@@ -1,7 +1,7 @@
 // src/06_realtime.ts —— 实时性：微批流式写入 + 增量聚合、并发查询、点查延迟、大结果流式导出
 import { createWriteStream } from 'node:fs';
-import { connect, exec, q, show, record } from './lib/duck.ts';
-import { sizes } from './lib/config.ts';
+import { connect, exec, q, show, record } from './lib/duck';
+import { sizes } from './lib/config';
 
 const con = await connect();
 

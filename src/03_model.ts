@@ -1,5 +1,5 @@
 // src/03_model.ts —— silver 清洗建模（身份打通、会话切分）+ gold.user_360 客户宽表（7 个数据源关联）
-import { connect, exec, q, show } from './lib/duck.ts';
+import { connect, exec, q, show } from './lib/duck';
 
 const con = await connect();
 const FROM_360 = process.argv[2] === '--from-360';   // 调试用：跳过前面已完成的步骤

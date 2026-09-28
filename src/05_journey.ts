@@ -1,5 +1,5 @@
 // src/05_journey.ts —— 用户旅程：会话漏斗、营销归因（ASOF JOIN）、购物篮关联、相似推荐、跨表 Top-N
-import { connect, exec, q, show } from './lib/duck.ts';
+import { connect, exec, q, show } from './lib/duck';
 
 const con = await connect();
 await con.run(`SET VARIABLE as_of = TIMESTAMP '2026-09-27'`);

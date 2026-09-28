@@ -1,5 +1,5 @@
 // src/04_crm.ts —— CRM 核心分析：复购、同期群、RFM、CLV、流失预警、忠诚度、等级迁移、邀请裂变
-import { connect, exec, q, show } from './lib/duck.ts';
+import { connect, exec, q, show } from './lib/duck';
 
 const con = await connect();
 await exec(con, `SET VARIABLE as_of = TIMESTAMP '2026-09-27'`);

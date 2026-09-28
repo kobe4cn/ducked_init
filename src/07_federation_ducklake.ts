@@ -1,7 +1,7 @@
 // src/07_federation_ducklake.ts —— 联邦查询（DuckDB × PostgreSQL × 湖）与 DuckLake 湖仓表
 //   需要 SEED_TARGET=pg。DuckLake 元数据存 PostgreSQL，数据文件存对象存储。
-import { config, lakePath } from './lib/config.ts';
-import { connect, exec, q, show } from './lib/duck.ts';
+import { config, lakePath } from './lib/config';
+import { connect, exec, q, show } from './lib/duck';
 
 const S = config.pg.schema;
 const con = await connect({ pg: true, ducklake: true });

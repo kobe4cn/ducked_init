@@ -38,3 +38,62 @@
 {"at":"2026-09-28T02:40:24.681Z","scale":1,"target":"pg","script":"02_ingest","step":"营销 CSV.gz → bronze/touches（按月分区）","ms":8523}
 {"at":"2026-09-28T02:40:24.725Z","scale":1,"target":"pg","script":"02_ingest","step":"商品 → silver.products","ms":44}
 {"at":"2026-09-28T02:40:24.803Z","scale":1,"target":"pg","script":"02_ingest","step":"入湖结果","ms":64,"rows":7}
+{"at":"2026-09-28T03:27:33.678Z","scale":1,"target":"pg","script":"03_model","step":"订单清洗 → silver.orders_clean","ms":4221}
+{"at":"2026-09-28T03:27:35.214Z","scale":1,"target":"pg","script":"03_model","step":"身份映射 device → user","ms":1535}
+{"at":"2026-09-28T03:27:47.184Z","scale":1,"target":"pg","script":"03_model","step":"事件身份补全 + 会话切分 → silver.events","ms":11970}
+{"at":"2026-09-28T03:27:47.393Z","scale":1,"target":"pg","script":"03_model","step":"身份打通效果","ms":208,"rows":1}
+{"at":"2026-09-28T03:27:48.780Z","scale":1,"target":"pg","script":"03_model","step":"360 ① 交易画像","ms":1386}
+{"at":"2026-09-28T03:27:49.725Z","scale":1,"target":"pg","script":"03_model","step":"360 ② 主渠道","ms":945}
+{"at":"2026-09-28T03:27:52.027Z","scale":1,"target":"pg","script":"03_model","step":"360 ③ 品类偏好（亿级明细 × 订单 × 商品）","ms":2302}
+{"at":"2026-09-28T03:27:52.647Z","scale":1,"target":"pg","script":"03_model","step":"360 ④ 近 30 天行为","ms":620}
+{"at":"2026-09-28T03:27:52.850Z","scale":1,"target":"pg","script":"03_model","step":"360 ⑤ 近 90 天营销触达（湖上 Parquet，分区裁剪）","ms":203}
+{"at":"2026-09-28T03:27:52.919Z","scale":1,"target":"pg","script":"03_model","step":"360 ⑥ 邀请人数","ms":68}
+{"at":"2026-09-28T03:27:54.324Z","scale":1,"target":"pg","script":"03_model","step":"360 ⑦ 7 源关联 → gold.user_360","ms":1405}
+{"at":"2026-09-28T03:27:54.408Z","scale":1,"target":"pg","script":"03_model","step":"user_360 样例（GMV Top 5）","ms":84,"rows":5}
+{"at":"2026-09-28T03:31:21.804Z","scale":1,"target":"pg","script":"04_crm","step":"1. 复购分析（按注册渠道）","ms":975,"rows":5}
+{"at":"2026-09-28T03:31:21.837Z","scale":1,"target":"pg","script":"04_crm","step":"1b. 多次消费的贡献结构","ms":32,"rows":5}
+{"at":"2026-09-28T03:31:22.503Z","scale":1,"target":"pg","script":"04_crm","step":"2. 同期群留存 → gold.cohort_retention","ms":665}
+{"at":"2026-09-28T03:31:22.506Z","scale":1,"target":"pg","script":"04_crm","step":"2b. 留存矩阵（%，PIVOT 行转列）","ms":3,"rows":12}
+{"at":"2026-09-28T03:31:24.596Z","scale":1,"target":"pg","script":"04_crm","step":"3. RFM → gold.rfm","ms":2090}
+{"at":"2026-09-28T03:31:24.627Z","scale":1,"target":"pg","script":"04_crm","step":"3b. RFM 人群画像","ms":31,"rows":6}
+{"at":"2026-09-28T03:31:25.947Z","scale":1,"target":"pg","script":"04_crm","step":"4. CLV → gold.clv","ms":1320}
+{"at":"2026-09-28T03:31:26.027Z","scale":1,"target":"pg","script":"04_crm","step":"4b. 各等级 CLV","ms":79,"rows":4}
+{"at":"2026-09-28T03:31:27.082Z","scale":1,"target":"pg","script":"04_crm","step":"5. 流失预警 → gold.churn_risk","ms":1056}
+{"at":"2026-09-28T03:31:27.096Z","scale":1,"target":"pg","script":"04_crm","step":"5b. 各城市最值得挽回的高价值客户","ms":14,"rows":8}
+{"at":"2026-09-28T03:31:27.115Z","scale":1,"target":"pg","script":"04_crm","step":"5c. 流失风险人群的可唤醒性","ms":19,"rows":2}
+{"at":"2026-09-28T03:31:30.062Z","scale":1,"target":"pg","script":"04_crm","step":"6. 忠诚度评分 → gold.loyalty_score","ms":2946}
+{"at":"2026-09-28T03:31:30.087Z","scale":1,"target":"pg","script":"04_crm","step":"6b. 忠诚度 × 会员等级（发现“高等级却不忠诚”的错配）","ms":25,"rows":4}
+{"at":"2026-09-28T03:31:30.723Z","scale":1,"target":"pg","script":"04_crm","step":"7. 季度消费档位迁移矩阵（行=本季，列=下季，单位：人次）","ms":636,"rows":4}
+{"at":"2026-09-28T03:31:31.008Z","scale":1,"target":"pg","script":"04_crm","step":"8. 裂变价值 Top 5（递归 CTE，最多 5 层）","ms":284,"rows":5}
+{"at":"2026-09-28T03:58:51.719Z","scale":1,"target":"pg","script":"05_journey","step":"1. 会话漏斗（按入口）","ms":451,"rows":4}
+{"at":"2026-09-28T03:58:55.303Z","scale":1,"target":"pg","script":"05_journey","step":"2. ASOF 归因 → gold.attribution","ms":3583}
+{"at":"2026-09-28T03:58:55.323Z","scale":1,"target":"pg","script":"05_journey","step":"2b. 7 天窗口 Last-Touch 归因","ms":20,"rows":4}
+{"at":"2026-09-28T03:58:55.335Z","scale":1,"target":"pg","script":"05_journey","step":"2c. 每个渠道表现最好的活动（QUALIFY）","ms":11,"rows":4}
+{"at":"2026-09-28T03:58:57.208Z","scale":1,"target":"pg","script":"05_journey","step":"3. 品类关联（提升度 > 1 表示正相关）","ms":1873,"rows":6}
+{"at":"2026-09-28T03:58:57.522Z","scale":1,"target":"pg","script":"05_journey","step":"4. 用户偏好向量（重要价值人群 2000 人样本）","ms":313}
+{"at":"2026-09-28T03:58:59.797Z","scale":1,"target":"pg","script":"05_journey","step":"4b. 召回 5000 热门商品 → 每人 Top 3（2000 人 × 5000 = 1000 万次相似度）","ms":2274,"rows":9}
+{"at":"2026-09-28T03:59:01.109Z","scale":1,"target":"pg","script":"05_journey","step":"5. 每城市铁杆客户 Top 3 品牌（五表关联）","ms":1312,"rows":9}
+{"at":"2026-09-28T04:02:22.558Z","scale":1,"target":"pg","script":"06_realtime","step":"微批写入（每批）","ms":5}
+{"at":"2026-09-28T04:02:22.558Z","scale":1,"target":"pg","script":"06_realtime","step":"增量合并（每批）","ms":3}
+{"at":"2026-09-28T04:02:22.558Z","scale":1,"target":"pg","script":"06_realtime","step":"大屏查询（每批）","ms":1}
+{"at":"2026-09-28T04:02:22.582Z","scale":1,"target":"pg","script":"06_realtime","step":"1b. 实时榜单 × 历史画像（实时表与离线表直接 JOIN）","ms":23,"rows":5}
+{"at":"2026-09-28T04:02:26.699Z","scale":1,"target":"pg","script":"06_realtime","step":"8 个重查询-串行","ms":2251}
+{"at":"2026-09-28T04:02:26.700Z","scale":1,"target":"pg","script":"06_realtime","step":"8 个重查询-4 连接并发","ms":1866}
+{"at":"2026-09-28T04:02:31.668Z","scale":1,"target":"pg","script":"06_realtime","step":"点查 p50","ms":5}
+{"at":"2026-09-28T04:02:31.668Z","scale":1,"target":"pg","script":"06_realtime","step":"点查 p95","ms":7}
+{"at":"2026-09-28T04:02:31.668Z","scale":1,"target":"pg","script":"06_realtime","step":"点查 p99","ms":9}
+{"at":"2026-09-28T04:02:33.299Z","scale":1,"target":"pg","script":"06_realtime","step":"流式导出挽回名单","ms":1570,"rows":1372117}
+{"at":"2026-09-28T04:02:33.789Z","scale":1,"target":"pg","script":"06_realtime","step":"全量重算 RFM","ms":490}
+{"at":"2026-09-28T04:03:25.363Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"1. 联邦查询：PG × 湖 × 分析库","ms":480,"rows":6}
+{"at":"2026-09-28T04:03:33.398Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"1b. 直接查 PG（WHERE 下推到 PG）","ms":8034,"rows":3}
+{"at":"2026-09-28T04:03:37.030Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"1c. postgres_query：整条 SQL 在 PG 执行","ms":3631,"rows":4}
+{"at":"2026-09-28T04:03:37.095Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2. ATTACH DuckLake（元数据：PostgreSQL，数据：对象存储）","ms":61}
+{"at":"2026-09-28T04:03:41.839Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2a. 建表并写入 9 月前的订单（新快照）","ms":4743}
+{"at":"2026-09-28T04:03:41.884Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2b. 设置分区（对之后写入的数据生效）","ms":44}
+{"at":"2026-09-28T04:03:42.586Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2c. 追加 9 月订单（新快照）","ms":702}
+{"at":"2026-09-28T04:03:44.064Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2d. 批量改状态（新快照）","ms":1478}
+{"at":"2026-09-28T04:03:44.072Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2e. 快照列表","ms":8,"rows":5}
+{"at":"2026-09-28T04:03:44.225Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2f. 时间旅行：对比历史快照与当前","ms":147,"rows":2}
+{"at":"2026-09-28T04:03:44.490Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2g. 变更流（CDC）：最后一个快照改了什么","ms":265,"rows":2}
+{"at":"2026-09-28T04:03:44.499Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2h. 合并相邻小文件","ms":9}
+{"at":"2026-09-28T04:03:44.519Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2i. DuckLake 在对象存储上的数据文件","ms":20,"rows":1}

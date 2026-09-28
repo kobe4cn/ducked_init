@@ -1,3 +1,4 @@
+#对象存储setup 脚本
 #!/usr/bin/env bash
 
 set -euo pipefail
