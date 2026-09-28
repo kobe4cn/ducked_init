@@ -1,0 +1,40 @@
+{"at":"2026-09-28T01:23:21.112Z","scale":1,"target":"pg","script":"01_seed","step":"生成客户 10,000,000","ms":5752}
+{"at":"2026-09-28T01:23:21.123Z","scale":1,"target":"pg","script":"01_seed","step":"PG 建表（先不建索引，批量写入更快）","ms":8}
+{"at":"2026-09-28T01:23:25.517Z","scale":1,"target":"pg","script":"01_seed","step":"PG 写入客户 10,000,000","ms":4393}
+{"at":"2026-09-28T01:26:36.635Z","scale":1,"target":"pg","script":"01_seed","step":"PG 建主键与索引、ANALYZE","ms":63421}
+{"at":"2026-09-28T01:26:50.291Z","scale":1,"target":"pg","script":"01_seed","step":"PostgreSQL 行数","ms":13655,"rows":1}
+{"at":"2026-09-28T01:26:50.396Z","scale":1,"target":"pg","script":"01_seed","step":"商品主数据 Parquet（10 万 SKU）","ms":103}
+{"at":"2026-09-28T01:28:35.125Z","scale":1,"target":"pg","script":"01_seed","step":"营销触达 CSV.gz（50,000,000 行）","ms":104729}
+{"at":"2026-09-28T01:32:57.481Z","scale":1,"target":"pg","script":"01_seed","step":"行为埋点 JSONL.gz（118 天 × 186,441 会话）","ms":262354}
+{"at":"2026-09-28T01:32:57.644Z","scale":1,"target":"pg","script":"01_seed","step":"会员 SaaS 后台库（mock_saas.duckdb）","ms":162}
+{"at":"2026-09-28T02:01:10.682Z","scale":1,"target":"pg","script":"02_ingest","step":"客户 → silver（PG 并行扫描）","ms":1676}
+{"at":"2026-09-28T02:01:19.350Z","scale":1,"target":"pg","script":"02_ingest","step":"订单 → silver","ms":8666}
+{"at":"2026-09-28T02:01:26.950Z","scale":1,"target":"pg","script":"02_ingest","step":"订单明细 → silver","ms":7600}
+{"at":"2026-09-28T02:11:50.941Z","scale":1,"target":"pg","script":"02_ingest","step":"客户 → silver（PG 并行扫描）","ms":2061}
+{"at":"2026-09-28T02:11:59.674Z","scale":1,"target":"pg","script":"02_ingest","step":"订单 → silver","ms":8733}
+{"at":"2026-09-28T02:12:07.599Z","scale":1,"target":"pg","script":"02_ingest","step":"订单明细 → silver","ms":7924}
+{"at":"2026-09-28T02:17:23.402Z","scale":1,"target":"pg","script":"02_ingest","step":"客户 → silver（PG 并行扫描）","ms":1881}
+{"at":"2026-09-28T02:17:31.834Z","scale":1,"target":"pg","script":"02_ingest","step":"订单 → silver","ms":8432}
+{"at":"2026-09-28T02:17:39.701Z","scale":1,"target":"pg","script":"02_ingest","step":"订单明细 → silver","ms":7867}
+{"at":"2026-09-28T02:27:16.455Z","scale":1,"target":"pg","script":"01_seed","step":"生成客户 10,000,000","ms":5979}
+{"at":"2026-09-28T02:27:16.948Z","scale":1,"target":"pg","script":"01_seed","step":"PG 建表（先不建索引，批量写入更快）","ms":488}
+{"at":"2026-09-28T02:27:21.117Z","scale":1,"target":"pg","script":"01_seed","step":"PG 写入客户 10,000,000","ms":4168}
+{"at":"2026-09-28T02:30:31.633Z","scale":1,"target":"pg","script":"01_seed","step":"PG 建主键与索引、ANALYZE","ms":64698}
+{"at":"2026-09-28T02:30:45.777Z","scale":1,"target":"pg","script":"01_seed","step":"PostgreSQL 行数","ms":14142,"rows":1}
+{"at":"2026-09-28T02:30:45.873Z","scale":1,"target":"pg","script":"01_seed","step":"商品主数据 Parquet（10 万 SKU）","ms":95}
+{"at":"2026-09-28T02:32:35.667Z","scale":1,"target":"pg","script":"01_seed","step":"营销触达 CSV.gz（50,000,000 行）","ms":109794}
+{"at":"2026-09-28T02:37:11.903Z","scale":1,"target":"pg","script":"01_seed","step":"行为埋点 JSONL.gz（118 天 × 186,441 会话）","ms":276235}
+{"at":"2026-09-28T02:37:12.054Z","scale":1,"target":"pg","script":"01_seed","step":"会员 SaaS 后台库（mock_saas.duckdb）","ms":150}
+{"at":"2026-09-28T02:38:25.773Z","scale":1,"target":"pg","script":"02_ingest","step":"客户 → silver（PG 并行扫描）","ms":2380}
+{"at":"2026-09-28T02:38:35.368Z","scale":1,"target":"pg","script":"02_ingest","step":"订单 → silver","ms":9594}
+{"at":"2026-09-28T02:38:43.593Z","scale":1,"target":"pg","script":"02_ingest","step":"订单明细 → silver","ms":8225}
+{"at":"2026-09-28T02:38:55.918Z","scale":1,"target":"pg","script":"02_ingest","step":"订单快照 → bronze（按月分区）","ms":12325}
+{"at":"2026-09-28T02:38:56.547Z","scale":1,"target":"pg","script":"02_ingest","step":"客户快照 → bronze","ms":629}
+{"at":"2026-09-28T02:39:00.146Z","scale":1,"target":"pg","script":"02_ingest","step":"明细快照 → bronze","ms":3598}
+{"at":"2026-09-28T02:39:22.792Z","scale":1,"target":"pg","script":"02_ingest","step":"（在 PG 中制造变更：1% 退款、客户改资料、5000 笔新订单）","ms":22605}
+{"at":"2026-09-28T02:39:35.098Z","scale":1,"target":"pg","script":"02_ingest","step":"会员接口：4 路并发分页拉取 → NDJSON 暂存","ms":12289}
+{"at":"2026-09-28T02:39:35.794Z","scale":1,"target":"pg","script":"02_ingest","step":"NDJSON 暂存 → silver.loyalty","ms":693}
+{"at":"2026-09-28T02:40:16.157Z","scale":1,"target":"pg","script":"02_ingest","step":"埋点 JSONL.gz → bronze/events（118 天，逐天写分区）","ms":39835}
+{"at":"2026-09-28T02:40:24.681Z","scale":1,"target":"pg","script":"02_ingest","step":"营销 CSV.gz → bronze/touches（按月分区）","ms":8523}
+{"at":"2026-09-28T02:40:24.725Z","scale":1,"target":"pg","script":"02_ingest","step":"商品 → silver.products","ms":44}
+{"at":"2026-09-28T02:40:24.803Z","scale":1,"target":"pg","script":"02_ingest","step":"入湖结果","ms":64,"rows":7}

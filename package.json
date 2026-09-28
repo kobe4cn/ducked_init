@@ -1,12 +1,24 @@
 {
-  "name": "",
+  "name": "duckdb_crm",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "react-router build",
     "dev": "react-router dev",
     "start": "react-router-serve ./build/server/index.js",
-    "typecheck": "react-router typegen && tsc"
+    "typecheck": "react-router typegen && tsc",
+    "check": "node --env-file=.env --import tsx src/00_check.ts",
+    "seed": "node --env-file=.env --import tsx src/01_seed.ts",
+    "ingest": "node --env-file=.env --import tsx src/02_ingest.ts",
+    "ingest:incr": "node --env-file=.env --import tsx src/02_ingest.ts incremental",
+    "model": "node --env-file=.env --import tsx src/03_model.ts",
+    "crm": "node --env-file=.env --import tsx src/04_crm.ts",
+    "journey": "node --env-file=.env --import tsx src/05_journey.ts",
+    "realtime": "node --env-file=.env --import tsx src/06_realtime.ts",
+    "federation": "node --env-file=.env --import tsx src/07_federation_ducklake.ts",
+    "v2": "node --env-file=.env --import tsx src/08_v2_features.ts",
+    "all": "npm run check && npm run seed && npm run ingest && npm run ingest:incr && npm run model && npm run crm && npm run journey && npm run realtime && npm run federation",
+    "report": "node --import tsx src/report.ts"
   },
   "dependencies": {
     "@react-router/node": "^8.4.0",
@@ -14,7 +26,8 @@
     "isbot": "^5.1.36",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "react-router": "^8.4.0"
+    "react-router": "^8.4.0",
+    "@duckdb/node-api": "1.5.5-r.5"
   },
   "devDependencies": {
     "@react-router/dev": "^8.4.0",
@@ -23,7 +36,8 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "tailwindcss": "^4.2.2",
-    "typescript": "^5.9.3",
-    "vite": "^8.0.3"
+    "typescript": "^7.0.2",
+    "vite": "^8.0.3",
+    "tsx": "^4.23.15"
   }
 }

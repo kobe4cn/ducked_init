@@ -1,0 +1,59 @@
+# 本地对象存储（二选一）+ 可选的 PostgreSQL
+#   默认：SeaweedFS          docker compose up -d
+#   备选：RustFS             docker compose --profile rustfs up -d rustfs rustfs-bucket
+#   没有现成 PG 时：         docker compose --profile pg up -d postgres
+# 生产环境请把 :latest 换成固定版本号。
+
+services:
+  # ---------------- SeaweedFS（Apache-2.0，推荐）----------------
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: >
+      server -dir=/data -ip.bind=0.0.0.0
+      -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+      -master.volumeSizeLimitMB=1024 -volume.max=0
+    ports:
+      - "8333:8333"   # S3 API
+      - "9333:9333"   # master 管理页
+      - "8888:8888"   # filer 浏览页
+    volumes:
+      - ./docker/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+      - seaweedfs-data:/data
+    restart: unless-stopped
+
+  # 创建存储桶 crm-lake（执行一次后退出）
+  create-bucket:
+    image: amazon/aws-cli:latest
+    depends_on: [seaweedfs]
+    environment:
+      AWS_ACCESS_KEY_ID: crm
+      AWS_SECRET_ACCESS_KEY: crm-secret
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: >
+      sh -c "until aws --endpoint-url http://seaweedfs:8333 s3 ls >/dev/null 2>&1; do sleep 2; done;
+             aws --endpoint-url http://seaweedfs:8333 s3 mb s3://crm-lake || true;
+             aws --endpoint-url http://seaweedfs:8333 s3 ls"
+    restart: "no"
+
+   # ---------------- PostgreSQL（已有容器可忽略）----------------
+  postgres:
+    profiles: [pg]
+    image: postgres:17
+    environment:
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: crm
+      POSTGRES_DB: crm
+    # 批量导入亿级数据时的推荐参数（仅限开发/压测环境）
+    command: >
+      postgres -c shared_buffers=2GB -c max_wal_size=16GB -c checkpoint_timeout=30min
+               -c synchronous_commit=off -c maintenance_work_mem=2GB -c max_parallel_maintenance_workers=4
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    shm_size: 1g
+    restart: unless-stopped
+    
+volumes:
+  seaweedfs-data:
+  pg-data:
