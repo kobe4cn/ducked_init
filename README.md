@@ -124,6 +124,8 @@ npm run dev                                                             # 打开
 
 开发环境不真正发信，登录邮件（含链接）直接输出到 `npm run dev` 的控制台；Magic Link 15 分钟内有效、只能使用一次，重新申请后旧链接作废；同一邮箱申请过于频繁会被限流（HTTP 429）。未登记的邮箱收不到链接，平台不开放注册；签发与发信在后台进行，已登记与未登记邮箱的答复内容与响应时间一致。
 
+界面使用 [shadcn/ui](https://ui.shadcn.com)（Radix + Tailwind CSS 4，`nova` 预设），组件源码在 `app/components/ui/`，配置见 `components.json`。新增组件：`npx shadcn@latest add <组件名>`；`app/components/ui/` 下是生成的代码，保持 shadcn 原样以便升级，业务样式写在页面里。
+
 #### 本地登录（获取 Magic Link）
 
 1. `npm run dev`，浏览器打开 `http://localhost:5173/login`，输入已登记的邮箱，点“发送登录链接”。

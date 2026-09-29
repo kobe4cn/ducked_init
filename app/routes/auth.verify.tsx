@@ -1,7 +1,11 @@
 // app/routes/auth.verify.tsx —— 打开 Magic Link 后确认登录
-import { Form, redirect } from 'react-router';
+import { Form, Link, redirect, useNavigation } from 'react-router';
+import { CircleAlert } from 'lucide-react';
 import type { Route } from './+types/auth.verify';
 import { consumeMagicLink } from '~/.server/auth';
+import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
+import { Button } from '~/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
 
 export function meta({}: Route.MetaArgs) {
   return [{ title: '确认登录 · CRM 数据分析平台' }];
@@ -21,19 +25,33 @@ export async function action({ request }: Route.ActionArgs) {
 
 export default function Verify({ loaderData, actionData }: Route.ComponentProps) {
   const error = actionData?.error ?? (loaderData.hasToken ? null : '登录链接无效，请重新申请。');
+  const submitting = useNavigation().state === 'submitting';
   return (
-    <main className="container mx-auto max-w-sm p-8 space-y-4">
-      <h1 className="text-2xl font-semibold">确认登录</h1>
-      {error ? (
-        <>
-          <p role="alert">{error}</p>
-          <a href="/login" className="underline">重新申请登录链接</a>
-        </>
-      ) : (
-        <Form method="post">
-          <button type="submit" className="w-full rounded bg-black text-white py-2">登录</button>
-        </Form>
-      )}
+    <main className="flex min-h-svh items-center justify-center bg-muted p-6">
+      <Card className="w-full max-w-sm">
+        <CardHeader>
+          <CardTitle className="text-xl">确认登录</CardTitle>
+          <CardDescription>登录链接只能使用一次。</CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4">
+          {error ? (
+            <>
+              <Alert variant="destructive" role="alert">
+                <CircleAlert />
+                <AlertTitle>无法登录</AlertTitle>
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+              <Button variant="outline" asChild>
+                <Link to="/login">重新申请登录链接</Link>
+              </Button>
+            </>
+          ) : (
+            <Form method="post">
+              <Button type="submit" className="w-full" disabled={submitting}>{submitting ? '登录中…' : '登录'}</Button>
+            </Form>
+          )}
+        </CardContent>
+      </Card>
     </main>
   );
 }
