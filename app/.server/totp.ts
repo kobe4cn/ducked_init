@@ -1,5 +1,6 @@
 // app/.server/totp.ts —— TOTP（RFC 6238：HMAC-SHA1、30 秒一步、6 位），供运营者第二因素使用
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import QRCode from 'qrcode';
 
 const STEP_SECONDS = 30;
 const DIGITS = 6;
@@ -77,3 +78,6 @@ export function otpauthUri(email: string, secret: string, issuer = 'CRM 运营�
   const params = new URLSearchParams({ secret, issuer, algorithm: 'SHA1', digits: String(DIGITS), period: String(STEP_SECONDS) });
   return `otpauth://totp/${label}?${params}`;
 }
+
+/** 绑定链接的二维码（PNG data URL），在服务端生成，密钥不经过任何第三方服务 */
+export const otpauthQrDataUrl = (uri: string) => QRCode.toDataURL(uri, { errorCorrectionLevel: 'M', margin: 2, width: 240 });

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { totpCode } from '../../app/.server/totp';
 import {
-  createOperator, createTenant, extractOpsLink, loginAs, loginAsOperator, opsMagicLogin, resetDb, startApp, totpSecretOn,
+  createOperator, createTenant, extractOpsLink, loginAs, loginAsOperator, opsMagicLogin, resetDb, scanTotpQrOn, startApp, totpSecretOn,
   type Client, type TestApp,
 } from './harness';
 
@@ -69,6 +69,13 @@ describe('运营后台登录：Magic Link + 强制 TOTP', () => {
     }
 
     const secret = await totpSecretOn(browser);
+    // 页面上的二维码可被认证器扫描，编码的是含同一密钥的 otpauth 绑定链接
+    const uri = new URL((await scanTotpQrOn(browser))!);
+    expect(uri.protocol).toBe('otpauth:');
+    expect(uri.host).toBe('totp');
+    expect(uri.searchParams.get('secret')).toBe(secret);
+    expect(decodeURIComponent(uri.pathname)).toContain(OPS);
+
     const wrong = await browser.post('/ops/totp', { code: '000000' === totpCode(secret) ? '111111' : '000000' });
     expect(wrong.status).toBe(400);
     expect(await wrong.text()).toContain('验证码不正确');
@@ -90,6 +97,7 @@ describe('运营后台登录：Magic Link + 强制 TOTP', () => {
     const page = await (await again.get('/ops/totp')).text();
     expect(page).not.toContain('data-totp-secret');
     expect(page).not.toContain(secret);
+    expect(await scanTotpQrOn(again)).toBeNull();
     expect((await again.get('/ops')).status).toBe(302);
 
     // 同一时间步内重放刚才用过的验证码

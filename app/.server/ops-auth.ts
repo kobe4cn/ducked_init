@@ -10,7 +10,7 @@ import { getDb, isUniqueViolation } from './db/client';
 import { operatorMagicLinks, operators, operatorSessions } from './db/schema';
 import { getMailer, type Mailer } from './mailer';
 import { EMAIL, normalizeEmail } from './tenants';
-import { generateSecret, otpauthUri, verifyTotp } from './totp';
+import { generateSecret, otpauthQrDataUrl, otpauthUri, verifyTotp } from './totp';
 
 export const OPS_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 /** 通过 Magic Link 后，须在这段时间内完成 TOTP 验证 */
@@ -169,7 +169,8 @@ export async function totpChallenge(request: Request) {
     await db.update(operators).set({ totpSecret: generateSecret() }).where(and(eq(operators.id, session.operatorId), isNull(operators.totpSecret)));
     [{ totpSecret: secret }] = await db.select({ totpSecret: operators.totpSecret }).from(operators).where(eq(operators.id, session.operatorId));
   }
-  return { email: session.email, setup: { secret: secret!, uri: otpauthUri(session.email, secret!) } };
+  const qr = await otpauthQrDataUrl(otpauthUri(session.email, secret!));
+  return { email: session.email, setup: { secret: secret!, qr } };
 }
 
 export type TotpResult =

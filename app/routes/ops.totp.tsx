@@ -1,4 +1,4 @@
-// app/routes/ops.totp.tsx —— 运营者第二因素：首次登录时绑定 TOTP（展示密钥并确认一次验证码），之后每次登录输入验证码
+// app/routes/ops.totp.tsx —— 运营者第二因素：首次登录时绑定 TOTP（展示二维码与密钥并确认一次验证码），之后每次登录输入验证码
 import { data, Form, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/ops.totp';
 import { totpChallenge, verifyOperatorTotp } from '~/.server/ops-auth';
@@ -42,12 +42,11 @@ export default function OpsTotp({ loaderData, actionData }: Route.ComponentProps
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
           {setup && (
-            <dl className="flex flex-col gap-2 text-sm">
-              <dt className="text-muted-foreground">密钥（手动输入）</dt>
-              <dd className="font-mono text-base tracking-wider" data-totp-secret={setup.secret}>{grouped(setup.secret)}</dd>
-              <dt className="text-muted-foreground">绑定链接（可生成二维码扫码添加）</dt>
-              <dd className="break-all font-mono text-xs">{setup.uri}</dd>
-            </dl>
+            <div className="flex flex-col items-center gap-3 text-sm">
+              <img src={setup.qr} data-totp-qr alt="TOTP 绑定二维码" width={240} height={240} className="rounded-md border bg-white" />
+              <p className="text-muted-foreground">用认证器 App 扫描二维码；无法扫码时手动输入密钥：</p>
+              <p className="font-mono text-base tracking-wider" data-totp-secret={setup.secret}>{grouped(setup.secret)}</p>
+            </div>
           )}
           <Form method="post">
             <FieldGroup>

@@ -4,6 +4,8 @@ import { promisify } from 'node:util';
 import { createServer, type ViteDevServer } from 'vite';
 import { createRequestHandler, type ServerBuild } from 'react-router';
 import pg from 'pg';
+import jsQR from 'jsqr';
+import { PNG } from 'pngjs';
 import type { Mail } from '../../app/.server/mailer';
 import { totpCode } from '../../app/.server/totp';
 
@@ -130,6 +132,18 @@ export async function totpSecretOn(browser: Client): Promise<string> {
   const m = html.match(/data-totp-secret="([A-Z2-7]+)"/);
   if (!m) throw new Error('TOTP 页面没有展示密钥');
   return m[1];
+}
+
+/** 像认证器 App 一样扫描 TOTP 页面上的二维码，返回其中编码的内容；页面没有二维码时返回 null */
+export async function scanTotpQrOn(browser: Client): Promise<string | null> {
+  const html = await (await browser.get('/ops/totp')).text();
+  const img = html.match(/<img[^>]*data-totp-qr[^>]*>/)?.[0];
+  const m = img?.match(/src="data:image\/png;base64,([^"]+)"/);
+  if (!m) return null;
+  const png = PNG.sync.read(Buffer.from(m[1], 'base64'));
+  const decoded = jsQR(new Uint8ClampedArray(png.data), png.width, png.height);
+  if (!decoded) throw new Error('TOTP 二维码无法识别');
+  return decoded.data;
 }
 
 /** 运营者完整登录（Magic Link + 首次绑定 TOTP），返回已登录的浏览器与 TOTP 密钥 */
