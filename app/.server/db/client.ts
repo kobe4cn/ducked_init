@@ -14,6 +14,9 @@ export function getDb() {
 
 export type Db = ReturnType<typeof getDb>;
 
+/** 驱动抛出的错误是否为唯一约束冲突（PG 23505） */
+export const isUniqueViolation = (e: unknown) => (e as { cause?: { code?: string } }).cause?.code === '23505';
+
 export async function closeDb() {
   await db?.$client.end();
   db = undefined;

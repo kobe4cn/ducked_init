@@ -12,9 +12,13 @@ PLATFORM_DATABASE_URL=postgres://crm:crm@localhost:5432/crm_platform
 # 可选：Magic Link 申请限流（同一邮箱每个窗口内的次数），默认 15 分钟 5 次
 # MAGIC_LINK_RATE_LIMIT=5
 # MAGIC_LINK_RATE_WINDOW_MINUTES=15
+# 可选：运营后台 /ops 的 IP 白名单（逗号分隔的 CIDR）；客户端地址取 OPS_CLIENT_IP_HEADER（默认 X-Forwarded-For）的最后一项
+# OPS_ALLOWED_CIDRS=10.0.0.0/8,192.168.0.0/16
+# OPS_CLIENT_IP_HEADER=x-forwarded-for
 
 npm run db:migrate                                                      # 建表 / 升级
 npm run tenant:create -- --slug acme --name 示例商贸 --admin-email admin@acme.com   # 开通租户（带默认空间）与首个管理员
+npm run operator:create -- --email ops@example.com                     # 新增运营者（只能用这条命令）
 npm run dev                                                             # 打开 /login，用管理员邮箱申请 Magic Link
 ```
 
@@ -47,6 +51,16 @@ npm run dev                                                             # 打开
 - 管理员在 `/members` 邀请成员（指定角色：管理员、数据工程师、分析师、查看者）、修改角色、移除成员。角色修改对已登录的会话立即生效；被移除成员的会话立即失效。租户至少保留一名管理员。
 - 权限矩阵在 `app/.server/access.ts`，每个 loader/action 入口用 `requirePermission` 执行；无权限返回 403 并说明需要的角色。
 - 管理员在 `/audit` 查看审计日志：开通租户、邀请、修改角色、移除成员。
+
+#### 运营后台
+
+运营者是独立于成员的身份（ADR-0007）：独立的 `operators` 表、登录入口 `/ops/login`、会话 cookie `crm_ops_session`（8 小时）。成员会话不能访问 `/ops`，运营者会话也不能访问成员页面。
+
+- 运营者只能在服务器上用 `npm run operator:create -- --email ...` 创建；后台没有新增或停用运营者的入口。
+- 登录：`/ops/login` 申请 Magic Link（邮件同样输出到控制台，链接为 `/ops/auth/verify?token=...`）→ 输入 TOTP 验证码。首次登录时绑定 TOTP：页面展示密钥与 `otpauth://` 绑定链接，确认一次验证码即完成绑定。同一个验证码只能用一次；连续输错 5 次需重新申请登录链接。
+- `/ops` 列出租户（名称、标识、开通时间、成员数、管理员邮箱）并开通租户；进入租户可改名、指定管理员（提升已有成员或新增管理员邮箱，用于管理员邮箱失效时的恢复）。运营者看不到成员名单与业务数据，也没有进入租户的入口。
+- 运营者对租户的操作写入该租户的审计日志，操作者显示为“运营者 ops@…”；运营者登录、绑定 TOTP、新增运营者等平台级事件不属于任何租户，只在 `/ops/audit` 可见。
+- 配置 `OPS_ALLOWED_CIDRS` 后只允许白名单内的地址访问 `/ops`。客户端地址取自反向代理写入的请求头，必须部署在会追加或覆盖该请求头的反向代理之后，否则可被伪造。取最后一项只适用于一层反向代理；多层代理（如 CDN + 负载均衡）时应让最内层代理把真实地址写入单独的请求头（如 `X-Real-IP`），并把 `OPS_CLIENT_IP_HEADER` 指向它。
 
 `npm test` 运行 HTTP 接缝测试：进程内启动 React Router 服务端，背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表）。
 

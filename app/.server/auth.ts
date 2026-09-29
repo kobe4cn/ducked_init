@@ -17,8 +17,8 @@ const rateLimit = () => ({
   windowMs: Number(process.env.MAGIC_LINK_RATE_WINDOW_MINUTES ?? 15) * 60 * 1000,
 });
 
-const newToken = () => randomBytes(32).toString('base64url');
-const sha256 = (token: string) => createHash('sha256').update(token).digest('hex');
+export const newToken = () => randomBytes(32).toString('base64url');
+export const sha256 = (token: string) => createHash('sha256').update(token).digest('hex');
 
 const sessionCookie = createCookie('crm_session', {
   httpOnly: true,
@@ -56,20 +56,23 @@ export async function requestMagicLink(rawEmail: string, requestOrigin: string):
   return { ok: true };
 }
 
-/** 记下这次申请；超过频率上限时返回需要等待的秒数 */
-async function recordRequest(email: string): Promise<number> {
+/**
+ * 记下这次申请；超过频率上限时返回需要等待的秒数。
+ * 限流按 key 计数：成员直接用邮箱，运营者在邮箱前加前缀，两边互不占用额度
+ */
+export async function recordRequest(key: string): Promise<number> {
   const db = getDb();
   const { max, windowMs } = rateLimit();
-  const emailHash = sha256(email);
+  const keyHash = sha256(key);
   const since = new Date(Date.now() - windowMs);
-  await db.delete(magicLinkRequests).where(and(eq(magicLinkRequests.emailHash, emailHash), lte(magicLinkRequests.createdAt, since)));
+  await db.delete(magicLinkRequests).where(and(eq(magicLinkRequests.emailHash, keyHash), lte(magicLinkRequests.createdAt, since)));
   const recent = await db
     .select({ createdAt: magicLinkRequests.createdAt })
     .from(magicLinkRequests)
-    .where(eq(magicLinkRequests.emailHash, emailHash))
+    .where(eq(magicLinkRequests.emailHash, keyHash))
     .orderBy(magicLinkRequests.createdAt);
   if (recent.length >= max) return Math.max(1, Math.ceil((recent[0].createdAt.getTime() + windowMs - Date.now()) / 1000));
-  await db.insert(magicLinkRequests).values({ emailHash, createdAt: new Date() });
+  await db.insert(magicLinkRequests).values({ emailHash: keyHash, createdAt: new Date() });
   return 0;
 }
 
