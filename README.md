@@ -104,6 +104,25 @@ npm run report     # 汇总每一步的耗时（记录在 reports/bench.jsonl）
 
 `SEED_TARGET=lake` 可以跳过 PG，直接生成“已从 PG 导出”的 Parquet，适合只压测湖上分析、PG 磁盘不够的情况。
 
+### 平台（多租户，开发中）
+
+`app/` 是多租户 CRM 数据分析平台的 React Router 应用（术语见 `CONTEXT.md`，架构决策见 `docs/adr/`）。平台元数据存放在平台 PostgreSQL 的 `platform` schema：
+
+```bash
+# .env 里加上平台元数据库（建议与演示数据分开建库）
+PLATFORM_DATABASE_URL=postgres://crm:crm@localhost:5432/crm_platform
+# 登录邮件里链接使用的站点地址：生产环境必填，开发环境未配置时取请求地址
+# APP_ORIGIN=https://crm.example.com
+
+npm run db:migrate                                                      # 建表 / 升级
+npm run tenant:create -- --slug acme --name 示例商贸 --admin-email admin@acme.com   # 开通租户（带默认空间）与首个管理员
+npm run dev                                                             # 打开 /login，用管理员邮箱申请 Magic Link
+```
+
+开发环境不真正发信，登录邮件（含链接）直接输出到 `npm run dev` 的控制台；Magic Link 15 分钟内有效、只能使用一次，未登记的邮箱收不到链接，平台不开放注册。
+
+`npm test` 运行 HTTP 接缝测试：进程内启动 React Router 服务端，背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表）。
+
 ---
 
 ## 3. 实测结果
