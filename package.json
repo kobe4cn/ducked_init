@@ -9,7 +9,7 @@
     "typecheck": "react-router typegen && tsc",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "node --env-file-if-exists=.env --import tsx scripts/db-migrate.ts",
+    "db:migrate": "drizzle-kit migrate",
     "tenant:create": "node --env-file-if-exists=.env --import tsx scripts/create-tenant.ts",
     "check": "node --env-file=.env --import tsx src/00_check.ts",
     "seed": "node --env-file=.env --import tsx src/01_seed.ts",
