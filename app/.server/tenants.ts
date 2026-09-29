@@ -1,11 +1,12 @@
-// app/.server/tenants.ts —— 运营者开通租户：租户 + 默认空间 + 首个管理员，一个事务内完成
+// app/.server/tenants.ts —— 运营者开通租户：租户 + 默认空间 + 首个管理员 + 审计记录，一个事务内完成
+import { recordAudit } from './audit';
 import { getDb } from './db/client';
 import { members, spaces, tenants } from './db/schema';
 
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
 
 const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export interface CreateTenantInput { slug: string; name: string; adminEmail: string }
 
@@ -21,6 +22,14 @@ export async function createTenant(input: CreateTenantInput) {
     const [tenant] = await tx.insert(tenants).values({ slug, name }).returning();
     const [space] = await tx.insert(spaces).values({ tenantId: tenant.id, name: '默认空间', isDefault: true }).returning();
     const [admin] = await tx.insert(members).values({ tenantId: tenant.id, email: adminEmail, role: 'admin' }).returning();
+    await recordAudit(tx, {
+      tenantId: tenant.id,
+      actor: null,
+      action: 'tenant.created',
+      targetType: 'tenant',
+      targetId: tenant.id,
+      detail: { slug, name, adminEmail },
+    });
     return { tenant, space, admin };
   });
 }

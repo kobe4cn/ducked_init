@@ -82,7 +82,7 @@ export async function startApp(): Promise<TestApp> {
 export async function resetDb() {
   const client = new pg.Client({ connectionString: process.env.PLATFORM_DATABASE_URL });
   await client.connect();
-  await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests CASCADE');
+  await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs CASCADE');
   await client.end();
 }
 
@@ -91,6 +91,22 @@ export async function runCli(script: string, args: string[]) {
   return promisify(execFile)(process.execPath, ['--import', 'tsx', script, ...args], {
     env: { ...process.env },
   }).then(r => ({ ...r, code: 0 }), (e: { stdout: string; stderr: string; code: number }) => e);
+}
+
+/** 以运营者身份开通租户（与 npm run tenant:create 相同的入口） */
+export const createTenant = (slug: string, name: string, adminEmail: string) =>
+  runCli('scripts/create-tenant.ts', ['--slug', slug, '--name', name, '--admin-email', adminEmail]);
+
+/** 申请 Magic Link → 打开链接 → 确认登录，返回已登录的浏览器 */
+export async function loginAs(app: TestApp, email: string): Promise<Client> {
+  const browser = app.client();
+  await browser.post('/login', { email });
+  await app.drain();
+  const mail = app.outbox.filter(m => m.to === email && /\/auth\/verify\?token=/.test(m.text)).at(-1);
+  if (!mail) throw new Error(`没有发给 ${email} 的登录邮件`);
+  const res = await browser.post(extractLink(mail), {});
+  if (res.status !== 302) throw new Error(`${email} 登录失败：${res.status}`);
+  return browser;
 }
 
 /** 从邮件正文里取出登录链接（路径 + 查询串） */

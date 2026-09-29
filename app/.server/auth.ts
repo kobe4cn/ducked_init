@@ -28,7 +28,8 @@ const sessionCookie = createCookie('crm_session', {
   maxAge: SESSION_TTL_MS / 1000,
 });
 
-function linkOrigin(requestOrigin: string) {
+/** 邮件里链接使用的站点地址 */
+export function linkOrigin(requestOrigin: string) {
   if (process.env.APP_ORIGIN) return process.env.APP_ORIGIN;
   if (process.env.NODE_ENV === 'production') throw new Error('生产环境必须配置 APP_ORIGIN（登录链接的站点地址）');
   return requestOrigin;

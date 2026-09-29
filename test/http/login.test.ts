@@ -1,14 +1,11 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Client, extractLink, resetDb, runCli, startApp, type Mail, type TestApp } from './harness';
+import { Client, createTenant, extractLink, resetDb, startApp, type Mail, type TestApp } from './harness';
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
-
-const createTenant = (slug: string, name: string, adminEmail: string) =>
-  runCli('scripts/create-tenant.ts', ['--slug', slug, '--name', name, '--admin-email', adminEmail]);
 
 /** 申请 Magic Link 并等待后台签发与发信完成 */
 async function requestLink(browser: Client, email: string) {
