@@ -141,7 +141,7 @@ SELECT depth AS 邀请层级, count(*) AS 客户数 FROM chain GROUP BY ALL ORDE
 if (process.env.DUMP) {
   writeFileSync(process.env.DUMP, JSON.stringify(steps, null, 2));
 } else {
-  const { connect, q, show } = await import('./lib/duck.ts');
+  const { connect, q, show } = await import('./lib/duck');
   const con = await connect();
   for (const s of steps) {
     const stmts = s.sql.split(/;\s*\n/).map(x => x.trim()).filter(Boolean);
