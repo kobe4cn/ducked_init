@@ -1,4 +1,65 @@
-# crm-lakehouse —— DuckDB + TypeScript 千万会员 / 亿级订单用户分析实战
+# CRM 数据分析平台
+## 主要功能演进
+### 平台（多租户，开发中）
+
+`app/` 是多租户 CRM 数据分析平台的 React Router 应用（术语见 `CONTEXT.md`，架构决策见 `docs/adr/`）。平台元数据存放在平台 PostgreSQL 的 `platform` schema：
+
+```bash
+# .env 里加上平台元数据库（建议与演示数据分开建库）
+PLATFORM_DATABASE_URL=postgres://crm:crm@localhost:5432/crm_platform
+# 登录邮件里链接使用的站点地址：生产环境必填，开发环境未配置时取请求地址
+# APP_ORIGIN=https://crm.example.com
+# 可选：Magic Link 申请限流（同一邮箱每个窗口内的次数），默认 15 分钟 5 次
+# MAGIC_LINK_RATE_LIMIT=5
+# MAGIC_LINK_RATE_WINDOW_MINUTES=15
+
+npm run db:migrate                                                      # 建表 / 升级
+npm run tenant:create -- --slug acme --name 示例商贸 --admin-email admin@acme.com   # 开通租户（带默认空间）与首个管理员
+npm run dev                                                             # 打开 /login，用管理员邮箱申请 Magic Link
+```
+
+开发环境不真正发信，登录邮件（含链接）直接输出到 `npm run dev` 的控制台；Magic Link 15 分钟内有效、只能使用一次，重新申请后旧链接作废；同一邮箱申请过于频繁会被限流（HTTP 429）。未登记的邮箱收不到链接，平台不开放注册；签发与发信在后台进行，已登记与未登记邮箱的答复内容与响应时间一致。
+
+界面使用 [shadcn/ui](https://ui.shadcn.com)（Radix + Tailwind CSS 4，`nova` 预设），组件源码在 `app/components/ui/`，配置见 `components.json`。新增组件：`npx shadcn@latest add <组件名>`；`app/components/ui/` 下是生成的代码，保持 shadcn 原样以便升级，业务样式写在页面里。
+
+#### 本地登录（获取 Magic Link）
+
+1. `npm run dev`，浏览器打开 `http://localhost:5173/login`，输入已登记的邮箱，点“发送登录链接”。
+2. 回到运行 `npm run dev` 的终端，找到下面这段输出，复制其中的链接到浏览器打开，点“登录”：
+   ```
+   ======== 邮件（开发环境，仅输出到控制台）========
+   收件人：admin@acme.com
+   ...
+   示例商贸：http://localhost:5173/auth/verify?token=xxxxxxxx
+   ```
+3. 登录后首页显示当前租户、空间与角色。
+
+注意：
+
+- 终端里有多条链接时用**最后一条**：重新申请后旧链接作废；链接 15 分钟内有效、只能用一次。
+- 同一邮箱每 15 分钟最多申请 5 次，本地调试可在 `.env` 调大 `MAGIC_LINK_RATE_LIMIT`。
+- 未登记的邮箱不会输出链接（页面答复与已登记邮箱相同）。要新增可登录的邮箱，目前只能用 `npm run tenant:create` 开通新租户并指定其管理员。
+- 同一邮箱隶属多个租户时，一封邮件里每个租户各有一条链接，选哪条就进入哪个租户。
+- `npm run start`（生产构建）下默认不允许把链接输出到日志，会直接报错；确需如此时设置 `MAILER=console`，并配置 `APP_ORIGIN`。
+
+`npm test` 运行 HTTP 接缝测试：进程内启动 React Router 服务端，背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表）。
+
+---
+## 技术栈
+
+- **Framework:** [React Router](https://reactrouter.com/) v8 with SSR
+- **Language:** TypeScript 7.x
+- **Database:** PostgreSQL 17 via [Drizzle ORM](https://orm.drizzle.team/) + DuckDB 1.5
+- **Styling:** Tailwind CSS 4 + [shadcn/ui](https://ui.shadcn.com/)
+- **Testing:** [Vitest](https://vitest.dev/)
+- **Build:** [Vite](https://vite.dev/) 7
+- **Real-time:** [Ably](https://ably.com/) for live presence
+
+
+---
+
+## 基于 duckdb 数据分析能力的测试样例(供参考)
+### crm-lakehouse —— DuckDB + TypeScript 千万会员 / 亿级订单用户分析实战
 
 用 **DuckDB + TypeScript** 搭一个 CRM 数据分析体系：多数据源入湖（PostgreSQL、对象存储、HTTP 接口、JSON / CSV 文件），
 建客户 360 宽表，做复购、同期群、RFM、CLV、流失预警、忠诚度、营销归因、购物篮、向量推荐、实时指标，
@@ -10,7 +71,7 @@
 
 ---
 
-## 1. 准备环境
+#### 1. 准备环境
 
 | 组件 | 要求 | 说明 |
 |---|---|---|
@@ -22,7 +83,7 @@
 DuckDB 扩展（`httpfs`、`postgres`、`ducklake`）首次使用时会从 `extensions.duckdb.org` 自动下载，不需要 npm 安装。
 内网环境见第 7 节“离线安装扩展”。
 
-### 1.1 PostgreSQL（已有容器）
+#### 1.1 PostgreSQL（已有容器）
 
 在你的 PG 里建库和用户（名字可以随意，和 `.env` 对应即可）：
 
@@ -43,7 +104,7 @@ maintenance_work_mem = 2GB
 
 容器启动时可以直接加在命令后面：`postgres -c max_wal_size=16GB -c synchronous_commit=off …`（`docker-compose.yml` 里的 `postgres` 服务有完整示例，已有容器可以忽略该服务）。
 
-### 1.2 对象存储
+#### 1.2 对象存储
 
 ```bash
 docker compose up -d          # 启动 SeaweedFS，并自动创建存储桶 crm-lake
@@ -54,7 +115,7 @@ docker compose --profile rustfs up -d rustfs rustfs-bucket
 
 不想用对象存储时，把 `.env` 里的 `LAKE_URI` 改成本地目录（如 `./data/lake`），其他代码不用改。
 
-### 1.3 安装与自检
+#### 1.3 安装与自检
 
 ```bash
 npm install
@@ -104,51 +165,6 @@ npm run report     # 汇总每一步的耗时（记录在 reports/bench.jsonl）
 
 `SEED_TARGET=lake` 可以跳过 PG，直接生成“已从 PG 导出”的 Parquet，适合只压测湖上分析、PG 磁盘不够的情况。
 
-### 平台（多租户，开发中）
-
-`app/` 是多租户 CRM 数据分析平台的 React Router 应用（术语见 `CONTEXT.md`，架构决策见 `docs/adr/`）。平台元数据存放在平台 PostgreSQL 的 `platform` schema：
-
-```bash
-# .env 里加上平台元数据库（建议与演示数据分开建库）
-PLATFORM_DATABASE_URL=postgres://crm:crm@localhost:5432/crm_platform
-# 登录邮件里链接使用的站点地址：生产环境必填，开发环境未配置时取请求地址
-# APP_ORIGIN=https://crm.example.com
-# 可选：Magic Link 申请限流（同一邮箱每个窗口内的次数），默认 15 分钟 5 次
-# MAGIC_LINK_RATE_LIMIT=5
-# MAGIC_LINK_RATE_WINDOW_MINUTES=15
-
-npm run db:migrate                                                      # 建表 / 升级
-npm run tenant:create -- --slug acme --name 示例商贸 --admin-email admin@acme.com   # 开通租户（带默认空间）与首个管理员
-npm run dev                                                             # 打开 /login，用管理员邮箱申请 Magic Link
-```
-
-开发环境不真正发信，登录邮件（含链接）直接输出到 `npm run dev` 的控制台；Magic Link 15 分钟内有效、只能使用一次，重新申请后旧链接作废；同一邮箱申请过于频繁会被限流（HTTP 429）。未登记的邮箱收不到链接，平台不开放注册；签发与发信在后台进行，已登记与未登记邮箱的答复内容与响应时间一致。
-
-界面使用 [shadcn/ui](https://ui.shadcn.com)（Radix + Tailwind CSS 4，`nova` 预设），组件源码在 `app/components/ui/`，配置见 `components.json`。新增组件：`npx shadcn@latest add <组件名>`；`app/components/ui/` 下是生成的代码，保持 shadcn 原样以便升级，业务样式写在页面里。
-
-#### 本地登录（获取 Magic Link）
-
-1. `npm run dev`，浏览器打开 `http://localhost:5173/login`，输入已登记的邮箱，点“发送登录链接”。
-2. 回到运行 `npm run dev` 的终端，找到下面这段输出，复制其中的链接到浏览器打开，点“登录”：
-   ```
-   ======== 邮件（开发环境，仅输出到控制台）========
-   收件人：admin@acme.com
-   ...
-   示例商贸：http://localhost:5173/auth/verify?token=xxxxxxxx
-   ```
-3. 登录后首页显示当前租户、空间与角色。
-
-注意：
-
-- 终端里有多条链接时用**最后一条**：重新申请后旧链接作废；链接 15 分钟内有效、只能用一次。
-- 同一邮箱每 15 分钟最多申请 5 次，本地调试可在 `.env` 调大 `MAGIC_LINK_RATE_LIMIT`。
-- 未登记的邮箱不会输出链接（页面答复与已登记邮箱相同）。要新增可登录的邮箱，目前只能用 `npm run tenant:create` 开通新租户并指定其管理员。
-- 同一邮箱隶属多个租户时，一封邮件里每个租户各有一条链接，选哪条就进入哪个租户。
-- `npm run start`（生产构建）下默认不允许把链接输出到日志，会直接报错；确需如此时设置 `MAILER=console`，并配置 `APP_ORIGIN`。
-
-`npm test` 运行 HTTP 接缝测试：进程内启动 React Router 服务端，背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表）。
-
----
 
 ## 3. 实测结果
 
@@ -359,12 +375,4 @@ ATTACH './data/crm_v2.duckdb' AS crm_v2 (STORAGE_VERSION 'v2.0.0');
 COPY FROM DATABASE crm TO crm_v2;
 ```
 
-## 8. 技术栈
 
-- **Framework:** [React Router](https://reactrouter.com/) v8 with SSR
-- **Language:** TypeScript 7.x
-- **Database:** PostgreSQL 17 via [Drizzle ORM](https://orm.drizzle.team/) + DuckDB 1.5
-- **Styling:** Tailwind CSS 4 + [shadcn/ui](https://ui.shadcn.com/)
-- **Testing:** [Vitest](https://vitest.dev/)
-- **Build:** [Vite](https://vite.dev/) 7
-- **Real-time:** [Ably](https://ably.com/) for live presence
