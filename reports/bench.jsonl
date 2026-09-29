@@ -97,3 +97,47 @@
 {"at":"2026-09-28T04:03:44.490Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2g. 变更流（CDC）：最后一个快照改了什么","ms":265,"rows":2}
 {"at":"2026-09-28T04:03:44.499Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2h. 合并相邻小文件","ms":9}
 {"at":"2026-09-28T04:03:44.519Z","scale":1,"target":"pg","script":"07_federation_ducklake","step":"2i. DuckLake 在对象存储上的数据文件","ms":20,"rows":1}
+{"at":"2026-09-28T23:01:06.722Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"1a. ROLLUP：城市 → 渠道，带小计和总计","ms":248,"rows":11}
+{"at":"2026-09-28T23:01:07.073Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"1b. GROUPING SETS：按城市 / 渠道 / 等级 / 全局，一条 SQL","ms":349,"rows":17}
+{"at":"2026-09-28T23:01:08.766Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"1c. CUBE：近 90 天 城市×渠道×等级 全部组合 → gold.cube_city_channel_tier","ms":739}
+{"at":"2026-09-28T23:01:14.749Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"2a. 每笔订单的近 30 天 / 近 365 天滚动消费 → gold.order_rolling","ms":5982}
+{"at":"2026-09-28T23:01:15.103Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"2b. 触发器：“30 天内第 3 单”的客户（按月）","ms":354,"rows":6}
+{"at":"2026-09-28T23:01:15.688Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"2c. 消费激增：近 30 天消费超过此前月均 3 倍","ms":584,"rows":5}
+{"at":"2026-09-28T23:01:19.336Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"3a. 准备：客户 × SKU 购买量","ms":3647}
+{"at":"2026-09-28T23:01:53.101Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"3c. 结果样例","ms":8,"rows":3}
+{"at":"2026-09-28T23:01:53.106Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"4a. 定义指标宏（存在库里，重启后仍在）","ms":3}
+{"at":"2026-09-28T23:01:53.133Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"4b. 标量宏：RFM 规则 + 客单价分档","ms":27,"rows":6}
+{"at":"2026-09-28T23:01:53.285Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"4d. 维度当参数：metrics.gmv_by('register_channel')","ms":24,"rows":5}
+{"at":"2026-09-28T23:01:53.294Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"4e. 指标目录（duckdb_functions）","ms":8,"rows":5}
+{"at":"2026-09-28T23:01:53.298Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"5a. 定义 ENUM 类型","ms":4}
+{"at":"2026-09-28T23:02:10.594Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"5c. ENUM 按定义顺序排序","ms":15,"rows":4}
+{"at":"2026-09-28T23:02:10.702Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"6a. 构造两个系统的会员表（B 表带真实答案 true_a_id，用于评估）","ms":107}
+{"at":"2026-09-28T23:02:10.702Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"6b. 标准化宏","ms":0}
+{"at":"2026-09-28T23:02:10.708Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"6c. 原始手机号精确匹配","ms":6,"rows":1}
+{"at":"2026-09-28T23:02:10.735Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"6d. 标准化手机号匹配","ms":26,"rows":1}
+{"at":"2026-09-28T23:02:15.172Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"6e. 手机号 + 姓名相似度兜底（分块）","ms":4437,"rows":1}
+{"at":"2026-09-28T23:02:15.173Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"6g. 相似度函数对中文姓名的表现","ms":1,"rows":3}
+{"at":"2026-09-28T23:03:28.519Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"7a. 会话 → 路径（string_agg + 正则折叠）→ gold.session_paths","ms":73346}
+{"at":"2026-09-28T23:03:28.653Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"7b. Top 路径","ms":133,"rows":8}
+{"at":"2026-09-28T23:03:28.876Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"7c. 正则找流失模式 + list_position","ms":222,"rows":4}
+{"at":"2026-09-28T23:03:30.558Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"7d. 步骤转移矩阵（行 = 当前，列 = 下一步）","ms":1682,"rows":6}
+{"at":"2026-09-28T23:03:32.916Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"8b. 人均指标：按行抽样有偏，按客户抽样无偏","ms":920,"rows":3}
+{"at":"2026-09-28T23:03:33.002Z","scale":1,"target":"pg","script":"09_advanced_sql","step":"8c. 固定种子，样本可复现","ms":86,"rows":1}
+{"at":"2026-09-29T00:28:07.259Z","scale":1,"target":"pg","script":"10_engineering","step":"9a. 生成服务库 ./data/serving/crm_serving_20260929002805.duckdb","ms":1586}
+{"at":"2026-09-29T00:28:15.633Z","scale":1,"target":"pg","script":"10_engineering","step":"11a. 个人信息写入加密库 data/secure/pii.duckdb","ms":78}
+{"at":"2026-09-29T00:28:15.635Z","scale":1,"target":"pg","script":"10_engineering","step":"11b. 正确密钥读取","ms":0,"rows":1}
+{"at":"2026-09-29T00:28:15.656Z","scale":1,"target":"pg","script":"10_engineering","step":"11c. 写加密 Parquet","ms":21}
+{"at":"2026-09-29T00:28:15.658Z","scale":1,"target":"pg","script":"10_engineering","step":"11d. 带密钥读取加密 Parquet","ms":0,"rows":1}
+{"at":"2026-09-29T00:28:15.659Z","scale":1,"target":"pg","script":"10_engineering","step":"11e. 脱敏宏与视图","ms":1}
+{"at":"2026-09-29T00:28:15.660Z","scale":1,"target":"pg","script":"10_engineering","step":"11f. 分析人员看到的数据","ms":1,"rows":3}
+{"at":"2026-09-29T00:28:15.664Z","scale":1,"target":"pg","script":"10_engineering","step":"12a. 读取 CSV，坏行不中断导入（store_rejects）","ms":3}
+{"at":"2026-09-29T00:28:15.665Z","scale":1,"target":"pg","script":"10_engineering","step":"  正常入库的行","ms":0,"rows":2}
+{"at":"2026-09-29T00:28:15.666Z","scale":1,"target":"pg","script":"10_engineering","step":"12b. 被隔离的坏行（reject_errors）","ms":1,"rows":3}
+{"at":"2026-09-29T00:28:15.667Z","scale":1,"target":"pg","script":"10_engineering","step":"12c. union_by_name：按列名合并，缺的列补 NULL","ms":1,"rows":2}
+{"at":"2026-09-29T00:28:18.118Z","scale":1,"target":"pg","script":"10_engineering","step":"13a. 初始化维表（2026-01-01 版本）","ms":668}
+{"at":"2026-09-29T00:28:19.020Z","scale":1,"target":"pg","script":"10_engineering","step":"13b. 两批变更后","ms":27,"rows":1}
+{"at":"2026-09-29T00:28:19.052Z","scale":1,"target":"pg","script":"10_engineering","step":"13c. 一个客户的完整历史","ms":32,"rows":3}
+{"at":"2026-09-29T00:28:19.972Z","scale":1,"target":"pg","script":"10_engineering","step":"13d. 同样的订单：按“下单时等级” vs 按“当前等级”","ms":920,"rows":4}
+{"at":"2026-09-29T00:28:24.106Z","scale":1,"target":"pg","script":"10_engineering","step":"14b. 写两份 Parquet（乱序 / 按客户排序）","ms":3832}
+{"at":"2026-09-29T00:28:24.878Z","scale":1,"target":"pg","script":"10_engineering","step":"14d. Bloom 过滤器探测：channel = 'wechat_shop'（不存在的值）","ms":228,"rows":3}
+{"at":"2026-09-29T00:28:24.879Z","scale":1,"target":"pg","script":"10_engineering","step":"14e. duckdb_memory()：内存用在哪","ms":2,"rows":5}

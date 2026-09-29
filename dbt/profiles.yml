@@ -1,0 +1,12 @@
+# dbt-duckdb 连接配置：dbt 自己的库存放模型结果；分析库以只读方式挂载为 crm
+crm:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('DBT_DB_FILE', '../data/dbt_marts.duckdb') }}"
+      threads: 2
+      attach:
+        - path: "{{ env_var('CRM_DB_FILE', '../data/crm.duckdb') }}"
+          alias: crm
+          read_only: true

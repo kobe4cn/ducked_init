@@ -17,27 +17,41 @@
     "realtime": "node --env-file=.env --import tsx src/06_realtime.ts",
     "federation": "node --env-file=.env --import tsx src/07_federation_ducklake.ts",
     "v2": "node --env-file=.env --import tsx src/08_v2_features.ts",
+    "advanced": "node --env-file=.env --import tsx src/09_advanced_sql.ts",
+    "engineering": "node --env-file=.env --import tsx src/10_engineering.ts",
+    "extensions": "node --env-file=.env --import tsx src/11_extensions.ts",
+    "lakeformats:make": "python3 scripts/make_delta_iceberg.py",
+    "wasm:build": "npm --prefix wasm install && npm --prefix wasm run build",
+    "wasm:data": "node --env-file=.env --import tsx src/lib/export-web.ts",
+    "wasm:serve": "npm --prefix wasm run serve",
+    "dbt": "cd dbt && CRM_DB_FILE=${CRM_DB_FILE:-../data/crm.duckdb} dbt build --profiles-dir .",
     "all": "npm run check && npm run seed && npm run ingest && npm run ingest:incr && npm run model && npm run crm && npm run journey && npm run realtime && npm run federation",
     "report": "node --import tsx src/report.ts"
   },
   "dependencies": {
+    "@duckdb/node-api": "1.5.5-r.5",
     "@react-router/node": "^8.4.0",
     "@react-router/serve": "^8.4.0",
+    "dotenv": "^18.0.4",
+    "drizzle-orm": "1.0.0-rc.4",
     "isbot": "^5.1.36",
+    "pg": "^8.23.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "react-router": "^8.4.0",
-    "@duckdb/node-api": "1.5.5-r.5"
+    "react-router": "^8.4.0"
   },
   "devDependencies": {
     "@react-router/dev": "^8.4.0",
     "@tailwindcss/vite": "^4.2.2",
     "@types/node": "^22",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
+    "drizzle-kit": "1.0.0-rc.4",
     "tailwindcss": "^4.2.2",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vite": "^8.0.3",
-    "tsx": "^4.23.15"
+    "vitest": "^5.0.2"
   }
 }

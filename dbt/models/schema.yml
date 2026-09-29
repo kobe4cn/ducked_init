@@ -1,0 +1,22 @@
+version: 2
+models:
+  - name: stg_paid_orders
+    columns:
+      - name: order_id
+        tests: [not_null, unique]
+      - name: net_amount
+        tests:
+          - not_null
+  - name: mart_customer_monthly
+    columns:
+      - name: customer_id
+        tests: [not_null]
+      - name: last_channel
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['app', 'mini_program', 'web', 'store']
+  - name: mart_segment_kpi
+    columns:
+      - name: segment
+        tests: [not_null, unique]

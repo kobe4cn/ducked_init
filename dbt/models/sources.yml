@@ -1,0 +1,14 @@
+version: 2
+sources:
+  - name: silver
+    database: crm            # 挂载进来的分析库
+    schema: silver
+    tables:
+      - name: orders_clean
+      - name: customers
+  - name: gold
+    database: crm
+    schema: gold
+    tables:
+      - name: rfm
+      - name: user_360

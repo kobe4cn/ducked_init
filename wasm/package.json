@@ -1,0 +1,18 @@
+{
+  "name": "crm-wasm-dashboard",
+  "description": "浏览器内的 DuckDB：直接查询 Parquet 的客户人群看板",
+  "scripts": {
+    "build": "esbuild src/app.ts --bundle --format=iife --target=es2020 --outfile=public/app.js",
+    "serve": "node serve.mjs",
+    "test": "node test.mjs"
+  },
+  "type": "module",
+  "dependencies": {
+    "@duckdb/duckdb-wasm": "^1.32.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "playwright-core": "^1.63.0"
+  },
+  "private": true
+}

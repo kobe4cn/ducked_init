@@ -12,12 +12,12 @@
 
 ## 1. 准备环境
 
-| 组件       | 要求         | 说明                                                                                     |
-| ---------- | ------------ | ---------------------------------------------------------------------------------------- |
-| Node.js    | ≥ 20.6       | 用到 `node --env-file`                                                                   |
-| PostgreSQL | 13 及以上    | 你已有的本地容器即可，需要从宿主机能连上（端口映射）                                     |
-| 对象存储   | 任意 S3 兼容 | 推荐 SeaweedFS，`docker-compose.yml` 已配好；也可 RustFS / Garage / 云上 S3 / 阿里云 OSS |
-| Docker     | 可选         | 用来启动对象存储                                                                         |
+| 组件 | 要求 | 说明 |
+|---|---|---|
+| Node.js | ≥ 20.6 | 用到 `node --env-file` |
+| PostgreSQL | 13 及以上 | 你已有的本地容器即可，需要从宿主机能连上（端口映射） |
+| 对象存储 | 任意 S3 兼容 | 推荐 SeaweedFS，`docker-compose.yml` 已配好；也可 RustFS / Garage / 云上 S3 / 阿里云 OSS |
+| Docker | 可选 | 用来启动对象存储 |
 
 DuckDB 扩展（`httpfs`、`postgres`、`ducklake`）首次使用时会从 `extensions.duckdb.org` 自动下载，不需要 npm 安装。
 内网环境见第 7 节“离线安装扩展”。
@@ -71,26 +71,36 @@ npm run all        # 按顺序跑完下面全部步骤
 npm run report     # 汇总每一步的耗时（记录在 reports/bench.jsonl）
 ```
 
-| 命令                  | 脚本                        | 做什么                                                                                                                   |
-| --------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `npm run check`       | `00_check.ts`               | 环境自检                                                                                                                 |
-| `npm run seed`        | `01_seed.ts`                | 生成数据：客户 / 订单 / 明细写入 PG；埋点 JSONL.gz、营销 CSV.gz、商品 Parquet 写入湖的 landing 区；会员 SaaS 后台库      |
-| `npm run ingest`      | `02_ingest.ts`              | 全量入湖：PG → silver 表 + bronze Parquet（按月分区）；会员接口并发分页拉取；文件 → 分区 Parquet；并在 PG 里制造一批变更 |
-| `npm run ingest:incr` | `02_ingest.ts incremental`  | 增量同步：`updated_at` 水位线，条件下推到 PG → `MERGE INTO` + CDC 批次落湖                                               |
-| `npm run model`       | `03_model.ts`               | 订单清洗、设备 → 用户身份打通、30 分钟会话切分、7 源关联的 `gold.user_360`                                               |
-| `npm run crm`         | `04_crm.ts`                 | 复购、多次消费贡献、同期群留存、RFM、CLV、流失预警、忠诚度评分、季度档位迁移、邀请裂变                                   |
-| `npm run journey`     | `05_journey.ts`             | 会话漏斗、ASOF 营销归因、购物篮提升度、向量相似推荐、五表关联 Top-N                                                      |
-| `npm run realtime`    | `06_realtime.ts`            | 微批写入 + 增量合并、并发查询、客户 360 点查、流式导出、全量重算                                                         |
-| `npm run federation`  | `07_federation_ducklake.ts` | 联邦查询（PG × 湖 × 分析库）、`postgres_query` 下推、DuckLake（元数据在 PG、数据在 S3、快照 / 时间旅行 / 变更流）        |
-| `npm run v2`          | `08_v2_features.ts`         | DuckDB 2.0 新能力（VARIANT、触发器、`$变量`、DML CTE、NEAREST、USING KEY）；需要 2.0 版 Node 驱动                        |
+| 命令 | 脚本 | 做什么 |
+|---|---|---|
+| `npm run check` | `00_check.ts` | 环境自检 |
+| `npm run seed` | `01_seed.ts` | 生成数据：客户 / 订单 / 明细写入 PG；埋点 JSONL.gz、营销 CSV.gz、商品 Parquet 写入湖的 landing 区；会员 SaaS 后台库 |
+| `npm run ingest` | `02_ingest.ts` | 全量入湖：PG → silver 表 + bronze Parquet（按月分区）；会员接口并发分页拉取；文件 → 分区 Parquet；并在 PG 里制造一批变更 |
+| `npm run ingest:incr` | `02_ingest.ts incremental` | 增量同步：`updated_at` 水位线，条件下推到 PG → `MERGE INTO` + CDC 批次落湖 |
+| `npm run model` | `03_model.ts` | 订单清洗、设备 → 用户身份打通、30 分钟会话切分、7 源关联的 `gold.user_360` |
+| `npm run crm` | `04_crm.ts` | 复购、多次消费贡献、同期群留存、RFM、CLV、流失预警、忠诚度评分、季度档位迁移、邀请裂变 |
+| `npm run journey` | `05_journey.ts` | 会话漏斗、ASOF 营销归因、购物篮提升度、向量相似推荐、五表关联 Top-N |
+| `npm run realtime` | `06_realtime.ts` | 微批写入 + 增量合并、并发查询、客户 360 点查、流式导出、全量重算 |
+| `npm run federation` | `07_federation_ducklake.ts` | 联邦查询（PG × 湖 × 分析库）、`postgres_query` 下推、DuckLake（元数据在 PG、数据在 S3、快照 / 时间旅行 / 变更流） |
+| `npm run v2` | `08_v2_features.ts` | DuckDB 2.0 新能力（VARIANT、触发器、`$变量`、DML CTE、NEAREST、USING KEY）；需要 2.0 版 Node 驱动 |
+| `npm run advanced` | `09_advanced_sql.ts` | 进阶 SQL：ROLLUP / CUBE / GROUPING SETS、RANGE 时间窗口、`arg_max(x, y, n)`、指标宏、ENUM、客户模糊匹配、行为路径、抽样 |
+| `npm run engineering` | `10_engineering.ts` | 上线必备：多进程只读 + 蓝绿切换、查询超时 / 取消 / 进度、加密与脱敏、数据质量、SCD2、性能诊断 |
+| `npm run extensions` | `11_extensions.ts` | 扩展：vss 向量索引、fts 中文全文检索、spatial 门店覆盖、excel、delta / iceberg、JS 自定义函数 |
+| `npm run wasm:data` / `wasm:build` / `wasm:serve` | `wasm/` | 浏览器里的 DuckDB：直接查询 Parquet 的客户人群看板 |
+| `npm run dbt` | `dbt/` | 用 dbt-duckdb 管理 SQL 模型：依赖、测试、增量、直接输出 Parquet |
+
+第 09–11 个脚本可以只跑其中一节：`npm run advanced -- 6`（只跑客户模糊匹配）。
+依赖关系：`engineering` 第 11 节、`extensions` 第 20 节要用到 `advanced` 第 6 节生成的 `silver.contacts_a`；
+`extensions` 第 19 节要先 `pip install deltalake pyarrow "pyiceberg[sql-sqlite]" && npm run lakeformats:make`；
+`npm run dbt` 需要 `pip install dbt-duckdb`。
 
 ### 规模怎么选
 
-| SCALE | 会员    | 订单    | 明细    | 埋点    | 建议机器      | PG 占用（估） | 湖 + 分析库（估） |
-| ----- | ------- | ------- | ------- | ------- | ------------- | ------------- | ----------------- |
-| 0.01  | 10 万   | 131 万  | 277 万  | 101 万  | 任意          | 0.5 GB        | 0.5 GB            |
-| 0.1   | 100 万  | 1310 万 | 2750 万 | 1010 万 | 4 核 8 GB     | 4 GB          | 3 GB              |
-| 1     | 1000 万 | 1.31 亿 | 2.75 亿 | 1.01 亿 | 8 核 16 GB 起 | 35–40 GB      | 25–30 GB          |
+| SCALE | 会员 | 订单 | 明细 | 埋点 | 建议机器 | PG 占用（估） | 湖 + 分析库（估） |
+|---|---|---|---|---|---|---|---|
+| 0.01 | 10 万 | 131 万 | 277 万 | 101 万 | 任意 | 0.5 GB | 0.5 GB |
+| 0.1 | 100 万 | 1310 万 | 2750 万 | 1010 万 | 4 核 8 GB | 4 GB | 3 GB |
+| 1 | 1000 万 | 1.31 亿 | 2.75 亿 | 1.01 亿 | 8 核 16 GB 起 | 35–40 GB | 25–30 GB |
 
 `SEED_TARGET=lake` 可以跳过 PG，直接生成“已从 PG 导出”的 Parquet，适合只压测湖上分析、PG 磁盘不够的情况。
 
@@ -102,55 +112,55 @@ npm run report     # 汇总每一步的耗时（记录在 reports/bench.jsonl）
 
 测试机很弱（2 核），这组数字是“下限”；8 核机器大多能快 3–4 倍。用 `SEED_TARGET=lake`（PG 磁盘不够），湖在本地磁盘。
 
-| 阶段 | 步骤                                                                      | 数据量                    | 耗时                               |
-| ---- | ------------------------------------------------------------------------- | ------------------------- | ---------------------------------- |
-| 生成 | 订单 + 明细（10 块）                                                      | 1.31 亿 + 2.75 亿         | 每块 4.5 s + 22 s，共约 4.5 分钟   |
-| 生成 | 埋点 JSONL.gz（118 天）                                                   | 1.01 亿                   | 598 s（gzip 单线程压缩为瓶颈）     |
-| 入库 | 订单 Parquet → silver                                                     | 1.31 亿                   | 39.8 s                             |
-| 入库 | 明细 Parquet → silver                                                     | 2.75 亿                   | 58.9 s                             |
-| 入湖 | 埋点 JSONL.gz → 分区 Parquet（一次性 PARTITION_BY；当前代码已改为逐天写） | 1.01 亿                   | 75.4 s                             |
-| 入湖 | 营销 CSV.gz → 分区 Parquet                                                | 5000 万                   | 29.3 s                             |
-| 入湖 | 会员接口 1000 万行（逐行 Appender）                                       | 504 页                    | 823.7 s ❌                         |
-| 入湖 | 会员接口 1000 万行（NDJSON 暂存 + read_json，当前写法）                   | 504 页                    | 77.2 s + 2.8 s ✅                  |
-| 建模 | 订单清洗                                                                  | 1.31 亿                   | 37.2 s                             |
-| 建模 | 身份打通 + 30 分钟会话切分                                                | 1.01 亿事件 → 2144 万会话 | 217.7 s                            |
-| 建模 | 品类偏好（明细 × 订单 × 商品）                                            | 2.75 亿 × 1.31 亿         | 63.4 s                             |
-| 建模 | 7 源关联 → `user_360`                                                     | 1000 万行                 | 23.2 s（宽表全部步骤合计约 110 s） |
-| 分析 | 复购分析                                                                  | 1.18 亿已付订单           | 13.3 s                             |
-| 分析 | 同期群留存                                                                |                           | 14.2 s                             |
-| 分析 | RFM / CLV / 流失预警                                                      | 850 万下单客户            | 10.8 s / 5.3 s / 8.8 s             |
-| 分析 | 忠诚度评分（7 个 percent_rank）                                           | 850 万                    | 21.4 s                             |
-| 分析 | 季度档位迁移矩阵                                                          |                           | 11.9 s                             |
-| 分析 | 邀请裂变（递归 5 层）                                                     | 1000 万客户               | 3.9 s                              |
-| 旅程 | 会话漏斗                                                                  | 2144 万会话               | 8.3 s                              |
-| 旅程 | ASOF 营销归因                                                             | 5000 万触达 × 1.18 亿订单 | 61.0 s                             |
-| 旅程 | 购物篮提升度（近 180 天）                                                 | 明细自连接                | 50.2 s                             |
-| 旅程 | 向量推荐（2000 人 × 5000 候选）                                           | 1000 万次余弦             | 17.4 s                             |
-| 旅程 | 五表关联 + 分组 Top-N                                                     |                           | 18.6 s                             |
-| 实时 | 每批 5000 条写入 / 增量合并 / 大屏查询                                    |                           | 15 ms / 12 ms / 3 ms               |
-| 实时 | 客户 360 点查（5 表关联）p50 / p95 / p99                                  | 1000 万客户               | 24 / 33 / 40 ms                    |
-| 实时 | 流式导出挽回名单                                                          | 137 万行                  | 4.2 s，Node 堆内存 20 MB           |
-| 实时 | 全量重算 RFM                                                              | 1.18 亿已付订单           | 7.8 s                              |
+| 阶段 | 步骤 | 数据量 | 耗时 |
+|---|---|---|---|
+| 生成 | 订单 + 明细（10 块） | 1.31 亿 + 2.75 亿 | 每块 4.5 s + 22 s，共约 4.5 分钟 |
+| 生成 | 埋点 JSONL.gz（118 天） | 1.01 亿 | 598 s（gzip 单线程压缩为瓶颈） |
+| 入库 | 订单 Parquet → silver | 1.31 亿 | 39.8 s |
+| 入库 | 明细 Parquet → silver | 2.75 亿 | 58.9 s |
+| 入湖 | 埋点 JSONL.gz → 分区 Parquet（一次性 PARTITION_BY；当前代码已改为逐天写） | 1.01 亿 | 75.4 s |
+| 入湖 | 营销 CSV.gz → 分区 Parquet | 5000 万 | 29.3 s |
+| 入湖 | 会员接口 1000 万行（逐行 Appender） | 504 页 | 823.7 s ❌ |
+| 入湖 | 会员接口 1000 万行（NDJSON 暂存 + read_json，当前写法） | 504 页 | 77.2 s + 2.8 s ✅ |
+| 建模 | 订单清洗 | 1.31 亿 | 37.2 s |
+| 建模 | 身份打通 + 30 分钟会话切分 | 1.01 亿事件 → 2144 万会话 | 217.7 s |
+| 建模 | 品类偏好（明细 × 订单 × 商品） | 2.75 亿 × 1.31 亿 | 63.4 s |
+| 建模 | 7 源关联 → `user_360` | 1000 万行 | 23.2 s（宽表全部步骤合计约 110 s） |
+| 分析 | 复购分析 | 1.18 亿已付订单 | 13.3 s |
+| 分析 | 同期群留存 | | 14.2 s |
+| 分析 | RFM / CLV / 流失预警 | 850 万下单客户 | 10.8 s / 5.3 s / 8.8 s |
+| 分析 | 忠诚度评分（7 个 percent_rank） | 850 万 | 21.4 s |
+| 分析 | 季度档位迁移矩阵 | | 11.9 s |
+| 分析 | 邀请裂变（递归 5 层） | 1000 万客户 | 3.9 s |
+| 旅程 | 会话漏斗 | 2144 万会话 | 8.3 s |
+| 旅程 | ASOF 营销归因 | 5000 万触达 × 1.18 亿订单 | 61.0 s |
+| 旅程 | 购物篮提升度（近 180 天） | 明细自连接 | 50.2 s |
+| 旅程 | 向量推荐（2000 人 × 5000 候选） | 1000 万次余弦 | 17.4 s |
+| 旅程 | 五表关联 + 分组 Top-N | | 18.6 s |
+| 实时 | 每批 5000 条写入 / 增量合并 / 大屏查询 | | 15 ms / 12 ms / 3 ms |
+| 实时 | 客户 360 点查（5 表关联）p50 / p95 / p99 | 1000 万客户 | 24 / 33 / 40 ms |
+| 实时 | 流式导出挽回名单 | 137 万行 | 4.2 s，Node 堆内存 20 MB |
+| 实时 | 全量重算 RFM | 1.18 亿已付订单 | 7.8 s |
 
 完整日志在 `reports/logs/`。
 
 ### 3.2 SCALE=0.1（100 万会员 / 1310 万订单），PostgreSQL 18 + S3 完整链路，同一台 2 核机器
 
-| 环节                                             | 数据量            | 耗时            | 吞吐            |
-| ------------------------------------------------ | ----------------- | --------------- | --------------- |
-| DuckDB 生成 → 写入 PG（`INSERT INTO pg.…`） 订单 | 1310 万           | 16.8 s          | 约 78 万行/秒   |
-| 同上 订单明细                                    | 2750 万           | 29.6 s          | 约 93 万行/秒   |
-| PG 建主键、索引、ANALYZE                         |                   | 35.3 s          |                 |
+| 环节 | 数据量 | 耗时 | 吞吐 |
+|---|---|---|---|
+| DuckDB 生成 → 写入 PG（`INSERT INTO pg.…`） 订单 | 1310 万 | 16.8 s | 约 78 万行/秒 |
+| 同上 订单明细 | 2750 万 | 29.6 s | 约 93 万行/秒 |
+| PG 建主键、索引、ANALYZE | | 35.3 s | |
 | PG → silver（postgres 扩展并行扫描） 订单 / 明细 | 1310 万 / 2750 万 | 10.9 s / 10.5 s | 120–260 万行/秒 |
-| silver → S3 bronze 订单快照（按月分区）          | 1310 万           | 7.1 s           |                 |
-| 会员接口（并发分页 → NDJSON → read_json）        | 100 万            | 4.4 s + 0.5 s   |                 |
-| S3 上的埋点 JSONL.gz → bronze（逐天）            | 1010 万           | 16.5 s          |                 |
-| 增量同步：拉取变更（条件下推 PG，走索引）+ MERGE | 5050 行           | 58 ms + 14 ms   |                 |
-| `user_360` 全部步骤                              | 100 万客户        | 约 9 s          |                 |
-| CRM 分析各项                                     |                   | 0.2–1.9 s       |                 |
-| 联邦查询（PG × 湖 × 分析库）                     |                   | 0.4–1.5 s       |                 |
-| DuckLake：写入 1240 万订单 / 追加 9 月订单       |                   | 5.4 s / 0.5 s   |                 |
-| DuckLake：`UPDATE` 改 0.1% 的行                  | 1.3 万行          | 99.9 s ⚠️       |                 |
+| silver → S3 bronze 订单快照（按月分区） | 1310 万 | 7.1 s | |
+| 会员接口（并发分页 → NDJSON → read_json） | 100 万 | 4.4 s + 0.5 s | |
+| S3 上的埋点 JSONL.gz → bronze（逐天） | 1010 万 | 16.5 s | |
+| 增量同步：拉取变更（条件下推 PG，走索引）+ MERGE | 5050 行 | 58 ms + 14 ms | |
+| `user_360` 全部步骤 | 100 万客户 | 约 9 s | |
+| CRM 分析各项 | | 0.2–1.9 s | |
+| 联邦查询（PG × 湖 × 分析库） | | 0.4–1.5 s | |
+| DuckLake：写入 1240 万订单 / 追加 9 月订单 | | 5.4 s / 0.5 s | |
+| DuckLake：`UPDATE` 改 0.1% 的行 | 1.3 万行 | 99.9 s ⚠️ | |
 
 按这个吞吐估算，`SCALE=1` 写入 PG 大约需要：订单 3 分钟、明细 5 分钟、建索引 6 分钟左右（与磁盘性能强相关）。
 DuckLake 的 `UPDATE` 会重写受影响的数据文件，在大表上批量改少量行代价高；湖仓表尽量以追加、按分区覆盖为主，
@@ -174,17 +184,43 @@ DuckLake 的 `UPDATE` 会重写受影响的数据文件，在大表上批量改�
 
 ---
 
+### 3.4 进阶能力实测（SCALE=0.1：100 万会员 / 1313 万订单 / 2751 万明细 / 1012 万埋点）
+
+| 能力 | 场景 | 结果 |
+|---|---|---|
+| GROUPING SETS | 看板 4 个切面 | 4 条 SQL 627 ms → 1 条 349 ms |
+| RANGE 时间窗口 | 1170 万订单的近 30 天 / 365 天滚动消费 | 7.1 s |
+| `arg_max(x, y, n)` | 每客户 Top 3 SKU（2446 万行） | 窗口函数 6.8 s → 3.0 s |
+| ENUM | 1274 万行订单宽表 | 分组 188 → 67 ms，排序 7.6 → 2.0 s |
+| 客户模糊匹配 | 6 万 × 20 万会员合并 | 召回率 50% → 98.3%，准确率 100% |
+| 行为路径 | 1012 万事件 → 212 万会话路径 | 18.7 s |
+| 抽样 | 人均订单（全量 14.07） | 按行抽样 1.33 ❌，按客户抽样 13.67 ✅ |
+| 多进程只读 | 4 进程客户画像点查 | p50 约 5.4 ms，合计约 604 QPS |
+| 查询超时 | 1 秒超时 | 1002 ms 取消，连接可继续使用 |
+| SCD2 | 按下单时等级 vs 当前等级 | 黑金 GMV 被高估 9700 万 |
+| Parquet 排序写入 | 查一个客户 | 需读行组 104 → 1，22.3 → 4.5 ms，文件小 17% |
+| HNSW 向量索引 | 30 万 / 100 万 × 32 维 | 暴力 14 / 35 ms → 索引约 2.2 ms；建索引 67 / 401 s，Recall 1.0 / 0.8 |
+| 中文全文检索 | 20 万工单（二元切分） | 建索引 5.1 s，查询约 0.2 s |
+| 就近门店 | 20 万客户 × 同城门店 | 0.64 s |
+| JS 自定义函数 | 20 万行 | 124 ms（同逻辑 SQL 宏 20 ms） |
+| DuckDB-Wasm | 83 万客户，浏览器内切换城市重新聚合 | 0.3 s（测试环境读 CSV，见说明） |
+| dbt | 4 模型 + 7 测试 | 全量 4.2 s，增量 3.3 s |
+
+完整日志：`reports/logs/scale01_advanced_engineering_extensions.log`。
+
+---
+
 ## 4. 对象存储选型（MinIO 社区版已停止维护）
 
 MinIO 社区版 2025 年 5 月移除了管理控制台，2025 年 12 月进入维护模式，2026 年 4 月仓库归档为只读。
 本地开发和自建环境可以用下面这些替代：
 
-| 方案                  | 许可证     | 特点                                                            | 适合                        |
-| --------------------- | ---------- | --------------------------------------------------------------- | --------------------------- |
-| **SeaweedFS**（默认） | Apache-2.0 | 成熟、分布式、小文件多时表现好；Kubeflow 已把默认对象存储换成它 | 本地开发 → 生产都可以       |
-| **RustFS**            | Apache-2.0 | 用法和控制台最接近 MinIO，迁移成本低；项目较新                  | 从 MinIO 迁过来、想要控制台 |
-| **Garage**            | AGPL-3.0   | 很轻量，适合多地点小集群；首次需要配置布局（layout）            | 边缘、多机房小规模部署      |
-| 云上 S3 / 阿里云 OSS  | 商业       | 免运维                                                          | 生产                        |
+| 方案 | 许可证 | 特点 | 适合 |
+|---|---|---|---|
+| **SeaweedFS**（默认） | Apache-2.0 | 成熟、分布式、小文件多时表现好；Kubeflow 已把默认对象存储换成它 | 本地开发 → 生产都可以 |
+| **RustFS** | Apache-2.0 | 用法和控制台最接近 MinIO，迁移成本低；项目较新 | 从 MinIO 迁过来、想要控制台 |
+| **Garage** | AGPL-3.0 | 很轻量，适合多地点小集群；首次需要配置布局（layout） | 边缘、多机房小规模部署 |
+| 云上 S3 / 阿里云 OSS | 商业 | 免运维 | 生产 |
 
 切换只需要改 `.env`：
 
@@ -232,9 +268,14 @@ src/
 ├── lib/
 │   ├── config.ts        读取 .env，规模参数
 │   ├── duck.ts          DuckDB 实例、扩展 / 密钥 / PG 挂载（实例级只初始化一次）、计时与记录
-│   └── mock-api.ts      模拟会员 SaaS 的分页接口（游标分页，不用 OFFSET）
+│   ├── mock-api.ts      模拟会员 SaaS 的分页接口（游标分页，不用 OFFSET）
+│   └── reader-worker.ts 只读查询子进程（多进程并发示例）
 ├── 00_check.ts … 08_v2_features.ts
+├── 09_advanced_sql.ts / 10_engineering.ts / 11_extensions.ts
 └── report.ts            汇总 reports/bench.jsonl
+scripts/make_delta_iceberg.py  生成 Delta / Iceberg 测试表
+wasm/                    DuckDB-Wasm 浏览器看板（src/app.ts、serve.mjs、test.mjs）
+dbt/                     dbt-duckdb 项目（profiles.yml、models/、macros/）
 docker-compose.yml       SeaweedFS（默认）/ RustFS / PostgreSQL（可选）
 docker/seaweedfs/s3.json SeaweedFS 的访问密钥配置
 .env.example             全部配置项
@@ -243,6 +284,14 @@ docker/seaweedfs/s3.json SeaweedFS 的访问密钥配置
 ---
 
 ## 7. 常见问题
+
+**DuckDB-Wasm 页面在内网打不开 Parquet**：浏览器里读 Parquet 需要 parquet 扩展，默认从 extensions.duckdb.org 下载。
+内网部署时把对应版本的 `*.duckdb_extension.wasm` 放到自己的静态服务器上，访问页面时加 `?ext_repo=https://你的地址`。
+没有扩展时也可以先用 CSV 验证：`?file=customers_web.csv`。
+
+**HNSW 索引持久化**：`vss` 扩展把索引写进磁盘库目前是实验功能（需要 `SET hnsw_enable_experimental_persistence = true`）。
+示例把索引放在内存库里，服务启动时重建；百万级以内优先考虑暴力计算。
+
 
 **扩展下载失败 / 内网环境**：DuckDB 扩展也发布在 PyPI 上，可以在能联网的机器下载后拷贝：
 

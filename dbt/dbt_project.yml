@@ -1,0 +1,15 @@
+# dbt 管理 SQL 模型：依赖顺序、测试、文档、增量
+name: crm_marts
+version: "1.0.0"
+profile: crm
+model-paths: ["models"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  crm_marts:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

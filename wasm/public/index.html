@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>客户人群看板（DuckDB-Wasm）</title>
+  <style>
+    body { font: 15px/1.6 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 24px; color: #15212a; }
+    table { border-collapse: collapse; margin-top: 12px; }
+    th, td { border-bottom: 1px solid #d6dddb; padding: 6px 14px; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    #log { background: #0f1a20; color: #d6e2e4; padding: 10px 14px; border-radius: 6px; font: 12px/1.6 ui-monospace, monospace; }
+    #timing { color: #1d6a71; margin-left: 12px; }
+  </style>
+</head>
+<body>
+  <h2>客户人群看板</h2>
+  <p>数据是服务端导出的一个 Parquet 文件；筛选和聚合全部在你的浏览器里由 DuckDB-Wasm 完成，服务端不参与计算。</p>
+  <label>城市：<select id="city"></select></label><span id="timing"></span>
+  <table id="result"></table>
+  <h3>运行日志</h3>
+  <pre id="log"></pre>
+  <script src="/app.js"></script>
+</body>
+</html>
