@@ -113,13 +113,16 @@ npm run report     # 汇总每一步的耗时（记录在 reports/bench.jsonl）
 PLATFORM_DATABASE_URL=postgres://crm:crm@localhost:5432/crm_platform
 # 登录邮件里链接使用的站点地址：生产环境必填，开发环境未配置时取请求地址
 # APP_ORIGIN=https://crm.example.com
+# 可选：Magic Link 申请限流（同一邮箱每个窗口内的次数），默认 15 分钟 5 次
+# MAGIC_LINK_RATE_LIMIT=5
+# MAGIC_LINK_RATE_WINDOW_MINUTES=15
 
 npm run db:migrate                                                      # 建表 / 升级
 npm run tenant:create -- --slug acme --name 示例商贸 --admin-email admin@acme.com   # 开通租户（带默认空间）与首个管理员
 npm run dev                                                             # 打开 /login，用管理员邮箱申请 Magic Link
 ```
 
-开发环境不真正发信，登录邮件（含链接）直接输出到 `npm run dev` 的控制台；Magic Link 15 分钟内有效、只能使用一次，未登记的邮箱收不到链接，平台不开放注册。
+开发环境不真正发信，登录邮件（含链接）直接输出到 `npm run dev` 的控制台；Magic Link 15 分钟内有效、只能使用一次，重新申请后旧链接作废；同一邮箱申请过于频繁会被限流（HTTP 429）。未登记的邮箱收不到链接，平台不开放注册；签发与发信在后台进行，已登记与未登记邮箱的答复内容与响应时间一致。
 
 `npm test` 运行 HTTP 接缝测试：进程内启动 React Router 服务端，背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表）。
 

@@ -1,4 +1,4 @@
-// 用法：npm run tenant:create -- --slug acme --name "示例商贸" --admin-email admin@acme.com
+// scripts/create-tenant.ts —— 用法：npm run tenant:create -- --slug acme --name "示例商贸" --admin-email admin@acme.com
 // 运营者开通租户：自动创建默认空间与首个管理员（管理员随后用该邮箱通过 Magic Link 登录）
 import { parseArgs } from 'node:util';
 import { closeDb } from '../app/.server/db/client';

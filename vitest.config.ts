@@ -1,3 +1,4 @@
+// vitest.config.ts —— 测试配置
 import { defineConfig } from 'vitest/config';
 
 // 测试用平台 PG（独立的库，测试会清表）。写进 process.env 使 globalSetup 与被测服务都能读到

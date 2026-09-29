@@ -1,11 +1,12 @@
-import { redirect } from "react-router";
-import type { Route } from "./+types/logout";
-import { logout } from "~/.server/auth";
+// app/routes/logout.tsx —— 退出登录
+import { redirect } from 'react-router';
+import type { Route } from './+types/logout';
+import { logout } from '~/.server/auth';
 
 export async function loader() {
-  throw redirect("/");
+  throw redirect('/');
 }
 
 export async function action({ request }: Route.ActionArgs) {
-  throw redirect("/login", { headers: { "Set-Cookie": await logout(request) } });
+  throw redirect('/login', { headers: { 'Set-Cookie': await logout(request) } });
 }

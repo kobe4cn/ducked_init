@@ -11,10 +11,12 @@ export type { Mail };
 export interface TestApp {
   /** 发出的邮件（替换了默认的控制台邮件） */
   outbox: Mail[];
-  /** 恢复默认邮件实现（开发环境：输出到控制台） */
-  useDefaultMailer(): Promise<void>;
+  /** 替换发信实现；传 undefined 恢复默认（开发环境：输出到控制台） */
+  setMailer(mailer: { send(m: Mail): Promise<void> } | undefined): void;
   /** 重新把邮件收进 outbox */
-  useTestMailer(): Promise<void>;
+  useTestMailer(): void;
+  /** 等待后台任务（签发链接、发信）全部完成 */
+  drain(): Promise<void>;
   client(): Client;
   close(): Promise<void>;
 }
@@ -57,16 +59,19 @@ export async function startApp(): Promise<TestApp> {
   const handler = createRequestHandler(build, 'development');
   const mailer = await vite.ssrLoadModule('/app/.server/mailer.ts');
   const db = await vite.ssrLoadModule('/app/.server/db/client.ts');
+  const background = await vite.ssrLoadModule('/app/.server/background.ts');
   const outbox: Mail[] = [];
   const testMailer = { async send(m: Mail) { outbox.push(m); } };
   mailer.setMailer(testMailer);
 
   return {
     outbox,
-    async useDefaultMailer() { mailer.setMailer(undefined); },
-    async useTestMailer() { mailer.setMailer(testMailer); },
+    setMailer: m => mailer.setMailer(m),
+    useTestMailer: () => mailer.setMailer(testMailer),
+    drain: () => background.drain(),
     client: () => new Client(req => handler(req)),
     async close() {
+      await background.drain();
       await db.closeDb();
       await vite.close();
     },
@@ -77,7 +82,7 @@ export async function startApp(): Promise<TestApp> {
 export async function resetDb() {
   const client = new pg.Client({ connectionString: process.env.PLATFORM_DATABASE_URL });
   await client.connect();
-  await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions CASCADE');
+  await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests CASCADE');
   await client.end();
 }
 

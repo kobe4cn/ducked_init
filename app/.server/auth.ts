@@ -1,17 +1,24 @@
 // app/.server/auth.ts —— 成员登录：Magic Link（一次性、短时有效、仅限已登记邮箱）与会话
 import { createHash, randomBytes } from 'node:crypto';
-import { and, eq, gt, isNull } from 'drizzle-orm';
+import { and, eq, gt, inArray, isNull, lte } from 'drizzle-orm';
 import { createCookie, redirect } from 'react-router';
 import { getDb } from './db/client';
-import { magicLinks, members, sessions, spaces, tenants, type Role } from './db/schema';
-import { getMailer } from './mailer';
+import { magicLinkRequests, magicLinks, members, sessions, spaces, tenants, type Role } from './db/schema';
+import { runInBackground } from './background';
+import { getMailer, type Mailer } from './mailer';
 import { normalizeEmail } from './tenants';
 
 export const MAGIC_LINK_TTL_MS = 15 * 60 * 1000;
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// 限流：同一邮箱在时间窗口内最多申请若干次（环境变量可调）
+const rateLimit = () => ({
+  max: Number(process.env.MAGIC_LINK_RATE_LIMIT ?? 5),
+  windowMs: Number(process.env.MAGIC_LINK_RATE_WINDOW_MINUTES ?? 15) * 60 * 1000,
+});
+
 const newToken = () => randomBytes(32).toString('base64url');
-const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
+const sha256 = (token: string) => createHash('sha256').update(token).digest('hex');
 
 const sessionCookie = createCookie('crm_session', {
   httpOnly: true,
@@ -27,17 +34,49 @@ function linkOrigin(requestOrigin: string) {
   return requestOrigin;
 }
 
+export type MagicLinkRequestResult = { ok: true } | { ok: false; retryAfterSeconds: number };
+
 /**
- * 为邮箱签发 Magic Link。未登记的邮箱静默忽略（不注册、不发信，也不向请求方透露邮箱是否存在）。
- * 同一邮箱隶属多个租户时，一封邮件里给出每个租户各自的链接。
+ * 申请 Magic Link。请求路径上只做与邮箱是否登记无关的工作（校验配置、限流），
+ * 查成员、签发与发信都放到后台：已登记与未登记邮箱的答复内容和响应时间都一样，无法据此探测成员邮箱。
+ * 未登记的邮箱不注册、不发信。
  * 链接的站点地址取 APP_ORIGIN；生产环境必须配置，否则伪造 Host 头就能让链接指向攻击者站点。
  */
-export async function requestMagicLink(rawEmail: string, requestOrigin: string) {
+export async function requestMagicLink(rawEmail: string, requestOrigin: string): Promise<MagicLinkRequestResult> {
   const base = linkOrigin(requestOrigin);
-  // 先取发信实现：配置缺失时无论邮箱是否登记都同样失败，不泄露邮箱是否存在
   const mailer = getMailer();
   const email = normalizeEmail(rawEmail);
-  if (!email) return;
+  if (!email) return { ok: true };
+
+  const retryAfterSeconds = await recordRequest(email);
+  if (retryAfterSeconds) return { ok: false, retryAfterSeconds };
+
+  runInBackground('签发 Magic Link', () => issueMagicLinks(email, base, mailer));
+  return { ok: true };
+}
+
+/** 记下这次申请；超过频率上限时返回需要等待的秒数 */
+async function recordRequest(email: string): Promise<number> {
+  const db = getDb();
+  const { max, windowMs } = rateLimit();
+  const emailHash = sha256(email);
+  const since = new Date(Date.now() - windowMs);
+  await db.delete(magicLinkRequests).where(and(eq(magicLinkRequests.emailHash, emailHash), lte(magicLinkRequests.createdAt, since)));
+  const recent = await db
+    .select({ createdAt: magicLinkRequests.createdAt })
+    .from(magicLinkRequests)
+    .where(eq(magicLinkRequests.emailHash, emailHash))
+    .orderBy(magicLinkRequests.createdAt);
+  if (recent.length >= max) return Math.max(1, Math.ceil((recent[0].createdAt.getTime() + windowMs - Date.now()) / 1000));
+  await db.insert(magicLinkRequests).values({ emailHash, createdAt: new Date() });
+  return 0;
+}
+
+/**
+ * 为已登记邮箱签发链接：该成员此前未使用的链接一律作废，只有最新一封邮件里的链接有效。
+ * 同一邮箱隶属多个租户时，一封邮件里给出每个租户各自的链接。
+ */
+async function issueMagicLinks(email: string, base: string, mailer: Mailer) {
   const db = getDb();
   const rows = await db
     .select({ memberId: members.id, tenantName: tenants.name })
@@ -48,14 +87,17 @@ export async function requestMagicLink(rawEmail: string, requestOrigin: string) 
 
   const expiresAt = new Date(Date.now() + MAGIC_LINK_TTL_MS);
   const links = rows.map(r => ({ ...r, token: newToken() }));
-  await db.insert(magicLinks).values(links.map(l => ({ memberId: l.memberId, tokenHash: hashToken(l.token), expiresAt })));
+  await db.transaction(async tx => {
+    await tx.delete(magicLinks).where(and(inArray(magicLinks.memberId, rows.map(r => r.memberId)), isNull(magicLinks.usedAt)));
+    await tx.insert(magicLinks).values(links.map(l => ({ memberId: l.memberId, tokenHash: sha256(l.token), expiresAt })));
+  });
 
   const lines = links.map(l => `${l.tenantName}：${new URL(`/auth/verify?token=${l.token}`, base)}`);
   await mailer.send({
     to: email,
     subject: '登录 CRM 数据分析平台',
     text: [
-      `点击下面的链接登录（${MAGIC_LINK_TTL_MS / 60_000} 分钟内有效，只能使用一次）：`,
+      `点击下面的链接登录（${MAGIC_LINK_TTL_MS / 60_000} 分钟内有效，只能使用一次；重新申请后旧链接作废）：`,
       '',
       ...lines,
       '',
@@ -72,14 +114,14 @@ export async function consumeMagicLink(token: string): Promise<string | null> {
   const [link] = await db
     .update(magicLinks)
     .set({ usedAt: now })
-    .where(and(eq(magicLinks.tokenHash, hashToken(token)), isNull(magicLinks.usedAt), gt(magicLinks.expiresAt, now)))
+    .where(and(eq(magicLinks.tokenHash, sha256(token)), isNull(magicLinks.usedAt), gt(magicLinks.expiresAt, now)))
     .returning({ memberId: magicLinks.memberId });
   if (!link) return null;
 
   const sessionToken = newToken();
   await db.insert(sessions).values({
     memberId: link.memberId,
-    tokenHash: hashToken(sessionToken),
+    tokenHash: sha256(sessionToken),
     expiresAt: new Date(now.getTime() + SESSION_TTL_MS),
   });
   return sessionCookie.serialize(sessionToken);
@@ -114,7 +156,7 @@ export async function getCurrentMember(request: Request): Promise<CurrentMember 
     .innerJoin(members, eq(members.id, sessions.memberId))
     .innerJoin(tenants, eq(tenants.id, members.tenantId))
     .innerJoin(spaces, and(eq(spaces.tenantId, tenants.id), eq(spaces.isDefault, true)))
-    .where(and(eq(sessions.tokenHash, hashToken(token)), gt(sessions.expiresAt, new Date())));
+    .where(and(eq(sessions.tokenHash, sha256(token)), gt(sessions.expiresAt, new Date())));
   return row ?? null;
 }
 
@@ -128,6 +170,6 @@ export async function requireMember(request: Request): Promise<CurrentMember> {
 /** 注销：删除会话并清除 cookie，返回 Set-Cookie 头 */
 export async function logout(request: Request): Promise<string> {
   const token = await readSessionToken(request);
-  if (token) await getDb().delete(sessions).where(eq(sessions.tokenHash, hashToken(token)));
+  if (token) await getDb().delete(sessions).where(eq(sessions.tokenHash, sha256(token)));
   return sessionCookie.serialize('', { maxAge: 0 });
 }

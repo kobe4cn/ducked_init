@@ -1,10 +1,11 @@
-import { Form } from "react-router";
-import type { Route } from "./+types/home";
-import { requireMember } from "~/.server/auth";
-import { ROLE_LABELS } from "~/.server/db/schema";
+// app/routes/home.tsx —— 首页：显示当前租户、空间与成员角色（需登录）
+import { Form } from 'react-router';
+import type { Route } from './+types/home';
+import { requireMember } from '~/.server/auth';
+import { ROLE_LABELS } from '~/.server/db/schema';
 
 export function meta({}: Route.MetaArgs) {
-  return [{ title: "CRM 数据分析平台" }];
+  return [{ title: 'CRM 数据分析平台' }];
 }
 
 export async function loader({ request }: Route.LoaderArgs) {

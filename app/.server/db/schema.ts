@@ -58,6 +58,13 @@ export const magicLinks = platform.table('magic_links', {
   createdAt: createdAt(),
 });
 
+// Magic Link 申请记录：用于按邮箱限流。已登记与未登记邮箱一视同仁地记录，邮箱只存哈希（未登记的是陌生人的信息）
+export const magicLinkRequests = platform.table('magic_link_requests', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  emailHash: text('email_hash').notNull(),
+  createdAt: createdAt(),
+}, t => [index('magic_link_requests_email_idx').on(t.emailHash, t.createdAt)]);
+
 // 会话：cookie 里放随机令牌，库里只存哈希；成员被删除时级联失效
 export const sessions = platform.table('sessions', {
   id: uuid('id').primaryKey().defaultRandom(),
