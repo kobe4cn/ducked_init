@@ -2,7 +2,7 @@
 //   ⑮ vss：HNSW 向量索引（百万级商品相似检索）   ⑯ fts：客服工单全文检索（中文二元分词）
 //   ⑰ spatial：客户到门店距离、就近分配、商圈覆盖  ⑱ excel：读写 xlsx
 //   ⑲ delta / iceberg：读取其他湖格式               ⑳ JS 自定义函数（Node 驱动）
-// 运行：npm run extensions（Delta / Iceberg 示例需要先运行 scripts/make_delta_iceberg.py 生成测试表）
+// 运行：pnpm extensions（Delta / Iceberg 示例需要先运行 scripts/make_delta_iceberg.py 生成测试表）
 import { existsSync, rmSync, statSync } from 'node:fs';
 import { DuckDBScalarFunction, VARCHAR } from '@duckdb/node-api';
 import { connect, exec, q, show } from './lib/duck';
@@ -209,7 +209,7 @@ if (part(20)) {
     },
   }));
   if (!(await q<any>(con, `SELECT 1 FROM duckdb_tables() WHERE schema_name = 'silver' AND table_name = 'contacts_a'`)).length)
-    throw new Error('请先运行 npm run advanced -- 6 生成 contacts_a');
+    throw new Error('请先运行 pnpm advanced 6 生成 contacts_a');
 
   let t = performance.now();
   const byJs = await q<any>(con, `SELECT phone_carrier(phone) AS 运营商, count(*) AS 人数 FROM silver.contacts_a GROUP BY ALL ORDER BY 1`);

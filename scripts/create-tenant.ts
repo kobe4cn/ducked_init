@@ -1,4 +1,4 @@
-// scripts/create-tenant.ts —— 用法：npm run tenant:create -- --slug acme --name "示例商贸" --admin-email admin@acme.com
+// scripts/create-tenant.ts —— 用法：pnpm tenant:create --slug acme --name "示例商贸" --admin-email admin@acme.com
 // 运营者开通租户：自动创建默认空间、首个管理员与数据湖（管理员随后用该邮箱通过 Magic Link 登录）。与运营后台调用同一个领域函数
 import { parseArgs } from 'node:util';
 import { closeDb } from '../app/.server/db/client';
@@ -14,7 +14,7 @@ const { values } = parseArgs({
 });
 
 if (!values.slug || !values.name || !values['admin-email']) {
-  console.error('用法：npm run tenant:create -- --slug <租户标识> --name <租户名称> --admin-email <管理员邮箱>');
+  console.error('用法：pnpm tenant:create --slug <租户标识> --name <租户名称> --admin-email <管理员邮箱>');
   process.exit(2);
 }
 

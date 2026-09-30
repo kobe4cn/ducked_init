@@ -2,6 +2,7 @@
   "name": "duckdb_crm",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@12.5.1",
   "scripts": {
     "build": "react-router build",
     "dev": "react-router dev",
@@ -29,11 +30,11 @@
     "engineering": "node --env-file=.env --import tsx src/10_engineering.ts",
     "extensions": "node --env-file=.env --import tsx src/11_extensions.ts",
     "lakeformats:make": "python3 scripts/make_delta_iceberg.py",
-    "wasm:build": "npm --prefix wasm install && npm --prefix wasm run build",
+    "wasm:build": "pnpm --dir wasm install && pnpm --dir wasm run build",
     "wasm:data": "node --env-file=.env --import tsx src/lib/export-web.ts",
-    "wasm:serve": "npm --prefix wasm run serve",
+    "wasm:serve": "pnpm --dir wasm run serve",
     "dbt": "cd dbt && CRM_DB_FILE=${CRM_DB_FILE:-../data/crm.duckdb} dbt build --profiles-dir .",
-    "all": "npm run check && npm run seed && npm run ingest && npm run ingest:incr && npm run model && npm run crm && npm run journey && npm run realtime && npm run federation",
+    "all": "pnpm check && pnpm seed && pnpm ingest && pnpm ingest:incr && pnpm model && pnpm crm && pnpm journey && pnpm realtime && pnpm federation",
     "report": "node --import tsx src/report.ts"
   },
   "dependencies": {

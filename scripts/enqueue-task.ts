@@ -1,4 +1,4 @@
-// scripts/enqueue-task.ts —— 用法：npm run task:enqueue -- --tenant acme --kind demo.seed --params '{"customers":1000}'
+// scripts/enqueue-task.ts —— 用法：pnpm task:enqueue --tenant acme --kind demo.seed --params '{"customers":1000}'
 // 为某个租户提交一个任务（由调度器派发执行）。任务类型见 app/.server/pipeline/handlers.ts
 import { parseArgs } from 'node:util';
 import { closeDb } from '../app/.server/db/client';
@@ -14,7 +14,7 @@ const { values } = parseArgs({
 });
 
 if (!values.tenant || !values.kind) {
-  console.error('用法：npm run task:enqueue -- --tenant <租户标识> --kind <任务类型> [--params <JSON>]');
+  console.error('用法：pnpm task:enqueue --tenant <租户标识> --kind <任务类型> [--params <JSON>]');
   process.exit(2);
 }
 

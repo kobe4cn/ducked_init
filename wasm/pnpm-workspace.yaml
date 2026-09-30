@@ -1,0 +1,3 @@
+# wasm/ 是独立项目，不属于根目录的 pnpm workspace
+allowBuilds:
+  esbuild: true

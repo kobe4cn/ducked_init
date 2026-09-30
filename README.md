@@ -20,23 +20,23 @@ PLATFORM_DATABASE_URL=postgres://crm:crm@localhost:5432/crm_platform
 # 调度器所在机器同时运行的工作进程上限，默认 4
 # PLATFORM_MAX_WORKERS=4
 
-npm run db:migrate                                                      # 建表 / 升级
-npm run tenant:create -- --slug acme --name 示例商贸 --admin-email admin@acme.com   # 开通租户（带默认空间）与首个管理员
-npm run operator:create -- --email ops@example.com                     # 新增运营者（只能用这条命令）
-npm run operator:reset-totp -- --email ops@example.com                 # 运营者丢失认证器时重置 TOTP
-npm run dispatcher                                                      # 常驻调度器：派发任务队列（另开一个终端）
-npm run task:enqueue -- --tenant acme --kind demo.seed --params '{"customers":1000}'  # 为租户生成演示数据
-npm run dev                                                             # 打开 /login，用管理员邮箱申请 Magic Link
+pnpm db:migrate                                   # 建表 / 升级
+pnpm tenant:create --slug acme --name 示例商贸 --admin-email admin@acme.com  # 开通租户（带默认空间）与首个管理员
+pnpm operator:create --email ops@example.com      # 新增运营者（只能用这条命令）
+pnpm operator:reset-totp --email ops@example.com  # 运营者丢失认证器时重置 TOTP
+pnpm dispatcher                                   # 常驻调度器：派发任务队列（另开一个终端）
+pnpm task:enqueue --tenant acme --kind demo.seed --params '{"customers":1000}'  # 为租户生成演示数据
+pnpm dev                                          # 打开 /login，用管理员邮箱申请 Magic Link
 ```
 
-开发环境不真正发信，登录邮件（含链接）直接输出到 `npm run dev` 的控制台；Magic Link 15 分钟内有效、只能使用一次，重新申请后旧链接作废；同一邮箱申请过于频繁会被限流（HTTP 429）。未登记的邮箱收不到链接，平台不开放注册；签发与发信在后台进行，已登记与未登记邮箱的答复内容与响应时间一致。
+开发环境不真正发信，登录邮件（含链接）直接输出到 `pnpm dev` 的控制台；Magic Link 15 分钟内有效、只能使用一次，重新申请后旧链接作废；同一邮箱申请过于频繁会被限流（HTTP 429）。未登记的邮箱收不到链接，平台不开放注册；签发与发信在后台进行，已登记与未登记邮箱的答复内容与响应时间一致。
 
-界面使用 [shadcn/ui](https://ui.shadcn.com)（Radix + Tailwind CSS 4，`nova` 预设），组件源码在 `app/components/ui/`，配置见 `components.json`。新增组件：`npx shadcn@latest add <组件名>`；`app/components/ui/` 下是生成的代码，保持 shadcn 原样以便升级，业务样式写在页面里。
+界面使用 [shadcn/ui](https://ui.shadcn.com)（Radix + Tailwind CSS 4，`nova` 预设），组件源码在 `app/components/ui/`，配置见 `components.json`。新增组件：`pnpm dlx shadcn@latest add <组件名>`；`app/components/ui/` 下是生成的代码，保持 shadcn 原样以便升级，业务样式写在页面里。
 
 #### 本地登录（获取 Magic Link）
 
-1. `npm run dev`，浏览器打开 `http://localhost:5173/login`，输入已登记的邮箱，点“发送登录链接”。
-2. 回到运行 `npm run dev` 的终端，找到下面这段输出，复制其中的链接到浏览器打开，点“登录”：
+1. `pnpm dev`，浏览器打开 `http://localhost:5173/login`，输入已登记的邮箱，点“发送登录链接”。
+2. 回到运行 `pnpm dev` 的终端，找到下面这段输出，复制其中的链接到浏览器打开，点“登录”：
    ```
    ======== 邮件（开发环境，仅输出到控制台）========
    收件人：admin@acme.com
@@ -51,7 +51,7 @@ npm run dev                                                             # 打开
 - 同一邮箱每 15 分钟最多申请 5 次，本地调试可在 `.env` 调大 `MAGIC_LINK_RATE_LIMIT`。
 - 未登记的邮箱不会输出链接（页面答复与已登记邮箱相同）。要新增可登录的邮箱，由租户管理员在“成员”页邀请（邀请邮件同样输出到控制台）。
 - 同一邮箱隶属多个租户时，一封邮件里每个租户各有一条链接，选哪条就进入哪个租户。
-- `npm run start`（生产构建）下默认不允许把链接输出到日志，会直接报错；确需如此时设置 `MAILER=console`，并配置 `APP_ORIGIN`。
+- `pnpm start`（生产构建）下默认不允许把链接输出到日志，会直接报错；确需如此时设置 `MAILER=console`，并配置 `APP_ORIGIN`。
 
 #### 成员与权限
 
@@ -63,9 +63,9 @@ npm run dev                                                             # 打开
 
 运营者是独立于成员的身份（ADR-0007）：独立的 `operators` 表、登录入口 `/ops/login`、会话 cookie `crm_ops_session`（8 小时）。成员会话不能访问 `/ops`，运营者会话也不能访问成员页面。
 
-- 运营者只能在服务器上用 `npm run operator:create -- --email ...` 创建；后台没有新增或停用运营者的入口。
+- 运营者只能在服务器上用 `pnpm operator:create --email ...` 创建；后台没有新增或停用运营者的入口。
 - 登录：`/ops/login` 申请 Magic Link（邮件同样输出到控制台，链接为 `/ops/auth/verify?token=...`）→ 输入 TOTP 验证码。首次登录时绑定 TOTP：页面展示二维码（服务端生成，用认证器 App 扫描）与可手动输入的密钥，确认一次验证码即完成绑定。同一个验证码只能用一次；连续输错 5 次需重新申请登录链接。
-- 运营者丢失认证器时，在服务器上执行 `npm run operator:reset-totp -- --email ...`：清除其 TOTP 绑定，作废其全部会话（含待验证的）与未使用的登录链接，并在 `/ops/audit` 记一条“重置 TOTP”。该运营者下次登录时重新走首次绑定。**重置后、本人完成绑定前，谁拿到下一封登录链接谁就能完成绑定**（ADR-0007），执行后应尽快通知运营者本人登录并完成绑定。
+- 运营者丢失认证器时，在服务器上执行 `pnpm operator:reset-totp --email ...`：清除其 TOTP 绑定，作废其全部会话（含待验证的）与未使用的登录链接，并在 `/ops/audit` 记一条“重置 TOTP”。该运营者下次登录时重新走首次绑定。**重置后、本人完成绑定前，谁拿到下一封登录链接谁就能完成绑定**（ADR-0007），执行后应尽快通知运营者本人登录并完成绑定。
 - `/ops` 列出租户（名称、标识、开通时间、状态、成员数、管理员邮箱）并开通租户；进入租户可改名、指定管理员（提升已有成员或新增管理员邮箱，用于管理员邮箱失效时的恢复；停用期间不可指定）、停用与恢复。运营者看不到成员名单与业务数据，也没有进入租户的入口。
 - 停用租户必须填写原因：该租户成员的会话与未使用的登录链接立即作废，之后申请登录也不会签发该租户的链接（页面答复不变；同一邮箱属于其他正常租户时，邮件里只有那些租户的链接）。数据完整保留，运行中的任务被终止、排队的任务暂停派发；恢复同样必须填写原因，恢复后成员重新登录即可。外部系统接口的停用处理随对应切片补充。
 - 运营者对租户的操作写入该租户的审计日志，操作者显示为“运营者 ops@…”；运营者登录、绑定 TOTP、重置 TOTP、新增运营者等平台级事件不属于任何租户，只在 `/ops/audit` 可见。
@@ -75,12 +75,12 @@ npm run dev                                                             # 打开
 #### 数据湖与任务
 
 - 开通租户时自动建好数据湖（ADR-0001、0002、0008）：存储前缀 `<PLATFORM_LAKE_URI>/tenants/<租户 ID>/`，平台 PG 中独占的 catalog schema 与数据库角色 `lake_<租户 ID>`（平台 PG 需要 15 及以上版本，平台账号需要 CREATEROLE 权限）。本功能上线前开通的租户没有数据湖，由运营者在租户页点“初始化数据湖”补建。
-- 任务队列在平台 PG（`platform.tasks`）。`npm run dispatcher` 领取任务，每个任务启动一个独立的工作进程：只拿到本租户角色的凭据，挂载后锁定 DuckDB 配置（只能访问本租户前缀、不能再挂载其他库），内存与线程按租户配额限制。
+- 任务队列在平台 PG（`platform.tasks`）。`pnpm dispatcher` 领取任务，每个任务启动一个独立的工作进程：只拿到本租户角色的凭据，挂载后锁定 DuckDB 配置（只能访问本租户前缀、不能再挂载其他库），内存与线程按租户配额限制。
 - 调度按租户公平：先派发运行中任务最少、再派发最久没被派发过的租户，同一租户内先进先出；租户运行中的任务达到并发上限时其余排队。停用租户时其运行中的任务被终止，排队的任务留在队列里、恢复后继续；停用期间不能提交任务。调度器失联超过 1 分钟的任务判为失败，调度器退出时它启动的工作进程随之退出。任务的错误信息对租户全体成员可见，其中的凭据会被抹掉。
 - 任务类型在 `app/.server/pipeline/handlers.ts`：`lake.inventory`（盘点本租户数据湖的表与行数）、`demo.seed`（造数夹具，确定性生成消费者与订单）。成员在 `/tasks` 查看本租户的任务与状态，成功的任务可展开查看结果（各表行数与运行时生效的内存、线程）。
 
 
-`npm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。设置 `TEST_S3_LAKE_URI=s3://crm-lake/platform-test` 后，租户隔离测试会在对象存储上再跑一遍，凭据取 `S3_*`，默认用 `docker/seaweedfs/s3.json` 里的开发账号；CI 会起 SeaweedFS 跑这组测试。对象存储上的测试数据不会自动清理。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
+`pnpm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。设置 `TEST_S3_LAKE_URI=s3://crm-lake/platform-test` 后，租户隔离测试会在对象存储上再跑一遍，凭据取 `S3_*`，默认用 `docker/seaweedfs/s3.json` 里的开发账号；CI 会起 SeaweedFS 跑这组测试。对象存储上的测试数据不会自动清理。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
 
 ---
 ## 技术栈
@@ -156,9 +156,9 @@ docker compose --profile rustfs up -d rustfs rustfs-bucket
 #### 1.3 安装与自检
 
 ```bash
-npm install
+pnpm install
 cp .env.example .env          # 按你的 PG / S3 修改
-npm run check                 # 检查 DuckDB、PostgreSQL、对象存储、DuckLake 扩展
+pnpm check                    # 检查 DuckDB、PostgreSQL、对象存储、DuckLake 扩展
 ```
 
 ---
@@ -166,32 +166,32 @@ npm run check                 # 检查 DuckDB、PostgreSQL、对象存储、Duck
 ## 2. 运行
 
 ```bash
-npm run all        # 按顺序跑完下面全部步骤
-npm run report     # 汇总每一步的耗时（记录在 reports/bench.jsonl）
+pnpm all        # 按顺序跑完下面全部步骤
+pnpm report     # 汇总每一步的耗时（记录在 reports/bench.jsonl）
 ```
 
 | 命令 | 脚本 | 做什么 |
 |---|---|---|
-| `npm run check` | `00_check.ts` | 环境自检 |
-| `npm run seed` | `01_seed.ts` | 生成数据：客户 / 订单 / 明细写入 PG；埋点 JSONL.gz、营销 CSV.gz、商品 Parquet 写入湖的 landing 区；会员 SaaS 后台库 |
-| `npm run ingest` | `02_ingest.ts` | 全量入湖：PG → silver 表 + bronze Parquet（按月分区）；会员接口并发分页拉取；文件 → 分区 Parquet；并在 PG 里制造一批变更 |
-| `npm run ingest:incr` | `02_ingest.ts incremental` | 增量同步：`updated_at` 水位线，条件下推到 PG → `MERGE INTO` + CDC 批次落湖 |
-| `npm run model` | `03_model.ts` | 订单清洗、设备 → 用户身份打通、30 分钟会话切分、7 源关联的 `gold.user_360` |
-| `npm run crm` | `04_crm.ts` | 复购、多次消费贡献、同期群留存、RFM、CLV、流失预警、忠诚度评分、季度档位迁移、邀请裂变 |
-| `npm run journey` | `05_journey.ts` | 会话漏斗、ASOF 营销归因、购物篮提升度、向量相似推荐、五表关联 Top-N |
-| `npm run realtime` | `06_realtime.ts` | 微批写入 + 增量合并、并发查询、客户 360 点查、流式导出、全量重算 |
-| `npm run federation` | `07_federation_ducklake.ts` | 联邦查询（PG × 湖 × 分析库）、`postgres_query` 下推、DuckLake（元数据在 PG、数据在 S3、快照 / 时间旅行 / 变更流） |
-| `npm run v2` | `08_v2_features.ts` | DuckDB 2.0 新能力（VARIANT、触发器、`$变量`、DML CTE、NEAREST、USING KEY）；需要 2.0 版 Node 驱动 |
-| `npm run advanced` | `09_advanced_sql.ts` | 进阶 SQL：ROLLUP / CUBE / GROUPING SETS、RANGE 时间窗口、`arg_max(x, y, n)`、指标宏、ENUM、客户模糊匹配、行为路径、抽样 |
-| `npm run engineering` | `10_engineering.ts` | 上线必备：多进程只读 + 蓝绿切换、查询超时 / 取消 / 进度、加密与脱敏、数据质量、SCD2、性能诊断 |
-| `npm run extensions` | `11_extensions.ts` | 扩展：vss 向量索引、fts 中文全文检索、spatial 门店覆盖、excel、delta / iceberg、JS 自定义函数 |
-| `npm run wasm:data` / `wasm:build` / `wasm:serve` | `wasm/` | 浏览器里的 DuckDB：直接查询 Parquet 的客户人群看板 |
-| `npm run dbt` | `dbt/` | 用 dbt-duckdb 管理 SQL 模型：依赖、测试、增量、直接输出 Parquet |
+| `pnpm check` | `00_check.ts` | 环境自检 |
+| `pnpm seed` | `01_seed.ts` | 生成数据：客户 / 订单 / 明细写入 PG；埋点 JSONL.gz、营销 CSV.gz、商品 Parquet 写入湖的 landing 区；会员 SaaS 后台库 |
+| `pnpm ingest` | `02_ingest.ts` | 全量入湖：PG → silver 表 + bronze Parquet（按月分区）；会员接口并发分页拉取；文件 → 分区 Parquet；并在 PG 里制造一批变更 |
+| `pnpm ingest:incr` | `02_ingest.ts incremental` | 增量同步：`updated_at` 水位线，条件下推到 PG → `MERGE INTO` + CDC 批次落湖 |
+| `pnpm model` | `03_model.ts` | 订单清洗、设备 → 用户身份打通、30 分钟会话切分、7 源关联的 `gold.user_360` |
+| `pnpm crm` | `04_crm.ts` | 复购、多次消费贡献、同期群留存、RFM、CLV、流失预警、忠诚度评分、季度档位迁移、邀请裂变 |
+| `pnpm journey` | `05_journey.ts` | 会话漏斗、ASOF 营销归因、购物篮提升度、向量相似推荐、五表关联 Top-N |
+| `pnpm realtime` | `06_realtime.ts` | 微批写入 + 增量合并、并发查询、客户 360 点查、流式导出、全量重算 |
+| `pnpm federation` | `07_federation_ducklake.ts` | 联邦查询（PG × 湖 × 分析库）、`postgres_query` 下推、DuckLake（元数据在 PG、数据在 S3、快照 / 时间旅行 / 变更流） |
+| `pnpm v2` | `08_v2_features.ts` | DuckDB 2.0 新能力（VARIANT、触发器、`$变量`、DML CTE、NEAREST、USING KEY）；需要 2.0 版 Node 驱动 |
+| `pnpm advanced` | `09_advanced_sql.ts` | 进阶 SQL：ROLLUP / CUBE / GROUPING SETS、RANGE 时间窗口、`arg_max(x, y, n)`、指标宏、ENUM、客户模糊匹配、行为路径、抽样 |
+| `pnpm engineering` | `10_engineering.ts` | 上线必备：多进程只读 + 蓝绿切换、查询超时 / 取消 / 进度、加密与脱敏、数据质量、SCD2、性能诊断 |
+| `pnpm extensions` | `11_extensions.ts` | 扩展：vss 向量索引、fts 中文全文检索、spatial 门店覆盖、excel、delta / iceberg、JS 自定义函数 |
+| `pnpm wasm:data` / `wasm:build` / `wasm:serve` | `wasm/` | 浏览器里的 DuckDB：直接查询 Parquet 的客户人群看板 |
+| `pnpm dbt` | `dbt/` | 用 dbt-duckdb 管理 SQL 模型：依赖、测试、增量、直接输出 Parquet |
 
-第 09–11 个脚本可以只跑其中一节：`npm run advanced -- 6`（只跑客户模糊匹配）。
+第 09–11 个脚本可以只跑其中一节：`pnpm advanced 6`（只跑客户模糊匹配）。
 依赖关系：`engineering` 第 11 节、`extensions` 第 20 节要用到 `advanced` 第 6 节生成的 `silver.contacts_a`；
-`extensions` 第 19 节要先 `pip install deltalake pyarrow "pyiceberg[sql-sqlite]" && npm run lakeformats:make`；
-`npm run dbt` 需要 `pip install dbt-duckdb`。
+`extensions` 第 19 节要先 `pip install deltalake pyarrow "pyiceberg[sql-sqlite]" && pnpm lakeformats:make`；
+`pnpm dbt` 需要 `pip install dbt-duckdb`。
 
 ### 规模怎么选
 
@@ -405,7 +405,7 @@ pip download --no-deps --only-binary=:all: --platform manylinux2014_x86_64 \
 
 **被系统杀掉（exit 137）**：调小 `DUCKDB_MEMORY`（物理内存的 50–60%），或减少 `DUCKDB_THREADS`。
 
-**升级到 DuckDB 2.0**：`@duckdb/node-api` 发布 2.0 后 `npm i @duckdb/node-api@latest`。
+**升级到 DuckDB 2.0**：`@duckdb/node-api` 发布 2.0 后 `pnpm add @duckdb/node-api@latest`。
 旧库文件需要先升级存储格式才能用 VARIANT / 触发器：
 
 ```sql

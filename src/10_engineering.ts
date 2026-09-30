@@ -2,7 +2,7 @@
 //   ⑨ 多进程只读并发 + 蓝绿切换        ⑩ 查询超时、取消与进度
 //   ⑪ 加密与脱敏（个人信息）          ⑫ 数据质量：坏行隔离、字段演进、断言检查
 //   ⑬ SCD2：客户属性历史与“下单时”口径  ⑭ 性能诊断：Profiling JSON、Parquet 行组与 Bloom 过滤器
-// 运行：npm run engineering（需要先跑过 model / crm）
+// 运行：pnpm engineering（需要先跑过 model / crm）
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -140,7 +140,7 @@ if (part(11)) {
   const encFile = './data/secure/pii.duckdb';
   rmSync(encFile, { force: true });
   if (!(await q<any>(con, `SELECT 1 FROM duckdb_tables() WHERE schema_name = 'silver' AND table_name = 'contacts_a'`)).length)
-    throw new Error('请先运行 npm run advanced -- 6 生成 contacts_a');
+    throw new Error('请先运行 pnpm advanced 6 生成 contacts_a');
 
   // 1) 加密数据库文件：整库 AES 加密，没有密钥无法打开
   await exec(con, `

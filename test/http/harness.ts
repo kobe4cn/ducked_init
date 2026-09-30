@@ -120,21 +120,21 @@ export async function resetDb() {
   if (!process.env.PLATFORM_LAKE_URI!.startsWith('s3://')) await rm(process.env.PLATFORM_LAKE_URI!, { recursive: true, force: true });
 }
 
-/** 以运营者身份执行命令行（与 npm run tenant:create 相同的入口） */
+/** 以运营者身份执行命令行（与 pnpm tenant:create 相同的入口） */
 export async function runCli(script: string, args: string[]) {
   return promisify(execFile)(process.execPath, ['--import', 'tsx', script, ...args], {
     env: { ...process.env },
   }).then(r => ({ ...r, code: 0 }), (e: { stdout: string; stderr: string; code: number }) => e);
 }
 
-/** 以运营者身份开通租户（与 npm run tenant:create 相同的入口） */
+/** 以运营者身份开通租户（与 pnpm tenant:create 相同的入口） */
 export const createTenant = (slug: string, name: string, adminEmail: string) =>
   runCli('scripts/create-tenant.ts', ['--slug', slug, '--name', name, '--admin-email', adminEmail]);
 
-/** 以服务器上的运营命令创建运营者（npm run operator:create） */
+/** 以服务器上的运营命令创建运营者（pnpm operator:create） */
 export const createOperator = (email: string) => runCli('scripts/create-operator.ts', ['--email', email]);
 
-/** 以服务器上的运营命令重置运营者的 TOTP（npm run operator:reset-totp） */
+/** 以服务器上的运营命令重置运营者的 TOTP（pnpm operator:reset-totp） */
 export const resetOperatorTotp = (email: string) => runCli('scripts/reset-operator-totp.ts', ['--email', email]);
 
 /** 从邮件正文里取出运营后台的登录链接（路径 + 查询串） */

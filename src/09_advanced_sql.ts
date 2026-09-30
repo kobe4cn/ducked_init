@@ -3,13 +3,13 @@
 //   ③ arg_max(x, y, n) 分组 Top-N                ④ MACRO 指标层
 //   ⑤ ENUM 低基数列                              ⑥ 客户模糊匹配与去重
 //   ⑦ 行为路径分析                               ⑧ 抽样
-// 运行：npm run advanced（需要先跑过 model / crm）
+// 运行：pnpm advanced（需要先跑过 model / crm）
 import { statSync, rmSync } from 'node:fs';
 import { connect, exec, q, show, timed } from './lib/duck';
 
 const con = await connect({ s3: false });
 await con.run(`SET VARIABLE as_of = TIMESTAMP '2026-09-27'`);
-const only = process.argv[2];                       // 例：npm run advanced -- 3  只跑第 3 节
+const only = process.argv[2];                       // 例：pnpm advanced 3  只跑第 3 节
 const part = (n: number) => !only || only === String(n);
 const ms = async (sql: string) => { const t = performance.now(); await con.run(sql); return performance.now() - t; };
 

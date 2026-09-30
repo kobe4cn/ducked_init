@@ -1,6 +1,6 @@
 // src/02_ingest.ts —— 多数据源 → 数据湖（bronze）+ 分析库（silver）
-//   用法：npm run ingest            全量
-//         npm run ingest:incr       增量（基于 updated_at 水位线，仅 SEED_TARGET=pg）
+//   用法：pnpm ingest            全量
+//         pnpm ingest:incr       增量（基于 updated_at 水位线，仅 SEED_TARGET=pg）
 //
 //   A. PostgreSQL：postgres 扩展并行扫描 → silver 表 → bronze Parquet（按月分区）
 //      增量：WHERE updated_at > 水位线（条件下推到 PG，走索引）→ MERGE INTO silver + 追加 CDC 批次
@@ -146,7 +146,7 @@ SELECT 'pg', 'customers', max(updated_at), NULL, count(*), now() FROM silver.cus
 INSERT OR REPLACE INTO meta.watermark
 SELECT 'pg', 'orders', max(updated_at), max(order_id), count(*), now() FROM silver.orders;`);
 
-// 在源库里制造变更，供 `npm run ingest:incr` 演示：约 1% 订单退款、客户改资料、新订单
+// 在源库里制造变更，供 `pnpm ingest:incr` 演示：约 1% 订单退款、客户改资料、新订单
 if (usePg) {
   await exec(
     con,
