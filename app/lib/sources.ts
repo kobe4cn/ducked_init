@@ -13,7 +13,7 @@ export const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
 export const SYNC_MODES = {
   watermark: '水位线增量',
   needs_confirmation: '待确认水位线',
-  full_compare: '全量比对（未上线）',
+  full_compare: '全量比对',
 } as const;
 export type SyncMode = keyof typeof SYNC_MODES;
 

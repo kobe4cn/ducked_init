@@ -1,7 +1,7 @@
 // app/.server/sources.ts —— 数据源：登记、修改与轮换凭据、测试连接、采集表清单与列统计、确认水位线字段。一律限定在操作者所属租户内。
 // 登记与修改时平台探测账号写权限，可写即拒绝；凭据用租户数据密钥加密保存，任何界面与接口都不回显。
-// 列统计由采集任务（source.profile）在工作进程里产出，保存在任务结果中；成员确认的水位线字段与业务主键保存在 source_tables。
-// 按水位线同步见 source-sync.ts
+// 列统计由采集任务（source.profile）在工作进程里产出，保存在任务结果中；成员确认的水位线字段、业务主键与软删除字段保存在 source_tables。
+// 同步见 source-sync.ts
 import { randomUUID } from 'node:crypto';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -9,8 +9,10 @@ import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { sources, sourceTables, tasks, type TaskStatus } from './db/schema';
-import { inspectSource, mongoReadGrant, type SourceSpec, type TableProfile, type WriteGrant } from './pipeline/source-engine';
-import type { SyncTableParam } from './pipeline/sync-engine';
+import {
+  inspectSource, isKeyType, isSoftDeleteType, mongoReadGrant, SOFT_DELETE_NAME, type SourceSpec, type TableProfile, type WriteGrant,
+} from './pipeline/source-engine';
+import { checkDeclaredKey, type SyncTableParam } from './pipeline/sync-engine';
 import type { SyncMode } from '../lib/sources';
 import { decryptForTenant, encryptForTenant } from './secrets';
 import {
@@ -25,6 +27,10 @@ const PROBE_LIMITS = { memoryLimitMb: 256, threads: 1 };
 
 /** 没有水位线字段、行数达到这个值的大表全量比对时默认每天同步一次，而不是每小时（SOURCE_LARGE_TABLE_ROWS，默认 1000 万） */
 const largeTableRows = () => Number(process.env.SOURCE_LARGE_TABLE_ROWS ?? 10_000_000);
+/** 数据源的同步周期（SOURCE_SYNC_INTERVAL_MINUTES，默认 60 分钟）：水位线表增量同步，其余表全量比对 */
+export const syncIntervalMinutes = () => Number(process.env.SOURCE_SYNC_INTERVAL_MINUTES ?? 60);
+/** 全量比对的大表多久同步一次（SOURCE_LARGE_TABLE_SYNC_HOURS，默认 24 小时） */
+export const largeTableSyncHours = () => Number(process.env.SOURCE_LARGE_TABLE_SYNC_HOURS ?? 24);
 
 /** 列出可写对象时最多举几个例子 */
 const GRANT_EXAMPLES = 5;
@@ -103,17 +109,26 @@ export async function registerSource(actor: CurrentMember, input: SourceInput) {
   return { id, tables, unreadable };
 }
 
+/** 没有水位线、行数达到大表阈值的表：全量比对默认每天一次 */
+const isLarge = (table: TableProfile, watermark: string | null) => !watermark && !table.watermarkCandidates.length && table.rows >= largeTableRows();
+
+/** 同步频率的说法：每小时、每天、每 N 分钟 / 小时 */
+const every = (minutes: number) =>
+  (minutes === 60 ? '每小时' : minutes === 1440 ? '每天' : minutes % 60 ? `每 ${minutes} 分钟` : `每 ${minutes / 60} 小时`);
+
 /**
  * 表的同步方式：成员确认了水位线字段 → 水位线增量；有候选未确认 → 待确认；
- * 没有候选的表 → 全量比对（大表默认每天一次，见 ADR-0010；尚未上线，这类表目前不会进湖）
+ * 没有候选的表 → 全量比对（大表默认每天一次，其余随数据源每小时一次，见 ADR-0010）
  */
 function syncModeOf(table: TableProfile, watermark: string | null): { syncMode: SyncMode; syncModeNote: string } {
-  if (watermark) return { syncMode: 'watermark', syncModeNote: `按 ${watermark} 增量同步` };
+  const interval = every(syncIntervalMinutes());
+  if (watermark) return { syncMode: 'watermark', syncModeNote: `按 ${watermark} ${interval}增量同步` };
   if (table.watermarkCandidates.length) return { syncMode: 'needs_confirmation', syncModeNote: '平台找到了可用的水位线字段，请确认' };
-  const note = '没有更新时间或自增主键，需要全量比对：这种同步方式尚未上线，这张表不会进湖';
-  const threshold = largeTableRows();
-  if (table.rows < threshold) return { syncMode: 'full_compare', syncModeNote: note };
-  return { syncMode: 'full_compare', syncModeNote: `${note}；行数达到 ${threshold.toLocaleString('zh-CN')}（大表，上线后默认每天同步一次）` };
+  if (!isLarge(table, watermark)) return { syncMode: 'full_compare', syncModeNote: `没有更新时间或自增主键：${interval}全量比对一次` };
+  return {
+    syncMode: 'full_compare',
+    syncModeNote: `没有更新时间或自增主键，行数达到 ${largeTableRows().toLocaleString('zh-CN')}（大表）：${every(largeTableSyncHours() * 60)}全量比对一次`,
+  };
 }
 
 /** 数据源最近一次采集任务（任何状态），以及最近一次成功的采集结果 */
@@ -142,8 +157,9 @@ export async function listSources(actor: CurrentMember) {
 }
 
 /**
- * 最近一次成功采集到的各表，带成员确认且仍然有效的水位线字段（没有时为 null）及其种类，以及成员确认的业务主键。
- * 采集后字段不再是候选（被删除、改名、出现空值或重复，或源表有了主键）时，之前的确认不再生效
+ * 最近一次成功采集到的各表，带成员确认且仍然有效的水位线字段（没有时为 null）及其种类、业务主键与软删除字段。
+ * 采集后水位线字段不再是候选（被删除、改名、出现空值），业务主键的列不在了或源表有了主键，软删除字段不在了或表没有了主键时，
+ * 之前的确认不再生效
  */
 async function confirmedTables(tenantId: string, sourceId: string) {
   const profiles = await latestProfiles(tenantId, sourceId);
@@ -153,24 +169,39 @@ async function confirmedTables(tenantId: string, sourceId: string) {
   const tables = profiles.tables.map(t => {
     const c = confirmed.get(t.name);
     const candidate = c?.watermarkColumn ? t.watermarkCandidates.find(w => w.column === c.watermarkColumn) : undefined;
-    // 旧的采集结果里没有业务主键候选
-    const key = c?.keyColumn && t.keyCandidates?.includes(c.keyColumn) ? c.keyColumn : null;
+    const has = (column: string, type: (t: string) => boolean) => t.columns.some(col => col.name === column && type(col.type));
+    // 旧的采集结果里没有主键信息
+    const key = c?.keyColumns?.length && !t.primaryKey?.length && c.keyColumns.every(k => has(k, isKeyType)) ? c.keyColumns : null;
+    const softDelete = c?.softDeleteColumn && (t.primaryKey?.length || key) && has(c.softDeleteColumn, isSoftDeleteType) ? c.softDeleteColumn : null;
     return {
       table: t,
       watermark: candidate ?? null,
       confirmedBy: candidate ? c!.confirmedByEmail : null,
       key,
       keyConfirmedBy: key ? c!.keyConfirmedByEmail : null,
+      softDelete,
+      softDeleteConfirmedBy: softDelete ? c!.softDeleteConfirmedByEmail : null,
     };
   });
   return { ...profiles, tables };
 }
 
-/** 按水位线增量同步的表：成员确认了水位线字段、且该字段在最近一次采集中仍是候选；带成员确认的业务主键 */
-export async function watermarkTables(tenantId: string, sourceId: string): Promise<SyncTableParam[]> {
+/**
+ * 要同步的表：成员确认了水位线字段（且该字段在最近一次采集中仍是候选）的按水位线增量同步，没有水位线候选的全量比对；
+ * 有候选、待确认的表不同步。带成员声明的业务主键与软删除字段，以及是否是全量比对的大表（默认每天同步一次）
+ */
+export async function syncTables(tenantId: string, sourceId: string): Promise<{ param: SyncTableParam; large: boolean }[]> {
   const { tables } = await confirmedTables(tenantId, sourceId);
-  return tables.flatMap(({ table, watermark, key }) =>
-    (watermark ? [{ name: table.name, column: watermark.column, kind: watermark.kind, ...(key && { key }) }] : []));
+  return tables.flatMap(({ table, watermark, key, softDelete }) => {
+    if (!watermark && table.watermarkCandidates.length) return [];
+    const param: SyncTableParam = {
+      name: table.name,
+      ...(watermark && { column: watermark.column, kind: watermark.kind }),
+      ...(key && { key }),
+      ...(softDelete && { softDelete }),
+    };
+    return [{ param, large: isLarge(table, watermark?.column ?? null) }];
+  });
 }
 
 /** 数据源详情：连接参数（不含凭据）、最近一次采集的状态（及跳过的无读权限的表）、各表的列统计、水位线候选与同步方式 */
@@ -188,15 +219,21 @@ export async function getSource(actor: CurrentMember, sourceId: string) {
       unreadable,
       profiledAt,
     },
-    tables: tables.map(({ table, watermark, confirmedBy, key, keyConfirmedBy }) => ({
+    tables: tables.map(({ table, watermark, confirmedBy, key, keyConfirmedBy, softDelete, softDeleteConfirmedBy }) => ({
       ...table,
       // 旧的采集结果里没有主键信息
       primaryKey: table.primaryKey ?? [],
       keyCandidates: table.keyCandidates ?? [],
+      /** 可以组成业务主键的列（整数、文本与 UUID） */
+      keyEligibleColumns: table.columns.filter(c => isKeyType(c.type)).map(c => c.name),
       watermark: watermark?.column ?? null,
       confirmedBy,
       key,
       keyConfirmedBy,
+      /** 软删除字段候选：按命名是删除标记的布尔、整数、日期与时间列 */
+      softDeleteCandidates: table.columns.filter(c => isSoftDeleteType(c.type) && SOFT_DELETE_NAME.test(c.name)).map(c => c.name),
+      softDelete,
+      softDeleteConfirmedBy,
       ...syncModeOf(table, watermark?.column ?? null),
     })),
   };
@@ -206,9 +243,7 @@ export async function getSource(actor: CurrentMember, sourceId: string) {
 export async function confirmWatermark(actor: CurrentMember, sourceId: string, tableName: string, column: string) {
   assertCan(actor, 'sources:write');
   const row = await requireSource(actor.tenant.id, sourceId);
-  const { tables } = await latestProfiles(actor.tenant.id, sourceId);
-  const table = tables.find(t => t.name === tableName);
-  if (!table) throw new SourceError(`数据源中没有表 ${tableName}`, 404);
+  const table = await profiledTable(actor.tenant.id, sourceId, tableName);
   if (!table.watermarkCandidates.some(c => c.column === column)) throw new SourceError(`${column} 不是 ${tableName} 的水位线候选字段`);
   await getDb().transaction(async tx => {
     const values = { watermarkColumn: column, confirmedByEmail: actor.email, confirmedAt: new Date() };
@@ -225,26 +260,72 @@ export async function confirmWatermark(actor: CurrentMember, sourceId: string, t
   });
 }
 
-/**
- * 成员为没有主键的表确认业务主键（从平台给出的候选中选）：同步据此区分新增与更新，并在比对主键全集时发现删除。
- * 候选只基于样本统计，同步时会在读到的行上再校验非空且唯一
- */
-export async function confirmKey(actor: CurrentMember, sourceId: string, tableName: string, column: string) {
-  assertCan(actor, 'sources:write');
-  const row = await requireSource(actor.tenant.id, sourceId);
-  const { tables } = await latestProfiles(actor.tenant.id, sourceId);
+/** 数据源最近一次成功采集到的某张表 */
+async function profiledTable(tenantId: string, sourceId: string, tableName: string) {
+  const { tables } = await latestProfiles(tenantId, sourceId);
   const table = tables.find(t => t.name === tableName);
   if (!table) throw new SourceError(`数据源中没有表 ${tableName}`, 404);
+  return table;
+}
+
+/**
+ * 成员为没有主键的表声明业务主键（一列或多列的组合，平台给出的候选只是样本中唯一的单列）：同步据此区分新增与更新，并发现删除。
+ * 声明时在源端校验这个组合非空且唯一，不满足时拒绝并给出样例；每次同步前还会在读到的行上再校验一次
+ */
+export async function confirmKey(actor: CurrentMember, sourceId: string, tableName: string, columns: string[]) {
+  assertCan(actor, 'sources:write');
+  const row = await requireSource(actor.tenant.id, sourceId);
+  const table = await profiledTable(actor.tenant.id, sourceId, tableName);
   if (table.primaryKey?.length) throw new SourceError(`${tableName} 已有主键 ${table.primaryKey.join('、')}，不需要业务主键`);
-  if (!table.keyCandidates?.includes(column)) throw new SourceError(`${column} 不是 ${tableName} 的业务主键候选字段`);
+  if (!columns.length) throw new SourceError('请选择组成业务主键的字段');
+  if (new Set(columns).size !== columns.length) throw new SourceError('业务主键的字段不能重复');
+  for (const column of columns) {
+    const profiled = table.columns.find(c => c.name === column);
+    if (!profiled) throw new SourceError(`${tableName} 中没有字段 ${column}`);
+    if (!isKeyType(profiled.type)) throw new SourceError(`${column} 的类型 ${profiled.type} 不能作业务主键（只支持整数、文本与 UUID）`);
+  }
+  const problem = await checkDeclaredKey(await loadSourceSpec(actor.tenant.id, sourceId), PROBE_LIMITS, tableName, columns).catch(e => {
+    throw new SourceError(`无法在数据源上校验业务主键：${(e as Error).message}`);
+  });
+  if (problem) throw new SourceError(`${problem}，不能作业务主键`);
   await getDb().transaction(async tx => {
-    const values = { keyColumn: column, keyConfirmedByEmail: actor.email };
+    const values = { keyColumns: columns, keyConfirmedByEmail: actor.email };
     await tx.insert(sourceTables).values({ sourceId, tableName, ...values })
       .onConflictDoUpdate({ target: [sourceTables.sourceId, sourceTables.tableName], set: values });
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
       action: 'source.key_confirmed',
+      targetType: 'source',
+      targetId: sourceId,
+      detail: { name: row.name, table: tableName, column: columns.join('、') },
+    });
+  });
+}
+
+/**
+ * 成员为有主键（源端主键或业务主键）的表声明软删除字段：取值为真（布尔）、非零（整数）或非空（日期与时间）的行按源端已删除处理，
+ * 同步时产出删除记录。没有主键的表不能声明：删除记录要靠主键指明删的是哪一行
+ */
+export async function confirmSoftDelete(actor: CurrentMember, sourceId: string, tableName: string, column: string) {
+  assertCan(actor, 'sources:write');
+  const row = await requireSource(actor.tenant.id, sourceId);
+  const table = await profiledTable(actor.tenant.id, sourceId, tableName);
+  const { tables } = await confirmedTables(actor.tenant.id, sourceId);
+  if (!table.primaryKey?.length && !tables.find(t => t.table.name === tableName)?.key) {
+    throw new SourceError(`${tableName} 没有主键，请先声明业务主键，再声明软删除字段`);
+  }
+  const profiled = table.columns.find(c => c.name === column);
+  if (!profiled) throw new SourceError(`${tableName} 中没有字段 ${column}`);
+  if (!isSoftDeleteType(profiled.type)) throw new SourceError(`${column} 的类型 ${profiled.type} 不能作软删除字段（只支持布尔、整数、日期与时间）`);
+  await getDb().transaction(async tx => {
+    const values = { softDeleteColumn: column, softDeleteConfirmedByEmail: actor.email };
+    await tx.insert(sourceTables).values({ sourceId, tableName, ...values })
+      .onConflictDoUpdate({ target: [sourceTables.sourceId, sourceTables.tableName], set: values });
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id,
+      actor,
+      action: 'source.soft_delete_confirmed',
       targetType: 'source',
       targetId: sourceId,
       detail: { name: row.name, table: tableName, column },

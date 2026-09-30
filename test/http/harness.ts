@@ -70,8 +70,10 @@ export class Client {
   /** 当前持有的某个 cookie 的值 */
   cookie(name: string) { return [...this.cookies.values()].find(c => c.name === name)?.value; }
 
-  post(path: string, form: Record<string, string> = {}, headers?: HeadersInit) {
-    return this.request(path, { method: 'POST', body: new URLSearchParams(form), headers });
+  /** 提交表单：取值为数组时同名字段提交多次（如多选框） */
+  post(path: string, form: Record<string, string | string[]> = {}, headers?: HeadersInit) {
+    const body = new URLSearchParams(Object.entries(form).flatMap(([k, v]) => (Array.isArray(v) ? v : [v]).map(x => [k, x])));
+    return this.request(path, { method: 'POST', body, headers });
   }
 }
 

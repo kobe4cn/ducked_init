@@ -1,5 +1,6 @@
 // app/routes/source.tsx —— 单个数据源：连接参数（凭据不显示）、测试连接、修改与轮换凭据、重新采集；
-// 各表的行数、列统计、同步方式、是否已进湖与水位线候选，成员从候选中确认水位线字段，没有主键的表确认业务主键；手动触发同步，查看每张表的同步历史
+// 各表的行数、列统计、同步方式与频率、是否已进湖与水位线候选，成员从候选中确认水位线字段，没有主键的表声明业务主键（可多列），
+// 有主键的表声明软删除字段；手动触发同步，查看每张表的同步历史
 import { useEffect } from 'react';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
 import { CircleAlert, CircleCheck } from 'lucide-react';
@@ -7,7 +8,9 @@ import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { getSyncStatus, syncSource } from '~/.server/source-sync';
-import { confirmKey, confirmWatermark, getSource, refreshSourceProfile, SourceError, testSource, updateSource } from '~/.server/sources';
+import {
+  confirmKey, confirmSoftDelete, confirmWatermark, getSource, refreshSourceProfile, SourceError, testSource, updateSource,
+} from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { formValues, SOURCE_KIND_LABELS, SYNC_MODES, type SyncMode } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
@@ -98,7 +101,10 @@ export async function action({ request, params }: Route.ActionArgs) {
         await confirmWatermark(member, params.sourceId, field('table'), field('column'));
         break;
       case 'confirm-key':
-        await confirmKey(member, params.sourceId, field('table'), field('column'));
+        await confirmKey(member, params.sourceId, field('table'), form.getAll('column').map(String));
+        break;
+      case 'confirm-soft-delete':
+        await confirmSoftDelete(member, params.sourceId, field('table'), field('column'));
         break;
       default:
         return data({ ok: null, error: '未知操作', values: null }, { status: 400 });
@@ -118,7 +124,6 @@ export async function action({ request, params }: Route.ActionArgs) {
  */
 function notInLakeReason(t: { syncMode: SyncMode }, history: object[] | undefined): string | null {
   if (history?.some(e => !('error' in e))) return null;
-  if (t.syncMode === 'full_compare') return '全量比对尚未上线';
   if (t.syncMode === 'needs_confirmation') return '待确认水位线';
   return history?.length ? '同步失败' : '等待首次同步';
 }
@@ -132,11 +137,12 @@ type TableView = Route.ComponentProps['loaderData']['tables'][number];
 type SyncEntry = Route.ComponentProps['loaderData']['sync']['history'][string][number];
 
 const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
-const BATCH_MODES = { full: '全表读取', incremental: '增量', reconcile: '主键比对' } as const;
+const BATCH_MODES = { full: '全表读取', incremental: '增量', reconcile: '主键比对', compare: '全量比对' } as const;
 const count = (n: number) => n.toLocaleString('zh-CN');
 
 /** 批次的读取范围：增量批次从水位线往回退了回看窗口时一并说明 */
 function watermarkRange(e: Extract<SyncEntry, { batch: number }>) {
+  if (e.watermarkColumn === null) return '—（没有水位线）';
   if (e.mode === 'reconcile') return `${e.watermarkColumn}：${e.watermarkTo ?? '—'}（不变）`;
   const lookback = e.readFrom !== null && e.readFrom !== e.watermarkFrom ? `（回看自 ${e.readFrom}）` : '';
   return `${e.watermarkColumn}：${e.watermarkFrom ?? '起始'} → ${e.watermarkTo ?? '—'}${lookback}`;
@@ -256,26 +262,70 @@ function Watermark({ table, canWrite, submitting }: { table: TableView; canWrite
   );
 }
 
-/** 主键：源端主键；没有时列出业务主键候选供成员确认。都没有时同步看不到删除、增量行一律记为新增 */
+/**
+ * 主键：源端主键；没有时成员可以声明业务主键（一列或多列，平台标出样本中唯一的单列作参考，确认前在源端校验）。
+ * 都没有时，全量比对按整行比对（修改记为一删一增），水位线同步的增量行一律记为新增、每天整行比对一次补上删除
+ */
 function Key({ table, canWrite, submitting }: { table: TableView; canWrite: boolean; submitting: boolean }) {
   if (table.primaryKey.length) return <div className="text-xs text-muted-foreground">{`主键：${table.primaryKey.join('、')}`}</div>;
-  if (!table.keyCandidates.length) {
-    return <div className="text-xs text-muted-foreground" data-no-key>没有主键：增量行一律记为新增，看不到源端的删除</div>;
-  }
+  return (
+    <div className="space-y-1 text-xs">
+      {table.key ? (
+        <div className="flex items-center gap-2" data-declared-key={table.key.join(',')}>
+          <span>{`业务主键：${table.key.join('、')}`}</span>
+          <Badge variant="secondary">{`已确认${table.keyConfirmedBy ? `（${table.keyConfirmedBy}）` : ''}`}</Badge>
+        </div>
+      ) : (
+        <div className="text-muted-foreground" data-no-key>
+          {table.syncMode === 'full_compare'
+            ? '没有主键：按整行比对，完全相同的重复行按出现次数计，修改记为一删一增'
+            : '没有主键：增量行一律记为新增；每天整行全量比对一次，补上源端的删除'}
+        </div>
+      )}
+      {canWrite && table.keyEligibleColumns.length > 0 && (
+        <details>
+          <summary className="cursor-pointer text-muted-foreground select-none">
+            {table.key ? '改为其他业务主键' : '声明业务主键（一列或多列的组合，能唯一标识一行；据此区分新增与更新）'}
+          </summary>
+          <Form method="post" className="mt-1 space-y-1">
+            <input type="hidden" name="intent" value="confirm-key" />
+            <input type="hidden" name="table" value={table.name} />
+            <div className="flex flex-wrap gap-x-3 gap-y-1">
+              {table.keyEligibleColumns.map(column => (
+                <label key={column} className="flex items-center gap-1" data-key-column={column}>
+                  <input type="checkbox" name="column" value={column} defaultChecked={table.key?.includes(column)} />
+                  <span className="font-mono">{column}</span>
+                  {table.keyCandidates.includes(column) && <span className="text-muted-foreground" data-key-candidate={column}>（样本中唯一）</span>}
+                </label>
+              ))}
+            </div>
+            <Button type="submit" variant="outline" size="sm" disabled={submitting}>在源端校验并确认</Button>
+          </Form>
+        </details>
+      )}
+    </div>
+  );
+}
+
+/** 软删除字段：有主键（源端主键或业务主键）的表可以从候选中确认，标记为删除的行同步时记为删除 */
+function SoftDelete({ table, canWrite, submitting }: { table: TableView; canWrite: boolean; submitting: boolean }) {
+  if (!table.primaryKey.length && !table.key) return null;
+  const candidates = [...new Set([...(table.softDelete ? [table.softDelete] : []), ...table.softDeleteCandidates])];
+  if (!candidates.length) return null;
   return (
     <ul className="space-y-1 text-xs">
-      {table.keyCandidates.map(column => (
-        <li key={column} className="flex items-center gap-2" data-key-candidate={column}>
+      {candidates.map(column => (
+        <li key={column} className="flex items-center gap-2" data-soft-delete-candidate={column}>
           <span className="font-mono">{column}</span>
-          <span className="text-muted-foreground">没有主键；样本中非空且唯一，可作业务主键（据此区分新增与更新、发现删除）</span>
-          {table.key === column ? (
-            <Badge variant="secondary">{`已确认${table.keyConfirmedBy ? `（${table.keyConfirmedBy}）` : ''}`}</Badge>
+          <span className="text-muted-foreground">软删除字段：为真、非零或非空的行记为删除</span>
+          {table.softDelete === column ? (
+            <Badge variant="secondary">{`已确认${table.softDeleteConfirmedBy ? `（${table.softDeleteConfirmedBy}）` : ''}`}</Badge>
           ) : canWrite ? (
             <Form method="post">
-              <input type="hidden" name="intent" value="confirm-key" />
+              <input type="hidden" name="intent" value="confirm-soft-delete" />
               <input type="hidden" name="table" value={table.name} />
               <input type="hidden" name="column" value={column} />
-              <Button type="submit" variant="outline" size="sm" disabled={submitting}>确认为业务主键</Button>
+              <Button type="submit" variant="outline" size="sm" disabled={submitting}>确认为软删除字段</Button>
             </Form>
           ) : null}
         </li>
@@ -356,7 +406,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
             <Badge variant={TASK_VARIANTS[profile.status]} data-profile-status={profile.status}>{`采集${profile.statusLabel}`}</Badge>
           </CardTitle>
           <CardDescription>
-            {`有更新时间或自增主键的表按水位线增量同步（需确认字段）；没有的表需要全量比对，这种同步方式尚未上线。最近采集：${time(profile.profiledAt)}`}
+            {`有更新时间或自增主键的表按水位线增量同步（需确认字段）；没有的表全量比对：每小时一次，大表每天一次。最近采集：${time(profile.profiledAt)}`}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -395,6 +445,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
                     <div className="text-xs text-muted-foreground">{t.syncModeNote}</div>
                     <Watermark table={t} canWrite={canWrite} submitting={submitting} />
                     <Key table={t} canWrite={canWrite} submitting={submitting} />
+                    <SoftDelete table={t} canWrite={canWrite} submitting={submitting} />
                   </TableCell>
                 </TableRow>
               ))}
@@ -417,7 +468,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
             <Badge variant={TASK_VARIANTS[sync.status]} data-sync-status={sync.status}>{sync.statusLabel}</Badge>
           </CardTitle>
           <CardDescription>
-            {`已确认水位线的表每小时增量同步一次，变化以变更批次追加到原始层；首次同步为全量。有主键的表每天再比对一次主键全集，补上源端的删除与漏掉的行。最近一次：${time(sync.attemptedAt)} 提交`}
+            {`已确认水位线的表每小时增量同步一次，首次同步为全表读取，每天再比对一次（有主键的比对主键全集，没有的整行比对），补上源端的删除与漏掉的行。没有水位线的表全量比对，大表每天一次。变化都以变更批次追加到原始层。最近一次：${time(sync.attemptedAt)} 提交`}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">

@@ -239,7 +239,10 @@ export const sourceTables = platform.table('source_tables', {
   watermarkColumn: text('watermark_column'),
   confirmedByEmail: text('confirmed_by_email'),
   confirmedAt: timestamp('confirmed_at', { withTimezone: true }),
-  /** 源表没有主键时成员确认的业务主键：同步据此区分新增与更新、发现删除 */
-  keyColumn: text('key_column'),
+  /** 源表没有主键时成员声明的业务主键（一列或多列的组合）：同步据此区分新增与更新、发现删除 */
+  keyColumns: text('key_columns').array(),
   keyConfirmedByEmail: text('key_confirmed_by_email'),
+  /** 成员声明的软删除字段：取值为真（布尔）、非零（整数）或非空（时间）的行按删除处理。只用于有主键的表 */
+  softDeleteColumn: text('soft_delete_column'),
+  softDeleteConfirmedByEmail: text('soft_delete_confirmed_by_email'),
 }, t => [primaryKey({ columns: [t.sourceId, t.tableName] })]);

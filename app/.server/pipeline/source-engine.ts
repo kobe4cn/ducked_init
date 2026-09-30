@@ -454,7 +454,12 @@ interface SummaryRow { column_name: string; column_type: string; min: string | n
 const isTemporal = (type: string) => /^(TIMESTAMP|DATE|TIME)/.test(type);
 const isNumeric = (type: string) => /^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|U|FLOAT|DOUBLE|DECIMAL)/.test(type);
 const isText = (type: string) => type === 'VARCHAR';
-const isKeyType = (type: string) => /^(U?(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT)|VARCHAR|UUID)$/.test(type);
+/** 可作业务主键的列类型：整数、文本与 UUID */
+export const isKeyType = (type: string) => /^(U?(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT)|VARCHAR|UUID)$/.test(type);
+/** 可作软删除字段的列类型：布尔（为真即删除）、整数（非零即删除）、日期与时间（非空即删除） */
+export const isSoftDeleteType = (type: string) => /^(BOOLEAN|U?(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT)|DATE|TIMESTAMP.*)$/.test(type);
+/** 软删除字段的常见命名 */
+export const SOFT_DELETE_NAME = /delet|remov/i;
 /** 样本中不同取值的个数（近似计数）至少占样本行数的这个比例，才算取值唯一 */
 const KEY_DISTINCT_SHARE = 0.98;
 

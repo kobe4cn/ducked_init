@@ -1,13 +1,15 @@
-// 水位线增量同步的流水线接缝：确认水位线 → 手动触发或按周期入队同步任务 → 调度器派发 → 变更批次追加到原始层 → 查看每张表的同步历史
+// 同步的流水线接缝：确认水位线（没有水位线的表全量比对）→ 手动触发或按周期入队同步任务 → 调度器派发 → 变更批次追加到原始层 → 查看每张表的同步历史
+import { eq } from 'drizzle-orm';
 import { MongoClient } from 'mongodb';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { tenants } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { enqueueDueSyncs, getSyncStatus, syncSource } from '../../app/.server/source-sync';
-import { confirmKey, confirmWatermark, getSource, registerSource, SourceError } from '../../app/.server/sources';
+import { confirmKey, confirmSoftDelete, confirmWatermark, getSource, registerSource, SourceError } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
@@ -75,8 +77,8 @@ describe('水位线增量同步到原始层', () => {
     // 更新时间水位线：源端提交时间取自该字段
     expect(first[0]).toMatchObject({ customer_id: 1, name: '消费者1', _commit_ts: '2024-06-01 01:00:00+00' });
     expect(await bronze(acme, id, 'orders', 'order_id')).toHaveLength(100);
-    // 没有确认水位线的表本次不同步
-    expect(await historyOf(engineer, id, 'regions')).toEqual([]);
+    // 没有水位线字段的表同一次同步里全量比对
+    expect(await historyOf(engineer, id, 'regions')).toMatchObject([{ batch: 1, mode: 'compare', rows: 2 }]);
 
     await grantOnSource(`
       INSERT INTO shop.customers (name, email, phone, city, created_at, updated_at)
@@ -176,10 +178,10 @@ describe('水位线增量同步到原始层', () => {
         GRANT SELECT ON shop.subscriptions TO ${READER.user};`);
       const table = (await getSource(engineer, id)).tables.find(t => t.name === 'subscriptions')!;
       expect(table).toMatchObject({ primaryKey: [], keyCandidates: ['email'], key: null });
-      await expect(confirmKey(engineer, id, 'subscriptions', 'plan')).rejects.toBeInstanceOf(SourceError);
-      await expect(confirmKey(engineer, id, 'customers', 'email')).rejects.toThrow(/已有主键/);
+      await expect(confirmKey(engineer, id, 'subscriptions', ['plan'])).rejects.toBeInstanceOf(SourceError);
+      await expect(confirmKey(engineer, id, 'customers', ['email'])).rejects.toThrow(/已有主键/);
       await confirmWatermark(engineer, id, 'subscriptions', 'updated_at');
-      await confirmKey(engineer, id, 'subscriptions', 'email');
+      await confirmKey(engineer, id, 'subscriptions', ['email']);
       await sync(engineer, id);
 
       await grantOnSource(`
@@ -228,13 +230,208 @@ describe('水位线增量同步到原始层', () => {
   });
 });
 
-describe('手动触发同步', () => {
-  it('数据工程师可以触发；已有同步在排队时不重复提交；没有确认水位线的数据源不能同步；分析师不能触发', async () => {
+/** 各行的 [列…, _op]，按原始层里的顺序 */
+const ops = (rows: Record<string, unknown>[], ...columns: string[]) => rows.map(r => [...columns.map(c => r[c]), r._op]);
+
+describe('全量比对（没有水位线的表）', () => {
+  it('有主键的表每次同步全量比对，产出新增、更新与删除：源端物理删除一笔订单后，原始层出现它的删除记录；没有变化时为空批次', async () => {
+    const { acme, engineer, id } = await pgSourceWithWatermarks(`
+      CREATE TABLE shop.legacy_orders (order_no text PRIMARY KEY, customer_id int NOT NULL, amount int NOT NULL);
+      INSERT INTO shop.legacy_orders SELECT 'L' || i, i % 5, i * 10 FROM generate_series(1, 6) i;
+      GRANT SELECT ON shop.legacy_orders TO ${READER.user};`);
+    expect((await getSource(engineer, id)).tables.find(t => t.name === 'legacy_orders')).toMatchObject({ syncMode: 'full_compare' });
+    await sync(engineer, id);
+    const first = await bronze(acme, id, 'legacy_orders', 'order_no');
+    expect(first).toHaveLength(6);
+    expect(new Set(first.map(r => `${r._op}/${r._batch}`))).toEqual(new Set(['insert/1']));
+    // 拿不到源端提交时间，用同步时间代替
+    expect(first[0]._commit_ts).toBe(first[0]._synced_at);
+    expect((await historyOf(engineer, id, 'legacy_orders'))[0]).toMatchObject({
+      batch: 1, mode: 'compare', rows: 6, inserted: 6, watermarkColumn: null, watermarkTo: null,
+    });
+
+    await grantOnSource(`
+      INSERT INTO shop.legacy_orders VALUES ('L7', 1, 70);
+      UPDATE shop.legacy_orders SET amount = 99 WHERE order_no = 'L2';
+      DELETE FROM shop.legacy_orders WHERE order_no = 'L3';`);
+    await sync(engineer, id);
+    const second = (await bronze(acme, id, 'legacy_orders', 'order_no')).filter(r => r._batch === 2);
+    // 删除记录只带主键
+    expect(ops(second, 'order_no', 'amount')).toEqual([['L2', 99, 'update'], ['L3', null, 'delete'], ['L7', 70, 'insert']]);
+    expect((await historyOf(engineer, id, 'legacy_orders'))[0]).toMatchObject({ batch: 2, mode: 'compare', inserted: 1, updated: 1, deleted: 1 });
+
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'legacy_orders'))[0]).toMatchObject({ batch: 3, rows: 0 });
+  });
+
+  it('没有唯一主键、含完全相同重复行的表按整行多重集比对：增删一条重复行恰好产出一条记录，修改一行产出一删一增', async () => {
+    const { acme, engineer, id } = await pgSourceWithWatermarks(`
+      CREATE TABLE shop.order_items (order_id int NOT NULL, sku text NOT NULL, qty int NOT NULL);
+      INSERT INTO shop.order_items VALUES (1, 'A', 1), (1, 'A', 1), (1, 'B', 2), (2, 'A', 1), (2, 'C', 3);
+      GRANT SELECT ON shop.order_items TO ${READER.user};`);
+    expect((await getSource(engineer, id)).tables.find(t => t.name === 'order_items')).toMatchObject({ primaryKey: [], key: null });
+    await sync(engineer, id);
+    expect(ops(await bronze(acme, id, 'order_items', 'order_id, sku'), 'order_id', 'sku', 'qty')).toEqual([
+      [1, 'A', 1, 'insert'], [1, 'A', 1, 'insert'], [1, 'B', 2, 'insert'], [2, 'A', 1, 'insert'], [2, 'C', 3, 'insert'],
+    ]);
+
+    await grantOnSource(`
+      DELETE FROM shop.order_items WHERE ctid = (SELECT ctid FROM shop.order_items WHERE order_id = 1 AND sku = 'A' LIMIT 1);
+      INSERT INTO shop.order_items VALUES (2, 'A', 1);
+      UPDATE shop.order_items SET qty = 4 WHERE order_id = 2 AND sku = 'C';`);
+    await sync(engineer, id);
+    const all = await bronze(acme, id, 'order_items', 'order_id, sku, _op');
+    // 删除记录带整行，才能知道删的是哪一行
+    expect(ops(all.filter(r => r._batch === 2), 'order_id', 'sku', 'qty')).toEqual([
+      [1, 'A', 1, 'delete'], [2, 'A', 1, 'insert'], [2, 'C', 3, 'delete'], [2, 'C', 4, 'insert'],
+    ]);
+    expect((await historyOf(engineer, id, 'order_items'))[0]).toMatchObject({ batch: 2, mode: 'compare', inserted: 2, updated: 0, deleted: 2 });
+
+    // 按批次回放（新增加一次、删除减一次）即为源表当前的多重集
+    const replay = new Map<string, number>();
+    for (const r of all) {
+      const row = `${r.order_id}/${r.sku}/${r.qty}`;
+      replay.set(row, (replay.get(row) ?? 0) + (r._op === 'delete' ? -1 : 1));
+    }
+    expect(Object.fromEntries([...replay].filter(([, n]) => n))).toEqual({ '1/A/1': 1, '1/B/2': 1, '2/A/1': 2, '2/C/4': 1 });
+
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'order_items'))[0]).toMatchObject({ batch: 3, rows: 0 });
+  });
+
+  it('成员可以声明多列业务主键：组合在源端有空值或不唯一时拒绝并给出样例；声明后修改一行产出一条更新', async () => {
+    const { acme, engineer, id } = await pgSourceWithWatermarks(`
+      CREATE TABLE shop.order_items (order_id int, sku text, qty int NOT NULL);
+      INSERT INTO shop.order_items VALUES (1, 'A', 1), (1, 'A', 1), (1, 'B', 2), (2, 'A', 1), (2, NULL, 3);
+      GRANT SELECT ON shop.order_items TO ${READER.user};`);
+    await expect(confirmKey(engineer, id, 'order_items', ['order_id', 'sku'])).rejects.toThrow(/有 1 行为空/);
+    await grantOnSource(`DELETE FROM shop.order_items WHERE sku IS NULL`);
+    await expect(confirmKey(engineer, id, 'order_items', ['order_id', 'sku'])).rejects.toThrow('不唯一（order_id=1, sku=A 出现 2 次）');
+    await expect(confirmKey(engineer, id, 'order_items', ['order_id', 'nope'])).rejects.toBeInstanceOf(SourceError);
+    await expect(confirmKey(engineer, id, 'order_items', [])).rejects.toBeInstanceOf(SourceError);
+    await grantOnSource(`DELETE FROM shop.order_items WHERE ctid = (SELECT ctid FROM shop.order_items WHERE order_id = 1 AND sku = 'A' LIMIT 1)`);
+    await confirmKey(engineer, id, 'order_items', ['order_id', 'sku']);
+    expect((await getSource(engineer, id)).tables.find(t => t.name === 'order_items')).toMatchObject({ key: ['order_id', 'sku'], keyConfirmedBy: 'de@acme.com' });
+    await sync(engineer, id);
+
+    await grantOnSource(`
+      UPDATE shop.order_items SET qty = 5 WHERE order_id = 1 AND sku = 'B';
+      DELETE FROM shop.order_items WHERE order_id = 2;`);
+    await sync(engineer, id);
+    const second = (await bronze(acme, id, 'order_items', 'order_id, sku')).filter(r => r._batch === 2);
+    expect(ops(second, 'order_id', 'sku', 'qty')).toEqual([[1, 'B', 5, 'update'], [2, 'A', null, 'delete']]);
+
+    // 同步前在读到的行上再校验一次
+    await grantOnSource(`INSERT INTO shop.order_items VALUES (1, 'B', 6)`);
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'order_items'))[0]).toMatchObject({ error: expect.stringContaining('order_id=1, sku=B 出现 2 次') });
+  });
+
+  it('按整行比对同步过的表之后再声明业务主键：由当前镜像接续，之后的修改记为更新', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, engineer, id } = await pgSourceWithWatermarks(`
+        CREATE TABLE shop.visits (visitor text NOT NULL, page text NOT NULL, updated_at timestamp NOT NULL);
+        INSERT INTO shop.visits SELECT 'v' || i, '/home', TIMESTAMP '2024-06-01' + i * INTERVAL '1 hour' FROM generate_series(1, 5) i;
+        GRANT SELECT ON shop.visits TO ${READER.user};`);
+      await confirmWatermark(engineer, id, 'visits', 'updated_at');
+      await sync(engineer, id);
+      // 修改先作为新增增量写入，旧版本到下一个比对批次才记为删除
+      await grantOnSource(`UPDATE shop.visits SET page = '/cart', updated_at = '2024-07-01' WHERE visitor = 'v2'`);
+      await sync(engineer, id);
+      await confirmKey(engineer, id, 'visits', ['visitor']);
+      await grantOnSource(`UPDATE shop.visits SET page = '/pay', updated_at = '2024-07-02' WHERE visitor = 'v2'`);
+      await sync(engineer, id);
+      const later = (await bronze(acme, id, 'visits', 'visitor')).filter(r => Number(r._batch) >= 4);
+      expect(ops(later, '_batch', 'visitor', 'page')).toEqual([[4, 'v2', '/pay', 'update']]);
+    });
+  });
+
+  it('有水位线、没有主键的表到了比对周期时整行全量比对：源端物理删除的行与增量期间多记的旧版本都出现删除记录', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, engineer, id } = await pgSourceWithWatermarks(`
+        CREATE TABLE shop.visits (visitor text NOT NULL, page text NOT NULL, updated_at timestamp NOT NULL);
+        INSERT INTO shop.visits SELECT 'v' || i, '/home', TIMESTAMP '2024-06-01' + i * INTERVAL '1 hour' FROM generate_series(1, 5) i;
+        GRANT SELECT ON shop.visits TO ${READER.user};`);
+      await confirmWatermark(engineer, id, 'visits', 'updated_at');
+      await sync(engineer, id);
+      await grantOnSource(`
+        UPDATE shop.visits SET page = '/cart', updated_at = '2024-07-01' WHERE visitor = 'v2';
+        DELETE FROM shop.visits WHERE visitor = 'v3';`);
+      await sync(engineer, id);
+
+      const history = await historyOf(engineer, id, 'visits');
+      expect(history.map(h => 'batch' in h && [h.batch, h.mode, h.inserted, h.deleted])).toEqual([
+        [3, 'compare', 0, 2], [2, 'incremental', 1, 0], [1, 'full', 5, 0],
+      ]);
+      // 比对批次不让水位线后退
+      expect(history[0]).toMatchObject({ watermarkColumn: 'updated_at', watermarkTo: '2024-07-01 00:00:00' });
+      const rows = (await bronze(acme, id, 'visits', 'visitor, _op')).filter(r => Number(r._batch) > 1);
+      expect(ops(rows, '_batch', 'visitor', 'page')).toEqual([[2, 'v2', '/cart', 'insert'], [3, 'v2', '/home', 'delete'], [3, 'v3', '/home', 'delete']]);
+
+      await sync(engineer, id);
+      expect((await historyOf(engineer, id, 'visits')).slice(0, 2).map(h => 'batch' in h && [h.batch, h.mode, h.rows])).toEqual([
+        [5, 'compare', 0], [4, 'incremental', 0],
+      ]);
+    });
+  });
+
+  it('声明了软删除字段的表按该字段产出删除；比对主键全集时不把已标记删除的行补回来', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, engineer, id } = await pgSourceWithWatermarks('ALTER TABLE shop.customers ADD COLUMN deleted_at timestamp');
+      expect((await getSource(engineer, id)).tables.find(t => t.name === 'customers')).toMatchObject({ softDeleteCandidates: ['deleted_at'] });
+      await expect(confirmSoftDelete(engineer, id, 'regions', 'code')).rejects.toThrow(/主键/);
+      await expect(confirmSoftDelete(engineer, id, 'customers', 'name')).rejects.toBeInstanceOf(SourceError);
+      await confirmSoftDelete(engineer, id, 'customers', 'deleted_at');
+      expect((await getSource(engineer, id)).tables.find(t => t.name === 'customers')).toMatchObject({ softDelete: 'deleted_at', softDeleteConfirmedBy: 'de@acme.com' });
+      await sync(engineer, id);
+
+      await grantOnSource(`UPDATE shop.customers SET deleted_at = '2024-07-01', updated_at = '2024-07-01' WHERE customer_id = 3`);
+      await sync(engineer, id);
+      const rows = (await bronze(acme, id, 'customers', 'customer_id')).filter(r => Number(r._batch) > 1);
+      // 软删除的记录带整行，提交时间取更新时间
+      expect(ops(rows, '_batch', 'customer_id', 'name')).toEqual([[2, 3, '消费者3', 'delete']]);
+      expect(rows[0]._commit_ts).toBe('2024-07-01 00:00:00+00');
+      expect((await historyOf(engineer, id, 'customers'))[0]).toMatchObject({ batch: 3, mode: 'reconcile', rows: 0 });
+    });
+  });
+});
+
+describe('全量比对超出内存上限', () => {
+  it('比对超出租户的内存配额时溢写到任务的临时目录，照常完成', async () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
-    const { id } = await registerSource(engineer, await pgSourceInput(READER));
+    const path = await duckdbSourceFile(acme);
+    const onSource = async (sql: string) => {
+      const instance = await DuckDBInstance.create(path);
+      const con = await instance.connect();
+      await con.run(sql);
+      con.closeSync();
+      instance.closeSync();
+    };
+    // 200 万行、没有主键：整行哈希的分组与比对放不进 64 MB（关掉溢写时报内存不足）
+    await onSource(`CREATE TABLE lines AS SELECT i // 3 AS order_id, 'SKU' || lpad((i % 7919)::VARCHAR, 6, '0') AS sku, i % 5 AS qty FROM range(2000000) t(i)`);
+    const { id } = await registerSource(engineer, { kind: 'duckdb', name: '明细文件', path: 'shop.duckdb' });
     await drain();
-    await expect(syncSource(engineer, id)).rejects.toThrow(/没有已确认水位线的表/);
+    await getDb().update(tenants).set({ memoryLimitMb: 64, threads: 1 }).where(eq(tenants.id, acme));
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 1, mode: 'compare', inserted: 2_000_000 });
+
+    await onSource(`DELETE FROM lines WHERE order_id < 10; INSERT INTO lines SELECT * FROM lines WHERE order_id = 10`);
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 2, inserted: 3, deleted: 30 });
+  });
+});
+
+describe('手动触发同步', () => {
+  it('数据工程师可以触发；已有同步在排队时不重复提交；只有待确认水位线的表时不能同步；分析师不能触发', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const input = await pgSourceInput(READER);
+    // 只剩有水位线候选的 customers 与 orders
+    await grantOnSource(`REVOKE SELECT ON shop.events, shop.regions FROM ${READER.user}`);
+    const { id } = await registerSource(engineer, input);
+    await drain();
+    await expect(syncSource(engineer, id)).rejects.toThrow(/没有可同步的表/);
 
     await confirmWatermark(engineer, id, 'orders', 'order_id');
     const task = await syncSource(engineer, id);
@@ -260,10 +457,12 @@ describe('手动触发同步', () => {
 });
 
 describe('按周期同步', () => {
-  it('确认了水位线的数据源每个周期入队一次同步，周期内不重复入队', async () => {
+  it('有要同步的表的数据源每个周期入队一次同步，周期内不重复入队', async () => {
     const { acme, id } = await pgSourceWithWatermarks();
+    // 另一个租户的数据源只有待确认水位线的表
     const other = await newTenant('globex');
-    await registerSource(await memberOf(other, 'de@globex.com'), await pgSourceInput(READER));
+    await duckdbSourceFile(other);
+    await registerSource(await memberOf(other, 'de@globex.com'), { kind: 'duckdb', name: '会员文件', path: 'shop.duckdb' });
     await drain();
 
     expect(await enqueueDueSyncs()).toEqual([id]);
@@ -273,6 +472,32 @@ describe('按周期同步', () => {
     expect((await listTasks(acme)).filter(t => t.kind === 'source.sync').map(t => t.status)).toEqual(['succeeded']);
     // 周期过去之后再次入队
     expect(await enqueueDueSyncs(new Date(Date.now() + 61 * 60_000))).toEqual([id]);
+  });
+
+  it('全量比对的大表默认每天同步一次，其余表随数据源每小时一次；手动触发时一并同步', async () => {
+    const { acme, engineer, id } = await pgSourceWithWatermarks();
+    const hour = 3_600_000;
+    /** 最近一次入队的同步带了哪些表 */
+    const tablesOf = async () => {
+      const [latest] = (await listTasks(acme)).filter(t => t.kind === 'source.sync');
+      return (latest.params.tables as { name: string }[]).map(t => t.name).sort();
+    };
+    expect((await getSource(engineer, id)).tables.find(t => t.name === 'events')).toMatchObject({
+      syncMode: 'full_compare', syncModeNote: expect.stringContaining('每天全量比对一次'),
+    });
+    expect(await enqueueDueSyncs()).toEqual([id]);
+    expect(await tablesOf()).toEqual(['customers', 'events', 'orders', 'regions']);
+    await drain();
+
+    expect(await enqueueDueSyncs(new Date(Date.now() + 1.1 * hour))).toEqual([id]);
+    expect(await tablesOf()).toEqual(['customers', 'orders', 'regions']);
+    await drain();
+    await syncSource(engineer, id);
+    expect(await tablesOf()).toEqual(['customers', 'events', 'orders', 'regions']);
+    await drain();
+
+    expect(await enqueueDueSyncs(new Date(Date.now() + 25 * hour))).toEqual([id]);
+    expect(await tablesOf()).toEqual(['customers', 'events', 'orders', 'regions']);
   });
 });
 
