@@ -3,6 +3,7 @@
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DuckDBInstance } from '@duckdb/node-api';
+import { MongoClient } from 'mongodb';
 import pg from 'pg';
 import { signedFetch, xmlTag } from '../../app/.server/s3-client';
 
@@ -215,3 +216,54 @@ export async function seedMysqlSource() {
   }
   return { kind: 'mysql', host: url.hostname, port: url.port || '3306', database: db };
 }
+
+/**
+ * MongoDB 源库（TEST_MONGO_URL，如 mongodb://crm:密码@localhost:27017/crm_source_test?authSource=admin，账号须能建库建用户）：
+ * - customers：ObjectId 主键 + updated_at（水位线候选：更新时间与 ObjectId），嵌套的 address 与数组 tags
+ * - orders：ObjectId 主键，没有更新时间（水位线候选：ObjectId）
+ * - events：字符串主键、没有更新时间，行数超过测试设定的大表阈值（全量比对、默认每天同步）
+ * 账号都建在源库里（认证库即源库）：只读、可写、只能列集合与读 customers 的、以及对源库没有任何权限的。
+ * 返回登记时提交的公共字段（不含账号）
+ */
+export async function seedMongoSource() {
+  const url = new URL(process.env.TEST_MONGO_URL!);
+  const db = url.pathname.slice(1);
+  const client = new MongoClient(url.toString());
+  try {
+    const source = client.db(db);
+    await source.dropDatabase();
+    for (const user of [...Object.values(MONGO_USERS)].map(u => u.user)) await source.command({ dropUser: user }).catch(() => undefined);
+    await source.command({ dropRole: 'customers_only' }).catch(() => undefined);
+    await source.collection('customers').insertMany(Array.from({ length: 40 }, (_, i) => ({
+      name: `消费者${i}`,
+      email: i % 4 === 0 ? null : `user${i}@example.com`,
+      address: { city: ['北京', '上海', '广州', '深圳'][i % 4], street: `路${i}号` },
+      tags: i % 2 ? ['vip'] : [],
+      updated_at: new Date(Date.UTC(2024, 5, 1, i)),
+    })));
+    await source.collection('orders').insertMany(Array.from({ length: 100 }, (_, i) => ({ customer: i % 40, amount: 10 + i, status: i % 2 ? 'paid' : 'refunded' })));
+    await source.collection<{ _id: string }>('events').insertMany(Array.from({ length: 1500 }, (_, i) => ({ _id: `evt-${i}`, type: 'view', occurred_at: new Date(Date.UTC(2024, 2, 1, 0, i)) })));
+    await source.command({
+      createRole: 'customers_only',
+      privileges: [
+        { resource: { db, collection: '' }, actions: ['listCollections'] },
+        { resource: { db, collection: 'customers' }, actions: ['find'] },
+      ],
+      roles: [],
+    });
+    const roles = { reader: [{ role: 'read', db }], writer: [{ role: 'readWrite', db }], partial: ['customers_only'], stranger: [] };
+    for (const [key, { user, password }] of Object.entries(MONGO_USERS)) {
+      await source.command({ createUser: user, pwd: password, roles: roles[key as keyof typeof MONGO_USERS] });
+    }
+  } finally {
+    await client.close();
+  }
+  return { kind: 'mongodb', host: url.hostname, port: url.port || '27017', database: db, authSource: db };
+}
+
+export const MONGO_USERS = {
+  reader: READER,
+  writer: WRITER,
+  partial: { user: 'crm_src_partial', password: 'partial-p@ss' },
+  stranger: { user: 'crm_src_stranger', password: 'stranger-p@ss' },
+};

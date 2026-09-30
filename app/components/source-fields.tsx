@@ -92,6 +92,38 @@ export function SourceFields({ kind, values, editing = false }: { kind: SourceKi
           </div>
         </>
       )}
+      {kind === 'mongodb' && (
+        <>
+          <div className="grid grid-cols-[1fr_8rem] gap-4">
+            <TextField name="host" label="主机" values={values} required placeholder="localhost 或 cluster0.xxxxx.mongodb.net" />
+            <TextField name="port" label="端口" values={values} placeholder="27017" />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <Field>
+              <FieldLabel htmlFor="source-srv">连接方式</FieldLabel>
+              <NativeSelect id="source-srv" name="srv" defaultValue={values.srv ?? 'false'}>
+                <NativeSelectOption value="false">主机与端口</NativeSelectOption>
+                <NativeSelectOption value="true">SRV 记录（MongoDB Atlas，自动使用 TLS）</NativeSelectOption>
+              </NativeSelect>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="source-tls">TLS</FieldLabel>
+              <NativeSelect id="source-tls" name="tls" defaultValue={values.tls ?? 'false'}>
+                <NativeSelectOption value="false">不使用</NativeSelectOption>
+                <NativeSelectOption value="true">使用</NativeSelectOption>
+              </NativeSelect>
+            </Field>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <TextField name="database" label="数据库名" values={values} required hint="库里的每个集合是一张表" />
+            <TextField name="authSource" label="认证库" values={values} placeholder="admin" hint="账号创建在哪个库里，默认 admin" />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <TextField name="user" label="用户名" values={values} required hint="必须是只读账号（如 read 角色）：可写的账号会被拒绝" />
+            <SecretField name="password" label="密码" editing={editing} />
+          </div>
+        </>
+      )}
       {kind === 's3' && (
         <>
           <div className="grid grid-cols-[1fr_10rem] gap-4">

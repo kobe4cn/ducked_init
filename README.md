@@ -91,8 +91,8 @@ pnpm dev                                          # 打开 /login，用管理员
 
 #### 数据源
 
-- 数据工程师与管理员在 `/sources` 登记数据源（分析师只读，查看者不可见）：PostgreSQL、MySQL、对象存储上的 Parquet / CSV / JSON 文件（前缀下每个子目录或顶层文件是一张表）、DuckDB 文件（对象存储上，或本机 `PLATFORM_SOURCE_FILES_DIR/<租户 ID>/` 下）。
-- 登记与修改前平台连接数据源并探测账号的写权限，**可写即拒绝**并列出可写的对象：PostgreSQL 查超级用户、建库 / 建 schema 权限与各表的 INSERT / UPDATE / DELETE / TRUNCATE；MySQL 查各级写类权限；对象存储发起一次分段上传并立即取消（不写入任何数据）。本机 DuckDB 文件没有账号，只读挂载。采集任务运行时再探测一次，登记后才被授予写权限的账号同样被拒绝。
+- 数据工程师与管理员在 `/sources` 登记数据源（分析师只读，查看者不可见）：PostgreSQL、MySQL、MongoDB（库里每个集合是一张表，嵌套字段展开成列）、对象存储上的 Parquet / CSV / JSON 文件（前缀下每个子目录或顶层文件是一张表）、DuckDB 文件（对象存储上，或本机 `PLATFORM_SOURCE_FILES_DIR/<租户 ID>/` 下）。
+- 登记与修改前平台连接数据源并探测账号的写权限，**可写即拒绝**并列出可写的对象：PostgreSQL 查超级用户、建库 / 建 schema 权限与各表的 INSERT / UPDATE / DELETE / TRUNCATE；MySQL 查各级写类权限；MongoDB 用 `connectionStatus` 查账号在各库、各集合上的写类操作（没有开启访问控制的服务一律视为可写）；对象存储发起一次分段上传并立即取消（不写入任何数据）。本机 DuckDB 文件没有账号，只读挂载。采集任务运行时再探测一次，登记后才被授予写权限的账号同样被拒绝。
 - 凭据（密码、对象存储密钥）用租户数据密钥加密保存（AES-256-GCM），数据密钥用 `PLATFORM_MASTER_KEY` 包裹后存在 `platform.tenant_keys`；页面与接口都不回显，修改时留空表示沿用，连接目标变了时须重新填写。任务派发时由调度器解密、经 IPC 交给工作进程，以临时 secret 注入内存中的 DuckDB，不落盘。
 - 源端以只读方式挂载后锁定 DuckDB 配置（不能再挂载其他库、读其他路径）；PostgreSQL 的只读挂载把一切语句放在只读事务里。发往源端的只有平台写死的只读查询，成员与模型都不能向源端发送 SQL。
 - 登记后自动提交采集任务（`source.profile`）：每张表的行数，基于前 10 万行样本的列统计（类型、空值率、基数、数值与时间列的取值范围；文本列只给长度范围与格式特征，不给取值），以及水位线候选（按命名是更新时间的时间列、由自增序列生成的主键）。成员从候选中确认水位线；没有候选的表全量比对，其中行数达到 `SOURCE_LARGE_TABLE_ROWS`（默认 1000 万）的大表默认每天同步一次（ADR-0010）。
@@ -114,7 +114,7 @@ pnpm dev                                          # 打开 /login，用管理员
    - **失败**：数据湖仍指向旧位置、数据完整，排队的任务照常执行。排除原因后重新执行同一条命令即可重试，新位置上残留的文件会被覆盖。调度器在迁移途中退出时，其他调度器会在 1 分钟后接手、从头再做。
 5. 迁移只在当前配置的一个对象存储服务内进行（换桶、换前缀）。要换对象存储服务，先迁到本地目录，改好 `S3_*` 后再迁到新服务上。
 
-`pnpm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。设置 `TEST_S3_LAKE_URI=s3://crm-lake/platform-test` 后，租户隔离测试会在对象存储上再跑一遍，平台账号取 `S3_*`，默认用本地 SeaweedFS 的开发账号 `crm` / `crm-secret`（SeaweedFS 须按上面的要求开启 IAM）；租户账号由测试开通租户时创建，每个用例前删除。CI 会起 SeaweedFS 跑这组测试。数据源测试在同一个 PG 上建源库 `crm_source_test` 与两个测试账号（`TEST_SOURCE_DATABASE_URL` 可覆盖）；设置 `TEST_MYSQL_URL`（如 `mysql://root:密码@127.0.0.1:3306/crm_source_test`）后再测 MySQL 数据源，CI 会起 MySQL 跑。对象存储上的测试数据不会自动清理。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
+`pnpm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。设置 `TEST_S3_LAKE_URI=s3://crm-lake/platform-test` 后，租户隔离测试会在对象存储上再跑一遍，平台账号取 `S3_*`，默认用本地 SeaweedFS 的开发账号 `crm` / `crm-secret`（SeaweedFS 须按上面的要求开启 IAM）；租户账号由测试开通租户时创建，每个用例前删除。CI 会起 SeaweedFS 跑这组测试。数据源测试在同一个 PG 上建源库 `crm_source_test` 与两个测试账号（`TEST_SOURCE_DATABASE_URL` 可覆盖）；设置 `TEST_MYSQL_URL`（如 `mysql://root:密码@127.0.0.1:3306/crm_source_test`）后再测 MySQL 数据源，设置 `TEST_MONGO_URL`（如 `mongodb://crm:crm-secret@localhost:27017/crm_source_test?authSource=admin`）后再测 MongoDB 数据源，CI 会起 MySQL 与 MongoDB 跑。对象存储上的测试数据不会自动清理。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展（测 MongoDB 时还有社区扩展 mongo）。
 
 ---
 ## 技术栈
@@ -183,6 +183,13 @@ docker compose up -d          # 启动 SeaweedFS，并自动创建存储桶 crm-
 # 或者用 RustFS：
 docker compose --profile rustfs up -d rustfs rustfs-bucket
 # 然后把 .env 里的 S3_ENDPOINT 改成 localhost:9000
+```
+
+需要 MongoDB 数据源做开发或测试时：`docker compose --profile mongo up -d mongodb`（开启访问控制，root 账号 `crm` / `crm-secret`）；用 Apple container 时：
+
+```bash
+container run -d --name mongodb -c 4 -m 4g -p 27017:27017 -v mongodb-data:/data/db \
+  -e MONGO_INITDB_ROOT_USERNAME=crm -e MONGO_INITDB_ROOT_PASSWORD=crm-secret docker.io/library/mongo:8
 ```
 
 不想用对象存储时，把 `.env` 里的 `LAKE_URI` 改成本地目录（如 `./data/lake`），其他代码不用改。

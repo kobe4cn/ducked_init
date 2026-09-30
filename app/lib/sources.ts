@@ -1,9 +1,10 @@
-// app/lib/sources.ts —— 数据源类型四种：PostgreSQL、MySQL、对象存储文件、DuckDB 文件。前后端共用（页面组件也要显示类型名称）
-export const SOURCE_KINDS = ['postgres', 'mysql', 's3', 'duckdb'] as const;
+// app/lib/sources.ts —— 数据源类型五种：PostgreSQL、MySQL、MongoDB、对象存储文件、DuckDB 文件。前后端共用（页面组件也要显示类型名称）
+export const SOURCE_KINDS = ['postgres', 'mysql', 'mongodb', 's3', 'duckdb'] as const;
 export type SourceKind = (typeof SOURCE_KINDS)[number];
 export const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
   postgres: 'PostgreSQL',
   mysql: 'MySQL',
+  mongodb: 'MongoDB',
   s3: '对象存储文件（S3）',
   duckdb: 'DuckDB 文件',
 };

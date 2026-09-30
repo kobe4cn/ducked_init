@@ -8,7 +8,7 @@ import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { sources, sourceTables, tasks, type TaskStatus } from './db/schema';
-import { inspectSource, type SourceSpec, type TableProfile, type WriteGrant } from './pipeline/source-engine';
+import { inspectSource, mongoReadGrant, type SourceSpec, type TableProfile, type WriteGrant } from './pipeline/source-engine';
 import type { SyncMode } from '../lib/sources';
 import { decryptForTenant, encryptForTenant } from './secrets';
 import {
@@ -34,8 +34,11 @@ function describeWriteGrants(user: string | undefined, grants: WriteGrant[]) {
 }
 
 /** 一张源表都读不了时的说明，附上需要授予的权限 */
-function describeNoReadGrants(user: string, unreadable: string[], schemas: string[]) {
-  const grants = schemas.map(s => `GRANT USAGE ON SCHEMA ${s} TO ${user}; GRANT SELECT ON ALL TABLES IN SCHEMA ${s} TO ${user};`).join(' ');
+function describeNoReadGrants(spec: SourceSpec, unreadable: string[], schemas: string[]) {
+  const user = 'user' in spec ? spec.user : '';
+  const grants = spec.kind === 'mongodb'
+    ? mongoReadGrant(spec)
+    : schemas.map(s => `GRANT USAGE ON SCHEMA ${s} TO ${user}; GRANT SELECT ON ALL TABLES IN SCHEMA ${s} TO ${user};`).join(' ');
   return `账号 ${user} 没有读权限，${unreadable.length} 张源表都读不了。请在源库授予：${grants}`;
 }
 
@@ -49,7 +52,7 @@ async function probe(spec: SourceSpec) {
   });
   const user = 'user' in spec ? spec.user : undefined;
   if (writable.length) throw new SourceError(describeWriteGrants(user, writable));
-  if (!tables.length && unreadable.length) throw new SourceError(describeNoReadGrants(user ?? '', unreadable, unreadableSchemas));
+  if (!tables.length && unreadable.length) throw new SourceError(describeNoReadGrants(spec, unreadable, unreadableSchemas));
   return { tables, unreadable };
 }
 

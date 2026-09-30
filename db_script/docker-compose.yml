@@ -2,6 +2,7 @@
 #   默认：SeaweedFS          docker compose up -d
 #   备选：RustFS             docker compose --profile rustfs up -d rustfs rustfs-bucket
 #   没有现成 PG 时：         docker compose --profile pg up -d postgres
+#   MongoDB 数据源（开发 / 测试）：docker compose --profile mongo up -d mongodb
 # 生产环境请把 :latest 换成固定版本号。
 
 services:
@@ -57,7 +58,22 @@ services:
       - pg-data:/var/lib/postgresql/data
     shm_size: 1g
     restart: unless-stopped
-    
+
+  # ---------------- MongoDB（数据源的开发与测试）----------------
+  # 开启访问控制：root 账号 crm / crm-secret（TEST_MONGO_URL 用它建测试库与测试账号）
+  mongodb:
+    profiles: [mongo]
+    image: mongo:8
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: crm
+      MONGO_INITDB_ROOT_PASSWORD: crm-secret
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    restart: unless-stopped
+
 volumes:
   seaweedfs-data:
   pg-data:
+  mongodb-data:

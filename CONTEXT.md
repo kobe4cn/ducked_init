@@ -60,7 +60,7 @@ _避免_：数据迁移（易与平台元数据库的结构迁移 `db:migrate` �
 _避免_：作业、Job
 
 **数据源（Source）**：
-租户登记的一个外部只读连接（PostgreSQL、MySQL、S3、DuckDB 文件等）。平台永不写入数据源。
+租户登记的一个外部只读连接（PostgreSQL、MySQL、MongoDB、S3、DuckDB 文件等）。平台永不写入数据源。
 _避免_：生产库、业务库（口语可用，但不作为术语）
 
 **水位线（Watermark）**：

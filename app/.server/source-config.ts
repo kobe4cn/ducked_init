@@ -33,12 +33,21 @@ function port(input: SourceInput, fallback: number) {
 
 const isS3Path = (p: string) => p.startsWith('s3://');
 
+const isOn = (v: string | undefined) => v === 'true' || v === 'on';
+
+/** MongoDB 的主机与库名会拼进连接串：只接受主机名字符与合法的库名，防止借此注入连接选项（如让驱动读取本机文件的 tlsCAFile） */
+function mongoName(input: SourceInput, key: string, label: string, fallback?: string) {
+  const v = text(input, key, label, fallback);
+  if (!/^[^\s/\\."$*<>:|?=&]+$/.test(v)) throw new SourceError(`${label}不合法：不能包含空格与 / \\ . " $ * < > : | ? = &`);
+  return v;
+}
+
 function s3Config(input: SourceInput) {
   return {
     endpoint: text(input, 'endpoint', '对象存储地址', 's3.amazonaws.com').replace(/^https?:\/\//, '').replace(/\/+$/, ''),
     region: text(input, 'region', '区域', 'us-east-1'),
     urlStyle: input.urlStyle === 'vhost' ? 'vhost' : 'path',
-    useSsl: input.useSsl === 'true' || input.useSsl === 'on' ? 'true' : 'false',
+    useSsl: isOn(input.useSsl) ? 'true' : 'false',
   };
 }
 
@@ -80,6 +89,22 @@ export async function parseSourceInput(tenantId: string, kind: SourceKind, input
       };
       secretKeys = ['password'];
       break;
+    case 'mongodb': {
+      const host = text(input, 'host', '主机');
+      if (!/^[A-Za-z0-9.-]+$/.test(host)) throw new SourceError('主机只能包含字母、数字、点与连字符');
+      const database = mongoName(input, 'database', '数据库名');
+      config = {
+        host,
+        port: port(input, 27017),
+        srv: isOn(input.srv) ? 'true' : 'false',
+        tls: isOn(input.tls) ? 'true' : 'false',
+        database,
+        authSource: mongoName(input, 'authSource', '认证库', 'admin'),
+        user: text(input, 'user', '用户名'),
+      };
+      secretKeys = ['password'];
+      break;
+    }
     case 's3': {
       const path = text(input, 'path', '文件前缀').replace(/\/*$/, '/');
       if (!/^s3:\/\/[^/]+\//.test(path)) throw new SourceError('文件前缀必须形如 s3://存储桶/前缀/');
@@ -114,7 +139,8 @@ export async function parseSourceInput(tenantId: string, kind: SourceKind, input
 }
 
 /** 决定凭据归属的连接参数：这些变了，原有的凭据不再沿用 */
-const connectionTarget = (c: Record<string, string>) => [c.host, c.port, c.database, c.user, c.endpoint, isS3Path(c.path ?? '') ? c.path.split('/')[2] : c.path];
+const connectionTarget = (c: Record<string, string>) =>
+  [c.host, c.port, c.database, c.authSource, c.user, c.endpoint, isS3Path(c.path ?? '') ? c.path.split('/')[2] : c.path];
 
 /**
  * 由 config 与凭据得到连接参数。本机上的 DuckDB 文件每次都重新解析真实路径并校验仍在租户目录内：
@@ -134,6 +160,11 @@ export async function resolveSourceSpec(tenantId: string, kind: SourceKind, conf
       return { kind, host: config.host, port: Number(config.port), database: config.database, schema: config.schema, user: config.user, password: credentials.password };
     case 'mysql':
       return { kind, host: config.host, port: Number(config.port), database: config.database, user: config.user, password: credentials.password };
+    case 'mongodb':
+      return {
+        kind, host: config.host, port: Number(config.port), srv: config.srv === 'true', tls: config.tls === 'true',
+        database: config.database, authSource: config.authSource, user: config.user, password: credentials.password,
+      };
     case 's3':
       return { kind, path: config.path, format: config.format as FileFormat, s3: s3() };
     case 'duckdb':

@@ -34,12 +34,26 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 30
+      # MongoDB 数据源的登记与只读校验测试（开启访问控制：root 账号 crm / crm）
+      mongodb:
+        image: mongo:8
+        env:
+          MONGO_INITDB_ROOT_USERNAME: crm
+          MONGO_INITDB_ROOT_PASSWORD: crm
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
     env:
       TEST_PLATFORM_DATABASE_URL: postgres://crm:crm@localhost:5432/crm_platform_test
       # 租户隔离测试在对象存储上再跑一遍（SeaweedFS，平台账号 crm / crm-secret，租户账号由测试开通租户时经 IAM API 创建）
       TEST_S3_LAKE_URI: s3://crm-lake/platform-test
       # 用 127.0.0.1 而不是 localhost：MySQL 客户端把 localhost 当作本机 socket
       TEST_MYSQL_URL: mysql://root:crm@127.0.0.1:3306/crm_source_test
+      TEST_MONGO_URL: mongodb://crm:crm@localhost:27017/crm_source_test?authSource=admin
     steps:
       - uses: actions/checkout@v4
       - name: Start SeaweedFS

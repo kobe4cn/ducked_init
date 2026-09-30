@@ -1,9 +1,11 @@
 // app/.server/pipeline/source-engine.ts —— 连接租户的数据源：只读挂载、探测账号写权限、列出源表、采集列统计与水位线候选。
 // 平台进程（登记、测试连接）与工作进程（采集任务）共用。凭据以临时 secret 注入独立的内存 DuckDB，不落盘；
 // 挂载后锁住配置：不能再挂载其他库、读其他路径。平台从不向源端发送写语句：PostgreSQL 的只读挂载把一切语句都放在只读事务里，
-// 发往源端的只有这里写死的只读查询（成员与模型都不能给出发往源端的 SQL）
+// 发往源端的只有这里写死的只读查询（成员与模型都不能给出发往源端的 SQL）。MongoDB 经社区扩展 mongo 只读挂载，
+// 账号的读写权限另用 MongoDB 驱动执行 connectionStatus 查询（扩展不能执行命令）
 import { randomUUID } from 'node:crypto';
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
+import { MongoClient, type MongoClientOptions } from 'mongodb';
 import { objectPath, signedFetch, xmlTag } from '../s3-client';
 import type { EngineLimits } from './lake-engine';
 
@@ -16,6 +18,8 @@ export type FileFormat = (typeof FILE_FORMATS)[number];
 export type SourceSpec =
   | { kind: 'postgres'; host: string; port: number; database: string; schema: string; user: string; password: string }
   | { kind: 'mysql'; host: string; port: number; database: string; user: string; password: string }
+  /** srv：以 mongodb+srv:// 连接（MongoDB Atlas），端口由 DNS 给出，并默认使用 TLS；authSource 是账号所在的认证库 */
+  | { kind: 'mongodb'; host: string; port: number; srv: boolean; tls: boolean; database: string; authSource: string; user: string; password: string }
   /** path 是以 / 结尾的前缀：其下每个子目录（或顶层的每个文件）是一张表 */
   | { kind: 's3'; path: string; format: FileFormat; s3: S3Connection }
   /** path 是对象存储上的文件（带 s3）或平台本机上租户源文件目录里的文件 */
@@ -60,6 +64,7 @@ const TEXT_FORMATS = {
   datetime: '^[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}',
   uuid: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
   json: '^\\s*[\\[{]',
+  objectid: '^[0-9a-f]{24}$',
 } as const;
 export type TextFormat = keyof typeof TEXT_FORMATS;
 
@@ -78,19 +83,22 @@ const FILE_EXTENSIONS: Record<FileFormat, RegExp> = {
 };
 const READERS: Record<FileFormat, string> = { parquet: 'read_parquet', csv: 'read_csv', json: 'read_json_auto' };
 
-/** 源表：名称、所在 schema、在会话里读取它的 FROM 子句，以及账号能否读取（PostgreSQL 目录里看得到没有读权限的表） */
+/** 源表：名称、所在 schema、在会话里读取它的 FROM 子句，以及账号能否读取（PostgreSQL 目录里看得到没有读权限的表，MongoDB 同理） */
 interface SourceTable { name: string; schema: string; from: string; readable: boolean }
 
 export interface SourceSession {
   /** 源端已只读挂载为 src，配置已锁定 */
   con: DuckDBConnection;
+  /** MongoDB 账号的权限（挂载前查询） */
+  mongo?: MongoAccess;
   tables(): Promise<SourceTable[]>;
   close(): void;
 }
 
 /** 错误信息会展示给成员：抹掉其中的凭据 */
 export function redactSourceSecrets(message: string, spec: SourceSpec) {
-  const secrets = (spec.kind === 'postgres' || spec.kind === 'mysql' ? [spec.password] : [spec.s3?.secret, spec.s3?.keyId])
+  // MongoDB 的连接串里密码经过百分号编码
+  const secrets = ('password' in spec ? [spec.password, encodeURIComponent(spec.password)] : [spec.s3?.secret, spec.s3?.keyId])
     .filter((s): s is string => !!s);
   return secrets.reduce((m, s) => m.replaceAll(s, '***'), message);
 }
@@ -109,6 +117,7 @@ export async function openSource(spec: SourceSpec, limits: EngineLimits): Promis
   });
   const con = await instance.connect();
   const close = () => { con.closeSync(); instance.closeSync(); };
+  let mongo: MongoAccess | undefined;
   try {
     let allowed: string[] = [];
     switch (spec.kind) {
@@ -123,6 +132,16 @@ export async function openSource(spec: SourceSpec, limits: EngineLimits): Promis
           CREATE TEMPORARY SECRET src_mysql (TYPE mysql, HOST ${lit(spec.host)}, PORT ${spec.port}, DATABASE ${lit(spec.database)},
             USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)});
           ATTACH '' AS src (TYPE mysql, SECRET src_mysql, READ_ONLY)`);
+        break;
+      case 'mongodb':
+        // 先用驱动登录并查权限：密码错误等连接问题在这里报出（扩展列集合失败时只会返回空清单）
+        mongo = await mongoAccess(spec);
+        await con.run(`INSTALL mongo FROM community; LOAD mongo;
+          CREATE TEMPORARY SECRET src_mongo (TYPE mongo, HOST ${lit(spec.host)}, PORT ${lit(String(spec.port))},
+            USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)}, AUTHSOURCE ${lit(spec.authSource)},
+            SRV ${lit(String(spec.srv))}, TLS ${lit(String(spec.tls))});
+          ATTACH ${lit(`dbname=${spec.database}`)} AS src (TYPE mongo, SECRET src_mongo, READ_ONLY);
+          SET mongo_enable_direct_scan = false`);
         break;
       case 's3':
         await con.run(s3Secret(spec.s3));
@@ -141,10 +160,10 @@ export async function openSource(spec: SourceSpec, limits: EngineLimits): Promis
     close();
     throw new Error(redactSourceSecrets((e as Error).message, spec));
   }
-  return { con, tables: () => listTables(con, spec), close };
+  return { con, mongo, tables: () => listTables(con, spec, mongo), close };
 }
 
-async function listTables(con: DuckDBConnection, spec: SourceSpec): Promise<SourceTable[]> {
+async function listTables(con: DuckDBConnection, spec: SourceSpec, mongo?: MongoAccess): Promise<SourceTable[]> {
   if (spec.kind === 's3') {
     const files = await rows<{ file: string }>(con, `SELECT file FROM glob(${lit(`${spec.path}**`)}) ORDER BY file`);
     const byTable = new Map<string, string[]>();
@@ -156,7 +175,10 @@ async function listTables(con: DuckDBConnection, spec: SourceSpec): Promise<Sour
     }
     return [...byTable].map(([name, list]) => ({ name, schema: '', from: `${READERS[spec.format]}([${list.map(lit).join(', ')}])`, readable: true }));
   }
-  const schema = spec.kind === 'postgres' ? spec.schema : spec.kind === 'mysql' ? spec.database : null;
+  if (spec.kind === 'mongodb' && !mongo!.can('listCollections', spec.database, '')) {
+    throw new Error(`账号 ${spec.user} 没有库 ${spec.database} 的读权限，列不出集合。请在 MongoDB 授予：${mongoReadGrant(spec)}`);
+  }
+  const schema = spec.kind === 'postgres' ? spec.schema : spec.kind === 'mysql' || spec.kind === 'mongodb' ? spec.database : null;
   const found = await rows<{ schema: string; name: string }>(con, `
     SELECT table_schema AS schema, table_name AS name FROM information_schema.tables
     WHERE table_catalog = 'src' ${schema ? `AND table_schema = ${lit(schema)}` : ''} ORDER BY ALL`);
@@ -167,7 +189,7 @@ async function listTables(con: DuckDBConnection, spec: SourceSpec): Promise<Sour
     name: schema || t.schema === 'main' ? t.name : `${t.schema}.${t.name}`,
     schema: t.schema,
     from: `src.${ident(t.schema)}.${ident(t.name)}`,
-    readable: !readable || readable.has(`${t.schema}.${t.name}`),
+    readable: mongo ? mongo.can('find', t.schema, t.name) : !readable || readable.has(`${t.schema}.${t.name}`),
   }));
 }
 
@@ -175,6 +197,85 @@ async function listTables(con: DuckDBConnection, spec: SourceSpec): Promise<Sour
 const PG_READABLE_TABLES = `
   SELECT n.nspname AS schema, c.relname AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND has_schema_privilege(n.oid, 'USAGE') AND has_table_privilege(c.oid, 'SELECT')`;
+
+/** MongoDB 权限的作用对象（connectionStatus 返回的 resource；system_buckets 是时序集合的底层桶） */
+interface MongoResource { db?: string; collection?: string; system_buckets?: string; cluster?: boolean; anyResource?: boolean }
+interface MongoPrivilege { resource: MongoResource; actions: string[] }
+
+/** MongoDB 账号的权限：accessControl 为 false 表示服务没有开启访问控制，任何连接都能做任何操作 */
+interface MongoAccess {
+  accessControl: boolean;
+  privileges: MongoPrivilege[];
+  /** 账号能否在 db.collection 上执行 action（collection 为空串表示整个库） */
+  can(action: string, db: string, collection: string): boolean;
+}
+
+/** 让账号能读整个源库的授权语句（在账号所在的认证库上执行） */
+export const mongoReadGrant = (spec: { user: string; authSource: string; database: string }) =>
+  `db.getSiblingDB(${lit(spec.authSource)}).grantRolesToUser(${lit(spec.user)}, [{ role: 'read', db: ${lit(spec.database)} }])`;
+
+const covers = (r: MongoResource, db: string, collection: string) =>
+  !!r.anyResource || (r.db !== undefined && (r.db === '' || r.db === db) && (r.collection === '' || r.collection === collection));
+
+function mongoClient(spec: Extract<SourceSpec, { kind: 'mongodb' }>, withAccount: boolean) {
+  const url = spec.srv ? `mongodb+srv://${spec.host}/` : `mongodb://${spec.host}:${spec.port}/`;
+  const options: MongoClientOptions = { serverSelectionTimeoutMS: 10_000, connectTimeoutMS: 10_000, tls: spec.srv || spec.tls };
+  if (withAccount) Object.assign(options, { auth: { username: spec.user, password: spec.password }, authSource: spec.authSource });
+  return new MongoClient(url, options);
+}
+
+/** 用 connectionStatus 查账号的全部权限；再以不带账号的连接列库，能列出即服务没有开启访问控制 */
+async function mongoAccess(spec: Extract<SourceSpec, { kind: 'mongodb' }>): Promise<MongoAccess> {
+  const client = mongoClient(spec, true);
+  let privileges: MongoPrivilege[];
+  try {
+    const status = await client.db(spec.authSource).command({ connectionStatus: 1, showPrivileges: true });
+    privileges = status.authInfo?.authenticatedUserPrivileges ?? [];
+  } finally {
+    await client.close();
+  }
+  const anonymous = mongoClient(spec, false);
+  const accessControl = await anonymous.db('admin').command({ listDatabases: 1, nameOnly: true })
+    .then(() => false, () => true)
+    .finally(() => anonymous.close());
+  return {
+    accessControl,
+    privileges,
+    can: (action, db, collection) => !accessControl
+      || privileges.some(p => covers(p.resource, db, collection) && (p.actions.includes(action) || p.actions.includes('anyAction'))),
+  };
+}
+
+/** 写入数据、改结构，以及能给自己授权（userAdmin 类）的操作 */
+const MONGO_WRITE_ACTIONS = new Set(['insert', 'update', 'remove', 'createCollection', 'dropCollection', 'dropDatabase', 'createIndex',
+  'dropIndex', 'collMod', 'convertToCapped', 'renameCollectionSameDB', 'emptycapped', 'compact', 'createSearchIndexes', 'dropSearchIndex',
+  'updateSearchIndex', 'applyOps', 'createUser', 'grantRole', 'createRole', 'grantRolesToUser', 'anyAction']);
+
+function mongoResourceLabel(r: MongoResource) {
+  if (r.anyResource) return '整个服务';
+  if (r.cluster) return '集群';
+  const db = r.db ? `库 ${r.db}` : '所有库';
+  if (r.system_buckets !== undefined) return `${db}的时序集合${r.system_buckets ? ` ${r.system_buckets}` : ''}`;
+  if (!r.collection) return db;
+  return r.db ? `${r.db}.${r.collection}` : `所有库的集合 ${r.collection}`;
+}
+
+/** 范围越大越靠前：拒绝登记时只举前几个例子，要让成员先看到最要紧的 */
+const mongoResourceRank = (r: MongoResource) =>
+  r.anyResource ? 0 : r.cluster ? 1 : r.db === '' && r.collection === '' ? 2 : r.collection === '' ? 3 : 4;
+
+function mongoWriteGrants({ accessControl, privileges }: MongoAccess): WriteGrant[] {
+  if (!accessControl) return [{ object: '整个服务（没有开启访问控制，任何连接都能写入）', privileges: ['全部操作'] }];
+  const writes = privileges
+    .map(p => ({ resource: p.resource, actions: p.actions.filter(a => MONGO_WRITE_ACTIONS.has(a)) }))
+    .filter(p => p.actions.length);
+  // 内置角色对整个库授权时，另对 system.js 等系统集合单列一条同样的权限，归到库上即可
+  const wholeDb = new Set(writes.filter(p => p.resource.db && p.resource.collection === '').map(p => p.resource.db));
+  return writes
+    .filter(p => !(p.resource.collection?.startsWith('system.') && wholeDb.has(p.resource.db)))
+    .sort((a, b) => mongoResourceRank(a.resource) - mongoResourceRank(b.resource))
+    .map(p => ({ object: mongoResourceLabel(p.resource), privileges: p.actions }));
+}
 
 /** 按对象归并 (权限, 对象) 行 */
 function groupGrants(list: { privilege: string; object: string }[]): WriteGrant[] {
@@ -243,6 +344,8 @@ export async function writeGrants(session: SourceSession, spec: SourceSpec): Pro
       return groupGrants(await rows(session.con, `SELECT * FROM postgres_query('src', ${lit(PG_WRITE_GRANTS)})`));
     case 'mysql':
       return groupGrants(await rows(session.con, `SELECT * FROM mysql_query('src', ${lit(MYSQL_WRITE_GRANTS)})`));
+    case 'mongodb':
+      return mongoWriteGrants(session.mongo!);
     case 's3':
       return s3WriteGrants(spec.s3, spec.path);
     case 'duckdb':
@@ -306,7 +409,7 @@ const isNumeric = (type: string) => /^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|U
 const isText = (type: string) => type === 'VARCHAR';
 
 /** 在会话里采集一张表：总行数，以及基于前 sampleRows 行样本的列统计与水位线候选 */
-async function profileTable(con: DuckDBConnection, table: SourceTable, increment: string | undefined, sampleRows: number): Promise<TableProfile> {
+async function profileTable(con: DuckDBConnection, table: SourceTable, increment: string | undefined, sampleRows: number, objectIdKey = false): Promise<TableProfile> {
   const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${table.from}`);
   await con.run(`CREATE OR REPLACE TEMP TABLE profile_sample AS SELECT * FROM ${table.from} LIMIT ${sampleRows}`);
   try {
@@ -345,6 +448,10 @@ async function profileTable(con: DuckDBConnection, table: SourceTable, increment
       .filter(c => c.type.startsWith('TIMESTAMP') && UPDATED_AT_NAME.test(c.name) && c.nullRate === 0)
       .map(c => ({ column: c.name, kind: 'updated_at', reason: `时间类型、按命名是更新时间，样本中无空值` }));
     if (increment) candidates.push({ column: increment, kind: 'increment', reason: '由自增序列生成的主键' });
+    const id = objectIdKey ? columns.find(c => c.name === '_id') : undefined;
+    if (id && id.nullRate === 0 && id.formats?.some(f => f.format === 'objectid' && f.share === 1)) {
+      candidates.push({ column: '_id', kind: 'increment', reason: 'ObjectId 主键：前 4 字节是创建时间，大体按插入顺序递增' });
+    }
     return { name: table.name, rows: Number(n), sampleRows: Math.min(Number(n), sampleRows), columns, watermarkCandidates: candidates };
   } finally {
     await con.run('DROP TABLE IF EXISTS profile_sample');
@@ -360,7 +467,9 @@ export async function profileSource(spec: SourceSpec, limits: EngineLimits, { sa
     const increments = await incrementKeys(session.con, spec);
     const all = await session.tables();
     const tables: TableProfile[] = [];
-    for (const t of all.filter(t => t.readable)) tables.push(await profileTable(session.con, t, increments.get(t.name), sampleRows));
+    for (const t of all.filter(t => t.readable)) {
+      tables.push(await profileTable(session.con, t, increments.get(t.name), sampleRows, spec.kind === 'mongodb'));
+    }
     return { tables, unreadable: all.filter(t => !t.readable).map(t => t.name) };
   } catch (e) {
     throw new Error(redactSourceSecrets((e as Error).message, spec));

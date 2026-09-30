@@ -1,0 +1,1 @@
+ALTER TYPE "platform"."source_kind" ADD VALUE 'mongodb' BEFORE 's3';

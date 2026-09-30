@@ -24,7 +24,7 @@ export function meta({}: Route.MetaArgs) {
 
 /** 列表上的一行摘要：连接的目标，不含凭据 */
 const targetOf = (kind: SourceKind, c: Record<string, string>) =>
-  kind === 'postgres' || kind === 'mysql' ? `${c.user}@${c.host}:${c.port}/${c.database}${c.schema ? `（${c.schema}）` : ''}` : c.path;
+  kind === 'postgres' || kind === 'mysql' || kind === 'mongodb' ? `${c.user}@${c.host}:${c.port}/${c.database}${c.schema ? `（${c.schema}）` : ''}` : c.path;
 
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');

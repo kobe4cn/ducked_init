@@ -24,12 +24,12 @@ export function meta({ loaderData }: Route.MetaArgs) {
 }
 
 const CONFIG_LABELS: Record<string, string> = {
-  host: '主机', port: '端口', database: '数据库名', schema: 'schema', user: '用户名',
+  host: '主机', port: '端口', database: '数据库名', schema: 'schema', user: '用户名', srv: 'SRV 记录', tls: 'TLS', authSource: '认证库',
   path: '路径', format: '文件格式', endpoint: '对象存储地址', region: '区域', urlStyle: '寻址方式', useSsl: 'HTTPS',
 };
 
 const FORMAT_LABELS: Record<string, string> = {
-  email: '邮箱', mobile: '手机号', integer: '整数', decimal: '小数', date: '日期', datetime: '日期时间', uuid: 'UUID', json: 'JSON',
+  email: '邮箱', mobile: '手机号', integer: '整数', decimal: '小数', date: '日期', datetime: '日期时间', uuid: 'UUID', json: 'JSON', objectid: 'ObjectId',
 };
 
 export async function loader({ request, params }: Route.LoaderArgs) {

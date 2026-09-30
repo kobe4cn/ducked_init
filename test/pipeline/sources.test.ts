@@ -10,7 +10,7 @@ import { confirmWatermark, getSource, registerSource, SourceError, testSource } 
 import { claimNextTask, finishTask } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
-import { duckdbSourceFile, grantOnSource, pgSourceInput, READER, s3SourceFiles, seedMysqlSource, WRITER } from './source-fixtures';
+import { duckdbSourceFile, grantOnSource, MONGO_USERS, pgSourceInput, READER, s3SourceFiles, seedMongoSource, seedMysqlSource, WRITER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -258,5 +258,60 @@ describe.skipIf(!process.env.TEST_MYSQL_URL)('MySQL 数据源', () => {
     const [orders] = (await getSource(engineer, id)).tables;
     expect(orders).toMatchObject({ name: 'orders', rows: 3 });
     expect(orders.watermarkCandidates.map(c => [c.column, c.kind])).toEqual([['updated_at', 'updated_at'], ['order_id', 'increment']]);
+  });
+});
+
+describe.skipIf(!process.env.TEST_MONGO_URL)('MongoDB 数据源', () => {
+  it('可写账号被拒绝；对源库没有读权限时拒绝并给出授权语句；只读账号登记后每个集合是一张表，嵌套字段展开成列', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const base = await seedMongoSource();
+    await expect(registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.writer }))
+      .rejects.toThrow(/可写[\s\S]*库 crm_source_test（[^）]*insert/);
+    await expect(registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.stranger }))
+      .rejects.toThrow(/没有库 crm_source_test 的读权限[\s\S]*grantRolesToUser\('crm_src_stranger', \[\{ role: 'read', db: 'crm_source_test' \}\]\)/);
+    await expect(registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.reader, password: 'wrong' })).rejects.toThrow(/无法连接数据源/);
+
+    const { id, tables } = await registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.reader });
+    expect(tables).toEqual(['customers', 'events', 'orders']);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    const source = await getSource(engineer, id);
+    expect(source.profile).toMatchObject({ status: 'succeeded' });
+    const byName = Object.fromEntries(source.tables.map(t => [t.name, t]));
+    expect(byName.customers).toMatchObject({ rows: 40, syncMode: 'needs_confirmation' });
+    expect(byName.customers.watermarkCandidates.map(c => [c.column, c.kind])).toEqual([['updated_at', 'updated_at'], ['_id', 'increment']]);
+    expect(byName.customers.columns.map(c => c.name)).toEqual(expect.arrayContaining(['address_city', 'tags']));
+    expect(byName.orders.watermarkCandidates.map(c => [c.column, c.kind])).toEqual([['_id', 'increment']]);
+    expect(byName.events).toMatchObject({ rows: 1500, syncMode: 'full_compare', watermarkCandidates: [] });
+    expect(byName.events.syncModeNote).toMatch(/大表，默认每天同步一次/);
+  });
+
+  it('账号只能读部分集合时照常登记，列出读不了的集合，采集跳过它们', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const base = await seedMongoSource();
+    const { id, tables, unreadable } = await registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.partial });
+    expect({ tables, unreadable }).toEqual({ tables: ['customers'], unreadable: ['events', 'orders'] });
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const source = await getSource(engineer, id);
+    expect(source.tables.map(t => t.name)).toEqual(['customers']);
+    expect(source.profile.unreadable).toEqual(['events', 'orders']);
+  });
+
+  it('只读挂载：不能向源端写入', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const base = await seedMongoSource();
+    // 用可写账号直接挂载（绕过登记时的探测），验证挂载本身也拦住写入
+    const { id } = await registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.reader });
+    const spec = await loadSourceSpec(acme, id);
+    const session = await openSource({ ...spec, ...MONGO_USERS.writer } as typeof spec, { memoryLimitMb: 256, threads: 1 });
+    try {
+      await expect(session.con.run(`INSERT INTO src.crm_source_test.orders (customer) VALUES (1)`)).rejects.toThrow(/read-only/);
+      await expect(session.con.run(`SELECT * FROM mongo_scan('mongodb://localhost:27017', 'admin', 'system.users')`)).rejects.toThrow(/Direct mongo_scan is disabled/);
+    } finally {
+      session.close();
+    }
   });
 });
