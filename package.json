@@ -2,7 +2,7 @@
   "name": "duckdb_crm",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@12.5.1",
+  "packageManager": "pnpm@12.6.0",
   "scripts": {
     "build": "react-router build",
     "dev": "react-router dev",
