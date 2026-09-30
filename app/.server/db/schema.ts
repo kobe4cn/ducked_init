@@ -11,10 +11,13 @@ export const roleEnum = platform.enum('member_role', ROLES);
 
 const createdAt = () => timestamp('created_at', { withTimezone: true }).notNull().defaultNow();
 
+// 停用（suspended_at 非空）：数据完整保留，可以恢复。目前拦截成员的会话与登录；外部系统接口与平台任务随对应切片接入
 export const tenants = platform.table('tenants', {
   id: uuid('id').primaryKey().defaultRandom(),
   slug: text('slug').notNull().unique(),
   name: text('name').notNull(),
+  suspendedAt: timestamp('suspended_at', { withTimezone: true }),
+  suspensionReason: text('suspension_reason'),
   createdAt: createdAt(),
 });
 

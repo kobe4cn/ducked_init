@@ -15,6 +15,8 @@ const ACTIONS = {
     label: '指定管理员',
     describe: (d: Detail) => `${d.email}（${d.from ? `原角色：${roleLabel(d.from)}` : '新增'}）`,
   },
+  'tenant.suspended': { label: '停用租户', describe: (d: Detail) => `原因：${d.reason}` },
+  'tenant.resumed': { label: '恢复租户', describe: (d: Detail) => `停用原因：${d.suspensionReason}` },
   'member.invited': { label: '邀请成员', describe: (d: Detail) => `${d.email}，角色：${roleLabel(d.role)}` },
   'member.role_changed': { label: '修改角色', describe: (d: Detail) => `${d.email}：${roleLabel(d.from)} → ${roleLabel(d.to)}` },
   'member.removed': { label: '移除成员', describe: (d: Detail) => `${d.email}（原角色：${roleLabel(d.role)}）` },

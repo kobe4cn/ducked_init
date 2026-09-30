@@ -1,8 +1,8 @@
-// app/.server/tenants.ts —— 运营者管理租户元数据：开通（租户 + 默认空间 + 首个管理员）、改名、指定管理员。
+// app/.server/tenants.ts —— 运营者管理租户元数据：开通（租户 + 默认空间 + 首个管理员）、改名、指定管理员、停用与恢复。
 // 运营命令与运营后台调用同一套函数；每次操作都在同一事务里写入该租户的审计日志
 import { and, asc, eq, sql } from 'drizzle-orm';
 import { recordAudit, type OperatorActor, type Tx } from './audit';
-import { linkOrigin } from './auth';
+import { linkOrigin, revokeTenantAccess } from './auth';
 import { runInBackground } from './background';
 import { getDb, isUniqueViolation } from './db/client';
 import { members, ROLE_LABELS, spaces, tenants } from './db/schema';
@@ -69,6 +69,8 @@ const tenantSummaries = () =>
       slug: tenants.slug,
       name: tenants.name,
       createdAt: tenants.createdAt,
+      suspendedAt: tenants.suspendedAt,
+      suspensionReason: tenants.suspensionReason,
       memberCount: sql<number>`count(${members.id})::int`,
       adminEmails: sql<string[]>`coalesce(array_agg(${members.email} order by ${members.email}) filter (where ${members.role} = 'admin'), '{}')`,
     })
@@ -154,4 +156,45 @@ export async function assignTenantAdmin(operator: OperatorActor, tenantId: strin
       ].join('\n'),
     }),
   );
+}
+
+/**
+ * 停用租户：必须填写原因。该租户成员的会话与未使用的登录链接随即作废，之后也申请不到这个租户的登录链接。
+ * 数据完整保留，恢复后成员重新登录即可
+ */
+export async function suspendTenant(operator: OperatorActor, tenantId: string, rawReason: string) {
+  const reason = rawReason.trim();
+  if (!reason) throw new TenantError('请填写停用原因');
+  await getDb().transaction(async tx => {
+    const tenant = await lockTenant(tx, tenantId);
+    if (tenant.suspendedAt) throw new TenantError('租户已停用');
+    await tx.update(tenants).set({ suspendedAt: new Date(), suspensionReason: reason }).where(eq(tenants.id, tenant.id));
+    await revokeTenantAccess(tx, tenant.id);
+    await recordAudit(tx, {
+      tenantId: tenant.id,
+      operator,
+      action: 'tenant.suspended',
+      targetType: 'tenant',
+      targetId: tenant.id,
+      detail: { reason },
+    });
+  });
+}
+
+/** 恢复租户：停用时会话已全部作废，成员需要重新登录 */
+export async function resumeTenant(operator: OperatorActor, tenantId: string) {
+  await getDb().transaction(async tx => {
+    const tenant = await lockTenant(tx, tenantId);
+    if (!tenant.suspendedAt) throw new TenantError('租户未停用');
+    await tx.update(tenants).set({ suspendedAt: null, suspensionReason: null }).where(eq(tenants.id, tenant.id));
+    await revokeTenantAccess(tx, tenant.id);
+    await recordAudit(tx, {
+      tenantId: tenant.id,
+      operator,
+      action: 'tenant.resumed',
+      targetType: 'tenant',
+      targetId: tenant.id,
+      detail: { suspensionReason: tenant.suspensionReason },
+    });
+  });
 }

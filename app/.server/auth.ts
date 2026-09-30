@@ -1,6 +1,7 @@
 // app/.server/auth.ts —— 成员登录：Magic Link（一次性、短时有效、仅限已登记邮箱）与会话
 import { createHash, randomBytes } from 'node:crypto';
 import { and, eq, gt, inArray, isNull, lte } from 'drizzle-orm';
+import type { Tx } from './audit';
 import { createCookie, redirect } from 'react-router';
 import { getDb } from './db/client';
 import { magicLinkRequests, magicLinks, members, sessions, spaces, tenants, type Role } from './db/schema';
@@ -78,7 +79,7 @@ export async function recordRequest(key: string): Promise<number> {
 
 /**
  * 为已登记邮箱签发链接：该成员此前未使用的链接一律作废，只有最新一封邮件里的链接有效。
- * 同一邮箱隶属多个租户时，一封邮件里给出每个租户各自的链接。
+ * 同一邮箱隶属多个租户时，一封邮件里给出每个租户各自的链接；已停用的租户不签发（页面答复不变，无法据此探测租户状态）。
  */
 async function issueMagicLinks(email: string, base: string, mailer: Mailer) {
   const db = getDb();
@@ -86,7 +87,7 @@ async function issueMagicLinks(email: string, base: string, mailer: Mailer) {
     .select({ memberId: members.id, tenantName: tenants.name })
     .from(members)
     .innerJoin(tenants, eq(tenants.id, members.tenantId))
-    .where(eq(members.email, email));
+    .where(and(eq(members.email, email), isNull(tenants.suspendedAt)));
   if (!rows.length) return;
 
   const expiresAt = new Date(Date.now() + MAGIC_LINK_TTL_MS);
@@ -110,15 +111,25 @@ async function issueMagicLinks(email: string, base: string, mailer: Mailer) {
   });
 }
 
-/** 消费 Magic Link：原子地标记为已用，成功则开启会话并返回 Set-Cookie 头；过期、已用或不存在返回 null */
+/** 消费 Magic Link：原子地标记为已用，成功则开启会话并返回 Set-Cookie 头；过期、已用、不存在或租户已停用返回 null */
 export async function consumeMagicLink(token: string): Promise<string | null> {
   if (!token) return null;
   const db = getDb();
   const now = new Date();
+  const activeMembers = db
+    .select({ id: members.id })
+    .from(members)
+    .innerJoin(tenants, eq(tenants.id, members.tenantId))
+    .where(isNull(tenants.suspendedAt));
   const [link] = await db
     .update(magicLinks)
     .set({ usedAt: now })
-    .where(and(eq(magicLinks.tokenHash, sha256(token)), isNull(magicLinks.usedAt), gt(magicLinks.expiresAt, now)))
+    .where(and(
+      eq(magicLinks.tokenHash, sha256(token)),
+      isNull(magicLinks.usedAt),
+      gt(magicLinks.expiresAt, now),
+      inArray(magicLinks.memberId, activeMembers),
+    ))
     .returning({ memberId: magicLinks.memberId });
   if (!link) return null;
 
@@ -160,8 +171,20 @@ export async function getCurrentMember(request: Request): Promise<CurrentMember 
     .innerJoin(members, eq(members.id, sessions.memberId))
     .innerJoin(tenants, eq(tenants.id, members.tenantId))
     .innerJoin(spaces, and(eq(spaces.tenantId, tenants.id), eq(spaces.isDefault, true)))
-    .where(and(eq(sessions.tokenHash, sha256(token)), gt(sessions.expiresAt, new Date())));
+    // 停用时会话已被删除；这里再按租户状态兜底，避免与停用并发签发的会话漏网
+    .where(and(eq(sessions.tokenHash, sha256(token)), gt(sessions.expiresAt, new Date()), isNull(tenants.suspendedAt)));
   return row ?? null;
+}
+
+/**
+ * 作废某租户全部成员的会话与未使用的登录链接（停用与恢复租户时调用）。
+ * 恢复时再做一次：签发链接、消费链接与停用并发时，可能在停用之后才写入链接或会话，
+ * 停用期间它们被租户状态拦住，恢复时须一并清除，否则会绕过“恢复后重新登录”
+ */
+export async function revokeTenantAccess(tx: Tx, tenantId: string) {
+  const tenantMembers = tx.select({ id: members.id }).from(members).where(eq(members.tenantId, tenantId));
+  await tx.delete(sessions).where(inArray(sessions.memberId, tenantMembers));
+  await tx.delete(magicLinks).where(and(inArray(magicLinks.memberId, tenantMembers), isNull(magicLinks.usedAt)));
 }
 
 /** 服务端入口处调用：未登录一律跳转登录页 */

@@ -1,10 +1,11 @@
-// app/routes/ops.tenants.tsx —— 运营后台首页：租户列表（只含成员数与管理员邮箱）与开通租户
+// app/routes/ops.tenants.tsx —— 运营后台首页：租户列表（状态、成员数与管理员邮箱）与开通租户
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import { CircleAlert } from 'lucide-react';
 import type { Route } from './+types/ops.tenants';
 import { requireOperator } from '~/.server/ops-auth';
 import { createTenant, listTenants, TenantError } from '~/.server/tenants';
 import { OpsShell } from '~/components/ops-shell';
+import { TenantStatusBadge } from '~/components/tenant-status-badge';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
@@ -21,7 +22,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   const tenants = await listTenants();
   return {
     email: operator.email,
-    tenants: tenants.map(t => ({ ...t, createdAt: t.createdAt.toISOString() })),
+    tenants: tenants.map(t => ({ ...t, createdAt: t.createdAt.toISOString(), suspendedAt: t.suspendedAt?.toISOString() ?? null })),
   };
 }
 
@@ -91,25 +92,43 @@ export default function OpsTenants({ loaderData, actionData }: Route.ComponentPr
                 <TableHead>名称</TableHead>
                 <TableHead>标识</TableHead>
                 <TableHead>开通时间</TableHead>
+                <TableHead>状态</TableHead>
                 <TableHead className="text-right">成员数</TableHead>
                 <TableHead>管理员</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {tenants.map(t => (
-                <TableRow key={t.id} data-tenant-slug={t.slug} data-tenant-id={t.id} data-member-count={t.memberCount}>
+                <TableRow
+                  key={t.id}
+                  data-tenant-slug={t.slug}
+                  data-tenant-id={t.id}
+                  data-member-count={t.memberCount}
+                  data-tenant-status={t.suspendedAt ? 'suspended' : 'active'}
+                  data-suspended-at={t.suspendedAt ?? undefined}
+                >
                   <TableCell>
                     <Link to={`/ops/tenants/${t.id}`} className="underline underline-offset-4">{t.name}</Link>
                   </TableCell>
                   <TableCell className="font-mono">{t.slug}</TableCell>
                   <TableCell className="text-muted-foreground">{new Date(t.createdAt).toLocaleDateString('zh-CN')}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-col gap-1">
+                      <TenantStatusBadge suspended={!!t.suspendedAt} />
+                      {t.suspendedAt && (
+                        <span className="text-xs text-muted-foreground">
+                          {new Date(t.suspendedAt).toLocaleString('zh-CN')}：{t.suspensionReason}
+                        </span>
+                      )}
+                    </div>
+                  </TableCell>
                   <TableCell className="text-right">{t.memberCount}</TableCell>
                   <TableCell>{t.adminEmails.join('、')}</TableCell>
                 </TableRow>
               ))}
               {!tenants.length && (
                 <TableRow>
-                  <TableCell colSpan={5} className="text-center text-muted-foreground">暂无租户</TableCell>
+                  <TableCell colSpan={6} className="text-center text-muted-foreground">暂无租户</TableCell>
                 </TableRow>
               )}
             </TableBody>
