@@ -9,7 +9,7 @@ import { recordAudit, type OperatorActor, type Tx } from './audit';
 import { getDb, type Db } from './db/client';
 import { tenantLakes } from './db/schema';
 import { openTenantLake, type LakeSpec } from './pipeline/lake-engine';
-import { issueTenantS3Account, platformS3, s3UserOf } from './s3-accounts';
+import { issueTenantS3Account, platformS3, putPrefixPlaceholder, s3UserOf } from './s3-accounts';
 
 type TenantLakeRow = typeof tenantLakes.$inferSelect;
 
@@ -93,15 +93,16 @@ async function ensureTenantS3Account(tenantId: string, operator: OperatorActor) 
 }
 
 /**
- * 建好存储前缀（对象存储上先建好本租户的账号）并初始化 DuckLake catalog（首次挂载时建元数据表）。
+ * 建好存储前缀（对象存储上先建好本租户的账号，再用它写入占位对象 .keep）并初始化 DuckLake catalog（首次挂载时建元数据表）。
  * 可重复执行：开通时初始化失败，或本功能上线前开通、还没有对象存储账号的租户，运营者可以重试补建。
  * 用本租户的数据库角色挂载，初始化出的元数据表归该角色所有。新建对象存储账号时记入审计，操作者为 operator
  */
 export async function initTenantCatalog(tenantId: string, operator: OperatorActor) {
   await ensureTenantS3Account(tenantId, operator);
-  const lake = (await lakeRow(tenantId))!;
-  if (!isS3(lake.dataPath)) await mkdir(lake.dataPath, { recursive: true });
-  const session = await openTenantLake(lakeSpecOf(lake), { memoryLimitMb: 256, threads: 1 });
+  const spec = lakeSpecOf((await lakeRow(tenantId))!);
+  if (spec.s3) await putPrefixPlaceholder(spec.dataPath, spec.s3);
+  else await mkdir(spec.dataPath, { recursive: true });
+  const session = await openTenantLake(spec, { memoryLimitMb: 256, threads: 1 });
   session.close();
   await getDb().update(tenantLakes).set({ catalogInitializedAt: new Date() }).where(eq(tenantLakes.tenantId, tenantId));
 }

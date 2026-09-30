@@ -22,32 +22,38 @@ export const s3UserOf = (tenantId: string) => `lake-${tenantId}`;
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 const hmac = (key: string | Buffer, s: string) => createHmac('sha256', key).update(s).digest();
 
-/** 调用 IAM API（AWS Signature V4 签名的表单 POST），返回响应 XML；出错时抛出带错误码的 IamError */
-async function iam(action: string, params: Record<string, string>) {
-  const s3 = platformS3();
-  const url = new URL(`${s3.useSsl ? 'https' : 'http'}://${s3.endpoint}/`);
-  const body = new URLSearchParams({ Action: action, Version: '2010-05-08', ...params }).toString();
+type S3Creds = Pick<ReturnType<typeof platformS3>, 'endpoint' | 'region' | 'key' | 'secret' | 'useSsl'>;
+
+/** 向存储服务发一个 AWS Signature V4 签名的请求；path 是已编码的路径（path-style：/bucket/key） */
+function signedFetch(creds: S3Creds, service: 'iam' | 's3', method: string, path: string, body: string, contentType: string) {
+  const url = new URL(`${creds.useSsl ? 'https' : 'http'}://${creds.endpoint}${path}`);
   const amzDate = new Date().toISOString().replace(/[-:]|\.\d{3}/g, '');
-  const scope = `${amzDate.slice(0, 8)}/${s3.region}/iam/aws4_request`;
+  const scope = `${amzDate.slice(0, 8)}/${creds.region}/${service}/aws4_request`;
   const headers: Record<string, string> = {
-    'content-type': 'application/x-www-form-urlencoded; charset=utf-8',
+    'content-type': contentType,
     host: url.host,
     'x-amz-content-sha256': sha256(body),
     'x-amz-date': amzDate,
   };
   const signed = Object.keys(headers).sort();
   const canonicalHeaders = signed.map(k => `${k}:${headers[k]}\n`).join('');
-  const canonical = ['POST', '/', '', canonicalHeaders, signed.join(';'), headers['x-amz-content-sha256']].join('\n');
-  const signingKey = [amzDate.slice(0, 8), s3.region, 'iam', 'aws4_request'].reduce<string | Buffer>((k, part) => hmac(k, part), `AWS4${s3.secret}`);
+  const canonical = [method, url.pathname, '', canonicalHeaders, signed.join(';'), headers['x-amz-content-sha256']].join('\n');
+  const signingKey = [amzDate.slice(0, 8), creds.region, service, 'aws4_request'].reduce<string | Buffer>((k, part) => hmac(k, part), `AWS4${creds.secret}`);
   const signature = hmac(signingKey, ['AWS4-HMAC-SHA256', amzDate, scope, sha256(canonical)].join('\n')).toString('hex');
   const { host: _host, ...sent } = headers;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { ...sent, authorization: `AWS4-HMAC-SHA256 Credential=${s3.key}/${scope}, SignedHeaders=${signed.join(';')}, Signature=${signature}` },
+  return fetch(url, {
+    method,
+    headers: { ...sent, authorization: `AWS4-HMAC-SHA256 Credential=${creds.key}/${scope}, SignedHeaders=${signed.join(';')}, Signature=${signature}` },
     body,
     // 调用方可能正持有平台 PG 的行锁，存储服务无响应时不能一直等下去
     signal: AbortSignal.timeout(15_000),
   });
+}
+
+/** 用平台账号调用 IAM API（表单 POST），返回响应 XML；出错时抛出带错误码的 IamError */
+async function iam(action: string, params: Record<string, string>) {
+  const body = new URLSearchParams({ Action: action, Version: '2010-05-08', ...params }).toString();
+  const res = await signedFetch(platformS3(), 'iam', 'POST', '/', body, 'application/x-www-form-urlencoded; charset=utf-8');
   const xml = await res.text();
   if (!res.ok) throw new IamError(action, tag(xml, 'Code') ?? String(res.status), tag(xml, 'Message') ?? xml);
   return xml;
@@ -98,4 +104,14 @@ export async function deleteTenantS3Account(tenantId: string) {
   await iam('DeleteUser', { UserName: s3UserOf(tenantId) }).catch(e => {
     if (!(e instanceof IamError && e.code === 'NoSuchEntity')) throw e;
   });
+}
+
+/**
+ * 用租户自己的账号在存储前缀下写入空的占位对象 .keep：对象存储没有真正的目录，还没有数据时前缀在存储服务上看不到。
+ * 可重复执行（覆盖写入）
+ */
+export async function putPrefixPlaceholder(dataPath: string, creds: S3Creds) {
+  const path = `/${dataPath.replace(/^s3:\/\//, '').split('/').filter(Boolean).map(encodeURIComponent).join('/')}/.keep`;
+  const res = await signedFetch(creds, 's3', 'PUT', path, '', 'application/octet-stream');
+  if (!res.ok) throw new Error(`在 ${dataPath} 写入占位对象失败（HTTP ${res.status}）：${await res.text()}`);
 }

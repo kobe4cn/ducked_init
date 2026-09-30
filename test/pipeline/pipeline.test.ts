@@ -81,6 +81,9 @@ const filesUnder = (lake: LakeSpec, prefix: string) =>
   unlocked(platformS3(lake), async con =>
     (await con.runAndReadAll(`SELECT file FROM glob('${prefix}**')`)).getRowObjectsJson().map(r => r.file as string));
 
+/** 存储前缀下的数据文件（不含占位对象 .keep） */
+const parquetUnder = async (lake: LakeSpec, prefix: string) => (await filesUnder(lake, prefix)).filter(f => f.endsWith('.parquet'));
+
 /** 以工作进程的方式打开租户的数据湖：领取任务得到的就是工作进程拿到的全部凭据 */
 async function openAsWorker(tenantId: string) {
   const { id } = await enqueueTask(tenantId, 'lake.inventory');
@@ -138,7 +141,7 @@ for (const { storage, lakeUri } of STORAGES) {
       const worker = await openAsWorker(globex);
       try {
         const { task, denied } = worker;
-        expect(await filesUnder(task.lake, acmeLake.dataPath)).not.toEqual([]);
+        expect(await parquetUnder(task.lake, acmeLake.dataPath)).not.toEqual([]);
         expect(JSON.stringify(task)).not.toContain(acmeLake.catalogSchema);
         expect(await denied(`SELECT count(*) FROM read_parquet('${acmeLake.dataPath}**/*.parquet')`)).toMatch(/Permission Error/);
         expect(await denied(`SELECT * FROM glob('${acmeLake.dataPath}*')`)).toMatch(/Permission Error/);
@@ -159,6 +162,13 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储上的越权访问',
   const defaultLakeUri = process.env.PLATFORM_LAKE_URI;
   beforeAll(() => { process.env.PLATFORM_LAKE_URI = process.env.TEST_S3_LAKE_URI; });
   afterAll(() => { process.env.PLATFORM_LAKE_URI = defaultLakeUri; });
+
+  it('开通后租户的存储前缀下即有占位对象 .keep，还没有数据时也能在存储服务上看到这个前缀', async () => {
+    const acme = await newTenant('acme');
+    const worker = await openAsWorker(acme);
+    await worker.close();
+    expect(await filesUnder(worker.task.lake, worker.task.lake.dataPath)).toEqual([`${worker.task.lake.dataPath}.keep`]);
+  });
 
   it('工作进程拿到的是本租户的 S3 凭据，不含平台账号的密钥', async () => {
     const acme = await newTenant('acme');
@@ -185,7 +195,7 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储上的越权访问',
     const worker = await openAsWorker(globex);
     await worker.close();
     const { lake } = worker.task;
-    const [acmeFile] = await filesUnder(lake, acmeLake.dataPath);
+    const [acmeFile] = await parquetUnder(lake, acmeLake.dataPath);
     expect(acmeFile).toBeDefined();
     const bucket = acmeLake.dataPath.split('/').slice(0, 3).join('/');
     const viaTraversal = `${lake.dataPath}../${acme}/`;
@@ -251,7 +261,7 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储上的越权访问',
     try {
       const { task, con, denied } = worker;
       const s3 = task.lake.s3!;
-      const [acmeFile] = await filesUnder(task.lake, acmeLake.dataPath);
+      const [acmeFile] = await parquetUnder(task.lake, acmeLake.dataPath);
       const viaEndpoint = acmeFile.replace('s3://', `${s3.useSsl ? 'https' : 'http'}://${s3.endpoint}/`);
       expect(await denied(`SELECT count(*) FROM read_parquet('${viaEndpoint}')`)).toMatch(/Permission Error/);
 
