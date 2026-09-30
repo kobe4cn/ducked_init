@@ -46,7 +46,7 @@ export async function action({ request, params }: Route.ActionArgs) {
         await suspendTenant(operator, params.tenantId, field('reason'));
         break;
       case 'resume':
-        await resumeTenant(operator, params.tenantId);
+        await resumeTenant(operator, params.tenantId, field('reason'));
         break;
       default:
         return data({ error: '未知操作' }, { status: 400 });
@@ -145,12 +145,18 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
         <Card>
           <CardHeader>
             <CardTitle>恢复租户</CardTitle>
-            <CardDescription>恢复后成员需要重新登录。</CardDescription>
+            <CardDescription>恢复后成员需要重新登录。原因会记入租户的审计日志，租户管理员可以看到。</CardDescription>
           </CardHeader>
           <CardContent>
             <Form method="post">
               <input type="hidden" name="intent" value="resume" />
-              <Button type="submit" disabled={submitting}>恢复</Button>
+              <FieldGroup className="flex-row items-end">
+                <Field>
+                  <FieldLabel htmlFor="resume-reason">恢复原因</FieldLabel>
+                  <Input id="resume-reason" name="reason" required placeholder="例如：已续约" />
+                </Field>
+                <Button type="submit" disabled={submitting}>恢复</Button>
+              </FieldGroup>
             </Form>
           </CardContent>
         </Card>

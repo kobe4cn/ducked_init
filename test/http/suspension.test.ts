@@ -24,7 +24,7 @@ async function tenantRow(ops: Client, slug: string) {
 }
 
 const suspend = (ops: Client, id: string, reason: string) => ops.post(`/ops/tenants/${id}`, { intent: 'suspend', reason });
-const resume = (ops: Client, id: string) => ops.post(`/ops/tenants/${id}`, { intent: 'resume' });
+const resume = (ops: Client, id: string, reason = '已续约') => ops.post(`/ops/tenants/${id}`, { intent: 'resume', reason });
 
 /** 申请登录链接，返回页面答复（去掉脚本）与这次发出的邮件 */
 async function requestLogin(email: string) {
@@ -127,7 +127,7 @@ describe('停用期间不能指定管理员', () => {
 });
 
 describe('恢复租户', () => {
-  it('恢复后成员需要重新登录；停用与恢复都写入该租户的审计日志', async () => {
+  it('恢复必须填写原因；恢复后成员需要重新登录；停用与恢复都写入该租户的审计日志', async () => {
     await createTenant('acme', '示例商贸', 'admin@acme.com');
     const before = await loginAs(app, 'admin@acme.com');
     const ops = await operator();
@@ -138,7 +138,12 @@ describe('恢复租户', () => {
     expect(await notSuspended.text()).toContain('未停用');
 
     await suspend(ops, id, '欠费未续约');
-    expect((await resume(ops, id)).status).toBe(302);
+    const blank = await resume(ops, id, '  ');
+    expect(blank.status).toBe(400);
+    expect(await blank.text()).toContain('请填写恢复原因');
+    expect((await tenantRow(ops, 'acme')).status).toBe('suspended');
+
+    expect((await resume(ops, id, '客户已续约')).status).toBe(302);
     const row = await tenantRow(ops, 'acme');
     expect(row.status).toBe('active');
     expect(row.html).not.toContain('欠费未续约');
@@ -147,7 +152,8 @@ describe('恢复租户', () => {
     const admin = await loginAs(app, 'admin@acme.com');
     const audit = await (await admin.get('/audit')).text();
     expect(auditActions(audit)).toEqual(['恢复租户', '停用租户', '开通租户']);
-    expect(audit).toContain('欠费未续约');
+    expect(audit).toContain('原因：欠费未续约');
+    expect(audit).toContain('原因：客户已续约');
     expect(audit).toContain(`运营者 ${OPS}`);
 
     const events = await (await ops.get('/ops/audit')).text();

@@ -182,8 +182,10 @@ export async function suspendTenant(operator: OperatorActor, tenantId: string, r
   });
 }
 
-/** 恢复租户：停用时会话已全部作废，成员需要重新登录 */
-export async function resumeTenant(operator: OperatorActor, tenantId: string) {
+/** 恢复租户：必须填写原因。停用时会话已全部作废，成员需要重新登录 */
+export async function resumeTenant(operator: OperatorActor, tenantId: string, rawReason: string) {
+  const reason = rawReason.trim();
+  if (!reason) throw new TenantError('请填写恢复原因');
   await getDb().transaction(async tx => {
     const tenant = await lockTenant(tx, tenantId);
     if (!tenant.suspendedAt) throw new TenantError('租户未停用');
@@ -195,7 +197,7 @@ export async function resumeTenant(operator: OperatorActor, tenantId: string) {
       action: 'tenant.resumed',
       targetType: 'tenant',
       targetId: tenant.id,
-      detail: { suspensionReason: tenant.suspensionReason },
+      detail: { reason, suspensionReason: tenant.suspensionReason },
     });
   });
 }
