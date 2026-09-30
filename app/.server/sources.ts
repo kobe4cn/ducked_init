@@ -105,15 +105,15 @@ export async function registerSource(actor: CurrentMember, input: SourceInput) {
 
 /**
  * 表的同步方式：成员确认了水位线字段 → 水位线增量；有候选未确认 → 待确认；
- * 没有候选的表 → 全量比对（大表默认每天一次，见 ADR-0010）
+ * 没有候选的表 → 全量比对（大表默认每天一次，见 ADR-0010；尚未上线，这类表目前不会进湖）
  */
 function syncModeOf(table: TableProfile, watermark: string | null): { syncMode: SyncMode; syncModeNote: string } {
   if (watermark) return { syncMode: 'watermark', syncModeNote: `按 ${watermark} 增量同步` };
   if (table.watermarkCandidates.length) return { syncMode: 'needs_confirmation', syncModeNote: '平台找到了可用的水位线字段，请确认' };
-  const note = '没有更新时间或自增主键，每次全量拉取并与上一版比对';
+  const note = '没有更新时间或自增主键，需要全量比对：这种同步方式尚未上线，这张表不会进湖';
   const threshold = largeTableRows();
   if (table.rows < threshold) return { syncMode: 'full_compare', syncModeNote: note };
-  return { syncMode: 'full_compare', syncModeNote: `${note}；行数达到 ${threshold.toLocaleString('zh-CN')}（大表，默认每天同步一次）` };
+  return { syncMode: 'full_compare', syncModeNote: `${note}；行数达到 ${threshold.toLocaleString('zh-CN')}（大表，上线后默认每天同步一次）` };
 }
 
 /** 数据源最近一次采集任务（任何状态），以及最近一次成功的采集结果 */

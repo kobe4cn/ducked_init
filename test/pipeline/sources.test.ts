@@ -120,7 +120,7 @@ describe('采集表清单、列统计与水位线候选', () => {
     expect(byName.orders.watermarkCandidates.map(c => [c.column, c.kind])).toEqual([['order_id', 'increment']]);
     expect(byName.regions).toMatchObject({ rows: 2, watermarkCandidates: [], syncMode: 'full_compare' });
     expect(byName.events).toMatchObject({ rows: 1500, watermarkCandidates: [], syncMode: 'full_compare' });
-    expect(byName.events.syncModeNote).toContain('大表，默认每天同步一次');
+    expect(byName.events.syncModeNote).toContain('大表，上线后默认每天同步一次');
     expect(byName.regions.syncModeNote).not.toContain('大表');
   });
 
@@ -284,7 +284,7 @@ describe.skipIf(!process.env.TEST_MONGO_URL)('MongoDB 数据源', () => {
     expect(byName.customers.columns.map(c => c.name)).toEqual(expect.arrayContaining(['address_city', 'tags']));
     expect(byName.orders.watermarkCandidates.map(c => [c.column, c.kind])).toEqual([['_id', 'increment']]);
     expect(byName.events).toMatchObject({ rows: 1500, syncMode: 'full_compare', watermarkCandidates: [] });
-    expect(byName.events.syncModeNote).toMatch(/大表，默认每天同步一次/);
+    expect(byName.events.syncModeNote).toMatch(/大表，上线后默认每天同步一次/);
   });
 
   it('账号只能读部分集合时照常登记，列出读不了的集合，采集跳过它们', async () => {

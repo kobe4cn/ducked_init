@@ -1,5 +1,5 @@
 // app/routes/source.tsx —— 单个数据源：连接参数（凭据不显示）、测试连接、修改与轮换凭据、重新采集；
-// 各表的行数、列统计、同步方式与水位线候选，成员从候选中确认水位线字段，没有主键的表确认业务主键；手动触发同步，查看每张表的同步历史
+// 各表的行数、列统计、同步方式、是否已进湖与水位线候选，成员从候选中确认水位线字段，没有主键的表确认业务主键；手动触发同步，查看每张表的同步历史
 import { useEffect } from 'react';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
 import { CircleAlert, CircleCheck } from 'lucide-react';
@@ -9,7 +9,7 @@ import { navFor } from '~/.server/nav';
 import { getSyncStatus, syncSource } from '~/.server/source-sync';
 import { confirmKey, confirmWatermark, getSource, refreshSourceProfile, SourceError, testSource, updateSource } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
-import { formValues, SOURCE_KIND_LABELS, SYNC_MODES } from '~/lib/sources';
+import { formValues, SOURCE_KIND_LABELS, SYNC_MODES, type SyncMode } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
 import { SourceFields } from '~/components/source-fields';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
@@ -58,7 +58,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         unreadable: source.profile.unreadable,
         profiledAt: source.profile.profiledAt?.toISOString() ?? null,
       },
-      tables: source.tables,
+      tables: source.tables.map(t => ({ ...t, notInLake: notInLakeReason(t, sync.history[t.name]) })),
       sync: {
         status: sync.status,
         statusLabel: sync.status === 'none' ? '未同步' : TASK_STATUS_LABELS[sync.status],
@@ -110,6 +110,17 @@ export async function action({ request, params }: Route.ActionArgs) {
     throw e;
   }
   throw redirect(`/sources/${params.sourceId}`);
+}
+
+/**
+ * 源表为什么没有进湖；同步成功过（写出过变更批次）的表返回 null。
+ * 同步页只列出同步过的表，这里从源端的全部表出发，没进湖的表不会被漏看
+ */
+function notInLakeReason(t: { syncMode: SyncMode }, history: object[] | undefined): string | null {
+  if (history?.some(e => !('error' in e))) return null;
+  if (t.syncMode === 'full_compare') return '全量比对尚未上线';
+  if (t.syncMode === 'needs_confirmation') return '待确认水位线';
+  return history?.length ? '同步失败' : '等待首次同步';
 }
 
 const TASK_VARIANTS = { none: 'outline', queued: 'outline', running: 'secondary', succeeded: 'default', failed: 'destructive' } as const;
@@ -167,6 +178,20 @@ function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }
           ))}
         </TableBody>
       </Table>
+    </div>
+  );
+}
+
+/** 进湖情况：源端的表（含账号读不了的）有几张已经进湖，没进湖的逐张说明原因 */
+function LakeCoverage({ tables, unreadable }: { tables: TableView[]; unreadable: string[] }) {
+  const missing = [
+    ...tables.filter(t => t.notInLake).map(t => `${t.name}（${t.notInLake}）`),
+    ...unreadable.map(name => `${name}（账号没有读权限）`),
+  ];
+  const inLake = tables.length - tables.filter(t => t.notInLake).length;
+  return (
+    <div className={`text-sm ${missing.length ? 'text-destructive' : 'text-muted-foreground'}`} data-lake-coverage>
+      {`已进湖 ${inLake} 张，未进湖 ${missing.length} 张${missing.length ? `：${missing.join('、')}` : ''}`}
     </div>
   );
 }
@@ -331,10 +356,11 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
             <Badge variant={TASK_VARIANTS[profile.status]} data-profile-status={profile.status}>{`采集${profile.statusLabel}`}</Badge>
           </CardTitle>
           <CardDescription>
-            {`有更新时间或自增主键的表按水位线增量同步（需确认字段）；没有的表全量比对（大表默认每天一次）。最近采集：${time(profile.profiledAt)}`}
+            {`有更新时间或自增主键的表按水位线增量同步（需确认字段）；没有的表需要全量比对，这种同步方式尚未上线。最近采集：${time(profile.profiledAt)}`}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
+          {(tables.length > 0 || profile.unreadable.length > 0) && <LakeCoverage tables={tables} unreadable={profile.unreadable} />}
           {profile.status === 'failed' && profile.error && (
             <div className="text-sm text-destructive">{`${time(profile.attemptedAt)} 提交的采集失败：${profile.error}`}</div>
           )}
@@ -360,7 +386,12 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
                   </TableCell>
                   <TableCell className="align-top">{t.rows.toLocaleString('zh-CN')}</TableCell>
                   <TableCell className="space-y-1 align-top whitespace-normal">
-                    <Badge variant={SYNC_VARIANTS[t.syncMode]}>{SYNC_MODES[t.syncMode]}</Badge>
+                    <div className="flex flex-wrap gap-1">
+                      <Badge variant={SYNC_VARIANTS[t.syncMode]}>{SYNC_MODES[t.syncMode]}</Badge>
+                      <Badge variant={t.notInLake ? 'destructive' : 'secondary'} data-in-lake={String(!t.notInLake)}>
+                        {t.notInLake ? `未进湖：${t.notInLake}` : '已进湖'}
+                      </Badge>
+                    </div>
                     <div className="text-xs text-muted-foreground">{t.syncModeNote}</div>
                     <Watermark table={t} canWrite={canWrite} submitting={submitting} />
                     <Key table={t} canWrite={canWrite} submitting={submitting} />

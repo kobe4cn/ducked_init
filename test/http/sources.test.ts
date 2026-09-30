@@ -132,7 +132,7 @@ describe('测试连接与轮换凭据', () => {
 });
 
 describe('列统计与水位线', () => {
-  it('采集完成后展示每张表的列统计、同步方式；没有水位线的大表也全量比对，默认每天同步；确认水位线后按增量同步', async () => {
+  it('采集完成后展示每张表的列统计、同步方式；没有水位线的表需要全量比对，页面如实说明该方式尚未上线；确认水位线后按增量同步', async () => {
     const { browser } = await engineerOf('acme');
     const id = sourceIdOf(await register(browser, await pgSourceInput(READER)));
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
@@ -140,8 +140,9 @@ describe('列统计与水位线', () => {
     const html = await (await browser.get(`/sources/${id}`)).text();
     expect(html).toContain('data-profile-status="succeeded"');
     expect(html).toMatch(/data-table="events"[^>]*data-sync-mode="full_compare"/);
-    expect(html).toContain('大表，默认每天同步一次');
-    expect(html).not.toContain('不支持');
+    expect(html).toContain('全量比对（未上线）');
+    expect(html).toContain('这种同步方式尚未上线，这张表不会进湖');
+    expect(html).toContain('大表，上线后默认每天同步一次');
     expect(html).toMatch(/data-table="regions"[^>]*data-sync-mode="full_compare"/);
     expect(html).toMatch(/data-table="customers"[^>]*data-sync-mode="needs_confirmation"/);
     expect(html).toMatch(/data-column="email"[\s\S]*?25(\.0)?%[\s\S]*?邮箱 100%/);
@@ -184,6 +185,7 @@ describe('列统计与水位线', () => {
     expect(html).toContain('data-profile-status="succeeded"');
     expect(html).toContain('已跳过 1 张表：events');
     expect(html).not.toContain('data-table="events"');
+    expect(html).toMatch(/data-lake-coverage[^>]*>[\s\S]*?已进湖 0 张，未进湖 4 张[\s\S]*?events（账号没有读权限）/);
 
     await grantOnSource(`REVOKE USAGE ON SCHEMA shop FROM ${READER.user}`);
     const rejected = await register(browser, { ...input, name: '电商库 2' });
@@ -202,6 +204,9 @@ describe('同步', () => {
     const early = await browser.post(`/sources/${id}`, { intent: 'sync' });
     expect(early.status).toBe(400);
     expect(await early.text()).toContain('没有已确认水位线的表');
+    const before = await (await browser.get(`/sources/${id}`)).text();
+    expect(before).toMatch(/data-lake-coverage[^>]*>[\s\S]*?已进湖 0 张，未进湖 4 张/);
+    expect(before).toMatch(/data-table="customers"[\s\S]*?data-in-lake="false"[^>]*>未进湖：待确认水位线/);
 
     await browser.post(`/sources/${id}`, { intent: 'confirm-watermark', table: 'customers', column: 'updated_at' });
     expect((await browser.post(`/sources/${id}`, { intent: 'sync' })).status).toBe(302);
@@ -211,6 +216,10 @@ describe('同步', () => {
     const html = await (await browser.get(`/sources/${id}`)).text();
     expect(html).toContain('data-sync-status="succeeded"');
     expect(html).toMatch(/data-sync-table="customers"[\s\S]*?data-batch="1"[\s\S]*?全表读取[\s\S]*?40[\s\S]*?ms[\s\S]*?2024-06-02 16:00:00/);
+    // 进湖情况：只有同步成功过的表算进湖，其余的说明原因
+    expect(html).toMatch(/data-lake-coverage[^>]*>[\s\S]*?已进湖 1 张，未进湖 3 张/);
+    expect(html).toMatch(/data-table="customers"[\s\S]*?data-in-lake="true"[^>]*>已进湖/);
+    expect(html).toMatch(/data-table="events"[\s\S]*?data-in-lake="false"[^>]*>未进湖：全量比对尚未上线/);
 
     await memberOf(tenantId, 'an@acme.com', 'analyst');
     const analyst = await loginAs(app, 'an@acme.com');
