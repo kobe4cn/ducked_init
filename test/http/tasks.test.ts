@@ -44,6 +44,20 @@ describe('成员查看本租户的任务', () => {
     expect(rows[1].html).toContain('参数 customers');
     expect(rows[2].html).toContain('成功');
   });
+
+  it('成功的任务可以查看结果：各表的行数与运行时的配额', async () => {
+    const acme = await newTenant('acme');
+    await runTask(acme, 'lake.inventory');
+    await runTask(acme, 'demo.seed', { customers: 10 });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const [seed, inventory] = taskRows(await (await admin.get('/tasks')).text());
+    expect(seed.html).toContain('查看结果');
+    expect(seed.html).toMatch(/data-result-table="customers"[\s\S]*?>10 行</);
+    expect(seed.html).toContain('data-result-table="orders"');
+    expect(seed.html).toMatch(/内存 \d+(\.\d+)? ?\w+ · 2 线程/);
+    expect(inventory.html).toContain('数据湖里还没有表');
+  });
 });
 
 describe('运营者设置租户配额', () => {
