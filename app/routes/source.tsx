@@ -1,11 +1,12 @@
 // app/routes/source.tsx —— 单个数据源：连接参数（凭据不显示）、测试连接、修改与轮换凭据、重新采集；
-// 各表的行数、列统计、同步方式与水位线候选，成员从候选中确认水位线字段
+// 各表的行数、列统计、同步方式与水位线候选，成员从候选中确认水位线字段；手动触发同步，查看每张表的同步历史
 import { useEffect } from 'react';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
 import { CircleAlert, CircleCheck } from 'lucide-react';
 import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
+import { getSyncStatus, syncSource } from '~/.server/source-sync';
 import { confirmWatermark, getSource, refreshSourceProfile, SourceError, testSource, updateSource } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { formValues, SOURCE_KIND_LABELS, SYNC_MODES } from '~/lib/sources';
@@ -36,6 +37,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   try {
     const source = await getSource(member, params.sourceId);
+    const sync = await getSyncStatus(member, params.sourceId);
     return {
       email: member.email,
       nav: navFor(member),
@@ -57,6 +59,14 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         profiledAt: source.profile.profiledAt?.toISOString() ?? null,
       },
       tables: source.tables,
+      sync: {
+        status: sync.status,
+        statusLabel: sync.status === 'none' ? '未同步' : TASK_STATUS_LABELS[sync.status],
+        error: sync.error,
+        attemptedAt: sync.attemptedAt?.toISOString() ?? null,
+        finishedAt: sync.finishedAt?.toISOString() ?? null,
+        history: sync.history,
+      },
     };
   } catch (e) {
     if (e instanceof SourceError) throw data(null, { status: e.status });
@@ -81,6 +91,9 @@ export async function action({ request, params }: Route.ActionArgs) {
       case 'refresh':
         await refreshSourceProfile(member, params.sourceId);
         break;
+      case 'sync':
+        await syncSource(member, params.sourceId);
+        break;
       case 'confirm-watermark':
         await confirmWatermark(member, params.sourceId, field('table'), field('column'));
         break;
@@ -96,12 +109,57 @@ export async function action({ request, params }: Route.ActionArgs) {
   throw redirect(`/sources/${params.sourceId}`);
 }
 
-const PROFILE_VARIANTS = { none: 'outline', queued: 'outline', running: 'secondary', succeeded: 'default', failed: 'destructive' } as const;
+const TASK_VARIANTS = { none: 'outline', queued: 'outline', running: 'secondary', succeeded: 'default', failed: 'destructive' } as const;
 const SYNC_VARIANTS = { watermark: 'default', needs_confirmation: 'secondary', full_compare: 'outline' } as const;
 const pct = (n: number) => `${Math.round(n * 1000) / 10}%`;
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
 type TableView = Route.ComponentProps['loaderData']['tables'][number];
+type SyncEntry = Route.ComponentProps['loaderData']['sync']['history'][string][number];
+
+const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
+
+/** 一张表的同步历史：每次同步一个变更批次（新的在前） */
+function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }) {
+  return (
+    <div data-sync-table={table} className="space-y-1">
+      <div className="font-mono text-sm font-medium">{table}</div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>批次</TableHead>
+            <TableHead>方式</TableHead>
+            <TableHead>行数</TableHead>
+            <TableHead>耗时</TableHead>
+            <TableHead>水位线</TableHead>
+            <TableHead>开始时间</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {entries.map(e => 'error' in e ? (
+            <TableRow key={e.taskId} data-sync-error>
+              <TableCell>—</TableCell>
+              <TableCell colSpan={3} className="whitespace-normal text-destructive">{`失败：${e.error}`}</TableCell>
+              <TableCell>—</TableCell>
+              <TableCell>{time(e.startedAt)}</TableCell>
+            </TableRow>
+          ) : (
+            <TableRow key={e.taskId} data-batch={e.batch}>
+              <TableCell>{e.batch}</TableCell>
+              <TableCell>{e.mode === 'full' ? '全表读取' : '增量'}</TableCell>
+              <TableCell>{`${e.rows.toLocaleString('zh-CN')}（新增 ${e.inserted.toLocaleString('zh-CN')}，更新 ${e.updated.toLocaleString('zh-CN')}）`}</TableCell>
+              <TableCell>{duration(e.durationMs)}</TableCell>
+              <TableCell className="font-mono text-xs whitespace-normal">
+                {`${e.watermarkColumn}：${e.watermarkFrom ?? '起始'} → ${e.watermarkTo ?? '—'}`}
+              </TableCell>
+              <TableCell>{time(e.startedAt)}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
 
 function ColumnStats({ table }: { table: TableView }) {
   return (
@@ -164,16 +222,18 @@ function Watermark({ table, canWrite, submitting }: { table: TableView; canWrite
 }
 
 export default function Source({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, source, profile, tables } = loaderData;
+  const { email, nav, canWrite, source, profile, tables, sync } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const profiling = profile.status === 'queued' || profile.status === 'running';
-  // 采集在调度器里异步进行：进行中时定时刷新，结束后停下
+  const syncing = sync.status === 'queued' || sync.status === 'running';
+  // 采集与同步在调度器里异步进行：进行中时定时刷新，结束后停下
   const revalidator = useRevalidator();
   useEffect(() => {
-    if (!profiling) return;
+    if (!profiling && !syncing) return;
     const timer = setInterval(() => { if (revalidator.state === 'idle') revalidator.revalidate(); }, 2000);
     return () => clearInterval(timer);
-  }, [profiling, revalidator]);
+  }, [profiling, syncing, revalidator]);
+  const synced = Object.entries(sync.history);
   const values = actionData?.values ?? { name: source.name, ...source.config };
   return (
     <AppShell email={email} nav={nav}>
@@ -230,7 +290,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             源表
-            <Badge variant={PROFILE_VARIANTS[profile.status]} data-profile-status={profile.status}>{`采集${profile.statusLabel}`}</Badge>
+            <Badge variant={TASK_VARIANTS[profile.status]} data-profile-status={profile.status}>{`采集${profile.statusLabel}`}</Badge>
           </CardTitle>
           <CardDescription>
             {`有更新时间或自增主键的表按水位线增量同步（需确认字段）；没有的表全量比对（大表默认每天一次）。最近采集：${time(profile.profiledAt)}`}
@@ -277,6 +337,29 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
               )}
             </TableBody>
           </Table>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            同步
+            <Badge variant={TASK_VARIANTS[sync.status]} data-sync-status={sync.status}>{sync.statusLabel}</Badge>
+          </CardTitle>
+          <CardDescription>
+            {`已确认水位线的表每小时增量同步一次，变化以变更批次追加到原始层；首次同步为全量。最近一次：${time(sync.attemptedAt)} 提交`}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {sync.status === 'failed' && sync.error && <div className="text-sm text-destructive">{`同步失败：${sync.error}`}</div>}
+          {canWrite && (
+            <Form method="post">
+              <input type="hidden" name="intent" value="sync" />
+              <Button type="submit" variant="outline" disabled={submitting || syncing}>{syncing ? '同步中…' : '立即同步'}</Button>
+            </Form>
+          )}
+          {synced.map(([table, entries]) => <SyncHistory key={table} table={table} entries={entries} />)}
+          {!synced.length && <div className="text-sm text-muted-foreground">还没有同步记录</div>}
         </CardContent>
       </Card>
 

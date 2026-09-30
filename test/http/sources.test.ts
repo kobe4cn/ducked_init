@@ -173,3 +173,32 @@ describe('列统计与水位线', () => {
     expect(await rejected.text()).toContain(`GRANT USAGE ON SCHEMA shop TO ${READER.user}`);
   });
 });
+
+describe('同步', () => {
+  it('数据工程师手动触发同步；数据源页显示每张表的同步历史（批次、行数、耗时、水位线）；分析师只能查看', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+    const id = sourceIdOf(await register(browser, await pgSourceInput(READER)));
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    // 还没有确认水位线的表
+    const early = await browser.post(`/sources/${id}`, { intent: 'sync' });
+    expect(early.status).toBe(400);
+    expect(await early.text()).toContain('没有已确认水位线的表');
+
+    await browser.post(`/sources/${id}`, { intent: 'confirm-watermark', table: 'customers', column: 'updated_at' });
+    expect((await browser.post(`/sources/${id}`, { intent: 'sync' })).status).toBe(302);
+    expect(await (await browser.get(`/sources/${id}`)).text()).toContain('data-sync-status="queued"');
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    const html = await (await browser.get(`/sources/${id}`)).text();
+    expect(html).toContain('data-sync-status="succeeded"');
+    expect(html).toMatch(/data-sync-table="customers"[\s\S]*?data-batch="1"[\s\S]*?全表读取[\s\S]*?40[\s\S]*?ms[\s\S]*?2024-06-02 16:00:00/);
+
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an@acme.com');
+    const seen = await (await analyst.get(`/sources/${id}`)).text();
+    expect(seen).toContain('data-batch="1"');
+    expect(seen).not.toContain('name="intent" value="sync"');
+    expect((await analyst.post(`/sources/${id}`, { intent: 'sync' })).status).toBe(403);
+  });
+});

@@ -1,6 +1,7 @@
 // app/.server/pipeline/lake-engine.ts —— 在当前进程里打开一个只挂载单个租户数据湖的 DuckDB（ADR-0001、0008）。
 // 工作进程用它执行任务，开通租户时也用它初始化 catalog。这里不碰平台 PG 的连接串：拿到的只有本租户的凭据
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
+import { attachSource, listTables, lockConfiguration, type MongoAccess, type SourceSpec, type SourceTable } from './source-engine';
 
 /** 一个租户的数据湖：数据文件所在的存储前缀，以及用本租户数据库角色连接的 DuckLake catalog */
 export interface LakeSpec {
@@ -17,6 +18,8 @@ export interface EngineLimits { memoryLimitMb: number; threads: number }
 export interface TenantLakeSession {
   /** 默认库已切到租户的数据湖（lake），表名不需要前缀 */
   con: DuckDBConnection;
+  /** 同时挂载了数据源时（同步任务）：源端以 src 只读挂载 */
+  source?: { mongo?: MongoAccess; tables(): Promise<SourceTable[]> };
   close(): void;
 }
 
@@ -29,10 +32,10 @@ export function redactLakeSecrets(message: string, lake: LakeSpec) {
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 
 /**
- * 挂载租户数据湖后锁住配置：只能读写本租户的存储前缀，不能再挂载其他库、读其他路径，也不能改回这些设置。
+ * 挂载租户数据湖（给了 source 时再只读挂载该数据源，ADR-0012）后锁住配置：只能读写本租户的存储前缀，不能再挂载其他库、读其他路径，也不能改回这些设置。
  * catalog 的数据库角色只能访问本租户的 schema，因此经 DuckLake 内部的 PG 连接也读不到其他租户与平台元数据
  */
-export async function openTenantLake(spec: LakeSpec, limits: EngineLimits): Promise<TenantLakeSession> {
+export async function openTenantLake(spec: LakeSpec, limits: EngineLimits, source?: SourceSpec): Promise<TenantLakeSession> {
   const instance = await DuckDBInstance.create(':memory:', {
     memory_limit: `${limits.memoryLimitMb}MiB`,
     threads: String(limits.threads),
@@ -45,15 +48,19 @@ export async function openTenantLake(spec: LakeSpec, limits: EngineLimits): Prom
       const s = spec.s3;
       await con.run(`INSTALL httpfs; LOAD httpfs;
         CREATE SECRET lake_s3 (TYPE s3, KEY_ID ${lit(s.key)}, SECRET ${lit(s.secret)}, REGION ${lit(s.region)},
-          ENDPOINT ${lit(s.endpoint)}, URL_STYLE ${lit(s.urlStyle)}, USE_SSL ${s.useSsl})`);
+          ENDPOINT ${lit(s.endpoint)}, URL_STYLE ${lit(s.urlStyle)}, USE_SSL ${s.useSsl}, SCOPE ${lit(spec.dataPath)})`);
     }
     await con.run(`ATTACH ${lit(`ducklake:postgres:${spec.catalogUrl}`)} AS lake
       (DATA_PATH ${lit(spec.dataPath)}, METADATA_SCHEMA ${lit(spec.catalogSchema)})`);
-    await con.run(`USE lake;
-      SET allowed_directories = [${lit(spec.dataPath)}];
-      SET enable_external_access = false;
-      SET lock_configuration = true;`);
-    return { con, close };
+    // 源端不带时区的时间一律按 UTC 解读，不随工作进程所在机器的时区变化
+    await con.run(`USE lake; SET TimeZone = 'UTC'`);
+    const attached = source ? await attachSource(con, source) : { allowed: [], mongo: undefined };
+    await lockConfiguration(con, [spec.dataPath, ...attached.allowed]);
+    return {
+      con,
+      close,
+      ...(source && { source: { mongo: attached.mongo, tables: () => listTables(con, source, attached.mongo) } }),
+    };
   } catch (e) {
     close();
     throw e;

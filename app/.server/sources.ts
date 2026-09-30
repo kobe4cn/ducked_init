@@ -1,6 +1,7 @@
 // app/.server/sources.ts —— 数据源：登记、修改与轮换凭据、测试连接、采集表清单与列统计、确认水位线字段。一律限定在操作者所属租户内。
 // 登记与修改时平台探测账号写权限，可写即拒绝；凭据用租户数据密钥加密保存，任何界面与接口都不回显。
-// 列统计由采集任务（source.profile）在工作进程里产出，保存在任务结果中；成员确认的水位线字段保存在 source_tables
+// 列统计由采集任务（source.profile）在工作进程里产出，保存在任务结果中；成员确认的水位线字段保存在 source_tables。
+// 按水位线同步见 source-sync.ts
 import { randomUUID } from 'node:crypto';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -9,6 +10,7 @@ import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { sources, sourceTables, tasks, type TaskStatus } from './db/schema';
 import { inspectSource, mongoReadGrant, type SourceSpec, type TableProfile, type WriteGrant } from './pipeline/source-engine';
+import type { SyncTableParam } from './pipeline/sync-engine';
 import type { SyncMode } from '../lib/sources';
 import { decryptForTenant, encryptForTenant } from './secrets';
 import {
@@ -139,14 +141,32 @@ export async function listSources(actor: CurrentMember) {
   return rows;
 }
 
+/** 最近一次成功采集到的各表，带成员确认且仍然有效的水位线字段（没有时为 null）及其种类 */
+async function tablesWithWatermarks(tenantId: string, sourceId: string) {
+  const profiles = await latestProfiles(tenantId, sourceId);
+  const confirmed = new Map(
+    (await getDb().select().from(sourceTables).where(eq(sourceTables.sourceId, sourceId))).map(t => [t.tableName, t]),
+  );
+  const tables = profiles.tables.map(t => {
+    const c = confirmed.get(t.name);
+    // 采集后字段不再是候选（被删除、改名或出现空值）时，之前的确认不再生效
+    const candidate = c?.watermarkColumn ? t.watermarkCandidates.find(w => w.column === c.watermarkColumn) : undefined;
+    return { table: t, watermark: candidate ?? null, confirmedBy: candidate ? c!.confirmedByEmail : null };
+  });
+  return { ...profiles, tables };
+}
+
+/** 按水位线增量同步的表：成员确认了水位线字段、且该字段在最近一次采集中仍是候选 */
+export async function watermarkTables(tenantId: string, sourceId: string): Promise<SyncTableParam[]> {
+  const { tables } = await tablesWithWatermarks(tenantId, sourceId);
+  return tables.flatMap(({ table, watermark }) => (watermark ? [{ name: table.name, column: watermark.column, kind: watermark.kind }] : []));
+}
+
 /** 数据源详情：连接参数（不含凭据）、最近一次采集的状态（及跳过的无读权限的表）、各表的列统计、水位线候选与同步方式 */
 export async function getSource(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'sources:read');
   const { credentials: _sealed, ...row } = await requireSource(actor.tenant.id, sourceId);
-  const { latest, tables, unreadable, profiledAt } = await latestProfiles(actor.tenant.id, sourceId);
-  const confirmed = new Map(
-    (await getDb().select().from(sourceTables).where(eq(sourceTables.sourceId, sourceId))).map(t => [t.tableName, t]),
-  );
+  const { latest, tables, unreadable, profiledAt } = await tablesWithWatermarks(actor.tenant.id, sourceId);
   return {
     ...row,
     profile: {
@@ -157,12 +177,12 @@ export async function getSource(actor: CurrentMember, sourceId: string) {
       unreadable,
       profiledAt,
     },
-    tables: tables.map(t => {
-      const c = confirmed.get(t.name);
-      // 采集后字段不再是候选（被删除、改名或出现空值）时，之前的确认不再生效
-      const watermark = c?.watermarkColumn && t.watermarkCandidates.some(w => w.column === c.watermarkColumn) ? c.watermarkColumn : null;
-      return { ...t, watermark, confirmedBy: watermark ? c!.confirmedByEmail : null, ...syncModeOf(t, watermark) };
-    }),
+    tables: tables.map(({ table, watermark, confirmedBy }) => ({
+      ...table,
+      watermark: watermark?.column ?? null,
+      confirmedBy,
+      ...syncModeOf(table, watermark?.column ?? null),
+    })),
   };
 }
 

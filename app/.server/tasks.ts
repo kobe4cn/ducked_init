@@ -20,14 +20,17 @@ export class TaskError extends Error {
 
 /** 入队一个任务。停用中的租户不能提交任务；共享锁与停用互斥，不会在停用的同时插进新任务 */
 export async function enqueueTask(tenantId: string, kind: string, params: Record<string, unknown> = {}) {
+  return getDb().transaction(tx => insertTask(tx, tenantId, kind, params));
+}
+
+/** 在调用方的事务里入队（调用方要在同一事务里先做检查时使用），规则同 enqueueTask */
+export async function insertTask(tx: Tx, tenantId: string, kind: string, params: Record<string, unknown> = {}) {
   if (!isTaskKind(kind)) throw new TaskError(`未知的任务类型：${kind}`);
-  return getDb().transaction(async tx => {
-    const [tenant] = await tx.select({ suspendedAt: tenants.suspendedAt }).from(tenants).where(eq(tenants.id, tenantId)).for('share');
-    if (!tenant) throw new TaskError('租户不存在', 404);
-    if (tenant.suspendedAt) throw new TaskError('租户已停用，不能提交任务');
-    const [task] = await tx.insert(tasks).values({ tenantId, kind, params }).returning();
-    return task;
-  });
+  const [tenant] = await tx.select({ suspendedAt: tenants.suspendedAt }).from(tenants).where(eq(tenants.id, tenantId)).for('share');
+  if (!tenant) throw new TaskError('租户不存在', 404);
+  if (tenant.suspendedAt) throw new TaskError('租户已停用，不能提交任务');
+  const [task] = await tx.insert(tasks).values({ tenantId, kind, params }).returning();
+  return task;
 }
 
 export async function getTask(taskId: string) {
@@ -141,7 +144,7 @@ export async function finishTask(taskId: string, outcome: WorkerOutcome) {
     .update(tasks)
     .set({
       status: 'error' in outcome ? 'failed' : 'succeeded',
-      result: 'result' in outcome ? outcome.result : null,
+      result: outcome.result ?? null,
       error: 'error' in outcome ? outcome.error : null,
       finishedAt: sql`now()`,
     })

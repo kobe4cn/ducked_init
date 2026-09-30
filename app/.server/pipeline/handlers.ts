@@ -1,16 +1,26 @@
 // app/.server/pipeline/handlers.ts —— 各类任务在工作进程里做什么。连接只挂载了本租户的数据湖（默认库），表名不带前缀。
 // 新增任务类型只改这里；参数在工作进程里校验，不合法时任务记为失败
 import type { DuckDBConnection } from '@duckdb/node-api';
-import type { EngineLimits } from './lake-engine';
+import type { EngineLimits, TenantLakeSession } from './lake-engine';
 import { profileSource, type SourceSpec } from './source-engine';
+import { syncSourceTables, type SyncTableParam } from './sync-engine';
 
 type Params = Record<string, unknown>;
 type Result = Record<string, unknown>;
 
-/** 任务的运行环境：配额，以及任务涉及数据源时（参数带 sourceId）派发时解密好的连接参数 */
-export interface TaskContext { limits: EngineLimits; source?: SourceSpec }
+/**
+ * 任务的运行环境：配额，任务涉及数据源时（参数带 sourceId）派发时解密好的连接参数，
+ * 本租户数据湖的会话（attachSource 的任务里数据源也挂在其中），以及抹掉错误信息中凭据的函数
+ */
+export interface TaskContext { limits: EngineLimits; source?: SourceSpec; session: TenantLakeSession; redact(message: string): string }
 
-interface Handler { label: string; run(con: DuckDBConnection, params: Params, ctx: TaskContext): Promise<Result> }
+/** attachSource：数据源与数据湖挂在同一个 DuckDB 里（在两者之间搬数据的任务） */
+interface Handler { label: string; attachSource?: boolean; run(con: DuckDBConnection, params: Params, ctx: TaskContext): Promise<Result> }
+
+/** 任务部分完成：记为失败，同时保留已完成部分的结果 */
+export class PartialFailure extends Error {
+  constructor(message: string, readonly result: Result) { super(message); }
+}
 
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 
@@ -23,6 +33,14 @@ export async function inventory(con: DuckDBConnection) {
     const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM "${t.schema}"."${t.name}"`);
     return { name: t.schema === 'main' ? t.name : `${t.schema}.${t.name}`, rows: Number(n) };
   }));
+}
+
+function syncTables(params: Params): SyncTableParam[] {
+  const tables = params.tables;
+  const valid = Array.isArray(tables) && tables.length > 0 && tables.every(t =>
+    typeof t?.name === 'string' && typeof t.column === 'string' && (t.kind === 'updated_at' || t.kind === 'increment'));
+  if (!valid) throw new Error('参数 tables 必须是非空的 { name, column, kind } 列表');
+  return tables as SyncTableParam[];
 }
 
 function positiveInt(params: Params, key: string, max: number) {
@@ -66,6 +84,21 @@ export const HANDLERS = {
     async run(_con, _params, { source, limits }) {
       if (!source) throw new Error('缺少数据源');
       return profileSource(source, limits);
+    },
+  },
+  // 水位线增量同步：每张表一个变更批次追加到原始层。有表失败时任务记为失败，结果里保留各表的批次与错误
+  'source.sync': {
+    label: '同步数据源',
+    attachSource: true,
+    async run(_con, params, { source, session, redact }) {
+      if (!source) throw new Error('缺少数据源');
+      if (typeof params.sourceId !== 'string') throw new Error('缺少参数 sourceId');
+      const tables = await syncSourceTables(session, source, params.sourceId, syncTables(params), redact);
+      const failed = tables.filter(t => 'error' in t);
+      if (failed.length) {
+        throw new PartialFailure(`${failed.length} 张表同步失败：${failed.map(t => `${t.table}（${'error' in t ? t.error : ''}）`).join('；')}`, { tables });
+      }
+      return { tables };
     },
   },
 } satisfies Record<string, Handler>;

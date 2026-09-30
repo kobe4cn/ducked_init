@@ -1,9 +1,11 @@
 // app/.server/pipeline/dispatcher.ts —— 调度器：从平台 PG 的队列领取任务，每个任务启动一个独立的工作进程（ADR-0001）。
 // 本机同时运行的工作进程不超过 maxWorkers；各租户的并发上限与公平调度由 claimNextTask 保证，可以部署多个调度器。
-// 数据湖迁移存储也由调度器执行（在本进程内，要用平台账号读旧前缀、写新前缀），同样占一个名额，先于任务领取
+// 数据湖迁移存储也由调度器执行（在本进程内，要用平台账号读旧前缀、写新前缀），同样占一个名额，先于任务领取。
+// 常驻运行时还定期为到期的数据源入队水位线增量同步
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '../lake-migration';
+import { enqueueDueSyncs } from '../source-sync';
 import { claimNextTask, failStaleTasks, finishTask, heartbeatTasks, setWorkerPid, type ClaimedTask } from '../tasks';
 import type { WorkerInput, WorkerOutcome } from './worker';
 
@@ -18,6 +20,8 @@ export interface DispatcherOptions {
   staleAfterMs?: number;
   /** 单个任务的运行时限，超时终止工作进程 */
   timeoutMs?: number;
+  /** 常驻运行时检查哪些数据源到了同步周期的间隔 */
+  syncCheckMs?: number;
 }
 
 // 工作进程只继承运行所需的环境变量（平台 PG 连接串等不在其中）；本租户数据湖的凭据经 IPC 单独传入
@@ -26,7 +30,9 @@ const workerEnv = () => Object.fromEntries(WORKER_ENV_KEYS.flatMap(k => (process
 
 interface RunningTask { child: ChildProcess; done: Promise<void>; abort(reason: string): void }
 
-export function createDispatcher({ maxWorkers, pollMs = 1000, staleAfterMs = 60_000, timeoutMs = 2 * 60 * 60_000 }: DispatcherOptions) {
+export function createDispatcher({
+  maxWorkers, pollMs = 1000, staleAfterMs = 60_000, timeoutMs = 2 * 60 * 60_000, syncCheckMs = 60_000,
+}: DispatcherOptions) {
   const running = new Map<string, RunningTask>();
   /** 本调度器执行中的数据湖迁移，按领取凭据（claim）索引；abort 让它就此放弃（已被其他调度器接手） */
   const migrations = new Map<string, { done: Promise<void>; abort: AbortController }>();
@@ -108,6 +114,14 @@ export function createDispatcher({ maxWorkers, pollMs = 1000, staleAfterMs = 60_
     await fill();
   }
 
+  let lastSyncCheck = 0;
+  /** 为到期的数据源入队同步：每 syncCheckMs 一次，多个调度器同时检查也不会重复入队 */
+  async function scheduleSyncs() {
+    if (Date.now() - lastSyncCheck < syncCheckMs) return;
+    lastSyncCheck = Date.now();
+    await enqueueDueSyncs();
+  }
+
   /** 每隔 pollMs 或有工作进程结束时醒来 */
   const nap = () => new Promise<void>(resolve => {
     wake = resolve;
@@ -126,6 +140,7 @@ export function createDispatcher({ maxWorkers, pollMs = 1000, staleAfterMs = 60_
     /** 持续运行，直到 stop()；之后等运行中的任务结束再返回 */
     async run() {
       while (!stopped) {
+        await scheduleSyncs().catch(e => console.error('[调度器] 入队到期的同步出错', e));
         await tick().catch(e => console.error('[调度器] 轮询出错', e));
         await nap();
       }

@@ -83,8 +83,11 @@ const FILE_EXTENSIONS: Record<FileFormat, RegExp> = {
 };
 const READERS: Record<FileFormat, string> = { parquet: 'read_parquet', csv: 'read_csv', json: 'read_json_auto' };
 
-/** 源表：名称、所在 schema、在会话里读取它的 FROM 子句，以及账号能否读取（PostgreSQL 目录里看得到没有读权限的表，MongoDB 同理） */
-interface SourceTable { name: string; schema: string; from: string; readable: boolean }
+/**
+ * 源表：名称、所在 schema 与源端的表名（对象存储文件没有）、在会话里读取它的 FROM 子句，
+ * 以及账号能否读取（PostgreSQL 目录里看得到没有读权限的表，MongoDB 同理）
+ */
+export interface SourceTable { name: string; schema: string; table: string; from: string; readable: boolean }
 
 export interface SourceSession {
   /** 源端已只读挂载为 src，配置已锁定 */
@@ -103,10 +106,54 @@ export function redactSourceSecrets(message: string, spec: SourceSpec) {
   return secrets.reduce((m, s) => m.replaceAll(s, '***'), message);
 }
 
-function s3Secret(s3: S3Connection) {
+/** 对象存储凭据只用于 scope 下的路径：同一个 DuckDB 里还挂着租户数据湖时（同步任务），两把凭据各管各的前缀 */
+function s3Secret(s3: S3Connection, scope: string) {
   return `INSTALL httpfs; LOAD httpfs;
     CREATE TEMPORARY SECRET src_s3 (TYPE s3, KEY_ID ${lit(s3.keyId)}, SECRET ${lit(s3.secret)}, REGION ${lit(s3.region)},
-      ENDPOINT ${lit(s3.endpoint)}, URL_STYLE ${lit(s3.urlStyle)}, USE_SSL ${s3.useSsl})`;
+      ENDPOINT ${lit(s3.endpoint)}, URL_STYLE ${lit(s3.urlStyle)}, USE_SSL ${s3.useSsl}, SCOPE ${lit(scope)})`;
+}
+
+/** 在已有的 DuckDB 里以 src 只读挂载数据源，返回锁定配置时要放行的路径。调用方负责随后锁住配置 */
+export async function attachSource(con: DuckDBConnection, spec: SourceSpec): Promise<{ allowed: string[]; mongo?: MongoAccess }> {
+  switch (spec.kind) {
+    case 'postgres':
+      await con.run(`INSTALL postgres; LOAD postgres;
+        CREATE TEMPORARY SECRET src_pg (TYPE postgres, HOST ${lit(spec.host)}, PORT ${spec.port}, DATABASE ${lit(spec.database)},
+          USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)});
+        ATTACH 'connect_timeout=10' AS src (TYPE postgres, SECRET src_pg, SCHEMA ${lit(spec.schema)}, READ_ONLY)`);
+      return { allowed: [] };
+    case 'mysql':
+      await con.run(`INSTALL mysql; LOAD mysql;
+        CREATE TEMPORARY SECRET src_mysql (TYPE mysql, HOST ${lit(spec.host)}, PORT ${spec.port}, DATABASE ${lit(spec.database)},
+          USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)});
+        ATTACH '' AS src (TYPE mysql, SECRET src_mysql, READ_ONLY)`);
+      return { allowed: [] };
+    case 'mongodb': {
+      // 先用驱动登录并查权限：密码错误等连接问题在这里报出（扩展列集合失败时只会返回空清单）
+      const mongo = await mongoAccess(spec);
+      await con.run(`INSTALL mongo FROM community; LOAD mongo;
+        CREATE TEMPORARY SECRET src_mongo (TYPE mongo, HOST ${lit(spec.host)}, PORT ${lit(String(spec.port))},
+          USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)}, AUTHSOURCE ${lit(spec.authSource)},
+          SRV ${lit(String(spec.srv))}, TLS ${lit(String(spec.tls))});
+        ATTACH ${lit(`dbname=${spec.database}`)} AS src (TYPE mongo, SECRET src_mongo, READ_ONLY);
+        SET mongo_enable_direct_scan = false`);
+      return { allowed: [], mongo };
+    }
+    case 's3':
+      await con.run(s3Secret(spec.s3, spec.path));
+      return { allowed: [spec.path] };
+    case 'duckdb':
+      if (spec.s3) await con.run(s3Secret(spec.s3, spec.path));
+      await con.run(`ATTACH ${lit(spec.path)} AS src (READ_ONLY)`);
+      return { allowed: [spec.path] };
+  }
+}
+
+/** 锁住配置：此后只能读 allowed 下的路径，不能再挂载其他库，也不能改回这些设置 */
+export async function lockConfiguration(con: DuckDBConnection, allowed: string[]) {
+  await con.run(`SET allowed_directories = [${allowed.map(lit).join(', ')}];
+    SET enable_external_access = false;
+    SET lock_configuration = true;`);
 }
 
 /** 只读挂载数据源并锁住配置 */
@@ -119,43 +166,9 @@ export async function openSource(spec: SourceSpec, limits: EngineLimits): Promis
   const close = () => { con.closeSync(); instance.closeSync(); };
   let mongo: MongoAccess | undefined;
   try {
-    let allowed: string[] = [];
-    switch (spec.kind) {
-      case 'postgres':
-        await con.run(`INSTALL postgres; LOAD postgres;
-          CREATE TEMPORARY SECRET src_pg (TYPE postgres, HOST ${lit(spec.host)}, PORT ${spec.port}, DATABASE ${lit(spec.database)},
-            USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)});
-          ATTACH 'connect_timeout=10' AS src (TYPE postgres, SECRET src_pg, SCHEMA ${lit(spec.schema)}, READ_ONLY)`);
-        break;
-      case 'mysql':
-        await con.run(`INSTALL mysql; LOAD mysql;
-          CREATE TEMPORARY SECRET src_mysql (TYPE mysql, HOST ${lit(spec.host)}, PORT ${spec.port}, DATABASE ${lit(spec.database)},
-            USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)});
-          ATTACH '' AS src (TYPE mysql, SECRET src_mysql, READ_ONLY)`);
-        break;
-      case 'mongodb':
-        // 先用驱动登录并查权限：密码错误等连接问题在这里报出（扩展列集合失败时只会返回空清单）
-        mongo = await mongoAccess(spec);
-        await con.run(`INSTALL mongo FROM community; LOAD mongo;
-          CREATE TEMPORARY SECRET src_mongo (TYPE mongo, HOST ${lit(spec.host)}, PORT ${lit(String(spec.port))},
-            USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)}, AUTHSOURCE ${lit(spec.authSource)},
-            SRV ${lit(String(spec.srv))}, TLS ${lit(String(spec.tls))});
-          ATTACH ${lit(`dbname=${spec.database}`)} AS src (TYPE mongo, SECRET src_mongo, READ_ONLY);
-          SET mongo_enable_direct_scan = false`);
-        break;
-      case 's3':
-        await con.run(s3Secret(spec.s3));
-        allowed = [spec.path];
-        break;
-      case 'duckdb':
-        if (spec.s3) await con.run(s3Secret(spec.s3));
-        await con.run(`ATTACH ${lit(spec.path)} AS src (READ_ONLY)`);
-        allowed = [spec.path];
-        break;
-    }
-    await con.run(`SET allowed_directories = [${allowed.map(lit).join(', ')}];
-      SET enable_external_access = false;
-      SET lock_configuration = true;`);
+    const attached = await attachSource(con, spec);
+    mongo = attached.mongo;
+    await lockConfiguration(con, attached.allowed);
   } catch (e) {
     close();
     throw new Error(redactSourceSecrets((e as Error).message, spec));
@@ -163,7 +176,7 @@ export async function openSource(spec: SourceSpec, limits: EngineLimits): Promis
   return { con, mongo, tables: () => listTables(con, spec, mongo), close };
 }
 
-async function listTables(con: DuckDBConnection, spec: SourceSpec, mongo?: MongoAccess): Promise<SourceTable[]> {
+export async function listTables(con: DuckDBConnection, spec: SourceSpec, mongo?: MongoAccess): Promise<SourceTable[]> {
   if (spec.kind === 's3') {
     const files = await rows<{ file: string }>(con, `SELECT file FROM glob(${lit(`${spec.path}**`)}) ORDER BY file`);
     const byTable = new Map<string, string[]>();
@@ -173,7 +186,7 @@ async function listTables(con: DuckDBConnection, spec: SourceSpec, mongo?: Mongo
       const name = rel.includes('/') ? rel.slice(0, rel.indexOf('/')) : rel.replace(FILE_EXTENSIONS[spec.format], '');
       byTable.set(name, [...(byTable.get(name) ?? []), file]);
     }
-    return [...byTable].map(([name, list]) => ({ name, schema: '', from: `${READERS[spec.format]}([${list.map(lit).join(', ')}])`, readable: true }));
+    return [...byTable].map(([name, list]) => ({ name, schema: '', table: name, from: `${READERS[spec.format]}([${list.map(lit).join(', ')}])`, readable: true }));
   }
   if (spec.kind === 'mongodb' && !mongo!.can('listCollections', spec.database, '')) {
     throw new Error(`账号 ${spec.user} 没有库 ${spec.database} 的读权限，列不出集合。请在 MongoDB 授予：${mongoReadGrant(spec)}`);
@@ -188,6 +201,7 @@ async function listTables(con: DuckDBConnection, spec: SourceSpec, mongo?: Mongo
   return found.map(t => ({
     name: schema || t.schema === 'main' ? t.name : `${t.schema}.${t.name}`,
     schema: t.schema,
+    table: t.name,
     from: `src.${ident(t.schema)}.${ident(t.name)}`,
     readable: mongo ? mongo.can('find', t.schema, t.name) : !readable || readable.has(`${t.schema}.${t.name}`),
   }));
@@ -203,7 +217,7 @@ interface MongoResource { db?: string; collection?: string; system_buckets?: str
 interface MongoPrivilege { resource: MongoResource; actions: string[] }
 
 /** MongoDB 账号的权限：accessControl 为 false 表示服务没有开启访问控制，任何连接都能做任何操作 */
-interface MongoAccess {
+export interface MongoAccess {
   accessControl: boolean;
   privileges: MongoPrivilege[];
   /** 账号能否在 db.collection 上执行 action（collection 为空串表示整个库） */
@@ -338,7 +352,7 @@ async function s3WriteGrants(s3: S3Connection, prefix: string): Promise<WriteGra
 }
 
 /** 账号在源端可以写入的对象；空数组表示只读。本机上的 DuckDB 文件没有账号，只读挂载即可 */
-export async function writeGrants(session: SourceSession, spec: SourceSpec): Promise<WriteGrant[]> {
+export async function writeGrants(session: Pick<SourceSession, 'con' | 'mongo'>, spec: SourceSpec): Promise<WriteGrant[]> {
   switch (spec.kind) {
     case 'postgres':
       return groupGrants(await rows(session.con, `SELECT * FROM postgres_query('src', ${lit(PG_WRITE_GRANTS)})`));
@@ -400,6 +414,35 @@ async function incrementKeys(con: DuckDBConnection, spec: SourceSpec): Promise<M
         AND c.column_default LIKE 'nextval(%'`);
   }
   return new Map(found.map(r => [r.table_name, r.column_name]));
+}
+
+/** 各表的主键列（表名 → 列名，按主键中的顺序）；对象存储文件没有主键，MongoDB 集合的主键是 _id */
+export async function primaryKeys(con: DuckDBConnection, spec: SourceSpec, tables: SourceTable[]): Promise<Map<string, string[]>> {
+  let found: { table_name: string; column_name: string }[] = [];
+  if (spec.kind === 'postgres') {
+    found = await rows(con, `SELECT * FROM postgres_query('src', ${lit(`
+      SELECT c.relname::text AS table_name, a.attname::text AS column_name
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, pos)
+      JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+      WHERE i.indisprimary AND n.nspname = ${lit(spec.schema)}
+      ORDER BY c.relname, k.pos`)})`);
+  } else if (spec.kind === 'mysql') {
+    found = await rows(con, `SELECT * FROM mysql_query('src', ${lit(`
+      SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name FROM information_schema.KEY_COLUMN_USAGE
+      WHERE TABLE_SCHEMA = ${lit(spec.database)} AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY TABLE_NAME, ORDINAL_POSITION`)})`);
+  } else if (spec.kind === 'duckdb') {
+    found = await rows(con, `
+      SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END AS table_name, unnest(constraint_column_names) AS column_name
+      FROM duckdb_constraints() WHERE database_name = 'src' AND constraint_type = 'PRIMARY KEY'`);
+  } else if (spec.kind === 'mongodb') {
+    found = tables.map(t => ({ table_name: t.name, column_name: '_id' }));
+  }
+  const keys = new Map<string, string[]>();
+  for (const r of found) keys.set(r.table_name, [...(keys.get(r.table_name) ?? []), r.column_name]);
+  return keys;
 }
 
 interface SummaryRow { column_name: string; column_type: string; min: string | null; max: string | null; approx_unique: string; count: string; null_percentage: string }
