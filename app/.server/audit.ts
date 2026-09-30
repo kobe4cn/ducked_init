@@ -28,6 +28,10 @@ const ACTIONS = {
       `${d.from} → ${d.to}，复制 ${d.files} 个文件（${d.bytes} 字节）；旧位置的文件未删除，确认后另行清理${d.warning ? `。注意：${d.warning}` : ''}`,
   },
   'tenant.lake_migration_failed': { label: '数据湖迁移失败', describe: (d: Detail) => `${d.from} → ${d.to}：${d.error}（仍使用原位置，可重试）` },
+  'tenant.lake_reset': {
+    label: '重置数据湖',
+    describe: (d: Detail) => `清空 catalog ${d.catalogSchema} 与 ${d.dataPath} 下的 ${d.files} 个文件，已重新初始化`,
+  },
   'tenant.quota_changed': { label: '调整配额', describe: (d: Detail) => describeQuotaChange(d.from as TenantQuota, d.to as TenantQuota) },
   'member.invited': { label: '邀请成员', describe: (d: Detail) => `${d.email}，角色：${roleLabel(d.role)}` },
   'member.role_changed': { label: '修改角色', describe: (d: Detail) => `${d.email}：${roleLabel(d.from)} → ${roleLabel(d.to)}` },

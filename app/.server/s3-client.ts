@@ -95,6 +95,11 @@ export async function getObject(creds: S3Creds, uri: string) {
   return res.body!;
 }
 
+/** 删除对象；对象不存在时也算成功 */
+export async function deleteObject(creds: S3Creds, uri: string) {
+  await ensureOk(await signedFetch(creds, 's3', { method: 'DELETE', path: objectPath(uri) }), `删除 ${uri} `);
+}
+
 /** 写入对象（覆盖）；流式内容须给出字节数 */
 export async function putObject(creds: S3Creds, uri: string, body: string | ReadableStream<Uint8Array>, size?: number) {
   await ensureOk(await signedFetch(creds, 's3', {

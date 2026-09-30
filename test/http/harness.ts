@@ -126,11 +126,13 @@ export async function resetDb() {
   if (!process.env.PLATFORM_LAKE_URI!.startsWith('s3://')) await rm(process.env.PLATFORM_LAKE_URI!, { recursive: true, force: true });
 }
 
-/** 以运营者身份执行命令行（与 pnpm tenant:create 相同的入口） */
-export async function runCli(script: string, args: string[]) {
-  return promisify(execFile)(process.execPath, ['--import', 'tsx', script, ...args], {
-    env: { ...process.env },
-  }).then(r => ({ ...r, code: 0 }), (e: { stdout: string; stderr: string; code: number }) => e);
+/** 以运营者身份执行命令行（与 pnpm tenant:create 相同的入口）；input 为标准输入（交互确认），env 覆盖环境变量 */
+export async function runCli(script: string, args: string[], { input, env }: { input?: string; env?: Record<string, string> } = {}) {
+  const run = promisify(execFile)(process.execPath, ['--import', 'tsx', script, ...args], {
+    env: { ...process.env, ...env },
+  });
+  run.child.stdin?.end(input ?? '');
+  return run.then(r => ({ ...r, code: 0 }), (e: { stdout: string; stderr: string; code: number }) => e);
 }
 
 /** 以运营者身份开通租户（与 pnpm tenant:create 相同的入口） */

@@ -42,9 +42,14 @@ export async function provisionTenantLake(tx: Tx, tenantId: string) {
   const { dataPath, catalogSchema, dbRole } = layout(tenantId);
   const dbPassword = randomBytes(24).toString('base64url');
   await tx.execute(sql.raw(`CREATE ROLE "${dbRole}" LOGIN PASSWORD '${dbPassword}'`));
-  await tx.execute(sql.raw(`CREATE SCHEMA "${catalogSchema}"`));
-  await tx.execute(sql.raw(`GRANT USAGE, CREATE ON SCHEMA "${catalogSchema}" TO "${dbRole}"`));
+  await createCatalogSchema(tx, catalogSchema, dbRole);
   await tx.insert(tenantLakes).values({ tenantId, dataPath, catalogSchema, dbRole, dbPassword });
+}
+
+/** 建好归平台所有的 catalog schema，只授予本租户角色使用与建表的权限（开通与重置数据湖时使用） */
+export async function createCatalogSchema(tx: Tx, catalogSchema: string, dbRole: string) {
+  await tx.execute(sql`CREATE SCHEMA ${sql.identifier(catalogSchema)}`);
+  await tx.execute(sql`GRANT USAGE, CREATE ON SCHEMA ${sql.identifier(catalogSchema)} TO ${sql.identifier(dbRole)}`);
 }
 
 /** 任务进程访问本租户数据湖所需的全部信息：只含本租户数据库角色与对象存储账号的凭据 */

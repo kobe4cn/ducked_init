@@ -18,7 +18,7 @@ import { TenantError } from './tenants';
 
 type LakeMigrationRow = typeof lakeMigrations.$inferSelect;
 
-const ACTIVE = ['pending', 'running'] as const;
+export const ACTIVE_MIGRATION = ['pending', 'running'] as const;
 
 /**
  * 申请把租户的数据湖迁到 root 下（<root>/tenants/<租户 ID>/）。数据湖须已初始化；已在目标位置时拒绝，
@@ -34,7 +34,7 @@ export async function requestLakeMigration(operator: OperatorActor, tenantId: st
     if (!lakeReady(lake)) throw new TenantError('数据湖未初始化，请先在运营后台初始化数据湖');
     const toPath = tenantDataPath(toRoot, tenantId);
     const [active] = await tx.select().from(lakeMigrations)
-      .where(and(eq(lakeMigrations.tenantId, tenantId), inArray(lakeMigrations.status, ACTIVE)));
+      .where(and(eq(lakeMigrations.tenantId, tenantId), inArray(lakeMigrations.status, ACTIVE_MIGRATION)));
     if (active?.toPath === toPath) return { migration: active, created: false };
     if (active) throw new TenantError(`数据湖正在迁移到 ${active.toPath}`);
     if (lake.dataPath === toPath) throw new TenantError(`数据湖已在 ${toPath}`);
