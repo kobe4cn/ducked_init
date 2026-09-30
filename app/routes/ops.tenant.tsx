@@ -124,16 +124,20 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
           <CardDescription>用于管理员邮箱失效时的恢复：该邮箱已是本租户成员则提升为管理员，否则以管理员身份加入，并收到登录通知。</CardDescription>
         </CardHeader>
         <CardContent>
-          <Form method="post">
-            <input type="hidden" name="intent" value="assign-admin" />
-            <FieldGroup className="flex-row items-end">
-              <Field>
-                <FieldLabel htmlFor="admin-email">邮箱</FieldLabel>
-                <Input id="admin-email" type="email" name="email" required placeholder="name@company.com" />
-              </Field>
-              <Button type="submit" disabled={submitting}>指定</Button>
-            </FieldGroup>
-          </Form>
+          {tenant.suspendedAt ? (
+            <p className="text-sm text-muted-foreground">租户已停用，恢复后才能指定管理员。</p>
+          ) : (
+            <Form method="post">
+              <input type="hidden" name="intent" value="assign-admin" />
+              <FieldGroup className="flex-row items-end">
+                <Field>
+                  <FieldLabel htmlFor="admin-email">邮箱</FieldLabel>
+                  <Input id="admin-email" type="email" name="email" required placeholder="name@company.com" />
+                </Field>
+                <Button type="submit" disabled={submitting}>指定</Button>
+              </FieldGroup>
+            </Form>
+          )}
         </CardContent>
       </Card>
 

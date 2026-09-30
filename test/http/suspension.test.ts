@@ -103,6 +103,29 @@ describe('停用租户', () => {
   });
 });
 
+describe('停用期间不能指定管理员', () => {
+  it('指定管理员被拒绝，不发通知也不写审计；恢复后可以指定', async () => {
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const ops = await operator();
+    const { id } = await tenantRow(ops, 'acme');
+    await suspend(ops, id, '欠费未续约');
+    expect(await (await ops.get(`/ops/tenants/${id}`)).text()).not.toContain('name="intent" value="assign-admin"');
+
+    app.outbox.length = 0;
+    const res = await ops.post(`/ops/tenants/${id}`, { intent: 'assign-admin', email: 'new-admin@acme.com' });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('租户已停用');
+    await app.drain();
+    expect(app.outbox).toHaveLength(0);
+    expect((await tenantRow(ops, 'acme')).html).not.toContain('new-admin@acme.com');
+
+    await resume(ops, id);
+    expect((await ops.post(`/ops/tenants/${id}`, { intent: 'assign-admin', email: 'new-admin@acme.com' })).status).toBe(302);
+    const admin = await loginAs(app, 'new-admin@acme.com');
+    expect(auditActions(await (await admin.get('/audit')).text())).toEqual(['指定管理员', '恢复租户', '停用租户', '开通租户']);
+  });
+});
+
 describe('恢复租户', () => {
   it('恢复后成员需要重新登录；停用与恢复都写入该租户的审计日志', async () => {
     await createTenant('acme', '示例商贸', 'admin@acme.com');

@@ -114,7 +114,7 @@ export async function renameTenant(operator: OperatorActor, tenantId: string, ra
 
 /**
  * 为租户指定管理员，用于管理员邮箱失效时的恢复：邮箱已是本租户成员则提升为管理员，否则以管理员身份加入。
- * 随后通知对方登录
+ * 随后通知对方登录。租户停用期间不能指定：对方申请不到登录链接，通知会自相矛盾
  */
 export async function assignTenantAdmin(operator: OperatorActor, tenantId: string, rawEmail: string, requestOrigin: string) {
   const email = normalizeEmail(rawEmail);
@@ -124,6 +124,7 @@ export async function assignTenantAdmin(operator: OperatorActor, tenantId: strin
 
   const tenant = await getDb().transaction(async tx => {
     const tenant = await lockTenant(tx, tenantId);
+    if (tenant.suspendedAt) throw new TenantError('租户已停用，恢复后才能指定管理员');
     const [existing] = await tx
       .select({ id: members.id, role: members.role })
       .from(members)
