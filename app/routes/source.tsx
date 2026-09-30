@@ -468,7 +468,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
             <Badge variant={TASK_VARIANTS[sync.status]} data-sync-status={sync.status}>{sync.statusLabel}</Badge>
           </CardTitle>
           <CardDescription>
-            {`已确认水位线的表每小时增量同步一次，首次同步为全表读取，每天再比对一次（有主键的比对主键全集，没有的整行比对），补上源端的删除与漏掉的行。没有水位线的表全量比对，大表每天一次。变化都以变更批次追加到原始层。最近一次：${time(sync.attemptedAt)} 提交`}
+            {`已确认水位线的表每小时增量同步一次，首次同步为全表读取，每天再比对一次（有主键的比对主键全集，没有的整行比对），补上源端的删除与漏掉的行。没有水位线的表全量比对，大表每天一次（立即同步时大表一并同步）。变化都以变更批次追加到原始层。最近一次：${time(sync.attemptedAt)} 提交`}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
