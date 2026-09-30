@@ -1,4 +1,4 @@
-// app/.server/tenants.ts —— 运营者管理租户元数据：开通（租户 + 默认空间 + 首个管理员）、改名、指定管理员、停用与恢复。
+// app/.server/tenants.ts —— 运营者管理租户元数据：开通（租户 + 默认空间 + 首个管理员 + 数据湖）、改名、指定管理员、停用与恢复、配额。
 // 运营命令与运营后台调用同一套函数；每次操作都在同一事务里写入该租户的审计日志
 import { and, asc, eq, sql } from 'drizzle-orm';
 import { recordAudit, type OperatorActor, type Tx } from './audit';
@@ -6,6 +6,8 @@ import { linkOrigin, revokeTenantAccess } from './auth';
 import { runInBackground } from './background';
 import { getDb, isUniqueViolation } from './db/client';
 import { members, ROLE_LABELS, spaces, tenants } from './db/schema';
+import { initTenantCatalog, provisionTenantLake, tenantLakeExists } from './lake';
+import { describeQuotaChange, parseQuota, quotaOf, type QuotaKey } from './quota';
 import { getMailer } from './mailer';
 
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
@@ -33,6 +35,11 @@ function parseName(raw: string) {
 
 export interface CreateTenantInput { slug: string; name: string; adminEmail: string }
 
+/**
+ * 开通租户：同一事务里建好默认空间、首个管理员与数据湖（catalog schema 与数据库角色）。
+ * 提交后再初始化 DuckLake catalog：它要用新建的数据库角色另开连接。初始化失败不回滚开通，
+ * lakeReady 为 false，运营者可以在租户页重试；在此之前不派发该租户的任务
+ */
 export async function createTenant(input: CreateTenantInput, operator: OperatorActor = null) {
   const slug = input.slug.trim();
   const name = parseName(input.name);
@@ -40,11 +47,13 @@ export async function createTenant(input: CreateTenantInput, operator: OperatorA
   if (!SLUG.test(slug)) throw new TenantError(`租户标识不合法：${slug}（只允许小写字母、数字与连字符）`);
   if (!EMAIL.test(adminEmail)) throw new TenantError(`管理员邮箱不合法：${input.adminEmail}`);
 
+  let created;
   try {
-    return await getDb().transaction(async tx => {
+    created = await getDb().transaction(async tx => {
       const [tenant] = await tx.insert(tenants).values({ slug, name }).returning();
       const [space] = await tx.insert(spaces).values({ tenantId: tenant.id, name: '默认空间', isDefault: true }).returning();
       const [admin] = await tx.insert(members).values({ tenantId: tenant.id, email: adminEmail, role: 'admin' }).returning();
+      await provisionTenantLake(tx, tenant.id);
       await recordAudit(tx, {
         tenantId: tenant.id,
         operator,
@@ -59,6 +68,50 @@ export async function createTenant(input: CreateTenantInput, operator: OperatorA
     if (isUniqueViolation(e)) throw new TenantError(`租户标识已存在：${slug}`);
     throw e;
   }
+  return { ...created, lakeReady: await tryInitTenantCatalog(created.tenant.id) };
+}
+
+/**
+ * 运营者初始化租户的数据湖：开通时初始化失败后重试，或为本功能上线前开通、还没有数据湖的租户补建。可重复执行
+ */
+export async function initTenantLake(operator: OperatorActor, tenantId: string) {
+  const tenant = await getTenant(tenantId);
+  const catalogSchema = await getDb().transaction(async tx => {
+    await lockTenant(tx, tenant.id);
+    if (!(await tenantLakeExists(tx, tenant.id))) await provisionTenantLake(tx, tenant.id);
+    return (await tenantLakeExists(tx, tenant.id))!;
+  });
+  try {
+    await initTenantCatalog(tenant.id);
+  } catch (e) {
+    console.error(`[数据湖初始化失败] 租户 ${tenant.id}`, e);
+    throw new TenantError('数据湖初始化失败，详见服务端日志');
+  }
+  await recordAudit(getDb(), {
+    tenantId: tenant.id,
+    operator,
+    action: 'tenant.lake_initialized',
+    targetType: 'tenant',
+    targetId: tenant.id,
+    detail: { catalogSchema },
+  });
+}
+
+/** 按标识查租户 ID（运营命令使用）；不存在时抛出 404 */
+export async function tenantIdBySlug(slug: string) {
+  const [tenant] = await getDb().select({ id: tenants.id }).from(tenants).where(eq(tenants.slug, slug.trim()));
+  if (!tenant) throw new TenantError(`租户不存在：${slug}`, 404);
+  return tenant.id;
+}
+
+async function tryInitTenantCatalog(tenantId: string) {
+  try {
+    await initTenantCatalog(tenantId);
+    return true;
+  } catch (e) {
+    console.error(`[数据湖初始化失败] 租户 ${tenantId}`, e);
+    return false;
+  }
 }
 
 // 租户元数据与成员统计：只给出成员数与管理员邮箱，不给出完整的成员名单（ADR-0007）
@@ -71,6 +124,9 @@ const tenantSummaries = () =>
       createdAt: tenants.createdAt,
       suspendedAt: tenants.suspendedAt,
       suspensionReason: tenants.suspensionReason,
+      memoryLimitMb: tenants.memoryLimitMb,
+      threads: tenants.threads,
+      maxConcurrentTasks: tenants.maxConcurrentTasks,
       memberCount: sql<number>`count(${members.id})::int`,
       adminEmails: sql<string[]>`coalesce(array_agg(${members.email} order by ${members.email}) filter (where ${members.role} = 'admin'), '{}')`,
     })
@@ -198,6 +254,27 @@ export async function resumeTenant(operator: OperatorActor, tenantId: string, ra
       targetType: 'tenant',
       targetId: tenant.id,
       detail: { reason, suspensionReason: tenant.suspensionReason },
+    });
+  });
+}
+
+/** 设置租户配额：对之后派发的任务生效，运行中的任务不受影响 */
+export async function setTenantQuota(operator: OperatorActor, tenantId: string, raw: Record<QuotaKey, unknown>) {
+  const parsed = parseQuota(raw);
+  if ('error' in parsed) throw new TenantError(parsed.error);
+  const to = parsed.quota;
+  await getDb().transaction(async tx => {
+    const tenant = await lockTenant(tx, tenantId);
+    const from = quotaOf(tenant);
+    if (!describeQuotaChange(from, to)) return;
+    await tx.update(tenants).set(to).where(eq(tenants.id, tenant.id));
+    await recordAudit(tx, {
+      tenantId: tenant.id,
+      operator,
+      action: 'tenant.quota_changed',
+      targetType: 'tenant',
+      targetId: tenant.id,
+      detail: { from, to },
     });
   });
 }

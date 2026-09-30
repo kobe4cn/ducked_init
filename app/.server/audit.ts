@@ -3,9 +3,11 @@ import { desc, eq } from 'drizzle-orm';
 import type { CurrentMember } from './auth';
 import { getDb, type Db } from './db/client';
 import { auditLogs, ROLE_LABELS, tenants, type Role } from './db/schema';
+import { describeQuotaChange, type TenantQuota } from './quota';
 
 type Detail = Record<string, unknown>;
 const roleLabel = (role: unknown) => ROLE_LABELS[role as Role] ?? String(role);
+
 
 // 每种审计动作的名称，以及把明细写成一句话的方式；新增动作只改这里
 const ACTIONS = {
@@ -17,6 +19,8 @@ const ACTIONS = {
   },
   'tenant.suspended': { label: '停用租户', describe: (d: Detail) => `原因：${d.reason}` },
   'tenant.resumed': { label: '恢复租户', describe: (d: Detail) => `原因：${d.reason}` },
+  'tenant.lake_initialized': { label: '初始化数据湖', describe: (d: Detail) => `catalog ${d.catalogSchema}` },
+  'tenant.quota_changed': { label: '调整配额', describe: (d: Detail) => describeQuotaChange(d.from as TenantQuota, d.to as TenantQuota) },
   'member.invited': { label: '邀请成员', describe: (d: Detail) => `${d.email}，角色：${roleLabel(d.role)}` },
   'member.role_changed': { label: '修改角色', describe: (d: Detail) => `${d.email}：${roleLabel(d.from)} → ${roleLabel(d.to)}` },
   'member.removed': { label: '移除成员', describe: (d: Detail) => `${d.email}（原角色：${roleLabel(d.role)}）` },

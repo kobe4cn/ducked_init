@@ -12,6 +12,8 @@
     "db:migrate": "drizzle-kit migrate",
     "tenant:create": "node --env-file-if-exists=.env --import tsx scripts/create-tenant.ts",
     "operator:create": "node --env-file-if-exists=.env --import tsx scripts/create-operator.ts",
+    "dispatcher": "node --env-file-if-exists=.env --import tsx scripts/run-dispatcher.ts",
+    "task:enqueue": "node --env-file-if-exists=.env --import tsx scripts/enqueue-task.ts",
     "operator:reset-totp": "node --env-file-if-exists=.env --import tsx scripts/reset-operator-totp.ts",
     "check": "node --env-file=.env --import tsx src/00_check.ts",
     "seed": "node --env-file=.env --import tsx src/01_seed.ts",

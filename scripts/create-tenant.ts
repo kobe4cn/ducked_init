@@ -1,7 +1,8 @@
 // scripts/create-tenant.ts —— 用法：npm run tenant:create -- --slug acme --name "示例商贸" --admin-email admin@acme.com
-// 运营者开通租户：自动创建默认空间与首个管理员（管理员随后用该邮箱通过 Magic Link 登录）。与运营后台调用同一个领域函数
+// 运营者开通租户：自动创建默认空间、首个管理员与数据湖（管理员随后用该邮箱通过 Magic Link 登录）。与运营后台调用同一个领域函数
 import { parseArgs } from 'node:util';
 import { closeDb } from '../app/.server/db/client';
+import { getTenantLake } from '../app/.server/lake';
 import { createTenant } from '../app/.server/tenants';
 
 const { values } = parseArgs({
@@ -18,10 +19,13 @@ if (!values.slug || !values.name || !values['admin-email']) {
 }
 
 try {
-  const { tenant, space, admin } = await createTenant({ slug: values.slug, name: values.name, adminEmail: values['admin-email'] });
+  const { tenant, space, admin, lakeReady } = await createTenant({ slug: values.slug, name: values.name, adminEmail: values['admin-email'] });
+  const lake = (await getTenantLake(tenant.id))!;
   console.log(`已创建租户 ${tenant.name}（${tenant.slug}，id=${tenant.id}）`);
   console.log(`  默认空间：${space.name}（id=${space.id}）`);
   console.log(`  管理员：${admin.email}`);
+  console.log(`  存储前缀：${lake.dataPath}`);
+  console.log(`  Catalog：${lake.catalogSchema}${lakeReady ? '' : '（初始化失败，请在运营后台的租户页重试）'}`);
 } catch (e) {
   console.error(`创建失败：${(e as Error).message}`);
   process.exitCode = 1;

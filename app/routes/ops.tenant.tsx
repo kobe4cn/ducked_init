@@ -1,9 +1,13 @@
-// app/routes/ops.tenant.tsx —— 运营后台的单个租户：改名、指定管理员（用于管理员邮箱失效时的恢复）、停用与恢复
+// app/routes/ops.tenant.tsx —— 运营后台的单个租户：改名、指定管理员（用于管理员邮箱失效时的恢复）、停用与恢复、配额与数据湖
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { CircleAlert } from 'lucide-react';
 import type { Route } from './+types/ops.tenant';
 import { requireOperator } from '~/.server/ops-auth';
-import { assignTenantAdmin, getTenant, renameTenant, resumeTenant, suspendTenant, TenantError } from '~/.server/tenants';
+import { getTenantLake } from '~/.server/lake';
+import { QUOTA_FIELDS, QUOTA_KEYS, type QuotaKey } from '~/.server/quota';
+import {
+  assignTenantAdmin, getTenant, initTenantLake, renameTenant, resumeTenant, setTenantQuota, suspendTenant, TenantError,
+} from '~/.server/tenants';
 import { OpsShell } from '~/components/ops-shell';
 import { TenantStatusBadge } from '~/components/tenant-status-badge';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
@@ -22,6 +26,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     const tenant = await getTenant(params.tenantId);
     return {
       email: operator.email,
+      lake: await getTenantLake(tenant.id),
+      quotaFields: QUOTA_KEYS.map(key => ({ key, ...QUOTA_FIELDS[key] })),
       tenant: { ...tenant, createdAt: tenant.createdAt.toISOString(), suspendedAt: tenant.suspendedAt?.toISOString() ?? null },
     };
   } catch (e) {
@@ -48,6 +54,12 @@ export async function action({ request, params }: Route.ActionArgs) {
       case 'resume':
         await resumeTenant(operator, params.tenantId, field('reason'));
         break;
+      case 'set-quota':
+        await setTenantQuota(operator, params.tenantId, Object.fromEntries(QUOTA_KEYS.map(k => [k, field(k)])) as Record<QuotaKey, string>);
+        break;
+      case 'init-lake':
+        await initTenantLake(operator, params.tenantId);
+        break;
       default:
         return data({ error: '未知操作' }, { status: 400 });
     }
@@ -59,7 +71,7 @@ export async function action({ request, params }: Route.ActionArgs) {
 }
 
 export default function OpsTenant({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, tenant } = loaderData;
+  const { email, tenant, lake, quotaFields } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   return (
     <OpsShell email={email}>
@@ -97,6 +109,54 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
             <dt className="text-muted-foreground">管理员</dt>
             <dd>{tenant.adminEmails.join('、')}</dd>
           </dl>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>数据湖</CardTitle>
+          <CardDescription>租户独立的存储前缀与 DuckLake catalog schema，开通时自动初始化。初始化完成前不派发该租户的任务。</CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4">
+          {lake ? (
+            <dl className="grid grid-cols-[6rem_1fr] gap-y-2 text-sm">
+              <dt className="text-muted-foreground">存储前缀</dt>
+              <dd className="font-mono break-all">{lake.dataPath}</dd>
+              <dt className="text-muted-foreground">Catalog</dt>
+              <dd className="font-mono">{lake.catalogSchema}</dd>
+              <dt className="text-muted-foreground">状态</dt>
+              <dd data-lake-status={lake.catalogInitialized ? 'ready' : 'pending'}>{lake.catalogInitialized ? '已初始化' : '未初始化'}</dd>
+            </dl>
+          ) : (
+            <p className="text-sm text-muted-foreground" data-lake-status="missing">该租户开通时平台还没有数据湖，初始化后才能运行任务。</p>
+          )}
+          {!lake?.catalogInitialized && (
+            <Form method="post">
+              <input type="hidden" name="intent" value="init-lake" />
+              <Button type="submit" variant="outline" disabled={submitting}>初始化数据湖</Button>
+            </Form>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>配额</CardTitle>
+          <CardDescription>每个任务在独立进程中运行，内存与线程按此限制；同时运行的任务超过并发数时排队。修改对之后派发的任务生效，并记入租户的审计日志。</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Form method="post">
+            <input type="hidden" name="intent" value="set-quota" />
+            <FieldGroup className="flex-row items-end">
+              {quotaFields.map(({ key, label, unit, min, max }) => (
+                <Field key={key}>
+                  <FieldLabel htmlFor={`quota-${key}`}>{label}{unit && `（${unit.trim()}）`}</FieldLabel>
+                  <Input id={`quota-${key}`} type="number" name={key} required min={min} max={max} defaultValue={tenant[key]} key={tenant[key]} />
+                </Field>
+              ))}
+              <Button type="submit" disabled={submitting}>保存</Button>
+            </FieldGroup>
+          </Form>
         </CardContent>
       </Card>
 

@@ -1,5 +1,6 @@
 // test/http/harness.ts —— HTTP 接缝：进程内启动 React Router 服务端（vite SSR），用 Request/Response 直接驱动；背后是测试用平台 PG
 import { execFile } from 'node:child_process';
+import { rm } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { createServer, type ViteDevServer } from 'vite';
 import { createRequestHandler, type ServerBuild } from 'react-router';
@@ -107,12 +108,15 @@ export async function startApp(): Promise<TestApp> {
   };
 }
 
-/** 清空平台元数据，保证每个用例从空库开始 */
+/** 清空平台元数据与租户数据湖（catalog schema、数据库角色、存储前缀），保证每个用例从空库开始 */
 export async function resetDb() {
   const client = new pg.Client({ connectionString: process.env.PLATFORM_DATABASE_URL });
   await client.connect();
-  await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions CASCADE');
+  const { rows } = await client.query<{ catalog_schema: string; db_role: string }>('SELECT catalog_schema, db_role FROM platform.tenant_lakes');
+  for (const r of rows) await client.query(`DROP SCHEMA IF EXISTS "${r.catalog_schema}" CASCADE; DROP ROLE IF EXISTS "${r.db_role}"`);
+  await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions, platform.tenant_lakes, platform.tasks CASCADE');
   await client.end();
+  await rm(process.env.PLATFORM_LAKE_URI!, { recursive: true, force: true });
 }
 
 /** 以运营者身份执行命令行（与 npm run tenant:create 相同的入口） */

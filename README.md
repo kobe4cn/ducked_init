@@ -15,11 +15,17 @@ PLATFORM_DATABASE_URL=postgres://crm:crm@localhost:5432/crm_platform
 # 可选：运营后台 /ops 的 IP 白名单（逗号分隔的 CIDR）；客户端地址取 OPS_CLIENT_IP_HEADER（默认 X-Forwarded-For）的最后一项
 # OPS_ALLOWED_CIDRS=10.0.0.0/8,192.168.0.0/16
 # OPS_CLIENT_IP_HEADER=x-forwarded-for
+# 租户数据湖的根：本地目录或对象存储（s3://bucket/prefix，凭据取上面的 S3_*），默认 ./data/platform-lake
+# PLATFORM_LAKE_URI=s3://crm-lake/platform
+# 调度器所在机器同时运行的工作进程上限，默认 4
+# PLATFORM_MAX_WORKERS=4
 
 npm run db:migrate                                                      # 建表 / 升级
 npm run tenant:create -- --slug acme --name 示例商贸 --admin-email admin@acme.com   # 开通租户（带默认空间）与首个管理员
 npm run operator:create -- --email ops@example.com                     # 新增运营者（只能用这条命令）
 npm run operator:reset-totp -- --email ops@example.com                 # 运营者丢失认证器时重置 TOTP
+npm run dispatcher                                                      # 常驻调度器：派发任务队列（另开一个终端）
+npm run task:enqueue -- --tenant acme --kind demo.seed --params '{"customers":1000}'  # 为租户生成演示数据
 npm run dev                                                             # 打开 /login，用管理员邮箱申请 Magic Link
 ```
 
@@ -61,11 +67,20 @@ npm run dev                                                             # 打开
 - 登录：`/ops/login` 申请 Magic Link（邮件同样输出到控制台，链接为 `/ops/auth/verify?token=...`）→ 输入 TOTP 验证码。首次登录时绑定 TOTP：页面展示二维码（服务端生成，用认证器 App 扫描）与可手动输入的密钥，确认一次验证码即完成绑定。同一个验证码只能用一次；连续输错 5 次需重新申请登录链接。
 - 运营者丢失认证器时，在服务器上执行 `npm run operator:reset-totp -- --email ...`：清除其 TOTP 绑定，作废其全部会话（含待验证的）与未使用的登录链接，并在 `/ops/audit` 记一条“重置 TOTP”。该运营者下次登录时重新走首次绑定。**重置后、本人完成绑定前，谁拿到下一封登录链接谁就能完成绑定**（ADR-0007），执行后应尽快通知运营者本人登录并完成绑定。
 - `/ops` 列出租户（名称、标识、开通时间、状态、成员数、管理员邮箱）并开通租户；进入租户可改名、指定管理员（提升已有成员或新增管理员邮箱，用于管理员邮箱失效时的恢复；停用期间不可指定）、停用与恢复。运营者看不到成员名单与业务数据，也没有进入租户的入口。
-- 停用租户必须填写原因：该租户成员的会话与未使用的登录链接立即作废，之后申请登录也不会签发该租户的链接（页面答复不变；同一邮箱属于其他正常租户时，邮件里只有那些租户的链接）。数据完整保留；恢复同样必须填写原因，恢复后成员重新登录即可。外部系统接口与流水线任务的停用处理随对应切片补充。
+- 停用租户必须填写原因：该租户成员的会话与未使用的登录链接立即作废，之后申请登录也不会签发该租户的链接（页面答复不变；同一邮箱属于其他正常租户时，邮件里只有那些租户的链接）。数据完整保留，运行中的任务被终止、排队的任务暂停派发；恢复同样必须填写原因，恢复后成员重新登录即可。外部系统接口的停用处理随对应切片补充。
 - 运营者对租户的操作写入该租户的审计日志，操作者显示为“运营者 ops@…”；运营者登录、绑定 TOTP、重置 TOTP、新增运营者等平台级事件不属于任何租户，只在 `/ops/audit` 可见。
+- 租户页展示数据湖（存储前缀、catalog schema、是否已初始化；初始化失败时可重试）与配额：单任务内存上限（MiB）、线程数、并发任务数，修改记入租户的审计日志。
+
+#### 数据湖与任务
+
+- 开通租户时自动建好数据湖（ADR-0001、0002、0008）：存储前缀 `<PLATFORM_LAKE_URI>/tenants/<租户 ID>/`，平台 PG 中独占的 catalog schema 与数据库角色 `lake_<租户 ID>`（平台 PG 需要 15 及以上版本，平台账号需要 CREATEROLE 权限）。本功能上线前开通的租户没有数据湖，由运营者在租户页点“初始化数据湖”补建。
+- 任务队列在平台 PG（`platform.tasks`）。`npm run dispatcher` 领取任务，每个任务启动一个独立的工作进程：只拿到本租户角色的凭据，挂载后锁定 DuckDB 配置（只能访问本租户前缀、不能再挂载其他库），内存与线程按租户配额限制。
+- 调度按租户公平：先派发运行中任务最少、再派发最久没被派发过的租户，同一租户内先进先出；租户运行中的任务达到并发上限时其余排队。停用租户时其运行中的任务被终止，排队的任务留在队列里、恢复后继续；停用期间不能提交任务。调度器失联超过 1 分钟的任务判为失败，调度器退出时它启动的工作进程随之退出。任务的错误信息对租户全体成员可见，其中的凭据会被抹掉。
+- 任务类型在 `app/.server/pipeline/handlers.ts`：`lake.inventory`（盘点本租户数据湖的表与行数）、`demo.seed`（造数夹具，确定性生成消费者与订单）。成员在 `/tasks` 查看本租户的任务与状态。
+
 - 配置 `OPS_ALLOWED_CIDRS` 后只允许白名单内的地址访问 `/ops`。客户端地址取自反向代理写入的请求头，必须部署在会追加或覆盖该请求头的反向代理之后，否则可被伪造。取最后一项只适用于一层反向代理；多层代理（如 CDN + 负载均衡）时应让最内层代理把真实地址写入单独的请求头（如 `X-Real-IP`），并把 `OPS_CLIENT_IP_HEADER` 指向它。
 
-`npm test` 运行 HTTP 接缝测试：进程内启动 React Router 服务端，背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表）。
+`npm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
 
 ---
 ## 技术栈

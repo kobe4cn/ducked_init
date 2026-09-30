@@ -11,13 +11,30 @@ export const roleEnum = platform.enum('member_role', ROLES);
 
 const createdAt = () => timestamp('created_at', { withTimezone: true }).notNull().defaultNow();
 
-// 停用（suspended_at 非空）：数据完整保留，可以恢复。目前拦截成员的会话与登录；外部系统接口与平台任务随对应切片接入
+// 停用（suspended_at 非空）：数据完整保留，可以恢复。拦截成员的会话与登录，排队的任务不再派发；外部系统接口随对应切片接入。
+// 配额由运营者设置：每个任务的 DuckDB 内存上限与线程数，以及同时运行的任务数（超出的排队）
 export const tenants = platform.table('tenants', {
   id: uuid('id').primaryKey().defaultRandom(),
   slug: text('slug').notNull().unique(),
   name: text('name').notNull(),
   suspendedAt: timestamp('suspended_at', { withTimezone: true }),
   suspensionReason: text('suspension_reason'),
+  memoryLimitMb: integer('memory_limit_mb').notNull().default(2048),
+  threads: integer('threads').notNull().default(2),
+  maxConcurrentTasks: integer('max_concurrent_tasks').notNull().default(1),
+  createdAt: createdAt(),
+});
+
+// 租户的数据湖（ADR-0001、0002、0008）：独立的对象存储前缀，DuckLake catalog 放在平台 PG 中本租户独占的 schema，
+// 由本租户独占的数据库角色拥有；任务进程只拿到这个角色的凭据，读不到其他租户的 catalog 与平台元数据。
+// catalog_initialized_at 为空表示 DuckLake 元数据表尚未建好（开通时初始化失败），此时不派发任务
+export const tenantLakes = platform.table('tenant_lakes', {
+  tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
+  dataPath: text('data_path').notNull(),
+  catalogSchema: text('catalog_schema').notNull().unique(),
+  dbRole: text('db_role').notNull().unique(),
+  dbPassword: text('db_password').notNull(),
+  catalogInitializedAt: timestamp('catalog_initialized_at', { withTimezone: true }),
   createdAt: createdAt(),
 });
 
@@ -124,4 +141,30 @@ export const auditLogs = platform.table('audit_logs', {
 }, t => [
   index('audit_logs_tenant_created_idx').on(t.tenantId, t.createdAt),
   index('audit_logs_operator_created_idx').on(t.createdAt).where(sql`actor_type = 'operator'`),
+]);
+
+export const TASK_STATUSES = ['queued', 'running', 'succeeded', 'failed'] as const;
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+export const taskStatusEnum = platform.enum('task_status', TASK_STATUSES);
+
+// 任务队列：每个任务由调度器派发给一个独立的工作进程，只挂载本租户的数据湖。
+// heartbeat_at 由派发它的调度器定期刷新（取数据库时钟）；调度器失联后，其他调度器据此把任务判为失败
+export const tasks = platform.table('tasks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  kind: text('kind').notNull(),
+  params: jsonb('params').$type<Record<string, unknown>>().notNull().default({}),
+  status: taskStatusEnum('status').notNull().default('queued'),
+  result: jsonb('result').$type<Record<string, unknown>>(),
+  error: text('error'),
+  workerPid: integer('worker_pid'),
+  heartbeatAt: timestamp('heartbeat_at', { withTimezone: true }),
+  startedAt: timestamp('started_at', { withTimezone: true }),
+  finishedAt: timestamp('finished_at', { withTimezone: true }),
+  createdAt: createdAt(),
+}, t => [
+  index('tasks_tenant_created_idx').on(t.tenantId, t.createdAt),
+  index('tasks_tenant_started_idx').on(t.tenantId, t.startedAt),
+  index('tasks_queued_idx').on(t.tenantId, t.createdAt).where(sql`status = 'queued'`),
+  index('tasks_running_idx').on(t.tenantId).where(sql`status = 'running'`),
 ]);
