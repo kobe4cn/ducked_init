@@ -48,6 +48,21 @@ describe('按租户的并发上限', () => {
   });
 });
 
+describe('多个调度器同时领取', () => {
+  it('同一任务只被领取一次，各租户的并发上限不被突破', async () => {
+    const acme = await newTenant('acme');
+    const globex = await newTenant('globex');
+    await setTenantQuota(null, acme, quota(2));
+    await setTenantQuota(null, globex, quota(1));
+    await enqueue(acme, 5);
+    await enqueue(globex, 5);
+
+    const claimed = (await Promise.all(Array.from({ length: 10 }, () => claimNextTask()))).filter(t => t !== null);
+    expect(new Set(claimed.map(t => t.id)).size).toBe(claimed.length);
+    expect(claimed.map(t => t.tenantId).sort()).toEqual([acme, acme, globex].sort());
+  });
+});
+
 describe('按租户公平调度', () => {
   it('大租户先排了很多任务，小租户的任务仍能在它之间轮到', async () => {
     const big = await newTenant('big');
