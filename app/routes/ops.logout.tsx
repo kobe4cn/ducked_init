@@ -8,5 +8,5 @@ export async function loader() {
 }
 
 export async function action({ request }: Route.ActionArgs) {
-  throw redirect('/ops/login', { headers: { 'Set-Cookie': await logoutOperator(request) } });
+  throw redirect('/ops/login', { headers: await logoutOperator(request) });
 }

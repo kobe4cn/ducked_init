@@ -18,8 +18,8 @@ export async function loader({ request }: Route.LoaderArgs) {
 export async function action({ request }: Route.ActionArgs) {
   const code = String((await request.formData()).get('code') ?? '');
   const result = await verifyOperatorTotp(request, code);
-  if (result.ok) throw redirect('/ops', { headers: { 'Set-Cookie': result.setCookie } });
-  if (result.locked) throw redirect('/ops/login?reason=totp_locked', { headers: { 'Set-Cookie': result.setCookie } });
+  if (result.ok) throw redirect('/ops', { headers: result.headers });
+  if (result.locked) throw redirect('/ops/login?reason=totp_locked', { headers: result.headers });
   return data({ error: result.error }, { status: 400 });
 }
 

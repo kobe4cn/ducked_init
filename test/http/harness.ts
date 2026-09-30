@@ -26,28 +26,47 @@ export interface TestApp {
 
 const ORIGIN = 'http://crm.test';
 
-/** 带 cookie 的浏览器替身，不自动跟随重定向 */
+/** RFC 6265 §5.1.4 路径匹配：/ops 匹配 /ops 与 /ops/…，但不匹配 /ops.data */
+const pathMatches = (requestPath: string, cookiePath: string) =>
+  requestPath === cookiePath ||
+  (requestPath.startsWith(cookiePath) && (cookiePath.endsWith('/') || requestPath[cookiePath.length] === '/'));
+
+/** RFC 6265 §5.1.4 默认路径：请求路径去掉最后一段 */
+const defaultPath = (requestPath: string) => {
+  const i = requestPath.lastIndexOf('/');
+  return i <= 0 ? '/' : requestPath.slice(0, i);
+};
+
+/** 带 cookie 的浏览器替身，不自动跟随重定向；像浏览器一样按 Path 决定是否携带 cookie */
 export class Client {
-  private cookies = new Map<string, string>();
+  private cookies = new Map<string, { name: string; value: string; path: string }>();
   constructor(private handler: (req: Request) => Promise<Response>) {}
 
   async request(path: string, init: RequestInit = {}): Promise<Response> {
+    const url = new URL(path, ORIGIN);
     const headers = new Headers(init.headers);
-    if (this.cookies.size) headers.set('Cookie', [...this.cookies].map(([k, v]) => `${k}=${v}`).join('; '));
-    const res = await this.handler(new Request(new URL(path, ORIGIN), { ...init, headers }));
-    for (const c of res.headers.getSetCookie()) {
-      const [pair, ...attrs] = c.split(';');
-      const [name, value] = [pair.slice(0, pair.indexOf('=')).trim(), pair.slice(pair.indexOf('=') + 1).trim()];
-      const expired = !value || attrs.some(a => /^\s*max-age=0\s*$/i.test(a) || /^\s*expires=Thu, 01 Jan 1970/i.test(a));
-      expired ? this.cookies.delete(name) : this.cookies.set(name, value);
-    }
+    // 与浏览器一样：同名 cookie 可按不同 Path 并存，Path 更长的排在前面（RFC 6265 §5.4）
+    const sent = [...this.cookies.values()].filter(c => pathMatches(url.pathname, c.path)).sort((x, y) => y.path.length - x.path.length);
+    if (sent.length && !headers.has('Cookie')) headers.set('Cookie', sent.map(c => `${c.name}=${c.value}`).join('; '));
+    const res = await this.handler(new Request(url, { ...init, headers }));
+    for (const c of res.headers.getSetCookie()) this.store(c, url.pathname);
     return res;
+  }
+
+  /** 按 Set-Cookie 头保存（或删除）cookie；requestPath 用于推出缺省的 Path */
+  store(setCookie: string, requestPath = '/') {
+    const [pair, ...attrs] = setCookie.split(';');
+    const [name, value] = [pair.slice(0, pair.indexOf('=')).trim(), pair.slice(pair.indexOf('=') + 1).trim()];
+    const expired = !value || attrs.some(a => /^\s*max-age=0\s*$/i.test(a) || /^\s*expires=Thu, 01 Jan 1970/i.test(a));
+    const path = attrs.map(a => a.trim().match(/^path=(.*)$/i)?.[1]).find(p => p?.startsWith('/')) ?? defaultPath(requestPath);
+    const key = `${name};${path}`;
+    expired ? this.cookies.delete(key) : this.cookies.set(key, { name, value, path });
   }
 
   get(path: string, headers?: HeadersInit) { return this.request(path, { headers }); }
 
   /** 当前持有的某个 cookie 的值 */
-  cookie(name: string) { return this.cookies.get(name); }
+  cookie(name: string) { return [...this.cookies.values()].find(c => c.name === name)?.value; }
 
   post(path: string, form: Record<string, string> = {}, headers?: HeadersInit) {
     return this.request(path, { method: 'POST', body: new URLSearchParams(form), headers });

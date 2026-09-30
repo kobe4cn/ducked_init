@@ -18,13 +18,25 @@ export const OPS_PENDING_TTL_MS = 10 * 60 * 1000;
 /** 同一次登录连续输错验证码的上限，超过后会话作废 */
 export const MAX_TOTP_FAILURES = 5;
 
+// path 不能设为 /ops：客户端导航到 /ops 时请求的是 /ops.data，按 cookie 路径匹配规则不会携带 /ops 的 cookie
 const opsCookie = createCookie('crm_ops_session', {
   httpOnly: true,
   sameSite: 'strict',
   secure: process.env.NODE_ENV === 'production',
-  path: '/ops',
+  path: '/',
   maxAge: OPS_SESSION_TTL_MS / 1000,
 });
+// 早先的版本把 cookie 设在 Path=/ops。浏览器会把它排在 Path=/ 的同名 cookie 前面一起发送，而解析时只取第一个，
+// 残留的旧 cookie 会遮住新会话；因此每次写入运营者 cookie 时顺带清掉它
+const legacyOpsCookie = createCookie('crm_ops_session', { path: '/ops' });
+
+/** 写入（或清除）运营者 cookie 的响应头，同时清掉 Path=/ops 的旧 cookie */
+async function opsCookieHeaders(token: string, options?: { maxAge: number }): Promise<Headers> {
+  const headers = new Headers();
+  headers.append('Set-Cookie', await legacyOpsCookie.serialize('', { maxAge: 0 }));
+  headers.append('Set-Cookie', await opsCookie.serialize(token, options));
+  return headers;
+}
 
 export interface CurrentOperator { operatorId: string; email: string }
 
@@ -96,8 +108,8 @@ async function issueOperatorMagicLink(email: string, base: string, mailer: Maile
   });
 }
 
-/** 消费 Magic Link：成功则开启一个待 TOTP 验证的会话，返回 Set-Cookie 头；过期、已用或不存在返回 null */
-export async function consumeOperatorMagicLink(token: string): Promise<string | null> {
+/** 消费 Magic Link：成功则开启一个待 TOTP 验证的会话，返回写入 cookie 的响应头；过期、已用或不存在返回 null */
+export async function consumeOperatorMagicLink(token: string): Promise<Headers | null> {
   if (!token) return null;
   const db = getDb();
   const now = new Date();
@@ -114,7 +126,7 @@ export async function consumeOperatorMagicLink(token: string): Promise<string | 
     tokenHash: sha256(sessionToken),
     expiresAt: new Date(now.getTime() + OPS_PENDING_TTL_MS),
   });
-  return opsCookie.serialize(sessionToken);
+  return opsCookieHeaders(sessionToken);
 }
 
 async function readOpsToken(request: Request): Promise<string | null> {
@@ -174,9 +186,9 @@ export async function totpChallenge(request: Request) {
 }
 
 export type TotpResult =
-  | { ok: true; setCookie: string }
+  | { ok: true; headers: Headers }
   | { ok: false; locked: false; error: string }
-  | { ok: false; locked: true; setCookie: string };
+  | { ok: false; locked: true; headers: Headers };
 
 /**
  * 校验 TOTP 验证码。首次通过即完成绑定。通过后换发会话令牌并延长到 8 小时；
@@ -197,7 +209,7 @@ export async function verifyOperatorTotp(request: Request, code: string): Promis
         .returning({ failures: operatorSessions.totpFailures });
       if (s.failures < MAX_TOTP_FAILURES) return { ok: false, locked: false, error: '验证码不正确或已使用，请输入认证器 App 上的最新验证码。' };
       await tx.delete(operatorSessions).where(eq(operatorSessions.id, session.sessionId));
-      return { ok: false, locked: true, setCookie: await opsCookie.serialize('', { maxAge: 0 }) };
+      return { ok: false, locked: true, headers: await opsCookieHeaders('', { maxAge: 0 }) };
     }
 
     const firstBinding = !operator.totpConfirmedAt;
@@ -216,15 +228,15 @@ export async function verifyOperatorTotp(request: Request, code: string): Promis
     const event = { tenantId: null, operator: actor, targetType: 'operator', targetId: operator.id, detail: { email: operator.email } };
     if (firstBinding) await recordAudit(tx, { ...event, action: 'operator.totp_bound' });
     await recordAudit(tx, { ...event, action: 'operator.logged_in' });
-    return { ok: true, setCookie: await opsCookie.serialize(token) };
+    return { ok: true, headers: await opsCookieHeaders(token) };
   });
 }
 
-/** 注销：删除运营者会话并清除 cookie，返回 Set-Cookie 头 */
-export async function logoutOperator(request: Request): Promise<string> {
+/** 注销：删除运营者会话并清除 cookie，返回清除 cookie 的响应头 */
+export async function logoutOperator(request: Request): Promise<Headers> {
   const token = await readOpsToken(request);
   if (token) await getDb().delete(operatorSessions).where(eq(operatorSessions.tokenHash, sha256(token)));
-  return opsCookie.serialize('', { maxAge: 0 });
+  return opsCookieHeaders('', { maxAge: 0 });
 }
 
 /**

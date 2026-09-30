@@ -88,6 +88,32 @@ describe('运营后台登录：Magic Link + 强制 TOTP', () => {
     expect(await home.text()).toContain(OPS);
   });
 
+  it('TOTP 通过后在页面内跳转到运营后台首页（请求 /ops.data）仍保持登录', async () => {
+    const { browser } = await operator();
+    // 客户端导航到 /ops 时，React Router 请求的是 /ops.data；运营者 cookie 必须随之发送
+    const res = await browser.get('/ops.data');
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).not.toContain('/ops/login');
+    expect(body).toContain(OPS);
+  });
+
+  it('浏览器里残留旧版本 Path=/ops 的运营者 cookie 时，重新登录仍能进入 TOTP 验证并登录', async () => {
+    await createOperator(OPS);
+    const browser = app.client();
+    // 旧版本留下的 cookie：路径更长，浏览器会把它排在新 cookie 前面
+    browser.store(`crm_ops_session=${encodeURIComponent(btoa(JSON.stringify('stale-token')))}; Path=/ops; HttpOnly`);
+    await browser.post('/ops/login', { email: OPS });
+    await app.drain();
+    expect((await browser.post(extractOpsLink(app.outbox.at(-1)!), {})).headers.get('Location')).toBe('/ops/totp');
+
+    const totp = await browser.get('/ops/totp.data');
+    expect(await totp.text()).not.toContain('/ops/login');
+    const secret = await totpSecretOn(browser);
+    expect((await browser.post('/ops/totp', { code: totpCode(secret) })).headers.get('Location')).toBe('/ops');
+    expect(await (await browser.get('/ops.data')).text()).toContain(OPS);
+  });
+
   it('绑定后再次登录不再展示密钥，仍须输入验证码；同一个验证码不能重复使用', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const { secret } = await operator();

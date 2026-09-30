@@ -18,9 +18,9 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 export async function action({ request }: Route.ActionArgs) {
   const token = new URL(request.url).searchParams.get('token') ?? '';
-  const setCookie = await consumeOperatorMagicLink(token);
-  if (!setCookie) return { error: '登录链接无效、已过期或已被使用，请重新申请。' };
-  throw redirect('/ops/totp', { headers: { 'Set-Cookie': setCookie } });
+  const headers = await consumeOperatorMagicLink(token);
+  if (!headers) return { error: '登录链接无效、已过期或已被使用，请重新申请。' };
+  throw redirect('/ops/totp', { headers });
 }
 
 export default function OpsVerify({ loaderData, actionData }: Route.ComponentProps) {
