@@ -1,7 +1,6 @@
 // app/routes/ops.audit.tsx —— 运营者审计日志：运营者对各租户的操作，以及运营者登录、绑定 TOTP、新增运营者等平台级事件
 import type { Route } from './+types/ops.audit';
 import { AUDIT_PAGE_SIZE, listOperatorAuditLogs } from '~/.server/audit';
-import { OPS_NAV } from '~/.server/nav';
 import { requireOperator } from '~/.server/ops-auth';
 import { OpsShell } from '~/components/ops-shell';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
@@ -24,7 +23,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 export default function OpsAudit({ loaderData }: Route.ComponentProps) {
   const { email, pageSize, logs } = loaderData;
   return (
-    <OpsShell email={email} nav={OPS_NAV}>
+    <OpsShell email={email}>
       <Card>
         <CardHeader>
           <CardTitle>审计日志</CardTitle>

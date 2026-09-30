@@ -1,18 +1,12 @@
 // app/.server/db/schema.ts —— 平台元数据（平台 PostgreSQL 的 platform schema）。业务数据不落这里（ADR-0002）
 import { sql } from 'drizzle-orm';
 import { boolean, index, integer, jsonb, pgSchema, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { ROLES } from '../../lib/roles';
+
+export { ROLE_LABELS, ROLES, type Role } from '../../lib/roles';
 
 export const platform = pgSchema('platform');
 
-// 角色固定四种：管理员、数据工程师、分析师、查看者
-export const ROLES = ['admin', 'data_engineer', 'analyst', 'viewer'] as const;
-export type Role = (typeof ROLES)[number];
-export const ROLE_LABELS: Record<Role, string> = {
-  admin: '管理员',
-  data_engineer: '数据工程师',
-  analyst: '分析师',
-  viewer: '查看者',
-};
 export const roleEnum = platform.enum('member_role', ROLES);
 
 const createdAt = () => timestamp('created_at', { withTimezone: true }).notNull().defaultNow();

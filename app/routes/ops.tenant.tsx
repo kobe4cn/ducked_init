@@ -2,7 +2,6 @@
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { CircleAlert } from 'lucide-react';
 import type { Route } from './+types/ops.tenant';
-import { OPS_NAV } from '~/.server/nav';
 import { requireOperator } from '~/.server/ops-auth';
 import { assignTenantAdmin, getTenant, renameTenant, TenantError } from '~/.server/tenants';
 import { OpsShell } from '~/components/ops-shell';
@@ -53,7 +52,7 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
   const { email, tenant } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   return (
-    <OpsShell email={email} nav={OPS_NAV}>
+    <OpsShell email={email}>
       {actionData?.error && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />

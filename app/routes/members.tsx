@@ -4,7 +4,7 @@ import { CircleAlert } from 'lucide-react';
 import type { Route } from './+types/members';
 import { can, requirePermission } from '~/.server/access';
 import { logout } from '~/.server/auth';
-import { ROLE_LABELS, ROLES, type Role } from '~/.server/db/schema';
+import { ROLE_LABELS, ROLES, type Role } from '~/lib/roles';
 import { changeMemberRole, inviteMember, listMembers, MemberError, removeMember } from '~/.server/members';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
