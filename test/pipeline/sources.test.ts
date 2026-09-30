@@ -119,8 +119,9 @@ describe('采集表清单、列统计与水位线候选', () => {
 
     expect(byName.orders.watermarkCandidates.map(c => [c.column, c.kind])).toEqual([['order_id', 'increment']]);
     expect(byName.regions).toMatchObject({ rows: 2, watermarkCandidates: [], syncMode: 'full_compare' });
-    expect(byName.events).toMatchObject({ rows: 1500, watermarkCandidates: [], syncMode: 'unsupported' });
-    expect(byName.events.syncModeNote).toContain('本期不支持');
+    expect(byName.events).toMatchObject({ rows: 1500, watermarkCandidates: [], syncMode: 'full_compare' });
+    expect(byName.events.syncModeNote).toContain('大表，默认每天同步一次');
+    expect(byName.regions.syncModeNote).not.toContain('大表');
   });
 
   it('成员从候选中确认水位线字段；不在候选中的字段被拒绝', async () => {

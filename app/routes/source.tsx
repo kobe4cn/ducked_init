@@ -97,7 +97,7 @@ export async function action({ request, params }: Route.ActionArgs) {
 }
 
 const PROFILE_VARIANTS = { none: 'outline', queued: 'outline', running: 'secondary', succeeded: 'default', failed: 'destructive' } as const;
-const SYNC_VARIANTS = { watermark: 'default', needs_confirmation: 'secondary', full_compare: 'outline', unsupported: 'destructive' } as const;
+const SYNC_VARIANTS = { watermark: 'default', needs_confirmation: 'secondary', full_compare: 'outline' } as const;
 const pct = (n: number) => `${Math.round(n * 1000) / 10}%`;
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
@@ -233,7 +233,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
             <Badge variant={PROFILE_VARIANTS[profile.status]} data-profile-status={profile.status}>{`采集${profile.statusLabel}`}</Badge>
           </CardTitle>
           <CardDescription>
-            {`有更新时间或自增主键的表按水位线增量同步（需确认字段）；没有的小表全量比对；没有的大表本期不支持。最近采集：${time(profile.profiledAt)}`}
+            {`有更新时间或自增主键的表按水位线增量同步（需确认字段）；没有的表全量比对（大表默认每天一次）。最近采集：${time(profile.profiledAt)}`}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">

@@ -132,15 +132,16 @@ describe('测试连接与轮换凭据', () => {
 });
 
 describe('列统计与水位线', () => {
-  it('采集完成后展示每张表的列统计、同步方式；大表提示本期不支持；确认水位线后按增量同步', async () => {
+  it('采集完成后展示每张表的列统计、同步方式；没有水位线的大表也全量比对，默认每天同步；确认水位线后按增量同步', async () => {
     const { browser } = await engineerOf('acme');
     const id = sourceIdOf(await register(browser, await pgSourceInput(READER)));
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
     const html = await (await browser.get(`/sources/${id}`)).text();
     expect(html).toContain('data-profile-status="succeeded"');
-    expect(html).toMatch(/data-table="events"[^>]*data-sync-mode="unsupported"/);
-    expect(html).toContain('无水位线的大表本期不支持');
+    expect(html).toMatch(/data-table="events"[^>]*data-sync-mode="full_compare"/);
+    expect(html).toContain('大表，默认每天同步一次');
+    expect(html).not.toContain('不支持');
     expect(html).toMatch(/data-table="regions"[^>]*data-sync-mode="full_compare"/);
     expect(html).toMatch(/data-table="customers"[^>]*data-sync-mode="needs_confirmation"/);
     expect(html).toMatch(/data-column="email"[\s\S]*?25(\.0)?%[\s\S]*?邮箱 100%/);

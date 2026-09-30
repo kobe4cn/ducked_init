@@ -24,7 +24,7 @@ const withClient = async <T>(url: string, run: (c: pg.Client) => Promise<T>) => 
  * 重建源库 shop schema：
  * - customers：自增主键 + updated_at（水位线候选：更新时间与自增主键）
  * - orders：identity 主键，没有更新时间（水位线候选：自增主键）
- * - events：没有水位线字段、行数超过测试设定的大表阈值（SOURCE_LARGE_TABLE_ROWS=1000）
+ * - events：没有水位线字段、行数超过测试设定的大表阈值（SOURCE_LARGE_TABLE_ROWS=1000），全量比对、默认每天同步
  * - regions：没有水位线字段的小表（全量比对）
  */
 export async function seedPgSource() {

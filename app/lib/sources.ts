@@ -13,7 +13,6 @@ export const SYNC_MODES = {
   watermark: '水位线增量',
   needs_confirmation: '待确认水位线',
   full_compare: '全量比对',
-  unsupported: '不支持',
 } as const;
 export type SyncMode = keyof typeof SYNC_MODES;
 

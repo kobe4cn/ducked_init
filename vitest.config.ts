@@ -14,7 +14,7 @@ process.env.TEST_SOURCE_DATABASE_URL ??= 'postgres://crm:crm@localhost:5432/crm_
 process.env.PLATFORM_MASTER_KEY = Buffer.alloc(32, 7).toString('base64');
 // DuckDB 文件类数据源所在的本地目录（每个租户一个子目录）
 process.env.PLATFORM_SOURCE_FILES_DIR = join(tmpdir(), 'crm_platform_test_sources');
-// 没有水位线字段、行数达到这个值的表本期不支持；测试调低，夹具里的 events 表即为大表
+// 没有水位线字段、行数达到这个值的大表全量比对时默认每天同步；测试调低，夹具里的 events 表即为大表
 process.env.SOURCE_LARGE_TABLE_ROWS = '1000';
 // 设置 TEST_S3_LAKE_URI（如 s3://crm-lake/platform-test）后，隔离测试在对象存储上再跑一遍。
 // 平台账号取 S3_*，未设置时用本地 SeaweedFS 的开发账号（db_script/docker-compose.yml）；租户账号由测试开通租户时经 IAM API 创建

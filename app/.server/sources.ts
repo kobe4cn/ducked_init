@@ -21,7 +21,7 @@ export { SourceError, type SourceInput } from './source-config';
 /** 平台进程里探测数据源（登记、修改、测试连接）时 DuckDB 的资源上限 */
 const PROBE_LIMITS = { memoryLimitMb: 256, threads: 1 };
 
-/** 没有水位线字段、行数达到这个值的表本期不支持（SOURCE_LARGE_TABLE_ROWS，默认 1000 万） */
+/** 没有水位线字段、行数达到这个值的大表全量比对时默认每天同步一次，而不是每小时（SOURCE_LARGE_TABLE_ROWS，默认 1000 万） */
 const largeTableRows = () => Number(process.env.SOURCE_LARGE_TABLE_ROWS ?? 10_000_000);
 
 /** 列出可写对象时最多举几个例子 */
@@ -100,17 +100,15 @@ export async function registerSource(actor: CurrentMember, input: SourceInput) {
 
 /**
  * 表的同步方式：成员确认了水位线字段 → 水位线增量；有候选未确认 → 待确认；
- * 没有候选的小表 → 全量比对；没有候选的大表 → 本期不支持
+ * 没有候选的表 → 全量比对（大表默认每天一次，见 ADR-0010）
  */
 function syncModeOf(table: TableProfile, watermark: string | null): { syncMode: SyncMode; syncModeNote: string } {
   if (watermark) return { syncMode: 'watermark', syncModeNote: `按 ${watermark} 增量同步` };
   if (table.watermarkCandidates.length) return { syncMode: 'needs_confirmation', syncModeNote: '平台找到了可用的水位线字段，请确认' };
+  const note = '没有更新时间或自增主键，每次全量拉取并与上一版比对';
   const threshold = largeTableRows();
-  if (table.rows < threshold) return { syncMode: 'full_compare', syncModeNote: '没有更新时间或自增主键，每次全量拉取并与上一版比对' };
-  return {
-    syncMode: 'unsupported',
-    syncModeNote: `没有更新时间或自增主键，且行数达到 ${threshold.toLocaleString('zh-CN')}：无水位线的大表本期不支持，同步时将跳过`,
-  };
+  if (table.rows < threshold) return { syncMode: 'full_compare', syncModeNote: note };
+  return { syncMode: 'full_compare', syncModeNote: `${note}；行数达到 ${threshold.toLocaleString('zh-CN')}（大表，默认每天同步一次）` };
 }
 
 /** 数据源最近一次采集任务（任何状态），以及最近一次成功的采集结果 */
