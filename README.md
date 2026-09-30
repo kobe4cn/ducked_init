@@ -35,16 +35,16 @@ pnpm lake:reset --tenant acme                     # 开发 / 演示：清空租�
 pnpm dev                                          # 打开 /login，用管理员邮箱申请 Magic Link
 ```
 
-开发环境不真正发信，登录邮件（含链接）直接输出到 `pnpm dev` 的控制台；Magic Link 15 分钟内有效、只能使用一次，重新申请后旧链接作废；同一邮箱申请过于频繁会被限流（HTTP 429）。未登记的邮箱收不到链接，平台不开放注册；签发与发信在后台进行，已登记与未登记邮箱的答复内容与响应时间一致。
+登录、邀请等邮件经 [Resend](https://resend.com) 发送：在 `.env` 配置 `RESEND_API_KEY`，发件人用 `MAIL_FROM`（须是 Resend 上已验证的域名；不填时用 `onboarding@resend.dev`，只能发给 Resend 账号本人的邮箱）。开发环境下邮件（含链接）同时输出到 `pnpm dev` 的控制台；未配置 `RESEND_API_KEY` 时只输出到控制台、不真正发信（也可用 `MAILER=console` 强制如此）。生产构建下不输出到控制台。发信实现在 `app/.server/mailer.ts`，接入其他邮件服务时在那里新增一个实现。Magic Link 15 分钟内有效、只能使用一次，重新申请后旧链接作废；同一邮箱申请过于频繁会被限流（HTTP 429）。未登记的邮箱收不到链接，平台不开放注册；签发与发信在后台进行，已登记与未登记邮箱的答复内容与响应时间一致。
 
 界面使用 [shadcn/ui](https://ui.shadcn.com)（Radix + Tailwind CSS 4，`nova` 预设），组件源码在 `app/components/ui/`，配置见 `components.json`。新增组件：`pnpm dlx shadcn@latest add <组件名>`；`app/components/ui/` 下是生成的代码，保持 shadcn 原样以便升级，业务样式写在页面里。
 
 #### 本地登录（获取 Magic Link）
 
 1. `pnpm dev`，浏览器打开 `http://localhost:5173/login`，输入已登记的邮箱，点“发送登录链接”。
-2. 回到运行 `pnpm dev` 的终端，找到下面这段输出，复制其中的链接到浏览器打开，点“登录”：
+2. 到邮箱里收信（配置了 `RESEND_API_KEY` 时），或回到运行 `pnpm dev` 的终端，找到下面这段输出，复制其中的链接到浏览器打开，点“登录”：
    ```
-   ======== 邮件（开发环境，仅输出到控制台）========
+   ======== 邮件（开发环境，输出到控制台）========
    收件人：admin@acme.com
    ...
    示例商贸：http://localhost:5173/auth/verify?token=xxxxxxxx
@@ -57,7 +57,7 @@ pnpm dev                                          # 打开 /login，用管理员
 - 同一邮箱每 15 分钟最多申请 5 次，本地调试可在 `.env` 调大 `MAGIC_LINK_RATE_LIMIT`。
 - 未登记的邮箱不会输出链接（页面答复与已登记邮箱相同）。要新增可登录的邮箱，由租户管理员在“成员”页邀请（邀请邮件同样输出到控制台）。
 - 同一邮箱隶属多个租户时，一封邮件里每个租户各有一条链接，选哪条就进入哪个租户。
-- `pnpm start`（生产构建）下默认不允许把链接输出到日志，会直接报错；确需如此时设置 `MAILER=console`，并配置 `APP_ORIGIN`。
+- `pnpm start`（生产构建）下须配置 `RESEND_API_KEY` 与 `APP_ORIGIN`；未配置发信时不允许把链接输出到日志，会直接报错，确需如此时设置 `MAILER=console`。
 
 #### 成员与权限
 
