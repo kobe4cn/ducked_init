@@ -57,6 +57,10 @@ export class Client {
 export async function startApp(): Promise<TestApp> {
   const vite: ViteDevServer = await createServer({
     configFile: 'vite.config.ts',
+    // 用单独的缓存目录、不做浏览器端依赖预构建：否则会改写开发服务器正在用的 node_modules/.vite/deps，
+    // 浏览器随后请求依赖时收到 504（Outdated Optimize Dep）
+    cacheDir: 'node_modules/.vite-test',
+    optimizeDeps: { noDiscovery: true, include: [] },
     server: { middlewareMode: true, hmr: false, watch: null },
     appType: 'custom',
     logLevel: 'error',
