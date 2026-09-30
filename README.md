@@ -19,6 +19,10 @@ PLATFORM_DATABASE_URL=postgres://crm:crm@localhost:5432/crm_platform
 # PLATFORM_LAKE_URI=s3://crm-lake/platform
 # 调度器所在机器同时运行的工作进程上限，默认 4
 # PLATFORM_MAX_WORKERS=4
+# 凭据信封加密的主密钥（登记数据源必需）：openssl rand -base64 32，平台与调度器用同一个值
+PLATFORM_MASTER_KEY=
+# 可选：本机 DuckDB 文件类数据源的目录（每个租户只能用 <目录>/<租户 ID>/ 下的文件）
+# PLATFORM_SOURCE_FILES_DIR=./data/source-files
 
 pnpm db:migrate                                   # 建表 / 升级
 pnpm tenant:create --slug acme --name 示例商贸 --admin-email admin@acme.com  # 开通租户（带默认空间）与首个管理员
@@ -82,9 +86,16 @@ pnpm dev                                          # 打开 /login，用管理员
 - 任务队列在平台 PG（`platform.tasks`）。`pnpm dispatcher` 领取任务，每个任务启动一个独立的工作进程：只拿到本租户角色的凭据，挂载后锁定 DuckDB 配置（只能访问本租户前缀、不能再挂载其他库），内存与线程按租户配额限制。
 - 调度按租户公平：先派发运行中任务最少、再派发最久没被派发过的租户，同一租户内先进先出；租户运行中的任务达到并发上限时其余排队。停用租户时其运行中的任务被终止，排队的任务留在队列里、恢复后继续；停用期间不能提交任务。调度器失联超过 1 分钟的任务判为失败，调度器退出时它启动的工作进程随之退出。任务的错误信息对租户全体成员可见，其中的凭据会被抹掉。
 - 租户的存储前缀在开通时写入平台库，修改 `PLATFORM_LAKE_URI` 只影响之后开通的租户；已开通租户的数据用 `pnpm lake:migrate` 搬过去（见下节）。
-- 任务类型在 `app/.server/pipeline/handlers.ts`：`lake.inventory`（盘点本租户数据湖的表与行数）、`demo.seed`（造数夹具，确定性生成消费者与订单）。成员在 `/tasks` 查看本租户的任务与状态，成功的任务可展开查看结果（各表行数与运行时生效的内存、线程）。
+- 任务类型在 `app/.server/pipeline/handlers.ts`：`lake.inventory`（盘点本租户数据湖的表与行数）、`demo.seed`（造数夹具，确定性生成消费者与订单）、`source.profile`（采集数据源，见下节）。成员在 `/tasks` 查看本租户的任务与状态，成功的任务可展开查看结果（各表行数与运行时生效的内存、线程）。
 - 开发 / 演示时清空某个租户的数据湖重来：`pnpm lake:reset --tenant acme`。命令先打印租户名称、catalog 与存储前缀，要求再输入一次租户标识确认（脚本里用 `--yes` 跳过）；然后删除并重建 catalog schema（租户的数据库角色、密码与 S3 账号不变）、删除存储前缀下的全部文件（本地目录与对象存储都支持）、重新初始化，并在租户审计日志记一条“重置数据湖”。该租户有运行中的任务时拒绝执行，迁移存储中时也拒绝；重置期间数据湖标为未初始化、不派发该租户的任务，排队的任务在重置完成后照常执行。中途出错时数据湖停在未初始化，重新执行同一条命令即可。`NODE_ENV=production` 时拒绝执行，除非加 `--force`；生产环境清除租户数据应走删除请求与租户退出，运营后台不提供重置按钮（ADR-0007）。
 
+#### 数据源
+
+- 数据工程师与管理员在 `/sources` 登记数据源（分析师只读，查看者不可见）：PostgreSQL、MySQL、对象存储上的 Parquet / CSV / JSON 文件（前缀下每个子目录或顶层文件是一张表）、DuckDB 文件（对象存储上，或本机 `PLATFORM_SOURCE_FILES_DIR/<租户 ID>/` 下）。
+- 登记与修改前平台连接数据源并探测账号的写权限，**可写即拒绝**并列出可写的对象：PostgreSQL 查超级用户、建库 / 建 schema 权限与各表的 INSERT / UPDATE / DELETE / TRUNCATE；MySQL 查各级写类权限；对象存储发起一次分段上传并立即取消（不写入任何数据）。本机 DuckDB 文件没有账号，只读挂载。采集任务运行时再探测一次，登记后才被授予写权限的账号同样被拒绝。
+- 凭据（密码、对象存储密钥）用租户数据密钥加密保存（AES-256-GCM），数据密钥用 `PLATFORM_MASTER_KEY` 包裹后存在 `platform.tenant_keys`；页面与接口都不回显，修改时留空表示沿用，连接目标变了时须重新填写。任务派发时由调度器解密、经 IPC 交给工作进程，以临时 secret 注入内存中的 DuckDB，不落盘。
+- 源端以只读方式挂载后锁定 DuckDB 配置（不能再挂载其他库、读其他路径）；PostgreSQL 的只读挂载把一切语句放在只读事务里。发往源端的只有平台写死的只读查询，成员与模型都不能向源端发送 SQL。
+- 登记后自动提交采集任务（`source.profile`）：每张表的行数，基于前 10 万行样本的列统计（类型、空值率、基数、数值与时间列的取值范围；文本列只给长度范围与格式特征，不给取值），以及水位线候选（按命名是更新时间的时间列、由自增序列生成的主键）。成员从候选中确认水位线；没有候选的小表全量比对，没有候选且行数达到 `SOURCE_LARGE_TABLE_ROWS`（默认 1000 万）的大表提示本期不支持。
 
 #### 平台切换存储（本地目录 ⇄ 对象存储、换桶）
 
@@ -103,7 +114,7 @@ pnpm dev                                          # 打开 /login，用管理员
    - **失败**：数据湖仍指向旧位置、数据完整，排队的任务照常执行。排除原因后重新执行同一条命令即可重试，新位置上残留的文件会被覆盖。调度器在迁移途中退出时，其他调度器会在 1 分钟后接手、从头再做。
 5. 迁移只在当前配置的一个对象存储服务内进行（换桶、换前缀）。要换对象存储服务，先迁到本地目录，改好 `S3_*` 后再迁到新服务上。
 
-`pnpm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。设置 `TEST_S3_LAKE_URI=s3://crm-lake/platform-test` 后，租户隔离测试会在对象存储上再跑一遍，平台账号取 `S3_*`，默认用本地 SeaweedFS 的开发账号 `crm` / `crm-secret`（SeaweedFS 须按上面的要求开启 IAM）；租户账号由测试开通租户时创建，每个用例前删除。CI 会起 SeaweedFS 跑这组测试。对象存储上的测试数据不会自动清理。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
+`pnpm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。设置 `TEST_S3_LAKE_URI=s3://crm-lake/platform-test` 后，租户隔离测试会在对象存储上再跑一遍，平台账号取 `S3_*`，默认用本地 SeaweedFS 的开发账号 `crm` / `crm-secret`（SeaweedFS 须按上面的要求开启 IAM）；租户账号由测试开通租户时创建，每个用例前删除。CI 会起 SeaweedFS 跑这组测试。数据源测试在同一个 PG 上建源库 `crm_source_test` 与两个测试账号（`TEST_SOURCE_DATABASE_URL` 可覆盖）；设置 `TEST_MYSQL_URL`（如 `mysql://root:密码@127.0.0.1:3306/crm_source_test`）后再测 MySQL 数据源，CI 会起 MySQL 跑。对象存储上的测试数据不会自动清理。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
 
 ---
 ## 技术栈

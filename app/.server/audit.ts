@@ -2,10 +2,11 @@
 import { desc, eq } from 'drizzle-orm';
 import type { CurrentMember } from './auth';
 import { getDb, type Db } from './db/client';
-import { auditLogs, ROLE_LABELS, tenants, type Role } from './db/schema';
+import { auditLogs, ROLE_LABELS, SOURCE_KIND_LABELS, tenants, type Role, type SourceKind } from './db/schema';
 import { describeQuotaChange, type TenantQuota } from './quota';
 
 type Detail = Record<string, unknown>;
+const sourceKindLabel = (kind: unknown) => SOURCE_KIND_LABELS[kind as SourceKind] ?? String(kind);
 const roleLabel = (role: unknown) => ROLE_LABELS[role as Role] ?? String(role);
 
 
@@ -36,6 +37,17 @@ const ACTIONS = {
   'member.invited': { label: '邀请成员', describe: (d: Detail) => `${d.email}，角色：${roleLabel(d.role)}` },
   'member.role_changed': { label: '修改角色', describe: (d: Detail) => `${d.email}：${roleLabel(d.from)} → ${roleLabel(d.to)}` },
   'member.removed': { label: '移除成员', describe: (d: Detail) => `${d.email}（原角色：${roleLabel(d.role)}）` },
+  'source.registered': { label: '登记数据源', describe: (d: Detail) => `「${d.name}」（${sourceKindLabel(d.kind)}），${d.tables} 张表` },
+  'source.updated': {
+    label: '修改数据源',
+    describe: (d: Detail) => [
+      `「${d.name}」`,
+      d.renamedFrom ? `由「${d.renamedFrom}」改名` : '',
+      (d.changed as string[] | undefined)?.length ? `修改 ${(d.changed as string[]).join('、')}` : '',
+      d.credentialsRotated ? '轮换凭据' : '',
+    ].filter(Boolean).join('，'),
+  },
+  'source.watermark_confirmed': { label: '确认水位线', describe: (d: Detail) => `「${d.name}」${d.table}：${d.column}` },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },

@@ -52,7 +52,7 @@ export function createDispatcher({ maxWorkers, pollMs = 1000, staleAfterMs = 60_
       outcome ??= { error: `工作进程异常退出（${signal ?? `退出码 ${code}`}）` };
       resolve();
     }));
-    const input: WorkerInput = { kind: task.kind, params: task.params, lake: task.lake, limits: task.limits };
+    const input: WorkerInput = { kind: task.kind, params: task.params, lake: task.lake, limits: task.limits, source: task.source };
     child.send(input);
     const done = exited
       .then(() => finishTask(task.id, outcome!))

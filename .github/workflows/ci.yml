@@ -22,10 +22,24 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # MySQL 数据源的登记与只读校验测试
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: crm
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pcrm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
     env:
       TEST_PLATFORM_DATABASE_URL: postgres://crm:crm@localhost:5432/crm_platform_test
       # 租户隔离测试在对象存储上再跑一遍（SeaweedFS，平台账号 crm / crm-secret，租户账号由测试开通租户时经 IAM API 创建）
       TEST_S3_LAKE_URI: s3://crm-lake/platform-test
+      # 用 127.0.0.1 而不是 localhost：MySQL 客户端把 localhost 当作本机 socket
+      TEST_MYSQL_URL: mysql://root:crm@127.0.0.1:3306/crm_source_test
     steps:
       - uses: actions/checkout@v4
       - name: Start SeaweedFS

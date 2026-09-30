@@ -5,6 +5,7 @@ import type { Tx } from './audit';
 import { getDb } from './db/client';
 import { tasks, tenantLakes, tenants } from './db/schema';
 import { lakeSpecOf } from './lake';
+import { loadSourceSpec, SourceError } from './source-config';
 import { HANDLERS, isTaskKind, type TaskKind } from './pipeline/handlers';
 import type { WorkerInput, WorkerOutcome } from './pipeline/worker';
 
@@ -57,12 +58,28 @@ export async function lockClaims(tx: Tx) {
 }
 
 /**
+ * 领取下一个任务并标为运行中；参数带 sourceId 的任务同时解密该数据源的凭据交给工作进程（不写进任务记录）。
+ * 数据源已不存在或凭据无法解密时，该任务直接记为失败，接着领取下一个。
+ */
+export async function claimNextTask(): Promise<ClaimedTask | null> {
+  for (;;) {
+    const task = await claimQueuedTask();
+    if (!task || typeof task.params.sourceId !== 'string') return task;
+    try {
+      return { ...task, source: await loadSourceSpec(task.tenantId, task.params.sourceId) };
+    } catch (e) {
+      await finishTask(task.id, { error: e instanceof SourceError ? e.message : `无法读取数据源的凭据：${(e as Error).message}` });
+    }
+  }
+}
+
+/**
  * 领取下一个任务并标为运行中；没有可派发的任务时返回 null。
  * 跳过已停用、数据湖未初始化（含对象存储上还没有本租户账号）、数据湖迁移中、以及运行中任务已达并发上限的租户。
  * 公平调度：先挑运行中任务最少的租户，再挑最久没被派发过的租户，同一租户内先进先出——
  * 排队再多的大租户每次也只占一个名额，小租户不会被饿死
  */
-export async function claimNextTask(): Promise<ClaimedTask | null> {
+async function claimQueuedTask(): Promise<ClaimedTask | null> {
   return getDb().transaction(async tx => {
     await lockClaims(tx);
     // 只看有排队任务的租户；各项统计都走按租户的索引，不随历史任务增多而变慢

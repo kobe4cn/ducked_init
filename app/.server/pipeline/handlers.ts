@@ -1,11 +1,16 @@
 // app/.server/pipeline/handlers.ts —— 各类任务在工作进程里做什么。连接只挂载了本租户的数据湖（默认库），表名不带前缀。
 // 新增任务类型只改这里；参数在工作进程里校验，不合法时任务记为失败
 import type { DuckDBConnection } from '@duckdb/node-api';
+import type { EngineLimits } from './lake-engine';
+import { profileSource, type SourceSpec } from './source-engine';
 
 type Params = Record<string, unknown>;
 type Result = Record<string, unknown>;
 
-interface Handler { label: string; run(con: DuckDBConnection, params: Params): Promise<Result> }
+/** 任务的运行环境：配额，以及任务涉及数据源时（参数带 sourceId）派发时解密好的连接参数 */
+export interface TaskContext { limits: EngineLimits; source?: SourceSpec }
+
+interface Handler { label: string; run(con: DuckDBConnection, params: Params, ctx: TaskContext): Promise<Result> }
 
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 
@@ -53,6 +58,14 @@ export const HANDLERS = {
                round(20 + ${u01('c.customer_id * 17 + k', 12)} * 980, 2) AS pay_amount
         FROM customers c, range(floor(${u01('c.customer_id', 10)} * 6)::BIGINT) r(k);`);
       return { tables: await inventory(con) };
+    },
+  },
+  // 采集数据源：表清单、行数、列统计与水位线候选。数据源只读挂载在另一个 DuckDB 里，不碰本租户的数据湖
+  'source.profile': {
+    label: '采集数据源',
+    async run(_con, _params, { source, limits }) {
+      if (!source) throw new Error('缺少数据源');
+      return { tables: await profileSource(source, limits) };
     },
   },
 } satisfies Record<string, Handler>;

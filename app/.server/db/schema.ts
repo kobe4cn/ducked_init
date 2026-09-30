@@ -1,9 +1,11 @@
 // app/.server/db/schema.ts —— 平台元数据（平台 PostgreSQL 的 platform schema）。业务数据不落这里（ADR-0002）
 import { sql } from 'drizzle-orm';
-import { boolean, index, integer, jsonb, pgSchema, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { boolean, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { ROLES } from '../../lib/roles';
+import { SOURCE_KINDS } from '../../lib/sources';
 
 export { ROLE_LABELS, ROLES, type Role } from '../../lib/roles';
+export { SOURCE_KIND_LABELS, SOURCE_KINDS, type SourceKind } from '../../lib/sources';
 
 export const platform = pgSchema('platform');
 
@@ -202,3 +204,39 @@ export const tasks = platform.table('tasks', {
   index('tasks_queued_idx').on(t.tenantId, t.createdAt).where(sql`status = 'queued'`),
   index('tasks_running_idx').on(t.tenantId).where(sql`status = 'running'`),
 ]);
+
+// 租户数据密钥（信封加密）：每个租户一把随机的数据密钥，用平台主密钥（PLATFORM_MASTER_KEY，以后可换 KMS）包裹后保存。
+// 数据源凭据、模型服务 API Key 等用它加密；首次需要时生成
+export const tenantKeys = platform.table('tenant_keys', {
+  tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
+  wrappedKey: text('wrapped_key').notNull(),
+  createdAt: createdAt(),
+});
+
+export const sourceKindEnum = platform.enum('source_kind', SOURCE_KINDS);
+
+// 数据源：租户登记的外部只读连接，属于某个空间。config 是可以展示的连接参数（主机、库名、用户名、路径等），
+// credentials 是用租户数据密钥加密的凭据（密码、对象存储密钥），任何界面与接口都不回显。
+// 登记与修改时平台探测账号的写权限，可写即拒绝，因此库里只有只读账号
+export const sources = platform.table('sources', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  spaceId: uuid('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  kind: sourceKindEnum('kind').notNull(),
+  config: jsonb('config').$type<Record<string, string>>().notNull(),
+  credentials: text('credentials').notNull(),
+  credentialsRotatedAt: timestamp('credentials_rotated_at', { withTimezone: true }),
+  createdAt: createdAt(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [uniqueIndex('sources_tenant_name_uq').on(t.tenantId, t.name)]);
+
+// 数据源里每张表由成员确认的设置：本期只有水位线字段（从平台给出的候选中确认）。
+// 表清单与列统计来自最近一次成功的采集任务（source.profile）的结果
+export const sourceTables = platform.table('source_tables', {
+  sourceId: uuid('source_id').notNull().references(() => sources.id, { onDelete: 'cascade' }),
+  tableName: text('table_name').notNull(),
+  watermarkColumn: text('watermark_column'),
+  confirmedByEmail: text('confirmed_by_email'),
+  confirmedAt: timestamp('confirmed_at', { withTimezone: true }),
+}, t => [primaryKey({ columns: [t.sourceId, t.tableName] })]);

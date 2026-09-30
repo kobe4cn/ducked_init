@@ -5,6 +5,7 @@ import type { CurrentMember } from './auth';
 export function navFor(member: CurrentMember) {
   return [
     { to: '/', label: '概览' },
+    ...(can(member.role, 'sources:read') ? [{ to: '/sources', label: '数据源' }] : []),
     { to: '/tasks', label: '任务' },
     ...(can(member.role, 'members:manage') ? [{ to: '/members', label: '成员' }] : []),
     ...(can(member.role, 'audit:read') ? [{ to: '/audit', label: '审计日志' }] : []),
