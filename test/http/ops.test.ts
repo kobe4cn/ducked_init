@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { totpCode } from '../../app/.server/totp';
 import {
-  createOperator, createTenant, extractOpsLink, loginAs, loginAsOperator, opsMagicLogin, resetDb, scanTotpQrOn, startApp, totpSecretOn,
+  createOperator, createTenant, extractOpsLink, loginAs, loginAsOperator, opsMagicLogin, resetDb, resetOperatorTotp, scanTotpQrOn, startApp,
+  totpSecretOn,
   type Client, type TestApp,
 } from './harness';
 
@@ -12,6 +13,7 @@ beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); });
 
 const OPS = 'ops@platform.com';
+const OTHER_OPS = 'ops2@platform.com';
 
 /** 创建运营者并完成首次登录 */
 async function operator(email = OPS) {
@@ -204,6 +206,79 @@ describe('运营后台登录：Magic Link + 强制 TOTP', () => {
     const res = await browser.post('/ops/logout');
     expect(res.headers.get('Location')).toBe('/ops/login');
     expect((await browser.get('/ops')).headers.get('Location')).toBe('/ops/login');
+  });
+});
+
+describe('运营命令：重置运营者的 TOTP', () => {
+  it('重置后该运营者原有的会话失效，访问运营后台跳转到登录页', async () => {
+    const { browser } = await operator();
+    const cli = await resetOperatorTotp(OPS);
+    expect(cli.code).toBe(0);
+    expect(cli.stdout).toContain(OPS);
+    const res = await browser.get('/ops');
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe('/ops/login');
+  });
+
+  it('重置后再次登录进入首次绑定：给出新的密钥，旧密钥的验证码不再被接受', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const { secret: old } = await operator();
+    expect((await resetOperatorTotp(OPS)).code).toBe(0);
+
+    vi.setSystemTime(Date.now() + 30_000);
+    const browser = await opsMagicLogin(app, OPS);
+    const secret = await totpSecretOn(browser);
+    expect(secret).not.toBe(old);
+    const stale = await browser.post('/ops/totp', { code: totpCode(old) });
+    expect(stale.status).toBe(400);
+    expect(await stale.text()).toContain('验证码不正确');
+
+    expect((await browser.post('/ops/totp', { code: totpCode(secret) })).headers.get('Location')).toBe('/ops');
+    expect((await browser.get('/ops')).status).toBe(200);
+  });
+
+  it('待验证的会话与未使用的登录链接一并作废', async () => {
+    await operator();
+    const pending = await opsMagicLogin(app, OPS);
+    await app.client().post('/ops/login', { email: OPS });
+    await app.drain();
+    const link = extractOpsLink(app.outbox.at(-1)!);
+
+    expect((await resetOperatorTotp(OPS)).code).toBe(0);
+    expect((await pending.get('/ops/totp')).headers.get('Location')).toBe('/ops/login');
+    expect(await (await app.client().post(link, {})).text()).toContain('登录链接无效、已过期或已被使用');
+  });
+
+  it('其他运营者的会话与 TOTP 不受影响', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    await operator();
+    const other = await operator(OTHER_OPS);
+    expect((await resetOperatorTotp(OPS)).code).toBe(0);
+
+    expect((await other.browser.get('/ops')).status).toBe(200);
+    vi.setSystemTime(Date.now() + 30_000);
+    const again = await opsMagicLogin(app, OTHER_OPS);
+    expect(await (await again.get('/ops/totp')).text()).not.toContain('data-totp-secret');
+    expect((await again.post('/ops/totp', { code: totpCode(other.secret) })).headers.get('Location')).toBe('/ops');
+  });
+
+  it('重置记为平台事件，操作者为运营命令，只在运营后台可见', async () => {
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    await operator();
+    const { browser } = await operator(OTHER_OPS);
+    expect((await resetOperatorTotp(OPS)).code).toBe(0);
+
+    const events = await (await browser.get('/ops/audit')).text();
+    expect(auditActions(events)[0]).toBe('重置 TOTP');
+    expect(events).toContain('运营者（运营命令）');
+    const admin = await loginAs(app, 'admin@acme.com');
+    expect(await (await admin.get('/audit')).text()).not.toContain('重置 TOTP');
+  });
+
+  it('邮箱不存在时报错并以非零状态退出', async () => {
+    const cli = await resetOperatorTotp('nobody@platform.com');
+    expect(cli.code).not.toBe(0);
+    expect(cli.stderr).toContain('重置失败：运营者不存在');
   });
 });
 

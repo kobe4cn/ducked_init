@@ -19,6 +19,7 @@ PLATFORM_DATABASE_URL=postgres://crm:crm@localhost:5432/crm_platform
 npm run db:migrate                                                      # 建表 / 升级
 npm run tenant:create -- --slug acme --name 示例商贸 --admin-email admin@acme.com   # 开通租户（带默认空间）与首个管理员
 npm run operator:create -- --email ops@example.com                     # 新增运营者（只能用这条命令）
+npm run operator:reset-totp -- --email ops@example.com                 # 运营者丢失认证器时重置 TOTP
 npm run dev                                                             # 打开 /login，用管理员邮箱申请 Magic Link
 ```
 
@@ -58,9 +59,10 @@ npm run dev                                                             # 打开
 
 - 运营者只能在服务器上用 `npm run operator:create -- --email ...` 创建；后台没有新增或停用运营者的入口。
 - 登录：`/ops/login` 申请 Magic Link（邮件同样输出到控制台，链接为 `/ops/auth/verify?token=...`）→ 输入 TOTP 验证码。首次登录时绑定 TOTP：页面展示二维码（服务端生成，用认证器 App 扫描）与可手动输入的密钥，确认一次验证码即完成绑定。同一个验证码只能用一次；连续输错 5 次需重新申请登录链接。
+- 运营者丢失认证器时，在服务器上执行 `npm run operator:reset-totp -- --email ...`：清除其 TOTP 绑定，作废其全部会话（含待验证的）与未使用的登录链接，并在 `/ops/audit` 记一条“重置 TOTP”。该运营者下次登录时重新走首次绑定。**重置后、本人完成绑定前，谁拿到下一封登录链接谁就能完成绑定**（ADR-0007），执行后应尽快通知运营者本人登录并完成绑定。
 - `/ops` 列出租户（名称、标识、开通时间、状态、成员数、管理员邮箱）并开通租户；进入租户可改名、指定管理员（提升已有成员或新增管理员邮箱，用于管理员邮箱失效时的恢复；停用期间不可指定）、停用与恢复。运营者看不到成员名单与业务数据，也没有进入租户的入口。
 - 停用租户必须填写原因：该租户成员的会话与未使用的登录链接立即作废，之后申请登录也不会签发该租户的链接（页面答复不变；同一邮箱属于其他正常租户时，邮件里只有那些租户的链接）。数据完整保留；恢复同样必须填写原因，恢复后成员重新登录即可。外部系统接口与流水线任务的停用处理随对应切片补充。
-- 运营者对租户的操作写入该租户的审计日志，操作者显示为“运营者 ops@…”；运营者登录、绑定 TOTP、新增运营者等平台级事件不属于任何租户，只在 `/ops/audit` 可见。
+- 运营者对租户的操作写入该租户的审计日志，操作者显示为“运营者 ops@…”；运营者登录、绑定 TOTP、重置 TOTP、新增运营者等平台级事件不属于任何租户，只在 `/ops/audit` 可见。
 - 配置 `OPS_ALLOWED_CIDRS` 后只允许白名单内的地址访问 `/ops`。客户端地址取自反向代理写入的请求头，必须部署在会追加或覆盖该请求头的反向代理之后，否则可被伪造。取最后一项只适用于一层反向代理；多层代理（如 CDN + 负载均衡）时应让最内层代理把真实地址写入单独的请求头（如 `X-Real-IP`），并把 `OPS_CLIENT_IP_HEADER` 指向它。
 
 `npm test` 运行 HTTP 接缝测试：进程内启动 React Router 服务端，背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表）。

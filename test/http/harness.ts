@@ -129,6 +129,9 @@ export const createTenant = (slug: string, name: string, adminEmail: string) =>
 /** 以服务器上的运营命令创建运营者（npm run operator:create） */
 export const createOperator = (email: string) => runCli('scripts/create-operator.ts', ['--email', email]);
 
+/** 以服务器上的运营命令重置运营者的 TOTP（npm run operator:reset-totp） */
+export const resetOperatorTotp = (email: string) => runCli('scripts/reset-operator-totp.ts', ['--email', email]);
+
 /** 从邮件正文里取出运营后台的登录链接（路径 + 查询串） */
 export function extractOpsLink(mail: Mail): string {
   const m = mail.text.match(/https?:\/\/\S+\/ops\/auth\/verify\?token=[\w-]+/);

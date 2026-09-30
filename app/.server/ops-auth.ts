@@ -64,6 +64,30 @@ export async function createOperator(rawEmail: string) {
 }
 
 /**
+ * 运营命令重置运营者的 TOTP（丢失认证器时）：清除密钥与绑定状态，下次登录重新走首次绑定；
+ * 同时作废该运营者的全部会话（含待验证的）与未使用的登录链接
+ */
+export async function resetOperatorTotp(rawEmail: string) {
+  const email = normalizeEmail(rawEmail);
+  return getDb().transaction(async tx => {
+    const [operator] = await tx.select({ id: operators.id, email: operators.email }).from(operators).where(eq(operators.email, email)).for('update');
+    if (!operator) throw new Error(`运营者不存在：${email}`);
+    await tx.update(operators).set({ totpSecret: null, totpConfirmedAt: null, totpLastStep: null }).where(eq(operators.id, operator.id));
+    await tx.delete(operatorSessions).where(eq(operatorSessions.operatorId, operator.id));
+    await tx.delete(operatorMagicLinks).where(and(eq(operatorMagicLinks.operatorId, operator.id), isNull(operatorMagicLinks.usedAt)));
+    await recordAudit(tx, {
+      tenantId: null,
+      operator: null,
+      action: 'operator.totp_reset',
+      targetType: 'operator',
+      targetId: operator.id,
+      detail: { email: operator.email },
+    });
+    return operator;
+  });
+}
+
+/**
  * 申请运营后台的 Magic Link。与成员登录一样：请求路径上只做限流，查运营者、签发与发信放到后台，
  * 运营者与非运营者邮箱得到的答复和响应时间都一样
  */

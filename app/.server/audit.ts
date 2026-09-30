@@ -23,6 +23,7 @@ const ACTIONS = {
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },
+  'operator.totp_reset': { label: '重置 TOTP', describe: (d: Detail) => `${d.email}` },
   'operator.logged_in': { label: '运营者登录', describe: (d: Detail) => `${d.email}` },
 } satisfies Record<string, { label: string; describe: (d: Detail) => string }>;
 export type AuditAction = keyof typeof ACTIONS;
