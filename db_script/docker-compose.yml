@@ -6,18 +6,22 @@
 
 services:
   # ---------------- SeaweedFS（Apache-2.0，推荐）----------------
+  # 账号由 SeaweedFS 自己保存在 filer 中（不用静态 -s3.config 文件），平台账号经 AWS_* 注入；
+  # 开启 IAM API 写入，平台开通租户时用它建每个租户只能访问自己前缀的账号（ADR-0008）
   seaweedfs:
     image: chrislusf/seaweedfs:latest
     command: >
       server -dir=/data -ip.bind=0.0.0.0
-      -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+      -s3 -s3.port=8333 -s3.iam.readOnly=false
       -master.volumeSizeLimitMB=1024 -volume.max=0
+    environment:
+      AWS_ACCESS_KEY_ID: crm
+      AWS_SECRET_ACCESS_KEY: crm-secret
     ports:
       - "8333:8333"   # S3 API
       - "9333:9333"   # master 管理页
       - "8888:8888"   # filer 浏览页
     volumes:
-      - ./docker/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
       - seaweedfs-data:/data
     restart: unless-stopped
 

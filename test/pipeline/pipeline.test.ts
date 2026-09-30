@@ -1,13 +1,18 @@
 // 租户流水线接缝：开通租户 → 入队任务 → 调度器派发到独立工作进程 → 读取任务结果。数据用 seed 造数夹具生成
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { DuckDBInstance } from '@duckdb/node-api';
+import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { eq } from 'drizzle-orm';
+import { listAuditLogs } from '../../app/.server/audit';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { tenantLakes } from '../../app/.server/db/schema';
+import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { deleteTenantS3Account } from '../../app/.server/s3-accounts';
 import { getTenantLake } from '../../app/.server/lake';
 import { openTenantLake, type LakeSpec } from '../../app/.server/pipeline/lake-engine';
-import { claimNextTask, enqueueTask, finishTask, listTasks } from '../../app/.server/tasks';
-import { setTenantQuota } from '../../app/.server/tenants';
+import { claimNextTask, enqueueTask, finishTask, getTask, listTasks } from '../../app/.server/tasks';
+import { initTenantLake, setTenantQuota } from '../../app/.server/tenants';
 import { resetDb } from '../http/harness';
 import { newTenant, runTask } from './fixtures';
 
@@ -52,22 +57,29 @@ describe('任务在独立进程中按租户配额运行', () => {
   });
 });
 
-/** 不加限制地列出存储前缀下的文件：确认数据确实落在那里，越权读取被拒才有意义 */
-async function filesUnder(lake: LakeSpec, prefix: string) {
+/** 不加 DuckDB 限制地执行 SQL；给了 S3 凭据时用它访问对象存储。返回执行结果，或被拒绝时的错误信息 */
+async function unlocked<T>(s3: LakeSpec['s3'], run: (con: DuckDBConnection) => Promise<T>) {
   const instance = await DuckDBInstance.create(':memory:');
   const con = await instance.connect();
   try {
-    if (lake.s3) {
-      const s = lake.s3;
-      await con.run(`INSTALL httpfs; LOAD httpfs; CREATE SECRET (TYPE s3, KEY_ID '${s.key}', SECRET '${s.secret}', REGION '${s.region}',
-        ENDPOINT '${s.endpoint}', URL_STYLE '${s.urlStyle}', USE_SSL ${s.useSsl})`);
+    if (s3) {
+      await con.run(`INSTALL httpfs; LOAD httpfs; CREATE SECRET (TYPE s3, KEY_ID '${s3.key}', SECRET '${s3.secret}', REGION '${s3.region}',
+        ENDPOINT '${s3.endpoint}', URL_STYLE '${s3.urlStyle}', USE_SSL ${s3.useSsl})`);
     }
-    return (await con.runAndReadAll(`SELECT file FROM glob('${prefix}**')`)).getRowObjectsJson().map(r => r.file as string);
+    return await run(con);
   } finally {
     con.closeSync();
     instance.closeSync();
   }
 }
+
+/** 平台账号的 S3 凭据（测试用它确认数据确实落在对象存储上）；本地目录时为 undefined */
+const platformS3 = (lake: LakeSpec): LakeSpec['s3'] => lake.s3 && { ...lake.s3, key: process.env.S3_ACCESS_KEY!, secret: process.env.S3_SECRET_KEY! };
+
+/** 用平台账号列出存储前缀下的文件：确认数据确实落在那里，越权读取被拒才有意义 */
+const filesUnder = (lake: LakeSpec, prefix: string) =>
+  unlocked(platformS3(lake), async con =>
+    (await con.runAndReadAll(`SELECT file FROM glob('${prefix}**')`)).getRowObjectsJson().map(r => r.file as string));
 
 /** 以工作进程的方式打开租户的数据湖：领取任务得到的就是工作进程拿到的全部凭据 */
 async function openAsWorker(tenantId: string) {
@@ -142,13 +154,94 @@ for (const { storage, lakeUri } of STORAGES) {
   });
 }
 
-// 对象存储上工作进程拿到的是平台共用的 S3 密钥（ADR-0008），以下绕路也必须走不通
+// 对象存储上的隔离由存储服务执行：工作进程拿到的是本租户的 S3 账号，只能访问本租户的前缀（ADR-0008）
 describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储上的越权访问', () => {
   const defaultLakeUri = process.env.PLATFORM_LAKE_URI;
   beforeAll(() => { process.env.PLATFORM_LAKE_URI = process.env.TEST_S3_LAKE_URI; });
   afterAll(() => { process.env.PLATFORM_LAKE_URI = defaultLakeUri; });
 
-  it('不能用路径穿越、直连存储服务的地址读写其他租户的数据，也读不出 S3 密钥', async () => {
+  it('工作进程拿到的是本租户的 S3 凭据，不含平台账号的密钥', async () => {
+    const acme = await newTenant('acme');
+    const globex = await newTenant('globex');
+    const worker = await openAsWorker(globex);
+    try {
+      const s3 = worker.task.lake.s3!;
+      expect(s3.key).not.toBe(process.env.S3_ACCESS_KEY);
+      expect(JSON.stringify(worker.task)).not.toContain(process.env.S3_SECRET_KEY);
+      const acmeWorker = await openAsWorker(acme);
+      await acmeWorker.close();
+      expect(acmeWorker.task.lake.s3!.key).not.toBe(s3.key);
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('即使不锁 DuckDB 配置，租户凭据也读写、列不到其他租户的前缀，路径穿越同样失败', async () => {
+    const acme = await newTenant('acme');
+    const globex = await newTenant('globex');
+    await runTask(acme, 'demo.seed', { customers: 20 });
+    const acmeLake = (await getTenantLake(acme))!;
+
+    const worker = await openAsWorker(globex);
+    await worker.close();
+    const { lake } = worker.task;
+    const [acmeFile] = await filesUnder(lake, acmeLake.dataPath);
+    expect(acmeFile).toBeDefined();
+    const bucket = acmeLake.dataPath.split('/').slice(0, 3).join('/');
+    const viaTraversal = `${lake.dataPath}../${acme}/`;
+
+    const attempts = await unlocked(lake.s3, async con => {
+      const tryRun = (sql: string) => con.run(sql).then(() => 'allowed', e => (e as Error).message);
+      return {
+        ownWrite: await tryRun(`COPY (SELECT 1 AS x) TO '${lake.dataPath}probe.parquet'`),
+        ownRead: await tryRun(`SELECT * FROM read_parquet('${lake.dataPath}probe.parquet')`),
+        ownList: await tryRun(`SELECT * FROM glob('${lake.dataPath}*')`),
+        read: await tryRun(`SELECT count(*) FROM read_parquet('${acmeFile}')`),
+        write: await tryRun(`COPY (SELECT 1 AS x) TO '${acmeLake.dataPath}evil.parquet'`),
+        list: await tryRun(`SELECT * FROM glob('${acmeLake.dataPath}*')`),
+        listBucket: await tryRun(`SELECT * FROM glob('${bucket}/*')`),
+        traversalRead: await tryRun(`SELECT count(*) FROM read_parquet('${viaTraversal}${acmeFile.slice(acmeLake.dataPath.length)}')`),
+        traversalWrite: await tryRun(`COPY (SELECT 1 AS x) TO '${viaTraversal}evil2.parquet'`),
+      };
+    });
+    expect(attempts).toMatchObject({ ownWrite: 'allowed', ownRead: 'allowed', ownList: 'allowed' });
+    // 由存储服务按租户账号的前缀策略拒绝
+    for (const k of ['read', 'write', 'list', 'listBucket'] as const) expect(attempts[k], k).toMatch(/AccessDenied/);
+    // 带 .. 的路径：DuckDB 原样发出，存储服务拒绝（SeaweedFS 不接受路径里的 ..，与凭据无关，见 ADR-0008）
+    for (const k of ['traversalRead', 'traversalWrite'] as const) expect(attempts[k], k).toMatch(/HTTP 403|HTTP code 403|HTTP 400|HTTP code 400/);
+    const acmeFiles = await filesUnder(lake, acmeLake.dataPath);
+    expect(acmeFiles).not.toContain(`${acmeLake.dataPath}evil.parquet`);
+    expect(acmeFiles).not.toContain(`${acmeLake.dataPath}evil2.parquet`);
+  });
+
+  it('本功能上线前开通、还没有对象存储账号的租户不派发任务，运营者补建账号后恢复运行并记入审计', async () => {
+    const acme = await newTenant('acme');
+    expect((await runTask(acme, 'demo.seed', { customers: 20 })).status).toBe('succeeded');
+    // 模拟上线前开通的租户：数据湖已初始化，但存储服务上没有它的账号
+    await deleteTenantS3Account(acme);
+    await getDb().update(tenantLakes).set({ s3AccessKey: null, s3SecretKey: null }).where(eq(tenantLakes.tenantId, acme));
+    expect(await getTenantLake(acme)).toMatchObject({ catalogInitialized: true, ready: false, s3User: { ready: false } });
+
+    const { id } = await enqueueTask(acme, 'lake.inventory');
+    await createDispatcher({ maxWorkers: 1 }).runUntilIdle();
+    expect((await getTask(id)).status).toBe('queued');
+
+    await initTenantLake(null, acme);
+    await initTenantLake(null, acme);
+    expect(await getTenantLake(acme)).toMatchObject({ ready: true, s3User: { name: `lake-${acme}`, ready: true } });
+    await createDispatcher({ maxWorkers: 1 }).runUntilIdle();
+    const task = await getTask(id);
+    expect(task.status).toBe('succeeded');
+    expect((task.result!.tables as { name: string; rows: number }[]).find(t => t.name === 'customers')?.rows).toBe(20);
+
+    // 开通时建一次，补建一次；重复初始化不再新建
+    const audit = await listAuditLogs(acme);
+    const created = `lake-${acme}，只能访问 ${(await getTenantLake(acme))!.dataPath}`;
+    expect(audit.filter(l => l.action === '建立对象存储账号').map(l => l.summary)).toEqual([created, created]);
+    expect(audit.filter(l => l.action === '初始化数据湖')).toHaveLength(2);
+  });
+
+  it('锁定配置的工作进程也不能直连存储服务的地址，读不出 S3 密钥', async () => {
     const acme = await newTenant('acme');
     const globex = await newTenant('globex');
     await runTask(acme, 'demo.seed', { customers: 20 });
@@ -159,15 +252,8 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储上的越权访问',
       const { task, con, denied } = worker;
       const s3 = task.lake.s3!;
       const [acmeFile] = await filesUnder(task.lake, acmeLake.dataPath);
-      expect(acmeFile).toBeDefined();
-
-      // 带 .. 的路径能通过 DuckDB 的 allowed_directories 检查，只靠存储服务拒绝（见 ADR-0008）
-      const viaTraversal = `${task.lake.dataPath}../${acme}/`;
-      expect(await denied(`SELECT count(*) FROM read_parquet('${viaTraversal}${acmeFile.slice(acmeLake.dataPath.length)}')`)).not.toBe('allowed');
-      expect(await denied(`COPY (SELECT 1) TO '${viaTraversal}evil.parquet'`)).not.toBe('allowed');
       const viaEndpoint = acmeFile.replace('s3://', `${s3.useSsl ? 'https' : 'http'}://${s3.endpoint}/`);
       expect(await denied(`SELECT count(*) FROM read_parquet('${viaEndpoint}')`)).toMatch(/Permission Error/);
-      expect(await filesUnder(task.lake, acmeLake.dataPath)).not.toContain(`${acmeLake.dataPath}evil.parquet`);
 
       const secrets = (await con.runAndReadAll('SELECT secret_string FROM duckdb_secrets()')).getRowObjectsJson();
       expect(JSON.stringify(secrets)).not.toContain(s3.secret);

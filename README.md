@@ -15,7 +15,7 @@ PLATFORM_DATABASE_URL=postgres://crm:crm@localhost:5432/crm_platform
 # 可选：运营后台 /ops 的 IP 白名单（逗号分隔的 CIDR）；客户端地址取 OPS_CLIENT_IP_HEADER（默认 X-Forwarded-For）的最后一项
 # OPS_ALLOWED_CIDRS=10.0.0.0/8,192.168.0.0/16
 # OPS_CLIENT_IP_HEADER=x-forwarded-for
-# 租户数据湖的根：本地目录或对象存储（s3://bucket/prefix，凭据取上面的 S3_*），默认 ./data/platform-lake
+# 租户数据湖的根：本地目录或对象存储（s3://bucket/prefix，平台账号取上面的 S3_*），默认 ./data/platform-lake
 # PLATFORM_LAKE_URI=s3://crm-lake/platform
 # 调度器所在机器同时运行的工作进程上限，默认 4
 # PLATFORM_MAX_WORKERS=4
@@ -75,12 +75,14 @@ pnpm dev                                          # 打开 /login，用管理员
 #### 数据湖与任务
 
 - 开通租户时自动建好数据湖（ADR-0001、0002、0008）：存储前缀 `<PLATFORM_LAKE_URI>/tenants/<租户 ID>/`，平台 PG 中独占的 catalog schema 与数据库角色 `lake_<租户 ID>`（平台 PG 需要 15 及以上版本，平台账号需要 CREATEROLE 权限）。本功能上线前开通的租户没有数据湖，由运营者在租户页点“初始化数据湖”补建。
+- 数据湖根在对象存储上时，开通租户还会经存储服务的 IAM API（SeaweedFS 内置在 S3 端口上）建好租户账号 `lake-<租户 ID>`，绑定只允许读写、删除、列出本租户前缀的策略；工作进程只拿到这个账号的密钥，拿不到 `S3_*` 平台账号。建账号失败时租户照常开通、不派发任务，运营者在租户页点“初始化数据湖”重试；早于此功能开通、还没有账号的租户同样由此补建，补建记入审计日志。本地目录模式不建账号。
+- SeaweedFS 部署要求：账号由 SeaweedFS 自己保存在 filer 中（**不能**用静态 `-s3.config` 文件，否则 IAM API 无法写入），开启 `-s3.iam.readOnly=false`，平台账号经 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` 注入（见 `db_script/docker-compose.yml`，与 `.env` 里的 `S3_ACCESS_KEY` / `S3_SECRET_KEY` 一致）。原先用 `-s3.config` 启动的实例改为上述方式重启即可，存储桶与数据不受影响。
 - 任务队列在平台 PG（`platform.tasks`）。`pnpm dispatcher` 领取任务，每个任务启动一个独立的工作进程：只拿到本租户角色的凭据，挂载后锁定 DuckDB 配置（只能访问本租户前缀、不能再挂载其他库），内存与线程按租户配额限制。
 - 调度按租户公平：先派发运行中任务最少、再派发最久没被派发过的租户，同一租户内先进先出；租户运行中的任务达到并发上限时其余排队。停用租户时其运行中的任务被终止，排队的任务留在队列里、恢复后继续；停用期间不能提交任务。调度器失联超过 1 分钟的任务判为失败，调度器退出时它启动的工作进程随之退出。任务的错误信息对租户全体成员可见，其中的凭据会被抹掉。
 - 任务类型在 `app/.server/pipeline/handlers.ts`：`lake.inventory`（盘点本租户数据湖的表与行数）、`demo.seed`（造数夹具，确定性生成消费者与订单）。成员在 `/tasks` 查看本租户的任务与状态，成功的任务可展开查看结果（各表行数与运行时生效的内存、线程）。
 
 
-`pnpm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。设置 `TEST_S3_LAKE_URI=s3://crm-lake/platform-test` 后，租户隔离测试会在对象存储上再跑一遍，凭据取 `S3_*`，默认用 `docker/seaweedfs/s3.json` 里的开发账号；CI 会起 SeaweedFS 跑这组测试。对象存储上的测试数据不会自动清理。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
+`pnpm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。设置 `TEST_S3_LAKE_URI=s3://crm-lake/platform-test` 后，租户隔离测试会在对象存储上再跑一遍，平台账号取 `S3_*`，默认用本地 SeaweedFS 的开发账号 `crm` / `crm-secret`（SeaweedFS 须按上面的要求开启 IAM）；租户账号由测试开通租户时创建，每个用例前删除。CI 会起 SeaweedFS 跑这组测试。对象存储上的测试数据不会自动清理。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
 
 ---
 ## 技术栈
@@ -375,7 +377,6 @@ scripts/make_delta_iceberg.py  生成 Delta / Iceberg 测试表
 wasm/                    DuckDB-Wasm 浏览器看板（src/app.ts、serve.mjs、test.mjs）
 dbt/                     dbt-duckdb 项目（profiles.yml、models/、macros/）
 docker-compose.yml       SeaweedFS（默认）/ RustFS / PostgreSQL（可选）
-docker/seaweedfs/s3.json SeaweedFS 的访问密钥配置
 .env.example             全部配置项
 ```
 

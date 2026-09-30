@@ -37,7 +37,8 @@ export interface CreateTenantInput { slug: string; name: string; adminEmail: str
 
 /**
  * 开通租户：同一事务里建好默认空间、首个管理员与数据湖（catalog schema 与数据库角色）。
- * 提交后再初始化 DuckLake catalog：它要用新建的数据库角色另开连接。初始化失败不回滚开通，
+ * 提交后再建对象存储上的租户账号（数据湖根在对象存储上时）并初始化 DuckLake catalog：前者是外部系统上的操作，
+ * 后者要用新建的数据库角色另开连接。任一步失败都不回滚开通，
  * lakeReady 为 false，运营者可以在租户页重试；在此之前不派发该租户的任务
  */
 export async function createTenant(input: CreateTenantInput, operator: OperatorActor = null) {
@@ -68,11 +69,12 @@ export async function createTenant(input: CreateTenantInput, operator: OperatorA
     if (isUniqueViolation(e)) throw new TenantError(`租户标识已存在：${slug}`);
     throw e;
   }
-  return { ...created, lakeReady: await tryInitTenantCatalog(created.tenant.id) };
+  return { ...created, lakeReady: await tryInitTenantCatalog(created.tenant.id, operator) };
 }
 
 /**
- * 运营者初始化租户的数据湖：开通时初始化失败后重试，或为本功能上线前开通、还没有数据湖的租户补建。可重复执行
+ * 运营者初始化租户的数据湖：开通时初始化失败后重试，或为本功能上线前开通、还没有数据湖
+ * （或在对象存储上还没有账号）的租户补建。可重复执行
  */
 export async function initTenantLake(operator: OperatorActor, tenantId: string) {
   const tenant = await getTenant(tenantId);
@@ -82,7 +84,7 @@ export async function initTenantLake(operator: OperatorActor, tenantId: string) 
     return (await tenantLakeExists(tx, tenant.id))!;
   });
   try {
-    await initTenantCatalog(tenant.id);
+    await initTenantCatalog(tenant.id, operator);
   } catch (e) {
     console.error(`[数据湖初始化失败] 租户 ${tenant.id}`, e);
     throw new TenantError('数据湖初始化失败，详见服务端日志');
@@ -104,9 +106,9 @@ export async function tenantIdBySlug(slug: string) {
   return tenant.id;
 }
 
-async function tryInitTenantCatalog(tenantId: string) {
+async function tryInitTenantCatalog(tenantId: string, operator: OperatorActor) {
   try {
-    await initTenantCatalog(tenantId);
+    await initTenantCatalog(tenantId, operator);
     return true;
   } catch (e) {
     console.error(`[数据湖初始化失败] 租户 ${tenantId}`, e);

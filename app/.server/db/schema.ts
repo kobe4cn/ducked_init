@@ -27,6 +27,8 @@ export const tenants = platform.table('tenants', {
 
 // 租户的数据湖（ADR-0001、0002、0008）：独立的对象存储前缀，DuckLake catalog 放在平台 PG 中本租户独占的 schema，
 // 由本租户独占的数据库角色拥有；任务进程只拿到这个角色的凭据，读不到其他租户的 catalog 与平台元数据。
+// 存储前缀在对象存储上时，s3_access_key / s3_secret_key 是本租户在存储服务上的账号，只能访问本租户的前缀；
+// 与数据库角色的密码同等对待。为空表示账号尚未建好（开通时失败或本功能上线前开通），此时不派发任务。
 // catalog_initialized_at 为空表示 DuckLake 元数据表尚未建好（开通时初始化失败），此时不派发任务
 export const tenantLakes = platform.table('tenant_lakes', {
   tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
@@ -34,6 +36,8 @@ export const tenantLakes = platform.table('tenant_lakes', {
   catalogSchema: text('catalog_schema').notNull().unique(),
   dbRole: text('db_role').notNull().unique(),
   dbPassword: text('db_password').notNull(),
+  s3AccessKey: text('s3_access_key'),
+  s3SecretKey: text('s3_secret_key'),
   catalogInitializedAt: timestamp('catalog_initialized_at', { withTimezone: true }),
   createdAt: createdAt(),
 });

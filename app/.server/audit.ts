@@ -20,6 +20,7 @@ const ACTIONS = {
   'tenant.suspended': { label: '停用租户', describe: (d: Detail) => `原因：${d.reason}` },
   'tenant.resumed': { label: '恢复租户', describe: (d: Detail) => `原因：${d.reason}` },
   'tenant.lake_initialized': { label: '初始化数据湖', describe: (d: Detail) => `catalog ${d.catalogSchema}` },
+  'tenant.s3_account_created': { label: '建立对象存储账号', describe: (d: Detail) => `${d.s3User}，只能访问 ${d.dataPath}` },
   'tenant.quota_changed': { label: '调整配额', describe: (d: Detail) => describeQuotaChange(d.from as TenantQuota, d.to as TenantQuota) },
   'member.invited': { label: '邀请成员', describe: (d: Detail) => `${d.email}，角色：${roleLabel(d.role)}` },
   'member.role_changed': { label: '修改角色', describe: (d: Detail) => `${d.email}：${roleLabel(d.from)} → ${roleLabel(d.to)}` },

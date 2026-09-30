@@ -7,6 +7,7 @@ CONTAINER_NAME="seaweedfs"
 VOLUME_NAME="seaweedfs-data"
 IMAGE="docker.io/chrislusf/seaweedfs:latest"
 
+# 平台账号经 AWS_* 注入，租户账号由平台经 IAM API 创建、保存在 filer 中（ADR-0008）
 # SeaweedFS 资源
 CPU_COUNT=8
 MEMORY_SIZE="12g"
@@ -37,7 +38,8 @@ container run -d \
     -p 8333:8333 \
     -p 9333:9333 \
     -p 8888:8888 \
-    -v "$PROJECT_DIR/docker/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro" \
+    -e AWS_ACCESS_KEY_ID=crm \
+    -e AWS_SECRET_ACCESS_KEY=crm-secret \
     -v "$VOLUME_NAME:/data" \
     "$IMAGE" \
     server \
@@ -45,7 +47,7 @@ container run -d \
         -ip.bind=0.0.0.0 \
         -s3 \
         -s3.port=8333 \
-        -s3.config=/etc/seaweedfs/s3.json \
+        -s3.iam.readOnly=false \
         -master.volumeSizeLimitMB=1024 \
         -volume.max=0 || {
     echo "ERROR: Failed to start SeaweedFS."

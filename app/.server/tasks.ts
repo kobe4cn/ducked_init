@@ -52,7 +52,7 @@ const CLAIM_LOCK = 0x7461736b;
 
 /**
  * 领取下一个任务并标为运行中；没有可派发的任务时返回 null。
- * 跳过已停用、数据湖未初始化、以及运行中任务已达并发上限的租户。
+ * 跳过已停用、数据湖未初始化（含对象存储上还没有本租户账号）、以及运行中任务已达并发上限的租户。
  * 公平调度：先挑运行中任务最少的租户，再挑最久没被派发过的租户，同一租户内先进先出——
  * 排队再多的大租户每次也只占一个名额，小租户不会被饿死
  */
@@ -65,6 +65,7 @@ export async function claimNextTask(): Promise<ClaimedTask | null> {
       FROM (SELECT DISTINCT tenant_id FROM platform.tasks WHERE status = 'queued') c
       JOIN platform.tenants tn ON tn.id = c.tenant_id AND tn.suspended_at IS NULL
       JOIN platform.tenant_lakes l ON l.tenant_id = c.tenant_id AND l.catalog_initialized_at IS NOT NULL
+        AND (l.data_path NOT LIKE 's3://%' OR l.s3_access_key IS NOT NULL)
       CROSS JOIN LATERAL (
         SELECT count(*)::int AS n FROM platform.tasks WHERE tenant_id = c.tenant_id AND status = 'running'
       ) r

@@ -9,7 +9,7 @@ process.env.PLATFORM_DATABASE_URL =
 // 租户数据湖的根目录：测试用本地临时目录（测试会清空）
 process.env.PLATFORM_LAKE_URI = join(tmpdir(), 'crm_platform_test_lake');
 // 设置 TEST_S3_LAKE_URI（如 s3://crm-lake/platform-test）后，隔离测试在对象存储上再跑一遍。
-// 凭据取 S3_*，未设置时用 docker/seaweedfs/s3.json 里的开发账号
+// 平台账号取 S3_*，未设置时用本地 SeaweedFS 的开发账号（db_script/docker-compose.yml）；租户账号由测试开通租户时经 IAM API 创建
 if (process.env.TEST_S3_LAKE_URI) {
   process.env.S3_ACCESS_KEY ??= 'crm';
   process.env.S3_SECRET_KEY ??= 'crm-secret';

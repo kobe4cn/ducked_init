@@ -115,7 +115,7 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
       <Card>
         <CardHeader>
           <CardTitle>数据湖</CardTitle>
-          <CardDescription>租户独立的存储前缀与 DuckLake catalog schema，开通时自动初始化。初始化完成前不派发该租户的任务。</CardDescription>
+          <CardDescription>租户独立的存储前缀（在对象存储上时另有只能访问该前缀的账号）与 DuckLake catalog schema，开通时自动初始化。初始化完成前不派发该租户的任务。</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
           {lake ? (
@@ -124,13 +124,21 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
               <dd className="font-mono break-all">{lake.dataPath}</dd>
               <dt className="text-muted-foreground">Catalog</dt>
               <dd className="font-mono">{lake.catalogSchema}</dd>
+              {lake.s3User && (
+                <>
+                  <dt className="text-muted-foreground">存储账号</dt>
+                  <dd data-s3-user={lake.s3User.ready ? 'ready' : 'missing'}>
+                    <span className="font-mono">{lake.s3User.name}</span>{lake.s3User.ready ? '' : '（未建立）'}
+                  </dd>
+                </>
+              )}
               <dt className="text-muted-foreground">状态</dt>
-              <dd data-lake-status={lake.catalogInitialized ? 'ready' : 'pending'}>{lake.catalogInitialized ? '已初始化' : '未初始化'}</dd>
+              <dd data-lake-status={lake.ready ? 'ready' : 'pending'}>{lake.ready ? '已初始化' : '未初始化'}</dd>
             </dl>
           ) : (
             <p className="text-sm text-muted-foreground" data-lake-status="missing">该租户开通时平台还没有数据湖，初始化后才能运行任务。</p>
           )}
-          {!lake?.catalogInitialized && (
+          {!lake?.ready && (
             <Form method="post">
               <input type="hidden" name="intent" value="init-lake" />
               <Button type="submit" variant="outline" disabled={submitting}>初始化数据湖</Button>

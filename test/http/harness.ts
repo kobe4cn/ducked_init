@@ -8,6 +8,7 @@ import pg from 'pg';
 import jsQR from 'jsqr';
 import { PNG } from 'pngjs';
 import type { Mail } from '../../app/.server/mailer';
+import { deleteTenantS3Account } from '../../app/.server/s3-accounts';
 import { totpCode } from '../../app/.server/totp';
 
 export type { Mail };
@@ -108,12 +109,17 @@ export async function startApp(): Promise<TestApp> {
   };
 }
 
-/** 清空平台元数据与租户数据湖（catalog schema、数据库角色、存储前缀），保证每个用例从空库开始 */
+/** 清空平台元数据与租户数据湖（catalog schema、数据库角色、对象存储账号、本地存储前缀），保证每个用例从空库开始 */
 export async function resetDb() {
   const client = new pg.Client({ connectionString: process.env.PLATFORM_DATABASE_URL });
   await client.connect();
-  const { rows } = await client.query<{ catalog_schema: string; db_role: string }>('SELECT catalog_schema, db_role FROM platform.tenant_lakes');
-  for (const r of rows) await client.query(`DROP SCHEMA IF EXISTS "${r.catalog_schema}" CASCADE; DROP ROLE IF EXISTS "${r.db_role}"`);
+  const { rows } = await client.query<{ tenant_id: string; data_path: string; catalog_schema: string; db_role: string }>(
+    'SELECT tenant_id, data_path, catalog_schema, db_role FROM platform.tenant_lakes');
+  for (const r of rows) {
+    await client.query(`DROP SCHEMA IF EXISTS "${r.catalog_schema}" CASCADE; DROP ROLE IF EXISTS "${r.db_role}"`);
+    // 上一轮在对象存储上跑、这一轮没有配置对象存储时，留下的账号不清（租户 ID 每次不同，不会冲突）
+    if (r.data_path.startsWith('s3://') && process.env.TEST_S3_LAKE_URI) await deleteTenantS3Account(r.tenant_id);
+  }
   await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions, platform.tenant_lakes, platform.tasks CASCADE');
   await client.end();
   // 对象存储上的数据不清：租户 ID 每次不同，前缀不会重叠

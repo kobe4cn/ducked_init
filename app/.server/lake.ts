@@ -1,13 +1,15 @@
-// app/.server/lake.ts —— 租户数据湖的开通（ADR-0001、0002、0008）：存储前缀、平台 PG 中独占的 catalog schema 与数据库角色。
-// 工作进程只拿到 lakeSpecOf() 给出的本租户凭据，拿不到平台 PG 的连接串
+// app/.server/lake.ts —— 租户数据湖的开通（ADR-0001、0002、0008）：存储前缀（对象存储上另有本租户的账号）、
+// 平台 PG 中独占的 catalog schema 与数据库角色。工作进程只拿到 lakeSpecOf() 给出的本租户凭据，
+// 拿不到平台 PG 的连接串，也拿不到对象存储的平台账号
 import { randomBytes } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { eq, sql } from 'drizzle-orm';
-import type { Tx } from './audit';
+import { recordAudit, type OperatorActor, type Tx } from './audit';
 import { getDb, type Db } from './db/client';
 import { tenantLakes } from './db/schema';
 import { openTenantLake, type LakeSpec } from './pipeline/lake-engine';
+import { issueTenantS3Account, platformS3, s3UserOf } from './s3-accounts';
 
 type TenantLakeRow = typeof tenantLakes.$inferSelect;
 
@@ -44,26 +46,17 @@ export async function provisionTenantLake(tx: Tx, tenantId: string) {
   await tx.insert(tenantLakes).values({ tenantId, dataPath, catalogSchema, dbRole, dbPassword });
 }
 
-/** 任务进程访问本租户数据湖所需的全部信息：只含本租户角色的凭据 */
-export function lakeSpecOf(lake: Pick<TenantLakeRow, 'dataPath' | 'catalogSchema' | 'dbRole' | 'dbPassword'>): LakeSpec {
+/** 任务进程访问本租户数据湖所需的全部信息：只含本租户数据库角色与对象存储账号的凭据 */
+export function lakeSpecOf(lake: Pick<TenantLakeRow, 'dataPath' | 'catalogSchema' | 'dbRole' | 'dbPassword' | 's3AccessKey' | 's3SecretKey'>): LakeSpec {
   const url = new URL(process.env.PLATFORM_DATABASE_URL ?? '');
   url.username = lake.dbRole;
   url.password = lake.dbPassword;
-  const env = (k: string, d: string) => process.env[k] ?? d;
+  if (isS3(lake.dataPath) && !(lake.s3AccessKey && lake.s3SecretKey)) throw new Error('租户在对象存储上还没有账号，请先初始化数据湖');
   return {
     dataPath: lake.dataPath,
     catalogUrl: url.toString(),
     catalogSchema: lake.catalogSchema,
-    ...(isS3(lake.dataPath) && {
-      s3: {
-        endpoint: env('S3_ENDPOINT', 'localhost:8333'),
-        region: env('S3_REGION', 'us-east-1'),
-        key: env('S3_ACCESS_KEY', ''),
-        secret: env('S3_SECRET_KEY', ''),
-        urlStyle: env('S3_URL_STYLE', 'path'),
-        useSsl: env('S3_USE_SSL', 'false') === 'true',
-      },
-    }),
+    ...(isS3(lake.dataPath) && { s3: { ...platformS3(), key: lake.s3AccessKey!, secret: lake.s3SecretKey! } }),
   };
 }
 
@@ -78,21 +71,53 @@ export async function tenantLakeExists(tx: Tx, tenantId: string) {
 }
 
 /**
- * 建好存储前缀并初始化 DuckLake catalog（首次挂载时建元数据表）。可重复执行：开通时初始化失败，运营者可以重试。
- * 用本租户的数据库角色挂载，初始化出的元数据表归该角色所有
+ * 存储前缀在对象存储上、租户还没有账号时，在存储服务上建好账号与前缀策略，与审计记录一起保存密钥。
+ * 锁住数据湖行，同一租户的并发初始化不会各自签发密钥、互相作废
  */
-export async function initTenantCatalog(tenantId: string) {
-  const lake = await lakeRow(tenantId);
-  if (!lake) throw new Error(`租户 ${tenantId} 还没有数据湖`);
+async function ensureTenantS3Account(tenantId: string, operator: OperatorActor) {
+  return getDb().transaction(async tx => {
+    const [lake] = await tx.select().from(tenantLakes).where(eq(tenantLakes.tenantId, tenantId)).for('update');
+    if (!lake) throw new Error(`租户 ${tenantId} 还没有数据湖`);
+    if (!isS3(lake.dataPath) || lake.s3AccessKey) return;
+    const { accessKey, secretKey } = await issueTenantS3Account(tenantId, lake.dataPath);
+    await tx.update(tenantLakes).set({ s3AccessKey: accessKey, s3SecretKey: secretKey }).where(eq(tenantLakes.tenantId, tenantId));
+    await recordAudit(tx, {
+      tenantId,
+      operator,
+      action: 'tenant.s3_account_created',
+      targetType: 'tenant',
+      targetId: tenantId,
+      detail: { s3User: s3UserOf(tenantId), dataPath: lake.dataPath },
+    });
+  });
+}
+
+/**
+ * 建好存储前缀（对象存储上先建好本租户的账号）并初始化 DuckLake catalog（首次挂载时建元数据表）。
+ * 可重复执行：开通时初始化失败，或本功能上线前开通、还没有对象存储账号的租户，运营者可以重试补建。
+ * 用本租户的数据库角色挂载，初始化出的元数据表归该角色所有。新建对象存储账号时记入审计，操作者为 operator
+ */
+export async function initTenantCatalog(tenantId: string, operator: OperatorActor) {
+  await ensureTenantS3Account(tenantId, operator);
+  const lake = (await lakeRow(tenantId))!;
   if (!isS3(lake.dataPath)) await mkdir(lake.dataPath, { recursive: true });
   const session = await openTenantLake(lakeSpecOf(lake), { memoryLimitMb: 256, threads: 1 });
   session.close();
   await getDb().update(tenantLakes).set({ catalogInitializedAt: new Date() }).where(eq(tenantLakes.tenantId, tenantId));
 }
 
-/** 运营者可见的数据湖元数据（不含凭据）；还没有数据湖时返回 null */
+/** 数据湖可以运行任务：catalog 已初始化，存储前缀在对象存储上时租户已有账号 */
+const lakeReady = (lake: TenantLakeRow) => !!lake.catalogInitializedAt && (!isS3(lake.dataPath) || !!lake.s3AccessKey);
+
+/** 运营者可见的数据湖元数据（不含凭据）；还没有数据湖时返回 null。s3User 在本地目录模式下为 null */
 export async function getTenantLake(tenantId: string) {
   const lake = await lakeRow(tenantId);
   if (!lake) return null;
-  return { dataPath: lake.dataPath, catalogSchema: lake.catalogSchema, catalogInitialized: !!lake.catalogInitializedAt };
+  return {
+    dataPath: lake.dataPath,
+    catalogSchema: lake.catalogSchema,
+    catalogInitialized: !!lake.catalogInitializedAt,
+    s3User: isS3(lake.dataPath) ? { name: s3UserOf(tenantId), ready: !!lake.s3AccessKey } : null,
+    ready: lakeReady(lake),
+  };
 }
