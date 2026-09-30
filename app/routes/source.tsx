@@ -1,6 +1,7 @@
 // app/routes/source.tsx —— 单个数据源：连接参数（凭据不显示）、测试连接、修改与轮换凭据、重新采集；
 // 各表的行数、列统计、同步方式与水位线候选，成员从候选中确认水位线字段
-import { data, Form, Link, redirect, useNavigation } from 'react-router';
+import { useEffect } from 'react';
+import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
 import { CircleAlert, CircleCheck } from 'lucide-react';
 import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
@@ -51,6 +52,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         status: source.profile.status,
         statusLabel: source.profile.status === 'none' ? '未采集' : TASK_STATUS_LABELS[source.profile.status],
         error: source.profile.error,
+        attemptedAt: source.profile.attemptedAt?.toISOString() ?? null,
+        unreadable: source.profile.unreadable,
         profiledAt: source.profile.profiledAt?.toISOString() ?? null,
       },
       tables: source.tables,
@@ -68,8 +71,9 @@ export async function action({ request, params }: Route.ActionArgs) {
   try {
     switch (field('intent')) {
       case 'test': {
-        const { tables } = await testSource(member, params.sourceId);
-        return { ok: `连接正常：${tables.length} 张表，账号只读`, error: null, values: null };
+        const { tables, unreadable } = await testSource(member, params.sourceId);
+        const skipped = unreadable.length ? `；${unreadable.length} 张表没有读权限，采集时跳过：${unreadable.join('、')}` : '';
+        return { ok: `连接正常：${tables.length} 张表，账号只读${skipped}`, error: null, values: null };
       }
       case 'update':
         await updateSource(member, params.sourceId, Object.fromEntries([...form].map(([k, v]) => [k, String(v)])));
@@ -162,6 +166,14 @@ function Watermark({ table, canWrite, submitting }: { table: TableView; canWrite
 export default function Source({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, canWrite, source, profile, tables } = loaderData;
   const submitting = useNavigation().state === 'submitting';
+  const profiling = profile.status === 'queued' || profile.status === 'running';
+  // 采集在调度器里异步进行：进行中时定时刷新，结束后停下
+  const revalidator = useRevalidator();
+  useEffect(() => {
+    if (!profiling) return;
+    const timer = setInterval(() => { if (revalidator.state === 'idle') revalidator.revalidate(); }, 2000);
+    return () => clearInterval(timer);
+  }, [profiling, revalidator]);
   const values = actionData?.values ?? { name: source.name, ...source.config };
   return (
     <AppShell email={email} nav={nav}>
@@ -225,7 +237,14 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          {profile.error && <div className="text-sm text-destructive">{profile.error}</div>}
+          {profile.status === 'failed' && profile.error && (
+            <div className="text-sm text-destructive">{`${time(profile.attemptedAt)} 提交的采集失败：${profile.error}`}</div>
+          )}
+          {profile.unreadable.length > 0 && (
+            <div className="text-sm text-muted-foreground" data-unreadable>
+              {`账号没有读权限，已跳过 ${profile.unreadable.length} 张表：${profile.unreadable.join('、')}。需要时在源库授予 SELECT 后重新采集`}
+            </div>
+          )}
           <Table>
             <TableHeader>
               <TableRow>
@@ -252,7 +271,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
               {!tables.length && (
                 <TableRow>
                   <TableCell colSpan={3} className="text-center text-muted-foreground">
-                    {profile.status === 'queued' || profile.status === 'running' ? '正在采集表清单与列统计…' : '暂无表'}
+                    {profiling ? '正在采集表清单与列统计…' : '暂无表'}
                   </TableCell>
                 </TableRow>
               )}

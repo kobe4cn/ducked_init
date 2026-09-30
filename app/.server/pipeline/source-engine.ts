@@ -78,8 +78,8 @@ const FILE_EXTENSIONS: Record<FileFormat, RegExp> = {
 };
 const READERS: Record<FileFormat, string> = { parquet: 'read_parquet', csv: 'read_csv', json: 'read_json_auto' };
 
-/** 源表：名称，以及在会话里读取它的 FROM 子句 */
-interface SourceTable { name: string; from: string }
+/** 源表：名称、所在 schema、在会话里读取它的 FROM 子句，以及账号能否读取（PostgreSQL 目录里看得到没有读权限的表） */
+interface SourceTable { name: string; schema: string; from: string; readable: boolean }
 
 export interface SourceSession {
   /** 源端已只读挂载为 src，配置已锁定 */
@@ -154,17 +154,27 @@ async function listTables(con: DuckDBConnection, spec: SourceSpec): Promise<Sour
       const name = rel.includes('/') ? rel.slice(0, rel.indexOf('/')) : rel.replace(FILE_EXTENSIONS[spec.format], '');
       byTable.set(name, [...(byTable.get(name) ?? []), file]);
     }
-    return [...byTable].map(([name, list]) => ({ name, from: `${READERS[spec.format]}([${list.map(lit).join(', ')}])` }));
+    return [...byTable].map(([name, list]) => ({ name, schema: '', from: `${READERS[spec.format]}([${list.map(lit).join(', ')}])`, readable: true }));
   }
   const schema = spec.kind === 'postgres' ? spec.schema : spec.kind === 'mysql' ? spec.database : null;
   const found = await rows<{ schema: string; name: string }>(con, `
     SELECT table_schema AS schema, table_name AS name FROM information_schema.tables
     WHERE table_catalog = 'src' ${schema ? `AND table_schema = ${lit(schema)}` : ''} ORDER BY ALL`);
+  const readable = spec.kind === 'postgres'
+    ? new Set((await rows<{ schema: string; name: string }>(con, `SELECT * FROM postgres_query('src', ${lit(PG_READABLE_TABLES)})`)).map(t => `${t.schema}.${t.name}`))
+    : null;
   return found.map(t => ({
     name: schema || t.schema === 'main' ? t.name : `${t.schema}.${t.name}`,
+    schema: t.schema,
     from: `src.${ident(t.schema)}.${ident(t.name)}`,
+    readable: !readable || readable.has(`${t.schema}.${t.name}`),
   }));
 }
+
+/** 账号能读取的表：schema 有 USAGE 且表有 SELECT */
+const PG_READABLE_TABLES = `
+  SELECT n.nspname AS schema, c.relname AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND has_schema_privilege(n.oid, 'USAGE') AND has_table_privilege(c.oid, 'SELECT')`;
 
 /** 按对象归并 (权限, 对象) 行 */
 function groupGrants(list: { privilege: string; object: string }[]): WriteGrant[] {
@@ -240,12 +250,18 @@ export async function writeGrants(session: SourceSession, spec: SourceSpec): Pro
   }
 }
 
-/** 测试连接：能否挂载、有哪些表、账号是否可写 */
+/** 测试连接：能否挂载、哪些表可读、哪些表没有读权限（及其 schema）、账号是否可写 */
 export async function inspectSource(spec: SourceSpec, limits: EngineLimits) {
   const session = await openSource(spec, limits);
   try {
-    const tables = (await session.tables()).map(t => t.name);
-    return { tables, writable: await writeGrants(session, spec) };
+    const all = await session.tables();
+    const unreadable = all.filter(t => !t.readable);
+    return {
+      tables: all.filter(t => t.readable).map(t => t.name),
+      unreadable: unreadable.map(t => t.name),
+      unreadableSchemas: [...new Set(unreadable.map(t => t.schema))],
+      writable: await writeGrants(session, spec),
+    };
   } catch (e) {
     throw new Error(redactSourceSecrets((e as Error).message, spec));
   } finally {
@@ -335,16 +351,17 @@ async function profileTable(con: DuckDBConnection, table: SourceTable, increment
   }
 }
 
-/** 采集全部源表的列统计与水位线候选。账号可写时拒绝采集（登记之后才被授予写权限的账号） */
+/** 采集可读源表的列统计与水位线候选，并列出跳过的无读权限的表。账号可写时拒绝采集（登记之后才被授予写权限的账号） */
 export async function profileSource(spec: SourceSpec, limits: EngineLimits, { sampleRows = 100_000 } = {}) {
   const session = await openSource(spec, limits);
   try {
     const writable = await writeGrants(session, spec);
     if (writable.length) throw new Error(`账号可以写入数据源（${writable.map(g => g.object).join('、')}），平台只使用只读账号，请更换账号`);
     const increments = await incrementKeys(session.con, spec);
+    const all = await session.tables();
     const tables: TableProfile[] = [];
-    for (const t of await session.tables()) tables.push(await profileTable(session.con, t, increments.get(t.name), sampleRows));
-    return tables;
+    for (const t of all.filter(t => t.readable)) tables.push(await profileTable(session.con, t, increments.get(t.name), sampleRows));
+    return { tables, unreadable: all.filter(t => !t.readable).map(t => t.name) };
   } catch (e) {
     throw new Error(redactSourceSecrets((e as Error).message, spec));
   } finally {

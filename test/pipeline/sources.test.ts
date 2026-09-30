@@ -27,6 +27,36 @@ describe('登记时校验账号只读', () => {
     expect(err.message).toMatch(/INSERT/);
   });
 
+  it('账号读不了任何源表（缺 schema USAGE）时拒绝登记，并说明缺哪些权限', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const input = await pgSourceInput(READER);
+    await grantOnSource(`REVOKE USAGE ON SCHEMA shop FROM ${READER.user}`);
+
+    const err = await registerSource(engineer, input).catch(e => e);
+    expect(err).toBeInstanceOf(SourceError);
+    expect(err.message).toContain('没有读权限');
+    expect(err.message).toContain('GRANT USAGE ON SCHEMA shop');
+  });
+
+  it('部分源表不可读时照常登记，列出不可读的表；采集跳过这些表', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const input = await pgSourceInput(READER);
+    await grantOnSource(`REVOKE SELECT ON shop.events FROM ${READER.user}`);
+
+    const { id, tables, unreadable } = await registerSource(engineer, input);
+    expect(tables).not.toContain('events');
+    expect(unreadable).toEqual(['events']);
+    expect(await testSource(engineer, id)).toMatchObject({ unreadable: ['events'] });
+
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const source = await getSource(engineer, id);
+    expect(source.profile.status).toBe('succeeded');
+    expect(source.profile.unreadable).toEqual(['events']);
+    expect(source.tables.map(t => t.name).sort()).toEqual(['customers', 'orders', 'regions']);
+  });
+
   it('只读账号可以登记', async () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');

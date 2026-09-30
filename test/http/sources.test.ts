@@ -151,4 +151,24 @@ describe('列统计与水位线', () => {
     expect(after).toMatch(/data-table="customers"[^>]*data-sync-mode="watermark"/);
     expect(after).toContain('按 updated_at 增量同步');
   });
+
+  it('账号读不了某些表时：测试连接与数据源页都列出这些表，采集跳过它们；一张都读不了时拒绝登记并给出授权语句', async () => {
+    const { browser } = await engineerOf('acme');
+    const input = await pgSourceInput(READER);
+    await grantOnSource(`REVOKE SELECT ON shop.events FROM ${READER.user}`);
+    const id = sourceIdOf(await register(browser, input));
+
+    const tested = await (await browser.post(`/sources/${id}`, { intent: 'test' })).text();
+    expect(tested).toContain('连接正常：3 张表，账号只读；1 张表没有读权限，采集时跳过：events');
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const html = await (await browser.get(`/sources/${id}`)).text();
+    expect(html).toContain('data-profile-status="succeeded"');
+    expect(html).toContain('已跳过 1 张表：events');
+    expect(html).not.toContain('data-table="events"');
+
+    await grantOnSource(`REVOKE USAGE ON SCHEMA shop FROM ${READER.user}`);
+    const rejected = await register(browser, { ...input, name: '电商库 2' });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toContain(`GRANT USAGE ON SCHEMA shop TO ${READER.user}`);
+  });
 });

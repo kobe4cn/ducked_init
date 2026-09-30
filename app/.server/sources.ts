@@ -33,13 +33,24 @@ function describeWriteGrants(user: string | undefined, grants: WriteGrant[]) {
   return `账号${user ? ` ${user} ` : ''}对数据源可写，平台只接受只读账号：${shown}${more}。请换用只读账号，或收回这些权限后重试`;
 }
 
-/** 连接数据源、列出表并探测写权限：连不上或账号可写时抛出 SourceError */
+/** 一张源表都读不了时的说明，附上需要授予的权限 */
+function describeNoReadGrants(user: string, unreadable: string[], schemas: string[]) {
+  const grants = schemas.map(s => `GRANT USAGE ON SCHEMA ${s} TO ${user}; GRANT SELECT ON ALL TABLES IN SCHEMA ${s} TO ${user};`).join(' ');
+  return `账号 ${user} 没有读权限，${unreadable.length} 张源表都读不了。请在源库授予：${grants}`;
+}
+
+/**
+ * 连接数据源、列出表并探测读写权限：连不上、账号可写或一张表都读不了时抛出 SourceError。
+ * 部分表没有读权限时照常通过，返回这些表（采集时跳过）
+ */
 async function probe(spec: SourceSpec) {
-  const { tables, writable } = await inspectSource(spec, PROBE_LIMITS).catch(e => {
+  const { tables, unreadable, unreadableSchemas, writable } = await inspectSource(spec, PROBE_LIMITS).catch(e => {
     throw new SourceError(`无法连接数据源：${(e as Error).message}`);
   });
-  if (writable.length) throw new SourceError(describeWriteGrants('user' in spec ? spec.user : undefined, writable));
-  return { tables };
+  const user = 'user' in spec ? spec.user : undefined;
+  if (writable.length) throw new SourceError(describeWriteGrants(user, writable));
+  if (!tables.length && unreadable.length) throw new SourceError(describeNoReadGrants(user ?? '', unreadable, unreadableSchemas));
+  return { tables, unreadable };
 }
 
 /** 提交一次采集任务（登记、修改后与成员手动重新采集） */
@@ -68,7 +79,7 @@ export async function registerSource(actor: CurrentMember, input: SourceInput) {
   if (!isSourceKind(kind)) throw new SourceError('请选择数据源类型');
   const name = parseName(input.name);
   const { config, credentials } = await parseSourceInput(actor.tenant.id, kind, input);
-  const { tables } = await probe(await resolveSourceSpec(actor.tenant.id, kind, config, credentials));
+  const { tables, unreadable } = await probe(await resolveSourceSpec(actor.tenant.id, kind, config, credentials));
 
   const id = randomUUID();
   const sealed = await encryptForTenant(actor.tenant.id, credentialsContext(id), credentials);
@@ -84,7 +95,7 @@ export async function registerSource(actor: CurrentMember, input: SourceInput) {
     });
   }));
   await enqueueProfile(actor.tenant.id, id);
-  return { id, tables };
+  return { id, tables, unreadable };
 }
 
 /**
@@ -109,7 +120,12 @@ async function latestProfiles(tenantId: string, sourceId: string) {
   const [succeeded]: (typeof tasks.$inferSelect | undefined)[] = latest?.status === 'succeeded'
     ? [latest]
     : await getDb().select().from(tasks).where(and(ofSource, eq(tasks.status, 'succeeded'))).orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
-  return { latest, tables: ((succeeded?.result?.tables ?? []) as TableProfile[]), profiledAt: succeeded?.finishedAt ?? null };
+  return {
+    latest,
+    tables: (succeeded?.result?.tables ?? []) as TableProfile[],
+    unreadable: (succeeded?.result?.unreadable ?? []) as string[],
+    profiledAt: succeeded?.finishedAt ?? null,
+  };
 }
 
 export async function listSources(actor: CurrentMember) {
@@ -122,17 +138,24 @@ export async function listSources(actor: CurrentMember) {
   return rows;
 }
 
-/** 数据源详情：连接参数（不含凭据）、最近一次采集的状态、各表的列统计、水位线候选与同步方式 */
+/** 数据源详情：连接参数（不含凭据）、最近一次采集的状态（及跳过的无读权限的表）、各表的列统计、水位线候选与同步方式 */
 export async function getSource(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'sources:read');
   const { credentials: _sealed, ...row } = await requireSource(actor.tenant.id, sourceId);
-  const { latest, tables, profiledAt } = await latestProfiles(actor.tenant.id, sourceId);
+  const { latest, tables, unreadable, profiledAt } = await latestProfiles(actor.tenant.id, sourceId);
   const confirmed = new Map(
     (await getDb().select().from(sourceTables).where(eq(sourceTables.sourceId, sourceId))).map(t => [t.tableName, t]),
   );
   return {
     ...row,
-    profile: { status: (latest?.status ?? 'none') as TaskStatus | 'none', error: latest?.error ?? null, profiledAt },
+    profile: {
+      status: (latest?.status ?? 'none') as TaskStatus | 'none',
+      error: latest?.error ?? null,
+      /** 最近一次采集（任何状态）提交的时间：重新采集后即便结果相同，成员也能看出是新的一次 */
+      attemptedAt: latest?.createdAt ?? null,
+      unreadable,
+      profiledAt,
+    },
     tables: tables.map(t => {
       const c = confirmed.get(t.name);
       // 采集后字段不再是候选（被删除、改名或出现空值）时，之前的确认不再生效
@@ -172,7 +195,7 @@ export async function refreshSourceProfile(actor: CurrentMember, sourceId: strin
   return enqueueProfile(actor.tenant.id, sourceId);
 }
 
-/** 测试连接：用保存的凭据连接数据源，列出表并再次探测写权限 */
+/** 测试连接：用保存的凭据连接数据源，列出表并再次探测读写权限 */
 export async function testSource(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'sources:write');
   return probe(await loadSourceSpec(actor.tenant.id, sourceId));

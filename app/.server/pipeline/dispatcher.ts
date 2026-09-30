@@ -55,7 +55,11 @@ export function createDispatcher({ maxWorkers, pollMs = 1000, staleAfterMs = 60_
     const input: WorkerInput = { kind: task.kind, params: task.params, lake: task.lake, limits: task.limits, source: task.source };
     child.send(input);
     const done = exited
-      .then(() => finishTask(task.id, outcome!))
+      .then(() => {
+        // 错误已由工作进程抹掉凭据；记进调度器日志，便于在后台排查
+        if ('error' in outcome!) console.warn(`[调度器] 任务 ${task.id}（${task.kind}）失败：${outcome.error}`);
+        return finishTask(task.id, outcome!);
+      })
       .catch(e => console.error(`[调度器] 任务 ${task.id} 结束时出错`, e))
       .finally(() => { running.delete(task.id); wake?.(); });
     running.set(task.id, { child, done, abort });

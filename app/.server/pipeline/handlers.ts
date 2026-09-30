@@ -65,7 +65,7 @@ export const HANDLERS = {
     label: '采集数据源',
     async run(_con, _params, { source, limits }) {
       if (!source) throw new Error('缺少数据源');
-      return { tables: await profileSource(source, limits) };
+      return profileSource(source, limits);
     },
   },
 } satisfies Record<string, Handler>;

@@ -68,7 +68,9 @@ export async function claimNextTask(): Promise<ClaimedTask | null> {
     try {
       return { ...task, source: await loadSourceSpec(task.tenantId, task.params.sourceId) };
     } catch (e) {
-      await finishTask(task.id, { error: e instanceof SourceError ? e.message : `无法读取数据源的凭据：${(e as Error).message}` });
+      const error = e instanceof SourceError ? e.message : `无法读取数据源的凭据：${(e as Error).message}`;
+      console.warn(`[调度器] 任务 ${task.id}（${task.kind}）失败：${error}`);
+      await finishTask(task.id, { error });
     }
   }
 }
