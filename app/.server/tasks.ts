@@ -1,6 +1,7 @@
 // app/.server/tasks.ts —— 平台 PG 上的任务队列：入队、按租户公平地领取、结束，以及成员查看本租户的任务。
 // 执行由调度器（pipeline/dispatcher.ts）派发给独立的工作进程
 import { and, desc, eq, inArray, isNotNull, ne, sql } from 'drizzle-orm';
+import type { Tx } from './audit';
 import { getDb } from './db/client';
 import { tasks, tenantLakes, tenants } from './db/schema';
 import { lakeSpecOf } from './lake';
@@ -50,15 +51,20 @@ export interface ClaimedTask extends WorkerInput { id: string; tenantId: string 
 // 领取任务时持有的事务级咨询锁：多个调度器串行领取，按租户的并发上限不会被同时突破
 const CLAIM_LOCK = 0x7461736b;
 
+/** 在事务内取得领取锁。领取数据湖迁移也持有它：迁移开始时该租户没有运行中的任务，此后也不会再派发 */
+export async function lockClaims(tx: Tx) {
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(${CLAIM_LOCK})`);
+}
+
 /**
  * 领取下一个任务并标为运行中；没有可派发的任务时返回 null。
- * 跳过已停用、数据湖未初始化（含对象存储上还没有本租户账号）、以及运行中任务已达并发上限的租户。
+ * 跳过已停用、数据湖未初始化（含对象存储上还没有本租户账号）、数据湖迁移中、以及运行中任务已达并发上限的租户。
  * 公平调度：先挑运行中任务最少的租户，再挑最久没被派发过的租户，同一租户内先进先出——
  * 排队再多的大租户每次也只占一个名额，小租户不会被饿死
  */
 export async function claimNextTask(): Promise<ClaimedTask | null> {
   return getDb().transaction(async tx => {
-    await tx.execute(sql`SELECT pg_advisory_xact_lock(${CLAIM_LOCK})`);
+    await lockClaims(tx);
     // 只看有排队任务的租户；各项统计都走按租户的索引，不随历史任务增多而变慢
     const { rows } = await tx.execute<{ id: string }>(sql`
       SELECT q.id
@@ -77,6 +83,9 @@ export async function claimNextTask(): Promise<ClaimedTask | null> {
         WHERE tenant_id = c.tenant_id AND status = 'queued' ORDER BY created_at, id LIMIT 1
       ) q
       WHERE r.n < tn.max_concurrent_tasks
+        AND NOT EXISTS (
+          SELECT 1 FROM platform.lake_migrations m WHERE m.tenant_id = c.tenant_id AND m.status IN ('pending', 'running')
+        )
       ORDER BY r.n, s.last_started NULLS FIRST, q.created_at, q.id
       LIMIT 1`);
     if (!rows.length) return null;

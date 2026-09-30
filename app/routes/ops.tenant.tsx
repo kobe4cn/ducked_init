@@ -24,9 +24,17 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   const operator = await requireOperator(request);
   try {
     const tenant = await getTenant(params.tenantId);
+    const lake = await getTenantLake(tenant.id);
     return {
       email: operator.email,
-      lake: await getTenantLake(tenant.id),
+      lake: lake && {
+        ...lake,
+        migration: lake.migration && {
+          ...lake.migration,
+          createdAt: lake.migration.createdAt.toISOString(),
+          finishedAt: lake.migration.finishedAt?.toISOString() ?? null,
+        },
+      },
       quotaFields: QUOTA_KEYS.map(key => ({ key, ...QUOTA_FIELDS[key] })),
       tenant: { ...tenant, createdAt: tenant.createdAt.toISOString(), suspendedAt: tenant.suspendedAt?.toISOString() ?? null },
     };
@@ -68,6 +76,36 @@ export async function action({ request, params }: Route.ActionArgs) {
     throw e;
   }
   throw redirect(`/ops/tenants/${params.tenantId}`);
+}
+
+type Migration = NonNullable<NonNullable<Route.ComponentProps['loaderData']['lake']>['migration']>;
+
+const at = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '');
+
+/** 最近一次迁移存储：进行中时给出目标，结束后给出旧位置（不自动删除）或失败原因 */
+function LakeMigration({ migration: m }: { migration: Migration }) {
+  switch (m.status) {
+    case 'pending':
+    case 'running':
+      return (
+        <span>
+          <strong>迁移中</strong>（{m.status === 'pending' ? '等待运行中的任务结束' : '复制中'}，申请于 {at(m.createdAt)}）→{' '}
+          <span className="font-mono break-all">{m.toPath}</span>
+        </span>
+      );
+    case 'succeeded':
+      return (
+        <span>
+          {at(m.finishedAt)} 迁移完成。旧位置 <span className="font-mono">{m.fromPath}</span> 的文件未删除，确认无误后另行清理
+        </span>
+      );
+    case 'failed':
+      return (
+        <span className="text-destructive">
+          {at(m.finishedAt)} 迁移到 <span className="font-mono break-all">{m.toPath}</span> 失败：{m.error}。仍使用原位置，可重新执行命令重试
+        </span>
+      );
+  }
 }
 
 export default function OpsTenant({ loaderData, actionData }: Route.ComponentProps) {
@@ -115,7 +153,7 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
       <Card>
         <CardHeader>
           <CardTitle>数据湖</CardTitle>
-          <CardDescription>租户独立的存储前缀（在对象存储上时另有只能访问该前缀的账号）与 DuckLake catalog schema，开通时自动初始化。初始化完成前不派发该租户的任务。</CardDescription>
+          <CardDescription>租户独立的存储前缀（在对象存储上时另有只能访问该前缀的账号）与 DuckLake catalog schema，开通时自动初始化。初始化完成前、迁移存储期间不派发该租户的任务。迁移存储用命令 <code>pnpm lake:migrate</code>。</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
           {lake ? (
@@ -134,6 +172,12 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
               )}
               <dt className="text-muted-foreground">状态</dt>
               <dd data-lake-status={lake.ready ? 'ready' : 'pending'}>{lake.ready ? '已初始化' : '未初始化'}</dd>
+              {lake.migration && (
+                <>
+                  <dt className="text-muted-foreground">迁移存储</dt>
+                  <dd data-lake-migration={lake.migration.status}><LakeMigration migration={lake.migration} /></dd>
+                </>
+              )}
             </dl>
           ) : (
             <p className="text-sm text-muted-foreground" data-lake-status="missing">该租户开通时平台还没有数据湖，初始化后才能运行任务。</p>

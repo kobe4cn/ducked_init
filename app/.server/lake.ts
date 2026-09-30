@@ -4,32 +4,33 @@
 import { randomBytes } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { eq, sql } from 'drizzle-orm';
+import { desc, eq, sql } from 'drizzle-orm';
 import { recordAudit, type OperatorActor, type Tx } from './audit';
 import { getDb, type Db } from './db/client';
-import { tenantLakes } from './db/schema';
+import { lakeMigrations, tenantLakes } from './db/schema';
+import { isS3 } from './lake-storage';
 import { openTenantLake, type LakeSpec } from './pipeline/lake-engine';
-import { issueTenantS3Account, platformS3, putPrefixPlaceholder, s3UserOf } from './s3-accounts';
+import { deleteTenantS3Account, issueTenantS3Account, platformS3, putPrefixPlaceholder, s3UserOf } from './s3-accounts';
 
 type TenantLakeRow = typeof tenantLakes.$inferSelect;
 
-/** 租户数据湖的根：对象存储（s3://bucket/prefix）或本地目录，默认 ./data/platform-lake */
-function lakeRoot() {
-  const root = (process.env.PLATFORM_LAKE_URI ?? './data/platform-lake').replace(/\/+$/, '');
-  return root.startsWith('s3://') ? root : resolve(root);
+/** 数据湖根的规范写法：对象存储（s3://bucket/prefix）原样去掉结尾的 /，本地目录转为绝对路径 */
+export function normalizeLakeRoot(uri: string) {
+  const root = uri.trim().replace(/\/+$/, '');
+  return isS3(root) ? root : resolve(root);
 }
 
-const isS3 = (path: string) => path.startsWith('s3://');
+/** 租户数据湖的根：PLATFORM_LAKE_URI，默认 ./data/platform-lake。只决定之后开通的租户放在哪里 */
+const lakeRoot = () => normalizeLakeRoot(process.env.PLATFORM_LAKE_URI ?? './data/platform-lake');
+
+/** 租户在某个数据湖根下的存储前缀：<根>/tenants/<租户 ID>/ */
+export const tenantDataPath = (root: string, tenantId: string) =>
+  isS3(root) ? `${root}/tenants/${tenantId}/` : `${join(root, 'tenants', tenantId)}/`;
 
 /** 每个租户的存储前缀与 catalog schema、数据库角色都由租户 ID 决定 */
 function layout(tenantId: string) {
-  const root = lakeRoot();
   const name = `lake_${tenantId.replace(/-/g, '')}`;
-  return {
-    dataPath: isS3(root) ? `${root}/tenants/${tenantId}/` : `${join(root, 'tenants', tenantId)}/`,
-    catalogSchema: name,
-    dbRole: name,
-  };
+  return { dataPath: tenantDataPath(lakeRoot(), tenantId), catalogSchema: name, dbRole: name };
 }
 
 /**
@@ -60,7 +61,7 @@ export function lakeSpecOf(lake: Pick<TenantLakeRow, 'dataPath' | 'catalogSchema
   };
 }
 
-async function lakeRow(tenantId: string, db: Tx | Db = getDb()) {
+export async function lakeRow(tenantId: string, db: Tx | Db = getDb()) {
   const [lake] = await db.select().from(tenantLakes).where(eq(tenantLakes.tenantId, tenantId));
   return lake;
 }
@@ -71,15 +72,16 @@ export async function tenantLakeExists(tx: Tx, tenantId: string) {
 }
 
 /**
- * 存储前缀在对象存储上、租户还没有账号时，在存储服务上建好账号与前缀策略，与审计记录一起保存密钥。
- * 锁住数据湖行，同一租户的并发初始化不会各自签发密钥、互相作废
+ * 存储前缀（默认为数据湖当前的前缀，迁移存储时为新前缀）在对象存储上、租户还没有账号时，在存储服务上建好账号与
+ * 只能访问该前缀的策略，与审计记录一起保存密钥。锁住数据湖行，同一租户的并发初始化不会各自签发密钥、互相作废
  */
-async function ensureTenantS3Account(tenantId: string, operator: OperatorActor) {
+export async function ensureTenantS3Account(tenantId: string, operator: OperatorActor, prefix?: string) {
   return getDb().transaction(async tx => {
     const [lake] = await tx.select().from(tenantLakes).where(eq(tenantLakes.tenantId, tenantId)).for('update');
     if (!lake) throw new Error(`租户 ${tenantId} 还没有数据湖`);
-    if (!isS3(lake.dataPath) || lake.s3AccessKey) return;
-    const { accessKey, secretKey } = await issueTenantS3Account(tenantId, lake.dataPath);
+    const dataPath = prefix ?? lake.dataPath;
+    if (!isS3(dataPath) || lake.s3AccessKey) return;
+    const { accessKey, secretKey } = await issueTenantS3Account(tenantId, dataPath);
     await tx.update(tenantLakes).set({ s3AccessKey: accessKey, s3SecretKey: secretKey }).where(eq(tenantLakes.tenantId, tenantId));
     await recordAudit(tx, {
       tenantId,
@@ -87,9 +89,15 @@ async function ensureTenantS3Account(tenantId: string, operator: OperatorActor) 
       action: 'tenant.s3_account_created',
       targetType: 'tenant',
       targetId: tenantId,
-      detail: { s3User: s3UserOf(tenantId), dataPath: lake.dataPath },
+      detail: { s3User: s3UserOf(tenantId), dataPath },
     });
   });
+}
+
+/** 删除租户在对象存储上的账号并清掉保存的密钥：数据湖迁离对象存储后，或迁往对象存储失败时收回为它新建的账号 */
+export async function dropTenantS3Account(tenantId: string) {
+  await deleteTenantS3Account(tenantId);
+  await getDb().update(tenantLakes).set({ s3AccessKey: null, s3SecretKey: null }).where(eq(tenantLakes.tenantId, tenantId));
 }
 
 /**
@@ -108,13 +116,30 @@ export async function initTenantCatalog(tenantId: string, operator: OperatorActo
 }
 
 /** 数据湖可以运行任务：catalog 已初始化，存储前缀在对象存储上时租户已有账号 */
-const lakeReady = (lake: TenantLakeRow) => !!lake.catalogInitializedAt && (!isS3(lake.dataPath) || !!lake.s3AccessKey);
+export const lakeReady = (lake: TenantLakeRow) => !!lake.catalogInitializedAt && (!isS3(lake.dataPath) || !!lake.s3AccessKey);
 
-/** 运营者可见的数据湖元数据（不含凭据）；还没有数据湖时返回 null。s3User 在本地目录模式下为 null */
+/**
+ * 运营者可见的数据湖元数据（不含凭据）；还没有数据湖时返回 null。s3User 在本地目录模式下为 null。
+ * migration 是最近一次迁移存储（没有迁移过时为 null），状态为 pending / running 即「迁移中」
+ */
 export async function getTenantLake(tenantId: string) {
   const lake = await lakeRow(tenantId);
   if (!lake) return null;
+  const [migration] = await getDb()
+    .select({
+      status: lakeMigrations.status,
+      fromPath: lakeMigrations.fromPath,
+      toPath: lakeMigrations.toPath,
+      error: lakeMigrations.error,
+      createdAt: lakeMigrations.createdAt,
+      finishedAt: lakeMigrations.finishedAt,
+    })
+    .from(lakeMigrations)
+    .where(eq(lakeMigrations.tenantId, tenantId))
+    .orderBy(desc(lakeMigrations.createdAt))
+    .limit(1);
   return {
+    migration: migration ?? null,
     dataPath: lake.dataPath,
     catalogSchema: lake.catalogSchema,
     catalogInitialized: !!lake.catalogInitializedAt,

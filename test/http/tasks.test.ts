@@ -1,6 +1,12 @@
+import { rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
+import { getTenantLake, tenantDataPath } from '../../app/.server/lake';
+import { requestLakeMigration } from '../../app/.server/lake-migration';
+import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { enqueueTask } from '../../app/.server/tasks';
 import { newTenant, runTask } from '../pipeline/fixtures';
 import { createOperator, loginAs, loginAsOperator, resetDb, startApp, type TestApp } from './harness';
@@ -113,5 +119,27 @@ describe('本功能上线前开通的租户', () => {
 
     const admin = await loginAs(app, 'admin@acme.com');
     expect(await (await admin.get('/audit')).text()).toContain('初始化数据湖');
+  });
+});
+
+describe('运营后台查看数据湖迁移', () => {
+  it('租户页展示当前存储位置与「迁移中」，完成后给出旧位置', async () => {
+    const acme = await newTenant('acme');
+    const oldPath = (await getTenantLake(acme))!.dataPath;
+    const target = join(tmpdir(), 'crm_platform_test_lake_moved');
+    await rm(target, { recursive: true, force: true });
+    expect((await createOperator('ops@platform.com')).code).toBe(0);
+    const { browser: ops } = await loginAsOperator(app, 'ops@platform.com');
+
+    await requestLakeMigration(null, acme, target);
+    const migrating = await (await ops.get(`/ops/tenants/${acme}`)).text();
+    expect(migrating).toContain('data-lake-migration="pending"');
+    expect(migrating).toContain(oldPath);
+    expect(migrating).toContain(tenantDataPath(target, acme));
+
+    await createDispatcher({ maxWorkers: 1 }).runUntilIdle();
+    const done = await (await ops.get(`/ops/tenants/${acme}`)).text();
+    expect(done).toContain('data-lake-migration="succeeded"');
+    expect(done).toContain(`旧位置 <span class="font-mono">${oldPath}</span>`);
   });
 });

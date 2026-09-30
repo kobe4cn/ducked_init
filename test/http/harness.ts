@@ -120,7 +120,7 @@ export async function resetDb() {
     // 上一轮在对象存储上跑、这一轮没有配置对象存储时，留下的账号不清（租户 ID 每次不同，不会冲突）
     if (r.data_path.startsWith('s3://') && process.env.TEST_S3_LAKE_URI) await deleteTenantS3Account(r.tenant_id);
   }
-  await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions, platform.tenant_lakes, platform.tasks CASCADE');
+  await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions, platform.tenant_lakes, platform.tasks, platform.lake_migrations CASCADE');
   await client.end();
   // 对象存储上的数据不清：租户 ID 每次不同，前缀不会重叠
   if (!process.env.PLATFORM_LAKE_URI!.startsWith('s3://')) await rm(process.env.PLATFORM_LAKE_URI!, { recursive: true, force: true });

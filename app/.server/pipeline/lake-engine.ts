@@ -20,6 +20,12 @@ export interface TenantLakeSession {
   close(): void;
 }
 
+/** 错误信息会展示给租户成员或写入审计日志：DuckDB 的报错可能带出 catalog 连接串，抹掉其中本租户的凭据 */
+export function redactLakeSecrets(message: string, lake: LakeSpec) {
+  const secrets = [new URL(lake.catalogUrl).password, lake.s3?.secret, lake.s3?.key].filter((s): s is string => !!s);
+  return secrets.reduce((m, s) => m.replaceAll(s, '***').replaceAll(encodeURIComponent(s), '***'), message);
+}
+
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 
 /**

@@ -147,6 +147,36 @@ export const auditLogs = platform.table('audit_logs', {
   index('audit_logs_operator_created_idx').on(t.createdAt).where(sql`actor_type = 'operator'`),
 ]);
 
+/** 数据湖盘点：各表（非 main schema 的带 schema 前缀）与行数 */
+export type LakeInventory = { name: string; rows: number }[];
+
+export const LAKE_MIGRATION_STATUSES = ['pending', 'running', 'succeeded', 'failed'] as const;
+export type LakeMigrationStatus = (typeof LAKE_MIGRATION_STATUSES)[number];
+export const lakeMigrationStatusEnum = platform.enum('lake_migration_status', LAKE_MIGRATION_STATUSES);
+
+// 数据湖迁移存储：把租户存储前缀下的文件搬到新的数据湖根下（本地目录 ⇄ 对象存储），再把 catalog 与 tenant_lakes 的 data_path 一起切过去。
+// pending / running 即「迁移中」：不派发该租户的任务（排队的保留），每个租户同时只有一个。pending 等该租户运行中的任务结束后
+// 由调度器领取；claim 每次领取时重新生成，heartbeat_at 由执行它的调度器定期刷新，失联后其他调度器可以重新领取、从头再做。
+// inventory 是复制前的盘点（各表行数），切换后与新位置的盘点比对；result 为复制的文件数与字节数，以及需要运营者留意的提示
+export const lakeMigrations = platform.table('lake_migrations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  fromPath: text('from_path').notNull(),
+  toPath: text('to_path').notNull(),
+  status: lakeMigrationStatusEnum('status').notNull().default('pending'),
+  claim: uuid('claim'),
+  heartbeatAt: timestamp('heartbeat_at', { withTimezone: true }),
+  inventory: jsonb('inventory').$type<LakeInventory>(),
+  result: jsonb('result').$type<{ files: number; bytes: number; warning?: string }>(),
+  error: text('error'),
+  startedAt: timestamp('started_at', { withTimezone: true }),
+  finishedAt: timestamp('finished_at', { withTimezone: true }),
+  createdAt: createdAt(),
+}, t => [
+  index('lake_migrations_tenant_created_idx').on(t.tenantId, t.createdAt),
+  uniqueIndex('lake_migrations_one_active_uq').on(t.tenantId).where(sql`status IN ('pending', 'running')`),
+]);
+
 export const TASK_STATUSES = ['queued', 'running', 'succeeded', 'failed'] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 export const taskStatusEnum = platform.enum('task_status', TASK_STATUSES);

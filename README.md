@@ -26,6 +26,7 @@ pnpm operator:create --email ops@example.com      # 新增运营者（只能用�
 pnpm operator:reset-totp --email ops@example.com  # 运营者丢失认证器时重置 TOTP
 pnpm dispatcher                                   # 常驻调度器：派发任务队列（另开一个终端）
 pnpm task:enqueue --tenant acme --kind demo.seed --params '{"customers":1000}'  # 为租户生成演示数据
+pnpm lake:migrate --all --to s3://crm-lake/platform  # 平台切换存储后，把已开通租户的数据湖搬到新的根下（见下文）
 pnpm dev                                          # 打开 /login，用管理员邮箱申请 Magic Link
 ```
 
@@ -79,8 +80,26 @@ pnpm dev                                          # 打开 /login，用管理员
 - SeaweedFS 部署要求：账号由 SeaweedFS 自己保存在 filer 中（**不能**用静态 `-s3.config` 文件，否则 IAM API 无法写入），开启 `-s3.iam.readOnly=false`，平台账号经 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` 注入（见 `db_script/docker-compose.yml`，与 `.env` 里的 `S3_ACCESS_KEY` / `S3_SECRET_KEY` 一致）。原先用 `-s3.config` 启动的实例改为上述方式重启即可，存储桶与数据不受影响。
 - 任务队列在平台 PG（`platform.tasks`）。`pnpm dispatcher` 领取任务，每个任务启动一个独立的工作进程：只拿到本租户角色的凭据，挂载后锁定 DuckDB 配置（只能访问本租户前缀、不能再挂载其他库），内存与线程按租户配额限制。
 - 调度按租户公平：先派发运行中任务最少、再派发最久没被派发过的租户，同一租户内先进先出；租户运行中的任务达到并发上限时其余排队。停用租户时其运行中的任务被终止，排队的任务留在队列里、恢复后继续；停用期间不能提交任务。调度器失联超过 1 分钟的任务判为失败，调度器退出时它启动的工作进程随之退出。任务的错误信息对租户全体成员可见，其中的凭据会被抹掉。
+- 租户的存储前缀在开通时写入平台库，修改 `PLATFORM_LAKE_URI` 只影响之后开通的租户；已开通租户的数据用 `pnpm lake:migrate` 搬过去（见下节）。
 - 任务类型在 `app/.server/pipeline/handlers.ts`：`lake.inventory`（盘点本租户数据湖的表与行数）、`demo.seed`（造数夹具，确定性生成消费者与订单）。成员在 `/tasks` 查看本租户的任务与状态，成功的任务可展开查看结果（各表行数与运行时生效的内存、线程）。
 
+
+#### 平台切换存储（本地目录 ⇄ 对象存储、换桶）
+
+已开通租户的数据要**搬过去**，而不是清空重建。DuckLake catalog 里 schema、表与数据文件的路径都相对于 `data_path`，迁移时复制存储前缀下的全部文件，再在一个事务里把 catalog（`ducklake_metadata`）与 `tenant_lakes` 的 `data_path` 一起切到新位置。
+
+1. 修改 `.env` 的 `PLATFORM_LAKE_URI` 为新的数据湖根（对象存储时同时配好 `S3_*` 平台账号，SeaweedFS 按上文开启 IAM），重启平台与调度器：之后开通的租户直接落在新位置。
+2. 申请迁移已开通的租户（新位置为 `<新根>/tenants/<租户 ID>/`）：
+   ```bash
+   pnpm lake:migrate --tenant acme --to s3://crm-lake/platform   # 单个租户
+   pnpm lake:migrate --all --to s3://crm-lake/platform           # 所有不在新根下的租户；已在的跳过，可以重复执行
+   ```
+   命令只申请迁移并把数据湖标记为「迁移中」，由 `pnpm dispatcher` 执行（文件多时耗时长）。迁移中不派发该租户的任务，成员仍可提交、任务排队；调度器等该租户运行中的任务结束后才开始复制。其他租户不受影响。
+3. 调度器依次：复制文件（用平台账号；迁往对象存储时先确保租户有 S3 账号，前缀策略在迁移期间同时覆盖新旧前缀）→ 核对新位置的文件清单与大小 → 一个事务里切换两处 `data_path` → 用新位置盘点各表行数，与迁移前比对（不一致时切回旧位置并记为失败）→ 收回租户 S3 账号对旧前缀的访问、取消「迁移中」。之后工作进程的 `allowed_directories` 与 S3 账号都只能访问新前缀。
+4. 在运营后台的租户页查看「迁移存储」状态；开始、完成、失败都记入该租户的审计日志。
+   - **完成**：结果里给出旧位置。旧位置的文件**不会自动删除**，确认租户数据正常后手动清理（如 `rm -rf <旧前缀>`，或在对象存储上删除该前缀）。
+   - **失败**：数据湖仍指向旧位置、数据完整，排队的任务照常执行。排除原因后重新执行同一条命令即可重试，新位置上残留的文件会被覆盖。调度器在迁移途中退出时，其他调度器会在 1 分钟后接手、从头再做。
+5. 迁移只在当前配置的一个对象存储服务内进行（换桶、换前缀）。要换对象存储服务，先迁到本地目录，改好 `S3_*` 后再迁到新服务上。
 
 `pnpm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。设置 `TEST_S3_LAKE_URI=s3://crm-lake/platform-test` 后，租户隔离测试会在对象存储上再跑一遍，平台账号取 `S3_*`，默认用本地 SeaweedFS 的开发账号 `crm` / `crm-secret`（SeaweedFS 须按上面的要求开启 IAM）；租户账号由测试开通租户时创建，每个用例前删除。CI 会起 SeaweedFS 跑这组测试。对象存储上的测试数据不会自动清理。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
 

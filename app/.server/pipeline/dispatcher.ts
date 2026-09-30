@@ -1,7 +1,9 @@
 // app/.server/pipeline/dispatcher.ts —— 调度器：从平台 PG 的队列领取任务，每个任务启动一个独立的工作进程（ADR-0001）。
-// 本机同时运行的工作进程不超过 maxWorkers；各租户的并发上限与公平调度由 claimNextTask 保证，可以部署多个调度器
+// 本机同时运行的工作进程不超过 maxWorkers；各租户的并发上限与公平调度由 claimNextTask 保证，可以部署多个调度器。
+// 数据湖迁移存储也由调度器执行（在本进程内，要用平台账号读旧前缀、写新前缀），同样占一个名额，先于任务领取
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '../lake-migration';
 import { claimNextTask, failStaleTasks, finishTask, heartbeatTasks, setWorkerPid, type ClaimedTask } from '../tasks';
 import type { WorkerInput, WorkerOutcome } from './worker';
 
@@ -26,6 +28,9 @@ interface RunningTask { child: ChildProcess; done: Promise<void>; abort(reason: 
 
 export function createDispatcher({ maxWorkers, pollMs = 1000, staleAfterMs = 60_000, timeoutMs = 2 * 60 * 60_000 }: DispatcherOptions) {
   const running = new Map<string, RunningTask>();
+  /** 本调度器执行中的数据湖迁移，按领取凭据（claim）索引；abort 让它就此放弃（已被其他调度器接手） */
+  const migrations = new Map<string, { done: Promise<void>; abort: AbortController }>();
+  const busy = () => running.size + migrations.size;
   let stopped = false;
   let wake: (() => void) | undefined;
   let lastHeartbeat = Date.now();
@@ -59,7 +64,16 @@ export function createDispatcher({ maxWorkers, pollMs = 1000, staleAfterMs = 60_
   // 领取任务串行进行：进程结束与定时轮询可能同时触发补位
   let filling = Promise.resolve();
   const fill = () => (filling = filling.then(async () => {
-    while (!stopped && running.size < maxWorkers) {
+    while (!stopped && busy() < maxWorkers) {
+      const migration = await claimLakeMigration(staleAfterMs);
+      if (!migration) break;
+      const abort = new AbortController();
+      const done = runLakeMigration(migration, abort.signal)
+        .catch(e => console.error(`[调度器] 数据湖迁移 ${migration.id} 出错`, e))
+        .finally(() => { migrations.delete(migration.claim); wake?.(); });
+      migrations.set(migration.claim, { done, abort });
+    }
+    while (!stopped && busy() < maxWorkers) {
       const task = await claimNextTask();
       if (!task) break;
       start(task);
@@ -73,9 +87,13 @@ export function createDispatcher({ maxWorkers, pollMs = 1000, staleAfterMs = 60_
   async function heartbeat() {
     try {
       for (const id of await heartbeatTasks([...running.keys()])) running.get(id)?.abort('任务已终止');
+      for (const claim of await heartbeatLakeMigrations([...migrations.keys()])) migrations.get(claim)?.abort.abort();
       lastHeartbeat = Date.now();
     } catch (e) {
-      if (Date.now() - lastHeartbeat > staleAfterMs) for (const t of running.values()) t.abort('调度器失联，任务中断');
+      if (Date.now() - lastHeartbeat > staleAfterMs) {
+        for (const t of running.values()) t.abort('调度器失联，任务中断');
+        for (const m of migrations.values()) m.abort.abort();
+      }
       throw e;
     }
   }
@@ -96,7 +114,7 @@ export function createDispatcher({ maxWorkers, pollMs = 1000, staleAfterMs = 60_
     /** 派发到队列里没有可派发的任务、且本调度器派发的任务全部结束为止（测试与一次性运行时使用） */
     async runUntilIdle() {
       await tick();
-      while (running.size) {
+      while (busy()) {
         await nap();
         await tick();
       }
@@ -107,7 +125,7 @@ export function createDispatcher({ maxWorkers, pollMs = 1000, staleAfterMs = 60_
         await tick().catch(e => console.error('[调度器] 轮询出错', e));
         await nap();
       }
-      await Promise.all([...running.values()].map(t => t.done));
+      await Promise.all([...[...running.values()].map(t => t.done), ...[...migrations.values()].map(m => m.done)]);
     },
     /** 不再领取新任务 */
     stop() {

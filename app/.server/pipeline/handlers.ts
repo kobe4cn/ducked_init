@@ -10,7 +10,7 @@ interface Handler { label: string; run(con: DuckDBConnection, params: Params): P
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 
 /** 本租户数据湖里的全部表与行数 */
-async function inventory(con: DuckDBConnection) {
+export async function inventory(con: DuckDBConnection) {
   const tables = await rows<{ schema: string; name: string }>(con, `
     SELECT table_schema AS schema, table_name AS name FROM information_schema.tables
     WHERE table_catalog = 'lake' ORDER BY ALL`);
