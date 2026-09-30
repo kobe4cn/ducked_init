@@ -20,6 +20,9 @@ function ignoreChromeDevtoolsProbe(): Plugin {
 
 export default defineConfig({
   plugins: [ignoreChromeDevtoolsProbe(), tailwindcss(), reactRouter()],
+  // 浏览器端一旦请求到 app/.server/pipeline/lake-engine.ts（React Router 只拦截 import，不拦直接请求），
+  // Vite 会把 DuckDB 登记为浏览器端依赖去预构建，原生模块 duckdb.node 打包失败（UNLOADABLE_DEPENDENCY）
+  optimizeDeps: { exclude: ["@duckdb/node-api"] },
   resolve: {
     tsconfigPaths: true,
   },
