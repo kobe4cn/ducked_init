@@ -239,4 +239,7 @@ export const sourceTables = platform.table('source_tables', {
   watermarkColumn: text('watermark_column'),
   confirmedByEmail: text('confirmed_by_email'),
   confirmedAt: timestamp('confirmed_at', { withTimezone: true }),
+  /** 源表没有主键时成员确认的业务主键：同步据此区分新增与更新、发现删除 */
+  keyColumn: text('key_column'),
+  keyConfirmedByEmail: text('key_confirmed_by_email'),
 }, t => [primaryKey({ columns: [t.sourceId, t.tableName] })]);

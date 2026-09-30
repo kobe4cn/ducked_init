@@ -153,6 +153,24 @@ describe('列统计与水位线', () => {
     expect(after).toContain('按 updated_at 增量同步');
   });
 
+  it('展示各表的主键；没有主键的表列出业务主键候选，成员确认后生效；没有候选时说明看不到删除', async () => {
+    const { browser } = await engineerOf('acme');
+    const id = sourceIdOf(await register(browser, await pgSourceInput(READER)));
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    const html = await (await browser.get(`/sources/${id}`)).text();
+    expect(html).toMatch(/data-table="customers"[\s\S]*?主键：customer_id/);
+    expect(html).toMatch(/data-table="regions"[\s\S]*?data-key-candidate="code"/);
+    expect(html).toMatch(/data-table="events"[\s\S]*?data-no-key/);
+
+    const res = await browser.post(`/sources/${id}`, { intent: 'confirm-key', table: 'regions', column: 'code' });
+    expect(res.status).toBe(302);
+    expect(await (await browser.get(`/sources/${id}`)).text()).toMatch(/data-key-candidate="code"[\s\S]*?已确认（de@acme.com）/);
+    const rejected = await browser.post(`/sources/${id}`, { intent: 'confirm-key', table: 'customers', column: 'email' });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toContain('已有主键 customer_id');
+  });
+
   it('账号读不了某些表时：测试连接与数据源页都列出这些表，采集跳过它们；一张都读不了时拒绝登记并给出授权语句', async () => {
     const { browser } = await engineerOf('acme');
     const input = await pgSourceInput(READER);

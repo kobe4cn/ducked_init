@@ -1,5 +1,5 @@
 // app/routes/source.tsx —— 单个数据源：连接参数（凭据不显示）、测试连接、修改与轮换凭据、重新采集；
-// 各表的行数、列统计、同步方式与水位线候选，成员从候选中确认水位线字段；手动触发同步，查看每张表的同步历史
+// 各表的行数、列统计、同步方式与水位线候选，成员从候选中确认水位线字段，没有主键的表确认业务主键；手动触发同步，查看每张表的同步历史
 import { useEffect } from 'react';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
 import { CircleAlert, CircleCheck } from 'lucide-react';
@@ -7,7 +7,7 @@ import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { getSyncStatus, syncSource } from '~/.server/source-sync';
-import { confirmWatermark, getSource, refreshSourceProfile, SourceError, testSource, updateSource } from '~/.server/sources';
+import { confirmKey, confirmWatermark, getSource, refreshSourceProfile, SourceError, testSource, updateSource } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { formValues, SOURCE_KIND_LABELS, SYNC_MODES } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
@@ -97,6 +97,9 @@ export async function action({ request, params }: Route.ActionArgs) {
       case 'confirm-watermark':
         await confirmWatermark(member, params.sourceId, field('table'), field('column'));
         break;
+      case 'confirm-key':
+        await confirmKey(member, params.sourceId, field('table'), field('column'));
+        break;
       default:
         return data({ ok: null, error: '未知操作', values: null }, { status: 400 });
     }
@@ -118,6 +121,15 @@ type TableView = Route.ComponentProps['loaderData']['tables'][number];
 type SyncEntry = Route.ComponentProps['loaderData']['sync']['history'][string][number];
 
 const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
+const BATCH_MODES = { full: '全表读取', incremental: '增量', reconcile: '主键比对' } as const;
+const count = (n: number) => n.toLocaleString('zh-CN');
+
+/** 批次的读取范围：增量批次从水位线往回退了回看窗口时一并说明 */
+function watermarkRange(e: Extract<SyncEntry, { batch: number }>) {
+  if (e.mode === 'reconcile') return `${e.watermarkColumn}：${e.watermarkTo ?? '—'}（不变）`;
+  const lookback = e.readFrom !== null && e.readFrom !== e.watermarkFrom ? `（回看自 ${e.readFrom}）` : '';
+  return `${e.watermarkColumn}：${e.watermarkFrom ?? '起始'} → ${e.watermarkTo ?? '—'}${lookback}`;
+}
 
 /** 一张表的同步历史：每次同步一个变更批次（新的在前） */
 function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }) {
@@ -136,22 +148,20 @@ function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }
           </TableRow>
         </TableHeader>
         <TableBody>
-          {entries.map(e => 'error' in e ? (
-            <TableRow key={e.taskId} data-sync-error>
+          {entries.map((e, i) => 'error' in e ? (
+            <TableRow key={`${e.taskId}-${i}`} data-sync-error>
               <TableCell>—</TableCell>
               <TableCell colSpan={3} className="whitespace-normal text-destructive">{`失败：${e.error}`}</TableCell>
               <TableCell>—</TableCell>
               <TableCell>{time(e.startedAt)}</TableCell>
             </TableRow>
           ) : (
-            <TableRow key={e.taskId} data-batch={e.batch}>
+            <TableRow key={`${e.taskId}-${i}`} data-batch={e.batch} data-batch-mode={e.mode}>
               <TableCell>{e.batch}</TableCell>
-              <TableCell>{e.mode === 'full' ? '全表读取' : '增量'}</TableCell>
-              <TableCell>{`${e.rows.toLocaleString('zh-CN')}（新增 ${e.inserted.toLocaleString('zh-CN')}，更新 ${e.updated.toLocaleString('zh-CN')}）`}</TableCell>
+              <TableCell>{BATCH_MODES[e.mode]}</TableCell>
+              <TableCell>{`${count(e.rows)}（新增 ${count(e.inserted)}，更新 ${count(e.updated)}，删除 ${count(e.deleted)}）`}</TableCell>
               <TableCell>{duration(e.durationMs)}</TableCell>
-              <TableCell className="font-mono text-xs whitespace-normal">
-                {`${e.watermarkColumn}：${e.watermarkFrom ?? '起始'} → ${e.watermarkTo ?? '—'}`}
-              </TableCell>
+              <TableCell className="font-mono text-xs whitespace-normal">{watermarkRange(e)}</TableCell>
               <TableCell>{time(e.startedAt)}</TableCell>
             </TableRow>
           ))}
@@ -213,6 +223,34 @@ function Watermark({ table, canWrite, submitting }: { table: TableView; canWrite
               <input type="hidden" name="table" value={table.name} />
               <input type="hidden" name="column" value={c.column} />
               <Button type="submit" variant="outline" size="sm" disabled={submitting}>确认为水位线</Button>
+            </Form>
+          ) : null}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** 主键：源端主键；没有时列出业务主键候选供成员确认。都没有时同步看不到删除、增量行一律记为新增 */
+function Key({ table, canWrite, submitting }: { table: TableView; canWrite: boolean; submitting: boolean }) {
+  if (table.primaryKey.length) return <div className="text-xs text-muted-foreground">{`主键：${table.primaryKey.join('、')}`}</div>;
+  if (!table.keyCandidates.length) {
+    return <div className="text-xs text-muted-foreground" data-no-key>没有主键：增量行一律记为新增，看不到源端的删除</div>;
+  }
+  return (
+    <ul className="space-y-1 text-xs">
+      {table.keyCandidates.map(column => (
+        <li key={column} className="flex items-center gap-2" data-key-candidate={column}>
+          <span className="font-mono">{column}</span>
+          <span className="text-muted-foreground">没有主键；样本中非空且唯一，可作业务主键（据此区分新增与更新、发现删除）</span>
+          {table.key === column ? (
+            <Badge variant="secondary">{`已确认${table.keyConfirmedBy ? `（${table.keyConfirmedBy}）` : ''}`}</Badge>
+          ) : canWrite ? (
+            <Form method="post">
+              <input type="hidden" name="intent" value="confirm-key" />
+              <input type="hidden" name="table" value={table.name} />
+              <input type="hidden" name="column" value={column} />
+              <Button type="submit" variant="outline" size="sm" disabled={submitting}>确认为业务主键</Button>
             </Form>
           ) : null}
         </li>
@@ -325,6 +363,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
                     <Badge variant={SYNC_VARIANTS[t.syncMode]}>{SYNC_MODES[t.syncMode]}</Badge>
                     <div className="text-xs text-muted-foreground">{t.syncModeNote}</div>
                     <Watermark table={t} canWrite={canWrite} submitting={submitting} />
+                    <Key table={t} canWrite={canWrite} submitting={submitting} />
                   </TableCell>
                 </TableRow>
               ))}
@@ -347,7 +386,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
             <Badge variant={TASK_VARIANTS[sync.status]} data-sync-status={sync.status}>{sync.statusLabel}</Badge>
           </CardTitle>
           <CardDescription>
-            {`已确认水位线的表每小时增量同步一次，变化以变更批次追加到原始层；首次同步为全量。最近一次：${time(sync.attemptedAt)} 提交`}
+            {`已确认水位线的表每小时增量同步一次，变化以变更批次追加到原始层；首次同步为全量。有主键的表每天再比对一次主键全集，补上源端的删除与漏掉的行。最近一次：${time(sync.attemptedAt)} 提交`}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">

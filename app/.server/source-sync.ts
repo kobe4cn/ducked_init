@@ -86,7 +86,9 @@ export async function getSyncStatus(actor: CurrentMember, sourceId: string) {
     .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(HISTORY_TASKS);
   const history: Record<string, SyncHistoryEntry[]> = {};
   for (const run of runs) {
-    for (const record of (run.result?.tables ?? []) as SyncRecord[]) (history[record.table] ??= []).push({ ...record, taskId: run.id });
+    // 一次同步里同一张表可能先后有增量与主键比对两个批次，同样新的在前
+    const records = [...((run.result?.tables ?? []) as SyncRecord[])].reverse();
+    for (const record of records) (history[record.table] ??= []).push({ ...record, taskId: run.id });
   }
   const [latest] = runs;
   return {

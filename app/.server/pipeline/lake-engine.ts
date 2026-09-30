@@ -1,5 +1,8 @@
 // app/.server/pipeline/lake-engine.ts —— 在当前进程里打开一个只挂载单个租户数据湖的 DuckDB（ADR-0001、0008）。
 // 工作进程用它执行任务，开通租户时也用它初始化 catalog。这里不碰平台 PG 的连接串：拿到的只有本租户的凭据
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 import { attachSource, listTables, lockConfiguration, type MongoAccess, type SourceSpec, type SourceTable } from './source-engine';
 
@@ -11,6 +14,9 @@ export interface LakeSpec {
   /** 存储前缀在对象存储上时的访问凭据 */
   s3?: { endpoint: string; region: string; key: string; secret: string; urlStyle: string; useSsl: boolean };
 }
+
+/** 超出内存上限时溢写到本机临时目录，溢写量以内存上限的这个倍数为限 */
+const SPILL_RATIO = 10;
 
 /** 按租户配额限制的计算资源 */
 export interface EngineLimits { memoryLimitMb: number; threads: number }
@@ -33,7 +39,8 @@ const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 
 /**
  * 挂载租户数据湖（给了 source 时再只读挂载该数据源，ADR-0012）后锁住配置：只能读写本租户的存储前缀，不能再挂载其他库、读其他路径，也不能改回这些设置。
- * catalog 的数据库角色只能访问本租户的 schema，因此经 DuckLake 内部的 PG 连接也读不到其他租户与平台元数据
+ * catalog 的数据库角色只能访问本租户的 schema，因此经 DuckLake 内部的 PG 连接也读不到其他租户与平台元数据。
+ * 大批次、比对等超出内存上限时溢写到本次会话专用的本机临时目录（ADR-0010），关闭会话即删除
  */
 export async function openTenantLake(spec: LakeSpec, limits: EngineLimits, source?: SourceSpec): Promise<TenantLakeSession> {
   const instance = await DuckDBInstance.create(':memory:', {
@@ -41,9 +48,11 @@ export async function openTenantLake(spec: LakeSpec, limits: EngineLimits, sourc
     threads: String(limits.threads),
   });
   const con = await instance.connect();
-  const close = () => { con.closeSync(); instance.closeSync(); };
+  const spill = mkdtempSync(join(tmpdir(), 'duckdb-task-'));
+  const close = () => { con.closeSync(); instance.closeSync(); rmSync(spill, { recursive: true, force: true }); };
   try {
-    await con.run('INSTALL ducklake; LOAD ducklake; INSTALL postgres; LOAD postgres;');
+    await con.run(`INSTALL ducklake; LOAD ducklake; INSTALL postgres; LOAD postgres;
+      SET temp_directory = ${lit(spill)}; SET max_temp_directory_size = '${limits.memoryLimitMb * SPILL_RATIO}MiB';`);
     if (spec.s3) {
       const s = spec.s3;
       await con.run(`INSTALL httpfs; LOAD httpfs;
@@ -55,7 +64,7 @@ export async function openTenantLake(spec: LakeSpec, limits: EngineLimits, sourc
     // 源端不带时区的时间一律按 UTC 解读，不随工作进程所在机器的时区变化
     await con.run(`USE lake; SET TimeZone = 'UTC'`);
     const attached = source ? await attachSource(con, source) : { allowed: [], mongo: undefined };
-    await lockConfiguration(con, [spec.dataPath, ...attached.allowed]);
+    await lockConfiguration(con, [spec.dataPath, spill, ...attached.allowed]);
     return {
       con,
       close,

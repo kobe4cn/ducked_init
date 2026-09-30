@@ -7,7 +7,7 @@ import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { enqueueDueSyncs, getSyncStatus, syncSource } from '../../app/.server/source-sync';
-import { confirmWatermark, getSource, registerSource, SourceError } from '../../app/.server/sources';
+import { confirmKey, confirmWatermark, getSource, registerSource, SourceError } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
@@ -31,11 +31,13 @@ async function bronze(tenantId: string, sourceId: string, table: string, orderBy
   }
 }
 
-/** 登记 PostgreSQL 数据源、采集，并确认 customers 按更新时间、orders 按自增主键同步 */
-async function pgSourceWithWatermarks() {
+/** 登记 PostgreSQL 数据源、采集，并确认 customers 按更新时间、orders 按自增主键同步。prepare 在登记前对源库执行 */
+async function pgSourceWithWatermarks(prepare?: string) {
   const acme = await newTenant('acme');
   const engineer = await memberOf(acme, 'de@acme.com');
-  const { id } = await registerSource(engineer, await pgSourceInput(READER));
+  const input = await pgSourceInput(READER);
+  if (prepare) await grantOnSource(prepare);
+  const { id } = await registerSource(engineer, input);
   await drain();
   await confirmWatermark(engineer, id, 'customers', 'updated_at');
   await confirmWatermark(engineer, id, 'orders', 'order_id');
@@ -44,6 +46,22 @@ async function pgSourceWithWatermarks() {
 
 const historyOf = async (engineer: Parameters<typeof getSource>[0], id: string, table: string) =>
   (await getSyncStatus(engineer, id)).history[table] ?? [];
+
+/** 在 fn 执行期间设置环境变量（调度器派发的工作进程继承它） */
+async function withEnv(vars: Record<string, string>, fn: () => Promise<void>) {
+  const saved = Object.fromEntries(Object.keys(vars).map(k => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try {
+    await fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+const sync = async (engineer: Parameters<typeof getSource>[0], id: string) => { await syncSource(engineer, id); await drain(); };
 
 describe('水位线增量同步到原始层', () => {
   it('首次同步为全量；之后按水位线增量，源端的新增与更新都以变更批次追加到原始层', async () => {
@@ -102,6 +120,81 @@ describe('水位线增量同步到原始层', () => {
     await drain();
     const third = (await bronze(acme, id, 'customers', 'customer_id')).filter(r => r._batch === 3);
     expect(third.map(r => [r.customer_id, r._op])).toEqual([[41, 'insert']]);
+  });
+
+  it('从水位线往回多读一个回看窗口：长事务晚提交的行、晚提交的小自增主键不会漏，回看范围内没变的行不重复写入', async () => {
+    // 95 号订单“分配在前、提交在后”：首次同步时源端还没有它
+    const { acme, engineer, id } = await pgSourceWithWatermarks('DELETE FROM shop.orders WHERE order_id = 95');
+    await sync(engineer, id);
+    await grantOnSource(`
+      INSERT INTO shop.customers (name, created_at, updated_at) VALUES ('晚提交', '2024-06-02', '2024-06-02 15:50:00');
+      INSERT INTO shop.orders (order_id, customer_id, amount, status, created_at) OVERRIDING SYSTEM VALUE VALUES (95, 1, 1, 'paid', '2024-05-01');`);
+    await sync(engineer, id);
+
+    const customers = (await bronze(acme, id, 'customers', 'customer_id')).filter(r => r._batch === 2);
+    expect(customers.map(r => [r.name, r._op])).toEqual([['晚提交', 'insert']]);
+    expect((await historyOf(engineer, id, 'customers'))[0]).toMatchObject({
+      batch: 2, mode: 'incremental', rows: 1, watermarkFrom: '2024-06-02 16:00:00', readFrom: '2024-06-02 15:45:00', watermarkTo: '2024-06-02 16:00:00',
+    });
+    const orders = (await bronze(acme, id, 'orders', 'order_id')).filter(r => r._batch === 2);
+    expect(orders.map(r => [r.order_id, r._op])).toEqual([['95', 'insert']]);
+    expect((await historyOf(engineer, id, 'orders'))[0]).toMatchObject({ rows: 1, watermarkFrom: '100', readFrom: '0', watermarkTo: '100' });
+  });
+
+  it('到了比对周期时比对主键全集：源端删除的主键记为删除，水位线漏掉的行补为新增；之后的更新照常识别', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, engineer, id } = await pgSourceWithWatermarks();
+      await sync(engineer, id);
+      // 更新时间早于回看窗口的新行（如直接改库补录的历史数据）增量读不到
+      await grantOnSource(`
+        DELETE FROM shop.customers WHERE customer_id = 7;
+        INSERT INTO shop.customers (name, created_at, updated_at) VALUES ('补录', '2024-01-01', '2024-01-01');
+        DELETE FROM shop.orders WHERE order_id = 3;`);
+      await sync(engineer, id);
+
+      const history = await historyOf(engineer, id, 'customers');
+      expect(history.map(h => 'batch' in h && [h.batch, h.mode, h.rows])).toEqual([[3, 'reconcile', 2], [2, 'incremental', 0], [1, 'full', 40]]);
+      expect(history[0]).toMatchObject({ inserted: 1, deleted: 1, watermarkTo: '2024-06-02 16:00:00' });
+      const reconciled = (await bronze(acme, id, 'customers', 'customer_id')).filter(r => r._batch === 3);
+      // 删除记录只带主键
+      expect(reconciled.map(r => [r.customer_id, r._op, r.name])).toEqual([[7, 'delete', null], [41, 'insert', '补录']]);
+      const orders = (await bronze(acme, id, 'orders', 'order_id')).filter(r => r._batch === 3);
+      expect(orders.map(r => [r.order_id, r._op])).toEqual([['3', 'delete']]);
+
+      await grantOnSource(`UPDATE shop.customers SET city = '成都', updated_at = '2024-07-01' WHERE customer_id = 41`);
+      await sync(engineer, id);
+      const later = (await bronze(acme, id, 'customers', 'customer_id')).filter(r => Number(r._batch) >= 4);
+      expect(later.map(r => [r._batch, r.customer_id, r._op])).toEqual([[4, 41, 'update']]);
+    });
+  });
+
+  it('没有主键的表可以确认业务主键：据此区分新增与更新、发现删除；主键不唯一时这张表同步失败', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, engineer, id } = await pgSourceWithWatermarks(`
+        CREATE TABLE shop.subscriptions (email text NOT NULL, plan text NOT NULL, updated_at timestamp NOT NULL);
+        INSERT INTO shop.subscriptions SELECT 'user' || i || '@example.com', 'basic', TIMESTAMP '2024-06-01' + i * INTERVAL '1 hour' FROM generate_series(1, 10) i;
+        GRANT SELECT ON shop.subscriptions TO ${READER.user};`);
+      const table = (await getSource(engineer, id)).tables.find(t => t.name === 'subscriptions')!;
+      expect(table).toMatchObject({ primaryKey: [], keyCandidates: ['email'], key: null });
+      await expect(confirmKey(engineer, id, 'subscriptions', 'plan')).rejects.toBeInstanceOf(SourceError);
+      await expect(confirmKey(engineer, id, 'customers', 'email')).rejects.toThrow(/已有主键/);
+      await confirmWatermark(engineer, id, 'subscriptions', 'updated_at');
+      await confirmKey(engineer, id, 'subscriptions', 'email');
+      await sync(engineer, id);
+
+      await grantOnSource(`
+        UPDATE shop.subscriptions SET plan = 'pro', updated_at = '2024-07-01' WHERE email = 'user2@example.com';
+        DELETE FROM shop.subscriptions WHERE email = 'user3@example.com';`);
+      await sync(engineer, id);
+      const rows = (await bronze(acme, id, 'subscriptions', 'email')).filter(r => Number(r._batch) > 1);
+      expect(rows.map(r => [r._batch, r.email, r._op])).toEqual([[2, 'user2@example.com', 'update'], [3, 'user3@example.com', 'delete']]);
+
+      await grantOnSource(`INSERT INTO shop.subscriptions VALUES ('user2@example.com', 'basic', '2024-07-02')`);
+      await syncSource(engineer, id);
+      await drain();
+      const [failed] = (await getSyncStatus(engineer, id)).history.subscriptions;
+      expect(failed).toMatchObject({ error: expect.stringContaining('不唯一') });
+    });
   });
 
   it('源表新增字段后照常同步，原始层随之加列', async () => {

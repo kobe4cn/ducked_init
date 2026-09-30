@@ -25,7 +25,10 @@ export interface DispatcherOptions {
 }
 
 // 工作进程只继承运行所需的环境变量（平台 PG 连接串等不在其中）；本租户数据湖的凭据经 IPC 单独传入
-const WORKER_ENV_KEYS = ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'NODE_ENV', 'SystemRoot'];
+const WORKER_ENV_KEYS = [
+  'PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'NODE_ENV', 'SystemRoot',
+  'SOURCE_SYNC_LOOKBACK_MINUTES', 'SOURCE_SYNC_LOOKBACK_IDS', 'SOURCE_RECONCILE_HOURS',
+];
 const workerEnv = () => Object.fromEntries(WORKER_ENV_KEYS.flatMap(k => (process.env[k] === undefined ? [] : [[k, process.env[k]!]])));
 
 interface RunningTask { child: ChildProcess; done: Promise<void>; abort(reason: string): void }

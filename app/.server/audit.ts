@@ -48,6 +48,7 @@ const ACTIONS = {
     ].filter(Boolean).join('，'),
   },
   'source.watermark_confirmed': { label: '确认水位线', describe: (d: Detail) => `「${d.name}」${d.table}：${d.column}` },
+  'source.key_confirmed': { label: '确认业务主键', describe: (d: Detail) => `「${d.name}」${d.table}：${d.column}` },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },

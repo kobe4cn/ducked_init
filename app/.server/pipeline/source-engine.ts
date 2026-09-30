@@ -53,6 +53,10 @@ export interface TableProfile {
   sampleRows: number;
   columns: ColumnProfile[];
   watermarkCandidates: WatermarkCandidate[];
+  /** 源端主键（按主键中的顺序）；没有时为空 */
+  primaryKey: string[];
+  /** 没有主键时可作业务主键的列：样本中非空、取值（近似）唯一的整数、文本或 UUID 列 */
+  keyCandidates: string[];
 }
 
 const TEXT_FORMATS = {
@@ -450,9 +454,15 @@ interface SummaryRow { column_name: string; column_type: string; min: string | n
 const isTemporal = (type: string) => /^(TIMESTAMP|DATE|TIME)/.test(type);
 const isNumeric = (type: string) => /^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|U|FLOAT|DOUBLE|DECIMAL)/.test(type);
 const isText = (type: string) => type === 'VARCHAR';
+const isKeyType = (type: string) => /^(U?(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT)|VARCHAR|UUID)$/.test(type);
+/** 样本中不同取值的个数（近似计数）至少占样本行数的这个比例，才算取值唯一 */
+const KEY_DISTINCT_SHARE = 0.98;
 
-/** 在会话里采集一张表：总行数，以及基于前 sampleRows 行样本的列统计与水位线候选 */
-async function profileTable(con: DuckDBConnection, table: SourceTable, increment: string | undefined, sampleRows: number, objectIdKey = false): Promise<TableProfile> {
+/** 在会话里采集一张表：总行数，以及基于前 sampleRows 行样本的列统计、水位线候选与业务主键候选 */
+async function profileTable(
+  con: DuckDBConnection, table: SourceTable, keys: { increment?: string; primary: string[] }, sampleRows: number, objectIdKey = false,
+): Promise<TableProfile> {
+  const { increment, primary } = keys;
   const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${table.from}`);
   await con.run(`CREATE OR REPLACE TEMP TABLE profile_sample AS SELECT * FROM ${table.from} LIMIT ${sampleRows}`);
   try {
@@ -495,7 +505,11 @@ async function profileTable(con: DuckDBConnection, table: SourceTable, increment
     if (id && id.nullRate === 0 && id.formats?.some(f => f.format === 'objectid' && f.share === 1)) {
       candidates.push({ column: '_id', kind: 'increment', reason: 'ObjectId 主键：前 4 字节是创建时间，大体按插入顺序递增' });
     }
-    return { name: table.name, rows: Number(n), sampleRows: Math.min(Number(n), sampleRows), columns, watermarkCandidates: candidates };
+    const sampled = Math.min(Number(n), sampleRows);
+    const keyCandidates = primary.length || !sampled ? [] : columns
+      .filter(c => isKeyType(c.type) && c.nullRate === 0 && c.distinct >= sampled * KEY_DISTINCT_SHARE)
+      .map(c => c.name);
+    return { name: table.name, rows: Number(n), sampleRows: sampled, columns, watermarkCandidates: candidates, primaryKey: primary, keyCandidates };
   } finally {
     await con.run('DROP TABLE IF EXISTS profile_sample');
   }
@@ -509,9 +523,11 @@ export async function profileSource(spec: SourceSpec, limits: EngineLimits, { sa
     if (writable.length) throw new Error(`账号可以写入数据源（${writable.map(g => g.object).join('、')}），平台只使用只读账号，请更换账号`);
     const increments = await incrementKeys(session.con, spec);
     const all = await session.tables();
+    const primary = await primaryKeys(session.con, spec, all);
     const tables: TableProfile[] = [];
     for (const t of all.filter(t => t.readable)) {
-      tables.push(await profileTable(session.con, t, increments.get(t.name), sampleRows, spec.kind === 'mongodb'));
+      const keys = { increment: increments.get(t.name), primary: primary.get(t.name) ?? [] };
+      tables.push(await profileTable(session.con, t, keys, sampleRows, spec.kind === 'mongodb'));
     }
     return { tables, unreadable: all.filter(t => !t.readable).map(t => t.name) };
   } catch (e) {

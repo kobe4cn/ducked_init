@@ -38,8 +38,9 @@ export async function inventory(con: DuckDBConnection) {
 function syncTables(params: Params): SyncTableParam[] {
   const tables = params.tables;
   const valid = Array.isArray(tables) && tables.length > 0 && tables.every(t =>
-    typeof t?.name === 'string' && typeof t.column === 'string' && (t.kind === 'updated_at' || t.kind === 'increment'));
-  if (!valid) throw new Error('参数 tables 必须是非空的 { name, column, kind } 列表');
+    typeof t?.name === 'string' && typeof t.column === 'string' && (t.kind === 'updated_at' || t.kind === 'increment')
+    && (t.key === undefined || typeof t.key === 'string'));
+  if (!valid) throw new Error('参数 tables 必须是非空的 { name, column, kind, key? } 列表');
   return tables as SyncTableParam[];
 }
 
@@ -86,7 +87,8 @@ export const HANDLERS = {
       return profileSource(source, limits);
     },
   },
-  // 水位线增量同步：每张表一个变更批次追加到原始层。有表失败时任务记为失败，结果里保留各表的批次与错误
+  // 水位线增量同步：每张表一个变更批次追加到原始层，有主键的表到期时再比对一次主键全集。
+  // 有表失败时任务记为失败，结果里保留各表的批次与错误
   'source.sync': {
     label: '同步数据源',
     attachSource: true,

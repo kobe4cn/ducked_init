@@ -1,6 +1,6 @@
 // app/.server/sources.ts —— 数据源：登记、修改与轮换凭据、测试连接、采集表清单与列统计、确认水位线字段。一律限定在操作者所属租户内。
 // 登记与修改时平台探测账号写权限，可写即拒绝；凭据用租户数据密钥加密保存，任何界面与接口都不回显。
-// 列统计由采集任务（source.profile）在工作进程里产出，保存在任务结果中；成员确认的水位线字段保存在 source_tables。
+// 列统计由采集任务（source.profile）在工作进程里产出，保存在任务结果中；成员确认的水位线字段与业务主键保存在 source_tables。
 // 按水位线同步见 source-sync.ts
 import { randomUUID } from 'node:crypto';
 import { and, desc, eq, sql } from 'drizzle-orm';
@@ -141,32 +141,43 @@ export async function listSources(actor: CurrentMember) {
   return rows;
 }
 
-/** 最近一次成功采集到的各表，带成员确认且仍然有效的水位线字段（没有时为 null）及其种类 */
-async function tablesWithWatermarks(tenantId: string, sourceId: string) {
+/**
+ * 最近一次成功采集到的各表，带成员确认且仍然有效的水位线字段（没有时为 null）及其种类，以及成员确认的业务主键。
+ * 采集后字段不再是候选（被删除、改名、出现空值或重复，或源表有了主键）时，之前的确认不再生效
+ */
+async function confirmedTables(tenantId: string, sourceId: string) {
   const profiles = await latestProfiles(tenantId, sourceId);
   const confirmed = new Map(
     (await getDb().select().from(sourceTables).where(eq(sourceTables.sourceId, sourceId))).map(t => [t.tableName, t]),
   );
   const tables = profiles.tables.map(t => {
     const c = confirmed.get(t.name);
-    // 采集后字段不再是候选（被删除、改名或出现空值）时，之前的确认不再生效
     const candidate = c?.watermarkColumn ? t.watermarkCandidates.find(w => w.column === c.watermarkColumn) : undefined;
-    return { table: t, watermark: candidate ?? null, confirmedBy: candidate ? c!.confirmedByEmail : null };
+    // 旧的采集结果里没有业务主键候选
+    const key = c?.keyColumn && t.keyCandidates?.includes(c.keyColumn) ? c.keyColumn : null;
+    return {
+      table: t,
+      watermark: candidate ?? null,
+      confirmedBy: candidate ? c!.confirmedByEmail : null,
+      key,
+      keyConfirmedBy: key ? c!.keyConfirmedByEmail : null,
+    };
   });
   return { ...profiles, tables };
 }
 
-/** 按水位线增量同步的表：成员确认了水位线字段、且该字段在最近一次采集中仍是候选 */
+/** 按水位线增量同步的表：成员确认了水位线字段、且该字段在最近一次采集中仍是候选；带成员确认的业务主键 */
 export async function watermarkTables(tenantId: string, sourceId: string): Promise<SyncTableParam[]> {
-  const { tables } = await tablesWithWatermarks(tenantId, sourceId);
-  return tables.flatMap(({ table, watermark }) => (watermark ? [{ name: table.name, column: watermark.column, kind: watermark.kind }] : []));
+  const { tables } = await confirmedTables(tenantId, sourceId);
+  return tables.flatMap(({ table, watermark, key }) =>
+    (watermark ? [{ name: table.name, column: watermark.column, kind: watermark.kind, ...(key && { key }) }] : []));
 }
 
 /** 数据源详情：连接参数（不含凭据）、最近一次采集的状态（及跳过的无读权限的表）、各表的列统计、水位线候选与同步方式 */
 export async function getSource(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'sources:read');
   const { credentials: _sealed, ...row } = await requireSource(actor.tenant.id, sourceId);
-  const { latest, tables, unreadable, profiledAt } = await tablesWithWatermarks(actor.tenant.id, sourceId);
+  const { latest, tables, unreadable, profiledAt } = await confirmedTables(actor.tenant.id, sourceId);
   return {
     ...row,
     profile: {
@@ -177,10 +188,15 @@ export async function getSource(actor: CurrentMember, sourceId: string) {
       unreadable,
       profiledAt,
     },
-    tables: tables.map(({ table, watermark, confirmedBy }) => ({
+    tables: tables.map(({ table, watermark, confirmedBy, key, keyConfirmedBy }) => ({
       ...table,
+      // 旧的采集结果里没有主键信息
+      primaryKey: table.primaryKey ?? [],
+      keyCandidates: table.keyCandidates ?? [],
       watermark: watermark?.column ?? null,
       confirmedBy,
+      key,
+      keyConfirmedBy,
       ...syncModeOf(table, watermark?.column ?? null),
     })),
   };
@@ -202,6 +218,33 @@ export async function confirmWatermark(actor: CurrentMember, sourceId: string, t
       tenantId: actor.tenant.id,
       actor,
       action: 'source.watermark_confirmed',
+      targetType: 'source',
+      targetId: sourceId,
+      detail: { name: row.name, table: tableName, column },
+    });
+  });
+}
+
+/**
+ * 成员为没有主键的表确认业务主键（从平台给出的候选中选）：同步据此区分新增与更新，并在比对主键全集时发现删除。
+ * 候选只基于样本统计，同步时会在读到的行上再校验非空且唯一
+ */
+export async function confirmKey(actor: CurrentMember, sourceId: string, tableName: string, column: string) {
+  assertCan(actor, 'sources:write');
+  const row = await requireSource(actor.tenant.id, sourceId);
+  const { tables } = await latestProfiles(actor.tenant.id, sourceId);
+  const table = tables.find(t => t.name === tableName);
+  if (!table) throw new SourceError(`数据源中没有表 ${tableName}`, 404);
+  if (table.primaryKey?.length) throw new SourceError(`${tableName} 已有主键 ${table.primaryKey.join('、')}，不需要业务主键`);
+  if (!table.keyCandidates?.includes(column)) throw new SourceError(`${column} 不是 ${tableName} 的业务主键候选字段`);
+  await getDb().transaction(async tx => {
+    const values = { keyColumn: column, keyConfirmedByEmail: actor.email };
+    await tx.insert(sourceTables).values({ sourceId, tableName, ...values })
+      .onConflictDoUpdate({ target: [sourceTables.sourceId, sourceTables.tableName], set: values });
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id,
+      actor,
+      action: 'source.key_confirmed',
       targetType: 'source',
       targetId: sourceId,
       detail: { name: row.name, table: tableName, column },
