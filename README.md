@@ -80,7 +80,7 @@ npm run dev                                                             # 打开
 
 - 配置 `OPS_ALLOWED_CIDRS` 后只允许白名单内的地址访问 `/ops`。客户端地址取自反向代理写入的请求头，必须部署在会追加或覆盖该请求头的反向代理之后，否则可被伪造。取最后一项只适用于一层反向代理；多层代理（如 CDN + 负载均衡）时应让最内层代理把真实地址写入单独的请求头（如 `X-Real-IP`），并把 `OPS_CLIENT_IP_HEADER` 指向它。
 
-`npm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
+`npm test` 运行 HTTP 接缝测试（进程内启动 React Router 服务端）与租户流水线接缝测试（直接调用领域函数与调度器，用 `demo.seed` 造数），背后是测试用平台 PG（默认 `postgres://crm:crm@localhost:5432/crm_platform_test`，可用 `TEST_PLATFORM_DATABASE_URL` 覆盖；库不存在会自动创建，每个用例前清表并删除租户的 catalog schema 与角色）。租户数据湖放在系统临时目录下的 `crm_platform_test_lake`。设置 `TEST_S3_LAKE_URI=s3://crm-lake/platform-test` 后，租户隔离测试会在对象存储上再跑一遍，凭据取 `S3_*`，默认用 `docker/seaweedfs/s3.json` 里的开发账号；CI 会起 SeaweedFS 跑这组测试。对象存储上的测试数据不会自动清理。首次运行需要联网下载 DuckDB 的 ducklake、postgres 扩展。
 
 ---
 ## 技术栈

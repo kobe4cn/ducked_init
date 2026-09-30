@@ -12,6 +12,9 @@ ADR-0001 要求每个任务只挂载本租户的数据。实测发现只“挂�
 
 - 租户数据库角色的密码明文存在平台 PG（`tenant_lakes`），与 ADR-0007 中 TOTP 密钥同属“平台库访问权限即信任的根”。
 - 对象存储上的前缀隔离目前只靠 DuckDB 的 `allowed_directories`：工作进程拿到的是平台共用的 S3 密钥。改为按租户签发的受限凭据（如 STS / 前缀策略）是后续加固项。
+  在 SeaweedFS 上实测（DuckDB 1.5.5，`test/pipeline/pipeline.test.ts`）：直接读写其他租户的前缀、`glob`、改用存储服务的 http 地址都会被 DuckDB 拒绝，`duckdb_secrets()` 里的密钥是打码的。
+  但 DuckDB 不规范化 S3 路径里的 `..`：`<本租户前缀>../<其他租户 ID>/…` 能通过 `allowed_directories` 检查，SeaweedFS 因签名与规范化后的路径对不上而返回 403，才没有读到数据。
+  换用其他对象存储或在前面加代理时，这条防线需要重新确认；按租户签发的受限凭据能从根本上堵住它。
 - 平台 PG 需要 15 及以上版本（更早的版本默认允许所有角色在 `public` schema 建表，租户之间会多出一条互通的渠道），平台账号需要 CREATEROLE 权限。
 - 租户角色仍能查询 `pg_catalog`，看得到其他 schema 的名称（即其他租户的 ID），看不到其中的内容。
 

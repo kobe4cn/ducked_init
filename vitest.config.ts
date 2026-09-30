@@ -8,6 +8,12 @@ process.env.PLATFORM_DATABASE_URL =
   process.env.TEST_PLATFORM_DATABASE_URL ?? 'postgres://crm:crm@localhost:5432/crm_platform_test';
 // 租户数据湖的根目录：测试用本地临时目录（测试会清空）
 process.env.PLATFORM_LAKE_URI = join(tmpdir(), 'crm_platform_test_lake');
+// 设置 TEST_S3_LAKE_URI（如 s3://crm-lake/platform-test）后，隔离测试在对象存储上再跑一遍。
+// 凭据取 S3_*，未设置时用 docker/seaweedfs/s3.json 里的开发账号
+if (process.env.TEST_S3_LAKE_URI) {
+  process.env.S3_ACCESS_KEY ??= 'crm';
+  process.env.S3_SECRET_KEY ??= 'crm-secret';
+}
 
 // 测试不走 vite.config.ts（reactRouter 插件由 HTTP 接缝自己起的 vite 服务加载）
 export default defineConfig({

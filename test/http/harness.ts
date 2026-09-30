@@ -116,7 +116,8 @@ export async function resetDb() {
   for (const r of rows) await client.query(`DROP SCHEMA IF EXISTS "${r.catalog_schema}" CASCADE; DROP ROLE IF EXISTS "${r.db_role}"`);
   await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions, platform.tenant_lakes, platform.tasks CASCADE');
   await client.end();
-  await rm(process.env.PLATFORM_LAKE_URI!, { recursive: true, force: true });
+  // 对象存储上的数据不清：租户 ID 每次不同，前缀不会重叠
+  if (!process.env.PLATFORM_LAKE_URI!.startsWith('s3://')) await rm(process.env.PLATFORM_LAKE_URI!, { recursive: true, force: true });
 }
 
 /** 以运营者身份执行命令行（与 npm run tenant:create 相同的入口） */
