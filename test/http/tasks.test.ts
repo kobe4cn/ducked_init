@@ -3,7 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { eq } from 'drizzle-orm';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { tasks } from '../../app/.server/db/schema';
 import { getTenantLake, tenantDataPath } from '../../app/.server/lake';
 import { requestLakeMigration } from '../../app/.server/lake-migration';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -63,6 +65,25 @@ describe('成员查看本租户的任务', () => {
     expect(seed.html).toContain('data-result-table="orders"');
     expect(seed.html).toMatch(/内存 \d+(\.\d+)? ?\w+ · 2 线程/);
     expect(inventory.html).toContain('数据湖里还没有表');
+  });
+
+  it('同步与核对任务的结果按表展示，读不到行数的表不报错', async () => {
+    const acme = await newTenant('acme');
+    const finish = async (kind: string, result: Record<string, unknown>) => {
+      const task = await enqueueTask(acme, kind, { sourceId: 'x' });
+      await getDb().update(tasks).set({ status: 'succeeded', result, finishedAt: new Date() }).where(eq(tasks.id, task.id));
+    };
+    await finish('source.sync', { tables: [{ table: 'orders', rows: 3 }, { table: 'gone_table', error: '源端已没有这张表', gone: true }] });
+    await finish('source.verify', { tables: [{ table: 'customers', sourceRows: 12, ok: true }, { table: 'secret', sourceRows: null, ok: null }], differences: 0 });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const res = await admin.get('/tasks');
+    expect(res.status).toBe(200);
+    const [verify, sync] = taskRows(await res.text());
+    expect(verify.html).toMatch(/data-result-table="customers"[\s\S]*?>12 行</);
+    expect(verify.html).toMatch(/data-result-table="secret"[\s\S]*?>—</);
+    expect(sync.html).toMatch(/data-result-table="orders"[\s\S]*?>3 行</);
+    expect(sync.html).toMatch(/data-result-table="gone_table"[\s\S]*?>—</);
   });
 });
 

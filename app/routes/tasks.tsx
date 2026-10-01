@@ -12,10 +12,26 @@ export function meta({}: Route.MetaArgs) {
   return [{ title: '任务 · CRM 数据分析平台' }];
 }
 
-// 工作进程回传的结果（pipeline/worker.ts）：各类任务都带本租户数据湖的表与行数，以及运行时生效的配额
-interface TaskResult {
-  tables?: { name: string; rows: number }[];
+// 工作进程回传的结果（pipeline/worker.ts）：各类任务都带按表的结果与运行时生效的配额。各类任务的表结构不同：
+// 盘点与采集是 { name, rows }，同步是 { table, rows }（失败或源端已删除的表没有 rows），核对是 { table, sourceRows }
+type RawTable = { name?: string; table?: string; rows?: unknown; sourceRows?: unknown };
+interface RawResult {
+  tables?: RawTable[];
   engine?: { memoryLimit: string; threads: number };
+}
+interface TaskResult {
+  /** rows 为 null：这张表没有行数（同步失败、源端已删除、核对时读不了） */
+  tables: { name: string; rows: number | null }[];
+  engine?: RawResult['engine'];
+}
+
+function taskResult(raw: RawResult | null): TaskResult | null {
+  if (!raw) return null;
+  const tables = (Array.isArray(raw.tables) ? raw.tables : []).map(t => {
+    const rows = t.rows ?? t.sourceRows;
+    return { name: String(t.name ?? t.table ?? ''), rows: typeof rows === 'number' ? rows : null };
+  });
+  return { tables, engine: raw.engine };
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -32,7 +48,7 @@ export async function loader({ request }: Route.LoaderArgs) {
       status: t.status,
       statusLabel: TASK_STATUS_LABELS[t.status],
       error: t.error,
-      result: t.status === 'succeeded' ? (t.result as TaskResult | null) : null,
+      result: t.status === 'succeeded' ? taskResult(t.result as RawResult | null) : null,
       createdAt: t.createdAt.toISOString(),
       startedAt: t.startedAt?.toISOString() ?? null,
       finishedAt: t.finishedAt?.toISOString() ?? null,
@@ -43,7 +59,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 const STATUS_VARIANTS = { queued: 'outline', running: 'secondary', succeeded: 'default', failed: 'destructive' } as const;
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
-function ResultDetails({ result: { tables = [], engine } }: { result: TaskResult }) {
+function ResultDetails({ result: { tables, engine } }: { result: TaskResult }) {
   return (
     <details className="text-xs text-muted-foreground">
       <summary className="cursor-pointer select-none">查看结果</summary>
@@ -52,7 +68,7 @@ function ResultDetails({ result: { tables = [], engine } }: { result: TaskResult
           <ul>
             {tables.map(t => (
               <li key={t.name} data-result-table={t.name}>
-                {`${t.name}：`}<span className="text-foreground">{`${t.rows.toLocaleString('zh-CN')} 行`}</span>
+                {`${t.name}：`}<span className="text-foreground">{t.rows === null ? '—' : `${t.rows.toLocaleString('zh-CN')} 行`}</span>
               </li>
             ))}
           </ul>
