@@ -98,10 +98,10 @@ export const HANDLERS = {
   'source.sync': {
     label: '同步数据源',
     attachSource: true,
-    async run(_con, params, { source, session, redact }) {
+    async run(_con, params, { source, session, limits, redact }) {
       if (!source) throw new Error('缺少数据源');
       if (typeof params.sourceId !== 'string') throw new Error('缺少参数 sourceId');
-      const tables = await syncSourceTables(session, source, params.sourceId, syncTables(params), redact);
+      const tables = await syncSourceTables(session, source, params.sourceId, syncTables(params), limits, redact);
       const failed = tables.filter(t => 'error' in t);
       if (failed.length) {
         throw new PartialFailure(`${failed.length} 张表同步失败：${failed.map(t => `${t.table}（${'error' in t ? t.error : ''}）`).join('；')}`, { tables });

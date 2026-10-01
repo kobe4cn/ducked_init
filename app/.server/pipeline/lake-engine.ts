@@ -16,7 +16,7 @@ export interface LakeSpec {
 }
 
 /** 超出内存上限时溢写到本机临时目录，溢写量以内存上限的这个倍数为限 */
-const SPILL_RATIO = 10;
+export const SPILL_RATIO = 10;
 
 /** 按租户配额限制的计算资源 */
 export interface EngineLimits { memoryLimitMb: number; threads: number }
@@ -40,7 +40,8 @@ const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 /**
  * 挂载租户数据湖（给了 source 时再只读挂载该数据源，ADR-0012）后锁住配置：只能读写本租户的存储前缀，不能再挂载其他库、读其他路径，也不能改回这些设置。
  * catalog 的数据库角色只能访问本租户的 schema，因此经 DuckLake 内部的 PG 连接也读不到其他租户与平台元数据。
- * 大批次、比对等超出内存上限时溢写到本次会话专用的本机临时目录（ADR-0010），关闭会话即删除
+ * 大批次、比对等超出内存上限时溢写到本次会话专用的本机临时目录（ADR-0010），关闭会话即删除。
+ * 同一目录下另挂一个本机库 stage，暂存同步时从源端读到的行：落盘时压缩，不占溢写配额（ADR-0010）
  */
 export async function openTenantLake(spec: LakeSpec, limits: EngineLimits, source?: SourceSpec): Promise<TenantLakeSession> {
   const instance = await DuckDBInstance.create(':memory:', {
@@ -52,7 +53,8 @@ export async function openTenantLake(spec: LakeSpec, limits: EngineLimits, sourc
   const close = () => { con.closeSync(); instance.closeSync(); rmSync(spill, { recursive: true, force: true }); };
   try {
     await con.run(`INSTALL ducklake; LOAD ducklake; INSTALL postgres; LOAD postgres;
-      SET temp_directory = ${lit(spill)}; SET max_temp_directory_size = '${limits.memoryLimitMb * SPILL_RATIO}MiB';`);
+      SET temp_directory = ${lit(spill)}; SET max_temp_directory_size = '${limits.memoryLimitMb * SPILL_RATIO}MiB';
+      ATTACH ${lit(join(spill, 'stage.duckdb'))} AS stage;`);
     if (spec.s3) {
       const s = spec.s3;
       await con.run(`INSTALL httpfs; LOAD httpfs;

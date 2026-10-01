@@ -375,6 +375,27 @@ describe('全量比对（没有水位线的表）', () => {
     });
   });
 
+  it('还没有镜像的表（加入整行比对之前同步过的）第一次比对时由原始层回放出镜像', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, engineer, id } = await pgSourceWithWatermarks(`
+        CREATE TABLE shop.visits (visitor text NOT NULL, page text NOT NULL, updated_at timestamp NOT NULL);
+        INSERT INTO shop.visits SELECT 'v' || i, '/home', TIMESTAMP '2024-06-01' + i * INTERVAL '1 hour' FROM generate_series(1, 5) i;
+        INSERT INTO shop.visits SELECT 'v1', '/home', TIMESTAMP '2024-06-01 01:00';
+        GRANT SELECT ON shop.visits TO ${READER.user};`);
+      await confirmWatermark(engineer, id, 'visits', 'updated_at');
+      await sync(engineer, id);
+      const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+      await session.con.run(`DROP TABLE "${bronzeSchema(id)}_mirror".visits`);
+      session.close();
+
+      await grantOnSource(`DELETE FROM shop.visits WHERE ctid = (SELECT min(ctid) FROM shop.visits WHERE visitor = 'v1')`);
+      await sync(engineer, id);
+      expect((await historyOf(engineer, id, 'visits')).slice(0, 2).map(h => 'batch' in h && [h.batch, h.mode, h.inserted, h.deleted])).toEqual([
+        [3, 'compare', 0, 1], [2, 'incremental', 0, 0],
+      ]);
+    });
+  });
+
   it('声明了软删除字段的表按该字段产出删除；比对主键全集时不把已标记删除的行补回来', async () => {
     await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
       const { acme, engineer, id } = await pgSourceWithWatermarks('ALTER TABLE shop.customers ADD COLUMN deleted_at timestamp');
@@ -420,6 +441,30 @@ describe('全量比对超出内存上限', () => {
     await sync(engineer, id);
     expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 2, inserted: 3, deleted: 30 });
   });
+
+  it('源表远大于溢写配额时也能比对：读到的行暂存在本机文件里，按整行哈希分桶比对', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const path = await duckdbSourceFile(acme);
+    const onSource = async (sql: string) => {
+      const instance = await DuckDBInstance.create(path);
+      const con = await instance.connect();
+      await con.run(sql);
+      con.closeSync();
+      instance.closeSync();
+    };
+    // 2000 万行、没有主键：不压缩地放在临时表里就超过 64 MB 内存配额对应的 640 MB 溢写上限
+    await onSource(`CREATE TABLE lines AS SELECT i // 5000 AS order_id, 'SKU' || lpad((i % 70001)::VARCHAR, 6, '0') AS sku, (i % 4) + 1 AS qty FROM range(20000000) t(i)`);
+    const { id } = await registerSource(engineer, { kind: 'duckdb', name: '明细文件', path: 'shop.duckdb' });
+    await drain();
+    await getDb().update(tenants).set({ memoryLimitMb: 64, threads: 1 }).where(eq(tenants.id, acme));
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 1, mode: 'compare', inserted: 20_000_000 });
+
+    await onSource(`DELETE FROM lines WHERE order_id = 0; UPDATE lines SET qty = 9 WHERE order_id = 1 AND qty = 1`);
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 2, inserted: 1250, deleted: 6250 });
+  }, 600_000);
 });
 
 describe('手动触发同步', () => {

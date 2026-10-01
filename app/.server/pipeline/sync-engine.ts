@@ -7,7 +7,7 @@
 // 用来判断新增还是更新、去掉回看重读到的未变化行，全表读取时找出源端已删除的主键，以及每天比对主键全集。
 // 没有主键的表另在 <schema>_mirror 里保存当前镜像：源表当前的每一行（重复行各一行）及其整行哈希，全表读取时按整行多重集比对
 import type { DuckDBConnection } from '@duckdb/node-api';
-import type { EngineLimits, TenantLakeSession } from './lake-engine';
+import { SPILL_RATIO, type EngineLimits, type TenantLakeSession } from './lake-engine';
 import { openSource, primaryKeys, redactSourceSecrets, writeGrants, type SourceSpec, type SourceTable, type WatermarkKind } from './source-engine';
 
 /**
@@ -80,6 +80,15 @@ const KEYS_PER_QUERY = 1000;
 const MAX_KEYS_BY_QUERY = 20_000;
 /** 平台为原始层表追加的列（除此之外都是源表的列） */
 const PLATFORM_COLUMNS = ['_op', '_commit_ts', '_batch', '_synced_at'];
+/** 本次读到的行（带整行哈希 _hash），暂存在会话的本机库 stage 里：落盘时压缩，不占溢写配额 */
+const INCOMING = 'stage.incoming';
+/** 整行多重集比对的中间结果：镜像的整行哈希、各整行哈希的出现次数之差、源端多出来的行、镜像多出来的行，同样暂存在 stage 里 */
+const MIRRORED = 'stage.mirrored';
+const DIFF = 'stage.diff';
+const ADDED = 'stage.added';
+const REMOVED = 'stage.removed';
+/** 按整行哈希分桶比对时，每 MiB 内存上限一个桶放多少个哈希（实测 2 GiB 放 3000 多万个仍不溢写，这里留一倍余量） */
+const HASHES_PER_MB = 8192;
 
 type Quote = (name: string) => string;
 
@@ -185,6 +194,7 @@ interface TableSync {
   /** 成员声明的软删除字段及其在 DuckDB 里的类型 */
   softDelete?: { column: string; type: string };
   options: SyncOptions;
+  limits: EngineLimits;
 }
 
 const targetOf = (t: TableSync) => `${ident(t.schema)}.${ident(t.table.name)}`;
@@ -247,7 +257,7 @@ async function ensureMirror(t: TableSync, columns: Column[]) {
     return;
   }
   if (!await tableExists(t.con, t.schema, t.table.name)) {
-    await t.con.run(`CREATE TABLE ${mirror} AS SELECT * FROM incoming LIMIT 0`);
+    await t.con.run(`CREATE TABLE ${mirror} AS SELECT * FROM ${INCOMING} LIMIT 0`);
     return;
   }
   const data = (await columnsOf(t.con, targetOf(t))).map(c => c.column_name).filter(c => !PLATFORM_COLUMNS.includes(c));
@@ -265,7 +275,7 @@ async function ensureMirror(t: TableSync, columns: Column[]) {
     CREATE TABLE ${mirror} AS
     WITH b AS (SELECT x.*, ${rowHash(data, 'x')} AS _hash FROM ${targetOf(t)} x),
     net AS (SELECT _hash, sum(CASE WHEN _op = 'delete' THEN -1 ELSE 1 END) AS _net FROM b GROUP BY _hash)
-    SELECT r.* EXCLUDE (${PLATFORM_COLUMNS.join(', ')}, _rn, _net)
+    SELECT r.* EXCLUDE (${PLATFORM_COLUMNS.join(', ')}, _rn)
     FROM (SELECT b.*, row_number() OVER (PARTITION BY b._hash ORDER BY b._batch DESC) AS _rn FROM b WHERE b._op <> 'delete') r
     JOIN net USING (_hash) WHERE r._rn <= net._net`);
   }
@@ -298,8 +308,8 @@ async function ensureKeyState(t: TableSync, hashed: string[]) {
 }
 
 /**
- * 在事务里：本批次写入的主键在当前主键状态里换成 incoming 中的最新一版，删除的主键移除
- * （整行哈希取 incoming 读取时算好的，与下次读到的比对口径一致）
+ * 在事务里：本批次写入的主键在当前主键状态里换成本次读到的最新一版，删除的主键移除
+ * （整行哈希取读取时算好的，与下次读到的比对口径一致）
  */
 async function updateKeyState(t: TableSync, batch: number) {
   const state = keyStateOf(t);
@@ -307,14 +317,14 @@ async function updateKeyState(t: TableSync, batch: number) {
   await t.con.run(`DELETE FROM ${state} USING ${written()} n WHERE ${joinOn(t.keys, state, 'n')}`);
   await t.con.run(`
     INSERT INTO ${state} SELECT ${keyList(t.keys, 'i')}, i._hash
-    FROM incoming i SEMI JOIN ${written(` AND _op <> 'delete'`)} n ON ${joinOn(t.keys, 'i', 'n')}`);
+    FROM ${INCOMING} i SEMI JOIN ${written(` AND _op <> 'delete'`)} n ON ${joinOn(t.keys, 'i', 'n')}`);
 }
 
 /** 主键在读到的行里必须非空且唯一（成员声明的业务主键只在声明时校验过） */
 async function assertKeysUnique(t: TableSync, columns: string[]) {
   const missing = t.keys.filter(k => !columns.includes(k));
   if (missing.length) throw new Error(`源表中没有主键字段 ${missing.join('、')}，请重新采集并确认`);
-  const problem = await keyViolation(t.con, build => `(${build(ident, 'incoming')})`, t.keys);
+  const problem = await keyViolation(t.con, build => `(${build(ident, INCOMING)})`, t.keys);
   if (problem) throw new Error(`${problem}，请换一个业务主键`);
 }
 
@@ -348,22 +358,66 @@ async function recordBatch(t: TableSync, record: Extract<SyncRecord, { batch: nu
 }
 
 /**
- * 在事务里：没有主键的表按整行多重集与当前镜像比对（diff 为各整行哈希在源端与镜像里出现次数之差）。
- * 源端多出来的行记为新增、镜像多出来的行记为删除（带整行），修改表现为一删一增；完全相同的重复行按出现次数计。
- * 随后镜像里这些哈希的行换成源端的
+ * 在写入数据湖的事务之前：没有主键的表按整行多重集与当前镜像比对，结果暂存在 stage 里。
+ * 各整行哈希在源端与镜像里出现次数之差按哈希分桶统计（每桶的哈希放得进内存，不必溢写），只留下有差异的哈希；
+ * 源端多出来的行（ADDED）与镜像多出来的行（REMOVED）按差值取够行数，完全相同的重复行按出现次数计。
+ * 镜像为空（首次同步）时读到的行都是新增，不必比对。返回源端多出来的行所在的关系
  */
-async function applyMultisetDiff(t: TableSync, batch: number, syncedAt: string) {
+async function stageMultisetDiff(t: TableSync) {
   const { con } = t;
   const mirror = mirrorOf(t);
-  const surplus = (from: string, sign: string) => `
-    SELECT r.* EXCLUDE (_hash, _rn, _delta) FROM (
-      SELECT x.*, d._delta, row_number() OVER (PARTITION BY x._hash) AS _rn
-      FROM ${from} x JOIN diff d ON d._hash = x._hash WHERE ${sign}d._delta > 0) r
-    WHERE r._rn <= ${sign}r._delta`;
-  await con.run(`INSERT INTO ${targetOf(t)} BY NAME SELECT r.*, ${batchColumns(t, `'insert'`, batch, syncedAt, 'r')} FROM (${surplus('incoming', '')}) r`);
-  await con.run(`INSERT INTO ${targetOf(t)} BY NAME SELECT r.*, ${batchColumns(t, `'delete'`, batch, syncedAt, 'r')} FROM (${surplus(mirror, '-')}) r`);
-  await con.run(`DELETE FROM ${mirror} WHERE _hash IN (SELECT _hash FROM diff)`);
-  await con.run(`INSERT INTO ${mirror} BY NAME SELECT i.* FROM incoming i SEMI JOIN diff d ON d._hash = i._hash`);
+  const count = async (relation: string) => Number((await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${relation}`))[0].n);
+  await con.run(`CREATE OR REPLACE TABLE ${DIFF} (_hash UBIGINT, _delta BIGINT, _n BIGINT)`);
+  await con.run(`CREATE OR REPLACE TABLE ${REMOVED} AS SELECT * FROM ${mirror} LIMIT 0`);
+  const mirrored = await count(mirror);
+  if (!mirrored) return INCOMING;
+
+  // 镜像的哈希先取到本机，分桶时不必反复读数据湖
+  await con.run(`CREATE OR REPLACE TABLE ${MIRRORED} AS SELECT _hash FROM ${mirror}`);
+  const buckets = Math.max(1, Math.ceil((await count(INCOMING) + mirrored) / (t.limits.memoryLimitMb * HASHES_PER_MB)));
+  const bucket = (column: string, b: number) => (buckets > 1 ? ` WHERE ${column} % ${buckets} = ${b}` : '');
+  for (let b = 0; b < buckets; b++) {
+    await con.run(`
+      INSERT INTO ${DIFF}
+      SELECT _hash, sum(s) AS _delta, count_if(s = 1) AS _n FROM (
+        SELECT _hash, 1 AS s FROM ${INCOMING}${bucket('_hash', b)}
+        UNION ALL SELECT _hash, -1 AS s FROM ${MIRRORED}${bucket('_hash', b)})
+      GROUP BY _hash HAVING sum(s) <> 0`);
+  }
+  await con.run(`DROP TABLE ${MIRRORED}`);
+
+  // 某个哈希在源端的行全是多出来的（最常见：新行）时整组都取，否则按差值取够行数
+  await con.run(`CREATE OR REPLACE TABLE ${ADDED} AS SELECT * FROM ${INCOMING} LIMIT 0`);
+  for (let b = 0; b < buckets; b++) {
+    const grown = `(SELECT * FROM ${DIFF}${bucket('_hash', b)}${buckets > 1 ? ' AND' : ' WHERE'} _delta > 0)`;
+    await con.run(`INSERT INTO ${ADDED} SELECT i.* FROM ${INCOMING} i JOIN ${grown} d ON d._hash = i._hash WHERE d._delta = d._n`);
+    await con.run(`
+      INSERT INTO ${ADDED} SELECT r.* EXCLUDE (_delta, _rn) FROM (
+        SELECT i.*, d._delta, row_number() OVER (PARTITION BY i._hash) AS _rn
+        FROM ${INCOMING} i JOIN ${grown} d ON d._hash = i._hash WHERE d._delta < d._n) r
+      WHERE r._rn <= r._delta`);
+  }
+  await con.run(`
+    INSERT INTO ${REMOVED} SELECT r.* EXCLUDE (_delta, _rn) FROM (
+      SELECT m.*, d._delta, row_number() OVER (PARTITION BY m._hash) AS _rn
+      FROM ${mirror} m JOIN (SELECT * FROM ${DIFF} WHERE _delta < 0) d ON d._hash = m._hash) r
+    WHERE r._rn <= -r._delta`);
+  return ADDED;
+}
+
+/**
+ * 在事务里：写入整行多重集比对的结果（stageMultisetDiff）。源端多出来的行记为新增、镜像多出来的行记为删除（带整行），
+ * 修改表现为一删一增。随后镜像跟上源端：有行减少的哈希换成源端的行，再追加多出来的行
+ */
+async function applyMultisetDiff(t: TableSync, added: string, batch: number, syncedAt: string) {
+  const { con } = t;
+  const mirror = mirrorOf(t);
+  const shrunk = `(SELECT _hash FROM ${DIFF} WHERE _delta < 0)`;
+  await con.run(`INSERT INTO ${targetOf(t)} BY NAME SELECT r.* EXCLUDE (_hash), ${batchColumns(t, `'insert'`, batch, syncedAt, 'r')} FROM ${added} r`);
+  await con.run(`INSERT INTO ${targetOf(t)} BY NAME SELECT r.* EXCLUDE (_hash), ${batchColumns(t, `'delete'`, batch, syncedAt, 'r')} FROM ${REMOVED} r`);
+  await con.run(`DELETE FROM ${mirror} WHERE _hash IN ${shrunk}`);
+  await con.run(`INSERT INTO ${mirror} BY NAME SELECT i.* FROM ${INCOMING} i SEMI JOIN ${shrunk} d ON d._hash = i._hash`);
+  await con.run(`INSERT INTO ${mirror} BY NAME SELECT * FROM ${added}`);
 }
 
 /**
@@ -395,26 +449,19 @@ async function syncTable(t: TableSync, compare = false): Promise<Extract<SyncRec
   const read = pushdown(spec, table, null, bound === null ? undefined : q => `${q(param.column!)} >= ${bound}`)
     ?? `(SELECT * FROM ${table.from}${readFrom === null ? '' : ` WHERE ${ident(param.column!)} >= ${cast(readFrom, wm!.column_type)}`})`;
   // 读取时一并算好整行哈希：比对、去重与更新当前主键状态都用它
-  await con.run(`CREATE OR REPLACE TEMP TABLE incoming AS SELECT r.*, ${rowHash(described.map(c => c.column_name), 'r')} AS _hash FROM ${read} r`);
+  await con.run(`CREATE OR REPLACE TABLE ${INCOMING} AS SELECT r.*, ${rowHash(described.map(c => c.column_name), 'r')} AS _hash FROM ${read} r`);
   try {
-    const columns = (await columnsOf(con, 'incoming')).filter(c => c.column_name !== '_hash');
+    const columns = (await columnsOf(con, INCOMING)).filter(c => c.column_name !== '_hash');
     const names = columns.map(c => c.column_name);
-    const staged = '(SELECT * EXCLUDE (_hash) FROM incoming)';
+    const staged = `(SELECT * EXCLUDE (_hash) FROM ${INCOMING})`;
     if (keys.length) await assertKeysUnique(t, names);
     const top = wm ? (await rows<{ top: string | null }>(con, `
-      SELECT greatest(${from === null ? 'NULL' : cast(from, wm.column_type)}, max(${ident(wm.column_name)}))::VARCHAR AS top FROM incoming`))[0].top : null;
+      SELECT greatest(${from === null ? 'NULL' : cast(from, wm.column_type)}, max(${ident(wm.column_name)}))::VARCHAR AS top FROM ${INCOMING}`))[0].top : null;
     const syncedAt = `TIMESTAMPTZ ${lit(startedAt.toISOString())}`;
     const multiset = !keys.length && !incremental;
-    // 没有主键的表先保证镜像存在（在写入数据湖的事务之外：一个事务只能写一个库，比对时还要写临时表 diff）
+    // 没有主键的表先保证镜像存在、整行比对好（在写入数据湖的事务之外：一个事务只能写一个库，比对结果暂存在 stage 里）
     if (!keys.length) await ensureMirror(t, columns);
-    if (multiset) {
-      await con.run(`
-        CREATE OR REPLACE TEMP TABLE diff AS
-        SELECT _hash, coalesce(s.n, 0) - coalesce(m.n, 0) AS _delta
-        FROM (SELECT _hash, count(*) AS n FROM incoming GROUP BY _hash) s
-        FULL JOIN (SELECT _hash, count(*) AS n FROM ${mirrorOf(t)} GROUP BY _hash) m USING (_hash)
-        WHERE coalesce(s.n, 0) <> coalesce(m.n, 0)`);
-    }
+    const added = multiset ? await stageMultisetDiff(t) : null;
 
     return await inTransaction(con, async () => {
       await ensureTarget(t, staged, columns);
@@ -426,32 +473,32 @@ async function syncTable(t: TableSync, compare = false): Promise<Extract<SyncRec
         await con.run(`
           INSERT INTO ${target} BY NAME
           SELECT i.* EXCLUDE (_hash), ${batchColumns(t, `CASE WHEN s._hash IS NULL THEN 'insert' ELSE 'update' END`, batch, syncedAt, 'i')}
-          FROM incoming i LEFT JOIN ${state} s ON ${joinOn(keys, 's', 'i')}
+          FROM ${INCOMING} i LEFT JOIN ${state} s ON ${joinOn(keys, 's', 'i')}
           WHERE ${isLive(t, 'i')} AND s._hash IS DISTINCT FROM i._hash`);
         if (t.softDelete) {
           await con.run(`
             INSERT INTO ${target} BY NAME SELECT i.* EXCLUDE (_hash), ${batchColumns(t, `'delete'`, batch, syncedAt, 'i', true)}
-            FROM incoming i SEMI JOIN ${state} s ON ${joinOn(keys, 's', 'i')} WHERE NOT (${isLive(t, 'i')})`);
+            FROM ${INCOMING} i SEMI JOIN ${state} s ON ${joinOn(keys, 's', 'i')} WHERE NOT (${isLive(t, 'i')})`);
         }
         if (!incremental) {
           await con.run(`
             INSERT INTO ${target} BY NAME SELECT ${keyList(keys, 's')}, ${batchColumns(t, `'delete'`, batch, syncedAt, 's')}
-            FROM ${state} s ANTI JOIN incoming i ON ${joinOn(keys, 's', 'i')}`);
+            FROM ${state} s ANTI JOIN ${INCOMING} i ON ${joinOn(keys, 's', 'i')}`);
         }
         await updateKeyState(t, batch);
       } else {
         await con.run(`DROP TABLE IF EXISTS ${keyStateOf(t)}`);
-        if (multiset) {
-          await applyMultisetDiff(t, batch, syncedAt);
+        if (added) {
+          await applyMultisetDiff(t, added, batch, syncedAt);
         } else {
           const inWindow = (alias: string) => `${alias}.${ident(param.column!)} <= ${cast(from!, wm!.column_type)}`;
           await con.run(`
-            INSERT INTO ${target} BY NAME SELECT i.* EXCLUDE (_hash), ${batchColumns(t, `'insert'`, batch, syncedAt, 'i')} FROM incoming i
+            INSERT INTO ${target} BY NAME SELECT i.* EXCLUDE (_hash), ${batchColumns(t, `'insert'`, batch, syncedAt, 'i')} FROM ${INCOMING} i
             WHERE NOT coalesce(${inWindow('i')} AND i._hash IN (
               SELECT ${rowHash(names, 'b')} FROM ${target} b
               WHERE b.${ident(param.column!)} >= ${cast(readFrom!, wm!.column_type)} AND ${inWindow('b')}), false)`);
           // 增量写入的行同样进入镜像，下次整行比对时才不会被当成新增
-          await con.run(`INSERT INTO ${mirrorOf(t)} BY NAME SELECT i.* FROM incoming i SEMI JOIN (
+          await con.run(`INSERT INTO ${mirrorOf(t)} BY NAME SELECT i.* FROM ${INCOMING} i SEMI JOIN (
             SELECT ${rowHash(names, 'b')} AS _hash FROM ${target} b WHERE b._batch = ${batch}) n ON n._hash = i._hash`);
         }
       }
@@ -469,7 +516,7 @@ async function syncTable(t: TableSync, compare = false): Promise<Extract<SyncRec
       }, startedAt, new Date());
     });
   } finally {
-    await con.run('DROP TABLE IF EXISTS incoming; DROP TABLE IF EXISTS diff');
+    await con.run([INCOMING, MIRRORED, DIFF, ADDED, REMOVED].map(r => `DROP TABLE IF EXISTS ${r};`).join(' '));
   }
 }
 
@@ -553,6 +600,13 @@ async function reconcileTable(t: TableSync, previous: Extract<SyncRecord, { batc
   }
 }
 
+/** DuckDB 内存或溢写空间不足时，在报错前说明租户的配额与处理办法 */
+function explain(message: string, limits: EngineLimits) {
+  if (!/Out of Memory/i.test(message)) return message;
+  return `超出租户的计算配额（单任务内存 ${limits.memoryLimitMb} MiB、线程 ${limits.threads}，溢写上限 ${limits.memoryLimitMb * SPILL_RATIO} MiB），`
+    + `请运营者在租户页提高单任务内存上限后重新同步；有水位线或主键时确认下来也能减少比对的开销。原始错误：${message}`;
+}
+
 /**
  * 同步数据源的若干张表（有水位线的增量读取，没有的全量比对），每张表一个变更批次、各自一个事务：一张表失败不影响其他表。
  * 增量同步的表到了比对周期时，紧接着再比对一次：有主键的比对主键全集，没有的整行全量比对。
@@ -560,8 +614,8 @@ async function reconcileTable(t: TableSync, previous: Extract<SyncRecord, { batc
  * redact 用来抹掉错误信息里的凭据
  */
 export async function syncSourceTables(
-  session: TenantLakeSession, spec: SourceSpec, sourceId: string, params: SyncTableParam[], redact: (message: string) => string,
-  options: SyncOptions = syncOptionsFromEnv(),
+  session: TenantLakeSession, spec: SourceSpec, sourceId: string, params: SyncTableParam[], limits: EngineLimits,
+  redact: (message: string) => string, options: SyncOptions = syncOptionsFromEnv(),
 ): Promise<SyncRecord[]> {
   const { con, source } = session;
   if (!source) throw new Error('数据源没有挂载');
@@ -579,7 +633,7 @@ export async function syncSourceTables(
 
   const records: SyncRecord[] = [];
   const failed = (table: string, startedAt: Date, e: unknown): SyncRecord =>
-    ({ table, startedAt: startedAt.toISOString(), durationMs: Date.now() - startedAt.getTime(), error: redact((e as Error).message) });
+    ({ table, startedAt: startedAt.toISOString(), durationMs: Date.now() - startedAt.getTime(), error: redact(explain((e as Error).message, limits)) });
   for (const param of params) {
     let startedAt = new Date();
     const table = tables.find(t => t.name === param.name);
@@ -587,7 +641,7 @@ export async function syncSourceTables(
       if (!table) throw new Error(`数据源中已没有表 ${param.name}`);
       if (!table.readable) throw new Error(`账号没有表 ${param.name} 的读权限`);
       const keys = primary.get(param.name) ?? param.key ?? [];
-      const t: TableSync = { con, spec, schema, table, param, keys, options };
+      const t: TableSync = { con, spec, schema, table, param, keys, options, limits };
       if (param.softDelete) {
         if (!keys.length) throw new Error(`没有主键的表不能按软删除字段 ${param.softDelete} 产出删除，请先声明业务主键`);
         const column = (await columnsOf(con, `SELECT * FROM ${table.from}`)).find(c => c.column_name === param.softDelete);
