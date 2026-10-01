@@ -87,7 +87,13 @@ const MIRRORED = 'stage.mirrored';
 const DIFF = 'stage.diff';
 const ADDED = 'stage.added';
 const REMOVED = 'stage.removed';
-/** 按整行哈希分桶比对时，每 MiB 内存上限一个桶放多少个哈希（实测 2 GiB 放 3000 多万个仍不溢写，这里留一倍余量） */
+/** 按主键比对的中间结果：当前主键状态的本机副本、要写入的行及其操作类型、源端已经没有的主键 */
+const KEYED = 'stage.keyed';
+const CHANGED = 'stage.changed';
+const GONE = 'stage.gone';
+/** 由原始层重建镜像或主键状态时，原始层（带整行哈希）的本机副本 */
+const HISTORY = 'stage.history';
+/** 按哈希分桶时，每 MiB 内存上限一个桶放多少行（实测 2 GiB 放 3000 多万个哈希仍不溢写，这里留一倍余量） */
 const HASHES_PER_MB = 8192;
 
 type Quote = (name: string) => string;
@@ -120,19 +126,24 @@ function liveCondition(column: string, type: string) {
   return `${column} IS NULL`;
 }
 
-/**
- * 业务主键在源表中的问题：有空值或不唯一时返回说明（不唯一时带一个重复样例），没有问题时返回 null。
- * PostgreSQL 与 MySQL 在源端统计，只传回结果
- */
-async function keyViolation(con: DuckDBConnection, relation: (build: (q: Quote, from: string) => string) => string, keys: string[]) {
+type KeyCheck = (con: DuckDBConnection, relation: (build: (q: Quote, from: string) => string) => string, keys: string[]) => Promise<string | null>;
+
+/** 业务主键有空值时返回说明。PostgreSQL 与 MySQL 在源端统计，只传回结果 */
+const nullKeys: KeyCheck = async (con, relation, keys) => {
   const [{ n: nulls }] = await rows<{ n: string }>(con, `SELECT * FROM ${relation((q, from) =>
     `SELECT COUNT(*) AS n FROM ${from} WHERE ${keys.map(k => `${q(k)} IS NULL`).join(' OR ')}`)}`);
-  if (Number(nulls)) return `业务主键 ${keys.join('、')} 有 ${nulls} 行为空`;
+  return Number(nulls) ? `业务主键 ${keys.join('、')} 有 ${nulls} 行为空` : null;
+};
+
+/** 业务主键不唯一时返回说明，带一个重复样例 */
+const duplicateKey: KeyCheck = async (con, relation, keys) => {
   const [dup] = await rows<Record<string, unknown>>(con, `SELECT * FROM ${relation((q, from) =>
     `SELECT ${keys.map(q).join(', ')}, COUNT(*) AS n FROM ${from} GROUP BY ${keys.map(q).join(', ')} HAVING COUNT(*) > 1 LIMIT 1`)}`);
-  if (dup) return `业务主键 ${keys.join('、')} 在源表中不唯一（${keys.map(k => `${k}=${dup[k]}`).join(', ')} 出现 ${dup.n} 次）`;
-  return null;
-}
+  return dup ? `业务主键 ${keys.join('、')} 在源表中不唯一（${keys.map(k => `${k}=${dup[k]}`).join(', ')} 出现 ${dup.n} 次）` : null;
+};
+
+/** 业务主键在源表中的问题：有空值或不唯一时返回说明，没有问题时返回 null */
+const keyViolation: KeyCheck = async (con, relation, keys) => await nullKeys(con, relation, keys) ?? duplicateKey(con, relation, keys);
 
 /**
  * 成员声明业务主键时，在源端校验这个组合非空且唯一（要扫一遍源表，PostgreSQL 与 MySQL 在源端执行）。
@@ -212,6 +223,12 @@ const keyList = (keys: string[], alias?: string) => keys.map(k => (alias ? `${al
  */
 const rowHash = (columns: string[], alias: string) =>
   `hash(concat_ws(chr(31), ${[...columns].sort().map(c => `${lit(`${c}=`)} || ${alias}.${ident(c)}::VARCHAR`).join(', ')}))`;
+const count = async (con: DuckDBConnection, relation: string) => Number((await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${relation}`))[0].n);
+/** n 行按哈希分成几个桶：每桶放得进内存，不必溢写 */
+const bucketsFor = (t: TableSync, n: number) => Math.max(1, Math.ceil(n / (t.limits.memoryLimitMb * HASHES_PER_MB)));
+/** 第 b 个桶的条件：hashed 是整行哈希或主键的哈希（整数位宽不同的同一个值哈希相同）；只有一个桶时为 true */
+const inBucket = (hashed: string, buckets: number, b: number) => (buckets > 1 ? `${hashed} % ${buckets} = ${b}` : 'true');
+const keyHash = (keys: string[], alias: string) => `hash(${keyList(keys, alias)})`;
 
 /** 事务里执行：失败时回滚 */
 async function inTransaction<T>(con: DuckDBConnection, work: () => Promise<T>) {
@@ -248,84 +265,172 @@ async function ensureTarget(t: TableSync, staged: string, columns: Column[]) {
 /**
  * 保证没有主键的表的当前镜像存在，并有源表的全部列。没有时由原始层重建：此前有主键（当前主键状态还在）时，
  * 取状态里每个主键的最新一版（有主键时删除记录只带主键、更新不记旧版本的删除，不能按整行回放）；
- * 否则按整行哈希回放各批次（新增与更新加一次、删除减一次），每个哈希留下净出现次数那么多行
+ * 否则按整行哈希回放各批次（新增与更新加一次、删除减一次），每个哈希留下净出现次数那么多行。
+ * 原始层先连同整行哈希取到本机，再按主键或整行哈希分桶回放，在一个事务里写入镜像
  */
 async function ensureMirror(t: TableSync, columns: Column[]) {
+  const { con } = t;
   const mirror = mirrorOf(t);
-  if (await tableExists(t.con, `${t.schema}_mirror`, t.table.name)) {
-    await addColumns(t.con, mirror, columns);
+  if (await tableExists(con, `${t.schema}_mirror`, t.table.name)) {
+    await addColumns(con, mirror, columns);
     return;
   }
-  if (!await tableExists(t.con, t.schema, t.table.name)) {
-    await t.con.run(`CREATE TABLE ${mirror} AS SELECT * FROM ${INCOMING} LIMIT 0`);
+  if (!await tableExists(con, t.schema, t.table.name)) {
+    await con.run(`CREATE TABLE ${mirror} AS SELECT * FROM ${INCOMING} LIMIT 0`);
     return;
   }
-  const data = (await columnsOf(t.con, targetOf(t))).map(c => c.column_name).filter(c => !PLATFORM_COLUMNS.includes(c));
-  if (await tableExists(t.con, `${t.schema}_keys`, t.table.name)) {
-    const state = keyStateOf(t);
-    const keys = (await columnsOf(t.con, state)).map(c => c.column_name).filter(c => c !== '_hash');
-    await t.con.run(`
-      CREATE TABLE ${mirror} AS
-      SELECT r.* EXCLUDE (${PLATFORM_COLUMNS.join(', ')}, _rn) FROM (
-        SELECT b.*, ${rowHash(data, 'b')} AS _hash, row_number() OVER (PARTITION BY ${keyList(keys, 'b')} ORDER BY b._batch DESC) AS _rn
-        FROM ${targetOf(t)} b WHERE b._op <> 'delete') r
-      SEMI JOIN ${state} s ON ${joinOn(keys, 'r', 's')} WHERE r._rn = 1`);
-  } else {
-    await t.con.run(`
-    CREATE TABLE ${mirror} AS
-    WITH b AS (SELECT x.*, ${rowHash(data, 'x')} AS _hash FROM ${targetOf(t)} x),
-    net AS (SELECT _hash, sum(CASE WHEN _op = 'delete' THEN -1 ELSE 1 END) AS _net FROM b GROUP BY _hash)
-    SELECT r.* EXCLUDE (${PLATFORM_COLUMNS.join(', ')}, _rn)
-    FROM (SELECT b.*, row_number() OVER (PARTITION BY b._hash ORDER BY b._batch DESC) AS _rn FROM b WHERE b._op <> 'delete') r
-    JOIN net USING (_hash) WHERE r._rn <= net._net`);
-  }
-  await addColumns(t.con, mirror, columns);
+  const data = (await columnsOf(con, targetOf(t))).map(c => c.column_name).filter(c => !PLATFORM_COLUMNS.includes(c));
+  const keyed = await tableExists(con, `${t.schema}_keys`, t.table.name);
+  const keys = keyed ? (await columnsOf(con, keyStateOf(t))).map(c => c.column_name).filter(c => c !== '_hash') : [];
+  await con.run(`
+    CREATE OR REPLACE TABLE ${HISTORY} AS SELECT b.* EXCLUDE (_commit_ts, _synced_at), ${rowHash(data, 'b')} AS _hash
+    FROM ${targetOf(t)} b${keyed ? ` WHERE b._op <> 'delete'` : ''}`);
+  if (keyed) await con.run(`CREATE OR REPLACE TABLE ${KEYED} AS SELECT ${keyList(keys)} FROM ${keyStateOf(t)}`);
+  const buckets = bucketsFor(t, await count(con, HISTORY));
+  await inTransaction(con, async () => {
+    await con.run(`CREATE TABLE ${mirror} AS SELECT * EXCLUDE (_op, _batch) FROM ${HISTORY} LIMIT 0`);
+    for (let b = 0; b < buckets; b++) {
+      if (keyed) {
+        await con.run(`
+          INSERT INTO ${mirror} BY NAME SELECT r.* EXCLUDE (_op, _batch, _rn) FROM (
+            SELECT h.*, row_number() OVER (PARTITION BY ${keyList(keys, 'h')} ORDER BY h._batch DESC) AS _rn
+            FROM ${HISTORY} h WHERE ${inBucket(keyHash(keys, 'h'), buckets, b)}) r
+          SEMI JOIN (SELECT * FROM ${KEYED} s WHERE ${inBucket(keyHash(keys, 's'), buckets, b)}) s ON ${joinOn(keys, 'r', 's')}
+          WHERE r._rn = 1`);
+      } else {
+        await con.run(`
+          INSERT INTO ${mirror} BY NAME SELECT r.* EXCLUDE (_op, _batch, _rn) FROM (
+            SELECT h.*, row_number() OVER (PARTITION BY h._hash ORDER BY h._batch DESC) AS _rn
+            FROM ${HISTORY} h WHERE h._op <> 'delete' AND ${inBucket('h._hash', buckets, b)}) r
+          JOIN (
+            SELECT _hash, sum(CASE WHEN _op = 'delete' THEN -1 ELSE 1 END) AS _net
+            FROM ${HISTORY} WHERE ${inBucket('_hash', buckets, b)} GROUP BY _hash) n ON n._hash = r._hash
+          WHERE r._rn <= n._net`);
+      }
+    }
+  });
+  await con.run(`DROP TABLE ${HISTORY}; DROP TABLE IF EXISTS ${KEYED}`);
+  await addColumns(con, mirror, columns);
 }
 
 /**
- * 在事务里：保证当前主键状态存在且按当前主键组织。没有（首次同步、此前没有主键）或主键变了（成员改了业务主键）时重建：
+ * 保证当前主键状态存在且按当前主键组织。没有（首次同步、此前没有主键）或主键变了（成员改了业务主键）时重建：
  * 此前没有主键、当前镜像还在时由镜像接续（整行比对的删除可能比新版本晚几个批次才记下，按批次取最新一版会把主键当成已删除）；
- * 否则由原始层重建，每个主键取最新一版（同一批次里一删一增时取新增），去掉最新一版是删除的
+ * 否则由原始层重建，每个主键取最新一版（同一批次里一删一增时取新增），去掉最新一版是删除的。
+ * 镜像或原始层先取到本机，再按主键的哈希分桶，在一个事务里写入主键状态
  */
-async function ensureKeyState(t: TableSync, hashed: string[]) {
+async function ensureKeyState(t: TableSync, columns: Column[]) {
+  const { con, keys } = t;
   const state = keyStateOf(t);
-  if (await tableExists(t.con, `${t.schema}_keys`, t.table.name)) {
-    const current = (await columnsOf(t.con, state)).map(c => c.column_name).filter(c => c !== '_hash');
-    if (current.join('\u0000') === t.keys.join('\u0000')) return;
-    await t.con.run(`DROP TABLE ${state}`);
+  if (await tableExists(con, `${t.schema}_keys`, t.table.name)) {
+    const current = (await columnsOf(con, state)).map(c => c.column_name).filter(c => c !== '_hash');
+    if (current.join('\u0000') === keys.join('\u0000')) return;
+    await con.run(`DROP TABLE ${state}`);
   }
-  if (await tableExists(t.con, `${t.schema}_mirror`, t.table.name)) {
-    await t.con.run(`
-      CREATE TABLE ${state} AS SELECT ${keyList(t.keys, 'm')}, m._hash
-      FROM (SELECT *, row_number() OVER (PARTITION BY ${keyList(t.keys)}) AS _rn FROM ${mirrorOf(t)}) m WHERE m._rn = 1`);
+  const mirrored = await tableExists(con, `${t.schema}_mirror`, t.table.name);
+  if (!mirrored && !await tableExists(con, t.schema, t.table.name)) {
+    await con.run(`CREATE TABLE ${state} AS SELECT ${keyList(keys)}, _hash FROM ${INCOMING} LIMIT 0`);
     return;
   }
-  await t.con.run(`
-    CREATE TABLE ${state} AS
-    SELECT ${keyList(t.keys, 'b')}, ${rowHash(hashed, 'b')} AS _hash
-    FROM (SELECT *, row_number() OVER (PARTITION BY ${keyList(t.keys)} ORDER BY _batch DESC, _op = 'delete') AS _rn FROM ${targetOf(t)}) b
-    WHERE b._rn = 1 AND b._op <> 'delete'`);
+  if (mirrored) {
+    await con.run(`CREATE OR REPLACE TABLE ${HISTORY} AS SELECT ${keyList(keys)}, _hash FROM ${mirrorOf(t)}`);
+  } else {
+    // 原始层还没有的新字段在旧行里为空，整行哈希里本来就不计
+    const known = new Set((await columnsOf(con, targetOf(t))).map(c => c.column_name));
+    const hashed = columns.map(c => c.column_name).filter(c => known.has(c));
+    await con.run(`
+      CREATE OR REPLACE TABLE ${HISTORY} AS SELECT ${keyList(keys, 'b')}, b._batch, b._op, ${rowHash(hashed, 'b')} AS _hash FROM ${targetOf(t)} b`);
+  }
+  const buckets = bucketsFor(t, await count(con, HISTORY));
+  await inTransaction(con, async () => {
+    await con.run(`CREATE TABLE ${state} AS SELECT ${keyList(keys)}, _hash FROM ${HISTORY} LIMIT 0`);
+    for (let b = 0; b < buckets; b++) {
+      const bucket = inBucket(keyHash(keys, 'h'), buckets, b);
+      await con.run(mirrored
+        ? `INSERT INTO ${state} SELECT ${keyList(keys, 'h')}, any_value(h._hash) FROM ${HISTORY} h WHERE ${bucket} GROUP BY ${keyList(keys, 'h')}`
+        : `INSERT INTO ${state} SELECT ${keyList(keys, 'r')}, r._hash FROM (
+            SELECT h.*, row_number() OVER (PARTITION BY ${keyList(keys, 'h')} ORDER BY h._batch DESC, h._op = 'delete') AS _rn
+            FROM ${HISTORY} h WHERE ${bucket}) r
+          WHERE r._rn = 1 AND r._op <> 'delete'`);
+    }
+  });
+  await con.run(`DROP TABLE ${HISTORY}`);
 }
 
 /**
- * 在事务里：本批次写入的主键在当前主键状态里换成本次读到的最新一版，删除的主键移除
- * （整行哈希取读取时算好的，与下次读到的比对口径一致）
+ * 在写入数据湖的事务之前：有主键的表按主键与当前主键状态比对，结果暂存在 stage 里。CHANGED 是要写入的行及其操作类型：
+ * 新增、更新，以及软删除字段标记为删除、主键状态里还有的行；全表读取时 GONE 是主键状态里有、源端已经没有的主键。
+ * 全表读取时主键状态先取到本机，两边按主键的哈希分桶比对；增量读取的行不多，直接与数据湖里的主键状态比对。
+ * 主键状态为空（首次同步）时读到的行都是新增，不必比对。
+ * 返回要写入的行所在的关系，以及主键状态里要换掉的主键数（主键状态为空时为 0）
  */
-async function updateKeyState(t: TableSync, batch: number) {
+async function stageKeyedDiff(t: TableSync, incremental: boolean) {
+  const { con, keys } = t;
   const state = keyStateOf(t);
-  const written = (where = '') => `(SELECT ${keyList(t.keys)} FROM ${targetOf(t)} WHERE _batch = ${batch}${where})`;
-  await t.con.run(`DELETE FROM ${state} USING ${written()} n WHERE ${joinOn(t.keys, state, 'n')}`);
-  await t.con.run(`
-    INSERT INTO ${state} SELECT ${keyList(t.keys, 'i')}, i._hash
-    FROM ${INCOMING} i SEMI JOIN ${written(` AND _op <> 'delete'`)} n ON ${joinOn(t.keys, 'i', 'n')}`);
+  await con.run(`CREATE OR REPLACE TABLE ${GONE} AS SELECT ${keyList(keys)} FROM ${INCOMING} LIMIT 0`);
+  const stated = await count(con, state);
+  if (!stated) return { changed: `(SELECT i.*, 'insert' AS _op FROM ${INCOMING} i WHERE ${isLive(t, 'i')})`, replaced: 0 };
+
+  let known = state;
+  let buckets = 1;
+  if (!incremental) {
+    await con.run(`CREATE OR REPLACE TABLE ${KEYED} AS SELECT * FROM ${state}`);
+    known = KEYED;
+    buckets = bucketsFor(t, await count(con, INCOMING) + stated);
+  }
+  await con.run(`CREATE OR REPLACE TABLE ${CHANGED} AS SELECT *, NULL::VARCHAR AS _op FROM ${INCOMING} LIMIT 0`);
+  for (let b = 0; b < buckets; b++) {
+    const read = `(SELECT * FROM ${INCOMING} i WHERE ${inBucket(keyHash(keys, 'i'), buckets, b)})`;
+    const held = `(SELECT * FROM ${known} s WHERE ${inBucket(keyHash(keys, 's'), buckets, b)})`;
+    await con.run(`
+      INSERT INTO ${CHANGED} BY NAME SELECT i.*, CASE WHEN s._hash IS NULL THEN 'insert' ELSE 'update' END AS _op
+      FROM ${read} i LEFT JOIN ${held} s ON ${joinOn(keys, 's', 'i')}
+      WHERE ${isLive(t, 'i')} AND s._hash IS DISTINCT FROM i._hash`);
+    if (t.softDelete) {
+      await con.run(`
+        INSERT INTO ${CHANGED} BY NAME SELECT i.*, 'delete' AS _op
+        FROM ${read} i SEMI JOIN ${held} s ON ${joinOn(keys, 's', 'i')} WHERE NOT (${isLive(t, 'i')})`);
+    }
+    if (!incremental) {
+      await con.run(`INSERT INTO ${GONE} SELECT ${keyList(keys, 's')} FROM ${held} s ANTI JOIN ${read} i ON ${joinOn(keys, 's', 'i')}`);
+    }
+  }
+  if (known === KEYED) await con.run(`DROP TABLE ${KEYED}`);
+  return { changed: CHANGED, replaced: await count(con, CHANGED) + await count(con, GONE) };
 }
 
-/** 主键在读到的行里必须非空且唯一（成员声明的业务主键只在声明时校验过） */
+/**
+ * 在事务里：写入主键比对的结果（stageKeyedDiff），随后主键状态跟上源端：写入与删除的主键先移除（按主键的哈希分桶），
+ * 再放入新增与更新的行（整行哈希取读取时算好的，与下次读到的比对口径一致）
+ */
+async function applyKeyedDiff(t: TableSync, changed: string, replaced: number, batch: number, syncedAt: string) {
+  const { con, keys } = t;
+  const state = keyStateOf(t);
+  await con.run(`INSERT INTO ${targetOf(t)} BY NAME SELECT c.* EXCLUDE (_hash, _op), ${batchColumns(t, 'c._op', batch, syncedAt, 'c')} FROM ${changed} c`);
+  await con.run(`INSERT INTO ${targetOf(t)} BY NAME SELECT g.*, ${batchColumns(t, `'delete'`, batch, syncedAt, 'g')} FROM ${GONE} g`);
+  const buckets = bucketsFor(t, replaced);
+  for (let b = 0; replaced && b < buckets; b++) {
+    await con.run(`
+      DELETE FROM ${state} USING (
+        SELECT ${keyList(keys, 'c')} FROM ${changed} c WHERE ${inBucket(keyHash(keys, 'c'), buckets, b)}
+        UNION ALL SELECT ${keyList(keys, 'g')} FROM ${GONE} g WHERE ${inBucket(keyHash(keys, 'g'), buckets, b)}) n
+      WHERE ${joinOn(keys, state, 'n')}`);
+  }
+  await con.run(`INSERT INTO ${state} SELECT ${keyList(keys, 'c')}, c._hash FROM ${changed} c WHERE c._op <> 'delete'`);
+}
+
+/** 主键在读到的行里必须非空且唯一（成员声明的业务主键只在声明时校验过）。按主键的哈希分桶找重复 */
 async function assertKeysUnique(t: TableSync, columns: string[]) {
   const missing = t.keys.filter(k => !columns.includes(k));
   if (missing.length) throw new Error(`源表中没有主键字段 ${missing.join('、')}，请重新采集并确认`);
-  const problem = await keyViolation(t.con, build => `(${build(ident, INCOMING)})`, t.keys);
+  const problem = await nullKeys(t.con, build => `(${build(ident, INCOMING)})`, t.keys);
   if (problem) throw new Error(`${problem}，请换一个业务主键`);
+  const buckets = bucketsFor(t, await count(t.con, INCOMING));
+  for (let b = 0; b < buckets; b++) {
+    const read = `(SELECT * FROM ${INCOMING} i WHERE ${inBucket(keyHash(t.keys, 'i'), buckets, b)})`;
+    const duplicate = await duplicateKey(t.con, build => `(${build(ident, read)})`, t.keys);
+    if (duplicate) throw new Error(`${duplicate}，请换一个业务主键`);
+  }
 }
 
 /**
@@ -366,22 +471,20 @@ async function recordBatch(t: TableSync, record: Extract<SyncRecord, { batch: nu
 async function stageMultisetDiff(t: TableSync) {
   const { con } = t;
   const mirror = mirrorOf(t);
-  const count = async (relation: string) => Number((await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${relation}`))[0].n);
   await con.run(`CREATE OR REPLACE TABLE ${DIFF} (_hash UBIGINT, _delta BIGINT, _n BIGINT)`);
   await con.run(`CREATE OR REPLACE TABLE ${REMOVED} AS SELECT * FROM ${mirror} LIMIT 0`);
-  const mirrored = await count(mirror);
+  const mirrored = await count(con, mirror);
   if (!mirrored) return INCOMING;
 
   // 镜像的哈希先取到本机，分桶时不必反复读数据湖
   await con.run(`CREATE OR REPLACE TABLE ${MIRRORED} AS SELECT _hash FROM ${mirror}`);
-  const buckets = Math.max(1, Math.ceil((await count(INCOMING) + mirrored) / (t.limits.memoryLimitMb * HASHES_PER_MB)));
-  const bucket = (column: string, b: number) => (buckets > 1 ? ` WHERE ${column} % ${buckets} = ${b}` : '');
+  const buckets = bucketsFor(t, await count(con, INCOMING) + mirrored);
   for (let b = 0; b < buckets; b++) {
     await con.run(`
       INSERT INTO ${DIFF}
       SELECT _hash, sum(s) AS _delta, count_if(s = 1) AS _n FROM (
-        SELECT _hash, 1 AS s FROM ${INCOMING}${bucket('_hash', b)}
-        UNION ALL SELECT _hash, -1 AS s FROM ${MIRRORED}${bucket('_hash', b)})
+        SELECT _hash, 1 AS s FROM ${INCOMING} WHERE ${inBucket('_hash', buckets, b)}
+        UNION ALL SELECT _hash, -1 AS s FROM ${MIRRORED} WHERE ${inBucket('_hash', buckets, b)})
       GROUP BY _hash HAVING sum(s) <> 0`);
   }
   await con.run(`DROP TABLE ${MIRRORED}`);
@@ -389,7 +492,7 @@ async function stageMultisetDiff(t: TableSync) {
   // 某个哈希在源端的行全是多出来的（最常见：新行）时整组都取，否则按差值取够行数
   await con.run(`CREATE OR REPLACE TABLE ${ADDED} AS SELECT * FROM ${INCOMING} LIMIT 0`);
   for (let b = 0; b < buckets; b++) {
-    const grown = `(SELECT * FROM ${DIFF}${bucket('_hash', b)}${buckets > 1 ? ' AND' : ' WHERE'} _delta > 0)`;
+    const grown = `(SELECT * FROM ${DIFF} WHERE ${inBucket('_hash', buckets, b)} AND _delta > 0)`;
     await con.run(`INSERT INTO ${ADDED} SELECT i.* FROM ${INCOMING} i JOIN ${grown} d ON d._hash = i._hash WHERE d._delta = d._n`);
     await con.run(`
       INSERT INTO ${ADDED} SELECT r.* EXCLUDE (_delta, _rn) FROM (
@@ -459,33 +562,18 @@ async function syncTable(t: TableSync, compare = false): Promise<Extract<SyncRec
       SELECT greatest(${from === null ? 'NULL' : cast(from, wm.column_type)}, max(${ident(wm.column_name)}))::VARCHAR AS top FROM ${INCOMING}`))[0].top : null;
     const syncedAt = `TIMESTAMPTZ ${lit(startedAt.toISOString())}`;
     const multiset = !keys.length && !incremental;
-    // 没有主键的表先保证镜像存在、整行比对好（在写入数据湖的事务之外：一个事务只能写一个库，比对结果暂存在 stage 里）
-    if (!keys.length) await ensureMirror(t, columns);
+    // 先保证主键状态或镜像存在、比对好（在写入数据湖的事务之外：一个事务只能写一个库，比对结果暂存在 stage 里）
+    if (keys.length) await ensureKeyState(t, columns);
+    else await ensureMirror(t, columns);
+    const keyed = keys.length ? await stageKeyedDiff(t, incremental) : null;
     const added = multiset ? await stageMultisetDiff(t) : null;
 
     return await inTransaction(con, async () => {
       await ensureTarget(t, staged, columns);
-      if (keys.length) {
-        // 当前主键状态与镜像只保留正在维护的那一个：主键有无变化后，另一个会过时（主键状态可能要先由镜像接续）
-        await ensureKeyState(t, names);
+      if (keyed) {
+        // 当前主键状态与镜像只保留正在维护的那一个：主键有无变化后，另一个会过时（主键状态可能已由镜像接续）
         await con.run(`DROP TABLE IF EXISTS ${mirrorOf(t)}`);
-        const state = keyStateOf(t);
-        await con.run(`
-          INSERT INTO ${target} BY NAME
-          SELECT i.* EXCLUDE (_hash), ${batchColumns(t, `CASE WHEN s._hash IS NULL THEN 'insert' ELSE 'update' END`, batch, syncedAt, 'i')}
-          FROM ${INCOMING} i LEFT JOIN ${state} s ON ${joinOn(keys, 's', 'i')}
-          WHERE ${isLive(t, 'i')} AND s._hash IS DISTINCT FROM i._hash`);
-        if (t.softDelete) {
-          await con.run(`
-            INSERT INTO ${target} BY NAME SELECT i.* EXCLUDE (_hash), ${batchColumns(t, `'delete'`, batch, syncedAt, 'i', true)}
-            FROM ${INCOMING} i SEMI JOIN ${state} s ON ${joinOn(keys, 's', 'i')} WHERE NOT (${isLive(t, 'i')})`);
-        }
-        if (!incremental) {
-          await con.run(`
-            INSERT INTO ${target} BY NAME SELECT ${keyList(keys, 's')}, ${batchColumns(t, `'delete'`, batch, syncedAt, 's')}
-            FROM ${state} s ANTI JOIN ${INCOMING} i ON ${joinOn(keys, 's', 'i')}`);
-        }
-        await updateKeyState(t, batch);
+        await applyKeyedDiff(t, keyed.changed, keyed.replaced, batch, syncedAt);
       } else {
         await con.run(`DROP TABLE IF EXISTS ${keyStateOf(t)}`);
         if (added) {
@@ -516,7 +604,7 @@ async function syncTable(t: TableSync, compare = false): Promise<Extract<SyncRec
       }, startedAt, new Date());
     });
   } finally {
-    await con.run([INCOMING, MIRRORED, DIFF, ADDED, REMOVED].map(r => `DROP TABLE IF EXISTS ${r};`).join(' '));
+    await con.run([INCOMING, MIRRORED, DIFF, ADDED, REMOVED, KEYED, CHANGED, GONE, HISTORY].map(r => `DROP TABLE IF EXISTS ${r};`).join(' '));
   }
 }
 

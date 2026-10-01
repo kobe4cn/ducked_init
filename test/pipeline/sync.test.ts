@@ -262,6 +262,14 @@ describe('全量比对（没有水位线的表）', () => {
 
     await sync(engineer, id);
     expect((await historyOf(engineer, id, 'legacy_orders'))[0]).toMatchObject({ batch: 3, rows: 0 });
+
+    // 源端去掉主键后按整行比对：镜像由主键状态里各主键的最新一版接续，删除记录带整行
+    await grantOnSource(`ALTER TABLE shop.legacy_orders DROP CONSTRAINT legacy_orders_pkey; DELETE FROM shop.legacy_orders WHERE order_no = 'L4'`);
+    await sync(engineer, id);
+    const fourth = (await bronze(acme, id, 'legacy_orders', 'order_no')).filter(r => r._batch === 4);
+    expect(ops(fourth, 'order_no', 'amount')).toEqual([['L4', 40, 'delete']]);
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'legacy_orders'))[0]).toMatchObject({ batch: 5, rows: 0 });
   });
 
   it('没有唯一主键、含完全相同重复行的表按整行多重集比对：增删一条重复行恰好产出一条记录，修改一行产出一删一增', async () => {
@@ -464,7 +472,48 @@ describe('全量比对超出内存上限', () => {
     await onSource(`DELETE FROM lines WHERE order_id = 0; UPDATE lines SET qty = 9 WHERE order_id = 1 AND qty = 1`);
     await sync(engineer, id);
     expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 2, inserted: 1250, deleted: 6250 });
-  }, 600_000);
+
+    // 没有镜像时由原始层回放：同样按整行哈希分桶
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    await session.con.run(`DROP TABLE "${bronzeSchema(id)}_mirror".lines`);
+    session.close();
+    await onSource(`DELETE FROM lines WHERE order_id = 2`);
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 3, inserted: 0, deleted: 5000 });
+  }, 900_000);
+
+  it('有主键的大表全量比对、重建主键状态时按主键的哈希分桶，不超出溢写配额', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const path = await duckdbSourceFile(acme);
+    const onSource = async (sql: string) => {
+      const instance = await DuckDBInstance.create(path);
+      const con = await instance.connect();
+      await con.run(sql);
+      con.closeSync();
+      instance.closeSync();
+    };
+    await onSource(`CREATE TABLE lines AS SELECT i AS line_id, i // 5000 AS order_id, 'SKU' || lpad((i % 70001)::VARCHAR, 6, '0') AS sku, (i % 4) + 1 AS qty FROM range(20000000) t(i)`);
+    const { id } = await registerSource(engineer, { kind: 'duckdb', name: '明细文件', path: 'shop.duckdb' });
+    await drain();
+    await confirmKey(engineer, id, 'lines', ['line_id']);
+    await getDb().update(tenants).set({ memoryLimitMb: 64, threads: 1 }).where(eq(tenants.id, acme));
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 1, mode: 'compare', inserted: 20_000_000 });
+
+    await onSource(`DELETE FROM lines WHERE line_id < 1000; UPDATE lines SET qty = 9 WHERE line_id BETWEEN 1000 AND 1999;
+      INSERT INTO lines SELECT 20000000 + i, 4000, 'NEW', 1 FROM range(500) t(i)`);
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 2, inserted: 500, updated: 1000, deleted: 1000 });
+
+    // 主键状态没有时由原始层重建
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    await session.con.run(`DROP TABLE "${bronzeSchema(id)}_keys".lines`);
+    session.close();
+    await onSource(`UPDATE lines SET qty = 8 WHERE line_id = 5000`);
+    await sync(engineer, id);
+    expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 3, inserted: 0, updated: 1, deleted: 0 });
+  }, 900_000);
 });
 
 describe('手动触发同步', () => {
