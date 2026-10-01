@@ -7,3 +7,4 @@ node_modules/
 /build/
 /data/
 /wasm/public/app.js
+.env.test

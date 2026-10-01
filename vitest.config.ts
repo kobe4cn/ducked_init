@@ -1,7 +1,12 @@
 // vitest.config.ts —— 测试配置
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defineConfig } from 'vitest/config';
+
+// 本地的 .env.test（不提交，模板见 .env.test.example）：对象存储、MongoDB、MySQL 测试的连接；命令行里设置的同名变量优先
+const envTest = join(import.meta.dirname, '.env.test');
+if (existsSync(envTest)) process.loadEnvFile(envTest);
 
 // 测试用平台 PG（独立的库，测试会清表）。写进 process.env 使 globalSetup 与被测服务都能读到
 process.env.PLATFORM_DATABASE_URL =
