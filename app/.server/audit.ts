@@ -4,6 +4,7 @@ import type { CurrentMember } from './auth';
 import { getDb, type Db } from './db/client';
 import { auditLogs, ROLE_LABELS, SOURCE_KIND_LABELS, tenants, type Role, type SourceKind } from './db/schema';
 import { describeQuotaChange, type TenantQuota } from './quota';
+import { entityLabel } from '../lib/canonical-model';
 
 type Detail = Record<string, unknown>;
 const sourceKindLabel = (kind: unknown) => SOURCE_KIND_LABELS[kind as SourceKind] ?? String(kind);
@@ -58,6 +59,15 @@ const ACTIONS = {
   'source.watermark_confirmed': { label: '确认水位线', describe: (d: Detail) => `「${d.name}」${d.table}：${d.column}` },
   'source.key_confirmed': { label: '确认业务主键', describe: (d: Detail) => `「${d.name}」${d.table}：${d.column}` },
   'source.soft_delete_confirmed': { label: '确认软删除字段', describe: (d: Detail) => `「${d.name}」${d.table}：${d.column}` },
+  'mapping.drafted': {
+    label: '起草映射',
+    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版草稿`,
+  },
+  'mapping.published': {
+    label: '发布映射',
+    describe: (d: Detail) =>
+      `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
+  },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },

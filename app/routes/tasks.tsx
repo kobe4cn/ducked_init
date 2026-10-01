@@ -3,6 +3,7 @@ import type { Route } from './+types/tasks';
 import { requireMember } from '~/.server/auth';
 import { navFor } from '~/.server/nav';
 import { listTasks, TASK_PAGE_SIZE, TASK_STATUS_LABELS } from '~/.server/tasks';
+import { entityLabel } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
 import { Badge } from '~/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
@@ -13,10 +14,13 @@ export function meta({}: Route.MetaArgs) {
 }
 
 // 工作进程回传的结果（pipeline/worker.ts）：各类任务都带按表的结果与运行时生效的配额。各类任务的表结构不同：
-// 盘点与采集是 { name, rows }，同步是 { table, rows }（失败或源端已删除的表没有 rows），核对是 { table, sourceRows }
+// 盘点与采集是 { name, rows }，同步是 { table, rows }（失败或源端已删除的表没有 rows），核对是 { table, sourceRows }；
+// 合并到标准层按映射给出 { entity, table, rows }（失败或跳过的映射没有 rows）
 type RawTable = { name?: string; table?: string; rows?: unknown; sourceRows?: unknown };
+type RawMapping = { entity?: string; table?: string; rows?: unknown };
 interface RawResult {
   tables?: RawTable[];
+  mappings?: RawMapping[];
   engine?: { memoryLimit: string; threads: number };
 }
 interface TaskResult {
@@ -31,6 +35,9 @@ function taskResult(raw: RawResult | null): TaskResult | null {
     const rows = t.rows ?? t.sourceRows;
     return { name: String(t.name ?? t.table ?? ''), rows: typeof rows === 'number' ? rows : null };
   });
+  for (const m of Array.isArray(raw.mappings) ? raw.mappings : []) {
+    tables.push({ name: `${entityLabel(String(m.entity ?? ''))} ← ${String(m.table ?? '')}`, rows: typeof m.rows === 'number' ? m.rows : null });
+  }
   return { tables, engine: raw.engine };
 }
 

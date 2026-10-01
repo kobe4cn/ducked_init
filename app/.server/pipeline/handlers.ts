@@ -5,6 +5,7 @@ import type { EngineLimits, TenantLakeSession } from './lake-engine';
 import { profileSource, type SourceSpec } from './source-engine';
 import { syncOptionsFromEnv, syncSourceTables, type SyncTableParam } from './sync-engine';
 import { verifySourceLake, type VerifyTableParam } from './verify-engine';
+import { mergeToSilver, type MergeMappingParam } from './merge-engine';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 
 type Params = Record<string, unknown>;
@@ -68,6 +69,18 @@ function verifyTables(params: Params): VerifyTableParam[] {
     && (t.column === undefined ? t.kind === undefined : typeof t.column === 'string' && (t.kind === 'updated_at' || t.kind === 'increment')));
   if (!valid) throw new Error('参数 tables 必须是 { name, inScope, reason, key?, softDelete?, column?, kind? } 列表');
   return tables as VerifyTableParam[];
+}
+
+/** 合并参数里的映射：已发布的版本及其合并计划（发布时已校验过，这里只核对形状） */
+function mergeMappings(params: Params): MergeMappingParam[] {
+  const mappings = params.mappings;
+  const valid = Array.isArray(mappings) && mappings.length > 0 && mappings.every(m =>
+    typeof m?.mapping === 'string' && Number.isInteger(m.version) && typeof m.sourceId === 'string'
+    && typeof m.entity === 'string' && typeof m.table === 'string'
+    && Array.isArray(m.columns) && m.columns.length > 0 && Array.isArray(m.entityColumns) && isStrings(m.key)
+    && (m.latest === null || typeof m.latest === 'string'));
+  if (!valid) throw new Error('参数 mappings 必须是非空的已发布映射列表');
+  return mappings as MergeMappingParam[];
 }
 
 function positiveInt(params: Params, key: string, max: number) {
@@ -144,6 +157,19 @@ export const HANDLERS = {
       if (typeof params.sourceId !== 'string') throw new Error('缺少参数 sourceId');
       const tables = await verifySourceLake(session, source, params.sourceId, verifyTables(params), limits, redact);
       return { tables, differences: tables.filter(t => t.ok === false).length };
+    },
+  },
+  // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务。
+  // 有映射失败时任务记为失败，结果里保留各映射的合并结果与错误；源表还没同步进原始层的映射跳过，不算失败
+  'silver.merge': {
+    label: '合并到标准层',
+    async run(_con, params, { session, redact }) {
+      const mappings = await mergeToSilver(session, mergeMappings(params), redact);
+      const failed = mappings.filter(m => 'error' in m);
+      if (failed.length) {
+        throw new PartialFailure(`${failed.length} 个映射合并失败：${failed.map(m => `${m.entity} ← ${m.table}（${'error' in m ? m.error : ''}）`).join('；')}`, { mappings });
+      }
+      return { mappings };
     },
   },
 } satisfies Record<string, Handler>;

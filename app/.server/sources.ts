@@ -9,7 +9,7 @@ import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
-import { sources, sourceTables, tasks, type TaskStatus } from './db/schema';
+import { mappings, mappingVersions, sources, sourceTables, tasks, type TaskStatus } from './db/schema';
 import {
   inspectSource, isKeyType, isSoftDeleteType, mongoReadGrant, SOFT_DELETE_NAME, type ListedTable, type SourceSpec, type TableProfile,
   type WriteGrant,
@@ -397,7 +397,8 @@ export async function confirmSoftDelete(actor: CurrentMember, sourceId: string, 
 
 /**
  * 成员修改同步范围：add 中的表选入，remove 中的表移出（已经在 / 不在范围内的忽略），记下成员与时间并记入审计。
- * 只能选入源端仍在、账号可读的表；选入的表随即入队一次采集。移出只停止采集与同步，原始层、主键状态与镜像都保留
+ * 只能选入源端仍在、账号可读的表；选入的表随即入队一次采集。移出只停止采集与同步，原始层、主键状态与镜像都保留。
+ * 已被已发布映射引用的表不能移出（ADR-0013）
  */
 export async function setSyncScope(actor: CurrentMember, sourceId: string, { add = [], remove = [] }: { add?: string[]; remove?: string[] }) {
   assertCan(actor, 'sources:write');
@@ -415,6 +416,13 @@ export async function setSyncScope(actor: CurrentMember, sourceId: string, { add
     }
     const added = [...listing.values()].filter(t => add.includes(t.tableName) && !t.inScope).map(t => t.tableName);
     const removed = [...listing.values()].filter(t => remove.includes(t.tableName) && !add.includes(t.tableName) && t.inScope).map(t => t.tableName);
+    // 已被已发布映射引用的表不能移出范围：标准层还要从它的变更批次合并
+    const mapped = removed.length
+      ? await tx.selectDistinct({ table: mappings.tableName }).from(mappings)
+        .innerJoin(mappingVersions, and(eq(mappingVersions.mappingId, mappings.id), eq(mappingVersions.status, 'published')))
+        .where(and(eq(mappings.sourceId, sourceId), inArray(mappings.tableName, removed)))
+      : [];
+    if (mapped.length) throw new SourceError(`${mapped.map(m => m.table).join('、')} 已被已发布的映射引用，不能移出同步范围`);
     if (!added.length && !removed.length) return { added, removed, task: null };
     const scoped = { scopedByEmail: actor.email, scopedAt: new Date() };
     const named = (names: string[]) => and(eq(sourceTables.sourceId, sourceId), inArray(sourceTables.tableName, names));

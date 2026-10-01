@@ -3,6 +3,7 @@ import { sql } from 'drizzle-orm';
 import { bigint, boolean, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { ROLES } from '../../lib/roles';
 import { SOURCE_KINDS } from '../../lib/sources';
+import type { MergePlan } from '../pipeline/mapping-spec';
 
 export { ROLE_LABELS, ROLES, type Role } from '../../lib/roles';
 export { SOURCE_KIND_LABELS, SOURCE_KINDS, type SourceKind } from '../../lib/sources';
@@ -260,3 +261,40 @@ export const sourceTables = platform.table('source_tables', {
   softDeleteColumn: text('soft_delete_column'),
   softDeleteConfirmedByEmail: text('soft_delete_confirmed_by_email'),
 }, t => [primaryKey({ columns: [t.sourceId, t.tableName] })]);
+
+export const MAPPING_VERSION_STATUSES = ['draft', 'published'] as const;
+export type MappingVersionStatus = (typeof MAPPING_VERSION_STATUSES)[number];
+export const mappingVersionStatusEnum = platform.enum('mapping_version_status', MAPPING_VERSION_STATUSES);
+
+// 映射：数据源里的一张表 → 一个标准实体（或自定义实体），属于某个空间（ADR-0015）。表与实体取自第一版文档，之后的版本不能改
+export const mappings = platform.table('mappings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  spaceId: uuid('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  sourceId: uuid('source_id').notNull().references(() => sources.id, { onDelete: 'cascade' }),
+  tableName: text('table_name').notNull(),
+  entity: text('entity').notNull(),
+  createdAt: createdAt(),
+}, t => [
+  index('mappings_tenant_idx').on(t.tenantId),
+  uniqueIndex('mappings_source_table_entity_uq').on(t.sourceId, t.tableName, t.entity),
+]);
+
+// 映射的各个版本：YAML 原文与校验通过后的合并计划。草稿可以改，每个映射同时只有一份草稿；发布后锁定，再改就是新的一版草稿。
+// authors 是改过这一版草稿的成员（邮箱），发布者不能是其中之一（双人发布）
+export const mappingVersions = platform.table('mapping_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  mappingId: uuid('mapping_id').notNull().references(() => mappings.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  status: mappingVersionStatusEnum('status').notNull().default('draft'),
+  yaml: text('yaml').notNull(),
+  plan: jsonb('plan').$type<MergePlan>().notNull(),
+  authors: text('authors').array().notNull(),
+  publishedByEmail: text('published_by_email'),
+  publishedAt: timestamp('published_at', { withTimezone: true }),
+  createdAt: createdAt(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [
+  uniqueIndex('mapping_versions_mapping_version_uq').on(t.mappingId, t.version),
+  uniqueIndex('mapping_versions_one_draft_uq').on(t.mappingId).where(sql`status = 'draft'`),
+]);

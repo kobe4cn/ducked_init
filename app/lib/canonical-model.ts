@@ -1,0 +1,162 @@
+// app/lib/canonical-model.ts —— 平台内置的标准模型（Canonical Model）：一组标准实体及其字段，所有指标与标签只基于它定义。
+// 同一大版本内只新增字段，不改名、不改语义；映射里的 model 写的是大版本号。前后端共用（标准模型页要展示实体与字段说明）
+export const MODEL_VERSION = '1.0';
+export const MODEL_MAJOR = 1;
+
+/** 字段类型：标准层里的列类型由它决定（时间一律是带时区的时间，按 UTC 存放；金额是两位小数的元） */
+export const FIELD_TYPES = {
+  string: { label: '文本', sql: 'VARCHAR' },
+  integer: { label: '整数', sql: 'BIGINT' },
+  decimal: { label: '小数（两位）', sql: 'DECIMAL(18, 2)' },
+  timestamp: { label: '时间（UTC）', sql: 'TIMESTAMPTZ' },
+  date: { label: '日期', sql: 'DATE' },
+  boolean: { label: '布尔', sql: 'BOOLEAN' },
+} as const;
+export type FieldType = keyof typeof FIELD_TYPES;
+export const FIELD_TYPE_NAMES = Object.keys(FIELD_TYPES) as FieldType[];
+
+export interface CanonicalField {
+  name: string;
+  type: FieldType;
+  label: string;
+  description: string;
+  /** 标准枚举：取值只能是其中之一，源端的取值用值字典对应过来 */
+  enum?: readonly string[];
+  /** 敏感信息：标准层及之后只存按租户加盐的哈希（ADR-0005） */
+  pii?: true;
+}
+
+export interface CanonicalEntity {
+  name: string;
+  label: string;
+  description: string;
+  /** 实体的主键字段：映射没有声明去重键时按它去重 */
+  key: readonly string[];
+  fields: readonly CanonicalField[];
+}
+
+const f = (name: string, type: FieldType, label: string, description: string, extra: Partial<CanonicalField> = {}): CanonicalField =>
+  ({ name, type, label, description, ...extra });
+
+export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
+  {
+    name: 'customer',
+    label: '消费者',
+    description: '租户 CRM 数据中的终端客户，是指标与标签的计算对象。',
+    key: ['customer_id'],
+    fields: [
+      f('customer_id', 'string', '消费者 ID', '源端的消费者标识（在一个数据源内唯一）'),
+      f('name', 'string', '姓名', '消费者姓名', { pii: true }),
+      f('phone', 'string', '手机号', '手机号', { pii: true }),
+      f('email', 'string', '邮箱', '邮箱地址', { pii: true }),
+      f('gender', 'string', '性别', '性别', { enum: ['male', 'female', 'unknown'] }),
+      f('birthday', 'date', '生日', '出生日期'),
+      f('city', 'string', '城市', '常住或注册城市'),
+      f('registered_at', 'timestamp', '注册时间', '成为消费者（注册、首次留资）的时间'),
+      f('updated_at', 'timestamp', '更新时间', '源端最后一次修改这条记录的时间'),
+    ],
+  },
+  {
+    name: 'order',
+    label: '订单',
+    description: '消费者的一笔交易。金额以元计。',
+    key: ['order_id'],
+    fields: [
+      f('order_id', 'string', '订单 ID', '源端的订单号'),
+      f('customer_id', 'string', '消费者 ID', '下单的消费者，对应消费者的 customer_id'),
+      f('status', 'string', '订单状态', '订单的当前状态', { enum: ['created', 'paid', 'shipped', 'completed', 'cancelled', 'refunded'] }),
+      f('amount', 'decimal', '实付金额', '消费者实际支付的金额（元）'),
+      f('created_at', 'timestamp', '下单时间', '订单创建的时间'),
+      f('paid_at', 'timestamp', '支付时间', '订单支付的时间，未支付为空'),
+      f('channel', 'string', '渠道', '下单渠道（如门店、小程序、天猫）'),
+      f('store_id', 'string', '门店 ID', '成交门店，线上订单可为空'),
+      f('updated_at', 'timestamp', '更新时间', '源端最后一次修改这条记录的时间'),
+    ],
+  },
+  {
+    name: 'order_item',
+    label: '订单明细',
+    description: '订单中的一个商品行。金额以元计。',
+    key: ['order_item_id'],
+    fields: [
+      f('order_item_id', 'string', '明细 ID', '源端的订单明细标识'),
+      f('order_id', 'string', '订单 ID', '所属订单，对应订单的 order_id'),
+      f('product_id', 'string', '商品 ID', '购买的商品，对应商品的 product_id'),
+      f('quantity', 'integer', '数量', '购买件数'),
+      f('unit_price', 'decimal', '单价', '成交单价（元）'),
+      f('amount', 'decimal', '金额', '这一行的实付金额（元）'),
+    ],
+  },
+  {
+    name: 'product',
+    label: '商品',
+    description: '租户售卖的商品（SKU）。',
+    key: ['product_id'],
+    fields: [
+      f('product_id', 'string', '商品 ID', '源端的商品或 SKU 标识'),
+      f('name', 'string', '商品名称', '商品名称'),
+      f('category', 'string', '品类', '商品所属品类'),
+      f('brand', 'string', '品牌', '商品品牌'),
+      f('price', 'decimal', '标价', '商品标价（元）'),
+    ],
+  },
+  {
+    name: 'event',
+    label: '行为事件',
+    description: '消费者在网站、App、小程序上的一次行为（浏览、加购、登录等）。',
+    key: ['event_id'],
+    fields: [
+      f('event_id', 'string', '事件 ID', '事件的唯一标识；源端没有时可用字段拼出'),
+      f('customer_id', 'string', '消费者 ID', '已登录时的消费者，匿名时为空'),
+      f('device_id', 'string', '设备 ID', '匿名访问时的设备标识'),
+      f('event_type', 'string', '事件类型', '如 view、add_to_cart、login'),
+      f('occurred_at', 'timestamp', '发生时间', '事件发生的时间'),
+      f('page', 'string', '页面', '事件发生的页面或屏幕'),
+    ],
+  },
+  {
+    name: 'touch',
+    label: '营销触达',
+    description: '一次对消费者的营销触达（短信、邮件、推送等）。',
+    key: ['touch_id'],
+    fields: [
+      f('touch_id', 'string', '触达 ID', '源端的触达记录标识'),
+      f('customer_id', 'string', '消费者 ID', '被触达的消费者'),
+      f('campaign_id', 'string', '活动 ID', '所属营销活动'),
+      f('channel', 'string', '触达渠道', '触达使用的渠道', { enum: ['sms', 'email', 'push', 'wechat', 'app', 'other'] }),
+      f('status', 'string', '触达结果', '触达的最终结果', { enum: ['sent', 'delivered', 'opened', 'clicked', 'failed'] }),
+      f('sent_at', 'timestamp', '发送时间', '触达发出的时间'),
+    ],
+  },
+  {
+    name: 'membership',
+    label: '会员',
+    description: '消费者在会员体系中的身份（会员是消费者的一个属性，不是另一种人）。',
+    key: ['membership_id'],
+    fields: [
+      f('membership_id', 'string', '会员号', '源端的会员卡号或会员标识'),
+      f('customer_id', 'string', '消费者 ID', '持有会员身份的消费者'),
+      f('level', 'string', '会员等级', '会员等级名称（如 gold、silver）'),
+      f('points', 'integer', '积分', '当前积分余额'),
+      f('status', 'string', '会员状态', '会员身份的当前状态', { enum: ['active', 'frozen', 'expired', 'cancelled'] }),
+      f('joined_at', 'timestamp', '入会时间', '成为会员的时间'),
+      f('expires_at', 'timestamp', '到期时间', '会员身份到期的时间，长期有效为空'),
+    ],
+  },
+];
+
+export type CanonicalEntityName = string;
+
+export const entityOf = (name: string) => CANONICAL_ENTITIES.find(e => e.name === name);
+
+/** 自定义实体的名称：custom_ 开头，小写字母、数字与下划线 */
+export const CUSTOM_ENTITY_PATTERN = '^custom_[a-z][a-z0-9_]*$';
+/** 标准实体上的扩展字段：x_ 开头，避免与标准模型以后新增的字段重名 */
+export const EXTENSION_PATTERN = '^x_[a-z][a-z0-9_]*$';
+/** 自定义实体的字段名 */
+export const CUSTOM_FIELD_PATTERN = '^[a-z][a-z0-9_]*$';
+
+export const isCustomEntity = (name: string) => new RegExp(CUSTOM_ENTITY_PATTERN).test(name);
+
+/** 实体的展示名称：标准实体用中文名，自定义实体用名称本身 */
+export const entityLabel = (name: string) => entityOf(name)?.label ?? name;
