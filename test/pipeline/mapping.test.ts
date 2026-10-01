@@ -43,19 +43,32 @@ const ORDER_LOG = `
     ('A1', '已退款', 1990, '2024-06-03 10:00'), ('A2', '已支付', 500, '2024-06-02 10:00');
   GRANT SELECT ON shop.order_log TO ${READER.user};`;
 
+/** 带主键的积分流水：变动类型是中文，变动积分带正负，只有部分行有关联订单与到期时间 */
+const POINT_LOGS = `
+  CREATE TABLE shop.point_logs (id serial PRIMARY KEY, customer_id int NOT NULL, member_no text NOT NULL, change_type text NOT NULL,
+    points int NOT NULL, balance int NOT NULL, order_no text, created_at timestamp NOT NULL, expire_time timestamp);
+  INSERT INTO shop.point_logs (customer_id, member_no, change_type, points, balance, order_no, created_at, expire_time) VALUES
+    (1, 'M001', '获得', 200, 200, 'NO1', '2024-06-01 10:00', '2025-06-01 10:00'),
+    (1, 'M001', '消费', -50, 150, 'NO2', '2024-06-02 10:00', NULL),
+    (1, 'M001', '兑换', -100, 50, NULL, '2024-06-03 10:00', NULL),
+    (2, 'M002', '过期', -30, 0, NULL, '2024-06-04 10:00', NULL),
+    (2, 'M002', '调整', 20, 20, NULL, '2024-06-05 10:00', NULL);
+  GRANT SELECT ON shop.point_logs TO ${READER.user};`;
+
 /** 两位数据工程师：一位起草、一位发布。登记数据源、选入全部表、确认水位线并同步一次 */
 async function syncedSource() {
   const acme = await newTenant('acme');
   const author = await memberOf(acme, 'de@acme.com');
   const reviewer = await memberOf(acme, 'de2@acme.com');
   const input = await pgSourceInput(READER);
-  await grantOnSource(ORDER_LOG);
+  await grantOnSource(ORDER_LOG + POINT_LOGS);
   const { id } = await registerSource(author, input);
   await selectAllTables(author, id);
   await drain();
   await confirmWatermark(author, id, 'customers', 'updated_at');
   await confirmWatermark(author, id, 'orders', 'order_id');
   await confirmWatermark(author, id, 'order_log', 'updated_at');
+  await confirmWatermark(author, id, 'point_logs', 'id');
   await syncSource(author, id);
   await drain();
   return { acme, author, reviewer, id };
@@ -101,6 +114,23 @@ dedupe:
   latest: updated_at
 `;
 
+const POINT_LOGS_MAPPING = `model: 1
+entity: points_transaction
+table: point_logs
+fields:
+  points_transaction_id: string(id)
+  customer_id: string(customer_id)
+  membership_id: member_no
+  change_type:
+    expr: change_type
+    dictionary: { 获得: earn, 消费: spend, 兑换: redeem, 过期: expire, 调整: adjust }
+  points_change: points
+  balance_after: balance
+  order_id: order_no
+  occurred_at: from_timezone(created_at, 'Asia/Shanghai')
+  expires_at: from_timezone(expire_time, 'Asia/Shanghai')
+`;
+
 /** 起草并由另一位成员发布，让调度器跑完合并 */
 async function publish(author: Awaited<ReturnType<typeof memberOf>>, reviewer: typeof author, sourceId: string, yaml: string) {
   const mapping = await createMapping(author, sourceId, yaml);
@@ -144,6 +174,21 @@ describe('发布映射并合并到标准层', () => {
     expect(order).toHaveLength(100);
     expect(order[0]).toMatchObject({ order_id: '1', customer_id: '2', amount: '11.00', status: 'refunded', x_amount_fen: '1100' });
     expect(new Set(order.map(o => o.status))).toEqual(new Set(['paid', 'refunded']));
+  });
+
+  it('积分流水：变动类型按值字典对应，变动积分保留正负，没有关联订单与到期时间的行为空', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, POINT_LOGS_MAPPING);
+    const rows = await silver(acme, 'points_transaction', 'points_transaction_id::INT');
+    expect(rows.map(r => [r.points_transaction_id, r.change_type, r.points_change, r.balance_after])).toEqual([
+      ['1', 'earn', '200', '200'], ['2', 'spend', '-50', '150'], ['3', 'redeem', '-100', '50'], ['4', 'expire', '-30', '0'], ['5', 'adjust', '20', '20'],
+    ]);
+    expect(rows[0]).toMatchObject({
+      customer_id: '1', membership_id: 'M001', order_id: 'NO1', _source: id,
+      // 源端是北京时间
+      occurred_at: '2024-06-01 02:00:00+00', expires_at: '2025-06-01 02:00:00+00',
+    });
+    expect(rows[2]).toMatchObject({ order_id: null, expires_at: null });
   });
 
   it('同步后的合并把源端的新增、更新与删除带进标准层；没有新批次时合并不改动', async () => {

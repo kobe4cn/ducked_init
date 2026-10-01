@@ -9,6 +9,7 @@
 --   - order_items：复合主键 (order_id, line_no)
 --   - events：没有主键与更新时间（整行比对），发生时间是 Unix 毫秒（from_epoch_millis），含少量完全重复的行
 --   - members：会员等级是中文，开卡时间为 DATE
+--   - point_logs：自增主键，变动类型是中文（值字典），积分带正负，会员号列叫 member_no，只有获得与消费有关联订单、只有获得有到期时间
 DROP DATABASE IF EXISTS crm_source;
 CREATE DATABASE crm_source DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE crm_source;
@@ -120,6 +121,36 @@ WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1000)
 SELECT i, ELT(1 + i % 4, '普通', '银卡', '金卡', '钻石'), (i * 37) % 5000, DATE '2023-03-01' + INTERVAL i DAY,
        TIMESTAMP '2024-06-01 00:00:00' + INTERVAL i MINUTE
 FROM s WHERE i % 3 <> 0;
+
+CREATE TABLE point_logs (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  customer_id BIGINT NOT NULL,
+  member_no BIGINT NOT NULL,
+  change_type VARCHAR(8) NOT NULL,
+  points INT NOT NULL COMMENT '增加为正，减少为负',
+  balance INT NOT NULL,
+  order_no VARCHAR(32),
+  created_at DATETIME NOT NULL COMMENT '北京时间',
+  expire_time DATETIME,
+  remark VARCHAR(32)
+);
+-- 每位会员 20 笔，按「获得、消费、获得、兑换、调整、过期」轮转；余额是按时间累计的变动，不会为负
+INSERT INTO point_logs (customer_id, member_no, change_type, points, balance, order_no, created_at, expire_time, remark)
+WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < 5999),
+t AS (
+  SELECT i, 1 + i % 300 AS c, i DIV 300 AS k, 1 + (i DIV 300) % 6 AS kind,
+         CASE (i DIV 300) % 6 WHEN 0 THEN 200 + i % 400 WHEN 1 THEN -(20 + i % 50) WHEN 2 THEN 200 + i * 7 % 400
+           WHEN 3 THEN -(50 + i % 100) WHEN 4 THEN IF(i % 2 = 0, 20, -20) ELSE -(10 + i % 30) END AS points
+  FROM s
+)
+SELECT t.c, m.member_id, ELT(t.kind, '获得', '消费', '获得', '兑换', '调整', '过期'), t.points,
+       SUM(t.points) OVER (PARTITION BY t.c ORDER BY t.k),
+       IF(t.kind IN (1, 2, 3), CONCAT('NO', 20240000000 + 1 + t.i * 13 % 5000), NULL),
+       TIMESTAMP '2024-01-01 09:00:00' + INTERVAL t.k * 14 DAY + INTERVAL t.c * 3 MINUTE,
+       IF(t.kind IN (1, 3), TIMESTAMP '2025-01-01 09:00:00' + INTERVAL t.k * 14 DAY + INTERVAL t.c * 3 MINUTE, NULL),
+       ELT(t.kind, '购物返积分', '下单抵扣', '购物返积分', '兑换礼品', '客服调整', '到期清零')
+FROM t JOIN members m ON m.customer_id = t.c
+ORDER BY t.k, t.c;
 
 DROP USER IF EXISTS 'crm_reader'@'%';
 CREATE USER 'crm_reader'@'%' IDENTIFIED BY 'reader-secret';

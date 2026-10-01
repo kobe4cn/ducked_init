@@ -1,7 +1,7 @@
 // app/lib/canonical-model.ts —— 平台内置的标准模型（Canonical Model）：一组标准实体及其字段，所有指标与标签只基于它定义。
 // 同一大版本内只做新增（新增实体、字段、标准枚举取值），不改名、不改语义、不改类型、不改已有实体的主键；每次新增小版本加一（ADR-0018）。
 // 映射里的 model 写的是大版本号。前后端共用（标准模型页要展示实体与字段说明）
-export const MODEL_VERSION = '1.0';
+export const MODEL_VERSION = '1.1';
 export const MODEL_MAJOR = 1;
 
 /** 字段类型：标准层里的列类型由它决定（时间一律是带时区的时间，按 UTC 存放；金额是两位小数的元） */
@@ -142,6 +142,23 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
       f('status', 'string', '会员状态', '会员身份的当前状态', { enum: ['active', 'frozen', 'expired', 'cancelled'] }),
       f('joined_at', 'timestamp', '入会时间', '成为会员的时间'),
       f('expires_at', 'timestamp', '到期时间', '会员身份到期的时间，长期有效为空'),
+    ],
+  },
+  {
+    name: 'points_transaction',
+    label: '积分流水',
+    description: '一笔积分变动（获得、消费抵扣、兑换、过期、调整）。当前余额看会员的积分，获取与消耗看积分流水。',
+    key: ['points_transaction_id'],
+    fields: [
+      f('points_transaction_id', 'string', '流水 ID', '源端的积分流水标识；源端没有时可用字段拼出'),
+      f('customer_id', 'string', '消费者 ID', '积分所属的消费者，对应消费者的 customer_id'),
+      f('membership_id', 'string', '会员号', '积分所属的会员，对应会员的 membership_id'),
+      f('change_type', 'string', '变动类型', '获得、消费抵扣、兑换礼品或权益、过期、人工调整（含退款冲回）', { enum: ['earn', 'spend', 'redeem', 'expire', 'adjust'] }),
+      f('points_change', 'integer', '变动积分', '带正负：增加为正，减少为负'),
+      f('balance_after', 'integer', '变动后余额', '这笔变动之后的积分余额，源端没有为空'),
+      f('order_id', 'string', '关联订单', '产生或使用这笔积分的订单，对应订单的 order_id'),
+      f('occurred_at', 'timestamp', '发生时间', '积分变动的时间'),
+      f('expires_at', 'timestamp', '到期时间', '这笔获得的积分的到期时间，不过期或不是获得为空'),
     ],
   },
 ];

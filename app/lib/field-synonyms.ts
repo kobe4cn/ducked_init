@@ -19,6 +19,8 @@ const UNIT_SUFFIX = /_(cents|fen|ms|millis)$/;
 /** 多个实体共有的字段 */
 const COMMON: Record<string, readonly string[]> = {
   customer_id: ['cust_id', 'user_id', 'uid', 'member_id', 'buyer_id', 'client_id', 'consumer_id'],
+  /** 带会员号的表里 member_id 是会员号，不当消费者 ID */
+  member_customer_id: ['cust_id', 'user_id', 'uid', 'buyer_id', 'consumer_id'],
   order_id: ['order_no', 'order_sn', 'order_code', 'trade_no', 'tid'],
   product_id: ['sku', 'sku_id', 'sku_code', 'goods_id', 'item_id', 'spu_id'],
   updated_at: ['update_time', 'updated_time', 'modified_at', 'modify_time', 'gmt_modified', 'last_modified', 'mtime', 'updated'],
@@ -82,12 +84,23 @@ const COLUMN_SYNONYMS: Record<string, Record<string, readonly string[]>> = {
   },
   membership: {
     membership_id: ['id', 'member_id', 'member_no', 'card_no', 'vip_no'],
-    customer_id: ['cust_id', 'user_id', 'uid', 'buyer_id', 'consumer_id'],
+    customer_id: COMMON.member_customer_id,
     level: ['member_level', 'level_name', 'grade', 'vip_level', 'tier'],
     points: ['point', 'score', 'credit', 'credits', 'balance_points'],
     status: ['member_status', 'state'],
     joined_at: ['join_time', 'joined_time', 'register_time', 'open_time', ...COMMON.created_at, 'created_at'],
     expires_at: ['expire_time', 'expired_at', 'expiry_date', 'valid_until', 'end_time'],
+  },
+  points_transaction: {
+    points_transaction_id: ['id', 'transaction_id', 'txn_id', 'log_id', 'flow_id', 'record_id', 'serial_no', 'points_log_id', 'point_log_id'],
+    membership_id: ['member_id', 'member_no', 'card_no', 'vip_no', 'membership_no'],
+    customer_id: COMMON.member_customer_id,
+    change_type: ['type', 'points_type', 'point_type', 'trans_type', 'transaction_type', 'biz_type', 'action'],
+    points_change: ['points', 'point', 'change_points', 'change_point', 'points_delta', 'delta', 'change_amount', 'change_value', 'score'],
+    balance_after: ['balance', 'points_balance', 'point_balance', 'after_balance', 'balance_points', 'remain_points', 'left_points'],
+    order_id: COMMON.order_id,
+    occurred_at: ['occurred', 'occur_time', 'trans_time', 'transaction_time', 'change_time', 'event_time', ...COMMON.created_at, 'created_at'],
+    expires_at: ['expire_time', 'expired_at', 'expire_at', 'expiry_time', 'expiry_date', 'expire_date', 'valid_until', 'end_time'],
   },
 };
 
@@ -133,6 +146,15 @@ const VALUE_SYNONYMS: Record<string, Record<string, Record<string, readonly stri
       frozen: ['冻结', '已冻结', 'freeze', 'locked'],
       expired: ['过期', '已过期', '失效', '已失效', 'expire'],
       cancelled: ['注销', '已注销', '取消', '已取消', 'canceled', 'closed'],
+    },
+  },
+  points_transaction: {
+    change_type: {
+      earn: ['获得', '获取', '发放', '赠送', '奖励', '累积', '增加', '购物获得', '消费获得', 'earned', 'gain', 'add', 'reward', 'issue'],
+      spend: ['消费', '抵扣', '积分抵扣', '抵现', '使用', 'spent', 'use', 'consume', 'deduct'],
+      redeem: ['兑换', '积分兑换', '兑礼', 'exchange', 'redemption'],
+      expire: ['过期', '到期', '失效', '过期清零', 'expired'],
+      adjust: ['调整', '人工调整', '手动调整', '冲回', '退款冲回', '退回', '修正', 'adjustment', 'manual', 'refund', 'rollback'],
     },
   },
 };

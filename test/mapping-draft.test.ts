@@ -1,5 +1,5 @@
 // 按规则生成映射草稿（纯函数）：源表的列统计 + 目标实体 → 映射 YAML。列名规范化与同义词匹配、格式特征校验、分 / 毫秒 / 无时区时间的转换、
-// 值字典骨架、没有主键的表；生成的草稿交给 checkMapping 校验。三张表贴合开发库 crm_source（db_script/mysql_seed.sql）的列统计
+// 值字典骨架、没有主键的表；生成的草稿交给 checkMapping 校验。四张表贴合开发库 crm_source（db_script/mysql_seed.sql）的列统计
 import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
@@ -43,6 +43,19 @@ const EVENTS = table('events', [
   column('channel', 'VARCHAR', { distinct: 3, top: top('app', 'mini', 'web') }),
 ]);
 
+const POINT_LOGS = table('point_logs', [
+  column('id', 'BIGINT', { min: '1', max: '4000' }),
+  column('customer_id', 'BIGINT', { min: '1', max: '299' }),
+  column('member_no', 'BIGINT', { min: '1', max: '200' }),
+  column('change_type', 'VARCHAR', { distinct: 5, top: top('获得', '消费', '兑换', '调整', '过期') }),
+  column('points', 'INTEGER', { min: '-149', max: '599' }),
+  column('balance', 'INTEGER', { min: '180', max: '2878' }),
+  column('order_no', 'VARCHAR', { nullRate: 0.45, length: { min: 13, max: 13 }, formats: [] }),
+  column('created_at', 'TIMESTAMP', { min: '2024-01-01 09:03:00', max: '2024-09-23 23:57:00' }),
+  column('expire_time', 'TIMESTAMP', { nullRate: 0.65, min: '2025-01-01 09:03:00', max: '2025-09-10 23:57:00' }),
+  column('remark', 'VARCHAR', { formats: [] }),
+], ['id']);
+
 const columnsOf = (...tables: TableProfile[]) => (name: string) =>
   tables.find(t => t.name === name)?.columns.map(c => c.name) ?? `数据源中没有表 ${name}`;
 
@@ -76,8 +89,8 @@ describe('列名规范化与同义词', () => {
   });
 });
 
-describe('开发库三张表生成的草稿', () => {
-  const columns = columnsOf(ORDERS, CUSTOMERS, EVENTS);
+describe('开发库四张表生成的草稿', () => {
+  const columns = columnsOf(ORDERS, CUSTOMERS, EVENTS, POINT_LOGS);
 
   it('orders：直接通过保存校验，同义词与转换写在行尾注释里', () => {
     const yaml = draft(ORDERS, 'order');
@@ -119,6 +132,26 @@ describe('开发库三张表生成的草稿', () => {
     expect(lineOf(yaml, 'event_id')).toContain('没有主键');
     expect(lineOf(yaml, 'occurred_at')).toContain('毫秒');
     expect(yaml).toMatch(/# 源表里没用到的列.*sku.*channel/);
+  });
+
+  it('point_logs：积分流水的主要字段都对上，中文变动类型预填值字典，直接通过保存校验', () => {
+    const yaml = draft(POINT_LOGS, 'points_transaction');
+    expect(checkMapping(yaml, columns)).toMatchObject({ ok: true, plan: { key: ['points_transaction_id'] } });
+    expect(fields(yaml)).toMatchObject({
+      points_transaction_id: 'string(id)',
+      customer_id: 'string(customer_id)',
+      membership_id: 'string(member_no)',
+      change_type: { expr: 'change_type', dictionary: { 获得: 'earn', 消费: 'spend', 兑换: 'redeem', 调整: 'adjust', 过期: 'expire' } },
+      points_change: 'points',
+      balance_after: 'balance',
+      order_id: 'order_no',
+      occurred_at: "from_timezone(created_at, 'Asia/Shanghai')",
+      expires_at: "from_timezone(expire_time, 'Asia/Shanghai')",
+    });
+    expect(lineOf(yaml, 'membership_id')).toContain('# 同义词：member_no');
+    expect(yaml).toMatch(/# 源表里没用到的列.*remark/);
+    // member_id 在积分流水里是会员号，不是消费者 ID
+    expect(fieldsForColumn('points_transaction', 'member_id')[0]).toMatchObject({ field: 'membership_id' });
   });
 });
 
