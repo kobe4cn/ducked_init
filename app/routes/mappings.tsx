@@ -1,16 +1,19 @@
 // app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、最近一次合并），
-// 新建映射（选数据源、编写 YAML，校验通过才保存为草稿），以及手动触发一次合并到标准层
+// 新建映射（选数据源、编写 YAML，校验通过才保存为草稿；编辑框旁对照所选源表的列统计与目标实体的标准字段），以及手动触发一次合并到标准层
+import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mappings';
 import { can, requirePermission } from '~/.server/access';
-import { createMapping, listMappings, MappingError, mergeNow } from '~/.server/mappings';
+import { createMapping, listMappings, MappingError, mergeNow, referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { mappingTemplate } from '~/.server/pipeline/mapping-spec';
 import { listSources } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
-import { entityLabel } from '~/lib/canonical-model';
+import { CANONICAL_ENTITIES, entityLabel, entityOf } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
-import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
+import { MappingErrors } from '~/components/mapping-editor';
+import { MappingEditorWithReference } from '~/components/mapping-reference';
+import { mappingOutline } from '~/lib/mapping-outline';
 import { Badge } from '~/components/ui/badge';
 import { Button } from '~/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
@@ -25,11 +28,15 @@ export function meta({}: Route.MetaArgs) {
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   const { mappings, merge } = await listMappings(member);
+  const sources = (await listSources(member)).map(s => ({ id: s.id, name: s.name }));
+  const canWrite = can(member.role, 'sources:write');
   return {
     email: member.email,
     nav: navFor(member),
-    canWrite: can(member.role, 'sources:write'),
-    sources: (await listSources(member)).map(s => ({ id: s.id, name: s.name })),
+    canWrite,
+    sources,
+    /** 各数据源可对照的源表（只有能新建映射时才给） */
+    tables: canWrite ? Object.fromEntries(await Promise.all(sources.map(async s => [s.id, await referenceTables(member, s.id)] as const))) : {},
     template: mappingTemplate('order', 'orders'),
     merge: {
       status: merge.status,
@@ -77,7 +84,8 @@ export async function action({ request }: Route.ActionArgs) {
 const TASK_VARIANTS = { none: 'outline', queued: 'outline', running: 'secondary', succeeded: 'default', failed: 'destructive' } as const;
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
-type LastMerge = Route.ComponentProps['loaderData']['mappings'][number]['lastMerge'];
+type LoaderData = Route.ComponentProps['loaderData'];
+type LastMerge = LoaderData['mappings'][number]['lastMerge'];
 
 /** 一个映射最近一次合并的结果 */
 function mergeSummary(m: LastMerge) {
@@ -88,7 +96,7 @@ function mergeSummary(m: LastMerge) {
 }
 
 export default function Mappings({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, sources, template, merge, mappings } = loaderData;
+  const { email, nav, canWrite, sources, tables, template, merge, mappings } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   return (
     <AppShell email={email} nav={nav}>
@@ -160,27 +168,66 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <Form method="post">
-              <input type="hidden" name="intent" value="create" />
-              <FieldGroup>
-                <Field>
-                  <FieldLabel htmlFor="mapping-source">数据源</FieldLabel>
-                  <NativeSelect id="mapping-source" name="sourceId" defaultValue={actionData?.values?.sourceId ?? sources[0]?.id}>
-                    {sources.map(s => <NativeSelectOption key={s.id} value={s.id}>{s.name}</NativeSelectOption>)}
-                  </NativeSelect>
-                </Field>
-                <Field>
-                  <FieldLabel>映射（YAML）</FieldLabel>
-                  <MappingEditor defaultValue={actionData?.values?.yaml ?? template} />
-                </Field>
-                <div>
-                  <Button type="submit" disabled={submitting || !sources.length}>{submitting ? '正在校验…' : '校验并保存草稿'}</Button>
-                </div>
-              </FieldGroup>
-            </Form>
+            <NewMapping
+              sources={sources}
+              tables={tables}
+              values={actionData?.values ?? { sourceId: sources[0]?.id ?? '', yaml: template }}
+              submitting={submitting}
+            />
           </CardContent>
         </Card>
       )}
     </AppShell>
+  );
+}
+
+/**
+ * 新建映射的表单：选数据源、编写 YAML。表与目标实体两个下拉框只决定旁边对照面板显示什么（默认取 YAML 里写的），不随表单提交
+ */
+function NewMapping({ sources, tables, values, submitting }: {
+  sources: LoaderData['sources'];
+  tables: LoaderData['tables'];
+  values: { sourceId: string; yaml: string };
+  submitting: boolean;
+}) {
+  const [sourceId, setSourceId] = useState(values.sourceId);
+  const [outline] = useState(() => mappingOutline(values.yaml));
+  const [tableName, setTableName] = useState(outline.table);
+  const [entity, setEntity] = useState(outline.entity && entityOf(outline.entity) ? outline.entity : CANONICAL_ENTITIES[0].name);
+  const sourceTables = tables[sourceId] ?? [];
+  const table = sourceTables.find(t => t.name === tableName) ?? sourceTables[0] ?? null;
+  return (
+    <Form method="post">
+      <input type="hidden" name="intent" value="create" />
+      <FieldGroup>
+        <div className="grid gap-4 sm:grid-cols-3">
+          <Field>
+            <FieldLabel htmlFor="mapping-source">数据源</FieldLabel>
+            <NativeSelect id="mapping-source" name="sourceId" value={sourceId} onChange={e => setSourceId(e.target.value)}>
+              {sources.map(s => <NativeSelectOption key={s.id} value={s.id}>{s.name}</NativeSelectOption>)}
+            </NativeSelect>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="mapping-table">表</FieldLabel>
+            <NativeSelect id="mapping-table" value={table?.name ?? ''} onChange={e => setTableName(e.target.value)} disabled={!sourceTables.length}>
+              {sourceTables.map(t => <NativeSelectOption key={t.name} value={t.name}>{t.name}</NativeSelectOption>)}
+            </NativeSelect>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="mapping-entity">目标实体</FieldLabel>
+            <NativeSelect id="mapping-entity" value={entity} onChange={e => setEntity(e.target.value)}>
+              {CANONICAL_ENTITIES.map(e => <NativeSelectOption key={e.name} value={e.name}>{`${e.label}（${e.name}）`}</NativeSelectOption>)}
+            </NativeSelect>
+          </Field>
+        </div>
+        <Field>
+          <FieldLabel>映射（YAML）</FieldLabel>
+          <MappingEditorWithReference defaultValue={values.yaml} table={table} entity={entity} />
+        </Field>
+        <div>
+          <Button type="submit" disabled={submitting || !sources.length}>{submitting ? '正在校验…' : '校验并保存草稿'}</Button>
+        </div>
+      </FieldGroup>
+    </Form>
   );
 }

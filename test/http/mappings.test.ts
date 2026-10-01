@@ -119,3 +119,41 @@ describe('编写与发布映射', () => {
     expect((await stranger.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS })).status).toBe(400);
   });
 });
+
+describe('编写映射时的对照面板', () => {
+  it('新建映射时显示所选源表的列统计与目标实体的字段，标出已对应与未对应的必填字段', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+
+    const html = await (await engineer.get('/mappings')).text();
+    // 表与实体下拉框，默认取模板里的 orders → order
+    expect(html).toContain('id="mapping-table"');
+    expect(html).toMatch(/<option[^>]*value="orders"[^>]*selected=""[^>]*>orders<\/option>/);
+    expect(html).toMatch(/<option[^>]*value="order"[^>]*selected=""[^>]*>订单（order）<\/option>/);
+    // 源表各列：类型、空值率、不同取值数、主键、常见取值
+    expect(html).toContain('data-reference-table="orders"');
+    expect(html).toMatch(/data-reference-column="order_id"[^>]*data-primary-key/);
+    expect(html).toMatch(/data-reference-column="status"[\s\S]*?paid（50）/);
+    // 目标实体的字段：模板里已对应的打勾，标准枚举一并给出
+    expect(html).toMatch(/data-reference-field="order_id"[^>]*data-mapped/);
+    expect(html).toMatch(/data-reference-field="paid_at"(?![^>]*data-mapped)/);
+    expect(html).toContain('created、paid、shipped、completed、cancelled、refunded');
+
+    // 校验不通过时按提交的 YAML 判断：没对应的主键突出显示
+    const rejected = await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS.replace('  order_id: string(order_id)\n', '') });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toMatch(/data-reference-field="order_id"[^>]*data-missing-required/);
+  });
+
+  it('编辑草稿时对照映射的源表与实体', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+
+    const html = await (await engineer.get(`/mappings/${id}`)).text();
+    expect(html).toContain('data-reference-table="orders"');
+    expect(html).toContain('data-reference-column="created_at"');
+    expect(html).toMatch(/data-reference-field="amount"[^>]*data-mapped/);
+    expect(html).toMatch(/data-reference-field="customer_id"(?![^>]*data-mapped)/);
+  });
+});

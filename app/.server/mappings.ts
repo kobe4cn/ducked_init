@@ -37,6 +37,23 @@ async function sourceColumns(tenantId: string, sourceId: string) {
   };
 }
 
+/**
+ * 编写映射时对照的源表（同步范围内、已采集的）：各列的类型、空值率、不同取值数与常见取值，
+ * 主键（源端主键，没有时为声明的业务主键）与确认的水位线字段
+ */
+export async function referenceTables(actor: CurrentMember, sourceId: string) {
+  assertCan(actor, 'sources:read');
+  const { tables } = await confirmedTables(actor.tenant.id, sourceId);
+  return tables.map(({ table, watermark, key }) => ({
+    name: table.name,
+    sampleRows: table.sampleRows,
+    // 旧的采集结果里没有主键信息
+    primaryKey: table.primaryKey?.length ? table.primaryKey : (key ?? []),
+    watermark: watermark?.column ?? null,
+    columns: table.columns.map(c => ({ name: c.name, type: c.type, nullRate: c.nullRate, distinct: c.distinct, top: c.top ?? null })),
+  }));
+}
+
 /** 校验映射文档（对照数据源的字段），不通过时抛出带问题列表的 MappingError */
 async function checked(tenantId: string, sourceId: string, yaml: string) {
   const result = checkMapping(yaml, await sourceColumns(tenantId, sourceId));

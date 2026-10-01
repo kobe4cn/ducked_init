@@ -169,6 +169,6 @@ describe('<功能>', () => {
 | `http/tasks.test.ts` | 任务页、租户配额、数据湖迁移查看 |
 | `http/sources.test.ts` | 数据源界面：登记、轮换凭据、选表、列统计、确认水位线 |
 | `http/mappings.test.ts` | 标准模型浏览、映射编辑与发布的界面与权限 |
-| `mapping-spec.test.ts` | 映射 YAML 校验与定位（纯函数） |
+| `mapping-spec.test.ts` | 映射 YAML 校验与定位、对照面板读出的 YAML 要点（纯函数） |
 | `client-build.test.ts` | 真实客户端构建，兜底页面误引 `.server` 模块 |
 | `mailer.test.ts` / `totp.test.ts` | 发信、TOTP（纯函数） |

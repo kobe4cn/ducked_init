@@ -1,15 +1,16 @@
 // app/routes/mapping.tsx —— 单个映射：各版本（已发布的锁定、草稿可改）、编辑草稿（数据工程师、管理员）、发布草稿（需另一位有发布权限的成员，
-// 作者看到不能发布的原因），以及这个映射每次合并到标准层的结果
+// 作者看到不能发布的原因；编辑框旁对照源表的列统计与实体的标准字段），以及这个映射每次合并到标准层的结果
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, deniedReason, requirePermission } from '~/.server/access';
-import { getMapping, MappingError, publishMapping, saveDraft } from '~/.server/mappings';
+import { getMapping, MappingError, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
 import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
+import { MappingEditorWithReference } from '~/components/mapping-reference';
 import { Badge } from '~/components/ui/badge';
 import { Button } from '~/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
@@ -24,16 +25,19 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   try {
     const m = await getMapping(member, params.mappingId);
     const canPublish = can(member.role, 'publish');
+    const canWrite = can(member.role, 'sources:write');
     return {
       email: member.email,
       nav: navFor(member),
-      canWrite: can(member.role, 'sources:write'),
+      canWrite,
       mapping: {
         id: m.id,
         source: m.source,
         table: m.tableName,
         entity: m.entity,
         entityLabel: entityLabel(m.entity),
+        /** 编辑草稿时对照的源表（还没采集、不在同步范围时为 null；不能编辑时不给） */
+        reference: canWrite ? ((await referenceTables(member, m.source.id)).find(t => t.name === m.tableName) ?? null) : null,
       },
       versions: m.versions.map(v => ({
         ...v,
@@ -175,7 +179,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
             {canWrite && (selected.status === 'draft' || !draft) ? (
               <Form method="post" className="space-y-3" key={selected.version}>
                 <input type="hidden" name="intent" value="save" />
-                <MappingEditor defaultValue={actionData?.yaml ?? selected.yaml} />
+                <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} />
                 <Button type="submit" disabled={submitting}>{submitting ? '正在校验…' : selected.status === 'draft' ? '校验并保存草稿' : '校验并保存为新草稿'}</Button>
               </Form>
             ) : (

@@ -1,13 +1,38 @@
-// app/components/mapping-editor.tsx —— 映射 YAML 的编辑框，以及校验不通过时逐项列出的问题（行、列、位置、说明）
+// app/components/mapping-editor.tsx —— 映射 YAML 的编辑框（可在光标处插入文本），以及校验不通过时逐项列出的问题（行、列、位置、说明）
+import { useImperativeHandle, useRef, type Ref } from 'react';
 import { CircleAlert } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 
 export interface MappingIssueView { line: number; col: number; path: string; message: string }
 
-export function MappingEditor({ name = 'yaml', defaultValue, readOnly = false }: { name?: string; defaultValue: string; readOnly?: boolean }) {
+export interface MappingEditorHandle {
+  /** 把文本插入到光标处（替换选中的部分），光标移到插入的文本之后 */
+  insert(text: string): void;
+}
+
+export function MappingEditor({ name = 'yaml', defaultValue, readOnly = false, ref, onValueChange }: {
+  name?: string;
+  defaultValue: string;
+  readOnly?: boolean;
+  ref?: Ref<MappingEditorHandle>;
+  /** 内容变化（输入或插入）后的全文 */
+  onValueChange?: (value: string) => void;
+}) {
+  const textarea = useRef<HTMLTextAreaElement>(null);
+  useImperativeHandle(ref, () => ({
+    insert(text) {
+      const el = textarea.current;
+      if (!el || el.readOnly) return;
+      el.focus();
+      el.setRangeText(text, el.selectionStart, el.selectionEnd, 'end');
+      onValueChange?.(el.value);
+    },
+  }), [onValueChange]);
   return (
     <textarea
+      ref={textarea}
       name={name}
+      onChange={onValueChange && (e => onValueChange(e.target.value))}
       defaultValue={defaultValue}
       readOnly={readOnly}
       spellCheck={false}

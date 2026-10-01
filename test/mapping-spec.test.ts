@@ -1,6 +1,8 @@
-// 映射文档的校验：不符合 Schema、表达式用了白名单之外的函数、引用了源表没有的字段、值字典对应到非标准枚举时被拒绝，并给出 YAML 里的行列位置
+// 映射文档的校验：不符合 Schema、表达式用了白名单之外的函数、引用了源表没有的字段、值字典对应到非标准枚举时被拒绝，并给出 YAML 里的行列位置；
+// 以及对照面板从编辑中的 YAML 读出的要点（已对应的字段、去重键）
 import { describe, expect, it } from 'vitest';
 import { checkMapping } from '../app/.server/pipeline/mapping-spec';
+import { mappingOutline } from '../app/lib/mapping-outline';
 
 const ORDERS = ['order_id', 'customer_id', 'amount', 'status', 'created_at', 'pay_fen', '下单时间'];
 const columns = (table: string) => (table === 'orders' ? ORDERS : `数据源中没有表 ${table}`);
@@ -93,5 +95,14 @@ colour: red
     const custom = `model: 1\nentity: custom_coupon\ntable: orders\nextensions:\n  code: { type: string, expr: string(order_id) }\n`;
     expect(issues(custom).map(i => i.message)).toEqual(['自定义实体必须声明去重键 dedupe.key']);
     expect(checkMapping(`${custom}dedupe: { key: [code] }\n`, columns).ok).toBe(true);
+  });
+});
+
+describe('对照面板读出的 YAML 要点', () => {
+  it('只把写了表达式的字段算作已对应，读出 dedupe.key；写到一半解析出错时尽量取能解析的部分', () => {
+    const outline = mappingOutline('entity: order\ntable: orders\nfields:\n  order_id: order_no\n  amount:\ndedupe:\n  key: [order_no_x]\n');
+    expect(outline).toEqual({ entity: 'order', table: 'orders', fields: new Set(['order_id']), dedupeKey: ['order_no_x'] });
+    expect(mappingOutline('entity: order\nfields:\n  status: { expr: status\n').entity).toBe('order');
+    expect(mappingOutline('fields: [').fields.size).toBe(0);
   });
 });
