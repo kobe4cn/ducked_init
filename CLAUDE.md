@@ -10,7 +10,7 @@ Default canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 
 ### Ticket sizing
 
-A `ready-for-agent` ticket has at most 3 acceptance criteria and an `## Implementation guide` section. Split oversized tickets just in time and write the guide with an Explore subagent. See `docs/agents/ticket-sizing.md`.
+A `ready-for-agent` ticket has at most 3 acceptance criteria and an `## Implementation guide` section. Before `/implement`, run `/prep-ticket <n>` (or without a number for the next ready ticket) to split it and write the guide. See `docs/agents/ticket-sizing.md`.
 
 ### Domain docs
 
