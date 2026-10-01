@@ -1,10 +1,10 @@
 // app/routes/mapping.tsx —— 单个映射：各版本（已发布的锁定、草稿可改）、编辑草稿（数据工程师、管理员）、发布草稿（需另一位有发布权限的成员，
-// 作者看到不能发布的原因；编辑框旁对照源表的列统计与实体的标准字段），以及这个映射每次合并到标准层的结果
+// 作者看到不能发布的原因；编辑框旁对照源表的列统计与实体的标准字段；可按规则重新生成草稿填进编辑框，不保存），以及这个映射每次合并到标准层的结果
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, deniedReason, requirePermission } from '~/.server/access';
-import { getMapping, MappingError, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
+import { draftForMapping, getMapping, MappingError, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel } from '~/lib/canonical-model';
@@ -63,6 +63,9 @@ export async function action({ request, params }: Route.ActionArgs) {
   const field = (name: string) => String(form.get(name) ?? '');
   try {
     switch (field('intent')) {
+      case 'draft':
+        // 只生成、填进编辑框，不保存；draftId 让编辑框换成新内容
+        return { error: null, issues: [], yaml: await draftForMapping(await requirePermission(request, 'sources:write'), params.mappingId), draftId: crypto.randomUUID() };
       case 'save':
         await saveDraft(await requirePermission(request, 'sources:write'), params.mappingId, field('yaml'));
         break;
@@ -70,10 +73,10 @@ export async function action({ request, params }: Route.ActionArgs) {
         await publishMapping(await requirePermission(request, 'publish'), params.mappingId, Number(field('version')));
         break;
       default:
-        return data({ error: '未知操作', issues: [], yaml: null }, { status: 400 });
+        return data({ error: '未知操作', issues: [], yaml: null, draftId: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof MappingError) return data({ error: e.message, issues: e.issues, yaml: field('yaml') || null }, { status: e.status });
+    if (e instanceof MappingError) return data({ error: e.message, issues: e.issues, yaml: field('yaml') || null, draftId: null }, { status: e.status });
     throw e;
   }
   throw redirect(`/mappings/${params.mappingId}`);
@@ -177,10 +180,16 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
           </CardHeader>
           <CardContent>
             {canWrite && (selected.status === 'draft' || !draft) ? (
-              <Form method="post" className="space-y-3" key={selected.version}>
-                <input type="hidden" name="intent" value="save" />
+              <Form method="post" className="space-y-3" key={`${selected.version}-${actionData?.draftId ?? ''}`}>
                 <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} />
-                <Button type="submit" disabled={submitting}>{submitting ? '正在校验…' : selected.status === 'draft' ? '校验并保存草稿' : '校验并保存为新草稿'}</Button>
+                <div className="flex gap-2">
+                  <Button type="submit" name="intent" value="save" disabled={submitting}>
+                    {submitting ? '正在处理…' : selected.status === 'draft' ? '校验并保存草稿' : '校验并保存为新草稿'}
+                  </Button>
+                  <Button type="submit" name="intent" value="draft" variant="outline" disabled={submitting || !mapping.reference} title="按列名、类型与常见取值生成，替换编辑框里的内容；不会保存">
+                    按规则生成草稿
+                  </Button>
+                </div>
               </Form>
             ) : (
               <MappingEditor key={selected.version} defaultValue={selected.yaml} readOnly />

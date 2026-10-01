@@ -1,5 +1,5 @@
 // 标准模型与映射的 HTTP 接缝：任何成员都能浏览标准模型；数据工程师在界面上编写映射（不合格的 YAML 被拒绝并给出位置），
-// 草稿作者不能自己发布，由另一位数据工程师或管理员发布；分析师只读，查看者看不到映射，其他租户一律 404
+// 也能按规则生成草稿填进编辑框（不保存）；草稿作者不能自己发布，由另一位数据工程师或管理员发布；分析师只读，查看者看不到映射，其他租户一律 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -31,6 +31,10 @@ fields:
   amount: amount
   status: { expr: status, dictionary: { paid: paid, refunded: refunded } }
 `;
+
+/** 页面上映射编辑框里的 YAML */
+const editorYaml = (html: string) => html.match(/<textarea[^>]*name="yaml"[^>]*>([\s\S]*?)<\/textarea>/)![1]
+  .replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 
 const mappingIdOf = (res: Response) => res.headers.get('Location')!.match(/^\/mappings\/([0-9a-f-]{36})$/)![1];
 
@@ -155,5 +159,55 @@ describe('编写映射时的对照面板', () => {
     expect(html).toContain('data-reference-column="created_at"');
     expect(html).toMatch(/data-reference-field="amount"[^>]*data-mapped/);
     expect(html).toMatch(/data-reference-field="customer_id"(?![^>]*data-mapped)/);
+  });
+});
+
+describe('按规则生成映射草稿', () => {
+  it('新建页按所选的表与实体生成草稿填进编辑框，不保存；确认后保存为草稿', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+
+    const generated = await engineer.post('/mappings', { intent: 'draft', sourceId, table: 'customers', entity: 'customer', yaml: '' });
+    expect(generated.status).toBe(200);
+    const html = await generated.text();
+    const yaml = editorYaml(html);
+    expect(yaml).toContain('table: customers');
+    expect(yaml).toMatch(/customer_id: string\(customer_id\) # 同名；源表主键/);
+    // 表与实体下拉框、对照面板跟着生成的草稿
+    expect(html).toMatch(/<option[^>]*value="customers"[^>]*selected=""[^>]*>customers<\/option>/);
+    expect(html).toMatch(/data-reference-field="customer_id"[^>]*data-mapped/);
+    // 只生成，不保存
+    expect(html).toContain('还没有映射');
+
+    const saved = await engineer.post('/mappings', { intent: 'create', sourceId, yaml });
+    expect(saved.status).toBe(302);
+    const id = mappingIdOf(saved);
+    expect(await (await engineer.get(`/mappings/${id}`)).text()).toContain('data-version-status="draft"');
+  });
+
+  it('详情页用映射的表与实体重新生成，保存后替换草稿；选的表不存在时说明原因', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+
+    const yaml = editorYaml(await (await engineer.post(`/mappings/${id}`, { intent: 'draft' })).text());
+    expect(yaml).toContain('order_id: string(order_id) # 同名；源表主键');
+    expect(yaml).toMatch(/customer_id: string\(customer_id\)/);
+    // 生成不改动草稿
+    expect(editorYaml(await (await engineer.get(`/mappings/${id}`)).text())).toBe(ORDERS);
+
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml })).status).toBe(302);
+    expect(editorYaml(await (await engineer.get(`/mappings/${id}`)).text())).toBe(yaml);
+
+    const missing = await engineer.post('/mappings', { intent: 'draft', sourceId, table: 'nope', entity: 'order' });
+    expect(missing.status).toBe(400);
+    expect(await missing.text()).toContain('数据源中没有表 nope');
+  });
+
+  it('分析师不能生成草稿', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    await memberOf(tenantId, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    expect((await analyst.post('/mappings', { intent: 'draft', sourceId, table: 'orders', entity: 'order' })).status).toBe(403);
   });
 });

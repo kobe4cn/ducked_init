@@ -8,11 +8,12 @@ import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, tasks, tenants, type TaskStatus } from './db/schema';
 import type { MergeMappingParam, MergeRecord } from './pipeline/merge-engine';
+import { draftMapping } from './pipeline/mapping-draft';
 import { checkMapping, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import { requireSource } from './source-config';
 import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
-import { entityLabel } from '../lib/canonical-model';
+import { entityLabel, entityOf } from '../lib/canonical-model';
 
 /** 可以展示给成员的业务错误；issues 是映射文档里带行列位置的问题 */
 export class MappingError extends Error {
@@ -22,18 +23,27 @@ export class MappingError extends Error {
 /** 合并状态取最近多少次合并任务 */
 const HISTORY_TASKS = 50;
 
-/** 数据源里各表的字段（最近一次成功采集到的）：表不在同步范围、还没采集时返回原因 */
-async function sourceColumns(tenantId: string, sourceId: string) {
+/** 数据源里各表最近一次成功采集到的列统计（带声明的业务主键）：表不在同步范围、还没采集时返回原因 */
+async function profiledTables(tenantId: string, sourceId: string) {
   const { listing, tables } = await confirmedTables(tenantId, sourceId);
   return (table: string) => {
     const profiled = tables.find(t => t.table.name === table);
-    if (profiled) return profiled.table.columns.map(c => c.name);
+    if (profiled) return profiled;
     const listed = listing.find(t => t.tableName === table);
     if (!listed || (listed.goneAt && !listed.inScope)) return `数据源中没有表 ${table}`;
     if (!listed.inScope) return `表 ${table} 不在同步范围内，请先在数据源页选入`;
     if (listed.goneAt) return `源端已不存在表 ${table}`;
     if (!listed.readable) return `账号没有表 ${table} 的读权限`;
     return `表 ${table} 还没有采集到列统计，请等采集完成`;
+  };
+}
+
+/** 数据源里各表的字段（最近一次成功采集到的）：表不在同步范围、还没采集时返回原因 */
+async function sourceColumns(tenantId: string, sourceId: string) {
+  const lookup = await profiledTables(tenantId, sourceId);
+  return (table: string) => {
+    const profiled = lookup(table);
+    return typeof profiled === 'string' ? profiled : profiled.table.columns.map(c => c.name);
   };
 }
 
@@ -52,6 +62,28 @@ export async function referenceTables(actor: CurrentMember, sourceId: string) {
     watermark: watermark?.column ?? null,
     columns: table.columns.map(c => ({ name: c.name, type: c.type, nullRate: c.nullRate, distinct: c.distinct, top: c.top ?? null })),
   }));
+}
+
+/**
+ * 按规则生成映射草稿（ADR-0017）：对照源表最近一次采集的列统计与目标实体，返回 YAML 文本。不调用模型、不保存、不记审计，
+ * 成员确认修改后仍走保存校验与双人发布
+ */
+export async function draftFor(actor: CurrentMember, sourceId: string, table: string, entity: string) {
+  assertCan(actor, 'sources:write');
+  await requireSource(actor.tenant.id, sourceId).catch(() => { throw new MappingError('请选择数据源'); });
+  if (!table) throw new MappingError('请选择表');
+  const target = entityOf(entity);
+  if (!target) throw new MappingError(`只能为标准实体生成草稿，${entity} 不是标准实体`);
+  const profiled = (await profiledTables(actor.tenant.id, sourceId))(table);
+  if (typeof profiled === 'string') throw new MappingError(profiled);
+  return draftMapping(profiled.table, target, { key: profiled.key ?? undefined });
+}
+
+/** 为已有映射（它的源表与实体）按规则生成草稿 */
+export async function draftForMapping(actor: CurrentMember, mappingId: string) {
+  assertCan(actor, 'sources:write');
+  const mapping = await requireMapping(actor.tenant.id, mappingId);
+  return draftFor(actor, mapping.sourceId, mapping.tableName, mapping.entity);
 }
 
 /** 校验映射文档（对照数据源的字段），不通过时抛出带问题列表的 MappingError */
