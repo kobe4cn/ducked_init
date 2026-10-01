@@ -23,3 +23,4 @@ Keep the main context window under ~150k tokens for a whole ticket, building inc
 - Locate with `grep -n` first, then read the range you need with `sed -n 'a,bp'`. Don't `cat` several files in one command.
 - When a tool result is saved to a `tool-results/` file because it was too large, grep that file for what you need. Don't Read it whole.
 - Write long command output (full test suite, builds) to a file and grep it.
+- Before writing tests, read `test/README.md` (fixtures, helpers, templates) instead of the harness and fixture sources. When you add a fixture helper or a test file, update it.
