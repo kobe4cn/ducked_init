@@ -160,6 +160,7 @@ describe('列统计与水位线', () => {
     expect(html).toMatch(/data-table="regions"[^>]*data-sync-mode="full_compare"[\s\S]*?每小时全量比对一次/);
     expect(html).toMatch(/data-table="customers"[^>]*data-sync-mode="needs_confirmation"/);
     expect(html).toMatch(/data-column="email"[\s\S]*?25(\.0)?%[\s\S]*?邮箱 100%/);
+    expect(html).toMatch(/data-column="status"[\s\S]*?data-top[^>]*>paid（50），refunded（50）/);
 
     const res = await browser.post(`/sources/${id}`, { intent: 'confirm-watermark', table: 'customers', column: 'updated_at' });
     expect(res.status).toBe(302);

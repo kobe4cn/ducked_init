@@ -358,6 +358,7 @@ function ColumnStats({ table }: { table: TableView }) {
             <TableHead>基数</TableHead>
             <TableHead>取值范围</TableHead>
             <TableHead>格式特征</TableHead>
+            <TableHead>常见取值（样本行数）</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -371,6 +372,9 @@ function ColumnStats({ table }: { table: TableView }) {
                 {c.min !== null ? `${c.min} ～ ${c.max}` : c.length ? `长度 ${c.length.min}～${c.length.max}` : '—'}
               </TableCell>
               <TableCell>{c.formats?.map(f => `${FORMAT_LABELS[f.format] ?? f.format} ${pct(f.share)}`).join('，') || '—'}</TableCell>
+              <TableCell className="whitespace-normal" data-top>
+                {c.top?.map(t => `${t.value}（${t.rows.toLocaleString('zh-CN')}）`).join('，') || '—'}
+              </TableCell>
             </TableRow>
           ))}
         </TableBody>

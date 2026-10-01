@@ -19,3 +19,4 @@
 | [0013](0013-explicit-sync-scope.md) | 成员逐张选定同步范围，只采集与同步范围内的表 | 同步范围、选表、采集 |
 | [0014](0014-read-only-lake-verification.md) | 湖中数据核对（`source.verify`）只读挂载、只出报告，修复只走同步 | 核对任务、覆盖情况报告 |
 | [0015](0015-mapping-publish-and-silver-merge.md) | 映射是平台解析的 YAML（白名单表达式、值字典、去重键），双人发布后按变更批次合并进标准层 | 映射、标准模型、标准层合并、`silver.merge` |
+| [0016](0016-low-cardinality-text-top-values.md) | 列统计只为低基数（≤50）、列名与格式都不像敏感信息的文本列保存常见取值与行数，`min`/`max` 仍不写文本 | 列统计、`ColumnProfile.top`、值字典对照、敏感字段识别 |

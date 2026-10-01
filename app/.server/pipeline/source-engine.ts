@@ -35,12 +35,14 @@ export interface ColumnProfile {
   nullRate: number;
   /** 样本中不同取值的个数（近似） */
   distinct: number;
-  /** 数值与时间列的取值范围；文本列不给取值（可能是手机号等敏感信息），只给长度范围 */
+  /** 数值与时间列的取值范围；文本列不给取值范围（可能是手机号等敏感信息），只给长度范围 */
   min: string | null;
   max: string | null;
   length?: { min: number; max: number };
   /** 文本列的格式特征：样本中符合各格式的比例，只列出至少一半符合的 */
   formats?: { format: TextFormat; share: number }[];
+  /** 低基数、不像敏感信息的文本列：样本中最常见的取值与各自的行数（ADR-0016） */
+  top?: { value: string; rows: number }[];
 }
 
 export type WatermarkKind = 'updated_at' | 'increment';
@@ -71,6 +73,15 @@ const TEXT_FORMATS = {
   objectid: '^[0-9a-f]{24}$',
 } as const;
 export type TextFormat = keyof typeof TEXT_FORMATS;
+
+/** 文本列不同取值（近似）不超过这个数，才保存常见取值；近似计数可能偏少，保存时也以此为上限 */
+const TOP_MAX_DISTINCT = 50;
+/** 常见取值的最大长度：更长的多半是备注等自由文本 */
+const TOP_VALUE_MAX_LENGTH = 64;
+/** 列名像敏感信息的，不保存取值；宁可误伤（如 hotel 命中 tel） */
+const SENSITIVE_NAME = /phone|mobile|tel|mail|name|addr|id_?card|id_?no|passport|cert|birth|ssn|contact|手机|电话|邮箱|姓名|名字|地址|身份证|证件|生日/i;
+/** 样本中有任何一个取值符合这些格式，就不保存取值 */
+const SENSITIVE_FORMATS: TextFormat[] = ['email', 'mobile'];
 
 /** 更新时间字段的常见命名 */
 const UPDATED_AT_NAME = /upd|modif|mtime|chang|last_?edit/i;
@@ -525,6 +536,14 @@ async function profileTable(
       }
       return profile;
     });
+    for (const [i, c] of texts.entries()) {
+      const profile = columns[summary.indexOf(c)];
+      const looksSensitive = SENSITIVE_NAME.test(c.column_name) || SENSITIVE_FORMATS.some(f => Number(textStats[`${f}${i}`] ?? 0) > 0);
+      if (looksSensitive || !profile.length || profile.length.max > TOP_VALUE_MAX_LENGTH || profile.distinct > TOP_MAX_DISTINCT) continue;
+      profile.top = (await rows<{ value: string; rows: string }>(con, `
+        SELECT ${ident(c.column_name)} AS value, count(*) AS rows FROM profile_sample WHERE ${ident(c.column_name)} IS NOT NULL
+        GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT ${TOP_MAX_DISTINCT}`)).map(r => ({ value: r.value, rows: Number(r.rows) }));
+    }
     const candidates: WatermarkCandidate[] = columns
       .filter(c => c.type.startsWith('TIMESTAMP') && UPDATED_AT_NAME.test(c.name) && c.nullRate === 0)
       .map(c => ({ column: c.name, kind: 'updated_at', reason: `时间类型、按命名是更新时间，样本中无空值` }));

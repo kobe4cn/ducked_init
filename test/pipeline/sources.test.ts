@@ -127,6 +127,43 @@ describe('采集表清单、列统计与水位线候选', () => {
     expect(byName.regions.syncModeNote).toBe('没有更新时间或自增主键：每小时全量比对一次');
   });
 
+  it('低基数、不像敏感信息的文本列保存最常见的取值与样本行数；像手机号、邮箱或列名像敏感信息的列不保存', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const input = await pgSourceInput(READER);
+    await grantOnSource(`
+      CREATE TABLE shop.contacts (channel text, note text, contact_tel text, backup text, extra text);
+      INSERT INTO shop.contacts SELECT
+        CASE WHEN i % 3 = 0 THEN 'web' ELSE 'app' END,
+        repeat('长', 200 + i % 2),
+        '021-' || (i % 5),
+        CASE WHEN i % 4 = 0 THEN '1380000000' || (i % 10) ELSE 'none' END,
+        CASE WHEN i % 10 = 0 THEN 'u' || i || '@acme.com' ELSE 'none' END
+      FROM generate_series(1, 30) i;
+      GRANT SELECT ON shop.contacts TO ${READER.user};`);
+    const { id } = await registerSource(engineer, input);
+    await selectAllTables(engineer, id);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    const source = await getSource(engineer, id);
+    const columnsOf = (table: string) => Object.fromEntries(source.tables.find(t => t.name === table)!.columns.map(c => [c.name, c]));
+    const customers = columnsOf('customers');
+    expect(customers.city.top).toHaveLength(4);
+    expect(customers.city.top).toEqual(expect.arrayContaining(['北京', '上海', '广州', '深圳'].map(value => ({ value, rows: 10 }))));
+    // 取值不进 min/max
+    expect(customers.city.min).toBeNull();
+    for (const c of ['name', 'email', 'phone']) expect(customers[c].top).toBeUndefined();
+    expect(columnsOf('orders').status.top).toEqual([{ value: 'paid', rows: 50 }, { value: 'refunded', rows: 50 }]);
+
+    const contacts = columnsOf('contacts');
+    expect(contacts.channel.top).toEqual([{ value: 'app', rows: 20 }, { value: 'web', rows: 10 }]);
+    // 取值过长、列名像电话、样本里混有手机号或邮箱的列都不保存取值
+    expect(contacts.note.top).toBeUndefined();
+    expect(contacts.contact_tel.top).toBeUndefined();
+    expect(contacts.backup.top).toBeUndefined();
+    expect(contacts.extra.top).toBeUndefined();
+  });
+
   it('成员从候选中确认水位线字段；不在候选中的字段被拒绝', async () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
