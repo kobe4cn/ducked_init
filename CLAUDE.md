@@ -8,6 +8,10 @@ Issues live in this repo's GitHub Issues, managed via the `gh` CLI. See `docs/ag
 
 Default canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
 
+### Ticket sizing
+
+A `ready-for-agent` ticket has at most 3 acceptance criteria and an `## Implementation guide` section. Split oversized tickets just in time and write the guide with an Explore subagent. See `docs/agents/ticket-sizing.md`.
+
 ### Domain docs
 
 Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
