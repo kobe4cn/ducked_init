@@ -1,4 +1,4 @@
-// 数据源的 HTTP 接缝：数据工程师在界面上登记、修改与轮换凭据、测试连接、查看列统计并确认水位线；凭据在任何页面与接口里都不回显
+// 数据源的 HTTP 接缝：数据工程师在界面上登记、修改与轮换凭据、测试连接、选定同步范围、查看列统计并确认水位线；凭据在任何页面与接口里都不回显
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -31,6 +31,20 @@ async function register(browser: Client, form: Record<string, string>) {
 
 const sourceIdOf = (res: Response) => res.headers.get('Location')!.match(/^\/sources\/([0-9a-f-]{36})$/)![1];
 
+const PG_TABLES = ['customers', 'events', 'orders', 'regions'];
+
+/** 在数据源页保存同步范围：页面列出 listed 这些表，勾选其中的 tables */
+const saveScope = (browser: Client, id: string, tables: string[], listed = PG_TABLES) =>
+  browser.post(`/sources/${id}`, { intent: 'scope', listed, table: tables });
+
+/** 登记电商库并把可读的表全部选入同步范围，让调度器跑完采集 */
+async function registerAndSelect(browser: Client, input: Record<string, string>, tables = PG_TABLES) {
+  const id = sourceIdOf(await register(browser, input));
+  expect((await saveScope(browser, id, tables)).status).toBe(302);
+  await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+  return id;
+}
+
 describe('登记数据源', () => {
   it('数据工程师登记后跳到数据源页；页面与接口都不回显密码', async () => {
     const { browser } = await engineerOf('acme');
@@ -46,7 +60,9 @@ describe('登记数据源', () => {
     expect(detail).toContain('crm_source_test');
     expect(detail).not.toContain(READER.password);
     expect(detail).not.toContain(READER.password.replace(/'/g, '&#x27;'));
-    expect(detail).toContain('data-profile-status="queued"');
+    // 登记后只列出表，所有表都不在同步范围内，不采集
+    expect(detail).toContain('data-profile-status="none"');
+    expect(detail).toContain('有 4 张新表未选');
   });
 
   it('可写账号被拒绝登记，页面说明哪些对象可写，表单里也不回显密码', async () => {
@@ -134,8 +150,7 @@ describe('测试连接与轮换凭据', () => {
 describe('列统计与水位线', () => {
   it('采集完成后展示每张表的列统计、同步方式与频率：没有水位线的表全量比对，大表每天一次；确认水位线后按增量同步', async () => {
     const { browser } = await engineerOf('acme');
-    const id = sourceIdOf(await register(browser, await pgSourceInput(READER)));
-    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const id = await registerAndSelect(browser, await pgSourceInput(READER));
 
     const html = await (await browser.get(`/sources/${id}`)).text();
     expect(html).toContain('data-profile-status="succeeded"');
@@ -155,8 +170,7 @@ describe('列统计与水位线', () => {
 
   it('展示各表的主键；没有主键的表说明按整行比对，成员可以声明多列业务主键（标出样本中唯一的列），不唯一时拒绝并给出样例', async () => {
     const { browser } = await engineerOf('acme');
-    const id = sourceIdOf(await register(browser, await pgSourceInput(READER)));
-    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const id = await registerAndSelect(browser, await pgSourceInput(READER));
 
     const html = await (await browser.get(`/sources/${id}`)).text();
     expect(html).toMatch(/data-table="customers"[\s\S]*?主键：customer_id/);
@@ -181,13 +195,17 @@ describe('列统计与水位线', () => {
     const id = sourceIdOf(await register(browser, input));
 
     const tested = await (await browser.post(`/sources/${id}`, { intent: 'test' })).text();
-    expect(tested).toContain('连接正常：3 张表，账号只读；1 张表没有读权限，采集时跳过：events');
+    expect(tested).toContain('连接正常：3 张表，账号只读；1 张表没有读权限，不能选入同步范围：events');
+    const refused = await saveScope(browser, id, PG_TABLES);
+    expect(refused.status).toBe(400);
+    expect(await refused.text()).toContain('账号没有表 events 的读权限');
+    expect((await saveScope(browser, id, ['customers', 'orders', 'regions'])).status).toBe(302);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
     const html = await (await browser.get(`/sources/${id}`)).text();
     expect(html).toContain('data-profile-status="succeeded"');
-    expect(html).toContain('已跳过 1 张表：events');
+    expect(html).toContain('不能选入同步范围：events');
     expect(html).not.toContain('data-table="events"');
-    expect(html).toMatch(/data-lake-coverage[^>]*>[\s\S]*?已进湖 0 张，未进湖 4 张[\s\S]*?events（账号没有读权限）/);
+    expect(html).toMatch(/data-lake-coverage[^>]*>[\s\S]*?已进湖 0 张，未进湖 3 张[\s\S]*?账号没有读权限 1 张/);
 
     await grantOnSource(`REVOKE USAGE ON SCHEMA shop FROM ${READER.user}`);
     const rejected = await register(browser, { ...input, name: '电商库 2' });
@@ -199,8 +217,7 @@ describe('列统计与水位线', () => {
 describe('同步', () => {
   it('数据工程师手动触发同步；数据源页显示每张表的同步历史（批次、行数、耗时、水位线）；分析师只能查看', async () => {
     const { tenantId, browser } = await engineerOf('acme');
-    const id = sourceIdOf(await register(browser, await pgSourceInput(READER)));
-    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const id = await registerAndSelect(browser, await pgSourceInput(READER));
 
     const before = await (await browser.get(`/sources/${id}`)).text();
     expect(before).toMatch(/data-lake-coverage[^>]*>[\s\S]*?已进湖 0 张，未进湖 4 张/);
@@ -228,5 +245,57 @@ describe('同步', () => {
     expect(seen).toContain('data-batch="1"');
     expect(seen).not.toContain('name="intent" value="sync"');
     expect((await analyst.post(`/sources/${id}`, { intent: 'sync' })).status).toBe(403);
+  });
+});
+
+describe('同步范围', () => {
+  it('登记后列出表与估算行数、都不在范围内；按表勾选保存后只采集选中的表，取消勾选即移出；分析师只能查看；修改记入审计', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+    const id = sourceIdOf(await register(browser, await pgSourceInput(READER)));
+    const listed = await (await browser.get(`/sources/${id}`)).text();
+    for (const name of PG_TABLES) expect(listed).toMatch(new RegExp(`data-listed="${name}"[^>]*data-in-scope="false"[\\s\\S]*?data-new`));
+    expect(listed).toContain('保存同步范围');
+    expect(listed).toMatch(/data-lake-coverage[^>]*>[\s\S]*?已进湖 0 张，未进湖 0 张；不在同步范围 4 张/);
+
+    expect((await saveScope(browser, id, ['customers', 'regions'])).status).toBe(302);
+    const selected = await (await browser.get(`/sources/${id}`)).text();
+    expect(selected).toContain('data-profile-status="queued"');
+    expect(selected).toMatch(/data-listed="customers"[^>]*data-in-scope="true"[\s\S]*?已选入（de@acme.com/);
+    expect(selected).toMatch(/data-listed="events"[^>]*data-in-scope="false"/);
+    expect(selected).not.toContain('张新表未选');
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const profiled = await (await browser.get(`/sources/${id}`)).text();
+    expect(profiled).toContain('data-table="customers"');
+    expect(profiled).not.toContain('data-table="events"');
+    // 范围内、有水位线候选未确认的表标为待确认水位线
+    expect(profiled).toMatch(/data-lake-coverage[^>]*>[\s\S]*?未进湖 2 张：customers（待确认水位线）、regions（等待首次同步）；不在同步范围 2 张/);
+
+    expect((await saveScope(browser, id, ['customers'])).status).toBe(302);
+    expect(await (await browser.get(`/sources/${id}`)).text()).toMatch(/data-listed="regions"[^>]*data-in-scope="false"/);
+
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an@acme.com');
+    const seen = await (await analyst.get(`/sources/${id}`)).text();
+    expect(seen).toMatch(/data-listed="customers"[^>]*data-in-scope="true"/);
+    expect(seen).not.toContain('保存同步范围');
+    expect((await saveScope(analyst, id, PG_TABLES)).status).toBe(403);
+
+    await memberOf(tenantId, 'admin@acme.com', 'admin');
+    const audit = await (await (await loginAs(app, 'admin@acme.com')).get('/audit')).text();
+    expect(audit).toContain('修改同步范围');
+    expect(audit).toContain('「电商库」，选入 customers、regions');
+    expect(audit).toContain('「电商库」，移出 regions');
+  });
+
+  it('源端删掉范围内的表后重新列出：页面标为源端已不存在；新出现的表提示未选', async () => {
+    const { browser } = await engineerOf('acme');
+    const id = await registerAndSelect(browser, await pgSourceInput(READER), ['regions', 'orders']);
+    await grantOnSource(`DROP TABLE shop.regions; CREATE TABLE shop.coupons (code text PRIMARY KEY); GRANT SELECT ON shop.coupons TO ${READER.user};`);
+    expect((await browser.post(`/sources/${id}`, { intent: 'refresh' })).status).toBe(302);
+    const html = await (await browser.get(`/sources/${id}`)).text();
+    expect(html).toMatch(/data-listed="regions"[^>]*data-in-scope="true"[\s\S]*?data-gone[^>]*>源端已不存在/);
+    expect(html).toMatch(/data-lake-coverage[^>]*>[\s\S]*?regions（源端已不存在）/);
+    expect(html).toContain('有 1 张新表未选');
+    expect(html).toMatch(/data-listed="coupons"[^>]*data-in-scope="false"[\s\S]*?data-new/);
   });
 });

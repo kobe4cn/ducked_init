@@ -12,7 +12,7 @@ import { enqueueDueSyncs, getSyncStatus, syncSource } from '../../app/.server/so
 import { confirmKey, confirmSoftDelete, confirmWatermark, getSource, registerSource, SourceError } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant } from './fixtures';
+import { memberOf, newTenant, selectAllTables } from './fixtures';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { duckdbSourceFile, grantOnSource, MONGO_USERS, pgSourceInput, READER, s3SourceFiles, seedMongoSource, seedMysqlSource } from './source-fixtures';
 
@@ -40,6 +40,7 @@ async function pgSourceWithWatermarks(prepare?: string) {
   const input = await pgSourceInput(READER);
   if (prepare) await grantOnSource(prepare);
   const { id } = await registerSource(engineer, input);
+  await selectAllTables(engineer, id);
   await drain();
   await confirmWatermark(engineer, id, 'customers', 'updated_at');
   await confirmWatermark(engineer, id, 'orders', 'order_id');
@@ -218,6 +219,7 @@ describe('水位线增量同步到原始层', () => {
     const engineer = await memberOf(acme, 'de@acme.com');
     await duckdbSourceFile(acme);
     const { id } = await registerSource(engineer, { kind: 'duckdb', name: '会员文件', path: 'shop.duckdb' });
+    await selectAllTables(engineer, id);
     await drain();
     await confirmWatermark(engineer, id, 'members', 'member_id');
     await syncSource(engineer, id);
@@ -440,6 +442,7 @@ describe('全量比对超出内存上限', () => {
     // 200 万行、没有主键：整行哈希的分组与比对放不进 64 MB（关掉溢写时报内存不足）
     await onSource(`CREATE TABLE lines AS SELECT i // 3 AS order_id, 'SKU' || lpad((i % 7919)::VARCHAR, 6, '0') AS sku, i % 5 AS qty FROM range(2000000) t(i)`);
     const { id } = await registerSource(engineer, { kind: 'duckdb', name: '明细文件', path: 'shop.duckdb' });
+    await selectAllTables(engineer, id);
     await drain();
     await getDb().update(tenants).set({ memoryLimitMb: 64, threads: 1 }).where(eq(tenants.id, acme));
     await sync(engineer, id);
@@ -464,6 +467,7 @@ describe('全量比对超出内存上限', () => {
     // 2000 万行、没有主键：不压缩地放在临时表里就超过 64 MB 内存配额对应的 640 MB 溢写上限
     await onSource(`CREATE TABLE lines AS SELECT i // 5000 AS order_id, 'SKU' || lpad((i % 70001)::VARCHAR, 6, '0') AS sku, (i % 4) + 1 AS qty FROM range(20000000) t(i)`);
     const { id } = await registerSource(engineer, { kind: 'duckdb', name: '明细文件', path: 'shop.duckdb' });
+    await selectAllTables(engineer, id);
     await drain();
     await getDb().update(tenants).set({ memoryLimitMb: 64, threads: 1 }).where(eq(tenants.id, acme));
     await sync(engineer, id);
@@ -495,6 +499,7 @@ describe('全量比对超出内存上限', () => {
     };
     await onSource(`CREATE TABLE lines AS SELECT i AS line_id, i // 5000 AS order_id, 'SKU' || lpad((i % 70001)::VARCHAR, 6, '0') AS sku, (i % 4) + 1 AS qty FROM range(20000000) t(i)`);
     const { id } = await registerSource(engineer, { kind: 'duckdb', name: '明细文件', path: 'shop.duckdb' });
+    await selectAllTables(engineer, id);
     await drain();
     await confirmKey(engineer, id, 'lines', ['line_id']);
     await getDb().update(tenants).set({ memoryLimitMb: 64, threads: 1 }).where(eq(tenants.id, acme));
@@ -524,6 +529,7 @@ describe('手动触发同步', () => {
     // 只剩有水位线候选的 customers 与 orders
     await grantOnSource(`REVOKE SELECT ON shop.events, shop.regions FROM ${READER.user}`);
     const { id } = await registerSource(engineer, input);
+    await selectAllTables(engineer, id);
     await drain();
     await expect(syncSource(engineer, id)).rejects.toThrow(/没有可同步的表/);
 
@@ -600,6 +606,7 @@ describe.skipIf(!process.env.TEST_MYSQL_URL)('MySQL 数据源同步', () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
     const { id } = await registerSource(engineer, { ...(await seedMysqlSource()), name: '订单库', ...READER });
+    await selectAllTables(engineer, id);
     await drain();
     await confirmWatermark(engineer, id, 'orders', 'updated_at');
     await syncSource(engineer, id);
@@ -613,6 +620,7 @@ describe.skipIf(!process.env.TEST_MONGO_URL)('MongoDB 数据源同步', () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
     const { id } = await registerSource(engineer, { ...(await seedMongoSource()), name: '商城', ...MONGO_USERS.reader });
+    await selectAllTables(engineer, id);
     await drain();
     await confirmWatermark(engineer, id, 'customers', 'updated_at');
     await confirmWatermark(engineer, id, 'orders', '_id');
@@ -649,6 +657,7 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储上的数据源与�
     const files = await s3SourceFiles(acme);
     try {
       const { id } = await registerSource(engineer, { ...files.base, name: '文件', ...files.reader });
+      await selectAllTables(engineer, id);
       await drain();
       await confirmWatermark(engineer, id, 'customers', 'updated_at');
       await syncSource(engineer, id);

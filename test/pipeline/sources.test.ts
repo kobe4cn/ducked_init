@@ -1,4 +1,4 @@
-// 数据源登记的流水线接缝：成员登记数据源（领域函数）→ 平台探测只读、加密保存凭据 → 调度器派发采集任务 → 查看表清单、列统计与水位线候选
+// 数据源登记的流水线接缝：成员登记数据源（领域函数）→ 平台探测只读、加密保存凭据、列出表 → 选入同步范围后调度器派发采集任务 → 查看列统计与水位线候选
 import { rm, symlink } from 'node:fs/promises';
 import pg from 'pg';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -9,7 +9,7 @@ import { loadSourceSpec } from '../../app/.server/source-config';
 import { confirmWatermark, getSource, registerSource, SourceError, testSource } from '../../app/.server/sources';
 import { claimNextTask, finishTask } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant } from './fixtures';
+import { memberOf, newTenant, selectAllTables } from './fixtures';
 import { duckdbSourceFile, grantOnSource, MONGO_USERS, pgSourceInput, READER, s3SourceFiles, seedMongoSource, seedMysqlSource, WRITER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -46,6 +46,7 @@ describe('登记时校验账号只读', () => {
     await grantOnSource(`REVOKE SELECT ON shop.events FROM ${READER.user}`);
 
     const { id, tables, unreadable } = await registerSource(engineer, input);
+    await selectAllTables(engineer, id);
     expect(tables).not.toContain('events');
     expect(unreadable).toEqual(['events']);
     expect(await testSource(engineer, id)).toMatchObject({ unreadable: ['events'] });
@@ -70,6 +71,7 @@ describe('凭据加密保存', () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
     const { id } = await registerSource(engineer, await pgSourceInput(READER));
+    await selectAllTables(engineer, id);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
     const db = new pg.Client({ connectionString: process.env.PLATFORM_DATABASE_URL });
@@ -91,10 +93,11 @@ describe('凭据加密保存', () => {
 });
 
 describe('采集表清单、列统计与水位线候选', () => {
-  it('登记后自动采集：每张表的行数、列统计，以及更新时间 / 自增主键候选', async () => {
+  it('选入同步范围后采集：每张表的行数、列统计，以及更新时间 / 自增主键候选', async () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
     const { id } = await registerSource(engineer, await pgSourceInput(READER));
+    await selectAllTables(engineer, id);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
     const source = await getSource(engineer, id);
@@ -128,6 +131,7 @@ describe('采集表清单、列统计与水位线候选', () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
     const { id } = await registerSource(engineer, await pgSourceInput(READER));
+    await selectAllTables(engineer, id);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
     await expect(confirmWatermark(engineer, id, 'customers', 'created_at')).rejects.toThrow('不是');
@@ -146,8 +150,9 @@ describe('任务运行时的数据源连接', () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
     const { id } = await registerSource(engineer, await pgSourceInput(READER));
+    await selectAllTables(engineer, id);
     const task = (await claimNextTask())!;
-    expect(task.params).toEqual({ sourceId: id });
+    expect(task.params).toEqual({ sourceId: id, tables: ['customers', 'events', 'orders', 'regions'] });
     expect(task.source).toMatchObject({ kind: 'postgres', user: READER.user, password: READER.password });
 
     const session = await openSource(task.source!, task.limits);
@@ -171,6 +176,7 @@ describe('任务运行时的数据源连接', () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
     const { id } = await registerSource(engineer, await pgSourceInput(READER));
+    await selectAllTables(engineer, id);
     await grantOnSource(`GRANT DELETE ON shop.regions TO ${READER.user}`);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
@@ -187,6 +193,7 @@ describe('DuckDB 文件数据源', () => {
     const engineer = await memberOf(acme, 'de@acme.com');
     await duckdbSourceFile(acme);
     const { id, tables } = await registerSource(engineer, { kind: 'duckdb', name: '会员文件', path: 'shop.duckdb' });
+    await selectAllTables(engineer, id);
     expect(tables).toEqual(['members']);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
@@ -202,6 +209,7 @@ describe('DuckDB 文件数据源', () => {
     const engineer = await memberOf(acme, 'de@acme.com');
     const path = await duckdbSourceFile(acme);
     const { id } = await registerSource(engineer, { kind: 'duckdb', name: '会员文件', path: 'shop.duckdb' });
+    await selectAllTables(engineer, id);
     await rm(path);
     await symlink(await duckdbSourceFile(globex), path);
 
@@ -230,6 +238,7 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储文件数据源', ()
       await expect(registerSource(engineer, { ...files.base, name: '文件', ...files.writer })).rejects.toThrow(/可写[\s\S]*（PutObject）/);
       await expect(registerSource(engineer, { ...files.base, name: '文件', ...files.deleter })).rejects.toThrow(/可写[\s\S]*（DeleteObject）/);
       const { id, tables } = await registerSource(engineer, { ...files.base, name: '文件', ...files.reader });
+      await selectAllTables(engineer, id);
       expect(tables).toEqual(['customers', 'orders']);
       await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
@@ -252,6 +261,7 @@ describe.skipIf(!process.env.TEST_MYSQL_URL)('MySQL 数据源', () => {
     const base = await seedMysqlSource();
     await expect(registerSource(engineer, { ...base, name: '订单库', ...WRITER })).rejects.toThrow(/可写[\s\S]*orders[\s\S]*INSERT/);
     const { id, tables } = await registerSource(engineer, { ...base, name: '订单库', ...READER });
+    await selectAllTables(engineer, id);
     expect(tables).toEqual(['orders']);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
@@ -273,6 +283,7 @@ describe.skipIf(!process.env.TEST_MONGO_URL)('MongoDB 数据源', () => {
     await expect(registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.reader, password: 'wrong' })).rejects.toThrow(/无法连接数据源/);
 
     const { id, tables } = await registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.reader });
+    await selectAllTables(engineer, id);
     expect(tables).toEqual(['customers', 'events', 'orders']);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
@@ -292,6 +303,7 @@ describe.skipIf(!process.env.TEST_MONGO_URL)('MongoDB 数据源', () => {
     const engineer = await memberOf(acme, 'de@acme.com');
     const base = await seedMongoSource();
     const { id, tables, unreadable } = await registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.partial });
+    await selectAllTables(engineer, id);
     expect({ tables, unreadable }).toEqual({ tables: ['customers'], unreadable: ['events', 'orders'] });
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
     const source = await getSource(engineer, id);
@@ -305,6 +317,7 @@ describe.skipIf(!process.env.TEST_MONGO_URL)('MongoDB 数据源', () => {
     const base = await seedMongoSource();
     // 用可写账号直接挂载（绕过登记时的探测），验证挂载本身也拦住写入
     const { id } = await registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.reader });
+    await selectAllTables(engineer, id);
     const spec = await loadSourceSpec(acme, id);
     const session = await openSource({ ...spec, ...MONGO_USERS.writer } as typeof spec, { memoryLimitMb: 256, threads: 1 });
     try {

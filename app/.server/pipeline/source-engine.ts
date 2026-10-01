@@ -1,4 +1,4 @@
-// app/.server/pipeline/source-engine.ts —— 连接租户的数据源：只读挂载、探测账号写权限、列出源表、采集列统计与水位线候选。
+// app/.server/pipeline/source-engine.ts —— 连接租户的数据源：只读挂载、探测账号写权限、列出源表（不读行）、采集给定表的列统计与水位线候选。
 // 平台进程（登记、测试连接）与工作进程（采集任务）共用。凭据以临时 secret 注入独立的内存 DuckDB，不落盘；
 // 挂载后锁住配置：不能再挂载其他库、读其他路径。平台从不向源端发送写语句：PostgreSQL 的只读挂载把一切语句都放在只读事务里，
 // 发往源端的只有这里写死的只读查询（成员与模型都不能给出发往源端的 SQL）。MongoDB 经社区扩展 mongo 只读挂载，
@@ -371,16 +371,39 @@ export async function writeGrants(session: Pick<SourceSession, 'con' | 'mongo'>,
   }
 }
 
-/** 测试连接：能否挂载、哪些表可读、哪些表没有读权限（及其 schema）、账号是否可写 */
+/** 列出表得到的一张表：名称、所在 schema、账号能否读取，以及源端廉价给出的估算行数（没有时为 null） */
+export interface ListedTable { name: string; schema: string; readable: boolean; estimatedRows: number | null }
+
+/**
+ * 源端统计信息里的估算行数（表名 → 行数），不读任何行：PostgreSQL 取 pg_class.reltuples（从没统计过的表为 -1，不给），
+ * MySQL 取 information_schema.TABLES.TABLE_ROWS。其他数据源不给
+ */
+async function estimatedRows(con: DuckDBConnection, spec: SourceSpec): Promise<Map<string, number>> {
+  let found: { name: string; n: string | number }[] = [];
+  if (spec.kind === 'postgres') {
+    found = await rows(con, `SELECT * FROM postgres_query('src', ${lit(`
+      SELECT c.relname::text AS name, c.reltuples::bigint AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = ${lit(spec.schema)} AND c.relkind IN ('r', 'p', 'm', 'f') AND c.reltuples >= 0`)})`);
+  } else if (spec.kind === 'mysql') {
+    found = await rows(con, `SELECT * FROM mysql_query('src', ${lit(`
+      SELECT TABLE_NAME AS name, TABLE_ROWS AS n FROM information_schema.TABLES
+      WHERE TABLE_SCHEMA = ${lit(spec.database)} AND TABLE_ROWS IS NOT NULL`)})`);
+  }
+  return new Map(found.map(r => [r.name, Number(r.n)]));
+}
+
+/** 测试连接与列出表：能否挂载、各表（含读权限与估算行数）、哪些表没有读权限（及其 schema）、账号是否可写。不读任何行 */
 export async function inspectSource(spec: SourceSpec, limits: EngineLimits) {
   const session = await openSource(spec, limits);
   try {
     const all = await session.tables();
     const unreadable = all.filter(t => !t.readable);
+    const estimates = await estimatedRows(session.con, spec);
     return {
       tables: all.filter(t => t.readable).map(t => t.name),
       unreadable: unreadable.map(t => t.name),
       unreadableSchemas: [...new Set(unreadable.map(t => t.schema))],
+      listed: all.map((t): ListedTable => ({ name: t.name, schema: t.schema, readable: t.readable, estimatedRows: estimates.get(t.table) ?? null })),
       writable: await writeGrants(session, spec),
     };
   } catch (e) {
@@ -520,21 +543,25 @@ async function profileTable(
   }
 }
 
-/** 采集可读源表的列统计与水位线候选，并列出跳过的无读权限的表。账号可写时拒绝采集（登记之后才被授予写权限的账号） */
-export async function profileSource(spec: SourceSpec, limits: EngineLimits, { sampleRows = 100_000 } = {}) {
+/**
+ * 采集给定的源表（同步范围内的表）的列统计与水位线候选，不碰其他表；列出其中跳过的无读权限的表。
+ * 账号可写时拒绝采集（登记之后才被授予写权限的账号）
+ */
+export async function profileSource(spec: SourceSpec, limits: EngineLimits, { tables: names, sampleRows = 100_000 }: { tables: string[]; sampleRows?: number }) {
   const session = await openSource(spec, limits);
   try {
     const writable = await writeGrants(session, spec);
     if (writable.length) throw new Error(`账号可以写入数据源（${writable.map(g => g.object).join('、')}），平台只使用只读账号，请更换账号`);
     const increments = await incrementKeys(session.con, spec);
     const all = await session.tables();
-    const primary = await primaryKeys(session.con, spec, all);
+    const selected = all.filter(t => names.includes(t.name));
+    const primary = await primaryKeys(session.con, spec, selected);
     const tables: TableProfile[] = [];
-    for (const t of all.filter(t => t.readable)) {
+    for (const t of selected.filter(t => t.readable)) {
       const keys = { increment: increments.get(t.name), primary: primary.get(t.name) ?? [] };
       tables.push(await profileTable(session.con, t, keys, sampleRows, spec.kind === 'mongodb'));
     }
-    return { tables, unreadable: all.filter(t => !t.readable).map(t => t.name) };
+    return { tables, unreadable: selected.filter(t => !t.readable).map(t => t.name) };
   } catch (e) {
     throw new Error(redactSourceSecrets((e as Error).message, spec));
   } finally {

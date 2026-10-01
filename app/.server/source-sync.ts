@@ -38,7 +38,7 @@ export async function syncSource(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'sources:write');
   await requireSource(actor.tenant.id, sourceId);
   const tables = (await syncTables(actor.tenant.id, sourceId)).map(t => t.param);
-  if (!tables.length) throw new SourceError('没有可同步的表：请先采集，并在源表中确认水位线字段');
+  if (!tables.length) throw new SourceError('没有可同步的表：请先选定同步范围，并为待确认水位线的表确认水位线字段');
   const { task, reason } = await getDb().transaction(tx => enqueueSync(tx, actor.tenant.id, sourceId, tables));
   if (!task) throw new SourceError(reason!);
   return task;

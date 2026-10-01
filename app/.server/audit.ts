@@ -47,6 +47,14 @@ const ACTIONS = {
       d.credentialsRotated ? '轮换凭据' : '',
     ].filter(Boolean).join('，'),
   },
+  'source.scope_changed': {
+    label: '修改同步范围',
+    describe: (d: Detail) => [
+      `「${d.name}」`,
+      (d.added as string[]).length ? `选入 ${(d.added as string[]).join('、')}` : '',
+      (d.removed as string[]).length ? `移出 ${(d.removed as string[]).join('、')}` : '',
+    ].filter(Boolean).join('，'),
+  },
   'source.watermark_confirmed': { label: '确认水位线', describe: (d: Detail) => `「${d.name}」${d.table}：${d.column}` },
   'source.key_confirmed': { label: '确认业务主键', describe: (d: Detail) => `「${d.name}」${d.table}：${d.column}` },
   'source.soft_delete_confirmed': { label: '确认软删除字段', describe: (d: Detail) => `「${d.name}」${d.table}：${d.column}` },

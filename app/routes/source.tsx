@@ -1,7 +1,8 @@
-// app/routes/source.tsx —— 单个数据源：连接参数（凭据不显示）、测试连接、修改与轮换凭据、重新采集；
-// 各表的行数、列统计、同步方式与频率、是否已进湖与水位线候选，成员从候选中确认水位线字段，没有主键的表声明业务主键（可多列），
+// app/routes/source.tsx —— 单个数据源：连接参数（凭据不显示）、测试连接、修改与轮换凭据、重新列出表并采集；
+// 同步范围：列出的表（估算行数、读权限、新表、源端已不存在），成员按 schema 全选、按名称过滤后批量选，保存的是逐张的表清单（ADR-0013）；
+// 范围内各表的行数、列统计、同步方式与频率、是否已进湖与水位线候选，成员从候选中确认水位线字段，没有主键的表声明业务主键（可多列），
 // 有主键的表声明软删除字段；手动触发同步，查看每张表的同步历史
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
 import { CircleAlert, CircleCheck } from 'lucide-react';
 import type { Route } from './+types/source';
@@ -9,7 +10,7 @@ import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { getSyncStatus, syncSource } from '~/.server/source-sync';
 import {
-  confirmKey, confirmSoftDelete, confirmWatermark, getSource, refreshSourceProfile, SourceError, testSource, updateSource,
+  confirmKey, confirmSoftDelete, confirmWatermark, getSource, relistSource, setSyncScope, SourceError, testSource, updateSource,
 } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { formValues, SOURCE_KIND_LABELS, SYNC_MODES, type SyncMode } from '~/lib/sources';
@@ -61,7 +62,13 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         unreadable: source.profile.unreadable,
         profiledAt: source.profile.profiledAt?.toISOString() ?? null,
       },
-      tables: source.tables.map(t => ({ ...t, notInLake: notInLakeReason(t, sync.history[t.name]) })),
+      listing: source.listing.map(t => ({
+        ...t,
+        scopedAt: t.scopedAt?.toISOString() ?? null,
+        notInLake: t.inScope ? notInLakeReason(t, source.tables.find(p => p.name === t.name), sync.history[t.name]) : null,
+      })),
+      newTables: source.newTables,
+      tables: source.tables.map(t => ({ ...t, notInLake: notInLakeReason(source.listing.find(l => l.name === t.name)!, t, sync.history[t.name]) })),
       sync: {
         status: sync.status,
         statusLabel: sync.status === 'none' ? '未同步' : TASK_STATUS_LABELS[sync.status],
@@ -85,15 +92,22 @@ export async function action({ request, params }: Route.ActionArgs) {
     switch (field('intent')) {
       case 'test': {
         const { tables, unreadable } = await testSource(member, params.sourceId);
-        const skipped = unreadable.length ? `；${unreadable.length} 张表没有读权限，采集时跳过：${unreadable.join('、')}` : '';
+        const skipped = unreadable.length ? `；${unreadable.length} 张表没有读权限，不能选入同步范围：${unreadable.join('、')}` : '';
         return { ok: `连接正常：${tables.length} 张表，账号只读${skipped}`, error: null, values: null };
       }
       case 'update':
         await updateSource(member, params.sourceId, Object.fromEntries([...form].map(([k, v]) => [k, String(v)])));
         break;
       case 'refresh':
-        await refreshSourceProfile(member, params.sourceId);
+        await relistSource(member, params.sourceId);
         break;
+      case 'scope': {
+        // 表单列出了哪些表（listed）、其中勾选了哪些（table）：勾选的选入，列出了却没勾选的移出
+        const selected = form.getAll('table').map(String);
+        const remove = form.getAll('listed').map(String).filter(name => !selected.includes(name));
+        await setSyncScope(member, params.sourceId, { add: selected, remove });
+        break;
+      }
       case 'sync':
         await syncSource(member, params.sourceId);
         break;
@@ -119,12 +133,18 @@ export async function action({ request, params }: Route.ActionArgs) {
 }
 
 /**
- * 源表为什么没有进湖；同步成功过（写出过变更批次）的表返回 null。
- * 同步页只列出同步过的表，这里从源端的全部表出发，没进湖的表不会被漏看
+ * 同步范围内的表为什么没有进湖；同步成功过（写出过变更批次）的表返回 null。
+ * 同步页只列出同步过的表，这里从范围内的全部表出发，没进湖的表不会被漏看
  */
-function notInLakeReason(t: { syncMode: SyncMode }, history: object[] | undefined): string | null {
+function notInLakeReason(
+  t: { gone: boolean; readable: boolean }, profiled: { syncMode: SyncMode } | undefined, history: object[] | undefined,
+): string | null {
   if (history?.some(e => !('error' in e))) return null;
-  if (t.syncMode === 'needs_confirmation') return '待确认水位线';
+  // 重新列出表之前，最近一次同步发现源端已没有这张表
+  if (t.gone || (history?.[0] && 'gone' in history[0])) return '源端已不存在';
+  if (!t.readable) return '账号没有读权限';
+  if (!profiled) return '等待采集';
+  if (profiled.syncMode === 'needs_confirmation') return '待确认水位线';
   return history?.length ? '同步失败' : '等待首次同步';
 }
 
@@ -134,6 +154,7 @@ const pct = (n: number) => `${Math.round(n * 1000) / 10}%`;
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
 type TableView = Route.ComponentProps['loaderData']['tables'][number];
+type ListedView = Route.ComponentProps['loaderData']['listing'][number];
 type SyncEntry = Route.ComponentProps['loaderData']['sync']['history'][string][number];
 
 const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
@@ -166,9 +187,11 @@ function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }
         </TableHeader>
         <TableBody>
           {entries.map((e, i) => 'error' in e ? (
-            <TableRow key={`${e.taskId}-${i}`} data-sync-error>
+            <TableRow key={`${e.taskId}-${i}`} data-sync-error={e.gone ? undefined : true} data-sync-gone={e.gone ? true : undefined}>
               <TableCell>—</TableCell>
-              <TableCell colSpan={3} className="whitespace-normal text-destructive">{`失败：${e.error}`}</TableCell>
+              <TableCell colSpan={3} className={`whitespace-normal ${e.gone ? 'text-muted-foreground' : 'text-destructive'}`}>
+                {e.gone ? `跳过：${e.error}` : `失败：${e.error}`}
+              </TableCell>
               <TableCell>—</TableCell>
               <TableCell>{time(e.startedAt)}</TableCell>
             </TableRow>
@@ -188,17 +211,119 @@ function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }
   );
 }
 
-/** 进湖情况：源端的表（含账号读不了的）有几张已经进湖，没进湖的逐张说明原因 */
-function LakeCoverage({ tables, unreadable }: { tables: TableView[]; unreadable: string[] }) {
-  const missing = [
-    ...tables.filter(t => t.notInLake).map(t => `${t.name}（${t.notInLake}）`),
-    ...unreadable.map(name => `${name}（账号没有读权限）`),
-  ];
-  const inLake = tables.length - tables.filter(t => t.notInLake).length;
+/** 进湖情况：同步范围内的表有几张已经进湖，没进湖的逐张说明原因；范围外的表只计数 */
+function LakeCoverage({ listing }: { listing: ListedView[] }) {
+  const scoped = listing.filter(t => t.inScope);
+  const missing = scoped.filter(t => t.notInLake).map(t => `${t.name}（${t.notInLake}）`);
+  const outside = listing.filter(t => !t.inScope);
+  const unreadable = outside.filter(t => !t.readable).length;
+  const others = [
+    outside.length - unreadable ? `不在同步范围 ${outside.length - unreadable} 张` : '',
+    unreadable ? `账号没有读权限 ${unreadable} 张` : '',
+  ].filter(Boolean).join('，');
   return (
     <div className={`text-sm ${missing.length ? 'text-destructive' : 'text-muted-foreground'}`} data-lake-coverage>
-      {`已进湖 ${inLake} 张，未进湖 ${missing.length} 张${missing.length ? `：${missing.join('、')}` : ''}`}
+      {`已进湖 ${scoped.length - missing.length} 张，未进湖 ${missing.length} 张${missing.length ? `：${missing.join('、')}` : ''}${others ? `；${others}` : ''}`}
     </div>
+  );
+}
+
+/**
+ * 同步范围：列出的全部表，按 schema 分组。可按名称过滤、按 schema 全选；过滤只是隐藏，保存时提交的是逐张勾选的表。
+ * 账号读不了、源端已不存在的表不能选入（已在范围内的可以移出）。服务端的范围变了（保存、重新列出表）时由调用方换 key 重置勾选
+ */
+function SyncScope({ listing, newTables, canWrite, submitting }: { listing: ListedView[]; newTables: number; canWrite: boolean; submitting: boolean }) {
+  const [filter, setFilter] = useState('');
+  const [selected, setSelected] = useState(() => new Set(listing.filter(t => t.inScope).map(t => t.name)));
+  const visible = (t: ListedView) => t.name.toLowerCase().includes(filter.trim().toLowerCase());
+  const addable = (t: ListedView) => canWrite && t.readable && !t.gone;
+  const selectable = (t: ListedView) => addable(t) || (canWrite && t.inScope);
+  const schemas = [...new Set(listing.map(t => t.schema))];
+  const toggle = (names: string[], on: boolean) => setSelected(prev => {
+    const next = new Set(prev);
+    for (const n of names) on ? next.add(n) : next.delete(n);
+    return next;
+  });
+  return (
+    <Form method="post" className="space-y-3">
+      <input type="hidden" name="intent" value="scope" />
+      {newTables > 0 && (
+        <div className="text-sm text-destructive" data-new-tables={newTables}>{`有 ${newTables} 张新表未选`}</div>
+      )}
+      {canWrite && (
+        <div className="flex flex-wrap items-center gap-2">
+          <Input className="max-w-64" placeholder="按名称过滤" value={filter} onChange={e => setFilter(e.target.value)} aria-label="按名称过滤" />
+          <Button type="button" variant="outline" size="sm" onClick={() => toggle(listing.filter(t => visible(t) && addable(t)).map(t => t.name), true)}>
+            全选过滤结果
+          </Button>
+          <Button type="button" variant="outline" size="sm" onClick={() => toggle(listing.filter(visible).map(t => t.name), false)}>
+            取消过滤结果
+          </Button>
+        </div>
+      )}
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="w-8" />
+            <TableHead>表</TableHead>
+            <TableHead>估算行数</TableHead>
+            <TableHead>状态</TableHead>
+          </TableRow>
+        </TableHeader>
+        {schemas.map(schema => {
+          const group = listing.filter(t => t.schema === schema);
+          const shown = group.filter(visible);
+          const choices = shown.filter(addable);
+          return (
+            <TableBody key={schema} data-schema={schema}>
+              {schemas.length > 1 || schema ? (
+                <TableRow hidden={!shown.length}>
+                  <TableCell>
+                    {canWrite && (
+                      <input
+                        type="checkbox"
+                        aria-label={`全选 ${schema || '全部'}`}
+                        disabled={!choices.length}
+                        checked={choices.length > 0 && choices.every(t => selected.has(t.name))}
+                        onChange={e => toggle(choices.map(t => t.name), e.target.checked)}
+                      />
+                    )}
+                  </TableCell>
+                  <TableCell colSpan={3} className="font-medium">{schema || '（无 schema）'}</TableCell>
+                </TableRow>
+              ) : null}
+              {group.map(t => (
+                <TableRow key={t.name} hidden={!visible(t)} data-listed={t.name} data-in-scope={String(t.inScope)}>
+                  <TableCell>
+                    <input type="hidden" name="listed" value={t.name} />
+                    <input
+                      type="checkbox"
+                      name="table"
+                      value={t.name}
+                      aria-label={t.name}
+                      disabled={!selectable(t)}
+                      checked={selected.has(t.name)}
+                      onChange={e => toggle([t.name], e.target.checked)}
+                    />
+                  </TableCell>
+                  <TableCell className="font-mono">{t.name}</TableCell>
+                  <TableCell>{t.estimatedRows === null ? '—' : `约 ${t.estimatedRows.toLocaleString('zh-CN')}`}</TableCell>
+                  <TableCell className="space-x-1 whitespace-normal">
+                    {t.gone && <Badge variant="destructive" data-gone>源端已不存在</Badge>}
+                    {!t.readable && !t.gone && <Badge variant="outline">账号没有读权限</Badge>}
+                    {t.isNew && <Badge variant="secondary" data-new>新表</Badge>}
+                    {t.inScope && (
+                      <span className="text-xs text-muted-foreground">{`已选入${t.scopedBy ? `（${t.scopedBy}，${time(t.scopedAt)}）` : ''}`}</span>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          );
+        })}
+      </Table>
+      {canWrite && <Button type="submit" disabled={submitting}>保存同步范围</Button>}
+    </Form>
   );
 }
 
@@ -335,7 +460,7 @@ function SoftDelete({ table, canWrite, submitting }: { table: TableView; canWrit
 }
 
 export default function Source({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, source, profile, tables, sync } = loaderData;
+  const { email, nav, canWrite, source, profile, listing, newTables, tables, sync } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const profiling = profile.status === 'queued' || profile.status === 'running';
   const syncing = sync.status === 'queued' || sync.status === 'running';
@@ -392,10 +517,28 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
               </Form>
               <Form method="post">
                 <input type="hidden" name="intent" value="refresh" />
-                <Button type="submit" variant="outline" disabled={submitting}>重新采集</Button>
+                <Button type="submit" variant="outline" disabled={submitting}>重新列出表并采集</Button>
               </Form>
             </div>
           )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>同步范围</CardTitle>
+          <CardDescription>
+            只有选入同步范围的表才会采集列统计、同步进原始层。新出现的表默认不选；移出范围只停止同步，已进湖的数据保留，重新选回后接着同步。
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <SyncScope
+            key={listing.map(t => `${t.name}:${t.inScope}`).join('\n')}
+            listing={listing}
+            newTables={newTables}
+            canWrite={canWrite}
+            submitting={submitting}
+          />
         </CardContent>
       </Card>
 
@@ -406,17 +549,17 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
             <Badge variant={TASK_VARIANTS[profile.status]} data-profile-status={profile.status}>{`采集${profile.statusLabel}`}</Badge>
           </CardTitle>
           <CardDescription>
-            {`有更新时间或自增主键的表按水位线增量同步（需确认字段）；没有的表全量比对：每小时一次，大表每天一次。最近采集：${time(profile.profiledAt)}`}
+            {`同步范围内的表：有更新时间或自增主键的按水位线增量同步（需确认字段），没有的全量比对：每小时一次，大表每天一次。最近采集：${time(profile.profiledAt)}`}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          {(tables.length > 0 || profile.unreadable.length > 0) && <LakeCoverage tables={tables} unreadable={profile.unreadable} />}
+          {listing.length > 0 && <LakeCoverage listing={listing} />}
           {profile.status === 'failed' && profile.error && (
             <div className="text-sm text-destructive">{`${time(profile.attemptedAt)} 提交的采集失败：${profile.error}`}</div>
           )}
           {profile.unreadable.length > 0 && (
             <div className="text-sm text-muted-foreground" data-unreadable>
-              {`账号没有读权限，已跳过 ${profile.unreadable.length} 张表：${profile.unreadable.join('、')}。需要时在源库授予 SELECT 后重新采集`}
+              {`账号没有读权限的 ${profile.unreadable.length} 张表不能选入同步范围：${profile.unreadable.join('、')}。需要时在源库授予 SELECT 后重新列出表`}
             </div>
           )}
           <Table>
@@ -452,7 +595,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
               {!tables.length && (
                 <TableRow>
                   <TableCell colSpan={3} className="text-center text-muted-foreground">
-                    {profiling ? '正在采集表清单与列统计…' : '暂无表'}
+                    {profiling ? '正在采集列统计…' : '同步范围内还没有采集过的表'}
                   </TableCell>
                 </TableRow>
               )}

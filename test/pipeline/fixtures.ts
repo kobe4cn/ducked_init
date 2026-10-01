@@ -1,10 +1,11 @@
-// test/pipeline/fixtures.ts —— 流水线接缝的夹具：直接调用领域函数开通租户、入队任务并让调度器把队列跑空
+// test/pipeline/fixtures.ts —— 流水线接缝的夹具：直接调用领域函数开通租户、入队任务并让调度器把队列跑空、把数据源的表全部选入同步范围
 import { and, eq } from 'drizzle-orm';
 import type { CurrentMember } from '../../app/.server/auth';
 import { getDb } from '../../app/.server/db/client';
 import { members, spaces, tenants, type Role } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { enqueueTask, getTask, type TaskKind } from '../../app/.server/tasks';
+import { getSource, setSyncScope } from '../../app/.server/sources';
 import { createTenant } from '../../app/.server/tenants';
 
 /** 开通一个租户，返回租户 ID */
@@ -37,4 +38,10 @@ export async function memberOf(tenantId: string, email: string, role: Role = 'da
     .innerJoin(spaces, and(eq(spaces.tenantId, tenants.id), eq(spaces.isDefault, true)))
     .where(and(eq(members.tenantId, tenantId), eq(members.email, email)));
   return row;
+}
+
+/** 把数据源列出的、账号可读的表全部选入同步范围（选入后入队采集，调用方再让调度器跑空） */
+export async function selectAllTables(member: CurrentMember, sourceId: string) {
+  const { listing } = await getSource(member, sourceId);
+  await setSyncScope(member, sourceId, { add: listing.filter(t => t.readable && !t.gone).map(t => t.name) });
 }

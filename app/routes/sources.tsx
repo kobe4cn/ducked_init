@@ -104,7 +104,7 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
         <Card>
           <CardHeader>
             <CardTitle>登记数据源</CardTitle>
-            <CardDescription>登记前平台会连接数据源并探测账号的写权限，可写的账号会被拒绝。登记后自动采集表清单与列统计。</CardDescription>
+            <CardDescription>登记前平台会连接数据源并探测账号的写权限，可写的账号会被拒绝。登记后列出表（不读取数据），在数据源页选定要同步的表，平台只采集与同步选中的表。</CardDescription>
           </CardHeader>
           <CardContent>
             <Form method="post">

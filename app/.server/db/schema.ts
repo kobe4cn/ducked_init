@@ -1,6 +1,6 @@
 // app/.server/db/schema.ts —— 平台元数据（平台 PostgreSQL 的 platform schema）。业务数据不落这里（ADR-0002）
 import { sql } from 'drizzle-orm';
-import { boolean, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { ROLES } from '../../lib/roles';
 import { SOURCE_KINDS } from '../../lib/sources';
 
@@ -231,11 +231,25 @@ export const sources = platform.table('sources', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, t => [uniqueIndex('sources_tenant_name_uq').on(t.tenantId, t.name)]);
 
-// 数据源里每张表由成员确认的设置：本期只有水位线字段（从平台给出的候选中确认）。
-// 表清单与列统计来自最近一次成功的采集任务（source.profile）的结果
+// 数据源里的每张表：最近一次列出表得到的清单（schema、读权限、估算行数，源端删掉的表记下发现的时间），
+// 成员选定的同步范围（ADR-0013），以及成员确认的水位线字段、业务主键与软删除字段。
+// 列统计来自采集任务（source.profile）的结果，只采集同步范围内的表
 export const sourceTables = platform.table('source_tables', {
   sourceId: uuid('source_id').notNull().references(() => sources.id, { onDelete: 'cascade' }),
   tableName: text('table_name').notNull(),
+  /** 表所在的 schema（PostgreSQL 的 schema、MySQL 与 MongoDB 的库、DuckDB 文件里的 schema；对象存储文件为空串） */
+  tableSchema: text('table_schema').notNull().default(''),
+  readable: boolean('readable').notNull().default(true),
+  /** 源端廉价给出的估算行数（PostgreSQL 的 reltuples、MySQL 的 TABLE_ROWS）；其他数据源与没有统计信息的表为 null */
+  estimatedRows: bigint('estimated_rows', { mode: 'number' }),
+  /** 第一次列出这张表的时间 */
+  discoveredAt: timestamp('discovered_at', { withTimezone: true }).notNull().defaultNow(),
+  /** 重新列出表时源端已经没有这张表：发现的时间（又出现时清空） */
+  goneAt: timestamp('gone_at', { withTimezone: true }),
+  /** 是否在同步范围内；选入、移出的成员与时间（迁移回填的表没有成员） */
+  inScope: boolean('in_scope').notNull().default(false),
+  scopedByEmail: text('scoped_by_email'),
+  scopedAt: timestamp('scoped_at', { withTimezone: true }),
   watermarkColumn: text('watermark_column'),
   confirmedByEmail: text('confirmed_by_email'),
   confirmedAt: timestamp('confirmed_at', { withTimezone: true }),

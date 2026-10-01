@@ -85,16 +85,18 @@ export const HANDLERS = {
       return { tables: await inventory(con) };
     },
   },
-  // 采集数据源：表清单、行数、列统计与水位线候选。数据源只读挂载在另一个 DuckDB 里，不碰本租户的数据湖
+  // 采集数据源：同步范围内的表（参数 tables）的行数、列统计与水位线候选，范围外的表不碰。
+  // 数据源只读挂载在另一个 DuckDB 里，不碰本租户的数据湖
   'source.profile': {
     label: '采集数据源',
-    async run(_con, _params, { source, limits }) {
+    async run(_con, params, { source, limits }) {
       if (!source) throw new Error('缺少数据源');
-      return profileSource(source, limits);
+      if (!isStrings(params.tables)) throw new Error('参数 tables 必须是非空的表名列表');
+      return profileSource(source, limits, { tables: params.tables });
     },
   },
   // 同步：每张表一个变更批次追加到原始层。有水位线的表增量读取，到了比对周期再比对一次主键全集（没有主键时整行全量比对）；
-  // 没有水位线的表全量比对。有表失败时任务记为失败，结果里保留各表的批次与错误
+  // 没有水位线的表全量比对。有表失败时任务记为失败，结果里保留各表的批次与错误；源端已经没有的表跳过，不算失败
   'source.sync': {
     label: '同步数据源',
     attachSource: true,
@@ -102,7 +104,7 @@ export const HANDLERS = {
       if (!source) throw new Error('缺少数据源');
       if (typeof params.sourceId !== 'string') throw new Error('缺少参数 sourceId');
       const tables = await syncSourceTables(session, source, params.sourceId, syncTables(params), limits, redact);
-      const failed = tables.filter(t => 'error' in t);
+      const failed = tables.filter(t => 'error' in t && !t.gone);
       if (failed.length) {
         throw new PartialFailure(`${failed.length} 张表同步失败：${failed.map(t => `${t.table}（${'error' in t ? t.error : ''}）`).join('；')}`, { tables });
       }

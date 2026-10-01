@@ -57,7 +57,8 @@ export type SyncRecord = { table: string; startedAt: string; durationMs: number 
     /** 同步后的水位线：起点与本次读到的最大值中较大的一个 */
     watermarkTo: string | null;
   }
-  | { error: string }
+  /** gone：源端已经没有这张表，跳过（不算同步失败） */
+  | { error: string; gone?: true }
 );
 
 /** 数据源在租户数据湖里的原始层 schema */
@@ -696,7 +697,8 @@ function explain(message: string, limits: EngineLimits) {
 }
 
 /**
- * 同步数据源的若干张表（有水位线的增量读取，没有的全量比对），每张表一个变更批次、各自一个事务：一张表失败不影响其他表。
+ * 同步数据源的若干张表（有水位线的增量读取，没有的全量比对），每张表一个变更批次、各自一个事务：一张表失败不影响其他表，
+ * 源端已经没有的表记为跳过。
  * 增量同步的表到了比对周期时，紧接着再比对一次：有主键的比对主键全集，没有的整行全量比对。
  * 账号可写时整体拒绝（登记之后才被授予写权限的账号）。
  * redact 用来抹掉错误信息里的凭据
@@ -725,8 +727,11 @@ export async function syncSourceTables(
   for (const param of params) {
     let startedAt = new Date();
     const table = tables.find(t => t.name === param.name);
+    if (!table) {
+      records.push({ table: param.name, startedAt: startedAt.toISOString(), durationMs: 0, error: `源端已不存在表 ${param.name}，已跳过`, gone: true });
+      continue;
+    }
     try {
-      if (!table) throw new Error(`数据源中已没有表 ${param.name}`);
       if (!table.readable) throw new Error(`账号没有表 ${param.name} 的读权限`);
       const keys = primary.get(param.name) ?? param.key ?? [];
       const t: TableSync = { con, spec, schema, table, param, keys, options, limits };
