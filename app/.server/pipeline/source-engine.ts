@@ -378,7 +378,7 @@ export interface ListedTable { name: string; schema: string; readable: boolean; 
  * 源端统计信息里的估算行数（表名 → 行数），不读任何行：PostgreSQL 取 pg_class.reltuples（从没统计过的表为 -1，不给），
  * MySQL 取 information_schema.TABLES.TABLE_ROWS。其他数据源不给
  */
-async function estimatedRows(con: DuckDBConnection, spec: SourceSpec): Promise<Map<string, number>> {
+export async function estimatedRows(con: DuckDBConnection, spec: SourceSpec): Promise<Map<string, number>> {
   let found: { name: string; n: string | number }[] = [];
   if (spec.kind === 'postgres') {
     found = await rows(con, `SELECT * FROM postgres_query('src', ${lit(`

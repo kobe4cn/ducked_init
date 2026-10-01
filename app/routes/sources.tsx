@@ -1,4 +1,4 @@
-// app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：本租户的数据源列表与登记表单
+// app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：本租户的数据源列表（最近一次核对有差异的标出来）与登记表单
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import { CircleAlert } from 'lucide-react';
@@ -6,6 +6,7 @@ import type { Route } from './+types/sources';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { listSources, registerSource, SourceError } from '~/.server/sources';
+import { verifyDifferences } from '~/.server/source-verify';
 import { formValues, SOURCE_KIND_LABELS, SOURCE_KINDS, type SourceKind } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
 import { SourceFields } from '~/components/source-fields';
@@ -29,11 +30,16 @@ const targetOf = (kind: SourceKind, c: Record<string, string>) =>
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   const rows = await listSources(member);
+  const differences = await verifyDifferences(member);
   return {
     email: member.email,
     nav: navFor(member),
     canWrite: can(member.role, 'sources:write'),
-    sources: rows.map(s => ({ id: s.id, name: s.name, kind: s.kind, target: targetOf(s.kind, s.config), createdAt: s.createdAt.toISOString() })),
+    sources: rows.map(s => ({
+      id: s.id, name: s.name, kind: s.kind, target: targetOf(s.kind, s.config), createdAt: s.createdAt.toISOString(),
+      /** 最近一次核对中有差异的表数（没有差异时为 0） */
+      differences: differences.get(s.id) ?? 0,
+    })),
   };
 }
 
@@ -84,7 +90,14 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
             <TableBody>
               {sources.map(s => (
                 <TableRow key={s.id} data-source-id={s.id}>
-                  <TableCell><Link to={`/sources/${s.id}`} className="font-medium hover:underline">{s.name}</Link></TableCell>
+                  <TableCell className="space-x-2">
+                    <Link to={`/sources/${s.id}`} className="font-medium hover:underline">{s.name}</Link>
+                    {s.differences > 0 && (
+                      <Link to={`/sources/${s.id}?tab=lake`} data-verify-differences={s.differences}>
+                        <Badge variant="destructive">{`核对有差异（${s.differences} 张表）`}</Badge>
+                      </Link>
+                    )}
+                  </TableCell>
                   <TableCell><Badge variant="outline">{SOURCE_KIND_LABELS[s.kind]}</Badge></TableCell>
                   <TableCell className="font-mono text-xs text-muted-foreground">{s.target}</TableCell>
                   <TableCell className="text-muted-foreground">{new Date(s.createdAt).toLocaleString('zh-CN')}</TableCell>

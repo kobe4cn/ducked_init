@@ -1,7 +1,9 @@
 // app/routes/source.tsx —— 单个数据源：连接参数（凭据不显示）、测试连接、修改与轮换凭据、重新列出表并采集；
 // 同步范围：列出的表（估算行数、读权限、新表、源端已不存在），成员按 schema 全选、按名称过滤后批量选，保存的是逐张的表清单（ADR-0013）；
 // 范围内各表的行数、列统计、同步方式与频率、是否已进湖与水位线候选，成员从候选中确认水位线字段，没有主键的表声明业务主键（可多列），
-// 有主键的表声明软删除字段；手动触发同步，查看每张表的同步历史
+// 有主键的表声明软删除字段；手动触发同步，查看每张表的同步历史。
+// 「湖中数据」标签页（?tab=lake）：最近一次核对的结果，每表一行显示覆盖、位置与文件、结构、数据量四项，可展开明细；
+// 手动触发核对，有差异时触发一次主键比对同步
 import { useEffect, useState } from 'react';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
 import { CircleAlert, CircleCheck } from 'lucide-react';
@@ -9,11 +11,13 @@ import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { getSyncStatus, syncSource } from '~/.server/source-sync';
+import { getVerifyStatus, notInLakeReason, verifySource } from '~/.server/source-verify';
 import {
   confirmKey, confirmSoftDelete, confirmWatermark, getSource, relistSource, setSyncScope, SourceError, testSource, updateSource,
 } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
-import { formValues, SOURCE_KIND_LABELS, SYNC_MODES, type SyncMode } from '~/lib/sources';
+import type { DataCheck, FailedCheck, FileCheck, StructureCheck, VerifyRecord } from '~/.server/pipeline/verify-engine';
+import { formValues, LAKE_COVERAGE, SOURCE_KIND_LABELS, SYNC_MODES, type LakeCoverage } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
 import { SourceFields } from '~/components/source-fields';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
@@ -37,12 +41,24 @@ const FORMAT_LABELS: Record<string, string> = {
   email: '邮箱', mobile: '手机号', integer: '整数', decimal: '小数', date: '日期', datetime: '日期时间', uuid: 'UUID', json: 'JSON', objectid: 'ObjectId',
 };
 
+/** 页面的标签页：概览（连接、同步范围、源表、同步）与湖中数据（核对结果） */
+const tabOf = (request: Request): 'overview' | 'lake' => (new URL(request.url).searchParams.get('tab') === 'lake' ? 'lake' : 'overview');
+
 export async function loader({ request, params }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   try {
     const source = await getSource(member, params.sourceId);
     const sync = await getSyncStatus(member, params.sourceId);
+    const verify = await getVerifyStatus(member, params.sourceId);
+    /** 同步范围内的表没有进湖的原因（同步成功过的为 null） */
+    const notInLake = (name: string) => {
+      const t = source.listing.find(l => l.name === name)!;
+      const profiled = source.tables.find(p => p.name === name);
+      const reason = notInLakeReason(t, profiled && { needsWatermark: profiled.syncMode === 'needs_confirmation' }, sync.history[name]);
+      return reason && LAKE_COVERAGE[reason];
+    };
     return {
+      tab: tabOf(request),
       email: member.email,
       nav: navFor(member),
       canWrite: can(member.role, 'sources:write'),
@@ -65,10 +81,10 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       listing: source.listing.map(t => ({
         ...t,
         scopedAt: t.scopedAt?.toISOString() ?? null,
-        notInLake: t.inScope ? notInLakeReason(t, source.tables.find(p => p.name === t.name), sync.history[t.name]) : null,
+        notInLake: t.inScope ? notInLake(t.name) : null,
       })),
       newTables: source.newTables,
-      tables: source.tables.map(t => ({ ...t, notInLake: notInLakeReason(source.listing.find(l => l.name === t.name)!, t, sync.history[t.name]) })),
+      tables: source.tables.map(t => ({ ...t, notInLake: notInLake(t.name) })),
       sync: {
         status: sync.status,
         statusLabel: sync.status === 'none' ? '未同步' : TASK_STATUS_LABELS[sync.status],
@@ -76,6 +92,15 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         attemptedAt: sync.attemptedAt?.toISOString() ?? null,
         finishedAt: sync.finishedAt?.toISOString() ?? null,
         history: sync.history,
+      },
+      verify: {
+        status: verify.status,
+        statusLabel: verify.status === 'none' ? '未核对' : TASK_STATUS_LABELS[verify.status],
+        error: verify.error,
+        attemptedAt: verify.attemptedAt?.toISOString() ?? null,
+        verifiedAt: verify.verifiedAt?.toISOString() ?? null,
+        differences: verify.differences,
+        tables: verify.tables,
       },
     };
   } catch (e) {
@@ -111,6 +136,12 @@ export async function action({ request, params }: Route.ActionArgs) {
       case 'sync':
         await syncSource(member, params.sourceId);
         break;
+      case 'verify':
+        await verifySource(member, params.sourceId);
+        break;
+      case 'reconcile':
+        await syncSource(member, params.sourceId, { reconcile: true });
+        break;
       case 'confirm-watermark':
         await confirmWatermark(member, params.sourceId, field('table'), field('column'));
         break;
@@ -129,23 +160,8 @@ export async function action({ request, params }: Route.ActionArgs) {
     }
     throw e;
   }
-  throw redirect(`/sources/${params.sourceId}`);
-}
-
-/**
- * 同步范围内的表为什么没有进湖；同步成功过（写出过变更批次）的表返回 null。
- * 同步页只列出同步过的表，这里从范围内的全部表出发，没进湖的表不会被漏看
- */
-function notInLakeReason(
-  t: { gone: boolean; readable: boolean }, profiled: { syncMode: SyncMode } | undefined, history: object[] | undefined,
-): string | null {
-  if (history?.some(e => !('error' in e))) return null;
-  // 重新列出表之前，最近一次同步发现源端已没有这张表
-  if (t.gone || (history?.[0] && 'gone' in history[0])) return '源端已不存在';
-  if (!t.readable) return '账号没有读权限';
-  if (!profiled) return '等待采集';
-  if (profiled.syncMode === 'needs_confirmation') return '待确认水位线';
-  return history?.length ? '同步失败' : '等待首次同步';
+  // 回到提交时所在的标签页
+  throw redirect(`/sources/${params.sourceId}${tabOf(request) === 'lake' ? '?tab=lake' : ''}`);
 }
 
 const TASK_VARIANTS = { none: 'outline', queued: 'outline', running: 'secondary', succeeded: 'default', failed: 'destructive' } as const;
@@ -459,18 +475,245 @@ function SoftDelete({ table, canWrite, submitting }: { table: TableView; canWrit
   );
 }
 
+const COVERAGE_VARIANTS: Record<LakeCoverage, 'default' | 'secondary' | 'outline' | 'destructive'> = {
+  in_lake: 'secondary',
+  out_of_scope: 'outline',
+  pending_profile: 'outline',
+  needs_watermark: 'outline',
+  pending_sync: 'outline',
+  sync_failed: 'destructive',
+  unreadable: 'outline',
+  gone: 'destructive',
+};
+
+const failed = (c: { ok: boolean } | undefined): c is FailedCheck => !!c && 'error' in c;
+/** 核对成功的一项；没有核对或出错时为 null */
+const passed = <T extends { ok: boolean }>(c: T | FailedCheck | undefined) => (c && !failed(c) ? c as T : null);
+
+/** 一项核对的简要状态：一致、有差异的要点或出错；没有核对这一项时为 — */
+function CheckCell<T extends { ok: boolean }>({ name, check, summary }: { name: string; check: T | FailedCheck | undefined; summary: (c: T) => string }) {
+  if (!check) return <TableCell className="text-muted-foreground">—</TableCell>;
+  return (
+    <TableCell className={`whitespace-normal ${check.ok ? '' : 'text-destructive'}`} data-check={name} data-ok={String(check.ok)}>
+      {failed(check) ? '出错' : summary(check as T)}
+    </TableCell>
+  );
+}
+
+const fileSummary = (f: FileCheck) => {
+  const issues = [
+    f.missing.length && `缺失 ${f.missing.length} 个`,
+    f.sizeMismatch.length && `大小不符 ${f.sizeMismatch.length} 个`,
+    f.footer.length && `尾部元数据不符 ${f.footer.length} 个`,
+    f.orphans.length && `孤儿文件 ${f.orphans.length} 个`,
+  ].filter(Boolean);
+  return issues.length ? issues.join('，') : `一致（${f.registered} 个文件${f.inlinedRows ? `，内联 ${count(f.inlinedRows)} 行` : ''}）`;
+};
+const structureSummary = (s: StructureCheck) => {
+  const issues = [
+    s.missingInLake.length && `湖中缺列 ${s.missingInLake.length}`,
+    s.typeChanged.length && `类型不同 ${s.typeChanged.length}`,
+  ].filter(Boolean);
+  if (issues.length) return issues.join('，');
+  return s.extraInLake.length ? `一致（湖中多出 ${s.extraInLake.length} 列）` : '一致';
+};
+const dataSummary = (d: DataCheck) => {
+  if (!d.keyed) return d.ok ? `一致（${count(d.lakeRows)} 行）` : `源端 ${count(d.sourceRows)} 行，湖中 ${count(d.lakeRows)} 行`;
+  const pending = d.pendingSync ? `；待下次同步 ${count(d.pendingSync)} 个` : '';
+  if (d.ok) return `一致（${count(d.lakeRows)} 个主键${pending}）`;
+  return `${[d.missing && `湖中缺失 ${count(d.missing)}`, d.extra && `湖中多出 ${count(d.extra)}`].filter(Boolean).join('，')}${pending}`;
+};
+
+const samples = (list: string[], total: number) => (list.length ? `：${list.join('、')}${total > list.length ? ' 等' : ''}` : '');
+
+/** 一张表的核对明细：位置与四项各自的细节 */
+function VerifyDetail({ t }: { t: VerifyRecord }) {
+  const files = passed<FileCheck>(t.files);
+  const structure = passed<StructureCheck>(t.structure);
+  const data = passed<DataCheck>(t.data);
+  const errors = [
+    t.error,
+    failed(t.files) && `文件核对出错：${t.files.error}`,
+    failed(t.structure) && `结构核对出错：${t.structure.error}`,
+    failed(t.data) && `数据量核对出错：${t.data.error}`,
+  ].filter((e): e is string => !!e);
+  const lines: string[] = [];
+  if (t.location) {
+    lines.push(`原始层：${t.location.schema}.${t.location.table}`, `存储前缀：${t.location.prefix}`);
+    lines.push(t.location.state ? `${t.location.state.includes('_keys.') ? '当前主键状态' : '当前镜像'}：${t.location.state}` : '当前主键状态 / 镜像：还没有');
+  }
+  if (t.outOfScope) lines.push('已移出同步范围：湖中数据不再更新，只核对位置与文件');
+  if (files) {
+    lines.push(`目录登记 ${files.registered} 个文件，当前 ${files.current} 个数据文件共 ${count(files.fileRows)} 行；内联在目录库中 ${count(files.inlinedRows)} 行（没有对应文件）`);
+    for (const path of files.missing) lines.push(`缺失：${path}`);
+    for (const f of files.sizeMismatch) lines.push(`大小不符：${f.path}（目录 ${count(f.expected)} 字节，存储上 ${count(f.actual)} 字节）`);
+    for (const f of files.footer) lines.push(`尾部元数据：${f.path}（${f.problem}）`);
+    for (const path of files.orphans) lines.push(`孤儿文件（目录未登记，只报告不删除）：${path}`);
+  }
+  if (structure) {
+    for (const c of structure.missingInLake) lines.push(`湖中缺列（源端新增字段）：${c.name} ${c.type}`);
+    for (const c of structure.extraInLake) lines.push(`湖中多出（源端删除字段，保留旧列属预期）：${c.name} ${c.type}`);
+    for (const c of structure.typeChanged) lines.push(`类型不同（${c.widened ? '源端放宽' : '不兼容'}）：${c.name} 湖中 ${c.lake}，源端 ${c.source}`);
+  }
+  if (data?.keyed) {
+    lines.push(`按主键 ${data.keys.join('、')} 比对：源端 ${count(data.sourceRows)} 个，湖中回放后 ${count(data.lakeRows)} 个${data.syncedThrough ? `；最近一次同步到 ${data.syncedThrough}` : ''}`);
+    if (data.missing) lines.push(`湖中缺失 ${count(data.missing)} 个${samples(data.samples.missing, data.missing)}`);
+    if (data.pendingSync) lines.push(`同步后新增，待下次同步 ${count(data.pendingSync)} 个${samples(data.samples.pendingSync, data.pendingSync)}`);
+    if (data.extra) lines.push(`湖中多出（源端已删）${count(data.extra)} 个${samples(data.samples.extra, data.extra)}`);
+  } else if (data) {
+    lines.push(`没有主键，按行数比较：源端 ${count(data.sourceRows)} 行，湖中回放后 ${count(data.lakeRows)} 行`);
+  }
+  if (!lines.length && !errors.length) return null;
+  return (
+    <details className="text-xs">
+      <summary className="cursor-pointer text-muted-foreground select-none">明细</summary>
+      <ul className="mt-1 space-y-0.5 font-mono break-all whitespace-normal">
+        {lines.map(l => <li key={l}>{l}</li>)}
+        {errors.map(e => <li key={e} className="text-destructive">{e}</li>)}
+      </ul>
+    </details>
+  );
+}
+
+/** 核对结果的汇总：源端的表有几张进湖、没进湖的按原因计数，源端已删除的另计，以及有差异的表数 */
+function verifySummary(tables: VerifyRecord[], differences: number) {
+  const atSource = tables.filter(t => t.coverage !== 'gone');
+  const inLake = atSource.filter(t => t.coverage === 'in_lake').length;
+  const reasons = (Object.keys(LAKE_COVERAGE) as LakeCoverage[])
+    .filter(c => c !== 'in_lake' && c !== 'gone')
+    .map(c => [c, atSource.filter(t => t.coverage === c).length] as const)
+    .filter(([, n]) => n)
+    .map(([c, n]) => `${LAKE_COVERAGE[c]} ${n} 张`);
+  const gone = tables.length - atSource.length;
+  return `源端 ${atSource.length} 张表：已进湖 ${inLake} 张，未进湖 ${atSource.length - inLake} 张${reasons.length ? `（${reasons.join('、')}）` : ''}`
+    + `${gone ? `；源端已删除 ${gone} 张` : ''}；有差异 ${differences} 张`;
+}
+
+type VerifyView = Route.ComponentProps['loaderData']['verify'];
+
+/**
+ * 湖中数据：最近一次核对的结果。每张源表一行：覆盖情况与源端行数；已进湖的表另有位置与文件、结构、数据量三项的简要状态，可展开明细。
+ * 结构或数据量有差异时可以立即触发一次主键比对同步（修复只走同步这一条写入路径）；只有文件的问题时主键比对修不了，只作说明
+ */
+function LakeData({ verify, canWrite, submitting, busy }: { verify: VerifyView; canWrite: boolean; submitting: boolean; busy: boolean }) {
+  const reconcilable = verify.tables.some(t => passed(t.structure)?.ok === false || passed(t.data)?.ok === false);
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          湖中数据
+          <Badge variant={TASK_VARIANTS[verify.status]} data-verify-status={verify.status}>{`核对${verify.statusLabel}`}</Badge>
+        </CardTitle>
+        <CardDescription>
+          {`从源端的全部表出发，核对每张表的数据进了湖里的什么位置、文件是否真实存在、结构与数据量是否与源端一致。核对只读、只出报告，不修改湖中数据；每天自动核对一次。最近一次核对：${time(verify.verifiedAt)}`}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {verify.status === 'failed' && verify.error && (
+          <div className="text-sm text-destructive">{`${time(verify.attemptedAt)} 提交的核对失败：${verify.error}`}</div>
+        )}
+        {canWrite && (
+          <div className="flex gap-2">
+            <Form method="post">
+              <input type="hidden" name="intent" value="verify" />
+              <Button type="submit" variant="outline" disabled={submitting || busy}>{busy ? '同步或核对进行中…' : '核对'}</Button>
+            </Form>
+            {reconcilable && (
+              <Form method="post">
+                <input type="hidden" name="intent" value="reconcile" />
+                <Button type="submit" disabled={submitting || busy}>立即主键比对</Button>
+              </Form>
+            )}
+          </div>
+        )}
+        {verify.verifiedAt && (
+          <div className={`text-sm ${verify.differences ? 'text-destructive' : 'text-muted-foreground'}`} data-verify-summary>
+            {verifySummary(verify.tables, verify.differences)}
+          </div>
+        )}
+        {verify.differences > 0 && !reconcilable && (
+          <div className="text-sm text-muted-foreground" data-files-only>
+            差异只在文件上（文件缺失、大小或尾部元数据不符、孤儿文件）：主键比对修不了，请联系运营者检查存储
+          </div>
+        )}
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>表</TableHead>
+              <TableHead>覆盖</TableHead>
+              <TableHead>源端行数</TableHead>
+              <TableHead>位置</TableHead>
+              <TableHead>文件</TableHead>
+              <TableHead>结构</TableHead>
+              <TableHead>数据量</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {verify.tables.map(t => (
+              <TableRow key={t.table} data-verify-table={t.table} data-coverage={t.coverage} data-verify-ok={t.ok === null ? undefined : String(t.ok)}>
+                <TableCell className="align-top">
+                  <div className="font-mono font-medium">{t.table}</div>
+                  <VerifyDetail t={t} />
+                </TableCell>
+                <TableCell className="align-top">
+                  <Badge variant={COVERAGE_VARIANTS[t.coverage]}>{LAKE_COVERAGE[t.coverage]}</Badge>
+                </TableCell>
+                <TableCell className="align-top">
+                  {t.sourceRows === null ? '—' : `${t.rowsEstimated ? '约 ' : ''}${count(t.sourceRows)}`}
+                </TableCell>
+                <TableCell className="align-top font-mono text-xs">{t.location ? `${t.location.schema}.${t.location.table}` : '—'}</TableCell>
+                <CheckCell name="files" check={t.files} summary={fileSummary} />
+                <CheckCell name="structure" check={t.structure} summary={structureSummary} />
+                <CheckCell name="data" check={t.data} summary={dataSummary} />
+              </TableRow>
+            ))}
+            {!verify.tables.length && (
+              <TableRow>
+                <TableCell colSpan={7} className="text-center text-muted-foreground">
+                  {verify.status === 'queued' || verify.status === 'running' ? '正在核对…' : '还没有核对结果'}
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** 标签页：概览与湖中数据 */
+function Tabs({ sourceId, tab }: { sourceId: string; tab: 'overview' | 'lake' }) {
+  const link = (to: string, active: boolean, label: string, name: string) => (
+    <Link
+      to={to}
+      data-tab={name}
+      aria-current={active ? 'page' : undefined}
+      className={`border-b-2 px-3 py-2 text-sm ${active ? 'border-primary font-medium' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+    >
+      {label}
+    </Link>
+  );
+  return (
+    <nav className="flex border-b">
+      {link(`/sources/${sourceId}`, tab === 'overview', '概览', 'overview')}
+      {link(`/sources/${sourceId}?tab=lake`, tab === 'lake', '湖中数据', 'lake')}
+    </nav>
+  );
+}
+
 export default function Source({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, source, profile, listing, newTables, tables, sync } = loaderData;
+  const { tab, email, nav, canWrite, source, profile, listing, newTables, tables, sync, verify } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const profiling = profile.status === 'queued' || profile.status === 'running';
   const syncing = sync.status === 'queued' || sync.status === 'running';
-  // 采集与同步在调度器里异步进行：进行中时定时刷新，结束后停下
+  const verifying = verify.status === 'queued' || verify.status === 'running';
+  // 采集、同步与核对在调度器里异步进行：进行中时定时刷新，结束后停下
   const revalidator = useRevalidator();
   useEffect(() => {
-    if (!profiling && !syncing) return;
+    if (!profiling && !syncing && !verifying) return;
     const timer = setInterval(() => { if (revalidator.state === 'idle') revalidator.revalidate(); }, 2000);
     return () => clearInterval(timer);
-  }, [profiling, syncing, revalidator]);
+  }, [profiling, syncing, verifying, revalidator]);
   const synced = Object.entries(sync.history);
   const values = actionData?.values ?? { name: source.name, ...source.config };
   return (
@@ -524,6 +767,10 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
         </CardContent>
       </Card>
 
+      <Tabs sourceId={source.id} tab={tab} />
+      {tab === 'lake' ? (
+        <LakeData verify={verify} canWrite={canWrite} submitting={submitting} busy={syncing || verifying} />
+      ) : (<>
       <Card>
         <CardHeader>
           <CardTitle>同步范围</CardTitle>
@@ -650,6 +897,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
           </CardContent>
         </Card>
       )}
+      </>)}
     </AppShell>
   );
 }

@@ -1,5 +1,5 @@
 // app/.server/source-sync.ts —— 数据源的同步（有水位线的表增量同步，没有的全量比对）：成员手动触发、调度器按周期入队（source.sync 任务），
-// 以及查看每张表的同步历史。
+// 核对发现差异后成员触发一次主键比对，以及查看每张表的同步历史。同一数据源的同步与核对（source.verify）互斥。
 // 同步本身在工作进程里进行（pipeline/sync-engine.ts）；每张表每次同步的变更批次、行数、耗时与水位线记在任务结果里
 import { and, desc, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -7,7 +7,8 @@ import type { Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { sources, tasks, tenants, type TaskStatus } from './db/schema';
-import type { SyncRecord, SyncTableParam } from './pipeline/sync-engine';
+import type { TaskKind } from './pipeline/handlers';
+import type { SyncRecord } from './pipeline/sync-engine';
 import { requireSource, SourceError } from './source-config';
 import { largeTableSyncHours, syncIntervalMinutes, syncTables } from './sources';
 import { insertTask } from './tasks';
@@ -15,31 +16,43 @@ import { insertTask } from './tasks';
 /** 同步历史取最近多少次同步任务 */
 const HISTORY_TASKS = 50;
 
-const ofSource = (tenantId: string, sourceId: string) =>
-  and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'source.sync'), sql`${tasks.params}->>'sourceId' = ${sourceId}`);
+/** 同一数据源上互斥的任务：同步写原始层，核对读原始层与源端，同时只能有一个在排队或运行 */
+type SourceTaskKind = Extract<TaskKind, 'source.sync' | 'source.verify'>;
+const SOURCE_TASK_KINDS: SourceTaskKind[] = ['source.sync', 'source.verify'];
+const SOURCE_TASK_LABELS: Record<SourceTaskKind, string> = { 'source.sync': '同步', 'source.verify': '核对' };
+
+export const ofSource = (tenantId: string, sourceId: string, kinds: SourceTaskKind[] = ['source.sync']) =>
+  and(eq(tasks.tenantId, tenantId), inArray(tasks.kind, kinds), sql`${tasks.params}->>'sourceId' = ${sourceId}`);
 
 /**
- * 锁住数据源行后检查并入队：同一数据源同时只有一个同步在排队或运行（两次同步写同一批原始层表会互相冲突）。
- * dueBefore 给出时，只有最近一次同步早于这个时间才入队（按周期同步）。不入队时返回 null 与原因
+ * 锁住数据源行后检查并入队：同一数据源同时只有一个同步或核对在排队或运行（两次同步写同一批原始层表会互相冲突，
+ * 核对与同步同时进行时读到的是写了一半的结果）。dueBefore 给出时，只有最近一次同类任务早于这个时间才入队（按周期）。
+ * 不入队时返回 null 与原因
  */
-async function enqueueSync(tx: Tx, tenantId: string, sourceId: string, tables: SyncTableParam[], dueBefore?: Date) {
+export async function enqueueSourceTask(
+  tx: Tx, tenantId: string, sourceId: string, kind: SourceTaskKind, params: Record<string, unknown>, dueBefore?: Date,
+) {
   await tx.select({ id: sources.id }).from(sources).where(eq(sources.id, sourceId)).for('update');
+  const [pending] = await tx.select({ kind: tasks.kind }).from(tasks)
+    .where(and(ofSource(tenantId, sourceId, SOURCE_TASK_KINDS), inArray(tasks.status, ['queued', 'running']))).limit(1);
+  if (pending) return { task: null, reason: `已有一次${SOURCE_TASK_LABELS[pending.kind as SourceTaskKind]}在排队或运行中` };
   const [latest] = await tx.select({ createdAt: tasks.createdAt }).from(tasks)
-    .where(ofSource(tenantId, sourceId)).orderBy(desc(tasks.createdAt)).limit(1);
-  const pending = await tx.select({ id: tasks.id }).from(tasks)
-    .where(and(ofSource(tenantId, sourceId), inArray(tasks.status, ['queued', 'running']))).limit(1);
-  if (pending.length) return { task: null, reason: '已有一次同步在排队或运行中' };
-  if (dueBefore && latest && latest.createdAt > dueBefore) return { task: null, reason: '本周期已经同步过' };
-  return { task: await insertTask(tx, tenantId, 'source.sync', { sourceId, tables }), reason: null };
+    .where(ofSource(tenantId, sourceId, [kind])).orderBy(desc(tasks.createdAt)).limit(1);
+  if (dueBefore && latest && latest.createdAt > dueBefore) return { task: null, reason: `本周期已经${SOURCE_TASK_LABELS[kind]}过` };
+  return { task: await insertTask(tx, tenantId, kind, { sourceId, ...params }), reason: null };
 }
 
-/** 成员手动触发一次同步（修复后不用等下一个周期）：同步所有要同步的表，全量比对的大表也在内 */
-export async function syncSource(actor: CurrentMember, sourceId: string) {
+/**
+ * 成员手动触发一次同步（修复后不用等下一个周期）：同步所有要同步的表，全量比对的大表也在内。
+ * reconcile 为真时（核对发现差异后的「立即主键比对」）不等比对周期，有水位线的表增量之后都比对一次主键全集（没有主键时整行比对）
+ */
+export async function syncSource(actor: CurrentMember, sourceId: string, { reconcile = false }: { reconcile?: boolean } = {}) {
   assertCan(actor, 'sources:write');
   await requireSource(actor.tenant.id, sourceId);
   const tables = (await syncTables(actor.tenant.id, sourceId)).map(t => t.param);
   if (!tables.length) throw new SourceError('没有可同步的表：请先选定同步范围，并为待确认水位线的表确认水位线字段');
-  const { task, reason } = await getDb().transaction(tx => enqueueSync(tx, actor.tenant.id, sourceId, tables));
+  const { task, reason } = await getDb().transaction(tx =>
+    enqueueSourceTask(tx, actor.tenant.id, sourceId, 'source.sync', { tables, ...(reconcile && { reconcile: true }) }));
   if (!task) throw new SourceError(reason!);
   return task;
 }
@@ -79,7 +92,7 @@ export async function enqueueDueSyncs(now = new Date()) {
     const tables = plan.filter(t => !t.large || !recent.has(t.param.name)).map(t => t.param);
     if (!tables.length) continue;
     try {
-      const { task } = await getDb().transaction(tx => enqueueSync(tx, tenantId, id, tables, dueBefore));
+      const { task } = await getDb().transaction(tx => enqueueSourceTask(tx, tenantId, id, 'source.sync', { tables }, dueBefore));
       if (task) enqueued.push(id);
     } catch (e) {
       console.error(`[调度器] 数据源 ${id} 的同步入队失败`, e);
@@ -98,7 +111,12 @@ export type SyncHistoryEntry = SyncRecord & { taskId: string };
 export async function getSyncStatus(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'sources:read');
   await requireSource(actor.tenant.id, sourceId);
-  const runs = await getDb().select().from(tasks).where(ofSource(actor.tenant.id, sourceId))
+  return syncStatus(actor.tenant.id, sourceId);
+}
+
+/** 同 getSyncStatus，不检查权限（平台内部使用，如核对时判断未进湖的原因） */
+export async function syncStatus(tenantId: string, sourceId: string) {
+  const runs = await getDb().select().from(tasks).where(ofSource(tenantId, sourceId))
     .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(HISTORY_TASKS);
   const history: Record<string, SyncHistoryEntry[]> = {};
   for (const run of runs) {

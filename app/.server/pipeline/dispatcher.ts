@@ -1,11 +1,12 @@
 // app/.server/pipeline/dispatcher.ts —— 调度器：从平台 PG 的队列领取任务，每个任务启动一个独立的工作进程（ADR-0001）。
 // 本机同时运行的工作进程不超过 maxWorkers；各租户的并发上限与公平调度由 claimNextTask 保证，可以部署多个调度器。
 // 数据湖迁移存储也由调度器执行（在本进程内，要用平台账号读旧前缀、写新前缀），同样占一个名额，先于任务领取。
-// 常驻运行时还定期为到期的数据源入队水位线增量同步
+// 常驻运行时还定期为到期的数据源入队同步与湖中数据核对
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '../lake-migration';
 import { enqueueDueSyncs } from '../source-sync';
+import { enqueueDueVerifies } from '../source-verify';
 import { claimNextTask, failStaleTasks, finishTask, heartbeatTasks, setWorkerPid, type ClaimedTask } from '../tasks';
 import type { WorkerInput, WorkerOutcome } from './worker';
 
@@ -20,7 +21,7 @@ export interface DispatcherOptions {
   staleAfterMs?: number;
   /** 单个任务的运行时限，超时终止工作进程 */
   timeoutMs?: number;
-  /** 常驻运行时检查哪些数据源到了同步周期的间隔 */
+  /** 常驻运行时检查哪些数据源到了同步或核对周期的间隔 */
   syncCheckMs?: number;
 }
 
@@ -118,11 +119,12 @@ export function createDispatcher({
   }
 
   let lastSyncCheck = 0;
-  /** 为到期的数据源入队同步：每 syncCheckMs 一次，多个调度器同时检查也不会重复入队 */
+  /** 为到期的数据源入队同步，再入队核对（有同步在排队时等下一次检查）：每 syncCheckMs 一次，多个调度器同时检查也不会重复入队 */
   async function scheduleSyncs() {
     if (Date.now() - lastSyncCheck < syncCheckMs) return;
     lastSyncCheck = Date.now();
     await enqueueDueSyncs();
+    await enqueueDueVerifies();
   }
 
   /** 每隔 pollMs 或有工作进程结束时醒来 */
@@ -143,7 +145,7 @@ export function createDispatcher({
     /** 持续运行，直到 stop()；之后等运行中的任务结束再返回 */
     async run() {
       while (!stopped) {
-        await scheduleSyncs().catch(e => console.error('[调度器] 入队到期的同步出错', e));
+        await scheduleSyncs().catch(e => console.error('[调度器] 入队到期的同步或核对出错', e));
         await tick().catch(e => console.error('[调度器] 轮询出错', e));
         await nap();
       }

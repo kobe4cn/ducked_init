@@ -80,7 +80,7 @@ const KEYS_PER_QUERY = 1000;
 /** 比对主键全集时漏掉的主键超过这个数，改为整表读取后在 DuckDB 里筛选，而不是按主键分批查询 */
 const MAX_KEYS_BY_QUERY = 20_000;
 /** 平台为原始层表追加的列（除此之外都是源表的列） */
-const PLATFORM_COLUMNS = ['_op', '_commit_ts', '_batch', '_synced_at'];
+export const PLATFORM_COLUMNS = ['_op', '_commit_ts', '_batch', '_synced_at'];
 /** 本次读到的行（带整行哈希 _hash），暂存在会话的本机库 stage 里：落盘时压缩，不占溢写配额 */
 const INCOMING = 'stage.incoming';
 /** 整行多重集比对的中间结果：镜像的整行哈希、各整行哈希的出现次数之差、源端多出来的行、镜像多出来的行，同样暂存在 stage 里 */
@@ -97,13 +97,13 @@ const HISTORY = 'stage.history';
 /** 按哈希分桶时，每 MiB 内存上限一个桶放多少行（实测 2 GiB 放 3000 多万个哈希仍不溢写，这里留一倍余量） */
 const HASHES_PER_MB = 8192;
 
-type Quote = (name: string) => string;
+export type Quote = (name: string) => string;
 
 /**
  * PostgreSQL 与 MySQL：查询写好后经 postgres_query / mysql_query 发往源端执行，条件在源端生效，不依赖扩展的条件下推。
  * 其他数据源返回 null，由调用方在 DuckDB 里读取
  */
-function pushdown(spec: SourceSpec, table: SourceTable, columns: string[] | null, where?: (q: Quote) => string) {
+export function pushdown(spec: SourceSpec, table: SourceTable, columns: string[] | null, where?: (q: Quote) => string) {
   if (spec.kind !== 'postgres' && spec.kind !== 'mysql') return null;
   const q = spec.kind === 'mysql' ? mysqlIdent : ident;
   const sql = `SELECT ${columns ? columns.map(q).join(', ') : '*'} FROM ${q(table.schema)}.${q(table.table)}${where ? ` WHERE ${where(q)}` : ''}`;
@@ -111,7 +111,7 @@ function pushdown(spec: SourceSpec, table: SourceTable, columns: string[] | null
 }
 
 /** 在源端执行的查询：PostgreSQL 与 MySQL 发往源端，其他数据源在 DuckDB 里读取。build 拿到引号函数与表的写法 */
-function onSource(spec: SourceSpec, table: SourceTable, build: (q: Quote, from: string) => string) {
+export function onSource(spec: SourceSpec, table: SourceTable, build: (q: Quote, from: string) => string) {
   if (spec.kind !== 'postgres' && spec.kind !== 'mysql') return `(${build(ident, table.from)})`;
   const q = spec.kind === 'mysql' ? mysqlIdent : ident;
   return `${spec.kind}_query('src', ${lit(build(q, `${q(table.schema)}.${q(table.table)}`))})`;
@@ -121,7 +121,7 @@ function onSource(spec: SourceSpec, table: SourceTable, build: (q: Quote, from: 
  * 软删除字段上“仍存在”的条件（DuckDB、PostgreSQL 与 MySQL 通用）：布尔为真、整数非零、日期与时间非空的行按删除处理。
  * column 是已加引号的列
  */
-function liveCondition(column: string, type: string) {
+export function liveCondition(column: string, type: string) {
   if (type === 'BOOLEAN') return `${column} IS NOT TRUE`;
   if (/INT/.test(type)) return `(${column} IS NULL OR ${column} = 0)`;
   return `${column} IS NULL`;
@@ -216,8 +216,8 @@ const tableExists = async (con: DuckDBConnection, schema: string, name: string) 
   SELECT 1 FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = ${lit(schema)} AND table_name = ${lit(name)}`)).length > 0;
 /** 软删除字段上仍存在的行（alias 为行的别名）；没有声明软删除字段时为 true */
 const isLive = (t: TableSync, alias: string) => (t.softDelete ? liveCondition(`${alias}.${ident(t.softDelete.column)}`, t.softDelete.type) : 'true');
-const joinOn = (keys: string[], a: string, b: string) => keys.map(k => `${a}.${ident(k)} = ${b}.${ident(k)}`).join(' AND ');
-const keyList = (keys: string[], alias?: string) => keys.map(k => (alias ? `${alias}.${ident(k)}` : ident(k))).join(', ');
+export const joinOn = (keys: string[], a: string, b: string) => keys.map(k => `${a}.${ident(k)} = ${b}.${ident(k)}`).join(' AND ');
+export const keyList = (keys: string[], alias?: string) => keys.map(k => (alias ? `${alias}.${ident(k)}` : ident(k))).join(', ');
 /**
  * 整行哈希：对“列名=取值”的文本按列名排序后拼接，空值不参与。这样与源端列的顺序、列类型的放宽无关，
  * 源表新增字段（旧行在新字段上为空）也不会让回看窗口里没变的行被当成更新
@@ -225,11 +225,12 @@ const keyList = (keys: string[], alias?: string) => keys.map(k => (alias ? `${al
 const rowHash = (columns: string[], alias: string) =>
   `hash(concat_ws(chr(31), ${[...columns].sort().map(c => `${lit(`${c}=`)} || ${alias}.${ident(c)}::VARCHAR`).join(', ')}))`;
 const count = async (con: DuckDBConnection, relation: string) => Number((await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${relation}`))[0].n);
-/** n 行按哈希分成几个桶：每桶放得进内存，不必溢写 */
-const bucketsFor = (t: TableSync, n: number) => Math.max(1, Math.ceil(n / (t.limits.memoryLimitMb * HASHES_PER_MB)));
+/** n 行按哈希分成几个桶：每桶放得进租户的内存上限，不必溢写 */
+export const bucketCount = (limits: EngineLimits, n: number) => Math.max(1, Math.ceil(n / (limits.memoryLimitMb * HASHES_PER_MB)));
+const bucketsFor = (t: TableSync, n: number) => bucketCount(t.limits, n);
 /** 第 b 个桶的条件：hashed 是整行哈希或主键的哈希（整数位宽不同的同一个值哈希相同）；只有一个桶时为 true */
-const inBucket = (hashed: string, buckets: number, b: number) => (buckets > 1 ? `${hashed} % ${buckets} = ${b}` : 'true');
-const keyHash = (keys: string[], alias: string) => `hash(${keyList(keys, alias)})`;
+export const inBucket = (hashed: string, buckets: number, b: number) => (buckets > 1 ? `${hashed} % ${buckets} = ${b}` : 'true');
+export const keyHash = (keys: string[], alias: string) => `hash(${keyList(keys, alias)})`;
 
 /** 事务里执行：失败时回滚 */
 async function inTransaction<T>(con: DuckDBConnection, work: () => Promise<T>) {

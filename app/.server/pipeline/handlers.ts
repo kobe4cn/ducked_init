@@ -3,7 +3,9 @@
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { EngineLimits, TenantLakeSession } from './lake-engine';
 import { profileSource, type SourceSpec } from './source-engine';
-import { syncSourceTables, type SyncTableParam } from './sync-engine';
+import { syncOptionsFromEnv, syncSourceTables, type SyncTableParam } from './sync-engine';
+import { verifySourceLake, type VerifyTableParam } from './verify-engine';
+import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 
 type Params = Record<string, unknown>;
 type Result = Record<string, unknown>;
@@ -14,8 +16,11 @@ type Result = Record<string, unknown>;
  */
 export interface TaskContext { limits: EngineLimits; source?: SourceSpec; session: TenantLakeSession; redact(message: string): string }
 
-/** attachSource：数据源与数据湖挂在同一个 DuckDB 里（在两者之间搬数据的任务） */
-interface Handler { label: string; attachSource?: boolean; run(con: DuckDBConnection, params: Params, ctx: TaskContext): Promise<Result> }
+/**
+ * attachSource：数据源与数据湖挂在同一个 DuckDB 里（在两者之间搬数据或对照的任务）；
+ * readOnlyLake：数据湖只读挂载（只出报告、不写湖的任务）
+ */
+interface Handler { label: string; attachSource?: boolean; readOnlyLake?: boolean; run(con: DuckDBConnection, params: Params, ctx: TaskContext): Promise<Result> }
 
 /** 任务部分完成：记为失败，同时保留已完成部分的结果 */
 export class PartialFailure extends Error {
@@ -48,6 +53,21 @@ function syncTables(params: Params): SyncTableParam[] {
   if (!valid) throw new Error('参数 tables 必须是非空的 { name, column?, kind?, key?, softDelete? } 列表');
   return (tables as (SyncTableParam | (Omit<SyncTableParam, 'key'> & { key: string }))[])
     .map(t => (typeof t.key === 'string' ? { ...t, key: [t.key] } : t as SyncTableParam));
+}
+
+/** 平台判断的未进湖原因：账号读不了、源端已删除由工作进程实时判断，不在参数里 */
+const NOT_IN_LAKE_REASONS = Object.keys(LAKE_COVERAGE).filter(c => !['in_lake', 'unreadable', 'gone'].includes(c)) as NotInLakeReason[];
+
+/** 核对参数里的表：最近一次列出表得到的清单（可以为空），每张带是否在同步范围内、平台判断的未进湖原因与同步设置 */
+function verifyTables(params: Params): VerifyTableParam[] {
+  const tables = params.tables;
+  const valid = Array.isArray(tables) && tables.every(t =>
+    typeof t?.name === 'string' && typeof t.inScope === 'boolean' && NOT_IN_LAKE_REASONS.includes(t.reason)
+    && (t.key === undefined || isStrings(t.key))
+    && (t.softDelete === undefined || typeof t.softDelete === 'string')
+    && (t.column === undefined ? t.kind === undefined : typeof t.column === 'string' && (t.kind === 'updated_at' || t.kind === 'increment')));
+  if (!valid) throw new Error('参数 tables 必须是 { name, inScope, reason, key?, softDelete?, column?, kind? } 列表');
+  return tables as VerifyTableParam[];
 }
 
 function positiveInt(params: Params, key: string, max: number) {
@@ -96,19 +116,34 @@ export const HANDLERS = {
     },
   },
   // 同步：每张表一个变更批次追加到原始层。有水位线的表增量读取，到了比对周期再比对一次主键全集（没有主键时整行全量比对）；
-  // 没有水位线的表全量比对。有表失败时任务记为失败，结果里保留各表的批次与错误；源端已经没有的表跳过，不算失败
+  // 没有水位线的表全量比对。参数 reconcile 为真时（成员在核对发现差异后触发）不等比对周期，增量之后都比对一次。
+  // 有表失败时任务记为失败，结果里保留各表的批次与错误；源端已经没有的表跳过，不算失败
   'source.sync': {
     label: '同步数据源',
     attachSource: true,
     async run(_con, params, { source, session, limits, redact }) {
       if (!source) throw new Error('缺少数据源');
       if (typeof params.sourceId !== 'string') throw new Error('缺少参数 sourceId');
-      const tables = await syncSourceTables(session, source, params.sourceId, syncTables(params), limits, redact);
+      const options = params.reconcile === true ? { ...syncOptionsFromEnv(), reconcileHours: 0 } : syncOptionsFromEnv();
+      const tables = await syncSourceTables(session, source, params.sourceId, syncTables(params), limits, redact, options);
       const failed = tables.filter(t => 'error' in t && !t.gone);
       if (failed.length) {
         throw new PartialFailure(`${failed.length} 张表同步失败：${failed.map(t => `${t.table}（${'error' in t ? t.error : ''}）`).join('；')}`, { tables });
       }
       return { tables };
+    },
+  },
+  // 核对湖中数据：源端的全部表标出是否进湖与源端行数，已进湖的表再核对位置、文件、结构与数据量。
+  // 数据湖只读挂载，只出报告不写湖；differences 是已进湖、四项有不一致的表数
+  'source.verify': {
+    label: '核对湖中数据',
+    attachSource: true,
+    readOnlyLake: true,
+    async run(_con, params, { source, session, limits, redact }) {
+      if (!source) throw new Error('缺少数据源');
+      if (typeof params.sourceId !== 'string') throw new Error('缺少参数 sourceId');
+      const tables = await verifySourceLake(session, source, params.sourceId, verifyTables(params), limits, redact);
+      return { tables, differences: tables.filter(t => t.ok === false).length };
     },
   },
 } satisfies Record<string, Handler>;

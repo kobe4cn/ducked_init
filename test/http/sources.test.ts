@@ -294,8 +294,66 @@ describe('同步范围', () => {
     expect((await browser.post(`/sources/${id}`, { intent: 'refresh' })).status).toBe(302);
     const html = await (await browser.get(`/sources/${id}`)).text();
     expect(html).toMatch(/data-listed="regions"[^>]*data-in-scope="true"[\s\S]*?data-gone[^>]*>源端已不存在/);
-    expect(html).toMatch(/data-lake-coverage[^>]*>[\s\S]*?regions（源端已不存在）/);
+    expect(html).toMatch(/data-lake-coverage[^>]*>[\s\S]*?regions（源端已删除）/);
     expect(html).toContain('有 1 张新表未选');
     expect(html).toMatch(/data-listed="coupons"[^>]*data-in-scope="false"[\s\S]*?data-new/);
+  });
+});
+
+describe('湖中数据', () => {
+  it('数据工程师触发核对；「湖中数据」标签页每表一行显示覆盖、位置与四项状态，汇总计入未进湖的表；有差异时可立即主键比对，列表标出有差异的数据源', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+    const id = await registerAndSelect(browser, await pgSourceInput(READER), ['customers', 'orders', 'regions']);
+    await browser.post(`/sources/${id}`, { intent: 'confirm-watermark', table: 'orders', column: 'order_id' });
+    await browser.post(`/sources/${id}`, { intent: 'sync' });
+    const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    await drain();
+
+    const lake = `/sources/${id}?tab=lake`;
+    expect(await (await browser.get(lake)).text()).toContain('data-verify-status="none"');
+    const triggered = await browser.post(lake, { intent: 'verify' });
+    expect(triggered.status).toBe(302);
+    expect(triggered.headers.get('Location')).toBe(lake);
+    expect(await (await browser.get(lake)).text()).toContain('data-verify-status="queued"');
+    await drain();
+
+    const html = await (await browser.get(lake)).text();
+    expect(html).toContain('data-verify-status="succeeded"');
+    expect(html).toMatch(/data-verify-summary[^>]*>源端 4 张表：已进湖 2 张，未进湖 2 张（不在同步范围 1 张、待确认水位线 1 张）；有差异 0 张/);
+    expect(html).toMatch(/data-verify-table="orders"[^>]*data-coverage="in_lake"[\s\S]*?bronze_[0-9a-f]{32}\.orders[\s\S]*?data-check="files" data-ok="true"[\s\S]*?data-check="structure" data-ok="true"[\s\S]*?data-check="data" data-ok="true"/);
+    expect(html).toMatch(/data-verify-table="events"[^>]*data-coverage="out_of_scope"[\s\S]*?不在同步范围[\s\S]*?1,500/);
+    expect(html).toMatch(/data-verify-table="customers"[^>]*data-coverage="needs_watermark"/);
+    expect(html).not.toContain('name="intent" value="reconcile"');
+    expect(await (await browser.get('/sources')).text()).not.toContain('data-verify-differences');
+
+    await grantOnSource('DELETE FROM shop.orders WHERE order_id = 3');
+    await browser.post(lake, { intent: 'verify' });
+    await drain();
+    const diff = await (await browser.get(lake)).text();
+    expect(diff).toMatch(/data-verify-table="orders"[^>]*data-verify-ok="false"[\s\S]*?湖中多出（源端已删）1 个：3[\s\S]*?data-check="data" data-ok="false"[^>]*>湖中多出 1</);
+    expect(diff).toContain('name="intent" value="reconcile"');
+    expect(await (await browser.get('/sources')).text()).toMatch(new RegExp(`data-source-id="${id}"[\\s\\S]*?data-verify-differences="1"`));
+
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an@acme.com');
+    const seen = await (await analyst.get(lake)).text();
+    expect(seen).toContain('data-verify-table="orders"');
+    expect(seen).not.toContain('name="intent" value="verify"');
+    expect(seen).not.toContain('name="intent" value="reconcile"');
+    expect((await analyst.post(lake, { intent: 'verify' })).status).toBe(403);
+    expect((await analyst.post(lake, { intent: 'reconcile' })).status).toBe(403);
+    await memberOf(tenantId, 'viewer@acme.com', 'viewer');
+    expect((await (await loginAs(app, 'viewer@acme.com')).get(lake)).status).toBe(403);
+
+    expect((await browser.post(lake, { intent: 'reconcile' })).headers.get('Location')).toBe(lake);
+    // 主键比对在排队时不能再核对
+    const busy = await browser.post(lake, { intent: 'verify' });
+    expect(busy.status).toBe(400);
+    expect(await busy.text()).toContain('已有一次同步在排队或运行中');
+    await drain();
+    await browser.post(lake, { intent: 'verify' });
+    await drain();
+    expect(await (await browser.get(lake)).text()).toMatch(/有差异 0 张/);
+    expect(await (await browser.get('/sources')).text()).not.toContain('data-verify-differences');
   });
 });

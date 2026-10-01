@@ -17,6 +17,23 @@ export const SYNC_MODES = {
 } as const;
 export type SyncMode = keyof typeof SYNC_MODES;
 
+/**
+ * 源表在湖中的覆盖情况（核对结果）：已进湖；未进湖的原因；或源端已删除（湖中仍有、或同步范围内的表源端已没有）
+ */
+export const LAKE_COVERAGE = {
+  in_lake: '已进湖',
+  out_of_scope: '不在同步范围',
+  pending_profile: '等待采集',
+  needs_watermark: '待确认水位线',
+  pending_sync: '等待首次同步',
+  sync_failed: '同步失败',
+  unreadable: '账号没有读权限',
+  gone: '源端已删除',
+} as const;
+export type LakeCoverage = keyof typeof LAKE_COVERAGE;
+/** 未进湖的原因中由平台按同步范围、采集与同步历史判断的那些（账号读不了、源端已删除由核对时实时判断） */
+export type NotInLakeReason = Exclude<LakeCoverage, 'in_lake' | 'unreadable' | 'gone'>;
+
 /** 凭据字段：任何页面都不回显，出错时回填表单也不带上 */
 const SECRET_FIELDS = ['password', 'keyId', 'secret'];
 

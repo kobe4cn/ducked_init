@@ -199,7 +199,7 @@ export async function listSources(actor: CurrentMember) {
  * 采集后水位线字段不再是候选（被删除、改名、出现空值），业务主键的列不在了或源表有了主键，软删除字段不在了或表没有了主键时，
  * 之前的确认不再生效
  */
-async function confirmedTables(tenantId: string, sourceId: string) {
+export async function confirmedTables(tenantId: string, sourceId: string) {
   const listing = await getDb().select().from(sourceTables).where(eq(sourceTables.sourceId, sourceId)).orderBy(sourceTables.tableName);
   const syncable = listing.filter(isSyncable);
   const { latest, profiles, profiledAt } = await latestProfiles(tenantId, sourceId, syncable.map(t => t.tableName));

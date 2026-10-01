@@ -26,6 +26,8 @@ export interface TenantLakeSession {
   con: DuckDBConnection;
   /** 同时挂载了数据源时（同步任务）：源端以 src 只读挂载 */
   source?: { mongo?: MongoAccess; tables(): Promise<SourceTable[]> };
+  /** 数据湖的存储前缀，以及在会话里读取 DuckLake 元数据表的位置（如 ducklake_data_file 前面加上它） */
+  lake: { dataPath: string; metadata: string };
   close(): void;
 }
 
@@ -36,14 +38,18 @@ export function redactLakeSecrets(message: string, lake: LakeSpec) {
 }
 
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
+const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 
 /**
  * 挂载租户数据湖（给了 source 时再只读挂载该数据源，ADR-0012）后锁住配置：只能读写本租户的存储前缀，不能再挂载其他库、读其他路径，也不能改回这些设置。
  * catalog 的数据库角色只能访问本租户的 schema，因此经 DuckLake 内部的 PG 连接也读不到其他租户与平台元数据。
  * 大批次、比对等超出内存上限时溢写到本次会话专用的本机临时目录（ADR-0010），关闭会话即删除。
- * 同一目录下另挂一个本机库 stage，暂存同步时从源端读到的行：落盘时压缩，不占溢写配额（ADR-0010）
+ * 同一目录下另挂一个本机库 stage，暂存同步时从源端读到的行：落盘时压缩，不占溢写配额（ADR-0010）。
+ * readOnly 时数据湖只读挂载（核对任务）：任何写入都会被 DuckDB 拒绝，本机库 stage 照常可写
  */
-export async function openTenantLake(spec: LakeSpec, limits: EngineLimits, source?: SourceSpec): Promise<TenantLakeSession> {
+export async function openTenantLake(
+  spec: LakeSpec, limits: EngineLimits, source?: SourceSpec, { readOnly = false }: { readOnly?: boolean } = {},
+): Promise<TenantLakeSession> {
   const instance = await DuckDBInstance.create(':memory:', {
     memory_limit: `${limits.memoryLimitMb}MiB`,
     threads: String(limits.threads),
@@ -62,7 +68,7 @@ export async function openTenantLake(spec: LakeSpec, limits: EngineLimits, sourc
           ENDPOINT ${lit(s.endpoint)}, URL_STYLE ${lit(s.urlStyle)}, USE_SSL ${s.useSsl}, SCOPE ${lit(spec.dataPath)})`);
     }
     await con.run(`ATTACH ${lit(`ducklake:postgres:${spec.catalogUrl}`)} AS lake
-      (DATA_PATH ${lit(spec.dataPath)}, METADATA_SCHEMA ${lit(spec.catalogSchema)})`);
+      (DATA_PATH ${lit(spec.dataPath)}, METADATA_SCHEMA ${lit(spec.catalogSchema)}${readOnly ? ', READ_ONLY' : ''})`);
     // 源端不带时区的时间一律按 UTC 解读，不随工作进程所在机器的时区变化
     await con.run(`USE lake; SET TimeZone = 'UTC'`);
     const attached = source ? await attachSource(con, source) : { allowed: [], mongo: undefined };
@@ -70,6 +76,7 @@ export async function openTenantLake(spec: LakeSpec, limits: EngineLimits, sourc
     return {
       con,
       close,
+      lake: { dataPath: spec.dataPath, metadata: `__ducklake_metadata_lake.${ident(spec.catalogSchema)}` },
       ...(source && { source: { mongo: attached.mongo, tables: () => listTables(con, source, attached.mongo) } }),
     };
   } catch (e) {
