@@ -1,12 +1,12 @@
 // app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、最近一次合并），
-// 新建映射（选数据源、编写 YAML，校验通过才保存为草稿；可按所选的表与实体按规则生成草稿填进编辑框，不保存；编辑框旁对照所选源表的列统计与目标实体的标准字段），
+// 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿；可按所选的表与实体按规则生成草稿填进编辑框，不保存；编辑框旁对照所选源表的列统计与目标实体的标准字段），
 // 以及手动触发一次合并到标准层
 import { useState } from 'react';
 import { parseDocument } from 'yaml';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mappings';
 import { can, requirePermission } from '~/.server/access';
-import { createMapping, draftFor, listMappings, MappingError, mergeNow, referenceTables } from '~/.server/mappings';
+import { createMapping, defaultDraft, draftFor, listMappings, MappingError, mergeNow, referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
 import { mappingTemplate } from '~/.server/pipeline/mapping-spec';
@@ -40,7 +40,8 @@ export async function loader({ request }: Route.LoaderArgs) {
     sources,
     /** 各数据源可对照的源表（只有能新建映射时才给） */
     tables: canWrite ? Object.fromEntries(await Promise.all(sources.map(async s => [s.id, await referenceTables(member, s.id)] as const))) : {},
-    template: mappingTemplate('order', 'orders'),
+    /** 新建映射编辑框的默认内容：第一个数据源的草稿，没有已采集的表时是模板 */
+    initialYaml: canWrite && sources[0] ? await defaultDraft(member, sources[0].id) : mappingTemplate('order', 'orders'),
     functions: functionList(),
     merge: {
       status: merge.status,
@@ -106,7 +107,7 @@ function mergeSummary(m: LastMerge) {
 }
 
 export default function Mappings({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, sources, tables, template, functions, merge, mappings } = loaderData;
+  const { email, nav, canWrite, sources, tables, initialYaml, functions, merge, mappings } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   return (
     <AppShell email={email} nav={nav}>
@@ -183,7 +184,7 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
               sources={sources}
               tables={tables}
               functions={functions}
-              values={actionData?.values ?? { sourceId: sources[0]?.id ?? '', yaml: template }}
+              values={actionData?.values ?? { sourceId: sources[0]?.id ?? '', yaml: initialYaml }}
               submitting={submitting}
             />
           </CardContent>

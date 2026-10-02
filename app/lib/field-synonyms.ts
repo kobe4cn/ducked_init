@@ -1,6 +1,6 @@
 // app/lib/field-synonyms.ts —— 标准字段的列名同义词与枚举取值的近义词：按规则生成映射草稿时据此把源列对应到标准字段、预填值字典，
-// 映射报错时也据此提示「这一列多半是哪个标准字段」。随标准模型（canonical-model.ts）一起维护，前后端共用（ADR-0017）
-import { entityOf } from './canonical-model';
+// 新建映射时按表名猜目标实体，映射报错时也据此提示「这一列多半是哪个标准字段」。随标准模型（canonical-model.ts）一起维护，前后端共用（ADR-0017）
+import { CANONICAL_ENTITIES, entityOf } from './canonical-model';
 
 /** 列名规范化：驼峰拆开、忽略大小写，连字符、空白与连续下划线都当作一个下划线（OrderId、order-id、ORDER_ID 都是 order_id） */
 export function normalizeName(s: string) {
@@ -243,6 +243,12 @@ export function fieldsForColumn(entityName: string, column: string): NameMatch[]
     if (i >= 0) matches.push({ field: f.name, by: 'synonym', rank: i + 1 });
   }
   return matches.sort((a, b) => a.rank - b.rank);
+}
+
+/** 表名对应的标准实体：规范化、去掉 t_ / tb_ 前缀后与实体同名，或是实体名的复数（orders、order_items）；认不出时为 undefined */
+export function entityForTable(table: string) {
+  const name = normalizeName(table).replace(/^tb?_/, '');
+  return CANONICAL_ENTITIES.find(e => [e.name, `${e.name}s`, `${e.name}es`].includes(name));
 }
 
 /** 编辑距离（插入、删除、替换各算一步） */

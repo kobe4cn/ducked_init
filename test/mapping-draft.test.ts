@@ -1,9 +1,9 @@
 // 按规则生成映射草稿（纯函数）：源表的列统计 + 目标实体 → 映射 YAML。列名规范化与同义词匹配、格式特征校验、分 / 毫秒 / 无时区时间的转换、
-// 值字典骨架、没有主键的表；生成的草稿交给 checkMapping 校验。八张表贴合开发库 crm_source（db_script/mysql_seed.sql）的列统计
+// 值字典骨架、没有主键的表、按表名猜目标实体；生成的草稿交给 checkMapping 校验。八张表贴合开发库 crm_source（db_script/mysql_seed.sql）的列统计
 import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
-import { fieldsForColumn, normalizeName, standardValue } from '../app/lib/field-synonyms';
+import { entityForTable, fieldsForColumn, normalizeName, standardValue } from '../app/lib/field-synonyms';
 import { draftMapping } from '../app/.server/pipeline/mapping-draft';
 import { checkMapping } from '../app/.server/pipeline/mapping-spec';
 import type { ColumnProfile, TableProfile } from '../app/.server/pipeline/source-engine';
@@ -342,5 +342,16 @@ describe('去重键', () => {
     expect(fields(yaml).membership_id).toBe('string(member_id)');
     expect(parse(yaml).dedupe).toBeUndefined();
     expect(lineOf(yaml, 'membership_id')).toContain('业务主键');
+  });
+});
+
+describe('按表名猜目标实体', () => {
+  it('同名、复数、驼峰与 t_ / tb_ 前缀都认得出；认不出时为 undefined', () => {
+    expect(entityForTable('orders')?.name).toBe('order');
+    expect(entityForTable('customer')?.name).toBe('customer');
+    expect(entityForTable('OrderItems')?.name).toBe('order_item');
+    expect(entityForTable('tb_coupons')?.name).toBe('coupon');
+    expect(entityForTable('t_points_transactions')?.name).toBe('points_transaction');
+    expect(entityForTable('regions')).toBeUndefined();
   });
 });

@@ -1,5 +1,5 @@
 // 标准模型与映射的 HTTP 接缝：任何成员都能浏览标准模型；数据工程师在界面上编写映射（不合格的 YAML 被拒绝并给出位置），
-// 也能按规则生成草稿填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
+// 新建页默认是按规则生成的草稿（源没有已采集的表时是模板），也能按所选的表与实体重新生成填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
 // 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { parseDocument } from 'yaml';
@@ -9,6 +9,7 @@ import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { memberOf, newTenant, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
+import { mappingTemplate } from '../../app/.server/pipeline/mapping-spec';
 import { entityOf } from '../../app/lib/canonical-model';
 import { readForm, writeField, type FieldChoice } from '../../app/lib/mapping-form';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -245,8 +246,9 @@ describe('编写映射时的对照面板', () => {
     const { sourceId } = await tenantWithSource('acme');
     const engineer = await loginAs(app, 'de@acme.com');
 
-    const html = await (await engineer.get('/mappings')).text();
-    // 表与实体下拉框，默认取模板里的 orders → order
+    // 按所选的 orders → order 生成草稿后看页面
+    const html = await (await engineer.post('/mappings', { intent: 'draft', sourceId, table: 'orders', entity: 'order' })).text();
+    // 表与实体下拉框跟着草稿里的 orders → order
     expect(html).toContain('id="mapping-table"');
     expect(html).toMatch(/<option[^>]*value="orders"[^>]*selected=""[^>]*>orders<\/option>/);
     expect(html).toMatch(/<option[^>]*value="order"[^>]*selected=""[^>]*>订单（order）<\/option>/);
@@ -254,7 +256,7 @@ describe('编写映射时的对照面板', () => {
     expect(html).toContain('data-reference-table="orders"');
     expect(html).toMatch(/data-reference-column="order_id"[^>]*data-primary-key/);
     expect(html).toMatch(/data-reference-column="status"[\s\S]*?paid（50）/);
-    // 目标实体的字段：模板里已对应的打勾，标准枚举一并给出
+    // 目标实体的字段：草稿里已对应的打勾，标准枚举一并给出
     expect(html).toMatch(/data-reference-field="order_id"[^>]*data-mapped/);
     expect(html).toMatch(/data-reference-field="paid_at"(?![^>]*data-mapped)/);
     expect(html).toContain('created、paid、shipped、completed、cancelled、refunded');
@@ -294,6 +296,29 @@ describe('编写映射时的对照面板', () => {
 });
 
 describe('按规则生成映射草稿', () => {
+  it('打开新建页时编辑框默认是第一个数据源的草稿：取第一张能按表名认出实体的已采集表，不保存', async () => {
+    await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    const html = await (await engineer.get('/mappings')).text();
+    const yaml = editorYaml(html);
+    expect(yaml).toContain('entity: customer');
+    expect(yaml).toContain('table: customers');
+    expect(yaml).toMatch(/customer_id: string\(customer_id\) # 同名；源表主键/);
+    // 表单里每个由草稿生成的字段带依据
+    expect(readForm(parseDocument(yaml), entityOf('customer')!).find(f => f.field === 'customer_id')!.basis).toBe('同名；源表主键');
+    expect(html).toMatch(/<option[^>]*value="customers"[^>]*selected=""[^>]*>customers<\/option>/);
+    expect(html).toMatch(/<option[^>]*value="customer"[^>]*selected=""[^>]*>消费者（customer）<\/option>/);
+    // 只生成，不保存
+    expect(html).toContain('还没有映射');
+  });
+
+  it('数据源还没有已采集的表时，新建页的编辑框是模板', async () => {
+    const other = await newTenant('globex');
+    await registerSource(await memberOf(other, 'de@globex.com'), await pgSourceInput(READER));
+    const fresh = await loginAs(app, 'de@globex.com');
+    expect(editorYaml(await (await fresh.get('/mappings')).text())).toBe(mappingTemplate('order', 'orders'));
+  });
+
   it('新建页按所选的表与实体生成草稿填进编辑框，不保存；确认后保存为草稿', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const engineer = await loginAs(app, 'de@acme.com');
@@ -372,8 +397,8 @@ describe('表单式映射编辑器', () => {
   it('只用表单完成订单映射（选列、分换成元、时区转换）：保存的 YAML 保留注释与顺序，另一人能发布', async () => {
     const { tenantId, sourceId } = await tenantWithSource('acme', ORDER_LOG);
     const author = await loginAs(app, 'de@acme.com');
-    // 新建页的模板，在下拉框里把表换成 order_log；手写一行注释，看它保留下来
-    const template = editorYaml(await (await author.get('/mappings')).text()).replace('table: orders', 'table: order_log')
+    // 从模板起头（源没有已采集的表时新建页给的就是它），表换成 order_log；手写一行注释，看它保留下来
+    const template = mappingTemplate('order', 'order_log')
       .replace('fields:\n', 'fields:\n  # 金额以分计\n');
     const tz = (column: string): FieldChoice => ({ transform: 'timezone', column, args: ['Asia/Shanghai'] });
     const yaml = fillForm(template, {

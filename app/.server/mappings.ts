@@ -9,11 +9,12 @@ import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, members, ROLES, sources, tasks, tenants, type TaskStatus } from './db/schema';
 import type { MergeMappingParam, MergeRecord } from './pipeline/merge-engine';
 import { draftMapping } from './pipeline/mapping-draft';
-import { checkMapping, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
+import { checkMapping, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import { requireSource } from './source-config';
 import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
-import { entityLabel, entityOf } from '../lib/canonical-model';
+import { CANONICAL_ENTITIES, entityLabel, entityOf } from '../lib/canonical-model';
+import { entityForTable } from '../lib/field-synonyms';
 
 /** 可以展示给成员的业务错误；issues 是映射文档里带行列位置的问题 */
 export class MappingError extends Error {
@@ -77,6 +78,22 @@ export async function draftFor(actor: CurrentMember, sourceId: string, table: st
   const profiled = (await profiledTables(actor.tenant.id, sourceId))(table);
   if (typeof profiled === 'string') throw new MappingError(profiled);
   return draftMapping(profiled.table, target, { key: profiled.key ?? undefined });
+}
+
+/**
+ * 新建映射时编辑框的默认内容：数据源里第一张能按表名认出实体的已采集表的草稿（都认不出时取第一张表、第一个实体）；
+ * 没有已采集的表、生成不了时是模板
+ */
+export async function defaultDraft(actor: CurrentMember, sourceId: string) {
+  const candidates = (await referenceTables(actor, sourceId)).map(t => ({ table: t.name, entity: entityForTable(t.name) }));
+  const pick = candidates.find(c => c.entity) ?? candidates[0];
+  if (!pick) return mappingTemplate('order', 'orders');
+  try {
+    return await draftFor(actor, sourceId, pick.table, (pick.entity ?? CANONICAL_ENTITIES[0]).name);
+  } catch (e) {
+    if (e instanceof MappingError) return mappingTemplate('order', 'orders');
+    throw e;
+  }
 }
 
 /** 为已有映射（它的源表与实体）按规则生成草稿 */
