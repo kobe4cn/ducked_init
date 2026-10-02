@@ -5,7 +5,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { createMapping, getMapping, MappingError, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { createMapping, enqueueDueMerges, getMapping, MappingError, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
@@ -114,7 +114,7 @@ async function syncedSource() {
   await confirmWatermark(author, id, 'coupons', 'update_time');
   await syncSource(author, id);
   await drain();
-  return { acme, author, reviewer, id };
+  return { acme, author, reviewer, id, input };
 }
 
 const CUSTOMERS = `model: 1
@@ -484,5 +484,52 @@ describe('发布映射并合并到标准层', () => {
     const orders = await publish(author, reviewer, id, ORDERS);
     await saveDraft(author, orders, ORDERS.replace('type: integer, expr: amount * 100', 'type: string, expr: string(amount)'));
     await expect(publishMapping(reviewer, orders, 2)).rejects.toThrow(/字段 x_amount_fen 在已发布的映射里是 integer，这里是 string/);
+  });
+
+  it('只有映射引用的表同步写入了变更才合并：别的表、别的数据源、没有变更的同步都不合并，定时检查也不补；发布只合并一次', async () => {
+    const { acme, author, reviewer, id, input } = await syncedSource();
+    const merges = async () => (await listTasks(acme)).filter(t => t.kind === 'silver.merge').length;
+    const mapping = await publish(author, reviewer, id, CUSTOMERS);
+    // 发布后合并一次，定时检查不再补
+    expect(await merges()).toBe(1);
+    expect(await enqueueDueMerges()).toEqual([]);
+
+    // 只改了映射没引用的表
+    await grantOnSource(`INSERT INTO shop.orders (customer_id, amount, status, created_at) VALUES (5, 99, 'paid', '2024-07-01');`);
+    await syncSource(author, id);
+    await drain();
+    // 同步没有写入变更
+    await syncSource(author, id);
+    await drain();
+    // 另一个数据源的同名表写入了变更
+    const other = await registerSource(author, { ...input, name: '电商库副本' });
+    await setSyncScope(author, other.id, { add: ['customers'] });
+    await drain();
+    await confirmWatermark(author, other.id, 'customers', 'updated_at');
+    await syncSource(author, other.id);
+    await drain();
+    // 第 2、4 次同步确实写入了变更（任务按新到旧排列）
+    const changed = (t: { result: unknown }, table: string) =>
+      ((t.result as { tables: { table: string; rows?: number }[] }).tables).some(r => r.table === table && r.rows! > 0);
+    const syncs = (await listTasks(acme)).filter(t => t.kind === 'source.sync');
+    expect(syncs).toHaveLength(4);
+    expect([changed(syncs[0], 'customers'), changed(syncs[1], 'customers') || changed(syncs[1], 'orders'), changed(syncs[2], 'orders')]).toEqual([true, false, true]);
+    expect(await merges()).toBe(1);
+    expect(await enqueueDueMerges()).toEqual([]);
+
+    // 映射引用的表写入了变更：同步后合并一次
+    await grantOnSource(`UPDATE shop.customers SET city = '成都', updated_at = '2024-07-01 10:00:00' WHERE customer_id = 5;`);
+    await syncSource(author, id);
+    await drain();
+    expect(await merges()).toBe(2);
+    expect(await enqueueDueMerges()).toEqual([]);
+    expect((await getMapping(author, mapping)).merge.history[0]).toMatchObject({ mode: 'incremental', updated: 1 });
+
+    // 发布时已有合并在排队：排队的合并不含新版本，定时检查补一次
+    await mergeNow(author);
+    const orders = await createMapping(author, id, ORDERS);
+    expect(await publishMapping(reviewer, orders.id, 1)).toBeNull();
+    await drain();
+    expect(await enqueueDueMerges()).toEqual([acme]);
   });
 });

@@ -1,5 +1,5 @@
 // app/.server/mappings.ts —— 映射：数据工程师用 YAML 编写“源表 → 标准实体”的映射，校验通过才能保存为草稿；草稿由最后保存它的人以外的
-// 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后入队合并任务（silver.merge），同步之后也会再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
+// 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后入队合并任务（silver.merge），同步给已发布映射的源表写入变更后也会再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
 // 一律限定在操作者所属租户内；合并本身在工作进程里进行（pipeline/merge-engine.ts）
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { assertCan, can } from './access';
@@ -201,6 +201,8 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
   if (blocker) throw new MappingError(blocker, draft.status === 'draft' ? 403 : 400);
   const { plan } = await checked(actor.tenant.id, mapping.sourceId, draft.yaml);
   return getDb().transaction(async tx => {
+    // 先锁住租户行（入队合并也锁它）：发布期间别的事务入队不了合并，不会有晚于发布时间、却不含这次发布的合并让定时检查漏补
+    await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, actor.tenant.id)).for('update');
     // 锁住映射行：与保存草稿互斥，发布的正是检查过的那份草稿
     await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
     // 等锁期间草稿可能已被丢弃
@@ -210,7 +212,8 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
     }
     await assertExtensionTypes(tx, actor.tenant.id, plan);
     await tx.update(mappingVersions)
-      .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: new Date() })
+      // 取数据库时间（事务开始时间），与同一事务里入队的合并任务的 created_at 相同：定时检查不会把这次发布当成合并之后的发布再补一次
+      .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: sql`now()` })
       .where(eq(mappingVersions.id, draft.id));
     const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
     await recordAudit(tx, {
@@ -293,11 +296,29 @@ export async function enqueueMerge(tx: Tx, tenantId: string) {
   return insertTask(tx, tenantId, 'silver.merge', { mappings: plans });
 }
 
-/** 同步结束后合并一次（调度器在同步任务结束时调用）：租户停用或没有已发布的映射时什么都不做 */
-export async function mergeAfterSync(tenantId: string) {
+/**
+ * 同步任务 s 是否给已发布映射 m 的源表写入了变更：同一数据源、同一张表、本批次写进原始层的行数大于 0（删除也算在内）。
+ * 比对周期里同一张表有两条记录，任意一条有变更即可；失败的记录没有 rows，自然排除（部分失败的任务照样参与判断）。
+ * 同步后的合并与定时检查共用这个判断（ADR-0015）
+ */
+const syncWroteMappingTable = (s: 's', m: 'm') => sql.raw(`${s}.kind = 'source.sync' AND ${s}.params->>'sourceId' = ${m}.source_id::text
+  AND EXISTS (SELECT 1 FROM jsonb_array_elements(${s}.result->'tables') r WHERE r->>'table' = ${m}.table_name AND (r->>'rows')::int > 0)`);
+
+/**
+ * 同步结束后合并一次（调度器在同步任务结束时调用）：只有这次同步给某个已发布映射的源表写入了变更才入队；
+ * 租户停用时什么都不做
+ */
+export async function mergeAfterSync(tenantId: string, syncTaskId: string) {
   return getDb().transaction(async tx => {
     const [tenant] = await tx.select({ suspendedAt: tenants.suspendedAt }).from(tenants).where(eq(tenants.id, tenantId));
     if (!tenant || tenant.suspendedAt) return null;
+    const { rows } = await tx.execute(sql`
+      SELECT 1 FROM ${tasks} s
+      JOIN ${mappings} m ON m.tenant_id = s.tenant_id
+      JOIN ${mappingVersions} v ON v.mapping_id = m.id AND v.status = 'published'
+      WHERE s.id = ${syncTaskId} AND ${syncWroteMappingTable('s', 'm')}
+      LIMIT 1`);
+    if (!rows.length) return null;
     return enqueueMerge(tx, tenantId);
   });
 }
@@ -313,7 +334,7 @@ export async function mergeNow(actor: CurrentMember) {
 
 /**
  * 为到期的租户入队合并（调度器定期调用）：租户未停用、有已发布的映射、没有合并在排队或运行，
- * 且最近一次合并之后有同步结束或有映射发布（合并运行期间发生的变化由此补上）。返回入队的租户
+ * 且最近一次合并之后有映射发布，或有同步结束并给已发布映射的源表写入了变更（合并运行期间发生的变化由此补上）。返回入队的租户
  */
 export async function enqueueDueMerges() {
   const { rows } = await getDb().execute<{ tenant_id: string }>(sql`
@@ -323,7 +344,7 @@ export async function enqueueDueMerges() {
     CROSS JOIN LATERAL (SELECT max(created_at) AS at FROM ${tasks} WHERE tenant_id = m.tenant_id AND kind = 'silver.merge') last
     WHERE last.at IS NULL
       OR v.published_at > last.at
-      OR EXISTS (SELECT 1 FROM ${tasks} s WHERE s.tenant_id = m.tenant_id AND s.kind = 'source.sync' AND s.finished_at > last.at)
+      OR EXISTS (SELECT 1 FROM ${tasks} s WHERE s.tenant_id = m.tenant_id AND s.finished_at > last.at AND ${syncWroteMappingTable('s', 'm')})
     ORDER BY m.tenant_id`);
   const enqueued: string[] = [];
   for (const { tenant_id: tenantId } of rows) {

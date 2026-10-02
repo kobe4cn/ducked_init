@@ -114,7 +114,7 @@ function MergeRow({ e }: { e: MergeEntry }) {
   return (
     <TableRow data-merge-mode={e.mode}>
       <TableCell>{`v${e.version}`}</TableCell>
-      <TableCell>{e.mode === 'rebuild' ? `重建（批次 1–${e.batchTo}）` : `增量（批次 ${e.batchFrom + 1}–${e.batchTo}）`}</TableCell>
+      <TableCell>{e.mode === 'rebuild' ? `重建（批次 1–${e.batchTo}）` : e.batchTo === e.batchFrom ? '增量（无新批次）' : `增量（批次 ${e.batchFrom + 1}–${e.batchTo}）`}</TableCell>
       <TableCell>{`${e.rows.toLocaleString('zh-CN')} 行（新增 ${e.inserted}，更新 ${e.updated}，删除 ${e.deleted}）`}</TableCell>
       <TableCell>{duration(e.durationMs)}</TableCell>
       <TableCell>{time(e.startedAt)}</TableCell>

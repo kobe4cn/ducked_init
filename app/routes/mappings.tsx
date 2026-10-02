@@ -100,6 +100,7 @@ function mergeSummary(m: LastMerge) {
   if (!m) return '—';
   if ('error' in m) return `失败：${m.error}`;
   if ('skipped' in m) return `跳过：${m.skipped}`;
+  if (m.mode === 'incremental' && m.batchTo === m.batchFrom) return `第 ${m.version} 版，无新批次，${m.rows.toLocaleString('zh-CN')} 行`;
   return `第 ${m.version} 版，${m.rows.toLocaleString('zh-CN')} 行（新增 ${m.inserted}，更新 ${m.updated}，删除 ${m.deleted}）`;
 }
 
