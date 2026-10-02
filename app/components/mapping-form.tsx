@@ -1,0 +1,252 @@
+// app/components/mapping-form.tsx —— 映射编辑区的「表单」标签页：按目标实体列出全部标准字段（类型、说明、是否必填），每个字段选源列
+// （带列类型与常见取值）与一种常用转换，或写自定义表达式（可插入白名单函数）。表单不存数据，每次修改都由 writeField 写回同一份 YAML（ADR-0017）；
+// 表单不认识的写法只读显示原表达式。选到一半（还没选源列、表达式写不完整）时只留在这一行，不写进 YAML
+import { useMemo, useRef, useState } from 'react';
+import { parseDocument } from 'yaml';
+import { entityOf, FIELD_TYPES, type CanonicalField, type FieldType } from '~/lib/canonical-model';
+import { parseExpression } from '~/lib/mapping-expr';
+import { expressionOf, readForm, TRANSFORMS, writeField, type FieldChoice, type FieldForm, type Part, type TransformId } from '~/lib/mapping-form';
+import type { ReferenceColumn, ReferenceFunction, ReferenceTable } from '~/components/mapping-reference';
+import { Badge } from '~/components/ui/badge';
+import { Button } from '~/components/ui/button';
+import { Input } from '~/components/ui/input';
+import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
+
+/** 表单显示不了时的说明（YAML 写错了、实体对不上），附到 YAML 标签页的入口 */
+function Notice({ children, onEditYaml }: { children: string; onEditYaml: () => void }) {
+  return (
+    <div data-mapping-form-notice className="space-y-2 rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+      <div>{children}</div>
+      <Button type="button" size="sm" variant="outline" onClick={onEditYaml}>到 YAML 标签页修改</Button>
+    </div>
+  );
+}
+
+/** 表单标签页：目标实体的全部标准字段，改动写回 yaml 后交给 onChange */
+export function MappingForm({ yaml, entity, table, functions, onChange, onEditYaml }: {
+  yaml: string;
+  /** 目标实体：表单按它列出标准字段 */
+  entity: string;
+  /** 源表；没有时源列手填 */
+  table: ReferenceTable | null;
+  functions: ReferenceFunction[];
+  onChange: (yaml: string) => void;
+  /** 切到 YAML 标签页 */
+  onEditYaml: () => void;
+}) {
+  const doc = useMemo(() => parseDocument(yaml), [yaml]);
+  const target = entityOf(entity);
+  if (!target) return <Notice onEditYaml={onEditYaml}>{`${entity} 不是标准实体，表单只列标准实体的字段，请在 YAML 里编写。`}</Notice>;
+  if (doc.errors.length) {
+    const e = doc.errors[0];
+    const at = e.linePos ? `第 ${e.linePos[0].line} 行：` : '';
+    return <Notice onEditYaml={onEditYaml}>{`YAML 有语法错误（${at}${e.message.split('\n')[0]}），改好之前表单无法显示。`}</Notice>;
+  }
+  const written = doc.get('entity');
+  if (typeof written === 'string' && written !== target.name) {
+    return <Notice onEditYaml={onEditYaml}>{`YAML 里写的实体是 ${written}，与目标实体 ${target.name} 不一致；请改成一致或按规则重新生成草稿。`}</Notice>;
+  }
+  const write = (field: string, choice: FieldChoice | null) => {
+    // writeField 会改 Document，另解析一份，不动渲染用的 doc
+    const next = parseDocument(yaml);
+    writeField(next, target, field, choice);
+    onChange(next.toString());
+  };
+  return (
+    <div className="max-h-[48rem] divide-y overflow-y-auto rounded-lg border text-sm">
+      {readForm(doc, target).map(form => (
+        <FieldRow
+          key={form.field}
+          form={form}
+          field={target.fields.find(f => f.name === form.field)!}
+          table={table}
+          functions={functions}
+          onWrite={choice => write(form.field, choice)}
+          onEditYaml={onEditYaml}
+        />
+      ))}
+    </div>
+  );
+}
+
+const transformOf = (id: TransformId) => TRANSFORMS.find(t => t.id === id)!;
+
+const choiceOf = (form: FieldForm): FieldChoice | null =>
+  form.transform && { transform: form.transform, column: form.column, args: form.args, parts: form.parts, raw: form.raw };
+
+/** 选择还缺什么（给出时不写进 YAML）；写得出表达式时为 null */
+function missing(choice: FieldChoice, type: FieldType): string | null {
+  const def = transformOf(choice.transform);
+  if (def.column && !choice.column) return '选一个源列';
+  const arg = def.args.find((a, i) => !a.optional && !choice.args?.[i]?.trim());
+  if (arg) return `填写${arg.label}`;
+  if (choice.transform === 'concat') {
+    if (!choice.parts?.length) return '至少加一段源列或文本';
+    if (choice.parts.some(p => 'column' in p && !p.column)) return '每段源列都要选一列';
+  }
+  try {
+    parseExpression(expressionOf(choice, type));
+    return null;
+  } catch (e) {
+    return choice.transform === 'custom' ? `表达式有误：${(e as Error).message}` : (e as Error).message;
+  }
+}
+
+/** 一个标准字段：说明、源列与转换；只读时显示原表达式 */
+function FieldRow({ form, field, table, functions, onWrite, onEditYaml }: {
+  form: FieldForm;
+  field: CanonicalField;
+  table: ReferenceTable | null;
+  functions: ReferenceFunction[];
+  onWrite: (choice: FieldChoice | null) => void;
+  onEditYaml: () => void;
+}) {
+  const [choice, setChoice] = useState(() => choiceOf(form));
+  // 这一行最后写进 YAML 的表达式；YAML 在别处改了（YAML 标签页、生成草稿）时按 YAML 重新读出
+  const [synced, setSynced] = useState(form.raw);
+  if (form.raw !== synced) {
+    setSynced(form.raw);
+    setChoice(choiceOf(form));
+  }
+  const problem = choice && missing(choice, field.type);
+  const unmapped = form.required && !form.raw;
+
+  const update = (next: FieldChoice | null) => {
+    setChoice(next);
+    if (!next) {
+      setSynced('');
+      onWrite(null);
+    } else if (!missing(next, field.type)) {
+      setSynced(expressionOf(next, field.type));
+      onWrite(next);
+    }
+  };
+  const switchTo = (id: TransformId | '') => {
+    if (!id) return update(null);
+    const def = transformOf(id);
+    let raw = form.raw;
+    if (choice && !missing(choice, field.type)) raw = expressionOf(choice, field.type);
+    update({
+      transform: id,
+      column: def.column ? (choice?.column ?? null) : null,
+      args: def.args.map(a => a.options?.[0].value ?? ''),
+      parts: id === 'concat' ? (choice?.column ? [{ column: choice.column }] : []) : undefined,
+      raw: id === 'custom' ? raw : undefined,
+    });
+  };
+  const def = choice && transformOf(choice.transform);
+
+  return (
+    <div data-form-field={field.name} data-readonly={form.readonly || undefined} className={`space-y-2 p-3 ${unmapped ? 'bg-destructive/10' : ''}`}>
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <span className="font-mono font-medium">{field.name}</span>
+        <span>{field.label}</span>
+        <span className="text-xs text-muted-foreground">{FIELD_TYPES[field.type].label}</span>
+        {form.required && <Badge variant={unmapped ? 'destructive' : 'secondary'}>{unmapped ? '必填（去重键），未对应' : '必填（去重键）'}</Badge>}
+      </div>
+      <div className="text-xs text-muted-foreground">
+        {field.description}
+        {field.enum && `。标准枚举：${field.enum.join('、')}；源端取值不同时在 YAML 里写值字典`}
+      </div>
+
+      {form.readonly ? (
+        <div className="space-y-1">
+          {form.raw && <code className="block rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap">{form.raw}</code>}
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span>{form.reason}</span>
+            <Button type="button" size="xs" variant="link" onClick={onEditYaml}>到 YAML 修改</Button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex flex-wrap items-center gap-2">
+          <NativeSelect size="sm" aria-label={`${field.name} 的转换`} value={choice?.transform ?? ''} onChange={e => switchTo(e.target.value as TransformId | '')}>
+            <NativeSelectOption value="">不对应</NativeSelectOption>
+            {TRANSFORMS.map(t => <NativeSelectOption key={t.id} value={t.id}>{t.label}</NativeSelectOption>)}
+          </NativeSelect>
+          {choice && def?.column && (
+            <ColumnPicker label={`${field.name} 的源列`} table={table} value={choice.column ?? ''} onChange={column => update({ ...choice, column })} />
+          )}
+          {choice && def?.args.map((a, i) => {
+            const value = choice.args?.[i] ?? '';
+            const set = (v: string) => update({ ...choice, args: def.args.map((_, j) => (j === i ? v : (choice.args?.[j] ?? ''))) });
+            return a.options ? (
+              <NativeSelect key={a.label} size="sm" aria-label={a.label} value={value} onChange={e => set(e.target.value)}>
+                {a.options.map(o => <NativeSelectOption key={o.value} value={o.value}>{o.label}</NativeSelectOption>)}
+              </NativeSelect>
+            ) : (
+              <Input key={a.label} className="h-7 w-56" aria-label={a.label} placeholder={a.hint ?? a.label} title={a.hint} value={value} onChange={e => set(e.target.value)} />
+            );
+          })}
+          {choice?.transform === 'concat' && <PartsEditor table={table} parts={choice.parts ?? []} onChange={parts => update({ ...choice, parts })} />}
+          {choice?.transform === 'custom' && <CustomExpression raw={choice.raw ?? ''} functions={functions} onChange={raw => update({ ...choice, raw })} />}
+        </div>
+      )}
+
+      {!form.readonly && problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
+      {form.basis && <div className="text-xs text-muted-foreground">{`依据：${form.basis}`}</div>}
+    </div>
+  );
+}
+
+/** 源列的说明：类型与常见取值 */
+const columnLabel = (c: ReferenceColumn) => {
+  const top = c.top?.slice(0, 3).map(t => t.value).join('、');
+  return `${c.name}（${c.type}${top ? `，常见：${top}` : ''}）`;
+};
+
+/** 选源列；没有可对照的源表时手填列名 */
+function ColumnPicker({ label, table, value, onChange }: { label: string; table: ReferenceTable | null; value: string; onChange: (column: string) => void }) {
+  if (!table) return <Input className="h-7 w-48 font-mono" aria-label={label} placeholder="源列名" value={value} onChange={e => onChange(e.target.value)} />;
+  const known = table.columns.some(c => c.name === value);
+  return (
+    <NativeSelect size="sm" aria-label={label} value={value} onChange={e => onChange(e.target.value)}>
+      <NativeSelectOption value="">选源列…</NativeSelectOption>
+      {value && !known && <NativeSelectOption value={value}>{`${value}（源表里没有这一列）`}</NativeSelectOption>}
+      {table.columns.map(c => <NativeSelectOption key={c.name} value={c.name}>{columnLabel(c)}</NativeSelectOption>)}
+    </NativeSelect>
+  );
+}
+
+/** 拼接的各段：源列或一段文本，按顺序拼起来 */
+function PartsEditor({ table, parts, onChange }: { table: ReferenceTable | null; parts: Part[]; onChange: (parts: Part[]) => void }) {
+  const set = (i: number, p: Part) => onChange(parts.map((q, j) => (j === i ? p : q)));
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {parts.map((p, i) => (
+        <span key={i} className="flex items-center gap-1">
+          {'column' in p
+            ? <ColumnPicker label={`第 ${i + 1} 段的源列`} table={table} value={p.column} onChange={column => set(i, { column })} />
+            : <Input className="h-7 w-28" aria-label={`第 ${i + 1} 段的文本`} placeholder="文本" value={p.text} onChange={e => set(i, { text: e.target.value })} />}
+          <Button type="button" size="xs" variant="ghost" aria-label={`去掉第 ${i + 1} 段`} onClick={() => onChange(parts.filter((_, j) => j !== i))}>×</Button>
+        </span>
+      ))}
+      <Button type="button" size="xs" variant="outline" onClick={() => onChange([...parts, { column: '' }])}>加一列</Button>
+      <Button type="button" size="xs" variant="outline" onClick={() => onChange([...parts, { text: '' }])}>加一段文本</Button>
+    </div>
+  );
+}
+
+/** 自定义表达式，旁边可把白名单函数插入到光标处 */
+function CustomExpression({ raw, functions, onChange }: { raw: string; functions: ReferenceFunction[]; onChange: (raw: string) => void }) {
+  const input = useRef<HTMLInputElement>(null);
+  const insert = (name: string) => {
+    const el = input.current;
+    if (!el) return;
+    const at = el.selectionStart ?? raw.length;
+    const next = `${raw.slice(0, at)}${name}(${raw.slice(el.selectionEnd ?? at)}`;
+    onChange(next);
+    requestAnimationFrame(() => {
+      el.focus();
+      el.setSelectionRange(at + name.length + 1, at + name.length + 1);
+    });
+  };
+  return (
+    <>
+      <Input ref={input} className="h-7 w-80 font-mono" aria-label="自定义表达式" placeholder="如 coalesce(pay_amount, pay_fen / 100)" value={raw} onChange={e => onChange(e.target.value)} />
+      <NativeSelect size="sm" aria-label="插入函数" value="" onChange={e => e.target.value && insert(e.target.value)}>
+        <NativeSelectOption value="">插入函数…</NativeSelectOption>
+        {functions.map(f => <NativeSelectOption key={f.name} value={f.name}>{`${f.signature}：${f.label}`}</NativeSelectOption>)}
+      </NativeSelect>
+    </>
+  );
+}

@@ -2,6 +2,7 @@
 // 新建映射（选数据源、编写 YAML，校验通过才保存为草稿；可按所选的表与实体按规则生成草稿填进编辑框，不保存；编辑框旁对照所选源表的列统计与目标实体的标准字段），
 // 以及手动触发一次合并到标准层
 import { useState } from 'react';
+import { parseDocument } from 'yaml';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mappings';
 import { can, requirePermission } from '~/.server/access';
@@ -192,9 +193,17 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
   );
 }
 
+/** YAML 里的 table 或 entity 换成 value（保留注释与顺序）；YAML 解析不了时不动 */
+function withTarget(yaml: string, key: 'table' | 'entity', value: string) {
+  const doc = parseDocument(yaml);
+  if (doc.errors.length || doc.get(key) === value) return yaml;
+  doc.set(key, value);
+  return doc.toString();
+}
+
 /**
- * 新建映射的表单：选数据源、编写 YAML。表与目标实体两个下拉框决定旁边对照面板显示什么（默认取 YAML 里写的），
- * 也是「按规则生成草稿」的输入；保存时以 YAML 里写的为准
+ * 新建映射的表单：选数据源、用表单或 YAML 编写映射。表与目标实体两个下拉框决定表单列哪些字段、对照面板显示什么（默认取 YAML 里写的），
+ * 也是「按规则生成草稿」的输入；换选时一并写进 YAML 的 table / entity，保存时以 YAML 里写的为准
  */
 function NewMapping({ sources, tables, functions, values, submitting }: {
   sources: LoaderData['sources'];
@@ -204,6 +213,7 @@ function NewMapping({ sources, tables, functions, values, submitting }: {
   submitting: boolean;
 }) {
   const [sourceId, setSourceId] = useState(values.sourceId);
+  const [yaml, setYaml] = useState(values.yaml);
   const [outline] = useState(() => mappingOutline(values.yaml));
   const [tableName, setTableName] = useState(outline.table);
   const [entity, setEntity] = useState(outline.entity && entityOf(outline.entity) ? outline.entity : CANONICAL_ENTITIES[0].name);
@@ -221,20 +231,20 @@ function NewMapping({ sources, tables, functions, values, submitting }: {
           </Field>
           <Field>
             <FieldLabel htmlFor="mapping-table">表</FieldLabel>
-            <NativeSelect id="mapping-table" name="table" value={table?.name ?? ''} onChange={e => setTableName(e.target.value)} disabled={!sourceTables.length}>
+            <NativeSelect id="mapping-table" name="table" value={table?.name ?? ''} onChange={e => { setTableName(e.target.value); setYaml(y => withTarget(y, 'table', e.target.value)); }} disabled={!sourceTables.length}>
               {sourceTables.map(t => <NativeSelectOption key={t.name} value={t.name}>{t.name}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
           <Field>
             <FieldLabel htmlFor="mapping-entity">目标实体</FieldLabel>
-            <NativeSelect id="mapping-entity" name="entity" value={entity} onChange={e => setEntity(e.target.value)}>
+            <NativeSelect id="mapping-entity" name="entity" value={entity} onChange={e => { setEntity(e.target.value); setYaml(y => withTarget(y, 'entity', e.target.value)); }}>
               {CANONICAL_ENTITIES.map(e => <NativeSelectOption key={e.name} value={e.name}>{`${e.label}（${e.name}）`}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
         </div>
         <Field>
-          <FieldLabel>映射（YAML）</FieldLabel>
-          <MappingEditorWithReference defaultValue={values.yaml} table={table} entity={entity} functions={functions} />
+          <FieldLabel>映射</FieldLabel>
+          <MappingEditorWithReference defaultValue={values.yaml} value={yaml} onValueChange={setYaml} table={table} entity={entity} functions={functions} />
         </Field>
         <div className="flex gap-2">
           <Button type="submit" name="intent" value="create" disabled={submitting || !sources.length}>{submitting ? '正在处理…' : '校验并保存草稿'}</Button>

@@ -1,11 +1,14 @@
 // app/components/mapping-reference.tsx —— 编写映射时放在编辑框旁的对照面板：源表各列的统计（类型、空值率、不同取值数、主键、水位线、常见取值），
 // 目标实体的标准字段（类型、是否必填、标准枚举）、写法速查与白名单函数。按编辑框里的 YAML 标出已对应的字段与还没对应的必填字段；
-// 点击列名、字段名、写法或函数插入到编辑框光标处
-import { useRef, useState } from 'react';
+// 点击列名、字段名、写法或函数插入到编辑框光标处。编辑区分「表单 / YAML」两个标签页，两边是同一份 YAML，始终由 YAML 框提交（ADR-0017）
+import { useEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import { Check } from 'lucide-react';
 import { entityOf, FIELD_TYPES } from '~/lib/canonical-model';
 import { mappingOutline } from '~/lib/mapping-outline';
 import { MappingEditor, type MappingEditorHandle } from '~/components/mapping-editor';
+import { MappingForm } from '~/components/mapping-form';
+import { Button } from '~/components/ui/button';
 import { Badge } from '~/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
@@ -31,19 +34,65 @@ const nameButton = (name: string, onInsert: (text: string) => void, text = name)
   <button type="button" className="text-left font-mono hover:underline" title="插入到编辑框光标处" onClick={() => onInsert(text)}>{name}</button>
 );
 
-/** 映射 YAML 编辑框，旁边是对照面板；点击面板里的列名、字段名、写法或函数插入到编辑框光标处 */
-export function MappingEditorWithReference({ defaultValue, table, entity, functions }: {
+const TABS = [{ id: 'form', label: '表单' }, { id: 'yaml', label: 'YAML' }] as const;
+
+/**
+ * 映射编辑区（表单 / YAML 标签页），旁边是对照面板；点击面板里的列名、字段名、写法或函数插入到 YAML 框光标处（在表单标签页时先切到 YAML）。
+ * 默认打开表单；表单要脚本，hydrate 之前（及不支持脚本时）只有 YAML 框可用，照常提交。给出 value 时由外部控制内容
+ */
+export function MappingEditorWithReference({ defaultValue, value, onValueChange, table, entity, functions }: {
   defaultValue: string;
+  value?: string;
+  onValueChange?: (yaml: string) => void;
   table: ReferenceTable | null;
   entity: string;
   functions: ReferenceFunction[];
 }) {
   const editor = useRef<MappingEditorHandle>(null);
-  const [yaml, setYaml] = useState(defaultValue);
+  const [own, setOwn] = useState(defaultValue);
+  const yaml = value ?? own;
+  const setYaml = onValueChange ?? setOwn;
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => setHydrated(true), []);
+  const [chosen, setTab] = useState<(typeof TABS)[number]['id']>('form');
+  const tab = hydrated ? chosen : 'yaml';
   return (
     <div className="grid gap-4 xl:grid-cols-2">
-      <MappingEditor ref={editor} defaultValue={defaultValue} onValueChange={setYaml} />
-      <MappingReference table={table} entity={entity} functions={functions} yaml={yaml} onInsert={text => editor.current?.insert(text)} />
+      <div className="space-y-2">
+        <div role="tablist" className="flex gap-1">
+          {TABS.map(t => (
+            <Button
+              key={t.id}
+              type="button"
+              role="tab"
+              size="sm"
+              variant={tab === t.id ? 'secondary' : 'ghost'}
+              aria-selected={tab === t.id}
+              data-editor-tab={t.id}
+              disabled={!hydrated && t.id === 'form'}
+              title={!hydrated && t.id === 'form' ? '表单需要浏览器脚本，加载完成前请用 YAML 编写' : undefined}
+              onClick={() => setTab(t.id)}
+            >
+              {t.label}
+            </Button>
+          ))}
+        </div>
+        {tab === 'form' && (
+          <MappingForm yaml={yaml} entity={entity} table={table} functions={functions} onChange={setYaml} onEditYaml={() => setTab('yaml')} />
+        )}
+        <MappingEditor ref={editor} defaultValue={defaultValue} value={yaml} onValueChange={setYaml} hidden={tab !== 'yaml'} />
+      </div>
+      <MappingReference
+        table={table}
+        entity={entity}
+        functions={functions}
+        yaml={yaml}
+        onInsert={text => {
+          // 先让 YAML 框显示出来，插入时才能聚焦、按光标位置插入
+          flushSync(() => setTab('yaml'));
+          editor.current?.insert(text);
+        }}
+      />
     </div>
   );
 }

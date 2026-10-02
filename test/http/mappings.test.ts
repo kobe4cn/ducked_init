@@ -1,12 +1,16 @@
 // 标准模型与映射的 HTTP 接缝：任何成员都能浏览标准模型；数据工程师在界面上编写映射（不合格的 YAML 被拒绝并给出位置），
-// 也能按规则生成草稿填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；分析师只读，查看者看不到映射，其他租户一律 404
+// 也能按规则生成草稿填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
+// 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { parseDocument } from 'yaml';
 import { closeDb } from '../../app/.server/db/client';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { memberOf, newTenant, selectAllTables } from '../pipeline/fixtures';
-import { pgSourceInput, READER } from '../pipeline/source-fixtures';
+import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
+import { entityOf } from '../../app/lib/canonical-model';
+import { readForm, writeField, type FieldChoice } from '../../app/lib/mapping-form';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
@@ -14,11 +18,13 @@ beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 
-/** 开通租户，登记电商库并把表全部选入同步范围、采集完；返回租户与数据源 */
-async function tenantWithSource(slug: string) {
+/** 开通租户，登记电商库（sql 先在源库里加表）并把表全部选入同步范围、采集完；返回租户与数据源 */
+async function tenantWithSource(slug: string, sql?: string) {
   const tenantId = await newTenant(slug);
   const engineer = await memberOf(tenantId, `de@${slug}.com`, 'data_engineer');
-  const { id } = await registerSource(engineer, await pgSourceInput(READER));
+  const input = await pgSourceInput(READER);
+  if (sql) await grantOnSource(sql);
+  const { id } = await registerSource(engineer, input);
   await selectAllTables(engineer, id);
   await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
   return { tenantId, sourceId: id };
@@ -334,5 +340,74 @@ describe('按规则生成映射草稿', () => {
     await memberOf(tenantId, 'analyst@acme.com', 'analyst');
     const analyst = await loginAs(app, 'analyst@acme.com');
     expect((await analyst.post('/mappings', { intent: 'draft', sourceId, table: 'orders', entity: 'order' })).status).toBe(403);
+  });
+});
+
+/** 没有主键的订单流水：金额以分计，状态是中文 */
+const ORDER_LOG = `
+  CREATE TABLE shop.order_log (order_no text NOT NULL, status text NOT NULL, amount_fen int NOT NULL, updated_at timestamp NOT NULL);
+  INSERT INTO shop.order_log VALUES ('A1', '已支付', 1990, '2024-06-01 10:00'), ('A2', '已退款', 500, '2024-06-02 10:00');
+  GRANT SELECT ON shop.order_log TO ${READER.user};`;
+
+/** 像在表单上逐个字段选择那样改 YAML（HTTP 测试不跑客户端脚本，直接用表单背后的 readForm / writeField） */
+function fillForm(yaml: string, choices: Record<string, FieldChoice | null>) {
+  const doc = parseDocument(yaml);
+  for (const [field, choice] of Object.entries(choices)) writeField(doc, entityOf('order')!, field, choice);
+  return doc.toString();
+}
+
+describe('表单式映射编辑器', () => {
+  it('编辑区有表单与 YAML 两个标签页；没有脚本时只有 YAML 框可用，照常提交', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    const html = await (await engineer.get('/mappings')).text();
+    expect(html).toMatch(/<button[^>]*data-editor-tab="form"[^>]*disabled=""/);
+    expect(html).toMatch(/<button[^>]*data-editor-tab="yaml"/);
+    expect(html).toMatch(/<textarea[^>]*name="yaml"(?![^>]*hidden)/);
+
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    expect(await (await engineer.get(`/mappings/${id}`)).text()).toMatch(/<button[^>]*data-editor-tab="form"/);
+  });
+
+  it('只用表单完成订单映射（选列、分换成元、时区转换）：保存的 YAML 保留注释与顺序，另一人能发布', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme', ORDER_LOG);
+    const author = await loginAs(app, 'de@acme.com');
+    // 新建页的模板，在下拉框里把表换成 order_log；手写一行注释，看它保留下来
+    const template = editorYaml(await (await author.get('/mappings')).text()).replace('table: orders', 'table: order_log')
+      .replace('fields:\n', 'fields:\n  # 金额以分计\n');
+    const tz = (column: string): FieldChoice => ({ transform: 'timezone', column, args: ['Asia/Shanghai'] });
+    const yaml = fillForm(template, {
+      order_id: { transform: 'direct', column: 'order_no' },
+      customer_id: null,
+      status: { transform: 'fixed', args: ['paid'] },
+      amount: { transform: 'cents', column: 'amount_fen' },
+      created_at: tz('updated_at'),
+      updated_at: tz('updated_at'),
+    });
+    const created = await author.post('/mappings', { intent: 'create', sourceId, yaml });
+    expect(created.status).toBe(302);
+    const id = mappingIdOf(created);
+
+    const saved = editorYaml(await (await author.get(`/mappings/${id}`)).text());
+    expect(saved).toBe(yaml);
+    expect(saved.split('\n')[0]).toBe(template.split('\n')[0]);
+    expect(saved).toContain('# 金额以分计');
+    expect(saved.indexOf('created_at')).toBeLessThan(saved.indexOf('updated_at'));
+    expect(saved.indexOf('fields:')).toBeLessThan(saved.indexOf('dedupe:'));
+    const form = readForm(parseDocument(saved), entityOf('order')!);
+    const at = (field: string) => form.find(f => f.field === field)!;
+    expect(at('amount')).toMatchObject({ transform: 'cents', column: 'amount_fen', readonly: false });
+    expect(at('created_at')).toMatchObject({ transform: 'timezone', column: 'updated_at', args: ['Asia/Shanghai'] });
+    expect(at('customer_id').transform).toBeNull();
+
+    // 在表单里再改一个字段，保存草稿
+    const edited = fillForm(saved, { channel: { transform: 'fixed', args: ['门店'] } });
+    expect((await author.post(`/mappings/${id}`, { intent: 'save', yaml: edited })).status).toBe(302);
+    expect(editorYaml(await (await author.get(`/mappings/${id}`)).text())).toBe(edited);
+
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+    expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    expect(await (await reviewer.get(`/mappings/${id}`)).text()).toContain('data-version="1" data-version-status="published"');
   });
 });

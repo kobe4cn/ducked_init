@@ -10,10 +10,14 @@ export interface MappingEditorHandle {
   insert(text: string): void;
 }
 
-export function MappingEditor({ name = 'yaml', defaultValue, readOnly = false, ref, onValueChange }: {
+export function MappingEditor({ name = 'yaml', defaultValue, value, readOnly = false, hidden, ref, onValueChange }: {
   name?: string;
   defaultValue: string;
+  /** 给出时由外部控制内容（与 onValueChange 一起用） */
+  value?: string;
   readOnly?: boolean;
+  /** 隐藏但仍随表单提交 */
+  hidden?: boolean;
   ref?: Ref<MappingEditorHandle>;
   /** 内容变化（输入或插入）后的全文 */
   onValueChange?: (value: string) => void;
@@ -33,10 +37,11 @@ export function MappingEditor({ name = 'yaml', defaultValue, readOnly = false, r
       ref={textarea}
       name={name}
       onChange={onValueChange && (e => onValueChange(e.target.value))}
-      defaultValue={defaultValue}
+      {...(value === undefined ? { defaultValue } : { value })}
       readOnly={readOnly}
+      hidden={hidden}
       spellCheck={false}
-      rows={Math.max(12, defaultValue.split('\n').length + 2)}
+      rows={Math.max(12, (value ?? defaultValue).split('\n').length + 2)}
       className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 font-mono text-xs leading-5 outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 read-only:bg-muted"
     />
   );
