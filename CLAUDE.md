@@ -12,6 +12,10 @@ Default canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 
 A `ready-for-agent` ticket has at most 3 acceptance criteria and an `## Implementation guide` section. Before `/implement`, run `/prep-ticket <n>` (or without a number for the next ready ticket) to split it and write the guide. See `docs/agents/ticket-sizing.md`.
 
+### UI conventions
+
+Before building or changing a page, read `docs/agents/ui.md` (shell, page header, stat tiles, card grid, tabs, status colors).
+
 ### Domain docs
 
 Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
