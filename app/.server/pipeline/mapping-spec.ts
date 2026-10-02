@@ -1,6 +1,6 @@
 // app/.server/pipeline/mapping-spec.ts —— 映射文档（YAML）：一张源表 → 一个标准实体（或自定义实体）。
 // 先按 JSON Schema（MAPPING_SCHEMA）校验结构，再对照标准模型与源表的字段做语义校验：字段表达式只能用白名单函数、只能引用源表里有的字段，
-// 值字典只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
+// 值字典与兜底值只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
 // 校验通过后得到合并计划（MergePlan）：标准层的列、每列的表达式与值字典、去重键与取最新字段，交给工作进程编译执行（ADR-0015）
 import { Ajv, type ErrorObject } from 'ajv';
 import { Document, isMap, isScalar, isSeq, LineCounter, parseDocument, type Node, type YAMLMap } from 'yaml';
@@ -12,8 +12,8 @@ import { fieldsForColumn, normalizeName, similarFields, similarNames, standardVa
 import { KIND_FIELD_TYPES, kindOf, ref } from './mapping-draft';
 import { ExprError, FUNCTIONS, parseExpression, referencedColumns, type Expr } from './mapping-expr';
 
-/** 字段的写法：表达式本身，或带值字典的对象 */
-export type FieldSpec = string | { expr: string; dictionary?: Record<string, string> };
+/** 字段的写法：表达式本身，或带值字典（与兜底值）的对象 */
+export type FieldSpec = string | { expr: string; dictionary?: Record<string, string>; otherwise?: string | null };
 
 export interface MappingSpec {
   /** 标准模型的大版本 */
@@ -24,7 +24,7 @@ export interface MappingSpec {
   description?: string;
   fields?: Record<string, FieldSpec>;
   /** 扩展字段（标准实体上以 x_ 开头）或自定义实体的全部字段：带类型 */
-  extensions?: Record<string, { type: FieldType; expr: string; label?: string; dictionary?: Record<string, string> }>;
+  extensions?: Record<string, { type: FieldType; expr: string; label?: string; dictionary?: Record<string, string>; otherwise?: string | null }>;
   /** 去重键与取最新规则：同一去重键的多行只留一行，取最新字段最大的那行。不写时按实体主键去重 */
   dedupe?: { key: string[]; latest?: string };
 }
@@ -39,6 +39,7 @@ const fieldSpec = {
     properties: {
       expr: { type: 'string', minLength: 1 },
       dictionary: { type: 'object', minProperties: 1, additionalProperties: { type: 'string', minLength: 1 } },
+      otherwise: { type: ['string', 'null'], minLength: 1 },
     },
   },
 };
@@ -65,6 +66,7 @@ export const MAPPING_SCHEMA = {
           expr: { type: 'string', minLength: 1 },
           label: { type: 'string' },
           dictionary: { type: 'object', minProperties: 1, additionalProperties: { type: 'string', minLength: 1 } },
+          otherwise: { type: ['string', 'null'], minLength: 1 },
         },
       },
     },
@@ -88,8 +90,11 @@ const validateSchema = new Ajv({ allErrors: true, strict: false }).compile(MAPPI
  */
 export interface MappingIssue { line: number; col: number; path: string; message: string; hint?: string }
 
-/** 标准层里的一列：类型、表达式、值字典与标准枚举 */
-export interface PlanColumn { name: string; type: FieldType; expr: string; dictionary?: Record<string, string>; enum?: readonly string[] }
+/**
+ * 标准层里的一列：类型、表达式、值字典与标准枚举。
+ * otherwise 是兜底值：值字典里没有（或没有值字典时不是标准枚举）的取值写成它，null 表示写成空；不写时这样的取值让合并失败
+ */
+export interface PlanColumn { name: string; type: FieldType; expr: string; dictionary?: Record<string, string>; enum?: readonly string[]; otherwise?: string | null }
 
 /** 合并计划：工作进程据此把源表的变更批次合并到标准层（MergeMappingParam 再加上映射与版本） */
 export interface MergePlan {
@@ -172,7 +177,7 @@ function fieldTypeOf(type: unknown): FieldType {
   return (FIELD_TYPE_NAMES as string[]).includes(t.toLowerCase()) ? (t.toLowerCase() as FieldType) : KIND_FIELD_TYPES[kindOf(t)];
 }
 
-/** 按扩展字段的写法整理（只留 type、expr、label、dictionary；有值字典时只能是文本） */
+/** 按扩展字段的写法整理（只留 type、expr、label、dictionary、otherwise；有值字典时只能是文本） */
 function asExtension(raw: Record<string, unknown>) {
   const dictionary = isRecord(raw.dictionary) ? raw.dictionary : undefined;
   return {
@@ -180,6 +185,7 @@ function asExtension(raw: Record<string, unknown>) {
     expr: typeof raw.expr === 'string' ? raw.expr : '源列',
     ...(typeof raw.label === 'string' && { label: raw.label }),
     ...(dictionary && { dictionary }),
+    ...((typeof raw.otherwise === 'string' || raw.otherwise === null) && { otherwise: raw.otherwise }),
   };
 }
 
@@ -213,8 +219,11 @@ function inferType(expr: Expr, columnType: (name: string) => string | undefined)
   }
 }
 
-/** 字段的写法拆成表达式与值字典 */
-const fieldParts = (raw: FieldSpec) => (typeof raw === 'string' ? { expr: raw, dictionary: undefined } : raw);
+/** 字段的写法拆成表达式、值字典与兜底值 */
+const fieldParts = (raw: FieldSpec): Exclude<FieldSpec, string> => (typeof raw === 'string' ? { expr: raw } : raw);
+
+/** 写了兜底值时（包括写成 null）带进合并计划；YAML 里的 null 要保留，不能与没写混为一谈 */
+const otherwiseOf = (raw: { otherwise?: string | null }) => (Object.hasOwn(raw, 'otherwise') ? { otherwise: raw.otherwise! } : {});
 
 const ISSUE_ORDER = (a: MappingIssue, b: MappingIssue) => a.line - b.line || a.col - b.col;
 
@@ -316,10 +325,23 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
       issue([...path, 'dictionary', from], `${to} 不是标准枚举值（可选：${allowed.join('、')}）`, { hint: value && snippet({ [from]: value }) });
     }
   };
+  /** 兜底值：只有值字典或标准枚举能判断“没对应上”的取值；标准字段的兜底值只能是标准枚举（或 null） */
+  const checkOtherwise = (path: Path, raw: { otherwise?: string | null }, dictionary: Record<string, string> | undefined, standard?: CanonicalField) => {
+    if (!Object.hasOwn(raw, 'otherwise')) return;
+    const otherwise = raw.otherwise!;
+    const allowed = standard?.enum;
+    if (!dictionary && !allowed) {
+      issue([...path, 'otherwise'], '兜底值只能用于有值字典或标准枚举的字段：这个字段没有值字典，不知道哪些取值算没对应上', { atKey: true });
+    } else if (otherwise !== null && allowed && !allowed.includes(otherwise)) {
+      const value = standardValue(spec.entity, standard.name, otherwise);
+      issue([...path, 'otherwise'], `${otherwise} 不是标准枚举值（可选：${allowed.join('、')}，或 null）`, { hint: value && snippet({ otherwise: value }) });
+    }
+  };
 
   /** fields 下写了标准模型里没有的字段：按右边的源列名、去掉 x_ 的名字（同名、同义词、相近）猜该写的标准字段，x_ 开头的附上扩展字段的写法 */
   const reportUnknownField = (entity: CanonicalEntity, name: string, raw: FieldSpec) => {
-    const { expr, dictionary } = fieldParts(raw);
+    const parts = fieldParts(raw);
+    const { expr, dictionary } = parts;
     let parsed: Expr | null = null;
     try { parsed = parseExpression(expr); } catch (e) { if (!(e instanceof ExprError)) throw e; }
     const refs = parsed ? referencedColumns(parsed).map(c => c.name) : [];
@@ -333,7 +355,9 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
     const extension = name.startsWith('x_');
     const extName = extension ? name : `x_${normalizeName(name)}`;
     const type = dictionary ? 'string' : parsed ? inferType(parsed, c => columns?.get(c)) : 'string';
-    const asExtension = snippet({ extensions: { [extName]: { type, expr, ...(dictionary && { dictionary }) } } }, [['extensions', extName]]);
+    const asExtension = snippet({
+      extensions: { [extName]: { type, expr, ...(dictionary && { dictionary, ...otherwiseOf(parts) }) } },
+    }, [['extensions', extName]]);
     const prefix = `${entity.label}（${entity.name}）没有标准字段 ${name}`;
     if (guess) {
       const label = entity.fields.find(f => f.name === guess)!.label;
@@ -368,10 +392,12 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
       if (entity) reportUnknownField(entity, name, raw);
       continue;
     }
-    const { expr, dictionary } = fieldParts(raw);
+    const parts = fieldParts(raw);
+    const { expr, dictionary } = parts;
     checkExpr(typeof raw === 'string' ? ['fields', name] : ['fields', name, 'expr'], expr);
     checkDictionary(['fields', name], field.type, dictionary, () => snippet({ [name]: expr }), field);
-    planned.push({ name, type: field.type, expr, ...(dictionary && { dictionary }), ...(field.enum && { enum: field.enum }) });
+    checkOtherwise(['fields', name], parts, dictionary, field);
+    planned.push({ name, type: field.type, expr, ...(dictionary && { dictionary }), ...(field.enum && { enum: field.enum }), ...otherwiseOf(parts) });
   }
   const extensionName = new RegExp(custom ? CUSTOM_FIELD_PATTERN : EXTENSION_PATTERN);
   for (const [name, ext] of Object.entries(spec.extensions ?? {})) {
@@ -383,7 +409,8 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
     }
     checkExpr(['extensions', name, 'expr'], ext.expr);
     checkDictionary(['extensions', name], ext.type, ext.dictionary, () => snippet({ [name]: { ...ext, type: 'string' } }, [[name]]));
-    planned.push({ name, type: ext.type, expr: ext.expr, ...(ext.dictionary && { dictionary: ext.dictionary }) });
+    checkOtherwise(['extensions', name], ext, ext.dictionary);
+    planned.push({ name, type: ext.type, expr: ext.expr, ...(ext.dictionary && { dictionary: ext.dictionary }), ...otherwiseOf(ext) });
   }
   if (!planned.length) issue(spec.fields ? ['fields'] : [], '至少要映射一个字段');
 

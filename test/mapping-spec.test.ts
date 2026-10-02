@@ -81,6 +81,33 @@ colour: red
     ]);
   });
 
+  it('兜底值带进合并计划：写 null 与不写是两回事，没有值字典的枚举字段也能兜底', () => {
+    const plan = (text: string) => {
+      const r = checkMapping(text, columns);
+      if (!r.ok) throw new Error(r.issues.map(i => i.message).join('\n'));
+      return r.plan;
+    };
+    const status = (text: string) => plan(text).columns.find(c => c.name === 'status')!;
+    expect(status(ok.replace('    expr: status\n', '    expr: status\n    otherwise: cancelled\n'))).toMatchObject({ otherwise: 'cancelled' });
+    expect(status(ok.replace('    expr: status\n', '    expr: status\n    otherwise: null\n'))).toHaveProperty('otherwise', null);
+    expect(status(ok)).not.toHaveProperty('otherwise');
+    expect(status(ok.replace(/  status:[^]*$/, '  status: { expr: status, otherwise: null }\n'))).toMatchObject({ otherwise: null, enum: expect.arrayContaining(['paid']) });
+    // 扩展字段的兜底值不受标准枚举限制
+    const level = plan(`${ok}extensions:\n  x_level: { type: string, expr: string(pay_fen), dictionary: { '1': gold }, otherwise: other }\n`);
+    expect(level.columns.find(c => c.name === 'x_level')).toMatchObject({ otherwise: 'other' });
+  });
+
+  it('兜底值不是标准枚举、或字段既没有值字典也没有标准枚举时被拒绝', () => {
+    const found = issues(ok.replace('    expr: status\n', '    expr: status\n    otherwise: Canceled\n'));
+    expect(found).toEqual([expect.objectContaining({ path: 'fields.status.otherwise', message: expect.stringMatching(/Canceled 不是标准枚举值/), hint: 'otherwise: cancelled' })]);
+    expect(issues(ok.replace('  customer_id: customer_id', '  customer_id: { expr: customer_id, otherwise: null }'))).toEqual([
+      expect.objectContaining({ path: 'fields.customer_id.otherwise', message: expect.stringMatching(/没有值字典/) }),
+    ]);
+    expect(issues(`${ok}extensions:\n  x_note: { type: string, expr: string(pay_fen), otherwise: other }\n`)).toEqual([
+      expect.objectContaining({ path: 'extensions.x_note.otherwise', message: expect.stringMatching(/没有值字典/) }),
+    ]);
+  });
+
   it('源表不能用于映射时指出原因；去重键与取最新字段必须是映射出来的字段', () => {
     expect(issues(ok.replace('table: orders', 'table: payments'))).toEqual([
       expect.objectContaining({ line: 3, path: 'table', message: '数据源中没有表 payments' }),

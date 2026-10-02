@@ -8,8 +8,9 @@ import { can, deniedReason, requirePermission } from '~/.server/access';
 import { discardDraft, draftForMapping, getMapping, MappingError, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/.server/pipeline/mapping-expr';
+import type { FallbackStat } from '~/.server/pipeline/merge-engine';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
-import { entityLabel } from '~/lib/canonical-model';
+import { entityLabel, entityOf } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
 import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
 import { MappingEditorWithReference } from '~/components/mapping-reference';
@@ -99,6 +100,13 @@ const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixe
 
 type MergeEntry = Route.ComponentProps['loaderData']['merge']['history'][number];
 
+/** 一列落入兜底的情况，如「订单状态有 2 种取值（共 312 行）落入兜底：closed（300）、pending_review（12）」 */
+function fallbackText(entity: string, f: FallbackStat) {
+  const label = entityOf(entity)?.fields.find(x => x.name === f.column)?.label ?? f.column;
+  const values = f.values.map(v => `${v.value}（${v.rows.toLocaleString('zh-CN')}）`).join('、');
+  return `${label}有 ${f.distinct} 种取值（共 ${f.rows.toLocaleString('zh-CN')} 行）落入兜底：${values}${f.distinct > f.values.length ? ' 等' : ''}`;
+}
+
 function MergeRow({ e }: { e: MergeEntry }) {
   if ('error' in e || 'skipped' in e) {
     return (
@@ -115,7 +123,12 @@ function MergeRow({ e }: { e: MergeEntry }) {
     <TableRow data-merge-mode={e.mode}>
       <TableCell>{`v${e.version}`}</TableCell>
       <TableCell>{e.mode === 'rebuild' ? `重建（批次 1–${e.batchTo}）` : e.batchTo === e.batchFrom ? '增量（无新批次）' : `增量（批次 ${e.batchFrom + 1}–${e.batchTo}）`}</TableCell>
-      <TableCell>{`${e.rows.toLocaleString('zh-CN')} 行（新增 ${e.inserted}，更新 ${e.updated}，删除 ${e.deleted}）`}</TableCell>
+      <TableCell className="whitespace-normal">
+        {`${e.rows.toLocaleString('zh-CN')} 行（新增 ${e.inserted}，更新 ${e.updated}，删除 ${e.deleted}）`}
+        {e.fallback?.map(f => (
+          <div key={f.column} className="text-sm text-muted-foreground" data-merge-fallback={f.column}>{fallbackText(e.entity, f)}</div>
+        ))}
+      </TableCell>
       <TableCell>{duration(e.durationMs)}</TableCell>
       <TableCell>{time(e.startedAt)}</TableCell>
     </TableRow>
@@ -229,7 +242,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
       <Card>
         <CardHeader>
           <CardTitle>合并到标准层</CardTitle>
-          <CardDescription>{`最近一次合并：${merge.statusLabel}。每次同步后，已发布的最新版本把原始层的新批次合并进标准层；换了版本时由全部批次重建。`}</CardDescription>
+          <CardDescription>{`最近一次合并：${merge.statusLabel}。每次同步后，已发布的最新版本把原始层的新批次合并进标准层；换了版本时由全部批次重建。写了兜底值的字段，每次合并列出本次落入兜底的取值。`}</CardDescription>
         </CardHeader>
         <CardContent>
           <Table>

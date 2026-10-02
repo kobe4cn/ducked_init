@@ -19,6 +19,7 @@ const SNIPPETS = [
   { kind: 'field', label: '普通字段', text: 'customer_id: buyer_id' },
   { kind: 'expr', label: '表达式', text: 'amount: coalesce(pay_amount, pay_fen / 100)' },
   { kind: 'dictionary', label: '值字典', text: "status: { expr: order_status, dictionary: { 已支付: paid, '2': refunded } }" },
+  { kind: 'otherwise', label: '兜底值（值字典没对应上的取值写成它，可写 null）', text: 'status: { expr: order_status, dictionary: { 已支付: paid }, otherwise: cancelled }' },
   { kind: 'extension', label: '扩展字段（写在 extensions 下）', text: 'x_coupon_code: { type: string, expr: coupon_code }' },
   { kind: 'dedupe', label: '去重键', text: 'dedupe: { key: [order_id], latest: updated_at }' },
 ];

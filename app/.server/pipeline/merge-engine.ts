@@ -14,6 +14,12 @@ import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
 /** 合并任务里的一个已发布映射：合并计划加上映射、版本与数据源 */
 export interface MergeMappingParam extends MergePlan { mapping: string; version: number; sourceId: string }
 
+/**
+ * 一列里落入兜底的取值：出现最多的几个取值与各自的行数，distinct 是共有几种取值，rows 是共有几行。
+ * 行数按源表的行计（没有主键的表里重复的行各计一次）；增量合并只统计本次变更的记录
+ */
+export interface FallbackStat { column: string; values: { value: string; rows: number }[]; distinct: number; rows: number }
+
 /** 一个映射一次合并的结果。时间为 ISO 字符串 */
 export type MergeRecord = { mapping: string; entity: string; table: string; version: number; startedAt: string; durationMs: number } & (
   | {
@@ -27,6 +33,8 @@ export type MergeRecord = { mapping: string; entity: string; table: string; vers
     deleted: number;
     /** 合并后本映射在标准层的行数 */
     rows: number;
+    /** 写了兜底值的列里落入兜底的取值（没有就不带） */
+    fallback?: FallbackStat[];
   }
   /** skipped：源表还没有同步进原始层，等首次同步后再合并（不算失败） */
   | { skipped: string }
@@ -78,32 +86,48 @@ async function inTransaction<T>(con: DuckDBConnection, work: () => Promise<T>) {
 /** 一列在源端的取值（表达式编译成 SQL，alias 是源表行的别名） */
 const rawValue = (c: PlanColumn, alias: string) => compileExpression(parseExpression(c.expr), alias);
 
-/** 一列写进标准层的值：有值字典时按字典对应，否则转成标准字段的类型 */
+/**
+ * 一列写进标准层的值：有值字典时按字典对应，否则转成标准字段的类型。
+ * 写了兜底值时，对应不上的取值（没有值字典时是标准枚举之外的取值）写成兜底值；源端为空的仍为空
+ */
 function columnValue(c: PlanColumn, alias: string) {
   const raw = rawValue(c, alias);
-  if (!c.dictionary) return `CAST(${raw} AS ${sqlType(c.type)})`;
-  return `CASE CAST(${raw} AS VARCHAR) ${Object.entries(c.dictionary).map(([from, to]) => `WHEN ${lit(from)} THEN ${lit(to)}`).join(' ')} END`;
+  const dictionary = c.dictionary ?? (c.otherwise !== undefined && c.enum ? Object.fromEntries(c.enum.map(v => [v, v])) : undefined);
+  if (!dictionary) return `CAST(${raw} AS ${sqlType(c.type)})`;
+  const text = `CAST(${raw} AS VARCHAR)`;
+  const otherwise = c.otherwise === undefined ? '' : ` ELSE ${c.otherwise === null ? 'NULL' : lit(c.otherwise)}`;
+  return `CASE WHEN ${text} IS NULL THEN NULL ${Object.entries(dictionary).map(([from, to]) => `WHEN ${text} = ${lit(from)} THEN ${lit(to)}`).join(' ')}${otherwise} END`;
 }
 
 /**
- * 值字典里没有、或（没有值字典时）不是标准枚举的取值：默认报错，不悄悄写进标准层。
- * 列出出现最多的几个取值与行数
+ * 值字典里没有、或（没有值字典时）不是标准枚举的取值：没写兜底值时报错，不悄悄写进标准层，列出出现最多的几个取值与行数；
+ * 写了兜底值时返回落入兜底的统计
  */
-async function assertKnownValues(con: DuckDBConnection, columns: PlanColumn[]) {
+async function checkUnknownValues(con: DuckDBConnection, columns: PlanColumn[]) {
+  const fallback: FallbackStat[] = [];
   for (const c of columns) {
     const allowed = c.dictionary ? Object.keys(c.dictionary) : c.enum;
     if (!allowed) continue;
     const raw = `CAST(${rawValue(c, 'l')} AS VARCHAR)`;
-    const unknown = await rows<{ v: string; n: string }>(con, `
-      SELECT ${raw} AS v, count(*) AS n FROM ${LIVE} l
-      WHERE ${raw} IS NOT NULL AND ${raw} NOT IN (${allowed.map(lit).join(', ')})
-      GROUP BY 1 ORDER BY n DESC, v LIMIT 5`);
+    // 没有主键的表一种整行一条当前记录，_n 是它出现的次数
+    const unknown = await rows<{ v: string; n: string; distinct_values: string; total_rows: string }>(con, `
+      SELECT v, n, count(*) OVER () AS distinct_values, sum(n) OVER () AS total_rows FROM (
+        SELECT ${raw} AS v, sum(l._n) AS n FROM ${LIVE} l
+        WHERE ${raw} IS NOT NULL AND ${raw} NOT IN (${allowed.map(lit).join(', ')}) GROUP BY 1)
+      ORDER BY n DESC, v LIMIT 5`);
     if (!unknown.length) continue;
+    if (c.otherwise !== undefined) {
+      fallback.push({
+        column: c.name, values: unknown.map(u => ({ value: u.v, rows: Number(u.n) })), distinct: Number(unknown[0].distinct_values), rows: Number(unknown[0].total_rows),
+      });
+      continue;
+    }
     const shown = unknown.map(u => `'${u.v}'（${u.n} 行）`).join('、');
     throw new Error(c.dictionary
-      ? `字段 ${c.name} 有值字典里没有的取值：${shown}，请在值字典里补上后重新发布`
-      : `字段 ${c.name} 有不是标准枚举的取值：${shown}，请用值字典对应到 ${c.enum!.join('、')}`);
+      ? `字段 ${c.name} 有值字典里没有的取值：${shown}，请在值字典里补上，或用 otherwise 写兜底值，再重新发布`
+      : `字段 ${c.name} 有不是标准枚举的取值：${shown}，请用值字典对应到 ${c.enum!.join('、')}，或用 otherwise 写兜底值`);
   }
+  return fallback;
 }
 
 /** 标准层表不存在时按实体的全部字段建表，存在时补上新的扩展字段 */
@@ -171,8 +195,8 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, now:
       SELECT l.*, coalesce(r._n, 0) + l._delta AS _n FROM ${LATEST} l LEFT JOIN ${held} r ON r._src = l._src) WHERE _n > 0`);
   }
 
-  // 转换：先查出值字典与标准枚举之外的取值，再算出各列
-  await assertKnownValues(con, plan.columns);
+  // 转换：先查出值字典与标准枚举之外的取值（没写兜底值时报错），再算出各列
+  const fallback = await checkUnknownValues(con, plan.columns);
   await con.run(`CREATE OR REPLACE TABLE ${ROWS} AS
     SELECT l._src, l._n, l._batch, ${plan.columns.map(c => `${columnValue(c, 'l')} AS ${ident(c.name)}`).join(', ')} FROM ${LIVE} l`);
   const key = plan.key;
@@ -226,6 +250,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, now:
     updated: Number(stats.updated),
     deleted: Number(stats.deleted),
     rows: await silverRows(),
+    ...(fallback.length && { fallback }),
   };
 }
 

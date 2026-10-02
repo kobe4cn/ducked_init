@@ -411,6 +411,21 @@ describe('发布映射并合并到标准层', () => {
     expect(await silver(acme, 'customer', 'customer_id::INT')).toHaveLength(40);
   });
 
+  it('写了兜底值时值字典里没有的取值写成兜底值，合并照常完成，并记下落入兜底的取值与行数', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const mapping = await publish(author, reviewer, id, ORDER_LOG_MAPPING
+      .replace(', 已退款: refunded', '')
+      .replace('    expr: trim(status)\n', '    expr: trim(status)\n    otherwise: cancelled\n'));
+
+    const [merge] = (await listTasks(acme)).filter(t => t.kind === 'silver.merge');
+    expect(merge.status).toBe('succeeded');
+    expect((await silver(acme, 'order', 'order_id')).map(o => [o.order_id, o.status])).toEqual([['A1', 'cancelled'], ['A2', 'paid']]);
+    // 统计的是源表里的行（A1 的两行已支付是重复行，各计一次），不是标准层的行
+    expect((await getMapping(author, mapping)).merge.history[0]).toMatchObject({
+      fallback: [{ column: 'status', values: [{ value: '已退款', rows: 1 }], distinct: 1, rows: 1 }],
+    });
+  });
+
   it('草稿作者不能自己发布；发布后版本锁定，再改是新的一版草稿，发布新版本后按新版本重建', async () => {
     const { acme, author, reviewer, id } = await syncedSource();
     const mapping = await createMapping(author, id, CUSTOMERS);

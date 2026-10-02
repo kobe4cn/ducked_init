@@ -1,9 +1,10 @@
 // 标准模型与映射的 HTTP 接缝：任何成员都能浏览标准模型；数据工程师在界面上编写映射（不合格的 YAML 被拒绝并给出位置），
-// 也能按规则生成草稿填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；分析师只读，查看者看不到映射，其他租户一律 404
+// 也能按规则生成草稿填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；分析师只读，查看者看不到映射，其他租户一律 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
-import { registerSource } from '../../app/.server/sources';
+import { syncSource } from '../../app/.server/source-sync';
+import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { memberOf, newTenant, selectAllTables } from '../pipeline/fixtures';
 import { pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -114,6 +115,22 @@ describe('编写与发布映射', () => {
     const audit = await (await (await loginAs(app, 'admin@acme.com')).get('/audit')).text();
     expect(audit).toContain('「电商库」orders → 订单，第 1 版草稿');
     expect(audit).toContain('「电商库」orders → 订单，第 1 版（作者 de@acme.com）');
+  });
+
+  it('合并时落入兜底的取值与行数显示在详情页的合并记录里', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await memberOf(tenantId, 'de@acme.com');
+    await confirmWatermark(engineer, sourceId, 'orders', 'order_id');
+    await syncSource(engineer, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const author = await loginAs(app, 'de@acme.com');
+    const yaml = ORDERS.replace('dictionary: { paid: paid, refunded: refunded }', 'dictionary: { paid: paid }, otherwise: cancelled');
+    const id = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml }));
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    expect((await (await loginAs(app, 'de2@acme.com')).post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    expect(await (await author.get(`/mappings/${id}`)).text()).toContain('订单状态有 1 种取值（共 50 行）落入兜底：refunded（50）');
   });
 
   it('发布者不能是最后保存草稿的人：A 起草、B 修改后 A 能发布、B 不能，反过来也一样', async () => {
