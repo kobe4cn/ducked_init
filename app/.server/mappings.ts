@@ -339,6 +339,19 @@ export async function mergeNow(actor: CurrentMember) {
   throw new MappingError(pending ? '已有一次合并在排队或运行中' : '还没有已发布的映射');
 }
 
+/** 成员在映射详情页手动合并这一个映射（最新已发布版本）；已有合并在排队时把它补进去，在运行时报错（之后还有没合并的版本或变更时由定时检查补上） */
+export async function mergeMapping(actor: CurrentMember, mappingId: string) {
+  assertCan(actor, 'sources:write');
+  await requireMapping(actor.tenant.id, mappingId);
+  return getDb().transaction(async tx => {
+    const task = await enqueueMerge(tx, actor.tenant.id, [mappingId]);
+    if (task) return task;
+    // 在同一个事务里判断原因：排队中的合并恰被领取时，这里读到的是运行中
+    if (!(await publishedPlans(tx, actor.tenant.id, [mappingId])).length) throw new MappingError('这个映射还没有已发布的版本');
+    throw new MappingError('已有一次合并在运行；它结束后，这个映射还有没合并的版本或变更时由定时检查补上');
+  });
+}
+
 /** 合并任务的参数 params 带了映射 mappingId（任一版本） */
 const mergeHas = (params: SQL, mappingId: SQL) => sql`${params}->'mappings' @> jsonb_build_array(jsonb_build_object('mapping', ${mappingId}))`;
 

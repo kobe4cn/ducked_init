@@ -1,11 +1,11 @@
 // app/routes/mapping.tsx —— 单个映射：各版本（已发布的锁定、草稿可改）、编辑与丢弃草稿（数据工程师、管理员）、发布草稿（需最后保存它的人以外的
 // 另一位有发布权限的成员，最后保存的人看到不能发布的原因，租户里只有自己有发布权限时提示先邀请成员；编辑框旁对照源表的列统计与实体的标准字段；
-// 可按规则重新生成草稿填进编辑框，不保存），以及这个映射每次合并到标准层的结果
+// 可按规则重新生成草稿填进编辑框，不保存），以及这个映射每次合并到标准层的结果；有已发布版本时可以立即合并这一个映射
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, deniedReason, requirePermission } from '~/.server/access';
-import { discardDraft, draftForMapping, getMapping, MappingError, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
+import { discardDraft, draftForMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/.server/pipeline/mapping-expr';
 import type { FallbackStat } from '~/.server/pipeline/merge-engine';
@@ -79,6 +79,9 @@ export async function action({ request, params }: Route.ActionArgs) {
       case 'publish':
         await publishMapping(await requirePermission(request, 'publish'), params.mappingId, Number(field('version')));
         break;
+      case 'merge':
+        await mergeMapping(await requirePermission(request, 'sources:write'), params.mappingId);
+        break;
       case 'discard': {
         // 从没发布过的映射整个删除，回到映射列表
         const { kept } = await discardDraft(await requirePermission(request, 'sources:write'), params.mappingId);
@@ -139,6 +142,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
   const { email, nav, canWrite, functions, mapping, versions, merge } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
+  const published = versions.some(v => v.status === 'published');
   const [shown, setShown] = useState(versions[0]?.version ?? 1);
   const selected = versions.find(v => v.version === shown) ?? versions[0];
   return (
@@ -191,7 +195,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
                           <Form
                             method="post"
                             onSubmit={e => {
-                              const back = versions.some(p => p.status === 'published') ? '回到最近的已发布版本' : '这个映射从没发布过，将被删除';
+                              const back = published ? '回到最近的已发布版本' : '这个映射从没发布过，将被删除';
                               if (!confirm(`丢弃第 ${v.version} 版草稿？${back}。`)) e.preventDefault();
                             }}
                           >
@@ -241,7 +245,15 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
 
       <Card>
         <CardHeader>
-          <CardTitle>合并到标准层</CardTitle>
+          <div className="flex items-center justify-between gap-3">
+            <CardTitle>合并到标准层</CardTitle>
+            {canWrite && published && (
+              <Form method="post">
+                <input type="hidden" name="intent" value="merge" />
+                <Button type="submit" size="sm" variant="outline" disabled={submitting} title="只合并这个映射已发布的最新版本">立即合并</Button>
+              </Form>
+            )}
+          </div>
           <CardDescription>{`这个映射最近一次合并：${merge.statusLabel}。发布后、以及同步给这个映射的源表写入了变更后，已发布的最新版本把原始层的新批次合并进标准层；换了版本时由全部批次重建。写了兜底值的字段，每次合并列出本次落入兜底的取值。`}</CardDescription>
         </CardHeader>
         <CardContent>

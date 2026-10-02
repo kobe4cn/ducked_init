@@ -5,7 +5,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
@@ -642,6 +642,37 @@ describe('发布映射并合并到标准层', () => {
       expect((await getMapping(author, customers)).merge.history[0]).toMatchObject({ mode: 'incremental', updated: 1 });
       expect((await getMapping(author, orders)).merge.history).toHaveLength(1);
       expect(await enqueueDueMerges()).toEqual([]);
+    });
+  });
+
+  it('详情页只合并这一个映射：任务只带它、只有它新增合并记录；已有合并在排队时并进去，在运行时提示由定时检查补上', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, author, reviewer, id } = await syncedSource();
+      const customers = await publish(author, reviewer, id, CUSTOMERS);
+      const orders = await publish(author, reviewer, id, ORDERS);
+
+      const task = await mergeMapping(author, customers);
+      expect(mergedMappings(task)).toEqual([customers]);
+      await drain();
+      expect((await getMapping(author, customers)).merge.history).toHaveLength(2);
+      expect((await getMapping(author, orders)).merge.history).toHaveLength(1);
+
+      // 已有合并在排队：并进同一个任务
+      const queued = await mergeMapping(author, customers);
+      const extended = await mergeMapping(author, orders);
+      expect(extended.id).toBe(queued.id);
+      expect(mergedMappings(extended)).toEqual([customers, orders].sort());
+
+      // 合并在运行：不入队，提示稍后补上
+      await getDb().update(tasks).set({ status: 'running', startedAt: sql`now()`, heartbeatAt: sql`now()` }).where(eq(tasks.id, queued.id));
+      await expect(mergeMapping(author, orders)).rejects.toThrow('已有一次合并在运行');
+      expect((await listTasks(acme)).filter(t => t.kind === 'silver.merge' && t.status === 'queued')).toEqual([]);
+
+      // 只有草稿的映射、别的租户的映射
+      const draft = await createMapping(author, id, ORDER_LOG_MAPPING);
+      await expect(mergeMapping(author, draft.id)).rejects.toThrow('这个映射还没有已发布的版本');
+      const other = await memberOf(await newTenant('globex'), 'de@globex.com');
+      await expect(mergeMapping(other, customers)).rejects.toMatchObject({ status: 404 });
     });
   });
 });

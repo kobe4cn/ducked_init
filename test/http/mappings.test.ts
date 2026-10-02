@@ -89,6 +89,8 @@ describe('编写与发布映射', () => {
     expect(detail).toContain('data-version-status="draft"');
     expect(detail).toContain('你最后改了这一版草稿，需由另一位数据工程师或管理员发布');
     expect((await engineer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(403);
+    // 只有草稿时不能合并
+    expect(detail).not.toContain('name="intent" value="merge"');
   });
 
   it('另一位数据工程师发布后版本锁定并入队合并；审计记下起草与发布', async () => {
@@ -104,6 +106,9 @@ describe('编写与发布映射', () => {
     expect(detail).toContain('data-version-status="published"');
     expect(detail).not.toContain('name="intent" value="publish"');
     expect(await (await reviewer.get('/tasks')).text()).toContain('合并到标准层');
+    // 已发布后可以在详情页只合并这个映射（发布入队的合并还在排队，并进去）
+    expect(detail).toContain('name="intent" value="merge"');
+    expect((await reviewer.post(`/mappings/${id}`, { intent: 'merge' })).status).toBe(302);
 
     // 已发布的版本再保存是新的一版草稿
     expect((await author.post(`/mappings/${id}`, { intent: 'save', yaml: ORDERS.replace('amount: amount', 'amount: amount / 100') })).status).toBe(302);
@@ -218,6 +223,7 @@ describe('编写与发布映射', () => {
     expect((await analyst.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS })).status).toBe(403);
     expect((await analyst.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(403);
     expect((await analyst.post(`/mappings/${id}`, { intent: 'save', yaml: ORDERS })).status).toBe(403);
+    expect((await analyst.post(`/mappings/${id}`, { intent: 'merge' })).status).toBe(403);
 
     const other = await newTenant('globex');
     await memberOf(other, 'de@globex.com', 'data_engineer');
