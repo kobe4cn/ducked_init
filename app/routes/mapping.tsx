@@ -18,6 +18,8 @@ import { Badge } from '~/components/ui/badge';
 import { Button } from '~/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { PrototypeSwitcher, useVariant } from '~/components/prototype-switcher';
+import { MappingA, MappingB, MappingC } from './mapping.prototype-variants';
 
 export function meta({ loaderData }: Route.MetaArgs) {
   return [{ title: `${loaderData ? `${loaderData.mapping.entityLabel} ← ${loaderData.mapping.table}` : '映射'} · CRM 数据分析平台` }];
@@ -138,7 +140,14 @@ function MergeRow({ e }: { e: MergeEntry }) {
   );
 }
 
-export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
+// PROTOTYPE：按 ?variant= 切换视觉方向，O 是现状
+export default function Mapping(props: Route.ComponentProps) {
+  const variant = useVariant();
+  const View = { A: MappingA, B: MappingB, C: MappingC, O: MappingCurrent }[variant];
+  return <><View {...props} MergeRow={MergeRow} /><PrototypeSwitcher /></>;
+}
+
+function MappingCurrent({ loaderData, actionData }: Pick<Route.ComponentProps, 'loaderData' | 'actionData'>) {
   const { email, nav, canWrite, functions, mapping, versions, merge } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');

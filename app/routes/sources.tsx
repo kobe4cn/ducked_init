@@ -18,6 +18,8 @@ import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { PrototypeSwitcher, useVariant } from '~/components/prototype-switcher';
+import { SourcesA, SourcesB, SourcesC } from './sources.prototype-variants';
 
 export function meta({}: Route.MetaArgs) {
   return [{ title: '数据源 · CRM 数据分析平台' }];
@@ -57,7 +59,14 @@ export async function action({ request }: Route.ActionArgs) {
   }
 }
 
-export default function Sources({ loaderData, actionData }: Route.ComponentProps) {
+// PROTOTYPE：按 ?variant= 切换视觉方向，O 是现状
+export default function Sources(props: Route.ComponentProps) {
+  const variant = useVariant();
+  const View = { A: SourcesA, B: SourcesB, C: SourcesC, O: SourcesCurrent }[variant];
+  return <><View {...props} /><PrototypeSwitcher /></>;
+}
+
+function SourcesCurrent({ loaderData, actionData }: Pick<Route.ComponentProps, 'loaderData' | 'actionData'>) {
   const { email, nav, canWrite, sources } = loaderData;
   const values: Record<string, string> = actionData?.values ?? {};
   const [kind, setKind] = useState<SourceKind>((SOURCE_KINDS as readonly string[]).includes(values.kind) ? (values.kind as SourceKind) : 'postgres');
