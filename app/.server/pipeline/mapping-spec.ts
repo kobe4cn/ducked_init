@@ -164,6 +164,25 @@ function locator(doc: Document, lines: LineCounter) {
   };
 }
 
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** 扩展字段的类型：标准层的类型名原样返回，源端的数据库类型（DECIMAL(12,2)、VARCHAR）换算成标准层的类型 */
+function fieldTypeOf(type: unknown): FieldType {
+  const t = String(type ?? '').trim();
+  return (FIELD_TYPE_NAMES as string[]).includes(t.toLowerCase()) ? (t.toLowerCase() as FieldType) : KIND_FIELD_TYPES[kindOf(t)];
+}
+
+/** 按扩展字段的写法整理（只留 type、expr、label、dictionary；有值字典时只能是文本） */
+function asExtension(raw: Record<string, unknown>) {
+  const dictionary = isRecord(raw.dictionary) ? raw.dictionary : undefined;
+  return {
+    type: dictionary ? 'string' : fieldTypeOf(raw.type),
+    expr: typeof raw.expr === 'string' ? raw.expr : '源列',
+    ...(typeof raw.label === 'string' && { label: raw.label }),
+    ...(dictionary && { dictionary }),
+  };
+}
+
 /** 改好的写法：flow 里的路径写成行内形式（如 { type: string, expr: x }） */
 function snippet(value: Record<string, unknown>, flow: Path[] = []) {
   const doc = new Document(value);
@@ -224,11 +243,32 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
 
   const value = doc.toJS() as unknown;
   if (!validateSchema(value)) {
+    // 两种常见写错先整条给出改法，不再逐项报 Schema 的错（行内写法里 DECIMAL(12,2) 的逗号还会拆出一个叫 2) 的键）：
+    // fields 下写了带 type 的扩展字段；扩展字段的 type 写成了源端的数据库类型
+    const rewritten: string[] = [];
+    const root = isRecord(value) ? value : {};
+    for (const [name, raw] of Object.entries(isRecord(root.fields) ? root.fields : {})) {
+      if (!isRecord(raw) || !('type' in raw)) continue;
+      rewritten.push(`fields.${name}`);
+      const extName = name.startsWith('x_') ? name : `x_${normalizeName(name)}`;
+      issue(['fields', name], `${name} 带了类型，是扩展字段：请移到 extensions 下${extName === name ? '' : '，以 x_ 开头'}`, {
+        atKey: true, hint: snippet({ extensions: { [extName]: asExtension(raw) } }, [['extensions', extName]]),
+      });
+    }
+    for (const [name, raw] of Object.entries(isRecord(root.extensions) ? root.extensions : {})) {
+      if (!isRecord(raw) || raw.type === undefined || (FIELD_TYPE_NAMES as unknown[]).includes(raw.type)) continue;
+      rewritten.push(`extensions.${name}`);
+      const types = FIELD_TYPE_NAMES.map(t => `${t}（${FIELD_TYPES[t].label}）`).join('、');
+      issue(['extensions', name, 'type'], `类型要写标准层的类型：${types}，不是源端的数据库类型；这里应为 ${fieldTypeOf(raw.type)}`, {
+        hint: snippet({ [name]: asExtension(raw) }, [[name]]),
+      });
+    }
     const seen = new Set<string>();
     for (const e of validateSchema.errors ?? []) {
       const d = describeSchemaError(e);
-      if (!d || seen.has(`${d.path.join('.')}|${d.message}`)) continue;
-      seen.add(`${d.path.join('.')}|${d.message}`);
+      const at = d?.path.join('.');
+      if (!d || rewritten.some(p => at === p || at!.startsWith(`${p}.`)) || seen.has(`${at}|${d.message}`)) continue;
+      seen.add(`${at}|${d.message}`);
       issue(d.path, d.message, { atKey: e.keyword === 'additionalProperties' });
     }
     return { ok: false, issues: issues.sort(ISSUE_ORDER) };

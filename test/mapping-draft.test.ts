@@ -305,6 +305,18 @@ describe('转换与值字典', () => {
     expect(lineOf(yaml, 'phone')).toContain('格式：手机号');
   });
 
+  it('以 _ts 结尾的列按时间对应；没用到的列生成注释掉的扩展字段写法，类型已换算，去掉注释即可保存', () => {
+    const t = table('orders', [column('order_id', 'VARCHAR'), column('order_ts', 'TIMESTAMP'), column('discount', 'DECIMAL(12,2)'), column('备注', 'VARCHAR')], ['order_id']);
+    const yaml = draft(t, 'order');
+    expect(fields(yaml)).toMatchObject({ created_at: "from_timezone(order_ts, 'Asia/Shanghai')" });
+    expect(lineOf(yaml, 'created_at')).toContain('同义词：order_ts');
+    expect(yaml).toContain('# extensions:\n#   x_discount: { type: decimal, expr: discount }\n');
+    // 列名做不成扩展字段名（中文）时按列序号起名
+    expect(yaml).toContain('#   x_col_4: { type: string, expr: 备注 }');
+    const uncommented = yaml.replace(/^# (extensions:|  x_)/gm, '$1');
+    expect(checkMapping(uncommented, () => t.columns)).toMatchObject({ ok: true, plan: { entityColumns: expect.arrayContaining([{ name: 'x_discount', type: 'decimal' }]) } });
+  });
+
   it('需要引号的列名在表达式里加上双引号', () => {
     const t = table('orders', [column('Order ID', 'VARCHAR'), column('Created-At', 'TIMESTAMP')], ['Order ID']);
     const yaml = draft(t, 'order');

@@ -2,7 +2,7 @@
 // 列名规范化后按同名与同义词对应到标准字段，再用类型与格式特征校验；按需加上分转元、毫秒时间戳、时区解读等转换，枚举字段按常见取值生成值字典骨架。
 // 每条对应的依据写在行尾注释里，没对应上的标准字段与没用到的源列列在文末。生成的只是草稿，仍要保存校验、双人发布（ADR-0015）
 import { Document, Scalar, YAMLMap } from 'yaml';
-import { MODEL_MAJOR, type CanonicalEntity, type CanonicalField, type FieldType } from '../../lib/canonical-model';
+import { EXTENSION_PATTERN, MODEL_MAJOR, type CanonicalEntity, type CanonicalField, type FieldType } from '../../lib/canonical-model';
 import { CENTS_SUFFIX, fieldsForColumn, normalizeName, standardValue } from '../../lib/field-synonyms';
 import type { ColumnProfile, TableProfile, TextFormat } from './source-engine';
 
@@ -101,6 +101,30 @@ function convert(field: CanonicalField, c: ColumnProfile, tz: string): Converted
 }
 
 interface Mapped { expr: string; reason: string[]; column?: ColumnProfile }
+
+/**
+ * 没用到的列写成扩展字段（注释掉放在文末，去掉注释即可保存）：类型按源列换算，不带时区的时间按时区解读；
+ * 列名做不成扩展字段名（中文、特殊字符）时用 x_col_<列序号>
+ */
+function extensionLines(columns: ColumnProfile[], all: ColumnProfile[], tz: string) {
+  const valid = new RegExp(EXTENSION_PATTERN);
+  const used = new Set<string>();
+  const extensions = new YAMLMap();
+  for (const c of columns) {
+    let name = `x_${normalizeName(c.name)}`;
+    if (!valid.test(name) || used.has(name)) name = `x_col_${all.indexOf(c) + 1}`;
+    used.add(name);
+    const kind = kindOf(c.type);
+    const col = ref(c.name);
+    const expr = kind === 'timestamp' ? `from_timezone(${col}, '${tz}')` : kind === 'other' ? `string(${col})` : col;
+    const spec = new YAMLMap();
+    spec.flow = true;
+    spec.set('type', KIND_FIELD_TYPES[kind]);
+    spec.set('expr', expr);
+    extensions.set(name, spec);
+  }
+  return new Document({ extensions }).toString({ lineWidth: 0, singleQuote: true }).trimEnd().split('\n');
+}
 
 /**
  * 按规则生成映射草稿（YAML 文本）。去重：实体主键没有对应上时用源表主键（没有时用成员声明的业务主键，再没有就用整行）拼出来；
@@ -204,7 +228,10 @@ export function draftMapping(table: TableProfile, entity: CanonicalEntity, opts:
     for (const f of unmapped) tail.push(`  ${f.name}（${f.label}）${rejected.has(f.name) ? `：${rejected.get(f.name)}` : ''}`);
   }
   const extra = table.columns.filter(c => !used.has(c.name));
-  if (extra.length) tail.push(`源表里没用到的列（要保留时写在 extensions 里，以 x_ 开头）：${extra.map(c => `${c.name}（${c.type}）`).join('、')}`);
+  if (extra.length) {
+    tail.push(`源表里没用到的列：${extra.map(c => `${c.name}（${c.type}）`).join('、')}。要保留时去掉下面的注释（扩展字段，类型已按源列换算）：`);
+    tail.push(...extensionLines(extra, table.columns, tz));
+  }
   if (tail.length) doc.comment = tail.map(l => ` ${l}`).join('\n');
   return doc.toString({ nullStr: '', lineWidth: 0 });
 }

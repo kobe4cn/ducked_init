@@ -126,6 +126,24 @@ describe('映射报错给出改法', () => {
     expect(coupon.hint).toBe('extensions:\n  x_coupon: { type: string, expr: string(pay_fen) }');
   });
 
+  it('fields 下写成扩展字段的样子（带 type）时只报一条：移到 extensions 下，type 换成标准层的类型', () => {
+    // 行内写法里 DECIMAL(12,2) 的逗号把它拆成了 type: DECIMAL(12 与一个叫 2) 的键，不再逐项报「不认识的项」
+    const found = issues(`${ok}  x_discount: { type: DECIMAL(12,2), expr: pay_fen }\n`);
+    expect(found).toEqual([expect.objectContaining({
+      path: 'fields.x_discount',
+      message: expect.stringMatching(/x_discount 带了类型，是扩展字段：请移到 extensions 下/),
+      hint: 'extensions:\n  x_discount: { type: decimal, expr: pay_fen }',
+    })]);
+  });
+
+  it('扩展字段的 type 写成源端的数据库类型时只报一条，给出换算后的写法', () => {
+    const found = issues(`${ok}extensions:\n  x_discount: { type: DECIMAL(12,2), expr: pay_fen }\n  x_note:\n    type: VARCHAR\n    expr: string(pay_fen)\n`);
+    expect(found.map(i => [i.path, i.message, i.hint])).toEqual([
+      ['extensions.x_discount.type', expect.stringMatching(/类型要写标准层的类型.*decimal/), 'x_discount: { type: decimal, expr: pay_fen }'],
+      ['extensions.x_note.type', expect.stringMatching(/类型要写标准层的类型/), 'x_note: { type: string, expr: string(pay_fen) }'],
+    ]);
+  });
+
   it('值字典用在非文本字段、对应到非标准枚举、缺主键时各附一行改好的写法', () => {
     const dictionary = issues(ok.replace('      已支付: paid', '      已支付: settled'))[0];
     expect(dictionary.hint).toBe('已支付: paid');

@@ -225,14 +225,16 @@ const VALUE_SYNONYMS: Record<string, Record<string, Record<string, readonly stri
 export type NameMatch = { field: string; by: 'same' | 'synonym'; rank: number };
 
 /**
- * 源列按名称可能对应的标准字段（同名在前，同义词按优先级），列名先规范化，带单位后缀（_cents、_fen、_ms）的也试去掉后缀的写法。
+ * 源列按名称可能对应的标准字段（同名在前，同义词按优先级），列名先规范化，带单位后缀（_cents、_fen、_ms）的也试去掉后缀的写法，
+ * 以 _ts 结尾的也试 _time 与 _at 的写法（order_ts 即 order_time）。
  * 实体不认识时为空
  */
 export function fieldsForColumn(entityName: string, column: string): NameMatch[] {
   const entity = entityOf(entityName);
   if (!entity) return [];
   const norm = normalizeName(column);
-  const names = [...new Set([norm, norm.replace(UNIT_SUFFIX, '')])];
+  const bare = norm.replace(UNIT_SUFFIX, '');
+  const names = [...new Set([norm, bare, ...(/_ts$/.test(bare) ? [bare.replace(/_ts$/, '_time'), bare.replace(/_ts$/, '_at')] : [])])];
   const synonyms = COLUMN_SYNONYMS[entity.name] ?? {};
   const matches: NameMatch[] = [];
   for (const f of entity.fields) {
