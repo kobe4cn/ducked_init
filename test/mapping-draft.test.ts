@@ -1,5 +1,5 @@
 // 按规则生成映射草稿（纯函数）：源表的列统计 + 目标实体 → 映射 YAML。列名规范化与同义词匹配、格式特征校验、分 / 毫秒 / 无时区时间的转换、
-// 值字典骨架、没有主键的表；生成的草稿交给 checkMapping 校验。四张表贴合开发库 crm_source（db_script/mysql_seed.sql）的列统计
+// 值字典骨架、没有主键的表；生成的草稿交给 checkMapping 校验。六张表贴合开发库 crm_source（db_script/mysql_seed.sql）的列统计
 import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
@@ -56,6 +56,23 @@ const POINT_LOGS = table('point_logs', [
   column('remark', 'VARCHAR', { formats: [] }),
 ], ['id']);
 
+const CONSENTS = table('consents', [
+  column('customer_id', 'BIGINT', { min: '1', max: '1000' }),
+  column('channel', 'VARCHAR', { distinct: 4, top: top('短信', '邮件', 'APP推送', '微信') }),
+  column('opt_in', 'CHAR', { distinct: 2, top: top('Y', 'N') }),
+  column('agree_time', 'TIMESTAMP', { nullRate: 0.13, min: '2023-01-02 22:00:00', max: '2024-05-16 11:00:00' }),
+  column('revoke_time', 'TIMESTAMP', { nullRate: 0.8, min: '2024-02-01 19:00:00', max: '2024-08-27 21:00:00' }),
+  column('update_time', 'TIMESTAMP', { min: '2023-01-02 22:00:00', max: '2024-08-27 21:00:00' }),
+], ['customer_id', 'channel']);
+
+const PREFERENCES = table('preferences', [
+  column('id', 'BIGINT', { min: '1', max: '2000' }),
+  column('customer_id', 'BIGINT', { min: '1', max: '1000' }),
+  column('pref_type', 'VARCHAR', { distinct: 3, top: top('category', 'brand', 'flavor') }),
+  column('pref_value', 'VARCHAR', { distinct: 12, formats: [] }),
+  column('updated_at', 'TIMESTAMP', { min: '2024-03-01 09:00:00', max: '2024-04-12 00:00:00' }),
+], ['id']);
+
 const columnsOf = (...tables: TableProfile[]) => (name: string) =>
   tables.find(t => t.name === name)?.columns.map(c => c.name) ?? `数据源中没有表 ${name}`;
 
@@ -89,8 +106,8 @@ describe('列名规范化与同义词', () => {
   });
 });
 
-describe('开发库四张表生成的草稿', () => {
-  const columns = columnsOf(ORDERS, CUSTOMERS, EVENTS, POINT_LOGS);
+describe('开发库六张表生成的草稿', () => {
+  const columns = columnsOf(ORDERS, CUSTOMERS, EVENTS, POINT_LOGS, CONSENTS, PREFERENCES);
 
   it('orders：直接通过保存校验，同义词与转换写在行尾注释里', () => {
     const yaml = draft(ORDERS, 'order');
@@ -152,6 +169,32 @@ describe('开发库四张表生成的草稿', () => {
     expect(yaml).toMatch(/# 源表里没用到的列.*remark/);
     // member_id 在积分流水里是会员号，不是消费者 ID
     expect(fieldsForColumn('points_transaction', 'member_id')[0]).toMatchObject({ field: 'membership_id' });
+  });
+
+  it('consents：复合主键就是营销同意的主键，渠道与 Y / N 预填值字典，直接通过保存校验', () => {
+    const yaml = draft(CONSENTS, 'consent');
+    expect(checkMapping(yaml, columns)).toMatchObject({ ok: true, plan: { key: ['customer_id', 'channel'] } });
+    expect(fields(yaml)).toEqual({
+      customer_id: 'string(customer_id)',
+      channel: { expr: 'channel', dictionary: { 短信: 'sms', 邮件: 'email', APP推送: 'push', 微信: 'wechat' } },
+      status: { expr: 'opt_in', dictionary: { Y: 'granted', N: 'revoked' } },
+      granted_at: "from_timezone(agree_time, 'Asia/Shanghai')",
+      revoked_at: "from_timezone(revoke_time, 'Asia/Shanghai')",
+      updated_at: "from_timezone(update_time, 'Asia/Shanghai')",
+    });
+    expect(yaml).not.toContain('dedupe');
+  });
+
+  it('preferences：偏好类型与偏好值对上，按实体主键去重并提示确认，直接通过保存校验', () => {
+    const yaml = draft(PREFERENCES, 'preference');
+    expect(checkMapping(yaml, columns)).toMatchObject({ ok: true, plan: { key: ['customer_id', 'preference_type', 'preference_value'] } });
+    expect(fields(yaml)).toEqual({
+      customer_id: 'string(customer_id)',
+      preference_type: 'pref_type',
+      preference_value: 'pref_value',
+      updated_at: "from_timezone(updated_at, 'Asia/Shanghai')",
+    });
+    expect(yaml).toContain('按 customer_id + preference_type + preference_value 去重，请确认它唯一');
   });
 });
 

@@ -27,6 +27,16 @@ const COMMON: Record<string, readonly string[]> = {
   created_at: ['create_time', 'created_time', 'gmt_create', 'ctime', 'created'],
 };
 
+/** 营销渠道的取值近义词：营销触达与营销同意共用 */
+const CHANNEL_VALUES: Record<string, readonly string[]> = {
+  sms: ['短信', '短消息'],
+  email: ['邮件', '电子邮件', 'mail', 'edm'],
+  push: ['推送', 'app推送', '消息推送'],
+  wechat: ['微信', 'wx', 'weixin', '公众号', '企业微信'],
+  app: ['站内信', 'inapp', 'in_app'],
+  other: ['其他', '其它'],
+};
+
 /** 各实体字段的列名同义词（都是规范化后的写法）；按优先级排列 */
 const COLUMN_SYNONYMS: Record<string, Record<string, readonly string[]>> = {
   customer: {
@@ -102,6 +112,20 @@ const COLUMN_SYNONYMS: Record<string, Record<string, readonly string[]>> = {
     occurred_at: ['occurred', 'occur_time', 'trans_time', 'transaction_time', 'change_time', 'event_time', ...COMMON.created_at, 'created_at'],
     expires_at: ['expire_time', 'expired_at', 'expire_at', 'expiry_time', 'expiry_date', 'expire_date', 'valid_until', 'end_time'],
   },
+  consent: {
+    customer_id: COMMON.customer_id,
+    channel: ['consent_channel', 'subscribe_channel', 'channel_type', 'send_channel', 'touch_channel'],
+    status: ['consent_status', 'opt_in', 'optin', 'opt_status', 'subscribe_status', 'subscribed', 'is_subscribed', 'agreed', 'is_agreed', 'consent', 'state'],
+    granted_at: ['grant_time', 'granted_time', 'consent_time', 'consented_at', 'agree_time', 'agreed_at', 'opt_in_time', 'opt_in_at', 'subscribe_time', 'subscribed_at'],
+    revoked_at: ['revoke_time', 'revoked_time', 'withdraw_time', 'withdrawn_at', 'opt_out_time', 'opt_out_at', 'unsubscribe_time', 'unsubscribed_at'],
+    updated_at: COMMON.updated_at,
+  },
+  preference: {
+    customer_id: COMMON.customer_id,
+    preference_type: ['pref_type', 'preference_key', 'pref_key', 'interest_type', 'type', 'key'],
+    preference_value: ['pref_value', 'interest_value', 'pref', 'interest', 'preference', 'value'],
+    updated_at: COMMON.updated_at,
+  },
 };
 
 /** 标准枚举的取值近义词（比较时忽略大小写与首尾空白）：标准值本身不用列出 */
@@ -124,14 +148,7 @@ const VALUE_SYNONYMS: Record<string, Record<string, Record<string, readonly stri
     },
   },
   touch: {
-    channel: {
-      sms: ['短信', '短消息'],
-      email: ['邮件', '电子邮件', 'mail', 'edm'],
-      push: ['推送', 'app推送', '消息推送'],
-      wechat: ['微信', 'wx', 'weixin', '公众号', '企业微信'],
-      app: ['站内信', 'inapp', 'in_app'],
-      other: ['其他', '其它'],
-    },
+    channel: CHANNEL_VALUES,
     status: {
       sent: ['已发送', '发送成功', '发送'],
       delivered: ['已送达', '送达', '到达'],
@@ -155,6 +172,13 @@ const VALUE_SYNONYMS: Record<string, Record<string, Record<string, readonly stri
       redeem: ['兑换', '积分兑换', '兑礼', 'exchange', 'redemption'],
       expire: ['过期', '到期', '失效', '过期清零', 'expired'],
       adjust: ['调整', '人工调整', '手动调整', '冲回', '退款冲回', '退回', '修正', 'adjustment', 'manual', 'refund', 'rollback'],
+    },
+  },
+  consent: {
+    channel: CHANNEL_VALUES,
+    status: {
+      granted: ['同意', '已同意', '订阅', '已订阅', '授权', '已授权', '允许', '接受', 'y', 'yes', 'true', 'opt_in', 'optin', 'subscribed', 'agree', 'agreed', 'accepted', 'allow'],
+      revoked: ['撤回', '已撤回', '拒绝', '已拒绝', '不同意', '退订', '已退订', '取消订阅', '取消授权', 'n', 'no', 'false', 'opt_out', 'optout', 'unsubscribed', 'withdrawn', 'declined', 'refused', 'rejected', 'deny'],
     },
   },
 };

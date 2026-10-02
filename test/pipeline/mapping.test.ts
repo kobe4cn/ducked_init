@@ -55,13 +55,31 @@ const POINT_LOGS = `
     (2, 'M002', '调整', 20, 20, NULL, '2024-06-05 10:00', NULL);
   GRANT SELECT ON shop.point_logs TO ${READER.user};`;
 
+/** 营销同意：一位消费者一个渠道一行，渠道与同意状态要按值字典对应；一开始就拒绝的没有同意时间 */
+const CONSENTS = `
+  CREATE TABLE shop.consents (customer_id int NOT NULL, channel text NOT NULL, opt_in text NOT NULL,
+    agree_time timestamp, revoke_time timestamp, update_time timestamp NOT NULL, PRIMARY KEY (customer_id, channel));
+  INSERT INTO shop.consents VALUES
+    (1, '短信', 'Y', '2024-06-01 10:00', NULL, '2024-06-01 10:00'),
+    (1, '邮件', 'N', '2024-06-01 10:00', '2024-06-05 10:00', '2024-06-05 10:00'),
+    (2, '微信', 'N', NULL, '2024-06-02 10:00', '2024-06-02 10:00');
+  GRANT SELECT ON shop.consents TO ${READER.user};`;
+
+/** 兴趣偏好：自增主键，一行一个键值，同一类型下可有多个值 */
+const PREFERENCES = `
+  CREATE TABLE shop.preferences (id serial PRIMARY KEY, customer_id int NOT NULL, pref_type text NOT NULL, pref_value text NOT NULL,
+    updated_at timestamp NOT NULL);
+  INSERT INTO shop.preferences (customer_id, pref_type, pref_value, updated_at) VALUES
+    (1, 'category', '护肤', '2024-06-01 10:00'), (1, 'category', '彩妆', '2024-06-01 10:00'), (2, 'brand', '自有品牌', '2024-06-02 10:00');
+  GRANT SELECT ON shop.preferences TO ${READER.user};`;
+
 /** 两位数据工程师：一位起草、一位发布。登记数据源、选入全部表、确认水位线并同步一次 */
 async function syncedSource() {
   const acme = await newTenant('acme');
   const author = await memberOf(acme, 'de@acme.com');
   const reviewer = await memberOf(acme, 'de2@acme.com');
   const input = await pgSourceInput(READER);
-  await grantOnSource(ORDER_LOG + POINT_LOGS);
+  await grantOnSource(ORDER_LOG + POINT_LOGS + CONSENTS + PREFERENCES);
   const { id } = await registerSource(author, input);
   await selectAllTables(author, id);
   await drain();
@@ -69,6 +87,8 @@ async function syncedSource() {
   await confirmWatermark(author, id, 'orders', 'order_id');
   await confirmWatermark(author, id, 'order_log', 'updated_at');
   await confirmWatermark(author, id, 'point_logs', 'id');
+  await confirmWatermark(author, id, 'consents', 'update_time');
+  await confirmWatermark(author, id, 'preferences', 'updated_at');
   await syncSource(author, id);
   await drain();
   return { acme, author, reviewer, id };
@@ -131,6 +151,32 @@ fields:
   expires_at: from_timezone(expire_time, 'Asia/Shanghai')
 `;
 
+const CONSENTS_MAPPING = `model: 1
+entity: consent
+table: consents
+fields:
+  customer_id: string(customer_id)
+  channel:
+    expr: channel
+    dictionary: { 短信: sms, 邮件: email, 微信: wechat }
+  status:
+    expr: opt_in
+    dictionary: { Y: granted, N: revoked }
+  granted_at: from_timezone(agree_time, 'Asia/Shanghai')
+  revoked_at: from_timezone(revoke_time, 'Asia/Shanghai')
+  updated_at: from_timezone(update_time, 'Asia/Shanghai')
+`;
+
+const PREFERENCES_MAPPING = `model: 1
+entity: preference
+table: preferences
+fields:
+  customer_id: string(customer_id)
+  preference_type: pref_type
+  preference_value: pref_value
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')
+`;
+
 /** 起草并由另一位成员发布，让调度器跑完合并 */
 async function publish(author: Awaited<ReturnType<typeof memberOf>>, reviewer: typeof author, sourceId: string, yaml: string) {
   const mapping = await createMapping(author, sourceId, yaml);
@@ -189,6 +235,28 @@ describe('发布映射并合并到标准层', () => {
       occurred_at: '2024-06-01 02:00:00+00', expires_at: '2025-06-01 02:00:00+00',
     });
     expect(rows[2]).toMatchObject({ order_id: null, expires_at: null });
+  });
+
+  it('营销同意：渠道与同意状态按值字典对应，一位消费者一个渠道一行，没同意过或没撤回过的时间为空', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, CONSENTS_MAPPING);
+    const consents = await silver(acme, 'consent', 'customer_id, channel');
+    expect(consents.map(r => [r.customer_id, r.channel, r.status, r.granted_at, r.revoked_at])).toEqual([
+      // 源端是北京时间
+      ['1', 'email', 'revoked', '2024-06-01 02:00:00+00', '2024-06-05 02:00:00+00'],
+      ['1', 'sms', 'granted', '2024-06-01 02:00:00+00', null],
+      ['2', 'wechat', 'revoked', null, '2024-06-02 02:00:00+00'],
+    ]);
+    expect(consents[0]).toMatchObject({ updated_at: '2024-06-05 02:00:00+00', _source: id });
+  });
+
+  it('兴趣偏好：按消费者 + 偏好类型 + 偏好值去重，同一类型下的多个值各占一行', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, PREFERENCES_MAPPING);
+    const preferences = await silver(acme, 'preference', 'customer_id, preference_type, preference_value');
+    expect(preferences.map(r => [r.customer_id, r.preference_type, r.preference_value])).toEqual([
+      ['1', 'category', '彩妆'], ['1', 'category', '护肤'], ['2', 'brand', '自有品牌'],
+    ]);
   });
 
   it('同步后的合并把源端的新增、更新与删除带进标准层；没有新批次时合并不改动', async () => {

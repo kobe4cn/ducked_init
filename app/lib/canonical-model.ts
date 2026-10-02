@@ -1,7 +1,7 @@
 // app/lib/canonical-model.ts —— 平台内置的标准模型（Canonical Model）：一组标准实体及其字段，所有指标与标签只基于它定义。
 // 同一大版本内只做新增（新增实体、字段、标准枚举取值），不改名、不改语义、不改类型、不改已有实体的主键；每次新增小版本加一（ADR-0018）。
 // 映射里的 model 写的是大版本号。前后端共用（标准模型页要展示实体与字段说明）
-export const MODEL_VERSION = '1.1';
+export const MODEL_VERSION = '1.2';
 export const MODEL_MAJOR = 1;
 
 /** 字段类型：标准层里的列类型由它决定（时间一律是带时区的时间，按 UTC 存放；金额是两位小数的元） */
@@ -35,6 +35,9 @@ export interface CanonicalEntity {
   key: readonly string[];
   fields: readonly CanonicalField[];
 }
+
+/** 营销渠道：营销触达与营销同意共用一套，加渠道时两边一起加（ADR-0018） */
+export const CHANNELS = ['sms', 'email', 'push', 'wechat', 'app', 'other'] as const;
 
 const f = (name: string, type: FieldType, label: string, description: string, extra: Partial<CanonicalField> = {}): CanonicalField =>
   ({ name, type, label, description, ...extra });
@@ -124,7 +127,7 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
       f('touch_id', 'string', '触达 ID', '源端的触达记录标识'),
       f('customer_id', 'string', '消费者 ID', '被触达的消费者'),
       f('campaign_id', 'string', '活动 ID', '所属营销活动'),
-      f('channel', 'string', '触达渠道', '触达使用的渠道', { enum: ['sms', 'email', 'push', 'wechat', 'app', 'other'] }),
+      f('channel', 'string', '触达渠道', '触达使用的渠道', { enum: CHANNELS }),
       f('status', 'string', '触达结果', '触达的最终结果', { enum: ['sent', 'delivered', 'opened', 'clicked', 'failed'] }),
       f('sent_at', 'timestamp', '发送时间', '触达发出的时间'),
     ],
@@ -159,6 +162,32 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
       f('order_id', 'string', '关联订单', '产生或使用这笔积分的订单，对应订单的 order_id'),
       f('occurred_at', 'timestamp', '发生时间', '积分变动的时间'),
       f('expires_at', 'timestamp', '到期时间', '这笔获得的积分的到期时间，不过期或不是获得为空'),
+    ],
+  },
+  {
+    name: 'consent',
+    label: '营销同意',
+    description: '消费者在某个渠道上是否同意接收营销信息的当前状态（隐私协议、用户协议的签署不在这里）。源端是变更日志时按更新时间取最新。',
+    key: ['customer_id', 'channel'],
+    fields: [
+      f('customer_id', 'string', '消费者 ID', '对应消费者的 customer_id'),
+      f('channel', 'string', '渠道', '同意接收营销信息的渠道，与营销触达的渠道是同一套', { enum: CHANNELS }),
+      f('status', 'string', '同意状态', '同意，或撤回、拒绝', { enum: ['granted', 'revoked'] }),
+      f('granted_at', 'timestamp', '同意时间', '最近一次同意的时间'),
+      f('revoked_at', 'timestamp', '撤回时间', '最近一次撤回的时间，没撤回过为空'),
+      f('updated_at', 'timestamp', '更新时间', '源端最后一次修改这条记录的时间'),
+    ],
+  },
+  {
+    name: 'preference',
+    label: '兴趣偏好',
+    description: '消费者的一条偏好（键值），同一类型下可以有多个值。只放源端记录的偏好，平台按行为推断的偏好是标签。',
+    key: ['customer_id', 'preference_type', 'preference_value'],
+    fields: [
+      f('customer_id', 'string', '消费者 ID', '对应消费者的 customer_id'),
+      f('preference_type', 'string', '偏好类型', '如 category（品类）、brand（品牌）、flavor（口味）、size（尺码）'),
+      f('preference_value', 'string', '偏好值', '偏好的取值（如某个品类名、品牌名）'),
+      f('updated_at', 'timestamp', '更新时间', '源端最后一次修改这条记录的时间'),
     ],
   },
 ];

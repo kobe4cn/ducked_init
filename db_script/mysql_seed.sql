@@ -1,7 +1,7 @@
 -- db_script/mysql_seed.sql —— 开发用的 MySQL 数据源：一个小电商库 crm_source（确定性造数，可重复执行，会先删库重建）
 -- 与只读账号 crm_reader / reader-secret（在平台登记数据源时用它；写类权限会被拒绝）。
 -- 测试用的 crm_source_test 由测试自己重建，不要放在这里。
---   container exec -i mysql mysql -uroot -pcrm < db_script/mysql_seed.sql
+--   container exec -i mysql mysql -uroot -pcrm --default-character-set=utf8mb4 < db_script/mysql_seed.sql
 -- 刻意保留了映射要处理的源端特点：
 --   - customers：自增主键 + updated_at（水位线），性别是中文、手机号带空格，约 1/5 没有邮箱
 --   - products：字符串主键（SKU），价格以分为单位（映射里 / 100）
@@ -10,6 +10,8 @@
 --   - events：没有主键与更新时间（整行比对），发生时间是 Unix 毫秒（from_epoch_millis），含少量完全重复的行
 --   - members：会员等级是中文，开卡时间为 DATE
 --   - point_logs：自增主键，变动类型是中文（值字典），积分带正负，会员号列叫 member_no，只有获得与消费有关联订单、只有获得有到期时间
+--   - consents：复合主键 (customer_id, channel)，渠道是中文、同意状态是 Y / N（值字典），一开始就拒绝的没有同意时间，没撤回过的没有撤回时间
+--   - preferences：自增主键与兴趣偏好的主键对不上（草稿按 消费者 + 偏好类型 + 偏好值 去重），同一消费者同一类型下有多个值
 DROP DATABASE IF EXISTS crm_source;
 CREATE DATABASE crm_source DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE crm_source;
@@ -151,6 +153,49 @@ SELECT t.c, m.member_id, ELT(t.kind, '获得', '消费', '获得', '兑换', '�
        ELT(t.kind, '购物返积分', '下单抵扣', '购物返积分', '兑换礼品', '客服调整', '到期清零')
 FROM t JOIN members m ON m.customer_id = t.c
 ORDER BY t.k, t.c;
+
+CREATE TABLE consents (
+  customer_id BIGINT NOT NULL,
+  channel VARCHAR(8) NOT NULL,
+  opt_in CHAR(1) NOT NULL COMMENT 'Y 同意，N 撤回或拒绝',
+  agree_time DATETIME COMMENT '北京时间',
+  revoke_time DATETIME,
+  update_time DATETIME NOT NULL,
+  PRIMARY KEY (customer_id, channel)
+);
+-- 每位消费者在三个渠道上有记录；1/5 撤回，其中 2/3 是一开始就拒绝（没有同意时间）
+INSERT INTO consents
+WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1000),
+ch(k) AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4),
+t AS (
+  SELECT i, ELT(k, '短信', '邮件', 'APP推送', '微信') AS name, (i * 7 + k * 3) % 10 AS r,
+         TIMESTAMP '2023-01-02 09:00:00' + INTERVAL i * 12 HOUR + INTERVAL k HOUR AS agreed,
+         TIMESTAMP '2024-02-01 10:00:00' + INTERVAL i * 5 HOUR + INTERVAL k HOUR AS revoked
+  FROM s JOIN ch ON (i + k) % 4 <> 0
+)
+SELECT i, name, IF(r < 8, 'Y', 'N'), IF(r = 9, NULL, agreed), IF(r < 8, NULL, revoked), IF(r < 8, agreed, revoked)
+FROM t;
+
+CREATE TABLE preferences (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  customer_id BIGINT NOT NULL,
+  pref_type VARCHAR(16) NOT NULL,
+  pref_value VARCHAR(32) NOT NULL,
+  updated_at DATETIME NOT NULL,
+  UNIQUE KEY (customer_id, pref_type, pref_value)
+);
+-- 每位消费者两条：同一类型下两个值，类型按「品类、品牌、口味」轮转
+INSERT INTO preferences (customer_id, pref_type, pref_value, updated_at)
+WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1000),
+n(j) AS (SELECT 0 UNION ALL SELECT 1)
+SELECT i, ELT(1 + i % 3, 'category', 'brand', 'flavor'),
+       CASE i % 3
+         WHEN 0 THEN ELT(1 + (i + j) % 6, '护肤', '彩妆', '香水', '个护', '母婴', '食品')
+         WHEN 1 THEN ELT(1 + (i + j) % 4, '自有品牌', '兰蔻', '雅诗兰黛', '资生堂')
+         ELSE ELT(1 + (i + j) % 4, '清淡', '甜', '辣', '酸') END,
+       TIMESTAMP '2024-03-01 08:00:00' + INTERVAL i HOUR
+FROM s, n
+ORDER BY i, j;
 
 DROP USER IF EXISTS 'crm_reader'@'%';
 CREATE USER 'crm_reader'@'%' IDENTIFIED BY 'reader-secret';
