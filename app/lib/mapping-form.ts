@@ -1,10 +1,10 @@
 // app/lib/mapping-form.ts —— 映射表单与 YAML 互转（客户端用，不做校验；校验见 .server/pipeline/mapping-spec.ts）：从映射 YAML 读出每个标准字段的
 // 表单状态（源列、常用转换与参数、依据），改单个字段时直接改原 Document 上的节点，注释与顺序都保留（ADR-0017）。
-// 表单不认识的写法（带值对照的对象写法、解析不了的表达式、其他结构）只读、原样保留，到 YAML 里改。
+// 表单不认识的写法（带值字典或兜底值的对象写法、解析不了的表达式、其他结构）只读、原样保留，到 YAML 里改。
 // 改了表达式时清掉该字段的行尾注释：草稿写在那里的依据（同名、单位、时区）对新写法不一定成立
 import { isMap, isScalar, isSeq, type Document, type Scalar } from 'yaml';
 import type { CanonicalEntity, FieldType } from './canonical-model';
-import { ExprError, parseExpression, ref, type Expr } from './mapping-expr';
+import { ExprError, lit, parseExpression, ref, type Expr } from './mapping-expr';
 
 export type TransformId = 'direct' | 'cents' | 'text' | 'timezone' | 'parse' | 'epoch' | 'concat' | 'fixed' | 'custom';
 
@@ -75,8 +75,6 @@ export interface FieldForm {
 
 const UNKNOWN = '这种写法表单不认识，请在 YAML 里修改';
 
-const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
-
 /** 解析后的表达式对应到常用转换；对不上的是自定义表达式 */
 function recognize(e: Expr): Pick<FieldForm, 'transform' | 'column' | 'args' | 'parts'> {
   const of = (transform: TransformId, column: string | null = null, args: string[] = []) => ({ transform, column, args });
@@ -141,7 +139,7 @@ function locate(doc: Document, field: string, required: boolean): { form: FieldF
   if (isMap(value)) {
     const keys = value.items.map(p => (isScalar(p.key) ? p.key.value : null));
     node = value.get('expr', true);
-    if (keys.includes('dictionary') || keys.includes('otherwise')) reason = '带值对照（dictionary / otherwise），请在 YAML 里修改';
+    if (keys.includes('dictionary') || keys.includes('otherwise')) reason = '带值字典或兜底值（dictionary / otherwise），请在 YAML 里修改';
     else if (keys.some(k => k !== 'expr')) reason = UNKNOWN;
   }
   if (!isScalar(node) || typeof node.value !== 'string') return { form: { ...form, readonly: true, reason: reason ?? UNKNOWN } };

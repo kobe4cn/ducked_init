@@ -96,11 +96,11 @@ describe('读出表单', () => {
     expect(field(odd, 'phone')).toMatchObject({ transform: null, column: null, raw: '', readonly: false });
   });
 
-  it('带值对照的对象写法、解析失败的表达式与认不出的结构只读，并说明原因', () => {
+  it('带值字典或兜底值的对象写法、解析失败的表达式与认不出的结构只读，并说明原因', () => {
     expect(field(readForm(parseDocument(HAND), ORDER), 'status'))
-      .toMatchObject({ transform: 'direct', column: 'status', raw: 'status', readonly: true, reason: expect.stringContaining('值对照') });
+      .toMatchObject({ transform: 'direct', column: 'status', raw: 'status', readonly: true, reason: expect.stringContaining('值字典') });
     const odd = readForm(parseDocument(ODD), CUSTOMER);
-    expect(field(odd, 'city')).toMatchObject({ transform: 'direct', readonly: true, reason: expect.stringContaining('值对照') });
+    expect(field(odd, 'city')).toMatchObject({ transform: 'direct', readonly: true, reason: expect.stringContaining('值字典') });
     expect(field(odd, 'name')).toMatchObject({ transform: 'custom', raw: 'foo(', readonly: true, reason: expect.stringContaining('表达式') });
     expect(field(odd, 'updated_at')).toMatchObject({ transform: null, readonly: true, reason: expect.any(String) });
   });
@@ -128,6 +128,7 @@ describe('读出表单', () => {
 });
 
 describe('写回 YAML', () => {
+  // 基准是 yaml 重新输出的文本：手写 YAML 里的非标准格式（如注释前的多个空格）在第一次写入时会被统一；草稿本来就是 yaml 输出的，逐字不变
   it('读 → 原样写回 → 文本不变（注释、顺序、引号都在）', () => {
     expect(rewriteAll(HAND)).toBe(parseDocument(HAND).toString());
     expect(rewriteAll(ODD, CUSTOMER)).toBe(ODD);

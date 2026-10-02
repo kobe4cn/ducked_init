@@ -39,7 +39,8 @@ export const KIND_FIELD_TYPES: Record<Kind, FieldType> = {
 export const ref = (name: string) =>
   /^[A-Za-z_\u0080-￿][A-Za-z0-9_\u0080-￿]*$/.test(name) && !/^(null|true|false)$/i.test(name) ? name : `"${name.replace(/"/g, '""')}"`;
 
-const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
+/** 表达式里的字符串字面量（单引号，内部的单引号写两遍） */
+export const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 
 const isTimeZone = (tz: string) => {
