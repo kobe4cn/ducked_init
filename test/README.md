@@ -159,7 +159,7 @@ describe('<功能>', () => {
 | `pipeline/scope.test.ts` | 同步范围：逐张选表、只采集与同步范围内的表 |
 | `pipeline/sync.test.ts` | 水位线增量与全量比对、变更批次、同步历史 |
 | `pipeline/verify.test.ts` | 湖中数据核对（覆盖、位置、文件、结构、数据量） |
-| `pipeline/mapping.test.ts` | 映射发布与标准层合并、去重键、值字典、双人发布（最后保存的人不能发布）、只有映射引用的表写入变更才在同步后合并（定时检查也不补） |
+| `pipeline/mapping.test.ts` | 映射发布与标准层合并、去重键、值字典、双人发布（最后保存的人不能发布）、只有映射引用的表写入变更才在同步后合并（定时检查也不补）、合并只带受影响的映射、补进排队中的合并、运行期间的变更由定时检查补上 |
 | `pipeline/migration.test.ts` | 数据湖迁移存储 |
 | `pipeline/reset.test.ts` | 开发用重置数据湖 |
 | `http/login.test.ts` | 租户与 Magic Link 登录 |

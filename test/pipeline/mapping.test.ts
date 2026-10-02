@@ -3,9 +3,9 @@
 import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { mappings, mappingVersions } from '../../app/.server/db/schema';
+import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { createMapping, enqueueDueMerges, getMapping, MappingError, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
@@ -240,6 +240,9 @@ async function publish(author: Awaited<ReturnType<typeof memberOf>>, reviewer: t
   await drain();
   return mapping.id;
 }
+
+/** 合并任务带的映射（按映射 ID 排序） */
+const mergedMappings = (task: { params: unknown }) => ((task.params as { mappings: { mapping: string }[] }).mappings).map(m => m.mapping).sort();
 
 /** 在 fn 执行期间设置环境变量（调度器派发的工作进程继承它） */
 async function withEnv(vars: Record<string, string>, fn: () => Promise<void>) {
@@ -565,11 +568,80 @@ describe('发布映射并合并到标准层', () => {
     expect(await enqueueDueMerges()).toEqual([]);
     expect((await getMapping(author, mapping)).merge.history[0]).toMatchObject({ mode: 'incremental', updated: 1 });
 
-    // 发布时已有合并在排队：排队的合并不含新版本，定时检查补一次
-    await mergeNow(author);
+    // 发布时已有合并在排队：新发布的映射补进排队中的那个合并，定时检查不再补
+    const queued = await mergeNow(author);
     const orders = await createMapping(author, id, ORDERS);
-    expect(await publishMapping(reviewer, orders.id, 1)).toBeNull();
+    const extended = await publishMapping(reviewer, orders.id, 1);
+    expect(extended?.id).toBe(queued.id);
+    expect(mergedMappings(extended!)).toEqual([mapping, orders.id].sort());
     await drain();
-    expect(await enqueueDueMerges()).toEqual([acme]);
+    expect(await merges()).toBe(3);
+    expect(await enqueueDueMerges()).toEqual([]);
+    expect((await getMapping(author, orders.id)).merge.history[0]).toMatchObject({ mode: 'rebuild', rows: 101 });
+  });
+
+  it('合并只带受影响的映射：发布只带刚发布的映射，同步只带源表写入了变更的映射，别的映射不新增合并记录', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, author, reviewer, id } = await syncedSource();
+      const mergeTasks = async () => (await listTasks(acme)).filter(t => t.kind === 'silver.merge');
+      const customers = await publish(author, reviewer, id, CUSTOMERS);
+      const orders = await publish(author, reviewer, id, ORDERS);
+      // 发布订单映射时只合并订单映射
+      expect((await mergeTasks()).map(mergedMappings)).toEqual([[orders], [customers]]);
+      expect((await getMapping(author, customers)).merge.history).toHaveLength(1);
+
+      await grantOnSource(`INSERT INTO shop.orders (customer_id, amount, status, created_at) VALUES (5, 99, 'paid', '2024-07-01');`);
+      await syncSource(author, id);
+      await drain();
+      const [latest] = await mergeTasks();
+      expect(mergedMappings(latest)).toEqual([orders]);
+      expect((await getMapping(author, orders)).merge.history[0]).toMatchObject({ mode: 'incremental', inserted: 1 });
+      expect((await getMapping(author, customers)).merge.history).toHaveLength(1);
+      expect(await enqueueDueMerges()).toEqual([]);
+
+      // 订单映射发布新版本、合并还在排队时，又一次同步给消费者表写入了变更：消费者映射补进同一个合并
+      await saveDraft(author, orders, ORDERS.replace('customer_id: string(customer_id)', 'customer_id: trim(string(customer_id))'));
+      const queued = await publishMapping(reviewer, orders, 2);
+      expect(mergedMappings(queued!)).toEqual([orders]);
+      // 首次同步给全部表写入了变更
+      const [firstSync] = (await listTasks(acme)).filter(t => t.kind === 'source.sync').slice(-1);
+      const extended = await mergeAfterSync(acme, firstSync.id);
+      expect(extended?.id).toBe(queued!.id);
+      expect((extended!.params as { mappings: { mapping: string; version: number }[] }).mappings.map(m => [m.mapping, m.version]))
+        .toEqual([[customers, 1], [orders, 2]].sort());
+
+      // 手动合并仍带全部映射
+      await drain();
+      expect(mergedMappings(await mergeNow(author))).toEqual([customers, orders].sort());
+    });
+  });
+
+  it('合并运行期间同步写入的变更，在它结束后由定时检查补上，只带变更了的映射', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, author, reviewer, id } = await syncedSource();
+      const customers = await publish(author, reviewer, id, CUSTOMERS);
+      const orders = await publish(author, reviewer, id, ORDERS);
+      // 让同步能与“运行中”的合并同时进行
+      await getDb().update(tenants).set({ maxConcurrentTasks: 2 }).where(eq(tenants.id, acme));
+      // 模拟一次正在运行的合并（领取后还没结束）
+      const running = await mergeNow(author);
+      await getDb().update(tasks).set({ status: 'running', startedAt: sql`now()`, heartbeatAt: sql`now()` }).where(eq(tasks.id, running.id));
+
+      await grantOnSource(`UPDATE shop.customers SET city = '成都', updated_at = '2024-07-01 10:00:00' WHERE customer_id = 5;`);
+      await syncSource(author, id);
+      await drain();
+      // 合并在运行，同步后不入队
+      expect((await listTasks(acme)).filter(t => t.kind === 'silver.merge' && t.status === 'queued')).toEqual([]);
+      expect(await enqueueDueMerges()).toEqual([]);
+
+      await getDb().update(tasks).set({ status: 'succeeded', finishedAt: sql`now()`, result: { mappings: [] } }).where(eq(tasks.id, running.id));
+      expect(await enqueueDueMerges()).toEqual([acme]);
+      const [due] = (await listTasks(acme)).filter(t => t.kind === 'silver.merge');
+      expect(mergedMappings(due)).toEqual([customers]);
+      await drain();
+      expect((await getMapping(author, customers)).merge.history[0]).toMatchObject({ mode: 'incremental', updated: 1 });
+      expect((await getMapping(author, orders)).merge.history).toHaveLength(1);
+      expect(await enqueueDueMerges()).toEqual([]);
+    });
   });
 });

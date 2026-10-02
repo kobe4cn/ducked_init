@@ -242,7 +242,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
       <Card>
         <CardHeader>
           <CardTitle>合并到标准层</CardTitle>
-          <CardDescription>{`最近一次合并：${merge.statusLabel}。每次同步后，已发布的最新版本把原始层的新批次合并进标准层；换了版本时由全部批次重建。写了兜底值的字段，每次合并列出本次落入兜底的取值。`}</CardDescription>
+          <CardDescription>{`这个映射最近一次合并：${merge.statusLabel}。发布后、以及同步给这个映射的源表写入了变更后，已发布的最新版本把原始层的新批次合并进标准层；换了版本时由全部批次重建。写了兜底值的字段，每次合并列出本次落入兜底的取值。`}</CardDescription>
         </CardHeader>
         <CardContent>
           <Table>

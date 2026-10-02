@@ -1,7 +1,7 @@
 // app/.server/mappings.ts —— 映射：数据工程师用 YAML 编写“源表 → 标准实体”的映射，校验通过才能保存为草稿；草稿由最后保存它的人以外的
-// 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后入队合并任务（silver.merge），同步给已发布映射的源表写入变更后也会再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
+// 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后为这个映射入队合并任务（silver.merge），同步给已发布映射的源表写入变更后也为这些映射再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
 // 一律限定在操作者所属租户内；合并本身在工作进程里进行（pipeline/merge-engine.ts）
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { assertCan, can } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
@@ -20,7 +20,7 @@ export class MappingError extends Error {
   constructor(message: string, readonly status: 400 | 403 | 404 = 400, readonly issues: MappingIssue[] = []) { super(message); }
 }
 
-/** 合并状态取最近多少次合并任务 */
+/** 映射详情的合并历史取最近多少次带这个映射的合并任务 */
 const HISTORY_TASKS = 50;
 
 /** 数据源里各表最近一次成功采集到的列统计（带声明的业务主键）：表不在同步范围、还没采集时返回原因 */
@@ -189,7 +189,7 @@ async function assertExtensionTypes(tx: Tx, tenantId: string, plan: MergePlan) {
 
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。发布前对照数据源当前的字段再校验一次。
- * 发布后版本锁定，并入队一次合并（已有合并在排队或运行时，由调度器在它之后补上）
+ * 发布后版本锁定，并为这个映射入队一次合并（已有合并在排队时补进那个合并，在运行时由调度器在它之后补上）
  */
 export async function publishMapping(actor: CurrentMember, mappingId: string, version: number) {
   assertCan(actor, 'publish');
@@ -201,7 +201,7 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
   if (blocker) throw new MappingError(blocker, draft.status === 'draft' ? 403 : 400);
   const { plan } = await checked(actor.tenant.id, mapping.sourceId, draft.yaml);
   return getDb().transaction(async tx => {
-    // 先锁住租户行（入队合并也锁它）：发布期间别的事务入队不了合并，不会有晚于发布时间、却不含这次发布的合并让定时检查漏补
+    // 先锁住租户行（入队合并也锁它）：与入队合并、定时检查互斥
     await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, actor.tenant.id)).for('update');
     // 锁住映射行：与保存草稿互斥，发布的正是检查过的那份草稿
     await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
@@ -212,7 +212,6 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
     }
     await assertExtensionTypes(tx, actor.tenant.id, plan);
     await tx.update(mappingVersions)
-      // 取数据库时间（事务开始时间），与同一事务里入队的合并任务的 created_at 相同：定时检查不会把这次发布当成合并之后的发布再补一次
       .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: sql`now()` })
       .where(eq(mappingVersions.id, draft.id));
     const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
@@ -224,7 +223,7 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
       targetId: mappingId,
       detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version, authors: draft.authors, lastEditor: draft.lastEditor },
     });
-    return enqueueMerge(tx, actor.tenant.id);
+    return enqueueMerge(tx, actor.tenant.id, [mappingId]);
   });
 }
 
@@ -266,15 +265,16 @@ async function publisherCount(tenantId: string) {
   return n;
 }
 
-/** 租户各映射最新的已发布版本及其合并计划（合并任务的参数） */
-async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId: string): Promise<MergeMappingParam[]> {
+/** 租户各映射（给了 mappingIds 时只取这些）最新的已发布版本及其合并计划（合并任务的参数） */
+async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId: string, mappingIds?: string[]): Promise<MergeMappingParam[]> {
+  if (mappingIds && !mappingIds.length) return [];
   const rows = await db
     .selectDistinctOn([mappingVersions.mappingId], {
       mapping: mappings.id, sourceId: mappings.sourceId, version: mappingVersions.version, plan: mappingVersions.plan,
     })
     .from(mappingVersions)
     .innerJoin(mappings, eq(mappings.id, mappingVersions.mappingId))
-    .where(and(eq(mappings.tenantId, tenantId), eq(mappingVersions.status, 'published')))
+    .where(and(eq(mappings.tenantId, tenantId), eq(mappingVersions.status, 'published'), mappingIds && inArray(mappings.id, mappingIds)))
     .orderBy(mappingVersions.mappingId, desc(mappingVersions.version));
   return rows
     .sort((a, b) => a.mapping.localeCompare(b.mapping))
@@ -284,16 +284,24 @@ async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId: strin
 const ofMerge = (tenantId: string) => and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'silver.merge'));
 
 /**
- * 在调用方的事务里入队一次合并（全部已发布映射的最新版本）。锁住租户行后检查：同一租户同时只有一个合并在排队或运行
- * （两个合并同时写同一张标准层表会冲突）；已有时不入队，返回 null。没有已发布的映射时也不入队
+ * 在调用方的事务里为给定映射（不给时为全部已发布映射）的最新已发布版本入队一次合并，返回带上它们的合并任务。
+ * 锁住租户行后检查：同一租户同时只有一个合并在排队或运行（两个合并同时写同一张标准层表会冲突）。
+ * 已有合并在排队时把映射补进去（同一映射换成最新版本）；已在运行（或补的时候刚被领取）时不入队，返回 null，由定时检查在它之后补上。
+ * 给定的映射都没有已发布版本时也不入队
  */
-export async function enqueueMerge(tx: Tx, tenantId: string) {
+export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string[]) {
   await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
-  const [pending] = await tx.select({ id: tasks.id }).from(tasks).where(and(ofMerge(tenantId), inArray(tasks.status, ['queued', 'running']))).limit(1);
-  if (pending) return null;
-  const plans = await publishedPlans(tx, tenantId);
+  const plans = await publishedPlans(tx, tenantId, mappingIds);
   if (!plans.length) return null;
-  return insertTask(tx, tenantId, 'silver.merge', { mappings: plans });
+  const [pending] = await tx.select().from(tasks).where(and(ofMerge(tenantId), inArray(tasks.status, ['queued', 'running']))).limit(1);
+  if (!pending) return insertTask(tx, tenantId, 'silver.merge', { mappings: plans });
+  if (pending.status !== 'queued') return null;
+  const queued = (pending.params.mappings ?? []) as MergeMappingParam[];
+  const merged = [...queued.filter(q => !plans.some(p => p.mapping === q.mapping)), ...plans].sort((a, b) => a.mapping.localeCompare(b.mapping));
+  // 领取合并不锁租户行：只在它仍在排队时改参数
+  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged } })
+    .where(and(eq(tasks.id, pending.id), eq(tasks.status, 'queued'))).returning();
+  return task ?? null;
 }
 
 /**
@@ -305,25 +313,24 @@ const syncWroteMappingTable = (s: 's', m: 'm') => sql.raw(`${s}.kind = 'source.s
   AND EXISTS (SELECT 1 FROM jsonb_array_elements(${s}.result->'tables') r WHERE r->>'table' = ${m}.table_name AND (r->>'rows')::int > 0)`);
 
 /**
- * 同步结束后合并一次（调度器在同步任务结束时调用）：只有这次同步给某个已发布映射的源表写入了变更才入队；
+ * 同步结束后合并一次（调度器在同步任务结束时调用）：只为这次同步给源表写入了变更的已发布映射入队，没有这样的映射时不入队；
  * 租户停用时什么都不做
  */
 export async function mergeAfterSync(tenantId: string, syncTaskId: string) {
   return getDb().transaction(async tx => {
     const [tenant] = await tx.select({ suspendedAt: tenants.suspendedAt }).from(tenants).where(eq(tenants.id, tenantId));
     if (!tenant || tenant.suspendedAt) return null;
-    const { rows } = await tx.execute(sql`
-      SELECT 1 FROM ${tasks} s
+    const { rows } = await tx.execute<{ id: string }>(sql`
+      SELECT m.id FROM ${tasks} s
       JOIN ${mappings} m ON m.tenant_id = s.tenant_id
-      JOIN ${mappingVersions} v ON v.mapping_id = m.id AND v.status = 'published'
       WHERE s.id = ${syncTaskId} AND ${syncWroteMappingTable('s', 'm')}
-      LIMIT 1`);
+        AND EXISTS (SELECT 1 FROM ${mappingVersions} v WHERE v.mapping_id = m.id AND v.status = 'published')`);
     if (!rows.length) return null;
-    return enqueueMerge(tx, tenantId);
+    return enqueueMerge(tx, tenantId, rows.map(r => r.id));
   });
 }
 
-/** 成员手动触发一次合并 */
+/** 成员手动触发一次合并（全部已发布映射）；已有合并在排队时把全部映射补进去，在运行时报错 */
 export async function mergeNow(actor: CurrentMember) {
   assertCan(actor, 'sources:write');
   const task = await getDb().transaction(tx => enqueueMerge(tx, actor.tenant.id));
@@ -332,24 +339,51 @@ export async function mergeNow(actor: CurrentMember) {
   throw new MappingError(pending ? '已有一次合并在排队或运行中' : '还没有已发布的映射');
 }
 
+/** 合并任务的参数 params 带了映射 mappingId（任一版本） */
+const mergeHas = (params: SQL, mappingId: SQL) => sql`${params}->'mappings' @> jsonb_build_array(jsonb_build_object('mapping', ${mappingId}))`;
+
 /**
- * 为到期的租户入队合并（调度器定期调用）：租户未停用、有已发布的映射、没有合并在排队或运行，
- * 且最近一次合并之后有映射发布，或有同步结束并给已发布映射的源表写入了变更（合并运行期间发生的变化由此补上）。返回入队的租户
+ * 到期要合并的映射（给了 tenantId 时只看这个租户）：映射已发布、租户未停用，带它的最近一次合并 last 不在排队，且
+ * (a) last 带的不是它最新的已发布版本（还没合并过也算；last 失败了也算带过，不自动重试），或
+ * (b) last 开始之后有同步结束并给它的源表写入了变更（合并运行期间发生的变化由此补上）。
+ * 同一租户的合并一个接一个，入队或补映射时都在租户锁里取最新的已发布版本，所以 last 带的就是合并过的最高版本；
+ * 按版本而不按发布时间判断 (a)：发布时间是事务开始时间，可能早于并发领取的合并的开始时间。
+ * 只找最近一次（按入队时间倒序走索引），不随历史合并增多而变慢
  */
-export async function enqueueDueMerges() {
-  const { rows } = await getDb().execute<{ tenant_id: string }>(sql`
-    SELECT DISTINCT m.tenant_id FROM ${mappings} m
+async function dueMappings(db: Tx | ReturnType<typeof getDb>, tenantId?: string) {
+  const { rows } = await db.execute<{ tenant_id: string; mapping_id: string }>(sql`
+    SELECT m.tenant_id, m.id AS mapping_id FROM ${mappings} m
     JOIN ${tenants} t ON t.id = m.tenant_id AND t.suspended_at IS NULL
-    JOIN ${mappingVersions} v ON v.mapping_id = m.id AND v.status = 'published'
-    CROSS JOIN LATERAL (SELECT max(created_at) AS at FROM ${tasks} WHERE tenant_id = m.tenant_id AND kind = 'silver.merge') last
-    WHERE last.at IS NULL
-      OR v.published_at > last.at
-      OR EXISTS (SELECT 1 FROM ${tasks} s WHERE s.tenant_id = m.tenant_id AND s.finished_at > last.at AND ${syncWroteMappingTable('s', 'm')})
-    ORDER BY m.tenant_id`);
+    CROSS JOIN LATERAL (SELECT max(version) AS version FROM ${mappingVersions} WHERE mapping_id = m.id AND status = 'published') v
+    LEFT JOIN LATERAL (
+      SELECT l.status, coalesce(l.started_at, l.created_at) AS at,
+        (SELECT (e->>'version')::int FROM jsonb_array_elements(l.params->'mappings') e WHERE e->>'mapping' = m.id::text) AS version
+      FROM ${tasks} l
+      WHERE l.tenant_id = m.tenant_id AND l.kind = 'silver.merge' AND ${mergeHas(sql`l.params`, sql`m.id::text`)}
+      ORDER BY l.created_at DESC, l.id DESC LIMIT 1
+    ) last ON true
+    WHERE v.version IS NOT NULL ${tenantId ? sql`AND m.tenant_id = ${tenantId}` : sql``}
+      AND last.status IS DISTINCT FROM 'queued'
+      AND (
+        last.version IS DISTINCT FROM v.version
+        OR EXISTS (SELECT 1 FROM ${tasks} s WHERE s.tenant_id = m.tenant_id AND s.finished_at > last.at AND ${syncWroteMappingTable('s', 'm')})
+      )
+    ORDER BY m.tenant_id, m.id`);
+  return rows;
+}
+
+/** 为到期的映射入队合并（调度器定期调用），每个租户一个合并；已有合并在排队时补进去。返回入队（或补进）合并的租户 */
+export async function enqueueDueMerges() {
+  const tenantIds = [...new Set((await dueMappings(getDb())).map(r => r.tenant_id))];
   const enqueued: string[] = [];
-  for (const { tenant_id: tenantId } of rows) {
+  for (const tenantId of tenantIds) {
     try {
-      if (await getDb().transaction(tx => enqueueMerge(tx, tenantId))) enqueued.push(tenantId);
+      const task = await getDb().transaction(async tx => {
+        // 先锁住租户行再算一次（enqueueMerge 里再锁是同一把锁）：查询之后可能已有发布、同步或合并入队
+        await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
+        return enqueueMerge(tx, tenantId, (await dueMappings(tx, tenantId)).map(r => r.mapping_id));
+      });
+      if (task) enqueued.push(tenantId);
     } catch (e) {
       console.error(`[调度器] 租户 ${tenantId} 的合并入队失败`, e);
     }
@@ -360,21 +394,43 @@ export async function enqueueDueMerges() {
 /** 一个映射最近一次合并的结果，带所属任务 */
 export type MergeHistoryEntry = MergeRecord & { taskId: string };
 
-/** 最近的合并任务（任何状态）与每个映射最近的合并结果（新的在前） */
-async function mergeStatus(tenantId: string) {
-  const runs = await getDb().select().from(tasks).where(ofMerge(tenantId)).orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(HISTORY_TASKS);
-  const history: Record<string, MergeHistoryEntry[]> = {};
-  for (const run of runs) {
-    for (const record of (run.result?.mappings ?? []) as MergeRecord[]) (history[record.mapping] ??= []).push({ ...record, taskId: run.id });
-  }
-  const [latest] = runs;
+/** 本租户最近一次合并任务（任何状态） */
+async function tenantLatestMerge(tenantId: string) {
+  const [latest] = await getDb().select().from(tasks).where(ofMerge(tenantId)).orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
   return {
     status: (latest?.status ?? 'none') as TaskStatus | 'none',
     error: latest?.error ?? null,
     attemptedAt: latest?.createdAt ?? null,
     finishedAt: latest?.finishedAt ?? null,
-    history,
   };
+}
+
+/** 各映射最近一次合并的结果（每个映射分别找带它的最近一次合并任务，不受别的映射合并得多少影响） */
+async function lastMergeByMapping(tenantId: string, mappingIds: string[]) {
+  if (!mappingIds.length) return {};
+  const { rows } = await getDb().execute<{ mapping_id: string; task_id: string; record: MergeRecord }>(sql`
+    SELECT m.id AS mapping_id, r.task_id, r.record FROM unnest(ARRAY[${sql.join(mappingIds.map(id => sql`${id}`), sql`, `)}]::uuid[]) m(id)
+    CROSS JOIN LATERAL (
+      SELECT t.id AS task_id, rec AS record FROM ${tasks} t, jsonb_array_elements(t.result->'mappings') rec
+      WHERE t.tenant_id = ${tenantId} AND t.kind = 'silver.merge' AND rec->>'mapping' = m.id::text
+      ORDER BY t.created_at DESC, t.id DESC LIMIT 1
+    ) r`);
+  return Object.fromEntries(rows.map(r => [r.mapping_id, { ...r.record, taskId: r.task_id } as MergeHistoryEntry]));
+}
+
+/**
+ * 一个映射的合并状态与历史（新的在前）：只看带这个映射的合并任务。结束了的任务按这个映射自己的结果判断成败，
+ * 别的映射合并失败不算在它头上
+ */
+async function mergesOfMapping(tenantId: string, mappingId: string) {
+  const runs = await getDb().select().from(tasks).where(and(ofMerge(tenantId), mergeHas(sql`${tasks.params}`, sql`${mappingId}::text`)))
+    .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(HISTORY_TASKS);
+  const history = runs.flatMap(run => ((run.result?.mappings ?? []) as MergeRecord[])
+    .filter(r => r.mapping === mappingId).map(r => ({ ...r, taskId: run.id }) as MergeHistoryEntry));
+  const [latest] = runs;
+  const own = latest && ((latest.result?.mappings ?? []) as MergeRecord[]).find(r => r.mapping === mappingId);
+  const status: TaskStatus | 'none' = !latest ? 'none' : own ? ('error' in own ? 'failed' : 'succeeded') : latest.status;
+  return { status, history };
 }
 
 /** 本租户的映射：数据源、源表、实体、已发布的最新版本与草稿，以及最近一次合并的结果 */
@@ -390,7 +446,8 @@ export async function listMappings(actor: CurrentMember) {
     ? await getDb().select({ mappingId: mappingVersions.mappingId, version: mappingVersions.version, status: mappingVersions.status })
       .from(mappingVersions).where(inArray(mappingVersions.mappingId, rows.map(r => r.mapping.id)))
     : [];
-  const merge = await mergeStatus(actor.tenant.id);
+  const merge = await tenantLatestMerge(actor.tenant.id);
+  const last = await lastMergeByMapping(actor.tenant.id, rows.map(r => r.mapping.id));
   return {
     merge,
     mappings: rows.map(({ mapping, sourceName }) => {
@@ -400,7 +457,7 @@ export async function listMappings(actor: CurrentMember) {
         sourceName,
         published: Math.max(0, ...mine.filter(v => v.status === 'published').map(v => v.version)) || null,
         draft: mine.find(v => v.status === 'draft')?.version ?? null,
-        lastMerge: merge.history[mapping.id]?.[0] ?? null,
+        lastMerge: last[mapping.id] ?? null,
       };
     }),
   };
@@ -412,7 +469,7 @@ export async function getMapping(actor: CurrentMember, mappingId: string) {
   const mapping = await requireMapping(actor.tenant.id, mappingId);
   const [source] = await getDb().select({ id: sources.id, name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
   const versions = await getDb().select().from(mappingVersions).where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version));
-  const merge = await mergeStatus(actor.tenant.id);
+  const merge = await mergesOfMapping(actor.tenant.id, mappingId);
   return {
     ...mapping,
     source,
@@ -428,6 +485,6 @@ export async function getMapping(actor: CurrentMember, mappingId: string) {
       updatedAt: v.updatedAt,
       publishBlocker: v.status === 'draft' ? publishBlocker(actor, v) : null,
     })),
-    merge: { ...merge, history: merge.history[mappingId] ?? [] },
+    merge,
   };
 }
