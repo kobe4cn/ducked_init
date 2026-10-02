@@ -162,7 +162,7 @@ export function SourcesB({ loaderData, actionData }: Props) {
           </div>
         ))}
       </div>
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
         {sources.map(s => (
           <Link key={s.id} to={`/sources/${s.id}`} className={cn('group rounded-2xl border bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md', s.differences > 0 && 'border-red-200')}>
             <div className="flex items-start justify-between">

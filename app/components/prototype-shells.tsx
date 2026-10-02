@@ -42,14 +42,14 @@ export function SidebarShell({ email, nav, children }: { email: string; nav: Nav
   );
 }
 
-/** B：白色顶栏 + 渐变大页头（标题、说明、主操作），内容在页头下方居中 */
+/** B：白色顶栏 + 渐变大页头（标题、说明、主操作）；内容区与 A 一样铺满宽度，宽表格和编辑器有足够空间 */
 export function HeroShell({ email, nav, title, description, actions, children }: {
   email: string; nav: NavItem[]; title: React.ReactNode; description?: React.ReactNode; actions?: React.ReactNode; children: React.ReactNode;
 }) {
   return (
     <div className="min-h-svh bg-slate-50">
       <header className="border-b bg-white">
-        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
+        <div className="flex h-16 items-center justify-between px-6 lg:px-8">
           <div className="flex items-center gap-8">
             <span className="flex items-center gap-2 font-semibold"><span className="size-6 rounded-full bg-gradient-to-br from-sky-400 to-violet-500" />CRM 数据分析平台</span>
             <nav className="flex gap-1 text-sm">
@@ -67,7 +67,7 @@ export function HeroShell({ email, nav, title, description, actions, children }:
         </div>
       </header>
       <section className="bg-gradient-to-b from-white to-slate-50">
-        <div className="mx-auto flex max-w-6xl items-end justify-between gap-6 px-6 pt-10 pb-6">
+        <div className="flex items-end justify-between gap-6 px-6 pt-8 pb-6 lg:px-8">
           <div>
             <h1 className="text-3xl font-semibold tracking-tight">{title}</h1>
             {description && <p className="mt-2 max-w-2xl text-slate-500">{description}</p>}
@@ -75,7 +75,7 @@ export function HeroShell({ email, nav, title, description, actions, children }:
           {actions}
         </div>
       </section>
-      <main className="mx-auto flex max-w-6xl flex-col gap-6 px-6 pb-24">{children}</main>
+      <main className="flex flex-col gap-6 px-6 pb-24 lg:px-8">{children}</main>
     </div>
   );
 }
