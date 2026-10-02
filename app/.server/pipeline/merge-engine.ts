@@ -7,7 +7,7 @@
 // 记下每个映射合并到了原始层的哪个批次，是下一次合并起点的唯一依据（与 ADR-0012 的批次日志同理）
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
-import { compileExpression, parseExpression } from './mapping-expr';
+import { compileExpression, parseExpression } from '../../lib/mapping-expr';
 import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
 import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
 

@@ -7,7 +7,7 @@ import type { Route } from './+types/mapping';
 import { can, deniedReason, requirePermission } from '~/.server/access';
 import { discardDraft, draftForMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
-import { functionList } from '~/.server/pipeline/mapping-expr';
+import { functionList } from '~/lib/mapping-expr';
 import type { FallbackStat } from '~/.server/pipeline/merge-engine';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel, entityOf } from '~/lib/canonical-model';

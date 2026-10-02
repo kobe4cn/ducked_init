@@ -3,7 +3,7 @@
 import type { Route } from './+types/model';
 import { requireMember } from '~/.server/auth';
 import { navFor } from '~/.server/nav';
-import { functionList } from '~/.server/pipeline/mapping-expr';
+import { functionList } from '~/lib/mapping-expr';
 import { CANONICAL_ENTITIES, FIELD_TYPES, MODEL_VERSION } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
 import { Badge } from '~/components/ui/badge';

@@ -9,8 +9,7 @@ import {
   type CanonicalEntity, type CanonicalField, type FieldType,
 } from '../../lib/canonical-model';
 import { fieldsForColumn, normalizeName, similarFields, similarNames, standardValue } from '../../lib/field-synonyms';
-import { KIND_FIELD_TYPES, kindOf, ref } from './mapping-draft';
-import { ExprError, FUNCTIONS, parseExpression, referencedColumns, type Expr } from './mapping-expr';
+import { ExprError, FUNCTIONS, KIND_FIELD_TYPES, kindOf, parseExpression, ref, referencedColumns, type Expr } from '../../lib/mapping-expr';
 
 /** 字段的写法：表达式本身，或带值字典（与兜底值）的对象 */
 export type FieldSpec = string | { expr: string; dictionary?: Record<string, string>; otherwise?: string | null };

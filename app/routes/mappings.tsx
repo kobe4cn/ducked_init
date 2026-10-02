@@ -7,7 +7,7 @@ import type { Route } from './+types/mappings';
 import { can, requirePermission } from '~/.server/access';
 import { createMapping, draftFor, listMappings, MappingError, mergeNow, referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
-import { functionList } from '~/.server/pipeline/mapping-expr';
+import { functionList } from '~/lib/mapping-expr';
 import { mappingTemplate } from '~/.server/pipeline/mapping-spec';
 import { listSources } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';

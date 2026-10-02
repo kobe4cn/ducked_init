@@ -1,8 +1,8 @@
-// app/.server/pipeline/mapping-expr.ts —— 映射里的字段表达式：平台自己解析的小语言，只允许白名单函数（类型转换、单位换算、COALESCE、
+// app/lib/mapping-expr.ts —— 映射里的字段表达式：平台自己解析的小语言，只允许白名单函数（类型转换、单位换算、COALESCE、
 // 时区转换等）与四则运算，由平台编译成 DuckDB SQL，成员写不进任意 SQL（ADR-0015）。
 // 语法：源表字段（标识符，或用双引号括起的任意字段名）、单引号字符串、数字、null / true / false、+ - * /、括号与函数调用。
-// 平台进程（保存与发布时校验）与工作进程（合并时编译）共用
-import type { FieldType } from '../../lib/canonical-model';
+// 平台进程（保存与发布时校验）、工作进程（合并时编译）与映射表单（客户端读写表达式）共用
+import type { FieldType } from './canonical-model';
 
 export type Expr =
   | { kind: 'column'; name: string; offset: number }
@@ -15,6 +15,29 @@ export type Expr =
 export class ExprError extends Error {
   constructor(message: string, readonly offset: number) { super(message); }
 }
+
+/** 源列类型的大类 */
+export type Kind = 'int' | 'decimal' | 'tstz' | 'timestamp' | 'date' | 'bool' | 'text' | 'other';
+export function kindOf(type: string): Kind {
+  const t = type.toUpperCase();
+  if (/^U?(TINY|SMALL|BIG|HUGE)?INT(EGER|\d)?\b/.test(t)) return 'int';
+  if (/^(DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL)/.test(t)) return 'decimal';
+  if (/^TIMESTAMP(TZ| WITH TIME ZONE)/.test(t)) return 'tstz';
+  if (/^(TIMESTAMP|DATETIME)/.test(t)) return 'timestamp';
+  if (t === 'DATE') return 'date';
+  if (t.startsWith('BOOL')) return 'bool';
+  if (/^(VARCHAR|TEXT|STRING|CHAR|BPCHAR|UUID)/.test(t)) return 'text';
+  return 'other';
+}
+
+/** 源列大类对应的字段类型（扩展字段的类型据此推断） */
+export const KIND_FIELD_TYPES: Record<Kind, FieldType> = {
+  int: 'integer', decimal: 'decimal', tstz: 'timestamp', timestamp: 'timestamp', date: 'date', bool: 'boolean', text: 'string', other: 'string',
+};
+
+/** 表达式里引用源列：不是普通标识符（或是 null / true / false）时加双引号 */
+export const ref = (name: string) =>
+  /^[A-Za-z_\u0080-￿][A-Za-z0-9_\u0080-￿]*$/.test(name) && !/^(null|true|false)$/i.test(name) ? name : `"${name.replace(/"/g, '""')}"`;
 
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
