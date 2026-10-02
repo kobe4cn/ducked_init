@@ -243,6 +243,35 @@ export function fieldsForColumn(entityName: string, column: string): NameMatch[]
   return matches.sort((a, b) => a.rank - b.rank);
 }
 
+/** 编辑距离（插入、删除、替换各算一步） */
+function distance(a: string, b: string) {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i];
+    for (let j = 1; j <= b.length; j++) row[j] = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = row;
+  }
+  return prev[b.length];
+}
+
+/**
+ * 候选里与 name 相近的名字（多半是拼错了）：规范化后编辑距离不超过名字长度的四分之一（至少 1、至多 2），近的在前
+ */
+export function similarNames(name: string, candidates: readonly string[]): string[] {
+  const norm = normalizeName(name);
+  const limit = Math.min(2, Math.max(1, Math.floor(norm.length / 4)));
+  return candidates
+    .map(c => ({ c, d: distance(norm, c) }))
+    .filter(({ d }) => d > 0 && d <= limit)
+    .sort((a, b) => a.d - b.d)
+    .map(({ c }) => c);
+}
+
+/** 实体里与 name 相近的标准字段（映射报错时提示「是不是想写」）；实体不认识时为空 */
+export function similarFields(entityName: string, name: string): string[] {
+  return similarNames(name, entityOf(entityName)?.fields.map(f => f.name) ?? []);
+}
+
 /** 源端取值对应的标准枚举值：与标准值同名或在近义词表里；对不上（如纯数字编码）时为 undefined */
 export function standardValue(entityName: string, fieldName: string, value: string) {
   const field = entityOf(entityName)?.fields.find(f => f.name === fieldName);

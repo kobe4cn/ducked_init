@@ -6,6 +6,7 @@ import type { Route } from './+types/mapping';
 import { can, deniedReason, requirePermission } from '~/.server/access';
 import { draftForMapping, getMapping, MappingError, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
+import { functionList } from '~/.server/pipeline/mapping-expr';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
@@ -30,6 +31,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       email: member.email,
       nav: navFor(member),
       canWrite,
+      functions: functionList(),
       mapping: {
         id: m.id,
         source: m.source,
@@ -111,7 +113,7 @@ function MergeRow({ e }: { e: MergeEntry }) {
 }
 
 export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, mapping, versions, merge } = loaderData;
+  const { email, nav, canWrite, functions, mapping, versions, merge } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const [shown, setShown] = useState(versions[0]?.version ?? 1);
@@ -181,7 +183,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
           <CardContent>
             {canWrite && (selected.status === 'draft' || !draft) ? (
               <Form method="post" className="space-y-3" key={`${selected.version}-${actionData?.draftId ?? ''}`}>
-                <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} />
+                <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} functions={functions} />
                 <div className="flex gap-2">
                   <Button type="submit" name="intent" value="save" disabled={submitting}>
                     {submitting ? '正在处理…' : selected.status === 'draft' ? '校验并保存草稿' : '校验并保存为新草稿'}

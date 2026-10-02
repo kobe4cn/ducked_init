@@ -1,5 +1,6 @@
 // app/components/mapping-reference.tsx —— 编写映射时放在编辑框旁的对照面板：源表各列的统计（类型、空值率、不同取值数、主键、水位线、常见取值），
-// 目标实体的标准字段（类型、是否必填、标准枚举）。按编辑框里的 YAML 标出已对应的字段与还没对应的必填字段；点击列名或字段名插入到编辑框光标处
+// 目标实体的标准字段（类型、是否必填、标准枚举）、写法速查与白名单函数。按编辑框里的 YAML 标出已对应的字段与还没对应的必填字段；
+// 点击列名、字段名、写法或函数插入到编辑框光标处
 import { useRef, useState } from 'react';
 import { Check } from 'lucide-react';
 import { entityOf, FIELD_TYPES } from '~/lib/canonical-model';
@@ -10,21 +11,38 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~
 
 export interface ReferenceColumn { name: string; type: string; nullRate: number; distinct: number; top: { value: string; rows: number }[] | null }
 export interface ReferenceTable { name: string; sampleRows: number; primaryKey: string[]; watermark: string | null; columns: ReferenceColumn[] }
+/** 白名单函数（由 loader 从 mapping-expr 的 FUNCTIONS 传来） */
+export interface ReferenceFunction { name: string; signature: string; label: string }
+
+/** 写法速查：每种写法一行能直接复制的例子 */
+const SNIPPETS = [
+  { kind: 'field', label: '普通字段', text: 'customer_id: buyer_id' },
+  { kind: 'expr', label: '表达式', text: 'amount: coalesce(pay_amount, pay_fen / 100)' },
+  { kind: 'dictionary', label: '值字典', text: "status: { expr: order_status, dictionary: { 已支付: paid, '2': refunded } }" },
+  { kind: 'extension', label: '扩展字段（写在 extensions 下）', text: 'x_coupon_code: { type: string, expr: coupon_code }' },
+  { kind: 'dedupe', label: '去重键', text: 'dedupe: { key: [order_id], latest: updated_at }' },
+];
 
 const pct = (n: number) => `${Math.round(n * 1000) / 10}%`;
 
-const nameButton = (name: string, onInsert: (text: string) => void) => (
-  <button type="button" className="font-mono hover:underline" title="插入到编辑框光标处" onClick={() => onInsert(name)}>{name}</button>
+/** 点击插入到编辑框光标处的名字或写法；text 是插入的文本（默认同显示的） */
+const nameButton = (name: string, onInsert: (text: string) => void, text = name) => (
+  <button type="button" className="text-left font-mono hover:underline" title="插入到编辑框光标处" onClick={() => onInsert(text)}>{name}</button>
 );
 
-/** 映射 YAML 编辑框，旁边是对照面板；点击面板里的列名或字段名插入到编辑框光标处 */
-export function MappingEditorWithReference({ defaultValue, table, entity }: { defaultValue: string; table: ReferenceTable | null; entity: string }) {
+/** 映射 YAML 编辑框，旁边是对照面板；点击面板里的列名、字段名、写法或函数插入到编辑框光标处 */
+export function MappingEditorWithReference({ defaultValue, table, entity, functions }: {
+  defaultValue: string;
+  table: ReferenceTable | null;
+  entity: string;
+  functions: ReferenceFunction[];
+}) {
   const editor = useRef<MappingEditorHandle>(null);
   const [yaml, setYaml] = useState(defaultValue);
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       <MappingEditor ref={editor} defaultValue={defaultValue} onValueChange={setYaml} />
-      <MappingReference table={table} entity={entity} yaml={yaml} onInsert={text => editor.current?.insert(text)} />
+      <MappingReference table={table} entity={entity} functions={functions} yaml={yaml} onInsert={text => editor.current?.insert(text)} />
     </div>
   );
 }
@@ -32,10 +50,11 @@ export function MappingEditorWithReference({ defaultValue, table, entity }: { de
 /**
  * 对照面板。必填字段是去重键：YAML 里 dedupe.key 声明的，没有声明时是实体的主键（与映射校验的规则一致，未对应时校验不通过）
  */
-function MappingReference({ table, entity, yaml, onInsert }: {
+function MappingReference({ table, entity, functions, yaml, onInsert }: {
   /** 所选的源表；表不在同步范围内或还没采集时为 null */
   table: ReferenceTable | null;
   entity: string;
+  functions: ReferenceFunction[];
   yaml: string;
   onInsert: (text: string) => void;
 }) {
@@ -127,6 +146,34 @@ function MappingReference({ table, entity, yaml, onInsert }: {
       ) : (
         <div className="text-muted-foreground">{`${entity} 不是标准实体，没有标准字段可对照。`}</div>
       )}
+
+      <div className="space-y-1">
+        <div className="font-medium">写法速查：点击插入到光标处</div>
+        <Table>
+          <TableBody>
+            {SNIPPETS.map(s => (
+              <TableRow key={s.kind} data-reference-snippet={s.kind}>
+                <TableCell className="text-muted-foreground">{s.label}</TableCell>
+                <TableCell className="whitespace-normal">{nameButton(s.text, onInsert)}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+
+      <div className="space-y-1">
+        <div className="font-medium">表达式可用的函数（白名单）</div>
+        <Table>
+          <TableBody>
+            {functions.map(f => (
+              <TableRow key={f.name} data-reference-function={f.name}>
+                <TableCell>{nameButton(f.signature, onInsert, `${f.name}(`)}</TableCell>
+                <TableCell className="whitespace-normal">{f.label}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
     </div>
   );
 }

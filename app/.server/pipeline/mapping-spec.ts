@@ -1,13 +1,16 @@
 // app/.server/pipeline/mapping-spec.ts —— 映射文档（YAML）：一张源表 → 一个标准实体（或自定义实体）。
 // 先按 JSON Schema（MAPPING_SCHEMA）校验结构，再对照标准模型与源表的字段做语义校验：字段表达式只能用白名单函数、只能引用源表里有的字段，
-// 值字典只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段。每个问题都带 YAML 里的行列位置。
+// 值字典只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
 // 校验通过后得到合并计划（MergePlan）：标准层的列、每列的表达式与值字典、去重键与取最新字段，交给工作进程编译执行（ADR-0015）
 import { Ajv, type ErrorObject } from 'ajv';
-import { isMap, isScalar, isSeq, LineCounter, parseDocument, type Document, type Node } from 'yaml';
+import { Document, isMap, isScalar, isSeq, LineCounter, parseDocument, type Node, type YAMLMap } from 'yaml';
 import {
-  CANONICAL_ENTITIES, CUSTOM_FIELD_PATTERN, entityOf, EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, isCustomEntity, MODEL_MAJOR, type FieldType,
+  CANONICAL_ENTITIES, CUSTOM_FIELD_PATTERN, entityOf, EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, isCustomEntity, MODEL_MAJOR,
+  type CanonicalEntity, type CanonicalField, type FieldType,
 } from '../../lib/canonical-model';
-import { ExprError, parseExpression, referencedColumns } from './mapping-expr';
+import { fieldsForColumn, normalizeName, similarFields, similarNames, standardValue } from '../../lib/field-synonyms';
+import { KIND_FIELD_TYPES, kindOf, ref } from './mapping-draft';
+import { ExprError, FUNCTIONS, parseExpression, referencedColumns, type Expr } from './mapping-expr';
 
 /** 字段的写法：表达式本身，或带值字典的对象 */
 export type FieldSpec = string | { expr: string; dictionary?: Record<string, string> };
@@ -79,8 +82,11 @@ export const MAPPING_SCHEMA = {
 
 const validateSchema = new Ajv({ allErrors: true, strict: false }).compile(MAPPING_SCHEMA);
 
-/** 映射里的一个问题：行列从 1 起（YAML 解析失败时也有），path 是出问题的位置（如 fields.status.dictionary） */
-export interface MappingIssue { line: number; col: number; path: string; message: string }
+/**
+ * 映射里的一个问题：行列从 1 起（YAML 解析失败时也有），path 是出问题的位置（如 fields.status.dictionary）；
+ * hint 是改好的写法（可直接粘贴的 YAML，可能多行），能给出时才有
+ */
+export interface MappingIssue { line: number; col: number; path: string; message: string; hint?: string }
 
 /** 标准层里的一列：类型、表达式、值字典与标准枚举 */
 export interface PlanColumn { name: string; type: FieldType; expr: string; dictionary?: Record<string, string>; enum?: readonly string[] }
@@ -105,7 +111,10 @@ export type MappingCheck = { ok: true; spec: MappingSpec; plan: MergePlan } | { 
  * 源表的字段：表不能用于映射时返回原因（不在同步范围、还没采集等）。
  * 不给时不检查源表（工作进程里只编译，不再对照）
  */
-export type SourceColumns = (table: string) => string[] | string;
+export type SourceColumns = (table: string) => SourceColumn[] | string;
+
+/** 源表的一列：名称与源端类型（DuckDB 类型名，如 BIGINT、VARCHAR） */
+export interface SourceColumn { name: string; type: string }
 
 type Path = (string | number)[];
 
@@ -155,6 +164,39 @@ function locator(doc: Document, lines: LineCounter) {
   };
 }
 
+/** 改好的写法：flow 里的路径写成行内形式（如 { type: string, expr: x }） */
+function snippet(value: Record<string, unknown>, flow: Path[] = []) {
+  const doc = new Document(value);
+  for (const p of flow) (doc.getIn(p, true) as YAMLMap).flow = true;
+  return doc.toString({ lineWidth: 0, singleQuote: true }).trimEnd();
+}
+
+/** 推断表达式的类型（给扩展字段的写法填类型）：源列按源端类型，函数按返回值，四则运算按数字 */
+function inferType(expr: Expr, columnType: (name: string) => string | undefined): FieldType {
+  switch (expr.kind) {
+    case 'column': {
+      const t = columnType(expr.name);
+      return t ? KIND_FIELD_TYPES[kindOf(t)] : 'string';
+    }
+    case 'literal':
+      if (expr.text !== undefined || expr.sql === 'NULL') return 'string';
+      if (/^(TRUE|FALSE)$/i.test(expr.sql)) return 'boolean';
+      return /^\d+$/.test(expr.sql) ? 'integer' : 'decimal';
+    case 'call':
+      return FUNCTIONS[expr.fn]?.returns ?? (expr.args[0] ? inferType(expr.args[0], columnType) : 'string');
+    case 'neg':
+      return inferType(expr.arg, columnType);
+    case 'binary': {
+      if (expr.op === '/') return 'decimal';
+      const both = [inferType(expr.left, columnType), inferType(expr.right, columnType)];
+      return both.every(t => t === 'integer') ? 'integer' : 'decimal';
+    }
+  }
+}
+
+/** 字段的写法拆成表达式与值字典 */
+const fieldParts = (raw: FieldSpec) => (typeof raw === 'string' ? { expr: raw, dictionary: undefined } : raw);
+
 const ISSUE_ORDER = (a: MappingIssue, b: MappingIssue) => a.line - b.line || a.col - b.col;
 
 /**
@@ -175,9 +217,9 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
   }
   const at = locator(doc, lines);
   const issues: MappingIssue[] = [];
-  const issue = (path: Path, message: string, { atKey = false, offset = 0 } = {}) => {
+  const issue = (path: Path, message: string, { atKey = false, offset = 0, hint }: { atKey?: boolean; offset?: number; hint?: string } = {}) => {
     const { line, col } = at(path, atKey);
-    issues.push({ line, col: col + offset, path: path.join('.'), message });
+    issues.push({ line, col: col + offset, path: path.join('.'), message, ...(hint && { hint }) });
   };
 
   const value = doc.toJS() as unknown;
@@ -200,11 +242,11 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
   }
 
   // 源表与它的字段
-  let columns: Set<string> | null = null;
+  let columns: Map<string, string> | null = null;
   if (sourceColumns) {
     const listed = sourceColumns(spec.table);
     if (typeof listed === 'string') issue(['table'], listed);
-    else columns = new Set(listed);
+    else columns = new Map(listed.map(c => [c.name, c.type]));
   }
 
   /** 校验一个表达式，返回其文本；表达式在 YAML 字符串里的位置按引号偏移一列 */
@@ -223,12 +265,58 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
   };
 
   const planned: PlanColumn[] = [];
-  const checkDictionary = (path: Path, type: FieldType, dictionary: Record<string, string> | undefined, allowed?: readonly string[]) => {
+  /** 值字典：只能用于文本字段，标准字段的只能对应到标准枚举。fixedType 是用于非文本字段时改好的写法（扩展字段改成文本，标准字段去掉值字典） */
+  const checkDictionary = (path: Path, type: FieldType, dictionary: Record<string, string> | undefined, fixedType: () => string, standard?: CanonicalField) => {
     if (!dictionary) return;
-    if (type !== 'string') issue([...path, 'dictionary'], '值字典只能用于文本字段', { atKey: true });
+    if (type !== 'string') issue([...path, 'dictionary'], '值字典只能用于文本字段', { atKey: true, hint: fixedType() });
+    const allowed = standard?.enum;
     for (const [from, to] of Object.entries(dictionary)) {
-      if (allowed && !allowed.includes(to)) issue([...path, 'dictionary', from], `${to} 不是标准枚举值（可选：${allowed.join('、')}）`);
+      if (!allowed || allowed.includes(to)) continue;
+      const value = standardValue(spec.entity, standard.name, to) ?? standardValue(spec.entity, standard.name, from);
+      issue([...path, 'dictionary', from], `${to} 不是标准枚举值（可选：${allowed.join('、')}）`, { hint: value && snippet({ [from]: value }) });
     }
+  };
+
+  /** fields 下写了标准模型里没有的字段：按右边的源列名、去掉 x_ 的名字（同名、同义词、相近）猜该写的标准字段，x_ 开头的附上扩展字段的写法 */
+  const reportUnknownField = (entity: CanonicalEntity, name: string, raw: FieldSpec) => {
+    const { expr, dictionary } = fieldParts(raw);
+    let parsed: Expr | null = null;
+    try { parsed = parseExpression(expr); } catch (e) { if (!(e instanceof ExprError)) throw e; }
+    const refs = parsed ? referencedColumns(parsed).map(c => c.name) : [];
+    const bare = name.replace(/^x_/, '');
+    const guess = [
+      ...refs.flatMap(c => fieldsForColumn(entity.name, c)).map(m => m.field),
+      ...fieldsForColumn(entity.name, bare).map(m => m.field),
+      ...similarFields(entity.name, bare),
+      ...refs.flatMap(c => similarFields(entity.name, c)),
+    ].find(f => !(f in spec.fields!));
+    const extension = name.startsWith('x_');
+    const extName = extension ? name : `x_${normalizeName(name)}`;
+    const type = dictionary ? 'string' : parsed ? inferType(parsed, c => columns?.get(c)) : 'string';
+    const asExtension = snippet({ extensions: { [extName]: { type, expr, ...(dictionary && { dictionary }) } } }, [['extensions', extName]]);
+    const prefix = `${entity.label}（${entity.name}）没有标准字段 ${name}`;
+    if (guess) {
+      const label = entity.fields.find(f => f.name === guess)!.label;
+      const asField = snippet({ [guess]: raw }, typeof raw === 'string' ? [] : [[guess]]);
+      issue(['fields', name], extension
+        ? `${prefix}：是不是想写 ${guess}（${label}）？若是租户特有的字段，请移到 extensions 下并带类型`
+        : `${prefix}：是不是想写 ${guess}（${label}）？`, { atKey: true, hint: extension ? `${asField}\n# 或作为扩展字段：\n${asExtension}` : asField });
+    } else if (extension) {
+      issue(['fields', name], `${prefix}；以 x_ 开头的扩展字段请移到 extensions 下并带类型`, { atKey: true, hint: asExtension });
+    } else {
+      issue(['fields', name], `${prefix}；租户特有的字段请写在 extensions 里，以 x_ 开头`, { atKey: true, hint: asExtension });
+    }
+  };
+
+  /** 源表里能对应到标准字段 name 的列（按同名、同义词优先级），写成该字段的表达式 */
+  const columnFor = (entity: CanonicalEntity, name: string) => {
+    if (!columns) return undefined;
+    const [best] = [...columns]
+      .flatMap(([col, type]) => fieldsForColumn(entity.name, col).filter(m => m.field === name).map(m => ({ col, type, rank: m.rank })))
+      .sort((a, b) => a.rank - b.rank);
+    if (!best) return undefined;
+    const field = entity.fields.find(f => f.name === name)!;
+    return field.type === 'string' && kindOf(best.type) !== 'text' ? `string(${ref(best.col)})` : ref(best.col);
   };
 
   if (custom && spec.fields && Object.keys(spec.fields).length) {
@@ -237,12 +325,12 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
   for (const [name, raw] of Object.entries(spec.fields ?? {})) {
     const field = entity?.fields.find(f => f.name === name);
     if (!field) {
-      if (entity) issue(['fields', name], `${entity.label}（${entity.name}）没有标准字段 ${name}；租户特有的字段请写在 extensions 里，以 x_ 开头`, { atKey: true });
+      if (entity) reportUnknownField(entity, name, raw);
       continue;
     }
-    const { expr, dictionary } = typeof raw === 'string' ? { expr: raw, dictionary: undefined } : raw;
+    const { expr, dictionary } = fieldParts(raw);
     checkExpr(typeof raw === 'string' ? ['fields', name] : ['fields', name, 'expr'], expr);
-    checkDictionary(['fields', name], field.type, dictionary, field.enum);
+    checkDictionary(['fields', name], field.type, dictionary, () => snippet({ [name]: expr }), field);
     planned.push({ name, type: field.type, expr, ...(dictionary && { dictionary }), ...(field.enum && { enum: field.enum }) });
   }
   const extensionName = new RegExp(custom ? CUSTOM_FIELD_PATTERN : EXTENSION_PATTERN);
@@ -254,7 +342,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
       continue;
     }
     checkExpr(['extensions', name, 'expr'], ext.expr);
-    checkDictionary(['extensions', name], ext.type, ext.dictionary);
+    checkDictionary(['extensions', name], ext.type, ext.dictionary, () => snippet({ [name]: { ...ext, type: 'string' } }, [[name]]));
     planned.push({ name, type: ext.type, expr: ext.expr, ...(ext.dictionary && { dictionary: ext.dictionary }) });
   }
   if (!planned.length) issue(spec.fields ? ['fields'] : [], '至少要映射一个字段');
@@ -262,11 +350,19 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
   // 去重键与取最新字段：必须是映射出来的字段
   const mapped = new Map(planned.map(c => [c.name, c]));
   const key = [...(spec.dedupe?.key ?? entity?.key ?? [])];
-  if (!spec.dedupe && custom) issue([], '自定义实体必须声明去重键 dedupe.key');
+  if (!spec.dedupe && custom) {
+    issue([], '自定义实体必须声明去重键 dedupe.key', { hint: 'dedupe:\n  key: [能唯一标识一行的字段]' });
+  }
   key.forEach((k, i) => {
     if (mapped.has(k)) return;
-    if (spec.dedupe) issue(['dedupe', 'key', i], `去重键 ${k} 不是本映射映射出来的字段`);
-    else issue(['fields'], `没有映射${entity!.label}的主键 ${k}：请映射它，或在 dedupe.key 里声明去重键`, { atKey: true });
+    if (spec.dedupe) {
+      const [near] = similarNames(k, [...mapped.keys()]);
+      issue(['dedupe', 'key', i], `去重键 ${k} 不是本映射映射出来的字段`, { hint: near && `key: [${key.map(x => (x === k ? near : x)).join(', ')}]` });
+    } else {
+      const expr = columnFor(entity!, k);
+      const hint = expr ? snippet({ [k]: expr }) : `${k}: 源表里能唯一标识一行的列\n# 或者\ndedupe:\n  key: [能唯一标识一行的字段]`;
+      issue(['fields'], `没有映射${entity!.label}的主键 ${k}：请映射它，或在 dedupe.key 里声明去重键`, { atKey: true, hint });
+    }
   });
   const latest = spec.dedupe?.latest ?? null;
   if (latest) {

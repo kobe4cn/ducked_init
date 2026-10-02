@@ -7,6 +7,7 @@ import type { Route } from './+types/mappings';
 import { can, requirePermission } from '~/.server/access';
 import { createMapping, draftFor, listMappings, MappingError, mergeNow, referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
+import { functionList } from '~/.server/pipeline/mapping-expr';
 import { mappingTemplate } from '~/.server/pipeline/mapping-spec';
 import { listSources } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
@@ -39,6 +40,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     /** 各数据源可对照的源表（只有能新建映射时才给） */
     tables: canWrite ? Object.fromEntries(await Promise.all(sources.map(async s => [s.id, await referenceTables(member, s.id)] as const))) : {},
     template: mappingTemplate('order', 'orders'),
+    functions: functionList(),
     merge: {
       status: merge.status,
       statusLabel: merge.status === 'none' ? '未合并' : TASK_STATUS_LABELS[merge.status],
@@ -102,7 +104,7 @@ function mergeSummary(m: LastMerge) {
 }
 
 export default function Mappings({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, sources, tables, template, merge, mappings } = loaderData;
+  const { email, nav, canWrite, sources, tables, template, functions, merge, mappings } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   return (
     <AppShell email={email} nav={nav}>
@@ -178,6 +180,7 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
               key={actionData?.draftId ?? 'new'}
               sources={sources}
               tables={tables}
+              functions={functions}
               values={actionData?.values ?? { sourceId: sources[0]?.id ?? '', yaml: template }}
               submitting={submitting}
             />
@@ -192,9 +195,10 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
  * 新建映射的表单：选数据源、编写 YAML。表与目标实体两个下拉框决定旁边对照面板显示什么（默认取 YAML 里写的），
  * 也是「按规则生成草稿」的输入；保存时以 YAML 里写的为准
  */
-function NewMapping({ sources, tables, values, submitting }: {
+function NewMapping({ sources, tables, functions, values, submitting }: {
   sources: LoaderData['sources'];
   tables: LoaderData['tables'];
+  functions: LoaderData['functions'];
   values: { sourceId: string; yaml: string };
   submitting: boolean;
 }) {
@@ -229,7 +233,7 @@ function NewMapping({ sources, tables, values, submitting }: {
         </div>
         <Field>
           <FieldLabel>映射（YAML）</FieldLabel>
-          <MappingEditorWithReference defaultValue={values.yaml} table={table} entity={entity} />
+          <MappingEditorWithReference defaultValue={values.yaml} table={table} entity={entity} functions={functions} />
         </Field>
         <div className="flex gap-2">
           <Button type="submit" name="intent" value="create" disabled={submitting || !sources.length}>{submitting ? '正在处理…' : '校验并保存草稿'}</Button>

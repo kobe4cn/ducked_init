@@ -4,7 +4,9 @@ import { describe, expect, it } from 'vitest';
 import { checkMapping } from '../app/.server/pipeline/mapping-spec';
 import { mappingOutline } from '../app/lib/mapping-outline';
 
-const ORDERS = ['order_id', 'customer_id', 'amount', 'status', 'created_at', 'pay_fen', '下单时间'];
+const ORDERS = (
+  [['order_id', 'BIGINT'], ['customer_id', 'BIGINT'], ['amount', 'DECIMAL(10,2)'], ['status', 'VARCHAR'], ['created_at', 'TIMESTAMP'], ['pay_fen', 'INTEGER'], ['下单时间', 'VARCHAR']] as const
+).map(([name, type]) => ({ name, type }));
 const columns = (table: string) => (table === 'orders' ? ORDERS : `数据源中没有表 ${table}`);
 
 const ok = `model: 1
@@ -95,6 +97,47 @@ colour: red
     const custom = `model: 1\nentity: custom_coupon\ntable: orders\nextensions:\n  code: { type: string, expr: string(order_id) }\n`;
     expect(issues(custom).map(i => i.message)).toEqual(['自定义实体必须声明去重键 dedupe.key']);
     expect(checkMapping(`${custom}dedupe: { key: [code] }\n`, columns).ok).toBe(true);
+  });
+});
+
+describe('映射报错给出改法', () => {
+  const withFields = (lines: string) => ok.replace(/  amount: .*\n  created_at: .*\n/, lines);
+
+  it('fields 下写了不存在的标准字段：按右边的源列名、去掉 x_ 的名字或相近的名字提示该写哪个标准字段', () => {
+    const found = issues(withFields('  x_order_ts: created_at\n  x_pay_amount: pay_fen / 100\n'));
+    expect(found.map(i => [i.path, i.message])).toEqual([
+      ['fields.x_order_ts', expect.stringMatching(/没有标准字段 x_order_ts.*是不是想写 created_at（下单时间）？/)],
+      ['fields.x_pay_amount', expect.stringMatching(/没有标准字段 x_pay_amount.*是不是想写 amount（实付金额）？/)],
+    ]);
+    expect(found[0].hint).toContain('created_at: created_at');
+    expect(found[1].hint).toContain('amount: pay_fen / 100');
+    // 拼错的字段名按相近匹配
+    const typo = issues(withFields('  ammount: pay_fen / 100\n'))[0];
+    expect(typo.message).toMatch(/没有标准字段 ammount.*是不是想写 amount（实付金额）？/);
+    expect(typo.hint).toBe('amount: pay_fen / 100');
+  });
+
+  it('fields 下的 x_ 字段附带放到 extensions 下的写法，类型按源列推断', () => {
+    const [ts, pay] = issues(withFields('  x_order_ts: created_at\n  x_pay_amount: pay_fen / 100\n'));
+    expect(ts.hint).toContain('extensions:\n  x_order_ts: { type: timestamp, expr: created_at }');
+    expect(pay.hint).toContain('extensions:\n  x_pay_amount: { type: decimal, expr: pay_fen / 100 }');
+    const [coupon] = issues(withFields('  x_coupon: string(pay_fen)\n'));
+    expect(coupon.message).toMatch(/没有标准字段 x_coupon.*extensions/);
+    expect(coupon.hint).toBe('extensions:\n  x_coupon: { type: string, expr: string(pay_fen) }');
+  });
+
+  it('值字典用在非文本字段、对应到非标准枚举、缺主键时各附一行改好的写法', () => {
+    const dictionary = issues(ok.replace('      已支付: paid', '      已支付: settled'))[0];
+    expect(dictionary.hint).toBe('已支付: paid');
+    const level = issues(`${ok}extensions:\n  x_level: { type: integer, expr: pay_fen, dictionary: { '1': gold } }\n`)[0];
+    expect(level.message).toBe('值字典只能用于文本字段');
+    expect(level.hint).toBe("x_level: { type: string, expr: pay_fen, dictionary: { '1': gold } }");
+    const key = issues(ok.replace('  order_id: string(order_id)\n', ''))[0];
+    expect(key.message).toMatch(/没有映射订单的主键 order_id/);
+    expect(key.hint).toBe('order_id: string(order_id)');
+    // 源表里没有能对应主键的列时，给出映射主键或声明去重键的写法
+    const unknown = checkMapping(ok.replace('  order_id: string(order_id)\n', ''));
+    expect(!unknown.ok && unknown.issues[0].hint).toMatch(/^order_id: .*\n# 或者\ndedupe:\n  key: \[/);
   });
 });
 

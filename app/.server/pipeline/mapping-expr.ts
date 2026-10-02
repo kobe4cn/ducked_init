@@ -2,6 +2,8 @@
 // 时区转换等）与四则运算，由平台编译成 DuckDB SQL，成员写不进任意 SQL（ADR-0015）。
 // 语法：源表字段（标识符，或用双引号括起的任意字段名）、单引号字符串、数字、null / true / false、+ - * /、括号与函数调用。
 // 平台进程（保存与发布时校验）与工作进程（合并时编译）共用
+import type { FieldType } from '../../lib/canonical-model';
+
 export type Expr =
   | { kind: 'column'; name: string; offset: number }
   | { kind: 'literal'; sql: string; text?: string; offset: number }
@@ -35,6 +37,10 @@ function textArg(call: Extract<Expr, { kind: 'call' }>, i: number, what: string)
 
 interface FunctionDef {
   label: string;
+  /** 写法（参数用中文说明，方括号里的可省略），对照面板与标准模型页展示 */
+  signature: string;
+  /** 返回值的字段类型（报错给扩展字段的写法时据此推断类型）；不写时同第一个参数 */
+  returns?: FieldType;
   /** 参数个数的下限与上限（上限为 Infinity 表示不限） */
   arity: [number, number];
   /** 校验字面量参数（如时区名） */
@@ -44,23 +50,26 @@ interface FunctionDef {
 
 /** 白名单函数：名称、说明与编译方式。新增函数只改这里 */
 export const FUNCTIONS: Record<string, FunctionDef> = {
-  string: { label: '转为文本', arity: [1, 1], sql: ([a]) => `CAST(${a} AS VARCHAR)` },
-  integer: { label: '转为整数', arity: [1, 1], sql: ([a]) => `CAST(${a} AS BIGINT)` },
-  decimal: { label: '转为小数', arity: [1, 1], sql: ([a]) => `CAST(${a} AS DOUBLE)` },
-  boolean: { label: '转为布尔', arity: [1, 1], sql: ([a]) => `CAST(${a} AS BOOLEAN)` },
+  string: { signature: 'string(x)', returns: 'string', label: '转为文本', arity: [1, 1], sql: ([a]) => `CAST(${a} AS VARCHAR)` },
+  integer: { signature: 'integer(x)', returns: 'integer', label: '转为整数', arity: [1, 1], sql: ([a]) => `CAST(${a} AS BIGINT)` },
+  decimal: { signature: 'decimal(x)', returns: 'decimal', label: '转为小数', arity: [1, 1], sql: ([a]) => `CAST(${a} AS DOUBLE)` },
+  boolean: { signature: 'boolean(x)', returns: 'boolean', label: '转为布尔', arity: [1, 1], sql: ([a]) => `CAST(${a} AS BOOLEAN)` },
   date: {
+    signature: "date(x[, '格式'])", returns: 'date',
     label: '转为日期；第二个参数为格式时按格式解析（如 \'%Y/%m/%d\'）',
     arity: [1, 2],
     check: call => { if (call.args.length === 2) textArg(call, 1, '格式'); },
     sql: (args, call) => (args.length === 2 ? `CAST(strptime(CAST(${args[0]} AS VARCHAR), ${lit(textArg(call, 1, '格式'))}) AS DATE)` : `CAST(${args[0]} AS DATE)`),
   },
   timestamp: {
+    signature: "timestamp(x[, '格式'])", returns: 'timestamp',
     label: '转为时间（不带时区的按 UTC）；第二个参数为格式时按格式解析（如 \'%Y-%m-%d %H:%M\'）',
     arity: [1, 2],
     check: call => { if (call.args.length === 2) textArg(call, 1, '格式'); },
     sql: (args, call) => (args.length === 2 ? `strptime(CAST(${args[0]} AS VARCHAR), ${lit(textArg(call, 1, '格式'))})` : `CAST(${args[0]} AS TIMESTAMP)`),
   },
   from_timezone: {
+    signature: "from_timezone(x, '时区')", returns: 'timestamp',
     label: '把源端的本地时间（不带时区）按给定时区解读，如 from_timezone(created_at, \'Asia/Shanghai\')',
     arity: [2, 2],
     check: call => {
@@ -69,18 +78,21 @@ export const FUNCTIONS: Record<string, FunctionDef> = {
     },
     sql: (args, call) => `timezone(${lit(textArg(call, 1, '时区'))}, CAST(${args[0]} AS TIMESTAMP))`,
   },
-  from_epoch_seconds: { label: 'Unix 秒转为时间', arity: [1, 1], sql: ([a]) => `to_timestamp(CAST(${a} AS DOUBLE))` },
-  from_epoch_millis: { label: 'Unix 毫秒转为时间', arity: [1, 1], sql: ([a]) => `to_timestamp(CAST(${a} AS DOUBLE) / 1000)` },
-  coalesce: { label: '取第一个非空值', arity: [2, Infinity], sql: args => `coalesce(${args.join(', ')})` },
-  nullif: { label: '与第二个参数相等时为空', arity: [2, 2], sql: ([a, b]) => `nullif(${a}, ${b})` },
-  lower: { label: '转小写', arity: [1, 1], sql: ([a]) => `lower(CAST(${a} AS VARCHAR))` },
-  upper: { label: '转大写', arity: [1, 1], sql: ([a]) => `upper(CAST(${a} AS VARCHAR))` },
-  trim: { label: '去掉首尾空白', arity: [1, 1], sql: ([a]) => `trim(CAST(${a} AS VARCHAR))` },
-  concat: { label: '拼接文本（空值当作空串）', arity: [1, Infinity], sql: args => `concat(${args.join(', ')})` },
-  substr: { label: '截取文本：substr(x, 起始位置从 1 起, 长度)', arity: [2, 3], sql: args => `substring(CAST(${args[0]} AS VARCHAR), ${args.slice(1).join(', ')})` },
-  round: { label: '四舍五入到给定小数位（默认 0）', arity: [1, 2], sql: args => `round(${args.join(', ')})` },
-  abs: { label: '绝对值', arity: [1, 1], sql: ([a]) => `abs(${a})` },
+  from_epoch_seconds: { signature: 'from_epoch_seconds(x)', returns: 'timestamp', label: 'Unix 秒转为时间', arity: [1, 1], sql: ([a]) => `to_timestamp(CAST(${a} AS DOUBLE))` },
+  from_epoch_millis: { signature: 'from_epoch_millis(x)', returns: 'timestamp', label: 'Unix 毫秒转为时间', arity: [1, 1], sql: ([a]) => `to_timestamp(CAST(${a} AS DOUBLE) / 1000)` },
+  coalesce: { signature: 'coalesce(x, y, ...)', label: '取第一个非空值', arity: [2, Infinity], sql: args => `coalesce(${args.join(', ')})` },
+  nullif: { signature: 'nullif(x, y)', label: '与第二个参数相等时为空', arity: [2, 2], sql: ([a, b]) => `nullif(${a}, ${b})` },
+  lower: { signature: 'lower(x)', returns: 'string', label: '转小写', arity: [1, 1], sql: ([a]) => `lower(CAST(${a} AS VARCHAR))` },
+  upper: { signature: 'upper(x)', returns: 'string', label: '转大写', arity: [1, 1], sql: ([a]) => `upper(CAST(${a} AS VARCHAR))` },
+  trim: { signature: 'trim(x)', returns: 'string', label: '去掉首尾空白', arity: [1, 1], sql: ([a]) => `trim(CAST(${a} AS VARCHAR))` },
+  concat: { signature: 'concat(x, y, ...)', returns: 'string', label: '拼接文本（空值当作空串）', arity: [1, Infinity], sql: args => `concat(${args.join(', ')})` },
+  substr: { signature: 'substr(x, 起始[, 长度])', returns: 'string', label: '截取文本：substr(x, 起始位置从 1 起, 长度)', arity: [2, 3], sql: args => `substring(CAST(${args[0]} AS VARCHAR), ${args.slice(1).join(', ')})` },
+  round: { signature: 'round(x[, 小数位])', returns: 'decimal', label: '四舍五入到给定小数位（默认 0）', arity: [1, 2], sql: args => `round(${args.join(', ')})` },
+  abs: { signature: 'abs(x)', label: '绝对值', arity: [1, 1], sql: ([a]) => `abs(${a})` },
 };
+
+/** 白名单函数的名称、写法与说明（交给页面展示） */
+export const functionList = () => Object.entries(FUNCTIONS).map(([name, f]) => ({ name, signature: f.signature, label: f.label }));
 
 const IDENT_START = /[A-Za-z_\u0080-￿]/;
 const IDENT_PART = /[A-Za-z0-9_\u0080-￿]/;

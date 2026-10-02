@@ -152,6 +152,21 @@ describe('编写映射时的对照面板', () => {
     expect(await rejected.text()).toMatch(/data-reference-field="order_id"[^>]*data-missing-required/);
   });
 
+  it('面板有写法速查与白名单函数；校验不通过时报错附上改好的写法', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+
+    const html = await (await engineer.get('/mappings')).text();
+    for (const kind of ['field', 'expr', 'dictionary', 'extension', 'dedupe']) expect(html).toContain(`data-reference-snippet="${kind}"`);
+    expect(html).toMatch(/data-reference-function="from_timezone"[\s\S]*?from_timezone\(x, &#x27;时区&#x27;\)/);
+
+    const rejected = await engineer.post('/mappings', { intent: 'create', sourceId, yaml: `${ORDERS}  x_order_ts: created_at\n` });
+    expect(rejected.status).toBe(400);
+    const page = await rejected.text();
+    expect(page).toMatch(/data-issue-path="fields.x_order_ts"[^>]*>[^<]*是不是想写 created_at（下单时间）？/);
+    expect(page).toMatch(/<pre data-issue-hint[^>]*>created_at: created_at/);
+  });
+
   it('编辑草稿时对照映射的源表与实体', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const engineer = await loginAs(app, 'de@acme.com');

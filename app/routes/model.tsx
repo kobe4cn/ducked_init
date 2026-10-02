@@ -3,7 +3,7 @@
 import type { Route } from './+types/model';
 import { requireMember } from '~/.server/auth';
 import { navFor } from '~/.server/nav';
-import { FUNCTIONS } from '~/.server/pipeline/mapping-expr';
+import { functionList } from '~/.server/pipeline/mapping-expr';
 import { CANONICAL_ENTITIES, FIELD_TYPES, MODEL_VERSION } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
 import { Badge } from '~/components/ui/badge';
@@ -19,7 +19,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   return {
     email: member.email,
     nav: navFor(member),
-    functions: Object.entries(FUNCTIONS).map(([name, f]) => ({ name, label: f.label })),
+    functions: functionList(),
   };
 }
 
@@ -92,7 +92,7 @@ export default function Model({ loaderData }: Route.ComponentProps) {
             <TableBody>
               {functions.map(f => (
                 <TableRow key={f.name} data-function={f.name}>
-                  <TableCell className="font-mono text-xs">{f.name}</TableCell>
+                  <TableCell className="font-mono text-xs">{f.signature}</TableCell>
                   <TableCell className="whitespace-normal text-muted-foreground">{f.label}</TableCell>
                 </TableRow>
               ))}

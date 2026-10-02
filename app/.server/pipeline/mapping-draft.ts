@@ -2,7 +2,7 @@
 // 列名规范化后按同名与同义词对应到标准字段，再用类型与格式特征校验；按需加上分转元、毫秒时间戳、时区解读等转换，枚举字段按常见取值生成值字典骨架。
 // 每条对应的依据写在行尾注释里，没对应上的标准字段与没用到的源列列在文末。生成的只是草稿，仍要保存校验、双人发布（ADR-0015）
 import { Document, Scalar, YAMLMap } from 'yaml';
-import { MODEL_MAJOR, type CanonicalEntity, type CanonicalField } from '../../lib/canonical-model';
+import { MODEL_MAJOR, type CanonicalEntity, type CanonicalField, type FieldType } from '../../lib/canonical-model';
 import { CENTS_SUFFIX, fieldsForColumn, normalizeName, standardValue } from '../../lib/field-synonyms';
 import type { ColumnProfile, TableProfile, TextFormat } from './source-engine';
 
@@ -24,8 +24,9 @@ const FORMAT_LABELS: Partial<Record<TextFormat, string>> = { integer: '整数', 
 const MILLIS = [946_684_800_000, 4_102_444_800_000];
 const SECONDS = [946_684_800, 4_102_444_800];
 
-type Kind = 'int' | 'decimal' | 'tstz' | 'timestamp' | 'date' | 'bool' | 'text' | 'other';
-function kindOf(type: string): Kind {
+/** 源列类型的大类 */
+export type Kind = 'int' | 'decimal' | 'tstz' | 'timestamp' | 'date' | 'bool' | 'text' | 'other';
+export function kindOf(type: string): Kind {
   const t = type.toUpperCase();
   if (/^U?(TINY|SMALL|BIG|HUGE)?INT(EGER|\d)?\b/.test(t)) return 'int';
   if (/^(DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL)/.test(t)) return 'decimal';
@@ -37,8 +38,13 @@ function kindOf(type: string): Kind {
   return 'other';
 }
 
+/** 源列大类对应的字段类型（扩展字段的类型据此推断） */
+export const KIND_FIELD_TYPES: Record<Kind, FieldType> = {
+  int: 'integer', decimal: 'decimal', tstz: 'timestamp', timestamp: 'timestamp', date: 'date', bool: 'boolean', text: 'string', other: 'string',
+};
+
 /** 表达式里引用源列：不是普通标识符（或是 null / true / false）时加双引号 */
-const ref = (name: string) =>
+export const ref = (name: string) =>
   /^[A-Za-z_\u0080-￿][A-Za-z0-9_\u0080-￿]*$/.test(name) && !/^(null|true|false)$/i.test(name) ? name : `"${name.replace(/"/g, '""')}"`;
 
 const hasFormat = (c: ColumnProfile, format: TextFormat) => !!c.formats?.some(f => f.format === format);

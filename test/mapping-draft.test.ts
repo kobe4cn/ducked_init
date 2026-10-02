@@ -97,7 +97,7 @@ const COUPONS = table('coupons', [
 ], ['coupon_code']);
 
 const columnsOf = (...tables: TableProfile[]) => (name: string) =>
-  tables.find(t => t.name === name)?.columns.map(c => c.name) ?? `数据源中没有表 ${name}`;
+  tables.find(t => t.name === name)?.columns ?? `数据源中没有表 ${name}`;
 
 const draft = (t: TableProfile, entity: string, opts?: Parameters<typeof draftMapping>[2]) => draftMapping(t, entityOf(entity)!, opts);
 const fields = (yaml: string) => (parse(yaml) as { fields: Record<string, unknown> }).fields;
@@ -309,7 +309,7 @@ describe('转换与值字典', () => {
     const t = table('orders', [column('Order ID', 'VARCHAR'), column('Created-At', 'TIMESTAMP')], ['Order ID']);
     const yaml = draft(t, 'order');
     expect(fields(yaml)).toMatchObject({ order_id: '"Order ID"', created_at: `from_timezone("Created-At", 'Asia/Shanghai')` });
-    expect(checkMapping(yaml, () => ['Order ID', 'Created-At']).ok).toBe(true);
+    expect(checkMapping(yaml, () => [{ name: 'Order ID', type: 'VARCHAR' }, { name: 'Created-At', type: 'TIMESTAMP' }]).ok).toBe(true);
   });
 });
 

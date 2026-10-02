@@ -43,7 +43,7 @@ async function sourceColumns(tenantId: string, sourceId: string) {
   const lookup = await profiledTables(tenantId, sourceId);
   return (table: string) => {
     const profiled = lookup(table);
-    return typeof profiled === 'string' ? profiled : profiled.table.columns.map(c => c.name);
+    return typeof profiled === 'string' ? profiled : profiled.table.columns.map(c => ({ name: c.name, type: c.type }));
   };
 }
 
