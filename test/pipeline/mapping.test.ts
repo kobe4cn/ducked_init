@@ -1,7 +1,9 @@
 // 映射与标准层合并的流水线接缝：同步到原始层 → 编写映射草稿 → 另一位成员发布 → 调度器派发合并 → 标准层；
 // 之后源端的新增、更新与删除随同步后的合并进入标准层，去重键与取最新规则让源端的重复行只计一次
+import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { mappings, mappingVersions } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createMapping, getMapping, MappingError, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -444,6 +446,27 @@ describe('发布映射并合并到标准层', () => {
     await saveDraft(reviewer, mapping.id, CUSTOMERS.replace('city: city', 'city: upper(city)'));
     await publishMapping(author, mapping.id, 1);
     expect((await getMapping(author, mapping.id)).versions[0]).toMatchObject({ status: 'published', authors: [author.email, reviewer.email], lastEditor: reviewer.email });
+  });
+
+  it('发布等锁期间草稿被丢弃时，发布被拒绝并提示刷新', async () => {
+    const { author, reviewer, id } = await syncedSource();
+    const mapping = await createMapping(author, id, CUSTOMERS);
+    let publishing!: Promise<unknown>;
+    await getDb().transaction(async tx => {
+      await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mapping.id)).for('update');
+      publishing = publishMapping(reviewer, mapping.id, 1).then(() => null, (e: unknown) => e);
+      // 等发布阻塞在映射行的锁上，再像丢弃草稿那样删掉草稿
+      for (let i = 0; i < 100; i++) {
+        const { rows } = await getDb().execute<{ n: number }>(sql`SELECT count(*)::int AS n FROM pg_locks WHERE NOT granted`);
+        if (rows[0].n > 0) break;
+        await new Promise(r => setTimeout(r, 50));
+      }
+      await tx.delete(mappingVersions).where(eq(mappingVersions.mappingId, mapping.id));
+    });
+    // 提交后发布才拿到锁
+    const error = await publishing;
+    expect(error).toBeInstanceOf(MappingError);
+    expect((error as MappingError).message).toMatch(/请刷新/);
   });
 
   it('已被已发布映射引用的表不能移出同步范围；映射引用的字段在源表里没有时不能保存；扩展字段不能换类型', async () => {

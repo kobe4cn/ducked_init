@@ -203,9 +203,10 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
   return getDb().transaction(async tx => {
     // 锁住映射行：与保存草稿互斥，发布的正是检查过的那份草稿
     await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
+    // 等锁期间草稿可能已被丢弃
     const [current] = await tx.select().from(mappingVersions).where(eq(mappingVersions.id, draft.id));
-    if (current.status !== 'draft' || current.updatedAt.getTime() !== draft.updatedAt.getTime()) {
-      throw new MappingError('草稿在你发布前被修改或已发布，请刷新后重新检查');
+    if (!current || current.status !== 'draft' || current.updatedAt.getTime() !== draft.updatedAt.getTime()) {
+      throw new MappingError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
     }
     await assertExtensionTypes(tx, actor.tenant.id, plan);
     await tx.update(mappingVersions)
