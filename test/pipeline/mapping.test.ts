@@ -426,6 +426,31 @@ describe('发布映射并合并到标准层', () => {
     });
   });
 
+  it('增量合并只统计本次变更的记录落入兜底的取值；没有新批次时不带统计', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const mapping = await publish(author, reviewer, id, ORDER_LOG_MAPPING
+      .replace(', 已退款: refunded', '')
+      .replace('    expr: trim(status)\n', '    expr: trim(status)\n    otherwise: null\n'));
+
+    // 新增的两种取值：已关闭是两行完全相同的重复行；之前落入兜底的已退款没有变化，不再计入
+    await grantOnSource(`INSERT INTO shop.order_log VALUES
+      ('A3', '已关闭', 100, '2024-06-04 10:00'), ('A3', '已关闭', 100, '2024-06-04 10:00'), ('A4', '待审核', 200, '2024-06-05 10:00');`);
+    await syncSource(author, id);
+    await drain();
+    const incremental = (await getMapping(author, mapping)).merge.history[0];
+    expect(incremental).toMatchObject({ mode: 'incremental' });
+    expect(incremental).toHaveProperty('fallback', [
+      { column: 'status', values: [{ value: '已关闭', rows: 2 }, { value: '待审核', rows: 1 }], distinct: 2, rows: 3 },
+    ]);
+    expect((await silver(acme, 'order', 'order_id')).map(o => [o.order_id, o.status])).toEqual([['A1', null], ['A2', 'paid'], ['A3', null], ['A4', null]]);
+
+    await mergeNow(author);
+    await drain();
+    const idle = (await getMapping(author, mapping)).merge.history[0];
+    expect(idle).toMatchObject({ mode: 'incremental', batchFrom: (incremental as { batchTo: number }).batchTo });
+    expect(idle).not.toHaveProperty('fallback');
+  });
+
   it('草稿作者不能自己发布；发布后版本锁定，再改是新的一版草稿，发布新版本后按新版本重建', async () => {
     const { acme, author, reviewer, id } = await syncedSource();
     const mapping = await createMapping(author, id, CUSTOMERS);
