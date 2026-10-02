@@ -44,11 +44,12 @@ describe('标准模型', () => {
     await memberOf(tenantId, 'viewer@acme.com', 'viewer');
     const viewer = await loginAs(app, 'viewer@acme.com');
     const html = await (await viewer.get('/model')).text();
-    expect(html).toContain('标准模型 v1.2');
-    for (const entity of ['customer', 'order', 'order_item', 'product', 'event', 'touch', 'membership', 'points_transaction', 'consent', 'preference']) expect(html).toContain(`data-entity="${entity}"`);
+    expect(html).toContain('标准模型 v1.3');
+    for (const entity of ['customer', 'order', 'order_item', 'product', 'event', 'touch', 'membership', 'points_transaction', 'consent', 'preference', 'coupon', 'coupon_template']) expect(html).toContain(`data-entity="${entity}"`);
     expect(html).toContain('标准枚举：created、paid、shipped、completed、cancelled、refunded');
     expect(html).toContain('标准枚举：earn、spend、redeem、expire、adjust');
     expect(html).toContain('标准枚举：granted、revoked');
+    expect(html).toContain('标准枚举：issued、redeemed、expired、voided');
     expect(html).toContain('data-function="from_timezone"');
     expect(await (await viewer.get('/')).text()).toContain('href="/model"');
     // 查看者看不到映射

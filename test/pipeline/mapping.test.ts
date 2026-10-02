@@ -73,13 +73,33 @@ const PREFERENCES = `
     (1, 'category', '护肤', '2024-06-01 10:00'), (1, 'category', '彩妆', '2024-06-01 10:00'), (2, 'brand', '自有品牌', '2024-06-02 10:00');
   GRANT SELECT ON shop.preferences TO ${READER.user};`;
 
+/** 券模板：字符串主键，券类型是中文，面额与门槛以分为单位，不适用的为空 */
+const COUPON_TEMPLATES = `
+  CREATE TABLE shop.coupon_templates (template_id text PRIMARY KEY, title text NOT NULL, coupon_type text NOT NULL,
+    face_value_fen int, pay_rate numeric(5, 2), threshold_fen int);
+  INSERT INTO shop.coupon_templates VALUES
+    ('TPL01', '满100减20', '满减', 2000, NULL, 10000), ('TPL02', '87.5折券', '折扣', NULL, 87.5, NULL), ('TPL03', '免运费券', '免运费', NULL, NULL, NULL);
+  GRANT SELECT ON shop.coupon_templates TO ${READER.user};`;
+
+/** 优惠券：券码作主键，状态是中文，只有已使用的有核销时间、核销订单与抵扣金额（以分为单位） */
+const COUPONS = `
+  CREATE TABLE shop.coupons (coupon_code text PRIMARY KEY, template_id text NOT NULL, activity_id text, user_id int NOT NULL,
+    status text NOT NULL, receive_time timestamp NOT NULL, use_time timestamp, order_no text, discount_fen int,
+    expire_time timestamp NOT NULL, update_time timestamp NOT NULL);
+  INSERT INTO shop.coupons VALUES
+    ('CP01', 'TPL01', 'ACT1', 1, '已使用', '2024-06-01 10:00', '2024-06-03 10:00', 'NO1', 2000, '2024-07-01 10:00', '2024-06-03 10:00'),
+    ('CP02', 'TPL02', NULL, 1, '未使用', '2024-06-02 10:00', NULL, NULL, NULL, '2024-07-02 10:00', '2024-06-02 10:00'),
+    ('CP03', 'TPL03', 'ACT1', 2, '已过期', '2024-06-01 10:00', NULL, NULL, NULL, '2024-07-01 10:00', '2024-07-01 10:00'),
+    ('CP04', 'TPL01', NULL, 2, '已作废', '2024-06-01 10:00', NULL, NULL, NULL, '2024-07-01 10:00', '2024-06-05 10:00');
+  GRANT SELECT ON shop.coupons TO ${READER.user};`;
+
 /** 两位数据工程师：一位起草、一位发布。登记数据源、选入全部表、确认水位线并同步一次 */
 async function syncedSource() {
   const acme = await newTenant('acme');
   const author = await memberOf(acme, 'de@acme.com');
   const reviewer = await memberOf(acme, 'de2@acme.com');
   const input = await pgSourceInput(READER);
-  await grantOnSource(ORDER_LOG + POINT_LOGS + CONSENTS + PREFERENCES);
+  await grantOnSource(ORDER_LOG + POINT_LOGS + CONSENTS + PREFERENCES + COUPON_TEMPLATES + COUPONS);
   const { id } = await registerSource(author, input);
   await selectAllTables(author, id);
   await drain();
@@ -89,6 +109,7 @@ async function syncedSource() {
   await confirmWatermark(author, id, 'point_logs', 'id');
   await confirmWatermark(author, id, 'consents', 'update_time');
   await confirmWatermark(author, id, 'preferences', 'updated_at');
+  await confirmWatermark(author, id, 'coupons', 'update_time');
   await syncSource(author, id);
   await drain();
   return { acme, author, reviewer, id };
@@ -177,6 +198,39 @@ fields:
   updated_at: from_timezone(updated_at, 'Asia/Shanghai')
 `;
 
+const COUPON_TEMPLATES_MAPPING = `model: 1
+entity: coupon_template
+table: coupon_templates
+fields:
+  coupon_template_id: template_id
+  name: title
+  coupon_type:
+    expr: coupon_type
+    dictionary: { 满减: cash, 折扣: discount, 免运费: shipping }
+  face_value: face_value_fen / 100
+  pay_percent: pay_rate
+  min_spend: threshold_fen / 100
+`;
+
+const COUPONS_MAPPING = `model: 1
+entity: coupon
+table: coupons
+fields:
+  coupon_id: coupon_code
+  coupon_template_id: template_id
+  campaign_id: activity_id
+  customer_id: string(user_id)
+  status:
+    expr: status
+    dictionary: { 已使用: redeemed, 未使用: issued, 已过期: expired, 已作废: voided }
+  issued_at: from_timezone(receive_time, 'Asia/Shanghai')
+  redeemed_at: from_timezone(use_time, 'Asia/Shanghai')
+  order_id: order_no
+  discount_amount: discount_fen / 100
+  expires_at: from_timezone(expire_time, 'Asia/Shanghai')
+  updated_at: from_timezone(update_time, 'Asia/Shanghai')
+`;
+
 /** 起草并由另一位成员发布，让调度器跑完合并 */
 async function publish(author: Awaited<ReturnType<typeof memberOf>>, reviewer: typeof author, sourceId: string, yaml: string) {
   const mapping = await createMapping(author, sourceId, yaml);
@@ -257,6 +311,35 @@ describe('发布映射并合并到标准层', () => {
     expect(preferences.map(r => [r.customer_id, r.preference_type, r.preference_value])).toEqual([
       ['1', 'category', '彩妆'], ['1', 'category', '护肤'], ['2', 'brand', '自有品牌'],
     ]);
+  });
+
+  it('券模板：券类型按值字典对应，面额与门槛从分换成元，不适用的为空', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, COUPON_TEMPLATES_MAPPING);
+    const templates = await silver(acme, 'coupon_template', 'coupon_template_id');
+    expect(templates.map(r => [r.coupon_template_id, r.name, r.coupon_type, r.face_value, r.pay_percent, r.min_spend])).toEqual([
+      ['TPL01', '满100减20', 'cash', '20.00', null, '100.00'],
+      ['TPL02', '87.5折券', 'discount', null, '87.50', null],
+      ['TPL03', '免运费券', 'shipping', null, null, null],
+    ]);
+  });
+
+  it('优惠券：券状态按值字典对应，只有已核销的有核销时间、核销订单与抵扣金额', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, COUPONS_MAPPING);
+    const coupons = await silver(acme, 'coupon', 'coupon_id');
+    expect(coupons.map(r => [r.coupon_id, r.coupon_template_id, r.campaign_id, r.customer_id, r.status])).toEqual([
+      ['CP01', 'TPL01', 'ACT1', '1', 'redeemed'],
+      ['CP02', 'TPL02', null, '1', 'issued'],
+      ['CP03', 'TPL03', 'ACT1', '2', 'expired'],
+      ['CP04', 'TPL01', null, '2', 'voided'],
+    ]);
+    // 源端是北京时间
+    expect(coupons[0]).toMatchObject({
+      issued_at: '2024-06-01 02:00:00+00', redeemed_at: '2024-06-03 02:00:00+00', order_id: 'NO1', discount_amount: '20.00',
+      expires_at: '2024-07-01 02:00:00+00', updated_at: '2024-06-03 02:00:00+00', _source: id,
+    });
+    expect(coupons[1]).toMatchObject({ redeemed_at: null, order_id: null, discount_amount: null });
   });
 
   it('同步后的合并把源端的新增、更新与删除带进标准层；没有新批次时合并不改动', async () => {

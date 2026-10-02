@@ -1,7 +1,7 @@
 // app/lib/canonical-model.ts —— 平台内置的标准模型（Canonical Model）：一组标准实体及其字段，所有指标与标签只基于它定义。
 // 同一大版本内只做新增（新增实体、字段、标准枚举取值），不改名、不改语义、不改类型、不改已有实体的主键；每次新增小版本加一（ADR-0018）。
 // 映射里的 model 写的是大版本号。前后端共用（标准模型页要展示实体与字段说明）
-export const MODEL_VERSION = '1.2';
+export const MODEL_VERSION = '1.3';
 export const MODEL_MAJOR = 1;
 
 /** 字段类型：标准层里的列类型由它决定（时间一律是带时区的时间，按 UTC 存放；金额是两位小数的元） */
@@ -188,6 +188,39 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
       f('preference_type', 'string', '偏好类型', '如 category（品类）、brand（品牌）、flavor（口味）、size（尺码）'),
       f('preference_value', 'string', '偏好值', '偏好的取值（如某个品类名、品牌名）'),
       f('updated_at', 'timestamp', '更新时间', '源端最后一次修改这条记录的时间'),
+    ],
+  },
+  {
+    name: 'coupon',
+    label: '优惠券',
+    description: '发给消费者的一张券（发放、核销、过期、作废）。面额、类型等券的定义在券模板里，券上只留这张券自己的事实。金额以元计。',
+    key: ['coupon_id'],
+    fields: [
+      f('coupon_id', 'string', '券 ID', '源端的券实例标识或券码'),
+      f('coupon_template_id', 'string', '券模板 ID', '这张券的模板，对应券模板的 coupon_template_id'),
+      f('campaign_id', 'string', '活动 ID', '发券的营销活动，与营销触达的 campaign_id 同义'),
+      f('customer_id', 'string', '消费者 ID', '领到这张券的消费者'),
+      f('status', 'string', '券状态', '已发放（未使用）、已核销、已过期、已作废', { enum: ['issued', 'redeemed', 'expired', 'voided'] }),
+      f('issued_at', 'timestamp', '发放时间', '券发到消费者手里的时间'),
+      f('redeemed_at', 'timestamp', '核销时间', '券被使用的时间，未核销为空'),
+      f('order_id', 'string', '核销订单', '使用这张券的订单，对应订单的 order_id'),
+      f('discount_amount', 'decimal', '抵扣金额', '核销时实际抵扣的金额（元），未核销为空'),
+      f('expires_at', 'timestamp', '到期时间', '这张券的到期时间'),
+      f('updated_at', 'timestamp', '更新时间', '源端最后一次修改这条记录的时间'),
+    ],
+  },
+  {
+    name: 'coupon_template',
+    label: '券模板',
+    description: '券的定义（券批次）：类型、面额或折扣、使用门槛。金额以元计。',
+    key: ['coupon_template_id'],
+    fields: [
+      f('coupon_template_id', 'string', '券模板 ID', '源端的券模板或券批次标识'),
+      f('name', 'string', '券名称', '券的名称'),
+      f('coupon_type', 'string', '券类型', '代金（含满减）、折扣、赠品（含兑换）、免运费、其他', { enum: ['cash', 'discount', 'gift', 'shipping', 'other'] }),
+      f('face_value', 'decimal', '面额', '代金券、满减券的面额（元），其他类型为空'),
+      f('pay_percent', 'decimal', '应付比例', '折扣券打折后应付的百分比（85 折写 85、87.5 折写 87.5），其他类型为空'),
+      f('min_spend', 'decimal', '使用门槛', '满多少元可用（元），无门槛为空'),
     ],
   },
 ];

@@ -204,7 +204,7 @@ container run -d --name mysql -c 4 -m 4g -p 3306:3306 -v mysql-data:/var/lib/mys
 container exec -i mysql mysql -uroot -pcrm --default-character-set=utf8mb4 < db_script/mysql_seed.sql   # 开发用电商库 crm_source，只读账号 crm_reader / reader-secret
 ```
 
-`crm_source` 有消费者、商品、订单、订单明细、行为事件、会员、积分流水、营销同意与兴趣偏好九张表，保留了映射要处理的源端特点（中文状态、北京时间、以分计价、Unix 毫秒、无主键的重复行），见脚本开头的说明。
+`crm_source` 有消费者、商品、订单、订单明细、行为事件、会员、积分流水、营销同意、兴趣偏好、券模板与优惠券十一张表，保留了映射要处理的源端特点（中文状态、北京时间、以分计价、Unix 毫秒、无主键的重复行），见脚本开头的说明。
 
 不想用对象存储时，把 `.env` 里的 `LAKE_URI` 改成本地目录（如 `./data/lake`），其他代码不用改。
 

@@ -126,6 +126,27 @@ const COLUMN_SYNONYMS: Record<string, Record<string, readonly string[]>> = {
     preference_value: ['pref_value', 'interest_value', 'pref', 'interest', 'preference', 'value'],
     updated_at: COMMON.updated_at,
   },
+  coupon: {
+    coupon_id: ['id', 'coupon_code', 'code', 'coupon_no', 'coupon_sn', 'user_coupon_id'],
+    coupon_template_id: ['template_id', 'tpl_id', 'coupon_tpl_id', 'batch_id', 'batch_no', 'coupon_batch_id', 'stock_id'],
+    campaign_id: ['activity_id', 'campaign', 'plan_id', 'act_id', 'promotion_id'],
+    customer_id: COMMON.customer_id,
+    status: ['coupon_status', 'use_status', 'state'],
+    issued_at: ['issue_time', 'issued_time', 'receive_time', 'received_at', 'get_time', 'grant_time', 'send_time', ...COMMON.created_at, 'created_at'],
+    redeemed_at: ['redeem_time', 'redeemed_time', 'use_time', 'used_time', 'used_at', 'verify_time', 'verified_at', 'write_off_time', 'consume_time'],
+    order_id: [...COMMON.order_id, 'use_order_id', 'use_order_no', 'used_order_id', 'redeem_order_id'],
+    discount_amount: ['discount', 'deduct_amount', 'deduction', 'discount_value', 'coupon_discount', 'off_amount', 'used_amount'],
+    expires_at: ['expire_time', 'expired_at', 'expire_at', 'expiry_time', 'expiry_date', 'expire_date', 'valid_until', 'valid_end', 'end_time'],
+    updated_at: COMMON.updated_at,
+  },
+  coupon_template: {
+    coupon_template_id: ['id', 'template_id', 'tpl_id', 'coupon_tpl_id', 'batch_id', 'batch_no', 'coupon_batch_id', 'stock_id'],
+    name: ['coupon_name', 'template_name', 'title', 'batch_name'],
+    coupon_type: ['type', 'template_type', 'coupon_kind', 'kind'],
+    face_value: ['denomination', 'par_value', 'face_amount', 'coupon_amount', 'reduce_amount', 'value', 'amount'],
+    pay_percent: ['pay_rate', 'pay_ratio', 'payable_percent', 'payable_rate'],
+    min_spend: ['threshold', 'min_amount', 'min_consume', 'min_order_amount', 'use_threshold', 'condition_amount', 'full_amount'],
+  },
 };
 
 /** 标准枚举的取值近义词（比较时忽略大小写与首尾空白）：标准值本身不用列出 */
@@ -179,6 +200,23 @@ const VALUE_SYNONYMS: Record<string, Record<string, Record<string, readonly stri
     status: {
       granted: ['同意', '已同意', '订阅', '已订阅', '授权', '已授权', '允许', '接受', 'y', 'yes', 'true', 'opt_in', 'optin', 'subscribed', 'agree', 'agreed', 'accepted', 'allow'],
       revoked: ['撤回', '已撤回', '拒绝', '已拒绝', '不同意', '退订', '已退订', '取消订阅', '取消授权', 'n', 'no', 'false', 'opt_out', 'optout', 'unsubscribed', 'withdrawn', 'declined', 'refused', 'rejected', 'deny'],
+    },
+  },
+  coupon: {
+    status: {
+      issued: ['未使用', '待使用', '可使用', '可用', '已发放', '已领取', '未核销', 'unused', 'available', 'received', 'active', 'valid'],
+      redeemed: ['已使用', '已核销', '使用', '核销', 'used', 'redeem', 'consumed', 'verified', 'written_off'],
+      expired: ['已过期', '过期', '已失效', '失效', 'expire', 'overdue'],
+      voided: ['已作废', '作废', '已撤销', '撤销', '已回收', '回收', 'void', 'invalid', 'revoked', 'cancelled', 'canceled', 'disabled'],
+    },
+  },
+  coupon_template: {
+    coupon_type: {
+      cash: ['代金', '代金券', '满减', '满减券', '现金券', '立减', '立减券', 'voucher', 'cash_coupon', 'reduce', 'full_reduction'],
+      discount: ['折扣', '折扣券', '打折', '打折券', 'discount_coupon', 'percent_off'],
+      gift: ['赠品', '赠品券', '兑换', '兑换券', '礼品券', 'gift_coupon', 'exchange'],
+      shipping: ['免运费', '免运费券', '运费券', '包邮', '包邮券', '免邮', 'free_shipping', 'freight'],
+      other: ['其他', '其它'],
     },
   },
 };

@@ -12,6 +12,8 @@
 --   - point_logs：自增主键，变动类型是中文（值字典），积分带正负，会员号列叫 member_no，只有获得与消费有关联订单、只有获得有到期时间
 --   - consents：复合主键 (customer_id, channel)，渠道是中文、同意状态是 Y / N（值字典），一开始就拒绝的没有同意时间，没撤回过的没有撤回时间
 --   - preferences：自增主键与兴趣偏好的主键对不上（草稿按 消费者 + 偏好类型 + 偏好值 去重），同一消费者同一类型下有多个值
+--   - coupon_templates：字符串主键，券类型是中文（值字典），面额与门槛以分为单位（/ 100），折扣券记应付比例（85 即 85 折），不适用的为空，没有水位线列
+--   - coupons：券码作主键，消费者列叫 user_id、模板列叫 template_id，状态是中文（值字典），约 1/4 没有活动，只有已使用的有核销时间、核销订单与抵扣金额（以分为单位）
 DROP DATABASE IF EXISTS crm_source;
 CREATE DATABASE crm_source DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE crm_source;
@@ -196,6 +198,56 @@ SELECT i, ELT(1 + i % 3, 'category', 'brand', 'flavor'),
        TIMESTAMP '2024-03-01 08:00:00' + INTERVAL i HOUR
 FROM s, n
 ORDER BY i, j;
+
+CREATE TABLE coupon_templates (
+  template_id VARCHAR(8) PRIMARY KEY,
+  title VARCHAR(32) NOT NULL,
+  coupon_type VARCHAR(8) NOT NULL,
+  face_value_fen INT COMMENT '满减券的面额（分）',
+  pay_rate DECIMAL(5, 2) COMMENT '折扣券的应付比例，85 即 85 折',
+  threshold_fen INT COMMENT '使用门槛（分），无门槛为空'
+);
+INSERT INTO coupon_templates VALUES
+  ('TPL01', '新人满100减20', '满减', 2000, NULL, 10000),
+  ('TPL02', '满300减50', '满减', 5000, NULL, 30000),
+  ('TPL03', '无门槛10元券', '满减', 1000, NULL, NULL),
+  ('TPL04', '85折券', '折扣', NULL, 85.00, NULL),
+  ('TPL05', '会员87.5折券', '折扣', NULL, 87.50, 20000),
+  ('TPL06', '生日赠品券', '赠品', NULL, NULL, NULL),
+  ('TPL07', '免运费券', '免运费', NULL, NULL, NULL);
+
+CREATE TABLE coupons (
+  coupon_code VARCHAR(16) PRIMARY KEY,
+  template_id VARCHAR(8) NOT NULL,
+  activity_id VARCHAR(16),
+  user_id BIGINT NOT NULL,
+  status VARCHAR(8) NOT NULL,
+  receive_time DATETIME NOT NULL COMMENT '北京时间',
+  use_time DATETIME,
+  order_no VARCHAR(32),
+  discount_fen INT COMMENT '核销时实际抵扣（分）',
+  expire_time DATETIME NOT NULL,
+  update_time DATETIME NOT NULL
+);
+-- 3000 张券轮转七个模板，有效期 30 天；4/10 已使用、3/10 未使用、2/10 已过期、1/10 已作废
+INSERT INTO coupons
+WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 3000),
+t AS (
+  SELECT i, CONCAT('TPL0', 1 + i % 7) AS tpl, i * 3 % 10 AS r, i * 3 % 10 < 4 AS used,
+         TIMESTAMP '2024-01-01 10:00:00' + INTERVAL i * 157 MINUTE AS issued,
+         TIMESTAMP '2024-01-01 10:00:00' + INTERVAL i * 157 MINUTE + INTERVAL 1 + i % 20 DAY AS used_at
+  FROM s
+)
+SELECT CONCAT('CP', LPAD(t.i, 8, '0')), t.tpl, IF(t.i % 4 = 0, NULL, CONCAT('ACT', 2024001 + t.i % 12)), 1 + (t.i * 7919) % 1000,
+       CASE WHEN t.used THEN '已使用' WHEN t.r < 7 THEN '未使用' WHEN t.r < 9 THEN '已过期' ELSE '已作废' END,
+       t.issued,
+       IF(t.used, t.used_at, NULL),
+       IF(t.used, CONCAT('NO', 20240000000 + 1 + t.i * 13 % 5000), NULL),
+       IF(t.used, COALESCE(tp.face_value_fen, CASE tp.coupon_type WHEN '折扣' THEN 1000 + t.i % 30 * 100 WHEN '赠品' THEN 3900 ELSE 800 END), NULL),
+       t.issued + INTERVAL 30 DAY,
+       CASE WHEN t.used THEN t.used_at WHEN t.r < 7 THEN t.issued WHEN t.r < 9 THEN t.issued + INTERVAL 30 DAY ELSE t.issued + INTERVAL 3 DAY END
+FROM t JOIN coupon_templates tp ON tp.template_id = t.tpl
+ORDER BY t.i;
 
 DROP USER IF EXISTS 'crm_reader'@'%';
 CREATE USER 'crm_reader'@'%' IDENTIFIED BY 'reader-secret';

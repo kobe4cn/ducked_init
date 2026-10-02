@@ -1,5 +1,5 @@
 // 按规则生成映射草稿（纯函数）：源表的列统计 + 目标实体 → 映射 YAML。列名规范化与同义词匹配、格式特征校验、分 / 毫秒 / 无时区时间的转换、
-// 值字典骨架、没有主键的表；生成的草稿交给 checkMapping 校验。六张表贴合开发库 crm_source（db_script/mysql_seed.sql）的列统计
+// 值字典骨架、没有主键的表；生成的草稿交给 checkMapping 校验。八张表贴合开发库 crm_source（db_script/mysql_seed.sql）的列统计
 import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
@@ -73,6 +73,29 @@ const PREFERENCES = table('preferences', [
   column('updated_at', 'TIMESTAMP', { min: '2024-03-01 09:00:00', max: '2024-04-12 00:00:00' }),
 ], ['id']);
 
+const COUPON_TEMPLATES = table('coupon_templates', [
+  column('template_id', 'VARCHAR', { distinct: 7, formats: [] }),
+  column('title', 'VARCHAR', { distinct: 7, formats: [] }),
+  column('coupon_type', 'VARCHAR', { distinct: 4, top: top('满减', '折扣', '赠品', '免运费') }),
+  column('face_value_fen', 'INTEGER', { nullRate: 0.57, min: '1000', max: '5000' }),
+  column('pay_rate', 'DECIMAL(5,2)', { nullRate: 0.71, min: '85.00', max: '87.50' }),
+  column('threshold_fen', 'INTEGER', { nullRate: 0.57, min: '10000', max: '30000' }),
+], ['template_id']);
+
+const COUPONS = table('coupons', [
+  column('coupon_code', 'VARCHAR', { distinct: 3000, length: { min: 10, max: 10 }, formats: [] }),
+  column('template_id', 'VARCHAR', { distinct: 7, top: top('TPL01', 'TPL02', 'TPL03', 'TPL04', 'TPL05', 'TPL06', 'TPL07') }),
+  column('activity_id', 'VARCHAR', { nullRate: 0.25, distinct: 12, formats: [] }),
+  column('user_id', 'BIGINT', { min: '1', max: '1000' }),
+  column('status', 'VARCHAR', { distinct: 4, top: top('已使用', '未使用', '已过期', '已作废') }),
+  column('receive_time', 'TIMESTAMP', { min: '2024-01-01 12:37:00', max: '2024-11-25 03:00:00' }),
+  column('use_time', 'TIMESTAMP', { nullRate: 0.6, min: '2024-01-04 12:37:00', max: '2024-11-29 03:00:00' }),
+  column('order_no', 'VARCHAR', { nullRate: 0.6, length: { min: 13, max: 13 }, formats: [] }),
+  column('discount_fen', 'INTEGER', { nullRate: 0.6, min: '800', max: '5000' }),
+  column('expire_time', 'TIMESTAMP', { min: '2024-01-31 12:37:00', max: '2024-12-25 03:00:00' }),
+  column('update_time', 'TIMESTAMP', { min: '2024-01-01 12:37:00', max: '2024-12-25 03:00:00' }),
+], ['coupon_code']);
+
 const columnsOf = (...tables: TableProfile[]) => (name: string) =>
   tables.find(t => t.name === name)?.columns.map(c => c.name) ?? `数据源中没有表 ${name}`;
 
@@ -106,8 +129,8 @@ describe('列名规范化与同义词', () => {
   });
 });
 
-describe('开发库六张表生成的草稿', () => {
-  const columns = columnsOf(ORDERS, CUSTOMERS, EVENTS, POINT_LOGS, CONSENTS, PREFERENCES);
+describe('开发库八张表生成的草稿', () => {
+  const columns = columnsOf(ORDERS, CUSTOMERS, EVENTS, POINT_LOGS, CONSENTS, PREFERENCES, COUPON_TEMPLATES, COUPONS);
 
   it('orders：直接通过保存校验，同义词与转换写在行尾注释里', () => {
     const yaml = draft(ORDERS, 'order');
@@ -195,6 +218,39 @@ describe('开发库六张表生成的草稿', () => {
       updated_at: "from_timezone(updated_at, 'Asia/Shanghai')",
     });
     expect(yaml).toContain('按 customer_id + preference_type + preference_value 去重，请确认它唯一');
+  });
+
+  it('coupon_templates：券类型预填值字典，面额与门槛以分为单位除以 100，直接通过保存校验', () => {
+    const yaml = draft(COUPON_TEMPLATES, 'coupon_template');
+    expect(checkMapping(yaml, columns)).toMatchObject({ ok: true, plan: { key: ['coupon_template_id'] } });
+    expect(fields(yaml)).toEqual({
+      coupon_template_id: 'template_id',
+      name: 'title',
+      coupon_type: { expr: 'coupon_type', dictionary: { 满减: 'cash', 折扣: 'discount', 赠品: 'gift', 免运费: 'shipping' } },
+      face_value: 'face_value_fen / 100',
+      pay_percent: 'pay_rate',
+      min_spend: 'threshold_fen / 100',
+    });
+    expect(yaml).not.toContain('源表里没用到的列');
+  });
+
+  it('coupons：券码作主键，中文券状态预填值字典，抵扣金额以分为单位，直接通过保存校验', () => {
+    const yaml = draft(COUPONS, 'coupon');
+    expect(checkMapping(yaml, columns)).toMatchObject({ ok: true, plan: { key: ['coupon_id'] } });
+    expect(fields(yaml)).toEqual({
+      coupon_id: 'coupon_code',
+      coupon_template_id: 'template_id',
+      campaign_id: 'activity_id',
+      customer_id: 'string(user_id)',
+      status: { expr: 'status', dictionary: { 已使用: 'redeemed', 未使用: 'issued', 已过期: 'expired', 已作废: 'voided' } },
+      issued_at: "from_timezone(receive_time, 'Asia/Shanghai')",
+      redeemed_at: "from_timezone(use_time, 'Asia/Shanghai')",
+      order_id: 'order_no',
+      discount_amount: 'discount_fen / 100',
+      expires_at: "from_timezone(expire_time, 'Asia/Shanghai')",
+      updated_at: "from_timezone(update_time, 'Asia/Shanghai')",
+    });
+    expect(lineOf(yaml, 'coupon_id')).toContain('源表主键');
   });
 });
 
