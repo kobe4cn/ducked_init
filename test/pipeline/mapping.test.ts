@@ -413,7 +413,7 @@ describe('发布映射并合并到标准层', () => {
     const { acme, author, reviewer, id } = await syncedSource();
     const mapping = await createMapping(author, id, CUSTOMERS);
     await expect(publishMapping(author, mapping.id, 1)).rejects.toMatchObject({ status: 403, message: expect.stringContaining('另一位') });
-    // 改过草稿的成员都算作者
+    // 最后保存草稿的成员不能发布
     await saveDraft(reviewer, mapping.id, CUSTOMERS.replace('city: city', 'city: upper(city)'));
     await expect(publishMapping(reviewer, mapping.id, 1)).rejects.toBeInstanceOf(MappingError);
     const third = await memberOf(acme, 'admin@acme.com', 'admin');
@@ -432,6 +432,18 @@ describe('发布映射并合并到标准层', () => {
     await drain();
     expect((await silver(acme, 'customer', 'customer_id::INT'))[0]).toMatchObject({ city: '上海市', _version: 2 });
     expect((await getMapping(author, mapping.id)).merge.history[0]).toMatchObject({ mode: 'rebuild', version: 2, rows: 40 });
+  });
+
+  it('发布者不能是最后保存草稿的人：A 起草、B 修改后 A 能发布，作者仍记下两人', async () => {
+    const { author, reviewer, id } = await syncedSource();
+    const mapping = await createMapping(author, id, CUSTOMERS);
+    await saveDraft(reviewer, mapping.id, CUSTOMERS.replace('city: city', 'city: upper(city)'));
+    // A 再保存后作者顺序不变，最后保存的人换回 A
+    await saveDraft(author, mapping.id, CUSTOMERS.replace('city: city', 'city: lower(city)'));
+    await expect(publishMapping(author, mapping.id, 1)).rejects.toMatchObject({ status: 403 });
+    await saveDraft(reviewer, mapping.id, CUSTOMERS.replace('city: city', 'city: upper(city)'));
+    await publishMapping(author, mapping.id, 1);
+    expect((await getMapping(author, mapping.id)).versions[0]).toMatchObject({ status: 'published', authors: [author.email, reviewer.email], lastEditor: reviewer.email });
   });
 
   it('已被已发布映射引用的表不能移出同步范围；映射引用的字段在源表里没有时不能保存；扩展字段不能换类型', async () => {

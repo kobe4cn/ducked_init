@@ -1,12 +1,12 @@
-// app/.server/mappings.ts —— 映射：数据工程师用 YAML 编写“源表 → 标准实体”的映射，校验通过才能保存为草稿；草稿由另一位有发布权限的成员发布，
-// 发布后版本锁定（再改是新的一版草稿）。发布后入队合并任务（silver.merge），同步之后也会再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
+// app/.server/mappings.ts —— 映射：数据工程师用 YAML 编写“源表 → 标准实体”的映射，校验通过才能保存为草稿；草稿由最后保存它的人以外的
+// 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后入队合并任务（silver.merge），同步之后也会再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
 // 一律限定在操作者所属租户内；合并本身在工作进程里进行（pipeline/merge-engine.ts）
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
-import { assertCan } from './access';
+import { assertCan, can } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
-import { mappings, mappingVersions, sources, tasks, tenants, type TaskStatus } from './db/schema';
+import { mappings, mappingVersions, members, ROLES, sources, tasks, tenants, type TaskStatus } from './db/schema';
 import type { MergeMappingParam, MergeRecord } from './pipeline/merge-engine';
 import { draftMapping } from './pipeline/mapping-draft';
 import { checkMapping, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
@@ -110,7 +110,7 @@ export async function createMapping(actor: CurrentMember, sourceId: string, yaml
       const [mapping] = await tx.insert(mappings).values({
         tenantId: actor.tenant.id, spaceId: actor.space.id, sourceId, tableName: plan.table, entity: plan.entity,
       }).returning();
-      await tx.insert(mappingVersions).values({ mappingId: mapping.id, version: 1, yaml, plan, authors: [actor.email] });
+      await tx.insert(mappingVersions).values({ mappingId: mapping.id, version: 1, yaml, plan, authors: [actor.email], lastEditor: actor.email });
       await recordAudit(tx, {
         tenantId: actor.tenant.id,
         actor,
@@ -128,7 +128,7 @@ export async function createMapping(actor: CurrentMember, sourceId: string, yaml
 }
 
 /**
- * 保存草稿：已有草稿时改它（记下又一位作者），否则在最新版本之上新建一版草稿（已发布的版本不变）。
+ * 保存草稿：已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
  * 表与实体在第一版就定下了，换表或换实体请新建映射
  */
 export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: string) {
@@ -139,15 +139,17 @@ export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: s
     throw new MappingError(`这个映射是 ${mapping.tableName} → ${mapping.entity}，不能改表或实体；请新建映射`);
   }
   return getDb().transaction(async tx => {
-    await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
+    // 锁住映射行；等锁期间映射可能因丢弃草稿被删除
+    const [locked] = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
+    if (!locked) throw new MappingError('映射不存在', 404);
     const [latest] = await tx.select().from(mappingVersions).where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version)).limit(1);
     if (latest?.status === 'draft') {
       const authors = latest.authors.includes(actor.email) ? latest.authors : [...latest.authors, actor.email];
-      await tx.update(mappingVersions).set({ yaml, plan, authors, updatedAt: new Date() }).where(eq(mappingVersions.id, latest.id));
+      await tx.update(mappingVersions).set({ yaml, plan, authors, lastEditor: actor.email, updatedAt: new Date() }).where(eq(mappingVersions.id, latest.id));
       return latest.version;
     }
     const version = (latest?.version ?? 0) + 1;
-    await tx.insert(mappingVersions).values({ mappingId, version, yaml, plan, authors: [actor.email] });
+    await tx.insert(mappingVersions).values({ mappingId, version, yaml, plan, authors: [actor.email], lastEditor: actor.email });
     const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
@@ -161,10 +163,13 @@ export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: s
   });
 }
 
-/** 有发布权限的成员发布不了某一版的原因（不是草稿、是这一版的作者）；可以发布时为 null。发布权限由调用方另行检查 */
-export function publishBlocker(actor: CurrentMember, version: { status: string; authors: string[] }) {
+/**
+ * 有发布权限的成员发布不了某一版的原因（不是草稿、最后保存这一版草稿的是自己）；可以发布时为 null。发布权限由调用方另行检查。
+ * 每一处改动都要由另一个人看过才能发布：最后保存的人之前的改动，最后保存的人保存时已经看过
+ */
+export function publishBlocker(actor: CurrentMember, version: { status: string; lastEditor: string }) {
   if (version.status !== 'draft') return '已发布的版本已锁定';
-  if (version.authors.includes(actor.email)) return '你改过这一版草稿，需由另一位数据工程师或管理员发布';
+  if (version.lastEditor === actor.email) return '你最后改了这一版草稿，需由另一位数据工程师或管理员发布';
   return null;
 }
 
@@ -183,7 +188,7 @@ async function assertExtensionTypes(tx: Tx, tenantId: string, plan: MergePlan) {
 }
 
 /**
- * 发布草稿：需要发布权限，且发布者不能是这一版草稿的作者（双人发布）。发布前对照数据源当前的字段再校验一次。
+ * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。发布前对照数据源当前的字段再校验一次。
  * 发布后版本锁定，并入队一次合并（已有合并在排队或运行时，由调度器在它之后补上）
  */
 export async function publishMapping(actor: CurrentMember, mappingId: string, version: number) {
@@ -213,10 +218,48 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
       action: 'mapping.published',
       targetType: 'mapping',
       targetId: mappingId,
-      detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version, authors: draft.authors },
+      detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version, authors: draft.authors, lastEditor: draft.lastEditor },
     });
     return enqueueMerge(tx, actor.tenant.id);
   });
+}
+
+/**
+ * 丢弃草稿：映射回到最近的已发布版本；从没发布过的映射整个删除（可以重新新建同一个“表 → 实体”映射）。
+ * 用于草稿卡住（如最后保存的人离职）的情况。返回映射是否还在
+ */
+export async function discardDraft(actor: CurrentMember, mappingId: string) {
+  assertCan(actor, 'sources:write');
+  return getDb().transaction(async tx => {
+    const mapping = await requireMapping(actor.tenant.id, mappingId, tx);
+    // 锁住映射行：与保存、发布互斥
+    await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
+    const versions = await tx.select({ id: mappingVersions.id, version: mappingVersions.version, status: mappingVersions.status })
+      .from(mappingVersions).where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version));
+    const draft = versions.find(v => v.status === 'draft');
+    if (!draft) throw new MappingError('这个映射没有草稿');
+    const published = versions.find(v => v.status === 'published')?.version ?? null;
+    // 从没发布过时删除映射，各版本随之级联删除
+    if (published) await tx.delete(mappingVersions).where(eq(mappingVersions.id, draft.id));
+    else await tx.delete(mappings).where(eq(mappings.id, mappingId));
+    const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id,
+      actor,
+      action: 'mapping.draft_discarded',
+      targetType: 'mapping',
+      targetId: mappingId,
+      detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version: draft.version, published },
+    });
+    return { kept: published !== null };
+  });
+}
+
+/** 本租户有发布权限的成员人数 */
+async function publisherCount(tenantId: string) {
+  const [{ n }] = await getDb().select({ n: sql<number>`count(*)::int` }).from(members)
+    .where(and(eq(members.tenantId, tenantId), inArray(members.role, ROLES.filter(r => can(r, 'publish')))));
+  return n;
 }
 
 /** 租户各映射最新的已发布版本及其合并计划（合并任务的参数） */
@@ -341,7 +384,7 @@ export async function listMappings(actor: CurrentMember) {
   };
 }
 
-/** 映射详情：各版本（新的在前）、当前成员能否发布草稿及原因，以及合并历史 */
+/** 映射详情：各版本（新的在前）、当前成员能否发布草稿及原因、本租户有发布权限的成员人数，以及合并历史 */
 export async function getMapping(actor: CurrentMember, mappingId: string) {
   assertCan(actor, 'sources:read');
   const mapping = await requireMapping(actor.tenant.id, mappingId);
@@ -351,11 +394,13 @@ export async function getMapping(actor: CurrentMember, mappingId: string) {
   return {
     ...mapping,
     source,
+    publishers: await publisherCount(actor.tenant.id),
     versions: versions.map(v => ({
       version: v.version,
       status: v.status,
       yaml: v.yaml,
       authors: v.authors,
+      lastEditor: v.lastEditor,
       publishedBy: v.publishedByEmail,
       publishedAt: v.publishedAt,
       updatedAt: v.updatedAt,

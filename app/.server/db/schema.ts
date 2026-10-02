@@ -281,7 +281,7 @@ export const mappings = platform.table('mappings', {
 ]);
 
 // 映射的各个版本：YAML 原文与校验通过后的合并计划。草稿可以改，每个映射同时只有一份草稿；发布后锁定，再改就是新的一版草稿。
-// authors 是改过这一版草稿的成员（邮箱），发布者不能是其中之一（双人发布）
+// authors 是改过这一版草稿的成员（邮箱，用于审计）；last_editor 是最后保存草稿的成员，发布者不能是这位成员（双人发布）
 export const mappingVersions = platform.table('mapping_versions', {
   id: uuid('id').primaryKey().defaultRandom(),
   mappingId: uuid('mapping_id').notNull().references(() => mappings.id, { onDelete: 'cascade' }),
@@ -290,6 +290,7 @@ export const mappingVersions = platform.table('mapping_versions', {
   yaml: text('yaml').notNull(),
   plan: jsonb('plan').$type<MergePlan>().notNull(),
   authors: text('authors').array().notNull(),
+  lastEditor: text('last_editor').notNull(),
   publishedByEmail: text('published_by_email'),
   publishedAt: timestamp('published_at', { withTimezone: true }),
   createdAt: createdAt(),

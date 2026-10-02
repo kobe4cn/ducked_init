@@ -68,6 +68,11 @@ const ACTIONS = {
     describe: (d: Detail) =>
       `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
   },
+  'mapping.draft_discarded': {
+    label: '丢弃映射草稿',
+    describe: (d: Detail) =>
+      `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '映射已删除'}`,
+  },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },

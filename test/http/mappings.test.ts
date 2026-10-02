@@ -1,5 +1,5 @@
 // 标准模型与映射的 HTTP 接缝：任何成员都能浏览标准模型；数据工程师在界面上编写映射（不合格的 YAML 被拒绝并给出位置），
-// 也能按规则生成草稿填进编辑框（不保存）；草稿作者不能自己发布，由另一位数据工程师或管理员发布；分析师只读，查看者看不到映射，其他租户一律 404
+// 也能按规则生成草稿填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；分析师只读，查看者看不到映射，其他租户一律 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -30,6 +30,18 @@ fields:
   order_id: string(order_id)
   amount: amount
   status: { expr: status, dictionary: { paid: paid, refunded: refunded } }
+`;
+
+const CUSTOMERS = `model: 1
+entity: customer
+table: customers
+fields:
+  customer_id: string(customer_id)
+  name: name
+  email: lower(email)
+  city: city
+  registered_at: from_timezone(created_at, 'Asia/Shanghai')
+  updated_at: updated_at
 `;
 
 /** 页面上映射编辑框里的 YAML */
@@ -74,7 +86,7 @@ describe('编写与发布映射', () => {
     const id = mappingIdOf(created);
     const detail = await (await engineer.get(`/mappings/${id}`)).text();
     expect(detail).toContain('data-version-status="draft"');
-    expect(detail).toContain('你改过这一版草稿，需由另一位数据工程师或管理员发布');
+    expect(detail).toContain('你最后改了这一版草稿，需由另一位数据工程师或管理员发布');
     expect((await engineer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(403);
   });
 
@@ -102,6 +114,78 @@ describe('编写与发布映射', () => {
     const audit = await (await (await loginAs(app, 'admin@acme.com')).get('/audit')).text();
     expect(audit).toContain('「电商库」orders → 订单，第 1 版草稿');
     expect(audit).toContain('「电商库」orders → 订单，第 1 版（作者 de@acme.com）');
+  });
+
+  it('发布者不能是最后保存草稿的人：A 起草、B 修改后 A 能发布、B 不能，反过来也一样', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const a = await loginAs(app, 'de@acme.com');
+    const b = await loginAs(app, 'admin@acme.com');
+    const edited = ORDERS.replace('amount: amount', 'amount: amount / 100');
+
+    const first = mappingIdOf(await a.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    expect((await b.post(`/mappings/${first}`, { intent: 'save', yaml: edited })).status).toBe(302);
+    expect(await (await b.get(`/mappings/${first}`)).text()).toContain('你最后改了这一版草稿');
+    expect((await b.post(`/mappings/${first}`, { intent: 'publish', version: '1' })).status).toBe(403);
+    expect(await (await a.get(`/mappings/${first}`)).text()).toContain('name="intent" value="publish"');
+    expect((await a.post(`/mappings/${first}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    // 已发布的版本仍锁定
+    expect((await b.post(`/mappings/${first}`, { intent: 'publish', version: '1' })).status).toBe(400);
+
+    const second = mappingIdOf(await b.post('/mappings', { intent: 'create', sourceId, yaml: CUSTOMERS }));
+    expect((await a.post(`/mappings/${second}`, { intent: 'save', yaml: CUSTOMERS.replace('city: city', 'city: upper(city)') })).status).toBe(302);
+    expect((await a.post(`/mappings/${second}`, { intent: 'publish', version: '1' })).status).toBe(403);
+    expect((await b.post(`/mappings/${second}`, { intent: 'publish', version: '1' })).status).toBe(302);
+  });
+
+  it('丢弃草稿：有已发布版本时回到已发布版本；从没发布过时映射删除、可以重新新建；都记审计', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    const admin = await loginAs(app, 'admin@acme.com');
+
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    expect((await admin.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: ORDERS.replace('amount: amount', 'amount: amount / 100') });
+    expect(await (await engineer.get(`/mappings/${id}`)).text()).toContain('name="intent" value="discard"');
+    const kept = await admin.post(`/mappings/${id}`, { intent: 'discard' });
+    expect(kept.headers.get('Location')).toBe(`/mappings/${id}`);
+    const detail = await (await engineer.get(`/mappings/${id}`)).text();
+    expect(detail).not.toContain('data-version-status="draft"');
+    expect(detail).toContain('data-version="1" data-version-status="published"');
+    expect(detail).not.toContain('name="intent" value="discard"');
+    expect((await admin.post(`/mappings/${id}`, { intent: 'discard' })).status).toBe(400);
+
+    const fresh = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: CUSTOMERS }));
+    const removed = await engineer.post(`/mappings/${fresh}`, { intent: 'discard' });
+    expect(removed.headers.get('Location')).toBe('/mappings');
+    expect((await engineer.get(`/mappings/${fresh}`)).status).toBe(404);
+    expect((await engineer.post('/mappings', { intent: 'create', sourceId, yaml: CUSTOMERS })).status).toBe(302);
+
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    expect((await (await loginAs(app, 'an@acme.com')).post(`/mappings/${id}`, { intent: 'discard' })).status).toBe(403);
+
+    const audit = await (await admin.get('/audit')).text();
+    expect(audit).toContain('「电商库」orders → 订单，丢弃第 2 版草稿，回到第 1 版');
+    expect(audit).toContain('「电商库」customers → 消费者，丢弃第 1 版草稿，映射已删除');
+  });
+
+  it('租户里只有自己有发布权限时，发布区提示先邀请成员', async () => {
+    const tenantId = await newTenant('solo');
+    const admin = await memberOf(tenantId, 'admin@solo.com', 'admin');
+    const { id: sourceId } = await registerSource(admin, await pgSourceInput(READER));
+    await selectAllTables(admin, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const browser = await loginAs(app, 'admin@solo.com');
+    const id = mappingIdOf(await browser.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+
+    await memberOf(tenantId, 'an@solo.com', 'analyst');
+    expect(await (await browser.get(`/mappings/${id}`)).text()).toContain('本租户只有你有发布权限，请先邀请一位数据工程师或管理员');
+    // 没有发布权限的成员仍看到权限说明
+    expect(await (await (await loginAs(app, 'an@solo.com')).get(`/mappings/${id}`)).text()).toContain('仅管理员、数据工程师可以发布映射与定义');
+
+    await memberOf(tenantId, 'de@solo.com', 'data_engineer');
+    const detail = await (await browser.get(`/mappings/${id}`)).text();
+    expect(detail).not.toContain('本租户只有你有发布权限');
+    expect(detail).toContain('你最后改了这一版草稿');
   });
 
   it('分析师只能查看映射，不能起草与发布；其他租户看不到', async () => {

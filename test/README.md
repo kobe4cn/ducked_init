@@ -159,7 +159,7 @@ describe('<功能>', () => {
 | `pipeline/scope.test.ts` | 同步范围：逐张选表、只采集与同步范围内的表 |
 | `pipeline/sync.test.ts` | 水位线增量与全量比对、变更批次、同步历史 |
 | `pipeline/verify.test.ts` | 湖中数据核对（覆盖、位置、文件、结构、数据量） |
-| `pipeline/mapping.test.ts` | 映射发布与标准层合并、去重键、值字典、双人发布 |
+| `pipeline/mapping.test.ts` | 映射发布与标准层合并、去重键、值字典、双人发布（最后保存的人不能发布） |
 | `pipeline/migration.test.ts` | 数据湖迁移存储 |
 | `pipeline/reset.test.ts` | 开发用重置数据湖 |
 | `http/login.test.ts` | 租户与 Magic Link 登录 |
@@ -168,7 +168,7 @@ describe('<功能>', () => {
 | `http/suspension.test.ts` | 停用与恢复租户 |
 | `http/tasks.test.ts` | 任务页、租户配额、数据湖迁移查看 |
 | `http/sources.test.ts` | 数据源界面：登记、轮换凭据、选表、列统计、确认水位线 |
-| `http/mappings.test.ts` | 标准模型浏览、映射编辑与发布的界面与权限、对照面板（列统计、标准字段、写法速查、函数）、报错附改法、按规则生成草稿（生成 → 保存） |
+| `http/mappings.test.ts` | 标准模型浏览、映射编辑与发布的界面与权限（最后保存的人不能发布、丢弃草稿、只有自己能发布时的提示）、对照面板（列统计、标准字段、写法速查、函数）、报错附改法、按规则生成草稿（生成 → 保存） |
 | `mapping-spec.test.ts` | 映射 YAML 校验与定位、报错附带的改法（是不是想写、扩展字段写法、值字典、主键）、对照面板读出的 YAML 要点（纯函数） |
 | `mapping-draft.test.ts` | 按规则生成映射草稿：列名同义词、格式校验、分 / 毫秒 / 时区转换、值字典骨架、去重键、没用到的列生成注释掉的扩展字段；手写贴合 MySQL 开发库的列统计（纯函数） |
 | `client-build.test.ts` | 真实客户端构建，兜底页面误引 `.server` 模块 |
