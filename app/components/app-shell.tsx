@@ -1,6 +1,7 @@
 // app/components/app-shell.tsx —— 登录后页面的外壳：白色顶栏（品牌、胶囊导航、头像首字母、退出登录），内容铺满宽度
-import { Form, NavLink } from 'react-router';
+import { Form, Link, useLocation } from 'react-router';
 import { LogOut } from 'lucide-react';
+import { activeNavTo } from '~/lib/nav';
 import { cn } from '~/lib/utils';
 import { Button } from '~/components/ui/button';
 
@@ -13,6 +14,7 @@ export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台
   brand?: string;
   logoutAction?: string;
 }) {
+  const active = activeNavTo(nav, useLocation().pathname);
   return (
     <div className="min-h-svh bg-slate-50">
       <header className="border-b bg-white">
@@ -24,14 +26,14 @@ export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台
             </span>
             <nav className="flex gap-1 text-sm">
               {nav.map(item => (
-                <NavLink
+                <Link
                   key={item.to}
                   to={item.to}
-                  end
-                  className={({ isActive }) => cn('rounded-full px-3 py-1.5 text-slate-600 hover:bg-slate-100', isActive && 'bg-slate-900 text-white hover:bg-slate-900')}
+                  aria-current={item.to === active ? 'page' : undefined}
+                  className={cn('rounded-full px-3 py-1.5 text-slate-600 hover:bg-slate-100', item.to === active && 'bg-slate-900 text-white hover:bg-slate-900')}
                 >
                   {item.label}
-                </NavLink>
+                </Link>
               ))}
             </nav>
           </div>
