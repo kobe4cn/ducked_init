@@ -1,23 +1,24 @@
-// app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：本租户的数据源列表（最近一次核对有差异的标出来）与登记表单
+// app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：指标卡、本租户的数据源卡片（最近一次核对有差异的标出来）与登记表单
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
-import { CircleAlert } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, CircleAlert, Cloud, Database, FileBox, Leaf, Plus, X } from 'lucide-react';
 import type { Route } from './+types/sources';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { listSources, registerSource, SourceError } from '~/.server/sources';
 import { verifyDifferences } from '~/.server/source-verify';
 import { formValues, SOURCE_KIND_LABELS, SOURCE_KINDS, type SourceKind } from '~/lib/sources';
+import { cn } from '~/lib/utils';
 import { AppShell } from '~/components/app-shell';
+import { PageHeader } from '~/components/page-header';
 import { SourceFields } from '~/components/source-fields';
+import { StatTile } from '~/components/stat-tile';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Badge } from '~/components/ui/badge';
 import { Button } from '~/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
 import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
 export function meta({}: Route.MetaArgs) {
   return [{ title: '数据源 · CRM 数据分析平台' }];
@@ -62,65 +63,66 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
   const values: Record<string, string> = actionData?.values ?? {};
   const [kind, setKind] = useState<SourceKind>((SOURCE_KINDS as readonly string[]).includes(values.kind) ? (values.kind as SourceKind) : 'postgres');
   const submitting = useNavigation().state === 'submitting';
+  const kinds = new Set(sources.map(s => s.kind)).size;
+  const needsAttention = sources.filter(s => s.differences > 0).length;
   return (
     <AppShell email={email} nav={nav}>
-      {actionData?.error && (
-        <Alert variant="destructive" role="alert">
-          <CircleAlert />
-          <AlertTitle>未能登记</AlertTitle>
-          <AlertDescription>{actionData.error}</AlertDescription>
-        </Alert>
+      <PageHeader title="数据源" description="本租户登记的外部只读连接。平台永不写入数据源；凭据加密保存，任何页面都不显示。" />
+
+      <div className="grid grid-cols-3 gap-4">
+        <StatTile label="数据源数" value={sources.length} hint={`${kinds} 种类型`} />
+        <StatTile label="核对一致" value={sources.length - needsAttention} hint="最近一次核对" tone={sources.length > needsAttention ? 'text-emerald-600' : undefined} />
+        <StatTile label="需要处理" value={needsAttention} hint="核对有差异的数据源" tone={needsAttention ? 'text-red-600' : undefined} />
+      </div>
+
+      {!sources.length && !canWrite && (
+        <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">还没有数据源。数据工程师或管理员登记后会出现在这里。</div>
       )}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>数据源</CardTitle>
-          <CardDescription>本租户登记的外部只读连接。平台永不写入数据源；凭据加密保存，任何页面都不显示。</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>名称</TableHead>
-                <TableHead>类型</TableHead>
-                <TableHead>连接</TableHead>
-                <TableHead>登记时间</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {sources.map(s => (
-                <TableRow key={s.id} data-source-id={s.id}>
-                  <TableCell className="space-x-2">
-                    <Link to={`/sources/${s.id}`} className="font-medium hover:underline">{s.name}</Link>
-                    {s.differences > 0 && (
-                      <Link to={`/sources/${s.id}?tab=lake`} data-verify-differences={s.differences}>
-                        <Badge variant="destructive">{`核对有差异（${s.differences} 张表）`}</Badge>
-                      </Link>
-                    )}
-                  </TableCell>
-                  <TableCell><Badge variant="outline">{SOURCE_KIND_LABELS[s.kind]}</Badge></TableCell>
-                  <TableCell className="font-mono text-xs text-muted-foreground">{s.target}</TableCell>
-                  <TableCell className="text-muted-foreground">{new Date(s.createdAt).toLocaleString('zh-CN')}</TableCell>
-                </TableRow>
-              ))}
-              {!sources.length && (
-                <TableRow>
-                  <TableCell colSpan={4} className="text-center text-muted-foreground">还没有数据源</TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
+        {sources.map(s => (
+          <Link
+            key={s.id}
+            to={s.differences > 0 ? `/sources/${s.id}?tab=lake` : `/sources/${s.id}`}
+            data-source-id={s.id}
+            className={cn('rounded-2xl border bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md', s.differences > 0 && 'border-red-200')}
+          >
+            <div className="flex items-start justify-between">
+              <KindIcon kind={s.kind} />
+              <Badge variant="outline" className="rounded-full">{SOURCE_KIND_LABELS[s.kind]}</Badge>
+            </div>
+            <div className="mt-4 text-lg font-medium">{s.name}</div>
+            <div className="mt-1 truncate font-mono text-xs text-slate-400">{s.target}</div>
+            <div className="mt-4 flex items-center justify-between border-t pt-3">
+              {s.differences > 0
+                ? <span data-verify-differences={s.differences} className="inline-flex items-center gap-1 text-sm text-red-600"><AlertTriangle className="size-3.5" />{`${s.differences} 张表有差异`}</span>
+                : <span className="inline-flex items-center gap-1 text-sm text-emerald-600"><CheckCircle2 className="size-3.5" />一致</span>}
+              <span className="text-xs text-slate-400">{`登记于 ${new Date(s.createdAt).toLocaleDateString('zh-CN')}`}</span>
+            </div>
+          </Link>
+        ))}
 
-      {canWrite && (
-        <Card>
-          <CardHeader>
-            <CardTitle>登记数据源</CardTitle>
-            <CardDescription>登记前平台会连接数据源并探测账号的写权限，可写的账号会被拒绝。登记后列出表（不读取数据），在数据源页选定要同步的表，平台只采集与同步选中的表。</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Form method="post">
+        {canWrite && (
+          // 没有 JS 时也能展开登记：<details> 收起时是虚线的「登记新的数据源」卡片，展开后占满一行
+          <details open={!sources.length || Boolean(actionData?.error)} className="group rounded-2xl border-2 border-dashed open:col-span-full open:border open:border-solid open:bg-white open:p-6 open:shadow-sm">
+            <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+              <span className="grid min-h-48 place-items-center text-slate-400 hover:text-slate-600 group-open:hidden">
+                <span className="flex flex-col items-center gap-2"><Plus className="size-6" />登记新的数据源</span>
+              </span>
+              <span className="hidden items-center justify-between gap-6 group-open:flex">
+                <h2 className="text-lg font-semibold">登记数据源</h2>
+                <X aria-hidden className="size-4 text-slate-400" />
+              </span>
+            </summary>
+            <p className="mt-1 mb-5 max-w-2xl text-sm text-slate-500">登记前平台会连接数据源并探测账号的写权限，可写的账号会被拒绝。登记后列出表（不读取数据），在数据源页选定要同步的表，平台只采集与同步选中的表。</p>
+            {actionData?.error && (
+              <Alert variant="destructive" role="alert" className="mb-5 max-w-2xl">
+                <CircleAlert />
+                <AlertTitle>未能登记</AlertTitle>
+                <AlertDescription>{actionData.error}</AlertDescription>
+              </Alert>
+            )}
+            <Form method="post" className="max-w-2xl">
               <input type="hidden" name="intent" value="register" />
               <FieldGroup>
                 <div className="grid grid-cols-2 gap-4">
@@ -141,9 +143,20 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
                 </div>
               </FieldGroup>
             </Form>
-          </CardContent>
-        </Card>
-      )}
+          </details>
+        )}
+      </div>
     </AppShell>
   );
+}
+
+const KIND_ICON: Record<SourceKind, typeof Database> = { postgres: Database, mysql: Database, mongodb: Leaf, s3: Cloud, duckdb: FileBox };
+/** 各类型固定色调（见 docs/agents/ui.md） */
+const KIND_TINT: Record<SourceKind, string> = {
+  postgres: 'bg-sky-100 text-sky-700', mysql: 'bg-orange-100 text-orange-700', mongodb: 'bg-emerald-100 text-emerald-700', s3: 'bg-violet-100 text-violet-700', duckdb: 'bg-amber-100 text-amber-700',
+};
+
+function KindIcon({ kind }: { kind: SourceKind }) {
+  const Icon = KIND_ICON[kind];
+  return <span className={cn('grid size-11 shrink-0 place-items-center rounded-xl', KIND_TINT[kind])}><Icon className="size-5" /></span>;
 }

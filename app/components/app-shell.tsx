@@ -1,4 +1,4 @@
-// app/components/app-shell.tsx —— 登录后页面的外壳：顶栏（导航、当前成员或运营者、退出登录）
+// app/components/app-shell.tsx —— 登录后页面的外壳：白色顶栏（品牌、胶囊导航、头像首字母、退出登录），内容铺满宽度
 import { Form, NavLink } from 'react-router';
 import { LogOut } from 'lucide-react';
 import { cn } from '~/lib/utils';
@@ -14,26 +14,31 @@ export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台
   logoutAction?: string;
 }) {
   return (
-    <div className="min-h-svh bg-muted">
-      <header className="border-b bg-background">
-        <div className="mx-auto flex h-14 max-w-5xl items-center justify-between gap-6 px-6">
-          <div className="flex items-center gap-6">
-            <span className="font-semibold">{brand}</span>
-            <nav className="flex items-center gap-4 text-sm">
+    <div className="min-h-svh bg-slate-50">
+      <header className="border-b bg-white">
+        <div className="flex h-16 items-center justify-between gap-6 px-6 lg:px-8">
+          <div className="flex items-center gap-8">
+            <span className="flex items-center gap-2 font-semibold">
+              <span className="size-6 rounded-full bg-gradient-to-br from-sky-400 to-violet-500" />
+              {brand}
+            </span>
+            <nav className="flex gap-1 text-sm">
               {nav.map(item => (
                 <NavLink
                   key={item.to}
                   to={item.to}
                   end
-                  className={({ isActive }) => cn('text-muted-foreground hover:text-foreground', isActive && 'text-foreground font-medium')}
+                  className={({ isActive }) => cn('rounded-full px-3 py-1.5 text-slate-600 hover:bg-slate-100', isActive && 'bg-slate-900 text-white hover:bg-slate-900')}
                 >
                   {item.label}
                 </NavLink>
               ))}
             </nav>
           </div>
-          <div className="flex items-center gap-3 text-sm text-muted-foreground">
-            <span>{email}</span>
+          <div className="flex items-center gap-3 text-sm text-slate-500">
+            <span role="img" title={email} aria-label={email} className="grid size-8 place-items-center rounded-full bg-slate-200 font-medium text-slate-700">
+              {email[0]?.toUpperCase()}
+            </span>
             <Form method="post" action={logoutAction}>
               <Button type="submit" variant="ghost" size="sm">
                 <LogOut data-icon="inline-start" />
@@ -43,7 +48,7 @@ export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台
           </div>
         </div>
       </header>
-      <main className="mx-auto flex max-w-5xl flex-col gap-6 p-6">{children}</main>
+      <main className="flex flex-col gap-6 px-6 pt-8 pb-24 lg:px-8">{children}</main>
     </div>
   );
 }

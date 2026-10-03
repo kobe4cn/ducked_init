@@ -55,6 +55,8 @@ describe('登记数据源', () => {
     const list = await pageAndData(browser, '/sources');
     expect(list).toContain('电商库');
     expect(list).toContain(`href="/sources/${id}"`);
+    expect(list).toMatch(/数据源数[\s\S]*?核对一致[\s\S]*?需要处理/);
+    expect(list).toContain('登记新的数据源');
     const detail = await pageAndData(browser, `/sources/${id}`);
     expect(detail).toContain(READER.user);
     expect(detail).toContain('crm_source_test');
@@ -86,6 +88,7 @@ describe('登记数据源', () => {
     const list = await (await analyst.get('/sources')).text();
     expect(list).toContain('电商库');
     expect(list).not.toContain('name="intent" value="register"');
+    expect(list).not.toContain('登记新的数据源');
     expect(await (await analyst.get(`/sources/${id}`)).text()).not.toContain('name="intent" value="update"');
     expect((await register(analyst, await pgSourceInput(READER, '另一个'))).status).toBe(403);
     expect((await analyst.post(`/sources/${id}`, { intent: 'test' })).status).toBe(403);
