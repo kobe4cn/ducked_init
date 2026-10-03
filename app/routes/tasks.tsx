@@ -72,8 +72,9 @@ function ResultDetails({ result: { tables, engine } }: { result: TaskResult }) {
       <div className="mt-1 space-y-1 pl-3">
         {tables.length ? (
           <ul>
-            {tables.map(t => (
-              <li key={t.name} data-result-table={t.name}>
+            {/* 同步结果按批次记录，同一张表可能出现多次（如增量后接全量比对），key 要带上序号 */}
+            {tables.map((t, i) => (
+              <li key={`${i}-${t.name}`} data-result-table={t.name}>
                 {`${t.name}：`}<span className="text-foreground">{t.rows === null ? '—' : `${t.rows.toLocaleString('zh-CN')} 行`}</span>
               </li>
             ))}
