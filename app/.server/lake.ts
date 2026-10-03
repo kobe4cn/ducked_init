@@ -107,6 +107,7 @@ export async function dropTenantS3Account(tenantId: string) {
 
 /**
  * 建好存储前缀（对象存储上先建好本租户的账号，再用它写入占位对象 .keep）并初始化 DuckLake catalog（首次挂载时建元数据表）。
+ * catalog 还没有元数据表时以加密方式新建，此后写入的数据文件都加密（ADR-0020）；加密上线前建好的 catalog 保持不加密。
  * 可重复执行：开通时初始化失败，或本功能上线前开通、还没有对象存储账号的租户，运营者可以重试补建。
  * 用本租户的数据库角色挂载，初始化出的元数据表归该角色所有。新建对象存储账号时记入审计，操作者为 operator
  */
@@ -115,7 +116,9 @@ export async function initTenantCatalog(tenantId: string, operator: OperatorActo
   const spec = lakeSpecOf((await lakeRow(tenantId))!);
   if (spec.s3) await putPrefixPlaceholder(spec.dataPath, spec.s3);
   else await mkdir(spec.dataPath, { recursive: true });
-  const session = await openTenantLake(spec, { memoryLimitMb: 256, threads: 1 });
+  const { rows: [{ initialized }] } = await getDb().execute<{ initialized: boolean }>(
+    sql`SELECT to_regclass(${`${spec.catalogSchema}.ducklake_metadata`}) IS NOT NULL AS initialized`);
+  const session = await openTenantLake(spec, { memoryLimitMb: 256, threads: 1 }, undefined, { encrypted: !initialized });
   session.close();
   await getDb().update(tenantLakes).set({ catalogInitializedAt: new Date() }).where(eq(tenantLakes.tenantId, tenantId));
 }

@@ -4,7 +4,8 @@
 // 在工作进程里运行，数据湖与数据源挂在同一个 DuckDB 里（源端只读挂载为 src），只用租户自己的凭据。
 // 每张已进湖的表核对四项：
 // - 位置：原始层 schema 与表名、对象存储前缀、当前主键状态或镜像的位置。
-// - 文件：目录登记的每个文件在存储上存在且大小一致，当前数据文件的尾部元数据（行数、字段）与目录一致；
+// - 文件：目录登记的每个文件在存储上存在且大小一致，当前数据文件的尾部元数据（行数、字段）与目录一致；加密的数据文件（ADR-0020）
+//   用目录里登记的文件密钥读行数，尾部的字段信息读不出来，不查字段；
 //   表前缀下存在、目录未登记的孤儿文件（已在待删除清单里的不算）只报告不删除；内联在目录库里的小批次单独列出行数。
 // - 结构：以核对时实时读取的源表结构为基准，与原始层的列对照。
 // - 数据量：有主键的表比对源端主键全集与原始层回放后的当前主键（与每日主键比对同一机制，但不写入）；没有主键的表比较行数
@@ -167,7 +168,10 @@ async function checkStructure(con: DuckDBConnection, table: SourceTable, bronze:
 const resolvePath = (base: string, path: string, relative: boolean) => (relative ? `${base}${path}` : path);
 
 interface TableMeta { table_id: string; schema_path: string | null; schema_relative: boolean; table_path: string | null; table_relative: boolean }
-interface RegisteredFile { path: string; path_is_relative: boolean; file_size_bytes: string; record_count: string | null; current: boolean; kind: 'data' | 'delete' }
+interface RegisteredFile {
+  path: string; path_is_relative: boolean; file_size_bytes: string; record_count: string | null; encryption_key: string | null;
+  current: boolean; kind: 'data' | 'delete';
+}
 
 /** 在 DuckLake 目录里找到原始层表的 ID 与数据文件所在的前缀 */
 async function tableMeta(session: TenantLakeSession, schema: string, name: string) {
@@ -185,10 +189,11 @@ async function tableMeta(session: TenantLakeSession, schema: string, name: strin
 async function checkFiles(session: TenantLakeSession, tableId: string, prefix: string): Promise<FileCheck> {
   const { con, lake } = session;
   const registered = (await rows<RegisteredFile>(con, `
-    SELECT path, path_is_relative, file_size_bytes::VARCHAR AS file_size_bytes, record_count::VARCHAR AS record_count, end_snapshot IS NULL AS current, 'data' AS kind
+    SELECT path, path_is_relative, file_size_bytes::VARCHAR AS file_size_bytes, record_count::VARCHAR AS record_count, encryption_key,
+      end_snapshot IS NULL AS current, 'data' AS kind
     FROM ${lake.metadata}.ducklake_data_file WHERE table_id = ${tableId}
     UNION ALL
-    SELECT path, path_is_relative, file_size_bytes::VARCHAR, NULL, end_snapshot IS NULL, 'delete'
+    SELECT path, path_is_relative, file_size_bytes::VARCHAR, NULL, NULL, end_snapshot IS NULL, 'delete'
     FROM ${lake.metadata}.ducklake_delete_file WHERE table_id = ${tableId}`))
     .map(f => ({ ...f, path: resolvePath(prefix, f.path, f.path_is_relative) }));
   const known = new Set(registered.map(f => f.path));
@@ -214,10 +219,14 @@ async function checkFiles(session: TenantLakeSession, tableId: string, prefix: s
   const footer: FileCheck['footer'] = [];
   for (const f of current.filter(f => sizes.has(f.path))) {
     try {
-      const [meta] = await rows<{ num_rows: string }>(con, `SELECT num_rows::VARCHAR AS num_rows FROM parquet_file_metadata(${lit(f.path)})`);
+      // parquet_file_metadata / parquet_schema 不接受密钥：加密文件用 read_parquet 带上目录里的文件密钥数行
+      const [meta] = await rows<{ num_rows: string }>(con, f.encryption_key
+        ? `SELECT count(*)::VARCHAR AS num_rows FROM read_parquet(${lit(f.path)}, encryption_config = {footer_key_value: from_base64(${lit(f.encryption_key)})})`
+        : `SELECT num_rows::VARCHAR AS num_rows FROM parquet_file_metadata(${lit(f.path)})`);
       if (Number(meta.num_rows) !== Number(f.record_count)) {
         footer.push({ path: f.path, problem: `尾部记录 ${meta.num_rows} 行，目录登记 ${f.record_count} 行` });
       }
+      if (f.encryption_key) continue;
       const unknown = (await rows<{ name: string; field_id: string }>(con, `
         SELECT name, field_id::VARCHAR AS field_id FROM parquet_schema(${lit(f.path)}) WHERE field_id IS NOT NULL`))
         .filter(c => !fieldIds.has(c.field_id));

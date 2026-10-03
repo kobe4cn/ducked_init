@@ -164,6 +164,7 @@ describe('<功能>', () => {
 | `pipeline/mapping.test.ts` | 映射发布与标准层合并、去重键、值字典、双人发布（最后保存的人不能发布）、只有映射引用的表写入变更才在同步后合并（定时检查也不补）、合并只带受影响的映射、补进排队中的合并、运行期间的变更由定时检查补上、详情页只合并单个映射 |
 | `pipeline/pii.test.ts` | 标准层敏感字段：规范化后按租户加盐哈希（不同写法同一哈希、与字段名无关）、`silver.*` / `silver_records` / 任务结果里没有明文、哈希上线前的明文标准层重建、转换报错抹掉取值与盐 |
 | `pipeline/migration.test.ts` | 数据湖迁移存储 |
+| `pipeline/encryption.test.ts` | 数据湖加密存储：新租户原始层 / `_keys` / `_mirror` 的文件不带密钥读不出、不含明文；加密前的未加密湖重新初始化照常同步 |
 | `pipeline/reset.test.ts` | 开发用重置数据湖 |
 | `http/login.test.ts` | 租户与 Magic Link 登录 |
 | `http/members.test.ts` | 成员邀请与角色、权限矩阵、审计日志、跨租户拒绝 |
