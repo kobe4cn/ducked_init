@@ -166,7 +166,7 @@ describe('<功能>', () => {
 | `http/members.test.ts` | 成员邀请与角色、权限矩阵、审计日志、跨租户拒绝 |
 | `http/ops.test.ts` | 运营者身份、TOTP、租户管理、审计、IP 白名单 |
 | `http/suspension.test.ts` | 停用与恢复租户 |
-| `http/tasks.test.ts` | 任务页、租户配额、数据湖迁移查看 |
+| `http/tasks.test.ts` | 任务页、首页的任务指标卡、租户配额、数据湖迁移查看 |
 | `http/sources.test.ts` | 数据源界面：登记、轮换凭据、选表、列统计、确认水位线 |
 | `http/mappings.test.ts` | 标准模型浏览、映射编辑与发布的界面与权限（最后保存的人不能发布、丢弃草稿、只有自己能发布时的提示）、对照面板（列统计、标准字段、写法速查、函数）、报错附改法、按规则生成草稿（生成 → 保存）、详情页立即合并的显示与权限、表单 / YAML 标签页（没有脚本时退回 YAML 框；用 `readForm` / `writeField` 填表单后保存并发布） |
 | `mapping-spec.test.ts` | 映射 YAML 校验与定位、报错附带的改法（是不是想写、扩展字段写法、值字典、主键）、对照面板读出的 YAML 要点（纯函数） |

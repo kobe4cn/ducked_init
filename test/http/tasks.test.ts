@@ -38,6 +38,11 @@ describe('成员查看本租户的任务', () => {
     const viewer = await loginAs(app, 'viewer@acme.com');
     const home = await (await viewer.get('/')).text();
     expect(home).toContain('href="/tasks"');
+    // 首页指标卡：只数本租户的任务
+    const tile = (label: string) => home.match(new RegExp(`>${label}</div><div[^>]*>(\\d+)<`))?.[1];
+    expect([tile('进行中'), tile('失败'), tile('成功')]).toEqual(['1', '1', '1']);
+    expect(home).not.toContain('数据源数');
+    expect(await (await admin.get('/')).text()).toMatch(/>数据源数<\/div><div[^>]*>0</);
 
     const html = await (await viewer.get('/tasks')).text();
     const rows = taskRows(html);
@@ -46,11 +51,9 @@ describe('成员查看本租户的任务', () => {
       ['demo.seed', 'failed'],
       ['lake.inventory', 'succeeded'],
     ]);
-    expect(rows[0].html).toContain('排队中');
+    expect(rows.map(r => r.html.match(/>(排队中|运行中|成功|失败)</)?.[1])).toEqual(['排队中', '失败', '成功']);
     expect(rows[0].html).toContain('生成演示数据');
-    expect(rows[1].html).toContain('失败');
     expect(rows[1].html).toContain('参数 customers');
-    expect(rows[2].html).toContain('成功');
   });
 
   it('成功的任务可以查看结果：各表的行数与运行时的配额', async () => {

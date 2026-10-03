@@ -25,7 +25,8 @@ import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { SourceFields } from '~/components/source-fields';
 import { StatTile } from '~/components/stat-tile';
-import { StatusText, type StatusTone } from '~/components/status-text';
+import { SectionHeader } from '~/components/section-header';
+import { StatusText, TASK_TONES, type StatusTone } from '~/components/status-text';
 import { VerifyBadge } from '~/components/verify-badge';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Badge } from '~/components/ui/badge';
@@ -170,13 +171,10 @@ export async function action({ request, params }: Route.ActionArgs) {
   throw redirect(`/sources/${params.sourceId}${tabOf(request) === 'lake' ? '?tab=lake' : ''}`);
 }
 
-/** 后台任务（采集、同步、核对）状态对应的色调 */
-const TASK_TONES = { none: 'none', queued: 'pending', running: 'pending', succeeded: 'ok', failed: 'bad' } as const satisfies Record<TaskStatus, StatusTone>;
 const SYNC_VARIANTS = { watermark: 'default', needs_confirmation: 'secondary', full_compare: 'outline' } as const;
 const pct = (n: number) => `${Math.round(n * 1000) / 10}%`;
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
-type TaskStatus = Route.ComponentProps['loaderData']['verify']['status'];
 type TableView = Route.ComponentProps['loaderData']['tables'][number];
 type ListedView = Route.ComponentProps['loaderData']['listing'][number];
 type SyncEntry = Route.ComponentProps['loaderData']['sync']['history'][string][number];
@@ -684,16 +682,6 @@ function LakeData({ verify, canWrite, submitting, busy }: { verify: VerifyView; 
         </TableBody>
       </Table>
     </section>
-  );
-}
-
-/** 面板里一个分区的标题：h2、状态与一段说明 */
-function SectionHeader({ title, status, children }: { title: string; status?: React.ReactNode; children?: React.ReactNode }) {
-  return (
-    <div className="space-y-1">
-      <h2 className="flex items-center gap-3 text-lg font-semibold">{title}{status}</h2>
-      {children && <p className="max-w-2xl text-sm text-slate-500">{children}</p>}
-    </div>
   );
 }
 

@@ -5,8 +5,8 @@ import { navFor } from '~/.server/nav';
 import { listTasks, TASK_PAGE_SIZE, TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
-import { Badge } from '~/components/ui/badge';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
+import { PageHeader } from '~/components/page-header';
+import { StatusText, TASK_TONES } from '~/components/status-text';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
 export function meta({}: Route.MetaArgs) {
@@ -63,7 +63,6 @@ export async function loader({ request }: Route.LoaderArgs) {
   };
 }
 
-const STATUS_VARIANTS = { queued: 'outline', running: 'secondary', succeeded: 'default', failed: 'destructive' } as const;
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
 function ResultDetails({ result: { tables, engine } }: { result: TaskResult }) {
@@ -92,12 +91,10 @@ export default function Tasks({ loaderData }: Route.ComponentProps) {
   const { email, nav, pageSize, tasks } = loaderData;
   return (
     <AppShell email={email} nav={nav}>
-      <Card>
-        <CardHeader>
-          <CardTitle>任务</CardTitle>
-          <CardDescription>本租户最近 {pageSize} 个任务，按提交时间倒序。超出并发上限的任务排队等待；成功的任务可展开查看结果。</CardDescription>
-        </CardHeader>
-        <CardContent>
+      <PageHeader title="任务" description={`本租户最近 ${pageSize} 个任务，按提交时间倒序。超出并发上限的任务排队等待；成功的任务可展开查看结果。`} />
+
+      {tasks.length ? (
+        <div className="rounded-2xl border bg-white p-6 shadow-sm">
           <Table>
             <TableHeader>
               <TableRow>
@@ -113,24 +110,21 @@ export default function Tasks({ loaderData }: Route.ComponentProps) {
                 <TableRow key={t.id} data-task-kind={t.kind} data-task-status={t.status}>
                   <TableCell>
                     {t.kindLabel}
-                    {t.error && <div className="text-xs whitespace-normal text-destructive">{t.error}</div>}
+                    {t.error && <div className="text-xs whitespace-normal text-red-600">{t.error}</div>}
                     {t.result && <ResultDetails result={t.result} />}
                   </TableCell>
-                  <TableCell><Badge variant={STATUS_VARIANTS[t.status]}>{t.statusLabel}</Badge></TableCell>
-                  <TableCell className="text-muted-foreground">{time(t.createdAt)}</TableCell>
-                  <TableCell className="text-muted-foreground">{time(t.startedAt)}</TableCell>
-                  <TableCell className="text-muted-foreground">{time(t.finishedAt)}</TableCell>
+                  <TableCell><StatusText tone={TASK_TONES[t.status]}>{t.statusLabel}</StatusText></TableCell>
+                  <TableCell className="text-slate-500">{time(t.createdAt)}</TableCell>
+                  <TableCell className="text-slate-500">{time(t.startedAt)}</TableCell>
+                  <TableCell className="text-slate-500">{time(t.finishedAt)}</TableCell>
                 </TableRow>
               ))}
-              {!tasks.length && (
-                <TableRow>
-                  <TableCell colSpan={5} className="text-center text-muted-foreground">暂无任务</TableCell>
-                </TableRow>
-              )}
             </TableBody>
           </Table>
-        </CardContent>
-      </Card>
+        </div>
+      ) : (
+        <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">暂无任务。采集、同步、核对、合并等后台任务提交后会出现在这里。</div>
+      )}
     </AppShell>
   );
 }

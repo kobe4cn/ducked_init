@@ -12,6 +12,9 @@ const TONES: Record<StatusTone, { icon: typeof CheckCircle2; color: string }> = 
   none: { icon: CircleDashed, color: 'text-slate-500' },
 };
 
+/** 后台任务（采集、同步、核对等）状态及从未运行过的 none 对应的色调，任务页与数据源详情页共用 */
+export const TASK_TONES = { none: 'none', queued: 'pending', running: 'pending', succeeded: 'ok', failed: 'bad' } as const satisfies Record<string, StatusTone>;
+
 export function StatusText({ tone, className, children, ...data }: {
   tone: StatusTone;
   className?: string;

@@ -3,7 +3,7 @@
 import { and, desc, eq, inArray, isNotNull, ne, sql } from 'drizzle-orm';
 import type { Tx } from './audit';
 import { getDb } from './db/client';
-import { tasks, tenantLakes, tenants } from './db/schema';
+import { TASK_STATUSES, tasks, tenantLakes, tenants, type TaskStatus } from './db/schema';
 import { lakeSpecOf } from './lake';
 import { loadSourceSpec, SourceError } from './source-config';
 import { HANDLERS, isTaskKind, type TaskKind } from './pipeline/handlers';
@@ -48,6 +48,18 @@ export async function listTasks(tenantId: string) {
     .orderBy(desc(tasks.createdAt), desc(tasks.id))
     .limit(TASK_PAGE_SIZE);
   return rows.map(t => ({ ...t, kindLabel: HANDLERS[t.kind as TaskKind]?.label ?? t.kind }));
+}
+
+/** 本租户各状态的任务数（不限于最近 TASK_PAGE_SIZE 个），没有任务的状态为 0 */
+export async function countTasksByStatus(tenantId: string): Promise<Record<TaskStatus, number>> {
+  const rows = await getDb()
+    .select({ status: tasks.status, n: sql<number>`count(*)::int` })
+    .from(tasks)
+    .where(eq(tasks.tenantId, tenantId))
+    .groupBy(tasks.status);
+  const counts = Object.fromEntries(TASK_STATUSES.map(s => [s, 0])) as Record<TaskStatus, number>;
+  for (const r of rows) counts[r.status] = r.n;
+  return counts;
 }
 
 export interface ClaimedTask extends WorkerInput { id: string; tenantId: string }
