@@ -1,19 +1,20 @@
 // app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：指标卡、本租户的数据源卡片（标出未核对与最近一次核对有差异的）与登记表单
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
-import { AlertTriangle, CheckCircle2, CircleAlert, CircleDashed, Plus, X } from 'lucide-react';
+import { CircleAlert, Plus, X } from 'lucide-react';
 import type { Route } from './+types/sources';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { listSources, registerSource, SourceError } from '~/.server/sources';
 import { verifyDifferences } from '~/.server/source-verify';
-import { formValues, SOURCE_KIND_LABELS, SOURCE_KINDS, type SourceKind } from '~/lib/sources';
+import { formValues, SOURCE_KIND_LABELS, SOURCE_KINDS, targetOf, type SourceKind } from '~/lib/sources';
 import { cn } from '~/lib/utils';
 import { AppShell } from '~/components/app-shell';
 import { KindIcon } from '~/components/kind-icon';
 import { PageHeader } from '~/components/page-header';
 import { SourceFields } from '~/components/source-fields';
 import { StatTile } from '~/components/stat-tile';
+import { VerifyBadge, verifyStateOf } from '~/components/verify-badge';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Badge } from '~/components/ui/badge';
 import { Button } from '~/components/ui/button';
@@ -24,10 +25,6 @@ import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select'
 export function meta({}: Route.MetaArgs) {
   return [{ title: '数据源 · CRM 数据分析平台' }];
 }
-
-/** 列表上的一行摘要：连接的目标，不含凭据 */
-const targetOf = (kind: SourceKind, c: Record<string, string>) =>
-  kind === 'postgres' || kind === 'mysql' || kind === 'mongodb' ? `${c.user}@${c.host}:${c.port}/${c.database}${c.schema ? `（${c.schema}）` : ''}` : c.path;
 
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
@@ -97,7 +94,7 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
             <div className="mt-4 text-lg font-medium">{s.name}</div>
             <div className="mt-1 truncate font-mono text-xs text-slate-400">{s.target}</div>
             <div className="mt-4 flex items-center justify-between border-t pt-3">
-              <VerifyBadge state={s.state} differences={s.differences} />
+              <VerifyBadge differences={s.differences} />
               <span className="text-xs text-slate-400">{`登记于 ${new Date(s.createdAt).toLocaleDateString('zh-CN')}`}</span>
             </div>
           </Link>
@@ -148,23 +145,5 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
         )}
       </div>
     </AppShell>
-  );
-}
-
-type VerifyState = 'none' | 'ok' | 'diff';
-/** 未核对（没有成功核对记录）、一致、有差异 */
-const verifyStateOf = (differences: number | null): VerifyState => differences === null ? 'none' : differences > 0 ? 'diff' : 'ok';
-
-/** 状态色配图标和文字（见 docs/agents/ui.md） */
-const VERIFY_BADGE: Record<VerifyState, { icon: typeof CheckCircle2; tone: string }> = {
-  none: { icon: CircleDashed, tone: 'text-slate-500' }, ok: { icon: CheckCircle2, tone: 'text-emerald-600' }, diff: { icon: AlertTriangle, tone: 'text-red-600' },
-};
-
-function VerifyBadge({ state, differences }: { state: VerifyState; differences: number | null }) {
-  const { icon: Icon, tone } = VERIFY_BADGE[state];
-  return (
-    <span data-verify-state={state} data-verify-differences={state === 'diff' ? differences! : undefined} className={cn('inline-flex items-center gap-1 text-sm', tone)}>
-      <Icon className="size-3.5" />{state === 'none' ? '未核对' : state === 'ok' ? '一致' : `${differences} 张表有差异`}
-    </span>
   );
 }

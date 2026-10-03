@@ -9,6 +9,10 @@ export const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
   duckdb: 'DuckDB 文件',
 };
 
+/** 数据源连接的目标（一行摘要），不含凭据 */
+export const targetOf = (kind: SourceKind, c: Record<string, string>) =>
+  kind === 'postgres' || kind === 'mysql' || kind === 'mongodb' ? `${c.user}@${c.host}:${c.port}/${c.database}${c.schema ? `（${c.schema}）` : ''}` : c.path;
+
 /** 源表的同步方式（由平台根据水位线候选与行数判断） */
 export const SYNC_MODES = {
   watermark: '水位线增量',

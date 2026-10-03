@@ -3,10 +3,11 @@
 // 范围内各表的行数、列统计、同步方式与频率、是否已进湖与水位线候选，成员从候选中确认水位线字段，没有主键的表声明业务主键（可多列），
 // 有主键的表声明软删除字段；手动触发同步，查看每张表的同步历史。
 // 「湖中数据」标签页（?tab=lake）：最近一次核对的结果，每表一行显示覆盖、位置与文件、结构、数据量四项，可展开明细；
-// 手动触发核对，有差异时触发一次主键比对同步
-import { useEffect, useState } from 'react';
+// 手动触发核对，有差异时触发一次主键比对同步。
+// 页头下是类型、目标、同步表数、核对状态四张指标卡，两个标签页的内容放在一个白色面板里
+import { Fragment, useEffect, useState } from 'react';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
-import { CircleAlert, CircleCheck } from 'lucide-react';
+import { CircleAlert, CircleCheck, PlugZap, RefreshCw } from 'lucide-react';
 import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
@@ -17,13 +18,18 @@ import {
 } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import type { DataCheck, FailedCheck, FileCheck, StructureCheck, VerifyRecord } from '~/.server/pipeline/verify-engine';
-import { formValues, LAKE_COVERAGE, SOURCE_KIND_LABELS, SYNC_MODES, type LakeCoverage } from '~/lib/sources';
+import { formValues, LAKE_COVERAGE, SOURCE_KIND_LABELS, SYNC_MODES, targetOf, type LakeCoverage } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
+import { KindIcon } from '~/components/kind-icon';
+import { PageHeader } from '~/components/page-header';
+import { PillTabs } from '~/components/pill-tabs';
 import { SourceFields } from '~/components/source-fields';
+import { StatTile } from '~/components/stat-tile';
+import { StatusText, type StatusTone } from '~/components/status-text';
+import { VerifyBadge } from '~/components/verify-badge';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Badge } from '~/components/ui/badge';
 import { Button } from '~/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
 import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
@@ -164,11 +170,13 @@ export async function action({ request, params }: Route.ActionArgs) {
   throw redirect(`/sources/${params.sourceId}${tabOf(request) === 'lake' ? '?tab=lake' : ''}`);
 }
 
-const TASK_VARIANTS = { none: 'outline', queued: 'outline', running: 'secondary', succeeded: 'default', failed: 'destructive' } as const;
+/** 后台任务（采集、同步、核对）状态对应的色调 */
+const TASK_TONES = { none: 'none', queued: 'pending', running: 'pending', succeeded: 'ok', failed: 'bad' } as const satisfies Record<TaskStatus, StatusTone>;
 const SYNC_VARIANTS = { watermark: 'default', needs_confirmation: 'secondary', full_compare: 'outline' } as const;
 const pct = (n: number) => `${Math.round(n * 1000) / 10}%`;
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
+type TaskStatus = Route.ComponentProps['loaderData']['verify']['status'];
 type TableView = Route.ComponentProps['loaderData']['tables'][number];
 type ListedView = Route.ComponentProps['loaderData']['listing'][number];
 type SyncEntry = Route.ComponentProps['loaderData']['sync']['history'][string][number];
@@ -238,9 +246,9 @@ function LakeCoverage({ listing }: { listing: ListedView[] }) {
     unreadable ? `账号没有读权限 ${unreadable} 张` : '',
   ].filter(Boolean).join('，');
   return (
-    <div className={`text-sm ${missing.length ? 'text-destructive' : 'text-muted-foreground'}`} data-lake-coverage>
+    <StatusText tone={missing.length ? 'bad' : scoped.length ? 'ok' : 'none'} data-lake-coverage>
       {`已进湖 ${scoped.length - missing.length} 张，未进湖 ${missing.length} 张${missing.length ? `：${missing.join('、')}` : ''}${others ? `；${others}` : ''}`}
-    </div>
+    </StatusText>
   );
 }
 
@@ -264,7 +272,7 @@ function SyncScope({ listing, newTables, canWrite, submitting }: { listing: List
     <Form method="post" className="space-y-3">
       <input type="hidden" name="intent" value="scope" />
       {newTables > 0 && (
-        <div className="text-sm text-destructive" data-new-tables={newTables}>{`有 ${newTables} 张新表未选`}</div>
+        <StatusText tone="pending" data-new-tables={newTables}>{`有 ${newTables} 张新表未选`}</StatusText>
       )}
       {canWrite && (
         <div className="flex flex-wrap items-center gap-2">
@@ -325,7 +333,7 @@ function SyncScope({ listing, newTables, canWrite, submitting }: { listing: List
                   <TableCell className="font-mono">{t.name}</TableCell>
                   <TableCell>{t.estimatedRows === null ? '—' : `约 ${t.estimatedRows.toLocaleString('zh-CN')}`}</TableCell>
                   <TableCell className="space-x-1 whitespace-normal">
-                    {t.gone && <Badge variant="destructive" data-gone>源端已不存在</Badge>}
+                    {t.gone && <StatusText tone="bad" data-gone>源端已不存在</StatusText>}
                     {!t.readable && !t.gone && <Badge variant="outline">账号没有读权限</Badge>}
                     {t.isNew && <Badge variant="secondary" data-new>新表</Badge>}
                     {t.inScope && (
@@ -479,15 +487,15 @@ function SoftDelete({ table, canWrite, submitting }: { table: TableView; canWrit
   );
 }
 
-const COVERAGE_VARIANTS: Record<LakeCoverage, 'default' | 'secondary' | 'outline' | 'destructive'> = {
-  in_lake: 'secondary',
-  out_of_scope: 'outline',
-  pending_profile: 'outline',
-  needs_watermark: 'outline',
-  pending_sync: 'outline',
-  sync_failed: 'destructive',
-  unreadable: 'outline',
-  gone: 'destructive',
+const COVERAGE_TONES: Record<LakeCoverage, StatusTone> = {
+  in_lake: 'ok',
+  out_of_scope: 'none',
+  pending_profile: 'pending',
+  needs_watermark: 'pending',
+  pending_sync: 'pending',
+  sync_failed: 'bad',
+  unreadable: 'none',
+  gone: 'bad',
 };
 
 const failed = (c: { ok: boolean } | undefined): c is FailedCheck => !!c && 'error' in c;
@@ -498,8 +506,10 @@ const passed = <T extends { ok: boolean }>(c: T | FailedCheck | undefined) => (c
 function CheckCell<T extends { ok: boolean }>({ name, check, summary }: { name: string; check: T | FailedCheck | undefined; summary: (c: T) => string }) {
   if (!check) return <TableCell className="text-muted-foreground">—</TableCell>;
   return (
-    <TableCell className={`whitespace-normal ${check.ok ? '' : 'text-destructive'}`} data-check={name} data-ok={String(check.ok)}>
-      {failed(check) ? '出错' : summary(check as T)}
+    <TableCell className="whitespace-normal">
+      <StatusText tone={check.ok ? 'ok' : 'bad'} className="items-start [&>svg]:mt-0.5" data-check={name} data-ok={String(check.ok)}>
+        {failed(check) ? '出错' : summary(check as T)}
+      </StatusText>
     </TableCell>
   );
 }
@@ -602,106 +612,88 @@ type VerifyView = Route.ComponentProps['loaderData']['verify'];
 function LakeData({ verify, canWrite, submitting, busy }: { verify: VerifyView; canWrite: boolean; submitting: boolean; busy: boolean }) {
   const reconcilable = verify.tables.some(t => passed(t.structure)?.ok === false || passed(t.data)?.ok === false);
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          湖中数据
-          <Badge variant={TASK_VARIANTS[verify.status]} data-verify-status={verify.status}>{`核对${verify.statusLabel}`}</Badge>
-        </CardTitle>
-        <CardDescription>
-          {`从源端的全部表出发，核对每张表的数据进了湖里的什么位置、文件是否真实存在、结构与数据量是否与源端一致。核对只读、只出报告，不修改湖中数据；每天自动核对一次。最近一次核对：${time(verify.verifiedAt)}`}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {verify.status === 'failed' && verify.error && (
-          <div className="text-sm text-destructive">{`${time(verify.attemptedAt)} 提交的核对失败：${verify.error}`}</div>
-        )}
-        {canWrite && (
-          <div className="flex gap-2">
+    <section className="space-y-3">
+      <SectionHeader title="湖中数据" status={<StatusText tone={TASK_TONES[verify.status]} data-verify-status={verify.status}>{`核对${verify.statusLabel}`}</StatusText>}>
+        {`从源端的全部表出发，核对每张表的数据进了湖里的什么位置、文件是否真实存在、结构与数据量是否与源端一致。核对只读、只出报告，不修改湖中数据；每天自动核对一次。最近一次核对：${time(verify.verifiedAt)}`}
+      </SectionHeader>
+      {verify.status === 'failed' && verify.error && (
+        <StatusText tone="bad">{`${time(verify.attemptedAt)} 提交的核对失败：${verify.error}`}</StatusText>
+      )}
+      {canWrite && (
+        <div className="flex gap-2">
+          <Form method="post">
+            <input type="hidden" name="intent" value="verify" />
+            <Button type="submit" variant="outline" disabled={submitting || busy}>{busy ? '同步或核对进行中…' : '核对'}</Button>
+          </Form>
+          {reconcilable && (
             <Form method="post">
-              <input type="hidden" name="intent" value="verify" />
-              <Button type="submit" variant="outline" disabled={submitting || busy}>{busy ? '同步或核对进行中…' : '核对'}</Button>
+              <input type="hidden" name="intent" value="reconcile" />
+              <Button type="submit" disabled={submitting || busy}>立即主键比对</Button>
             </Form>
-            {reconcilable && (
-              <Form method="post">
-                <input type="hidden" name="intent" value="reconcile" />
-                <Button type="submit" disabled={submitting || busy}>立即主键比对</Button>
-              </Form>
-            )}
-          </div>
-        )}
-        {verify.verifiedAt && (
-          <div className={`text-sm ${verify.differences ? 'text-destructive' : 'text-muted-foreground'}`} data-verify-summary>
-            {verifySummary(verify.tables, verify.differences)}
-          </div>
-        )}
-        {verify.differences > 0 && !reconcilable && (
-          <div className="text-sm text-muted-foreground" data-files-only>
-            差异只在文件上（文件缺失、大小或尾部元数据不符、孤儿文件）：主键比对修不了，请联系运营者检查存储
-          </div>
-        )}
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>表</TableHead>
-              <TableHead>覆盖</TableHead>
-              <TableHead>源端行数</TableHead>
-              <TableHead>位置</TableHead>
-              <TableHead>文件</TableHead>
-              <TableHead>结构</TableHead>
-              <TableHead>数据量</TableHead>
+          )}
+        </div>
+      )}
+      {verify.verifiedAt && (
+        <StatusText tone={verify.differences ? 'bad' : 'ok'} data-verify-summary>
+          {verifySummary(verify.tables, verify.differences)}
+        </StatusText>
+      )}
+      {verify.differences > 0 && !reconcilable && (
+        <div className="text-sm text-muted-foreground" data-files-only>
+          差异只在文件上（文件缺失、大小或尾部元数据不符、孤儿文件）：主键比对修不了，请联系运营者检查存储
+        </div>
+      )}
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>表</TableHead>
+            <TableHead>覆盖</TableHead>
+            <TableHead>源端行数</TableHead>
+            <TableHead>位置</TableHead>
+            <TableHead>文件</TableHead>
+            <TableHead>结构</TableHead>
+            <TableHead>数据量</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {verify.tables.map(t => (
+            <TableRow key={t.table} data-verify-table={t.table} data-coverage={t.coverage} data-verify-ok={t.ok === null ? undefined : String(t.ok)}>
+              <TableCell className="align-top">
+                <div className="font-mono font-medium">{t.table}</div>
+                <VerifyDetail t={t} />
+              </TableCell>
+              <TableCell className="align-top">
+                <StatusText tone={COVERAGE_TONES[t.coverage]}>{LAKE_COVERAGE[t.coverage]}</StatusText>
+              </TableCell>
+              <TableCell className="align-top">
+                {t.sourceRows === null ? '—' : `${t.rowsEstimated ? '约 ' : ''}${count(t.sourceRows)}`}
+              </TableCell>
+              <TableCell className="align-top font-mono text-xs">{t.location ? `${t.location.schema}.${t.location.table}` : '—'}</TableCell>
+              <CheckCell name="files" check={t.files} summary={fileSummary} />
+              <CheckCell name="structure" check={t.structure} summary={structureSummary} />
+              <CheckCell name="data" check={t.data} summary={dataSummary} />
             </TableRow>
-          </TableHeader>
-          <TableBody>
-            {verify.tables.map(t => (
-              <TableRow key={t.table} data-verify-table={t.table} data-coverage={t.coverage} data-verify-ok={t.ok === null ? undefined : String(t.ok)}>
-                <TableCell className="align-top">
-                  <div className="font-mono font-medium">{t.table}</div>
-                  <VerifyDetail t={t} />
-                </TableCell>
-                <TableCell className="align-top">
-                  <Badge variant={COVERAGE_VARIANTS[t.coverage]}>{LAKE_COVERAGE[t.coverage]}</Badge>
-                </TableCell>
-                <TableCell className="align-top">
-                  {t.sourceRows === null ? '—' : `${t.rowsEstimated ? '约 ' : ''}${count(t.sourceRows)}`}
-                </TableCell>
-                <TableCell className="align-top font-mono text-xs">{t.location ? `${t.location.schema}.${t.location.table}` : '—'}</TableCell>
-                <CheckCell name="files" check={t.files} summary={fileSummary} />
-                <CheckCell name="structure" check={t.structure} summary={structureSummary} />
-                <CheckCell name="data" check={t.data} summary={dataSummary} />
-              </TableRow>
-            ))}
-            {!verify.tables.length && (
-              <TableRow>
-                <TableCell colSpan={7} className="text-center text-muted-foreground">
-                  {verify.status === 'queued' || verify.status === 'running' ? '正在核对…' : '还没有核对结果'}
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-      </CardContent>
-    </Card>
+          ))}
+          {!verify.tables.length && (
+            <TableRow>
+              <TableCell colSpan={7} className="text-center text-muted-foreground">
+                {verify.status === 'queued' || verify.status === 'running' ? '正在核对…' : '还没有核对结果'}
+              </TableCell>
+            </TableRow>
+          )}
+        </TableBody>
+      </Table>
+    </section>
   );
 }
 
-/** 标签页：概览与湖中数据 */
-function Tabs({ sourceId, tab }: { sourceId: string; tab: 'overview' | 'lake' }) {
-  const link = (to: string, active: boolean, label: string, name: string) => (
-    <Link
-      to={to}
-      data-tab={name}
-      aria-current={active ? 'page' : undefined}
-      className={`border-b-2 px-3 py-2 text-sm ${active ? 'border-primary font-medium' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
-    >
-      {label}
-    </Link>
-  );
+/** 面板里一个分区的标题：h2、状态与一段说明 */
+function SectionHeader({ title, status, children }: { title: string; status?: React.ReactNode; children?: React.ReactNode }) {
   return (
-    <nav className="flex border-b">
-      {link(`/sources/${sourceId}`, tab === 'overview', '概览', 'overview')}
-      {link(`/sources/${sourceId}?tab=lake`, tab === 'lake', '湖中数据', 'lake')}
-    </nav>
+    <div className="space-y-1">
+      <h2 className="flex items-center gap-3 text-lg font-semibold">{title}{status}</h2>
+      {children && <p className="max-w-2xl text-sm text-slate-500">{children}</p>}
+    </div>
   );
 }
 
@@ -720,8 +712,26 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
   }, [profiling, syncing, verifying, revalidator]);
   const synced = Object.entries(sync.history);
   const values = actionData?.values ?? { name: source.name, ...source.config };
+  const base = `/sources/${source.id}`;
   return (
     <AppShell email={email} nav={nav}>
+      <PageHeader
+        title={source.name}
+        description={<><Link to="/sources" className="hover:underline">← 数据源</Link>{` · 登记于 ${time(source.createdAt)}`}</>}
+        actions={canWrite && (
+          <>
+            <Form method="post">
+              <input type="hidden" name="intent" value="test" />
+              <Button type="submit" variant="outline" disabled={submitting}><PlugZap />测试连接</Button>
+            </Form>
+            <Form method="post">
+              <input type="hidden" name="intent" value="refresh" />
+              <Button type="submit" variant="outline" disabled={submitting}><RefreshCw />重新列出表并采集</Button>
+            </Form>
+          </>
+        )}
+      />
+
       {actionData?.error && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />
@@ -737,171 +747,163 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
         </Alert>
       )}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>{source.name}</CardTitle>
-          <CardDescription>
-            <Link to="/sources" className="hover:underline">数据源</Link>
-            {` · ${SOURCE_KIND_LABELS[source.kind]} · 登记于 ${time(source.createdAt)}`}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <dl className="grid grid-cols-[8rem_1fr] gap-x-4 gap-y-1 text-sm">
-            {Object.entries(source.config).map(([k, v]) => (
-              <div key={k} className="contents">
-                <dt className="text-muted-foreground">{CONFIG_LABELS[k] ?? k}</dt>
-                <dd className="font-mono">{v}</dd>
-              </div>
-            ))}
-            <dt className="text-muted-foreground">凭据</dt>
-            <dd>{`已加密保存，不可查看${source.credentialsRotatedAt ? `（${time(source.credentialsRotatedAt)} 轮换）` : ''}`}</dd>
-          </dl>
-          {canWrite && (
-            <div className="flex gap-2">
-              <Form method="post">
-                <input type="hidden" name="intent" value="test" />
-                <Button type="submit" variant="outline" disabled={submitting}>测试连接</Button>
-              </Form>
-              <Form method="post">
-                <input type="hidden" name="intent" value="refresh" />
-                <Button type="submit" variant="outline" disabled={submitting}>重新列出表并采集</Button>
-              </Form>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <StatTile
+          label="类型"
+          value={<span className="flex items-center gap-3 text-xl"><KindIcon kind={source.kind} />{SOURCE_KIND_LABELS[source.kind]}</span>}
+        />
+        <StatTile
+          label="目标"
+          value={<span className="block truncate font-mono text-base">{targetOf(source.kind, source.config)}</span>}
+        />
+        <StatTile label="同步表数" value={listing.filter(t => t.inScope).length} hint={`共列出 ${listing.length} 张表`} />
+        <StatTile
+          label="核对状态"
+          value={<VerifyBadge differences={verify.verifiedAt ? verify.differences : null} className="gap-2 text-3xl font-semibold [&>svg]:size-6" />}
+          hint={verifying ? '核对进行中…' : `最近一次核对：${time(verify.verifiedAt)}`}
+        />
+      </div>
 
-      <Tabs sourceId={source.id} tab={tab} />
-      {tab === 'lake' ? (
-        <LakeData verify={verify} canWrite={canWrite} submitting={submitting} busy={syncing || verifying} />
-      ) : (<>
-      <Card>
-        <CardHeader>
-          <CardTitle>同步范围</CardTitle>
-          <CardDescription>
-            只有选入同步范围的表才会采集列统计、同步进原始层。新出现的表默认不选；移出范围只停止同步，已进湖的数据保留，重新选回后接着同步。
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <SyncScope
-            key={listing.map(t => `${t.name}:${t.inScope}`).join('\n')}
-            listing={listing}
-            newTables={newTables}
-            canWrite={canWrite}
-            submitting={submitting}
-          />
-        </CardContent>
-      </Card>
+      <PillTabs
+        current={tab}
+        tabs={[
+          { key: 'overview', label: '概览', href: base },
+          { key: 'lake', label: '湖中数据', href: `${base}?tab=lake` },
+        ]}
+      />
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            源表
-            <Badge variant={TASK_VARIANTS[profile.status]} data-profile-status={profile.status}>{`采集${profile.statusLabel}`}</Badge>
-          </CardTitle>
-          <CardDescription>
-            {`同步范围内的表：有更新时间或自增主键的按水位线增量同步（需确认字段），没有的全量比对：每小时一次，大表每天一次。最近采集：${time(profile.profiledAt)}`}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {listing.length > 0 && <LakeCoverage listing={listing} />}
-          {profile.status === 'failed' && profile.error && (
-            <div className="text-sm text-destructive">{`${time(profile.attemptedAt)} 提交的采集失败：${profile.error}`}</div>
-          )}
-          {profile.unreadable.length > 0 && (
-            <div className="text-sm text-muted-foreground" data-unreadable>
-              {`账号没有读权限的 ${profile.unreadable.length} 张表不能选入同步范围：${profile.unreadable.join('、')}。需要时在源库授予 SELECT 后重新列出表`}
-            </div>
-          )}
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>表</TableHead>
-                <TableHead>行数</TableHead>
-                <TableHead>同步方式</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {tables.map(t => (
-                <TableRow key={t.name} data-table={t.name} data-sync-mode={t.syncMode}>
-                  <TableCell className="align-top">
-                    <div className="font-mono font-medium">{t.name}</div>
-                    <ColumnStats table={t} />
-                  </TableCell>
-                  <TableCell className="align-top">{t.rows.toLocaleString('zh-CN')}</TableCell>
-                  <TableCell className="space-y-1 align-top whitespace-normal">
-                    <div className="flex flex-wrap gap-1">
-                      <Badge variant={SYNC_VARIANTS[t.syncMode]}>{SYNC_MODES[t.syncMode]}</Badge>
-                      <Badge variant={t.notInLake ? 'destructive' : 'secondary'} data-in-lake={String(!t.notInLake)}>
-                        {t.notInLake ? `未进湖：${t.notInLake}` : '已进湖'}
-                      </Badge>
-                    </div>
-                    <div className="text-xs text-muted-foreground">{t.syncModeNote}</div>
-                    <Watermark table={t} canWrite={canWrite} submitting={submitting} />
-                    <Key table={t} canWrite={canWrite} submitting={submitting} />
-                    <SoftDelete table={t} canWrite={canWrite} submitting={submitting} />
-                  </TableCell>
-                </TableRow>
-              ))}
-              {!tables.length && (
-                <TableRow>
-                  <TableCell colSpan={3} className="text-center text-muted-foreground">
-                    {profiling ? '正在采集列统计…' : '同步范围内还没有采集过的表'}
-                  </TableCell>
-                </TableRow>
+      <div className="rounded-2xl border bg-white p-6 shadow-sm">
+        {tab === 'lake' ? (
+          <LakeData verify={verify} canWrite={canWrite} submitting={submitting} busy={syncing || verifying} />
+        ) : (
+          <div className="space-y-10">
+            <section className="space-y-3">
+              <SectionHeader title="连接" />
+              <dl className="grid grid-cols-[8rem_1fr] gap-x-4 gap-y-1 text-sm">
+                {Object.entries(source.config).map(([k, v]) => (
+                  <div key={k} className="contents">
+                    <dt className="text-muted-foreground">{CONFIG_LABELS[k] ?? k}</dt>
+                    <dd className="font-mono">{v}</dd>
+                  </div>
+                ))}
+                <dt className="text-muted-foreground">凭据</dt>
+                <dd>{`已加密保存，不可查看${source.credentialsRotatedAt ? `（${time(source.credentialsRotatedAt)} 轮换）` : ''}`}</dd>
+              </dl>
+            </section>
+
+            <section className="space-y-3">
+              <SectionHeader title="同步范围">
+                只有选入同步范围的表才会采集列统计、同步进原始层。新出现的表默认不选；移出范围只停止同步，已进湖的数据保留，重新选回后接着同步。
+              </SectionHeader>
+              <SyncScope
+                key={listing.map(t => `${t.name}:${t.inScope}`).join('\n')}
+                listing={listing}
+                newTables={newTables}
+                canWrite={canWrite}
+                submitting={submitting}
+              />
+            </section>
+
+            <section className="space-y-3">
+              <SectionHeader
+                title="源表"
+                status={<StatusText tone={TASK_TONES[profile.status]} data-profile-status={profile.status}>{`采集${profile.statusLabel}`}</StatusText>}
+              >
+                {`同步范围内的表：有更新时间或自增主键的按水位线增量同步（需确认字段），没有的全量比对：每小时一次，大表每天一次。最近采集：${time(profile.profiledAt)}`}
+              </SectionHeader>
+              {listing.length > 0 && <LakeCoverage listing={listing} />}
+              {profile.status === 'failed' && profile.error && (
+                <StatusText tone="bad">{`${time(profile.attemptedAt)} 提交的采集失败：${profile.error}`}</StatusText>
               )}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            同步
-            <Badge variant={TASK_VARIANTS[sync.status]} data-sync-status={sync.status}>{sync.statusLabel}</Badge>
-          </CardTitle>
-          <CardDescription>
-            {`已确认水位线的表每小时增量同步一次，首次同步为全表读取，每天再比对一次（有主键的比对主键全集，没有的整行比对），补上源端的删除与漏掉的行。没有水位线的表全量比对，大表每天一次（立即同步时大表一并同步）。变化都以变更批次追加到原始层。最近一次：${time(sync.attemptedAt)} 提交`}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {sync.status === 'failed' && sync.error && <div className="text-sm text-destructive">{`同步失败：${sync.error}`}</div>}
-          {canWrite && (
-            <Form method="post">
-              <input type="hidden" name="intent" value="sync" />
-              <Button type="submit" variant="outline" disabled={submitting || syncing}>{syncing ? '同步中…' : '立即同步'}</Button>
-            </Form>
-          )}
-          {synced.map(([table, entries]) => <SyncHistory key={table} table={table} entries={entries} />)}
-          {!synced.length && <div className="text-sm text-muted-foreground">还没有同步记录</div>}
-        </CardContent>
-      </Card>
-
-      {canWrite && (
-        <Card>
-          <CardHeader>
-            <CardTitle>修改与轮换凭据</CardTitle>
-            <CardDescription>保存前重新校验连接与只读。凭据留空表示沿用已保存的；主机、库名、用户名或路径变了时须重新填写。</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Form method="post">
-              <input type="hidden" name="intent" value="update" />
-              <FieldGroup>
-                <Field>
-                  <FieldLabel htmlFor="source-name">名称</FieldLabel>
-                  <Input id="source-name" name="name" required defaultValue={values.name ?? ''} />
-                </Field>
-                <SourceFields kind={source.kind} values={values} editing />
-                <div>
-                  <Button type="submit" disabled={submitting}>{submitting ? '正在校验…' : '校验并保存'}</Button>
+              {profile.unreadable.length > 0 && (
+                <div className="text-sm text-muted-foreground" data-unreadable>
+                  {`账号没有读权限的 ${profile.unreadable.length} 张表不能选入同步范围：${profile.unreadable.join('、')}。需要时在源库授予 SELECT 后重新列出表`}
                 </div>
-              </FieldGroup>
-            </Form>
-          </CardContent>
-        </Card>
-      )}
-      </>)}
+              )}
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>表</TableHead>
+                    <TableHead>行数</TableHead>
+                    <TableHead>同步方式</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {tables.map(t => (
+                    <Fragment key={t.name}>
+                      <TableRow data-table={t.name} data-sync-mode={t.syncMode} className="border-b-0">
+                        <TableCell className="align-top font-mono font-medium">{t.name}</TableCell>
+                        <TableCell className="align-top">{t.rows.toLocaleString('zh-CN')}</TableCell>
+                        <TableCell className="space-y-1 align-top whitespace-normal">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Badge variant={SYNC_VARIANTS[t.syncMode]}>{SYNC_MODES[t.syncMode]}</Badge>
+                            <StatusText tone={t.notInLake ? 'bad' : 'ok'} data-in-lake={String(!t.notInLake)}>
+                              {t.notInLake ? `未进湖：${t.notInLake}` : '已进湖'}
+                            </StatusText>
+                          </div>
+                          <div className="text-xs text-muted-foreground">{t.syncModeNote}</div>
+                          <Watermark table={t} canWrite={canWrite} submitting={submitting} />
+                          <Key table={t} canWrite={canWrite} submitting={submitting} />
+                          <SoftDelete table={t} canWrite={canWrite} submitting={submitting} />
+                        </TableCell>
+                      </TableRow>
+                      {/* 列统计单独一行占满表格宽度 */}
+                      <TableRow className="hover:bg-transparent">
+                        <TableCell colSpan={3} className="pt-0">
+                          <ColumnStats table={t} />
+                        </TableCell>
+                      </TableRow>
+                    </Fragment>
+                  ))}
+                  {!tables.length && (
+                    <TableRow>
+                      <TableCell colSpan={3} className="text-center text-muted-foreground">
+                        {profiling ? '正在采集列统计…' : '同步范围内还没有采集过的表'}
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </section>
+
+            <section className="space-y-4">
+              <SectionHeader title="同步" status={<StatusText tone={TASK_TONES[sync.status]} data-sync-status={sync.status}>{sync.statusLabel}</StatusText>}>
+                {`已确认水位线的表每小时增量同步一次，首次同步为全表读取，每天再比对一次（有主键的比对主键全集，没有的整行比对），补上源端的删除与漏掉的行。没有水位线的表全量比对，大表每天一次（立即同步时大表一并同步）。变化都以变更批次追加到原始层。最近一次：${time(sync.attemptedAt)} 提交`}
+              </SectionHeader>
+              {sync.status === 'failed' && sync.error && <StatusText tone="bad">{`同步失败：${sync.error}`}</StatusText>}
+              {canWrite && (
+                <Form method="post">
+                  <input type="hidden" name="intent" value="sync" />
+                  <Button type="submit" variant="outline" disabled={submitting || syncing}>{syncing ? '同步中…' : '立即同步'}</Button>
+                </Form>
+              )}
+              {synced.map(([table, entries]) => <SyncHistory key={table} table={table} entries={entries} />)}
+              {!synced.length && <div className="text-sm text-muted-foreground">还没有同步记录</div>}
+            </section>
+
+            {canWrite && (
+              <section className="max-w-2xl space-y-4">
+                <SectionHeader title="修改与轮换凭据">
+                  保存前重新校验连接与只读。凭据留空表示沿用已保存的；主机、库名、用户名或路径变了时须重新填写。
+                </SectionHeader>
+                <Form method="post">
+                  <input type="hidden" name="intent" value="update" />
+                  <FieldGroup>
+                    <Field>
+                      <FieldLabel htmlFor="source-name">名称</FieldLabel>
+                      <Input id="source-name" name="name" required defaultValue={values.name ?? ''} />
+                    </Field>
+                    <SourceFields kind={source.kind} values={values} editing />
+                    <div>
+                      <Button type="submit" disabled={submitting}>{submitting ? '正在校验…' : '校验并保存'}</Button>
+                    </div>
+                  </FieldGroup>
+                </Form>
+              </section>
+            )}
+          </div>
+        )}
+      </div>
     </AppShell>
   );
 }
