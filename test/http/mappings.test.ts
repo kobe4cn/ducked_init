@@ -142,7 +142,17 @@ describe('编写与发布映射', () => {
     expect((await (await loginAs(app, 'de2@acme.com')).post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
-    expect(await (await author.get(`/mappings/${id}?tab=merges`)).text()).toContain('订单状态有 1 种取值（共 50 行）落入兜底：refunded（50）');
+    const merges = await (await author.get(`/mappings/${id}?tab=merges`)).text();
+    expect(merges).toContain('订单状态有 1 种取值（共 50 行）落入兜底：refunded（50）');
+    // 一键加进值对照：打开编辑标签页的表单，定位到该字段并带上这些取值（不带版本，有草稿时也落在草稿上）
+    const href = `/mappings/${id}?tab=edit&amp;field=status&amp;add=refunded`;
+    expect(merges).toContain(`href="${href}"`);
+    const edit = await author.get(href.replaceAll('&amp;', '&'));
+    expect(edit.status).toBe(200);
+    expect(await edit.text()).toMatch(/<textarea[^>]*name="yaml"/);
+    // 不能编辑的成员看不到
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    expect(await (await (await loginAs(app, 'an@acme.com')).get(`/mappings/${id}?tab=merges`)).text()).not.toContain('data-add-to-dictionary');
   });
 
   it('发布者不能是最后保存草稿的人：A 起草、B 修改后 A 能发布、B 不能，反过来也一样', async () => {
@@ -467,5 +477,26 @@ describe('表单式映射编辑器', () => {
     const reviewer = await loginAs(app, 'de2@acme.com');
     expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
     expect(await (await reviewer.get(`/mappings/${id}?tab=versions`)).text()).toContain('data-version="1" data-version-status="published"');
+  });
+
+  it('在表单里为订单状态填好值对照（含未对应的源值）并选兜底：写出的 YAML 保存成功', async () => {
+    const { sourceId } = await tenantWithSource('acme', ORDER_LOG);
+    const author = await loginAs(app, 'de@acme.com');
+    const yaml = fillForm(mappingTemplate('order', 'order_log'), {
+      order_id: { transform: 'direct', column: 'order_no' },
+      customer_id: null,
+      status: {
+        transform: 'direct', column: 'status',
+        dictionary: [{ from: '已支付', to: 'paid' }, { from: '已退款', to: 'refunded' }, { from: '待审核', to: null }],
+        otherwise: null,
+      },
+      amount: { transform: 'cents', column: 'amount_fen' },
+      created_at: { transform: 'direct', column: 'updated_at' },
+      updated_at: { transform: 'direct', column: 'updated_at' },
+    });
+    expect(parseDocument(yaml).toJS().fields.status).toEqual({ expr: 'status', dictionary: { 已支付: 'paid', 已退款: 'refunded' }, otherwise: null });
+    const created = await author.post('/mappings', { intent: 'create', sourceId, yaml });
+    expect(created.status).toBe(302);
+    expect(editorYaml(await (await author.get(`/mappings/${mappingIdOf(created)}`)).text())).toBe(yaml);
   });
 });

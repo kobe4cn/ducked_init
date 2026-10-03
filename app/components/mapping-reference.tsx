@@ -7,7 +7,7 @@ import { Check } from 'lucide-react';
 import { entityOf, FIELD_TYPES } from '~/lib/canonical-model';
 import { mappingOutline } from '~/lib/mapping-outline';
 import { MappingEditor, type MappingEditorHandle } from '~/components/mapping-editor';
-import { MappingForm } from '~/components/mapping-form';
+import { MappingForm, type FormFocus } from '~/components/mapping-form';
 import { Button } from '~/components/ui/button';
 import { Badge } from '~/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
@@ -38,15 +38,17 @@ const TABS = [{ id: 'form', label: '表单' }, { id: 'yaml', label: 'YAML' }] as
 
 /**
  * 映射编辑区（表单 / YAML 标签页），旁边是对照面板；点击面板里的列名、字段名、写法或函数插入到 YAML 框光标处（在表单标签页时先切到 YAML）。
- * 默认打开表单；表单要脚本，hydrate 之前（及不支持脚本时）只有 YAML 框可用，照常提交。给出 value 时由外部控制内容
+ * 默认打开表单；表单要脚本，hydrate 之前（及不支持脚本时）只有 YAML 框可用，照常提交。给出 value 时由外部控制内容；
+ * 给出 focus 时表单定位到那个字段，把要加的源值作为待对应的行列进它的值对照表
  */
-export function MappingEditorWithReference({ defaultValue, value, onValueChange, table, entity, functions }: {
+export function MappingEditorWithReference({ defaultValue, value, onValueChange, table, entity, functions, focus }: {
   defaultValue: string;
   value?: string;
   onValueChange?: (yaml: string) => void;
   table: ReferenceTable | null;
   entity: string;
   functions: ReferenceFunction[];
+  focus?: FormFocus | null;
 }) {
   const editor = useRef<MappingEditorHandle>(null);
   const [own, setOwn] = useState(defaultValue);
@@ -78,7 +80,7 @@ export function MappingEditorWithReference({ defaultValue, value, onValueChange,
           ))}
         </div>
         {tab === 'form' && (
-          <MappingForm yaml={yaml} entity={entity} table={table} functions={functions} onChange={setYaml} onEditYaml={() => setTab('yaml')} />
+          <MappingForm yaml={yaml} entity={entity} table={table} functions={functions} focus={focus} onChange={setYaml} onEditYaml={() => setTab('yaml')} />
         )}
         <MappingEditor ref={editor} defaultValue={defaultValue} value={yaml} onValueChange={setYaml} hidden={tab !== 'yaml'} />
       </div>

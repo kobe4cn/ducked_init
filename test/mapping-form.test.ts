@@ -1,10 +1,11 @@
 // 映射表单与 YAML 互转（纯函数）：从映射 YAML 读出每个标准字段的表单状态（源列、常用转换、参数、依据、是否只读），
-// 改单个字段时在原 Document 上改，保留注释与顺序；表单不认识的写法只读、原样保留
+// 改单个字段时在原 Document 上改，保留注释与顺序；枚举字段的值对照与兜底读出、写回；表单不认识的写法只读、原样保留
 import { parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
-import { readForm, TRANSFORMS, writeField, type FieldChoice, type FieldForm } from '../app/lib/mapping-form';
+import { dictionaryRows, readForm, seedDictionary, TRANSFORMS, writeField, type FieldChoice, type FieldForm } from '../app/lib/mapping-form';
 import { draftMapping } from '../app/.server/pipeline/mapping-draft';
+import { checkMapping } from '../app/.server/pipeline/mapping-spec';
 import type { ColumnProfile, TableProfile } from '../app/.server/pipeline/source-engine';
 
 const ORDER = entityOf('order')!;
@@ -35,7 +36,8 @@ const CUSTOMERS = table('customers', [
 ], ['customer_id']);
 
 const field = (forms: FieldForm[], name: string) => forms.find(f => f.field === name)!;
-const choiceOf = ({ transform, column, args, parts, raw }: FieldForm): FieldChoice => ({ transform: transform!, column, args, parts, raw });
+const choiceOf = ({ transform, column, args, parts, raw, dictionary, otherwise }: FieldForm): FieldChoice =>
+  ({ transform: transform!, column, args, parts, raw, dictionary, ...(otherwise !== undefined && { otherwise }) });
 
 /** 把每个可写的字段按读出的状态原样写回 */
 function rewriteAll(yaml: string, entity = ORDER) {
@@ -96,9 +98,18 @@ describe('读出表单', () => {
     expect(field(odd, 'phone')).toMatchObject({ transform: null, column: null, raw: '', readonly: false });
   });
 
-  it('带值字典或兜底值的对象写法、解析失败的表达式与认不出的结构只读，并说明原因', () => {
-    expect(field(readForm(parseDocument(HAND), ORDER), 'status'))
-      .toMatchObject({ transform: 'direct', column: 'status', raw: 'status', readonly: true, reason: expect.stringContaining('值字典') });
+  it('枚举字段读出值对照与兜底：草稿里待填（null）的条目是未对应，没写兜底时不当作写了', () => {
+    const hand = field(readForm(parseDocument(HAND), ORDER), 'status');
+    expect(hand).toMatchObject({ transform: 'direct', column: 'status', readonly: false, dictionary: [{ from: '已支付', to: 'paid' }] });
+    expect(hand).not.toHaveProperty('otherwise');
+    const yaml = "model: 1\nentity: order\ntable: orders\nfields:\n  status:\n    expr: st\n    dictionary:\n      '2': refunded\n      9: # 待填\n    otherwise: null\n";
+    expect(field(readForm(parseDocument(yaml), ORDER), 'status'))
+      .toMatchObject({ readonly: false, dictionary: [{ from: '2', to: 'refunded' }, { from: '9', to: null }], otherwise: null });
+    // 没写值字典的枚举字段：对照为空
+    expect(field(readForm(parseDocument('fields:\n  status: st\n'), ORDER), 'status')).toMatchObject({ dictionary: [], readonly: false });
+  });
+
+  it('非枚举字段的值字典或兜底值、解析失败的表达式与认不出的结构只读，并说明原因', () => {
     const odd = readForm(parseDocument(ODD), CUSTOMER);
     expect(field(odd, 'city')).toMatchObject({ transform: 'direct', readonly: true, reason: expect.stringContaining('值字典') });
     expect(field(odd, 'name')).toMatchObject({ transform: 'custom', raw: 'foo(', readonly: true, reason: expect.stringContaining('表达式') });
@@ -149,8 +160,8 @@ describe('写回 YAML', () => {
     expect(changed).toEqual([[expect.stringMatching(/^ {2}created_at: from_timezone\(ordered_at, 'Asia\/Shanghai'\) # 同义词/), "  created_at: from_timezone(ordered_at, 'UTC')"]]);
   });
 
-  it('七种常用转换与自定义表达式都能写回并读出同样的状态', () => {
-    const choices: [string, FieldChoice, string][] = [
+  it('七种常用转换、自定义表达式与值对照 / 兜底都能写回并读出同样的状态', () => {
+    const choices: [string, FieldChoice, unknown][] = [
       ['customer_id', { transform: 'direct', column: '客户 编号' }, '"客户 编号"'],
       ['amount', { transform: 'cents', column: 'pay_fen' }, 'pay_fen / 100'],
       ['status', { transform: 'text', column: 'st' }, 'string(st)'],
@@ -161,11 +172,13 @@ describe('写回 YAML', () => {
       ['channel', { transform: 'concat', parts: [{ column: 'a' }, { text: "it's" }, { column: 'null' }] }, `concat(a, 'it''s', "null")`],
       ['store_id', { transform: 'fixed', args: ["S'01"] }, "'S''01'"],
       ['store_id', { transform: 'custom', raw: 'coalesce(a, b)' }, 'coalesce(a, b)'],
+      ['status', { transform: 'direct', column: 'st', dictionary: [{ from: '已支付', to: 'paid' }] }, { expr: 'st', dictionary: { 已支付: 'paid' } }],
+      ['status', { transform: 'direct', column: 'st', dictionary: [], otherwise: 'cancelled' }, { expr: 'st', otherwise: 'cancelled' }],
     ];
     for (const [name, choice, expr] of choices) {
       const doc = parseDocument('model: 1\nentity: order\ntable: orders\nfields:\n  order_id: order_id\n');
       writeField(doc, ORDER, name, choice);
-      expect(doc.getIn(['fields', name])).toBe(expr);
+      expect(doc.toJS().fields[name]).toEqual(expr);
       expect(field(readForm(parseDocument(doc.toString()), ORDER), name)).toMatchObject({ ...choice, readonly: false });
     }
   });
@@ -204,5 +217,62 @@ describe('写回 YAML', () => {
     expect(() => writeField(doc, CUSTOMER, 'phone', { transform: 'custom', raw: ' ' })).toThrow();
     writeField(doc, CUSTOMER, 'customer_id', { transform: 'direct', column: 'id' });
     expect(doc.toString()).toBe(ODD.replace('coalesce(id, legacy_id)', 'id'));
+  });
+});
+
+describe('值对照与兜底', () => {
+  const STATUS = 'model: 1\nentity: order\ntable: orders\nfields:\n  order_id: order_id\n  status: order_status # 同名\n';
+
+  it('填好订单状态的值对照、选兜底：写成对象写法，未对应的源值不写入，写出的 YAML 通过校验', () => {
+    const doc = parseDocument(STATUS);
+    writeField(doc, ORDER, 'status', {
+      transform: 'direct', column: 'order_status',
+      dictionary: [{ from: '已支付', to: 'paid' }, { from: 'paid', to: 'paid' }, { from: '2', to: 'refunded' }, { from: '待审核', to: null }],
+      otherwise: null,
+    });
+    const yaml = doc.toString();
+    expect(yaml).toBe(`${STATUS.replace('  status: order_status # 同名\n', '')}  status:\n    expr: order_status # 同名\n    dictionary:\n      已支付: paid\n      paid: paid\n      "2": refunded\n    otherwise: null\n`);
+    expect(checkMapping(yaml)).toMatchObject({ ok: true });
+    expect(field(readForm(parseDocument(yaml), ORDER), 'status')).toMatchObject({ dictionary: [{ from: '已支付', to: 'paid' }, { from: 'paid', to: 'paid' }, { from: '2', to: 'refunded' }], otherwise: null });
+  });
+
+  it('改对照或兜底时保留表达式与它的依据注释；去掉对照与兜底时变回标量写法', () => {
+    const yaml = draftMapping(ORDERS, ORDER);
+    const doc = parseDocument(yaml);
+    const status = field(readForm(doc, ORDER), 'status');
+    writeField(doc, ORDER, 'status', { ...choiceOf(status), dictionary: [...status.dictionary!, { from: '已关闭', to: 'cancelled' }], otherwise: 'cancelled' });
+    expect(doc.toString()).toContain('expr: status # 同名');
+    // 没变的对照条目沿用原节点
+    expect(field(readForm(doc, ORDER), 'status')).toMatchObject({ dictionary: [...status.dictionary!, { from: '已关闭', to: 'cancelled' }], otherwise: 'cancelled' });
+    expect(checkMapping(doc.toString())).toMatchObject({ ok: true });
+
+    writeField(doc, ORDER, 'status', { ...choiceOf(status), dictionary: [] });
+    expect(doc.toString()).toMatch(/^ {2}status: status # 同名/m);
+  });
+
+  it('草稿里待填（null）的条目：只改兜底时也一并去掉，写出的 YAML 通过校验', () => {
+    const doc = parseDocument(draftMapping(table('orders', [column('order_id', 'BIGINT'), column('status', 'VARCHAR', { distinct: 2, top: top('已支付', 'X9') })], ['order_id']), ORDER));
+    const status = field(readForm(doc, ORDER), 'status');
+    expect(status.dictionary).toEqual([{ from: '已支付', to: 'paid' }, { from: 'X9', to: null }]);
+    expect(checkMapping(doc.toString())).toMatchObject({ ok: false });
+    writeField(doc, ORDER, 'status', { ...choiceOf(status), otherwise: null });
+    expect(doc.toJS().fields.status).toEqual({ expr: 'status', dictionary: { 已支付: 'paid' }, otherwise: null });
+    expect(checkMapping(doc.toString())).toMatchObject({ ok: true });
+  });
+
+  it('对照表的行：已有对照在前，常见取值与落入兜底里还没对照的源值作为未对应的行接在后面，附上建议的标准值', () => {
+    expect(dictionaryRows('order', 'status', [{ from: '已支付', to: 'paid' }, { from: '待付款', to: null }], ['已支付', '已退款', 'zz', '待付款', '已退款']))
+      .toEqual([
+        { from: '已支付', to: 'paid', extra: false },
+        { from: '待付款', to: null, extra: false, suggestion: 'created' },
+        { from: '已退款', to: null, extra: true, suggestion: 'refunded' },
+        { from: 'zz', to: null, extra: true },
+      ]);
+  });
+
+  it('新建对照时按常见取值预填能确定的标准值（同值也写上），其余待对应', () => {
+    expect(seedDictionary('order', 'status', ['paid', '已退款', '99'])).toEqual([
+      { from: 'paid', to: 'paid' }, { from: '已退款', to: 'refunded' }, { from: '99', to: null },
+    ]);
   });
 });

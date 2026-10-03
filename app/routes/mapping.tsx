@@ -1,7 +1,8 @@
 // app/routes/mapping.tsx —— 单个映射：各版本（已发布的锁定、草稿可改）、编辑与丢弃草稿（数据工程师、管理员）、发布草稿（需最后保存它的人以外的
 // 另一位有发布权限的成员，最后保存的人看到不能发布的原因，租户里只有自己有发布权限时提示先邀请成员；编辑框旁对照源表的列统计与实体的标准字段；
 // 可按规则重新生成草稿填进编辑框，不保存），以及这个映射每次合并到标准层的结果；有已发布版本时可以立即合并这一个映射。
-// 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）
+// 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）；
+// 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）
 import { AlertTriangle, ArrowRight, Boxes, CheckCircle2, Lock, PencilLine, Play, Trash2, Upload } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
@@ -9,6 +10,7 @@ import { can, deniedReason, requirePermission } from '~/.server/access';
 import { discardDraft, draftForMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
+import { isEnumField } from '~/lib/mapping-form';
 import type { FallbackStat } from '~/.server/pipeline/merge-engine';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel, entityOf } from '~/lib/canonical-model';
@@ -33,18 +35,26 @@ const tabOf = (request: Request): Tab => {
   return TABS.find(t => t === tab) ?? 'edit';
 };
 
+const focusOf = (url: URL) => {
+  const field = url.searchParams.get('field');
+  return field ? { field, add: url.searchParams.getAll('add') } : null;
+};
+
 export async function loader({ request, params }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   try {
     const m = await getMapping(member, params.mappingId);
     const canPublish = can(member.role, 'publish');
     const canWrite = can(member.role, 'sources:write');
+    const url = new URL(request.url);
     return {
       email: member.email,
       nav: navFor(member),
       tab: tabOf(request),
       /** 编辑页显示的版本（?version=N，没有这一版时为 null，显示最新的一版） */
-      version: Number(new URL(request.url).searchParams.get('version')) || null,
+      version: Number(url.searchParams.get('version')) || null,
+      /** 表单定位到的字段与要加进它值对照表的源值（?field=&add=） */
+      focus: focusOf(url),
       canWrite,
       functions: functionList(),
       mapping: {
@@ -127,7 +137,11 @@ function fallbackText(entity: string, f: FallbackStat) {
   return `${label}有 ${f.distinct} 种取值（共 ${f.rows.toLocaleString('zh-CN')} 行）落入兜底：${values}${f.distinct > f.values.length ? ' 等' : ''}`;
 }
 
-function MergeRow({ e }: { e: MergeEntry }) {
+/** 把落入兜底的取值加进值对照：打开编辑标签页的表单，定位到该字段（只用于标准枚举字段） */
+const addToDictionaryHref = (base: string, f: FallbackStat) =>
+  `${base}?${new URLSearchParams([['tab', 'edit'], ['field', f.column], ...f.values.map(v => ['add', v.value])])}`;
+
+function MergeRow({ e, base, canWrite }: { e: MergeEntry; base: string; canWrite: boolean }) {
   if ('error' in e || 'skipped' in e) {
     return (
       <TableRow data-merge-error={'error' in e ? true : undefined}>
@@ -146,7 +160,12 @@ function MergeRow({ e }: { e: MergeEntry }) {
       <TableCell className="whitespace-normal">
         {`${e.rows.toLocaleString('zh-CN')} 行（新增 ${e.inserted}，更新 ${e.updated}，删除 ${e.deleted}）`}
         {e.fallback?.map(f => (
-          <div key={f.column} className="text-sm text-muted-foreground" data-merge-fallback={f.column}>{fallbackText(e.entity, f)}</div>
+          <div key={f.column} className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground" data-merge-fallback={f.column}>
+            {fallbackText(e.entity, f)}
+            {canWrite && isEnumField(entityOf(e.entity)?.fields.find(x => x.name === f.column)) && (
+              <Button asChild size="xs" variant="outline"><Link to={addToDictionaryHref(base, f)} data-add-to-dictionary={f.column}>加进值对照</Link></Button>
+            )}
+          </div>
         ))}
       </TableCell>
       <TableCell>{duration(e.durationMs)}</TableCell>
@@ -192,7 +211,7 @@ function DraftActions({ v, canWrite, published, submitting }: { v: Version; canW
 }
 
 export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, version, canWrite, functions, mapping, versions, merge } = loaderData;
+  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, merge } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -272,7 +291,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
             </div>
             {canWrite && (selected.status === 'draft' || !draft) ? (
               <Form method="post" className="space-y-3" key={`${selected.version}-${actionData?.draftId ?? ''}`}>
-                <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} functions={functions} />
+                <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} functions={functions} focus={focus} />
                 <div className="flex gap-2">
                   <Button type="submit" name="intent" value="save" disabled={submitting}>
                     {submitting ? '正在处理…' : selected.status === 'draft' ? '校验并保存草稿' : '校验并保存为新草稿'}
@@ -335,7 +354,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {merge.history.map((e, i) => <MergeRow key={`${e.taskId}-${i}`} e={e} />)}
+                {merge.history.map((e, i) => <MergeRow key={`${e.taskId}-${i}`} e={e} base={base} canWrite={canWrite} />)}
                 {!merge.history.length && (
                   <TableRow>
                     <TableCell colSpan={5} className="text-center text-slate-500">还没有合并过</TableCell>
