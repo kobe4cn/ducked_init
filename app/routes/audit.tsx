@@ -4,7 +4,7 @@ import { requirePermission } from '~/.server/access';
 import { AUDIT_PAGE_SIZE, listAuditLogs } from '~/.server/audit';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
+import { PageHeader } from '~/components/page-header';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
 export function meta({}: Route.MetaArgs) {
@@ -26,12 +26,10 @@ export default function Audit({ loaderData }: Route.ComponentProps) {
   const { email, nav, pageSize, logs } = loaderData;
   return (
     <AppShell email={email} nav={nav}>
-      <Card>
-        <CardHeader>
-          <CardTitle>审计日志</CardTitle>
-          <CardDescription>本租户最近 {pageSize} 条关键操作记录，按时间倒序。</CardDescription>
-        </CardHeader>
-        <CardContent>
+      <PageHeader title="审计日志" description={`本租户最近 ${pageSize} 条关键操作记录，按时间倒序。`} />
+
+      {logs.length ? (
+        <div className="rounded-2xl border bg-white p-6 shadow-sm">
           <Table>
             <TableHeader>
               <TableRow>
@@ -44,21 +42,18 @@ export default function Audit({ loaderData }: Route.ComponentProps) {
             <TableBody>
               {logs.map(l => (
                 <TableRow key={l.id} data-audit-action={l.action}>
-                  <TableCell className="text-muted-foreground">{new Date(l.at).toLocaleString('zh-CN')}</TableCell>
+                  <TableCell className="text-slate-500">{new Date(l.at).toLocaleString('zh-CN')}</TableCell>
                   <TableCell>{l.actor}</TableCell>
                   <TableCell>{l.action}</TableCell>
                   <TableCell>{l.summary}</TableCell>
                 </TableRow>
               ))}
-              {!logs.length && (
-                <TableRow>
-                  <TableCell colSpan={4} className="text-center text-muted-foreground">暂无记录</TableCell>
-                </TableRow>
-              )}
             </TableBody>
           </Table>
-        </CardContent>
-      </Card>
+        </div>
+      ) : (
+        <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">暂无记录。邀请成员、修改角色、发布映射等关键操作会记录在这里。</div>
+      )}
     </AppShell>
   );
 }

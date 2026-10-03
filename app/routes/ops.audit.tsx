@@ -3,7 +3,7 @@ import type { Route } from './+types/ops.audit';
 import { AUDIT_PAGE_SIZE, listOperatorAuditLogs } from '~/.server/audit';
 import { requireOperator } from '~/.server/ops-auth';
 import { OpsShell } from '~/components/ops-shell';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
+import { PageHeader } from '~/components/page-header';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
 export function meta({}: Route.MetaArgs) {
@@ -24,12 +24,10 @@ export default function OpsAudit({ loaderData }: Route.ComponentProps) {
   const { email, pageSize, logs } = loaderData;
   return (
     <OpsShell email={email}>
-      <Card>
-        <CardHeader>
-          <CardTitle>审计日志</CardTitle>
-          <CardDescription>最近 {pageSize} 条运营者操作与平台级事件，按时间倒序。成员在租户内的操作不在此显示。</CardDescription>
-        </CardHeader>
-        <CardContent>
+      <PageHeader title="审计日志" description={`最近 ${pageSize} 条运营者操作与平台级事件，按时间倒序。成员在租户内的操作不在此显示。`} />
+
+      {logs.length ? (
+        <div className="rounded-2xl border bg-white p-6 shadow-sm">
           <Table>
             <TableHeader>
               <TableRow>
@@ -43,22 +41,19 @@ export default function OpsAudit({ loaderData }: Route.ComponentProps) {
             <TableBody>
               {logs.map(l => (
                 <TableRow key={l.id} data-audit-action={l.action}>
-                  <TableCell className="text-muted-foreground">{new Date(l.at).toLocaleString('zh-CN')}</TableCell>
+                  <TableCell className="text-slate-500">{new Date(l.at).toLocaleString('zh-CN')}</TableCell>
                   <TableCell>{l.actor}</TableCell>
                   <TableCell>{l.action}</TableCell>
-                  <TableCell>{l.tenant ?? <span className="text-muted-foreground">平台</span>}</TableCell>
+                  <TableCell>{l.tenant ?? <span className="text-slate-500">平台</span>}</TableCell>
                   <TableCell>{l.summary}</TableCell>
                 </TableRow>
               ))}
-              {!logs.length && (
-                <TableRow>
-                  <TableCell colSpan={5} className="text-center text-muted-foreground">暂无记录</TableCell>
-                </TableRow>
-              )}
             </TableBody>
           </Table>
-        </CardContent>
-      </Card>
+        </div>
+      ) : (
+        <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">暂无记录。运营者登录、开通与停用租户等操作会记录在这里。</div>
+      )}
     </OpsShell>
   );
 }

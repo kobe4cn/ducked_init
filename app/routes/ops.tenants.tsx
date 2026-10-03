@@ -5,10 +5,11 @@ import type { Route } from './+types/ops.tenants';
 import { requireOperator } from '~/.server/ops-auth';
 import { createTenant, listTenants, TenantError } from '~/.server/tenants';
 import { OpsShell } from '~/components/ops-shell';
-import { TenantStatusBadge } from '~/components/tenant-status-badge';
+import { PageHeader } from '~/components/page-header';
+import { SectionHeader } from '~/components/section-header';
+import { TenantStatus } from '~/components/tenant-status';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
 import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
@@ -45,6 +46,8 @@ export default function OpsTenants({ loaderData, actionData }: Route.ComponentPr
   const submitting = useNavigation().state === 'submitting';
   return (
     <OpsShell email={email}>
+      <PageHeader title="租户" description="运营后台只显示租户的成员数与管理员邮箱，不显示成员名单与业务数据。" />
+
       {actionData?.error && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />
@@ -53,39 +56,30 @@ export default function OpsTenants({ loaderData, actionData }: Route.ComponentPr
         </Alert>
       )}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>开通租户</CardTitle>
-          <CardDescription>同时创建默认空间与首个管理员；管理员随后用该邮箱通过登录链接进入平台。</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Form method="post">
-            <input type="hidden" name="intent" value="create-tenant" />
-            <FieldGroup className="flex-row items-end">
-              <Field>
-                <FieldLabel htmlFor="tenant-slug">标识</FieldLabel>
-                <Input id="tenant-slug" name="slug" required placeholder="acme" />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="tenant-name">名称</FieldLabel>
-                <Input id="tenant-name" name="name" required placeholder="示例商贸" />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="tenant-admin">首个管理员邮箱</FieldLabel>
-                <Input id="tenant-admin" type="email" name="adminEmail" required placeholder="admin@company.com" />
-              </Field>
-              <Button type="submit" disabled={submitting}>开通</Button>
-            </FieldGroup>
-          </Form>
-        </CardContent>
-      </Card>
+      <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        <SectionHeader title="开通租户">同时创建默认空间与首个管理员；管理员随后用该邮箱通过登录链接进入平台。</SectionHeader>
+        <Form method="post">
+          <input type="hidden" name="intent" value="create-tenant" />
+          <FieldGroup className="flex-row items-end">
+            <Field>
+              <FieldLabel htmlFor="tenant-slug">标识</FieldLabel>
+              <Input id="tenant-slug" name="slug" required placeholder="acme" />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="tenant-name">名称</FieldLabel>
+              <Input id="tenant-name" name="name" required placeholder="示例商贸" />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="tenant-admin">首个管理员邮箱</FieldLabel>
+              <Input id="tenant-admin" type="email" name="adminEmail" required placeholder="admin@company.com" />
+            </Field>
+            <Button type="submit" disabled={submitting}>开通</Button>
+          </FieldGroup>
+        </Form>
+      </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>租户</CardTitle>
-          <CardDescription>运营后台只显示租户的成员数与管理员邮箱，不显示成员名单与业务数据。</CardDescription>
-        </CardHeader>
-        <CardContent>
+      {tenants.length ? (
+        <div className="rounded-2xl border bg-white p-6 shadow-sm">
           <Table>
             <TableHeader>
               <TableRow>
@@ -108,15 +102,15 @@ export default function OpsTenants({ loaderData, actionData }: Route.ComponentPr
                   data-suspended-at={t.suspendedAt ?? undefined}
                 >
                   <TableCell>
-                    <Link to={`/ops/tenants/${t.id}`} className="underline underline-offset-4">{t.name}</Link>
+                    <Link to={`/ops/tenants/${t.id}`} className="font-medium hover:underline">{t.name}</Link>
                   </TableCell>
                   <TableCell className="font-mono">{t.slug}</TableCell>
-                  <TableCell className="text-muted-foreground">{new Date(t.createdAt).toLocaleDateString('zh-CN')}</TableCell>
+                  <TableCell className="text-slate-500">{new Date(t.createdAt).toLocaleDateString('zh-CN')}</TableCell>
                   <TableCell>
                     <div className="flex flex-col gap-1">
-                      <TenantStatusBadge suspended={!!t.suspendedAt} />
+                      <TenantStatus suspended={!!t.suspendedAt} />
                       {t.suspendedAt && (
-                        <span className="text-xs text-muted-foreground">
+                        <span className="text-xs text-slate-500">
                           {new Date(t.suspendedAt).toLocaleString('zh-CN')}：{t.suspensionReason}
                         </span>
                       )}
@@ -126,15 +120,12 @@ export default function OpsTenants({ loaderData, actionData }: Route.ComponentPr
                   <TableCell>{t.adminEmails.join('、')}</TableCell>
                 </TableRow>
               ))}
-              {!tenants.length && (
-                <TableRow>
-                  <TableCell colSpan={6} className="text-center text-muted-foreground">暂无租户</TableCell>
-                </TableRow>
-              )}
             </TableBody>
           </Table>
-        </CardContent>
-      </Card>
+        </div>
+      ) : (
+        <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">暂无租户。用上面的表单开通第一个租户。</div>
+      )}
     </OpsShell>
   );
 }
