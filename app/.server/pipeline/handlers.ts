@@ -12,10 +12,10 @@ type Params = Record<string, unknown>;
 type Result = Record<string, unknown>;
 
 /**
- * 任务的运行环境：配额，任务涉及数据源时（参数带 sourceId）派发时解密好的连接参数，
+ * 任务的运行环境：配额，任务涉及数据源时（参数带 sourceId）派发时解密好的连接参数，合并到标准层时租户的敏感信息盐，
  * 本租户数据湖的会话（attachSource 的任务里数据源也挂在其中），以及抹掉错误信息中凭据的函数
  */
-export interface TaskContext { limits: EngineLimits; source?: SourceSpec; session: TenantLakeSession; redact(message: string): string }
+export interface TaskContext { limits: EngineLimits; source?: SourceSpec; piiSalt?: string; session: TenantLakeSession; redact(message: string): string }
 
 /**
  * attachSource：数据源与数据湖挂在同一个 DuckDB 里（在两者之间搬数据或对照的任务）；
@@ -163,8 +163,9 @@ export const HANDLERS = {
   // 有映射失败时任务记为失败，结果里保留各映射的合并结果与错误；源表还没同步进原始层的映射跳过，不算失败
   'silver.merge': {
     label: '合并到标准层',
-    async run(_con, params, { session, redact }) {
-      const mappings = await mergeToSilver(session, mergeMappings(params), redact);
+    async run(_con, params, { session, piiSalt, redact }) {
+      if (!piiSalt) throw new Error('缺少敏感信息盐');
+      const mappings = await mergeToSilver(session, mergeMappings(params), piiSalt, redact);
       const failed = mappings.filter(m => 'error' in m);
       if (failed.length) {
         throw new PartialFailure(`${failed.length} 个映射合并失败：${failed.map(m => `${m.entity} ← ${m.table}（${'error' in m ? m.error : ''}）`).join('；')}`, { mappings });

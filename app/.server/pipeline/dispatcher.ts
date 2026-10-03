@@ -63,7 +63,7 @@ export function createDispatcher({
       outcome ??= { error: `工作进程异常退出（${signal ?? `退出码 ${code}`}）` };
       resolve();
     }));
-    const input: WorkerInput = { kind: task.kind, params: task.params, lake: task.lake, limits: task.limits, source: task.source };
+    const input: WorkerInput = { kind: task.kind, params: task.params, lake: task.lake, limits: task.limits, source: task.source, piiSalt: task.piiSalt };
     child.send(input);
     const done = exited
       .then(async () => {

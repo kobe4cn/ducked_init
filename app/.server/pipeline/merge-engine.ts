@@ -4,10 +4,12 @@
 // 每个映射另在 silver_records 里保存源表当前每条记录转换后的结果（当前记录）：有主键的表每个主键一行，没有主键的表每种整行一行、
 // 带出现次数 _n。变更批次先改当前记录（删除的移除，新增与更新的换成新版本），再对受影响的去重键重新取最新的一行写进标准层，
 // 所以源端的重复行只计一次，删掉其中一行时标准层回落到剩下的行。合并日志 silver._merges 与这些写入在同一个 DuckLake 事务里，
-// 记下每个映射合并到了原始层的哪个批次，是下一次合并起点的唯一依据（与 ADR-0012 的批次日志同理）
+// 记下每个映射合并到了原始层的哪个批次，是下一次合并起点的唯一依据（与 ADR-0012 的批次日志同理）。
+// 标准实体的敏感字段（pii）在转换时就规范化并换成按租户加盐的哈希，当前记录与标准层里都没有明文（ADR-0005）
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
-import { compileExpression, parseExpression } from '../../lib/mapping-expr';
+import { entityOf } from '../../lib/canonical-model';
+import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
 import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
 import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
 
@@ -44,6 +46,11 @@ export type MergeRecord = { mapping: string; entity: string; table: string; vers
 export const SILVER = 'silver';
 const RECORDS = 'silver_records';
 const MERGES = `${SILVER}._merges`;
+/**
+ * 标准层的写法，记在合并日志里；上次合并的写法不同时由全部批次重建。
+ * 2：敏感字段只存加盐哈希；之前的日志里没有这一列（为空），敏感字段是明文
+ */
+const SCHEME = 2;
 
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
@@ -86,12 +93,26 @@ async function inTransaction<T>(con: DuckDBConnection, work: () => Promise<T>) {
 /** 一列在源端的取值（表达式编译成 SQL，alias 是源表行的别名） */
 const rawValue = (c: PlanColumn, alias: string) => compileExpression(parseExpression(c.expr), alias);
 
+/** 标准实体里的敏感字段。按标准模型现算，发布时写进的合并计划里没有这个标记（老的计划也照样适用） */
+const piiFields = (entity: string) => new Set(entityOf(entity)?.fields.filter(f => f.pii).map(f => f.name));
+
 /**
- * 一列写进标准层的值：有值字典时按字典对应，否则转成标准字段的类型。
+ * 敏感字段哈希前的规范化，让同一个值不论写法都得到同一个哈希：手机号只留数字并去掉 86 / 0086 前缀（后面是 1 开头的 11 位手机号时），
+ * 邮箱去掉首尾空格并转小写，其余去掉首尾空格。规范化后为空串的记为空
+ */
+function normalizedPii(field: string, text: string) {
+  if (field === 'phone') return `nullif(regexp_replace(regexp_replace(${text}, '[^0-9]', '', 'g'), '^(00)?86(1[0-9]{10})$', '\\2'), '')`;
+  return `nullif(${field === 'email' ? `lower(trim(${text}))` : `trim(${text})`}, '')`;
+}
+
+/**
+ * 一列写进标准层的值：敏感字段是规范化后加盐的 sha256（十六进制，与字段名无关，同一租户里同一个值的哈希相同）；
+ * 其他列有值字典时按字典对应，否则转成标准字段的类型。
  * 写了兜底值时，对应不上的取值（没有值字典时是标准枚举之外的取值）写成兜底值；源端为空的仍为空
  */
-function columnValue(c: PlanColumn, alias: string) {
+function columnValue(c: PlanColumn, alias: string, salt: string | null) {
   const raw = rawValue(c, alias);
+  if (salt !== null) return `sha256(${lit(salt)} || ${normalizedPii(c.name, `CAST(${raw} AS VARCHAR)`)})`;
   const dictionary = c.dictionary ?? (c.otherwise !== undefined && c.enum ? Object.fromEntries(c.enum.map(v => [v, v])) : undefined);
   if (!dictionary) return `CAST(${raw} AS ${sqlType(c.type)})`;
   const text = `CAST(${raw} AS VARCHAR)`;
@@ -130,28 +151,44 @@ async function checkUnknownValues(con: DuckDBConnection, columns: PlanColumn[]) 
   return fallback;
 }
 
-/** 标准层表不存在时按实体的全部字段建表，存在时补上新的扩展字段 */
+/**
+ * 转换出错时 DuckDB 的报错可能带出源端的取值：把敏感字段引用的源列里出现在报错中的取值（原样或去掉首尾空格后）抹掉，
+ * 不区分大小写。只有一个字的取值不抹，免得把整条报错抹花
+ */
+async function withoutPii(con: DuckDBConnection, columns: PlanColumn[], message: string) {
+  const sources = [...new Set(columns.flatMap(c => referencedColumns(parseExpression(c.expr)).map(r => r.name)))];
+  if (!sources.length) return message;
+  const found = await rows<{ v: string }>(con, `
+    SELECT DISTINCT v FROM (${sources.map(s => `SELECT CAST(l.${ident(s)} AS VARCHAR) AS raw FROM ${LIVE} l`).join(' UNION ALL ')}), unnest([raw, trim(raw)]) AS t(v)
+    WHERE length(v) > 1 AND contains(${lit(message.toLowerCase())}, lower(v))`);
+  return found.map(f => f.v).sort((a, b) => b.length - a.length)
+    .reduce((m, v) => m.replace(new RegExp(v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '***'), message);
+}
+
+/** 标准层表不存在时按实体的全部字段建表，存在时补上新的扩展字段。敏感字段存哈希，类型总是 VARCHAR */
 async function ensureSilverTable(con: DuckDBConnection, plan: MergeMappingParam) {
   const table = silverTable(plan.entity);
+  const pii = piiFields(plan.entity);
+  const typeOf = (c: MergePlan['entityColumns'][number]) => (pii.has(c.name) ? 'VARCHAR' : sqlType(c.type));
   if (!await tableExists(con, SILVER, plan.entity)) {
     await con.run(`CREATE TABLE ${table} (
-      ${plan.entityColumns.map(c => `${ident(c.name)} ${sqlType(c.type)}`).join(', ')},
+      ${plan.entityColumns.map(c => `${ident(c.name)} ${typeOf(c)}`).join(', ')},
       _mapping VARCHAR, _source VARCHAR, _version INTEGER, _merged_at TIMESTAMPTZ)`);
     return;
   }
   const known = new Set((await columnsOf(con, table)).map(c => c.column_name));
   for (const c of plan.entityColumns.filter(c => !known.has(c.name))) {
-    await con.run(`ALTER TABLE ${table} ADD COLUMN ${ident(c.name)} ${sqlType(c.type)}`);
+    await con.run(`ALTER TABLE ${table} ADD COLUMN ${ident(c.name)} ${typeOf(c)}`);
   }
 }
 
-interface LastMerge { version: number; source_keys: string; batch_to: string }
+interface LastMerge { version: number; source_keys: string; batch_to: string; scheme: number | null }
 
 /**
  * 合并一个映射：读出原始层里上次合并之后的批次，改当前记录，再对受影响的去重键重新取最新的一行写进标准层。
- * 首次合并、映射换了版本或源表的主键变了时由全部批次重建（当前记录与本映射在标准层的行都换掉）
+ * 首次合并、映射换了版本、源表的主键变了或标准层的写法变了时由全部批次重建（当前记录与本映射在标准层的行都换掉）
  */
-async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, now: Date): Promise<MergeRecord> {
+async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date): Promise<MergeRecord> {
   const startedAt = new Date();
   const base = { mapping: plan.mapping, entity: plan.entity, table: plan.table, version: plan.version, startedAt: startedAt.toISOString() };
   const schema = bronzeSchema(plan.sourceId);
@@ -165,8 +202,8 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, now:
   const keyed = await tableExists(con, `${schema}_keys`, plan.table);
   const sourceKeys = keyed ? (await columnsOf(con, `${ident(`${schema}_keys`)}.${ident(plan.table)}`)).map(c => c.column_name).filter(c => c !== '_hash') : [];
   const [last] = await rows<LastMerge>(con, `
-    SELECT version, source_keys, batch_to FROM ${MERGES} WHERE mapping_id = ${lit(plan.mapping)} ORDER BY started_at DESC LIMIT 1`);
-  const rebuild = !last || last.version !== plan.version || last.source_keys !== sourceKeys.join(',')
+    SELECT version, source_keys, batch_to, scheme FROM ${MERGES} WHERE mapping_id = ${lit(plan.mapping)} ORDER BY started_at DESC LIMIT 1`);
+  const rebuild = !last || last.version !== plan.version || last.source_keys !== sourceKeys.join(',') || last.scheme !== SCHEME
     || !await tableExists(con, RECORDS, `m_${plan.mapping.replace(/-/g, '')}`);
   const from = rebuild ? 0 : Number(last.batch_to);
   const [{ top }] = await rows<{ top: string | null }>(con, `SELECT max(_batch) AS top FROM ${bronze}`);
@@ -195,10 +232,13 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, now:
       SELECT l.*, coalesce(r._n, 0) + l._delta AS _n FROM ${LATEST} l LEFT JOIN ${held} r ON r._src = l._src) WHERE _n > 0`);
   }
 
-  // 转换：先查出值字典与标准枚举之外的取值（没写兜底值时报错），再算出各列
-  const fallback = await checkUnknownValues(con, plan.columns);
+  // 转换：先查出值字典与标准枚举之外的取值（没写兜底值时报错；敏感字段不查，取值会进报错与兜底统计），再算出各列。
+  // 敏感字段在这一步就换成哈希：ROWS 也是当前记录
+  const pii = piiFields(plan.entity);
+  const fallback = await checkUnknownValues(con, plan.columns.filter(c => !pii.has(c.name)));
   await con.run(`CREATE OR REPLACE TABLE ${ROWS} AS
-    SELECT l._src, l._n, l._batch, ${plan.columns.map(c => `${columnValue(c, 'l')} AS ${ident(c.name)}`).join(', ')} FROM ${LIVE} l`);
+    SELECT l._src, l._n, l._batch, ${plan.columns.map(c => `${columnValue(c, 'l', pii.has(c.name) ? salt : null)} AS ${ident(c.name)}`).join(', ')} FROM ${LIVE} l`)
+    .catch(async (e: Error) => { throw new Error(await withoutPii(con, plan.columns.filter(c => pii.has(c.name)), e.message)); });
   const key = plan.key;
   const [{ n: nullKeys }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${ROWS} WHERE ${key.map(k => `${ident(k)} IS NULL`).join(' OR ')}`);
   if (Number(nullKeys)) throw new Error(`去重键 ${key.join('、')} 有 ${nullKeys} 行为空，请检查映射或在源端补齐`);
@@ -238,7 +278,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, now:
       FROM ${WINNERS} w`);
     await con.run(`INSERT INTO ${MERGES} VALUES (
       ${lit(plan.mapping)}, ${plan.version}, ${lit(sourceKeys.join(','))}, ${from}, ${to},
-      ${stats.inserted}, ${stats.updated}, ${stats.deleted}, TIMESTAMPTZ ${lit(startedAt.toISOString())}, TIMESTAMPTZ ${lit(new Date().toISOString())})`);
+      ${stats.inserted}, ${stats.updated}, ${stats.deleted}, TIMESTAMPTZ ${lit(startedAt.toISOString())}, TIMESTAMPTZ ${lit(new Date().toISOString())}, ${SCHEME})`);
   });
   return {
     ...base,
@@ -256,20 +296,22 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, now:
 
 /**
  * 按已发布的映射合并到标准层，每个映射各自一个事务：一个映射失败（表达式在数据上出错、值字典缺取值、去重键为空）
- * 只影响它自己，其他映射照常合并。redact 用来抹掉错误信息里的凭据
+ * 只影响它自己，其他映射照常合并。salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐
  */
-export async function mergeToSilver(session: TenantLakeSession, plans: MergeMappingParam[], redact: (message: string) => string): Promise<MergeRecord[]> {
+export async function mergeToSilver(session: TenantLakeSession, plans: MergeMappingParam[], salt: string, redact: (message: string) => string): Promise<MergeRecord[]> {
   const { con } = session;
+  // 早于敏感字段哈希的数据湖里，合并日志还没有 scheme 列：补上后老的日志为空，各映射下次合并时重建
   await con.run(`CREATE SCHEMA IF NOT EXISTS ${SILVER}; CREATE SCHEMA IF NOT EXISTS ${RECORDS};
     CREATE TABLE IF NOT EXISTS ${MERGES} (
       mapping_id VARCHAR, version INTEGER, source_keys VARCHAR, batch_from BIGINT, batch_to BIGINT,
-      inserted BIGINT, updated BIGINT, deleted BIGINT, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ)`);
+      inserted BIGINT, updated BIGINT, deleted BIGINT, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, scheme INTEGER);
+    ALTER TABLE ${MERGES} ADD COLUMN IF NOT EXISTS scheme INTEGER`);
   const now = new Date();
   const records: MergeRecord[] = [];
   for (const plan of plans) {
     const startedAt = new Date();
     try {
-      records.push(await mergeMapping(con, plan, now));
+      records.push(await mergeMapping(con, plan, salt, now));
     } catch (e) {
       records.push({
         mapping: plan.mapping, entity: plan.entity, table: plan.table, version: plan.version,

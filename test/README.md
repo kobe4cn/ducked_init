@@ -36,6 +36,8 @@ npx vitest run test/pipeline/mapping.test.ts # 单个文件
 | `memberOf(tenantId, email, role = 'data_engineer')` | 返回该成员的 `CurrentMember`，不存在则以给定角色加入；用作领域函数的第一个参数 |
 | `runTask(tenantId, kind, params?)` | 入队一个任务并让调度器跑空，返回任务最终状态 |
 | `selectAllTables(member, sourceId)` | 把数据源里可读的表全部选入同步范围（会入队采集，之后要跑空调度器） |
+| `publish(author, reviewer, sourceId, yaml)` | 起草映射并由另一位成员发布，跑空调度器（合并完成），返回映射 ID |
+| `silver(tenantId, entity, orderBy)` | 读出标准层某个实体的表（时间按 UTC 文本、金额按文本，去掉 `_merged_at`） |
 
 跑空调度器：`createDispatcher({ maxWorkers: 2 }).runUntilIdle()`（来自 `app/.server/pipeline/dispatcher`），测试里通常包成 `const drain = () => ...`。
 
@@ -111,7 +113,7 @@ describe('<功能>', () => {
 });
 ```
 
-需要原始层有数据时，在 `tenantWithSource` 之后确认水位线并同步：`confirmWatermark(member, sourceId, 'customers', 'updated_at')`、`syncSource(member, sourceId)`，再 `drain()`（完整例子见 `mapping.test.ts` 的 `syncedSource`）。读数据湖里的表用 `openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 })`，用完 `session.close()`（例子见 `mapping.test.ts` 的 `silver`）。
+需要原始层有数据时，在 `tenantWithSource` 之后确认水位线并同步：`confirmWatermark(member, sourceId, 'customers', 'updated_at')`、`syncSource(member, sourceId)`，再 `drain()`（完整例子见 `mapping.test.ts` 的 `syncedSource`）。读标准层用 `silver`；读数据湖里别的表用 `openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 })`，用完 `session.close()`（例子见 `fixtures.ts` 的 `silver`、`pii.test.ts` 的 `silverDump`）。
 
 ## 新建一个 HTTP 测试
 
@@ -160,6 +162,7 @@ describe('<功能>', () => {
 | `pipeline/sync.test.ts` | 水位线增量与全量比对、变更批次、同步历史 |
 | `pipeline/verify.test.ts` | 湖中数据核对（覆盖、位置、文件、结构、数据量） |
 | `pipeline/mapping.test.ts` | 映射发布与标准层合并、去重键、值字典、双人发布（最后保存的人不能发布）、只有映射引用的表写入变更才在同步后合并（定时检查也不补）、合并只带受影响的映射、补进排队中的合并、运行期间的变更由定时检查补上、详情页只合并单个映射 |
+| `pipeline/pii.test.ts` | 标准层敏感字段：规范化后按租户加盐哈希（不同写法同一哈希、与字段名无关）、`silver.*` / `silver_records` / 任务结果里没有明文、哈希上线前的明文标准层重建、转换报错抹掉取值与盐 |
 | `pipeline/migration.test.ts` | 数据湖迁移存储 |
 | `pipeline/reset.test.ts` | 开发用重置数据湖 |
 | `http/login.test.ts` | 租户与 Magic Link 登录 |

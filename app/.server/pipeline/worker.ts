@@ -4,14 +4,18 @@ import { HANDLERS, PartialFailure, type TaskKind } from './handlers';
 import { openTenantLake, redactLakeSecrets, type EngineLimits, type LakeSpec } from './lake-engine';
 import { redactSourceSecrets, type SourceSpec } from './source-engine';
 
-/** source 是任务涉及的数据源（参数带 sourceId 时），凭据已由调度器解密，只在内存里使用 */
-export interface WorkerInput { kind: TaskKind; params: Record<string, unknown>; lake: LakeSpec; limits: EngineLimits; source?: SourceSpec }
+/**
+ * source 是任务涉及的数据源（参数带 sourceId 时），凭据已由调度器解密；piiSalt 是合并到标准层时给敏感字段加盐的租户盐。
+ * 两者都只在内存里使用
+ */
+export interface WorkerInput { kind: TaskKind; params: Record<string, unknown>; lake: LakeSpec; limits: EngineLimits; source?: SourceSpec; piiSalt?: string }
 /** 任务部分完成时既有错误也有结果 */
 export type WorkerOutcome = { result: Record<string, unknown> } | { error: string; result?: Record<string, unknown> };
 
 const redactor = (input: WorkerInput) => (message: string) => {
-  const redacted = redactLakeSecrets(message, input.lake);
-  return input.source ? redactSourceSecrets(redacted, input.source) : redacted;
+  let redacted = redactLakeSecrets(message, input.lake);
+  if (input.source) redacted = redactSourceSecrets(redacted, input.source);
+  return input.piiSalt ? redacted.replaceAll(input.piiSalt, '***') : redacted;
 };
 
 async function run(input: WorkerInput): Promise<WorkerOutcome> {
@@ -25,7 +29,7 @@ async function run(input: WorkerInput): Promise<WorkerOutcome> {
     const [engine] = (await session.con.runAndReadAll(
       `SELECT current_setting('memory_limit') AS "memoryLimit", current_setting('threads')::INT AS threads`,
     )).getRowObjectsJson();
-    const ctx = { limits: input.limits, source: input.source, session, redact: redactor(input) };
+    const ctx = { limits: input.limits, source: input.source, piiSalt: input.piiSalt, session, redact: redactor(input) };
     try {
       return { result: { ...(await handler.run(session.con, input.params, ctx)), engine } };
     } catch (e) {

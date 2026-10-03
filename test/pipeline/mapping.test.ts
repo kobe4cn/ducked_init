@@ -4,36 +4,19 @@ import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
-import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
-import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, selectAllTables } from './fixtures';
+import { memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 
 const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
-
-/** 读取本租户标准层某个实体的表（时间按 UTC 文本、金额按文本显示） */
-async function silver(tenantId: string, entity: string, orderBy: string) {
-  const session = await openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 });
-  try {
-    const columns = (await session.con.runAndReadAll(`DESCRIBE silver."${entity}"`)).getRowObjectsJson() as { column_name: string; column_type: string }[];
-    // 带时区的时间在会话里按 UTC 转成文本（不交给客户端按本机时区换算）
-    const times = columns.filter(c => c.column_type === 'TIMESTAMP WITH TIME ZONE' && c.column_name !== '_merged_at').map(c => `"${c.column_name}"::VARCHAR AS "${c.column_name}"`);
-    const reader = await session.con.runAndReadAll(`SELECT * EXCLUDE (_merged_at) REPLACE (_version::INT AS _version${times.map(t => `, ${t}`).join('')})
-      FROM silver."${entity}" ORDER BY ${orderBy}`);
-    return reader.getRowObjectsJson() as Record<string, unknown>[];
-  } finally {
-    session.close();
-  }
-}
 
 /**
  * 没有主键的订单流水：同一订单的多个版本（含完全相同的重复行），状态是中文
@@ -233,14 +216,6 @@ fields:
   updated_at: from_timezone(update_time, 'Asia/Shanghai')
 `;
 
-/** 起草并由另一位成员发布，让调度器跑完合并 */
-async function publish(author: Awaited<ReturnType<typeof memberOf>>, reviewer: typeof author, sourceId: string, yaml: string) {
-  const mapping = await createMapping(author, sourceId, yaml);
-  await publishMapping(reviewer, mapping.id, 1);
-  await drain();
-  return mapping.id;
-}
-
 /** 合并任务带的映射（按映射 ID 排序） */
 const mergedMappings = (task: { params: unknown }) => ((task.params as { mappings: { mapping: string }[] }).mappings).map(m => m.mapping).sort();
 
@@ -269,7 +244,9 @@ describe('发布映射并合并到标准层', () => {
     const customers = await silver(acme, 'customer', 'customer_id::INT');
     expect(customers).toHaveLength(40);
     expect(customers[0]).toMatchObject({
-      customer_id: '1', name: '消费者1', email: 'user1@example.com', city: '上海', _source: id, _version: 1,
+      customer_id: '1', city: '上海', _source: id, _version: 1,
+      // 敏感字段只存加盐哈希（见 pii.test.ts）
+      name: expect.stringMatching(/^[0-9a-f]{64}$/), email: expect.stringMatching(/^[0-9a-f]{64}$/),
       // 源端 2024-01-02 00:00 是北京时间
       registered_at: '2024-01-01 16:00:00+00', updated_at: '2024-06-01 01:00:00+00',
       // 没映射的标准字段为空

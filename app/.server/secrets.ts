@@ -1,7 +1,7 @@
 // app/.server/secrets.ts —— 信封加密：租户的凭据（数据源密码、对象存储密钥，以后还有模型服务 API Key）用租户数据密钥加密，
 // 数据密钥用平台主密钥包裹后存在平台库（tenant_keys）。平台库泄露时拿不到明文；换用 KMS 时只改 wrapKey / unwrapKey。
 // 只在平台进程里使用：工作进程只拿到任务启动时解密好的凭据（经 IPC 传入），拿不到主密钥
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHmac, randomBytes } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { getDb } from './db/client';
 import { tenantKeys } from './db/schema';
@@ -51,4 +51,12 @@ export async function encryptForTenant(tenantId: string, context: string, value:
 
 export async function decryptForTenant(tenantId: string, context: string, sealed: string): Promise<Record<string, string>> {
   return JSON.parse(unseal(await tenantDataKey(tenantId), sealed, `${tenantId}:${context}`).toString());
+}
+
+/**
+ * 租户的敏感信息盐：标准层里敏感字段的哈希按它加盐（ADR-0005）。由租户数据密钥派生（HMAC），不另存；
+ * 和凭据一样只在领取任务时交给工作进程，不写进任务参数
+ */
+export async function tenantPiiSalt(tenantId: string) {
+  return createHmac('sha256', await tenantDataKey(tenantId)).update('pii-salt').digest('hex');
 }

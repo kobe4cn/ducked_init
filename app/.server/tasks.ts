@@ -5,6 +5,7 @@ import type { Tx } from './audit';
 import { getDb } from './db/client';
 import { TASK_STATUSES, tasks, tenantLakes, tenants, type TaskStatus } from './db/schema';
 import { lakeSpecOf } from './lake';
+import { tenantPiiSalt } from './secrets';
 import { loadSourceSpec, SourceError } from './source-config';
 import { HANDLERS, isTaskKind, type TaskKind } from './pipeline/handlers';
 import type { WorkerInput, WorkerOutcome } from './pipeline/worker';
@@ -73,17 +74,22 @@ export async function lockClaims(tx: Tx) {
 }
 
 /**
- * 领取下一个任务并标为运行中；参数带 sourceId 的任务同时解密该数据源的凭据交给工作进程（不写进任务记录）。
- * 数据源已不存在或凭据无法解密时，该任务直接记为失败，接着领取下一个。
+ * 领取下一个任务并标为运行中；参数带 sourceId 的任务同时解密该数据源的凭据交给工作进程，合并到标准层的任务同时派生
+ * 租户的敏感信息盐（都不写进任务记录）。数据源已不存在或凭据、盐无法取得时，该任务直接记为失败，接着领取下一个。
  */
 export async function claimNextTask(): Promise<ClaimedTask | null> {
   for (;;) {
     const task = await claimQueuedTask();
-    if (!task || typeof task.params.sourceId !== 'string') return task;
+    if (!task) return null;
+    let reading = '数据源的凭据';
     try {
-      return { ...task, source: await loadSourceSpec(task.tenantId, task.params.sourceId) };
+      const { sourceId } = task.params;
+      if (typeof sourceId === 'string') task.source = await loadSourceSpec(task.tenantId, sourceId);
+      reading = '敏感信息盐';
+      if (task.kind === 'silver.merge') task.piiSalt = await tenantPiiSalt(task.tenantId);
+      return task;
     } catch (e) {
-      const error = e instanceof SourceError ? e.message : `无法读取数据源的凭据：${(e as Error).message}`;
+      const error = e instanceof SourceError ? e.message : `无法读取${reading}：${(e as Error).message}`;
       console.warn(`[调度器] 任务 ${task.id}（${task.kind}）失败：${error}`);
       await finishTask(task.id, { error });
     }
