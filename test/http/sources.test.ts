@@ -1,6 +1,7 @@
 // 数据源的 HTTP 接缝：数据工程师在界面上登记、修改与轮换凭据、测试连接、选定同步范围、查看列统计并确认水位线；凭据在任何页面与接口里都不回显
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { tasks } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER, WRITER } from '../pipeline/source-fixtures';
@@ -315,10 +316,20 @@ describe('湖中数据', () => {
 
     const lake = `/sources/${id}?tab=lake`;
     expect(await (await browser.get(lake)).text()).toContain('data-verify-status="none"');
+    // 没有成功核对记录（没核对过、核对失败、排队中）的数据源是「未核对」，不计入「核对一致」
+    /** 列表页上该数据源卡片从开头到核对状态 <span> 结束的一段 */
+    const card = (html: string) => html.match(new RegExp(`data-source-id="${id}"[\\s\\S]*?data-verify-state="(\\w+)"[^>]*>[\\s\\S]*?</span>`))![0];
+    const consistent = (html: string) => Number(html.match(/核对一致<\/div><div[^>]*>(\d+)</)![1]);
+    let list = await (await browser.get('/sources')).text();
+    expect(card(list)).toMatch(/data-verify-state="none"[\s\S]*?未核对/);
+    expect(consistent(list)).toBe(0);
+    await getDb().insert(tasks).values({ tenantId, kind: 'source.verify', params: { sourceId: id }, status: 'failed', error: 'x' });
+    expect(card(await (await browser.get('/sources')).text())).toContain('data-verify-state="none"');
     const triggered = await browser.post(lake, { intent: 'verify' });
     expect(triggered.status).toBe(302);
     expect(triggered.headers.get('Location')).toBe(lake);
     expect(await (await browser.get(lake)).text()).toContain('data-verify-status="queued"');
+    expect(card(await (await browser.get('/sources')).text())).toContain('data-verify-state="none"');
     await drain();
 
     const html = await (await browser.get(lake)).text();
@@ -328,7 +339,10 @@ describe('湖中数据', () => {
     expect(html).toMatch(/data-verify-table="events"[^>]*data-coverage="out_of_scope"[\s\S]*?不在同步范围[\s\S]*?1,500/);
     expect(html).toMatch(/data-verify-table="customers"[^>]*data-coverage="needs_watermark"/);
     expect(html).not.toContain('name="intent" value="reconcile"');
-    expect(await (await browser.get('/sources')).text()).not.toContain('data-verify-differences');
+    list = await (await browser.get('/sources')).text();
+    expect(list).not.toContain('data-verify-differences');
+    expect(card(list)).toMatch(/data-verify-state="ok"[\s\S]*?一致/);
+    expect(consistent(list)).toBe(1);
 
     await grantOnSource('DELETE FROM shop.orders WHERE order_id = 3');
     await browser.post(lake, { intent: 'verify' });
@@ -336,7 +350,12 @@ describe('湖中数据', () => {
     const diff = await (await browser.get(lake)).text();
     expect(diff).toMatch(/data-verify-table="orders"[^>]*data-verify-ok="false"[\s\S]*?湖中多出（源端已删）1 个：3[\s\S]*?data-check="data" data-ok="false"[^>]*>湖中多出 1</);
     expect(diff).toContain('name="intent" value="reconcile"');
-    expect(await (await browser.get('/sources')).text()).toMatch(new RegExp(`data-source-id="${id}"[\\s\\S]*?data-verify-differences="1"`));
+    list = await (await browser.get('/sources')).text();
+    expect(card(list)).toMatch(/data-verify-state="diff"[^>]*data-verify-differences="1"/);
+    expect(consistent(list)).toBe(0);
+    // 最近一次核对失败时仍取最近一次成功核对的结果
+    await getDb().insert(tasks).values({ tenantId, kind: 'source.verify', params: { sourceId: id }, status: 'failed', error: 'x' });
+    expect(card(await (await browser.get('/sources')).text())).toContain('data-verify-state="diff"');
 
     await memberOf(tenantId, 'an@acme.com', 'analyst');
     const analyst = await loginAs(app, 'an@acme.com');

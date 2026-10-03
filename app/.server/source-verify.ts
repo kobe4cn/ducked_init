@@ -120,15 +120,13 @@ export async function getVerifyStatus(actor: CurrentMember, sourceId: string) {
   };
 }
 
-/** 本租户各数据源最近一次成功核对中有差异的表数（数据源 ID → 表数），只列出有差异的 */
+/** 本租户各数据源最近一次成功核对中有差异的表数（数据源 ID → 表数，一致为 0）；没有成功核对记录的数据源不在其中 */
 export async function verifyDifferences(actor: CurrentMember) {
   assertCan(actor, 'sources:read');
   const { rows } = await getDb().execute<{ source_id: string; differences: number }>(sql`
-    SELECT source_id, differences FROM (
-      SELECT DISTINCT ON (t.params->>'sourceId') t.params->>'sourceId' AS source_id, coalesce((t.result->>'differences')::int, 0) AS differences
-      FROM ${tasks} t
-      WHERE t.tenant_id = ${actor.tenant.id} AND t.kind = 'source.verify' AND t.status = 'succeeded'
-      ORDER BY t.params->>'sourceId', t.created_at DESC, t.id DESC) latest
-    WHERE differences > 0`);
+    SELECT DISTINCT ON (t.params->>'sourceId') t.params->>'sourceId' AS source_id, coalesce((t.result->>'differences')::int, 0) AS differences
+    FROM ${tasks} t
+    WHERE t.tenant_id = ${actor.tenant.id} AND t.kind = 'source.verify' AND t.status = 'succeeded'
+    ORDER BY t.params->>'sourceId', t.created_at DESC, t.id DESC`);
   return new Map(rows.map(r => [r.source_id, Number(r.differences)]));
 }

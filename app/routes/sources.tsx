@@ -1,7 +1,7 @@
-// app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：指标卡、本租户的数据源卡片（最近一次核对有差异的标出来）与登记表单
+// app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：指标卡、本租户的数据源卡片（标出未核对与最近一次核对有差异的）与登记表单
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
-import { AlertTriangle, CheckCircle2, CircleAlert, Cloud, Database, FileBox, Leaf, Plus, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, CircleAlert, CircleDashed, Cloud, Database, FileBox, Leaf, Plus, X } from 'lucide-react';
 import type { Route } from './+types/sources';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
@@ -38,8 +38,8 @@ export async function loader({ request }: Route.LoaderArgs) {
     canWrite: can(member.role, 'sources:write'),
     sources: rows.map(s => ({
       id: s.id, name: s.name, kind: s.kind, target: targetOf(s.kind, s.config), createdAt: s.createdAt.toISOString(),
-      /** 最近一次核对中有差异的表数（没有差异时为 0） */
-      differences: differences.get(s.id) ?? 0,
+      /** 最近一次成功核对中有差异的表数（一致为 0，没有成功核对记录为 null） */
+      differences: differences.get(s.id) ?? null,
     })),
   };
 }
@@ -64,14 +64,16 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
   const [kind, setKind] = useState<SourceKind>((SOURCE_KINDS as readonly string[]).includes(values.kind) ? (values.kind as SourceKind) : 'postgres');
   const submitting = useNavigation().state === 'submitting';
   const kinds = new Set(sources.map(s => s.kind)).size;
-  const needsAttention = sources.filter(s => s.differences > 0).length;
+  const cards = sources.map(s => ({ ...s, state: verifyStateOf(s.differences) }));
+  const needsAttention = cards.filter(s => s.state === 'diff').length;
+  const consistent = cards.filter(s => s.state === 'ok').length;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader title="数据源" description="本租户登记的外部只读连接。平台永不写入数据源；凭据加密保存，任何页面都不显示。" />
 
       <div className="grid grid-cols-3 gap-4">
         <StatTile label="数据源数" value={sources.length} hint={`${kinds} 种类型`} />
-        <StatTile label="核对一致" value={sources.length - needsAttention} hint="最近一次核对" tone={sources.length > needsAttention ? 'text-emerald-600' : undefined} />
+        <StatTile label="核对一致" value={consistent} hint="最近一次核对" tone={consistent ? 'text-emerald-600' : undefined} />
         <StatTile label="需要处理" value={needsAttention} hint="核对有差异的数据源" tone={needsAttention ? 'text-red-600' : undefined} />
       </div>
 
@@ -80,12 +82,12 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
       )}
 
       <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
-        {sources.map(s => (
+        {cards.map(s => (
           <Link
             key={s.id}
-            to={s.differences > 0 ? `/sources/${s.id}?tab=lake` : `/sources/${s.id}`}
+            to={s.state === 'diff' ? `/sources/${s.id}?tab=lake` : `/sources/${s.id}`}
             data-source-id={s.id}
-            className={cn('rounded-2xl border bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md', s.differences > 0 && 'border-red-200')}
+            className={cn('rounded-2xl border bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md', s.state === 'diff' && 'border-red-200')}
           >
             <div className="flex items-start justify-between">
               <KindIcon kind={s.kind} />
@@ -94,9 +96,7 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
             <div className="mt-4 text-lg font-medium">{s.name}</div>
             <div className="mt-1 truncate font-mono text-xs text-slate-400">{s.target}</div>
             <div className="mt-4 flex items-center justify-between border-t pt-3">
-              {s.differences > 0
-                ? <span data-verify-differences={s.differences} className="inline-flex items-center gap-1 text-sm text-red-600"><AlertTriangle className="size-3.5" />{`${s.differences} 张表有差异`}</span>
-                : <span className="inline-flex items-center gap-1 text-sm text-emerald-600"><CheckCircle2 className="size-3.5" />一致</span>}
+              <VerifyBadge state={s.state} differences={s.differences} />
               <span className="text-xs text-slate-400">{`登记于 ${new Date(s.createdAt).toLocaleDateString('zh-CN')}`}</span>
             </div>
           </Link>
@@ -147,6 +147,24 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
         )}
       </div>
     </AppShell>
+  );
+}
+
+type VerifyState = 'none' | 'ok' | 'diff';
+/** 未核对（没有成功核对记录）、一致、有差异 */
+const verifyStateOf = (differences: number | null): VerifyState => differences === null ? 'none' : differences > 0 ? 'diff' : 'ok';
+
+/** 状态色配图标和文字（见 docs/agents/ui.md） */
+const VERIFY_BADGE: Record<VerifyState, { icon: typeof Database; tone: string }> = {
+  none: { icon: CircleDashed, tone: 'text-slate-500' }, ok: { icon: CheckCircle2, tone: 'text-emerald-600' }, diff: { icon: AlertTriangle, tone: 'text-red-600' },
+};
+
+function VerifyBadge({ state, differences }: { state: VerifyState; differences: number | null }) {
+  const { icon: Icon, tone } = VERIFY_BADGE[state];
+  return (
+    <span data-verify-state={state} data-verify-differences={state === 'diff' ? differences! : undefined} className={cn('inline-flex items-center gap-1 text-sm', tone)}>
+      <Icon className="size-3.5" />{state === 'none' ? '未核对' : state === 'ok' ? '一致' : `${differences} 张表有差异`}
+    </span>
   );
 }
 
