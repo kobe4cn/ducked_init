@@ -1,6 +1,7 @@
 // app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、最近一次合并），
 // 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿；可按所选的表与实体按规则生成草稿填进编辑框，不保存；编辑框旁对照所选源表的列统计与目标实体的标准字段），
 // 以及手动触发一次合并到标准层
+import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, PencilLine, Play, Plus, X } from 'lucide-react';
 import { useState } from 'react';
 import { parseDocument } from 'yaml';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
@@ -17,12 +18,11 @@ import { AppShell } from '~/components/app-shell';
 import { MappingErrors } from '~/components/mapping-editor';
 import { MappingEditorWithReference } from '~/components/mapping-reference';
 import { mappingOutline } from '~/lib/mapping-outline';
-import { Badge } from '~/components/ui/badge';
+import { cn } from '~/lib/utils';
+import { PageHeader } from '~/components/page-header';
 import { Button } from '~/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
 import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
 export function meta({}: Route.MetaArgs) {
   return [{ title: '映射 · CRM 数据分析平台' }];
@@ -91,10 +91,18 @@ export async function action({ request }: Route.ActionArgs) {
   }
 }
 
-const TASK_VARIANTS = { none: 'outline', queued: 'outline', running: 'secondary', succeeded: 'default', failed: 'destructive' } as const;
+type LoaderData = Route.ComponentProps['loaderData'];
+
+/** 合并状态色配图标（见 docs/agents/ui.md） */
+const TASK_STATUS: Record<LoaderData['merge']['status'], { icon: typeof CheckCircle2; tone: string }> = {
+  none: { icon: CircleDashed, tone: 'text-slate-500' },
+  queued: { icon: CircleDashed, tone: 'text-amber-600' },
+  running: { icon: Loader2, tone: 'text-amber-600' },
+  succeeded: { icon: CheckCircle2, tone: 'text-emerald-600' },
+  failed: { icon: AlertTriangle, tone: 'text-red-600' },
+};
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
-type LoaderData = Route.ComponentProps['loaderData'];
 type LastMerge = LoaderData['mappings'][number]['lastMerge'];
 
 /** 一个映射最近一次合并的结果 */
@@ -109,76 +117,79 @@ function mergeSummary(m: LastMerge) {
 export default function Mappings({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, canWrite, sources, tables, initialYaml, functions, merge, mappings } = loaderData;
   const submitting = useNavigation().state === 'submitting';
+  const { icon: MergeIcon, tone: mergeTone } = TASK_STATUS[merge.status];
   return (
     <AppShell email={email} nav={nav}>
-      {actionData?.error && <MappingErrors error={actionData.error} issues={actionData.issues} />}
-
-      <Card>
-        <CardHeader>
-          <CardTitle>映射</CardTitle>
-          <CardDescription>
-            数据源中的表 → 标准实体与字段的对应关系，带版本。草稿由另一位数据工程师或管理员发布后锁定；
-            已发布的映射在每次同步后把原始层的变更批次合并进标准层。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex items-center gap-3 text-sm" data-merge-status={merge.status}>
-            <span>最近一次合并：</span>
-            <Badge variant={TASK_VARIANTS[merge.status]}>{merge.statusLabel}</Badge>
-            <span className="text-muted-foreground">{time(merge.attemptedAt)}</span>
+      <PageHeader
+        title="映射"
+        description="数据源中的表 → 标准实体与字段的对应关系，带版本。草稿由另一位数据工程师或管理员发布后锁定；已发布的映射在每次同步后把原始层的变更批次合并进标准层。"
+        actions={
+          <>
+            <span className="flex flex-col items-end text-sm" data-merge-status={merge.status}>
+              <span className={cn('inline-flex items-center gap-1', mergeTone)}><MergeIcon className="size-3.5" />{`最近一次合并：${merge.statusLabel}`}</span>
+              <span className="text-xs text-slate-400">{time(merge.attemptedAt)}</span>
+            </span>
             {canWrite && (
               <Form method="post">
                 <input type="hidden" name="intent" value="merge" />
-                <Button type="submit" size="sm" variant="outline" disabled={submitting}>立即合并</Button>
+                <Button type="submit" variant="outline" disabled={submitting}><Play />立即合并</Button>
               </Form>
             )}
-          </div>
-          {merge.error && <div className="text-sm whitespace-normal text-destructive">{merge.error}</div>}
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>实体</TableHead>
-                <TableHead>源表</TableHead>
-                <TableHead>版本</TableHead>
-                <TableHead>最近一次合并</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {mappings.map(m => (
-                <TableRow key={m.id} data-mapping-id={m.id}>
-                  <TableCell>
-                    <Link to={`/mappings/${m.id}`} className="font-medium hover:underline">{`${m.entityLabel}（${m.entity}）`}</Link>
-                  </TableCell>
-                  <TableCell className="font-mono text-xs">{`${m.sourceName} / ${m.table}`}</TableCell>
-                  <TableCell className="space-x-1">
-                    {m.published ? <Badge>{`已发布 v${m.published}`}</Badge> : <Badge variant="outline">未发布</Badge>}
-                    {m.draft && <Badge variant="secondary">{`草稿 v${m.draft}`}</Badge>}
-                  </TableCell>
-                  <TableCell className={`text-sm whitespace-normal ${m.lastMerge && 'error' in m.lastMerge ? 'text-destructive' : 'text-muted-foreground'}`}>
-                    {mergeSummary(m.lastMerge)}
-                  </TableCell>
-                </TableRow>
-              ))}
-              {!mappings.length && (
-                <TableRow>
-                  <TableCell colSpan={4} className="text-center text-muted-foreground">还没有映射</TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
+          </>
+        }
+      />
 
-      {canWrite && (
-        <Card>
-          <CardHeader>
-            <CardTitle>新建映射</CardTitle>
-            <CardDescription>
+      {merge.error && <div className="flex items-start gap-1 text-sm whitespace-normal text-red-600"><AlertTriangle className="mt-0.5 size-3.5 shrink-0" />{merge.error}</div>}
+      {actionData?.error && <MappingErrors error={actionData.error} issues={actionData.issues} />}
+
+      {!mappings.length && (
+        <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">
+          {canWrite ? '还没有映射。一个映射把数据源里的一张表对应到一个标准实体，在下面新建第一个。' : '还没有映射。数据工程师或管理员新建后会出现在这里。'}
+        </div>
+      )}
+
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
+        {mappings.map(m => {
+          const failed = m.lastMerge && 'error' in m.lastMerge;
+          return (
+            <Link
+              key={m.id}
+              to={`/mappings/${m.id}`}
+              data-mapping-id={m.id}
+              className={cn('rounded-2xl border bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md', failed && 'border-red-200')}
+            >
+              <div className="text-lg font-medium">{`${m.entityLabel}（${m.entity}）`}</div>
+              <div className="mt-1 truncate font-mono text-xs text-slate-400">{`${m.sourceName} / ${m.table}`}</div>
+              <div className="mt-4 flex flex-wrap gap-3 text-sm">
+                {m.published
+                  ? <span className="inline-flex items-center gap-1 text-emerald-600"><CheckCircle2 className="size-3.5" />{`已发布 v${m.published}`}</span>
+                  : <span className="inline-flex items-center gap-1 text-slate-500"><CircleDashed className="size-3.5" />未发布</span>}
+                {m.draft && <span className="inline-flex items-center gap-1 text-amber-600"><PencilLine className="size-3.5" />{`草稿 v${m.draft}`}</span>}
+              </div>
+              <div className={cn('mt-4 flex items-start gap-1 border-t pt-3 text-xs', failed ? 'text-red-600' : 'text-slate-400')}>
+                {failed && <AlertTriangle className="mt-px size-3.5 shrink-0" />}
+                <span className="line-clamp-2">{m.lastMerge ? `最近一次合并：${mergeSummary(m.lastMerge)}` : '还没有合并过'}</span>
+              </div>
+            </Link>
+          );
+        })}
+
+        {canWrite && (
+          // 没有 JS 时也能展开新建：<details> 收起时是虚线的「新建映射」卡片，展开后占满一行（编辑框与对照面板需要整行宽度）
+          <details open={!mappings.length || Boolean(actionData)} className="group rounded-2xl border-2 border-dashed open:col-span-full open:border open:border-solid open:bg-white open:p-6 open:shadow-sm">
+            <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+              <span className="grid min-h-40 place-items-center text-slate-400 hover:text-slate-600 group-open:hidden">
+                <span className="flex flex-col items-center gap-2"><Plus className="size-6" />新建映射</span>
+              </span>
+              <span className="hidden items-center justify-between gap-6 group-open:flex">
+                <h2 className="text-lg font-semibold">新建映射</h2>
+                <X aria-hidden className="size-4 text-slate-400" />
+              </span>
+            </summary>
+            <p className="mt-1 mb-5 max-w-2xl text-sm text-slate-500">
               一个映射把数据源里的一张表（须在同步范围内、已采集）对应到一个实体。字段表达式只能用白名单函数，
               值字典把源端枚举对应到标准枚举，dedupe 声明去重键与取最新字段。实体与字段说明见<Link to="/model" className="underline">标准模型</Link>。
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
+            </p>
             <NewMapping
               key={actionData?.draftId ?? 'new'}
               sources={sources}
@@ -187,9 +198,9 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
               values={actionData?.values ?? { sourceId: sources[0]?.id ?? '', yaml: initialYaml }}
               submitting={submitting}
             />
-          </CardContent>
-        </Card>
-      )}
+          </details>
+        )}
+      </div>
     </AppShell>
   );
 }

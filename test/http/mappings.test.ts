@@ -93,7 +93,7 @@ describe('编写与发布映射', () => {
     expect(created.status).toBe(302);
     const id = mappingIdOf(created);
     const detail = await (await engineer.get(`/mappings/${id}`)).text();
-    expect(detail).toContain('data-version-status="draft"');
+    expect(await (await engineer.get(`/mappings/${id}?tab=versions`)).text()).toContain('data-version-status="draft"');
     expect(detail).toContain('你最后改了这一版草稿，需由另一位数据工程师或管理员发布');
     expect((await engineer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(403);
     // 只有草稿时不能合并
@@ -110,7 +110,7 @@ describe('编写与发布映射', () => {
     expect(await (await reviewer.get(`/mappings/${id}`)).text()).toContain('name="intent" value="publish"');
     expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
     const detail = await (await reviewer.get(`/mappings/${id}`)).text();
-    expect(detail).toContain('data-version-status="published"');
+    expect(await (await reviewer.get(`/mappings/${id}?tab=versions`)).text()).toContain('data-version-status="published"');
     expect(detail).not.toContain('name="intent" value="publish"');
     expect(await (await reviewer.get('/tasks')).text()).toContain('合并到标准层');
     // 已发布后可以在详情页只合并这个映射（发布入队的合并还在排队，并进去）
@@ -119,7 +119,7 @@ describe('编写与发布映射', () => {
 
     // 已发布的版本再保存是新的一版草稿
     expect((await author.post(`/mappings/${id}`, { intent: 'save', yaml: ORDERS.replace('amount: amount', 'amount: amount / 100') })).status).toBe(302);
-    const after = await (await author.get(`/mappings/${id}`)).text();
+    const after = await (await author.get(`/mappings/${id}?tab=versions`)).text();
     expect(after).toContain('data-version="2" data-version-status="draft"');
     expect(after).toContain('data-version="1" data-version-status="published"');
 
@@ -142,7 +142,7 @@ describe('编写与发布映射', () => {
     expect((await (await loginAs(app, 'de2@acme.com')).post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
-    expect(await (await author.get(`/mappings/${id}`)).text()).toContain('订单状态有 1 种取值（共 50 行）落入兜底：refunded（50）');
+    expect(await (await author.get(`/mappings/${id}?tab=merges`)).text()).toContain('订单状态有 1 种取值（共 50 行）落入兜底：refunded（50）');
   });
 
   it('发布者不能是最后保存草稿的人：A 起草、B 修改后 A 能发布、B 不能，反过来也一样', async () => {
@@ -177,7 +177,7 @@ describe('编写与发布映射', () => {
     expect(await (await engineer.get(`/mappings/${id}`)).text()).toContain('name="intent" value="discard"');
     const kept = await admin.post(`/mappings/${id}`, { intent: 'discard' });
     expect(kept.headers.get('Location')).toBe(`/mappings/${id}`);
-    const detail = await (await engineer.get(`/mappings/${id}`)).text();
+    const detail = await (await engineer.get(`/mappings/${id}?tab=versions`)).text();
     expect(detail).not.toContain('data-version-status="draft"');
     expect(detail).toContain('data-version="1" data-version-status="published"');
     expect(detail).not.toContain('name="intent" value="discard"');
@@ -238,6 +238,39 @@ describe('编写与发布映射', () => {
     expect((await stranger.get(`/mappings/${id}`)).status).toBe(404);
     expect((await stranger.post(`/mappings/${id}`, { intent: 'save', yaml: ORDERS })).status).toBe(404);
     expect((await stranger.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS })).status).toBe(400);
+  });
+
+  it('详情页的编辑、版本、合并记录标签页由 ?tab= 在服务端渲染，发布与合并后回到原标签页', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const author = await loginAs(app, 'de@acme.com');
+    const id = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+
+    const edit = await (await author.get(`/mappings/${id}`)).text();
+    expect(edit).toMatch(/<a(?=[^>]*aria-current="page")[^>]*data-tab="edit"/);
+    expect(edit).toContain('name="yaml"');
+    expect(edit).not.toContain('data-version-status=');
+    expect(edit).not.toContain('还没有合并过');
+
+    const versions = await (await author.get(`/mappings/${id}?tab=versions`)).text();
+    expect(versions).toMatch(/<a(?=[^>]*aria-current="page")[^>]*data-tab="versions"/);
+    expect(versions).toContain('data-version="1" data-version-status="draft"');
+    expect(versions).not.toContain('name="yaml"');
+
+    const merges = await (await author.get(`/mappings/${id}?tab=merges`)).text();
+    expect(merges).toMatch(/<a(?=[^>]*aria-current="page")[^>]*data-tab="merges"/);
+    expect(merges).toContain('还没有合并过');
+    expect(merges).not.toContain('data-version-status=');
+
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+    expect((await reviewer.post(`/mappings/${id}?tab=versions`, { intent: 'publish', version: '1' })).headers.get('Location')).toBe(`/mappings/${id}?tab=versions`);
+    expect((await reviewer.post(`/mappings/${id}?tab=merges`, { intent: 'merge' })).headers.get('Location')).toBe(`/mappings/${id}?tab=merges`);
+    expect((await reviewer.post(`/mappings/${id}`, { intent: 'merge' })).headers.get('Location')).toBe(`/mappings/${id}`);
+
+    // 在版本页选中某一版，编辑页显示那一版
+    await author.post(`/mappings/${id}`, { intent: 'save', yaml: ORDERS.replace('amount: amount', 'amount: amount / 100') });
+    expect(editorYaml(await (await author.get(`/mappings/${id}`)).text())).toContain('amount / 100');
+    expect(editorYaml(await (await author.get(`/mappings/${id}?version=1`)).text())).not.toContain('amount / 100');
   });
 });
 
@@ -338,7 +371,7 @@ describe('按规则生成映射草稿', () => {
     const saved = await engineer.post('/mappings', { intent: 'create', sourceId, yaml });
     expect(saved.status).toBe(302);
     const id = mappingIdOf(saved);
-    expect(await (await engineer.get(`/mappings/${id}`)).text()).toContain('data-version-status="draft"');
+    expect(await (await engineer.get(`/mappings/${id}?tab=versions`)).text()).toContain('data-version-status="draft"');
   });
 
   it('详情页用映射的表与实体重新生成，保存后替换草稿；选的表不存在时说明原因', async () => {
@@ -433,6 +466,6 @@ describe('表单式映射编辑器', () => {
     await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
     const reviewer = await loginAs(app, 'de2@acme.com');
     expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
-    expect(await (await reviewer.get(`/mappings/${id}`)).text()).toContain('data-version="1" data-version-status="published"');
+    expect(await (await reviewer.get(`/mappings/${id}?tab=versions`)).text()).toContain('data-version="1" data-version-status="published"');
   });
 });

@@ -1,7 +1,7 @@
 // app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：指标卡、本租户的数据源卡片（标出未核对与最近一次核对有差异的）与登记表单
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
-import { AlertTriangle, CheckCircle2, CircleAlert, CircleDashed, Cloud, Database, FileBox, Leaf, Plus, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, CircleAlert, CircleDashed, Plus, X } from 'lucide-react';
 import type { Route } from './+types/sources';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
@@ -10,6 +10,7 @@ import { verifyDifferences } from '~/.server/source-verify';
 import { formValues, SOURCE_KIND_LABELS, SOURCE_KINDS, type SourceKind } from '~/lib/sources';
 import { cn } from '~/lib/utils';
 import { AppShell } from '~/components/app-shell';
+import { KindIcon } from '~/components/kind-icon';
 import { PageHeader } from '~/components/page-header';
 import { SourceFields } from '~/components/source-fields';
 import { StatTile } from '~/components/stat-tile';
@@ -155,7 +156,7 @@ type VerifyState = 'none' | 'ok' | 'diff';
 const verifyStateOf = (differences: number | null): VerifyState => differences === null ? 'none' : differences > 0 ? 'diff' : 'ok';
 
 /** 状态色配图标和文字（见 docs/agents/ui.md） */
-const VERIFY_BADGE: Record<VerifyState, { icon: typeof Database; tone: string }> = {
+const VERIFY_BADGE: Record<VerifyState, { icon: typeof CheckCircle2; tone: string }> = {
   none: { icon: CircleDashed, tone: 'text-slate-500' }, ok: { icon: CheckCircle2, tone: 'text-emerald-600' }, diff: { icon: AlertTriangle, tone: 'text-red-600' },
 };
 
@@ -166,15 +167,4 @@ function VerifyBadge({ state, differences }: { state: VerifyState; differences: 
       <Icon className="size-3.5" />{state === 'none' ? '未核对' : state === 'ok' ? '一致' : `${differences} 张表有差异`}
     </span>
   );
-}
-
-const KIND_ICON: Record<SourceKind, typeof Database> = { postgres: Database, mysql: Database, mongodb: Leaf, s3: Cloud, duckdb: FileBox };
-/** 各类型固定色调（见 docs/agents/ui.md） */
-const KIND_TINT: Record<SourceKind, string> = {
-  postgres: 'bg-sky-100 text-sky-700', mysql: 'bg-orange-100 text-orange-700', mongodb: 'bg-emerald-100 text-emerald-700', s3: 'bg-violet-100 text-violet-700', duckdb: 'bg-amber-100 text-amber-700',
-};
-
-function KindIcon({ kind }: { kind: SourceKind }) {
-  const Icon = KIND_ICON[kind];
-  return <span className={cn('grid size-11 shrink-0 place-items-center rounded-xl', KIND_TINT[kind])}><Icon className="size-5" /></span>;
 }

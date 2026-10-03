@@ -497,7 +497,7 @@ export async function listMappings(actor: CurrentMember) {
 export async function getMapping(actor: CurrentMember, mappingId: string) {
   assertCan(actor, 'sources:read');
   const mapping = await requireMapping(actor.tenant.id, mappingId);
-  const [source] = await getDb().select({ id: sources.id, name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
+  const [source] = await getDb().select({ id: sources.id, name: sources.name, kind: sources.kind }).from(sources).where(eq(sources.id, mapping.sourceId));
   const versions = await getDb().select().from(mappingVersions).where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version));
   const merge = await mergesOfMapping(actor.tenant.id, mappingId);
   return {
