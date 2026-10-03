@@ -24,11 +24,12 @@ fields:
       '2': refunded
 `;
 
-const issues = (text: string) => {
-  const r = checkMapping(text, columns);
+const issuesWith = (text: string, source: typeof columns | ((table: string) => { name: string; type: string }[] | string)) => {
+  const r = checkMapping(text, source);
   if (r.ok) throw new Error('应当校验失败');
   return r.issues;
 };
+const issues = (text: string) => issuesWith(text, columns);
 
 describe('映射文档的校验', () => {
   it('合法的映射得到合并计划：没有声明去重键时按实体主键去重', () => {
@@ -124,6 +125,43 @@ colour: red
     const custom = `model: 1\nentity: custom_coupon\ntable: orders\nextensions:\n  code: { type: string, expr: string(order_id) }\n`;
     expect(issues(custom).map(i => i.message)).toEqual(['自定义实体必须声明去重键 dedupe.key']);
     expect(checkMapping(`${custom}dedupe: { key: [code] }\n`, columns).ok).toBe(true);
+  });
+});
+
+describe('敏感字段', () => {
+  const CUSTOMERS = (table: string) => (table === 'customers'
+    ? [{ name: 'id', type: 'BIGINT' }, { name: 'name', type: 'VARCHAR' }, { name: 'wechat', type: 'VARCHAR' }, { name: 'age', type: 'INTEGER' }]
+    : `数据源中没有表 ${table}`);
+  const BASE = 'model: 1\nentity: customer\ntable: customers\nfields:\n  customer_id: string(id)\n';
+
+  it('扩展字段可以标成敏感：合并计划里的列带上标记；内置敏感字段在计划里总是敏感', () => {
+    const r = checkMapping(`${BASE}  name: name\n  gender: \"'unknown'\"\nextensions:\n  x_wechat: { type: string, expr: wechat, sensitive: true }\n  x_age: { type: integer, expr: age, sensitive: false }\n`, CUSTOMERS);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const col = (name: string) => r.plan.columns.find(c => c.name === name);
+    expect(col('x_wechat')).toMatchObject({ sensitive: true });
+    expect(col('name')).toMatchObject({ sensitive: true });
+    expect(col('gender')?.sensitive).toBeUndefined();
+    expect(col('x_age')?.sensitive).toBeUndefined();
+  });
+
+  it('敏感扩展字段只存哈希：类型只能是文本，不能带值字典与兜底', () => {
+    const found = issuesWith(`${BASE}extensions:\n  x_age: { type: integer, expr: age, sensitive: true }\n`, CUSTOMERS);
+    expect(found).toEqual([expect.objectContaining({ path: 'extensions.x_age.type', message: expect.stringMatching(/敏感.*string/), hint: expect.stringContaining('type: string') })]);
+    // 哈希的是源端取值，值字典与兜底对它不起作用
+    expect(issuesWith(`${BASE}extensions:\n  x_wechat: { type: string, expr: wechat, sensitive: true, dictionary: { a: b } }\n`, CUSTOMERS)).toEqual([
+      expect.objectContaining({ path: 'extensions.x_wechat.sensitive', message: expect.stringContaining('值字典') }),
+    ]);
+  });
+
+  it('内置敏感字段不能取消敏感标记；标准字段不能自行标成敏感', () => {
+    expect(checkMapping(`${BASE}  name: { expr: name, sensitive: true }\n`, CUSTOMERS).ok).toBe(true);
+    expect(issuesWith(`${BASE}  name: { expr: name, sensitive: false }\n`, CUSTOMERS)).toEqual([
+      expect.objectContaining({ line: 6, path: 'fields.name.sensitive', message: expect.stringContaining('不能取消') }),
+    ]);
+    expect(issuesWith(`${BASE}  city: { expr: wechat, sensitive: true }\n`, CUSTOMERS)).toEqual([
+      expect.objectContaining({ path: 'fields.city.sensitive', message: expect.stringContaining('扩展字段') }),
+    ]);
   });
 });
 

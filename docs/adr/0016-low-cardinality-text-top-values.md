@@ -6,7 +6,7 @@
 
 现在放宽为：采集列统计时，满足以下全部条件的文本列（`VARCHAR`）在 `ColumnProfile.top` 里保存样本中最常见的取值与各自的样本行数，按行数从多到少，最多 50 个。
 - 样本中不同取值（近似）不超过 50。
-- 列名不像敏感信息：不命中 `phone`/`mobile`/`tel`/`mail`/`name`/`addr`/`id_card`/`id_no`/`passport`/`cert`/`birth`/`ssn`/`contact` 等英文片段，也不命中“手机、电话、邮箱、姓名、名字、地址、身份证、证件、生日”等中文（完整清单见 `source-engine.ts` 的 `SENSITIVE_NAME`）。
+- 列名不像敏感信息：不命中 `phone`/`mobile`/`tel`/`mail`/`name`/`addr`/`id_card`/`id_no`/`passport`/`cert`/`birth`/`ssn`/`contact` 等英文片段，也不命中“手机、电话、邮箱、姓名、名字、地址、身份证、证件、生日”等中文（完整清单见 `app/lib/sensitive.ts` 的 `SENSITIVE_NAME`）。
 - 样本中**没有任何一个**取值符合邮箱或手机号格式（不是格式特征里“至少一半符合”的门槛：混着少数手机号的备用联系方式列也排除）。
 - 最长的取值不超过 64 个字符：更长的多半是备注之类的自由文本。
 

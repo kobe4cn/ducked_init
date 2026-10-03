@@ -61,7 +61,8 @@ export async function referenceTables(actor: CurrentMember, sourceId: string) {
     // 旧的采集结果里没有主键信息
     primaryKey: table.primaryKey?.length ? table.primaryKey : (key ?? []),
     watermark: watermark?.column ?? null,
-    columns: table.columns.map(c => ({ name: c.name, type: c.type, nullRate: c.nullRate, distinct: c.distinct, top: c.top ?? null })),
+    // formats：表单新建扩展字段时据此判断是否像敏感信息
+    columns: table.columns.map(c => ({ name: c.name, type: c.type, nullRate: c.nullRate, distinct: c.distinct, top: c.top ?? null, formats: c.formats ?? [] })),
   }));
 }
 

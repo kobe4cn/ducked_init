@@ -8,6 +8,7 @@ import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 import { MongoClient, type MongoClientOptions } from 'mongodb';
 import { objectPath, signedFetch, xmlTag } from '../s3-client';
 import type { EngineLimits } from './lake-engine';
+import { SENSITIVE_FORMATS, SENSITIVE_NAME } from '../../lib/sensitive';
 
 export interface S3Connection { endpoint: string; region: string; urlStyle: string; useSsl: boolean; keyId: string; secret: string }
 
@@ -78,10 +79,6 @@ export type TextFormat = keyof typeof TEXT_FORMATS;
 const TOP_MAX_DISTINCT = 50;
 /** 常见取值的最大长度：更长的多半是备注等自由文本 */
 const TOP_VALUE_MAX_LENGTH = 64;
-/** 列名像敏感信息的，不保存取值；宁可误伤（如 hotel 命中 tel） */
-const SENSITIVE_NAME = /phone|mobile|tel|mail|name|addr|id_?card|id_?no|passport|cert|birth|ssn|contact|手机|电话|邮箱|姓名|名字|地址|身份证|证件|生日/i;
-/** 样本中有任何一个取值符合这些格式，就不保存取值 */
-const SENSITIVE_FORMATS: TextFormat[] = ['email', 'mobile'];
 
 /** 更新时间字段的常见命名 */
 const UPDATED_AT_NAME = /upd|modif|mtime|chang|last_?edit/i;
@@ -538,6 +535,7 @@ async function profileTable(
     });
     for (const [i, c] of texts.entries()) {
       const profile = columns[summary.indexOf(c)];
+      // 列名像敏感信息，或样本中有任何一个取值像邮箱、手机号，就不保存取值
       const looksSensitive = SENSITIVE_NAME.test(c.column_name) || SENSITIVE_FORMATS.some(f => Number(textStats[`${f}${i}`] ?? 0) > 0);
       if (looksSensitive || !profile.length || profile.length.max > TOP_VALUE_MAX_LENGTH || profile.distinct > TOP_MAX_DISTINCT) continue;
       profile.top = (await rows<{ value: string; rows: string }>(con, `

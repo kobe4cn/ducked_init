@@ -1,6 +1,6 @@
 // app/.server/pipeline/mapping-spec.ts —— 映射文档（YAML）：一张源表 → 一个标准实体（或自定义实体）。
 // 先按 JSON Schema（MAPPING_SCHEMA）校验结构，再对照标准模型与源表的字段做语义校验：字段表达式只能用白名单函数、只能引用源表里有的字段，
-// 值字典与兜底值只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
+// 值字典与兜底值只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段；扩展字段可标成敏感（只能是文本），内置敏感字段不能取消敏感标记。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
 // 校验通过后得到合并计划（MergePlan）：标准层的列、每列的表达式与值字典、去重键与取最新字段，交给工作进程编译执行（ADR-0015）
 import { Ajv, type ErrorObject } from 'ajv';
 import { Document, isMap, isScalar, isSeq, LineCounter, parseDocument, type Node, type YAMLMap } from 'yaml';
@@ -12,7 +12,7 @@ import { fieldsForColumn, normalizeName, similarFields, similarNames, standardVa
 import { ExprError, FUNCTIONS, KIND_FIELD_TYPES, kindOf, parseExpression, ref, referencedColumns, type Expr } from '../../lib/mapping-expr';
 
 /** 字段的写法：表达式本身，或带值字典（与兜底值）的对象 */
-export type FieldSpec = string | { expr: string; dictionary?: Record<string, string>; otherwise?: string | null };
+export type FieldSpec = string | { expr: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean };
 
 export interface MappingSpec {
   /** 标准模型的大版本 */
@@ -22,8 +22,8 @@ export interface MappingSpec {
   table: string;
   description?: string;
   fields?: Record<string, FieldSpec>;
-  /** 扩展字段（标准实体上以 x_ 开头）或自定义实体的全部字段：带类型 */
-  extensions?: Record<string, { type: FieldType; expr: string; label?: string; dictionary?: Record<string, string>; otherwise?: string | null }>;
+  /** 扩展字段（标准实体上以 x_ 开头）或自定义实体的全部字段：带类型；sensitive 为真时标准层只存加盐哈希 */
+  extensions?: Record<string, { type: FieldType; expr: string; label?: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean }>;
   /** 去重键与取最新规则：同一去重键的多行只留一行，取最新字段最大的那行。不写时按实体主键去重 */
   dedupe?: { key: string[]; latest?: string };
 }
@@ -39,6 +39,7 @@ const fieldSpec = {
       expr: { type: 'string', minLength: 1 },
       dictionary: { type: 'object', minProperties: 1, additionalProperties: { type: 'string', minLength: 1 } },
       otherwise: { type: ['string', 'null'], minLength: 1 },
+      sensitive: { type: 'boolean' },
     },
   },
 };
@@ -66,6 +67,7 @@ export const MAPPING_SCHEMA = {
           label: { type: 'string' },
           dictionary: { type: 'object', minProperties: 1, additionalProperties: { type: 'string', minLength: 1 } },
           otherwise: { type: ['string', 'null'], minLength: 1 },
+          sensitive: { type: 'boolean' },
         },
       },
     },
@@ -91,9 +93,12 @@ export interface MappingIssue { line: number; col: number; path: string; message
 
 /**
  * 标准层里的一列：类型、表达式、值字典与标准枚举。
- * otherwise 是兜底值：值字典里没有（或没有值字典时不是标准枚举）的取值写成它，null 表示写成空；不写时这样的取值让合并失败
+ * otherwise 是兜底值：值字典里没有（或没有值字典时不是标准枚举）的取值写成它，null 表示写成空；不写时这样的取值让合并失败。
+ * sensitive：敏感字段（内置的与标成敏感的扩展字段），标准层只存加盐哈希
  */
-export interface PlanColumn { name: string; type: FieldType; expr: string; dictionary?: Record<string, string>; enum?: readonly string[]; otherwise?: string | null }
+export interface PlanColumn {
+  name: string; type: FieldType; expr: string; dictionary?: Record<string, string>; enum?: readonly string[]; otherwise?: string | null; sensitive?: true;
+}
 
 /** 合并计划：工作进程据此把源表的变更批次合并到标准层（MergeMappingParam 再加上映射与版本） */
 export interface MergePlan {
@@ -176,15 +181,16 @@ function fieldTypeOf(type: unknown): FieldType {
   return (FIELD_TYPE_NAMES as string[]).includes(t.toLowerCase()) ? (t.toLowerCase() as FieldType) : KIND_FIELD_TYPES[kindOf(t)];
 }
 
-/** 按扩展字段的写法整理（只留 type、expr、label、dictionary、otherwise；有值字典时只能是文本） */
+/** 按扩展字段的写法整理（只留 type、expr、label、dictionary、otherwise、sensitive；有值字典或敏感时只能是文本） */
 function asExtension(raw: Record<string, unknown>) {
   const dictionary = isRecord(raw.dictionary) ? raw.dictionary : undefined;
   return {
-    type: dictionary ? 'string' : fieldTypeOf(raw.type),
+    type: dictionary || raw.sensitive === true ? 'string' : fieldTypeOf(raw.type),
     expr: typeof raw.expr === 'string' ? raw.expr : '源列',
     ...(typeof raw.label === 'string' && { label: raw.label }),
     ...(dictionary && { dictionary }),
     ...((typeof raw.otherwise === 'string' || raw.otherwise === null) && { otherwise: raw.otherwise }),
+    ...(raw.sensitive === true && { sensitive: true }),
   };
 }
 
@@ -396,7 +402,15 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
     checkExpr(typeof raw === 'string' ? ['fields', name] : ['fields', name, 'expr'], expr);
     checkDictionary(['fields', name], field.type, dictionary, () => snippet({ [name]: expr }), field);
     checkOtherwise(['fields', name], parts, dictionary, field);
-    planned.push({ name, type: field.type, expr, ...(dictionary && { dictionary }), ...(field.enum && { enum: field.enum }), ...otherwiseOf(parts) });
+    // 标准字段是否敏感由标准模型决定：可以照写 sensitive: true，不能取消，也不能把别的标准字段标成敏感
+    if (parts.sensitive === false && field.pii) {
+      issue(['fields', name, 'sensitive'], `${field.label}（${name}）是内置敏感字段，不能取消敏感标记`, { atKey: true });
+    } else if (parts.sensitive === true && !field.pii) {
+      issue(['fields', name, 'sensitive'], `${field.label}（${name}）不是敏感字段：只有扩展字段可以标成敏感`, { atKey: true });
+    }
+    planned.push({
+      name, type: field.type, expr, ...(dictionary && { dictionary }), ...(field.enum && { enum: field.enum }), ...otherwiseOf(parts), ...(field.pii && { sensitive: true as const }),
+    });
   }
   const extensionName = new RegExp(custom ? CUSTOM_FIELD_PATTERN : EXTENSION_PATTERN);
   for (const [name, ext] of Object.entries(spec.extensions ?? {})) {
@@ -409,7 +423,16 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
     checkExpr(['extensions', name, 'expr'], ext.expr);
     checkDictionary(['extensions', name], ext.type, ext.dictionary, () => snippet({ [name]: { ...ext, type: 'string' } }, [[name]]));
     checkOtherwise(['extensions', name], ext, ext.dictionary);
-    planned.push({ name, type: ext.type, expr: ext.expr, ...(ext.dictionary && { dictionary: ext.dictionary }), ...otherwiseOf(ext) });
+    // 敏感字段在标准层存的是十六进制的哈希
+    if (ext.sensitive && ext.type !== 'string') {
+      issue(['extensions', name, 'type'], '敏感字段在标准层只存哈希，类型只能是 string（文本）', { hint: snippet({ [name]: { ...ext, type: 'string' } }, [[name]]) });
+    }
+    if (ext.sensitive && (ext.dictionary || Object.hasOwn(ext, 'otherwise'))) {
+      issue(['extensions', name, 'sensitive'], '敏感字段在标准层只存源端取值的哈希，值字典与兜底对它不起作用：请去掉 dictionary / otherwise，或取消敏感标记', { atKey: true });
+    }
+    planned.push({
+      name, type: ext.type, expr: ext.expr, ...(ext.dictionary && { dictionary: ext.dictionary }), ...otherwiseOf(ext), ...(ext.sensitive && { sensitive: true as const }),
+    });
   }
   if (!planned.length) issue(spec.fields ? ['fields'] : [], '至少要映射一个字段');
 

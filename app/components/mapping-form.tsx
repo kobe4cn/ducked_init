@@ -2,7 +2,8 @@
 // （带列类型与常见取值）与一种常用转换，或写自定义表达式（可插入白名单函数）；枚举字段另有「源值 → 标准值」的值对照与兜底。
 // 表单不存数据，每次修改都由 writeField 写回同一份 YAML（ADR-0017）；表单不认识的写法只读显示原表达式。
 // 选到一半（还没选源列、表达式写不完整）时只留在这一行，不写进 YAML；还没对应的源值只显示（标黄），不写进值字典。
-// 标准字段之后是扩展字段：已有的可改名、类型与中文名，取消勾选即删除；下面列出还没用到的源列，勾选即加为扩展字段
+// 内置敏感字段带「敏感」徽标，不能取消。标准字段之后是扩展字段：已有的可改名、类型、中文名与是否敏感（敏感的只能是文本），取消勾选即删除；
+// 下面列出还没用到的源列，勾选即加为扩展字段（名称或格式像敏感信息的默认标成敏感）
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
 import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, type CanonicalField, type FieldType } from '~/lib/canonical-model';
@@ -192,6 +193,7 @@ function FieldRow({ entity, form, field, table, functions, pending, onWrite, onE
         <span className="font-mono font-medium">{field.name}</span>
         <span>{field.label}</span>
         <span className="text-xs text-muted-foreground">{FIELD_TYPES[field.type].label}</span>
+        {field.pii && <Badge variant="outline" title="标准层只存加盐哈希，不能取消">敏感信息</Badge>}
         {form.required && <Badge variant={unmapped ? 'destructive' : 'secondary'}>{unmapped ? '必填（去重键），未对应' : '必填（去重键）'}</Badge>}
       </div>
       <div className="text-xs text-muted-foreground">
@@ -300,7 +302,7 @@ function ExtensionRow({ form, others, onWrite, onEditYaml }: {
   onWrite: (choice: ExtensionChoice | null) => void;
   onEditYaml: () => void;
 }) {
-  const read = { name: form.name, type: form.type ?? 'string', label: form.label };
+  const read = { name: form.name, type: form.type ?? 'string', label: form.label, sensitive: form.sensitive };
   const [draft, setDraft] = useState(read);
   // YAML 在别处改了时按 YAML 重新读出
   const current = JSON.stringify(read);
@@ -322,7 +324,10 @@ function ExtensionRow({ form, others, onWrite, onEditYaml }: {
       <div className="flex flex-wrap items-center gap-2">
         <input type="checkbox" checked aria-label={`保留扩展字段 ${form.name}`} disabled={form.readonly} onChange={() => onWrite(null)} />
         {form.readonly ? (
-          <span className="font-mono">{form.name}</span>
+          <>
+            <span className="font-mono">{form.name}</span>
+            {form.sensitive && <Badge variant="outline">敏感信息</Badge>}
+          </>
         ) : (
           <>
             <Input className="h-7 w-48 font-mono" aria-label={`${form.name} 的名字`} value={draft.name} onChange={e => update({ ...draft, name: e.target.value })} />
@@ -330,13 +335,23 @@ function ExtensionRow({ form, others, onWrite, onEditYaml }: {
               size="sm"
               aria-label={`${form.name} 的类型`}
               value={draft.type}
-              disabled={form.dictionary}
-              title={form.dictionary ? '带值字典或兜底的扩展字段只能是文本' : undefined}
+              disabled={form.dictionary || draft.sensitive}
+              title={form.dictionary ? '带值字典或兜底的扩展字段只能是文本' : draft.sensitive ? '敏感字段只存哈希，只能是文本' : undefined}
               onChange={e => update({ ...draft, type: e.target.value as FieldType })}
             >
               {FIELD_TYPE_NAMES.map(t => <NativeSelectOption key={t} value={t}>{`${t}（${FIELD_TYPES[t].label}）`}</NativeSelectOption>)}
             </NativeSelect>
             <Input className="h-7 w-40" aria-label={`${form.name} 的中文名`} placeholder="中文名（可不填）" value={draft.label} onChange={e => update({ ...draft, label: e.target.value })} />
+            <label className="flex items-center gap-1 text-xs" title={form.dictionary ? '带值字典或兜底的扩展字段不能标成敏感' : '标准层只存加盐哈希'}>
+              {/* 标成敏感时类型改为文本 */}
+              <input
+                type="checkbox"
+                checked={draft.sensitive}
+                disabled={form.dictionary}
+                onChange={e => update({ ...draft, sensitive: e.target.checked, ...(e.target.checked && { type: 'string' as const }) })}
+              />
+              敏感
+            </label>
           </>
         )}
       </div>

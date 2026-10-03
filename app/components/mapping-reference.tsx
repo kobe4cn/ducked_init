@@ -12,7 +12,11 @@ import { Button } from '~/components/ui/button';
 import { Badge } from '~/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
-export interface ReferenceColumn { name: string; type: string; nullRate: number; distinct: number; top: { value: string; rows: number }[] | null }
+export interface ReferenceColumn {
+  name: string; type: string; nullRate: number; distinct: number; top: { value: string; rows: number }[] | null;
+  /** 样本里过半取值符合的文本格式（如 email、mobile） */
+  formats?: { format: string; share: number }[];
+}
 export interface ReferenceTable { name: string; sampleRows: number; primaryKey: string[]; watermark: string | null; columns: ReferenceColumn[] }
 /** 白名单函数（由 loader 从 mapping-expr 的 FUNCTIONS 传来） */
 export interface ReferenceFunction { name: string; signature: string; label: string }

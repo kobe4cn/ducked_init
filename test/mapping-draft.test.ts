@@ -317,6 +317,21 @@ describe('转换与值字典', () => {
     expect(checkMapping(uncommented, () => t.columns)).toMatchObject({ ok: true, plan: { entityColumns: expect.arrayContaining([{ name: 'x_discount', type: 'decimal' }]) } });
   });
 
+  it('没用到的列名称或格式像敏感信息时，扩展字段写法默认标成敏感（文本）', () => {
+    const t = table('orders', [
+      column('order_id', 'VARCHAR'), column('receiver_addr', 'VARCHAR'), column('contact_tel', 'BIGINT'),
+      column('memo', 'VARCHAR', { formats: [{ format: 'mobile', share: 0.9 }] }), column('discount', 'DECIMAL(12,2)'),
+    ], ['order_id']);
+    const yaml = draft(t, 'order');
+    expect(yaml).toContain('#   x_receiver_addr: { type: string, expr: receiver_addr, sensitive: true }\n');
+    expect(yaml).toContain('#   x_contact_tel: { type: string, expr: string(contact_tel), sensitive: true }\n');
+    expect(yaml).toContain('#   x_memo: { type: string, expr: memo, sensitive: true }\n');
+    expect(yaml).toContain('#   x_discount: { type: decimal, expr: discount }\n');
+    const uncommented = yaml.replace(/^# (extensions:|  x_)/gm, '$1');
+    const r = checkMapping(uncommented, () => t.columns);
+    expect(r.ok && r.plan.columns.filter(c => c.sensitive).map(c => c.name)).toEqual(['x_receiver_addr', 'x_contact_tel', 'x_memo']);
+  });
+
   it('需要引号的列名在表达式里加上双引号', () => {
     const t = table('orders', [column('Order ID', 'VARCHAR'), column('Created-At', 'TIMESTAMP')], ['Order ID']);
     const yaml = draft(t, 'order');

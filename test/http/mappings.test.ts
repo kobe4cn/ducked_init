@@ -524,4 +524,24 @@ describe('表单式映射编辑器', () => {
     expect(created.status).toBe(302);
     expect(editorYaml(await (await author.get(`/mappings/${mappingIdOf(created)}`)).text())).toBe(yaml);
   });
+  it('敏感字段：表单里把扩展字段标成敏感后保存成功；YAML 里取消内置敏感字段的敏感标记被拒绝', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const author = await loginAs(app, 'de@acme.com');
+    const customers = { columns: [{ name: 'customer_id', type: 'INTEGER' }, { name: 'phone', type: 'VARCHAR' }, { name: 'created_at', type: 'TIMESTAMP' }] };
+    const doc = parseDocument(CUSTOMERS);
+    // 列名像手机号：默认标成敏感
+    const phone = newExtension(customers, 'phone', []);
+    expect(phone).toMatchObject({ name: 'x_phone', type: 'string', sensitive: true });
+    writeExtension(doc, phone.name, phone);
+    writeExtension(doc, 'x_phone', { ...phone, name: 'x_backup_phone' });
+    const yaml = doc.toString();
+    expect(parseDocument(yaml).toJS().extensions).toEqual({ x_backup_phone: { type: 'string', expr: 'phone', sensitive: true } });
+    const created = await author.post('/mappings', { intent: 'create', sourceId, yaml });
+    expect(created.status).toBe(302);
+    expect(editorYaml(await (await author.get(`/mappings/${mappingIdOf(created)}`)).text())).toBe(yaml);
+
+    const rejected = await author.post(`/mappings/${mappingIdOf(created)}`, { intent: 'save', yaml: yaml.replace('  name: name\n', '  name: { expr: name, sensitive: false }\n') });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toContain('（fields.name.sensitive）：姓名（name）是内置敏感字段，不能取消敏感标记');
+  });
 });

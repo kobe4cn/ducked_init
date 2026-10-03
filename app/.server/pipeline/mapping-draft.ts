@@ -82,7 +82,7 @@ interface Mapped { expr: string; reason: string[]; column?: ColumnProfile }
 
 /**
  * 没用到的列写成扩展字段（注释掉放在文末，去掉注释即可保存）：类型按源列换算，不带时区的时间按时区解读；
- * 列名做不成扩展字段名（中文、特殊字符）时用 x_col_<列序号>
+ * 列名或格式像敏感信息的标成敏感（文本）。列名做不成扩展字段名（中文、特殊字符）时用 x_col_<列序号>
  */
 function extensionLines(columns: ColumnProfile[], all: ColumnProfile[], tz: string) {
   const used = new Set<string>();
@@ -90,11 +90,12 @@ function extensionLines(columns: ColumnProfile[], all: ColumnProfile[], tz: stri
   for (const c of columns) {
     const name = extensionName(c.name, all.indexOf(c) + 1, used);
     used.add(name);
-    const { type, expr } = extensionSpec(c, tz);
+    const { type, expr, sensitive } = extensionSpec(c, tz);
     const spec = new YAMLMap();
     spec.flow = true;
     spec.set('type', type);
     spec.set('expr', expr);
+    if (sensitive) spec.set('sensitive', true);
     extensions.set(name, spec);
   }
   return new Document({ extensions }).toString({ lineWidth: 0, singleQuote: true }).trimEnd().split('\n');

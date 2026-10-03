@@ -2,7 +2,8 @@
 // 表单状态（源列、常用转换与参数、枚举字段的值对照与兜底、依据），改单个字段时直接改原 Document 上的节点，注释与顺序都保留（ADR-0017）。
 // 表单不认识的写法（非枚举字段的值字典或兜底值、解析不了的表达式、其他结构）只读、原样保留，到 YAML 里改。
 // 改了表达式时清掉该字段的行尾注释：草稿写在那里的依据（同名、单位、时区）对新写法不一定成立。
-// 扩展字段：列出还没被任何字段用到的源列，勾选即按列推断名字与类型加上；已有的扩展字段可改名、类型与中文名，取消勾选即删除，值字典与兜底原样保留
+// 扩展字段：列出还没被任何字段用到的源列，勾选即按列推断名字与类型加上（列名或格式像敏感信息的默认标成敏感）；已有的扩展字段可改名、类型、中文名
+// 与是否敏感，取消勾选即删除，值字典与兜底原样保留。标准字段是否敏感由标准模型决定，YAML 里照写的 sensitive 原样保留
 import { isMap, isScalar, isSeq, YAMLMap, type Document, type Scalar } from 'yaml';
 import { EXTENSION_PATTERN, FIELD_TYPE_NAMES, type CanonicalEntity, type CanonicalField, type FieldType } from './canonical-model';
 import { extensionName, standardValue } from './field-synonyms';
@@ -174,7 +175,7 @@ function locate(doc: Document, standard: CanonicalField | undefined, field: stri
   if (isMap(value)) {
     const keys = value.items.map(p => (isScalar(p.key) ? p.key.value : null));
     node = value.get('expr', true);
-    if (keys.some(k => k !== 'expr' && k !== 'dictionary' && k !== 'otherwise')) reason = UNKNOWN;
+    if (keys.some(k => k !== 'expr' && k !== 'dictionary' && k !== 'otherwise' && k !== 'sensitive')) reason = UNKNOWN;
     else if (keys.includes('dictionary') || keys.includes('otherwise')) {
       const read = isEnumField(standard) ? readDictionary(value) : '非枚举字段带值字典或兜底值（dictionary / otherwise），请在 YAML 里修改';
       if (typeof read === 'string') reason = read;
@@ -330,14 +331,16 @@ export interface ExtensionForm {
   label: string;
   /** 带值字典或兜底：类型只能是文本，对照与兜底原样保留，到 YAML 里改 */
   dictionary: boolean;
+  /** 标成敏感：标准层只存加盐哈希，类型只能是文本 */
+  sensitive: boolean;
   readonly: boolean;
   reason?: string;
 }
 
 /** 表单上对一个扩展字段的选择（name 是改名后的名字）；交给 writeExtension 写回 YAML */
-export interface ExtensionChoice { name: string; type: FieldType; expr: string; label?: string }
+export interface ExtensionChoice { name: string; type: FieldType; expr: string; label?: string; sensitive?: boolean }
 
-const EXTENSION_KEYS = ['type', 'expr', 'label', 'dictionary', 'otherwise'];
+const EXTENSION_KEYS = ['type', 'expr', 'label', 'dictionary', 'otherwise', 'sensitive'];
 
 /** extensions 下的字段表；没写时都没有，写的不是字段表时是原因 */
 function extensionsMap(doc: Document): { map?: YAMLMap; reason?: string } {
@@ -347,22 +350,24 @@ function extensionsMap(doc: Document): { map?: YAMLMap; reason?: string } {
 }
 
 function readExtension(name: string, value: unknown): ExtensionForm {
-  const form: ExtensionForm = { name, type: null, expr: '', label: '', dictionary: false, readonly: false };
+  const form: ExtensionForm = { name, type: null, expr: '', label: '', dictionary: false, sensitive: false, readonly: false };
   if (!isMap(value)) return { ...form, expr: isScalar(value) && typeof value.value === 'string' ? value.value : '', readonly: true, reason: UNKNOWN };
   const get = (key: string) => {
     const node = value.get(key, true);
     return isScalar(node) ? node.value : node;
   };
-  const [type, expr, label] = [get('type'), get('expr'), get('label')];
+  const [type, expr, label, sensitive] = [get('type'), get('expr'), get('label'), get('sensitive')];
   const read: ExtensionForm = {
     ...form,
     type: FIELD_TYPE_NAMES.find(t => t === type) ?? null,
     expr: typeof expr === 'string' ? expr : '',
     label: typeof label === 'string' ? label : '',
     dictionary: value.has('dictionary') || value.has('otherwise'),
+    sensitive: sensitive === true,
   };
   const keys = value.items.map(p => (isScalar(p.key) ? p.key.value : null));
-  if (keys.some(k => !EXTENSION_KEYS.includes(String(k))) || typeof expr !== 'string' || (label != null && typeof label !== 'string')) {
+  if (keys.some(k => !EXTENSION_KEYS.includes(String(k))) || typeof expr !== 'string' || (label != null && typeof label !== 'string')
+    || (sensitive != null && typeof sensitive !== 'boolean')) {
     return { ...read, readonly: true, reason: UNKNOWN };
   }
   if (!read.type) return { ...read, readonly: true, reason: `类型 ${String(type)} 不是标准层的类型，请在 YAML 里修改` };
@@ -385,8 +390,13 @@ export function extensionNameProblem(name: string, others: readonly string[]): s
   return others.includes(name) ? nameTaken(name) : null;
 }
 
-/** 勾选源列时的扩展字段：名字 x_<列名>（做不成或与 taken 重名时 x_col_<列序号>），类型按列推断，不带时区的时间按 Asia/Shanghai 解读 */
-export function newExtension(table: { columns: readonly { name: string; type: string }[] }, column: string, taken: readonly string[]): ExtensionChoice {
+/**
+ * 勾选源列时的扩展字段：名字 x_<列名>（做不成或与 taken 重名时 x_col_<列序号>），类型按列推断，不带时区的时间按 Asia/Shanghai 解读；
+ * 列名或格式（采集到的 formats）像敏感信息的标成敏感，类型为文本
+ */
+export function newExtension(
+  table: { columns: readonly { name: string; type: string; formats?: readonly { format: string }[] }[] }, column: string, taken: readonly string[],
+): ExtensionChoice {
   const at = table.columns.findIndex(c => c.name === column);
   if (at < 0) throw new Error(`源表里没有列 ${column}`);
   return { name: extensionName(column, at + 1, taken), ...extensionSpec(table.columns[at]) };
@@ -412,8 +422,8 @@ export function unusedColumns<C extends { name: string }>(doc: Document, table: 
 }
 
 /**
- * 把一个扩展字段的选择写回原 Document（null 表示删掉）。已有的改名时原位改键，类型、表达式、中文名只改变了的项，值字典、兜底与注释保留；
- * 新的以 { type, expr, label } 追加在 extensions 末尾，删光时去掉 extensions。只读的扩展字段、改名与已有的重名时抛错
+ * 把一个扩展字段的选择写回原 Document（null 表示删掉）。已有的改名时原位改键，类型、表达式、中文名、敏感只改变了的项，值字典、兜底与注释保留；
+ * 新的以 { type, expr, label, sensitive } 追加在 extensions 末尾（不敏感时不写 sensitive），删光时去掉 extensions。只读的扩展字段、改名与已有的重名时抛错
  */
 export function writeExtension(doc: Document, name: string, choice: ExtensionChoice | null): void {
   const { map, reason } = extensionsMap(doc);
@@ -437,6 +447,7 @@ export function writeExtension(doc: Document, name: string, choice: ExtensionCho
     setKey(doc, spec, 'type', choice.type);
     setKey(doc, spec, 'expr', choice.expr);
     if (label) setKey(doc, spec, 'label', label);
+    if (choice.sensitive) setKey(doc, spec, 'sensitive', true);
     if (map) map.items.push(doc.createPair(choice.name, spec));
     else {
       const extensions = new YAMLMap();
@@ -447,7 +458,7 @@ export function writeExtension(doc: Document, name: string, choice: ExtensionCho
   }
   if (choice.name !== name) (pair.key as Scalar).value = choice.name;
   const spec = pair.value as YAMLMap;
-  const set = (key: string, value: string) => {
+  const set = (key: string, value: string | boolean) => {
     const old = spec.get(key, true);
     if (!(isScalar(old) && old.value === value)) setKey(doc, spec, key, value);
   };
@@ -455,4 +466,6 @@ export function writeExtension(doc: Document, name: string, choice: ExtensionCho
   set('expr', choice.expr);
   if (label) set('label', label);
   else spec.delete('label');
+  if (choice.sensitive) set('sensitive', true);
+  else spec.delete('sensitive');
 }

@@ -21,12 +21,12 @@ beforeEach(async () => { await resetDb(); });
 
 const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
-/** 线索表：同一批人换了写法（空格、大小写、+86 与分隔符），第 2 位的姓名一栏误填了邮箱 */
+/** 线索表：同一批人换了写法（空格、大小写、+86 与分隔符），第 2 位的姓名一栏误填了邮箱；微信号是租户特有的敏感信息 */
 const LEADS = `
-  CREATE TABLE shop.leads (id int PRIMARY KEY, full_name text, mobile text, mail text);
+  CREATE TABLE shop.leads (id int PRIMARY KEY, full_name text, mobile text, mail text, wechat text, channel text);
   INSERT INTO shop.leads VALUES
-    (1, '  消费者1 ', '+86 138-0000-0001', '  User1@Example.COM '),
-    (2, 'user2@example.com', '0086 13800000002', NULL);
+    (1, '  消费者1 ', '+86 138-0000-0001', '  User1@Example.COM ', ' wxid_lead1 ', '门店'),
+    (2, 'user2@example.com', '0086 13800000002', NULL, NULL, '小程序');
   GRANT SELECT ON shop.leads TO ${READER.user};`;
 
 const CUSTOMERS = `model: 1
@@ -110,6 +110,22 @@ describe('标准层的敏感字段只存加盐哈希', () => {
     expect(tables.filter(t => t.startsWith('silver_records.'))).toHaveLength(2);
     expect(plaintextIn(text)).toEqual([]);
     expect(plaintextIn(await taskText(acme))).toEqual([]);
+  });
+
+  it('标成敏感的扩展字段与内置敏感字段一样只存加盐哈希，没标的扩展字段照常存明文', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, `${LEADS_MAPPING}extensions:
+  x_wechat: { type: string, expr: wechat, sensitive: true }
+  x_channel: { type: string, expr: channel }
+`);
+    const salt = await tenantPiiSalt(acme);
+    const hash = (v: string) => createHash('sha256').update(salt + v).digest('hex');
+
+    const rows = await silver(acme, 'customer', 'customer_id');
+    expect(rows.map(r => [r.customer_id, r.x_wechat, r.x_channel])).toEqual([['L1', hash('wxid_lead1'), '门店'], ['L2', null, '小程序']]);
+    const { text } = await silverDump(acme);
+    expect(text).not.toContain('wxid_lead1');
+    expect(plaintextIn(text)).toEqual([]);
   });
 
   it('哈希上线之前按明文合并的标准层，下次合并时识别出来并重建', async () => {

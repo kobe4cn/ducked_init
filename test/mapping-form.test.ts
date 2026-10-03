@@ -314,8 +314,8 @@ describe('扩展字段', () => {
 
     writeExtension(doc, 'x_customer_id', { name: 'x_buyer', type: 'string', expr: 'customer_id', label: '买家' });
     expect(readExtensions(doc).extensions).toEqual([
-      { name: 'x_buyer', type: 'string', expr: 'customer_id', label: '买家', dictionary: false, readonly: false },
-      { name: 'x_ordered_at', type: 'timestamp', expr: "from_timezone(ordered_at, 'Asia/Shanghai')", label: '', dictionary: false, readonly: false },
+      { name: 'x_buyer', type: 'string', expr: 'customer_id', label: '买家', dictionary: false, sensitive: false, readonly: false },
+      { name: 'x_ordered_at', type: 'timestamp', expr: "from_timezone(ordered_at, 'Asia/Shanghai')", label: '', dictionary: false, sensitive: false, readonly: false },
     ]);
     expect(checkMapping(doc.toString())).toMatchObject({ ok: true });
     // 改成已有的名字不行
@@ -351,5 +351,41 @@ describe('扩展字段', () => {
     expect(out).toBe(yaml.replace('    otherwise: null\n', '    otherwise: null\n    label: 会员等级\n'));
     expect(parseDocument(out).toJS().extensions.x_level).toEqual({ type: 'string', expr: 'lvl', dictionary: { 1: '金卡' }, otherwise: null, label: '会员等级' });
     expect(readExtensions(parseDocument('extensions: [a]\n'))).toMatchObject({ extensions: [], reason: expect.any(String) });
+  });
+  it('敏感：列名或格式像敏感信息的源列加为扩展字段时默认标成敏感（文本）；勾选、取消敏感写回 YAML', () => {
+    const contacts = table('contacts', [
+      column('id', 'BIGINT'),
+      column('wechat_name', 'VARCHAR'),
+      column('memo', 'VARCHAR', { formats: [{ format: 'email', share: 0.8 }] }),
+      column('birthday', 'DATE'),
+      column('level', 'VARCHAR', { formats: [] }),
+    ]);
+    expect(newExtension(contacts, 'wechat_name', [])).toEqual({ name: 'x_wechat_name', type: 'string', expr: 'wechat_name', sensitive: true });
+    expect(newExtension(contacts, 'memo', [])).toEqual({ name: 'x_memo', type: 'string', expr: 'memo', sensitive: true });
+    expect(newExtension(contacts, 'birthday', [])).toEqual({ name: 'x_birthday', type: 'string', expr: 'string(birthday)', sensitive: true });
+    expect(newExtension(contacts, 'level', [])).toEqual({ name: 'x_level', type: 'string', expr: 'level' });
+
+    const base = 'model: 1\nentity: customer\ntable: contacts\nfields:\n  customer_id: string(id)\n';
+    const doc = parseDocument(base);
+    writeExtension(doc, 'x_birthday', newExtension(contacts, 'birthday', []));
+    writeExtension(doc, 'x_level', newExtension(contacts, 'level', []));
+    expect(doc.toString()).toBe(`${base}extensions:\n  x_birthday: { type: string, expr: string(birthday), sensitive: true }\n  x_level: { type: string, expr: level }\n`);
+    expect(readExtensions(doc).extensions.map(e => [e.name, e.sensitive, e.readonly])).toEqual([['x_birthday', true, false], ['x_level', false, false]]);
+    const sensitive = (yaml: string) => { const r = checkMapping(yaml); return r.ok ? r.plan.columns.filter(c => c.sensitive).map(c => c.name) : r.issues; };
+    expect(sensitive(doc.toString())).toEqual(['x_birthday']);
+
+    writeExtension(doc, 'x_level', { name: 'x_level', type: 'string', expr: 'level', sensitive: true });
+    writeExtension(doc, 'x_birthday', { name: 'x_birthday', type: 'string', expr: 'string(birthday)', sensitive: false });
+    expect(doc.toString()).toBe(`${base}extensions:\n  x_birthday: { type: string, expr: string(birthday) }\n  x_level: { type: string, expr: level, sensitive: true }\n`);
+    expect(sensitive(doc.toString())).toEqual(['x_level']);
+    // sensitive 写的不是 true / false 时只读
+    expect(readExtensions(parseDocument('extensions:\n  x_a: { type: string, expr: a, sensitive: yes please }\n')).extensions[0].readonly).toBe(true);
+  });
+
+  it('标准字段照写 sensitive: true 时表单照常可改', () => {
+    const doc = parseDocument('model: 1\nentity: customer\ntable: customers\nfields:\n  customer_id: string(customer_id)\n  name: { expr: name, sensitive: true }\n');
+    expect(field(readForm(doc, CUSTOMER), 'name')).toMatchObject({ transform: 'direct', column: 'name', readonly: false });
+    writeField(doc, CUSTOMER, 'name', { transform: 'text', column: 'name' });
+    expect(doc.toJS().fields.name).toEqual({ expr: 'string(name)', sensitive: true });
   });
 });

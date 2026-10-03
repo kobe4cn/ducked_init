@@ -5,7 +5,7 @@
 // 带出现次数 _n。变更批次先改当前记录（删除的移除，新增与更新的换成新版本），再对受影响的去重键重新取最新的一行写进标准层，
 // 所以源端的重复行只计一次，删掉其中一行时标准层回落到剩下的行。合并日志 silver._merges 与这些写入在同一个 DuckLake 事务里，
 // 记下每个映射合并到了原始层的哪个批次，是下一次合并起点的唯一依据（与 ADR-0012 的批次日志同理）。
-// 标准实体的敏感字段（pii）在转换时就规范化并换成按租户加盐的哈希，当前记录与标准层里都没有明文（ADR-0005）
+// 敏感字段（标准实体的 pii 字段与标成敏感的扩展字段）在转换时就规范化并换成按租户加盐的哈希，当前记录与标准层里都没有明文（ADR-0005）
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
 import { entityOf } from '../../lib/canonical-model';
@@ -93,8 +93,9 @@ async function inTransaction<T>(con: DuckDBConnection, work: () => Promise<T>) {
 /** 一列在源端的取值（表达式编译成 SQL，alias 是源表行的别名） */
 const rawValue = (c: PlanColumn, alias: string) => compileExpression(parseExpression(c.expr), alias);
 
-/** 标准实体里的敏感字段。按标准模型现算，发布时写进的合并计划里没有这个标记（老的计划也照样适用） */
-const piiFields = (entity: string) => new Set(entityOf(entity)?.fields.filter(f => f.pii).map(f => f.name));
+/** 合并计划里的敏感字段：标成敏感的列，加上标准模型里的敏感字段（早先发布的合并计划里没有这个标记，照样适用） */
+const sensitiveColumns = (plan: MergePlan) =>
+  new Set([...(entityOf(plan.entity)?.fields.filter(f => f.pii).map(f => f.name) ?? []), ...plan.columns.filter(c => c.sensitive).map(c => c.name)]);
 
 /**
  * 敏感字段哈希前的规范化，让同一个值不论写法都得到同一个哈希：手机号只留数字并去掉 86 / 0086 前缀（后面是 1 开头的 11 位手机号时），
@@ -168,7 +169,7 @@ async function withoutPii(con: DuckDBConnection, columns: PlanColumn[], message:
 /** 标准层表不存在时按实体的全部字段建表，存在时补上新的扩展字段。敏感字段存哈希，类型总是 VARCHAR */
 async function ensureSilverTable(con: DuckDBConnection, plan: MergeMappingParam) {
   const table = silverTable(plan.entity);
-  const pii = piiFields(plan.entity);
+  const pii = sensitiveColumns(plan);
   const typeOf = (c: MergePlan['entityColumns'][number]) => (pii.has(c.name) ? 'VARCHAR' : sqlType(c.type));
   if (!await tableExists(con, SILVER, plan.entity)) {
     await con.run(`CREATE TABLE ${table} (
@@ -234,7 +235,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
 
   // 转换：先查出值字典与标准枚举之外的取值（没写兜底值时报错；敏感字段不查，取值会进报错与兜底统计），再算出各列。
   // 敏感字段在这一步就换成哈希：ROWS 也是当前记录
-  const pii = piiFields(plan.entity);
+  const pii = sensitiveColumns(plan);
   const fallback = await checkUnknownValues(con, plan.columns.filter(c => !pii.has(c.name)));
   await con.run(`CREATE OR REPLACE TABLE ${ROWS} AS
     SELECT l._src, l._n, l._batch, ${plan.columns.map(c => `${columnValue(c, 'l', pii.has(c.name) ? salt : null)} AS ${ident(c.name)}`).join(', ')} FROM ${LIVE} l`)

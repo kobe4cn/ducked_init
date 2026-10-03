@@ -3,6 +3,7 @@
 // 语法：源表字段（标识符，或用双引号括起的任意字段名）、单引号字符串、数字、null / true / false、+ - * /、括号与函数调用。
 // 平台进程（保存与发布时校验）、工作进程（合并时编译）与映射表单（客户端读写表达式）共用
 import type { FieldType } from './canonical-model';
+import { looksSensitive } from './sensitive';
 
 export type Expr =
   | { kind: 'column'; name: string; offset: number }
@@ -35,10 +36,16 @@ export const KIND_FIELD_TYPES: Record<Kind, FieldType> = {
   int: 'integer', decimal: 'decimal', tstz: 'timestamp', timestamp: 'timestamp', date: 'date', bool: 'boolean', text: 'string', other: 'string',
 };
 
-/** 源列做成扩展字段时的类型与表达式：类型按源列大类推断，不带时区的时间按 tz 解读，认不出的类型转为文本 */
-export function extensionSpec(column: { name: string; type: string }, tz = 'Asia/Shanghai'): { type: FieldType; expr: string } {
+/**
+ * 源列做成扩展字段时的类型与表达式：类型按源列大类推断，不带时区的时间按 tz 解读，认不出的类型转为文本。
+ * 列名或格式像敏感信息的标成敏感：标准层只存哈希，类型是文本，不是文本的列转为文本
+ */
+export function extensionSpec(
+  column: { name: string; type: string; formats?: readonly { format: string }[] }, tz = 'Asia/Shanghai',
+): { type: FieldType; expr: string; sensitive?: true } {
   const kind = kindOf(column.type);
   const col = ref(column.name);
+  if (looksSensitive(column)) return { type: 'string', expr: kind === 'text' ? col : `string(${col})`, sensitive: true };
   return { type: KIND_FIELD_TYPES[kind], expr: kind === 'timestamp' ? `from_timezone(${col}, ${lit(tz)})` : kind === 'other' ? `string(${col})` : col };
 }
 
