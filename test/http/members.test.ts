@@ -68,11 +68,11 @@ describe('成员邀请与角色', () => {
 
 // spec 的权限矩阵（角色 × 操作），作为独立的期望来源
 const MATRIX: Record<string, Record<string, boolean>> = {
-  //                  数据源/映射 读、写        指标/标签定义 读、草稿、写                      发布           沙箱          结果层               成员 / API Key / 模型服务 / 审计
-  admin:         { 'sources:read': true,  'sources:write': true,  'definitions:read': true,  'definitions:draft': true,  'definitions:write': true,  publish: true,  sandbox: true,  'results:read': true, 'members:manage': true,  'api_keys:manage': true,  'model_provider:manage': true,  'audit:read': true },
-  data_engineer: { 'sources:read': true,  'sources:write': true,  'definitions:read': true,  'definitions:draft': true,  'definitions:write': true,  publish: true,  sandbox: true,  'results:read': true, 'members:manage': false, 'api_keys:manage': false, 'model_provider:manage': false, 'audit:read': false },
-  analyst:       { 'sources:read': true,  'sources:write': false, 'definitions:read': true,  'definitions:draft': true,  'definitions:write': false, publish: false, sandbox: true,  'results:read': true, 'members:manage': false, 'api_keys:manage': false, 'model_provider:manage': false, 'audit:read': false },
-  viewer:        { 'sources:read': false, 'sources:write': false, 'definitions:read': true,  'definitions:draft': false, 'definitions:write': false, publish: false, sandbox: false, 'results:read': true, 'members:manage': false, 'api_keys:manage': false, 'model_provider:manage': false, 'audit:read': false },
+  //                  数据源/映射 读、写        指标/标签定义 读、草稿、写                      发布           沙箱          结果层               成员 / API Key / 模型服务 / 审计 / 解密敏感信息
+  admin:         { 'sources:read': true,  'sources:write': true,  'definitions:read': true,  'definitions:draft': true,  'definitions:write': true,  publish: true,  sandbox: true,  'results:read': true, 'members:manage': true,  'api_keys:manage': true,  'model_provider:manage': true,  'audit:read': true,  'pii:reveal': true },
+  data_engineer: { 'sources:read': true,  'sources:write': true,  'definitions:read': true,  'definitions:draft': true,  'definitions:write': true,  publish: true,  sandbox: true,  'results:read': true, 'members:manage': false, 'api_keys:manage': false, 'model_provider:manage': false, 'audit:read': false, 'pii:reveal': false },
+  analyst:       { 'sources:read': true,  'sources:write': false, 'definitions:read': true,  'definitions:draft': true,  'definitions:write': false, publish: false, sandbox: true,  'results:read': true, 'members:manage': false, 'api_keys:manage': false, 'model_provider:manage': false, 'audit:read': false, 'pii:reveal': false },
+  viewer:        { 'sources:read': false, 'sources:write': false, 'definitions:read': true,  'definitions:draft': false, 'definitions:write': false, publish: false, sandbox: false, 'results:read': true, 'members:manage': false, 'api_keys:manage': false, 'model_provider:manage': false, 'audit:read': false, 'pii:reveal': false },
 };
 
 /** 以指定角色登录（管理员直接用开通时的首个管理员） */

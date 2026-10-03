@@ -168,6 +168,7 @@ describe('<功能>', () => {
 | `pipeline/reset.test.ts` | 开发用重置数据湖 |
 | `http/login.test.ts` | 租户与 Magic Link 登录 |
 | `http/members.test.ts` | 成员邀请与角色、权限矩阵、审计日志、跨租户拒绝 |
+| `http/pii.test.ts` | 解密敏感信息：管理员按映射与源表主键看到明文、明文不进任务表与审计、审计 `pii.revealed`、不填原因或找不到记录不解密也不记审计、其他角色 403、其他租户 404 |
 | `http/ops.test.ts` | 运营者身份、TOTP、租户管理、审计、IP 白名单 |
 | `http/suspension.test.ts` | 停用与恢复租户 |
 | `http/tasks.test.ts` | 任务页、首页的任务指标卡、租户配额、数据湖迁移查看 |

@@ -16,12 +16,13 @@ export const PERMISSIONS = {
   'api_keys:manage': '管理外部系统 API Key',
   'model_provider:manage': '配置模型服务',
   'audit:read': '查看审计日志',
+  'pii:reveal': '申请解密敏感信息',
 } as const;
 export type Permission = keyof typeof PERMISSIONS;
 
 const ALL = Object.keys(PERMISSIONS) as Permission[];
 
-// 与 spec 的权限矩阵一一对应：管理员拥有全部权限；成员、API Key、模型服务与审计只属于管理员
+// 与 spec 的权限矩阵一一对应：管理员拥有全部权限；成员、API Key、模型服务、审计与解密敏感信息只属于管理员（ADR-0005）
 const MATRIX: Record<Role, readonly Permission[]> = {
   admin: ALL,
   data_engineer: ['sources:read', 'sources:write', 'definitions:read', 'definitions:draft', 'definitions:write', 'publish', 'sandbox', 'results:read'],

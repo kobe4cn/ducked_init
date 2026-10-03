@@ -284,7 +284,7 @@ async function publisherCount(tenantId: string) {
 }
 
 /** 租户各映射（给了 mappingIds 时只取这些）最新的已发布版本及其合并计划（合并任务的参数） */
-async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId: string, mappingIds?: string[]): Promise<MergeMappingParam[]> {
+export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId: string, mappingIds?: string[]): Promise<MergeMappingParam[]> {
   if (mappingIds && !mappingIds.length) return [];
   const rows = await db
     .selectDistinctOn([mappingVersions.mappingId], {

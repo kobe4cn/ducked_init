@@ -73,6 +73,13 @@ const ACTIONS = {
     describe: (d: Detail) =>
       `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '映射已删除'}`,
   },
+  // 只记定位记录的主键与原因，不记明文
+  'pii.revealed': {
+    label: '解密敏感信息',
+    describe: (d: Detail) =>
+      `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，主键 ${Object.entries(d.key as Record<string, string>).map(([k, v]) => `${k} = ${v}`).join('，')}，`
+      + `字段 ${(d.fields as string[]).join('、')}；原因：${d.reason}`,
+  },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },

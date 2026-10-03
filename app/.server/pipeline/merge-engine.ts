@@ -91,11 +91,24 @@ async function inTransaction<T>(con: DuckDBConnection, work: () => Promise<T>) {
 }
 
 /** 一列在源端的取值（表达式编译成 SQL，alias 是源表行的别名） */
-const rawValue = (c: PlanColumn, alias: string) => compileExpression(parseExpression(c.expr), alias);
+export const rawValue = (c: PlanColumn, alias: string) => compileExpression(parseExpression(c.expr), alias);
 
 /** 合并计划里的敏感字段：标成敏感的列，加上标准模型里的敏感字段（早先发布的合并计划里没有这个标记，照样适用） */
-const sensitiveColumns = (plan: MergePlan) =>
+export const sensitiveColumns = (plan: MergePlan) =>
   new Set([...(entityOf(plan.entity)?.fields.filter(f => f.pii).map(f => f.name) ?? []), ...plan.columns.filter(c => c.sensitive).map(c => c.name)]);
+
+/** 合并计划里映射出来的敏感字段列 */
+export const sensitivePlanColumns = (plan: MergePlan) => {
+  const pii = sensitiveColumns(plan);
+  return plan.columns.filter(c => pii.has(c.name));
+};
+
+/** 源表的主键列，取自同步维护的当前主键状态（ADR-0012）；没有主键的表返回 null */
+export async function sourceKeysOf(con: DuckDBConnection, sourceId: string, table: string) {
+  const keys = `${bronzeSchema(sourceId)}_keys`;
+  if (!await tableExists(con, keys, table)) return null;
+  return (await columnsOf(con, `${ident(keys)}.${ident(table)}`)).map(c => c.column_name).filter(c => c !== '_hash');
+}
 
 /**
  * 敏感字段哈希前的规范化，让同一个值不论写法都得到同一个哈希：手机号只留数字并去掉 86 / 0086 前缀（后面是 1 开头的 11 位手机号时），
@@ -199,9 +212,9 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   const bronze = `${ident(schema)}.${ident(plan.table)}`;
   const records = recordsOf(plan.mapping);
   const silver = silverTable(plan.entity);
-  // 源表的主键取自同步维护的当前主键状态（ADR-0012）；没有主键的表按整行区分记录
-  const keyed = await tableExists(con, `${schema}_keys`, plan.table);
-  const sourceKeys = keyed ? (await columnsOf(con, `${ident(`${schema}_keys`)}.${ident(plan.table)}`)).map(c => c.column_name).filter(c => c !== '_hash') : [];
+  // 没有主键的表按整行区分记录
+  const sourceKeys = await sourceKeysOf(con, plan.sourceId, plan.table) ?? [];
+  const keyed = sourceKeys.length > 0;
   const [last] = await rows<LastMerge>(con, `
     SELECT version, source_keys, batch_to, scheme FROM ${MERGES} WHERE mapping_id = ${lit(plan.mapping)} ORDER BY started_at DESC LIMIT 1`);
   const rebuild = !last || last.version !== plan.version || last.source_keys !== sourceKeys.join(',') || last.scheme !== SCHEME
