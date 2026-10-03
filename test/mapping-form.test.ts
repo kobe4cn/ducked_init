@@ -1,9 +1,13 @@
 // 映射表单与 YAML 互转（纯函数）：从映射 YAML 读出每个标准字段的表单状态（源列、常用转换、参数、依据、是否只读），
-// 改单个字段时在原 Document 上改，保留注释与顺序；枚举字段的值对照与兜底读出、写回；表单不认识的写法只读、原样保留
+// 改单个字段时在原 Document 上改，保留注释与顺序；枚举字段的值对照与兜底读出、写回；表单不认识的写法只读、原样保留；
+// 扩展字段：没用到的源列、读出已有的扩展字段、加上 / 改名 / 删除
 import { parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
-import { dictionaryRows, readForm, seedDictionary, TRANSFORMS, writeField, type FieldChoice, type FieldForm } from '../app/lib/mapping-form';
+import {
+  dictionaryRows, newExtension, readExtensions, readForm, seedDictionary, TRANSFORMS, unusedColumns, writeExtension, writeField,
+  type FieldChoice, type FieldForm,
+} from '../app/lib/mapping-form';
 import { draftMapping } from '../app/.server/pipeline/mapping-draft';
 import { checkMapping } from '../app/.server/pipeline/mapping-spec';
 import type { ColumnProfile, TableProfile } from '../app/.server/pipeline/source-engine';
@@ -274,5 +278,78 @@ describe('值对照与兜底', () => {
     expect(seedDictionary('order', 'status', ['paid', '已退款', '99'])).toEqual([
       { from: 'paid', to: 'paid' }, { from: '已退款', to: 'refunded' }, { from: '99', to: null },
     ]);
+  });
+});
+
+describe('扩展字段', () => {
+  const BASE = 'model: 1\nentity: order\ntable: orders\nfields:\n  order_id: string(order_id) # 主键\n  amount: pay_amount_fen / 100\n';
+
+  it('没用到的源列：标准字段与扩展字段的表达式里引用过的列都不算，草稿文末注释里的扩展字段不算用到', () => {
+    const yaml = `${BASE}extensions:\n  x_note: { type: string, expr: "concat(remark, '!')" }\n`;
+    expect(unusedColumns(parseDocument(yaml), ORDERS).map(c => c.name)).toEqual(['customer_id', 'status', 'ordered_at', 'pay_time']);
+    // 解析不了的表达式不算用到任何列
+    expect(unusedColumns(parseDocument('fields:\n  order_id: foo(order_id\n'), ORDERS).map(c => c.name)).toContain('order_id');
+    const draft = draftMapping(ORDERS, ORDER);
+    expect(draft).toContain('x_remark');
+    expect(unusedColumns(parseDocument(draft), ORDERS).map(c => c.name)).toEqual(['remark']);
+  });
+
+  it('勾选源列：名字默认 x_<列名>（做不成或重名时 x_col_<列序号>），类型按列推断，不带时区的时间按时区解读', () => {
+    expect(newExtension(ORDERS, 'customer_id', [])).toEqual({ name: 'x_customer_id', type: 'integer', expr: 'customer_id' });
+    expect(newExtension(ORDERS, 'ordered_at', [])).toEqual({ name: 'x_ordered_at', type: 'timestamp', expr: "from_timezone(ordered_at, 'Asia/Shanghai')" });
+    expect(newExtension(ORDERS, 'remark', ['x_remark'])).toMatchObject({ name: 'x_col_7', type: 'string' });
+    // x_col_<列序号> 也被占用（如成员改名改成了它）时不覆盖已有的扩展字段
+    expect(newExtension(ORDERS, 'remark', ['x_remark', 'x_col_7'])).toMatchObject({ name: 'x_col_7_2' });
+    const odd = table('t', [column('备注', 'VARCHAR'), column('Geo', 'GEOMETRY')]);
+    expect(newExtension(odd, '备注', [])).toEqual({ name: 'x_col_1', type: 'string', expr: '备注' });
+    expect(newExtension(odd, 'Geo', [])).toEqual({ name: 'x_geo', type: 'string', expr: 'string(Geo)' });
+  });
+
+  it('加上、改名、改类型与中文名、删除：写出的 YAML 通过校验，其他行不动', () => {
+    const doc = parseDocument(BASE);
+    writeExtension(doc, 'x_customer_id', newExtension(ORDERS, 'customer_id', []));
+    writeExtension(doc, 'x_ordered_at', newExtension(ORDERS, 'ordered_at', []));
+    expect(doc.toString()).toBe(`${BASE}extensions:\n  x_customer_id: { type: integer, expr: customer_id }\n  x_ordered_at: { type: timestamp, expr: "from_timezone(ordered_at, 'Asia/Shanghai')" }\n`);
+    expect(checkMapping(doc.toString())).toMatchObject({ ok: true });
+
+    writeExtension(doc, 'x_customer_id', { name: 'x_buyer', type: 'string', expr: 'customer_id', label: '买家' });
+    expect(readExtensions(doc).extensions).toEqual([
+      { name: 'x_buyer', type: 'string', expr: 'customer_id', label: '买家', dictionary: false, readonly: false },
+      { name: 'x_ordered_at', type: 'timestamp', expr: "from_timezone(ordered_at, 'Asia/Shanghai')", label: '', dictionary: false, readonly: false },
+    ]);
+    expect(checkMapping(doc.toString())).toMatchObject({ ok: true });
+    // 改成已有的名字不行
+    expect(() => writeExtension(doc, 'x_buyer', { name: 'x_ordered_at', type: 'string', expr: 'customer_id' })).toThrow(/已有/);
+
+    writeExtension(doc, 'x_buyer', null);
+    writeExtension(doc, 'x_ordered_at', null);
+    expect(doc.toString()).toBe(BASE);
+  });
+
+  it('读入已有的扩展字段：值字典与兜底、注释保留；认不出的写法只读', () => {
+    const yaml = `${BASE}extensions:
+  # 租户特有
+  x_amount_fen: { type: integer, expr: pay_amount_fen } # 原始金额
+  x_level:
+    type: string
+    expr: lvl
+    dictionary: { '1': 金卡 }
+    otherwise: null
+  x_bad: lvl
+  x_odd: { type: varchar, expr: lvl }
+`;
+    const doc = parseDocument(yaml);
+    const { extensions } = readExtensions(doc);
+    expect(extensions.map(e => [e.name, e.readonly, e.dictionary])).toEqual([['x_amount_fen', false, false], ['x_level', false, true], ['x_bad', true, false], ['x_odd', true, false]]);
+    expect(extensions[2].reason).toEqual(expect.any(String));
+    expect(() => writeExtension(doc, 'x_bad', null)).toThrow();
+
+    // 只改中文名：值字典、兜底与注释都在
+    writeExtension(doc, 'x_level', { name: 'x_level', type: 'string', expr: 'lvl', label: '会员等级' });
+    writeExtension(doc, 'x_amount_fen', { name: 'x_amount_fen', type: 'integer', expr: 'pay_amount_fen' });
+    const out = doc.toString();
+    expect(out).toBe(yaml.replace('    otherwise: null\n', '    otherwise: null\n    label: 会员等级\n'));
+    expect(parseDocument(out).toJS().extensions.x_level).toEqual({ type: 'string', expr: 'lvl', dictionary: { 1: '金卡' }, otherwise: null, label: '会员等级' });
+    expect(readExtensions(parseDocument('extensions: [a]\n'))).toMatchObject({ extensions: [], reason: expect.any(String) });
   });
 });

@@ -1,6 +1,6 @@
 // 标准模型与映射的 HTTP 接缝：任何成员都能浏览标准模型；数据工程师在界面上编写映射（不合格的 YAML 被拒绝并给出位置），
 // 新建页默认是按规则生成的草稿（源没有已采集的表时是模板），也能按所选的表与实体重新生成填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
-// 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
+// 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射（含勾选源列加的扩展字段）照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { parseDocument } from 'yaml';
 import { closeDb } from '../../app/.server/db/client';
@@ -11,7 +11,7 @@ import { memberOf, newTenant, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { mappingTemplate } from '../../app/.server/pipeline/mapping-spec';
 import { entityOf } from '../../app/lib/canonical-model';
-import { readForm, writeField, type FieldChoice } from '../../app/lib/mapping-form';
+import { newExtension, readForm, unusedColumns, writeExtension, writeField, type FieldChoice } from '../../app/lib/mapping-form';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
@@ -495,6 +495,31 @@ describe('表单式映射编辑器', () => {
       updated_at: { transform: 'direct', column: 'updated_at' },
     });
     expect(parseDocument(yaml).toJS().fields.status).toEqual({ expr: 'status', dictionary: { 已支付: 'paid', 已退款: 'refunded' }, otherwise: null });
+    const created = await author.post('/mappings', { intent: 'create', sourceId, yaml });
+    expect(created.status).toBe(302);
+    expect(editorYaml(await (await author.get(`/mappings/${mappingIdOf(created)}`)).text())).toBe(yaml);
+  });
+
+  it('在表单里勾选没用到的源列加为扩展字段（名字与类型自动带出，可改名、填中文名）：写出的 YAML 保存成功', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const author = await loginAs(app, 'de@acme.com');
+    // 对照面板里 shop.orders 的列
+    const orders = { columns: [
+      { name: 'order_id', type: 'INTEGER' }, { name: 'customer_id', type: 'INTEGER' }, { name: 'amount', type: 'DECIMAL(10,2)' },
+      { name: 'status', type: 'VARCHAR' }, { name: 'created_at', type: 'TIMESTAMP' },
+    ] };
+    const doc = parseDocument(ORDERS);
+    expect(unusedColumns(doc, orders).map(c => c.name)).toEqual(['customer_id', 'created_at']);
+    for (const c of unusedColumns(doc, orders)) {
+      const ext = newExtension(orders, c.name, []);
+      writeExtension(doc, ext.name, ext);
+    }
+    writeExtension(doc, 'x_customer_id', { name: 'x_buyer_id', type: 'string', expr: 'customer_id', label: '买家' });
+    const yaml = doc.toString();
+    expect(parseDocument(yaml).toJS().extensions).toEqual({
+      x_buyer_id: { type: 'string', expr: 'customer_id', label: '买家' },
+      x_created_at: { type: 'timestamp', expr: "from_timezone(created_at, 'Asia/Shanghai')" },
+    });
     const created = await author.post('/mappings', { intent: 'create', sourceId, yaml });
     expect(created.status).toBe(302);
     expect(editorYaml(await (await author.get(`/mappings/${mappingIdOf(created)}`)).text())).toBe(yaml);

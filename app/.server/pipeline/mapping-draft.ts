@@ -2,9 +2,9 @@
 // 列名规范化后按同名与同义词对应到标准字段，再用类型与格式特征校验；按需加上分转元、毫秒时间戳、时区解读等转换，枚举字段按常见取值生成值字典骨架。
 // 每条对应的依据写在行尾注释里，没对应上的标准字段与没用到的源列列在文末。生成的只是草稿，仍要保存校验、双人发布（ADR-0015）
 import { Document, Scalar, YAMLMap } from 'yaml';
-import { EXTENSION_PATTERN, MODEL_MAJOR, type CanonicalEntity, type CanonicalField } from '../../lib/canonical-model';
-import { CENTS_SUFFIX, fieldsForColumn, normalizeName, standardValue } from '../../lib/field-synonyms';
-import { KIND_FIELD_TYPES, kindOf, ref } from '../../lib/mapping-expr';
+import { MODEL_MAJOR, type CanonicalEntity, type CanonicalField } from '../../lib/canonical-model';
+import { CENTS_SUFFIX, extensionName, fieldsForColumn, normalizeName, standardValue } from '../../lib/field-synonyms';
+import { extensionSpec, kindOf, ref } from '../../lib/mapping-expr';
 import type { ColumnProfile, TableProfile, TextFormat } from './source-engine';
 
 export interface DraftOptions {
@@ -85,19 +85,15 @@ interface Mapped { expr: string; reason: string[]; column?: ColumnProfile }
  * 列名做不成扩展字段名（中文、特殊字符）时用 x_col_<列序号>
  */
 function extensionLines(columns: ColumnProfile[], all: ColumnProfile[], tz: string) {
-  const valid = new RegExp(EXTENSION_PATTERN);
   const used = new Set<string>();
   const extensions = new YAMLMap();
   for (const c of columns) {
-    let name = `x_${normalizeName(c.name)}`;
-    if (!valid.test(name) || used.has(name)) name = `x_col_${all.indexOf(c) + 1}`;
+    const name = extensionName(c.name, all.indexOf(c) + 1, used);
     used.add(name);
-    const kind = kindOf(c.type);
-    const col = ref(c.name);
-    const expr = kind === 'timestamp' ? `from_timezone(${col}, '${tz}')` : kind === 'other' ? `string(${col})` : col;
+    const { type, expr } = extensionSpec(c, tz);
     const spec = new YAMLMap();
     spec.flow = true;
-    spec.set('type', KIND_FIELD_TYPES[kind]);
+    spec.set('type', type);
     spec.set('expr', expr);
     extensions.set(name, spec);
   }

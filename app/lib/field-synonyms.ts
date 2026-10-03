@@ -1,6 +1,6 @@
 // app/lib/field-synonyms.ts —— 标准字段的列名同义词与枚举取值的近义词：按规则生成映射草稿时据此把源列对应到标准字段、预填值字典，
-// 新建映射时按表名猜目标实体，映射报错时也据此提示「这一列多半是哪个标准字段」。随标准模型（canonical-model.ts）一起维护，前后端共用（ADR-0017）
-import { CANONICAL_ENTITIES, entityOf } from './canonical-model';
+// 新建映射时按表名猜目标实体，映射报错时也据此提示「这一列多半是哪个标准字段」；没用到的源列据规范化的列名起扩展字段名。随标准模型（canonical-model.ts）一起维护，前后端共用（ADR-0017）
+import { CANONICAL_ENTITIES, entityOf, EXTENSION_PATTERN } from './canonical-model';
 
 /** 列名规范化：驼峰拆开、忽略大小写，连字符、空白与连续下划线都当作一个下划线（OrderId、order-id、ORDER_ID 都是 order_id） */
 export function normalizeName(s: string) {
@@ -10,6 +10,16 @@ export function normalizeName(s: string) {
     .toLowerCase()
     .replace(/[-\s_]+/g, '_')
     .replace(/^_|_$/g, '');
+}
+
+/** 源列做成扩展字段时的名字：x_<规范化的列名>；做不成（中文、特殊字符）或已被占用时用 x_col_<列序号，从 1 起>，它也被占用时再加 _2、_3…。草稿与映射表单共用 */
+export function extensionName(column: string, position: number, taken: Iterable<string>) {
+  const used = new Set(taken);
+  const name = `x_${normalizeName(column)}`;
+  if (new RegExp(EXTENSION_PATTERN).test(name) && !used.has(name)) return name;
+  let fallback = `x_col_${position}`;
+  for (let n = 2; used.has(fallback); n++) fallback = `x_col_${position}_${n}`;
+  return fallback;
 }
 
 /** 带单位的列名后缀：分（金额除以 100）与毫秒；对应字段时先去掉 */

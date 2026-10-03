@@ -35,6 +35,13 @@ export const KIND_FIELD_TYPES: Record<Kind, FieldType> = {
   int: 'integer', decimal: 'decimal', tstz: 'timestamp', timestamp: 'timestamp', date: 'date', bool: 'boolean', text: 'string', other: 'string',
 };
 
+/** 源列做成扩展字段时的类型与表达式：类型按源列大类推断，不带时区的时间按 tz 解读，认不出的类型转为文本 */
+export function extensionSpec(column: { name: string; type: string }, tz = 'Asia/Shanghai'): { type: FieldType; expr: string } {
+  const kind = kindOf(column.type);
+  const col = ref(column.name);
+  return { type: KIND_FIELD_TYPES[kind], expr: kind === 'timestamp' ? `from_timezone(${col}, ${lit(tz)})` : kind === 'other' ? `string(${col})` : col };
+}
+
 /** 表达式里引用源列：不是普通标识符（或是 null / true / false）时加双引号 */
 export const ref = (name: string) =>
   /^[A-Za-z_\u0080-￿][A-Za-z0-9_\u0080-￿]*$/.test(name) && !/^(null|true|false)$/i.test(name) ? name : `"${name.replace(/"/g, '""')}"`;

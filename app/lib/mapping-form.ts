@@ -1,11 +1,12 @@
 // app/lib/mapping-form.ts —— 映射表单与 YAML 互转（客户端用，不做校验；校验见 .server/pipeline/mapping-spec.ts）：从映射 YAML 读出每个标准字段的
 // 表单状态（源列、常用转换与参数、枚举字段的值对照与兜底、依据），改单个字段时直接改原 Document 上的节点，注释与顺序都保留（ADR-0017）。
 // 表单不认识的写法（非枚举字段的值字典或兜底值、解析不了的表达式、其他结构）只读、原样保留，到 YAML 里改。
-// 改了表达式时清掉该字段的行尾注释：草稿写在那里的依据（同名、单位、时区）对新写法不一定成立
+// 改了表达式时清掉该字段的行尾注释：草稿写在那里的依据（同名、单位、时区）对新写法不一定成立。
+// 扩展字段：列出还没被任何字段用到的源列，勾选即按列推断名字与类型加上；已有的扩展字段可改名、类型与中文名，取消勾选即删除，值字典与兜底原样保留
 import { isMap, isScalar, isSeq, YAMLMap, type Document, type Scalar } from 'yaml';
-import type { CanonicalEntity, CanonicalField, FieldType } from './canonical-model';
-import { standardValue } from './field-synonyms';
-import { ExprError, lit, parseExpression, ref, type Expr } from './mapping-expr';
+import { EXTENSION_PATTERN, FIELD_TYPE_NAMES, type CanonicalEntity, type CanonicalField, type FieldType } from './canonical-model';
+import { extensionName, standardValue } from './field-synonyms';
+import { ExprError, extensionSpec, lit, parseExpression, ref, referencedColumns, type Expr } from './mapping-expr';
 
 export type TransformId = 'direct' | 'cents' | 'text' | 'timezone' | 'parse' | 'epoch' | 'concat' | 'fixed' | 'custom';
 
@@ -317,4 +318,141 @@ function setKey(doc: Document, map: YAMLMap, key: string, value: unknown) {
   const pair = map.items.find(p => isScalar(p.key) && p.key.value === key);
   if (pair) pair.value = doc.createNode(value);
   else map.items.push(doc.createPair(key, value));
+}
+
+/** 扩展字段在 YAML 里的表单状态 */
+export interface ExtensionForm {
+  name: string;
+  /** 不是标准层的类型时为 null（只读） */
+  type: FieldType | null;
+  expr: string;
+  /** 中文名，没写时为空串 */
+  label: string;
+  /** 带值字典或兜底：类型只能是文本，对照与兜底原样保留，到 YAML 里改 */
+  dictionary: boolean;
+  readonly: boolean;
+  reason?: string;
+}
+
+/** 表单上对一个扩展字段的选择（name 是改名后的名字）；交给 writeExtension 写回 YAML */
+export interface ExtensionChoice { name: string; type: FieldType; expr: string; label?: string }
+
+const EXTENSION_KEYS = ['type', 'expr', 'label', 'dictionary', 'otherwise'];
+
+/** extensions 下的字段表；没写时都没有，写的不是字段表时是原因 */
+function extensionsMap(doc: Document): { map?: YAMLMap; reason?: string } {
+  const node = doc.get('extensions', true);
+  if (node == null || (isScalar(node) && node.value == null)) return {};
+  return isMap(node) ? { map: node } : { reason: 'extensions 下不是字段表，请在 YAML 里修改' };
+}
+
+function readExtension(name: string, value: unknown): ExtensionForm {
+  const form: ExtensionForm = { name, type: null, expr: '', label: '', dictionary: false, readonly: false };
+  if (!isMap(value)) return { ...form, expr: isScalar(value) && typeof value.value === 'string' ? value.value : '', readonly: true, reason: UNKNOWN };
+  const get = (key: string) => {
+    const node = value.get(key, true);
+    return isScalar(node) ? node.value : node;
+  };
+  const [type, expr, label] = [get('type'), get('expr'), get('label')];
+  const read: ExtensionForm = {
+    ...form,
+    type: FIELD_TYPE_NAMES.find(t => t === type) ?? null,
+    expr: typeof expr === 'string' ? expr : '',
+    label: typeof label === 'string' ? label : '',
+    dictionary: value.has('dictionary') || value.has('otherwise'),
+  };
+  const keys = value.items.map(p => (isScalar(p.key) ? p.key.value : null));
+  if (keys.some(k => !EXTENSION_KEYS.includes(String(k))) || typeof expr !== 'string' || (label != null && typeof label !== 'string')) {
+    return { ...read, readonly: true, reason: UNKNOWN };
+  }
+  if (!read.type) return { ...read, readonly: true, reason: `类型 ${String(type)} 不是标准层的类型，请在 YAML 里修改` };
+  return read;
+}
+
+const pairName = (key: unknown) => (isScalar(key) ? String(key.value) : '');
+
+/** YAML 里的扩展字段（按 YAML 里的顺序）；extensions 写的不是字段表时只有原因 */
+export function readExtensions(doc: Document): { extensions: ExtensionForm[]; reason?: string } {
+  const { map, reason } = extensionsMap(doc);
+  return { extensions: map?.items.map(p => readExtension(pairName(p.key), p.value)) ?? [], ...(reason && { reason }) };
+}
+
+const nameTaken = (name: string) => `扩展字段 ${name} 已有，换一个名字`;
+
+/** 扩展字段名的问题；合格时为 null。others 是其他扩展字段的名字 */
+export function extensionNameProblem(name: string, others: readonly string[]): string | null {
+  if (!new RegExp(EXTENSION_PATTERN).test(name)) return '名字要以 x_ 开头，只用小写字母、数字与下划线';
+  return others.includes(name) ? nameTaken(name) : null;
+}
+
+/** 勾选源列时的扩展字段：名字 x_<列名>（做不成或与 taken 重名时 x_col_<列序号>），类型按列推断，不带时区的时间按 Asia/Shanghai 解读 */
+export function newExtension(table: { columns: readonly { name: string; type: string }[] }, column: string, taken: readonly string[]): ExtensionChoice {
+  const at = table.columns.findIndex(c => c.name === column);
+  if (at < 0) throw new Error(`源表里没有列 ${column}`);
+  return { name: extensionName(column, at + 1, taken), ...extensionSpec(table.columns[at]) };
+}
+
+/** 还没被任何标准字段或扩展字段的表达式用到的源列（按源表的列顺序）；解析不了的表达式不算用到 */
+export function unusedColumns<C extends { name: string }>(doc: Document, table: { columns: readonly C[] }): C[] {
+  const used = new Set<string>();
+  for (const key of ['fields', 'extensions']) {
+    const node = doc.get(key, true);
+    if (!isMap(node)) continue;
+    for (const p of node.items) {
+      const expr = isMap(p.value) ? p.value.get('expr', true) : p.value;
+      if (!isScalar(expr) || typeof expr.value !== 'string') continue;
+      try {
+        for (const c of referencedColumns(parseExpression(expr.value))) used.add(c.name);
+      } catch (e) {
+        if (!(e instanceof ExprError)) throw e;
+      }
+    }
+  }
+  return table.columns.filter(c => !used.has(c.name));
+}
+
+/**
+ * 把一个扩展字段的选择写回原 Document（null 表示删掉）。已有的改名时原位改键，类型、表达式、中文名只改变了的项，值字典、兜底与注释保留；
+ * 新的以 { type, expr, label } 追加在 extensions 末尾，删光时去掉 extensions。只读的扩展字段、改名与已有的重名时抛错
+ */
+export function writeExtension(doc: Document, name: string, choice: ExtensionChoice | null): void {
+  const { map, reason } = extensionsMap(doc);
+  if (reason) throw new Error(reason);
+  const pair = map?.items.find(p => pairName(p.key) === name);
+  if (pair) {
+    const form = readExtension(name, pair.value);
+    if (form.readonly) throw new Error(`${name}：${form.reason}`);
+  }
+  if (!choice) {
+    if (!map || !pair) return;
+    map.items.splice(map.items.indexOf(pair), 1);
+    if (!map.items.length) doc.delete('extensions');
+    return;
+  }
+  if (choice.name !== name && map?.items.some(p => pairName(p.key) === choice.name)) throw new Error(nameTaken(choice.name));
+  const label = choice.label?.trim();
+  if (!pair) {
+    const spec = new YAMLMap();
+    spec.flow = true;
+    setKey(doc, spec, 'type', choice.type);
+    setKey(doc, spec, 'expr', choice.expr);
+    if (label) setKey(doc, spec, 'label', label);
+    if (map) map.items.push(doc.createPair(choice.name, spec));
+    else {
+      const extensions = new YAMLMap();
+      extensions.items.push(doc.createPair(choice.name, spec));
+      doc.set('extensions', extensions);
+    }
+    return;
+  }
+  if (choice.name !== name) (pair.key as Scalar).value = choice.name;
+  const spec = pair.value as YAMLMap;
+  const set = (key: string, value: string) => {
+    const old = spec.get(key, true);
+    if (!(isScalar(old) && old.value === value)) setKey(doc, spec, key, value);
+  };
+  set('type', choice.type);
+  set('expr', choice.expr);
+  if (label) set('label', label);
+  else spec.delete('label');
 }

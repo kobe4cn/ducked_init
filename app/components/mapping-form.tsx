@@ -1,14 +1,16 @@
 // app/components/mapping-form.tsx —— 映射编辑区的「表单」标签页：按目标实体列出全部标准字段（类型、说明、是否必填），每个字段选源列
 // （带列类型与常见取值）与一种常用转换，或写自定义表达式（可插入白名单函数）；枚举字段另有「源值 → 标准值」的值对照与兜底。
 // 表单不存数据，每次修改都由 writeField 写回同一份 YAML（ADR-0017）；表单不认识的写法只读显示原表达式。
-// 选到一半（还没选源列、表达式写不完整）时只留在这一行，不写进 YAML；还没对应的源值只显示（标黄），不写进值字典
+// 选到一半（还没选源列、表达式写不完整）时只留在这一行，不写进 YAML；还没对应的源值只显示（标黄），不写进值字典。
+// 标准字段之后是扩展字段：已有的可改名、类型与中文名，取消勾选即删除；下面列出还没用到的源列，勾选即加为扩展字段
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
-import { entityOf, FIELD_TYPES, type CanonicalField, type FieldType } from '~/lib/canonical-model';
+import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, type CanonicalField, type FieldType } from '~/lib/canonical-model';
 import { parseExpression } from '~/lib/mapping-expr';
 import {
-  dictionaryRows, expressionOf, readForm, seedDictionary, TRANSFORMS, writeField, writtenDictionary,
-  type DictionaryEntry, type FieldChoice, type FieldForm, type Part, type TransformId,
+  dictionaryRows, expressionOf, extensionNameProblem, newExtension, readExtensions, readForm, seedDictionary, TRANSFORMS, unusedColumns,
+  writeExtension, writeField, writtenDictionary,
+  type DictionaryEntry, type ExtensionChoice, type ExtensionForm, type FieldChoice, type FieldForm, type Part, type TransformId,
 } from '~/lib/mapping-form';
 import type { ReferenceColumn, ReferenceFunction, ReferenceTable } from '~/components/mapping-reference';
 import { Badge } from '~/components/ui/badge';
@@ -65,6 +67,11 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
     writeField(next, target, field, choice);
     onChange(next.toString());
   };
+  const writeExt = (name: string, choice: ExtensionChoice | null) => {
+    const next = parseDocument(yaml);
+    writeExtension(next, name, choice);
+    onChange(next.toString());
+  };
   return (
     <div className="max-h-[48rem] divide-y overflow-y-auto rounded-lg border text-sm">
       {readForm(doc, target).map(form => (
@@ -80,6 +87,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
           onEditYaml={onEditYaml}
         />
       ))}
+      <Extensions doc={doc} table={table} onWrite={writeExt} onEditYaml={onEditYaml} />
     </div>
   );
 }
@@ -236,6 +244,111 @@ function FieldRow({ entity, form, field, table, functions, pending, onWrite, onE
 
       {!form.readonly && problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
       {form.basis && <div className="text-xs text-muted-foreground">{`依据：${form.basis}`}</div>}
+    </div>
+  );
+}
+
+/** 扩展字段区块：已有的扩展字段（可改，取消勾选即删除），以及还没用到的源列（勾选即加为扩展字段） */
+function Extensions({ doc, table, onWrite, onEditYaml }: {
+  doc: ReturnType<typeof parseDocument>;
+  table: ReferenceTable | null;
+  onWrite: (name: string, choice: ExtensionChoice | null) => void;
+  onEditYaml: () => void;
+}) {
+  const { extensions, reason } = readExtensions(doc);
+  const names = extensions.map(e => e.name);
+  const unused = table ? unusedColumns(doc, table) : [];
+  return (
+    <div data-form-extensions className="space-y-2 p-3">
+      <div className="flex flex-wrap items-baseline gap-x-2">
+        <span className="font-medium">扩展字段</span>
+        <span className="text-xs text-muted-foreground">标准模型里没有的租户特有字段，名字以 x_ 开头</span>
+      </div>
+      {reason ? (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span>{reason}</span>
+          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>到 YAML 修改</Button>
+        </div>
+      ) : (
+        <>
+          {/* 按位置作 key：改名时这一行不重新挂载，输入框不丢焦点 */}
+          {extensions.map((form, i) => (
+            <ExtensionRow key={i} form={form} others={names.filter(n => n !== form.name)} onWrite={choice => onWrite(form.name, choice)} onEditYaml={onEditYaml} />
+          ))}
+          {unused.length > 0 && <div className="pt-1 text-xs text-muted-foreground">没用到的源列，勾选即加为扩展字段：</div>}
+          {unused.map(c => (
+            <label key={c.name} data-unused-column={c.name} className="flex items-center gap-2 text-xs">
+              <input type="checkbox" checked={false} onChange={() => {
+                const ext = newExtension(table!, c.name, names);
+                onWrite(ext.name, ext);
+              }} />
+              <span className="font-mono">{columnLabel(c)}</span>
+            </label>
+          ))}
+          {!table && !extensions.length && <div className="text-xs text-muted-foreground">没有可对照的源表，扩展字段请在 YAML 里编写</div>}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** 一个已有的扩展字段：名字、类型、中文名可改，表达式只显示；名字不合格时只留在这一行，不写进 YAML */
+function ExtensionRow({ form, others, onWrite, onEditYaml }: {
+  form: ExtensionForm;
+  /** 其他扩展字段的名字 */
+  others: string[];
+  onWrite: (choice: ExtensionChoice | null) => void;
+  onEditYaml: () => void;
+}) {
+  const read = { name: form.name, type: form.type ?? 'string', label: form.label };
+  const [draft, setDraft] = useState(read);
+  // YAML 在别处改了时按 YAML 重新读出
+  const current = JSON.stringify(read);
+  const [synced, setSynced] = useState(current);
+  if (current !== synced) {
+    setSynced(current);
+    setDraft(read);
+  }
+  const problem = extensionNameProblem(draft.name, others);
+  const update = (next: typeof draft) => {
+    setDraft(next);
+    if (extensionNameProblem(next.name, others)) return;
+    // 中文名写进 YAML 时去掉首尾空白：按写进去的样子记下，输入中的空格不被重新读出冲掉
+    setSynced(JSON.stringify({ ...next, label: next.label.trim() }));
+    onWrite({ ...next, expr: form.expr });
+  };
+  return (
+    <div data-form-extension={form.name} data-readonly={form.readonly || undefined} className="space-y-1 rounded-md border p-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <input type="checkbox" checked aria-label={`保留扩展字段 ${form.name}`} disabled={form.readonly} onChange={() => onWrite(null)} />
+        {form.readonly ? (
+          <span className="font-mono">{form.name}</span>
+        ) : (
+          <>
+            <Input className="h-7 w-48 font-mono" aria-label={`${form.name} 的名字`} value={draft.name} onChange={e => update({ ...draft, name: e.target.value })} />
+            <NativeSelect
+              size="sm"
+              aria-label={`${form.name} 的类型`}
+              value={draft.type}
+              disabled={form.dictionary}
+              title={form.dictionary ? '带值字典或兜底的扩展字段只能是文本' : undefined}
+              onChange={e => update({ ...draft, type: e.target.value as FieldType })}
+            >
+              {FIELD_TYPE_NAMES.map(t => <NativeSelectOption key={t} value={t}>{`${t}（${FIELD_TYPES[t].label}）`}</NativeSelectOption>)}
+            </NativeSelect>
+            <Input className="h-7 w-40" aria-label={`${form.name} 的中文名`} placeholder="中文名（可不填）" value={draft.label} onChange={e => update({ ...draft, label: e.target.value })} />
+          </>
+        )}
+      </div>
+      {form.expr && <code className="block rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap">{form.expr}</code>}
+      {form.dictionary && !form.readonly && <div className="text-xs text-muted-foreground">带值字典或兜底，请在 YAML 里修改对照</div>}
+      {form.readonly && (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span>{form.reason}</span>
+          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>到 YAML 修改</Button>
+        </div>
+      )}
+      {!form.readonly && problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
     </div>
   );
 }
