@@ -3,12 +3,14 @@ import { desc, eq } from 'drizzle-orm';
 import type { CurrentMember } from './auth';
 import { getDb, type Db } from './db/client';
 import { auditLogs, ROLE_LABELS, SOURCE_KIND_LABELS, tenants, type Role, type SourceKind } from './db/schema';
+import { TEMPLATES } from './pipeline/templates';
 import { describeQuotaChange, type TenantQuota } from './quota';
 import { entityLabel } from '../lib/canonical-model';
 
 type Detail = Record<string, unknown>;
 const sourceKindLabel = (kind: unknown) => SOURCE_KIND_LABELS[kind as SourceKind] ?? String(kind);
 const roleLabel = (role: unknown) => ROLE_LABELS[role as Role] ?? String(role);
+const templateLabel = (template: unknown) => TEMPLATES[template as keyof typeof TEMPLATES]?.label ?? String(template);
 
 
 // 每种审计动作的名称，以及把明细写成一句话的方式；新增动作只改这里
@@ -72,6 +74,15 @@ const ACTIONS = {
     label: '丢弃映射草稿',
     describe: (d: Detail) =>
       `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '映射已删除'}`,
+  },
+  'template.drafted': { label: '起草模板参数', describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版草稿` },
+  'template.published': {
+    label: '发布模板参数',
+    describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
+  },
+  'template.draft_discarded': {
+    label: '丢弃模板参数草稿',
+    describe: (d: Detail) => `${templateLabel(d.template)}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '回到默认参数'}`,
   },
   // 只记定位记录的主键与原因，不记明文
   'pii.revealed': {

@@ -300,6 +300,36 @@ export const mappingVersions = platform.table('mapping_versions', {
   uniqueIndex('mapping_versions_one_draft_uq').on(t.mappingId).where(sql`status = 'draft'`),
 ]);
 
+export const templateVersionStatusEnum = platform.enum('template_version_status', MAPPING_VERSION_STATUSES);
+
+// 分析模板定义：租户对某个分析模板（如 rfm，见 pipeline/templates）的参数，每个租户每个模板一份（ADR-0004）。第一次保存草稿时建立，
+// 从没发布过的定义丢弃草稿时删除；没有已发布版本时模板用注册表里的默认参数
+export const templateDefinitions = platform.table('template_definitions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  template: text('template').notNull(),
+  createdAt: createdAt(),
+}, t => [uniqueIndex('template_definitions_tenant_template_uq').on(t.tenantId, t.template)]);
+
+// 模板定义的各个版本：校验通过的参数（不含每次运行时给定的参数，如 RFM 的 asOf）。草稿与双人发布的规则同映射版本（ADR-0015）：
+// 每个定义同时只有一份草稿，发布后锁定；last_editor 是最后保存草稿的成员，发布者不能是这位成员
+export const templateVersions = platform.table('template_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  definitionId: uuid('definition_id').notNull().references(() => templateDefinitions.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  status: templateVersionStatusEnum('status').notNull().default('draft'),
+  params: jsonb('params').$type<Record<string, unknown>>().notNull(),
+  authors: text('authors').array().notNull(),
+  lastEditor: text('last_editor').notNull(),
+  publishedByEmail: text('published_by_email'),
+  publishedAt: timestamp('published_at', { withTimezone: true }),
+  createdAt: createdAt(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [
+  uniqueIndex('template_versions_definition_version_uq').on(t.definitionId, t.version),
+  uniqueIndex('template_versions_one_draft_uq').on(t.definitionId).where(sql`status = 'draft'`),
+]);
+
 // 结果快照：分析模板任务（如 gold.rfm）每次成功后在租户数据湖结果层写下的一张表（ADR-0002：数据在湖里，这里只登记元数据）。
 // definition_version 是运行所用的已发布模板定义版本（参数直接放在任务里时为空）；expires_at 为创建后 90 天，过期清理后记下 expired_at
 export const snapshots = platform.table('snapshots', {

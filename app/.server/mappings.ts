@@ -295,7 +295,7 @@ export async function discardDraft(actor: CurrentMember, mappingId: string) {
 }
 
 /** 本租户有发布权限的成员人数 */
-async function publisherCount(tenantId: string) {
+export async function publisherCount(tenantId: string) {
   const [{ n }] = await getDb().select({ n: sql<number>`count(*)::int` }).from(members)
     .where(and(eq(members.tenantId, tenantId), inArray(members.role, ROLES.filter(r => can(r, 'publish')))));
   return n;

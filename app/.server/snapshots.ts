@@ -27,16 +27,21 @@ export class SnapshotError extends Error {
   constructor(message: string, readonly status: 400 | 404 = 400) { super(message); }
 }
 
-/** 分析模板任务成功后登记它的快照（任务结果里的 table、rows、params）；任务没有成功（如已被判为中断）或已登记过时什么也不做 */
+/**
+ * 分析模板任务成功后登记它的快照（任务结果里的 table、rows、params，任务参数里的模板定义版本 definitionVersion）；
+ * 任务没有成功（如已被判为中断）或已登记过时什么也不做
+ */
 export async function registerSnapshot(tenantId: string, taskId: string, template: SnapshotTemplate) {
   const db = getDb();
-  const [task] = await db.select({ status: tasks.status, result: tasks.result }).from(tasks)
+  const [task] = await db.select({ status: tasks.status, params: tasks.params, result: tasks.result }).from(tasks)
     .where(and(eq(tasks.id, taskId), eq(tasks.tenantId, tenantId)));
   if (task?.status !== 'succeeded' || !task.result) return;
   const { table, rows, params } = task.result as { table: string; rows: number; params: Record<string, unknown> };
+  const { definitionVersion } = task.params as { definitionVersion?: unknown };
   const createdAt = new Date();
   await db.insert(snapshots).values({
     tenantId, template, taskId, table, params, rowCount: rows, createdAt,
+    definitionVersion: Number.isInteger(definitionVersion) ? definitionVersion as number : null,
     expiresAt: new Date(createdAt.getTime() + SNAPSHOT_RETENTION_DAYS * 24 * 60 * 60 * 1000),
   }).onConflictDoNothing({ target: snapshots.taskId });
 }

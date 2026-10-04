@@ -111,6 +111,16 @@ export function parseRfmParams(params: Record<string, unknown>): RfmParams {
   return { asOf: asOf(params.asOf), lookbackDays: p.lookbackDays, statuses: [...new Set(statuses as string[])].sort(), binning: binning(p.binning), segments: segments(p.segments) };
 }
 
+/** 模板定义里的参数：除每次运行时给定的 asOf 以外的全部参数 */
+export type RfmDefinition = Omit<RfmParams, 'asOf'>;
+
+/** 校验模板定义的参数并补上默认值；asOf 不属于定义，写了也报错 */
+export function parseRfmDefinition(params: Record<string, unknown>): RfmDefinition {
+  if ('asOf' in params) throw new Error('参数 asOf 在每次运行时给定，不属于模板定义');
+  const { asOf: _, ...definition } = parseRfmParams({ ...params, asOf: '1970-01-01' });
+  return definition;
+}
+
 const ORDER = 'silver."order"';
 const day = (column: string) => `(${column} AT TIME ZONE 'UTC')::DATE`;
 

@@ -1,9 +1,10 @@
 // 分析页的 HTTP 接缝：有结果层查看权限的成员在「分析」页看到本租户的 RFM 快照，打开看各人群与分页的消费者明细（只有 consumer_id 与分值，没有明文）；
-// 其他租户的快照 404，已过期的快照标灰、打不开
+// 其他租户的快照 404，已过期的快照标灰、打不开；RFM 模板参数页的权限矩阵：查看者只读，分析师能起草不能发布，
+// 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { snapshots } from '../../app/.server/db/schema';
+import { snapshots, tasks } from '../../app/.server/db/schema';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
@@ -71,5 +72,86 @@ describe('分析页', () => {
     expect(html).toContain('data-snapshot-status="expired">已过期');
     expect(html).not.toContain(`href="/analytics/snapshots/${snapshot.id}"`);
     expect((await browser.get(`/analytics/snapshots/${snapshot.id}`)).status).toBe(404);
+  });
+});
+
+/** 模板参数页表单：回看 400 天、固定阈值分箱、两条分群规则 */
+const FORM = {
+  intent: 'save',
+  lookbackDays: '400',
+  status: ['paid', 'completed'],
+  binning: 'thresholds',
+  recency: '30, 90, 180, 365',
+  frequency: '2，3，5，8',
+  monetary: '100 500 1000 5000',
+  segment: ['高价值', '其他', ''],
+  rMin: ['', '', ''], rMax: ['', '', ''], fMin: ['', '', ''], fMax: ['', '', ''], mMin: ['3', '', ''], mMax: ['', '', ''],
+};
+
+describe('RFM 模板参数页', () => {
+  it('查看者看到生效的默认参数，没有保存按钮，提交草稿返回 403', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+    expect(await (await browser.get('/analytics')).text()).toContain('href="/analytics/templates/rfm"');
+    const res = await browser.get('/analytics/templates/rfm');
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('当前生效：默认参数');
+    expect(html).toMatch(/name="lookbackDays"[^>]*value="365"/);
+    expect(html).toContain('value="重要价值"');
+    expect(html).not.toContain('校验并保存草稿');
+    expect((await browser.post('/analytics/templates/rfm', FORM)).status).toBe(403);
+    expect((await browser.get('/analytics/templates/nope')).status).toBe(404);
+  });
+
+  it('分析师保存草稿，参数不合法时报错；分析师和最后保存的人都不能发布，另一位数据工程师发布后入队 gold.rfm', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await memberOf(acme, 'de@acme.com', 'data_engineer');
+    await memberOf(acme, 'de2@acme.com', 'data_engineer');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+
+    const bad = await analyst.post('/analytics/templates/rfm', { ...FORM, segment: ['高价值', '其他'], mMin: ['3', '1'] });
+    expect(bad.status).toBe(400);
+    expect(await bad.text()).toContain('最后一条不能带条件');
+
+    expect((await analyst.post('/analytics/templates/rfm', FORM)).status).toBe(302);
+    const page = await (await analyst.get('/analytics/templates/rfm')).text();
+    expect(page).toContain('第 1 版草稿');
+    expect(page).toMatch(/name="lookbackDays"[^>]*value="400"/);
+    expect(page).toContain('value="2, 3, 5, 8"');
+    expect(page).toMatch(/data-publish-blocker[^>]*>.*?仅管理员、数据工程师可以发布映射与定义/s);
+    expect((await analyst.post('/analytics/templates/rfm', { intent: 'publish', version: '1' })).status).toBe(403);
+
+    // 数据工程师改过之后成了最后保存的人，不能发布
+    const de = await loginAs(app, 'de@acme.com');
+    expect((await de.post('/analytics/templates/rfm', { ...FORM, lookbackDays: '500' })).status).toBe(302);
+    expect(await (await de.get('/analytics/templates/rfm')).text()).toContain('你最后改了这一版草稿');
+    expect((await de.post('/analytics/templates/rfm', { intent: 'publish', version: '1' })).status).toBe(403);
+
+    const de2 = await loginAs(app, 'de2@acme.com');
+    const published = await de2.post('/analytics/templates/rfm', { intent: 'publish', version: '1' });
+    expect(published.status).toBe(302);
+    expect(published.headers.get('location')).toBe('/analytics/templates/rfm?published=1');
+    expect(await (await de2.get('/analytics/templates/rfm?published=1')).text()).toContain('第 1 版已发布');
+    const [task] = await getDb().select().from(tasks).where(eq(tasks.tenantId, acme));
+    expect(task).toMatchObject({ kind: 'gold.rfm', status: 'queued', params: { lookbackDays: 500, statuses: ['completed', 'paid'], definitionVersion: 1 } });
+  });
+
+  it('管理员能发布别人保存的草稿；丢弃草稿后回到已发布的参数', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    const admin = await loginAs(app, 'admin@acme.com');
+    await analyst.post('/analytics/templates/rfm', FORM);
+    expect((await admin.post('/analytics/templates/rfm', { intent: 'publish', version: '1' })).status).toBe(302);
+    expect(await (await admin.get('/analytics/templates/rfm')).text()).toContain('当前生效：第 1 版');
+
+    await analyst.post('/analytics/templates/rfm', { ...FORM, lookbackDays: '30' });
+    expect((await analyst.post('/analytics/templates/rfm', { intent: 'discard' })).status).toBe(302);
+    const html = await (await analyst.get('/analytics/templates/rfm')).text();
+    expect(html).not.toContain('草稿</span>');
+    expect(html).toMatch(/name="lookbackDays"[^>]*value="400"/);
   });
 });
