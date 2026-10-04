@@ -7,15 +7,18 @@ import { syncOptionsFromEnv, syncSourceTables, type SyncTableParam } from './syn
 import { verifySourceLake, type VerifyTableParam } from './verify-engine';
 import { mergeToSilver, type MergeMappingParam } from './merge-engine';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
+import { IDENTITIES } from './identity-engine';
+import { TEMPLATES } from './templates';
+import { compileRfmUnlinked } from './templates/rfm';
 
 type Params = Record<string, unknown>;
 type Result = Record<string, unknown>;
 
 /**
- * 任务的运行环境：配额，任务涉及数据源时（参数带 sourceId）派发时解密好的连接参数，合并到标准层时租户的敏感信息盐，
+ * 任务的运行环境：任务 ID，配额，任务涉及数据源时（参数带 sourceId）派发时解密好的连接参数，合并到标准层时租户的敏感信息盐，
  * 本租户数据湖的会话（attachSource 的任务里数据源也挂在其中），以及抹掉错误信息中凭据的函数
  */
-export interface TaskContext { limits: EngineLimits; source?: SourceSpec; piiSalt?: string; session: TenantLakeSession; redact(message: string): string }
+export interface TaskContext { taskId: string; limits: EngineLimits; source?: SourceSpec; piiSalt?: string; session: TenantLakeSession; redact(message: string): string }
 
 /**
  * attachSource：数据源与数据湖挂在同一个 DuckDB 里（在两者之间搬数据或对照的任务）；
@@ -182,6 +185,26 @@ export const HANDLERS = {
       ];
       if (problems.length) throw new PartialFailure(problems.join('；'), result);
       return result;
+    },
+  },
+  // RFM 分层：按参数（asOf 必填，其余取模板默认值）把打通后的统一消费者的订单编译成 R/F/M 分与人群，
+  // 写进结果层的一张快照表 gold."rfm__<任务 ID>"，只有 consumer_id 与分值，没有明文。打通不到消费者的订单不计入，结果里报告条数。
+  // 第一期参数直接放在任务参数里，还不经过已发布的定义；参数编辑与双人发布之后接上
+  'gold.rfm': {
+    label: TEMPLATES.rfm.label,
+    async run(con, params, { taskId }) {
+      const rfm = TEMPLATES.rfm.parse(params);
+      const present = await rows<{ name: string }>(con, `
+        SELECT table_name AS name FROM information_schema.tables
+        WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN ('order', '_identities')`);
+      const has = (name: string) => present.some(t => t.name === name);
+      if (!has('order')) throw new Error('标准层还没有订单（silver.order）：先发布 order 映射并合并');
+      if (!has('_identities')) throw new Error(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`);
+      const name = `rfm__${taskId}`;
+      await con.run(`CREATE SCHEMA IF NOT EXISTS gold; CREATE TABLE gold."${name}" AS ${TEMPLATES.rfm.compile(rfm)}`);
+      const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM gold."${name}"`);
+      const [{ n: unlinked }] = await rows<{ n: string }>(con, compileRfmUnlinked(rfm));
+      return { table: `gold.${name}`, rows: Number(n), unlinkedOrders: Number(unlinked), params: rfm };
     },
   },
 } satisfies Record<string, Handler>;

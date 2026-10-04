@@ -51,9 +51,16 @@ npx vitest run test/pipeline/mapping.test.ts # 单个文件
 | `seedPgSource()` | 只重建源库，返回连接信息（`pgSourceInput` 内部已调用） |
 | `duckdbSourceFile(tenantId, file?)` | 在租户源文件目录下生成 DuckDB 文件，返回路径 |
 | `s3SourceFiles(tenantId)` | 对象存储上的 parquet 源文件与三个受限账号（需 `TEST_S3_LAKE_URI`） |
-| `seedIdentitySources(member)` | 重建源库并建 `crm.customers`、`loyalty.members`、`tracking.users` + `tracking.events` 三个 schema，各登记为一个数据源（CRM、会员、埋点）、选表、确认水位线（`updated_at`）、同步完，返回 `{ crm, loyalty, tracking }`；两边同一个人的手机写法不同、只有邮箱相同、外部 ID 相同、手机-邮箱成链，另有空手机 / 空邮箱的记录；埋点用户与 CRM 重叠，事件含 login 与匿名事件，一台设备先后被两个人登录、一台同一时刻被两人登录（详见函数注释） |
+| `seedIdentitySources(member)` | 重建源库并建 `crm.customers`、`loyalty.members`、`tracking.users` + `tracking.events` 三个 schema，各登记为一个数据源（CRM、会员、埋点）、选表、确认水位线（`updated_at`）、同步完，返回 `{ crm, loyalty, tracking }`；两边同一个人的手机写法不同、只有邮箱相同、外部 ID 相同、手机-邮箱成链，另有空手机 / 空邮箱的记录；埋点用户与 CRM 重叠，事件含 login 与匿名事件，一台设备先后被两个人登录、一台同一时刻被两人登录（详见函数注释）。`{ orders: true }` 时 CRM 与会员源各多一张订单表（`crm.orders`、`loyalty.orders`，列名与状态写法不同，含一笔打通不到消费者的订单与一笔晚于 2024-07-01 的订单）一并同步 |
 | `seedMysqlSource()` | MySQL 源库，`orders` 带自增主键与 `updated_at`（需 `TEST_MYSQL_URL`） |
 | `seedMongoSource()` / `MONGO_USERS` | MongoDB 源库与几种权限的账号（需 `TEST_MONGO_URL`） |
+
+### `test/pipeline/identity-fixtures.ts`
+
+| helper | 作用 |
+|---|---|
+| `publishedIdentitySources({ orders? })` | 开通租户 `acme`，`de@acme.com` 登记同步三个身份打通数据源、`de2@acme.com` 审核发布三个 customer 映射与埋点事件映射（`orders` 为真时再发布两个订单映射），合并与打通跑完；返回 `{ acme, author, reviewer, sources, mappings, names }` |
+| `CRM` / `LOYALTY` / `TRACKING_USERS` / `TRACKING_EVENTS` / `CRM_ORDERS` / `LOYALTY_ORDERS` | 上面发布的映射 YAML，改规则后重新发布时在其后追加内容 |
 
 PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 
@@ -165,6 +172,7 @@ describe('<功能>', () => {
 | `pipeline/mapping.test.ts` | 映射发布与标准层合并、去重键、值字典、双人发布（最后保存的人不能发布）、只有映射引用的表写入变更才在同步后合并（定时检查也不补）、合并只带受影响的映射、补进排队中的合并、运行期间的变更由定时检查补上、详情页只合并单个映射 |
 | `pipeline/pii.test.ts` | 标准层敏感字段：规范化后按租户加盐哈希（不同写法同一哈希、与字段名无关）、`silver.*` / `silver_records` / 任务结果里没有明文、哈希上线前的明文标准层重建、转换报错抹掉取值与盐、标成敏感的扩展字段同样只存哈希 |
 | `pipeline/identity.test.ts` | 身份打通：CRM、会员、埋点三个源的消费者按手机号 / 邮箱 / 外部 ID 哈希取传递闭包合并（写法不同、只有邮箱相同、链、空值不合并）、`silver._identities` 没有明文且 `consumer_id` 不是敏感字段哈希、匿名设备按全局最近一次登录归属（并列取较小 `consumer_id`，匿名事件经设备归属）、任务结果的打通摘要、重复合并结果一致；映射里配置匹配字段（去掉邮箱后重新发布、组随之变化）、更高优先级字段冲突时不按低优先级字段合并、两个 `customer` 映射规则不一致时拒绝发布 |
+| `pipeline/rfm.test.ts` | `gold.rfm` 任务：两个数据源的订单经打通合到同一消费者、分值与人群与手算一致、快照表只有 `consumer_id` 与分值、打通不到的订单单独计数；同一 `as_of` 重复运行结果一致；没有 `silver.order` 或参数不合法时任务失败 |
 | `pipeline/migration.test.ts` | 数据湖迁移存储 |
 | `pipeline/encryption.test.ts` | 数据湖加密存储：新租户原始层 / `_keys` / `_mirror` 的文件不带密钥读不出、不含明文；加密前的未加密湖重新初始化照常同步 |
 | `pipeline/reset.test.ts` | 开发用重置数据湖 |
@@ -179,6 +187,7 @@ describe('<功能>', () => {
 | `mapping-spec.test.ts` | 映射 YAML 校验与定位、报错附带的改法（是不是想写、扩展字段写法、值字典、主键）、敏感字段（扩展字段的敏感标记只能是文本、内置敏感字段不能取消）、对照面板读出的 YAML 要点（纯函数） |
 | `mapping-draft.test.ts` | 按规则生成映射草稿：列名同义词、格式校验、分 / 毫秒 / 时区转换、值字典骨架、去重键、没用到的列生成注释掉的扩展字段（像敏感信息的默认标成敏感）；手写贴合 MySQL 开发库的列统计（纯函数） |
 | `mapping-form.test.ts` | 映射表单与 YAML 互转：读出每个标准字段的源列、常用转换、参数与依据，写回时只改那一行、保留注释与顺序，枚举字段的值对照与兜底（未对应的不写入、写出的 YAML 通过校验、对照表的待对应行与预填），表单不认识的写法只读；扩展字段（没用到的源列、默认名字与类型、读入 / 加上 / 改名 / 删除后通过校验、像敏感信息的源列默认标成敏感与勾选敏感）（纯函数） |
+| `rfm-template.test.ts` | RFM 模板：参数校验与默认值、同样参数编译出同样 SQL；在内存 DuckDB 里对手造的标准层算出已知答案（五分位与阈值分箱、自定义分群、状态 / 回看窗口 / as_of 过滤、并列按 `consumer_id`、打通不到的订单计数）（纯函数） |
 | `nav.test.ts` | 顶栏导航高亮：子页面高亮所属导航项，按完整路径段匹配，运营后台审计日志不连带租户（纯函数） |
 | `client-build.test.ts` | 真实客户端构建，兜底页面误引 `.server` 模块 |
 | `mailer.test.ts` / `totp.test.ts` | 发信、TOTP（纯函数） |

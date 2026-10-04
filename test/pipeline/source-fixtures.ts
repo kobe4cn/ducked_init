@@ -115,8 +115,10 @@ export async function pgSourceInput(account: { user: string; password: string },
  * - 用户 u1 ↔ crm 1 手机号相同，u2 ↔ loyalty 2 邮箱相同，u9 是只在埋点里出现的人
  * - 设备 d1：u1 先登录、u2 后登录，另有匿名事件，归属 u2；d2：u9 与 u1 同一时刻登录（并列），另有匿名事件
  * - 设备 d3 只有匿名事件、d4 只有已登录的浏览（没有 login），都不归属任何人
+ * orders 为真时 CRM 与会员源各多一张订单表（crm.orders、loyalty.orders，列名与状态写法不同），一并选表同步，
+ * 订单的金额与时间对应 rfm.test.ts 里 RFM 的已知答案；crm.orders 里有一笔下单人 99 不存在，打通不到消费者
  */
-export async function seedIdentitySources(member: CurrentMember) {
+export async function seedIdentitySources(member: CurrentMember, { orders = false } = {}) {
   const input = await pgSourceInput(READER);
   await grantOnSource(`
     DROP SCHEMA IF EXISTS crm CASCADE; DROP SCHEMA IF EXISTS loyalty CASCADE; DROP SCHEMA IF EXISTS tracking CASCADE;
@@ -154,11 +156,28 @@ export async function seedIdentitySources(member: CurrentMember) {
       ('e7', NULL, 'd2', 'view', '2024-06-03 10:00'),
       ('e8', NULL, 'd3', 'view', '2024-06-03 10:00'),
       ('e9', 'u1', 'd4', 'view', '2024-06-03 10:00');
+    ${orders ? `
+    CREATE TABLE crm.orders (order_no text PRIMARY KEY, customer int, status text, amount numeric(18,2), created_at timestamp, paid_at timestamp, updated_at timestamp NOT NULL);
+    INSERT INTO crm.orders VALUES
+      ('A1', 1, 'paid', 100, '2024-06-30 08:00', '2024-06-30 09:00', '2024-06-30'),
+      ('A2', 2, 'paid', 300, '2024-04-30 20:00', '2024-05-01 10:00', '2024-06-30'),
+      ('A3', 5, 'paid', 200, '2024-06-20 10:00', '2024-06-20 10:00', '2024-06-30'),
+      ('A4', 7, 'refunded', 999, '2024-06-28 10:00', '2024-06-28 10:00', '2024-06-30'),
+      ('A5', 99, 'paid', 50, '2024-06-01 10:00', '2024-06-01 10:00', '2024-06-30'),
+      ('A6', 6, 'paid', 150, '2024-04-01 10:00', '2024-04-01 10:00', '2024-06-30');
+    CREATE TABLE loyalty.orders (id int PRIMARY KEY, member_id int, state text, total numeric(18,2), ordered_at timestamp, updated_at timestamp NOT NULL);
+    INSERT INTO loyalty.orders VALUES
+      (1, 1, '已支付', 400, '2024-06-01 10:00', '2024-06-30'),
+      (2, 5, '已支付', 200, '2024-06-25 10:00', '2024-06-30'),
+      (3, 3, '已支付', 80, '2024-03-01 10:00', '2024-06-30'),
+      (4, 6, '已完成', 1000, '2024-06-15 10:00', '2024-06-30'),
+      (5, 6, '已支付', 500, '2024-07-02 10:00', '2024-07-02');` : ''}
     GRANT USAGE ON SCHEMA crm, loyalty, tracking TO ${READER.user};
     GRANT SELECT ON ALL TABLES IN SCHEMA crm, loyalty, tracking TO ${READER.user};`);
   const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
   const ids: string[] = [];
-  const sources: [string, string, string[]][] = [['CRM', 'crm', ['customers']], ['会员', 'loyalty', ['members']], ['埋点', 'tracking', ['users', 'events']]];
+  const extra = orders ? ['orders'] : [];
+  const sources: [string, string, string[]][] = [['CRM', 'crm', ['customers', ...extra]], ['会员', 'loyalty', ['members', ...extra]], ['埋点', 'tracking', ['users', 'events']]];
   for (const [name, schema, tables] of sources) {
     const { id } = await registerSource(member, { ...input, name, schema });
     await drain();

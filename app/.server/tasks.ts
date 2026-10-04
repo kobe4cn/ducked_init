@@ -63,7 +63,7 @@ export async function countTasksByStatus(tenantId: string): Promise<Record<TaskS
   return counts;
 }
 
-export interface ClaimedTask extends WorkerInput { id: string; tenantId: string }
+export interface ClaimedTask extends Omit<WorkerInput, 'taskId'> { id: string; tenantId: string }
 
 // 领取任务时持有的事务级咨询锁：多个调度器串行领取，按租户的并发上限不会被同时突破
 const CLAIM_LOCK = 0x7461736b;
