@@ -2,15 +2,16 @@
 // 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后为这个映射入队合并任务（silver.merge），同步给已发布映射的源表写入变更后也为这些映射再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
 // 一律限定在操作者所属租户内；合并本身在工作进程里进行（pipeline/merge-engine.ts）
 import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
-import { assertCan, can } from './access';
+import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
-import { mappings, mappingVersions, members, ROLES, sources, tasks, tenants, type TaskStatus } from './db/schema';
+import { mappings, mappingVersions, sources, tasks, tenants, type TaskStatus } from './db/schema';
 import { identityRules } from './pipeline/identity-engine';
 import type { MergeMappingParam, MergeRecord } from './pipeline/merge-engine';
 import { draftMapping } from './pipeline/mapping-draft';
 import { checkMapping, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
+import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { requireSource } from './source-config';
 import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
@@ -163,8 +164,7 @@ export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: s
     if (!locked) throw new MappingError('映射不存在', 404);
     const [latest] = await tx.select().from(mappingVersions).where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version)).limit(1);
     if (latest?.status === 'draft') {
-      const authors = latest.authors.includes(actor.email) ? latest.authors : [...latest.authors, actor.email];
-      await tx.update(mappingVersions).set({ yaml, plan, authors, lastEditor: actor.email, updatedAt: new Date() }).where(eq(mappingVersions.id, latest.id));
+      await tx.update(mappingVersions).set({ yaml, plan, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() }).where(eq(mappingVersions.id, latest.id));
       return latest.version;
     }
     const version = (latest?.version ?? 0) + 1;
@@ -180,16 +180,6 @@ export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: s
     });
     return version;
   });
-}
-
-/**
- * 有发布权限的成员发布不了某一版的原因（不是草稿、最后保存这一版草稿的是自己）；可以发布时为 null。发布权限由调用方另行检查。
- * 每一处改动都要由另一个人看过才能发布：最后保存的人之前的改动，最后保存的人保存时已经看过
- */
-export function publishBlocker(actor: CurrentMember, version: { status: string; lastEditor: string }) {
-  if (version.status !== 'draft') return '已发布的版本已锁定';
-  if (version.lastEditor === actor.email) return '你最后改了这一版草稿，需由另一位数据工程师或管理员发布';
-  return null;
 }
 
 /**
@@ -242,7 +232,7 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
     await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
     // 等锁期间草稿可能已被丢弃
     const [current] = await tx.select().from(mappingVersions).where(eq(mappingVersions.id, draft.id));
-    if (!current || current.status !== 'draft' || current.updatedAt.getTime() !== draft.updatedAt.getTime()) {
+    if (isStale(current, draft)) {
       throw new MappingError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
     }
     await assertExtensionTypes(tx, actor.tenant.id, plan);
@@ -292,13 +282,6 @@ export async function discardDraft(actor: CurrentMember, mappingId: string) {
     });
     return { kept: published !== null };
   });
-}
-
-/** 本租户有发布权限的成员人数 */
-export async function publisherCount(tenantId: string) {
-  const [{ n }] = await getDb().select({ n: sql<number>`count(*)::int` }).from(members)
-    .where(and(eq(members.tenantId, tenantId), inArray(members.role, ROLES.filter(r => can(r, 'publish')))));
-  return n;
 }
 
 /** 租户各映射（给了 mappingIds 时只取这些）最新的已发布版本及其合并计划（合并任务的参数） */
@@ -533,7 +516,7 @@ export async function getMapping(actor: CurrentMember, mappingId: string) {
       publishedBy: v.publishedByEmail,
       publishedAt: v.publishedAt,
       updatedAt: v.updatedAt,
-      publishBlocker: v.status === 'draft' ? publishBlocker(actor, v) : null,
+      publishBlocker: publishBlocker(actor, v),
     })),
     merge,
   };

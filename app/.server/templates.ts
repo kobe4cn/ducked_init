@@ -7,7 +7,7 @@ import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { templateDefinitions, templateVersions } from './db/schema';
-import { publishBlocker, publisherCount } from './mappings';
+import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { TEMPLATES } from './pipeline/templates';
 import { insertTask } from './tasks';
 
@@ -84,8 +84,7 @@ export async function saveDraft(actor: CurrentMember, id: string, params: Record
     const [latest] = await tx.select().from(templateVersions)
       .where(eq(templateVersions.definitionId, definitionId)).orderBy(desc(templateVersions.version)).limit(1);
     if (latest?.status === 'draft') {
-      const authors = latest.authors.includes(actor.email) ? latest.authors : [...latest.authors, actor.email];
-      await tx.update(templateVersions).set({ params: definition, authors, lastEditor: actor.email, updatedAt: new Date() })
+      await tx.update(templateVersions).set({ params: definition, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
         .where(eq(templateVersions.id, latest.id));
       return latest.version;
     }
@@ -121,7 +120,7 @@ export async function publishTemplate(actor: CurrentMember, id: string, version:
     // 锁住定义行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿。不像发布映射那样锁租户行：模板任务不合并进排队中的任务，没有要互斥的入队检查
     await tx.select({ id: templateDefinitions.id }).from(templateDefinitions).where(eq(templateDefinitions.id, draft.definitionId)).for('update');
     const [current] = await tx.select().from(templateVersions).where(eq(templateVersions.id, draft.id));
-    if (!current || current.status !== 'draft' || current.updatedAt.getTime() !== draft.updatedAt.getTime()) {
+    if (isStale(current, draft)) {
       throw new TemplateError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
     }
     await tx.update(templateVersions)

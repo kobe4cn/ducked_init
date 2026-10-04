@@ -262,9 +262,10 @@ export const sourceTables = platform.table('source_tables', {
   softDeleteConfirmedByEmail: text('soft_delete_confirmed_by_email'),
 }, t => [primaryKey({ columns: [t.sourceId, t.tableName] })]);
 
-export const MAPPING_VERSION_STATUSES = ['draft', 'published'] as const;
-export type MappingVersionStatus = (typeof MAPPING_VERSION_STATUSES)[number];
-export const mappingVersionStatusEnum = platform.enum('mapping_version_status', MAPPING_VERSION_STATUSES);
+/** 双人发布的版本状态（映射、模板定义共用，ADR-0015）：草稿可改，已发布的锁定 */
+export const VERSION_STATUSES = ['draft', 'published'] as const;
+export type VersionStatus = (typeof VERSION_STATUSES)[number];
+export const mappingVersionStatusEnum = platform.enum('mapping_version_status', VERSION_STATUSES);
 
 // 映射：数据源里的一张表 → 一个标准实体（或自定义实体），属于某个空间（ADR-0015）。表与实体取自第一版文档，之后的版本不能改
 export const mappings = platform.table('mappings', {
@@ -300,7 +301,7 @@ export const mappingVersions = platform.table('mapping_versions', {
   uniqueIndex('mapping_versions_one_draft_uq').on(t.mappingId).where(sql`status = 'draft'`),
 ]);
 
-export const templateVersionStatusEnum = platform.enum('template_version_status', MAPPING_VERSION_STATUSES);
+export const templateVersionStatusEnum = platform.enum('template_version_status', VERSION_STATUSES);
 
 // 分析模板定义：租户对某个分析模板（如 rfm，见 pipeline/templates）的参数，每个租户每个模板一份（ADR-0004）。第一次保存草稿时建立，
 // 从没发布过的定义丢弃草稿时删除；没有已发布版本时模板用注册表里的默认参数

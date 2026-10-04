@@ -3,18 +3,20 @@
 // 可按规则重新生成草稿填进编辑框，不保存），以及这个映射每次合并到标准层的结果；有已发布版本时可以立即合并这一个映射。
 // 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）；
 // 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）
-import { AlertTriangle, ArrowRight, Boxes, CheckCircle2, Lock, PencilLine, Play, Trash2, Upload } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Boxes, PencilLine, Play } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
-import { can, deniedReason, requirePermission } from '~/.server/access';
+import { can, requirePermission } from '~/.server/access';
 import { discardDraft, draftForMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
+import { publishReason } from '~/.server/publish-rules';
 import { functionList } from '~/lib/mapping-expr';
 import { isEnumField } from '~/lib/mapping-form';
 import type { FallbackStat } from '~/.server/pipeline/merge-engine';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel, entityOf } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
+import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { KindIcon } from '~/components/kind-icon';
 import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
 import { MappingEditorWithReference } from '~/components/mapping-reference';
@@ -44,7 +46,6 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   try {
     const m = await getMapping(member, params.mappingId);
-    const canPublish = can(member.role, 'publish');
     const canWrite = can(member.role, 'sources:write');
     const url = new URL(request.url);
     return {
@@ -71,10 +72,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         publishedAt: v.publishedAt?.toISOString() ?? null,
         updatedAt: v.updatedAt.toISOString(),
         /** 当前成员发布不了这一版草稿的原因（没有发布权限、最后保存的是自己、租户里没有别人能发布）；可以发布或不是草稿时为 null */
-        publishBlocker: v.status !== 'draft' ? null
-          : !canPublish ? deniedReason('publish')
-          : v.publishBlocker && m.publishers === 1 && v.lastEditor === member.email ? '本租户只有你有发布权限，请先邀请一位数据工程师或管理员'
-          : v.publishBlocker,
+        publishBlocker: publishReason(member, v, m.publishers),
       })),
       merge: {
         status: m.merge.status,
@@ -128,7 +126,6 @@ const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixe
 
 type LoaderData = Route.ComponentProps['loaderData'];
 type MergeEntry = LoaderData['merge']['history'][number];
-type Version = LoaderData['versions'][number];
 
 /** 一列落入兜底的情况，如「订单状态有 2 种取值（共 312 行）落入兜底：closed（300）、pending_review（12）」 */
 function fallbackText(entity: string, f: FallbackStat) {
@@ -174,42 +171,6 @@ function MergeRow({ e, base, canWrite }: { e: MergeEntry; base: string; canWrite
   );
 }
 
-/** 版本状态：已发布（锁定）或草稿，颜色配图标和文字（见 docs/agents/ui.md） */
-function VersionStatus({ v }: { v: Version }) {
-  return v.status === 'published'
-    ? <span className="inline-flex items-center gap-1 text-sm text-emerald-600"><CheckCircle2 className="size-3.5" />已发布</span>
-    : <span className="inline-flex items-center gap-1 text-sm text-amber-600"><PencilLine className="size-3.5" />草稿</span>;
-}
-
-/** 草稿的发布与丢弃（发布不了时在按钮位置说明原因） */
-function DraftActions({ v, canWrite, published, submitting }: { v: Version; canWrite: boolean; published: boolean; submitting: boolean }) {
-  return (
-    <>
-      {v.publishBlocker ? (
-        <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-publish-blocker><Lock className="size-3.5 shrink-0" />{v.publishBlocker}</span>
-      ) : (
-        <Form method="post">
-          <input type="hidden" name="intent" value="publish" />
-          <input type="hidden" name="version" value={v.version} />
-          <Button type="submit" disabled={submitting}><Upload />{`发布 v${v.version}`}</Button>
-        </Form>
-      )}
-      {canWrite && (
-        <Form
-          method="post"
-          onSubmit={e => {
-            const back = published ? '回到最近的已发布版本' : '这个映射从没发布过，将被删除';
-            if (!confirm(`丢弃第 ${v.version} 版草稿？${back}。`)) e.preventDefault();
-          }}
-        >
-          <input type="hidden" name="intent" value="discard" />
-          <Button type="submit" variant="destructive" disabled={submitting}><Trash2 />丢弃草稿</Button>
-        </Form>
-      )}
-    </>
-  );
-}
-
 export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, merge } = loaderData;
   const submitting = useNavigation().state === 'submitting';
@@ -225,7 +186,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
         description={<Link to="/mappings" className="hover:underline">← 全部映射</Link>}
         actions={
           <>
-            {draft && <DraftActions v={draft} canWrite={canWrite} published={Boolean(live)} submitting={submitting} />}
+            {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : '这个映射从没发布过，将被删除'} submitting={submitting} />}
             {canWrite && live && (
               <Form method="post">
                 <input type="hidden" name="intent" value="merge" />

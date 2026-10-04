@@ -1,17 +1,19 @@
 // app/routes/analytics.templates.$id.tsx —— 分析模板参数（有定义查看权限的成员）：RFM 的回看天数、计入的订单状态、分箱方式（五分位或固定阈值）与分群规则表。
 // 有起草权限的成员保存草稿（参数不合法时报错）、丢弃草稿；草稿由最后保存它的人以外的另一位有发布权限的成员发布（ADR-0015），
 // 发布后以新参数入队一次 RFM 计算，产出的快照记下定义版本。没有已发布版本时生效的是模板的默认参数
-import { CheckCircle2, Lock, PencilLine, Plus, Trash2, Upload, X } from 'lucide-react';
+import { CheckCircle2, Plus, X } from 'lucide-react';
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.templates.$id';
-import { can, deniedReason, requirePermission } from '~/.server/access';
+import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
+import { publishReason } from '~/.server/publish-rules';
 import type { RfmDefinition, ScoreRange, SegmentRule } from '~/.server/pipeline/templates/rfm';
 import { TaskError } from '~/.server/tasks';
 import { discardDraft, getTemplate, publishTemplate, saveDraft, TemplateError } from '~/.server/templates';
 import { entityOf } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
+import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { PageHeader } from '~/components/page-header';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
@@ -31,7 +33,6 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   // 页面上的表单只有 RFM 的参数
   if (params.templateId !== 'rfm') throw data(null, { status: 404 });
   const t = await getTemplate(member, params.templateId);
-  const canPublish = can(member.role, 'publish');
   return {
     email: member.email,
     nav: navFor(member),
@@ -51,10 +52,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       publishedAt: v.publishedAt?.toISOString() ?? null,
       updatedAt: v.updatedAt.toISOString(),
       /** 当前成员发布不了这一版草稿的原因（没有发布权限、最后保存的是自己、租户里没有别人能发布）；可以发布或不是草稿时为 null */
-      publishBlocker: v.status !== 'draft' ? null
-        : !canPublish ? deniedReason('publish')
-        : v.publishBlocker && t.publishers === 1 && v.lastEditor === member.email ? '本租户只有你有发布权限，请先邀请一位数据工程师或管理员'
-        : v.publishBlocker,
+      publishBlocker: publishReason(member, v, t.publishers),
     })),
   };
 }
@@ -113,45 +111,6 @@ export async function action({ request, params }: Route.ActionArgs) {
 }
 
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
-
-type LoaderData = Route.ComponentProps['loaderData'];
-type Version = LoaderData['versions'][number];
-
-/** 版本状态：已发布（锁定）或草稿，颜色配图标和文字（见 docs/agents/ui.md） */
-function VersionStatus({ v }: { v: Version }) {
-  return v.status === 'published'
-    ? <span className="inline-flex items-center gap-1 text-sm text-emerald-600"><CheckCircle2 className="size-3.5" />已发布</span>
-    : <span className="inline-flex items-center gap-1 text-sm text-amber-600"><PencilLine className="size-3.5" />草稿</span>;
-}
-
-/** 草稿的发布与丢弃（发布不了时在按钮位置说明原因） */
-function DraftActions({ v, canDraft, published, submitting }: { v: Version; canDraft: boolean; published: boolean; submitting: boolean }) {
-  return (
-    <div className="flex items-center justify-end gap-2">
-      {v.publishBlocker ? (
-        <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-publish-blocker><Lock className="size-3.5 shrink-0" />{v.publishBlocker}</span>
-      ) : (
-        <Form method="post">
-          <input type="hidden" name="intent" value="publish" />
-          <input type="hidden" name="version" value={v.version} />
-          <Button type="submit" disabled={submitting}><Upload />{`发布 v${v.version}`}</Button>
-        </Form>
-      )}
-      {canDraft && (
-        <Form
-          method="post"
-          onSubmit={e => {
-            const back = published ? '回到最近的已发布版本' : '回到模板的默认参数';
-            if (!confirm(`丢弃第 ${v.version} 版草稿？${back}。`)) e.preventDefault();
-          }}
-        >
-          <input type="hidden" name="intent" value="discard" />
-          <Button type="submit" variant="destructive" disabled={submitting}><Trash2 />丢弃草稿</Button>
-        </Form>
-      )}
-    </div>
-  );
-}
 
 const rangeInput = (range: ScoreRange | undefined, end: 'min' | 'max') => range?.[end] ?? '';
 
@@ -303,7 +262,12 @@ export default function TemplateParams({ loaderData, actionData }: Route.Compone
                   <TableCell>{v.authors.join('、')}</TableCell>
                   <TableCell className="text-slate-500">{`${v.lastEditor} · ${time(v.updatedAt)}`}</TableCell>
                   <TableCell className="text-slate-500">{v.publishedByEmail ? `${v.publishedByEmail} · ${time(v.publishedAt)}` : '—'}</TableCell>
-                  <TableCell>{v.status === 'draft' && <DraftActions v={v} canDraft={canDraft} published={published !== null} submitting={submitting} />}</TableCell>
+                  <TableCell>{v.status === 'draft' && (
+                    <DraftActions
+                      v={v} canDiscard={canDraft} discardHint={published !== null ? '回到最近的已发布版本' : '回到模板的默认参数'}
+                      submitting={submitting} className="justify-end"
+                    />
+                  )}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
