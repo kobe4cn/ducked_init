@@ -1,15 +1,32 @@
 // app/.server/pipeline/identity-engine.ts —— 身份打通：把本租户各数据源的 customer 记录按确定性规则归并为统一消费者，
 // 结果整表写进 silver._identities(_source, customer_id, consumer_id)。在合并到标准层之后、工作进程里运行。
-// 一条源记录的身份是 (_source, customer_id)（customer_id 只在一个数据源内唯一，两者有一个为空的行不参与）。规则是标准层里敏感字段的哈希精确相等
-// （哈希前已规范化，空值不参与），合并语义是传递闭包：A-B 手机相同、B-C 邮箱相同，则 A、B、C 是同一个消费者。
+// 一条源记录的身份是 (_source, customer_id)（customer_id 只在一个数据源内唯一，两者有一个为空的行不参与）。规则是按优先级排列的匹配字段，
+// 比的是标准层里敏感字段的哈希（哈希前已规范化，空值不参与）：两条记录在某个匹配字段上相等、且在每个更高优先级的字段上不冲突
+// （冲突是双方都有值、没有一个相同）时相连；之后取传递闭包：A-B 手机相同、B-C 邮箱相同，则 A、B、C 是同一个消费者。
+// 匹配规则由各 customer 映射配置（identityRules），都没配置时用平台默认规则。
 // 统一消费者 ID 取组内最小的 (_source, customer_id) 再哈希，与敏感字段的哈希无关，同样的输入总得到同样的结果。
 // 之后由 silver.event 的登录事件求设备归属，整表写进 silver._device_owner(device_id, consumer_id, login_at)：
 // 每台登录过的设备归属到它全局最近一次登录的统一消费者（登录事件的 customer_id 只在它自己的 _source 内解析），
 // 同一时刻并列时取较小的 consumer_id；匿名事件（customer_id 为空）经 device_id 对应到统一消费者
 import type { DuckDBConnection } from '@duckdb/node-api';
 
-/** 默认的匹配规则：按顺序是手机号、邮箱、外部 ID 的哈希精确相等。顺序只是优先级的记录，合并语义是纯传递闭包 */
-export const DEFAULT_RULES = ['phone', 'email', 'external_id'] as const;
+/** 默认的匹配规则：按优先级是手机号、邮箱、外部 ID 的哈希精确相等 */
+export const DEFAULT_RULES: readonly string[] = ['phone', 'email', 'external_id'];
+
+/**
+ * 租户的匹配规则：各 customer 映射里配置的匹配字段必须一致（没配置的映射不参与），都没配置时是默认规则。
+ * 不一致时抛错，说明是哪些映射；mappingName 给出映射在报错里的叫法
+ */
+export function identityRules<P extends { entity: string; identity?: { match: string[] } }>(plans: P[], mappingName: (plan: P) => string): readonly string[] {
+  const configured = plans.filter(p => p.entity === 'customer' && p.identity);
+  const [first] = configured;
+  const other = configured.find(p => p.identity!.match.join() !== first.identity!.match.join());
+  if (other) {
+    const show = (p: P) => `${mappingName(p)}（${p.identity!.match.join(' > ')}）`;
+    throw new Error(`消费者映射的身份打通匹配规则不一致：${show(first)}、${show(other)}；请改成一致，或只在一个映射里配置`);
+  }
+  return first ? first.identity!.match : DEFAULT_RULES;
+}
 
 /** 登录事件的事件类型，先写死，还不能配置 */
 export const LOGIN_EVENT = 'login';
@@ -23,6 +40,8 @@ const CUSTOMER = 'silver."customer"';
 const EVENT = 'silver."event"';
 const NODES = 'stage.identity_nodes';
 const VALUES = 'stage.identity_values';
+const WIDE = 'stage.identity_wide';
+const EDGES = 'stage.identity_edges';
 const LABELS = 'stage.identity_labels';
 const NEXT = 'stage.identity_next';
 
@@ -50,12 +69,31 @@ export async function resolveIdentities(con: DuckDBConnection, rules: readonly s
       ? used.map(r => `SELECT n.node, ${lit(r)} AS rule, c.${ident(r)} AS value FROM ${CUSTOMER} c
           JOIN ${NODES} n ON n._source = c._source AND n.customer_id = c.customer_id WHERE c.${ident(r)} IS NOT NULL`).join(' UNION ALL ')
       : `SELECT NULL::BIGINT AS node, NULL::VARCHAR AS rule, NULL::VARCHAR AS value LIMIT 0`})`);
-    // 标签传播到不动点：每条记录取与它共享某个取值的记录里最小的标签，再取自己标签那条记录的标签（跳跃，收敛更快）
+    // 每条记录在各匹配字段上的取值（排好序的列表，没有值时为空）：c0 是最高优先级的字段
+    const col = (j: number) => `c${j}`;
+    await con.run(`CREATE OR REPLACE TABLE ${WIDE} AS SELECT node${used.map((r, j) => `,
+      CASE WHEN count(*) FILTER (WHERE rule = ${lit(r)}) > 0 THEN list_sort(list(DISTINCT value) FILTER (WHERE rule = ${lit(r)})) END AS ${col(j)}`).join('')}
+      FROM ${VALUES} GROUP BY node`);
+    // 第 i 个字段上的边：同一个取值、更高优先级字段的取值也完全相同的记录是一类，彼此都不冲突，连到类里最小的记录；
+    // 同一个取值的不同类之间，在更高优先级字段上不冲突时，两类的代表相连。这样边数随记录数线性增长，只有类与类之间成对比较
+    await con.run(`CREATE OR REPLACE TABLE ${EDGES} (a BIGINT, b BIGINT)`);
+    for (const [i, r] of used.entries()) {
+      const higher = used.slice(0, i).map((_, j) => col(j));
+      const sig = ['v.value', ...higher.map(c => `w.${c}`)].join(', ');
+      const fits = higher.map(c => `NOT (x.${c} IS NOT NULL AND y.${c} IS NOT NULL AND NOT list_has_any(x.${c}, y.${c}))`);
+      await con.run(`INSERT INTO ${EDGES}
+        WITH m AS (SELECT v.node, v.value${higher.map(c => `, w.${c}`).join('')}, min(v.node) OVER (PARTITION BY ${sig}) AS rep
+          FROM ${VALUES} v JOIN ${WIDE} w USING (node) WHERE v.rule = ${lit(r)}),
+        reps AS (SELECT DISTINCT rep, value${higher.map(c => `, ${c}`).join('')} FROM m)
+        SELECT node, rep FROM m WHERE node <> rep${higher.length ? `
+        UNION ALL SELECT x.rep, y.rep FROM reps x JOIN reps y ON x.value = y.value AND x.rep < y.rep WHERE ${fits.join(' AND ')}` : ''}`);
+    }
+    await con.run(`INSERT INTO ${EDGES} SELECT b, a FROM ${EDGES}`);
+    // 标签传播到不动点：每条记录取相连记录里最小的标签，再取自己标签那条记录的标签（跳跃，收敛更快）
     await con.run(`CREATE OR REPLACE TABLE ${LABELS} AS SELECT node, node AS label FROM ${NODES}`);
     for (;;) {
       await con.run(`CREATE OR REPLACE TABLE ${NEXT} AS
-        WITH shared AS (SELECT v.rule, v.value, min(l.label) AS label FROM ${VALUES} v JOIN ${LABELS} l USING (node) GROUP BY ALL),
-        near AS (SELECT v.node, min(s.label) AS label FROM ${VALUES} v JOIN shared s USING (rule, value) GROUP BY ALL)
+        WITH near AS (SELECT e.a AS node, min(l.label) AS label FROM ${EDGES} e JOIN ${LABELS} l ON l.node = e.b GROUP BY ALL)
         SELECT l.node, least(l.label, coalesce(n.label, l.label), j.label) AS label
         FROM ${LABELS} l LEFT JOIN near n USING (node) JOIN ${LABELS} j ON j.node = l.label`);
       const [{ changed }] = await rows<{ changed: string }>(con, `
@@ -91,6 +129,6 @@ export async function resolveIdentities(con: DuckDBConnection, rules: readonly s
       SELECT count(DISTINCT consumer_id) AS groups, count(*) AS records, (SELECT count(*) FROM ${DEVICE_OWNER}) AS devices FROM ${IDENTITIES}`);
     return { groups: Number(summary.groups), records: Number(summary.records), devices: Number(summary.devices) };
   } finally {
-    await con.run([NODES, VALUES, LABELS, NEXT].map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
+    await con.run([NODES, VALUES, WIDE, EDGES, LABELS, NEXT].map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
   }
 }

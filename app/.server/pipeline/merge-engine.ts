@@ -9,7 +9,7 @@
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
 import { entityOf } from '../../lib/canonical-model';
-import { resolveIdentities, type IdentitySummary } from './identity-engine';
+import { DEFAULT_RULES, resolveIdentities, type IdentitySummary } from './identity-engine';
 import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
 import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
 import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
@@ -315,10 +315,12 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
 /**
  * 按已发布的映射合并到标准层，每个映射各自一个事务：一个映射失败（表达式在数据上出错、值字典缺取值、去重键为空）
  * 只影响它自己，其他映射照常合并。之后本租户有 silver.customer 时整表重算身份打通（一次合并只带受影响的映射，增量会漏），
- * 失败同样只记在 identities 里。salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐
+ * 失败同样只记在 identities 里。rules 是租户全部 customer 映射汇总出的匹配规则（入队合并时算好，不只是这次带的映射）；
+ * salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐
  */
-export async function mergeToSilver(session: TenantLakeSession, plans: MergeMappingParam[], salt: string, redact: (message: string) => string)
-  : Promise<{ mappings: MergeRecord[]; identities?: IdentityRecord }> {
+export async function mergeToSilver(
+  session: TenantLakeSession, plans: MergeMappingParam[], salt: string, redact: (message: string) => string, rules: readonly string[] = DEFAULT_RULES,
+): Promise<{ mappings: MergeRecord[]; identities?: IdentityRecord }> {
   const { con } = session;
   // 早于敏感字段哈希的数据湖里，合并日志还没有 scheme 列：补上后老的日志为空，各映射下次合并时重建
   await con.run(`CREATE SCHEMA IF NOT EXISTS ${SILVER}; CREATE SCHEMA IF NOT EXISTS ${RECORDS};
@@ -344,7 +346,7 @@ export async function mergeToSilver(session: TenantLakeSession, plans: MergeMapp
   if (!await tableExists(con, SILVER, 'customer')) return { mappings: records };
   const startedAt = Date.now();
   try {
-    const summary = await resolveIdentities(con);
+    const summary = await resolveIdentities(con, rules);
     return { mappings: records, identities: { ...summary, durationMs: Date.now() - startedAt } };
   } catch (e) {
     return { mappings: records, identities: { durationMs: Date.now() - startedAt, error: redact((e as Error).message) } };

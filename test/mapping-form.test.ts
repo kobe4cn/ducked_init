@@ -5,7 +5,8 @@ import { parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
 import {
-  dictionaryRows, newExtension, readExtensions, readForm, seedDictionary, TRANSFORMS, unusedColumns, writeExtension, writeField,
+  dictionaryRows, identityCandidates, newExtension, readExtensions, readForm, readIdentity, seedDictionary, TRANSFORMS, unusedColumns, writeExtension,
+  writeField, writeIdentity,
   type FieldChoice, type FieldForm,
 } from '../app/lib/mapping-form';
 import { draftMapping } from '../app/.server/pipeline/mapping-draft';
@@ -387,5 +388,32 @@ describe('扩展字段', () => {
     expect(field(readForm(doc, CUSTOMER), 'name')).toMatchObject({ transform: 'direct', column: 'name', readonly: false });
     writeField(doc, CUSTOMER, 'name', { transform: 'text', column: 'name' });
     expect(doc.toJS().fields.name).toEqual({ expr: 'string(name)', sensitive: true });
+  });
+});
+
+describe('身份打通的匹配字段', () => {
+  const BASE = 'model: 1\nentity: customer\ntable: customers\nfields:\n  customer_id: string(id)\n  name: name\n  phone: mobile # 同义词\n  city: city\n'
+    + '  email:\nextensions:\n  x_wechat: { type: string, expr: wechat, sensitive: true }\n  x_age: { type: integer, expr: age }\n';
+
+  it('可选的是 YAML 里已映射的敏感字段：标准字段按实体顺序，之后是标成敏感的扩展字段', () => {
+    expect(identityCandidates(parseDocument(BASE), CUSTOMER)).toEqual(['name', 'phone', 'x_wechat']);
+  });
+
+  it('选字段并排序写成 identity.match，读回一致、通过校验；全部去掉时删掉 identity，其他行不动', () => {
+    const doc = parseDocument(BASE.replace('  email:\n', ''));
+    expect(readIdentity(doc)).toEqual({ match: [] });
+    writeIdentity(doc, ['x_wechat', 'phone']);
+    expect(doc.toString()).toContain('identity:\n  match: [ x_wechat, phone ]\n');
+    expect(readIdentity(parseDocument(doc.toString()))).toEqual({ match: ['x_wechat', 'phone'] });
+    const columns = ['id', 'name', 'mobile', 'city', 'wechat', 'age'].map(name => ({ name, type: 'VARCHAR' }));
+    expect(checkMapping(doc.toString(), () => columns)).toMatchObject({ ok: true, plan: { identity: { match: ['x_wechat', 'phone'] } } });
+    writeIdentity(doc, []);
+    expect(doc.toString()).toBe(BASE.replace('  email:\n', ''));
+  });
+
+  it('表单不认识的写法只读', () => {
+    expect(readIdentity(parseDocument('identity: [phone]\n'))).toMatchObject({ match: [], reason: expect.stringContaining('YAML') });
+    expect(readIdentity(parseDocument('identity:\n  match: phone\n'))).toMatchObject({ reason: expect.stringContaining('YAML') });
+    expect(() => writeIdentity(parseDocument('identity: [phone]\n'), ['phone'])).toThrow(/YAML/);
   });
 });

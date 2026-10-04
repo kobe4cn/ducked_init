@@ -3,8 +3,9 @@
 // 表单不认识的写法（非枚举字段的值字典或兜底值、解析不了的表达式、其他结构）只读、原样保留，到 YAML 里改。
 // 改了表达式时清掉该字段的行尾注释：草稿写在那里的依据（同名、单位、时区）对新写法不一定成立。
 // 扩展字段：列出还没被任何字段用到的源列，勾选即按列推断名字与类型加上（列名或格式像敏感信息的默认标成敏感）；已有的扩展字段可改名、类型、中文名
-// 与是否敏感，取消勾选即删除，值字典与兜底原样保留。标准字段是否敏感由标准模型决定，YAML 里照写的 sensitive 原样保留
-import { isMap, isScalar, isSeq, YAMLMap, type Document, type Scalar } from 'yaml';
+// 与是否敏感，取消勾选即删除，值字典与兜底原样保留。标准字段是否敏感由标准模型决定，YAML 里照写的 sensitive 原样保留。
+// 身份打通（只用于 customer）：从已映射的敏感字段里选匹配字段并排序，写成 identity.match，全部去掉时删掉 identity
+import { isMap, isScalar, isSeq, YAMLMap, YAMLSeq, type Document, type Scalar } from 'yaml';
 import { EXTENSION_PATTERN, FIELD_TYPE_NAMES, type CanonicalEntity, type CanonicalField, type FieldType } from './canonical-model';
 import { extensionName, standardValue } from './field-synonyms';
 import { ExprError, extensionSpec, lit, parseExpression, ref, referencedColumns, type Expr } from './mapping-expr';
@@ -468,4 +469,47 @@ export function writeExtension(doc: Document, name: string, choice: ExtensionCho
   else spec.delete('label');
   if (choice.sensitive) set('sensitive', true);
   else spec.delete('sensitive');
+}
+
+/**
+ * 身份打通可选的匹配字段：YAML 里已映射（有表达式）的敏感字段，标准字段按实体顺序，之后是标成敏感的扩展字段（按 YAML 里的顺序）
+ */
+export function identityCandidates(doc: Document, entity: CanonicalEntity): string[] {
+  const fields = doc.get('fields', true);
+  const mapped = (name: string) => {
+    const value = isMap(fields) ? fields.get(name, true) : undefined;
+    return value != null && !(isScalar(value) && value.value == null);
+  };
+  return [
+    ...entity.fields.filter(f => f.pii && mapped(f.name)).map(f => f.name),
+    ...readExtensions(doc).extensions.filter(e => e.sensitive).map(e => e.name),
+  ];
+}
+
+/** YAML 里身份打通的匹配字段（按优先级）；没写时为空，写法表单不认识时带原因（只读） */
+export function readIdentity(doc: Document): { match: string[]; reason?: string } {
+  const node = doc.get('identity', true);
+  if (node == null || (isScalar(node) && node.value == null)) return { match: [] };
+  const match = isMap(node) ? node.get('match', true) : undefined;
+  const keys = isMap(node) ? node.items.map(p => pairName(p.key)) : [];
+  if (!isSeq(match) || keys.some(k => k !== 'match') || !match.items.every(i => isScalar(i) && typeof i.value === 'string')) {
+    return { match: [], reason: 'identity 的写法表单不认识，请在 YAML 里修改' };
+  }
+  return { match: match.items.map(i => String((i as Scalar).value)) };
+}
+
+/** 把匹配字段（按优先级）写成 identity.match（行内列表），没有字段时删掉 identity。写法表单不认识时抛错 */
+export function writeIdentity(doc: Document, match: string[]): void {
+  const { reason } = readIdentity(doc);
+  if (reason) throw new Error(reason);
+  if (!match.length) {
+    doc.delete('identity');
+    return;
+  }
+  const seq = new YAMLSeq();
+  seq.flow = true;
+  seq.items.push(...match.map(m => doc.createNode(m)));
+  const identity = new YAMLMap();
+  setKey(doc, identity, 'match', seq);
+  doc.set('identity', identity);
 }

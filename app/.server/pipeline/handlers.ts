@@ -83,6 +83,14 @@ function mergeMappings(params: Params): MergeMappingParam[] {
   return mappings as MergeMappingParam[];
 }
 
+/** 合并参数里身份打通的匹配规则（入队时由全部 customer 映射汇总）；早先入队的合并没有这一项，用默认规则 */
+function identityMatch(params: Params) {
+  const rules = params.identity;
+  if (rules === undefined) return undefined;
+  if (!isStrings(rules)) throw new Error('参数 identity 必须是非空的字段名列表');
+  return rules;
+}
+
 function positiveInt(params: Params, key: string, max: number) {
   const v = params[key];
   if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > max) throw new Error(`参数 ${key} 必须是 1 到 ${max} 之间的整数`);
@@ -159,14 +167,14 @@ export const HANDLERS = {
       return { tables, differences: tables.filter(t => t.ok === false).length };
     },
   },
-  // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务，之后重算身份打通。
+  // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务，之后按参数里的匹配规则重算身份打通。
   // 有映射或打通失败时任务记为失败，结果里保留各映射的合并结果、打通摘要（组数、记录数与已归属设备数，不带哈希）与错误；
   // 源表还没同步进原始层的映射跳过，不算失败
   'silver.merge': {
     label: '合并到标准层',
     async run(_con, params, { session, piiSalt, redact }) {
       if (!piiSalt) throw new Error('缺少敏感信息盐');
-      const result = await mergeToSilver(session, mergeMappings(params), piiSalt, redact);
+      const result = await mergeToSilver(session, mergeMappings(params), piiSalt, redact, identityMatch(params));
       const failed = result.mappings.filter(m => 'error' in m);
       const problems = [
         ...(failed.length ? [`${failed.length} 个映射合并失败：${failed.map(m => `${m.entity} ← ${m.table}（${'error' in m ? m.error : ''}）`).join('；')}`] : []),

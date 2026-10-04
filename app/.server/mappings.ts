@@ -7,6 +7,7 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, members, ROLES, sources, tasks, tenants, type TaskStatus } from './db/schema';
+import { identityRules } from './pipeline/identity-engine';
 import type { MergeMappingParam, MergeRecord } from './pipeline/merge-engine';
 import { draftMapping } from './pipeline/mapping-draft';
 import { checkMapping, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
@@ -205,6 +206,22 @@ async function assertExtensionTypes(tx: Tx, tenantId: string, plan: MergePlan) {
   }
 }
 
+/** 映射在报错里的叫法 */
+const mappingName = (p: { table: string; entity: string }) => `${p.table} → ${p.entity}`;
+
+/**
+ * 身份打通的匹配规则在全部 customer 映射里必须一致：与其他映射已发布的规则（本映射之前发布的版本不算）不一致时拒绝。
+ * 要改规则，先把其他映射的规则去掉或改成一样
+ */
+async function assertIdentityRules(tx: Tx, tenantId: string, mappingId: string, plan: MergePlan) {
+  const others = (await publishedPlans(tx, tenantId)).filter(o => o.mapping !== mappingId);
+  try {
+    identityRules([...others, { ...plan, mapping: mappingId }], mappingName);
+  } catch (e) {
+    throw new MappingError((e as Error).message);
+  }
+}
+
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。发布前对照数据源当前的字段再校验一次。
  * 发布后版本锁定，并为这个映射入队一次合并（已有合并在排队时补进那个合并，在运行时由调度器在它之后补上）
@@ -229,6 +246,7 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
       throw new MappingError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
     }
     await assertExtensionTypes(tx, actor.tenant.id, plan);
+    await assertIdentityRules(tx, actor.tenant.id, mappingId, plan);
     await tx.update(mappingVersions)
       .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: sql`now()` })
       .where(eq(mappingVersions.id, draft.id));
@@ -305,19 +323,20 @@ const ofMerge = (tenantId: string) => and(eq(tasks.tenantId, tenantId), eq(tasks
  * 在调用方的事务里为给定映射（不给时为全部已发布映射）的最新已发布版本入队一次合并，返回带上它们的合并任务。
  * 锁住租户行后检查：同一租户同时只有一个合并在排队或运行（两个合并同时写同一张标准层表会冲突）。
  * 已有合并在排队时把映射补进去（同一映射换成最新版本）；已在运行（或补的时候刚被领取）时不入队，返回 null，由定时检查在它之后补上。
- * 给定的映射都没有已发布版本时也不入队
+ * 给定的映射都没有已发布版本时也不入队。参数里另带身份打通的匹配规则，由全部已发布的 customer 映射汇总（合并后整表重算打通，不只看这次的映射）
  */
 export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string[]) {
   await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
   const plans = await publishedPlans(tx, tenantId, mappingIds);
   if (!plans.length) return null;
   const [pending] = await tx.select().from(tasks).where(and(ofMerge(tenantId), inArray(tasks.status, ['queued', 'running']))).limit(1);
-  if (!pending) return insertTask(tx, tenantId, 'silver.merge', { mappings: plans });
+  const identity = identityRules(mappingIds ? await publishedPlans(tx, tenantId) : plans, mappingName);
+  if (!pending) return insertTask(tx, tenantId, 'silver.merge', { mappings: plans, identity });
   if (pending.status !== 'queued') return null;
   const queued = (pending.params.mappings ?? []) as MergeMappingParam[];
   const merged = [...queued.filter(q => !plans.some(p => p.mapping === q.mapping)), ...plans].sort((a, b) => a.mapping.localeCompare(b.mapping));
   // 领取合并不锁租户行：只在它仍在排队时改参数
-  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged } })
+  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, identity } })
     .where(and(eq(tasks.id, pending.id), eq(tasks.status, 'queued'))).returning();
   return task ?? null;
 }

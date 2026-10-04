@@ -2,15 +2,17 @@
 // silver._identities 里每条 (_source, customer_id) 对应一个统一消费者，silver._device_owner 里每台登录过的设备归属到
 // 最近一次登录的统一消费者，任务结果带打通摘要，表里没有明文
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb } from '../../app/.server/db/client';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { mergeNow } from '../../app/.server/mappings';
+import { mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { syncSource } from '../../app/.server/source-sync';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, publish, silver } from './fixtures';
-import { seedIdentitySources } from './source-fixtures';
+import { grantOnSource, seedIdentitySources } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -103,11 +105,19 @@ async function published() {
   const author = await memberOf(acme, 'de@acme.com');
   const reviewer = await memberOf(acme, 'de2@acme.com');
   const { crm, loyalty, tracking } = await seedIdentitySources(author);
-  await publish(author, reviewer, crm, CRM);
-  await publish(author, reviewer, loyalty, LOYALTY);
-  await publish(author, reviewer, tracking, TRACKING_USERS);
+  const mappings = {
+    crm: await publish(author, reviewer, crm, CRM),
+    loyalty: await publish(author, reviewer, loyalty, LOYALTY),
+    tracking: await publish(author, reviewer, tracking, TRACKING_USERS),
+  };
   await publish(author, reviewer, tracking, TRACKING_EVENTS);
-  return { acme, author, names: { [crm]: 'crm', [loyalty]: 'loyalty', [tracking]: 'tracking' } };
+  return { acme, author, reviewer, sources: { crm, loyalty, tracking }, mappings, names: { [crm]: 'crm', [loyalty]: 'loyalty', [tracking]: 'tracking' } };
+}
+
+/** 给映射存一版新草稿并由另一位成员发布，跑空调度器（合并与打通完成） */
+async function republish(author: CurrentMember, reviewer: CurrentMember, mappingId: string, yaml: string) {
+  await publishMapping(reviewer, mappingId, await saveDraft(author, mappingId, yaml));
+  await drain();
 }
 
 describe('身份打通：多源消费者确定性合并', () => {
@@ -165,5 +175,54 @@ describe('身份打通：多源消费者确定性合并', () => {
     const after = await identities(acme);
     expect(after.rows).toEqual(before.rows);
     expect(after.devices).toEqual(before.devices);
+  });
+});
+
+describe('身份打通：可配置匹配字段与优先级', () => {
+  it('在 customer 映射里去掉邮箱、重新发布后按新规则重算：只靠邮箱相连的记录分开', async () => {
+    const { acme, author, reviewer, mappings, names } = await published();
+    await republish(author, reviewer, mappings.crm, `${CRM}identity:\n  match: [phone, external_id]\n`);
+    const { rows } = await identities(acme);
+    expect(groupsOf(rows, names)).toEqual([
+      ['crm:1', 'loyalty:1', 'tracking:u1'],
+      ['crm:2', 'loyalty:2'],
+      ['crm:3'],
+      ['crm:4'],
+      ['crm:5', 'loyalty:5'],
+      ['crm:6'],
+      ['crm:7', 'loyalty:6'],
+      ['loyalty:3'],
+      ['loyalty:4'],
+      ['tracking:u2'],
+      ['tracking:u9'],
+    ]);
+    const [merge] = (await listTasks(acme)).filter(t => t.kind === 'silver.merge');
+    expect(merge.params.identity).toEqual(['phone', 'external_id']);
+  });
+
+  it('更高优先级的字段双方都有值且不同时，不按更低优先级的字段合并', async () => {
+    const { acme, author, reviewer, sources, mappings, names } = await published();
+    // 同一个手机号、不同的邮箱
+    await grantOnSource(`INSERT INTO crm.customers VALUES (8, '吴十', '13600000008', 'wu@crm.test', NULL, '2024-06-02');
+      INSERT INTO loyalty.members VALUES (7, '吴十', '136 0000 0008', 'wu10@loyalty.test', NULL, '2024-06-02');`);
+    for (const id of [sources.crm, sources.loyalty]) await syncSource(author, id);
+    await drain();
+    const together = (rows: Identity[]) => groupsOf(rows, names).find(g => g.includes('crm:8'));
+    // 默认规则里手机号优先：合并
+    expect(together((await identities(acme)).rows)).toEqual(['crm:8', 'loyalty:7']);
+
+    // 邮箱优先于手机号：邮箱冲突，不再按手机号合并；其余记录照旧
+    await republish(author, reviewer, mappings.crm, `${CRM}identity:\n  match: [email, phone, external_id]\n`);
+    const { rows } = await identities(acme);
+    expect(together(rows)).toEqual(['crm:8']);
+    expect(groupsOf(rows, names).find(g => g.includes('crm:5'))).toEqual(['crm:5', 'crm:6', 'loyalty:5']);
+  });
+
+  it('两个 customer 映射配置的规则不一致时发布被拒绝；规则一致或另一个没配置时可以发布', async () => {
+    const { author, reviewer, mappings } = await published();
+    await republish(author, reviewer, mappings.crm, `${CRM}identity:\n  match: [phone, email]\n`);
+    const draft = await saveDraft(author, mappings.loyalty, `${LOYALTY}identity:\n  match: [email, phone]\n`);
+    await expect(publishMapping(reviewer, mappings.loyalty, draft)).rejects.toThrow(/匹配规则不一致.*customers → customer（phone > email）.*members → customer（email > phone）/);
+    await republish(author, reviewer, mappings.loyalty, `${LOYALTY}identity:\n  match: [phone, email]\n`);
   });
 });

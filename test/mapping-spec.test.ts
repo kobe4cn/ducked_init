@@ -165,6 +165,38 @@ describe('敏感字段', () => {
   });
 });
 
+describe('身份打通的匹配规则', () => {
+  const CUSTOMERS = (table: string) => (table === 'customers'
+    ? ['id', 'mobile', 'mail', 'wechat', 'city'].map(name => ({ name, type: name === 'id' ? 'BIGINT' : 'VARCHAR' }))
+    : `数据源中没有表 ${table}`);
+  const BASE = 'model: 1\nentity: customer\ntable: customers\nfields:\n  customer_id: string(id)\n  phone: mobile\n  email: mail\n  city: city\n'
+    + 'extensions:\n  x_wechat: { type: string, expr: wechat, sensitive: true }\n';
+
+  it('匹配字段按顺序是优先级，带进合并计划；没写时计划里没有', () => {
+    const r = checkMapping(`${BASE}identity:\n  match: [email, x_wechat, phone]\n`, CUSTOMERS);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.plan.identity).toEqual({ match: ['email', 'x_wechat', 'phone'] });
+    const plain = checkMapping(BASE, CUSTOMERS);
+    expect(plain.ok && plain.plan.identity).toBeUndefined();
+  });
+
+  it('只能选本映射映射出来的敏感字段，不能重复，至少一个', () => {
+    expect(issuesWith(`${BASE}identity:\n  match: [phone, external_id, city]\n`, CUSTOMERS)).toEqual([
+      expect.objectContaining({ path: 'identity.match.1', message: expect.stringContaining('没有映射') }),
+      expect.objectContaining({ path: 'identity.match.2', message: expect.stringContaining('不是敏感字段') }),
+    ]);
+    expect(issuesWith(`${BASE}identity:\n  match: [phone, phone]\n`, CUSTOMERS)).toEqual([expect.objectContaining({ path: 'identity.match', message: '不能有重复项' })]);
+    expect(issuesWith(`${BASE}identity:\n  match: []\n`, CUSTOMERS)).toEqual([expect.objectContaining({ path: 'identity.match', message: '不能为空' })]);
+  });
+
+  it('只有消费者（customer）映射能配置匹配规则', () => {
+    expect(issues(`${ok}identity:\n  match: [customer_id]\n`)).toEqual([
+      expect.objectContaining({ path: 'identity', message: expect.stringContaining('customer') }),
+    ]);
+  });
+});
+
 describe('映射报错给出改法', () => {
   const withFields = (lines: string) => ok.replace(/  amount: .*\n  created_at: .*\n/, lines);
 

@@ -1,7 +1,7 @@
 // app/.server/pipeline/mapping-spec.ts —— 映射文档（YAML）：一张源表 → 一个标准实体（或自定义实体）。
 // 先按 JSON Schema（MAPPING_SCHEMA）校验结构，再对照标准模型与源表的字段做语义校验：字段表达式只能用白名单函数、只能引用源表里有的字段，
-// 值字典与兜底值只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段；扩展字段可标成敏感（只能是文本），内置敏感字段不能取消敏感标记。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
-// 校验通过后得到合并计划（MergePlan）：标准层的列、每列的表达式与值字典、去重键与取最新字段，交给工作进程编译执行（ADR-0015）
+// 值字典与兜底值只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段，身份打通的匹配字段（只用于 customer）必须是映射出来的敏感字段；扩展字段可标成敏感（只能是文本），内置敏感字段不能取消敏感标记。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
+// 校验通过后得到合并计划（MergePlan）：标准层的列、每列的表达式与值字典、去重键与取最新字段、身份打通的匹配规则，交给工作进程编译执行（ADR-0015）
 import { Ajv, type ErrorObject } from 'ajv';
 import { Document, isMap, isScalar, isSeq, LineCounter, parseDocument, type Node, type YAMLMap } from 'yaml';
 import {
@@ -26,7 +26,12 @@ export interface MappingSpec {
   extensions?: Record<string, { type: FieldType; expr: string; label?: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean }>;
   /** 去重键与取最新规则：同一去重键的多行只留一行，取最新字段最大的那行。不写时按实体主键去重 */
   dedupe?: { key: string[]; latest?: string };
+  /** 身份打通的匹配字段（只用于 customer）：本映射映射出来的敏感字段，数组顺序即优先级。不写时用平台默认规则 */
+  identity?: IdentityRules;
 }
+
+/** 身份打通的匹配规则：按优先级排列的匹配字段 */
+export interface IdentityRules { match: string[] }
 
 const fieldSpec = {
   type: ['string', 'object'],
@@ -80,6 +85,14 @@ export const MAPPING_SCHEMA = {
         latest: { type: 'string', minLength: 1 },
       },
     },
+    identity: {
+      type: 'object',
+      required: ['match'],
+      additionalProperties: false,
+      properties: {
+        match: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 } },
+      },
+    },
   },
 } as const;
 
@@ -112,6 +125,8 @@ export interface MergePlan {
   key: string[];
   /** 取最新字段：同一去重键取它最大的一行；为空时取最近同步到的一行 */
   latest: string | null;
+  /** 身份打通的匹配规则（只有配置了的 customer 映射才有） */
+  identity?: IdentityRules;
 }
 
 export type MappingCheck = { ok: true; spec: MappingSpec; plan: MergePlan } | { ok: false; issues: MappingIssue[] };
@@ -460,6 +475,17 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
     else if (c.type === 'string' || c.type === 'boolean') issue(['dedupe', 'latest'], `取最新字段 ${latest} 应为时间、日期或数字`);
   }
 
+  // 身份打通的匹配字段：只用于 customer，必须是映射出来的敏感字段（标准层里是可比对的哈希）
+  if (spec.identity && spec.entity !== 'customer') {
+    issue(['identity'], '只有消费者（customer）映射能配置身份打通的匹配规则', { atKey: true });
+  } else {
+    spec.identity?.match.forEach((name, i) => {
+      const c = mapped.get(name);
+      if (!c) issue(['identity', 'match', i], `匹配字段 ${name} 没有映射：只能选本映射映射出来的敏感字段`);
+      else if (!c.sensitive) issue(['identity', 'match', i], `匹配字段 ${name} 不是敏感字段：只能按敏感字段的哈希匹配`);
+    });
+  }
+
   if (issues.length) return { ok: false, issues: issues.sort(ISSUE_ORDER) };
   const extensions = Object.entries(spec.extensions ?? {}).map(([name, e]) => ({ name, type: e.type }));
   return {
@@ -472,6 +498,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
       entityColumns: [...(entity?.fields.map(f => ({ name: f.name, type: f.type })) ?? []), ...extensions],
       key,
       latest,
+      ...(spec.identity && { identity: { match: [...spec.identity.match] } }),
     },
   };
 }

@@ -3,14 +3,15 @@
 // 表单不存数据，每次修改都由 writeField 写回同一份 YAML（ADR-0017）；表单不认识的写法只读显示原表达式。
 // 选到一半（还没选源列、表达式写不完整）时只留在这一行，不写进 YAML；还没对应的源值只显示（标黄），不写进值字典。
 // 内置敏感字段带「敏感」徽标，不能取消。标准字段之后是扩展字段：已有的可改名、类型、中文名与是否敏感（敏感的只能是文本），取消勾选即删除；
-// 下面列出还没用到的源列，勾选即加为扩展字段（名称或格式像敏感信息的默认标成敏感）
+// 下面列出还没用到的源列，勾选即加为扩展字段（名称或格式像敏感信息的默认标成敏感）。
+// 消费者（customer）映射最后是「身份打通」：从已映射的敏感字段里勾选匹配字段并排序（越靠前优先级越高），不选时用平台默认规则
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
-import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, type CanonicalField, type FieldType } from '~/lib/canonical-model';
+import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, type CanonicalEntity, type CanonicalField, type FieldType } from '~/lib/canonical-model';
 import { parseExpression } from '~/lib/mapping-expr';
 import {
-  dictionaryRows, expressionOf, extensionNameProblem, newExtension, readExtensions, readForm, seedDictionary, TRANSFORMS, unusedColumns,
-  writeExtension, writeField, writtenDictionary,
+  dictionaryRows, expressionOf, extensionNameProblem, identityCandidates, newExtension, readExtensions, readForm, readIdentity, seedDictionary,
+  TRANSFORMS, unusedColumns, writeExtension, writeField, writeIdentity, writtenDictionary,
   type DictionaryEntry, type ExtensionChoice, type ExtensionForm, type FieldChoice, type FieldForm, type Part, type TransformId,
 } from '~/lib/mapping-form';
 import type { ReferenceColumn, ReferenceFunction, ReferenceTable } from '~/components/mapping-reference';
@@ -73,6 +74,11 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
     writeExtension(next, name, choice);
     onChange(next.toString());
   };
+  const writeMatch = (match: string[]) => {
+    const next = parseDocument(yaml);
+    writeIdentity(next, match);
+    onChange(next.toString());
+  };
   return (
     <div className="max-h-[48rem] divide-y overflow-y-auto rounded-lg border text-sm">
       {readForm(doc, target).map(form => (
@@ -89,6 +95,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
         />
       ))}
       <Extensions doc={doc} table={table} onWrite={writeExt} onEditYaml={onEditYaml} />
+      {target.name === 'customer' && <Identity doc={doc} entity={target} onWrite={writeMatch} onEditYaml={onEditYaml} />}
     </div>
   );
 }
@@ -364,6 +371,58 @@ function ExtensionRow({ form, others, onWrite, onEditYaml }: {
         </div>
       )}
       {!form.readonly && problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
+    </div>
+  );
+}
+
+/** 身份打通的匹配字段：勾选已映射的敏感字段，选中的按优先级排列、可上下移动；YAML 里有但已不可选的字段标出，只能去掉 */
+function Identity({ doc, entity, onWrite, onEditYaml }: {
+  doc: ReturnType<typeof parseDocument>;
+  entity: CanonicalEntity;
+  onWrite: (match: string[]) => void;
+  onEditYaml: () => void;
+}) {
+  const { match, reason } = readIdentity(doc);
+  const candidates = identityCandidates(doc, entity);
+  const move = (i: number, by: number) => {
+    const next = [...match];
+    [next[i], next[i + by]] = [next[i + by], next[i]];
+    onWrite(next);
+  };
+  return (
+    <div data-form-identity className="space-y-2 p-3">
+      <div className="flex flex-wrap items-baseline gap-x-2">
+        <span className="font-medium">身份打通</span>
+        <span className="text-xs text-muted-foreground">
+          按哪些敏感字段的哈希判断是同一个人，越靠前优先级越高：更高优先级的字段双方都有值且不同时，不按后面的字段合并。不选时用默认规则（手机号、邮箱、外部 ID）
+        </span>
+      </div>
+      {reason ? (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span>{reason}</span>
+          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>到 YAML 修改</Button>
+        </div>
+      ) : (
+        <>
+          {match.map((name, i) => (
+            <div key={name} data-identity-match={name} className="flex items-center gap-2 text-xs">
+              <input type="checkbox" checked aria-label={`不按 ${name} 匹配`} onChange={() => onWrite(match.filter(m => m !== name))} />
+              <span className="w-6 text-muted-foreground">{i + 1}</span>
+              <span className="font-mono">{name}</span>
+              {!candidates.includes(name) && <span className="text-destructive">没有映射或不是敏感字段，请去掉</span>}
+              <Button type="button" size="xs" variant="ghost" aria-label={`${name} 提前`} disabled={i === 0} onClick={() => move(i, -1)}>↑</Button>
+              <Button type="button" size="xs" variant="ghost" aria-label={`${name} 推后`} disabled={i === match.length - 1} onClick={() => move(i, 1)}>↓</Button>
+            </div>
+          ))}
+          {candidates.filter(c => !match.includes(c)).map(name => (
+            <label key={name} data-identity-candidate={name} className="flex items-center gap-2 text-xs">
+              <input type="checkbox" checked={false} onChange={() => onWrite([...match, name])} />
+              <span className="font-mono">{name}</span>
+            </label>
+          ))}
+          {!candidates.length && !match.length && <div className="text-xs text-muted-foreground">还没有映射敏感字段，映射手机号、邮箱等之后才能选</div>}
+        </>
+      )}
     </div>
   );
 }
