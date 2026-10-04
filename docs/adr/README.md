@@ -7,7 +7,7 @@
 | [0001](0001-tenant-physical-isolation.md) | 租户在存储层物理隔离：独立存储前缀与 DuckLake catalog，每个计算任务独立 DuckDB 进程 | 任何跨租户、任务进程、数据湖挂载 |
 | [0002](0002-ducklake-single-landing-zone.md) | 业务数据只落 DuckLake；DuckDB 只做用完即弃的计算；平台 PG 只存元数据 | 决定数据存哪里、新增持久化 |
 | [0003](0003-llm-design-time-only.md) | 大语言模型只在设计时产出声明式草稿，经 Schema 校验与确定性编译后发布，运行时不调用 | 映射 / 指标 / 标签草稿、LLM 相关功能 |
-| [0004](0004-own-dsl-and-templates-not-dbt.md) | 指标与标签用平台自有 YAML DSL 与分析模板编译成 SQL，不用 dbt | 指标、标签、分析模板、`src/` 与 `dbt/` |
+| [0004](0004-own-dsl-and-templates-not-dbt.md) | 指标与标签用平台自有 YAML DSL 与分析模板编译成 SQL，不用 dbt | 指标、标签、分析模板、模板定义、`src/` 与 `dbt/` |
 | [0005](0005-pii-hashed-from-silver.md) | 敏感信息从标准层起只存加盐哈希，明文仅加密留在原始层 | 标准层字段、身份打通、敏感字段、解密审计 |
 | [0006](0006-bronze-as-change-batch-log.md) | 原始层统一存为变更批次（`_op`/`_commit_ts`/`_batch`），标准层只通过 MERGE 消费 | 原始层表格式、任何同步方式、标准层合并 |
 | [0007](0007-operator-console-separate-identity.md) | 运营后台用独立的运营者身份（`operators`、`/ops/login`、Magic Link + TOTP），只管租户元数据 | `/ops` 路由、运营者认证、租户开通 / 配额 |
@@ -24,3 +24,4 @@
 | [0018](0018-points-consent-coupon-canonical-entities.md) | 积分流水、营销同意、兴趣偏好、优惠券、券模板升格为标准实体（字段、主键、枚举见正文）；同一大版本内新增实体、字段、枚举取值算兼容，小版本随每次新增加一；用自定义实体承载过这些数据的租户新建映射迁移 | 标准模型、新增标准实体或字段、`MODEL_VERSION`、积分 / 同意 / 偏好 / 优惠券的映射 |
 | [0019](0019-custom-entity-registration-and-relations.md) | 标准模型只收平台模板要用的实体，其余登记为自定义实体；实体间用通用关系（终点为主键、跨映射唯一）连接，指标、标签与模板用维度路径在计算时关联，不读原始层 | 自定义实体、实体登记、关系、维度路径、指标 / 标签 / 模板的维度、是否新增标准实体、身份打通与 `silver._identities`、设备归属 `silver._device_owner` |
 | [0020](0020-ducklake-whole-lake-encryption.md) | 租户数据湖建 catalog 时开启 DuckLake 整湖加密（一个文件一个密钥，密钥存在租户 catalog，防对象存储泄露）；已有的未加密湖不迁移；删除请求按 DELETE → 重写数据文件 → 过期快照 → 清理旧文件擦除；结果快照过期删表后同样过期 DuckLake 快照并清理旧文件（清空整湖时间旅行） | 数据湖挂载与初始化、直接读湖里的 parquet 文件、核对文件、删除请求、结果快照过期、依赖 DuckLake 时间旅行或旧版本、湖迁移 |
+| [0021](0021-template-definitions.md) | 模板参数存成租户的模板定义（每个租户每个模板一份，第一次保存草稿时建立，没有已发布版本时用注册表默认参数），按映射的规则双人发布；起草和丢弃用 `definitions:draft`；定义不含运行参数（`asOf`），发布后以 UTC 当天为 `asOf` 入队一次模板任务，快照记下定义版本；发布只锁定义行 | 模板定义、模板参数、`template_definitions` / `template_versions`、模板任务入队、快照的 `definition_version`、`publish-rules.ts`、`definitions:draft` 权限 |

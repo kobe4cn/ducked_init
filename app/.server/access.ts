@@ -6,8 +6,8 @@ import { ROLE_LABELS, ROLES, type Role } from './db/schema';
 export const PERMISSIONS = {
   'sources:read': '查看数据源与映射',
   'sources:write': '登记与修改数据源、映射',
-  'definitions:read': '查看指标与标签定义',
-  'definitions:draft': '起草指标与标签定义',
+  'definitions:read': '查看指标、标签与模板定义',
+  'definitions:draft': '起草指标、标签与模板定义',
   'definitions:write': '修改与删除指标、标签定义',
   publish: '发布映射与定义',
   sandbox: '使用个人沙箱',

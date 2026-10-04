@@ -1,0 +1,21 @@
+# 模板参数存成租户的模板定义，带版本，按映射的规则双人发布
+
+分析模板（RFM 等）是平台内置的（ADR-0004），每个模板在注册表（`app/.server/pipeline/templates/index.ts`）里带一套默认参数。租户要调参数（如 RFM 的分档边界），调过的参数会决定结果快照里每个消费者落在哪个人群，和映射一样会影响下游，不能一个人改完就生效。CONTEXT.md 原来写的是「成员填参数即得到一份指标或标签定义」，但指标 DSL 还没做，#88 先把模板参数单独存成模板定义。
+
+**一个租户一个模板一份。** 定义存在 `template_definitions`，`(tenant_id, template)` 唯一；参数存在它的版本 `template_versions`（`params`）里。定义行在第一次保存草稿时建立（`saveDraft` 用 `onConflictDoNothing`），不预先建。没有已发布版本时，模板页显示的生效参数是注册表里的默认参数（`getTemplate`：`published?.params ?? TEMPLATES[t].defaults`）；任务参数里没写的项也由模板解析时补上默认值（如 `parseRfmParams`）。平台不会在没有已发布版本时自动入队模板任务。从没发布过的定义丢弃草稿时，整个定义行连同版本一起删掉，之后又回到默认参数。
+
+**双人发布，规则同映射。** 每个定义同时只有一份草稿（部分唯一索引 `template_versions_one_draft_uq`），改过草稿的成员记为作者（`authors`），另记最后保存草稿的成员（`last_editor`）。发布需要 `publish` 权限，且发布者不能是最后保存草稿的人（ADR-0015）。映射和模板共用同一个判断 `publishBlocker`（`app/.server/publish-rules.ts`），两边的规则不会各改各的。发布后版本锁定，再改就是新的一版草稿。
+
+**起草和丢弃用 `definitions:draft`，不是 `sources:write`。** 映射的起草和丢弃要 `sources:write`（ADR-0015），只有管理员、数据工程师有。模板定义和指标、标签定义一样属于分析，起草和丢弃复用 `definitions:draft`，所以分析师也能起草、丢弃，但不能发布（分析师没有 `publish`）。
+
+**定义里不含运行参数。** 定义只存长期不变的参数，不存每次运行时给定的参数（如 RFM 的 `asOf`）。发布后在同一个事务里以当天（UTC）为 `asOf` 入队一次模板任务，任务参数是定义的参数加上 `asOf` 和 `definitionVersion`。任务 handler 先剥掉 `definitionVersion` 再按模板解析参数；快照登记时把它记进 `snapshots.definition_version`，看快照就知道是按哪一版定义算的。直接给参数入队、不带 `definitionVersion` 的任务也照样能跑，这时快照的 `definition_version` 为空。
+
+**发布只锁定义行。** 发布映射先锁租户行，再锁映射行：入队合并时会把要合并的映射并进排队中的合并任务，发布要与入队合并、定时检查互斥。模板任务不合并进排队中的任务，没有要互斥的入队检查，所以发布模板只锁定义行（`for update`），与保存草稿、丢弃互斥，保证发布的正是检查过的那份草稿；锁到以后再核对一次草稿没被改过（`isStale`）。
+
+## 已接受的取舍
+
+- 分析师能起草和丢弃模板定义，和映射的起草权限不一致：模板参数属于分析，发布仍要有 `publish` 的另一个人看过。
+- 丢弃从没发布过的定义会删掉定义行，草稿的审计记录留着，但定义的 ID 换了。
+- 发布时的 `asOf` 取 UTC 当天，不按租户时区。
+- 不带 `definitionVersion` 的任务产出的快照，看不出参数来自哪一版定义，只能看快照里存的参数。
+- 指标 DSL 做出来以后，模板是否改为生成指标或标签定义另行决定；本决定只管模板自己的参数。
