@@ -1,5 +1,5 @@
 // test/pipeline/source-fixtures.ts —— 数据源夹具：本地 PostgreSQL 上的源库（与 src/01_seed.ts 一样用 hash 确定性造数），
-// 一个只读账号与一个对订单表可写的账号；放在租户源文件目录下的 DuckDB 文件；以及身份打通用的两个已登记并同步完的数据源
+// 一个只读账号与一个对订单表可写的账号；放在租户源文件目录下的 DuckDB 文件；以及身份打通用的三个已登记并同步完的数据源
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DuckDBInstance } from '@duckdb/node-api';
@@ -104,19 +104,23 @@ export async function pgSourceInput(account: { user: string; password: string },
 }
 
 /**
- * 身份打通用的两个数据源（重建源库后在其中建 crm、loyalty 两个 schema），登记、选表、确认水位线并同步一次，返回两个数据源的 ID。
+ * 身份打通用的三个数据源（重建源库后在其中建 crm、loyalty、tracking 三个 schema），登记、选表、确认水位线并同步一次，返回三个数据源的 ID。
  * 两边的 ID 都从 1 编起（同一个 customer_id 在两个源里是不同的人），同一个人的写法不同：
  * - crm 1 ↔ loyalty 1：手机号 +86 带空格 / 带横线；crm 2 ↔ loyalty 2：0086 前缀
  * - crm 3 ↔ loyalty 3：只有邮箱相同（大小写与首尾空格不同）
  * - crm 4、loyalty 4：手机号与邮箱都是空串或空白，不与任何人合并
  * - crm 5 ↔ loyalty 5 手机号相同，loyalty 5 ↔ crm 6 邮箱相同：三条记录成一条链
  * - crm 7 ↔ loyalty 6：只有外部 ID（unionid）相同
+ * 埋点源 tracking 自带用户表 users（映射为 customer，与 CRM 重叠）与事件表 events：
+ * - 用户 u1 ↔ crm 1 手机号相同，u2 ↔ loyalty 2 邮箱相同，u9 是只在埋点里出现的人
+ * - 设备 d1：u1 先登录、u2 后登录，另有匿名事件，归属 u2；d2：u9 与 u1 同一时刻登录（并列），另有匿名事件
+ * - 设备 d3 只有匿名事件、d4 只有已登录的浏览（没有 login），都不归属任何人
  */
 export async function seedIdentitySources(member: CurrentMember) {
   const input = await pgSourceInput(READER);
   await grantOnSource(`
-    DROP SCHEMA IF EXISTS crm CASCADE; DROP SCHEMA IF EXISTS loyalty CASCADE;
-    CREATE SCHEMA crm; CREATE SCHEMA loyalty;
+    DROP SCHEMA IF EXISTS crm CASCADE; DROP SCHEMA IF EXISTS loyalty CASCADE; DROP SCHEMA IF EXISTS tracking CASCADE;
+    CREATE SCHEMA crm; CREATE SCHEMA loyalty; CREATE SCHEMA tracking;
     CREATE TABLE crm.customers (id int PRIMARY KEY, name text, mobile text, email text, unionid text, updated_at timestamp NOT NULL);
     INSERT INTO crm.customers VALUES
       (1, '张三', '+86 138 0000 0001', 'zhang@crm.test', NULL, '2024-06-01'),
@@ -134,21 +138,38 @@ export async function seedIdentitySources(member: CurrentMember) {
       (4, '周九', '   ', ' ', NULL, '2024-06-01'),
       (5, '钱七', '139 0000 0005', 'QIAN7@example.com', NULL, '2024-06-01'),
       (6, '孙八', NULL, NULL, ' wx_union_8 ', '2024-06-01');
-    GRANT USAGE ON SCHEMA crm, loyalty TO ${READER.user};
-    GRANT SELECT ON ALL TABLES IN SCHEMA crm, loyalty TO ${READER.user};`);
+    CREATE TABLE tracking.users (user_id text PRIMARY KEY, phone text, email text, updated_at timestamp NOT NULL);
+    INSERT INTO tracking.users VALUES
+      ('u1', '13800000001', NULL, '2024-06-01'),
+      ('u2', NULL, 'LI4@loyalty.test', '2024-06-01'),
+      ('u9', '13700000009', NULL, '2024-06-01');
+    CREATE TABLE tracking.events (event_id text PRIMARY KEY, user_id text, device_id text, event_type text, ts timestamp NOT NULL, updated_at timestamp NOT NULL DEFAULT '2024-06-04');
+    INSERT INTO tracking.events (event_id, user_id, device_id, event_type, ts) VALUES
+      ('e1', 'u1', 'd1', 'login', '2024-06-01 10:00'),
+      ('e2', NULL, 'd1', 'view', '2024-06-01 11:00'),
+      ('e3', 'u2', 'd1', 'login', '2024-06-02 10:00'),
+      ('e4', NULL, 'd1', 'add_to_cart', '2024-06-02 11:00'),
+      ('e5', 'u9', 'd2', 'login', '2024-06-03 09:00'),
+      ('e6', 'u1', 'd2', 'login', '2024-06-03 09:00'),
+      ('e7', NULL, 'd2', 'view', '2024-06-03 10:00'),
+      ('e8', NULL, 'd3', 'view', '2024-06-03 10:00'),
+      ('e9', 'u1', 'd4', 'view', '2024-06-03 10:00');
+    GRANT USAGE ON SCHEMA crm, loyalty, tracking TO ${READER.user};
+    GRANT SELECT ON ALL TABLES IN SCHEMA crm, loyalty, tracking TO ${READER.user};`);
   const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
   const ids: string[] = [];
-  for (const [name, schema, table] of [['CRM', 'crm', 'customers'], ['会员', 'loyalty', 'members']]) {
+  const sources: [string, string, string[]][] = [['CRM', 'crm', ['customers']], ['会员', 'loyalty', ['members']], ['埋点', 'tracking', ['users', 'events']]];
+  for (const [name, schema, tables] of sources) {
     const { id } = await registerSource(member, { ...input, name, schema });
     await drain();
-    await setSyncScope(member, id, { add: [table] });
+    await setSyncScope(member, id, { add: tables });
     await drain();
-    await confirmWatermark(member, id, table, 'updated_at');
+    for (const table of tables) await confirmWatermark(member, id, table, 'updated_at');
     await syncSource(member, id);
     await drain();
     ids.push(id);
   }
-  return { crm: ids[0], loyalty: ids[1] };
+  return { crm: ids[0], loyalty: ids[1], tracking: ids[2] };
 }
 
 /** 在租户的源文件目录下（PLATFORM_SOURCE_FILES_DIR/<租户 ID>/）生成一个 DuckDB 文件，返回其路径 */
