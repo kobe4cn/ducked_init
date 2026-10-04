@@ -159,18 +159,21 @@ export const HANDLERS = {
       return { tables, differences: tables.filter(t => t.ok === false).length };
     },
   },
-  // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务。
-  // 有映射失败时任务记为失败，结果里保留各映射的合并结果与错误；源表还没同步进原始层的映射跳过，不算失败
+  // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务，之后重算身份打通。
+  // 有映射或打通失败时任务记为失败，结果里保留各映射的合并结果、打通摘要（组数与记录数，不带哈希）与错误；
+  // 源表还没同步进原始层的映射跳过，不算失败
   'silver.merge': {
     label: '合并到标准层',
     async run(_con, params, { session, piiSalt, redact }) {
       if (!piiSalt) throw new Error('缺少敏感信息盐');
-      const mappings = await mergeToSilver(session, mergeMappings(params), piiSalt, redact);
-      const failed = mappings.filter(m => 'error' in m);
-      if (failed.length) {
-        throw new PartialFailure(`${failed.length} 个映射合并失败：${failed.map(m => `${m.entity} ← ${m.table}（${'error' in m ? m.error : ''}）`).join('；')}`, { mappings });
-      }
-      return { mappings };
+      const result = await mergeToSilver(session, mergeMappings(params), piiSalt, redact);
+      const failed = result.mappings.filter(m => 'error' in m);
+      const problems = [
+        ...(failed.length ? [`${failed.length} 个映射合并失败：${failed.map(m => `${m.entity} ← ${m.table}（${'error' in m ? m.error : ''}）`).join('；')}`] : []),
+        ...(result.identities && 'error' in result.identities ? [`身份打通失败：${result.identities.error}`] : []),
+      ];
+      if (problems.length) throw new PartialFailure(problems.join('；'), result);
+      return result;
     },
   },
 } satisfies Record<string, Handler>;

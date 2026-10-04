@@ -1,7 +1,7 @@
 // app/lib/canonical-model.ts —— 平台内置的标准模型（Canonical Model）：一组标准实体及其字段，所有指标与标签只基于它定义。
 // 同一大版本内只做新增（新增实体、字段、标准枚举取值），不改名、不改语义、不改类型、不改已有实体的主键；每次新增小版本加一（ADR-0018）。
 // 映射里的 model 写的是大版本号。前后端共用（标准模型页要展示实体与字段说明）
-export const MODEL_VERSION = '1.3';
+export const MODEL_VERSION = '1.4';
 export const MODEL_MAJOR = 1;
 
 /** 字段类型：标准层里的列类型由它决定（时间一律是带时区的时间，按 UTC 存放；金额是两位小数的元） */
@@ -53,6 +53,7 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
       f('name', 'string', '姓名', '消费者姓名', { pii: true }),
       f('phone', 'string', '手机号', '手机号', { pii: true }),
       f('email', 'string', '邮箱', '邮箱地址', { pii: true }),
+      f('external_id', 'string', '外部 ID', '跨系统通用的消费者标识（如微信 unionid、集团会员号），身份打通按它精确匹配', { pii: true }),
       f('gender', 'string', '性别', '性别', { enum: ['male', 'female', 'unknown'] }),
       f('birthday', 'date', '生日', '出生日期'),
       f('city', 'string', '城市', '常住或注册城市'),

@@ -51,6 +51,7 @@ npx vitest run test/pipeline/mapping.test.ts # 单个文件
 | `seedPgSource()` | 只重建源库，返回连接信息（`pgSourceInput` 内部已调用） |
 | `duckdbSourceFile(tenantId, file?)` | 在租户源文件目录下生成 DuckDB 文件，返回路径 |
 | `s3SourceFiles(tenantId)` | 对象存储上的 parquet 源文件与三个受限账号（需 `TEST_S3_LAKE_URI`） |
+| `seedIdentitySources(member)` | 重建源库并建 `crm.customers`、`loyalty.members` 两个 schema，各登记为一个数据源（CRM、会员）、选表、确认水位线、同步完，返回 `{ crm, loyalty }`；两边同一个人的手机写法不同、只有邮箱相同、外部 ID 相同、手机-邮箱成链，另有空手机 / 空邮箱的记录（详见函数注释） |
 | `seedMysqlSource()` | MySQL 源库，`orders` 带自增主键与 `updated_at`（需 `TEST_MYSQL_URL`） |
 | `seedMongoSource()` / `MONGO_USERS` | MongoDB 源库与几种权限的账号（需 `TEST_MONGO_URL`） |
 
@@ -163,6 +164,7 @@ describe('<功能>', () => {
 | `pipeline/verify.test.ts` | 湖中数据核对（覆盖、位置、文件、结构、数据量） |
 | `pipeline/mapping.test.ts` | 映射发布与标准层合并、去重键、值字典、双人发布（最后保存的人不能发布）、只有映射引用的表写入变更才在同步后合并（定时检查也不补）、合并只带受影响的映射、补进排队中的合并、运行期间的变更由定时检查补上、详情页只合并单个映射 |
 | `pipeline/pii.test.ts` | 标准层敏感字段：规范化后按租户加盐哈希（不同写法同一哈希、与字段名无关）、`silver.*` / `silver_records` / 任务结果里没有明文、哈希上线前的明文标准层重建、转换报错抹掉取值与盐、标成敏感的扩展字段同样只存哈希 |
+| `pipeline/identity.test.ts` | 身份打通：CRM、会员两个源的消费者按手机号 / 邮箱 / 外部 ID 哈希取传递闭包合并（写法不同、只有邮箱相同、链、空值不合并）、`silver._identities` 没有明文且 `consumer_id` 不是敏感字段哈希、任务结果的打通摘要、重复合并结果一致 |
 | `pipeline/migration.test.ts` | 数据湖迁移存储 |
 | `pipeline/encryption.test.ts` | 数据湖加密存储：新租户原始层 / `_keys` / `_mirror` 的文件不带密钥读不出、不含明文；加密前的未加密湖重新初始化照常同步 |
 | `pipeline/reset.test.ts` | 开发用重置数据湖 |

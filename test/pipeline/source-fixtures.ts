@@ -1,11 +1,15 @@
 // test/pipeline/source-fixtures.ts —— 数据源夹具：本地 PostgreSQL 上的源库（与 src/01_seed.ts 一样用 hash 确定性造数），
-// 一个只读账号与一个对订单表可写的账号；以及放在租户源文件目录下的 DuckDB 文件
+// 一个只读账号与一个对订单表可写的账号；放在租户源文件目录下的 DuckDB 文件；以及身份打通用的两个已登记并同步完的数据源
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { MongoClient } from 'mongodb';
 import pg from 'pg';
+import type { CurrentMember } from '../../app/.server/auth';
+import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { signedFetch, xmlTag } from '../../app/.server/s3-client';
+import { syncSource } from '../../app/.server/source-sync';
+import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 
 export const SOURCE_DB_URL = process.env.TEST_SOURCE_DATABASE_URL!;
 export const READER = { user: 'crm_src_reader', password: 'reader-p@ss\'word' };
@@ -97,6 +101,54 @@ export const grantOnSource = (statement: string) => withClient(SOURCE_DB_URL, c 
 export async function pgSourceInput(account: { user: string; password: string }, name = '电商库') {
   const conn = await seedPgSource();
   return { kind: 'postgres', name, ...conn, ...account };
+}
+
+/**
+ * 身份打通用的两个数据源（重建源库后在其中建 crm、loyalty 两个 schema），登记、选表、确认水位线并同步一次，返回两个数据源的 ID。
+ * 两边的 ID 都从 1 编起（同一个 customer_id 在两个源里是不同的人），同一个人的写法不同：
+ * - crm 1 ↔ loyalty 1：手机号 +86 带空格 / 带横线；crm 2 ↔ loyalty 2：0086 前缀
+ * - crm 3 ↔ loyalty 3：只有邮箱相同（大小写与首尾空格不同）
+ * - crm 4、loyalty 4：手机号与邮箱都是空串或空白，不与任何人合并
+ * - crm 5 ↔ loyalty 5 手机号相同，loyalty 5 ↔ crm 6 邮箱相同：三条记录成一条链
+ * - crm 7 ↔ loyalty 6：只有外部 ID（unionid）相同
+ */
+export async function seedIdentitySources(member: CurrentMember) {
+  const input = await pgSourceInput(READER);
+  await grantOnSource(`
+    DROP SCHEMA IF EXISTS crm CASCADE; DROP SCHEMA IF EXISTS loyalty CASCADE;
+    CREATE SCHEMA crm; CREATE SCHEMA loyalty;
+    CREATE TABLE crm.customers (id int PRIMARY KEY, name text, mobile text, email text, unionid text, updated_at timestamp NOT NULL);
+    INSERT INTO crm.customers VALUES
+      (1, '张三', '+86 138 0000 0001', 'zhang@crm.test', NULL, '2024-06-01'),
+      (2, '李四', '13800000002', NULL, NULL, '2024-06-01'),
+      (3, '王五', NULL, 'Wang5@Example.COM', NULL, '2024-06-01'),
+      (4, '赵六', '', '', NULL, '2024-06-01'),
+      (5, '钱七', '13900000005', NULL, NULL, '2024-06-01'),
+      (6, '钱七', NULL, 'qian7@example.com', NULL, '2024-06-01'),
+      (7, '孙八', NULL, NULL, 'wx_union_8', '2024-06-01');
+    CREATE TABLE loyalty.members (member_id int PRIMARY KEY, full_name text, phone text, mail text, unionid text, updated_at timestamp NOT NULL);
+    INSERT INTO loyalty.members VALUES
+      (1, '张三', '138-0000-0001', NULL, NULL, '2024-06-01'),
+      (2, '李四', '0086 13800000002', 'li4@loyalty.test', NULL, '2024-06-01'),
+      (3, '王五', NULL, '  wang5@example.com ', NULL, '2024-06-01'),
+      (4, '周九', '   ', ' ', NULL, '2024-06-01'),
+      (5, '钱七', '139 0000 0005', 'QIAN7@example.com', NULL, '2024-06-01'),
+      (6, '孙八', NULL, NULL, ' wx_union_8 ', '2024-06-01');
+    GRANT USAGE ON SCHEMA crm, loyalty TO ${READER.user};
+    GRANT SELECT ON ALL TABLES IN SCHEMA crm, loyalty TO ${READER.user};`);
+  const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+  const ids: string[] = [];
+  for (const [name, schema, table] of [['CRM', 'crm', 'customers'], ['会员', 'loyalty', 'members']]) {
+    const { id } = await registerSource(member, { ...input, name, schema });
+    await drain();
+    await setSyncScope(member, id, { add: [table] });
+    await drain();
+    await confirmWatermark(member, id, table, 'updated_at');
+    await syncSource(member, id);
+    await drain();
+    ids.push(id);
+  }
+  return { crm: ids[0], loyalty: ids[1] };
 }
 
 /** 在租户的源文件目录下（PLATFORM_SOURCE_FILES_DIR/<租户 ID>/）生成一个 DuckDB 文件，返回其路径 */
