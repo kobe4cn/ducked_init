@@ -1,11 +1,13 @@
 // app/.server/pipeline/dispatcher.ts —— 调度器：从平台 PG 的队列领取任务，每个任务启动一个独立的工作进程（ADR-0001）。
 // 本机同时运行的工作进程不超过 maxWorkers；各租户的并发上限与公平调度由 claimNextTask 保证，可以部署多个调度器。
 // 数据湖迁移存储也由调度器执行（在本进程内，要用平台账号读旧前缀、写新前缀），同样占一个名额，先于任务领取。
-// 常驻运行时还定期为到期的数据源入队同步与湖中数据核对，为有新变化的租户入队标准层合并；同步给已发布映射的源表写入变更后随即入队一次合并
+// 常驻运行时还定期为到期的数据源入队同步与湖中数据核对，为有新变化的租户入队标准层合并；同步给已发布映射的源表写入变更后随即入队一次合并，
+// 分析模板任务成功后登记结果快照
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '../lake-migration';
 import { enqueueDueMerges, mergeAfterSync } from '../mappings';
+import { registerSnapshot } from '../snapshots';
 import { enqueueDueSyncs } from '../source-sync';
 import { enqueueDueVerifies } from '../source-verify';
 import { claimNextTask, failStaleTasks, finishTask, heartbeatTasks, setWorkerPid, type ClaimedTask } from '../tasks';
@@ -72,6 +74,8 @@ export function createDispatcher({
         await finishTask(task.id, outcome!);
         // 同步给已发布映射的源表写入了变更批次（部分失败时也可能有）：随即把它们合并进标准层
         if (task.kind === 'source.sync' && outcome!.result) await mergeAfterSync(task.tenantId, task.id);
+        // 分析模板任务写好了结果层的快照表：登记到平台元数据，分析页据此列出
+        if (task.kind === 'gold.rfm' && outcome!.result) await registerSnapshot(task.tenantId, task.id, 'rfm');
       })
       .catch(e => console.error(`[调度器] 任务 ${task.id} 结束时出错`, e))
       .finally(() => { running.delete(task.id); wake?.(); });

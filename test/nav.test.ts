@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { activeNavTo } from '../app/lib/nav';
 
-const MEMBER_NAV = [{ to: '/' }, { to: '/sources' }, { to: '/mappings' }, { to: '/model' }];
+const MEMBER_NAV = [{ to: '/' }, { to: '/sources' }, { to: '/mappings' }, { to: '/model' }, { to: '/analytics' }];
 const OPS_NAV = [{ to: '/ops' }, { to: '/ops/audit' }];
 
 describe('导航高亮', () => {
@@ -10,6 +10,7 @@ describe('导航高亮', () => {
     expect(activeNavTo(MEMBER_NAV, '/sources')).toBe('/sources');
     expect(activeNavTo(MEMBER_NAV, '/sources/123')).toBe('/sources');
     expect(activeNavTo(MEMBER_NAV, '/')).toBe('/');
+    expect(activeNavTo(MEMBER_NAV, '/analytics/snapshots/abc')).toBe('/analytics');
   });
 
   it('只按完整的路径段匹配，前缀相同的其他页面不算', () => {

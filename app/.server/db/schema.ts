@@ -299,3 +299,23 @@ export const mappingVersions = platform.table('mapping_versions', {
   uniqueIndex('mapping_versions_mapping_version_uq').on(t.mappingId, t.version),
   uniqueIndex('mapping_versions_one_draft_uq').on(t.mappingId).where(sql`status = 'draft'`),
 ]);
+
+// 结果快照：分析模板任务（如 gold.rfm）每次成功后在租户数据湖结果层写下的一张表（ADR-0002：数据在湖里，这里只登记元数据）。
+// definition_version 是运行所用的已发布模板定义版本（参数直接放在任务里时为空）；expires_at 为创建后 90 天，过期清理后记下 expired_at
+export const snapshots = platform.table('snapshots', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  template: text('template').notNull(),
+  definitionVersion: integer('definition_version'),
+  taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'cascade' }),
+  /** 数据湖里的表名（如 gold.rfm__<任务 ID>） */
+  table: text('table').notNull(),
+  params: jsonb('params').$type<Record<string, unknown>>().notNull(),
+  rowCount: bigint('row_count', { mode: 'number' }).notNull(),
+  createdAt: createdAt(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  expiredAt: timestamp('expired_at', { withTimezone: true }),
+}, t => [
+  index('snapshots_tenant_created_idx').on(t.tenantId, t.createdAt),
+  uniqueIndex('snapshots_task_uq').on(t.taskId),
+]);
