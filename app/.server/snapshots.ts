@@ -1,11 +1,14 @@
 // app/.server/snapshots.ts —— 结果快照：分析模板任务成功后，调度器把它写进结果层的那张表登记到平台元数据（模板、参数、任务、表名、行数，
 // 创建后 90 天过期）；数据仍只在租户数据湖里（ADR-0002）。分析页列出本租户的快照，打开时在请求内只读挂载本租户的数据湖读取，
-// 快照表只有 consumer_id 与分值，没有明文（ADR-0005）。一律限定在给定租户内
-import { and, desc, eq } from 'drizzle-orm';
+// 快照表只有 consumer_id 与分值，没有明文（ADR-0005）。到期后调度器为每个租户入队 gold.expire 删表并清理湖里的旧文件，成功后标记 expiredAt。
+// 一律限定在给定租户内
+import { and, desc, eq, inArray, isNull, lte } from 'drizzle-orm';
+import type { Tx } from './audit';
 import { getDb } from './db/client';
-import { snapshots, tasks } from './db/schema';
+import { snapshots, tasks, tenants } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { openTenantLake } from './pipeline/lake-engine';
+import { insertTask } from './tasks';
 import { TEMPLATES } from './pipeline/templates';
 import type { RfmParams } from './pipeline/templates/rfm';
 
@@ -36,6 +39,47 @@ export async function registerSnapshot(tenantId: string, taskId: string, templat
     tenantId, template, taskId, table, params, rowCount: rows, createdAt,
     expiresAt: new Date(createdAt.getTime() + SNAPSHOT_RETENTION_DAYS * 24 * 60 * 60 * 1000),
   }).onConflictDoNothing({ target: snapshots.taskId });
+}
+
+/**
+ * 为有到期快照（expiresAt 已到、还没标记过期）的租户各入队一个 gold.expire，参数是到期快照的表名；
+ * 本租户已有排队或运行中的 gold.expire 时跳过（下一次检查再补上），多个调度器同时检查也不会重复入队。返回入队了的租户
+ */
+export async function enqueueDueExpiries(now = new Date()) {
+  const due = (db: Tx | ReturnType<typeof getDb>, tenantId?: string) => db
+    .select({ tenantId: snapshots.tenantId, table: snapshots.table }).from(snapshots)
+    .innerJoin(tenants, and(eq(tenants.id, snapshots.tenantId), isNull(tenants.suspendedAt)))
+    .where(and(lte(snapshots.expiresAt, now), isNull(snapshots.expiredAt), tenantId ? eq(snapshots.tenantId, tenantId) : undefined))
+    .orderBy(snapshots.tenantId, snapshots.table);
+  const enqueued: string[] = [];
+  for (const tenantId of [...new Set((await due(getDb())).map(d => d.tenantId))]) {
+    try {
+      const task = await getDb().transaction(async tx => {
+        // 先锁住租户行再查一次：查询之后可能已有调度器入队过期、甚至已执行完
+        await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
+        const [pending] = await tx.select({ id: tasks.id }).from(tasks)
+          .where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'gold.expire'), inArray(tasks.status, ['queued', 'running']))).limit(1);
+        const tables = (await due(tx, tenantId)).map(d => d.table);
+        if (pending || !tables.length) return null;
+        return insertTask(tx, tenantId, 'gold.expire', { tables });
+      });
+      if (task) enqueued.push(tenantId);
+    } catch (e) {
+      console.error(`[调度器] 租户 ${tenantId} 的快照过期入队失败`, e);
+    }
+  }
+  return enqueued;
+}
+
+/** gold.expire 成功后把它删掉的表对应的快照标记为已过期；任务没有成功时什么也不做 */
+export async function markExpired(tenantId: string, taskId: string) {
+  const db = getDb();
+  const [task] = await db.select({ status: tasks.status, params: tasks.params }).from(tasks)
+    .where(and(eq(tasks.id, taskId), eq(tasks.tenantId, tenantId)));
+  if (task?.status !== 'succeeded') return;
+  const { tables } = task.params as { tables: string[] };
+  await db.update(snapshots).set({ expiredAt: new Date() })
+    .where(and(eq(snapshots.tenantId, tenantId), inArray(snapshots.table, tables), isNull(snapshots.expiredAt)));
 }
 
 /** 本租户的全部快照，最新的在前 */

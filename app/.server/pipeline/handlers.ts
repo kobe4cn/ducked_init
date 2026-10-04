@@ -207,6 +207,23 @@ export const HANDLERS = {
       return { table: `gold.${name}`, rows: Number(n), unlinkedOrders: Number(unlinked), params: rfm };
     },
   },
+  // 快照过期：删掉参数里到期快照的表（已删的跳过，重复执行不报错），再按 ADR-0020 擦除湖里的数据：
+  // 删整张表后它的文件不再被当前的 DuckLake 快照引用，不用像删除请求那样重写数据文件；让此前的 DuckLake 快照全部过期，再从存储上删掉旧文件。
+  // 过期的 DuckLake 快照是整个租户湖的，此后时间旅行只能回到这一刻；平台没有依赖更早版本的功能（镜像也只看当前版本，ADR-0010）
+  'gold.expire': {
+    label: '快照过期',
+    async run(con, params) {
+      const tables = params.tables;
+      if (!isStrings(tables) || !tables.every(t => /^gold\.[a-z]+__[0-9a-f-]{36}$/.test(t))) {
+        throw new Error('参数 tables 必须是非空的结果层快照表名列表');
+      }
+      for (const t of tables) await con.run(`DROP TABLE IF EXISTS gold."${t.slice('gold.'.length)}"`);
+      await con.run(`
+        CALL ducklake_expire_snapshots('lake', older_than => now());
+        CALL ducklake_cleanup_old_files('lake', cleanup_all => true);`);
+      return { tables };
+    },
+  },
 } satisfies Record<string, Handler>;
 
 export type TaskKind = keyof typeof HANDLERS;

@@ -173,7 +173,7 @@ describe('<功能>', () => {
 | `pipeline/pii.test.ts` | 标准层敏感字段：规范化后按租户加盐哈希（不同写法同一哈希、与字段名无关）、`silver.*` / `silver_records` / 任务结果里没有明文、哈希上线前的明文标准层重建、转换报错抹掉取值与盐、标成敏感的扩展字段同样只存哈希 |
 | `pipeline/identity.test.ts` | 身份打通：CRM、会员、埋点三个源的消费者按手机号 / 邮箱 / 外部 ID 哈希取传递闭包合并（写法不同、只有邮箱相同、链、空值不合并）、`silver._identities` 没有明文且 `consumer_id` 不是敏感字段哈希、匿名设备按全局最近一次登录归属（并列取较小 `consumer_id`，匿名事件经设备归属）、任务结果的打通摘要、重复合并结果一致；映射里配置匹配字段（去掉邮箱后重新发布、组随之变化）、更高优先级字段冲突时不按低优先级字段合并、两个 `customer` 映射规则不一致时拒绝发布 |
 | `pipeline/rfm.test.ts` | `gold.rfm` 任务：两个数据源的订单经打通合到同一消费者、分值与人群与手算一致、快照表只有 `consumer_id` 与分值、打通不到的订单单独计数；同一 `as_of` 重复运行结果一致；没有 `silver.order` 或参数不合法时任务失败 |
-| `pipeline/snapshots.test.ts` | 结果快照登记：`gold.rfm` 成功后登记模板、完整参数、表名、行数、90 天后过期，失败不登记，只在本租户可见；只读读出 RFM 快照的人群人数与金额（按定义顺序）与分页的消费者明细 |
+| `pipeline/snapshots.test.ts` | 结果快照登记：`gold.rfm` 成功后登记模板、完整参数、表名、行数、90 天后过期，失败不登记，只在本租户可见；只读读出 RFM 快照的人群人数与金额（按定义顺序）与分页的消费者明细；到期快照经 `enqueueDueExpiries` → `gold.expire` 删表、清掉 parquet 文件与内联在 catalog 的行、标记 `expiredAt`，未到期的不受影响，不重复入队、重复执行不报错 |
 | `pipeline/migration.test.ts` | 数据湖迁移存储 |
 | `pipeline/encryption.test.ts` | 数据湖加密存储：新租户原始层 / `_keys` / `_mirror` 的文件不带密钥读不出、不含明文；加密前的未加密湖重新初始化照常同步 |
 | `pipeline/reset.test.ts` | 开发用重置数据湖 |

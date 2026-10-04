@@ -2,12 +2,12 @@
 // 本机同时运行的工作进程不超过 maxWorkers；各租户的并发上限与公平调度由 claimNextTask 保证，可以部署多个调度器。
 // 数据湖迁移存储也由调度器执行（在本进程内，要用平台账号读旧前缀、写新前缀），同样占一个名额，先于任务领取。
 // 常驻运行时还定期为到期的数据源入队同步与湖中数据核对，为有新变化的租户入队标准层合并；同步给已发布映射的源表写入变更后随即入队一次合并，
-// 分析模板任务成功后登记结果快照
+// 分析模板任务成功后登记结果快照；还定期为有到期快照的租户入队快照过期，成功后标记快照已过期
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '../lake-migration';
 import { enqueueDueMerges, mergeAfterSync } from '../mappings';
-import { registerSnapshot } from '../snapshots';
+import { enqueueDueExpiries, markExpired, registerSnapshot } from '../snapshots';
 import { enqueueDueSyncs } from '../source-sync';
 import { enqueueDueVerifies } from '../source-verify';
 import { claimNextTask, failStaleTasks, finishTask, heartbeatTasks, setWorkerPid, type ClaimedTask } from '../tasks';
@@ -76,6 +76,8 @@ export function createDispatcher({
         if (task.kind === 'source.sync' && outcome!.result) await mergeAfterSync(task.tenantId, task.id);
         // 分析模板任务写好了结果层的快照表：登记到平台元数据，分析页据此列出
         if (task.kind === 'gold.rfm' && outcome!.result) await registerSnapshot(task.tenantId, task.id, 'rfm');
+        // 到期快照的表已删、旧文件已清理：标记为已过期，分析页不再打开它们
+        if (task.kind === 'gold.expire' && outcome!.result) await markExpired(task.tenantId, task.id);
       })
       .catch(e => console.error(`[调度器] 任务 ${task.id} 结束时出错`, e))
       .finally(() => { running.delete(task.id); wake?.(); });
@@ -127,7 +129,7 @@ export function createDispatcher({
 
   let lastSyncCheck = 0;
   /**
-   * 为到期的数据源入队同步，再入队核对（有同步在排队时等下一次检查），最后为有新变化的租户入队合并：
+   * 为到期的数据源入队同步，再入队核对（有同步在排队时等下一次检查），然后为有新变化的租户入队合并，最后为有到期快照的租户入队快照过期：
    * 每 syncCheckMs 一次，多个调度器同时检查也不会重复入队
    */
   async function scheduleSyncs() {
@@ -136,6 +138,7 @@ export function createDispatcher({
     await enqueueDueSyncs();
     await enqueueDueVerifies();
     await enqueueDueMerges();
+    await enqueueDueExpiries();
   }
 
   /** 每隔 pollMs 或有工作进程结束时醒来 */
@@ -156,7 +159,7 @@ export function createDispatcher({
     /** 持续运行，直到 stop()；之后等运行中的任务结束再返回 */
     async run() {
       while (!stopped) {
-        await scheduleSyncs().catch(e => console.error('[调度器] 入队到期的同步、核对或合并出错', e));
+        await scheduleSyncs().catch(e => console.error('[调度器] 入队到期的同步、核对、合并或快照过期出错', e));
         await tick().catch(e => console.error('[调度器] 轮询出错', e));
         await nap();
       }
