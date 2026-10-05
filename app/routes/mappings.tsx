@@ -1,5 +1,5 @@
 // app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、最近一次合并），
-// 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿；可按所选的表与实体按规则生成草稿填进编辑框，不保存；编辑框旁对照所选源表的列统计与目标实体的标准字段），
+// 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿；可按所选的表与实体按规则生成草稿填进编辑框，不保存；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
 // 以及手动触发一次合并到标准层
 import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, PencilLine, Play, Plus, X } from 'lucide-react';
 import { useState } from 'react';
@@ -7,13 +7,14 @@ import { isMap, isScalar, parseDocument } from 'yaml';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mappings';
 import { can, requirePermission } from '~/.server/access';
+import { customEntityRegistrations } from '~/.server/custom-entities';
 import { createMapping, defaultDraft, draftFor, listMappings, MappingError, mergeNow, referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
 import { mappingTemplate } from '~/.server/pipeline/mapping-spec';
 import { listSources } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
-import { CANONICAL_ENTITIES, entityLabel, entityOf } from '~/lib/canonical-model';
+import { CANONICAL_ENTITIES, entityLabel, entityOf, isCustomEntity } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
 import { MappingErrors } from '~/components/mapping-editor';
 import { MappingEditorWithReference } from '~/components/mapping-reference';
@@ -40,6 +41,8 @@ export async function loader({ request }: Route.LoaderArgs) {
     sources,
     /** 各数据源可对照的源表（只有能新建映射时才给） */
     tables: canWrite ? Object.fromEntries(await Promise.all(sources.map(async s => [s.id, await referenceTables(member, s.id)] as const))) : {},
+    /** 本租户自定义实体的已发布登记，新建时可选为目标实体、在对照面板里对照（只有能新建映射时才给） */
+    registered: canWrite ? await customEntityRegistrations(member) : {},
     /** 新建映射编辑框的默认内容：第一个数据源的草稿，没有已采集的表时是模板 */
     initialYaml: canWrite && sources[0] ? await defaultDraft(member, sources[0].id) : mappingTemplate('order', 'orders'),
     functions: functionList(),
@@ -115,7 +118,7 @@ function mergeSummary(m: LastMerge) {
 }
 
 export default function Mappings({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, sources, tables, initialYaml, functions, merge, mappings } = loaderData;
+  const { email, nav, canWrite, sources, tables, registered, initialYaml, functions, merge, mappings } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const { icon: MergeIcon, tone: mergeTone } = TASK_STATUS[merge.status];
   return (
@@ -194,6 +197,7 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
               key={actionData?.draftId ?? 'new'}
               sources={sources}
               tables={tables}
+              registered={registered}
               functions={functions}
               values={actionData?.values ?? { sourceId: sources[0]?.id ?? '', yaml: initialYaml }}
               submitting={submitting}
@@ -229,9 +233,10 @@ const inputValue = (t: { name: string; view?: true }) => (t.view ? `${VIEW_PREFI
  * 新建映射的表单：选数据源、用表单或 YAML 编写映射。表与目标实体两个下拉框决定表单列哪些字段、对照面板显示什么（默认取 YAML 里写的），
  * 也是「按规则生成草稿」的输入；换选时一并写进 YAML 的 table / entity，保存时以 YAML 里写的为准
  */
-function NewMapping({ sources, tables, functions, values, submitting }: {
+function NewMapping({ sources, tables, registered, functions, values, submitting }: {
   sources: LoaderData['sources'];
   tables: LoaderData['tables'];
+  registered: LoaderData['registered'];
   functions: LoaderData['functions'];
   values: { sourceId: string; yaml: string };
   submitting: boolean;
@@ -240,7 +245,13 @@ function NewMapping({ sources, tables, functions, values, submitting }: {
   const [yaml, setYaml] = useState(values.yaml);
   const [outline] = useState(() => mappingOutline(values.yaml));
   const [inputName, setInputName] = useState(outline.view ? inputValue({ name: outline.view, view: true }) : outline.table);
-  const [entity, setEntity] = useState(outline.entity && entityOf(outline.entity) ? outline.entity : CANONICAL_ENTITIES[0].name);
+  const [entity, setEntity] = useState(outline.entity && (entityOf(outline.entity) || isCustomEntity(outline.entity)) ? outline.entity : CANONICAL_ENTITIES[0].name);
+  // 标准实体、已发布登记的自定义实体，以及 YAML 里写的未登记自定义实体（对照面板提示去登记）
+  const entities = [
+    ...CANONICAL_ENTITIES.map(e => ({ name: e.name, label: e.label })),
+    ...Object.values(registered).map(e => ({ name: e.name, label: e.label })),
+    ...(isCustomEntity(entity) && !registered[entity] ? [{ name: entity, label: '未登记' }] : []),
+  ];
   const sourceTables = tables[sourceId] ?? [];
   const table = sourceTables.find(t => inputValue(t) === inputName) ?? sourceTables[0] ?? null;
   const selectInput = (value: string) => {
@@ -266,13 +277,13 @@ function NewMapping({ sources, tables, functions, values, submitting }: {
           <Field>
             <FieldLabel htmlFor="mapping-entity">目标实体</FieldLabel>
             <NativeSelect id="mapping-entity" name="entity" value={entity} onChange={e => { setEntity(e.target.value); setYaml(y => withTarget(y, 'entity', e.target.value)); }}>
-              {CANONICAL_ENTITIES.map(e => <NativeSelectOption key={e.name} value={e.name}>{`${e.label}（${e.name}）`}</NativeSelectOption>)}
+              {entities.map(e => <NativeSelectOption key={e.name} value={e.name}>{`${e.label}（${e.name}）`}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
         </div>
         <Field>
           <FieldLabel>映射</FieldLabel>
-          <MappingEditorWithReference defaultValue={values.yaml} value={yaml} onValueChange={setYaml} table={table} entity={entity} functions={functions} />
+          <MappingEditorWithReference defaultValue={values.yaml} value={yaml} onValueChange={setYaml} table={table} entity={entity} registered={registered} functions={functions} />
         </Field>
         <div className="flex gap-2">
           <Button type="submit" name="intent" value="create" disabled={submitting || !sources.length}>{submitting ? '正在处理…' : '校验并保存草稿'}</Button>

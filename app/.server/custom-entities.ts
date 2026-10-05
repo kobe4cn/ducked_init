@@ -314,3 +314,9 @@ export async function publishedCustomEntities(db: Tx | ReturnType<typeof getDb>,
     .orderBy(customEntityVersions.entityId, desc(customEntityVersions.version));
   return new Map(rows.map(r => [r.name, r]));
 }
+
+/** 本租户已发布的自定义实体登记，按名称索引成普通对象（loader 传给映射页的对照面板） */
+export async function customEntityRegistrations(actor: CurrentMember): Promise<Record<string, RegisteredEntity>> {
+  assertCan(actor, 'sources:read');
+  return Object.fromEntries(await publishedCustomEntities(getDb(), actor.tenant.id));
+}

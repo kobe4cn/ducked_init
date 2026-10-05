@@ -1,5 +1,5 @@
 // app/routes/mapping.tsx —— 单个映射：各版本（已发布的锁定、草稿可改）、编辑与丢弃草稿（数据工程师、管理员）、发布草稿（需最后保存它的人以外的
-// 另一位有发布权限的成员，最后保存的人看到不能发布的原因，租户里只有自己有发布权限时提示先邀请成员；编辑框旁对照源表的列统计与实体的标准字段；
+// 另一位有发布权限的成员，最后保存的人看到不能发布的原因，租户里只有自己有发布权限时提示先邀请成员；编辑框旁对照源表的列统计与实体的标准字段（自定义实体对照它已发布登记的字段）；
 // 可按规则重新生成草稿填进编辑框，不保存），以及这个映射每次合并到标准层的结果；有已发布版本时可以立即合并这一个映射。
 // 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）；
 // 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）；
@@ -9,6 +9,7 @@ import { AlertTriangle, ArrowRight, Boxes, CheckCircle2, FileDiff, FlaskConical,
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
+import { customEntityRegistrations } from '~/.server/custom-entities';
 import { discardDraft, draftForMapping, dryRunMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
@@ -46,6 +47,9 @@ const focusOf = (url: URL) => {
   return field ? { field, add: url.searchParams.getAll('add') } : null;
 };
 
+/** 只留映射实体那一条登记，不把整个租户的登记都下发到页面 */
+const registrationOf = <T,>(all: Record<string, T>, entity: string): Record<string, T> => (entity in all ? { [entity]: all[entity] } : {});
+
 export async function loader({ request, params }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   try {
@@ -70,6 +74,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         entityLabel: entityLabel(m.entity),
         /** 编辑草稿时对照的源表（还没采集、不在同步范围时为 null；不能编辑时不给） */
         reference: canWrite ? ((await referenceTables(member, m.source.id)).find(t => t.name === m.tableName && !!t.view === !!m.sourceViewId) ?? null) : null,
+        /** 映射的实体是已发布登记的自定义实体时，编辑草稿对照的登记（只给这一条；不能编辑时不给） */
+        registered: canWrite ? registrationOf(await customEntityRegistrations(member), m.entity) : {},
       },
       versions: m.versions.map(v => ({
         ...v,
@@ -366,7 +372,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
             {selected.status === 'draft' && draftDiff && <DraftDiff entity={mapping.entity} version={selected.version} diff={draftDiff} />}
             {canWrite && (selected.status === 'draft' || !draft) ? (
               <Form method="post" className="space-y-3" key={`${selected.version}-${actionData?.draftId ?? ''}`}>
-                <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} functions={functions} focus={focus} />
+                <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} registered={mapping.registered} functions={functions} focus={focus} />
                 <div className="flex gap-2">
                   <Button type="submit" name="intent" value="save" disabled={submitting}>
                     {submitting ? '正在处理…' : selected.status === 'draft' ? '校验并保存草稿' : '校验并保存为新草稿'}

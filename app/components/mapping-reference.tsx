@@ -1,10 +1,11 @@
 // app/components/mapping-reference.tsx —— 编写映射时放在编辑框旁的对照面板：源表各列的统计（类型、空值率、不同取值数、主键、水位线、常见取值），
-// 目标实体的标准字段（类型、是否必填、标准枚举）、写法速查与白名单函数。按编辑框里的 YAML 标出已对应的字段与还没对应的必填字段；
+// 目标实体的标准字段（类型、是否必填、标准枚举）或自定义实体已发布登记的字段（类型、是否敏感、说明、主键）、写法速查与白名单函数。按编辑框里的 YAML 标出已对应的字段与还没对应的必填字段；
 // 点击列名、字段名、写法或函数插入到编辑框光标处。编辑区分「表单 / YAML」两个标签页，两边是同一份 YAML，始终由 YAML 框提交（ADR-0017）
 import { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { Check } from 'lucide-react';
-import { entityOf, FIELD_TYPES } from '~/lib/canonical-model';
+import { Link } from 'react-router';
+import { type CustomEntityField, entityOf, FIELD_TYPES, isCustomEntity } from '~/lib/canonical-model';
 import { mappingOutline } from '~/lib/mapping-outline';
 import { MappingEditor, type MappingEditorHandle } from '~/components/mapping-editor';
 import { MappingForm, type FormFocus } from '~/components/mapping-form';
@@ -19,6 +20,8 @@ export interface ReferenceColumn {
 }
 /** view 为真时是已发布的源视图：只有列名与类型，没有列统计 */
 export interface ReferenceTable { name: string; view?: true; sampleRows: number; primaryKey: string[]; watermark: string | null; columns: ReferenceColumn[] }
+/** 自定义实体最新的已发布登记（由 loader 从 publishedCustomEntities 传来） */
+export interface RegisteredEntityView { label: string; fields: CustomEntityField[]; primaryKey: string[] }
 /** 白名单函数（由 loader 从 mapping-expr 的 FUNCTIONS 传来） */
 export interface ReferenceFunction { name: string; signature: string; label: string }
 
@@ -46,12 +49,14 @@ const TABS = [{ id: 'form', label: '表单' }, { id: 'yaml', label: 'YAML' }] as
  * 默认打开表单；表单要脚本，hydrate 之前（及不支持脚本时）只有 YAML 框可用，照常提交。给出 value 时由外部控制内容；
  * 给出 focus 时表单定位到那个字段，把要加的源值作为待对应的行列进它的值对照表
  */
-export function MappingEditorWithReference({ defaultValue, value, onValueChange, table, entity, functions, focus }: {
+export function MappingEditorWithReference({ defaultValue, value, onValueChange, table, entity, registered, functions, focus }: {
   defaultValue: string;
   value?: string;
   onValueChange?: (yaml: string) => void;
   table: ReferenceTable | null;
   entity: string;
+  /** 本租户自定义实体的已发布登记，按名称索引 */
+  registered?: Record<string, RegisteredEntityView>;
   functions: ReferenceFunction[];
   focus?: FormFocus | null;
 }) {
@@ -92,6 +97,7 @@ export function MappingEditorWithReference({ defaultValue, value, onValueChange,
       <MappingReference
         table={table}
         entity={entity}
+        registered={registered?.[entity] ?? null}
         functions={functions}
         yaml={yaml}
         onInsert={text => {
@@ -107,10 +113,12 @@ export function MappingEditorWithReference({ defaultValue, value, onValueChange,
 /**
  * 对照面板。必填字段是去重键：YAML 里 dedupe.key 声明的，没有声明时是实体的主键（与映射校验的规则一致，未对应时校验不通过）
  */
-function MappingReference({ table, entity, functions, yaml, onInsert }: {
+function MappingReference({ table, entity, registered, functions, yaml, onInsert }: {
   /** 所选的源表；表不在同步范围内或还没采集时为 null */
   table: ReferenceTable | null;
   entity: string;
+  /** 所选自定义实体的已发布登记；不是自定义实体或没登记时为 null */
+  registered: RegisteredEntityView | null;
   functions: ReferenceFunction[];
   yaml: string;
   onInsert: (text: string) => void;
@@ -199,6 +207,36 @@ function MappingReference({ table, entity, functions, yaml, onInsert }: {
               })}
             </TableBody>
           </Table>
+        </div>
+      ) : registered ? (
+        <div data-reference-registered={entity} className="space-y-1">
+          <div className="font-medium">{`${registered.label}（${entity}）已发布登记的字段：写在 extensions 下`}</div>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>字段</TableHead>
+                <TableHead>类型</TableHead>
+                <TableHead>说明</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {registered.fields.map(f => (
+                <TableRow key={f.name} data-reference-field={f.name} data-primary-key={registered.primaryKey.includes(f.name) || undefined}>
+                  <TableCell className="space-x-1">
+                    {nameButton(f.name, onInsert)}
+                    {registered.primaryKey.includes(f.name) && <Badge variant="secondary">主键</Badge>}
+                    {f.sensitive && <Badge variant="outline">敏感</Badge>}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">{FIELD_TYPES[f.type].label}</TableCell>
+                  <TableCell className="whitespace-normal">{f.description || '—'}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      ) : isCustomEntity(entity) ? (
+        <div data-reference-unregistered={entity} className="text-muted-foreground">
+          {`${entity} 未登记：先到`}<Link to="/entities" className="underline">自定义实体</Link>登记并发布，才有字段可对照。
         </div>
       ) : (
         <div className="text-muted-foreground">{`${entity} 不是标准实体，没有标准字段可对照。`}</div>

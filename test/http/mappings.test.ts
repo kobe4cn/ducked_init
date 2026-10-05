@@ -4,6 +4,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { parseDocument } from 'yaml';
 import { closeDb } from '../../app/.server/db/client';
+import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
@@ -424,6 +425,43 @@ describe('编写映射时的对照面板', () => {
     expect(html).toContain('data-reference-column="created_at"');
     expect(html).toMatch(/data-reference-field="amount"[^>]*data-mapped/);
     expect(html).toMatch(/data-reference-field="customer_id"(?![^>]*data-mapped)/);
+  });
+
+  it('自定义实体的映射对照它已发布登记的字段（类型、敏感、说明、主键）；没登记的提示去登记', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const author = await memberOf(tenantId, 'de@acme.com');
+    const coupon = await createCustomEntity(author, {
+      name: 'custom_coupon', label: '优惠券', kind: 'dimension', primaryKey: ['code'],
+      fields: [
+        { name: 'code', type: 'string', description: '券码', sensitive: false },
+        { name: 'owner_phone', type: 'string', description: '领券手机号', sensitive: true },
+      ],
+    });
+    await publishCustomEntity(await memberOf(tenantId, 'de2@acme.com'), coupon, 1);
+    // 只有草稿的登记不显示
+    await createCustomEntity(author, { name: 'custom_store', label: '门店', kind: 'dimension', primaryKey: ['store_id'], fields: [{ name: 'store_id', type: 'string', description: '', sensitive: false }] });
+    const engineer = await loginAs(app, 'de@acme.com');
+    const yaml = 'model: 1\nentity: custom_coupon\ntable: orders\ndedupe: { key: [code] }\nextensions:\n  code: { type: string, expr: string(order_id) }\n';
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml }));
+
+    const html = await (await engineer.get(`/mappings/${id}`)).text();
+    expect(html).toContain('data-reference-registered="custom_coupon"');
+    expect(html).toMatch(/data-reference-field="code"[^>]*data-primary-key[\s\S]*?主键[\s\S]*?文本[\s\S]*?券码/);
+    expect(html).toMatch(/data-reference-field="owner_phone"(?![^>]*data-primary-key)[\s\S]*?敏感[\s\S]*?领券手机号/);
+
+    // 新建页：目标实体可选已发布登记的自定义实体，不列只有草稿的
+    const page = await (await engineer.get('/mappings')).text();
+    expect(page).toMatch(/<option[^>]*value="custom_coupon">优惠券（custom_coupon）<\/option>/);
+    expect(page).not.toContain('value="custom_store"');
+    // 新建时选了已登记的自定义实体（保存被拒后带着它渲染回来），面板显示其登记字段
+    const chosen = await (await engineer.post('/mappings', { intent: 'create', sourceId, yaml: `${yaml}  x_bad: nope\n` })).text();
+    expect(chosen).toMatch(/<option[^>]*value="custom_coupon"[^>]*selected=""/);
+    expect(chosen).toContain('data-reference-registered="custom_coupon"');
+    expect(chosen).toMatch(/data-reference-field="owner_phone"/);
+    // 写了没登记的自定义实体，保存被拒后面板提示去登记
+    const rejected = await (await engineer.post('/mappings', { intent: 'create', sourceId, yaml: yaml.replace('custom_coupon', 'custom_store') })).text();
+    expect(rejected).toMatch(/<option[^>]*value="custom_store"[^>]*selected=""[^>]*>未登记（custom_store）<\/option>/);
+    expect(rejected).toMatch(/data-reference-unregistered="custom_store"[\s\S]*?未登记[\s\S]*?href="\/entities"/);
   });
 });
 
