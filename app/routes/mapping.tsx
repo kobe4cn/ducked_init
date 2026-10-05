@@ -3,8 +3,9 @@
 // 可按规则重新生成草稿填进编辑框，不保存），以及这个映射每次合并到标准层的结果；有已发布版本时可以立即合并这一个映射。
 // 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）；
 // 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）；
-// 编辑页可空跑正在查看的版本：在原始层样本上转换，编辑框下方展示样例行（敏感字段是哈希）与基础断言，不写标准层
-import { AlertTriangle, ArrowRight, Boxes, CheckCircle2, FlaskConical, PencilLine, Play } from 'lucide-react';
+// 编辑页可空跑正在查看的版本：在原始层样本上转换，编辑框下方展示样例行（敏感字段是哈希）与基础断言，不写标准层；
+// 查看草稿时在编辑框上方展示它与最新已发布版本的差异（列级与去重键、取最新字段、身份打通匹配字段），供审阅者决定是否发布
+import { AlertTriangle, ArrowRight, Boxes, CheckCircle2, FileDiff, FlaskConical, PencilLine, Play } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
@@ -13,6 +14,7 @@ import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
 import { functionList } from '~/lib/mapping-expr';
 import { isEnumField } from '~/lib/mapping-form';
+import type { ColumnField, PlanDiff } from '~/lib/mapping-diff';
 import type { DryRunResult } from '~/.server/pipeline/dry-run-engine';
 import type { FallbackStat } from '~/.server/pipeline/merge-engine';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
@@ -76,6 +78,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         /** 当前成员发布不了这一版草稿的原因（没有发布权限、最后保存的是自己、租户里没有别人能发布）；可以发布或不是草稿时为 null */
         publishBlocker: publishReason(member, v, m.publishers),
       })),
+      /** 草稿相对最新已发布版本 against 的差异；没有草稿时为 null */
+      draftDiff: m.draftDiff,
       merge: {
         status: m.merge.status,
         statusLabel: m.merge.status === 'none' ? '未合并' : TASK_STATUS_LABELS[m.merge.status],
@@ -246,8 +250,42 @@ function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult 
   );
 }
 
+const COLUMN_FIELD_LABELS: Record<ColumnField, string> = { type: '类型', expr: '表达式', dictionary: '值字典', otherwise: '兜底', sensitive: '敏感标记' };
+
+/** 草稿与最新已发布版本的差异：首个版本、没有差异，或逐项列出列与去重 / 身份打通配置的变化 */
+function DraftDiff({ entity, version, diff }: { entity: string; version: number; diff: PlanDiff & { against: number | null } }) {
+  const label = (name: string) => {
+    const l = entityOf(entity)?.fields.find(f => f.name === name)?.label;
+    return <>{l && `${l} `}<span className="font-mono">{name}</span></>;
+  };
+  const fieldList = (list: string[] | null, none = '—') => (list?.length ? list.map((n, i) => <span key={n}>{i > 0 && '、'}{label(n)}</span>) : none);
+  const latestText = (name: string | null) => (name ? label(name) : '最近同步到的一行');
+  return (
+    <section className="mb-4 rounded-xl border bg-slate-50 p-4" data-draft-diff={version}>
+      <h2 className="flex items-center gap-2 text-sm font-semibold">
+        <FileDiff className="size-4 text-amber-600" />
+        {diff.first ? `v${version} 是首个版本` : `v${version} 与已发布 v${diff.against} 的差异`}
+      </h2>
+      {diff.first ? (
+        <p className="mt-1 text-sm text-slate-500">还没有已发布的版本，发布后这一版的全部列与去重规则生效。</p>
+      ) : diff.empty ? (
+        <p className="mt-1 text-sm text-slate-500" data-diff-item="none">合并计划与已发布版本相同（只改了注释或写法）。</p>
+      ) : (
+        <ul className="mt-2 space-y-1 text-sm">
+          {diff.added.map(n => <li key={`added-${n}`} data-diff-item={`added-${n}`}>新增列 {label(n)}</li>)}
+          {diff.removed.map(n => <li key={`removed-${n}`} data-diff-item={`removed-${n}`}>删除列 {label(n)}</li>)}
+          {diff.changed.map(c => <li key={`changed-${c.name}`} data-diff-item={`changed-${c.name}`}>{label(c.name)} 改了{c.fields.map(f => COLUMN_FIELD_LABELS[f]).join('、')}</li>)}
+          {diff.key && <li data-diff-item="key">去重键：{fieldList(diff.key.from)} → {fieldList(diff.key.to)}</li>}
+          {diff.latest && <li data-diff-item="latest">取最新字段：{latestText(diff.latest.from)} → {latestText(diff.latest.to)}</li>}
+          {diff.identity && <li data-diff-item="identity">身份打通匹配字段：{fieldList(diff.identity.from, '平台默认')} → {fieldList(diff.identity.to, '平台默认')}</li>}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, merge } = loaderData;
+  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, draftDiff, merge } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -325,6 +363,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
                   : '只读。'}
               </p>
             </div>
+            {selected.status === 'draft' && draftDiff && <DraftDiff entity={mapping.entity} version={selected.version} diff={draftDiff} />}
             {canWrite && (selected.status === 'draft' || !draft) ? (
               <Form method="post" className="space-y-3" key={`${selected.version}-${actionData?.draftId ?? ''}`}>
                 <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} functions={functions} focus={focus} />

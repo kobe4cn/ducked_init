@@ -244,6 +244,36 @@ describe('编写与发布映射', () => {
     expect(audit).toContain('「电商库」customers → 消费者，丢弃第 1 版草稿，映射已删除');
   });
 
+  it('查看草稿时展示它与最新已发布版本的差异；没有已发布版本时是首个版本，查看已发布版本时不展示', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    const first = await (await reviewer.get(`/mappings/${id}`)).text();
+    expect(first).toContain('data-draft-diff="1"');
+    expect(first).toContain('v1 是首个版本');
+
+    expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    expect(await (await reviewer.get(`/mappings/${id}`)).text()).not.toContain('data-draft-diff');
+
+    const v2 = ORDERS
+      .replace('amount: amount', 'amount: amount / 100')
+      .replace(/  status: .*\n/, "  created_at: from_timezone(created_at, 'Asia/Shanghai')\n")
+      + 'dedupe: { key: [order_id], latest: created_at }\n';
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: v2 })).status).toBe(302);
+    const diff = await (await reviewer.get(`/mappings/${id}`)).text();
+    expect(diff).toContain('v2 与已发布 v1 的差异');
+    for (const item of ['added-created_at', 'removed-status', 'changed-amount', 'latest']) expect(diff).toContain(`data-diff-item="${item}"`);
+    expect(diff).not.toContain('data-diff-item="key"');
+    // 只改注释时计划相同
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: `# 只加注释\n${ORDERS}` })).status).toBe(302);
+    expect(await (await reviewer.get(`/mappings/${id}`)).text()).toContain('data-diff-item="none"');
+    // 查看已发布的 v1 时不展示
+    expect(await (await reviewer.get(`/mappings/${id}?version=1`)).text()).not.toContain('data-draft-diff');
+  });
+
   it('租户里只有自己有发布权限时，发布区提示先邀请成员', async () => {
     const tenantId = await newTenant('solo');
     const admin = await memberOf(tenantId, 'admin@solo.com', 'admin');

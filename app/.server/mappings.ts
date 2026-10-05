@@ -22,6 +22,7 @@ import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
 import { CANONICAL_ENTITIES, entityLabel, entityOf } from '../lib/canonical-model';
 import { entityForTable } from '../lib/field-synonyms';
+import { diffPlans } from '../lib/mapping-diff';
 
 /** 可以展示给成员的业务错误；issues 是映射文档里带行列位置的问题 */
 export class MappingError extends Error {
@@ -532,13 +533,18 @@ export async function listMappings(actor: CurrentMember) {
   };
 }
 
-/** 映射详情：各版本（新的在前）、当前成员能否发布草稿及原因、本租户有发布权限的成员人数，以及合并历史 */
+/**
+ * 映射详情：各版本（新的在前）、当前成员能否发布草稿及原因、本租户有发布权限的成员人数、合并历史，
+ * 以及草稿相对最新已发布版本（against，没有时为 null）的差异（没有草稿时为 null；只下发差异，不下发计划）
+ */
 export async function getMapping(actor: CurrentMember, mappingId: string) {
   assertCan(actor, 'sources:read');
   const mapping = await requireMapping(actor.tenant.id, mappingId);
   const [source] = await getDb().select({ id: sources.id, name: sources.name, kind: sources.kind }).from(sources).where(eq(sources.id, mapping.sourceId));
   const versions = await getDb().select().from(mappingVersions).where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version));
   const merge = await mergesOfMapping(actor.tenant.id, mappingId);
+  const draft = versions.find(v => v.status === 'draft');
+  const live = versions.find(v => v.status === 'published');
   return {
     ...mapping,
     source,
@@ -554,6 +560,7 @@ export async function getMapping(actor: CurrentMember, mappingId: string) {
       updatedAt: v.updatedAt,
       publishBlocker: publishBlocker(actor, v),
     })),
+    draftDiff: draft ? { against: live?.version ?? null, ...diffPlans(live?.plan ?? null, draft.plan) } : null,
     merge,
   };
 }
