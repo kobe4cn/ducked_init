@@ -2,16 +2,18 @@
 // 另一位有发布权限的成员，最后保存的人看到不能发布的原因，租户里只有自己有发布权限时提示先邀请成员；编辑框旁对照源表的列统计与实体的标准字段；
 // 可按规则重新生成草稿填进编辑框，不保存），以及这个映射每次合并到标准层的结果；有已发布版本时可以立即合并这一个映射。
 // 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）；
-// 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）
-import { AlertTriangle, ArrowRight, Boxes, PencilLine, Play } from 'lucide-react';
+// 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）；
+// 编辑页可空跑正在查看的版本：在原始层样本上转换，编辑框下方展示样例行（敏感字段是哈希）与基础断言，不写标准层
+import { AlertTriangle, ArrowRight, Boxes, CheckCircle2, FlaskConical, PencilLine, Play } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
-import { discardDraft, draftForMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
+import { discardDraft, draftForMapping, dryRunMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
 import { functionList } from '~/lib/mapping-expr';
 import { isEnumField } from '~/lib/mapping-form';
+import type { DryRunResult } from '~/.server/pipeline/dry-run-engine';
 import type { FallbackStat } from '~/.server/pipeline/merge-engine';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel, entityOf } from '~/lib/canonical-model';
@@ -93,7 +95,12 @@ export async function action({ request, params }: Route.ActionArgs) {
     switch (field('intent')) {
       case 'draft':
         // 只生成、填进编辑框，不保存；draftId 让编辑框换成新内容
-        return { error: null, issues: [], yaml: await draftForMapping(await requirePermission(request, 'sources:write'), params.mappingId), draftId: crypto.randomUUID() };
+        return { error: null, issues: [], yaml: await draftForMapping(await requirePermission(request, 'sources:write'), params.mappingId), draftId: crypto.randomUUID(), dryRun: null };
+      case 'dryrun': {
+        // 只转换样本、展示结果，不保存，也不写标准层
+        const version = Number(field('version'));
+        return { error: null, issues: [], yaml: null, draftId: null, dryRun: { version, ...await dryRunMapping(await requirePermission(request, 'sources:write'), params.mappingId, version) } };
+      }
       case 'save':
         await saveDraft(await requirePermission(request, 'sources:write'), params.mappingId, field('yaml'));
         break;
@@ -110,10 +117,10 @@ export async function action({ request, params }: Route.ActionArgs) {
         break;
       }
       default:
-        return data({ error: '未知操作', issues: [], yaml: null, draftId: null }, { status: 400 });
+        return data({ error: '未知操作', issues: [], yaml: null, draftId: null, dryRun: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof MappingError) return data({ error: e.message, issues: e.issues, yaml: field('yaml') || null, draftId: null }, { status: e.status });
+    if (e instanceof MappingError) return data({ error: e.message, issues: e.issues, yaml: field('yaml') || null, draftId: null, dryRun: null }, { status: e.status });
     throw e;
   }
   // 回到提交时所在的标签页
@@ -127,11 +134,11 @@ const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixe
 type LoaderData = Route.ComponentProps['loaderData'];
 type MergeEntry = LoaderData['merge']['history'][number];
 
-/** 一列落入兜底的情况，如「订单状态有 2 种取值（共 312 行）落入兜底：closed（300）、pending_review（12）」 */
-function fallbackText(entity: string, f: FallbackStat) {
+/** 一列落入兜底的情况，如「订单状态有 2 种取值（共 312 行）落入兜底：closed（300）、pending_review（12）」；what 换掉「落入兜底」 */
+function fallbackText(entity: string, f: FallbackStat, what = '落入兜底') {
   const label = entityOf(entity)?.fields.find(x => x.name === f.column)?.label ?? f.column;
   const values = f.values.map(v => `${v.value}（${v.rows.toLocaleString('zh-CN')}）`).join('、');
-  return `${label}有 ${f.distinct} 种取值（共 ${f.rows.toLocaleString('zh-CN')} 行）落入兜底：${values}${f.distinct > f.values.length ? ' 等' : ''}`;
+  return `${label}有 ${f.distinct} 种取值（共 ${f.rows.toLocaleString('zh-CN')} 行）${what}：${values}${f.distinct > f.values.length ? ' 等' : ''}`;
 }
 
 /** 把落入兜底的取值加进值对照：打开编辑标签页的表单，定位到该字段（只用于标准枚举字段） */
@@ -168,6 +175,74 @@ function MergeRow({ e, base, canWrite }: { e: MergeEntry; base: string; canWrite
       <TableCell>{duration(e.durationMs)}</TableCell>
       <TableCell>{time(e.startedAt)}</TableCell>
     </TableRow>
+  );
+}
+
+/** 一条断言：通过时绿色对勾，否则按严重程度标红（合并会失败）或标黄（合并照常，值得留意） */
+function Assertion({ name, ok, severe, children }: { name: string; ok: boolean; severe?: boolean; children: React.ReactNode }) {
+  const tone = ok ? 'text-emerald-600' : severe ? 'text-red-600' : 'text-amber-600';
+  return (
+    <li className={`flex items-start gap-2 text-sm ${tone}`} data-assertion={name} data-ok={ok}>
+      {ok ? <CheckCircle2 className="mt-0.5 size-4 shrink-0" /> : <AlertTriangle className="mt-0.5 size-4 shrink-0" />}
+      <span className="whitespace-normal">{children}</span>
+    </li>
+  );
+}
+
+/** 空跑结果：基础断言与转换后的样例行（敏感字段是加盐哈希，空值显示为 —） */
+function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult & { version: number } }) {
+  const { assertions: a, columns, rows, sampled } = result;
+  const label = (name: string) => entityOf(entity)?.fields.find(f => f.name === name)?.label ?? name;
+  const keys = a.key.map(label).join('、');
+  return (
+    <section className="mt-6 space-y-4 border-t pt-6" data-dryrun={result.version}>
+      <div>
+        <h2 className="font-semibold">{`空跑 v${result.version}`}</h2>
+        <p className="max-w-2xl text-sm text-slate-500">{`取原始层里最新的 ${sampled} 条记录（最多 ${result.limit} 条）转换，没有写进标准层。`}</p>
+      </div>
+      <ul className="space-y-1.5">
+        <Assertion name="key-nulls" ok={!a.keyNulls} severe>{a.keyNulls ? `去重键（${keys}）有 ${a.keyNulls} 行为空，合并会失败` : `去重键（${keys}）都不为空`}</Assertion>
+        <Assertion name="key-unique" ok={!a.keyDuplicates}>{a.keyDuplicates ? `${a.keyDuplicates} 个去重键出现在不止一行，合并时只取最新的一行` : '去重键在样本里都唯一'}</Assertion>
+        {Object.entries(a.requiredNulls).filter(([name]) => !a.key.includes(name)).map(([name, nulls]) => (
+          <Assertion key={name} name={`required-${name}`} ok={!nulls}>{nulls ? `必填字段${label(name)}有 ${nulls} 行为空` : `必填字段${label(name)}都不为空`}</Assertion>
+        ))}
+        {a.unknownValues.map(u => (
+          <Assertion key={u.column} name={`unknown-${u.column}`} ok={false} severe={!u.fallback}>
+            {u.fallback ? fallbackText(entity, u) : `${fallbackText(entity, u, '不在值字典里')}，没写兜底值，合并会失败`}
+          </Assertion>
+        ))}
+      </ul>
+      <div className="overflow-x-auto rounded-2xl border bg-white">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              {columns.map(c => (
+                <TableHead key={c.name} data-dryrun-column={c.name}>
+                  <span className="block font-mono">{c.name}</span>
+                  <span className="block text-xs font-normal text-slate-400">{`${c.sensitive ? '哈希 · ' : ''}空 ${c.nulls}/${sampled}`}</span>
+                </TableHead>
+              ))}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((r, i) => (
+              <TableRow key={i} data-dryrun-row>
+                {columns.map(c => (
+                  <TableCell key={c.name} className={`max-w-[16rem] truncate ${c.sensitive ? 'font-mono text-xs' : ''}`} title={r[c.name] == null ? undefined : String(r[c.name])}>
+                    {r[c.name] == null ? <span className="text-slate-400">—</span> : String(r[c.name])}
+                  </TableCell>
+                ))}
+              </TableRow>
+            ))}
+            {!rows.length && (
+              <TableRow>
+                <TableCell colSpan={columns.length} className="text-center text-slate-500">源表在原始层里没有记录</TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </div>
+    </section>
   );
 }
 
@@ -265,6 +340,15 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
             ) : (
               <MappingEditor key={selected.version} defaultValue={selected.yaml} readOnly />
             )}
+            {canWrite && (
+              <Form method="post" className="mt-4 flex flex-wrap items-center gap-3">
+                <input type="hidden" name="intent" value="dryrun" />
+                <input type="hidden" name="version" value={selected.version} />
+                <Button type="submit" variant="outline" disabled={submitting}><FlaskConical />{`空跑 v${selected.version}`}</Button>
+                <span className="text-sm text-slate-500">在原始层最新的样本上转换已保存的这一版，看样例行与基础断言；编辑框里没保存的修改不参与，也不写标准层。</span>
+              </Form>
+            )}
+            {actionData?.dryRun && actionData.dryRun.version === selected.version && <DryRunPanel entity={mapping.entity} result={actionData.dryRun} />}
           </>
         )}
 

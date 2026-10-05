@@ -1,5 +1,6 @@
 // app/.server/mappings.ts —— 映射：数据工程师用 YAML 编写“源表 → 标准实体”的映射，校验通过才能保存为草稿；草稿由最后保存它的人以外的
 // 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后为这个映射入队合并任务（silver.merge），同步给已发布映射的源表写入变更后也为这些映射再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
+// 编辑时可对任一版本空跑：在请求内只读挂载本租户的数据湖，转换原始层的样本，返回样例行与基础断言，不写标准层（pipeline/dry-run-engine.ts）。
 // 一律限定在操作者所属租户内；合并本身在工作进程里进行（pipeline/merge-engine.ts）
 import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -7,11 +8,15 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, tasks, tenants, type TaskStatus } from './db/schema';
+import { lakeReady, lakeRow, lakeSpecOf } from './lake';
+import { dryRun } from './pipeline/dry-run-engine';
 import { identityRules } from './pipeline/identity-engine';
+import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import type { MergeMappingParam, MergeRecord } from './pipeline/merge-engine';
 import { draftMapping } from './pipeline/mapping-draft';
 import { checkMapping, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
+import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
 import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
@@ -25,6 +30,10 @@ export class MappingError extends Error {
 
 /** 映射详情的合并历史取最近多少次带这个映射的合并任务 */
 const HISTORY_TASKS = 50;
+
+/** 空跑取多少条源记录，与所用的计算资源 */
+const DRY_RUN_ROWS = 50;
+const DRY_RUN_LIMITS = { memoryLimitMb: 512, threads: 1 };
 
 /** 数据源里各表最近一次成功采集到的列统计（带声明的业务主键）：表不在同步范围、还没采集时返回原因 */
 async function profiledTables(tenantId: string, sourceId: string) {
@@ -282,6 +291,33 @@ export async function discardDraft(actor: CurrentMember, mappingId: string) {
     });
     return { kept: published !== null };
   });
+}
+
+/**
+ * 空跑映射的第 version 版：在只读挂载的数据湖上转换原始层里源表最新的样本（只用会话的本机库 stage），返回样例行与基础断言。
+ * 不写标准层与合并日志、不记审计。源表还没同步、转换出错时抛出 MappingError（报错里抹掉凭据、盐与敏感字段的取值）
+ */
+export async function dryRunMapping(actor: CurrentMember, mappingId: string, version: number) {
+  assertCan(actor, 'sources:write');
+  const mapping = await requireMapping(actor.tenant.id, mappingId);
+  const [row] = await getDb().select({ plan: mappingVersions.plan }).from(mappingVersions)
+    .where(and(eq(mappingVersions.mappingId, mappingId), eq(mappingVersions.version, version)));
+  if (!row) throw new MappingError(`没有第 ${version} 版`, 404);
+  const lake = await lakeRow(actor.tenant.id);
+  if (!lake || !lakeReady(lake)) throw new MappingError('本租户的数据湖还没有初始化');
+  const salt = await tenantPiiSalt(actor.tenant.id);
+  const spec = lakeSpecOf(lake);
+  const session = await openTenantLake(spec, DRY_RUN_LIMITS, undefined, { readOnly: true });
+  try {
+    const result = await dryRun(session.con, row.plan, mapping.sourceId, salt, DRY_RUN_ROWS);
+    if ('skipped' in result) throw new MappingError(result.skipped);
+    return result;
+  } catch (e) {
+    if (e instanceof MappingError) throw e;
+    throw new MappingError(`空跑失败：${redactLakeSecrets((e as Error).message, spec).replaceAll(salt, '***')}`);
+  } finally {
+    session.close();
+  }
 }
 
 /** 租户各映射（给了 mappingIds 时只取这些）最新的已发布版本及其合并计划（合并任务的参数） */

@@ -23,6 +23,9 @@ export interface MergeMappingParam extends MergePlan { mapping: string; version:
  */
 export interface FallbackStat { column: string; values: { value: string; rows: number }[]; distinct: number; rows: number }
 
+/** 合并或空跑的中间表：每条源记录的最后一版 latest，与其中仍存在的记录 live（带出现次数 _n） */
+export interface LiveTables { latest: string; live: string }
+
 /** 一个映射一次合并的结果。时间为 ISO 字符串 */
 export type MergeRecord = { mapping: string; entity: string; table: string; version: number; startedAt: string; durationMs: number } & (
   | {
@@ -61,7 +64,7 @@ const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 const columnsOf = (con: DuckDBConnection, relation: string) => rows<{ column_name: string; column_type: string }>(con, `DESCRIBE ${relation}`);
 const count = async (con: DuckDBConnection, relation: string) => Number((await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${relation}`))[0].n);
-const tableExists = async (con: DuckDBConnection, schema: string, name: string) => (await rows(con, `
+export const tableExists = async (con: DuckDBConnection, schema: string, name: string) => (await rows(con, `
   SELECT 1 FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = ${lit(schema)} AND table_name = ${lit(name)}`)).length > 0;
 const keyList = (keys: string[], alias?: string) => keys.map(k => (alias ? `${alias}.${ident(k)}` : ident(k))).join(', ');
 const joinOn = (keys: string[], a: string, b: string) => keys.map(k => `${a}.${ident(k)} = ${b}.${ident(k)}`).join(' AND ');
@@ -139,29 +142,37 @@ function columnValue(c: PlanColumn, alias: string, salt: string | null) {
 }
 
 /**
+ * 一列在 live 里值字典没有、或（没有值字典时）不是标准枚举的取值：出现最多的几个取值与行数（按 _n 计）。
+ * 没有值字典也没有标准枚举，或没有这样的取值时返回 null
+ */
+export async function unknownValues(con: DuckDBConnection, c: PlanColumn, live: string): Promise<FallbackStat | null> {
+  const allowed = c.dictionary ? Object.keys(c.dictionary) : c.enum;
+  if (!allowed) return null;
+  const raw = `CAST(${rawValue(c, 'l')} AS VARCHAR)`;
+  // 没有主键的表一种整行一条当前记录，_n 是它出现的次数
+  const unknown = await rows<{ v: string; n: string; distinct_values: string; total_rows: string }>(con, `
+    SELECT v, n, count(*) OVER () AS distinct_values, sum(n) OVER () AS total_rows FROM (
+      SELECT ${raw} AS v, sum(l._n) AS n FROM ${live} l
+      WHERE ${raw} IS NOT NULL AND ${raw} NOT IN (${allowed.map(lit).join(', ')}) GROUP BY 1)
+    ORDER BY n DESC, v LIMIT 5`);
+  if (!unknown.length) return null;
+  return { column: c.name, values: unknown.map(u => ({ value: u.v, rows: Number(u.n) })), distinct: Number(unknown[0].distinct_values), rows: Number(unknown[0].total_rows) };
+}
+
+/**
  * 值字典里没有、或（没有值字典时）不是标准枚举的取值：没写兜底值时报错，不悄悄写进标准层，列出出现最多的几个取值与行数；
  * 写了兜底值时返回落入兜底的统计
  */
 async function checkUnknownValues(con: DuckDBConnection, columns: PlanColumn[]) {
   const fallback: FallbackStat[] = [];
   for (const c of columns) {
-    const allowed = c.dictionary ? Object.keys(c.dictionary) : c.enum;
-    if (!allowed) continue;
-    const raw = `CAST(${rawValue(c, 'l')} AS VARCHAR)`;
-    // 没有主键的表一种整行一条当前记录，_n 是它出现的次数
-    const unknown = await rows<{ v: string; n: string; distinct_values: string; total_rows: string }>(con, `
-      SELECT v, n, count(*) OVER () AS distinct_values, sum(n) OVER () AS total_rows FROM (
-        SELECT ${raw} AS v, sum(l._n) AS n FROM ${LIVE} l
-        WHERE ${raw} IS NOT NULL AND ${raw} NOT IN (${allowed.map(lit).join(', ')}) GROUP BY 1)
-      ORDER BY n DESC, v LIMIT 5`);
-    if (!unknown.length) continue;
+    const unknown = await unknownValues(con, c, LIVE);
+    if (!unknown) continue;
     if (c.otherwise !== undefined) {
-      fallback.push({
-        column: c.name, values: unknown.map(u => ({ value: u.v, rows: Number(u.n) })), distinct: Number(unknown[0].distinct_values), rows: Number(unknown[0].total_rows),
-      });
+      fallback.push(unknown);
       continue;
     }
-    const shown = unknown.map(u => `'${u.v}'（${u.n} 行）`).join('、');
+    const shown = unknown.values.map(u => `'${u.value}'（${u.rows} 行）`).join('、');
     throw new Error(c.dictionary
       ? `字段 ${c.name} 有值字典里没有的取值：${shown}，请在值字典里补上，或用 otherwise 写兜底值，再重新发布`
       : `字段 ${c.name} 有不是标准枚举的取值：${shown}，请用值字典对应到 ${c.enum!.join('、')}，或用 otherwise 写兜底值`);
@@ -173,14 +184,50 @@ async function checkUnknownValues(con: DuckDBConnection, columns: PlanColumn[]) 
  * 转换出错时 DuckDB 的报错可能带出源端的取值：把敏感字段引用的源列里出现在报错中的取值（原样或去掉首尾空格后）抹掉，
  * 不区分大小写。只有一个字的取值不抹，免得把整条报错抹花
  */
-async function withoutPii(con: DuckDBConnection, columns: PlanColumn[], message: string) {
+async function withoutPii(con: DuckDBConnection, columns: PlanColumn[], message: string, live: string) {
   const sources = [...new Set(columns.flatMap(c => referencedColumns(parseExpression(c.expr)).map(r => r.name)))];
   if (!sources.length) return message;
   const found = await rows<{ v: string }>(con, `
-    SELECT DISTINCT v FROM (${sources.map(s => `SELECT CAST(l.${ident(s)} AS VARCHAR) AS raw FROM ${LIVE} l`).join(' UNION ALL ')}), unnest([raw, trim(raw)]) AS t(v)
+    SELECT DISTINCT v FROM (${sources.map(s => `SELECT CAST(l.${ident(s)} AS VARCHAR) AS raw FROM ${live} l`).join(' UNION ALL ')}), unnest([raw, trim(raw)]) AS t(v)
     WHERE length(v) > 1 AND contains(${lit(message.toLowerCase())}, lower(v))`);
   return found.map(f => f.v).sort((a, b) => b.length - a.length)
     .reduce((m, v) => m.replace(new RegExp(v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '***'), message);
+}
+
+/**
+ * 每条源记录在原始层 (from, to] 批次里的最后一版写进 latest，其中仍存在的写进 live：有主键时按主键取最新（同一批次里一删一增取新增）；
+ * 没有主键时按整行累计出现次数的变化，held 是之前的当前记录（带 _n，由全部批次重建时为 null）
+ */
+export async function liveRecords(
+  con: DuckDBConnection, bronze: string, sourceKeys: string[], { from, to, held }: { from: number; to: number; held: string | null }, { latest, live }: LiveTables,
+) {
+  const window = `b._batch > ${from} AND b._batch <= ${to}`;
+  if (sourceKeys.length) {
+    await con.run(`CREATE OR REPLACE TABLE ${latest} AS SELECT * EXCLUDE (_rn) FROM (
+      SELECT b.*, hash(${keyList(sourceKeys, 'b')}) AS _src, 0::BIGINT AS _delta,
+        row_number() OVER (PARTITION BY ${keyList(sourceKeys, 'b')} ORDER BY b._batch DESC, b._op = 'delete') AS _rn
+      FROM ${bronze} b WHERE ${window}) WHERE _rn = 1`);
+    await con.run(`CREATE OR REPLACE TABLE ${live} AS SELECT l.*, 1::BIGINT AS _n FROM ${latest} l WHERE l._op <> 'delete'`);
+    return;
+  }
+  const data = (await columnsOf(con, bronze)).map(c => c.column_name).filter(c => !PLATFORM_COLUMNS.includes(c));
+  await con.run(`CREATE OR REPLACE TABLE ${latest} AS SELECT * EXCLUDE (_rn) FROM (
+    SELECT h.*, sum(CASE WHEN h._op = 'delete' THEN -1 ELSE 1 END) OVER (PARTITION BY h._src) AS _delta,
+      row_number() OVER (PARTITION BY h._src ORDER BY h._batch DESC) AS _rn
+    FROM (SELECT b.*, ${rowHash(data, 'b')} AS _src FROM ${bronze} b WHERE ${window}) h) WHERE _rn = 1`);
+  await con.run(`CREATE OR REPLACE TABLE ${live} AS SELECT * FROM (
+    SELECT l.*, coalesce(r._n, 0) + l._delta AS _n FROM ${latest} l LEFT JOIN ${held ?? '(SELECT NULL::UBIGINT AS _src, NULL::BIGINT AS _n LIMIT 0)'} r ON r._src = l._src) WHERE _n > 0`);
+}
+
+/**
+ * 把 live 里的记录按合并计划转换成各列，写进 into（带 _src、_n、_batch）。敏感字段在这一步就换成按租户加盐的哈希；
+ * 转换出错时报错里抹掉敏感字段引用的源端取值
+ */
+export async function transformRows(con: DuckDBConnection, plan: MergePlan, salt: string, { live, into }: { live: string; into: string }) {
+  const pii = sensitiveColumns(plan);
+  await con.run(`CREATE OR REPLACE TABLE ${into} AS
+    SELECT l._src, l._n, l._batch, ${plan.columns.map(c => `${columnValue(c, 'l', pii.has(c.name) ? salt : null)} AS ${ident(c.name)}`).join(', ')} FROM ${live} l`)
+    .catch(async (e: Error) => { throw new Error(await withoutPii(con, plan.columns.filter(c => pii.has(c.name)), e.message, live)); });
 }
 
 /** 标准层表不存在时按实体的全部字段建表，存在时补上新的扩展字段。敏感字段存哈希，类型总是 VARCHAR */
@@ -218,7 +265,6 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   const silver = silverTable(plan.entity);
   // 没有主键的表按整行区分记录
   const sourceKeys = await sourceKeysOf(con, plan.sourceId, plan.table) ?? [];
-  const keyed = sourceKeys.length > 0;
   const [last] = await rows<LastMerge>(con, `
     SELECT version, source_keys, batch_to, scheme FROM ${MERGES} WHERE mapping_id = ${lit(plan.mapping)} ORDER BY started_at DESC LIMIT 1`);
   const rebuild = !last || last.version !== plan.version || last.source_keys !== sourceKeys.join(',') || last.scheme !== SCHEME
@@ -231,32 +277,11 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     return { ...base, durationMs: Date.now() - startedAt.getTime(), mode: 'incremental', batchFrom: from, batchTo: from, inserted: 0, updated: 0, deleted: 0, rows: await silverRows() };
   }
 
-  const data = (await columnsOf(con, bronze)).map(c => c.column_name).filter(c => !PLATFORM_COLUMNS.includes(c));
-  const window = `b._batch > ${from} AND b._batch <= ${to}`;
-  // 每条源记录在这些批次里的最后一版：有主键时按主键取最新（同一批次里一删一增取新增）；没有主键时按整行累计出现次数的变化
-  if (keyed) {
-    await con.run(`CREATE OR REPLACE TABLE ${LATEST} AS SELECT * EXCLUDE (_rn) FROM (
-      SELECT b.*, hash(${keyList(sourceKeys, 'b')}) AS _src, 0::BIGINT AS _delta,
-        row_number() OVER (PARTITION BY ${keyList(sourceKeys, 'b')} ORDER BY b._batch DESC, b._op = 'delete') AS _rn
-      FROM ${bronze} b WHERE ${window}) WHERE _rn = 1`);
-    await con.run(`CREATE OR REPLACE TABLE ${LIVE} AS SELECT l.*, 1::BIGINT AS _n FROM ${LATEST} l WHERE l._op <> 'delete'`);
-  } else {
-    await con.run(`CREATE OR REPLACE TABLE ${LATEST} AS SELECT * EXCLUDE (_rn) FROM (
-      SELECT h.*, sum(CASE WHEN h._op = 'delete' THEN -1 ELSE 1 END) OVER (PARTITION BY h._src) AS _delta,
-        row_number() OVER (PARTITION BY h._src ORDER BY h._batch DESC) AS _rn
-      FROM (SELECT b.*, ${rowHash(data, 'b')} AS _src FROM ${bronze} b WHERE ${window}) h) WHERE _rn = 1`);
-    const held = rebuild ? `(SELECT NULL::UBIGINT AS _src, NULL::BIGINT AS _n LIMIT 0)` : records;
-    await con.run(`CREATE OR REPLACE TABLE ${LIVE} AS SELECT * FROM (
-      SELECT l.*, coalesce(r._n, 0) + l._delta AS _n FROM ${LATEST} l LEFT JOIN ${held} r ON r._src = l._src) WHERE _n > 0`);
-  }
-
-  // 转换：先查出值字典与标准枚举之外的取值（没写兜底值时报错；敏感字段不查，取值会进报错与兜底统计），再算出各列。
-  // 敏感字段在这一步就换成哈希：ROWS 也是当前记录
+  await liveRecords(con, bronze, sourceKeys, { from, to, held: rebuild ? null : records }, { latest: LATEST, live: LIVE });
+  // 先查出值字典与标准枚举之外的取值（没写兜底值时报错；敏感字段不查，取值会进报错与兜底统计），再转换
   const pii = sensitiveColumns(plan);
   const fallback = await checkUnknownValues(con, plan.columns.filter(c => !pii.has(c.name)));
-  await con.run(`CREATE OR REPLACE TABLE ${ROWS} AS
-    SELECT l._src, l._n, l._batch, ${plan.columns.map(c => `${columnValue(c, 'l', pii.has(c.name) ? salt : null)} AS ${ident(c.name)}`).join(', ')} FROM ${LIVE} l`)
-    .catch(async (e: Error) => { throw new Error(await withoutPii(con, plan.columns.filter(c => pii.has(c.name)), e.message)); });
+  await transformRows(con, plan, salt, { live: LIVE, into: ROWS });
   const key = plan.key;
   const [{ n: nullKeys }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${ROWS} WHERE ${key.map(k => `${ident(k)} IS NULL`).join(' OR ')}`);
   if (Number(nullKeys)) throw new Error(`去重键 ${key.join('、')} 有 ${nullKeys} 行为空，请检查映射或在源端补齐`);

@@ -155,6 +155,43 @@ describe('编写与发布映射', () => {
     expect(await (await (await loginAs(app, 'an@acme.com')).get(`/mappings/${id}?tab=merges`)).text()).not.toContain('data-add-to-dictionary');
   });
 
+  it('编辑页空跑正在查看的版本：展示样例行（邮箱是哈希）与断言，不保存；没同步时提示原因；分析师 403、其他租户 404', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await memberOf(tenantId, 'de@acme.com');
+    const author = await loginAs(app, 'de@acme.com');
+    const id = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: `${CUSTOMERS}identity:\n  match: [email]\n` }));
+    expect(await (await author.get(`/mappings/${id}`)).text()).toContain('name="intent" value="dryrun"');
+    // 源表还没同步进原始层
+    const early = await author.post(`/mappings/${id}`, { intent: 'dryrun', version: '1' });
+    expect(early.status).toBe(400);
+    expect(await early.text()).toContain('源表 customers 还没有同步进原始层，首次同步后再空跑');
+
+    await confirmWatermark(engineer, sourceId, 'customers', 'updated_at');
+    await syncSource(engineer, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const res = await author.post(`/mappings/${id}`, { intent: 'dryrun', version: '1' });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-dryrun="1"');
+    expect(html).toContain('取原始层里最新的 40 条记录（最多 50 条）转换');
+    expect(html.match(/data-dryrun-row/g)).toHaveLength(40);
+    expect(html).toMatch(/data-assertion="key-nulls" data-ok="true"/);
+    expect(html).toMatch(/data-assertion="required-email" data-ok="false"/);
+    expect(html).toContain('必填字段邮箱有 10 行为空');
+    expect(html).toMatch(/>[0-9a-f]{64}</);
+    expect(html).not.toMatch(/[\w.]+@example\.\w+/);
+    // 空跑不保存：版本仍只有一版
+    expect(await (await author.get(`/mappings/${id}?tab=versions`)).text()).toContain('版本（1）');
+
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an@acme.com');
+    expect(await (await analyst.get(`/mappings/${id}`)).text()).not.toContain('value="dryrun"');
+    expect((await analyst.post(`/mappings/${id}`, { intent: 'dryrun', version: '1' })).status).toBe(403);
+    const other = await newTenant('globex');
+    await memberOf(other, 'de@globex.com', 'data_engineer');
+    expect((await (await loginAs(app, 'de@globex.com')).post(`/mappings/${id}`, { intent: 'dryrun', version: '1' })).status).toBe(404);
+  });
+
   it('发布者不能是最后保存草稿的人：A 起草、B 修改后 A 能发布、B 不能，反过来也一样', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const a = await loginAs(app, 'de@acme.com');
