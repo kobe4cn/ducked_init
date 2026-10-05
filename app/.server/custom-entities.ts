@@ -1,13 +1,14 @@
 // app/.server/custom-entities.ts —— 自定义实体登记（ADR-0019）：成员在标准模型之外登记的实体，名称 custom_ 开头、租户内唯一（建实体时定下，之后不能改），
 // 每一版登记中文名、类型（维度 / 事实，只用于引导）、字段（名称、类型、说明、是否敏感）与主键。保存草稿时校验登记本身。
 // 草稿按映射同样的规则双人发布：由最后保存它的人以外的另一位有发布权限的成员在页面上发布，也可以丢弃（回到最近的已发布版本，
-// 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。一律限定在操作者所属租户内
-import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
+// 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。发布过的实体只能新增字段（规则同 ADR-0018），
+// 没被已发布映射引用的实体可以由有发布权限的成员删除。一律限定在操作者所属租户内
+import { and, desc, eq, exists, getTableColumns, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
-import { customEntities, customEntityVersions } from './db/schema';
+import { customEntities, customEntityVersions, mappings, mappingVersions, sources } from './db/schema';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType } from '../lib/canonical-model';
 
@@ -67,6 +68,24 @@ function checkRegistration(input: CustomEntityInput): Omit<RegisteredEntity, 'na
   return { label, kind: input.kind, fields, primaryKey };
 }
 
+/**
+ * 发布后只能新增字段：新的一版与最近的已发布版本相比，已有字段不能少、类型与敏感标记不能变，主键必须完全相同。
+ * 中文名、类型（维度 / 事实）、字段说明与字段顺序可以改。不兼容时抛出 CustomEntityError
+ */
+function checkAdditive(published: Omit<RegisteredEntity, 'name'>, next: Omit<RegisteredEntity, 'name'>) {
+  const reject = (reason: string) => {
+    throw new CustomEntityError(`${reason}：发布后只能新增字段；改主键、改类型、改名要新建实体`);
+  };
+  const nextByName = new Map(next.fields.map(f => [f.name, f]));
+  for (const f of published.fields) {
+    const nextField = nextByName.get(f.name);
+    if (!nextField) reject(`不能删除字段 ${f.name}`);
+    else if (nextField.type !== f.type) reject(`不能改字段 ${f.name} 的类型（${f.type} → ${nextField.type}）`);
+    else if (nextField.sensitive !== f.sensitive) reject(`不能改字段 ${f.name} 的敏感标记`);
+  }
+  if (next.primaryKey.join() !== published.primaryKey.join()) reject(`不能改主键（${published.primaryKey.join(', ')}）`);
+}
+
 /** 本租户的自定义实体；不存在（含属于别的租户）时 404 */
 async function requireEntity(tenantId: string, entityId: string) {
   if (!/^[0-9a-f-]{36}$/i.test(entityId)) throw new CustomEntityError('自定义实体不存在', 404);
@@ -74,6 +93,22 @@ async function requireEntity(tenantId: string, entityId: string) {
     .where(and(eq(customEntities.id, entityId), eq(customEntities.tenantId, tenantId)));
   if (!row) throw new CustomEntityError('自定义实体不存在', 404);
   return row;
+}
+
+/**
+ * 引用这个实体的已发布映射（有已发布版本、映射的实体是它；映射的实体建映射时定下），按「数据源」表名列出。
+ * 指标与标签还不能引用自定义实体，只查映射
+ */
+async function publishedReferrers(db: Tx | ReturnType<typeof getDb>, tenantId: string, name: string) {
+  const rows = await db.select({ source: sources.name, table: mappings.tableName, viewId: mappings.sourceViewId })
+    .from(mappings).innerJoin(sources, eq(sources.id, mappings.sourceId))
+    .where(and(
+      eq(mappings.tenantId, tenantId), eq(mappings.entity, name),
+      exists(db.select({ id: mappingVersions.id }).from(mappingVersions)
+        .where(and(eq(mappingVersions.mappingId, mappings.id), eq(mappingVersions.status, 'published')))),
+    ))
+    .orderBy(sources.name, mappings.tableName);
+  return rows.map(r => `「${r.source}」${r.viewId ? '源视图 ' : ''}${r.table}`);
 }
 
 /** 列表里的一个自定义实体：最新一版的中文名与类型，最近的已发布版本号与草稿的版本号（没有时为 null） */
@@ -99,7 +134,7 @@ export async function listCustomEntities(actor: CurrentMember) {
   return [...entities.values()];
 }
 
-/** 自定义实体详情：各版本（最新的在前，带当前成员发布不了的原因）、草稿与最近的已发布版本，以及本租户有发布权限的成员人数 */
+/** 自定义实体详情：各版本（最新的在前，带当前成员发布不了的原因）、草稿与最近的已发布版本、本租户有发布权限的成员人数，以及引用它的已发布映射 */
 export async function getCustomEntity(actor: CurrentMember, entityId: string) {
   assertCan(actor, 'sources:read');
   const entity = await requireEntity(actor.tenant.id, entityId);
@@ -115,6 +150,7 @@ export async function getCustomEntity(actor: CurrentMember, entityId: string) {
     draft: versions.find(v => v.status === 'draft') ?? null,
     published: versions.find(v => v.status === 'published') ?? null,
     publishers: await publisherCount(actor.tenant.id),
+    referrers: await publishedReferrers(getDb(), actor.tenant.id, entity.name),
   };
 }
 
@@ -145,7 +181,7 @@ export async function createCustomEntity(actor: CurrentMember, input: CustomEnti
 }
 
 /**
- * 保存草稿：登记校验通过后，已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
+ * 保存草稿：登记校验通过、且发布过时只新增了字段（checkAdditive）后，已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
  * 名称不能改，input.name 被忽略。返回草稿的版本号
  */
 export async function saveCustomEntityDraft(actor: CurrentMember, entityId: string, input: CustomEntityInput) {
@@ -158,6 +194,10 @@ export async function saveCustomEntityDraft(actor: CurrentMember, entityId: stri
     if (!locked) throw new CustomEntityError('自定义实体已被删除', 404);
     const [latest] = await tx.select().from(customEntityVersions)
       .where(eq(customEntityVersions.entityId, entityId)).orderBy(desc(customEntityVersions.version)).limit(1);
+    const [published] = await tx.select().from(customEntityVersions)
+      .where(and(eq(customEntityVersions.entityId, entityId), eq(customEntityVersions.status, 'published')))
+      .orderBy(desc(customEntityVersions.version)).limit(1);
+    if (published) checkAdditive(published, registration);
     if (latest?.status === 'draft') {
       await tx.update(customEntityVersions)
         .set({ ...registration, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
@@ -234,6 +274,30 @@ export async function discardCustomEntityDraft(actor: CurrentMember, entityId: s
       detail: { name: entity.name, version: draft.version, published },
     });
     return { kept: published !== null };
+  });
+}
+
+/**
+ * 删除自定义实体（硬删除，各版本随之级联删除）：需要发布权限；被已发布的映射引用时拒绝并列出这些映射。
+ * 引用检查与删除在同一事务里，并锁住实体行（发布映射目前不锁实体行，要等映射发布对照登记校验时才完全互斥）
+ */
+export async function deleteCustomEntity(actor: CurrentMember, entityId: string) {
+  assertCan(actor, 'publish');
+  const entity = await requireEntity(actor.tenant.id, entityId);
+  await getDb().transaction(async tx => {
+    const [locked] = await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
+    if (!locked) throw new CustomEntityError('自定义实体已被删除', 404);
+    const referrers = await publishedReferrers(tx, actor.tenant.id, entity.name);
+    if (referrers.length) throw new CustomEntityError(`${entity.name} 被已发布的映射引用，不能删除：${referrers.join('、')}`);
+    await tx.delete(customEntities).where(eq(customEntities.id, entityId));
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id,
+      actor,
+      action: 'custom_entity.deleted',
+      targetType: 'custom_entity',
+      targetId: entityId,
+      detail: { name: entity.name },
+    });
   });
 }
 

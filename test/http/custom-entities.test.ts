@@ -1,5 +1,6 @@
 // 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），最后保存的人发布不了，
-// 另一位成员在详情页发布；再改是新的一版草稿。分析师只读，查看者 403，其他租户 404；导航「映射」后面是「自定义实体」
+// 另一位成员在详情页发布；再改是新的一版草稿。分析师只读，查看者 403，其他租户 404；导航「映射」后面是「自定义实体」。
+// 有发布权限的成员删除实体后回到列表
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { memberOf, newTenant } from '../pipeline/fixtures';
@@ -87,10 +88,11 @@ describe('自定义实体', () => {
     expect(html).toContain('只读。');
     expect(html).toContain('仅管理员、数据工程师可以发布映射与定义');
     expect(html).not.toContain('value="save"');
+    expect(html).not.toContain('value="delete"');
     expect(html).toContain('data-field="manager_phone"');
     expect((await analyst.post('/entities', { ...STORE, name: 'custom_x' })).status).toBe(403);
     const { intent: _, ...rest } = STORE;
-    for (const form of [{ ...rest, intent: 'save' }, { intent: 'publish', version: '1' }, { intent: 'discard' }] as Record<string, string | string[]>[]) {
+    for (const form of [{ ...rest, intent: 'save' }, { intent: 'publish', version: '1' }, { intent: 'discard' }, { intent: 'delete' }] as Record<string, string | string[]>[]) {
       expect((await analyst.post(page, form)).status, String(form.intent)).toBe(403);
     }
 
@@ -105,11 +107,23 @@ describe('自定义实体', () => {
     expect((await outsider.get(page)).status).toBe(404);
     expect((await outsider.post(page, { ...rest, intent: 'save' })).status).toBe(404);
     expect((await outsider.post(page, { intent: 'discard' })).status).toBe(404);
+    expect((await outsider.post(page, { intent: 'delete' })).status).toBe(404);
     expect(await (await outsider.get('/entities')).text()).not.toContain('data-custom-entity=');
 
     // 从没发布过的实体丢弃草稿即整条删除，回到列表
     const discarded = await author.post(page, { intent: 'discard' });
     expect(locationOf(discarded)).toBe('/entities');
     expect((await author.get(page)).status).toBe(404);
+  });
+
+  it('有发布权限的成员删除实体，回到列表', async () => {
+    await acme();
+    const author = await loginAs(app, 'de@acme.com');
+    const page = locationOf(await author.post('/entities', STORE));
+    expect(await (await author.get(page)).text()).toContain('value="delete"');
+    const deleted = await author.post(page, { intent: 'delete' });
+    expect(locationOf(deleted)).toBe('/entities');
+    expect((await author.get(page)).status).toBe(404);
+    expect(await (await author.get('/entities')).text()).not.toContain('data-custom-entity=');
   });
 });

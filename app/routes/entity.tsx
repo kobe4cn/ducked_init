@@ -1,12 +1,13 @@
 // app/routes/entity.tsx —— 单个自定义实体（ADR-0019）：数据工程师、管理员编辑登记（中文名、类型、字段与主键；名称建实体时定下，不能改），
-// 各版本（已发布的锁定、草稿可改）、丢弃草稿，发布草稿需最后保存它的人以外的另一位有发布权限的成员在这个页面上操作，没有自动发布。
+// 各版本（已发布的锁定、草稿可改；发布过的只能新增字段）、丢弃草稿，发布草稿需最后保存它的人以外的另一位有发布权限的成员在这个页面上操作，
+// 没有自动发布。有发布权限的成员可以删除没被已发布映射引用的实体。
 // 分编辑、版本两个标签页（?tab=edit|versions，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）
-import { CircleAlert } from 'lucide-react';
-import { data, Link, redirect, useNavigation } from 'react-router';
+import { CircleAlert, Lock, Trash2 } from 'lucide-react';
+import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entity';
 import { can, requirePermission } from '~/.server/access';
 import {
-  CustomEntityError, customEntityInputOf, discardCustomEntityDraft, getCustomEntity, publishCustomEntity, saveCustomEntityDraft,
+  CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, publishCustomEntity, saveCustomEntityDraft,
 } from '~/.server/custom-entities';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
@@ -36,7 +37,10 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       nav: navFor(member),
       tab: tabOf(request),
       canWrite: can(member.role, 'sources:write'),
+      canDelete: can(member.role, 'publish'),
       entity: found.entity,
+      /** 引用这个实体的已发布映射；有引用时不能删除 */
+      referrers: found.referrers,
       /** 编辑页显示的版本（?version=N，没有时显示最新的一版） */
       version: Number(new URL(request.url).searchParams.get('version')) || null,
       versions: found.versions.map(v => ({
@@ -71,11 +75,17 @@ export async function action({ request, params }: Route.ActionArgs) {
         if (!kept) throw redirect('/entities');
         break;
       }
+      case 'delete':
+        await deleteCustomEntity(await requirePermission(request, 'publish'), params.entityId);
+        throw redirect('/entities');
       default:
-        return data({ error: '未知操作', input: null }, { status: 400 });
+        return data({ error: '未知操作', intent: null, input: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof CustomEntityError) return data({ error: e.message, input: form.get('intent') === 'save' ? input : null }, { status: e.status });
+    if (e instanceof CustomEntityError) {
+      const intent = String(form.get('intent'));
+      return data({ error: e.message, intent, input: intent === 'save' ? input : null }, { status: e.status });
+    }
     throw e;
   }
   const tab = tabOf(request);
@@ -93,7 +103,7 @@ function editHint(canWrite: boolean, selected: { status: string }, draft: { vers
 }
 
 export default function Entity({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, canWrite, entity, version, versions } = loaderData;
+  const { email, nav, tab, canWrite, canDelete, entity, referrers, version, versions } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -104,12 +114,31 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
       <PageHeader
         title={<span className="font-mono">{entity.name}</span>}
         description={<Link to="/entities" className="hover:underline">← 全部自定义实体</Link>}
-        actions={draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : '这个自定义实体从没发布过，将被删除'} submitting={submitting} />}
+        actions={(
+          <div className="flex items-center gap-2">
+            {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : '这个自定义实体从没发布过，将被删除'} submitting={submitting} />}
+            {canDelete && (referrers.length ? (
+              <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-delete-blocker>
+                <Lock className="size-3.5 shrink-0" />{`被已发布的映射引用，不能删除：${referrers.join('、')}`}
+              </span>
+            ) : (
+              <Form
+                method="post"
+                onSubmit={e => {
+                  if (!confirm(`删除自定义实体 ${entity.name}？所有版本一并删除，不能恢复。`)) e.preventDefault();
+                }}
+              >
+                <input type="hidden" name="intent" value="delete" />
+                <Button type="submit" variant="destructive" disabled={submitting}><Trash2 />删除实体</Button>
+              </Form>
+            ))}
+          </div>
+        )}
       />
       {actionData?.error && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />
-          <AlertTitle>未保存</AlertTitle>
+          <AlertTitle>{actionData.intent === 'delete' ? '未删除' : '未保存'}</AlertTitle>
           <AlertDescription>{actionData.error}</AlertDescription>
         </Alert>
       )}
