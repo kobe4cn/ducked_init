@@ -18,9 +18,9 @@ Keep this session light: never read source files in full here. All exploration g
 
 ## 2. Decide whether it needs work
 
-- **≤3 acceptance criteria and has `## Implementation guide`**: it's ready. Spot-check two `file:line` references in the guide with `grep -n`. If they're stale, refresh the guide (step 3) without splitting. Otherwise stop and say it's ready.
-- **≤3 acceptance criteria, no guide**: add a guide (steps 3 and 5) without splitting.
-- **More than 3 acceptance criteria**: split it and give each child a guide (steps 3–6).
+- **≤3 acceptance criteria, ≤4 `Change` lines, and has `## Implementation guide`**: it's ready, unless the guide was written before its blockers landed or leaves a decision open ("如果 #x 决定…"). Spot-check two `file:line` references in the guide with `grep -n`. If they're stale, or either condition applies, refresh the guide (step 3) without splitting. Otherwise stop and say it's ready.
+- **≤3 acceptance criteria, no guide**: add a guide (steps 3 and 5) without splitting. If the report shows more than 4 existing files to change, split instead.
+- **More than 3 acceptance criteria, or more than 4 existing files to change**: split it and give each child a guide (steps 3–6).
 
 ## 3. Explore
 
@@ -35,15 +35,15 @@ Launch an `Explore` subagent with breadth "medium". Wait for its report, and don
 
 ## 请回答（只给结论，不贴文件内容或大段代码）
 对每一块分别给出：
-- 要改 / 新建的文件，精确到 `file:line`（函数或区块的起始行）
+- 要改 / 新建的文件，精确到 `file:起止行`（要改的函数或区块的行范围）
 - 可复用的已有接口：一行函数签名；表结构 / 类型的字段名
 - 数据现在从哪来、存在哪（表、JSON 字段、类型定义）
 - 相关的校验、权限、路由入口（loader / action 的位置）
 - 相关 ADR 编号（查 docs/adr/README.md）
-- 测试放哪个文件、可复用的 helper（查 test/README.md）
+- 测试放哪个文件、可复用的 helper（查 test/README.md）、可照着写的一个已有用例（grep test/CATALOG.md，给出文件 + it 名）
 - 种子数据或测试数据里会影响验收的事实
 - 非显而易见的坑（会被校验拦下、缺失的属性、隐私或权限约束）
-- 各块之间的依赖，以及每块预计新增行数（含测试）
+- 各块之间的依赖，每块要改几个已有文件，以及每块预计新增行数（含测试）
 
 输出控制在 1500 字以内，用条目列出。
 ```
@@ -52,11 +52,11 @@ Add questions specific to the ticket, e.g. the seed tables named in its acceptan
 
 ## 4. Draw the slices
 
-From the report, split the ticket into vertical slices. Each slice has ≤3 acceptance criteria and about ≤800 lines including tests. Every original acceptance criterion must land in exactly one child. Order the slices by their dependencies.
+From the report, split the ticket into vertical slices. Each slice has ≤3 acceptance criteria, changes ≤4 existing files, and adds about ≤800 lines including tests. Every original acceptance criterion must land in exactly one child. Order the slices by their dependencies.
 
 ## 5. Write each guide
 
-Use the template in `docs/agents/ticket-sizing.md`. Before publishing, `grep -n` two or three of the references to confirm the line numbers. Put open decisions the implementer must make under **Decide**.
+Use the template in `docs/agents/ticket-sizing.md`. Before publishing, `grep -n` two or three of the references to confirm the line numbers. Don't leave decisions to the implementer: settle each one now, write the outcome into the guide (or an ADR), and if it needs a human, ask the user before publishing.
 
 ## 6. Publish
 
