@@ -1,5 +1,7 @@
 // app/components/custom-entity-form.tsx —— 自定义实体登记的表单与只读字段表（ADR-0019）：列表页的新建与详情页的编辑共用。
-// 不用脚本增删行：已有字段各一行，再加 EXTRA_ROWS 行空行（空行忽略），要更多行就先保存。主键是逗号分隔的字段名
+// 已有字段各一行，再加 EXTRA_ROWS 行空行（空行忽略）；「添加字段」再多给空行，没加载脚本时就先保存再加。主键是逗号分隔的字段名
+import { Plus } from 'lucide-react';
+import { useState } from 'react';
 import { Form } from 'react-router';
 import { Button } from '~/components/ui/button';
 import { Field, FieldLabel } from '~/components/ui/field';
@@ -33,7 +35,8 @@ export function CustomEntityForm({ intent, values, submitting, submitLabel }: {
   submitLabel: string;
 }) {
   const v = values ?? EMPTY;
-  const rows = [...v.fields, ...Array.from({ length: EXTRA_ROWS }, () => ({ name: '', type: 'string', description: '', sensitive: false }))];
+  const [extra, setExtra] = useState(EXTRA_ROWS);
+  const rows = [...v.fields, ...Array.from({ length: extra }, () => ({ name: '', type: 'string', description: '', sensitive: false }))];
   return (
     <Form method="post" className="space-y-5 text-left">
       <input type="hidden" name="intent" value={intent} />
@@ -82,7 +85,10 @@ export function CustomEntityForm({ intent, values, submitting, submitLabel }: {
           </TableBody>
         </Table>
       </div>
-      <p className="max-w-2xl text-sm text-slate-500">{`字段名只用小写字母、数字与下划线，以字母开头；字段名留空的行忽略，要更多行请先保存。敏感字段在标准层只存哈希，类型只能是 string。`}</p>
+      <Button type="button" variant="outline" size="sm" onClick={() => setExtra(n => n + 1)}>
+        <Plus />添加字段
+      </Button>
+      <p className="max-w-2xl text-sm text-slate-500">{`字段名只用小写字母、数字与下划线，以字母开头；字段名留空的行忽略。敏感字段在标准层只存哈希，类型只能是 string。`}</p>
       <Field className="max-w-2xl">
         <FieldLabel htmlFor="entity-primary-key">主键</FieldLabel>
         <Input id="entity-primary-key" name="primaryKey" defaultValue={v.primaryKey.join(', ')} placeholder="store_id" className="font-mono" required />
