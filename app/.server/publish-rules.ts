@@ -1,4 +1,4 @@
-// app/.server/publish-rules.ts —— 双人发布规则（ADR-0015）：映射与模板定义共用。草稿由最后保存它的人以外的另一位有发布权限的成员发布，
+// app/.server/publish-rules.ts —— 双人发布规则（ADR-0015）：映射、模板定义与源视图共用。草稿由最后保存它的人以外的另一位有发布权限的成员发布，
 // 发布后版本锁定；这里判断谁发布不了、为什么，以及保存草稿时记作者、发布前确认草稿没被改过。除 publisherCount 查库外都是纯函数
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { can, deniedReason } from './access';

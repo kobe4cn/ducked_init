@@ -88,6 +88,15 @@ const ACTIONS = {
     label: '丢弃模板参数草稿',
     describe: (d: Detail) => `${templateLabel(d.template)}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '回到默认参数'}`,
   },
+  'source_view.drafted': { label: '起草源视图', describe: (d: Detail) => `「${d.source}」${d.name}，第 ${d.version} 版草稿` },
+  'source_view.published': {
+    label: '发布源视图',
+    describe: (d: Detail) => `「${d.source}」${d.name}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
+  },
+  'source_view.draft_discarded': {
+    label: '丢弃源视图草稿',
+    describe: (d: Detail) => `「${d.source}」${d.name}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '源视图已删除'}`,
+  },
   // 只记定位记录的主键与原因，不记明文
   'pii.revealed': {
     label: '解密敏感信息',

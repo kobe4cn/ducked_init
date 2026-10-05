@@ -1,4 +1,4 @@
-// app/components/draft-version.tsx —— 双人发布的版本（映射、模板定义共用，ADR-0015）：版本状态，以及草稿的发布与丢弃（发布不了时在按钮位置说明原因）
+// app/components/draft-version.tsx —— 双人发布的版本（映射、模板定义、源视图共用，ADR-0015）：版本状态，以及草稿的发布与丢弃（发布不了时在按钮位置说明原因）
 import { CheckCircle2, Lock, PencilLine, Trash2, Upload } from 'lucide-react';
 import { Form } from 'react-router';
 import { Button } from '~/components/ui/button';

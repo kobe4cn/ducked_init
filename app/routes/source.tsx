@@ -4,15 +4,17 @@
 // 有主键的表声明软删除字段；手动触发同步，查看每张表的同步历史。
 // 「湖中数据」标签页（?tab=lake）：最近一次核对的结果，每表一行显示覆盖、位置与文件、结构、数据量四项，可展开明细；
 // 手动触发核对，有差异时触发一次主键比对同步。
-// 页头下是类型、目标、同步表数、核对状态四张指标卡，两个标签页的内容放在一个白色面板里
+// 「源视图」标签页（?tab=views）：这个数据源下的源视图（只读原始层的 SELECT，ADR-0022）及其发布状态，数据工程师、管理员可以新建。
+// 页头下是类型、目标、同步表数、核对状态四张指标卡，各标签页的内容放在一个白色面板里
 import { Fragment, useEffect, useState } from 'react';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
-import { CircleAlert, CircleCheck, PlugZap, RefreshCw } from 'lucide-react';
+import { CheckCircle2, CircleAlert, CircleCheck, PencilLine, PlugZap, Plus, RefreshCw, ScrollText } from 'lucide-react';
 import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { getSyncStatus, syncSource } from '~/.server/source-sync';
 import { getVerifyStatus, notInLakeReason, verifySource } from '~/.server/source-verify';
+import { listSourceViews, type SourceViewSummary } from '~/.server/source-views';
 import {
   confirmKey, confirmSoftDelete, confirmWatermark, getSource, relistSource, setSyncScope, SourceError, testSource, updateSource,
 } from '~/.server/sources';
@@ -24,6 +26,7 @@ import { KindIcon } from '~/components/kind-icon';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { SourceFields } from '~/components/source-fields';
+import { NewSourceViewForm } from '~/components/source-view-form';
 import { StatTile } from '~/components/stat-tile';
 import { SectionHeader } from '~/components/section-header';
 import { StatusText, TASK_TONES, type StatusTone } from '~/components/status-text';
@@ -48,8 +51,12 @@ const FORMAT_LABELS: Record<string, string> = {
   email: '邮箱', mobile: '手机号', integer: '整数', decimal: '小数', date: '日期', datetime: '日期时间', uuid: 'UUID', json: 'JSON', objectid: 'ObjectId',
 };
 
-/** 页面的标签页：概览（连接、同步范围、源表、同步）与湖中数据（核对结果） */
-const tabOf = (request: Request): 'overview' | 'lake' => (new URL(request.url).searchParams.get('tab') === 'lake' ? 'lake' : 'overview');
+/** 页面的标签页：概览（连接、同步范围、源表、同步）、湖中数据（核对结果）与源视图 */
+type Tab = 'overview' | 'lake' | 'views';
+const tabOf = (request: Request): Tab => {
+  const tab = new URL(request.url).searchParams.get('tab');
+  return tab === 'lake' || tab === 'views' ? tab : 'overview';
+};
 
 export async function loader({ request, params }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
@@ -57,6 +64,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     const source = await getSource(member, params.sourceId);
     const sync = await getSyncStatus(member, params.sourceId);
     const verify = await getVerifyStatus(member, params.sourceId);
+    const { views } = await listSourceViews(member, params.sourceId);
     /** 同步范围内的表没有进湖的原因（同步成功过的为 null） */
     const notInLake = (name: string) => {
       const t = source.listing.find(l => l.name === name)!;
@@ -109,6 +117,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         differences: verify.differences,
         tables: verify.tables,
       },
+      views,
     };
   } catch (e) {
     if (e instanceof SourceError) throw data(null, { status: e.status });
@@ -685,8 +694,45 @@ function LakeData({ verify, canWrite, submitting, busy }: { verify: VerifyView; 
   );
 }
 
+/** 源视图：每个一张卡片（名称、已发布版本、草稿），可新建时末尾是虚线的新建卡片；没有源视图时说明它是什么，可新建时直接给出新建表单 */
+function SourceViews({ base, views, canWrite, submitting }: { base: string; views: SourceViewSummary[]; canWrite: boolean; submitting: boolean }) {
+  const intro = '源视图是一段只读本数据源原始层的 SELECT，用来把复杂的源表整理成可映射的形状。保存时在原始层上校验并预览，按双人发布规则由另一位成员发布。';
+  if (!views.length) {
+    return (
+      <div className="space-y-3 py-6 text-center">
+        <ScrollText className="mx-auto size-8 text-slate-300" />
+        <p className="mx-auto max-w-2xl text-sm text-slate-500">{`还没有源视图。${intro}`}</p>
+        {canWrite && <NewSourceViewForm action={`${base}/views/new`} submitting={submitting} />}
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-4">
+      <p className="max-w-2xl text-sm text-slate-500">{intro}</p>
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
+        {views.map(v => (
+          <Link key={v.id} to={`${base}/views/${v.id}`} data-source-view={v.name} className="rounded-2xl border bg-white p-5 shadow-sm transition hover:shadow-md">
+            <span className="block truncate font-mono font-medium">{v.name}</span>
+            <span className="mt-2 flex flex-wrap gap-3 text-sm">
+              {v.published
+                ? <span className="inline-flex items-center gap-1 text-emerald-600"><CheckCircle2 className="size-3.5" />{`已发布 v${v.published}`}</span>
+                : <span className="text-slate-500">还没有发布</span>}
+              {v.draft && <span className="inline-flex items-center gap-1 text-amber-600"><PencilLine className="size-3.5" />{`草稿 v${v.draft}`}</span>}
+            </span>
+          </Link>
+        ))}
+        {canWrite && (
+          <Link to={`${base}/views/new`} className="flex items-center justify-center gap-2 rounded-2xl border border-dashed p-5 text-sm text-slate-500 hover:border-slate-400 hover:text-slate-900">
+            <Plus className="size-4" />新建源视图
+          </Link>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function Source({ loaderData, actionData }: Route.ComponentProps) {
-  const { tab, email, nav, canWrite, source, profile, listing, newTables, tables, sync, verify } = loaderData;
+  const { tab, email, nav, canWrite, source, profile, listing, newTables, tables, sync, verify, views } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const profiling = profile.status === 'queued' || profile.status === 'running';
   const syncing = sync.status === 'queued' || sync.status === 'running';
@@ -757,12 +803,15 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
         tabs={[
           { key: 'overview', label: '概览', href: base },
           { key: 'lake', label: '湖中数据', href: `${base}?tab=lake` },
+          { key: 'views', label: `源视图（${views.length}）`, href: `${base}?tab=views` },
         ]}
       />
 
       <div className="rounded-2xl border bg-white p-6 shadow-sm">
         {tab === 'lake' ? (
           <LakeData verify={verify} canWrite={canWrite} submitting={submitting} busy={syncing || verifying} />
+        ) : tab === 'views' ? (
+          <SourceViews base={base} views={views} canWrite={canWrite} submitting={submitting} />
         ) : (
           <div className="space-y-10">
             <section className="space-y-3">

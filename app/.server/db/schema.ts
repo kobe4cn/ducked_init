@@ -262,7 +262,7 @@ export const sourceTables = platform.table('source_tables', {
   softDeleteConfirmedByEmail: text('soft_delete_confirmed_by_email'),
 }, t => [primaryKey({ columns: [t.sourceId, t.tableName] })]);
 
-/** 双人发布的版本状态（映射、模板定义共用，ADR-0015）：草稿可改，已发布的锁定 */
+/** 双人发布的版本状态（映射、模板定义、源视图共用，ADR-0015）：草稿可改，已发布的锁定 */
 export const VERSION_STATUSES = ['draft', 'published'] as const;
 export type VersionStatus = (typeof VERSION_STATUSES)[number];
 export const mappingVersionStatusEnum = platform.enum('mapping_version_status', VERSION_STATUSES);
@@ -329,6 +329,40 @@ export const templateVersions = platform.table('template_versions', {
 }, t => [
   uniqueIndex('template_versions_definition_version_uq').on(t.definitionId, t.version),
   uniqueIndex('template_versions_one_draft_uq').on(t.definitionId).where(sql`status = 'draft'`),
+]);
+
+export const sourceViewVersionStatusEnum = platform.enum('source_view_version_status', VERSION_STATUSES);
+
+// 源视图：数据工程师在某个数据源下手写的只读 SELECT，只能读本数据源的原始层，用来把复杂源表整理成可映射的形状（ADR-0022）。
+// 名称在数据源内唯一；第一次保存草稿时建立，从没发布过的源视图丢弃草稿时删除
+export const sourceViews = platform.table('source_views', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  sourceId: uuid('source_id').notNull().references(() => sources.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  createdAt: createdAt(),
+}, t => [
+  index('source_views_tenant_idx').on(t.tenantId),
+  uniqueIndex('source_views_source_name_uq').on(t.sourceId, t.name),
+]);
+
+// 源视图的各个版本：校验通过的 SQL。草稿与双人发布的规则同映射版本（ADR-0015）：每个源视图同时只有一份草稿，发布后锁定；
+// last_editor 是最后保存草稿的成员，发布者不能是这位成员。只能由成员在页面上发布，没有自动发布
+export const sourceViewVersions = platform.table('source_view_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  viewId: uuid('view_id').notNull().references(() => sourceViews.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  status: sourceViewVersionStatusEnum('status').notNull().default('draft'),
+  sql: text('sql').notNull(),
+  authors: text('authors').array().notNull(),
+  lastEditor: text('last_editor').notNull(),
+  publishedByEmail: text('published_by_email'),
+  publishedAt: timestamp('published_at', { withTimezone: true }),
+  createdAt: createdAt(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [
+  uniqueIndex('source_view_versions_view_version_uq').on(t.viewId, t.version),
+  uniqueIndex('source_view_versions_one_draft_uq').on(t.viewId).where(sql`status = 'draft'`),
 ]);
 
 // 结果快照：分析模板任务（如 gold.rfm）每次成功后在租户数据湖结果层写下的一张表（ADR-0002：数据在湖里，这里只登记元数据）。

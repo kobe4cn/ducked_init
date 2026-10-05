@@ -62,7 +62,7 @@ export interface TableProfile {
   keyCandidates: string[];
 }
 
-const TEXT_FORMATS = {
+export const TEXT_FORMATS = {
   email: '^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$',
   mobile: '^(\\+?86)?1[3-9][0-9]{9}$',
   integer: '^-?[0-9]+$',
