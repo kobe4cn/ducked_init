@@ -88,6 +88,29 @@ describe('成员查看本租户的任务', () => {
     expect(sync.html).toMatch(/data-result-table="orders"[\s\S]*?>3 行</);
     expect(sync.html).toMatch(/data-result-table="gone_table"[\s\S]*?>—</);
   });
+
+  it('RFM 分层任务展示快照表与打通不到消费者的订单，快照过期任务列出删除的表', async () => {
+    const acme = await newTenant('acme');
+    const finish = async (kind: string, result: Record<string, unknown>) => {
+      const task = await enqueueTask(acme, kind, {});
+      await getDb().update(tasks).set({ status: 'succeeded', result, finishedAt: new Date() }).where(eq(tasks.id, task.id));
+    };
+    const rfmTable = 'gold.rfm__791a674d-0000-4000-8000-000000000000';
+    const oldTable = 'gold.rfm__11111111-0000-4000-8000-000000000000';
+    await finish('gold.rfm', { table: rfmTable, rows: 147393, unlinkedOrders: 42, params: { asOf: '2026-10-01' }, engine: { memoryLimit: '2 GiB', threads: 2 } });
+    await finish('gold.expire', { tables: [oldTable], engine: { memoryLimit: '2 GiB', threads: 2 } });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const [expire, rfm] = taskRows(await (await admin.get('/tasks')).text());
+    expect(rfm.html).toMatch(new RegExp(`data-result-table="${rfmTable}"[\\s\\S]*?>147,393 行<`));
+    expect(rfm.html).toMatch(/打通不到消费者的订单：<span[^>]*>42</);
+    expect(rfm.html).not.toContain('数据湖里还没有表');
+    expect(rfm.html).not.toContain('asOf');
+    expect(rfm.html).toContain('运行配额');
+    expect(expire.html).toMatch(new RegExp(`data-result-table="${oldTable}"[\\s\\S]*?>已删除<`));
+    expect(expire.html).not.toContain('：—');
+    expect(expire.html).not.toContain('数据湖里还没有表');
+  });
 });
 
 describe('运营者设置租户配额', () => {

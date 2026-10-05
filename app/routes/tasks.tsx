@@ -15,30 +15,39 @@ export function meta({}: Route.MetaArgs) {
 
 // 工作进程回传的结果（pipeline/worker.ts）：各类任务都带按表的结果与运行时生效的配额。各类任务的表结构不同：
 // 盘点与采集是 { name, rows }，同步是 { table, rows }（失败或源端已删除的表没有 rows），核对是 { table, sourceRows }；
-// 合并到标准层按映射给出 { entity, table, rows }（失败或跳过的映射没有 rows）
+// 合并到标准层按映射给出 { entity, table, rows }（失败或跳过的映射没有 rows）；
+// RFM 分层只写一张快照表，表名与行数在顶层 { table, rows, unlinkedOrders, params }；快照过期的 tables 是删掉的表名 string[]
 type RawTable = { name?: string; table?: string; rows?: unknown; sourceRows?: unknown };
 type RawMapping = { entity?: string; table?: string; rows?: unknown };
 interface RawResult {
-  tables?: RawTable[];
+  tables?: (RawTable | string)[];
   mappings?: RawMapping[];
+  table?: unknown;
+  rows?: unknown;
+  unlinkedOrders?: unknown;
   engine?: { memoryLimit: string; threads: number };
 }
 interface TaskResult {
-  /** rows 为 null：这张表没有行数（同步失败、源端已删除、核对时读不了） */
-  tables: { name: string; rows: number | null }[];
+  /** rows 为 null：这张表没有行数（同步失败、源端已删除、核对时读不了）；dropped：快照过期删掉的表 */
+  tables: { name: string; rows: number | null; dropped?: true }[];
+  /** RFM 分层：打通不到消费者、没计入的订单数 */
+  unlinkedOrders?: number;
   engine?: RawResult['engine'];
 }
 
 function taskResult(raw: RawResult | null): TaskResult | null {
   if (!raw) return null;
-  const tables = (Array.isArray(raw.tables) ? raw.tables : []).map(t => {
+  const tables: TaskResult['tables'] = (Array.isArray(raw.tables) ? raw.tables : []).map(t => {
+    if (typeof t === 'string') return { name: t, rows: null, dropped: true };
     const rows = t.rows ?? t.sourceRows;
     return { name: String(t.name ?? t.table ?? ''), rows: typeof rows === 'number' ? rows : null };
   });
   for (const m of Array.isArray(raw.mappings) ? raw.mappings : []) {
     tables.push({ name: `${entityLabel(String(m.entity ?? ''))} ← ${String(m.table ?? '')}`, rows: typeof m.rows === 'number' ? m.rows : null });
   }
-  return { tables, engine: raw.engine };
+  if (typeof raw.table === 'string') tables.push({ name: raw.table, rows: typeof raw.rows === 'number' ? raw.rows : null });
+  const unlinkedOrders = typeof raw.unlinkedOrders === 'number' ? raw.unlinkedOrders : undefined;
+  return { tables, unlinkedOrders, engine: raw.engine };
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -65,7 +74,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
-function ResultDetails({ result: { tables, engine } }: { result: TaskResult }) {
+function ResultDetails({ result: { tables, unlinkedOrders, engine } }: { result: TaskResult }) {
   return (
     <details className="text-xs text-muted-foreground">
       <summary className="cursor-pointer select-none">查看结果</summary>
@@ -75,12 +84,15 @@ function ResultDetails({ result: { tables, engine } }: { result: TaskResult }) {
             {/* 同步结果按批次记录，同一张表可能出现多次（如增量后接全量比对），key 要带上序号 */}
             {tables.map((t, i) => (
               <li key={`${i}-${t.name}`} data-result-table={t.name}>
-                {`${t.name}：`}<span className="text-foreground">{t.rows === null ? '—' : `${t.rows.toLocaleString('zh-CN')} 行`}</span>
+                {`${t.name}：`}<span className="text-foreground">{t.dropped ? '已删除' : t.rows === null ? '—' : `${t.rows.toLocaleString('zh-CN')} 行`}</span>
               </li>
             ))}
           </ul>
         ) : (
           <div>数据湖里还没有表</div>
+        )}
+        {unlinkedOrders !== undefined && (
+          <div>打通不到消费者的订单：<span className="text-foreground">{unlinkedOrders.toLocaleString('zh-CN')}</span></div>
         )}
         {engine && <div>{`运行配额：内存 ${engine.memoryLimit} · ${engine.threads} 线程`}</div>}
       </div>
