@@ -1,10 +1,10 @@
 // 分析页的 HTTP 接缝：有结果层查看权限的成员在「分析」页看到本租户的 RFM 快照，打开看各人群与分页的消费者明细（只有 consumer_id 与分值，没有明文）；
 // 其他租户的快照 404，已过期的快照标灰、打不开；RFM 模板参数页的权限矩阵：查看者只读，分析师能起草不能发布，
-// 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm
+// 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm；按生效版本重新计算（分析师 403、未来日期与重复入队被拒）
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { snapshots, tasks } from '../../app/.server/db/schema';
+import { snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
@@ -137,6 +137,42 @@ describe('RFM 模板参数页', () => {
     expect(await (await de2.get('/analytics/templates/rfm?published=1')).text()).toContain('第 1 版已发布');
     const [task] = await getDb().select().from(tasks).where(eq(tasks.tenantId, acme));
     expect(task).toMatchObject({ kind: 'gold.rfm', status: 'queued', params: { lookbackDays: 500, statuses: ['completed', 'paid'], definitionVersion: 1 } });
+  });
+
+  it('有发布权限的成员按生效版本重新计算，可填参考日期；分析师看到无权限的说明且提交 403，未来日期与重复入队被拒，版本不变', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await memberOf(acme, 'de@acme.com', 'data_engineer');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    const de = await loginAs(app, 'de@acme.com');
+    expect(await (await de.get('/analytics/templates/rfm')).text()).not.toContain('重新计算');
+    expect((await de.post('/analytics/templates/rfm', { intent: 'recompute' })).status).toBe(400);
+
+    await analyst.post('/analytics/templates/rfm', FORM);
+    await de.post('/analytics/templates/rfm', { intent: 'publish', version: '1' });
+    // 调度器不运行，发布入队的任务一直在排队
+    const queued = await de.post('/analytics/templates/rfm', { intent: 'recompute', asOf: '' });
+    expect(queued.status).toBe(400);
+    expect(await queued.text()).toContain('已在排队或运行中');
+    await getDb().update(tasks).set({ status: 'succeeded' }).where(eq(tasks.tenantId, acme));
+
+    expect(await (await analyst.get('/analytics/templates/rfm')).text()).toMatch(/data-recompute-denied[^>]*>.*?仅管理员、数据工程师可以发布映射与定义/s);
+    expect((await analyst.post('/analytics/templates/rfm', { intent: 'recompute' })).status).toBe(403);
+    const future = await de.post('/analytics/templates/rfm', { intent: 'recompute', asOf: '2999-01-01' });
+    expect(future.status).toBe(400);
+    expect(await future.text()).toContain('晚于今天');
+
+    const page = await (await de.get('/analytics/templates/rfm')).text();
+    expect(page).toContain('name="asOf"');
+    expect(page).toContain(`max="${new Date().toISOString().slice(0, 10)}"`);
+    const recomputed = await de.post('/analytics/templates/rfm', { intent: 'recompute', asOf: '2026-09-30' });
+    expect(recomputed.status).toBe(302);
+    expect(recomputed.headers.get('location')).toBe('/analytics/templates/rfm?recomputed=1');
+    expect(await (await de.get('/analytics/templates/rfm?recomputed=1')).text()).toContain('已按第 1 版参数入队一次计算');
+    const rows = await getDb().select().from(tasks).where(eq(tasks.tenantId, acme)).orderBy(tasks.createdAt);
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toMatchObject({ kind: 'gold.rfm', status: 'queued', params: { lookbackDays: 400, asOf: '2026-09-30', definitionVersion: 1 } });
+    expect(await getDb().select().from(templateVersions)).toHaveLength(1);
   });
 
   it('管理员能发布别人保存的草稿；丢弃草稿后回到已发布的参数', async () => {

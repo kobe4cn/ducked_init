@@ -1,12 +1,13 @@
 // 分析模板定义的流水线接缝：成员保存模板参数草稿（saveDraft）→ 另一位有发布权限的成员发布（publishTemplate）→ 以新参数入队 gold.rfm →
-// 调度器派发并在成功后登记快照 → listSnapshots 读出的定义版本与参数；getTemplate 读出各版本与当前生效的参数
+// 调度器派发并在成功后登记快照 → listSnapshots 读出的定义版本与参数；getTemplate 读出各版本与当前生效的参数；
+// 按当前生效的版本重新计算（recomputeTemplate），可指定参考日期
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { RFM_DEFAULTS } from '../../app/.server/pipeline/templates/rfm';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { getTask } from '../../app/.server/tasks';
-import { discardDraft, getTemplate, publishTemplate, saveDraft, TemplateError } from '../../app/.server/templates';
+import { discardDraft, getTemplate, publishTemplate, recomputeTemplate, saveDraft, TemplateError } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
@@ -83,6 +84,32 @@ describe('分析模板定义', () => {
     // 发布后再改是新的一版草稿，已发布的第 1 版不变
     expect(await saveDraft(analyst, 'rfm', { ...PARAMS, lookbackDays: 400 })).toBe(2);
     expect(await getTemplate(analyst, 'rfm')).toMatchObject({ params: PARAMS, draft: { version: 2 }, published: { version: 1 } });
+  });
+
+  it('重新计算：以当前生效版本的参数入队 gold.rfm，不产生新版本；可指定参考日期，不能晚于今天；同模板已有任务在排队或运行时拒绝', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await expect(recomputeTemplate(reviewer, 'rfm')).rejects.toThrow(/还没有发布/);
+    await saveDraft(author, 'rfm', PARAMS);
+    await publishTemplate(reviewer, 'rfm', 1);
+    // 发布入队的任务还在排队
+    await expect(recomputeTemplate(reviewer, 'rfm')).rejects.toThrow(/已在排队或运行中/);
+    await drain();
+
+    await expect(recomputeTemplate(analyst, 'rfm')).rejects.toMatchObject({ init: { status: 403 } });
+    await expect(recomputeTemplate(reviewer, 'rfm', '2999-01-01')).rejects.toThrow(/晚于今天/);
+    await expect(recomputeTemplate(reviewer, 'rfm', '2026-02-30')).rejects.toBeInstanceOf(TemplateError);
+
+    const today = await recomputeTemplate(author, 'rfm');
+    expect(today.version).toBe(1);
+    expect(today.task).toMatchObject({ kind: 'gold.rfm', status: 'queued', params: { ...PARAMS, asOf: new Date().toISOString().slice(0, 10), definitionVersion: 1 } });
+    await drain();
+    const { task } = await recomputeTemplate(reviewer, 'rfm', '2026-09-30');
+    expect(task.params).toEqual({ ...PARAMS, asOf: '2026-09-30', definitionVersion: 1 });
+    await drain();
+    expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
+    expect((await listSnapshots(acme)).find(s => s.taskId === task.id)).toMatchObject({ definitionVersion: 1, params: { asOf: '2026-09-30', lookbackDays: 3650 } });
+    expect((await getTemplate(analyst, 'rfm')).versions).toHaveLength(1);
   });
 
   it('丢弃草稿：有已发布版本时回到它，从没发布过时回到默认参数', async () => {

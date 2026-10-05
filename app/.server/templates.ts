@@ -1,12 +1,13 @@
 // app/.server/templates.ts —— 分析模板定义：成员调整分析模板（如 RFM）的参数，校验通过才能保存为草稿；草稿按映射同样的规则双人发布——
 // 由最后保存它的人以外的另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本，从没发布过时回到注册表里的默认参数）。
-// 发布后版本锁定，并以新参数（加上当天的 asOf）入队一次模板任务，快照登记时记下定义版本（ADR-0004、0015）。一律限定在操作者所属租户内
-import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
+// 发布后版本锁定，并以新参数（加上当天的 asOf）入队一次模板任务，快照登记时记下定义版本（ADR-0004、0015）。
+// 也可以按当前生效的版本重新计算（可指定参考日期），不产生新版本。一律限定在操作者所属租户内
+import { and, desc, eq, getTableColumns, inArray, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
-import { templateDefinitions, templateVersions } from './db/schema';
+import { tasks, templateDefinitions, templateVersions, tenants } from './db/schema';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { TEMPLATES } from './pipeline/templates';
 import { insertTask } from './tasks';
@@ -26,14 +27,21 @@ function requireTemplate(id: string): TemplateId {
   return id as TemplateId;
 }
 
-/** 校验定义的参数并补上默认值 */
-function checked(template: TemplateId, params: Record<string, unknown>) {
+/** 校验参数，不合法时把说明原因的错误转成 TemplateError */
+function validated<T>(parse: () => T) {
   try {
-    return TEMPLATES[template].parseDefinition(params) as Record<string, unknown>;
+    return parse();
   } catch (e) {
     throw new TemplateError((e as Error).message);
   }
 }
+
+/** 校验定义的参数并补上默认值 */
+const checked = (template: TemplateId, params: Record<string, unknown>) =>
+  validated(() => TEMPLATES[template].parseDefinition(params) as Record<string, unknown>);
+
+/** 今天（UTC），模板任务 asOf 的默认值与上限 */
+export const todayUtc = () => new Date().toISOString().slice(0, 10);
 
 const ofDefinition = (tenantId: string, template: TemplateId) =>
   and(eq(templateDefinitions.tenantId, tenantId), eq(templateDefinitions.template, template));
@@ -117,7 +125,7 @@ export async function publishTemplate(actor: CurrentMember, id: string, version:
   if (blocker) throw new TemplateError(blocker, draft.status === 'draft' ? 403 : 400);
   const definition = checked(template, draft.params);
   return getDb().transaction(async tx => {
-    // 锁住定义行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿。不像发布映射那样锁租户行：模板任务不合并进排队中的任务，没有要互斥的入队检查
+    // 锁住定义行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿。不锁租户行、不查排队中的任务：发布总要按新参数算一次（ADR-0021）
     await tx.select({ id: templateDefinitions.id }).from(templateDefinitions).where(eq(templateDefinitions.id, draft.definitionId)).for('update');
     const [current] = await tx.select().from(templateVersions).where(eq(templateVersions.id, draft.id));
     if (isStale(current, draft)) {
@@ -134,8 +142,46 @@ export async function publishTemplate(actor: CurrentMember, id: string, version:
       targetId: draft.definitionId,
       detail: { template, version, authors: draft.authors, lastEditor: draft.lastEditor },
     });
-    const asOf = new Date().toISOString().slice(0, 10);
-    return insertTask(tx, actor.tenant.id, TASK_KINDS[template], { ...definition, asOf, definitionVersion: version });
+    return insertTask(tx, actor.tenant.id, TASK_KINDS[template], { ...definition, asOf: todayUtc(), definitionVersion: version });
+  });
+}
+
+/**
+ * 重新计算：需要发布权限。以当前生效的已发布版本的参数，加上参考日期 asOf（不给时为当天，UTC；不能晚于今天）入队一次模板任务，
+ * 任务参数带上这一版的 definitionVersion，不产生新版本。还没有已发布版本时不能重新计算（第一次计算由发布入队）。
+ * 锁住租户行后检查：本租户已有同一模板的任务在排队或运行时拒绝。返回按的版本号与入队的任务
+ */
+export async function recomputeTemplate(actor: CurrentMember, id: string, asOf?: string) {
+  assertCan(actor, 'publish');
+  const template = requireTemplate(id);
+  const day = asOf || todayUtc();
+  const kind = TASK_KINDS[template];
+  return getDb().transaction(async tx => {
+    // 锁住租户行：与另一次重新计算互斥；同时发布的入队要等这里提交（insertTask 的共享锁），锁到以后读到的就是当前生效的版本
+    await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, actor.tenant.id)).for('update');
+    const [published] = await tx.select({ definitionId: templateVersions.definitionId, version: templateVersions.version, params: templateVersions.params })
+      .from(templateVersions)
+      .innerJoin(templateDefinitions, eq(templateDefinitions.id, templateVersions.definitionId))
+      .where(and(ofDefinition(actor.tenant.id, template), eq(templateVersions.status, 'published')))
+      .orderBy(desc(templateVersions.version)).limit(1);
+    if (!published) throw new TemplateError('还没有发布过参数，发布第一版后会自动计算一次');
+    const params = { ...published.params, asOf: day };
+    validated(() => TEMPLATES[template].parse(params));
+    // 校验过格式后两边都是 YYYY-MM-DD，可以直接比较字符串
+    if (day > todayUtc()) throw new TemplateError(`参考日期 ${day} 晚于今天（UTC ${todayUtc()}）`);
+    const [pending] = await tx.select({ id: tasks.id }).from(tasks)
+      .where(and(eq(tasks.tenantId, actor.tenant.id), eq(tasks.kind, kind), inArray(tasks.status, ['queued', 'running']))).limit(1);
+    if (pending) throw new TemplateError(`${TEMPLATES[template].label}已在排队或运行中，完成后再重新计算`);
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id,
+      actor,
+      action: 'template.recomputed',
+      targetType: 'template',
+      targetId: published.definitionId,
+      detail: { template, version: published.version, asOf: day },
+    });
+    const task = await insertTask(tx, actor.tenant.id, kind, { ...params, definitionVersion: published.version });
+    return { version: published.version, task };
   });
 }
 
