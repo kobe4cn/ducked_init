@@ -1,10 +1,9 @@
 // app/.server/pipeline/dry-run-engine.ts —— 映射空跑：取原始层里源表最新、未删除的前 N 条记录，按合并计划转换，返回样例行与基础断言。
 // 中间表只放在会话的本机库 stage 里，不写标准层、当前记录与合并日志 silver._merges，可以在只读挂载的数据湖上运行。
-// 转换与合并共用 merge-engine 的同一套步骤，敏感字段同样换成按租户加盐的哈希，样例行里没有明文（ADR-0005）
+// 输入是源视图时样本取自视图的结果（sourceView 是视图最新的已发布版本）。转换与合并共用 merge-engine 的同一套步骤，敏感字段同样换成按租户加盐的哈希，样例行里没有明文（ADR-0005）
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { MergePlan } from './mapping-spec';
-import { liveRecords, sensitiveColumns, sourceKeysOf, tableExists, transformRows, unknownValues, type FallbackStat } from './merge-engine';
-import { bronzeSchema } from './sync-engine';
+import { liveRecords, mappingInput, sensitiveColumns, transformRows, unknownValues, type FallbackStat, type SourceViewParam } from './merge-engine';
 
 /** 样例里的一列：是否敏感（值是哈希）、是否必填（去重键与身份打通的匹配字段），以及为空的行数 */
 export interface DryRunColumn { name: string; sensitive: boolean; required: boolean; nulls: number }
@@ -34,6 +33,7 @@ const LATEST = 'stage.dryrun_latest';
 const LIVE = 'stage.dryrun_live';
 const SAMPLE = 'stage.dryrun_sample';
 const ROWS = 'stage.dryrun_rows';
+const VIEW_ROWS = 'stage.dryrun_view';
 
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
@@ -45,12 +45,14 @@ const requiredColumns = (plan: MergePlan) => new Set([...plan.key, ...(plan.iden
  * 空跑一个映射：源表还没有同步进原始层时返回 skipped。样例取最近批次里的记录（同一批次按记录哈希，结果确定）；
  * 转换出错时抛出的错误已抹掉敏感字段的源端取值（盐由调用方抹掉）
  */
-export async function dryRun(con: DuckDBConnection, plan: MergePlan, sourceId: string, salt: string, limit: number): Promise<DryRunResult | { skipped: string }> {
-  const schema = bronzeSchema(sourceId);
-  if (!await tableExists(con, schema, plan.table)) return { skipped: `源表 ${plan.table} 还没有同步进原始层，首次同步后再空跑` };
-  const bronze = `${ident(schema)}.${ident(plan.table)}`;
+export async function dryRun(
+  con: DuckDBConnection, plan: MergePlan, sourceId: string, salt: string, limit: number, sourceView?: SourceViewParam,
+): Promise<DryRunResult | { skipped: string }> {
+  const input = await mappingInput(con, plan, sourceId, sourceView, VIEW_ROWS, '空跑');
+  if ('skipped' in input) return input;
   try {
-    const sourceKeys = await sourceKeysOf(con, sourceId, plan.table) ?? [];
+    const sourceKeys = input.keys;
+    const bronze = await input.load();
     const [{ top }] = await rows<{ top: string | null }>(con, `SELECT max(_batch) AS top FROM ${bronze}`);
     await liveRecords(con, bronze, sourceKeys, { from: 0, to: Number(top ?? 0), held: null }, { latest: LATEST, live: LIVE });
     await con.run(`CREATE OR REPLACE TABLE ${SAMPLE} AS SELECT * FROM ${LIVE} ORDER BY _batch DESC, _src LIMIT ${limit}`);
@@ -86,6 +88,6 @@ export async function dryRun(con: DuckDBConnection, plan: MergePlan, sourceId: s
       },
     };
   } finally {
-    await con.run([LATEST, LIVE, SAMPLE, ROWS].map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
+    await con.run([LATEST, LIVE, SAMPLE, ROWS, VIEW_ROWS].map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
   }
 }

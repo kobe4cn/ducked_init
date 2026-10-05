@@ -5,17 +5,26 @@
 // 带出现次数 _n。变更批次先改当前记录（删除的移除，新增与更新的换成新版本），再对受影响的去重键重新取最新的一行写进标准层，
 // 所以源端的重复行只计一次，删掉其中一行时标准层回落到剩下的行。合并日志 silver._merges 与这些写入在同一个 DuckLake 事务里，
 // 记下每个映射合并到了原始层的哪个批次，是下一次合并起点的唯一依据（与 ADR-0012 的批次日志同理）。
-// 敏感字段（标准实体的 pii 字段与标成敏感的扩展字段）在转换时就规范化并换成按租户加盐的哈希，当前记录与标准层里都没有明文（ADR-0005）
+// 敏感字段（标准实体的 pii 字段与标成敏感的扩展字段）在转换时就规范化并换成按租户加盐的哈希，当前记录与标准层里都没有明文（ADR-0005）。
+// 输入是源视图的映射（ADR-0023）先把视图在原始层上执行的结果物化进会话的本机库，再照源表处理；视图的批次号来自不同的表、不能比较，
+// 所以不增量：视图版本或它引用的表有新批次时由全部批次重建，否则不动
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
 import { entityOf } from '../../lib/canonical-model';
 import { DEFAULT_RULES, resolveIdentities, type IdentitySummary } from './identity-engine';
 import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
 import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
+import { bronzeTablesOf, checkViewSql } from './source-view-engine';
 import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
 
-/** 合并任务里的一个已发布映射：合并计划加上映射、版本与数据源 */
-export interface MergeMappingParam extends MergePlan { mapping: string; version: number; sourceId: string }
+/**
+ * 合并任务里的一个已发布映射：合并计划加上映射、版本与数据源；输入是源视图时另带视图最新的已发布版本
+ * （版本号、SQL 与引用的原始层表，入队时取定）
+ */
+export interface MergeMappingParam extends MergePlan { mapping: string; version: number; sourceId: string; sourceView?: SourceViewParam }
+
+/** 合并或空跑时源视图的已发布版本 */
+export interface SourceViewParam { version: number; sql: string; tables: string[] }
 
 /**
  * 一列里落入兜底的取值：出现最多的几个取值与各自的行数，distinct 是共有几种取值，rows 是共有几行。
@@ -84,6 +93,7 @@ const ROWS = 'stage.merge_rows';
 const KEYS = 'stage.merge_keys';
 const BEFORE = 'stage.merge_before';
 const WINNERS = 'stage.merge_winners';
+const VIEW_ROWS = 'stage.merge_view';
 
 async function inTransaction<T>(con: DuckDBConnection, work: () => Promise<T>) {
   await con.run('BEGIN');
@@ -115,6 +125,58 @@ export async function sourceKeysOf(con: DuckDBConnection, sourceId: string, tabl
   const keys = `${bronzeSchema(sourceId)}_keys`;
   if (!await tableExists(con, keys, table)) return null;
   return (await columnsOf(con, `${ident(keys)}.${ident(table)}`)).map(c => c.column_name).filter(c => c !== '_hash');
+}
+
+/**
+ * 映射读的输入：keys 是记录标识列（源表的主键，源视图是映射写的 view_key；为空时按整行区分记录）；
+ * rebuildTag 记在合并日志的 source_keys 里，与上次合并的不同时由全部批次重建：源表是主键，源视图另加视图版本与引用的各表最新的批次；
+ * load 返回读变更批次的关系（源视图在这时物化进 into）
+ */
+export interface MappingInput { keys: string[]; rebuildTag: string; load: () => Promise<string> }
+
+/**
+ * 映射 plan 读的原始层：源表时是 bronze_<数据源 ID>."<表>"，源视图时是视图（sourceView）在本源原始层上执行的结果。
+ * 源表或视图引用的表还没有同步进原始层时返回 skipped（step 是提示里的“合并”或“空跑”）。
+ * 视图 SQL 执行前按保存时的规则再校验一次（只读本源原始层、只能是一条 SELECT），合并的会话不是只读挂载
+ */
+export async function mappingInput(
+  con: DuckDBConnection, plan: MergePlan, sourceId: string, sourceView: SourceViewParam | undefined, into: string, step: string,
+): Promise<MappingInput | { skipped: string }> {
+  const schema = bronzeSchema(sourceId);
+  if (!plan.view) {
+    if (!await tableExists(con, schema, plan.table)) return { skipped: `源表 ${plan.table} 还没有同步进原始层，首次同步后再${step}` };
+    const keys = await sourceKeysOf(con, sourceId, plan.table) ?? [];
+    const bronze = `${ident(schema)}.${ident(plan.table)}`;
+    return { keys, rebuildTag: keys.join(','), load: async () => bronze };
+  }
+  if (!sourceView) throw new Error(`源视图 ${plan.table} 没有已发布的版本`);
+  const present = await bronzeTablesOf(con, sourceId);
+  const missing = sourceView.tables.filter(t => !present.includes(t));
+  if (missing.length) return { skipped: `源视图 ${plan.table} 引用的表 ${missing.join('、')} 还没有同步进原始层，首次同步后再${step}` };
+  const tables = await checkViewSql(con, sourceView.sql, sourceId, present);
+  const batches = [];
+  for (const t of tables) {
+    const [{ top }] = await rows<{ top: string | null }>(con, `SELECT max(_batch) AS top FROM ${ident(schema)}.${ident(t)}`);
+    batches.push(`${t}=${top ?? 0}`);
+  }
+  const keys = plan.view.key;
+  return {
+    keys,
+    rebuildTag: `${keys.join(',')}|view@${sourceView.version}|${batches.join(',')}`,
+    load: async () => {
+      // 不带 catalog 的表名按本源原始层解析（同源视图的预览）；换行再收尾，SQL 末尾的行注释不会吞掉右括号
+      await con.run(`USE lake.${ident(schema)}`);
+      try {
+        await con.run(`CREATE OR REPLACE TABLE ${into} AS SELECT * FROM (\n${sourceView.sql}\n)`);
+      } catch (e) {
+        // 这里读的是明文原始层（不像预览读哈希过的同名视图），转换出错的报错会带出取值：引号里的字面量一律抹掉
+        throw new Error(`源视图 ${plan.table} 执行出错：${(e as Error).message.replace(/'(?:[^']|'')*'/g, "'***'")}`);
+      } finally {
+        await con.run('USE lake');
+      }
+      return into;
+    },
+  };
 }
 
 /**
@@ -256,26 +318,26 @@ interface LastMerge { version: number; source_keys: string; batch_to: string; sc
 async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date): Promise<MergeRecord> {
   const startedAt = new Date();
   const base = { mapping: plan.mapping, entity: plan.entity, table: plan.table, version: plan.version, startedAt: startedAt.toISOString() };
-  const schema = bronzeSchema(plan.sourceId);
-  if (!await tableExists(con, schema, plan.table)) {
-    return { ...base, durationMs: Date.now() - startedAt.getTime(), skipped: `源表 ${plan.table} 还没有同步进原始层，首次同步后再合并` };
-  }
-  const bronze = `${ident(schema)}.${ident(plan.table)}`;
+  const input = await mappingInput(con, plan, plan.sourceId, plan.sourceView, VIEW_ROWS, '合并');
+  if ('skipped' in input) return { ...base, durationMs: Date.now() - startedAt.getTime(), skipped: input.skipped };
   const records = recordsOf(plan.mapping);
   const silver = silverTable(plan.entity);
   // 没有主键的表按整行区分记录
-  const sourceKeys = await sourceKeysOf(con, plan.sourceId, plan.table) ?? [];
+  const sourceKeys = input.keys;
   const [last] = await rows<LastMerge>(con, `
     SELECT version, source_keys, batch_to, scheme FROM ${MERGES} WHERE mapping_id = ${lit(plan.mapping)} ORDER BY started_at DESC LIMIT 1`);
-  const rebuild = !last || last.version !== plan.version || last.source_keys !== sourceKeys.join(',') || last.scheme !== SCHEME
+  const rebuild = !last || last.version !== plan.version || last.source_keys !== input.rebuildTag || last.scheme !== SCHEME
     || !await tableExists(con, RECORDS, `m_${plan.mapping.replace(/-/g, '')}`);
   const from = rebuild ? 0 : Number(last.batch_to);
+  const silverRows = async () => count(con, `${silver} WHERE _mapping = ${lit(plan.mapping)}`);
+  const unchanged = async (): Promise<MergeRecord> =>
+    ({ ...base, durationMs: Date.now() - startedAt.getTime(), mode: 'incremental', batchFrom: from, batchTo: from, inserted: 0, updated: 0, deleted: 0, rows: await silverRows() });
+  // 源视图不增量：没有要重建的变化时不读视图
+  if (!rebuild && plan.view) return unchanged();
+  const bronze = await input.load();
   const [{ top }] = await rows<{ top: string | null }>(con, `SELECT max(_batch) AS top FROM ${bronze}`);
   const to = Number(top ?? 0);
-  const silverRows = async () => count(con, `${silver} WHERE _mapping = ${lit(plan.mapping)}`);
-  if (!rebuild && to <= from) {
-    return { ...base, durationMs: Date.now() - startedAt.getTime(), mode: 'incremental', batchFrom: from, batchTo: from, inserted: 0, updated: 0, deleted: 0, rows: await silverRows() };
-  }
+  if (!rebuild && to <= from) return unchanged();
 
   await liveRecords(con, bronze, sourceKeys, { from, to, held: rebuild ? null : records }, { latest: LATEST, live: LIVE });
   // 先查出值字典与标准枚举之外的取值（没写兜底值时报错；敏感字段不查，取值会进报错与兜底统计），再转换
@@ -320,7 +382,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
         ${lit(plan.mapping)} AS _mapping, ${lit(plan.sourceId)} AS _source, ${plan.version} AS _version, TIMESTAMPTZ ${lit(now.toISOString())} AS _merged_at
       FROM ${WINNERS} w`);
     await con.run(`INSERT INTO ${MERGES} VALUES (
-      ${lit(plan.mapping)}, ${plan.version}, ${lit(sourceKeys.join(','))}, ${from}, ${to},
+      ${lit(plan.mapping)}, ${plan.version}, ${lit(input.rebuildTag)}, ${from}, ${to},
       ${stats.inserted}, ${stats.updated}, ${stats.deleted}, TIMESTAMPTZ ${lit(startedAt.toISOString())}, TIMESTAMPTZ ${lit(new Date().toISOString())}, ${SCHEME})`);
   });
   return {
@@ -365,7 +427,7 @@ export async function mergeToSilver(
         startedAt: startedAt.toISOString(), durationMs: Date.now() - startedAt.getTime(), error: redact((e as Error).message),
       });
     } finally {
-      await con.run([LATEST, LIVE, ROWS, KEYS, BEFORE, WINNERS].map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
+      await con.run([LATEST, LIVE, ROWS, KEYS, BEFORE, WINNERS, VIEW_ROWS].map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
     }
   }
   if (!await tableExists(con, SILVER, 'customer')) return { mappings: records };

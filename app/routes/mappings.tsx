@@ -3,7 +3,7 @@
 // 以及手动触发一次合并到标准层
 import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, PencilLine, Play, Plus, X } from 'lucide-react';
 import { useState } from 'react';
-import { parseDocument } from 'yaml';
+import { isMap, isScalar, parseDocument } from 'yaml';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mappings';
 import { can, requirePermission } from '~/.server/access';
@@ -205,13 +205,25 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
   );
 }
 
-/** YAML 里的 table 或 entity 换成 value（保留注释与顺序）；YAML 解析不了时不动 */
-function withTarget(yaml: string, key: 'table' | 'entity', value: string) {
+/**
+ * YAML 里的 table、view 或 entity 换成 value（保留注释与顺序）；table 与 view 只能写一个，换成另一种时原地改键名，换成 table 时去掉 view_key。
+ * YAML 解析不了时不动
+ */
+function withTarget(yaml: string, key: 'table' | 'view' | 'entity', value: string) {
   const doc = parseDocument(yaml);
-  if (doc.errors.length || doc.get(key) === value) return yaml;
+  if (doc.errors.length || !isMap(doc.contents)) return yaml;
+  const other = key === 'table' ? 'view' : key === 'view' ? 'table' : null;
+  const swapped = other && doc.contents.items.find(i => isScalar(i.key) && i.key.value === other);
+  if (!swapped && doc.get(key) === value) return yaml;
+  if (swapped && isScalar(swapped.key)) swapped.key.value = key;
   doc.set(key, value);
+  if (key === 'table') doc.delete('view_key');
   return doc.toString();
 }
+
+/** 表下拉框的取值：源视图前加 view: 与同名的源表区分 */
+const VIEW_PREFIX = 'view:';
+const inputValue = (t: { name: string; view?: true }) => (t.view ? `${VIEW_PREFIX}${t.name}` : t.name);
 
 /**
  * 新建映射的表单：选数据源、用表单或 YAML 编写映射。表与目标实体两个下拉框决定表单列哪些字段、对照面板显示什么（默认取 YAML 里写的），
@@ -227,10 +239,14 @@ function NewMapping({ sources, tables, functions, values, submitting }: {
   const [sourceId, setSourceId] = useState(values.sourceId);
   const [yaml, setYaml] = useState(values.yaml);
   const [outline] = useState(() => mappingOutline(values.yaml));
-  const [tableName, setTableName] = useState(outline.table);
+  const [inputName, setInputName] = useState(outline.view ? inputValue({ name: outline.view, view: true }) : outline.table);
   const [entity, setEntity] = useState(outline.entity && entityOf(outline.entity) ? outline.entity : CANONICAL_ENTITIES[0].name);
   const sourceTables = tables[sourceId] ?? [];
-  const table = sourceTables.find(t => t.name === tableName) ?? sourceTables[0] ?? null;
+  const table = sourceTables.find(t => inputValue(t) === inputName) ?? sourceTables[0] ?? null;
+  const selectInput = (value: string) => {
+    setInputName(value);
+    setYaml(y => (value.startsWith(VIEW_PREFIX) ? withTarget(y, 'view', value.slice(VIEW_PREFIX.length)) : withTarget(y, 'table', value)));
+  };
   return (
     <Form method="post">
       <FieldGroup>
@@ -242,9 +258,9 @@ function NewMapping({ sources, tables, functions, values, submitting }: {
             </NativeSelect>
           </Field>
           <Field>
-            <FieldLabel htmlFor="mapping-table">表</FieldLabel>
-            <NativeSelect id="mapping-table" name="table" value={table?.name ?? ''} onChange={e => { setTableName(e.target.value); setYaml(y => withTarget(y, 'table', e.target.value)); }} disabled={!sourceTables.length}>
-              {sourceTables.map(t => <NativeSelectOption key={t.name} value={t.name}>{t.name}</NativeSelectOption>)}
+            <FieldLabel htmlFor="mapping-table">表或源视图</FieldLabel>
+            <NativeSelect id="mapping-table" name="table" value={table ? inputValue(table) : ''} onChange={e => selectInput(e.target.value)} disabled={!sourceTables.length}>
+              {sourceTables.map(t => <NativeSelectOption key={inputValue(t)} value={inputValue(t)}>{t.view ? `源视图 ${t.name}` : t.name}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
           <Field>
@@ -260,7 +276,7 @@ function NewMapping({ sources, tables, functions, values, submitting }: {
         </Field>
         <div className="flex gap-2">
           <Button type="submit" name="intent" value="create" disabled={submitting || !sources.length}>{submitting ? '正在处理…' : '校验并保存草稿'}</Button>
-          <Button type="submit" name="intent" value="draft" variant="outline" disabled={submitting || !table} title="按列名、类型与常见取值生成，替换编辑框里的内容；不会保存">
+          <Button type="submit" name="intent" value="draft" variant="outline" disabled={submitting || !table || !!table.view} title={table?.view ? '按规则生成草稿要用源表的列统计，源视图请直接编写' : '按列名、类型与常见取值生成，替换编辑框里的内容；不会保存'}>
             按规则生成草稿
           </Button>
         </div>

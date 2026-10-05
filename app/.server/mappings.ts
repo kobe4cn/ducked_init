@@ -1,4 +1,4 @@
-// app/.server/mappings.ts —— 映射：数据工程师用 YAML 编写“源表 → 标准实体”的映射，校验通过才能保存为草稿；草稿由最后保存它的人以外的
+// app/.server/mappings.ts —— 映射：数据工程师用 YAML 编写“源表（或已发布的源视图，ADR-0023）→ 标准实体”的映射，校验通过才能保存为草稿；草稿由最后保存它的人以外的
 // 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后为这个映射入队合并任务（silver.merge），同步给已发布映射的源表写入变更后也为这些映射再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
 // 编辑时可对任一版本空跑：在请求内只读挂载本租户的数据湖，转换原始层的样本，返回样例行与基础断言，不写标准层（pipeline/dry-run-engine.ts）。
 // 一律限定在操作者所属租户内；合并本身在工作进程里进行（pipeline/merge-engine.ts）
@@ -7,7 +7,7 @@ import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
-import { mappings, mappingVersions, sources, tasks, tenants, type TaskStatus } from './db/schema';
+import { mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { dryRun } from './pipeline/dry-run-engine';
 import { identityRules } from './pipeline/identity-engine';
@@ -51,23 +51,65 @@ async function profiledTables(tenantId: string, sourceId: string) {
   };
 }
 
-/** 数据源里各表的字段（最近一次成功采集到的）：表不在同步范围、还没采集时返回原因 */
+/**
+ * 源视图（给了 viewIds 时只取这些，否则取数据源 sourceId 下的）最新的已发布版本：SQL、输出列与引用的原始层表。
+ * 早于映射读源视图（#96）保存的版本没有列与表，为空
+ */
+async function publishedViews(db: Tx | ReturnType<typeof getDb>, tenantId: string, where: { sourceId: string } | { viewIds: string[] }) {
+  if ('viewIds' in where && !where.viewIds.length) return [];
+  return db
+    .selectDistinctOn([sourceViewVersions.viewId], {
+      id: sourceViews.id, name: sourceViews.name, version: sourceViewVersions.version,
+      sql: sourceViewVersions.sql, columns: sourceViewVersions.columns, tables: sourceViewVersions.tables,
+    })
+    .from(sourceViewVersions)
+    .innerJoin(sourceViews, eq(sourceViews.id, sourceViewVersions.viewId))
+    .where(and(eq(sourceViews.tenantId, tenantId), eq(sourceViewVersions.status, 'published'),
+      'sourceId' in where ? eq(sourceViews.sourceId, where.sourceId) : inArray(sourceViews.id, where.viewIds)))
+    .orderBy(sourceViewVersions.viewId, desc(sourceViewVersions.version));
+}
+
+/** 合并与空跑用到的源视图版本 */
+const viewParam = (v: { version: number; sql: string; tables: string[] | null }) => ({ version: v.version, sql: v.sql, tables: v.tables ?? [] });
+
+/**
+ * 数据源里各表的字段（最近一次成功采集到的）与已发布源视图的输出列：表不在同步范围、还没采集，或源视图没有发布时返回原因。
+ * 另返回已发布的源视图（新建映射时据此记下视图）
+ */
 async function sourceColumns(tenantId: string, sourceId: string) {
   const lookup = await profiledTables(tenantId, sourceId);
-  return (table: string) => {
+  const views = await publishedViews(getDb(), tenantId, { sourceId });
+  return (table: string, view?: boolean) => {
+    if (view) {
+      const found = views.find(v => v.name === table);
+      if (!found) return `数据源中没有已发布的源视图 ${table}`;
+      return found.columns ?? `源视图 ${table} 是在映射支持源视图之前保存的，请重新保存并发布一版`;
+    }
     const profiled = lookup(table);
     return typeof profiled === 'string' ? profiled : profiled.table.columns.map(c => ({ name: c.name, type: c.type }));
   };
 }
 
+/** 对照面板里的一张源表或一个源视图（列统计的取值见 referenceTables） */
+export interface ReferenceInput {
+  name: string; view?: true; sampleRows: number; primaryKey: string[]; watermark: string | null;
+  columns: { name: string; type: string; nullRate: number; distinct: number; top: { value: string; rows: number }[] | null; formats: { format: string; share: number }[] }[];
+}
+
 /**
  * 编写映射时对照的源表（同步范围内、已采集的）：各列的类型、空值率、不同取值数与常见取值，
- * 主键（源端主键，没有时为声明的业务主键）与确认的水位线字段
+ * 主键（源端主键，没有时为声明的业务主键）与确认的水位线字段；其后是已发布的源视图（view 为真，只有列名与类型，没有列统计）
  */
-export async function referenceTables(actor: CurrentMember, sourceId: string) {
+export async function referenceTables(actor: CurrentMember, sourceId: string): Promise<ReferenceInput[]> {
   assertCan(actor, 'sources:read');
   const { tables } = await confirmedTables(actor.tenant.id, sourceId);
-  return tables.map(({ table, watermark, key }) => ({
+  const views = (await publishedViews(getDb(), actor.tenant.id, { sourceId })).filter(v => v.columns)
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(v => ({
+      name: v.name, view: true as const, sampleRows: 0, primaryKey: [] as string[], watermark: null,
+      columns: v.columns!.map(c => ({ name: c.name, type: c.type, nullRate: 0, distinct: 0, top: null, formats: [] })),
+    }));
+  return [...tables.map(({ table, watermark, key }) => ({
     name: table.name,
     sampleRows: table.sampleRows,
     // 旧的采集结果里没有主键信息
@@ -75,7 +117,7 @@ export async function referenceTables(actor: CurrentMember, sourceId: string) {
     watermark: watermark?.column ?? null,
     // formats：表单新建扩展字段时据此判断是否像敏感信息
     columns: table.columns.map(c => ({ name: c.name, type: c.type, nullRate: c.nullRate, distinct: c.distinct, top: c.top ?? null, formats: c.formats ?? [] })),
-  }));
+  })), ...views];
 }
 
 /**
@@ -98,7 +140,7 @@ export async function draftFor(actor: CurrentMember, sourceId: string, table: st
  * 没有已采集的表、生成不了时是模板
  */
 export async function defaultDraft(actor: CurrentMember, sourceId: string) {
-  const candidates = (await referenceTables(actor, sourceId)).map(t => ({ table: t.name, entity: entityForTable(t.name) }));
+  const candidates = (await referenceTables(actor, sourceId)).filter(t => !t.view).map(t => ({ table: t.name, entity: entityForTable(t.name) }));
   const pick = candidates.find(c => c.entity) ?? candidates[0];
   if (!pick) return mappingTemplate('order', 'orders');
   try {
@@ -113,14 +155,20 @@ export async function defaultDraft(actor: CurrentMember, sourceId: string) {
 export async function draftForMapping(actor: CurrentMember, mappingId: string) {
   assertCan(actor, 'sources:write');
   const mapping = await requireMapping(actor.tenant.id, mappingId);
+  if (mapping.sourceViewId) throw new MappingError('按规则生成草稿要用源表的列统计，读源视图的映射请直接编辑');
   return draftFor(actor, mapping.sourceId, mapping.tableName, mapping.entity);
 }
 
-/** 校验映射文档（对照数据源的字段），不通过时抛出带问题列表的 MappingError */
+/**
+ * 校验映射文档（对照数据源的字段与已发布的源视图），不通过时抛出带问题列表的 MappingError。
+ * viewId 是输入为源视图时这个视图的 ID，否则为 null
+ */
 async function checked(tenantId: string, sourceId: string, yaml: string) {
   const result = checkMapping(yaml, await sourceColumns(tenantId, sourceId));
   if (!result.ok) throw new MappingError(`映射有 ${result.issues.length} 处问题，未保存`, 400, result.issues);
-  return result;
+  const [view] = result.plan.view ? await getDb().select({ id: sourceViews.id }).from(sourceViews)
+    .where(and(eq(sourceViews.tenantId, tenantId), eq(sourceViews.sourceId, sourceId), eq(sourceViews.name, result.plan.table))) : [];
+  return { ...result, viewId: view?.id ?? null };
 }
 
 async function requireMapping(tenantId: string, mappingId: string, tx: Tx | ReturnType<typeof getDb> = getDb()) {
@@ -134,11 +182,11 @@ async function requireMapping(tenantId: string, mappingId: string, tx: Tx | Retu
 export async function createMapping(actor: CurrentMember, sourceId: string, yaml: string) {
   assertCan(actor, 'sources:write');
   const source = await requireSource(actor.tenant.id, sourceId).catch(() => { throw new MappingError('请选择数据源'); });
-  const { plan } = await checked(actor.tenant.id, sourceId, yaml);
+  const { plan, viewId } = await checked(actor.tenant.id, sourceId, yaml);
   try {
     return await getDb().transaction(async tx => {
       const [mapping] = await tx.insert(mappings).values({
-        tenantId: actor.tenant.id, spaceId: actor.space.id, sourceId, tableName: plan.table, entity: plan.entity,
+        tenantId: actor.tenant.id, spaceId: actor.space.id, sourceId, tableName: plan.table, sourceViewId: viewId, entity: plan.entity,
       }).returning();
       await tx.insert(mappingVersions).values({ mappingId: mapping.id, version: 1, yaml, plan, authors: [actor.email], lastEditor: actor.email });
       await recordAudit(tx, {
@@ -164,9 +212,9 @@ export async function createMapping(actor: CurrentMember, sourceId: string, yaml
 export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: string) {
   assertCan(actor, 'sources:write');
   const mapping = await requireMapping(actor.tenant.id, mappingId);
-  const { plan } = await checked(actor.tenant.id, mapping.sourceId, yaml);
-  if (plan.table !== mapping.tableName || plan.entity !== mapping.entity) {
-    throw new MappingError(`这个映射是 ${mapping.tableName} → ${mapping.entity}，不能改表或实体；请新建映射`);
+  const { plan, viewId } = await checked(actor.tenant.id, mapping.sourceId, yaml);
+  if (plan.table !== mapping.tableName || viewId !== mapping.sourceViewId || plan.entity !== mapping.entity) {
+    throw new MappingError(`这个映射是 ${mapping.sourceViewId ? '源视图 ' : ''}${mapping.tableName} → ${mapping.entity}，不能改表、源视图或实体；请新建映射`);
   }
   return getDb().transaction(async tx => {
     // 锁住映射行；等锁期间映射可能因丢弃草稿被删除
@@ -295,7 +343,7 @@ export async function discardDraft(actor: CurrentMember, mappingId: string) {
 }
 
 /**
- * 空跑映射的第 version 版：在只读挂载的数据湖上转换原始层里源表最新的样本（只用会话的本机库 stage），返回样例行与基础断言。
+ * 空跑映射的第 version 版：在只读挂载的数据湖上转换原始层里源表（或源视图）最新的样本（只用会话的本机库 stage），返回样例行与基础断言。
  * 不写标准层与合并日志、不记审计。源表还没同步、转换出错时抛出 MappingError（报错里抹掉凭据、盐与敏感字段的取值）
  */
 export async function dryRunMapping(actor: CurrentMember, mappingId: string, version: number) {
@@ -304,13 +352,15 @@ export async function dryRunMapping(actor: CurrentMember, mappingId: string, ver
   const [row] = await getDb().select({ plan: mappingVersions.plan }).from(mappingVersions)
     .where(and(eq(mappingVersions.mappingId, mappingId), eq(mappingVersions.version, version)));
   if (!row) throw new MappingError(`没有第 ${version} 版`, 404);
+  // 输入是源视图时空跑它最新的已发布版本
+  const [view] = mapping.sourceViewId ? await publishedViews(getDb(), actor.tenant.id, { viewIds: [mapping.sourceViewId] }) : [];
   const lake = await lakeRow(actor.tenant.id);
   if (!lake || !lakeReady(lake)) throw new MappingError('本租户的数据湖还没有初始化');
   const salt = await tenantPiiSalt(actor.tenant.id);
   const spec = lakeSpecOf(lake);
   const session = await openTenantLake(spec, DRY_RUN_LIMITS, undefined, { readOnly: true });
   try {
-    const result = await dryRun(session.con, row.plan, mapping.sourceId, salt, DRY_RUN_ROWS);
+    const result = await dryRun(session.con, row.plan, mapping.sourceId, salt, DRY_RUN_ROWS, view && viewParam(view));
     if ('skipped' in result) throw new MappingError(result.skipped);
     return result;
   } catch (e) {
@@ -321,20 +371,30 @@ export async function dryRunMapping(actor: CurrentMember, mappingId: string, ver
   }
 }
 
-/** 租户各映射（给了 mappingIds 时只取这些）最新的已发布版本及其合并计划（合并任务的参数） */
+/**
+ * 租户各映射（给了 mappingIds 时只取这些）最新的已发布版本及其合并计划（合并任务的参数）。
+ * 输入是源视图的映射带上视图最新的已发布版本（SQL 与引用的表），工作进程不读平台库
+ */
 export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId: string, mappingIds?: string[]): Promise<MergeMappingParam[]> {
   if (mappingIds && !mappingIds.length) return [];
   const rows = await db
     .selectDistinctOn([mappingVersions.mappingId], {
-      mapping: mappings.id, sourceId: mappings.sourceId, version: mappingVersions.version, plan: mappingVersions.plan,
+      mapping: mappings.id, sourceId: mappings.sourceId, viewId: mappings.sourceViewId, version: mappingVersions.version, plan: mappingVersions.plan,
     })
     .from(mappingVersions)
     .innerJoin(mappings, eq(mappings.id, mappingVersions.mappingId))
     .where(and(eq(mappings.tenantId, tenantId), eq(mappingVersions.status, 'published'), mappingIds && inArray(mappings.id, mappingIds)))
     .orderBy(mappingVersions.mappingId, desc(mappingVersions.version));
+  const views = await publishedViews(db, tenantId, { viewIds: [...new Set(rows.flatMap(r => (r.viewId ? [r.viewId] : [])))] });
   return rows
     .sort((a, b) => a.mapping.localeCompare(b.mapping))
-    .map(r => ({ ...r.plan, mapping: r.mapping, version: r.version, sourceId: r.sourceId }));
+    .map(({ viewId, ...r }) => {
+      const view = views.find(v => v.id === viewId);
+      return {
+        ...r.plan, mapping: r.mapping, version: r.version, sourceId: r.sourceId,
+        ...(view && { sourceView: viewParam(view) }),
+      };
+    });
 }
 
 const ofMerge = (tenantId: string) => and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'silver.merge'));
@@ -363,11 +423,15 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
 
 /**
  * 同步任务 s 是否给已发布映射 m 的源表写入了变更：同一数据源、同一张表、本批次写进原始层的行数大于 0（删除也算在内）。
+ * 输入是源视图的映射看视图最新的已发布版本引用的任一张表。
  * 比对周期里同一张表有两条记录，任意一条有变更即可；失败的记录没有 rows，自然排除（部分失败的任务照样参与判断）。
  * 同步后的合并与定时检查共用这个判断（ADR-0015）
  */
 const syncWroteMappingTable = (s: 's', m: 'm') => sql.raw(`${s}.kind = 'source.sync' AND ${s}.params->>'sourceId' = ${m}.source_id::text
-  AND EXISTS (SELECT 1 FROM jsonb_array_elements(${s}.result->'tables') r WHERE r->>'table' = ${m}.table_name AND (r->>'rows')::int > 0)`);
+  AND EXISTS (SELECT 1 FROM jsonb_array_elements(${s}.result->'tables') r WHERE (r->>'rows')::int > 0 AND r->>'table' = ANY(CASE
+    WHEN ${m}.source_view_id IS NULL THEN ARRAY[${m}.table_name]
+    ELSE (SELECT vv.tables FROM platform.source_view_versions vv WHERE vv.view_id = ${m}.source_view_id AND vv.status = 'published' ORDER BY vv.version DESC LIMIT 1)
+  END))`);
 
 /**
  * 同步结束后合并一次（调度器在同步任务结束时调用）：只为这次同步给源表写入了变更的已发布映射入队，没有这样的映射时不入队；
@@ -414,7 +478,8 @@ const mergeHas = (params: SQL, mappingId: SQL) => sql`${params}->'mappings' @> j
 
 /**
  * 到期要合并的映射（给了 tenantId 时只看这个租户）：映射已发布、租户未停用，带它的最近一次合并 last 不在排队，且
- * (a) last 带的不是它最新的已发布版本（还没合并过也算；last 失败了也算带过，不自动重试），或
+ * (a) last 带的不是它最新的已发布版本（还没合并过也算；last 失败了也算带过，不自动重试；读源视图的映射另看 last 带的视图版本，
+ *     视图发布时已有合并在运行、入队不了的由此补上），或
  * (b) last 开始之后有同步结束并给它的源表写入了变更（合并运行期间发生的变化由此补上）。
  * 同一租户的合并一个接一个，入队或补映射时都在租户锁里取最新的已发布版本，所以 last 带的就是合并过的最高版本；
  * 按版本而不按发布时间判断 (a)：发布时间是事务开始时间，可能早于并发领取的合并的开始时间。
@@ -427,7 +492,8 @@ async function dueMappings(db: Tx | ReturnType<typeof getDb>, tenantId?: string)
     CROSS JOIN LATERAL (SELECT max(version) AS version FROM ${mappingVersions} WHERE mapping_id = m.id AND status = 'published') v
     LEFT JOIN LATERAL (
       SELECT l.status, coalesce(l.started_at, l.created_at) AS at,
-        (SELECT (e->>'version')::int FROM jsonb_array_elements(l.params->'mappings') e WHERE e->>'mapping' = m.id::text) AS version
+        (SELECT (e->>'version')::int FROM jsonb_array_elements(l.params->'mappings') e WHERE e->>'mapping' = m.id::text) AS version,
+        (SELECT (e->'sourceView'->>'version')::int FROM jsonb_array_elements(l.params->'mappings') e WHERE e->>'mapping' = m.id::text) AS view_version
       FROM ${tasks} l
       WHERE l.tenant_id = m.tenant_id AND l.kind = 'silver.merge' AND ${mergeHas(sql`l.params`, sql`m.id::text`)}
       ORDER BY l.created_at DESC, l.id DESC LIMIT 1
@@ -436,6 +502,8 @@ async function dueMappings(db: Tx | ReturnType<typeof getDb>, tenantId?: string)
       AND last.status IS DISTINCT FROM 'queued'
       AND (
         last.version IS DISTINCT FROM v.version
+        OR (m.source_view_id IS NOT NULL AND last.view_version IS DISTINCT FROM
+          (SELECT max(version) FROM ${sourceViewVersions} WHERE view_id = m.source_view_id AND status = 'published'))
         OR EXISTS (SELECT 1 FROM ${tasks} s WHERE s.tenant_id = m.tenant_id AND s.finished_at > last.at AND ${syncWroteMappingTable('s', 'm')})
       )
     ORDER BY m.tenant_id, m.id`);

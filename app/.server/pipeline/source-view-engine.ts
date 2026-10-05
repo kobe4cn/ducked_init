@@ -17,7 +17,8 @@ export class ViewSqlError extends Error {}
 export const VIEW_PLATFORM_COLUMNS = ['_op', '_batch', '_commit_ts'] as const;
 
 export interface ViewColumn { name: string; type: string; sensitive: boolean }
-export interface ViewPreview { columns: ViewColumn[]; rows: Record<string, unknown>[]; limit: number }
+/** tables：视图引用的本数据源原始层的表（映射在这些表同步后合并） */
+export interface ViewPreview { columns: ViewColumn[]; rows: Record<string, unknown>[]; limit: number; tables: string[] }
 
 /** SQL 引用的一张表；cte 为真时它是所在作用域里定义的 CTE */
 interface TableRef { catalog: string; schema: string; table: string; cte: boolean }
@@ -65,7 +66,8 @@ function collect(node: unknown, out: { tables: TableRef[]; forbidden: string[] }
 
 /**
  * 校验源视图的 SQL：只能是一条 SELECT，引用的表只能是本数据源原始层的表（可以带 bronze_<数据源 ID> 前缀，也可以不带，不能带 catalog）
- * 或所在作用域里的 CTE，不能用表函数、SHOW 等与读配置的函数。bronzeTables 是本数据源原始层现有的表。不合规时抛出 ViewSqlError
+ * 或所在作用域里的 CTE，不能用表函数、SHOW 等与读配置的函数。bronzeTables 是本数据源原始层现有的表。不合规时抛出 ViewSqlError；
+ * 通过时返回引用的原始层表（按 bronzeTables 里的写法，去重排序）
  */
 export async function checkViewSql(con: DuckDBConnection, sql: string, sourceId: string, bronzeTables: readonly string[]) {
   if (!sql) throw new ViewSqlError('请填写 SQL');
@@ -79,7 +81,8 @@ export async function checkViewSql(con: DuckDBConnection, sql: string, sourceId:
   collect(tree.statements, found);
   if (found.forbidden.length) throw new ViewSqlError(`源视图不能用 ${[...new Set(found.forbidden)].join('、')}，只能读本数据源原始层的表`);
   const schema = bronzeSchema(sourceId);
-  const own = new Set(bronzeTables.map(t => t.toLowerCase()));
+  const own = new Map(bronzeTables.map(t => [t.toLowerCase(), t]));
+  const used = new Set<string>();
   for (const t of found.tables) {
     const name = [t.catalog, t.schema, t.table].filter(Boolean).join('.');
     // 不能带 catalog：预览在 stage 里的同名视图上执行，带上 lake 就绕过了敏感列的哈希
@@ -87,8 +90,11 @@ export async function checkViewSql(con: DuckDBConnection, sql: string, sourceId:
       throw new ViewSqlError(`源视图只能读本数据源原始层的表，不能读 ${name}`);
     }
     if (t.cte) continue;
-    if (!own.has(t.table.toLowerCase())) throw new ViewSqlError(`本数据源的原始层没有表 ${t.table}（只能读已同步进原始层的表）`);
+    const table = own.get(t.table.toLowerCase());
+    if (!table) throw new ViewSqlError(`本数据源的原始层没有表 ${t.table}（只能读已同步进原始层的表）`);
+    used.add(table);
   }
+  return [...used].sort();
 }
 
 /** 本数据源原始层现有的表 */
@@ -136,7 +142,7 @@ export async function previewView(
   con: DuckDBConnection, sql: string, sourceId: string, salt: string, limit: number, sensitive: Readonly<Record<string, readonly string[]>> = {},
 ): Promise<ViewPreview> {
   const tables = await bronzeTablesOf(con, sourceId);
-  await checkViewSql(con, sql, sourceId, tables);
+  const used = await checkViewSql(con, sql, sourceId, tables);
   // 换行再收尾：SQL 末尾的行注释不会吞掉右括号
   const query = `SELECT * FROM (\n${sql}\n)`;
   const schema = bronzeSchema(sourceId);
@@ -157,6 +163,7 @@ export async function previewView(
       columns,
       rows: sample.map(r => Object.fromEntries(columns.map(c => [c.name, c.sensitive ? hash(r[c.name]) : r[c.name]]))),
       limit,
+      tables: used,
     };
   } finally {
     await con.run(`USE lake; DROP SCHEMA IF EXISTS stage.${ident(schema)} CASCADE`);

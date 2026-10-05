@@ -55,7 +55,7 @@ fields:
 colour: red
 `);
     expect(found).toEqual([
-      { line: 1, col: 1, path: '', message: '缺少 table' },
+      { line: 1, col: 1, path: '', message: '缺少 table（源表）或 view（源视图）' },
       { line: 1, col: 8, path: 'model', message: '应为 1（标准模型 v1）' },
       { line: 5, col: 11, path: 'fields.amount', message: expect.stringContaining('应为文本或对象') },
       { line: 6, col: 1, path: 'colour', message: '不认识的项 colour' },
@@ -125,6 +125,39 @@ colour: red
     const custom = `model: 1\nentity: custom_coupon\ntable: orders\nextensions:\n  code: { type: string, expr: string(order_id) }\n`;
     expect(issues(custom).map(i => i.message)).toEqual(['自定义实体必须声明去重键 dedupe.key']);
     expect(checkMapping(`${custom}dedupe: { key: [code] }\n`, columns).ok).toBe(true);
+  });
+});
+
+describe('以源视图为输入', () => {
+  const VIEW = [['order_id', 'BIGINT'], ['amount', 'DECIMAL(10,2)'], ['region', 'VARCHAR']].map(([name, type]) => ({ name, type }));
+  /** 源视图与源表同名时各查各的 */
+  const lookup = (name: string, view?: boolean) => (view ? (name === 'orders' ? VIEW : `数据源中没有已发布的源视图 ${name}`) : columns(name));
+  const viewed = `model: 1\nentity: order\nview: orders\nview_key: [order_id]\nfields:\n  order_id: string(order_id)\n  amount: amount\n`;
+
+  it('view 引用已发布的源视图，按视图的列校验；计划里带上视图的记录标识列', () => {
+    const r = checkMapping(viewed, lookup);
+    expect(r.ok && r.plan).toMatchObject({ table: 'orders', view: { key: ['order_id'] } });
+    const keyless = checkMapping(viewed.replace('view_key: [order_id]\n', ''), lookup);
+    expect(keyless.ok && keyless.plan.view).toEqual({ key: [] });
+    // 视图里没有源表的列
+    expect(issuesWith(viewed.replace('amount: amount', 'amount: pay_fen'), lookup)).toEqual([
+      expect.objectContaining({ path: 'fields.amount', message: '源视图 orders 中没有字段 pay_fen' }),
+    ]);
+  });
+
+  it('table 与 view 必须且只能写一个；view_key 只能用于源视图，且必须是视图里的列', () => {
+    expect(issuesWith(viewed.replace('view: orders\n', ''), lookup).map(i => i.message)).toContain('缺少 table（源表）或 view（源视图）');
+    expect(issuesWith(viewed.replace('view: orders\n', 'view: orders\ntable: orders\n'), lookup).map(i => i.message))
+      .toContain('table 与 view 只能写一个：源表写 table，源视图写 view');
+    expect(issuesWith(ok.replace('table: orders', 'table: orders\nview_key: [order_id]'), columns)).toEqual([
+      expect.objectContaining({ path: 'view_key', message: 'view_key 只能用于源视图（view）' }),
+    ]);
+    expect(issuesWith(viewed.replace('[order_id]', '[order_no]'), lookup)).toEqual([
+      expect.objectContaining({ path: 'view_key.0', message: '源视图 orders 中没有字段 order_no' }),
+    ]);
+    expect(issuesWith(viewed.replace('view: orders', 'view: payments'), lookup)).toEqual([
+      expect.objectContaining({ path: 'view', message: '数据源中没有已发布的源视图 payments' }),
+    ]);
   });
 });
 
@@ -259,7 +292,7 @@ describe('映射报错给出改法', () => {
 describe('对照面板读出的 YAML 要点', () => {
   it('只把写了表达式的字段算作已对应，读出 dedupe.key；写到一半解析出错时尽量取能解析的部分', () => {
     const outline = mappingOutline('entity: order\ntable: orders\nfields:\n  order_id: order_no\n  amount:\ndedupe:\n  key: [order_no_x]\n');
-    expect(outline).toEqual({ entity: 'order', table: 'orders', fields: new Set(['order_id']), dedupeKey: ['order_no_x'] });
+    expect(outline).toEqual({ entity: 'order', table: 'orders', view: null, fields: new Set(['order_id']), dedupeKey: ['order_no_x'] });
     expect(mappingOutline('entity: order\nfields:\n  status: { expr: status\n').entity).toBe('order');
     expect(mappingOutline('fields: [').fields.size).toBe(0);
   });

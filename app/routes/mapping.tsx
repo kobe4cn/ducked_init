@@ -69,7 +69,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         entity: m.entity,
         entityLabel: entityLabel(m.entity),
         /** 编辑草稿时对照的源表（还没采集、不在同步范围时为 null；不能编辑时不给） */
-        reference: canWrite ? ((await referenceTables(member, m.source.id)).find(t => t.name === m.tableName) ?? null) : null,
+        reference: canWrite ? ((await referenceTables(member, m.source.id)).find(t => t.name === m.tableName && !!t.view === !!m.sourceViewId) ?? null) : null,
       },
       versions: m.versions.map(v => ({
         ...v,

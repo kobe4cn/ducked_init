@@ -1,4 +1,4 @@
-// app/.server/pipeline/mapping-spec.ts —— 映射文档（YAML）：一张源表 → 一个标准实体（或自定义实体）。
+// app/.server/pipeline/mapping-spec.ts —— 映射文档（YAML）：一张源表（或一个已发布的源视图）→ 一个标准实体（或自定义实体）。
 // 先按 JSON Schema（MAPPING_SCHEMA）校验结构，再对照标准模型与源表的字段做语义校验：字段表达式只能用白名单函数、只能引用源表里有的字段，
 // 值字典与兜底值只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段，身份打通的匹配字段（只用于 customer）必须是映射出来的敏感字段；扩展字段可标成敏感（只能是文本），内置敏感字段不能取消敏感标记。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
 // 校验通过后得到合并计划（MergePlan）：标准层的列、每列的表达式与值字典、去重键与取最新字段、身份打通的匹配规则，交给工作进程编译执行（ADR-0015）
@@ -18,8 +18,12 @@ export interface MappingSpec {
   /** 标准模型的大版本 */
   model: number;
   entity: string;
-  /** 源表（数据源里的表名，与同步范围里的一致） */
+  /** 源表（数据源里的表名，与同步范围里的一致）；与 view 二选一，校验通过后为源表或源视图的名字 */
   table: string;
+  /** 已发布的源视图（ADR-0022）；与 table 二选一 */
+  view?: string;
+  /** 源视图里标识一条记录的列（通常是主表的主键）；不写时按整行区分记录。只能用于源视图 */
+  view_key?: string[];
   description?: string;
   fields?: Record<string, FieldSpec>;
   /** 扩展字段（标准实体上以 x_ 开头）或自定义实体的全部字段：带类型；sensitive 为真时标准层只存加盐哈希 */
@@ -52,12 +56,14 @@ const fieldSpec = {
 /** 映射文档的 JSON Schema（模型起草映射时也用它约束输出） */
 export const MAPPING_SCHEMA = {
   type: 'object',
-  required: ['model', 'entity', 'table'],
+  required: ['model', 'entity'],
   additionalProperties: false,
   properties: {
     model: { const: MODEL_MAJOR },
     entity: { type: 'string', minLength: 1 },
     table: { type: 'string', minLength: 1 },
+    view: { type: 'string', minLength: 1 },
+    view_key: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 } },
     description: { type: 'string' },
     fields: { type: 'object', additionalProperties: fieldSpec },
     extensions: {
@@ -96,6 +102,9 @@ export const MAPPING_SCHEMA = {
   },
 } as const;
 
+/** table 与 view 都没写：Schema 里两者都是选填，另行检查 */
+const MISSING_INPUT = '缺少 table（源表）或 view（源视图）';
+
 const validateSchema = new Ajv({ allErrors: true, strict: false }).compile(MAPPING_SCHEMA);
 
 /**
@@ -116,7 +125,10 @@ export interface PlanColumn {
 /** 合并计划：工作进程据此把源表的变更批次合并到标准层（MergeMappingParam 再加上映射与版本） */
 export interface MergePlan {
   entity: string;
+  /** 源表或源视图的名字 */
   table: string;
+  /** 输入是源视图时才有：key 是视图里标识一条记录的列，为空时按整行区分记录 */
+  view?: { key: string[] };
   /** 映射出来的列 */
   columns: PlanColumn[];
   /** 标准层表应有的全部列：标准实体的全部字段（没映射的为空）加上本映射的扩展字段 */
@@ -132,10 +144,10 @@ export interface MergePlan {
 export type MappingCheck = { ok: true; spec: MappingSpec; plan: MergePlan } | { ok: false; issues: MappingIssue[] };
 
 /**
- * 源表的字段：表不能用于映射时返回原因（不在同步范围、还没采集等）。
+ * 源表（view 为真时是已发布的源视图）的字段：不能用于映射时返回原因（不在同步范围、还没采集、没有发布等）。
  * 不给时不检查源表（工作进程里只编译，不再对照）
  */
-export type SourceColumns = (table: string) => SourceColumn[] | string;
+export type SourceColumns = (name: string, view?: boolean) => SourceColumn[] | string;
 
 /** 源表的一列：名称与源端类型（DuckDB 类型名，如 BIGINT、VARCHAR） */
 export interface SourceColumn { name: string; type: string }
@@ -292,6 +304,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
         hint: snippet({ [name]: asExtension(raw) }, [[name]]),
       });
     }
+    if (root.table === undefined && root.view === undefined) issue([], MISSING_INPUT);
     const seen = new Set<string>();
     for (const e of validateSchema.errors ?? []) {
       const d = describeSchemaError(e);
@@ -303,6 +316,13 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
     return { ok: false, issues: issues.sort(ISSUE_ORDER) };
   }
   const spec = value as MappingSpec;
+  const isView = spec.view !== undefined;
+  if (isView === (spec.table !== undefined)) {
+    issue(isView ? ['view'] : [], isView ? 'table 与 view 只能写一个：源表写 table，源视图写 view' : MISSING_INPUT, { atKey: isView });
+    return { ok: false, issues };
+  }
+  if (isView) spec.table = spec.view!;
+  const inputLabel = isView ? '源视图' : '源表';
   const entity = entityOf(spec.entity);
   const custom = isCustomEntity(spec.entity);
   if (!entity && !custom) {
@@ -310,13 +330,17 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
     return { ok: false, issues };
   }
 
-  // 源表与它的字段
+  // 源表（或源视图）与它的字段
   let columns: Map<string, string> | null = null;
   if (sourceColumns) {
-    const listed = sourceColumns(spec.table);
-    if (typeof listed === 'string') issue(['table'], listed);
+    const listed = sourceColumns(spec.table, isView);
+    if (typeof listed === 'string') issue([isView ? 'view' : 'table'], listed);
     else columns = new Map(listed.map(c => [c.name, c.type]));
   }
+  if (spec.view_key && !isView) issue(['view_key'], 'view_key 只能用于源视图（view）', { atKey: true });
+  spec.view_key?.forEach((name, i) => {
+    if (isView && columns && !columns.has(name)) issue(['view_key', i], `源视图 ${spec.table} 中没有字段 ${name}`);
+  });
 
   /** 校验一个表达式，返回其文本；表达式在 YAML 字符串里的位置按引号偏移一列 */
   const checkExpr = (path: Path, expr: string) => {
@@ -325,7 +349,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
     try {
       const parsed = parseExpression(expr);
       for (const c of referencedColumns(parsed)) {
-        if (columns && !columns.has(c.name)) issue(path, `源表 ${spec.table} 中没有字段 ${c.name}`, { offset: quote + c.offset });
+        if (columns && !columns.has(c.name)) issue(path, `${inputLabel} ${spec.table} 中没有字段 ${c.name}`, { offset: quote + c.offset });
       }
     } catch (e) {
       if (!(e instanceof ExprError)) throw e;
@@ -494,6 +518,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
     plan: {
       entity: spec.entity,
       table: spec.table,
+      ...(isView && { view: { key: [...(spec.view_key ?? [])] } }),
       columns: planned,
       entityColumns: [...(entity?.fields.map(f => ({ name: f.name, type: f.type })) ?? []), ...extensions],
       key,

@@ -1,16 +1,17 @@
 // app/.server/source-views.ts —— 源视图：数据工程师在某个数据源下手写一段只读原始层的 SELECT，把复杂源表整理成可映射的形状（ADR-0022）。
 // 保存草稿时在请求内只读挂载本租户的数据湖校验 SQL（只能读本数据源原始层的表，见 pipeline/source-view-engine.ts），并取出视图的列与前几行样本。
 // 草稿按映射同样的规则双人发布：由最后保存它的人以外的另一位有发布权限的成员在页面上发布，也可以丢弃（回到最近的已发布版本，
-// 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。一律限定在操作者所属租户内
+// 从没发布过时整个删除）；发布后版本锁定，并为基于它的已发布映射入队合并（ADR-0023）。没有任何自动发布的路径。一律限定在操作者所属租户内
 import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
-import { sources, sourceViews, sourceViewVersions } from './db/schema';
+import { mappings, sources, sourceViews, sourceViewVersions } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
+import { enqueueMerge } from './mappings';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
-import { normalizeViewSql, previewView, ViewSqlError } from './pipeline/source-view-engine';
+import { normalizeViewSql, previewView, VIEW_PLATFORM_COLUMNS, ViewSqlError, type ViewPreview } from './pipeline/source-view-engine';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
@@ -65,6 +66,12 @@ async function checkAndPreview(tenantId: string, sourceId: string, viewSql: stri
     session.close();
   }
 }
+
+/** 版本里存下的形状：输出列（不含平台列，映射对照字段用）与引用的原始层表（这些表同步后合并基于视图的映射） */
+const shapeOf = (preview: ViewPreview) => ({
+  columns: preview.columns.filter(c => !(VIEW_PLATFORM_COLUMNS as readonly string[]).includes(c.name)).map(c => ({ name: c.name, type: c.type })),
+  tables: preview.tables,
+});
 
 /** 列表里的一个源视图：最近的已发布版本号与草稿的版本号，没有时为 null */
 export interface SourceViewSummary { id: string; name: string; published: number | null; draft: number | null }
@@ -123,11 +130,11 @@ export async function createSourceView(actor: CurrentMember, sourceId: string, i
   const name = input.name.trim();
   if (!VIEW_NAME.test(name)) throw new SourceViewError('视图名要以小写字母开头，只含小写字母、数字和下划线，最长 63 个字符');
   const viewSql = normalizeViewSql(input.sql);
-  await checkAndPreview(actor.tenant.id, sourceId, viewSql);
+  const shape = shapeOf(await checkAndPreview(actor.tenant.id, sourceId, viewSql));
   try {
     return await getDb().transaction(async tx => {
       const [view] = await tx.insert(sourceViews).values({ tenantId: actor.tenant.id, sourceId, name }).returning({ id: sourceViews.id });
-      await tx.insert(sourceViewVersions).values({ viewId: view.id, version: 1, sql: viewSql, authors: [actor.email], lastEditor: actor.email });
+      await tx.insert(sourceViewVersions).values({ viewId: view.id, version: 1, sql: viewSql, ...shape, authors: [actor.email], lastEditor: actor.email });
       await recordAudit(tx, {
         tenantId: actor.tenant.id,
         actor,
@@ -152,7 +159,7 @@ export async function saveSourceViewDraft(actor: CurrentMember, sourceId: string
   assertCan(actor, 'sources:write');
   const view = await requireView(actor.tenant.id, sourceId, viewId);
   const viewSql = normalizeViewSql(input);
-  await checkAndPreview(actor.tenant.id, view.sourceId, viewSql);
+  const shape = shapeOf(await checkAndPreview(actor.tenant.id, view.sourceId, viewSql));
   return getDb().transaction(async tx => {
     // 锁住源视图行：与发布、丢弃互斥；丢弃从没发布过的源视图会删除它
     const [locked] = await tx.select({ id: sourceViews.id }).from(sourceViews).where(eq(sourceViews.id, viewId)).for('update');
@@ -160,12 +167,12 @@ export async function saveSourceViewDraft(actor: CurrentMember, sourceId: string
     const [latest] = await tx.select().from(sourceViewVersions)
       .where(eq(sourceViewVersions.viewId, viewId)).orderBy(desc(sourceViewVersions.version)).limit(1);
     if (latest?.status === 'draft') {
-      await tx.update(sourceViewVersions).set({ sql: viewSql, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
+      await tx.update(sourceViewVersions).set({ sql: viewSql, ...shape, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
         .where(eq(sourceViewVersions.id, latest.id));
       return latest.version;
     }
     const version = (latest?.version ?? 0) + 1;
-    await tx.insert(sourceViewVersions).values({ viewId, version, sql: viewSql, authors: [actor.email], lastEditor: actor.email });
+    await tx.insert(sourceViewVersions).values({ viewId, version, sql: viewSql, ...shape, authors: [actor.email], lastEditor: actor.email });
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
@@ -180,7 +187,7 @@ export async function saveSourceViewDraft(actor: CurrentMember, sourceId: string
 
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。只由成员在页面上调用，没有自动发布。
- * 发布后版本锁定
+ * 发布后版本锁定，并为基于这个源视图的已发布映射入队一次合并（按新版本重建）
  */
 export async function publishSourceView(actor: CurrentMember, sourceId: string, viewId: string, version: number) {
   assertCan(actor, 'publish');
@@ -190,6 +197,8 @@ export async function publishSourceView(actor: CurrentMember, sourceId: string, 
   if (!draft) throw new SourceViewError(`没有第 ${version} 版`, 404);
   const blocker = publishBlocker(actor, draft);
   if (blocker) throw new SourceViewError(blocker, draft.status === 'draft' ? 403 : 400);
+  // 早于映射读源视图（#96）保存的草稿没有输出列与引用的表，映射对照不了、同步后也触发不了合并
+  if (!draft.columns || !draft.tables) throw new SourceViewError('这份草稿保存得较早，没有记下视图的列与引用的表：请重新保存一次再发布');
   await getDb().transaction(async tx => {
     // 锁住源视图行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿
     await tx.select({ id: sourceViews.id }).from(sourceViews).where(eq(sourceViews.id, viewId)).for('update');
@@ -206,6 +215,8 @@ export async function publishSourceView(actor: CurrentMember, sourceId: string, 
       targetId: viewId,
       detail: { source: view.sourceName, name: view.name, version, authors: draft.authors, lastEditor: draft.lastEditor },
     });
+    const dependents = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.sourceViewId, viewId));
+    if (dependents.length) await enqueueMerge(tx, actor.tenant.id, dependents.map(m => m.id));
   });
 }
 

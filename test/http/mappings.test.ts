@@ -6,6 +6,7 @@ import { parseDocument } from 'yaml';
 import { closeDb } from '../../app/.server/db/client';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
+import { createSourceView, publishSourceView } from '../../app/.server/source-views';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { memberOf, newTenant, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
@@ -153,6 +154,27 @@ describe('编写与发布映射', () => {
     // 不能编辑的成员看不到
     await memberOf(tenantId, 'an@acme.com', 'analyst');
     expect(await (await (await loginAs(app, 'an@acme.com')).get(`/mappings/${id}?tab=merges`)).text()).not.toContain('data-add-to-dictionary');
+  });
+
+  it('新建映射的表下拉框列出已发布的源视图；YAML 写 view 的映射保存后，详情页对照视图的列，空跑转换视图的样本', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await memberOf(tenantId, 'de@acme.com');
+    const reviewer = await memberOf(tenantId, 'de2@acme.com');
+    await confirmWatermark(engineer, sourceId, 'orders', 'order_id');
+    await syncSource(engineer, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const viewId = await createSourceView(engineer, sourceId, { name: 'paid_orders', sql: "SELECT order_id, amount, status, _op, _batch, _commit_ts FROM orders WHERE status = 'paid'" });
+    const author = await loginAs(app, 'de@acme.com');
+    expect(await (await author.get('/mappings')).text()).not.toContain('源视图 paid_orders');
+    await publishSourceView(reviewer, sourceId, viewId, 1);
+    expect(await (await author.get('/mappings')).text()).toMatch(/<option[^>]*value="view:paid_orders">源视图 paid_orders</);
+
+    const yaml = ORDERS.replace('table: orders', 'view: paid_orders\nview_key: [order_id]');
+    const id = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml }));
+    expect(await (await author.get(`/mappings/${id}`)).text()).toContain('源视图 paid_orders（只有列与类型，没有列统计）');
+    const dry = await author.post(`/mappings/${id}`, { intent: 'dryrun', version: '1' });
+    expect(dry.status).toBe(200);
+    expect(await dry.text()).toContain('data-dryrun="1"');
   });
 
   it('编辑页空跑正在查看的版本：展示样例行（邮箱是哈希）与断言，不保存；没同步时提示原因；分析师 403、其他租户 404', async () => {

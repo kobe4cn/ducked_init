@@ -31,6 +31,8 @@ const tableExists = async (con: DuckDBConnection, schema: string, name: string) 
 export async function readSensitive(con: DuckDBConnection, sourceId: string, plan: MergePlan, key: string): Promise<RevealedRecord> {
   const columns = sensitivePlanColumns(plan);
   if (!columns.length) throw new RevealError('这个映射没有敏感字段', 400);
+  // 源视图可能连接多张表、改写取值，按源表主键找不回它的一行
+  if (plan.view) throw new RevealError(`这个映射读的是源视图 ${plan.table}，不能按源表主键解密；请在读源表的映射上解密`, 400);
   const schema = bronzeSchema(sourceId);
   if (!await tableExists(con, schema, plan.table)) throw new RevealError(`源表 ${plan.table} 还没有同步进原始层`, 404);
   const keys = await sourceKeysOf(con, sourceId, plan.table);

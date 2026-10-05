@@ -273,7 +273,9 @@ export const mappings = platform.table('mappings', {
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
   spaceId: uuid('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
   sourceId: uuid('source_id').notNull().references(() => sources.id, { onDelete: 'cascade' }),
+  // 源表名；输入是源视图时是视图名，source_view_id 指向它（ADR-0023）
   tableName: text('table_name').notNull(),
+  sourceViewId: uuid('source_view_id').references(() => sourceViews.id),
   entity: text('entity').notNull(),
   createdAt: createdAt(),
 }, t => [
@@ -354,6 +356,9 @@ export const sourceViewVersions = platform.table('source_view_versions', {
   version: integer('version').notNull(),
   status: sourceViewVersionStatusEnum('status').notNull().default('draft'),
   sql: text('sql').notNull(),
+  // 保存时校验得到的输出列（不含平台列）与引用的原始层表（映射据此对照字段、在这些表同步后合并）；早于 #96 保存的版本为空
+  columns: jsonb('columns').$type<{ name: string; type: string }[]>(),
+  tables: text('tables').array(),
   authors: text('authors').array().notNull(),
   lastEditor: text('last_editor').notNull(),
   publishedByEmail: text('published_by_email'),

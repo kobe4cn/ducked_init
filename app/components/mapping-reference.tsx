@@ -17,7 +17,8 @@ export interface ReferenceColumn {
   /** 样本里过半取值符合的文本格式（如 email、mobile） */
   formats?: { format: string; share: number }[];
 }
-export interface ReferenceTable { name: string; sampleRows: number; primaryKey: string[]; watermark: string | null; columns: ReferenceColumn[] }
+/** view 为真时是已发布的源视图：只有列名与类型，没有列统计 */
+export interface ReferenceTable { name: string; view?: true; sampleRows: number; primaryKey: string[]; watermark: string | null; columns: ReferenceColumn[] }
 /** 白名单函数（由 loader 从 mapping-expr 的 FUNCTIONS 传来） */
 export interface ReferenceFunction { name: string; signature: string; label: string }
 
@@ -122,7 +123,7 @@ function MappingReference({ table, entity, functions, yaml, onInsert }: {
     <div className="max-h-[48rem] space-y-4 overflow-y-auto text-xs">
       {table ? (
         <div data-reference-table={table.name} className="space-y-1">
-          <div className="font-medium">{`源表 ${table.name}（基于前 ${table.sampleRows.toLocaleString('zh-CN')} 行样本）`}</div>
+          <div className="font-medium">{table.view ? `源视图 ${table.name}（只有列与类型，没有列统计）` : `源表 ${table.name}（基于前 ${table.sampleRows.toLocaleString('zh-CN')} 行样本）`}</div>
           <Table>
             <TableHeader>
               <TableRow>
@@ -147,8 +148,8 @@ function MappingReference({ table, entity, functions, yaml, onInsert }: {
                     {table.watermark === c.name && <Badge variant="outline">水位线</Badge>}
                   </TableCell>
                   <TableCell className="font-mono text-muted-foreground">{c.type}</TableCell>
-                  <TableCell>{pct(c.nullRate)}</TableCell>
-                  <TableCell>{c.distinct.toLocaleString('zh-CN')}</TableCell>
+                  <TableCell>{table.view ? '—' : pct(c.nullRate)}</TableCell>
+                  <TableCell>{table.view ? '—' : c.distinct.toLocaleString('zh-CN')}</TableCell>
                   <TableCell className="whitespace-normal">{c.top?.map(t => `${t.value}（${t.rows.toLocaleString('zh-CN')}）`).join('，') || '—'}</TableCell>
                 </TableRow>
               ))}
