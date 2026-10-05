@@ -6,6 +6,7 @@ import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
+import { publishedCustomEntities } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
@@ -160,11 +161,12 @@ export async function draftForMapping(actor: CurrentMember, mappingId: string) {
 }
 
 /**
- * 校验映射文档（对照数据源的字段与已发布的源视图），不通过时抛出带问题列表的 MappingError。
+ * 校验映射文档（对照数据源的字段、已发布的源视图与已发布的自定义实体登记），不通过时抛出带问题列表的 MappingError。
  * viewId 是输入为源视图时这个视图的 ID，否则为 null
  */
 async function checked(tenantId: string, sourceId: string, yaml: string) {
-  const result = checkMapping(yaml, await sourceColumns(tenantId, sourceId));
+  const registered = await publishedCustomEntities(getDb(), tenantId);
+  const result = checkMapping(yaml, await sourceColumns(tenantId, sourceId), name => registered.get(name));
   if (!result.ok) throw new MappingError(`映射有 ${result.issues.length} 处问题，未保存`, 400, result.issues);
   const [view] = result.plan.view ? await getDb().select({ id: sourceViews.id }).from(sourceViews)
     .where(and(eq(sourceViews.tenantId, tenantId), eq(sourceViews.sourceId, sourceId), eq(sourceViews.name, result.plan.table))) : [];

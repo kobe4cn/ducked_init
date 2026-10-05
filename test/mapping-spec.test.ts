@@ -126,6 +126,41 @@ colour: red
     expect(issues(custom).map(i => i.message)).toEqual(['自定义实体必须声明去重键 dedupe.key']);
     expect(checkMapping(`${custom}dedupe: { key: [code] }\n`, columns).ok).toBe(true);
   });
+
+  it('对照已发布的自定义实体登记：未登记的实体、未登记的字段、类型或敏感标记不一致时报行列', () => {
+    const coupon = {
+      name: 'custom_coupon', label: '优惠券', kind: 'dimension' as const, primaryKey: ['code'],
+      fields: [
+        { name: 'code', type: 'string' as const, description: '', sensitive: false },
+        { name: 'owner_phone', type: 'string' as const, description: '', sensitive: true },
+        { name: 'issued_at', type: 'timestamp' as const, description: '', sensitive: false },
+      ],
+    };
+    const registered = (name: string) => (name === 'custom_coupon' ? coupon : undefined);
+    const check = (yaml: string) => checkMapping(yaml, columns, registered);
+    const head = 'model: 1\nentity: custom_coupon\ntable: orders\ndedupe: { key: [code] }\nextensions:\n';
+
+    const unregistered = check('model: 1\nentity: custom_store\ntable: orders\ndedupe: { key: [code] }\nextensions:\n  code: { type: string, expr: string(order_id) }\n');
+    expect(!unregistered.ok && unregistered.issues).toEqual([
+      { line: 2, col: 9, path: 'entity', message: expect.stringMatching(/custom_store 还没有登记.*「自定义实体」登记并发布/) },
+    ]);
+
+    const wrong = check(`${head}  code: { type: string, expr: string(order_id) }\n  coupon_no: { type: string, expr: string(order_id) }\n  issued_at: { type: date, expr: created_at }\n  owner_phone: { type: string, expr: status, sensitive: false }\n`);
+    expect(!wrong.ok && wrong.issues.map(({ line, col, path, message, hint }) => ({ line, col, path, message, hint }))).toEqual([
+      { line: 7, col: 3, path: 'extensions.coupon_no', message: expect.stringMatching(/没有登记字段 coupon_no/), hint: undefined },
+      { line: 8, col: 22, path: 'extensions.issued_at.type', message: expect.stringContaining('登记的类型是 timestamp'), hint: 'type: timestamp' },
+      { line: 9, col: 57, path: 'extensions.owner_phone.sensitive', message: expect.stringContaining('登记为敏感字段'), hint: 'sensitive: true' },
+    ]);
+
+    // 没写 sensitive 时采用登记的值；不传登记时不校验
+    const fine = check(`${head}  code: { type: string, expr: string(order_id) }\n  owner_phone: { type: string, expr: status }\n`);
+    expect(fine.ok && fine.plan.columns.map(c => [c.name, c.sensitive])).toEqual([['code', undefined], ['owner_phone', true]]);
+    const dictionary = check(`${head}  code: { type: string, expr: string(order_id) }\n  owner_phone: { type: string, expr: status, dictionary: { a: b } }\n`);
+    expect(!dictionary.ok && dictionary.issues).toEqual([
+      { line: 7, col: 46, path: 'extensions.owner_phone.dictionary', message: expect.stringMatching(/登记为敏感字段.*请去掉 dictionary/) },
+    ]);
+    expect(checkMapping(`${head.replace('[code]', '[coupon_no]')}  coupon_no: { type: string, expr: string(order_id) }\n`, columns).ok).toBe(true);
+  });
 });
 
 describe('以源视图为输入', () => {

@@ -149,6 +149,13 @@ export type MappingCheck = { ok: true; spec: MappingSpec; plan: MergePlan } | { 
  */
 export type SourceColumns = (name: string, view?: boolean) => SourceColumn[] | string;
 
+/**
+ * 自定义实体已发布的登记（ADR-0019，custom-entities.ts 的 RegisteredEntity 里校验要用的部分）：没登记或只有草稿时返回 undefined。
+ * 不给时不对照登记（工作进程里只编译，不再对照）
+ */
+export type RegisteredEntities = (entity: string) => RegisteredEntity | undefined;
+export interface RegisteredEntity { name: string; fields: readonly { name: string; type: FieldType; sensitive: boolean }[] }
+
 /** 源表的一列：名称与源端类型（DuckDB 类型名，如 BIGINT、VARCHAR） */
 export interface SourceColumn { name: string; type: string }
 
@@ -260,10 +267,10 @@ const otherwiseOf = (raw: { otherwise?: string | null }) => (Object.hasOwn(raw, 
 const ISSUE_ORDER = (a: MappingIssue, b: MappingIssue) => a.line - b.line || a.col - b.col;
 
 /**
- * 校验映射文档：YAML 语法、JSON Schema、对照标准模型与源表字段的语义检查。
+ * 校验映射文档：YAML 语法、JSON Schema、对照标准模型、源表字段与自定义实体登记的语义检查。
  * 通过时返回规范化后的文档与合并计划，否则返回全部问题（按位置排序）
  */
-export function checkMapping(text: string, sourceColumns?: SourceColumns): MappingCheck {
+export function checkMapping(text: string, sourceColumns?: SourceColumns, registered?: RegisteredEntities): MappingCheck {
   const lines = new LineCounter();
   const doc = parseDocument(text, { lineCounter: lines, prettyErrors: false });
   if (doc.errors.length) {
@@ -328,6 +335,10 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
   if (!entity && !custom) {
     issue(['entity'], `不认识的实体 ${spec.entity}（标准实体：${CANONICAL_ENTITIES.map(e => e.name).join('、')}；自定义实体以 custom_ 开头）`);
     return { ok: false, issues };
+  }
+  const registration = custom ? registered?.(spec.entity) : undefined;
+  if (custom && registered && !registration) {
+    issue(['entity'], `自定义实体 ${spec.entity} 还没有登记并发布（草稿不算）：请先到「自定义实体」登记并发布`);
   }
 
   // 源表（或源视图）与它的字段
@@ -459,18 +470,38 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns): Mappi
         : `扩展字段 ${name} 必须以 x_ 开头（只用小写字母、数字与下划线），避免与标准字段重名`, { atKey: true });
       continue;
     }
+    // 自定义实体的字段对照登记：类型与敏感标记要一致（同一列不能有的存哈希、有的存明文，ADR-0005）；没写敏感标记时采用登记的
+    const registeredField = registration?.fields.find(f => f.name === name);
+    if (registration && !registeredField) {
+      const names = registration.fields.map(f => f.name).join('、');
+      issue(['extensions', name], `${spec.entity} 没有登记字段 ${name}（已登记：${names}）：请先到「自定义实体」登记并发布这个字段`, { atKey: true });
+      continue;
+    }
+    if (registeredField && registeredField.type !== ext.type) {
+      const { type } = registeredField;
+      issue(['extensions', name, 'type'], `字段 ${name} 登记的类型是 ${type}（${FIELD_TYPES[type].label}），映射里要写一样的类型`, { hint: `type: ${type}` });
+    }
+    if (registeredField && ext.sensitive !== undefined && ext.sensitive !== registeredField.sensitive) {
+      issue(['extensions', name, 'sensitive'], registeredField.sensitive
+        ? `字段 ${name} 登记为敏感字段：标准层只存哈希，映射里不能取消敏感标记`
+        : `字段 ${name} 登记为不敏感字段：映射里不能标成敏感`, { hint: `sensitive: ${registeredField.sensitive}` });
+    }
+    const sensitive = ext.sensitive ?? registeredField?.sensitive;
     checkExpr(['extensions', name, 'expr'], ext.expr);
     checkDictionary(['extensions', name], ext.type, ext.dictionary, () => snippet({ [name]: { ...ext, type: 'string' } }, [[name]]));
     checkOtherwise(['extensions', name], ext, ext.dictionary);
     // 敏感字段在标准层存的是十六进制的哈希
-    if (ext.sensitive && ext.type !== 'string') {
+    if (sensitive && !registeredField && ext.type !== 'string') {
       issue(['extensions', name, 'type'], '敏感字段在标准层只存哈希，类型只能是 string（文本）', { hint: snippet({ [name]: { ...ext, type: 'string' } }, [[name]]) });
     }
-    if (ext.sensitive && (ext.dictionary || Object.hasOwn(ext, 'otherwise'))) {
+    if (sensitive && ext.sensitive === undefined && (ext.dictionary || Object.hasOwn(ext, 'otherwise'))) {
+      // 敏感标记来自登记，映射里没写：报在值字典或兜底上
+      issue(['extensions', name, ext.dictionary ? 'dictionary' : 'otherwise'], `字段 ${name} 登记为敏感字段，标准层只存源端取值的哈希，值字典与兜底对它不起作用：请去掉 dictionary / otherwise`, { atKey: true });
+    } else if (sensitive && (ext.dictionary || Object.hasOwn(ext, 'otherwise'))) {
       issue(['extensions', name, 'sensitive'], '敏感字段在标准层只存源端取值的哈希，值字典与兜底对它不起作用：请去掉 dictionary / otherwise，或取消敏感标记', { atKey: true });
     }
     planned.push({
-      name, type: ext.type, expr: ext.expr, ...(ext.dictionary && { dictionary: ext.dictionary }), ...otherwiseOf(ext), ...(ext.sensitive && { sensitive: true as const }),
+      name, type: ext.type, expr: ext.expr, ...(ext.dictionary && { dictionary: ext.dictionary }), ...otherwiseOf(ext), ...(sensitive && { sensitive: true as const }),
     });
   }
   if (!planned.length) issue(spec.fields ? ['fields'] : [], '至少要映射一个字段');

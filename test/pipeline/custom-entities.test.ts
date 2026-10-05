@@ -8,11 +8,12 @@ import {
   saveCustomEntityDraft, type CustomEntityInput,
 } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { createMapping } from '../../app/.server/mappings';
+import { createMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
-import { registerSource } from '../../app/.server/sources';
+import { syncSource } from '../../app/.server/source-sync';
+import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables } from './fixtures';
+import { memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -199,5 +200,41 @@ describe('删除自定义实体', () => {
     const outsider = await memberOf(await newTenant('globex'), 'de@globex.com');
     await expect(deleteCustomEntity(outsider, id)).rejects.toMatchObject({ status: 404 });
     expect(await listCustomEntities(author)).toHaveLength(1);
+  });
+});
+
+describe('映射对照自定义实体登记', () => {
+  it('没登记或只有草稿时映射保存不了；登记发布后能保存、发布并合并进标准层，敏感字段按登记存哈希', async () => {
+    const { acme, author, reviewer } = await engineers();
+    const { id: sourceId } = await registerSource(author, await pgSourceInput(READER));
+    await selectAllTables(author, sourceId);
+    await drain();
+    await confirmWatermark(author, sourceId, 'customers', 'updated_at');
+    await syncSource(author, sourceId);
+    await drain();
+    const yaml = `model: 1
+entity: custom_store
+table: customers
+extensions:
+  store_id: { type: string, expr: string(customer_id) }
+  manager_phone: { type: string, expr: phone }
+dedupe: { key: [store_id] }
+`;
+    const rejected = () => createMapping(author, sourceId, yaml).then(() => '已保存', (e: { issues: unknown }) => e.issues);
+    expect(await rejected()).toEqual([
+      { line: 2, col: 9, path: 'entity', message: expect.stringContaining('请先到「自定义实体」登记并发布') },
+    ]);
+    const id = await createCustomEntity(author, STORE);
+    expect(await rejected()).toEqual([expect.objectContaining({ path: 'entity' })]);
+
+    await publishCustomEntity(reviewer, id, 1);
+    const mappingId = await publish(author, reviewer, sourceId, yaml);
+    const rows = await silver(acme, 'custom_store', 'store_id::INT');
+    expect(rows).toHaveLength(40);
+    expect(rows[0]).toMatchObject({ store_id: '1', manager_phone: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    // 保存草稿同样对照登记：没登记的字段报在该字段
+    await expect(saveDraft(author, mappingId, yaml.replace('dedupe', '  city: { type: string, expr: city }\ndedupe'))).rejects.toMatchObject({
+      issues: [expect.objectContaining({ line: 7, path: 'extensions.city', message: expect.stringContaining('没有登记字段 city') })],
+    });
   });
 });
