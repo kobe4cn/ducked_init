@@ -97,6 +97,15 @@ const ACTIONS = {
     label: '丢弃源视图草稿',
     describe: (d: Detail) => `「${d.source}」${d.name}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '源视图已删除'}`,
   },
+  'custom_entity.drafted': { label: '起草自定义实体', describe: (d: Detail) => `${d.name}，第 ${d.version} 版草稿` },
+  'custom_entity.published': {
+    label: '发布自定义实体',
+    describe: (d: Detail) => `${d.name}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
+  },
+  'custom_entity.draft_discarded': {
+    label: '丢弃自定义实体草稿',
+    describe: (d: Detail) => `${d.name}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '自定义实体已删除'}`,
+  },
   // 只记定位记录的主键与原因，不记明文
   'pii.revealed': {
     label: '解密敏感信息',

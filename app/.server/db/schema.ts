@@ -1,6 +1,7 @@
 // app/.server/db/schema.ts —— 平台元数据（平台 PostgreSQL 的 platform schema）。业务数据不落这里（ADR-0002）
 import { sql } from 'drizzle-orm';
 import { bigint, boolean, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import type { CustomEntityField, CustomEntityKind } from '../../lib/canonical-model';
 import { ROLES } from '../../lib/roles';
 import { SOURCE_KINDS } from '../../lib/sources';
 import type { MergePlan } from '../pipeline/mapping-spec';
@@ -368,6 +369,41 @@ export const sourceViewVersions = platform.table('source_view_versions', {
 }, t => [
   uniqueIndex('source_view_versions_view_version_uq').on(t.viewId, t.version),
   uniqueIndex('source_view_versions_one_draft_uq').on(t.viewId).where(sql`status = 'draft'`),
+]);
+
+export const customEntityVersionStatusEnum = platform.enum('custom_entity_version_status', VERSION_STATUSES);
+
+// 自定义实体：租户在标准模型之外登记的实体（ADR-0019），映射可以写到它。名称 custom_ 开头、租户内唯一，建实体时定下、之后不能改；
+// 第一次保存草稿时建立，从没发布过的实体丢弃草稿时删除
+export const customEntities = platform.table('custom_entities', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  createdAt: createdAt(),
+}, t => [
+  uniqueIndex('custom_entities_tenant_name_uq').on(t.tenantId, t.name),
+]);
+
+// 自定义实体的各个版本：中文名、类型（维度 / 事实，只用于引导）、字段与主键。草稿与双人发布的规则同映射版本（ADR-0015）：
+// 每个实体同时只有一份草稿，发布后锁定；last_editor 是最后保存草稿的成员，发布者不能是这位成员。只能由成员在页面上发布，没有自动发布
+export const customEntityVersions = platform.table('custom_entity_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  entityId: uuid('entity_id').notNull().references(() => customEntities.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  status: customEntityVersionStatusEnum('status').notNull().default('draft'),
+  label: text('label').notNull(),
+  kind: text('kind').$type<CustomEntityKind>().notNull(),
+  fields: jsonb('fields').$type<CustomEntityField[]>().notNull(),
+  primaryKey: text('primary_key').array().notNull(),
+  authors: text('authors').array().notNull(),
+  lastEditor: text('last_editor').notNull(),
+  publishedByEmail: text('published_by_email'),
+  publishedAt: timestamp('published_at', { withTimezone: true }),
+  createdAt: createdAt(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [
+  uniqueIndex('custom_entity_versions_entity_version_uq').on(t.entityId, t.version),
+  uniqueIndex('custom_entity_versions_one_draft_uq').on(t.entityId).where(sql`status = 'draft'`),
 ]);
 
 // 结果快照：分析模板任务（如 gold.rfm）每次成功后在租户数据湖结果层写下的一张表（ADR-0002：数据在湖里，这里只登记元数据）。

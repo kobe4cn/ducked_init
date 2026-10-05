@@ -237,6 +237,12 @@ export const EXTENSION_PATTERN = '^x_[a-z][a-z0-9_]*$';
 /** 自定义实体的字段名 */
 export const CUSTOM_FIELD_PATTERN = '^[a-z][a-z0-9_]*$';
 
+/** 自定义实体的类型：维度或事实，只用于引导 */
+export const CUSTOM_ENTITY_KINDS = { dimension: '维度', fact: '事实' } as const;
+export type CustomEntityKind = keyof typeof CUSTOM_ENTITY_KINDS;
+/** 自定义实体登记的一个字段；敏感字段在标准层只存哈希，类型只能是 string */
+export interface CustomEntityField { name: string; type: FieldType; description: string; sensitive: boolean }
+
 export const isCustomEntity = (name: string) => new RegExp(CUSTOM_ENTITY_PATTERN).test(name);
 
 /** 实体的展示名称：标准实体用中文名，自定义实体用名称本身 */
