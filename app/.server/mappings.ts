@@ -580,7 +580,7 @@ export async function latestIdentitySummary(tenantId: string) {
 }
 
 /** 各映射最近一次合并的结果（每个映射分别找带它的最近一次合并任务，不受别的映射合并得多少影响） */
-async function lastMergeByMapping(tenantId: string, mappingIds: string[]) {
+export async function lastMergeByMapping(tenantId: string, mappingIds: string[]) {
   if (!mappingIds.length) return {};
   const { rows } = await getDb().execute<{ mapping_id: string; task_id: string; record: MergeRecord }>(sql`
     SELECT m.id AS mapping_id, r.task_id, r.record FROM unnest(ARRAY[${sql.join(mappingIds.map(id => sql`${id}`), sql`, `)}]::uuid[]) m(id)

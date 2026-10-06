@@ -7,7 +7,10 @@ const KIND_TINT: Record<SourceKind, string> = {
   postgres: 'bg-sky-100 text-sky-700', mysql: 'bg-orange-100 text-orange-700', mongodb: 'bg-emerald-100 text-emerald-700', s3: 'bg-violet-100 text-violet-700', duckdb: 'bg-amber-100 text-amber-700',
 };
 
-export function KindIcon({ kind }: { kind: SourceKind }) {
+/** small：放在行内或图节点里的小号 */
+export function KindIcon({ kind, small }: { kind: SourceKind; small?: boolean }) {
   const Icon = KIND_ICON[kind];
-  return <span className={`grid size-11 shrink-0 place-items-center rounded-xl ${KIND_TINT[kind]}`}><Icon className="size-5" /></span>;
+  return small
+    ? <span className={`grid size-5 shrink-0 place-items-center rounded-md ${KIND_TINT[kind]}`}><Icon className="size-3" /></span>
+    : <span className={`grid size-11 shrink-0 place-items-center rounded-xl ${KIND_TINT[kind]}`}><Icon className="size-5" /></span>;
 }

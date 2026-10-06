@@ -1,16 +1,24 @@
 // app/routes/lineage.tsx —— 数据地图（需登录，任何角色）：关系图画出已接入的标准层表与 _identities、_device_owner 之间的关系，
-// 图下服务端渲染一份表与关系的列表；点表节点（?node=）给出按租户湖挂载为 lake 写的示例 SQL。源端的表与字段需要 sources:read，不在这里下发。
-// _identities 显示匹配规则与最近一次打通的摘要（只有计数）；?all=1 时把未接入的标准实体与它们的内置关系也画出来，灰显
+// 图下服务端渲染一份表与关系的列表；点表节点（?node=）给出按租户湖挂载为 lake 写的示例 SQL。
+// _identities 显示匹配规则与最近一次打通的摘要（只有计数）；?all=1 时把未接入的标准实体与它们的内置关系也画出来，灰显。
+// 流向图（?tab=flow）画源表 → 映射 → 标准层表 → 打通表，带各映射最近一次合并与标准层表行数（取自任务结果，不查湖），图下同样有一份列表；
+// 只对有 sources:read 的成员开放，没有权限时回到关系图，源表名与映射信息都不下发
 import { Link, useSearchParams } from 'react-router';
 import type { Route } from './+types/lineage';
+import { can } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
 import { getDb } from '~/.server/db/client';
-import { latestIdentitySummary, publishedPlans } from '~/.server/mappings';
+import { lastMergeByMapping, latestIdentitySummary, type MergeHistoryEntry, publishedPlans } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { identityRules } from '~/.server/pipeline/identity-engine';
+import { listSources } from '~/.server/sources';
 import { deriveLineage } from '~/lib/lineage';
+import { type FlowInput, type FlowMerge, silverTotals } from '~/lib/lineage-flow';
 import { relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
+import type { SourceKind } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
+import { KindIcon } from '~/components/kind-icon';
+import { FlowGraphView, MergeStatus } from '~/components/lineage-flow';
 import { RelationGraphView } from '~/components/lineage-graph';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
@@ -21,12 +29,17 @@ export function meta({}: Route.MetaArgs) {
   return [{ title: '数据地图 · CRM 数据分析平台' }];
 }
 
-/** 页面的标签页：关系图（#82 再加流向图） */
-type Tab = 'graph';
-const tabOf = (_request: Request): Tab => {
-  // 目前只有关系图；#82 加流向图后按 ?tab= 区分
-  return 'graph';
-};
+/** 页面的标签页：关系图、流向图（需要 sources:read，没有权限时回到关系图） */
+type Tab = 'graph' | 'flow';
+const tabOf = (request: Request, canFlow: boolean): Tab =>
+  canFlow && new URL(request.url).searchParams.get('tab') === 'flow' ? 'flow' : 'graph';
+
+/** 一个映射最近一次合并的结果只留状态、结束时间与行数 */
+const flowMerge = (r: MergeHistoryEntry): FlowMerge => ({
+  status: 'error' in r ? 'failed' : 'skipped' in r ? 'skipped' : 'ok',
+  at: new Date(Date.parse(r.startedAt) + r.durationMs).toISOString(),
+  rows: 'rows' in r ? r.rows : null,
+});
 
 const NODE_KINDS = { entity: '标准层表', identity: '身份对应', device: '设备归属' } as const;
 const EDGE_KINDS = { ref: '内置关系', identity: '经 _identities', device: '经 _device_owner' } as const;
@@ -51,8 +64,23 @@ export async function loader({ request }: Route.LoaderArgs) {
   });
   const node = searchParams.get('node');
   const sql = node ? sampleSql(node, graph) : null;
+  const canFlow = can(member.role, 'sources:read');
+  const tab = tabOf(request, canFlow);
+  let flow: FlowInput | null = null;
+  if (tab === 'flow') {
+    // 只取数据源的名字与种类，不带连接配置；不下发合并计划（里面有列与表达式）
+    const sources = (await listSources(member)).map(({ id, name, kind }) => ({ id, name, kind }));
+    const { tables, edges } = deriveLineage({ plans, sources });
+    const last = await lastMergeByMapping(member.tenant.id, plans.map(p => p.mapping));
+    flow = {
+      tables, identityEdges: edges, identity: graph.nodes.find(n => n.identity)?.identity ?? null,
+      merges: Object.fromEntries(Object.entries(last).map(([id, r]) => [id, flowMerge(r)])),
+    };
+  }
   return {
-    tab: tabOf(request),
+    tab,
+    canFlow,
+    flow,
     email: member.email,
     nav: navFor(member),
     graph,
@@ -63,7 +91,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 }
 
 export default function Lineage({ loaderData }: Route.ComponentProps) {
-  const { tab, email, nav, graph, showAll, node, sql } = loaderData;
+  const { tab, canFlow, flow, email, nav, graph, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
   const [searchParams] = useSearchParams();
   const nodeHref = (id: string) => {
@@ -84,13 +112,19 @@ export default function Lineage({ loaderData }: Route.ComponentProps) {
         description="已接入的标准层表之间怎么关联。指向消费者的关系经 _identities 按 (_source, customer_id) 对应到统一消费者；匿名事件的设备经 _device_owner 按最近一次登录归到消费者。点一张表看示例 SQL。"
       />
 
-      <PillTabs current={tab} tabs={[{ key: 'graph', label: '关系图', href: '/lineage' }]} />
+      <PillTabs
+        current={tab}
+        tabs={[
+          { key: 'graph', label: '关系图', href: '/lineage' },
+          ...(canFlow ? [{ key: 'flow' as const, label: '流向图', href: '/lineage?tab=flow' }] : []),
+        ]}
+      />
 
       {graph.nodes.length === 0 ? (
         <section className="rounded-2xl border bg-white p-6 shadow-sm">
           <SectionHeader title="还没有已发布的映射">发布映射、合并到标准层之后，这里会画出已接入的表和它们之间的关系。</SectionHeader>
         </section>
-      ) : (
+      ) : flow ? <FlowSection flow={flow} /> : (
         <>
           <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
             <div className="flex items-start justify-between gap-6">
@@ -172,5 +206,73 @@ export default function Lineage({ loaderData }: Route.ComponentProps) {
         </>
       )}
     </AppShell>
+  );
+}
+
+/** 流向图与图下服务端渲染的列表（React Flow 挂载后才渲染，列表给没有脚本时与测试用） */
+function FlowSection({ flow }: { flow: FlowInput }) {
+  const silver = [...silverTotals(flow.tables, flow.merges).values()];
+  return (
+    <>
+      <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        <SectionHeader title="流向图">源表按数据源分组，点分组可以折叠或展开；映射节点显示版本与最近一次合并，失败的标红，点开看合并记录；标准层表显示行数（各映射最近一次合并成功时的行数之和，最近一次失败或跳过的映射不计入）与写入它的映射数。</SectionHeader>
+        <FlowGraphView flow={flow} />
+      </section>
+
+      <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        <SectionHeader title="映射与标准层表" />
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>数据源</TableHead>
+              <TableHead>源表</TableHead>
+              <TableHead>版本</TableHead>
+              <TableHead>标准层表</TableHead>
+              <TableHead>最近一次合并</TableHead>
+              <TableHead>行数</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {flow.tables.map(t => {
+              const merge = flow.merges[t.mapping];
+              const status = merge?.status ?? 'never';
+              return (
+                <TableRow key={t.mapping} data-flow-mapping={t.mapping} data-version={t.version} data-merge-status={status}>
+                  <TableCell>
+                    <span className="flex items-center gap-2"><KindIcon kind={t.sourceKind as SourceKind} small />{t.sourceName}</span>
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">
+                    {t.table}
+                    {t.viaView && <span className="ml-2 font-sans text-slate-500">源视图</span>}
+                  </TableCell>
+                  <TableCell>{`v${t.version}`}</TableCell>
+                  <TableCell className="font-mono text-xs">{t.target}</TableCell>
+                  <TableCell><MergeStatus status={status} at={merge?.at ?? null} mappingId={t.mapping} /></TableCell>
+                  <TableCell {...(merge?.rows != null ? { 'data-rows': merge.rows } : {})}>{merge?.rows != null ? merge.rows.toLocaleString('zh-CN') : '—'}</TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>标准层表</TableHead>
+              <TableHead>映射数</TableHead>
+              <TableHead>行数</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {silver.map(s => (
+              <TableRow key={s.entity} data-silver={s.entity} data-mappings={s.mappings} data-rows={s.rows}>
+                <TableCell className="font-mono text-xs">{`silver.${s.entity}`}</TableCell>
+                <TableCell>{s.mappings}</TableCell>
+                <TableCell>{s.rows.toLocaleString('zh-CN')}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </section>
+    </>
   );
 }

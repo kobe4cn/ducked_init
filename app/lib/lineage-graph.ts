@@ -27,10 +27,11 @@ export interface GraphEdge { id: string; source: string; target: string; kind: '
 
 export interface RelationGraph { nodes: GraphNode[]; edges: GraphEdge[] }
 
-const IDENTITIES = '_identities';
-const DEVICE_OWNER = '_device_owner';
-const WIDTH = 180;
-const HEIGHT = 56;
+export const IDENTITIES = '_identities';
+export const DEVICE_OWNER = '_device_owner';
+/** 表节点的尺寸 */
+export const NODE_WIDTH = 180;
+export const NODE_HEIGHT = 56;
 /** 带打通摘要的 _identities 节点多出规则与计数两行 */
 const IDENTITY_HEIGHT = 96;
 
@@ -43,16 +44,16 @@ export const ruleLabels = (rules: readonly string[]) =>
 export function relationGraph(input: { edges: LineageEdge[]; connected: string[]; showAll: boolean; identity?: IdentityInfo | null }): RelationGraph {
   const connected = [...new Set(input.connected)];
   const entity = (id: string, live: boolean): Omit<GraphNode, 'x' | 'y'> =>
-    ({ id, label: entityOf(id)?.label ?? id, kind: 'entity', connected: live, width: WIDTH, height: HEIGHT });
+    ({ id, label: entityOf(id)?.label ?? id, kind: 'entity', connected: live, width: NODE_WIDTH, height: NODE_HEIGHT });
   const nodes = connected.map(id => entity(id, true));
   if (input.showAll) nodes.push(...CANONICAL_ENTITIES.filter(e => !connected.includes(e.name)).map(e => entity(e.name, false)));
   if (connected.includes('customer')) {
     nodes.push({
-      id: IDENTITIES, label: IDENTITIES, kind: 'identity', connected: true, width: WIDTH,
-      ...(input.identity ? { identity: input.identity, height: IDENTITY_HEIGHT } : { height: HEIGHT }),
+      id: IDENTITIES, label: IDENTITIES, kind: 'identity', connected: true, width: NODE_WIDTH,
+      ...(input.identity ? { identity: input.identity, height: IDENTITY_HEIGHT } : { height: NODE_HEIGHT }),
     });
   }
-  if (connected.includes('event')) nodes.push({ id: DEVICE_OWNER, label: DEVICE_OWNER, kind: 'device', connected: true, width: WIDTH, height: HEIGHT });
+  if (connected.includes('event')) nodes.push({ id: DEVICE_OWNER, label: DEVICE_OWNER, kind: 'device', connected: true, width: NODE_WIDTH, height: NODE_HEIGHT });
   const nodeIds = new Set(nodes.map(n => n.id));
   const liveIds = new Set(nodes.filter(n => n.connected).map(n => n.id));
 
