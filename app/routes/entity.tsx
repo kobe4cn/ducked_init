@@ -1,13 +1,13 @@
 // app/routes/entity.tsx —— 单个自定义实体（ADR-0019）：数据工程师、管理员编辑登记（中文名、类型、字段与主键；名称建实体时定下，不能改），
 // 各版本（已发布的锁定、草稿可改；发布过的只能新增字段）、丢弃草稿，发布草稿需最后保存它的人以外的另一位有发布权限的成员在这个页面上操作，
-// 没有自动发布。有发布权限的成员可以删除没被已发布映射引用的实体。
+// 没有自动发布。有发布权限的成员可以删除没被已发布映射引用的实体。平台推断出的登记草稿提示成员核对后保存确认，确认前发布不了。
 // 分编辑、版本两个标签页（?tab=edit|versions，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）
-import { CircleAlert, Lock, Trash2 } from 'lucide-react';
+import { CircleAlert, Info, Lock, Trash2 } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entity';
 import { can, requirePermission } from '~/.server/access';
 import {
-  CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, publishCustomEntity, saveCustomEntityDraft,
+  CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, saveCustomEntityDraft,
 } from '~/.server/custom-entities';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
@@ -39,6 +39,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       canWrite: can(member.role, 'sources:write'),
       canDelete: can(member.role, 'publish'),
       entity: found.entity,
+      /** 草稿是平台推断、还没有成员确认（保存）过的登记 */
+      inferred: !!found.draft && isInferredDraft(found.draft),
       /** 引用这个实体的已发布映射；有引用时不能删除 */
       referrers: found.referrers,
       /** 编辑页显示的版本（?version=N，没有时显示最新的一版） */
@@ -103,7 +105,7 @@ function editHint(canWrite: boolean, selected: { status: string }, draft: { vers
 }
 
 export default function Entity({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, canWrite, canDelete, entity, referrers, version, versions } = loaderData;
+  const { email, nav, tab, canWrite, canDelete, entity, inferred, referrers, version, versions } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -140,6 +142,13 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
           <CircleAlert />
           <AlertTitle>{actionData.intent === 'delete' ? '未删除' : '未保存'}</AlertTitle>
           <AlertDescription>{actionData.error}</AlertDescription>
+        </Alert>
+      )}
+      {inferred && (
+        <Alert data-inferred>
+          <Info />
+          <AlertTitle>推断登记 · 待确认</AlertTitle>
+          <AlertDescription>这份登记由已发布映射推断，请核对字段、类型和主键后保存确认；主键和已发布字段在发布后不能改。</AlertDescription>
         </Alert>
       )}
       <PillTabs

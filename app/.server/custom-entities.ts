@@ -2,15 +2,19 @@
 // 每一版登记中文名、类型（维度 / 事实，只用于引导）、字段（名称、类型、说明、是否敏感）与主键。保存草稿时校验登记本身。
 // 草稿按映射同样的规则双人发布：由最后保存它的人以外的另一位有发布权限的成员在页面上发布，也可以丢弃（回到最近的已发布版本，
 // 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。发布过的实体只能新增字段（规则同 ADR-0018），
-// 没被已发布映射引用的实体可以由有发布权限的成员删除。一律限定在操作者所属租户内
+// 没被已发布映射引用的实体可以由有发布权限的成员删除。已发布映射在用、但没登记的实体由平台推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），
+// 先由一位成员确认（保存），再由另一位成员发布。一律限定在操作者所属租户内
 import { and, desc, eq, exists, getTableColumns, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { customEntities, customEntityVersions, mappings, mappingVersions, sources } from './db/schema';
+import { publishedPlans } from './mappings';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
-import { CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType } from '../lib/canonical-model';
+import {
+  CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType, isCustomEntity,
+} from '../lib/canonical-model';
 
 /** 可以展示给成员的业务错误 */
 export class CustomEntityError extends Error {
@@ -111,23 +115,26 @@ async function publishedReferrers(db: Tx | ReturnType<typeof getDb>, tenantId: s
   return rows.map(r => `「${r.source}」${r.viewId ? '源视图 ' : ''}${r.table}`);
 }
 
-/** 列表里的一个自定义实体：最新一版的中文名与类型，最近的已发布版本号与草稿的版本号（没有时为 null） */
-export interface CustomEntitySummary { id: string; name: string; label: string; kind: CustomEntityKind; published: number | null; draft: number | null }
+/** 列表里的一个自定义实体：最新一版的中文名与类型，最近的已发布版本号与草稿的版本号（没有时为 null），草稿是否为待确认的推断登记 */
+export interface CustomEntitySummary {
+  id: string; name: string; label: string; kind: CustomEntityKind; published: number | null; draft: number | null; inferred: boolean;
+}
 
-/** 本租户的自定义实体，按名称排序 */
+/** 本租户的自定义实体，按名称排序。先为已发布映射在用、但没登记的实体推断登记草稿 */
 export async function listCustomEntities(actor: CurrentMember) {
   assertCan(actor, 'sources:read');
+  await getDb().transaction(tx => inferCustomEntityDrafts(tx, actor.tenant.id));
   const versions = await getDb().select({
     id: customEntities.id, name: customEntities.name, version: customEntityVersions.version, status: customEntityVersions.status,
-    label: customEntityVersions.label, kind: customEntityVersions.kind,
+    label: customEntityVersions.label, kind: customEntityVersions.kind, lastEditor: customEntityVersions.lastEditor,
   })
     .from(customEntities).innerJoin(customEntityVersions, eq(customEntityVersions.entityId, customEntities.id))
     .where(eq(customEntities.tenantId, actor.tenant.id))
     .orderBy(customEntities.name, desc(customEntityVersions.version));
   const entities = new Map<string, CustomEntitySummary>();
   for (const v of versions) {
-    const entity = entities.get(v.id) ?? { id: v.id, name: v.name, label: v.label, kind: v.kind, published: null, draft: null };
-    if (v.status === 'draft') entity.draft = v.version;
+    const entity = entities.get(v.id) ?? { id: v.id, name: v.name, label: v.label, kind: v.kind, published: null, draft: null, inferred: false };
+    if (v.status === 'draft') Object.assign(entity, { draft: v.version, inferred: isInferredDraft(v) });
     else entity.published ??= v.version;
     entities.set(v.id, entity);
   }
@@ -146,7 +153,7 @@ export async function getCustomEntity(actor: CurrentMember, entityId: string) {
   }).from(customEntityVersions).where(eq(customEntityVersions.entityId, entityId)).orderBy(desc(customEntityVersions.version));
   return {
     entity,
-    versions: versions.map(v => ({ ...v, publishBlocker: publishBlocker(actor, v) })),
+    versions: versions.map(v => ({ ...v, publishBlocker: isInferredDraft(v) ? UNCONFIRMED : publishBlocker(actor, v) })),
     draft: versions.find(v => v.status === 'draft') ?? null,
     published: versions.find(v => v.status === 'published') ?? null,
     publishers: await publisherCount(actor.tenant.id),
@@ -225,6 +232,7 @@ export async function publishCustomEntity(actor: CurrentMember, entityId: string
   const [draft] = await getDb().select(getTableColumns(customEntityVersions)).from(customEntityVersions)
     .where(and(eq(customEntityVersions.entityId, entityId), eq(customEntityVersions.version, version)));
   if (!draft) throw new CustomEntityError(`没有第 ${version} 版`, 404);
+  if (isInferredDraft(draft)) throw new CustomEntityError(UNCONFIRMED);
   const blocker = publishBlocker(actor, draft);
   if (blocker) throw new CustomEntityError(blocker, draft.status === 'draft' ? 403 : 400);
   await getDb().transaction(async tx => {
@@ -299,6 +307,53 @@ export async function deleteCustomEntity(actor: CurrentMember, entityId: string)
       detail: { name: entity.name },
     });
   });
+}
+
+/** 推断登记草稿的作者与最后保存的人：平台本身，不是哪位成员 */
+export const INFERRED_BY = 'platform';
+
+/** 这一版是平台推断、还没有成员确认（保存）过的登记草稿 */
+export const isInferredDraft = (v: { status: string; lastEditor: string }) => v.status === 'draft' && v.lastEditor === INFERRED_BY;
+
+const UNCONFIRMED = '推断出的登记要先由一位成员确认（保存）后，再由另一位成员发布';
+
+/**
+ * 为已发布映射在用、但没有登记的自定义实体推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），幂等：已有登记（含只有草稿）的实体不动。
+ * 字段取各映射扩展字段的并集，类型与敏感标记照映射（映射发布时已保证同名字段类型一致；敏感只要有一份为真就是真）；
+ * 主键取去重键，各映射不一致时取映射 ID 排第一的那份，并在主键第一个字段的说明里列出分歧。推断不出合格登记的实体跳过。不记审计
+ */
+export async function inferCustomEntityDrafts(tx: Tx, tenantId: string) {
+  const registeredNames = new Set((await tx.select({ name: customEntities.name }).from(customEntities)
+    .where(eq(customEntities.tenantId, tenantId))).map(r => r.name));
+  // publishedPlans 按映射 ID 排序
+  const byEntity = new Map<string, Awaited<ReturnType<typeof publishedPlans>>>();
+  for (const plan of await publishedPlans(tx, tenantId)) {
+    if (isCustomEntity(plan.entity) && !registeredNames.has(plan.entity)) byEntity.set(plan.entity, [...byEntity.get(plan.entity) ?? [], plan]);
+  }
+  for (const [name, plans] of byEntity) {
+    const fields = new Map<string, CustomEntityField>();
+    for (const c of plans.flatMap(p => p.columns)) {
+      const field = fields.get(c.name);
+      if (field) field.sensitive ||= !!c.sensitive;
+      else fields.set(c.name, { name: c.name, type: c.type, description: '', sensitive: !!c.sensitive });
+    }
+    const primaryKey = plans[0].key;
+    const keys = [...new Set(plans.map(p => p.key.join(', ')))];
+    const keyField = fields.get(primaryKey[0]);
+    if (keys.length > 1 && keyField) {
+      keyField.description = `各映射的去重键不一致：${plans.map(p => `${p.table}（${p.key.join(', ')}）`).join('；')}。推断取了第一份，请确认主键`;
+    }
+    let checked;
+    try {
+      checked = checkRegistration({ label: name.replace(/^custom_/, ''), kind: 'dimension', fields: [...fields.values()], primaryKey });
+    } catch (e) {
+      if (e instanceof CustomEntityError) continue;
+      throw e;
+    }
+    const [entity] = await tx.insert(customEntities).values({ tenantId, name }).onConflictDoNothing().returning({ id: customEntities.id });
+    if (!entity) continue;
+    await tx.insert(customEntityVersions).values({ entityId: entity.id, version: 1, ...checked, authors: [INFERRED_BY], lastEditor: INFERRED_BY });
+  }
 }
 
 /** 本租户每个自定义实体最新的已发布登记，按名称索引（映射校验与合并用）；从没发布过的实体不在其中 */

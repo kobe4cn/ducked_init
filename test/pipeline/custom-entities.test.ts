@@ -1,13 +1,14 @@
 // 自定义实体登记的接缝（ADR-0019）：createCustomEntity / saveCustomEntityDraft 校验名称、字段与主键后保存草稿；
 // 双人发布与丢弃同源视图；publishedCustomEntities 给出每个实体最新的已发布版本。发布过的实体只能新增字段；
-// deleteCustomEntity 删除没被已发布映射引用的实体
+// deleteCustomEntity 删除没被已发布映射引用的实体；inferCustomEntityDrafts 为已发布映射在用、但没登记的实体推断登记草稿
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import {
-  createCustomEntity, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, listCustomEntities, publishCustomEntity, publishedCustomEntities,
-  saveCustomEntityDraft, type CustomEntityInput,
+  createCustomEntity, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, inferCustomEntityDrafts, listCustomEntities, publishCustomEntity,
+  publishedCustomEntities, saveCustomEntityDraft, type CustomEntityInput,
 } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
+import { customEntities } from '../../app/.server/db/schema';
 import { createMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
@@ -43,7 +44,7 @@ describe('自定义实体草稿', () => {
   it('保存后列表与详情能看到草稿', async () => {
     const { author } = await engineers();
     const id = await createCustomEntity(author, STORE);
-    expect(await listCustomEntities(author)).toEqual([{ id, name: 'custom_store', label: '门店', kind: 'dimension', published: null, draft: 1 }]);
+    expect(await listCustomEntities(author)).toEqual([{ id, name: 'custom_store', label: '门店', kind: 'dimension', published: null, draft: 1, inferred: false }]);
     const entity = await getCustomEntity(author, id);
     expect(entity.entity).toEqual({ id, name: 'custom_store' });
     expect(entity.draft).toMatchObject({ version: 1, label: '门店', fields: STORE.fields, primaryKey: ['store_id'], lastEditor: 'de@acme.com' });
@@ -113,7 +114,7 @@ describe('自定义实体发布', () => {
     const entity = await getCustomEntity(author, id);
     expect(entity.draft).toBeNull();
     expect(entity.versions.map(v => v.version)).toEqual([1]);
-    expect(await listCustomEntities(author)).toEqual([{ id, name: 'custom_store', label: '门店', kind: 'dimension', published: 1, draft: null }]);
+    expect(await listCustomEntities(author)).toEqual([{ id, name: 'custom_store', label: '门店', kind: 'dimension', published: 1, draft: null, inferred: false }]);
   });
 
   it('丢弃从没发布过的实体会删除它；分析师不能起草与发布', async () => {
@@ -236,5 +237,93 @@ dedupe: { key: [store_id] }
     await expect(saveDraft(author, mappingId, yaml.replace('dedupe', '  city: { type: string, expr: city }\ndedupe'))).rejects.toMatchObject({
       issues: [expect.objectContaining({ line: 7, path: 'extensions.city', message: expect.stringContaining('没有登记字段 city') })],
     });
+  });
+});
+
+describe('推断登记', () => {
+  /** 登记并发布 custom_store、发布引用它的映射后直接删掉登记，模拟登记功能上线前就在用的实体 */
+  async function unregistered(yamls: string[], sync = false) {
+    const { acme, author, reviewer } = await engineers();
+    const { id: sourceId } = await registerSource(author, await pgSourceInput(READER));
+    await selectAllTables(author, sourceId);
+    await drain();
+    await publishCustomEntity(reviewer, await createCustomEntity(author, STORE), 1);
+    const mappingIds = [];
+    for (const yaml of yamls) mappingIds.push(await publish(author, reviewer, sourceId, yaml));
+    await getDb().delete(customEntities);
+    if (sync) {
+      await confirmWatermark(author, sourceId, 'customers', 'updated_at');
+      await syncSource(author, sourceId);
+    }
+    return { acme, author, reviewer, mappingIds };
+  }
+  const CUSTOMERS = `model: 1
+entity: custom_store
+table: customers
+extensions:
+  store_id: { type: string, expr: string(customer_id) }
+  manager_phone: { type: string, expr: phone }
+dedupe: { key: [store_id] }
+`;
+  const ORDERS = `model: 1
+entity: custom_store
+table: orders
+extensions:
+  store_id: { type: string, expr: string(customer_id) }
+  opened_on: { type: date, expr: created_at }
+dedupe: { key: [store_id, opened_on] }
+`;
+
+  it('字段取各映射扩展字段的并集、类型与敏感标记照映射，主键取映射 ID 排第一的去重键并说明分歧；重复调用不多出草稿', async () => {
+    const { acme, author, mappingIds } = await unregistered([CUSTOMERS, ORDERS]);
+    await getDb().transaction(tx => inferCustomEntityDrafts(tx, acme));
+    await getDb().transaction(tx => inferCustomEntityDrafts(tx, acme));
+
+    const [summary] = await listCustomEntities(author);
+    expect(summary).toMatchObject({ name: 'custom_store', label: 'store', kind: 'dimension', published: null, draft: 1 });
+    const { draft, versions } = await getCustomEntity(author, summary.id);
+    expect(versions).toHaveLength(1);
+    const first = mappingIds[0] < mappingIds[1] ? 'customers' : 'orders';
+    expect(draft).toMatchObject({
+      authors: ['platform'],
+      lastEditor: 'platform',
+      primaryKey: first === 'customers' ? ['store_id'] : ['store_id', 'opened_on'],
+    });
+    expect(draft!.fields.map(({ description: _, ...f }) => f).sort((a, b) => a.name.localeCompare(b.name))).toEqual([
+      { name: 'manager_phone', type: 'string', sensitive: true },
+      { name: 'opened_on', type: 'date', sensitive: false },
+      { name: 'store_id', type: 'string', sensitive: false },
+    ]);
+    expect(draft!.fields.find(f => f.name === 'store_id')!.description).toMatch(/去重键不一致[^]*store_id, opened_on/);
+  });
+
+  it('推断草稿直接发布被拒；一位成员确认保存、另一位成员发布后成为已发布登记；确认前照常合并', async () => {
+    const { acme, author, reviewer } = await unregistered([CUSTOMERS], true);
+    await getDb().transaction(tx => inferCustomEntityDrafts(tx, acme));
+    const [{ id }] = await listCustomEntities(author);
+    await expect(publishCustomEntity(reviewer, id, 1)).rejects.toMatchObject({ status: 400, message: expect.stringContaining('先由一位成员确认') });
+
+    // 确认前：已发布映射照常合并进标准层
+    await drain();
+    expect(await silver(acme, 'custom_store', 'store_id::INT')).toHaveLength(40);
+
+    const { draft } = await getCustomEntity(author, id);
+    await saveCustomEntityDraft(author, id, { label: '门店', kind: draft!.kind, fields: draft!.fields, primaryKey: draft!.primaryKey });
+    await publishCustomEntity(reviewer, id, 1);
+    expect((await publishedCustomEntities(getDb(), acme)).get('custom_store')).toMatchObject({
+      label: '门店', primaryKey: ['store_id'], fields: [expect.objectContaining({ name: 'store_id' }), expect.objectContaining({ name: 'manager_phone', sensitive: true })],
+    });
+    // 已登记的实体不再推断
+    await getDb().transaction(tx => inferCustomEntityDrafts(tx, acme));
+    expect((await getCustomEntity(author, id)).versions).toHaveLength(1);
+  });
+
+  it('成员已有草稿的实体不推断、不覆盖', async () => {
+    const { acme, author } = await unregistered([CUSTOMERS]);
+    const id = await createCustomEntity(author, { ...STORE, label: '成员登记的门店' });
+    await getDb().transaction(tx => inferCustomEntityDrafts(tx, acme));
+    const { versions, draft } = await getCustomEntity(author, id);
+    expect(versions).toHaveLength(1);
+    expect(draft).toMatchObject({ label: '成员登记的门店', fields: STORE.fields, lastEditor: 'de@acme.com' });
   });
 });

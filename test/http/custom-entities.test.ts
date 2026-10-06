@@ -1,9 +1,14 @@
 // 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），最后保存的人发布不了，
 // 另一位成员在详情页发布；再改是新的一版草稿。分析师只读，查看者 403，其他租户 404；导航「映射」后面是「自定义实体」。
-// 有发布权限的成员删除实体后回到列表
+// 有发布权限的成员删除实体后回到列表。已发布映射在用、但没登记的实体在列表与详情页标为待确认的推断登记，确认保存、另一位成员发布后提示消失
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
-import { memberOf, newTenant } from '../pipeline/fixtures';
+import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { customEntities } from '../../app/.server/db/schema';
+import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { registerSource } from '../../app/.server/sources';
+import { memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
+import { pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
@@ -125,5 +130,54 @@ describe('自定义实体', () => {
     expect(locationOf(deleted)).toBe('/entities');
     expect((await author.get(page)).status).toBe(404);
     expect(await (await author.get('/entities')).text()).not.toContain('data-custom-entity=');
+  });
+});
+
+describe('推断登记', () => {
+  it('已发布映射在用、但没登记的实体在列表与详情页标为待确认；直接发布被拒，一位成员确认保存、另一位成员发布后提示消失', async () => {
+    const tenantId = await acme();
+    const [de, de2] = [await memberOf(tenantId, 'de@acme.com'), await memberOf(tenantId, 'de2@acme.com')];
+    const { id: sourceId } = await registerSource(de, await pgSourceInput(READER));
+    await selectAllTables(de, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    await publishCustomEntity(de2, await createCustomEntity(de, {
+      name: 'custom_store',
+      label: '门店',
+      kind: 'dimension',
+      fields: [
+        { name: 'store_id', type: 'string', description: '', sensitive: false },
+        { name: 'manager_phone', type: 'string', description: '', sensitive: true },
+      ],
+      primaryKey: ['store_id'],
+    }), 1);
+    await publish(de, de2, sourceId, `model: 1
+entity: custom_store
+table: customers
+extensions:
+  store_id: { type: string, expr: string(customer_id) }
+  manager_phone: { type: string, expr: phone }
+dedupe: { key: [store_id] }
+`);
+    // 模拟登记功能上线前就在用的实体
+    await getDb().delete(customEntities);
+
+    const author = await loginAs(app, 'de@acme.com');
+    const list = await (await author.get('/entities')).text();
+    expect(list).toContain('推断登记 · 待确认 v1');
+    const page = `/entities/${list.match(/href="\/entities\/([0-9a-f-]{36})"/)![1]}`;
+    const detail = await (await author.get(page)).text();
+    expect(detail).toContain('这份登记由已发布映射推断，请核对字段、类型和主键后保存确认');
+    expect(detail).toContain('value="manager_phone"');
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    expect(await (await admin.get(page)).text()).toContain('推断出的登记要先由一位成员确认（保存）后，再由另一位成员发布');
+    expect((await admin.post(page, { intent: 'publish', version: '1' })).status).toBe(400);
+
+    const { intent: _, name: __, ...rest } = STORE;
+    expect((await author.post(page, { ...rest, intent: 'save' })).status).toBe(302);
+    expect(await (await author.get('/entities')).text()).not.toContain('推断登记');
+    expect(await (await admin.get(page)).text()).not.toContain('由已发布映射推断');
+    expect((await admin.post(page, { intent: 'publish', version: '1' })).status).toBe(302);
+    expect(await (await author.get('/entities')).text()).toContain('已发布 v1');
   });
 });

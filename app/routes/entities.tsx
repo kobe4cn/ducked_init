@@ -1,6 +1,6 @@
 // app/routes/entities.tsx —— 自定义实体列表（ADR-0019）：租户在标准模型之外登记的实体，各自的中文名、类型、已发布版本与草稿。
 // 数据工程师、管理员在这里新建（名称、中文名、类型、字段与主键，保存为第一版草稿，到详情页由另一位成员发布）；分析师只读。
-// 没有实体时直接给出新建表单；?new=1 时在列表上方打开新建表单
+// 没有实体时直接给出新建表单；?new=1 时在列表上方打开新建表单。已发布映射在用、但没登记的实体打开列表时推断出登记草稿，标为待确认
 import { CheckCircle2, CircleAlert, PencilLine, Plus } from 'lucide-react';
 import { data, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entities';
@@ -90,7 +90,7 @@ export default function Entities({ loaderData, actionData }: Route.ComponentProp
                   <TableCell>{e.label}</TableCell>
                   <TableCell className="text-sm">{CUSTOM_ENTITY_KINDS[e.kind]}</TableCell>
                   <TableCell className="text-sm">{e.published ? <span className="inline-flex items-center gap-1 text-emerald-600"><CheckCircle2 className="size-3.5" />{`已发布 v${e.published}`}</span> : <span className="text-slate-400">—</span>}</TableCell>
-                  <TableCell className="text-sm">{e.draft ? <span className="inline-flex items-center gap-1 text-amber-600"><PencilLine className="size-3.5" />{`草稿 v${e.draft}`}</span> : <span className="text-slate-400">—</span>}</TableCell>
+                  <TableCell className="text-sm">{e.draft ? <span className="inline-flex items-center gap-1 text-amber-600" data-inferred={e.inferred || undefined}><PencilLine className="size-3.5" />{e.inferred ? `推断登记 · 待确认 v${e.draft}` : `草稿 v${e.draft}`}</span> : <span className="text-slate-400">—</span>}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
