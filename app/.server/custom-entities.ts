@@ -46,11 +46,12 @@ export function customEntityInputOf(form: FormData): CustomEntityInput {
   };
 }
 
-const ENTITY_NAME = new RegExp(CUSTOM_ENTITY_PATTERN);
+/** 自定义实体名称的规则（CUSTOM_ENTITY_PATTERN） */
+export const ENTITY_NAME = new RegExp(CUSTOM_ENTITY_PATTERN);
 const FIELD_NAME = new RegExp(CUSTOM_FIELD_PATTERN);
 
 /** 校验并整理一版登记（去掉首尾空白、主键去重）；不合格时抛出 CustomEntityError，说明原因 */
-function checkRegistration(input: CustomEntityInput): Omit<RegisteredEntity, 'name'> {
+export function checkRegistration(input: CustomEntityInput): Omit<RegisteredEntity, 'name'> {
   const label = input.label.trim();
   if (!label) throw new CustomEntityError('请填写中文名');
   if (!Object.hasOwn(CUSTOM_ENTITY_KINDS, input.kind)) throw new CustomEntityError('类型只能是维度或事实');

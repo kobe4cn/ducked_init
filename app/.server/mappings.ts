@@ -6,7 +6,7 @@ import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
-import { publishedCustomEntities } from './custom-entities';
+import { publishedCustomEntities, type RegisteredEntity } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
@@ -38,7 +38,7 @@ const DRY_RUN_ROWS = 50;
 const DRY_RUN_LIMITS = { memoryLimitMb: 512, threads: 1 };
 
 /** 数据源里各表最近一次成功采集到的列统计（带声明的业务主键）：表不在同步范围、还没采集时返回原因 */
-async function profiledTables(tenantId: string, sourceId: string) {
+export async function profiledTables(tenantId: string, sourceId: string) {
   const { listing, tables } = await confirmedTables(tenantId, sourceId);
   return (table: string) => {
     const profiled = tables.find(t => t.table.name === table);
@@ -168,12 +168,12 @@ export async function draftForMapping(actor: CurrentMember, mappingId: string) {
 }
 
 /**
- * 校验映射文档（对照数据源的字段、已发布的源视图与已发布的自定义实体登记），不通过时抛出带问题列表的 MappingError。
+ * 校验映射文档（对照数据源的字段、已发布的源视图与已发布的自定义实体登记；给了 registrations 时对照它），不通过时抛出带问题列表的 MappingError。
  * viewId 是输入为源视图时这个视图的 ID，否则为 null
  */
-async function checked(tenantId: string, sourceId: string, yaml: string) {
-  const registered = await publishedCustomEntities(getDb(), tenantId);
-  const result = checkMapping(yaml, await sourceColumns(tenantId, sourceId), name => registered.get(name));
+export async function checkMappingDraft(tenantId: string, sourceId: string, yaml: string, registrations?: Map<string, RegisteredEntity>) {
+  const entities = registrations ?? await publishedCustomEntities(getDb(), tenantId);
+  const result = checkMapping(yaml, await sourceColumns(tenantId, sourceId), name => entities.get(name));
   if (!result.ok) throw new MappingError(`映射有 ${result.issues.length} 处问题，未保存`, 400, result.issues);
   const [view] = result.plan.view ? await getDb().select({ id: sourceViews.id }).from(sourceViews)
     .where(and(eq(sourceViews.tenantId, tenantId), eq(sourceViews.sourceId, sourceId), eq(sourceViews.name, result.plan.table))) : [];
@@ -187,11 +187,14 @@ async function requireMapping(tenantId: string, mappingId: string, tx: Tx | Retu
   return row;
 }
 
-/** 新建映射：文档校验通过后保存为第一版草稿。同一数据源的同一张表到同一个实体只能有一个映射 */
-export async function createMapping(actor: CurrentMember, sourceId: string, yaml: string) {
+/**
+ * 新建映射：文档校验通过后保存为第一版草稿。同一数据源的同一张表到同一个实体只能有一个映射。
+ * opts.registrations 只给一键直通（passthrough.ts）用：对照这些登记校验（含刚建、还没发布的那份），而不是只对照已发布登记
+ */
+export async function createMapping(actor: CurrentMember, sourceId: string, yaml: string, opts?: { registrations: Map<string, RegisteredEntity> }) {
   assertCan(actor, 'sources:write');
   const source = await requireSource(actor.tenant.id, sourceId).catch(() => { throw new MappingError('请选择数据源'); });
-  const { plan, viewId } = await checked(actor.tenant.id, sourceId, yaml);
+  const { plan, viewId } = await checkMappingDraft(actor.tenant.id, sourceId, yaml, opts?.registrations);
   try {
     return await getDb().transaction(async tx => {
       const [mapping] = await tx.insert(mappings).values({
@@ -221,7 +224,7 @@ export async function createMapping(actor: CurrentMember, sourceId: string, yaml
 export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: string) {
   assertCan(actor, 'sources:write');
   const mapping = await requireMapping(actor.tenant.id, mappingId);
-  const { plan, viewId } = await checked(actor.tenant.id, mapping.sourceId, yaml);
+  const { plan, viewId } = await checkMappingDraft(actor.tenant.id, mapping.sourceId, yaml);
   if (plan.table !== mapping.tableName || viewId !== mapping.sourceViewId || plan.entity !== mapping.entity) {
     throw new MappingError(`这个映射是 ${mapping.sourceViewId ? '源视图 ' : ''}${mapping.tableName} → ${mapping.entity}，不能改表、源视图或实体；请新建映射`);
   }
@@ -291,7 +294,7 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
   if (!draft) throw new MappingError(`没有第 ${version} 版`, 404);
   const blocker = publishBlocker(actor, draft);
   if (blocker) throw new MappingError(blocker, draft.status === 'draft' ? 403 : 400);
-  const { plan } = await checked(actor.tenant.id, mapping.sourceId, draft.yaml);
+  const { plan } = await checkMappingDraft(actor.tenant.id, mapping.sourceId, draft.yaml);
   return getDb().transaction(async tx => {
     // 先锁住租户行（入队合并也锁它）：与入队合并、定时检查互斥
     await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, actor.tenant.id)).for('update');
