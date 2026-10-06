@@ -4,8 +4,11 @@
 // 流向图（?tab=flow）画源表 → 映射 → 标准层表 → 打通表，带各映射最近一次合并与标准层表行数（取自任务结果，不查湖），图下同样有一份列表；
 // 只对有 sources:read 的成员开放，没有权限时回到关系图，源表名与映射信息都不下发。
 // 点已接入的标准层表（关系图 ?node=<entity>，流向图 ?node=silver.<entity>）在右侧抽屉列出字段明细：有 sources:read 时带各映射的源表、源列、表达式、
-// 标记与兜底统计，否则只下发字段说明与行数（在 loader 里裁剪）
+// 标记与兜底统计，否则只下发字段说明与行数（在 loader 里裁剪）。
+// 单表聚焦画布（?tab=flow&focus=<实体>，从抽屉进入）只画这张标准层表与写入它的源表，连线从源列连到字段；同样只对有 sources:read 的成员开放
+import { useMemo } from 'react';
 import { Link, useSearchParams } from 'react-router';
+import { ArrowLeft } from 'lucide-react';
 import type { Route } from './+types/lineage';
 import { can } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
@@ -17,6 +20,7 @@ import { identityRules } from '~/.server/pipeline/identity-engine';
 import { listSources } from '~/.server/sources';
 import { entityOf } from '~/lib/canonical-model';
 import { deriveLineage } from '~/lib/lineage';
+import { focusGraph, type FocusInput } from '~/lib/lineage-focus';
 import { entityFields, type FieldDrawer, redactFields } from '~/lib/lineage-fields';
 import { type FlowInput, type FlowMerge, silverTotals } from '~/lib/lineage-flow';
 import { relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
@@ -24,6 +28,7 @@ import type { SourceKind } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
 import { KindIcon } from '~/components/kind-icon';
 import { LineageDrawer } from '~/components/lineage-drawer';
+import { FocusGraphView } from '~/components/lineage-focus';
 import { FlowGraphView, MergeStatus } from '~/components/lineage-flow';
 import { RelationGraphView } from '~/components/lineage-graph';
 import { PageHeader } from '~/components/page-header';
@@ -79,15 +84,29 @@ export async function loader({ request }: Route.LoaderArgs) {
   const canFlow = can(member.role, 'sources:read');
   const tab = tabOf(request, canFlow);
   const drawerEntity = drawerEntityOf(node, connected);
+  const focusParam = searchParams.get('focus');
+  const focusEntity = tab === 'flow' && focusParam && connected.includes(focusParam) ? focusParam : null;
   let flow: FlowInput | null = null;
   let drawer: FieldDrawer | null = null;
+  let focus: FocusInput | null = null;
   if (tab === 'flow' || drawerEntity) {
     // 只取数据源的名字与种类，不带连接配置；不下发合并计划（里面有列与表达式）
     const sources = canFlow ? (await listSources(member)).map(({ id, name, kind }) => ({ id, name, kind })) : [];
     const lineage = deriveLineage({ plans, sources });
     const last = await lastMergeByMapping(member.tenant.id, plans.map(p => p.mapping));
     const merges = Object.fromEntries(Object.entries(last).map(([id, r]) => [id, flowMerge(r)]));
-    if (tab === 'flow') {
+    if (focusEntity) {
+      const canonical = entityOf(focusEntity);
+      const custom = canonical ? undefined : (await publishedCustomEntities(getDb(), member.tenant.id)).get(focusEntity);
+      // 字段顺序同抽屉；只下发写入这张表的血缘与它用到的数据源名字
+      const own = lineage.tables.filter(t => t.entity === focusEntity);
+      focus = {
+        entity: focusEntity,
+        fields: entityFields(lineage, focusEntity, canonical?.fields ?? custom?.fields ?? [], {}).map(f => f.name),
+        lineage: lineage.fields.filter(f => f.entity === focusEntity),
+        sourceNames: Object.fromEntries(own.map(t => [t.sourceId, t.sourceName])),
+      };
+    } else if (tab === 'flow') {
       flow = { tables: lineage.tables, identityEdges: lineage.edges, identity: graph.nodes.find(n => n.identity)?.identity ?? null, merges };
     }
     if (drawerEntity) {
@@ -104,6 +123,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     tab,
     canFlow,
     flow,
+    focus,
     drawer,
     email: member.email,
     nav: navFor(member),
@@ -115,7 +135,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 }
 
 export default function Lineage({ loaderData }: Route.ComponentProps) {
-  const { tab, canFlow, flow, drawer, email, nav, graph, showAll, node, sql } = loaderData;
+  const { tab, canFlow, flow, focus, drawer, email, nav, graph, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
   const [searchParams] = useSearchParams();
   const nodeHref = (id: string) => {
@@ -153,7 +173,7 @@ export default function Lineage({ loaderData }: Route.ComponentProps) {
         <section className="rounded-2xl border bg-white p-6 shadow-sm">
           <SectionHeader title="还没有已发布的映射">发布映射、合并到标准层之后，这里会画出已接入的表和它们之间的关系。</SectionHeader>
         </section>
-      ) : flow ? <FlowSection flow={flow} /> : (
+      ) : focus ? <FocusSection focus={focus} /> : flow ? <FlowSection flow={flow} /> : (
         <>
           <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
             <div className="flex items-start justify-between gap-6">
@@ -235,8 +255,61 @@ export default function Lineage({ loaderData }: Route.ComponentProps) {
         </>
       )}
 
-      {drawer && <LineageDrawer drawer={drawer} closeHref={closeDrawerHref} />}
+      {drawer && <LineageDrawer drawer={drawer} closeHref={closeDrawerHref} focusHref={drawer.detail ? `/lineage?tab=flow&focus=${encodeURIComponent(drawer.entity)}` : null} />}
     </AppShell>
+  );
+}
+
+/** 单表聚焦画布与图下服务端渲染的连线列表（画布挂载后才渲染，列表给没有脚本时与测试用） */
+function FocusSection({ focus }: { focus: FocusInput }) {
+  const graph = useMemo(() => focusGraph(focus), [focus]);
+  const [searchParams] = useSearchParams();
+  const backHref = (() => {
+    const next = new URLSearchParams(searchParams);
+    next.delete('focus');
+    return `/lineage?${next}`;
+  })();
+  // 边都从源表出发
+  const tables = new Map(graph.nodes.flatMap(n => (n.data.kind === 'table' ? [[n.id, n.data] as const] : [])));
+  return (
+    <>
+      <section data-focus={focus.entity} className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        <div className="flex items-start justify-between gap-6">
+          <SectionHeader title={`聚焦：silver.${focus.entity}`}>只画这张标准层表和写入它的源表。源表只列出被表达式引用到的源列，每条线从源列连到标准层字段；常量表达式没有连线。点标准层表看字段明细。</SectionHeader>
+          <Link to={backHref} preventScrollReset className="flex shrink-0 items-center gap-1 text-sm text-slate-600 hover:underline">
+            <ArrowLeft className="size-4" />返回流向图
+          </Link>
+        </div>
+        <FocusGraphView graph={graph} />
+      </section>
+
+      <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        <SectionHeader title="字段连线" />
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>数据源</TableHead>
+              <TableHead>源表</TableHead>
+              <TableHead>源列</TableHead>
+              <TableHead>标准层字段</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {graph.edges.map(e => {
+              const t = tables.get(e.source)!;
+              return (
+                <TableRow key={e.id} data-field-edge={`${t.sourceId}:${t.label}.${e.sourceHandle}→${e.targetHandle}`}>
+                  <TableCell>{t.sourceName}</TableCell>
+                  <TableCell className="font-mono text-xs">{t.label}</TableCell>
+                  <TableCell className="font-mono text-xs">{e.sourceHandle}</TableCell>
+                  <TableCell className="font-mono text-xs">{e.targetHandle}</TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </section>
+    </>
   );
 }
 

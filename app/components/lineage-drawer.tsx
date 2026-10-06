@@ -1,13 +1,14 @@
 // app/components/lineage-drawer.tsx —— 数据地图的标准层表字段抽屉：固定在右侧，列出表的行数与每个字段的说明；
 // 有明细时（sources:read）每个字段再列出各映射的源表、表达式与源列，标出敏感哈希、值字典、扩展字段与兜底，兜底的附上最近一次合并的兜底统计。
-// 关闭是去掉 ?node= 的链接
+// 关闭是去掉 ?node= 的链接；有明细时带「聚焦此表」链接，进入单表聚焦画布
 import { Link } from 'react-router';
-import { AlertTriangle, BookOpen, Lock, Puzzle, X } from 'lucide-react';
+import { AlertTriangle, BookOpen, Focus, Lock, Puzzle, X } from 'lucide-react';
 import { fallbackText } from '~/lib/fallback';
 import type { FieldDrawer, FieldSource } from '~/lib/lineage-fields';
 import { Badge } from '~/components/ui/badge';
 
-export function LineageDrawer({ drawer, closeHref }: { drawer: FieldDrawer; closeHref: string }) {
+/** focusHref：单表聚焦画布的链接，没有 sources:read 时为 null */
+export function LineageDrawer({ drawer, closeHref, focusHref }: { drawer: FieldDrawer; closeHref: string; focusHref: string | null }) {
   return (
     <aside
       data-drawer={drawer.entity}
@@ -21,6 +22,11 @@ export function LineageDrawer({ drawer, closeHref }: { drawer: FieldDrawer; clos
             {drawer.label !== drawer.entity && <span className="mr-3">{drawer.label}</span>}
             <span data-drawer-rows={drawer.rows}>{`${drawer.rows.toLocaleString('zh-CN')} 行`}</span>
           </p>
+          {focusHref && (
+            <Link to={focusHref} className="mt-2 inline-flex items-center gap-1 text-xs text-slate-600 hover:underline">
+              <Focus className="size-3" />聚焦此表
+            </Link>
+          )}
         </div>
         <Link to={closeHref} preventScrollReset aria-label="关闭" className="rounded-lg p-1 text-slate-500 hover:bg-slate-100">
           <X className="size-4" />

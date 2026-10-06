@@ -1,6 +1,7 @@
 // test/http/lineage.test.ts —— 数据地图的 HTTP 接缝：任何成员都能打开 /lineage，关系图下的表与关系列表画出已接入的标准层表与 _identities、_device_owner，
 // 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；_identities 显示匹配规则与最近一次合并的打通摘要（没有合并任务时显示尚未合并）；
-// 「显示未接入的标准实体」开关（?all=1）灰显未接入的实体；没有已发布映射时显示空状态；流向图（?tab=flow）只对有 sources:read 的成员开放：列表带源表名、版本、行数与合并状态，失败的链到合并记录
+// 「显示未接入的标准实体」开关（?all=1）灰显未接入的实体；没有已发布映射时显示空状态；流向图（?tab=flow）只对有 sources:read 的成员开放：列表带源表名、版本、行数与合并状态，失败的链到合并记录；
+// 抽屉里的「聚焦此表」进入单表聚焦画布（?tab=flow&focus=），画布下的连线列表从源列连到标准层字段；查看者访问 ?focus= 回到关系图
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { and, desc, eq } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -196,6 +197,47 @@ describe('数据地图', () => {
       expect(fieldRow(html, 'status')).toContain('订单的当前状态');
       for (const table of ['customers', 'members', 'users', 'events', 'orders']) expect(html).not.toMatch(new RegExp(`(?<![-\\w])${table}\\b`));
       for (const banned of ['string(customer)', 'from_timezone', '已关闭', '作废', '兜底', '值字典', 'sourceColumns']) expect(html).not.toContain(banned);
+    }
+  });
+
+  it('数据工程师从抽屉点「聚焦此表」进入单表聚焦画布：同名源表按数据源分开，连线从源列连到标准层字段，有返回流向图的入口', async () => {
+    const { acme, sources } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'eng@acme.com', 'data_engineer');
+    const eng = await loginAs(app, 'eng@acme.com');
+
+    const drawer = decode(await (await eng.get('/lineage?tab=flow&node=silver.order')).text());
+    expect(drawer).toContain('聚焦此表');
+    expect(drawer).toContain('href="/lineage?tab=flow&focus=order"');
+
+    const html = decode(await (await eng.get('/lineage?tab=flow&focus=order')).text());
+    expect(html).toContain('data-tab="flow"');
+    expect(html).toContain('data-focus="order"');
+    expect(html).toMatch(/href="\/lineage\?tab=flow"[^>]*>(?:(?!<\/a>)[\s\S])*返回流向图/);
+    // 两张 orders 各自连到字段；多列与单列表达式都按源列出边
+    expect(html).toContain(`data-field-edge="${sources.crm}:orders.order_no→order_id"`);
+    expect(html).toContain(`data-field-edge="${sources.crm}:orders.customer→customer_id"`);
+    expect(html).toContain(`data-field-edge="${sources.loyalty}:orders.id→order_id"`);
+    expect(html).toContain(`data-field-edge="${sources.loyalty}:orders.state→status"`);
+    // 聚焦画布不带流向图的映射列表，也不画别的标准层表
+    expect(html).not.toContain('data-flow-mapping');
+    expect(html).not.toContain(`data-field-edge="${sources.crm}:customers.`);
+
+    // 不认识的实体回到流向图
+    expect(await (await eng.get('/lineage?tab=flow&focus=nope')).text()).toContain('data-flow-mapping');
+  });
+
+  it('查看者访问 ?focus= 时回到关系图，页面不出现源表名；抽屉里没有「聚焦此表」', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+
+    for (const url of ['/lineage?tab=flow&focus=order', '/lineage?focus=order&node=order']) {
+      const html = decode(await (await viewer.get(url)).text());
+      expect(html).toContain('data-tab="graph"');
+      expect(html).not.toContain('data-focus');
+      expect(html).not.toContain('data-field-edge');
+      expect(html).not.toContain('聚焦此表');
+      for (const table of ['customers', 'members', 'users', 'events', 'orders']) expect(html).not.toMatch(new RegExp(`(?<![-\\w])${table}\\b`));
     }
   });
 
