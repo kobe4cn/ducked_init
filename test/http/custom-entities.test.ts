@@ -1,10 +1,11 @@
 // test/http/custom-entities.test.ts —— 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），最后保存的人发布不了，
 // 另一位成员在详情页发布；再改是新的一版草稿。分析师只读，查看者 403，其他租户 404；导航「映射」后面是「自定义实体」。
-// 有发布权限的成员删除实体后回到列表；从源表一键生成后跳到实体详情页。已发布映射在用、但没登记的实体在列表与详情页标为待确认的推断登记，确认保存、另一位成员发布后提示消失；
+// 有发布权限的成员删除实体后回到列表；从源表一键生成后跳到实体详情页，详情页显示配套的映射草稿，另一位成员把登记与映射一起发布。已发布映射在用、但没登记的实体在列表与详情页标为待确认的推断登记，确认保存、另一位成员发布后提示消失；
 // 登记发布前映射列表与详情页提示实体待补登；映射详情页的实体卡片链接到实体页，映射页用登记的中文名
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
+import { createPassthrough } from '../../app/.server/passthrough';
 import { customEntities } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { registerSource } from '../../app/.server/sources';
@@ -149,6 +150,33 @@ describe('自定义实体', () => {
     expect(detail).toContain('custom_customers');
     expect(detail).toContain('value="customer_id"');
     expect(await (await author.get('/mappings')).text()).toMatch(/customers[^]*?custom_customers|custom_customers[^]*?customers/);
+  });
+
+  it('详情页显示配套的映射草稿；最后保存的人看到原因，管理员点「登记与映射一起发布」后两份都发布', async () => {
+    const tenantId = await acme();
+    const de = await memberOf(tenantId, 'de@acme.com');
+    const { id: sourceId } = await registerSource(de, await pgSourceInput(READER));
+    await selectAllTables(de, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const { entityId, mappingId } = await createPassthrough(de, sourceId, 'customers');
+    const page = `/entities/${entityId}`;
+
+    const authorView = await (await (await loginAs(app, 'de@acme.com')).get(page)).text();
+    expect(authorView).toContain(`href="/mappings/${mappingId}"`);
+    expect(authorView).toContain('你最后改了这一版草稿');
+    expect(authorView).not.toContain('value="publishTogether"');
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const detail = await (await admin.get(page)).text();
+    expect(detail).toContain('配套的映射草稿');
+    expect(detail).toContain('主键和字段类型以后都不能改');
+    expect(detail).toContain('登记与映射一起发布');
+    const published = await admin.post(page, { intent: 'publishTogether', version: '1', mappingId, mappingVersion: '1' });
+    expect(locationOf(published)).toBe(page);
+    const after = await (await admin.get(`${page}?tab=versions`)).text();
+    expect(after).not.toContain('配套的映射草稿');
+    expect(after).toContain('data-version-status="published"');
+    expect(await (await admin.get(`/mappings/${mappingId}?tab=versions`)).text()).toContain('admin@acme.com');
   });
 
   it('有发布权限的成员删除实体，回到列表', async () => {

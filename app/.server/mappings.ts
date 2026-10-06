@@ -180,7 +180,7 @@ export async function checkMappingDraft(tenantId: string, sourceId: string, yaml
   return { ...result, viewId: view?.id ?? null };
 }
 
-async function requireMapping(tenantId: string, mappingId: string, tx: Tx | ReturnType<typeof getDb> = getDb()) {
+export async function requireMapping(tenantId: string, mappingId: string, tx: Tx | ReturnType<typeof getDb> = getDb()) {
   if (!/^[0-9a-f-]{36}$/i.test(mappingId)) throw new MappingError('映射不存在', 404);
   const [row] = await tx.select().from(mappings).where(and(eq(mappings.id, mappingId), eq(mappings.tenantId, tenantId)));
   if (!row) throw new MappingError('映射不存在', 404);
@@ -298,29 +298,40 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
   return getDb().transaction(async tx => {
     // 先锁住租户行（入队合并也锁它）：与入队合并、定时检查互斥
     await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, actor.tenant.id)).for('update');
-    // 锁住映射行：与保存草稿互斥，发布的正是检查过的那份草稿
-    await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
-    // 等锁期间草稿可能已被丢弃
-    const [current] = await tx.select().from(mappingVersions).where(eq(mappingVersions.id, draft.id));
-    if (isStale(current, draft)) {
-      throw new MappingError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
-    }
-    await assertExtensionTypes(tx, actor.tenant.id, plan);
-    await assertIdentityRules(tx, actor.tenant.id, mappingId, plan);
-    await tx.update(mappingVersions)
-      .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: sql`now()` })
-      .where(eq(mappingVersions.id, draft.id));
-    const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'mapping.published',
-      targetType: 'mapping',
-      targetId: mappingId,
-      detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version, authors: draft.authors, lastEditor: draft.lastEditor },
-    });
-    return enqueueMerge(tx, actor.tenant.id, [mappingId]);
+    return publishMappingDraft(tx, actor, mapping, draft, plan);
   });
+}
+
+/**
+ * 在调用方的事务里发布检查过的这份草稿（plan 是发布前对照数据源当前的字段校验出的），记审计并入队合并，返回合并任务（同 enqueueMerge）。
+ * 调用方须已锁住租户行；这里锁映射行。等锁期间草稿被修改、发布或丢弃，或扩展字段类型、身份打通规则与已发布映射冲突时抛出 MappingError。
+ * 发布权限与双人发布由调用方检查（publishMapping，以及一键直通里登记与映射一起发布）
+ */
+export async function publishMappingDraft(
+  tx: Tx, actor: CurrentMember, mapping: typeof mappings.$inferSelect, draft: typeof mappingVersions.$inferSelect, plan: MergePlan,
+) {
+  // 锁住映射行：与保存草稿互斥，发布的正是检查过的那份草稿
+  await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mapping.id)).for('update');
+  // 等锁期间草稿可能已被丢弃
+  const [current] = await tx.select().from(mappingVersions).where(eq(mappingVersions.id, draft.id));
+  if (isStale(current, draft)) {
+    throw new MappingError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
+  }
+  await assertExtensionTypes(tx, actor.tenant.id, plan);
+  await assertIdentityRules(tx, actor.tenant.id, mapping.id, plan);
+  await tx.update(mappingVersions)
+    .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: sql`now()` })
+    .where(eq(mappingVersions.id, draft.id));
+  const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
+  await recordAudit(tx, {
+    tenantId: actor.tenant.id,
+    actor,
+    action: 'mapping.published',
+    targetType: 'mapping',
+    targetId: mapping.id,
+    detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version: draft.version, authors: draft.authors, lastEditor: draft.lastEditor },
+  });
+  return enqueueMerge(tx, actor.tenant.id, [mapping.id]);
 }
 
 /**

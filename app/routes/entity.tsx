@@ -1,8 +1,9 @@
 // app/routes/entity.tsx —— 单个自定义实体（ADR-0019）：数据工程师、管理员编辑登记（中文名、类型、字段与主键；名称建实体时定下，不能改），
 // 各版本（已发布的锁定、草稿可改；发布过的只能新增字段）、丢弃草稿，发布草稿需最后保存它的人以外的另一位有发布权限的成员在这个页面上操作，
 // 没有自动发布。有发布权限的成员可以删除没被已发布映射引用的实体。平台推断出的登记草稿提示成员核对后保存确认，确认前发布不了。
+// 从没发布过的登记有配套的映射草稿（一键直通生成的）时，显示这个映射，可以把登记与映射一起发布（passthrough.ts）。
 // 分编辑、版本两个标签页（?tab=edit|versions，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）
-import { CircleAlert, Info, Lock, Trash2 } from 'lucide-react';
+import { ArrowRight, CircleAlert, Info, Lock, Trash2, Upload } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entity';
 import { can, requirePermission } from '~/.server/access';
@@ -10,7 +11,8 @@ import {
   CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, saveCustomEntityDraft,
 } from '~/.server/custom-entities';
 import { navFor } from '~/.server/nav';
-import { publishReason } from '~/.server/publish-rules';
+import { passthroughPair, publishPassthrough } from '~/.server/passthrough';
+import { publishBlocker, publishReason } from '~/.server/publish-rules';
 import { AppShell } from '~/components/app-shell';
 import { CustomEntityForm, EntityFieldsTable } from '~/components/custom-entity-form';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
@@ -32,6 +34,9 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   try {
     const found = await getCustomEntity(member, params.entityId);
+    const firstDraft = !found.published && found.draft?.version === 1 ? found.draft : null;
+    const pair = firstDraft && await passthroughPair(member.tenant.id, found.entity.name);
+    const pairDraft = { status: 'draft', lastEditor: pair?.lastEditor ?? '' };
     return {
       email: member.email,
       nav: navFor(member),
@@ -52,6 +57,12 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         /** 当前成员发布不了这一版草稿的原因；可以发布或不是草稿时为 null */
         publishBlocker: publishReason(member, v, found.publishers),
       })),
+      /** 配套的映射草稿；登记发布过或没有时为 null。publishBlocker 是当前成员不能把两份一起发布的原因 */
+      pair: pair && {
+        ...pair,
+        publishBlocker: publishReason(member, found.versions.find(v => v.version === 1)!, found.publishers)
+          ?? publishReason(member, { ...pairDraft, publishBlocker: publishBlocker(member, pairDraft) }, found.publishers),
+      },
     };
   } catch (e) {
     if (e instanceof CustomEntityError) throw data(null, { status: e.status });
@@ -70,6 +81,11 @@ export async function action({ request, params }: Route.ActionArgs) {
         throw redirect(base);
       case 'publish':
         await publishCustomEntity(await requirePermission(request, 'publish'), params.entityId, Number(form.get('version')));
+        break;
+      case 'publishTogether':
+        await publishPassthrough(
+          await requirePermission(request, 'publish'), params.entityId, Number(form.get('version')), String(form.get('mappingId')), Number(form.get('mappingVersion')),
+        );
         break;
       case 'discard': {
         // 从没发布过的实体整个删除，回到列表
@@ -105,7 +121,7 @@ function editHint(canWrite: boolean, selected: { status: string }, draft: { vers
 }
 
 export default function Entity({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, canWrite, canDelete, entity, inferred, referrers, version, versions } = loaderData;
+  const { email, nav, tab, canWrite, canDelete, entity, inferred, referrers, version, versions, pair } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -150,6 +166,28 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
           <AlertTitle>推断登记 · 待确认</AlertTitle>
           <AlertDescription>这份登记由已发布映射推断，请核对字段、类型和主键后保存确认；主键和已发布字段在发布后不能改。</AlertDescription>
         </Alert>
+      )}
+      {pair && (
+        <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border bg-white p-6 shadow-sm" data-passthrough-pair>
+          <div className="space-y-1">
+            <p className="text-sm text-slate-500">配套的映射草稿</p>
+            <Link to={`/mappings/${pair.mappingId}`} className="flex items-center gap-2 font-semibold hover:underline">
+              {pair.sourceName}<span className="font-mono">{pair.table}</span><ArrowRight className="size-4 text-slate-400" /><span className="font-mono">{entity.name}</span>
+            </Link>
+            <p className="max-w-2xl text-sm text-slate-500">登记与映射一起发布后合并入标准层。发布后只能新增字段，主键和字段类型以后都不能改。</p>
+          </div>
+          {pair.publishBlocker ? (
+            <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-publish-blocker><Lock className="size-3.5 shrink-0" />{pair.publishBlocker}</span>
+          ) : (
+            <Form method="post">
+              <input type="hidden" name="intent" value="publishTogether" />
+              <input type="hidden" name="version" value={1} />
+              <input type="hidden" name="mappingId" value={pair.mappingId} />
+              <input type="hidden" name="mappingVersion" value={pair.version} />
+              <Button type="submit" disabled={submitting}><Upload />登记与映射一起发布</Button>
+            </Form>
+          )}
+        </div>
       )}
       <PillTabs
         current={tab}

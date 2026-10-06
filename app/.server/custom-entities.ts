@@ -92,7 +92,7 @@ function checkAdditive(published: Omit<RegisteredEntity, 'name'>, next: Omit<Reg
 }
 
 /** 本租户的自定义实体；不存在（含属于别的租户）时 404 */
-async function requireEntity(tenantId: string, entityId: string) {
+export async function requireEntity(tenantId: string, entityId: string) {
   if (!/^[0-9a-f-]{36}$/i.test(entityId)) throw new CustomEntityError('自定义实体不存在', 404);
   const [row] = await getDb().select({ id: customEntities.id, name: customEntities.name }).from(customEntities)
     .where(and(eq(customEntities.id, entityId), eq(customEntities.tenantId, tenantId)));
@@ -239,19 +239,29 @@ export async function publishCustomEntity(actor: CurrentMember, entityId: string
   await getDb().transaction(async tx => {
     // 锁住实体行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿
     await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
-    const [current] = await tx.select().from(customEntityVersions).where(eq(customEntityVersions.id, draft.id));
-    if (isStale(current, draft)) throw new CustomEntityError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
-    await tx.update(customEntityVersions)
-      .set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` })
-      .where(eq(customEntityVersions.id, draft.id));
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'custom_entity.published',
-      targetType: 'custom_entity',
-      targetId: entityId,
-      detail: { name: entity.name, version, authors: draft.authors, lastEditor: draft.lastEditor },
-    });
+    await publishEntityDraft(tx, actor, entity, draft);
+  });
+}
+
+/**
+ * 在调用方的事务里发布检查过的这份草稿并记审计；调用方须已锁住实体行。等锁期间草稿被修改、发布或丢弃时抛出 CustomEntityError。
+ * 发布权限与双人发布由调用方检查（publishCustomEntity，以及一键直通里登记与映射一起发布）
+ */
+export async function publishEntityDraft(
+  tx: Tx, actor: CurrentMember, entity: { id: string; name: string }, draft: typeof customEntityVersions.$inferSelect,
+) {
+  const [current] = await tx.select().from(customEntityVersions).where(eq(customEntityVersions.id, draft.id));
+  if (isStale(current, draft)) throw new CustomEntityError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
+  await tx.update(customEntityVersions)
+    .set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` })
+    .where(eq(customEntityVersions.id, draft.id));
+  await recordAudit(tx, {
+    tenantId: actor.tenant.id,
+    actor,
+    action: 'custom_entity.published',
+    targetType: 'custom_entity',
+    targetId: entity.id,
+    detail: { name: entity.name, version: draft.version, authors: draft.authors, lastEditor: draft.lastEditor },
   });
 }
 
@@ -316,7 +326,7 @@ export const INFERRED_BY = 'platform';
 /** 这一版是平台推断、还没有成员确认（保存）过的登记草稿 */
 export const isInferredDraft = (v: { status: string; lastEditor: string }) => v.status === 'draft' && v.lastEditor === INFERRED_BY;
 
-const UNCONFIRMED = '推断出的登记要先由一位成员确认（保存）后，再由另一位成员发布';
+export const UNCONFIRMED = '推断出的登记要先由一位成员确认（保存）后，再由另一位成员发布';
 
 /**
  * 为已发布映射在用、但没有登记的自定义实体推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），幂等：已有登记（含只有草稿）的实体不动。

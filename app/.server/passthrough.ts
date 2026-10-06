@@ -3,18 +3,22 @@
 // 与覆盖全部列、以主键去重的恒等映射。两份草稿的作者都是点按钮的成员，之后照常由另一位成员发布。
 // 先整体预检，有一项不过就两份都不写；登记与映射各自一个事务，映射仍然写不进时删掉刚建的登记（记审计）。
 // 同名实体的预检不加锁：并发生成同一张表时由 custom_entities 的租户内名称唯一约束兜底，后到的那次照常报「已有名为…」
-import { and, eq } from 'drizzle-orm';
+// 第二步在实体详情页：从没发布过的登记草稿与配套的映射草稿由另一位成员一次双人发布（一个事务里先发布登记再发布映射，入队合并），任一份不满足发布条件时都不发布
+import { and, asc, eq, getTableColumns, gt, notExists } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import {
-  checkRegistration, createCustomEntity, CustomEntityError, type CustomEntityInput, ENTITY_NAME, publishedCustomEntities, type RegisteredEntity,
+  checkRegistration, createCustomEntity, CustomEntityError, type CustomEntityInput, ENTITY_NAME, isInferredDraft, publishedCustomEntities,
+  publishEntityDraft, type RegisteredEntity, requireEntity, UNCONFIRMED,
 } from './custom-entities';
 import { getDb } from './db/client';
-import { customEntities } from './db/schema';
-import { checkMappingDraft, createMapping, MappingError, profiledTables } from './mappings';
+import { customEntities, customEntityVersions, mappings, mappingVersions, sources, tenants } from './db/schema';
+import { checkMappingDraft, createMapping, MappingError, profiledTables, publishMappingDraft, requireMapping } from './mappings';
 import { draftCustomMapping, DraftError, fieldNameFor } from './pipeline/mapping-draft';
 import type { TableProfile } from './pipeline/source-engine';
+import { publishBlocker } from './publish-rules';
 import { requireSource } from './source-config';
 import { extensionSpec } from '../lib/mapping-expr';
 
@@ -89,6 +93,64 @@ export async function createPassthrough(actor: CurrentMember, sourceId: string, 
     });
     return rethrow(e);
   }
+}
+
+/**
+ * 实体的配套映射：目标是这个实体、只有一版草稿（从没发布过）的映射，有多个时取最早建的；没有时为 null。
+ * lastEditor 是最后保存这版映射草稿的人，用来判断当前成员能不能一起发布
+ */
+export async function passthroughPair(tenantId: string, entityName: string) {
+  const later = alias(mappingVersions, 'later');
+  const [pair] = await getDb().select({
+    mappingId: mappings.id, version: mappingVersions.version, sourceName: sources.name, table: mappings.tableName, lastEditor: mappingVersions.lastEditor,
+  })
+    .from(mappings).innerJoin(sources, eq(sources.id, mappings.sourceId))
+    .innerJoin(mappingVersions, and(eq(mappingVersions.mappingId, mappings.id), eq(mappingVersions.version, 1), eq(mappingVersions.status, 'draft')))
+    .where(and(
+      eq(mappings.tenantId, tenantId), eq(mappings.entity, entityName),
+      notExists(getDb().select({ id: later.id }).from(later).where(and(eq(later.mappingId, mappings.id), gt(later.version, 1)))),
+    ))
+    .orderBy(asc(mappings.createdAt)).limit(1);
+  return pair ?? null;
+}
+
+/**
+ * 登记与配套映射一起发布：需要发布权限，两份草稿都要满足发布条件（双人发布、都是从没发布过的第一版），否则都不发布。
+ * 映射对照这份登记草稿预检；一个事务里先发布登记、再发布映射（映射的校验在事务里才看得到刚发布的登记）并入队合并。
+ * 等锁期间任一份草稿被改或被丢弃时整个事务回滚，报「请刷新后重新检查」
+ */
+export async function publishPassthrough(actor: CurrentMember, entityId: string, entityVersion: number, mappingId: string, mappingVersion: number) {
+  assertCan(actor, 'publish');
+  const tenantId = actor.tenant.id;
+  const entity = await requireEntity(tenantId, entityId);
+  const mapping = await requireMapping(tenantId, mappingId).catch(rethrow);
+  if (mapping.entity !== entity.name) throw new CustomEntityError(`映射的目标是 ${mapping.entity}，不是 ${entity.name}`);
+  const [entityDraft] = await getDb().select(getTableColumns(customEntityVersions)).from(customEntityVersions)
+    .where(and(eq(customEntityVersions.entityId, entityId), eq(customEntityVersions.version, entityVersion)));
+  if (!entityDraft) throw new CustomEntityError(`没有第 ${entityVersion} 版`, 404);
+  const [mappingDraft] = await getDb().select().from(mappingVersions)
+    .where(and(eq(mappingVersions.mappingId, mappingId), eq(mappingVersions.version, mappingVersion)));
+  if (!mappingDraft) throw new CustomEntityError(`映射没有第 ${mappingVersion} 版`, 404);
+  if (isInferredDraft(entityDraft)) throw new CustomEntityError(UNCONFIRMED);
+  for (const draft of [entityDraft, mappingDraft]) {
+    const blocker = publishBlocker(actor, draft);
+    if (blocker) throw new CustomEntityError(blocker, draft.status === 'draft' ? 403 : 400);
+  }
+  if (entityVersion !== 1 || mappingVersion !== 1) throw new CustomEntityError('登记或映射发布过，请分开发布');
+
+  // 对照已发布登记加上这份登记草稿预检映射；事务里的 stale 检查保证发布的正是这两份
+  const draftRegistration: RegisteredEntity = {
+    name: entity.name, label: entityDraft.label, kind: entityDraft.kind, fields: entityDraft.fields, primaryKey: entityDraft.primaryKey,
+  };
+  const registry = new Map(await publishedCustomEntities(getDb(), tenantId)).set(entity.name, draftRegistration);
+  const { plan } = await checkMappingDraft(tenantId, mapping.sourceId, mappingDraft.yaml, registry).catch(rethrow);
+  return getDb().transaction(async tx => {
+    // 锁的顺序同单独发布：租户行（入队合并也锁它）、实体行、映射行（publishMappingDraft 里）
+    await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
+    await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
+    await publishEntityDraft(tx, actor, entity, entityDraft);
+    return publishMappingDraft(tx, actor, mapping, mappingDraft, plan).catch(rethrow);
+  });
 }
 
 /** 映射的问题转成实体页能回显的 CustomEntityError */
