@@ -11,7 +11,7 @@ import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { dryRun } from './pipeline/dry-run-engine';
-import { identityRules } from './pipeline/identity-engine';
+import { identityRules, type IdentitySummary } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import type { MergeMappingParam, MergeRecord } from './pipeline/merge-engine';
 import { draftCustomMapping, draftMapping, DraftError } from './pipeline/mapping-draft';
@@ -564,6 +564,19 @@ async function tenantLatestMerge(tenantId: string) {
     attemptedAt: latest?.createdAt ?? null,
     finishedAt: latest?.finishedAt ?? null,
   };
+}
+
+/**
+ * 本租户最近一次打通成功的摘要（统一消费者数、参与打通的记录数、已归属的设备数），带所属任务与时间；只有计数，不带消费者标识。
+ * 跳过没有打通的合并（没有 silver.customer）与打通失败的；部分失败的合并任务照样落了 result，也算在内。还没打通过时为 null
+ */
+export async function latestIdentitySummary(tenantId: string) {
+  const [latest] = await getDb().select({ id: tasks.id, createdAt: tasks.createdAt, result: tasks.result }).from(tasks)
+    .where(and(ofMerge(tenantId), sql`${tasks.result} ? 'identities' AND NOT (${tasks.result}->'identities') ? 'error'`))
+    .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
+  if (!latest) return null;
+  const { groups, records, devices } = (latest.result as { identities: IdentitySummary }).identities;
+  return { groups, records, devices, taskId: latest.id, at: latest.createdAt };
 }
 
 /** 各映射最近一次合并的结果（每个映射分别找带它的最近一次合并任务，不受别的映射合并得多少影响） */

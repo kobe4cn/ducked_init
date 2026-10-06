@@ -1,7 +1,10 @@
 // test/http/lineage.test.ts —— 数据地图的 HTTP 接缝：任何成员都能打开 /lineage，关系图下的表与关系列表画出已接入的标准层表与 _identities、_device_owner，
-// 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；没有已发布映射时显示空状态
+// 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；_identities 显示匹配规则与最近一次合并的打通摘要（没有合并任务时显示尚未合并）；
+// 「显示未接入的标准实体」开关（?all=1）灰显未接入的实体；没有已发布映射时显示空状态
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { and, desc, eq } from 'drizzle-orm';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { tasks } from '../../app/.server/db/schema';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -41,6 +44,38 @@ describe('数据地图', () => {
 
     // 不认识的节点不出 SQL 面板
     expect(await (await viewer.get('/lineage?node=nope')).text()).not.toContain('data-sql');
+  });
+
+  it('_identities 显示匹配规则与最近一次合并的打通摘要；打开「显示未接入的标准实体」后灰显它们；没有合并任务时显示尚未合并', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+
+    const [merge] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')))
+      .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
+    const { groups, records } = (merge.result as { identities: { groups: number; records: number } }).identities;
+    expect(groups).toBeGreaterThan(0);
+
+    const html = decode(await (await viewer.get('/lineage')).text());
+    // 这些映射都没配 identity.match，用默认规则
+    expect(html).toContain('手机号 > 邮箱 > 外部 ID');
+    expect(html).toContain(`data-groups="${groups}"`);
+    expect(html).toContain(`data-records="${records}"`);
+    expect(html).not.toContain('尚未合并');
+    expect(html).toMatch(/data-show-all[^>]*aria-checked="false"|aria-checked="false"[^>]*data-show-all/);
+    expect(html).not.toContain('data-node="product"');
+    expect(html).not.toContain('data-connected="false"');
+
+    const all = decode(await (await viewer.get('/lineage?all=1&node=order')).text());
+    expect(all).toContain('data-node="product"');
+    expect(all).toContain('data-connected="false"');
+    // 开关保留 node，指向关掉 all 的 URL
+    expect(all).toMatch(/href="\/lineage\?node=order"[^>]*data-show-all|data-show-all[^>]*href="\/lineage\?node=order"/);
+
+    await getDb().delete(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')));
+    const none = await (await viewer.get('/lineage')).text();
+    expect(none).toContain('尚未合并');
+    expect(none).not.toContain('data-groups');
   });
 
   it('没有已发布映射时显示空状态', async () => {

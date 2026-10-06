@@ -1,11 +1,13 @@
 // test/lineage-graph.test.ts —— 数据地图的关系图：由血缘的关系边与已接入的实体画出节点（含 _identities、_device_owner）、边的种类与说明、
-// dagre 布局的坐标，以及点表节点给出的示例 SQL（按租户湖挂载为 lake 来写，不带连接方式与凭据）（纯函数）
+// dagre 布局的坐标，显示未接入的标准实体时的节点与边（标为未接入），_identities 节点上的打通摘要，
+// 以及点表节点给出的示例 SQL（按租户湖挂载为 lake 来写，不带连接方式与凭据；未接入的节点没有）（纯函数）
 import { describe, expect, it } from 'vitest';
 import { deriveLineage } from '../app/lib/lineage';
-import { relationGraph, sampleSql } from '../app/lib/lineage-graph';
+import { relationGraph, ruleLabels, sampleSql } from '../app/lib/lineage-graph';
 
 const { edges } = deriveLineage({ plans: [], sources: [] });
-const graphOf = (connected: string[]) => relationGraph({ edges, connected });
+const graphOf = (connected: string[], extra: { showAll?: boolean; identity?: Parameters<typeof relationGraph>[0]['identity'] } = {}) =>
+  relationGraph({ edges, connected, showAll: false, ...extra });
 
 describe('关系图', () => {
   it('只接入 order 时，没有 customer 节点，也没有 identity 边', () => {
@@ -45,6 +47,37 @@ describe('关系图', () => {
     expect(g.edges.some(e => e.source === 'custom_store' || e.target === 'custom_store')).toBe(false);
     // 不止一层，坐标不全相同
     expect(new Set(g.nodes.map(n => n.x)).size).toBeGreaterThan(1);
+  });
+
+  it('显示未接入的标准实体时，未接入的实体出节点并标为未接入，两端有一端未接入的边也是未接入', () => {
+    const g = graphOf(['customer', 'coupon'], { showAll: true });
+    expect(g.nodes.find(n => n.id === 'coupon_template')).toMatchObject({ label: '券模板', kind: 'entity', connected: false });
+    expect(g.nodes.find(n => n.id === 'coupon')).toMatchObject({ connected: true });
+    expect(g.nodes.find(n => n.id === '_identities')).toMatchObject({ connected: true });
+    // _device_owner 仍按 event 是否已接入
+    expect(g.nodes.some(n => n.id === '_device_owner')).toBe(false);
+    expect(g.edges.find(e => e.kind === 'ref' && e.source === 'coupon' && e.target === 'coupon_template')).toMatchObject({ connected: false });
+    expect(g.edges.find(e => e.source === 'coupon' && e.target === 'customer')).toMatchObject({ connected: true });
+    expect(g.edges.find(e => e.source === 'order_item' && e.target === 'order')).toMatchObject({ connected: false });
+    // 未接入的表在湖里还没有，不给示例 SQL
+    expect(sampleSql('coupon_template', g)).toBeNull();
+    expect(sampleSql('coupon', g)).toContain('lake.silver."coupon"');
+  });
+
+  it('不显示未接入的标准实体时，没有这些节点，节点与边都是已接入', () => {
+    const g = graphOf(['customer', 'coupon']);
+    expect(g.nodes.map(n => n.id).sort()).toEqual(['_identities', 'coupon', 'customer']);
+    expect(g.nodes.every(n => n.connected) && g.edges.every(e => e.connected)).toBe(true);
+  });
+
+  it('_identities 节点挂上打通摘要，并为显示摘要加高', () => {
+    const identity = { rules: ['phone', 'email'], summary: { groups: 3, records: 7 } };
+    const g = graphOf(['customer'], { identity });
+    const node = g.nodes.find(n => n.id === '_identities')!;
+    expect(node.identity).toEqual(identity);
+    expect(node.height).toBeGreaterThan(56);
+    expect(g.nodes.find(n => n.id === 'customer')!.identity).toBeUndefined();
+    expect(ruleLabels(['phone', 'email', 'external_id'])).toBe('手机号 > 邮箱 > 外部 ID');
   });
 });
 

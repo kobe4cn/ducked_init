@@ -1,20 +1,29 @@
 // app/lib/lineage-graph.ts —— 数据地图的关系图：由血缘的关系边与已接入的标准层表画出节点与边（指向 customer 的经 _identities 关联，
-// event.device_id 经 _device_owner 归到消费者，口径见 ADR-0019），用 dagre 算好坐标；点表节点给出示例 SQL，
+// event.device_id 经 _device_owner 归到消费者，口径见 ADR-0019），用 dagre 算好坐标；_identities 节点挂上匹配规则与最近一次打通的摘要；
+// 打开 showAll 时把未接入的标准实体与它们的内置关系也画出来，标为未接入；点表节点给出示例 SQL，
 // 一律按租户湖挂载为 lake 来写（ADR-0001/0008），不带连接方式与凭据。前后端共用的纯函数
 import { Graph, layout } from '@dagrejs/dagre';
-import { entityOf } from './canonical-model';
+import { CANONICAL_ENTITIES, entityOf } from './canonical-model';
 import type { LineageEdge } from './lineage';
+
+/** 身份打通的现状：匹配规则（读不出来时为 null）与最近一次打通的摘要（还没打通过时为 null），只有计数，不带消费者标识 */
+export interface IdentityInfo { rules: readonly string[] | null; summary: { groups: number; records: number } | null }
 
 export interface GraphNode {
   id: string;
   label: string;
   kind: 'entity' | 'identity' | 'device';
+  /** 已接入（有已发布映射）；showAll 画出来的未接入标准实体为 false */
+  connected: boolean;
+  /** 只挂在 _identities 节点上 */
+  identity?: IdentityInfo;
   /** 节点中心的坐标 */
   x: number; y: number;
   width: number; height: number;
 }
 
-export interface GraphEdge { id: string; source: string; target: string; kind: 'ref' | 'identity' | 'device'; label: string }
+/** connected：两端都已接入 */
+export interface GraphEdge { id: string; source: string; target: string; kind: 'ref' | 'identity' | 'device'; label: string; connected: boolean }
 
 export interface RelationGraph { nodes: GraphNode[]; edges: GraphEdge[] }
 
@@ -22,15 +31,30 @@ const IDENTITIES = '_identities';
 const DEVICE_OWNER = '_device_owner';
 const WIDTH = 180;
 const HEIGHT = 56;
+/** 带打通摘要的 _identities 节点多出规则与计数两行 */
+const IDENTITY_HEIGHT = 96;
 
 const tableOf = (silver: string) => silver.replace(/^silver\./, '');
 
-export function relationGraph(input: { edges: LineageEdge[]; connected: string[] }): RelationGraph {
+/** 匹配规则按 customer 的字段名称写，按优先级以「 > 」连接，如「手机号 > 邮箱 > 外部 ID」 */
+export const ruleLabels = (rules: readonly string[]) =>
+  rules.map(r => entityOf('customer')?.fields.find(f => f.name === r)?.label ?? r).join(' > ');
+
+export function relationGraph(input: { edges: LineageEdge[]; connected: string[]; showAll: boolean; identity?: IdentityInfo | null }): RelationGraph {
   const connected = [...new Set(input.connected)];
-  const nodes: Omit<GraphNode, 'x' | 'y'>[] = connected.map(id => ({ id, label: entityOf(id)?.label ?? id, kind: 'entity', width: WIDTH, height: HEIGHT }));
-  if (connected.includes('customer')) nodes.push({ id: IDENTITIES, label: IDENTITIES, kind: 'identity', width: WIDTH, height: HEIGHT });
-  if (connected.includes('event')) nodes.push({ id: DEVICE_OWNER, label: DEVICE_OWNER, kind: 'device', width: WIDTH, height: HEIGHT });
+  const entity = (id: string, live: boolean): Omit<GraphNode, 'x' | 'y'> =>
+    ({ id, label: entityOf(id)?.label ?? id, kind: 'entity', connected: live, width: WIDTH, height: HEIGHT });
+  const nodes = connected.map(id => entity(id, true));
+  if (input.showAll) nodes.push(...CANONICAL_ENTITIES.filter(e => !connected.includes(e.name)).map(e => entity(e.name, false)));
+  if (connected.includes('customer')) {
+    nodes.push({
+      id: IDENTITIES, label: IDENTITIES, kind: 'identity', connected: true, width: WIDTH,
+      ...(input.identity ? { identity: input.identity, height: IDENTITY_HEIGHT } : { height: HEIGHT }),
+    });
+  }
+  if (connected.includes('event')) nodes.push({ id: DEVICE_OWNER, label: DEVICE_OWNER, kind: 'device', connected: true, width: WIDTH, height: HEIGHT });
   const nodeIds = new Set(nodes.map(n => n.id));
+  const liveIds = new Set(nodes.filter(n => n.connected).map(n => n.id));
 
   const edges: GraphEdge[] = [];
   for (const e of input.edges) {
@@ -40,10 +64,10 @@ export function relationGraph(input: { edges: LineageEdge[]; connected: string[]
     const label = e.kind === 'ref' ? `${e.from.field} → ${target}.${e.to.field}`
       : e.kind === 'identity' ? '经 _identities 按 (_source, customer_id) 关联'
       : 'device_id（不带 _source，取最近一次登录）';
-    edges.push({ id: `${e.kind}:${source}.${e.from.field}->${target}`, source, target, kind: e.kind, label });
+    edges.push({ id: `${e.kind}:${source}.${e.from.field}->${target}`, source, target, kind: e.kind, label, connected: liveIds.has(source) && liveIds.has(target) });
   }
   if (nodeIds.has(IDENTITIES)) {
-    edges.push({ id: `identity:customer.customer_id->${IDENTITIES}`, source: 'customer', target: IDENTITIES, kind: 'identity', label: 'customer_id → consumer_id' });
+    edges.push({ id: `identity:customer.customer_id->${IDENTITIES}`, source: 'customer', target: IDENTITIES, kind: 'identity', label: 'customer_id → consumer_id', connected: true });
   }
 
   const g = new Graph();
@@ -64,9 +88,9 @@ export function relationGraph(input: { edges: LineageEdge[]; connected: string[]
 
 const lake = (table: string) => `lake.silver."${table}"`;
 
-/** 点表节点时给出的示例 SQL；不认识的节点返回 null */
+/** 点表节点时给出的示例 SQL；不认识的节点与未接入的节点（湖里还没有这张表）返回 null */
 export function sampleSql(nodeId: string, graph: RelationGraph): string | null {
-  if (!graph.nodes.some(n => n.id === nodeId)) return null;
+  if (!graph.nodes.some(n => n.id === nodeId && n.connected)) return null;
   const identitiesTable = lake(IDENTITIES);
   if (nodeId === 'customer') {
     return [
