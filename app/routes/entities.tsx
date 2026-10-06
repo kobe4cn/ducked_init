@@ -18,6 +18,7 @@ import { PageHeader } from '~/components/page-header';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
+import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 import { CUSTOM_ENTITY_KINDS } from '~/lib/canonical-model';
@@ -49,9 +50,9 @@ export async function action({ request }: Route.ActionArgs) {
   const form = await request.formData();
   const field = (name: string) => String(form.get(name) ?? '');
   if (field('intent') === 'passthrough') {
-    const picked = { sourceId: field('sourceId'), table: field('table') };
+    const picked = { sourceId: field('sourceId'), table: field('table'), name: field('name').trim() };
     try {
-      const { entityId } = await createPassthrough(await requirePermission(request, 'sources:write'), picked.sourceId, picked.table);
+      const { entityId } = await createPassthrough(await requirePermission(request, 'sources:write'), picked.sourceId, picked.table, picked.name);
       throw redirect(`/entities/${entityId}`);
     } catch (e) {
       if (e instanceof CustomEntityError) return data({ error: e.message, input: null, passthrough: picked }, { status: e.status });
@@ -89,7 +90,7 @@ export default function Entities({ loaderData, actionData }: Route.ComponentProp
       {actionData?.error && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />
-          <AlertTitle>未保存</AlertTitle>
+          <AlertTitle>{actionData.passthrough ? '没有生成' : '未保存'}</AlertTitle>
           <AlertDescription>{actionData.error}</AlertDescription>
         </Alert>
       )}
@@ -97,7 +98,7 @@ export default function Entities({ loaderData, actionData }: Route.ComponentProp
         <section className="rounded-2xl border bg-white p-6 shadow-sm">
           <h2 className="mb-1 font-semibold">从源表一键生成</h2>
           <p className="mb-4 max-w-2xl text-sm text-slate-500">
-            选一张已采集的源表，生成实体 custom_&lt;表名&gt; 的登记草稿（每列一个字段，类型与敏感标记取自源列，主键取源表主键或声明的业务主键）和覆盖全部列的映射草稿。两份草稿都需由另一位数据工程师或管理员发布。
+            选一张已采集的源表，生成实体的登记草稿（实体名留空时为 custom_&lt;表名&gt;，别的数据源已有同名表时另填一个）（每列一个字段，类型与敏感标记取自源列，主键取源表主键或声明的业务主键）和覆盖全部列的映射草稿。两份草稿都需由另一位数据工程师或管理员发布。
           </p>
           <PassthroughForm sources={sources} tables={tables} values={actionData?.passthrough ?? null} submitting={submitting} />
         </section>
@@ -146,7 +147,7 @@ export default function Entities({ loaderData, actionData }: Route.ComponentProp
 function PassthroughForm({ sources, tables, values, submitting }: {
   sources: { id: string; name: string }[];
   tables: Record<string, string[]>;
-  values: { sourceId: string; table: string } | null;
+  values: { sourceId: string; table: string; name: string } | null;
   submitting: boolean;
 }) {
   const [sourceId, setSourceId] = useState(values?.sourceId ?? sources[0]?.id ?? '');
@@ -169,6 +170,10 @@ function PassthroughForm({ sources, tables, values, submitting }: {
             </NativeSelect>
           </Field>
         </div>
+        <Field className="sm:max-w-sm">
+          <FieldLabel htmlFor="passthrough-name">实体名（可选）</FieldLabel>
+          <Input id="passthrough-name" name="name" className="font-mono" placeholder="custom_<表名>" defaultValue={values?.name ?? ''} />
+        </Field>
         {!sourceTables.length && <p className="text-sm text-slate-500">这个数据源还没有已采集的源表。</p>}
         <div className="flex gap-2">
           <Button type="submit" name="intent" value="passthrough" disabled={submitting || !sourceTables.length}>{submitting ? '正在生成…' : '生成登记与映射草稿'}</Button>

@@ -1,9 +1,10 @@
 // test/pipeline/passthrough.test.ts —— 一键直通的接缝（ADR-0019）：createPassthrough 从一张已采集的源表一次生成自定义实体的登记草稿与恒等映射草稿，
-// 字段的类型与敏感标记取自源列，主键取源表主键（没有时取声明的业务主键）；预检不过时两份草稿都不写。
+// 字段的类型与敏感标记取自源列，主键取源表主键（没有时取声明的业务主键）；实体名默认 custom_<表名>，撞名时建议带数据源名，可以另填；预检不过时两份草稿都不写。
+// 丢弃从没发布过的登记时配套的映射草稿一并丢弃。
 // publishPassthrough 由另一位成员把两份草稿一起双人发布并入队合并，任一份不满足发布条件时都不发布
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
-import { getCustomEntity } from '../../app/.server/custom-entities';
+import { discardCustomEntityDraft, getCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { customEntities, customEntityVersions } from '../../app/.server/db/schema';
 import { discardDraft, getMapping, listMappings } from '../../app/.server/mappings';
@@ -63,8 +64,34 @@ describe('一键直通', () => {
     expect((await listMappings(author)).mappings).toHaveLength(0);
 
     await createPassthrough(author, sourceId, 'customers');
-    await expect(createPassthrough(author, sourceId, 'customers')).rejects.toThrow('已有名为 custom_customers 的自定义实体');
+    await expect(createPassthrough(author, sourceId, 'customers')).rejects.toThrow('已有名为 custom_customers 的自定义实体：请换一个实体名');
     expect((await listMappings(author)).mappings).toHaveLength(1);
+  });
+
+  it('撞名时建议带数据源名的实体名，填了实体名就用它；实体名不合规则时拒绝', async () => {
+    const acme = await newTenant('acme');
+    const author = await memberOf(acme, 'de@acme.com');
+    const { id: sourceId } = await registerSource(author, await pgSourceInput(READER, 'shop_pg'));
+    await selectAllTables(author, sourceId);
+    await drain();
+    await createPassthrough(author, sourceId, 'customers');
+    await expect(createPassthrough(author, sourceId, 'customers')).rejects.toThrow('如 custom_shop_pg_customers');
+    await expect(createPassthrough(author, sourceId, 'customers', 'shop_customers')).rejects.toThrow('实体名要以 custom_ 开头');
+
+    const { entityId, mappingId } = await createPassthrough(author, sourceId, 'customers', 'custom_shop_pg_customers');
+    expect((await getCustomEntity(author, entityId)).entity.name).toBe('custom_shop_pg_customers');
+    expect(await getMapping(author, mappingId)).toMatchObject({ entity: 'custom_shop_pg_customers', tableName: 'customers' });
+  });
+
+  it('丢弃从没发布过的登记时一并丢弃配套的映射草稿，之后同一张表能再生成', async () => {
+    const { author, sourceId } = await profiledSource();
+    const { entityId } = await createPassthrough(author, sourceId, 'customers');
+    expect(await discardCustomEntityDraft(author, entityId)).toEqual({ kept: false });
+    expect((await listMappings(author)).mappings).toHaveLength(0);
+
+    const again = await createPassthrough(author, sourceId, 'customers');
+    expect((await getCustomEntity(author, again.entityId)).entity.name).toBe('custom_customers');
+    expect(await getMapping(author, again.mappingId)).toMatchObject({ entity: 'custom_customers' });
   });
 
   it('表不在同步范围或没采集时给出原因；分析师不能生成', async () => {

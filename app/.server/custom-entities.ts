@@ -4,7 +4,7 @@
 // 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。发布过的实体只能新增字段（规则同 ADR-0018），
 // 没被已发布映射引用的实体可以由有发布权限的成员删除。已发布映射在用、但没登记的实体由平台推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），
 // 先由一位成员确认（保存），再由另一位成员发布；登记发布前映射页提示实体待补登，映射页的实体链接到实体页。一律限定在操作者所属租户内
-import { and, desc, eq, exists, getTableColumns, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, exists, getTableColumns, inArray, notExists, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
@@ -114,6 +114,18 @@ async function publishedReferrers(db: Tx | ReturnType<typeof getDb>, tenantId: s
     ))
     .orderBy(sources.name, mappings.tableName);
   return rows.map(r => `「${r.source}」${r.viewId ? '源视图 ' : ''}${r.table}`);
+}
+
+/** 目标是这个实体、从没发布过的映射（如一键直通配套的映射草稿）：丢弃从没发布过的登记时一并丢弃 */
+export async function unpublishedMappingsOf(tenantId: string, name: string, db: Tx | ReturnType<typeof getDb> = getDb()) {
+  return db.select({ id: mappings.id, source: sources.name, table: mappings.tableName })
+    .from(mappings).innerJoin(sources, eq(sources.id, mappings.sourceId))
+    .where(and(
+      eq(mappings.tenantId, tenantId), eq(mappings.entity, name),
+      notExists(db.select({ id: mappingVersions.id }).from(mappingVersions)
+        .where(and(eq(mappingVersions.mappingId, mappings.id), eq(mappingVersions.status, 'published')))),
+    ))
+    .orderBy(sources.name, mappings.tableName);
 }
 
 /** 列表里的一个自定义实体：最新一版的中文名与类型，最近的已发布版本号与草稿的版本号（没有时为 null），草稿是否为待确认的推断登记 */
@@ -281,9 +293,25 @@ export async function discardCustomEntityDraft(actor: CurrentMember, entityId: s
     const draft = versions.find(v => v.status === 'draft');
     if (!draft) throw new CustomEntityError('这个自定义实体没有草稿');
     const published = versions.find(v => v.status === 'published')?.version ?? null;
-    // 从没发布过时删除实体，各版本随之级联删除
+    // 从没发布过时删除实体，各版本随之级联删除；目标是它、从没发布过的映射一并丢弃，免得留下指向不存在实体的映射
     if (published) await tx.delete(customEntityVersions).where(eq(customEntityVersions.id, draft.id));
-    else await tx.delete(customEntities).where(eq(customEntities.id, entityId));
+    else {
+      await tx.delete(customEntities).where(eq(customEntities.id, entityId));
+      const orphans = await unpublishedMappingsOf(actor.tenant.id, entity.name, tx);
+      if (orphans.length) {
+        // 实体行之后锁映射行，与一起发布的加锁顺序一致；锁住后再确认仍没有已发布版本
+        await tx.select({ id: mappings.id }).from(mappings).where(inArray(mappings.id, orphans.map(m => m.id))).for('update');
+        for (const m of await unpublishedMappingsOf(actor.tenant.id, entity.name, tx)) {
+          const [{ version }] = await tx.select({ version: mappingVersions.version }).from(mappingVersions)
+            .where(eq(mappingVersions.mappingId, m.id)).orderBy(desc(mappingVersions.version)).limit(1);
+          await tx.delete(mappings).where(eq(mappings.id, m.id));
+          await recordAudit(tx, {
+            tenantId: actor.tenant.id, actor, action: 'mapping.draft_discarded', targetType: 'mapping', targetId: m.id,
+            detail: { source: m.source, table: m.table, entity: entity.name, version, published: null },
+          });
+        }
+      }
+    }
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,

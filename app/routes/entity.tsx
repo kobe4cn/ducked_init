@@ -8,7 +8,7 @@ import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entity';
 import { can, requirePermission } from '~/.server/access';
 import {
-  CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, saveCustomEntityDraft,
+  CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, saveCustomEntityDraft, unpublishedMappingsOf,
 } from '~/.server/custom-entities';
 import { navFor } from '~/.server/nav';
 import { passthroughPair, publishPassthrough } from '~/.server/passthrough';
@@ -37,6 +37,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     const firstDraft = !found.published && found.draft?.version === 1 ? found.draft : null;
     const pair = firstDraft && await passthroughPair(member.tenant.id, found.entity.name);
     const pairDraft = { status: 'draft', lastEditor: pair?.lastEditor ?? '' };
+    const unpublishedMappings = found.published ? [] : await unpublishedMappingsOf(member.tenant.id, found.entity.name);
     return {
       email: member.email,
       nav: navFor(member),
@@ -57,6 +58,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         /** 当前成员发布不了这一版草稿的原因；可以发布或不是草稿时为 null */
         publishBlocker: publishReason(member, v, found.publishers),
       })),
+      /** 丢弃从没发布过的登记时一并丢弃的映射（目标是它、从没发布过） */
+      unpublishedMappings: unpublishedMappings.map(m => `「${m.source}」${m.table}`),
       /** 配套的映射草稿；登记发布过或没有时为 null。publishBlocker 是当前成员不能把两份一起发布的原因 */
       pair: pair && {
         ...pair,
@@ -121,7 +124,7 @@ function editHint(canWrite: boolean, selected: { status: string }, draft: { vers
 }
 
 export default function Entity({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, canWrite, canDelete, entity, inferred, referrers, version, versions, pair } = loaderData;
+  const { email, nav, tab, canWrite, canDelete, entity, inferred, referrers, version, versions, pair, unpublishedMappings } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -134,7 +137,7 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
         description={<Link to="/entities" className="hover:underline">← 全部自定义实体</Link>}
         actions={(
           <div className="flex items-center gap-2">
-            {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : '这个自定义实体从没发布过，将被删除'} submitting={submitting} />}
+            {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : `这个自定义实体从没发布过，将被删除${unpublishedMappings.length ? `，目标是它的映射草稿一并丢弃：${unpublishedMappings.join('、')}` : ''}`} submitting={submitting} />}
             {canDelete && (referrers.length ? (
               <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-delete-blocker>
                 <Lock className="size-3.5 shrink-0" />{`被已发布的映射引用，不能删除：${referrers.join('、')}`}

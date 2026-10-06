@@ -1,6 +1,6 @@
 // test/http/custom-entities.test.ts —— 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），最后保存的人发布不了，
 // 另一位成员在详情页发布；再改是新的一版草稿。分析师只读，查看者 403，其他租户 404；导航「映射」后面是「自定义实体」。
-// 有发布权限的成员删除实体后回到列表；从源表一键生成后跳到实体详情页，详情页显示配套的映射草稿，另一位成员把登记与映射一起发布。已发布映射在用、但没登记的实体在列表与详情页标为待确认的推断登记，确认保存、另一位成员发布后提示消失；
+// 有发布权限的成员删除实体后回到列表；从源表一键生成后跳到实体详情页（撞名时另填实体名），丢弃从没发布过的登记时配套映射草稿一并丢弃，详情页显示配套的映射草稿，另一位成员把登记与映射一起发布。已发布映射在用、但没登记的实体在列表与详情页标为待确认的推断登记，确认保存、另一位成员发布后提示消失；
 // 登记发布前映射列表与详情页提示实体待补登；映射详情页的实体卡片链接到实体页，映射页用登记的中文名
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
@@ -150,6 +150,18 @@ describe('自定义实体', () => {
     expect(detail).toContain('custom_customers');
     expect(detail).toContain('value="customer_id"');
     expect(await (await author.get('/mappings')).text()).toMatch(/customers[^]*?custom_customers|custom_customers[^]*?customers/);
+
+    const clash = await author.post('/entities?passthrough=1', { intent: 'passthrough', sourceId, table: 'customers', name: '' });
+    expect(clash.status).toBe(400);
+    const clashPage = await clash.text();
+    expect(clashPage).toContain('没有生成');
+    expect(clashPage).toContain('请换一个实体名');
+    const renamed = await author.post('/entities?passthrough=1', { intent: 'passthrough', sourceId, table: 'customers', name: 'custom_shop_customers' });
+    expect(await (await author.get(locationOf(renamed))).text()).toContain('custom_shop_customers');
+
+    // 丢弃从没发布过的登记，配套的映射草稿一起没了
+    expect(locationOf(await author.post(locationOf(created), { intent: 'discard' }))).toBe('/entities');
+    expect(await (await author.get('/mappings')).text()).not.toContain('custom_customers');
   });
 
   it('详情页显示配套的映射草稿；最后保存的人看到原因，管理员点「登记与映射一起发布」后两份都发布', async () => {
