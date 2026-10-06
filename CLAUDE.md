@@ -28,7 +28,7 @@ Keep the main context window under ~150k tokens for a whole ticket, building inc
 
 - The ticket's `## Implementation guide` is your exploration: start from its `file:line` references, confirm line numbers with `grep -n`, then change the code.
 - In the main thread, read in full only the files you are about to modify, and only if they are under ~300 lines. In a longer file, read just the functions you will change: `grep -n` to find them, then `sed -n` that range. To understand a module you won't change, read its header comment and `grep -n '^export'`.
-- Locate with `grep -n` first, then read the range you need with `sed -n 'a,bp'`. Don't `cat` several files in one command.
+- Locate with `grep -n` first, then read the range you need with `sed -n 'a,bp'`.
 - When a tool result is saved to a `tool-results/` file because it was too large, grep that file for what you need. Don't Read it whole.
 - Write long command output (full test suite, builds) to a file and grep it. The full suite takes 15–25 minutes: run it with `run_in_background` and wait for its completion notice before running any other vitest.
 - Before writing tests, read `test/README.md` (fixtures, helpers, templates) instead of the harness and fixture sources. To find a similar existing test, `grep -n` `test/CATALOG.md`; don't read it whole. When you add a fixture helper, update `test/README.md`; when you add a test file, add its row to `test/CATALOG.md`.

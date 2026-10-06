@@ -21,6 +21,10 @@ Build on the shadcn components in `app/components/ui/` and lucide icons. Don't a
 - **Flow row**: a detail page that connects two things (source table → entity) shows them as two cards joined by an arrow. Each card has a tinted icon and links to its own page.
 - **Kind icons**: data-source kinds have a fixed tint: postgres sky, mysql orange, mongodb emerald, s3 violet, duckdb amber.
 
+## Forms
+
+- **Repeatable rows** (fields, conditions, columns): render existing rows plus an "添加一行" button, with no fixed row limit. Blank rows are ignored on save. HTTP tests only see the server-rendered rows, so test the controls' presence and check the page in a browser.
+
 ## Status colors
 
 | Meaning | Color |
