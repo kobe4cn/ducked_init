@@ -1,9 +1,9 @@
 // app/components/lineage-graph.tsx —— 数据地图的关系图：用 React Flow 画 relationGraph 算好坐标的节点与边，挂载后才渲染（服务端不测量节点）；
 // 经 _identities、_device_owner 的边用虚线与不同颜色并显示说明；未接入的节点与边灰显；_identities 节点内显示匹配规则与打通摘要；
-// 点节点把 ?node= 写进 URL，页面据此给出示例 SQL
+// 节点可以拖动（只在本页有效，可重置），悬停或选中节点时突出它的连线、其余变淡；点节点把 ?node= 写进 URL，页面据此给出示例 SQL
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router';
-import { Background, type Edge, MarkerType, type Node, Position, ReactFlow } from '@xyflow/react';
+import { Background, Controls, type Edge, MarkerType, type Node, type NodeChange, Panel, Position, ReactFlow, type XYPosition } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { type GraphEdge, type GraphNode, type RelationGraph, ruleLabels } from '~/lib/lineage-graph';
 
@@ -36,43 +36,65 @@ export function RelationGraphView({ graph, selected }: { graph: RelationGraph; s
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   const [, setSearchParams] = useSearchParams();
+  // 拖动过的节点位置（左上角）；节点变了（如切换显示未接入的实体）时回到 dagre 的布局。
+  // 点节点会重新加载、换一个 graph 对象，所以按节点集合而不是 graph 本身判断
+  const [moved, setMoved] = useState<Record<string, XYPosition>>({});
+  const layoutKey = graph.nodes.map(n => n.id).join();
+  useEffect(() => setMoved({}), [layoutKey]);
+  // 悬停的节点：它与选中节点的连线突出显示，其余的变淡
+  const [hovered, setHovered] = useState<string | null>(null);
+  const focus = hovered ?? selected;
 
   const nodes = useMemo<Node[]>(() => graph.nodes.map(n => ({
     id: n.id,
     // React Flow 的坐标是左上角，dagre 给的是中心
-    position: { x: n.x - n.width / 2, y: n.y - n.height / 2 },
+    position: moved[n.id] ?? { x: n.x - n.width / 2, y: n.y - n.height / 2 },
     data: { label: nodeLabel(n) },
     width: n.width, height: n.height,
     sourcePosition: Position.Right, targetPosition: Position.Left,
-    draggable: false, connectable: false,
+    connectable: false,
     selected: n.id === selected,
     style: {
       ...NODE_STYLE[n.kind], ...(n.connected ? {} : DISCONNECTED_NODE), width: n.width, height: n.height, borderWidth: n.id === selected ? 2 : 1, borderRadius: 12,
-      fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'grab',
       ...(n.id === selected ? { borderColor: '#0f172a' } : {}),
     },
-  })), [graph, selected]);
+  })), [graph, selected, moved]);
 
   const edges = useMemo<Edge[]>(() => graph.edges.map(e => {
     const color = e.connected ? EDGE_COLOR[e.kind] : DISCONNECTED_EDGE;
+    const near = focus !== null && (e.source === focus || e.target === focus);
+    const faded = focus !== null && !near;
     return {
       id: e.id, source: e.source, target: e.target,
-      label: e.kind === 'ref' ? undefined : e.label,
+      // 内置关系平时不显示说明，悬停或选中一端时显示
+      label: e.kind === 'ref' && !near ? undefined : e.label,
       labelStyle: { fontSize: 11, fill: color },
-      style: { stroke: color, strokeDasharray: e.kind === 'ref' ? undefined : '6 4', opacity: e.connected ? 1 : 0.6 },
+      zIndex: near ? 1 : 0,
+      style: {
+        stroke: color, strokeDasharray: e.kind === 'ref' ? undefined : '6 4', strokeWidth: near ? 2 : 1,
+        opacity: faded ? 0.12 : e.connected ? 1 : 0.6,
+      },
       markerEnd: { type: MarkerType.ArrowClosed, color },
     };
-  }), [graph]);
+  }), [graph, focus]);
+
+  const onNodesChange = (changes: NodeChange[]) => {
+    const positions = changes.flatMap(c => (c.type === 'position' && c.position ? [[c.id, c.position] as const] : []));
+    if (positions.length) setMoved(prev => ({ ...prev, ...Object.fromEntries(positions) }));
+  };
 
   return (
-    <div className="h-[480px] rounded-xl border bg-slate-50">
+    <div className="h-[560px] rounded-xl border bg-slate-50">
       {mounted && (
         <ReactFlow
           nodes={nodes}
           edges={edges}
           fitView
-          nodesDraggable={false}
           nodesConnectable={false}
+          onNodesChange={onNodesChange}
+          onNodeMouseEnter={(_, node) => setHovered(node.id)}
+          onNodeMouseLeave={() => setHovered(null)}
           proOptions={{ hideAttribution: true }}
           onNodeClick={(_, node) => graph.nodes.find(n => n.id === node.id)?.connected && setSearchParams(prev => {
             const next = new URLSearchParams(prev);
@@ -81,6 +103,14 @@ export function RelationGraphView({ graph, selected }: { graph: RelationGraph; s
           }, { preventScrollReset: true })}
         >
           <Background />
+          <Controls showInteractive={false} />
+          {Object.keys(moved).length > 0 && (
+            <Panel position="top-right">
+              <button type="button" onClick={() => setMoved({})} className="rounded-lg border bg-white px-3 py-1 text-xs text-slate-600 shadow-sm hover:bg-slate-50">
+                重置布局
+              </button>
+            </Panel>
+          )}
         </ReactFlow>
       )}
     </div>
