@@ -137,6 +137,7 @@ describe('自定义实体', () => {
     const form = await (await author.get('/entities?passthrough=1')).text();
     expect(form).toContain('value="passthrough"');
     expect(form).toContain('>customers</option>');
+    expect(form).toContain('id="passthrough-name"');
 
     const rejected = await author.post('/entities?passthrough=1', { intent: 'passthrough', sourceId, table: 'regions' });
     expect(rejected.status).toBe(400);
