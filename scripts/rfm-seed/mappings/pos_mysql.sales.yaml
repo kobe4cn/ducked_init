@@ -1,0 +1,21 @@
+# pos_mysql（MySQL）sales → 订单。状态是中文；member_id 为空的是散客单（打通不到消费者）
+model: 1
+entity: order
+table: sales
+fields:
+  order_id: string(sale_id)
+  customer_id: string(member_id)
+  status:
+    expr: status
+    dictionary:
+      待支付: created
+      已支付: paid
+      已发货: shipped
+      已完成: completed
+      已取消: cancelled
+      已退款: refunded
+  amount: amount
+  created_at: from_timezone(sold_at, 'Asia/Shanghai')
+  paid_at: from_timezone(paid_at, 'Asia/Shanghai')
+  store_id: store_code
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')

@@ -1,0 +1,18 @@
+# shop_pg（Postgres）customers → 消费者。时间列是 timestamptz，直接用，不要 from_timezone
+model: 1
+entity: customer
+table: customers
+fields:
+  customer_id: string(customer_id)
+  name: nick_name
+  phone: mobile
+  email: email
+  external_id: unionid
+  gender:
+    expr: gender
+    dictionary:
+      F: female
+      M: male
+  city: city
+  registered_at: created_at
+  updated_at: updated_at

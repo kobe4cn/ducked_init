@@ -1,0 +1,21 @@
+# shop_pg（Postgres）orders → 订单。待支付在源端叫 pending
+model: 1
+entity: order
+table: orders
+fields:
+  order_id: string(order_id)
+  customer_id: string(customer_id)
+  status:
+    expr: status
+    dictionary:
+      pending: created
+      paid: paid
+      shipped: shipped
+      completed: completed
+      cancelled: cancelled
+      refunded: refunded
+  amount: pay_amount
+  created_at: created_at
+  paid_at: paid_at
+  channel: channel
+  updated_at: updated_at

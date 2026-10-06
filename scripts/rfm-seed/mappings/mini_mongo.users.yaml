@@ -1,0 +1,12 @@
+# mini_mongo（MongoDB）users → 消费者。嵌套的 contact.email / contact.mobile 展开成 contact_email / contact_mobile。
+# Mongo 的 Date 是 UTC 时间：不要用 from_timezone(..., 'Asia/Shanghai')，草稿若这样生成要改掉
+model: 1
+entity: customer
+table: users
+fields:
+  customer_id: member_no
+  name: nickname
+  phone: contact_mobile
+  email: contact_email
+  registered_at: created_at
+  updated_at: updated_at

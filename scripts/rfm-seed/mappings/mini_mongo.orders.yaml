@@ -1,0 +1,24 @@
+# mini_mongo（MongoDB）orders → 订单。约 2% 的订单号有两个文档（旧版本待支付），按订单号去重、取 updated_at 最新的一份。
+# buyer.member_no 以 M9 开头、users 里没有的是孤儿单（打通不到消费者）
+model: 1
+entity: order
+table: orders
+fields:
+  order_id: order_no
+  customer_id: buyer_member_no
+  status:
+    expr: status
+    dictionary:
+      UNPAID: created
+      PAID: paid
+      SHIPPED: shipped
+      DONE: completed
+      CANCELED: cancelled
+      REFUND: refunded
+  amount: pay_amount
+  created_at: created_at
+  paid_at: pay_paid_at
+  updated_at: updated_at
+dedupe:
+  key: [order_id]
+  latest: updated_at

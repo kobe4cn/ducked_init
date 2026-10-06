@@ -1,0 +1,11 @@
+# live_duckdb（S3 上的 DuckDB 文件）viewers → 消费者。只有手机号（中间带空格）；时间是不带时区的北京时间
+model: 1
+entity: customer
+table: viewers
+fields:
+  customer_id: string(viewer_id)
+  phone: phone
+  registered_at: from_timezone(joined_at, 'Asia/Shanghai')
+  updated_at: from_timezone(modified_at, 'Asia/Shanghai')
+extensions:
+  x_level: { type: string, expr: level }

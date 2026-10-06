@@ -1,0 +1,20 @@
+# live_duckdb（S3 上的 DuckDB 文件）live_orders → 订单。状态是单字母，金额以分为单位
+model: 1
+entity: order
+table: live_orders
+fields:
+  order_id: order_code
+  customer_id: string(viewer_id)
+  status:
+    expr: state
+    dictionary:
+      'N': created
+      'P': paid
+      'S': shipped
+      'C': completed
+      'X': cancelled
+      'R': refunded
+  amount: amount_cents / 100
+  created_at: from_timezone(ordered_at, 'Asia/Shanghai')
+  paid_at: from_timezone(paid_at, 'Asia/Shanghai')
+  updated_at: from_timezone(modified_at, 'Asia/Shanghai')

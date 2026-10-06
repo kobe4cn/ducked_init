@@ -1,0 +1,11 @@
+# pos_mysql（MySQL）members → 消费者。手机号是 +86 138-xxxx-xxxx、邮箱大写带空格，平台规范化后再哈希；时间是不带时区的北京时间
+model: 1
+entity: customer
+table: members
+fields:
+  customer_id: string(member_id)
+  name: member_name
+  phone: phone
+  email: email
+  registered_at: from_timezone(registered_at, 'Asia/Shanghai')
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')

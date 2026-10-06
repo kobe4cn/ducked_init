@@ -8,3 +8,8 @@ node_modules/
 /data/
 /wasm/public/app.js
 .env.test
+
+# Agent scratch space (logs, drafts, probes)
+.scratch/
+# Generated RFM seed data and credentials
+scripts/rfm-seed/out/
