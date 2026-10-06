@@ -14,7 +14,7 @@ npx vitest run test/pipeline/mapping.test.ts # 单个文件
   - `TEST_S3_LAKE_URI`：对象存储上的隔离测试与文件数据源
   - `TEST_MYSQL_URL`：MySQL 数据源
   - `TEST_MONGO_URL`：MongoDB 数据源
-- `test/global-setup.ts` 在开跑前建库并迁移到最新结构。所有测试共用一个库，**文件串行执行**（`fileParallelism: false`）。
+- `test/global-setup.ts` 在开跑前建库并迁移到最新结构。所有测试共用一个库，**文件串行执行**（`fileParallelism: false`）；它还加了一把锁，已有 vitest 在跑时，再启动的 vitest 会直接报错退出。
 
 ## 两种接缝，选哪个
 
