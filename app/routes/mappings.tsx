@@ -1,4 +1,4 @@
-// app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、最近一次合并），
+// app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、目标自定义实体待补登、最近一次合并），
 // 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿；可按所选的表与实体按规则生成草稿填进编辑框，不保存；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
 // 以及手动触发一次合并到标准层
 import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, PencilLine, Play, Plus, X } from 'lucide-react';
@@ -7,7 +7,7 @@ import { isMap, isScalar, parseDocument } from 'yaml';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mappings';
 import { can, requirePermission } from '~/.server/access';
-import { customEntityRegistrations } from '~/.server/custom-entities';
+import { customEntityRegistrations, pendingRegistrations } from '~/.server/custom-entities';
 import { createMapping, defaultDraft, draftFor, listMappings, MappingError, mergeNow, referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
@@ -32,6 +32,7 @@ export function meta({}: Route.MetaArgs) {
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   const { mappings, merge } = await listMappings(member);
+  const unregistered = await pendingRegistrations(member, mappings.map(m => m.entity));
   const sources = (await listSources(member)).map(s => ({ id: s.id, name: s.name }));
   const canWrite = can(member.role, 'sources:write');
   return {
@@ -61,6 +62,8 @@ export async function loader({ request }: Route.LoaderArgs) {
       published: m.published,
       draft: m.draft,
       lastMerge: m.lastMerge,
+      /** 目标是还没有已发布登记的自定义实体时，去补登的实体页（推断不出登记时是实体列表）；否则为 null */
+      pendingEntity: unregistered[m.entity] ?? null,
     })),
   };
 }
@@ -154,26 +157,31 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
       <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
         {mappings.map(m => {
           const failed = m.lastMerge && 'error' in m.lastMerge;
+          // 卡片整体链到映射，「实体待补登」链到实体页：不能把链接套在链接里，卡片链接铺在底层，标记浮在它上面
           return (
-            <Link
+            <div
               key={m.id}
-              to={`/mappings/${m.id}`}
               data-mapping-id={m.id}
-              className={cn('rounded-2xl border bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md', failed && 'border-red-200')}
+              className={cn('relative rounded-2xl border bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md', failed && 'border-red-200')}
             >
-              <div className="text-lg font-medium">{`${m.entityLabel}（${m.entity}）`}</div>
+              <Link to={`/mappings/${m.id}`} className="block text-lg font-medium after:absolute after:inset-0">{`${m.entityLabel}（${m.entity}）`}</Link>
               <div className="mt-1 truncate font-mono text-xs text-slate-400">{`${m.sourceName} / ${m.table}`}</div>
               <div className="mt-4 flex flex-wrap gap-3 text-sm">
                 {m.published
                   ? <span className="inline-flex items-center gap-1 text-emerald-600"><CheckCircle2 className="size-3.5" />{`已发布 v${m.published}`}</span>
                   : <span className="inline-flex items-center gap-1 text-slate-500"><CircleDashed className="size-3.5" />未发布</span>}
                 {m.draft && <span className="inline-flex items-center gap-1 text-amber-600"><PencilLine className="size-3.5" />{`草稿 v${m.draft}`}</span>}
+                {m.pendingEntity && (
+                  <Link to={m.pendingEntity} title="这个实体还没有已发布的登记，去确认补登" className="relative inline-flex items-center gap-1 text-amber-600 hover:underline">
+                    <AlertTriangle className="size-3.5" />实体待补登
+                  </Link>
+                )}
               </div>
               <div className={cn('mt-4 flex items-start gap-1 border-t pt-3 text-xs', failed ? 'text-red-600' : 'text-slate-400')}>
                 {failed && <AlertTriangle className="mt-px size-3.5 shrink-0" />}
                 <span className="line-clamp-2">{m.lastMerge ? `最近一次合并：${mergeSummary(m.lastMerge)}` : '还没有合并过'}</span>
               </div>
-            </Link>
+            </div>
           );
         })}
 

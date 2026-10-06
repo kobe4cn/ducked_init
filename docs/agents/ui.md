@@ -14,7 +14,7 @@ Build on the shadcn components in `app/components/ui/` and lucide icons. Don't a
 ## Building blocks
 
 - **Stat tiles** (`StatTile`): a label, a large number and a hint, in `rounded-2xl border bg-white p-5 shadow-sm`. Use 2 to 4 of them at the top of an overview page. Give the number a status color only when it means something.
-- **Card grid**: for lists of up to a few dozen items with an identity (sources, mappings), use `grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4`. Each card is a whole `Link`. When the user can create items, put a dashed "add" card at the end of the grid.
+- **Card grid**: for lists of up to a few dozen items with an identity (sources, mappings), use `grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4`. Each card is a whole `Link`. When a card needs a second link inside it (the mapping card's 实体待补登), make the card a `relative` `div`, stretch the title `Link` over it with `after:absolute after:inset-0`, and give the inner link `relative` so it sits above. When the user can create items, put a dashed "add" card at the end of the grid.
 - **Tables**: for long or row-shaped data (tasks, audit logs, members, merge history), use a `Table` inside a white `rounded-2xl border` panel.
 - **Panels**: group the content in `rounded-2xl border bg-white p-6 shadow-sm`. Don't nest cards inside panels.
 - **Pill tabs**: a `rounded-full bg-slate-200/60 p-1` group, with the active tab `bg-white shadow-sm`. Keep the tab in the URL (`?tab=`), like `source.tsx` does, so the page renders on the server and links work.

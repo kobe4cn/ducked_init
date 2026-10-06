@@ -1,6 +1,7 @@
-// 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），最后保存的人发布不了，
+// test/http/custom-entities.test.ts —— 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），最后保存的人发布不了，
 // 另一位成员在详情页发布；再改是新的一版草稿。分析师只读，查看者 403，其他租户 404；导航「映射」后面是「自定义实体」。
-// 有发布权限的成员删除实体后回到列表。已发布映射在用、但没登记的实体在列表与详情页标为待确认的推断登记，确认保存、另一位成员发布后提示消失
+// 有发布权限的成员删除实体后回到列表。已发布映射在用、但没登记的实体在列表与详情页标为待确认的推断登记，确认保存、另一位成员发布后提示消失；
+// 登记发布前映射列表与详情页提示实体待补登
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -133,24 +134,24 @@ describe('自定义实体', () => {
   });
 });
 
-describe('推断登记', () => {
-  it('已发布映射在用、但没登记的实体在列表与详情页标为待确认；直接发布被拒，一位成员确认保存、另一位成员发布后提示消失', async () => {
-    const tenantId = await acme();
-    const [de, de2] = [await memberOf(tenantId, 'de@acme.com'), await memberOf(tenantId, 'de2@acme.com')];
-    const { id: sourceId } = await registerSource(de, await pgSourceInput(READER));
-    await selectAllTables(de, sourceId);
-    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
-    await publishCustomEntity(de2, await createCustomEntity(de, {
-      name: 'custom_store',
-      label: '门店',
-      kind: 'dimension',
-      fields: [
-        { name: 'store_id', type: 'string', description: '', sensitive: false },
-        { name: 'manager_phone', type: 'string', description: '', sensitive: true },
-      ],
-      primaryKey: ['store_id'],
-    }), 1);
-    await publish(de, de2, sourceId, `model: 1
+/** 已发布映射在用 custom_store、但它没有登记（模拟登记功能上线前就在用的实体）。返回映射 ID */
+async function legacyStoreMapping() {
+  const tenantId = await acme();
+  const [de, de2] = [await memberOf(tenantId, 'de@acme.com'), await memberOf(tenantId, 'de2@acme.com')];
+  const { id: sourceId } = await registerSource(de, await pgSourceInput(READER));
+  await selectAllTables(de, sourceId);
+  await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+  await publishCustomEntity(de2, await createCustomEntity(de, {
+    name: 'custom_store',
+    label: '门店',
+    kind: 'dimension',
+    fields: [
+      { name: 'store_id', type: 'string', description: '', sensitive: false },
+      { name: 'manager_phone', type: 'string', description: '', sensitive: true },
+    ],
+    primaryKey: ['store_id'],
+  }), 1);
+  const mappingId = await publish(de, de2, sourceId, `model: 1
 entity: custom_store
 table: customers
 extensions:
@@ -158,9 +159,14 @@ extensions:
   manager_phone: { type: string, expr: phone }
 dedupe: { key: [store_id] }
 `);
-    // 模拟登记功能上线前就在用的实体
-    await getDb().delete(customEntities);
+  // 模拟登记功能上线前就在用的实体
+  await getDb().delete(customEntities);
+  return mappingId;
+}
 
+describe('推断登记', () => {
+  it('已发布映射在用、但没登记的实体在列表与详情页标为待确认；直接发布被拒，一位成员确认保存、另一位成员发布后提示消失', async () => {
+    await legacyStoreMapping();
     const author = await loginAs(app, 'de@acme.com');
     const list = await (await author.get('/entities')).text();
     expect(list).toContain('推断登记 · 待确认 v1');
@@ -179,5 +185,28 @@ dedupe: { key: [store_id] }
     expect(await (await admin.get(page)).text()).not.toContain('由已发布映射推断');
     expect((await admin.post(page, { intent: 'publish', version: '1' })).status).toBe(302);
     expect(await (await author.get('/entities')).text()).toContain('已发布 v1');
+  });
+
+  it('映射列表与详情页提示目标实体待补登并链接到实体页；只有草稿的登记也算，另一位成员发布登记后提示消失', async () => {
+    const mappingId = await legacyStoreMapping();
+    const author = await loginAs(app, 'de@acme.com');
+    const list = await (await author.get('/mappings')).text();
+    expect(list).toContain('实体待补登');
+    const page = `/entities/${list.match(/href="\/entities\/([0-9a-f-]{36})"/)![1]}`;
+    expect(await (await author.get(page)).text()).toContain('custom_store');
+    const detail = await (await author.get(`/mappings/${mappingId}`)).text();
+    expect(detail).toContain('实体待补登');
+    expect(detail).toContain(`href="${page}"`);
+    expect(detail).toContain('保存不了新草稿');
+
+    // 确认保存后只有草稿，仍然待补登
+    const { intent: _, name: __, ...rest } = STORE;
+    expect((await author.post(page, { ...rest, intent: 'save' })).status).toBe(302);
+    expect(await (await author.get('/mappings')).text()).toContain('实体待补登');
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    expect((await admin.post(page, { intent: 'publish', version: '1' })).status).toBe(302);
+    expect(await (await author.get('/mappings')).text()).not.toContain('实体待补登');
+    expect(await (await author.get(`/mappings/${mappingId}`)).text()).not.toContain('实体待补登');
   });
 });

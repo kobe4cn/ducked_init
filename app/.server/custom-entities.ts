@@ -3,8 +3,8 @@
 // 草稿按映射同样的规则双人发布：由最后保存它的人以外的另一位有发布权限的成员在页面上发布，也可以丢弃（回到最近的已发布版本，
 // 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。发布过的实体只能新增字段（规则同 ADR-0018），
 // 没被已发布映射引用的实体可以由有发布权限的成员删除。已发布映射在用、但没登记的实体由平台推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），
-// 先由一位成员确认（保存），再由另一位成员发布。一律限定在操作者所属租户内
-import { and, desc, eq, exists, getTableColumns, sql } from 'drizzle-orm';
+// 先由一位成员确认（保存），再由另一位成员发布；登记发布前映射页提示实体待补登。一律限定在操作者所属租户内
+import { and, desc, eq, exists, getTableColumns, inArray, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
@@ -374,4 +374,21 @@ export async function publishedCustomEntities(db: Tx | ReturnType<typeof getDb>,
 export async function customEntityRegistrations(actor: CurrentMember): Promise<Record<string, RegisteredEntity>> {
   assertCan(actor, 'sources:read');
   return Object.fromEntries(await publishedCustomEntities(getDb(), actor.tenant.id));
+}
+
+/**
+ * 这些实体里还没有已发布登记的自定义实体（只有草稿的也算：映射校验不把草稿当作登记），按名称索引到去补登的页面：它的实体页，
+ * 推断不出合格登记、也没人登记过时是实体列表（映射页提示待补登）。先推断登记草稿，让已发布映射在用的实体有实体页可去
+ */
+export async function pendingRegistrations(actor: CurrentMember, entities: string[]): Promise<Record<string, string>> {
+  assertCan(actor, 'sources:read');
+  const custom = [...new Set(entities.filter(isCustomEntity))];
+  if (!custom.length) return {};
+  return getDb().transaction(async tx => {
+    await inferCustomEntityDrafts(tx, actor.tenant.id);
+    const published = await publishedCustomEntities(tx, actor.tenant.id);
+    const ids = new Map((await tx.select({ id: customEntities.id, name: customEntities.name }).from(customEntities)
+      .where(and(eq(customEntities.tenantId, actor.tenant.id), inArray(customEntities.name, custom)))).map(r => [r.name, r.id]));
+    return Object.fromEntries(custom.filter(name => !published.has(name)).map(name => [name, ids.has(name) ? `/entities/${ids.get(name)}` : '/entities']));
+  });
 }

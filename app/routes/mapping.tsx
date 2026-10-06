@@ -1,6 +1,6 @@
 // app/routes/mapping.tsx —— 单个映射：各版本（已发布的锁定、草稿可改）、编辑与丢弃草稿（数据工程师、管理员）、发布草稿（需最后保存它的人以外的
 // 另一位有发布权限的成员，最后保存的人看到不能发布的原因，租户里只有自己有发布权限时提示先邀请成员；编辑框旁对照源表的列统计与实体的标准字段（自定义实体对照它已发布登记的字段）；
-// 可按规则重新生成草稿填进编辑框，不保存），以及这个映射每次合并到标准层的结果；有已发布版本时可以立即合并这一个映射。
+// 可按规则重新生成草稿填进编辑框，不保存），以及这个映射每次合并到标准层的结果；实体是还没有已发布登记的自定义实体时顶部提示待补登、链接到实体页；有已发布版本时可以立即合并这一个映射。
 // 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）；
 // 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）；
 // 编辑页可空跑正在查看的版本：在原始层样本上转换，编辑框下方展示样例行（敏感字段是哈希）与基础断言，不写标准层；
@@ -9,7 +9,7 @@ import { AlertTriangle, ArrowRight, Boxes, CheckCircle2, FileDiff, FlaskConical,
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
-import { customEntityRegistrations } from '~/.server/custom-entities';
+import { customEntityRegistrations, pendingRegistrations } from '~/.server/custom-entities';
 import { discardDraft, draftForMapping, dryRunMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
@@ -28,6 +28,7 @@ import { MappingEditorWithReference } from '~/components/mapping-reference';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { StatTile } from '~/components/stat-tile';
+import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
@@ -56,6 +57,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     const m = await getMapping(member, params.mappingId);
     const canWrite = can(member.role, 'sources:write');
     const url = new URL(request.url);
+    const unregistered = await pendingRegistrations(member, [m.entity]);
     return {
       email: member.email,
       nav: navFor(member),
@@ -76,6 +78,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         reference: canWrite ? ((await referenceTables(member, m.source.id)).find(t => t.name === m.tableName && !!t.view === !!m.sourceViewId) ?? null) : null,
         /** 映射的实体是已发布登记的自定义实体时，编辑草稿对照的登记（只给这一条；不能编辑时不给） */
         registered: canWrite ? registrationOf(await customEntityRegistrations(member), m.entity) : {},
+        /** 实体是还没有已发布登记的自定义实体时，去补登的实体页（推断不出登记时是实体列表）；否则为 null */
+        pendingEntity: unregistered[m.entity] ?? null,
       },
       versions: m.versions.map(v => ({
         ...v,
@@ -316,6 +320,18 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
         }
       />
 
+      {mapping.pendingEntity && (
+        <Alert role="status">
+          <AlertTriangle />
+          <AlertTitle>{`实体待补登：${mapping.entity} 还没有已发布的登记`}</AlertTitle>
+          <AlertDescription>
+            <p>
+              登记发布前，这个映射保存不了新草稿；已发布的版本照常合并。
+              <Link to={mapping.pendingEntity} className="underline">去实体页确认登记</Link>，再由另一位成员发布。
+            </p>
+          </AlertDescription>
+        </Alert>
+      )}
       {actionData?.error && <MappingErrors error={actionData.error} issues={actionData.issues} />}
 
       <div className="grid gap-4 lg:grid-cols-[1fr_auto_1fr_1.2fr]">
