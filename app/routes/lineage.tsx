@@ -2,22 +2,28 @@
 // 图下服务端渲染一份表与关系的列表；点表节点（?node=）给出按租户湖挂载为 lake 写的示例 SQL。
 // _identities 显示匹配规则与最近一次打通的摘要（只有计数）；?all=1 时把未接入的标准实体与它们的内置关系也画出来，灰显。
 // 流向图（?tab=flow）画源表 → 映射 → 标准层表 → 打通表，带各映射最近一次合并与标准层表行数（取自任务结果，不查湖），图下同样有一份列表；
-// 只对有 sources:read 的成员开放，没有权限时回到关系图，源表名与映射信息都不下发
+// 只对有 sources:read 的成员开放，没有权限时回到关系图，源表名与映射信息都不下发。
+// 点已接入的标准层表（关系图 ?node=<entity>，流向图 ?node=silver.<entity>）在右侧抽屉列出字段明细：有 sources:read 时带各映射的源表、源列、表达式、
+// 标记与兜底统计，否则只下发字段说明与行数（在 loader 里裁剪）
 import { Link, useSearchParams } from 'react-router';
 import type { Route } from './+types/lineage';
 import { can } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
+import { publishedCustomEntities } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import { lastMergeByMapping, latestIdentitySummary, type MergeHistoryEntry, publishedPlans } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { identityRules } from '~/.server/pipeline/identity-engine';
 import { listSources } from '~/.server/sources';
+import { entityOf } from '~/lib/canonical-model';
 import { deriveLineage } from '~/lib/lineage';
+import { entityFields, type FieldDrawer, redactFields } from '~/lib/lineage-fields';
 import { type FlowInput, type FlowMerge, silverTotals } from '~/lib/lineage-flow';
 import { relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
 import type { SourceKind } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
 import { KindIcon } from '~/components/kind-icon';
+import { LineageDrawer } from '~/components/lineage-drawer';
 import { FlowGraphView, MergeStatus } from '~/components/lineage-flow';
 import { RelationGraphView } from '~/components/lineage-graph';
 import { PageHeader } from '~/components/page-header';
@@ -40,6 +46,12 @@ const flowMerge = (r: MergeHistoryEntry): FlowMerge => ({
   at: new Date(Date.parse(r.startedAt) + r.durationMs).toISOString(),
   rows: 'rows' in r ? r.rows : null,
 });
+
+/** 抽屉要打开的标准层表：关系图的节点是实体名，流向图的是 silver.<实体>；只认已接入的 */
+const drawerEntityOf = (node: string | null, connected: string[]) => {
+  const entity = node?.startsWith('silver.') ? node.slice('silver.'.length) : node;
+  return entity && connected.includes(entity) ? entity : null;
+};
 
 const NODE_KINDS = { entity: '标准层表', identity: '身份对应', device: '设备归属' } as const;
 const EDGE_KINDS = { ref: '内置关系', identity: '经 _identities', device: '经 _device_owner' } as const;
@@ -66,21 +78,33 @@ export async function loader({ request }: Route.LoaderArgs) {
   const sql = node ? sampleSql(node, graph) : null;
   const canFlow = can(member.role, 'sources:read');
   const tab = tabOf(request, canFlow);
+  const drawerEntity = drawerEntityOf(node, connected);
   let flow: FlowInput | null = null;
-  if (tab === 'flow') {
+  let drawer: FieldDrawer | null = null;
+  if (tab === 'flow' || drawerEntity) {
     // 只取数据源的名字与种类，不带连接配置；不下发合并计划（里面有列与表达式）
-    const sources = (await listSources(member)).map(({ id, name, kind }) => ({ id, name, kind }));
-    const { tables, edges } = deriveLineage({ plans, sources });
+    const sources = canFlow ? (await listSources(member)).map(({ id, name, kind }) => ({ id, name, kind })) : [];
+    const lineage = deriveLineage({ plans, sources });
     const last = await lastMergeByMapping(member.tenant.id, plans.map(p => p.mapping));
-    flow = {
-      tables, identityEdges: edges, identity: graph.nodes.find(n => n.identity)?.identity ?? null,
-      merges: Object.fromEntries(Object.entries(last).map(([id, r]) => [id, flowMerge(r)])),
-    };
+    const merges = Object.fromEntries(Object.entries(last).map(([id, r]) => [id, flowMerge(r)]));
+    if (tab === 'flow') {
+      flow = { tables: lineage.tables, identityEdges: lineage.edges, identity: graph.nodes.find(n => n.identity)?.identity ?? null, merges };
+    }
+    if (drawerEntity) {
+      const canonical = entityOf(drawerEntity);
+      const custom = canonical ? undefined : (await publishedCustomEntities(getDb(), member.tenant.id)).get(drawerEntity);
+      // 兜底统计里是源端的取值，只给有 sources:read 的人
+      const fallbacks = canFlow ? Object.fromEntries(Object.entries(last).map(([id, r]) => [id, 'fallback' in r ? r.fallback : undefined])) : {};
+      const fields = entityFields(lineage, drawerEntity, canonical?.fields ?? custom?.fields ?? [], fallbacks);
+      const head = { entity: drawerEntity, label: canonical?.label ?? custom?.label ?? drawerEntity, rows: silverTotals(lineage.tables, merges).get(`silver.${drawerEntity}`)?.rows ?? 0 };
+      drawer = canFlow ? { ...head, detail: true, fields } : { ...head, detail: false, fields: redactFields(fields) };
+    }
   }
   return {
     tab,
     canFlow,
     flow,
+    drawer,
     email: member.email,
     nav: navFor(member),
     graph,
@@ -91,7 +115,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 }
 
 export default function Lineage({ loaderData }: Route.ComponentProps) {
-  const { tab, canFlow, flow, email, nav, graph, showAll, node, sql } = loaderData;
+  const { tab, canFlow, flow, drawer, email, nav, graph, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
   const [searchParams] = useSearchParams();
   const nodeHref = (id: string) => {
@@ -99,6 +123,11 @@ export default function Lineage({ loaderData }: Route.ComponentProps) {
     next.set('node', id);
     return `?${next}`;
   };
+  const closeDrawerHref = (() => {
+    const next = new URLSearchParams(searchParams);
+    next.delete('node');
+    return next.size ? `/lineage?${next}` : '/lineage';
+  })();
   const showAllHref = (() => {
     const next = new URLSearchParams(searchParams);
     if (showAll) next.delete('all');
@@ -205,6 +234,8 @@ export default function Lineage({ loaderData }: Route.ComponentProps) {
           </section>
         </>
       )}
+
+      {drawer && <LineageDrawer drawer={drawer} closeHref={closeDrawerHref} />}
     </AppShell>
   );
 }

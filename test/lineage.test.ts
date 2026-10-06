@@ -63,8 +63,9 @@ describe('由已发布映射推导血缘', () => {
     expect(by('order.total_amount')).toEqual({
       entity: 'order', field: 'total_amount', mapping: 'm-order', version: 3, sourceId: 's-shop', table: 'orders',
       expr: 'coalesce(amount, 0) - discount + amount', sourceColumns: ['amount', 'discount'], sensitive: false, dictionary: false, extension: false,
+      fallback: null,
     });
-    expect(by('order.status')).toMatchObject({ dictionary: true, sensitive: false, extension: false });
+    expect(by('order.status')).toMatchObject({ dictionary: true, sensitive: false, extension: false, fallback: { value: null } });
     expect(by('order.x_buyer_phone')).toMatchObject({ sensitive: true, extension: true, sourceColumns: ['phone'] });
     expect(by('customer.phone')).toMatchObject({ sensitive: true, table: 'v_members', sourceColumns: ['mobile'] });
     expect(by('custom_store.x_region')).toMatchObject({ extension: false });

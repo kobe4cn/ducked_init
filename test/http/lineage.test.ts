@@ -4,15 +4,39 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { and, desc, eq } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { tasks } from '../../app/.server/db/schema';
-import { memberOf, newTenant } from '../pipeline/fixtures';
-import { publishedIdentitySources } from '../pipeline/identity-fixtures';
+import { mappings, tasks } from '../../app/.server/db/schema';
+import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
+import { lastMergeByMapping, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { memberOf, newTenant, publish } from '../pipeline/fixtures';
+import { CRM_ORDERS, publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
+
+/**
+ * 把 CRM 订单映射的 status 改成兜底写空并发布第 2 版（不跑合并），再在它最近一次合并的结果里写上兜底统计；
+ * 返回映射 ID 与各标准层表的行数（按实体，取自任务结果）
+ */
+async function fallbackOnCrmOrders(fixture: Awaited<ReturnType<typeof publishedIdentitySources>>) {
+  const { acme, author, reviewer, sources } = fixture;
+  const [{ id }] = await getDb().select({ id: mappings.id }).from(mappings)
+    .where(and(eq(mappings.tenantId, acme), eq(mappings.sourceId, sources.crm), eq(mappings.tableName, 'orders')));
+  await saveDraft(author, id, CRM_ORDERS.replace('refunded: refunded } }', 'refunded: refunded }, otherwise: null }'));
+  await publishMapping(reviewer, id, 2);
+  const { taskId } = (await lastMergeByMapping(acme, [id]))[id];
+  const [task] = await getDb().select().from(tasks).where(eq(tasks.id, taskId));
+  const result = task.result as { mappings: { mapping: string }[] };
+  const fallback = [{ column: 'status', values: [{ value: '已关闭', rows: 3 }, { value: '作废', rows: 1 }], distinct: 2, rows: 4 }];
+  await getDb().update(tasks).set({ result: { ...result, mappings: result.mappings.map(m => (m.mapping === id ? { ...m, fallback } : m)) } })
+    .where(eq(tasks.id, taskId));
+  return id;
+}
+
+/** 抽屉里一个字段的那一行 */
+const fieldRow = (html: string, field: string) => html.match(new RegExp(`<li[^>]*data-field="${field}"[\\s\\S]*?</li>`))![0];
 
 const decode = (html: string) => html.replaceAll('&quot;', '"').replaceAll('&#x27;', "'").replaceAll('&gt;', '>').replaceAll('&lt;', '<').replaceAll('&amp;', '&');
 
@@ -124,6 +148,85 @@ describe('数据地图', () => {
     expect(html).not.toContain('data-flow-mapping');
     expect(html).toContain('data-tab="graph"');
     for (const table of ['customers', 'members', 'users', 'events', 'orders']) expect(html).not.toMatch(new RegExp(`(?<![-\\w])${table}\\b`));
+  });
+
+  it('数据工程师点标准层表节点打开字段抽屉：各映射的源表、源列与表达式，标出敏感哈希、值字典与兜底，兜底的字段附上最近一次合并的兜底统计', async () => {
+    const fixture = await publishedIdentitySources({ orders: true });
+    await fallbackOnCrmOrders(fixture);
+    await memberOf(fixture.acme, 'eng@acme.com', 'data_engineer');
+    const eng = await loginAs(app, 'eng@acme.com');
+
+    // 流向图点标准层表：?node=silver.order，保留 tab=flow
+    const html = decode(await (await eng.get('/lineage?tab=flow&node=silver.order')).text());
+    expect(html).toContain('data-tab="flow"');
+    expect(html).toContain('data-drawer="order"');
+    expect(html).toMatch(/data-drawer-rows="[1-9]\d*"/);
+    expect(html).toContain('href="/lineage?tab=flow"');
+    const status = fieldRow(html, 'status');
+    expect(status).toContain('订单状态');
+    for (const text of ['orders', 'state', '值字典', '兜底：空', '已关闭', '作废']) expect(status).toContain(text);
+    expect(status).toMatch(/4[^<]*行/);
+    expect(status).toMatch(/2[^<]*种/);
+    expect(fieldRow(html, 'customer_id')).toContain('string(customer)');
+    // 值字典只标出有，不输出字典内容
+    expect(status).not.toContain('已支付');
+
+    // 关系图点表节点（?node=order）也打开同一个抽屉；customer 的手机号只存哈希
+    const graph = decode(await (await eng.get('/lineage?node=order')).text());
+    expect(graph).toContain('data-drawer="order"');
+    expect(graph).toContain('data-sql');
+    expect(fieldRow(graph, 'status')).toContain('已关闭');
+    expect(fieldRow(decode(await (await eng.get('/lineage?node=silver.customer')).text()), 'phone')).toContain('敏感哈希');
+
+    // 打通表与不认识的节点不开抽屉
+    for (const node of ['silver._identities', 'silver.product', 'nope']) expect(await (await eng.get(`/lineage?node=${node}`)).text()).not.toContain('data-drawer');
+  });
+
+  it('查看者的字段抽屉只有字段说明与行数：返回的数据与页面都不出现源表名、源列、表达式或兜底取值', async () => {
+    const fixture = await publishedIdentitySources({ orders: true });
+    await fallbackOnCrmOrders(fixture);
+    await memberOf(fixture.acme, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+
+    for (const url of ['/lineage?node=order', '/lineage?tab=flow&node=silver.order']) {
+      const html = decode(await (await viewer.get(url)).text());
+      expect(html).toContain('data-drawer="order"');
+      expect(html).toMatch(/data-drawer-rows="[1-9]\d*"/);
+      expect(fieldRow(html, 'status')).toContain('订单状态');
+      expect(fieldRow(html, 'status')).toContain('订单的当前状态');
+      for (const table of ['customers', 'members', 'users', 'events', 'orders']) expect(html).not.toMatch(new RegExp(`(?<![-\\w])${table}\\b`));
+      for (const banned of ['string(customer)', 'from_timezone', '已关闭', '作废', '兜底', '值字典', 'sourceColumns']) expect(html).not.toContain(banned);
+    }
+  });
+
+  it('自定义实体的表节点也能打开字段抽屉，字段说明取自实体登记', async () => {
+    const { acme, author, reviewer, sources } = await publishedIdentitySources();
+    const entity = await createCustomEntity(author, {
+      name: 'custom_member_card', label: '会员卡', kind: 'dimension', primaryKey: ['card_id'],
+      fields: [{ name: 'card_id', type: 'string', description: '会员卡号', sensitive: false }, { name: 'holder', type: 'string', description: '持卡人姓名', sensitive: false }],
+    });
+    await publishCustomEntity(reviewer, entity, 1);
+    await publish(author, reviewer, sources.loyalty, `model: 1
+entity: custom_member_card
+table: members
+extensions:
+  card_id: { type: string, expr: string(member_id) }
+  holder: { type: string, expr: full_name }
+dedupe: { key: [card_id] }
+`);
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    const html = decode(await (await viewer.get('/lineage?node=custom_member_card')).text());
+    expect(html).toContain('data-drawer="custom_member_card"');
+    expect(html).toContain('会员卡');
+    expect(fieldRow(html, 'card_id')).toContain('会员卡号');
+    expect(fieldRow(html, 'holder')).toContain('持卡人姓名');
+
+    const eng = await loginAs(app, 'de@acme.com');
+    const full = decode(await (await eng.get('/lineage?tab=flow&node=silver.custom_member_card')).text());
+    expect(fieldRow(full, 'holder')).toContain('持卡人姓名');
+    expect(fieldRow(full, 'holder')).toContain('full_name');
+    expect(fieldRow(full, 'holder')).not.toContain('扩展字段');
   });
 
   it('没有已发布映射时显示空状态', async () => {

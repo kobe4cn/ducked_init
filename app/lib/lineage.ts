@@ -28,6 +28,8 @@ export interface FieldLineage {
   dictionary: boolean;
   /** 标准实体上的扩展字段（x_ 开头）；自定义实体的列一律不算 */
   extension: boolean;
+  /** 写了兜底值（otherwise）时是兜底值：对不上的取值写成它，value 为 null 是写成空（ADR-0015）；没写时为 null */
+  fallback: { value: string | null } | null;
 }
 
 /**
@@ -47,7 +49,7 @@ export interface Lineage { tables: TableLineage[]; fields: FieldLineage[]; edges
 const IDENTITIES = 'silver._identities';
 const DEVICE_OWNER = 'silver._device_owner';
 
-const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+export const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 const extensionName = new RegExp(EXTENSION_PATTERN);
 
 function edges(): LineageEdge[] {
@@ -90,6 +92,7 @@ export function deriveLineage(input: { plans: MergeMappingParam[]; sources: { id
       sensitive: !!c.sensitive,
       dictionary: !!c.dictionary,
       extension: canonical && extensionName.test(c.name),
+      fallback: c.otherwise === undefined ? null : { value: c.otherwise },
     }));
   });
   fields.sort((a, b) => cmp(a.entity, b.entity) || cmp(a.field, b.field) || cmp(a.mapping, b.mapping));

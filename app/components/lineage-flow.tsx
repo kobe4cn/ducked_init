@@ -1,8 +1,8 @@
 // app/components/lineage-flow.tsx —— 数据地图的流向图：用 React Flow 画 flowGraph 算好坐标的节点与边，挂载后才渲染（服务端不测量节点）；
 // 源表按数据源分组，点分组切换折叠（数据源超过 5 个时默认全部折叠），折叠后在客户端重新排版；映射节点显示版本与最近一次合并，
-// 失败的标红并链到该映射的合并记录；标准层表节点显示行数与映射数。节点可以拖动（只在本页有效，可重置）
+// 失败的标红并链到该映射的合并记录；标准层表节点显示行数与映射数，点它把 ?node=silver.<实体> 写进 URL 打开字段抽屉。节点可以拖动（只在本页有效，可重置）
 import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router';
+import { Link, useSearchParams } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleDashed, Clock } from 'lucide-react';
 import { Background, Controls, type Edge, MarkerType, type Node, type NodeChange, type NodeProps, Panel, Position, ReactFlow, type XYPosition } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
@@ -88,6 +88,7 @@ function nodeLabel(d: FlowData, tableCount: Record<string, number>): React.React
 
 export function FlowGraphView({ flow }: { flow: FlowInput }) {
   const [mounted, setMounted] = useState(false);
+  const [, setSearchParams] = useSearchParams();
   useEffect(() => setMounted(true), []);
   const sourceIds = useMemo(() => [...new Set(flow.tables.map(t => t.sourceId))], [flow]);
   const [collapsed, setCollapsed] = useState(() => defaultCollapsed(sourceIds));
@@ -164,6 +165,11 @@ export function FlowGraphView({ flow }: { flow: FlowInput }) {
           onNodeClick={(_, node) => {
             const d = graph.nodes.find(n => n.id === node.id)?.data;
             if (d?.kind === 'source' && node.id === groupId(d.sourceId)) toggle(d.sourceId);
+            if (d?.kind === 'silver') setSearchParams(prev => {
+              const next = new URLSearchParams(prev);
+              next.set('node', node.id);
+              return next;
+            }, { preventScrollReset: true });
           }}
         >
           <Background />

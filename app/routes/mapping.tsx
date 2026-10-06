@@ -13,6 +13,7 @@ import { customEntityPages, customEntityRegistrations } from '~/.server/custom-e
 import { discardDraft, draftForMapping, dryRunMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
+import { fallbackText } from '~/lib/fallback';
 import { functionList } from '~/lib/mapping-expr';
 import { isEnumField } from '~/lib/mapping-form';
 import type { ColumnField, PlanDiff } from '~/lib/mapping-diff';
@@ -150,12 +151,9 @@ const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixe
 type LoaderData = Route.ComponentProps['loaderData'];
 type MergeEntry = LoaderData['merge']['history'][number];
 
-/** 一列落入兜底的情况，如「订单状态有 2 种取值（共 312 行）落入兜底：closed（300）、pending_review（12）」；what 换掉「落入兜底」 */
-function fallbackText(entity: string, f: FallbackStat, what = '落入兜底') {
-  const label = entityOf(entity)?.fields.find(x => x.name === f.column)?.label ?? f.column;
-  const values = f.values.map(v => `${v.value}（${v.rows.toLocaleString('zh-CN')}）`).join('、');
-  return `${label}有 ${f.distinct} 种取值（共 ${f.rows.toLocaleString('zh-CN')} 行）${what}：${values}${f.distinct > f.values.length ? ' 等' : ''}`;
-}
+/** 一列落入兜底的情况，字段用实体上的名称（见 fallbackText） */
+const columnFallbackText = (entity: string, f: FallbackStat, what?: string) =>
+  fallbackText(entityOf(entity)?.fields.find(x => x.name === f.column)?.label ?? f.column, f, what);
 
 /** 把落入兜底的取值加进值对照：打开编辑标签页的表单，定位到该字段（只用于标准枚举字段） */
 const addToDictionaryHref = (base: string, f: FallbackStat) =>
@@ -181,7 +179,7 @@ function MergeRow({ e, base, canWrite }: { e: MergeEntry; base: string; canWrite
         {`${e.rows.toLocaleString('zh-CN')} 行（新增 ${e.inserted}，更新 ${e.updated}，删除 ${e.deleted}）`}
         {e.fallback?.map(f => (
           <div key={f.column} className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground" data-merge-fallback={f.column}>
-            {fallbackText(e.entity, f)}
+            {columnFallbackText(e.entity, f)}
             {canWrite && isEnumField(entityOf(e.entity)?.fields.find(x => x.name === f.column)) && (
               <Button asChild size="xs" variant="outline"><Link to={addToDictionaryHref(base, f)} data-add-to-dictionary={f.column}>加进值对照</Link></Button>
             )}
@@ -224,7 +222,7 @@ function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult 
         ))}
         {a.unknownValues.map(u => (
           <Assertion key={u.column} name={`unknown-${u.column}`} ok={false} severe={!u.fallback}>
-            {u.fallback ? fallbackText(entity, u) : `${fallbackText(entity, u, '不在值字典里')}，没写兜底值，合并会失败`}
+            {u.fallback ? columnFallbackText(entity, u) : `${columnFallbackText(entity, u, '不在值字典里')}，没写兜底值，合并会失败`}
           </Assertion>
         ))}
       </ul>
