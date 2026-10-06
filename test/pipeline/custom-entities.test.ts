@@ -1,6 +1,6 @@
 // 自定义实体登记的接缝（ADR-0019）：createCustomEntity / saveCustomEntityDraft 校验名称、字段与主键后保存草稿；
 // 双人发布与丢弃同源视图；publishedCustomEntities 给出每个实体最新的已发布版本。发布过的实体只能新增字段；
-// deleteCustomEntity 删除没被已发布映射引用的实体；inferCustomEntityDrafts 为已发布映射在用、但没登记的实体推断登记草稿
+// deleteCustomEntity 删除没被已发布映射引用的实体；draftFor 按已发布登记生成自定义实体的映射草稿；inferCustomEntityDrafts 为已发布映射在用、但没登记的实体推断登记草稿
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import {
@@ -9,7 +9,7 @@ import {
 } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { customEntities } from '../../app/.server/db/schema';
-import { createMapping, saveDraft } from '../../app/.server/mappings';
+import { createMapping, draftFor, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
@@ -237,6 +237,35 @@ dedupe: { key: [store_id] }
     await expect(saveDraft(author, mappingId, yaml.replace('dedupe', '  city: { type: string, expr: city }\ndedupe'))).rejects.toMatchObject({
       issues: [expect.objectContaining({ line: 7, path: 'extensions.city', message: expect.stringContaining('没有登记字段 city') })],
     });
+  });
+
+  it('登记发布后按规则生成的草稿直接能保存；没登记、只有草稿或源表没有主键对应的列时报错', async () => {
+    const { author, reviewer } = await engineers();
+    const { id: sourceId } = await registerSource(author, await pgSourceInput(READER));
+    await selectAllTables(author, sourceId);
+    await drain();
+    const MEMBER: CustomEntityInput = {
+      name: 'custom_member', label: '会员', kind: 'dimension', primaryKey: ['customer_id'],
+      fields: [
+        { name: 'customer_id', type: 'string', description: '', sensitive: false },
+        { name: 'phone', type: 'string', description: '', sensitive: true },
+        { name: 'created_at', type: 'date', description: '', sensitive: false },
+      ],
+    };
+    const draft = () => draftFor(author, sourceId, 'customers', 'custom_member');
+    const unregistered = '只能为标准实体或已发布登记的自定义实体生成草稿，custom_member 都不是';
+    await expect(draft()).rejects.toThrow(unregistered);
+    const id = await createCustomEntity(author, MEMBER);
+    await expect(draft()).rejects.toThrow(unregistered);
+
+    await publishCustomEntity(reviewer, id, 1);
+    const yaml = await draft();
+    expect(yaml).toContain('created_at → 源列 created_at');
+    await expect(createMapping(author, sourceId, yaml)).resolves.toBeTruthy();
+
+    const other = await createCustomEntity(author, { ...MEMBER, name: 'custom_shop', primaryKey: ['shop_id'], fields: [...MEMBER.fields, { name: 'shop_id', type: 'string', description: '', sensitive: false }] });
+    await publishCustomEntity(reviewer, other, 1);
+    await expect(draftFor(author, sourceId, 'customers', 'custom_shop')).rejects.toThrow('源表没有与主键字段 shop_id 对应的列');
   });
 });
 

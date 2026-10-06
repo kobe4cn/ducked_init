@@ -14,7 +14,7 @@ import { dryRun } from './pipeline/dry-run-engine';
 import { identityRules } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import type { MergeMappingParam, MergeRecord } from './pipeline/merge-engine';
-import { draftMapping } from './pipeline/mapping-draft';
+import { draftCustomMapping, draftMapping, DraftError } from './pipeline/mapping-draft';
 import { checkMapping, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { tenantPiiSalt } from './secrets';
@@ -122,18 +122,25 @@ export async function referenceTables(actor: CurrentMember, sourceId: string): P
 }
 
 /**
- * 按规则生成映射草稿（ADR-0017）：对照源表最近一次采集的列统计与目标实体，返回 YAML 文本。不调用模型、不保存、不记审计，
+ * 按规则生成映射草稿（ADR-0017）：对照源表最近一次采集的列统计与目标实体（标准实体，或已发布登记的自定义实体），返回 YAML 文本。不调用模型、不保存、不记审计，
  * 成员确认修改后仍走保存校验与双人发布
  */
 export async function draftFor(actor: CurrentMember, sourceId: string, table: string, entity: string) {
   assertCan(actor, 'sources:write');
   await requireSource(actor.tenant.id, sourceId).catch(() => { throw new MappingError('请选择数据源'); });
   if (!table) throw new MappingError('请选择表');
-  const target = entityOf(entity);
-  if (!target) throw new MappingError(`只能为标准实体生成草稿，${entity} 不是标准实体`);
   const profiled = (await profiledTables(actor.tenant.id, sourceId))(table);
   if (typeof profiled === 'string') throw new MappingError(profiled);
-  return draftMapping(profiled.table, target, { key: profiled.key ?? undefined });
+  const target = entityOf(entity);
+  if (target) return draftMapping(profiled.table, target, { key: profiled.key ?? undefined });
+  // 自定义实体只认已发布的登记，与保存校验一致（ADR-0019）
+  const registration = (await publishedCustomEntities(getDb(), actor.tenant.id)).get(entity);
+  if (!registration) throw new MappingError(`只能为标准实体或已发布登记的自定义实体生成草稿，${entity} 都不是`);
+  try {
+    return draftCustomMapping(profiled.table, registration);
+  } catch (e) {
+    throw e instanceof DraftError ? new MappingError(e.message) : e;
+  }
 }
 
 /**

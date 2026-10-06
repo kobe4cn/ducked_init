@@ -1,10 +1,10 @@
 // 按规则生成映射草稿（纯函数）：源表的列统计 + 目标实体 → 映射 YAML。列名规范化与同义词匹配、格式特征校验、分 / 毫秒 / 无时区时间的转换、
-// 值字典骨架、没有主键的表、按表名猜目标实体；生成的草稿交给 checkMapping 校验。八张表贴合开发库 crm_source（db_script/mysql_seed.sql）的列统计
+// 值字典骨架、没有主键的表、按表名猜目标实体、对照已发布登记的自定义实体；生成的草稿交给 checkMapping 校验。八张表贴合开发库 crm_source（db_script/mysql_seed.sql）的列统计
 import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
 import { entityForTable, fieldsForColumn, normalizeName, standardValue } from '../app/lib/field-synonyms';
-import { draftMapping } from '../app/.server/pipeline/mapping-draft';
+import { draftCustomMapping, draftMapping, fieldNameFor } from '../app/.server/pipeline/mapping-draft';
 import { checkMapping } from '../app/.server/pipeline/mapping-spec';
 import type { ColumnProfile, TableProfile } from '../app/.server/pipeline/source-engine';
 
@@ -368,5 +368,67 @@ describe('按表名猜目标实体', () => {
     expect(entityForTable('tb_coupons')?.name).toBe('coupon');
     expect(entityForTable('t_points_transactions')?.name).toBe('points_transaction');
     expect(entityForTable('regions')).toBeUndefined();
+  });
+});
+
+describe('自定义实体', () => {
+  const STORE = {
+    name: 'custom_store', label: '门店', kind: 'dimension' as const, primaryKey: ['store_id'],
+    fields: [
+      { name: 'store_id', type: 'string' as const, description: '', sensitive: false },
+      { name: 'manager_phone', type: 'string' as const, description: '', sensitive: true },
+      { name: 'opened_on', type: 'date' as const, description: '', sensitive: false },
+      { name: 'staff', type: 'integer' as const, description: '', sensitive: false },
+      { name: 'region', type: 'string' as const, description: '', sensitive: false },
+    ],
+  };
+  const STORES = table('stores', [
+    column('Store_ID', 'BIGINT'),
+    column('Manager Phone', 'VARCHAR', { formats: [{ format: 'mobile', share: 1 }] }),
+    column('opened_on', 'TIMESTAMP'),
+    column('staff', 'VARCHAR'),
+    column('备注', 'VARCHAR'),
+  ]);
+
+  it('列名规范化：小写、非字母数字下划线换成 _，做不成字段名时为 null', () => {
+    expect(fieldNameFor('Store_ID')).toBe('store_id');
+    expect(fieldNameFor('Manager Phone')).toBe('manager_phone');
+    expect(fieldNameFor('--a--b--')).toBe('a_b');
+    expect(fieldNameFor('备注')).toBeNull();
+    expect(fieldNameFor('1st')).toBeNull();
+  });
+
+  it('规范化后同名的列对应到登记字段，类型按登记；登记是 string 时转成文本，其他对不上的跳过并注明；去重键是登记的主键', () => {
+    const yaml = draftCustomMapping(STORES, STORE);
+    const doc = parse(yaml);
+    expect(doc).toEqual({
+      model: 1, entity: 'custom_store', table: 'stores',
+      extensions: {
+        store_id: { type: 'string', expr: 'string(Store_ID)' },
+        manager_phone: { type: 'string', expr: '"Manager Phone"' },
+      },
+      dedupe: { key: ['store_id'] },
+    });
+    expect(yaml).toContain('opened_on → 源列 opened_on（TIMESTAMP）/ 登记 date');
+    expect(yaml).toContain('staff → 源列 staff（VARCHAR）/ 登记 integer');
+    expect(checkMapping(yaml, () => STORES.columns, name => (name === STORE.name ? STORE : undefined)).ok).toBe(true);
+  });
+
+  it('类型一致的列直接用，不带时区的时间按时区解读', () => {
+    const t = table('stores', [column('store_id', 'VARCHAR'), column('opened_on', 'DATE'), column('staff', 'INTEGER')]);
+    expect(parse(draftCustomMapping(t, STORE)).extensions).toEqual({
+      store_id: { type: 'string', expr: 'store_id' },
+      opened_on: { type: 'date', expr: 'opened_on' },
+      staff: { type: 'integer', expr: 'staff' },
+    });
+    const at = { ...STORE, fields: [...STORE.fields, { name: 'closed_at', type: 'timestamp' as const, description: '', sensitive: false }] };
+    const yaml = draftCustomMapping(table('stores', [column('store_id', 'VARCHAR'), column('closed_at', 'TIMESTAMP')]), at, { timezone: 'UTC' });
+    expect(parse(yaml).extensions.closed_at).toEqual({ type: 'timestamp', expr: "from_timezone(closed_at, 'UTC')" });
+  });
+
+  it('源表没有与主键字段对应的列、或对应列类型对不上时报错', () => {
+    expect(() => draftCustomMapping(table('stores', [column('region', 'VARCHAR')]), STORE)).toThrow('源表没有与主键字段 store_id 对应的列');
+    expect(() => draftCustomMapping(table('stores', [column('store_id', 'DATE')]), { ...STORE, fields: [{ ...STORE.fields[3], name: 'store_id' }] }))
+      .toThrow('主键字段的类型对不上：store_id → 源列 store_id（DATE）/ 登记 integer');
   });
 });

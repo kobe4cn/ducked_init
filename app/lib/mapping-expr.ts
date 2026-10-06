@@ -43,9 +43,20 @@ export const KIND_FIELD_TYPES: Record<Kind, FieldType> = {
 export function extensionSpec(
   column: { name: string; type: string; formats?: readonly { format: string }[] }, tz = 'Asia/Shanghai',
 ): { type: FieldType; expr: string; sensitive?: true } {
+  if (looksSensitive(column)) return { type: 'string', expr: textExpr(column), sensitive: true };
+  return extensionExpr(column, tz);
+}
+
+/** 源列转为文本的表达式：本来就是文本时直接引用 */
+export function textExpr(column: { name: string; type: string }) {
+  const col = ref(column.name);
+  return kindOf(column.type) === 'text' ? col : `string(${col})`;
+}
+
+/** 源列按大类推断的字段类型与表达式（不看是否敏感）：不带时区的时间按 tz 解读，认不出的类型转为文本 */
+export function extensionExpr(column: { name: string; type: string }, tz = 'Asia/Shanghai'): { type: FieldType; expr: string } {
   const kind = kindOf(column.type);
   const col = ref(column.name);
-  if (looksSensitive(column)) return { type: 'string', expr: kind === 'text' ? col : `string(${col})`, sensitive: true };
   return { type: KIND_FIELD_TYPES[kind], expr: kind === 'timestamp' ? `from_timezone(${col}, ${lit(tz)})` : kind === 'other' ? `string(${col})` : col };
 }
 

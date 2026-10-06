@@ -1,10 +1,12 @@
 // app/.server/pipeline/mapping-draft.ts —— 按规则生成映射草稿：源表的列统计 + 目标实体 → 映射 YAML，不调用模型、不从历史映射里学（ADR-0017）。
 // 列名规范化后按同名与同义词对应到标准字段，再用类型与格式特征校验；按需加上分转元、毫秒时间戳、时区解读等转换，枚举字段按常见取值生成值字典骨架。
-// 每条对应的依据写在行尾注释里，没对应上的标准字段与没用到的源列列在文末。生成的只是草稿，仍要保存校验、双人发布（ADR-0015）
+// 每条对应的依据写在行尾注释里，没对应上的标准字段与没用到的源列列在文末。生成的只是草稿，仍要保存校验、双人发布（ADR-0015）。
+// 自定义实体（ADR-0019）对照已发布的登记：列名规范化后与登记字段同名的对应上，类型按登记，去重键是登记的主键
 import { Document, Scalar, YAMLMap } from 'yaml';
-import { MODEL_MAJOR, type CanonicalEntity, type CanonicalField } from '../../lib/canonical-model';
+import { CUSTOM_FIELD_PATTERN, MODEL_MAJOR, type CanonicalEntity, type CanonicalField } from '../../lib/canonical-model';
 import { CENTS_SUFFIX, extensionName, fieldsForColumn, normalizeName, standardValue } from '../../lib/field-synonyms';
-import { extensionSpec, kindOf, ref } from '../../lib/mapping-expr';
+import { extensionExpr, extensionSpec, kindOf, ref, textExpr } from '../../lib/mapping-expr';
+import type { RegisteredEntity } from '../custom-entities';
 import type { ColumnProfile, TableProfile, TextFormat } from './source-engine';
 
 export interface DraftOptions {
@@ -209,4 +211,62 @@ export function draftMapping(table: TableProfile, entity: CanonicalEntity, opts:
   }
   if (tail.length) doc.comment = tail.map(l => ` ${l}`).join('\n');
   return doc.toString({ nullStr: '', lineWidth: 0 });
+}
+
+/** 生成不了草稿（如源表没有与主键字段对应的列） */
+export class DraftError extends Error {}
+
+/** 列名做成字段名：小写，连续的非小写字母、数字、下划线换成 _，去掉首尾的 _；仍不合字段名规则（如以数字开头、全是中文）时为 null */
+export function fieldNameFor(column: string): string | null {
+  const name = column.toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+  return new RegExp(CUSTOM_FIELD_PATTERN).test(name) ? name : null;
+}
+
+/**
+ * 按已发布登记为自定义实体生成映射草稿（YAML 文本）：按登记字段的顺序找列名规范化后同名的源列（每列只用一次），
+ * 类型与登记一致时照源列换算，登记是 string 时转成文本，其他对不上的不映射并在顶部注释里列出。
+ * 不写 sensitive（继承登记），去重键是登记的主键；主键字段没有对应的列时抛 DraftError
+ */
+export function draftCustomMapping(table: TableProfile, reg: RegisteredEntity, opts: Pick<DraftOptions, 'timezone'> = {}): string {
+  const tz = opts.timezone ?? 'Asia/Shanghai';
+  const used = new Set<string>();
+  const extensions = new YAMLMap();
+  const mismatched: string[] = [];
+  const unmatched: string[] = [];
+  for (const field of reg.fields) {
+    const column = table.columns.find(c => !used.has(c.name) && fieldNameFor(c.name) === field.name);
+    if (!column) {
+      unmatched.push(field.name);
+      continue;
+    }
+    used.add(column.name);
+    const inferred = extensionExpr(column, tz);
+    let expr: string;
+    if (inferred.type === field.type) expr = inferred.expr;
+    else if (field.type === 'string') expr = textExpr(column);
+    else {
+      mismatched.push(`${field.name} → 源列 ${column.name}（${column.type}）/ 登记 ${field.type}`);
+      continue;
+    }
+    const spec = new YAMLMap();
+    spec.flow = true;
+    spec.set('type', field.type);
+    spec.set('expr', expr);
+    extensions.set(field.name, spec);
+  }
+  const missingKey = reg.primaryKey.find(k => !extensions.has(k));
+  if (missingKey) {
+    const mismatch = mismatched.find(l => l.startsWith(`${missingKey} → `));
+    throw new DraftError(mismatch ? `主键字段的类型对不上：${mismatch}` : `源表没有与主键字段 ${missingKey} 对应的列`);
+  }
+
+  const doc = new Document({ model: MODEL_MAJOR, entity: reg.name, table: table.name, extensions });
+  const dedupeKey = doc.createNode(reg.primaryKey);
+  dedupeKey.flow = true;
+  (doc.contents as YAMLMap).set('dedupe', doc.createNode({ key: dedupeKey }));
+  const head = [` 按规则生成的草稿：源表 ${table.name} → ${reg.label}（${reg.name}），字段与类型按已发布的登记。请逐项确认后保存`];
+  if (mismatched.length) head.push(' 类型对不上、没有映射的字段（字段 → 源列类型 / 登记类型）：', ...mismatched.map(l => `   ${l}`));
+  if (unmatched.length) head.push(` 源表里没有同名列的登记字段：${unmatched.join('、')}`);
+  doc.commentBefore = head.join('\n');
+  return doc.toString({ lineWidth: 0, singleQuote: true });
 }
