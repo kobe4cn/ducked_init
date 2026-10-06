@@ -1,7 +1,7 @@
 // app/lib/canonical-model.ts —— 平台内置的标准模型（Canonical Model）：一组标准实体及其字段，所有指标与标签只基于它定义。
 // 同一大版本内只做新增（新增实体、字段、标准枚举取值），不改名、不改语义、不改类型、不改已有实体的主键；每次新增小版本加一（ADR-0018）。
 // 映射里的 model 写的是大版本号。前后端共用（标准模型页要展示实体与字段说明）
-export const MODEL_VERSION = '1.4';
+export const MODEL_VERSION = '1.5';
 export const MODEL_MAJOR = 1;
 
 /** 字段类型：标准层里的列类型由它决定（时间一律是带时区的时间，按 UTC 存放；金额是两位小数的元） */
@@ -25,6 +25,8 @@ export interface CanonicalField {
   enum?: readonly string[];
   /** 敏感信息：标准层及之后只存按租户加盐的哈希（ADR-0005） */
   pii?: true;
+  /** 关联：这个字段指向另一个标准实体的哪个字段（指向 customer 的在标准层经 silver._identities 关联，ADR-0019） */
+  ref?: { entity: string; field: string };
 }
 
 export interface CanonicalEntity {
@@ -68,7 +70,7 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
     key: ['order_id'],
     fields: [
       f('order_id', 'string', '订单 ID', '源端的订单号'),
-      f('customer_id', 'string', '消费者 ID', '下单的消费者，对应消费者的 customer_id'),
+      f('customer_id', 'string', '消费者 ID', '下单的消费者，对应消费者的 customer_id', { ref: { entity: 'customer', field: 'customer_id' } }),
       f('status', 'string', '订单状态', '订单的当前状态', { enum: ['created', 'paid', 'shipped', 'completed', 'cancelled', 'refunded'] }),
       f('amount', 'decimal', '实付金额', '消费者实际支付的金额（元）'),
       f('created_at', 'timestamp', '下单时间', '订单创建的时间'),
@@ -85,8 +87,8 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
     key: ['order_item_id'],
     fields: [
       f('order_item_id', 'string', '明细 ID', '源端的订单明细标识'),
-      f('order_id', 'string', '订单 ID', '所属订单，对应订单的 order_id'),
-      f('product_id', 'string', '商品 ID', '购买的商品，对应商品的 product_id'),
+      f('order_id', 'string', '订单 ID', '所属订单，对应订单的 order_id', { ref: { entity: 'order', field: 'order_id' } }),
+      f('product_id', 'string', '商品 ID', '购买的商品，对应商品的 product_id', { ref: { entity: 'product', field: 'product_id' } }),
       f('quantity', 'integer', '数量', '购买件数'),
       f('unit_price', 'decimal', '单价', '成交单价（元）'),
       f('amount', 'decimal', '金额', '这一行的实付金额（元）'),
@@ -112,7 +114,7 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
     key: ['event_id'],
     fields: [
       f('event_id', 'string', '事件 ID', '事件的唯一标识；源端没有时可用字段拼出'),
-      f('customer_id', 'string', '消费者 ID', '已登录时的消费者，匿名时为空'),
+      f('customer_id', 'string', '消费者 ID', '已登录时的消费者，匿名时为空', { ref: { entity: 'customer', field: 'customer_id' } }),
       f('device_id', 'string', '设备 ID', '匿名访问时的设备标识'),
       f('event_type', 'string', '事件类型', '如 view、add_to_cart、login'),
       f('occurred_at', 'timestamp', '发生时间', '事件发生的时间'),
@@ -126,7 +128,7 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
     key: ['touch_id'],
     fields: [
       f('touch_id', 'string', '触达 ID', '源端的触达记录标识'),
-      f('customer_id', 'string', '消费者 ID', '被触达的消费者'),
+      f('customer_id', 'string', '消费者 ID', '被触达的消费者', { ref: { entity: 'customer', field: 'customer_id' } }),
       f('campaign_id', 'string', '活动 ID', '所属营销活动'),
       f('channel', 'string', '触达渠道', '触达使用的渠道', { enum: CHANNELS }),
       f('status', 'string', '触达结果', '触达的最终结果', { enum: ['sent', 'delivered', 'opened', 'clicked', 'failed'] }),
@@ -140,7 +142,7 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
     key: ['membership_id'],
     fields: [
       f('membership_id', 'string', '会员号', '源端的会员卡号或会员标识'),
-      f('customer_id', 'string', '消费者 ID', '持有会员身份的消费者'),
+      f('customer_id', 'string', '消费者 ID', '持有会员身份的消费者', { ref: { entity: 'customer', field: 'customer_id' } }),
       f('level', 'string', '会员等级', '会员等级名称（如 gold、silver）'),
       f('points', 'integer', '积分', '当前积分余额'),
       f('status', 'string', '会员状态', '会员身份的当前状态', { enum: ['active', 'frozen', 'expired', 'cancelled'] }),
@@ -155,12 +157,12 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
     key: ['points_transaction_id'],
     fields: [
       f('points_transaction_id', 'string', '流水 ID', '源端的积分流水标识；源端没有时可用字段拼出'),
-      f('customer_id', 'string', '消费者 ID', '积分所属的消费者，对应消费者的 customer_id'),
-      f('membership_id', 'string', '会员号', '积分所属的会员，对应会员的 membership_id'),
+      f('customer_id', 'string', '消费者 ID', '积分所属的消费者，对应消费者的 customer_id', { ref: { entity: 'customer', field: 'customer_id' } }),
+      f('membership_id', 'string', '会员号', '积分所属的会员，对应会员的 membership_id', { ref: { entity: 'membership', field: 'membership_id' } }),
       f('change_type', 'string', '变动类型', '获得、消费抵扣、兑换礼品或权益、过期、人工调整（含退款冲回）', { enum: ['earn', 'spend', 'redeem', 'expire', 'adjust'] }),
       f('points_change', 'integer', '变动积分', '带正负：增加为正，减少为负'),
       f('balance_after', 'integer', '变动后余额', '这笔变动之后的积分余额，源端没有为空'),
-      f('order_id', 'string', '关联订单', '产生或使用这笔积分的订单，对应订单的 order_id'),
+      f('order_id', 'string', '关联订单', '产生或使用这笔积分的订单，对应订单的 order_id', { ref: { entity: 'order', field: 'order_id' } }),
       f('occurred_at', 'timestamp', '发生时间', '积分变动的时间'),
       f('expires_at', 'timestamp', '到期时间', '这笔获得的积分的到期时间，不过期或不是获得为空'),
     ],
@@ -171,7 +173,7 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
     description: '消费者在某个渠道上是否同意接收营销信息的当前状态（隐私协议、用户协议的签署不在这里）。源端是变更日志时按更新时间取最新。',
     key: ['customer_id', 'channel'],
     fields: [
-      f('customer_id', 'string', '消费者 ID', '对应消费者的 customer_id'),
+      f('customer_id', 'string', '消费者 ID', '对应消费者的 customer_id', { ref: { entity: 'customer', field: 'customer_id' } }),
       f('channel', 'string', '渠道', '同意接收营销信息的渠道，与营销触达的渠道是同一套', { enum: CHANNELS }),
       f('status', 'string', '同意状态', '同意，或撤回、拒绝', { enum: ['granted', 'revoked'] }),
       f('granted_at', 'timestamp', '同意时间', '最近一次同意的时间'),
@@ -185,7 +187,7 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
     description: '消费者的一条偏好（键值），同一类型下可以有多个值。只放源端记录的偏好，平台按行为推断的偏好是标签。',
     key: ['customer_id', 'preference_type', 'preference_value'],
     fields: [
-      f('customer_id', 'string', '消费者 ID', '对应消费者的 customer_id'),
+      f('customer_id', 'string', '消费者 ID', '对应消费者的 customer_id', { ref: { entity: 'customer', field: 'customer_id' } }),
       f('preference_type', 'string', '偏好类型', '如 category（品类）、brand（品牌）、flavor（口味）、size（尺码）'),
       f('preference_value', 'string', '偏好值', '偏好的取值（如某个品类名、品牌名）'),
       f('updated_at', 'timestamp', '更新时间', '源端最后一次修改这条记录的时间'),
@@ -198,13 +200,13 @@ export const CANONICAL_ENTITIES: readonly CanonicalEntity[] = [
     key: ['coupon_id'],
     fields: [
       f('coupon_id', 'string', '券 ID', '源端的券实例标识或券码'),
-      f('coupon_template_id', 'string', '券模板 ID', '这张券的模板，对应券模板的 coupon_template_id'),
+      f('coupon_template_id', 'string', '券模板 ID', '这张券的模板，对应券模板的 coupon_template_id', { ref: { entity: 'coupon_template', field: 'coupon_template_id' } }),
       f('campaign_id', 'string', '活动 ID', '发券的营销活动，与营销触达的 campaign_id 同义'),
-      f('customer_id', 'string', '消费者 ID', '领到这张券的消费者'),
+      f('customer_id', 'string', '消费者 ID', '领到这张券的消费者', { ref: { entity: 'customer', field: 'customer_id' } }),
       f('status', 'string', '券状态', '已发放（未使用）、已核销、已过期、已作废', { enum: ['issued', 'redeemed', 'expired', 'voided'] }),
       f('issued_at', 'timestamp', '发放时间', '券发到消费者手里的时间'),
       f('redeemed_at', 'timestamp', '核销时间', '券被使用的时间，未核销为空'),
-      f('order_id', 'string', '核销订单', '使用这张券的订单，对应订单的 order_id'),
+      f('order_id', 'string', '核销订单', '使用这张券的订单，对应订单的 order_id', { ref: { entity: 'order', field: 'order_id' } }),
       f('discount_amount', 'decimal', '抵扣金额', '核销时实际抵扣的金额（元），未核销为空'),
       f('expires_at', 'timestamp', '到期时间', '这张券的到期时间'),
       f('updated_at', 'timestamp', '更新时间', '源端最后一次修改这条记录的时间'),

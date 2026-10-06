@@ -64,6 +64,7 @@ export default function Model({ loaderData }: Route.ComponentProps) {
                   <TableCell className="whitespace-normal text-slate-500">
                     {f.description}
                     {f.enum && <div className="font-mono text-xs">{`标准枚举：${f.enum.join('、')}`}</div>}
+                    {f.ref && <div className="font-mono text-xs" data-ref={`${f.ref.entity}.${f.ref.field}`}>{`→ ${f.ref.entity}.${f.ref.field}`}</div>}
                   </TableCell>
                 </TableRow>
               ))}

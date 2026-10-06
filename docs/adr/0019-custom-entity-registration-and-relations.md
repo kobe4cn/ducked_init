@@ -43,3 +43,9 @@
 - 关系声明在映射级：同一条维度路径在不同行上含义不同，指标面对的是整个实体。否决。
 - 允许指标直接读原始层：破坏 ADR-0005、0006 与 0015。否决。
 - 结构继续从映射推断，不单独登记：主键、关系、敏感标记没有地方声明。否决。
+
+## 补充（#80）
+
+- 标准实体之间的关系改成字段上的结构化 `ref`（如 `order_item.order_id → order.order_id`），标准模型升到 1.5；没有对应标准实体的字段（`order.store_id`、`campaign_id`）不写 `ref`。
+- 指向 `customer` 的关系在标准层经 `silver._identities` 按 (`_source`, `customer_id`) 关联，不直接按 `customer_id` 相等；`event.device_id` 经 `silver._device_owner` 归到消费者。
+- 数据地图的血缘（表级、字段级与关系边）由已发布映射与标准模型推导（`app/lib/lineage.ts`），不落库；只看表达式与列名，不读数据值。
