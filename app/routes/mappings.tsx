@@ -7,7 +7,7 @@ import { isMap, isScalar, parseDocument } from 'yaml';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mappings';
 import { can, requirePermission } from '~/.server/access';
-import { customEntityRegistrations, pendingRegistrations } from '~/.server/custom-entities';
+import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { createMapping, defaultDraft, draftFor, listMappings, MappingError, mergeNow, referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
@@ -32,7 +32,7 @@ export function meta({}: Route.MetaArgs) {
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   const { mappings, merge } = await listMappings(member);
-  const unregistered = await pendingRegistrations(member, mappings.map(m => m.entity));
+  const customPages = await customEntityPages(member, mappings.map(m => m.entity));
   const sources = (await listSources(member)).map(s => ({ id: s.id, name: s.name }));
   const canWrite = can(member.role, 'sources:write');
   return {
@@ -58,12 +58,12 @@ export async function loader({ request }: Route.LoaderArgs) {
       sourceName: m.sourceName,
       table: m.tableName,
       entity: m.entity,
-      entityLabel: entityLabel(m.entity),
+      entityLabel: customPages[m.entity]?.label ?? entityLabel(m.entity),
       published: m.published,
       draft: m.draft,
       lastMerge: m.lastMerge,
       /** 目标是还没有已发布登记的自定义实体时，去补登的实体页（推断不出登记时是实体列表）；否则为 null */
-      pendingEntity: unregistered[m.entity] ?? null,
+      pendingEntity: customPages[m.entity]?.pending ? customPages[m.entity].href : null,
     })),
   };
 }

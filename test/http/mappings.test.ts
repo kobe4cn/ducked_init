@@ -97,6 +97,9 @@ describe('编写与发布映射', () => {
     const detail = await (await engineer.get(`/mappings/${id}`)).text();
     expect(await (await engineer.get(`/mappings/${id}?tab=versions`)).text()).toContain('data-version-status="draft"');
     expect(detail).toContain('你最后改了这一版草稿，需由另一位数据工程师或管理员发布');
+    // 标准实体的卡片链接到标准模型
+    expect(detail).toContain('text-slate-500">标准实体<');
+    expect(detail).toMatch(/href="\/model"[^>]*><span class="grid size-11[^"]*bg-violet-100/);
     expect((await engineer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(403);
     // 只有草稿时不能合并
     expect(detail).not.toContain('name="intent" value="merge"');

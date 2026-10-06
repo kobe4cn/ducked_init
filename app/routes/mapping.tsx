@@ -9,7 +9,7 @@ import { AlertTriangle, ArrowRight, Boxes, CheckCircle2, FileDiff, FlaskConical,
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
-import { customEntityRegistrations, pendingRegistrations } from '~/.server/custom-entities';
+import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { discardDraft, draftForMapping, dryRunMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
@@ -19,7 +19,7 @@ import type { ColumnField, PlanDiff } from '~/lib/mapping-diff';
 import type { DryRunResult } from '~/.server/pipeline/dry-run-engine';
 import type { FallbackStat } from '~/.server/pipeline/merge-engine';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
-import { entityLabel, entityOf } from '~/lib/canonical-model';
+import { entityLabel, entityOf, isCustomEntity } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { KindIcon } from '~/components/kind-icon';
@@ -57,7 +57,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     const m = await getMapping(member, params.mappingId);
     const canWrite = can(member.role, 'sources:write');
     const url = new URL(request.url);
-    const unregistered = await pendingRegistrations(member, [m.entity]);
+    const customPage = (await customEntityPages(member, [m.entity]))[m.entity];
     return {
       email: member.email,
       nav: navFor(member),
@@ -73,13 +73,15 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         source: m.source,
         table: m.tableName,
         entity: m.entity,
-        entityLabel: entityLabel(m.entity),
+        entityLabel: customPage?.label ?? entityLabel(m.entity),
+        /** 实体卡片的去处：自定义实体是它的实体页（推断不出登记时是实体列表），标准实体是标准模型页 */
+        entityPage: customPage?.href ?? '/model',
         /** 编辑草稿时对照的源表（还没采集、不在同步范围时为 null；不能编辑时不给） */
         reference: canWrite ? ((await referenceTables(member, m.source.id)).find(t => t.name === m.tableName && !!t.view === !!m.sourceViewId) ?? null) : null,
         /** 映射的实体是已发布登记的自定义实体时，编辑草稿对照的登记（只给这一条；不能编辑时不给） */
         registered: canWrite ? registrationOf(await customEntityRegistrations(member), m.entity) : {},
         /** 实体是还没有已发布登记的自定义实体时，去补登的实体页（推断不出登记时是实体列表）；否则为 null */
-        pendingEntity: unregistered[m.entity] ?? null,
+        pendingEntity: customPage?.pending ? customPage.href : null,
       },
       versions: m.versions.map(v => ({
         ...v,
@@ -343,10 +345,10 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
           </span>
         </Link>
         <div className="hidden place-items-center text-slate-300 lg:grid"><ArrowRight className="size-6" /></div>
-        <Link to="/model" className="flex items-center gap-3 rounded-2xl border bg-white p-5 shadow-sm transition hover:shadow-md">
+        <Link to={mapping.entityPage} className="flex items-center gap-3 rounded-2xl border bg-white p-5 shadow-sm transition hover:shadow-md">
           <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-violet-100 text-violet-700"><Boxes className="size-5" /></span>
           <span className="min-w-0">
-            <span className="block text-xs text-slate-500">标准实体</span>
+            <span className="block text-xs text-slate-500">{isCustomEntity(mapping.entity) ? '自定义实体' : '标准实体'}</span>
             <span className="block truncate font-medium">{`${mapping.entityLabel}（${mapping.entity}）`}</span>
           </span>
         </Link>

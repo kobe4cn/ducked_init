@@ -1,7 +1,7 @@
 // test/http/custom-entities.test.ts —— 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），最后保存的人发布不了，
 // 另一位成员在详情页发布；再改是新的一版草稿。分析师只读，查看者 403，其他租户 404；导航「映射」后面是「自定义实体」。
 // 有发布权限的成员删除实体后回到列表。已发布映射在用、但没登记的实体在列表与详情页标为待确认的推断登记，确认保存、另一位成员发布后提示消失；
-// 登记发布前映射列表与详情页提示实体待补登
+// 登记发布前映射列表与详情页提示实体待补登；映射详情页的实体卡片链接到实体页，映射页用登记的中文名
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -29,6 +29,9 @@ const STORE = {
   fieldSensitive: ['1'],
   primaryKey: 'store_id',
 };
+
+/** 映射详情页实体卡片的链接 */
+const ENTITY_CARD = /href="([^"]+)"[^>]*><span class="grid size-11[^"]*bg-violet-100/;
 
 const locationOf = (res: Response) => res.headers.get('location') ?? '';
 
@@ -208,5 +211,22 @@ describe('推断登记', () => {
     expect((await admin.post(page, { intent: 'publish', version: '1' })).status).toBe(302);
     expect(await (await author.get('/mappings')).text()).not.toContain('实体待补登');
     expect(await (await author.get(`/mappings/${mappingId}`)).text()).not.toContain('实体待补登');
+  });
+
+  it('映射详情页的实体卡片对自定义实体标「自定义实体」并链接到它的实体页；列表与详情页用登记的中文名，发布前取草稿的', async () => {
+    const mappingId = await legacyStoreMapping();
+    const author = await loginAs(app, 'de@acme.com');
+    const detail = await (await author.get(`/mappings/${mappingId}`)).text();
+    const page = `/entities/${detail.match(/href="\/entities\/([0-9a-f-]{36})"/)![1]}`;
+    expect(detail).toContain('text-slate-500">自定义实体<');
+    expect(detail.match(ENTITY_CARD)![1]).toBe(page);
+    expect(detail).toContain('store（custom_store）');
+
+    const { intent: _, name: __, ...rest } = STORE;
+    expect((await author.post(page, { ...rest, intent: 'save' })).status).toBe(302);
+    expect(await (await author.get('/mappings')).text()).toContain('门店（custom_store）');
+    const admin = await loginAs(app, 'admin@acme.com');
+    expect((await admin.post(page, { intent: 'publish', version: '1' })).status).toBe(302);
+    expect(await (await author.get(`/mappings/${mappingId}`)).text()).toContain('门店（custom_store）');
   });
 });
