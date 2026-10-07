@@ -9,7 +9,7 @@ import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
-import { memberOf, newTenant, selectAllTables } from '../pipeline/fixtures';
+import { memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { mappingTemplate } from '../../app/.server/pipeline/mapping-spec';
 import { entityOf } from '../../app/lib/canonical-model';
@@ -188,6 +188,40 @@ describe('编写与发布映射', () => {
     expect(merges).toContain('等，共 40 个，请在映射里用字段表达式对齐（如加前缀）或去掉一边的映射');
     expect(await (await author.get(`/mappings/${orders}?tab=merges`)).text()).not.toContain('data-merge-error');
     expect(await (await author.get('/tasks')).text()).toContain(conflict);
+  });
+
+  it('分析师能在映射列表上运行主键冲突体检并查看报告：每对重叠的映射列出重叠数、样本键、一致比例与建议；其他操作仍然 403', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await memberOf(tenantId, 'de@acme.com');
+    const reviewer = await memberOf(tenantId, 'de2@acme.com');
+    await confirmWatermark(engineer, sourceId, 'customers', 'updated_at');
+    await confirmWatermark(engineer, sourceId, 'orders', 'order_id');
+    await syncSource(engineer, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    // touch 不被关系指向：customers 的 id 1..40 全在 orders 的 1..100 里
+    const a = await publish(engineer, reviewer, sourceId, 'model: 1\nentity: touch\ntable: customers\nfields:\n  touch_id: string(customer_id)\n  campaign_id: city\n');
+    const b = await publish(engineer, reviewer, sourceId, 'model: 1\nentity: touch\ntable: orders\nfields:\n  touch_id: string(order_id)\n  campaign_id: status\n');
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an@acme.com');
+
+    expect(await (await analyst.get('/mappings')).text()).toContain('data-keycheck-status="never"');
+    expect((await analyst.post('/mappings', { intent: 'keycheck' })).status).toBe(302);
+    expect(await (await analyst.get('/mappings')).text()).toContain('data-keycheck-status="running"');
+    expect((await analyst.post('/mappings', { intent: 'keycheck' })).status).toBe(400);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    const page = await (await analyst.get('/mappings')).text();
+    expect(page).toContain('data-keycheck-status="ok"');
+    expect(page).toContain(`data-keycheck-pair="touch:${[a, b].sort().join(':')}"`);
+    expect(page).toContain('重叠 40 个键');
+    expect(page).toContain('1、10、11、12、13');
+    expect(page).toContain('一致 0%');
+    expect(page).toContain('多半是重复接入');
+    expect(page).toContain('电商库 / customers');
+
+    for (const intent of ['merge', 'create', 'draft']) {
+      expect((await analyst.post('/mappings', { intent, sourceId, yaml: ORDERS })).status).toBe(403);
+    }
   });
 
   it('新建映射的表下拉框列出已发布的源视图；YAML 写 view 的映射保存后，详情页对照视图的列，空跑转换视图的样本', async () => {

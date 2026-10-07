@@ -71,15 +71,15 @@ const MERGES = `${SILVER}._merges`;
  */
 const SCHEME = 2;
 
-const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
-const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
-const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+export const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
+export const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
+export const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 const columnsOf = (con: DuckDBConnection, relation: string) => rows<{ column_name: string; column_type: string }>(con, `DESCRIBE ${relation}`);
 const count = async (con: DuckDBConnection, relation: string) => Number((await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${relation}`))[0].n);
 export const tableExists = async (con: DuckDBConnection, schema: string, name: string) => (await rows(con, `
   SELECT 1 FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = ${lit(schema)} AND table_name = ${lit(name)}`)).length > 0;
-const keyList = (keys: string[], alias?: string) => keys.map(k => (alias ? `${alias}.${ident(k)}` : ident(k))).join(', ');
-const joinOn = (keys: string[], a: string, b: string) => keys.map(k => `${a}.${ident(k)} = ${b}.${ident(k)}`).join(' AND ');
+export const keyList = (keys: string[], alias?: string) => keys.map(k => (alias ? `${alias}.${ident(k)}` : ident(k))).join(', ');
+export const joinOn = (keys: string[], a: string, b: string) => keys.map(k => `${a}.${ident(k)} = ${b}.${ident(k)}`).join(' AND ');
 /** 整行哈希（与同步时的算法相同）：“列名=取值”按列名排序后拼接，空值不参与 */
 const rowHash = (columns: string[], alias: string) =>
   `hash(concat_ws(chr(31), ${[...columns].sort().map(c => `${lit(`${c}=`)} || ${alias}.${ident(c)}::VARCHAR`).join(', ')}))`;

@@ -6,6 +6,7 @@ import { profileSource, type SourceSpec } from './source-engine';
 import { syncOptionsFromEnv, syncSourceTables, type SyncTableParam } from './sync-engine';
 import { verifySourceLake, type VerifyTableParam } from './verify-engine';
 import { inspectLake, type InspectParams } from './inspect-engine';
+import { runKeyCheck, type KeyCheckParams } from './key-check-engine';
 import { mergeToSilver, type MergeMappingParam } from './merge-engine';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { IDENTITIES } from './identity-engine';
@@ -106,6 +107,16 @@ function inspectExpected(params: Params): InspectParams['expected'] {
   return expected as InspectParams['expected'];
 }
 
+/** 主键冲突体检参数里的实体：主键、是否按数据源比较、各映射与映射出来的列（入队时由已发布映射算出） */
+function keyCheckTargets(params: Params): KeyCheckParams['entities'] {
+  const { entities } = params;
+  const valid = Array.isArray(entities) && entities.every(e =>
+    typeof e?.entity === 'string' && isStrings(e.key) && typeof e.bySource === 'boolean'
+    && Array.isArray(e.mappings) && e.mappings.every((m: { mapping?: unknown; columns?: unknown }) => typeof m?.mapping === 'string' && isStrings(m.columns)));
+  if (!valid) throw new Error('参数 entities 必须是 { entity, key, bySource, mappings: { mapping, columns }[] } 列表');
+  return entities as KeyCheckParams['entities'];
+}
+
 function positiveInt(params: Params, key: string, max: number) {
   const v = params[key];
   if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > max) throw new Error(`参数 ${key} 必须是 1 到 ${max} 之间的整数`);
@@ -188,6 +199,13 @@ export const HANDLERS = {
     label: '漂移检查',
     readOnlyLake: true,
     run: (con, params) => inspectLake(con, { expected: inspectExpected(params) }),
+  },
+  // 主键冲突体检：对每个实体里主键撞上的每对映射，统计重叠的键数、样本键与字段一致的比例，给出建议（ADR-0024）。
+  // 数据湖只读挂载，只出报告不改标准层
+  'silver.keycheck': {
+    label: '主键冲突体检',
+    readOnlyLake: true,
+    run: (con, params) => runKeyCheck(con, { entities: keyCheckTargets(params) }),
   },
   // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务，之后按参数里的匹配规则重算身份打通。
   // 有映射或打通失败时任务记为失败，结果里保留各映射的合并结果、打通摘要（组数、记录数与已归属设备数，不带哈希）与错误；

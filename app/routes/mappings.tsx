@@ -1,16 +1,18 @@
 // app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、目标自定义实体待补登、最近一次合并），
 // 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿；可按所选的表与实体按规则生成草稿填进编辑框，不保存；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
-// 以及手动触发一次合并到标准层
-import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, PencilLine, Play, Plus, X } from 'lucide-react';
-import { useState } from 'react';
+// 手动触发一次合并到标准层，以及主键冲突体检（silver.keycheck）：任何能看映射的成员都可以运行，报告按实体列出主键重叠的映射对
+import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, PencilLine, Play, Plus, ScanSearch, X } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { isMap, isScalar, parseDocument } from 'yaml';
-import { data, Form, Link, redirect, useNavigation } from 'react-router';
+import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
 import type { Route } from './+types/mappings';
-import { can, requirePermission } from '~/.server/access';
+import { assertCan, can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
+import { checkKeysNow, getKeyCheckStatus, KeyCheckError } from '~/.server/key-check';
 import { createMapping, defaultDraft, draftFor, listMappings, MappingError, mergeNow, referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
+import { SUGGESTION_LABELS } from '~/.server/pipeline/key-check-engine';
 import { mappingTemplate } from '~/.server/pipeline/mapping-spec';
 import { listSources } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
@@ -21,6 +23,7 @@ import { MappingEditorWithReference } from '~/components/mapping-reference';
 import { mappingOutline } from '~/lib/mapping-outline';
 import { cn } from '~/lib/utils';
 import { PageHeader } from '~/components/page-header';
+import { SectionHeader } from '~/components/section-header';
 import { Button } from '~/components/ui/button';
 import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
@@ -35,6 +38,8 @@ export async function loader({ request }: Route.LoaderArgs) {
   const customPages = await customEntityPages(member, mappings.map(m => m.entity));
   const sources = (await listSources(member)).map(s => ({ id: s.id, name: s.name }));
   const canWrite = can(member.role, 'sources:write');
+  const keyCheck = await getKeyCheckStatus(member);
+  const mappingNames = new Map(mappings.map(m => [m.id, `${m.sourceName} / ${m.tableName}`]));
   return {
     email: member.email,
     nav: navFor(member),
@@ -53,6 +58,17 @@ export async function loader({ request }: Route.LoaderArgs) {
       error: merge.error,
       attemptedAt: merge.attemptedAt?.toISOString() ?? null,
     },
+    keyCheck: {
+      status: KEYCHECK_STATUS[keyCheck.status],
+      error: keyCheck.error,
+      checkedAt: keyCheck.checkedAt?.toISOString() ?? null,
+      // 映射显示成「数据源 / 源表」，体检之后删掉的映射显示 ID
+      entities: keyCheck.entities.map(e => ({
+        ...e,
+        entityLabel: customPages[e.entity]?.label ?? entityLabel(e.entity),
+        pairs: e.pairs.map(p => ({ ...p, aName: mappingNames.get(p.a) ?? p.a, bName: mappingNames.get(p.b) ?? p.b, suggestionLabel: SUGGESTION_LABELS[p.suggestion] })),
+      })),
+    },
     mappings: mappings.map(m => ({
       id: m.id,
       sourceName: m.sourceName,
@@ -68,12 +84,20 @@ export async function loader({ request }: Route.LoaderArgs) {
   };
 }
 
+/** 最近一次体检任务的状态 → 页面上的状态：从没体检过、体检中（排队或运行）、失败、成功 */
+const KEYCHECK_STATUS = { none: 'never', queued: 'running', running: 'running', failed: 'failed', succeeded: 'ok' } as const;
+
+/** 运行体检（intent=keycheck）只要 sources:read，其余操作都要 sources:write */
 export async function action({ request }: Route.ActionArgs) {
-  const member = await requirePermission(request, 'sources:write');
+  const member = await requirePermission(request, 'sources:read');
   const form = await request.formData();
   const field = (name: string) => String(form.get(name) ?? '');
+  if (field('intent') !== 'keycheck') assertCan(member, 'sources:write');
   try {
     switch (field('intent')) {
+      case 'keycheck':
+        await checkKeysNow(member);
+        throw redirect('/mappings');
       case 'draft': {
         // 只生成、填进编辑框，不保存；draftId 让编辑框换成新内容
         const yaml = await draftFor(member, field('sourceId'), field('table'), field('entity'));
@@ -90,6 +114,7 @@ export async function action({ request }: Route.ActionArgs) {
         return data({ error: '未知操作', issues: [], values: null, draftId: null }, { status: 400 });
     }
   } catch (e) {
+    if (e instanceof KeyCheckError) return data({ error: e.message, issues: [], values: null, draftId: null }, { status: 400 });
     if (e instanceof MappingError) {
       return data({ error: e.message, issues: e.issues, values: { sourceId: field('sourceId'), yaml: field('yaml') }, draftId: null }, { status: e.status });
     }
@@ -120,8 +145,57 @@ function mergeSummary(m: LastMerge) {
   return `第 ${m.version} 版，${m.rows.toLocaleString('zh-CN')} 行（新增 ${m.inserted}，更新 ${m.updated}，删除 ${m.deleted}）`;
 }
 
+const percent = (ratio: number | null) => (ratio === null ? '无可比字段' : `一致 ${Math.round(ratio * 100)}%`);
+
+/**
+ * 主键冲突体检：最近一次体检的状态，以及最近一次成功体检里按实体列出的主键重叠的映射对（重叠键数、样本键、字段一致的比例与建议）。
+ * 只出报告不改标准层；体检中时页面定时刷新到体检结束
+ */
+function KeyCheckSection({ keyCheck }: { keyCheck: LoaderData['keyCheck'] }) {
+  const { status, entities, checkedAt } = keyCheck;
+  const clashes = entities.reduce((n, e) => n + e.pairs.length, 0);
+  const alarming = status === 'failed' || clashes > 0;
+  const revalidator = useRevalidator();
+  useEffect(() => {
+    if (status !== 'running') return;
+    const timer = setInterval(() => { if (revalidator.state === 'idle') revalidator.revalidate(); }, 2000);
+    return () => clearInterval(timer);
+  }, [status, revalidator]);
+  return (
+    <section data-keycheck-status={status} className={cn('space-y-4 rounded-2xl border bg-white p-6 shadow-sm', alarming && 'border-red-200')}>
+      <SectionHeader title="主键冲突体检">统计每个实体里主键撞上的映射对：重叠的键数、样本键，以及重叠的键里两边都映射了的字段全部一致的比例，并给出建议。只出报告，不改标准层；customer 不参与，主键含消费者 ID 的实体按数据源比较。</SectionHeader>
+      <p className="flex flex-wrap items-center text-sm text-slate-500">
+        {status === 'never' && '尚未体检'}
+        {status === 'running' && <span className="flex items-center gap-2 text-amber-600"><Loader2 className="size-4 animate-spin" />体检中</span>}
+        {status === 'failed' && <span className="flex items-center gap-2 text-red-600"><AlertTriangle className="size-4" />{`体检失败：${keyCheck.error ?? ''}`}</span>}
+        {checkedAt && <span className={status === 'ok' ? undefined : 'ml-3'}>{`${status === 'ok' ? '' : '上次'}体检时间：${time(checkedAt)}`}</span>}
+      </p>
+      {checkedAt && (clashes === 0 ? (
+        <p data-no-keycheck-clash className="flex items-center gap-2 text-sm text-emerald-600"><CheckCircle2 className="size-4" />没有主键冲突</p>
+      ) : entities.map(e => (
+        <div key={e.entity} data-keycheck-entity={e.entity} className="space-y-2">
+          <h3 className="text-sm font-medium">{`${e.entityLabel}（${e.entity}）`}{e.bySource && <span className="ml-2 text-xs font-normal text-slate-400">按数据源比较</span>}</h3>
+          <ul className="divide-y rounded-xl border text-sm">
+            {e.pairs.map(p => (
+              <li key={`${p.a}:${p.b}`} data-keycheck-pair={`${e.entity}:${p.a}:${p.b}`} className="space-y-1 px-4 py-2">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                  <span className="font-mono text-xs">{`${p.aName} ↔ ${p.bName}`}</span>
+                  <span className="text-red-600">{`重叠 ${p.overlap.toLocaleString('zh-CN')} 个键`}</span>
+                  <span className="text-slate-500">{percent(p.agreement)}</span>
+                  <span className="text-slate-500">{`建议：${p.suggestionLabel}`}</span>
+                </div>
+                <div className="truncate font-mono text-xs text-slate-400">{`样本键：${p.samples.map(k => k.join(', ')).join('、')}`}</div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )))}
+    </section>
+  );
+}
+
 export default function Mappings({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, sources, tables, registered, initialYaml, functions, merge, mappings } = loaderData;
+  const { email, nav, canWrite, sources, tables, registered, initialYaml, functions, merge, keyCheck, mappings } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const { icon: MergeIcon, tone: mergeTone } = TASK_STATUS[merge.status];
   return (
@@ -135,6 +209,12 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
               <span className={cn('inline-flex items-center gap-1', mergeTone)}><MergeIcon className="size-3.5" />{`最近一次合并：${merge.statusLabel}`}</span>
               <span className="text-xs text-slate-400">{time(merge.attemptedAt)}</span>
             </span>
+            <Form method="post">
+              <input type="hidden" name="intent" value="keycheck" />
+              <Button type="submit" variant="outline" disabled={submitting || keyCheck.status === 'running'}>
+                <ScanSearch />{keyCheck.status === 'running' ? '体检中…' : '运行体检'}
+              </Button>
+            </Form>
             {canWrite && (
               <Form method="post">
                 <input type="hidden" name="intent" value="merge" />
@@ -147,6 +227,8 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
 
       {merge.error && <div className="flex items-start gap-1 text-sm whitespace-normal text-red-600"><AlertTriangle className="mt-0.5 size-3.5 shrink-0" />{merge.error}</div>}
       {actionData?.error && <MappingErrors error={actionData.error} issues={actionData.issues} />}
+
+      <KeyCheckSection keyCheck={keyCheck} />
 
       {!mappings.length && (
         <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">
