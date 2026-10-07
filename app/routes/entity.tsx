@@ -213,6 +213,7 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
               <CustomEntityForm
                 key={selected.version}
                 intent="save"
+                entity={entity.name}
                 values={actionData?.input ?? selected}
                 targets={targets}
                 submitting={submitting}

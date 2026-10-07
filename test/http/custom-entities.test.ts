@@ -100,11 +100,12 @@ describe('自定义实体', () => {
     const form = await (await author.get(page)).text();
     expect(form).toContain('name="relField"');
     expect(form).toMatch(/name="relFrom"[^]*?value=""[^>]*>本实体<[^]*?value="order">order（订单）</);
+    expect(form).toMatch(/name="relEntity"[^]*?value=""[^>]*>本实体</);
     expect(form).toMatch(/value="custom_region">custom_region（大区）</);
     expect(form).toMatch(/value="customer">customer（消费者）</);
 
     const { intent: _, name: __, ...rest } = STORE;
-    const save = { ...rest, intent: 'save', fieldName: ['store_id', 'manager_phone', 'region_id'], relFrom: ['', 'order', ''], relField: ['region_id', 'store_id', ''], relEntity: ['custom_region', 'custom_store', ''] };
+    const save = { ...rest, intent: 'save', fieldName: ['store_id', 'manager_phone', 'region_id'], relFrom: ['', 'order', ''], relField: ['region_id', 'store_id', ''], relEntity: ['custom_region', '', ''] };
     const rejected = await author.post(page, { ...save, relTarget: ['region_name', 'store_id', ''] });
     expect(rejected.status).toBe(400);
     const html = await rejected.text();

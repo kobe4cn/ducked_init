@@ -1,6 +1,6 @@
 // app/components/custom-entity-form.tsx —— 自定义实体登记的表单与只读字段表、关系表（ADR-0019）：列表页的新建与详情页的编辑共用。
 // 已有字段各一行，再加 EXTRA_ROWS 行空行（空行忽略）；「添加字段」再多给空行，没加载脚本时就先保存再加。主键是逗号分隔的字段名。
-// 关系同样按行填：起点实体（本实体或标准实体）、起点字段、终点实体（标准实体与已发布的自定义实体里选）与终点字段（终点的主键）
+// 关系同样按行填：起点实体（本实体或标准实体）、起点字段、终点实体（本实体、标准实体与已发布的自定义实体里选）与终点字段（终点的主键）
 import { Plus } from 'lucide-react';
 import { useState } from 'react';
 import { Form } from 'react-router';
@@ -34,10 +34,11 @@ const EMPTY: EntityFormValues = { label: '', kind: 'dimension', fields: [], prim
 /**
  * 登记表单（提交 intent）：新建时多一个名称输入框（建实体时定下，之后不能改）。
  * 字段按行提交 fieldName / fieldType / fieldDescription，敏感勾选框提交行号 fieldSensitive；关系按行提交 relFrom / relField / relEntity / relTarget，
- * 起点实体选「本实体」时 relFrom 为空
+ * 起点、终点实体选「本实体」时 relFrom / relEntity 为空。entity 是本实体的名称（编辑时）：已存的关系里写着它的回显成「本实体」，终点列表里不再列它
  */
-export function CustomEntityForm({ intent, values, targets, submitting, submitLabel }: {
+export function CustomEntityForm({ intent, entity, values, targets, submitting, submitLabel }: {
   intent: 'create' | 'save';
+  entity?: string;
   values?: EntityFormValues | null;
   targets: RelationTarget[];
   submitting: boolean;
@@ -45,6 +46,8 @@ export function CustomEntityForm({ intent, values, targets, submitting, submitLa
 }) {
   const v = values ?? EMPTY;
   const canonical = targets.filter(t => entityOf(t.name));
+  const others = targets.filter(t => t.name !== entity);
+  const refOf = (r: EntityRelation) => (r.ref.entity === entity ? '' : r.ref.entity);
   const [extra, setExtra] = useState(EXTRA_ROWS);
   const [extraRelations, setExtraRelations] = useState(EXTRA_RELATION_ROWS);
   const rows = [...v.fields, ...Array.from({ length: extra }, () => ({ name: '', type: 'string', description: '', sensitive: false }))];
@@ -129,11 +132,11 @@ export function CustomEntityForm({ intent, values, targets, submitting, submitLa
                 </TableCell>
                 <TableCell><Input name="relField" defaultValue={r.from.field} placeholder="region_id" aria-label={`第 ${i + 1} 条关系的字段`} className="font-mono" /></TableCell>
                 <TableCell>
-                  <NativeSelect name="relEntity" defaultValue={r.ref.entity} aria-label={`第 ${i + 1} 条关系的终点实体`}>
-                    <NativeSelectOption value="">选择实体</NativeSelectOption>
+                  <NativeSelect name="relEntity" defaultValue={refOf(r)} aria-label={`第 ${i + 1} 条关系的终点实体`}>
+                    <NativeSelectOption value="">本实体</NativeSelectOption>
                     {/* 已填的终点不在可选列表里（如没发布）时也列出，报错后原样回显 */}
-                    {r.ref.entity && !targets.some(t => t.name === r.ref.entity) && <NativeSelectOption value={r.ref.entity}>{r.ref.entity}</NativeSelectOption>}
-                    {targets.map(t => <NativeSelectOption key={t.name} value={t.name}>{`${t.name}（${t.label}）`}</NativeSelectOption>)}
+                    {refOf(r) && !others.some(t => t.name === r.ref.entity) && <NativeSelectOption value={r.ref.entity}>{r.ref.entity}</NativeSelectOption>}
+                    {others.map(t => <NativeSelectOption key={t.name} value={t.name}>{`${t.name}（${t.label}）`}</NativeSelectOption>)}
                   </NativeSelect>
                 </TableCell>
                 <TableCell><Input name="relTarget" defaultValue={r.ref.field} placeholder="终点的主键" aria-label={`第 ${i + 1} 条关系的终点字段`} className="font-mono" /></TableCell>
@@ -146,7 +149,7 @@ export function CustomEntityForm({ intent, values, targets, submitting, submitLa
         <Plus />添加关系
       </Button>
       <p className="max-w-2xl text-sm text-slate-500">
-        {`关系把一个字段指向另一个实体的主键，两端类型要相同。起点是本实体的字段时，终点可以是标准实体或已发布的自定义实体，只能是单列主键：${targets.filter(t => t.primaryKey.length === 1).map(t => `${t.name}.${t.primaryKey[0]}`).join('、') || '暂无'}。起点也可以是标准实体的字段（含已发布映射用过的 x_ 扩展字段，如 order.x_store_id），这时终点是本实体的主键。不能成环。字段留空的行忽略；发布后只能新增关系。`}
+        {`关系把一个字段指向另一个实体的主键，两端类型要相同。起点是本实体的字段时，终点可以是标准实体或已发布的自定义实体，只能是单列主键：${others.filter(t => t.primaryKey.length === 1).map(t => `${t.name}.${t.primaryKey[0]}`).join('、') || '暂无'}。起点也可以是标准实体的字段（含已发布映射用过的 x_ 扩展字段，如 order.x_store_id），这时终点选「本实体」、填本实体的主键。不能成环。字段留空的行忽略；发布后只能新增关系。`}
       </p>
       <Button type="submit" disabled={submitting}>{submitting ? '正在保存…' : submitLabel}</Button>
     </Form>

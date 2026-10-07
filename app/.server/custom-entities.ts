@@ -35,7 +35,7 @@ export type CustomEntityInput = Omit<RegisteredEntity, 'name'> & { name?: string
 /**
  * 页面表单（components/custom-entity-form.tsx）提交的登记：字段按行提交 fieldName / fieldType / fieldDescription，
  * 敏感勾选框提交行号 fieldSensitive；字段名留空的行忽略。主键按逗号（或顿号）分隔。
- * 关系按行提交 relFrom / relField / relEntity / relTarget（起点实体、起点字段、终点实体、终点字段），起点字段留空的行忽略；起点实体留空，即本实体
+ * 关系按行提交 relFrom / relField / relEntity / relTarget（起点实体、起点字段、终点实体、终点字段），起点字段留空的行忽略；起点实体或终点实体留空，即本实体
  */
 export function customEntityInputOf(form: FormData): CustomEntityInput {
   const all = (key: string) => form.getAll(key).map(String);
@@ -66,7 +66,7 @@ const EXTENSION_NAME = new RegExp(EXTENSION_PATTERN);
 
 /**
  * 校验并整理一版登记（去掉首尾空白、主键去重）；不合格时抛出 CustomEntityError，说明原因。name 是本实体的名称：
- * 关系的起点要是本实体已登记的字段（起点实体留空时补上 name），或标准实体的字段或 x_ 扩展字段，这时终点要是本实体（关系挂在另一端的登记上）。
+ * 关系的起点要是本实体已登记的字段（起点、终点实体留空时补上 name），或标准实体的字段或 x_ 扩展字段，这时终点要是本实体（关系挂在另一端的登记上）。
  * x_ 字段的类型、关系的终点与成环在 checkRelations 里对照已发布的映射与实体校验
  */
 export function checkRegistration(input: CustomEntityInput, name = input.name?.trim() ?? ''): CheckedRegistration {
@@ -90,7 +90,7 @@ export function checkRegistration(input: CustomEntityInput, name = input.name?.t
   for (const k of primaryKey) if (!seen.has(k)) throw new CustomEntityError(`主键 ${k} 不是已登记的字段`);
   const relations = (input.relations ?? []).map(r => ({
     from: { entity: r.from.entity.trim() || name, field: r.from.field.trim() },
-    ref: { entity: r.ref.entity.trim(), field: r.ref.field.trim() },
+    ref: { entity: r.ref.entity.trim() || name, field: r.ref.field.trim() },
   }));
   const declared = new Set<string>();
   for (const r of relations) {
@@ -100,7 +100,7 @@ export function checkRegistration(input: CustomEntityInput, name = input.name?.t
     if (canonical && !canonical.fields.some(f => f.name === r.from.field) && !EXTENSION_NAME.test(r.from.field)) {
       throw new CustomEntityError(`关系的起点 ${r.from.field} 不是 ${r.from.entity} 的字段，也不是 x_ 开头的扩展字段`);
     }
-    if (!r.ref.entity || !r.ref.field) throw new CustomEntityError(`请填写关系 ${r.from.field} 的终点实体与终点字段`);
+    if (!r.ref.field) throw new CustomEntityError(`请填写关系 ${relationText(r)} 的终点字段`);
     if (canonical && r.ref.entity !== name) throw new CustomEntityError(`关系 ${relationText(r)}：起点是标准实体时，终点要是本实体 ${name}`);
     if (r.ref.entity === r.from.entity) throw new CustomEntityError(`关系 ${relationText(r)} 指向本实体自己：自指算成环，不能声明`);
     if (declared.has(relationText(r))) throw new CustomEntityError(`关系 ${relationText(r)} 重复`);
