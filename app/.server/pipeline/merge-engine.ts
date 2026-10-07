@@ -194,11 +194,18 @@ function normalizedPii(field: string, text: string) {
 /**
  * 一列写进标准层的值：敏感字段是规范化后加盐的 sha256（十六进制，与字段名无关，同一租户里同一个值的哈希相同）；
  * 其他列有值字典时按字典对应，否则转成标准字段的类型。
- * 写了兜底值时，对应不上的取值（没有值字典时是标准枚举之外的取值）写成兜底值；源端为空的仍为空
+ * 写了兜底值时，对应不上的取值（没有值字典时是标准枚举之外的取值）写成兜底值；源端为空的仍为空。
+ * 带键空间的列（只会是不敏感的文本列）最后加上 <键空间>: 前缀，空值仍为空（ADR-0024）
  */
 function columnValue(c: PlanColumn, alias: string, salt: string | null) {
   const raw = rawValue(c, alias);
   if (salt !== null) return `sha256(${lit(salt)} || ${normalizedPii(c.name, `CAST(${raw} AS VARCHAR)`)})`;
+  const value = plainValue(c, raw);
+  return c.keySpace ? `CASE WHEN ${value} IS NULL THEN NULL ELSE ${lit(`${c.keySpace}:`)} || CAST(${value} AS VARCHAR) END` : value;
+}
+
+/** 不敏感的列：按值字典对应，或转成标准字段的类型 */
+function plainValue(c: PlanColumn, raw: string) {
   const dictionary = c.dictionary ?? (c.otherwise !== undefined && c.enum ? Object.fromEntries(c.enum.map(v => [v, v])) : undefined);
   if (!dictionary) return `CAST(${raw} AS ${sqlType(c.type)})`;
   const text = `CAST(${raw} AS VARCHAR)`;
@@ -295,10 +302,10 @@ export async function transformRows(con: DuckDBConnection, plan: MergePlan, salt
     .catch(async (e: Error) => { throw new Error(await withoutPii(con, plan.columns.filter(c => pii.has(c.name)), e.message, live)); });
 }
 
-/** 合并写进每张标准层表的系统列：来自哪个映射、哪个数据源、映射版本与合并时间 */
-export const SILVER_SYSTEM_COLUMNS = { _mapping: 'VARCHAR', _source: 'VARCHAR', _version: 'INTEGER', _merged_at: 'TIMESTAMPTZ' } as const;
+/** 合并写进每张标准层表的系统列：来自哪个映射、哪个数据源、映射版本、合并时间与映射的键空间（没声明时为空） */
+export const SILVER_SYSTEM_COLUMNS = { _mapping: 'VARCHAR', _source: 'VARCHAR', _version: 'INTEGER', _merged_at: 'TIMESTAMPTZ', _key_space: 'VARCHAR' } as const;
 
-/** 标准层表不存在时按实体的全部字段建表，存在时补上新的扩展字段。敏感字段存哈希，类型总是 VARCHAR */
+/** 标准层表不存在时按实体的全部字段建表，存在时补上新的扩展字段与后来加的系统列（如 _key_space）。敏感字段存哈希，类型总是 VARCHAR */
 async function ensureSilverTable(con: DuckDBConnection, plan: MergeMappingParam) {
   const table = silverTable(plan.entity);
   const pii = sensitiveColumns(plan);
@@ -309,6 +316,7 @@ async function ensureSilverTable(con: DuckDBConnection, plan: MergeMappingParam)
       ${Object.entries(SILVER_SYSTEM_COLUMNS).map(([name, type]) => `${name} ${type}`).join(', ')})`);
     return;
   }
+  for (const [name, type] of Object.entries(SILVER_SYSTEM_COLUMNS)) await con.run(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${name} ${type}`);
   const known = new Set((await columnsOf(con, table)).map(c => c.column_name));
   for (const c of plan.entityColumns.filter(c => !known.has(c.name))) {
     await con.run(`ALTER TABLE ${table} ADD COLUMN ${ident(c.name)} ${typeOf(c)}`);
@@ -385,7 +393,8 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     }
     await con.run(`
       INSERT INTO ${silver} BY NAME SELECT w.* EXCLUDE (_src, _n, _batch),
-        ${lit(plan.mapping)} AS _mapping, ${lit(plan.sourceId)} AS _source, ${plan.version} AS _version, TIMESTAMPTZ ${lit(now.toISOString())} AS _merged_at
+        ${lit(plan.mapping)} AS _mapping, ${lit(plan.sourceId)} AS _source, ${plan.version} AS _version, TIMESTAMPTZ ${lit(now.toISOString())} AS _merged_at,
+        ${plan.keySpace ? lit(plan.keySpace) : 'NULL'} AS _key_space
       FROM ${WINNERS} w`);
     if (plan.uniqueKey) await assertUniqueAcrossMappings(con, silver, plan.mapping, plan.uniqueKey);
     await con.run(`INSERT INTO ${MERGES} VALUES (

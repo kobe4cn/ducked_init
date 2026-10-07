@@ -9,7 +9,7 @@ const plan = (mapping: string, entity: string, entityColumns: MergeMappingParam[
   mapping, version: 1, sourceId: 's1', entity, table: 't', columns, entityColumns, key: ['customer_id'], latest: null,
 });
 
-const SYSTEM = { _mapping: 'VARCHAR', _source: 'VARCHAR', _version: 'INTEGER', _merged_at: 'TIMESTAMPTZ' };
+const SYSTEM = { _mapping: 'VARCHAR', _source: 'VARCHAR', _version: 'INTEGER', _merged_at: 'TIMESTAMPTZ', _key_space: 'VARCHAR' };
 
 describe('应有结构', () => {
   it('敏感字段写成 VARCHAR，其余按字段类型；同一实体的多个映射取列的并集，带系统列', () => {

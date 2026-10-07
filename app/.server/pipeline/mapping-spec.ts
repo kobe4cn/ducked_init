@@ -1,18 +1,19 @@
 // app/.server/pipeline/mapping-spec.ts —— 映射文档（YAML）：一张源表（或一个已发布的源视图）→ 一个标准实体（或自定义实体）。
 // 先按 JSON Schema（MAPPING_SCHEMA）校验结构，再对照标准模型与源表的字段做语义校验：字段表达式只能用白名单函数、只能引用源表里有的字段，
 // 值字典与兜底值只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段，身份打通的匹配字段（只用于 customer）必须是映射出来的敏感字段；扩展字段可标成敏感（只能是文本），内置敏感字段不能取消敏感标记。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
+// 映射可以声明键空间（ADR-0024）：单列文本主键在标准层写成 <键空间>:<原值>，指向别的实体的字段（内置 ref 与已登记关系的起点）可以在字段上写同样的键空间。
 // 校验通过后得到合并计划（MergePlan）：标准层的列、每列的表达式与值字典、去重键与取最新字段、身份打通的匹配规则，交给工作进程编译执行（ADR-0015）
 import { Ajv, type ErrorObject } from 'ajv';
 import { Document, isMap, isScalar, isSeq, LineCounter, parseDocument, type Node, type YAMLMap } from 'yaml';
 import {
   CANONICAL_ENTITIES, CUSTOM_FIELD_PATTERN, entityOf, EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, isCustomEntity, MODEL_MAJOR,
-  type CanonicalEntity, type CanonicalField, type FieldType,
+  type CanonicalEntity, type CanonicalField, type EntityRelation, type FieldType,
 } from '../../lib/canonical-model';
 import { fieldsForColumn, normalizeName, similarFields, similarNames, standardValue } from '../../lib/field-synonyms';
 import { ExprError, FUNCTIONS, KIND_FIELD_TYPES, kindOf, parseExpression, ref, referencedColumns, type Expr } from '../../lib/mapping-expr';
 
-/** 字段的写法：表达式本身，或带值字典（与兜底值）的对象 */
-export type FieldSpec = string | { expr: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean };
+/** 字段的写法：表达式本身，或带值字典（与兜底值）、键空间的对象 */
+export type FieldSpec = string | { expr: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean; key_space?: string };
 
 export interface MappingSpec {
   /** 标准模型的大版本 */
@@ -25,9 +26,11 @@ export interface MappingSpec {
   /** 源视图里标识一条记录的列（通常是主表的主键）；不写时按整行区分记录。只能用于源视图 */
   view_key?: string[];
   description?: string;
+  /** 键空间（ADR-0024）：单列文本主键在标准层写成 <键空间>:<原值> */
+  key_space?: string;
   fields?: Record<string, FieldSpec>;
   /** 扩展字段（标准实体上以 x_ 开头）或自定义实体的全部字段：带类型；sensitive 为真时标准层只存加盐哈希 */
-  extensions?: Record<string, { type: FieldType; expr: string; label?: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean }>;
+  extensions?: Record<string, { type: FieldType; expr: string; label?: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean; key_space?: string }>;
   /** 去重键与取最新规则：同一去重键的多行只留一行，取最新字段最大的那行。不写时按实体主键去重 */
   dedupe?: { key: string[]; latest?: string };
   /** 身份打通的匹配字段（只用于 customer）：本映射映射出来的敏感字段，数组顺序即优先级。不写时用平台默认规则 */
@@ -36,6 +39,9 @@ export interface MappingSpec {
 
 /** 身份打通的匹配规则：按优先级排列的匹配字段 */
 export interface IdentityRules { match: string[] }
+
+/** 键空间名：小写字母、数字与下划线，不会有冒号（第一个冒号就是键空间与原值的分界） */
+const keySpace = { type: 'string', pattern: '^[a-z0-9_]+$' };
 
 const fieldSpec = {
   type: ['string', 'object'],
@@ -49,6 +55,7 @@ const fieldSpec = {
       dictionary: { type: 'object', minProperties: 1, additionalProperties: { type: 'string', minLength: 1 } },
       otherwise: { type: ['string', 'null'], minLength: 1 },
       sensitive: { type: 'boolean' },
+      key_space: keySpace,
     },
   },
 };
@@ -65,6 +72,7 @@ export const MAPPING_SCHEMA = {
     view: { type: 'string', minLength: 1 },
     view_key: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 } },
     description: { type: 'string' },
+    key_space: keySpace,
     fields: { type: 'object', additionalProperties: fieldSpec },
     extensions: {
       type: 'object',
@@ -79,6 +87,7 @@ export const MAPPING_SCHEMA = {
           dictionary: { type: 'object', minProperties: 1, additionalProperties: { type: 'string', minLength: 1 } },
           otherwise: { type: ['string', 'null'], minLength: 1 },
           sensitive: { type: 'boolean' },
+          key_space: keySpace,
         },
       },
     },
@@ -116,10 +125,11 @@ export interface MappingIssue { line: number; col: number; path: string; message
 /**
  * 标准层里的一列：类型、表达式、值字典与标准枚举。
  * otherwise 是兜底值：值字典里没有（或没有值字典时不是标准枚举）的取值写成它，null 表示写成空；不写时这样的取值让合并失败。
- * sensitive：敏感字段（内置的与标成敏感的扩展字段），标准层只存加盐哈希
+ * sensitive：敏感字段（内置的与标成敏感的扩展字段），标准层只存加盐哈希。
+ * keySpace：键空间（主键列取映射的键空间，引用列取字段上写的），标准层写成 <键空间>:<值>
  */
 export interface PlanColumn {
-  name: string; type: FieldType; expr: string; dictionary?: Record<string, string>; enum?: readonly string[]; otherwise?: string | null; sensitive?: true;
+  name: string; type: FieldType; expr: string; dictionary?: Record<string, string>; enum?: readonly string[]; otherwise?: string | null; sensitive?: true; keySpace?: string;
 }
 
 /** 合并计划：工作进程据此把源表的变更批次合并到标准层（MergeMappingParam 再加上映射与版本） */
@@ -139,6 +149,8 @@ export interface MergePlan {
   latest: string | null;
   /** 身份打通的匹配规则（只有配置了的 customer 映射才有） */
   identity?: IdentityRules;
+  /** 映射声明的键空间，写进标准层的 _key_space */
+  keySpace?: string;
 }
 
 export type MappingCheck = { ok: true; spec: MappingSpec; plan: MergePlan } | { ok: false; issues: MappingIssue[] };
@@ -150,11 +162,13 @@ export type MappingCheck = { ok: true; spec: MappingSpec; plan: MergePlan } | { 
 export type SourceColumns = (name: string, view?: boolean) => SourceColumn[] | string;
 
 /**
- * 自定义实体已发布的登记（ADR-0019，custom-entities.ts 的 RegisteredEntity 里校验要用的部分）：没登记或只有草稿时返回 undefined。
+ * 自定义实体已发布的登记（ADR-0019，custom-entities.ts 的 RegisteredEntity 里校验要用的部分），按实体名；没登记或只有草稿的不在里面。
  * 不给时不对照登记（工作进程里只编译，不再对照）
  */
-export type RegisteredEntities = (entity: string) => RegisteredEntity | undefined;
-export interface RegisteredEntity { name: string; fields: readonly { name: string; type: FieldType; sensitive: boolean }[] }
+export type RegisteredEntities = ReadonlyMap<string, RegisteredEntity>;
+export interface RegisteredEntity {
+  name: string; fields: readonly { name: string; type: FieldType; sensitive: boolean }[]; primaryKey: readonly string[]; relations?: readonly EntityRelation[];
+}
 
 /** 源表的一列：名称与源端类型（DuckDB 类型名，如 BIGINT、VARCHAR） */
 export interface SourceColumn { name: string; type: string }
@@ -176,6 +190,7 @@ function describeSchemaError(e: ErrorObject): { path: Path; message: string } | 
     case 'enum': return { path, message: `应为以下之一：${(p.allowedValues as string[]).join('、')}` };
     case 'minLength': case 'minItems': case 'minProperties': return { path, message: '不能为空' };
     case 'uniqueItems': return { path, message: '不能有重复项' };
+    case 'pattern': return { path, message: path.at(-1) === 'key_space' ? '键空间只能用小写字母、数字与下划线' : `应符合 ${p.pattern}` };
     default: return { path, message: e.message ?? e.keyword };
   }
 }
@@ -336,7 +351,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
     issue(['entity'], `不认识的实体 ${spec.entity}（标准实体：${CANONICAL_ENTITIES.map(e => e.name).join('、')}；自定义实体以 custom_ 开头）`);
     return { ok: false, issues };
   }
-  const registration = custom ? registered?.(spec.entity) : undefined;
+  const registration = custom ? registered?.get(spec.entity) : undefined;
   if (custom && registered && !registration) {
     issue(['entity'], `自定义实体 ${spec.entity} 还没有登记并发布（草稿不算）：请先到「自定义实体」登记并发布`);
   }
@@ -391,6 +406,23 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
       const value = standardValue(spec.entity, standard.name, otherwise);
       issue([...path, 'otherwise'], `${otherwise} 不是标准枚举值（可选：${allowed.join('、')}，或 null）`, { hint: value && snippet({ otherwise: value }) });
     }
+  };
+
+  /** 已登记关系里起点是本实体的字段（关系可以登记在终点实体上：标准实体的 x_ 字段指向自定义实体）；不给登记时为 null，不对照 */
+  const relationOrigins = registered && new Set([...registered.values()]
+    .flatMap(e => e.relations ?? []).filter(r => r.from.entity === spec.entity).map(r => r.from.field));
+  /** 一列不能加键空间的原因（敏感字段存的是哈希，非文本列放不下前缀）；能加时为 null */
+  const keySpaceRefusal = (c: Pick<PlanColumn, 'name' | 'type' | 'sensitive'>) => {
+    if (c.type !== 'string') return `${c.name} 是 ${c.type}（${FIELD_TYPES[c.type].label}）：键空间只能用于文本`;
+    return c.sensitive ? `${c.name} 是敏感字段，标准层存的是哈希，不能加键空间` : null;
+  };
+  /** 字段上的键空间：只能写在指向别的实体的字段上（内置 ref 或已登记关系的起点），且这一列能加键空间 */
+  const checkFieldKeySpace = (path: Path, c: PlanColumn, builtinRef: boolean) => {
+    if (c.keySpace === undefined) return;
+    const refusal = !builtinRef && relationOrigins && !relationOrigins.has(c.name)
+      ? `${c.name} 不指向别的实体：字段上的键空间只能写在标准模型内置的引用字段或已登记关系的起点上`
+      : keySpaceRefusal(c);
+    if (refusal) issue([...path, 'key_space'], refusal, { atKey: true });
   };
 
   /** fields 下写了标准模型里没有的字段：按右边的源列名、去掉 x_ 的名字（同名、同义词、相近）猜该写的标准字段，x_ 开头的附上扩展字段的写法 */
@@ -458,9 +490,12 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
     } else if (parts.sensitive === true && !field.pii) {
       issue(['fields', name, 'sensitive'], `${field.label}（${name}）不是敏感字段：只有扩展字段可以标成敏感`, { atKey: true });
     }
-    planned.push({
+    const column: PlanColumn = {
       name, type: field.type, expr, ...(dictionary && { dictionary }), ...(field.enum && { enum: field.enum }), ...otherwiseOf(parts), ...(field.pii && { sensitive: true as const }),
-    });
+      ...(parts.key_space && { keySpace: parts.key_space }),
+    };
+    checkFieldKeySpace(['fields', name], column, !!field.ref);
+    planned.push(column);
   }
   const extensionName = new RegExp(custom ? CUSTOM_FIELD_PATTERN : EXTENSION_PATTERN);
   for (const [name, ext] of Object.entries(spec.extensions ?? {})) {
@@ -500,9 +535,12 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
     } else if (sensitive && (ext.dictionary || Object.hasOwn(ext, 'otherwise'))) {
       issue(['extensions', name, 'sensitive'], '敏感字段在标准层只存源端取值的哈希，值字典与兜底对它不起作用：请去掉 dictionary / otherwise，或取消敏感标记', { atKey: true });
     }
-    planned.push({
+    const column: PlanColumn = {
       name, type: ext.type, expr: ext.expr, ...(ext.dictionary && { dictionary: ext.dictionary }), ...otherwiseOf(ext), ...(sensitive && { sensitive: true as const }),
-    });
+      ...(ext.key_space && { keySpace: ext.key_space }),
+    };
+    checkFieldKeySpace(['extensions', name], column, false);
+    planned.push(column);
   }
   if (!planned.length) issue(spec.fields ? ['fields'] : [], '至少要映射一个字段');
 
@@ -530,6 +568,23 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
     else if (c.type === 'string' || c.type === 'boolean') issue(['dedupe', 'latest'], `取最新字段 ${latest} 应为时间、日期或数字`);
   }
 
+  // 键空间加在实体主键上（不是去重键）：只能是映射出来的、单列、不敏感的文本主键。自定义实体没给登记时不知道主键，不检查也不加（计划里也不带）
+  const primaryKey = entity?.key ?? registration?.primaryKey;
+  for (const c of planned) {
+    if (c.keySpace && primaryKey?.includes(c.name)) {
+      const path = spec.fields && Object.hasOwn(spec.fields, c.name) ? ['fields', c.name, 'key_space'] : ['extensions', c.name, 'key_space'];
+      issue(path, `${c.name} 是主键：主键的键空间写在映射顶层的 key_space`, { atKey: true, hint: `key_space: ${c.keySpace}` });
+    }
+  }
+  if (spec.key_space !== undefined && primaryKey) {
+    const [k] = primaryKey;
+    const c = mapped.get(k);
+    if (primaryKey.length > 1) issue(['key_space'], `${spec.entity} 的主键有多列（${primaryKey.join(', ')}）：键空间只能用于单列主键，复合主键请在字段表达式里对齐`);
+    else if (!c) issue(['key_space'], `没有映射主键 ${k}：键空间加在主键上，请先映射它`);
+    else if (keySpaceRefusal(c)) issue(['key_space'], `主键 ${keySpaceRefusal(c)}`, { hint: c.type === 'string' ? undefined : `${k}: string(源列)` });
+    else c.keySpace = spec.key_space;
+  }
+
   // 身份打通的匹配字段：只用于 customer，必须是映射出来的敏感字段（标准层里是可比对的哈希）
   if (spec.identity && spec.entity !== 'customer') {
     issue(['identity'], '只有消费者（customer）映射能配置身份打通的匹配规则', { atKey: true });
@@ -555,6 +610,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
       key,
       latest,
       ...(spec.identity && { identity: { match: [...spec.identity.match] } }),
+      ...(spec.key_space && primaryKey && { keySpace: spec.key_space }),
     },
   };
 }

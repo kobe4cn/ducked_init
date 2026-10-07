@@ -136,7 +136,7 @@ colour: red
         { name: 'issued_at', type: 'timestamp' as const, description: '', sensitive: false },
       ],
     };
-    const registered = (name: string) => (name === 'custom_coupon' ? coupon : undefined);
+    const registered = new Map([['custom_coupon', coupon]]);
     const check = (yaml: string) => checkMapping(yaml, columns, registered);
     const head = 'model: 1\nentity: custom_coupon\ntable: orders\ndedupe: { key: [code] }\nextensions:\n';
 
@@ -160,6 +160,77 @@ colour: red
       { line: 7, col: 46, path: 'extensions.owner_phone.dictionary', message: expect.stringMatching(/登记为敏感字段.*请去掉 dictionary/) },
     ]);
     expect(checkMapping(`${head.replace('[code]', '[coupon_no]')}  coupon_no: { type: string, expr: string(order_id) }\n`, columns).ok).toBe(true);
+  });
+});
+
+describe('键空间', () => {
+  /** 订单：主键与指向消费者的 customer_id 都可以带键空间 */
+  const order = `${ok}key_space: pos\n`.replace('  customer_id: customer_id\n', '  customer_id: { expr: string(customer_id), key_space: crm }\n');
+  const ticket = {
+    name: 'custom_ticket', label: '工单', primaryKey: ['ticket_no'],
+    fields: [
+      { name: 'ticket_no', type: 'integer' as const, sensitive: false },
+      { name: 'phone', type: 'string' as const, sensitive: true },
+      { name: 'order_ref', type: 'string' as const, sensitive: false },
+      { name: 'note', type: 'string' as const, sensitive: false },
+    ],
+    // 工单的 order_ref 指向订单；订单的扩展字段 x_ticket 指向工单（关系登记在终点工单上）
+    relations: [
+      { from: { entity: 'custom_ticket', field: 'order_ref' }, ref: { entity: 'order', field: 'order_id' } },
+      { from: { entity: 'order', field: 'x_ticket' }, ref: { entity: 'custom_ticket', field: 'ticket_no' } },
+    ],
+  };
+  const registered = new Map([['custom_ticket', ticket]]);
+  const tickets = (key: string[], keySpace = 'svc') =>
+    `model: 1\nentity: custom_ticket\ntable: orders\nkey_space: ${keySpace}\ndedupe: { key: [${key.join(', ')}] }\nextensions:\n`
+    + '  ticket_no: { type: integer, expr: order_id }\n  phone: { type: string, expr: status }\n  note: { type: string, expr: status, key_space: svc }\n';
+
+  it('映射声明键空间：主键列与写了键空间的引用列带进合并计划', () => {
+    const r = checkMapping(order, columns);
+    expect(r.ok && r.plan.keySpace).toBe('pos');
+    const col = (name: string) => (r.ok ? r.plan.columns.find(c => c.name === name) : undefined);
+    expect(col('order_id')).toMatchObject({ keySpace: 'pos' });
+    expect(col('customer_id')).toMatchObject({ keySpace: 'crm' });
+    expect(col('amount')?.keySpace).toBeUndefined();
+    const plain = checkMapping(ok, columns);
+    expect(plain.ok && [plain.plan.keySpace, plain.plan.columns.some(c => c.keySpace)]).toEqual([undefined, false]);
+  });
+
+  it('已登记关系的起点（自定义字段、标准实体的 x_ 字段）可以写键空间', () => {
+    const r = checkMapping(`${order}extensions:\n  x_ticket: { type: string, expr: string(pay_fen), key_space: svc }\n`, columns, registered);
+    expect(r.ok && r.plan.columns.find(c => c.name === 'x_ticket')).toMatchObject({ keySpace: 'svc' });
+    const custom = checkMapping('model: 1\nentity: custom_ticket\ntable: orders\ndedupe: { key: [ticket_no] }\nextensions:\n'
+      + '  ticket_no: { type: integer, expr: order_id }\n  order_ref: { type: string, expr: string(order_id), key_space: pos }\n', columns, registered);
+    expect(custom.ok && custom.plan.columns.find(c => c.name === 'order_ref')).toMatchObject({ keySpace: 'pos' });
+  });
+
+  it('键空间只能用小写字母、数字与下划线', () => {
+    expect(issuesWith(`${ok}key_space: POS-1\n`, columns)).toEqual([expect.objectContaining({ path: 'key_space' })]);
+    expect(issuesWith(ok.replace('  customer_id: customer_id\n', '  customer_id: { expr: customer_id, key_space: \'a:b\' }\n'), columns))
+      .toEqual([expect.objectContaining({ path: 'fields.customer_id.key_space' })]);
+  });
+
+  it('复合主键、非文本主键、敏感主键不能声明键空间', () => {
+    const consent = 'model: 1\nentity: consent\ntable: orders\nkey_space: pos\nfields:\n  customer_id: string(customer_id)\n  channel: status\n';
+    expect(issuesWith(consent, columns)).toEqual([
+      expect.objectContaining({ line: 4, path: 'key_space', message: expect.stringContaining('主键有多列（customer_id, channel）') }),
+    ]);
+    const check = (yaml: string) => { const r = checkMapping(yaml, columns, registered); return r.ok ? [] : r.issues.map(i => `${i.path} ${i.message}`); };
+    expect(check(tickets(['ticket_no']).replace('  note: { type: string, expr: status, key_space: svc }\n', ''))).toEqual([
+      expect.stringMatching(/^key_space .*主键 ticket_no 是 integer/),
+    ]);
+    const sensitiveKey = new Map([['custom_ticket', { ...ticket, primaryKey: ['phone'] }]]);
+    const r = checkMapping(tickets(['phone']).replace('  note: { type: string, expr: status, key_space: svc }\n', ''), columns, sensitiveKey);
+    expect(!r.ok && r.issues).toEqual([expect.objectContaining({ path: 'key_space', message: expect.stringContaining('主键 phone 是敏感字段') })]);
+  });
+
+  it('字段上的键空间只能写在内置 ref 或已登记关系的起点上', () => {
+    const status = checkMapping(ok.replace('    expr: status\n', '    expr: status\n    key_space: pos\n'), columns, new Map());
+    expect(!status.ok && status.issues).toEqual([
+      expect.objectContaining({ path: 'fields.status.key_space', message: expect.stringContaining('status 不指向别的实体') }),
+    ]);
+    const r = checkMapping(tickets(['ticket_no'], 'x').replace('key_space: x\n', ''), columns, registered);
+    expect(!r.ok && r.issues).toEqual([expect.objectContaining({ path: 'extensions.note.key_space', message: expect.stringContaining('note 不指向别的实体') })]);
   });
 });
 

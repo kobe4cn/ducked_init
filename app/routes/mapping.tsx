@@ -260,9 +260,9 @@ function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult 
   );
 }
 
-const COLUMN_FIELD_LABELS: Record<ColumnField, string> = { type: '类型', expr: '表达式', dictionary: '值字典', otherwise: '兜底', sensitive: '敏感标记' };
+const COLUMN_FIELD_LABELS: Record<ColumnField, string> = { type: '类型', expr: '表达式', dictionary: '值字典', otherwise: '兜底', sensitive: '敏感标记', keySpace: '键空间' };
 
-/** 草稿与最新已发布版本的差异：首个版本、没有差异，或逐项列出列与去重 / 身份打通配置的变化 */
+/** 草稿与最新已发布版本的差异：首个版本、没有差异，或逐项列出列与去重 / 身份打通 / 键空间配置的变化 */
 function DraftDiff({ entity, version, diff }: { entity: string; version: number; diff: PlanDiff & { against: number | null } }) {
   const label = (name: string) => {
     const l = entityOf(entity)?.fields.find(f => f.name === name)?.label;
@@ -288,6 +288,7 @@ function DraftDiff({ entity, version, diff }: { entity: string; version: number;
           {diff.key && <li data-diff-item="key">去重键：{fieldList(diff.key.from)} → {fieldList(diff.key.to)}</li>}
           {diff.latest && <li data-diff-item="latest">取最新字段：{latestText(diff.latest.from)} → {latestText(diff.latest.to)}</li>}
           {diff.identity && <li data-diff-item="identity">身份打通匹配字段：{fieldList(diff.identity.from, '平台默认')} → {fieldList(diff.identity.to, '平台默认')}</li>}
+          {diff.keySpace && <li data-diff-item="key-space">键空间：<span className="font-mono">{diff.keySpace.from ?? '—'}</span> → <span className="font-mono">{diff.keySpace.to ?? '—'}</span></li>}
         </ul>
       )}
     </section>

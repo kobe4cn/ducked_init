@@ -80,13 +80,19 @@ const COUPONS = `
     ('CP04', 'TPL01', NULL, 2, '已作废', '2024-06-01 10:00', NULL, NULL, NULL, '2024-07-01 10:00', '2024-06-05 10:00');
   GRANT SELECT ON shop.coupons TO ${READER.user};`;
 
-/** 两位数据工程师：一位起草、一位发布。登记数据源、选入全部表、确认水位线并同步一次 */
-async function syncedSource() {
+/** 订单明细：文本主键，order_id 对应 orders 的自增主键 */
+const ORDER_ITEMS = `
+  CREATE TABLE shop.order_items (item_no text PRIMARY KEY, order_id int NOT NULL, qty int NOT NULL);
+  INSERT INTO shop.order_items VALUES ('I1', 1, 2), ('I2', 1, 1), ('I3', 2, 5);
+  GRANT SELECT ON shop.order_items TO ${READER.user};`;
+
+/** 两位数据工程师：一位起草、一位发布。登记数据源、选入全部表（extra 是另加的源表）、确认水位线并同步一次 */
+async function syncedSource(extra = '') {
   const acme = await newTenant('acme');
   const author = await memberOf(acme, 'de@acme.com');
   const reviewer = await memberOf(acme, 'de2@acme.com');
   const input = await pgSourceInput(READER);
-  await grantOnSource(ORDER_LOG + POINT_LOGS + CONSENTS + PREFERENCES + COUPON_TEMPLATES + COUPONS);
+  await grantOnSource(ORDER_LOG + POINT_LOGS + CONSENTS + PREFERENCES + COUPON_TEMPLATES + COUPONS + extra);
   const { id } = await registerSource(author, input);
   await selectAllTables(author, id);
   await drain();
@@ -409,6 +415,22 @@ describe('发布映射并合并到标准层', () => {
     expect((await getMapping(author, again)).merge.history[0]).not.toHaveProperty('error');
     expect((await silver(acme, 'customer', 'customer_id::INT')).filter(c => c.customer_id === '1').map(c => c._mapping).sort())
       .toEqual([customers, again].sort());
+  });
+
+  it('映射声明键空间：标准层的主键带前缀并记下 _key_space；同源订单明细的 order_id 写了同一键空间，两边关联得上', async () => {
+    const { acme, author, reviewer, id } = await syncedSource(ORDER_ITEMS);
+    await publish(author, reviewer, id, `${ORDERS}key_space: pos\n`);
+    await publish(author, reviewer, id, 'model: 1\nentity: order_item\ntable: order_items\nfields:\n'
+      + '  order_item_id: item_no\n  order_id: { expr: string(order_id), key_space: pos }\n  quantity: qty\n');
+
+    const orders = await silver(acme, 'order', 'order_id');
+    expect(orders.find(o => o.order_id === 'pos:1')).toMatchObject({ customer_id: expect.not.stringContaining(':'), _key_space: 'pos' });
+    expect(orders.every(o => /^pos:\d+$/.test(String(o.order_id)) && o._key_space === 'pos')).toBe(true);
+    // 明细的映射没声明键空间：自己的主键照原值，_key_space 为空
+    const items = await silver(acme, 'order_item', 'order_item_id');
+    expect(items.map(i => [i.order_item_id, i.order_id, i._key_space])).toEqual([['I1', 'pos:1', null], ['I2', 'pos:1', null], ['I3', 'pos:2', null]]);
+    const ids = new Set(orders.map(o => o.order_id));
+    expect(items.every(i => ids.has(i.order_id))).toBe(true);
   });
 
   it('写了兜底值时值字典里没有的取值写成兜底值，合并照常完成，并记下落入兜底的取值与行数', async () => {

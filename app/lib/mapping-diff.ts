@@ -1,9 +1,9 @@
-// app/lib/mapping-diff.ts —— 映射两个版本合并计划的结构化差异（发布前审阅草稿用）：列的新增、删除与改动，去重键、取最新字段、身份打通匹配字段的变化。
+// app/lib/mapping-diff.ts —— 映射两个版本合并计划的结构化差异（发布前审阅草稿用）：列的新增、删除与改动，去重键、取最新字段、身份打通匹配字段、键空间的变化。
 // 只比用户写的部分：标准枚举（enum）来自标准模型，不算改动；值字典按内容比较，不看键的顺序
 import type { MergePlan, PlanColumn } from '~/.server/pipeline/mapping-spec';
 
 /** 列上可能改动的属性 */
-export type ColumnField = 'type' | 'expr' | 'dictionary' | 'otherwise' | 'sensitive';
+export type ColumnField = 'type' | 'expr' | 'dictionary' | 'otherwise' | 'sensitive' | 'keySpace';
 
 /** 一项配置前后的值，没变化时整项为 null */
 export type Change<T> = { from: T; to: T } | null;
@@ -18,6 +18,8 @@ export type PlanDiff =
     key: Change<string[]>;
     latest: Change<string | null>;
     identity: Change<string[] | null>;
+    /** 映射的键空间 */
+    keySpace: Change<string | null>;
     /** 两版的计划没有差异 */
     empty: boolean;
   };
@@ -38,6 +40,7 @@ function columnChanges(a: PlanColumn, b: PlanColumn): ColumnField[] {
     ['dictionary', sameDictionary(a.dictionary, b.dictionary)],
     ['otherwise', a.otherwise === b.otherwise],
     ['sensitive', !!a.sensitive === !!b.sensitive],
+    ['keySpace', a.keySpace === b.keySpace],
   ] as const).flatMap(([field, same]) => (same ? [] : [field]));
 }
 
@@ -57,5 +60,9 @@ export function diffPlans(prev: MergePlan | null, next: MergePlan): PlanDiff {
   const key = change(prev.key, next.key, sameList);
   const latest = change(prev.latest, next.latest, (a, b) => a === b);
   const identity = change(prev.identity?.match ?? null, next.identity?.match ?? null, sameList);
-  return { first: false, added, removed, changed, key, latest, identity, empty: !added.length && !removed.length && !changed.length && !key && !latest && !identity };
+  const keySpace = change(prev.keySpace ?? null, next.keySpace ?? null, (a, b) => a === b);
+  return {
+    first: false, added, removed, changed, key, latest, identity, keySpace,
+    empty: !added.length && !removed.length && !changed.length && !key && !latest && !identity && !keySpace,
+  };
 }

@@ -173,7 +173,7 @@ export async function draftForMapping(actor: CurrentMember, mappingId: string) {
  */
 export async function checkMappingDraft(tenantId: string, sourceId: string, yaml: string, registrations?: Map<string, RegisteredEntity>) {
   const entities = registrations ?? await publishedCustomEntities(getDb(), tenantId);
-  const result = checkMapping(yaml, await sourceColumns(tenantId, sourceId), name => entities.get(name));
+  const result = checkMapping(yaml, await sourceColumns(tenantId, sourceId), entities);
   if (!result.ok) throw new MappingError(`映射有 ${result.issues.length} 处问题，未保存`, 400, result.issues);
   const [view] = result.plan.view ? await getDb().select({ id: sourceViews.id }).from(sourceViews)
     .where(and(eq(sourceViews.tenantId, tenantId), eq(sourceViews.sourceId, sourceId), eq(sourceViews.name, result.plan.table))) : [];

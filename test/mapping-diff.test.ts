@@ -28,7 +28,7 @@ describe('映射版本差异', () => {
     const next = plan({
       columns: prev.columns.map(c => (c.name === 'status' ? { ...c, dictionary: { refunded: 'refunded', paid: 'paid' }, enum: ['paid'] } : c)),
     });
-    expect(diffPlans(prev, next)).toEqual({ first: false, added: [], removed: [], changed: [], key: null, latest: null, identity: null, empty: true });
+    expect(diffPlans(prev, next)).toEqual({ first: false, added: [], removed: [], changed: [], key: null, latest: null, identity: null, keySpace: null, empty: true });
   });
 
   it('列出新增、删除的列和改了哪些属性的列', () => {
@@ -71,5 +71,15 @@ describe('映射版本差异', () => {
     expect(diffPlans(plan({ identity: { match: ['phone', 'email'] } }), plan({ identity: { match: ['email', 'phone'] } }))).toMatchObject({
       identity: { from: ['phone', 'email'], to: ['email', 'phone'] },
     });
+  });
+
+  it('映射级与字段级键空间的变化：映射的键空间给出前后两边，列上算作改了键空间', () => {
+    const prev = plan();
+    const next = plan({
+      keySpace: 'pos',
+      columns: prev.columns.map(c => (c.name === 'order_id' ? { ...c, keySpace: 'pos' } : c)),
+    });
+    expect(diffPlans(prev, next)).toMatchObject({ keySpace: { from: null, to: 'pos' }, changed: [{ name: 'order_id', fields: ['keySpace'] }], empty: false });
+    expect(diffPlans(next, next)).toMatchObject({ keySpace: null, changed: [], empty: true });
   });
 });

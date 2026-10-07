@@ -411,7 +411,7 @@ describe('自定义实体', () => {
     });
     expect(yaml).toContain('opened_on → 源列 opened_on（TIMESTAMP）/ 登记 date');
     expect(yaml).toContain('staff → 源列 staff（VARCHAR）/ 登记 integer');
-    expect(checkMapping(yaml, () => STORES.columns, name => (name === STORE.name ? STORE : undefined)).ok).toBe(true);
+    expect(checkMapping(yaml, () => STORES.columns, new Map([[STORE.name, STORE]])).ok).toBe(true);
   });
 
   it('类型一致的列直接用，不带时区的时间按时区解读', () => {
