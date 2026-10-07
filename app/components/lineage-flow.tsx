@@ -1,13 +1,15 @@
 // app/components/lineage-flow.tsx —— 数据地图的流向图：用 React Flow 画 flowGraph 算好坐标的节点与边，挂载后才渲染（服务端不测量节点）；
 // 源表按数据源分组，点分组切换折叠（数据源超过 5 个时默认全部折叠），折叠后在客户端重新排版；映射节点显示版本与最近一次合并，
-// 失败的标红并链到该映射的合并记录；标准层表节点显示行数与映射数，点它把 ?node=silver.<实体> 写进 URL 打开字段抽屉，点源表节点写 ?node=table:<数据源>:<表> 打开源表抽屉。
+// 失败的标红并链到该映射的合并记录；标准层表节点显示行数与映射数，最近一次漂移检查有差异的标红边、带漂移徽标与 data-node-drift，点它把 ?node=silver.<实体> 写进 URL 打开字段抽屉，点源表节点写 ?node=table:<数据源>:<表> 打开源表抽屉。
 // 反向查有结果（hits）时未命中的节点与连线变淡。节点可以拖动（只在本页有效，可重置）
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleDashed, Clock } from 'lucide-react';
 import { Background, Controls, type Edge, MarkerType, type Node, type NodeChange, type NodeProps, Panel, Position, ReactFlow, type XYPosition } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
+import { DRIFT_NODE_STYLE, DriftBadge } from '~/components/drift-badge';
 import { KindIcon } from '~/components/kind-icon';
+import { driftAttrs, type DriftByTable } from '~/lib/lineage-drift';
 import { defaultCollapsed, type FlowData, type FlowInput, flowGraph, type FlowStatus, groupId, MERGE_STATUS } from '~/lib/lineage-flow';
 import { ruleLabels } from '~/lib/lineage-graph';
 import type { SearchHits } from '~/lib/lineage-search';
@@ -53,7 +55,7 @@ const NODE_TYPES = { flowGroup: GroupNode };
 
 const small = (text: React.ReactNode, className = 'text-slate-500') => <div className={`text-[10px] ${className}`}>{text}</div>;
 
-function nodeLabel(d: FlowData, tableCount: Record<string, number>): React.ReactNode {
+function nodeLabel(d: FlowData, tableCount: Record<string, number>, drift: DriftByTable): React.ReactNode {
   switch (d.kind) {
     case 'source':
       return d.collapsed
@@ -74,7 +76,13 @@ function nodeLabel(d: FlowData, tableCount: Record<string, number>): React.React
         </div>
       );
     case 'silver':
-      return <div className="leading-tight"><div>{d.label}</div>{small(`${d.rows.toLocaleString('zh-CN')} 行 · ${d.mappings} 个映射`)}</div>;
+      return (
+        <div className="leading-tight">
+          <div>{d.label}</div>
+          {small(`${d.rows.toLocaleString('zh-CN')} 行 · ${d.mappings} 个映射`)}
+          {drift[d.entity] && <DriftBadge counts={drift[d.entity]} small />}
+        </div>
+      );
     case 'identity': {
       const summary = d.identity?.summary;
       return (
@@ -90,7 +98,8 @@ function nodeLabel(d: FlowData, tableCount: Record<string, number>): React.React
   }
 }
 
-export function FlowGraphView({ flow, hits }: { flow: FlowInput; hits?: SearchHits | null }) {
+/** drift：最近一次成功的漂移检查里有差异的表 */
+export function FlowGraphView({ flow, hits, drift }: { flow: FlowInput; hits?: SearchHits | null; drift: DriftByTable }) {
   const [mounted, setMounted] = useState(false);
   const [, setSearchParams] = useSearchParams();
   useEffect(() => setMounted(true), []);
@@ -115,22 +124,24 @@ export function FlowGraphView({ flow, hits }: { flow: FlowInput; hits?: SearchHi
   const nodes = useMemo<Node[]>(() => graph.nodes.map(n => {
     const failed = n.data.kind === 'mapping' && n.data.status === 'failed';
     const group = n.type === 'group';
+    const nodeDrift = n.data.kind === 'silver' ? drift[n.data.entity] : undefined;
     return {
       ...n,
       type: group ? 'flowGroup' : undefined,
       position: moved[n.id] ?? n.position,
-      data: { label: nodeLabel(n.data, tableCount) },
+      data: { label: nodeLabel(n.data, tableCount, drift) },
+      domAttributes: driftAttrs(nodeDrift) as React.HTMLAttributes<HTMLDivElement>,
       sourcePosition: Position.Right, targetPosition: Position.Left,
       connectable: false,
       style: {
-        ...NODE_STYLE[n.data.kind], ...(failed ? FAILED : {}), width: n.width, height: n.height, borderWidth: 1, borderStyle: 'solid', borderRadius: 12, fontSize: 12,
+        ...NODE_STYLE[n.data.kind], ...(failed ? FAILED : {}), ...(nodeDrift ? DRIFT_NODE_STYLE : {}), width: n.width, height: n.height, borderWidth: 1, borderStyle: 'solid', borderRadius: 12, fontSize: 12,
         ...(group
           ? { background: 'rgba(240, 249, 255, 0.6)', display: 'flex', alignItems: 'flex-start' }
           : { display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center' as const, cursor: n.data.kind === 'source' || n.data.kind === 'table' ? 'pointer' : 'grab' }),
         ...(hits && !group && !hits.nodes.has(n.id) ? { opacity: FADED } : {}),
       },
     };
-  }), [graph, moved, tableCount, hits]);
+  }), [graph, moved, tableCount, hits, drift]);
 
   const edges = useMemo<Edge[]>(() => graph.edges.map(e => {
     const near = hovered !== null && (e.source === hovered || e.target === hovered);

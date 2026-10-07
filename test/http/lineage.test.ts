@@ -3,7 +3,8 @@
 // 「显示未接入的标准实体」开关（?all=1）灰显未接入的实体；没有已发布映射时显示空状态；流向图（?tab=flow）只对有 sources:read 的成员开放：列表带源表名、版本、行数与合并状态，失败的链到合并记录；
 // 抽屉里的「聚焦此表」进入单表聚焦画布（?tab=flow&focus=），画布下的连线列表从源列连到标准层字段；查看者访问 ?focus= 回到关系图；
 // 流向图与聚焦画布上反向查（?q=）标出命中的行，源表节点（?node=table:…）打开源表抽屉；查看者两者都不生效；
-// 关系图下的「漂移检查」区块：数据工程师点按钮入队 lake.inspect（重复点提示已在排队），查看者看不到按钮、提交被拒，任何角色都看到最近一次结果
+// 关系图下的「漂移检查」区块：数据工程师点按钮入队 lake.inspect（重复点提示已在排队），查看者看不到按钮、提交被拒，任何角色都看到最近一次结果；
+// 最近一次成功检查里有差异的表在两张图的列表行上带漂移标记，孤表在区块里单独列出
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { and, desc, eq } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -392,6 +393,45 @@ dedupe: { key: [card_id] }
     const failed = await (await viewer.get('/lineage')).text();
     expect(failed).toContain('data-inspect-status="failed"');
     expect(failed).toContain('数据湖读取失败');
+  });
+
+  it('最近一次成功的漂移检查有差异的标准层表，在关系图与流向图上标出差异种类与数量；孤表在漂移检查区块单独列出', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'eng@acme.com', 'data_engineer');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const eng = await loginAs(app, 'eng@acme.com');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+
+    // 从没检查过：没有标记
+    expect(await (await viewer.get('/lineage')).text()).not.toContain('data-node-drift');
+    expect(await (await eng.get('/lineage?tab=flow')).text()).not.toContain('data-node-drift');
+
+    await getDb().insert(tasks).values({
+      tenantId: acme, kind: 'lake.inspect', status: 'succeeded', finishedAt: new Date(),
+      result: { drifts: [
+        { table: 'customer', kind: 'missing', column: 'city', expected: 'VARCHAR' },
+        { table: 'customer', kind: 'missing', column: 'phone', expected: 'VARCHAR' },
+        { table: 'customer', kind: 'type', column: 'birthday', expected: 'DATE', actual: 'VARCHAR' },
+        { table: 'stray', kind: 'orphan' },
+      ] },
+    });
+    const nodeRow = (html: string, node: string) => html.match(new RegExp(`<tr[^>]*data-node="${node}"[\\s\\S]*?</tr>`))![0];
+    for (const who of [viewer, eng]) {
+      const graph = await (await who.get('/lineage')).text();
+      const customer = nodeRow(graph, 'customer');
+      expect(customer).toContain('data-node-drift="missing,type"');
+      expect(customer).toContain('缺 2 列 · 类型 1');
+      expect(nodeRow(graph, 'order')).not.toContain('data-node-drift');
+      expect(graph).not.toContain('data-node="stray"');
+      const orphan = graph.match(/<li[^>]*data-orphan="stray"[\s\S]*?<\/li>/)![0];
+      expect(orphan).toContain('湖里有这张表，但已没有任何已发布映射写入');
+    }
+
+    const flow = await (await eng.get('/lineage?tab=flow')).text();
+    const silver = flow.match(/<tr[^>]*data-silver="customer"[\s\S]*?<\/tr>/)![0];
+    expect(silver).toContain('data-node-drift="missing,type"');
+    expect(silver).toContain('缺 2 列 · 类型 1');
+    expect(flow.match(/<tr[^>]*data-silver="order"[^>]*>/)![0]).not.toContain('data-node-drift');
   });
 
   it('没有已发布映射时显示空状态', async () => {

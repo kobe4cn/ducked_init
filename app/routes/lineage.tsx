@@ -8,7 +8,8 @@
 // 单表聚焦画布（?tab=flow&focus=<实体>，从抽屉进入）只画这张标准层表与写入它的源表，连线从源列连到字段；同样只对有 sources:read 的成员开放
 // 流向图与聚焦画布上可以反向查（?q=列 或 表.列，不区分大小写）：命中的源表、映射、标准层表与连线保持原样，其余变淡；点源表节点（?node=table:<数据源>:<表>）
 // 在抽屉里按源列列出它影响的标准层字段。两者都只对有 sources:read 的成员生效。
-// 关系图下的「漂移检查」区块列出最近一次漂移检查（lake.inspect）的结果，任何角色可见；有 sources:write 的成员可以触发一次检查
+// 关系图下的「漂移检查」区块列出最近一次漂移检查（lake.inspect）的结果，任何角色可见；有 sources:write 的成员可以触发一次检查。
+// 最近一次成功的检查里有差异的标准层表在两张图的节点与图下列表上标出差异种类与数量；孤表在图上没有节点，在区块里单独列出
 import { useMemo } from 'react';
 import { data, Form, Link, redirect, useSearchParams } from 'react-router';
 import { AlertTriangle, ArrowLeft, CheckCircle2, CircleAlert, Loader2, Search } from 'lucide-react';
@@ -27,12 +28,14 @@ import type { Drift } from '~/.server/pipeline/inspect-engine';
 import { entityOf } from '~/lib/canonical-model';
 import { deriveLineage } from '~/lib/lineage';
 import { focusGraph, type FocusInput } from '~/lib/lineage-focus';
+import { driftAttrs, driftByTable, type DriftByTable } from '~/lib/lineage-drift';
 import { entityFields, type FieldDrawer, redactFields } from '~/lib/lineage-fields';
 import { type FlowInput, type FlowMerge, silverTotals } from '~/lib/lineage-flow';
 import { type SearchHits, searchImpact, tableImpact, type TableImpact } from '~/lib/lineage-search';
 import { relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
 import type { SourceKind } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
+import { DriftBadge } from '~/components/drift-badge';
 import { KindIcon } from '~/components/kind-icon';
 import { LineageDrawer, TableDrawer } from '~/components/lineage-drawer';
 import { FocusGraphView } from '~/components/lineage-focus';
@@ -152,6 +155,7 @@ export async function loader({ request }: Route.LoaderArgs) {
       inspectedAt: inspect.inspectedAt?.toISOString() ?? null,
       drifts: inspect.drifts,
     },
+    drift: driftByTable(inspect.drifts),
     flow,
     focus,
     drawer,
@@ -188,7 +192,7 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function Lineage({ loaderData, actionData }: Route.ComponentProps) {
-  const { tab, canFlow, canInspect, inspect, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, showAll, node, sql } = loaderData;
+  const { tab, canFlow, canInspect, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
   const [rawParams] = useSearchParams();
   // 链接里不带不生效的参数：关系图没有反向查，没有 sources:read 时不开源表抽屉
@@ -234,7 +238,7 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
         <section className="rounded-2xl border bg-white p-6 shadow-sm">
           <SectionHeader title="还没有已发布的映射">发布映射、合并到标准层之后，这里会画出已接入的表和它们之间的关系。</SectionHeader>
         </section>
-      ) : focus ? <FocusSection focus={focus} q={q} hits={hits} /> : flow ? <FlowSection flow={flow} q={q} hits={hits} /> : (
+      ) : focus ? <FocusSection focus={focus} q={q} hits={hits} /> : flow ? <FlowSection flow={flow} q={q} hits={hits} drift={drift} /> : (
         <>
           <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
             <div className="flex items-start justify-between gap-6">
@@ -246,7 +250,7 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
                 显示未接入的标准实体
               </Link>
             </div>
-            <RelationGraphView graph={graph} selected={node} />
+            <RelationGraphView graph={graph} selected={node} drift={drift} />
           </section>
 
           {sql && node && (
@@ -269,12 +273,13 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
               </TableHeader>
               <TableBody>
                 {graph.nodes.map(n => (
-                  <TableRow key={n.id} data-node={n.id} data-connected={n.connected} aria-selected={n.id === node} className={n.connected ? undefined : 'text-slate-400'}>
+                  <TableRow key={n.id} data-node={n.id} data-connected={n.connected} {...driftAttrs(drift[n.id])} aria-selected={n.id === node} className={n.connected ? undefined : 'text-slate-400'}>
                     <TableCell>
                       {n.connected
                         ? <Link to={nodeHref(n.id)} preventScrollReset className="font-mono text-xs hover:underline">{`silver.${n.id}`}</Link>
                         : <span className="font-mono text-xs">{`silver.${n.id}`}</span>}
                       {n.label !== n.id && <span className={`ml-2 ${n.connected ? 'text-slate-500' : ''}`}>{n.label}</span>}
+                      {drift[n.id] && <span className="ml-3"><DriftBadge counts={drift[n.id]} /></span>}
                       {n.identity && (
                         <div className="mt-1 space-x-3 text-xs text-slate-500">
                           {n.identity.rules && <span data-rules>匹配规则：{ruleLabels(n.identity.rules)}</span>}
@@ -332,6 +337,9 @@ const DRIFT_KINDS = { missing: '缺列', extra: '多列', type: '类型不一致
  */
 function InspectSection({ inspect, canInspect, submitError }: { inspect: InspectView; canInspect: boolean; submitError: string | null }) {
   const { status, drifts, inspectedAt } = inspect;
+  // 孤表在两张图上都没有节点，单独列出
+  const orphans = drifts.filter(d => d.kind === 'orphan');
+  const columns = drifts.filter(d => d.kind !== 'orphan');
   const alarming = status === 'failed' || (inspectedAt !== null && drifts.length > 0);
   return (
     <section data-inspect-status={status} className={`space-y-4 rounded-2xl border bg-white p-6 shadow-sm ${alarming ? 'border-red-200' : ''}`}>
@@ -362,8 +370,8 @@ function InspectSection({ inspect, canInspect, submitError }: { inspect: Inspect
       ) : (
         <>
           <p className="flex items-center gap-2 text-sm text-red-600"><AlertTriangle className="size-4" />{`${drifts.length} 处漂移`}</p>
-          <ul className="divide-y rounded-xl border text-sm">
-            {drifts.map(d => (
+          {columns.length > 0 && <ul className="divide-y rounded-xl border text-sm">
+            {columns.map(d => (
               <li key={`${d.table}:${d.kind}:${d.column ?? ''}`} data-drift={`${d.table}:${d.kind}:${d.column ?? ''}`} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2">
                 <span className="font-mono text-xs">{`silver.${d.table}`}</span>
                 <span className="text-red-600">{DRIFT_KINDS[d.kind]}</span>
@@ -373,7 +381,18 @@ function InspectSection({ inspect, canInspect, submitError }: { inspect: Inspect
                 )}
               </li>
             ))}
-          </ul>
+          </ul>}
+          {orphans.length > 0 && (
+            <ul className="divide-y rounded-xl border border-red-200 text-sm">
+              {orphans.map(d => (
+                <li key={d.table} data-drift={`${d.table}:orphan:`} data-orphan={d.table} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2">
+                  <span className="font-mono text-xs">{`silver.${d.table}`}</span>
+                  <span className="text-red-600">{DRIFT_KINDS.orphan}</span>
+                  <span className="text-slate-500">湖里有这张表，但已没有任何已发布映射写入</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </>
       ))}
     </section>
@@ -436,14 +455,14 @@ function FocusSection({ focus, q, hits }: { focus: FocusInput; q: string; hits: 
 }
 
 /** 流向图与图下服务端渲染的列表（React Flow 挂载后才渲染，列表给没有脚本时与测试用） */
-function FlowSection({ flow, q, hits }: { flow: FlowInput; q: string; hits: SearchHits | null }) {
+function FlowSection({ flow, q, hits, drift }: { flow: FlowInput; q: string; hits: SearchHits | null; drift: DriftByTable }) {
   const silver = [...silverTotals(flow.tables, flow.merges).values()];
   return (
     <>
       <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
         <SectionHeader title="流向图">源表按数据源分组，点分组可以折叠或展开；映射节点显示版本与最近一次合并，失败的标红，点开看合并记录；标准层表显示行数（各映射最近一次合并成功时的行数之和，最近一次失败或跳过的映射不计入）与写入它的映射数。点源表看它的列影响了哪些字段。</SectionHeader>
         <ImpactSearch q={q} focus={null} found={hits && hits.nodes.size > 0} />
-        <FlowGraphView flow={flow} hits={hits} />
+        <FlowGraphView flow={flow} hits={hits} drift={drift} />
       </section>
 
       <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
@@ -491,8 +510,11 @@ function FlowSection({ flow, q, hits }: { flow: FlowInput; q: string; hits: Sear
           </TableHeader>
           <TableBody>
             {silver.map(s => (
-              <TableRow key={s.entity} data-silver={s.entity} data-mappings={s.mappings} data-rows={s.rows} {...hitAttrs(hits, hits?.nodes.has(`silver.${s.entity}`))}>
-                <TableCell className="font-mono text-xs">{`silver.${s.entity}`}</TableCell>
+              <TableRow key={s.entity} data-silver={s.entity} data-mappings={s.mappings} data-rows={s.rows} {...driftAttrs(drift[s.entity])} {...hitAttrs(hits, hits?.nodes.has(`silver.${s.entity}`))}>
+                <TableCell className="font-mono text-xs">
+                  {`silver.${s.entity}`}
+                  {drift[s.entity] && <span className="ml-3 font-sans"><DriftBadge counts={drift[s.entity]} /></span>}
+                </TableCell>
                 <TableCell>{s.mappings}</TableCell>
                 <TableCell>{s.rows.toLocaleString('zh-CN')}</TableCell>
               </TableRow>
