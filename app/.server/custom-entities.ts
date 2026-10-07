@@ -59,6 +59,22 @@ export function customEntityInputOf(form: FormData): CustomEntityInput {
 /** 关系的展示：起点实体.起点字段 → 终点实体.终点字段 */
 const relationText = (r: EntityRelation) => `${r.from.entity}.${r.from.field} → ${r.ref.entity}.${r.ref.field}`;
 
+/** 标准模型字段上内置的 ref，写成与登记上的关系同形的边 */
+const BUILTIN_RELATIONS: EntityRelation[] = CANONICAL_ENTITIES.flatMap(e => e.fields.flatMap(f => (f.ref ? [{ from: { entity: e.name, field: f.name }, ref: f.ref }] : [])));
+
+/**
+ * 被关系指向的实体与各自的主键：内置 ref 与已发布登记上关系的终点，customer 除外。
+ * 合并时这些实体的主键在整个实体内跨映射唯一（ADR-0019「终点主键在整个实体内唯一」）
+ */
+export function referencedKeys(published: Map<string, RegisteredEntity>): Map<string, string[]> {
+  const targets = new Set([...BUILTIN_RELATIONS, ...[...published.values()].flatMap(e => e.relations ?? [])].map(r => r.ref.entity));
+  targets.delete('customer');
+  return new Map([...targets].flatMap(name => {
+    const key = entityOf(name)?.key.slice() ?? published.get(name)?.primaryKey;
+    return key ? [[name, key] as const] : [];
+  }));
+}
+
 /** 自定义实体名称的规则（CUSTOM_ENTITY_PATTERN） */
 export const ENTITY_NAME = new RegExp(CUSTOM_ENTITY_PATTERN);
 const FIELD_NAME = new RegExp(CUSTOM_FIELD_PATTERN);
@@ -149,7 +165,7 @@ export async function checkRelations(
   const edges = [
     ...[...published.values()].filter(e => e.name !== name).flatMap(e => e.relations ?? []),
     ...registration.relations,
-    ...CANONICAL_ENTITIES.flatMap(e => e.fields.flatMap(f => (f.ref ? [{ from: { entity: e.name, field: f.name }, ref: f.ref }] : []))),
+    ...BUILTIN_RELATIONS,
   ];
   const cycle = findCycle(edges, name);
   if (cycle) throw new CustomEntityError(`关系成环：${cycle.join(' → ')}；维度路径要能沿关系一直走到头，不能绕回来`);

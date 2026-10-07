@@ -393,6 +393,24 @@ describe('发布映射并合并到标准层', () => {
     expect(await silver(acme, 'customer', 'customer_id::INT')).toHaveLength(40);
   });
 
+  it('order 是内置 ref 的终点：order_id 与已有映射重叠的映射合并失败；customer 不查，主键重叠照常合并', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const customers = await publish(author, reviewer, id, CUSTOMERS);
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const before = await silver(acme, 'order', 'order_id::INT');
+    // customers 表的 customer_id 1..40 与 orders 表的 order_id 1..100 重叠
+    const clash = await publish(author, reviewer, id, 'model: 1\nentity: order\ntable: customers\nfields:\n  order_id: string(customer_id)\n');
+    expect((await getMapping(author, clash)).merge.history[0]).toMatchObject({
+      error: expect.stringContaining(`主键 order_id 跨映射重复：1（映射 ${[orders, clash].sort().join('、')}）`),
+    });
+    expect(await silver(acme, 'order', 'order_id::INT')).toEqual(before);
+
+    const again = await publish(author, reviewer, id, 'model: 1\nentity: customer\ntable: orders\nfields:\n  customer_id: string(customer_id)\n');
+    expect((await getMapping(author, again)).merge.history[0]).not.toHaveProperty('error');
+    expect((await silver(acme, 'customer', 'customer_id::INT')).filter(c => c.customer_id === '1').map(c => c._mapping).sort())
+      .toEqual([customers, again].sort());
+  });
+
   it('写了兜底值时值字典里没有的取值写成兜底值，合并照常完成，并记下落入兜底的取值与行数', async () => {
     const { acme, author, reviewer, id } = await syncedSource();
     const mapping = await publish(author, reviewer, id, ORDER_LOG_MAPPING

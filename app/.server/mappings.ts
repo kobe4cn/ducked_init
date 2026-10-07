@@ -6,7 +6,7 @@ import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
-import { publishedCustomEntities, type RegisteredEntity } from './custom-entities';
+import { publishedCustomEntities, referencedKeys, type RegisteredEntity } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
@@ -396,7 +396,8 @@ export async function dryRunMapping(actor: CurrentMember, mappingId: string, ver
 
 /**
  * 租户各映射（给了 mappingIds 时只取这些）最新的已发布版本及其合并计划（合并任务的参数）。
- * 输入是源视图的映射带上视图最新的已发布版本（SQL 与引用的表），工作进程不读平台库
+ * 输入是源视图的映射带上视图最新的已发布版本（SQL 与引用的表），工作进程不读平台库；
+ * 写入被关系指向的实体（标准模型内置 ref 与已发布登记上关系的终点，customer 除外）的映射带上实体主键 uniqueKey，合并时跨映射查重（ADR-0019）
  */
 export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId: string, mappingIds?: string[]): Promise<MergeMappingParam[]> {
   if (mappingIds && !mappingIds.length) return [];
@@ -409,13 +410,16 @@ export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId
     .where(and(eq(mappings.tenantId, tenantId), eq(mappingVersions.status, 'published'), mappingIds && inArray(mappings.id, mappingIds)))
     .orderBy(mappingVersions.mappingId, desc(mappingVersions.version));
   const views = await publishedViews(db, tenantId, { viewIds: [...new Set(rows.flatMap(r => (r.viewId ? [r.viewId] : [])))] });
+  const referenced = referencedKeys(await publishedCustomEntities(db, tenantId));
   return rows
     .sort((a, b) => a.mapping.localeCompare(b.mapping))
     .map(({ viewId, ...r }) => {
       const view = views.find(v => v.id === viewId);
+      const uniqueKey = referenced.get(r.plan.entity);
       return {
         ...r.plan, mapping: r.mapping, version: r.version, sourceId: r.sourceId,
         ...(view && { sourceView: viewParam(view) }),
+        ...(uniqueKey && { uniqueKey }),
       };
     });
 }

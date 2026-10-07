@@ -10,9 +10,10 @@ import {
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { customEntities } from '../../app/.server/db/schema';
 import type { EntityRelation } from '../../app/lib/canonical-model';
-import { createMapping, draftFor, saveDraft } from '../../app/.server/mappings';
+import { createMapping, draftFor, getMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
+import { listTasks } from '../../app/.server/tasks';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
@@ -567,5 +568,70 @@ dedupe: { key: [store_id, opened_on] }
     const { versions, draft } = await getCustomEntity(author, id);
     expect(versions).toHaveLength(1);
     expect(draft).toMatchObject({ label: '成员登记的门店', fields: STORE.fields, lastEditor: 'de@acme.com' });
+  });
+});
+
+describe('被关系指向的实体跨映射检查主键唯一', () => {
+  const CUSTOMERS = `model: 1
+entity: custom_store
+table: customers
+extensions:
+  store_id: { type: string, expr: string(customer_id) }
+dedupe: { key: [store_id] }
+`;
+  const ORDERS = `model: 1
+entity: custom_store
+table: orders
+extensions:
+  store_id: { type: string, expr: string(customer_id) }
+  opened_on: { type: date, expr: created_at }
+dedupe: { key: [store_id] }
+`;
+  /** 登记并发布 custom_store（referenced 时另登记指向它的 custom_shelf），customers 映射先合并，再发布 store_id 与之重叠的 orders 映射 */
+  async function overlapping(referenced: boolean) {
+    const { acme, author, reviewer } = await engineers();
+    const { id: sourceId } = await registerSource(author, await pgSourceInput(READER));
+    await selectAllTables(author, sourceId);
+    await drain();
+    await confirmWatermark(author, sourceId, 'customers', 'updated_at');
+    await confirmWatermark(author, sourceId, 'orders', 'order_id');
+    await syncSource(author, sourceId);
+    await drain();
+    await publishCustomEntity(reviewer, await createCustomEntity(author, STORE), 1);
+    if (referenced) {
+      await publishCustomEntity(reviewer, await createCustomEntity(author, {
+        name: 'custom_shelf', label: '货架', kind: 'dimension', primaryKey: ['shelf_id'],
+        fields: [{ name: 'shelf_id', type: 'string', description: '', sensitive: false }, { name: 'store_id', type: 'string', description: '', sensitive: false }],
+        relations: [{ from: { entity: 'custom_shelf', field: 'store_id' }, ref: { entity: 'custom_store', field: 'store_id' } }],
+      }), 1);
+    }
+    const first = await publish(author, reviewer, sourceId, CUSTOMERS);
+    const before = await silver(acme, 'custom_store', 'store_id::INT, _mapping');
+    const second = await publish(author, reviewer, sourceId, ORDERS);
+    return { acme, author, first, second, before };
+  }
+
+  it('被指向时后合并的映射带着重复的主键合并失败，列出冲突的键与映射，标准层不变；先合并的映射照常完成', async () => {
+    const { acme, author, first, second, before } = await overlapping(true);
+    expect(before).toHaveLength(40);
+    expect((await getMapping(author, first)).merge.history[0]).toMatchObject({ mode: 'rebuild', rows: 40 });
+
+    const conflict = `主键 store_id 跨映射重复：1（映射 ${[first, second].sort().join('、')}）；10（映射`;
+    const [merge] = (await listTasks(acme)).filter(t => t.kind === 'silver.merge');
+    expect(merge.status).toBe('failed');
+    expect(merge.error).toContain(conflict);
+    const { error } = (await getMapping(author, second)).merge.history[0] as { error: string };
+    expect(error).toContain(conflict);
+    // 最多列出 5 个键：1、10、11、12、13，共 40 个
+    expect(error.match(/（映射/g)).toHaveLength(5);
+    expect(error).toContain('共 40 个');
+    expect(await silver(acme, 'custom_store', 'store_id::INT, _mapping')).toEqual(before);
+  });
+
+  it('没被关系指向时同样的重复照常合并', async () => {
+    const { acme } = await overlapping(false);
+    const [merge] = (await listTasks(acme)).filter(t => t.kind === 'silver.merge');
+    expect(merge.status).toBe('succeeded');
+    expect(await silver(acme, 'custom_store', 'store_id::INT, _mapping')).toHaveLength(80);
   });
 });
