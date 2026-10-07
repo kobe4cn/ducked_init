@@ -9,7 +9,7 @@ import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
-import { memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
+import { memberOf, mergeUnchecked, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { mappingTemplate } from '../../app/.server/pipeline/mapping-spec';
 import { entityOf } from '../../app/lib/canonical-model';
@@ -164,7 +164,7 @@ describe('编写与发布映射', () => {
     expect(await (await (await loginAs(app, 'an@acme.com')).get(`/mappings/${id}?tab=merges`)).text()).not.toContain('data-add-to-dictionary');
   });
 
-  it('被关系指向的实体主键跨映射重复时，后发布的映射在详情页的合并记录与任务页标红，列出冲突的键与映射', async () => {
+  it('实体主键跨映射重复时，后发布的映射在详情页的合并记录与任务页标红，列出冲突的键与映射', async () => {
     const { tenantId, sourceId } = await tenantWithSource('acme');
     const engineer = await memberOf(tenantId, 'de@acme.com');
     await confirmWatermark(engineer, sourceId, 'customers', 'updated_at');
@@ -201,9 +201,10 @@ describe('编写与发布映射', () => {
     await confirmWatermark(engineer, sourceId, 'orders', 'order_id');
     await syncSource(engineer, sourceId);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
-    // touch 不被关系指向：customers 的 id 1..40 全在 orders 的 1..100 里
+    // customers 的 id 1..40 全在 orders 的 1..100 里：b 合并时被独占检查拦下，不查主键再合并一次，模拟检查上线前就已存在的重叠
     const a = await publish(engineer, reviewer, sourceId, 'model: 1\nentity: touch\ntable: customers\nfields:\n  touch_id: string(customer_id)\n  campaign_id: city\n');
     const b = await publish(engineer, reviewer, sourceId, 'model: 1\nentity: touch\ntable: orders\nfields:\n  touch_id: string(order_id)\n  campaign_id: status\n');
+    expect((await mergeUnchecked(tenantId, [b])).status).toBe('succeeded');
     await memberOf(tenantId, 'an@acme.com', 'analyst');
     const analyst = await loginAs(app, 'an@acme.com');
 

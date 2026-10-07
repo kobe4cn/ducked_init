@@ -571,7 +571,7 @@ dedupe: { key: [store_id, opened_on] }
   });
 });
 
-describe('被关系指向的实体跨映射检查主键唯一', () => {
+describe('自定义实体跨映射检查主键唯一', () => {
   const CUSTOMERS = `model: 1
 entity: custom_store
 table: customers
@@ -628,10 +628,11 @@ dedupe: { key: [store_id] }
     expect(await silver(acme, 'custom_store', 'store_id::INT, _mapping')).toEqual(before);
   });
 
-  it('没被关系指向时同样的重复照常合并', async () => {
-    const { acme } = await overlapping(false);
+  it('没被关系指向时同样的重复也合并失败（ADR-0024 独占），标准层不变', async () => {
+    const { acme, before } = await overlapping(false);
     const [merge] = (await listTasks(acme)).filter(t => t.kind === 'silver.merge');
-    expect(merge.status).toBe('succeeded');
-    expect(await silver(acme, 'custom_store', 'store_id::INT, _mapping')).toHaveLength(80);
+    expect(merge.status).toBe('failed');
+    expect(merge.error).toContain('主键 store_id 跨映射重复');
+    expect(await silver(acme, 'custom_store', 'store_id::INT, _mapping')).toEqual(before);
   });
 });

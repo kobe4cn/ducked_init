@@ -9,7 +9,7 @@ import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
+import { memberOf, mergeUnchecked, newTenant, publish, selectAllTables, silver } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -51,7 +51,7 @@ async function syncedSources() {
   return { acme, author, reviewer, id: ids[0], other: ids[1] };
 }
 
-// touch 不被关系指向，两个映射的主键可以重叠：customers 的 id 是 1..40，orders 的 id 是 1..100；
+// touch 两个映射的主键重叠：customers 的 id 是 1..40，orders 的 id 是 1..100；
 // campaign_id 一边是城市、一边是订单状态，从不一致
 const TOUCH_FROM_CUSTOMERS = 'model: 1\nentity: touch\ntable: customers\nfields:\n  touch_id: string(customer_id)\n  campaign_id: city\n';
 const TOUCH_FROM_ORDERS = 'model: 1\nentity: touch\ntable: orders\nfields:\n  touch_id: string(order_id)\n  campaign_id: status\n  customer_id: string(customer_id)\n';
@@ -78,6 +78,8 @@ describe('主键冲突体检', () => {
     const consentB = await publish(author, reviewer, id, CONSENT.replace('table: consents', 'table: consents_copy'));
     // 另一个数据源的同一批键不算撞上
     await publish(author, reviewer, other, CONSENT);
+    // 后发布的 touch 与同源的第二个 consent 映射合并时被独占检查拦下，不查主键再合并一次，模拟检查上线前就已存在的重叠
+    expect((await mergeUnchecked(acme, [fromOrders, consentB])).status).toBe('succeeded');
     expect((await silver(acme, 'consent', 'customer_id')).filter(c => c._source === other)).toHaveLength(3);
     const before = { touch: await silver(acme, 'touch', 'touch_id, _mapping'), order: await silver(acme, 'order', 'order_id'), merges: await mergeLogRows(acme) };
 

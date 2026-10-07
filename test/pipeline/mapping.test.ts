@@ -2,6 +2,7 @@
 // 之后源端的新增、更新与删除随同步后的合并进入标准层，去重键与取最新规则让源端的重复行只计一次；漂移检查报告缺列时，重建合并补上标准层缺的列
 import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
 import {
@@ -82,6 +83,12 @@ const COUPONS = `
     ('CP04', 'TPL01', NULL, 2, '已作废', '2024-06-01 10:00', NULL, NULL, NULL, '2024-07-01 10:00', '2024-06-05 10:00');
   GRANT SELECT ON shop.coupons TO ${READER.user};`;
 
+/** 营销同意的副本：与 consents 同样的行 */
+const CONSENTS_COPY = `
+  CREATE TABLE shop.consents_copy (LIKE shop.consents INCLUDING ALL);
+  INSERT INTO shop.consents_copy SELECT * FROM shop.consents;
+  GRANT SELECT ON shop.consents_copy TO ${READER.user};`;
+
 /** 订单明细：文本主键，order_id 对应 orders 的自增主键 */
 const ORDER_ITEMS = `
   CREATE TABLE shop.order_items (item_no text PRIMARY KEY, order_id int NOT NULL, qty int NOT NULL);
@@ -96,6 +103,12 @@ async function syncedSource(extra = '') {
   const input = await pgSourceInput(READER);
   await grantOnSource(ORDER_LOG + POINT_LOGS + CONSENTS + PREFERENCES + COUPON_TEMPLATES + COUPONS + extra);
   const { id } = await registerSource(author, input);
+  await syncAllTables(author, id);
+  return { acme, author, reviewer, id, input };
+}
+
+/** 选入数据源的全部表、确认水位线并同步一次 */
+async function syncAllTables(author: CurrentMember, id: string) {
   await selectAllTables(author, id);
   await drain();
   await confirmWatermark(author, id, 'customers', 'updated_at');
@@ -107,7 +120,6 @@ async function syncedSource(extra = '') {
   await confirmWatermark(author, id, 'coupons', 'update_time');
   await syncSource(author, id);
   await drain();
-  return { acme, author, reviewer, id, input };
 }
 
 const CUSTOMERS = `model: 1
@@ -417,6 +429,52 @@ describe('发布映射并合并到标准层', () => {
     expect((await getMapping(author, again)).merge.history[0]).not.toHaveProperty('error');
     expect((await silver(acme, 'customer', 'customer_id::INT')).filter(c => c.customer_id === '1').map(c => c._mapping).sort())
       .toEqual([customers, again].sort());
+  });
+
+  /** 写入 event 的映射：event_id 取 table 的 column */
+  const events = (table: string, column: string, extra = '') => `model: 1\nentity: event\ntable: ${table}\nfields:\n  event_id: string(${column})\n${extra}`;
+
+  it('不被关系指向的 event 也跨映射查主键：event_id 与已有映射重叠的映射合并失败，列出冲突的键与映射，标准层不变', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const fromOrders = await publish(author, reviewer, id, events('orders', 'order_id'));
+    const before = await silver(acme, 'event', 'event_id::INT');
+    expect(before).toHaveLength(100);
+    // customers 表的 customer_id 1..40 全在 orders 表的 order_id 1..100 里
+    const clash = await publish(author, reviewer, id, events('customers', 'customer_id'));
+    const { error } = (await getMapping(author, clash)).merge.history[0] as { error: string };
+    expect(error).toContain(`主键 event_id 跨映射重复：1（映射 ${[fromOrders, clash].sort().join('、')}）；10（映射`);
+    expect(error).toContain('共 40 个');
+    expect(await silver(acme, 'event', 'event_id::INT')).toEqual(before);
+  });
+
+  it('consent 的主键含指向 customer 的 customer_id：两个数据源有相同的 (customer_id, channel) 照常合并，同一数据源的两个映射重复时后合并的失败', async () => {
+    const { acme, author, reviewer, id, input } = await syncedSource(CONSENTS_COPY);
+    await confirmWatermark(author, id, 'consents_copy', 'update_time');
+    await syncSource(author, id);
+    await drain();
+    const { id: other } = await registerSource(author, { ...input, name: '第二库' });
+    await syncAllTables(author, other);
+    const first = await publish(author, reviewer, id, CONSENTS_MAPPING);
+    const elsewhere = await publish(author, reviewer, other, CONSENTS_MAPPING);
+    expect((await getMapping(author, elsewhere)).merge.history[0]).not.toHaveProperty('error');
+    const before = await silver(acme, 'consent', 'customer_id, channel, _source');
+    expect(before.map(c => c._source).sort()).toEqual([id, id, id, other, other, other].sort());
+
+    const clash = await publish(author, reviewer, id, CONSENTS_MAPPING.replace('table: consents', 'table: consents_copy'));
+    expect((await getMapping(author, clash)).merge.history[0]).toMatchObject({
+      error: expect.stringContaining(`主键 customer_id、channel 跨映射重复：1, email（映射 ${[first, clash].sort().join('、')}）`),
+    });
+    expect(await silver(acme, 'consent', 'customer_id, channel, _source')).toEqual(before);
+  });
+
+  it('两个映射的主键原值重叠、其中一个声明了键空间时照常合并：标准层比较的是带前缀的主键', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const fromOrders = await publish(author, reviewer, id, events('orders', 'order_id'));
+    const fromCustomers = await publish(author, reviewer, id, events('customers', 'customer_id', 'key_space: crm\n'));
+    expect((await getMapping(author, fromCustomers)).merge.history[0]).not.toHaveProperty('error');
+    const rows = await silver(acme, 'event', 'event_id');
+    expect(rows).toHaveLength(140);
+    expect(rows.filter(e => e.event_id === '1' || e.event_id === 'crm:1').map(e => e._mapping).sort()).toEqual([fromOrders, fromCustomers].sort());
   });
 
   it('映射声明键空间：标准层的主键带前缀并记下 _key_space；同源订单明细的 order_id 写了同一键空间，两边关联得上', async () => {

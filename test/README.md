@@ -37,6 +37,7 @@ npx vitest run test/pipeline/mapping.test.ts # 单个文件
 | `runTask(tenantId, kind, params?)` | 入队一个任务并让调度器跑空，返回任务最终状态 |
 | `selectAllTables(member, sourceId)` | 把数据源里可读的表全部选入同步范围（会入队采集，之后要跑空调度器） |
 | `publish(author, reviewer, sourceId, yaml)` | 起草映射并由另一位成员发布，跑空调度器（合并完成），返回映射 ID |
+| `mergeUnchecked(tenantId, mappingIds)` | 不查跨映射主键，把这些已发布映射合并一次（去掉 `uniqueKey` / `uniqueBySource`），模拟独占检查上线前已存在的重叠；返回合并任务最终状态 |
 | `silver(tenantId, entity, orderBy)` | 读出标准层某个实体的表（时间按 UTC 文本、金额按文本，去掉 `_merged_at`） |
 
 跑空调度器：`createDispatcher({ maxWorkers: 2 }).runUntilIdle()`（来自 `app/.server/pipeline/dispatcher`），测试里通常包成 `const drain = () => ...`。

@@ -5,7 +5,7 @@ import type { CurrentMember } from '../../app/.server/auth';
 import { getDb } from '../../app/.server/db/client';
 import { members, spaces, tenants, type Role } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { createMapping, publishMapping } from '../../app/.server/mappings';
+import { createMapping, publishedPlans, publishMapping } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { enqueueTask, getTask, type TaskKind } from '../../app/.server/tasks';
@@ -56,6 +56,15 @@ export async function publish(author: CurrentMember, reviewer: CurrentMember, so
   await publishMapping(reviewer, mapping.id, 1);
   await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
   return mapping.id;
+}
+
+/**
+ * 不查跨映射主键，把这些已发布映射合并一次（参数里去掉 uniqueKey 与 uniqueBySource），模拟独占检查上线前就已存在的重叠（ADR-0024）；
+ * 返回合并任务的最终状态
+ */
+export async function mergeUnchecked(tenantId: string, mappingIds: string[]) {
+  const mappings = (await publishedPlans(getDb(), tenantId, mappingIds)).map(({ uniqueKey: _k, uniqueBySource: _s, ...plan }) => plan);
+  return runTask(tenantId, 'silver.merge', { mappings });
 }
 
 /** 读取本租户标准层某个实体的表（时间按 UTC 文本、金额按文本显示） */

@@ -71,15 +71,19 @@ export function relationsFrom(entity: string, published: Map<string, RegisteredE
 }
 
 /**
- * 被关系指向的实体与各自的主键：内置 ref 与已发布登记上关系的终点，customer 除外。
- * 合并时这些实体的主键在整个实体内跨映射唯一（ADR-0019「终点主键在整个实体内唯一」）
+ * 合并时跨映射唯一的实体与各自的主键：全部标准实体与已发布的自定义实体，customer 与主键未知的实体除外（ADR-0024「独占」）。
+ * bySource：主键里有字段指向 customer（标准实体看字段上内置的 ref，自定义实体与扩展字段看已发布登记上的关系），这时只在同一个数据源内唯一
  */
-export function referencedKeys(published: Map<string, RegisteredEntity>): Map<string, string[]> {
-  const targets = new Set(allRelations(published).map(r => r.ref.entity));
-  targets.delete('customer');
-  return new Map([...targets].flatMap(name => {
+export function uniqueKeys(published: Map<string, RegisteredEntity>): Map<string, { key: string[]; bySource: boolean }> {
+  const relations = [...published.values()].flatMap(e => e.relations ?? []);
+  const toCustomer = (entity: string, field: string) =>
+    entityOf(entity)?.fields.find(f => f.name === field)?.ref?.entity === 'customer'
+    || relations.some(r => r.from.entity === entity && r.from.field === field && r.ref.entity === 'customer');
+  const names = new Set([...CANONICAL_ENTITIES.map(e => e.name), ...published.keys()]);
+  names.delete('customer');
+  return new Map([...names].flatMap(name => {
     const key = entityOf(name)?.key.slice() ?? published.get(name)?.primaryKey;
-    return key ? [[name, key] as const] : [];
+    return key?.length ? [[name, { key, bySource: key.some(f => toCustomer(name, f)) }] as const] : [];
   }));
 }
 
