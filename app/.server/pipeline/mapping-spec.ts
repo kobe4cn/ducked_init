@@ -6,7 +6,7 @@
 import { Ajv, type ErrorObject } from 'ajv';
 import { Document, isMap, isScalar, isSeq, LineCounter, parseDocument, type Node, type YAMLMap } from 'yaml';
 import {
-  CANONICAL_ENTITIES, CUSTOM_FIELD_PATTERN, entityOf, EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, isCustomEntity, MODEL_MAJOR,
+  CANONICAL_ENTITIES, CUSTOM_FIELD_PATTERN, entityOf, EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, isCustomEntity, KEY_SPACE_PATTERN, MODEL_MAJOR,
   type CanonicalEntity, type CanonicalField, type EntityRelation, type FieldType,
 } from '../../lib/canonical-model';
 import { fieldsForColumn, normalizeName, similarFields, similarNames, standardValue } from '../../lib/field-synonyms';
@@ -40,8 +40,8 @@ export interface MappingSpec {
 /** 身份打通的匹配规则：按优先级排列的匹配字段 */
 export interface IdentityRules { match: string[] }
 
-/** 键空间名：小写字母、数字与下划线，不会有冒号（第一个冒号就是键空间与原值的分界） */
-const keySpace = { type: 'string', pattern: '^[a-z0-9_]+$' };
+/** 键空间名（KEY_SPACE_PATTERN） */
+const keySpace = { type: 'string', pattern: KEY_SPACE_PATTERN };
 
 const fieldSpec = {
   type: ['string', 'object'],

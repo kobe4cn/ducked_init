@@ -236,6 +236,8 @@ export const entityOf = (name: string) => CANONICAL_ENTITIES.find(e => e.name ==
 export const CUSTOM_ENTITY_PATTERN = '^custom_[a-z][a-z0-9_]*$';
 /** 标准实体上的扩展字段：x_ 开头，避免与标准模型以后新增的字段重名 */
 export const EXTENSION_PATTERN = '^x_[a-z][a-z0-9_]*$';
+/** 键空间名：小写字母、数字与下划线，不会有冒号（第一个冒号就是键空间与原值的分界，ADR-0024） */
+export const KEY_SPACE_PATTERN = '^[a-z0-9_]+$';
 /** 自定义实体的字段名 */
 export const CUSTOM_FIELD_PATTERN = '^[a-z][a-z0-9_]*$';
 

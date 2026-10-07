@@ -1,12 +1,12 @@
 // 映射表单与 YAML 互转（纯函数）：从映射 YAML 读出每个标准字段的表单状态（源列、常用转换、参数、依据、是否只读），
 // 改单个字段时在原 Document 上改，保留注释与顺序；枚举字段的值对照与兜底读出、写回；表单不认识的写法只读、原样保留；
-// 扩展字段：没用到的源列、读出已有的扩展字段、加上 / 改名 / 删除
+// 扩展字段：没用到的源列、读出已有的扩展字段、加上 / 改名 / 删除；映射与引用字段的键空间读出、写回，引用字段按同源目标实体的键空间预填
 import { parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
 import {
-  dictionaryRows, identityCandidates, newExtension, readExtensions, readForm, readIdentity, seedDictionary, TRANSFORMS, unusedColumns, writeExtension,
-  writeField, writeIdentity,
+  dictionaryRows, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity, readKeySpace, seedDictionary, TRANSFORMS,
+  unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace,
   type FieldChoice, type FieldForm,
 } from '../app/lib/mapping-form';
 import { draftMapping } from '../app/.server/pipeline/mapping-draft';
@@ -41,8 +41,8 @@ const CUSTOMERS = table('customers', [
 ], ['customer_id']);
 
 const field = (forms: FieldForm[], name: string) => forms.find(f => f.field === name)!;
-const choiceOf = ({ transform, column, args, parts, raw, dictionary, otherwise }: FieldForm): FieldChoice =>
-  ({ transform: transform!, column, args, parts, raw, dictionary, ...(otherwise !== undefined && { otherwise }) });
+const choiceOf = ({ transform, column, args, parts, raw, dictionary, otherwise, keySpace }: FieldForm): FieldChoice =>
+  ({ transform: transform!, column, args, parts, raw, dictionary, ...(otherwise !== undefined && { otherwise }), keySpace });
 
 /** 把每个可写的字段按读出的状态原样写回 */
 function rewriteAll(yaml: string, entity = ORDER) {
@@ -415,5 +415,55 @@ describe('身份打通的匹配字段', () => {
     expect(readIdentity(parseDocument('identity: [phone]\n'))).toMatchObject({ match: [], reason: expect.stringContaining('YAML') });
     expect(readIdentity(parseDocument('identity:\n  match: phone\n'))).toMatchObject({ reason: expect.stringContaining('YAML') });
     expect(() => writeIdentity(parseDocument('identity: [phone]\n'), ['phone'])).toThrow(/YAML/);
+  });
+});
+
+describe('键空间', () => {
+  const ITEM = entityOf('order_item')!;
+  const ITEMS = 'model: 1\nentity: order_item\ntable: order_items\nfields:\n  order_item_id: item_no\n  order_id: string(order_id) # 同名\n  quantity: qty\n';
+  const columns = ['item_no', 'order_id', 'qty'].map(name => ({ name, type: 'VARCHAR' }));
+
+  it('映射顶层的 key_space 读出、写回，清空时删掉，其他行不动', () => {
+    const doc = parseDocument(ITEMS);
+    expect(readKeySpace(doc)).toBeNull();
+    writeKeySpace(doc, 'pos');
+    expect(doc.toString()).toBe(`${ITEMS}key_space: pos\n`);
+    expect(readKeySpace(parseDocument(doc.toString()))).toBe('pos');
+    writeKeySpace(doc, 'web');
+    expect(readKeySpace(doc)).toBe('web');
+    writeKeySpace(doc, null);
+    expect(doc.toString()).toBe(ITEMS);
+  });
+
+  it('带 key_space 的引用字段可写，读出键空间；原样写回文本不变', () => {
+    const yaml = ITEMS.replace('string(order_id) # 同名', '{ expr: string(order_id), key_space: pos }');
+    expect(field(readForm(parseDocument(yaml), ITEM), 'order_id')).toMatchObject({ transform: 'text', column: 'order_id', keySpace: 'pos', readonly: false });
+    expect(field(readForm(parseDocument(ITEMS), ITEM), 'order_id')).not.toHaveProperty('keySpace');
+    expect(rewriteAll(yaml, ITEM)).toBe(yaml);
+    expect(field(readForm(parseDocument(ITEMS.replace('string(order_id) # 同名', '{ expr: order_id, key_space: 1 }')), ITEM), 'order_id').readonly).toBe(true);
+  });
+
+  it('写字段时带上键空间写成对象写法并通过校验；清空键空间时变回原来的写法', () => {
+    const doc = parseDocument(ITEMS);
+    writeField(doc, ITEM, 'order_id', { transform: 'text', column: 'order_id', keySpace: 'pos' });
+    expect(field(readForm(doc, ITEM), 'order_id')).toMatchObject({ transform: 'text', keySpace: 'pos', readonly: false });
+    expect(checkMapping(doc.toString(), () => columns)).toMatchObject({ ok: true, plan: { columns: expect.arrayContaining([expect.objectContaining({ name: 'order_id', keySpace: 'pos' })]) } });
+    writeField(doc, ITEM, 'order_id', { transform: 'text', column: 'order_id', keySpace: 'web' });
+    expect(field(readForm(doc, ITEM), 'order_id').keySpace).toBe('web');
+    writeField(doc, ITEM, 'order_id', { transform: 'text', column: 'order_id', keySpace: '' });
+    expect(doc.toString()).toBe(ITEMS);
+    // 还没对应的字段直接写成对象写法
+    writeField(doc, ITEM, 'product_id', { transform: 'direct', column: 'sku', keySpace: 'pos' });
+    expect(field(readForm(doc, ITEM), 'product_id')).toMatchObject({ column: 'sku', keySpace: 'pos' });
+  });
+
+  it('引用字段的键空间：YAML 里写了的照写，没写时按同源目标实体的键空间预填；不是引用字段的没有', () => {
+    const forms = readForm(parseDocument(ITEMS), ITEM);
+    const keySpaces = { order: 'pos', product: 'erp' };
+    const standard = (name: string) => ITEM.fields.find(f => f.name === name)!;
+    expect(keySpaceOf(field(forms, 'order_id'), standard('order_id'), keySpaces)).toBe('pos');
+    expect(keySpaceOf(field(forms, 'product_id'), standard('product_id'), {})).toBe('');
+    expect(keySpaceOf({ ...field(forms, 'order_id'), keySpace: 'web' }, standard('order_id'), keySpaces)).toBe('web');
+    expect(keySpaceOf(field(forms, 'quantity'), standard('quantity'), keySpaces)).toBeNull();
   });
 });

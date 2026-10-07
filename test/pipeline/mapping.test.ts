@@ -4,7 +4,9 @@ import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
-import { createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, rebuildEntity, saveDraft } from '../../app/.server/mappings';
+import {
+  createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, rebuildEntity, referenceTables, saveDraft,
+} from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -437,9 +439,13 @@ describe('发布映射并合并到标准层', () => {
   const orderItems = (orderId: string) =>
     `model: 1\nentity: order_item\ntable: order_items\nfields:\n  order_item_id: item_no\n  order_id: ${orderId}\n  quantity: qty\n`;
 
-  it('同源订单映射声明了键空间 pos：订单明细的 order_id 没写或写了别的键空间时发布被拒，列出字段与应写的 pos；写了 pos 照常发布', async () => {
+  it('同源订单映射声明了键空间 pos：对照的每张源表带上 order → pos（表单据此预填）；订单明细的 order_id 没写或写了别的键空间时发布被拒，列出字段与应写的 pos；写了 pos 照常发布', async () => {
     const { author, reviewer, id } = await syncedSource(ORDER_ITEMS);
+    expect((await referenceTables(author, id)).every(t => JSON.stringify(t.keySpaces) === '{}')).toBe(true);
     await publish(author, reviewer, id, `${ORDERS}key_space: pos\n`);
+    const tables = await referenceTables(author, id);
+    expect(tables.find(t => t.name === 'order_items')!.keySpaces).toEqual({ order: 'pos' });
+    expect(tables.every(t => t.keySpaces.order === 'pos')).toBe(true);
     const items = await createMapping(author, id, orderItems('string(order_id)'));
     await expect(publishMapping(reviewer, items.id, 1)).rejects.toThrow(new MappingError('引用字段要写上目标实体在同一数据源里声明的键空间：order_id 应写 key_space: pos'));
     // 还没发布过：草稿原地改，仍是第 1 版
@@ -460,6 +466,8 @@ describe('发布映射并合并到标准层', () => {
     await syncSource(author, other.id);
     await drain();
     await publish(author, reviewer, other.id, `${ORDERS}key_space: web\n`);
+    expect((await referenceTables(author, id)).find(t => t.name === 'order_items')!.keySpaces).toEqual({});
+    expect((await referenceTables(author, other.id)).find(t => t.name === 'orders')!.keySpaces).toEqual({ order: 'web' });
 
     const items = await createMapping(author, id, orderItems('string(order_id)'));
     await publishMapping(reviewer, items.id, 1);

@@ -4,7 +4,9 @@
 // 改了表达式时清掉该字段的行尾注释：草稿写在那里的依据（同名、单位、时区）对新写法不一定成立。
 // 扩展字段：列出还没被任何字段用到的源列，勾选即按列推断名字与类型加上（列名或格式像敏感信息的默认标成敏感）；已有的扩展字段可改名、类型、中文名
 // 与是否敏感，取消勾选即删除，值字典与兜底原样保留。标准字段是否敏感由标准模型决定，YAML 里照写的 sensitive 原样保留。
-// 身份打通（只用于 customer）：从已映射的敏感字段里选匹配字段并排序，写成 identity.match，全部去掉时删掉 identity
+// 身份打通（只用于 customer）：从已映射的敏感字段里选匹配字段并排序，写成 identity.match，全部去掉时删掉 identity。
+// 键空间（ADR-0024）：映射顶层的 key_space 可填可清空；引用字段的 key_space 随字段写成对象写法 { expr, key_space }，
+// 没写时按同一数据源里目标实体已发布映射声明的键空间预填（只在写这个字段时一并写进 YAML）
 import { isMap, isScalar, isSeq, YAMLMap, YAMLSeq, type Document, type Scalar } from 'yaml';
 import { EXTENSION_PATTERN, FIELD_TYPE_NAMES, type CanonicalEntity, type CanonicalField, type FieldType } from './canonical-model';
 import { extensionName, standardValue } from './field-synonyms';
@@ -64,6 +66,8 @@ export interface FieldChoice {
   dictionary?: DictionaryEntry[];
   /** 兜底值：null 是记为空；undefined 是不写（没对上的取值让合并失败） */
   otherwise?: string | null;
+  /** 引用字段的键空间；空时不写 key_space */
+  keySpace?: string | null;
 }
 
 export interface FieldForm {
@@ -81,6 +85,8 @@ export interface FieldForm {
   dictionary?: DictionaryEntry[];
   /** 兜底值，只在 YAML 里写了时有这一项（null 是记为空） */
   otherwise?: string | null;
+  /** 键空间，只在 YAML 里写了时有这一项 */
+  keySpace?: string;
   readonly: boolean;
   /** 只读的原因 */
   reason?: string;
@@ -172,16 +178,20 @@ function locate(doc: Document, standard: CanonicalField | undefined, field: stri
 
   let node: unknown = value;
   let reason: string | undefined;
-  let dictionary: Pick<FieldForm, 'dictionary' | 'otherwise'> = {};
+  // 对象写法里表达式之外表单认识的项：值对照、兜底与键空间
+  let extras: Pick<FieldForm, 'dictionary' | 'otherwise' | 'keySpace'> = {};
   if (isMap(value)) {
     const keys = value.items.map(p => (isScalar(p.key) ? p.key.value : null));
     node = value.get('expr', true);
-    if (keys.some(k => k !== 'expr' && k !== 'dictionary' && k !== 'otherwise' && k !== 'sensitive')) reason = UNKNOWN;
+    const keySpace = value.get('key_space');
+    if (keys.some(k => k !== 'expr' && k !== 'dictionary' && k !== 'otherwise' && k !== 'sensitive' && k !== 'key_space')) reason = UNKNOWN;
+    else if (keys.includes('key_space') && typeof keySpace !== 'string') reason = UNKNOWN;
     else if (keys.includes('dictionary') || keys.includes('otherwise')) {
       const read = isEnumField(standard) ? readDictionary(value) : '非枚举字段带值字典或兜底值（dictionary / otherwise），请在 YAML 里修改';
       if (typeof read === 'string') reason = read;
-      else dictionary = read;
+      else extras = read;
     }
+    if (typeof keySpace === 'string') extras = { ...extras, keySpace };
   }
   if (!isScalar(node) || typeof node.value !== 'string') return { form: { ...form, readonly: true, reason: reason ?? UNKNOWN } };
 
@@ -189,7 +199,7 @@ function locate(doc: Document, standard: CanonicalField | undefined, field: stri
   const basis = node.comment?.trim() || undefined;
   try {
     const spec = isMap(value) ? value : undefined;
-    return { form: { ...form, ...recognize(parseExpression(raw)), raw, ...dictionary, readonly: !!reason, reason, basis }, ...(!reason && { node, spec }) };
+    return { form: { ...form, ...recognize(parseExpression(raw)), raw, ...extras, readonly: !!reason, reason, basis }, ...(!reason && { node, spec }) };
   } catch (e) {
     if (!(e instanceof ExprError)) throw e;
     return { form: { ...form, transform: 'custom', raw, readonly: true, reason: reason ?? `表达式有误（${e.message}），请在 YAML 里修改`, basis } };
@@ -266,13 +276,15 @@ export function writeField(doc: Document, entity: CanonicalEntity, field: string
   // 与 YAML 里原样的条目比：草稿里待填（null）的条目在写这个字段时一并去掉，否则校验不通过
   const dictionaryChanged = !sameDictionary(dictionary, form.dictionary?.length ? form.dictionary : undefined);
   const otherwiseChanged = otherwise !== form.otherwise;
+  const keySpace = choice.keySpace?.trim() || undefined;
+  const keySpaceChanged = keySpace !== form.keySpace;
   if (node) {
     if (!form.transform || expressionOf({ ...form, transform: form.transform }, type) !== expr) {
       node.value = expr;
       node.type = undefined;
       node.comment = undefined;
     }
-    if (!dictionaryChanged && !otherwiseChanged) return;
+    if (!dictionaryChanged && !otherwiseChanged && !keySpaceChanged) return;
     if (spec) {
       if (dictionaryChanged) {
         if (dictionary) setKey(doc, spec, 'dictionary', dictionaryNode(doc, dictionary, spec.get('dictionary', true)));
@@ -280,14 +292,16 @@ export function writeField(doc: Document, entity: CanonicalEntity, field: string
       }
       if (otherwise === undefined) spec.delete('otherwise');
       else if (otherwiseChanged) setKey(doc, spec, 'otherwise', otherwise);
-      // 对照与兜底都去掉了：变回标量写法
+      if (!keySpace) spec.delete('key_space');
+      else if (keySpaceChanged) setKey(doc, spec, 'key_space', keySpace);
+      // 对照、兜底与键空间都去掉了：变回标量写法
       const pair = isMap(fields) ? fields.items.find(p => p.value === spec) : undefined;
       if (pair && spec.items.length === 1) pair.value = node;
       return;
     }
   }
   // 表达式节点（带依据注释）原样放进对象写法
-  const value = dictionary || otherwise !== undefined ? specNode(doc, node ?? expr, dictionary, otherwise) : (node ?? expr);
+  const value = dictionary || otherwise !== undefined || keySpace ? specNode(doc, node ?? expr, dictionary, otherwise, keySpace) : (node ?? expr);
   if (!isMap(fields)) {
     doc.set('fields', doc.createNode({ [field]: value }));
     return;
@@ -306,13 +320,24 @@ export function writeField(doc: Document, entity: CanonicalEntity, field: string
   else fields.items.splice(next, 0, pair);
 }
 
-/** 对象写法 { expr, dictionary, otherwise } */
-function specNode(doc: Document, expr: Scalar | string, dictionary: DictionaryEntry[] | undefined, otherwise: string | null | undefined) {
+/** 对象写法 { expr, dictionary, otherwise, key_space }；只带键空间、表达式没有行尾注释时写成行内 */
+function specNode(doc: Document, expr: Scalar | string, dictionary: DictionaryEntry[] | undefined, otherwise: string | null | undefined, keySpace?: string) {
   const spec = new YAMLMap();
+  spec.flow = !dictionary && otherwise === undefined && !(typeof expr !== 'string' && expr.comment);
   setKey(doc, spec, 'expr', expr);
   if (dictionary) setKey(doc, spec, 'dictionary', dictionaryNode(doc, dictionary));
   if (otherwise !== undefined) setKey(doc, spec, 'otherwise', otherwise);
+  if (keySpace) setKey(doc, spec, 'key_space', keySpace);
   return spec;
+}
+
+/**
+ * 引用字段（标准模型内置 ref）表单上的键空间：YAML 里写了的照写，没写时是 keySpaces（同一数据源里各实体已发布映射声明的键空间）里
+ * 目标实体的键空间，都没有时为空串；不是引用字段时为 null（不显示键空间）
+ */
+export function keySpaceOf(form: FieldForm, standard: CanonicalField, keySpaces: Readonly<Record<string, string>>): string | null {
+  if (!standard.ref) return null;
+  return form.keySpace ?? keySpaces[standard.ref.entity] ?? '';
 }
 
 /** 设置对象写法里的一项；新加的键也是 Scalar 节点（YAMLMap.set 加的是字符串键，原地再读时认不出） */
@@ -512,4 +537,17 @@ export function writeIdentity(doc: Document, match: string[]): void {
   const identity = new YAMLMap();
   setKey(doc, identity, 'match', seq);
   doc.set('identity', identity);
+}
+
+/** 映射顶层的键空间；没写或写的不是文本时为 null */
+export function readKeySpace(doc: Document): string | null {
+  const value = doc.get('key_space');
+  return typeof value === 'string' ? value : null;
+}
+
+/** 写映射顶层的键空间，空时删掉 key_space */
+export function writeKeySpace(doc: Document, keySpace: string | null): void {
+  const value = keySpace?.trim();
+  if (!value) doc.delete('key_space');
+  else if (readKeySpace(doc) !== value) doc.set('key_space', value);
 }

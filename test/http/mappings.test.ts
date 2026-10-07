@@ -1,6 +1,6 @@
 // 标准模型与映射的 HTTP 接缝：任何成员都能浏览标准模型；数据工程师在界面上编写映射（不合格的 YAML 被拒绝并给出位置），
 // 新建页默认是按规则生成的草稿（源没有已采集的表时是模板），也能按所选的表与实体重新生成填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
-// 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射（含勾选源列加的扩展字段）照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
+// 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射（含勾选源列加的扩展字段、映射与引用字段的键空间）照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { parseDocument } from 'yaml';
 import { closeDb } from '../../app/.server/db/client';
@@ -13,7 +13,10 @@ import { memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtu
 import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { mappingTemplate } from '../../app/.server/pipeline/mapping-spec';
 import { entityOf } from '../../app/lib/canonical-model';
-import { newExtension, readForm, unusedColumns, writeExtension, writeField, type FieldChoice } from '../../app/lib/mapping-form';
+import { referenceTables } from '../../app/.server/mappings';
+import {
+  keySpaceOf, newExtension, readForm, readKeySpace, unusedColumns, writeExtension, writeField, writeKeySpace, type FieldChoice,
+} from '../../app/lib/mapping-form';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
@@ -718,6 +721,39 @@ describe('表单式映射编辑器', () => {
     expect(created.status).toBe(302);
     expect(editorYaml(await (await author.get(`/mappings/${mappingIdOf(created)}`)).text())).toBe(yaml);
   });
+  it('键空间：表单里给订单映射填 pos 并发布；订单明细表单的 order_id 按同源订单映射预填 pos，打开时 YAML 不变，填写该字段后带上 key_space: pos 并能发布', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme', `
+      CREATE TABLE shop.order_items (item_no text PRIMARY KEY, order_id int NOT NULL, qty int NOT NULL);
+      GRANT SELECT ON shop.order_items TO ${READER.user};`);
+    const author = await loginAs(app, 'de@acme.com');
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+    const orders = parseDocument(ORDERS);
+    writeKeySpace(orders, 'pos');
+    expect(readKeySpace(parseDocument(orders.toString()))).toBe('pos');
+    const ordersId = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: orders.toString() }));
+    expect((await reviewer.post(`/mappings/${ordersId}`, { intent: 'publish', version: '1' })).status).toBe(302);
+
+    const ITEM = entityOf('order_item')!;
+    const items = 'model: 1\nentity: order_item\ntable: order_items\nfields:\n  order_item_id: item_no\n  order_id: string(order_id)\n  quantity: qty\n';
+    const itemsId = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: items }));
+    // 编辑页对照的源表带上同源订单映射的键空间，order_id 一行据此预填；只是打开表单时 YAML 不变
+    const table = (await referenceTables(await memberOf(tenantId, 'de@acme.com'), sourceId)).find(t => t.name === 'order_items')!;
+    const saved = parseDocument(editorYaml(await (await author.get(`/mappings/${itemsId}`)).text()));
+    expect(saved.toString()).toBe(items);
+    const orderId = readForm(saved, ITEM).find(f => f.field === 'order_id')!;
+    const keySpace = keySpaceOf(orderId, ITEM.fields.find(f => f.name === 'order_id')!, table.keySpaces);
+    expect(keySpace).toBe('pos');
+    const rejected = await reviewer.post(`/mappings/${itemsId}`, { intent: 'publish', version: '1' });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toContain('order_id 应写 key_space: pos');
+
+    writeField(saved, ITEM, 'order_id', { transform: 'text', column: 'order_id', keySpace });
+    expect(saved.toJS().fields.order_id).toEqual({ expr: 'string(order_id)', key_space: 'pos' });
+    expect((await author.post(`/mappings/${itemsId}`, { intent: 'save', yaml: saved.toString() })).status).toBe(302);
+    expect((await reviewer.post(`/mappings/${itemsId}`, { intent: 'publish', version: '1' })).status).toBe(302);
+  });
+
   it('敏感字段：表单里把扩展字段标成敏感后保存成功；YAML 里取消内置敏感字段的敏感标记被拒绝', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const author = await loginAs(app, 'de@acme.com');

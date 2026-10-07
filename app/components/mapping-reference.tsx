@@ -18,8 +18,10 @@ export interface ReferenceColumn {
   /** 样本里过半取值符合的文本格式（如 email、mobile） */
   formats?: { format: string; share: number }[];
 }
-/** view 为真时是已发布的源视图：只有列名与类型，没有列统计 */
-export interface ReferenceTable { name: string; view?: true; sampleRows: number; primaryKey: string[]; watermark: string | null; columns: ReferenceColumn[] }
+/** view 为真时是已发布的源视图：只有列名与类型，没有列统计。keySpaces 是同一数据源里各实体已发布映射声明的键空间（实体 → 键空间） */
+export interface ReferenceTable {
+  name: string; view?: true; sampleRows: number; primaryKey: string[]; watermark: string | null; columns: ReferenceColumn[]; keySpaces: Record<string, string>;
+}
 /** 自定义实体最新的已发布登记（由 loader 从 publishedCustomEntities 传来） */
 export interface RegisteredEntityView { label: string; fields: CustomEntityField[]; primaryKey: string[] }
 /** 白名单函数（由 loader 从 mapping-expr 的 FUNCTIONS 传来） */

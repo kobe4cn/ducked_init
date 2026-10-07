@@ -4,14 +4,16 @@
 // 选到一半（还没选源列、表达式写不完整）时只留在这一行，不写进 YAML；还没对应的源值只显示（标黄），不写进值字典。
 // 内置敏感字段带「敏感」徽标，不能取消。标准字段之后是扩展字段：已有的可改名、类型、中文名与是否敏感（敏感的只能是文本），取消勾选即删除；
 // 下面列出还没用到的源列，勾选即加为扩展字段（名称或格式像敏感信息的默认标成敏感）。
-// 消费者（customer）映射最后是「身份打通」：从已映射的敏感字段里勾选匹配字段并排序（越靠前优先级越高），不选时用平台默认规则
+// 消费者（customer）映射最后是「身份打通」：从已映射的敏感字段里勾选匹配字段并排序（越靠前优先级越高），不选时用平台默认规则。
+// 键空间（ADR-0024）：最上面是映射的键空间；指向别的实体的字段每行有键空间，没写时按同一数据源里目标实体已发布映射的键空间预填，
+// 预填值只在写这个字段时一并写进 YAML，打开表单不改 YAML；清空预填值不写进 YAML，重新打开表单时又会预填（发布时本来也要求写同源目标的键空间）
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
-import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, type CanonicalEntity, type CanonicalField, type FieldType } from '~/lib/canonical-model';
+import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, KEY_SPACE_PATTERN, type CanonicalEntity, type CanonicalField, type FieldType } from '~/lib/canonical-model';
 import { parseExpression } from '~/lib/mapping-expr';
 import {
-  dictionaryRows, expressionOf, extensionNameProblem, identityCandidates, newExtension, readExtensions, readForm, readIdentity, seedDictionary,
-  TRANSFORMS, unusedColumns, writeExtension, writeField, writeIdentity, writtenDictionary,
+  dictionaryRows, expressionOf, extensionNameProblem, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity,
+  readKeySpace, seedDictionary, TRANSFORMS, unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace, writtenDictionary,
   type DictionaryEntry, type ExtensionChoice, type ExtensionForm, type FieldChoice, type FieldForm, type Part, type TransformId,
 } from '~/lib/mapping-form';
 import type { ReferenceColumn, ReferenceFunction, ReferenceTable } from '~/components/mapping-reference';
@@ -79,8 +81,14 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
     writeIdentity(next, match);
     onChange(next.toString());
   };
+  const writeSpace = (keySpace: string | null) => {
+    const next = parseDocument(yaml);
+    writeKeySpace(next, keySpace);
+    onChange(next.toString());
+  };
   return (
     <div className="max-h-[48rem] divide-y overflow-y-auto rounded-lg border text-sm">
+      <KeySpace doc={doc} onWrite={writeSpace} />
       {readForm(doc, target).map(form => (
         <FieldRow
           key={form.field}
@@ -89,6 +97,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
           field={target.fields.find(f => f.name === form.field)!}
           table={table}
           functions={functions}
+          keySpaces={table?.keySpaces ?? {}}
           pending={focus?.field === form.field ? focus.add : []}
           onWrite={choice => write(form.field, choice)}
           onEditYaml={onEditYaml}
@@ -109,9 +118,14 @@ const choiceOf = (form: FieldForm): FieldChoice | null => form.transform && {
   dictionary: form.dictionary, ...(form.otherwise !== undefined && { otherwise: form.otherwise }),
 };
 
-/** 选择写进 YAML 后的样子；与 YAML 读出的一致时这一行不用重新读 */
-const syncKey = (choice: FieldChoice | null, type: FieldType) =>
-  choice ? JSON.stringify([expressionOf(choice, type), writtenDictionary(choice.dictionary) ?? [], choice.otherwise === undefined ? 0 : choice.otherwise]) : '';
+/** 选择（连同键空间）写进 YAML 后的样子；与 YAML 读出的一致时这一行不用重新读 */
+const syncKey = (choice: FieldChoice | null, type: FieldType, keySpace?: string | null) => choice
+  ? JSON.stringify([expressionOf(choice, type), writtenDictionary(choice.dictionary) ?? [], choice.otherwise === undefined ? 0 : choice.otherwise, keySpace?.trim() ?? ''])
+  : '';
+
+const KEY_SPACE = new RegExp(KEY_SPACE_PATTERN);
+const keySpaceProblem = (keySpace?: string | null) =>
+  keySpace?.trim() && !KEY_SPACE.test(keySpace.trim()) ? '键空间只用小写字母、数字与下划线' : null;
 
 /** 选择还缺什么（给出时不写进 YAML）；写得出表达式时为 null */
 function missing(choice: FieldChoice, type: FieldType): string | null {
@@ -123,6 +137,8 @@ function missing(choice: FieldChoice, type: FieldType): string | null {
     if (!choice.parts?.length) return '至少加一段源列或文本';
     if (choice.parts.some(p => 'column' in p && !p.column)) return '每段源列都要选一列';
   }
+  const space = keySpaceProblem(choice.keySpace);
+  if (space) return space;
   const entries = choice.dictionary ?? [];
   if (entries.some(e => e.to !== null && !e.from)) return '值对照里对应了标准值的行要填源值';
   const twice = (writtenDictionary(entries) ?? []).find((e, i, all) => all.findIndex(x => x.from === e.from) !== i);
@@ -135,39 +151,61 @@ function missing(choice: FieldChoice, type: FieldType): string | null {
   }
 }
 
-/** 一个标准字段：说明、源列与转换；只读时显示原表达式 */
-function FieldRow({ entity, form, field, table, functions, pending, onWrite, onEditYaml }: {
+/** 一个标准字段：说明、源列与转换，引用字段另有键空间；只读时显示原表达式 */
+function FieldRow({ entity, form, field, table, functions, keySpaces, pending, onWrite, onEditYaml }: {
   entity: string;
   form: FieldForm;
   field: CanonicalField;
   table: ReferenceTable | null;
   functions: ReferenceFunction[];
+  /** 同一数据源里各实体已发布映射声明的键空间，引用字段没写键空间时据此预填 */
+  keySpaces: Record<string, string>;
   /** 要作为待对应的行加进值对照表的源值 */
   pending: string[];
   onWrite: (choice: FieldChoice | null) => void;
   onEditYaml: () => void;
 }) {
   const [choice, setChoice] = useState(() => choiceOf(form));
+  // 键空间只存在这里（choice 里不带）：引用字段按 keySpaceOf 预填，不论这一行是否已对应都留着，写这个字段时一并写进 YAML；
+  // 不是引用字段时照 YAML 里写的（没有输入框）
+  const initialKeySpace = keySpaceOf(form, field, keySpaces) ?? form.keySpace ?? null;
+  const [keySpace, setKeySpace] = useState(initialKeySpace);
   // 这一行最后写进 YAML 的样子；YAML 在别处改了（YAML 标签页、生成草稿）时按 YAML 重新读出
-  const current = syncKey(choiceOf(form), field.type);
+  const current = syncKey(choiceOf(form), field.type, form.keySpace);
   const [synced, setSynced] = useState(current);
   if (current !== synced) {
     setSynced(current);
     setChoice(choiceOf(form));
+    setKeySpace(initialKeySpace);
   }
-  const problem = choice && missing(choice, field.type);
+  // 新建页换了数据源或源表：没写键空间时按新的同源键空间重新预填
+  const declared = field.ref ? (keySpaces[field.ref.entity] ?? '') : null;
+  const [seen, setSeen] = useState(declared);
+  if (declared !== seen) {
+    setSeen(declared);
+    if (form.keySpace === undefined) setKeySpace(initialKeySpace);
+  }
+  const problem = choice && missing({ ...choice, keySpace }, field.type);
   const unmapped = form.required && !form.raw;
 
-  const update = (next: FieldChoice | null) => {
+  const update = (next: FieldChoice | null, space = keySpace) => {
     setChoice(next);
     if (!next) {
       setSynced('');
       onWrite(null);
-    } else if (!missing(next, field.type)) {
-      setSynced(syncKey(next, field.type));
-      onWrite(next);
+      return;
+    }
+    const written = { ...next, keySpace: space };
+    if (!missing(written, field.type)) {
+      setSynced(syncKey(next, field.type, space));
+      onWrite(written);
     }
   };
+  const changeKeySpace = (space: string) => {
+    setKeySpace(space);
+    if (choice) update(choice, space);
+  };
+  const keySpacePending = keySpace?.trim() && keySpace.trim() !== form.keySpace && choice && !problem;
   const topValues = (column?: string | null) => table?.columns.find(c => c.name === column)?.top?.map(t => t.value) ?? [];
   // 新对应的枚举字段选了源列：按常见取值新建值对照，其他取值默认记为空
   const newEnum = form.dictionary && !form.raw && !form.dictionary.length && form.otherwise === undefined;
@@ -238,6 +276,18 @@ function FieldRow({ entity, form, field, table, functions, pending, onWrite, onE
           })}
           {choice?.transform === 'concat' && <PartsEditor table={table} parts={choice.parts ?? []} onChange={parts => update({ ...choice, parts })} />}
           {choice?.transform === 'custom' && <CustomExpression raw={choice.raw ?? ''} functions={functions} onChange={raw => update({ ...choice, raw })} />}
+        </div>
+      )}
+      {!form.readonly && field.ref && (
+        <div data-form-key-space={field.name} className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-muted-foreground">{`键空间（${field.ref.entity} 的主键所在）`}</span>
+          <Input className="h-7 w-40" aria-label={`${field.name} 的键空间`} placeholder="不写" value={keySpace ?? ''} onChange={e => changeKeySpace(e.target.value)} />
+          {keySpacePending && (
+            <>
+              <span className="text-muted-foreground">还没写进 YAML</span>
+              <Button type="button" size="xs" variant="link" onClick={() => update(choice)}>写进 YAML</Button>
+            </>
+          )}
         </div>
       )}
       {!form.readonly && choice && form.dictionary && choice.transform !== 'fixed' && (
@@ -371,6 +421,37 @@ function ExtensionRow({ form, others, onWrite, onEditYaml }: {
         </div>
       )}
       {!form.readonly && problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
+    </div>
+  );
+}
+
+/** 映射的键空间：主键在标准层带上这个前缀，同一数据源里指向本实体的引用字段要写同一个；清空时删掉 key_space */
+function KeySpace({ doc, onWrite }: { doc: ReturnType<typeof parseDocument>; onWrite: (keySpace: string | null) => void }) {
+  const written = readKeySpace(doc) ?? '';
+  const [value, setValue] = useState(written);
+  // YAML 在别处改了时按 YAML 重新读出
+  const [synced, setSynced] = useState(written);
+  if (written !== synced) {
+    setSynced(written);
+    setValue(written);
+  }
+  const problem = keySpaceProblem(value);
+  const change = (next: string) => {
+    setValue(next);
+    if (keySpaceProblem(next)) return;
+    setSynced(next.trim());
+    onWrite(next.trim() || null);
+  };
+  return (
+    <div data-form-mapping-key-space className="space-y-2 p-3">
+      <div className="flex flex-wrap items-baseline gap-x-2">
+        <span className="font-medium">键空间</span>
+        <span className="text-xs text-muted-foreground">
+          多个映射写同一实体、主键取值可能撞上时，给本映射起一个键空间（如 pos），标准层的主键写成「键空间:原值」；同一数据源里指向本实体的字段要写同一个键空间。不写时主键照原值
+        </span>
+      </div>
+      <Input className="h-7 w-40" aria-label="映射的键空间" placeholder="不写" value={value} onChange={e => change(e.target.value)} />
+      {problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
     </div>
   );
 }

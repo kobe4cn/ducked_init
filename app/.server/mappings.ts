@@ -94,20 +94,27 @@ async function sourceColumns(tenantId: string, sourceId: string) {
 /** 对照面板里的一张源表或一个源视图（列统计的取值见 referenceTables） */
 export interface ReferenceInput {
   name: string; view?: true; sampleRows: number; primaryKey: string[]; watermark: string | null;
+  /** 同一数据源里各实体已发布映射声明的键空间（实体 → 键空间），表单据此预填引用字段的键空间 */
+  keySpaces: Record<string, string>;
   columns: { name: string; type: string; nullRate: number; distinct: number; top: { value: string; rows: number }[] | null; formats: { format: string; share: number }[] }[];
 }
 
 /**
  * 编写映射时对照的源表（同步范围内、已采集的）：各列的类型、空值率、不同取值数与常见取值，
- * 主键（源端主键，没有时为声明的业务主键）与确认的水位线字段；其后是已发布的源视图（view 为真，只有列名与类型，没有列统计）
+ * 主键（源端主键，没有时为声明的业务主键）与确认的水位线字段；其后是已发布的源视图（view 为真，只有列名与类型，没有列统计）。
+ * 每张都带同一份键空间：同一数据源里已发布映射声明的键空间，同一实体有几个时取第一个（ADR-0024）
  */
 export async function referenceTables(actor: CurrentMember, sourceId: string): Promise<ReferenceInput[]> {
   assertCan(actor, 'sources:read');
   const { tables } = await confirmedTables(actor.tenant.id, sourceId);
+  const keySpaces: Record<string, string> = {};
+  for (const p of await publishedPlans(getDb(), actor.tenant.id)) {
+    if (p.sourceId === sourceId && p.keySpace && !(p.entity in keySpaces)) keySpaces[p.entity] = p.keySpace;
+  }
   const views = (await publishedViews(getDb(), actor.tenant.id, { sourceId })).filter(v => v.columns)
     .sort((a, b) => a.name.localeCompare(b.name))
     .map(v => ({
-      name: v.name, view: true as const, sampleRows: 0, primaryKey: [] as string[], watermark: null,
+      name: v.name, view: true as const, sampleRows: 0, primaryKey: [] as string[], watermark: null, keySpaces,
       columns: v.columns!.map(c => ({ name: c.name, type: c.type, nullRate: 0, distinct: 0, top: null, formats: [] })),
     }));
   return [...tables.map(({ table, watermark, key }) => ({
@@ -116,6 +123,7 @@ export async function referenceTables(actor: CurrentMember, sourceId: string): P
     // 旧的采集结果里没有主键信息
     primaryKey: table.primaryKey?.length ? table.primaryKey : (key ?? []),
     watermark: watermark?.column ?? null,
+    keySpaces,
     // formats：表单新建扩展字段时据此判断是否像敏感信息
     columns: table.columns.map(c => ({ name: c.name, type: c.type, nullRate: c.nullRate, distinct: c.distinct, top: c.top ?? null, formats: c.formats ?? [] })),
   })), ...views];
