@@ -1,6 +1,7 @@
 // app/components/lineage-flow.tsx —— 数据地图的流向图：用 React Flow 画 flowGraph 算好坐标的节点与边，挂载后才渲染（服务端不测量节点）；
 // 源表按数据源分组，点分组切换折叠（数据源超过 5 个时默认全部折叠），折叠后在客户端重新排版；映射节点显示版本与最近一次合并，
-// 失败的标红并链到该映射的合并记录；标准层表节点显示行数与映射数，点它把 ?node=silver.<实体> 写进 URL 打开字段抽屉。节点可以拖动（只在本页有效，可重置）
+// 失败的标红并链到该映射的合并记录；标准层表节点显示行数与映射数，点它把 ?node=silver.<实体> 写进 URL 打开字段抽屉，点源表节点写 ?node=table:<数据源>:<表> 打开源表抽屉。
+// 反向查有结果（hits）时未命中的节点与连线变淡。节点可以拖动（只在本页有效，可重置）
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleDashed, Clock } from 'lucide-react';
@@ -9,6 +10,7 @@ import '@xyflow/react/dist/style.css';
 import { KindIcon } from '~/components/kind-icon';
 import { defaultCollapsed, type FlowData, type FlowInput, flowGraph, type FlowStatus, groupId, MERGE_STATUS } from '~/lib/lineage-flow';
 import { ruleLabels } from '~/lib/lineage-graph';
+import type { SearchHits } from '~/lib/lineage-search';
 import type { SourceKind } from '~/lib/sources';
 
 const NODE_STYLE: Record<FlowData['kind'], React.CSSProperties> = {
@@ -20,6 +22,8 @@ const NODE_STYLE: Record<FlowData['kind'], React.CSSProperties> = {
   device: { background: '#f5f3ff', borderColor: '#c4b5fd' },
 };
 const FAILED: React.CSSProperties = { background: '#fef2f2', borderColor: '#fca5a5' };
+/** 变淡：悬停时与它无关的连线、反向查时没命中的节点与连线 */
+export const FADED = 0.15;
 
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
@@ -86,7 +90,7 @@ function nodeLabel(d: FlowData, tableCount: Record<string, number>): React.React
   }
 }
 
-export function FlowGraphView({ flow }: { flow: FlowInput }) {
+export function FlowGraphView({ flow, hits }: { flow: FlowInput; hits?: SearchHits | null }) {
   const [mounted, setMounted] = useState(false);
   const [, setSearchParams] = useSearchParams();
   useEffect(() => setMounted(true), []);
@@ -122,20 +126,21 @@ export function FlowGraphView({ flow }: { flow: FlowInput }) {
         ...NODE_STYLE[n.data.kind], ...(failed ? FAILED : {}), width: n.width, height: n.height, borderWidth: 1, borderStyle: 'solid', borderRadius: 12, fontSize: 12,
         ...(group
           ? { background: 'rgba(240, 249, 255, 0.6)', display: 'flex', alignItems: 'flex-start' }
-          : { display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center' as const, cursor: n.data.kind === 'source' ? 'pointer' : 'grab' }),
+          : { display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center' as const, cursor: n.data.kind === 'source' || n.data.kind === 'table' ? 'pointer' : 'grab' }),
+        ...(hits && !group && !hits.nodes.has(n.id) ? { opacity: FADED } : {}),
       },
     };
-  }), [graph, moved, tableCount]);
+  }), [graph, moved, tableCount, hits]);
 
   const edges = useMemo<Edge[]>(() => graph.edges.map(e => {
     const near = hovered !== null && (e.source === hovered || e.target === hovered);
     return {
       ...e,
       zIndex: 1,
-      style: { stroke: '#94a3b8', strokeWidth: near ? 2 : 1, opacity: hovered !== null && !near ? 0.15 : 1 },
+      style: { stroke: '#94a3b8', strokeWidth: near ? 2 : 1, opacity: (hovered !== null && !near) || (hits && !hits.edges.has(e.id)) ? FADED : 1 },
       markerEnd: { type: MarkerType.ArrowClosed, color: '#94a3b8' },
     };
-  }), [graph, hovered]);
+  }), [graph, hovered, hits]);
 
   const onNodesChange = (changes: NodeChange[]) => {
     const positions = changes.flatMap(c => (c.type === 'position' && c.position ? [[c.id, c.position] as const] : []));
@@ -165,7 +170,7 @@ export function FlowGraphView({ flow }: { flow: FlowInput }) {
           onNodeClick={(_, node) => {
             const d = graph.nodes.find(n => n.id === node.id)?.data;
             if (d?.kind === 'source' && node.id === groupId(d.sourceId)) toggle(d.sourceId);
-            if (d?.kind === 'silver') setSearchParams(prev => {
+            if (d?.kind === 'silver' || d?.kind === 'table') setSearchParams(prev => {
               const next = new URLSearchParams(prev);
               next.set('node', node.id);
               return next;

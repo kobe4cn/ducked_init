@@ -6,9 +6,11 @@
 // 点已接入的标准层表（关系图 ?node=<entity>，流向图 ?node=silver.<entity>）在右侧抽屉列出字段明细：有 sources:read 时带各映射的源表、源列、表达式、
 // 标记与兜底统计，否则只下发字段说明与行数（在 loader 里裁剪）。
 // 单表聚焦画布（?tab=flow&focus=<实体>，从抽屉进入）只画这张标准层表与写入它的源表，连线从源列连到字段；同样只对有 sources:read 的成员开放
+// 流向图与聚焦画布上可以反向查（?q=列 或 表.列，不区分大小写）：命中的源表、映射、标准层表与连线保持原样，其余变淡；点源表节点（?node=table:<数据源>:<表>）
+// 在抽屉里按源列列出它影响的标准层字段。两者都只对有 sources:read 的成员生效
 import { useMemo } from 'react';
-import { Link, useSearchParams } from 'react-router';
-import { ArrowLeft } from 'lucide-react';
+import { Form, Link, useSearchParams } from 'react-router';
+import { ArrowLeft, Search } from 'lucide-react';
 import type { Route } from './+types/lineage';
 import { can } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
@@ -23,17 +25,19 @@ import { deriveLineage } from '~/lib/lineage';
 import { focusGraph, type FocusInput } from '~/lib/lineage-focus';
 import { entityFields, type FieldDrawer, redactFields } from '~/lib/lineage-fields';
 import { type FlowInput, type FlowMerge, silverTotals } from '~/lib/lineage-flow';
+import { type SearchHits, searchImpact, tableImpact, type TableImpact } from '~/lib/lineage-search';
 import { relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
 import type { SourceKind } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
 import { KindIcon } from '~/components/kind-icon';
-import { LineageDrawer } from '~/components/lineage-drawer';
+import { LineageDrawer, TableDrawer } from '~/components/lineage-drawer';
 import { FocusGraphView } from '~/components/lineage-focus';
 import { FlowGraphView, MergeStatus } from '~/components/lineage-flow';
 import { RelationGraphView } from '~/components/lineage-graph';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { SectionHeader } from '~/components/section-header';
+import { Input } from '~/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
 export function meta({}: Route.MetaArgs) {
@@ -86,10 +90,15 @@ export async function loader({ request }: Route.LoaderArgs) {
   const drawerEntity = drawerEntityOf(node, connected);
   const focusParam = searchParams.get('focus');
   const focusEntity = tab === 'flow' && focusParam && connected.includes(focusParam) ? focusParam : null;
+  // 反向查只在流向图与聚焦画布上；源表抽屉里有源表名与表达式，同样只给有 sources:read 的人
+  const q = tab === 'flow' ? searchParams.get('q')?.trim() ?? '' : '';
+  const tableNode = canFlow && node?.startsWith('table:') ? node : null;
   let flow: FlowInput | null = null;
   let drawer: FieldDrawer | null = null;
   let focus: FocusInput | null = null;
-  if (tab === 'flow' || drawerEntity) {
+  let hitIds: { nodes: string[]; edges: string[]; fields: string[] } | null = null;
+  let tableDrawer: TableImpact | null = null;
+  if (tab === 'flow' || drawerEntity || tableNode) {
     // 只取数据源的名字与种类，不带连接配置；不下发合并计划（里面有列与表达式）
     const sources = canFlow ? (await listSources(member)).map(({ id, name, kind }) => ({ id, name, kind })) : [];
     const lineage = deriveLineage({ plans, sources });
@@ -109,6 +118,9 @@ export async function loader({ request }: Route.LoaderArgs) {
     } else if (tab === 'flow') {
       flow = { tables: lineage.tables, identityEdges: lineage.edges, identity: graph.nodes.find(n => n.identity)?.identity ?? null, merges };
     }
+    const found = searchImpact(lineage, q);
+    if (found) hitIds = { nodes: [...found.nodes], edges: [...found.edges], fields: [...found.fields] };
+    if (tableNode) tableDrawer = tableImpact(lineage, tableNode);
     if (drawerEntity) {
       const canonical = entityOf(drawerEntity);
       const custom = canonical ? undefined : (await publishedCustomEntities(getDb(), member.tenant.id)).get(drawerEntity);
@@ -125,6 +137,9 @@ export async function loader({ request }: Route.LoaderArgs) {
     flow,
     focus,
     drawer,
+    q,
+    hitIds,
+    tableDrawer,
     email: member.email,
     nav: navFor(member),
     graph,
@@ -135,9 +150,17 @@ export async function loader({ request }: Route.LoaderArgs) {
 }
 
 export default function Lineage({ loaderData }: Route.ComponentProps) {
-  const { tab, canFlow, flow, focus, drawer, email, nav, graph, showAll, node, sql } = loaderData;
+  const { tab, canFlow, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
-  const [searchParams] = useSearchParams();
+  const [rawParams] = useSearchParams();
+  // 链接里不带不生效的参数：关系图没有反向查，没有 sources:read 时不开源表抽屉
+  const searchParams = new URLSearchParams(rawParams);
+  if (tab !== 'flow') searchParams.delete('q');
+  if (!canFlow && searchParams.get('node')?.startsWith('table:')) searchParams.delete('node');
+  const hits = useMemo<SearchHits | null>(
+    () => hitIds && { nodes: new Set(hitIds.nodes), edges: new Set(hitIds.edges), fields: new Set(hitIds.fields) },
+    [hitIds],
+  );
   const nodeHref = (id: string) => {
     const next = new URLSearchParams(searchParams);
     next.set('node', id);
@@ -173,7 +196,7 @@ export default function Lineage({ loaderData }: Route.ComponentProps) {
         <section className="rounded-2xl border bg-white p-6 shadow-sm">
           <SectionHeader title="还没有已发布的映射">发布映射、合并到标准层之后，这里会画出已接入的表和它们之间的关系。</SectionHeader>
         </section>
-      ) : focus ? <FocusSection focus={focus} /> : flow ? <FlowSection flow={flow} /> : (
+      ) : focus ? <FocusSection focus={focus} q={q} hits={hits} /> : flow ? <FlowSection flow={flow} q={q} hits={hits} /> : (
         <>
           <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
             <div className="flex items-start justify-between gap-6">
@@ -255,13 +278,14 @@ export default function Lineage({ loaderData }: Route.ComponentProps) {
         </>
       )}
 
+      {tableDrawer && <TableDrawer impact={tableDrawer} closeHref={closeDrawerHref} />}
       {drawer && <LineageDrawer drawer={drawer} closeHref={closeDrawerHref} focusHref={drawer.detail ? `/lineage?tab=flow&focus=${encodeURIComponent(drawer.entity)}` : null} />}
     </AppShell>
   );
 }
 
 /** 单表聚焦画布与图下服务端渲染的连线列表（画布挂载后才渲染，列表给没有脚本时与测试用） */
-function FocusSection({ focus }: { focus: FocusInput }) {
+function FocusSection({ focus, q, hits }: { focus: FocusInput; q: string; hits: SearchHits | null }) {
   const graph = useMemo(() => focusGraph(focus), [focus]);
   const [searchParams] = useSearchParams();
   const backHref = (() => {
@@ -275,12 +299,14 @@ function FocusSection({ focus }: { focus: FocusInput }) {
     <>
       <section data-focus={focus.entity} className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
         <div className="flex items-start justify-between gap-6">
-          <SectionHeader title={`聚焦：silver.${focus.entity}`}>只画这张标准层表和写入它的源表。源表只列出被表达式引用到的源列，每条线从源列连到标准层字段；常量表达式没有连线。点标准层表看字段明细。</SectionHeader>
+          <SectionHeader title={`聚焦：silver.${focus.entity}`}>只画这张标准层表和写入它的源表。源表只列出被表达式引用到的源列，每条线从源列连到标准层字段；常量表达式没有连线。点标准层表看字段明细，点源表看它的列影响了哪些字段。</SectionHeader>
           <Link to={backHref} preventScrollReset className="flex shrink-0 items-center gap-1 text-sm text-slate-600 hover:underline">
             <ArrowLeft className="size-4" />返回流向图
           </Link>
         </div>
-        <FocusGraphView graph={graph} />
+        {/* 搜索按整个血缘算，这里只看这张表的画布上有没有命中 */}
+        <ImpactSearch q={q} focus={focus.entity} found={hits && graph.nodes.some(n => hits.nodes.has(n.id))} />
+        <FocusGraphView graph={graph} hits={hits} />
       </section>
 
       <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
@@ -298,7 +324,7 @@ function FocusSection({ focus }: { focus: FocusInput }) {
             {graph.edges.map(e => {
               const t = tables.get(e.source)!;
               return (
-                <TableRow key={e.id} data-field-edge={`${t.sourceId}:${t.label}.${e.sourceHandle}→${e.targetHandle}`}>
+                <TableRow key={e.id} data-field-edge={`${t.sourceId}:${t.label}.${e.sourceHandle}→${e.targetHandle}`} {...hitAttrs(hits, hits?.edges.has(e.id))}>
                   <TableCell>{t.sourceName}</TableCell>
                   <TableCell className="font-mono text-xs">{t.label}</TableCell>
                   <TableCell className="font-mono text-xs">{e.sourceHandle}</TableCell>
@@ -314,13 +340,14 @@ function FocusSection({ focus }: { focus: FocusInput }) {
 }
 
 /** 流向图与图下服务端渲染的列表（React Flow 挂载后才渲染，列表给没有脚本时与测试用） */
-function FlowSection({ flow }: { flow: FlowInput }) {
+function FlowSection({ flow, q, hits }: { flow: FlowInput; q: string; hits: SearchHits | null }) {
   const silver = [...silverTotals(flow.tables, flow.merges).values()];
   return (
     <>
       <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
-        <SectionHeader title="流向图">源表按数据源分组，点分组可以折叠或展开；映射节点显示版本与最近一次合并，失败的标红，点开看合并记录；标准层表显示行数（各映射最近一次合并成功时的行数之和，最近一次失败或跳过的映射不计入）与写入它的映射数。</SectionHeader>
-        <FlowGraphView flow={flow} />
+        <SectionHeader title="流向图">源表按数据源分组，点分组可以折叠或展开；映射节点显示版本与最近一次合并，失败的标红，点开看合并记录；标准层表显示行数（各映射最近一次合并成功时的行数之和，最近一次失败或跳过的映射不计入）与写入它的映射数。点源表看它的列影响了哪些字段。</SectionHeader>
+        <ImpactSearch q={q} focus={null} found={hits && hits.nodes.size > 0} />
+        <FlowGraphView flow={flow} hits={hits} />
       </section>
 
       <section className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
@@ -341,7 +368,7 @@ function FlowSection({ flow }: { flow: FlowInput }) {
               const merge = flow.merges[t.mapping];
               const status = merge?.status ?? 'never';
               return (
-                <TableRow key={t.mapping} data-flow-mapping={t.mapping} data-version={t.version} data-merge-status={status}>
+                <TableRow key={t.mapping} data-flow-mapping={t.mapping} data-version={t.version} data-merge-status={status} {...hitAttrs(hits, hits?.nodes.has(`mapping:${t.mapping}`))}>
                   <TableCell>
                     <span className="flex items-center gap-2"><KindIcon kind={t.sourceKind as SourceKind} small />{t.sourceName}</span>
                   </TableCell>
@@ -368,7 +395,7 @@ function FlowSection({ flow }: { flow: FlowInput }) {
           </TableHeader>
           <TableBody>
             {silver.map(s => (
-              <TableRow key={s.entity} data-silver={s.entity} data-mappings={s.mappings} data-rows={s.rows}>
+              <TableRow key={s.entity} data-silver={s.entity} data-mappings={s.mappings} data-rows={s.rows} {...hitAttrs(hits, hits?.nodes.has(`silver.${s.entity}`))}>
                 <TableCell className="font-mono text-xs">{`silver.${s.entity}`}</TableCell>
                 <TableCell>{s.mappings}</TableCell>
                 <TableCell>{s.rows.toLocaleString('zh-CN')}</TableCell>
@@ -378,5 +405,26 @@ function FlowSection({ flow }: { flow: FlowInput }) {
         </Table>
       </section>
     </>
+  );
+}
+
+/** 有搜索时：命中的行带 data-hit，其余变淡 */
+const hitAttrs = (hits: SearchHits | null, hit: boolean | undefined) =>
+  !hits ? {} : hit ? { 'data-hit': true } : { className: 'opacity-40' };
+
+/** 反向查：按列名或「表.列」搜索（GET，?q=），保留标签页与聚焦的表；found 为 false 时说没有找到，没有搜索时为 null */
+function ImpactSearch({ q, focus, found }: { q: string; focus: string | null; found: boolean | null }) {
+  return (
+    <div className="space-y-2">
+      <Form method="get" preventScrollReset className="flex max-w-2xl items-center gap-2">
+        <input type="hidden" name="tab" value="flow" />
+        {focus && <input type="hidden" name="focus" value={focus} />}
+        <div className="relative flex-1">
+          <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-slate-400" />
+          <Input key={q} type="search" name="q" defaultValue={q} placeholder="反向查：列名，或 表.列" aria-label="反向查源列" className="pl-8" />
+        </div>
+      </Form>
+      {found === false && <p data-no-hits className="text-sm text-slate-500">{`没有找到引用「${q}」的映射。`}</p>}
+    </div>
   );
 }

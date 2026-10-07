@@ -1,7 +1,8 @@
 // test/http/lineage.test.ts —— 数据地图的 HTTP 接缝：任何成员都能打开 /lineage，关系图下的表与关系列表画出已接入的标准层表与 _identities、_device_owner，
 // 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；_identities 显示匹配规则与最近一次合并的打通摘要（没有合并任务时显示尚未合并）；
 // 「显示未接入的标准实体」开关（?all=1）灰显未接入的实体；没有已发布映射时显示空状态；流向图（?tab=flow）只对有 sources:read 的成员开放：列表带源表名、版本、行数与合并状态，失败的链到合并记录；
-// 抽屉里的「聚焦此表」进入单表聚焦画布（?tab=flow&focus=），画布下的连线列表从源列连到标准层字段；查看者访问 ?focus= 回到关系图
+// 抽屉里的「聚焦此表」进入单表聚焦画布（?tab=flow&focus=），画布下的连线列表从源列连到标准层字段；查看者访问 ?focus= 回到关系图；
+// 流向图与聚焦画布上反向查（?q=）标出命中的行，源表节点（?node=table:…）打开源表抽屉；查看者两者都不生效
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { and, desc, eq } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -224,6 +225,77 @@ describe('数据地图', () => {
 
     // 不认识的实体回到流向图
     expect(await (await eng.get('/lineage?tab=flow&focus=nope')).text()).toContain('data-flow-mapping');
+  });
+
+  it('数据工程师在流向图和聚焦画布上反向查一个源列：命中的映射、标准层表与字段连线带 data-hit，没有命中时显示没有找到', async () => {
+    const { acme, sources } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'eng@acme.com', 'data_engineer');
+    const eng = await loginAs(app, 'eng@acme.com');
+    const orderMappings = await getDb().select({ id: mappings.id, sourceId: mappings.sourceId }).from(mappings)
+      .where(and(eq(mappings.tenantId, acme), eq(mappings.tableName, 'orders')));
+    const crmOrders = orderMappings.find(m => m.sourceId === sources.crm)!.id;
+    const loyaltyOrders = orderMappings.find(m => m.sourceId === sources.loyalty)!.id;
+    const mappingRow = (html: string, id: string) => html.match(new RegExp(`<tr[^>]*data-flow-mapping="${id}"[^>]*>`))![0];
+    const silverRow = (html: string, entity: string) => html.match(new RegExp(`<tr[^>]*data-silver="${entity}"[^>]*>`))![0];
+
+    expect(await (await eng.get('/lineage?tab=flow')).text()).toContain('name="q"');
+
+    // 只有 CRM 的 orders 有 status 列（会员的叫 state）
+    const html = decode(await (await eng.get('/lineage?tab=flow&q=STATUS')).text());
+    expect(html).toMatch(/name="q"[^>]*value="STATUS"|value="STATUS"[^>]*name="q"/);
+    expect(mappingRow(html, crmOrders)).toContain('data-hit');
+    expect(mappingRow(html, loyaltyOrders)).not.toContain('data-hit');
+    expect(silverRow(html, 'order')).toContain('data-hit');
+    expect(silverRow(html, 'customer')).not.toContain('data-hit');
+    expect(html).not.toContain('没有找到');
+
+    // 表.列：两个数据源里的 orders 都命中
+    const both = decode(await (await eng.get('/lineage?tab=flow&q=orders.updated_at')).text());
+    for (const id of [crmOrders, loyaltyOrders]) expect(mappingRow(both, id)).toContain('data-hit');
+    expect(silverRow(both, 'customer')).not.toContain('data-hit');
+
+    expect(decode(await (await eng.get('/lineage?tab=flow&q=members.nope')).text())).toContain('没有找到');
+
+    // 聚焦画布：命中的字段连线带 data-hit
+    const focus = decode(await (await eng.get('/lineage?tab=flow&focus=order&q=state')).text());
+    expect(focus).toContain('name="q"');
+    expect(focus).toMatch(new RegExp(`data-field-edge="${sources.loyalty}:orders.state→status"[^>]*data-hit|data-hit[^>]*data-field-edge="${sources.loyalty}:orders.state→status"`));
+    expect(focus.match(new RegExp(`<tr[^>]*data-field-edge="${sources.crm}:orders.status→status"[^>]*>`))![0]).not.toContain('data-hit');
+    expect(focus).not.toContain('没有找到');
+    // 只命中别的标准层表（CRM customers 的 mobile）时，聚焦画布上也算没有找到
+    expect(decode(await (await eng.get('/lineage?tab=flow&focus=order&q=mobile')).text())).toContain('没有找到');
+  });
+
+  it('数据工程师点源表节点打开源表抽屉：按源列列出它影响的标准层字段、映射与表达式', async () => {
+    const { acme, sources } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'eng@acme.com', 'data_engineer');
+    const eng = await loginAs(app, 'eng@acme.com');
+
+    const html = decode(await (await eng.get(`/lineage?tab=flow&node=table:${sources.crm}:orders`)).text());
+    expect(html).toContain(`data-table-drawer="${sources.crm}:orders"`);
+    for (const impact of ['status→order.status', 'customer→order.customer_id', 'order_no→order.order_id', 'updated_at→order.updated_at']) {
+      expect(html).toContain(`data-impact="${impact}"`);
+    }
+    expect(html).toContain('string(customer)');
+    // 只列这个数据源的 orders：会员的 state 不在里面
+    expect(html).not.toContain('data-impact="state→');
+
+    // 不认识的源表不开抽屉
+    expect(await (await eng.get(`/lineage?tab=flow&node=table:${sources.crm}:nope`)).text()).not.toContain('data-table-drawer');
+  });
+
+  it('查看者没有反向查与源表抽屉：看不到搜索框，?q= 与 ?node=table:… 不生效，页面不出现源表名', async () => {
+    const { acme, sources } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+
+    for (const url of ['/lineage?q=status', '/lineage?tab=flow&q=orders.status', `/lineage?node=table:${sources.crm}:orders`, `/lineage?tab=flow&node=table:${sources.crm}:orders&q=status`]) {
+      const html = decode(await (await viewer.get(url)).text());
+      expect(html).toContain('data-tab="graph"');
+      expect(html).not.toContain('name="q"');
+      for (const banned of ['data-hit', 'data-impact', 'data-table-drawer', '没有找到']) expect(html).not.toContain(banned);
+      for (const table of ['customers', 'members', 'users', 'events', 'orders']) expect(html).not.toMatch(new RegExp(`(?<![-\\w])${table}\\b`));
+    }
   });
 
   it('查看者访问 ?focus= 时回到关系图，页面不出现源表名；抽屉里没有「聚焦此表」', async () => {

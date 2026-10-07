@@ -1,16 +1,22 @@
 // app/components/lineage-focus.tsx —— 数据地图的单表聚焦画布：用 React Flow 画 focusGraph 算好坐标的节点与边，挂载后才渲染；
 // 自定义节点 fieldTable 逐行列出字段，每行左右各一个 handle（id 是列名），连线从源列连到标准层字段。悬停节点时高亮它的连线，
-// 点标准层表把 ?node=silver.<实体> 写进 URL 打开字段抽屉。节点可以拖动（只在本页有效，可重置）
+// 点标准层表把 ?node=silver.<实体> 写进 URL 打开字段抽屉，点源表写 ?node=table:<数据源>:<表> 打开源表抽屉。反向查有结果（hits）时
+// 未命中的节点与连线变淡，命中的字段行高亮。节点可以拖动（只在本页有效，可重置）
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router';
 import { Background, Controls, type Edge, Handle, MarkerType, type Node, type NodeChange, type NodeProps, Panel, Position, ReactFlow, type XYPosition } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
+import { FADED } from '~/components/lineage-flow';
 import { FOCUS_HEADER, FOCUS_ROW, type FocusData, type FocusGraph } from '~/lib/lineage-focus';
+import { fieldKey, type SearchHits } from '~/lib/lineage-search';
 
 const HIDDEN_HANDLE: React.CSSProperties = { opacity: 0, width: 6, height: 6, minWidth: 0, minHeight: 0, border: 0 };
 
-/** 一张表：表头是表名（源表再带数据源名字），下面逐行是列 */
-function FieldTableNode({ data }: NodeProps<Node<FocusData>>) {
+/** 节点数据再带上反向查命中的列 */
+type FieldTableData = FocusData & { hitColumns?: Set<string> };
+
+/** 一张表：表头是表名（源表再带数据源名字），下面逐行是列，反向查命中的列高亮 */
+function FieldTableNode({ data }: NodeProps<Node<FieldTableData>>) {
   const silver = data.kind === 'silver';
   return (
     <div className={`h-full overflow-hidden rounded-xl border text-xs ${silver ? 'border-slate-400 bg-slate-50' : 'border-slate-300 bg-white'}`}>
@@ -19,7 +25,7 @@ function FieldTableNode({ data }: NodeProps<Node<FocusData>>) {
         {data.kind === 'table' && <div className="truncate text-[10px] text-slate-500">{data.sourceName}</div>}
       </div>
       {data.columns.map(c => (
-        <div key={c} className="relative flex items-center px-3 font-mono text-slate-700" style={{ height: FOCUS_ROW }}>
+        <div key={c} className={`relative flex items-center px-3 font-mono ${data.hitColumns?.has(c) ? 'bg-sky-100 font-semibold text-slate-900' : 'text-slate-700'}`} style={{ height: FOCUS_ROW }}>
           <Handle type="target" position={Position.Left} id={c} isConnectable={false} style={HIDDEN_HANDLE} />
           <span className="truncate">{c}</span>
           <Handle type="source" position={Position.Right} id={c} isConnectable={false} style={HIDDEN_HANDLE} />
@@ -31,7 +37,7 @@ function FieldTableNode({ data }: NodeProps<Node<FocusData>>) {
 }
 const NODE_TYPES = { fieldTable: FieldTableNode };
 
-export function FocusGraphView({ graph }: { graph: FocusGraph }) {
+export function FocusGraphView({ graph, hits }: { graph: FocusGraph; hits?: SearchHits | null }) {
   const [mounted, setMounted] = useState(false);
   const [, setSearchParams] = useSearchParams();
   useEffect(() => setMounted(true), []);
@@ -44,20 +50,21 @@ export function FocusGraphView({ graph }: { graph: FocusGraph }) {
   const nodes = useMemo<Node[]>(() => graph.nodes.map(n => ({
     ...n,
     type: 'fieldTable',
+    data: hits ? { ...n.data, hitColumns: new Set(n.data.columns.filter(c => hits.fields.has(fieldKey(n.id, c)))) } : n.data,
     position: moved[n.id] ?? n.position,
     connectable: false,
-    style: { width: n.width, height: n.height, cursor: n.data.kind === 'silver' ? 'pointer' : 'grab' },
-  })), [graph, moved]);
+    style: { width: n.width, height: n.height, cursor: 'pointer', ...(hits && !hits.nodes.has(n.id) ? { opacity: FADED } : {}) },
+  })), [graph, moved, hits]);
 
   const edges = useMemo<Edge[]>(() => graph.edges.map(e => {
     const near = hovered !== null && (e.source === hovered || e.target === hovered);
     return {
       ...e,
       zIndex: 1,
-      style: { stroke: '#94a3b8', strokeWidth: near ? 2 : 1, opacity: hovered !== null && !near ? 0.15 : 1 },
+      style: { stroke: '#94a3b8', strokeWidth: near ? 2 : 1, opacity: (hovered !== null && !near) || (hits && !hits.edges.has(e.id)) ? FADED : 1 },
       markerEnd: { type: MarkerType.ArrowClosed, color: '#94a3b8' },
     };
-  }), [graph, hovered]);
+  }), [graph, hovered, hits]);
 
   const onNodesChange = (changes: NodeChange[]) => {
     const positions = changes.flatMap(c => (c.type === 'position' && c.position ? [[c.id, c.position] as const] : []));
@@ -78,7 +85,7 @@ export function FocusGraphView({ graph }: { graph: FocusGraph }) {
           onNodeMouseLeave={() => setHovered(null)}
           proOptions={{ hideAttribution: true }}
           onNodeClick={(_, node) => {
-            if (graph.nodes.find(n => n.id === node.id)?.data.kind === 'silver') setSearchParams(prev => {
+            if (graph.nodes.some(n => n.id === node.id)) setSearchParams(prev => {
               const next = new URLSearchParams(prev);
               next.set('node', node.id);
               return next;
