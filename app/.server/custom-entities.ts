@@ -62,12 +62,20 @@ const relationText = (r: EntityRelation) => `${r.from.entity}.${r.from.field} �
 /** 标准模型字段上内置的 ref，写成与登记上的关系同形的边 */
 const BUILTIN_RELATIONS: EntityRelation[] = CANONICAL_ENTITIES.flatMap(e => e.fields.flatMap(f => (f.ref ? [{ from: { entity: e.name, field: f.name }, ref: f.ref }] : [])));
 
+/** 租户的全部关系：标准模型内置的 ref 与已发布登记上的关系 */
+const allRelations = (published: Map<string, RegisteredEntity>) => [...BUILTIN_RELATIONS, ...[...published.values()].flatMap(e => e.relations ?? [])];
+
+/** 以 entity 为起点的全部关系：标准模型内置的 ref 与已发布登记上的关系（ADR-0019） */
+export function relationsFrom(entity: string, published: Map<string, RegisteredEntity>): EntityRelation[] {
+  return allRelations(published).filter(r => r.from.entity === entity);
+}
+
 /**
  * 被关系指向的实体与各自的主键：内置 ref 与已发布登记上关系的终点，customer 除外。
  * 合并时这些实体的主键在整个实体内跨映射唯一（ADR-0019「终点主键在整个实体内唯一」）
  */
 export function referencedKeys(published: Map<string, RegisteredEntity>): Map<string, string[]> {
-  const targets = new Set([...BUILTIN_RELATIONS, ...[...published.values()].flatMap(e => e.relations ?? [])].map(r => r.ref.entity));
+  const targets = new Set(allRelations(published).map(r => r.ref.entity));
   targets.delete('customer');
   return new Map([...targets].flatMap(name => {
     const key = entityOf(name)?.key.slice() ?? published.get(name)?.primaryKey;

@@ -6,7 +6,7 @@ import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
-import { publishedCustomEntities, referencedKeys, type RegisteredEntity } from './custom-entities';
+import { publishedCustomEntities, referencedKeys, type RegisteredEntity, relationsFrom } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
@@ -283,6 +283,24 @@ async function assertIdentityRules(tx: Tx, tenantId: string, mappingId: string, 
 }
 
 /**
+ * 引用字段的键空间（ADR-0024）：本映射里指向别的实体的字段（内置 ref 与已登记关系的起点），要写上同一数据源里目标实体已发布映射
+ * （本映射不算）声明的键空间之一；自引用时用本映射自己声明的键空间。同源目标实体都没声明键空间时不检查（目标映射可能还没发布）
+ */
+async function assertKeySpaces(tx: Tx, tenantId: string, mapping: typeof mappings.$inferSelect, plan: MergePlan) {
+  const relations = relationsFrom(plan.entity, await publishedCustomEntities(tx, tenantId));
+  if (!relations.length) return;
+  const sameSource = (await publishedPlans(tx, tenantId)).filter(p => p.sourceId === mapping.sourceId && p.mapping !== mapping.id);
+  const spacesOf = (entity: string) => (entity === plan.entity
+    ? (plan.keySpace ? [plan.keySpace] : [])
+    : [...new Set(sameSource.flatMap(p => (p.entity === entity && p.keySpace ? [p.keySpace] : [])))]);
+  const wrong = plan.columns.flatMap(c => {
+    const spaces = [...new Set(relations.filter(r => r.from.field === c.name).flatMap(r => spacesOf(r.ref.entity)))];
+    return spaces.length && !(c.keySpace && spaces.includes(c.keySpace)) ? [`${c.name} 应写 ${spaces.map(s => `key_space: ${s}`).join(' 或 ')}`] : [];
+  });
+  if (wrong.length) throw new MappingError(`引用字段要写上目标实体在同一数据源里声明的键空间：${wrong.join('；')}`);
+}
+
+/**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。发布前对照数据源当前的字段再校验一次。
  * 发布后版本锁定，并为这个映射入队一次合并（已有合并在排队时补进那个合并，在运行时由调度器在它之后补上）
  */
@@ -304,7 +322,7 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
 
 /**
  * 在调用方的事务里发布检查过的这份草稿（plan 是发布前对照数据源当前的字段校验出的），记审计并入队合并，返回合并任务（同 enqueueMerge）。
- * 调用方须已锁住租户行；这里锁映射行。等锁期间草稿被修改、发布或丢弃，或扩展字段类型、身份打通规则与已发布映射冲突时抛出 MappingError。
+ * 调用方须已锁住租户行；这里锁映射行。等锁期间草稿被修改、发布或丢弃，或扩展字段类型、身份打通规则与已发布映射冲突、引用字段没写同源目标实体的键空间时抛出 MappingError。
  * 发布权限与双人发布由调用方检查（publishMapping，以及一键直通里登记与映射一起发布）
  */
 export async function publishMappingDraft(
@@ -319,6 +337,7 @@ export async function publishMappingDraft(
   }
   await assertExtensionTypes(tx, actor.tenant.id, plan);
   await assertIdentityRules(tx, actor.tenant.id, mapping.id, plan);
+  await assertKeySpaces(tx, actor.tenant.id, mapping, plan);
   await tx.update(mappingVersions)
     .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: sql`now()` })
     .where(eq(mappingVersions.id, draft.id));

@@ -433,6 +433,41 @@ describe('发布映射并合并到标准层', () => {
     expect(items.every(i => ids.has(i.order_id))).toBe(true);
   });
 
+  /** 订单明细的映射，orderId 是 order_id 一行的右边 */
+  const orderItems = (orderId: string) =>
+    `model: 1\nentity: order_item\ntable: order_items\nfields:\n  order_item_id: item_no\n  order_id: ${orderId}\n  quantity: qty\n`;
+
+  it('同源订单映射声明了键空间 pos：订单明细的 order_id 没写或写了别的键空间时发布被拒，列出字段与应写的 pos；写了 pos 照常发布', async () => {
+    const { author, reviewer, id } = await syncedSource(ORDER_ITEMS);
+    await publish(author, reviewer, id, `${ORDERS}key_space: pos\n`);
+    const items = await createMapping(author, id, orderItems('string(order_id)'));
+    await expect(publishMapping(reviewer, items.id, 1)).rejects.toThrow(new MappingError('引用字段要写上目标实体在同一数据源里声明的键空间：order_id 应写 key_space: pos'));
+    // 还没发布过：草稿原地改，仍是第 1 版
+    expect(await saveDraft(author, items.id, orderItems('{ expr: string(order_id), key_space: web }'))).toBe(1);
+    await expect(publishMapping(reviewer, items.id, 1)).rejects.toThrow('order_id 应写 key_space: pos');
+    expect(await saveDraft(author, items.id, orderItems('{ expr: string(order_id), key_space: pos }'))).toBe(1);
+    await publishMapping(reviewer, items.id, 1);
+    expect((await getMapping(author, items.id)).versions.find(v => v.version === 1)).toMatchObject({ status: 'published' });
+  });
+
+  it('同源订单映射没声明键空间时，订单明细的 order_id 写不写键空间都照常发布；别的数据源的订单映射声明了键空间也不参与检查', async () => {
+    const { author, reviewer, id, input } = await syncedSource(ORDER_ITEMS);
+    await publish(author, reviewer, id, ORDERS);
+    const other = await registerSource(author, { ...input, name: '电商库副本' });
+    await setSyncScope(author, other.id, { add: ['orders'] });
+    await drain();
+    await confirmWatermark(author, other.id, 'orders', 'order_id');
+    await syncSource(author, other.id);
+    await drain();
+    await publish(author, reviewer, other.id, `${ORDERS}key_space: web\n`);
+
+    const items = await createMapping(author, id, orderItems('string(order_id)'));
+    await publishMapping(reviewer, items.id, 1);
+    expect(await saveDraft(author, items.id, orderItems('{ expr: string(order_id), key_space: pos }'))).toBe(2);
+    await publishMapping(reviewer, items.id, 2);
+    expect((await getMapping(author, items.id)).versions.find(v => v.version === 2)).toMatchObject({ status: 'published' });
+  });
+
   it('写了兜底值时值字典里没有的取值写成兜底值，合并照常完成，并记下落入兜底的取值与行数', async () => {
     const { acme, author, reviewer, id } = await syncedSource();
     const mapping = await publish(author, reviewer, id, ORDER_LOG_MAPPING
