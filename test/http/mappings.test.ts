@@ -161,6 +161,35 @@ describe('编写与发布映射', () => {
     expect(await (await (await loginAs(app, 'an@acme.com')).get(`/mappings/${id}?tab=merges`)).text()).not.toContain('data-add-to-dictionary');
   });
 
+  it('被关系指向的实体主键跨映射重复时，后发布的映射在详情页的合并记录与任务页标红，列出冲突的键与映射', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await memberOf(tenantId, 'de@acme.com');
+    await confirmWatermark(engineer, sourceId, 'customers', 'updated_at');
+    await confirmWatermark(engineer, sourceId, 'orders', 'order_id');
+    await syncSource(engineer, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const author = await loginAs(app, 'de@acme.com');
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+    const publish = async (yaml: string) => {
+      const id = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml }));
+      expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
+      await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+      return id;
+    };
+    // order 是内置 ref 的终点；customers 表的 customer_id 1..40 与 orders 表的 order_id 1..100 重叠
+    const orders = await publish(ORDERS);
+    const clash = await publish('model: 1\nentity: order\ntable: customers\nfields:\n  order_id: string(customer_id)\n');
+    const conflict = `主键 order_id 跨映射重复：1（映射 ${[orders, clash].sort().join('、')}）；10（映射`;
+
+    const merges = await (await author.get(`/mappings/${clash}?tab=merges`)).text();
+    expect(merges).toContain('data-merge-error');
+    expect(merges).toContain(`失败：${conflict}`);
+    expect(merges).toContain('等，共 40 个，请在映射里用字段表达式对齐（如加前缀）或去掉一边的映射');
+    expect(await (await author.get(`/mappings/${orders}?tab=merges`)).text()).not.toContain('data-merge-error');
+    expect(await (await author.get('/tasks')).text()).toContain(conflict);
+  });
+
   it('新建映射的表下拉框列出已发布的源视图；YAML 写 view 的映射保存后，详情页对照视图的列，空跑转换视图的样本', async () => {
     const { tenantId, sourceId } = await tenantWithSource('acme');
     const engineer = await memberOf(tenantId, 'de@acme.com');
