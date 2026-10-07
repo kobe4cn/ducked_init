@@ -1,9 +1,9 @@
 // app/.server/custom-entities.ts —— 自定义实体登记（ADR-0019）：成员在标准模型之外登记的实体，名称 custom_ 开头、租户内唯一（建实体时定下，之后不能改），
-// 每一版登记中文名、类型（维度 / 事实，只用于引导）、字段（名称、类型、说明、是否敏感）、主键与关系（本实体字段 → 另一个已发布实体的单列主键，
-// ADR-0019「关系」）。保存草稿时校验登记本身与关系的终点，发布时再校验一次终点。
+// 每一版登记中文名、类型（维度 / 事实，只用于引导）、字段（名称、类型、说明、是否敏感）、主键与关系（本实体或标准实体的字段 → 另一个实体的单列主键，
+// 至少一端是本实体，ADR-0019「关系」）。保存草稿时校验登记本身、关系的两端与成环，发布时再校验一次。
 // 草稿按映射同样的规则双人发布：由最后保存它的人以外的另一位有发布权限的成员在页面上发布，也可以丢弃（回到最近的已发布版本，
 // 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。发布过的实体只能新增字段与关系（规则同 ADR-0018），
-// 没被已发布映射引用的实体可以由有发布权限的成员删除。已发布映射在用、但没登记的实体由平台推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），
+// 没被已发布映射、也没被别的实体的已发布关系指向的实体可以由有发布权限的成员删除。已发布映射在用、但没登记的实体由平台推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），
 // 先由一位成员确认（保存），再由另一位成员发布；登记发布前映射页提示实体待补登，映射页的实体链接到实体页。一律限定在操作者所属租户内
 import { and, desc, eq, exists, getTableColumns, inArray, notExists, sql } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -15,7 +15,7 @@ import { publishedPlans } from './mappings';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import {
   CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, type EntityRelation, entityOf,
-  FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType, isCustomEntity,
+  EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType, isCustomEntity,
 } from '../lib/canonical-model';
 
 /** 可以展示给成员的业务错误 */
@@ -35,13 +35,13 @@ export type CustomEntityInput = Omit<RegisteredEntity, 'name'> & { name?: string
 /**
  * 页面表单（components/custom-entity-form.tsx）提交的登记：字段按行提交 fieldName / fieldType / fieldDescription，
  * 敏感勾选框提交行号 fieldSensitive；字段名留空的行忽略。主键按逗号（或顿号）分隔。
- * 关系按行提交 relField / relEntity / relTarget（起点字段、终点实体、终点字段），起点字段留空的行忽略；起点实体留空，即本实体
+ * 关系按行提交 relFrom / relField / relEntity / relTarget（起点实体、起点字段、终点实体、终点字段），起点字段留空的行忽略；起点实体留空，即本实体
  */
 export function customEntityInputOf(form: FormData): CustomEntityInput {
   const all = (key: string) => form.getAll(key).map(String);
   const [names, types, descriptions] = [all('fieldName'), all('fieldType'), all('fieldDescription')];
   const sensitive = new Set(all('fieldSensitive').map(Number));
-  const [relFields, relEntities, relTargets] = [all('relField'), all('relEntity'), all('relTarget')];
+  const [relFroms, relFields, relEntities, relTargets] = [all('relFrom'), all('relField'), all('relEntity'), all('relTarget')];
   return {
     name: form.has('name') ? String(form.get('name')) : undefined,
     label: String(form.get('label') ?? ''),
@@ -51,21 +51,23 @@ export function customEntityInputOf(form: FormData): CustomEntityInput {
       : [])),
     primaryKey: String(form.get('primaryKey') ?? '').split(/[,，、\s]+/),
     relations: relFields.flatMap((field, i) => (field.trim()
-      ? [{ from: { entity: '', field }, ref: { entity: relEntities[i] ?? '', field: relTargets[i] ?? '' } }]
+      ? [{ from: { entity: relFroms[i] ?? '', field }, ref: { entity: relEntities[i] ?? '', field: relTargets[i] ?? '' } }]
       : [])),
   };
 }
 
-/** 关系的展示：起点字段 → 终点实体.终点字段 */
-const relationText = (r: EntityRelation) => `${r.from.field} → ${r.ref.entity}.${r.ref.field}`;
+/** 关系的展示：起点实体.起点字段 → 终点实体.终点字段 */
+const relationText = (r: EntityRelation) => `${r.from.entity}.${r.from.field} → ${r.ref.entity}.${r.ref.field}`;
 
 /** 自定义实体名称的规则（CUSTOM_ENTITY_PATTERN） */
 export const ENTITY_NAME = new RegExp(CUSTOM_ENTITY_PATTERN);
 const FIELD_NAME = new RegExp(CUSTOM_FIELD_PATTERN);
+const EXTENSION_NAME = new RegExp(EXTENSION_PATTERN);
 
 /**
  * 校验并整理一版登记（去掉首尾空白、主键去重）；不合格时抛出 CustomEntityError，说明原因。name 是本实体的名称：
- * 关系的起点要是本实体已登记的字段（起点实体留空时补上 name）。关系的终点在 checkRelations 里对照已发布的实体校验
+ * 关系的起点要是本实体已登记的字段（起点实体留空时补上 name），或标准实体的字段或 x_ 扩展字段，这时终点要是本实体（关系挂在另一端的登记上）。
+ * x_ 字段的类型、关系的终点与成环在 checkRelations 里对照已发布的映射与实体校验
  */
 export function checkRegistration(input: CustomEntityInput, name = input.name?.trim() ?? ''): CheckedRegistration {
   const label = input.label.trim();
@@ -92,10 +94,15 @@ export function checkRegistration(input: CustomEntityInput, name = input.name?.t
   }));
   const declared = new Set<string>();
   for (const r of relations) {
-    if (r.from.entity !== name) throw new CustomEntityError(`关系 ${relationText(r)} 的起点要是本实体 ${name} 的字段`);
-    if (!seen.has(r.from.field)) throw new CustomEntityError(`关系的起点 ${r.from.field} 不是已登记的字段`);
+    const canonical = entityOf(r.from.entity);
+    if (r.from.entity !== name && !canonical) throw new CustomEntityError(`关系 ${relationText(r)} 的起点要是本实体 ${name} 或标准实体的字段`);
+    if (!canonical && !seen.has(r.from.field)) throw new CustomEntityError(`关系的起点 ${r.from.field} 不是已登记的字段`);
+    if (canonical && !canonical.fields.some(f => f.name === r.from.field) && !EXTENSION_NAME.test(r.from.field)) {
+      throw new CustomEntityError(`关系的起点 ${r.from.field} 不是 ${r.from.entity} 的字段，也不是 x_ 开头的扩展字段`);
+    }
     if (!r.ref.entity || !r.ref.field) throw new CustomEntityError(`请填写关系 ${r.from.field} 的终点实体与终点字段`);
-    if (r.ref.entity === name) throw new CustomEntityError(`关系 ${relationText(r)} 指向本实体自己：自指算成环，不能声明`);
+    if (canonical && r.ref.entity !== name) throw new CustomEntityError(`关系 ${relationText(r)}：起点是标准实体时，终点要是本实体 ${name}`);
+    if (r.ref.entity === r.from.entity) throw new CustomEntityError(`关系 ${relationText(r)} 指向本实体自己：自指算成环，不能声明`);
     if (declared.has(relationText(r))) throw new CustomEntityError(`关系 ${relationText(r)} 重复`);
     declared.add(relationText(r));
   }
@@ -103,25 +110,73 @@ export function checkRegistration(input: CustomEntityInput, name = input.name?.t
 }
 
 /**
- * 校验关系的终点：终点是标准实体或本租户已发布的自定义实体（只有草稿的、包括推断出的登记草稿都不算），ref.field 是它唯一的一列主键，
- * 且与起点字段类型相同。敏感字段可以作为关系的键（两端都是哈希）。不合格时抛出 CustomEntityError
+ * 校验本实体 name 这一版登记的关系：终点是标准实体、本租户已发布的自定义实体（只有草稿的、包括推断出的登记草稿都不算）或本实体，
+ * ref.field 是它唯一的一列主键，且与起点字段类型相同。起点是标准实体的 x_ 字段时，类型取自用了它的已发布映射（映射草稿不算），
+ * 没有映射用过或各映射给的类型不同时报错。敏感字段可以作为关系的键（两端都是哈希）。
+ * 再把本版的关系放进租户的关系图（别的实体已发布的关系、标准模型内置的 ref）检查成环。不合格时抛出 CustomEntityError
  */
-export async function checkRelations(db: Tx | ReturnType<typeof getDb>, tenantId: string, registration: Pick<CheckedRegistration, 'fields' | 'relations'>) {
+export async function checkRelations(
+  db: Tx | ReturnType<typeof getDb>, tenantId: string, name: string, registration: Pick<CheckedRegistration, 'fields' | 'primaryKey' | 'relations'>,
+) {
   if (!registration.relations.length) return;
   const published = await publishedCustomEntities(db, tenantId);
+  let plans: Awaited<ReturnType<typeof publishedPlans>> | undefined;
+  const typeOf = async (r: EntityRelation): Promise<FieldType> => {
+    const origin = entityOf(r.from.entity);
+    if (!origin) return registration.fields.find(f => f.name === r.from.field)!.type;
+    const field = origin.fields.find(f => f.name === r.from.field);
+    if (field) return field.type;
+    plans ??= await publishedPlans(db, tenantId);
+    const types = [...new Set(plans.filter(p => p.entity === r.from.entity)
+      .flatMap(p => p.entityColumns.filter(c => c.name === r.from.field).map(c => c.type)))];
+    if (!types.length) throw new CustomEntityError(`关系 ${relationText(r)}：${r.from.field} 没有被已发布的 ${r.from.entity} 映射用过，类型无从确定`);
+    if (types.length > 1) throw new CustomEntityError(`关系 ${relationText(r)}：各已发布的 ${r.from.entity} 映射给 ${r.from.field} 的类型不一致（${types.join('、')}）`);
+    return types[0];
+  };
   for (const r of registration.relations) {
-    const canonical = entityOf(r.ref.entity);
-    const custom = published.get(r.ref.entity);
-    const target = canonical
-      ? { key: canonical.key, fields: canonical.fields as readonly { name: string; type: FieldType }[] }
+    const canonicalTarget = entityOf(r.ref.entity);
+    const custom = r.ref.entity === name ? registration : published.get(r.ref.entity);
+    const target = canonicalTarget
+      ? { key: canonicalTarget.key, fields: canonicalTarget.fields as readonly { name: string; type: FieldType }[] }
       : custom && { key: custom.primaryKey, fields: custom.fields };
     if (!target) throw new CustomEntityError(`关系 ${relationText(r)} 的终点 ${r.ref.entity} 不存在或没发布：终点要是标准实体或已发布的自定义实体`);
     if (target.key.length !== 1) throw new CustomEntityError(`关系 ${relationText(r)}：${r.ref.entity} 的主键有多列（${target.key.join(', ')}），终点只能是单列主键`);
     if (r.ref.field !== target.key[0]) throw new CustomEntityError(`关系 ${relationText(r)}：${r.ref.field} 不是 ${r.ref.entity} 的主键（${target.key[0]}）`);
-    const fromType = registration.fields.find(f => f.name === r.from.field)!.type;
+    const fromType = await typeOf(r);
     const refType = target.fields.find(f => f.name === r.ref.field)!.type;
     if (fromType !== refType) throw new CustomEntityError(`关系 ${relationText(r)} 两端类型不一致（${fromType} → ${refType}）`);
   }
+  const edges = [
+    ...[...published.values()].filter(e => e.name !== name).flatMap(e => e.relations ?? []),
+    ...registration.relations,
+    ...CANONICAL_ENTITIES.flatMap(e => e.fields.flatMap(f => (f.ref ? [{ from: { entity: e.name, field: f.name }, ref: f.ref }] : []))),
+  ];
+  const cycle = findCycle(edges, name);
+  if (cycle) throw new CustomEntityError(`关系成环：${cycle.join(' → ')}；维度路径要能沿关系一直走到头，不能绕回来`);
+}
+
+/**
+ * 关系图（实体 → 实体）里经过 start 的一个环，按路径列出实体、从 start 写起、首尾相同；没有时为 null。
+ * 本版新增的边都挂在本实体上，新出现的环一定经过它；只从它找，租户里已有的无关的环不拦这次保存
+ */
+function findCycle(relations: EntityRelation[], start: string): string[] | null {
+  const next = new Map<string, Set<string>>();
+  for (const r of relations) next.set(r.from.entity, (next.get(r.from.entity) ?? new Set()).add(r.ref.entity));
+  const done = new Set<string>();
+  const path: string[] = [];
+  const visit = (node: string): string[] | null => {
+    if (node === start && path.length) return [...path, node];
+    if (path.includes(node) || done.has(node)) return null;
+    path.push(node);
+    for (const to of next.get(node) ?? []) {
+      const found = visit(to);
+      if (found) return found;
+    }
+    path.pop();
+    done.add(node);
+    return null;
+  };
+  return visit(start);
 }
 
 /** 关系可选的终点：标准实体与本租户已发布的自定义实体，各自的名称、中文名与主键（实体页的关系下拉） */
@@ -168,8 +223,8 @@ export async function requireEntity(tenantId: string, entityId: string) {
 }
 
 /**
- * 引用这个实体的已发布映射（有已发布版本、映射的实体是它；映射的实体建映射时定下），按「数据源」表名列出。
- * 指标与标签还不能引用自定义实体，只查映射
+ * 引用这个实体的已发布映射（有已发布版本、映射的实体是它；映射的实体建映射时定下），按「数据源」表名列出；
+ * 再列出别的实体已发布的登记上指向它的关系（挂在它自己登记上的关系随它一起删，不算引用）。指标与标签还不能引用自定义实体
  */
 async function publishedReferrers(db: Tx | ReturnType<typeof getDb>, tenantId: string, name: string) {
   const rows = await db.select({ source: sources.name, table: mappings.tableName, viewId: mappings.sourceViewId })
@@ -180,7 +235,9 @@ async function publishedReferrers(db: Tx | ReturnType<typeof getDb>, tenantId: s
         .where(and(eq(mappingVersions.mappingId, mappings.id), eq(mappingVersions.status, 'published')))),
     ))
     .orderBy(sources.name, mappings.tableName);
-  return rows.map(r => `「${r.source}」${r.viewId ? '源视图 ' : ''}${r.table}`);
+  const relations = [...(await publishedCustomEntities(db, tenantId)).values()]
+    .flatMap(e => (e.name === name ? [] : (e.relations ?? []).filter(r => r.ref.entity === name)));
+  return [...rows.map(r => `「${r.source}」${r.viewId ? '源视图 ' : ''}${r.table}`), ...relations.map(r => `关系 ${relationText(r)}`)];
 }
 
 /** 目标是这个实体、从没发布过的映射（如一键直通配套的映射草稿）：丢弃从没发布过的登记时一并丢弃 */
@@ -249,7 +306,7 @@ export async function createCustomEntity(actor: CurrentMember, input: CustomEnti
   const registration = checkRegistration(input, name);
   try {
     return await getDb().transaction(async tx => {
-      await checkRelations(tx, actor.tenant.id, registration);
+      await checkRelations(tx, actor.tenant.id, name, registration);
       const [entity] = await tx.insert(customEntities).values({ tenantId: actor.tenant.id, name }).returning({ id: customEntities.id });
       await tx.insert(customEntityVersions).values({ entityId: entity.id, version: 1, ...registration, authors: [actor.email], lastEditor: actor.email });
       await recordAudit(tx, {
@@ -286,7 +343,7 @@ export async function saveCustomEntityDraft(actor: CurrentMember, entityId: stri
       .where(and(eq(customEntityVersions.entityId, entityId), eq(customEntityVersions.status, 'published')))
       .orderBy(desc(customEntityVersions.version)).limit(1);
     if (published) checkAdditive(published, registration);
-    await checkRelations(tx, actor.tenant.id, registration);
+    await checkRelations(tx, actor.tenant.id, entity.name, registration);
     if (latest?.status === 'draft') {
       await tx.update(customEntityVersions)
         .set({ ...registration, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
@@ -309,7 +366,7 @@ export async function saveCustomEntityDraft(actor: CurrentMember, entityId: stri
 
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。只由成员在页面上调用，没有自动发布。发布后版本锁定。
- * 关系的终点在发布时再校验一次（publishEntityDraft），因为终点可能在保存后被删
+ * 关系在发布时再校验一次（publishEntityDraft），因为终点可能在保存后被删，别的实体发布的关系也可能与它成环
  */
 export async function publishCustomEntity(actor: CurrentMember, entityId: string, version: number) {
   assertCan(actor, 'publish');
@@ -328,7 +385,7 @@ export async function publishCustomEntity(actor: CurrentMember, entityId: string
 }
 
 /**
- * 在调用方的事务里再校验关系的终点，发布检查过的这份草稿并记审计；调用方须已锁住实体行。等锁期间草稿被修改、发布或丢弃，或关系的终点不再合格时抛出 CustomEntityError。
+ * 在调用方的事务里再校验关系，发布检查过的这份草稿并记审计；调用方须已锁住实体行。等锁期间草稿被修改、发布或丢弃，或关系不再合格时抛出 CustomEntityError。
  * 发布权限与双人发布由调用方检查（publishCustomEntity，以及一键直通里登记与映射一起发布）
  */
 export async function publishEntityDraft(
@@ -336,7 +393,7 @@ export async function publishEntityDraft(
 ) {
   const [current] = await tx.select().from(customEntityVersions).where(eq(customEntityVersions.id, draft.id));
   if (isStale(current, draft)) throw new CustomEntityError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
-  await checkRelations(tx, actor.tenant.id, current);
+  await checkRelations(tx, actor.tenant.id, entity.name, current);
   await tx.update(customEntityVersions)
     .set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` })
     .where(eq(customEntityVersions.id, draft.id));
@@ -398,7 +455,7 @@ export async function discardCustomEntityDraft(actor: CurrentMember, entityId: s
 }
 
 /**
- * 删除自定义实体（硬删除，各版本随之级联删除）：需要发布权限；被已发布的映射引用时拒绝并列出这些映射。
+ * 删除自定义实体（硬删除，各版本随之级联删除）：需要发布权限；被已发布的映射或别的实体已发布的关系引用时拒绝并列出它们。
  * 引用检查与删除在同一事务里，并锁住实体行（发布映射目前不锁实体行，要等映射发布对照登记校验时才完全互斥）
  */
 export async function deleteCustomEntity(actor: CurrentMember, entityId: string) {
@@ -408,7 +465,7 @@ export async function deleteCustomEntity(actor: CurrentMember, entityId: string)
     const [locked] = await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
     if (!locked) throw new CustomEntityError('自定义实体已被删除', 404);
     const referrers = await publishedReferrers(tx, actor.tenant.id, entity.name);
-    if (referrers.length) throw new CustomEntityError(`${entity.name} 被已发布的映射引用，不能删除：${referrers.join('、')}`);
+    if (referrers.length) throw new CustomEntityError(`${entity.name} 被已发布的映射或关系引用，不能删除：${referrers.join('、')}`);
     await tx.delete(customEntities).where(eq(customEntities.id, entityId));
     await recordAudit(tx, {
       tenantId: actor.tenant.id,

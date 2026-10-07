@@ -223,7 +223,7 @@ describe('关系', () => {
     });
     const rejected: [Partial<CustomEntityInput>, RegExp][] = [
       [rel('nope', 'custom_region', 'region_id'), /起点 nope 不是已登记的字段/],
-      [{ relations: [{ ...toRegion, from: { entity: 'custom_region', field: 'region_id' } }] }, /起点要是本实体 custom_store 的字段/],
+      [{ relations: [{ ...toRegion, from: { entity: 'custom_region', field: 'region_id' } }] }, /起点要是本实体 custom_store 或标准实体的字段/],
       [{ relations: [toRegion, toRegion] }, /重复/],
       [rel('region_id', 'custom_store', 'store_id'), /自指算成环/],
       [rel('region_id', 'custom_nowhere', 'region_id'), /custom_nowhere 不存在或没发布/],
@@ -261,8 +261,8 @@ describe('关系', () => {
     await publishCustomEntity(reviewer, otherRegion, 1);
 
     const rejected: [Partial<CustomEntityInput>, RegExp][] = [
-      [{ relations: [] }, /不能删除或修改关系 region_id → custom_region\.region_id/],
-      [{ relations: [{ ...toRegion, ref: { entity: 'custom_area', field: 'region_id' } }] }, /不能删除或修改关系 region_id → custom_region\.region_id/],
+      [{ relations: [] }, /不能删除或修改关系 custom_store\.region_id → custom_region\.region_id/],
+      [{ relations: [{ ...toRegion, ref: { entity: 'custom_area', field: 'region_id' } }] }, /不能删除或修改关系 custom_store\.region_id → custom_region\.region_id/],
     ];
     for (const [patch, message] of rejected) {
       const error = await saveCustomEntityDraft(author, storeId, { ...STORE_IN_REGION, ...patch }).then(() => '已保存', (e: Error) => e.message);
@@ -274,6 +274,86 @@ describe('关系', () => {
     expect(await saveCustomEntityDraft(author, storeId, { ...STORE_IN_REGION, relations: [toCustomer, toRegion] })).toBe(2);
     await publishCustomEntity(reviewer, storeId, 2);
     expect((await publishedCustomEntities(getDb(), acme)).get('custom_store')?.relations).toEqual([toCustomer, toRegion]);
+  });
+});
+
+describe('标准实体字段作起点、成环', () => {
+  const ORDERS = `model: 1
+entity: order
+table: orders
+fields:
+  order_id: string(order_id)
+extensions:
+  x_store_id: { type: string, expr: string(customer_id) }
+  x_store_no: { type: integer, expr: customer_id }
+`;
+  const toStore = (entity: string, field: string): EntityRelation => ({ from: { entity, field }, ref: { entity: 'custom_store', field: 'store_id' } });
+
+  /** 两位数据工程师，order 映射（扩展字段 x_store_id、x_store_no）已发布，另有一份只有草稿的 order 映射用了 x_draft_only */
+  async function withOrderMapping() {
+    const people = await engineers();
+    const { id: sourceId } = await registerSource(people.author, await pgSourceInput(READER));
+    await selectAllTables(people.author, sourceId);
+    await drain();
+    await publish(people.author, people.reviewer, sourceId, ORDERS);
+    await createMapping(people.author, sourceId, 'model: 1\nentity: order\ntable: customers\nfields:\n  order_id: string(customer_id)\nextensions:\n  x_draft_only: { type: string, expr: city }\n');
+    return people;
+  }
+
+  it('能在终点的登记上声明标准字段与 x_ 字段作起点的关系，x_ 字段的类型取自已发布映射', async () => {
+    const { acme, author, reviewer } = await withOrderMapping();
+    const relations = [toStore('order', 'x_store_id'), toStore('order', 'store_id')];
+    const storeId = await createCustomEntity(author, { ...STORE, relations });
+    await publishCustomEntity(reviewer, storeId, 1);
+    expect((await publishedCustomEntities(getDb(), acme)).get('custom_store')?.relations).toEqual(relations);
+
+    const rejected: [EntityRelation, RegExp][] = [
+      [toStore('order', 'x_nowhere'), /x_nowhere 没有被已发布的 order 映射用过/],
+      [toStore('order', 'x_draft_only'), /x_draft_only 没有被已发布的 order 映射用过/],
+      [toStore('order', 'x_store_no'), /类型不一致（integer → string）/],
+      [toStore('order', 'nope'), /nope 不是 order 的字段/],
+      [{ from: { entity: 'order', field: 'store_id' }, ref: { entity: 'customer', field: 'customer_id' } }, /起点是标准实体时，终点要是本实体 custom_store/],
+    ];
+    for (const [relation, message] of rejected) {
+      const error = await saveCustomEntityDraft(author, storeId, { ...STORE, relations: [...relations, relation] }).then(() => '已保存', (e: Error) => e.message);
+      expect(error, JSON.stringify(relation)).toMatch(message);
+    }
+    expect((await getCustomEntity(author, storeId)).draft).toBeNull();
+  });
+
+  it('成环时报错并写出环的路径：自定义实体之间的环、加上标准模型内置 ref 的环；发布时再查一次', async () => {
+    const { author, reviewer } = await engineers();
+    const entity = (name: string, key: string, more: string[] = []): CustomEntityInput => ({
+      name, label: name, kind: 'dimension', primaryKey: [key],
+      fields: [key, ...more].map(f => ({ name: f, type: 'string', description: '', sensitive: false })),
+    });
+    const b = await createCustomEntity(author, entity('custom_b', 'b_id', ['a_id']));
+    await publishCustomEntity(reviewer, b, 1);
+    const a = await createCustomEntity(author, {
+      ...entity('custom_a', 'a_id', ['b_id']), relations: [{ from: { entity: 'custom_a', field: 'b_id' }, ref: { entity: 'custom_b', field: 'b_id' } }],
+    });
+    // A 还是草稿：B → A 的终点不合格；A 发布后 B → A 成环
+    const backToA = { ...entity('custom_b', 'b_id', ['a_id']), relations: [{ from: { entity: '', field: 'a_id' }, ref: { entity: 'custom_a', field: 'a_id' } }] };
+    await expect(saveCustomEntityDraft(author, b, backToA)).rejects.toThrow(/custom_a 不存在或没发布/);
+    await publishCustomEntity(reviewer, a, 1);
+    await expect(saveCustomEntityDraft(author, b, backToA)).rejects.toThrow('关系成环：custom_b → custom_a → custom_b');
+
+    // custom_store → order_item →（内置 ref）order → custom_store
+    await expect(createCustomEntity(author, {
+      ...STORE,
+      fields: [...STORE.fields, { name: 'last_item_id', type: 'string', description: '', sensitive: false }],
+      relations: [toStore('order', 'store_id'), { from: { entity: 'custom_store', field: 'last_item_id' }, ref: { entity: 'order_item', field: 'order_item_id' } }],
+    })).rejects.toThrow('关系成环：custom_store → order_item → order → custom_store');
+
+    // 两份草稿各自不成环，先发布的一份让另一份发布时成环
+    const c = await createCustomEntity(author, entity('custom_c', 'c_id', ['d_id']));
+    await publishCustomEntity(reviewer, c, 1);
+    const d = await createCustomEntity(author, entity('custom_d', 'd_id', ['c_id']));
+    await publishCustomEntity(reviewer, d, 1);
+    const cToD = await saveCustomEntityDraft(author, c, { ...entity('custom_c', 'c_id', ['d_id']), relations: [{ from: { entity: '', field: 'd_id' }, ref: { entity: 'custom_d', field: 'd_id' } }] });
+    const dToC = await saveCustomEntityDraft(author, d, { ...entity('custom_d', 'd_id', ['c_id']), relations: [{ from: { entity: '', field: 'c_id' }, ref: { entity: 'custom_c', field: 'c_id' } }] });
+    await publishCustomEntity(reviewer, c, cToD);
+    await expect(publishCustomEntity(reviewer, d, dToC)).rejects.toThrow('关系成环：custom_d → custom_c → custom_d');
   });
 });
 
@@ -291,7 +371,7 @@ describe('删除自定义实体', () => {
     await publish(author, reviewer, sourceId, yaml);
 
     await expect(deleteCustomEntity(reviewer, id)).rejects.toMatchObject({
-      status: 400, message: 'custom_store 被已发布的映射引用，不能删除：「电商库」customers',
+      status: 400, message: 'custom_store 被已发布的映射或关系引用，不能删除：「电商库」customers',
     });
     expect((await getCustomEntity(author, id)).referrers).toEqual(['「电商库」customers']);
 
@@ -299,6 +379,31 @@ describe('删除自定义实体', () => {
     await deleteCustomEntity(reviewer, unused);
     await expect(getCustomEntity(author, unused)).rejects.toMatchObject({ status: 404 });
     expect((await listAuditLogs(acme)).filter(l => l.action === '删除自定义实体').map(l => l.summary)).toEqual(['custom_region']);
+  });
+
+  it('被其他实体的已发布关系指向时拒绝并列出关系；挂在本实体上的关系不算', async () => {
+    const { author, reviewer } = await engineers();
+    const storeId = await createCustomEntity(author, {
+      ...STORE, relations: [{ from: { entity: 'order', field: 'store_id' }, ref: { entity: 'custom_store', field: 'store_id' } }],
+    });
+    await publishCustomEntity(reviewer, storeId, 1);
+    const shelf: CustomEntityInput = {
+      name: 'custom_shelf', label: '货架', kind: 'dimension', primaryKey: ['shelf_id'],
+      fields: ['shelf_id', 'store_id'].map(name => ({ name, type: 'string', description: '', sensitive: false })),
+      relations: [{ from: { entity: '', field: 'store_id' }, ref: { entity: 'custom_store', field: 'store_id' } }],
+    };
+    const shelfId = await createCustomEntity(author, shelf);
+    // 只有草稿的关系不算
+    expect((await getCustomEntity(author, storeId)).referrers).toEqual([]);
+    await publishCustomEntity(reviewer, shelfId, 1);
+
+    await expect(deleteCustomEntity(reviewer, storeId)).rejects.toMatchObject({
+      status: 400, message: 'custom_store 被已发布的映射或关系引用，不能删除：关系 custom_shelf.store_id → custom_store.store_id',
+    });
+    expect((await getCustomEntity(author, storeId)).referrers).toEqual(['关系 custom_shelf.store_id → custom_store.store_id']);
+    await deleteCustomEntity(reviewer, shelfId);
+    await deleteCustomEntity(reviewer, storeId);
+    expect(await listCustomEntities(author)).toEqual([]);
   });
 
   it('需要发布权限：分析师 403，其他租户 404', async () => {

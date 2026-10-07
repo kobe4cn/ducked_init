@@ -50,7 +50,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       targets: await relationTargets(member),
       /** 草稿是平台推断、还没有成员确认（保存）过的登记 */
       inferred: !!found.draft && isInferredDraft(found.draft),
-      /** 引用这个实体的已发布映射；有引用时不能删除 */
+      /** 引用这个实体的已发布映射与别的实体指向它的已发布关系；有引用时不能删除 */
       referrers: found.referrers,
       /** 编辑页显示的版本（?version=N，没有时显示最新的一版） */
       version: Number(new URL(request.url).searchParams.get('version')) || null,
@@ -143,7 +143,7 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
             {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : `这个自定义实体从没发布过，将被删除${unpublishedMappings.length ? `，目标是它的映射草稿一并丢弃：${unpublishedMappings.join('、')}` : ''}`} submitting={submitting} />}
             {canDelete && (referrers.length ? (
               <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-delete-blocker>
-                <Lock className="size-3.5 shrink-0" />{`被已发布的映射引用，不能删除：${referrers.join('、')}`}
+                <Lock className="size-3.5 shrink-0" />{`被已发布的映射或关系引用，不能删除：${referrers.join('、')}`}
               </span>
             ) : (
               <Form

@@ -86,7 +86,7 @@ describe('自定义实体', () => {
     expect(versions).not.toContain('custom_other');
   });
 
-  it('数据工程师在实体页给登记加关系：终点可选标准实体与已发布的自定义实体，报错时保留已填的关系，发布后详情页能看到', async () => {
+  it('数据工程师在实体页给登记加关系：起点可选本实体或标准实体，终点可选标准实体与已发布的自定义实体，报错时保留已填的关系，发布后详情页能看到', async () => {
     const tenantId = await acme();
     const [de, admin] = [await memberOf(tenantId, 'de@acme.com'), await memberOf(tenantId, 'admin@acme.com')];
     const regionId = await createCustomEntity(de, {
@@ -99,24 +99,27 @@ describe('自定义实体', () => {
     const page = locationOf(await author.post('/entities', STORE));
     const form = await (await author.get(page)).text();
     expect(form).toContain('name="relField"');
+    expect(form).toMatch(/name="relFrom"[^]*?value=""[^>]*>本实体<[^]*?value="order">order（订单）</);
     expect(form).toMatch(/value="custom_region">custom_region（大区）</);
     expect(form).toMatch(/value="customer">customer（消费者）</);
 
     const { intent: _, name: __, ...rest } = STORE;
-    const save = { ...rest, intent: 'save', fieldName: ['store_id', 'manager_phone', 'region_id'], relField: ['region_id', ''], relEntity: ['custom_region', ''] };
-    const rejected = await author.post(page, { ...save, relTarget: ['region_name', ''] });
+    const save = { ...rest, intent: 'save', fieldName: ['store_id', 'manager_phone', 'region_id'], relFrom: ['', 'order', ''], relField: ['region_id', 'store_id', ''], relEntity: ['custom_region', 'custom_store', ''] };
+    const rejected = await author.post(page, { ...save, relTarget: ['region_name', 'store_id', ''] });
     expect(rejected.status).toBe(400);
     const html = await rejected.text();
     expect(html).toContain('region_name 不是 custom_region 的主键（region_id）');
     expect(html).toContain('value="region_name"');
     expect(html).toMatch(/<option[^>]*value="custom_region" selected=""/);
+    expect(html).toMatch(/<option[^>]*value="order" selected=""/);
 
-    expect((await author.post(page, { ...save, relTarget: ['region_id', ''] })).status).toBe(302);
+    expect((await author.post(page, { ...save, relTarget: ['region_id', 'store_id', ''] })).status).toBe(302);
     const adminBrowser = await loginAs(app, 'admin@acme.com');
     expect((await adminBrowser.post(page, { intent: 'publish', version: '1' })).status).toBe(302);
     await memberOf(tenantId, 'an@acme.com', 'analyst');
     const detail = await (await (await loginAs(app, 'an@acme.com')).get(page)).text();
-    expect(detail).toMatch(/data-relation="region_id"[^]*?custom_region\.region_id/);
+    expect(detail).toMatch(/data-relation="region_id"[^]*?custom_store\.region_id[^]*?custom_region\.region_id/);
+    expect(detail).toMatch(/data-relation="store_id"[^]*?order\.store_id[^]*?custom_store\.store_id/);
   });
 
   it('分析师只读，查看者 403，其他租户 404', async () => {
