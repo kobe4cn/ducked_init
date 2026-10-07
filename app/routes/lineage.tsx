@@ -10,8 +10,8 @@
 // 在抽屉里按源列列出它影响的标准层字段。两者都只对有 sources:read 的成员生效。
 // 关系图下的「漂移检查」区块列出最近一次漂移检查（lake.inspect）的结果，任何角色可见；有 sources:write 的成员可以触发一次检查。
 // 最近一次成功的检查里有差异的标准层表在两张图的节点与图下列表上标出差异种类与数量；孤表在图上没有节点，在区块里单独列出
-import { useMemo } from 'react';
-import { data, Form, Link, redirect, useSearchParams } from 'react-router';
+import { useEffect, useMemo } from 'react';
+import { data, Form, Link, redirect, useRevalidator, useSearchParams } from 'react-router';
 import { AlertTriangle, ArrowLeft, CheckCircle2, CircleAlert, Loader2, Search } from 'lucide-react';
 import type { Route } from './+types/lineage';
 import { can, requirePermission } from '~/.server/access';
@@ -333,7 +333,7 @@ const DRIFT_KINDS = { missing: '缺列', extra: '多列', type: '类型不一致
 
 /**
  * 漂移检查：最近一次检查的状态，以及最近一次成功检查的时间与每条差异（表、种类、列、应有 / 实际类型）。
- * 有 sources:write 的成员可以触发一次检查，检查中时按钮不可用
+ * 有 sources:write 的成员可以触发一次检查，检查中时按钮不可用、页面定时刷新到检查结束
  */
 function InspectSection({ inspect, canInspect, submitError }: { inspect: InspectView; canInspect: boolean; submitError: string | null }) {
   const { status, drifts, inspectedAt } = inspect;
@@ -341,6 +341,13 @@ function InspectSection({ inspect, canInspect, submitError }: { inspect: Inspect
   const orphans = drifts.filter(d => d.kind === 'orphan');
   const columns = drifts.filter(d => d.kind !== 'orphan');
   const alarming = status === 'failed' || (inspectedAt !== null && drifts.length > 0);
+  // 检查在调度器里异步进行：检查中时定时刷新，结束后停下
+  const revalidator = useRevalidator();
+  useEffect(() => {
+    if (status !== 'running') return;
+    const timer = setInterval(() => { if (revalidator.state === 'idle') revalidator.revalidate(); }, 2000);
+    return () => clearInterval(timer);
+  }, [status, revalidator]);
   return (
     <section data-inspect-status={status} className={`space-y-4 rounded-2xl border bg-white p-6 shadow-sm ${alarming ? 'border-red-200' : ''}`}>
       <div className="flex items-start justify-between gap-6">
