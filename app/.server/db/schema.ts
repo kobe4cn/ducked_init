@@ -1,7 +1,7 @@
 // app/.server/db/schema.ts —— 平台元数据（平台 PostgreSQL 的 platform schema）。业务数据不落这里（ADR-0002）
 import { sql } from 'drizzle-orm';
 import { bigint, boolean, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
-import type { CustomEntityField, CustomEntityKind } from '../../lib/canonical-model';
+import type { CustomEntityField, CustomEntityKind, EntityRelation } from '../../lib/canonical-model';
 import { ROLES } from '../../lib/roles';
 import { SOURCE_KINDS } from '../../lib/sources';
 import type { MergePlan } from '../pipeline/mapping-spec';
@@ -384,7 +384,7 @@ export const customEntities = platform.table('custom_entities', {
   uniqueIndex('custom_entities_tenant_name_uq').on(t.tenantId, t.name),
 ]);
 
-// 自定义实体的各个版本：中文名、类型（维度 / 事实，只用于引导）、字段与主键。草稿与双人发布的规则同映射版本（ADR-0015）：
+// 自定义实体的各个版本：中文名、类型（维度 / 事实，只用于引导）、字段、主键与关系（起点写全称，ADR-0019「关系」）。草稿与双人发布的规则同映射版本（ADR-0015）：
 // 每个实体同时只有一份草稿，发布后锁定；last_editor 是最后保存草稿的成员，发布者不能是这位成员。只能由成员在页面上发布，没有自动发布
 export const customEntityVersions = platform.table('custom_entity_versions', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -395,6 +395,7 @@ export const customEntityVersions = platform.table('custom_entity_versions', {
   kind: text('kind').$type<CustomEntityKind>().notNull(),
   fields: jsonb('fields').$type<CustomEntityField[]>().notNull(),
   primaryKey: text('primary_key').array().notNull(),
+  relations: jsonb('relations').$type<EntityRelation[]>().notNull().default([]),
   authors: text('authors').array().notNull(),
   lastEditor: text('last_editor').notNull(),
   publishedByEmail: text('published_by_email'),

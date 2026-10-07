@@ -1,5 +1,6 @@
-// app/components/custom-entity-form.tsx —— 自定义实体登记的表单与只读字段表（ADR-0019）：列表页的新建与详情页的编辑共用。
-// 已有字段各一行，再加 EXTRA_ROWS 行空行（空行忽略）；「添加字段」再多给空行，没加载脚本时就先保存再加。主键是逗号分隔的字段名
+// app/components/custom-entity-form.tsx —— 自定义实体登记的表单与只读字段表、关系表（ADR-0019）：列表页的新建与详情页的编辑共用。
+// 已有字段各一行，再加 EXTRA_ROWS 行空行（空行忽略）；「添加字段」再多给空行，没加载脚本时就先保存再加。主键是逗号分隔的字段名。
+// 关系同样按行填：起点字段、终点实体（标准实体与已发布的自定义实体里选）与终点字段（终点的主键）
 import { Plus } from 'lucide-react';
 import { useState } from 'react';
 import { Form } from 'react-router';
@@ -8,7 +9,7 @@ import { Field, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
-import { CUSTOM_ENTITY_KINDS, FIELD_TYPE_NAMES, FIELD_TYPES, type CustomEntityField } from '~/lib/canonical-model';
+import { CUSTOM_ENTITY_KINDS, FIELD_TYPE_NAMES, FIELD_TYPES, type CustomEntityField, type EntityRelation } from '~/lib/canonical-model';
 
 /** 表单里的一版登记（与服务端的 CustomEntityInput 同形；类型按字符串传，未通过校验时原样回显） */
 export interface EntityFormValues {
@@ -17,26 +18,38 @@ export interface EntityFormValues {
   kind: string;
   fields: (Omit<CustomEntityField, 'type'> & { type: string })[];
   primaryKey: string[];
+  relations?: EntityRelation[];
 }
+
+/** 关系可选的终点：名称、中文名与主键 */
+export interface RelationTarget { name: string; label: string; primaryKey: string[] }
 
 /** 已有字段之后多给的空行数 */
 const EXTRA_ROWS = 3;
+/** 已有关系之后多给的空行数 */
+const EXTRA_RELATION_ROWS = 1;
 
 const EMPTY: EntityFormValues = { label: '', kind: 'dimension', fields: [], primaryKey: [] };
 
 /**
  * 登记表单（提交 intent）：新建时多一个名称输入框（建实体时定下，之后不能改）。
- * 字段按行提交 fieldName / fieldType / fieldDescription，敏感勾选框提交行号 fieldSensitive
+ * 字段按行提交 fieldName / fieldType / fieldDescription，敏感勾选框提交行号 fieldSensitive；关系按行提交 relField / relEntity / relTarget
  */
-export function CustomEntityForm({ intent, values, submitting, submitLabel }: {
+export function CustomEntityForm({ intent, values, targets, submitting, submitLabel }: {
   intent: 'create' | 'save';
   values?: EntityFormValues | null;
+  targets: RelationTarget[];
   submitting: boolean;
   submitLabel: string;
 }) {
   const v = values ?? EMPTY;
   const [extra, setExtra] = useState(EXTRA_ROWS);
+  const [extraRelations, setExtraRelations] = useState(EXTRA_RELATION_ROWS);
   const rows = [...v.fields, ...Array.from({ length: extra }, () => ({ name: '', type: 'string', description: '', sensitive: false }))];
+  const relationRows = [
+    ...(v.relations ?? []),
+    ...Array.from({ length: extraRelations }, () => ({ from: { entity: '', field: '' }, ref: { entity: '', field: '' } })),
+  ];
   return (
     <Form method="post" className="space-y-5 text-left">
       <input type="hidden" name="intent" value={intent} />
@@ -93,6 +106,39 @@ export function CustomEntityForm({ intent, values, submitting, submitLabel }: {
         <FieldLabel htmlFor="entity-primary-key">主键</FieldLabel>
         <Input id="entity-primary-key" name="primaryKey" defaultValue={v.primaryKey.join(', ')} placeholder="store_id" className="font-mono" required />
       </Field>
+      <div className="overflow-x-auto rounded-2xl border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>关系：本实体字段</TableHead>
+              <TableHead>终点实体</TableHead>
+              <TableHead>终点字段（主键）</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {relationRows.map((r, i) => (
+              <TableRow key={i} data-relation-row={i}>
+                <TableCell><Input name="relField" defaultValue={r.from.field} placeholder="region_id" aria-label={`第 ${i + 1} 条关系的字段`} className="font-mono" /></TableCell>
+                <TableCell>
+                  <NativeSelect name="relEntity" defaultValue={r.ref.entity} aria-label={`第 ${i + 1} 条关系的终点实体`}>
+                    <NativeSelectOption value="">选择实体</NativeSelectOption>
+                    {/* 已填的终点不在可选列表里（如没发布）时也列出，报错后原样回显 */}
+                    {r.ref.entity && !targets.some(t => t.name === r.ref.entity) && <NativeSelectOption value={r.ref.entity}>{r.ref.entity}</NativeSelectOption>}
+                    {targets.map(t => <NativeSelectOption key={t.name} value={t.name}>{`${t.name}（${t.label}）`}</NativeSelectOption>)}
+                  </NativeSelect>
+                </TableCell>
+                <TableCell><Input name="relTarget" defaultValue={r.ref.field} placeholder="终点的主键" aria-label={`第 ${i + 1} 条关系的终点字段`} className="font-mono" /></TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+      <Button type="button" variant="outline" size="sm" onClick={() => setExtraRelations(n => n + 1)}>
+        <Plus />添加关系
+      </Button>
+      <p className="max-w-2xl text-sm text-slate-500">
+        {`关系把本实体的一个字段指向另一个实体的主键，两端类型要相同。终点可以是标准实体或已发布的自定义实体，只能是单列主键：${targets.filter(t => t.primaryKey.length === 1).map(t => `${t.name}.${t.primaryKey[0]}`).join('、') || '暂无'}。字段留空的行忽略；发布后只能新增关系。`}
+      </p>
       <Button type="submit" disabled={submitting}>{submitting ? '正在保存…' : submitLabel}</Button>
     </Form>
   );
@@ -117,6 +163,29 @@ export function EntityFieldsTable({ fields, primaryKey }: Pick<EntityFormValues,
             <TableCell className="text-sm">{f.type}</TableCell>
             <TableCell className="text-sm text-slate-500">{f.description || '—'}</TableCell>
             <TableCell className="text-sm text-slate-500">{[primaryKey.includes(f.name) && '主键', f.sensitive && '敏感'].filter(Boolean).join('、')}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+/** 一版登记的只读关系表：本实体字段 → 终点实体.终点字段；没有关系时不显示 */
+export function EntityRelationsTable({ relations }: { relations: EntityRelation[] }) {
+  if (!relations.length) return null;
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>关系：本实体字段</TableHead>
+          <TableHead>终点</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {relations.map(r => (
+          <TableRow key={`${r.from.field}-${r.ref.entity}-${r.ref.field}`} data-relation={r.from.field}>
+            <TableCell className="font-mono">{r.from.field}</TableCell>
+            <TableCell className="font-mono">{`${r.ref.entity}.${r.ref.field}`}</TableCell>
           </TableRow>
         ))}
       </TableBody>

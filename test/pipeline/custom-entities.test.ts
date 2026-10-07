@@ -1,5 +1,5 @@
 // 自定义实体登记的接缝（ADR-0019）：createCustomEntity / saveCustomEntityDraft 校验名称、字段与主键后保存草稿；
-// 双人发布与丢弃同源视图；publishedCustomEntities 给出每个实体最新的已发布版本。发布过的实体只能新增字段；
+// 双人发布与丢弃同源视图；publishedCustomEntities 给出每个实体最新的已发布版本。关系的终点保存与发布时都校验；发布过的实体只能新增字段与关系；
 // deleteCustomEntity 删除没被已发布映射引用的实体；draftFor 按已发布登记生成自定义实体的映射草稿；inferCustomEntityDrafts 为已发布映射在用、但没登记的实体推断登记草稿
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
@@ -9,6 +9,7 @@ import {
 } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { customEntities } from '../../app/.server/db/schema';
+import type { EntityRelation } from '../../app/lib/canonical-model';
 import { createMapping, draftFor, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
@@ -107,7 +108,7 @@ describe('自定义实体发布', () => {
     expect((await getCustomEntity(author, id)).draft).toMatchObject({ authors: ['de2@acme.com', 'de@acme.com'], lastEditor: 'de@acme.com' });
     // 草稿不影响已发布的登记
     expect(await publishedCustomEntities(getDb(), acme)).toEqual(new Map([['custom_store', {
-      name: 'custom_store', label: '门店', kind: 'dimension', fields: STORE.fields, primaryKey: ['store_id'],
+      name: 'custom_store', label: '门店', kind: 'dimension', fields: STORE.fields, primaryKey: ['store_id'], relations: [],
     }]]));
 
     expect(await discardCustomEntityDraft(author, id)).toEqual({ kept: true });
@@ -166,6 +167,113 @@ describe('发布后只能新增字段', () => {
     expect((await publishedCustomEntities(getDb(), acme)).get('custom_store')).toMatchObject({ label: '线下门店', kind: 'fact', fields: changed.fields });
     // 对照的是最新的已发布版本
     await expect(saveCustomEntityDraft(author, id, STORE)).rejects.toThrow(/不能删除字段 city/);
+  });
+});
+
+describe('关系', () => {
+  const REGION: CustomEntityInput = {
+    name: 'custom_region',
+    label: '大区',
+    kind: 'dimension',
+    fields: [{ name: 'region_id', type: 'string', description: '', sensitive: false }, { name: 'region_name', type: 'string', description: '', sensitive: false }],
+    primaryKey: ['region_id'],
+  };
+  const toRegion: EntityRelation = { from: { entity: 'custom_store', field: 'region_id' }, ref: { entity: 'custom_region', field: 'region_id' } };
+  const STORE_IN_REGION: CustomEntityInput = {
+    ...STORE, fields: [...STORE.fields, { name: 'region_id', type: 'string', description: '', sensitive: false }], relations: [toRegion],
+  };
+
+  /** 两位数据工程师，大区已登记并发布 */
+  async function withRegion() {
+    const people = await engineers();
+    const regionId = await createCustomEntity(people.author, REGION);
+    await publishCustomEntity(people.reviewer, regionId, 1);
+    return { ...people, regionId };
+  }
+
+  it('关系的终点可以是已发布的自定义实体或标准实体的主键，跟登记一起保存、发布', async () => {
+    const { acme, author, reviewer } = await withRegion();
+    const storeId = await createCustomEntity(author, STORE_IN_REGION);
+    const toCustomer: EntityRelation = { from: { entity: 'custom_redeem', field: 'customer_id' }, ref: { entity: 'customer', field: 'customer_id' } };
+    const redeemId = await createCustomEntity(author, {
+      name: 'custom_redeem', label: '核销', kind: 'fact',
+      fields: [{ name: 'redeem_id', type: 'string', description: '', sensitive: false }, { name: 'customer_id', type: 'string', description: '', sensitive: true }],
+      primaryKey: ['redeem_id'],
+      // 起点不写实体时就是本实体
+      relations: [{ from: { entity: '', field: 'customer_id' }, ref: toCustomer.ref }],
+    });
+    expect((await getCustomEntity(author, storeId)).draft).toMatchObject({ relations: [toRegion] });
+    await publishCustomEntity(reviewer, storeId, 1);
+    await publishCustomEntity(reviewer, redeemId, 1);
+    const published = await publishedCustomEntities(getDb(), acme);
+    expect(published.get('custom_store')?.relations).toEqual([toRegion]);
+    expect(published.get('custom_redeem')?.relations).toEqual([toCustomer]);
+    expect(published.get('custom_region')?.relations).toEqual([]);
+  });
+
+  it('起点字段没登记、终点不存在或没发布、终点不是单列主键、两端类型不一致时报错，什么也不保存', async () => {
+    const { author, reviewer } = await withRegion();
+    // 只有草稿的实体不能作终点
+    await createCustomEntity(author, { ...REGION, name: 'custom_zone' });
+    await createCustomEntity(author, {
+      ...REGION, name: 'custom_cell', fields: [...REGION.fields, { name: 'cell_id', type: 'string', description: '', sensitive: false }], primaryKey: ['region_id', 'cell_id'],
+    });
+    const rel = (from: string, entity: string, field: string): Partial<CustomEntityInput> => ({
+      relations: [{ from: { entity: 'custom_store', field: from }, ref: { entity, field } }],
+    });
+    const rejected: [Partial<CustomEntityInput>, RegExp][] = [
+      [rel('nope', 'custom_region', 'region_id'), /起点 nope 不是已登记的字段/],
+      [{ relations: [{ ...toRegion, from: { entity: 'custom_region', field: 'region_id' } }] }, /起点要是本实体 custom_store 的字段/],
+      [{ relations: [toRegion, toRegion] }, /重复/],
+      [rel('region_id', 'custom_store', 'store_id'), /自指算成环/],
+      [rel('region_id', 'custom_nowhere', 'region_id'), /custom_nowhere 不存在或没发布/],
+      [rel('region_id', 'custom_zone', 'region_id'), /custom_zone 不存在或没发布/],
+      [rel('region_id', 'custom_region', 'region_name'), /region_name 不是 custom_region 的主键（region_id）/],
+      [rel('region_id', 'customer', 'phone'), /phone 不是 customer 的主键（customer_id）/],
+      [{ ...STORE_IN_REGION, fields: [...STORE.fields, { name: 'region_id', type: 'integer', description: '', sensitive: false }] }, /类型不一致.*integer.*string/],
+      [rel('opened_on', 'customer', 'customer_id'), /类型不一致/],
+    ];
+    for (const [patch, message] of rejected) {
+      const error = await createCustomEntity(author, { ...STORE_IN_REGION, ...patch }).then(() => '已保存', (e: Error) => e.message);
+      expect(error, JSON.stringify(patch)).toMatch(message);
+    }
+    expect((await listCustomEntities(author)).map(e => e.name)).toEqual(['custom_cell', 'custom_region', 'custom_zone']);
+
+    // 终点主键有两列：草稿的复合主键不算（没发布），发布后报「单列主键」
+    const cell = (await listCustomEntities(author)).find(e => e.name === 'custom_cell')!;
+    await publishCustomEntity(reviewer, cell.id, 1);
+    await expect(createCustomEntity(author, { ...STORE_IN_REGION, ...rel('region_id', 'custom_cell', 'region_id') })).rejects.toThrow(/custom_cell 的主键有多列/);
+  });
+
+  it('发布时再校验终点：保存后终点被删就发布不了', async () => {
+    const { author, reviewer, regionId } = await withRegion();
+    const storeId = await createCustomEntity(author, STORE_IN_REGION);
+    await deleteCustomEntity(reviewer, regionId);
+    await expect(publishCustomEntity(reviewer, storeId, 1)).rejects.toThrow(/custom_region 不存在或没发布/);
+    expect((await getCustomEntity(author, storeId)).published).toBeNull();
+  });
+
+  it('发布后删掉或改动已发布的关系被拒绝；新增关系可以保存并发布', async () => {
+    const { acme, author, reviewer } = await withRegion();
+    const storeId = await createCustomEntity(author, STORE_IN_REGION);
+    await publishCustomEntity(reviewer, storeId, 1);
+    const otherRegion = await createCustomEntity(author, { ...REGION, name: 'custom_area' });
+    await publishCustomEntity(reviewer, otherRegion, 1);
+
+    const rejected: [Partial<CustomEntityInput>, RegExp][] = [
+      [{ relations: [] }, /不能删除或修改关系 region_id → custom_region\.region_id/],
+      [{ relations: [{ ...toRegion, ref: { entity: 'custom_area', field: 'region_id' } }] }, /不能删除或修改关系 region_id → custom_region\.region_id/],
+    ];
+    for (const [patch, message] of rejected) {
+      const error = await saveCustomEntityDraft(author, storeId, { ...STORE_IN_REGION, ...patch }).then(() => '已保存', (e: Error) => e.message);
+      expect(error, JSON.stringify(patch)).toMatch(message);
+    }
+    expect((await getCustomEntity(author, storeId)).draft).toBeNull();
+
+    const toCustomer: EntityRelation = { from: { entity: 'custom_store', field: 'manager_phone' }, ref: { entity: 'customer', field: 'customer_id' } };
+    expect(await saveCustomEntityDraft(author, storeId, { ...STORE_IN_REGION, relations: [toCustomer, toRegion] })).toBe(2);
+    await publishCustomEntity(reviewer, storeId, 2);
+    expect((await publishedCustomEntities(getDb(), acme)).get('custom_store')?.relations).toEqual([toCustomer, toRegion]);
   });
 });
 

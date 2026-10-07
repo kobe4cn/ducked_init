@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."custom_entity_versions" ADD COLUMN "relations" jsonb DEFAULT '[]' NOT NULL;

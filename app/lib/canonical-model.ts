@@ -244,6 +244,8 @@ export const CUSTOM_ENTITY_KINDS = { dimension: '维度', fact: '事实' } as co
 export type CustomEntityKind = keyof typeof CUSTOM_ENTITY_KINDS;
 /** 自定义实体登记的一个字段；敏感字段在标准层只存哈希，类型只能是 string */
 export interface CustomEntityField { name: string; type: FieldType; description: string; sensitive: boolean }
+/** 登记上声明的一条关系（ADR-0019「关系」）：起点是本实体的一个字段，终点是另一个已发布实体的单列主键；ref 与 CanonicalField.ref 同形 */
+export interface EntityRelation { from: { entity: string; field: string }; ref: { entity: string; field: string } }
 
 export const isCustomEntity = (name: string) => new RegExp(CUSTOM_ENTITY_PATTERN).test(name);
 

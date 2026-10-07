@@ -1,5 +1,5 @@
 // app/routes/entities.tsx —— 自定义实体列表（ADR-0019）：租户在标准模型之外登记的实体，各自的中文名、类型、已发布版本与草稿。
-// 数据工程师、管理员在这里新建（名称、中文名、类型、字段与主键，保存为第一版草稿，到详情页由另一位成员发布）；分析师只读。
+// 数据工程师、管理员在这里新建（名称、中文名、类型、字段、主键与关系，保存为第一版草稿，到详情页由另一位成员发布）；分析师只读。
 // 没有实体时直接给出新建表单；?new=1 时在列表上方打开新建表单。已发布映射在用、但没登记的实体打开列表时推断出登记草稿，标为待确认。
 // ?passthrough=1 时打开一键直通：选数据源和一张已采集的源表，一次生成登记草稿与恒等映射草稿，跳到实体详情页（passthrough.ts）
 import { CheckCircle2, CircleAlert, PencilLine, Plus, Zap } from 'lucide-react';
@@ -7,7 +7,7 @@ import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entities';
 import { can, requirePermission } from '~/.server/access';
-import { createCustomEntity, CustomEntityError, customEntityInputOf, listCustomEntities } from '~/.server/custom-entities';
+import { createCustomEntity, CustomEntityError, customEntityInputOf, listCustomEntities, relationTargets } from '~/.server/custom-entities';
 import { referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { createPassthrough } from '~/.server/passthrough';
@@ -40,6 +40,8 @@ export async function loader({ request }: Route.LoaderArgs) {
     creating: params.has('new'),
     passthrough,
     entities: await listCustomEntities(member),
+    /** 新建表单里关系可选的终点 */
+    targets: canWrite ? await relationTargets(member) : [],
     /** 一键直通可选的数据源，与各数据源已采集的源表名（只在打开一键直通时才给） */
     sources,
     tables: Object.fromEntries(await Promise.all(sources.map(async s => [s.id, (await referenceTables(member, s.id)).filter(t => !t.view).map(t => t.name)] as const))),
@@ -71,7 +73,7 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function Entities({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, creating, passthrough, entities, sources, tables } = loaderData;
+  const { email, nav, canWrite, creating, passthrough, entities, targets, sources, tables } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const showPassthrough = canWrite && (passthrough || !!actionData?.passthrough);
   const showForm = canWrite && !showPassthrough && (creating || !entities.length || !!actionData);
@@ -107,7 +109,7 @@ export default function Entities({ loaderData, actionData }: Route.ComponentProp
         <section className="rounded-2xl border bg-white p-6 shadow-sm">
           <h2 className="mb-1 font-semibold">新建自定义实体</h2>
           {!entities.length && <p className="mb-4 max-w-2xl text-sm text-slate-500">还没有自定义实体。登记名称、字段与主键，保存为第一版草稿。</p>}
-          <CustomEntityForm intent="create" values={actionData?.input} submitting={submitting} submitLabel="保存草稿" />
+          <CustomEntityForm intent="create" values={actionData?.input} targets={targets} submitting={submitting} submitLabel="保存草稿" />
         </section>
       )}
       {!entities.length && !canWrite && (

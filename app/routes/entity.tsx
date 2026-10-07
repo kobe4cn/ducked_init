@@ -1,5 +1,5 @@
-// app/routes/entity.tsx —— 单个自定义实体（ADR-0019）：数据工程师、管理员编辑登记（中文名、类型、字段与主键；名称建实体时定下，不能改），
-// 各版本（已发布的锁定、草稿可改；发布过的只能新增字段）、丢弃草稿，发布草稿需最后保存它的人以外的另一位有发布权限的成员在这个页面上操作，
+// app/routes/entity.tsx —— 单个自定义实体（ADR-0019）：数据工程师、管理员编辑登记（中文名、类型、字段、主键与关系；名称建实体时定下，不能改），
+// 各版本（已发布的锁定、草稿可改；发布过的只能新增字段与关系）、丢弃草稿，发布草稿需最后保存它的人以外的另一位有发布权限的成员在这个页面上操作，
 // 没有自动发布。有发布权限的成员可以删除没被已发布映射引用的实体。平台推断出的登记草稿提示成员核对后保存确认，确认前发布不了。
 // 从没发布过的登记有配套的映射草稿（一键直通生成的）时，显示这个映射，可以把登记与映射一起发布（passthrough.ts）。
 // 分编辑、版本两个标签页（?tab=edit|versions，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）
@@ -8,13 +8,14 @@ import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entity';
 import { can, requirePermission } from '~/.server/access';
 import {
-  CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, saveCustomEntityDraft, unpublishedMappingsOf,
+  CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, relationTargets, saveCustomEntityDraft,
+  unpublishedMappingsOf,
 } from '~/.server/custom-entities';
 import { navFor } from '~/.server/nav';
 import { passthroughPair, publishPassthrough } from '~/.server/passthrough';
 import { publishBlocker, publishReason } from '~/.server/publish-rules';
 import { AppShell } from '~/components/app-shell';
-import { CustomEntityForm, EntityFieldsTable } from '~/components/custom-entity-form';
+import { CustomEntityForm, EntityFieldsTable, EntityRelationsTable } from '~/components/custom-entity-form';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
@@ -45,6 +46,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       canWrite: can(member.role, 'sources:write'),
       canDelete: can(member.role, 'publish'),
       entity: found.entity,
+      /** 关系可选的终点：标准实体与已发布的自定义实体 */
+      targets: await relationTargets(member),
       /** 草稿是平台推断、还没有成员确认（保存）过的登记 */
       inferred: !!found.draft && isInferredDraft(found.draft),
       /** 引用这个实体的已发布映射；有引用时不能删除 */
@@ -124,7 +127,7 @@ function editHint(canWrite: boolean, selected: { status: string }, draft: { vers
 }
 
 export default function Entity({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, canWrite, canDelete, entity, inferred, referrers, version, versions, pair, unpublishedMappings } = loaderData;
+  const { email, nav, tab, canWrite, canDelete, entity, targets, inferred, referrers, version, versions, pair, unpublishedMappings } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -211,6 +214,7 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
                 key={selected.version}
                 intent="save"
                 values={actionData?.input ?? selected}
+                targets={targets}
                 submitting={submitting}
                 submitLabel={selected.status === 'draft' ? '保存草稿' : '保存为新草稿'}
               />
@@ -218,6 +222,7 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
               <>
                 <p className="mb-4 text-sm">{`${selected.label} · ${CUSTOM_ENTITY_KINDS[selected.kind]} · 主键 `}<span className="font-mono">{selected.primaryKey.join(', ')}</span></p>
                 <EntityFieldsTable fields={selected.fields} primaryKey={selected.primaryKey} />
+                <EntityRelationsTable relations={selected.relations} />
               </>
             )}
           </>

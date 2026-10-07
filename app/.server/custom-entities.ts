@@ -1,7 +1,8 @@
 // app/.server/custom-entities.ts —— 自定义实体登记（ADR-0019）：成员在标准模型之外登记的实体，名称 custom_ 开头、租户内唯一（建实体时定下，之后不能改），
-// 每一版登记中文名、类型（维度 / 事实，只用于引导）、字段（名称、类型、说明、是否敏感）与主键。保存草稿时校验登记本身。
+// 每一版登记中文名、类型（维度 / 事实，只用于引导）、字段（名称、类型、说明、是否敏感）、主键与关系（本实体字段 → 另一个已发布实体的单列主键，
+// ADR-0019「关系」）。保存草稿时校验登记本身与关系的终点，发布时再校验一次终点。
 // 草稿按映射同样的规则双人发布：由最后保存它的人以外的另一位有发布权限的成员在页面上发布，也可以丢弃（回到最近的已发布版本，
-// 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。发布过的实体只能新增字段（规则同 ADR-0018），
+// 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。发布过的实体只能新增字段与关系（规则同 ADR-0018），
 // 没被已发布映射引用的实体可以由有发布权限的成员删除。已发布映射在用、但没登记的实体由平台推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），
 // 先由一位成员确认（保存），再由另一位成员发布；登记发布前映射页提示实体待补登，映射页的实体链接到实体页。一律限定在操作者所属租户内
 import { and, desc, eq, exists, getTableColumns, inArray, notExists, sql } from 'drizzle-orm';
@@ -13,7 +14,8 @@ import { customEntities, customEntityVersions, mappings, mappingVersions, source
 import { publishedPlans } from './mappings';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import {
-  CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType, isCustomEntity,
+  CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, type EntityRelation, entityOf,
+  FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType, isCustomEntity,
 } from '../lib/canonical-model';
 
 /** 可以展示给成员的业务错误 */
@@ -21,20 +23,25 @@ export class CustomEntityError extends Error {
   constructor(message: string, readonly status: 400 | 403 | 404 = 400) { super(message); }
 }
 
-/** 一个自定义实体的一版登记 */
-export interface RegisteredEntity { name: string; label: string; kind: CustomEntityKind; fields: CustomEntityField[]; primaryKey: string[] }
+/** 一个自定义实体的一版登记；没有关系时 relations 可以不填 */
+export interface RegisteredEntity { name: string; label: string; kind: CustomEntityKind; fields: CustomEntityField[]; primaryKey: string[]; relations?: EntityRelation[] }
+
+/** 校验整理过的一版登记：关系一定有 */
+type CheckedRegistration = Omit<RegisteredEntity, 'name'> & { relations: EntityRelation[] };
 
 /** 新建与保存草稿的输入；名称只在新建时接收 */
 export type CustomEntityInput = Omit<RegisteredEntity, 'name'> & { name?: string };
 
 /**
  * 页面表单（components/custom-entity-form.tsx）提交的登记：字段按行提交 fieldName / fieldType / fieldDescription，
- * 敏感勾选框提交行号 fieldSensitive；字段名留空的行忽略。主键按逗号（或顿号）分隔
+ * 敏感勾选框提交行号 fieldSensitive；字段名留空的行忽略。主键按逗号（或顿号）分隔。
+ * 关系按行提交 relField / relEntity / relTarget（起点字段、终点实体、终点字段），起点字段留空的行忽略；起点实体留空，即本实体
  */
 export function customEntityInputOf(form: FormData): CustomEntityInput {
   const all = (key: string) => form.getAll(key).map(String);
   const [names, types, descriptions] = [all('fieldName'), all('fieldType'), all('fieldDescription')];
   const sensitive = new Set(all('fieldSensitive').map(Number));
+  const [relFields, relEntities, relTargets] = [all('relField'), all('relEntity'), all('relTarget')];
   return {
     name: form.has('name') ? String(form.get('name')) : undefined,
     label: String(form.get('label') ?? ''),
@@ -43,15 +50,24 @@ export function customEntityInputOf(form: FormData): CustomEntityInput {
       ? [{ name, type: (types[i] ?? '') as FieldType, description: descriptions[i] ?? '', sensitive: sensitive.has(i) }]
       : [])),
     primaryKey: String(form.get('primaryKey') ?? '').split(/[,，、\s]+/),
+    relations: relFields.flatMap((field, i) => (field.trim()
+      ? [{ from: { entity: '', field }, ref: { entity: relEntities[i] ?? '', field: relTargets[i] ?? '' } }]
+      : [])),
   };
 }
+
+/** 关系的展示：起点字段 → 终点实体.终点字段 */
+const relationText = (r: EntityRelation) => `${r.from.field} → ${r.ref.entity}.${r.ref.field}`;
 
 /** 自定义实体名称的规则（CUSTOM_ENTITY_PATTERN） */
 export const ENTITY_NAME = new RegExp(CUSTOM_ENTITY_PATTERN);
 const FIELD_NAME = new RegExp(CUSTOM_FIELD_PATTERN);
 
-/** 校验并整理一版登记（去掉首尾空白、主键去重）；不合格时抛出 CustomEntityError，说明原因 */
-export function checkRegistration(input: CustomEntityInput): Omit<RegisteredEntity, 'name'> {
+/**
+ * 校验并整理一版登记（去掉首尾空白、主键去重）；不合格时抛出 CustomEntityError，说明原因。name 是本实体的名称：
+ * 关系的起点要是本实体已登记的字段（起点实体留空时补上 name）。关系的终点在 checkRelations 里对照已发布的实体校验
+ */
+export function checkRegistration(input: CustomEntityInput, name = input.name?.trim() ?? ''): CheckedRegistration {
   const label = input.label.trim();
   if (!label) throw new CustomEntityError('请填写中文名');
   if (!Object.hasOwn(CUSTOM_ENTITY_KINDS, input.kind)) throw new CustomEntityError('类型只能是维度或事实');
@@ -70,16 +86,61 @@ export function checkRegistration(input: CustomEntityInput): Omit<RegisteredEnti
   const primaryKey = [...new Set(input.primaryKey.map(k => k.trim()).filter(Boolean))];
   if (!primaryKey.length) throw new CustomEntityError('请填写主键：一个或几个已登记的字段');
   for (const k of primaryKey) if (!seen.has(k)) throw new CustomEntityError(`主键 ${k} 不是已登记的字段`);
-  return { label, kind: input.kind, fields, primaryKey };
+  const relations = (input.relations ?? []).map(r => ({
+    from: { entity: r.from.entity.trim() || name, field: r.from.field.trim() },
+    ref: { entity: r.ref.entity.trim(), field: r.ref.field.trim() },
+  }));
+  const declared = new Set<string>();
+  for (const r of relations) {
+    if (r.from.entity !== name) throw new CustomEntityError(`关系 ${relationText(r)} 的起点要是本实体 ${name} 的字段`);
+    if (!seen.has(r.from.field)) throw new CustomEntityError(`关系的起点 ${r.from.field} 不是已登记的字段`);
+    if (!r.ref.entity || !r.ref.field) throw new CustomEntityError(`请填写关系 ${r.from.field} 的终点实体与终点字段`);
+    if (r.ref.entity === name) throw new CustomEntityError(`关系 ${relationText(r)} 指向本实体自己：自指算成环，不能声明`);
+    if (declared.has(relationText(r))) throw new CustomEntityError(`关系 ${relationText(r)} 重复`);
+    declared.add(relationText(r));
+  }
+  return { label, kind: input.kind, fields, primaryKey, relations };
 }
 
 /**
- * 发布后只能新增字段：新的一版与最近的已发布版本相比，已有字段不能少、类型与敏感标记不能变，主键必须完全相同。
+ * 校验关系的终点：终点是标准实体或本租户已发布的自定义实体（只有草稿的、包括推断出的登记草稿都不算），ref.field 是它唯一的一列主键，
+ * 且与起点字段类型相同。敏感字段可以作为关系的键（两端都是哈希）。不合格时抛出 CustomEntityError
+ */
+export async function checkRelations(db: Tx | ReturnType<typeof getDb>, tenantId: string, registration: Pick<CheckedRegistration, 'fields' | 'relations'>) {
+  if (!registration.relations.length) return;
+  const published = await publishedCustomEntities(db, tenantId);
+  for (const r of registration.relations) {
+    const canonical = entityOf(r.ref.entity);
+    const custom = published.get(r.ref.entity);
+    const target = canonical
+      ? { key: canonical.key, fields: canonical.fields as readonly { name: string; type: FieldType }[] }
+      : custom && { key: custom.primaryKey, fields: custom.fields };
+    if (!target) throw new CustomEntityError(`关系 ${relationText(r)} 的终点 ${r.ref.entity} 不存在或没发布：终点要是标准实体或已发布的自定义实体`);
+    if (target.key.length !== 1) throw new CustomEntityError(`关系 ${relationText(r)}：${r.ref.entity} 的主键有多列（${target.key.join(', ')}），终点只能是单列主键`);
+    if (r.ref.field !== target.key[0]) throw new CustomEntityError(`关系 ${relationText(r)}：${r.ref.field} 不是 ${r.ref.entity} 的主键（${target.key[0]}）`);
+    const fromType = registration.fields.find(f => f.name === r.from.field)!.type;
+    const refType = target.fields.find(f => f.name === r.ref.field)!.type;
+    if (fromType !== refType) throw new CustomEntityError(`关系 ${relationText(r)} 两端类型不一致（${fromType} → ${refType}）`);
+  }
+}
+
+/** 关系可选的终点：标准实体与本租户已发布的自定义实体，各自的名称、中文名与主键（实体页的关系下拉） */
+export async function relationTargets(actor: CurrentMember) {
+  assertCan(actor, 'sources:read');
+  const custom = [...(await publishedCustomEntities(getDb(), actor.tenant.id)).values()];
+  return [
+    ...CANONICAL_ENTITIES.map(e => ({ name: e.name, label: e.label, primaryKey: [...e.key] })),
+    ...custom.map(e => ({ name: e.name, label: e.label, primaryKey: e.primaryKey })),
+  ];
+}
+
+/**
+ * 发布后只能新增字段与关系：新的一版与最近的已发布版本相比，已有字段不能少、类型与敏感标记不能变，主键必须完全相同，已发布的关系原样都在。
  * 中文名、类型（维度 / 事实）、字段说明与字段顺序可以改。不兼容时抛出 CustomEntityError
  */
-function checkAdditive(published: Omit<RegisteredEntity, 'name'>, next: Omit<RegisteredEntity, 'name'>) {
+function checkAdditive(published: CheckedRegistration, next: CheckedRegistration) {
   const reject = (reason: string) => {
-    throw new CustomEntityError(`${reason}：发布后只能新增字段；改主键、改类型、改名要新建实体`);
+    throw new CustomEntityError(`${reason}：发布后只能新增字段与关系；改主键、改类型、改名要新建实体`);
   };
   const nextByName = new Map(next.fields.map(f => [f.name, f]));
   for (const f of published.fields) {
@@ -89,6 +150,12 @@ function checkAdditive(published: Omit<RegisteredEntity, 'name'>, next: Omit<Reg
     else if (nextField.sensitive !== f.sensitive) reject(`不能改字段 ${f.name} 的敏感标记`);
   }
   if (next.primaryKey.join() !== published.primaryKey.join()) reject(`不能改主键（${published.primaryKey.join(', ')}）`);
+  // 按值比较：jsonb 存进去后对象键的顺序会变
+  const keyOf = (r: EntityRelation) => [r.from.entity, r.from.field, r.ref.entity, r.ref.field].join('\n');
+  const nextRelations = new Set(next.relations.map(keyOf));
+  for (const r of published.relations) {
+    if (!nextRelations.has(keyOf(r))) reject(`不能删除或修改关系 ${relationText(r)}`);
+  }
 }
 
 /** 本租户的自定义实体；不存在（含属于别的租户）时 404 */
@@ -161,7 +228,7 @@ export async function getCustomEntity(actor: CurrentMember, entityId: string) {
   const versions = await getDb().select({
     version: customEntityVersions.version, status: customEntityVersions.status,
     label: customEntityVersions.label, kind: customEntityVersions.kind, fields: customEntityVersions.fields, primaryKey: customEntityVersions.primaryKey,
-    authors: customEntityVersions.authors, lastEditor: customEntityVersions.lastEditor,
+    relations: customEntityVersions.relations, authors: customEntityVersions.authors, lastEditor: customEntityVersions.lastEditor,
     publishedByEmail: customEntityVersions.publishedByEmail, publishedAt: customEntityVersions.publishedAt, updatedAt: customEntityVersions.updatedAt,
   }).from(customEntityVersions).where(eq(customEntityVersions.entityId, entityId)).orderBy(desc(customEntityVersions.version));
   return {
@@ -179,9 +246,10 @@ export async function createCustomEntity(actor: CurrentMember, input: CustomEnti
   assertCan(actor, 'sources:write');
   const name = (input.name ?? '').trim();
   if (!ENTITY_NAME.test(name)) throw new CustomEntityError('名称要以 custom_ 开头，之后只含小写字母、数字和下划线（如 custom_store）');
-  const registration = checkRegistration(input);
+  const registration = checkRegistration(input, name);
   try {
     return await getDb().transaction(async tx => {
+      await checkRelations(tx, actor.tenant.id, registration);
       const [entity] = await tx.insert(customEntities).values({ tenantId: actor.tenant.id, name }).returning({ id: customEntities.id });
       await tx.insert(customEntityVersions).values({ entityId: entity.id, version: 1, ...registration, authors: [actor.email], lastEditor: actor.email });
       await recordAudit(tx, {
@@ -201,13 +269,13 @@ export async function createCustomEntity(actor: CurrentMember, input: CustomEnti
 }
 
 /**
- * 保存草稿：登记校验通过、且发布过时只新增了字段（checkAdditive）后，已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
+ * 保存草稿：登记与关系的终点校验通过、且发布过时只新增了字段与关系（checkAdditive）后，已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
  * 名称不能改，input.name 被忽略。返回草稿的版本号
  */
 export async function saveCustomEntityDraft(actor: CurrentMember, entityId: string, input: CustomEntityInput) {
   assertCan(actor, 'sources:write');
   const entity = await requireEntity(actor.tenant.id, entityId);
-  const registration = checkRegistration(input);
+  const registration = checkRegistration(input, entity.name);
   return getDb().transaction(async tx => {
     // 锁住实体行：与发布、丢弃互斥；丢弃从没发布过的实体会删除它
     const [locked] = await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
@@ -218,6 +286,7 @@ export async function saveCustomEntityDraft(actor: CurrentMember, entityId: stri
       .where(and(eq(customEntityVersions.entityId, entityId), eq(customEntityVersions.status, 'published')))
       .orderBy(desc(customEntityVersions.version)).limit(1);
     if (published) checkAdditive(published, registration);
+    await checkRelations(tx, actor.tenant.id, registration);
     if (latest?.status === 'draft') {
       await tx.update(customEntityVersions)
         .set({ ...registration, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
@@ -238,7 +307,10 @@ export async function saveCustomEntityDraft(actor: CurrentMember, entityId: stri
   });
 }
 
-/** 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。只由成员在页面上调用，没有自动发布。发布后版本锁定 */
+/**
+ * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。只由成员在页面上调用，没有自动发布。发布后版本锁定。
+ * 关系的终点在发布时再校验一次（publishEntityDraft），因为终点可能在保存后被删
+ */
 export async function publishCustomEntity(actor: CurrentMember, entityId: string, version: number) {
   assertCan(actor, 'publish');
   const entity = await requireEntity(actor.tenant.id, entityId);
@@ -256,7 +328,7 @@ export async function publishCustomEntity(actor: CurrentMember, entityId: string
 }
 
 /**
- * 在调用方的事务里发布检查过的这份草稿并记审计；调用方须已锁住实体行。等锁期间草稿被修改、发布或丢弃时抛出 CustomEntityError。
+ * 在调用方的事务里再校验关系的终点，发布检查过的这份草稿并记审计；调用方须已锁住实体行。等锁期间草稿被修改、发布或丢弃，或关系的终点不再合格时抛出 CustomEntityError。
  * 发布权限与双人发布由调用方检查（publishCustomEntity，以及一键直通里登记与映射一起发布）
  */
 export async function publishEntityDraft(
@@ -264,6 +336,7 @@ export async function publishEntityDraft(
 ) {
   const [current] = await tx.select().from(customEntityVersions).where(eq(customEntityVersions.id, draft.id));
   if (isStale(current, draft)) throw new CustomEntityError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
+  await checkRelations(tx, actor.tenant.id, current);
   await tx.update(customEntityVersions)
     .set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` })
     .where(eq(customEntityVersions.id, draft.id));
@@ -384,7 +457,7 @@ export async function inferCustomEntityDrafts(tx: Tx, tenantId: string) {
     }
     let checked;
     try {
-      checked = checkRegistration({ label: name.replace(/^custom_/, ''), kind: 'dimension', fields: [...fields.values()], primaryKey });
+      checked = checkRegistration({ label: name.replace(/^custom_/, ''), kind: 'dimension', fields: [...fields.values()], primaryKey }, name);
     } catch (e) {
       if (e instanceof CustomEntityError) continue;
       throw e;
@@ -400,7 +473,7 @@ export async function publishedCustomEntities(db: Tx | ReturnType<typeof getDb>,
   const rows = await db
     .selectDistinctOn([customEntityVersions.entityId], {
       name: customEntities.name, label: customEntityVersions.label, kind: customEntityVersions.kind,
-      fields: customEntityVersions.fields, primaryKey: customEntityVersions.primaryKey,
+      fields: customEntityVersions.fields, primaryKey: customEntityVersions.primaryKey, relations: customEntityVersions.relations,
     })
     .from(customEntityVersions)
     .innerJoin(customEntities, eq(customEntities.id, customEntityVersions.entityId))
