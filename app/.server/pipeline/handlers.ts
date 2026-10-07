@@ -5,6 +5,7 @@ import type { EngineLimits, TenantLakeSession } from './lake-engine';
 import { profileSource, type SourceSpec } from './source-engine';
 import { syncOptionsFromEnv, syncSourceTables, type SyncTableParam } from './sync-engine';
 import { verifySourceLake, type VerifyTableParam } from './verify-engine';
+import { inspectLake, type InspectParams } from './inspect-engine';
 import { mergeToSilver, type MergeMappingParam } from './merge-engine';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { IDENTITIES } from './identity-engine';
@@ -94,6 +95,16 @@ function identityMatch(params: Params) {
   return rules;
 }
 
+/** 漂移检查参数里的应有结构：表名 → 列名 → 类型（入队时由已发布映射算出） */
+function inspectExpected(params: Params): InspectParams['expected'] {
+  const { expected } = params;
+  const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+  if (!isObject(expected) || !Object.values(expected).every(t => isObject(t) && Object.values(t).every(v => typeof v === 'string'))) {
+    throw new Error('参数 expected 必须是 表名 → 列名 → 类型 的对象');
+  }
+  return expected as InspectParams['expected'];
+}
+
 function positiveInt(params: Params, key: string, max: number) {
   const v = params[key];
   if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > max) throw new Error(`参数 ${key} 必须是 1 到 ${max} 之间的整数`);
@@ -169,6 +180,13 @@ export const HANDLERS = {
       const tables = await verifySourceLake(session, source, params.sourceId, verifyTables(params), limits, redact);
       return { tables, differences: tables.filter(t => t.ok === false).length };
     },
+  },
+  // 漂移检查：对比标准层表的实际结构与参数里的应有结构（入队时由已发布映射算出），报告缺列、多列、类型不一致与孤表。
+  // 数据湖只读挂载，只出报告不写湖；修复走合并
+  'lake.inspect': {
+    label: '漂移检查',
+    readOnlyLake: true,
+    run: (con, params) => inspectLake(con, { expected: inspectExpected(params) }),
   },
   // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务，之后按参数里的匹配规则重算身份打通。
   // 有映射或打通失败时任务记为失败，结果里保留各映射的合并结果、打通摘要（组数、记录数与已归属设备数，不带哈希）与错误；

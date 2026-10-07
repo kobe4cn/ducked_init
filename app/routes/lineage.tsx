@@ -7,19 +7,23 @@
 // 标记与兜底统计，否则只下发字段说明与行数（在 loader 里裁剪）。
 // 单表聚焦画布（?tab=flow&focus=<实体>，从抽屉进入）只画这张标准层表与写入它的源表，连线从源列连到字段；同样只对有 sources:read 的成员开放
 // 流向图与聚焦画布上可以反向查（?q=列 或 表.列，不区分大小写）：命中的源表、映射、标准层表与连线保持原样，其余变淡；点源表节点（?node=table:<数据源>:<表>）
-// 在抽屉里按源列列出它影响的标准层字段。两者都只对有 sources:read 的成员生效
+// 在抽屉里按源列列出它影响的标准层字段。两者都只对有 sources:read 的成员生效。
+// 关系图下的「漂移检查」区块列出最近一次漂移检查（lake.inspect）的结果，任何角色可见；有 sources:write 的成员可以触发一次检查
 import { useMemo } from 'react';
-import { Form, Link, useSearchParams } from 'react-router';
-import { ArrowLeft, Search } from 'lucide-react';
+import { data, Form, Link, redirect, useSearchParams } from 'react-router';
+import { AlertTriangle, ArrowLeft, CheckCircle2, CircleAlert, Loader2, Search } from 'lucide-react';
 import type { Route } from './+types/lineage';
-import { can } from '~/.server/access';
+import { can, requirePermission } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
+import { getInspectStatus, InspectError, inspectLakeNow } from '~/.server/lake-inspect';
 import { lastMergeByMapping, latestIdentitySummary, type MergeHistoryEntry, publishedPlans } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { identityRules } from '~/.server/pipeline/identity-engine';
 import { listSources } from '~/.server/sources';
+import { TaskError } from '~/.server/tasks';
+import type { Drift } from '~/.server/pipeline/inspect-engine';
 import { entityOf } from '~/lib/canonical-model';
 import { deriveLineage } from '~/lib/lineage';
 import { focusGraph, type FocusInput } from '~/lib/lineage-focus';
@@ -37,6 +41,8 @@ import { RelationGraphView } from '~/components/lineage-graph';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { SectionHeader } from '~/components/section-header';
+import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
+import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
@@ -61,6 +67,10 @@ const drawerEntityOf = (node: string | null, connected: string[]) => {
   const entity = node?.startsWith('silver.') ? node.slice('silver.'.length) : node;
   return entity && connected.includes(entity) ? entity : null;
 };
+
+/** 最近一次漂移检查任务的状态 → 页面上的状态：从没检查过、检查中（排队或运行）、失败、成功 */
+const INSPECT_STATUS = { none: 'never', queued: 'running', running: 'running', failed: 'failed', succeeded: 'ok' } as const;
+type InspectView = { status: (typeof INSPECT_STATUS)[keyof typeof INSPECT_STATUS]; error: string | null; inspectedAt: string | null; drifts: Drift[] };
 
 const NODE_KINDS = { entity: '标准层表', identity: '身份对应', device: '设备归属' } as const;
 const EDGE_KINDS = { ref: '内置关系', identity: '经 _identities', device: '经 _device_owner' } as const;
@@ -131,9 +141,17 @@ export async function loader({ request }: Route.LoaderArgs) {
       drawer = canFlow ? { ...head, detail: true, fields } : { ...head, detail: false, fields: redactFields(fields) };
     }
   }
+  const inspect = await getInspectStatus(member);
   return {
     tab,
     canFlow,
+    canInspect: can(member.role, 'sources:write'),
+    inspect: {
+      status: INSPECT_STATUS[inspect.status],
+      error: inspect.error,
+      inspectedAt: inspect.inspectedAt?.toISOString() ?? null,
+      drifts: inspect.drifts,
+    },
     flow,
     focus,
     drawer,
@@ -149,8 +167,28 @@ export async function loader({ request }: Route.LoaderArgs) {
   };
 }
 
-export default function Lineage({ loaderData }: Route.ComponentProps) {
-  const { tab, canFlow, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, showAll, node, sql } = loaderData;
+/** 触发一次漂移检查（需 sources:write）；已有一次在排队或运行中时返回原因 */
+export async function action({ request }: Route.ActionArgs) {
+  const member = await requirePermission(request, 'sources:write');
+  const form = await request.formData();
+  try {
+    switch (String(form.get('intent') ?? '')) {
+      case 'inspect':
+        await inspectLakeNow(member);
+        break;
+      default:
+        return data({ error: '未知操作' }, { status: 400 });
+    }
+  } catch (e) {
+    if (e instanceof InspectError) return data({ error: e.message }, { status: 400 });
+    if (e instanceof TaskError) return data({ error: e.message }, { status: e.status });
+    throw e;
+  }
+  throw redirect('/lineage');
+}
+
+export default function Lineage({ loaderData, actionData }: Route.ComponentProps) {
+  const { tab, canFlow, canInspect, inspect, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
   const [rawParams] = useSearchParams();
   // 链接里不带不生效的参数：关系图没有反向查，没有 sources:read 时不开源表抽屉
@@ -278,9 +316,67 @@ export default function Lineage({ loaderData }: Route.ComponentProps) {
         </>
       )}
 
+      {tab === 'graph' && <InspectSection inspect={inspect} canInspect={canInspect} submitError={actionData?.error ?? null} />}
+
       {tableDrawer && <TableDrawer impact={tableDrawer} closeHref={closeDrawerHref} />}
       {drawer && <LineageDrawer drawer={drawer} closeHref={closeDrawerHref} focusHref={drawer.detail ? `/lineage?tab=flow&focus=${encodeURIComponent(drawer.entity)}` : null} />}
     </AppShell>
+  );
+}
+
+const DRIFT_KINDS = { missing: '缺列', extra: '多列', type: '类型不一致', orphan: '孤表' } as const;
+
+/**
+ * 漂移检查：最近一次检查的状态，以及最近一次成功检查的时间与每条差异（表、种类、列、应有 / 实际类型）。
+ * 有 sources:write 的成员可以触发一次检查，检查中时按钮不可用
+ */
+function InspectSection({ inspect, canInspect, submitError }: { inspect: InspectView; canInspect: boolean; submitError: string | null }) {
+  const { status, drifts, inspectedAt } = inspect;
+  const alarming = status === 'failed' || (inspectedAt !== null && drifts.length > 0);
+  return (
+    <section data-inspect-status={status} className={`space-y-4 rounded-2xl border bg-white p-6 shadow-sm ${alarming ? 'border-red-200' : ''}`}>
+      <div className="flex items-start justify-between gap-6">
+        <SectionHeader title="漂移检查">对比湖里标准层表的实际结构与标准模型、已发布映射推出的应有结构，报告缺列、多列、类型不一致与没有映射写入的孤表。只出报告，修复走合并。</SectionHeader>
+        {canInspect && (
+          <Form method="post" preventScrollReset className="shrink-0">
+            <input type="hidden" name="intent" value="inspect" />
+            <Button type="submit" variant="outline" disabled={status === 'running'}>{status === 'running' ? '检查中…' : '漂移检查'}</Button>
+          </Form>
+        )}
+      </div>
+      {submitError && (
+        <Alert variant="destructive" role="alert">
+          <CircleAlert />
+          <AlertTitle>没有开始检查</AlertTitle>
+          <AlertDescription>{submitError}</AlertDescription>
+        </Alert>
+      )}
+      <p className="flex flex-wrap items-center text-sm text-slate-500">
+        {status === 'never' && '尚未检查'}
+        {status === 'running' && <span className="flex items-center gap-2 text-amber-600"><Loader2 className="size-4 animate-spin" />检查中</span>}
+        {status === 'failed' && <span className="flex items-center gap-2 text-red-600"><CircleAlert className="size-4" />{`检查失败：${inspect.error ?? ''}`}</span>}
+        {inspectedAt && <span className={status === 'ok' ? undefined : 'ml-3'}>{`${status === 'ok' ? '' : '上次'}检查时间：${new Date(inspectedAt).toLocaleString('zh-CN')}`}</span>}
+      </p>
+      {inspectedAt && (drifts.length === 0 ? (
+        <p data-no-drift className="flex items-center gap-2 text-sm text-emerald-600"><CheckCircle2 className="size-4" />没有漂移</p>
+      ) : (
+        <>
+          <p className="flex items-center gap-2 text-sm text-red-600"><AlertTriangle className="size-4" />{`${drifts.length} 处漂移`}</p>
+          <ul className="divide-y rounded-xl border text-sm">
+            {drifts.map(d => (
+              <li key={`${d.table}:${d.kind}:${d.column ?? ''}`} data-drift={`${d.table}:${d.kind}:${d.column ?? ''}`} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2">
+                <span className="font-mono text-xs">{`silver.${d.table}`}</span>
+                <span className="text-red-600">{DRIFT_KINDS[d.kind]}</span>
+                {d.column && <span className="font-mono text-xs">{d.column}</span>}
+                {(d.expected || d.actual) && (
+                  <span className="text-slate-500">{`应有 ${d.expected ?? '—'} / 实际 ${d.actual ?? '—'}`}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </>
+      ))}
+    </section>
   );
 }
 

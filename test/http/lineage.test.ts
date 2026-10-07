@@ -2,7 +2,8 @@
 // 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；_identities 显示匹配规则与最近一次合并的打通摘要（没有合并任务时显示尚未合并）；
 // 「显示未接入的标准实体」开关（?all=1）灰显未接入的实体；没有已发布映射时显示空状态；流向图（?tab=flow）只对有 sources:read 的成员开放：列表带源表名、版本、行数与合并状态，失败的链到合并记录；
 // 抽屉里的「聚焦此表」进入单表聚焦画布（?tab=flow&focus=），画布下的连线列表从源列连到标准层字段；查看者访问 ?focus= 回到关系图；
-// 流向图与聚焦画布上反向查（?q=）标出命中的行，源表节点（?node=table:…）打开源表抽屉；查看者两者都不生效
+// 流向图与聚焦画布上反向查（?q=）标出命中的行，源表节点（?node=table:…）打开源表抽屉；查看者两者都不生效；
+// 关系图下的「漂移检查」区块：数据工程师点按钮入队 lake.inspect（重复点提示已在排队），查看者看不到按钮、提交被拒，任何角色都看到最近一次结果
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { and, desc, eq } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -341,6 +342,56 @@ dedupe: { key: [card_id] }
     expect(fieldRow(full, 'holder')).toContain('持卡人姓名');
     expect(fieldRow(full, 'holder')).toContain('full_name');
     expect(fieldRow(full, 'holder')).not.toContain('扩展字段');
+  });
+
+  it('数据工程师点「漂移检查」入队，重复点提示已在排队；查看者看不到按钮、提交被拒，但看得到最近一次结果的每条差异', async () => {
+    const { acme } = await publishedIdentitySources();
+    await memberOf(acme, 'eng@acme.com', 'data_engineer');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const eng = await loginAs(app, 'eng@acme.com');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+
+    const before = await (await eng.get('/lineage')).text();
+    expect(before).toContain('data-inspect-status="never"');
+    expect(before).toContain('尚未检查');
+    expect(before).toContain('name="intent" value="inspect"');
+
+    expect((await eng.post('/lineage', { intent: 'inspect' })).status).toBe(302);
+    const [queued, ...more] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'lake.inspect')));
+    expect(more).toEqual([]);
+    expect(queued.status).toBe('queued');
+    expect(queued.params).toHaveProperty('expected.customer.customer_id', 'VARCHAR');
+    const again = await eng.post('/lineage', { intent: 'inspect' });
+    expect(again.status).toBe(400);
+    expect(await again.text()).toContain('已有一次漂移检查在排队或运行中');
+    expect(await (await eng.get('/lineage')).text()).toContain('data-inspect-status="running"');
+
+    const viewerPage = await (await viewer.get('/lineage')).text();
+    expect(viewerPage).toContain('data-inspect-status="running"');
+    expect(viewerPage).not.toContain('value="inspect"');
+    expect((await viewer.post('/lineage', { intent: 'inspect' })).status).toBe(403);
+
+    await getDb().update(tasks).set({
+      status: 'succeeded', finishedAt: new Date(),
+      result: { drifts: [
+        { table: 'customer', kind: 'missing', column: 'city', expected: 'VARCHAR' },
+        { table: 'customer', kind: 'type', column: 'birthday', expected: 'DATE', actual: 'VARCHAR' },
+        { table: 'stray', kind: 'orphan' },
+      ] },
+    }).where(eq(tasks.id, queued.id));
+    const report = await (await viewer.get('/lineage')).text();
+    expect(report).toContain('data-inspect-status="ok"');
+    expect(report).toContain('检查时间');
+    for (const drift of ['customer:missing:city', 'customer:type:birthday', 'stray:orphan:']) expect(report).toContain(`data-drift="${drift}"`);
+    expect(report).toContain('应有 DATE / 实际 VARCHAR');
+
+    await getDb().update(tasks).set({ result: { drifts: [] } }).where(eq(tasks.id, queued.id));
+    expect(await (await viewer.get('/lineage')).text()).toContain('没有漂移');
+
+    await getDb().update(tasks).set({ status: 'failed', error: '数据湖读取失败' }).where(eq(tasks.id, queued.id));
+    const failed = await (await viewer.get('/lineage')).text();
+    expect(failed).toContain('data-inspect-status="failed"');
+    expect(failed).toContain('数据湖读取失败');
   });
 
   it('没有已发布映射时显示空状态', async () => {

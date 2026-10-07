@@ -292,6 +292,9 @@ export async function transformRows(con: DuckDBConnection, plan: MergePlan, salt
     .catch(async (e: Error) => { throw new Error(await withoutPii(con, plan.columns.filter(c => pii.has(c.name)), e.message, live)); });
 }
 
+/** 合并写进每张标准层表的系统列：来自哪个映射、哪个数据源、映射版本与合并时间 */
+export const SILVER_SYSTEM_COLUMNS = { _mapping: 'VARCHAR', _source: 'VARCHAR', _version: 'INTEGER', _merged_at: 'TIMESTAMPTZ' } as const;
+
 /** 标准层表不存在时按实体的全部字段建表，存在时补上新的扩展字段。敏感字段存哈希，类型总是 VARCHAR */
 async function ensureSilverTable(con: DuckDBConnection, plan: MergeMappingParam) {
   const table = silverTable(plan.entity);
@@ -300,7 +303,7 @@ async function ensureSilverTable(con: DuckDBConnection, plan: MergeMappingParam)
   if (!await tableExists(con, SILVER, plan.entity)) {
     await con.run(`CREATE TABLE ${table} (
       ${plan.entityColumns.map(c => `${ident(c.name)} ${typeOf(c)}`).join(', ')},
-      _mapping VARCHAR, _source VARCHAR, _version INTEGER, _merged_at TIMESTAMPTZ)`);
+      ${Object.entries(SILVER_SYSTEM_COLUMNS).map(([name, type]) => `${name} ${type}`).join(', ')})`);
     return;
   }
   const known = new Set((await columnsOf(con, table)).map(c => c.column_name));
