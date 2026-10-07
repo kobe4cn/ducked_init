@@ -534,6 +534,54 @@ describe('发布映射并合并到标准层', () => {
     expect((await getMapping(author, items.id)).versions.find(v => v.version === 2)).toMatchObject({ status: 'published' });
   });
 
+  it('订单映射的草稿把键空间由 pos 改成 store：发布区列出同源已发布、order_id 仍写 pos 的订单明细映射与字段，提示一起改；这一版照常能发布', async () => {
+    const { author, reviewer, id } = await syncedSource(ORDER_ITEMS);
+    const orders = await publish(author, reviewer, id, `${ORDERS}key_space: pos\n`);
+    const items = await publish(author, reviewer, id, orderItems('{ expr: string(order_id), key_space: pos }'));
+    expect((await getMapping(author, orders)).keySpaceFollowers).toEqual([]);
+
+    expect(await saveDraft(author, orders, `${ORDERS}key_space: store\n`)).toBe(2);
+    expect((await getMapping(author, orders)).keySpaceFollowers).toEqual([{ mapping: items, entity: 'order_item', table: 'order_items', fields: ['order_id'] }]);
+    await publishMapping(reviewer, orders, 2);
+    expect((await getMapping(author, orders)).versions.find(v => v.version === 2)).toMatchObject({ status: 'published' });
+  });
+
+  it('订单映射第一次声明键空间 pos 时列出 order_id 没写键空间的订单明细映射；删掉键空间时列出写了 pos 的', async () => {
+    const { author, reviewer, id } = await syncedSource(ORDER_ITEMS);
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const items = await publish(author, reviewer, id, orderItems('string(order_id)'));
+    const followers = [{ mapping: items, entity: 'order_item', table: 'order_items', fields: ['order_id'] }];
+
+    // 订单明细的草稿已写 pos 不算，比较的是它的已发布版本
+    expect(await saveDraft(author, items, orderItems('{ expr: string(order_id), key_space: pos }'))).toBe(2);
+    expect(await saveDraft(author, orders, `${ORDERS}key_space: pos\n`)).toBe(2);
+    expect((await getMapping(author, orders)).keySpaceFollowers).toEqual(followers);
+    await publishMapping(reviewer, orders, 2);
+    await publishMapping(reviewer, items, 2);
+
+    expect(await saveDraft(author, orders, ORDERS)).toBe(3);
+    expect((await getMapping(author, orders)).keySpaceFollowers).toEqual(followers);
+  });
+
+  it('键空间没变、同源引用映射已写了新的键空间、或引用映射在别的数据源时不列出', async () => {
+    const { author, reviewer, id, input } = await syncedSource(ORDER_ITEMS);
+    const orders = await publish(author, reviewer, id, ORDERS);
+    await publish(author, reviewer, id, orderItems('{ expr: string(order_id), key_space: pos }'));
+    const other = await registerSource(author, { ...input, name: '电商库副本' });
+    await setSyncScope(author, other.id, { add: ['order_items'] });
+    await drain();
+    await syncSource(author, other.id);
+    await drain();
+    await publish(author, reviewer, other.id, orderItems('string(order_id)'));
+
+    // 键空间没变：都没声明
+    expect(await saveDraft(author, orders, ORDERS.replace('fields:\n', 'fields:\n  # 只改注释\n'))).toBe(2);
+    expect((await getMapping(author, orders)).keySpaceFollowers).toEqual([]);
+    // 改成 pos：同源订单明细已写 pos，别的数据源里没写键空间的订单明细不算
+    expect(await saveDraft(author, orders, `${ORDERS}key_space: pos\n`)).toBe(2);
+    expect((await getMapping(author, orders)).keySpaceFollowers).toEqual([]);
+  });
+
   it('写了兜底值时值字典里没有的取值写成兜底值，合并照常完成，并记下落入兜底的取值与行数', async () => {
     const { acme, author, reviewer, id } = await syncedSource();
     const mapping = await publish(author, reviewer, id, ORDER_LOG_MAPPING

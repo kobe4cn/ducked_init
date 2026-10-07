@@ -6,7 +6,7 @@ import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
-import { publishedCustomEntities, type RegisteredEntity, relationsFrom, uniqueKeys } from './custom-entities';
+import { publishedCustomEntities, type RegisteredEntity, relationsFrom, relationsTo, uniqueKeys } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
@@ -21,7 +21,7 @@ import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
 import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
-import { CANONICAL_ENTITIES, entityLabel, entityOf } from '../lib/canonical-model';
+import { CANONICAL_ENTITIES, entityLabel, entityOf, type EntityRelation } from '../lib/canonical-model';
 import { entityForTable } from '../lib/field-synonyms';
 import { diffPlans } from '../lib/mapping-diff';
 
@@ -290,6 +290,11 @@ async function assertIdentityRules(tx: Tx, tenantId: string, mappingId: string, 
   }
 }
 
+/** 计划里的引用列：列名是 relations 里某条关系起点字段的列，带上它写的键空间与关系的终点实体 */
+function referenceColumns(plan: Pick<MergePlan, 'columns'>, relations: EntityRelation[]) {
+  return plan.columns.flatMap(c => relations.filter(r => r.from.field === c.name).map(r => ({ column: c.name, keySpace: c.keySpace, target: r.ref.entity })));
+}
+
 /**
  * 引用字段的键空间（ADR-0024）：本映射里指向别的实体的字段（内置 ref 与已登记关系的起点），要写上同一数据源里目标实体已发布映射
  * （本映射不算）声明的键空间之一；自引用时用本映射自己声明的键空间。同源目标实体都没声明键空间时不检查（目标映射可能还没发布）
@@ -301,11 +306,29 @@ async function assertKeySpaces(tx: Tx, tenantId: string, mapping: typeof mapping
   const spacesOf = (entity: string) => (entity === plan.entity
     ? (plan.keySpace ? [plan.keySpace] : [])
     : [...new Set(sameSource.flatMap(p => (p.entity === entity && p.keySpace ? [p.keySpace] : [])))]);
+  const references = referenceColumns(plan, relations);
   const wrong = plan.columns.flatMap(c => {
-    const spaces = [...new Set(relations.filter(r => r.from.field === c.name).flatMap(r => spacesOf(r.ref.entity)))];
+    const own = references.filter(r => r.column === c.name);
+    const spaces = [...new Set(own.flatMap(r => spacesOf(r.target)))];
     return spaces.length && !(c.keySpace && spaces.includes(c.keySpace)) ? [`${c.name} 应写 ${spaces.map(s => `key_space: ${s}`).join(' 或 ')}`] : [];
   });
   if (wrong.length) throw new MappingError(`引用字段要写上目标实体在同一数据源里声明的键空间：${wrong.join('；')}`);
+}
+
+/**
+ * 主键的键空间改了时要一起改的映射（ADR-0024「同源一起改」）：草稿的键空间与最新已发布版本（没有时按未声明）不同时，
+ * 同一数据源里引用本实体（自引用除外）的别的映射中，已发布版本的引用字段没写新键空间的那些映射与字段。只是提示，不阻止发布
+ */
+async function keySpaceFollowers(db: Tx | ReturnType<typeof getDb>, tenantId: string, mapping: typeof mappings.$inferSelect, draft: MergePlan, live?: MergePlan) {
+  const next = draft.keySpace;
+  if (next === live?.keySpace) return [];
+  const relations = relationsTo(draft.entity, await publishedCustomEntities(db, tenantId));
+  if (!relations.length) return [];
+  return (await publishedPlans(db, tenantId)).flatMap(p => {
+    if (p.sourceId !== mapping.sourceId || p.mapping === mapping.id) return [];
+    const fields = [...new Set(referenceColumns(p, relations.filter(r => r.from.entity === p.entity)).filter(r => r.keySpace !== next).map(r => r.column))];
+    return fields.length ? [{ mapping: p.mapping, entity: p.entity, table: p.table, fields }] : [];
+  });
 }
 
 /**
@@ -699,7 +722,8 @@ export async function listMappings(actor: CurrentMember) {
 
 /**
  * 映射详情：各版本（新的在前）、当前成员能否发布草稿及原因、本租户有发布权限的成员人数、合并历史，
- * 以及草稿相对最新已发布版本（against，没有时为 null）的差异（没有草稿时为 null；只下发差异，不下发计划）
+ * 以及草稿相对最新已发布版本（against，没有时为 null）的差异（没有草稿时为 null；只下发差异，不下发计划），
+ * 草稿相对最新已发布版本的键空间变化（from/to，未声明为 null；没变或没有草稿时为 null）与要一起改的同源引用映射（keySpaceFollowers）
  */
 export async function getMapping(actor: CurrentMember, mappingId: string) {
   assertCan(actor, 'sources:read');
@@ -725,6 +749,8 @@ export async function getMapping(actor: CurrentMember, mappingId: string) {
       publishBlocker: publishBlocker(actor, v),
     })),
     draftDiff: draft ? { against: live?.version ?? null, ...diffPlans(live?.plan ?? null, draft.plan) } : null,
+    keySpaceChange: draft && draft.plan.keySpace !== live?.plan.keySpace ? { from: live?.plan.keySpace ?? null, to: draft.plan.keySpace ?? null } : null,
+    keySpaceFollowers: draft ? await keySpaceFollowers(getDb(), actor.tenant.id, mapping, draft.plan, live?.plan) : [],
     merge,
   };
 }

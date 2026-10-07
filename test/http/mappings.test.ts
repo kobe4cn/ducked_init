@@ -755,6 +755,31 @@ describe('表单式映射编辑器', () => {
     expect((await reviewer.post(`/mappings/${itemsId}`, { intent: 'publish', version: '1' })).status).toBe(302);
   });
 
+  it('键空间：订单映射的草稿把键空间由 pos 改成 store 时，发布区列出同源订单明细映射与它的 order_id，这一版照常能发布', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme', `
+      CREATE TABLE shop.order_items (item_no text PRIMARY KEY, order_id int NOT NULL, qty int NOT NULL);
+      GRANT SELECT ON shop.order_items TO ${READER.user};`);
+    const author = await loginAs(app, 'de@acme.com');
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+    const ordersId = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: `${ORDERS}key_space: pos\n` }));
+    expect((await reviewer.post(`/mappings/${ordersId}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    const items = 'model: 1\nentity: order_item\ntable: order_items\nfields:\n  order_item_id: item_no\n  order_id: { expr: string(order_id), key_space: pos }\n  quantity: qty\n';
+    const itemsId = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: items }));
+    expect((await reviewer.post(`/mappings/${itemsId}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    expect(await (await reviewer.get(`/mappings/${ordersId}`)).text()).not.toContain('data-key-space-followers');
+
+    expect((await author.post(`/mappings/${ordersId}`, { intent: 'save', yaml: `${ORDERS}key_space: store\n` })).status).toBe(302);
+    const page = await (await reviewer.get(`/mappings/${ordersId}`)).text();
+    const alert = page.slice(page.indexOf('data-key-space-followers'));
+    expect(alert).toContain('由 pos 改为 store');
+    expect(alert).toContain(`href="/mappings/${itemsId}"`);
+    expect(alert).toContain('order_items');
+    expect(alert).toContain('data-key-space-follower-field="order_id"');
+    expect((await reviewer.post(`/mappings/${ordersId}`, { intent: 'publish', version: '2' })).status).toBe(302);
+    expect(await (await reviewer.get(`/mappings/${ordersId}`)).text()).not.toContain('data-key-space-followers');
+  });
+
   it('敏感字段：表单里把扩展字段标成敏感后保存成功；YAML 里取消内置敏感字段的敏感标记被拒绝', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const author = await loginAs(app, 'de@acme.com');

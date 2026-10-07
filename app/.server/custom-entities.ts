@@ -70,6 +70,11 @@ export function relationsFrom(entity: string, published: Map<string, RegisteredE
   return allRelations(published).filter(r => r.from.entity === entity);
 }
 
+/** 以 entity 为终点、起点是别的实体的全部关系（自引用除外）：标准模型内置的 ref 与已发布登记上的关系（ADR-0019） */
+export function relationsTo(entity: string, published: Map<string, RegisteredEntity>): EntityRelation[] {
+  return allRelations(published).filter(r => r.ref.entity === entity && r.from.entity !== entity);
+}
+
 /**
  * 合并时跨映射唯一的实体与各自的主键：全部标准实体与已发布的自定义实体，customer 与主键未知的实体除外（ADR-0024「独占」）。
  * bySource：主键里有字段指向 customer（标准实体看字段上内置的 ref，自定义实体与扩展字段看已发布登记上的关系），这时只在同一个数据源内唯一

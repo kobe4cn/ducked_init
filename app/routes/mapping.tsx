@@ -93,6 +93,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       })),
       /** 草稿相对最新已发布版本 against 的差异；没有草稿时为 null */
       draftDiff: m.draftDiff,
+      /** 草稿改了主键的键空间（from → to，未声明为 null）且有要一起改的同源引用映射时才有（只是提示，不阻止发布）；否则为 null */
+      keySpaceChange: m.keySpaceChange && m.keySpaceFollowers.length ? { ...m.keySpaceChange, followers: m.keySpaceFollowers } : null,
       merge: {
         status: m.merge.status,
         statusLabel: m.merge.status === 'none' ? '未合并' : TASK_STATUS_LABELS[m.merge.status],
@@ -296,7 +298,7 @@ function DraftDiff({ entity, version, diff }: { entity: string; version: number;
 }
 
 export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, draftDiff, merge } = loaderData;
+  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, draftDiff, keySpaceChange, merge } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -330,6 +332,24 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
               登记发布前，这个映射保存不了新草稿；已发布的版本照常合并。
               <Link to={mapping.pendingEntity} className="underline">去实体页确认登记</Link>，再由另一位成员发布。
             </p>
+          </AlertDescription>
+        </Alert>
+      )}
+      {keySpaceChange && (
+        <Alert role="status" data-key-space-followers>
+          <AlertTriangle className="text-amber-600" />
+          <AlertTitle>{`主键的键空间由 ${keySpaceChange.from ?? '未声明'} 改为 ${keySpaceChange.to ?? '未声明'}`}</AlertTitle>
+          <AlertDescription>
+            <p>同一数据源里这些已发布映射的引用字段还按旧的键空间写，关系会对不上。请把它们改成{keySpaceChange.to ? ` key_space: ${keySpaceChange.to}` : '不写键空间'}，与本映射一起改、一起发布（本映射先发布）：</p>
+            <ul className="mt-1 space-y-0.5">
+              {keySpaceChange.followers.map(f => (
+                <li key={f.mapping}>
+                  <Link to={`/mappings/${f.mapping}`} className="font-mono underline">{f.table}</Link>
+                  <span className="text-slate-500">{`（${f.entity}）`}</span>
+                  {f.fields.map(field => <code key={field} className="ml-2" data-key-space-follower-field={field}>{field}</code>)}
+                </li>
+              ))}
+            </ul>
           </AlertDescription>
         </Alert>
       )}
