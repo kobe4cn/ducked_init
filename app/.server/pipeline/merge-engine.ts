@@ -19,9 +19,9 @@ import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
 
 /**
  * 合并任务里的一个已发布映射：合并计划加上映射、版本与数据源；输入是源视图时另带视图最新的已发布版本
- * （版本号、SQL 与引用的原始层表，入队时取定）
+ * （版本号、SQL 与引用的原始层表，入队时取定）。rebuild 为真时强制由全部批次重建（数据地图上的重建合并，补上标准层缺的列）
  */
-export interface MergeMappingParam extends MergePlan { mapping: string; version: number; sourceId: string; sourceView?: SourceViewParam }
+export interface MergeMappingParam extends MergePlan { mapping: string; version: number; sourceId: string; sourceView?: SourceViewParam; rebuild?: boolean }
 
 /** 合并或空跑时源视图的已发布版本 */
 export interface SourceViewParam { version: number; sql: string; tables: string[] }
@@ -316,7 +316,7 @@ interface LastMerge { version: number; source_keys: string; batch_to: string; sc
 
 /**
  * 合并一个映射：读出原始层里上次合并之后的批次，改当前记录，再对受影响的去重键重新取最新的一行写进标准层。
- * 首次合并、映射换了版本、源表的主键变了或标准层的写法变了时由全部批次重建（当前记录与本映射在标准层的行都换掉）
+ * 首次合并、映射换了版本、源表的主键变了、标准层的写法变了或带了强制重建标记时由全部批次重建（当前记录与本映射在标准层的行都换掉）
  */
 async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date): Promise<MergeRecord> {
   const startedAt = new Date();
@@ -329,7 +329,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   const sourceKeys = input.keys;
   const [last] = await rows<LastMerge>(con, `
     SELECT version, source_keys, batch_to, scheme FROM ${MERGES} WHERE mapping_id = ${lit(plan.mapping)} ORDER BY started_at DESC LIMIT 1`);
-  const rebuild = !last || last.version !== plan.version || last.source_keys !== input.rebuildTag || last.scheme !== SCHEME
+  const rebuild = plan.rebuild || !last || last.version !== plan.version || last.source_keys !== input.rebuildTag || last.scheme !== SCHEME
     || !await tableExists(con, RECORDS, `m_${plan.mapping.replace(/-/g, '')}`);
   const from = rebuild ? 0 : Number(last.batch_to);
   const silverRows = async () => count(con, `${silver} WHERE _mapping = ${lit(plan.mapping)}`);

@@ -82,7 +82,7 @@ function mergeMappings(params: Params): MergeMappingParam[] {
     typeof m?.mapping === 'string' && Number.isInteger(m.version) && typeof m.sourceId === 'string'
     && typeof m.entity === 'string' && typeof m.table === 'string'
     && Array.isArray(m.columns) && m.columns.length > 0 && Array.isArray(m.entityColumns) && isStrings(m.key)
-    && (m.latest === null || typeof m.latest === 'string'));
+    && (m.latest === null || typeof m.latest === 'string') && (m.rebuild === undefined || typeof m.rebuild === 'boolean'));
   if (!valid) throw new Error('参数 mappings 必须是非空的已发布映射列表');
   return mappings as MergeMappingParam[];
 }

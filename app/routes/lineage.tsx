@@ -8,7 +8,8 @@
 // 单表聚焦画布（?tab=flow&focus=<实体>，从抽屉进入）只画这张标准层表与写入它的源表，连线从源列连到字段；同样只对有 sources:read 的成员开放
 // 流向图与聚焦画布上可以反向查（?q=列 或 表.列，不区分大小写）：命中的源表、映射、标准层表与连线保持原样，其余变淡；点源表节点（?node=table:<数据源>:<表>）
 // 在抽屉里按源列列出它影响的标准层字段。两者都只对有 sources:read 的成员生效。
-// 关系图下的「漂移检查」区块列出最近一次漂移检查（lake.inspect）的结果，任何角色可见；有 sources:write 的成员可以触发一次检查。
+// 关系图下的「漂移检查」区块列出最近一次漂移检查（lake.inspect）的结果，任何角色可见；有 sources:write 的成员可以触发一次检查，
+// 并对缺列的表「重建合并」（写入它的已发布映射都带强制重建标记入队一次合并，补上缺的列）；类型不一致、多列与孤表只给提示。
 // 最近一次成功的检查里有差异的标准层表在两张图的节点与图下列表上标出差异种类与数量；孤表在图上没有节点，在区块里单独列出
 import { useEffect, useMemo } from 'react';
 import { data, Form, Link, redirect, useRevalidator, useSearchParams } from 'react-router';
@@ -19,7 +20,7 @@ import { requireMember } from '~/.server/auth';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import { getInspectStatus, InspectError, inspectLakeNow } from '~/.server/lake-inspect';
-import { lastMergeByMapping, latestIdentitySummary, type MergeHistoryEntry, publishedPlans } from '~/.server/mappings';
+import { lastMergeByMapping, latestIdentitySummary, MappingError, type MergeHistoryEntry, publishedPlans, rebuildEntity } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { identityRules } from '~/.server/pipeline/identity-engine';
 import { listSources } from '~/.server/sources';
@@ -148,7 +149,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   return {
     tab,
     canFlow,
-    canInspect: can(member.role, 'sources:write'),
+    canWrite: can(member.role, 'sources:write'),
     inspect: {
       status: INSPECT_STATUS[inspect.status],
       error: inspect.error,
@@ -171,28 +172,35 @@ export async function loader({ request }: Route.LoaderArgs) {
   };
 }
 
-/** 触发一次漂移检查（需 sources:write）；已有一次在排队或运行中时返回原因 */
+/**
+ * 触发一次漂移检查（intent=inspect），或重建合并一张缺列的标准层表（intent=rebuild，带 entity），都需 sources:write；
+ * 不能开始时返回原因（已有检查或合并在排队或运行中、没有映射写入这张表）
+ */
 export async function action({ request }: Route.ActionArgs) {
   const member = await requirePermission(request, 'sources:write');
   const form = await request.formData();
+  const intent = String(form.get('intent') ?? '');
   try {
-    switch (String(form.get('intent') ?? '')) {
+    switch (intent) {
       case 'inspect':
         await inspectLakeNow(member);
         break;
+      case 'rebuild':
+        await rebuildEntity(member, String(form.get('entity') ?? ''));
+        break;
       default:
-        return data({ error: '未知操作' }, { status: 400 });
+        return data({ error: '未知操作', intent }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof InspectError) return data({ error: e.message }, { status: 400 });
-    if (e instanceof TaskError) return data({ error: e.message }, { status: e.status });
+    if (e instanceof InspectError || e instanceof MappingError) return data({ error: e.message, intent }, { status: 400 });
+    if (e instanceof TaskError) return data({ error: e.message, intent }, { status: e.status });
     throw e;
   }
   throw redirect('/lineage');
 }
 
 export default function Lineage({ loaderData, actionData }: Route.ComponentProps) {
-  const { tab, canFlow, canInspect, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, showAll, node, sql } = loaderData;
+  const { tab, canFlow, canWrite, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
   const [rawParams] = useSearchParams();
   // 链接里不带不生效的参数：关系图没有反向查，没有 sources:read 时不开源表抽屉
@@ -321,7 +329,7 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
         </>
       )}
 
-      {tab === 'graph' && <InspectSection inspect={inspect} canInspect={canInspect} submitError={actionData?.error ?? null} />}
+      {tab === 'graph' && <InspectSection inspect={inspect} canWrite={canWrite} failure={actionData ?? null} />}
 
       {tableDrawer && <TableDrawer impact={tableDrawer} closeHref={closeDrawerHref} />}
       {drawer && <LineageDrawer drawer={drawer} closeHref={closeDrawerHref} focusHref={drawer.detail ? `/lineage?tab=flow&focus=${encodeURIComponent(drawer.entity)}` : null} />}
@@ -331,15 +339,26 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
 
 const DRIFT_KINDS = { missing: '缺列', extra: '多列', type: '类型不一致', orphan: '孤表' } as const;
 
+/** 除缺列外的差异只给提示：类型不一致要删表重建（暂不支持），多列与孤表不影响合并（ADR-0015） */
+const DRIFT_HINTS = { extra: '不影响合并，平台不删除湖表', type: '需要删表重建，暂不支持', orphan: '不影响合并，平台不删除湖表' } as const;
+
+function DriftHint({ kind }: { kind: keyof typeof DRIFT_HINTS }) {
+  return <span data-drift-hint={kind} className="text-xs text-slate-400">{DRIFT_HINTS[kind]}</span>;
+}
+
 /**
  * 漂移检查：最近一次检查的状态，以及最近一次成功检查的时间与每条差异（表、种类、列、应有 / 实际类型）。
- * 有 sources:write 的成员可以触发一次检查，检查中时按钮不可用、页面定时刷新到检查结束
+ * 有 sources:write 的成员可以触发一次检查，检查中时按钮不可用、页面定时刷新到检查结束；
+ * 缺列的表在它的第一条缺列旁有「重建合并」按钮，其余差异只给提示
  */
-function InspectSection({ inspect, canInspect, submitError }: { inspect: InspectView; canInspect: boolean; submitError: string | null }) {
+function InspectSection({ inspect, canWrite, failure }: { inspect: InspectView; canWrite: boolean; failure: { error: string; intent: string } | null }) {
   const { status, drifts, inspectedAt } = inspect;
   // 孤表在两张图上都没有节点，单独列出
   const orphans = drifts.filter(d => d.kind === 'orphan');
   const columns = drifts.filter(d => d.kind !== 'orphan');
+  // 一张表一个重建按钮：放在它的第一条缺列上
+  const missing = columns.filter(d => d.kind === 'missing');
+  const rebuildAt = new Set(missing.filter((d, i) => missing.findIndex(m => m.table === d.table) === i));
   const alarming = status === 'failed' || (inspectedAt !== null && drifts.length > 0);
   // 检查在调度器里异步进行：检查中时定时刷新，结束后停下
   const revalidator = useRevalidator();
@@ -351,19 +370,19 @@ function InspectSection({ inspect, canInspect, submitError }: { inspect: Inspect
   return (
     <section data-inspect-status={status} className={`space-y-4 rounded-2xl border bg-white p-6 shadow-sm ${alarming ? 'border-red-200' : ''}`}>
       <div className="flex items-start justify-between gap-6">
-        <SectionHeader title="漂移检查">对比湖里标准层表的实际结构与标准模型、已发布映射推出的应有结构，报告缺列、多列、类型不一致与没有映射写入的孤表。只出报告，修复走合并。</SectionHeader>
-        {canInspect && (
+        <SectionHeader title="漂移检查">对比湖里标准层表的实际结构与标准模型、已发布映射推出的应有结构，报告缺列、多列、类型不一致与没有映射写入的孤表。缺列可重建合并补上，其余只给提示。</SectionHeader>
+        {canWrite && (
           <Form method="post" preventScrollReset className="shrink-0">
             <input type="hidden" name="intent" value="inspect" />
             <Button type="submit" variant="outline" disabled={status === 'running'}>{status === 'running' ? '检查中…' : '漂移检查'}</Button>
           </Form>
         )}
       </div>
-      {submitError && (
+      {failure && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />
-          <AlertTitle>没有开始检查</AlertTitle>
-          <AlertDescription>{submitError}</AlertDescription>
+          <AlertTitle>{failure.intent === 'rebuild' ? '没有开始重建' : '没有开始检查'}</AlertTitle>
+          <AlertDescription>{failure.error}</AlertDescription>
         </Alert>
       )}
       <p className="flex flex-wrap items-center text-sm text-slate-500">
@@ -386,6 +405,13 @@ function InspectSection({ inspect, canInspect, submitError }: { inspect: Inspect
                 {(d.expected || d.actual) && (
                   <span className="text-slate-500">{`应有 ${d.expected ?? '—'} / 实际 ${d.actual ?? '—'}`}</span>
                 )}
+                {d.kind === 'missing' ? canWrite && rebuildAt.has(d) && (
+                  <Form method="post" preventScrollReset className="ml-auto">
+                    <input type="hidden" name="intent" value="rebuild" />
+                    <input type="hidden" name="entity" value={d.table} />
+                    <Button type="submit" variant="outline" size="sm">重建合并</Button>
+                  </Form>
+                ) : <DriftHint kind={d.kind} />}
               </li>
             ))}
           </ul>}
@@ -396,6 +422,7 @@ function InspectSection({ inspect, canInspect, submitError }: { inspect: Inspect
                   <span className="font-mono text-xs">{`silver.${d.table}`}</span>
                   <span className="text-red-600">{DRIFT_KINDS.orphan}</span>
                   <span className="text-slate-500">湖里有这张表，但已没有任何已发布映射写入</span>
+                  <DriftHint kind="orphan" />
                 </li>
               ))}
             </ul>

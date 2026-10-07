@@ -1,11 +1,13 @@
 // 映射与标准层合并的流水线接缝：同步到原始层 → 编写映射草稿 → 另一位成员发布 → 调度器派发合并 → 标准层；
-// 之后源端的新增、更新与删除随同步后的合并进入标准层，去重键与取最新规则让源端的重复行只计一次
+// 之后源端的新增、更新与删除随同步后的合并进入标准层，去重键与取最新规则让源端的重复行只计一次；漂移检查报告缺列时，重建合并补上标准层缺的列
 import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
-import { createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, rebuildEntity, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
+import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
@@ -651,5 +653,39 @@ describe('发布映射并合并到标准层', () => {
       const other = await memberOf(await newTenant('globex'), 'de@globex.com');
       await expect(mergeMapping(other, customers)).rejects.toMatchObject({ status: 404 });
     });
+  });
+
+  it('重建合并补上标准层缺的列：只带写入这个实体的映射并都带强制重建标记，行数不变；不带标记的合并补不上；已有合并在排队或运行、没有映射、查看者都被拒', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const customers = await publish(author, reviewer, id, CUSTOMERS);
+    await publish(author, reviewer, id, ORDERS);
+    const before = await silver(acme, 'customer', 'customer_id::INT');
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      await session.con.run('ALTER TABLE silver.customer DROP COLUMN city');
+    } finally {
+      session.close();
+    }
+
+    // 没有新批次的普通合并提前返回，缺的列补不上
+    await mergeMapping(author, customers);
+    await drain();
+    expect((await silver(acme, 'customer', 'customer_id::INT'))[0]).not.toHaveProperty('city');
+
+    const task = await rebuildEntity(author, 'customer');
+    expect(mergedMappings(task)).toEqual([customers]);
+    expect((task.params as { mappings: { rebuild?: boolean }[] }).mappings.every(m => m.rebuild === true)).toBe(true);
+    await drain();
+    const rebuilt = await silver(acme, 'customer', 'customer_id::INT');
+    expect(before[0]).toMatchObject({ customer_id: '1', city: '上海' });
+    expect(rebuilt).toEqual(before);
+
+    // 合并在排队或运行、没有映射写入的实体、查看者
+    const queued = await rebuildEntity(author, 'customer');
+    await expect(rebuildEntity(author, 'customer')).rejects.toThrow('已有一次合并在排队或运行中');
+    await getDb().update(tasks).set({ status: 'running', startedAt: sql`now()`, heartbeatAt: sql`now()` }).where(eq(tasks.id, queued.id));
+    await expect(rebuildEntity(author, 'customer')).rejects.toThrow('已有一次合并在排队或运行中');
+    await expect(rebuildEntity(author, 'coupon')).rejects.toThrow('没有已发布的映射写入');
+    await expect(rebuildEntity(await memberOf(acme, 'v@acme.com', 'viewer'), 'customer')).rejects.toMatchObject({ init: { status: 403 } });
   });
 });

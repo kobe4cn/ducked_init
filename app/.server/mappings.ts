@@ -422,22 +422,34 @@ export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId
 
 const ofMerge = (tenantId: string) => and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'silver.merge'));
 
+/** 租户在排队或运行中的合并（同一租户同时只有一个） */
+async function pendingMerge(db: Tx | ReturnType<typeof getDb>, tenantId: string) {
+  const [pending] = await db.select().from(tasks).where(and(ofMerge(tenantId), inArray(tasks.status, ['queued', 'running']))).limit(1);
+  return pending;
+}
+
+const lockTenant = (tx: Tx, tenantId: string) => tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
+
 /**
  * 在调用方的事务里为给定映射（不给时为全部已发布映射）的最新已发布版本入队一次合并，返回带上它们的合并任务。
  * 锁住租户行后检查：同一租户同时只有一个合并在排队或运行（两个合并同时写同一张标准层表会冲突）。
  * 已有合并在排队时把映射补进去（同一映射换成最新版本）；已在运行（或补的时候刚被领取）时不入队，返回 null，由定时检查在它之后补上。
- * 给定的映射都没有已发布版本时也不入队。参数里另带身份打通的匹配规则，由全部已发布的 customer 映射汇总（合并后整表重算打通，不只看这次的映射）
+ * 给定的映射都没有已发布版本时也不入队。参数里另带身份打通的匹配规则，由全部已发布的 customer 映射汇总（合并后整表重算打通，不只看这次的映射）。
+ * opts.rebuild 时给这些映射带上强制重建标记；排队中的映射已带标记时，补进去的同一映射保留它
  */
-export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string[]) {
-  await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
-  const plans = await publishedPlans(tx, tenantId, mappingIds);
+export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string[], opts?: { rebuild?: boolean }) {
+  await lockTenant(tx, tenantId);
+  const plans = (await publishedPlans(tx, tenantId, mappingIds)).map(p => (opts?.rebuild ? { ...p, rebuild: true } : p));
   if (!plans.length) return null;
-  const [pending] = await tx.select().from(tasks).where(and(ofMerge(tenantId), inArray(tasks.status, ['queued', 'running']))).limit(1);
+  const pending = await pendingMerge(tx, tenantId);
   const identity = identityRules(mappingIds ? await publishedPlans(tx, tenantId) : plans, mappingName);
   if (!pending) return insertTask(tx, tenantId, 'silver.merge', { mappings: plans, identity });
   if (pending.status !== 'queued') return null;
   const queued = (pending.params.mappings ?? []) as MergeMappingParam[];
-  const merged = [...queued.filter(q => !plans.some(p => p.mapping === q.mapping)), ...plans].sort((a, b) => a.mapping.localeCompare(b.mapping));
+  const merged = [
+    ...queued.filter(q => !plans.some(p => p.mapping === q.mapping)),
+    ...plans.map(p => (queued.some(q => q.mapping === p.mapping && q.rebuild) ? { ...p, rebuild: true } : p)),
+  ].sort((a, b) => a.mapping.localeCompare(b.mapping));
   // 领取合并不锁租户行：只在它仍在排队时改参数
   const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, identity } })
     .where(and(eq(tasks.id, pending.id), eq(tasks.status, 'queued'))).returning();
@@ -479,7 +491,7 @@ export async function mergeNow(actor: CurrentMember) {
   assertCan(actor, 'sources:write');
   const task = await getDb().transaction(tx => enqueueMerge(tx, actor.tenant.id));
   if (task) return task;
-  const [pending] = await getDb().select({ id: tasks.id }).from(tasks).where(and(ofMerge(actor.tenant.id), inArray(tasks.status, ['queued', 'running']))).limit(1);
+  const pending = await pendingMerge(getDb(), actor.tenant.id);
   throw new MappingError(pending ? '已有一次合并在排队或运行中' : '还没有已发布的映射');
 }
 
@@ -493,6 +505,22 @@ export async function mergeMapping(actor: CurrentMember, mappingId: string) {
     // 在同一个事务里判断原因：排队中的合并恰被领取时，这里读到的是运行中
     if (!(await publishedPlans(tx, actor.tenant.id, [mappingId])).length) throw new MappingError('这个映射还没有已发布的版本');
     throw new MappingError('已有一次合并在运行；它结束后，这个映射还有没合并的版本或变更时由定时检查补上');
+  });
+}
+
+/**
+ * 成员在数据地图上重建合并一张标准层表（漂移检查报告缺列时）：写入实体 entity 的全部已发布映射都带上强制重建标记入队一次合并，
+ * 合并时补上缺的列（只补列，不改列类型、不删列，ADR-0015）。已有合并在排队或运行中时报错，不并进去（先锁租户行再查，与入队互斥）
+ */
+export async function rebuildEntity(actor: CurrentMember, entity: string) {
+  assertCan(actor, 'sources:write');
+  return getDb().transaction(async tx => {
+    await lockTenant(tx, actor.tenant.id);
+    const ids = (await publishedPlans(tx, actor.tenant.id)).filter(p => p.entity === entity).map(p => p.mapping);
+    if (!ids.length) throw new MappingError('这张表没有已发布的映射写入');
+    if (await pendingMerge(tx, actor.tenant.id)) throw new MappingError('已有一次合并在排队或运行中，等它结束后再重建');
+    // 锁已持有、没有排队或运行中的合并，入队必定成功
+    return (await enqueueMerge(tx, actor.tenant.id, ids, { rebuild: true }))!;
   });
 }
 

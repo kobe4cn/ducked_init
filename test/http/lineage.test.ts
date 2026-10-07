@@ -4,7 +4,8 @@
 // 抽屉里的「聚焦此表」进入单表聚焦画布（?tab=flow&focus=），画布下的连线列表从源列连到标准层字段；查看者访问 ?focus= 回到关系图；
 // 流向图与聚焦画布上反向查（?q=）标出命中的行，源表节点（?node=table:…）打开源表抽屉；查看者两者都不生效；
 // 关系图下的「漂移检查」区块：数据工程师点按钮入队 lake.inspect（重复点提示已在排队），查看者看不到按钮、提交被拒，任何角色都看到最近一次结果；
-// 最近一次成功检查里有差异的表在两张图的列表行上带漂移标记，孤表在区块里单独列出
+// 最近一次成功检查里有差异的表在两张图的列表行上带漂移标记，孤表在区块里单独列出；缺列的表旁边有「重建合并」按钮（查看者没有、提交被拒），
+// 类型不一致、多列与孤表只给提示
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { and, desc, eq } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -432,6 +433,63 @@ dedupe: { key: [card_id] }
     expect(silver).toContain('data-node-drift="missing,type"');
     expect(silver).toContain('缺 2 列 · 类型 1');
     expect(flow.match(/<tr[^>]*data-silver="order"[^>]*>/)![0]).not.toContain('data-node-drift');
+  });
+
+  it('缺列的表旁边有「重建合并」按钮，提交后入队一次带强制重建标记的合并；类型不一致、多列、孤表只给提示；查看者看不到按钮、提交被拒', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'eng@acme.com', 'data_engineer');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const eng = await loginAs(app, 'eng@acme.com');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    await getDb().insert(tasks).values({
+      tenantId: acme, kind: 'lake.inspect', status: 'succeeded', finishedAt: new Date(),
+      result: { drifts: [
+        { table: 'customer', kind: 'missing', column: 'city', expected: 'VARCHAR' },
+        { table: 'customer', kind: 'missing', column: 'phone', expected: 'VARCHAR' },
+        { table: 'customer', kind: 'type', column: 'birthday', expected: 'DATE', actual: 'VARCHAR' },
+        { table: 'order', kind: 'extra', column: 'legacy', actual: 'VARCHAR' },
+        { table: 'stray', kind: 'orphan' },
+      ] },
+    });
+    const driftRow = (html: string, drift: string) => decode(html.match(new RegExp(`<li[^>]*data-drift="${drift}"[\\s\\S]*?</li>`))![0]);
+
+    const page = await (await eng.get('/lineage')).text();
+    // 一张表一个按钮，放在它的第一条缺列上
+    expect(page.match(/value="rebuild"/g)).toHaveLength(1);
+    const city = driftRow(page, 'customer:missing:city');
+    expect(city).toContain('name="intent" value="rebuild"');
+    expect(city).toContain('name="entity" value="customer"');
+    expect(city).toContain('重建合并');
+    const type = driftRow(page, 'customer:type:birthday');
+    expect(type).toContain('data-drift-hint="type"');
+    expect(type).toContain('需要删表重建，暂不支持');
+    for (const [drift, kind] of [['order:extra:legacy', 'extra'], ['stray:orphan:', 'orphan']]) {
+      const row = driftRow(page, drift);
+      expect(row).toContain(`data-drift-hint="${kind}"`);
+      expect(row).toContain('不影响合并，平台不删除湖表');
+      expect(row).not.toContain('value="rebuild"');
+    }
+
+    const viewerPage = await (await viewer.get('/lineage')).text();
+    expect(viewerPage).not.toContain('value="rebuild"');
+    expect(viewerPage).toContain('data-drift-hint="type"');
+    expect((await viewer.post('/lineage', { intent: 'rebuild', entity: 'customer' })).status).toBe(403);
+
+    const merges = () => getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge'), eq(tasks.status, 'queued')));
+    expect(await merges()).toEqual([]);
+    expect((await eng.post('/lineage', { intent: 'rebuild', entity: 'customer' })).status).toBe(302);
+    const [merge, ...more] = await merges();
+    expect(more).toEqual([]);
+    const planned = (merge.params as { mappings: { entity: string; rebuild?: boolean }[] }).mappings;
+    expect(planned.length).toBeGreaterThan(0);
+    expect(planned.every(m => m.entity === 'customer' && m.rebuild === true)).toBe(true);
+
+    const again = await eng.post('/lineage', { intent: 'rebuild', entity: 'customer' });
+    expect(again.status).toBe(400);
+    const html = decode(await again.text());
+    expect(html).toContain('没有开始重建');
+    expect(html).toContain('已有一次合并在排队或运行中');
+    expect((await eng.post('/lineage', { intent: 'rebuild', entity: 'stray' })).status).toBe(400);
   });
 
   it('没有已发布映射时显示空状态', async () => {
