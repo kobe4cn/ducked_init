@@ -1,10 +1,11 @@
 // 自定义实体登记的接缝（ADR-0019）：createCustomEntity / saveCustomEntityDraft 校验名称、字段与主键后保存草稿；
 // 双人发布与丢弃同源视图；publishedCustomEntities 给出每个实体最新的已发布版本。关系的终点保存与发布时都校验；发布过的实体只能新增字段与关系；
-// deleteCustomEntity 删除没被已发布映射引用的实体；draftFor 按已发布登记生成自定义实体的映射草稿；inferCustomEntityDrafts 为已发布映射在用、但没登记的实体推断登记草稿
+// deleteCustomEntity 删除没被已发布映射引用的实体；draftFor 按已发布登记生成自定义实体的映射草稿；inferCustomEntityDrafts 为已发布映射在用、但没登记的实体推断登记草稿；
+// relationSuggestions 按列名与取值包含推荐关系，adoptRelation 把推荐的关系采纳进登记草稿
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import {
-  createCustomEntity, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, inferCustomEntityDrafts, listCustomEntities, publishCustomEntity,
+  adoptRelation, createCustomEntity, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, inferCustomEntityDrafts, listCustomEntities, publishCustomEntity,
   publishedCustomEntities, saveCustomEntityDraft, type CustomEntityInput,
 } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -12,12 +13,13 @@ import { customEntities } from '../../app/.server/db/schema';
 import type { EntityRelation } from '../../app/lib/canonical-model';
 import { createMapping, draftFor, getMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { relationSuggestions } from '../../app/.server/relation-suggest';
 import { syncSource } from '../../app/.server/source-sync';
 import { listTasks } from '../../app/.server/tasks';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
-import { pgSourceInput, READER } from './source-fixtures';
+import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -634,5 +636,64 @@ dedupe: { key: [store_id] }
     expect(merge.status).toBe('failed');
     expect(merge.error).toContain('主键 store_id 跨映射重复');
     expect(await silver(acme, 'custom_store', 'store_id::INT, _mapping')).toEqual(before);
+  });
+});
+
+describe('关系推荐', () => {
+  /** 大区 N / S；门店的大区都在其中，网点有一个不存在的大区 W */
+  const TABLES = `
+    CREATE TABLE shop.areas (code text PRIMARY KEY, name text NOT NULL);
+    INSERT INTO shop.areas VALUES ('N', '北区'), ('S', '南区');
+    CREATE TABLE shop.stores (store_id text PRIMARY KEY, region_code text NOT NULL);
+    INSERT INTO shop.stores VALUES ('S1', 'N'), ('S2', 'S'), ('S3', 'N');
+    CREATE TABLE shop.outlets (outlet_id text PRIMARY KEY, region_code text NOT NULL);
+    INSERT INTO shop.outlets VALUES ('O1', 'N'), ('O2', 'W');
+    GRANT SELECT ON shop.areas, shop.stores, shop.outlets TO ${READER.user};`;
+  const field = (name: string) => ({ name, type: 'string' as const, description: '', sensitive: false });
+  const entity = (name: string, key: string, ...more: string[]): CustomEntityInput =>
+    ({ name, label: name, kind: 'dimension', fields: [key, ...more].map(field), primaryKey: [key] });
+  const mapping = (name: string, table: string, key: string, ...more: string[]) =>
+    `model: 1\nentity: ${name}\ntable: ${table}\nextensions:\n${[key, ...more].map(f => `  ${f}: { type: string, expr: ${f} }\n`).join('')}dedupe: { key: [${key}] }\n`;
+  const toRegion = (from: string): EntityRelation => ({ from: { entity: from, field: 'region_code' }, ref: { entity: 'custom_region', field: 'code' } });
+  /** 标准字段 order.store_id 按列名指向门店，没有已发布的 order 映射，取值无从核对 */
+  const orderToStore = { relation: { from: { entity: 'order', field: 'store_id' }, ref: { entity: 'custom_store', field: 'store_id' } }, checked: 'name-only' };
+
+  /** 门店、网点、大区都已登记并发布，门店与网点的映射已合并；大区的映射还没发布 */
+  async function withStores() {
+    const people = await engineers();
+    const input = await pgSourceInput(READER);
+    await grantOnSource(TABLES);
+    const { id: sourceId } = await registerSource(people.author, input);
+    await selectAllTables(people.author, sourceId);
+    await drain();
+    await syncSource(people.author, sourceId);
+    await drain();
+    const ids: Record<string, string> = {};
+    for (const [name, key, more] of [['custom_region', 'code', 'name'], ['custom_store', 'store_id', 'region_code'], ['custom_outlet', 'outlet_id', 'region_code']]) {
+      ids[name] = await createCustomEntity(people.author, entity(name, key, more));
+      await publishCustomEntity(people.reviewer, ids[name], 1);
+    }
+    await publish(people.author, people.reviewer, sourceId, mapping('custom_store', 'stores', 'store_id', 'region_code'));
+    await publish(people.author, people.reviewer, sourceId, mapping('custom_outlet', 'outlets', 'outlet_id', 'region_code'));
+    return { ...people, sourceId, ids };
+  }
+
+  it('按列名推荐，起点的常见取值都在终点的标准层里时标「取值已核对」，有找不到的不推荐，终点还没合并时标「未核对取值」', async () => {
+    const { author, reviewer, sourceId, ids } = await withStores();
+    expect(await relationSuggestions(author, ids.custom_store)).toEqual([{ relation: toRegion('custom_store'), checked: 'name-only' }, orderToStore]);
+    await publish(author, reviewer, sourceId, mapping('custom_region', 'areas', 'code', 'name'));
+    expect(await relationSuggestions(author, ids.custom_store)).toEqual([{ relation: toRegion('custom_store'), checked: 'values' }, orderToStore]);
+    expect(await relationSuggestions(author, ids.custom_outlet)).toEqual([]);
+  });
+
+  it('采纳后关系进了草稿、采纳的人是最后保存的人，不再推荐；重复采纳报错；分析师不能采纳', async () => {
+    const { acme, author, reviewer, ids } = await withStores();
+    expect(await adoptRelation(reviewer, ids.custom_store, { from: { entity: '', field: 'region_code' }, ref: { entity: 'custom_region', field: 'code' } })).toBe(2);
+    const { draft } = await getCustomEntity(author, ids.custom_store);
+    expect(draft).toMatchObject({ relations: [toRegion('custom_store')], lastEditor: 'de2@acme.com' });
+    expect(await relationSuggestions(author, ids.custom_store)).toEqual([orderToStore]);
+    await expect(adoptRelation(author, ids.custom_store, toRegion('custom_store'))).rejects.toThrow('关系 custom_store.region_code → custom_region.code 已经登记');
+    const analyst = await memberOf(acme, 'an@acme.com', 'analyst');
+    await expect(adoptRelation(analyst, ids.custom_store, toRegion('custom_store'))).rejects.toMatchObject({ init: { status: 403 } });
   });
 });

@@ -8,17 +8,19 @@ import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entity';
 import { can, requirePermission } from '~/.server/access';
 import {
-  CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, relationTargets, saveCustomEntityDraft,
+  adoptRelation, CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, relationTargets, saveCustomEntityDraft,
   unpublishedMappingsOf,
 } from '~/.server/custom-entities';
 import { navFor } from '~/.server/nav';
 import { passthroughPair, publishPassthrough } from '~/.server/passthrough';
 import { publishBlocker, publishReason } from '~/.server/publish-rules';
+import { relationSuggestions } from '~/.server/relation-suggest';
 import { AppShell } from '~/components/app-shell';
 import { CustomEntityForm, EntityFieldsTable, EntityRelationsTable } from '~/components/custom-entity-form';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
+import { RelationSuggestionsCard } from '~/components/relation-suggestions-card';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
@@ -48,6 +50,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       entity: found.entity,
       /** 关系可选的终点：标准实体与已发布的自定义实体 */
       targets: await relationTargets(member),
+      /** 编辑页推荐的关系（ADR-0019）；只有能改登记的成员才算，省掉查标准层 */
+      suggestions: tabOf(request) === 'edit' && can(member.role, 'sources:write') ? await relationSuggestions(member, params.entityId) : [],
       /** 草稿是平台推断、还没有成员确认（保存）过的登记 */
       inferred: !!found.draft && isInferredDraft(found.draft),
       /** 引用这个实体的已发布映射与别的实体指向它的已发布关系；有引用时不能删除 */
@@ -85,6 +89,12 @@ export async function action({ request, params }: Route.ActionArgs) {
       case 'save':
         await saveCustomEntityDraft(await requirePermission(request, 'sources:write'), params.entityId, input);
         throw redirect(base);
+      case 'adoptRelation': {
+        const [relation] = input.relations ?? [];
+        if (!relation) return data({ error: '没有要采纳的关系', intent: 'adoptRelation', input: null }, { status: 400 });
+        await adoptRelation(await requirePermission(request, 'sources:write'), params.entityId, relation);
+        throw redirect(base);
+      }
       case 'publish':
         await publishCustomEntity(await requirePermission(request, 'publish'), params.entityId, Number(form.get('version')));
         break;
@@ -127,7 +137,7 @@ function editHint(canWrite: boolean, selected: { status: string }, draft: { vers
 }
 
 export default function Entity({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, canWrite, canDelete, entity, targets, inferred, referrers, version, versions, pair, unpublishedMappings } = loaderData;
+  const { email, nav, tab, canWrite, canDelete, entity, targets, suggestions, inferred, referrers, version, versions, pair, unpublishedMappings } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -258,6 +268,7 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
           </>
         )}
       </div>
+      {tab === 'edit' && suggestions.length > 0 && <RelationSuggestionsCard suggestions={suggestions} submitting={submitting} />}
     </AppShell>
   );
 }

@@ -15,7 +15,7 @@ import { publishedPlans } from './mappings';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import {
   CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, type EntityRelation, entityOf,
-  EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType, isCustomEntity,
+  EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType, isCustomEntity, relationText,
 } from '../lib/canonical-model';
 
 /** 可以展示给成员的业务错误 */
@@ -56,14 +56,11 @@ export function customEntityInputOf(form: FormData): CustomEntityInput {
   };
 }
 
-/** 关系的展示：起点实体.起点字段 → 终点实体.终点字段 */
-const relationText = (r: EntityRelation) => `${r.from.entity}.${r.from.field} → ${r.ref.entity}.${r.ref.field}`;
-
 /** 标准模型字段上内置的 ref，写成与登记上的关系同形的边 */
 const BUILTIN_RELATIONS: EntityRelation[] = CANONICAL_ENTITIES.flatMap(e => e.fields.flatMap(f => (f.ref ? [{ from: { entity: e.name, field: f.name }, ref: f.ref }] : [])));
 
 /** 租户的全部关系：标准模型内置的 ref 与已发布登记上的关系 */
-const allRelations = (published: Map<string, RegisteredEntity>) => [...BUILTIN_RELATIONS, ...[...published.values()].flatMap(e => e.relations ?? [])];
+export const allRelations = (published: Map<string, RegisteredEntity>) => [...BUILTIN_RELATIONS, ...[...published.values()].flatMap(e => e.relations ?? [])];
 
 /** 以 entity 为起点的全部关系：标准模型内置的 ref 与已发布登记上的关系（ADR-0019） */
 export function relationsFrom(entity: string, published: Map<string, RegisteredEntity>): EntityRelation[] {
@@ -363,27 +360,48 @@ export async function createCustomEntity(actor: CurrentMember, input: CustomEnti
  * 名称不能改，input.name 被忽略。返回草稿的版本号
  */
 export async function saveCustomEntityDraft(actor: CurrentMember, entityId: string, input: CustomEntityInput) {
+  return saveDraft(actor, entityId, () => input);
+}
+
+/**
+ * 采纳一条推荐的关系（relation-suggest.ts）：追加到最新一版登记（有草稿时是草稿，否则是最近的已发布版本）上，照保存草稿校验、保存，
+ * 采纳的人成为最后保存的人；只有推断出的草稿时，采纳即确认这份登记。起点、终点实体留空即本实体。关系已登记时报错。返回草稿的版本号
+ */
+export async function adoptRelation(actor: CurrentMember, entityId: string, relation: EntityRelation) {
+  return saveDraft(actor, entityId, (latest, name) => {
+    const end = ({ entity, field }: EntityRelation['from']) => ({ entity: entity.trim() || name, field: field.trim() });
+    const adopted = { from: end(relation.from), ref: end(relation.ref) };
+    if (latest.relations.some(r => relationText(r) === relationText(adopted))) throw new CustomEntityError(`关系 ${relationText(adopted)} 已经登记`);
+    return { ...latest, relations: [...latest.relations, adopted] };
+  });
+}
+
+/** 保存草稿与采纳关系共用：锁住实体行后按最新一版得出要保存的登记，在同一个事务里校验、保存 */
+async function saveDraft(
+  actor: CurrentMember, entityId: string, inputOf: (latest: typeof customEntityVersions.$inferSelect, name: string) => CustomEntityInput,
+) {
   assertCan(actor, 'sources:write');
   const entity = await requireEntity(actor.tenant.id, entityId);
-  const registration = checkRegistration(input, entity.name);
   return getDb().transaction(async tx => {
-    // 锁住实体行：与发布、丢弃互斥；丢弃从没发布过的实体会删除它
+    // 锁住实体行：与发布、丢弃互斥；丢弃从没发布过的实体会删除它。采纳关系在锁里读最新一版，不覆盖同时保存的修改
     const [locked] = await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
     if (!locked) throw new CustomEntityError('自定义实体已被删除', 404);
     const [latest] = await tx.select().from(customEntityVersions)
       .where(eq(customEntityVersions.entityId, entityId)).orderBy(desc(customEntityVersions.version)).limit(1);
+    if (!latest) throw new CustomEntityError('自定义实体已被删除', 404);
+    const registration = checkRegistration(inputOf(latest, entity.name), entity.name);
     const [published] = await tx.select().from(customEntityVersions)
       .where(and(eq(customEntityVersions.entityId, entityId), eq(customEntityVersions.status, 'published')))
       .orderBy(desc(customEntityVersions.version)).limit(1);
     if (published) checkAdditive(published, registration);
     await checkRelations(tx, actor.tenant.id, entity.name, registration);
-    if (latest?.status === 'draft') {
+    if (latest.status === 'draft') {
       await tx.update(customEntityVersions)
         .set({ ...registration, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
         .where(eq(customEntityVersions.id, latest.id));
       return latest.version;
     }
-    const version = (latest?.version ?? 0) + 1;
+    const version = latest.version + 1;
     await tx.insert(customEntityVersions).values({ entityId, version, ...registration, authors: [actor.email], lastEditor: actor.email });
     await recordAudit(tx, {
       tenantId: actor.tenant.id,

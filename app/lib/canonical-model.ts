@@ -248,6 +248,10 @@ export type CustomEntityKind = keyof typeof CUSTOM_ENTITY_KINDS;
 export interface CustomEntityField { name: string; type: FieldType; description: string; sensitive: boolean }
 /** 登记上声明的一条关系（ADR-0019「关系」）：起点是本实体的一个字段，终点是另一个已发布实体的单列主键；ref 与 CanonicalField.ref 同形 */
 export interface EntityRelation { from: { entity: string; field: string }; ref: { entity: string; field: string } }
+/** 关系的展示：起点实体.起点字段 → 终点实体.终点字段 */
+export const relationText = (r: EntityRelation) => `${r.from.entity}.${r.from.field} → ${r.ref.entity}.${r.ref.field}`;
+/** 实体页推荐的一条关系（relation-suggest.ts）：checked 为 values 时起点的常见取值都在终点主键里找到了，name-only 时只按列名推荐、没核对取值 */
+export interface RelationSuggestion { relation: EntityRelation; checked: 'values' | 'name-only' }
 
 export const isCustomEntity = (name: string) => new RegExp(CUSTOM_ENTITY_PATTERN).test(name);
 

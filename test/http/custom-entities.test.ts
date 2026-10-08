@@ -1,4 +1,4 @@
-// test/http/custom-entities.test.ts —— 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），在实体页给登记加关系（报错时保留已填的关系），最后保存的人发布不了，
+// test/http/custom-entities.test.ts —— 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），在实体页给登记加关系（报错时保留已填的关系）、一键采纳推荐的关系，最后保存的人发布不了，
 // 另一位成员在详情页发布；再改是新的一版草稿。分析师只读，查看者 403，其他租户 404；导航「映射」后面是「自定义实体」。
 // 有发布权限的成员删除实体后回到列表；从源表一键生成后跳到实体详情页（撞名时另填实体名），丢弃从没发布过的登记时配套映射草稿一并丢弃，详情页显示配套的映射草稿，另一位成员把登记与映射一起发布。已发布映射在用、但没登记的实体在列表与详情页标为待确认的推断登记，确认保存、另一位成员发布后提示消失；
 // 登记发布前映射列表与详情页提示实体待补登；映射详情页的实体卡片链接到实体页，映射页用登记的中文名
@@ -121,6 +121,34 @@ describe('自定义实体', () => {
     const detail = await (await (await loginAs(app, 'an@acme.com')).get(page)).text();
     expect(detail).toMatch(/data-relation="region_id"[^]*?custom_store\.region_id[^]*?custom_region\.region_id/);
     expect(detail).toMatch(/data-relation="store_id"[^]*?order\.store_id[^]*?custom_store\.store_id/);
+  });
+
+  it('数据工程师在实体页看到推荐关系并一键采纳到登记草稿，采纳后不再推荐；分析师看不到推荐', async () => {
+    const tenantId = await acme();
+    const [de, admin] = [await memberOf(tenantId, 'de@acme.com'), await memberOf(tenantId, 'admin@acme.com')];
+    const field = (name: string) => ({ name, type: 'string' as const, description: '', sensitive: false });
+    await publishCustomEntity(admin, await createCustomEntity(de, { name: 'custom_region', label: '大区', kind: 'dimension', fields: [field('region_id')], primaryKey: ['region_id'] }), 1);
+    const storeId = await createCustomEntity(de, { name: 'custom_store', label: '门店', kind: 'dimension', fields: [field('store_id'), field('region_id')], primaryKey: ['store_id'] });
+    const page = `/entities/${storeId}`;
+    const author = await loginAs(app, 'de@acme.com');
+    const html = await (await author.get(page)).text();
+    expect(html).toContain('推荐关系');
+    expect(html).toMatch(/data-relation-suggestion="custom_store.region_id → custom_region.region_id"[^]*?data-checked="name-only">未核对取值</);
+    expect(html).toContain('data-relation-suggestion="order.store_id → custom_store.store_id"');
+
+    const adopt = { intent: 'adoptRelation', relFrom: 'custom_store', relField: 'region_id', relEntity: 'custom_region', relTarget: 'region_id' };
+    expect((await author.post(page, adopt)).status).toBe(302);
+    const after = await (await author.get(page)).text();
+    expect(after).not.toContain('data-relation-suggestion="custom_store.region_id → custom_region.region_id"');
+    expect(after).toMatch(/name="relField"[^>]*value="region_id"[^]*?<option[^>]*value="custom_region" selected=""/);
+    const again = await author.post(page, adopt);
+    expect(again.status).toBe(400);
+    expect(await again.text()).toContain('关系 custom_store.region_id → custom_region.region_id 已经登记');
+
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an@acme.com');
+    expect(await (await analyst.get(page)).text()).not.toContain('推荐关系');
+    expect((await analyst.post(page, adopt)).status).toBe(403);
   });
 
   it('分析师只读，查看者 403，其他租户 404', async () => {
