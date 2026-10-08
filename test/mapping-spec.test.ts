@@ -1,7 +1,9 @@
-// 映射文档的校验：不符合 Schema、表达式用了白名单之外的函数、引用了源表没有的字段、值字典对应到非标准枚举时被拒绝，并给出 YAML 里的行列位置；
+// 映射文档的校验：不符合 Schema、表达式用了白名单之外的函数、引用了源表没有的字段、值字典对应到非标准枚举、行过滤 where 不返回布尔时被拒绝，并给出 YAML 里的行列位置；
+// 表达式里比较与逻辑运算的编译；
 // 以及对照面板从编辑中的 YAML 读出的要点（已对应的字段、去重键）
 import { describe, expect, it } from 'vitest';
 import { checkMapping } from '../app/.server/pipeline/mapping-spec';
+import { compileExpression, parseExpression } from '../app/lib/mapping-expr';
 import { mappingOutline } from '../app/lib/mapping-outline';
 
 const ORDERS = (
@@ -68,6 +70,24 @@ colour: red
     // 不能借字符串或子查询拼出任意 SQL：语法本身不接受
     expect(issues(ok.replace('string(order_id)', '(SELECT 1)'))[0].message).toMatch(/表达式错误/);
     expect(issues(ok.replace("'Asia/Shanghai'", "'Mars/Base'"))[0].message).toMatch(/不认识的时区/);
+  });
+
+  it('行过滤 where 必须是返回布尔的表达式，只能引用源表里有的字段', () => {
+    expect(issues(`${ok}where: amount + 1\n`)).toEqual([{ line: 14, col: 8, path: 'where', message: 'where 必须是返回布尔的表达式' }]);
+    expect(issues(`${ok}where: nope = 1\n`)).toEqual([{ line: 14, col: 8, path: 'where', message: '源表 orders 中没有字段 nope' }]);
+    expect(issues(`${ok}where: "status = "\n`)).toEqual([{ line: 14, col: 18, path: 'where', message: '表达式错误：表达式不完整' }]);
+    const r = checkMapping(`${ok}where: status <> '作废' and amount is not null\n`, columns);
+    expect(r.ok && r.plan.where).toBe("status <> '作废' and amount is not null");
+  });
+
+  it('表达式支持比较、and / or / not、is null 与 in，编译时每个节点整体加括号', () => {
+    expect(compileExpression(parseExpression('a and b or not c is null'), 't')).toBe('((t."a" AND t."b") OR (NOT (t."c" IS NULL)))');
+    expect(compileExpression(parseExpression("x in ('a', 'b') and y not in (1)"), 't')).toBe("((t.\"x\" IN ('a', 'b')) AND (t.\"y\" NOT IN (1)))");
+    expect(compileExpression(parseExpression('a != 1 or b is not null'), 't')).toBe('((t."a" <> 1) OR (t."b" IS NOT NULL))');
+    expect(compileExpression(parseExpression('-a + 1 >= b * 2'), 't')).toBe('(((-t."a") + 1) >= (t."b" * 2))');
+    expect(compileExpression(parseExpression('coalesce(a = 1, false)'), 't')).toBe('coalesce((t."a" = 1), FALSE)');
+    expect(() => parseExpression('a in ()')).toThrow(/表达式不完整|无法识别/);
+    expect(() => parseExpression('a is 1')).toThrow(/null/);
   });
 
   it('引用源表里没有的字段、映射到标准模型里没有的字段、值字典对应到非标准枚举都被拒绝', () => {

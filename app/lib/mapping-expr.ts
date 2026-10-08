@@ -1,6 +1,7 @@
 // app/lib/mapping-expr.ts —— 映射里的字段表达式：平台自己解析的小语言，只允许白名单函数（类型转换、单位换算、COALESCE、
 // 时区转换等）与四则运算，由平台编译成 DuckDB SQL，成员写不进任意 SQL（ADR-0015）。
-// 语法：源表字段（标识符，或用双引号括起的任意字段名）、单引号字符串、数字、null / true / false、+ - * /、括号与函数调用。
+// 语法：源表字段（标识符，或用双引号括起的任意字段名）、单引号字符串、数字、null / true / false、+ - * /、括号与函数调用；
+// 返回布尔的写法（映射的行过滤 where，ADR-0024）：比较 = <> != < <= > >=、and / or / not、is [not] null、[not] in (…, …)。
 // 平台进程（保存与发布时校验）、工作进程（合并时编译）与映射表单（客户端读写表达式）共用
 import type { FieldType } from './canonical-model';
 import { looksSensitive } from './sensitive';
@@ -10,7 +11,17 @@ export type Expr =
   | { kind: 'literal'; sql: string; text?: string; offset: number }
   | { kind: 'call'; fn: string; args: Expr[]; offset: number }
   | { kind: 'binary'; op: '+' | '-' | '*' | '/'; left: Expr; right: Expr; offset: number }
-  | { kind: 'neg'; arg: Expr; offset: number };
+  | { kind: 'neg'; arg: Expr; offset: number }
+  | { kind: 'compare'; op: CompareOp; left: Expr; right: Expr; offset: number }
+  | { kind: 'logic'; op: 'and' | 'or'; left: Expr; right: Expr; offset: number }
+  | { kind: 'not'; arg: Expr; offset: number }
+  | { kind: 'isnull'; arg: Expr; negated: boolean; offset: number }
+  | { kind: 'in'; arg: Expr; list: Expr[]; negated: boolean; offset: number };
+
+export type CompareOp = '=' | '<>' | '<' | '<=' | '>' | '>=';
+
+/** 关键字：作字段名时要加双引号 */
+const KEYWORDS = ['and', 'or', 'not', 'is', 'in'];
 
 /** 表达式里的错误：offset 是在表达式文本里的位置（从 0 起） */
 export class ExprError extends Error {
@@ -60,9 +71,9 @@ export function extensionExpr(column: { name: string; type: string }, tz = 'Asia
   return { type: KIND_FIELD_TYPES[kind], expr: kind === 'timestamp' ? `from_timezone(${col}, ${lit(tz)})` : kind === 'other' ? `string(${col})` : col };
 }
 
-/** 表达式里引用源列：不是普通标识符（或是 null / true / false）时加双引号 */
+/** 表达式里引用源列：不是普通标识符（或是 null / true / false 与关键字）时加双引号 */
 export const ref = (name: string) =>
-  /^[A-Za-z_\u0080-￿][A-Za-z0-9_\u0080-￿]*$/.test(name) && !/^(null|true|false)$/i.test(name) ? name : `"${name.replace(/"/g, '""')}"`;
+  /^[A-Za-z_\u0080-￿][A-Za-z0-9_\u0080-￿]*$/.test(name) && !['null', 'true', 'false', ...KEYWORDS].includes(name.toLowerCase()) ? name : `"${name.replace(/"/g, '""')}"`;
 
 /** 表达式里的字符串字面量（单引号，内部的单引号写两遍） */
 export const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
@@ -151,6 +162,20 @@ export function parseExpression(src: string): Expr {
   let i = 0;
   const skip = () => { while (i < src.length && /\s/.test(src[i])) i++; };
   const peek = () => { skip(); return src[i]; };
+  /** 下一个标识符（小写）；不是标识符时为空串 */
+  const word = () => {
+    skip();
+    let j = i;
+    if (!IDENT_START.test(src[j] ?? '')) return '';
+    while (j < src.length && IDENT_PART.test(src[j])) j++;
+    return src.slice(i, j).toLowerCase();
+  };
+  /** 下一个标识符是关键字 w 时吃掉它 */
+  const keyword = (w: string) => {
+    if (word() !== w) return false;
+    i += w.length;
+    return true;
+  };
 
   function quoted(close: string, what: string) {
     const start = i;
@@ -174,7 +199,7 @@ export function parseExpression(src: string): Expr {
     if (c === undefined) throw new ExprError('表达式不完整', i);
     if (c === '(') {
       i++;
-      const e = additive();
+      const e = or();
       if (peek() !== ')') throw new ExprError('缺少右括号', i);
       i++;
       return e;
@@ -201,7 +226,7 @@ export function parseExpression(src: string): Expr {
         const args: Expr[] = [];
         if (peek() !== ')') {
           for (;;) {
-            args.push(additive());
+            args.push(or());
             if (peek() === ',') { i++; continue; }
             break;
           }
@@ -220,6 +245,7 @@ export function parseExpression(src: string): Expr {
       const lower = name.toLowerCase();
       if (lower === 'null') return { kind: 'literal', sql: 'NULL', offset: start };
       if (lower === 'true' || lower === 'false') return { kind: 'literal', sql: lower.toUpperCase(), offset: start };
+      if (KEYWORDS.includes(lower)) throw new ExprError(`${name} 是关键字，作字段名时请加双引号："${name}"`, start);
       return { kind: 'column', name, offset: start };
     }
     throw new ExprError(`无法识别的字符 ${c}`, i);
@@ -247,8 +273,61 @@ export function parseExpression(src: string): Expr {
   const multiplicative = binary(unary, ['*', '/']);
   const additive = binary(multiplicative, ['+', '-']);
 
+  /** 比较、is [not] null 与 [not] in (…)：两边都是四则运算，不连写 */
+  function comparison(): Expr {
+    const left = additive();
+    skip();
+    const offset = i;
+    const op = /^(<=|>=|<>|!=|=|<|>)/.exec(src.slice(i))?.[0];
+    if (op) {
+      i += op.length;
+      return { kind: 'compare', op: op === '!=' ? '<>' : (op as CompareOp), left, right: additive(), offset };
+    }
+    if (keyword('is')) {
+      const negated = keyword('not');
+      if (!keyword('null')) throw new ExprError('is 后面只能是 null 或 not null', i);
+      return { kind: 'isnull', arg: left, negated, offset };
+    }
+    const negated = keyword('not');
+    if (keyword('in')) {
+      if (peek() !== '(') throw new ExprError("in 后面要用括号列出取值，如 in ('a', 'b')", i);
+      i++;
+      const list: Expr[] = [];
+      for (;;) {
+        list.push(or());
+        if (peek() === ',') { i++; continue; }
+        break;
+      }
+      if (peek() !== ')') throw new ExprError('in 的取值缺少右括号', i);
+      i++;
+      return { kind: 'in', arg: left, list, negated, offset };
+    }
+    if (negated) throw new ExprError('not 放在这里只能接 in', i);
+    return left;
+  }
+
+  function not(): Expr {
+    skip();
+    const offset = i;
+    return keyword('not') ? { kind: 'not', arg: not(), offset } : comparison();
+  }
+
+  function logic(next: () => Expr, op: 'and' | 'or') {
+    return (): Expr => {
+      let left = next();
+      for (;;) {
+        skip();
+        const offset = i;
+        if (!keyword(op)) return left;
+        left = { kind: 'logic', op, left, right: next(), offset };
+      }
+    };
+  }
+  const and = logic(not, 'and');
+  const or = logic(and, 'or');
+
   if (!src.trim()) throw new ExprError('表达式为空', 0);
-  const expr = additive();
+  const expr = or();
   skip();
   if (i < src.length) throw new ExprError(`多余的内容：${src.slice(i, i + 20)}`, i);
   return expr;
@@ -260,8 +339,9 @@ export function referencedColumns(expr: Expr): { name: string; offset: number }[
     case 'column': return [{ name: expr.name, offset: expr.offset }];
     case 'literal': return [];
     case 'call': return expr.args.flatMap(referencedColumns);
-    case 'binary': return [...referencedColumns(expr.left), ...referencedColumns(expr.right)];
-    case 'neg': return referencedColumns(expr.arg);
+    case 'binary': case 'compare': case 'logic': return [...referencedColumns(expr.left), ...referencedColumns(expr.right)];
+    case 'neg': case 'not': case 'isnull': return referencedColumns(expr.arg);
+    case 'in': return [expr.arg, ...expr.list].flatMap(referencedColumns);
   }
 }
 
@@ -271,7 +351,14 @@ export function compileExpression(expr: Expr, alias: string): string {
     case 'column': return `${alias}.${ident(expr.name)}`;
     case 'literal': return expr.sql;
     case 'call': return FUNCTIONS[expr.fn].sql(expr.args.map(a => compileExpression(a, alias)), expr);
-    case 'binary': return `(${compileExpression(expr.left, alias)} ${expr.op} ${compileExpression(expr.right, alias)})`;
+    case 'binary': case 'compare': return `(${compileExpression(expr.left, alias)} ${expr.op} ${compileExpression(expr.right, alias)})`;
     case 'neg': return `(-${compileExpression(expr.arg, alias)})`;
+    case 'logic': return `(${compileExpression(expr.left, alias)} ${expr.op.toUpperCase()} ${compileExpression(expr.right, alias)})`;
+    case 'not': return `(NOT ${compileExpression(expr.arg, alias)})`;
+    case 'isnull': return `(${compileExpression(expr.arg, alias)} IS ${expr.negated ? 'NOT ' : ''}NULL)`;
+    case 'in': {
+      const list = expr.list.map(e => compileExpression(e, alias)).join(', ');
+      return `(${compileExpression(expr.arg, alias)} ${expr.negated ? 'NOT ' : ''}IN (${list}))`;
+    }
   }
 }

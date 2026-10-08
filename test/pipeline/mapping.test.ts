@@ -399,6 +399,31 @@ describe('发布映射并合并到标准层', () => {
     });
   });
 
+  it('行过滤 where：只合并满足条件的源记录，取值为空算不满足，过滤掉的行数记进合并记录', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const mapping = await publish(author, reviewer, id, `${CUSTOMERS}where: email is not null\n`);
+    const customers = await silver(acme, 'customer', 'customer_id::INT');
+    expect(customers).toHaveLength(30);
+    expect(customers.every(c => c.email !== null)).toBe(true);
+    expect((await getMapping(author, mapping)).merge.history[0]).toMatchObject({ mode: 'rebuild', rows: 30, filtered: 10 });
+  });
+
+  it('行过滤 where：记录更新后不再满足条件时，增量合并删掉它在标准层的行并回落到同去重键的其他记录', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, author, reviewer, id } = await syncedSource();
+      const mapping = await publish(author, reviewer, id, `${ORDER_LOG_MAPPING}where: status <> '作废'\n`);
+      const rows = () => silver(acme, 'order', 'order_id').then(r => r.map(o => [o.order_id, o.status, o.updated_at]));
+      expect(await rows()).toEqual([['A1', 'refunded', '2024-06-03 10:00:00+00'], ['A2', 'paid', '2024-06-02 10:00:00+00']]);
+
+      // 「作废」不在值字典里：先过滤，不会让合并失败
+      await grantOnSource(`UPDATE shop.order_log SET status = '作废', updated_at = '2024-06-04 10:00' WHERE status = '已退款';`);
+      await syncSource(author, id);
+      await drain();
+      expect(await rows()).toEqual([['A1', 'paid', '2024-06-01 10:00:00+00'], ['A2', 'paid', '2024-06-02 10:00:00+00']]);
+      expect((await getMapping(author, mapping)).merge.history[0]).toMatchObject({ mode: 'incremental', updated: 1, filtered: 1 });
+    });
+  });
+
   it('值字典里没有的取值让这个映射合并失败（不悄悄写入），其他映射照常合并', async () => {
     const { acme, author, reviewer, id } = await syncedSource();
     await publish(author, reviewer, id, CUSTOMERS);

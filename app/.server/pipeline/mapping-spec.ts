@@ -2,6 +2,7 @@
 // 先按 JSON Schema（MAPPING_SCHEMA）校验结构，再对照标准模型与源表的字段做语义校验：字段表达式只能用白名单函数、只能引用源表里有的字段，
 // 值字典与兜底值只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段，身份打通的匹配字段（只用于 customer）必须是映射出来的敏感字段；扩展字段可标成敏感（只能是文本），内置敏感字段不能取消敏感标记。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
 // 映射可以声明键空间（ADR-0024）：单列文本主键在标准层写成 <键空间>:<原值>，指向别的实体的字段（内置 ref 与已登记关系的起点）可以在字段上写同样的键空间。
+// 映射可以写行过滤 where（ADR-0024）：返回布尔的表达式，不满足（含取值为空）的源记录不进标准层。
 // 校验通过后得到合并计划（MergePlan）：标准层的列、每列的表达式与值字典、去重键与取最新字段、身份打通的匹配规则，交给工作进程编译执行（ADR-0015）
 import { Ajv, type ErrorObject } from 'ajv';
 import { Document, isMap, isScalar, isSeq, LineCounter, parseDocument, type Node, type YAMLMap } from 'yaml';
@@ -35,6 +36,8 @@ export interface MappingSpec {
   dedupe?: { key: string[]; latest?: string };
   /** 身份打通的匹配字段（只用于 customer）：本映射映射出来的敏感字段，数组顺序即优先级。不写时用平台默认规则 */
   identity?: IdentityRules;
+  /** 行过滤（ADR-0024）：返回布尔的表达式，不满足（含取值为空）的源记录不进标准层 */
+  where?: string;
 }
 
 /** 身份打通的匹配规则：按优先级排列的匹配字段 */
@@ -108,6 +111,7 @@ export const MAPPING_SCHEMA = {
         match: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 } },
       },
     },
+    where: { type: 'string', minLength: 1 },
   },
 } as const;
 
@@ -151,6 +155,8 @@ export interface MergePlan {
   identity?: IdentityRules;
   /** 映射声明的键空间，写进标准层的 _key_space */
   keySpace?: string;
+  /** 行过滤：返回布尔的表达式，不满足（含取值为空）的源记录视为不存在 */
+  where?: string;
 }
 
 export type MappingCheck = { ok: true; spec: MappingSpec; plan: MergePlan } | { ok: false; issues: MappingIssue[] };
@@ -250,7 +256,7 @@ function snippet(value: Record<string, unknown>, flow: Path[] = []) {
   return doc.toString({ lineWidth: 0, singleQuote: true }).trimEnd();
 }
 
-/** 推断表达式的类型（给扩展字段的写法填类型）：源列按源端类型，函数按返回值，四则运算按数字 */
+/** 推断表达式的类型（给扩展字段的写法填类型）：源列按源端类型，函数按返回值，四则运算按数字，比较与逻辑运算按布尔 */
 function inferType(expr: Expr, columnType: (name: string) => string | undefined): FieldType {
   switch (expr.kind) {
     case 'column': {
@@ -270,6 +276,8 @@ function inferType(expr: Expr, columnType: (name: string) => string | undefined)
       const both = [inferType(expr.left, columnType), inferType(expr.right, columnType)];
       return both.every(t => t === 'integer') ? 'integer' : 'decimal';
     }
+    case 'compare': case 'logic': case 'not': case 'isnull': case 'in':
+      return 'boolean';
   }
 }
 
@@ -368,15 +376,15 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
     if (isView && columns && !columns.has(name)) issue(['view_key', i], `源视图 ${spec.table} 中没有字段 ${name}`);
   });
 
-  /** 校验一个表达式，返回其文本；表达式在 YAML 字符串里的位置按引号偏移一列 */
-  const checkExpr = (path: Path, expr: string) => {
+  /** 校验一个表达式，没有问题时返回解析结果；表达式在 YAML 字符串里的位置按引号偏移一列 */
+  const checkExpr = (path: Path, expr: string): Expr | undefined => {
     const node = doc.getIn(path, true) as { type?: string } | undefined;
     const quote = node?.type === 'QUOTE_DOUBLE' || node?.type === 'QUOTE_SINGLE' ? 1 : 0;
     try {
       const parsed = parseExpression(expr);
-      for (const c of referencedColumns(parsed)) {
-        if (columns && !columns.has(c.name)) issue(path, `${inputLabel} ${spec.table} 中没有字段 ${c.name}`, { offset: quote + c.offset });
-      }
+      const missing = referencedColumns(parsed).filter(c => columns && !columns.has(c.name));
+      for (const c of missing) issue(path, `${inputLabel} ${spec.table} 中没有字段 ${c.name}`, { offset: quote + c.offset });
+      return missing.length ? undefined : parsed;
     } catch (e) {
       if (!(e instanceof ExprError)) throw e;
       issue(path, `表达式错误：${e.message}`, { offset: quote + e.offset });
@@ -585,6 +593,12 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
     else c.keySpace = spec.key_space;
   }
 
+  // 行过滤：只能引用源表里有的字段，必须返回布尔（不知道源列类型时列都按文本推断，不检查）
+  if (spec.where !== undefined) {
+    const parsed = checkExpr(['where'], spec.where);
+    if (parsed && columns && inferType(parsed, c => columns?.get(c)) !== 'boolean') issue(['where'], 'where 必须是返回布尔的表达式');
+  }
+
   // 身份打通的匹配字段：只用于 customer，必须是映射出来的敏感字段（标准层里是可比对的哈希）
   if (spec.identity && spec.entity !== 'customer') {
     issue(['identity'], '只有消费者（customer）映射能配置身份打通的匹配规则', { atKey: true });
@@ -611,6 +625,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
       latest,
       ...(spec.identity && { identity: { match: [...spec.identity.match] } }),
       ...(spec.key_space && primaryKey && { keySpace: spec.key_space }),
+      ...(spec.where && { where: spec.where }),
     },
   };
 }

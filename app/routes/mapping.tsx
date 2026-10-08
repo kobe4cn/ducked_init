@@ -179,6 +179,7 @@ function MergeRow({ e, base, canWrite }: { e: MergeEntry; base: string; canWrite
       <TableCell>{e.mode === 'rebuild' ? `重建（批次 1–${e.batchTo}）` : e.batchTo === e.batchFrom ? '增量（无新批次）' : `增量（批次 ${e.batchFrom + 1}–${e.batchTo}）`}</TableCell>
       <TableCell className="whitespace-normal">
         {`${e.rows.toLocaleString('zh-CN')} 行（新增 ${e.inserted}，更新 ${e.updated}，删除 ${e.deleted}）`}
+        {e.filtered !== undefined && <span data-merge-filtered={e.filtered}>{`，过滤 ${e.filtered.toLocaleString('zh-CN')} 行`}</span>}
         {e.fallback?.map(f => (
           <div key={f.column} className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground" data-merge-fallback={f.column}>
             {columnFallbackText(e.entity, f)}

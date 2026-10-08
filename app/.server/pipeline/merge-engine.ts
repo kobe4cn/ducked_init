@@ -54,6 +54,8 @@ export type MergeRecord = { mapping: string; entity: string; table: string; vers
     rows: number;
     /** 写了兜底值的列里落入兜底的取值（没有就不带） */
     fallback?: FallbackStat[];
+    /** 写了行过滤 where 时，不满足条件被滤掉的源表行数（增量合并只统计本次变更的记录） */
+    filtered?: number;
   }
   /** skipped：源表还没有同步进原始层，等首次同步后再合并（不算失败） */
   | { skipped: string }
@@ -257,7 +259,7 @@ async function checkUnknownValues(con: DuckDBConnection, columns: PlanColumn[]) 
  * 转换出错时 DuckDB 的报错可能带出源端的取值：把敏感字段引用的源列里出现在报错中的取值（原样或去掉首尾空格后）抹掉，
  * 不区分大小写。只有一个字的取值不抹，免得把整条报错抹花
  */
-async function withoutPii(con: DuckDBConnection, columns: PlanColumn[], message: string, live: string) {
+async function withoutPii(con: DuckDBConnection, columns: Pick<PlanColumn, 'expr'>[], message: string, live: string) {
   const sources = [...new Set(columns.flatMap(c => referencedColumns(parseExpression(c.expr)).map(r => r.name)))];
   if (!sources.length) return message;
   const found = await rows<{ v: string }>(con, `
@@ -355,6 +357,8 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   if (!rebuild && to <= from) return unchanged();
 
   await liveRecords(con, bronze, sourceKeys, { from, to, held: rebuild ? null : records }, { latest: LATEST, live: LIVE });
+  // 行过滤：不满足（含取值为空）的记录从 live 里去掉，视为当前记录里不存在；latest 不动，它们的旧版本照常删除、受影响的去重键回落（ADR-0024）
+  const filtered = plan.where ? await filterLive(con, plan) : undefined;
   // 先查出值字典与标准枚举之外的取值（没写兜底值时报错；敏感字段不查，取值会进报错与兜底统计），再转换
   const pii = sensitiveColumns(plan);
   const fallback = await checkUnknownValues(con, plan.columns.filter(c => !pii.has(c.name)));
@@ -413,7 +417,22 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     deleted: Number(stats.deleted),
     rows: await silverRows(),
     ...(fallback.length && { fallback }),
+    ...(filtered !== undefined && { filtered }),
   };
+}
+
+/**
+ * 从 live 里删掉不满足 where 的记录，返回删掉的源表行数（没有主键的表一条记录可代表多行）。
+ * 报错里抹掉敏感字段与 where 引用的源端取值（where 可能引用没映射的敏感列）
+ */
+async function filterLive(con: DuckDBConnection, plan: MergeMappingParam) {
+  const failing = `(${compileExpression(parseExpression(plan.where!), LIVE)}) IS NOT TRUE`;
+  const pii = sensitiveColumns(plan);
+  const scrubbed = [...plan.columns.filter(c => pii.has(c.name)), { expr: plan.where! }];
+  const clean = async (e: Error) => { throw new Error(await withoutPii(con, scrubbed, e.message, LIVE)); };
+  const [{ n }] = await rows<{ n: string }>(con, `SELECT coalesce(sum(_n), 0) AS n FROM ${LIVE} WHERE ${failing}`).catch(clean);
+  await con.run(`DELETE FROM ${LIVE} WHERE ${failing}`).catch(clean);
+  return Number(n);
 }
 
 /**
