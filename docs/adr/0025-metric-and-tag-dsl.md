@@ -11,7 +11,7 @@ ADR-0004 决定指标与标签用平台自有的 YAML DSL 编译成 SQL；ADR-00
 - `base`：基础实体，必须有引用 `customer.customer_id` 的 `customer_id` 字段（或就是 `customer`）。通过 `silver._identities`（`_source, customer_id`）关联到 `consumer_id`，关联不到的行不计入。
 - `measure`：`{ agg: count|count_distinct|sum|avg|min|max, field? }`，只有 `count` 可以不写 `field`；`sum`/`avg` 只能用整数、小数字段。
 - `filter`：可选，`[{ field, op, value? }]`，全部用 AND 连接；字段只能是基础实体的字段，`op` 为 `eq|ne|in|not_in|gt|gte|lt|lte|is_null|not_null`，取值按字段类型校验后用 `lit` 写入，不接受表达式。
-- `window`：可选，`{ field, days }`，`field` 是基础实体的时间或日期字段，取 `(asOf - days, asOf]`。没写时只取 `field <= asOf` 的限制也不加。
+- `window`：可选，`{ field, days }`，`field` 是基础实体的时间或日期字段，取 `(asOf - days, asOf]`。没写时不加时间限制。
 - `dimensions`：可选，最多 3 个，`[{ name, path, as_of? }]`。`path` 写成 `order.store_id -> custom_store.region_id -> custom_region.name`：第一段的实体是 `base`；相邻两段之间，前一段的字段必须有一条关系（内置 `ref` 或已发布登记上的关系）指向后一段实体的单列主键；最多 3 跳；不成环（沿用 `allRelations` 的全部关系判断）；终点不能是敏感字段。编译成链式 `LEFT JOIN`，结果转成 `VARCHAR`，关联不到或为空记为「未关联」，不丢行。`as_of` 是给「按时间点关联」预留的位置，只接受 `current`（默认），其他值报「暂不支持按时间点关联」。
 - 能引用的只有标准实体、已发布登记的自定义实体（推断出的、未确认的登记不算）和已发布映射里的 `x_` 字段；不读原始层。度量、过滤、窗口用到的字段都不能是敏感字段（`isSensitiveField`）。
 
