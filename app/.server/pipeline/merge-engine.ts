@@ -10,7 +10,7 @@
 // 所以不增量：视图版本或它引用的表有新批次时由全部批次重建，否则不动
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
-import { entityOf } from '../../lib/canonical-model';
+import { entityOf, type EntityRelation, type RelationStat } from '../../lib/canonical-model';
 import { DEFAULT_RULES, resolveIdentities, type IdentitySummary } from './identity-engine';
 import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
 import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
@@ -63,6 +63,9 @@ export type MergeRecord = { mapping: string; entity: string; table: string; vers
   | { error: string }
 );
 
+/** 合并任务里的一条已发布关系（内置 ref 与已发布登记上的关系）；sensitive：起点是敏感字段，标准层里是哈希，入队时算好 */
+export interface RelationParam extends EntityRelation { sensitive: boolean }
+
 /** 合并后的身份打通：摘要与耗时，失败时是错误信息 */
 export type IdentityRecord = { durationMs: number } & (IdentitySummary | { error: string });
 
@@ -87,6 +90,10 @@ export const joinOn = (keys: string[], a: string, b: string) => keys.map(k => `$
 /** 整行哈希（与同步时的算法相同）：“列名=取值”按列名排序后拼接，空值不参与 */
 const rowHash = (columns: string[], alias: string) =>
   `hash(concat_ws(chr(31), ${[...columns].sort().map(c => `${lit(`${c}=`)} || ${alias}.${ident(c)}::VARCHAR`).join(', ')}))`;
+
+const columnExists = async (con: DuckDBConnection, entity: string, column: string) => (await rows(con, `
+  SELECT 1 FROM information_schema.columns WHERE table_catalog = 'lake' AND table_schema = ${lit(SILVER)} AND table_name = ${lit(entity)}
+    AND column_name = ${lit(column)}`)).length > 0;
 
 /** 标准层表：silver."<实体>" */
 export const silverTable = (entity: string) => `${SILVER}.${ident(entity)}`;
@@ -453,14 +460,47 @@ async function assertUniqueAcrossMappings(con: DuckDBConnection, silver: string,
 }
 
 /**
+ * 统计每条关系的孤儿：起点有值、在终点主键里找不到的行（ADR-0019，左连接）。键空间两端一致，直接比较（ADR-0024）；
+ * 终点是 customer 时只在同一个数据源内找（customer 不做跨映射唯一）。一条关系出错只记在它自己身上（只留报错摘要，不带取值）
+ */
+export async function relationStats(con: DuckDBConnection, relations: RelationParam[], redact: (message: string) => string): Promise<RelationStat[]> {
+  const present = async ({ entity, field }: EntityRelation['from']) => await tableExists(con, SILVER, entity) && await columnExists(con, entity, field);
+  const stats: RelationStat[] = [];
+  for (const { from, ref, sensitive } of relations) {
+    try {
+      if (!await present(from) || !await present(ref)) {
+        stats.push({ from, ref, status: 'unmerged' });
+        continue;
+      }
+      const bySource = ref.entity === 'customer';
+      const fromValue = `f.${ident(from.field)}`;
+      // f：起点表；t：终点去重后的主键 k
+      const joined = `${silverTable(from.entity)} f LEFT JOIN (SELECT DISTINCT ${ident(ref.field)} AS k${bySource ? ', _source' : ''} FROM ${silverTable(ref.entity)}) t
+        ON ${fromValue} = t.k${bySource ? ' AND f._source = t._source' : ''}`;
+      const [counts] = await rows<{ with_value: string; orphans: string }>(con, `
+        SELECT count(*) FILTER (WHERE ${fromValue} IS NOT NULL) AS with_value, count(*) FILTER (WHERE ${fromValue} IS NOT NULL AND t.k IS NULL) AS orphans FROM ${joined}`);
+      const orphans = Number(counts.orphans);
+      const samples = sensitive || !orphans ? [] : (await rows<{ v: string }>(con, `
+        SELECT DISTINCT ${fromValue}::VARCHAR AS v FROM ${joined} WHERE ${fromValue} IS NOT NULL AND t.k IS NULL ORDER BY v LIMIT 5`)).map(r => r.v);
+      stats.push({ from, ref, withValue: Number(counts.with_value), orphans, samples });
+    } catch (e) {
+      // 只留第一个冒号之前的摘要：DuckDB 的报错可能带上取值，统计结果给只读成员看
+      stats.push({ from, ref, error: redact((e as Error).message).split(/[:：]/)[0] });
+    }
+  }
+  return stats;
+}
+
+/**
  * 按已发布的映射合并到标准层，每个映射各自一个事务：一个映射失败（表达式在数据上出错、值字典缺取值、去重键为空）
  * 只影响它自己，其他映射照常合并。之后本租户有 silver.customer 时整表重算身份打通（一次合并只带受影响的映射，增量会漏），
  * 失败同样只记在 identities 里。rules 是租户全部 customer 映射汇总出的匹配规则（入队合并时算好，不只是这次带的映射）；
- * salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐
+ * 打通之前统计 relations（租户全部已发布关系，同样入队时算好）的孤儿，记在 relations 里，出错不算合并失败；salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐
  */
 export async function mergeToSilver(
   session: TenantLakeSession, plans: MergeMappingParam[], salt: string, redact: (message: string) => string, rules: readonly string[] = DEFAULT_RULES,
-): Promise<{ mappings: MergeRecord[]; identities?: IdentityRecord }> {
+  relations: RelationParam[] = [],
+): Promise<{ mappings: MergeRecord[]; relations?: RelationStat[]; identities?: IdentityRecord }> {
   const { con } = session;
   // 早于敏感字段哈希的数据湖里，合并日志还没有 scheme 列：补上后老的日志为空，各映射下次合并时重建
   await con.run(`CREATE SCHEMA IF NOT EXISTS ${SILVER}; CREATE SCHEMA IF NOT EXISTS ${RECORDS};
@@ -483,12 +523,13 @@ export async function mergeToSilver(
       await con.run([LATEST, LIVE, ROWS, KEYS, BEFORE, WINNERS, VIEW_ROWS].map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
     }
   }
-  if (!await tableExists(con, SILVER, 'customer')) return { mappings: records };
+  const merged = { mappings: records, ...(relations.length > 0 && { relations: await relationStats(con, relations, redact) }) };
+  if (!await tableExists(con, SILVER, 'customer')) return merged;
   const startedAt = Date.now();
   try {
     const summary = await resolveIdentities(con, rules);
-    return { mappings: records, identities: { ...summary, durationMs: Date.now() - startedAt } };
+    return { ...merged, identities: { ...summary, durationMs: Date.now() - startedAt } };
   } catch (e) {
-    return { mappings: records, identities: { durationMs: Date.now() - startedAt, error: redact((e as Error).message) } };
+    return { ...merged, identities: { durationMs: Date.now() - startedAt, error: redact((e as Error).message) } };
   }
 }

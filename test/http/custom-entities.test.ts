@@ -1,4 +1,4 @@
-// test/http/custom-entities.test.ts —— 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），在实体页给登记加关系（报错时保留已填的关系）、一键采纳推荐的关系，最后保存的人发布不了，
+// test/http/custom-entities.test.ts —— 自定义实体的 HTTP 接缝（ADR-0019）：数据工程师在「自定义实体」页新建登记（不合格时页面给出原因），在实体页给登记加关系（报错时保留已填的关系）、一键采纳推荐的关系、看已发布关系在最近一次合并后的孤儿比例与样例键，最后保存的人发布不了，
 // 另一位成员在详情页发布；再改是新的一版草稿。分析师只读，查看者 403，其他租户 404；导航「映射」后面是「自定义实体」。
 // 有发布权限的成员删除实体后回到列表；从源表一键生成后跳到实体详情页（撞名时另填实体名），丢弃从没发布过的登记时配套映射草稿一并丢弃，详情页显示配套的映射草稿，另一位成员把登记与映射一起发布。已发布映射在用、但没登记的实体在列表与详情页标为待确认的推断登记，确认保存、另一位成员发布后提示消失；
 // 登记发布前映射列表与详情页提示实体待补登；映射详情页的实体卡片链接到实体页，映射页用登记的中文名
@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { createPassthrough } from '../../app/.server/passthrough';
-import { customEntities } from '../../app/.server/db/schema';
+import { customEntities, tasks } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { registerSource } from '../../app/.server/sources';
 import { memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
@@ -149,6 +149,52 @@ describe('自定义实体', () => {
     const analyst = await loginAs(app, 'an@acme.com');
     expect(await (await analyst.get(page)).text()).not.toContain('推荐关系');
     expect((await analyst.post(page, adopt)).status).toBe(403);
+  });
+
+  it('实体页「已发布关系」显示最近一次合并后的孤儿比例与样例键：有孤儿、0 孤儿、敏感起点不给样例键；没合并过时尚未合并，编辑态与只读态都显示', async () => {
+    const tenantId = await acme();
+    const [de, admin] = [await memberOf(tenantId, 'de@acme.com'), await memberOf(tenantId, 'admin@acme.com')];
+    const field = (name: string, sensitive = false) => ({ name, type: 'string' as const, description: '', sensitive });
+    await publishCustomEntity(admin, await createCustomEntity(de, { name: 'custom_store', label: '门店', kind: 'dimension', fields: [field('store_id')], primaryKey: ['store_id'] }), 1);
+    const relation = (from: string, entity: string, ref = from) => ({ from: { entity: 'custom_redeem', field: from }, ref: { entity, field: ref } });
+    const [toStore, toCoupon, toCustomer] = [relation('store_id', 'custom_store'), relation('coupon_id', 'coupon'), relation('customer_id', 'customer')];
+    const redeemId = await createCustomEntity(de, {
+      name: 'custom_redeem', label: '核销', kind: 'fact', primaryKey: ['redeem_id'],
+      fields: [field('redeem_id'), field('store_id'), field('coupon_id'), field('customer_id', true)], relations: [toStore, toCoupon, toCustomer],
+    });
+    await publishCustomEntity(admin, redeemId, 1);
+    const page = `/entities/${redeemId}`;
+    const row = (html: string, text: string) => html.match(new RegExp(`<li[^>]*data-relation-stat="${text}"[^]*?</li>`))?.[0] ?? '';
+    const [store, coupon, customer] = ['custom_redeem.store_id → custom_store.store_id', 'custom_redeem.coupon_id → coupon.coupon_id', 'custom_redeem.customer_id → customer.customer_id'];
+
+    const author = await loginAs(app, 'de@acme.com');
+    const before = await (await author.get(page)).text();
+    expect(before).toContain('已发布关系');
+    for (const text of [store, coupon, customer]) expect(row(before, text)).toContain('尚未合并');
+    expect(before).not.toContain('data-orphans');
+
+    // 最近一次合并的结果（改 tasks.result 造出）：门店有孤儿，券没有，消费者起点敏感、没有样例键
+    await getDb().insert(tasks).values({
+      tenantId, kind: 'silver.merge', status: 'succeeded', finishedAt: new Date(),
+      result: { mappings: [], relations: [
+        { ...toStore, withValue: 10, orphans: 2, samples: ['S8', 'S9'] },
+        { ...toCoupon, withValue: 4, orphans: 0, samples: [] },
+        { ...toCustomer, withValue: 6, orphans: 6, samples: [] },
+      ] },
+    });
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    for (const browser of [author, await loginAs(app, 'an@acme.com')]) {
+      const html = await (await browser.get(page)).text();
+      expect(row(html, store)).toMatch(/data-orphans="2">孤儿 20%（2 \/ 10 行）</);
+      expect(row(html, store)).toMatch(/样例键：[^]*S8、S9/);
+      expect(row(html, coupon)).toMatch(/data-orphans="0">孤儿 0%（0 \/ 4 行）</);
+      expect(row(html, customer)).toMatch(/data-orphans="6">孤儿 100%（6 \/ 6 行）</);
+      expect(row(html, customer)).not.toContain('样例键');
+    }
+    // 自定义实体只列起点或终点是它的关系
+    const storePage = await (await author.get(`/entities/${(await getDb().select().from(customEntities)).find(e => e.name === 'custom_store')!.id}`)).text();
+    expect(row(storePage, store)).toContain('data-orphans="2"');
+    expect(storePage).not.toContain(`data-relation-stat="${coupon}"`);
   });
 
   it('分析师只读，查看者 403，其他租户 404', async () => {

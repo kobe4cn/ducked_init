@@ -6,14 +6,14 @@ import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
-import { publishedCustomEntities, type RegisteredEntity, relationsFrom, relationsTo, uniqueKeys } from './custom-entities';
+import { allRelations, publishedCustomEntities, type RegisteredEntity, relationsFrom, relationsTo, uniqueKeys } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { dryRun } from './pipeline/dry-run-engine';
 import { identityRules, type IdentitySummary } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
-import type { MergeMappingParam, MergeRecord } from './pipeline/merge-engine';
+import type { MergeMappingParam, MergeRecord, RelationParam } from './pipeline/merge-engine';
 import { draftCustomMapping, draftMapping, DraftError } from './pipeline/mapping-draft';
 import { checkMapping, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
@@ -21,7 +21,7 @@ import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
 import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
-import { CANONICAL_ENTITIES, entityLabel, entityOf, type EntityRelation } from '../lib/canonical-model';
+import { CANONICAL_ENTITIES, entityLabel, entityOf, type EntityRelation, type RelationStat, relationText } from '../lib/canonical-model';
 import { entityForTable } from '../lib/field-synonyms';
 import { diffPlans } from '../lib/mapping-diff';
 
@@ -483,13 +483,25 @@ async function pendingMerge(db: Tx | ReturnType<typeof getDb>, tenantId: string)
   return pending;
 }
 
+/**
+ * 合并后要统计孤儿的关系：全部已发布关系（内置 ref 与已发布登记上的），带上起点是否敏感（ADR-0005，标准层里是哈希，不给样例键）：
+ * 标准实体的 pii 字段、登记里标成敏感的字段，或已发布映射里标成敏感的列（x_ 字段）
+ */
+function relationParams(published: Map<string, RegisteredEntity>, plans: MergeMappingParam[]): RelationParam[] {
+  const sensitive = ({ entity, field }: EntityRelation['from']) => !!entityOf(entity)?.fields.find(f => f.name === field)?.pii
+    || !!published.get(entity)?.fields.find(f => f.name === field)?.sensitive
+    || plans.some(p => p.entity === entity && p.columns.some(c => c.name === field && c.sensitive));
+  return allRelations(published).map(r => ({ ...r, sensitive: sensitive(r.from) }));
+}
+
 const lockTenant = (tx: Tx, tenantId: string) => tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
 
 /**
  * 在调用方的事务里为给定映射（不给时为全部已发布映射）的最新已发布版本入队一次合并，返回带上它们的合并任务。
  * 锁住租户行后检查：同一租户同时只有一个合并在排队或运行（两个合并同时写同一张标准层表会冲突）。
  * 已有合并在排队时把映射补进去（同一映射换成最新版本）；已在运行（或补的时候刚被领取）时不入队，返回 null，由定时检查在它之后补上。
- * 给定的映射都没有已发布版本时也不入队。参数里另带身份打通的匹配规则，由全部已发布的 customer 映射汇总（合并后整表重算打通，不只看这次的映射）。
+ * 给定的映射都没有已发布版本时也不入队。参数里另带身份打通的匹配规则，由全部已发布的 customer 映射汇总（合并后整表重算打通，不只看这次的映射），
+ * 与要统计孤儿的全部已发布关系（工作进程不读平台库）。
  * opts.rebuild 时给这些映射带上强制重建标记；排队中的映射已带标记时，补进去的同一映射保留它
  */
 export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string[], opts?: { rebuild?: boolean }) {
@@ -497,8 +509,10 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
   const plans = (await publishedPlans(tx, tenantId, mappingIds)).map(p => (opts?.rebuild ? { ...p, rebuild: true } : p));
   if (!plans.length) return null;
   const pending = await pendingMerge(tx, tenantId);
-  const identity = identityRules(mappingIds ? await publishedPlans(tx, tenantId) : plans, mappingName);
-  if (!pending) return insertTask(tx, tenantId, 'silver.merge', { mappings: plans, identity });
+  const all = mappingIds ? await publishedPlans(tx, tenantId) : plans;
+  const identity = identityRules(all, mappingName);
+  const relations = relationParams(await publishedCustomEntities(tx, tenantId), all);
+  if (!pending) return insertTask(tx, tenantId, 'silver.merge', { mappings: plans, identity, relations });
   if (pending.status !== 'queued') return null;
   const queued = (pending.params.mappings ?? []) as MergeMappingParam[];
   const merged = [
@@ -506,7 +520,7 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
     ...plans.map(p => (queued.some(q => q.mapping === p.mapping && q.rebuild) ? { ...p, rebuild: true } : p)),
   ].sort((a, b) => a.mapping.localeCompare(b.mapping));
   // 领取合并不锁租户行：只在它仍在排队时改参数
-  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, identity } })
+  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, identity, relations } })
     .where(and(eq(tasks.id, pending.id), eq(tasks.status, 'queued'))).returning();
   return task ?? null;
 }
@@ -660,6 +674,28 @@ export async function latestIdentitySummary(tenantId: string) {
   if (!latest) return null;
   const { groups, records, devices } = (latest.result as { identities: IdentitySummary }).identities;
   return { groups, records, devices, taskId: latest.id, at: latest.createdAt };
+}
+
+/** 本租户最近一次带关系孤儿统计的合并：各关系的统计与完成时间；还没有时为 null */
+export async function latestRelationStats(tenantId: string) {
+  const [latest] = await getDb().select({ finishedAt: tasks.finishedAt, result: tasks.result }).from(tasks)
+    .where(and(ofMerge(tenantId), sql`${tasks.result} ? 'relations'`))
+    .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
+  if (!latest) return null;
+  return { relations: (latest.result as { relations: RelationStat[] }).relations, at: latest.finishedAt };
+}
+
+/**
+ * 一个实体相关（起点或终点是它）的已发布关系与最近一次合并后的孤儿统计（ADR-0019）。
+ * 最近一次合并没有统计到的关系（还没合并过，或合并之后才发布的）为 unmerged
+ */
+export async function entityRelationStats(tenantId: string, entity: string) {
+  const latest = await latestRelationStats(tenantId);
+  const relations = allRelations(await publishedCustomEntities(getDb(), tenantId)).filter(r => r.from.entity === entity || r.ref.entity === entity);
+  return {
+    at: latest?.at ?? null,
+    relations: relations.map((r): RelationStat => latest?.relations.find(s => relationText(s) === relationText(r)) ?? { ...r, status: 'unmerged' }),
+  };
 }
 
 /** 各映射最近一次合并的结果（每个映射分别找带它的最近一次合并任务，不受别的映射合并得多少影响） */

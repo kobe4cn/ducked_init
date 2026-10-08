@@ -250,6 +250,12 @@ export interface CustomEntityField { name: string; type: FieldType; description:
 export interface EntityRelation { from: { entity: string; field: string }; ref: { entity: string; field: string } }
 /** 关系的展示：起点实体.起点字段 → 终点实体.终点字段 */
 export const relationText = (r: EntityRelation) => `${r.from.entity}.${r.from.field} → ${r.ref.entity}.${r.ref.field}`;
+/**
+ * 合并后一条关系的孤儿统计（ADR-0019）：起点有值的行数 withValue，其中在终点主键里找不到的 orphans，与最多 5 个孤儿键 samples
+ * （起点敏感时不给）。两端的表或列还没有时为 unmerged；查询出错时是错误信息
+ */
+export type RelationStat = EntityRelation & ({ withValue: number; orphans: number; samples: string[] } | { status: 'unmerged' } | { error: string });
+
 /** 实体页推荐的一条关系（relation-suggest.ts）：checked 为 values 时起点的常见取值都在终点主键里找到了，name-only 时只按列名推荐、没核对取值 */
 export interface RelationSuggestion { relation: EntityRelation; checked: 'values' | 'name-only' }
 
