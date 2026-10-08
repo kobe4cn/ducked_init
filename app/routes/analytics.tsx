@@ -1,4 +1,4 @@
-// app/routes/analytics.tsx —— 分析（有结果层查看权限的成员）：本租户分析模板任务产出的结果快照（带所用的模板定义版本），最新的在前；已过期的标灰、不能打开。
+// app/routes/analytics.tsx —— 分析（有结果层查看权限的成员）：本租户分析模板任务产出的结果快照（带所用的模板定义版本），最新的在前；已过期的标灰、不能打开，登记时数据不完整的标「数据不完整」（详情在快照页）。
 // 有定义查看权限的成员从这里进入 RFM 模板参数页
 import { SlidersHorizontal } from 'lucide-react';
 import { Link } from 'react-router';
@@ -33,6 +33,7 @@ export async function loader({ request }: Route.LoaderArgs) {
       definitionVersion: s.definitionVersion,
       rowCount: s.rowCount,
       expired: !!s.expiredAt,
+      incomplete: !!s.incomplete,
       createdAt: s.createdAt.toISOString(),
       expiresAt: s.expiresAt.toISOString(),
     })),
@@ -79,7 +80,9 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
                   <TableCell>
                     {s.expired
                       ? <StatusText tone="none" data-snapshot-status="expired">已过期</StatusText>
-                      : <StatusText tone="ok" data-snapshot-status="available">可查看</StatusText>}
+                      : s.incomplete
+                        ? <StatusText tone="pending" data-snapshot-status="incomplete">数据不完整</StatusText>
+                        : <StatusText tone="ok" data-snapshot-status="available">可查看</StatusText>}
                   </TableCell>
                 </TableRow>
               ))}

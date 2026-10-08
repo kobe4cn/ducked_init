@@ -71,6 +71,21 @@ describe('分析页', () => {
     expect(html).toContain('源表 members → customer：源表读取失败，从未成功合并');
   });
 
+  it('带数据不完整标记的快照在列表里显示「数据不完整」，不带标记的照旧可查看', async () => {
+    const { acme, snapshot } = await rfmSnapshot();
+    await runTask(acme, 'gold.rfm', { asOf: '2024-08-01' });
+    const complete = (await listSnapshots(acme)).find(s => s.id !== snapshot.id)!;
+    await getDb().update(snapshots).set({ incomplete: [
+      { mapping: '00000000-0000-0000-0000-000000000001', entity: 'order', table: 'orders', error: '源表读取失败', lastSuccessAt: null },
+    ] }).where(eq(snapshots.id, snapshot.id));
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+    const html = await (await browser.get('/analytics')).text();
+    expect(html).toMatch(new RegExp(`data-snapshot="${snapshot.id}"(?:(?!</tr>).)*data-snapshot-status="incomplete">数据不完整`, 's'));
+    expect(html).toMatch(new RegExp(`data-snapshot="${complete.id}"(?:(?!</tr>).)*data-snapshot-status="available">可查看`, 's'));
+    expect(html).toContain(`href="/analytics/snapshots/${snapshot.id}"`);
+  });
+
   it('其他租户的快照返回 404，也不出现在它的列表里', async () => {
     const { snapshot } = await rfmSnapshot();
     const globex = await newTenant('globex');
@@ -81,9 +96,12 @@ describe('分析页', () => {
     expect((await browser.get('/analytics/snapshots/not-a-uuid')).status).toBe(404);
   });
 
-  it('已过期的快照在列表中标为已过期、没有链接，直接打开返回 404', async () => {
+  it('已过期的快照（即使带数据不完整标记）在列表中标为已过期、没有链接，直接打开返回 404', async () => {
     const { acme, snapshot } = await rfmSnapshot();
-    await getDb().update(snapshots).set({ expiredAt: new Date() }).where(eq(snapshots.id, snapshot.id));
+    // 同时带数据不完整标记：过期优先
+    await getDb().update(snapshots).set({ expiredAt: new Date(), incomplete: [
+      { mapping: '00000000-0000-0000-0000-000000000001', entity: 'order', table: 'orders', error: '源表读取失败', lastSuccessAt: null },
+    ] }).where(eq(snapshots.id, snapshot.id));
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     const browser = await loginAs(app, 'viewer@acme.com');
     const html = await (await browser.get('/analytics')).text();
