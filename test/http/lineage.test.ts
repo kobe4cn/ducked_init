@@ -1,5 +1,6 @@
 // test/http/lineage.test.ts —— 数据地图的 HTTP 接缝：任何成员都能打开 /lineage，关系图下的表与关系列表画出已接入的标准层表与 _identities、_device_owner，
 // 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；_identities 显示匹配规则与最近一次合并的打通摘要（没有合并任务时显示尚未合并）；
+// 内置关系边带最近一次合并后的孤儿比例（样例键只给数据工程师，统计失败标红，没有合并任务时为尚未合并）；
 // 「显示未接入的标准实体」开关（?all=1）灰显未接入的实体；没有已发布映射时显示空状态；流向图（?tab=flow）只对有 sources:read 的成员开放：列表带源表名、版本、行数与合并状态，失败的链到合并记录；
 // 抽屉里的「聚焦此表」进入单表聚焦画布（?tab=flow&focus=），画布下的连线列表从源列连到标准层字段；查看者访问 ?focus= 回到关系图；
 // 流向图与聚焦画布上反向查（?q=）标出命中的行，源表节点（?node=table:…）打开源表抽屉；查看者两者都不生效；
@@ -12,6 +13,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, tasks } from '../../app/.server/db/schema';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { lastMergeByMapping, publishMapping, saveDraft } from '../../app/.server/mappings';
+import type { RelationStat } from '../../app/lib/canonical-model';
 import { memberOf, newTenant, publish } from '../pipeline/fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -105,6 +107,50 @@ describe('数据地图', () => {
     const none = await (await viewer.get('/lineage')).text();
     expect(none).toContain('尚未合并');
     expect(none).not.toContain('data-groups');
+  });
+
+  it('表与关系列表上已接入的内置关系显示最近一次合并后的孤儿比例与样例键（只给数据工程师）；统计失败标红，没有合并任务时显示尚未合并', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'eng@acme.com', 'data_engineer');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const eng = await loginAs(app, 'eng@acme.com');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    const ORDER = 'identity:order.customer_id->customer';
+    const EVENT = 'identity:event.customer_id->customer';
+    const edgeRow = (html: string, id: string) => html.match(new RegExp(`<tr[^>]*data-edge-id="${id}"[\\s\\S]*?</tr>`))![0];
+
+    const html = decode(await (await eng.get('/lineage')).text());
+    expect(edgeRow(html, ORDER)).toContain('data-edge-orphans="1"');
+    expect(edgeRow(html, ORDER)).toContain('1 / 11 行');
+    expect(edgeRow(html, ORDER)).toMatch(/data-samples[\s\S]*99/);
+    expect(edgeRow(html, EVENT)).toContain('data-edge-orphans="0"');
+    // 指向 _identities、_device_owner 的边不统计
+    expect(edgeRow(html, 'identity:customer.customer_id->_identities')).not.toMatch(/data-edge-(orphans|stat)/);
+    expect(html).not.toContain('尚未合并');
+
+    const forViewer = decode(await (await viewer.get('/lineage')).text());
+    expect(edgeRow(forViewer, ORDER)).toContain('data-edge-orphans="1"');
+    expect(forViewer).not.toContain('data-samples');
+
+    // 未接入的边（?all=1 才出现）不统计，也不写尚未合并
+    const all = decode(await (await eng.get('/lineage?all=1')).text());
+    expect(edgeRow(all, 'ref:order_item.order_id->order')).not.toMatch(/data-edge-(orphans|stat)/);
+    expect(all).not.toContain('尚未合并');
+
+    const [merge] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')))
+      .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
+    const result = merge.result as { relations: RelationStat[] };
+    await getDb().update(tasks).set({
+      result: { ...result, relations: result.relations.map(r => (r.from.entity === 'order' && r.from.field === 'customer_id' ? { from: r.from, ref: r.ref, error: 'boom' } : r)) },
+    }).where(eq(tasks.id, merge.id));
+    const failed = decode(await (await eng.get('/lineage')).text());
+    expect(edgeRow(failed, ORDER)).toContain('data-edge-stat="error"');
+    expect(edgeRow(failed, ORDER)).toContain('统计失败：boom');
+
+    await getDb().delete(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')));
+    const none = decode(await (await eng.get('/lineage')).text());
+    expect(edgeRow(none, ORDER)).toContain('data-edge-stat="unmerged"');
+    expect(edgeRow(none, EVENT)).toContain('data-edge-stat="unmerged"');
   });
 
   it('数据工程师打开流向图，看到各映射的源表、版本、最近一次合并与标准层表行数；合并失败的映射标红并链到合并记录', async () => {

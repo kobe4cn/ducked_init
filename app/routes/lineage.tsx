@@ -1,6 +1,7 @@
 // app/routes/lineage.tsx —— 数据地图（需登录，任何角色）：关系图画出已接入的标准层表与 _identities、_device_owner 之间的关系，
 // 图下服务端渲染一份表与关系的列表；点表节点（?node=）给出按租户湖挂载为 lake 写的示例 SQL。
-// _identities 显示匹配规则与最近一次打通的摘要（只有计数）；?all=1 时把未接入的标准实体与它们的内置关系也画出来，灰显。
+// _identities 显示匹配规则与最近一次打通的摘要（只有计数）；列表里已接入、指向标准实体的内置关系带最近一次合并后的孤儿比例，展开看行数与样例键
+// （样例键只给有 sources:read 的成员，ADR-0019/0005）；?all=1 时把未接入的标准实体与它们的内置关系也画出来，灰显。
 // 流向图（?tab=flow）画源表 → 映射 → 标准层表 → 打通表，带各映射最近一次合并与标准层表行数（取自任务结果，不查湖），图下同样有一份列表；
 // 只对有 sources:read 的成员开放，没有权限时回到关系图，源表名与映射信息都不下发。
 // 点已接入的标准层表（关系图 ?node=<entity>，流向图 ?node=silver.<entity>）在右侧抽屉列出字段明细：有 sources:read 时带各映射的源表、源列、表达式、
@@ -20,22 +21,24 @@ import { requireMember } from '~/.server/auth';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import { getInspectStatus, InspectError, inspectLakeNow } from '~/.server/lake-inspect';
-import { lastMergeByMapping, latestIdentitySummary, MappingError, type MergeHistoryEntry, publishedPlans, rebuildEntity } from '~/.server/mappings';
+import { lastMergeByMapping, latestIdentitySummary, latestRelationStats, MappingError, type MergeHistoryEntry, publishedPlans, rebuildEntity } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { identityRules } from '~/.server/pipeline/identity-engine';
 import { listSources } from '~/.server/sources';
 import { TaskError } from '~/.server/tasks';
 import type { Drift } from '~/.server/pipeline/inspect-engine';
-import { entityOf } from '~/lib/canonical-model';
+import { entityOf, type RelationStat, relationText } from '~/lib/canonical-model';
 import { deriveLineage } from '~/lib/lineage';
 import { focusGraph, type FocusInput } from '~/lib/lineage-focus';
 import { driftAttrs, driftByTable, type DriftByTable } from '~/lib/lineage-drift';
 import { entityFields, type FieldDrawer, redactFields } from '~/lib/lineage-fields';
 import { type FlowInput, type FlowMerge, silverTotals } from '~/lib/lineage-flow';
 import { type SearchHits, searchImpact, tableImpact, type TableImpact } from '~/lib/lineage-search';
-import { relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
+import { type GraphEdge, relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
 import type { SourceKind } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
+import { percent, StatLine } from '~/components/relation-stats-card';
+import { StatusText } from '~/components/status-text';
 import { DriftBadge } from '~/components/drift-badge';
 import { KindIcon } from '~/components/kind-icon';
 import { LineageDrawer, TableDrawer } from '~/components/lineage-drawer';
@@ -100,6 +103,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   const node = searchParams.get('node');
   const sql = node ? sampleSql(node, graph) : null;
   const canFlow = can(member.role, 'sources:read');
+  const edgeStats = await relationStatsByEdge(member.tenant.id, graph, canFlow);
   const tab = tabOf(request, canFlow);
   const drawerEntity = drawerEntityOf(node, connected);
   const focusParam = searchParams.get('focus');
@@ -166,10 +170,28 @@ export async function loader({ request }: Route.LoaderArgs) {
     email: member.email,
     nav: navFor(member),
     graph,
+    edgeStats,
     showAll,
     node: sql ? node : null,
     sql,
   };
+}
+
+/**
+ * 已接入、指向标准实体的内置关系边在最近一次合并后的孤儿统计（ADR-0019），按边 id；最近一次合并没有统计到的
+ * （还没合并过，或合并之后才发布的）为 unmerged。样例键是标准层里的取值，同兜底统计只给有 sources:read 的人
+ */
+async function relationStatsByEdge(tenantId: string, graph: { edges: GraphEdge[] }, withSamples: boolean) {
+  const latest = await latestRelationStats(tenantId);
+  const stats: Record<string, RelationStat> = {};
+  for (const edge of graph.edges) {
+    const ref = edge.connected && edge.fromField ? entityOf(edge.source)?.fields.find(f => f.name === edge.fromField)?.ref : undefined;
+    if (!ref) continue;
+    const relation = { from: { entity: edge.source, field: edge.fromField! }, ref };
+    const stat = latest?.relations.find(r => relationText(r) === relationText(relation)) ?? { ...relation, status: 'unmerged' as const };
+    stats[edge.id] = 'samples' in stat && !withSamples ? { ...stat, samples: [] } : stat;
+  }
+  return stats;
 }
 
 /**
@@ -200,7 +222,7 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function Lineage({ loaderData, actionData }: Route.ComponentProps) {
-  const { tab, canFlow, canWrite, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, showAll, node, sql } = loaderData;
+  const { tab, canFlow, canWrite, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, edgeStats, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
   const [rawParams] = useSearchParams();
   // 链接里不带不生效的参数：关系图没有反向查，没有 sources:read 时不开源表抽屉
@@ -312,15 +334,17 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
                   <TableHead>到</TableHead>
                   <TableHead>关系</TableHead>
                   <TableHead>说明</TableHead>
+                  <TableHead>孤儿</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {graph.edges.map(e => (
-                  <TableRow key={e.id} data-edge={e.kind} data-connected={e.connected} className={e.connected ? undefined : 'text-slate-400'}>
+                  <TableRow key={e.id} data-edge={e.kind} data-edge-id={e.id} data-connected={e.connected} className={e.connected ? undefined : 'text-slate-400'}>
                     <TableCell className="font-mono text-xs">{e.source}</TableCell>
                     <TableCell className="font-mono text-xs">{e.target}</TableCell>
                     <TableCell className={e.connected ? 'text-slate-500' : ''}>{EDGE_KINDS[e.kind]}</TableCell>
                     <TableCell className="whitespace-normal font-mono text-xs">{e.label}</TableCell>
+                    <TableCell className="whitespace-normal">{edgeStats[e.id] ? <EdgeStat stat={edgeStats[e.id]} /> : <span className="text-slate-400">—</span>}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -578,5 +602,19 @@ function ImpactSearch({ q, focus, found }: { q: string; focus: string | null; fo
       </Form>
       {found === false && <p data-no-hits className="text-sm text-slate-500">{`没有找到引用「${q}」的映射。`}</p>}
     </div>
+  );
+}
+
+/** 表与关系列表上一条内置关系的孤儿统计：收起时只有比例（或尚未合并、统计失败），展开看孤儿行数 / 有值行数与样例键 */
+function EdgeStat({ stat }: { stat: RelationStat }) {
+  if ('status' in stat) return <span data-edge-stat="unmerged"><StatLine stat={stat} /></span>;
+  if ('error' in stat) return <span data-edge-stat="error"><StatLine stat={stat} /></span>;
+  return (
+    <details data-edge-orphans={stat.orphans}>
+      <summary className="cursor-pointer">
+        <StatusText tone={stat.orphans ? 'bad' : 'ok'} className="align-middle">{percent(stat.orphans, stat.withValue)}</StatusText>
+      </summary>
+      <div className="mt-2"><StatLine stat={stat} /></div>
+    </details>
   );
 }

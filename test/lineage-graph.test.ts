@@ -29,6 +29,13 @@ describe('关系图', () => {
     expect(edge('event', 'customer')).toEqual([{ kind: 'identity', label: '经 _identities 按 (_source, customer_id) 关联' }]);
     expect(edge('customer', '_identities')).toEqual([{ kind: 'identity', label: 'customer_id → consumer_id' }]);
     expect(edge('event', '_device_owner')).toEqual([{ kind: 'device', label: 'device_id（不带 _source，取最近一次登录）' }]);
+    // 只有指向标准实体的 ref / identity 边带起点字段，用来对上合并后的孤儿统计
+    const fromField = (source: string, target: string) => g.edges.filter(e => e.source === source && e.target === target).map(e => e.fromField);
+    expect(fromField('order_item', 'order')).toEqual(['order_id']);
+    expect(fromField('order', 'customer')).toEqual(['customer_id']);
+    expect(fromField('event', 'customer')).toEqual(['customer_id']);
+    expect(fromField('customer', '_identities')).toEqual([undefined]);
+    expect(fromField('event', '_device_owner')).toEqual([undefined]);
     // 两端都已接入的边才保留
     for (const e of g.edges) {
       expect(g.nodes.some(n => n.id === e.source)).toBe(true);

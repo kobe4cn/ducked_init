@@ -22,8 +22,8 @@ export interface GraphNode {
   width: number; height: number;
 }
 
-/** connected：两端都已接入 */
-export interface GraphEdge { id: string; source: string; target: string; kind: 'ref' | 'identity' | 'device'; label: string; connected: boolean }
+/** connected：两端都已接入；fromField：起点字段，只挂在指向标准实体的 ref / identity 边上，用来对上合并后的孤儿统计（ADR-0019） */
+export interface GraphEdge { id: string; source: string; target: string; kind: 'ref' | 'identity' | 'device'; label: string; connected: boolean; fromField?: string }
 
 export interface RelationGraph { nodes: GraphNode[]; edges: GraphEdge[] }
 
@@ -65,7 +65,11 @@ export function relationGraph(input: { edges: LineageEdge[]; connected: string[]
     const label = e.kind === 'ref' ? `${e.from.field} → ${target}.${e.to.field}`
       : e.kind === 'identity' ? '经 _identities 按 (_source, customer_id) 关联'
       : 'device_id（不带 _source，取最近一次登录）';
-    edges.push({ id: `${e.kind}:${source}.${e.from.field}->${target}`, source, target, kind: e.kind, label, connected: liveIds.has(source) && liveIds.has(target) });
+    const toEntity = e.kind !== 'device' && target !== IDENTITIES && target !== DEVICE_OWNER;
+    edges.push({
+      id: `${e.kind}:${source}.${e.from.field}->${target}`, source, target, kind: e.kind, label, connected: liveIds.has(source) && liveIds.has(target),
+      ...(toEntity && { fromField: e.from.field }),
+    });
   }
   if (nodeIds.has(IDENTITIES)) {
     edges.push({ id: `identity:customer.customer_id->${IDENTITIES}`, source: 'customer', target: IDENTITIES, kind: 'identity', label: 'customer_id → consumer_id', connected: true });

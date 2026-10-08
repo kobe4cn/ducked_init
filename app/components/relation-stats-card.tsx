@@ -1,12 +1,14 @@
-// app/components/relation-stats-card.tsx —— 实体页的「已发布关系」（ADR-0019）：本实体相关的每条已发布关系在最近一次合并后的孤儿比例
+// app/components/relation-stats-card.tsx —— 实体页的「已发布关系」（ADR-0019，单条统计的显示 StatLine 数据地图也用）：本实体相关的每条已发布关系在最近一次合并后的孤儿比例
 // （起点有值、在终点主键里找不到的行占起点有值行数的比例）与样例键；起点敏感时标准层里是哈希，不给样例键（ADR-0005）
 import { StatusText } from '~/components/status-text';
 import { type RelationStat, relationText } from '~/lib/canonical-model';
 import { cn } from '~/lib/utils';
 
-const percent = (orphans: number, withValue: number) => `${withValue ? Number(((orphans / withValue) * 100).toFixed(1)) : 0}%`;
+/** 孤儿比例，保留一位小数；起点没有有值行时为 0% */
+export const percent = (orphans: number, withValue: number) => `${withValue ? Number(((orphans / withValue) * 100).toFixed(1)) : 0}%`;
 
-function StatLine({ stat }: { stat: RelationStat }) {
+/** 一条关系的统计：尚未合并、统计失败（标红），或孤儿比例（有孤儿标红）与样例键 */
+export function StatLine({ stat }: { stat: RelationStat }) {
   if ('status' in stat) return <StatusText tone="none">尚未合并</StatusText>;
   if ('error' in stat) return <StatusText tone="bad">{`统计失败：${stat.error}`}</StatusText>;
   const { withValue, orphans, samples } = stat;
