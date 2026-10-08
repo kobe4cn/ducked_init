@@ -21,7 +21,7 @@ import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
 import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
-import { CANONICAL_ENTITIES, entityLabel, entityOf, type EntityRelation, type RelationStat, relationText } from '../lib/canonical-model';
+import { CANONICAL_ENTITIES, type CustomEntityField, entityLabel, entityOf, type EntityRelation, type RelationStat, relationText } from '../lib/canonical-model';
 import { entityForTable } from '../lib/field-synonyms';
 import { diffPlans } from '../lib/mapping-diff';
 
@@ -484,14 +484,24 @@ async function pendingMerge(db: Tx | ReturnType<typeof getDb>, tenantId: string)
 }
 
 /**
- * 合并后要统计孤儿的关系：全部已发布关系（内置 ref 与已发布登记上的），带上起点是否敏感（ADR-0005，标准层里是哈希，不给样例键）：
- * 标准实体的 pii 字段、登记里标成敏感的字段，或已发布映射里标成敏感的列（x_ 字段）
+ * 合并后要统计孤儿的关系：全部已发布关系（内置 ref 与已发布登记上的），带上起点是否敏感（isSensitiveField；标准层里是哈希，不给样例键）
  */
 function relationParams(published: Map<string, RegisteredEntity>, plans: MergeMappingParam[]): RelationParam[] {
-  const sensitive = ({ entity, field }: EntityRelation['from']) => !!entityOf(entity)?.fields.find(f => f.name === field)?.pii
-    || !!published.get(entity)?.fields.find(f => f.name === field)?.sensitive
+  return allRelations(published).map(r => ({ ...r, sensitive: isSensitiveField(r.from, e => published.get(e)?.fields, plans) }));
+}
+
+/**
+ * 实体字段在标准层里是否敏感（ADR-0005，存的是哈希）：标准实体的 pii 字段、自定义实体登记（custom 给出字段）里标成敏感的字段，
+ * 或已发布映射里标成敏感的列（x_ 字段，任一映射标了就算）
+ */
+export function isSensitiveField(
+  { entity, field }: EntityRelation['from'],
+  custom: (entity: string) => readonly CustomEntityField[] | undefined,
+  plans: readonly MergeMappingParam[],
+): boolean {
+  return !!entityOf(entity)?.fields.find(f => f.name === field)?.pii
+    || !!custom(entity)?.find(f => f.name === field)?.sensitive
     || plans.some(p => p.entity === entity && p.columns.some(c => c.name === field && c.sensitive));
-  return allRelations(published).map(r => ({ ...r, sensitive: sensitive(r.from) }));
 }
 
 const lockTenant = (tx: Tx, tenantId: string) => tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');

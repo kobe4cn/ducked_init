@@ -11,7 +11,7 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { customEntities, customEntityVersions, mappings, mappingVersions, sources } from './db/schema';
-import { publishedPlans } from './mappings';
+import { isSensitiveField, publishedPlans } from './mappings';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import {
   CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, type EntityRelation, entityOf,
@@ -142,7 +142,8 @@ export function checkRegistration(input: CustomEntityInput, name = input.name?.t
 /**
  * 校验本实体 name 这一版登记的关系：终点是标准实体、本租户已发布的自定义实体（只有草稿的、包括推断出的登记草稿都不算）或本实体，
  * ref.field 是它唯一的一列主键，且与起点字段类型相同。起点是标准实体的 x_ 字段时，类型取自用了它的已发布映射（映射草稿不算），
- * 没有映射用过或各映射给的类型不同时报错。敏感字段可以作为关系的键（两端都是哈希）。
+ * 没有映射用过或各映射给的类型不同时报错。敏感字段可以作为关系的键，但两端要同为敏感或同为明文（ADR-0005：标准层里敏感字段是哈希，
+ * 只有一端敏感时永远关联不上）；本实体已发布版本里已有的关系不查敏感性（它们要原样保留，已发布的不下架）。
  * 再把本版的关系放进租户的关系图（别的实体已发布的关系、标准模型内置的 ref）检查成环。不合格时抛出 CustomEntityError
  */
 export async function checkRelations(
@@ -163,6 +164,9 @@ export async function checkRelations(
     if (types.length > 1) throw new CustomEntityError(`关系 ${relationText(r)}：各已发布的 ${r.from.entity} 映射给 ${r.from.field} 的类型不一致（${types.join('、')}）`);
     return types[0];
   };
+  // 本实体的字段取这一版登记（新加的字段还没发布）
+  const fieldsOf = (entity: string) => (entity === name ? registration.fields : published.get(entity)?.fields);
+  const publishedTexts = new Set((published.get(name)?.relations ?? []).map(relationText));
   for (const r of registration.relations) {
     const canonicalTarget = entityOf(r.ref.entity);
     const custom = r.ref.entity === name ? registration : published.get(r.ref.entity);
@@ -175,6 +179,13 @@ export async function checkRelations(
     const fromType = await typeOf(r);
     const refType = target.fields.find(f => f.name === r.ref.field)!.type;
     if (fromType !== refType) throw new CustomEntityError(`关系 ${relationText(r)} 两端类型不一致（${fromType} → ${refType}）`);
+    if (publishedTexts.has(relationText(r))) continue;
+    const allPlans = (plans ??= await publishedPlans(db, tenantId));
+    const [fromSensitive, refSensitive] = [r.from, r.ref].map(end => isSensitiveField(end, fieldsOf, allPlans));
+    if (fromSensitive !== refSensitive) {
+      const text = (sensitive: boolean) => (sensitive ? '敏感' : '明文');
+      throw new CustomEntityError(`关系 ${relationText(r)}：两端敏感性不一致（起点${text(fromSensitive)}、终点${text(refSensitive)}），标准层里无法关联`);
+    }
   }
   const edges = [
     ...[...published.values()].filter(e => e.name !== name).flatMap(e => e.relations ?? []),

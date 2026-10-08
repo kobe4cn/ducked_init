@@ -151,16 +151,16 @@ describe('自定义实体', () => {
     expect((await analyst.post(page, adopt)).status).toBe(403);
   });
 
-  it('实体页「已发布关系」显示最近一次合并后的孤儿比例与样例键：有孤儿、0 孤儿、敏感起点不给样例键；没合并过时尚未合并，编辑态与只读态都显示', async () => {
+  it('实体页「已发布关系」显示最近一次合并后的孤儿比例与样例键：有孤儿、0 孤儿、没有样例键时不显示；没合并过时尚未合并，编辑态与只读态都显示', async () => {
     const tenantId = await acme();
     const [de, admin] = [await memberOf(tenantId, 'de@acme.com'), await memberOf(tenantId, 'admin@acme.com')];
-    const field = (name: string, sensitive = false) => ({ name, type: 'string' as const, description: '', sensitive });
+    const field = (name: string) => ({ name, type: 'string' as const, description: '', sensitive: false });
     await publishCustomEntity(admin, await createCustomEntity(de, { name: 'custom_store', label: '门店', kind: 'dimension', fields: [field('store_id')], primaryKey: ['store_id'] }), 1);
     const relation = (from: string, entity: string, ref = from) => ({ from: { entity: 'custom_redeem', field: from }, ref: { entity, field: ref } });
     const [toStore, toCoupon, toCustomer] = [relation('store_id', 'custom_store'), relation('coupon_id', 'coupon'), relation('customer_id', 'customer')];
     const redeemId = await createCustomEntity(de, {
       name: 'custom_redeem', label: '核销', kind: 'fact', primaryKey: ['redeem_id'],
-      fields: [field('redeem_id'), field('store_id'), field('coupon_id'), field('customer_id', true)], relations: [toStore, toCoupon, toCustomer],
+      fields: [field('redeem_id'), field('store_id'), field('coupon_id'), field('customer_id')], relations: [toStore, toCoupon, toCustomer],
     });
     await publishCustomEntity(admin, redeemId, 1);
     const page = `/entities/${redeemId}`;
@@ -173,7 +173,7 @@ describe('自定义实体', () => {
     for (const text of [store, coupon, customer]) expect(row(before, text)).toContain('尚未合并');
     expect(before).not.toContain('data-orphans');
 
-    // 最近一次合并的结果（改 tasks.result 造出）：门店有孤儿，券没有，消费者起点敏感、没有样例键
+    // 最近一次合并的结果（改 tasks.result 造出）：门店有孤儿，券没有，消费者没有样例键（起点敏感时就是这样）
     await getDb().insert(tasks).values({
       tenantId, kind: 'silver.merge', status: 'succeeded', finishedAt: new Date(),
       result: { mappings: [], relations: [

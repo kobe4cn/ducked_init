@@ -9,7 +9,7 @@ import { allRelations, publishedCustomEntities, requireEntity } from './custom-e
 import { getDb } from './db/client';
 import { customEntityVersions } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
-import { publishedPlans } from './mappings';
+import { isSensitiveField, publishedPlans } from './mappings';
 import { openTenantLake } from './pipeline/lake-engine';
 import { SILVER } from './pipeline/merge-engine';
 import { confirmedTables } from './sources';
@@ -21,10 +21,10 @@ import { parseExpression, referencedColumns } from '../lib/mapping-expr';
 export interface SuggestInput {
   /** 本实体：推荐的关系都登记在它上面 */
   entity: string;
-  /** 候选起点字段：本实体登记的字段，标准实体的字段与已发布映射用过的 x_ 字段 */
-  origins: { entity: string; field: string; type: FieldType }[];
-  /** 候选终点：主键只有一列的实体（含本实体）与主键的类型 */
-  targets: { entity: string; key: string; type: FieldType }[];
+  /** 候选起点字段：本实体登记的字段，标准实体的字段与已发布映射用过的 x_ 字段；sensitive 是标准层里存的是不是哈希（ADR-0005） */
+  origins: { entity: string; field: string; type: FieldType; sensitive: boolean }[];
+  /** 候选终点：主键只有一列的实体（含本实体）与主键的类型、是否敏感 */
+  targets: { entity: string; key: string; type: FieldType; sensitive: boolean }[];
   /** 已有的关系：标准模型内置的 ref、已发布登记与本实体草稿上的关系 */
   existing: EntityRelation[];
   /** 取值核对的结果，按关系的展示文字（relationText）：true 是全部找到，false 是有找不到的；没有的算没核对 */
@@ -38,13 +38,13 @@ const similar = (field: string, target: { entity: string; key: string }) => {
 };
 
 /**
- * 推荐登记在本实体上的关系：本实体的字段指向别的实体，标准实体的字段指向本实体；列名相似、两端类型相同、还没登记过。
+ * 推荐登记在本实体上的关系：本实体的字段指向别的实体，标准实体的字段指向本实体；列名相似、两端类型与敏感性相同、还没登记过。
  * 取值核对出有找不到的不推荐。按候选起点的顺序
  */
 export function suggestRelations({ entity, origins, targets, existing, checks }: SuggestInput): RelationSuggestion[] {
   const known = new Set(existing.map(relationText));
   return origins.flatMap(origin => targets
-    .filter(t => (origin.entity === entity ? t.entity !== entity : t.entity === entity) && t.type === origin.type && similar(origin.field, t))
+    .filter(t => (origin.entity === entity ? t.entity !== entity : t.entity === entity) && t.type === origin.type && t.sensitive === origin.sensitive && similar(origin.field, t))
     .flatMap((t): RelationSuggestion[] => {
       const relation = { from: { entity: origin.entity, field: origin.field }, ref: { entity: t.entity, field: t.key } };
       const check = checks?.get(relationText(relation));
@@ -79,6 +79,9 @@ export async function relationSuggestions(actor: CurrentMember, entityId: string
       extensions.set(key, (extensions.get(key) ?? new Set()).add(c.type));
     }
   }
+  // 本实体的字段取最新一版登记（可能是草稿）
+  const sensitive = (entity: string, field: string) =>
+    isSensitiveField({ entity, field }, e => (e === name ? latest.fields : published.get(e)?.fields), plans);
   const origins = [
     ...latest.fields.map(f => ({ entity: name, field: f.name, type: f.type })),
     ...CANONICAL_ENTITIES.flatMap(e => e.fields.map(f => ({ entity: e.name, field: f.name, type: f.type }))),
@@ -86,9 +89,9 @@ export async function relationSuggestions(actor: CurrentMember, entityId: string
       const [entity, field] = key.split('.');
       return types.size === 1 ? [{ entity, field, type: [...types][0] }] : [];
     }),
-  ];
+  ].map(o => ({ ...o, sensitive: sensitive(o.entity, o.field) }));
   const keyed = (entity: string, key: readonly string[], fields: readonly { name: string; type: FieldType }[]) =>
-    (key.length === 1 ? [{ entity, key: key[0], type: fields.find(f => f.name === key[0])!.type }] : []);
+    (key.length === 1 ? [{ entity, key: key[0], type: fields.find(f => f.name === key[0])!.type, sensitive: sensitive(entity, key[0]) }] : []);
   const targets = [
     ...CANONICAL_ENTITIES.flatMap(e => keyed(e.name, e.key, e.fields)),
     ...[...published.values()].filter(e => e.name !== name).flatMap(e => keyed(e.name, e.primaryKey, e.fields)),

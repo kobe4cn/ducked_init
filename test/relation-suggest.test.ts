@@ -14,19 +14,19 @@ const texts = (input: SuggestInput) => suggestRelations(input).map(s => relation
 const STORE: SuggestInput = {
   entity: 'custom_store',
   origins: [
-    { entity: 'custom_store', field: 'store_id', type: 'string' },
-    { entity: 'custom_store', field: 'region_code', type: 'string' },
-    { entity: 'custom_store', field: 'customer_id', type: 'string' },
-    { entity: 'custom_store', field: 'opened_on', type: 'date' },
-    { entity: 'order', field: 'store_id', type: 'string' },
-    { entity: 'order', field: 'x_store_id', type: 'string' },
-    { entity: 'order', field: 'x_store_store_id', type: 'string' },
-    { entity: 'order', field: 'x_region_code', type: 'string' },
+    { entity: 'custom_store', field: 'store_id', type: 'string', sensitive: false },
+    { entity: 'custom_store', field: 'region_code', type: 'string', sensitive: false },
+    { entity: 'custom_store', field: 'customer_id', type: 'string', sensitive: false },
+    { entity: 'custom_store', field: 'opened_on', type: 'date', sensitive: false },
+    { entity: 'order', field: 'store_id', type: 'string', sensitive: false },
+    { entity: 'order', field: 'x_store_id', type: 'string', sensitive: false },
+    { entity: 'order', field: 'x_store_store_id', type: 'string', sensitive: false },
+    { entity: 'order', field: 'x_region_code', type: 'string', sensitive: false },
   ],
   targets: [
-    { entity: 'custom_region', key: 'code', type: 'string' },
-    { entity: 'customer', key: 'customer_id', type: 'string' },
-    { entity: 'custom_store', key: 'store_id', type: 'string' },
+    { entity: 'custom_region', key: 'code', type: 'string', sensitive: false },
+    { entity: 'customer', key: 'customer_id', type: 'string', sensitive: false },
+    { entity: 'custom_store', key: 'store_id', type: 'string', sensitive: false },
   ],
   existing: [],
 };
@@ -43,11 +43,23 @@ describe('suggestRelations', () => {
   });
 
   it('本实体的字段不指向本实体，标准实体的字段只指向本实体', () => {
-    expect(texts({ ...STORE, origins: [{ entity: 'custom_store', field: 'store_id', type: 'string' }, { entity: 'order', field: 'x_region_code', type: 'string' }] })).toEqual([]);
+    expect(texts({ ...STORE, origins: [{ entity: 'custom_store', field: 'store_id', type: 'string', sensitive: false }, { entity: 'order', field: 'x_region_code', type: 'string', sensitive: false }] })).toEqual([]);
   });
 
   it('两端类型不一致时不推荐', () => {
-    expect(texts({ ...STORE, origins: [{ entity: 'custom_store', field: 'region_code', type: 'integer' }, { entity: 'order', field: 'store_id', type: 'integer' }] })).toEqual([]);
+    expect(texts({ ...STORE, origins: [{ entity: 'custom_store', field: 'region_code', type: 'integer', sensitive: false }, { entity: 'order', field: 'store_id', type: 'integer', sensitive: false }] })).toEqual([]);
+  });
+
+  it('两端敏感性不一致时不推荐：标准层里一端是哈希，关联不上', () => {
+    const sensitive = (o: SuggestInput['origins'][number]) => ({ ...o, sensitive: o.field === 'customer_id' || o.field === 'x_store_id' });
+    expect(texts({ ...STORE, origins: STORE.origins.map(sensitive) })).toEqual([
+      'custom_store.region_code → custom_region.code',
+      'order.store_id → custom_store.store_id',
+      'order.x_store_store_id → custom_store.store_id',
+    ]);
+    // 两端都敏感照常推荐
+    const targets = STORE.targets.map(t => ({ ...t, sensitive: t.entity === 'customer' }));
+    expect(texts({ ...STORE, origins: STORE.origins.map(sensitive), targets })).toContain('custom_store.customer_id → customer.customer_id');
   });
 
   it('已有的关系（内置 ref、已发布或草稿上登记的）不再推荐', () => {

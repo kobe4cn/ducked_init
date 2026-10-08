@@ -2,6 +2,7 @@
 // 双人发布与丢弃同源视图；publishedCustomEntities 给出每个实体最新的已发布版本。关系的终点保存与发布时都校验；发布过的实体只能新增字段与关系；
 // deleteCustomEntity 删除没被已发布映射引用的实体；draftFor 按已发布登记生成自定义实体的映射草稿；inferCustomEntityDrafts 为已发布映射在用、但没登记的实体推断登记草稿；
 // relationSuggestions 按列名与取值包含推荐关系，adoptRelation 把推荐的关系采纳进登记草稿
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import {
@@ -9,7 +10,7 @@ import {
   publishedCustomEntities, saveCustomEntityDraft, type CustomEntityInput,
 } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { customEntities } from '../../app/.server/db/schema';
+import { customEntities, customEntityVersions } from '../../app/.server/db/schema';
 import type { EntityRelation } from '../../app/lib/canonical-model';
 import { createMapping, draftFor, getMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -186,6 +187,13 @@ describe('关系', () => {
     ...STORE, fields: [...STORE.fields, { name: 'region_id', type: 'string', description: '', sensitive: false }], relations: [toRegion],
   };
 
+  /** 主键标了敏感的实体：标准层里主键是哈希 */
+  const VAULT: CustomEntityInput = {
+    name: 'custom_vault', label: '保险柜', kind: 'dimension', primaryKey: ['vault_id'],
+    fields: [{ name: 'vault_id', type: 'string', description: '', sensitive: true }],
+  };
+  const toVault: EntityRelation = { from: { entity: 'custom_store', field: 'manager_phone' }, ref: { entity: 'custom_vault', field: 'vault_id' } };
+
   /** 两位数据工程师，大区已登记并发布 */
   async function withRegion() {
     const people = await engineers();
@@ -200,7 +208,7 @@ describe('关系', () => {
     const toCustomer: EntityRelation = { from: { entity: 'custom_redeem', field: 'customer_id' }, ref: { entity: 'customer', field: 'customer_id' } };
     const redeemId = await createCustomEntity(author, {
       name: 'custom_redeem', label: '核销', kind: 'fact',
-      fields: [{ name: 'redeem_id', type: 'string', description: '', sensitive: false }, { name: 'customer_id', type: 'string', description: '', sensitive: true }],
+      fields: [{ name: 'redeem_id', type: 'string', description: '', sensitive: false }, { name: 'customer_id', type: 'string', description: '', sensitive: false }],
       primaryKey: ['redeem_id'],
       // 起点不写实体时就是本实体
       relations: [{ from: { entity: '', field: 'customer_id' }, ref: toCustomer.ref }],
@@ -214,8 +222,9 @@ describe('关系', () => {
     expect(published.get('custom_region')?.relations).toEqual([]);
   });
 
-  it('起点字段没登记、终点不存在或没发布、终点不是单列主键、两端类型不一致时报错，什么也不保存', async () => {
+  it('起点字段没登记、终点不存在或没发布、终点不是单列主键、两端类型或敏感性不一致时报错，什么也不保存', async () => {
     const { author, reviewer } = await withRegion();
+    await publishCustomEntity(reviewer, await createCustomEntity(author, VAULT), 1);
     // 只有草稿的实体不能作终点
     await createCustomEntity(author, { ...REGION, name: 'custom_zone' });
     await createCustomEntity(author, {
@@ -235,17 +244,45 @@ describe('关系', () => {
       [rel('region_id', 'customer', 'phone'), /phone 不是 customer 的主键（customer_id）/],
       [{ ...STORE_IN_REGION, fields: [...STORE.fields, { name: 'region_id', type: 'integer', description: '', sensitive: false }] }, /类型不一致.*integer.*string/],
       [rel('opened_on', 'customer', 'customer_id'), /类型不一致/],
+      [rel('manager_phone', 'customer', 'customer_id'), /^关系 custom_store\.manager_phone → customer\.customer_id：两端敏感性不一致（起点敏感、终点明文），标准层里无法关联$/],
+      [rel('region_id', 'custom_vault', 'vault_id'), /^关系 custom_store\.region_id → custom_vault\.vault_id：两端敏感性不一致（起点明文、终点敏感），标准层里无法关联$/],
     ];
     for (const [patch, message] of rejected) {
       const error = await createCustomEntity(author, { ...STORE_IN_REGION, ...patch }).then(() => '已保存', (e: Error) => e.message);
       expect(error, JSON.stringify(patch)).toMatch(message);
     }
-    expect((await listCustomEntities(author)).map(e => e.name)).toEqual(['custom_cell', 'custom_region', 'custom_zone']);
+    expect((await listCustomEntities(author)).map(e => e.name)).toEqual(['custom_cell', 'custom_region', 'custom_vault', 'custom_zone']);
 
     // 终点主键有两列：草稿的复合主键不算（没发布），发布后报「单列主键」
     const cell = (await listCustomEntities(author)).find(e => e.name === 'custom_cell')!;
     await publishCustomEntity(reviewer, cell.id, 1);
     await expect(createCustomEntity(author, { ...STORE_IN_REGION, ...rel('region_id', 'custom_cell', 'region_id') })).rejects.toThrow(/custom_cell 的主键有多列/);
+  });
+
+  it('两端都敏感的关系照常保存、发布', async () => {
+    const { acme, author, reviewer } = await withRegion();
+    await publishCustomEntity(reviewer, await createCustomEntity(author, VAULT), 1);
+    const storeId = await createCustomEntity(author, { ...STORE_IN_REGION, relations: [toRegion, toVault] });
+    await publishCustomEntity(reviewer, storeId, 1);
+    expect((await publishedCustomEntities(getDb(), acme)).get('custom_store')?.relations).toEqual([toRegion, toVault]);
+  });
+
+  it('已发布的敏感性不一致的关系不拦：照原样保留时能加字段、保存并发布；新加的不一致关系照样拒绝', async () => {
+    const { acme, author, reviewer } = await withRegion();
+    const storeId = await createCustomEntity(author, STORE_IN_REGION);
+    await publishCustomEntity(reviewer, storeId, 1);
+    // 校验上线前发布的不一致关系：敏感的 manager_phone → 明文的 customer.customer_id
+    const legacy: EntityRelation = { from: { entity: 'custom_store', field: 'manager_phone' }, ref: { entity: 'customer', field: 'customer_id' } };
+    await getDb().update(customEntityVersions).set({ relations: [toRegion, legacy] }).where(eq(customEntityVersions.entityId, storeId));
+
+    const fields = [...STORE_IN_REGION.fields, { name: 'note', type: 'string' as const, description: '', sensitive: false }];
+    expect(await saveCustomEntityDraft(author, storeId, { ...STORE_IN_REGION, fields, relations: [toRegion, legacy] })).toBe(2);
+    await publishCustomEntity(reviewer, storeId, 2);
+    expect((await publishedCustomEntities(getDb(), acme)).get('custom_store')?.fields.map(f => f.name)).toContain('note');
+
+    const another: EntityRelation = { from: { entity: 'customer', field: 'phone' }, ref: { entity: 'custom_store', field: 'store_id' } };
+    await expect(saveCustomEntityDraft(author, storeId, { ...STORE_IN_REGION, fields, relations: [toRegion, legacy, another] }))
+      .rejects.toThrow('关系 customer.phone → custom_store.store_id：两端敏感性不一致（起点敏感、终点明文），标准层里无法关联');
   });
 
   it('发布时再校验终点：保存后终点被删就发布不了', async () => {
@@ -273,8 +310,9 @@ describe('关系', () => {
     }
     expect((await getCustomEntity(author, storeId)).draft).toBeNull();
 
-    const toCustomer: EntityRelation = { from: { entity: 'custom_store', field: 'manager_phone' }, ref: { entity: 'customer', field: 'customer_id' } };
-    expect(await saveCustomEntityDraft(author, storeId, { ...STORE_IN_REGION, relations: [toCustomer, toRegion] })).toBe(2);
+    const toCustomer: EntityRelation = { from: { entity: 'custom_store', field: 'customer_id' }, ref: { entity: 'customer', field: 'customer_id' } };
+    const fields = [...STORE_IN_REGION.fields, { name: 'customer_id', type: 'string' as const, description: '', sensitive: false }];
+    expect(await saveCustomEntityDraft(author, storeId, { ...STORE_IN_REGION, fields, relations: [toCustomer, toRegion] })).toBe(2);
     await publishCustomEntity(reviewer, storeId, 2);
     expect((await publishedCustomEntities(getDb(), acme)).get('custom_store')?.relations).toEqual([toCustomer, toRegion]);
   });
