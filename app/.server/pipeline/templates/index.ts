@@ -4,6 +4,8 @@ import { compileRfm, parseRfmDefinition, parseRfmParams, RFM_DEFAULTS, type RfmP
 
 export interface Template<P, D = Partial<P>> {
   label: string;
+  /** 模板读到的实体（含维度路径上经过的实体）：登记快照时查这些实体的映射有没有合并失败 */
+  entities: readonly string[];
   /** 除必填参数以外的默认参数 */
   defaults: D;
   /** 校验任务参数并补上默认值，不合法时抛出说明原因的错误 */
@@ -15,5 +17,6 @@ export interface Template<P, D = Partial<P>> {
 }
 
 export const TEMPLATES = {
-  rfm: { label: 'RFM 分层', defaults: RFM_DEFAULTS, parse: parseRfmParams, parseDefinition: parseRfmDefinition, compile: compileRfm } satisfies Template<RfmParams, Omit<RfmParams, 'asOf'>>,
+  // customer：RFM 按 _identities 归到统一消费者，_identities 由 customer 映射算出
+  rfm: { label: 'RFM 分层', entities: ['order', 'customer'], defaults: RFM_DEFAULTS, parse: parseRfmParams, parseDefinition: parseRfmDefinition, compile: compileRfm } satisfies Template<RfmParams, Omit<RfmParams, 'asOf'>>,
 };

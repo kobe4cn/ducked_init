@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."snapshots" ADD COLUMN "incomplete" jsonb;

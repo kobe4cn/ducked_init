@@ -53,6 +53,24 @@ describe('分析页', () => {
     for (const text of [listHtml, html, consumers]) for (const p of PLAINTEXT) expect(text).not.toContain(p);
   });
 
+  it('登记时有映射合并失败的快照标「数据不完整」，列出源表、实体、原因摘要与数据停在的时间；完整的快照不标', async () => {
+    const { acme, snapshot } = await rfmSnapshot();
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+    expect(await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text()).not.toContain('data-snapshot-incomplete');
+
+    const lastSuccessAt = '2024-06-30T08:00:00.000Z';
+    await getDb().update(snapshots).set({ incomplete: [
+      { mapping: '00000000-0000-0000-0000-000000000001', entity: 'order', table: 'orders', error: '字段 status 有值字典里没有的取值', lastSuccessAt },
+      { mapping: '00000000-0000-0000-0000-000000000002', entity: 'customer', table: 'members', error: '源表读取失败', lastSuccessAt: null },
+    ] }).where(eq(snapshots.id, snapshot.id));
+    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
+    expect(html).toContain('data-snapshot-incomplete');
+    expect(html).toContain('数据不完整');
+    expect(html).toContain('源表 orders → order：字段 status 有值字典里没有的取值，数据停在 ');
+    expect(html).toContain('源表 members → customer：源表读取失败，从未成功合并');
+  });
+
   it('其他租户的快照返回 404，也不出现在它的列表里', async () => {
     const { snapshot } = await rfmSnapshot();
     const globex = await newTenant('globex');

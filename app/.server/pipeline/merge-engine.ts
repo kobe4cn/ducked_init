@@ -59,6 +59,7 @@ export type MergeRecord = { mapping: string; entity: string; table: string; vers
   }
   /** skipped：源表还没有同步进原始层，等首次同步后再合并（不算失败） */
   | { skipped: string }
+  /** 报错原文（已 redact）。第一个全角冒号「：」之前不放取值：快照登记时只留这部分作原因摘要（snapshots.ts summarizeMergeError） */
   | { error: string }
 );
 

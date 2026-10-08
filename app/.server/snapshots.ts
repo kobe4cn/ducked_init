@@ -1,13 +1,16 @@
 // app/.server/snapshots.ts —— 结果快照：分析模板任务成功后，调度器把它写进结果层的那张表登记到平台元数据（模板、参数、任务、表名、行数，
 // 创建后 90 天过期）；数据仍只在租户数据湖里（ADR-0002）。分析页列出本租户的快照，打开时在请求内只读挂载本租户的数据湖读取，
-// 快照表只有 consumer_id 与分值，没有明文（ADR-0005）。到期后调度器为每个租户入队 gold.expire 删表并清理湖里的旧文件，成功后标记 expiredAt。
+// 快照表只有 consumer_id 与分值，没有明文（ADR-0005）。登记时模板读到的实体有已发布映射在任务开始前最近一次合并失败的，照常登记，
+// 但在快照上记下这些映射（数据不完整），原因只留摘要、不带源端取值。到期后调度器为每个租户入队 gold.expire 删表并清理湖里的旧文件，成功后标记 expiredAt。
 // 一律限定在给定租户内
-import { and, desc, eq, inArray, isNull, lte } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, lte, sql, type SQL } from 'drizzle-orm';
 import type { Tx } from './audit';
 import { getDb } from './db/client';
-import { snapshots, tasks, tenants } from './db/schema';
+import { snapshots, tasks, tenants, type IncompleteMapping } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
+import { publishedPlans } from './mappings';
 import { openTenantLake } from './pipeline/lake-engine';
+import type { MergeRecord } from './pipeline/merge-engine';
 import { insertTask } from './tasks';
 import { TEMPLATES } from './pipeline/templates';
 import type { RfmParams } from './pipeline/templates/rfm';
@@ -28,22 +31,58 @@ export class SnapshotError extends Error {
 }
 
 /**
- * 分析模板任务成功后登记它的快照（任务结果里的 table、rows、params，任务参数里的模板定义版本 definitionVersion）；
- * 任务没有成功（如已被判为中断）或已登记过时什么也不做
+ * 分析模板任务成功后登记它的快照（任务结果里的 table、rows、params，任务参数里的模板定义版本 definitionVersion），
+ * 并记下任务开始前模板读到的实体里最近一次合并失败的映射（incompleteMappings）；任务没有成功（如已被判为中断）或已登记过时什么也不做
  */
 export async function registerSnapshot(tenantId: string, taskId: string, template: SnapshotTemplate) {
   const db = getDb();
-  const [task] = await db.select({ status: tasks.status, params: tasks.params, result: tasks.result }).from(tasks)
+  const [task] = await db.select({ status: tasks.status, params: tasks.params, result: tasks.result, startedAt: tasks.startedAt }).from(tasks)
     .where(and(eq(tasks.id, taskId), eq(tasks.tenantId, tenantId)));
   if (task?.status !== 'succeeded' || !task.result) return;
   const { table, rows, params } = task.result as { table: string; rows: number; params: Record<string, unknown> };
   const { definitionVersion } = task.params as { definitionVersion?: unknown };
+  const incomplete = await incompleteMappings(tenantId, TEMPLATES[template].entities, task.startedAt ?? new Date());
   const createdAt = new Date();
   await db.insert(snapshots).values({
     tenantId, template, taskId, table, params, rowCount: rows, createdAt,
+    incomplete: incomplete.length ? incomplete : null,
     definitionVersion: Number.isInteger(definitionVersion) ? definitionVersion as number : null,
     expiresAt: new Date(createdAt.getTime() + SNAPSHOT_RETENTION_DAYS * 24 * 60 * 60 * 1000),
   }).onConflictDoNothing({ target: snapshots.taskId });
+}
+
+/**
+ * 这些实体的已发布映射里，在 before 之前结束的合并中最近一次（跳过的不算，也不盖掉之前的结果）失败了的映射，
+ * 带原因摘要与这个映射最近一次成功合并的任务的结束时间。按每个映射自己的记录判断，不看任务状态；没有 result.mappings 的合并任务不算
+ */
+export async function incompleteMappings(tenantId: string, entities: readonly string[], before: Date): Promise<IncompleteMapping[]> {
+  const ids = (await publishedPlans(getDb(), tenantId)).filter(p => entities.includes(p.entity)).map(p => p.mapping);
+  if (!ids.length) return [];
+  // 映射 m.id 在 before 之前结束的合并里最近一条满足 recordFilter 的记录（FROM 起的子查询主体）
+  const latestRecordWhere = (recordFilter: SQL) => sql`
+    FROM ${tasks} t, jsonb_array_elements(t.result->'mappings') rec
+    WHERE t.tenant_id = ${tenantId} AND t.kind = 'silver.merge' AND t.finished_at <= ${before.toISOString()}::timestamptz
+      AND rec->>'mapping' = m.id::text AND ${recordFilter}
+    ORDER BY t.created_at DESC, t.id DESC LIMIT 1`;
+  const { rows } = await getDb().execute<{ record: MergeRecord & { error: string }; last_success_at: string | Date | null }>(sql`
+    SELECT f.record, s.finished_at AS last_success_at FROM unnest(ARRAY[${sql.join(ids.map(id => sql`${id}`), sql`, `)}]::uuid[]) m(id)
+    CROSS JOIN LATERAL (SELECT rec AS record ${latestRecordWhere(sql`NOT rec ? 'skipped'`)}) f
+    LEFT JOIN LATERAL (SELECT t.finished_at ${latestRecordWhere(sql`rec ? 'rows'`)}) s ON true
+    WHERE f.record ? 'error'
+    ORDER BY m.id`);
+  return rows.map(({ record: { mapping, entity, table, error }, last_success_at }) => ({
+    mapping, entity, table, error: summarizeMergeError(error),
+    lastSuccessAt: last_success_at === null ? null : new Date(last_success_at).toISOString(),
+  }));
+}
+
+/**
+ * 合并报错的摘要：只留第一个全角冒号之前的部分（冒号后是取值，如主键冲突时没有引号的键值、值字典缺失的取值），
+ * 截到 120 字。原文写进任务前已在工作进程里 redact 过，这里再去掉取值
+ */
+export function summarizeMergeError(message: string) {
+  const colon = message.indexOf('：');
+  return (colon < 0 ? message : message.slice(0, colon)).slice(0, 120);
 }
 
 /**

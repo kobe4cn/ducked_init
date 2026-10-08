@@ -1,6 +1,7 @@
 // app/routes/analytics.snapshots.$id.tsx —— RFM 快照结果（有结果层查看权限的成员）：各人群的人数与金额（?tab=segments），
-// 按 consumer_id 分页的消费者明细（?tab=consumers&page=N）。每次请求只读挂载本租户的数据湖读取；页面上只有 consumer_id 与分值，没有明文。
+// 按 consumer_id 分页的消费者明细（?tab=consumers&page=N）。登记时有映射最近一次合并失败的快照标「数据不完整」，列出失败的映射。每次请求只读挂载本租户的数据湖读取；页面上只有 consumer_id 与分值，没有明文。
 // 其他租户的快照、已过期的快照返回 404
+import { AlertTriangle } from 'lucide-react';
 import { data, Link } from 'react-router';
 import type { Route } from './+types/analytics.snapshots.$id';
 import { requirePermission } from '~/.server/access';
@@ -8,6 +9,7 @@ import { navFor } from '~/.server/nav';
 import { TEMPLATES } from '~/.server/pipeline/templates';
 import { CONSUMER_PAGE_SIZE, getSnapshot, readRfmSnapshot, SnapshotError } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
+import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { StatTile } from '~/components/stat-tile';
@@ -44,6 +46,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         rowCount: snapshot.rowCount,
         createdAt: snapshot.createdAt.toISOString(),
         expiresAt: snapshot.expiresAt.toISOString(),
+        incomplete: snapshot.incomplete,
       },
       ...result,
     };
@@ -67,6 +70,23 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
         title={`${snapshot.templateLabel} · ${snapshot.asOf}`}
         description={<><Link to="/analytics" className="hover:underline">← 全部快照</Link>{`　回看 ${snapshot.lookbackDays} 天，创建于 ${date(snapshot.createdAt)}，${date(snapshot.expiresAt)} 过期`}</>}
       />
+
+      {snapshot.incomplete && (
+        <Alert role="status" data-snapshot-incomplete className="border-amber-200 bg-amber-50 text-amber-900">
+          <AlertTriangle className="text-amber-600" />
+          <AlertTitle>数据不完整</AlertTitle>
+          <AlertDescription>
+            <p>计算时以下映射最近一次合并失败，结果没有包含它们最新的数据：</p>
+            <ul className="list-disc pl-5">
+              {snapshot.incomplete.map(m => (
+                <li key={m.mapping} data-incomplete-mapping={m.mapping}>
+                  {`源表 ${m.table} → ${m.entity}：${m.error}，${m.lastSuccessAt ? `数据停在 ${new Date(m.lastSuccessAt).toLocaleString('zh-CN')}` : '从未成功合并'}`}
+                </li>
+              ))}
+            </ul>
+          </AlertDescription>
+        </Alert>
+      )}
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatTile label="消费者" value={snapshot.rowCount.toLocaleString('zh-CN')} hint="打通后的统一消费者" />
