@@ -12,6 +12,8 @@ import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { IDENTITIES } from './identity-engine';
 import { TEMPLATES } from './templates';
 import { compileRfmUnlinked } from './templates/rfm';
+import { assertOrThrow, runAssertions } from './assertions';
+import { PartialFailure } from './partial-failure';
 
 type Params = Record<string, unknown>;
 type Result = Record<string, unknown>;
@@ -28,10 +30,6 @@ export interface TaskContext { taskId: string; limits: EngineLimits; source?: So
  */
 interface Handler { label: string; attachSource?: boolean; readOnlyLake?: boolean; run(con: DuckDBConnection, params: Params, ctx: TaskContext): Promise<Result> }
 
-/** 任务部分完成：记为失败，同时保留已完成部分的结果 */
-export class PartialFailure extends Error {
-  constructor(message: string, readonly result: Result) { super(message); }
-}
 
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 
@@ -237,7 +235,8 @@ export const HANDLERS = {
   },
   // RFM 分层：按参数（asOf 必填，其余取模板默认值）把打通后的统一消费者的订单编译成 R/F/M 分与人群，
   // 写进结果层的一张快照表 gold."rfm__<任务 ID>"，只有 consumer_id 与分值，没有明文。打通不到消费者的订单不计入，结果里报告条数。
-  // 发布模板定义后入队的任务带上定义版本 definitionVersion（登记快照时记下），其余参数是定义的参数加上 asOf；也可以直接给参数、不带版本
+  // 发布模板定义后入队的任务带上定义版本 definitionVersion（登记快照时记下），其余参数是定义的参数加上 asOf；也可以直接给参数、不带版本。
+  // 计算前先对读到的实体跑内置断言（ADR-0026），error 级失败时任务失败、不写快照表；结果带全部断言 assertions
   'gold.rfm': {
     label: TEMPLATES.rfm.label,
     async run(con, params, { taskId }) {
@@ -249,15 +248,18 @@ export const HANDLERS = {
       const has = (name: string) => present.some(t => t.name === name);
       if (!has('order')) throw new Error('标准层还没有订单（silver.order）：先发布 order 映射并合并');
       if (!has('_identities')) throw new Error(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`);
+      const assertions = await runAssertions(con, TEMPLATES.rfm.entities);
+      assertOrThrow(assertions);
       const name = `rfm__${taskId}`;
       await con.run(`CREATE SCHEMA IF NOT EXISTS gold; CREATE TABLE gold."${name}" AS ${TEMPLATES.rfm.compile(rfm)}`);
       const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM gold."${name}"`);
       const [{ n: unlinked }] = await rows<{ n: string }>(con, compileRfmUnlinked(rfm));
-      return { table: `gold.${name}`, rows: Number(n), unlinkedOrders: Number(unlinked), params: rfm };
+      return { table: `gold.${name}`, rows: Number(n), unlinkedOrders: Number(unlinked), params: rfm, assertions };
     },
   },
   // 指标或标签（ADR-0025）：发布定义时入队，参数里带上入队时按当天编译好的 SQL 与它用到的实体（不再访问平台库）。
-  // 标准层有这些实体与身份打通结果时，把 SQL 的结果写进结果层的一张快照表 gold."<种类>__<任务 ID>"，只有 consumer_id、维度与值
+  // 标准层有这些实体与身份打通结果时，把 SQL 的结果写进结果层的一张快照表 gold."<种类>__<任务 ID>"，只有 consumer_id、维度与值。
+  // 断言同 gold.rfm
   'gold.dsl': {
     label: '指标与标签',
     async run(con, params, { taskId }) {
@@ -271,10 +273,12 @@ export const HANDLERS = {
       const missing = entities.filter(entity => !present.has(entity));
       if (missing.length) throw new Error(`标准层还没有 ${missing.map(entity => `silver.${entity}`).join('、')}：先发布 ${missing.join('、')} 的映射并合并`);
       if (!present.has('_identities')) throw new Error(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`);
+      const assertions = await runAssertions(con, entities);
+      assertOrThrow(assertions);
       const name = `${kind}__${taskId}`;
       await con.run(`CREATE SCHEMA IF NOT EXISTS gold; CREATE TABLE gold."${name}" AS ${sql}`);
       const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM gold."${name}"`);
-      return { table: `gold.${name}`, rows: Number(n), params: { kind, key, asOf, definitionVersion } };
+      return { table: `gold.${name}`, rows: Number(n), params: { kind, key, asOf, definitionVersion }, assertions };
     },
   },
   // 快照过期：删掉参数里到期快照的表（已删的跳过，重复执行不报错），再按 ADR-0020 擦除湖里的数据：

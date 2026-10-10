@@ -128,11 +128,11 @@ export const operatorSessions = platform.table('operator_sessions', {
   createdAt: createdAt(),
 });
 
-export const ACTOR_TYPES = ['member', 'operator'] as const;
+export const ACTOR_TYPES = ['member', 'operator', 'system'] as const;
 export type ActorType = (typeof ACTOR_TYPES)[number];
 
 // 审计日志：只追加。操作者邮箱在写入时留存，成员被移除后记录仍可追溯。
-// 操作者是运营者时 actor_type 为 operator（经运营命令操作时没有运营者身份，邮箱为空）；
+// 操作者是运营者时 actor_type 为 operator（经运营命令操作时没有运营者身份，邮箱为空）；平台自己发现的事件（如断言失败）为 system；
 // 与租户无关的平台级事件 tenant_id 为空，只在运营后台可见
 export const auditLogs = platform.table('audit_logs', {
   id: uuid('id').primaryKey().defaultRandom(),

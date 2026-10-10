@@ -1,6 +1,7 @@
 // app/.server/pipeline/worker.ts —— 工作进程入口：由调度器为每个任务单独启动，执行完即退出（ADR-0001）。
 // 通过 IPC 收到任务（类型、参数、本租户数据湖的凭据、配额），回传结果或错误。环境变量里没有平台 PG 的连接串
-import { HANDLERS, PartialFailure, type TaskKind } from './handlers';
+import { HANDLERS, type TaskKind } from './handlers';
+import { PartialFailure } from './partial-failure';
 import { openTenantLake, redactLakeSecrets, type EngineLimits, type LakeSpec } from './lake-engine';
 import { redactSourceSecrets, type SourceSpec } from './source-engine';
 

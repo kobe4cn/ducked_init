@@ -132,6 +132,11 @@ const ACTIONS = {
       `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，主键 ${Object.entries(d.key as Record<string, string>).map(([k, v]) => `${k} = ${v}`).join('，')}，`
       + `字段 ${(d.fields as string[]).join('、')}；原因：${d.reason}`,
   },
+  // 平台在结果层任务计算前发现的数据质量问题（ADR-0026）：只记断言名、实体与行数，不记行内容
+  'assertion.failed': {
+    label: '断言失败',
+    describe: (d: Detail) => `${d.task}：${(d.summaries as string[]).join('；')}，未产出新快照，继续使用上一版`,
+  },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },
@@ -156,13 +161,17 @@ export type AuditEntry = {
   | { tenantId: string; actor: Pick<CurrentMember, 'memberId' | 'email'> }
   /** 运营者的操作；tenantId 为 null 表示与租户无关的平台级事件 */
   | { tenantId: string | null; operator: OperatorActor }
+  /** 平台自己发现的事件，没有操作者 */
+  | { tenantId: string; system: true }
 );
 
 /** 与被审计的变更放在同一事务里写入：变更成功则一定留下记录 */
 export async function recordAudit(tx: Tx | Db, entry: AuditEntry) {
   const actor = 'actor' in entry
     ? { actorType: 'member' as const, actorMemberId: entry.actor.memberId, actorEmail: entry.actor.email }
-    : { actorType: 'operator' as const, actorOperatorId: entry.operator?.operatorId ?? null, actorEmail: entry.operator?.email ?? null };
+    : 'system' in entry
+      ? { actorType: 'system' as const }
+      : { actorType: 'operator' as const, actorOperatorId: entry.operator?.operatorId ?? null, actorEmail: entry.operator?.email ?? null };
   await tx.insert(auditLogs).values({
     tenantId: entry.tenantId,
     ...actor,
@@ -180,7 +189,7 @@ function present(r: AuditRow) {
   return {
     id: r.id,
     at: r.createdAt,
-    actor: r.actorType === 'operator' ? (r.actorEmail ? `运营者 ${r.actorEmail}` : '运营者（运营命令）') : (r.actorEmail ?? ''),
+    actor: r.actorType === 'operator' ? (r.actorEmail ? `运营者 ${r.actorEmail}` : '运营者（运营命令）') : r.actorType === 'system' ? '平台' : (r.actorEmail ?? ''),
     action: action?.label ?? r.action,
     summary: action ? action.describe(r.detail) : JSON.stringify(r.detail),
   };
