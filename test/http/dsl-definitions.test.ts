@@ -2,7 +2,9 @@
 // 校验不通过时按行列列出问题；分析页「新建标签」进到标签种类的新建页；查看者看不到「新建指标」、打不开新建页、提交 403；分析页里 metric: 快照链接到定义页；
 // 定义页点「预览」展示前 50 行与总行数（查看者也能预览），标准层缺表时给出说明，不存在的定义 404；有草稿且已发布过时点「预览影响」展示指标与下游标签的变化人数；
 // 版本表里发布不了的成员看到原因，另一位数据工程师发布后入队 gold.dsl；丢弃草稿回到已发布版本，从没发布过时回到分析页；
-// 数据工程师看到「删除」按钮（分析师看不到、提交 403），被已发布标签引用的指标删不了，删除后回到分析页
+// 数据工程师看到「删除」按钮（分析师看不到、提交 403），被已发布标签引用的指标删不了，删除后回到分析页；
+// 有早于生效版本的快照时数据工程师点「回刷」入队按旧统计日的计算，分析师在按钮处看到原因、提交 403
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks } from '../../app/.server/db/schema';
@@ -221,5 +223,38 @@ describe('指标与标签定义页', () => {
     expect(await (await engineer.get(metric)).text()).toContain('删除指标');
     expect((await engineer.post(metric, { intent: 'delete' })).headers.get('location')).toBe('/analytics');
     expect((await engineer.get(metric)).status).toBe(404);
+  });
+
+  it('有早于生效版本的快照时显示可回刷的张数，数据工程师点「回刷」按旧统计日入队；分析师在按钮处看到原因、提交 403', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const author = await memberOf(acme, 'de@acme.com', 'data_engineer');
+    const reviewer = await memberOf(acme, 'de2@acme.com', 'data_engineer');
+    await createDefinition(author, 'metric', 'revenue', REVENUE);
+    const first = await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    // 第 1 版在 2024-07-15 算过一张快照
+    await getDb().insert(snapshots).values({
+      tenantId: acme, template: 'metric:revenue', definitionVersion: 1, taskId: first.id, table: `gold.metric__${first.id}`,
+      params: { kind: 'metric', key: 'revenue', asOf: '2024-07-15', definitionVersion: 1 }, rowCount: 1, expiresAt: new Date(Date.now() + 86_400_000),
+    });
+    const path = '/analytics/definitions/metric/revenue';
+    expect(await (await loginAs(app, 'de@acme.com').then(b => b.get(path))).text()).toMatch(/data-backfill-count[^>]*>没有需要回刷的快照/);
+    await saveDslDraft(author, 'metric', 'revenue', REVENUE.replace('sum', 'avg'));
+    await publishDefinition(reviewer, 'metric', 'revenue', 2);
+    await getDb().update(tasks).set({ status: 'succeeded' });
+
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    expect(await (await analyst.get(path)).text()).toMatch(/data-backfill-denied[^>]*>.*?仅管理员、数据工程师可以发布映射与定义/s);
+    expect((await analyst.post(path, { intent: 'backfill' })).status).toBe(403);
+
+    const engineer = await loginAs(app, 'de@acme.com');
+    expect(await (await engineer.get(path)).text()).toMatch(/data-backfill-count[^>]*>1 张未过期的快照早于生效的第 2 版（统计日 2024-07-15）/);
+    const backfilled = await engineer.post(path, { intent: 'backfill' });
+    expect(backfilled.headers.get('location')).toBe(`${path}?backfilled=1`);
+    expect(await (await engineer.get(`${path}?backfilled=1`)).text()).toContain('已按 1 个统计日入队回刷');
+    const queued = await getDb().select({ params: tasks.params }).from(tasks).where(eq(tasks.status, 'queued'));
+    expect(queued.map(t => [t.params.key, t.params.definitionVersion, t.params.asOf])).toEqual([['revenue', 2, '2024-07-15']]);
+    // 已在排队：再点给出原因
+    expect(await (await engineer.post(path, { intent: 'backfill' })).text()).toContain('已有计算在排队或运行中');
   });
 });

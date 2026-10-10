@@ -87,6 +87,13 @@ const ACTIONS = {
     describe: (d: Detail) => `${dslLabel(d)} ${d.key}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '定义已删除'}`,
   },
   'definition.deleted': { label: '删除指标或标签', describe: (d: Detail) => `${dslLabel(d)} ${d.key}` },
+  'definition.backfilled': {
+    label: '回刷指标或标签',
+    describe: (d: Detail) => {
+      const tags = d.tags as string[];
+      return `${dslLabel(d)} ${d.key}，按第 ${d.version} 版回刷 ${(d.days as string[]).join('、')}${tags.length ? `，连同标签 ${tags.join('、')}` : ''}`;
+    },
+  },
   'template.published': {
     label: '发布模板参数',
     describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,

@@ -2,18 +2,20 @@
 // 键在租户与种类内唯一；每个定义同时只有一份草稿，再次保存改的是同一份，记下作者与最后保存的人，之后按映射同样的规则双人发布（ADR-0015）。
 // 校验对照本租户已发布的自定义实体登记与已发布映射的扩展字段（标签另对照各指标最新的已发布版本）；定义页展示编译出的 SQL，并可在只读挂载的数据湖上预览前 50 行，
 // 有草稿且有已发布版本时还能预览发布的影响（两版结果按消费者对比，只给计数）。
-// 发布后版本锁定，并以当天为 asOf 入队一次 gold.dsl（编译在入队时完成，SQL 进任务参数），成功后登记为一张快照（template 为 <种类>:<键>）。
+// 发布后版本锁定，并以当天为 asOf 入队一次 gold.dsl（编译在入队时完成，SQL 进任务参数），成功后登记为一张快照（template 为 <种类>:<键>）；
+// 发布指标时同一事务里另为引用它的每个已发布标签入队一次（标签 SQL 内联刚发布的指标）。已有快照不动；有发布权限的成员可手动回刷：
+// 早于生效版本的未过期快照按各自的 asOf 以生效版本重算（指标连同下游标签），本定义已有任务在排队或运行时拒绝。
 // 有修改与删除权限的成员可以删除定义；被已发布标签引用的指标不能删（依赖由已发布版本按需解析，dsl-dependencies.ts）。
 // 一律限定在操作者所属租户内
 import type { DuckDBConnection } from '@duckdb/node-api';
-import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
+import { and, desc, eq, getTableColumns, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { publishedCustomEntities } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { publishedTagsOf, publishedTagsReferencing } from './dsl-dependencies';
-import { dslDefinitions, dslVersions } from './db/schema';
+import { dslDefinitions, dslVersions, snapshots, tasks } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { lockTenant, publishedPlans } from './mappings';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
@@ -65,6 +67,46 @@ async function assertValid(kind: DslKind, tenantId: string, yaml: string) {
 const ofDefinition = (tenantId: string, kind: DslKind, key: string) =>
   and(eq(dslDefinitions.tenantId, tenantId), eq(dslDefinitions.kind, kind), eq(dslDefinitions.key, key));
 
+/** 定义的一版：入队 gold.dsl 时带上它的种类、键、定义 ID 与版本号 */
+interface DslVersionRef { kind: DslKind; key: string; definitionId: string; version: number }
+
+/** 在调用方的事务里按 asOf 编译定义的一版（spec 已对照 ctx 校验通过）并入队一次 gold.dsl，参数带上编译出的 SQL 与用到的实体（任务不再访问平台库） */
+const enqueueDsl = (tx: Tx, tenantId: string, d: DslVersionRef, spec: unknown, ctx: DslContext, asOf: string) =>
+  insertTask(tx, tenantId, 'gold.dsl', {
+    kind: d.kind, key: d.key, definitionId: d.definitionId, definitionVersion: d.version, asOf,
+    sql: DSL_KINDS[d.kind].compile(spec, ctx, asOf, d.key), entities: DSL_KINDS[d.kind].entities(spec, ctx),
+  });
+
+/**
+ * 引用指标 metric 的已发布标签（各自最新的已发布版本），按 ctx（其中的 metric 是要算的那一版）校验：通过的带上 spec，
+ * 不再通过的（如指标加了维度）只给键，不入队
+ */
+async function downstreamTags(tx: Tx, tenantId: string, metric: string, ctx: DslContext) {
+  const ready: { tag: DslVersionRef; spec: unknown }[] = [];
+  const skipped: string[] = [];
+  for (const { definitionId, key, version, yaml } of await publishedTagsReferencing(tx, tenantId, metric)) {
+    const checked = DSL_KINDS.tag.check(yaml, ctx);
+    if (checked.ok) ready.push({ tag: { kind: 'tag', key, definitionId, version }, spec: checked.spec });
+    else skipped.push(key);
+  }
+  return { ready, skipped };
+}
+
+/**
+ * 可回刷的快照：本定义未过期、定义版本早于 version 的快照，统计日已有第 version 版未过期快照的不算（已经回刷过或当天发布过，
+ * 否则旧快照过期前每次回刷都会再算一遍）。返回张数与它们的统计日（去重、升序）
+ */
+async function staleSnapshots(db: Tx | ReturnType<typeof getDb>, tenantId: string, kind: DslKind, key: string, version: number) {
+  const live = await db.select({ version: snapshots.definitionVersion, asOf: sql<string | null>`${snapshots.params}->>'asOf'` }).from(snapshots)
+    .where(and(eq(snapshots.tenantId, tenantId), eq(snapshots.template, `${kind}:${key}`), isNull(snapshots.expiredAt)));
+  const current = new Set(live.filter(s => s.version === version).map(s => s.asOf));
+  // asOf 来自任务结果里的参数，不是 YYYY-MM-DD 的（不该出现）不拿去编译
+  const stale = live
+    .filter(s => s.version !== null && s.version < version && s.asOf !== null && /^\d{4}-\d{2}-\d{2}$/.test(s.asOf) && !current.has(s.asOf))
+    .map(s => s.asOf!);
+  return { snapshots: stale.length, days: [...new Set(stale)].sort() };
+}
+
 /** 新建定义：键要合规且在本租户这一种类里没用过，YAML 校验通过后保存为第 1 版草稿 */
 export async function createDefinition(actor: CurrentMember, kind: string, key: string, yaml: string) {
   assertCan(actor, 'definitions:draft');
@@ -115,7 +157,7 @@ export async function saveDslDraft(actor: CurrentMember, kind: string, key: stri
 }
 
 /**
- * 本租户的一个定义：各版本（最新的在前，带当前成员发布不了的原因）、草稿与最近的已发布版本、本租户有发布权限的成员人数、引用它的已发布标签，
+ * 本租户的一个定义：各版本（最新的在前，带当前成员发布不了的原因）、草稿与最近的已发布版本、本租户有发布权限的成员人数、引用它的已发布标签、可回刷的快照，
  * 以及最新一版（有草稿时是草稿）按今天（UTC）编译出的 SQL；它对照当前的登记与映射不再通过校验时给出问题
  */
 export async function getDefinition(actor: CurrentMember, kind: string, key: string) {
@@ -144,6 +186,8 @@ export async function getDefinition(actor: CurrentMember, kind: string, key: str
     publishers: await publisherCount(actor.tenant.id),
     /** 引用这个指标的已发布标签的键；有引用时不能删除 */
     dependents: kind === 'metric' ? await publishedTagsOf(getDb(), actor.tenant.id, key) : [],
+    /** 可回刷的快照数与它们的统计日（去重、升序） */
+    backfill: published ? await staleSnapshots(getDb(), actor.tenant.id, kind, key, published.version) : { snapshots: 0, days: [] as string[] },
     compiled: result.ok
       ? { version: versions[0]!.version, sql: DSL_KINDS[kind].compile(result.spec, ctx, todayUtc(), key), issues: [] as DslIssue[] }
       : { version: versions[0]!.version, sql: null, issues: result.issues },
@@ -152,7 +196,9 @@ export async function getDefinition(actor: CurrentMember, kind: string, key: str
 
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。发布前对照当前的登记与映射再校验一次，并按当天（UTC）编译。
- * 发布后版本锁定，同一事务里入队一次 gold.dsl，任务参数带上编译出的 SQL 与用到的实体（任务不再访问平台库）。返回入队的任务
+ * 发布后版本锁定，同一事务里入队一次 gold.dsl，任务参数带上编译出的 SQL 与用到的实体（任务不再访问平台库）；
+ * 发布指标时另为引用它的每个已发布标签按同一天入队一次，标签 SQL 内联刚发布的这一版指标（按新指标不再通过校验的标签不入队，记进审计）。
+ * 已有快照不动。不与排队中的任务去重（ADR-0021）。返回这个定义自己入队的任务
  */
 export async function publishDefinition(actor: CurrentMember, kind: string, key: string, version: number) {
   assertCan(actor, 'publish');
@@ -174,15 +220,65 @@ export async function publishDefinition(actor: CurrentMember, kind: string, key:
     const checked = DSL_KINDS[kind].check(draft.yaml, ctx);
     if (!checked.ok) throw new DslError('对照当前已发布的登记与映射，这一版不再通过校验，不能发布', 400, checked.issues);
     const asOf = todayUtc();
+    // 下游标签按刚发布的这一版指标校验与编译（ctx 里的还是之前的已发布版本）
+    const tagCtx = kind === 'metric' ? withMetric(ctx, key, checked as DslCheck<MetricSpec>) : ctx;
+    const downstream = kind === 'metric' ? await downstreamTags(tx, actor.tenant.id, key, tagCtx) : { ready: [], skipped: [] };
     await tx.update(dslVersions).set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` }).where(eq(dslVersions.id, draft.id));
     await recordAudit(tx, {
       tenantId: actor.tenant.id, actor, action: 'definition.published', targetType: 'definition', targetId: draft.definitionId,
-      detail: { kind, key, version, authors: draft.authors, lastEditor: draft.lastEditor },
+      detail: { kind, key, version, authors: draft.authors, lastEditor: draft.lastEditor, tags: downstream.ready.map(t => t.tag.key), skippedTags: downstream.skipped },
     });
-    return insertTask(tx, actor.tenant.id, 'gold.dsl', {
-      kind, key, definitionId: draft.definitionId, definitionVersion: version, asOf,
-      sql: DSL_KINDS[kind].compile(checked.spec, ctx, asOf, key), entities: DSL_KINDS[kind].entities(checked.spec, ctx),
+    const task = await enqueueDsl(tx, actor.tenant.id, { kind, key, definitionId: draft.definitionId, version }, checked.spec, ctx, asOf);
+    for (const { tag, spec } of downstream.ready) await enqueueDsl(tx, actor.tenant.id, tag, spec, tagCtx, asOf);
+    return task;
+  });
+}
+
+/**
+ * 手动回刷（ADR-0025）：需要发布权限。对本定义未过期、定义版本早于生效版本的快照（统计日已有生效版本快照的不算），
+ * 按各自的 asOf（同一天只算一次）以生效版本各入队一次 gold.dsl；指标连同引用它的每个已发布标签（内联生效版本的指标，不再通过校验的跳过）。
+ * 已有快照不动，旧快照留到正常过期。锁住租户行后检查（ADR-0021）：本定义或要一并入队的下游标签已有任务在排队或运行时拒绝；没有可回刷的快照时拒绝。记审计。
+ * 返回按的版本号、回刷的统计日与入队的任务
+ */
+export async function backfillDefinition(actor: CurrentMember, kind: string, key: string) {
+  assertCan(actor, 'publish');
+  requireKind(kind);
+  const { label } = DSL_KINDS[kind];
+  return getDb().transaction(async tx => {
+    // 锁住租户行：与另一次回刷、发布定义与映射互斥，锁到以后读到的就是当前生效的版本与依赖
+    await lockTenant(tx, actor.tenant.id);
+    const [published] = await tx.select({ definitionId: dslVersions.definitionId, version: dslVersions.version, yaml: dslVersions.yaml }).from(dslVersions)
+      .innerJoin(dslDefinitions, eq(dslDefinitions.id, dslVersions.definitionId))
+      .where(and(ofDefinition(actor.tenant.id, kind, key), eq(dslVersions.status, 'published')))
+      .orderBy(desc(dslVersions.version)).limit(1);
+    if (!published) {
+      const [definition] = await tx.select({ id: dslDefinitions.id }).from(dslDefinitions).where(ofDefinition(actor.tenant.id, kind, key));
+      throw definition ? new DslError(`这个${label}还没有发布过，没有可回刷的快照`) : new DslError(`没有键为 ${key} 的${label}`, 404);
+    }
+    const { days } = await staleSnapshots(tx, actor.tenant.id, kind, key, published.version);
+    if (!days.length) throw new DslError(`没有需要回刷的快照：早于生效的第 ${published.version} 版的快照都已过期，或它们的统计日已有这一版的快照`);
+    // ctx 里的指标就是各自生效的版本，下游标签按它内联
+    const ctx = await dslContext(tx, actor.tenant.id);
+    const checked = DSL_KINDS[kind].check(published.yaml, ctx);
+    if (!checked.ok) throw new DslError(`对照当前已发布的登记与映射，生效的第 ${published.version} 版不再通过校验，不能回刷`, 400, checked.issues);
+    const downstream = kind === 'metric' ? await downstreamTags(tx, actor.tenant.id, key, ctx) : { ready: [], skipped: [] };
+    // 要入队的定义（自己与下游标签）有任何一个已在排队或运行时拒绝，免得同一定义同时算两遍
+    const [pending] = await tx.select({ key: sql<string>`${tasks.params}->>'key'` }).from(tasks).where(and(
+      eq(tasks.tenantId, actor.tenant.id), eq(tasks.kind, 'gold.dsl'), inArray(tasks.status, ['queued', 'running']),
+      inArray(sql`${tasks.params}->>'definitionId'`, [published.definitionId, ...downstream.ready.map(t => t.tag.definitionId)]),
+    )).limit(1);
+    if (pending) throw new DslError(`${pending.key === key ? `这个${label}` : `引用它的标签 ${pending.key}`}已有计算在排队或运行中，完成后再回刷`);
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id, actor, action: 'definition.backfilled', targetType: 'definition', targetId: published.definitionId,
+      detail: { kind, key, version: published.version, days, tags: downstream.ready.map(t => t.tag.key), skippedTags: downstream.skipped },
     });
+    const self = { kind, key, definitionId: published.definitionId, version: published.version };
+    const enqueued = [];
+    for (const day of days) {
+      enqueued.push(await enqueueDsl(tx, actor.tenant.id, self, checked.spec, ctx, day));
+      for (const { tag, spec } of downstream.ready) enqueued.push(await enqueueDsl(tx, actor.tenant.id, tag, spec, ctx, day));
+    }
+    return { version: published.version, days, tasks: enqueued };
   });
 }
 

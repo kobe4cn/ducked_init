@@ -2,12 +2,13 @@
 // YAML 编辑框（有起草权限的成员保存草稿，校验不通过时按行列列出问题）、最新一版编译出的 SQL 与样本预览（只读挂载上按今天运行，前 50 行与总行数），
 // 以及各版本的作者与最后保存的人；草稿由最后保存它的人以外的另一位有发布权限的成员发布（发布后以当天入队一次计算，成功后快照出现在分析页），也可以丢弃。
 // 有草稿且有已发布版本时可以预览发布的影响：指标与受影响的下游标签按两版结果对比的消费者计数（只读挂载上按今天算，不出消费者 ID）。
+// 发布过的定义有早于生效版本的未过期快照时，有发布权限的成员可以按各自的统计日以生效版本回刷（指标连同下游标签），没有权限时说明原因。
 // 有修改与删除权限的成员可以删除定义（被已发布标签引用的指标删不了）
-import { AlertTriangle, CheckCircle2, Lock, Trash2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Lock, RefreshCw, Trash2 } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.$kind.$key';
-import { can, requirePermission } from '~/.server/access';
-import { deleteDefinition, discardDslDraft, DslError, getDefinition, impactOf, previewDefinition, publishDefinition, saveDslDraft } from '~/.server/dsl-definitions';
+import { can, deniedReason, requirePermission } from '~/.server/access';
+import { backfillDefinition, deleteDefinition, discardDslDraft, DslError, getDefinition, impactOf, previewDefinition, publishDefinition, saveDslDraft } from '~/.server/dsl-definitions';
 import { navFor } from '~/.server/nav';
 import { UNLINKED } from '~/.server/pipeline/dsl/metric-spec';
 import { publishReason } from '~/.server/publish-rules';
@@ -44,6 +45,12 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     justSaved: Number(search.get('saved')) || null,
     /** 刚发布的版本（发布后跳回本页时带上 ?published=N） */
     justPublished: Number(search.get('published')) || null,
+    /** 刚回刷的统计日数（回刷后跳回本页时带上 ?backfilled=N） */
+    justBackfilled: Number(search.get('backfilled')) || null,
+    /** 可回刷的快照数与统计日 */
+    backfill: d.backfill,
+    /** 没有发布权限时回刷不了的原因 */
+    backfillDenied: can(member.role, 'publish') ? null : deniedReason('publish'),
     kind: d.kind,
     key: d.key,
     label: d.label,
@@ -83,6 +90,10 @@ export async function action({ request, params }: Route.ActionArgs) {
         await publishDefinition(await requirePermission(request, 'publish'), params.kind, params.key, version);
         throw redirect(`${page}?published=${version}`);
       }
+      case 'backfill': {
+        const { days } = await backfillDefinition(await requirePermission(request, 'publish'), params.kind, params.key);
+        throw redirect(`${page}?backfilled=${days.length}`);
+      }
       case 'discard': {
         const { published } = await discardDslDraft(await requirePermission(request, 'definitions:draft'), params.kind, params.key);
         // 从没发布过时定义已删除，回到分析页
@@ -114,7 +125,7 @@ export async function action({ request, params }: Route.ActionArgs) {
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
 export default function Definition({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canDraft, canDelete, dependents, justSaved, justPublished, kind, key, label, yaml, published, compiled, unlinked, versions } = loaderData;
+  const { email, nav, canDraft, canDelete, dependents, justSaved, justPublished, justBackfilled, backfill, backfillDenied, kind, key, label, yaml, published, compiled, unlinked, versions } = loaderData;
   const navigation = useNavigation();
   const submitting = navigation.state === 'submitting';
   const previewing = submitting && navigation.formData?.get('intent') === 'preview';
@@ -156,7 +167,16 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
         <Alert role="status">
           <CheckCircle2 />
           <AlertTitle>{`第 ${justPublished} 版已发布`}</AlertTitle>
-          <AlertDescription>已按今天入队一次计算，完成后快照出现在分析页。</AlertDescription>
+          <AlertDescription>
+            {`已按今天入队一次计算${kind === 'metric' ? '（连同引用它的已发布标签）' : ''}，完成后快照出现在分析页。`}
+          </AlertDescription>
+        </Alert>
+      )}
+      {justBackfilled && !actionData?.error && (
+        <Alert role="status">
+          <CheckCircle2 />
+          <AlertTitle>{`已按 ${justBackfilled} 个统计日入队回刷`}</AlertTitle>
+          <AlertDescription>完成后新快照出现在分析页，旧快照保留到过期。</AlertDescription>
         </Alert>
       )}
 
@@ -284,6 +304,29 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
                 : <p className="text-sm text-slate-500">没有引用这个指标的已发布标签。</p>}
             </div>
           )}
+        </div>
+      )}
+
+      {published && (
+        <div className="rounded-2xl border bg-white p-6 shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="font-medium">回刷历史快照</h2>
+              <p data-backfill-count className="max-w-2xl text-sm text-slate-500">
+                {backfill.snapshots
+                  ? `${backfill.snapshots} 张未过期的快照早于生效的第 ${published} 版（统计日 ${backfill.days.join('、')}），按各自的统计日以第 ${published} 版重算${kind === 'metric' ? '，连同引用它的已发布标签' : ''}；旧快照保留到过期。`
+                  : `没有需要回刷的快照：未过期的快照都已按第 ${published} 版算过。`}
+              </p>
+            </div>
+            {backfillDenied
+              ? <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-backfill-denied><Lock className="size-3.5 shrink-0" />{backfillDenied}</span>
+              : (
+                <Form method="post">
+                  <input type="hidden" name="intent" value="backfill" />
+                  <Button type="submit" variant="outline" disabled={submitting || !backfill.snapshots}><RefreshCw />回刷</Button>
+                </Form>
+              )}
+          </div>
         </div>
       )}
 
