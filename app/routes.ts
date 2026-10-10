@@ -17,6 +17,8 @@ export default [
   route('analytics', 'routes/analytics.tsx'),
   route('analytics/snapshots/:snapshotId', 'routes/analytics.snapshots.$id.tsx'),
   route('analytics/templates/:templateId', 'routes/analytics.templates.$id.tsx'),
+  route('analytics/definitions/new', 'routes/analytics.definitions.new.tsx'),
+  route('analytics/definitions/:kind/:key', 'routes/analytics.definitions.$kind.$key.tsx'),
   route('members', 'routes/members.tsx'),
   route('audit', 'routes/audit.tsx'),
   route('pii/reveal', 'routes/pii.reveal.tsx'),

@@ -179,12 +179,12 @@ export interface RegisteredEntity {
 /** 源表的一列：名称与源端类型（DuckDB 类型名，如 BIGINT、VARCHAR） */
 export interface SourceColumn { name: string; type: string }
 
-type Path = (string | number)[];
+export type Path = (string | number)[];
 
 const TYPE_LABELS: Record<string, string> = { string: '文本', object: '对象（键: 值）', array: '列表', number: '数字', integer: '整数', boolean: '布尔' };
 
 /** 把 Ajv 的错误译成中文，返回出问题的路径与说明 */
-function describeSchemaError(e: ErrorObject): { path: Path; message: string } | null {
+export function describeSchemaError(e: ErrorObject): { path: Path; message: string } | null {
   const path: Path = e.instancePath.split('/').slice(1).map(s => s.replace(/~1/g, '/').replace(/~0/g, '~'));
   const p = e.params as Record<string, unknown>;
   switch (e.keyword) {
@@ -196,13 +196,14 @@ function describeSchemaError(e: ErrorObject): { path: Path; message: string } | 
     case 'enum': return { path, message: `应为以下之一：${(p.allowedValues as string[]).join('、')}` };
     case 'minLength': case 'minItems': case 'minProperties': return { path, message: '不能为空' };
     case 'uniqueItems': return { path, message: '不能有重复项' };
+    case 'minimum': return { path, message: `应不小于 ${p.limit}` };
     case 'pattern': return { path, message: path.at(-1) === 'key_space' ? '键空间只能用小写字母、数字与下划线' : `应符合 ${p.pattern}` };
     default: return { path, message: e.message ?? e.keyword };
   }
 }
 
 /** 行列定位：path 指向的节点（键不存在时退到最近的上级）；atKey 为真时指向键而不是值 */
-function locator(doc: Document, lines: LineCounter) {
+export function locator(doc: Document, lines: LineCounter) {
   return (path: Path, atKey = false) => {
     let node: unknown = doc.contents;
     let at: [number, number] | undefined = (doc.contents as Node | null)?.range?.slice(0, 2) as [number, number] | undefined;
