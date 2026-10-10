@@ -13,10 +13,11 @@ import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { lit } from '../../app/.server/pipeline/merge-engine';
 import { listSnapshots, readRfmSnapshot } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
+import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, mergeUnchecked, runTask } from './fixtures';
+import { memberOf, mergeUnchecked, publish, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
-import { grantOnSource } from './source-fixtures';
+import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 const outbox: Mail[] = [];
 afterAll(async () => { await closeDb(); });
@@ -215,5 +216,115 @@ describe('隔离区', () => {
     const dropped = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
     expect((dropped!.result as { assertions: unknown[] }).assertions).toContainEqual(expect.objectContaining({ name: 'row_drop', entity: 'order', failed: 8 }));
     expect((await quarantine(acme, dropped!.id)).map(r => r.assertion)).not.toContain('row_drop');
+  });
+});
+
+/**
+ * 积分源（shop schema）：积分流水同 mapping.test.ts 的 POINT_LOGS，M001 另有 6 笔同一时刻的 +1（id 6–11，按字符串排序 '10' 会排在 '6' 前面）；
+ * 会员表里 M001 余额 56 与流水对得上，M002 余额 20：最后一笔余额是 20，但流水求和是 -10；M003 余额 10 但没有流水（按求和 0 算）
+ */
+const POINTS_SOURCE = `
+  CREATE TABLE shop.point_logs (id serial PRIMARY KEY, customer_id int NOT NULL, member_no text NOT NULL, change_type text NOT NULL,
+    points int NOT NULL, balance int NOT NULL, order_no text, created_at timestamp NOT NULL, expire_time timestamp);
+  INSERT INTO shop.point_logs (customer_id, member_no, change_type, points, balance, order_no, created_at, expire_time) VALUES
+    (1, 'M001', '获得', 200, 200, 'NO1', '2024-06-01 10:00', '2025-06-01 10:00'),
+    (1, 'M001', '消费', -50, 150, 'NO2', '2024-06-02 10:00', NULL),
+    (1, 'M001', '兑换', -100, 50, NULL, '2024-06-03 10:00', NULL),
+    (2, 'M002', '过期', -30, 0, NULL, '2024-06-04 10:00', NULL),
+    (2, 'M002', '调整', 20, 20, NULL, '2024-06-05 10:00', NULL);
+  INSERT INTO shop.point_logs (customer_id, member_no, change_type, points, balance, order_no, created_at, expire_time)
+    SELECT 1, 'M001', '获得', 1, 50 + i, NULL, '2024-06-07 10:00', NULL FROM generate_series(1, 6) i;
+  CREATE TABLE shop.memberships (member_no text PRIMARY KEY, customer_id int NOT NULL, level text NOT NULL, points int NOT NULL, updated_at timestamp NOT NULL);
+  INSERT INTO shop.memberships VALUES ('M001', 1, 'gold', 56, '2024-06-01'), ('M002', 2, 'silver', 20, '2024-06-01'), ('M003', 3, 'silver', 10, '2024-06-01');
+  GRANT SELECT ON shop.point_logs, shop.memberships TO ${READER.user};`;
+
+const POINT_LOGS_MAPPING = `model: 1
+entity: points_transaction
+table: point_logs
+fields:
+  points_transaction_id: string(id)
+  customer_id: string(customer_id)
+  membership_id: member_no
+  change_type:
+    expr: change_type
+    dictionary: { 获得: earn, 消费: spend, 兑换: redeem, 过期: expire, 调整: adjust }
+  points_change: points
+  balance_after: balance
+  order_id: order_no
+  occurred_at: from_timezone(created_at, 'Asia/Shanghai')
+  expires_at: from_timezone(expire_time, 'Asia/Shanghai')
+`;
+
+const MEMBERSHIPS_MAPPING = `model: 1
+entity: membership
+table: memberships
+fields:
+  membership_id: member_no
+  customer_id: string(customer_id)
+  level: level
+  points: points
+`;
+
+/** 身份打通的租户上再登记积分源（shop schema），同步并发布会员与积分流水的映射 */
+async function withPointsSource() {
+  const fixture = await publishedIdentitySources();
+  const { author, reviewer } = fixture;
+  const input = await pgSourceInput(READER, '积分库');
+  await grantOnSource(POINTS_SOURCE);
+  const { id } = await registerSource(author, input);
+  await drain();
+  await setSyncScope(author, id, { add: ['point_logs', 'memberships'] });
+  await drain();
+  await confirmWatermark(author, id, 'point_logs', 'id');
+  await confirmWatermark(author, id, 'memberships', 'updated_at');
+  await syncSource(author, id);
+  await drain();
+  await publish(author, reviewer, id, POINT_LOGS_MAPPING);
+  await publish(author, reviewer, id, MEMBERSHIPS_MAPPING);
+  return { ...fixture, points: id };
+}
+
+const pointsDsl = { kind: 'metric', key: 'm', asOf: '2024-07-01', sql: 'SELECT consumer_id, 1 AS value FROM silver._identities', entities: ['membership', 'points_transaction'] };
+
+describe('积分余额与积分流水的一致性', () => {
+  it('余额与流水求和对不上（含没有流水）的会员报 warn（带会员数与差额合计），样本写会员号与差额；同一时刻的流水按 id 数值排序，断档不误报；任务照常产出', async () => {
+    const { acme } = await withPointsSource();
+    const task = await runTask(acme, 'gold.dsl', pointsDsl);
+    expect(task).toMatchObject({ status: 'succeeded' });
+    const assertions = (task!.result as { assertions: unknown[] }).assertions;
+    expect(assertions).toContainEqual({ name: 'points_balance', level: 'warn', entity: 'membership', failed: 2, detail: '2 个会员不一致，差额合计 40' });
+    expect(assertions).toContainEqual({ name: 'points_chain', level: 'warn', entity: 'points_transaction', failed: 0, detail: 'balance_after' });
+    expect(await goldTables(acme)).toEqual([`metric__${task!.id}`]);
+    expect(outbox).toHaveLength(0);
+
+    const rows = await quarantine(acme, task!.id);
+    expect(rows.map(r => [r.assertion, r.level, r.entity, r.key])).toEqual([['points_balance', 'warn', 'membership', 'M002'], ['points_balance', 'warn', 'membership', 'M003']]);
+    expect(rows.map(r => JSON.parse(r.row))).toEqual([
+      { membership_id: 'M002', points: 20, sum_change: -10, last_balance: 20, diff: 30 },
+      { membership_id: 'M003', points: 10, sum_change: 0, last_balance: null, diff: 10 },
+    ]);
+  });
+
+  it('流水 balance_after 不等于上一笔余额加本笔变动时报断档，样本写这笔流水；任务照常产出', async () => {
+    const { acme, points } = await withPointsSource();
+    await grantOnSource(`INSERT INTO shop.point_logs (customer_id, member_no, change_type, points, balance, order_no, created_at, expire_time)
+      VALUES (2, 'M002', '获得', 5, 99, NULL, '2024-06-08 10:00', NULL)`);
+    await syncSource(await memberOf(acme, 'de@acme.com'), points);
+    await drain();
+
+    const task = await runTask(acme, 'gold.dsl', pointsDsl);
+    expect(task).toMatchObject({ status: 'succeeded' });
+    const assertions = (task!.result as { assertions: unknown[] }).assertions;
+    expect(assertions).toContainEqual({ name: 'points_chain', level: 'warn', entity: 'points_transaction', failed: 1, detail: 'balance_after' });
+    expect(assertions).toContainEqual(expect.objectContaining({ name: 'points_balance', failed: 2, detail: '2 个会员不一致，差额合计 35' }));
+    const chain = (await quarantine(acme, task!.id)).filter(r => r.assertion === 'points_chain');
+    expect(chain.map(r => [r.entity, r.key])).toEqual([['points_transaction', '12']]);
+    expect(JSON.parse(chain[0].row)).toMatchObject({ membership_id: 'M002', points_change: 5, balance_after: 99, previous_balance: 20 });
+  });
+
+  it('只读消费者的任务不跑积分断言', async () => {
+    const { acme } = await withPointsSource();
+    const task = await runTask(acme, 'gold.dsl', { ...pointsDsl, entities: ['customer'] });
+    expect((task!.result as { assertions: { name: string }[] }).assertions.map(a => a.name)).not.toContain('points_balance');
   });
 });

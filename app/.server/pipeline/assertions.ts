@@ -1,7 +1,8 @@
 // app/.server/pipeline/assertions.ts —— 内置断言（ADR-0026）：结果层任务计算前，对任务读到的标准实体检查数据质量。
 // error 级的断言失败时任务失败、不登记快照（外部继续读上一版）；warn 级只记录。结果只有断言名、实体、不合格行数与比例，不带行内容。
 // 每次运行给检查过的实体各追加一行到湖里的 silver._assertion_runs，行数骤降以它为基准（工作进程不连平台库）。
-// 断言失败时，每条断言最多 SAMPLE_LIMIT 行不合格行的样本追加到湖里的隔离区 silver._quarantine；只从标准层取样（敏感字段只有哈希，ADR-0005），行数骤降不取样
+// 断言失败时，每条断言最多 SAMPLE_LIMIT 行不合格行的样本追加到湖里的隔离区 silver._quarantine；只从标准层取样（敏感字段只有哈希，ADR-0005），行数骤降不取样。
+// 读会员或积分流水时另跑两条积分 warn：余额与流水对账、流水余额断档
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { entityOf } from '../../lib/canonical-model';
 import { lit } from './merge-engine';
@@ -33,6 +34,8 @@ export const ASSERTION_LABELS: Record<string, string> = {
   amount_non_negative: '金额非负',
   order_customer_link: '订单关联消费者',
   row_drop: '行数骤降',
+  points_balance: '积分余额对账',
+  points_chain: '积分流水断档',
 };
 
 /** 订单关联得上消费者的比例低于它时告警 */
@@ -50,6 +53,9 @@ const AMOUNT_FIELDS: Record<string, string[]> = {
   order_item: ['amount', 'unit_price'],
   product: ['price'],
 };
+
+/** 同一会员的流水按时间排序；同一时刻再按 id 的数值排（id 是字符串，'10' 会排在 '2' 前面） */
+const POINTS_ORDER = 'occurred_at, TRY_CAST(points_transaction_id AS BIGINT), points_transaction_id';
 
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
@@ -73,7 +79,7 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
   const columns = new Map<string, Set<string>>();
   for (const c of await rows<{ entity: string; name: string }>(con, `
     SELECT table_name AS entity, column_name AS name FROM information_schema.columns
-    WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, 'customer'].map(lit).join(', ')})`)) {
+    WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, 'customer', 'membership', 'points_transaction'].map(lit).join(', ')})`)) {
     columns.set(c.entity, (columns.get(c.entity) ?? new Set()).add(c.name));
   }
   await con.run(`CREATE TABLE IF NOT EXISTS ${RUNS} (task_id VARCHAR, entity VARCHAR, rows BIGINT, assertions JSON, "at" TIMESTAMPTZ)`);
@@ -126,6 +132,16 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
       results.push({ name: 'row_drop', level: 'warn', entity, failed: rowCount < previous * MIN_ROW_RATIO ? previous - rowCount : 0, rows: rowCount, previous });
     }
   }
+  const membership = columns.get('membership');
+  const pointsTx = columns.get('points_transaction');
+  if ((entities.includes('membership') || entities.includes('points_transaction'))
+    && membership && ['membership_id', 'points'].every(c => membership.has(c))
+    && pointsTx && ['membership_id', 'points_change', 'balance_after', 'occurred_at'].every(c => pointsTx.has(c))) {
+    for (const [result, sample] of await pointsAssertions(con)) {
+      results.push(result);
+      samples.set(result, sample);
+    }
+  }
   await recordRuns(con, taskId, rowCounts, results);
   await writeQuarantine(con, taskId, samples);
   return results;
@@ -164,6 +180,33 @@ async function orderCustomerLink(con: DuckDBConnection, bySource: boolean): Prom
   const orphans = Number(total) - Number(linked);
   const ratio = Number(total) ? Number(linked) / Number(total) : 1;
   return { name: 'order_customer_link', level: 'warn', entity: 'order', failed: ratio < MIN_ORDER_LINK_RATIO ? orphans : 0, ratio: Math.round(ratio * 10000) / 10000, orphans };
+}
+
+/**
+ * 积分的两条 warn 断言（membership 与 points_transaction 都在标准层时）。
+ * points_balance：membership.points 与流水 points_change 之和（没有流水时为 0）、或按时间最后一笔的 balance_after（为空不比）不相等的会员数；
+ * diff 是余额减流水求和，求和对得上时是余额减最后一笔余额，detail 带会员数与 |diff| 合计。
+ * points_chain：同一会员按时间排序后 balance_after 不等于上一笔 balance_after + points_change 的流水数（每会员第一笔、余额为空的不查）
+ */
+async function pointsAssertions(con: DuckDBConnection): Promise<[AssertionResult, string][]> {
+  const balance = `
+    SELECT m.membership_id, m.points, coalesce(t.sum_change, 0) AS sum_change, t.last_balance,
+      CASE WHEN m.points <> coalesce(t.sum_change, 0) THEN m.points - coalesce(t.sum_change, 0) ELSE m.points - t.last_balance END AS diff
+    FROM silver.membership m LEFT JOIN (
+      SELECT membership_id, sum(points_change)::BIGINT AS sum_change, arg_max_null(balance_after, (${POINTS_ORDER})) AS last_balance
+      FROM silver.points_transaction WHERE membership_id IS NOT NULL GROUP BY membership_id) t USING (membership_id)
+    WHERE m.points <> coalesce(t.sum_change, 0) OR m.points <> t.last_balance`;
+  const chain = `
+    SELECT * FROM (
+      SELECT *, lag(balance_after) OVER (PARTITION BY membership_id ORDER BY ${POINTS_ORDER}) AS previous_balance
+      FROM silver.points_transaction WHERE membership_id IS NOT NULL)
+    WHERE balance_after <> previous_balance + points_change`;
+  const [{ n, total }] = await rows<{ n: string; total: string }>(con, `SELECT count(*) AS n, coalesce(sum(abs(diff)), 0)::BIGINT AS total FROM (${balance})`);
+  const [{ n: broken }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM (${chain})`);
+  return [
+    [{ name: 'points_balance', level: 'warn', entity: 'membership', failed: Number(n), detail: `${n} 个会员不一致，差额合计 ${total}` }, balance],
+    [{ name: 'points_chain', level: 'warn', entity: 'points_transaction', failed: Number(broken), detail: 'balance_after' }, chain],
+  ];
 }
 
 /** 失败的 error 级断言 */

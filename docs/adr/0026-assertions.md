@@ -7,13 +7,13 @@
 **两个级别。**
 
 - `error`：失败时任务记为失败（保留结果），不写快照表、不登记快照（ADR-0021 的快照只登记成功的任务），外部继续读上一版快照。先做两条：主键唯一（按标准模型的主键判重，主键为空的行不算；`customer` 与主键含 `customer` 引用的实体按 `_source` 判重，与 ADR-0024 一致；带上 `_key_space`）与金额非负（`order.amount`、`order_item.amount` / `unit_price`、`product.price`）。自定义实体的主键在工作进程里不可知，暂不检查。
-- `warn`：只记进 `assertions`，任务照常成功、照常登记快照，不告警。两条：订单关联消费者（`order.customer_id` 非空且在 `silver.customer` 同一数据源里找得到的订单占比低于 80% 时失败，带比例与关联不上的订单数；按数据源找消费者同 ADR-0019 的关系统计，但 `customer_id` 为空的订单也算关联不上，分母是全部订单）与行数骤降（实体行数少于该实体上一次运行记录的一半时失败，带前后行数；首次运行没有基准不报）。
+- `warn`：只记进 `assertions`，任务照常成功、照常登记快照，不告警。四条：订单关联消费者（`order.customer_id` 非空且在 `silver.customer` 同一数据源里找得到的订单占比低于 80% 时失败，带比例与关联不上的订单数；按数据源找消费者同 ADR-0019 的关系统计，但 `customer_id` 为空的订单也算关联不上，分母是全部订单）与行数骤降（实体行数少于该实体上一次运行记录的一半时失败，带前后行数；首次运行没有基准不报）；以及积分的两条（任务实体含 `membership` 或 `points_transaction`、且两张标准表都存在时跑，不设阈值）：积分余额对账（`membership.points` 与流水 `points_change` 之和（没有流水的会员按 0 算）、或按时间最后一笔的 `balance_after`（为空不比）任一不相等的会员数，`detail` 带会员数与差额绝对值合计）与积分流水断档（同一会员按 `occurred_at` 排序后 `balance_after` 不等于上一笔 `balance_after + points_change` 的流水数，每会员第一笔不查；同一时刻按 id 的数值排序）。
 
 **运行记录。** 每次跑断言，给检查过的实体各追加一行到湖里的 `silver._assertion_runs`（`task_id, entity, rows, assertions JSON, at`），error 失败的运行也记。行数骤降的基准取这张表里该实体最近一行的 `rows`：工作进程不连平台库，不能从 `tasks` 表取。表名以 `_` 开头，漂移检查不看它；只有计数与比例，没有行内容，删除请求不用处理它。
 
 **告警。** error 断言让任务失败时，调度器给租户全部管理员发邮件，并记一条审计 `assertion.failed`；操作者记为平台（`actor_type = system`），不出现在运营后台。邮件与审计只写断言名、实体与行数。这修订了 ADR-0014（核对「不做通知或告警」）与 ADR-0024（「不设告警模式」）的说法：那两处的结论不变（核对只出报告，独占不设宽限期），但结果层的阻断必须让人知道，否则快照悄悄停在旧版本没人发现。
 
-**隔离区。** error 或 warn 断言失败时，每条断言最多 100 行不合格行写进湖里的 `silver._quarantine`（`assertion, level, entity, key, row JSON, task_id, at`；`key` 是标准模型主键，多列用逗号连接，`row` 是 `to_json` 的整行）。error 失败时先写隔离区再让任务失败。`order_customer_link` 写关联不上的订单（customer_id 为空的也算），`row_drop` 不写行。只从标准层取样，敏感字段只有哈希（ADR-0005），不回原始层取。没标成敏感的扩展字段在标准层里仍是明文（ADR-0005「还没做的」），会随整行进隔离区并显示在页面上。有 `sources:read` 的成员在「数据质量」页（`/quality`）看最近 20 次运行记录与最近 200 行隔离区样本，请求内只读挂载本租户数据湖。隔离区带行内容，删除请求要把该消费者在这张表里的行一起删掉（#24）；整湖擦除时两张表随湖删除（ADR-0020）。
+**隔离区。** error 或 warn 断言失败时，每条断言最多 100 行不合格行写进湖里的 `silver._quarantine`（`assertion, level, entity, key, row JSON, task_id, at`；`key` 是标准模型主键，多列用逗号连接，`row` 是 `to_json` 的整行）。error 失败时先写隔离区再让任务失败。`order_customer_link` 写关联不上的订单（customer_id 为空的也算），`row_drop` 不写行，`points_balance` 写会员号与 `{ points, sum_change, last_balance, diff }`，`points_chain` 写断档的流水（带上一笔余额 `previous_balance`）。只从标准层取样，敏感字段只有哈希（ADR-0005），不回原始层取。没标成敏感的扩展字段在标准层里仍是明文（ADR-0005「还没做的」），会随整行进隔离区并显示在页面上。有 `sources:read` 的成员在「数据质量」页（`/quality`）看最近 20 次运行记录与最近 200 行隔离区样本，请求内只读挂载本租户数据湖。隔离区带行内容，删除请求要把该消费者在这张表里的行一起删掉（#24）；整湖擦除时两张表随湖删除（ADR-0020）。
 
 ## 后果
 
