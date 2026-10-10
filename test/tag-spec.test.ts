@@ -1,10 +1,11 @@
 // test/tag-spec.test.ts —— 标签 DSL：引用的指标要已发布、没有维度、取值为数字，rules 不能为空、when 要有条件、取值不能为空，按行列报错；
-// 编译出的 SQL 内联指标、带上键，在内存 DuckDB 里对手造的标准层得到已知答案（纯函数，不碰平台库与数据湖）
+// 编译出的 SQL 内联指标、带上键，在内存 DuckDB 里对手造的标准层得到已知答案；发布前的影响预览（impact.ts）按 consumer_id 对比两版结果只给计数（纯函数，不碰平台库与数据湖）
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { DSL_KINDS } from '../app/.server/pipeline/dsl';
-import { checkMetric, type DslContext } from '../app/.server/pipeline/dsl/metric-spec';
-import { checkTag, compileTag, type TagSpec } from '../app/.server/pipeline/dsl/tag-spec';
+import { compileMetricDiff, compileTagDiff } from '../app/.server/pipeline/dsl/impact';
+import { checkMetric, compileMetric, type DslContext } from '../app/.server/pipeline/dsl/metric-spec';
+import { checkTag, compileTag, withMetric, type TagSpec } from '../app/.server/pipeline/dsl/tag-spec';
 
 const base: DslContext = { published: new Map(), plans: [], metrics: new Map() };
 const ctx: DslContext = {
@@ -116,5 +117,58 @@ describe('标签 DSL：编译出的 SQL 的结果', () => {
   it('按顺序取第一条命中的规则', async () => {
     const rows = await run('metric: revenue\nrules:\n  - { value: buyer, when: { gte: 100 } }\n  - { value: whale, when: { gte: 1000 } }\ndefault: 0\n');
     expect(rows.map(r => r.tag_value)).toEqual(['buyer', 'buyer', '0', '0']);
+  });
+
+  const values = (rows: string) => `SELECT * FROM (VALUES ${rows}) t(consumer_id, tag_key, tag_value)`;
+  const diff = async (sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson();
+
+  it('标签的影响：换了取值、新增、移出分开，按「原取值 → 新取值」分组计人数，取值没变的不出现；不出 consumer_id', async () => {
+    const before = values(`('c1','k','a'), ('c2','k','a'), ('c3','k','a'), ('c4','k','b'), ('c5','k','b')`);
+    const after = values(`('c1','k','a'), ('c2','k','b'), ('c3','k','b'), ('c4','k','a'), ('c6','k','a'), ('c7','k','a')`);
+    const rows = await diff(compileTagDiff(before, after));
+    expect(rows).toEqual([
+      { before: null, after: 'a', consumers: 2 },
+      { before: 'a', after: 'b', consumers: 2 },
+      { before: 'b', after: null, consumers: 1 },
+      { before: 'b', after: 'a', consumers: 1 },
+    ]);
+    expect(await diff(compileTagDiff(before, before))).toEqual([]);
+  });
+
+  it('草稿指标内联进标签：门槛不变时只有换了取值的消费者；指标加了过滤，结果里少了的消费者算移出', async () => {
+    const draft = (yaml: string) => withMetric(ctx, 'revenue', checkMetric(yaml, base));
+    const tag = (c: DslContext) => compileTag(ok(TIERS), c, '2024-07-01', 'value_tier');
+    // c3 只有 20 元订单、c4 的订单金额为空，过滤后都不在指标结果里；c1、c2 的订单都大于 50，取值不变
+    const filtered = draft('base: order\nmeasure: { agg: sum, field: amount }\nfilter:\n  - { field: amount, op: gt, value: 50 }\n');
+    expect(await diff(compileTagDiff(tag(ctx), tag(filtered)))).toEqual([{ before: 'low', after: null, consumers: 2 }]);
+    // 改成数订单笔数：c1 2 笔、其余 1 笔，都低于 100 → 都成 low
+    const counted = draft('base: order\nmeasure: { agg: count }\n');
+    expect(await diff(compileTagDiff(tag(ctx), tag(counted)))).toEqual([
+      { before: 'high', after: 'low', consumers: 1 },
+      { before: 'mid', after: 'low', consumers: 1 },
+    ]);
+  });
+
+  it('指标的影响：每个消费者的全部行（含维度）按取值对比，给出取值变化、新增、移出的消费者数', async () => {
+    const revenue = (yaml: string) => {
+      const r = checkMetric(yaml, base);
+      if (!r.ok) throw new Error(JSON.stringify(r.issues));
+      return compileMetric(r.spec, base, '2024-07-01');
+    };
+    const sum = revenue('base: order\nmeasure: { agg: sum, field: amount }\n');
+    const filtered = revenue('base: order\nmeasure: { agg: sum, field: amount }\nfilter:\n  - { field: amount, op: gt, value: 50 }\n');
+    const counted = revenue('base: order\nmeasure: { agg: count }\n');
+    expect(await diff(compileMetricDiff(sum, filtered))).toEqual([{ changed: 0, added: 0, removed: 2 }]);
+    expect(await diff(compileMetricDiff(filtered, sum))).toEqual([{ changed: 0, added: 2, removed: 0 }]);
+    // c1 1000 → 2 笔，c2 150 → 1，c3 20 → 1；c4 空 → 1
+    expect(await diff(compileMetricDiff(sum, counted))).toEqual([{ changed: 4, added: 0, removed: 0 }]);
+    expect(await diff(compileMetricDiff(sum, sum))).toEqual([{ changed: 0, added: 0, removed: 0 }]);
+    // 带维度时，消费者的任一行变了就算变：c1 的两笔订单在不同源，按源拆成两行
+    const multi = (rows: string) => `SELECT * FROM (VALUES ${rows}) t(consumer_id, src, value)`;
+    expect(await diff(compileMetricDiff(multi(`('c1','s1',100), ('c1','s2',900), ('c2','s1',150)`), multi(`('c1','s1',100), ('c1','s2',901), ('c2','s1',150)`))))
+      .toEqual([{ changed: 1, added: 0, removed: 0 }]);
+    // 只比较取值：维度改名不算变
+    const renamed = `SELECT * FROM (VALUES ('c1','s1',100), ('c1','s2',900), ('c2','s1',150)) t(consumer_id, origin, value)`;
+    expect(await diff(compileMetricDiff(multi(`('c1','s1',100), ('c1','s2',900), ('c2','s1',150)`), renamed))).toEqual([{ changed: 0, added: 0, removed: 0 }]);
   });
 });

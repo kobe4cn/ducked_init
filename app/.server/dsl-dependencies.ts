@@ -8,7 +8,7 @@ import type { getDb } from './db/client';
 import { dslDefinitions, dslVersions } from './db/schema';
 import { DSL_KINDS, type DslKind } from './pipeline/dsl';
 
-/** 本租户每个定义最新的已发布版本的依赖，按种类、键排序 */
+/** 本租户每个定义最新的已发布版本（YAML）与它的依赖，按种类、键排序 */
 export async function publishedDependents(db: Tx | ReturnType<typeof getDb>, tenantId: string) {
   const rows = await db
     .selectDistinctOn([dslVersions.definitionId], { kind: dslDefinitions.kind, key: dslDefinitions.key, yaml: dslVersions.yaml })
@@ -17,10 +17,14 @@ export async function publishedDependents(db: Tx | ReturnType<typeof getDb>, ten
     .where(and(eq(dslDefinitions.tenantId, tenantId), eq(dslVersions.status, 'published')))
     .orderBy(dslVersions.definitionId, desc(dslVersions.version));
   return rows
-    .map(r => ({ kind: r.kind as DslKind, key: r.key, ...DSL_KINDS[r.kind as DslKind].dependencies(parse(r.yaml)) }))
+    .map(r => ({ kind: r.kind as DslKind, key: r.key, yaml: r.yaml, ...DSL_KINDS[r.kind as DslKind].dependencies(parse(r.yaml)) }))
     .sort((a, b) => a.kind.localeCompare(b.kind) || a.key.localeCompare(b.key));
 }
 
+/** 引用这个指标的已发布标签（各自最新的已发布版本），按键排序 */
+export const publishedTagsReferencing = async (db: Tx | ReturnType<typeof getDb>, tenantId: string, metric: string) =>
+  (await publishedDependents(db, tenantId)).filter(d => d.kind === 'tag' && d.metrics.includes(metric));
+
 /** 引用这个指标的已发布标签的键 */
 export const publishedTagsOf = async (db: Tx | ReturnType<typeof getDb>, tenantId: string, metric: string) =>
-  (await publishedDependents(db, tenantId)).filter(d => d.kind === 'tag' && d.metrics.includes(metric)).map(d => d.key);
+  (await publishedTagsReferencing(db, tenantId, metric)).map(d => d.key);

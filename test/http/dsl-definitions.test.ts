@@ -1,12 +1,12 @@
 // test/http/dsl-definitions.test.ts —— 指标定义的 HTTP 接缝：分析师在新建页填写键与 YAML 保存草稿 → 跳到定义页看到编译出的 SQL 与版本；在定义页再次保存改同一份草稿；
 // 校验不通过时按行列列出问题；分析页「新建标签」进到标签种类的新建页；查看者看不到「新建指标」、打不开新建页、提交 403；分析页里 metric: 快照链接到定义页；
-// 定义页点「预览」展示前 50 行与总行数（查看者也能预览），标准层缺表时给出说明，不存在的定义 404；
+// 定义页点「预览」展示前 50 行与总行数（查看者也能预览），标准层缺表时给出说明，不存在的定义 404；有草稿且已发布过时点「预览影响」展示指标与下游标签的变化人数；
 // 版本表里发布不了的成员看到原因，另一位数据工程师发布后入队 gold.dsl；丢弃草稿回到已发布版本，从没发布过时回到分析页；
 // 数据工程师看到「删除」按钮（分析师看不到、提交 403），被已发布标签引用的指标删不了，删除后回到分析页
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks } from '../../app/.server/db/schema';
-import { createDefinition, getDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
+import { createDefinition, getDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -129,6 +129,35 @@ describe('指标与标签定义页', () => {
     expect(missing.status).toBe(400);
     expect(await missing.text()).toContain('标准层还没有 silver.customer、silver.order：先发布 customer、order 的映射并合并');
     expect((await outsider.post('/analytics/definitions/metric/missing', { intent: 'preview' })).status).toBe(404);
+  });
+
+  it('有草稿且已发布过时定义页点「预览影响」：指标给出变化人数，下游标签按草稿不再通过校验时说明原因；标签草稿列出「原取值 → 新取值」；没有明文', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    await createDefinition(author, 'metric', 'revenue', 'base: order\nmeasure: { agg: count }\n');
+    await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    await createDefinition(author, 'tag', 'buyer', 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n');
+    await publishDefinition(reviewer, 'tag', 'buyer', 1);
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    const metric = '/analytics/definitions/metric/revenue';
+    // 没有草稿时不显示
+    expect(await (await viewer.get(metric)).text()).not.toContain('预览影响');
+
+    // 加了维度：5 个有订单的消费者行都变了；标签引用不了带维度的指标
+    await saveDslDraft(author, 'metric', 'revenue', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n');
+    expect(await (await viewer.get(metric)).text()).toContain('预览影响');
+    const res = await viewer.post(metric, { intent: 'impact' });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toMatch(/data-impact-metric[^>]*>指标 revenue：取值变化 5 人，新增 0 人，移出 0 人</);
+    expect(html).toMatch(/data-impact-tag="buyer".*?带维度/s);
+    expect(html).not.toMatch(/zhang@crm\.test|13800000001/);
+
+    // 标签草稿换了取值的名字：有订单的 5 个消费者从 high 换成 vip
+    await saveDslDraft(author, 'tag', 'buyer', 'metric: revenue\nrules:\n  - { value: vip, when: { gte: 1 } }\ndefault: low\n');
+    const tag = await (await viewer.post('/analytics/definitions/tag/buyer', { intent: 'impact' })).text();
+    expect(tag).toMatch(/data-impact-tag="buyer".*?high → vip：5 人/s);
+    expect((await viewer.post('/analytics/definitions/metric/missing', { intent: 'impact' })).status).toBe(404);
   });
 
   it('发布不了的成员在版本表里看到原因；另一位数据工程师发布后入队 gold.dsl；丢弃草稿回到已发布版本，从没发布过时删除定义回到分析页', async () => {

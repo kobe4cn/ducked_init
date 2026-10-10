@@ -1,6 +1,6 @@
 // app/.server/pipeline/dsl/tag-spec.ts —— 标签定义（YAML，ADR-0025）：引用一个已发布、没有维度、取值为数字的指标，按规则给每个消费者一个取值。
 // 规则按顺序取第一条命中的（when 里的条件全部满足才算命中），都没命中的取 default；取值是分析师写的常量。
-// 标签只认指标最新的已发布版本（DslContext.metrics），指标草稿不影响标签。编译时把这一版指标的 SQL 内联成 CTE（不读指标快照），
+// 标签只认指标最新的已发布版本（DslContext.metrics），指标草稿不影响标签（发布前的影响预览用 withMetric 换成草稿来算）。编译时把这一版指标的 SQL 内联成 CTE（不读指标快照），
 // 结果覆盖指标结果里的每个消费者，列为 consumer_id、tag_key、tag_value；tag_key 是定义行上不变的键，写成字面量。
 // 纯函数：不碰平台库与数据湖，同样的定义与 asOf 编译出同样的 SQL
 import { Ajv } from 'ajv';
@@ -61,6 +61,10 @@ function metricOf(key: string, ctx: DslContext): MetricSpec | string {
   if (!isNumericMetric(metric.spec, ctx)) return `指标 ${key} 的取值不是数字，标签的规则比不了大小`;
   return metric.spec;
 }
+
+/** 把一个指标换成指定的版本（如草稿）后的上下文：影响预览按它校验、编译下游标签 */
+export const withMetric = (ctx: DslContext, key: string, metric: DslCheck<MetricSpec>): DslContext =>
+  ({ ...ctx, metrics: new Map(ctx.metrics).set(key, metric) });
 
 /** 编译用：引用的指标（校验已通过，不能用时说明调用方传错了定义） */
 function requireMetric(spec: TagSpec, ctx: DslContext): MetricSpec {

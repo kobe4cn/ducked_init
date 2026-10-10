@@ -1,12 +1,13 @@
 // app/routes/analytics.definitions.$kind.$key.tsx —— 指标或标签定义（有定义查看权限的成员，页面与种类无关，ADR-0025）：
 // YAML 编辑框（有起草权限的成员保存草稿，校验不通过时按行列列出问题）、最新一版编译出的 SQL 与样本预览（只读挂载上按今天运行，前 50 行与总行数），
 // 以及各版本的作者与最后保存的人；草稿由最后保存它的人以外的另一位有发布权限的成员发布（发布后以当天入队一次计算，成功后快照出现在分析页），也可以丢弃。
+// 有草稿且有已发布版本时可以预览发布的影响：指标与受影响的下游标签按两版结果对比的消费者计数（只读挂载上按今天算，不出消费者 ID）。
 // 有修改与删除权限的成员可以删除定义（被已发布标签引用的指标删不了）
-import { CheckCircle2, Lock, Trash2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Lock, Trash2 } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.$kind.$key';
 import { can, requirePermission } from '~/.server/access';
-import { deleteDefinition, discardDslDraft, DslError, getDefinition, previewDefinition, publishDefinition, saveDslDraft } from '~/.server/dsl-definitions';
+import { deleteDefinition, discardDslDraft, DslError, getDefinition, impactOf, previewDefinition, publishDefinition, saveDslDraft } from '~/.server/dsl-definitions';
 import { navFor } from '~/.server/nav';
 import { UNLINKED } from '~/.server/pipeline/dsl/metric-spec';
 import { publishReason } from '~/.server/publish-rules';
@@ -93,13 +94,19 @@ export async function action({ request, params }: Route.ActionArgs) {
       case 'preview': {
         const member = await requirePermission(request, 'definitions:read');
         const preview = await previewDefinition(member, params.kind, params.key, Number(form.get('version')) || undefined);
-        return { error: null, issues: [], yaml: null, preview };
+        return { error: null, issues: [], yaml: null, preview, impact: null };
+      }
+      case 'impact': {
+        const member = await requirePermission(request, 'definitions:read');
+        const impact = await impactOf(member, params.kind, params.key);
+        if (!impact) return data({ error: '没有草稿或还没有发布过，没有可预览的影响', issues: [], yaml: null, preview: null, impact: null }, { status: 400 });
+        return { error: null, issues: [], yaml: null, preview: null, impact };
       }
       default:
-        return data({ error: '未知操作', issues: [], yaml: null, preview: null }, { status: 400 });
+        return data({ error: '未知操作', issues: [], yaml: null, preview: null, impact: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof DslError) return data({ error: e.message, issues: e.issues, yaml: intent === 'save' ? yaml : null, preview: null }, { status: e.status });
+    if (e instanceof DslError) return data({ error: e.message, issues: e.issues, yaml: intent === 'save' ? yaml : null, preview: null, impact: null }, { status: e.status });
     throw e;
   }
 }
@@ -112,6 +119,8 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
   const submitting = navigation.state === 'submitting';
   const previewing = submitting && navigation.formData?.get('intent') === 'preview';
   const preview = actionData?.preview ?? null;
+  const impacting = submitting && navigation.formData?.get('intent') === 'impact';
+  const impact = actionData?.impact ?? null;
   const draft = versions.find(v => v.status === 'draft');
   const editing = actionData?.yaml ?? yaml;
   return (
@@ -155,7 +164,7 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
         <h2 className="mb-4 font-medium">{draft ? `第 ${draft.version} 版草稿` : canDraft ? '编辑定义（保存后成为新的一版草稿）' : '生效的定义'}</h2>
         <Form method="post" className="space-y-4">
           <MappingEditor key={editing} defaultValue={editing} readOnly={!canDraft} />
-          {canDraft && <Button type="submit" name="intent" value="save" disabled={submitting}>{submitting && !previewing ? '正在校验…' : '校验并保存草稿'}</Button>}
+          {canDraft && <Button type="submit" name="intent" value="save" disabled={submitting}>{submitting && !previewing && !impacting ? '正在校验…' : '校验并保存草稿'}</Button>}
         </Form>
       </div>
 
@@ -209,6 +218,74 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
           </>
         )}
       </div>
+
+      {draft && published && (
+        <div className="rounded-2xl border bg-white p-6 shadow-sm">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="font-medium">发布的影响</h2>
+              <p className="text-sm text-slate-500">
+                {`在只读挂载的数据湖上按今天分别运行生效的第 ${published} 版与第 ${draft.version} 版草稿，按消费者对比，只给人数`}
+                {kind === 'metric' ? '；受影响的是引用这个指标的已发布标签（按草稿指标重算）。' : '。'}
+              </p>
+            </div>
+            <Form method="post">
+              <input type="hidden" name="intent" value="impact" />
+              <Button type="submit" variant="outline" disabled={submitting}>{impacting ? '正在计算…' : '预览影响'}</Button>
+            </Form>
+          </div>
+          {impact && (
+            <div data-impact className="space-y-4">
+              <p className="text-sm text-slate-500">{`第 ${impact.published} 版 → 第 ${impact.version} 版，统计日 ${impact.asOf}`}</p>
+              {impact.metric && (
+                <p data-impact-metric className="text-sm">
+                  {`指标 ${key}：取值变化 ${impact.metric.changed} 人，新增 ${impact.metric.added} 人，移出 ${impact.metric.removed} 人`}
+                </p>
+              )}
+              {impact.tags.length
+                ? (
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>受影响的标签</TableHead>
+                        <TableHead>换了取值</TableHead>
+                        <TableHead>新增</TableHead>
+                        <TableHead>移出</TableHead>
+                        <TableHead>原取值 → 新取值</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {impact.tags.map(t => (
+                        <TableRow key={t.key} data-impact-tag={t.key}>
+                          <TableCell><Link to={`/analytics/definitions/tag/${t.key}`} className="hover:underline">{t.key}</Link></TableCell>
+                          {t.issue
+                            ? (
+                              <TableCell colSpan={4} className="text-red-600">
+                                <span className="flex items-center gap-1"><AlertTriangle className="size-3.5 shrink-0" />{t.issue}</span>
+                              </TableCell>
+                            )
+                            : (
+                              <>
+                                <TableCell>{t.changed}</TableCell>
+                                <TableCell>{t.added}</TableCell>
+                                <TableCell>{t.removed}</TableCell>
+                                <TableCell className="text-slate-500">
+                                  {t.transitions.length
+                                    ? t.transitions.map(x => `${x.before ?? '（无）'} → ${x.after ?? '（无）'}：${x.consumers} 人`).join('；')
+                                    : '没有变化'}
+                                </TableCell>
+                              </>
+                            )}
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                )
+                : <p className="text-sm text-slate-500">没有引用这个指标的已发布标签。</p>}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="rounded-2xl border bg-white p-6 shadow-sm">
         <h2 className="mb-4 font-medium">版本</h2>

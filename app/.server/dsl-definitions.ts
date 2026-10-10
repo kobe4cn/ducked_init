@@ -1,21 +1,25 @@
 // app/.server/dsl-definitions.ts —— 指标与标签定义（ADR-0025）：成员用 YAML 写定义，按种类（pipeline/dsl 的注册表）校验通过才能保存为草稿。
 // 键在租户与种类内唯一；每个定义同时只有一份草稿，再次保存改的是同一份，记下作者与最后保存的人，之后按映射同样的规则双人发布（ADR-0015）。
-// 校验对照本租户已发布的自定义实体登记与已发布映射的扩展字段（标签另对照各指标最新的已发布版本）；定义页展示编译出的 SQL，并可在只读挂载的数据湖上预览前 50 行。
+// 校验对照本租户已发布的自定义实体登记与已发布映射的扩展字段（标签另对照各指标最新的已发布版本）；定义页展示编译出的 SQL，并可在只读挂载的数据湖上预览前 50 行，
+// 有草稿且有已发布版本时还能预览发布的影响（两版结果按消费者对比，只给计数）。
 // 发布后版本锁定，并以当天为 asOf 入队一次 gold.dsl（编译在入队时完成，SQL 进任务参数），成功后登记为一张快照（template 为 <种类>:<键>）。
 // 有修改与删除权限的成员可以删除定义；被已发布标签引用的指标不能删（依赖由已发布版本按需解析，dsl-dependencies.ts）。
 // 一律限定在操作者所属租户内
+import type { DuckDBConnection } from '@duckdb/node-api';
 import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { publishedCustomEntities } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
-import { publishedTagsOf } from './dsl-dependencies';
+import { publishedTagsOf, publishedTagsReferencing } from './dsl-dependencies';
 import { dslDefinitions, dslVersions } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { lockTenant, publishedPlans } from './mappings';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
+import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
 import { checkMetric, type DslCheck, type DslContext, type DslIssue, type MetricSpec } from './pipeline/dsl/metric-spec';
+import { withMetric } from './pipeline/dsl/tag-spec';
 import { IDENTITIES } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { lit, rows } from './pipeline/merge-engine';
@@ -241,6 +245,33 @@ const PREVIEW_ROWS = 50;
 const PREVIEW_LIMITS = { memoryLimitMb: 512, threads: 1 };
 
 /**
+ * 在只读挂载的数据湖上运行 run：先确认标准层已有 entities 与身份打通结果，没有时抛出说明（what 是操作名，如「预览」）；
+ * 查询出错时报错里抹掉湖的凭据。只读：不建表、不入队任务、不登记快照
+ */
+async function onReadOnlyLake<T>(tenantId: string, entities: string[], what: string, run: (con: DuckDBConnection) => Promise<T>): Promise<T> {
+  const lake = await lakeRow(tenantId);
+  if (!lake || !lakeReady(lake)) throw new DslError('本租户的数据湖还没有初始化');
+  const spec = lakeSpecOf(lake);
+  const session = await openTenantLake(spec, PREVIEW_LIMITS, undefined, { readOnly: true });
+  try {
+    const present = new Set((await rows<{ name: string }>(session.con, `
+      SELECT table_name AS name FROM information_schema.tables
+      WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities'].map(lit).join(', ')})`)).map(t => t.name));
+    const missing = entities.filter(entity => !present.has(entity));
+    if (missing.length) {
+      throw new DslError(`标准层还没有 ${missing.map(entity => `silver.${entity}`).join('、')}：先发布 ${missing.join('、')} 的映射并合并，再${what}`);
+    }
+    if (!present.has('_identities')) throw new DslError(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并，再${what}`);
+    return await run(session.con);
+  } catch (e) {
+    if (e instanceof DslError) throw e;
+    throw new DslError(`${what}失败：${redactLakeSecrets((e as Error).message, spec)}`);
+  } finally {
+    session.close();
+  }
+}
+
+/**
  * 样本预览：在只读挂载的数据湖上按今天（UTC）运行定义第 version 版（默认最新一版）编译出的 SQL，返回列名、前 50 行与总行数。
  * 只执行一条 SELECT：不建表、不入队任务、不登记快照。标准层还没有定义用到的实体或身份打通结果时抛出说明；
  * 结果只有 consumer_id、维度与值，或标签的键与取值（敏感字段在校验时已被拒），查询出错时报错里抹掉湖的凭据
@@ -256,23 +287,10 @@ export async function previewDefinition(actor: CurrentMember, kind: string, key:
   const ctx = await dslContext(getDb(), actor.tenant.id);
   const checked = DSL_KINDS[kind].check(row.yaml, ctx);
   if (!checked.ok) throw new DslError('对照当前已发布的登记与映射，这一版不再通过校验，不能预览', 400, checked.issues);
-  const lake = await lakeRow(actor.tenant.id);
-  if (!lake || !lakeReady(lake)) throw new DslError('本租户的数据湖还没有初始化');
   const asOf = todayUtc();
   const sql = DSL_KINDS[kind].compile(checked.spec, ctx, asOf, key);
-  const spec = lakeSpecOf(lake);
-  const session = await openTenantLake(spec, PREVIEW_LIMITS, undefined, { readOnly: true });
-  try {
-    const entities = DSL_KINDS[kind].entities(checked.spec, ctx);
-    const present = new Set((await rows<{ name: string }>(session.con, `
-      SELECT table_name AS name FROM information_schema.tables
-      WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities'].map(lit).join(', ')})`)).map(t => t.name));
-    const missing = entities.filter(entity => !present.has(entity));
-    if (missing.length) {
-      throw new DslError(`标准层还没有 ${missing.map(entity => `silver.${entity}`).join('、')}：先发布 ${missing.join('、')} 的映射并合并，再预览`);
-    }
-    if (!present.has('_identities')) throw new DslError(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并，再预览`);
-    const reader = await session.con.runAndReadAll(
+  return onReadOnlyLake(actor.tenant.id, DSL_KINDS[kind].entities(checked.spec, ctx), '预览', async con => {
+    const reader = await con.runAndReadAll(
       `SELECT *, count(*) OVER () AS _preview_total FROM (${sql}) ORDER BY ALL LIMIT ${PREVIEW_ROWS}`);
     const columns = reader.columnNames().filter(c => c !== '_preview_total');
     const result = reader.getRowObjectsJson() as Record<string, string | number | boolean | null>[];
@@ -283,10 +301,91 @@ export async function previewDefinition(actor: CurrentMember, kind: string, key:
       total: Number(result[0]?._preview_total ?? 0),
       rows: result.map(({ _preview_total: _, ...r }) => r),
     };
-  } catch (e) {
-    if (e instanceof DslError) throw e;
-    throw new DslError(`预览失败：${redactLakeSecrets((e as Error).message, spec)}`);
-  } finally {
-    session.close();
+  });
+}
+
+/** 两版结果对比的消费者数：换了取值、只在草稿里有（新增）、只在已发布版本里有（移出） */
+export interface DiffCounts { changed: number; added: number; removed: number }
+
+/** 取值有变的一组人：新增的 before 为空，移出的 after 为空 */
+export interface TagTransition { before: string | null; after: string | null; consumers: number }
+
+/** 一个受影响的标签：两版结果对比的计数与按「原取值 → 新取值」的分组；草稿让它不再通过校验时只有原因（issue），计数为 0 */
+export interface TagImpact extends DiffCounts {
+  key: string;
+  issue: string | null;
+  transitions: TagTransition[];
+}
+
+/**
+ * 发布前的影响预览：定义有草稿且有已发布版本时（否则返回 null），在只读挂载的数据湖上按今天（UTC）分别运行已发布版本与草稿，按 consumer_id 对比，只给计数。
+ * 指标草稿：它自己取值变化、新增、移出的消费者数，以及引用它的每个已发布标签（最新的已发布版本，内联草稿指标）的 TagImpact；
+ * 草稿让某个标签不再通过校验（如加了维度）时，那个标签只给出原因。标签草稿：只有它自己。
+ * 不出 consumer_id 与明文，不建表、不入队任务、不登记快照
+ */
+export async function impactOf(actor: CurrentMember, kind: string, key: string) {
+  assertCan(actor, 'definitions:read');
+  requireKind(kind);
+  const versions = await getDb().select({ version: dslVersions.version, status: dslVersions.status, yaml: dslVersions.yaml }).from(dslVersions)
+    .innerJoin(dslDefinitions, eq(dslDefinitions.id, dslVersions.definitionId))
+    .where(ofDefinition(actor.tenant.id, kind, key))
+    .orderBy(desc(dslVersions.version));
+  if (!versions.length) throw new DslError(`没有键为 ${key} 的${DSL_KINDS[kind].label}`, 404);
+  const draft = versions.find(v => v.status === 'draft');
+  const published = versions.find(v => v.status === 'published');
+  if (!draft || !published) return null;
+
+  const ctx = await dslContext(getDb(), actor.tenant.id);
+  const asOf = todayUtc();
+  /** 按 c 校验并编译一版，带上用到的实体；不通过时返回问题 */
+  const compile = (k: DslKind, defKey: string, yaml: string, c: DslContext) => {
+    const checked = DSL_KINDS[k].check(yaml, c);
+    if (!checked.ok) return checked;
+    return { ok: true as const, sql: DSL_KINDS[k].compile(checked.spec, c, asOf, defKey), entities: DSL_KINDS[k].entities(checked.spec, c) };
+  };
+  const before = compile(kind, key, published.yaml, ctx);
+  if (!before.ok) throw new DslError(`对照当前已发布的登记与映射，生效的第 ${published.version} 版不再通过校验，算不了影响`, 400, before.issues);
+  const after = compile(kind, key, draft.yaml, ctx);
+  if (!after.ok) throw new DslError(`对照当前已发布的登记与映射，第 ${draft.version} 版草稿不再通过校验，算不了影响`, 400, after.issues);
+
+  // 受影响的标签：标签草稿是它自己；指标草稿是引用它的已发布标签，旧的按已发布的指标、新的按草稿指标编译
+  const entities = new Set([...before.entities, ...after.entities]);
+  const tags: ({ key: string; before: string; after: string } | { key: string; issue: string })[] = [];
+  if (kind === 'tag') tags.push({ key, before: before.sql, after: after.sql });
+  else {
+    const draftCtx = withMetric(ctx, key, checkMetric(draft.yaml, ctx));
+    for (const tag of await publishedTagsReferencing(getDb(), actor.tenant.id, key)) {
+      const old = compile('tag', tag.key, tag.yaml, ctx);
+      const next = compile('tag', tag.key, tag.yaml, draftCtx);
+      if (!old.ok) tags.push({ key: tag.key, issue: `生效的版本对照当前的登记与映射不再通过校验：${old.issues.map(i => i.message).join('；')}` });
+      else if (!next.ok) tags.push({ key: tag.key, issue: `按草稿不再通过校验，发布后算不出来：${next.issues.map(i => i.message).join('；')}` });
+      else {
+        for (const entity of [...old.entities, ...next.entities]) entities.add(entity);
+        tags.push({ key: tag.key, before: old.sql, after: next.sql });
+      }
+    }
   }
+
+  return onReadOnlyLake(actor.tenant.id, [...entities], '预览影响', async con => {
+    const impacts: TagImpact[] = [];
+    for (const tag of tags) {
+      if ('issue' in tag) {
+        impacts.push({ key: tag.key, issue: tag.issue, changed: 0, added: 0, removed: 0, transitions: [] });
+        continue;
+      }
+      const transitions = await rows<TagTransition>(con, compileTagDiff(tag.before, tag.after));
+      const count = (match: (t: TagTransition) => boolean) => transitions.filter(match).reduce((n, t) => n + t.consumers, 0);
+      impacts.push({
+        key: tag.key, issue: null, transitions,
+        changed: count(t => t.before !== null && t.after !== null), added: count(t => t.before === null), removed: count(t => t.after === null),
+      });
+    }
+    return {
+      version: draft.version,
+      published: published.version,
+      asOf,
+      metric: kind === 'metric' ? (await rows<DiffCounts>(con, compileMetricDiff(before.sql, after.sql)))[0]! : null,
+      tags: impacts,
+    };
+  });
 }
