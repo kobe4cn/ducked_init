@@ -12,6 +12,7 @@ import { CheckCircle2, CircleAlert, CircleCheck, PencilLine, PlugZap, Plus, Refr
 import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
+import { getKeyChecks } from '~/.server/source-key-check';
 import { getSyncStatus, syncSource } from '~/.server/source-sync';
 import { getVerifyStatus, notInLakeReason, verifySource } from '~/.server/source-verify';
 import { listSourceViews, type SourceViewSummary } from '~/.server/source-views';
@@ -22,6 +23,7 @@ import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import type { DataCheck, FailedCheck, FileCheck, StructureCheck, VerifyRecord } from '~/.server/pipeline/verify-engine';
 import { formValues, LAKE_COVERAGE, SOURCE_KIND_LABELS, SYNC_MODES, targetOf, type LakeCoverage } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
+import { KeyCheckFindings } from '~/components/key-check-findings';
 import { KindIcon } from '~/components/kind-icon';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
@@ -65,6 +67,19 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     const sync = await getSyncStatus(member, params.sourceId);
     const verify = await getVerifyStatus(member, params.sourceId);
     const { views } = await listSourceViews(member, params.sourceId);
+    const keyChecks = await getKeyChecks(member, params.sourceId);
+    /**
+     * 表最近一次业务主键检查：排队或运行中为 running，有空值或重复为 failed（带结果），任务出错为 error；
+     * 通过的已写回声明，不再单独显示。检查期间与不通过时，原有声明照旧生效
+     */
+    const keyCheckOf = (name: string) => {
+      const c = keyChecks.get(name);
+      if (!c) return null;
+      const { keyColumns } = c;
+      if (c.status === 'queued' || c.status === 'running') return { status: 'running' as const, keyColumns };
+      if (c.status === 'failed' || !c.result) return { status: 'error' as const, keyColumns, error: c.error ?? '未知错误' };
+      return c.result.ok ? null : { status: 'failed' as const, keyColumns, result: c.result };
+    };
     /** 同步范围内的表没有进湖的原因（同步成功过的为 null） */
     const notInLake = (name: string) => {
       const t = source.listing.find(l => l.name === name)!;
@@ -99,7 +114,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         notInLake: t.inScope ? notInLake(t.name) : null,
       })),
       newTables: source.newTables,
-      tables: source.tables.map(t => ({ ...t, notInLake: notInLake(t.name) })),
+      tables: source.tables.map(t => ({ ...t, notInLake: notInLake(t.name), keyCheck: t.primaryKey.length ? null : keyCheckOf(t.name) })),
       sync: {
         status: sync.status,
         statusLabel: sync.status === 'none' ? '未同步' : TASK_STATUS_LABELS[sync.status],
@@ -423,7 +438,8 @@ function Watermark({ table, canWrite, submitting }: { table: TableView; canWrite
 }
 
 /**
- * 主键：源端主键；没有时成员可以声明业务主键（一列或多列，平台标出样本中唯一的单列作参考，确认前在源端校验）。
+ * 主键：源端主键；没有时成员可以声明业务主键（一列或多列，平台标出样本中唯一的单列作参考，在源端全表检查通过后才生效）。
+ * 检查进行中与不通过时，在当前生效的声明下面显示新声明的检查状态；不通过时列出空值行数与重复键。
  * 都没有时，全量比对按整行比对（修改记为一删一增），水位线同步的增量行一律记为新增、每天整行比对一次补上删除
  */
 function Key({ table, canWrite, submitting }: { table: TableView; canWrite: boolean; submitting: boolean }) {
@@ -442,6 +458,7 @@ function Key({ table, canWrite, submitting }: { table: TableView; canWrite: bool
             : '没有主键：增量行一律记为新增；每天整行全量比对一次，补上源端的删除'}
         </div>
       )}
+      {table.keyCheck && <KeyCheck check={table.keyCheck} />}
       {canWrite && table.keyEligibleColumns.length > 0 && (
         <details>
           <summary className="cursor-pointer text-muted-foreground select-none">
@@ -459,12 +476,30 @@ function Key({ table, canWrite, submitting }: { table: TableView; canWrite: bool
                 </label>
               ))}
             </div>
-            <Button type="submit" variant="outline" size="sm" disabled={submitting}>在源端校验并确认</Button>
+            <Button type="submit" variant="outline" size="sm" disabled={submitting || table.keyCheck?.status === 'running'}>在源端全表检查并确认</Button>
           </Form>
         </details>
       )}
     </div>
   );
+}
+
+/** 新声明的业务主键检查：进行中、没通过（空值行数与重复键）或检查出错 */
+function KeyCheck({ check }: { check: NonNullable<TableView['keyCheck']> }) {
+  const columns = check.keyColumns.join('、');
+  switch (check.status) {
+    case 'running':
+      return <StatusText tone="pending" data-keycheck-status="running">{`正在全表检查新声明：${columns}`}</StatusText>;
+    case 'error':
+      return <StatusText tone="bad" data-keycheck-status="error">{`新声明 ${columns} 检查出错：${check.error}`}</StatusText>;
+    case 'failed':
+      return (
+        <div className="space-y-0.5">
+          <StatusText tone="bad" data-keycheck-status="failed">{`新声明 ${columns} 未通过全表检查，没有生效`}</StatusText>
+          <KeyCheckFindings result={check.result} className="pl-5" />
+        </div>
+      );
+  }
 }
 
 /** 软删除字段：有主键（源端主键或业务主键）的表可以从候选中确认，标记为删除的行同步时记为删除 */
@@ -737,13 +772,14 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
   const profiling = profile.status === 'queued' || profile.status === 'running';
   const syncing = sync.status === 'queued' || sync.status === 'running';
   const verifying = verify.status === 'queued' || verify.status === 'running';
-  // 采集、同步与核对在调度器里异步进行：进行中时定时刷新，结束后停下
+  const keyChecking = tables.some(t => t.keyCheck?.status === 'running');
+  // 采集、同步、核对与业务主键检查在调度器里异步进行：进行中时定时刷新，结束后停下
   const revalidator = useRevalidator();
   useEffect(() => {
-    if (!profiling && !syncing && !verifying) return;
+    if (!profiling && !syncing && !verifying && !keyChecking) return;
     const timer = setInterval(() => { if (revalidator.state === 'idle') revalidator.revalidate(); }, 2000);
     return () => clearInterval(timer);
-  }, [profiling, syncing, verifying, revalidator]);
+  }, [profiling, syncing, verifying, keyChecking, revalidator]);
   const synced = Object.entries(sync.history);
   const values = actionData?.values ?? { name: source.name, ...source.config };
   const base = `/sources/${source.id}`;

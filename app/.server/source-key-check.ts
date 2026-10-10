@@ -68,17 +68,20 @@ export async function applyKeyCheck(tenantId: string, taskId: string) {
   });
 }
 
-/** 数据源每张表最近一次业务主键检查：表名 → 状态、结果与错误 */
+/** 数据源每张表最近一次业务主键检查：表名 → 检查的声明、状态、结果与错误 */
 export async function getKeyChecks(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'sources:read');
   await requireSource(actor.tenant.id, sourceId);
   const checks = await getDb().select().from(tasks).where(ofSource(actor.tenant.id, sourceId, ['source.keycheck']))
     .orderBy(desc(tasks.createdAt), desc(tasks.id));
-  const latest = new Map<string, { status: TaskStatus; result: KeyCheckTaskResult | null; error: string | null }>();
+  const latest = new Map<string, { keyColumns: string[]; status: TaskStatus; result: KeyCheckTaskResult | null; error: string | null }>();
   for (const t of checks) {
-    const tableName = (t.params as Partial<KeyCheckTaskParams>).tableName;
+    const { tableName, keyColumns } = t.params as Partial<KeyCheckTaskParams>;
     if (typeof tableName === 'string' && !latest.has(tableName)) {
-      latest.set(tableName, { status: t.status as TaskStatus, result: t.result as KeyCheckTaskResult | null, error: t.error });
+      latest.set(tableName, {
+        keyColumns: Array.isArray(keyColumns) ? keyColumns : [],
+        status: t.status as TaskStatus, result: t.result as KeyCheckTaskResult | null, error: t.error,
+      });
     }
   }
   return latest;

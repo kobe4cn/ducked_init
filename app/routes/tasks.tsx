@@ -4,7 +4,9 @@ import { requireMember } from '~/.server/auth';
 import { navFor } from '~/.server/nav';
 import { listTasks, TASK_PAGE_SIZE, TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel } from '~/lib/canonical-model';
+import type { KeyCheckTaskResult } from '~/.server/source-key-check';
 import { AppShell } from '~/components/app-shell';
+import { KeyCheckFindings } from '~/components/key-check-findings';
 import { PageHeader } from '~/components/page-header';
 import { StatusText, TASK_TONES } from '~/components/status-text';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
@@ -16,7 +18,8 @@ export function meta({}: Route.MetaArgs) {
 // 工作进程回传的结果（pipeline/worker.ts）：各类任务都带按表的结果与运行时生效的配额。各类任务的表结构不同：
 // 盘点与采集是 { name, rows }，同步是 { table, rows }（失败或源端已删除的表没有 rows），核对是 { table, sourceRows }；
 // 合并到标准层按映射给出 { entity, table, rows }（失败或跳过的映射没有 rows）；
-// RFM 分层只写一张快照表，表名与行数在顶层 { table, rows, unlinkedOrders, params }；快照过期的 tables 是删掉的表名 string[]
+// RFM 分层只写一张快照表，表名与行数在顶层 { table, rows, unlinkedOrders, params }；快照过期的 tables 是删掉的表名 string[]；
+// 校验业务主键没有表清单，结果是 { tableName, keyColumns, ok, nullRows, duplicates }（source-key-check.ts）
 type RawTable = { name?: string; table?: string; rows?: unknown; sourceRows?: unknown };
 type RawMapping = { entity?: string; table?: string; rows?: unknown };
 interface RawResult {
@@ -25,6 +28,11 @@ interface RawResult {
   table?: unknown;
   rows?: unknown;
   unlinkedOrders?: unknown;
+  tableName?: unknown;
+  keyColumns?: unknown;
+  ok?: unknown;
+  nullRows?: unknown;
+  duplicates?: unknown;
   engine?: { memoryLimit: string; threads: number };
 }
 interface TaskResult {
@@ -32,6 +40,8 @@ interface TaskResult {
   tables: { name: string; rows: number | null; dropped?: true }[];
   /** RFM 分层：打通不到消费者、没计入的订单数 */
   unlinkedOrders?: number;
+  /** 校验业务主键：是否通过、空值行数与前几个重复键（敏感列的 key 为 null） */
+  keyCheck?: KeyCheckTaskResult;
   engine?: RawResult['engine'];
 }
 
@@ -47,7 +57,10 @@ function taskResult(raw: RawResult | null): TaskResult | null {
   }
   if (typeof raw.table === 'string') tables.push({ name: raw.table, rows: typeof raw.rows === 'number' ? raw.rows : null });
   const unlinkedOrders = typeof raw.unlinkedOrders === 'number' ? raw.unlinkedOrders : undefined;
-  return { tables, unlinkedOrders, engine: raw.engine };
+  const isKeyCheck = typeof raw.tableName === 'string' && typeof raw.ok === 'boolean' && typeof raw.nullRows === 'number'
+    && Array.isArray(raw.keyColumns) && Array.isArray(raw.duplicates);
+  const keyCheck = isKeyCheck ? raw as KeyCheckTaskResult : undefined;
+  return { tables, unlinkedOrders, keyCheck, engine: raw.engine };
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -74,12 +87,20 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
-function ResultDetails({ result: { tables, unlinkedOrders, engine } }: { result: TaskResult }) {
+function ResultDetails({ result: { tables, unlinkedOrders, keyCheck, engine } }: { result: TaskResult }) {
   return (
     <details className="text-xs text-muted-foreground">
       <summary className="cursor-pointer select-none">查看结果</summary>
       <div className="mt-1 space-y-1 pl-3">
-        {tables.length ? (
+        {keyCheck ? (
+          <div className="space-y-0.5">
+            <div data-keycheck-result={keyCheck.tableName}>
+              {`${keyCheck.tableName} 的业务主键 ${keyCheck.keyColumns.join('、')}：`}
+              <StatusText tone={keyCheck.ok ? 'ok' : 'bad'} className="text-xs">{keyCheck.ok ? '通过' : '不通过'}</StatusText>
+            </div>
+            {!keyCheck.ok && <KeyCheckFindings result={keyCheck} className="pl-3" />}
+          </div>
+        ) : tables.length ? (
           <ul>
             {/* 同步结果按批次记录，同一张表可能出现多次（如增量后接全量比对），key 要带上序号 */}
             {tables.map((t, i) => (

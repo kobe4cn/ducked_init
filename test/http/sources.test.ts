@@ -195,6 +195,38 @@ describe('列统计与水位线', () => {
     expect(await rejected.text()).toContain('已有主键 customer_id');
   });
 
+  it('声明业务主键后显示全表检查的进度，检查期间原有声明照旧生效；不通过时列出重复键与空值行数，任务页显示同样的结果', async () => {
+    const { browser } = await engineerOf('acme');
+    const id = await registerAndSelect(browser, await pgSourceInput(READER));
+    const page = async () => (await browser.get(`/sources/${id}`)).text();
+
+    await browser.post(`/sources/${id}`, { intent: 'confirm-key', table: 'regions', column: 'code' });
+    expect(await page()).toMatch(/data-table="regions"[\s\S]*?data-no-key[\s\S]*?data-keycheck-status="running"[^>]*>正在全表检查新声明：code/);
+    const again = await browser.post(`/sources/${id}`, { intent: 'confirm-key', table: 'regions', column: 'name' });
+    expect(again.status).toBe(400);
+    expect(await again.text()).toContain('regions 已有一次业务主键检查在排队或运行中');
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    expect(await page()).not.toContain('data-keycheck-status=');
+
+    await browser.post(`/sources/${id}`, { intent: 'confirm-key', table: 'regions', column: 'name' });
+    expect(await page()).toMatch(/data-declared-key="code"[\s\S]*?data-keycheck-status="running"[^>]*>正在全表检查新声明：name/);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    expect(await page()).toContain('data-declared-key="name"');
+
+    await browser.post(`/sources/${id}`, { intent: 'confirm-key', table: 'events', column: 'customer_id' });
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    expect(await page()).toMatch(new RegExp([
+      'data-table="events"[\\s\\S]*?data-no-key',
+      'data-keycheck-status="failed"[^>]*>新声明 customer_id 未通过全表检查',
+      'data-keycheck-null-rows[^>]*>空值 0 行',
+      'data-keycheck-duplicate[^>]*>customer_id=1 出现 38 次',
+    ].join('[\\s\\S]*?')));
+
+    const tasksPage = await (await browser.get('/tasks')).text();
+    expect(tasksPage).toMatch(/data-task-kind="source.keycheck"[\s\S]*?data-keycheck-result="events"[^>]*>events 的业务主键 customer_id：(?:<[^>]+>)*不通过[\s\S]*?空值 0 行[\s\S]*?customer_id=1 出现 38 次[\s\S]*?运行配额/);
+    expect(tasksPage).toMatch(/data-keycheck-result="regions"[^>]*>regions 的业务主键 name：(?:<[^>]+>)*通过/);
+  });
+
   it('账号读不了某些表时：测试连接与数据源页都列出这些表，采集跳过它们；一张都读不了时拒绝登记并给出授权语句', async () => {
     const { browser } = await engineerOf('acme');
     const input = await pgSourceInput(READER);
