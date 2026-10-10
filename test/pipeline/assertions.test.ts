@@ -104,6 +104,8 @@ describe('error 断言阻断快照并告警', () => {
     expect((task!.result as { assertions: unknown[] }).assertions).toContainEqual(
       { name: 'primary_key_unique', level: 'error', entity: 'order', failed: 2, detail: 'order_id, _key_space' });
     await expectBlocked(acme, snapshot, /主键唯一（silver\.order，2 行不合格）/);
+    const rows = await onLake<{ assertion: string; key: string }>(acme, `SELECT assertion, "key" FROM silver._quarantine WHERE task_id = ${lit(task!.id)}`);
+    expect(rows).toEqual([{ assertion: 'primary_key_unique', key: '1' }, { assertion: 'primary_key_unique', key: '1' }]);
   });
 
   it('gold.dsl 只检查参数里的实体：读到负金额的订单时失败并告警，不读订单时照常产出', async () => {
@@ -175,5 +177,43 @@ describe('warn 断言只记录不阻断', () => {
     expect(await listSnapshots(acme)).toHaveLength(2);
     const runs = await assertionRuns(acme, task!.id);
     expect(JSON.parse(runs.find(r => r.entity === 'order')!.assertions)).toContainEqual(expect.objectContaining({ name: 'row_drop', previous: 11 }));
+  });
+});
+
+/** 湖里某个任务写进隔离区的行 */
+const quarantine = (acme: string, taskId: string) => onLake<{ assertion: string; level: string; entity: string; key: string; row: string }>(acme, `
+  SELECT assertion, level, entity, "key", "row"::VARCHAR AS "row" FROM silver._quarantine WHERE task_id = ${lit(taskId)} ORDER BY "key"`);
+
+describe('隔离区', () => {
+  it('error 断言失败时把不合格行写进 silver._quarantine（断言名、级别、实体、键、行 JSON），再让任务失败', async () => {
+    const { acme, sources } = await withRfmSnapshot();
+    await insertCrmOrder(acme, sources.crm, `'A7', 1, 'paid', -10, '2024-06-29 10:00', '2024-06-29 10:00', now()`);
+
+    const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
+    expect(task).toMatchObject({ status: 'failed' });
+    const rows = await quarantine(acme, task!.id);
+    expect(rows).toEqual([{ assertion: 'amount_non_negative', level: 'error', entity: 'order', key: 'A7', row: expect.any(String) }]);
+    expect(JSON.parse(rows[0].row)).toMatchObject({ order_id: 'A7', amount: -10 });
+  });
+
+  it('订单关联消费者告警时写孤儿订单；行数骤降不写行；没有失败的任务不写', async () => {
+    const { acme, sources } = await withRfmSnapshot();
+    const [first] = await onLake<{ task_id: string }>(acme, `SELECT task_id FROM silver._assertion_runs`);
+    expect(await quarantine(acme, first.task_id)).toEqual([]);
+
+    await grantOnSource(`INSERT INTO crm.orders VALUES ('A8', NULL, 'paid', 10, '2024-06-29 10:00', '2024-06-29 10:00', now()), ('A9', NULL, 'paid', 10, '2024-06-29 10:00', '2024-06-29 10:00', now())`);
+    await syncSource(await memberOf(acme, 'de@acme.com'), sources.crm);
+    await drain();
+    const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
+    expect(task).toMatchObject({ status: 'succeeded' });
+    const rows = await quarantine(acme, task!.id);
+    expect(rows).toHaveLength(3);
+    expect(rows.every(r => r.assertion === 'order_customer_link' && r.level === 'warn' && r.entity === 'order')).toBe(true);
+    expect(rows.map(r => r.key)).toEqual(expect.arrayContaining(['A8', 'A9']));
+
+    await onLake(acme, `DELETE FROM silver."order" WHERE order_id IN (SELECT order_id FROM silver."order" ORDER BY order_id LIMIT 8)`);
+    const dropped = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
+    expect((dropped!.result as { assertions: unknown[] }).assertions).toContainEqual(expect.objectContaining({ name: 'row_drop', entity: 'order', failed: 8 }));
+    expect((await quarantine(acme, dropped!.id)).map(r => r.assertion)).not.toContain('row_drop');
   });
 });

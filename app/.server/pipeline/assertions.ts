@@ -1,14 +1,18 @@
 // app/.server/pipeline/assertions.ts —— 内置断言（ADR-0026）：结果层任务计算前，对任务读到的标准实体检查数据质量。
 // error 级的断言失败时任务失败、不登记快照（外部继续读上一版）；warn 级只记录。结果只有断言名、实体、不合格行数与比例，不带行内容。
-// 每次运行给检查过的实体各追加一行到湖里的 silver._assertion_runs，行数骤降以它为基准（工作进程不连平台库）
+// 每次运行给检查过的实体各追加一行到湖里的 silver._assertion_runs，行数骤降以它为基准（工作进程不连平台库）。
+// 断言失败时，每条断言最多 SAMPLE_LIMIT 行不合格行的样本追加到湖里的隔离区 silver._quarantine；只从标准层取样（敏感字段只有哈希，ADR-0005），行数骤降不取样
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { entityOf } from '../../lib/canonical-model';
 import { lit } from './merge-engine';
 import { PartialFailure } from './partial-failure';
 
+/** error 失败时阻断任务，warn 只记录 */
+export type AssertionLevel = 'error' | 'warn';
+
 export interface AssertionResult {
   name: string;
-  level: 'error' | 'warn';
+  level: AssertionLevel;
   entity: string;
   /** 不合格的行数 */
   failed: number;
@@ -36,6 +40,9 @@ const MIN_ORDER_LINK_RATIO = 0.8;
 /** 行数少于上一次运行的这个比例时告警 */
 const MIN_ROW_RATIO = 0.5;
 const RUNS = 'silver._assertion_runs';
+const QUARANTINE = 'silver._quarantine';
+/** 每条失败的断言最多写进隔离区的行数 */
+export const SAMPLE_LIMIT = 100;
 
 /** 各实体的金额字段 */
 const AMOUNT_FIELDS: Record<string, string[]> = {
@@ -71,6 +78,8 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
   }
   await con.run(`CREATE TABLE IF NOT EXISTS ${RUNS} (task_id VARCHAR, entity VARCHAR, rows BIGINT, assertions JSON, "at" TIMESTAMPTZ)`);
   const results: AssertionResult[] = [];
+  /** 断言 → 取出它不合格行的 SELECT（未加 LIMIT） */
+  const samples = new Map<AssertionResult, string>();
   const rowCounts = new Map<string, number>();
   for (const entity of entities) {
     const present = columns.get(entity);
@@ -86,16 +95,30 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
         SELECT coalesce(sum(n), 0) AS n FROM (
           SELECT count(*) AS n FROM ${table} WHERE ${modelKey.map(k => `${ident(k)} IS NOT NULL`).join(' AND ')}
           GROUP BY ${key.map(ident).join(', ')} HAVING count(*) > 1)`);
-      results.push({ name: 'primary_key_unique', level: 'error', entity, failed: Number(n), detail: key.join(', ') });
+      const result: AssertionResult = { name: 'primary_key_unique', level: 'error', entity, failed: Number(n), detail: key.join(', ') };
+      results.push(result);
+      samples.set(result, `
+        SELECT t.* FROM ${table} t SEMI JOIN (
+          SELECT ${key.map(ident).join(', ')} FROM ${table} WHERE ${modelKey.map(k => `${ident(k)} IS NOT NULL`).join(' AND ')}
+          GROUP BY ${key.map(ident).join(', ')} HAVING count(*) > 1) d
+        ON ${key.map(k => `t.${ident(k)} IS NOT DISTINCT FROM d.${ident(k)}`).join(' AND ')}`);
     }
     const amounts = (AMOUNT_FIELDS[entity] ?? []).filter(f => present.has(f));
     if (amounts.length) {
-      const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${table} WHERE ${amounts.map(f => `${ident(f)} < 0`).join(' OR ')}`);
-      results.push({ name: 'amount_non_negative', level: 'error', entity, failed: Number(n), detail: amounts.join(', ') });
+      const negative = `SELECT * FROM ${table} WHERE ${amounts.map(f => `${ident(f)} < 0`).join(' OR ')}`;
+      const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM (${negative})`);
+      const result: AssertionResult = { name: 'amount_non_negative', level: 'error', entity, failed: Number(n), detail: amounts.join(', ') };
+      results.push(result);
+      samples.set(result, negative);
     }
     const customer = columns.get('customer');
     if (entity === 'order' && present.has('customer_id') && customer?.has('customer_id')) {
-      results.push(await orderCustomerLink(con, present.has('_source') && customer.has('_source')));
+      const bySource = present.has('_source') && customer.has('_source');
+      const result = await orderCustomerLink(con, bySource);
+      results.push(result);
+      samples.set(result, `
+        SELECT f.* FROM silver."order" f ANTI JOIN (SELECT DISTINCT customer_id AS k${bySource ? ', _source' : ''} FROM silver.customer) t
+          ON f.customer_id = t.k${bySource ? ' AND f._source = t._source' : ''}`);
     }
     const [lastRun] = await rows<{ rows: string }>(con, `SELECT rows FROM ${RUNS} WHERE entity = ${lit(entity)} ORDER BY "at" DESC LIMIT 1`);
     if (lastRun) {
@@ -104,7 +127,24 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
     }
   }
   await recordRuns(con, taskId, rowCounts, results);
+  await writeQuarantine(con, taskId, samples);
   return results;
+}
+
+/**
+ * 把每条失败断言的不合格行（最多 SAMPLE_LIMIT 行）追加进隔离区，表不存在时先建。
+ * 每行记断言、级别、实体、标准模型主键（多列用逗号连接）、整行 JSON、任务与时间
+ */
+async function writeQuarantine(con: DuckDBConnection, taskId: string, samples: ReadonlyMap<AssertionResult, string>) {
+  await con.run(`CREATE TABLE IF NOT EXISTS ${QUARANTINE} (assertion VARCHAR, level VARCHAR, entity VARCHAR, "key" VARCHAR, "row" JSON, task_id VARCHAR, "at" TIMESTAMPTZ)`);
+  for (const [r, sample] of samples) {
+    if (!r.failed) continue;
+    const key = entityOf(r.entity)!.key.map(k => `s.${ident(k)}::VARCHAR`).join(`, ',', `);
+    await con.run(`
+      INSERT INTO ${QUARANTINE}
+      SELECT ${lit(r.name)}, ${lit(r.level)}, ${lit(r.entity)}, concat(${key}), to_json(s), ${lit(taskId)}, now()
+      FROM (${sample} ORDER BY ALL LIMIT ${SAMPLE_LIMIT}) s`);
+  }
 }
 
 /** 给检查过的实体各追加一行运行记录：行数与这个实体的断言结果 */
