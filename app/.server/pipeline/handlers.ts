@@ -248,7 +248,7 @@ export const HANDLERS = {
       const has = (name: string) => present.some(t => t.name === name);
       if (!has('order')) throw new Error('标准层还没有订单（silver.order）：先发布 order 映射并合并');
       if (!has('_identities')) throw new Error(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`);
-      const assertions = await runAssertions(con, TEMPLATES.rfm.entities);
+      const assertions = await runAssertions(con, TEMPLATES.rfm.entities, taskId);
       assertOrThrow(assertions);
       const name = `rfm__${taskId}`;
       await con.run(`CREATE SCHEMA IF NOT EXISTS gold; CREATE TABLE gold."${name}" AS ${TEMPLATES.rfm.compile(rfm)}`);
@@ -273,7 +273,7 @@ export const HANDLERS = {
       const missing = entities.filter(entity => !present.has(entity));
       if (missing.length) throw new Error(`标准层还没有 ${missing.map(entity => `silver.${entity}`).join('、')}：先发布 ${missing.join('、')} 的映射并合并`);
       if (!present.has('_identities')) throw new Error(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`);
-      const assertions = await runAssertions(con, entities);
+      const assertions = await runAssertions(con, entities, taskId);
       assertOrThrow(assertions);
       const name = `${kind}__${taskId}`;
       await con.run(`CREATE SCHEMA IF NOT EXISTS gold; CREATE TABLE gold."${name}" AS ${sql}`);

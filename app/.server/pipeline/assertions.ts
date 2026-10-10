@@ -1,5 +1,6 @@
 // app/.server/pipeline/assertions.ts —— 内置断言（ADR-0026）：结果层任务计算前，对任务读到的标准实体检查数据质量。
-// error 级的断言失败时任务失败、不登记快照（外部继续读上一版）；warn 级只记录。结果只有断言名、实体与不合格行数，不带行内容
+// error 级的断言失败时任务失败、不登记快照（外部继续读上一版）；warn 级只记录。结果只有断言名、实体、不合格行数与比例，不带行内容。
+// 每次运行给检查过的实体各追加一行到湖里的 silver._assertion_runs，行数骤降以它为基准（工作进程不连平台库）
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { entityOf } from '../../lib/canonical-model';
 import { lit } from './merge-engine';
@@ -13,12 +14,28 @@ export interface AssertionResult {
   failed: number;
   /** 检查了哪些字段 */
   detail?: string;
+  /** order_customer_link：关联得上消费者的订单比例 */
+  ratio?: number;
+  /** order_customer_link：关联不上消费者的订单数（customer_id 为空也算） */
+  orphans?: number;
+  /** row_drop：本次运行时的行数 */
+  rows?: number;
+  /** row_drop：该实体上一次运行时的行数 */
+  previous?: number;
 }
 
 export const ASSERTION_LABELS: Record<string, string> = {
   primary_key_unique: '主键唯一',
   amount_non_negative: '金额非负',
+  order_customer_link: '订单关联消费者',
+  row_drop: '行数骤降',
 };
+
+/** 订单关联得上消费者的比例低于它时告警 */
+const MIN_ORDER_LINK_RATIO = 0.8;
+/** 行数少于上一次运行的这个比例时告警 */
+const MIN_ROW_RATIO = 0.5;
+const RUNS = 'silver._assertion_runs';
 
 /** 各实体的金额字段 */
 const AMOUNT_FIELDS: Record<string, string[]> = {
@@ -41,16 +58,27 @@ function uniqueKey(entity: string, columns: Set<string>) {
   return [...model.key, ...(bySource && columns.has('_source') ? ['_source'] : []), ...(columns.has('_key_space') ? ['_key_space'] : [])];
 }
 
-/** 对这些实体里在标准层存在的表跑内置断言：主键唯一（主键为空的行不算重复）、金额非负 */
-export async function runAssertions(con: DuckDBConnection, entities: readonly string[]): Promise<AssertionResult[]> {
-  const columns = await rows<{ entity: string; name: string }>(con, `
+/**
+ * 对这些实体里在标准层存在的表跑内置断言：主键唯一（主键为空的行不算重复）、金额非负（error）；订单关联消费者的比例、
+ * 行数比该实体上一次运行少一半以上（warn，首次运行没有基准不报）。之后给检查过的实体各追加一行运行记录，记在任务 taskId 名下
+ */
+export async function runAssertions(con: DuckDBConnection, entities: readonly string[], taskId: string): Promise<AssertionResult[]> {
+  const columns = new Map<string, Set<string>>();
+  for (const c of await rows<{ entity: string; name: string }>(con, `
     SELECT table_name AS entity, column_name AS name FROM information_schema.columns
-    WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${entities.map(lit).join(', ')})`);
+    WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, 'customer'].map(lit).join(', ')})`)) {
+    columns.set(c.entity, (columns.get(c.entity) ?? new Set()).add(c.name));
+  }
+  await con.run(`CREATE TABLE IF NOT EXISTS ${RUNS} (task_id VARCHAR, entity VARCHAR, rows BIGINT, assertions JSON, "at" TIMESTAMPTZ)`);
   const results: AssertionResult[] = [];
+  const rowCounts = new Map<string, number>();
   for (const entity of entities) {
-    const present = new Set(columns.filter(c => c.entity === entity).map(c => c.name));
-    if (!present.size) continue;
+    const present = columns.get(entity);
+    if (!present) continue;
     const table = `silver.${ident(entity)}`;
+    const [{ n: total }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${table}`);
+    const rowCount = Number(total);
+    rowCounts.set(entity, rowCount);
     const key = uniqueKey(entity, present);
     if (key) {
       const modelKey = entityOf(entity)!.key;
@@ -65,8 +93,37 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
       const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${table} WHERE ${amounts.map(f => `${ident(f)} < 0`).join(' OR ')}`);
       results.push({ name: 'amount_non_negative', level: 'error', entity, failed: Number(n), detail: amounts.join(', ') });
     }
+    const customer = columns.get('customer');
+    if (entity === 'order' && present.has('customer_id') && customer?.has('customer_id')) {
+      results.push(await orderCustomerLink(con, present.has('_source') && customer.has('_source')));
+    }
+    const [lastRun] = await rows<{ rows: string }>(con, `SELECT rows FROM ${RUNS} WHERE entity = ${lit(entity)} ORDER BY "at" DESC LIMIT 1`);
+    if (lastRun) {
+      const previous = Number(lastRun.rows);
+      results.push({ name: 'row_drop', level: 'warn', entity, failed: rowCount < previous * MIN_ROW_RATIO ? previous - rowCount : 0, rows: rowCount, previous });
+    }
   }
+  await recordRuns(con, taskId, rowCounts, results);
   return results;
+}
+
+/** 给检查过的实体各追加一行运行记录：行数与这个实体的断言结果 */
+async function recordRuns(con: DuckDBConnection, taskId: string, rowCounts: ReadonlyMap<string, number>, results: readonly AssertionResult[]) {
+  for (const [entity, rowCount] of rowCounts) {
+    const json = JSON.stringify(results.filter(r => r.entity === entity));
+    await con.run(`INSERT INTO ${RUNS} VALUES (${lit(taskId)}, ${lit(entity)}, ${rowCount}, ${lit(json)}::JSON, now())`);
+  }
+}
+
+/** 订单里 customer_id 非空且在 silver.customer 里找得到（按数据源找，同 relationStats）的比例；customer_id 为空的订单也算关联不上（orphans）。低于阈值时把关联不上的订单数记为不合格 */
+async function orderCustomerLink(con: DuckDBConnection, bySource: boolean): Promise<AssertionResult> {
+  const [{ total, linked }] = await rows<{ total: string; linked: string }>(con, `
+    SELECT count(*) AS total, count(t.k) AS linked FROM silver."order" f
+    LEFT JOIN (SELECT DISTINCT customer_id AS k${bySource ? ', _source' : ''} FROM silver.customer) t
+      ON f.customer_id = t.k${bySource ? ' AND f._source = t._source' : ''}`);
+  const orphans = Number(total) - Number(linked);
+  const ratio = Number(total) ? Number(linked) / Number(total) : 1;
+  return { name: 'order_customer_link', level: 'warn', entity: 'order', failed: ratio < MIN_ORDER_LINK_RATIO ? orphans : 0, ratio: Math.round(ratio * 10000) / 10000, orphans };
 }
 
 /** 失败的 error 级断言 */

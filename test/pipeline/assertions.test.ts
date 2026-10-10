@@ -1,5 +1,6 @@
 // test/pipeline/assertions.test.ts —— 内置断言的流水线接缝：往源库注入坏数据 → 同步并合并进标准层 → runTask('gold.rfm' / 'gold.dsl') → 工作进程计算前跑断言 →
-// 任务结果 result.assertions、listSnapshots（不登记新快照、旧快照仍可读）、数据湖里没有新的快照表、告警邮件与审计 assertion.failed
+// 任务结果 result.assertions、listSnapshots（不登记新快照、旧快照仍可读）、数据湖里没有新的快照表、告警邮件与审计 assertion.failed；
+// warn 断言只记录：任务照常成功、登记快照，结果与湖里的 silver._assertion_runs 都带这条 warn
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
@@ -9,6 +10,7 @@ import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { setMailer, type Mail } from '../../app/.server/mailer';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import { lit } from '../../app/.server/pipeline/merge-engine';
 import { listSnapshots, readRfmSnapshot } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { resetDb } from '../http/harness';
@@ -115,6 +117,63 @@ describe('error 断言阻断快照并告警', () => {
 
     const ok = await runTask(acme, 'gold.dsl', dsl(['customer']));
     expect(ok).toMatchObject({ status: 'succeeded' });
-    expect((ok!.result as { assertions: { entity: string }[] }).assertions.map(a => a.entity)).toEqual(['customer']);
+    expect(new Set((ok!.result as { assertions: { entity: string }[] }).assertions.map(a => a.entity))).toEqual(new Set(['customer']));
+  });
+});
+
+/** 湖里某个任务的断言运行记录 */
+const assertionRuns = (acme: string, taskId: string) => onLake<{ entity: string; rows: string; assertions: string }>(acme, `
+  SELECT entity, rows::VARCHAR AS rows, assertions::VARCHAR AS assertions FROM silver._assertion_runs WHERE task_id = ${lit(taskId)} ORDER BY entity`);
+
+describe('warn 断言只记录不阻断', () => {
+  it('订单关联消费者的比例低于 80%：记一条 warn（带比例与孤儿数），任务成功、登记快照，运行记录里也有', async () => {
+    const { acme, sources, snapshot } = await withRfmSnapshot();
+    // 种子数据 11 单里 10 单关联得上，不触发
+    expect((await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' }))!.result).toMatchObject({
+      assertions: expect.arrayContaining([{ name: 'order_customer_link', level: 'warn', entity: 'order', failed: 0, ratio: 0.9091, orphans: 1 }]),
+    });
+    // 再来两单没有下单人：10/13 关联得上
+    await grantOnSource(`INSERT INTO crm.orders VALUES ('A8', NULL, 'paid', 10, '2024-06-29 10:00', '2024-06-29 10:00', now()), ('A9', NULL, 'paid', 10, '2024-06-29 10:00', '2024-06-29 10:00', now())`);
+    await syncSource(await memberOf(acme, 'de@acme.com'), sources.crm);
+    await drain();
+    outbox.length = 0;
+
+    const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
+    expect(task).toMatchObject({ status: 'succeeded' });
+    const warn = { name: 'order_customer_link', level: 'warn', entity: 'order', failed: 3, ratio: 0.7692, orphans: 3 };
+    expect((task!.result as { assertions: unknown[] }).assertions).toContainEqual(warn);
+    const snapshots = await listSnapshots(acme);
+    expect(snapshots).toHaveLength(3);
+    expect(snapshots).toContainEqual(snapshot);
+    expect(outbox).toHaveLength(0);
+
+    const runs = await assertionRuns(acme, task!.id);
+    expect(runs.map(r => [r.entity, r.rows])).toEqual([['customer', expect.any(String)], ['order', '13']]);
+    expect(JSON.parse(runs[1].assertions)).toContainEqual(warn);
+
+    // gold.dsl 只读订单时同样检查（silver.customer 不在参数里也查）
+    const dsl = await runTask(acme, 'gold.dsl', { kind: 'metric', key: 'm', asOf: '2024-07-01', sql: 'SELECT consumer_id, 1 AS value FROM silver._identities', entities: ['order'] });
+    expect(dsl).toMatchObject({ status: 'succeeded' });
+    expect((dsl!.result as { assertions: unknown[] }).assertions).toContainEqual(warn);
+  });
+
+  it('实体行数比上一次运行少一半以上：记一条 warn（带前后行数），首次运行没有基准不报', async () => {
+    const { acme } = await withRfmSnapshot();
+    const [firstTask] = await onLake<{ task_id: string }>(acme, `SELECT task_id FROM silver._assertion_runs`);
+    const [firstRun] = await assertionRuns(acme, firstTask.task_id);
+    expect(JSON.parse(firstRun.assertions).map((a: { name: string }) => a.name)).not.toContain('row_drop');
+
+    await onLake(acme, `DELETE FROM silver."order" WHERE order_id IN (SELECT order_id FROM silver."order" ORDER BY order_id LIMIT 6)`);
+    const [{ n }] = await onLake<{ n: string }>(acme, `SELECT count(*)::VARCHAR AS n FROM silver."order"`);
+    expect(Number(n)).toBeLessThan(11 / 2);
+
+    const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
+    expect(task).toMatchObject({ status: 'succeeded' });
+    const assertions = (task!.result as { assertions: { name: string; entity: string }[] }).assertions;
+    expect(assertions).toContainEqual({ name: 'row_drop', level: 'warn', entity: 'order', failed: 11 - Number(n), rows: Number(n), previous: 11 });
+    expect(assertions).toContainEqual(expect.objectContaining({ name: 'row_drop', entity: 'customer', failed: 0 }));
+    expect(await listSnapshots(acme)).toHaveLength(2);
+    const runs = await assertionRuns(acme, task!.id);
+    expect(JSON.parse(runs.find(r => r.entity === 'order')!.assertions)).toContainEqual(expect.objectContaining({ name: 'row_drop', previous: 11 }));
   });
 });
