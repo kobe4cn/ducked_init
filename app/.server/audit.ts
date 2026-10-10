@@ -76,6 +76,7 @@ const ACTIONS = {
       `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '映射已删除'}`,
   },
   'template.drafted': { label: '起草模板参数', describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版草稿` },
+  'definition.drafted': { label: '起草指标或标签', describe: (d: Detail) => `${d.kind === 'tag' ? '标签' : '指标'} ${d.key}，第 ${d.version} 版草稿` },
   'template.published': {
     label: '发布模板参数',
     describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,

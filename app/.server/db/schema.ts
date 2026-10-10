@@ -431,3 +431,34 @@ export const snapshots = platform.table('snapshots', {
   index('snapshots_tenant_created_idx').on(t.tenantId, t.createdAt),
   uniqueIndex('snapshots_task_uq').on(t.taskId),
 ]);
+
+export const DSL_DEFINITION_KINDS = ['metric', 'tag'] as const;
+export const dslKindEnum = platform.enum('dsl_kind', DSL_DEFINITION_KINDS);
+
+// DSL 定义：租户自己写的指标或标签（ADR-0025），键在租户与种类内唯一。在新建页起草时建立，之后的保存都改同一份草稿
+export const dslDefinitions = platform.table('dsl_definitions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  kind: dslKindEnum('kind').notNull(),
+  key: text('key').notNull(),
+  createdAt: createdAt(),
+}, t => [uniqueIndex('dsl_definitions_tenant_kind_key_uq').on(t.tenantId, t.kind, t.key)]);
+
+// DSL 定义的各个版本：YAML 原文。草稿与双人发布的规则同模板定义版本（ADR-0015）：每个定义同时只有一份草稿，发布后锁定；
+// last_editor 是最后保存草稿的成员，发布者不能是这位成员
+export const dslVersions = platform.table('dsl_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  definitionId: uuid('definition_id').notNull().references(() => dslDefinitions.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  status: templateVersionStatusEnum('status').notNull().default('draft'),
+  yaml: text('yaml').notNull(),
+  authors: text('authors').array().notNull(),
+  lastEditor: text('last_editor').notNull(),
+  publishedByEmail: text('published_by_email'),
+  publishedAt: timestamp('published_at', { withTimezone: true }),
+  createdAt: createdAt(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [
+  uniqueIndex('dsl_versions_definition_version_uq').on(t.definitionId, t.version),
+  uniqueIndex('dsl_versions_one_draft_uq').on(t.definitionId).where(sql`status = 'draft'`),
+]);
