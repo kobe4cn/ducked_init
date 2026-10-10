@@ -2,7 +2,8 @@
 // 以及重叠的键里两边都映射了的字段全部一致的比例，按比例给出建议。在工作进程里运行，数据湖只读挂载，只出报告、不改标准层。
 // 实体的主键、是否按数据源比较与各映射的列在入队时由平台算好放进参数（工作进程不连平台库）
 import type { DuckDBConnection } from '@duckdb/node-api';
-import { ident, joinOn, keyList, lit, rows, SILVER, silverTable, SILVER_SYSTEM_COLUMNS, tableExists } from './merge-engine';
+import { SILVER } from './lake-schemas';
+import { ident, joinOn, keyList, lit, rows, silverTable, SILVER_SYSTEM_COLUMNS, tableExists } from './merge-engine';
 
 /**
  * 一个实体：主键、写入它的已发布映射（各带映射出来的列名）；bySource 为真时（主键含指向 customer 的字段）

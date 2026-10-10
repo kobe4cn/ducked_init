@@ -30,6 +30,7 @@
 | `pipeline/migration.test.ts` | 数据湖迁移存储 |
 | `pipeline/encryption.test.ts` | 数据湖加密存储：新租户原始层 / `_keys` / `_mirror` 的文件不带密钥读不出、不含明文；加密前的未加密湖重新初始化照常同步 |
 | `pipeline/reset.test.ts` | 开发用重置数据湖 |
+| `pipeline/lake-schemas.test.ts` | 固定的 schema 与平台表（ADR-0020）：新租户的湖里有 `gold`、`silver`、`silver_records` 与 `silver._merges`（带 `scheme` 列）、`_assertion_runs`、`_quarantine`，不预建身份打通的表；并发数为 4 的租户在空的结果层上同时跑 6 个 `gold.dsl` 全部成功（确有任务同时运行），`resetTenantLake` 之后同样成立；`pnpm lake:ensure` 给缺表、缺 `gold`、缺 `scheme` 列的租户补建（`--tenant` 只处理一个，不给时处理全部） |
 | `http/login.test.ts` | 租户与 Magic Link 登录 |
 | `http/members.test.ts` | 成员邀请与角色、权限矩阵、审计日志、跨租户拒绝 |
 | `http/pii.test.ts` | 解密敏感信息：管理员按映射与源表主键看到明文、明文不进任务表与审计、审计 `pii.revealed`、不填原因或找不到记录不解密也不记审计、其他角色 403、其他租户 404 |

@@ -67,7 +67,7 @@ describe('成员查看本租户的任务', () => {
     expect(seed.html).toMatch(/data-result-table="customers"[\s\S]*?>10 行</);
     expect(seed.html).toContain('data-result-table="orders"');
     expect(seed.html).toMatch(/内存 \d+(\.\d+)? ?\w+ · 2 线程/);
-    expect(inventory.html).toContain('数据湖里还没有表');
+    expect(inventory.html).toMatch(/data-result-table="silver\._merges"[\s\S]*?>0 行</);
   });
 
   it('同步与核对任务的结果按表展示，读不到行数的表不报错', async () => {

@@ -11,7 +11,7 @@ import { customEntityVersions } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { isSensitiveField, publishedPlans } from './mappings';
 import { openTenantLake } from './pipeline/lake-engine';
-import { SILVER } from './pipeline/merge-engine';
+import { SILVER } from './pipeline/lake-schemas';
 import { confirmedTables } from './sources';
 import {
   CANONICAL_ENTITIES, type EntityRelation, entityOf, EXTENSION_PATTERN, type FieldType, isCustomEntity, type RelationSuggestion, relationText,

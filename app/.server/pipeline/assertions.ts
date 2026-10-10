@@ -5,6 +5,7 @@
 // 读会员或积分流水时另跑两条积分 warn：余额与流水对账、流水余额断档
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { entityOf } from '../../lib/canonical-model';
+import { ASSERTION_RUNS, QUARANTINE } from './lake-schemas';
 import { lit } from './merge-engine';
 import { PartialFailure } from './partial-failure';
 
@@ -42,8 +43,6 @@ export const ASSERTION_LABELS: Record<string, string> = {
 const MIN_ORDER_LINK_RATIO = 0.8;
 /** 行数少于上一次运行的这个比例时告警 */
 const MIN_ROW_RATIO = 0.5;
-const RUNS = 'silver._assertion_runs';
-const QUARANTINE = 'silver._quarantine';
 /** 每条失败的断言最多写进隔离区的行数 */
 export const SAMPLE_LIMIT = 100;
 
@@ -82,7 +81,6 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
     WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, 'customer', 'membership', 'points_transaction'].map(lit).join(', ')})`)) {
     columns.set(c.entity, (columns.get(c.entity) ?? new Set()).add(c.name));
   }
-  await con.run(`CREATE TABLE IF NOT EXISTS ${RUNS} (task_id VARCHAR, entity VARCHAR, rows BIGINT, assertions JSON, "at" TIMESTAMPTZ)`);
   const results: AssertionResult[] = [];
   /** 断言 → 取出它不合格行的 SELECT（未加 LIMIT） */
   const samples = new Map<AssertionResult, string>();
@@ -126,7 +124,7 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
         SELECT f.* FROM silver."order" f ANTI JOIN (SELECT DISTINCT customer_id AS k${bySource ? ', _source' : ''} FROM silver.customer) t
           ON f.customer_id = t.k${bySource ? ' AND f._source = t._source' : ''}`);
     }
-    const [lastRun] = await rows<{ rows: string }>(con, `SELECT rows FROM ${RUNS} WHERE entity = ${lit(entity)} ORDER BY "at" DESC LIMIT 1`);
+    const [lastRun] = await rows<{ rows: string }>(con, `SELECT rows FROM ${ASSERTION_RUNS} WHERE entity = ${lit(entity)} ORDER BY "at" DESC LIMIT 1`);
     if (lastRun) {
       const previous = Number(lastRun.rows);
       results.push({ name: 'row_drop', level: 'warn', entity, failed: rowCount < previous * MIN_ROW_RATIO ? previous - rowCount : 0, rows: rowCount, previous });
@@ -148,11 +146,10 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
 }
 
 /**
- * 把每条失败断言的不合格行（最多 SAMPLE_LIMIT 行）追加进隔离区，表不存在时先建。
+ * 把每条失败断言的不合格行（最多 SAMPLE_LIMIT 行）追加进隔离区（表在初始化数据湖时建好）。
  * 每行记断言、级别、实体、标准模型主键（多列用逗号连接）、整行 JSON、任务与时间
  */
 async function writeQuarantine(con: DuckDBConnection, taskId: string, samples: ReadonlyMap<AssertionResult, string>) {
-  await con.run(`CREATE TABLE IF NOT EXISTS ${QUARANTINE} (assertion VARCHAR, level VARCHAR, entity VARCHAR, "key" VARCHAR, "row" JSON, task_id VARCHAR, "at" TIMESTAMPTZ)`);
   for (const [r, sample] of samples) {
     if (!r.failed) continue;
     const key = entityOf(r.entity)!.key.map(k => `s.${ident(k)}::VARCHAR`).join(`, ',', `);
@@ -167,7 +164,7 @@ async function writeQuarantine(con: DuckDBConnection, taskId: string, samples: R
 async function recordRuns(con: DuckDBConnection, taskId: string, rowCounts: ReadonlyMap<string, number>, results: readonly AssertionResult[]) {
   for (const [entity, rowCount] of rowCounts) {
     const json = JSON.stringify(results.filter(r => r.entity === entity));
-    await con.run(`INSERT INTO ${RUNS} VALUES (${lit(taskId)}, ${lit(entity)}, ${rowCount}, ${lit(json)}::JSON, now())`);
+    await con.run(`INSERT INTO ${ASSERTION_RUNS} VALUES (${lit(taskId)}, ${lit(entity)}, ${rowCount}, ${lit(json)}::JSON, now())`);
   }
 }
 

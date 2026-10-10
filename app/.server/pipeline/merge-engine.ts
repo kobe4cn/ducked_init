@@ -10,6 +10,7 @@
 // 所以不增量：视图版本或它引用的表有新批次时由全部批次重建，否则不动
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
+import { MERGES, RECORDS, SILVER } from './lake-schemas';
 import { entityOf, type EntityRelation, type RelationStat } from '../../lib/canonical-model';
 import { DEFAULT_RULES, resolveIdentities, type IdentitySummary } from './identity-engine';
 import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
@@ -69,9 +70,6 @@ export interface RelationParam extends EntityRelation { sensitive: boolean }
 /** 合并后的身份打通：摘要与耗时，失败时是错误信息 */
 export type IdentityRecord = { durationMs: number } & (IdentitySummary | { error: string });
 
-export const SILVER = 'silver';
-const RECORDS = 'silver_records';
-const MERGES = `${SILVER}._merges`;
 /**
  * 标准层的写法，记在合并日志里；上次合并的写法不同时由全部批次重建。
  * 2：敏感字段只存加盐哈希；之前的日志里没有这一列（为空），敏感字段是明文
@@ -502,12 +500,6 @@ export async function mergeToSilver(
   relations: RelationParam[] = [],
 ): Promise<{ mappings: MergeRecord[]; relations?: RelationStat[]; identities?: IdentityRecord }> {
   const { con } = session;
-  // 早于敏感字段哈希的数据湖里，合并日志还没有 scheme 列：补上后老的日志为空，各映射下次合并时重建
-  await con.run(`CREATE SCHEMA IF NOT EXISTS ${SILVER}; CREATE SCHEMA IF NOT EXISTS ${RECORDS};
-    CREATE TABLE IF NOT EXISTS ${MERGES} (
-      mapping_id VARCHAR, version INTEGER, source_keys VARCHAR, batch_from BIGINT, batch_to BIGINT,
-      inserted BIGINT, updated BIGINT, deleted BIGINT, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, scheme INTEGER);
-    ALTER TABLE ${MERGES} ADD COLUMN IF NOT EXISTS scheme INTEGER`);
   const now = new Date();
   const records: MergeRecord[] = [];
   for (const plan of plans) {

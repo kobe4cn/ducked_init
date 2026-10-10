@@ -251,7 +251,7 @@ export const HANDLERS = {
       const assertions = await runAssertions(con, TEMPLATES.rfm.entities, taskId);
       assertOrThrow(assertions);
       const name = `rfm__${taskId}`;
-      await con.run(`CREATE SCHEMA IF NOT EXISTS gold; CREATE TABLE gold."${name}" AS ${TEMPLATES.rfm.compile(rfm)}`);
+      await con.run(`CREATE TABLE gold."${name}" AS ${TEMPLATES.rfm.compile(rfm)}`);
       const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM gold."${name}"`);
       const [{ n: unlinked }] = await rows<{ n: string }>(con, compileRfmUnlinked(rfm));
       return { table: `gold.${name}`, rows: Number(n), unlinkedOrders: Number(unlinked), params: rfm, assertions };
@@ -276,7 +276,7 @@ export const HANDLERS = {
       const assertions = await runAssertions(con, entities, taskId);
       assertOrThrow(assertions);
       const name = `${kind}__${taskId}`;
-      await con.run(`CREATE SCHEMA IF NOT EXISTS gold; CREATE TABLE gold."${name}" AS ${sql}`);
+      await con.run(`CREATE TABLE gold."${name}" AS ${sql}`);
       const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM gold."${name}"`);
       return { table: `gold.${name}`, rows: Number(n), params: { kind, key, asOf, definitionVersion }, assertions };
     },

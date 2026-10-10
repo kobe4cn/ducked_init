@@ -20,6 +20,9 @@ const inventoryOf = async (tenantId: string) => {
   return task.result!.tables;
 };
 
+/** 初始化数据湖时建好的平台表（ensureLakeSchemas），空湖的清单里只有它们 */
+const EMPTY_INVENTORY = ['silver._assertion_runs', 'silver._merges', 'silver._quarantine'].map(name => ({ name, rows: 0 }));
+
 const dataPathOf = async (tenantId: string) => (await getTenantLake(tenantId))!.dataPath;
 const filesOf = async (tenantId: string) => (await listLakeFiles(await dataPathOf(tenantId))).map(f => f.path).sort();
 const auditOf = async (tenantId: string) => (await listAuditLogs(tenantId)).map(l => `${l.actor} ${l.action}：${l.summary}`);
@@ -46,7 +49,7 @@ for (const { storage, root } of [
       expect(result.files).toBeGreaterThanOrEqual(oldFiles.length);
 
       expect(await getTenantLake(acme)).toMatchObject({ ready: true, catalogInitialized: true });
-      expect(await inventoryOf(acme)).toEqual([]);
+      expect(await inventoryOf(acme)).toEqual(EMPTY_INVENTORY);
       // 只剩重新初始化时写入的占位对象（对象存储）或空目录（本地）
       expect((await filesOf(acme)).filter(f => f !== '.keep')).toEqual([]);
 
@@ -78,7 +81,7 @@ describe('重置期间的调度', () => {
     const { resetAt } = await resetTenantLake(null, acme);
     await runTask(acme, 'lake.inventory');
     const task = await getTask(queued.id);
-    expect(task).toMatchObject({ status: 'succeeded', result: { tables: [] } });
+    expect(task).toMatchObject({ status: 'succeeded', result: { tables: EMPTY_INVENTORY } });
     expect(task.startedAt!.getTime()).toBeGreaterThanOrEqual(resetAt.getTime());
   });
 
@@ -106,11 +109,11 @@ describe('命令行 pnpm lake:reset', () => {
     expect(wrong.code).toBe(1);
     expect(wrong.stdout).toContain(dataPath);
     expect(wrong.stderr).toContain('已取消');
-    expect(await inventoryOf(acme)).not.toEqual([]);
+    expect(await inventoryOf(acme)).not.toEqual(EMPTY_INVENTORY);
 
     const ok = await runCli('scripts/reset-lake.ts', ['--tenant', 'acme'], { input: 'acme\n' });
     expect(ok.code).toBe(0);
-    expect(await inventoryOf(acme)).toEqual([]);
+    expect(await inventoryOf(acme)).toEqual(EMPTY_INVENTORY);
   });
 
   it('生产环境未加 --force 时拒绝；加 --force --yes 时执行', async () => {
@@ -120,10 +123,10 @@ describe('命令行 pnpm lake:reset', () => {
     const refused = await runCli('scripts/reset-lake.ts', ['--tenant', 'acme', '--yes'], { env: prod });
     expect(refused.code).toBe(1);
     expect(refused.stderr).toContain('生产环境');
-    expect(await inventoryOf(acme)).not.toEqual([]);
+    expect(await inventoryOf(acme)).not.toEqual(EMPTY_INVENTORY);
 
     const forced = await runCli('scripts/reset-lake.ts', ['--tenant', 'acme', '--yes', '--force'], { env: prod });
     expect(forced.code).toBe(0);
-    expect(await inventoryOf(acme)).toEqual([]);
+    expect(await inventoryOf(acme)).toEqual(EMPTY_INVENTORY);
   });
 });

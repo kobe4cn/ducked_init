@@ -43,7 +43,10 @@ describe('任务在独立进程中按租户配额运行', () => {
     const second = await runTask(acme, 'lake.inventory');
 
     expect(first.status).toBe('succeeded');
-    expect(first.result).toMatchObject({ engine: { memoryLimit: '300.0 MiB', threads: 1 }, tables: [] });
+    expect(first.result).toMatchObject({
+      engine: { memoryLimit: '300.0 MiB', threads: 1 },
+      tables: ['silver._assertion_runs', 'silver._merges', 'silver._quarantine'].map(name => ({ name, rows: 0 })),
+    });
     expect(first.workerPid).not.toBe(process.pid);
     expect(second.workerPid).not.toBe(first.workerPid);
     expect((await listTasks(acme)).map(t => t.status)).toEqual(['succeeded', 'succeeded']);
@@ -121,7 +124,8 @@ for (const { storage, lakeUri } of STORAGES) {
       expect((await runTask(globex, 'demo.seed', { customers: 50 })).status).toBe('succeeded');
 
       const tablesOf = async (tenantId: string) =>
-        Object.fromEntries(((await runTask(tenantId, 'lake.inventory')).result!.tables as { name: string; rows: number }[]).map(t => [t.name, t.rows]));
+        Object.fromEntries(((await runTask(tenantId, 'lake.inventory')).result!.tables as { name: string; rows: number }[])
+          .filter(t => !t.name.startsWith('silver._')).map(t => [t.name, t.rows]));
       const a = await tablesOf(acme);
       const b = await tablesOf(globex);
       expect(Object.keys(a).sort()).toEqual(['customers', 'orders']);

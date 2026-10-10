@@ -17,6 +17,7 @@
     "task:enqueue": "node --env-file-if-exists=.env --import tsx scripts/enqueue-task.ts",
     "lake:migrate": "node --env-file-if-exists=.env --import tsx scripts/migrate-lake.ts",
     "lake:reset": "node --env-file-if-exists=.env --import tsx scripts/reset-lake.ts",
+    "lake:ensure": "node --env-file-if-exists=.env --import tsx scripts/ensure-lake-schemas.ts",
     "operator:reset-totp": "node --env-file-if-exists=.env --import tsx scripts/reset-operator-totp.ts",
     "check": "node --env-file=.env --import tsx src/00_check.ts",
     "seed": "node --env-file=.env --import tsx src/01_seed.ts",

@@ -60,8 +60,6 @@ describe('数据质量页', () => {
     const globex = await newTenant('globex');
     const session = await openTenantLake(lakeSpecOf((await lakeRow(globex))!), { memoryLimitMb: 256, threads: 1 });
     try {
-      await session.con.run(`CREATE SCHEMA IF NOT EXISTS silver`);
-      await session.con.run(`CREATE TABLE silver._assertion_runs (task_id VARCHAR, entity VARCHAR, rows BIGINT, assertions JSON, "at" TIMESTAMPTZ)`);
       await session.con.run(`INSERT INTO silver._assertion_runs VALUES ('globex-task', 'order', 3, '[{"name":"amount_non_negative","level":"error","entity":"order","failed":0}]', now())`);
     } finally {
       session.close();

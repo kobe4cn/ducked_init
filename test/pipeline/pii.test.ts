@@ -5,7 +5,7 @@ import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
-import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
+import { ensureTenantLakeSchemas, lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { mergeNow } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -143,6 +143,8 @@ describe('标准层的敏感字段只存加盐哈希', () => {
       session.close();
     }
     expect(plaintextIn((await silverDump(acme)).text)).toEqual(['消费者']);
+    // 上线前先跑 pnpm lake:ensure，给合并日志补上 scheme 列（老的日志为空）
+    await ensureTenantLakeSchemas(acme);
 
     const task = await mergeNow(author);
     await drain();

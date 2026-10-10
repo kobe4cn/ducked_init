@@ -8,6 +8,8 @@ ADR-0005 要求明文只以加密形式留在原始层。原始层（`bronze_<�
 
 **怎么开启。** 加密要写进 catalog：DuckLake 在 `ducklake_metadata` 里记下 `encrypted = true`，之后的挂载不带 `ENCRYPTED` 也照样加密写入。已经建好的未加密 catalog 不能补开加密（带 `ENCRYPTED` 挂载会报错）。所以 `initTenantCatalog` 先看 catalog schema 里有没有元数据表：没有就以加密方式新建，有就照原样挂载，可以重复执行。写加密文件需要 httpfs 带来的加密模块，工作进程在本地目录模式下也加载 httpfs。
 
+**固定的 schema 和平台表在初始化时建好（#155）。** `initTenantCatalog` 挂载后接着调用 `ensureLakeSchemas`，建好 `gold`、`silver`、`silver_records` 三个 schema 和 `silver._merges`、`silver._assertion_runs`、`silver._quarantine` 三张平台表，任务里不再建。原因是 DuckLake 提交时，两个事务都新建同名的 schema 或表就判冲突，租户并发数大于 1 时空湖上同时跑的结果层任务会有一个失败；schema 已经存在时，各任务在其下建不同名字的表可以并发提交。按名字区分的表（每个数据源的 `bronze_<id>`、`_keys`、`_mirror`，标准层实体表，结果快照）照旧由任务建；`silver._identities`、`silver._device_owner` 不预建，因为结果层任务靠它们存不存在判断“还没打通”。此前开通的租户用 `pnpm lake:ensure` 补建，可以重复执行。
+
 **已有的湖不迁移。** 加密上线前开通的租户，catalog 保持不加密，数据文件仍是明文，同步、核对、迁移照常。开发和演示环境可以用 `pnpm lake:reset` 重建成加密湖。生产环境要给已有的湖加密时，另做一个运营命令，把数据复制到新建的加密湖里，本决定不做。迁移存储（`lake:migrate`）只是逐个复制文件，不改变加密状态；文件密钥跟着 catalog 走，不跟着前缀走。
 
 **核对怎么读加密文件。** `parquet_file_metadata` / `parquet_schema` 不接受密钥。核对（ADR-0014）对加密文件改用 `read_parquet(..., encryption_config = {footer_key_value: <目录里的密钥>})` 读行数，不再检查尾部有没有目录里没有的字段（字段信息在加密的尾部里读不出来）。明文文件仍查两项。
