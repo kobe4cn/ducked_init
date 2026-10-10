@@ -173,7 +173,7 @@ describe('列统计与水位线', () => {
     expect(after).toContain('按 updated_at 每小时增量同步');
   });
 
-  it('展示各表的主键；没有主键的表说明按整行比对，成员可以声明多列业务主键（标出样本中唯一的列），不唯一时拒绝并给出样例', async () => {
+  it('展示各表的主键；没有主键的表说明按整行比对，成员可以声明多列业务主键（标出样本中唯一的列），全表检查不唯一时声明不生效', async () => {
     const { browser } = await engineerOf('acme');
     const id = await registerAndSelect(browser, await pgSourceInput(READER));
 
@@ -184,10 +184,12 @@ describe('列统计与水位线', () => {
 
     const res = await browser.post(`/sources/${id}`, { intent: 'confirm-key', table: 'regions', column: ['code', 'name'] });
     expect(res.status).toBe(302);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
     expect(await (await browser.get(`/sources/${id}`)).text()).toMatch(/data-declared-key="code,name"[\s\S]*?已确认（de@acme.com）/);
     const duplicated = await browser.post(`/sources/${id}`, { intent: 'confirm-key', table: 'events', column: ['event_type'] });
-    expect(duplicated.status).toBe(400);
-    expect(await duplicated.text()).toContain('event_type=view 出现 1500 次');
+    expect(duplicated.status).toBe(302);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    expect((await (await browser.get(`/sources/${id}`)).text()).match(/data-declared-key="[^"]*"/g)).toEqual(['data-declared-key="code,name"']);
     const rejected = await browser.post(`/sources/${id}`, { intent: 'confirm-key', table: 'customers', column: 'email' });
     expect(rejected.status).toBe(400);
     expect(await rejected.text()).toContain('已有主键 customer_id');

@@ -14,13 +14,15 @@ import {
   inspectSource, isKeyType, isSoftDeleteType, mongoReadGrant, SOFT_DELETE_NAME, type ListedTable, type SourceSpec, type TableProfile,
   type WriteGrant,
 } from './pipeline/source-engine';
-import { checkDeclaredKey, type SyncTableParam } from './pipeline/sync-engine';
+import type { SyncTableParam } from './pipeline/sync-engine';
 import type { SyncMode } from '../lib/sources';
 import { decryptForTenant, encryptForTenant } from './secrets';
 import {
   credentialsContext, isSourceKind, loadSourceSpec, parseSourceInput, requireSource, resolveSourceSpec, SourceError, type SourceInput,
 } from './source-config';
+import { enqueueKeyCheck } from './source-key-check';
 import { insertTask } from './tasks';
+import { looksSensitive } from '../lib/sensitive';
 
 export { SourceError, type SourceInput } from './source-config';
 
@@ -332,37 +334,25 @@ async function profiledTable(tenantId: string, sourceId: string, tableName: stri
 
 /**
  * 成员为没有主键的表声明业务主键（一列或多列的组合，平台给出的候选只是样本中唯一的单列）：同步据此区分新增与更新，并发现删除。
- * 声明时在源端校验这个组合非空且唯一，不满足时拒绝并给出样例；每次同步前还会在读到的行上再校验一次
+ * 这里只校验字段，随即入队一次全表检查（source.keycheck，source-key-check.ts），返回任务；检查通过后才写回声明并记审计，
+ * 不通过时原有声明不变。每次同步前还会在读到的行上再校验一次
  */
 export async function confirmKey(actor: CurrentMember, sourceId: string, tableName: string, columns: string[]) {
   assertCan(actor, 'sources:write');
-  const row = await requireSource(actor.tenant.id, sourceId);
+  await requireSource(actor.tenant.id, sourceId);
   const table = await profiledTable(actor.tenant.id, sourceId, tableName);
   if (table.primaryKey?.length) throw new SourceError(`${tableName} 已有主键 ${table.primaryKey.join('、')}，不需要业务主键`);
   if (!columns.length) throw new SourceError('请选择组成业务主键的字段');
   if (new Set(columns).size !== columns.length) throw new SourceError('业务主键的字段不能重复');
-  for (const column of columns) {
-    const profiled = table.columns.find(c => c.name === column);
-    if (!profiled) throw new SourceError(`${tableName} 中没有字段 ${column}`);
-    if (!isKeyType(profiled.type)) throw new SourceError(`${column} 的类型 ${profiled.type} 不能作业务主键（只支持整数、文本与 UUID）`);
-  }
-  const problem = await checkDeclaredKey(await loadSourceSpec(actor.tenant.id, sourceId), PROBE_LIMITS, tableName, columns).catch(e => {
-    throw new SourceError(`无法在数据源上校验业务主键：${(e as Error).message}`);
+  const chosen = columns.map(column => {
+    const c = table.columns.find(p => p.name === column);
+    if (!c) throw new SourceError(`${tableName} 中没有字段 ${column}`);
+    if (!isKeyType(c.type)) throw new SourceError(`${column} 的类型 ${c.type} 不能作业务主键（只支持整数、文本与 UUID）`);
+    return c;
   });
-  if (problem) throw new SourceError(`${problem}，不能作业务主键`);
-  await getDb().transaction(async tx => {
-    const values = { keyColumns: columns, keyConfirmedByEmail: actor.email };
-    await tx.insert(sourceTables).values({ sourceId, tableName, ...values })
-      .onConflictDoUpdate({ target: [sourceTables.sourceId, sourceTables.tableName], set: values });
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'source.key_confirmed',
-      targetType: 'source',
-      targetId: sourceId,
-      detail: { name: row.name, table: tableName, column: columns.join('、') },
-    });
-  });
+  return getDb().transaction(tx => enqueueKeyCheck(tx, actor.tenant.id, {
+    sourceId, tableName, keyColumns: columns, sensitive: chosen.some(looksSensitive), memberId: actor.memberId, email: actor.email,
+  }));
 }
 
 /**

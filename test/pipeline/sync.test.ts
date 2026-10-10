@@ -9,8 +9,10 @@ import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { enqueueDueSyncs, getSyncStatus, syncSource } from '../../app/.server/source-sync';
+import { getKeyChecks } from '../../app/.server/source-key-check';
 import { confirmKey, confirmSoftDelete, confirmWatermark, getSource, registerSource, SourceError } from '../../app/.server/sources';
-import { listTasks } from '../../app/.server/tasks';
+import { listAuditLogs } from '../../app/.server/audit';
+import { getTask, listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, selectAllTables } from './fixtures';
 import { DuckDBInstance } from '@duckdb/node-api';
@@ -20,6 +22,15 @@ afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 
 const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+/** 声明业务主键并等全表检查结束，返回这张表最近一次检查的结果 */
+async function declareKey(engineer: Parameters<typeof getSource>[0], id: string, table: string, columns: string[]) {
+  await confirmKey(engineer, id, table, columns);
+  await drain();
+  return (await getKeyChecks(engineer, id)).get(table)!;
+}
+const keyOf = async (engineer: Parameters<typeof getSource>[0], id: string, table: string) =>
+  (await getSource(engineer, id)).tables.find(t => t.name === table)!.key;
 
 /** 读取本租户数据湖里某个数据源某张表的原始层（按批次与主键排序）；时间按 UTC 显示 */
 async function bronze(tenantId: string, sourceId: string, table: string, orderBy: string) {
@@ -179,10 +190,20 @@ describe('水位线增量同步到原始层', () => {
         GRANT SELECT ON shop.subscriptions TO ${READER.user};`);
       const table = (await getSource(engineer, id)).tables.find(t => t.name === 'subscriptions')!;
       expect(table).toMatchObject({ primaryKey: [], keyCandidates: ['email'], key: null });
-      await expect(confirmKey(engineer, id, 'subscriptions', ['plan'])).rejects.toBeInstanceOf(SourceError);
+      await expect(confirmKey(engineer, id, 'subscriptions', ['nope'])).rejects.toBeInstanceOf(SourceError);
       await expect(confirmKey(engineer, id, 'customers', ['email'])).rejects.toThrow(/已有主键/);
       await confirmWatermark(engineer, id, 'subscriptions', 'updated_at');
-      await confirmKey(engineer, id, 'subscriptions', ['email']);
+      // 不唯一时声明不生效；email 像敏感信息，重复键只给次数
+      expect((await declareKey(engineer, id, 'subscriptions', ['plan'])).result).toMatchObject({
+        tableName: 'subscriptions', keyColumns: ['plan'], ok: false, nullRows: 0, duplicates: [{ key: ['basic'], count: 10 }],
+      });
+      expect(await keyOf(engineer, id, 'subscriptions')).toBeNull();
+      await grantOnSource(`INSERT INTO shop.subscriptions VALUES ('user1@example.com', 'pro', '2024-05-01')`);
+      expect((await declareKey(engineer, id, 'subscriptions', ['email'])).result).toMatchObject({ ok: false, duplicates: [{ key: null, count: 2 }] });
+      await grantOnSource(`DELETE FROM shop.subscriptions WHERE plan = 'pro'`);
+      expect((await declareKey(engineer, id, 'subscriptions', ['email'])).result).toMatchObject({ ok: true, nullRows: 0, duplicates: [] });
+      expect(await keyOf(engineer, id, 'subscriptions')).toEqual(['email']);
+      expect((await listAuditLogs(acme)).filter(l => l.action === '确认业务主键').map(l => l.summary)).toEqual([expect.stringContaining('subscriptions：email')]);
       await sync(engineer, id);
 
       await grantOnSource(`
@@ -314,14 +335,27 @@ describe('全量比对（没有水位线的表）', () => {
       CREATE TABLE shop.order_items (order_id int, sku text, qty int NOT NULL);
       INSERT INTO shop.order_items VALUES (1, 'A', 1), (1, 'A', 1), (1, 'B', 2), (2, 'A', 1), (2, NULL, 3);
       GRANT SELECT ON shop.order_items TO ${READER.user};`);
-    await expect(confirmKey(engineer, id, 'order_items', ['order_id', 'sku'])).rejects.toThrow(/有 1 行为空/);
+    // 请求立即返回、入队一次检查；同一张表已在排队时拒绝
+    const task = await confirmKey(engineer, id, 'order_items', ['order_id', 'sku']);
+    expect(task).toMatchObject({ kind: 'source.keycheck', status: 'queued' });
+    await expect(confirmKey(engineer, id, 'order_items', ['order_id', 'sku'])).rejects.toThrow(/已有一次业务主键检查在排队或运行中/);
+    await drain();
+    const checked = await getTask(task.id);
+    expect(checked).toMatchObject({
+      status: 'succeeded',
+      result: { ok: false, nullRows: 1, duplicates: [{ key: ['1', 'A'], count: 2 }], engine: { memoryLimit: '2.0 GiB', threads: expect.any(Number) } },
+    });
+    expect(await keyOf(engineer, id, 'order_items')).toBeNull();
     await grantOnSource(`DELETE FROM shop.order_items WHERE sku IS NULL`);
-    await expect(confirmKey(engineer, id, 'order_items', ['order_id', 'sku'])).rejects.toThrow('不唯一（order_id=1, sku=A 出现 2 次）');
+    expect((await declareKey(engineer, id, 'order_items', ['order_id', 'sku'])).result).toMatchObject({ ok: false, nullRows: 0, duplicates: [{ key: ['1', 'A'], count: 2 }] });
     await expect(confirmKey(engineer, id, 'order_items', ['order_id', 'nope'])).rejects.toBeInstanceOf(SourceError);
     await expect(confirmKey(engineer, id, 'order_items', [])).rejects.toBeInstanceOf(SourceError);
     await grantOnSource(`DELETE FROM shop.order_items WHERE ctid = (SELECT ctid FROM shop.order_items WHERE order_id = 1 AND sku = 'A' LIMIT 1)`);
-    await confirmKey(engineer, id, 'order_items', ['order_id', 'sku']);
+    expect((await declareKey(engineer, id, 'order_items', ['order_id', 'sku'])).result).toMatchObject({ ok: true });
     expect((await getSource(engineer, id)).tables.find(t => t.name === 'order_items')).toMatchObject({ key: ['order_id', 'sku'], keyConfirmedBy: 'de@acme.com' });
+    // 改声明时检查不通过：原有声明保持
+    expect((await declareKey(engineer, id, 'order_items', ['sku'])).result).toMatchObject({ ok: false, duplicates: [{ key: ['A'], count: 2 }] });
+    expect(await keyOf(engineer, id, 'order_items')).toEqual(['order_id', 'sku']);
     await sync(engineer, id);
 
     await grantOnSource(`
@@ -337,6 +371,24 @@ describe('全量比对（没有水位线的表）', () => {
     expect((await historyOf(engineer, id, 'order_items'))[0]).toMatchObject({ error: expect.stringContaining('order_id=1, sku=B 出现 2 次') });
   });
 
+  it('租户配额很小时业务主键检查按哈希分多桶：全表的重复键与空值仍都检出，取出现次数最多的 5 个', async () => {
+    // 8 MiB 每桶放 65536 个键，约 20 万行分 4 桶；原有 1500 行里 customer_id 每个出现 37–38 次，另造 6 个出现更多次的键
+    const { acme, engineer, id } = await pgSourceWithWatermarks(`
+      INSERT INTO shop.events SELECT 'click', 1000000 + i, TIMESTAMPTZ '2024-04-01' FROM generate_series(1, 200000) i;
+      INSERT INTO shop.events SELECT 'buy', k, TIMESTAMPTZ '2024-05-01' FROM generate_series(1, 6) k, generate_series(1, 100 - k * 10) n;
+      UPDATE shop.events SET customer_id = NULL WHERE event_type = 'view' AND occurred_at < TIMESTAMPTZ '2024-03-01 00:08';`);
+    await getDb().update(tenants).set({ memoryLimitMb: 8, threads: 1 }).where(eq(tenants.id, acme));
+    const check = await declareKey(engineer, id, 'events', ['customer_id']);
+    expect(check).toMatchObject({ status: 'succeeded', error: null });
+    expect(check.result).toMatchObject({
+      ok: false,
+      nullRows: 7,
+      duplicates: [{ key: ['1'], count: 127 }, { key: ['2'], count: 117 }, { key: ['3'], count: 107 }, { key: ['4'], count: 97 }, { key: ['5'], count: 87 }],
+      engine: { memoryLimit: '8.0 MiB', threads: 1 },
+    });
+    expect(await keyOf(engineer, id, 'events')).toBeNull();
+  });
+
   it('按整行比对同步过的表之后再声明业务主键：由当前镜像接续，之后的修改记为更新', async () => {
     await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
       const { acme, engineer, id } = await pgSourceWithWatermarks(`
@@ -349,6 +401,7 @@ describe('全量比对（没有水位线的表）', () => {
       await grantOnSource(`UPDATE shop.visits SET page = '/cart', updated_at = '2024-07-01' WHERE visitor = 'v2'`);
       await sync(engineer, id);
       await confirmKey(engineer, id, 'visits', ['visitor']);
+      await drain();
       await grantOnSource(`UPDATE shop.visits SET page = '/pay', updated_at = '2024-07-02' WHERE visitor = 'v2'`);
       await sync(engineer, id);
       const later = (await bronze(acme, id, 'visits', 'visitor')).filter(r => Number(r._batch) >= 4);
@@ -502,6 +555,7 @@ describe('全量比对超出内存上限', () => {
     await selectAllTables(engineer, id);
     await drain();
     await confirmKey(engineer, id, 'lines', ['line_id']);
+    await drain();
     await getDb().update(tenants).set({ memoryLimitMb: 64, threads: 1 }).where(eq(tenants.id, acme));
     await sync(engineer, id);
     expect((await historyOf(engineer, id, 'lines'))[0]).toMatchObject({ batch: 1, mode: 'compare', inserted: 20_000_000 });

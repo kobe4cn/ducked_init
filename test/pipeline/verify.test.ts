@@ -100,6 +100,7 @@ describe('覆盖：从源端的全部表出发', () => {
     await confirmWatermark(engineer, id, 'orders', 'order_id');
     await grantOnSource(`DELETE FROM shop.regions WHERE name = '北方二'`);
     await confirmKey(engineer, id, 'regions', ['code']);
+    await drain();
     await grantOnSource(`INSERT INTO shop.regions VALUES ('N', '北方二')`);
     await syncSource(engineer, id);
     await drain();

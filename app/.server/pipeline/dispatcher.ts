@@ -10,6 +10,7 @@ import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '.
 import { enqueueDueMerges, mergeAfterSync } from '../mappings';
 import { alertAssertionFailure } from '../quality';
 import { enqueueDueExpiries, markExpired, registerSnapshot } from '../snapshots';
+import { applyKeyCheck } from '../source-key-check';
 import { enqueueDueSyncs } from '../source-sync';
 import { enqueueDueVerifies } from '../source-verify';
 import { claimNextTask, failStaleTasks, finishTask, heartbeatTasks, setWorkerPid, type ClaimedTask } from '../tasks';
@@ -76,6 +77,8 @@ export function createDispatcher({
         await finishTask(task.id, outcome!);
         // 同步给已发布映射的源表写入了变更批次（部分失败时也可能有）：随即把它们合并进标准层
         if (task.kind === 'source.sync' && outcome!.result) await mergeAfterSync(task.tenantId, task.id);
+        // 业务主键的全表检查通过：写回声明并记审计（工作进程里没有平台库）
+        if (task.kind === 'source.keycheck' && outcome!.result) await applyKeyCheck(task.tenantId, task.id);
         // 分析模板任务写好了结果层的快照表：登记到平台元数据，分析页据此列出
         if (task.kind === 'gold.rfm' && outcome!.result) await registerSnapshot(task.tenantId, task.id, 'rfm');
         if (task.kind === 'gold.dsl' && outcome!.result) await registerDslSnapshot(task.tenantId, task.id);

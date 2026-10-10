@@ -21,7 +21,7 @@ type SourceTaskKind = Extract<TaskKind, 'source.sync' | 'source.verify'>;
 const SOURCE_TASK_KINDS: SourceTaskKind[] = ['source.sync', 'source.verify'];
 const SOURCE_TASK_LABELS: Record<SourceTaskKind, string> = { 'source.sync': '同步', 'source.verify': '核对' };
 
-export const ofSource = (tenantId: string, sourceId: string, kinds: SourceTaskKind[] = ['source.sync']) =>
+export const ofSource = (tenantId: string, sourceId: string, kinds: TaskKind[] = ['source.sync']) =>
   and(eq(tasks.tenantId, tenantId), inArray(tasks.kind, kinds), sql`${tasks.params}->>'sourceId' = ${sourceId}`);
 
 /**

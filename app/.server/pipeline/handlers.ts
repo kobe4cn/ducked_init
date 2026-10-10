@@ -3,7 +3,7 @@
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { EngineLimits, TenantLakeSession } from './lake-engine';
 import { profileSource, type SourceSpec } from './source-engine';
-import { syncOptionsFromEnv, syncSourceTables, type SyncTableParam } from './sync-engine';
+import { checkKeyColumns, syncOptionsFromEnv, syncSourceTables, type SyncTableParam } from './sync-engine';
 import { verifySourceLake, type VerifyTableParam } from './verify-engine';
 import { inspectLake, type InspectParams } from './inspect-engine';
 import { runKeyCheck, type KeyCheckParams } from './key-check-engine';
@@ -187,6 +187,27 @@ export const HANDLERS = {
         throw new PartialFailure(`${failed.length} 张表同步失败：${failed.map(t => `${t.table}（${'error' in t ? t.error : ''}）`).join('；')}`, { tables });
       }
       return { tables };
+    },
+  },
+  // 校验业务主键：成员声明的组合在源表全表上是否非空且唯一，按租户配额分桶检查（源端只读，数据湖只给溢写目录）。
+  // 有空值或重复时任务仍记为成功，ok 为假；通过时调度器写回声明（source-key-check.ts）。主键列像敏感信息时重复键不带取值（ADR-0005）
+  'source.keycheck': {
+    label: '校验业务主键',
+    attachSource: true,
+    readOnlyLake: true,
+    async run(_con, params, { source, session, limits }) {
+      if (!source || !session.source) throw new Error('缺少数据源');
+      const { tableName, keyColumns } = params;
+      if (typeof tableName !== 'string') throw new Error('缺少参数 tableName');
+      if (!isStrings(keyColumns)) throw new Error('参数 keyColumns 必须是非空的字段列表');
+      const table = (await session.source.tables()).find(t => t.name === tableName);
+      if (!table) throw new Error(`数据源中已没有表 ${tableName}`);
+      if (!table.readable) throw new Error(`账号没有表 ${tableName} 的读权限`);
+      const { nullRows, duplicates } = await checkKeyColumns(session.con, source, table, keyColumns, limits);
+      return {
+        tableName, keyColumns, ok: nullRows === 0 && duplicates.length === 0, nullRows,
+        duplicates: duplicates.map(d => ({ key: params.sensitive === true ? null : d.key, count: d.count })),
+      };
     },
   },
   // 核对湖中数据：源端的全部表标出是否进湖与源端行数，已进湖的表再核对位置、文件、结构与数据量。

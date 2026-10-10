@@ -8,7 +8,7 @@
 // 没有主键的表另在 <schema>_mirror 里保存当前镜像：源表当前的每一行（重复行各一行）及其整行哈希，全表读取时按整行多重集比对
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { SPILL_RATIO, type EngineLimits, type TenantLakeSession } from './lake-engine';
-import { openSource, primaryKeys, redactSourceSecrets, writeGrants, type SourceSpec, type SourceTable, type WatermarkKind } from './source-engine';
+import { primaryKeys, writeGrants, type SourceSpec, type SourceTable, type WatermarkKind } from './source-engine';
 
 /**
  * 同步任务里的一张表：成员确认的水位线字段及其种类（没有时全量比对）；源表没有主键时可带成员声明的业务主键（一列或多列），
@@ -143,24 +143,34 @@ const duplicateKey: KeyCheck = async (con, relation, keys) => {
   return dup ? `业务主键 ${keys.join('、')} 在源表中不唯一（${keys.map(k => `${k}=${dup[k]}`).join(', ')} 出现 ${dup.n} 次）` : null;
 };
 
-/** 业务主键在源表中的问题：有空值或不唯一时返回说明，没有问题时返回 null */
-const keyViolation: KeyCheck = async (con, relation, keys) => await nullKeys(con, relation, keys) ?? duplicateKey(con, relation, keys);
+/** 声明业务主键时的检查结果：主键有空值的行数，以及出现次数最多的至多 KEY_DUPLICATES 个重复键（取值为文本） */
+export interface KeyColumnsCheck { nullRows: number; duplicates: { key: string[]; count: number }[] }
+
+/** 检查结果里最多列出几个重复键 */
+const KEY_DUPLICATES = 5;
 
 /**
- * 成员声明业务主键时，在源端校验这个组合非空且唯一（要扫一遍源表，PostgreSQL 与 MySQL 在源端执行）。
- * 返回问题说明，没有问题时返回 null。redact 前的错误信息可能带凭据，这里一并抹掉
+ * 成员声明业务主键时，在源表全表上检查这个组合非空且唯一（不抽样）。行数与空值在源端统计（PostgreSQL 与 MySQL），
+ * 重复按主键的哈希分桶找：每桶只读主键列，放得进租户的内存上限，桶多时源表要读多遍
  */
-export async function checkDeclaredKey(spec: SourceSpec, limits: EngineLimits, tableName: string, keys: string[]) {
-  const session = await openSource(spec, limits);
-  try {
-    const table = (await session.tables()).find(t => t.name === tableName);
-    if (!table) throw new Error(`数据源中已没有表 ${tableName}`);
-    return await keyViolation(session.con, build => onSource(spec, table, build), keys);
-  } catch (e) {
-    throw new Error(redactSourceSecrets((e as Error).message, spec));
-  } finally {
-    session.close();
+export async function checkKeyColumns(con: DuckDBConnection, spec: SourceSpec, table: SourceTable, keys: string[], limits: EngineLimits): Promise<KeyColumnsCheck> {
+  const complete = (q: Quote) => keys.map(k => `${q(k)} IS NOT NULL`).join(' AND ');
+  const [{ n, nulls }] = await rows<{ n: string; nulls: string }>(con, `SELECT * FROM ${onSource(spec, table, (q, from) =>
+    `SELECT COUNT(*) AS n, COUNT(*) - COUNT(CASE WHEN ${complete(q)} THEN 1 END) AS nulls FROM ${from}`)}`);
+  const keyed = onSource(spec, table, (q, from) => `SELECT ${keys.map(q).join(', ')} FROM ${from} WHERE ${complete(q)}`);
+  const buckets = bucketCount(limits, Number(n) - Number(nulls));
+  const duplicates: KeyColumnsCheck['duplicates'] = [];
+  for (let b = 0; b < buckets; b++) {
+    const found = await rows<Record<string, string> & { _n: string }>(con, `
+      SELECT ${keys.map(k => `${ident(k)}::VARCHAR AS ${ident(k)}`).join(', ')}, count(*) AS _n FROM ${keyed} k
+      WHERE ${inBucket(keyHash(keys, 'k'), buckets, b)} GROUP BY ${keyList(keys, 'k')} HAVING count(*) > 1
+      ORDER BY _n DESC, ${keys.map(ident).join(', ')} LIMIT ${KEY_DUPLICATES}`);
+    duplicates.push(...found.map(d => ({ key: keys.map(k => d[k]), count: Number(d._n) })));
   }
+  // 与桶内的排序一致：次数多的在前，次数相同时逐列按文本（字节序）比较
+  const byText = (a: string[], b: string[]) => { const i = a.findIndex((v, j) => v !== b[j]); return i < 0 ? 0 : a[i] < b[i] ? -1 : 1; };
+  duplicates.sort((a, b) => b.count - a.count || byText(a.key, b.key));
+  return { nullRows: Number(nulls), duplicates: duplicates.slice(0, KEY_DUPLICATES) };
 }
 
 /**
