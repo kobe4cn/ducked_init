@@ -1,7 +1,9 @@
 // app/.server/dsl-definitions.ts —— 指标与标签定义（ADR-0025）：成员用 YAML 写定义，按种类（pipeline/dsl 的注册表）校验通过才能保存为草稿。
 // 键在租户与种类内唯一；每个定义同时只有一份草稿，再次保存改的是同一份，记下作者与最后保存的人，之后按映射同样的规则双人发布（ADR-0015）。
-// 校验对照本租户已发布的自定义实体登记与已发布映射的扩展字段；定义页展示编译出的 SQL，并可在只读挂载的数据湖上预览前 50 行。一律限定在操作者所属租户内
-import { and, desc, eq } from 'drizzle-orm';
+// 校验对照本租户已发布的自定义实体登记与已发布映射的扩展字段；定义页展示编译出的 SQL，并可在只读挂载的数据湖上预览前 50 行。
+// 发布后版本锁定，并以当天为 asOf 入队一次 gold.dsl（编译在入队时完成，SQL 进任务参数），成功后登记为一张快照（template 为 <种类>:<键>）。
+// 一律限定在操作者所属租户内
+import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
@@ -15,7 +17,9 @@ import type { DslContext, DslIssue } from './pipeline/dsl/metric-spec';
 import { IDENTITIES } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { lit, rows } from './pipeline/merge-engine';
-import { withAuthor } from './publish-rules';
+import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
+import { registerTaskSnapshot } from './snapshots';
+import { insertTask } from './tasks';
 import { todayUtc } from './templates';
 
 /** 定义的键：小写字母开头，只用小写字母、数字与下划线 */
@@ -95,7 +99,7 @@ export async function saveDslDraft(actor: CurrentMember, kind: string, key: stri
 }
 
 /**
- * 本租户的一个定义：各版本（最新的在前）、草稿与最近的已发布版本，
+ * 本租户的一个定义：各版本（最新的在前，带当前成员发布不了的原因）、草稿与最近的已发布版本、本租户有发布权限的成员人数，
  * 以及最新一版（有草稿时是草稿）按今天（UTC）编译出的 SQL；它对照当前的登记与映射不再通过校验时给出问题
  */
 export async function getDefinition(actor: CurrentMember, kind: string, key: string) {
@@ -118,14 +122,83 @@ export async function getDefinition(actor: CurrentMember, kind: string, key: str
     kind,
     key,
     label: DSL_KINDS[kind].label,
-    versions,
+    versions: versions.map(v => ({ ...v, publishBlocker: publishBlocker(actor, v) })),
     draft,
     published,
+    publishers: await publisherCount(actor.tenant.id),
     compiled: result.ok
       ? { version: versions[0]!.version, sql: DSL_KINDS[kind].compile(result.spec, ctx, todayUtc()), issues: [] as DslIssue[] }
       : { version: versions[0]!.version, sql: null, issues: result.issues },
   };
 }
+
+/**
+ * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。发布前对照当前的登记与映射再校验一次，并按当天（UTC）编译。
+ * 发布后版本锁定，同一事务里入队一次 gold.dsl，任务参数带上编译出的 SQL 与用到的实体（任务不再访问平台库）。返回入队的任务
+ */
+export async function publishDefinition(actor: CurrentMember, kind: string, key: string, version: number) {
+  assertCan(actor, 'publish');
+  requireKind(kind);
+  const [draft] = await getDb().select(getTableColumns(dslVersions)).from(dslVersions)
+    .innerJoin(dslDefinitions, eq(dslDefinitions.id, dslVersions.definitionId))
+    .where(and(ofDefinition(actor.tenant.id, kind, key), eq(dslVersions.version, version)));
+  if (!draft) throw new DslError(`没有第 ${version} 版`, 404);
+  const blocker = publishBlocker(actor, draft);
+  if (blocker) throw new DslError(blocker, draft.status === 'draft' ? 403 : 400);
+  return getDb().transaction(async tx => {
+    // 锁住定义行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿
+    await tx.select({ id: dslDefinitions.id }).from(dslDefinitions).where(eq(dslDefinitions.id, draft.definitionId)).for('update');
+    const [current] = await tx.select().from(dslVersions).where(eq(dslVersions.id, draft.id));
+    if (isStale(current, draft)) throw new DslError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
+    const ctx = await dslContext(tx, actor.tenant.id);
+    const checked = DSL_KINDS[kind].check(draft.yaml, ctx);
+    if (!checked.ok) throw new DslError('对照当前已发布的登记与映射，这一版不再通过校验，不能发布', 400, checked.issues);
+    const asOf = todayUtc();
+    await tx.update(dslVersions).set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` }).where(eq(dslVersions.id, draft.id));
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id, actor, action: 'definition.published', targetType: 'definition', targetId: draft.definitionId,
+      detail: { kind, key, version, authors: draft.authors, lastEditor: draft.lastEditor },
+    });
+    return insertTask(tx, actor.tenant.id, 'gold.dsl', {
+      kind, key, definitionId: draft.definitionId, definitionVersion: version, asOf,
+      sql: DSL_KINDS[kind].compile(checked.spec, ctx, asOf), entities: [...DSL_KINDS[kind].entities(checked.spec)],
+    });
+  });
+}
+
+/**
+ * 丢弃草稿：回到最近的已发布版本；从没发布过的定义整个删除。用于草稿卡住（如最后保存的人离职）的情况。
+ * 返回回到的已发布版本号（没有时为 null）
+ */
+export async function discardDslDraft(actor: CurrentMember, kind: string, key: string) {
+  assertCan(actor, 'definitions:draft');
+  requireKind(kind);
+  return getDb().transaction(async tx => {
+    // 锁住定义行：与保存、发布互斥
+    const [definition] = await tx.select({ id: dslDefinitions.id }).from(dslDefinitions).where(ofDefinition(actor.tenant.id, kind, key)).for('update');
+    if (!definition) throw new DslError(`没有键为 ${key} 的${DSL_KINDS[kind].label}`, 404);
+    const versions = await tx.select({ id: dslVersions.id, version: dslVersions.version, status: dslVersions.status })
+      .from(dslVersions).where(eq(dslVersions.definitionId, definition.id)).orderBy(desc(dslVersions.version));
+    const draft = versions.find(v => v.status === 'draft');
+    if (!draft) throw new DslError(`这个${DSL_KINDS[kind].label}没有草稿`, 404);
+    const published = versions.find(v => v.status === 'published')?.version ?? null;
+    // 从没发布过时删除定义，各版本随之级联删除
+    if (published) await tx.delete(dslVersions).where(eq(dslVersions.id, draft.id));
+    else await tx.delete(dslDefinitions).where(eq(dslDefinitions.id, definition.id));
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id, actor, action: 'definition.draft_discarded', targetType: 'definition', targetId: definition.id,
+      detail: { kind, key, version: draft.version, published },
+    });
+    return { published };
+  });
+}
+
+/**
+ * gold.dsl 成功后登记它的快照：template 为 <种类>:<键>，读到的实体取任务参数 entities（入队时由定义得出）；
+ * 其余（定义版本、行数、90 天过期、不完整的映射）同分析模板的快照
+ */
+export const registerDslSnapshot = (tenantId: string, taskId: string) =>
+  registerTaskSnapshot(tenantId, taskId, params => ({ template: `${params.kind}:${params.key}`, entities: params.entities as string[] }));
 
 const PREVIEW_ROWS = 50;
 const PREVIEW_LIMITS = { memoryLimitMb: 512, threads: 1 };

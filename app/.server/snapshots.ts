@@ -1,4 +1,4 @@
-// app/.server/snapshots.ts —— 结果快照：分析模板任务成功后，调度器把它写进结果层的那张表登记到平台元数据（模板、参数、任务、表名、行数，
+// app/.server/snapshots.ts —— 结果快照：分析模板（与指标、标签）任务成功后，调度器把它写进结果层的那张表登记到平台元数据（模板、参数、任务、表名、行数，
 // 创建后 90 天过期）；数据仍只在租户数据湖里（ADR-0002）。分析页列出本租户的快照，打开时在请求内只读挂载本租户的数据湖读取，
 // 快照表只有 consumer_id 与分值，没有明文（ADR-0005）。登记时模板读到的实体有已发布映射在任务开始前最近一次合并失败的，照常登记，
 // 但在快照上记下这些映射（数据不完整），原因只留摘要、不带源端取值。到期后调度器为每个租户入队 gold.expire 删表并清理湖里的旧文件，成功后标记 expiredAt。
@@ -34,14 +34,24 @@ export class SnapshotError extends Error {
  * 分析模板任务成功后登记它的快照（任务结果里的 table、rows、params，任务参数里的模板定义版本 definitionVersion），
  * 并记下任务开始前模板读到的实体里最近一次合并失败的映射（incompleteMappings）；任务没有成功（如已被判为中断）或已登记过时什么也不做
  */
-export async function registerSnapshot(tenantId: string, taskId: string, template: SnapshotTemplate) {
+export const registerSnapshot = (tenantId: string, taskId: string, template: SnapshotTemplate) =>
+  registerTaskSnapshot(tenantId, taskId, () => ({ template, entities: TEMPLATES[template].entities }));
+
+/**
+ * 结果层任务成功后登记它的快照：describe 由任务参数给出快照的 template 与读到的实体，其余同 registerSnapshot。
+ * 每次只新增这一张，已有的快照不变
+ */
+export async function registerTaskSnapshot(
+  tenantId: string, taskId: string, describe: (params: Record<string, unknown>) => { template: string; entities: readonly string[] },
+) {
   const db = getDb();
   const [task] = await db.select({ status: tasks.status, params: tasks.params, result: tasks.result, startedAt: tasks.startedAt }).from(tasks)
     .where(and(eq(tasks.id, taskId), eq(tasks.tenantId, tenantId)));
   if (task?.status !== 'succeeded' || !task.result) return;
   const { table, rows, params } = task.result as { table: string; rows: number; params: Record<string, unknown> };
   const { definitionVersion } = task.params as { definitionVersion?: unknown };
-  const incomplete = await incompleteMappings(tenantId, TEMPLATES[template].entities, task.startedAt ?? new Date());
+  const { template, entities } = describe(task.params as Record<string, unknown>);
+  const incomplete = await incompleteMappings(tenantId, entities, task.startedAt ?? new Date());
   const createdAt = new Date();
   await db.insert(snapshots).values({
     tenantId, template, taskId, table, params, rowCount: rows, createdAt,

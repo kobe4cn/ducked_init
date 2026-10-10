@@ -2,9 +2,10 @@
 // 本机同时运行的工作进程不超过 maxWorkers；各租户的并发上限与公平调度由 claimNextTask 保证，可以部署多个调度器。
 // 数据湖迁移存储也由调度器执行（在本进程内，要用平台账号读旧前缀、写新前缀），同样占一个名额，先于任务领取。
 // 常驻运行时还定期为到期的数据源入队同步与湖中数据核对，为有新变化的租户入队标准层合并；同步给已发布映射的源表写入变更后随即入队一次合并，
-// 分析模板任务成功后登记结果快照；还定期为有到期快照的租户入队快照过期，成功后标记快照已过期
+// 分析模板与指标、标签任务成功后登记结果快照；还定期为有到期快照的租户入队快照过期，成功后标记快照已过期
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { registerDslSnapshot } from '../dsl-definitions';
 import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '../lake-migration';
 import { enqueueDueMerges, mergeAfterSync } from '../mappings';
 import { enqueueDueExpiries, markExpired, registerSnapshot } from '../snapshots';
@@ -76,6 +77,7 @@ export function createDispatcher({
         if (task.kind === 'source.sync' && outcome!.result) await mergeAfterSync(task.tenantId, task.id);
         // 分析模板任务写好了结果层的快照表：登记到平台元数据，分析页据此列出
         if (task.kind === 'gold.rfm' && outcome!.result) await registerSnapshot(task.tenantId, task.id, 'rfm');
+        if (task.kind === 'gold.dsl' && outcome!.result) await registerDslSnapshot(task.tenantId, task.id);
         // 到期快照的表已删、旧文件已清理：标记为已过期，分析页不再打开它们
         if (task.kind === 'gold.expire' && outcome!.result) await markExpired(task.tenantId, task.id);
       })

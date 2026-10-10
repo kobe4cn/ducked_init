@@ -1,10 +1,11 @@
 // test/http/dsl-definitions.test.ts —— 指标定义的 HTTP 接缝：分析师在新建页填写键与 YAML 保存草稿 → 跳到定义页看到编译出的 SQL 与版本；在定义页再次保存改同一份草稿；
 // 校验不通过时按行列列出问题；查看者看不到「新建指标」、打不开新建页、提交 403；分析页里 metric: 快照链接到定义页；
-// 定义页点「预览」展示前 50 行与总行数（查看者也能预览），标准层缺表时给出说明，不存在的定义 404
+// 定义页点「预览」展示前 50 行与总行数（查看者也能预览），标准层缺表时给出说明，不存在的定义 404；
+// 版本表里发布不了的成员看到原因，另一位数据工程师发布后入队 gold.dsl；丢弃草稿回到已发布版本，从没发布过时回到分析页
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks } from '../../app/.server/db/schema';
-import { createDefinition } from '../../app/.server/dsl-definitions';
+import { createDefinition, getDefinition } from '../../app/.server/dsl-definitions';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -111,5 +112,39 @@ describe('指标定义页', () => {
     expect(missing.status).toBe(400);
     expect(await missing.text()).toContain('标准层还没有 silver.customer、silver.order：先发布 customer、order 的映射并合并');
     expect((await outsider.post('/analytics/definitions/metric/missing', { intent: 'preview' })).status).toBe(404);
+  });
+
+  it('发布不了的成员在版本表里看到原因；另一位数据工程师发布后入队 gold.dsl；丢弃草稿回到已发布版本，从没发布过时删除定义回到分析页', async () => {
+    const acme = await newTenant('acme');
+    const analystMember = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await memberOf(acme, 'de@acme.com', 'data_engineer');
+    await memberOf(acme, 'de2@acme.com', 'data_engineer');
+    await createDefinition(analystMember, 'metric', 'revenue', REVENUE);
+    const path = '/analytics/definitions/metric/revenue';
+
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    expect(await (await analyst.get(path)).text()).toMatch(/data-publish-blocker[^>]*>.*?仅管理员、数据工程师可以发布映射与定义/s);
+    expect((await analyst.post(path, { intent: 'publish', version: '1' })).status).toBe(403);
+
+    const engineer = await loginAs(app, 'de@acme.com');
+    await engineer.post(path, { intent: 'save', yaml: REVENUE.replace('sum', 'avg') });
+    expect(await (await engineer.get(path)).text()).toMatch(/data-publish-blocker[^>]*>.*?你最后改了这一版草稿/s);
+    expect((await engineer.post(path, { intent: 'publish', version: '1' })).status).toBe(403);
+
+    const reviewer = await loginAs(app, 'de2@acme.com');
+    expect(await (await reviewer.get(path)).text()).toContain('发布 v1');
+    const published = await reviewer.post(path, { intent: 'publish', version: '1' });
+    expect(published.headers.get('location')).toBe(`${path}?published=1`);
+    expect(await (await reviewer.get(`${path}?published=1`)).text()).toContain('第 1 版已发布');
+    expect(await getDb().select({ kind: tasks.kind }).from(tasks)).toContainEqual({ kind: 'gold.dsl' });
+
+    await analyst.post(path, { intent: 'save', yaml: REVENUE });
+    expect((await analyst.post(path, { intent: 'discard' })).headers.get('location')).toBe(path);
+    expect(await getDefinition(analystMember, 'metric', 'revenue')).toMatchObject({ draft: null, published: { version: 1 } });
+    expect((await analyst.post(path, { intent: 'discard' })).status).toBe(404);
+
+    await createDefinition(analystMember, 'metric', 'orders', REVENUE);
+    expect((await analyst.post('/analytics/definitions/metric/orders', { intent: 'discard' })).headers.get('location')).toBe('/analytics');
+    expect((await analyst.get('/analytics/definitions/metric/orders')).status).toBe(404);
   });
 });

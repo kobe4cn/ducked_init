@@ -7,7 +7,7 @@ import { syncOptionsFromEnv, syncSourceTables, type SyncTableParam } from './syn
 import { verifySourceLake, type VerifyTableParam } from './verify-engine';
 import { inspectLake, type InspectParams } from './inspect-engine';
 import { runKeyCheck, type KeyCheckParams } from './key-check-engine';
-import { mergeToSilver, type MergeMappingParam, type RelationParam } from './merge-engine';
+import { lit, mergeToSilver, type MergeMappingParam, type RelationParam } from './merge-engine';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { IDENTITIES } from './identity-engine';
 import { TEMPLATES } from './templates';
@@ -254,6 +254,27 @@ export const HANDLERS = {
       const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM gold."${name}"`);
       const [{ n: unlinked }] = await rows<{ n: string }>(con, compileRfmUnlinked(rfm));
       return { table: `gold.${name}`, rows: Number(n), unlinkedOrders: Number(unlinked), params: rfm };
+    },
+  },
+  // 指标或标签（ADR-0025）：发布定义时入队，参数里带上入队时按当天编译好的 SQL 与它用到的实体（不再访问平台库）。
+  // 标准层有这些实体与身份打通结果时，把 SQL 的结果写进结果层的一张快照表 gold."<种类>__<任务 ID>"，只有 consumer_id、维度与值
+  'gold.dsl': {
+    label: '指标与标签',
+    async run(con, params, { taskId }) {
+      const { kind, key, asOf, definitionVersion, sql, entities } = params;
+      if (typeof kind !== 'string' || !/^[a-z]+$/.test(kind)) throw new Error('参数 kind 不合法');
+      if (typeof sql !== 'string' || !sql) throw new Error('缺少参数 sql');
+      if (!isStrings(entities)) throw new Error('参数 entities 必须是非空的实体名列表');
+      const present = new Set((await rows<{ name: string }>(con, `
+        SELECT table_name AS name FROM information_schema.tables
+        WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities'].map(lit).join(', ')})`)).map(t => t.name));
+      const missing = entities.filter(entity => !present.has(entity));
+      if (missing.length) throw new Error(`标准层还没有 ${missing.map(entity => `silver.${entity}`).join('、')}：先发布 ${missing.join('、')} 的映射并合并`);
+      if (!present.has('_identities')) throw new Error(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`);
+      const name = `${kind}__${taskId}`;
+      await con.run(`CREATE SCHEMA IF NOT EXISTS gold; CREATE TABLE gold."${name}" AS ${sql}`);
+      const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM gold."${name}"`);
+      return { table: `gold.${name}`, rows: Number(n), params: { kind, key, asOf, definitionVersion } };
     },
   },
   // 快照过期：删掉参数里到期快照的表（已删的跳过，重复执行不报错），再按 ADR-0020 擦除湖里的数据：

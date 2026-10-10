@@ -1,18 +1,21 @@
 // test/pipeline/dsl-definitions.test.ts —— 指标与标签定义的流水线接缝：成员新建定义（createDefinition）→ 再次保存改同一份草稿（saveDslDraft）→ getDefinition 读出各版本、
 // 作者与最后保存的人，以及编译出的 SQL；键不合规或重复、YAML 校验不通过、没有起草权限时拒绝且不写入。
-// 样本预览（previewDefinition）在只读挂载的数据湖上按今天运行编译出的 SQL，给出前 50 行与总行数，湖与任务队列不变
+// 样本预览（previewDefinition）在只读挂载的数据湖上按今天运行编译出的 SQL，给出前 50 行与总行数，湖与任务队列不变。
+// 双人发布（publishDefinition）以当天入队 gold.dsl，调度器成功后登记快照；丢弃草稿（discardDslDraft）回到已发布版本或删除定义
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { dslVersions, mappings, tasks } from '../../app/.server/db/schema';
-import { createDefinition, DslError, getDefinition, previewDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
+import { createDefinition, discardDslDraft, DslError, getDefinition, previewDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { publishMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, relistSource, setSyncScope } from '../../app/.server/sources';
+import { getTask } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, publish } from './fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from './identity-fixtures';
@@ -181,5 +184,80 @@ describe('样本预览', () => {
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     await createDefinition(analyst, 'metric', 'revenue', REVENUE);
     await expect(previewDefinition(analyst, 'metric', 'revenue')).rejects.toThrow(/标准层还没有.*silver\.order.*发布.*映射并合并/);
+  });
+});
+
+// 不限时间窗口：覆盖夹具里 2024 年的订单
+const ALL_REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\n';
+
+describe('发布与丢弃', () => {
+  it('最后保存草稿的人与分析师不能发布；另一位数据工程师发布后版本锁定，以当天入队 gold.dsl，成功后登记快照；再改是新一版草稿，再发布只新增快照', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
+
+    const error = await publishDefinition(author, 'metric', 'revenue', 1).catch(e => e);
+    expect(error).toBeInstanceOf(DslError);
+    expect(error.message).toMatch(/最后改了这一版草稿/);
+    await expect(publishDefinition(analyst, 'metric', 'revenue', 1)).rejects.toMatchObject({ init: { status: 403 } });
+
+    const today = new Date().toISOString().slice(0, 10);
+    const task = await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    expect(task).toMatchObject({
+      kind: 'gold.dsl', status: 'queued',
+      params: { kind: 'metric', key: 'revenue', definitionId: expect.any(String), definitionVersion: 1, asOf: today, entities: ['order'], sql: expect.stringContaining('silver._identities') },
+    });
+    expect(await getDefinition(analyst, 'metric', 'revenue')).toMatchObject({ draft: null, published: { version: 1, publishedByEmail: reviewer.email } });
+    await expect(publishDefinition(author, 'metric', 'revenue', 1)).rejects.toThrow(/已锁定/);
+
+    await drain();
+    expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
+    const [first] = await listSnapshots(acme);
+    const [{ n }] = await onLake<{ n: string }>(acme, `SELECT count(*)::VARCHAR AS n FROM gold."metric__${task.id}"`);
+    expect(Number(n)).toBeGreaterThan(0);
+    expect(first).toMatchObject({
+      template: 'metric:revenue', taskId: task.id, table: `gold.metric__${task.id}`, definitionVersion: 1, rowCount: Number(n), incomplete: null,
+      params: { kind: 'metric', key: 'revenue', asOf: today, definitionVersion: 1 },
+    });
+    expect(first!.expiresAt.getTime() - first!.createdAt.getTime()).toBe(90 * 24 * 60 * 60 * 1000);
+
+    // 发布后再改是新的一版草稿，键不变，已发布的第 1 版不变
+    expect(await saveDslDraft(analyst, 'metric', 'revenue', REVENUE_BY_CITY.replace(REVENUE, ALL_REVENUE))).toBe(2);
+    expect(await getDefinition(analyst, 'metric', 'revenue')).toMatchObject({ key: 'revenue', draft: { version: 2 }, published: { version: 1 } });
+    const second = await publishDefinition(author, 'metric', 'revenue', 2);
+    await drain();
+    expect(await getTask(second.id)).toMatchObject({ status: 'succeeded' });
+    const snapshots = await listSnapshots(acme);
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots.find(s => s.taskId === second.id)).toMatchObject({ template: 'metric:revenue', definitionVersion: 2 });
+    expect(snapshots.find(s => s.taskId === task.id)).toEqual(first);
+  });
+
+  it('任务失败（标准层还没有订单）时不登记快照', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources();
+    await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
+    const task = await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    await drain();
+    expect(await getTask(task.id)).toMatchObject({ status: 'failed', error: expect.stringMatching(/silver\.order/) });
+    expect(await listSnapshots(acme)).toEqual([]);
+  });
+
+  it('丢弃草稿：有已发布版本时回到它，从没发布过时删除整个定义', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    expect(await discardDslDraft(analyst, 'metric', 'revenue')).toEqual({ published: null });
+    await expect(getDefinition(analyst, 'metric', 'revenue')).rejects.toMatchObject({ status: 404 });
+    await expect(discardDslDraft(analyst, 'metric', 'revenue')).rejects.toMatchObject({ status: 404 });
+
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await publishDefinition(engineer, 'metric', 'revenue', 1);
+    await expect(discardDslDraft(analyst, 'metric', 'revenue')).rejects.toMatchObject({ status: 404, message: expect.stringMatching(/没有草稿/) });
+    await saveDslDraft(analyst, 'metric', 'revenue', REVENUE_BY_CITY);
+    expect(await discardDslDraft(engineer, 'metric', 'revenue')).toEqual({ published: 1 });
+    expect(await getDefinition(analyst, 'metric', 'revenue')).toMatchObject({ draft: null, published: { version: 1, yaml: REVENUE } });
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    await expect(discardDslDraft(viewer, 'metric', 'revenue')).rejects.toMatchObject({ init: { status: 403 } });
   });
 });

@@ -11,6 +11,7 @@ type Detail = Record<string, unknown>;
 const sourceKindLabel = (kind: unknown) => SOURCE_KIND_LABELS[kind as SourceKind] ?? String(kind);
 const roleLabel = (role: unknown) => ROLE_LABELS[role as Role] ?? String(role);
 const templateLabel = (template: unknown) => TEMPLATES[template as keyof typeof TEMPLATES]?.label ?? String(template);
+const dslLabel = (d: Detail) => (d.kind === 'tag' ? '标签' : '指标');
 
 
 // 每种审计动作的名称，以及把明细写成一句话的方式；新增动作只改这里
@@ -76,7 +77,15 @@ const ACTIONS = {
       `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '映射已删除'}`,
   },
   'template.drafted': { label: '起草模板参数', describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版草稿` },
-  'definition.drafted': { label: '起草指标或标签', describe: (d: Detail) => `${d.kind === 'tag' ? '标签' : '指标'} ${d.key}，第 ${d.version} 版草稿` },
+  'definition.drafted': { label: '起草指标或标签', describe: (d: Detail) => `${dslLabel(d)} ${d.key}，第 ${d.version} 版草稿` },
+  'definition.published': {
+    label: '发布指标或标签',
+    describe: (d: Detail) => `${dslLabel(d)} ${d.key}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
+  },
+  'definition.draft_discarded': {
+    label: '丢弃指标或标签草稿',
+    describe: (d: Detail) => `${dslLabel(d)} ${d.key}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '定义已删除'}`,
+  },
   'template.published': {
     label: '发布模板参数',
     describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,

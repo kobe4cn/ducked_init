@@ -1,18 +1,19 @@
 // app/routes/analytics.definitions.$kind.$key.tsx —— 指标或标签定义（有定义查看权限的成员，页面与种类无关，ADR-0025）：
 // YAML 编辑框（有起草权限的成员保存草稿，校验不通过时按行列列出问题）、最新一版编译出的 SQL 与样本预览（只读挂载上按今天运行，前 50 行与总行数），
-// 以及各版本的作者与最后保存的人
+// 以及各版本的作者与最后保存的人；草稿由最后保存它的人以外的另一位有发布权限的成员发布（发布后以当天入队一次计算，成功后快照出现在分析页），也可以丢弃
 import { CheckCircle2 } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.$kind.$key';
 import { can, requirePermission } from '~/.server/access';
-import { DslError, getDefinition, previewDefinition, saveDslDraft } from '~/.server/dsl-definitions';
+import { discardDslDraft, DslError, getDefinition, previewDefinition, publishDefinition, saveDslDraft } from '~/.server/dsl-definitions';
 import { navFor } from '~/.server/nav';
 import { UNLINKED } from '~/.server/pipeline/dsl/metric-spec';
+import { publishReason } from '~/.server/publish-rules';
 import { AppShell } from '~/components/app-shell';
-import { VersionStatus } from '~/components/draft-version';
+import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
 import { PageHeader } from '~/components/page-header';
-import { Alert, AlertTitle } from '~/components/ui/alert';
+import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
@@ -29,12 +30,15 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     if (e instanceof DslError && e.status === 404) throw data(null, { status: 404 });
     throw e;
   }
+  const search = new URL(request.url).searchParams;
   return {
     email: member.email,
     nav: navFor(member),
     canDraft: can(member.role, 'definitions:draft'),
     /** 刚保存的版本（保存后跳回本页时带上 ?saved=N） */
-    justSaved: Number(new URL(request.url).searchParams.get('saved')) || null,
+    justSaved: Number(search.get('saved')) || null,
+    /** 刚发布的版本（发布后跳回本页时带上 ?published=N） */
+    justPublished: Number(search.get('published')) || null,
     kind: d.kind,
     key: d.key,
     label: d.label,
@@ -52,6 +56,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       publishedByEmail: v.publishedByEmail,
       publishedAt: v.publishedAt?.toISOString() ?? null,
       updatedAt: v.updatedAt.toISOString(),
+      /** 当前成员发布不了这一版草稿的原因（没有发布权限、最后保存的是自己、租户里没有别人能发布）；可以发布或不是草稿时为 null */
+      publishBlocker: publishReason(member, v, d.publishers),
     })),
   };
 }
@@ -60,11 +66,22 @@ export async function action({ request, params }: Route.ActionArgs) {
   const form = await request.formData();
   const yaml = String(form.get('yaml') ?? '');
   const intent = String(form.get('intent') ?? '');
+  const page = `/analytics/definitions/${params.kind}/${params.key}`;
   try {
     switch (intent) {
       case 'save': {
         const version = await saveDslDraft(await requirePermission(request, 'definitions:draft'), params.kind, params.key, yaml);
-        throw redirect(`/analytics/definitions/${params.kind}/${params.key}?saved=${version}`);
+        throw redirect(`${page}?saved=${version}`);
+      }
+      case 'publish': {
+        const version = Number(form.get('version'));
+        await publishDefinition(await requirePermission(request, 'publish'), params.kind, params.key, version);
+        throw redirect(`${page}?published=${version}`);
+      }
+      case 'discard': {
+        const { published } = await discardDslDraft(await requirePermission(request, 'definitions:draft'), params.kind, params.key);
+        // 从没发布过时定义已删除，回到分析页
+        throw redirect(published ? page : '/analytics');
       }
       case 'preview': {
         const member = await requirePermission(request, 'definitions:read');
@@ -83,7 +100,7 @@ export async function action({ request, params }: Route.ActionArgs) {
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
 export default function Definition({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canDraft, justSaved, kind, key, label, yaml, published, compiled, unlinked, versions } = loaderData;
+  const { email, nav, canDraft, justSaved, justPublished, kind, key, label, yaml, published, compiled, unlinked, versions } = loaderData;
   const navigation = useNavigation();
   const submitting = navigation.state === 'submitting';
   const previewing = submitting && navigation.formData?.get('intent') === 'preview';
@@ -102,6 +119,13 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
         <Alert role="status">
           <CheckCircle2 />
           <AlertTitle>{`第 ${justSaved} 版草稿已保存`}</AlertTitle>
+        </Alert>
+      )}
+      {justPublished && !actionData?.error && (
+        <Alert role="status">
+          <CheckCircle2 />
+          <AlertTitle>{`第 ${justPublished} 版已发布`}</AlertTitle>
+          <AlertDescription>已按今天入队一次计算，完成后快照出现在分析页。</AlertDescription>
         </Alert>
       )}
 
@@ -174,6 +198,7 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
               <TableHead>作者</TableHead>
               <TableHead>最后保存</TableHead>
               <TableHead>发布</TableHead>
+              <TableHead />
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -184,6 +209,14 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
                 <TableCell>{v.authors.join('、')}</TableCell>
                 <TableCell className="text-slate-500">{`${v.lastEditor} · ${time(v.updatedAt)}`}</TableCell>
                 <TableCell className="text-slate-500">{v.publishedByEmail ? `${v.publishedByEmail} · ${time(v.publishedAt)}` : '—'}</TableCell>
+                <TableCell>
+                  {v.status === 'draft' && (
+                    <DraftActions
+                      v={v} canDiscard={canDraft} discardHint={published !== null ? '回到最近的已发布版本' : '从没发布过，整个定义将被删除'}
+                      submitting={submitting} className="justify-end"
+                    />
+                  )}
+                </TableCell>
               </TableRow>
             ))}
           </TableBody>
