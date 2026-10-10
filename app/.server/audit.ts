@@ -86,6 +86,7 @@ const ACTIONS = {
     label: '丢弃指标或标签草稿',
     describe: (d: Detail) => `${dslLabel(d)} ${d.key}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '定义已删除'}`,
   },
+  'definition.deleted': { label: '删除指标或标签', describe: (d: Detail) => `${dslLabel(d)} ${d.key}` },
   'template.published': {
     label: '发布模板参数',
     describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,

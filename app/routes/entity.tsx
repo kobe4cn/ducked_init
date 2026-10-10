@@ -1,6 +1,6 @@
 // app/routes/entity.tsx —— 单个自定义实体（ADR-0019）：数据工程师、管理员编辑登记（中文名、类型、字段、主键与关系；名称建实体时定下，不能改），
 // 各版本（已发布的锁定、草稿可改；发布过的只能新增字段与关系）、丢弃草稿，发布草稿需最后保存它的人以外的另一位有发布权限的成员在这个页面上操作，
-// 没有自动发布。有发布权限的成员可以删除没被已发布映射引用的实体。平台推断出的登记草稿提示成员核对后保存确认，确认前发布不了。
+// 没有自动发布。有发布权限的成员可以删除没被已发布映射、关系或指标引用的实体。平台推断出的登记草稿提示成员核对后保存确认，确认前发布不了。
 // 从没发布过的登记有配套的映射草稿（一键直通生成的）时，显示这个映射，可以把登记与映射一起发布（passthrough.ts）。
 // 编辑页列出本实体相关的已发布关系在最近一次合并后的孤儿比例与样例键。
 // 分编辑、版本两个标签页（?tab=edit|versions，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）
@@ -61,7 +61,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         : { at: null, relations: [] },
       /** 草稿是平台推断、还没有成员确认（保存）过的登记 */
       inferred: !!found.draft && isInferredDraft(found.draft),
-      /** 引用这个实体的已发布映射与别的实体指向它的已发布关系；有引用时不能删除 */
+      /** 引用这个实体的已发布映射、已发布指标与别的实体指向它的已发布关系；有引用时不能删除 */
       referrers: found.referrers,
       /** 编辑页显示的版本（?version=N，没有时显示最新的一版） */
       version: Number(new URL(request.url).searchParams.get('version')) || null,
@@ -160,7 +160,7 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
             {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : `这个自定义实体从没发布过，将被删除${unpublishedMappings.length ? `，目标是它的映射草稿一并丢弃：${unpublishedMappings.join('、')}` : ''}`} submitting={submitting} />}
             {canDelete && (referrers.length ? (
               <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-delete-blocker>
-                <Lock className="size-3.5 shrink-0" />{`被已发布的映射或关系引用，不能删除：${referrers.join('、')}`}
+                <Lock className="size-3.5 shrink-0" />{`被已发布的映射、关系或指标引用，不能删除：${referrers.join('、')}`}
               </span>
             ) : (
               <Form

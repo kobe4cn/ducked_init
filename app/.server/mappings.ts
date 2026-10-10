@@ -10,6 +10,7 @@ import { allRelations, publishedCustomEntities, type RegisteredEntity, relations
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
+import { publishedDependents } from './dsl-dependencies';
 import { dryRun } from './pipeline/dry-run-engine';
 import { identityRules, type IdentitySummary } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
@@ -274,6 +275,19 @@ async function assertExtensionTypes(tx: Tx, tenantId: string, plan: MergePlan) {
   }
 }
 
+/**
+ * 发布后这个实体的已发布映射（本映射换成这一版）里仍要有已发布指标引用的每个 x_ 字段（ADR-0025）：不再有时拒绝，报出指标的键与字段。
+ * 调用方已锁住租户行，与发布指标互斥
+ */
+async function assertMetricFields(tx: Tx, tenantId: string, mappingId: string, plan: MergePlan) {
+  const after = [...(await publishedPlans(tx, tenantId)).filter(o => o.mapping !== mappingId && o.entity === plan.entity), plan];
+  const present = new Set(after.flatMap(p => p.columns.map(c => c.name)));
+  const missing = (await publishedDependents(tx, tenantId)).flatMap(d => d.fields
+    .filter(f => f.entity === plan.entity && f.field.startsWith('x_') && !present.has(f.field))
+    .map(f => `指标 ${d.key} 的 ${f.field}`));
+  if (missing.length) throw new MappingError(`发布后 ${plan.entity} 的已发布映射里不再有已发布指标引用的扩展字段，不能发布：${missing.join('、')}`);
+}
+
 /** 映射在报错里的叫法 */
 const mappingName = (p: { table: string; entity: string }) => `${p.table} → ${p.entity}`;
 
@@ -369,6 +383,7 @@ export async function publishMappingDraft(
   await assertExtensionTypes(tx, actor.tenant.id, plan);
   await assertIdentityRules(tx, actor.tenant.id, mapping.id, plan);
   await assertKeySpaces(tx, actor.tenant.id, mapping, plan);
+  await assertMetricFields(tx, actor.tenant.id, mapping.id, plan);
   await tx.update(mappingVersions)
     .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: sql`now()` })
     .where(eq(mappingVersions.id, draft.id));
@@ -504,7 +519,8 @@ export function isSensitiveField(
     || plans.some(p => p.entity === entity && p.columns.some(c => c.name === field && c.sensitive));
 }
 
-const lockTenant = (tx: Tx, tenantId: string) => tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
+/** 锁住租户行：入队合并、发布映射与定义、删除定义与自定义实体先拿它，按租户串行 */
+export const lockTenant = (tx: Tx, tenantId: string) => tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
 
 /**
  * 在调用方的事务里为给定映射（不给时为全部已发布映射）的最新已发布版本入队一次合并，返回带上它们的合并任务。

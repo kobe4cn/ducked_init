@@ -2,6 +2,7 @@
 // 键在租户与种类内唯一；每个定义同时只有一份草稿，再次保存改的是同一份，记下作者与最后保存的人，之后按映射同样的规则双人发布（ADR-0015）。
 // 校验对照本租户已发布的自定义实体登记与已发布映射的扩展字段（标签另对照各指标最新的已发布版本）；定义页展示编译出的 SQL，并可在只读挂载的数据湖上预览前 50 行。
 // 发布后版本锁定，并以当天为 asOf 入队一次 gold.dsl（编译在入队时完成，SQL 进任务参数），成功后登记为一张快照（template 为 <种类>:<键>）。
+// 有修改与删除权限的成员可以删除定义；被已发布标签引用的指标不能删（依赖由已发布版本按需解析，dsl-dependencies.ts）。
 // 一律限定在操作者所属租户内
 import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -9,9 +10,10 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { publishedCustomEntities } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
+import { publishedTagsOf } from './dsl-dependencies';
 import { dslDefinitions, dslVersions } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
-import { publishedPlans } from './mappings';
+import { lockTenant, publishedPlans } from './mappings';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
 import { checkMetric, type DslCheck, type DslContext, type DslIssue, type MetricSpec } from './pipeline/dsl/metric-spec';
 import { IDENTITIES } from './pipeline/identity-engine';
@@ -109,7 +111,7 @@ export async function saveDslDraft(actor: CurrentMember, kind: string, key: stri
 }
 
 /**
- * 本租户的一个定义：各版本（最新的在前，带当前成员发布不了的原因）、草稿与最近的已发布版本、本租户有发布权限的成员人数，
+ * 本租户的一个定义：各版本（最新的在前，带当前成员发布不了的原因）、草稿与最近的已发布版本、本租户有发布权限的成员人数、引用它的已发布标签，
  * 以及最新一版（有草稿时是草稿）按今天（UTC）编译出的 SQL；它对照当前的登记与映射不再通过校验时给出问题
  */
 export async function getDefinition(actor: CurrentMember, kind: string, key: string) {
@@ -136,6 +138,8 @@ export async function getDefinition(actor: CurrentMember, kind: string, key: str
     draft,
     published,
     publishers: await publisherCount(actor.tenant.id),
+    /** 引用这个指标的已发布标签的键；有引用时不能删除 */
+    dependents: kind === 'metric' ? await publishedTagsOf(getDb(), actor.tenant.id, key) : [],
     compiled: result.ok
       ? { version: versions[0]!.version, sql: DSL_KINDS[kind].compile(result.spec, ctx, todayUtc(), key), issues: [] as DslIssue[] }
       : { version: versions[0]!.version, sql: null, issues: result.issues },
@@ -156,6 +160,8 @@ export async function publishDefinition(actor: CurrentMember, kind: string, key:
   const blocker = publishBlocker(actor, draft);
   if (blocker) throw new DslError(blocker, draft.status === 'draft' ? 403 : 400);
   return getDb().transaction(async tx => {
+    // 先锁住租户行：与映射发布、删除定义与自定义实体互斥，它们按已发布定义的依赖做检查
+    await lockTenant(tx, actor.tenant.id);
     // 锁住定义行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿
     await tx.select({ id: dslDefinitions.id }).from(dslDefinitions).where(eq(dslDefinitions.id, draft.definitionId)).for('update');
     const [current] = await tx.select().from(dslVersions).where(eq(dslVersions.id, draft.id));
@@ -200,6 +206,27 @@ export async function discardDslDraft(actor: CurrentMember, kind: string, key: s
       detail: { kind, key, version: draft.version, published },
     });
     return { published };
+  });
+}
+
+/**
+ * 删除定义（硬删除，各版本随之级联删除；已登记的快照留到正常过期）：需要修改与删除权限。
+ * 指标被已发布的标签引用（各标签最新的已发布版本，草稿不算）时拒绝并列出这些标签的键
+ */
+export async function deleteDefinition(actor: CurrentMember, kind: string, key: string) {
+  assertCan(actor, 'definitions:write');
+  requireKind(kind);
+  await getDb().transaction(async tx => {
+    // 先锁租户行（与发布定义、映射互斥，同时发布的标签要么已提交、要么看不到这个指标），再锁定义行后查依赖
+    await lockTenant(tx, actor.tenant.id);
+    const [definition] = await tx.select({ id: dslDefinitions.id }).from(dslDefinitions).where(ofDefinition(actor.tenant.id, kind, key)).for('update');
+    if (!definition) throw new DslError(`没有键为 ${key} 的${DSL_KINDS[kind].label}`, 404);
+    const tags = kind === 'metric' ? await publishedTagsOf(tx, actor.tenant.id, key) : [];
+    if (tags.length) throw new DslError(`指标 ${key} 被已发布的标签引用，不能删除：${tags.join('、')}`);
+    await tx.delete(dslDefinitions).where(eq(dslDefinitions.id, definition.id));
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id, actor, action: 'definition.deleted', targetType: 'definition', targetId: definition.id, detail: { kind, key },
+    });
   });
 }
 

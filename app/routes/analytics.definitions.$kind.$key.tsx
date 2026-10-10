@@ -1,11 +1,12 @@
 // app/routes/analytics.definitions.$kind.$key.tsx —— 指标或标签定义（有定义查看权限的成员，页面与种类无关，ADR-0025）：
 // YAML 编辑框（有起草权限的成员保存草稿，校验不通过时按行列列出问题）、最新一版编译出的 SQL 与样本预览（只读挂载上按今天运行，前 50 行与总行数），
-// 以及各版本的作者与最后保存的人；草稿由最后保存它的人以外的另一位有发布权限的成员发布（发布后以当天入队一次计算，成功后快照出现在分析页），也可以丢弃
-import { CheckCircle2 } from 'lucide-react';
+// 以及各版本的作者与最后保存的人；草稿由最后保存它的人以外的另一位有发布权限的成员发布（发布后以当天入队一次计算，成功后快照出现在分析页），也可以丢弃。
+// 有修改与删除权限的成员可以删除定义（被已发布标签引用的指标删不了）
+import { CheckCircle2, Lock, Trash2 } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.$kind.$key';
 import { can, requirePermission } from '~/.server/access';
-import { discardDslDraft, DslError, getDefinition, previewDefinition, publishDefinition, saveDslDraft } from '~/.server/dsl-definitions';
+import { deleteDefinition, discardDslDraft, DslError, getDefinition, previewDefinition, publishDefinition, saveDslDraft } from '~/.server/dsl-definitions';
 import { navFor } from '~/.server/nav';
 import { UNLINKED } from '~/.server/pipeline/dsl/metric-spec';
 import { publishReason } from '~/.server/publish-rules';
@@ -35,6 +36,9 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     email: member.email,
     nav: navFor(member),
     canDraft: can(member.role, 'definitions:draft'),
+    canDelete: can(member.role, 'definitions:write'),
+    /** 引用这个指标的已发布标签的键；有引用时不能删除 */
+    dependents: d.dependents,
     /** 刚保存的版本（保存后跳回本页时带上 ?saved=N） */
     justSaved: Number(search.get('saved')) || null,
     /** 刚发布的版本（发布后跳回本页时带上 ?published=N） */
@@ -83,6 +87,9 @@ export async function action({ request, params }: Route.ActionArgs) {
         // 从没发布过时定义已删除，回到分析页
         throw redirect(published ? page : '/analytics');
       }
+      case 'delete':
+        await deleteDefinition(await requirePermission(request, 'definitions:write'), params.kind, params.key);
+        throw redirect('/analytics');
       case 'preview': {
         const member = await requirePermission(request, 'definitions:read');
         const preview = await previewDefinition(member, params.kind, params.key, Number(form.get('version')) || undefined);
@@ -100,7 +107,7 @@ export async function action({ request, params }: Route.ActionArgs) {
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
 export default function Definition({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canDraft, justSaved, justPublished, kind, key, label, yaml, published, compiled, unlinked, versions } = loaderData;
+  const { email, nav, canDraft, canDelete, dependents, justSaved, justPublished, kind, key, label, yaml, published, compiled, unlinked, versions } = loaderData;
   const navigation = useNavigation();
   const submitting = navigation.state === 'submitting';
   const previewing = submitting && navigation.formData?.get('intent') === 'preview';
@@ -112,6 +119,21 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
       <PageHeader
         title={`${label} · ${key}`}
         description={<><Link to="/analytics" className="hover:underline">← 分析</Link>{`　${kind}:${key}　当前生效：${published ? `第 ${published} 版` : '还没有发布'}`}</>}
+        actions={canDelete && (dependents.length ? (
+          <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-delete-blocker>
+            <Lock className="size-3.5 shrink-0" />{`被已发布的标签引用，不能删除：${dependents.join('、')}`}
+          </span>
+        ) : (
+          <Form
+            method="post"
+            onSubmit={e => {
+              if (!confirm(`删除${label} ${key}？所有版本一并删除，不能恢复；已有的快照保留到过期。`)) e.preventDefault();
+            }}
+          >
+            <input type="hidden" name="intent" value="delete" />
+            <Button type="submit" variant="destructive" disabled={submitting}><Trash2 />{`删除${label}`}</Button>
+          </Form>
+        ))}
       />
 
       {actionData?.error && <MappingErrors error={actionData.error} issues={actionData.issues} />}

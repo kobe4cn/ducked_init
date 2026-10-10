@@ -3,7 +3,7 @@
 // 至少一端是本实体，ADR-0019「关系」）。保存草稿时校验登记本身、关系的两端与成环，发布时再校验一次。
 // 草稿按映射同样的规则双人发布：由最后保存它的人以外的另一位有发布权限的成员在页面上发布，也可以丢弃（回到最近的已发布版本，
 // 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。发布过的实体只能新增字段与关系（规则同 ADR-0018），
-// 没被已发布映射、也没被别的实体的已发布关系指向的实体可以由有发布权限的成员删除。已发布映射在用、但没登记的实体由平台推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），
+// 没被已发布映射、已发布指标引用，也没被别的实体的已发布关系指向的实体可以由有发布权限的成员删除。已发布映射在用、但没登记的实体由平台推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），
 // 先由一位成员确认（保存），再由另一位成员发布；登记发布前映射页提示实体待补登，映射页的实体链接到实体页。一律限定在操作者所属租户内
 import { and, desc, eq, exists, getTableColumns, inArray, notExists, sql } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -11,7 +11,8 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { customEntities, customEntityVersions, mappings, mappingVersions, sources } from './db/schema';
-import { isSensitiveField, publishedPlans } from './mappings';
+import { isSensitiveField, lockTenant, publishedPlans } from './mappings';
+import { publishedDependents } from './dsl-dependencies';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import {
   CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, type EntityRelation, entityOf,
@@ -265,7 +266,8 @@ export async function requireEntity(tenantId: string, entityId: string) {
 
 /**
  * 引用这个实体的已发布映射（有已发布版本、映射的实体是它；映射的实体建映射时定下），按「数据源」表名列出；
- * 再列出别的实体已发布的登记上指向它的关系（挂在它自己登记上的关系随它一起删，不算引用）。指标与标签还不能引用自定义实体
+ * 再列出别的实体已发布的登记上指向它的关系（挂在它自己登记上的关系随它一起删，不算引用），以及以它为基础实体或维度路径经过它的已发布指标
+ * （各指标最新的已发布版本，草稿不算；标签经指标引用实体，指标在就删不了）
  */
 async function publishedReferrers(db: Tx | ReturnType<typeof getDb>, tenantId: string, name: string) {
   const rows = await db.select({ source: sources.name, table: mappings.tableName, viewId: mappings.sourceViewId })
@@ -278,7 +280,10 @@ async function publishedReferrers(db: Tx | ReturnType<typeof getDb>, tenantId: s
     .orderBy(sources.name, mappings.tableName);
   const relations = [...(await publishedCustomEntities(db, tenantId)).values()]
     .flatMap(e => (e.name === name ? [] : (e.relations ?? []).filter(r => r.ref.entity === name)));
-  return [...rows.map(r => `「${r.source}」${r.viewId ? '源视图 ' : ''}${r.table}`), ...relations.map(r => `关系 ${relationText(r)}`)];
+  const metrics = (await publishedDependents(db, tenantId)).filter(d => d.kind === 'metric' && d.entities.includes(name)).map(d => d.key);
+  return [
+    ...rows.map(r => `「${r.source}」${r.viewId ? '源视图 ' : ''}${r.table}`), ...relations.map(r => `关系 ${relationText(r)}`), ...metrics.map(key => `指标 ${key}`),
+  ];
 }
 
 /** 目标是这个实体、从没发布过的映射（如一键直通配套的映射草稿）：丢弃从没发布过的登记时一并丢弃 */
@@ -517,17 +522,18 @@ export async function discardCustomEntityDraft(actor: CurrentMember, entityId: s
 }
 
 /**
- * 删除自定义实体（硬删除，各版本随之级联删除）：需要发布权限；被已发布的映射或别的实体已发布的关系引用时拒绝并列出它们。
- * 引用检查与删除在同一事务里，并锁住实体行（发布映射目前不锁实体行，要等映射发布对照登记校验时才完全互斥）
+ * 删除自定义实体（硬删除，各版本随之级联删除）：需要发布权限；被已发布的映射、别的实体已发布的关系或已发布的指标引用时拒绝并列出它们。
+ * 引用检查与删除在同一事务里，先锁租户行（与发布映射、发布指标互斥）再锁实体行
  */
 export async function deleteCustomEntity(actor: CurrentMember, entityId: string) {
   assertCan(actor, 'publish');
   const entity = await requireEntity(actor.tenant.id, entityId);
   await getDb().transaction(async tx => {
+    await lockTenant(tx, actor.tenant.id);
     const [locked] = await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
     if (!locked) throw new CustomEntityError('自定义实体已被删除', 404);
     const referrers = await publishedReferrers(tx, actor.tenant.id, entity.name);
-    if (referrers.length) throw new CustomEntityError(`${entity.name} 被已发布的映射或关系引用，不能删除：${referrers.join('、')}`);
+    if (referrers.length) throw new CustomEntityError(`${entity.name} 被已发布的映射、关系或指标引用，不能删除：${referrers.join('、')}`);
     await tx.delete(customEntities).where(eq(customEntities.id, entityId));
     await recordAudit(tx, {
       tenantId: actor.tenant.id,

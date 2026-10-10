@@ -2,13 +2,14 @@
 // 作者与最后保存的人，以及编译出的 SQL；键不合规或重复、YAML 校验不通过、没有起草权限时拒绝且不写入。
 // 样本预览（previewDefinition）在只读挂载的数据湖上按今天运行编译出的 SQL，给出前 50 行与总行数，湖与任务队列不变。
 // 双人发布（publishDefinition）以当天入队 gold.dsl，调度器成功后登记快照；丢弃草稿（discardDslDraft）回到已发布版本或删除定义
-// 标签只引用指标最新的已发布版本，快照每行带不变的 tag_key
+// 标签只引用指标最新的已发布版本，快照每行带不变的 tag_key。删除定义（deleteDefinition）：被已发布标签引用的指标不能删
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { listAuditLogs } from '../../app/.server/audit';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { dslVersions, mappings, tasks } from '../../app/.server/db/schema';
-import { createDefinition, discardDslDraft, DslError, getDefinition, previewDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
+import { createDefinition, deleteDefinition, discardDslDraft, DslError, getDefinition, previewDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { publishMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -314,5 +315,41 @@ describe('标签定义', () => {
     await expect(createDefinition(author, 'tag', 'city_tier', 'metric: revenue_by_city\nrules: []\ndefault: low\n'))
       .rejects.toMatchObject({ issues: [{ path: 'rules', message: '不能为空' }] });
     await expect(getDefinition(author, 'tag', 'city_tier')).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe('删除定义', () => {
+  it('被已发布标签引用的指标不能删并列出标签的键，草稿与标签的旧版本里的引用不算；分析师不能删；删除级联版本并记审计', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const tier = 'metric: revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n';
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await publishDefinition(engineer, 'metric', 'revenue', 1);
+    for (const key of ['value_tier', 'big_spender']) {
+      await createDefinition(analyst, 'tag', key, tier);
+      await publishDefinition(engineer, 'tag', key, 1);
+    }
+    // 只有草稿的标签不算引用
+    await createDefinition(analyst, 'tag', 'draft_tier', tier);
+
+    await expect(deleteDefinition(analyst, 'metric', 'revenue')).rejects.toMatchObject({ init: { status: 403 } });
+    await expect(deleteDefinition(engineer, 'metric', 'revenue')).rejects.toMatchObject({
+      status: 400, message: '指标 revenue 被已发布的标签引用，不能删除：big_spender、value_tier',
+    });
+    expect((await getDefinition(analyst, 'metric', 'revenue')).dependents).toEqual(['big_spender', 'value_tier']);
+    // 只看标签最新的已发布版本：value_tier 第 2 版改引用 orders
+    await createDefinition(analyst, 'metric', 'orders', 'base: order\nmeasure: { agg: count }\n');
+    await publishDefinition(engineer, 'metric', 'orders', 1);
+    await saveDslDraft(analyst, 'tag', 'value_tier', tier.replace('revenue', 'orders'));
+    await publishDefinition(engineer, 'tag', 'value_tier', 2);
+    await deleteDefinition(engineer, 'tag', 'big_spender');
+    await deleteDefinition(engineer, 'metric', 'revenue');
+    await expect(getDefinition(analyst, 'metric', 'revenue')).rejects.toMatchObject({ status: 404 });
+    await expect(deleteDefinition(engineer, 'metric', 'revenue')).rejects.toMatchObject({ status: 404 });
+    await expect(deleteDefinition(engineer, 'metric', 'orders')).rejects.toThrow('指标 orders 被已发布的标签引用，不能删除：value_tier');
+    expect(await getDb().select().from(dslVersions)).toHaveLength(4);
+    expect((await listAuditLogs(acme)).filter(l => l.action === '删除指标或标签').map(l => l.summary))
+      .toEqual(['指标 revenue', '标签 big_spender']);
   });
 });

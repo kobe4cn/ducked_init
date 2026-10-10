@@ -302,12 +302,39 @@ export function isNumericMetric(spec: MetricSpec, ctx: DslContext): boolean {
   return !!type && NUMERIC.includes(type);
 }
 
-/** 定义用到的实体（基础实体与维度路径经过的实体），排好序 */
-export function metricEntities(spec: MetricSpec): string[] {
-  const all = new Set([spec.base]);
-  for (const d of spec.dimensions ?? []) for (const part of d.path.split('->')) all.add(part.trim().split('.')[0]!);
-  return [...all].sort();
+/** 定义的依赖（ADR-0025「依赖按需计算」）：引用的指标键、用到的实体与字段，各自去重排序 */
+export interface Dependencies {
+  metrics: string[];
+  /** 基础实体与维度路径经过的每个实体 */
+  entities: string[];
+  /** 度量、过滤、窗口的字段（在基础实体上），与维度路径的各段 */
+  fields: { entity: string; field: string }[];
 }
+
+/** 指标的依赖：只看结构（通过 JSON Schema 即可），不对照登记与映射 */
+export function metricDependencies(spec: MetricSpec): Dependencies {
+  const fields = new Map<string, { entity: string; field: string }>();
+  const add = (entity: string, field: string | undefined) => {
+    if (field !== undefined) fields.set(`${entity}.${field}`, { entity, field });
+  };
+  add(spec.base, spec.measure.field);
+  for (const f of spec.filter ?? []) add(spec.base, f.field);
+  add(spec.base, spec.window?.field);
+  for (const d of spec.dimensions ?? []) {
+    for (const part of d.path.split('->')) {
+      const [entity, field] = part.trim().split('.');
+      add(entity!, field);
+    }
+  }
+  return {
+    metrics: [],
+    entities: [...new Set([spec.base, ...[...fields.values()].map(f => f.entity)])].sort(),
+    fields: [...fields.keys()].sort().map(k => fields.get(k)!),
+  };
+}
+
+/** 定义用到的实体（基础实体与维度路径经过的实体），排好序 */
+export const metricEntities = (spec: MetricSpec): string[] => metricDependencies(spec).entities;
 
 /** 过滤取值写成 SQL 字面量 */
 function sqlValue(f: FieldInfo, v: Scalar) {

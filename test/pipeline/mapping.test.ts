@@ -4,6 +4,7 @@ import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
+import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
 import {
   createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, rebuildEntity, referenceTables, saveDraft,
@@ -720,6 +721,21 @@ describe('发布映射并合并到标准层', () => {
     const orders = await publish(author, reviewer, id, ORDERS);
     await saveDraft(author, orders, ORDERS.replace('type: integer, expr: amount * 100', 'type: string, expr: string(amount)'));
     await expect(publishMapping(reviewer, orders, 2)).rejects.toThrow(/字段 x_amount_fen 在已发布的映射里是 integer，这里是 string/);
+  });
+
+  it('新版本去掉被已发布指标引用的扩展字段时拒绝发布，报出指标的键与字段；指标草稿里的引用不算', async () => {
+    const { author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    await createDefinition(author, 'metric', 'fen_total', 'base: order\nmeasure: { agg: sum, field: x_amount_fen }\n');
+    await publishDefinition(reviewer, 'metric', 'fen_total', 1);
+    await saveDraft(author, orders, ORDERS.replace(/extensions:[^]*$/, ''));
+    await expect(publishMapping(reviewer, orders, 2)).rejects.toMatchObject({
+      message: '发布后 order 的已发布映射里不再有已发布指标引用的扩展字段，不能发布：指标 fen_total 的 x_amount_fen',
+    });
+
+    await deleteDefinition(reviewer, 'metric', 'fen_total');
+    await createDefinition(author, 'metric', 'fen_total', 'base: order\nmeasure: { agg: sum, field: x_amount_fen }\n');
+    await publishMapping(reviewer, orders, 2);
   });
 
   it('只有映射引用的表同步写入了变更才合并：别的表、别的数据源、没有变更的同步都不合并，定时检查也不补；发布只合并一次', async () => {

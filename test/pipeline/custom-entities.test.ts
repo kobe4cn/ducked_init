@@ -1,6 +1,6 @@
 // 自定义实体登记的接缝（ADR-0019）：createCustomEntity / saveCustomEntityDraft 校验名称、字段与主键后保存草稿；
 // 双人发布与丢弃同源视图；publishedCustomEntities 给出每个实体最新的已发布版本。关系的终点保存与发布时都校验；发布过的实体只能新增字段与关系；
-// deleteCustomEntity 删除没被已发布映射引用的实体；draftFor 按已发布登记生成自定义实体的映射草稿；inferCustomEntityDrafts 为已发布映射在用、但没登记的实体推断登记草稿；
+// deleteCustomEntity 删除没被已发布映射、关系或指标引用的实体；draftFor 按已发布登记生成自定义实体的映射草稿；inferCustomEntityDrafts 为已发布映射在用、但没登记的实体推断登记草稿；
 // relationSuggestions 按列名与取值包含推荐关系，adoptRelation 把推荐的关系采纳进登记草稿
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -10,6 +10,7 @@ import {
   publishedCustomEntities, saveCustomEntityDraft, type CustomEntityInput,
 } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
+import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { customEntities, customEntityVersions } from '../../app/.server/db/schema';
 import type { EntityRelation } from '../../app/lib/canonical-model';
 import { createMapping, draftFor, getMapping, saveDraft } from '../../app/.server/mappings';
@@ -412,7 +413,7 @@ describe('删除自定义实体', () => {
     await publish(author, reviewer, sourceId, yaml);
 
     await expect(deleteCustomEntity(reviewer, id)).rejects.toMatchObject({
-      status: 400, message: 'custom_store 被已发布的映射或关系引用，不能删除：「电商库」customers',
+      status: 400, message: 'custom_store 被已发布的映射、关系或指标引用，不能删除：「电商库」customers',
     });
     expect((await getCustomEntity(author, id)).referrers).toEqual(['「电商库」customers']);
 
@@ -439,11 +440,31 @@ describe('删除自定义实体', () => {
     await publishCustomEntity(reviewer, shelfId, 1);
 
     await expect(deleteCustomEntity(reviewer, storeId)).rejects.toMatchObject({
-      status: 400, message: 'custom_store 被已发布的映射或关系引用，不能删除：关系 custom_shelf.store_id → custom_store.store_id',
+      status: 400, message: 'custom_store 被已发布的映射、关系或指标引用，不能删除：关系 custom_shelf.store_id → custom_store.store_id',
     });
     expect((await getCustomEntity(author, storeId)).referrers).toEqual(['关系 custom_shelf.store_id → custom_store.store_id']);
     await deleteCustomEntity(reviewer, shelfId);
     await deleteCustomEntity(reviewer, storeId);
+    expect(await listCustomEntities(author)).toEqual([]);
+  });
+
+  it('被已发布指标的维度路径经过时拒绝并列出指标的键；指标草稿不算，删掉指标后能删除', async () => {
+    const { author, reviewer } = await engineers();
+    const id = await createCustomEntity(author, {
+      ...STORE, relations: [{ from: { entity: 'order', field: 'store_id' }, ref: { entity: 'custom_store', field: 'store_id' } }],
+    });
+    await publishCustomEntity(reviewer, id, 1);
+    const byStore = 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: opened_on, path: order.store_id -> custom_store.opened_on }\n';
+    await createDefinition(author, 'metric', 'orders_by_store', byStore);
+    await publishDefinition(reviewer, 'metric', 'orders_by_store', 1);
+    await createDefinition(author, 'metric', 'draft_by_store', byStore);
+
+    await expect(deleteCustomEntity(reviewer, id)).rejects.toMatchObject({
+      status: 400, message: 'custom_store 被已发布的映射、关系或指标引用，不能删除：指标 orders_by_store',
+    });
+    expect((await getCustomEntity(author, id)).referrers).toEqual(['指标 orders_by_store']);
+    await deleteDefinition(reviewer, 'metric', 'orders_by_store');
+    await deleteCustomEntity(reviewer, id);
     expect(await listCustomEntities(author)).toEqual([]);
   });
 

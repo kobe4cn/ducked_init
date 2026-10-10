@@ -1,11 +1,12 @@
 // test/http/dsl-definitions.test.ts —— 指标定义的 HTTP 接缝：分析师在新建页填写键与 YAML 保存草稿 → 跳到定义页看到编译出的 SQL 与版本；在定义页再次保存改同一份草稿；
 // 校验不通过时按行列列出问题；分析页「新建标签」进到标签种类的新建页；查看者看不到「新建指标」、打不开新建页、提交 403；分析页里 metric: 快照链接到定义页；
 // 定义页点「预览」展示前 50 行与总行数（查看者也能预览），标准层缺表时给出说明，不存在的定义 404；
-// 版本表里发布不了的成员看到原因，另一位数据工程师发布后入队 gold.dsl；丢弃草稿回到已发布版本，从没发布过时回到分析页
+// 版本表里发布不了的成员看到原因，另一位数据工程师发布后入队 gold.dsl；丢弃草稿回到已发布版本，从没发布过时回到分析页；
+// 数据工程师看到「删除」按钮（分析师看不到、提交 403），被已发布标签引用的指标删不了，删除后回到分析页
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks } from '../../app/.server/db/schema';
-import { createDefinition, getDefinition } from '../../app/.server/dsl-definitions';
+import { createDefinition, getDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -162,5 +163,34 @@ describe('指标与标签定义页', () => {
     await createDefinition(analystMember, 'metric', 'orders', REVENUE);
     expect((await analyst.post('/analytics/definitions/metric/orders', { intent: 'discard' })).headers.get('location')).toBe('/analytics');
     expect((await analyst.get('/analytics/definitions/metric/orders')).status).toBe(404);
+  });
+
+  it('数据工程师看到删除按钮，分析师看不到且提交 403；被已发布标签引用的指标在按钮处说明原因、提交 400 并列出标签，删掉标签后能删，回到分析页', async () => {
+    const acme = await newTenant('acme');
+    const analystMember = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const engineerMember = await memberOf(acme, 'de@acme.com', 'data_engineer');
+    await createDefinition(analystMember, 'metric', 'revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    await publishDefinition(engineerMember, 'metric', 'revenue', 1);
+    await createDefinition(analystMember, 'tag', 'value_tier', 'metric: revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n');
+    await publishDefinition(engineerMember, 'tag', 'value_tier', 1);
+    const metric = '/analytics/definitions/metric/revenue';
+
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    expect(await (await analyst.get(metric)).text()).not.toContain('删除指标');
+    expect((await analyst.post(metric, { intent: 'delete' })).status).toBe(403);
+
+    const engineer = await loginAs(app, 'de@acme.com');
+    const page = await (await engineer.get(metric)).text();
+    expect(page).toMatch(/data-delete-blocker[^>]*>.*?被已发布的标签引用，不能删除：value_tier/s);
+    expect(page).not.toContain('删除指标');
+    // 绕过页面直接提交也被拒
+    const blocked = await engineer.post(metric, { intent: 'delete' });
+    expect(blocked.status).toBe(400);
+    expect(await blocked.text()).toContain('指标 revenue 被已发布的标签引用，不能删除：value_tier');
+
+    expect((await engineer.post('/analytics/definitions/tag/value_tier', { intent: 'delete' })).headers.get('location')).toBe('/analytics');
+    expect(await (await engineer.get(metric)).text()).toContain('删除指标');
+    expect((await engineer.post(metric, { intent: 'delete' })).headers.get('location')).toBe('/analytics');
+    expect((await engineer.get(metric)).status).toBe(404);
   });
 });

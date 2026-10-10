@@ -5,7 +5,7 @@
 // 纯函数：不碰平台库与数据湖，同样的定义与 asOf 编译出同样的 SQL
 import { Ajv } from 'ajv';
 import { lit } from '../merge-engine';
-import { compileMetric, isNumericMetric, metricEntities, parseDsl, type DslCheck, type DslContext, type MetricSpec } from './metric-spec';
+import { compileMetric, isNumericMetric, metricEntities, parseDsl, type Dependencies, type DslCheck, type DslContext, type MetricSpec } from './metric-spec';
 
 export const TAG_CONDITIONS = ['gte', 'gt', 'lte', 'lt', 'eq'] as const;
 type Condition = (typeof TAG_CONDITIONS)[number];
@@ -92,6 +92,9 @@ export function checkTag(text: string, ctx: DslContext): DslCheck<TagSpec> {
 export function tagEntities(spec: TagSpec, ctx: DslContext): string[] {
   return metricEntities(requireMetric(spec, ctx));
 }
+
+/** 标签的依赖：引用的指标键（实体与字段经由指标，指标在就删不掉） */
+export const tagDependencies = (spec: TagSpec): Dependencies => ({ metrics: [spec.metric], entities: [], fields: [] });
 
 const COMPARE: Record<Condition, string> = { gte: '>=', gt: '>', lte: '<=', lt: '<', eq: '=' };
 
