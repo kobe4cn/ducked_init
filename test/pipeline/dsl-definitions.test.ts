@@ -1,11 +1,22 @@
 // test/pipeline/dsl-definitions.test.ts —— 指标与标签定义的流水线接缝：成员新建定义（createDefinition）→ 再次保存改同一份草稿（saveDslDraft）→ getDefinition 读出各版本、
-// 作者与最后保存的人，以及编译出的 SQL；键不合规或重复、YAML 校验不通过、没有起草权限时拒绝且不写入
+// 作者与最后保存的人，以及编译出的 SQL；键不合规或重复、YAML 校验不通过、没有起草权限时拒绝且不写入。
+// 样本预览（previewDefinition）在只读挂载的数据湖上按今天运行编译出的 SQL，给出前 50 行与总行数，湖与任务队列不变
+import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { dslVersions } from '../../app/.server/db/schema';
-import { createDefinition, DslError, getDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
+import { dslVersions, mappings, tasks } from '../../app/.server/db/schema';
+import { createDefinition, DslError, getDefinition, previewDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
+import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
+import { publishMapping, saveDraft } from '../../app/.server/mappings';
+import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import { syncSource } from '../../app/.server/source-sync';
+import { confirmWatermark, relistSource, setSyncScope } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant } from './fixtures';
+import { memberOf, newTenant, publish } from './fixtures';
+import { CRM_ORDERS, publishedIdentitySources } from './identity-fixtures';
+import { grantOnSource, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -70,5 +81,105 @@ describe('指标定义', () => {
     await createDefinition(analyst, 'metric', 'revenue', REVENUE);
     await expect(saveDslDraft(viewer, 'metric', 'revenue', REVENUE_BY_CITY)).rejects.toMatchObject({ init: { status: 403 } });
     expect((await getDefinition(viewer, 'metric', 'revenue')).draft).toMatchObject({ yaml: REVENUE, authors: ['analyst@acme.com'] });
+  });
+});
+
+const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+/** 在本租户数据湖里执行 SQL（查看快照） */
+async function onLake<T = Record<string, unknown>>(tenantId: string, sql: string) {
+  const session = await openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 });
+  try {
+    return (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+  } finally {
+    session.close();
+  }
+}
+
+const SNAPSHOT = `SELECT max(snapshot_id)::VARCHAR AS n FROM ducklake_snapshots('lake')`;
+
+/**
+ * 身份打通的三个源与两个订单映射已发布（crm.orders 里 A5 的下单人 99 打通不到消费者），CRM 源另加 60 笔 1 元订单（N01…N60，下单人 1）与门店表 stores；
+ * 自定义实体 custom_store（store_id、name，关系 order.store_id → custom_store.store_id）登记发布并从 stores 合并；
+ * CRM 订单映射重新发布，store_id 取订单号：A1、A2 与 N01…N60 能关联到门店，其余订单（含会员源的订单）关联不到
+ */
+async function ordersWithStores() {
+  const people = await publishedIdentitySources({ orders: true });
+  const { author, reviewer, sources: { crm } } = people;
+  await grantOnSource(`
+    INSERT INTO crm.orders SELECT 'N' || lpad(i::text, 2, '0'), 1, 'paid', 1, '2024-07-05 10:00', '2024-07-05 10:00', '2024-07-10' FROM generate_series(1, 60) i;
+    CREATE TABLE crm.stores (store_id text PRIMARY KEY, name text, updated_at timestamp NOT NULL);
+    INSERT INTO crm.stores VALUES ('A1', '一店', '2024-06-01'), ('A2', '二店', '2024-06-01');
+    INSERT INTO crm.stores SELECT 'N' || lpad(i::text, 2, '0'), '店' || lpad(i::text, 2, '0'), '2024-06-01' FROM generate_series(1, 60) i;
+    GRANT SELECT ON crm.stores TO ${READER.user};`);
+  await relistSource(author, crm);
+  await drain();
+  await setSyncScope(author, crm, { add: ['stores'] });
+  await drain();
+  await confirmWatermark(author, crm, 'stores', 'updated_at');
+  await syncSource(author, crm);
+  await drain();
+  const store = await createCustomEntity(author, {
+    name: 'custom_store', label: '门店', kind: 'dimension', primaryKey: ['store_id'],
+    fields: [{ name: 'store_id', type: 'string', description: '', sensitive: false }, { name: 'name', type: 'string', description: '', sensitive: false }],
+    relations: [{ from: { entity: 'order', field: 'store_id' }, ref: { entity: 'custom_store', field: 'store_id' } }],
+  });
+  await publishCustomEntity(reviewer, store, 1);
+  await publish(author, reviewer, crm, 'model: 1\nentity: custom_store\ntable: stores\nextensions:\n  store_id: { type: string, expr: store_id }\n  name: { type: string, expr: name }\ndedupe: { key: [store_id] }\n');
+  const [orders] = await getDb().select({ id: mappings.id }).from(mappings).where(and(eq(mappings.sourceId, crm), eq(mappings.tableName, 'orders')));
+  await publishMapping(reviewer, orders!.id, await saveDraft(author, orders!.id, `${CRM_ORDERS}  store_id: order_no\n`));
+  await drain();
+  return people;
+}
+
+const BY_STORE = 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: store, path: order.store_id -> custom_store.name }\n';
+
+describe('样本预览', () => {
+  it('在只读挂载上按今天运行编译出的 SQL，给出前 50 行与总行数；关联不到门店的记「未关联」，打通不到消费者的订单不计入；湖与任务不变', async () => {
+    const { acme } = await ordersWithStores();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    // 不计 1 元订单：每个消费者与门店一行，共 6 行
+    await createDefinition(analyst, 'metric', 'big_orders', `${BY_STORE}filter:\n  - { field: amount, op: gt, value: 1 }\n`);
+    await createDefinition(analyst, 'metric', 'by_store', BY_STORE);
+    const [before] = await onLake<{ n: string }>(acme, SNAPSHOT);
+    const queued = (await getDb().select().from(tasks)).length;
+
+    const big = await previewDefinition(analyst, 'metric', 'big_orders');
+    expect(big).toMatchObject({ version: 1, asOf: new Date().toISOString().slice(0, 10), columns: ['consumer_id', 'store', 'value'], total: 6 });
+    expect(big.rows).toHaveLength(6);
+    // consumer_id 是平台 ID（哈希），不是手机号或邮箱
+    expect(big.rows.every(r => /^[0-9a-f]{64}$/.test(String(r.consumer_id)))).toBe(true);
+    expect(big.rows.map(r => r.store).sort()).toEqual(['一店', '二店', '未关联', '未关联', '未关联', '未关联']);
+    // 下单人 99 的 A5（50 元）不在结果里
+    expect(big.rows.reduce((sum, r) => sum + Number(r.value), 0)).toBe(100 + 300 + 200 + 999 + 150 + 400 + 200 + 80 + 1000 + 500);
+
+    // 60 个 1 元门店各一行，共 66 行，只给出前 50 行
+    const all = await previewDefinition(analyst, 'metric', 'by_store');
+    expect(all).toMatchObject({ total: 66 });
+    expect(all.rows).toHaveLength(50);
+
+    const [after] = await onLake<{ n: string }>(acme, SNAPSHOT);
+    expect(after).toEqual(before);
+    expect(await getDb().select().from(tasks)).toHaveLength(queued);
+  });
+
+  it('标准层还没有基础实体或身份打通结果时给出说明；没有的版本与其他租户的定义 404，查看者可以预览', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await expect(previewDefinition(analyst, 'metric', 'revenue')).rejects.toThrow(/标准层还没有.*silver\.order/);
+    await expect(previewDefinition(analyst, 'metric', 'revenue', 2)).rejects.toMatchObject({ status: 404 });
+    const outsider = await memberOf(await newTenant('globex'), 'analyst@globex.com', 'analyst');
+    await expect(previewDefinition(outsider, 'metric', 'revenue')).rejects.toMatchObject({ status: 404 });
+
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    await expect(previewDefinition(viewer, 'metric', 'revenue')).rejects.toThrow(/标准层还没有/);
+  });
+
+  it('只发布了 customer 映射、还没有订单时说明缺 silver.order', async () => {
+    const { acme } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await expect(previewDefinition(analyst, 'metric', 'revenue')).rejects.toThrow(/标准层还没有.*silver\.order.*发布.*映射并合并/);
   });
 });

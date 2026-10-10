@@ -1,9 +1,12 @@
 // test/http/dsl-definitions.test.ts —— 指标定义的 HTTP 接缝：分析师在新建页填写键与 YAML 保存草稿 → 跳到定义页看到编译出的 SQL 与版本；在定义页再次保存改同一份草稿；
-// 校验不通过时按行列列出问题；查看者看不到「新建指标」、打不开新建页、提交 403；分析页里 metric: 快照链接到定义页
+// 校验不通过时按行列列出问题；查看者看不到「新建指标」、打不开新建页、提交 403；分析页里 metric: 快照链接到定义页；
+// 定义页点「预览」展示前 50 行与总行数（查看者也能预览），标准层缺表时给出说明，不存在的定义 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks } from '../../app/.server/db/schema';
+import { createDefinition } from '../../app/.server/dsl-definitions';
 import { memberOf, newTenant } from '../pipeline/fixtures';
+import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
@@ -83,5 +86,30 @@ describe('指标定义页', () => {
     const html = await (await (await loginAs(app, 'viewer@acme.com')).get('/analytics')).text();
     expect(html).toMatch(/href="\/analytics\/definitions\/metric\/revenue"[^>]*>revenue</);
     expect(html).not.toContain(`/analytics/snapshots/${snapshot!.id}`);
+  });
+
+  it('定义页点「预览」展示结果与总行数，关联不到的维度显示「未关联」、没有明文；查看者也能预览；标准层缺表时给出说明；不存在的定义 404', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await createDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'revenue', REVENUE);
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    expect(await (await viewer.get('/analytics/definitions/metric/revenue')).text()).toContain('预览第 1 版');
+
+    // 5 个打通后的消费者有订单；CRM 的 customer 映射没有 city，全部「未关联」
+    const res = await viewer.post('/analytics/definitions/metric/revenue', { intent: 'preview', version: '1' });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toMatch(/data-preview-total[^>]*>第 1 版，统计日 \d{4}-\d{2}-\d{2}：共 5 行</);
+    expect(html).toContain('<th');
+    expect(html.match(/>未关联</g)).toHaveLength(5);
+    expect(html).not.toMatch(/zhang@crm\.test|13800000001/);
+
+    const globex = await newTenant('globex');
+    await createDefinition(await memberOf(globex, 'analyst@globex.com', 'analyst'), 'metric', 'revenue', REVENUE);
+    const outsider = await loginAs(app, 'analyst@globex.com');
+    const missing = await outsider.post('/analytics/definitions/metric/revenue', { intent: 'preview', version: '1' });
+    expect(missing.status).toBe(400);
+    expect(await missing.text()).toContain('标准层还没有 silver.customer、silver.order：先发布 customer、order 的映射并合并');
+    expect((await outsider.post('/analytics/definitions/metric/missing', { intent: 'preview' })).status).toBe(404);
   });
 });
