@@ -1,5 +1,5 @@
 // test/http/dsl-definitions.test.ts —— 指标定义的 HTTP 接缝：分析师在新建页填写键与 YAML 保存草稿 → 跳到定义页看到编译出的 SQL 与版本；在定义页再次保存改同一份草稿；
-// 校验不通过时按行列列出问题；查看者看不到「新建指标」、打不开新建页、提交 403；分析页里 metric: 快照链接到定义页；
+// 校验不通过时按行列列出问题；分析页「新建标签」进到标签种类的新建页；查看者看不到「新建指标」、打不开新建页、提交 403；分析页里 metric: 快照链接到定义页；
 // 定义页点「预览」展示前 50 行与总行数（查看者也能预览），标准层缺表时给出说明，不存在的定义 404；
 // 版本表里发布不了的成员看到原因，另一位数据工程师发布后入队 gold.dsl；丢弃草稿回到已发布版本，从没发布过时回到分析页
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -17,14 +17,14 @@ beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n';
 
-describe('指标定义页', () => {
+describe('指标与标签定义页', () => {
   it('分析师新建指标、再次保存改同一份草稿，定义页展示编译出的 SQL；校验不通过时按行列列出问题', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'analyst@acme.com', 'analyst');
     await memberOf(acme, 'de@acme.com', 'data_engineer');
     const analyst = await loginAs(app, 'analyst@acme.com');
 
-    expect(await (await analyst.get('/analytics')).text()).toContain('href="/analytics/definitions/new"');
+    expect(await (await analyst.get('/analytics')).text()).toContain('href="/analytics/definitions/new?kind=metric"');
     expect((await analyst.get('/analytics/definitions/new')).status).toBe(200);
 
     const bad = await analyst.post('/analytics/definitions/new', { key: 'revenue', yaml: 'base: order\nmeasure: { agg: sum, field: channel }\n' });
@@ -53,6 +53,22 @@ describe('指标定义页', () => {
 
     expect((await engineer.get('/analytics/definitions/metric/missing')).status).toBe(404);
     expect((await engineer.get('/analytics/definitions/nope/revenue')).status).toBe(404);
+  });
+
+  it('分析页「新建标签」进到标签种类的新建页；引用未发布的指标时按行列列出问题，种类不存在时 404', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+
+    expect(await (await analyst.get('/analytics')).text()).toContain('href="/analytics/definitions/new?kind=tag"');
+    const page = await (await analyst.get('/analytics/definitions/new?kind=tag')).text();
+    expect(page).toContain('新建标签');
+    expect(page).toContain('name="kind" value="tag"');
+    expect((await analyst.get('/analytics/definitions/new?kind=nope')).status).toBe(404);
+
+    const bad = await analyst.post('/analytics/definitions/new', { kind: 'tag', key: 'value_tier', yaml: 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n' });
+    expect(bad.status).toBe(400);
+    expect(await bad.text()).toMatch(/data-issue-line="1"[^>]*>第 1 行第 9 列（metric）：没有已发布的指标 revenue/);
   });
 
   it('查看者看不到「新建指标」、打不开新建页、不能保存，但能查看定义；其他租户 404', async () => {

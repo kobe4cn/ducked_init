@@ -1,5 +1,5 @@
 // app/routes/analytics.tsx —— 分析（有结果层查看权限的成员）：本租户分析模板任务产出的结果快照（带所用的模板定义版本），最新的在前；已过期的标灰、不能打开，登记时数据不完整的标「数据不完整」（详情在快照页）。
-// 有定义查看权限的成员从这里进入 RFM 模板参数页，有起草权限的成员从这里新建指标；指标与标签（template 为 metric:<键>、tag:<键>）的快照链接到它们的定义页（ADR-0025）
+// 有定义查看权限的成员从这里进入 RFM 模板参数页，有起草权限的成员从这里新建指标或标签；指标与标签（template 为 metric:<键>、tag:<键>）的快照链接到它们的定义页（ADR-0025）
 import { Plus, SlidersHorizontal } from 'lucide-react';
 import { Link } from 'react-router';
 import type { Route } from './+types/analytics';
@@ -59,7 +59,8 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
         actions={(canReadDefinitions || canDraftDefinitions) && (
           <>
             {canReadDefinitions && <Button asChild variant="outline"><Link to="/analytics/templates/rfm"><SlidersHorizontal />RFM 模板参数</Link></Button>}
-            {canDraftDefinitions && <Button asChild><Link to="/analytics/definitions/new"><Plus />新建指标</Link></Button>}
+            {canDraftDefinitions && <Button asChild variant="outline"><Link to="/analytics/definitions/new?kind=tag"><Plus />新建标签</Link></Button>}
+            {canDraftDefinitions && <Button asChild><Link to="/analytics/definitions/new?kind=metric"><Plus />新建指标</Link></Button>}
           </>
         )}
       />

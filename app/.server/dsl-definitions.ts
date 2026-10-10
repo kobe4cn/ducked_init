@@ -1,6 +1,6 @@
 // app/.server/dsl-definitions.ts —— 指标与标签定义（ADR-0025）：成员用 YAML 写定义，按种类（pipeline/dsl 的注册表）校验通过才能保存为草稿。
 // 键在租户与种类内唯一；每个定义同时只有一份草稿，再次保存改的是同一份，记下作者与最后保存的人，之后按映射同样的规则双人发布（ADR-0015）。
-// 校验对照本租户已发布的自定义实体登记与已发布映射的扩展字段；定义页展示编译出的 SQL，并可在只读挂载的数据湖上预览前 50 行。
+// 校验对照本租户已发布的自定义实体登记与已发布映射的扩展字段（标签另对照各指标最新的已发布版本）；定义页展示编译出的 SQL，并可在只读挂载的数据湖上预览前 50 行。
 // 发布后版本锁定，并以当天为 asOf 入队一次 gold.dsl（编译在入队时完成，SQL 进任务参数），成功后登记为一张快照（template 为 <种类>:<键>）。
 // 一律限定在操作者所属租户内
 import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
@@ -13,7 +13,7 @@ import { dslDefinitions, dslVersions } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { publishedPlans } from './mappings';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
-import type { DslContext, DslIssue } from './pipeline/dsl/metric-spec';
+import { checkMetric, type DslCheck, type DslContext, type DslIssue, type MetricSpec } from './pipeline/dsl/metric-spec';
 import { IDENTITIES } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { lit, rows } from './pipeline/merge-engine';
@@ -34,9 +34,19 @@ function requireKind(kind: string): asserts kind is DslKind {
   if (!isDslKind(kind)) throw new DslError(`没有 ${kind} 这种定义`, 404);
 }
 
-/** 校验与编译定义要用的本租户上下文：已发布的自定义实体登记与已发布映射的合并计划 */
+/**
+ * 校验与编译定义要用的本租户上下文：已发布的自定义实体登记、已发布映射的合并计划，
+ * 以及各指标最新的已发布版本（对照前两者校验，供标签引用；指标草稿不算）
+ */
 export async function dslContext(db: Tx | ReturnType<typeof getDb>, tenantId: string): Promise<DslContext> {
-  return { published: await publishedCustomEntities(db, tenantId), plans: await publishedPlans(db, tenantId) };
+  const base = { published: await publishedCustomEntities(db, tenantId), plans: await publishedPlans(db, tenantId), metrics: new Map() };
+  const published = await db.select({ key: dslDefinitions.key, yaml: dslVersions.yaml }).from(dslVersions)
+    .innerJoin(dslDefinitions, eq(dslDefinitions.id, dslVersions.definitionId))
+    .where(and(eq(dslDefinitions.tenantId, tenantId), eq(dslDefinitions.kind, 'metric'), eq(dslVersions.status, 'published')))
+    .orderBy(desc(dslVersions.version));
+  const metrics = new Map<string, DslCheck<MetricSpec>>();
+  for (const { key, yaml } of published) if (!metrics.has(key)) metrics.set(key, checkMetric(yaml, base));
+  return { ...base, metrics };
 }
 
 /** 校验定义，不通过时抛出带问题的 DslError */
@@ -127,7 +137,7 @@ export async function getDefinition(actor: CurrentMember, kind: string, key: str
     published,
     publishers: await publisherCount(actor.tenant.id),
     compiled: result.ok
-      ? { version: versions[0]!.version, sql: DSL_KINDS[kind].compile(result.spec, ctx, todayUtc()), issues: [] as DslIssue[] }
+      ? { version: versions[0]!.version, sql: DSL_KINDS[kind].compile(result.spec, ctx, todayUtc(), key), issues: [] as DslIssue[] }
       : { version: versions[0]!.version, sql: null, issues: result.issues },
   };
 }
@@ -161,7 +171,7 @@ export async function publishDefinition(actor: CurrentMember, kind: string, key:
     });
     return insertTask(tx, actor.tenant.id, 'gold.dsl', {
       kind, key, definitionId: draft.definitionId, definitionVersion: version, asOf,
-      sql: DSL_KINDS[kind].compile(checked.spec, ctx, asOf), entities: [...DSL_KINDS[kind].entities(checked.spec)],
+      sql: DSL_KINDS[kind].compile(checked.spec, ctx, asOf, key), entities: DSL_KINDS[kind].entities(checked.spec, ctx),
     });
   });
 }
@@ -206,7 +216,7 @@ const PREVIEW_LIMITS = { memoryLimitMb: 512, threads: 1 };
 /**
  * 样本预览：在只读挂载的数据湖上按今天（UTC）运行定义第 version 版（默认最新一版）编译出的 SQL，返回列名、前 50 行与总行数。
  * 只执行一条 SELECT：不建表、不入队任务、不登记快照。标准层还没有定义用到的实体或身份打通结果时抛出说明；
- * 结果只有 consumer_id、维度与值（敏感字段在校验时已被拒），查询出错时报错里抹掉湖的凭据
+ * 结果只有 consumer_id、维度与值，或标签的键与取值（敏感字段在校验时已被拒），查询出错时报错里抹掉湖的凭据
  */
 export async function previewDefinition(actor: CurrentMember, kind: string, key: string, version?: number) {
   assertCan(actor, 'definitions:read');
@@ -222,11 +232,11 @@ export async function previewDefinition(actor: CurrentMember, kind: string, key:
   const lake = await lakeRow(actor.tenant.id);
   if (!lake || !lakeReady(lake)) throw new DslError('本租户的数据湖还没有初始化');
   const asOf = todayUtc();
-  const sql = DSL_KINDS[kind].compile(checked.spec, ctx, asOf);
+  const sql = DSL_KINDS[kind].compile(checked.spec, ctx, asOf, key);
   const spec = lakeSpecOf(lake);
   const session = await openTenantLake(spec, PREVIEW_LIMITS, undefined, { readOnly: true });
   try {
-    const entities = DSL_KINDS[kind].entities(checked.spec);
+    const entities = DSL_KINDS[kind].entities(checked.spec, ctx);
     const present = new Set((await rows<{ name: string }>(session.con, `
       SELECT table_name AS name FROM information_schema.tables
       WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities'].map(lit).join(', ')})`)).map(t => t.name));

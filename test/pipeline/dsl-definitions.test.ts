@@ -2,6 +2,7 @@
 // 作者与最后保存的人，以及编译出的 SQL；键不合规或重复、YAML 校验不通过、没有起草权限时拒绝且不写入。
 // 样本预览（previewDefinition）在只读挂载的数据湖上按今天运行编译出的 SQL，给出前 50 行与总行数，湖与任务队列不变。
 // 双人发布（publishDefinition）以当天入队 gold.dsl，调度器成功后登记快照；丢弃草稿（discardDslDraft）回到已发布版本或删除定义
+// 标签只引用指标最新的已发布版本，快照每行带不变的 tag_key
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
@@ -259,5 +260,59 @@ describe('发布与丢弃', () => {
     expect(await getDefinition(analyst, 'metric', 'revenue')).toMatchObject({ draft: null, published: { version: 1, yaml: REVENUE } });
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
     await expect(discardDslDraft(viewer, 'metric', 'revenue')).rejects.toMatchObject({ init: { status: 403 } });
+  });
+});
+
+describe('标签定义', () => {
+  it('只认指标的已发布版本；双人发布后快照为 consumer_id、tag_key、tag_value，覆盖指标结果里的每个消费者；发布第二版键不变、定义版本递增', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
+    const tiers = (threshold: number, high = 'high') => `metric: revenue\nrules:\n  - { value: ${high}, when: { gte: ${threshold} } }\ndefault: low\n`;
+    // 指标还只是草稿：标签引用不到
+    await expect(createDefinition(author, 'tag', 'value_tier', tiers(100))).rejects.toMatchObject({ issues: [{ path: 'metric', message: '没有已发布的指标 revenue' }] });
+
+    const metricTask = await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    await drain();
+    const metric = await onLake<{ consumer_id: string; value: string }>(acme, `SELECT consumer_id, value::VARCHAR AS value FROM gold."metric__${metricTask.id}" ORDER BY consumer_id`);
+    const values = metric.map(m => Number(m.value)).sort((a, b) => a - b);
+    const threshold = values[Math.floor(values.length / 2)]!;
+    expect(values[0]).toBeLessThan(threshold);
+
+    // 指标的新草稿带维度，不影响标签：标签只认已发布的第 1 版
+    await saveDslDraft(author, 'metric', 'revenue', `${ALL_REVENUE}dimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n`);
+    expect(await createDefinition(author, 'tag', 'value_tier', tiers(threshold))).toEqual({ kind: 'tag', key: 'value_tier', version: 1 });
+    expect((await getDefinition(author, 'tag', 'value_tier')).compiled.sql).toContain(`'value_tier' AS tag_key`);
+    const preview = await previewDefinition(author, 'tag', 'value_tier');
+    expect(preview).toMatchObject({ columns: ['consumer_id', 'tag_key', 'tag_value'], total: metric.length });
+
+    await expect(publishDefinition(author, 'tag', 'value_tier', 1)).rejects.toThrow(/最后改了这一版草稿/);
+    const first = await publishDefinition(reviewer, 'tag', 'value_tier', 1);
+    expect(first.params).toMatchObject({ kind: 'tag', key: 'value_tier', definitionVersion: 1, entities: ['order'] });
+    await drain();
+    expect(await getTask(first.id)).toMatchObject({ status: 'succeeded' });
+    expect(await onLake(acme, `SELECT * FROM gold."tag__${first.id}" ORDER BY consumer_id`)).toEqual(
+      metric.map(m => ({ consumer_id: m.consumer_id, tag_key: 'value_tier', tag_value: Number(m.value) >= threshold ? 'high' : 'low' })));
+
+    await saveDslDraft(author, 'tag', 'value_tier', tiers(threshold, 'vip'));
+    const second = await publishDefinition(reviewer, 'tag', 'value_tier', 2);
+    await drain();
+    expect(await getTask(second.id)).toMatchObject({ status: 'succeeded' });
+    expect(await getDefinition(author, 'tag', 'value_tier')).toMatchObject({ key: 'value_tier', published: { version: 2 } });
+    expect(await onLake(acme, `SELECT DISTINCT tag_key, tag_value FROM gold."tag__${second.id}" ORDER BY ALL`))
+      .toEqual([{ tag_key: 'value_tier', tag_value: 'low' }, { tag_key: 'value_tier', tag_value: 'vip' }]);
+    const snapshots = await listSnapshots(acme);
+    expect(snapshots.find(s => s.taskId === first.id)).toMatchObject({ template: 'tag:value_tier', definitionVersion: 1, rowCount: metric.length });
+    expect(snapshots.find(s => s.taskId === second.id)).toMatchObject({ template: 'tag:value_tier', definitionVersion: 2, rowCount: metric.length });
+  });
+
+  it('引用带维度的指标、rules 为空被拒，不写入', async () => {
+    const { author, reviewer } = await publishedIdentitySources({ orders: true });
+    await createDefinition(author, 'metric', 'revenue_by_city', REVENUE_BY_CITY);
+    await publishDefinition(reviewer, 'metric', 'revenue_by_city', 1);
+    await expect(createDefinition(author, 'tag', 'city_tier', 'metric: revenue_by_city\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n'))
+      .rejects.toMatchObject({ issues: [{ path: 'metric', message: expect.stringMatching(/带维度/) }] });
+    await expect(createDefinition(author, 'tag', 'city_tier', 'metric: revenue_by_city\nrules: []\ndefault: low\n'))
+      .rejects.toMatchObject({ issues: [{ path: 'rules', message: '不能为空' }] });
+    await expect(getDefinition(author, 'tag', 'city_tier')).rejects.toMatchObject({ status: 404 });
   });
 });

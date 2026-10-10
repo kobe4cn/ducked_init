@@ -35,6 +35,7 @@ const plan = (entity: string, columns: { name: string; type: CustomEntityField['
 const ctx: DslContext = {
   published,
   plans: [plan('order', [{ name: 'x_vip_level', type: 'string' }, { name: 'x_buyer_phone', type: 'string', sensitive: true }])],
+  metrics: new Map(),
 };
 
 const ok = (yaml: string): MetricSpec => {
@@ -62,7 +63,7 @@ describe('指标 DSL：校验', () => {
   it('合规的定义通过，注册表登记了 metric', () => {
     expect(ok(REGION)).toMatchObject({ base: 'order', measure: { agg: 'sum', field: 'amount' } });
     expect(DSL_KINDS.metric.check).toBe(checkMetric);
-    expect(DSL_KINDS.metric.entities(ok(REGION))).toEqual(['custom_region', 'custom_store', 'order']);
+    expect(DSL_KINDS.metric.entities(ok(REGION), ctx)).toEqual(['custom_region', 'custom_store', 'order']);
   });
 
   it('基础实体可以是 customer、带指向 customer 的 customer_id 的自定义实体；x_ 字段只认已发布映射里的', () => {

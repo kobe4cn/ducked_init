@@ -3,8 +3,9 @@
 // 基础实体要能关联到消费者（customer 本身，或有指向 customer 的 customer_id），字段要存在、类型合用、不能是敏感字段；
 // 维度路径沿关系走到头：每一跳都是指向下一实体单列主键的关系，最多 3 跳，不能成环。每个问题都带 YAML 里的行列位置。
 // 校验通过后编译成 SQL：基础实体经 silver._identities 关联到 consumer_id，维度路径编译成链式 LEFT JOIN，关联不到或为空记「未关联」。
+// 这里也放各种定义共用的部分：租户上下文 DslContext、问题 DslIssue 与校验结果 DslCheck、YAML 与 JSON Schema 的第一步 parseDsl。
 // 纯函数：不碰平台库与数据湖，同样的定义与 asOf 编译出同样的 SQL
-import { Ajv } from 'ajv';
+import { Ajv, type ValidateFunction } from 'ajv';
 import { LineCounter, parseDocument } from 'yaml';
 import { CANONICAL_ENTITIES, entityOf, isCustomEntity, type EntityRelation, type FieldType } from '../../../lib/canonical-model';
 import { IDENTITIES } from '../identity-engine';
@@ -27,8 +28,11 @@ export interface MetricSpec {
   dimensions?: { name: string; path: string; as_of?: string }[];
 }
 
-/** 校验与编译要用的租户上下文：已发布的自定义实体登记，与已发布映射的合并计划（扩展字段的类型与敏感性只来自它们） */
-export interface DslContext { published: RegisteredEntities; plans: readonly MergeMappingParam[] }
+/**
+ * 校验与编译要用的租户上下文：已发布的自定义实体登记，与已发布映射的合并计划（扩展字段的类型与敏感性只来自它们）；
+ * metrics 是本租户各指标最新的已发布版本（键 → 对照登记与映射校验的结果），标签只引用它们
+ */
+export interface DslContext { published: RegisteredEntities; plans: readonly MergeMappingParam[]; metrics: ReadonlyMap<string, DslCheck<MetricSpec>> }
 
 /** 定义里的一个问题：行列从 1 起，path 是出问题的位置（如 dimensions.0.path） */
 export interface DslIssue { line: number; col: number; path: string; message: string }
@@ -174,11 +178,11 @@ function valueProblem(name: string, f: FieldInfo, v: Scalar): string | null {
 
 const ISSUE_ORDER = (a: DslIssue, b: DslIssue) => a.line - b.line || a.col - b.col;
 
-/**
- * 校验指标定义：YAML 语法、JSON Schema，再对照租户上下文做语义检查。
- * 通过时返回定义，否则返回全部问题（按位置排序）
- */
-export function checkMetric(text: string, ctx: DslContext): DslCheck<MetricSpec> {
+/** 解析好、结构合规的定义：value 是 YAML 的取值，issue 按路径记下语义问题（行列取自 YAML），done 给出校验结果 */
+export interface ParsedDsl { value: unknown; issue: (path: Path, message: string) => void; done: <S>(spec: S) => DslCheck<S> }
+
+/** 各种定义共用的第一步：YAML 语法与 JSON Schema。不通过时返回全部问题（按位置排序） */
+export function parseDsl(text: string, validate: ValidateFunction): ParsedDsl | { ok: false; issues: DslIssue[] } {
   const lines = new LineCounter();
   const doc = parseDocument(text, { lineCounter: lines, prettyErrors: false });
   if (doc.errors.length) {
@@ -198,19 +202,30 @@ export function checkMetric(text: string, ctx: DslContext): DslCheck<MetricSpec>
   };
 
   const value = doc.toJS() as unknown;
-  if (!validateSchema(value)) {
-    for (const e of validateSchema.errors ?? []) {
+  if (!validate(value)) {
+    for (const e of validate.errors ?? []) {
       const d = describeSchemaError(e);
       if (d) issue(d.path, d.message);
     }
     return { ok: false, issues: dedupe(issues).sort(ISSUE_ORDER) };
   }
+  return { value, issue, done: spec => (issues.length ? { ok: false, issues: issues.sort(ISSUE_ORDER) } : { ok: true, spec }) };
+}
+
+/**
+ * 校验指标定义：YAML 语法、JSON Schema，再对照租户上下文做语义检查。
+ * 通过时返回定义，否则返回全部问题（按位置排序）
+ */
+export function checkMetric(text: string, ctx: DslContext): DslCheck<MetricSpec> {
+  const parsed = parseDsl(text, validateSchema);
+  if ('ok' in parsed) return parsed;
+  const { value, issue, done } = parsed;
   const spec = value as MetricSpec;
 
   const base = entityIn(spec.base, ctx);
   if (typeof base === 'string') {
     issue(['base'], base);
-    return { ok: false, issues };
+    return done(spec);
   }
   if (spec.base !== 'customer') {
     const linked = base.fields.has('customer_id')
@@ -273,10 +288,19 @@ export function checkMetric(text: string, ctx: DslContext): DslCheck<MetricSpec>
     if (typeof resolved === 'string') issue(['dimensions', i, 'path'], resolved);
   }
 
-  return issues.length ? { ok: false, issues: issues.sort(ISSUE_ORDER) } : { ok: true, spec };
+  return done(spec);
 }
 
 const dedupe = (issues: DslIssue[]) => issues.filter((x, i) => issues.findIndex(y => y.path === x.path && y.message === x.message) === i);
+
+/** 指标的取值是不是数字：count、count_distinct、sum、avg 总是，min、max 看度量字段的类型 */
+export function isNumericMetric(spec: MetricSpec, ctx: DslContext): boolean {
+  const { agg, field } = spec.measure;
+  if (agg !== 'min' && agg !== 'max') return true;
+  const base = entityIn(spec.base, ctx);
+  const type = typeof base === 'string' || field === undefined ? undefined : base.fields.get(field)?.type;
+  return !!type && NUMERIC.includes(type);
+}
 
 /** 定义用到的实体（基础实体与维度路径经过的实体），排好序 */
 export function metricEntities(spec: MetricSpec): string[] {
