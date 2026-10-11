@@ -117,6 +117,36 @@ signups → event（56 万行）因此要全表扫 event，unique 从 0.16 s 变
   同一天的复测里 SeaweedFS 两次中断：一次容器退出，一次所有可写卷同时写满（`volume … is oversized`），新卷 26 s 后才建好，期间写入被拒、合并失败；重启容器后 localhost:8333 的端口转发也断过一次。所以这次写入步骤的数字反映的是存储状态，不是合并代码；底价的成因要单独查存储。
 - BEFORE（keys 步骤）与 DELETE（deleteInsert 步骤）照票里的范围决定没有动，events → event 上分别是 51–71 s 和 35–36 s，留给以后的票。
 
+#### 重建时的 keys 与 DELETE（#168，2026-10-11）
+
+改动：重建时不建 KEYS；inserted / updated / deleted 由 WINNERS 与 BEFORE 的一次 `FULL OUTER JOIN` 得出（原来是两次 ANTI JOIN 加一次 SEMI JOIN）；silver 不存在时不建 BEFORE。DELETE 没改。
+测法：`crmlab-10m` 上 `rebuildEntity(…, 'event')`，一个工作进程（16 线程、64 GiB），期间没有别的任务，连跑两次。#169（写入步骤的固定耗时、SeaweedFS 写满卷）**还没修**，deleteInsert 的数字受存储状态影响。
+
+events → event（2.84 亿行，只重建 event 的 6 个映射；单位 s）：
+
+| | keys | deleteInsert | keys + deleteInsert | 映射合计 |
+|---|---|---|---|---|
+| 之前（#164） | 50.9 | 36.0 | 86.9 | 166 |
+| 现在，第一次 | 43.3 | 57.7 | 101.0 | 200 |
+| 现在，第二次 | 42.1 | 34.4 | 76.5 | 168 |
+
+两次的统计都是 inserted 0、updated 284,493,904、deleted 0，与改之前的语义一致。
+
+**没有降到 30 s 以内。** 在同一个租户湖上把 keys 和 deleteInsert 的几段 SQL 单独跑了一遍（16 线程、64 GiB，中间表放内存）：
+
+| 片段 | 耗时 s | 说明 |
+|---|---|---|
+| BEFORE（`SELECT DISTINCT event_id` 本映射在 silver 的行） | 3.0 | 只读一列，DuckLake 按 `_mapping` 的文件统计跳过别的映射 |
+| 原来的 KEYS（`DISTINCT` 去重键） | 1.9 | 本票省掉 |
+| 统计：原来三个子查询 / 现在一次全连接 | 8.3 / 4.9 | 本票省约 3.4 s |
+| WINNERS（每个去重键 `row_number` 取一行，带全部列） | 17.1 | 合并里在落盘压缩的 stage 库上建，比内存里慢，是 keys 的大头 |
+| DELETE 本映射的行（事务里执行后回滚） | 18.7 | 见下 |
+
+- keys 省下的 7–9 s 正好是 KEYS 加上统计少做的那部分。BEFORE 本来就只要约 3 s，不是瓶颈。keys 剩下的约 42 s 里，大头是 WINNERS 的去重排序。WINNERS 要写进标准层，不能省；本票的范围也不包括改它。如果要再降，只能在源表主键与去重键相同、没有取最新规则的时候跳过 `row_number`，那要另开一张票。
+- DELETE 已经是按文件整片删的。重建前后对比 `ducklake_data_file` / `ducklake_delete_file`（快照 636 → 643）：event 的 6 个映射各自的数据文件（events 18 个，其余各 1 个，每个文件里 `_mapping` 的最小值等于最大值）全部结束、换成新文件，**删除文件一个都没写**。所以不需要 `SET PARTITIONED BY (_mapping)`。
+  不过 DELETE 仍要 18.7 s：DuckLake 要逐行判断条件、数出删掉的行数，才知道整个文件都被删光了。这一步要读 18 个文件、2.84 亿行（加密的，ADR-0020），所以花时间。
+  deleteInsert 剩下的约 16–39 s 是写 2.84 亿行新文件，两次相差 23 s，和 #169 记下的存储抖动是同一类问题。写入的耗时由行数和存储决定，合并代码这边没有可省的。
+
 ## 正确性（verify.ts，用时 48 秒）
 
 全部一致，没有 ✘：

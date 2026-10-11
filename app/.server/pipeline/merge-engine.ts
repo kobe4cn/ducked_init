@@ -405,24 +405,32 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   const [{ n: nullKeys }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${ROWS} WHERE ${key.map(k => `${ident(k)} IS NULL`).join(' OR ')}`);
   if (Number(nullKeys)) throw new Error(`去重键 ${key.join('、')} 有 ${nullKeys} 行为空，请检查映射或在源端补齐`);
 
-  // 受影响的去重键：改动的源记录在旧版本与新版本里的去重键。重建时是全部的去重键（本映射在标准层的行都换掉）
+  // 受影响的去重键：改动的源记录在旧版本与新版本里的去重键。重建时是全部的去重键（本映射在标准层的行都换掉），不建 KEYS
   const changed = `(SELECT _src FROM ${LATEST})`;
-  const previous = rebuild ? '' : `SELECT ${keyList(key, 'r')} FROM ${records} r WHERE r._src IN ${changed} UNION ALL `;
-  await con.run(`CREATE OR REPLACE TABLE ${KEYS} AS SELECT DISTINCT * FROM (${previous}SELECT ${keyList(key)} FROM ${ROWS})`);
+  if (!rebuild) {
+    await con.run(`CREATE OR REPLACE TABLE ${KEYS} AS SELECT DISTINCT * FROM (
+      SELECT ${keyList(key, 'r')} FROM ${records} r WHERE r._src IN ${changed} UNION ALL SELECT ${keyList(key)} FROM ${ROWS})`);
+  }
+  // 标准层里本映射受影响的旧键，只用于统计。保留 DISTINCT：换过去重键后旧行可能重复或有空键，空键连不上 WINNERS，算进 deleted
   const mine = `${silver} s WHERE s._mapping = ${lit(plan.mapping)}`;
   const silverExists = await tableExists(con, SILVER, plan.entity);
-  await con.run(`CREATE OR REPLACE TABLE ${BEFORE} AS ${silverExists
-    ? `SELECT DISTINCT ${keyList(key, 's')} FROM ${mine}${rebuild ? '' : ` AND EXISTS (SELECT 1 FROM ${KEYS} k WHERE ${joinOn(key, 'k', 's')})`}`
-    : `SELECT * FROM ${KEYS} LIMIT 0`}`);
+  if (silverExists) {
+    await con.run(`CREATE OR REPLACE TABLE ${BEFORE} AS SELECT DISTINCT ${keyList(key, 's')} FROM ${mine}${rebuild
+      ? '' : ` AND EXISTS (SELECT 1 FROM ${KEYS} k WHERE ${joinOn(key, 'k', 's')})`}`);
+  }
   // 每个受影响的去重键取最新的一行：取最新字段最大（空值最后），再按最近的批次，最后按记录的哈希，结果确定
   const kept = rebuild ? '' : `SELECT r.* FROM ${records} r SEMI JOIN ${KEYS} k ON ${joinOn(key, 'r', 'k')} WHERE r._src NOT IN ${changed} UNION ALL `;
   const order = [...(plan.latest ? [`c.${ident(plan.latest)} DESC NULLS LAST`] : []), 'c._batch DESC', 'c._src'].join(', ');
   await con.run(`CREATE OR REPLACE TABLE ${WINNERS} AS SELECT * EXCLUDE (_rn) FROM (
     SELECT c.*, row_number() OVER (PARTITION BY ${keyList(key, 'c')} ORDER BY ${order}) AS _rn FROM (${kept}SELECT * FROM ${ROWS}) c) WHERE _rn = 1`);
-  const [stats] = await rows<{ inserted: string; updated: string; deleted: string }>(con, `
-    SELECT (SELECT count(*) FROM ${WINNERS} w ANTI JOIN ${BEFORE} b ON ${joinOn(key, 'w', 'b')}) AS inserted,
-           (SELECT count(*) FROM ${WINNERS} w SEMI JOIN ${BEFORE} b ON ${joinOn(key, 'w', 'b')}) AS updated,
-           (SELECT count(*) FROM ${BEFORE} b ANTI JOIN ${WINNERS} w ON ${joinOn(key, 'w', 'b')}) AS deleted`);
+  // 三个统计一次扫描：WINNERS 的键不重复、BEFORE 去过重，全连接后每个键至多一行；joinOn 用 =，空键两边都连不上
+  const [stats] = silverExists
+    ? await rows<{ inserted: string; updated: string; deleted: string }>(con, `
+      SELECT count(*) FILTER (WHERE w._in_winners AND b._in_before IS NULL) AS inserted,
+        count(*) FILTER (WHERE w._in_winners AND b._in_before) AS updated, count(*) FILTER (WHERE w._in_winners IS NULL) AS deleted
+      FROM (SELECT ${keyList(key)}, true AS _in_winners FROM ${WINNERS}) w
+      FULL OUTER JOIN (SELECT *, true AS _in_before FROM ${BEFORE}) b ON ${joinOn(key, 'w', 'b')}`)
+    : [{ inserted: String(await count(con, WINNERS)), updated: '0', deleted: '0' }];
   lap('keys');
 
   await inTransaction(con, async () => {

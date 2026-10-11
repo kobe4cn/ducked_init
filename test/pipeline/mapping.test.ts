@@ -980,4 +980,29 @@ describe('发布映射并合并到标准层', () => {
     await expect(rebuildEntity(author, 'coupon')).rejects.toThrow('没有已发布的映射写入');
     await expect(rebuildEntity(await memberOf(acme, 'v@acme.com', 'viewer'), 'customer')).rejects.toMatchObject({ init: { status: 403 } });
   });
+
+  it('强制重建的统计：再次重建全算更新；标准层里本映射多出的行（含重复键与空键）算删除，重建后换掉', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const before = await silver(acme, 'order', 'order_id::INT');
+    const latest = async () => (await getMapping(author, orders)).merge.history[0];
+    expect(await latest()).toMatchObject({ mode: 'rebuild', inserted: 100, updated: 0, deleted: 0, rows: 100 });
+
+    await rebuildEntity(author, 'order');
+    await drain();
+    expect(await latest()).toMatchObject({ mode: 'rebuild', inserted: 0, updated: 100, deleted: 0, rows: 100 });
+
+    // 标准层里本映射多出两个源端没有的键、一行重复键与一行空键：重复键只算一次更新，空键连不上任何键算删除
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      await session.con.run(`INSERT INTO silver."order" SELECT * REPLACE (CASE order_id WHEN '2' THEN 'X1' WHEN '3' THEN 'X2' WHEN '4' THEN NULL ELSE order_id END AS order_id)
+        FROM silver."order" WHERE order_id IN ('1', '2', '3', '4')`);
+    } finally {
+      session.close();
+    }
+    await rebuildEntity(author, 'order');
+    await drain();
+    expect(await latest()).toMatchObject({ mode: 'rebuild', inserted: 0, updated: 100, deleted: 3, rows: 100 });
+    expect(await silver(acme, 'order', 'order_id::INT')).toEqual(before);
+  });
 });
