@@ -383,6 +383,29 @@ describe('发布映射并合并到标准层', () => {
     });
   });
 
+  it('合并记录带上各步骤的耗时（毫秒，非负），rows 与标准层里本映射的实际行数一致', async () => {
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      const { acme, author, reviewer, id } = await syncedSource();
+      const orderMapping = await publish(author, reviewer, id, ORDERS);
+      await grantOnSource(`
+        DELETE FROM shop.orders WHERE order_id IN (3, 4);
+        INSERT INTO shop.orders (customer_id, amount, status, created_at) VALUES (5, 99, 'paid', '2024-07-01');`);
+      await syncSource(author, id);
+      await drain();
+
+      const [incremental, rebuild] = (await getMapping(author, orderMapping)).merge.history;
+      expect(rebuild).toMatchObject({ mode: 'rebuild', rows: 100 });
+      expect(incremental).toMatchObject({ mode: 'incremental', inserted: 1, deleted: 2, rows: 99 });
+      expect(await silver(acme, 'order', 'order_id::INT')).toHaveLength(99);
+      for (const record of [rebuild, incremental]) {
+        expect(Object.keys(record.steps ?? {}).sort()).toEqual([
+          'commit', 'deleteInsert', 'ensureTable', 'input', 'keys', 'lastMerge', 'live', 'maxBatch', 'mergeLog', 'records', 'rows', 'transform', 'unique', 'unknownValues',
+        ]);
+        for (const ms of Object.values(record.steps!)) expect(ms).toBeGreaterThanOrEqual(0);
+      }
+    });
+  });
+
   it('去重键与取最新规则：源端的重复行只计一次，删除最新的一行后回落到剩下的一行', async () => {
     await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
       const { acme, author, reviewer, id } = await syncedSource();

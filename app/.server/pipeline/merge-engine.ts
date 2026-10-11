@@ -40,8 +40,21 @@ export interface FallbackStat { column: string; values: { value: string; rows: n
 /** 合并或空跑的中间表：每条源记录的最后一版 latest，与其中仍存在的记录 live（带出现次数 _n） */
 export interface LiveTables { latest: string; live: string }
 
+/**
+ * 合并一个映射的各步骤（计时用）：input 判断源表与读主键（源视图另含物化），lastMerge 读合并日志，maxBatch 取原始层最新批次，
+ * live 取每条源记录的最新一版（含行过滤），unknownValues 查兜底取值，transform 转换（含敏感字段哈希），keys 算受影响的键与胜出行；
+ * 事务内 ensureTable、records（写当前记录）、deleteInsert（换掉本映射在标准层的行）、unique（跨映射唯一）、mergeLog，commit 是提交本身；
+ * rows 数本映射在标准层的行数
+ */
+export type MergeStep = 'input' | 'lastMerge' | 'maxBatch' | 'live' | 'unknownValues' | 'transform' | 'keys'
+  | 'ensureTable' | 'records' | 'deleteInsert' | 'unique' | 'mergeLog' | 'commit' | 'rows';
+
 /** 一个映射一次合并的结果。时间为 ISO 字符串 */
-export type MergeRecord = { mapping: string; entity: string; table: string; version: number; startedAt: string; durationMs: number } & (
+export type MergeRecord = {
+  mapping: string; entity: string; table: string; version: number; startedAt: string; durationMs: number;
+  /** 各步骤的耗时（毫秒）；提前返回（跳过、没有新批次）时只有走过的步骤 */
+  steps?: Partial<Record<MergeStep, number>>;
+} & (
   | {
     /** rebuild：首次合并、映射换了版本或源表的主键变了，由原始层全部批次重建 */
     mode: 'incremental' | 'rebuild';
@@ -340,8 +353,17 @@ interface LastMerge { version: number; source_keys: string; batch_to: string; sc
  */
 async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date): Promise<MergeRecord> {
   const startedAt = new Date();
-  const base = { mapping: plan.mapping, entity: plan.entity, table: plan.table, version: plan.version, startedAt: startedAt.toISOString() };
+  // 分步计时：lap(步骤) 把上一次打点以来的耗时累加到这一步
+  const steps: Partial<Record<MergeStep, number>> = {};
+  let mark = startedAt.getTime();
+  const lap = (step: MergeStep) => {
+    const t = Date.now();
+    steps[step] = (steps[step] ?? 0) + t - mark;
+    mark = t;
+  };
+  const base = { mapping: plan.mapping, entity: plan.entity, table: plan.table, version: plan.version, startedAt: startedAt.toISOString(), steps };
   const input = await mappingInput(con, plan, plan.sourceId, plan.sourceView, VIEW_ROWS, '合并');
+  lap('input');
   if ('skipped' in input) return { ...base, durationMs: Date.now() - startedAt.getTime(), skipped: input.skipped };
   const records = recordsOf(plan.mapping);
   const silver = silverTable(plan.entity);
@@ -351,6 +373,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     SELECT version, source_keys, batch_to, scheme FROM ${MERGES} WHERE mapping_id = ${lit(plan.mapping)} ORDER BY started_at DESC LIMIT 1`);
   const rebuild = plan.rebuild || !last || last.version !== plan.version || last.source_keys !== input.rebuildTag || last.scheme !== SCHEME
     || !await tableExists(con, RECORDS, `m_${plan.mapping.replace(/-/g, '')}`);
+  lap('lastMerge');
   const from = rebuild ? 0 : Number(last.batch_to);
   const silverRows = async () => count(con, `${silver} WHERE _mapping = ${lit(plan.mapping)}`);
   const unchanged = async (): Promise<MergeRecord> =>
@@ -358,17 +381,23 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   // 源视图不增量：没有要重建的变化时不读视图
   if (!rebuild && plan.view) return unchanged();
   const bronze = await input.load();
+  // 源视图在这时物化，与上面的 input 累加
+  lap('input');
   const [{ top }] = await rows<{ top: string | null }>(con, `SELECT max(_batch) AS top FROM ${bronze}`);
   const to = Number(top ?? 0);
+  lap('maxBatch');
   if (!rebuild && to <= from) return unchanged();
 
   await liveRecords(con, bronze, sourceKeys, { from, to, held: rebuild ? null : records }, { latest: LATEST, live: LIVE });
   // 行过滤：不满足（含取值为空）的记录从 live 里去掉，视为当前记录里不存在；latest 不动，它们的旧版本照常删除、受影响的去重键回落（ADR-0024）
   const filtered = plan.where ? await filterLive(con, plan) : undefined;
+  lap('live');
   // 先查出值字典与标准枚举之外的取值（没写兜底值时报错；敏感字段不查，取值会进报错与兜底统计），再转换
   const pii = sensitiveColumns(plan);
   const fallback = await checkUnknownValues(con, plan.columns.filter(c => !pii.has(c.name)));
+  lap('unknownValues');
   await transformRows(con, plan, salt, { live: LIVE, into: ROWS });
+  lap('transform');
   const key = plan.key;
   const [{ n: nullKeys }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${ROWS} WHERE ${key.map(k => `${ident(k)} IS NULL`).join(' OR ')}`);
   if (Number(nullKeys)) throw new Error(`去重键 ${key.join('、')} 有 ${nullKeys} 行为空，请检查映射或在源端补齐`);
@@ -391,15 +420,19 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     SELECT (SELECT count(*) FROM ${WINNERS} w ANTI JOIN ${BEFORE} b ON ${joinOn(key, 'w', 'b')}) AS inserted,
            (SELECT count(*) FROM ${WINNERS} w SEMI JOIN ${BEFORE} b ON ${joinOn(key, 'w', 'b')}) AS updated,
            (SELECT count(*) FROM ${BEFORE} b ANTI JOIN ${WINNERS} w ON ${joinOn(key, 'w', 'b')}) AS deleted`);
+  lap('keys');
 
   await inTransaction(con, async () => {
     await ensureSilverTable(con, plan);
+    lap('ensureTable');
     if (rebuild) {
       await con.run(`DROP TABLE IF EXISTS ${records}; CREATE TABLE ${records} AS SELECT * FROM ${ROWS}`);
+      lap('records');
       await con.run(`DELETE FROM ${silver} WHERE _mapping = ${lit(plan.mapping)}`);
     } else {
       await con.run(`DELETE FROM ${records} WHERE _src IN (SELECT _src FROM ${LATEST})`);
       await con.run(`INSERT INTO ${records} SELECT * FROM ${ROWS}`);
+      lap('records');
       await con.run(`DELETE FROM ${silver} USING ${KEYS} k WHERE ${silver}._mapping = ${lit(plan.mapping)} AND ${joinOn(key, silver, 'k')}`);
     }
     await con.run(`
@@ -407,21 +440,29 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
         ${lit(plan.mapping)} AS _mapping, ${lit(plan.sourceId)} AS _source, ${plan.version} AS _version, TIMESTAMPTZ ${lit(now.toISOString())} AS _merged_at,
         ${plan.keySpace ? lit(plan.keySpace) : 'NULL'} AS _key_space
       FROM ${WINNERS} w`);
+    lap('deleteInsert');
     if (plan.uniqueKey) await assertUniqueAcrossMappings(con, silver, plan.mapping, plan.uniqueKey, plan.uniqueBySource);
+    lap('unique');
     await con.run(`INSERT INTO ${MERGES} VALUES (
       ${lit(plan.mapping)}, ${plan.version}, ${lit(input.rebuildTag)}, ${from}, ${to},
       ${stats.inserted}, ${stats.updated}, ${stats.deleted}, TIMESTAMPTZ ${lit(startedAt.toISOString())}, TIMESTAMPTZ ${lit(new Date().toISOString())}, ${SCHEME})`);
+    lap('mergeLog');
   });
+  lap('commit');
+  const silverCount = await silverRows();
+  lap('rows');
+  const durationMs = Date.now() - startedAt.getTime();
+  console.log(`[合并] ${plan.table} → ${plan.entity}（${plan.mapping}）：${silverCount} 行，${durationMs} ms（${Object.entries(steps).map(([k, v]) => `${k} ${v}`).join('、')}）`);
   return {
     ...base,
-    durationMs: Date.now() - startedAt.getTime(),
+    durationMs,
     mode: rebuild ? 'rebuild' : 'incremental',
     batchFrom: from,
     batchTo: to,
     inserted: Number(stats.inserted),
     updated: Number(stats.updated),
     deleted: Number(stats.deleted),
-    rows: await silverRows(),
+    rows: silverCount,
     ...(fallback.length && { fallback }),
     ...(filtered !== undefined && { filtered }),
   };
@@ -493,12 +534,12 @@ export async function relationStats(con: DuckDBConnection, relations: RelationPa
  * 按已发布的映射合并到标准层，每个映射各自一个事务：一个映射失败（表达式在数据上出错、值字典缺取值、去重键为空）
  * 只影响它自己，其他映射照常合并。之后本租户有 silver.customer 时整表重算身份打通（一次合并只带受影响的映射，增量会漏），
  * 失败同样只记在 identities 里。rules 是租户全部 customer 映射汇总出的匹配规则（入队合并时算好，不只是这次带的映射）；
- * 打通之前统计 relations（租户全部已发布关系，同样入队时算好）的孤儿，记在 relations 里，出错不算合并失败；salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐
+ * 打通之前统计 relations（租户全部已发布关系，同样入队时算好）的孤儿，记在 relations 里（耗时记在 relationsMs），出错不算合并失败；salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐
  */
 export async function mergeToSilver(
   session: TenantLakeSession, plans: MergeMappingParam[], salt: string, redact: (message: string) => string, rules: readonly string[] = DEFAULT_RULES,
   relations: RelationParam[] = [],
-): Promise<{ mappings: MergeRecord[]; relations?: RelationStat[]; identities?: IdentityRecord }> {
+): Promise<{ mappings: MergeRecord[]; relations?: RelationStat[]; relationsMs?: number; identities?: IdentityRecord }> {
   const { con } = session;
   const now = new Date();
   const records: MergeRecord[] = [];
@@ -515,7 +556,9 @@ export async function mergeToSilver(
       await con.run([LATEST, LIVE, ROWS, KEYS, BEFORE, WINNERS, VIEW_ROWS].map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
     }
   }
-  const merged = { mappings: records, ...(relations.length > 0 && { relations: await relationStats(con, relations, redact) }) };
+  const relationsFrom = Date.now();
+  const orphans = relations.length > 0 ? await relationStats(con, relations, redact) : undefined;
+  const merged = { mappings: records, ...(orphans && { relations: orphans, relationsMs: Date.now() - relationsFrom }) };
   if (!await tableExists(con, SILVER, 'customer')) return merged;
   const startedAt = Date.now();
   try {
