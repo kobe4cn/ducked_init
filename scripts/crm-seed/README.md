@@ -178,6 +178,12 @@ node --env-file=.env --import tsx scripts/crm-seed/seed.ts --round 2
 
 造数：`seed.ts --persons 10000000 --set 10m`。数据源登记时用 `_10m` 的库与 schema、`crm/10m/` 的 S3 前缀（`setup.ts --set 10m` 会自动这样登记）。每一步的耗时与峰值内存记进 `docs/test-plans/crmlab-10m-baseline.md`；核对用 `verify.ts crmlab-10m --set 10m`。
 
+全部映射强制重建一次（排查写入耗时用；已有合并在排队或运行中时不入队，要先开着调度器 `pnpm dispatcher`）：
+
+```bash
+node --env-file-if-exists=.env --import tsx scripts/rebuild-all.ts --tenant crmlab-10m
+```
+
 ## 四、探针速查
 
 | pid | 用例 | 构造 | 期望 |

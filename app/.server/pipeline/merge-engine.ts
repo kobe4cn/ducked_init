@@ -465,7 +465,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   const silverCount = await silverRows();
   lap('rows');
   const durationMs = Date.now() - startedAt.getTime();
-  console.log(`[合并] ${plan.table} → ${plan.entity}（${plan.mapping}）：${silverCount} 行，${durationMs} ms（${Object.entries(steps).map(([k, v]) => `${k} ${v}`).join('、')}）`);
+  console.log(`${new Date().toISOString()} [合并] ${plan.table} → ${plan.entity}（${plan.mapping}）：${silverCount} 行，${durationMs} ms（${Object.entries(steps).map(([k, v]) => `${k} ${v}`).join('、')}）`);
   return {
     ...base,
     durationMs,

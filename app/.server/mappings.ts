@@ -493,7 +493,7 @@ export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId
 const ofMerge = (tenantId: string) => and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'silver.merge'));
 
 /** 租户在排队或运行中的合并（同一租户同时只有一个） */
-async function pendingMerge(db: Tx | ReturnType<typeof getDb>, tenantId: string) {
+export async function pendingMerge(db: Tx | ReturnType<typeof getDb>, tenantId: string) {
   const [pending] = await db.select().from(tasks).where(and(ofMerge(tenantId), inArray(tasks.status, ['queued', 'running']))).limit(1);
   return pending;
 }
