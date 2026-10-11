@@ -114,14 +114,17 @@ export const silverTable = (entity: string) => `${SILVER}.${ident(entity)}`;
 /** 一个映射的当前记录 */
 const recordsOf = (mapping: string) => `${RECORDS}.${ident(`m_${mapping.replace(/-/g, '')}`)}`;
 
-/** 合并的中间结果，暂存在会话的本机库 stage 里（落盘时压缩，ADR-0010） */
-const LATEST = 'stage.merge_latest';
-const LIVE = 'stage.merge_live';
-const ROWS = 'stage.merge_rows';
-const KEYS = 'stage.merge_keys';
-const BEFORE = 'stage.merge_before';
-const WINNERS = 'stage.merge_winners';
-const VIEW_ROWS = 'stage.merge_view';
+/** 合并的中间结果，暂存在会话的本机库 stage 里（落盘时压缩，ADR-0010）。按实体并行合并时每条队列一组，表名带上队列的后缀，互不覆盖 */
+const stageTables = (suffix: string) => ({
+  latest: `stage.merge_latest_${suffix}`,
+  live: `stage.merge_live_${suffix}`,
+  rows: `stage.merge_rows_${suffix}`,
+  keys: `stage.merge_keys_${suffix}`,
+  before: `stage.merge_before_${suffix}`,
+  winners: `stage.merge_winners_${suffix}`,
+  view: `stage.merge_view_${suffix}`,
+});
+type StageTables = ReturnType<typeof stageTables>;
 
 async function inTransaction<T>(con: DuckDBConnection, work: () => Promise<T>) {
   await con.run('BEGIN');
@@ -260,10 +263,10 @@ export async function unknownValues(con: DuckDBConnection, c: PlanColumn, live: 
  * 值字典里没有、或（没有值字典时）不是标准枚举的取值：没写兜底值时报错，不悄悄写进标准层，列出出现最多的几个取值与行数；
  * 写了兜底值时返回落入兜底的统计
  */
-async function checkUnknownValues(con: DuckDBConnection, columns: PlanColumn[]) {
+async function checkUnknownValues(con: DuckDBConnection, columns: PlanColumn[], live: string) {
   const fallback: FallbackStat[] = [];
   for (const c of columns) {
-    const unknown = await unknownValues(con, c, LIVE);
+    const unknown = await unknownValues(con, c, live);
     if (!unknown) continue;
     if (c.otherwise !== undefined) {
       fallback.push(unknown);
@@ -354,7 +357,7 @@ interface LastMerge { version: number; source_keys: string; batch_to: string; sc
  * 合并一个映射：读出原始层里上次合并之后的批次，改当前记录，再对受影响的去重键重新取最新的一行写进标准层。
  * 首次合并、映射换了版本、源表的主键变了、标准层的写法变了或带了强制重建标记时由全部批次重建（当前记录与本映射在标准层的行都换掉）
  */
-async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date): Promise<MergeRecord> {
+async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date, stage: StageTables): Promise<MergeRecord> {
   const startedAt = new Date();
   // 分步计时：lap(步骤) 把上一次打点以来的耗时累加到这一步
   const steps: Partial<Record<MergeStep, number>> = {};
@@ -365,7 +368,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     mark = t;
   };
   const base = { mapping: plan.mapping, entity: plan.entity, table: plan.table, version: plan.version, startedAt: startedAt.toISOString(), steps };
-  const input = await mappingInput(con, plan, plan.sourceId, plan.sourceView, VIEW_ROWS, '合并');
+  const input = await mappingInput(con, plan, plan.sourceId, plan.sourceView, stage.view, '合并');
   lap('input');
   if ('skipped' in input) return { ...base, durationMs: Date.now() - startedAt.getTime(), skipped: input.skipped };
   const records = recordsOf(plan.mapping);
@@ -391,46 +394,46 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   lap('maxBatch');
   if (!rebuild && to <= from) return unchanged();
 
-  await liveRecords(con, bronze, sourceKeys, { from, to, held: rebuild ? null : records }, { latest: LATEST, live: LIVE });
+  await liveRecords(con, bronze, sourceKeys, { from, to, held: rebuild ? null : records }, { latest: stage.latest, live: stage.live });
   // 行过滤：不满足（含取值为空）的记录从 live 里去掉，视为当前记录里不存在；latest 不动，它们的旧版本照常删除、受影响的去重键回落（ADR-0024）
-  const filtered = plan.where ? await filterLive(con, plan) : undefined;
+  const filtered = plan.where ? await filterLive(con, plan, stage.live) : undefined;
   lap('live');
   // 先查出值字典与标准枚举之外的取值（没写兜底值时报错；敏感字段不查，取值会进报错与兜底统计），再转换
   const pii = sensitiveColumns(plan);
-  const fallback = await checkUnknownValues(con, plan.columns.filter(c => !pii.has(c.name)));
+  const fallback = await checkUnknownValues(con, plan.columns.filter(c => !pii.has(c.name)), stage.live);
   lap('unknownValues');
-  await transformRows(con, plan, salt, { live: LIVE, into: ROWS });
+  await transformRows(con, plan, salt, { live: stage.live, into: stage.rows });
   lap('transform');
   const key = plan.key;
-  const [{ n: nullKeys }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${ROWS} WHERE ${key.map(k => `${ident(k)} IS NULL`).join(' OR ')}`);
+  const [{ n: nullKeys }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${stage.rows} WHERE ${key.map(k => `${ident(k)} IS NULL`).join(' OR ')}`);
   if (Number(nullKeys)) throw new Error(`去重键 ${key.join('、')} 有 ${nullKeys} 行为空，请检查映射或在源端补齐`);
 
-  // 受影响的去重键：改动的源记录在旧版本与新版本里的去重键。重建时是全部的去重键（本映射在标准层的行都换掉），不建 KEYS
-  const changed = `(SELECT _src FROM ${LATEST})`;
+  // 受影响的去重键：改动的源记录在旧版本与新版本里的去重键。重建时是全部的去重键（本映射在标准层的行都换掉），不建 stage.keys
+  const changed = `(SELECT _src FROM ${stage.latest})`;
   if (!rebuild) {
-    await con.run(`CREATE OR REPLACE TABLE ${KEYS} AS SELECT DISTINCT * FROM (
-      SELECT ${keyList(key, 'r')} FROM ${records} r WHERE r._src IN ${changed} UNION ALL SELECT ${keyList(key)} FROM ${ROWS})`);
+    await con.run(`CREATE OR REPLACE TABLE ${stage.keys} AS SELECT DISTINCT * FROM (
+      SELECT ${keyList(key, 'r')} FROM ${records} r WHERE r._src IN ${changed} UNION ALL SELECT ${keyList(key)} FROM ${stage.rows})`);
   }
-  // 标准层里本映射受影响的旧键，只用于统计。保留 DISTINCT：换过去重键后旧行可能重复或有空键，空键连不上 WINNERS，算进 deleted
+  // 标准层里本映射受影响的旧键，只用于统计。保留 DISTINCT：换过去重键后旧行可能重复或有空键，空键连不上 stage.winners，算进 deleted
   const mine = `${silver} s WHERE s._mapping = ${lit(plan.mapping)}`;
   const silverExists = await tableExists(con, SILVER, plan.entity);
   if (silverExists) {
-    await con.run(`CREATE OR REPLACE TABLE ${BEFORE} AS SELECT DISTINCT ${keyList(key, 's')} FROM ${mine}${rebuild
-      ? '' : ` AND EXISTS (SELECT 1 FROM ${KEYS} k WHERE ${joinOn(key, 'k', 's')})`}`);
+    await con.run(`CREATE OR REPLACE TABLE ${stage.before} AS SELECT DISTINCT ${keyList(key, 's')} FROM ${mine}${rebuild
+      ? '' : ` AND EXISTS (SELECT 1 FROM ${stage.keys} k WHERE ${joinOn(key, 'k', 's')})`}`);
   }
   // 每个受影响的去重键取最新的一行：取最新字段最大（空值最后），再按最近的批次，最后按记录的哈希，结果确定
-  const kept = rebuild ? '' : `SELECT r.* FROM ${records} r SEMI JOIN ${KEYS} k ON ${joinOn(key, 'r', 'k')} WHERE r._src NOT IN ${changed} UNION ALL `;
+  const kept = rebuild ? '' : `SELECT r.* FROM ${records} r SEMI JOIN ${stage.keys} k ON ${joinOn(key, 'r', 'k')} WHERE r._src NOT IN ${changed} UNION ALL `;
   const order = [...(plan.latest ? [`c.${ident(plan.latest)} DESC NULLS LAST`] : []), 'c._batch DESC', 'c._src'].join(', ');
-  await con.run(`CREATE OR REPLACE TABLE ${WINNERS} AS SELECT * EXCLUDE (_rn) FROM (
-    SELECT c.*, row_number() OVER (PARTITION BY ${keyList(key, 'c')} ORDER BY ${order}) AS _rn FROM (${kept}SELECT * FROM ${ROWS}) c) WHERE _rn = 1`);
-  // 三个统计一次扫描：WINNERS 的键不重复、BEFORE 去过重，全连接后每个键至多一行；joinOn 用 =，空键两边都连不上
+  await con.run(`CREATE OR REPLACE TABLE ${stage.winners} AS SELECT * EXCLUDE (_rn) FROM (
+    SELECT c.*, row_number() OVER (PARTITION BY ${keyList(key, 'c')} ORDER BY ${order}) AS _rn FROM (${kept}SELECT * FROM ${stage.rows}) c) WHERE _rn = 1`);
+  // 三个统计一次扫描：stage.winners 的键不重复、stage.before 去过重，全连接后每个键至多一行；joinOn 用 =，空键两边都连不上
   const [stats] = silverExists
     ? await rows<{ inserted: string; updated: string; deleted: string }>(con, `
       SELECT count(*) FILTER (WHERE w._in_winners AND b._in_before IS NULL) AS inserted,
         count(*) FILTER (WHERE w._in_winners AND b._in_before) AS updated, count(*) FILTER (WHERE w._in_winners IS NULL) AS deleted
-      FROM (SELECT ${keyList(key)}, true AS _in_winners FROM ${WINNERS}) w
-      FULL OUTER JOIN (SELECT *, true AS _in_before FROM ${BEFORE}) b ON ${joinOn(key, 'w', 'b')}`)
-    : [{ inserted: String(await count(con, WINNERS)), updated: '0', deleted: '0' }];
+      FROM (SELECT ${keyList(key)}, true AS _in_winners FROM ${stage.winners}) w
+      FULL OUTER JOIN (SELECT *, true AS _in_before FROM ${stage.before}) b ON ${joinOn(key, 'w', 'b')}`)
+    : [{ inserted: String(await count(con, stage.winners)), updated: '0', deleted: '0' }];
   lap('keys');
 
   await inTransaction(con, async () => {
@@ -438,23 +441,23 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     lap('ensureTable');
     // 主键有列没映射时（声明了 dedupe.key）本映射的主键在标准层全为空，不会重复
     const unique = plan.uniqueKey?.every(k => plan.columns.some(c => c.name === k)) && plan.uniqueKey;
-    if (unique) await assertUniqueAcrossMappings(con, silver, plan.mapping, unique, plan.uniqueBySource ? plan.sourceId : undefined);
+    if (unique) await assertUniqueAcrossMappings(con, silver, plan.mapping, unique, stage.winners, plan.uniqueBySource ? plan.sourceId : undefined);
     lap('unique');
     if (rebuild) {
-      await con.run(`DROP TABLE IF EXISTS ${records}; CREATE TABLE ${records} AS SELECT * FROM ${ROWS}`);
+      await con.run(`DROP TABLE IF EXISTS ${records}; CREATE TABLE ${records} AS SELECT * FROM ${stage.rows}`);
       lap('records');
       await con.run(`DELETE FROM ${silver} WHERE _mapping = ${lit(plan.mapping)}`);
     } else {
-      await con.run(`DELETE FROM ${records} WHERE _src IN (SELECT _src FROM ${LATEST})`);
-      await con.run(`INSERT INTO ${records} SELECT * FROM ${ROWS}`);
+      await con.run(`DELETE FROM ${records} WHERE _src IN (SELECT _src FROM ${stage.latest})`);
+      await con.run(`INSERT INTO ${records} SELECT * FROM ${stage.rows}`);
       lap('records');
-      await con.run(`DELETE FROM ${silver} USING ${KEYS} k WHERE ${silver}._mapping = ${lit(plan.mapping)} AND ${joinOn(key, silver, 'k')}`);
+      await con.run(`DELETE FROM ${silver} USING ${stage.keys} k WHERE ${silver}._mapping = ${lit(plan.mapping)} AND ${joinOn(key, silver, 'k')}`);
     }
     await con.run(`
       INSERT INTO ${silver} BY NAME SELECT w.* EXCLUDE (_src, _n, _batch),
         ${lit(plan.mapping)} AS _mapping, ${lit(plan.sourceId)} AS _source, ${plan.version} AS _version, TIMESTAMPTZ ${lit(now.toISOString())} AS _merged_at,
         ${plan.keySpace ? lit(plan.keySpace) : 'NULL'} AS _key_space
-      FROM ${WINNERS} w`);
+      FROM ${stage.winners} w`);
     lap('deleteInsert');
     await con.run(`INSERT INTO ${MERGES} VALUES (
       ${lit(plan.mapping)}, ${plan.version}, ${lit(input.rebuildTag)}, ${from}, ${to},
@@ -485,27 +488,27 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
  * 从 live 里删掉不满足 where 的记录，返回删掉的源表行数（没有主键的表一条记录可代表多行）。
  * 报错里抹掉敏感字段与 where 引用的源端取值（where 可能引用没映射的敏感列）
  */
-async function filterLive(con: DuckDBConnection, plan: MergeMappingParam) {
-  const failing = `(${compileExpression(parseExpression(plan.where!), LIVE)}) IS NOT TRUE`;
+async function filterLive(con: DuckDBConnection, plan: MergeMappingParam, live: string) {
+  const failing = `(${compileExpression(parseExpression(plan.where!), live)}) IS NOT TRUE`;
   const pii = sensitiveColumns(plan);
   const scrubbed = [...plan.columns.filter(c => pii.has(c.name)), { expr: plan.where! }];
-  const clean = async (e: Error) => { throw new Error(await withoutPii(con, scrubbed, e.message, LIVE)); };
-  const [{ n }] = await rows<{ n: string }>(con, `SELECT coalesce(sum(_n), 0) AS n FROM ${LIVE} WHERE ${failing}`).catch(clean);
-  await con.run(`DELETE FROM ${LIVE} WHERE ${failing}`).catch(clean);
+  const clean = async (e: Error) => { throw new Error(await withoutPii(con, scrubbed, e.message, live)); };
+  const [{ n }] = await rows<{ n: string }>(con, `SELECT coalesce(sum(_n), 0) AS n FROM ${live} WHERE ${failing}`).catch(clean);
+  await con.run(`DELETE FROM ${live} WHERE ${failing}`).catch(clean);
   return Number(n);
 }
 
 /**
- * 本映射这次要写入的主键（WINNERS）不能和别的映射在标准层的行重复（ADR-0024「独占」）；source 给出时只和同一个数据源的映射比较。主键为空的行不算重复。
+ * 本映射这次要写入的主键（winners）不能和别的映射在标准层的行重复（ADR-0024「独占」）；source 给出时只和同一个数据源的映射比较。主键为空的行不算重复。
  * 只拿本次写入的键去连接其他映射的行，不对整个实体表分组，耗时随本映射的行数增长；增量时后写进来的冲突键在别的映射合并时已经查过。
  * 要在本事务改 silver 之前调用：改过之后 DuckLake 的基数估计不准，哈希表会建在 silver 一侧，小映射要全表扫大共享表（见 crmlab-10m-baseline.md #164）。
  * 先到先得，重复时报错让本映射的事务回滚；报错列出最多 5 个冲突的键与所在的映射
  */
-async function assertUniqueAcrossMappings(con: DuckDBConnection, silver: string, mapping: string, key: string[], source?: string) {
+async function assertUniqueAcrossMappings(con: DuckDBConnection, silver: string, mapping: string, key: string[], winners: string, source?: string) {
   const conflicts = await rows<{ k: string; mappings: string[]; total: string }>(con, `
     SELECT concat_ws(', ', ${key.map(k => `w.${ident(k)}::VARCHAR`).join(', ')}) AS k,
       list_sort(list_distinct(list(o._mapping)) || [${lit(mapping)}]) AS mappings, count(*) OVER () AS total
-    FROM (SELECT DISTINCT ${keyList(key)} FROM ${WINNERS}) w
+    FROM (SELECT DISTINCT ${keyList(key)} FROM ${winners}) w
     JOIN (SELECT ${keyList(key)}, _mapping FROM ${silver} WHERE _mapping <> ${lit(mapping)}${source ? ` AND _source = ${lit(source)}` : ''}) o ON ${joinOn(key, 'w', 'o')}
     GROUP BY ${keyList(key, 'w')} ORDER BY k LIMIT 5`);
   if (!conflicts.length) return;
@@ -552,9 +555,37 @@ export async function relationStats(con: DuckDBConnection, relations: RelationPa
 const changedIdentityInputs = (records: MergeRecord[]) => records.some(r =>
   IDENTITY_INPUTS.includes(r.entity) && 'mode' in r && (r.mode === 'rebuild' || r.inserted + r.updated + r.deleted > 0));
 
+/** 提交冲突（不同实体的事务同时提交，DuckLake 报错含 conflict，ADR-0015）时回滚后整个映射再试的次数 */
+const CONFLICT_RETRIES = 2;
+
+/** 合并一个映射，出错只记在它自己的合并记录上；提交冲突时重试。每次尝试之后删掉本队列的中间表（后缀是队列序号） */
+async function mergeOne(
+  con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date, stage: StageTables, redact: (message: string) => string,
+): Promise<MergeRecord> {
+  const startedAt = new Date();
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await mergeMapping(con, plan, salt, now, stage);
+    } catch (e) {
+      const message = redact((e as Error).message);
+      if (attempt < CONFLICT_RETRIES && /conflict/i.test(message)) {
+        console.log(`${new Date().toISOString()} [合并] ${plan.table} → ${plan.entity}（${plan.mapping}）提交冲突，重试：${message}`);
+        continue;
+      }
+      return {
+        mapping: plan.mapping, entity: plan.entity, table: plan.table, version: plan.version,
+        startedAt: startedAt.toISOString(), durationMs: Date.now() - startedAt.getTime(), error: message,
+      };
+    } finally {
+      // 删不掉也不影响下一个映射（中间表都是 CREATE OR REPLACE），不让它中断本队列
+      await con.run(Object.values(stage).map(t => `DROP TABLE IF EXISTS ${t};`).join(' ')).catch(() => undefined);
+    }
+  }
+}
+
 /**
  * 按已发布的映射合并到标准层，每个映射各自一个事务：一个映射失败（表达式在数据上出错、值字典缺取值、去重键为空）
- * 只影响它自己，其他映射照常合并。之后本租户有 silver.customer、且这次改到了 customer 或 event 时整表重算身份打通
+ * 只影响它自己，其他映射照常合并。不同实体的映射并行合并，同一实体的串行（ADR-0015）。之后本租户有 silver.customer、且这次改到了 customer 或 event 时整表重算身份打通
  * （一次合并只带受影响的映射，增量会漏）；打通结果表不在或 forceIdentities（入队时发现匹配规则变了或上次打通失败）时同样重算，
  * 否则沿用上次的结果，identities 记成跳过。失败同样只记在 identities 里。rules 是租户全部 customer 映射汇总出的匹配规则（入队合并时算好，不只是这次带的映射）；
  * 打通之前统计 relations（租户全部已发布关系，同样入队时算好）的孤儿，记在 relations 里（耗时记在 relationsMs），出错不算合并失败；salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐
@@ -565,20 +596,20 @@ export async function mergeToSilver(
 ): Promise<{ mappings: MergeRecord[]; relations?: RelationStat[]; relationsMs?: number; identities?: IdentityRecord }> {
   const { con } = session;
   const now = new Date();
-  const records: MergeRecord[] = [];
-  for (const plan of plans) {
-    const startedAt = new Date();
+  // 每个实体一条队列，组内按 plans 的顺序串行（同一实体的映射有跨映射唯一检查，ADR-0024），组间各用一个连接并发；结果按 plans 的顺序回填
+  const queues = new Map<string, number[]>();
+  plans.forEach((plan, i) => queues.set(plan.entity, [...(queues.get(plan.entity) ?? []), i]));
+  const records: MergeRecord[] = new Array(plans.length);
+  const settled = await Promise.allSettled([...queues.values()].map(async (indexes, q) => {
+    const queueCon = await session.connect();
     try {
-      records.push(await mergeMapping(con, plan, salt, now));
-    } catch (e) {
-      records.push({
-        mapping: plan.mapping, entity: plan.entity, table: plan.table, version: plan.version,
-        startedAt: startedAt.toISOString(), durationMs: Date.now() - startedAt.getTime(), error: redact((e as Error).message),
-      });
+      for (const i of indexes) records[i] = await mergeOne(queueCon, plans[i], salt, now, stageTables(String(q)), redact);
     } finally {
-      await con.run([LATEST, LIVE, ROWS, KEYS, BEFORE, WINNERS, VIEW_ROWS].map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
+      queueCon.closeSync();
     }
-  }
+  }));
+  const failed = settled.find((s): s is PromiseRejectedResult => s.status === 'rejected');
+  if (failed) throw failed.reason;
   const relationsFrom = Date.now();
   const orphans = relations.length > 0 ? await relationStats(con, relations, redact) : undefined;
   const merged = { mappings: records, ...(orphans && { relations: orphans, relationsMs: Date.now() - relationsFrom }) };

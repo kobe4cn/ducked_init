@@ -28,6 +28,8 @@ export interface TenantLakeSession {
   source?: { mongo?: MongoAccess; tables(): Promise<SourceTable[]> };
   /** 数据湖的存储前缀，以及在会话里读取 DuckLake 元数据表的位置（如 ducklake_data_file 前面加上它） */
   lake: { dataPath: string; metadata: string };
+  /** 同一实例上再开一个连接（默认库同样是 lake），与 con 共享内存与线程池，可以并发执行；由调用方 closeSync()，close() 不管 */
+  connect(): Promise<DuckDBConnection>;
   close(): void;
 }
 
@@ -72,12 +74,23 @@ export async function openTenantLake(
     }
     await con.run(`ATTACH ${lit(`ducklake:postgres:${spec.catalogUrl}`)} AS lake
       (DATA_PATH ${lit(spec.dataPath)}, METADATA_SCHEMA ${lit(spec.catalogSchema)}${readOnly ? ', READ_ONLY' : ''}${encrypted ? ', ENCRYPTED' : ''})`);
-    // 源端不带时区的时间一律按 UTC 解读，不随工作进程所在机器的时区变化
-    await con.run(`USE lake; SET TimeZone = 'UTC'`);
+    // 源端不带时区的时间一律按 UTC 解读，不随工作进程所在机器的时区变化；GLOBAL 让之后 connect() 开的连接同样按 UTC
+    await con.run(`USE lake; SET GLOBAL TimeZone = 'UTC'`);
     const attached = source ? await attachSource(con, source) : { allowed: [], mongo: undefined };
     await lockConfiguration(con, [spec.dataPath, spill, ...attached.allowed]);
+    const connect = async () => {
+      const extra = await instance.connect();
+      try {
+        await extra.run('USE lake');
+      } catch (e) {
+        extra.closeSync();
+        throw e;
+      }
+      return extra;
+    };
     return {
       con,
+      connect,
       close,
       lake: { dataPath: spec.dataPath, metadata: `__ducklake_metadata_lake.${ident(spec.catalogSchema)}` },
       ...(source && { source: { mongo: attached.mongo, tables: () => listTables(con, source, attached.mongo) } }),

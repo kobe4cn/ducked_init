@@ -7,11 +7,12 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
 import {
-  createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, rebuildEntity, referenceTables, saveDraft,
+  createMapping, enqueueDueMerges, enqueueMerge, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, rebuildEntity, referenceTables, saveDraft,
 } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import type { MergeMappingParam, MergeRecord } from '../../app/.server/pipeline/merge-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
@@ -494,6 +495,30 @@ describe('发布映射并合并到标准层', () => {
     expect(error).toContain(`主键 event_id 跨映射重复：1（映射 ${[fromOrders, clash].sort().join('、')}）；10（映射`);
     expect(error).toContain('共 40 个');
     expect(await silver(acme, 'event', 'event_id::INT')).toEqual(before);
+  });
+
+  it('一次合并里不同实体的映射并行、同一实体的串行，合并记录按入队的映射顺序', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, CUSTOMERS);
+    await publish(author, reviewer, id, ORDERS);
+    await publish(author, reviewer, id, events('orders', 'order_id'));
+    await publish(author, reviewer, id, events('order_log', 'order_no', 'dedupe:\n  key: [event_id]\n'));
+    const task = await getDb().transaction(tx => enqueueMerge(tx, acme, undefined, { rebuild: true }));
+    await drain();
+
+    const merge = (await listTasks(acme)).find(t => t.id === task!.id)!;
+    expect(merge.status).toBe('succeeded');
+    const records = (merge.result as { mappings: MergeRecord[] }).mappings;
+    expect(records.map(r => r.mapping)).toEqual((task!.params.mappings as MergeMappingParam[]).map(p => p.mapping));
+    expect(records.every(r => 'mode' in r && r.mode === 'rebuild')).toBe(true);
+    const span = (r: MergeRecord) => [Date.parse(r.startedAt), Date.parse(r.startedAt) + r.durationMs];
+    const overlaps = (a: MergeRecord, b: MergeRecord) => span(a)[0] < span(b)[1] && span(b)[0] < span(a)[1];
+    const [first, second] = records.filter(r => r.entity === 'event');
+    expect(overlaps(first, second)).toBe(false);
+    const byEntity = (entity: string) => records.find(r => r.entity === entity)!;
+    // 各实体的队列同时开跑，每条队列的第一个映射互相重叠
+    expect(overlaps(byEntity('customer'), byEntity('order'))).toBe(true);
+    expect(overlaps(byEntity('customer'), first)).toBe(true);
   });
 
   it('增量合并新增了和其他映射冲突的主键：这次合并失败，报错格式与全量时一样，标准层不变', async () => {
