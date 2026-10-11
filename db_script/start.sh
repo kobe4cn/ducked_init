@@ -80,11 +80,17 @@ else
         >/dev/null 2>&1 || true
 fi
 
+# localhost 的端口转发在大流量下会断连（#169），平台与测试的 S3_ENDPOINT 直接用容器 IP；IP 每次重建容器都可能变
+CONTAINER_IP="$(container inspect "$CONTAINER_NAME" | python3 -c 'import json,sys; d=json.load(sys.stdin); d=d[0] if isinstance(d,list) else d; print(d["status"]["networks"][0]["ipv4Address"].split("/")[0])' 2>/dev/null || true)"
+
 echo
 echo "==> SeaweedFS started."
 echo
+echo "Container IP: ${CONTAINER_IP:-（没查到，用 container ls 看）}"
+echo "  .env 里设 S3_ENDPOINT=${CONTAINER_IP:-<容器 IP>}:8333，改完重启平台进程与调度器"
+echo
 echo "Endpoints:"
-echo "  S3 API:        http://localhost:8333"
+echo "  S3 API:        http://localhost:8333（大流量会断，平台用上面的容器 IP）"
 echo "  Master UI:     http://localhost:9333"
 echo "  Filer UI:      http://localhost:8888"
 echo

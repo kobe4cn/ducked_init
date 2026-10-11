@@ -378,7 +378,7 @@ MinIO 社区版 2025 年 5 月移除了管理控制台，2025 年 12 月进入�
 切换只需要改 `.env`：
 
 ```ini
-# SeaweedFS
+# SeaweedFS（macOS 上用 Apple container 跑时写容器 IP，见下）
 S3_ENDPOINT=localhost:8333
 S3_URL_STYLE=path
 S3_USE_SSL=false
@@ -389,6 +389,9 @@ S3_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
 S3_URL_STYLE=vhost
 S3_USE_SSL=true
 ```
+
+用 `db_script/start.sh`（Apple container）跑 SeaweedFS 时，`S3_ENDPOINT` 写容器 IP（脚本末尾会打印，形如 `192.168.64.9:8333`），不要用 `localhost:8333`：
+localhost 的端口转发在大流量下会断连，传 4 MB 就可能断（#169，`docs/test-plans/crmlab-10m-baseline.md`）。容器 IP 在每次重建容器后都可能变，重建后要改 `.env` 并重启平台进程与调度器。
 
 ---
 
