@@ -1,0 +1,6 @@
+# 近 365 天营收：已支付、已发货、已完成的订单金额（S1 = 14.00；E2 时区边界；K2 撤下 oms 后天猫不翻倍）
+base: order
+measure: { agg: sum, field: amount }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }
+window: { field: created_at, days: 365 }

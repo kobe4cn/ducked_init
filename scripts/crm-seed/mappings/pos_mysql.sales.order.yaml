@@ -1,0 +1,25 @@
+# pos_mysql（MySQL）sales → 订单。sale_id 从 1 起，与商城订单号重号：键空间 pos，标准层写成 pos:<sale_id>（K1）。
+# 测试门店 T999 的单与作废单（is_void = 1）不进标准层（K7）；散客单 member_id 为空（打通不到人）；状态是中文，时间是北京时间
+model: 1
+entity: order
+table: sales
+key_space: pos
+where: store_code <> 'T999' and is_void = 0
+fields:
+  order_id: string(sale_id)
+  customer_id: string(member_id)
+  status:
+    expr: status
+    dictionary:
+      待支付: created
+      已支付: paid
+      已发货: shipped
+      已完成: completed
+      已取消: cancelled
+      已退款: refunded
+  amount: amount
+  created_at: from_timezone(sold_at, 'Asia/Shanghai')
+  paid_at: from_timezone(paid_at, 'Asia/Shanghai')
+  channel: "'store'"
+  store_id: store_code
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')

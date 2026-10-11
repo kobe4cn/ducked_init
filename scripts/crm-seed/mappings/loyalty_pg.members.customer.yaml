@@ -1,0 +1,11 @@
+# loyalty_pg（Postgres）members → 消费者。会员中心自己的会员号（L…）；手机必有、邮箱约 60%、unionid 约 50%
+model: 1
+entity: customer
+table: members
+fields:
+  customer_id: member_id
+  phone: mobile
+  email: email
+  external_id: unionid
+  registered_at: created_at
+  updated_at: updated_at

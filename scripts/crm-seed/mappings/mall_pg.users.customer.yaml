@@ -1,0 +1,20 @@
+# mall_pg（Postgres）users → 消费者。user_id 从 1 起；unionid 作外部 ID（与天猫、企微、会员中心的 unionid 打通）；性别 F / M
+model: 1
+entity: customer
+table: users
+fields:
+  customer_id: string(user_id)
+  name: nickname
+  phone: mobile
+  email: email
+  external_id: unionid
+  gender:
+    expr: gender
+    dictionary:
+      F: female
+      M: male
+    otherwise: unknown
+  birthday: birthday
+  city: city
+  registered_at: registered_at
+  updated_at: updated_at

@@ -1,0 +1,13 @@
+# activity_s3 源视图 attendances（views/activity_s3.attendances.sql）→ 行为事件「活动到场」（E3：P17 报名 2 场、到场 1 场）；
+# 时间取活动日期（北京时间零点）
+model: 1
+entity: event
+view: attendances
+view_key: [报名编号]
+fields:
+  event_id: concat('attend:', 报名编号)
+  customer_id: 报名编号
+  event_type: "'activity_attend'"
+  occurred_at: from_timezone(活动日期, 'Asia/Shanghai')
+extensions:
+  x_activity_id: { type: string, expr: 活动编号, label: 活动 }

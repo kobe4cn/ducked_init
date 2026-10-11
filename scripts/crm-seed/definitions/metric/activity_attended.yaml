@@ -1,0 +1,5 @@
+# 线下活动到场次数（E3 = 1）
+base: event
+measure: { agg: count }
+filter:
+  - { field: event_type, op: eq, value: activity_attend }

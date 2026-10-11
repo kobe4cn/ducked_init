@@ -1,0 +1,22 @@
+# loyalty_pg（Postgres）points_ledger → 积分流水。points 带正负；关联订单是 来源 + 单号，拼成 POS / 商城订单的键空间写法（pos:123、mall:123），
+# 没有关联订单的拼出来是 ':'，写成空
+model: 1
+entity: points_transaction
+table: points_ledger
+fields:
+  points_transaction_id: txn_id
+  customer_id: member_id
+  membership_id: card_no
+  change_type:
+    expr: txn_type
+    dictionary:
+      EARN: earn
+      SPEND: spend
+      REDEEM: redeem
+      EXPIRE: expire
+      ADJUST: adjust
+  points_change: points
+  balance_after: balance_after
+  order_id: nullif(concat(order_source, ':', order_no), ':')
+  occurred_at: occurred_at
+  expires_at: expires_at

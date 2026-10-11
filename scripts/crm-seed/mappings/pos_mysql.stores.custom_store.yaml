@@ -1,0 +1,9 @@
+# pos_mysql（MySQL）stores → 自定义实体 custom_store（门店维度，登记了关系 custom_store.region_id → custom_region）
+model: 1
+entity: custom_store
+table: stores
+extensions:
+  store_id: { type: string, expr: store_code }
+  store_name: { type: string, expr: store_name }
+  region_id: { type: string, expr: region_id }
+dedupe: { key: [store_id] }

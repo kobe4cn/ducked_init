@@ -1,0 +1,24 @@
+# oms_mongo（MongoDB）orders → 订单：只在 K2 用例里临时发布，演示「同一批订单两路接入」，用完撤下（#144）。
+# 嵌套字段按下划线展开（buyer.id → buyer_id，payment.total → payment_total）；约 2% 订单另有一个旧版本文档（同一 tid），
+# 按 tid 去重、取 updated_at 最新的一版（K6：P01 的天猫订单旧版本金额 999，去重后是 150）；Mongo 的 Date 是 UTC
+model: 1
+entity: order
+table: orders
+fields:
+  order_id: tid
+  customer_id: buyer_id
+  status:
+    expr: status
+    dictionary:
+      WAIT_BUYER_PAY: created
+      WAIT_SELLER_SEND_GOODS: paid
+      WAIT_BUYER_CONFIRM_GOODS: shipped
+      TRADE_FINISHED: completed
+      TRADE_CLOSED: cancelled
+      REFUND_SUCCESS: refunded
+  amount: payment_total
+  created_at: created_at
+  paid_at: payment_paid_at
+  channel: "'tmall'"
+  updated_at: updated_at
+dedupe: { key: [order_id], latest: updated_at }

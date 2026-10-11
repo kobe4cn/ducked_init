@@ -1,0 +1,13 @@
+# pos_mysql（MySQL）sale_items → 订单明细。明细号与所属订单都在键空间 pos 里（引用字段要显式写 key_space，否则指向商城的同号订单）；
+# 商品 sku 指向商城的商品主数据（K3）
+model: 1
+entity: order_item
+table: sale_items
+key_space: pos
+fields:
+  order_item_id: string(line_id)
+  order_id: { expr: string(sale_id), key_space: pos }
+  product_id: sku
+  quantity: qty
+  unit_price: price
+  amount: line_amount

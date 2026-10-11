@@ -1,0 +1,8 @@
+# 近 365 天按区域的营收：订单 → 门店 → 区域（线上订单没有门店，记「未关联」）
+base: order
+measure: { agg: sum, field: amount }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }
+window: { field: created_at, days: 365 }
+dimensions:
+  - { name: region, path: order.store_id -> custom_store.region_id -> custom_region.region_name }

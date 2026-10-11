@@ -1,0 +1,12 @@
+# mall_pg（Postgres）order_items → 订单明细。明细号与所属订单都在键空间 mall
+model: 1
+entity: order_item
+table: order_items
+key_space: mall
+fields:
+  order_item_id: string(item_id)
+  order_id: { expr: string(order_id), key_space: mall }
+  product_id: sku
+  quantity: qty
+  unit_price: unit_price
+  amount: line_amount

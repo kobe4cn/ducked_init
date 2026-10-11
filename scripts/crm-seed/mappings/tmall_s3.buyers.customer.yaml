@@ -1,0 +1,11 @@
+# tmall_s3（S3 Parquet）buyers → 消费者。buyer_id 形如 tb_…；unionid 作外部 ID；约 30% 有收货手机；时间是 Unix 毫秒
+model: 1
+entity: customer
+table: buyers
+fields:
+  customer_id: buyer_id
+  name: buyer_nick
+  phone: receiver_mobile
+  external_id: unionid
+  registered_at: from_epoch_millis(created_ms)
+  updated_at: from_epoch_millis(created_ms)

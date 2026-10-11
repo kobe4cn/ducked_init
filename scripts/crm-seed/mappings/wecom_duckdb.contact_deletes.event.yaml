@@ -1,0 +1,12 @@
+# wecom_duckdb 源视图 contact_deletes（views/wecom_duckdb.contact_deletes.sql）→ 行为事件「删除好友」
+model: 1
+entity: event
+view: contact_deletes
+view_key: [external_userid]
+fields:
+  event_id: concat('wecom_delete:', external_userid)
+  customer_id: external_userid
+  event_type: "'wecom_delete'"
+  occurred_at: from_timezone(del_time, 'Asia/Shanghai')
+extensions:
+  x_guide_id: { type: string, expr: guide_id, label: 导购 }

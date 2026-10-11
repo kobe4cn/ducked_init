@@ -1,0 +1,5 @@
+# 核销过的券数（C1 = 1）
+base: coupon
+measure: { agg: count }
+filter:
+  - { field: status, op: eq, value: redeemed }

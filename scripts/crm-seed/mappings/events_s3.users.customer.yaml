@@ -1,0 +1,10 @@
+# events_s3（S3 JSON / Parquet）users → 消费者：埋点平台的用户档案，user_id 是商城的用户 ID。
+# 平台只在本数据源内解析事件的 customer_id（#150），这张表让埋点源有自己的消费者记录，靠手机、邮箱并到商城那个人
+model: 1
+entity: customer
+table: users
+fields:
+  customer_id: user_id
+  phone: mobile
+  email: email
+  registered_at: from_epoch_millis(first_login_ms)

@@ -1,0 +1,9 @@
+# loyalty_pg（Postgres）preferences → 偏好（品类偏好）
+model: 1
+entity: preference
+table: preferences
+fields:
+  customer_id: member_id
+  preference_type: pref_type
+  preference_value: pref_value
+  updated_at: updated_at

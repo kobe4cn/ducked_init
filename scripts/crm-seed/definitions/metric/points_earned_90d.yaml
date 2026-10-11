@@ -1,0 +1,6 @@
+# 近 90 天获得的积分（L1 = 100）
+base: points_transaction
+measure: { agg: sum, field: points_change }
+filter:
+  - { field: change_type, op: eq, value: earn }
+window: { field: occurred_at, days: 90 }

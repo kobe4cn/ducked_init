@@ -1,0 +1,11 @@
+# events_s3（S3 JSON / Parquet）events → 行为事件。匿名事件 user_id 为空、只有 device_id（P06、P07 经设备归属到人）；时间是 Unix 毫秒
+model: 1
+entity: event
+table: events
+fields:
+  event_id: event_id
+  customer_id: user_id
+  device_id: device_id
+  event_type: event_name
+  occurred_at: from_epoch_millis(ts_ms)
+  page: page

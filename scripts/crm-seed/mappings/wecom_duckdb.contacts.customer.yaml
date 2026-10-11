@@ -1,0 +1,12 @@
+# wecom_duckdb（S3 上的 DuckDB 文件）contacts → 消费者。企微外部联系人，unionid 作外部 ID；x_guide_id 是添加他的导购（P12）；时间是北京时间
+model: 1
+entity: customer
+table: contacts
+fields:
+  customer_id: external_userid
+  phone: mobile
+  external_id: unionid
+  registered_at: from_timezone(add_time, 'Asia/Shanghai')
+  updated_at: from_timezone(update_time, 'Asia/Shanghai')
+extensions:
+  x_guide_id: { type: string, expr: guide_id, label: 添加的导购 }

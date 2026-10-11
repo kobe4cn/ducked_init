@@ -1,0 +1,21 @@
+# douyin_s3（S3 CSV）dy_orders → 订单。中文表头；订单状态是数字码；金额以分计；时间是北京时间
+model: 1
+entity: order
+table: dy_orders
+fields:
+  order_id: string(订单编号)
+  customer_id: 买家openid
+  status:
+    expr: string(订单状态)
+    dictionary:
+      '1': created
+      '2': paid
+      '3': shipped
+      '5': completed
+      '4': cancelled
+      '21': refunded
+  amount: decimal("实付金额（分）") / 100
+  created_at: from_timezone(下单时间, 'Asia/Shanghai')
+  paid_at: from_timezone(支付时间, 'Asia/Shanghai')
+  channel: "'douyin'"
+  updated_at: from_timezone(更新时间, 'Asia/Shanghai')

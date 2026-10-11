@@ -1,0 +1,8 @@
+# 近 30 天与导购的企微聊天次数，按导购（P12 在 G0001 下 = 4；导购在事件的扩展字段 x_guide_id 上）
+base: event
+measure: { agg: count }
+filter:
+  - { field: event_type, op: eq, value: wecom_chat }
+window: { field: occurred_at, days: 30 }
+dimensions:
+  - { name: guide, path: event.x_guide_id }

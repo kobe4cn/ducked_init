@@ -1,0 +1,21 @@
+# loyalty_pg（Postgres）coupons → 券
+model: 1
+entity: coupon
+table: coupons
+fields:
+  coupon_id: coupon_code
+  coupon_template_id: template_id
+  campaign_id: campaign_id
+  customer_id: member_id
+  status:
+    expr: status
+    dictionary:
+      UNUSED: issued
+      USED: redeemed
+      EXPIRED: expired
+      VOID: voided
+  issued_at: issued_at
+  redeemed_at: used_at
+  discount_amount: discount_amount
+  expires_at: expires_at
+  updated_at: updated_at

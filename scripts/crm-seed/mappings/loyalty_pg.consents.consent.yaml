@@ -1,0 +1,20 @@
+# loyalty_pg（Postgres）consents → 营销同意（短信 / 邮件 / 微信）。状态 Y / N
+model: 1
+entity: consent
+table: consents
+fields:
+  customer_id: member_id
+  channel:
+    expr: channel
+    dictionary:
+      SMS: sms
+      EMAIL: email
+      WECHAT: wechat
+  status:
+    expr: status
+    dictionary:
+      Y: granted
+      N: revoked
+  granted_at: granted_at
+  revoked_at: revoked_at
+  updated_at: updated_at

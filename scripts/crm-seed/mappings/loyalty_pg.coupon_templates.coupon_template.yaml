@@ -1,0 +1,18 @@
+# loyalty_pg（Postgres）coupon_templates → 券模板。discount_rate 是应付比例的小数（0.85），标准模型写 85
+model: 1
+entity: coupon_template
+table: coupon_templates
+fields:
+  coupon_template_id: template_id
+  name: name
+  coupon_type:
+    expr: type
+    dictionary:
+      CASH: cash
+      DISCOUNT: discount
+      GIFT: gift
+      FREESHIP: shipping
+    otherwise: other
+  face_value: face_value
+  pay_percent: discount_rate * 100
+  min_spend: threshold

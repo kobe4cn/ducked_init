@@ -1,0 +1,11 @@
+# activity_s3 signups → 行为事件「活动报名」：每条报名一条
+model: 1
+entity: event
+table: signups
+fields:
+  event_id: concat('signup:', 报名编号)
+  customer_id: 报名编号
+  event_type: "'activity_signup'"
+  occurred_at: from_timezone(报名时间, 'Asia/Shanghai')
+extensions:
+  x_activity_id: { type: string, expr: 活动编号, label: 活动 }

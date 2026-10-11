@@ -1,0 +1,17 @@
+# loyalty_pg（Postgres）memberships → 会员。points_balance 是源端维护的余额（L3：探针 99000017 的余额被改成 999，与流水对不上，#148）
+model: 1
+entity: membership
+table: memberships
+fields:
+  membership_id: card_no
+  customer_id: member_id
+  level: tier
+  points: points_balance
+  status:
+    expr: status
+    dictionary:
+      正常: active
+      冻结: frozen
+      注销: cancelled
+  joined_at: joined_at
+  expires_at: expires_at

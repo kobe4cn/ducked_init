@@ -1,0 +1,22 @@
+# tmall_s3（S3 Parquet）trades → 订单。天猫 tid 全局唯一，不用键空间；状态是天猫交易状态，时间是 Unix 毫秒。
+# 订单中台 oms_mongo 里有同一批订单的第二份拷贝，不要再映射它（K2）
+model: 1
+entity: order
+table: trades
+fields:
+  order_id: string(tid)
+  customer_id: buyer_id
+  status:
+    expr: trade_status
+    dictionary:
+      WAIT_BUYER_PAY: created
+      WAIT_SELLER_SEND_GOODS: paid
+      WAIT_BUYER_CONFIRM_GOODS: shipped
+      TRADE_FINISHED: completed
+      TRADE_CLOSED: cancelled
+      REFUND_SUCCESS: refunded
+  amount: payment
+  created_at: from_epoch_millis(created_ms)
+  paid_at: from_epoch_millis(pay_ms)
+  channel: "'tmall'"
+  updated_at: from_epoch_millis(modified_ms)

@@ -1,0 +1,8 @@
+# pos_mysql（MySQL）regions → 自定义实体 custom_region（区域维度）。R9 是测试区域，只挂了测试门店 T999
+model: 1
+entity: custom_region
+table: regions
+extensions:
+  region_id: { type: string, expr: region_id }
+  region_name: { type: string, expr: region_name }
+dedupe: { key: [region_id] }

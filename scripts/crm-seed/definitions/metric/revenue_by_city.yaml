@@ -1,0 +1,8 @@
+# 近 365 天按城市的营收：维度取消费者记录上的城市。同一个人在两个源城市不同时分成两行（K8，#145）
+base: order
+measure: { agg: sum, field: amount }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }
+window: { field: created_at, days: 365 }
+dimensions:
+  - { name: city, path: order.customer_id -> customer.city }

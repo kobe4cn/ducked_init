@@ -1,0 +1,10 @@
+# mall_pg（Postgres）products → 商品。商品主数据只有这一个来源（K3）：POS 明细与商城明细的 sku 都指向它
+model: 1
+entity: product
+table: products
+fields:
+  product_id: sku
+  name: title
+  category: category
+  brand: brand
+  price: list_price

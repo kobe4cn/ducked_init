@@ -1,0 +1,17 @@
+# wecom_duckdb mass_sends → 营销触达（企微群发，渠道 wechat）。结果是中文
+model: 1
+entity: touch
+table: mass_sends
+fields:
+  touch_id: send_id
+  customer_id: external_userid
+  campaign_id: campaign_id
+  channel: "'wechat'"
+  status:
+    expr: result
+    dictionary:
+      失败: failed
+      送达: delivered
+      已读: opened
+      点击: clicked
+  sent_at: from_timezone(send_time, 'Asia/Shanghai')

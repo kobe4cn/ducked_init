@@ -1,0 +1,15 @@
+# pos_mysql（MySQL）members.sms_opt_in → 营销同意（短信）。与会员中心的短信同意是同一个人的两条（K5：标准层两条都留，消费者层取舍待 #145）。
+# 映射表达式没有条件分支，granted_at / revoked_at 区分不了，只映射状态与变更时间
+model: 1
+entity: consent
+table: members
+where: opt_updated_at is not null
+fields:
+  customer_id: string(member_id)
+  channel: "'sms'"
+  status:
+    expr: string(sms_opt_in)
+    dictionary:
+      '1': granted
+      '0': revoked
+  updated_at: from_timezone(opt_updated_at, 'Asia/Shanghai')

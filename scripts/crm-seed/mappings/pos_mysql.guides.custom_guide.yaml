@@ -1,0 +1,9 @@
+# pos_mysql（MySQL）guides → 自定义实体 custom_guide（导购维度，关系 custom_guide.store_id → custom_store）。导购姓名登记为敏感字段
+model: 1
+entity: custom_guide
+table: guides
+extensions:
+  guide_id: { type: string, expr: guide_id }
+  guide_name: { type: string, expr: guide_name, sensitive: true }
+  store_id: { type: string, expr: store_code }
+dedupe: { key: [guide_id] }

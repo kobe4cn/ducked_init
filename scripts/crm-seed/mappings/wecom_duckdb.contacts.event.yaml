@@ -1,0 +1,11 @@
+# wecom_duckdb contacts → 行为事件「导购添加好友」：每个联系人一条
+model: 1
+entity: event
+table: contacts
+fields:
+  event_id: concat('wecom_add:', external_userid)
+  customer_id: external_userid
+  event_type: "'wecom_add'"
+  occurred_at: from_timezone(add_time, 'Asia/Shanghai')
+extensions:
+  x_guide_id: { type: string, expr: guide_id, label: 导购 }

@@ -1,0 +1,22 @@
+# mall_pg（Postgres）orders → 订单。order_id 从 1 起，与 POS 重号：键空间 mall（K1）；channel 是 web / miniapp
+model: 1
+entity: order
+table: orders
+key_space: mall
+fields:
+  order_id: string(order_id)
+  customer_id: string(user_id)
+  status:
+    expr: status
+    dictionary:
+      pending: created
+      paid: paid
+      shipped: shipped
+      completed: completed
+      cancelled: cancelled
+      refunded: refunded
+  amount: pay_amount
+  created_at: created_at
+  paid_at: paid_at
+  channel: channel
+  updated_at: updated_at

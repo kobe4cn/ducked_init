@@ -1,0 +1,15 @@
+# douyin_s3（S3 CSV）源视图 douyin_buyers（views/douyin_s3.douyin_buyers.sql）→ 消费者。买家信息内嵌在订单里，同一买家多行，
+# 按 openid 取更新时间最新的一行。openid 只在抖音内有意义，不当外部 ID；约 40% 授权了明文手机号（CSV 读成整数，转回文本），
+# 未授权的只有脱敏手机号（P09：打通不到人，是真实限制）；时间是北京时间
+model: 1
+entity: customer
+view: douyin_buyers
+view_key: [openid]
+fields:
+  customer_id: openid
+  phone: string(mobile)
+  city: city
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')
+extensions:
+  x_douyin_phone_mask: { type: string, expr: mobile_mask, label: 抖音脱敏手机号, sensitive: false }
+dedupe: { key: [customer_id], latest: updated_at }

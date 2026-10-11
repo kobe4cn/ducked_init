@@ -1,0 +1,5 @@
+# 积分活跃：近 90 天获得 ≥ 100 积分为活跃，其余沉默
+metric: points_earned_90d
+rules:
+  - { value: 活跃, when: { gte: 100 } }
+default: 沉默

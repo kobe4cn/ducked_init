@@ -1,0 +1,6 @@
+# 价值分层：近 365 天营收 ≥ 5000 高、≥ 1000 中，其余低（只覆盖有营收的消费者，#146）
+metric: revenue_365d
+rules:
+  - { value: 高, when: { gte: 5000 } }
+  - { value: 中, when: { gte: 1000 } }
+default: 低

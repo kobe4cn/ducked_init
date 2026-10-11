@@ -1,0 +1,6 @@
+# 全渠道：近 365 天下单渠道 ≥ 3 全渠道、≥ 2 双渠道，其余单渠道（P01 全渠道）
+metric: channel_count
+rules:
+  - { value: 全渠道, when: { gte: 3 } }
+  - { value: 双渠道, when: { gte: 2 } }
+default: 单渠道

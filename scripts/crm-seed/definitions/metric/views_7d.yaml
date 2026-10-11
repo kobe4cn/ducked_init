@@ -1,0 +1,6 @@
+# 近 7 天浏览次数：含经设备归属到人的匿名浏览（P06 = 12，P15 = 10）
+base: event
+measure: { agg: count }
+filter:
+  - { field: event_type, op: eq, value: view }
+window: { field: occurred_at, days: 7 }

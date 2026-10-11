@@ -1,0 +1,3 @@
+# 积分余额：全部积分流水的变动之和（L1 = 15；L3 的 membership.points = 999 与它对不上，#148）
+base: points_transaction
+measure: { agg: sum, field: points_change }

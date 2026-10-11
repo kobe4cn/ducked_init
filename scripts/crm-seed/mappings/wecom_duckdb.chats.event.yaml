@@ -1,0 +1,12 @@
+# wecom_duckdb chats → 行为事件「导购聊天」（按天汇总的会话，msg_count 是消息条数）
+model: 1
+entity: event
+table: chats
+fields:
+  event_id: chat_id
+  customer_id: external_userid
+  event_type: "'wecom_chat'"
+  occurred_at: from_timezone(chat_time, 'Asia/Shanghai')
+extensions:
+  x_guide_id: { type: string, expr: guide_id, label: 导购 }
+  x_msg_count: { type: integer, expr: msg_count, label: 消息条数 }

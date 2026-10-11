@@ -1,0 +1,13 @@
+# pos_mysql（MySQL）members → 消费者。member_id 从 1 起，与商城的 user_id 重号（K4：按数据源区分，不冲突）；
+# 手机号形如 +86 139-0000-0001（平台哈希前去掉非数字与 86 前缀），邮箱带首尾空格且大写（哈希前去空格转小写）；时间是北京时间
+model: 1
+entity: customer
+table: members
+fields:
+  customer_id: string(member_id)
+  name: member_name
+  phone: phone
+  email: email
+  city: city
+  registered_at: from_timezone(registered_at, 'Asia/Shanghai')
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')
