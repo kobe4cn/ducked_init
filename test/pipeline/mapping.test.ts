@@ -496,6 +496,45 @@ describe('发布映射并合并到标准层', () => {
     expect(await silver(acme, 'event', 'event_id::INT')).toEqual(before);
   });
 
+  it('增量合并新增了和其他映射冲突的主键：这次合并失败，报错格式与全量时一样，标准层不变', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const fromOrders = await publish(author, reviewer, id, events('orders', 'order_id'));
+    const fromLog = await publish(author, reviewer, id, events('order_log', 'order_no', 'dedupe:\n  key: [event_id]\n'));
+    expect((await getMapping(author, fromLog)).merge.history[0]).not.toHaveProperty('error');
+    const before = await silver(acme, 'event', 'event_id');
+    expect(before).toHaveLength(102);
+
+    // 订单流水新增的 7、8 与 orders 表的 order_id 重叠
+    await grantOnSource(`INSERT INTO shop.order_log VALUES ('7', '已支付', 100, '2024-06-04 10:00'), ('8', '已支付', 100, '2024-06-04 10:00');`);
+    await syncSource(author, id);
+    await drain();
+    const mappings = [fromOrders, fromLog].sort().join('、');
+    expect((await getMapping(author, fromLog)).merge.history[0]).toMatchObject({
+      error: expect.stringContaining(`主键 event_id 跨映射重复：7（映射 ${mappings}）；8（映射 ${mappings}），请在映射里`),
+    });
+    expect(await silver(acme, 'event', 'event_id')).toEqual(before);
+  });
+
+  it('同一个映射内部主键重复（去重键与主键不同）不算跨映射重复，照常合并', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, events('customers', 'customer_id', 'key_space: crm\n'));
+    // 一位消费者有多笔订单：event_id 取 customer_id，按 (event_id, page) 去重后同一个 event_id 有多行
+    const fromOrders = await publish(author, reviewer, id, events('orders', 'customer_id', '  page: string(order_id)\ndedupe:\n  key: [event_id, page]\n'));
+    expect((await getMapping(author, fromOrders)).merge.history[0]).not.toHaveProperty('error');
+    const rows = (await silver(acme, 'event', 'event_id, page')).filter(e => e._mapping === fromOrders);
+    expect(rows).toHaveLength(100);
+    expect(new Set(rows.map(e => e.event_id)).size).toBeLessThan(100);
+  });
+
+  it('映射用去重键、没映射实体主键时照常合并：主键全为空，不算跨映射重复', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, events('orders', 'order_id'));
+    const pages = await publish(author, reviewer, id, 'model: 1\nentity: event\ntable: order_log\nfields:\n  page: order_no\ndedupe:\n  key: [page]\n');
+    expect((await getMapping(author, pages)).merge.history[0]).not.toHaveProperty('error');
+    const rows = (await silver(acme, 'event', 'event_id, page')).filter(e => e._mapping === pages);
+    expect(rows.map(e => [e.event_id, e.page])).toEqual([[null, 'A1'], [null, 'A2']]);
+  });
+
   it('consent 的主键含指向 customer 的 customer_id：两个数据源有相同的 (customer_id, channel) 照常合并，同一数据源的两个映射重复时后合并的失败', async () => {
     const { acme, author, reviewer, id, input } = await syncedSource(CONSENTS_COPY);
     await confirmWatermark(author, id, 'consents_copy', 'update_time');

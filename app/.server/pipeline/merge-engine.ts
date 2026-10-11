@@ -428,6 +428,10 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   await inTransaction(con, async () => {
     await ensureSilverTable(con, plan);
     lap('ensureTable');
+    // 主键有列没映射时（声明了 dedupe.key）本映射的主键在标准层全为空，不会重复
+    const unique = plan.uniqueKey?.every(k => plan.columns.some(c => c.name === k)) && plan.uniqueKey;
+    if (unique) await assertUniqueAcrossMappings(con, silver, plan.mapping, unique, plan.uniqueBySource ? plan.sourceId : undefined);
+    lap('unique');
     if (rebuild) {
       await con.run(`DROP TABLE IF EXISTS ${records}; CREATE TABLE ${records} AS SELECT * FROM ${ROWS}`);
       lap('records');
@@ -444,8 +448,6 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
         ${plan.keySpace ? lit(plan.keySpace) : 'NULL'} AS _key_space
       FROM ${WINNERS} w`);
     lap('deleteInsert');
-    if (plan.uniqueKey) await assertUniqueAcrossMappings(con, silver, plan.mapping, plan.uniqueKey, plan.uniqueBySource);
-    lap('unique');
     await con.run(`INSERT INTO ${MERGES} VALUES (
       ${lit(plan.mapping)}, ${plan.version}, ${lit(input.rebuildTag)}, ${from}, ${to},
       ${stats.inserted}, ${stats.updated}, ${stats.deleted}, TIMESTAMPTZ ${lit(startedAt.toISOString())}, TIMESTAMPTZ ${lit(new Date().toISOString())}, ${SCHEME})`);
@@ -486,15 +488,18 @@ async function filterLive(con: DuckDBConnection, plan: MergeMappingParam) {
 }
 
 /**
- * 本映射刚写入的主键不能和别的映射在标准层的行重复（ADR-0024「独占」）；bySource 时只和同一个数据源的映射比较。主键为空的行不算重复。
+ * 本映射这次要写入的主键（WINNERS）不能和别的映射在标准层的行重复（ADR-0024「独占」）；source 给出时只和同一个数据源的映射比较。主键为空的行不算重复。
+ * 只拿本次写入的键去连接其他映射的行，不对整个实体表分组，耗时随本映射的行数增长；增量时后写进来的冲突键在别的映射合并时已经查过。
+ * 要在本事务改 silver 之前调用：改过之后 DuckLake 的基数估计不准，哈希表会建在 silver 一侧，小映射要全表扫大共享表（见 crmlab-10m-baseline.md #164）。
  * 先到先得，重复时报错让本映射的事务回滚；报错列出最多 5 个冲突的键与所在的映射
  */
-async function assertUniqueAcrossMappings(con: DuckDBConnection, silver: string, mapping: string, key: string[], bySource = false) {
-  const on = bySource ? [...key, '_source'] : key;
+async function assertUniqueAcrossMappings(con: DuckDBConnection, silver: string, mapping: string, key: string[], source?: string) {
   const conflicts = await rows<{ k: string; mappings: string[]; total: string }>(con, `
-    SELECT concat_ws(', ', ${key.map(k => `s.${ident(k)}::VARCHAR`).join(', ')}) AS k, list(DISTINCT s._mapping ORDER BY s._mapping) AS mappings, count(*) OVER () AS total
-    FROM ${silver} s SEMI JOIN (SELECT DISTINCT ${keyList(on)} FROM ${silver} WHERE _mapping = ${lit(mapping)}) m ON ${joinOn(on, 's', 'm')}
-    GROUP BY ${keyList(on, 's')} HAVING count(DISTINCT s._mapping) > 1 ORDER BY k LIMIT 5`);
+    SELECT concat_ws(', ', ${key.map(k => `w.${ident(k)}::VARCHAR`).join(', ')}) AS k,
+      list_sort(list_distinct(list(o._mapping)) || [${lit(mapping)}]) AS mappings, count(*) OVER () AS total
+    FROM (SELECT DISTINCT ${keyList(key)} FROM ${WINNERS}) w
+    JOIN (SELECT ${keyList(key)}, _mapping FROM ${silver} WHERE _mapping <> ${lit(mapping)}${source ? ` AND _source = ${lit(source)}` : ''}) o ON ${joinOn(key, 'w', 'o')}
+    GROUP BY ${keyList(key, 'w')} ORDER BY k LIMIT 5`);
   if (!conflicts.length) return;
   const total = Number(conflicts[0].total);
   throw new Error(`主键 ${key.join('、')} 跨映射重复：${conflicts.map(c => `${c.k}（映射 ${c.mappings.join('、')}）`).join('；')}${total > conflicts.length ? `等，共 ${total} 个` : ''}，`
