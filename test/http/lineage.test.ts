@@ -1,5 +1,5 @@
 // test/http/lineage.test.ts —— 数据地图的 HTTP 接缝：任何成员都能打开 /lineage，关系图下的表与关系列表画出已接入的标准层表与 _identities、_device_owner，
-// 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；_identities 显示匹配规则与最近一次合并的打通摘要（没有合并任务时显示尚未合并）；
+// 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；_identities 显示匹配规则与最近一次打通的摘要（没有合并任务时显示尚未合并）；
 // 内置关系边带最近一次合并后的孤儿比例（样例键只给数据工程师，统计失败标红，没有合并任务时为尚未合并）；
 // 「显示未接入的标准实体」开关（?all=1）灰显未接入的实体；没有已发布映射时显示空状态；流向图（?tab=flow）只对有 sources:read 的成员开放：列表带源表名、版本、行数与合并状态，失败的链到合并记录；
 // 抽屉里的「聚焦此表」进入单表聚焦画布（?tab=flow&focus=），画布下的连线列表从源列连到标准层字段；查看者访问 ?focus= 回到关系图；
@@ -12,7 +12,7 @@ import { and, desc, eq } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, tasks } from '../../app/.server/db/schema';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
-import { lastMergeByMapping, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { lastMergeByMapping, latestIdentitySummary, publishMapping, saveDraft } from '../../app/.server/mappings';
 import type { RelationStat } from '../../app/lib/canonical-model';
 import { memberOf, newTenant, publish } from '../pipeline/fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from '../pipeline/identity-fixtures';
@@ -77,14 +77,13 @@ describe('数据地图', () => {
     expect(await (await viewer.get('/lineage?node=nope')).text()).not.toContain('data-sql');
   });
 
-  it('_identities 显示匹配规则与最近一次合并的打通摘要；打开「显示未接入的标准实体」后灰显它们；没有合并任务时显示尚未合并', async () => {
+  it('_identities 显示匹配规则与最近一次打通的摘要（跳过打通的合并不算）；打开「显示未接入的标准实体」后灰显它们；没有合并任务时显示尚未合并', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     const viewer = await loginAs(app, 'viewer@acme.com');
 
-    const [merge] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')))
-      .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
-    const { groups, records } = (merge.result as { identities: { groups: number; records: number } }).identities;
+    // 最后一次合并只带订单映射、跳过了打通：摘要取的是之前真正打通的那次
+    const { groups, records } = (await latestIdentitySummary(acme))!;
     expect(groups).toBeGreaterThan(0);
 
     const html = decode(await (await viewer.get('/lineage')).text());

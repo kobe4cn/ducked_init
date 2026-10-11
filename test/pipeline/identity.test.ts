@@ -1,11 +1,13 @@
-// 身份打通的流水线接缝：CRM、会员、埋点三个数据源同步进原始层 → 发布映射 → 调度器派发合并（合并后整表重算打通）→
-// silver._identities 里每条 (_source, customer_id) 对应一个统一消费者，silver._device_owner 里每台登录过的设备归属到
-// 最近一次登录的统一消费者，任务结果带打通摘要，表里没有明文
+// 身份打通的流水线接缝：CRM、会员、埋点三个数据源同步进原始层 → 发布映射 → 调度器派发合并（改到 customer 或 event、
+// 打通结果表不在或入队时要求强制时整表重算打通，否则跳过）→ silver._identities 里每条 (_source, customer_id) 对应一个统一消费者，
+// silver._device_owner 里每台登录过的设备归属到最近一次登录的统一消费者，任务结果带打通摘要，表里没有明文
+import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CurrentMember } from '../../app/.server/auth';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { latestIdentitySummary, listMappings, mergeMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { syncSource } from '../../app/.server/source-sync';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -58,6 +60,13 @@ const groupsOf = (rows: Identity[], names: Record<string, string>) => {
   for (const r of rows) groups.set(r.consumer_id, [...(groups.get(r.consumer_id) ?? []), `${names[r._source]}:${r.customer_id}`]);
   return [...groups.values()].map(g => g.sort()).sort((a, b) => a[0].localeCompare(b[0]));
 };
+
+/** 本租户最近一次合并任务（按创建时间） */
+async function lastMerge(tenantId: string) {
+  const [merge] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'silver.merge')))
+    .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
+  return merge as typeof merge & { result: { identities?: Record<string, unknown> } };
+}
 
 /** 给映射存一版新草稿并由另一位成员发布，跑空调度器（合并与打通完成） */
 async function republish(author: CurrentMember, reviewer: CurrentMember, mappingId: string, yaml: string) {
@@ -120,6 +129,69 @@ describe('身份打通：多源消费者确定性合并', () => {
     const after = await identities(acme);
     expect(after.rows).toEqual(before.rows);
     expect(after.devices).toEqual(before.devices);
+  });
+});
+
+describe('身份打通：只在改到 customer 或 event 时重算', () => {
+  it('没有变化的合并跳过打通并写明原因：打通表不动，数据地图的摘要仍是上次真正打通的那次', async () => {
+    const { acme, author } = await publishedIdentitySources();
+    const before = await identities(acme);
+    const summary = await latestIdentitySummary(acme);
+    await mergeNow(author);
+    await drain();
+    const merge = await lastMerge(acme);
+    expect(merge.status).toBe('succeeded');
+    expect(merge.result.identities).toEqual({ durationMs: 0, skipped: expect.stringMatching(/沿用上次/) });
+    expect((await identities(acme)).text).toBe(before.text);
+    expect(await latestIdentitySummary(acme)).toEqual(summary);
+    expect(summary).toMatchObject({ groups: 8, records: 16, devices: 2 });
+  });
+
+  it('只合并订单映射时跳过打通', async () => {
+    const { acme, author } = await publishedIdentitySources({ orders: true });
+    // 发布订单映射后的首次合并（重建、有插入）只带订单映射
+    expect((await lastMerge(acme)).result.identities).toMatchObject({ skipped: expect.any(String) });
+    const order = (await listMappings(author)).mappings.find(m => m.entity === 'order')!;
+    await mergeMapping(author, order.id);
+    await drain();
+    expect((await lastMerge(acme)).result.identities).toMatchObject({ skipped: expect.any(String) });
+  });
+
+  it('上次打通失败时，没有数据变化也强制重算', async () => {
+    const { acme, author } = await publishedIdentitySources();
+    const last = await lastMerge(acme);
+    await getDb().update(tasks).set({ result: { ...last.result, identities: { durationMs: 1, error: '模拟失败' } } }).where(eq(tasks.id, last.id));
+    await mergeNow(author);
+    await drain();
+    const merge = await lastMerge(acme);
+    expect(merge.params.identityForce).toBe(true);
+    expect(merge.result.identities).toMatchObject({ groups: 8, records: 16, devices: 2 });
+  });
+
+  it('上次合并没写结果就结束（崩溃、超时）时，没有数据变化也强制重算', async () => {
+    const { acme, author } = await publishedIdentitySources();
+    const last = await lastMerge(acme);
+    await getDb().update(tasks).set({ status: 'failed', result: null }).where(eq(tasks.id, last.id));
+    await mergeNow(author);
+    await drain();
+    const merge = await lastMerge(acme);
+    expect(merge.params.identityForce).toBe(true);
+    expect(merge.result.identities).toMatchObject({ groups: 8, records: 16, devices: 2 });
+  });
+
+  it('打通结果表不存在时重算', async () => {
+    const { acme, author } = await publishedIdentitySources();
+    const before = await identities(acme);
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      await session.con.run('DROP TABLE silver._device_owner');
+    } finally {
+      session.close();
+    }
+    await mergeNow(author);
+    await drain();
+    expect((await lastMerge(acme)).result.identities).toMatchObject({ groups: 8, devices: 2 });
+    expect((await identities(acme)).devices).toEqual(before.devices);
   });
 });
 

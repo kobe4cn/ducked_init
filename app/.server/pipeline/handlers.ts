@@ -95,6 +95,16 @@ function identityMatch(params: Params) {
   return rules;
 }
 
+/**
+ * 合并参数里是否强制重算身份打通（入队时发现匹配规则变了或上次打通失败，工作进程不读平台库判断不出来）；
+ * 早先入队的合并没有这一项，按不强制处理
+ */
+function identityForce(params: Params) {
+  const force = params.identityForce;
+  if (force !== undefined && typeof force !== 'boolean') throw new Error('参数 identityForce 必须是布尔值');
+  return force ?? false;
+}
+
 /** 合并参数里要统计孤儿的已发布关系（入队时带上全部关系与起点是否敏感）；早先入队的合并没有这一项，不统计 */
 function mergeRelations(params: Params): RelationParam[] {
   const { relations } = params;
@@ -237,14 +247,15 @@ export const HANDLERS = {
     readOnlyLake: true,
     run: (con, params) => runKeyCheck(con, { entities: keyCheckTargets(params) }),
   },
-  // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务，之后按参数里的匹配规则重算身份打通。
+  // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务，之后按参数里的匹配规则重算身份打通
+  // （没改到 customer / event、结果表都在且参数没要求强制时跳过打通，结果里写明原因）。
   // 有映射或打通失败时任务记为失败，结果里保留各映射的合并结果、打通摘要（组数、记录数与已归属设备数，不带哈希）与错误；
   // 源表还没同步进原始层的映射跳过，不算失败。结果另带各关系的孤儿统计，统计出错不算失败
   'silver.merge': {
     label: '合并到标准层',
     async run(_con, params, { session, piiSalt, redact }) {
       if (!piiSalt) throw new Error('缺少敏感信息盐');
-      const result = await mergeToSilver(session, mergeMappings(params), piiSalt, redact, identityMatch(params), mergeRelations(params));
+      const result = await mergeToSilver(session, mergeMappings(params), piiSalt, redact, identityMatch(params), mergeRelations(params), identityForce(params));
       const failed = result.mappings.filter(m => 'error' in m);
       const problems = [
         ...(failed.length ? [`${failed.length} 个映射合并失败：${failed.map(m => `${m.entity} ← ${m.table}（${'error' in m ? m.error : ''}）`).join('；')}`] : []),
