@@ -1,8 +1,10 @@
 // app/.server/mappings.ts —— 映射：数据工程师用 YAML 编写“源表（或已发布的源视图，ADR-0023）→ 标准实体”的映射，校验通过才能保存为草稿；草稿由最后保存它的人以外的
 // 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后为这个映射入队合并任务（silver.merge），同步给已发布映射的源表写入变更后也为这些映射再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
+// 源表新增的列可一键加为扩展字段，写进草稿（或最新已发布版本）的 YAML 填进编辑框，不保存。
 // 编辑时可对任一版本空跑：在请求内只读挂载本租户的数据湖，转换原始层的样本，返回样例行与基础断言，不写标准层（pipeline/dry-run-engine.ts）。
 // 一律限定在操作者所属租户内；合并本身在工作进程里进行（pipeline/merge-engine.ts）
 import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
+import { parseDocument } from 'yaml';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
@@ -26,6 +28,7 @@ import { insertTask } from './tasks';
 import { CANONICAL_ENTITIES, type CustomEntityField, entityLabel, entityOf, type EntityRelation, type RelationStat, relationText } from '../lib/canonical-model';
 import { entityForTable } from '../lib/field-synonyms';
 import { diffPlans } from '../lib/mapping-diff';
+import { newExtension, readExtensions, writeExtension } from '../lib/mapping-form';
 
 /** 可以展示给成员的业务错误；issues 是映射文档里带行列位置的问题 */
 export class MappingError extends Error {
@@ -175,6 +178,40 @@ export async function draftForMapping(actor: CurrentMember, mappingId: string) {
   const mapping = await requireMapping(actor.tenant.id, mappingId);
   if (mapping.sourceViewId) throw new MappingError('按规则生成草稿要用源表的列统计，读源视图的映射请直接编辑');
   return draftFor(actor, mapping.sourceId, mapping.tableName, mapping.entity);
+}
+
+/**
+ * 把源表新增、映射还没用到的列（mappingDrift 的新列）按表单勾选源列的规则加为扩展字段（名字 x_<列名>，类型按列推断，像敏感信息的标成敏感），
+ * 写进草稿（没有草稿时是最新已发布版本）的 YAML，返回文本。不保存，保存仍走校验与双人发布（ADR-0015）
+ */
+export async function yamlWithColumns(actor: CurrentMember, mappingId: string, columns: string[]) {
+  assertCan(actor, 'sources:write');
+  const mapping = await requireMapping(actor.tenant.id, mappingId);
+  if (!columns.length) throw new MappingError('请选择要加为扩展字段的列');
+  const fresh = new Set((await mappingDrift(actor.tenant.id, [mappingId])).get(mappingId)?.newColumns.map(c => c.name));
+  const stale = columns.find(c => !fresh.has(c));
+  if (stale !== undefined) throw new MappingError(`${stale} 不是源表新增、映射还没用到的列`);
+  const profiled = (await profiledTables(actor.tenant.id, mapping.sourceId))(mapping.tableName);
+  if (typeof profiled === 'string') throw new MappingError(profiled);
+  const versions = await getDb().select({ status: mappingVersions.status, yaml: mappingVersions.yaml }).from(mappingVersions)
+    .where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version));
+  const base = versions.find(v => v.status === 'draft') ?? versions.find(v => v.status === 'published');
+  if (!base) throw new MappingError('映射还没有版本');
+  const doc = parseDocument(base.yaml);
+  const { extensions, reason } = readExtensions(doc);
+  if (reason) throw new MappingError(reason);
+  const taken = extensions.map(e => e.name);
+  try {
+    for (const column of new Set(columns)) {
+      const choice = newExtension(profiled.table, column, taken);
+      writeExtension(doc, choice.name, choice);
+      taken.push(choice.name);
+    }
+  } catch (e) {
+    // 已有的扩展字段是表单不认识的写法等
+    throw new MappingError(e instanceof Error ? e.message : String(e));
+  }
+  return doc.toString();
 }
 
 /**

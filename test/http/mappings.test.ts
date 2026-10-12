@@ -1,5 +1,5 @@
 // 标准模型与映射的 HTTP 接缝：任何成员都能浏览标准模型；数据工程师在界面上编写映射（不合格的 YAML 被拒绝并给出位置），
-// 新建页默认是按规则生成的草稿（源没有已采集的表时是模板），也能按所选的表与实体重新生成填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
+// 新建页默认是按规则生成的草稿（源没有已采集的表时是模板），也能按所选的表与实体重新生成填进编辑框（不保存），详情页能把源表新增的列一键生成为扩展字段填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
 // 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射（含勾选源列加的扩展字段、映射与引用字段的键空间）照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { parseDocument } from 'yaml';
@@ -627,6 +627,50 @@ describe('按规则生成映射草稿', () => {
     await memberOf(tenantId, 'analyst@acme.com', 'analyst');
     const analyst = await loginAs(app, 'analyst@acme.com');
     expect((await analyst.post('/mappings', { intent: 'draft', sourceId, table: 'orders', entity: 'order' })).status).toBe(403);
+  });
+
+  it('详情页把源表新增的列一键生成为扩展字段填进编辑框（像敏感信息的标成敏感），不保存；保存后不再提醒；不是新列时说明原因，分析师 403', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const author = await memberOf(tenantId, 'de@acme.com');
+    const id = await publish(author, await memberOf(tenantId, 'de2@acme.com'), sourceId, CUSTOMERS);
+    await grantOnSource('ALTER TABLE shop.customers ADD COLUMN level text; ALTER TABLE shop.customers ADD COLUMN backup_mobile text;');
+    await relistSource(author, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const engineer = await loginAs(app, 'de@acme.com');
+    const before = await (await engineer.get(`/mappings/${id}`)).text();
+    expect(before).toContain('data-add-columns="level,backup_mobile"');
+    expect(before).toContain('data-add-column="level"');
+
+    const generated = await engineer.post(`/mappings/${id}`, { intent: 'add-columns', column: ['level', 'backup_mobile'] });
+    expect(generated.status).toBe(200);
+    const yaml = editorYaml(await generated.text());
+    expect(yaml).toContain(CUSTOMERS.trim());
+    expect(yaml).toContain('x_level: { type: string, expr: level }');
+    expect(yaml).toContain('x_backup_mobile: { type: string, expr: backup_mobile, sensitive: true }');
+    // 只生成，不保存：仍只有已发布的 v1
+    const versions = await (await engineer.get(`/mappings/${id}?tab=versions`)).text();
+    expect(versions).not.toContain('data-version-status="draft"');
+    expect(versions).not.toContain('data-version="2"');
+
+    // 先只加 level 并保存：level 不再提醒
+    const onlyLevel = editorYaml(await (await engineer.post(`/mappings/${id}`, { intent: 'add-columns', column: 'level' })).text());
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: onlyLevel })).status).toBe(302);
+    expect(await (await engineer.get(`/mappings/${id}`)).text()).toContain('data-drift-new="backup_mobile"');
+    // 有草稿时基于草稿：带着已加的 x_level
+    const fromDraft = editorYaml(await (await engineer.post(`/mappings/${id}`, { intent: 'add-columns', column: 'backup_mobile' })).text());
+    expect(fromDraft).toBe(yaml);
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: fromDraft })).status).toBe(302);
+    const after = await (await engineer.get(`/mappings/${id}`)).text();
+    expect(after).not.toContain('data-drift-new');
+    // 已用上的列不再是新列
+    const again = await engineer.post(`/mappings/${id}`, { intent: 'add-columns', column: 'level' });
+    expect(again.status).toBe(400);
+    expect(await again.text()).toContain('level 不是源表新增、映射还没用到的列');
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'add-columns', column: 'email' })).status).toBe(400);
+
+    await memberOf(tenantId, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    expect((await analyst.post(`/mappings/${id}`, { intent: 'add-columns', column: 'level' })).status).toBe(403);
   });
 });
 
