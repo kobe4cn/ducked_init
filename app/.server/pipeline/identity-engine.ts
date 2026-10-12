@@ -42,7 +42,10 @@ export const consumerSensitive = <P extends { entity: string; columns: { name: s
 /** 登录事件的事件类型，先写死，还不能配置 */
 export const LOGIN_EVENT = 'login';
 
-/** 一次打通的摘要：统一消费者（组）数、参与打通的源记录数、已归属的设备数，以及本次记下的 ID 合并与拆开数 */
+/**
+ * 一次打通的摘要：统一消费者（组）数、参与打通的源记录数、已归属的设备数；merged 是本次由多个旧 ID 合并成的组数（三合一算 1），
+ * split 是本次被拆开的旧 ID 数（一拆三算 1），都按组计，不是变更表的条数
+ */
 export interface IdentitySummary { groups: number; records: number; devices: number; merged: number; split: number }
 
 export const IDENTITIES = 'silver._identities';
@@ -198,7 +201,8 @@ export async function resolveIdentities(
     }
     const [summary] = await rows<{ groups: string; records: string; devices: string; merged: string; split: string }>(con, `
       SELECT count(DISTINCT consumer_id) AS groups, count(*) AS records, (SELECT count(*) FROM ${DEVICE_OWNER}) AS devices,
-        (SELECT count(*) FROM ${CHANGES} WHERE reason = 'merge') AS merged, (SELECT count(*) FROM ${CHANGES} WHERE reason = 'split') AS split
+        (SELECT count(DISTINCT new_id) FROM ${CHANGES} WHERE reason = 'merge') AS merged,
+        (SELECT count(DISTINCT old_id) FROM ${CHANGES} WHERE reason = 'split') AS split
       FROM ${IDENTITIES}`);
     return {
       groups: Number(summary.groups), records: Number(summary.records), devices: Number(summary.devices),

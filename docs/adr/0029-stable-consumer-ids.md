@@ -19,7 +19,7 @@ ADR-0019 补充（#76）里，统一消费者 ID 是组内最小源记录 `(_sou
 
 **老湖播种。** 有 `_identities`、没有分配表时，先用 `_identities` 里现有的 ID 播种（`assigned_at` 取当前时间），原 ID 全部保留，不记变更。
 
-摘要 `IdentitySummary` 加上本次记下的 `merged`、`split` 条数，随合并任务结果保存。
+摘要 `IdentitySummary` 加上本次的 `merged`、`split`，随合并任务结果保存。两者按组计、不是变更表的条数：`merged` 是由多个旧 ID 合并成的新组数（三合一记 2 条 `merge`，算 1），`split` 是被拆开的旧 ID 数（一拆三记 2 条 `split`，算 1），数据地图据此显示「合并 N 组、拆开 M 组」。
 
 ## 已接受的取舍
 

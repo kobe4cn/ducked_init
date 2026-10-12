@@ -538,6 +538,26 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     expect(await idChanges(acme, tables)).toEqual({ changes: [], retired: [] });
   });
 
+  it('摘要的 merged、split 按组计：三个旧 ID 合成一组算 1、一个旧 ID 拆成三组算 1，变更表仍是每个 ID 一条', async () => {
+    const { acme } = await publishedIdentitySources();
+    const tables = await idTables(acme);
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      // 让一个三条记录的组原来分属三个 ID，再让另外三个组原来共用一个 ID
+      await session.con.run(`
+        UPDATE silver._identities SET consumer_id = 'm-' || _source || '-' || customer_id
+        WHERE consumer_id = (SELECT consumer_id FROM silver._identities GROUP BY 1 HAVING count(*) = 3 ORDER BY 1 LIMIT 1);
+        UPDATE silver._identities SET consumer_id = 'x'
+        WHERE consumer_id IN (SELECT DISTINCT consumer_id FROM silver._identities WHERE consumer_id NOT LIKE 'm-%' ORDER BY 1 LIMIT 3)`);
+      expect(await resolveIdentities(session.con)).toMatchObject({ groups: 8, merged: 1, split: 1 });
+    } finally {
+      session.close();
+    }
+    const { changes } = await idChanges(acme, tables);
+    expect(changes.filter(c => c.reason === 'merge')).toHaveLength(2);
+    expect(changes.filter(c => c.reason === 'split').map(c => c.old_id)).toEqual(['x', 'x']);
+  });
+
   it('新组的哈希撞上分配过的 ID（包括已退役的）时加盐重算，直到不撞', async () => {
     const { acme } = await publishedIdentitySources();
     const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
