@@ -22,7 +22,7 @@ import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
 import { checkMetric, type DslCheck, type DslContext, type DslIssue, type MetricSpec } from './pipeline/dsl/metric-spec';
 import { withMetric } from './pipeline/dsl/tag-spec';
-import { IDENTITIES } from './pipeline/identity-engine';
+import { DEVICE_OWNER, IDENTITIES } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { lit, rows } from './pipeline/merge-engine';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
@@ -341,10 +341,11 @@ const PREVIEW_ROWS = 50;
 const PREVIEW_LIMITS = { memoryLimitMb: 512, threads: 1 };
 
 /**
- * 在只读挂载的数据湖上运行 run：先确认标准层已有 entities 与身份打通结果，没有时抛出说明（what 是操作名，如「预览」）；
+ * 在只读挂载的数据湖上运行 run：先确认标准层已有 entities 与身份打通结果（sqls 里有用到设备归属的还要有 _device_owner），
+ * 没有时抛出说明（what 是操作名，如「预览」）；
  * 查询出错时报错里抹掉湖的凭据。只读：不建表、不入队任务、不登记快照
  */
-async function onReadOnlyLake<T>(tenantId: string, entities: string[], what: string, run: (con: DuckDBConnection) => Promise<T>): Promise<T> {
+async function onReadOnlyLake<T>(tenantId: string, entities: string[], sqls: string[], what: string, run: (con: DuckDBConnection) => Promise<T>): Promise<T> {
   const lake = await lakeRow(tenantId);
   if (!lake || !lakeReady(lake)) throw new DslError('本租户的数据湖还没有初始化');
   const spec = lakeSpecOf(lake);
@@ -352,12 +353,15 @@ async function onReadOnlyLake<T>(tenantId: string, entities: string[], what: str
   try {
     const present = new Set((await rows<{ name: string }>(session.con, `
       SELECT table_name AS name FROM information_schema.tables
-      WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities'].map(lit).join(', ')})`)).map(t => t.name));
+      WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities', '_device_owner'].map(lit).join(', ')})`)).map(t => t.name));
     const missing = entities.filter(entity => !present.has(entity));
     if (missing.length) {
       throw new DslError(`标准层还没有 ${missing.map(entity => `silver.${entity}`).join('、')}：先发布 ${missing.join('、')} 的映射并合并，再${what}`);
     }
     if (!present.has('_identities')) throw new DslError(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并，再${what}`);
+    if (sqls.some(sql => sql.includes(DEVICE_OWNER)) && !present.has('_device_owner')) {
+      throw new DslError(`标准层还没有设备归属结果（${DEVICE_OWNER}）：重新合并一次映射，再${what}`);
+    }
     return await run(session.con);
   } catch (e) {
     if (e instanceof DslError) throw e;
@@ -385,7 +389,7 @@ export async function previewDefinition(actor: CurrentMember, kind: string, key:
   if (!checked.ok) throw new DslError('对照当前已发布的登记与映射，这一版不再通过校验，不能预览', 400, checked.issues);
   const asOf = todayUtc();
   const sql = DSL_KINDS[kind].compile(checked.spec, ctx, asOf, key);
-  return onReadOnlyLake(actor.tenant.id, DSL_KINDS[kind].entities(checked.spec, ctx), '预览', async con => {
+  return onReadOnlyLake(actor.tenant.id, DSL_KINDS[kind].entities(checked.spec, ctx), [sql], '预览', async con => {
     const reader = await con.runAndReadAll(
       `SELECT *, count(*) OVER () AS _preview_total FROM (${sql}) ORDER BY ALL LIMIT ${PREVIEW_ROWS}`);
     const columns = reader.columnNames().filter(c => c !== '_preview_total');
@@ -462,7 +466,7 @@ export async function impactOf(actor: CurrentMember, kind: string, key: string) 
     }
   }
 
-  return onReadOnlyLake(actor.tenant.id, [...entities], '预览影响', async con => {
+  return onReadOnlyLake(actor.tenant.id, [...entities], [before.sql, after.sql, ...tags.flatMap(t => ('issue' in t ? [] : [t.before, t.after]))], '预览影响', async con => {
     const impacts: TagImpact[] = [];
     for (const tag of tags) {
       if ('issue' in tag) {

@@ -9,7 +9,7 @@ import { inspectLake, type InspectParams } from './inspect-engine';
 import { runKeyCheck, type KeyCheckParams } from './key-check-engine';
 import { lit, mergeToSilver, type MergeMappingParam, type RelationParam } from './merge-engine';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
-import { IDENTITIES } from './identity-engine';
+import { DEVICE_OWNER, IDENTITIES } from './identity-engine';
 import { TEMPLATES } from './templates';
 import { compileRfmUnlinked } from './templates/rfm';
 import { assertOrThrow, runAssertions } from './assertions';
@@ -290,7 +290,7 @@ export const HANDLERS = {
     },
   },
   // 指标或标签（ADR-0025）：发布定义时入队，参数里带上入队时按当天编译好的 SQL 与它用到的实体（不再访问平台库）。
-  // 标准层有这些实体与身份打通结果时，把 SQL 的结果写进结果层的一张快照表 gold."<种类>__<任务 ID>"，只有 consumer_id、维度与值。
+  // 标准层有这些实体与身份打通结果（SQL 用到设备归属时还要有 _device_owner）时，把 SQL 的结果写进结果层的一张快照表 gold."<种类>__<任务 ID>"，只有 consumer_id、维度与值。
   // 断言同 gold.rfm
   'gold.dsl': {
     label: '指标与标签',
@@ -301,10 +301,11 @@ export const HANDLERS = {
       if (!isStrings(entities)) throw new Error('参数 entities 必须是非空的实体名列表');
       const present = new Set((await rows<{ name: string }>(con, `
         SELECT table_name AS name FROM information_schema.tables
-        WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities'].map(lit).join(', ')})`)).map(t => t.name));
+        WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities', '_device_owner'].map(lit).join(', ')})`)).map(t => t.name));
       const missing = entities.filter(entity => !present.has(entity));
       if (missing.length) throw new Error(`标准层还没有 ${missing.map(entity => `silver.${entity}`).join('、')}：先发布 ${missing.join('、')} 的映射并合并`);
       if (!present.has('_identities')) throw new Error(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`);
+      if (sql.includes(DEVICE_OWNER) && !present.has('_device_owner')) throw new Error(`标准层还没有设备归属结果（${DEVICE_OWNER}）：重新合并一次映射`);
       const assertions = await runAssertions(con, entities, taskId);
       assertOrThrow(assertions);
       const name = `${kind}__${taskId}`;

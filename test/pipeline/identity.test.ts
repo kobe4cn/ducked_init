@@ -10,10 +10,11 @@ import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { latestIdentitySummary, listMappings, mergeMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { syncSource } from '../../app/.server/source-sync';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { checkMetric, compileMetric, type DslContext } from '../../app/.server/pipeline/dsl/metric-spec';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { silver } from './fixtures';
+import { runTask, silver } from './fixtures';
 import { CRM, LOYALTY, publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 
@@ -119,6 +120,37 @@ describe('身份打通：多源消费者确定性合并', () => {
       { event_id: 'e7', consumer_id: [u1, u9].sort()[0] },
       { event_id: 'e8', consumer_id: null },
     ]);
+  });
+
+  it('event 指标的快照里匿名事件经设备归属计入设备主人；没有 _device_owner 的老湖给出提示', async () => {
+    const { acme, names } = await publishedIdentitySources();
+    const { rows } = await identities(acme);
+    const consumerOf = (who: string) => rows.find(r => `${names[r._source]}:${r.customer_id}` === who)!.consumer_id;
+    const [u1, u2, u9] = ['tracking:u1', 'tracking:u2', 'tracking:u9'].map(consumerOf);
+    const ctx: DslContext = { published: new Map(), plans: [], metrics: new Map() };
+    const checked = checkMetric('base: event\nmeasure: { agg: count }\nfilter:\n  - { field: event_type, op: ne, value: login }\n', ctx);
+    if (!checked.ok) throw new Error(JSON.stringify(checked.issues));
+    const params = { kind: 'metric', key: 'views', asOf: '2024-07-01', sql: compileMetric(checked.spec, ctx, '2024-07-01'), entities: ['event'] };
+
+    // d1 的 e2、e4 归 u2；d2 的 e7 归 u1、u9 中较小的；d3 的 e8 不计入；e9 是 u1 登录状态下的浏览
+    const task = await runTask(acme, 'gold.dsl', params);
+    expect(task.status).toBe('succeeded');
+    const table = `gold."${(task.result as { table: string }).table.slice('gold.'.length)}"`;
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      const snapshot = (await session.con.runAndReadAll(`SELECT consumer_id, value::INTEGER AS value FROM ${table} ORDER BY consumer_id`)).getRowObjectsJson();
+      const d2 = [u1, u9].sort()[0];
+      const expected = new Map<string, number>([[u2, 2], [u1, 1]]);
+      expected.set(d2, (expected.get(d2) ?? 0) + 1);
+      expect(snapshot).toEqual([...expected].sort(([a], [b]) => a.localeCompare(b)).map(([consumer_id, value]) => ({ consumer_id, value })));
+      await session.con.run('DROP TABLE silver._device_owner');
+    } finally {
+      session.close();
+    }
+
+    const failed = await runTask(acme, 'gold.dsl', params);
+    expect(failed.status).toBe('failed');
+    expect(failed.error).toContain('silver._device_owner');
   });
 
   it('同样的输入再合并一次，打通表与设备归属表的内容完全一致', async () => {

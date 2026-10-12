@@ -107,6 +107,14 @@ describe('指标 DSL：校验', () => {
     expect(found.map(i => i.line)).toEqual([2, 3]);
     expect(found[0]!.col).toBeGreaterThan(1);
   });
+
+  it('device_attribution 只有 base 为 event 时能写', () => {
+    expect(ok('base: event\nmeasure: { agg: count }\ndevice_attribution: false\n').device_attribution).toBe(false);
+    expect(issues('base: order\nmeasure: { agg: count }\ndevice_attribution: true\n')).toEqual([
+      expect.objectContaining({ line: 3, path: 'device_attribution', message: expect.stringMatching(/只有基础实体为 event/) }),
+    ]);
+    expect(issues('base: event\nmeasure: { agg: count }\ndevice_attribution: yes please\n')[0]).toMatchObject({ line: 3 });
+  });
 });
 
 describe('指标 DSL：编译', () => {
@@ -135,6 +143,20 @@ describe('指标 DSL：编译', () => {
     expect(dim('order.customer_id -> customer.city')).toContain('d0_1._source = b._source');
     expect(dim('order.store_id -> custom_store.name')).not.toContain('d0_1._source');
   });
+
+  it('event 指标缺省经 silver._device_owner 归属匿名事件；device_attribution: false 时与原来逐字节一致', () => {
+    const sql = (extra = '') => compileMetric(ok(`base: event\nmeasure: { agg: count }\n${extra}`), ctx, '2024-07-01');
+    expect(sql()).toContain('silver._device_owner');
+    expect(sql('device_attribution: true\n')).toBe(sql());
+    expect(sql('device_attribution: false\n')).toBe([
+      'SELECT i.consumer_id, COUNT(*) AS value',
+      'FROM silver."event" b',
+      'INNER JOIN silver._identities i ON i._source = b._source AND i.customer_id = b.customer_id',
+      'GROUP BY ALL',
+      'ORDER BY ALL',
+    ].join('\n'));
+    expect(compileMetric(ok('base: order\nmeasure: { agg: count }\n'), ctx, '2024-07-01')).not.toContain('_device_owner');
+  });
 });
 
 describe('指标 DSL：编译出的 SQL 的结果', () => {
@@ -142,7 +164,8 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
   let con: DuckDBConnection;
 
   // 消费者 c1（两个源）、c2；o5 的门店不在门店表里、o6 没有门店、o7 的门店没有区域，都记为「未关联」；o8 打通不到消费者，不计入；
-  // o9 在窗口外，o10 状态不计入
+  // o9 在窗口外，o10 状态不计入。
+  // 事件：设备 d1 先后被 c1、c2 登录，归 c2；d2 归 c1；d3 从未登录过；e6 的 customer_id 打通不到，不按设备 d2 归属
   beforeAll(async () => {
     instance = await DuckDBInstance.create(':memory:');
     con = await instance.connect();
@@ -167,7 +190,18 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
       CREATE TABLE silver.custom_store (store_id VARCHAR, region_id VARCHAR, name VARCHAR, parent_id VARCHAR);
       INSERT INTO silver.custom_store VALUES ('st1', 'r1', '一店', NULL), ('st2', 'r2', '二店', NULL), ('st3', 'r1', '三店', NULL), ('st4', NULL, '四店', NULL);
       CREATE TABLE silver.custom_region (region_id VARCHAR, name VARCHAR, manager_phone VARCHAR, country_id VARCHAR);
-      INSERT INTO silver.custom_region VALUES ('r1', '华东', NULL, NULL), ('r2', '华北', NULL, NULL);`);
+      INSERT INTO silver.custom_region VALUES ('r1', '华东', NULL, NULL), ('r2', '华北', NULL, NULL);
+      CREATE TABLE silver._device_owner (device_id VARCHAR, consumer_id VARCHAR, login_at TIMESTAMPTZ);
+      INSERT INTO silver._device_owner VALUES ('d1', 'c2', '2024-06-20 10:00:00+00'), ('d2', 'c1', '2024-06-10 10:00:00+00');
+      CREATE TABLE silver.event (event_id VARCHAR, customer_id VARCHAR, device_id VARCHAR, event_type VARCHAR, occurred_at TIMESTAMPTZ, page VARCHAR, _source VARCHAR);
+      INSERT INTO silver.event VALUES
+        ('e1', '1', 'd1', 'login', '2024-06-10 10:00:00+00', NULL, 's1'),
+        ('e2', NULL, 'd1', 'view', '2024-06-15 10:00:00+00', NULL, 's1'),
+        ('e3', NULL, 'd1', 'view', '2024-06-21 10:00:00+00', NULL, 's1'),
+        ('e4', '2', 'd1', 'login', '2024-06-20 10:00:00+00', NULL, 's1'),
+        ('e5', NULL, 'd3', 'view', '2024-06-15 10:00:00+00', NULL, 's1'),
+        ('e6', 'x', 'd2', 'view', '2024-06-15 10:00:00+00', NULL, 's2'),
+        ('e7', NULL, 'd2', 'view', '2024-06-15 10:00:00+00', NULL, 's1');`);
   });
 
   afterAll(() => {
@@ -202,6 +236,25 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
     expect(await run('base: customer\nmeasure: { agg: count }\n')).toEqual([
       { consumer_id: 'c1', value: 2 },
       { consumer_id: 'c2', value: 1 },
+    ]);
+  });
+
+  it('event 指标的匿名事件经设备归属计入设备主人（共享设备归最近一次登录者），从未登录过的设备与打通不到的 customer_id 不计入', async () => {
+    expect(await run('base: event\nmeasure: { agg: count }\n')).toEqual([
+      { consumer_id: 'c1', value: 2 },
+      { consumer_id: 'c2', value: 3 },
+    ]);
+    expect(await run('base: event\nmeasure: { agg: count }\ndevice_attribution: false\n')).toEqual([
+      { consumer_id: 'c1', value: 1 },
+      { consumer_id: 'c2', value: 1 },
+    ]);
+  });
+
+  it('维度路径 event.customer_id -> customer 这一跳，匿名事件仍记「未关联」', async () => {
+    expect(await run('base: event\nmeasure: { agg: count }\ndimensions:\n  - { name: city, path: event.customer_id -> customer.city }\n')).toEqual([
+      { consumer_id: 'c1', city: '上海', value: 1 },
+      { consumer_id: 'c1', city: '未关联', value: 1 },
+      { consumer_id: 'c2', city: '未关联', value: 3 },
     ]);
   });
 });

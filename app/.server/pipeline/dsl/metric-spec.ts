@@ -2,13 +2,14 @@
 // 先按 JSON Schema（METRIC_SCHEMA）校验结构，再对照标准模型、已发布的自定义实体登记与已发布映射的扩展字段做语义校验：
 // 基础实体要能关联到消费者（customer 本身，或有指向 customer 的 customer_id），字段要存在、类型合用、不能是敏感字段；
 // 维度路径沿关系走到头：每一跳都是指向下一实体单列主键的关系，最多 3 跳，不能成环。每个问题都带 YAML 里的行列位置。
-// 校验通过后编译成 SQL：基础实体经 silver._identities 关联到 consumer_id，维度路径编译成链式 LEFT JOIN，关联不到或为空记「未关联」。
+// 校验通过后编译成 SQL：基础实体经 silver._identities 关联到 consumer_id（event 的匿名事件缺省再经 silver._device_owner 按设备归属，ADR-0019），
+// 维度路径编译成链式 LEFT JOIN，关联不到或为空记「未关联」。
 // 这里也放各种定义共用的部分：租户上下文 DslContext、问题 DslIssue 与校验结果 DslCheck、YAML 与 JSON Schema 的第一步 parseDsl。
 // 纯函数：不碰平台库与数据湖，同样的定义与 asOf 编译出同样的 SQL
 import { Ajv, type ValidateFunction } from 'ajv';
 import { LineCounter, parseDocument } from 'yaml';
 import { CANONICAL_ENTITIES, entityOf, isCustomEntity, type EntityRelation, type FieldType } from '../../../lib/canonical-model';
-import { IDENTITIES } from '../identity-engine';
+import { DEVICE_OWNER, IDENTITIES } from '../identity-engine';
 import { describeSchemaError, locator, type Path, type RegisteredEntities } from '../mapping-spec';
 import { ident, lit, silverTable, type MergeMappingParam } from '../merge-engine';
 
@@ -26,6 +27,8 @@ export interface MetricSpec {
   window?: { field: string; days: number };
   /** 维度：path 形如 order.store_id -> custom_store.region_id -> custom_region.name；as_of 只支持 current */
   dimensions?: { name: string; path: string; as_of?: string }[];
+  /** 只有 base 为 event 时能写：customer_id 为空的匿名事件经 device_id 按设备归属计入，缺省为 true */
+  device_attribution?: boolean;
 }
 
 /**
@@ -84,6 +87,7 @@ export const METRIC_SCHEMA = {
         properties: { name: { type: 'string', pattern: '^[a-z][a-z0-9_]*$' }, path: { type: 'string', minLength: 1 }, as_of: { type: 'string' } },
       },
     },
+    device_attribution: { type: 'boolean' },
   },
 } as const;
 
@@ -232,6 +236,7 @@ export function checkMetric(text: string, ctx: DslContext): DslCheck<MetricSpec>
       && relationsOf(ctx).some(r => r.from.entity === spec.base && r.from.field === 'customer_id' && r.ref.entity === 'customer' && r.ref.field === 'customer_id');
     if (!linked) issue(['base'], `基础实体 ${spec.base} 要有指向 customer.customer_id 的 customer_id，才能关联到消费者`);
   }
+  if (spec.device_attribution !== undefined && spec.base !== 'event') issue(['device_attribution'], '只有基础实体为 event 时才能写 device_attribution');
 
   /** 基础实体上的字段：不存在或敏感时报问题并返回 undefined */
   const baseField = (path: Path, name: string, use: string) => {
@@ -402,10 +407,17 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
     where.push(`${day} > DATE ${lit(asOf)} - ${spec.window.days}`, `${day} <= DATE ${lit(asOf)}`);
   }
 
+  // 设备归属（ADR-0019）：customer_id 有值只经 _identities 解析，为空才经 device_id 查 _device_owner，两边都查不到的不计入
+  const byDevice = spec.base === 'event' && spec.device_attribution !== false;
+  const consumer = byDevice ? 'COALESCE(i.consumer_id, o.consumer_id)' : 'i.consumer_id';
+  if (byDevice) where.unshift(`${consumer} IS NOT NULL`);
   return [
-    `SELECT i.consumer_id, ${[...dims, `${measure} AS value`].join(', ')}`,
+    `SELECT ${byDevice ? `${consumer} AS consumer_id` : consumer}, ${[...dims, `${measure} AS value`].join(', ')}`,
     `FROM ${silverTable(spec.base)} b`,
-    `INNER JOIN ${IDENTITIES} i ON i._source = b._source AND i.customer_id = b.customer_id`,
+    ...(byDevice
+      ? [`LEFT JOIN ${IDENTITIES} i ON i._source = b._source AND i.customer_id = b.customer_id`,
+        `LEFT JOIN ${DEVICE_OWNER} o ON b.customer_id IS NULL AND o.device_id = b.device_id`]
+      : [`INNER JOIN ${IDENTITIES} i ON i._source = b._source AND i.customer_id = b.customer_id`]),
     ...joins,
     ...(where.length ? [`WHERE ${where.join('\n  AND ')}`] : []),
     'GROUP BY ALL',
