@@ -7,8 +7,11 @@
 // 统一消费者 ID 取组内最小的 (_source, customer_id) 再哈希，与敏感字段的哈希无关，同样的输入总得到同样的结果。
 // 之后由 silver.event 的登录事件求设备归属，整表写进 silver._device_owner(device_id, consumer_id, login_at)：
 // 每台登录过的设备归属到它全局最近一次登录的统一消费者（登录事件的 customer_id 只在它自己的 _source 内解析），
-// 同一时刻并列时取较小的 consumer_id；匿名事件（customer_id 为空）经 device_id 对应到统一消费者
+// 同一时刻并列时取较小的 consumer_id；匿名事件（customer_id 为空）经 device_id 对应到统一消费者。
+// 最后整表写出 silver._consumer：每个统一消费者一行，customer 的每个非敏感属性取一个存活值并记下来源 <列>__source（ADR-0027）
 import type { DuckDBConnection } from '@duckdb/node-api';
+import { entityOf } from '../../lib/canonical-model';
+import { SILVER_SYSTEM_COLUMNS } from './merge-engine';
 
 /** 默认的匹配规则：按优先级是手机号、邮箱、外部 ID 的哈希精确相等 */
 export const DEFAULT_RULES: readonly string[] = ['phone', 'email', 'external_id'];
@@ -28,6 +31,10 @@ export function identityRules<P extends { entity: string; identity?: { match: st
   return first ? first.identity!.match : DEFAULT_RULES;
 }
 
+/** 不进 _consumer 的敏感字段：各 customer 映射里标成敏感的列（标准模型的敏感字段 resolveIdentities 总是排除） */
+export const consumerSensitive = <P extends { entity: string; columns: { name: string; sensitive?: boolean }[] }>(plans: P[]): string[] =>
+  [...new Set(plans.filter(p => p.entity === 'customer').flatMap(p => p.columns.filter(c => c.sensitive).map(c => c.name)))].sort();
+
 /** 登录事件的事件类型，先写死，还不能配置 */
 export const LOGIN_EVENT = 'login';
 
@@ -36,6 +43,7 @@ export interface IdentitySummary { groups: number; records: number; devices: num
 
 export const IDENTITIES = 'silver._identities';
 export const DEVICE_OWNER = 'silver._device_owner';
+export const CONSUMER = 'silver._consumer';
 const CUSTOMER = 'silver."customer"';
 const EVENT = 'silver."event"';
 const NODES = 'stage.identity_nodes';
@@ -49,14 +57,29 @@ const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 
+/** resolveIdentities 的选项 */
+export interface IdentityOptions {
+  /** 属性存活的数据源优先级：映射 ID → 名次，越小越优先，没配的排最后；为空时只按 updated_at 取最新 */
+  priority?: Record<string, number>;
+  /** 另外不进 _consumer 的敏感字段（映射里标成敏感的 x_ 字段，见 consumerSensitive）；标准模型的敏感字段总是不进 */
+  sensitive?: readonly string[];
+}
+
 /**
- * 由 silver.customer 整表重算身份打通，再由 silver.event（不存在时没有设备归属）求设备归属，
- * 在一个事务里覆盖写入 silver._identities 与 silver._device_owner。silver.customer 必须存在；
+ * 由 silver.customer 整表重算身份打通，再由 silver.event（不存在时没有设备归属）求设备归属与统一消费者的属性，
+ * 在一个事务里覆盖写入 silver._identities、silver._device_owner 与 silver._consumer。silver.customer 必须存在；
  * 表里还没有的规则字段（早先发布的映射建的表没有新加的字段）跳过。中间结果在会话的本机库 stage 里算好，
  * 事务里只写数据湖（DuckDB 一个事务只能写一个库）
  */
-export async function resolveIdentities(con: DuckDBConnection, rules: readonly string[] = DEFAULT_RULES): Promise<IdentitySummary> {
-  const columns = new Set((await rows<{ column_name: string }>(con, `DESCRIBE ${CUSTOMER}`)).map(c => c.column_name));
+export async function resolveIdentities(
+  con: DuckDBConnection, rules: readonly string[] = DEFAULT_RULES, opts: IdentityOptions = {},
+): Promise<IdentitySummary> {
+  const described = (await rows<{ column_name: string }>(con, `DESCRIBE ${CUSTOMER}`)).map(c => c.column_name);
+  const columns = new Set(described);
+  const sensitive = new Set([...entityOf('customer')!.fields.filter(f => f.pii).map(f => f.name), ...opts.sensitive ?? []]);
+  // 属性列：除系统列、customer_id 与敏感字段以外的列
+  const notAttributes = new Set([...Object.keys(SILVER_SYSTEM_COLUMNS), 'customer_id', ...sensitive]);
+  const attributes = described.filter(c => !notAttributes.has(c));
   const used = rules.filter(r => columns.has(r));
   const events = (await rows(con, `
     SELECT 1 FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name = 'event'`)).length > 0;
@@ -120,6 +143,19 @@ export async function resolveIdentities(con: DuckDBConnection, rules: readonly s
           QUALIFY row_number() OVER (PARTITION BY e.device_id ORDER BY e.occurred_at DESC, i.consumer_id) = 1
           ORDER BY e.device_id`);
       }
+      // 每个属性取排序最前的非空值（名次、updated_at 新的在前，再按 (_source, customer_id) 定序），来源取同一行的 _source
+      const ranks = Object.entries(opts.priority ?? {});
+      const order = [
+        ...(ranks.length ? [`CASE c._mapping ${ranks.map(([m, r]) => `WHEN ${lit(m)} THEN ${Number(r)}`).join(' ')} END ASC NULLS LAST`] : []),
+        ...(columns.has('updated_at') ? ['c.updated_at DESC NULLS LAST'] : []),
+        'c._source', 'c.customer_id',
+      ].join(', ');
+      await con.run(`CREATE OR REPLACE TABLE ${CONSUMER} AS
+        SELECT i.consumer_id${attributes.map(a => `,
+          first(c.${ident(a)} ORDER BY ${order}) FILTER (WHERE c.${ident(a)} IS NOT NULL) AS ${ident(a)},
+          first(c._source ORDER BY ${order}) FILTER (WHERE c.${ident(a)} IS NOT NULL) AS ${ident(`${a}__source`)}`).join('')}
+        FROM ${CUSTOMER} c JOIN ${IDENTITIES} i ON i._source = c._source AND i.customer_id = c.customer_id
+        GROUP BY i.consumer_id ORDER BY i.consumer_id`);
       await con.run('COMMIT');
     } catch (e) {
       await con.run('ROLLBACK').catch(() => undefined);

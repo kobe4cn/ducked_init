@@ -12,7 +12,7 @@ import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
 import { MERGES, RECORDS, SILVER } from './lake-schemas';
 import { entityOf, type EntityRelation, type RelationStat } from '../../lib/canonical-model';
-import { DEFAULT_RULES, DEVICE_OWNER, IDENTITIES, resolveIdentities, type IdentitySummary } from './identity-engine';
+import { consumerSensitive, DEFAULT_RULES, DEVICE_OWNER, IDENTITIES, resolveIdentities, type IdentitySummary } from './identity-engine';
 import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
 import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
 import { bronzeTablesOf, checkViewSql } from './source-view-engine';
@@ -592,7 +592,7 @@ async function mergeOne(
  */
 export async function mergeToSilver(
   session: TenantLakeSession, plans: MergeMappingParam[], salt: string, redact: (message: string) => string, rules: readonly string[] = DEFAULT_RULES,
-  relations: RelationParam[] = [], forceIdentities = false,
+  relations: RelationParam[] = [], forceIdentities = false, sensitive: readonly string[] = [],
 ): Promise<{ mappings: MergeRecord[]; relations?: RelationStat[]; relationsMs?: number; identities?: IdentityRecord }> {
   const { con } = session;
   const now = new Date();
@@ -623,7 +623,7 @@ export async function mergeToSilver(
   }
   const startedAt = Date.now();
   try {
-    const summary = await resolveIdentities(con, rules);
+    const summary = await resolveIdentities(con, rules, { sensitive: [...new Set([...sensitive, ...consumerSensitive(plans)])] });
     return { ...merged, identities: { ...summary, durationMs: Date.now() - startedAt } };
   } catch (e) {
     return { ...merged, identities: { durationMs: Date.now() - startedAt, error: redact((e as Error).message) } };

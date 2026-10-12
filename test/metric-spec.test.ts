@@ -97,6 +97,10 @@ describe('指标 DSL：校验', () => {
     ['超过 3 个维度', `base: order\nmeasure: { agg: count }\ndimensions:\n${['a', 'b', 'c', 'd'].map(n => `  - { name: ${n}, path: order.channel }\n`).join('')}`, 4, /最多 3 个/],
     ['维度名重复', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: a, path: order.channel }\n  - { name: a, path: order.status }\n', 5, /重复/],
     ['as_of 不是 current', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: a, path: order.channel, as_of: "2024-01-01" }\n', 4, /暂不支持按时间点关联/],
+    ['consumer 维度用了敏感字段', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: a, path: consumer.phone }\n', 4, /敏感字段 consumer\.phone/],
+    ['consumer 维度没有这个字段', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: a, path: consumer.customer_id }\n', 4, /consumer 没有字段 customer_id/],
+    ['consumer 维度写了多段', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: a, path: consumer.city -> custom_store.name }\n', 4, /只能写一段/],
+    ['基础实体没有 customer_id 时不能按 consumer 做维度', 'base: custom_store\nmeasure: { agg: count }\ndimensions:\n  - { name: a, path: consumer.city }\n', 4, /custom_store 没有 customer_id，不能按 consumer 做维度/],
   ])('%s', (_, yaml, line, message) => {
     const found = issues(yaml);
     expect(found.find(i => message.test(i.message)), JSON.stringify(found)).toMatchObject({ line });
@@ -144,6 +148,17 @@ describe('指标 DSL：编译', () => {
     expect(dim('order.store_id -> custom_store.name')).not.toContain('d0_1._source');
   });
 
+  it('consumer 维度经 consumer_id 关联 silver._consumer，同一指标里只关联一次；依赖记作 customer 的字段', () => {
+    const yaml = 'base: event\nmeasure: { agg: count }\ndimensions:\n  - { name: city, path: consumer.city }\n  - { name: g, path: consumer.gender }\n';
+    const sql = compileMetric(ok(yaml), ctx, '2024-07-01');
+    expect(sql.match(/silver\._consumer/g)).toHaveLength(1);
+    expect(sql).toContain('LEFT JOIN silver._consumer cs ON cs.consumer_id = COALESCE(i.consumer_id, o.consumer_id)');
+    expect(DSL_KINDS.metric.dependencies(ok(yaml))).toMatchObject({
+      entities: ['customer', 'event'],
+      fields: [{ entity: 'customer', field: 'city' }, { entity: 'customer', field: 'gender' }],
+    });
+  });
+
   it('event 指标缺省经 silver._device_owner 归属匿名事件；device_attribution: false 时与原来逐字节一致', () => {
     const sql = (extra = '') => compileMetric(ok(`base: event\nmeasure: { agg: count }\n${extra}`), ctx, '2024-07-01');
     expect(sql()).toContain('silver._device_owner');
@@ -173,6 +188,8 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
       CREATE SCHEMA silver;
       CREATE TABLE silver._identities (_source VARCHAR, customer_id VARCHAR, consumer_id VARCHAR);
       INSERT INTO silver._identities VALUES ('s1','1','c1'), ('s2','10','c1'), ('s1','2','c2');
+      CREATE TABLE silver._consumer (consumer_id VARCHAR, city VARCHAR, city__source VARCHAR);
+      INSERT INTO silver._consumer VALUES ('c1', '北京', 's2'), ('c2', NULL, NULL);
       CREATE TABLE silver.customer (customer_id VARCHAR, city VARCHAR, _source VARCHAR);
       INSERT INTO silver.customer VALUES ('1', '上海', 's1'), ('10', '北京', 's2'), ('2', NULL, 's1');
       CREATE TABLE silver."order" (order_id VARCHAR, customer_id VARCHAR, status VARCHAR, amount DECIMAL(18,2), created_at TIMESTAMPTZ, store_id VARCHAR, _source VARCHAR);
@@ -247,6 +264,17 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
     expect(await run('base: event\nmeasure: { agg: count }\ndevice_attribution: false\n')).toEqual([
       { consumer_id: 'c1', value: 1 },
       { consumer_id: 'c2', value: 1 },
+    ]);
+  });
+
+  it('consumer.city 维度一个人只有一个城市（不按源记录拆行），没有城市的记「未关联」；event 的匿名事件按设备主人取城市', async () => {
+    expect(await run('base: order\nmeasure: { agg: max, field: amount }\nfilter:\n  - { field: status, op: eq, value: paid }\ndimensions:\n  - { name: city, path: consumer.city }\n')).toEqual([
+      { consumer_id: 'c1', city: '北京', value: 1000 },
+      { consumer_id: 'c2', city: '未关联', value: 70 },
+    ]);
+    expect(await run('base: event\nmeasure: { agg: count }\ndimensions:\n  - { name: city, path: consumer.city }\n')).toEqual([
+      { consumer_id: 'c1', city: '北京', value: 2 },
+      { consumer_id: 'c2', city: '未关联', value: 3 },
     ]);
   });
 

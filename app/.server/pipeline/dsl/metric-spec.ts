@@ -3,13 +3,13 @@
 // 基础实体要能关联到消费者（customer 本身，或有指向 customer 的 customer_id），字段要存在、类型合用、不能是敏感字段；
 // 维度路径沿关系走到头：每一跳都是指向下一实体单列主键的关系，最多 3 跳，不能成环。每个问题都带 YAML 里的行列位置。
 // 校验通过后编译成 SQL：基础实体经 silver._identities 关联到 consumer_id（event 的匿名事件缺省再经 silver._device_owner 按设备归属，ADR-0019），
-// 维度路径编译成链式 LEFT JOIN，关联不到或为空记「未关联」。
+// 维度路径编译成链式 LEFT JOIN，关联不到或为空记「未关联」；consumer.<字段> 的维度取统一消费者的属性（silver._consumer，ADR-0027），一个人只有一个取值。
 // 这里也放各种定义共用的部分：租户上下文 DslContext、问题 DslIssue 与校验结果 DslCheck、YAML 与 JSON Schema 的第一步 parseDsl。
 // 纯函数：不碰平台库与数据湖，同样的定义与 asOf 编译出同样的 SQL
 import { Ajv, type ValidateFunction } from 'ajv';
 import { LineCounter, parseDocument } from 'yaml';
 import { CANONICAL_ENTITIES, entityOf, isCustomEntity, type EntityRelation, type FieldType } from '../../../lib/canonical-model';
-import { DEVICE_OWNER, IDENTITIES } from '../identity-engine';
+import { CONSUMER, DEVICE_OWNER, IDENTITIES } from '../identity-engine';
 import { describeSchemaError, locator, type Path, type RegisteredEntities } from '../mapping-spec';
 import { ident, lit, silverTable, type MergeMappingParam } from '../merge-engine';
 
@@ -25,7 +25,10 @@ export interface MetricSpec {
   filter?: { field: string; op: (typeof FILTER_OPS)[number]; value?: Scalar | Scalar[] }[];
   /** 时间窗口：field（时间或日期）落在 (asOf - days, asOf] 里才计入 */
   window?: { field: string; days: number };
-  /** 维度：path 形如 order.store_id -> custom_store.region_id -> custom_region.name；as_of 只支持 current */
+  /**
+   * 维度：path 形如 order.store_id -> custom_store.region_id -> custom_region.name，或 consumer.city（统一消费者的属性）；
+   * as_of 只支持 current
+   */
   dimensions?: { name: string; path: string; as_of?: string }[];
   /** 只有 base 为 event 时能写：customer_id 为空的匿名事件经 device_id 按设备归属计入，缺省为 true */
   device_attribution?: boolean;
@@ -130,7 +133,13 @@ const relationsOf = (ctx: DslContext) => [...BUILTIN_RELATIONS, ...[...ctx.publi
  */
 export interface Step { entity: string; field: string; join?: { key: string; bySource: boolean } }
 
-/** 解析并检查维度路径：从基础实体出发，每一跳是指向下一实体单列主键的关系，最多 MAX_HOPS 跳，不能成环，终点不能是敏感字段 */
+/** 统一消费者属性的维度路径以它开头（silver._consumer，不是标准层实体） */
+export const CONSUMER_ENTITY = 'consumer';
+
+/**
+ * 解析并检查维度路径：从基础实体出发，每一跳是指向下一实体单列主键的关系，最多 MAX_HOPS 跳，不能成环，终点不能是敏感字段。
+ * consumer.<字段> 只有一段，字段是 customer 的非敏感字段（customer_id 除外），基础实体要有 customer_id
+ */
 export function resolvePath(path: string, base: string, ctx: DslContext): { steps: Step[]; type: FieldType } | string {
   const parts = path.split('->').map(s => s.trim());
   const steps: Step[] = [];
@@ -138,6 +147,17 @@ export function resolvePath(path: string, base: string, ctx: DslContext): { step
     const m = /^([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)$/.exec(part);
     if (!m) return `维度路径的每一段要写成 实体.字段，${part || '（空）'} 不是`;
     steps.push({ entity: m[1]!, field: m[2]! });
+  }
+  if (steps[0]!.entity === CONSUMER_ENTITY) {
+    if (steps.length > 1) return `${CONSUMER_ENTITY} 维度只能写一段 ${CONSUMER_ENTITY}.字段`;
+    const baseEntity = entityIn(base, ctx);
+    if (base !== 'customer' && base !== 'event' && (typeof baseEntity === 'string' || !baseEntity.fields.has('customer_id'))) return `${base} 没有 customer_id，不能按 ${CONSUMER_ENTITY} 做维度`;
+    const { field } = steps[0]!;
+    const customer = entityIn('customer', ctx);
+    const f = field === 'customer_id' || typeof customer === 'string' ? undefined : customer.fields.get(field);
+    if (!f) return `${CONSUMER_ENTITY} 没有字段 ${field}`;
+    if (f.sensitive) return `维度不能用敏感字段 ${CONSUMER_ENTITY}.${field}`;
+    return { steps, type: f.type };
   }
   if (steps[0]!.entity !== base) return `维度路径要从基础实体 ${base} 出发`;
   if (steps.length - 1 > MAX_HOPS) return `维度路径最多 ${MAX_HOPS} 跳，这里有 ${steps.length - 1} 跳`;
@@ -310,7 +330,7 @@ export function isNumericMetric(spec: MetricSpec, ctx: DslContext): boolean {
 /** 定义的依赖（ADR-0025「依赖按需计算」）：引用的指标键、用到的实体与字段，各自去重排序 */
 export interface Dependencies {
   metrics: string[];
-  /** 基础实体与维度路径经过的每个实体 */
+  /** 基础实体与维度路径经过的每个实体（consumer 维度记作 customer：它的属性来自 silver.customer） */
   entities: string[];
   /** 度量、过滤、窗口的字段（在基础实体上），与维度路径的各段 */
   fields: { entity: string; field: string }[];
@@ -328,7 +348,7 @@ export function metricDependencies(spec: MetricSpec): Dependencies {
   for (const d of spec.dimensions ?? []) {
     for (const part of d.path.split('->')) {
       const [entity, field] = part.trim().split('.');
-      add(entity!, field);
+      add(entity === CONSUMER_ENTITY ? 'customer' : entity!, field);
     }
   }
   return {
@@ -363,11 +383,22 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
   if (typeof base === 'string') throw new Error(base);
   const col = (name: string) => `b.${ident(name)}`;
 
+  // 设备归属（ADR-0019）：customer_id 有值只经 _identities 解析，为空才经 device_id 查 _device_owner，两边都查不到的不计入
+  const byDevice = spec.base === 'event' && spec.device_attribution !== false;
+  const consumer = byDevice ? 'COALESCE(i.consumer_id, o.consumer_id)' : 'i.consumer_id';
+
   const joins: string[] = [];
   const dims: string[] = [];
+  const dimension = (alias: string, field: string, name: string) => `COALESCE(NULLIF(CAST(${alias}.${ident(field)} AS VARCHAR), ''), ${lit(UNLINKED)}) AS ${ident(name)}`;
   for (const [i, d] of (spec.dimensions ?? []).entries()) {
     const resolved = resolvePath(d.path, spec.base, ctx);
     if (typeof resolved === 'string') throw new Error(resolved);
+    if (resolved.steps[0]!.entity === CONSUMER_ENTITY) {
+      const consumerJoin = `LEFT JOIN ${CONSUMER} cs ON cs.consumer_id = ${consumer}`;
+      if (!joins.includes(consumerJoin)) joins.unshift(consumerJoin);
+      dims.push(dimension('cs', resolved.steps[0]!.field, d.name));
+      continue;
+    }
     let prev = 'b';
     for (const [j, step] of resolved.steps.slice(0, -1).entries()) {
       const next = resolved.steps[j + 1]!;
@@ -378,7 +409,7 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
       prev = alias;
     }
     const end = resolved.steps.at(-1)!;
-    dims.push(`COALESCE(NULLIF(CAST(${prev}.${ident(end.field)} AS VARCHAR), ''), ${lit(UNLINKED)}) AS ${ident(d.name)}`);
+    dims.push(dimension(prev, end.field, d.name));
   }
 
   const { agg, field } = spec.measure;
@@ -407,9 +438,6 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
     where.push(`${day} > DATE ${lit(asOf)} - ${spec.window.days}`, `${day} <= DATE ${lit(asOf)}`);
   }
 
-  // 设备归属（ADR-0019）：customer_id 有值只经 _identities 解析，为空才经 device_id 查 _device_owner，两边都查不到的不计入
-  const byDevice = spec.base === 'event' && spec.device_attribution !== false;
-  const consumer = byDevice ? 'COALESCE(i.consumer_id, o.consumer_id)' : 'i.consumer_id';
   if (byDevice) where.unshift(`${consumer} IS NOT NULL`);
   return [
     `SELECT ${byDevice ? `${consumer} AS consumer_id` : consumer}, ${[...dims, `${measure} AS value`].join(', ')}`,

@@ -14,7 +14,7 @@ import { mappingIgnoredColumns, mappings, mappingVersions, sources, sourceViews,
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { publishedDependents } from './dsl-dependencies';
 import { dryRun } from './pipeline/dry-run-engine';
-import { identityRules, type IdentitySummary } from './pipeline/identity-engine';
+import { consumerSensitive, identityRules, type IdentitySummary } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import type { MergeMappingParam, MergeRecord, RelationParam } from './pipeline/merge-engine';
 import { draftCustomMapping, draftMapping, DraftError } from './pipeline/mapping-draft';
@@ -603,7 +603,7 @@ export const lockTenant = (tx: Tx, tenantId: string) => tx.select({ id: tenants.
  * 在调用方的事务里为给定映射（不给时为全部已发布映射）的最新已发布版本入队一次合并，返回带上它们的合并任务。
  * 锁住租户行后检查：同一租户同时只有一个合并在排队或运行（两个合并同时写同一张标准层表会冲突）。
  * 已有合并在排队时把映射补进去（同一映射换成最新版本）；已在运行（或补的时候刚被领取）时不入队，返回 null，由定时检查在它之后补上。
- * 给定的映射都没有已发布版本时也不入队。参数里另带身份打通的匹配规则，由全部已发布的 customer 映射汇总（重算打通时整表重算，不只看这次的映射），
+ * 给定的映射都没有已发布版本时也不入队。参数里另带身份打通的匹配规则与不进 _consumer 的敏感字段，由全部已发布的 customer 映射汇总（重算打通时整表重算，不只看这次的映射），
  * 与要统计孤儿的全部已发布关系（工作进程不读平台库），
  * 以及是否强制重算打通 identityForce（见 mustRecomputeIdentities；补进排队中的合并时，已为真的保留）。
  * opts.rebuild 时给这些映射带上强制重建标记；排队中的映射已带标记时，补进去的同一映射保留它
@@ -615,17 +615,18 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
   const pending = await pendingMerge(tx, tenantId);
   const all = mappingIds ? await publishedPlans(tx, tenantId) : plans;
   const identity = identityRules(all, mappingName);
+  const sensitive = consumerSensitive(all);
   const relations = relationParams(await publishedCustomEntities(tx, tenantId), all);
   if (pending?.status === 'running') return null;
   const force = await mustRecomputeIdentities(tx, tenantId, identity);
-  if (!pending) return insertTask(tx, tenantId, 'silver.merge', { mappings: plans, identity, relations, identityForce: force });
+  if (!pending) return insertTask(tx, tenantId, 'silver.merge', { mappings: plans, identity, consumerSensitive: sensitive, relations, identityForce: force });
   const queued = (pending.params.mappings ?? []) as MergeMappingParam[];
   const merged = [
     ...queued.filter(q => !plans.some(p => p.mapping === q.mapping)),
     ...plans.map(p => (queued.some(q => q.mapping === p.mapping && q.rebuild) ? { ...p, rebuild: true } : p)),
   ].sort((a, b) => a.mapping.localeCompare(b.mapping));
   // 领取合并不锁租户行：只在它仍在排队时改参数
-  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, identity, relations, identityForce: pending.params.identityForce === true || force } })
+  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, identity, consumerSensitive: sensitive, relations, identityForce: pending.params.identityForce === true || force } })
     .where(and(eq(tasks.id, pending.id), eq(tasks.status, 'queued'))).returning();
   return task ?? null;
 }

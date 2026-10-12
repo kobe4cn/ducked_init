@@ -9,7 +9,7 @@ import { inspectLake, type InspectParams } from './inspect-engine';
 import { runKeyCheck, type KeyCheckParams } from './key-check-engine';
 import { lit, mergeToSilver, type MergeMappingParam, type RelationParam } from './merge-engine';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
-import { DEVICE_OWNER, IDENTITIES } from './identity-engine';
+import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './identity-engine';
 import { TEMPLATES } from './templates';
 import { compileRfmUnlinked } from './templates/rfm';
 import { assertOrThrow, runAssertions } from './assertions';
@@ -103,6 +103,14 @@ function identityForce(params: Params) {
   const force = params.identityForce;
   if (force !== undefined && typeof force !== 'boolean') throw new Error('参数 identityForce 必须是布尔值');
   return force ?? false;
+}
+
+/** 合并参数里不进 _consumer 的敏感字段（入队时由全部 customer 映射汇总）；早先入队的合并没有这一项，只看这次合并的映射 */
+function mergeConsumerSensitive(params: Params): string[] {
+  const { consumerSensitive } = params;
+  if (consumerSensitive === undefined) return [];
+  if (!Array.isArray(consumerSensitive) || !consumerSensitive.every(s => typeof s === 'string')) throw new Error('参数 consumerSensitive 必须是字段名列表');
+  return consumerSensitive;
 }
 
 /** 合并参数里要统计孤儿的已发布关系（入队时带上全部关系与起点是否敏感）；早先入队的合并没有这一项，不统计 */
@@ -255,7 +263,7 @@ export const HANDLERS = {
     label: '合并到标准层',
     async run(_con, params, { session, piiSalt, redact }) {
       if (!piiSalt) throw new Error('缺少敏感信息盐');
-      const result = await mergeToSilver(session, mergeMappings(params), piiSalt, redact, identityMatch(params), mergeRelations(params), identityForce(params));
+      const result = await mergeToSilver(session, mergeMappings(params), piiSalt, redact, identityMatch(params), mergeRelations(params), identityForce(params), mergeConsumerSensitive(params));
       const failed = result.mappings.filter(m => 'error' in m);
       const problems = [
         ...(failed.length ? [`${failed.length} 个映射合并失败：${failed.map(m => `${m.entity} ← ${m.table}（${'error' in m ? m.error : ''}）`).join('；')}`] : []),
@@ -290,7 +298,7 @@ export const HANDLERS = {
     },
   },
   // 指标或标签（ADR-0025）：发布定义时入队，参数里带上入队时按当天编译好的 SQL 与它用到的实体（不再访问平台库）。
-  // 标准层有这些实体与身份打通结果（SQL 用到设备归属时还要有 _device_owner）时，把 SQL 的结果写进结果层的一张快照表 gold."<种类>__<任务 ID>"，只有 consumer_id、维度与值。
+  // 标准层有这些实体与身份打通结果（SQL 用到设备归属时还要有 _device_owner，用到 consumer 维度时还要有 _consumer）时，把 SQL 的结果写进结果层的一张快照表 gold."<种类>__<任务 ID>"，只有 consumer_id、维度与值。
   // 断言同 gold.rfm
   'gold.dsl': {
     label: '指标与标签',
@@ -301,11 +309,12 @@ export const HANDLERS = {
       if (!isStrings(entities)) throw new Error('参数 entities 必须是非空的实体名列表');
       const present = new Set((await rows<{ name: string }>(con, `
         SELECT table_name AS name FROM information_schema.tables
-        WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities', '_device_owner'].map(lit).join(', ')})`)).map(t => t.name));
+        WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities', '_device_owner', '_consumer'].map(lit).join(', ')})`)).map(t => t.name));
       const missing = entities.filter(entity => !present.has(entity));
       if (missing.length) throw new Error(`标准层还没有 ${missing.map(entity => `silver.${entity}`).join('、')}：先发布 ${missing.join('、')} 的映射并合并`);
       if (!present.has('_identities')) throw new Error(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`);
       if (sql.includes(DEVICE_OWNER) && !present.has('_device_owner')) throw new Error(`标准层还没有设备归属结果（${DEVICE_OWNER}）：重新合并一次映射`);
+      if (sql.includes(CONSUMER) && !present.has('_consumer')) throw new Error(`标准层还没有统一消费者属性（${CONSUMER}）：重新合并一次映射`);
       const assertions = await runAssertions(con, entities, taskId);
       assertOrThrow(assertions);
       const name = `${kind}__${taskId}`;

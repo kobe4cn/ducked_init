@@ -22,7 +22,7 @@ import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
 import { checkMetric, type DslCheck, type DslContext, type DslIssue, type MetricSpec } from './pipeline/dsl/metric-spec';
 import { withMetric } from './pipeline/dsl/tag-spec';
-import { DEVICE_OWNER, IDENTITIES } from './pipeline/identity-engine';
+import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { lit, rows } from './pipeline/merge-engine';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
@@ -341,7 +341,7 @@ const PREVIEW_ROWS = 50;
 const PREVIEW_LIMITS = { memoryLimitMb: 512, threads: 1 };
 
 /**
- * 在只读挂载的数据湖上运行 run：先确认标准层已有 entities 与身份打通结果（sqls 里有用到设备归属的还要有 _device_owner），
+ * 在只读挂载的数据湖上运行 run：先确认标准层已有 entities 与身份打通结果（sqls 里有用到设备归属的还要有 _device_owner，用到 consumer 维度的还要有 _consumer），
  * 没有时抛出说明（what 是操作名，如「预览」）；
  * 查询出错时报错里抹掉湖的凭据。只读：不建表、不入队任务、不登记快照
  */
@@ -353,7 +353,7 @@ async function onReadOnlyLake<T>(tenantId: string, entities: string[], sqls: str
   try {
     const present = new Set((await rows<{ name: string }>(session.con, `
       SELECT table_name AS name FROM information_schema.tables
-      WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities', '_device_owner'].map(lit).join(', ')})`)).map(t => t.name));
+      WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities', '_device_owner', '_consumer'].map(lit).join(', ')})`)).map(t => t.name));
     const missing = entities.filter(entity => !present.has(entity));
     if (missing.length) {
       throw new DslError(`标准层还没有 ${missing.map(entity => `silver.${entity}`).join('、')}：先发布 ${missing.join('、')} 的映射并合并，再${what}`);
@@ -361,6 +361,9 @@ async function onReadOnlyLake<T>(tenantId: string, entities: string[], sqls: str
     if (!present.has('_identities')) throw new DslError(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并，再${what}`);
     if (sqls.some(sql => sql.includes(DEVICE_OWNER)) && !present.has('_device_owner')) {
       throw new DslError(`标准层还没有设备归属结果（${DEVICE_OWNER}）：重新合并一次映射，再${what}`);
+    }
+    if (sqls.some(sql => sql.includes(CONSUMER)) && !present.has('_consumer')) {
+      throw new DslError(`标准层还没有统一消费者属性（${CONSUMER}）：重新合并一次映射，再${what}`);
     }
     return await run(session.con);
   } catch (e) {

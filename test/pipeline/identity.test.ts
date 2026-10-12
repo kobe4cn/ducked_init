@@ -11,6 +11,7 @@ import { latestIdentitySummary, listMappings, mergeMapping, mergeNow, publishMap
 import { syncSource } from '../../app/.server/source-sync';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { checkMetric, compileMetric, type DslContext } from '../../app/.server/pipeline/dsl/metric-spec';
+import { resolveIdentities } from '../../app/.server/pipeline/identity-engine';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
@@ -151,6 +152,77 @@ describe('身份打通：多源消费者确定性合并', () => {
     const failed = await runTask(acme, 'gold.dsl', params);
     expect(failed.status).toBe('failed');
     expect(failed.error).toContain('silver._device_owner');
+  });
+
+  it('统一消费者属性：每人一行，按 updated_at 取最新的非空值并记来源，名次优先于 updated_at；不收敏感字段', async () => {
+    const { acme, names, mappings } = await publishedIdentitySources();
+    const source = Object.fromEntries(Object.entries(names).map(([id, name]) => [name, id]));
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    const read = async (sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson();
+    try {
+      // 合并已经写出 _consumer：每个统一消费者一行，没有敏感字段
+      const [{ consumers, groups }] = await read(`SELECT (SELECT count(*) FROM silver._consumer)::INTEGER AS consumers,
+        (SELECT count(DISTINCT consumer_id) FROM silver._identities)::INTEGER AS groups`);
+      expect(consumers).toBe(groups);
+      const columns = (await read('DESCRIBE silver._consumer')).map(c => c.column_name);
+      expect(columns).toEqual(expect.arrayContaining(['consumer_id', 'city', 'city__source', 'updated_at']));
+      expect(columns.filter(c => /^(name|phone|email|external_id|customer_id|_mapping|_source)(__source)?$/.test(String(c)))).toEqual([]);
+
+      // crm 1、loyalty 1、tracking u1 是同一个人：loyalty 的城市更新，tracking 最新但城市为空
+      await session.con.run(`UPDATE silver.customer SET city = CASE _source WHEN '${source.crm}' THEN '上海' WHEN '${source.loyalty}' THEN '北京' END,
+        updated_at = CASE _source WHEN '${source.crm}' THEN TIMESTAMPTZ '2024-06-01 00:00:00+00' WHEN '${source.loyalty}' THEN TIMESTAMPTZ '2024-06-05 00:00:00+00'
+          ELSE TIMESTAMPTZ '2024-06-09 00:00:00+00' END
+        WHERE customer_id IN ('1', 'u1')`);
+      const u1 = async () => read(`SELECT c.city, c.city__source FROM silver._consumer c JOIN silver._identities i USING (consumer_id)
+        WHERE i._source = '${source.tracking}' AND i.customer_id = 'u1'`);
+      await resolveIdentities(session.con);
+      expect(await u1()).toEqual([{ city: '北京', city__source: source.loyalty }]);
+      await resolveIdentities(session.con, undefined, { priority: { [mappings.crm]: 1 } });
+      expect(await u1()).toEqual([{ city: '上海', city__source: source.crm }]);
+
+      // 映射里标成敏感的字段（由 consumerSensitive 汇总传入）也不进 _consumer
+      await resolveIdentities(session.con, undefined, { sensitive: ['city'] });
+      expect((await read('DESCRIBE silver._consumer')).map(c => c.column_name)).not.toContain('city');
+    } finally {
+      session.close();
+    }
+  });
+
+  it('consumer.city 维度的指标里一个人只出现一次；没有 _consumer 的老湖给出重新合并的提示', async () => {
+    const { acme, names } = await publishedIdentitySources();
+    const source = Object.fromEntries(Object.entries(names).map(([id, name]) => [name, id]));
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      await session.con.run(`UPDATE silver.customer SET city = CASE _source WHEN '${source.crm}' THEN '上海' ELSE '北京' END,
+        updated_at = CASE _source WHEN '${source.crm}' THEN TIMESTAMPTZ '2024-06-01 00:00:00+00' ELSE TIMESTAMPTZ '2024-06-05 00:00:00+00' END
+        WHERE customer_id = '1'`);
+      await resolveIdentities(session.con);
+    } finally {
+      session.close();
+    }
+    const ctx: DslContext = { published: new Map(), plans: [], metrics: new Map() };
+    const checked = checkMetric('base: customer\nmeasure: { agg: count }\ndimensions:\n  - { name: city, path: consumer.city }\n', ctx);
+    if (!checked.ok) throw new Error(JSON.stringify(checked.issues));
+    const params = { kind: 'metric', key: 'by_city', asOf: '2024-07-01', sql: compileMetric(checked.spec, ctx, '2024-07-01'), entities: ['customer'] };
+
+    const task = await runTask(acme, 'gold.dsl', params);
+    expect(task.status).toBe('succeeded');
+    const table = `gold."${(task.result as { table: string }).table.slice('gold.'.length)}"`;
+    const again = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      // crm 1、loyalty 1、tracking u1 是同一个人：只有一行，城市取较新的北京，三条源记录都计入
+      const rows = (await again.con.runAndReadAll(`SELECT g.city, g.value::INTEGER AS value FROM ${table} g
+        JOIN silver._identities i USING (consumer_id) WHERE i._source = '${source.crm}' AND i.customer_id = '1'`)).getRowObjectsJson();
+      expect(rows).toEqual([{ city: '北京', value: 3 }]);
+      await again.con.run('DROP TABLE silver._consumer');
+    } finally {
+      again.close();
+    }
+
+    const failed = await runTask(acme, 'gold.dsl', params);
+    expect(failed.status).toBe('failed');
+    expect(failed.error).toContain('silver._consumer');
+    expect(failed.error).toContain('重新合并一次映射');
   });
 
   it('同样的输入再合并一次，打通表与设备归属表的内容完全一致', async () => {

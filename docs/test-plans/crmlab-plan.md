@@ -148,7 +148,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | K5 同意冲突 | P01 在会员中心同意短信（早），POS 撤回（晚） | ⚠️ 两行都在，无「当前是否同意」（#145） |
 | K6 旧版本文档 | oms 里 P01 的天猫单另有旧版本文档（WAIT_BUYER_PAY 999 → TRADE_FINISHED 150） | 去重后 1 笔 150.00 |
 | K7 行过滤 | pos 测试门店 T999 有 37 笔 | 标准层没有；合并记录显示过滤 37 行 |
-| K8 属性冲突 | P01 城市上海 / 杭州 | ⚠️ 按城市的指标里 P01 两行（#145） |
+| K8 属性冲突 | P01 城市上海 / 杭州 | 维度写 `order.customer_id -> customer.city` 时 P01 按源记录拆成两行；写 `consumer.city` 时一行，城市取 `updated_at` 较新的那条（ADR-0027，#174） |
 | K9 抖音买家拆分 | dy_orders 每单一行，买家内嵌 | 源视图按 openid 拆出买家：每个买家 1 条消费者记录；没下过单的抖音用户不在导出里 |
 
 ### 交易、积分、行为、券（L、E、C、S）
@@ -205,7 +205,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | `coupons_redeemed` | status = redeemed | C1 = 1 |
 | `wecom_chats_30d` | event_type = wecom_chat，30 天，维度 `event.x_guide_id` | P12 在 G0001 下 4 |
 | `activity_attended` | event_type = activity_attend | E3 = 1 |
-| `revenue_by_city` | 维度 `order.customer_id -> customer.city` | ⚠️ K8：P01 三行（上海、杭州、未关联） |
+| `revenue_by_city` | 维度 `order.customer_id -> customer.city` | K8：P01 三行（上海、杭州、未关联）；改写维度为 `consumer.city` 后 P01 一行（ADR-0027） |
 
 ### T4 标签 ✅ / ⚠️
 | 键 | 规则 | 核对 |
