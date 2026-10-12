@@ -4,7 +4,10 @@
 // 比的是标准层里敏感字段的哈希（哈希前已规范化，空值不参与）：两条记录在某个匹配字段上相等、且在每个更高优先级的字段上不冲突
 // （冲突是双方都有值、没有一个相同）时相连；之后取传递闭包：A-B 手机相同、B-C 邮箱相同，则 A、B、C 是同一个消费者。
 // 匹配规则由各 customer 映射配置（identityRules），都没配置时用平台默认规则。
-// 统一消费者 ID 取组内最小的 (_source, customer_id) 再哈希，与敏感字段的哈希无关，同样的输入总得到同样的结果。
+// 统一消费者 ID 分配后固定（ADR-0029）：新算出的组对照上一版 _identities 沿用旧 ID，每个旧 ID 留给原成员最多的组，
+// 一组继承多个旧 ID 时留分配最早的、其余记 merge 并退役，没分到旧 ID 的组从原 ID 拆出、记 split；
+// 全新的组取组内最小的 (_source, customer_id) 再哈希（与敏感字段的哈希无关），撞上分配过的 ID 时加盐重算。
+// 分配表 silver._consumer_ids 与变更表 silver._consumer_id_changes 和 _identities 在同一个事务里写入。
 // 之后由 silver.event 的登录事件求设备归属，整表写进 silver._device_owner(device_id, consumer_id, login_at)：
 // 每台登录过的设备归属到它全局最近一次登录的统一消费者（登录事件的 customer_id 只在它自己的 _source 内解析），
 // 同一时刻并列时取较小的 consumer_id；匿名事件（customer_id 为空）经 device_id 对应到统一消费者。
@@ -39,13 +42,15 @@ export const consumerSensitive = <P extends { entity: string; columns: { name: s
 /** 登录事件的事件类型，先写死，还不能配置 */
 export const LOGIN_EVENT = 'login';
 
-/** 一次打通的摘要：统一消费者（组）数、参与打通的源记录数与已归属的设备数 */
-export interface IdentitySummary { groups: number; records: number; devices: number }
+/** 一次打通的摘要：统一消费者（组）数、参与打通的源记录数、已归属的设备数，以及本次记下的 ID 合并与拆开数 */
+export interface IdentitySummary { groups: number; records: number; devices: number; merged: number; split: number }
 
 export const IDENTITIES = 'silver._identities';
 export const DEVICE_OWNER = 'silver._device_owner';
 export const CONSUMER = 'silver._consumer';
 export const CONSUMER_CONSENT = 'silver._consumer_consent';
+export const CONSUMER_IDS = 'silver._consumer_ids';
+export const CONSUMER_ID_CHANGES = 'silver._consumer_id_changes';
 const CUSTOMER = 'silver."customer"';
 const EVENT = 'silver."event"';
 const CONSENT = 'silver."consent"';
@@ -55,6 +60,12 @@ const WIDE = 'stage.identity_wide';
 const EDGES = 'stage.identity_edges';
 const LABELS = 'stage.identity_labels';
 const NEXT = 'stage.identity_next';
+const OLD_IDS = 'stage.identity_old_ids';
+const OVERLAP = 'stage.identity_overlap';
+const OWNER = 'stage.identity_owner';
+const ASSIGNED = 'stage.identity_assigned';
+const CHANGES = 'stage.identity_changes';
+const NEXT_IDS = 'stage.identity_next_ids';
 
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
@@ -87,6 +98,9 @@ export async function resolveIdentities(
   const used = rules.filter(r => columns.has(r));
   const hasEvent = await tableExists(con, 'silver', 'event');
   const hasConsent = await tableExists(con, 'silver', 'consent');
+  const hasIdentities = await tableExists(con, 'silver', IDENTITIES.split('.')[1]);
+  const hasIds = await tableExists(con, 'silver', CONSUMER_IDS.split('.')[1]);
+  const nowSql = `${lit(new Date().toISOString())}::TIMESTAMPTZ`;
   try {
     // 每条源记录一个编号，按 (_source, customer_id) 排序，组里最小的编号就是组里最小的源记录
     await con.run(`CREATE OR REPLACE TABLE ${NODES} AS
@@ -128,15 +142,21 @@ export async function resolveIdentities(
       await con.run(`CREATE OR REPLACE TABLE ${LABELS} AS SELECT * FROM ${NEXT}`);
       if (!Number(changed)) break;
     }
+    await assignIds(con, hasIdentities, hasIds, nowSql);
 
     await con.run('BEGIN');
     try {
       await con.run(`CREATE TABLE IF NOT EXISTS ${IDENTITIES} (_source VARCHAR, customer_id VARCHAR, consumer_id VARCHAR)`);
       await con.run(`DELETE FROM ${IDENTITIES}`);
       await con.run(`INSERT INTO ${IDENTITIES}
-        SELECT n._source, n.customer_id, sha256(m._source || chr(31) || m.customer_id) AS consumer_id
-        FROM ${NODES} n JOIN ${LABELS} l USING (node) JOIN ${NODES} m ON m.node = l.label
+        SELECT n._source, n.customer_id, a.consumer_id
+        FROM ${NODES} n JOIN ${LABELS} l USING (node) JOIN ${ASSIGNED} a USING (label)
         ORDER BY n._source, n.customer_id`);
+      await con.run(`CREATE TABLE IF NOT EXISTS ${CONSUMER_IDS} (consumer_id VARCHAR, assigned_at TIMESTAMPTZ, retired_at TIMESTAMPTZ)`);
+      await con.run(`DELETE FROM ${CONSUMER_IDS}`);
+      await con.run(`INSERT INTO ${CONSUMER_IDS} SELECT * FROM ${NEXT_IDS} ORDER BY consumer_id`);
+      await con.run(`CREATE TABLE IF NOT EXISTS ${CONSUMER_ID_CHANGES} (old_id VARCHAR, new_id VARCHAR, reason VARCHAR, changed_at TIMESTAMPTZ)`);
+      await con.run(`INSERT INTO ${CONSUMER_ID_CHANGES} SELECT old_id, new_id, reason, ${nowSql} FROM ${CHANGES} ORDER BY reason, old_id, new_id`);
       await con.run(`CREATE TABLE IF NOT EXISTS ${DEVICE_OWNER} (device_id VARCHAR, consumer_id VARCHAR, login_at TIMESTAMPTZ)`);
       await con.run(`DELETE FROM ${DEVICE_OWNER}`);
       if (hasEvent) {
@@ -176,10 +196,69 @@ export async function resolveIdentities(
       await con.run('ROLLBACK').catch(() => undefined);
       throw e;
     }
-    const [summary] = await rows<{ groups: string; records: string; devices: string }>(con, `
-      SELECT count(DISTINCT consumer_id) AS groups, count(*) AS records, (SELECT count(*) FROM ${DEVICE_OWNER}) AS devices FROM ${IDENTITIES}`);
-    return { groups: Number(summary.groups), records: Number(summary.records), devices: Number(summary.devices) };
+    const [summary] = await rows<{ groups: string; records: string; devices: string; merged: string; split: string }>(con, `
+      SELECT count(DISTINCT consumer_id) AS groups, count(*) AS records, (SELECT count(*) FROM ${DEVICE_OWNER}) AS devices,
+        (SELECT count(*) FROM ${CHANGES} WHERE reason = 'merge') AS merged, (SELECT count(*) FROM ${CHANGES} WHERE reason = 'split') AS split
+      FROM ${IDENTITIES}`);
+    return {
+      groups: Number(summary.groups), records: Number(summary.records), devices: Number(summary.devices),
+      merged: Number(summary.merged), split: Number(summary.split),
+    };
   } finally {
-    await con.run([NODES, VALUES, WIDE, EDGES, LABELS, NEXT].map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
+    await con.run([NODES, VALUES, WIDE, EDGES, LABELS, NEXT, OLD_IDS, OVERLAP, OWNER, ASSIGNED, CHANGES, NEXT_IDS]
+      .map(t => `DROP TABLE IF EXISTS ${t};`).join(' '));
   }
+}
+
+/**
+ * 在 stage 里给新算出的每个组（LABELS 的 label，即组里最小的 node）选定统一消费者 ID：对照上一版 _identities，
+ * 每个旧 ID 只留给原成员最多的组（平局取 label 小的，即含最小源记录的组）；一组继承多个旧 ID 时留 assigned_at 最早的
+ * （平局取较小的 ID），其余记 merge 并退役；没分到旧 ID 的组取新 ID，从它含有的每个旧 ID 拆出、记 split。
+ * 结果是 ASSIGNED(label, consumer_id)、CHANGES(old_id, new_id, reason) 与写回分配表的全部行 NEXT_IDS。
+ * 分配表不存在时用上一版 _identities 播种（原 ID 全部保留，不记变更）。必须在写 _identities 的事务之前调用
+ */
+/** 新组的 ID：组内最小源记录（m）的哈希，salt 大于 0 时在哈希输入后加盐 */
+const freshId = (salt: string) => `sha256(m._source || chr(31) || m.customer_id${salt === '0' ? '' : ` || chr(31) || (${salt})`})`;
+
+async function assignIds(con: DuckDBConnection, hasIdentities: boolean, hasIds: boolean, nowSql: string) {
+  await con.run(`CREATE OR REPLACE TABLE ${OLD_IDS} AS ${hasIds
+    ? `SELECT consumer_id, assigned_at, retired_at FROM ${CONSUMER_IDS}`
+    : hasIdentities
+      ? `SELECT DISTINCT consumer_id, ${nowSql} AS assigned_at, NULL::TIMESTAMPTZ AS retired_at FROM ${IDENTITIES}`
+      : `SELECT NULL::VARCHAR AS consumer_id, NULL::TIMESTAMPTZ AS assigned_at, NULL::TIMESTAMPTZ AS retired_at LIMIT 0`}`);
+  // 每个新组与每个旧 ID 重叠的源记录数
+  await con.run(`CREATE OR REPLACE TABLE ${OVERLAP} AS ${hasIdentities
+    ? `SELECT l.label, i.consumer_id AS old_id, count(*) AS n
+      FROM ${NODES} n JOIN ${LABELS} l USING (node) JOIN ${IDENTITIES} i ON i._source = n._source AND i.customer_id = n.customer_id
+      GROUP BY ALL`
+    : `SELECT NULL::BIGINT AS label, NULL::VARCHAR AS old_id, NULL::BIGINT AS n LIMIT 0`}`);
+  // 每个旧 ID 归属的新组；组内按 assigned_at、ID 排名，第一名存活
+  await con.run(`CREATE OR REPLACE TABLE ${OWNER} AS
+    SELECT label, old_id, row_number() OVER (PARTITION BY label ORDER BY o.assigned_at NULLS LAST, old_id) AS rank
+    FROM (SELECT * FROM ${OVERLAP} QUALIFY row_number() OVER (PARTITION BY old_id ORDER BY n DESC, label) = 1) w
+    LEFT JOIN ${OLD_IDS} o ON o.consumer_id = w.old_id`);
+  // 没分到旧 ID 的组先取组内最小源记录的哈希，撞上分配过的 ID 就在哈希输入后加盐重算
+  await con.run(`CREATE OR REPLACE TABLE ${ASSIGNED} AS
+    SELECT label, old_id AS consumer_id, false AS fresh, 0 AS salt FROM ${OWNER} WHERE rank = 1
+    UNION ALL
+    SELECT l.label, ${freshId('0')}, true, 0
+    FROM (SELECT DISTINCT label FROM ${LABELS}) l JOIN ${NODES} m ON m.node = l.label
+    WHERE l.label NOT IN (SELECT label FROM ${OWNER})`);
+  for (;;) {
+    const clash = `fresh AND consumer_id IN (SELECT consumer_id FROM ${OLD_IDS})`;
+    const [{ clashes }] = await rows<{ clashes: string }>(con, `SELECT count(*) AS clashes FROM ${ASSIGNED} WHERE ${clash}`);
+    if (!Number(clashes)) break;
+    await con.run(`UPDATE ${ASSIGNED} a SET salt = a.salt + 1,
+      consumer_id = ${freshId('a.salt + 1')} FROM ${NODES} m WHERE m.node = a.label AND ${clash}`);
+  }
+  await con.run(`CREATE OR REPLACE TABLE ${CHANGES} AS
+    SELECT w.old_id, a.consumer_id AS new_id, 'merge' AS reason FROM ${OWNER} w JOIN ${ASSIGNED} a USING (label) WHERE w.rank > 1
+    UNION ALL
+    SELECT v.old_id, a.consumer_id, 'split' FROM ${OVERLAP} v JOIN ${ASSIGNED} a USING (label) WHERE a.fresh`);
+  await con.run(`CREATE OR REPLACE TABLE ${NEXT_IDS} AS
+    SELECT consumer_id, assigned_at,
+      CASE WHEN consumer_id IN (SELECT old_id FROM ${CHANGES} WHERE reason = 'merge') THEN ${nowSql} ELSE retired_at END AS retired_at
+    FROM ${OLD_IDS}
+    UNION ALL
+    SELECT consumer_id, ${nowSql}, NULL FROM ${ASSIGNED} WHERE fresh`);
 }

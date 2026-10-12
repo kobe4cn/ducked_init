@@ -12,7 +12,7 @@ import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
 import { MERGES, RECORDS, SILVER } from './lake-schemas';
 import { entityOf, type EntityRelation, type RelationStat } from '../../lib/canonical-model';
-import { CONSUMER, CONSUMER_CONSENT, consumerSensitive, DEFAULT_RULES, DEVICE_OWNER, IDENTITIES, resolveIdentities, type IdentitySummary } from './identity-engine';
+import { CONSUMER, CONSUMER_CONSENT, CONSUMER_IDS, consumerSensitive, DEFAULT_RULES, DEVICE_OWNER, IDENTITIES, resolveIdentities, type IdentitySummary } from './identity-engine';
 import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
 import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
 import { bronzeTablesOf, checkViewSql } from './source-view-engine';
@@ -616,7 +616,7 @@ export async function mergeToSilver(
   const merged = { mappings: records, ...(orphans && { relations: orphans, relationsMs: Date.now() - relationsFrom }) };
   if (!await tableExists(con, SILVER, 'customer')) return merged;
   const resultsExist = async () => {
-    for (const t of [IDENTITIES, DEVICE_OWNER, CONSUMER, CONSUMER_CONSENT]) if (!await tableExists(con, SILVER, t.split('.')[1])) return false;
+    for (const t of [IDENTITIES, DEVICE_OWNER, CONSUMER, CONSUMER_CONSENT, CONSUMER_IDS]) if (!await tableExists(con, SILVER, t.split('.')[1])) return false;
     return true;
   };
   if (!forceIdentities && !changedIdentityInputs(records) && await resultsExist()) {

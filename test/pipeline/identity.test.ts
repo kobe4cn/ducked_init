@@ -447,3 +447,130 @@ describe('身份打通：可配置匹配字段与优先级', () => {
     await republish(author, reviewer, mappings.loyalty, `${LOYALTY}identity:\n  match: [phone, email]\n`);
   });
 });
+
+describe('身份打通：统一消费者 ID 分配后固定', () => {
+  type Change = { old_id: string; new_id: string; reason: string };
+  /** silver._consumer_id_changes 的全部行（不含时间），silver._consumer_ids 里已退役的 ID 与每个 ID 的分配时间 */
+  async function idTables(tenantId: string) {
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 });
+    const read = async <T>(sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+    try {
+      const ids = await read<{ consumer_id: string; assigned_at: string; retired: boolean }>(
+        'SELECT consumer_id, epoch_ms(assigned_at)::VARCHAR AS assigned_at, retired_at IS NOT NULL AS retired FROM silver._consumer_ids');
+      return {
+        changes: await read<Change>('SELECT old_id, new_id, reason FROM silver._consumer_id_changes ORDER BY reason, old_id, new_id'),
+        retired: ids.filter(r => r.retired).map(r => r.consumer_id).sort(),
+        assignedAt: Object.fromEntries(ids.map(r => [r.consumer_id, Number(r.assigned_at)])),
+      };
+    } finally {
+      session.close();
+    }
+  }
+  /** 从 before 到现在新增的变更记录与新退役的 ID（发布各源时已有的合并不算） */
+  async function idChanges(tenantId: string, before: Awaited<ReturnType<typeof idTables>>) {
+    const now = await idTables(tenantId);
+    const seen = new Set(before.changes.map(c => JSON.stringify(c)));
+    return { changes: now.changes.filter(c => !seen.has(JSON.stringify(c))), retired: now.retired.filter(id => !before.retired.includes(id)) };
+  }
+  /** 「数据源名:customer_id」→ 统一消费者 ID */
+  const idsOf = (rows: Identity[], names: Record<string, string>) =>
+    Object.fromEntries(rows.map(r => [`${names[r._source]}:${r.customer_id}`, r.consumer_id]));
+
+  it('新源记录把两个已有消费者连起来：存活的 ID 取分配较早、平局取较小的那个，另一个记 merge 并退役；其余 ID 不变', async () => {
+    const { acme, author, sources, names } = await publishedIdentitySources();
+    const before = idsOf((await identities(acme)).rows, names);
+    const tables = await idTables(acme);
+    // 手机号与 u9 相同、邮箱与 crm 3 / loyalty 3 相同
+    await grantOnSource(`INSERT INTO crm.customers VALUES (8, '王五', '13700000009', 'wang5@example.com', NULL, '2024-06-02')`);
+    await syncSource(author, sources.crm);
+    await drain();
+    const after = idsOf((await identities(acme)).rows, names);
+    const [kept, gone] = [before['crm:3'], before['tracking:u9']]
+      .sort((a, b) => tables.assignedAt[a] - tables.assignedAt[b] || a.localeCompare(b));
+    for (const who of ['crm:3', 'loyalty:3', 'crm:8', 'tracking:u9']) expect(after[who]).toBe(kept);
+    for (const who of Object.keys(before).filter(w => !['crm:3', 'loyalty:3', 'tracking:u9'].includes(w))) expect(after[who]).toBe(before[who]);
+    expect(await idChanges(acme, tables)).toEqual({ changes: [{ old_id: gone, new_id: kept, reason: 'merge' }], retired: [gone] });
+    expect((await lastMerge(acme)).result.identities).toMatchObject({ groups: 7, merged: 1, split: 0 });
+  });
+
+  it('改规则使组拆开：原 ID 留给原成员最多的那组（平局取含最小源记录的组），其余组分到新 ID 并记 split', async () => {
+    const { acme, author, reviewer, mappings, names } = await publishedIdentitySources();
+    const before = idsOf((await identities(acme)).rows, names);
+    const tables = await idTables(acme);
+    await republish(author, reviewer, mappings.crm, `${CRM}identity:\n  match: [phone, external_id]\n`);
+    const after = idsOf((await identities(acme)).rows, names);
+    const all = new Set(Object.values(before));
+    // {crm2, loyalty2 | u2} 2 比 1、{crm5, loyalty5 | crm6} 2 比 1：原 ID 留给两条的那组
+    expect([after['crm:2'], after['loyalty:2']]).toEqual([before['crm:2'], before['crm:2']]);
+    expect([after['crm:5'], after['loyalty:5']]).toEqual([before['crm:5'], before['crm:5']]);
+    expect(all.has(after['tracking:u2'])).toBe(false);
+    expect(all.has(after['crm:6'])).toBe(false);
+    // {crm3 | loyalty3} 1 比 1：恰好一组保留原 ID
+    const three = [after['crm:3'], after['loyalty:3']];
+    expect(three.filter(id => id === before['crm:3'])).toHaveLength(1);
+    const split3 = three.find(id => id !== before['crm:3'])!;
+    expect(all.has(split3)).toBe(false);
+
+    const expected = [
+      { old_id: before['crm:2'], new_id: after['tracking:u2'], reason: 'split' },
+      { old_id: before['crm:3'], new_id: split3, reason: 'split' },
+      { old_id: before['crm:5'], new_id: after['crm:6'], reason: 'split' },
+    ].sort((a, b) => a.old_id.localeCompare(b.old_id) || a.new_id.localeCompare(b.new_id));
+    expect(await idChanges(acme, tables)).toEqual({ changes: expected, retired: [] });
+    expect((await lastMerge(acme)).result.identities).toMatchObject({ groups: 11, merged: 0, split: 3 });
+    // 其余组 ID 不变
+    for (const who of ['crm:1', 'loyalty:1', 'crm:4', 'crm:7', 'loyalty:4', 'tracking:u9']) expect(after[who]).toBe(before[who]);
+  });
+
+  it('没有任何变化的重算不产生变更记录，ID 不变', async () => {
+    const { acme } = await publishedIdentitySources();
+    const before = await identities(acme);
+    const tables = await idTables(acme);
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      expect(await resolveIdentities(session.con)).toMatchObject({ groups: 8, records: 16, merged: 0, split: 0 });
+    } finally {
+      session.close();
+    }
+    const after = await identities(acme);
+    expect(after.rows).toEqual(before.rows);
+    expect(after.devices).toEqual(before.devices);
+    expect(await idChanges(acme, tables)).toEqual({ changes: [], retired: [] });
+  });
+
+  it('新组的哈希撞上分配过的 ID（包括已退役的）时加盐重算，直到不撞', async () => {
+    const { acme } = await publishedIdentitySources();
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    const read = async (sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson();
+    try {
+      // 新源记录 (zz, new1) 自成一组：它的哈希与加一次盐的哈希都已分配过（退役），取加两次盐的
+      await session.con.run(`INSERT INTO silver.customer (_source, customer_id) VALUES ('zz', 'new1');
+        INSERT INTO silver._consumer_ids SELECT sha256('zz' || chr(31) || 'new1' || s), TIMESTAMPTZ '2024-01-01 00:00:00+00', TIMESTAMPTZ '2024-02-01 00:00:00+00'
+        FROM (VALUES (''), (chr(31) || '1')) t(s)`);
+      await resolveIdentities(session.con);
+      expect(await read(`SELECT consumer_id = sha256('zz' || chr(31) || 'new1' || chr(31) || '2') AS salted FROM silver._identities
+        WHERE _source = 'zz'`)).toEqual([{ salted: true }]);
+    } finally {
+      session.close();
+    }
+  });
+
+  it('老湖有 _identities、没有分配表时，重算用现有 ID 播种，原 ID 全部保留、不记变更', async () => {
+    const { acme, author } = await publishedIdentitySources();
+    const before = await identities(acme);
+    const tables = await idTables(acme);
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      // 模拟老湖：ID 不是现在的哈希（老湖的 ID 也可能来自别的算法），分配表还不存在
+      await session.con.run(`UPDATE silver._identities SET consumer_id = 'old-' || consumer_id; DROP TABLE silver._consumer_ids`);
+    } finally {
+      session.close();
+    }
+    await mergeNow(author);
+    await drain();
+    expect((await lastMerge(acme)).result.identities).toMatchObject({ groups: 8, merged: 0, split: 0 });
+    const after = await identities(acme);
+    expect(after.rows).toEqual(before.rows.map(r => ({ ...r, consumer_id: `old-${r.consumer_id}` })));
+    expect(await idChanges(acme, tables)).toEqual({ changes: [], retired: [] });
+  });
+});
