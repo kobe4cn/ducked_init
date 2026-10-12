@@ -116,9 +116,11 @@ export async function pgSourceInput(account: { user: string; password: string },
  * - 设备 d1：u1 先登录、u2 后登录，另有匿名事件，归属 u2；d2：u9 与 u1 同一时刻登录（并列），另有匿名事件
  * - 设备 d3 只有匿名事件、d4 只有已登录的浏览（没有 login），都不归属任何人
  * orders 为真时 CRM 与会员源各多一张订单表（crm.orders、loyalty.orders，列名与状态写法不同），一并选表同步，
- * 订单的金额与时间对应 rfm.test.ts 里 RFM 的已知答案；crm.orders 里有一笔下单人 99 不存在，打通不到消费者
+ * 订单的金额与时间对应 rfm.test.ts 里 RFM 的已知答案；crm.orders 里有一笔下单人 99 不存在，打通不到消费者。
+ * consents 为真时两个源各多一张同意表 consents（状态写法不同）：crm 1 短信早同意、loyalty 1 短信晚撤回；
+ * crm 2 短信同意与 loyalty 2 短信撤回的更新时间相同
  */
-export async function seedIdentitySources(member: CurrentMember, { orders = false } = {}) {
+export async function seedIdentitySources(member: CurrentMember, { orders = false, consents = false } = {}) {
   const input = await pgSourceInput(READER);
   await grantOnSource(`
     DROP SCHEMA IF EXISTS crm CASCADE; DROP SCHEMA IF EXISTS loyalty CASCADE; DROP SCHEMA IF EXISTS tracking CASCADE;
@@ -172,11 +174,16 @@ export async function seedIdentitySources(member: CurrentMember, { orders = fals
       (3, 3, '已支付', 80, '2024-03-01 10:00', '2024-06-30'),
       (4, 6, '已完成', 1000, '2024-06-15 10:00', '2024-06-30'),
       (5, 6, '已支付', 500, '2024-07-02 10:00', '2024-07-02');` : ''}
+    ${consents ? `
+    CREATE TABLE crm.consents (customer int, channel text, opt_in text, updated_at timestamp NOT NULL, PRIMARY KEY (customer, channel));
+    INSERT INTO crm.consents VALUES (1, '短信', 'Y', '2024-06-01 10:00'), (1, '邮件', 'Y', '2024-06-01 10:00'), (2, '短信', 'Y', '2024-06-03 10:00');
+    CREATE TABLE loyalty.consents (member_id int, channel text, state text, updated_at timestamp NOT NULL, PRIMARY KEY (member_id, channel));
+    INSERT INTO loyalty.consents VALUES (1, '短信', '撤回', '2024-06-05 10:00'), (2, '短信', '撤回', '2024-06-03 10:00');` : ''}
     GRANT USAGE ON SCHEMA crm, loyalty, tracking TO ${READER.user};
     GRANT SELECT ON ALL TABLES IN SCHEMA crm, loyalty, tracking TO ${READER.user};`);
   const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
   const ids: string[] = [];
-  const extra = orders ? ['orders'] : [];
+  const extra = [...orders ? ['orders'] : [], ...consents ? ['consents'] : []];
   const sources: [string, string, string[]][] = [['CRM', 'crm', ['customers', ...extra]], ['会员', 'loyalty', ['members', ...extra]], ['埋点', 'tracking', ['users', 'events']]];
   for (const [name, schema, tables] of sources) {
     const { id } = await registerSource(member, { ...input, name, schema });

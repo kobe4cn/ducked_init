@@ -8,10 +8,11 @@
 // 之后由 silver.event 的登录事件求设备归属，整表写进 silver._device_owner(device_id, consumer_id, login_at)：
 // 每台登录过的设备归属到它全局最近一次登录的统一消费者（登录事件的 customer_id 只在它自己的 _source 内解析），
 // 同一时刻并列时取较小的 consumer_id；匿名事件（customer_id 为空）经 device_id 对应到统一消费者。
-// 最后整表写出 silver._consumer：每个统一消费者一行，customer 的每个非敏感属性取一个存活值并记下来源 <列>__source（ADR-0027）
+// 最后整表写出 silver._consumer：每个统一消费者一行，customer 的每个非敏感属性取一个存活值并记下来源 <列>__source（ADR-0027），
+// 与 silver._consumer_consent：每个统一消费者每个渠道一行，取各源里 updated_at 最新的同意状态，同一时刻撤回优先，记下来源 _source
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { entityOf } from '../../lib/canonical-model';
-import { SILVER_SYSTEM_COLUMNS } from './merge-engine';
+import { SILVER_SYSTEM_COLUMNS, tableExists } from './merge-engine';
 
 /** 默认的匹配规则：按优先级是手机号、邮箱、外部 ID 的哈希精确相等 */
 export const DEFAULT_RULES: readonly string[] = ['phone', 'email', 'external_id'];
@@ -44,8 +45,10 @@ export interface IdentitySummary { groups: number; records: number; devices: num
 export const IDENTITIES = 'silver._identities';
 export const DEVICE_OWNER = 'silver._device_owner';
 export const CONSUMER = 'silver._consumer';
+export const CONSUMER_CONSENT = 'silver._consumer_consent';
 const CUSTOMER = 'silver."customer"';
 const EVENT = 'silver."event"';
+const CONSENT = 'silver."consent"';
 const NODES = 'stage.identity_nodes';
 const VALUES = 'stage.identity_values';
 const WIDE = 'stage.identity_wide';
@@ -67,7 +70,8 @@ export interface IdentityOptions {
 
 /**
  * 由 silver.customer 整表重算身份打通，再由 silver.event（不存在时没有设备归属）求设备归属与统一消费者的属性，
- * 在一个事务里覆盖写入 silver._identities、silver._device_owner 与 silver._consumer。silver.customer 必须存在；
+ * 再由 silver.consent（不存在时是空表）求统一消费者的同意，
+ * 在一个事务里覆盖写入 silver._identities、silver._device_owner、silver._consumer 与 silver._consumer_consent。silver.customer 必须存在；
  * 表里还没有的规则字段（早先发布的映射建的表没有新加的字段）跳过。中间结果在会话的本机库 stage 里算好，
  * 事务里只写数据湖（DuckDB 一个事务只能写一个库）
  */
@@ -81,8 +85,8 @@ export async function resolveIdentities(
   const notAttributes = new Set([...Object.keys(SILVER_SYSTEM_COLUMNS), 'customer_id', ...sensitive]);
   const attributes = described.filter(c => !notAttributes.has(c));
   const used = rules.filter(r => columns.has(r));
-  const events = (await rows(con, `
-    SELECT 1 FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name = 'event'`)).length > 0;
+  const hasEvent = await tableExists(con, 'silver', 'event');
+  const hasConsent = await tableExists(con, 'silver', 'consent');
   try {
     // 每条源记录一个编号，按 (_source, customer_id) 排序，组里最小的编号就是组里最小的源记录
     await con.run(`CREATE OR REPLACE TABLE ${NODES} AS
@@ -135,7 +139,7 @@ export async function resolveIdentities(
         ORDER BY n._source, n.customer_id`);
       await con.run(`CREATE TABLE IF NOT EXISTS ${DEVICE_OWNER} (device_id VARCHAR, consumer_id VARCHAR, login_at TIMESTAMPTZ)`);
       await con.run(`DELETE FROM ${DEVICE_OWNER}`);
-      if (events) {
+      if (hasEvent) {
         await con.run(`INSERT INTO ${DEVICE_OWNER}
           SELECT e.device_id, i.consumer_id, e.occurred_at AS login_at
           FROM ${EVENT} e JOIN ${IDENTITIES} i ON i._source = e._source AND i.customer_id = e.customer_id
@@ -156,6 +160,17 @@ export async function resolveIdentities(
           first(c._source ORDER BY ${order}) FILTER (WHERE c.${ident(a)} IS NOT NULL) AS ${ident(`${a}__source`)}`).join('')}
         FROM ${CUSTOMER} c JOIN ${IDENTITIES} i ON i._source = c._source AND i.customer_id = c.customer_id
         GROUP BY i.consumer_id ORDER BY i.consumer_id`);
+      // 同意只按时间，不看数据源名次：updated_at 新的在前，同一时刻撤回在前，再按 (_source, customer_id) 定序
+      await con.run(`CREATE OR REPLACE TABLE ${CONSUMER_CONSENT} (consumer_id VARCHAR, channel VARCHAR, status VARCHAR, updated_at TIMESTAMPTZ, _source VARCHAR)`);
+      if (hasConsent) {
+        await con.run(`INSERT INTO ${CONSUMER_CONSENT}
+          SELECT i.consumer_id, c.channel, c.status, c.updated_at, c._source
+          FROM ${CONSENT} c JOIN ${IDENTITIES} i ON i._source = c._source AND i.customer_id = c.customer_id
+          WHERE c.channel IS NOT NULL
+          QUALIFY row_number() OVER (PARTITION BY i.consumer_id, c.channel
+            ORDER BY c.updated_at DESC NULLS LAST, (c.status = 'revoked') DESC NULLS LAST, c._source, c.customer_id) = 1
+          ORDER BY i.consumer_id, c.channel`);
+      }
       await con.run('COMMIT');
     } catch (e) {
       await con.run('ROLLBACK').catch(() => undefined);

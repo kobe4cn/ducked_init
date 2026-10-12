@@ -1,6 +1,8 @@
-// 身份打通的流水线接缝：CRM、会员、埋点三个数据源同步进原始层 → 发布映射 → 调度器派发合并（改到 customer 或 event、
+// test/pipeline/identity.test.ts —— 身份打通的流水线接缝：CRM、会员、埋点三个数据源同步进原始层 → 发布映射 → 调度器派发合并（改到 customer、event 或 consent、
 // 打通结果表不在或入队时要求强制时整表重算打通，否则跳过）→ silver._identities 里每条 (_source, customer_id) 对应一个统一消费者，
-// silver._device_owner 里每台登录过的设备归属到最近一次登录的统一消费者，任务结果带打通摘要，表里没有明文
+// silver._device_owner 里每台登录过的设备归属到最近一次登录的统一消费者，silver._consumer 与 silver._consumer_consent 是统一消费者的属性与同意，
+// 任务结果带打通摘要，表里没有明文
+import type { DuckDBConnection } from '@duckdb/node-api';
 import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CurrentMember } from '../../app/.server/auth';
@@ -54,6 +56,12 @@ async function anonymousEvents(tenantId: string) {
   } finally {
     session.close();
   }
+}
+
+/** 某条源记录所属的统一消费者在 silver._consumer_consent 里的各渠道状态与来源（按渠道排序） */
+async function consumerConsent(con: DuckDBConnection, sourceId: string, customerId: string) {
+  return (await con.runAndReadAll(`SELECT c.channel, c.status, c._source FROM silver._consumer_consent c JOIN silver._identities i USING (consumer_id)
+    WHERE i._source = '${sourceId}' AND i.customer_id = '${customerId}' ORDER BY c.channel`)).getRowObjectsJson();
 }
 
 /** 按统一消费者分组，每组是「数据源名:customer_id」的列表；组按第一条排序，便于整体比较 */
@@ -167,6 +175,8 @@ describe('身份打通：多源消费者确定性合并', () => {
       const columns = (await read('DESCRIBE silver._consumer')).map(c => c.column_name);
       expect(columns).toEqual(expect.arrayContaining(['consumer_id', 'city', 'city__source', 'updated_at']));
       expect(columns.filter(c => /^(name|phone|email|external_id|customer_id|_mapping|_source)(__source)?$/.test(String(c)))).toEqual([]);
+      // 没有同意映射（silver.consent 不存在）时 _consumer_consent 是空表
+      expect(await read('SELECT count(*)::INTEGER AS n FROM silver._consumer_consent')).toEqual([{ n: 0 }]);
 
       // crm 1、loyalty 1、tracking u1 是同一个人：loyalty 的城市更新，tracking 最新但城市为空
       await session.con.run(`UPDATE silver.customer SET city = CASE _source WHEN '${source.crm}' THEN '上海' WHEN '${source.loyalty}' THEN '北京' END,
@@ -183,6 +193,26 @@ describe('身份打通：多源消费者确定性合并', () => {
       // 映射里标成敏感的字段（由 consumerSensitive 汇总传入）也不进 _consumer
       await resolveIdentities(session.con, undefined, { sensitive: ['city'] });
       expect((await read('DESCRIBE silver._consumer')).map(c => c.column_name)).not.toContain('city');
+    } finally {
+      session.close();
+    }
+  });
+
+  it('统一消费者的同意：每人每渠道一行，取各源里最新的状态并记来源，不看数据源名次；同一时刻撤回优先', async () => {
+    const { acme, names } = await publishedIdentitySources({ consents: true });
+    const source = Object.fromEntries(Object.entries(names).map(([id, name]) => [name, id]));
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      // crm 1 短信早同意、loyalty 1 短信晚撤回：取撤回；邮件只有 crm 有
+      expect(await consumerConsent(session.con, source.crm, '1')).toEqual([
+        { channel: 'email', status: 'granted', _source: source.crm },
+        { channel: 'sms', status: 'revoked', _source: source.loyalty },
+      ]);
+      // crm 2 同意与 loyalty 2 撤回同一时刻：取撤回；两边状态对调后仍取撤回，来源跟着换
+      expect(await consumerConsent(session.con, source.crm, '2')).toEqual([{ channel: 'sms', status: 'revoked', _source: source.loyalty }]);
+      await session.con.run(`UPDATE silver.consent SET status = CASE status WHEN 'granted' THEN 'revoked' ELSE 'granted' END WHERE customer_id = '2'`);
+      await resolveIdentities(session.con);
+      expect(await consumerConsent(session.con, source.crm, '2')).toEqual([{ channel: 'sms', status: 'revoked', _source: source.crm }]);
     } finally {
       session.close();
     }
@@ -236,7 +266,7 @@ describe('身份打通：多源消费者确定性合并', () => {
   });
 });
 
-describe('身份打通：只在改到 customer 或 event 时重算', () => {
+describe('身份打通：只在改到 customer、event 或 consent 时重算', () => {
   it('没有变化的合并跳过打通并写明原因：打通表不动，数据地图的摘要仍是上次真正打通的那次', async () => {
     const { acme, author } = await publishedIdentitySources();
     const before = await identities(acme);
@@ -296,6 +326,47 @@ describe('身份打通：只在改到 customer 或 event 时重算', () => {
     await drain();
     expect((await lastMerge(acme)).result.identities).toMatchObject({ groups: 8, devices: 2 });
     expect((await identities(acme)).devices).toEqual(before.devices);
+  });
+
+  it('只同步、合并了同意映射时也重算 _consumer_consent', async () => {
+    const { acme, author, sources, consentMappings } = await publishedIdentitySources({ consents: true });
+    await grantOnSource(`UPDATE loyalty.consents SET state = '同意', updated_at = '2024-06-07 10:00' WHERE member_id = 1`);
+    await syncSource(author, sources.loyalty);
+    await drain();
+    const merge = await lastMerge(acme);
+    expect((merge.params.mappings as { mapping: string }[]).map(m => m.mapping)).toEqual([consentMappings!.loyalty]);
+    expect(merge.result.identities).toMatchObject({ groups: 8 });
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      expect(await consumerConsent(session.con, sources.crm, '1')).toContainEqual({ channel: 'sms', status: 'granted', _source: sources.loyalty });
+    } finally {
+      session.close();
+    }
+  });
+
+  it('_consumer 与 _consumer_consent 被删掉后，数据没变的合并把它们补回', async () => {
+    const { acme, author } = await publishedIdentitySources({ consents: true });
+    const onLake = async <T>(f: (read: (sql: string) => Promise<unknown[]>) => Promise<T>) => {
+      const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+      try {
+        return await f(async sql => (await session.con.runAndReadAll(sql)).getRowObjectsJson());
+      } finally {
+        session.close();
+      }
+    };
+    const snapshot = () => onLake(async read => ({
+      consumer: await read('SELECT * FROM silver._consumer ORDER BY consumer_id'),
+      consent: await read('SELECT * FROM silver._consumer_consent ORDER BY consumer_id, channel'),
+    }));
+    const before = await snapshot();
+    expect(before.consent.length).toBeGreaterThan(0);
+    for (const table of ['_consumer', '_consumer_consent']) {
+      await onLake(read => read(`DROP TABLE silver.${table}`));
+      await mergeNow(author);
+      await drain();
+      expect((await lastMerge(acme)).result.identities).toMatchObject({ groups: 8 });
+      expect(await snapshot()).toEqual(before);
+    }
   });
 });
 

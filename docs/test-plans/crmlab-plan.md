@@ -145,7 +145,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | K2 重复接入 | oms.orders 与 tmall.trades 同一批 tid | 映射 oms 后合并失败；体检判为重复接入；撤下后天猫金额不翻倍；⚠️ 不能合并互补字段（#144） |
 | K3 共用主数据 | POS 明细引用 mall 的 SKU | 按 `order_item.product_id → product.category` 分组时 POS 明细也有品类 |
 | K4 消费者同号 | pos 与 mall 都有 `customer_id = 1`（不同人） | 两个消费者 |
-| K5 同意冲突 | P01 在会员中心同意短信（早），POS 撤回（晚） | ⚠️ 两行都在，无「当前是否同意」（#145） |
+| K5 同意冲突 | P01 在会员中心同意短信（早），POS 撤回（晚） | `_consumer_consent` 里 P01 短信为 revoked |
 | K6 旧版本文档 | oms 里 P01 的天猫单另有旧版本文档（WAIT_BUYER_PAY 999 → TRADE_FINISHED 150） | 去重后 1 笔 150.00 |
 | K7 行过滤 | pos 测试门店 T999 有 37 笔 | 标准层没有；合并记录显示过滤 37 行 |
 | K8 属性冲突 | P01 城市上海 / 杭州 | 维度写 `order.customer_id -> customer.city` 时 P01 按源记录拆成两行；写 `consumer.city` 时一行，城市取 `updated_at` 较新的那条（ADR-0027，#174） |

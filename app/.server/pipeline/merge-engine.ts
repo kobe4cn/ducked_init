@@ -12,7 +12,7 @@ import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
 import { MERGES, RECORDS, SILVER } from './lake-schemas';
 import { entityOf, type EntityRelation, type RelationStat } from '../../lib/canonical-model';
-import { consumerSensitive, DEFAULT_RULES, DEVICE_OWNER, IDENTITIES, resolveIdentities, type IdentitySummary } from './identity-engine';
+import { CONSUMER, CONSUMER_CONSENT, consumerSensitive, DEFAULT_RULES, DEVICE_OWNER, IDENTITIES, resolveIdentities, type IdentitySummary } from './identity-engine';
 import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
 import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
 import { bronzeTablesOf, checkViewSql } from './source-view-engine';
@@ -80,11 +80,11 @@ export type MergeRecord = {
 /** 合并任务里的一条已发布关系（内置 ref 与已发布登记上的关系）；sensitive：起点是敏感字段，标准层里是哈希，入队时算好 */
 export interface RelationParam extends EntityRelation { sensitive: boolean }
 
-/** 合并后的身份打通：摘要与耗时，失败时是错误信息；这次没改到 customer 与 event 时跳过（skipped 是原因），沿用上次的结果 */
+/** 合并后的身份打通：摘要与耗时，失败时是错误信息；这次没改到 customer、event 与 consent 时跳过（skipped 是原因），沿用上次的结果 */
 export type IdentityRecord = { durationMs: number } & (IdentitySummary | { error: string } | { skipped: string });
 
-/** 身份打通读的标准层表：customer 与 event（设备归属读登录事件） */
-const IDENTITY_INPUTS = ['customer', 'event'];
+/** 身份打通读的标准层表：customer、event（设备归属读登录事件）与 consent（统一消费者的同意） */
+const IDENTITY_INPUTS = ['customer', 'event', 'consent'];
 
 /**
  * 标准层的写法，记在合并日志里；上次合并的写法不同时由全部批次重建。
@@ -550,7 +550,7 @@ export async function relationStats(con: DuckDBConnection, relations: RelationPa
 }
 
 /**
- * 这次合并是否改到了身份打通读的表：customer 或 event 的映射有插入、更新、删除或重建过。跳过与出错的映射不算（出错的已回滚）
+ * 这次合并是否改到了身份打通读的表：customer、event 或 consent 的映射有插入、更新、删除或重建过。跳过与出错的映射不算（出错的已回滚）
  */
 const changedIdentityInputs = (records: MergeRecord[]) => records.some(r =>
   IDENTITY_INPUTS.includes(r.entity) && 'mode' in r && (r.mode === 'rebuild' || r.inserted + r.updated + r.deleted > 0));
@@ -585,7 +585,7 @@ async function mergeOne(
 
 /**
  * 按已发布的映射合并到标准层，每个映射各自一个事务：一个映射失败（表达式在数据上出错、值字典缺取值、去重键为空）
- * 只影响它自己，其他映射照常合并。不同实体的映射并行合并，同一实体的串行（ADR-0015）。之后本租户有 silver.customer、且这次改到了 customer 或 event 时整表重算身份打通
+ * 只影响它自己，其他映射照常合并。不同实体的映射并行合并，同一实体的串行（ADR-0015）。之后本租户有 silver.customer、且这次改到了 customer、event 或 consent 时整表重算身份打通
  * （一次合并只带受影响的映射，增量会漏）；打通结果表不在或 forceIdentities（入队时发现匹配规则变了或上次打通失败）时同样重算，
  * 否则沿用上次的结果，identities 记成跳过。失败同样只记在 identities 里。rules 是租户全部 customer 映射汇总出的匹配规则（入队合并时算好，不只是这次带的映射）；
  * 打通之前统计 relations（租户全部已发布关系，同样入队时算好）的孤儿，记在 relations 里（耗时记在 relationsMs），出错不算合并失败；salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐
@@ -615,11 +615,11 @@ export async function mergeToSilver(
   const merged = { mappings: records, ...(orphans && { relations: orphans, relationsMs: Date.now() - relationsFrom }) };
   if (!await tableExists(con, SILVER, 'customer')) return merged;
   const resultsExist = async () => {
-    for (const t of [IDENTITIES, DEVICE_OWNER]) if (!await tableExists(con, SILVER, t.split('.')[1])) return false;
+    for (const t of [IDENTITIES, DEVICE_OWNER, CONSUMER, CONSUMER_CONSENT]) if (!await tableExists(con, SILVER, t.split('.')[1])) return false;
     return true;
   };
   if (!forceIdentities && !changedIdentityInputs(records) && await resultsExist()) {
-    return { ...merged, identities: { durationMs: 0, skipped: '本次合并没有改到 customer 与 event，沿用上次的身份打通结果' } };
+    return { ...merged, identities: { durationMs: 0, skipped: '本次合并没有改到 customer、event 与 consent，沿用上次的身份打通结果' } };
   }
   const startedAt = Date.now();
   try {
