@@ -139,7 +139,7 @@ export function createDispatcher({
   let lastSyncCheck = 0;
   /**
    * 为到期的数据源入队同步，再入队核对（有同步在排队时等下一次检查），然后为有新变化的租户入队合并，为有到期快照的租户入队快照过期，
-   * 最后为依赖的实体有新合并的已发布指标与标签入队当天的刷新：
+   * 最后为依赖的实体有新合并的已发布指标、标签与模板入队当天的刷新：
    * 每 syncCheckMs 一次，多个调度器同时检查也不会重复入队
    */
   async function scheduleSyncs() {

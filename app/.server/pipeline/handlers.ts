@@ -285,12 +285,13 @@ export const HANDLERS = {
   },
   // RFM 分层：按参数（asOf 必填，其余取模板默认值）把打通后的统一消费者的订单编译成 R/F/M 分与人群，
   // 写进结果层的一张快照表 gold."rfm__<任务 ID>"，只有 consumer_id 与分值，没有明文。打通不到消费者的订单不计入，结果里报告条数。
-  // 发布模板定义后入队的任务带上定义版本 definitionVersion（登记快照时记下），其余参数是定义的参数加上 asOf；也可以直接给参数、不带版本。
+  // 发布、重新计算或定时刷新入队的任务带上定义版本 definitionVersion 与来源 trigger（登记快照时记下），其余参数是定义的参数加上 asOf；
+  // 也可以直接给参数、不带版本。
   // 计算前先对读到的实体跑内置断言（ADR-0026），error 级失败时任务失败、不写快照表；结果带全部断言 assertions
   'gold.rfm': {
     label: TEMPLATES.rfm.label,
     async run(con, params, { taskId }) {
-      const { definitionVersion: _, ...rest } = params;
+      const { definitionVersion: _, trigger: __, ...rest } = params;
       const rfm = TEMPLATES.rfm.parse(rest);
       const present = await rows<{ name: string }>(con, `
         SELECT table_name AS name FROM information_schema.tables

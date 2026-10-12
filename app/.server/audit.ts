@@ -113,6 +113,10 @@ const ACTIONS = {
     label: '重新计算模板',
     describe: (d: Detail) => `${templateLabel(d.template)}，按第 ${d.version} 版参数，参考日期 ${d.asOf}`,
   },
+  'template.refreshed': {
+    label: '定时刷新模板',
+    describe: (d: Detail) => `${templateLabel(d.template)}，按第 ${d.version} 版参数刷新 ${d.asOf}`,
+  },
   'template.draft_discarded': {
     label: '丢弃模板参数草稿',
     describe: (d: Detail) => `${templateLabel(d.template)}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '回到默认参数'}`,

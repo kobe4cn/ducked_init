@@ -1,13 +1,14 @@
 // app/.server/templates.ts —— 分析模板定义：成员调整分析模板（如 RFM）的参数，校验通过才能保存为草稿；草稿按映射同样的规则双人发布——
 // 由最后保存它的人以外的另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本，从没发布过时回到注册表里的默认参数）。
 // 发布后版本锁定，并以新参数（加上当天的 asOf）入队一次模板任务，快照登记时记下定义版本（ADR-0004、0015）。
-// 也可以按当前生效的版本重新计算（可指定参考日期），不产生新版本。一律限定在操作者所属租户内
+// 也可以按当前生效的版本重新计算（可指定参考日期），不产生新版本；依赖的实体有新合并后调度器按当天以生效版本重算（refresh.ts，ADR-0028）。
+// 任务参数与快照记下来源（发布、手动重新计算、定时刷新）。一律限定在操作者所属租户内
 import { and, desc, eq, getTableColumns, inArray, sql } from 'drizzle-orm';
 import { assertCan } from './access';
-import { recordAudit } from './audit';
+import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
-import { tasks, templateDefinitions, templateVersions, tenants } from './db/schema';
+import { tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { TEMPLATES } from './pipeline/templates';
 import { insertTask } from './tasks';
@@ -15,7 +16,7 @@ import { insertTask } from './tasks';
 export type TemplateId = keyof typeof TEMPLATES;
 
 /** 模板 → 运行它的任务类型 */
-const TASK_KINDS = { rfm: 'gold.rfm' } as const satisfies Record<TemplateId, string>;
+export const TASK_KINDS = { rfm: 'gold.rfm' } as const satisfies Record<TemplateId, string>;
 
 /** 可以展示给成员的业务错误 */
 export class TemplateError extends Error {
@@ -45,6 +46,13 @@ export const todayUtc = () => new Date().toISOString().slice(0, 10);
 
 const ofDefinition = (tenantId: string, template: TemplateId) =>
   and(eq(templateDefinitions.tenantId, tenantId), eq(templateDefinitions.template, template));
+
+/**
+ * 在调用方的事务里以模板定义一版的参数加上 asOf 入队一次模板任务，任务参数带上定义版本 definitionVersion 与来源 trigger（登记快照时记下）
+ */
+export const enqueueTemplate = (
+  tx: Tx, tenantId: string, template: TemplateId, params: Record<string, unknown>, version: number, asOf: string, trigger: SnapshotTrigger,
+) => insertTask(tx, tenantId, TASK_KINDS[template], { ...params, asOf, definitionVersion: version, trigger });
 
 /**
  * 本租户某个模板的定义：各版本（最新的在前）、草稿与最近的已发布版本，当前生效的参数（没有已发布版本时为注册表里的默认参数），
@@ -112,7 +120,7 @@ export async function saveDraft(actor: CurrentMember, id: string, params: Record
 
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。发布前再校验一次参数。
- * 发布后版本锁定，并以这一版的参数加上当天（UTC）的 asOf 入队一次模板任务，任务参数带上 definitionVersion。返回入队的任务
+ * 发布后版本锁定，并以这一版的参数加上当天（UTC）的 asOf 入队一次模板任务（来源 publish）。返回入队的任务
  */
 export async function publishTemplate(actor: CurrentMember, id: string, version: number) {
   assertCan(actor, 'publish');
@@ -142,13 +150,13 @@ export async function publishTemplate(actor: CurrentMember, id: string, version:
       targetId: draft.definitionId,
       detail: { template, version, authors: draft.authors, lastEditor: draft.lastEditor },
     });
-    return insertTask(tx, actor.tenant.id, TASK_KINDS[template], { ...definition, asOf: todayUtc(), definitionVersion: version });
+    return enqueueTemplate(tx, actor.tenant.id, template, definition, version, todayUtc(), 'publish');
   });
 }
 
 /**
  * 重新计算：需要发布权限。以当前生效的已发布版本的参数，加上参考日期 asOf（不给时为当天，UTC；不能晚于今天）入队一次模板任务，
- * 任务参数带上这一版的 definitionVersion，不产生新版本。还没有已发布版本时不能重新计算（第一次计算由发布入队）。
+ * 来源 manual，不产生新版本。还没有已发布版本时不能重新计算（第一次计算由发布入队）。
  * 锁住租户行后检查：本租户已有同一模板的任务在排队或运行时拒绝。返回按的版本号与入队的任务
  */
 export async function recomputeTemplate(actor: CurrentMember, id: string, asOf?: string) {
@@ -165,8 +173,7 @@ export async function recomputeTemplate(actor: CurrentMember, id: string, asOf?:
       .where(and(ofDefinition(actor.tenant.id, template), eq(templateVersions.status, 'published')))
       .orderBy(desc(templateVersions.version)).limit(1);
     if (!published) throw new TemplateError('还没有发布过参数，发布第一版后会自动计算一次');
-    const params = { ...published.params, asOf: day };
-    validated(() => TEMPLATES[template].parse(params));
+    validated(() => TEMPLATES[template].parse({ ...published.params, asOf: day }));
     // 校验过格式后两边都是 YYYY-MM-DD，可以直接比较字符串
     if (day > todayUtc()) throw new TemplateError(`参考日期 ${day} 晚于今天（UTC ${todayUtc()}）`);
     const [pending] = await tx.select({ id: tasks.id }).from(tasks)
@@ -180,7 +187,7 @@ export async function recomputeTemplate(actor: CurrentMember, id: string, asOf?:
       targetId: published.definitionId,
       detail: { template, version: published.version, asOf: day },
     });
-    const task = await insertTask(tx, actor.tenant.id, kind, { ...params, definitionVersion: published.version });
+    const task = await enqueueTemplate(tx, actor.tenant.id, template, published.params, published.version, day, 'manual');
     return { version: published.version, task };
   });
 }
