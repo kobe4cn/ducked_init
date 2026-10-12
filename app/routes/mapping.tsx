@@ -345,7 +345,7 @@ function SourceDrift({ drift, canAdd, submitting }: { drift: NonNullable<LoaderD
   );
 }
 
-const COLUMN_FIELD_LABELS: Record<ColumnField, string> = { type: '类型', expr: '表达式', dictionary: '值字典', otherwise: '兜底', sensitive: '敏感标记', keySpace: '键空间' };
+const COLUMN_FIELD_LABELS: Record<ColumnField, string> = { type: '类型', expr: '表达式', dictionary: '值字典', otherwise: '兜底', sensitive: '敏感标记', keySpace: '键空间', customerSource: '跨源引用的数据源' };
 
 /** 草稿与最新已发布版本的差异：首个版本、没有差异，或逐项列出列与去重 / 身份打通 / 键空间配置的变化 */
 function DraftDiff({ entity, version, diff }: { entity: string; version: number; diff: PlanDiff & { against: number | null } }) {

@@ -18,7 +18,7 @@ import { consumerSensitive, identityRules, type IdentitySummary } from './pipeli
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import type { MergeMappingParam, MergeRecord, RelationParam } from './pipeline/merge-engine';
 import { draftCustomMapping, draftMapping, DraftError } from './pipeline/mapping-draft';
-import { checkMapping, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
+import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
@@ -240,12 +240,33 @@ export async function ignoreColumn(actor: CurrentMember, mappingId: string, colu
 }
 
 /**
- * 校验映射文档（对照数据源的字段、已发布的源视图与已发布的自定义实体登记；给了 registrations 时对照它），不通过时抛出带问题列表的 MappingError。
- * viewId 是输入为源视图时这个视图的 ID，否则为 null
+ * 跨源引用的目标数据源（customer_source）：按名字找同租户的数据源，看它有没有已发布的 customer 映射。
+ * YAML 里没写 customer_source 时不查平台库
+ */
+async function customerSources(tenantId: string, sourceId: string, yaml: string): Promise<CustomerSources> {
+  if (!yaml.includes('customer_source')) return { self: sourceId, resolve: () => 'missing' };
+  const db = getDb();
+  const all = await db.select({ id: sources.id, name: sources.name }).from(sources).where(eq(sources.tenantId, tenantId));
+  const published = new Set((await db.selectDistinct({ sourceId: mappings.sourceId }).from(mappings)
+    .innerJoin(mappingVersions, eq(mappingVersions.mappingId, mappings.id))
+    .where(and(eq(mappings.tenantId, tenantId), eq(mappings.entity, 'customer'), eq(mappingVersions.status, 'published')))).map(r => r.sourceId));
+  return {
+    self: sourceId,
+    resolve: name => {
+      const source = all.find(s => s.name === name);
+      if (!source) return 'missing';
+      return published.has(source.id) ? { id: source.id } : 'unpublished';
+    },
+  };
+}
+
+/**
+ * 校验映射文档（对照数据源的字段、已发布的源视图、已发布的自定义实体登记与跨源引用的目标数据源；给了 registrations 时对照它），不通过时抛出带问题列表的 MappingError。
+ * viewId 是输入为源视图时这个视图的 ID，否则为 null；notices 是不拦保存与发布的提示
  */
 export async function checkMappingDraft(tenantId: string, sourceId: string, yaml: string, registrations?: Map<string, RegisteredEntity>) {
   const entities = registrations ?? await publishedCustomEntities(getDb(), tenantId);
-  const result = checkMapping(yaml, await sourceColumns(tenantId, sourceId), entities);
+  const result = checkMapping(yaml, await sourceColumns(tenantId, sourceId), entities, await customerSources(tenantId, sourceId, yaml));
   if (!result.ok) throw new MappingError(`映射有 ${result.issues.length} 处问题，未保存`, 400, result.issues);
   const [view] = result.plan.view ? await getDb().select({ id: sourceViews.id }).from(sourceViews)
     .where(and(eq(sourceViews.tenantId, tenantId), eq(sourceViews.sourceId, sourceId), eq(sourceViews.name, result.plan.table))) : [];

@@ -2,7 +2,7 @@
 // 表达式里比较与逻辑运算的编译；
 // 以及对照面板从编辑中的 YAML 读出的要点（已对应的字段、去重键）
 import { describe, expect, it } from 'vitest';
-import { checkMapping } from '../app/.server/pipeline/mapping-spec';
+import { checkMapping, type CustomerSources } from '../app/.server/pipeline/mapping-spec';
 import { compileExpression, parseExpression } from '../app/lib/mapping-expr';
 import { mappingOutline } from '../app/lib/mapping-outline';
 
@@ -251,6 +251,62 @@ describe('键空间', () => {
     ]);
     const r = checkMapping(tickets(['ticket_no'], 'x').replace('key_space: x\n', ''), columns, registered);
     expect(!r.ok && r.issues).toEqual([expect.objectContaining({ path: 'extensions.note.key_space', message: expect.stringContaining('note 不指向别的实体') })]);
+  });
+});
+
+describe('跨源引用 customer_source', () => {
+  /** 本源 src-pos；mall_pg 有已发布的 customer 映射，crm_draft 没有 */
+  const sources: CustomerSources = {
+    self: 'src-pos',
+    resolve: name => (name === 'mall_pg' ? { id: 'src-mall' } : name === 'pos' ? { id: 'src-pos' } : name === 'crm_draft' ? 'unpublished' : 'missing'),
+  };
+  const withSource = (target: string) => ok.replace('  customer_id: customer_id\n', `  customer_id: { expr: string(customer_id), customer_source: ${target} }\n`);
+  /** 标准订单的 x_buyer 指向消费者（关系登记在自定义实体上也算） */
+  const registered = new Map([['custom_ticket', {
+    name: 'custom_ticket', primaryKey: ['ticket_no'], fields: [{ name: 'ticket_no', type: 'string' as const, sensitive: false }],
+    relations: [{ from: { entity: 'order', field: 'x_buyer' }, ref: { entity: 'customer', field: 'customer_id' } }],
+  }]]);
+
+  it('计划里声明了的列带目标源的 sourceId，指向 customer 的引用列都带 customerRef', () => {
+    const r = checkMapping(`${withSource('mall_pg')}extensions:\n  x_buyer: { type: string, expr: status, customer_source: mall_pg }\n`, columns, registered, sources);
+    expect(r.ok && r.notices).toEqual([]);
+    const col = (name: string) => (r.ok ? r.plan.columns.find(c => c.name === name) : undefined);
+    expect(col('customer_id')).toMatchObject({ customerSource: 'src-mall', customerRef: true });
+    expect(col('x_buyer')).toMatchObject({ customerSource: 'src-mall', customerRef: true });
+    expect(col('status')).not.toHaveProperty('customerRef');
+    // 没声明时除 customerRef 外与现在一致
+    const plain = checkMapping(ok, columns, registered, sources);
+    expect(plain.ok && plain.plan.columns.find(c => c.name === 'customer_id')).toEqual({ name: 'customer_id', type: 'string', expr: 'customer_id', customerRef: true });
+  });
+
+  it('不指向 customer、目标源不存在、目标源没有已发布的 customer 映射时报错并指出行列', () => {
+    const notRef = checkMapping(ok.replace('    expr: status\n', '    expr: status\n    customer_source: mall_pg\n'), columns, new Map(), sources);
+    expect(!notRef.ok && notRef.issues).toEqual([
+      expect.objectContaining({ line: 11, path: 'fields.status.customer_source', message: expect.stringContaining('status 不指向消费者') }),
+    ]);
+    const missing = checkMapping(withSource('nope'), columns, new Map(), sources);
+    expect(!missing.ok && missing.issues).toEqual([
+      expect.objectContaining({ line: 6, path: 'fields.customer_id.customer_source', message: expect.stringContaining('没有数据源 nope') }),
+    ]);
+    const unpublished = checkMapping(withSource('crm_draft'), columns, new Map(), sources);
+    expect(!unpublished.ok && unpublished.issues).toEqual([
+      expect.objectContaining({ path: 'fields.customer_id.customer_source', message: expect.stringContaining('crm_draft 还没有已发布的消费者（customer）映射') }),
+    ]);
+  });
+
+  it('写的就是本数据源时只提示可以省略，不拦发布，计划里也不带', () => {
+    const r = checkMapping(withSource('pos'), columns, new Map(), sources);
+    expect(r.ok && r.notices).toEqual([expect.objectContaining({ line: 6, path: 'fields.customer_id.customer_source', message: expect.stringContaining('可以省略') })]);
+    expect(r.ok && r.plan.columns.find(c => c.name === 'customer_id')).not.toHaveProperty('customerSource');
+  });
+
+  it('不传数据源回调时只查语法与是否指向 customer', () => {
+    const r = checkMapping(withSource('nope'), columns);
+    expect(r.ok && r.plan.columns.find(c => c.name === 'customer_id')).toEqual({ name: 'customer_id', type: 'string', expr: 'string(customer_id)', customerRef: true });
+    expect(issuesWith(ok.replace('    expr: status\n', '    expr: status\n    customer_source: mall_pg\n'), columns)).toEqual([
+      expect.objectContaining({ path: 'fields.status.customer_source' }),
+    ]);
+    expect(issuesWith(withSource("''"), columns)).toEqual([expect.objectContaining({ path: 'fields.customer_id.customer_source' })]);
   });
 });
 

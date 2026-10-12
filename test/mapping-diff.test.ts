@@ -94,4 +94,12 @@ describe('映射版本差异', () => {
     expect(diffPlans(prev, next)).toMatchObject({ keySpace: { from: null, to: 'pos' }, changed: [{ name: 'order_id', fields: ['keySpace'] }], empty: false });
     expect(diffPlans(next, next)).toMatchObject({ keySpace: null, changed: [], empty: true });
   });
+
+  it('跨源引用的目标数据源变了算作列的改动；只多了 customerRef 不算', () => {
+    const prev = plan();
+    const ref = plan({ columns: prev.columns.map(c => (c.name === 'email' ? { ...c, customerRef: true as const } : c)) });
+    expect(diffPlans(prev, ref)).toMatchObject({ changed: [], empty: true });
+    const next = plan({ columns: ref.columns.map(c => (c.name === 'email' ? { ...c, customerSource: 'src-mall' } : c)) });
+    expect(diffPlans(ref, next)).toMatchObject({ changed: [{ name: 'email', fields: ['customerSource'] }], empty: false });
+  });
 });

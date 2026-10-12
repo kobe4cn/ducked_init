@@ -3,7 +3,7 @@
 import type { MergePlan, PlanColumn } from '~/.server/pipeline/mapping-spec';
 
 /** 列上可能改动的属性 */
-export type ColumnField = 'type' | 'expr' | 'dictionary' | 'otherwise' | 'sensitive' | 'keySpace';
+export type ColumnField = 'type' | 'expr' | 'dictionary' | 'otherwise' | 'sensitive' | 'keySpace' | 'customerSource';
 
 /** 一项配置前后的值，没变化时整项为 null */
 export type Change<T> = { from: T; to: T } | null;
@@ -45,6 +45,7 @@ function columnChanges(a: PlanColumn, b: PlanColumn): ColumnField[] {
     ['otherwise', a.otherwise === b.otherwise],
     ['sensitive', !!a.sensitive === !!b.sensitive],
     ['keySpace', a.keySpace === b.keySpace],
+    ['customerSource', a.customerSource === b.customerSource],
   ] as const).flatMap(([field, same]) => (same ? [] : [field]));
 }
 

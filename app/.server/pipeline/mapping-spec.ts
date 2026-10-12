@@ -2,6 +2,7 @@
 // 先按 JSON Schema（MAPPING_SCHEMA）校验结构，再对照标准模型与源表的字段做语义校验：字段表达式只能用白名单函数、只能引用源表里有的字段，
 // 值字典与兜底值只能对应到标准枚举，去重键与取最新字段必须是映射出来的字段，身份打通的匹配字段（只用于 customer）必须是映射出来的敏感字段；扩展字段可标成敏感（只能是文本），内置敏感字段不能取消敏感标记。每个问题都带 YAML 里的行列位置，常见错误还附上改好的写法（hint）。
 // 映射可以声明键空间（ADR-0024）：单列文本主键在标准层写成 <键空间>:<原值>，指向别的实体的字段（内置 ref 与已登记关系的起点）可以在字段上写同样的键空间。
+// 指向 customer 的引用字段可以写 customer_source（目标消费者所在数据源的名字），计划里记成目标数据源 ID；写的是本源时只提示可以省略。
 // 映射可以写行过滤 where（ADR-0024）：返回布尔的表达式，不满足（含取值为空）的源记录不进标准层。
 // 校验通过后得到合并计划（MergePlan）：标准层的列、每列的表达式与值字典、去重键与取最新字段、身份打通的匹配规则，交给工作进程编译执行（ADR-0015）
 import { Ajv, type ErrorObject } from 'ajv';
@@ -14,7 +15,7 @@ import { fieldsForColumn, normalizeName, similarFields, similarNames, standardVa
 import { ExprError, FUNCTIONS, KIND_FIELD_TYPES, kindOf, parseExpression, ref, referencedColumns, type Expr } from '../../lib/mapping-expr';
 
 /** 字段的写法：表达式本身，或带值字典（与兜底值）、键空间的对象 */
-export type FieldSpec = string | { expr: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean; key_space?: string };
+export type FieldSpec = string | { expr: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean; key_space?: string; customer_source?: string };
 
 export interface MappingSpec {
   /** 标准模型的大版本 */
@@ -31,7 +32,7 @@ export interface MappingSpec {
   key_space?: string;
   fields?: Record<string, FieldSpec>;
   /** 扩展字段（标准实体上以 x_ 开头）或自定义实体的全部字段：带类型；sensitive 为真时标准层只存加盐哈希 */
-  extensions?: Record<string, { type: FieldType; expr: string; label?: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean; key_space?: string }>;
+  extensions?: Record<string, { type: FieldType; expr: string; label?: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean; key_space?: string; customer_source?: string }>;
   /** 去重键与取最新规则：同一去重键的多行只留一行，取最新字段最大的那行。不写时按实体主键去重 */
   dedupe?: { key: string[]; latest?: string };
   /** 身份打通的匹配字段（只用于 customer）：本映射映射出来的敏感字段，数组顺序即优先级。不写时用平台默认规则 */
@@ -64,6 +65,7 @@ const fieldSpec = {
       otherwise: { type: ['string', 'null'], minLength: 1 },
       sensitive: { type: 'boolean' },
       key_space: keySpace,
+      customer_source: { type: 'string', minLength: 1 },
     },
   },
 };
@@ -96,6 +98,7 @@ export const MAPPING_SCHEMA = {
           otherwise: { type: ['string', 'null'], minLength: 1 },
           sensitive: { type: 'boolean' },
           key_space: keySpace,
+          customer_source: { type: 'string', minLength: 1 },
         },
       },
     },
@@ -143,10 +146,12 @@ export interface MappingIssue { line: number; col: number; path: string; message
  * 标准层里的一列：类型、表达式、值字典与标准枚举。
  * otherwise 是兜底值：值字典里没有（或没有值字典时不是标准枚举）的取值写成它，null 表示写成空；不写时这样的取值让合并失败。
  * sensitive：敏感字段（内置的与标成敏感的扩展字段），标准层只存加盐哈希。
- * keySpace：键空间（主键列取映射的键空间，引用列取字段上写的），标准层写成 <键空间>:<值>
+ * keySpace：键空间（主键列取映射的键空间，引用列取字段上写的），标准层写成 <键空间>:<值>。
+ * customerRef：指向 customer 的引用列（内置 ref 或已登记关系）；customerSource：字段上写的 customer_source 解析出的目标数据源 ID（跨源引用，写的是本源时不带）
  */
 export interface PlanColumn {
   name: string; type: FieldType; expr: string; dictionary?: Record<string, string>; enum?: readonly string[]; otherwise?: string | null; sensitive?: true; keySpace?: string;
+  customerSource?: string; customerRef?: true;
 }
 
 /** 合并计划：工作进程据此把源表的变更批次合并到标准层（MergeMappingParam 再加上映射与版本） */
@@ -174,13 +179,21 @@ export interface MergePlan {
   where?: string;
 }
 
-export type MappingCheck = { ok: true; spec: MappingSpec; plan: MergePlan } | { ok: false; issues: MappingIssue[] };
+/** 校验结果；notices 是不拦发布的提示（如 customer_source 写的就是本数据源） */
+export type MappingCheck = { ok: true; spec: MappingSpec; plan: MergePlan; notices: MappingIssue[] } | { ok: false; issues: MappingIssue[] };
 
 /**
  * 源表（view 为真时是已发布的源视图）的字段：不能用于映射时返回原因（不在同步范围、还没采集、没有发布等）。
  * 不给时不检查源表（工作进程里只编译，不再对照）
  */
 export type SourceColumns = (name: string, view?: boolean) => SourceColumn[] | string;
+
+/**
+ * 跨源引用的目标数据源：self 是本映射所属数据源的 ID；resolve 按 customer_source 里写的数据源名找同租户的数据源，
+ * 返回它的 ID，没有这个数据源时为 missing，它还没有已发布的 customer 映射时为 unpublished。
+ * 不给时不对照数据源（脚本与工作进程），只查是否指向 customer，计划里也不带 customerSource
+ */
+export interface CustomerSources { self: string; resolve(name: string): { id: string } | 'missing' | 'unpublished' }
 
 /**
  * 自定义实体已发布的登记（ADR-0019，custom-entities.ts 的 RegisteredEntity 里校验要用的部分），按实体名；没登记或只有草稿的不在里面。
@@ -309,7 +322,7 @@ const ISSUE_ORDER = (a: MappingIssue, b: MappingIssue) => a.line - b.line || a.c
  * 校验映射文档：YAML 语法、JSON Schema、对照标准模型、源表字段与自定义实体登记的语义检查。
  * 通过时返回规范化后的文档与合并计划，否则返回全部问题（按位置排序）
  */
-export function checkMapping(text: string, sourceColumns?: SourceColumns, registered?: RegisteredEntities): MappingCheck {
+export function checkMapping(text: string, sourceColumns?: SourceColumns, registered?: RegisteredEntities, customerSources?: CustomerSources): MappingCheck {
   const lines = new LineCounter();
   const doc = parseDocument(text, { lineCounter: lines, prettyErrors: false });
   if (doc.errors.length) {
@@ -323,9 +336,10 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
   }
   const at = locator(doc, lines);
   const issues: MappingIssue[] = [];
-  const issue = (path: Path, message: string, { atKey = false, offset = 0, hint }: { atKey?: boolean; offset?: number; hint?: string } = {}) => {
+  const notices: MappingIssue[] = [];
+  const issue = (path: Path, message: string, { atKey = false, offset = 0, hint, notice = false }: { atKey?: boolean; offset?: number; hint?: string; notice?: boolean } = {}) => {
     const { line, col } = at(path, atKey);
-    issues.push({ line, col: col + offset, path: path.join('.'), message, ...(hint && { hint }) });
+    (notice ? notices : issues).push({ line, col: col + offset, path: path.join('.'), message, ...(hint && { hint }) });
   };
 
   const value = doc.toJS() as unknown;
@@ -432,9 +446,9 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
     }
   };
 
-  /** 已登记关系里起点是本实体的字段（关系可以登记在终点实体上：标准实体的 x_ 字段指向自定义实体）；不给登记时为 null，不对照 */
-  const relationOrigins = registered && new Set([...registered.values()]
-    .flatMap(e => e.relations ?? []).filter(r => r.from.entity === spec.entity).map(r => r.from.field));
+  /** 已登记关系里起点是本实体的字段及其终点实体（关系可以登记在终点实体上：标准实体的 x_ 字段指向自定义实体）；不给登记时为 null，不对照 */
+  const relationOrigins = registered && new Map([...registered.values()]
+    .flatMap(e => e.relations ?? []).filter(r => r.from.entity === spec.entity).map(r => [r.from.field, r.ref.entity]));
   /** 一列不能加键空间的原因（敏感字段存的是哈希，非文本列放不下前缀）；能加时为 null */
   const keySpaceRefusal = (c: Pick<PlanColumn, 'name' | 'type' | 'sensitive'>) => {
     if (c.type !== 'string') return `${c.name} 是 ${c.type}（${FIELD_TYPES[c.type].label}）：键空间只能用于文本`;
@@ -447,6 +461,27 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
       ? `${c.name} 不指向别的实体：字段上的键空间只能写在标准模型内置的引用字段或已登记关系的起点上`
       : keySpaceRefusal(c);
     if (refusal) issue([...path, 'key_space'], refusal, { atKey: true });
+  };
+  /**
+   * 指向 customer 的引用列带上 customerRef；字段上的 customer_source 只能写在这样的列上（标准字段看内置 ref；不给登记时扩展字段不知道指向谁，不检查），
+   * 给了数据源回调时解析成目标数据源 ID：没有这个数据源、它没有已发布的 customer 映射时报错，写的就是本源时只提示可以省略
+   */
+  const checkFieldCustomerSource = (path: Path, c: PlanColumn, standard: CanonicalField | undefined, target: string | undefined) => {
+    const toCustomer = standard?.ref?.entity === 'customer' || relationOrigins?.get(c.name) === 'customer';
+    if (toCustomer) c.customerRef = true;
+    if (target === undefined) return;
+    const sourcePath = [...path, 'customer_source'];
+    if (!toCustomer) {
+      if (!standard && !relationOrigins) return;
+      issue(sourcePath, `${c.name} 不指向消费者（customer）：customer_source 只能写在指向 customer 的引用字段上`, { atKey: true });
+      return;
+    }
+    if (!customerSources) return;
+    const resolved = customerSources.resolve(target);
+    if (resolved === 'missing') issue(sourcePath, `没有数据源 ${target}：customer_source 写目标消费者所在数据源的名字`, { atKey: true });
+    else if (resolved === 'unpublished') issue(sourcePath, `数据源 ${target} 还没有已发布的消费者（customer）映射，引用对不上：请先发布它的 customer 映射`, { atKey: true });
+    else if (resolved.id === customerSources.self) issue(sourcePath, `${target} 就是本数据源，customer_source 可以省略`, { atKey: true, notice: true });
+    else c.customerSource = resolved.id;
   };
 
   /** fields 下写了标准模型里没有的字段：按右边的源列名、去掉 x_ 的名字（同名、同义词、相近）猜该写的标准字段，x_ 开头的附上扩展字段的写法 */
@@ -519,6 +554,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
       ...(parts.key_space && { keySpace: parts.key_space }),
     };
     checkFieldKeySpace(['fields', name], column, !!field.ref);
+    checkFieldCustomerSource(['fields', name], column, field, parts.customer_source);
     planned.push(column);
   }
   const extensionName = new RegExp(custom ? CUSTOM_FIELD_PATTERN : EXTENSION_PATTERN);
@@ -564,6 +600,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
       ...(ext.key_space && { keySpace: ext.key_space }),
     };
     checkFieldKeySpace(['extensions', name], column, false);
+    checkFieldCustomerSource(['extensions', name], column, undefined, ext.customer_source);
     planned.push(column);
   }
   if (!planned.length) issue(spec.fields ? ['fields'] : [], '至少要映射一个字段');
@@ -649,6 +686,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
       ...(spec.key_space && primaryKey && { keySpace: spec.key_space }),
       ...(spec.where && { where: spec.where }),
     },
+    notices: notices.sort(ISSUE_ORDER),
   };
 }
 
