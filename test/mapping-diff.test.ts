@@ -1,4 +1,4 @@
-// 映射两个版本合并计划的差异：列的新增 / 删除 / 改动（类型、表达式、值字典、兜底、敏感标记），去重键、取最新字段、身份打通匹配字段的变化；
+// 映射两个版本合并计划的差异：列的新增 / 删除 / 改动（类型、表达式、值字典、兜底、敏感标记），去重键、取最新字段、身份打通匹配字段、属性取舍名次、行过滤的变化；
 // 没有已发布版本时是首个版本（纯函数）
 import { describe, expect, it } from 'vitest';
 import type { MergePlan } from '../app/.server/pipeline/mapping-spec';
@@ -28,7 +28,7 @@ describe('映射版本差异', () => {
     const next = plan({
       columns: prev.columns.map(c => (c.name === 'status' ? { ...c, dictionary: { refunded: 'refunded', paid: 'paid' }, enum: ['paid'] } : c)),
     });
-    expect(diffPlans(prev, next)).toEqual({ first: false, added: [], removed: [], changed: [], key: null, latest: null, identity: null, keySpace: null, empty: true });
+    expect(diffPlans(prev, next)).toEqual({ first: false, added: [], removed: [], changed: [], key: null, latest: null, identity: null, keySpace: null, survivorship: null, where: null, empty: true });
   });
 
   it('列出新增、删除的列和改了哪些属性的列', () => {
@@ -71,6 +71,18 @@ describe('映射版本差异', () => {
     expect(diffPlans(plan({ identity: { match: ['phone', 'email'] } }), plan({ identity: { match: ['email', 'phone'] } }))).toMatchObject({
       identity: { from: ['phone', 'email'], to: ['email', 'phone'] },
     });
+  });
+
+  it('属性取舍名次与行过滤的从无到有、改值、从有到无都给出前后两边', () => {
+    const bare = plan();
+    const v1 = plan({ survivorship: { priority: 1 }, where: "status <> 'test'" });
+    const v2 = plan({ survivorship: { priority: 2 }, where: "status <> 'void'" });
+    expect(diffPlans(bare, v1)).toMatchObject({ survivorship: { from: null, to: 1 }, where: { from: null, to: "status <> 'test'" }, empty: false });
+    expect(diffPlans(v1, v2)).toMatchObject({ survivorship: { from: 1, to: 2 }, where: { from: "status <> 'test'", to: "status <> 'void'" }, empty: false });
+    expect(diffPlans(v2, bare)).toMatchObject({ survivorship: { from: 2, to: null }, where: { from: "status <> 'void'", to: null }, empty: false });
+    // 只改其中一项也不算相同
+    expect(diffPlans(bare, plan({ survivorship: { priority: 1 } }))).toMatchObject({ survivorship: { from: null, to: 1 }, where: null, empty: false });
+    expect(diffPlans(v1, v1)).toMatchObject({ survivorship: null, where: null, empty: true });
   });
 
   it('映射级与字段级键空间的变化：映射的键空间给出前后两边，列上算作改了键空间', () => {

@@ -364,6 +364,12 @@ describe('编写与发布映射', () => {
     // 只改注释时计划相同
     expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: `# 只加注释\n${ORDERS}` })).status).toBe(302);
     expect(await (await reviewer.get(`/mappings/${id}`)).text()).toContain('data-diff-item="none"');
+    // 只加行过滤时不算相同，列出前后表达式
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: `${ORDERS}where: amount > 0\n` })).status).toBe(302);
+    const filtered = await (await reviewer.get(`/mappings/${id}`)).text();
+    expect(filtered).not.toContain('data-diff-item="none"');
+    expect(filtered).toContain('data-diff-item="where"');
+    expect(filtered).toContain('amount &gt; 0');
     // 查看已发布的 v1 时不展示
     expect(await (await reviewer.get(`/mappings/${id}?version=1`)).text()).not.toContain('data-draft-diff');
   });

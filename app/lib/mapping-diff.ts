@@ -1,4 +1,4 @@
-// app/lib/mapping-diff.ts —— 映射两个版本合并计划的结构化差异（发布前审阅草稿用）：列的新增、删除与改动，去重键、取最新字段、身份打通匹配字段、键空间的变化。
+// app/lib/mapping-diff.ts —— 映射两个版本合并计划的结构化差异（发布前审阅草稿用）：列的新增、删除与改动，去重键、取最新字段、身份打通匹配字段、键空间、属性取舍名次、行过滤的变化。
 // 只比用户写的部分：标准枚举（enum）来自标准模型，不算改动；值字典按内容比较，不看键的顺序
 import type { MergePlan, PlanColumn } from '~/.server/pipeline/mapping-spec';
 
@@ -20,6 +20,10 @@ export type PlanDiff =
     identity: Change<string[] | null>;
     /** 映射的键空间 */
     keySpace: Change<string | null>;
+    /** 属性取舍名次（survivorship.priority） */
+    survivorship: Change<number | null>;
+    /** 行过滤表达式，只比较文本 */
+    where: Change<string | null>;
     /** 两版的计划没有差异 */
     empty: boolean;
   };
@@ -56,13 +60,15 @@ export function diffPlans(prev: MergePlan | null, next: MergePlan): PlanDiff {
     const fields = old ? columnChanges(old, c) : [];
     return fields.length ? [{ name: c.name, fields }] : [];
   });
-  const change = <T extends readonly string[] | string | null>(from: T, to: T, same: (a: T, b: T) => boolean): Change<T> => (same(from, to) ? null : { from, to });
+  const change = <T extends readonly string[] | string | number | null>(from: T, to: T, same: (a: T, b: T) => boolean): Change<T> => (same(from, to) ? null : { from, to });
   const key = change(prev.key, next.key, sameList);
   const latest = change(prev.latest, next.latest, (a, b) => a === b);
   const identity = change(prev.identity?.match ?? null, next.identity?.match ?? null, sameList);
   const keySpace = change(prev.keySpace ?? null, next.keySpace ?? null, (a, b) => a === b);
+  const survivorship = change(prev.survivorship?.priority ?? null, next.survivorship?.priority ?? null, (a, b) => a === b);
+  const where = change(prev.where ?? null, next.where ?? null, (a, b) => a === b);
   return {
-    first: false, added, removed, changed, key, latest, identity, keySpace,
-    empty: !added.length && !removed.length && !changed.length && !key && !latest && !identity && !keySpace,
+    first: false, added, removed, changed, key, latest, identity, keySpace, survivorship, where,
+    empty: !added.length && !removed.length && !changed.length && !key && !latest && !identity && !keySpace && !survivorship && !where,
   };
 }

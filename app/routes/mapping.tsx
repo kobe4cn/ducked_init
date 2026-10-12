@@ -355,6 +355,7 @@ function DraftDiff({ entity, version, diff }: { entity: string; version: number;
   };
   const fieldList = (list: string[] | null, none = '—') => (list?.length ? list.map((n, i) => <span key={n}>{i > 0 && '、'}{label(n)}</span>) : none);
   const latestText = (name: string | null) => (name ? label(name) : '最近同步到的一行');
+  const codeText = (text: string | null) => <span className="font-mono">{text ?? '—'}</span>;
   return (
     <section className="mb-4 rounded-xl border bg-slate-50 p-4" data-draft-diff={version}>
       <h2 className="flex items-center gap-2 text-sm font-semibold">
@@ -373,7 +374,9 @@ function DraftDiff({ entity, version, diff }: { entity: string; version: number;
           {diff.key && <li data-diff-item="key">去重键：{fieldList(diff.key.from)} → {fieldList(diff.key.to)}</li>}
           {diff.latest && <li data-diff-item="latest">取最新字段：{latestText(diff.latest.from)} → {latestText(diff.latest.to)}</li>}
           {diff.identity && <li data-diff-item="identity">身份打通匹配字段：{fieldList(diff.identity.from, '平台默认')} → {fieldList(diff.identity.to, '平台默认')}</li>}
-          {diff.keySpace && <li data-diff-item="key-space">键空间：<span className="font-mono">{diff.keySpace.from ?? '—'}</span> → <span className="font-mono">{diff.keySpace.to ?? '—'}</span></li>}
+          {diff.keySpace && <li data-diff-item="key-space">键空间：{codeText(diff.keySpace.from)} → {codeText(diff.keySpace.to)}</li>}
+          {diff.survivorship && <li data-diff-item="survivorship">属性取舍名次：{diff.survivorship.from ?? '—'} → {diff.survivorship.to ?? '—'}</li>}
+          {diff.where && <li data-diff-item="where">行过滤：{codeText(diff.where.from)} → {codeText(diff.where.to)}</li>}
         </ul>
       )}
     </section>
