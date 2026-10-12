@@ -20,6 +20,11 @@ export type Snapshot = typeof snapshots.$inferSelect;
 
 /** 快照从创建起保留的天数 */
 export const SNAPSHOT_RETENTION_DAYS = 90;
+
+/** 快照来源在页面上的说法；老快照没记来源（null）时显示「—」 */
+export const triggerLabel = (trigger: SnapshotTrigger | null) =>
+  trigger ? ({ publish: '发布', backfill: '回刷', scheduled: '定时刷新', manual: '手动' } satisfies Record<SnapshotTrigger, string>)[trigger] : '—';
+
 export const CONSUMER_PAGE_SIZE = 50;
 
 /** 读一张快照用的计算资源 */

@@ -3,12 +3,14 @@
 // 定义页点「预览」展示前 50 行与总行数（查看者也能预览），标准层缺表时给出说明，不存在的定义 404；有草稿且已发布过时点「预览影响」展示指标与下游标签的变化人数；
 // 版本表里发布不了的成员看到原因，另一位数据工程师发布后入队 gold.dsl；丢弃草稿回到已发布版本，从没发布过时回到分析页；
 // 数据工程师看到「删除」按钮（分析师看不到、提交 403），被已发布标签引用的指标删不了，删除后回到分析页；
-// 有早于生效版本的快照时数据工程师点「回刷」入队按旧统计日的计算，分析师在按钮处看到原因、提交 403
+// 有早于生效版本的快照时数据工程师点「回刷」入队按旧统计日的计算，分析师在按钮处看到原因、提交 403；
+// 数据工程师点「重新计算」按生效版本以今天入队（连同下游标签，来源 manual），定义页显示最近一次刷新的时间与来源，分析页快照列表显示来源
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks } from '../../app/.server/db/schema';
 import { createDefinition, getDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
+import { todayUtc } from '../../app/.server/templates';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -256,5 +258,64 @@ describe('指标与标签定义页', () => {
     expect(queued.map(t => [t.params.key, t.params.definitionVersion, t.params.asOf])).toEqual([['revenue', 2, '2024-07-15']]);
     // 已在排队：再点给出原因
     expect(await (await engineer.post(path, { intent: 'backfill' })).text()).toContain('已有计算在排队或运行中');
+  });
+
+  it('分析页快照列表显示每张快照的来源，没有记来源的老快照显示「—」', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const snapshot = async (trigger: 'backfill' | null, asOf: string) => ({
+      tenantId: acme, template: 'metric:revenue', trigger,
+      taskId: (await getDb().insert(tasks).values({ tenantId: acme, kind: 'gold.dsl', status: 'succeeded' }).returning())[0]!.id, table: `gold.dsl__${asOf}`, params: { asOf }, rowCount: 3,
+      expiresAt: new Date(Date.now() + 86_400_000),
+    });
+    const [backfilled, old] = await getDb().insert(snapshots).values([await snapshot('backfill', '2024-07-01'), await snapshot(null, '2024-06-01')]).returning();
+
+    const html = await (await (await loginAs(app, 'viewer@acme.com')).get('/analytics')).text();
+    expect(html).toContain('来源');
+    expect(html).toMatch(new RegExp(`data-snapshot="${backfilled!.id}".*?data-snapshot-trigger[^>]*>回刷<`, 's'));
+    expect(html).toMatch(new RegExp(`data-snapshot="${old!.id}".*?data-snapshot-trigger[^>]*>—<`, 's'));
+  });
+
+  it('数据工程师点「重新计算」按生效版本以今天入队（连同下游标签，来源 manual），已在排队时拒绝；定义页显示最近一次刷新；分析师看不到按钮、提交 403', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const author = await memberOf(acme, 'de@acme.com', 'data_engineer');
+    const reviewer = await memberOf(acme, 'de2@acme.com', 'data_engineer');
+    // 标签引用的指标不能带维度
+    await createDefinition(author, 'metric', 'revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    const path = '/analytics/definitions/metric/revenue';
+    const engineer = await loginAs(app, 'de@acme.com');
+    // 还没发布：没有按钮，提交说明原因
+    expect(await (await engineer.get(path)).text()).not.toContain('data-recompute');
+    expect(await (await engineer.post(path, { intent: 'recompute' })).text()).toContain('还没有发布过');
+
+    const first = await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    await createDefinition(author, 'tag', 'buyer', 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n');
+    await publishDefinition(reviewer, 'tag', 'buyer', 1);
+    expect(await (await engineer.get(path)).text()).toMatch(/data-last-refresh[^>]*>还没有刷新过/);
+    // 发布入队的计算还在排队：拒绝
+    const busy = await engineer.post(path, { intent: 'recompute' });
+    expect(busy.status).toBe(400);
+    expect(await busy.text()).toContain('已有计算在排队或运行中');
+    await getDb().update(tasks).set({ status: 'succeeded' });
+    await getDb().insert(snapshots).values({
+      tenantId: acme, template: 'metric:revenue', definitionVersion: 1, trigger: 'scheduled', taskId: first.id, table: `gold.dsl__${first.id}`,
+      params: { kind: 'metric', key: 'revenue', asOf: '2024-07-15', definitionVersion: 1 }, rowCount: 1, expiresAt: new Date(Date.now() + 86_400_000),
+    });
+    expect(await (await engineer.get(path)).text()).toMatch(/data-last-refresh[^>]*>.*?定时刷新/s);
+
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    const analystPage = await (await analyst.get(path)).text();
+    expect(analystPage).toMatch(/data-recompute-denied[^>]*>.*?仅管理员、数据工程师可以发布映射与定义/s);
+    expect(analystPage).not.toContain('value="recompute"');
+    expect((await analyst.post(path, { intent: 'recompute' })).status).toBe(403);
+
+    const recomputed = await engineer.post(path, { intent: 'recompute' });
+    expect(recomputed.headers.get('location')).toBe(`${path}?recomputed=1`);
+    expect(await (await engineer.get(`${path}?recomputed=1`)).text()).toContain('已按生效的第 1 版入队今天的计算');
+    const queued = await getDb().select({ params: tasks.params }).from(tasks).where(eq(tasks.status, 'queued'));
+    expect(queued.map(t => [t.params.key, t.params.definitionVersion, t.params.asOf, t.params.trigger]).sort())
+      .toEqual([['buyer', 1, todayUtc(), 'manual'], ['revenue', 1, todayUtc(), 'manual']]);
+    expect(await (await engineer.post(path, { intent: 'recompute' })).text()).toContain('已有计算在排队或运行中');
   });
 });

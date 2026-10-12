@@ -1,4 +1,4 @@
-// app/routes/analytics.tsx —— 分析（有结果层查看权限的成员）：本租户分析模板任务产出的结果快照（带所用的模板定义版本），最新的在前；已过期的标灰、不能打开，登记时数据不完整的标「数据不完整」（详情在快照页）。
+// app/routes/analytics.tsx —— 分析（有结果层查看权限的成员）：本租户分析模板任务产出的结果快照（带所用的模板定义版本与来源），最新的在前；已过期的标灰、不能打开，登记时数据不完整的标「数据不完整」（详情在快照页）。
 // 有定义查看权限的成员从这里进入 RFM 模板参数页，有起草权限的成员从这里新建指标或标签；指标与标签（template 为 metric:<键>、tag:<键>）的快照链接到它们的定义页（ADR-0025）
 import { Plus, SlidersHorizontal } from 'lucide-react';
 import { Link } from 'react-router';
@@ -6,7 +6,7 @@ import type { Route } from './+types/analytics';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { TEMPLATES } from '~/.server/pipeline/templates';
-import { listSnapshots, SNAPSHOT_RETENTION_DAYS, type SnapshotTemplate } from '~/.server/snapshots';
+import { listSnapshots, SNAPSHOT_RETENTION_DAYS, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
 import { StatusText } from '~/components/status-text';
@@ -39,6 +39,8 @@ export async function loader({ request }: Route.LoaderArgs) {
         href: dsl ? `/analytics/definitions/${dsl[1]}/${dsl[2]}` : `/analytics/snapshots/${s.id}`,
         asOf: typeof s.params.asOf === 'string' ? s.params.asOf : null,
         definitionVersion: s.definitionVersion,
+        /** 来源（发布、回刷、定时刷新、手动）；老快照没记时为「—」 */
+        trigger: triggerLabel(s.trigger),
         rowCount: s.rowCount,
         expired: !!s.expiredAt,
         incomplete: !!s.incomplete,
@@ -73,6 +75,7 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
                 <TableHead>模板</TableHead>
                 <TableHead>参考日期</TableHead>
                 <TableHead>参数</TableHead>
+                <TableHead>来源</TableHead>
                 <TableHead>消费者</TableHead>
                 <TableHead>创建时间</TableHead>
                 <TableHead>过期时间</TableHead>
@@ -87,6 +90,7 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
                   </TableCell>
                   <TableCell>{s.asOf ?? '—'}</TableCell>
                   <TableCell data-definition-version>{s.definitionVersion ? `定义第 ${s.definitionVersion} 版` : '任务参数'}</TableCell>
+                  <TableCell data-snapshot-trigger>{s.trigger}</TableCell>
                   <TableCell>{s.rowCount.toLocaleString('zh-CN')}</TableCell>
                   <TableCell className={cn(!s.expired && 'text-slate-500')}>{time(s.createdAt)}</TableCell>
                   <TableCell className={cn(!s.expired && 'text-slate-500')}>{time(s.expiresAt)}</TableCell>

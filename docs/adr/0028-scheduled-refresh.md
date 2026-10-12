@@ -17,7 +17,7 @@ ADR-0025 定下「发布只算最新快照，回刷手动」：指标与标签�
 
 **模板也适用（#179）。** 已发布的模板（如 RFM，各自最新的已发布版本）在同一个租户事务里、指标与标签之后检查，规则相同：依赖的实体取 `TEMPLATES[模板].entities`（RFM 是 `order`、`customer`），「最近一次计算」是本租户这个模板的最近一次模板任务（如 `gold.rfm`，任何状态）；模板按模板去重（每个租户一个定义），已有任务在排队或运行、或当天已有当前版本的未过期快照时跳过；以生效版本的参数加上当天的 `asOf` 入队，来源 `scheduled`，审计 `template.refreshed`。模板发布入队的任务来源记 `publish`，「重新计算」记 `manual`（ADR-0021）。有已发布模板而没有已发布指标或标签的租户同样检查。
 
-**快照记来源。** `platform.snapshots` 新加 `trigger text`：`publish`（发布）、`backfill`（回刷）、`scheduled`（定时刷新）、`manual`（手动）；这一列之前的老快照为空。`gold.dsl` 与模板任务（如 `gold.rfm`）的任务参数带上 `trigger`，登记快照时从任务参数里读（快照的 `params` 来自任务结果，里面没有它）；不在取值范围里或没写时为空。
+**快照记来源。** `platform.snapshots` 新加 `trigger text`：`publish`（发布）、`backfill`（回刷）、`scheduled`（定时刷新）、`manual`（手动）；这一列之前的老快照为空。`gold.dsl` 与模板任务（如 `gold.rfm`）的任务参数带上 `trigger`，登记快照时从任务参数里读（快照的 `params` 来自任务结果，里面没有它）；不在取值范围里或没写时为空。指标与标签的定义页另有「重新计算」（#180）：有发布权限的成员按当天以生效版本入队（指标连同下游标签，去重同回刷），来源 `manual`，审计 `definition.recomputed`；定义页显示最近一张未过期快照的时间与来源，分析页快照列表显示来源。
 
 ## 已接受的取舍
 

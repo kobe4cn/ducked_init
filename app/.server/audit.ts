@@ -98,6 +98,13 @@ const ACTIONS = {
       return `${dslLabel(d)} ${d.key}，按第 ${d.version} 版回刷 ${(d.days as string[]).join('、')}${tags.length ? `，连同标签 ${tags.join('、')}` : ''}`;
     },
   },
+  'definition.recomputed': {
+    label: '重新计算指标或标签',
+    describe: (d: Detail) => {
+      const tags = d.tags as string[];
+      return `${dslLabel(d)} ${d.key}，按第 ${d.version} 版重新计算 ${d.asOf}${tags.length ? `，连同标签 ${tags.join('、')}` : ''}`;
+    },
+  },
   'definition.refreshed': {
     label: '定时刷新指标或标签',
     describe: (d: Detail) => {
