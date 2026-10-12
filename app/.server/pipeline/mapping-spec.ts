@@ -36,12 +36,17 @@ export interface MappingSpec {
   dedupe?: { key: string[]; latest?: string };
   /** 身份打通的匹配字段（只用于 customer）：本映射映射出来的敏感字段，数组顺序即优先级。不写时用平台默认规则 */
   identity?: IdentityRules;
+  /** 属性取舍的数据源优先级（只用于 customer，ADR-0027）：名次越小越优先，没配的映射排在配了的之后 */
+  survivorship?: Survivorship;
   /** 行过滤（ADR-0024）：返回布尔的表达式，不满足（含取值为空）的源记录不进标准层 */
   where?: string;
 }
 
 /** 身份打通的匹配规则：按优先级排列的匹配字段 */
 export interface IdentityRules { match: string[] }
+
+/** 属性取舍的配置：本映射的名次（正整数，越小越优先） */
+export interface Survivorship { priority: number }
 
 /** 键空间名（KEY_SPACE_PATTERN） */
 const keySpace = { type: 'string', pattern: KEY_SPACE_PATTERN };
@@ -111,6 +116,14 @@ export const MAPPING_SCHEMA = {
         match: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 } },
       },
     },
+    survivorship: {
+      type: 'object',
+      required: ['priority'],
+      additionalProperties: false,
+      properties: {
+        priority: { type: 'integer', minimum: 1 },
+      },
+    },
     where: { type: 'string', minLength: 1 },
   },
 } as const;
@@ -153,6 +166,8 @@ export interface MergePlan {
   latest: string | null;
   /** 身份打通的匹配规则（只有配置了的 customer 映射才有） */
   identity?: IdentityRules;
+  /** 属性取舍的名次（只有配置了的 customer 映射才有） */
+  survivorship?: Survivorship;
   /** 映射声明的键空间，写进标准层的 _key_space */
   keySpace?: string;
   /** 行过滤：返回布尔的表达式，不满足（含取值为空）的源记录视为不存在 */
@@ -611,6 +626,11 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
     });
   }
 
+  // 属性取舍的名次：只用于 customer
+  if (spec.survivorship && spec.entity !== 'customer') {
+    issue(['survivorship'], '只有消费者（customer）映射能配置属性取舍的优先级', { atKey: true });
+  }
+
   if (issues.length) return { ok: false, issues: issues.sort(ISSUE_ORDER) };
   const extensions = Object.entries(spec.extensions ?? {}).map(([name, e]) => ({ name, type: e.type }));
   return {
@@ -625,6 +645,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
       key,
       latest,
       ...(spec.identity && { identity: { match: [...spec.identity.match] } }),
+      ...(spec.survivorship && { survivorship: { priority: spec.survivorship.priority } }),
       ...(spec.key_space && primaryKey && { keySpace: spec.key_space }),
       ...(spec.where && { where: spec.where }),
     },

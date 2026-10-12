@@ -392,6 +392,35 @@ describe('身份打通：可配置匹配字段与优先级', () => {
     expect(merge.params.identity).toEqual(['phone', 'external_id']);
   });
 
+  it('统一消费者的属性默认取较新的；给另一个映射配上 survivorship 名次并重新发布后按名次重算', async () => {
+    const { acme, author, reviewer, sources, mappings, names } = await publishedIdentitySources();
+    // crm 1 与 loyalty 1 是同一个人：两边的城市不同，loyalty 的更新
+    await grantOnSource("UPDATE loyalty.members SET updated_at = '2024-06-05' WHERE member_id = 1");
+    await syncSource(author, sources.loyalty);
+    await drain();
+    const withCity = (yaml: string, city: string) => `${yaml}  city: "'${city}'"\n  updated_at: from_timezone(updated_at, 'UTC')\n`;
+    await republish(author, reviewer, mappings.crm, withCity(CRM, '上海'));
+    await republish(author, reviewer, mappings.loyalty, withCity(LOYALTY, '北京'));
+    const crm1 = async () => {
+      const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+      try {
+        return (await session.con.runAndReadAll(`SELECT c.city, c.city__source FROM silver._consumer c JOIN silver._identities i USING (consumer_id)
+          WHERE i._source = '${sources.crm}' AND i.customer_id = '1'`)).getRowObjectsJson();
+      } finally {
+        session.close();
+      }
+    };
+    expect(await crm1()).toEqual([{ city: '北京', city__source: sources.loyalty }]);
+    expect(names[sources.loyalty]).toBe('loyalty');
+
+    // 只改名次：customer 数据不变，入队时发现名次变了，强制重算
+    await republish(author, reviewer, mappings.crm, `${withCity(CRM, '上海')}survivorship:\n  priority: 1\n`);
+    expect(await crm1()).toEqual([{ city: '上海', city__source: sources.crm }]);
+    const merge = await lastMerge(acme);
+    expect(merge.params).toMatchObject({ survivorship: { [mappings.crm]: 1 }, identityForce: true });
+    expect(merge.result.identities).not.toHaveProperty('skipped');
+  });
+
   it('更高优先级的字段双方都有值且不同时，不按更低优先级的字段合并', async () => {
     const { acme, author, reviewer, sources, mappings, names } = await publishedIdentitySources();
     // 同一个手机号、不同的邮箱

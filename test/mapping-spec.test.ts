@@ -356,6 +356,32 @@ describe('身份打通的匹配规则', () => {
   });
 });
 
+describe('属性取舍的数据源优先级', () => {
+  const CUSTOMERS = (table: string) => (table === 'customers'
+    ? ['id', 'city'].map(name => ({ name, type: name === 'id' ? 'BIGINT' : 'VARCHAR' }))
+    : `数据源中没有表 ${table}`);
+  const BASE = 'model: 1\nentity: customer\ntable: customers\nfields:\n  customer_id: string(id)\n  city: city\n';
+
+  it('名次带进合并计划；没写时计划里没有', () => {
+    const r = checkMapping(`${BASE}survivorship:\n  priority: 1\n`, CUSTOMERS);
+    expect(r.ok && r.plan.survivorship).toEqual({ priority: 1 });
+    const plain = checkMapping(BASE, CUSTOMERS);
+    expect(plain.ok && plain.plan.survivorship).toBeUndefined();
+  });
+
+  it('名次必须是正整数', () => {
+    expect(issuesWith(`${BASE}survivorship:\n  priority: 0\n`, CUSTOMERS)).toEqual([expect.objectContaining({ path: 'survivorship.priority', message: '应不小于 1' })]);
+    expect(issuesWith(`${BASE}survivorship:\n  priority: 1.5\n`, CUSTOMERS)).toEqual([expect.objectContaining({ path: 'survivorship.priority', message: '应为整数' })]);
+    expect(issuesWith(`${BASE}survivorship:\n  priority: high\n`, CUSTOMERS)).toEqual([expect.objectContaining({ path: 'survivorship.priority', message: '应为整数' })]);
+  });
+
+  it('只有消费者（customer）映射能配置优先级', () => {
+    expect(issues(`${ok}survivorship:\n  priority: 1\n`)).toEqual([
+      expect.objectContaining({ path: 'survivorship', message: expect.stringContaining('customer') }),
+    ]);
+  });
+});
+
 describe('映射报错给出改法', () => {
   const withFields = (lines: string) => ok.replace(/  amount: .*\n  created_at: .*\n/, lines);
 

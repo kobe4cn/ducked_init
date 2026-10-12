@@ -588,11 +588,12 @@ async function mergeOne(
  * 只影响它自己，其他映射照常合并。不同实体的映射并行合并，同一实体的串行（ADR-0015）。之后本租户有 silver.customer、且这次改到了 customer、event 或 consent 时整表重算身份打通
  * （一次合并只带受影响的映射，增量会漏）；打通结果表不在或 forceIdentities（入队时发现匹配规则变了或上次打通失败）时同样重算，
  * 否则沿用上次的结果，identities 记成跳过。失败同样只记在 identities 里。rules 是租户全部 customer 映射汇总出的匹配规则（入队合并时算好，不只是这次带的映射）；
- * 打通之前统计 relations（租户全部已发布关系，同样入队时算好）的孤儿，记在 relations 里（耗时记在 relationsMs），出错不算合并失败；salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐
+ * 打通之前统计 relations（租户全部已发布关系，同样入队时算好）的孤儿，记在 relations 里（耗时记在 relationsMs），出错不算合并失败；salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐；
+ * priority 是属性取舍的名次（映射 ID → 名次，同样入队时由全部 customer 映射汇总，ADR-0027）
  */
 export async function mergeToSilver(
   session: TenantLakeSession, plans: MergeMappingParam[], salt: string, redact: (message: string) => string, rules: readonly string[] = DEFAULT_RULES,
-  relations: RelationParam[] = [], forceIdentities = false, sensitive: readonly string[] = [],
+  relations: RelationParam[] = [], forceIdentities = false, sensitive: readonly string[] = [], priority: Record<string, number> = {},
 ): Promise<{ mappings: MergeRecord[]; relations?: RelationStat[]; relationsMs?: number; identities?: IdentityRecord }> {
   const { con } = session;
   const now = new Date();
@@ -623,7 +624,10 @@ export async function mergeToSilver(
   }
   const startedAt = Date.now();
   try {
-    const summary = await resolveIdentities(con, rules, { sensitive: [...new Set([...sensitive, ...consumerSensitive(plans)])] });
+    const summary = await resolveIdentities(con, rules, {
+      sensitive: [...new Set([...sensitive, ...consumerSensitive(plans)])],
+      priority,
+    });
     return { ...merged, identities: { ...summary, durationMs: Date.now() - startedAt } };
   } catch (e) {
     return { ...merged, identities: { durationMs: Date.now() - startedAt, error: redact((e as Error).message) } };

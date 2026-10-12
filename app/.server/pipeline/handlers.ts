@@ -105,6 +105,16 @@ function identityForce(params: Params) {
   return force ?? false;
 }
 
+/** 合并参数里属性取舍的名次：映射 ID → 正整数名次（入队时由全部 customer 映射汇总）；早先入队的合并没有这一项，只按 updated_at 取最新 */
+function mergeSurvivorship(params: Params): Record<string, number> {
+  const { survivorship } = params;
+  if (survivorship === undefined) return {};
+  const valid = typeof survivorship === 'object' && survivorship !== null && !Array.isArray(survivorship)
+    && Object.values(survivorship).every(r => Number.isInteger(r) && (r as number) >= 1);
+  if (!valid) throw new Error('参数 survivorship 必须是映射 ID 到正整数名次的对照');
+  return survivorship as Record<string, number>;
+}
+
 /** 合并参数里不进 _consumer 的敏感字段（入队时由全部 customer 映射汇总）；早先入队的合并没有这一项，只看这次合并的映射 */
 function mergeConsumerSensitive(params: Params): string[] {
   const { consumerSensitive } = params;
@@ -263,7 +273,7 @@ export const HANDLERS = {
     label: '合并到标准层',
     async run(_con, params, { session, piiSalt, redact }) {
       if (!piiSalt) throw new Error('缺少敏感信息盐');
-      const result = await mergeToSilver(session, mergeMappings(params), piiSalt, redact, identityMatch(params), mergeRelations(params), identityForce(params), mergeConsumerSensitive(params));
+      const result = await mergeToSilver(session, mergeMappings(params), piiSalt, redact, identityMatch(params), mergeRelations(params), identityForce(params), mergeConsumerSensitive(params), mergeSurvivorship(params));
       const failed = result.mappings.filter(m => 'error' in m);
       const problems = [
         ...(failed.length ? [`${failed.length} 个映射合并失败：${failed.map(m => `${m.entity} ← ${m.table}（${'error' in m ? m.error : ''}）`).join('；')}`] : []),

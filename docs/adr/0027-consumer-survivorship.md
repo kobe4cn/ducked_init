@@ -4,7 +4,9 @@
 
 **一张表。** 合并时身份打通之后、在写 `_identities`、`_device_owner` 的同一个事务里整表重写 `silver._consumer`：每个统一消费者一行，列是 `consumer_id`，加上 `silver.customer` 里每个属性列与它的来源列 `<列>__source`（取值那条源记录的 `_source`）。属性列是 customer 表里除系统列（`_mapping, _source, _version, _merged_at, _key_space`）与 `customer_id` 以外的全部列，随表结构变化，所以整表 `CREATE OR REPLACE`。实现在 `app/.server/pipeline/identity-engine.ts` 的 `resolveIdentities`。
 
-**存活规则。** 每个属性单独取值：只看非空值，按 `updated_at` 新的在前（为空的排最后），再按 `(_source, customer_id)` 定序，取第一条。同样的输入总得到同样的结果。不同属性可以来自不同的源记录。`resolveIdentities` 另收数据源优先级（映射 ID → 名次，越小越优先，没配的排最后），名次排在 `updated_at` 前面；从映射配置传入留给后续的票，见下。
+**存活规则。** 每个属性单独取值：只看非空值，按 `updated_at` 新的在前（为空的排最后），再按 `(_source, customer_id)` 定序，取第一条。同样的输入总得到同样的结果。不同属性可以来自不同的源记录。`resolveIdentities` 另收数据源优先级（映射 ID → 名次，越小越优先，没配的排最后），名次排在 `updated_at` 前面，配置方式见下。
+
+**数据源优先级（#176）。** customer 映射可以写 `survivorship: { priority: <正整数> }`，数字越小越优先；只有 customer 映射能写，`priority` 不是正整数时映射校验报在这个键上。排序键是 `priority ASC NULLS LAST, updated_at DESC NULLS LAST, _source, customer_id`：先按名次取非空值，名次相同或都没配再按 `updated_at`。名次按 silver 的 `_mapping`（映射 ID）对，不按数据源（同一数据源可以有几个 customer 映射），任务参数里也只放映射 ID（映射可以改名）。入队合并时由全部已发布的 customer 映射汇总成 `survivorship`（映射 ID → 名次）放进任务参数，与匹配规则一样不只看这次合并的映射；名次与上次真正打通时不同就带 `identityForce` 强制重算，否则只改名次的发布因为 customer 数据没变会跳过打通。名次只作用于 `_consumer` 的属性，不作用于同意（见下）。这是成员显式声明的取舍，即 ADR-0024 所说「存活规则由成员显式声明」在统一消费者上的落地。
 
 **不收敏感字段。** 标准模型的敏感字段（`name, phone, email, external_id`）与映射里标成敏感的 `x_` 字段不进 `_consumer`（ADR-0005；后者入队合并时由全部已发布的 customer 映射汇总进任务参数 `consumerSensitive`，与匹配规则一样不只看这次合并的映射）：它们在标准层只有哈希，做维度没有意义，也不该多一份副本。
 
