@@ -418,13 +418,19 @@ export const customEntityVersions = platform.table('custom_entity_versions', {
 /** 快照登记时最近一次合并失败的映射：源表、实体、原因摘要（不带取值）与这个映射最近一次成功合并的时间（ISO 字符串，从未成功时为空） */
 export interface IncompleteMapping { mapping: string; entity: string; table: string; error: string; lastSuccessAt: string | null }
 
+/** 快照的来源（ADR-0028）：发布、回刷、定时刷新或手动 */
+export const SNAPSHOT_TRIGGERS = ['publish', 'backfill', 'scheduled', 'manual'] as const;
+export type SnapshotTrigger = (typeof SNAPSHOT_TRIGGERS)[number];
+
 // 结果快照：分析模板任务（如 gold.rfm）每次成功后在租户数据湖结果层写下的一张表（ADR-0002：数据在湖里，这里只登记元数据）。
-// definition_version 是运行所用的已发布模板定义版本（参数直接放在任务里时为空）；expires_at 为创建后 90 天，过期清理后记下 expired_at
+// definition_version 是运行所用的已发布模板定义版本（参数直接放在任务里时为空）；trigger 是来源（任务参数没写时与老快照一样为空）；
+// expires_at 为创建后 90 天，过期清理后记下 expired_at
 export const snapshots = platform.table('snapshots', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
   template: text('template').notNull(),
   definitionVersion: integer('definition_version'),
+  trigger: text('trigger').$type<SnapshotTrigger>(),
   taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'cascade' }),
   /** 数据湖里的表名（如 gold.rfm__<任务 ID>） */
   table: text('table').notNull(),

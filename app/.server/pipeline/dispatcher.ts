@@ -9,6 +9,7 @@ import { registerDslSnapshot } from '../dsl-definitions';
 import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '../lake-migration';
 import { enqueueDueMerges, mergeAfterSync } from '../mappings';
 import { alertAssertionFailure } from '../quality';
+import { enqueueDueRefreshes } from '../refresh';
 import { enqueueDueExpiries, markExpired, registerSnapshot } from '../snapshots';
 import { applyKeyCheck } from '../source-key-check';
 import { enqueueDueSyncs } from '../source-sync';
@@ -137,7 +138,8 @@ export function createDispatcher({
 
   let lastSyncCheck = 0;
   /**
-   * 为到期的数据源入队同步，再入队核对（有同步在排队时等下一次检查），然后为有新变化的租户入队合并，最后为有到期快照的租户入队快照过期：
+   * 为到期的数据源入队同步，再入队核对（有同步在排队时等下一次检查），然后为有新变化的租户入队合并，为有到期快照的租户入队快照过期，
+   * 最后为依赖的实体有新合并的已发布指标与标签入队当天的刷新：
    * 每 syncCheckMs 一次，多个调度器同时检查也不会重复入队
    */
   async function scheduleSyncs() {
@@ -147,6 +149,7 @@ export function createDispatcher({
     await enqueueDueVerifies();
     await enqueueDueMerges();
     await enqueueDueExpiries();
+    await enqueueDueRefreshes();
   }
 
   /** 每隔 pollMs 或有工作进程结束时醒来 */
@@ -167,7 +170,7 @@ export function createDispatcher({
     /** 持续运行，直到 stop()；之后等运行中的任务结束再返回 */
     async run() {
       while (!stopped) {
-        await scheduleSyncs().catch(e => console.error('[调度器] 入队到期的同步、核对、合并或快照过期出错', e));
+        await scheduleSyncs().catch(e => console.error('[调度器] 入队到期的同步、核对、合并、快照过期或结果层刷新出错', e));
         await tick().catch(e => console.error('[调度器] 轮询出错', e));
         await nap();
       }

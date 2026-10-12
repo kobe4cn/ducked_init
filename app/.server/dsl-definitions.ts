@@ -5,6 +5,7 @@
 // 发布后版本锁定，并以当天为 asOf 入队一次 gold.dsl（编译在入队时完成，SQL 进任务参数），成功后登记为一张快照（template 为 <种类>:<键>）；
 // 发布指标时同一事务里另为引用它的每个已发布标签入队一次（标签 SQL 内联刚发布的指标）。已有快照不动；有发布权限的成员可手动回刷：
 // 早于生效版本的未过期快照按各自的 asOf 以生效版本重算（指标连同下游标签），本定义已有任务在排队或运行时拒绝。
+// 依赖的实体有新合并后调度器按当天以生效版本重算（refresh.ts，ADR-0028）；任务参数与快照记下来源（发布、回刷、定时刷新）。
 // 有修改与删除权限的成员可以删除定义；被已发布标签引用的指标不能删（依赖由已发布版本按需解析，dsl-dependencies.ts）。
 // 一律限定在操作者所属租户内
 import type { DuckDBConnection } from '@duckdb/node-api';
@@ -15,7 +16,7 @@ import type { CurrentMember } from './auth';
 import { publishedCustomEntities } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { publishedTagsOf, publishedTagsReferencing } from './dsl-dependencies';
-import { dslDefinitions, dslVersions, snapshots, tasks } from './db/schema';
+import { dslDefinitions, dslVersions, snapshots, tasks, type SnapshotTrigger } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { lockTenant, publishedPlans } from './mappings';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
@@ -68,20 +69,23 @@ const ofDefinition = (tenantId: string, kind: DslKind, key: string) =>
   and(eq(dslDefinitions.tenantId, tenantId), eq(dslDefinitions.kind, kind), eq(dslDefinitions.key, key));
 
 /** 定义的一版：入队 gold.dsl 时带上它的种类、键、定义 ID 与版本号 */
-interface DslVersionRef { kind: DslKind; key: string; definitionId: string; version: number }
+export interface DslVersionRef { kind: DslKind; key: string; definitionId: string; version: number }
 
-/** 在调用方的事务里按 asOf 编译定义的一版（spec 已对照 ctx 校验通过）并入队一次 gold.dsl，参数带上编译出的 SQL 与用到的实体（任务不再访问平台库） */
-const enqueueDsl = (tx: Tx, tenantId: string, d: DslVersionRef, spec: unknown, ctx: DslContext, asOf: string) =>
+/**
+ * 在调用方的事务里按 asOf 编译定义的一版（spec 已对照 ctx 校验通过）并入队一次 gold.dsl，参数带上编译出的 SQL、用到的实体（任务不再访问平台库）
+ * 与来源 trigger（登记快照时记下）
+ */
+export const enqueueDsl = (tx: Tx, tenantId: string, d: DslVersionRef, spec: unknown, ctx: DslContext, asOf: string, trigger: SnapshotTrigger) =>
   insertTask(tx, tenantId, 'gold.dsl', {
     kind: d.kind, key: d.key, definitionId: d.definitionId, definitionVersion: d.version, asOf,
-    sql: DSL_KINDS[d.kind].compile(spec, ctx, asOf, d.key), entities: DSL_KINDS[d.kind].entities(spec, ctx),
+    sql: DSL_KINDS[d.kind].compile(spec, ctx, asOf, d.key), entities: DSL_KINDS[d.kind].entities(spec, ctx), trigger,
   });
 
 /**
  * 引用指标 metric 的已发布标签（各自最新的已发布版本），按 ctx（其中的 metric 是要算的那一版）校验：通过的带上 spec，
  * 不再通过的（如指标加了维度）只给键，不入队
  */
-async function downstreamTags(tx: Tx, tenantId: string, metric: string, ctx: DslContext) {
+export async function downstreamTags(tx: Tx, tenantId: string, metric: string, ctx: DslContext) {
   const ready: { tag: DslVersionRef; spec: unknown }[] = [];
   const skipped: string[] = [];
   for (const { definitionId, key, version, yaml } of await publishedTagsReferencing(tx, tenantId, metric)) {
@@ -228,8 +232,8 @@ export async function publishDefinition(actor: CurrentMember, kind: string, key:
       tenantId: actor.tenant.id, actor, action: 'definition.published', targetType: 'definition', targetId: draft.definitionId,
       detail: { kind, key, version, authors: draft.authors, lastEditor: draft.lastEditor, tags: downstream.ready.map(t => t.tag.key), skippedTags: downstream.skipped },
     });
-    const task = await enqueueDsl(tx, actor.tenant.id, { kind, key, definitionId: draft.definitionId, version }, checked.spec, ctx, asOf);
-    for (const { tag, spec } of downstream.ready) await enqueueDsl(tx, actor.tenant.id, tag, spec, tagCtx, asOf);
+    const task = await enqueueDsl(tx, actor.tenant.id, { kind, key, definitionId: draft.definitionId, version }, checked.spec, ctx, asOf, 'publish');
+    for (const { tag, spec } of downstream.ready) await enqueueDsl(tx, actor.tenant.id, tag, spec, tagCtx, asOf, 'publish');
     return task;
   });
 }
@@ -275,8 +279,8 @@ export async function backfillDefinition(actor: CurrentMember, kind: string, key
     const self = { kind, key, definitionId: published.definitionId, version: published.version };
     const enqueued = [];
     for (const day of days) {
-      enqueued.push(await enqueueDsl(tx, actor.tenant.id, self, checked.spec, ctx, day));
-      for (const { tag, spec } of downstream.ready) enqueued.push(await enqueueDsl(tx, actor.tenant.id, tag, spec, ctx, day));
+      enqueued.push(await enqueueDsl(tx, actor.tenant.id, self, checked.spec, ctx, day, 'backfill'));
+      for (const { tag, spec } of downstream.ready) enqueued.push(await enqueueDsl(tx, actor.tenant.id, tag, spec, ctx, day, 'backfill'));
     }
     return { version: published.version, days, tasks: enqueued };
   });

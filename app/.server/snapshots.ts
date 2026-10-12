@@ -6,7 +6,7 @@
 import { and, desc, eq, inArray, isNull, lte, sql, type SQL } from 'drizzle-orm';
 import type { Tx } from './audit';
 import { getDb } from './db/client';
-import { snapshots, tasks, tenants, type IncompleteMapping } from './db/schema';
+import { SNAPSHOT_TRIGGERS, snapshots, tasks, tenants, type IncompleteMapping, type SnapshotTrigger } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { publishedPlans } from './mappings';
 import { openTenantLake } from './pipeline/lake-engine';
@@ -31,7 +31,7 @@ export class SnapshotError extends Error {
 }
 
 /**
- * 分析模板任务成功后登记它的快照（任务结果里的 table、rows、params，任务参数里的模板定义版本 definitionVersion），
+ * 分析模板任务成功后登记它的快照（任务结果里的 table、rows、params，任务参数里的模板定义版本 definitionVersion 与来源 trigger），
  * 并记下任务开始前模板读到的实体里最近一次合并失败的映射（incompleteMappings）；任务没有成功（如已被判为中断）或已登记过时什么也不做
  */
 export const registerSnapshot = (tenantId: string, taskId: string, template: SnapshotTemplate) =>
@@ -49,7 +49,7 @@ export async function registerTaskSnapshot(
     .where(and(eq(tasks.id, taskId), eq(tasks.tenantId, tenantId)));
   if (task?.status !== 'succeeded' || !task.result) return;
   const { table, rows, params } = task.result as { table: string; rows: number; params: Record<string, unknown> };
-  const { definitionVersion } = task.params as { definitionVersion?: unknown };
+  const { definitionVersion, trigger } = task.params as { definitionVersion?: unknown; trigger?: unknown };
   const { template, entities } = describe(task.params as Record<string, unknown>);
   const incomplete = await incompleteMappings(tenantId, entities, task.startedAt ?? new Date());
   const createdAt = new Date();
@@ -57,6 +57,7 @@ export async function registerTaskSnapshot(
     tenantId, template, taskId, table, params, rowCount: rows, createdAt,
     incomplete: incomplete.length ? incomplete : null,
     definitionVersion: Number.isInteger(definitionVersion) ? definitionVersion as number : null,
+    trigger: SNAPSHOT_TRIGGERS.includes(trigger as SnapshotTrigger) ? trigger as SnapshotTrigger : null,
     expiresAt: new Date(createdAt.getTime() + SNAPSHOT_RETENTION_DAYS * 24 * 60 * 60 * 1000),
   }).onConflictDoNothing({ target: snapshots.taskId });
 }
