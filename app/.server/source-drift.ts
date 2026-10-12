@@ -2,6 +2,7 @@
 // 新列的基线是最新已发布版本发布时（publishedAt 之前）这张表最近一次成功采集到的列：发布时就有、没被引用的列视为有意不映射。
 // 「已引用」是最新已发布版本与当前草稿引用的列之并，草稿用上了新列提醒就消失；成员标记为忽略的列（mapping_ignored_columns）也不再提醒。只读，标记忽略在 mappings.ts；
 // 源视图的映射没有列统计，不在同步范围、读不了、源端已没有的表不在最近一次采集里，都不报差异。与标准层漂移（lineage-drift.ts）无关
+// sourceDrift 把一个数据源下的差异按表分组，给数据源页的表清单用
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { getDb } from './db/client';
 import { mappingIgnoredColumns, mappings, mappingVersions, tasks } from './db/schema';
@@ -95,4 +96,31 @@ async function baselineColumns(tenantId: string, rows: { mappingId: string; sour
       LIMIT 1
     ) b`);
   return new Map(found.map(r => [r.mapping_id, new Set(r.columns.map(c => c.name))]));
+}
+
+export interface TableDrift {
+  mappingId: string;
+  entity: string;
+  newColumns: string[];
+  missing: string[];
+}
+
+/**
+ * 数据源下各表的映射列差异，按表名分组；一张表对应多个映射（不同实体）时每个映射一条，按实体排序。没有差异的表不在结果里
+ */
+export async function sourceDrift(tenantId: string, sourceId: string): Promise<Map<string, TableDrift[]>> {
+  const rows = await getDb().select({ id: mappings.id, entity: mappings.entity }).from(mappings)
+    .where(and(eq(mappings.tenantId, tenantId), eq(mappings.sourceId, sourceId)))
+    .orderBy(mappings.entity);
+  const drift = await mappingDrift(tenantId, rows.map(r => r.id));
+  const byTable = new Map<string, TableDrift[]>();
+  for (const { id, entity } of rows) {
+    const d = drift.get(id);
+    if (!d) continue;
+    byTable.set(d.tableName, [
+      ...byTable.get(d.tableName) ?? [],
+      { mappingId: id, entity, newColumns: d.newColumns.map(c => c.name), missing: d.missing },
+    ]);
+  }
+  return byTable;
 }

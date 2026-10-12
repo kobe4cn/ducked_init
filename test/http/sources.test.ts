@@ -3,7 +3,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
-import { memberOf, newTenant } from '../pipeline/fixtures';
+import { ignoreColumn } from '../../app/.server/mappings';
+import { registerSource, relistSource } from '../../app/.server/sources';
+import { memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER, WRITER } from '../pipeline/source-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
@@ -336,6 +338,46 @@ describe('同步范围', () => {
     expect(html).toMatch(/data-lake-coverage[^>]*>[\s\S]*?regions（源端已删除）/);
     expect(html).toContain('有 1 张新表未选');
     expect(html).toMatch(/data-listed="coupons"[^>]*data-in-scope="false"[\s\S]*?data-new/);
+  });
+});
+
+describe('映射的列差异', () => {
+  const ORDERS = `model: 1
+entity: order
+table: orders
+fields:
+  order_id: string(order_id)
+  amount: amount
+  status: { expr: status, dictionary: { paid: paid, refunded: refunded } }
+`;
+  /** 源表清单里某张表的行（到列统计行之前） */
+  const tableRow = (html: string, table: string) => html.match(new RegExp(`<tr[^>]*data-table="${table}"[\\s\\S]*?</tr>`))![0];
+
+  it('源表新增列、映射引用的列在源端被删除并重新采集后：表行标出新列未映射与源端已删除并链接到映射；新列忽略后不再标出，没有差异的表不标', async () => {
+    const tenantId = await newTenant('acme');
+    const author = await memberOf(tenantId, 'de@acme.com');
+    const { id: sourceId } = await registerSource(author, await pgSourceInput(READER));
+    await selectAllTables(author, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const mappingId = await publish(author, await memberOf(tenantId, 'de2@acme.com'), sourceId, ORDERS);
+    const browser = await loginAs(app, 'de@acme.com');
+    expect(await (await browser.get(`/sources/${sourceId}`)).text()).not.toContain('data-drift-');
+
+    await grantOnSource(`ALTER TABLE shop.orders ADD COLUMN channel text, ADD COLUMN coupon text; ALTER TABLE shop.orders DROP COLUMN amount;`);
+    await relistSource(author, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    const html = await (await browser.get(`/sources/${sourceId}`)).text();
+    const orders = tableRow(html, 'orders');
+    expect(orders).toMatch(new RegExp(`href="/mappings/${mappingId}"[^>]*>[\\s\\S]*?data-drift-new="channel,coupon"[^>]*>order：2 个新列未映射`));
+    expect(orders).toMatch(new RegExp(`href="/mappings/${mappingId}"[^>]*>[\\s\\S]*?data-drift-missing="amount"[^>]*>order：源端已删除 1 列`));
+    expect(tableRow(html, 'customers')).not.toContain('data-drift-');
+
+    await ignoreColumn(author, mappingId, 'channel');
+    await ignoreColumn(author, mappingId, 'coupon');
+    const ignored = tableRow(await (await browser.get(`/sources/${sourceId}`)).text(), 'orders');
+    expect(ignored).not.toContain('data-drift-new');
+    expect(ignored).toContain('data-drift-missing="amount"');
   });
 });
 

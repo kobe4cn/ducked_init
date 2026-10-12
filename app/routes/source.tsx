@@ -12,6 +12,7 @@ import { CheckCircle2, CircleAlert, CircleCheck, PencilLine, PlugZap, Plus, Refr
 import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
+import { sourceDrift } from '~/.server/source-drift';
 import { getKeyChecks } from '~/.server/source-key-check';
 import { getSyncStatus, syncSource } from '~/.server/source-sync';
 import { getVerifyStatus, notInLakeReason, verifySource } from '~/.server/source-verify';
@@ -68,6 +69,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     const verify = await getVerifyStatus(member, params.sourceId);
     const { views } = await listSourceViews(member, params.sourceId);
     const keyChecks = await getKeyChecks(member, params.sourceId);
+    const drift = await sourceDrift(member.tenant.id, params.sourceId);
     /**
      * 表最近一次业务主键检查：排队或运行中为 running，有空值或重复为 failed（带结果），任务出错为 error；
      * 通过的已写回声明，不再单独显示。检查期间与不通过时，原有声明照旧生效
@@ -114,7 +116,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         notInLake: t.inScope ? notInLake(t.name) : null,
       })),
       newTables: source.newTables,
-      tables: source.tables.map(t => ({ ...t, notInLake: notInLake(t.name), keyCheck: t.primaryKey.length ? null : keyCheckOf(t.name) })),
+      tables: source.tables.map(t => ({ ...t, notInLake: notInLake(t.name), keyCheck: t.primaryKey.length ? null : keyCheckOf(t.name), drift: drift.get(t.name) ?? [] })),
       sync: {
         status: sync.status,
         statusLabel: sync.status === 'none' ? '未同步' : TASK_STATUS_LABELS[sync.status],
@@ -410,6 +412,27 @@ function ColumnStats({ table }: { table: TableView }) {
         </TableBody>
       </Table>
     </details>
+  );
+}
+
+/** 这张表的已发布映射的列差异：每个映射一行，标出没映射的新列与源端已删除的引用列，链接到映射详情页 */
+function TableMappingDrift({ drift }: { drift: TableView['drift'] }) {
+  if (!drift.length) return null;
+  return (
+    <ul className="space-y-1">
+      {drift.map(d => (
+        <li key={d.mappingId}>
+          <Link to={`/mappings/${d.mappingId}`} className="inline-flex flex-wrap items-center gap-2 hover:underline">
+            {d.newColumns.length > 0 && (
+              <StatusText tone="pending" data-drift-new={d.newColumns.join(',')}>{`${d.entity}：${d.newColumns.length} 个新列未映射`}</StatusText>
+            )}
+            {d.missing.length > 0 && (
+              <StatusText tone="bad" data-drift-missing={d.missing.join(',')}>{`${d.entity}：源端已删除 ${d.missing.length} 列`}</StatusText>
+            )}
+          </Link>
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -915,6 +938,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
                             </StatusText>
                           </div>
                           <div className="text-xs text-muted-foreground">{t.syncModeNote}</div>
+                          <TableMappingDrift drift={t.drift} />
                           <Watermark table={t} canWrite={canWrite} submitting={submitting} />
                           <Key table={t} canWrite={canWrite} submitting={submitting} />
                           <SoftDelete table={t} canWrite={canWrite} submitting={submitting} />
