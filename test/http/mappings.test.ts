@@ -8,7 +8,7 @@ import { createCustomEntity, publishCustomEntity } from '../../app/.server/custo
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
-import { confirmWatermark, registerSource } from '../../app/.server/sources';
+import { confirmWatermark, registerSource, relistSource } from '../../app/.server/sources';
 import { memberOf, mergeUnchecked, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { mappingTemplate } from '../../app/.server/pipeline/mapping-spec';
@@ -366,6 +366,27 @@ describe('编写与发布映射', () => {
     expect(await (await reviewer.get(`/mappings/${id}`)).text()).toContain('data-diff-item="none"');
     // 查看已发布的 v1 时不展示
     expect(await (await reviewer.get(`/mappings/${id}?version=1`)).text()).not.toContain('data-draft-diff');
+  });
+
+  it('发布后源表新增一列、删除映射引用的列并重新采集：映射列表与详情页标出新列（带类型与常见取值）与源端已删除的列', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const author = await memberOf(tenantId, 'de@acme.com');
+    const id = await publish(author, await memberOf(tenantId, 'de2@acme.com'), sourceId, ORDERS);
+    const browser = await loginAs(app, 'de@acme.com');
+    expect(await (await browser.get('/mappings')).text()).not.toContain('data-drift-');
+
+    await grantOnSource(`ALTER TABLE shop.orders ADD COLUMN channel text DEFAULT '门店'; ALTER TABLE shop.orders DROP COLUMN amount;`);
+    await relistSource(author, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    const list = await (await browser.get('/mappings')).text();
+    expect(list).toContain('data-drift-new="channel">源表新增 1 列');
+    expect(list).toContain('data-drift-missing="amount">源端已删除 1 列');
+    const detail = await (await browser.get(`/mappings/${id}`)).text();
+    expect(detail).toContain('data-drift-new="channel"');
+    expect(detail).toMatch(/data-drift-column="channel">.*channel.*VARCHAR.*常见取值：门店/);
+    expect(detail).toContain('data-drift-missing="amount">源端已删除 1 列：amount');
+    expect(detail).toContain('合并时这一列为空值；若是去重键，合并会失败');
   });
 
   it('租户里只有自己有发布权限时，发布区提示先邀请成员', async () => {

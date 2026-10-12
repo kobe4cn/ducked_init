@@ -20,6 +20,7 @@ import { checkMapping, mappingTemplate, type MappingIssue, type MergePlan } from
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
+import { mappingDrift } from './source-drift';
 import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
 import { CANONICAL_ENTITIES, type CustomEntityField, entityLabel, entityOf, type EntityRelation, type RelationStat, relationText } from '../lib/canonical-model';
@@ -768,7 +769,7 @@ async function mergesOfMapping(tenantId: string, mappingId: string) {
   return { status, history };
 }
 
-/** 本租户的映射：数据源、源表、实体、已发布的最新版本与草稿，以及最近一次合并的结果 */
+/** 本租户的映射：数据源、源表、实体、已发布的最新版本与草稿、源表列差异（没有时为 null），以及最近一次合并的结果 */
 export async function listMappings(actor: CurrentMember) {
   assertCan(actor, 'sources:read');
   const rows = await getDb()
@@ -783,6 +784,7 @@ export async function listMappings(actor: CurrentMember) {
     : [];
   const merge = await tenantLatestMerge(actor.tenant.id);
   const last = await lastMergeByMapping(actor.tenant.id, rows.map(r => r.mapping.id));
+  const drift = await mappingDrift(actor.tenant.id);
   return {
     merge,
     mappings: rows.map(({ mapping, sourceName }) => {
@@ -793,6 +795,7 @@ export async function listMappings(actor: CurrentMember) {
         published: Math.max(0, ...mine.filter(v => v.status === 'published').map(v => v.version)) || null,
         draft: mine.find(v => v.status === 'draft')?.version ?? null,
         lastMerge: last[mapping.id] ?? null,
+        drift: drift.get(mapping.id) ?? null,
       };
     }),
   };
@@ -801,7 +804,8 @@ export async function listMappings(actor: CurrentMember) {
 /**
  * 映射详情：各版本（新的在前）、当前成员能否发布草稿及原因、本租户有发布权限的成员人数、合并历史，
  * 以及草稿相对最新已发布版本（against，没有时为 null）的差异（没有草稿时为 null；只下发差异，不下发计划），
- * 草稿相对最新已发布版本的键空间变化（from/to，未声明为 null；没变或没有草稿时为 null）与要一起改的同源引用映射（keySpaceFollowers）
+ * 草稿相对最新已发布版本的键空间变化（from/to，未声明为 null；没变或没有草稿时为 null）与要一起改的同源引用映射（keySpaceFollowers），
+ * 以及源表列差异（没有时为 null）
  */
 export async function getMapping(actor: CurrentMember, mappingId: string) {
   assertCan(actor, 'sources:read');
@@ -829,6 +833,7 @@ export async function getMapping(actor: CurrentMember, mappingId: string) {
     draftDiff: draft ? { against: live?.version ?? null, ...diffPlans(live?.plan ?? null, draft.plan) } : null,
     keySpaceChange: draft && draft.plan.keySpace !== live?.plan.keySpace ? { from: live?.plan.keySpace ?? null, to: draft.plan.keySpace ?? null } : null,
     keySpaceFollowers: draft ? await keySpaceFollowers(getDb(), actor.tenant.id, mapping, draft.plan, live?.plan) : [],
+    drift: (await mappingDrift(actor.tenant.id, [mappingId])).get(mappingId) ?? null,
     merge,
   };
 }

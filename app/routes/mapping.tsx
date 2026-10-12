@@ -29,6 +29,7 @@ import { MappingEditorWithReference } from '~/components/mapping-reference';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { StatTile } from '~/components/stat-tile';
+import { StatusText } from '~/components/status-text';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
@@ -93,6 +94,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       })),
       /** 草稿相对最新已发布版本 against 的差异；没有草稿时为 null */
       draftDiff: m.draftDiff,
+      /** 源表列差异：最近一次采集里映射没用到的新列（带类型与常见取值）与源端已删除的列；没有时为 null */
+      drift: m.drift,
       /** 草稿改了主键的键空间（from → to，未声明为 null）且有要一起改的同源引用映射时才有（只是提示，不阻止发布）；否则为 null */
       keySpaceChange: m.keySpaceChange && m.keySpaceFollowers.length ? { ...m.keySpaceChange, followers: m.keySpaceFollowers } : null,
       merge: {
@@ -263,6 +266,38 @@ function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult 
   );
 }
 
+/** 源表列差异：最新已发布版本发布后源表新增、已发布版本与草稿都没用到的列，以及已发布版本引用、源端已删除的列 */
+function SourceDrift({ drift }: { drift: NonNullable<LoaderData['drift']> }) {
+  return (
+    <section className="mb-4 space-y-3 rounded-xl border bg-slate-50 p-4" data-source-drift>
+      {drift.newColumns.length > 0 && (
+        <div>
+          <StatusText tone="pending" className="font-semibold" data-drift-new={drift.newColumns.map(c => c.name).join(',')}>
+            {`源表新增 ${drift.newColumns.length} 列，映射还没用到`}
+          </StatusText>
+          <p className="mt-1 text-sm text-slate-500">发布后源表新采集到的列。在草稿里用上这一列并保存后，提醒消失。</p>
+          <ul className="mt-2 space-y-1 text-sm">
+            {drift.newColumns.map(c => (
+              <li key={c.name} data-drift-column={c.name}>
+                <span className="font-mono">{c.name}</span> <span className="font-mono text-slate-400">{c.type}</span>
+                {c.top?.length ? <span className="text-slate-500">{` · 常见取值：${c.top.map(t => t.value).join('、')}`}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {drift.missing.length > 0 && (
+        <div>
+          <StatusText tone="bad" className="font-semibold" data-drift-missing={drift.missing.join(',')}>
+            {`源端已删除 ${drift.missing.length} 列：${drift.missing.join('、')}`}
+          </StatusText>
+          <p className="mt-1 text-sm text-slate-500">已发布版本引用了这些列，合并时这一列为空值；若是去重键，合并会失败。</p>
+        </div>
+      )}
+    </section>
+  );
+}
+
 const COLUMN_FIELD_LABELS: Record<ColumnField, string> = { type: '类型', expr: '表达式', dictionary: '值字典', otherwise: '兜底', sensitive: '敏感标记', keySpace: '键空间' };
 
 /** 草稿与最新已发布版本的差异：首个版本、没有差异，或逐项列出列与去重 / 身份打通 / 键空间配置的变化 */
@@ -299,7 +334,7 @@ function DraftDiff({ entity, version, diff }: { entity: string; version: number;
 }
 
 export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, draftDiff, keySpaceChange, merge } = loaderData;
+  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, draftDiff, drift, keySpaceChange, merge } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -407,6 +442,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
                   : '只读。'}
               </p>
             </div>
+            {drift && <SourceDrift drift={drift} />}
             {selected.status === 'draft' && draftDiff && <DraftDiff entity={mapping.entity} version={selected.version} diff={draftDiff} />}
             {canWrite && (selected.status === 'draft' || !draft) ? (
               <Form method="post" className="space-y-3" key={`${selected.version}-${actionData?.draftId ?? ''}`}>

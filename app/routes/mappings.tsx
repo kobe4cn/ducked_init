@@ -24,6 +24,7 @@ import { mappingOutline } from '~/lib/mapping-outline';
 import { cn } from '~/lib/utils';
 import { PageHeader } from '~/components/page-header';
 import { SectionHeader } from '~/components/section-header';
+import { StatusText } from '~/components/status-text';
 import { Button } from '~/components/ui/button';
 import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
@@ -78,6 +79,8 @@ export async function loader({ request }: Route.LoaderArgs) {
       published: m.published,
       draft: m.draft,
       lastMerge: m.lastMerge,
+      /** 源表列差异：没用到的新列与源端已删除的列（列名）；没有时为 null */
+      drift: m.drift ? { newColumns: m.drift.newColumns.map(c => c.name), missing: m.drift.missing } : null,
       /** 目标是还没有已发布登记的自定义实体时，去补登的实体页（推断不出登记时是实体列表）；否则为 null */
       pendingEntity: customPages[m.entity]?.pending ? customPages[m.entity].href : null,
     })),
@@ -239,12 +242,13 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
       <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
         {mappings.map(m => {
           const failed = m.lastMerge && 'error' in m.lastMerge;
+          const sourceMissing = !!m.drift?.missing.length;
           // 卡片整体链到映射，「实体待补登」链到实体页：不能把链接套在链接里，卡片链接铺在底层，标记浮在它上面
           return (
             <div
               key={m.id}
               data-mapping-id={m.id}
-              className={cn('relative rounded-2xl border bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md', failed && 'border-red-200')}
+              className={cn('relative rounded-2xl border bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md', (failed || sourceMissing) && 'border-red-200')}
             >
               <Link to={`/mappings/${m.id}`} className="block text-lg font-medium after:absolute after:inset-0">{`${m.entityLabel}（${m.entity}）`}</Link>
               <div className="mt-1 truncate font-mono text-xs text-slate-400">{`${m.sourceName} / ${m.table}`}</div>
@@ -257,6 +261,12 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
                   <Link to={m.pendingEntity} title="这个实体还没有已发布的登记，去确认补登" className="relative inline-flex items-center gap-1 text-amber-600 hover:underline">
                     <AlertTriangle className="size-3.5" />实体待补登
                   </Link>
+                )}
+                {m.drift && m.drift.newColumns.length > 0 && (
+                  <StatusText tone="pending" data-drift-new={m.drift.newColumns.join(',')}>{`源表新增 ${m.drift.newColumns.length} 列`}</StatusText>
+                )}
+                {m.drift && sourceMissing && (
+                  <StatusText tone="bad" data-drift-missing={m.drift.missing.join(',')}>{`源端已删除 ${m.drift.missing.length} 列`}</StatusText>
                 )}
               </div>
               <div className={cn('mt-4 flex items-start gap-1 border-t pt-3 text-xs', failed ? 'text-red-600' : 'text-slate-400')}>
