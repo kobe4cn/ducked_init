@@ -1,10 +1,10 @@
 // app/.server/source-drift.ts —— 映射的源表列差异：已发布映射的源表在最近一次采集里新增了映射没用到的列，或映射引用的列在源端已删除。
 // 新列的基线是最新已发布版本发布时（publishedAt 之前）这张表最近一次成功采集到的列：发布时就有、没被引用的列视为有意不映射。
-// 「已引用」是最新已发布版本与当前草稿引用的列之并，草稿用上了新列提醒就消失。只读，不带操作；
+// 「已引用」是最新已发布版本与当前草稿引用的列之并，草稿用上了新列提醒就消失；成员标记为忽略的列（mapping_ignored_columns）也不再提醒。只读，标记忽略在 mappings.ts；
 // 源视图的映射没有列统计，不在同步范围、读不了、源端已没有的表不在最近一次采集里，都不报差异。与标准层漂移（lineage-drift.ts）无关
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { getDb } from './db/client';
-import { mappings, mappingVersions, tasks } from './db/schema';
+import { mappingIgnoredColumns, mappings, mappingVersions, tasks } from './db/schema';
 import type { MergePlan } from './pipeline/mapping-spec';
 import type { ColumnProfile } from './pipeline/source-engine';
 import { confirmedTables } from './sources';
@@ -13,7 +13,7 @@ import { ExprError, parseExpression, referencedColumns } from '../lib/mapping-ex
 export interface MappingDrift {
   sourceId: string;
   tableName: string;
-  /** 最近一次采集里有、发布时的采集里没有、已发布版本与草稿都没引用的列 */
+  /** 最近一次采集里有、发布时的采集里没有、已发布版本与草稿都没引用、也没被标记为忽略的列 */
   newColumns: ColumnProfile[];
   /** 最新已发布版本引用、最近一次采集里已经没有的列 */
   missing: string[];
@@ -52,6 +52,8 @@ export async function mappingDrift(tenantId: string, mappingIds?: string[]): Pro
   if (!live.length) return drift;
   const drafts = await getDb().select({ mappingId: mappingVersions.mappingId, plan: mappingVersions.plan }).from(mappingVersions)
     .where(and(inArray(mappingVersions.mappingId, live.map(r => r.mappingId)), eq(mappingVersions.status, 'draft')));
+  const ignored = await getDb().select({ mappingId: mappingIgnoredColumns.mappingId, column: mappingIgnoredColumns.column }).from(mappingIgnoredColumns)
+    .where(inArray(mappingIgnoredColumns.mappingId, live.map(r => r.mappingId)));
   const latestColumns = new Map<string, Map<string, ColumnProfile[]>>();
   for (const sourceId of new Set(live.map(r => r.sourceId))) {
     const { tables } = await confirmedTables(tenantId, sourceId);
@@ -65,7 +67,8 @@ export async function mappingDrift(tenantId: string, mappingIds?: string[]): Pro
     const draft = drafts.find(d => d.mappingId === r.mappingId);
     const referencedByLiveOrDraft = new Set([...used, ...(draft ? referenced(draft.plan) : [])]);
     const baseline = baselines.get(r.mappingId) ?? new Set(columns.map(c => c.name));
-    const newColumns = columns.filter(c => !baseline.has(c.name) && !referencedByLiveOrDraft.has(c.name));
+    const ignoredHere = new Set(ignored.filter(i => i.mappingId === r.mappingId).map(i => i.column));
+    const newColumns = columns.filter(c => !baseline.has(c.name) && !referencedByLiveOrDraft.has(c.name) && !ignoredHere.has(c.name));
     const missing = [...used].filter(name => !columns.some(c => c.name === name));
     if (newColumns.length || missing.length) drift.set(r.mappingId, { sourceId: r.sourceId, tableName: r.tableName, newColumns, missing });
   }

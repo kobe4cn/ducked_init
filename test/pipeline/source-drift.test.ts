@@ -2,7 +2,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb } from '../../app/.server/db/client';
-import { saveDraft } from '../../app/.server/mappings';
+import { ignoreColumn, MappingError, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { mappingDrift } from '../../app/.server/source-drift';
@@ -80,5 +80,23 @@ describe('映射源表列差异', () => {
     expect((await mappingDrift(acme)).get(mappingId)?.newColumns.map(c => c.name)).toEqual(['level']);
     await saveDraft(author, mappingId, `${CUSTOMERS}extensions:\n  x_level: { type: string, expr: level }\n`);
     expect((await mappingDrift(acme)).has(mappingId)).toBe(false);
+  });
+
+  it('新列标记为忽略后不再提醒，其余新列照旧；忽略不是新列的列名报错', async () => {
+    const { acme, author, id, mappingId } = await publishedCustomers();
+    await alterAndRelist(author, id, 'ALTER TABLE shop.customers ADD COLUMN level text; ALTER TABLE shop.customers ADD COLUMN backup_mobile text');
+    await ignoreColumn(author, mappingId, 'level');
+    expect((await mappingDrift(acme)).get(mappingId)?.newColumns.map(c => c.name)).toEqual(['backup_mobile']);
+    await expect(ignoreColumn(author, mappingId, 'level')).rejects.toMatchObject({ status: 400 });
+    await expect(ignoreColumn(author, mappingId, 'email')).rejects.toBeInstanceOf(MappingError);
+    await ignoreColumn(author, mappingId, 'backup_mobile');
+    expect((await mappingDrift(acme)).has(mappingId)).toBe(false);
+  });
+
+  it('只有源端已删除的列时忽略不了，删列提醒照旧', async () => {
+    const { acme, author, id, mappingId } = await publishedCustomers();
+    await alterAndRelist(author, id, 'ALTER TABLE shop.customers DROP COLUMN email');
+    await expect(ignoreColumn(author, mappingId, 'email')).rejects.toMatchObject({ status: 400 });
+    expect((await mappingDrift(acme)).get(mappingId)).toMatchObject({ newColumns: [], missing: ['email'] });
   });
 });

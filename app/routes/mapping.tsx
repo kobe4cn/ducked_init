@@ -1,6 +1,6 @@
 // app/routes/mapping.tsx —— 单个映射：各版本（已发布的锁定、草稿可改）、编辑与丢弃草稿（数据工程师、管理员）、发布草稿（需最后保存它的人以外的
 // 另一位有发布权限的成员，最后保存的人看到不能发布的原因，租户里只有自己有发布权限时提示先邀请成员；编辑框旁对照源表的列统计与实体的标准字段（自定义实体对照它已发布登记的字段）；
-// 可按规则重新生成草稿、或把源表新增的列加为扩展字段填进编辑框，不保存），以及这个映射每次合并到标准层的结果；实体是还没有已发布登记的自定义实体时顶部提示待补登、链接到实体页；有已发布版本时可以立即合并这一个映射。
+// 可按规则重新生成草稿、或把源表新增的列加为扩展字段填进编辑框，不保存；新列也可标记为忽略，不再提醒），以及这个映射每次合并到标准层的结果；实体是还没有已发布登记的自定义实体时顶部提示待补登、链接到实体页；有已发布版本时可以立即合并这一个映射。
 // 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）；
 // 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）；
 // 编辑页可空跑正在查看的版本：在原始层样本上转换，编辑框下方展示样例行（敏感字段是哈希）与基础断言，不写标准层；
@@ -10,7 +10,7 @@ import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
-import { discardDraft, draftForMapping, dryRunMapping, getMapping, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft, yamlWithColumns } from '~/.server/mappings';
+import { discardDraft, draftForMapping, dryRunMapping, getMapping, ignoreColumn, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft, yamlWithColumns } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
 import { fallbackText } from '~/lib/fallback';
@@ -123,6 +123,10 @@ export async function action({ request, params }: Route.ActionArgs) {
         const yaml = await yamlWithColumns(await requirePermission(request, 'sources:write'), params.mappingId, form.getAll('column').map(String));
         return { error: null, issues: [], yaml, draftId: crypto.randomUUID(), dryRun: null };
       }
+      case 'ignore-column':
+        // 有意不映射这一列：不再提醒
+        await ignoreColumn(await requirePermission(request, 'sources:write'), params.mappingId, field('column'));
+        break;
       case 'dryrun': {
         // 只转换样本、展示结果，不保存，也不写标准层
         const version = Number(field('version'));
@@ -282,9 +286,19 @@ function AddColumns({ columns, submitting, children, ...attrs }: { columns: stri
   );
 }
 
+function IgnoreColumn({ column, submitting }: { column: string; submitting: boolean }) {
+  return (
+    <Form method="post" className="inline" onSubmit={e => { if (!confirm(`忽略新列 ${column}？之后不再提醒，不能取消。`)) e.preventDefault(); }}>
+      <input type="hidden" name="intent" value="ignore-column" />
+      <input type="hidden" name="column" value={column} />
+      <Button type="submit" size="xs" variant="destructive" disabled={submitting} title="有意不映射这一列，不再提醒；不能取消" data-ignore-column={column}>忽略</Button>
+    </Form>
+  );
+}
+
 /**
  * 源表列差异：最新已发布版本发布后源表新增、已发布版本与草稿都没用到的列，以及已发布版本引用、源端已删除的列。
- * canAdd 时新列可加为扩展字段（全部或逐列）
+ * canAdd 时新列可加为扩展字段（全部或逐列），或逐列标记为忽略
  */
 function SourceDrift({ drift, canAdd, submitting }: { drift: NonNullable<LoaderData['drift']>; canAdd: boolean; submitting: boolean }) {
   const names = drift.newColumns.map(c => c.name);
@@ -295,7 +309,7 @@ function SourceDrift({ drift, canAdd, submitting }: { drift: NonNullable<LoaderD
           <StatusText tone="pending" className="font-semibold" data-drift-new={names.join(',')}>
             {`源表新增 ${drift.newColumns.length} 列，映射还没用到`}
           </StatusText>
-          <p className="mt-1 text-sm text-slate-500">发布后源表新采集到的列。在草稿里用上这一列并保存后，提醒消失。</p>
+          <p className="mt-1 text-sm text-slate-500">发布后源表新采集到的列。在草稿里用上这一列并保存，或标记为忽略后，提醒消失。</p>
           {canAdd && (
             <div className="mt-2">
               <AddColumns columns={names} submitting={submitting} data-add-columns={names.join(',')}>
@@ -308,7 +322,12 @@ function SourceDrift({ drift, canAdd, submitting }: { drift: NonNullable<LoaderD
               <li key={c.name} data-drift-column={c.name}>
                 <span className="font-mono">{c.name}</span> <span className="font-mono text-slate-400">{c.type}</span>
                 {c.top?.length ? <span className="text-slate-500">{` · 常见取值：${c.top.map(t => t.value).join('、')}`}</span> : null}
-                {canAdd && <span className="ml-2"><AddColumns columns={[c.name]} submitting={submitting} data-add-column={c.name}>加为扩展字段</AddColumns></span>}
+                {canAdd && (
+                  <span className="ml-2">
+                    <AddColumns columns={[c.name]} submitting={submitting} data-add-column={c.name}>加为扩展字段</AddColumns>
+                    <IgnoreColumn column={c.name} submitting={submitting} />
+                  </span>
+                )}
               </li>
             ))}
           </ul>

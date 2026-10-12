@@ -672,6 +672,33 @@ describe('按规则生成映射草稿', () => {
     const analyst = await loginAs(app, 'analyst@acme.com');
     expect((await analyst.post(`/mappings/${id}`, { intent: 'add-columns', column: 'level' })).status).toBe(403);
   });
+
+  it('详情页把新列标记为忽略：映射列表与详情页不再提醒这一列，记审计；不是新列 400，分析师 403', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const author = await memberOf(tenantId, 'de@acme.com');
+    const id = await publish(author, await memberOf(tenantId, 'de2@acme.com'), sourceId, CUSTOMERS);
+    await grantOnSource('ALTER TABLE shop.customers ADD COLUMN level text; ALTER TABLE shop.customers ADD COLUMN backup_mobile text;');
+    await relistSource(author, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const engineer = await loginAs(app, 'de@acme.com');
+    expect(await (await engineer.get(`/mappings/${id}`)).text()).toContain('data-ignore-column="level"');
+
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'ignore-column', column: 'level' })).status).toBe(302);
+    const detail = await (await engineer.get(`/mappings/${id}`)).text();
+    expect(detail).toContain('data-drift-new="backup_mobile"');
+    expect(detail).not.toContain('data-drift-column="level"');
+    expect(await (await engineer.get('/mappings')).text()).toContain('data-drift-new="backup_mobile">源表新增 1 列');
+
+    const again = await engineer.post(`/mappings/${id}`, { intent: 'ignore-column', column: 'level' });
+    expect(again.status).toBe(400);
+    expect(await again.text()).toContain('level 不是源表新增、映射还没用到的列');
+    await memberOf(tenantId, 'analyst@acme.com', 'analyst');
+    expect((await (await loginAs(app, 'analyst@acme.com')).post(`/mappings/${id}`, { intent: 'ignore-column', column: 'backup_mobile' })).status).toBe(403);
+
+    await memberOf(tenantId, 'admin@acme.com', 'admin');
+    const audit = await (await (await loginAs(app, 'admin@acme.com')).get('/audit')).text();
+    expect(audit).toContain('「电商库」customers → 消费者，忽略新列 level');
+  });
 });
 
 /** 没有主键的订单流水：金额以分计，状态是中文 */

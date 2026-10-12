@@ -76,6 +76,10 @@ const ACTIONS = {
     describe: (d: Detail) =>
       `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '映射已删除'}`,
   },
+  'mapping.column_ignored': {
+    label: '忽略源表新列',
+    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，忽略新列 ${d.column}`,
+  },
   'template.drafted': { label: '起草模板参数', describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版草稿` },
   'definition.drafted': { label: '起草指标或标签', describe: (d: Detail) => `${dslLabel(d)} ${d.key}，第 ${d.version} 版草稿` },
   'definition.published': {

@@ -304,6 +304,14 @@ export const mappingVersions = platform.table('mapping_versions', {
   uniqueIndex('mapping_versions_one_draft_uq').on(t.mappingId).where(sql`status = 'draft'`),
 ]);
 
+// 映射源表里成员标记为有意不映射的新列：不再出现在新列提醒里（source-drift.ts）。只能标记，不能取消
+export const mappingIgnoredColumns = platform.table('mapping_ignored_columns', {
+  mappingId: uuid('mapping_id').notNull().references(() => mappings.id, { onDelete: 'cascade' }),
+  column: text('column').notNull(),
+  ignoredByEmail: text('ignored_by_email').notNull(),
+  ignoredAt: timestamp('ignored_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [primaryKey({ columns: [t.mappingId, t.column] })]);
+
 export const templateVersionStatusEnum = platform.enum('template_version_status', VERSION_STATUSES);
 
 // 分析模板定义：租户对某个分析模板（如 rfm，见 pipeline/templates）的参数，每个租户每个模板一份（ADR-0004）。第一次保存草稿时建立，

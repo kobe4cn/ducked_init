@@ -1,6 +1,6 @@
 // app/.server/mappings.ts —— 映射：数据工程师用 YAML 编写“源表（或已发布的源视图，ADR-0023）→ 标准实体”的映射，校验通过才能保存为草稿；草稿由最后保存它的人以外的
 // 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后为这个映射入队合并任务（silver.merge），同步给已发布映射的源表写入变更后也为这些映射再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
-// 源表新增的列可一键加为扩展字段，写进草稿（或最新已发布版本）的 YAML 填进编辑框，不保存。
+// 源表新增的列可一键加为扩展字段，写进草稿（或最新已发布版本）的 YAML 填进编辑框，不保存；也可标记为有意不映射（忽略），不再提醒并记审计。
 // 编辑时可对任一版本空跑：在请求内只读挂载本租户的数据湖，转换原始层的样本，返回样例行与基础断言，不写标准层（pipeline/dry-run-engine.ts）。
 // 一律限定在操作者所属租户内；合并本身在工作进程里进行（pipeline/merge-engine.ts）
 import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
@@ -10,7 +10,7 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { allRelations, publishedCustomEntities, type RegisteredEntity, relationsFrom, relationsTo, uniqueKeys } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
-import { mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
+import { mappingIgnoredColumns, mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { publishedDependents } from './dsl-dependencies';
 import { dryRun } from './pipeline/dry-run-engine';
@@ -212,6 +212,31 @@ export async function yamlWithColumns(actor: CurrentMember, mappingId: string, c
     throw new MappingError(e instanceof Error ? e.message : String(e));
   }
   return doc.toString();
+}
+
+/** 有意不映射源表新增的一列（mappingDrift 的新列）：记下成员，之后不再提醒，记审计。不能取消 */
+export async function ignoreColumn(actor: CurrentMember, mappingId: string, column: string) {
+  assertCan(actor, 'sources:write');
+  await getDb().transaction(async tx => {
+    const mapping = await requireMapping(actor.tenant.id, mappingId, tx);
+    // 锁住映射行：与保存草稿互斥，草稿刚用上这一列时不再把它标成忽略
+    await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
+    const isNewColumn = (await mappingDrift(actor.tenant.id, [mappingId])).get(mappingId)?.newColumns.some(c => c.name === column);
+    if (!isNewColumn) throw new MappingError(`${column} 不是源表新增、映射还没用到的列`);
+    const inserted = await tx.insert(mappingIgnoredColumns).values({ mappingId, column, ignoredByEmail: actor.email }).onConflictDoNothing()
+      .returning({ column: mappingIgnoredColumns.column });
+    // 并发的另一次请求已经忽略了这一列
+    if (!inserted.length) return;
+    const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id,
+      actor,
+      action: 'mapping.column_ignored',
+      targetType: 'mapping',
+      targetId: mappingId,
+      detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, column },
+    });
+  });
 }
 
 /**
