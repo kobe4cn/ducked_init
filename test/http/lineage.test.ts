@@ -1,5 +1,5 @@
 // test/http/lineage.test.ts —— 数据地图的 HTTP 接缝：任何成员都能打开 /lineage，关系图下的表与关系列表画出已接入的标准层表与 _identities、_device_owner，
-// 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；_identities 显示匹配规则与最近一次打通的摘要（没有合并任务时显示尚未合并）；
+// 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；_identities 显示匹配规则与最近一次打通的摘要，有合并、拆开时带组数（没有合并任务时显示尚未合并）；
 // 内置关系边带最近一次合并后的孤儿比例（样例键只给数据工程师，统计失败标红，没有合并任务时为尚未合并）；
 // 「显示未接入的标准实体」开关（?all=1）灰显未接入的实体；没有已发布映射时显示空状态；流向图（?tab=flow）只对有 sources:read 的成员开放：列表带源表名、版本、行数与合并状态，失败的链到合并记录；
 // 抽屉里的「聚焦此表」进入单表聚焦画布（?tab=flow&focus=），画布下的连线列表从源列连到标准层字段；查看者访问 ?focus= 回到关系图；
@@ -101,6 +101,26 @@ describe('数据地图', () => {
     expect(all).toContain('data-connected="false"');
     // 开关保留 node，指向关掉 all 的 URL
     expect(all).toMatch(/href="\/lineage\?node=order"[^>]*data-show-all|data-show-all[^>]*href="\/lineage\?node=order"/);
+
+    // 新打通结果里合并、拆开都为 0 时不显示这一行
+    expect(html).not.toContain('data-merged');
+    // 最近一次打通有合并或拆开时显示组数
+    const { taskId } = (await latestIdentitySummary(acme))!;
+    const [task] = await getDb().select({ result: tasks.result }).from(tasks).where(eq(tasks.id, taskId));
+    const result = task.result as { identities: { merged?: number; split?: number } };
+    const withIdentities = (identities: object) =>
+      getDb().update(tasks).set({ result: { ...result, identities } }).where(eq(tasks.id, taskId));
+    await withIdentities({ ...result.identities, merged: 2, split: 1 });
+    const changed = decode(await (await viewer.get('/lineage')).text());
+    expect(changed).toContain('data-merged="2"');
+    expect(changed).toContain('data-split="1"');
+    expect(changed).toContain('合并 2 组、拆开 1 组');
+    expect(await latestIdentitySummary(acme)).toMatchObject({ merged: 2, split: 1 });
+    // 上一版的打通结果没有这两个字段：为 null，不显示
+    const { merged: _merged, split: _split, ...old } = result.identities;
+    await withIdentities(old);
+    expect(await latestIdentitySummary(acme)).toMatchObject({ merged: null, split: null });
+    expect(await (await viewer.get('/lineage')).text()).not.toContain('data-merged');
 
     await getDb().delete(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')));
     const none = await (await viewer.get('/lineage')).text();

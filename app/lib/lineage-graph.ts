@@ -6,8 +6,18 @@ import { Graph, layout } from '@dagrejs/dagre';
 import { CANONICAL_ENTITIES, entityOf } from './canonical-model';
 import type { LineageEdge } from './lineage';
 
-/** 身份打通的现状：匹配规则（读不出来时为 null）与最近一次打通的摘要（还没打通过时为 null），只有计数，不带消费者标识 */
-export interface IdentityInfo { rules: readonly string[] | null; summary: { groups: number; records: number } | null }
+/**
+ * 身份打通的现状：匹配规则（读不出来时为 null）与最近一次打通的摘要（还没打通过时为 null），只有计数，不带消费者标识；
+ * merged / split 是那次打通合并、拆开的组数（ADR-0029），上一版的结果没有时为 null
+ */
+export interface IdentityInfo {
+  rules: readonly string[] | null;
+  summary: { groups: number; records: number; merged?: number | null; split?: number | null } | null;
+}
+
+/** 摘要里「合并 N 组、拆开 M 组」那一行；两者都为 0 或没有时为 null，不显示 */
+export const identityChangesLabel = (summary: IdentityInfo['summary']) =>
+  summary && (summary.merged || summary.split) ? `合并 ${(summary.merged ?? 0).toLocaleString('zh-CN')} 组、拆开 ${(summary.split ?? 0).toLocaleString('zh-CN')} 组` : null;
 
 export interface GraphNode {
   id: string;
@@ -32,8 +42,9 @@ export const DEVICE_OWNER = '_device_owner';
 /** 表节点的尺寸 */
 export const NODE_WIDTH = 180;
 export const NODE_HEIGHT = 56;
-/** 带打通摘要的 _identities 节点多出规则与计数两行 */
+/** 带打通摘要的 _identities 节点多出规则与计数两行；有合并、拆开时再多一行 */
 const IDENTITY_HEIGHT = 96;
+const IDENTITY_LINE = 14;
 
 const tableOf = (silver: string) => silver.replace(/^silver\./, '');
 
@@ -50,7 +61,7 @@ export function relationGraph(input: { edges: LineageEdge[]; connected: string[]
   if (connected.includes('customer')) {
     nodes.push({
       id: IDENTITIES, label: IDENTITIES, kind: 'identity', connected: true, width: NODE_WIDTH,
-      ...(input.identity ? { identity: input.identity, height: IDENTITY_HEIGHT } : { height: NODE_HEIGHT }),
+      ...(input.identity ? { identity: input.identity, height: IDENTITY_HEIGHT + (identityChangesLabel(input.identity.summary) ? IDENTITY_LINE : 0) } : { height: NODE_HEIGHT }),
     });
   }
   if (connected.includes('event')) nodes.push({ id: DEVICE_OWNER, label: DEVICE_OWNER, kind: 'device', connected: true, width: NODE_WIDTH, height: NODE_HEIGHT });

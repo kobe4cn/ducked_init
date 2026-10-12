@@ -11,7 +11,7 @@ import { DRIFT_NODE_STYLE, DriftBadge } from '~/components/drift-badge';
 import { KindIcon } from '~/components/kind-icon';
 import { driftAttrs, type DriftByTable } from '~/lib/lineage-drift';
 import { defaultCollapsed, type FlowData, type FlowInput, flowGraph, type FlowStatus, groupId, MERGE_STATUS } from '~/lib/lineage-flow';
-import { ruleLabels } from '~/lib/lineage-graph';
+import { identityChangesLabel, ruleLabels } from '~/lib/lineage-graph';
 import type { SearchHits } from '~/lib/lineage-search';
 import type { SourceKind } from '~/lib/sources';
 
@@ -84,12 +84,14 @@ function nodeLabel(d: FlowData, tableCount: Record<string, number>, drift: Drift
         </div>
       );
     case 'identity': {
-      const summary = d.identity?.summary;
+      const summary = d.identity?.summary ?? null;
+      const changes = identityChangesLabel(summary);
       return (
         <div className="leading-tight">
           <div>{d.label}</div>
           {d.identity?.rules && small(ruleLabels(d.identity.rules))}
           {small(summary ? `统一消费者 ${summary.groups.toLocaleString('zh-CN')} · 记录 ${summary.records.toLocaleString('zh-CN')}` : '尚未合并')}
+          {changes && small(changes)}
         </div>
       );
     }

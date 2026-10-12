@@ -779,7 +779,8 @@ async function tenantLatestMerge(tenantId: string) {
 }
 
 /**
- * 本租户最近一次打通成功的摘要（统一消费者数、参与打通的记录数、已归属的设备数），带所属任务与时间；只有计数，不带消费者标识。
+ * 本租户最近一次打通成功的摘要（统一消费者数、参与打通的记录数、已归属的设备数，以及本次 ID 合并与拆开的组数，上一版的结果没有这两项时为 null），
+ * 带所属任务与时间；只有计数，不带消费者标识。
  * 跳过没有打通的合并（没有 silver.customer）、打通失败的与沿用上次结果而跳过打通的；部分失败的合并任务照样落了 result，也算在内。还没打通过时为 null
  */
 export async function latestIdentitySummary(tenantId: string) {
@@ -787,8 +788,8 @@ export async function latestIdentitySummary(tenantId: string) {
     .where(and(ofMerge(tenantId), sql`${tasks.result} ? 'identities' AND NOT (${tasks.result}->'identities') ?| array['error', 'skipped']`))
     .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
   if (!latest) return null;
-  const { groups, records, devices } = (latest.result as { identities: IdentitySummary }).identities;
-  return { groups, records, devices, taskId: latest.id, at: latest.createdAt };
+  const { groups, records, devices, merged, split } = (latest.result as { identities: Partial<IdentitySummary> & Pick<IdentitySummary, 'groups' | 'records' | 'devices'> }).identities;
+  return { groups, records, devices, merged: merged ?? null, split: split ?? null, taskId: latest.id, at: latest.createdAt };
 }
 
 /** 本租户最近一次带关系孤儿统计的合并：各关系的统计与完成时间；还没有时为 null */

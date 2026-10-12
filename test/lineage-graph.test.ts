@@ -1,9 +1,9 @@
 // test/lineage-graph.test.ts —— 数据地图的关系图：由血缘的关系边与已接入的实体画出节点（含 _identities、_device_owner）、边的种类与说明、
-// dagre 布局的坐标，显示未接入的标准实体时的节点与边（标为未接入），_identities 节点上的打通摘要，
+// dagre 布局的坐标，显示未接入的标准实体时的节点与边（标为未接入），_identities 节点上的打通摘要（有合并、拆开时多一行组数），
 // 以及点表节点给出的示例 SQL（按租户湖挂载为 lake 来写，不带连接方式与凭据；未接入的节点没有）（纯函数）
 import { describe, expect, it } from 'vitest';
 import { deriveLineage } from '../app/lib/lineage';
-import { relationGraph, ruleLabels, sampleSql } from '../app/lib/lineage-graph';
+import { identityChangesLabel, relationGraph, ruleLabels, sampleSql } from '../app/lib/lineage-graph';
 
 const { edges } = deriveLineage({ plans: [], sources: [] });
 const graphOf = (connected: string[], extra: { showAll?: boolean; identity?: Parameters<typeof relationGraph>[0]['identity'] } = {}) =>
@@ -85,6 +85,16 @@ describe('关系图', () => {
     expect(node.height).toBeGreaterThan(56);
     expect(g.nodes.find(n => n.id === 'customer')!.identity).toBeUndefined();
     expect(ruleLabels(['phone', 'email', 'external_id'])).toBe('手机号 > 邮箱 > 外部 ID');
+  });
+
+  it('最近一次打通有合并或拆开时多一行「合并 N 组、拆开 M 组」并再加高；都为 0 或没有这两项时不显示', () => {
+    const base = { groups: 3, records: 7 };
+    expect(identityChangesLabel({ ...base, merged: 2, split: 0 })).toBe('合并 2 组、拆开 0 组');
+    expect(identityChangesLabel({ ...base, merged: 0, split: 1 })).toBe('合并 0 组、拆开 1 组');
+    for (const summary of [{ ...base, merged: 0, split: 0 }, { ...base, merged: null, split: null }, base, null]) expect(identityChangesLabel(summary)).toBeNull();
+    const height = (summary: { groups: number; records: number; merged?: number; split?: number }) =>
+      graphOf(['customer'], { identity: { rules: null, summary } }).nodes.find(n => n.id === '_identities')!.height;
+    expect(height({ ...base, merged: 1, split: 0 })).toBeGreaterThan(height(base));
   });
 });
 

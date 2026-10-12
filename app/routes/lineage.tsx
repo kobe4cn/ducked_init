@@ -34,7 +34,7 @@ import { driftAttrs, driftByTable, type DriftByTable } from '~/lib/lineage-drift
 import { entityFields, type FieldDrawer, redactFields } from '~/lib/lineage-fields';
 import { type FlowInput, type FlowMerge, silverTotals } from '~/lib/lineage-flow';
 import { type SearchHits, searchImpact, tableImpact, type TableImpact } from '~/lib/lineage-search';
-import { type GraphEdge, relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
+import { type GraphEdge, identityChangesLabel, type IdentityInfo, relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
 import type { SourceKind } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
 import { percent, StatLine } from '~/components/relation-stats-card';
@@ -79,6 +79,12 @@ const drawerEntityOf = (node: string | null, connected: string[]) => {
 const INSPECT_STATUS = { none: 'never', queued: 'running', running: 'running', failed: 'failed', succeeded: 'ok' } as const;
 type InspectView = { status: (typeof INSPECT_STATUS)[keyof typeof INSPECT_STATUS]; error: string | null; inspectedAt: string | null; drifts: Drift[] };
 
+/** 最近一次打通合并、拆开的组数；都为 0 或上一版结果没有时不显示 */
+function IdentityChanges({ summary }: { summary: NonNullable<IdentityInfo['summary']> }) {
+  const label = identityChangesLabel(summary);
+  return label && <span data-merged={summary.merged ?? 0} data-split={summary.split ?? 0}>{label}</span>;
+}
+
 const NODE_KINDS = { entity: '标准层表', identity: '身份对应', device: '设备归属' } as const;
 const EDGE_KINDS = { ref: '内置关系', identity: '经 _identities', device: '经 _device_owner' } as const;
 
@@ -98,7 +104,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   const summary = await latestIdentitySummary(member.tenant.id);
   const graph = relationGraph({
     edges: deriveLineage({ plans, sources: [] }).edges, connected, showAll,
-    identity: { rules, summary: summary && { groups: summary.groups, records: summary.records } },
+    identity: { rules, summary: summary && { groups: summary.groups, records: summary.records, merged: summary.merged, split: summary.split } },
   });
   const node = searchParams.get('node');
   const sql = node ? sampleSql(node, graph) : null;
@@ -317,6 +323,7 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
                             <>
                               <span data-groups={n.identity.summary.groups}>统一消费者 {n.identity.summary.groups.toLocaleString()}</span>
                               <span data-records={n.identity.summary.records}>参与打通的记录 {n.identity.summary.records.toLocaleString()}</span>
+                              <IdentityChanges summary={n.identity.summary} />
                             </>
                           ) : <span>尚未合并</span>}
                         </div>

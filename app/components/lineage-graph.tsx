@@ -8,7 +8,7 @@ import { Background, Controls, type Edge, MarkerType, type Node, type NodeChange
 import '@xyflow/react/dist/style.css';
 import { DRIFT_NODE_STYLE, DriftBadge } from '~/components/drift-badge';
 import { driftAttrs, type DriftByTable, type DriftCounts } from '~/lib/lineage-drift';
-import { type GraphEdge, type GraphNode, type RelationGraph, ruleLabels } from '~/lib/lineage-graph';
+import { type GraphEdge, type GraphNode, type RelationGraph, identityChangesLabel, ruleLabels } from '~/lib/lineage-graph';
 
 const NODE_STYLE: Record<GraphNode['kind'], React.CSSProperties> = {
   entity: { background: '#fff', borderColor: '#cbd5e1' },
@@ -24,6 +24,7 @@ const nodeLabel = (n: GraphNode, drift: DriftCounts | undefined): React.ReactNod
   const name = n.kind === 'entity' && n.label !== n.id ? `${n.label}（${n.id}）` : n.label;
   if (!n.identity && !drift) return name;
   const { rules, summary } = n.identity ?? {};
+  const changes = identityChangesLabel(summary ?? null);
   return (
     <div className="space-y-0.5 leading-tight">
       <div>{name}</div>
@@ -33,6 +34,7 @@ const nodeLabel = (n: GraphNode, drift: DriftCounts | undefined): React.ReactNod
           {summary ? `统一消费者 ${summary.groups.toLocaleString()} · 记录 ${summary.records.toLocaleString()}` : '尚未合并'}
         </div>
       )}
+      {changes && <div className="text-[10px] text-slate-500">{changes}</div>}
       {drift && <DriftBadge counts={drift} small />}
     </div>
   );
