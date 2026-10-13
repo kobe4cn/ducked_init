@@ -10,7 +10,7 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { allRelations, publishedCustomEntities, type RegisteredEntity, relationsFrom, relationsTo, uniqueKeys } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
-import { mappingIgnoredColumns, mappings, mappingVersions, sources, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
+import { mappingIgnoredColumns, mappings, mappingVersions, sources, sourceTables, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { publishedDependents } from './dsl-dependencies';
 import { dryRun } from './pipeline/dry-run-engine';
@@ -512,6 +512,18 @@ async function keySpaceFollowers(db: Tx | ReturnType<typeof getDb>, tenantId: st
 }
 
 /**
+ * 发布（与恢复停用的映射，ADR-0031）前对照其余已发布映射的检查：扩展字段类型、身份打通规则、引用字段的键空间、被跨源引用的 customer 键空间与已发布指标引用的扩展字段。
+ * 主键独占不在这里，由随后的合并检查（ADR-0024）
+ */
+async function assertPublishable(tx: Tx, tenantId: string, mapping: typeof mappings.$inferSelect, plan: MergePlan) {
+  await assertExtensionTypes(tx, tenantId, plan);
+  await assertIdentityRules(tx, tenantId, mapping.id, plan);
+  await assertKeySpaces(tx, tenantId, mapping, plan);
+  await assertCrossSourceReferrers(tx, tenantId, mapping, plan);
+  await assertMetricFields(tx, tenantId, mapping.id, plan);
+}
+
+/**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。发布前对照数据源当前的字段再校验一次。
  * 发布后版本锁定，并为这个映射入队一次合并（已有合并在排队时补进那个合并，在运行时由调度器在它之后补上）
  */
@@ -546,11 +558,7 @@ export async function publishMappingDraft(
   if (isStale(current, draft)) {
     throw new MappingError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
   }
-  await assertExtensionTypes(tx, actor.tenant.id, plan);
-  await assertIdentityRules(tx, actor.tenant.id, mapping.id, plan);
-  await assertKeySpaces(tx, actor.tenant.id, mapping, plan);
-  await assertCrossSourceReferrers(tx, actor.tenant.id, mapping, plan);
-  await assertMetricFields(tx, actor.tenant.id, mapping.id, plan);
+  await assertPublishable(tx, actor.tenant.id, mapping, plan);
   await tx.update(mappingVersions)
     .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: sql`now()` })
     .where(eq(mappingVersions.id, draft.id));
@@ -674,6 +682,47 @@ export async function confirmDisable(actor: CurrentMember, mappingId: string) {
     const task = await enqueueMerge(tx, actor.tenant.id, rest, { drop: [{ mapping: mappingId, entity: mapping.entity }] });
     if (!task) throw new MappingError('已有一次合并在运行，等它结束后再确认停用');
     return { requestedBy: mapping.disableRequestedByEmail, confirmedBy: actor.email };
+  });
+}
+
+/**
+ * 恢复停用的映射（ADR-0031）：需要发布权限，一人即可。停用期间别的映射可能占了它让出的位置，恢复前对照数据源当前的字段、已发布的登记与其余已发布映射
+ * 重跑发布时的检查（文档校验与 assertPublishable），源表（输入是源视图时视图引用的表）移出了同步范围时拒绝，要先选回（否则重建读不到批次）。
+ * 清掉停用列、记审计，在同一事务里为它入队一次重建合并（撤下时已删掉它的水位）；主键被别的映射占了时是这次合并失败，与发布时一样。已有合并在运行时报错、不恢复
+ */
+export async function restoreMapping(actor: CurrentMember, mappingId: string) {
+  assertCan(actor, 'publish');
+  const tenantId = actor.tenant.id;
+  const { sourceId } = await requireMapping(tenantId, mappingId);
+  await getDb().transaction(async tx => {
+    // 先锁源表行再锁租户行，与修改同步范围（锁源表行后入队任务共享锁租户行）同序，不死锁
+    const scoped = new Set((await tx.select({ table: sourceTables.tableName, inScope: sourceTables.inScope }).from(sourceTables)
+      .where(eq(sourceTables.sourceId, sourceId)).for('update')).flatMap(t => (t.inScope ? [t.table] : [])));
+    await lockTenant(tx, tenantId);
+    const [mapping] = await tx.select().from(mappings).where(eq(mappings.id, mappingId)).for('update');
+    if (!mapping.disabledAt) throw new MappingError('映射没有停用');
+    // 锁住映射行之后再读：停用期间也能发布新版本
+    const [published] = await tx.select({ version: mappingVersions.version, yaml: mappingVersions.yaml, plan: mappingVersions.plan }).from(mappingVersions)
+      .where(and(eq(mappingVersions.mappingId, mappingId), eq(mappingVersions.status, 'published'))).orderBy(desc(mappingVersions.version)).limit(1);
+    const [view] = mapping.sourceViewId ? await publishedViews(tx, tenantId, { viewIds: [mapping.sourceViewId] }) : [];
+    if (mapping.sourceViewId && !view) throw new MappingError(`源视图 ${mapping.tableName} 没有已发布的版本，不能恢复`);
+    const tables = view ? view.tables ?? [] : [mapping.tableName];
+    const outOfScope = tables.filter(t => !scoped.has(t));
+    if (outOfScope.length) throw new MappingError(`源表 ${outOfScope.join('、')} 不在同步范围内，先把它选回同步范围再恢复`);
+    // 文档校验要在同步范围检查之后（范围外的表没有字段可对照）；它只读、另开连接，持锁期间读到的是已提交的数据
+    await checkMappingDraft(tenantId, mapping.sourceId, published.yaml);
+    await assertPublishable(tx, tenantId, mapping, published.plan);
+    await tx.update(mappings).set({ disabledAt: null, disabledByEmail: null }).where(eq(mappings.id, mappingId));
+    const names = await sourceNames(tx, tenantId);
+    await recordAudit(tx, {
+      tenantId,
+      actor,
+      action: 'mapping.restored',
+      targetType: 'mapping',
+      targetId: mappingId,
+      detail: { source: names.get(mapping.sourceId), table: mapping.tableName, entity: mapping.entity, version: published.version },
+    });
+    if (!await enqueueMerge(tx, tenantId, [mappingId], { rebuild: true })) throw new MappingError('已有一次合并在运行，等它结束后再恢复');
   });
 }
 

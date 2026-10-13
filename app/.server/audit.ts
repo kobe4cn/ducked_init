@@ -84,6 +84,10 @@ const ACTIONS = {
     label: '停用映射',
     describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，提议人 ${d.requestedBy}、确认人 ${d.confirmedBy}`,
   },
+  'mapping.restored': {
+    label: '恢复映射',
+    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版`,
+  },
   'mapping.column_ignored': {
     label: '忽略源表新列',
     describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，忽略新列 ${d.column}`,

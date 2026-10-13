@@ -1,6 +1,6 @@
 // 映射与标准层合并的流水线接缝：同步到原始层 → 编写映射草稿 → 另一位成员发布 → 调度器派发合并 → 标准层；
 // 之后源端的新增、更新与删除随同步后的合并进入标准层，去重键与取最新规则让源端的重复行只计一次；漂移检查报告缺列时，重建合并补上标准层缺的列；
-// 映射停用要两人确认，停用后同步后的合并与定时检查都不再算它，确认停用时入队的合并撤下它写进标准层的行（ADR-0031）
+// 映射停用要两人确认，停用后同步后的合并与定时检查都不再算它，确认停用时入队的合并撤下它写进标准层的行；恢复由一人确认，重跑发布时的检查后入队重建合并（ADR-0031）
 import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
@@ -10,7 +10,7 @@ import { createDefinition, deleteDefinition, publishDefinition } from '../../app
 import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
 import {
   confirmDisable, createMapping, enqueueDueMerges, enqueueMerge, getMapping, listMappings, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishedPlans, publishMapping,
-  rebuildEntity, referenceTables, requestDisable, saveDraft,
+  rebuildEntity, referenceTables, requestDisable, restoreMapping, saveDraft,
 } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
@@ -1247,5 +1247,102 @@ describe('停用映射', () => {
     await requestDisable(author, orders);
     await expect(confirmDisable(reviewer, orders)).rejects.toThrow('已有一次合并在运行');
     expect(await getMapping(author, orders)).toMatchObject({ disabledAt: null });
+  });
+
+  /** 提议并确认停用，跑完撤下它的合并 */
+  const disable = async (author: CurrentMember, reviewer: CurrentMember, mapping: string) => {
+    await requestDisable(author, mapping);
+    await confirmDisable(reviewer, mapping);
+    await drain();
+  };
+
+  it('停用再恢复订单映射：一人即可恢复，入队带 rebuild 的合并，合并后标准层与停用前一致；审计记下恢复映射；没停用的、查看者被拒', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, CUSTOMERS);
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const before = await silver(acme, 'order', 'order_id::INT');
+    await expect(restoreMapping(author, orders)).rejects.toThrow('映射没有停用');
+
+    await disable(author, reviewer, orders);
+    expect(await silver(acme, 'order', 'order_id::INT')).toEqual([]);
+    await expect(restoreMapping(await memberOf(acme, 'v@acme.com', 'viewer'), orders)).rejects.toMatchObject({ init: { status: 403 } });
+    // 提议停用的人自己就能恢复
+    await restoreMapping(author, orders);
+    expect(await getMapping(author, orders)).toMatchObject({ disabledAt: null, disabledByEmail: null });
+    expect((await publishedPlans(getDb(), acme)).map(p => p.mapping)).toContain(orders);
+    const queued = await lastMerge(acme);
+    expect(queued.params.mappings).toEqual([expect.objectContaining({ mapping: orders, rebuild: true })]);
+    await drain();
+    expect((await lastMerge(acme)).status).toBe('succeeded');
+    expect(await silver(acme, 'order', 'order_id::INT')).toEqual(before);
+    await expect(restoreMapping(reviewer, orders)).rejects.toThrow('映射没有停用');
+
+    const audit = (await listAuditLogs(acme)).filter(l => l.action === '恢复映射').map(l => `${l.actor} ${l.summary}`);
+    expect(audit).toEqual(['de@acme.com 「电商库」orders → 订单，第 1 版']);
+  });
+
+  it('停用期间别的映射发布后占了它的 order_id：恢复后的重建合并失败，报出与发布冲突映射时一样的主键冲突，标准层不变', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    await disable(author, reviewer, orders);
+    const clash = await publish(author, reviewer, id, 'model: 1\nentity: order\ntable: customers\nfields:\n  order_id: string(customer_id)\n');
+    const before = await silver(acme, 'order', 'order_id::INT');
+    expect(new Set(before.map(o => o._mapping))).toEqual(new Set([clash]));
+
+    await restoreMapping(author, orders);
+    await drain();
+    expect((await getMapping(author, orders)).merge.history[0]).toMatchObject({ error: expect.stringMatching(/^主键 order_id 跨映射重复：/) });
+    expect(await silver(acme, 'order', 'order_id::INT')).toEqual(before);
+  });
+
+  it('恢复时重跑发布时的检查：停用期间别的订单映射把 x_amount_fen 发布成文本后恢复被拒，映射仍停用', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    await disable(author, reviewer, orders);
+    await publish(author, reviewer, id, `${ORDER_LOG_MAPPING}extensions:\n  x_amount_fen: { type: string, expr: string(amount_fen) }\n`);
+    const merges = (await listTasks(acme)).filter(t => t.kind === 'silver.merge').length;
+
+    await expect(restoreMapping(author, orders)).rejects.toThrow(/字段 x_amount_fen 在已发布的映射里是 string，这里是 integer/);
+    expect(await getMapping(author, orders)).toMatchObject({ disabledAt: expect.any(Date) });
+    expect((await listTasks(acme)).filter(t => t.kind === 'silver.merge')).toHaveLength(merges);
+  });
+
+  it('停用期间源表可以移出同步范围；移出后恢复被拒、提示先选回，选回后能恢复', async () => {
+    const { author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    await expect(setSyncScope(author, id, { remove: ['orders'] })).rejects.toThrow(/已被已发布的映射引用/);
+    await disable(author, reviewer, orders);
+    await setSyncScope(author, id, { remove: ['orders'] });
+
+    await expect(restoreMapping(author, orders)).rejects.toThrow('源表 orders 不在同步范围内，先把它选回同步范围再恢复');
+    await setSyncScope(author, id, { add: ['orders'] });
+    await restoreMapping(author, orders);
+    expect(await getMapping(author, orders)).toMatchObject({ disabledAt: null });
+  });
+
+  it('确认停用后撤下它的合并还在排队时恢复：那次合并同时带 drop 与它的重建，先撤下再重建，标准层与停用前一致', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const before = await silver(acme, 'order', 'order_id::INT');
+    await requestDisable(author, orders);
+    await confirmDisable(reviewer, orders);
+    await restoreMapping(author, orders);
+    const queued = await lastMerge(acme);
+    expect(queued.params.drop).toEqual([{ mapping: orders, entity: 'order' }]);
+    expect(queued.params.mappings).toEqual([expect.objectContaining({ mapping: orders, rebuild: true })]);
+    await drain();
+    expect((await lastMerge(acme)).status).toBe('succeeded');
+    expect(await silver(acme, 'order', 'order_id::INT')).toEqual(before);
+  });
+
+  it('已有合并在运行时不能恢复', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    await publish(author, reviewer, id, CUSTOMERS);
+    await disable(author, reviewer, orders);
+    const pending = await getDb().transaction(tx => enqueueMerge(tx, acme));
+    await getDb().update(tasks).set({ status: 'running' }).where(eq(tasks.id, pending!.id));
+    await expect(restoreMapping(author, orders)).rejects.toThrow('已有一次合并在运行');
+    expect(await getMapping(author, orders)).toMatchObject({ disabledAt: expect.any(Date) });
   });
 });

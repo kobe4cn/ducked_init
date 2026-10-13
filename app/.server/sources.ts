@@ -406,11 +406,11 @@ export async function setSyncScope(actor: CurrentMember, sourceId: string, { add
     }
     const added = [...listing.values()].filter(t => add.includes(t.tableName) && !t.inScope).map(t => t.tableName);
     const removed = [...listing.values()].filter(t => remove.includes(t.tableName) && !add.includes(t.tableName) && t.inScope).map(t => t.tableName);
-    // 已被已发布映射引用的表不能移出范围：标准层还要从它的变更批次合并
+    // 已被已发布映射引用的表不能移出范围：标准层还要从它的变更批次合并。停用的映射不算（ADR-0031），恢复前要先选回范围
     const mapped = removed.length
       ? await tx.selectDistinct({ table: mappings.tableName }).from(mappings)
         .innerJoin(mappingVersions, and(eq(mappingVersions.mappingId, mappings.id), eq(mappingVersions.status, 'published')))
-        .where(and(eq(mappings.sourceId, sourceId), inArray(mappings.tableName, removed)))
+        .where(and(eq(mappings.sourceId, sourceId), isNull(mappings.disabledAt), inArray(mappings.tableName, removed)))
       : [];
     if (mapped.length) throw new SourceError(`${mapped.map(m => m.table).join('、')} 已被已发布的映射引用，不能移出同步范围`);
     if (!added.length && !removed.length) return { added, removed, task: null };

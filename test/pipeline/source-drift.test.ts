@@ -2,7 +2,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb } from '../../app/.server/db/client';
-import { ignoreColumn, MappingError, saveDraft } from '../../app/.server/mappings';
+import { confirmDisable, ignoreColumn, MappingError, requestDisable, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { mappingDrift } from '../../app/.server/source-drift';
@@ -41,7 +41,7 @@ async function publishedCustomers() {
   await syncSource(author, id);
   await drain();
   const mappingId = await publish(author, reviewer, id, CUSTOMERS);
-  return { acme, author, id, mappingId };
+  return { acme, author, reviewer, id, mappingId };
 }
 
 /** 改源表结构后重新采集 */
@@ -98,5 +98,14 @@ describe('映射源表列差异', () => {
     await alterAndRelist(author, id, 'ALTER TABLE shop.customers DROP COLUMN email');
     await expect(ignoreColumn(author, mappingId, 'email')).rejects.toMatchObject({ status: 400 });
     expect((await mappingDrift(acme)).get(mappingId)).toMatchObject({ newColumns: [], missing: ['email'] });
+  });
+
+  it('停用的映射不做差异检查（ADR-0031）', async () => {
+    const { acme, author, reviewer, id, mappingId } = await publishedCustomers();
+    await alterAndRelist(author, id, 'ALTER TABLE shop.customers DROP COLUMN email');
+    expect((await mappingDrift(acme)).has(mappingId)).toBe(true);
+    await requestDisable(author, mappingId);
+    await confirmDisable(reviewer, mappingId);
+    expect((await mappingDrift(acme)).has(mappingId)).toBe(false);
   });
 });

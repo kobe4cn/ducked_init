@@ -34,7 +34,7 @@ function referenced(plan: MergePlan) {
 }
 
 /**
- * 租户各已发布映射（给了 mappingIds 时只取这些）的源表列差异；没有差异的映射不在结果里
+ * 租户各已发布映射（给了 mappingIds 时只取这些；停用的映射除外，ADR-0031）的源表列差异；没有差异的映射不在结果里
  */
 export async function mappingDrift(tenantId: string, mappingIds?: string[]): Promise<Map<string, MappingDrift>> {
   const drift = new Map<string, MappingDrift>();
@@ -46,7 +46,7 @@ export async function mappingDrift(tenantId: string, mappingIds?: string[]): Pro
     .from(mappingVersions)
     .innerJoin(mappings, eq(mappings.id, mappingVersions.mappingId))
     .where(and(
-      eq(mappings.tenantId, tenantId), eq(mappingVersions.status, 'published'), isNull(mappings.sourceViewId), mappingIds && inArray(mappings.id, mappingIds),
+      eq(mappings.tenantId, tenantId), isNull(mappings.disabledAt), eq(mappingVersions.status, 'published'), isNull(mappings.sourceViewId), mappingIds && inArray(mappings.id, mappingIds),
     ))
     .orderBy(mappingVersions.mappingId, desc(mappingVersions.version)))
     .flatMap(r => (r.publishedAt ? [{ ...r, publishedAt: r.publishedAt }] : []));
