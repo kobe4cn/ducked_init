@@ -5,7 +5,7 @@
 // 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。发布过的实体只能新增字段与关系（规则同 ADR-0018），
 // 没被已发布映射、已发布指标引用，也没被别的实体的已发布关系指向的实体可以由有发布权限的成员删除。已发布映射在用、但没登记的实体由平台推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），
 // 先由一位成员确认（保存），再由另一位成员发布；登记发布前映射页提示实体待补登，映射页的实体链接到实体页。一律限定在操作者所属租户内
-import { and, desc, eq, exists, getTableColumns, inArray, notExists, sql } from 'drizzle-orm';
+import { and, desc, eq, exists, getTableColumns, inArray, isNull, notExists, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
@@ -265,7 +265,7 @@ export async function requireEntity(tenantId: string, entityId: string) {
 }
 
 /**
- * 引用这个实体的已发布映射（有已发布版本、映射的实体是它；映射的实体建映射时定下），按「数据源」表名列出；
+ * 引用这个实体的已发布映射（有已发布版本、没停用、映射的实体是它；映射的实体建映射时定下），按「数据源」表名列出；
  * 再列出别的实体已发布的登记上指向它的关系（挂在它自己登记上的关系随它一起删，不算引用），以及以它为基础实体或维度路径经过它的已发布指标
  * （各指标最新的已发布版本，草稿不算；标签经指标引用实体，指标在就删不了）
  */
@@ -273,7 +273,7 @@ async function publishedReferrers(db: Tx | ReturnType<typeof getDb>, tenantId: s
   const rows = await db.select({ source: sources.name, table: mappings.tableName, viewId: mappings.sourceViewId })
     .from(mappings).innerJoin(sources, eq(sources.id, mappings.sourceId))
     .where(and(
-      eq(mappings.tenantId, tenantId), eq(mappings.entity, name),
+      eq(mappings.tenantId, tenantId), eq(mappings.entity, name), isNull(mappings.disabledAt),
       exists(db.select({ id: mappingVersions.id }).from(mappingVersions)
         .where(and(eq(mappingVersions.mappingId, mappings.id), eq(mappingVersions.status, 'published')))),
     ))

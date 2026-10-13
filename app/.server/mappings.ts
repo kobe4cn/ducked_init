@@ -3,7 +3,7 @@
 // 源表新增的列可一键加为扩展字段，写进草稿（或最新已发布版本）的 YAML 填进编辑框，不保存；也可标记为有意不映射（忽略），不再提醒并记审计。
 // 编辑时可对任一版本空跑：在请求内只读挂载本租户的数据湖，转换原始层的样本，返回样例行与基础断言，不写标准层（pipeline/dry-run-engine.ts）。
 // 一律限定在操作者所属租户内；合并本身在工作进程里进行（pipeline/merge-engine.ts）
-import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm';
 import { parseDocument } from 'yaml';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
@@ -255,7 +255,7 @@ export async function ignoreColumn(actor: CurrentMember, mappingId: string, colu
 }
 
 /**
- * 跨源引用的目标数据源（customer_source）：按名字找同租户的数据源，看它有没有已发布的 customer 映射。
+ * 跨源引用的目标数据源（customer_source）：按名字找同租户的数据源，看它有没有已发布（且没停用）的 customer 映射。
  * YAML 里没写 customer_source 时不查平台库
  */
 async function customerSources(tenantId: string, sourceId: string, yaml: string): Promise<CustomerSources> {
@@ -264,7 +264,7 @@ async function customerSources(tenantId: string, sourceId: string, yaml: string)
   const all = await db.select({ id: sources.id, name: sources.name }).from(sources).where(eq(sources.tenantId, tenantId));
   const published = new Set((await db.selectDistinct({ sourceId: mappings.sourceId }).from(mappings)
     .innerJoin(mappingVersions, eq(mappingVersions.mappingId, mappings.id))
-    .where(and(eq(mappings.tenantId, tenantId), eq(mappings.entity, 'customer'), eq(mappingVersions.status, 'published')))).map(r => r.sourceId));
+    .where(and(eq(mappings.tenantId, tenantId), eq(mappings.entity, 'customer'), isNull(mappings.disabledAt), eq(mappingVersions.status, 'published')))).map(r => r.sourceId));
   return {
     self: sourceId,
     resolve: name => {
@@ -598,6 +598,81 @@ export async function discardDraft(actor: CurrentMember, mappingId: string) {
 }
 
 /**
+ * 有发布权限的成员做不了停用的这一步（request 提议、confirm 确认，ADR-0031）的报错：映射没有已发布版本、已停用，
+ * 确认时还没有人提议或提议的是自己（双人确认，403）；可以时为 null。发布权限由调用方另行检查
+ */
+function disableBlocker(actor: CurrentMember, mapping: typeof mappings.$inferSelect, published: boolean, step: 'request' | 'confirm') {
+  if (!published) return new MappingError('这个映射还没有发布，不用停用；可以丢弃草稿');
+  if (mapping.disabledAt) return new MappingError('映射已停用');
+  if (step === 'request') return null;
+  if (!mapping.disableRequestedByEmail) return new MappingError('还没有人提议停用这个映射');
+  if (mapping.disableRequestedByEmail === actor.email) return new MappingError('你提议了停用，需由另一位数据工程师或管理员确认', 403);
+  return null;
+}
+
+/** 停用的两步各记的审计 */
+const DISABLE_ACTIONS = { request: 'mapping.disable_requested', confirm: 'mapping.disabled' } as const;
+
+/**
+ * 停用的一步：锁住租户行（与发布、入队合并互斥）与映射行后检查 disableBlocker，以及 customer 映射没被别的数据源跨源引用（ADR-0030，
+ * 停用后这些引用的 _customer_source 会指向空），然后在同一事务里做 apply 并记审计，apply 返回的是审计 detail 里另加的项
+ */
+async function disableStep(
+  actor: CurrentMember, mappingId: string, step: keyof typeof DISABLE_ACTIONS,
+  apply: (tx: Tx, mapping: typeof mappings.$inferSelect) => Promise<Record<string, unknown> | void>,
+) {
+  assertCan(actor, 'publish');
+  await getDb().transaction(async tx => {
+    await lockTenant(tx, actor.tenant.id);
+    await requireMapping(actor.tenant.id, mappingId, tx);
+    const [mapping] = await tx.select().from(mappings).where(eq(mappings.id, mappingId)).for('update');
+    const [published] = await tx.select({ id: mappingVersions.id }).from(mappingVersions)
+      .where(and(eq(mappingVersions.mappingId, mappingId), eq(mappingVersions.status, 'published'))).limit(1);
+    const blocker = disableBlocker(actor, mapping, !!published, step);
+    if (blocker) throw blocker;
+    const names = await sourceNames(tx, actor.tenant.id);
+    if (mapping.entity === 'customer') {
+      const referrers = (await crossSourceReferrers(tx, actor.tenant.id, mapping.sourceId)).filter(r => r.sourceId !== mapping.sourceId);
+      if (referrers.length) {
+        throw new MappingError(`${names.get(mapping.sourceId)} 的消费者（customer）映射被别的数据源跨源引用，停用后这些引用会找不到消费者：`
+          + `${referrers.map(r => `${names.get(r.sourceId)} 的 ${r.mapping}（${r.columns.join('、')}）`).join('；')}，先改掉或停用它们`);
+      }
+    }
+    const detail = await apply(tx, mapping);
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id,
+      actor,
+      action: DISABLE_ACTIONS[step],
+      targetType: 'mapping',
+      targetId: mappingId,
+      detail: { source: names.get(mapping.sourceId), table: mapping.tableName, entity: mapping.entity, ...detail },
+    });
+  });
+}
+
+/**
+ * 提议停用已发布的映射（ADR-0031）：需要发布权限，记下提议人与时间；已有提议时覆盖原提议人。被别的数据源跨源引用的 customer 映射不能停用
+ */
+export async function requestDisable(actor: CurrentMember, mappingId: string) {
+  await disableStep(actor, mappingId, 'request', async tx => {
+    await tx.update(mappings).set({ disableRequestedByEmail: actor.email, disableRequestedAt: sql`now()` }).where(eq(mappings.id, mappingId));
+  });
+}
+
+/**
+ * 确认停用（ADR-0031）：需要发布权限，确认人不能是提议人。停用后映射不再算作已发布（publishedPlans、同步后的合并与定时检查都跳过它），
+ * 停用人记为提议人、确认人记在审计里，并清掉提议。被别的数据源跨源引用的 customer 映射不能停用（提议之后才有的引用也算）
+ */
+export async function confirmDisable(actor: CurrentMember, mappingId: string) {
+  await disableStep(actor, mappingId, 'confirm', async (tx, mapping) => {
+    await tx.update(mappings)
+      .set({ disabledAt: sql`now()`, disabledByEmail: mapping.disableRequestedByEmail, disableRequestedByEmail: null, disableRequestedAt: null })
+      .where(eq(mappings.id, mappingId));
+    return { requestedBy: mapping.disableRequestedByEmail, confirmedBy: actor.email };
+  });
+}
+
+/**
  * 空跑映射的第 version 版：在只读挂载的数据湖上转换原始层里源表（或源视图）最新的样本（只用会话的本机库 stage），返回样例行与基础断言。
  * 不写标准层与合并日志、不记审计。源表还没同步、转换出错时抛出 MappingError（报错里抹掉凭据、盐与敏感字段的取值）
  */
@@ -627,7 +702,7 @@ export async function dryRunMapping(actor: CurrentMember, mappingId: string, ver
 }
 
 /**
- * 租户各映射（给了 mappingIds 时只取这些）最新的已发布版本及其合并计划（合并任务的参数）。
+ * 租户各映射（给了 mappingIds 时只取这些；停用的映射除外，ADR-0031）最新的已发布版本及其合并计划（合并任务的参数）。
  * 输入是源视图的映射带上视图最新的已发布版本（SQL 与引用的表），工作进程不读平台库；
  * 写入全部实体（customer 除外，ADR-0024「独占」）的映射带上实体主键 uniqueKey，合并时跨映射查重；主键含指向 customer 的字段时
  * 另带 uniqueBySource，只在同一个数据源内查重
@@ -640,7 +715,7 @@ export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId
     })
     .from(mappingVersions)
     .innerJoin(mappings, eq(mappings.id, mappingVersions.mappingId))
-    .where(and(eq(mappings.tenantId, tenantId), eq(mappingVersions.status, 'published'), mappingIds && inArray(mappings.id, mappingIds)))
+    .where(and(eq(mappings.tenantId, tenantId), isNull(mappings.disabledAt), eq(mappingVersions.status, 'published'), mappingIds && inArray(mappings.id, mappingIds)))
     .orderBy(mappingVersions.mappingId, desc(mappingVersions.version));
   const views = await publishedViews(db, tenantId, { viewIds: [...new Set(rows.flatMap(r => (r.viewId ? [r.viewId] : [])))] });
   const uniqueByEntity = uniqueKeys(await publishedCustomEntities(db, tenantId));
@@ -757,7 +832,7 @@ const syncWroteMappingTable = (s: 's', m: 'm') => sql.raw(`${s}.kind = 'source.s
   END))`);
 
 /**
- * 同步结束后合并一次（调度器在同步任务结束时调用）：只为这次同步给源表写入了变更的已发布映射入队，没有这样的映射时不入队；
+ * 同步结束后合并一次（调度器在同步任务结束时调用）：只为这次同步给源表写入了变更的已发布映射（停用的除外）入队，没有这样的映射时不入队；
  * 租户停用时什么都不做
  */
 export async function mergeAfterSync(tenantId: string, syncTaskId: string) {
@@ -767,7 +842,7 @@ export async function mergeAfterSync(tenantId: string, syncTaskId: string) {
     const { rows } = await tx.execute<{ id: string }>(sql`
       SELECT m.id FROM ${tasks} s
       JOIN ${mappings} m ON m.tenant_id = s.tenant_id
-      WHERE s.id = ${syncTaskId} AND ${syncWroteMappingTable('s', 'm')}
+      WHERE s.id = ${syncTaskId} AND m.disabled_at IS NULL AND ${syncWroteMappingTable('s', 'm')}
         AND EXISTS (SELECT 1 FROM ${mappingVersions} v WHERE v.mapping_id = m.id AND v.status = 'published')`);
     if (!rows.length) return null;
     return enqueueMerge(tx, tenantId, rows.map(r => r.id));
@@ -816,7 +891,7 @@ export async function rebuildEntity(actor: CurrentMember, entity: string) {
 const mergeHas = (params: SQL, mappingId: SQL) => sql`${params}->'mappings' @> jsonb_build_array(jsonb_build_object('mapping', ${mappingId}))`;
 
 /**
- * 到期要合并的映射（给了 tenantId 时只看这个租户）：映射已发布、租户未停用，带它的最近一次合并 last 不在排队，且
+ * 到期要合并的映射（给了 tenantId 时只看这个租户）：映射已发布且没停用、租户未停用，带它的最近一次合并 last 不在排队，且
  * (a) last 带的不是它最新的已发布版本（还没合并过也算；last 失败了也算带过，不自动重试；读源视图的映射另看 last 带的视图版本，
  *     视图发布时已有合并在运行、入队不了的由此补上），或
  * (b) last 开始之后有同步结束并给它的源表写入了变更（合并运行期间发生的变化由此补上）。
@@ -837,7 +912,7 @@ async function dueMappings(db: Tx | ReturnType<typeof getDb>, tenantId?: string)
       WHERE l.tenant_id = m.tenant_id AND l.kind = 'silver.merge' AND ${mergeHas(sql`l.params`, sql`m.id::text`)}
       ORDER BY l.created_at DESC, l.id DESC LIMIT 1
     ) last ON true
-    WHERE v.version IS NOT NULL ${tenantId ? sql`AND m.tenant_id = ${tenantId}` : sql``}
+    WHERE v.version IS NOT NULL AND m.disabled_at IS NULL ${tenantId ? sql`AND m.tenant_id = ${tenantId}` : sql``}
       AND last.status IS DISTINCT FROM 'queued'
       AND (
         last.version IS DISTINCT FROM v.version

@@ -1,9 +1,10 @@
 // test/pipeline/customer-source.test.ts —— 跨源引用 customer_source（#150）：草稿检查按数据源名找同租户的数据源，目标源不存在、写在不指向 customer 的字段上时报错，
 // 写的是本源时只提示可以省略；发布出的计划里声明了的列带目标源的 sourceId，指向 customer 的引用列带 customerRef。
-// 发布时跨源引用的键空间要与目标源 customer 映射的一致，目标源重发 customer 映射使引用失效时被拒；crossSourceReferrers 查得到跨源引用（#187）
+// 发布时跨源引用的键空间要与目标源 customer 映射的一致，目标源重发 customer 映射使引用失效时被拒；crossSourceReferrers 查得到跨源引用（#187）；
+// 被跨源引用的 customer 映射不能停用（#193）
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { checkMappingDraft, crossSourceReferrers, MappingError, publishedPlans, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { checkMappingDraft, confirmDisable, crossSourceReferrers, MappingError, publishedPlans, publishMapping, requestDisable, saveDraft } from '../../app/.server/mappings';
 import { resetDb } from '../http/harness';
 import { CRM_ORDERS, LOYALTY, LOYALTY_ORDERS, publishedIdentitySources } from './identity-fixtures';
 
@@ -67,5 +68,28 @@ describe('跨源引用 customer_source', () => {
     await republish(orderOf(sources.crm), CRM_ORDERS.replace('  customer_id: string(customer)\n', '  customer_id: { expr: string(customer), customer_source: 会员, key_space: mem }\n'));
     await expect(republish(mappings.loyalty, LOYALTY))
       .rejects.toThrow(new MappingError('会员 的消费者（customer）映射发布后不再声明键空间，这些跨源引用会失效：CRM 的 orders → order（customer_id 写的是 key_space: mem），先把它们改成一致再发布'));
+  });
+
+  it('被别的数据源跨源引用的 customer 映射不能停用：提议与确认时都检查，报错列出引用方；引用方先停用后可以停用，之后不能再新写指向它的引用', async () => {
+    const { acme, author, reviewer, sources, mappings } = await publishedIdentitySources({ orders: true });
+    const [orders] = (await publishedPlans(getDb(), acme)).filter(p => p.sourceId === sources.crm && p.entity === 'order');
+    const blocked = new MappingError('会员 的消费者（customer）映射被别的数据源跨源引用，停用后这些引用会找不到消费者：CRM 的 orders → order（customer_id），先改掉或停用它们');
+
+    // 提议之后才有引用：确认时被拒
+    await requestDisable(author, mappings.loyalty);
+    await publishMapping(reviewer, orders.mapping, await saveDraft(author, orders.mapping, withSource('会员')));
+    await expect(confirmDisable(reviewer, mappings.loyalty)).rejects.toThrow(blocked);
+    await expect(requestDisable(author, mappings.loyalty)).rejects.toThrow(blocked);
+    expect((await publishedPlans(getDb(), acme)).map(p => p.mapping)).toContain(mappings.loyalty);
+
+    await requestDisable(author, orders.mapping);
+    await confirmDisable(reviewer, orders.mapping);
+    await requestDisable(author, mappings.loyalty);
+    await confirmDisable(reviewer, mappings.loyalty);
+    expect((await publishedPlans(getDb(), acme)).map(p => p.mapping)).not.toContain(mappings.loyalty);
+    // 目标源的 customer 映射都停用了：新的跨源引用写不进去
+    await expect(checkMappingDraft(acme, sources.crm, withSource('会员'))).rejects.toMatchObject({
+      issues: [expect.objectContaining({ path: 'fields.customer_id.customer_source' })],
+    });
   });
 });

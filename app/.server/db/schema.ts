@@ -279,6 +279,11 @@ export const mappings = platform.table('mappings', {
   sourceViewId: uuid('source_view_id').references(() => sourceViews.id),
   entity: text('entity').notNull(),
   createdAt: createdAt(),
+  // 映射停用（ADR-0031）：一位有发布权限的成员提议，另一位确认后写 disabled_at 与停用人（提议人，确认人记在审计里），清掉提议；停用的映射不再算作已发布
+  disableRequestedByEmail: text('disable_requested_by_email'),
+  disableRequestedAt: timestamp('disable_requested_at', { withTimezone: true }),
+  disabledByEmail: text('disabled_by_email'),
+  disabledAt: timestamp('disabled_at', { withTimezone: true }),
 }, t => [
   index('mappings_tenant_idx').on(t.tenantId),
   uniqueIndex('mappings_source_table_entity_uq').on(t.sourceId, t.tableName, t.entity),

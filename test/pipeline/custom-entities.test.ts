@@ -13,7 +13,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { customEntities, customEntityVersions } from '../../app/.server/db/schema';
 import type { EntityRelation } from '../../app/lib/canonical-model';
-import { createMapping, draftFor, getMapping, saveDraft } from '../../app/.server/mappings';
+import { confirmDisable, createMapping, draftFor, getMapping, requestDisable, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { relationSuggestions } from '../../app/.server/relation-suggest';
 import { syncSource } from '../../app/.server/source-sync';
@@ -421,6 +421,23 @@ describe('删除自定义实体', () => {
     await deleteCustomEntity(reviewer, unused);
     await expect(getCustomEntity(author, unused)).rejects.toMatchObject({ status: 404 });
     expect((await listAuditLogs(acme)).filter(l => l.action === '删除自定义实体').map(l => l.summary)).toEqual(['custom_region']);
+  });
+
+  it('停用的映射不再算引用：引用方为空，可以删除', async () => {
+    const { author, reviewer } = await engineers();
+    const id = await createCustomEntity(author, STORE);
+    await publishCustomEntity(reviewer, id, 1);
+    const { id: sourceId } = await registerSource(author, await pgSourceInput(READER));
+    await selectAllTables(author, sourceId);
+    await drain();
+    const mapping = await publish(author, reviewer, sourceId,
+      'model: 1\nentity: custom_store\ntable: customers\nextensions:\n  store_id: { type: string, expr: string(customer_id) }\ndedupe: { key: [store_id] }\n');
+    expect((await getCustomEntity(author, id)).referrers).toEqual(['「电商库」customers']);
+
+    await requestDisable(author, mapping);
+    await confirmDisable(reviewer, mapping);
+    expect((await getCustomEntity(author, id)).referrers).toEqual([]);
+    await deleteCustomEntity(reviewer, id);
   });
 
   it('被其他实体的已发布关系指向时拒绝并列出关系；挂在本实体上的关系不算', async () => {

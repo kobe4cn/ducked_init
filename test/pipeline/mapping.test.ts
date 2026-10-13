@@ -1,13 +1,16 @@
 // 映射与标准层合并的流水线接缝：同步到原始层 → 编写映射草稿 → 另一位成员发布 → 调度器派发合并 → 标准层；
-// 之后源端的新增、更新与删除随同步后的合并进入标准层，去重键与取最新规则让源端的重复行只计一次；漂移检查报告缺列时，重建合并补上标准层缺的列
+// 之后源端的新增、更新与删除随同步后的合并进入标准层，去重键与取最新规则让源端的重复行只计一次；漂移检查报告缺列时，重建合并补上标准层缺的列；
+// 映射停用要两人确认，停用后同步后的合并与定时检查都不再算它（ADR-0031）
 import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { listAuditLogs } from '../../app/.server/audit';
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
 import {
-  createMapping, enqueueDueMerges, enqueueMerge, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, rebuildEntity, referenceTables, saveDraft,
+  confirmDisable, createMapping, enqueueDueMerges, enqueueMerge, getMapping, listMappings, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishedPlans, publishMapping,
+  rebuildEntity, referenceTables, requestDisable, saveDraft,
 } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
@@ -1078,5 +1081,69 @@ describe('发布映射并合并到标准层', () => {
     await drain();
     expect(await latest()).toMatchObject({ mode: 'rebuild', inserted: 0, updated: 100, deleted: 3, rows: 100 });
     expect(await silver(acme, 'order', 'order_id::INT')).toEqual(before);
+  });
+});
+
+describe('停用映射', () => {
+  it('提议停用后由另一位有发布权限的成员确认才生效，提议人自己确认被拒；再次提议覆盖提议人；审计记下提议与停用', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const mapping = await publish(author, reviewer, id, CUSTOMERS);
+    const draftOnly = await createMapping(author, id, ORDERS);
+    const third = await memberOf(acme, 'admin@acme.com', 'admin');
+    await expect(requestDisable(await memberOf(acme, 'v@acme.com', 'viewer'), mapping)).rejects.toMatchObject({ init: { status: 403 } });
+    await expect(requestDisable(author, draftOnly.id)).rejects.toThrow('这个映射还没有发布');
+    await expect(confirmDisable(reviewer, mapping)).rejects.toThrow('还没有人提议停用这个映射');
+
+    await requestDisable(author, mapping);
+    await expect(confirmDisable(author, mapping)).rejects.toMatchObject({ status: 403, message: expect.stringContaining('另一位') });
+    // 再次提议覆盖提议人：原提议人现在可以确认
+    await requestDisable(reviewer, mapping);
+    expect(await getMapping(author, mapping)).toMatchObject({ disableRequestedByEmail: 'de2@acme.com', disabledAt: null });
+    await expect(confirmDisable(reviewer, mapping)).rejects.toMatchObject({ status: 403 });
+    await confirmDisable(author, mapping);
+    expect(await getMapping(author, mapping)).toMatchObject({ disabledAt: expect.any(Date), disabledByEmail: 'de2@acme.com', disableRequestedByEmail: null });
+    expect((await listMappings(author)).mappings.find(m => m.id === mapping)).toMatchObject({ disabledAt: expect.any(Date), disabledByEmail: 'de2@acme.com' });
+    await expect(requestDisable(third, mapping)).rejects.toThrow('映射已停用');
+    await expect(confirmDisable(third, mapping)).rejects.toThrow('映射已停用');
+
+    const audit = (await listAuditLogs(acme)).filter(l => l.action.includes('停用')).map(l => `${l.actor} ${l.action} ${l.summary}`);
+    expect(audit).toEqual([
+      'de@acme.com 停用映射 「电商库」customers → 消费者，提议人 de2@acme.com、确认人 de@acme.com',
+      'de2@acme.com 提议停用映射 「电商库」customers → 消费者',
+      'de@acme.com 提议停用映射 「电商库」customers → 消费者',
+    ]);
+  });
+
+  it('停用后已发布映射的读取方都不再算它：publishedPlans、同步后的合并、定时检查都跳过，别的映射照常', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const customers = await publish(author, reviewer, id, CUSTOMERS);
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const merges = async () => (await listTasks(acme)).filter(t => t.kind === 'silver.merge').length;
+    expect((await publishedPlans(getDb(), acme)).map(p => p.mapping).sort()).toEqual([customers, orders].sort());
+
+    await requestDisable(author, customers);
+    // 只是提议时照常算
+    expect((await publishedPlans(getDb(), acme)).map(p => p.mapping)).toContain(customers);
+    await confirmDisable(reviewer, customers);
+    expect((await publishedPlans(getDb(), acme)).map(p => p.mapping)).toEqual([orders]);
+    expect(await publishedPlans(getDb(), acme, [customers])).toEqual([]);
+
+    // 停用的映射的源表写入变更：同步后不合并，定时检查也不补
+    const before = await merges();
+    await grantOnSource(`UPDATE shop.customers SET city = '成都', updated_at = '2024-07-01 10:00:00' WHERE customer_id = 5;`);
+    await syncSource(author, id);
+    await drain();
+    const [sync] = (await listTasks(acme)).filter(t => t.kind === 'source.sync');
+    expect(await mergeAfterSync(acme, sync.id)).toBeNull();
+    expect(await merges()).toBe(before);
+    expect(await enqueueDueMerges()).toEqual([]);
+
+    // 别的映射照常：订单表写入变更后同步合并只带订单映射
+    await grantOnSource(`INSERT INTO shop.orders (customer_id, amount, status, created_at) VALUES (5, 99, 'paid', '2024-07-01');`);
+    await syncSource(author, id);
+    await drain();
+    const [merge] = (await listTasks(acme)).filter(t => t.kind === 'silver.merge');
+    expect(mergedMappings(merge)).toEqual([orders]);
+    expect(await enqueueDueMerges()).toEqual([]);
   });
 });

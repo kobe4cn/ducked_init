@@ -76,6 +76,14 @@ const ACTIONS = {
     describe: (d: Detail) =>
       `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '映射已删除'}`,
   },
+  'mapping.disable_requested': {
+    label: '提议停用映射',
+    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}`,
+  },
+  'mapping.disabled': {
+    label: '停用映射',
+    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，提议人 ${d.requestedBy}、确认人 ${d.confirmedBy}`,
+  },
   'mapping.column_ignored': {
     label: '忽略源表新列',
     describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，忽略新列 ${d.column}`,
