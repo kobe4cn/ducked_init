@@ -8,7 +8,7 @@ import { getDb } from './db/client';
 import { tasks, tenants, type TaskStatus } from './db/schema';
 import { publishedPlans } from './mappings';
 import type { Drift, InspectParams } from './pipeline/inspect-engine';
-import { customerSourceColumnsOf, sensitiveColumns, SILVER_SYSTEM_COLUMNS, type MergeMappingParam } from './pipeline/merge-engine';
+import { sourceColumnsForPlan, sensitiveColumns, SILVER_SYSTEM_COLUMNS, type MergeMappingParam } from './pipeline/merge-engine';
 import { sqlType } from './pipeline/mapping-spec';
 import { insertTask } from './tasks';
 
@@ -24,7 +24,7 @@ export function expectedTables(plans: MergeMappingParam[]): InspectParams['expec
     const pii = sensitiveColumns(plan);
     const table = (expected[plan.entity] ??= {});
     for (const c of plan.entityColumns) table[c.name] ??= pii.has(c.name) ? 'VARCHAR' : sqlType(c.type);
-    for (const name of customerSourceColumnsOf(plan)) table[name] = 'VARCHAR';
+    for (const name of sourceColumnsForPlan(plan)) table[name] = 'VARCHAR';
   }
   for (const table of Object.values(expected)) Object.assign(table, SILVER_SYSTEM_COLUMNS);
   return expected;

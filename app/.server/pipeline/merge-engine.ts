@@ -342,8 +342,8 @@ export const SILVER_SYSTEM_COLUMNS = { _mapping: 'VARCHAR', _source: 'VARCHAR', 
 const customerRefColumns = (plan: MergePlan) => plan.columns.filter(c => c.customerRef || c.name === 'customer_id');
 
 /** 标准层表上本映射要有的数据源列：实体有 customer_id 就有 _customer_source（不论本映射映不映射它），再加上本映射其他引用列的 */
-export const customerSourceColumnsOf = (plan: MergePlan) => [...new Set([
-  ...plan.entityColumns.filter(c => c.name === 'customer_id').map(c => c.name), ...customerRefColumns(plan).map(c => c.name),
+export const sourceColumnsForPlan = (plan: MergePlan) => [...new Set([
+  ...(plan.entityColumns.some(c => c.name === 'customer_id') ? ['customer_id'] : []), ...customerRefColumns(plan).map(c => c.name),
 ])].map(customerSourceColumn);
 
 /**
@@ -354,7 +354,7 @@ async function ensureSilverTable(con: DuckDBConnection, plan: MergeMappingParam)
   const table = silverTable(plan.entity);
   const pii = sensitiveColumns(plan);
   const typeOf = (c: MergePlan['entityColumns'][number]) => (pii.has(c.name) ? 'VARCHAR' : sqlType(c.type));
-  const sourceColumns = customerSourceColumnsOf(plan);
+  const sourceColumns = sourceColumnsForPlan(plan);
   if (!await tableExists(con, SILVER, plan.entity)) {
     await con.run(`CREATE TABLE ${table} (
       ${plan.entityColumns.map(c => `${ident(c.name)} ${typeOf(c)}`).join(', ')},
