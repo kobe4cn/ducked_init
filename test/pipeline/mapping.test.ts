@@ -647,6 +647,23 @@ describe('发布映射并合并到标准层', () => {
     expect((await getMapping(author, items.id)).versions.find(v => v.version === 2)).toMatchObject({ status: 'published' });
   });
 
+  it('对照的每张源表带上有已发布 customer 映射的其他数据源（表单据此列出跨源引用的所属数据源），不含本源与只有草稿的数据源', async () => {
+    const { author, reviewer, id, input } = await syncedSource();
+    for (const t of await referenceTables(author, id)) expect(t.customerSources).toEqual([]);
+    const other = await registerSource(author, { ...input, name: '电商库副本' });
+    await setSyncScope(author, other.id, { add: ['customers'] });
+    await drain();
+    await confirmWatermark(author, other.id, 'customers', 'updated_at');
+    await syncSource(author, other.id);
+    await drain();
+    const draft = await createMapping(author, other.id, CUSTOMERS);
+    expect((await referenceTables(author, id))[0].customerSources).toEqual([]);
+    await publishMapping(reviewer, draft.id, 1);
+    for (const t of await referenceTables(author, id)) expect(t.customerSources).toEqual([{ id: other.id, name: '电商库副本' }]);
+    await publish(author, reviewer, id, CUSTOMERS);
+    expect((await referenceTables(author, other.id))[0].customerSources).toEqual([{ id, name: input.name }]);
+  });
+
   it('订单映射的草稿把键空间由 pos 改成 store：发布区列出同源已发布、order_id 仍写 pos 的订单明细映射与字段，提示一起改；这一版照常能发布', async () => {
     const { author, reviewer, id } = await syncedSource(ORDER_ITEMS);
     const orders = await publish(author, reviewer, id, `${ORDERS}key_space: pos\n`);

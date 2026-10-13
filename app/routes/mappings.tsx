@@ -1,5 +1,5 @@
 // app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、目标自定义实体待补登、最近一次合并），
-// 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿；可按所选的表与实体按规则生成草稿填进编辑框，不保存；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
+// 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿，检查有提示（notices）时留在本页列出提示与新映射的入口；可按所选的表与实体按规则生成草稿填进编辑框，不保存；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
 // 手动触发一次合并到标准层，以及主键冲突体检（silver.keycheck）：任何能看映射的成员都可以运行，报告按实体列出主键重叠的映射对
 import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, PencilLine, Play, Plus, ScanSearch, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
@@ -18,7 +18,7 @@ import { listSources } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { CANONICAL_ENTITIES, entityLabel, entityOf, isCustomEntity } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
-import { MappingErrors } from '~/components/mapping-editor';
+import { MappingErrors, MappingNotices } from '~/components/mapping-editor';
 import { MappingEditorWithReference } from '~/components/mapping-reference';
 import { mappingOutline } from '~/lib/mapping-outline';
 import { cn } from '~/lib/utils';
@@ -108,6 +108,8 @@ export async function action({ request }: Route.ActionArgs) {
       }
       case 'create': {
         const mapping = await createMapping(member, field('sourceId'), field('yaml'));
+        // 检查有提示时不跳转，在列表页列出提示并给出新映射的入口
+        if (mapping.notices.length) return { error: null, issues: [], values: null, draftId: null, created: { id: mapping.id, notices: mapping.notices } };
         throw redirect(`/mappings/${mapping.id}`);
       }
       case 'merge':
@@ -201,6 +203,8 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
   const { email, nav, canWrite, sources, tables, registered, initialYaml, functions, merge, keyCheck, mappings } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const { icon: MergeIcon, tone: mergeTone } = TASK_STATUS[merge.status];
+  // 新建成功但检查有提示时留在本页列出
+  const created = actionData && 'created' in actionData ? actionData.created : undefined;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -230,6 +234,11 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
 
       {merge.error && <div className="flex items-start gap-1 text-sm whitespace-normal text-red-600"><AlertTriangle className="mt-0.5 size-3.5 shrink-0" />{merge.error}</div>}
       {actionData?.error && <MappingErrors error={actionData.error} issues={actionData.issues} />}
+      {created && (
+        <MappingNotices title="映射已新建（第 1 版草稿已保存），检查有以下提示（不影响发布）" notices={created.notices}>
+          <Link to={`/mappings/${created.id}`} className="underline">打开新建的映射</Link>
+        </MappingNotices>
+      )}
 
       <KeyCheckSection keyCheck={keyCheck} />
 
@@ -279,7 +288,7 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
 
         {canWrite && (
           // 没有 JS 时也能展开新建：<details> 收起时是虚线的「新建映射」卡片，展开后占满一行（编辑框与对照面板需要整行宽度）
-          <details open={!mappings.length || Boolean(actionData)} className="group rounded-2xl border-2 border-dashed open:col-span-full open:border open:border-solid open:bg-white open:p-6 open:shadow-sm">
+          <details open={!mappings.length || Boolean(actionData && !created)} className="group rounded-2xl border-2 border-dashed open:col-span-full open:border open:border-solid open:bg-white open:p-6 open:shadow-sm">
             <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden">
               <span className="grid min-h-40 place-items-center text-slate-400 hover:text-slate-600 group-open:hidden">
                 <span className="flex flex-col items-center gap-2"><Plus className="size-6" />新建映射</span>

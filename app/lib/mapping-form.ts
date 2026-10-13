@@ -6,7 +6,8 @@
 // 与是否敏感，取消勾选即删除，值字典与兜底原样保留。标准字段是否敏感由标准模型决定，YAML 里照写的 sensitive 原样保留。
 // 身份打通（只用于 customer）：从已映射的敏感字段里选匹配字段并排序，写成 identity.match，全部去掉时删掉 identity。
 // 键空间（ADR-0024）：映射顶层的 key_space 可填可清空；引用字段的 key_space 随字段写成对象写法 { expr, key_space }，
-// 没写时按同一数据源里目标实体已发布映射声明的键空间预填（只在写这个字段时一并写进 YAML）
+// 没写时按同一数据源里目标实体已发布映射声明的键空间预填（只在写这个字段时一并写进 YAML）。
+// 跨源引用（ADR-0030）：指向 customer 的引用字段的 customer_source（目标消费者所在数据源的名字）随字段写成对象写法，选回本数据源时删掉
 import { isMap, isScalar, isSeq, YAMLMap, YAMLSeq, type Document, type Scalar } from 'yaml';
 import { EXTENSION_PATTERN, FIELD_TYPE_NAMES, type CanonicalEntity, type CanonicalField, type FieldType } from './canonical-model';
 import { extensionName, standardValue } from './field-synonyms';
@@ -68,6 +69,8 @@ export interface FieldChoice {
   otherwise?: string | null;
   /** 引用字段的键空间；空时不写 key_space */
   keySpace?: string | null;
+  /** 指向 customer 的引用字段所属数据源的名字；空时（本数据源）不写 customer_source */
+  customerSource?: string | null;
 }
 
 export interface FieldForm {
@@ -87,6 +90,8 @@ export interface FieldForm {
   otherwise?: string | null;
   /** 键空间，只在 YAML 里写了时有这一项 */
   keySpace?: string;
+  /** 跨源引用的数据源名字，只在 YAML 里写了时有这一项 */
+  customerSource?: string;
   readonly: boolean;
   /** 只读的原因 */
   reason?: string;
@@ -166,6 +171,9 @@ function readDictionary(value: YAMLMap): Pick<FieldForm, 'dictionary' | 'otherwi
   return { dictionary, otherwise: v ?? null };
 }
 
+/** 标准字段对象写法里表单认识的键 */
+const FIELD_KEYS = ['expr', 'dictionary', 'otherwise', 'sensitive', 'key_space', 'customer_source'];
+
 /** 字段在 YAML 里的表单状态，以及可写时表达式所在的节点、对象写法的节点 */
 function locate(doc: Document, standard: CanonicalField | undefined, field: string, required: boolean): { form: FieldForm; node?: Scalar; spec?: YAMLMap } {
   const form: FieldForm = { field, required, transform: null, column: null, args: [], raw: '', readonly: false, ...(isEnumField(standard) && { dictionary: [] }) };
@@ -178,20 +186,23 @@ function locate(doc: Document, standard: CanonicalField | undefined, field: stri
 
   let node: unknown = value;
   let reason: string | undefined;
-  // 对象写法里表达式之外表单认识的项：值对照、兜底与键空间
-  let extras: Pick<FieldForm, 'dictionary' | 'otherwise' | 'keySpace'> = {};
+  // 对象写法里表达式之外表单认识的项：值对照、兜底、键空间与跨源引用的数据源
+  let extras: Pick<FieldForm, 'dictionary' | 'otherwise' | 'keySpace' | 'customerSource'> = {};
   if (isMap(value)) {
     const keys = value.items.map(p => (isScalar(p.key) ? p.key.value : null));
     node = value.get('expr', true);
     const keySpace = value.get('key_space');
-    if (keys.some(k => k !== 'expr' && k !== 'dictionary' && k !== 'otherwise' && k !== 'sensitive' && k !== 'key_space')) reason = UNKNOWN;
+    const customerSource = value.get('customer_source');
+    if (keys.some(k => !FIELD_KEYS.includes(String(k)))) reason = UNKNOWN;
     else if (keys.includes('key_space') && typeof keySpace !== 'string') reason = UNKNOWN;
+    else if (keys.includes('customer_source') && typeof customerSource !== 'string') reason = UNKNOWN;
     else if (keys.includes('dictionary') || keys.includes('otherwise')) {
       const read = isEnumField(standard) ? readDictionary(value) : '非枚举字段带值字典或兜底值（dictionary / otherwise），请在 YAML 里修改';
       if (typeof read === 'string') reason = read;
       else extras = read;
     }
     if (typeof keySpace === 'string') extras = { ...extras, keySpace };
+    if (typeof customerSource === 'string') extras = { ...extras, customerSource };
   }
   if (!isScalar(node) || typeof node.value !== 'string') return { form: { ...form, readonly: true, reason: reason ?? UNKNOWN } };
 
@@ -278,13 +289,15 @@ export function writeField(doc: Document, entity: CanonicalEntity, field: string
   const otherwiseChanged = otherwise !== form.otherwise;
   const keySpace = choice.keySpace?.trim() || undefined;
   const keySpaceChanged = keySpace !== form.keySpace;
+  const customerSource = choice.customerSource?.trim() || undefined;
+  const customerSourceChanged = customerSource !== form.customerSource;
   if (node) {
     if (!form.transform || expressionOf({ ...form, transform: form.transform }, type) !== expr) {
       node.value = expr;
       node.type = undefined;
       node.comment = undefined;
     }
-    if (!dictionaryChanged && !otherwiseChanged && !keySpaceChanged) return;
+    if (!dictionaryChanged && !otherwiseChanged && !keySpaceChanged && !customerSourceChanged) return;
     if (spec) {
       if (dictionaryChanged) {
         if (dictionary) setKey(doc, spec, 'dictionary', dictionaryNode(doc, dictionary, spec.get('dictionary', true)));
@@ -294,14 +307,17 @@ export function writeField(doc: Document, entity: CanonicalEntity, field: string
       else if (otherwiseChanged) setKey(doc, spec, 'otherwise', otherwise);
       if (!keySpace) spec.delete('key_space');
       else if (keySpaceChanged) setKey(doc, spec, 'key_space', keySpace);
-      // 对照、兜底与键空间都去掉了：变回标量写法
+      if (!customerSource) spec.delete('customer_source');
+      else if (customerSourceChanged) setKey(doc, spec, 'customer_source', customerSource);
+      // 对照、兜底、键空间与数据源都去掉了：变回标量写法
       const pair = isMap(fields) ? fields.items.find(p => p.value === spec) : undefined;
       if (pair && spec.items.length === 1) pair.value = node;
       return;
     }
   }
   // 表达式节点（带依据注释）原样放进对象写法
-  const value = dictionary || otherwise !== undefined || keySpace ? specNode(doc, node ?? expr, dictionary, otherwise, keySpace) : (node ?? expr);
+  const value = dictionary || otherwise !== undefined || keySpace || customerSource
+    ? specNode(doc, node ?? expr, dictionary, otherwise, keySpace, customerSource) : (node ?? expr);
   if (!isMap(fields)) {
     doc.set('fields', doc.createNode({ [field]: value }));
     return;
@@ -320,14 +336,17 @@ export function writeField(doc: Document, entity: CanonicalEntity, field: string
   else fields.items.splice(next, 0, pair);
 }
 
-/** 对象写法 { expr, dictionary, otherwise, key_space }；只带键空间、表达式没有行尾注释时写成行内 */
-function specNode(doc: Document, expr: Scalar | string, dictionary: DictionaryEntry[] | undefined, otherwise: string | null | undefined, keySpace?: string) {
+/** 对象写法 { expr, dictionary, otherwise, key_space, customer_source }；只带键空间与数据源、表达式没有行尾注释时写成行内 */
+function specNode(
+  doc: Document, expr: Scalar | string, dictionary: DictionaryEntry[] | undefined, otherwise: string | null | undefined, keySpace?: string, customerSource?: string,
+) {
   const spec = new YAMLMap();
   spec.flow = !dictionary && otherwise === undefined && !(typeof expr !== 'string' && expr.comment);
   setKey(doc, spec, 'expr', expr);
   if (dictionary) setKey(doc, spec, 'dictionary', dictionaryNode(doc, dictionary));
   if (otherwise !== undefined) setKey(doc, spec, 'otherwise', otherwise);
   if (keySpace) setKey(doc, spec, 'key_space', keySpace);
+  if (customerSource) setKey(doc, spec, 'customer_source', customerSource);
   return spec;
 }
 

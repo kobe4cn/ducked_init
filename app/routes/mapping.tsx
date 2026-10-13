@@ -1,6 +1,7 @@
 // app/routes/mapping.tsx —— 单个映射：各版本（已发布的锁定、草稿可改）、编辑与丢弃草稿（数据工程师、管理员）、发布草稿（需最后保存它的人以外的
 // 另一位有发布权限的成员，最后保存的人看到不能发布的原因，租户里只有自己有发布权限时提示先邀请成员；编辑框旁对照源表的列统计与实体的标准字段（自定义实体对照它已发布登记的字段）；
 // 可按规则重新生成草稿、或把源表新增的列加为扩展字段填进编辑框，不保存；新列也可标记为忽略，不再提醒），以及这个映射每次合并到标准层的结果；实体是还没有已发布登记的自定义实体时顶部提示待补登、链接到实体页；有已发布版本时可以立即合并这一个映射。
+// 保存草稿时检查有提示（notices，如 customer_source 写的就是本数据源）不跳转，留在编辑页列出提示。
 // 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）；
 // 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）；
 // 编辑页可空跑正在查看的版本：在原始层样本上转换，编辑框下方展示样例行（敏感字段是哈希）与基础断言，不写标准层；
@@ -10,7 +11,7 @@ import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
-import { discardDraft, draftForMapping, dryRunMapping, getMapping, ignoreColumn, MappingError, mergeMapping, publishMapping, referenceTables, saveDraft, yamlWithColumns } from '~/.server/mappings';
+import { discardDraft, draftForMapping, dryRunMapping, getMapping, ignoreColumn, MappingError, mergeMapping, publishMapping, referenceTables, saveMappingDraft, yamlWithColumns } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
 import { fallbackText } from '~/lib/fallback';
@@ -24,7 +25,7 @@ import { entityLabel, entityOf, isCustomEntity } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { KindIcon } from '~/components/kind-icon';
-import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
+import { MappingEditor, MappingErrors, MappingNotices } from '~/components/mapping-editor';
 import { MappingEditorWithReference } from '~/components/mapping-reference';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
@@ -132,9 +133,12 @@ export async function action({ request, params }: Route.ActionArgs) {
         const version = Number(field('version'));
         return { error: null, issues: [], yaml: null, draftId: null, dryRun: { version, ...await dryRunMapping(await requirePermission(request, 'sources:write'), params.mappingId, version) } };
       }
-      case 'save':
-        await saveDraft(await requirePermission(request, 'sources:write'), params.mappingId, field('yaml'));
+      case 'save': {
+        // 检查有提示时不跳转，留在编辑页列出提示（草稿已保存）
+        const { notices } = await saveMappingDraft(await requirePermission(request, 'sources:write'), params.mappingId, field('yaml'));
+        if (notices.length) return { error: null, issues: [], yaml: null, draftId: null, dryRun: null, notices };
         break;
+      }
       case 'publish':
         await publishMapping(await requirePermission(request, 'publish'), params.mappingId, Number(field('version')));
         break;
@@ -442,6 +446,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
         </Alert>
       )}
       {actionData?.error && <MappingErrors error={actionData.error} issues={actionData.issues} />}
+      {actionData && 'notices' in actionData && actionData.notices && <MappingNotices title="草稿已保存，检查有以下提示（不影响发布）" notices={actionData.notices} />}
 
       <div className="grid gap-4 lg:grid-cols-[1fr_auto_1fr_1.2fr]">
         <Link to={`/sources/${mapping.source.id}`} className="flex items-center gap-3 rounded-2xl border bg-white p-5 shadow-sm transition hover:shadow-md">

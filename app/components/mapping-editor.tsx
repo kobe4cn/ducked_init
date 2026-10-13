@@ -1,6 +1,7 @@
-// app/components/mapping-editor.tsx —— 映射 YAML 的编辑框（可在光标处插入文本），以及校验不通过时逐项列出的问题（行、列、位置、说明、改好的写法）
-import { useImperativeHandle, useRef, type Ref } from 'react';
-import { CircleAlert } from 'lucide-react';
+// app/components/mapping-editor.tsx —— 映射 YAML 的编辑框（可在光标处插入文本），以及校验不通过时逐项列出的问题（行、列、位置、说明、改好的写法），
+// 保存通过但检查有提示（notices，如 customer_source 写的就是本数据源）时逐项列出的提示
+import { useImperativeHandle, useRef, type ReactNode, type Ref } from 'react';
+import { AlertTriangle, CircleAlert } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 
 export interface MappingIssueView { line: number; col: number; path: string; message: string; hint?: string }
@@ -44,6 +45,24 @@ export function MappingEditor({ name = 'yaml', defaultValue, value, readOnly = f
       rows={Math.max(12, (value ?? defaultValue).split('\n').length + 2)}
       className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 font-mono text-xs leading-5 outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 read-only:bg-muted"
     />
+  );
+}
+
+/** 不拦保存与发布的提示（行列 + 文字）；children 是标题下的附加内容 */
+export function MappingNotices({ title, notices, children }: { title: string; notices: MappingIssueView[]; children?: ReactNode }) {
+  return (
+    <Alert role="status" data-mapping-notices>
+      <AlertTriangle className="text-amber-600" />
+      <AlertTitle>{title}</AlertTitle>
+      <AlertDescription>
+        {children}
+        <ul className="list-disc space-y-0.5 pl-4">
+          {notices.map((i, n) => (
+            <li key={n} data-notice-line={i.line} data-notice-path={i.path}>{`第 ${i.line} 行第 ${i.col} 列${i.path ? `（${i.path}）` : ''}：${i.message}`}</li>
+          ))}
+        </ul>
+      </AlertDescription>
+    </Alert>
   );
 }
 

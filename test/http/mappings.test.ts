@@ -1,4 +1,5 @@
 // 标准模型与映射的 HTTP 接缝：任何成员都能浏览标准模型；数据工程师在界面上编写映射（不合格的 YAML 被拒绝并给出位置），
+// 保存通过但检查有提示（notices）时新建与保存都留在页面上列出提示；
 // 新建页默认是按规则生成的草稿（源没有已采集的表时是模板），也能按所选的表与实体重新生成填进编辑框（不保存），详情页能把源表新增的列一键生成为扩展字段填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
 // 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射（含勾选源列加的扩展字段、映射与引用字段的键空间）照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -107,6 +108,32 @@ describe('编写与发布映射', () => {
     expect((await engineer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(403);
     // 只有草稿时不能合并
     expect(detail).not.toContain('name="intent" value="merge"');
+  });
+
+  it('检查有提示时（customer_source 写的就是本数据源）新建与保存照常存下草稿，页面列出提示「可以省略」；没有提示时照常跳转', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const author = await loginAs(app, 'de@acme.com');
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+    const customers = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: CUSTOMERS }));
+    expect((await reviewer.post(`/mappings/${customers}`, { intent: 'publish', version: '1' })).status).toBe(302);
+
+    const self = ORDERS.replace('  amount: amount\n', '  customer_id: { expr: string(customer_id), customer_source: 电商库 }\n  amount: amount\n');
+    const created = await author.post('/mappings', { intent: 'create', sourceId, yaml: self });
+    expect(created.status).toBe(200);
+    const html = await created.text();
+    expect(html).toContain('data-mapping-notices');
+    expect(html).toContain('（fields.customer_id.customer_source）：电商库 就是本数据源，customer_source 可以省略');
+    const id = html.match(/href="\/mappings\/([0-9a-f-]{36})"[^>]*>打开新建的映射/)![1];
+    expect(editorYaml(await (await author.get(`/mappings/${id}`)).text())).toBe(self);
+
+    const saved = await author.post(`/mappings/${id}`, { intent: 'save', yaml: self.replace('amount: amount', 'amount: amount * 1') });
+    expect(saved.status).toBe(200);
+    expect(await saved.text()).toContain('customer_source 可以省略');
+    expect(editorYaml(await (await author.get(`/mappings/${id}`)).text())).toContain('amount: amount * 1');
+    const plain = await author.post(`/mappings/${id}`, { intent: 'save', yaml: ORDERS });
+    expect(plain.status).toBe(302);
+    expect(await (await author.get(`/mappings/${id}`)).text()).not.toContain('data-mapping-notices');
   });
 
   it('另一位数据工程师发布后版本锁定并入队合并；审计记下起草与发布', async () => {

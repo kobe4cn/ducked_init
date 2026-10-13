@@ -6,7 +6,8 @@
 // 下面列出还没用到的源列，勾选即加为扩展字段（名称或格式像敏感信息的默认标成敏感）。
 // 消费者（customer）映射最后是「身份打通」：从已映射的敏感字段里勾选匹配字段并排序（越靠前优先级越高），不选时用平台默认规则。
 // 键空间（ADR-0024）：最上面是映射的键空间；指向别的实体的字段每行有键空间，没写时按同一数据源里目标实体已发布映射的键空间预填，
-// 预填值只在写这个字段时一并写进 YAML，打开表单不改 YAML；清空预填值不写进 YAML，重新打开表单时又会预填（发布时本来也要求写同源目标的键空间）
+// 预填值只在写这个字段时一并写进 YAML，打开表单不改 YAML；清空预填值不写进 YAML，重新打开表单时又会预填（发布时本来也要求写同源目标的键空间）。
+// 跨源引用（ADR-0030）：指向 customer 的字段在键空间旁选「所属数据源」，可选本租户有已发布 customer 映射的其他数据源，默认本数据源（不写 customer_source）
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
 import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, KEY_SPACE_PATTERN, type CanonicalEntity, type CanonicalField, type FieldType } from '~/lib/canonical-model';
@@ -98,6 +99,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
           table={table}
           functions={functions}
           keySpaces={table?.keySpaces ?? {}}
+          customerSourceOptions={table?.customerSources ?? []}
           pending={focus?.field === form.field ? focus.add : []}
           onWrite={choice => write(form.field, choice)}
           onEditYaml={onEditYaml}
@@ -118,9 +120,11 @@ const choiceOf = (form: FieldForm): FieldChoice | null => form.transform && {
   dictionary: form.dictionary, ...(form.otherwise !== undefined && { otherwise: form.otherwise }),
 };
 
-/** 选择（连同键空间）写进 YAML 后的样子；与 YAML 读出的一致时这一行不用重新读 */
-const syncKey = (choice: FieldChoice | null, type: FieldType, keySpace?: string | null) => choice
-  ? JSON.stringify([expressionOf(choice, type), writtenDictionary(choice.dictionary) ?? [], choice.otherwise === undefined ? 0 : choice.otherwise, keySpace?.trim() ?? ''])
+/** 选择（连同键空间与所属数据源）写进 YAML 后的样子；与 YAML 读出的一致时这一行不用重新读 */
+const syncKey = (choice: FieldChoice | null, type: FieldType, keySpace?: string | null, customerSource?: string) => choice
+  ? JSON.stringify([
+    expressionOf(choice, type), writtenDictionary(choice.dictionary) ?? [], choice.otherwise === undefined ? 0 : choice.otherwise, keySpace?.trim() ?? '', customerSource ?? '',
+  ])
   : '';
 
 const KEY_SPACE = new RegExp(KEY_SPACE_PATTERN);
@@ -151,8 +155,8 @@ function missing(choice: FieldChoice, type: FieldType): string | null {
   }
 }
 
-/** 一个标准字段：说明、源列与转换，引用字段另有键空间；只读时显示原表达式 */
-function FieldRow({ entity, form, field, table, functions, keySpaces, pending, onWrite, onEditYaml }: {
+/** 一个标准字段：说明、源列与转换，引用字段另有键空间，指向 customer 的还有所属数据源；只读时显示原表达式 */
+function FieldRow({ entity, form, field, table, functions, keySpaces, customerSourceOptions, pending, onWrite, onEditYaml }: {
   entity: string;
   form: FieldForm;
   field: CanonicalField;
@@ -160,6 +164,8 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, pending, o
   functions: ReferenceFunction[];
   /** 同一数据源里各实体已发布映射声明的键空间，引用字段没写键空间时据此预填 */
   keySpaces: Record<string, string>;
+  /** 有已发布 customer 映射的其他数据源，指向 customer 的字段可选为所属数据源 */
+  customerSourceOptions: { id: string; name: string }[];
   /** 要作为待对应的行加进值对照表的源值 */
   pending: string[];
   onWrite: (choice: FieldChoice | null) => void;
@@ -170,13 +176,16 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, pending, o
   // 不是引用字段时照 YAML 里写的（没有输入框）
   const initialKeySpace = keySpaceOf(form, field, keySpaces) ?? form.keySpace ?? null;
   const [keySpace, setKeySpace] = useState(initialKeySpace);
+  // 所属数据源同键空间一样只存在这里，空串是本数据源
+  const [customerSource, setCustomerSource] = useState(form.customerSource ?? '');
   // 这一行最后写进 YAML 的样子；YAML 在别处改了（YAML 标签页、生成草稿）时按 YAML 重新读出
-  const current = syncKey(choiceOf(form), field.type, form.keySpace);
+  const current = syncKey(choiceOf(form), field.type, form.keySpace, form.customerSource);
   const [synced, setSynced] = useState(current);
   if (current !== synced) {
     setSynced(current);
     setChoice(choiceOf(form));
     setKeySpace(initialKeySpace);
+    setCustomerSource(form.customerSource ?? '');
   }
   // 新建页换了数据源或源表：没写键空间时按新的同源键空间重新预填
   const declared = field.ref ? (keySpaces[field.ref.entity] ?? '') : null;
@@ -188,16 +197,16 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, pending, o
   const problem = choice && missing({ ...choice, keySpace }, field.type);
   const unmapped = form.required && !form.raw;
 
-  const update = (next: FieldChoice | null, space = keySpace) => {
+  const update = (next: FieldChoice | null, space = keySpace, source = customerSource) => {
     setChoice(next);
     if (!next) {
       setSynced('');
       onWrite(null);
       return;
     }
-    const written = { ...next, keySpace: space };
+    const written = { ...next, keySpace: space, customerSource: source };
     if (!missing(written, field.type)) {
-      setSynced(syncKey(next, field.type, space));
+      setSynced(syncKey(next, field.type, space, source || undefined));
       onWrite(written);
     }
   };
@@ -205,6 +214,12 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, pending, o
     setKeySpace(space);
     if (choice) update(choice, space);
   };
+  const changeCustomerSource = (source: string) => {
+    setCustomerSource(source);
+    if (choice) update(choice, keySpace, source);
+  };
+  // YAML 里写的数据源不在可选里（没有已发布的 customer 映射、写的是本源）时也列出来，保存时由校验指出
+  const sourceNames = [...new Set([...customerSourceOptions.map(s => s.name), ...(customerSource ? [customerSource] : [])])];
   const keySpacePending = keySpace?.trim() && keySpace.trim() !== form.keySpace && choice && !problem;
   const topValues = (column?: string | null) => table?.columns.find(c => c.name === column)?.top?.map(t => t.value) ?? [];
   // 新对应的枚举字段选了源列：按常见取值新建值对照，其他取值默认记为空
@@ -282,6 +297,15 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, pending, o
         <div data-form-key-space={field.name} className="flex flex-wrap items-center gap-2 text-xs">
           <span className="text-muted-foreground">{`键空间（${field.ref.entity} 的主键所在）`}</span>
           <Input className="h-7 w-40" aria-label={`${field.name} 的键空间`} placeholder="不写" value={keySpace ?? ''} onChange={e => changeKeySpace(e.target.value)} />
+          {field.ref.entity === 'customer' && (
+            <>
+              <span className="text-muted-foreground">所属数据源</span>
+              <NativeSelect size="sm" aria-label={`${field.name} 的所属数据源`} value={customerSource} onChange={e => changeCustomerSource(e.target.value)}>
+                <NativeSelectOption value="">本数据源</NativeSelectOption>
+                {sourceNames.map(name => <NativeSelectOption key={name} value={name}>{name}</NativeSelectOption>)}
+              </NativeSelect>
+            </>
+          )}
           {keySpacePending && (
             <>
               <span className="text-muted-foreground">还没写进 YAML</span>

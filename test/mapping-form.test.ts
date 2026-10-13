@@ -1,6 +1,7 @@
 // 映射表单与 YAML 互转（纯函数）：从映射 YAML 读出每个标准字段的表单状态（源列、常用转换、参数、依据、是否只读），
 // 改单个字段时在原 Document 上改，保留注释与顺序；枚举字段的值对照与兜底读出、写回；表单不认识的写法只读、原样保留；
-// 扩展字段：没用到的源列、读出已有的扩展字段、加上 / 改名 / 删除；映射与引用字段的键空间读出、写回，引用字段按同源目标实体的键空间预填
+// 扩展字段：没用到的源列、读出已有的扩展字段、加上 / 改名 / 删除；映射与引用字段的键空间读出、写回，引用字段按同源目标实体的键空间预填；
+// 指向 customer 的引用字段的 customer_source 读出、写回
 import { parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
@@ -41,8 +42,8 @@ const CUSTOMERS = table('customers', [
 ], ['customer_id']);
 
 const field = (forms: FieldForm[], name: string) => forms.find(f => f.field === name)!;
-const choiceOf = ({ transform, column, args, parts, raw, dictionary, otherwise, keySpace }: FieldForm): FieldChoice =>
-  ({ transform: transform!, column, args, parts, raw, dictionary, ...(otherwise !== undefined && { otherwise }), keySpace });
+const choiceOf = ({ transform, column, args, parts, raw, dictionary, otherwise, keySpace, customerSource }: FieldForm): FieldChoice =>
+  ({ transform: transform!, column, args, parts, raw, dictionary, ...(otherwise !== undefined && { otherwise }), keySpace, customerSource });
 
 /** 把每个可写的字段按读出的状态原样写回 */
 function rewriteAll(yaml: string, entity = ORDER) {
@@ -465,5 +466,35 @@ describe('键空间', () => {
     expect(keySpaceOf(field(forms, 'product_id'), standard('product_id'), {})).toBe('');
     expect(keySpaceOf({ ...field(forms, 'order_id'), keySpace: 'web' }, standard('order_id'), keySpaces)).toBe('web');
     expect(keySpaceOf(field(forms, 'quantity'), standard('quantity'), keySpaces)).toBeNull();
+  });
+});
+
+describe('跨源引用的数据源', () => {
+  const ORDERS_YAML = 'model: 1\nentity: order\ntable: orders\nfields:\n  order_id: order_no\n  customer_id: cid # 同名\n';
+  const columns = ['order_no', 'cid'].map(name => ({ name, type: 'VARCHAR' }));
+  const sources = { self: 'src-pos', resolve: (name: string) => (name === 'crm' ? { id: 'src-crm' } : 'missing' as const) };
+
+  it('带 customer_source 的引用字段可写，读出数据源名字；原样写回文本不变；不是字符串时只读', () => {
+    const yaml = ORDERS_YAML.replace('cid # 同名', '{ expr: cid, customer_source: crm }');
+    expect(field(readForm(parseDocument(yaml), ORDER), 'customer_id')).toMatchObject({ column: 'cid', customerSource: 'crm', readonly: false });
+    expect(field(readForm(parseDocument(ORDERS_YAML), ORDER), 'customer_id')).not.toHaveProperty('customerSource');
+    expect(rewriteAll(yaml, ORDER)).toBe(yaml);
+    expect(field(readForm(parseDocument(ORDERS_YAML.replace('cid # 同名', '{ expr: cid, customer_source: 1 }')), ORDER), 'customer_id').readonly).toBe(true);
+  });
+
+  it('选了别的数据源写成 { expr, customer_source } 并通过校验；选回本数据源时删掉这个键、变回原来的写法', () => {
+    const doc = parseDocument(ORDERS_YAML);
+    writeField(doc, ORDER, 'customer_id', { transform: 'direct', column: 'cid', customerSource: 'crm' });
+    expect(field(readForm(doc, ORDER), 'customer_id')).toMatchObject({ column: 'cid', customerSource: 'crm', basis: '同名', readonly: false });
+    expect(checkMapping(doc.toString(), () => columns, undefined, sources)).toMatchObject({
+      ok: true, plan: { columns: expect.arrayContaining([expect.objectContaining({ name: 'customer_id', customerSource: 'src-crm' })]) },
+    });
+    // 与键空间并存，去掉其中一个时另一个留着
+    writeField(doc, ORDER, 'customer_id', { transform: 'direct', column: 'cid', customerSource: 'crm', keySpace: 'crm' });
+    expect(field(readForm(doc, ORDER), 'customer_id')).toMatchObject({ customerSource: 'crm', keySpace: 'crm' });
+    writeField(doc, ORDER, 'customer_id', { transform: 'direct', column: 'cid', keySpace: 'crm' });
+    expect(field(readForm(doc, ORDER), 'customer_id')).not.toHaveProperty('customerSource');
+    writeField(doc, ORDER, 'customer_id', { transform: 'direct', column: 'cid', customerSource: null });
+    expect(doc.toString()).toBe(ORDERS_YAML);
   });
 });

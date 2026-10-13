@@ -101,25 +101,32 @@ export interface ReferenceInput {
   name: string; view?: true; sampleRows: number; primaryKey: string[]; watermark: string | null;
   /** 同一数据源里各实体已发布映射声明的键空间（实体 → 键空间），表单据此预填引用字段的键空间 */
   keySpaces: Record<string, string>;
+  /** 本租户有已发布 customer 映射的其他数据源（按名字排序），表单里指向 customer 的引用字段据此选所属数据源（customer_source） */
+  customerSources: { id: string; name: string }[];
   columns: { name: string; type: string; nullRate: number; distinct: number; top: { value: string; rows: number }[] | null; formats: { format: string; share: number }[] }[];
 }
 
 /**
  * 编写映射时对照的源表（同步范围内、已采集的）：各列的类型、空值率、不同取值数与常见取值，
  * 主键（源端主键，没有时为声明的业务主键）与确认的水位线字段；其后是已发布的源视图（view 为真，只有列名与类型，没有列统计）。
- * 每张都带同一份键空间：同一数据源里已发布映射声明的键空间，同一实体有几个时取第一个（ADR-0024）
+ * 每张都带同一份键空间：同一数据源里已发布映射声明的键空间，同一实体有几个时取第一个（ADR-0024）；
+ * 以及同一份跨源引用可选的数据源：有已发布 customer 映射的其他数据源（ADR-0030）
  */
 export async function referenceTables(actor: CurrentMember, sourceId: string): Promise<ReferenceInput[]> {
   assertCan(actor, 'sources:read');
   const { tables } = await confirmedTables(actor.tenant.id, sourceId);
   const keySpaces: Record<string, string> = {};
+  const withCustomer = new Set<string>();
   for (const p of await publishedPlans(getDb(), actor.tenant.id)) {
     if (p.sourceId === sourceId && p.keySpace && !(p.entity in keySpaces)) keySpaces[p.entity] = p.keySpace;
+    if (p.entity === 'customer' && p.sourceId !== sourceId) withCustomer.add(p.sourceId);
   }
+  const names = withCustomer.size ? await sourceNames(getDb(), actor.tenant.id) : new Map<string, string>();
+  const otherCustomerSources = [...withCustomer].map(id => ({ id, name: names.get(id)! })).sort((a, b) => a.name.localeCompare(b.name));
   const views = (await publishedViews(getDb(), actor.tenant.id, { sourceId })).filter(v => v.columns)
     .sort((a, b) => a.name.localeCompare(b.name))
     .map(v => ({
-      name: v.name, view: true as const, sampleRows: 0, primaryKey: [] as string[], watermark: null, keySpaces,
+      name: v.name, view: true as const, sampleRows: 0, primaryKey: [] as string[], watermark: null, keySpaces, customerSources: otherCustomerSources,
       columns: v.columns!.map(c => ({ name: c.name, type: c.type, nullRate: 0, distinct: 0, top: null, formats: [] })),
     }));
   return [...tables.map(({ table, watermark, key }) => ({
@@ -129,6 +136,7 @@ export async function referenceTables(actor: CurrentMember, sourceId: string): P
     primaryKey: table.primaryKey?.length ? table.primaryKey : (key ?? []),
     watermark: watermark?.column ?? null,
     keySpaces,
+    customerSources: otherCustomerSources,
     // formats：表单新建扩展字段时据此判断是否像敏感信息
     columns: table.columns.map(c => ({ name: c.name, type: c.type, nullRate: c.nullRate, distinct: c.distinct, top: c.top ?? null, formats: c.formats ?? [] })),
   })), ...views];
@@ -281,13 +289,13 @@ export async function requireMapping(tenantId: string, mappingId: string, tx: Tx
 }
 
 /**
- * 新建映射：文档校验通过后保存为第一版草稿。同一数据源的同一张表到同一个实体只能有一个映射。
+ * 新建映射：文档校验通过后保存为第一版草稿，返回的映射行带上检查的 notices（不拦保存的提示）。同一数据源的同一张表到同一个实体只能有一个映射。
  * opts.registrations 只给一键直通（passthrough.ts）用：对照这些登记校验（含刚建、还没发布的那份），而不是只对照已发布登记
  */
 export async function createMapping(actor: CurrentMember, sourceId: string, yaml: string, opts?: { registrations: Map<string, RegisteredEntity> }) {
   assertCan(actor, 'sources:write');
   const source = await requireSource(actor.tenant.id, sourceId).catch(() => { throw new MappingError('请选择数据源'); });
-  const { plan, viewId } = await checkMappingDraft(actor.tenant.id, sourceId, yaml, opts?.registrations);
+  const { plan, viewId, notices } = await checkMappingDraft(actor.tenant.id, sourceId, yaml, opts?.registrations);
   try {
     return await getDb().transaction(async tx => {
       const [mapping] = await tx.insert(mappings).values({
@@ -302,7 +310,7 @@ export async function createMapping(actor: CurrentMember, sourceId: string, yaml
         targetId: mapping.id,
         detail: { source: source.name, table: plan.table, entity: plan.entity, version: 1 },
       });
-      return mapping;
+      return { ...mapping, notices };
     });
   } catch (e) {
     if (isUniqueViolation(e)) throw new MappingError(`「${source.name}」的 ${plan.table} 已有到 ${entityLabel(plan.entity)} 的映射，请在那个映射上修改`);
@@ -315,13 +323,18 @@ export async function createMapping(actor: CurrentMember, sourceId: string, yaml
  * 表与实体在第一版就定下了，换表或换实体请新建映射
  */
 export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: string) {
+  return (await saveMappingDraft(actor, mappingId, yaml)).version;
+}
+
+/** 同 saveDraft，另返回检查的 notices（不拦保存的提示，编辑页显示） */
+export async function saveMappingDraft(actor: CurrentMember, mappingId: string, yaml: string): Promise<{ version: number; notices: MappingIssue[] }> {
   assertCan(actor, 'sources:write');
   const mapping = await requireMapping(actor.tenant.id, mappingId);
-  const { plan, viewId } = await checkMappingDraft(actor.tenant.id, mapping.sourceId, yaml);
+  const { plan, viewId, notices } = await checkMappingDraft(actor.tenant.id, mapping.sourceId, yaml);
   if (plan.table !== mapping.tableName || viewId !== mapping.sourceViewId || plan.entity !== mapping.entity) {
     throw new MappingError(`这个映射是 ${mapping.sourceViewId ? '源视图 ' : ''}${mapping.tableName} → ${mapping.entity}，不能改表、源视图或实体；请新建映射`);
   }
-  return getDb().transaction(async tx => {
+  const saved = await getDb().transaction(async tx => {
     // 锁住映射行；等锁期间映射可能因丢弃草稿被删除
     const [locked] = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
     if (!locked) throw new MappingError('映射不存在', 404);
@@ -343,6 +356,7 @@ export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: s
     });
     return version;
   });
+  return { version: saved, notices };
 }
 
 /**
