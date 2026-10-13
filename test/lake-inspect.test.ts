@@ -1,4 +1,4 @@
-// test/lake-inspect.test.ts —— 漂移检查的应有结构：按实体汇总各已发布映射的列（敏感字段一律 VARCHAR、多映射取并集、带系统列），
+// test/lake-inspect.test.ts —— 漂移检查的应有结构：按实体汇总各已发布映射的列（敏感字段一律 VARCHAR、多映射取并集、带系统列与跨源引用的数据源列），
 // 以及比较前的类型规范化（纯函数）
 import { describe, expect, it } from 'vitest';
 import { expectedTables } from '../app/.server/lake-inspect';
@@ -12,16 +12,17 @@ const plan = (mapping: string, entity: string, entityColumns: MergeMappingParam[
 const SYSTEM = { _mapping: 'VARCHAR', _source: 'VARCHAR', _version: 'INTEGER', _merged_at: 'TIMESTAMPTZ', _key_space: 'VARCHAR' };
 
 describe('应有结构', () => {
-  it('敏感字段写成 VARCHAR，其余按字段类型；同一实体的多个映射取列的并集，带系统列', () => {
+  it('敏感字段写成 VARCHAR，其余按字段类型；同一实体的多个映射取列的并集，带系统列与跨源引用的数据源列', () => {
     const expected = expectedTables([
       plan('m1', 'customer', [{ name: 'customer_id', type: 'string' }, { name: 'phone', type: 'string' }, { name: 'x_points', type: 'integer' }]),
       plan('m2', 'customer', [{ name: 'customer_id', type: 'string' }, { name: 'phone', type: 'string' }, { name: 'x_wechat', type: 'string' }, { name: 'x_level', type: 'integer' }],
         [{ name: 'x_level', type: 'integer', expr: 'level', sensitive: true }]),
-      plan('m3', 'order', [{ name: 'order_id', type: 'string' }, { name: 'amount', type: 'decimal' }, { name: 'paid_at', type: 'timestamp' }]),
+      plan('m3', 'order', [{ name: 'order_id', type: 'string' }, { name: 'amount', type: 'decimal' }, { name: 'paid_at', type: 'timestamp' }, { name: 'x_referrer', type: 'string' }],
+        [{ name: 'x_referrer', type: 'string', expr: 'referrer', customerRef: true }]),
     ]);
     expect(expected).toEqual({
-      customer: { customer_id: 'VARCHAR', phone: 'VARCHAR', x_points: 'BIGINT', x_wechat: 'VARCHAR', x_level: 'VARCHAR', ...SYSTEM },
-      order: { order_id: 'VARCHAR', amount: 'DECIMAL(18, 2)', paid_at: 'TIMESTAMPTZ', ...SYSTEM },
+      customer: { customer_id: 'VARCHAR', phone: 'VARCHAR', x_points: 'BIGINT', x_wechat: 'VARCHAR', x_level: 'VARCHAR', _customer_source: 'VARCHAR', ...SYSTEM },
+      order: { order_id: 'VARCHAR', amount: 'DECIMAL(18, 2)', paid_at: 'TIMESTAMPTZ', x_referrer: 'VARCHAR', _x_referrer_source: 'VARCHAR', ...SYSTEM },
     });
   });
 

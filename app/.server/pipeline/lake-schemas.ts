@@ -3,6 +3,7 @@
 // 按名字区分的表（每个数据源的 bronze_<id>、标准层实体表、结果层快照）以及靠存在与否判断「还没打通」的
 // silver._identities / silver._device_owner 不在这里建
 import type { DuckDBConnection } from '@duckdb/node-api';
+import { ensureCustomerSourceColumns } from './customer-source-columns';
 
 /** 标准层 */
 export const SILVER = 'silver';
@@ -25,4 +26,6 @@ export async function ensureLakeSchemas(con: DuckDBConnection) {
     ALTER TABLE ${MERGES} ADD COLUMN IF NOT EXISTS scheme INTEGER;
     CREATE TABLE IF NOT EXISTS ${ASSERTION_RUNS} (task_id VARCHAR, entity VARCHAR, rows BIGINT, assertions JSON, "at" TIMESTAMPTZ);
     CREATE TABLE IF NOT EXISTS ${QUARANTINE} (assertion VARCHAR, level VARCHAR, entity VARCHAR, "key" VARCHAR, "row" JSON, task_id VARCHAR, "at" TIMESTAMPTZ)`);
+  // 早于跨源引用的数据湖里，标准层有 customer_id 的表还没有 _customer_source：补上并按 _source 回填（ADR-0030）
+  await ensureCustomerSourceColumns(con);
 }

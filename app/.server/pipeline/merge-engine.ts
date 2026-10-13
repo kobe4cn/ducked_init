@@ -14,6 +14,8 @@ import { MERGES, RECORDS, SILVER } from './lake-schemas';
 import { entityOf, type EntityRelation, type RelationStat } from '../../lib/canonical-model';
 import { CONSUMER, CONSUMER_CONSENT, CONSUMER_IDS, consumerSensitive, DEFAULT_RULES, DEVICE_OWNER, IDENTITIES, resolveIdentities, type IdentitySummary } from './identity-engine';
 import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
+import { customerSourceColumn } from '../../lib/customer-source';
+import { ensureCustomerSourceColumns } from './customer-source-columns';
 import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
 import { bronzeTablesOf, checkViewSql } from './source-view-engine';
 import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
@@ -333,15 +335,30 @@ export async function transformRows(con: DuckDBConnection, plan: MergePlan, salt
 /** 合并写进每张标准层表的系统列：来自哪个映射、哪个数据源、映射版本、合并时间与映射的键空间（没声明时为空） */
 export const SILVER_SYSTEM_COLUMNS = { _mapping: 'VARCHAR', _source: 'VARCHAR', _version: 'INTEGER', _merged_at: 'TIMESTAMPTZ', _key_space: 'VARCHAR' } as const;
 
-/** 标准层表不存在时按实体的全部字段建表，存在时补上新的扩展字段与后来加的系统列（如 _key_space）。敏感字段存哈希，类型总是 VARCHAR */
+/**
+ * 本映射里指向 customer 的引用列（ADR-0030）：计划里带 customerRef 的，以及名为 customer_id 的列
+ * （customer 自己的主键也记数据源；早于 customerRef 的老计划只能这样认）。每列旁边落一列 customerSourceColumn
+ */
+const customerRefColumns = (plan: MergePlan) => plan.columns.filter(c => c.customerRef || c.name === 'customer_id');
+
+/** 标准层表上本映射要有的数据源列：实体有 customer_id 就有 _customer_source（不论本映射映不映射它），再加上本映射其他引用列的 */
+export const customerSourceColumnsOf = (plan: MergePlan) => [...new Set([
+  ...plan.entityColumns.filter(c => c.name === 'customer_id').map(c => c.name), ...customerRefColumns(plan).map(c => c.name),
+])].map(customerSourceColumn);
+
+/**
+ * 标准层表不存在时按实体的全部字段建表，存在时补上新的扩展字段、后来加的系统列（如 _key_space）与本映射引用列的数据源列。
+ * 敏感字段存哈希，类型总是 VARCHAR
+ */
 async function ensureSilverTable(con: DuckDBConnection, plan: MergeMappingParam) {
   const table = silverTable(plan.entity);
   const pii = sensitiveColumns(plan);
   const typeOf = (c: MergePlan['entityColumns'][number]) => (pii.has(c.name) ? 'VARCHAR' : sqlType(c.type));
+  const sourceColumns = customerSourceColumnsOf(plan);
   if (!await tableExists(con, SILVER, plan.entity)) {
     await con.run(`CREATE TABLE ${table} (
       ${plan.entityColumns.map(c => `${ident(c.name)} ${typeOf(c)}`).join(', ')},
-      ${Object.entries(SILVER_SYSTEM_COLUMNS).map(([name, type]) => `${name} ${type}`).join(', ')})`);
+      ${Object.entries(SILVER_SYSTEM_COLUMNS).map(([name, type]) => `${name} ${type}`).join(', ')}${sourceColumns.map(name => `, ${ident(name)} VARCHAR`).join('')})`);
     return;
   }
   for (const [name, type] of Object.entries(SILVER_SYSTEM_COLUMNS)) await con.run(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${name} ${type}`);
@@ -349,6 +366,7 @@ async function ensureSilverTable(con: DuckDBConnection, plan: MergeMappingParam)
   for (const c of plan.entityColumns.filter(c => !known.has(c.name))) {
     await con.run(`ALTER TABLE ${table} ADD COLUMN ${ident(c.name)} ${typeOf(c)}`);
   }
+  for (const name of sourceColumns.filter(name => !known.has(name))) await con.run(`ALTER TABLE ${table} ADD COLUMN ${ident(name)} VARCHAR`);
 }
 
 interface LastMerge { version: number; source_keys: string; batch_to: string; scheme: number | null }
@@ -456,7 +474,8 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     await con.run(`
       INSERT INTO ${silver} BY NAME SELECT w.* EXCLUDE (_src, _n, _batch),
         ${lit(plan.mapping)} AS _mapping, ${lit(plan.sourceId)} AS _source, ${plan.version} AS _version, TIMESTAMPTZ ${lit(now.toISOString())} AS _merged_at,
-        ${plan.keySpace ? lit(plan.keySpace) : 'NULL'} AS _key_space
+        ${plan.keySpace ? lit(plan.keySpace) : 'NULL'} AS _key_space${customerRefColumns(plan).map(c => `,
+        ${lit(c.customerSource ?? plan.sourceId)} AS ${ident(customerSourceColumn(c.name))}`).join('')}
       FROM ${stage.winners} w`);
     lap('deleteInsert');
     await con.run(`INSERT INTO ${MERGES} VALUES (
@@ -597,6 +616,8 @@ export async function mergeToSilver(
 ): Promise<{ mappings: MergeRecord[]; relations?: RelationStat[]; relationsMs?: number; identities?: IdentityRecord }> {
   const { con } = session;
   const now = new Date();
+  // 老湖补 _customer_source 并回填（lake:ensure 之前的数据湖），之后各映射与身份打通都按它解析
+  await ensureCustomerSourceColumns(con);
   // 每个实体一条队列，组内按 plans 的顺序串行（同一实体的映射有跨映射唯一检查，ADR-0024），组间各用一个连接并发；结果按 plans 的顺序回填
   const queues = new Map<string, number[]>();
   plans.forEach((plan, i) => queues.set(plan.entity, [...(queues.get(plan.entity) ?? []), i]));

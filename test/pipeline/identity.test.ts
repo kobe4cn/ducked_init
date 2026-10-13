@@ -18,7 +18,7 @@ import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { runTask, silver } from './fixtures';
-import { CRM, LOYALTY, publishedIdentitySources } from './identity-fixtures';
+import { CRM, LOYALTY, publishedIdentitySources, TRACKING_EVENTS } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -131,6 +131,25 @@ describe('身份打通：多源消费者确定性合并', () => {
     ]);
   });
 
+  it('事件映射声明 customer_id 属于 CRM 数据源后，登录事件按 CRM 那条消费者记录所在的统一消费者给设备定主人', async () => {
+    const { acme, author, reviewer, sources, names } = await publishedIdentitySources();
+    // 用户 3 只在 CRM 里有（埋点源只有 u1、u2、u9）
+    await grantOnSource(`INSERT INTO tracking.events (event_id, user_id, device_id, event_type, ts) VALUES ('e10', '3', 'd5', 'login', '2024-06-04 09:00')`);
+    await syncSource(author, sources.tracking);
+    await drain();
+    expect((await identities(acme)).devices.map(d => d.device_id)).toEqual(['d1', 'd2']);
+
+    const events = (await listMappings(author)).mappings.find(m => m.entity === 'event')!;
+    await republish(author, reviewer, events.id, TRACKING_EVENTS.replace('  customer_id: user_id\n', '  customer_id: { expr: user_id, customer_source: CRM }\n'));
+    const { rows, devices } = await identities(acme);
+    const crm3 = rows.find(r => `${names[r._source]}:${r.customer_id}` === 'crm:3')!.consumer_id;
+    // u1、u2、u9 在 CRM 里找不到，登录过的 d1、d2 归不到人
+    expect(devices).toEqual([{ device_id: 'd5', consumer_id: crm3, login_at: '2024-06-04 09:00' }]);
+    expect(await silver(acme, 'event', 'event_id')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event_id: 'e1', _source: sources.tracking, _customer_source: sources.crm }),
+    ]));
+  });
+
   it('event 指标的快照里匿名事件经设备归属计入设备主人；没有 _device_owner 的老湖给出提示', async () => {
     const { acme, names } = await publishedIdentitySources();
     const { rows } = await identities(acme);
@@ -174,7 +193,7 @@ describe('身份打通：多源消费者确定性合并', () => {
       expect(consumers).toBe(groups);
       const columns = (await read('DESCRIBE silver._consumer')).map(c => c.column_name);
       expect(columns).toEqual(expect.arrayContaining(['consumer_id', 'city', 'city__source', 'updated_at']));
-      expect(columns.filter(c => /^(name|phone|email|external_id|customer_id|_mapping|_source)(__source)?$/.test(String(c)))).toEqual([]);
+      expect(columns.filter(c => /^(name|phone|email|external_id|customer_id|_mapping|_source|_customer_source)(__source)?$/.test(String(c)))).toEqual([]);
       // 没有同意映射（silver.consent 不存在）时 _consumer_consent 是空表
       expect(await read('SELECT count(*)::INTEGER AS n FROM silver._consumer_consent')).toEqual([{ n: 0 }]);
 

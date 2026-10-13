@@ -12,6 +12,7 @@ import {
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import { ensureLakeSchemas } from '../../app/.server/pipeline/lake-schemas';
 import type { MergeMappingParam, MergeRecord } from '../../app/.server/pipeline/merge-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
@@ -604,6 +605,37 @@ describe('发布映射并合并到标准层', () => {
     expect(items.map(i => [i.order_item_id, i.order_id, i._key_space])).toEqual([['I1', 'pos:1', null], ['I2', 'pos:1', null], ['I3', 'pos:2', null]]);
     const ids = new Set(orders.map(o => o.order_id));
     expect(items.every(i => ids.has(i.order_id))).toBe(true);
+  });
+
+  it('标准层的 customer_id 旁边落 _customer_source：没声明跨源引用时就是行自己的 _source', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, CUSTOMERS);
+    await publish(author, reviewer, id, ORDERS);
+    for (const entity of ['customer', 'order']) {
+      const rows = await silver(acme, entity, 'customer_id');
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.every(r => r._source === id && r._customer_source === id)).toBe(true);
+    }
+  });
+
+  it('老湖里有 customer_id 却没有 _customer_source 的表，lake:ensure 与合并时补上这一列并按 _source 回填，不整表重建', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    const dropColumn = () => session.con.run('ALTER TABLE silver."order" DROP COLUMN _customer_source');
+    try {
+      await dropColumn();
+      await ensureLakeSchemas(session.con);
+      expect((await silver(acme, 'order', 'order_id')).every(r => r._customer_source === id)).toBe(true);
+      await dropColumn();
+    } finally {
+      session.close();
+    }
+
+    await mergeMapping(author, orders);
+    await drain();
+    expect((await silver(acme, 'order', 'order_id')).every(r => r._customer_source === id)).toBe(true);
+    expect((await getMapping(author, orders)).merge.history[0]).not.toMatchObject({ mode: 'rebuild' });
   });
 
   /** 订单明细的映射，orderId 是 order_id 一行的右边 */
