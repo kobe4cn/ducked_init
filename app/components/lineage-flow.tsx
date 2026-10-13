@@ -1,6 +1,7 @@
 // app/components/lineage-flow.tsx —— 数据地图的流向图：用 React Flow 画 flowGraph 算好坐标的节点与边，挂载后才渲染（服务端不测量节点）；
 // 源表按数据源分组，点分组切换折叠（数据源超过 5 个时默认全部折叠），折叠后在客户端重新排版；映射节点显示版本与最近一次合并，
 // 失败的标红并链到该映射的合并记录；标准层表节点显示行数与映射数，最近一次漂移检查有差异的标红边、带漂移徽标与 data-node-drift，点它把 ?node=silver.<实体> 写进 URL 打开字段抽屉，点源表节点写 ?node=table:<数据源>:<表> 打开源表抽屉。
+// 映射里声明的跨源引用画成从标准层表指向目标源 customer 映射节点的绿色虚线，标「跨源 · <数据源名>」并带 data-cross-source。
 // 反向查有结果（hits）时未命中的节点与连线变淡。节点可以拖动（只在本页有效，可重置）
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router';
@@ -23,6 +24,8 @@ const NODE_STYLE: Record<FlowData['kind'], React.CSSProperties> = {
   identity: { background: '#ecfdf5', borderColor: '#6ee7b7' },
   device: { background: '#f5f3ff', borderColor: '#c4b5fd' },
 };
+/** 跨源边与关系图里经 _identities 的边同色 */
+const CROSS_SOURCE_COLOR = '#059669';
 const FAILED: React.CSSProperties = { background: '#fef2f2', borderColor: '#fca5a5' };
 /** 变淡：悬停时与它无关的连线、反向查时没命中的节点与连线 */
 export const FADED = 0.15;
@@ -147,11 +150,16 @@ export function FlowGraphView({ flow, hits, drift }: { flow: FlowInput; hits?: S
 
   const edges = useMemo<Edge[]>(() => graph.edges.map(e => {
     const near = hovered !== null && (e.source === hovered || e.target === hovered);
+    const color = e.data?.crossSource ? CROSS_SOURCE_COLOR : '#94a3b8';
     return {
       ...e,
       zIndex: 1,
-      style: { stroke: '#94a3b8', strokeWidth: near ? 2 : 1, opacity: (hovered !== null && !near) || (hits && !hits.edges.has(e.id)) ? FADED : 1 },
-      markerEnd: { type: MarkerType.ArrowClosed, color: '#94a3b8' },
+      labelStyle: { fontSize: 11, fill: color },
+      style: {
+        stroke: color, strokeDasharray: e.data?.crossSource ? '6 4' : undefined, strokeWidth: near ? 2 : 1,
+        opacity: (hovered !== null && !near) || (hits && !hits.edges.has(e.id)) ? FADED : 1,
+      },
+      markerEnd: { type: MarkerType.ArrowClosed, color },
     };
   }), [graph, hovered, hits]);
 

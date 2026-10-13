@@ -1,10 +1,11 @@
 // app/lib/lineage-flow.ts —— 数据地图的流向图：源表（按数据源分组，可折叠）→ 映射 → 标准层表 → 打通表（_identities、_device_owner），
 // 映射节点带版本与最近一次合并的时间与结果，标准层表节点带行数（最近一次合并成功的各映射的行数之和，取自任务结果，不查湖）与写入它的映射数；
-// 用 dagre 的复合图算好坐标，返回 React Flow 的节点与边。只用表级血缘，不带列与表达式（ADR-0019）。前后端共用的纯函数
+// 用 dagre 的复合图算好坐标，返回 React Flow 的节点与边。只用表级血缘，不带列与表达式（ADR-0019）；
+// 映射里声明的跨源引用画成从标准层表指向目标源 customer 映射节点的「跨源」边（带 data-cross-source，不参与布局，ADR-0030）。前后端共用的纯函数
 import { Graph, layout } from '@dagrejs/dagre';
 import type { Edge, Node } from '@xyflow/react';
 import type { LineageEdge, TableLineage } from './lineage';
-import { DEVICE_OWNER, NODE_HEIGHT, IDENTITIES, type IdentityInfo, relationGraph, NODE_WIDTH } from './lineage-graph';
+import { crossSourceIds, crossSourceLabel, DEVICE_OWNER, type GraphEdge, NODE_HEIGHT, IDENTITIES, type IdentityInfo, relationGraph, NODE_WIDTH } from './lineage-graph';
 
 /** 一个映射最近一次合并：时间是结束时间（ISO）；rows 只在成功时有 */
 export interface FlowMerge { status: 'ok' | 'skipped' | 'failed'; at: string; rows: number | null }
@@ -23,10 +24,11 @@ export type FlowData =
 
 export type FlowNode = Node<FlowData> & { width: number; height: number };
 
-export interface FlowGraph { nodes: FlowNode[]; edges: Edge[] }
+/** 跨源边的 data 带 crossSource（目标数据源），其余边没有 data */
+export interface FlowGraph { nodes: FlowNode[]; edges: Edge<{ crossSource?: GraphEdge['crossSource'] }>[] }
 
-/** 流向图的输入：表级血缘、各映射最近一次合并（按映射 id）、关系边（从中取指向打通表的）与 _identities 的打通现状 */
-export interface FlowInput { tables: TableLineage[]; merges: Record<string, FlowMerge>; identityEdges: LineageEdge[]; identity?: IdentityInfo | null }
+/** 流向图的输入：表级血缘、各映射最近一次合并（按映射 id）、关系边（从中取指向打通表的与跨源引用）与 _identities 的打通现状 */
+export interface FlowInput { tables: TableLineage[]; merges: Record<string, FlowMerge>; relationEdges: LineageEdge[]; identity?: IdentityInfo | null }
 
 /** 数据源超过这么多个时默认全部折叠 */
 const COLLAPSE_OVER = 5;
@@ -91,13 +93,31 @@ export function flowGraph(
   }
 
   // 打通表与指向它们的边沿用关系图的口径
-  const relation = relationGraph({ edges: input.identityEdges, connected: input.tables.map(t => t.entity), showAll: false, identity: input.identity });
+  const relation = relationGraph({ edges: input.relationEdges, connected: input.tables.map(t => t.entity), showAll: false, identity: input.identity });
   for (const n of relation.nodes) {
     if (n.id === IDENTITIES) add({ id: n.id, data: { kind: 'identity', label: n.label, identity: n.identity ?? null }, width: n.width, height: n.height });
     if (n.id === DEVICE_OWNER) add({ id: n.id, data: { kind: 'device', label: n.label }, width: n.width, height: n.height });
   }
   for (const e of relation.edges) {
     if ((e.kind === 'identity' || e.kind === 'device') && (e.target === IDENTITIES || e.target === DEVICE_OWNER)) link(`silver.${e.source}`, e.target);
+  }
+
+  // 跨源引用回指目标源 customer 的映射节点，排完版再加，免得把映射与标准层表的左右次序拉乱；同一对节点只画一条（流向图只看表级）
+  const crossEdges: Edge<{ crossSource: GraphEdge['crossSource'] }>[] = [];
+  for (const e of input.relationEdges) {
+    const source = `silver.${e.from.entity}`;
+    if (!e.customerSource || !nodes.has(source)) continue;
+    const crossSource = [{ sourceId: e.customerSource, name: e.customerSourceName ?? null }];
+    for (const t of input.tables) {
+      if (t.entity !== 'customer' || t.sourceId !== e.customerSource) continue;
+      const target = mappingId(t.mapping);
+      const id = `cross:${source}->${target}`;
+      if (crossEdges.some(x => x.id === id)) continue;
+      crossEdges.push({
+        id, source, target, data: { crossSource }, label: crossSourceLabel({ crossSource }),
+        domAttributes: { 'data-cross-source': crossSourceIds({ crossSource }) } as Edge['domAttributes'],
+      });
+    }
   }
 
   // 展开的数据源是复合图里的分组：dagre 只排子节点，分组框按子节点的范围加内边距算
@@ -142,6 +162,6 @@ export function flowGraph(
         ...(n.parent ? { parentId: n.parent, extent: 'parent' as const } : {}),
       };
     }),
-    edges,
+    edges: [...edges, ...crossEdges],
   };
 }

@@ -141,7 +141,7 @@ export async function loader({ request }: Route.LoaderArgs) {
         sourceNames: Object.fromEntries(own.map(t => [t.sourceId, t.sourceName])),
       };
     } else if (tab === 'flow') {
-      flow = { tables: lineage.tables, identityEdges: lineage.edges, identity: graph.nodes.find(n => n.identity)?.identity ?? null, merges };
+      flow = { tables: lineage.tables, relationEdges: lineage.edges, identity: graph.nodes.find(n => n.identity)?.identity ?? null, merges };
     }
     const found = searchImpact(lineage, q);
     if (found) hitIds = { nodes: [...found.nodes], edges: [...found.edges], fields: [...found.fields] };
