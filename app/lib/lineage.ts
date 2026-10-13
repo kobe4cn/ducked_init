@@ -1,7 +1,8 @@
 // app/lib/lineage.ts —— 数据地图的血缘：由已发布映射推出表级（数据源 → 源表或源视图 → 映射及版本 → 标准层表）、
-// 字段级（标准层字段在各映射里对应的源列与表达式）与标准实体之间的关系边。只看表达式与列名，不读数据值，不落库（ADR-0019）
+// 字段级（标准层字段在各映射里对应的源列与表达式）与标准实体之间的关系边（含映射里声明的跨源引用，ADR-0030）。只看表达式与列名，不读数据值，不落库（ADR-0019）
 import type { MergeMappingParam } from '~/.server/pipeline/merge-engine';
 import { CANONICAL_ENTITIES, entityOf, EXTENSION_PATTERN, isCustomEntity } from './canonical-model';
+import { customerSourceColumn } from './customer-source';
 import { parseExpression, referencedColumns } from './mapping-expr';
 
 export interface TableLineage {
@@ -41,6 +42,8 @@ export interface LineageEdge {
   to: { table: string; field: string };
   via?: { table: string; on: string[] };
   kind: 'ref' | 'identity' | 'device';
+  /** 跨源引用（ADR-0030）：映射里声明的目标数据源 ID 与名字（不知道名字时不带） */
+  customerSource?: string; customerSourceName?: string;
 }
 
 export interface Lineage { tables: TableLineage[]; fields: FieldLineage[]; edges: LineageEdge[] }
@@ -52,6 +55,9 @@ const DEVICE_OWNER = 'silver._device_owner';
 export const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 const extensionName = new RegExp(EXTENSION_PATTERN);
 
+/** 指向 customer 的边经 _identities 关联 */
+const VIA_IDENTITIES = { table: IDENTITIES, on: ['_source', 'customer_id'] };
+
 function edges(): LineageEdge[] {
   const out: LineageEdge[] = [];
   for (const e of CANONICAL_ENTITIES) {
@@ -60,12 +66,31 @@ function edges(): LineageEdge[] {
       const from = { entity: e.name, field: f.name };
       const to = { table: `silver.${f.ref.entity}`, field: f.ref.field };
       out.push(f.ref.entity === 'customer'
-        ? { from, to, via: { table: IDENTITIES, on: ['_source', 'customer_id'] }, kind: 'identity' }
+        ? { from, to, via: VIA_IDENTITIES, kind: 'identity' }
         : { from, to, kind: 'ref' });
     }
   }
   out.push({ from: { entity: 'event', field: 'device_id' }, to: { table: DEVICE_OWNER, field: 'device_id' }, kind: 'device' });
   return out;
+}
+
+/**
+ * 计划里声明了 customer_source 的列各出一条指向 customer 的边，经 _identities 按（引用列旁的数据源列, 引用列）关联；
+ * 同一实体字段指向同一数据源的只留一条（ADR-0030）
+ */
+function crossSourceEdges(plans: MergeMappingParam[], sources: Map<string, { name: string }>): LineageEdge[] {
+  const out = new Map<string, LineageEdge>();
+  for (const p of plans) {
+    for (const c of p.columns) {
+      if (!c.customerSource) continue;
+      const name = sources.get(c.customerSource)?.name;
+      out.set(`${p.entity}.${c.name}:${c.customerSource}`, {
+        from: { entity: p.entity, field: c.name }, to: { table: 'silver.customer', field: 'customer_id' },
+        via: { table: IDENTITIES, on: [customerSourceColumn(c.name), c.name] }, kind: 'identity', customerSource: c.customerSource, ...(name !== undefined && { customerSourceName: name }),
+      });
+    }
+  }
+  return [...out.values()];
 }
 
 /** 由已发布映射（publishedPlans 的结果）与数据源推出血缘；结果按实体、字段、映射排序 */
@@ -97,7 +122,7 @@ export function deriveLineage(input: { plans: MergeMappingParam[]; sources: { id
   });
   fields.sort((a, b) => cmp(a.entity, b.entity) || cmp(a.field, b.field) || cmp(a.mapping, b.mapping));
 
-  return { tables, fields, edges: edges() };
+  return { tables, fields, edges: [...edges(), ...crossSourceEdges(input.plans, sources)] };
 }
 
 /** 一个源列影响了哪些标准层字段 */

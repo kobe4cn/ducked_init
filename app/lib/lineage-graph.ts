@@ -1,11 +1,11 @@
 // app/lib/lineage-graph.ts —— 数据地图的关系图：由血缘的关系边与已接入的标准层表画出节点与边（指向 customer 的经 _identities 关联，
-// event.device_id 经 _device_owner 归到消费者，口径见 ADR-0019），用 dagre 算好坐标；_identities 节点挂上匹配规则与最近一次打通的摘要；
+// event.device_id 经 _device_owner 归到消费者，口径见 ADR-0019；映射里声明的跨源引用标在指向 customer 的边上，ADR-0030），用 dagre 算好坐标；_identities 节点挂上匹配规则与最近一次打通的摘要；
 // 打开 showAll 时把未接入的标准实体与它们的内置关系也画出来，标为未接入；点表节点给出示例 SQL，
 // 一律按租户湖挂载为 lake 来写（ADR-0001/0008），不带连接方式与凭据。前后端共用的纯函数
 import { Graph, layout } from '@dagrejs/dagre';
 import { CANONICAL_ENTITIES, entityOf } from './canonical-model';
-import type { LineageEdge } from './lineage';
 import { customerSourceColumn } from './customer-source';
+import type { LineageEdge } from './lineage';
 
 /**
  * 身份打通的现状：匹配规则（读不出来时为 null）与最近一次打通的摘要（还没打通过时为 null），只有计数，不带消费者标识；
@@ -33,8 +33,14 @@ export interface GraphNode {
   width: number; height: number;
 }
 
-/** connected：两端都已接入；fromField：起点字段，只挂在指向标准实体的 ref / identity 边上，用来对上合并后的孤儿统计（ADR-0019） */
-export interface GraphEdge { id: string; source: string; target: string; kind: 'ref' | 'identity' | 'device'; label: string; connected: boolean; fromField?: string }
+/**
+ * connected：两端都已接入；fromField：起点字段，只挂在指向标准实体的 ref / identity 边上，用来对上合并后的孤儿统计（ADR-0019）；
+ * crossSource：映射里声明的跨源引用指向的数据源（ADR-0030），按出现顺序，不知道名字时 name 为 null
+ */
+export interface GraphEdge {
+  id: string; source: string; target: string; kind: 'ref' | 'identity' | 'device'; label: string; connected: boolean; fromField?: string;
+  crossSource?: { sourceId: string; name: string | null }[];
+}
 
 export interface RelationGraph { nodes: GraphNode[]; edges: GraphEdge[] }
 
@@ -52,6 +58,16 @@ const tableOf = (silver: string) => silver.replace(/^silver\./, '');
 /** 匹配规则按 customer 的字段名称写，按优先级以「 > 」连接，如「手机号 > 邮箱 > 外部 ID」 */
 export const ruleLabels = (rules: readonly string[]) =>
   rules.map(r => entityOf('customer')?.fields.find(f => f.name === r)?.label ?? r).join(' > ');
+
+/** 跨源边的标注：「跨源 · <数据源名>」，不知道名字时只写「跨源」；不是跨源边时为 null */
+export function crossSourceLabel(edge: Pick<GraphEdge, 'crossSource'>): string | null {
+  if (!edge.crossSource) return null;
+  const names = edge.crossSource.flatMap(s => (s.name === null ? [] : [s.name]));
+  return names.length ? `跨源 · ${names.join('、')}` : '跨源';
+}
+
+/** 跨源边的 data-cross-source：目标数据源 ID 以逗号连接；不是跨源边时为 undefined（不出属性） */
+export const crossSourceIds = (edge: Pick<GraphEdge, 'crossSource'>) => edge.crossSource?.map(s => s.sourceId).join(',');
 
 export function relationGraph(input: { edges: LineageEdge[]; connected: string[]; showAll: boolean; identity?: IdentityInfo | null }): RelationGraph {
   const connected = [...new Set(input.connected)];
@@ -78,10 +94,16 @@ export function relationGraph(input: { edges: LineageEdge[]; connected: string[]
       : e.kind === 'identity' ? '经 _identities 按 (_customer_source, customer_id) 关联'
       : 'device_id（不带 _source，取最近一次登录）';
     const toEntity = e.kind !== 'device' && target !== IDENTITIES && target !== DEVICE_OWNER;
-    edges.push({
-      id: `${e.kind}:${source}.${e.from.field}->${target}`, source, target, kind: e.kind, label, connected: liveIds.has(source) && liveIds.has(target),
-      ...(toEntity && { fromField: e.from.field }),
-    });
+    const id = `${e.kind}:${source}.${e.from.field}->${target}`;
+    // 跨源引用合并到同一字段已有的边上（标准字段已有内置边），没有时（如扩展字段）另起一条
+    let edge = edges.find(x => x.id === id);
+    if (!edge) {
+      edge = { id, source, target, kind: e.kind, label, connected: liveIds.has(source) && liveIds.has(target), ...(toEntity && { fromField: e.from.field }) };
+      edges.push(edge);
+    }
+    if (e.customerSource && !edge.crossSource?.some(s => s.sourceId === e.customerSource)) {
+      (edge.crossSource ??= []).push({ sourceId: e.customerSource, name: e.customerSourceName ?? null });
+    }
   }
   if (nodeIds.has(IDENTITIES)) {
     edges.push({ id: `identity:customer.customer_id->${IDENTITIES}`, source: 'customer', target: IDENTITIES, kind: 'identity', label: 'customer_id → consumer_id', connected: true });

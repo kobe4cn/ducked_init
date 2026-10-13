@@ -1,5 +1,5 @@
 // app/components/lineage-graph.tsx —— 数据地图的关系图：用 React Flow 画 relationGraph 算好坐标的节点与边，挂载后才渲染（服务端不测量节点）；
-// 经 _identities、_device_owner 的边用虚线与不同颜色并显示说明；未接入的节点与边灰显；_identities 节点内显示匹配规则与打通摘要；
+// 经 _identities、_device_owner 的边用虚线与不同颜色并显示说明；映射里声明了跨源引用的边标「跨源 · <数据源名>」并带 data-cross-source；未接入的节点与边灰显；_identities 节点内显示匹配规则与打通摘要；
 // 最近一次漂移检查有差异的标准层表标红边、带漂移徽标与 data-node-drift；
 // 节点可以拖动（只在本页有效，可重置），悬停或选中节点时突出它的连线、其余变淡；点节点把 ?node= 写进 URL，页面据此给出示例 SQL
 import { useEffect, useMemo, useState } from 'react';
@@ -8,7 +8,7 @@ import { Background, Controls, type Edge, MarkerType, type Node, type NodeChange
 import '@xyflow/react/dist/style.css';
 import { DRIFT_NODE_STYLE, DriftBadge } from '~/components/drift-badge';
 import { driftAttrs, type DriftByTable, type DriftCounts } from '~/lib/lineage-drift';
-import { type GraphEdge, type GraphNode, type RelationGraph, identityChangesLabel, ruleLabels } from '~/lib/lineage-graph';
+import { crossSourceIds, crossSourceLabel, type GraphEdge, type GraphNode, type RelationGraph, identityChangesLabel, ruleLabels } from '~/lib/lineage-graph';
 
 const NODE_STYLE: Record<GraphNode['kind'], React.CSSProperties> = {
   entity: { background: '#fff', borderColor: '#cbd5e1' },
@@ -19,6 +19,13 @@ const NODE_STYLE: Record<GraphNode['kind'], React.CSSProperties> = {
 const EDGE_COLOR: Record<GraphEdge['kind'], string> = { ref: '#94a3b8', identity: '#059669', device: '#7c3aed' };
 const DISCONNECTED_NODE: React.CSSProperties = { background: '#f8fafc', borderColor: '#e2e8f0', borderStyle: 'dashed', color: '#94a3b8', opacity: 0.7 };
 const DISCONNECTED_EDGE = '#cbd5e1';
+
+/** 内置关系平时不显示说明，悬停或选中一端时显示；跨源边一直标「跨源 · <数据源名>」，悬停或选中时再带说明 */
+const edgeLabel = (e: GraphEdge, near: boolean) => {
+  const cross = crossSourceLabel(e);
+  if (cross) return near ? `${cross}｜${e.label}` : cross;
+  return e.kind === 'ref' && !near ? undefined : e.label;
+};
 
 const nodeLabel = (n: GraphNode, drift: DriftCounts | undefined): React.ReactNode => {
   const name = n.kind === 'entity' && n.label !== n.id ? `${n.label}（${n.id}）` : n.label;
@@ -77,8 +84,8 @@ export function RelationGraphView({ graph, selected, drift }: { graph: RelationG
     const faded = focus !== null && !near;
     return {
       id: e.id, source: e.source, target: e.target,
-      // 内置关系平时不显示说明，悬停或选中一端时显示
-      label: e.kind === 'ref' && !near ? undefined : e.label,
+      label: edgeLabel(e, near),
+      ...(e.crossSource && { domAttributes: { 'data-cross-source': crossSourceIds(e) } as Edge['domAttributes'] }),
       labelStyle: { fontSize: 11, fill: color },
       zIndex: near ? 1 : 0,
       style: {

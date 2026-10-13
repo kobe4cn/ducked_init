@@ -1,5 +1,5 @@
 // test/lineage.test.ts —— 数据地图的血缘：由已发布映射推出表级（数据源 → 源表 → 映射及版本 → 标准层表）、字段级（标准层字段对应的源列与表达式）
-// 与关系边（标准实体的 ref、经 silver._identities 关联 customer、event.device_id → silver._device_owner），以及一个源列的影响范围（纯函数）
+// 与关系边（标准实体的 ref、经 silver._identities 关联 customer、event.device_id → silver._device_owner、映射里声明的跨源引用），以及一个源列的影响范围（纯函数）
 import { describe, expect, it } from 'vitest';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
 import { deriveLineage, impactOf } from '../app/lib/lineage';
@@ -89,5 +89,26 @@ describe('由已发布映射推导血缘', () => {
     expect(edges).toContainEqual({ from: { entity: 'event', field: 'device_id' }, to: { table: 'silver._device_owner', field: 'device_id' }, kind: 'device' });
     expect(edges.filter(e => e.kind === 'identity')).toHaveLength(8);
     expect(edges.filter(e => e.kind === 'ref')).toHaveLength(6);
+  });
+
+  it('跨源引用：声明了 customer_source 的计划列各出一条指向 customer 的边，带目标数据源 ID 与名字；不认识的数据源不带名字', () => {
+    const cross = plan({
+      columns: [
+        { name: 'order_id', type: 'string', expr: 'string(order_id)' },
+        { name: 'customer_id', type: 'string', expr: 'buyer', customerRef: true, customerSource: 's-erp' },
+        { name: 'x_referrer', type: 'string', expr: 'referrer', customerRef: true, customerSource: 's-gone' },
+        { name: 'x_buyer', type: 'string', expr: 'buyer', customerRef: true },
+      ],
+    });
+    const via = (on: string[]) => ({ table: 'silver._identities', on });
+    const to = { table: 'silver.customer', field: 'customer_id' };
+    const { edges } = deriveLineage({ plans: [cross, { ...cross, mapping: 'm-order-2' }], sources });
+    // 经 _identities 按引用列旁的数据源列关联
+    expect(edges.filter(e => e.customerSource)).toEqual([
+      { from: { entity: 'order', field: 'customer_id' }, to, via: via(['_customer_source', 'customer_id']), kind: 'identity', customerSource: 's-erp', customerSourceName: 'ERP' },
+      { from: { entity: 'order', field: 'x_referrer' }, to, via: via(['_x_referrer_source', 'x_referrer']), kind: 'identity', customerSource: 's-gone' },
+    ]);
+    // 没有跨源声明时只有内置的关系边
+    expect(deriveLineage({ plans, sources }).edges).toEqual(deriveLineage({ plans: [], sources: [] }).edges);
   });
 });

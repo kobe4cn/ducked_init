@@ -1,9 +1,9 @@
 // test/lineage-graph.test.ts —— 数据地图的关系图：由血缘的关系边与已接入的实体画出节点（含 _identities、_device_owner）、边的种类与说明、
-// dagre 布局的坐标，显示未接入的标准实体时的节点与边（标为未接入），_identities 节点上的打通摘要（有合并、拆开时多一行组数），
+// 跨源引用合并到同一字段的边上并标「跨源 · <数据源名>」，dagre 布局的坐标，显示未接入的标准实体时的节点与边（标为未接入），_identities 节点上的打通摘要（有合并、拆开时多一行组数），
 // 以及点表节点给出的示例 SQL（按租户湖挂载为 lake 来写，不带连接方式与凭据；未接入的节点没有）（纯函数）
 import { describe, expect, it } from 'vitest';
 import { deriveLineage } from '../app/lib/lineage';
-import { identityChangesLabel, relationGraph, ruleLabels, sampleSql } from '../app/lib/lineage-graph';
+import { crossSourceLabel, identityChangesLabel, relationGraph, ruleLabels, sampleSql } from '../app/lib/lineage-graph';
 
 const { edges } = deriveLineage({ plans: [], sources: [] });
 const graphOf = (connected: string[], extra: { showAll?: boolean; identity?: Parameters<typeof relationGraph>[0]['identity'] } = {}) =>
@@ -42,6 +42,33 @@ describe('关系图', () => {
       expect(g.nodes.some(n => n.id === e.target)).toBe(true);
     }
     expect(new Set(g.edges.map(e => e.id)).size).toBe(g.edges.length);
+  });
+
+  it('跨源引用：同一字段已有内置边时合并到那条边上（不画重复边），扩展字段另出一条边；都带目标数据源', () => {
+    const to = { table: 'silver.customer', field: 'customer_id' };
+    const via = { table: 'silver._identities', on: ['_source', 'customer_id'] };
+    const cross = [
+      ...edges,
+      { from: { entity: 'order', field: 'customer_id' }, to, via, kind: 'identity' as const, customerSource: 's-erp', customerSourceName: 'ERP' },
+      { from: { entity: 'order', field: 'customer_id' }, to, via, kind: 'identity' as const, customerSource: 's-crm', customerSourceName: 'CRM' },
+      // 同一字段指向同一数据源的只记一次
+      { from: { entity: 'order', field: 'customer_id' }, to, via, kind: 'identity' as const, customerSource: 's-erp', customerSourceName: 'ERP' },
+      { from: { entity: 'order', field: 'x_referrer' }, to, via, kind: 'identity' as const, customerSource: 's-gone' },
+    ];
+    const g = relationGraph({ edges: cross, connected: ['customer', 'order'], showAll: false });
+    const toCustomer = g.edges.filter(e => e.source === 'order' && e.target === 'customer');
+    expect(toCustomer.map(e => [e.fromField, e.crossSource])).toEqual([
+      ['customer_id', [{ sourceId: 's-erp', name: 'ERP' }, { sourceId: 's-crm', name: 'CRM' }]],
+      ['x_referrer', [{ sourceId: 's-gone', name: null }]],
+    ]);
+    expect(toCustomer.every(e => e.kind === 'identity')).toBe(true);
+    expect(new Set(g.edges.map(e => e.id)).size).toBe(g.edges.length);
+    expect(crossSourceLabel(toCustomer[0])).toBe('跨源 · ERP、CRM');
+    // 不知道数据源名（没有 sources:read）时只写「跨源」
+    expect(crossSourceLabel(toCustomer[1])).toBe('跨源');
+    // 没有跨源声明时没有 crossSource，与现在一致
+    expect(graphOf(['customer', 'order']).edges.some(e => 'crossSource' in e)).toBe(false);
+    expect(crossSourceLabel(graphOf(['customer', 'order']).edges[0])).toBeNull();
   });
 
   it('每个节点都有坐标与尺寸；自定义实体只出节点，标签用实体名', () => {

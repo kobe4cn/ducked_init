@@ -1,6 +1,6 @@
 // test/http/lineage.test.ts —— 数据地图的 HTTP 接缝：任何成员都能打开 /lineage，关系图下的表与关系列表画出已接入的标准层表与 _identities、_device_owner，
 // 页面不出现源表名；点表节点（?node=）给出按 lake 写的示例 SQL；_identities 显示匹配规则与最近一次打通的摘要，有合并、拆开时带组数（没有合并任务时显示尚未合并）；
-// 内置关系边带最近一次合并后的孤儿比例（样例键只给数据工程师，统计失败标红，没有合并任务时为尚未合并）；
+// 内置关系边带最近一次合并后的孤儿比例（样例键只给数据工程师，统计失败标红，没有合并任务时为尚未合并）；声明了跨源引用的边标「跨源 · <数据源名>」（查看者不带名字）；
 // 「显示未接入的标准实体」开关（?all=1）灰显未接入的实体；没有已发布映射时显示空状态；流向图（?tab=flow）只对有 sources:read 的成员开放：列表带源表名、版本、行数与合并状态，失败的链到合并记录；
 // 抽屉里的「聚焦此表」进入单表聚焦画布（?tab=flow&focus=），画布下的连线列表从源列连到标准层字段；查看者访问 ?focus= 回到关系图；
 // 流向图与聚焦画布上反向查（?q=）标出命中的行，源表节点（?node=table:…）打开源表抽屉；查看者两者都不生效；
@@ -170,6 +170,31 @@ describe('数据地图', () => {
     const none = decode(await (await eng.get('/lineage')).text());
     expect(edgeRow(none, ORDER)).toContain('data-edge-stat="unmerged"');
     expect(edgeRow(none, EVENT)).toContain('data-edge-stat="unmerged"');
+  });
+
+  it('映射里声明了跨源引用时，表与关系列表上那条指向 customer 的边带 data-cross-source 与「跨源 · <数据源名>」；查看者只看到「跨源」', async () => {
+    const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const edgeRow = (html: string) => html.match(/<tr[^>]*data-edge-id="identity:order.customer_id-&gt;customer"[\s\S]*?<\/tr>/)![0];
+
+    // 还没有跨源声明：与现在一致
+    const de = await loginAs(app, 'de@acme.com');
+    expect(await (await de.get('/lineage')).text()).not.toContain('data-cross-source');
+
+    const [{ id }] = await getDb().select({ id: mappings.id }).from(mappings)
+      .where(and(eq(mappings.tenantId, acme), eq(mappings.sourceId, sources.crm), eq(mappings.tableName, 'orders')));
+    await saveDraft(author, id, CRM_ORDERS.replace('customer_id: string(customer)', 'customer_id: { expr: string(customer), customer_source: 会员 }'));
+    await publishMapping(reviewer, id, 2);
+
+    const row = edgeRow(await (await de.get('/lineage')).text());
+    expect(row).toContain(`data-cross-source="${sources.loyalty}"`);
+    expect(row).toContain('跨源 · 会员');
+
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    const viewerRow = edgeRow(await (await viewer.get('/lineage')).text());
+    expect(viewerRow).toContain(`data-cross-source="${sources.loyalty}"`);
+    expect(viewerRow).toContain('跨源');
+    expect(viewerRow).not.toContain('跨源 · ');
   });
 
   it('数据工程师打开流向图，看到各映射的源表、版本、最近一次合并与标准层表行数；合并失败的映射标红并链到合并记录', async () => {

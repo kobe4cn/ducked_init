@@ -1,7 +1,7 @@
 // app/routes/lineage.tsx —— 数据地图（需登录，任何角色）：关系图画出已接入的标准层表与 _identities、_device_owner 之间的关系，
 // 图下服务端渲染一份表与关系的列表；点表节点（?node=）给出按租户湖挂载为 lake 写的示例 SQL。
 // _identities 显示匹配规则与最近一次打通的摘要（只有计数）；列表里已接入、指向标准实体的内置关系带最近一次合并后的孤儿比例，展开看行数与样例键
-// （样例键只给有 sources:read 的成员，ADR-0019/0005）；?all=1 时把未接入的标准实体与它们的内置关系也画出来，灰显。
+// （样例键只给有 sources:read 的成员，ADR-0019/0005）；映射里声明了跨源引用的边标「跨源 · <数据源名>」（data-cross-source，没有 sources:read 时不带名字，ADR-0030）；?all=1 时把未接入的标准实体与它们的内置关系也画出来，灰显。
 // 流向图（?tab=flow）画源表 → 映射 → 标准层表 → 打通表，带各映射最近一次合并与标准层表行数（取自任务结果，不查湖），图下同样有一份列表；
 // 只对有 sources:read 的成员开放，没有权限时回到关系图，源表名与映射信息都不下发。
 // 点已接入的标准层表（关系图 ?node=<entity>，流向图 ?node=silver.<entity>）在右侧抽屉列出字段明细：有 sources:read 时带各映射的源表、源列、表达式、
@@ -34,12 +34,13 @@ import { driftAttrs, driftByTable, type DriftByTable } from '~/lib/lineage-drift
 import { entityFields, type FieldDrawer, redactFields } from '~/lib/lineage-fields';
 import { type FlowInput, type FlowMerge, silverTotals } from '~/lib/lineage-flow';
 import { type SearchHits, searchImpact, tableImpact, type TableImpact } from '~/lib/lineage-search';
-import { type GraphEdge, identityChangesLabel, type IdentityInfo, relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
+import { crossSourceIds, crossSourceLabel, type GraphEdge, identityChangesLabel, type IdentityInfo, relationGraph, ruleLabels, sampleSql } from '~/lib/lineage-graph';
 import type { SourceKind } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
 import { percent, StatLine } from '~/components/relation-stats-card';
 import { StatusText } from '~/components/status-text';
 import { DriftBadge } from '~/components/drift-badge';
+import { Badge } from '~/components/ui/badge';
 import { KindIcon } from '~/components/kind-icon';
 import { LineageDrawer, TableDrawer } from '~/components/lineage-drawer';
 import { FocusGraphView } from '~/components/lineage-focus';
@@ -102,13 +103,16 @@ export async function loader({ request }: Route.LoaderArgs) {
     rules = null;
   }
   const summary = await latestIdentitySummary(member.tenant.id);
+  const canFlow = can(member.role, 'sources:read');
+  // 只取数据源的名字与种类，不带连接配置；不下发合并计划（里面有列与表达式）。没有 sources:read 时跨源边不带数据源名
+  const sources = canFlow ? (await listSources(member)).map(({ id, name, kind }) => ({ id, name, kind })) : [];
+  const lineage = deriveLineage({ plans, sources });
   const graph = relationGraph({
-    edges: deriveLineage({ plans, sources: [] }).edges, connected, showAll,
+    edges: lineage.edges, connected, showAll,
     identity: { rules, summary: summary && { groups: summary.groups, records: summary.records, merged: summary.merged, split: summary.split } },
   });
   const node = searchParams.get('node');
   const sql = node ? sampleSql(node, graph) : null;
-  const canFlow = can(member.role, 'sources:read');
   const edgeStats = await relationStatsByEdge(member.tenant.id, graph, canFlow);
   const tab = tabOf(request, canFlow);
   const drawerEntity = drawerEntityOf(node, connected);
@@ -123,9 +127,6 @@ export async function loader({ request }: Route.LoaderArgs) {
   let hitIds: { nodes: string[]; edges: string[]; fields: string[] } | null = null;
   let tableDrawer: TableImpact | null = null;
   if (tab === 'flow' || drawerEntity || tableNode) {
-    // 只取数据源的名字与种类，不带连接配置；不下发合并计划（里面有列与表达式）
-    const sources = canFlow ? (await listSources(member)).map(({ id, name, kind }) => ({ id, name, kind })) : [];
-    const lineage = deriveLineage({ plans, sources });
     const last = await lastMergeByMapping(member.tenant.id, plans.map(p => p.mapping));
     const merges = Object.fromEntries(Object.entries(last).map(([id, r]) => [id, flowMerge(r)]));
     if (focusEntity) {
@@ -346,11 +347,17 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
               </TableHeader>
               <TableBody>
                 {graph.edges.map(e => (
-                  <TableRow key={e.id} data-edge={e.kind} data-edge-id={e.id} data-connected={e.connected} className={e.connected ? undefined : 'text-slate-400'}>
+                  <TableRow
+                    key={e.id} data-edge={e.kind} data-edge-id={e.id} data-connected={e.connected} className={e.connected ? undefined : 'text-slate-400'}
+                    data-cross-source={crossSourceIds(e)}
+                  >
                     <TableCell className="font-mono text-xs">{e.source}</TableCell>
                     <TableCell className="font-mono text-xs">{e.target}</TableCell>
                     <TableCell className={e.connected ? 'text-slate-500' : ''}>{EDGE_KINDS[e.kind]}</TableCell>
-                    <TableCell className="whitespace-normal font-mono text-xs">{e.label}</TableCell>
+                    <TableCell className="whitespace-normal font-mono text-xs">
+                      {e.label}
+                      {e.crossSource && <Badge variant="outline" className="ml-2 font-sans">{crossSourceLabel(e)}</Badge>}
+                    </TableCell>
                     <TableCell className="whitespace-normal">{edgeStats[e.id] ? <EdgeStat stat={edgeStats[e.id]} /> : <span className="text-slate-400">—</span>}</TableCell>
                   </TableRow>
                 ))}
