@@ -33,7 +33,7 @@ export interface FieldLineage {
 }
 
 /**
- * 标准实体之间的关系边。ref 是内置关系；identity 是指向 customer 的关系，在标准层经 silver._identities 按 (_source, customer_id) 关联；
+ * 标准实体之间的关系边。ref 是内置关系；identity 是指向 customer 的关系，在标准层经 silver._identities 按 (_customer_source, customer_id) 关联；
  * device 是 event.device_id 经 silver._device_owner 归到消费者
  */
 export interface LineageEdge {

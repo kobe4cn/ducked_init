@@ -1,17 +1,24 @@
 // test/pipeline/relation-stats.test.ts —— 关系孤儿比例的流水线接缝（ADR-0019）：身份打通数据源与订单映射发布 → 调度器派发合并（入队时带上全部已发布关系）→
-// 合并任务结果 relations 里每条关系的起点有值行数、孤儿数与样例键；敏感起点不给样例键，两端还没合并的标 unmerged
+// 合并任务结果 relations 里每条关系的起点有值行数、孤儿数与样例键；敏感起点不给样例键，两端还没合并的标 unmerged。
+// 终点是 customer 时按起点的数据源列（跨源引用的目标数据源，ADR-0030）找，老湖没有这一列时退回 _source
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb } from '../../app/.server/db/client';
-import { entityRelationStats } from '../../app/.server/mappings';
+import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
+import { entityRelationStats, listMappings, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import { relationStats } from '../../app/.server/pipeline/merge-engine';
 import { type RelationStat, relationText } from '../../app/lib/canonical-model';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { publish } from './fixtures';
-import { publishedIdentitySources } from './identity-fixtures';
+import { publishedIdentitySources, TRACKING_EVENTS } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
+
+const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 最近一次合并任务的参数与结果里的关系，按「起点 → 终点」取 */
 async function lastMerge(tenantId: string) {
@@ -57,5 +64,26 @@ describe('关系孤儿比例', () => {
     const { at, relations } = await entityRelationStats(acme, 'custom_redeem');
     expect(at).toBeTruthy();
     expect(relations).toEqual([expect.objectContaining({ from: { entity: 'custom_redeem', field: 'customer_id' }, orphans: 1 })]);
+  });
+
+  it('事件声明 customer_source 指向 CRM 后，event → customer 只在 CRM 里找；起点没有数据源列的老湖退回 _source', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources();
+    expect((await lastMerge(acme)).stat('event.customer_id → customer.customer_id')).toMatchObject({ withValue: 5, orphans: 0 });
+
+    const events = (await listMappings(author)).mappings.find(m => m.entity === 'event')!;
+    await publishMapping(reviewer, events.id, await saveDraft(author, events.id,
+      TRACKING_EVENTS.replace('  customer_id: user_id\n', '  customer_id: { expr: user_id, customer_source: CRM }\n')));
+    await drain();
+    // u1、u2、u9 是埋点的用户，在 CRM 里找不到
+    expect((await lastMerge(acme)).stat('event.customer_id → customer.customer_id')).toMatchObject({ withValue: 5, orphans: 5, samples: ['u1', 'u2', 'u9'] });
+
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      await session.con.run('ALTER TABLE silver.event DROP COLUMN _customer_source');
+      const ends = { from: { entity: 'event', field: 'customer_id' }, ref: { entity: 'customer', field: 'customer_id' } };
+      expect(await relationStats(session.con, [{ ...ends, sensitive: false }], m => m)).toEqual([{ ...ends, withValue: 5, orphans: 0, samples: [] }]);
+    } finally {
+      session.close();
+    }
   });
 });

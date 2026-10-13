@@ -5,6 +5,7 @@
 import { Graph, layout } from '@dagrejs/dagre';
 import { CANONICAL_ENTITIES, entityOf } from './canonical-model';
 import type { LineageEdge } from './lineage';
+import { customerSourceColumn } from './customer-source';
 
 /**
  * 身份打通的现状：匹配规则（读不出来时为 null）与最近一次打通的摘要（还没打通过时为 null），只有计数，不带消费者标识；
@@ -74,7 +75,7 @@ export function relationGraph(input: { edges: LineageEdge[]; connected: string[]
     const target = tableOf(e.to.table);
     if (!nodeIds.has(source) || !nodeIds.has(target)) continue;
     const label = e.kind === 'ref' ? `${e.from.field} → ${target}.${e.to.field}`
-      : e.kind === 'identity' ? '经 _identities 按 (_source, customer_id) 关联'
+      : e.kind === 'identity' ? '经 _identities 按 (_customer_source, customer_id) 关联'
       : 'device_id（不带 _source，取最近一次登录）';
     const toEntity = e.kind !== 'device' && target !== IDENTITIES && target !== DEVICE_OWNER;
     edges.push({
@@ -135,12 +136,15 @@ export function sampleSql(nodeId: string, graph: RelationGraph): string | null {
       'LIMIT 100;',
     ].join('\n');
   }
-  if (graph.edges.some(e => e.kind === 'identity' && e.source === nodeId && e.target === 'customer')) {
+  const toCustomer = graph.edges.find(e => e.kind === 'identity' && e.source === nodeId && e.target === 'customer');
+  if (toCustomer) {
+    // 引用列旁的数据源列：跨源引用时是目标数据源（ADR-0030）
+    const field = toCustomer.fromField ?? 'customer_id';
     return [
       '-- 按统一消费者汇总',
       'SELECT i.consumer_id, count(*) AS records',
       `FROM ${lake(nodeId)} t`,
-      `JOIN ${identitiesTable} i ON i._source = t._source AND i.customer_id = t.customer_id`,
+      `JOIN ${identitiesTable} i ON i._source = t."${customerSourceColumn(field)}" AND i.customer_id = t."${field}"`,
       'GROUP BY i.consumer_id',
       'ORDER BY records DESC',
       'LIMIT 100;',

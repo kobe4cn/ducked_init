@@ -259,7 +259,7 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
     <AppShell email={email} nav={nav}>
       <PageHeader
         title="数据地图"
-        description="已接入的标准层表之间怎么关联。指向消费者的关系经 _identities 按 (_source, customer_id) 对应到统一消费者；匿名事件的设备经 _device_owner 按最近一次登录归到消费者。点一张表看示例 SQL。"
+        description="已接入的标准层表之间怎么关联。指向消费者的关系经 _identities 按 (_customer_source, customer_id) 对应到统一消费者；匿名事件的设备经 _device_owner 按最近一次登录归到消费者。点一张表看示例 SQL。"
       />
 
       <PillTabs

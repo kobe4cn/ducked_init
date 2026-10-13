@@ -1,5 +1,5 @@
 // test/pipeline/key-check.test.ts —— 跨映射主键冲突体检的流水线接缝：checkKeysNow 入队 silver.keycheck → 调度器派发、只读挂载数据湖 → getKeyCheckStatus 读出报告；
-// 标准层与合并日志不变（ADR-0024「冲突体检」）
+// 标准层与合并日志不变（ADR-0024「冲突体检」）。主键含指向 customer 的字段时按 _customer_source 比较（跨源引用，ADR-0030）
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { checkKeysNow, getKeyCheckStatus, KeyCheckError } from '../../app/.server/key-check';
@@ -116,5 +116,19 @@ describe('主键冲突体检', () => {
     expect(await silver(acme, 'touch', 'touch_id, _mapping')).toEqual(before.touch);
     expect(await silver(acme, 'order', 'order_id')).toEqual(before.order);
     expect(await mergeLogRows(acme)).toBe(before.merges);
+  });
+
+  it('主键含 customer_id 的实体按 _customer_source 比较：两个数据源都指向电商库的同一批消费者时报冲突', async () => {
+    const { author, reviewer, id, other } = await syncedSources();
+    await publish(author, reviewer, id, 'model: 1\nentity: customer\ntable: customers\nfields:\n  customer_id: string(customer_id)\n');
+    const local = await publish(author, reviewer, id, CONSENT);
+    const cross = await publish(author, reviewer, other,
+      CONSENT.replace('  customer_id: string(customer_id)\n', '  customer_id: { expr: string(customer_id), customer_source: 电商库 }\n'));
+    await checkKeysNow(author);
+    await drain();
+
+    const [a, b] = [local, cross].sort();
+    const consent = (await getKeyCheckStatus(author)).entities.find(e => e.entity === 'consent');
+    expect(consent).toMatchObject({ bySource: true, pairs: [{ a, b, overlap: 3, suggestion: 'duplicate' }] });
   });
 });

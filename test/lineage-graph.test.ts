@@ -25,8 +25,8 @@ describe('关系图', () => {
     ]);
     const edge = (source: string, target: string) => g.edges.filter(e => e.source === source && e.target === target).map(e => ({ kind: e.kind, label: e.label }));
     expect(edge('order_item', 'order')).toEqual([{ kind: 'ref', label: 'order_id → order.order_id' }]);
-    expect(edge('order', 'customer')).toEqual([{ kind: 'identity', label: '经 _identities 按 (_source, customer_id) 关联' }]);
-    expect(edge('event', 'customer')).toEqual([{ kind: 'identity', label: '经 _identities 按 (_source, customer_id) 关联' }]);
+    expect(edge('order', 'customer')).toEqual([{ kind: 'identity', label: '经 _identities 按 (_customer_source, customer_id) 关联' }]);
+    expect(edge('event', 'customer')).toEqual([{ kind: 'identity', label: '经 _identities 按 (_customer_source, customer_id) 关联' }]);
     expect(edge('customer', '_identities')).toEqual([{ kind: 'identity', label: 'customer_id → consumer_id' }]);
     expect(edge('event', '_device_owner')).toEqual([{ kind: 'device', label: 'device_id（不带 _source，取最近一次登录）' }]);
     // 只有指向标准实体的 ref / identity 边带起点字段，用来对上合并后的孤儿统计
@@ -101,11 +101,11 @@ describe('关系图', () => {
 describe('示例 SQL', () => {
   const g = graphOf(['customer', 'order', 'order_item', 'event', 'custom_store']);
 
-  it('按统一消费者汇总订单：join lake.silver."_identities"，不带连接方式与凭据', () => {
+  it('按统一消费者汇总订单：join lake.silver."_identities"，按 customer_id 旁的数据源列 _customer_source 关联（跨源引用），不带连接方式与凭据', () => {
     const sql = sampleSql('order', g)!;
     expect(sql).toContain('lake.silver."order"');
     expect(sql).toContain('lake.silver."_identities"');
-    expect(sql).toContain('i._source = t._source AND i.customer_id = t.customer_id');
+    expect(sql).toContain('i._source = t."_customer_source" AND i.customer_id = t."customer_id"');
     expect(sql).toContain('consumer_id');
     expect(sql).toContain('LIMIT 100');
     for (const id of g.nodes.map(n => n.id)) {
@@ -117,6 +117,7 @@ describe('示例 SQL', () => {
 
   it('customer、_identities、_device_owner 与其余表各有模板，不认识的节点返回 null', () => {
     expect(sampleSql('customer', g)).toContain('i.consumer_id, c.*');
+    expect(sampleSql('customer', g)).toContain('i._source = c._source');
     expect(sampleSql('_identities', g)).toMatch(/GROUP BY consumer_id/);
     expect(sampleSql('_device_owner', g)).toContain('lake.silver."event" e LEFT JOIN lake.silver."_device_owner" d ON d.device_id = e.device_id');
     expect(sampleSql('order_item', g)).toBe('SELECT *\nFROM lake.silver."order_item"\nLIMIT 100;');

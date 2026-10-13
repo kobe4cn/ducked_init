@@ -107,7 +107,7 @@ export const joinOn = (keys: string[], a: string, b: string) => keys.map(k => `$
 const rowHash = (columns: string[], alias: string) =>
   `hash(concat_ws(chr(31), ${[...columns].sort().map(c => `${lit(`${c}=`)} || ${alias}.${ident(c)}::VARCHAR`).join(', ')}))`;
 
-const columnExists = async (con: DuckDBConnection, entity: string, column: string) => (await rows(con, `
+export const columnExists = async (con: DuckDBConnection, entity: string, column: string) => (await rows(con, `
   SELECT 1 FROM information_schema.columns WHERE table_catalog = 'lake' AND table_schema = ${lit(SILVER)} AND table_name = ${lit(entity)}
     AND column_name = ${lit(column)}`)).length > 0;
 
@@ -538,7 +538,7 @@ async function assertUniqueAcrossMappings(con: DuckDBConnection, silver: string,
 
 /**
  * 统计每条关系的孤儿：起点有值、在终点主键里找不到的行（ADR-0019，左连接）。键空间两端一致，直接比较（ADR-0024）；
- * 终点是 customer 时只在同一个数据源内找（customer 不做跨映射唯一）。一条关系出错只记在它自己身上（只留报错摘要，不带取值）
+ * 终点是 customer 时只在起点的数据源列（customerSourceColumn，跨源引用时是目标数据源）指向的数据源内找（customer 不做跨映射唯一）。一条关系出错只记在它自己身上（只留报错摘要，不带取值）
  */
 export async function relationStats(con: DuckDBConnection, relations: RelationParam[], redact: (message: string) => string): Promise<RelationStat[]> {
   const present = async ({ entity, field }: EntityRelation['from']) => await tableExists(con, SILVER, entity) && await columnExists(con, entity, field);
@@ -550,10 +550,12 @@ export async function relationStats(con: DuckDBConnection, relations: RelationPa
         continue;
       }
       const bySource = ref.entity === 'customer';
+      // 起点的数据源列（ADR-0030）：老湖里还没有这一列时退回行自己的 _source
+      const fromSource = bySource && await columnExists(con, from.entity, customerSourceColumn(from.field)) ? customerSourceColumn(from.field) : '_source';
       const fromValue = `f.${ident(from.field)}`;
       // f：起点表；t：终点去重后的主键 k
       const joined = `${silverTable(from.entity)} f LEFT JOIN (SELECT DISTINCT ${ident(ref.field)} AS k${bySource ? ', _source' : ''} FROM ${silverTable(ref.entity)}) t
-        ON ${fromValue} = t.k${bySource ? ' AND f._source = t._source' : ''}`;
+        ON ${fromValue} = t.k${bySource ? ` AND f.${ident(fromSource)} = t._source` : ''}`;
       const [counts] = await rows<{ with_value: string; orphans: string }>(con, `
         SELECT count(*) FILTER (WHERE ${fromValue} IS NOT NULL) AS with_value, count(*) FILTER (WHERE ${fromValue} IS NOT NULL AND t.k IS NULL) AS orphans FROM ${joined}`);
       const orphans = Number(counts.orphans);

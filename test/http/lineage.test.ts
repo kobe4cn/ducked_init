@@ -62,7 +62,7 @@ describe('数据地图', () => {
     for (const node of ['customer', 'order', 'event', '_identities', '_device_owner']) expect(html).toContain(`data-node="${node}"`);
     expect(html).toContain('data-edge="identity"');
     expect(html).toContain('data-edge="device"');
-    expect(html).toContain('经 _identities 按 (_source, customer_id) 关联');
+    expect(html).toContain('经 _identities 按 (_customer_source, customer_id) 关联');
     expect(html).toContain('device_id（不带 _source，取最近一次登录）');
     expect(html).not.toContain('data-sql');
     // 源表名（customers、members、users、events、orders）不下发
@@ -70,7 +70,7 @@ describe('数据地图', () => {
 
     const order = decode(await (await viewer.get('/lineage?node=order')).text());
     expect(order).toContain('data-sql');
-    expect(order).toContain('lake.silver."_identities" i ON i._source = t._source AND i.customer_id = t.customer_id');
+    expect(order).toContain('lake.silver."_identities" i ON i._source = t."_customer_source" AND i.customer_id = t."customer_id"');
     for (const banned of ['ATTACH', 'password', 's3://']) expect(order).not.toContain(banned);
 
     // 不认识的节点不出 SQL 面板
