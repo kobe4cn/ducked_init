@@ -393,24 +393,85 @@ function referenceColumns(plan: Pick<MergePlan, 'columns'>, relations: EntityRel
   return plan.columns.flatMap(c => relations.filter(r => r.from.field === c.name).map(r => ({ column: c.name, keySpace: c.keySpace, target: r.ref.entity })));
 }
 
+const keySpaceText = (spaces: string[]) => spaces.map(s => `key_space: ${s}`).join(' 或 ');
+
+/** 跨源引用列与目标数据源 customer 的键空间 spaces 对不上：spaces 非空时没写其中之一，为空时写了键空间（标准层的主键不带前缀） */
+const crossSourceMismatch = (c: MergePlan['columns'][number], spaces: string[]) => (spaces.length ? !(c.keySpace && spaces.includes(c.keySpace)) : !!c.keySpace);
+
+/** 某数据源里 entity 各已发布映射声明的键空间（去重） */
+const keySpacesIn = (plans: Pick<MergePlan, 'entity' | 'keySpace'>[], entity: string) =>
+  [...new Set(plans.flatMap(p => (p.entity === entity && p.keySpace ? [p.keySpace] : [])))];
+
+async function sourceNames(db: Tx | ReturnType<typeof getDb>, tenantId: string) {
+  return new Map((await db.select({ id: sources.id, name: sources.name }).from(sources).where(eq(sources.tenantId, tenantId))).map(s => [s.id, s.name]));
+}
+
 /**
  * 引用字段的键空间（ADR-0024）：本映射里指向别的实体的字段（内置 ref 与已登记关系的起点），要写上同一数据源里目标实体已发布映射
- * （本映射不算）声明的键空间之一；自引用时用本映射自己声明的键空间。同源目标实体都没声明键空间时不检查（目标映射可能还没发布）
+ * （本映射不算）声明的键空间之一；自引用时用本映射自己声明的键空间。同源目标实体都没声明键空间时不检查（目标映射可能还没发布）。
+ * 写了 customer_source 的跨源引用（ADR-0030）改对照目标数据源里已发布 customer 映射声明的键空间（目标源一定有已发布的 customer 映射，都没声明时引用不能写键空间），报错里给出目标数据源
  */
 async function assertKeySpaces(tx: Tx, tenantId: string, mapping: typeof mappings.$inferSelect, plan: MergePlan) {
   const relations = relationsFrom(plan.entity, await publishedCustomEntities(tx, tenantId));
   if (!relations.length) return;
-  const sameSource = (await publishedPlans(tx, tenantId)).filter(p => p.sourceId === mapping.sourceId && p.mapping !== mapping.id);
-  const spacesOf = (entity: string) => (entity === plan.entity
-    ? (plan.keySpace ? [plan.keySpace] : [])
-    : [...new Set(sameSource.flatMap(p => (p.entity === entity && p.keySpace ? [p.keySpace] : [])))]);
+  const others = (await publishedPlans(tx, tenantId)).filter(p => p.mapping !== mapping.id);
+  const sameSource = others.filter(p => p.sourceId === mapping.sourceId);
+  const spacesOf = (entity: string) => (entity === plan.entity ? (plan.keySpace ? [plan.keySpace] : []) : keySpacesIn(sameSource, entity));
   const references = referenceColumns(plan, relations);
   const wrong = plan.columns.flatMap(c => {
+    if (c.customerSource) return [];
     const own = references.filter(r => r.column === c.name);
     const spaces = [...new Set(own.flatMap(r => spacesOf(r.target)))];
-    return spaces.length && !(c.keySpace && spaces.includes(c.keySpace)) ? [`${c.name} 应写 ${spaces.map(s => `key_space: ${s}`).join(' 或 ')}`] : [];
+    return spaces.length && !(c.keySpace && spaces.includes(c.keySpace)) ? [`${c.name} 应写 ${keySpaceText(spaces)}`] : [];
   });
   if (wrong.length) throw new MappingError(`引用字段要写上目标实体在同一数据源里声明的键空间：${wrong.join('；')}`);
+  const crossSource = plan.columns.filter(c => c.customerSource);
+  if (!crossSource.length) return;
+  const names = await sourceNames(tx, tenantId);
+  const wrongCross = crossSource.flatMap(c => {
+    const spaces = keySpacesIn(others.filter(p => p.sourceId === c.customerSource), 'customer');
+    if (!crossSourceMismatch(c, spaces)) return [];
+    return [`${c.name} ${spaces.length ? `应写 ${keySpaceText(spaces)}` : '不应写键空间，目标数据源没声明'}（数据源 ${names.get(c.customerSource!)}）`];
+  });
+  if (wrongCross.length) throw new MappingError(`跨源引用字段要写上目标数据源里消费者（customer）映射声明的键空间：${wrongCross.join('；')}`);
+}
+
+/** 各映射里 customer_source 指向 sourceId 的跨源引用列 */
+function crossSourceColumns(plans: MergeMappingParam[], sourceId: string) {
+  return plans.flatMap(p => {
+    const columns = p.columns.filter(c => c.customerSource === sourceId);
+    return columns.length ? [{ plan: p, columns }] : [];
+  });
+}
+
+/**
+ * 跨源引用了 sourceId 的已发布映射（ADR-0030）：最新已发布版本里有字段的 customer_source 指向这个数据源的映射，带上映射名（表 → 实体）、
+ * 所在数据源与这些字段。依赖查询，将来删除数据源时据此阻止删除
+ */
+export async function crossSourceReferrers(db: Tx | ReturnType<typeof getDb>, tenantId: string, sourceId: string) {
+  return crossSourceColumns(await publishedPlans(db, tenantId), sourceId)
+    .map(({ plan, columns }) => ({ mappingId: plan.mapping, mapping: mappingName(plan), sourceId: plan.sourceId, columns: columns.map(c => c.name) }));
+}
+
+/**
+ * 重发 customer 映射改了键空间时（ADR-0030）：本数据源发布后的 customer 键空间（本映射的新计划加上同源别的已发布 customer 映射）
+ * 与别的数据源跨源引用本源的字段写的键空间对不上（没有键空间时是写了键空间的）就拒绝发布，列出这些映射与字段。键空间没变时不查
+ */
+async function assertCrossSourceReferrers(tx: Tx, tenantId: string, mapping: typeof mappings.$inferSelect, plan: MergePlan) {
+  if (plan.entity !== 'customer') return;
+  const all = await publishedPlans(tx, tenantId);
+  if (all.find(p => p.mapping === mapping.id)?.keySpace === plan.keySpace) return;
+  const spaces = keySpacesIn([plan, ...all.filter(p => p.sourceId === mapping.sourceId && p.mapping !== mapping.id)], 'customer');
+  const broken = crossSourceColumns(all, mapping.sourceId).flatMap(({ plan: referrer, columns }) => {
+    const fields = columns.filter(c => crossSourceMismatch(c, spaces));
+    return fields.length ? [{ referrer, fields }] : [];
+  });
+  if (!broken.length) return;
+  const names = await sourceNames(tx, tenantId);
+  const listed = broken.map(({ referrer, fields }) =>
+    `${names.get(referrer.sourceId)} 的 ${mappingName(referrer)}（${fields.map(c => `${c.name} ${c.keySpace ? `写的是 key_space: ${c.keySpace}` : '没写键空间'}`).join('、')}）`);
+  throw new MappingError(`${names.get(mapping.sourceId)} 的消费者（customer）映射发布后${spaces.length ? `键空间为 ${keySpaceText(spaces)}` : '不再声明键空间'}，`
+    + `这些跨源引用会失效：${listed.join('；')}，先把它们改成一致再发布`);
 }
 
 /**
@@ -451,7 +512,7 @@ export async function publishMapping(actor: CurrentMember, mappingId: string, ve
 
 /**
  * 在调用方的事务里发布检查过的这份草稿（plan 是发布前对照数据源当前的字段校验出的），记审计并入队合并，返回合并任务（同 enqueueMerge）。
- * 调用方须已锁住租户行；这里锁映射行。等锁期间草稿被修改、发布或丢弃，或扩展字段类型、身份打通规则与已发布映射冲突、引用字段没写同源目标实体的键空间时抛出 MappingError。
+ * 调用方须已锁住租户行；这里锁映射行。等锁期间草稿被修改、发布或丢弃，或扩展字段类型、身份打通规则与已发布映射冲突、引用字段没写同源目标实体（跨源引用为目标数据源 customer）的键空间、改了 customer 键空间使别的数据源的跨源引用失效时抛出 MappingError。
  * 发布权限与双人发布由调用方检查（publishMapping，以及一键直通里登记与映射一起发布）
  */
 export async function publishMappingDraft(
@@ -467,6 +528,7 @@ export async function publishMappingDraft(
   await assertExtensionTypes(tx, actor.tenant.id, plan);
   await assertIdentityRules(tx, actor.tenant.id, mapping.id, plan);
   await assertKeySpaces(tx, actor.tenant.id, mapping, plan);
+  await assertCrossSourceReferrers(tx, actor.tenant.id, mapping, plan);
   await assertMetricFields(tx, actor.tenant.id, mapping.id, plan);
   await tx.update(mappingVersions)
     .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: sql`now()` })
