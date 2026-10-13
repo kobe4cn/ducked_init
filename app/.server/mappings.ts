@@ -16,7 +16,7 @@ import { publishedDependents } from './dsl-dependencies';
 import { dryRun } from './pipeline/dry-run-engine';
 import { consumerSensitive, identityRules, type IdentitySummary } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
-import type { MergeMappingParam, MergeRecord, RelationParam } from './pipeline/merge-engine';
+import type { MergeDrop, MergeMappingParam, MergeRecord, RelationParam } from './pipeline/merge-engine';
 import { draftCustomMapping, draftMapping, DraftError } from './pipeline/mapping-draft';
 import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
@@ -661,13 +661,18 @@ export async function requestDisable(actor: CurrentMember, mappingId: string) {
 
 /**
  * 确认停用（ADR-0031）：需要发布权限，确认人不能是提议人。停用后映射不再算作已发布（publishedPlans、同步后的合并与定时检查都跳过它），
- * 停用人记为提议人、确认人记在审计里，并清掉提议。被别的数据源跨源引用的 customer 映射不能停用（提议之后才有的引用也算）
+ * 停用人记为提议人、确认人记在审计里，并清掉提议。被别的数据源跨源引用的 customer 映射不能停用（提议之后才有的引用也算）。
+ * 同一事务里入队一次合并：撤下它写进标准层的行，同实体其余映射一起合并；已有合并在运行时报错，不停用
  */
 export async function confirmDisable(actor: CurrentMember, mappingId: string) {
   await disableStep(actor, mappingId, 'confirm', async (tx, mapping) => {
     await tx.update(mappings)
       .set({ disabledAt: sql`now()`, disabledByEmail: mapping.disableRequestedByEmail, disableRequestedByEmail: null, disableRequestedAt: null })
       .where(eq(mappings.id, mappingId));
+    // 撤下它写进标准层的行，同实体其余映射一起合并（失败的合并不自动重试，原先因它失败的映射要在这次补上，ADR-0015）
+    const rest = (await publishedPlans(tx, actor.tenant.id)).filter(p => p.entity === mapping.entity).map(p => p.mapping);
+    const task = await enqueueMerge(tx, actor.tenant.id, rest, { drop: [{ mapping: mappingId, entity: mapping.entity }] });
+    if (!task) throw new MappingError('已有一次合并在运行，等它结束后再确认停用');
     return { requestedBy: mapping.disableRequestedByEmail, confirmedBy: actor.email };
   });
 }
@@ -793,12 +798,14 @@ export const lockTenant = (tx: Tx, tenantId: string) => tx.select({ id: tenants.
  * 给定的映射都没有已发布版本时也不入队。参数里另带身份打通的匹配规则、属性取舍的名次（映射 ID → 名次）与不进 _consumer 的敏感字段，由全部已发布的 customer 映射汇总（重算打通时整表重算，不只看这次的映射），
  * 与要统计孤儿的全部已发布关系（工作进程不读平台库），
  * 以及是否强制重算打通 identityForce（见 mustRecomputeIdentities；补进排队中的合并时，已为真的保留）。
- * opts.rebuild 时给这些映射带上强制重建标记；排队中的映射已带标记时，补进去的同一映射保留它
+ * opts.rebuild 时给这些映射带上强制重建标记；排队中的映射已带标记时，补进去的同一映射保留它。
+ * opts.drop 是要撤下的停用映射（ADR-0031）：带上它时没有已发布的映射也入队；并进排队中的合并时，从它的映射里剔除这些映射、drop 并在一起
  */
-export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string[], opts?: { rebuild?: boolean }) {
+export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string[], opts?: { rebuild?: boolean; drop?: MergeDrop[] }) {
   await lockTenant(tx, tenantId);
   const plans = (await publishedPlans(tx, tenantId, mappingIds)).map(p => (opts?.rebuild ? { ...p, rebuild: true } : p));
-  if (!plans.length) return null;
+  const incoming = opts?.drop ?? [];
+  if (!plans.length && !incoming.length) return null;
   const pending = await pendingMerge(tx, tenantId);
   const all = mappingIds ? await publishedPlans(tx, tenantId) : plans;
   const identity = identityRules(all, mappingName);
@@ -807,14 +814,20 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
   const relations = relationParams(await publishedCustomEntities(tx, tenantId), all);
   if (pending?.status === 'running') return null;
   const force = await mustRecomputeIdentities(tx, tenantId, identity, survivorship);
-  if (!pending) return insertTask(tx, tenantId, 'silver.merge', { mappings: plans, identity, survivorship, consumerSensitive: sensitive, relations, identityForce: force });
+  if (!pending) {
+    return insertTask(tx, tenantId, 'silver.merge', {
+      mappings: plans, ...(incoming.length > 0 && { drop: incoming }), identity, survivorship, consumerSensitive: sensitive, relations, identityForce: force,
+    });
+  }
+  const queuedDrop = (pending.params.drop ?? []) as MergeDrop[];
+  const drop = [...queuedDrop, ...incoming.filter(d => !queuedDrop.some(q => q.mapping === d.mapping))];
   const queued = (pending.params.mappings ?? []) as MergeMappingParam[];
   const merged = [
-    ...queued.filter(q => !plans.some(p => p.mapping === q.mapping)),
+    ...queued.filter(q => !plans.some(p => p.mapping === q.mapping) && !drop.some(d => d.mapping === q.mapping)),
     ...plans.map(p => (queued.some(q => q.mapping === p.mapping && q.rebuild) ? { ...p, rebuild: true } : p)),
   ].sort((a, b) => a.mapping.localeCompare(b.mapping));
   // 领取合并不锁租户行：只在它仍在排队时改参数
-  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, identity, survivorship, consumerSensitive: sensitive, relations, identityForce: pending.params.identityForce === true || force } })
+  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, ...(drop.length > 0 && { drop }), identity, survivorship, consumerSensitive: sensitive, relations, identityForce: pending.params.identityForce === true || force } })
     .where(and(eq(tasks.id, pending.id), eq(tasks.status, 'queued'))).returning();
   return task ?? null;
 }

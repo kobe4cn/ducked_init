@@ -1,6 +1,6 @@
 // 映射与标准层合并的流水线接缝：同步到原始层 → 编写映射草稿 → 另一位成员发布 → 调度器派发合并 → 标准层；
 // 之后源端的新增、更新与删除随同步后的合并进入标准层，去重键与取最新规则让源端的重复行只计一次；漂移检查报告缺列时，重建合并补上标准层缺的列；
-// 映射停用要两人确认，停用后同步后的合并与定时检查都不再算它（ADR-0031）
+// 映射停用要两人确认，停用后同步后的合并与定时检查都不再算它，确认停用时入队的合并撤下它写进标准层的行（ADR-0031）
 import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
@@ -21,7 +21,8 @@ import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
+import { memberOf, mergeUnchecked, newTenant, publish, selectAllTables, silver } from './fixtures';
+import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -1145,5 +1146,106 @@ describe('停用映射', () => {
     const [merge] = (await listTasks(acme)).filter(t => t.kind === 'silver.merge');
     expect(mergedMappings(merge)).toEqual([orders]);
     expect(await enqueueDueMerges()).toEqual([]);
+  });
+
+  /** 本租户最近入队的一次合并（listTasks 按入队时间倒序） */
+  const lastMerge = async (acme: string) => (await listTasks(acme)).find(t => t.kind === 'silver.merge')!;
+
+  it('order_id 重叠、后发布的映射合并失败；停用它后自动入队的合并撤下它的行、带上其余订单映射，合并成功，标准层与只发布前一个时一致', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    await publish(author, reviewer, id, CUSTOMERS);
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const before = await silver(acme, 'order', 'order_id::INT');
+    const clash = await publish(author, reviewer, id, 'model: 1\nentity: order\ntable: customers\nfields:\n  order_id: string(customer_id)\n');
+    expect((await getMapping(author, clash)).merge.history[0]).toHaveProperty('error');
+    // 模拟独占检查上线前已写进标准层的重叠
+    expect((await mergeUnchecked(acme, [clash])).status).toBe('succeeded');
+    expect((await silver(acme, 'order', 'order_id::INT')).filter(o => o._mapping === clash)).toHaveLength(40);
+
+    await requestDisable(author, clash);
+    await confirmDisable(reviewer, clash);
+    const queued = await lastMerge(acme);
+    expect(mergedMappings(queued)).toEqual([orders]);
+    expect(queued.params.drop).toEqual([{ mapping: clash, entity: 'order' }]);
+    await drain();
+    const merge = (await listTasks(acme)).find(t => t.id === queued.id)!;
+    expect(merge.status).toBe('succeeded');
+    expect(merge.result).toMatchObject({ dropped: [{ mapping: clash, entity: 'order', deleted: 40 }] });
+    expect(await silver(acme, 'order', 'order_id::INT')).toEqual(before);
+  });
+
+  it('order_id 重叠时停用先发布的映射：自动入队的合并带上原先失败的映射，它补进标准层', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const clash = await publish(author, reviewer, id, 'model: 1\nentity: order\ntable: customers\nfields:\n  order_id: string(customer_id)\n');
+    expect((await getMapping(author, clash)).merge.history[0]).toHaveProperty('error');
+
+    await requestDisable(author, orders);
+    await confirmDisable(reviewer, orders);
+    expect(mergedMappings(await lastMerge(acme))).toEqual([clash]);
+    await drain();
+    expect((await lastMerge(acme)).status).toBe('succeeded');
+    const rows = await silver(acme, 'order', 'order_id::INT');
+    expect(new Set(rows.map(o => o._mapping))).toEqual(new Set([clash]));
+    expect(rows).toHaveLength(40);
+  });
+
+  it('停用 customer 映射后合并重算身份打通，统一消费者里不再有它的源记录', async () => {
+    const { acme, author, reviewer, sources, mappings: { loyalty } } = await publishedIdentitySources();
+    const identitySources = async () => {
+      const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+      try {
+        return ((await session.con.runAndReadAll('SELECT DISTINCT _source FROM silver._identities ORDER BY _source')).getRowObjectsJson() as { _source: string }[])
+          .map(r => r._source);
+      } finally {
+        session.close();
+      }
+    };
+    expect(await identitySources()).toContain(sources.loyalty);
+
+    await requestDisable(author, loyalty);
+    await confirmDisable(reviewer, loyalty);
+    const queued = await lastMerge(acme);
+    // 停掉的是这个数据源唯一的 customer 映射：其余 customer 映射照样带上
+    expect(mergedMappings(queued)).not.toContain(loyalty);
+    // 只靠 drop 触发重算：去掉入队时（匹配规则或名次变了）可能置上的强制标记
+    await getDb().update(tasks).set({ params: { ...queued.params, identityForce: false } }).where(eq(tasks.id, queued.id));
+    await drain();
+    const merge = (await listTasks(acme)).find(t => t.id === queued.id)!;
+    expect(merge.status).toBe('succeeded');
+    expect((merge.result as { identities: object }).identities).not.toHaveProperty('skipped');
+    expect(await identitySources()).toEqual([sources.crm, sources.tracking].sort());
+    expect((await silver(acme, 'customer', '_source, customer_id')).some(c => c._mapping === loyalty)).toBe(false);
+  });
+
+  it('停用时排队中的合并带着这个映射：从它的映射里剔除、并入 drop，那次合并不再写入它的行', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const orderLog = await publish(author, reviewer, id, ORDER_LOG_MAPPING);
+    expect((await silver(acme, 'order', 'order_id')).some(o => o._mapping === orderLog)).toBe(true);
+    const pending = await getDb().transaction(tx => enqueueMerge(tx, acme, undefined, { rebuild: true }));
+    expect(mergedMappings(pending!)).toEqual([orders, orderLog].sort());
+
+    await requestDisable(author, orderLog);
+    await confirmDisable(reviewer, orderLog);
+    const [queued] = await getDb().select().from(tasks).where(eq(tasks.id, pending!.id));
+    expect(queued.status).toBe('queued');
+    expect(mergedMappings(queued)).toEqual([orders]);
+    expect(queued.params.drop).toEqual([{ mapping: orderLog, entity: 'order' }]);
+    await drain();
+    expect((await listTasks(acme)).find(t => t.id === pending!.id)!.status).toBe('succeeded');
+    const rows = await silver(acme, 'order', 'order_id');
+    expect(new Set(rows.map(o => o._mapping))).toEqual(new Set([orders]));
+    expect(rows).toHaveLength(100);
+  });
+
+  it('已有合并在运行时不能确认停用', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const pending = await getDb().transaction(tx => enqueueMerge(tx, acme));
+    await getDb().update(tasks).set({ status: 'running' }).where(eq(tasks.id, pending!.id));
+    await requestDisable(author, orders);
+    await expect(confirmDisable(reviewer, orders)).rejects.toThrow('已有一次合并在运行');
+    expect(await getMapping(author, orders)).toMatchObject({ disabledAt: null });
   });
 });

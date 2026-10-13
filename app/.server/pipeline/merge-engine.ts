@@ -30,6 +30,15 @@ export interface MergeMappingParam extends MergePlan {
   mapping: string; version: number; sourceId: string; sourceView?: SourceViewParam; rebuild?: boolean; uniqueKey?: string[]; uniqueBySource?: boolean;
 }
 
+/**
+ * 合并任务里要撤下的停用映射（ADR-0031）：合并前删掉它写进标准层实体 entity 的行、它的当前记录与合并日志里的水位
+ * （之后万一再合并它就走重建）
+ */
+export interface MergeDrop { mapping: string; entity: string }
+
+/** 撤下的停用映射与从标准层删掉的行数 */
+export type DroppedMapping = MergeDrop & { deleted: number };
+
 /** 合并或空跑时源视图的已发布版本 */
 export interface SourceViewParam { version: number; sql: string; tables: string[] }
 
@@ -571,10 +580,29 @@ export async function relationStats(con: DuckDBConnection, relations: RelationPa
 }
 
 /**
- * 这次合并是否改到了身份打通读的表：customer、event 或 consent 的映射有插入、更新、删除或重建过。跳过与出错的映射不算（出错的已回滚）
+ * 这次合并是否改到了身份打通读的表：customer、event 或 consent 的映射有插入、更新、删除或重建过，或撤下了这些实体的停用映射。
+ * 跳过与出错的映射不算（出错的已回滚）
  */
-const changedIdentityInputs = (records: MergeRecord[]) => records.some(r =>
+const changedIdentityInputs = (records: MergeRecord[], drop: MergeDrop[]) => drop.some(d => IDENTITY_INPUTS.includes(d.entity)) || records.some(r =>
   IDENTITY_INPUTS.includes(r.entity) && 'mode' in r && (r.mode === 'rebuild' || r.inserted + r.updated + r.deleted > 0));
+
+/**
+ * 撤下停用的映射（ADR-0031）：一个事务里删掉它写进标准层的行（表不在时没有可删的）、它的当前记录与合并日志里的水位，返回删掉的行数
+ */
+async function dropMapping(con: DuckDBConnection, { mapping, entity }: MergeDrop): Promise<DroppedMapping> {
+  return inTransaction(con, async () => {
+    let deleted = 0;
+    if (await tableExists(con, SILVER, entity)) {
+      const rowsOfMapping = `${silverTable(entity)} WHERE _mapping = ${lit(mapping)}`;
+      deleted = await count(con, rowsOfMapping);
+      await con.run(`DELETE FROM ${rowsOfMapping}`);
+    }
+    await con.run(`DROP TABLE IF EXISTS ${recordsOf(mapping)}`);
+    await con.run(`DELETE FROM ${MERGES} WHERE mapping_id = ${lit(mapping)}`);
+    console.log(`${new Date().toISOString()} [合并] 撤下停用的映射 ${mapping}（${entity}）：删掉 ${deleted} 行`);
+    return { mapping, entity, deleted };
+  });
+}
 
 /** 提交冲突（不同实体的事务同时提交，DuckLake 报错含 conflict，ADR-0015）时回滚后整个映射再试的次数 */
 const CONFLICT_RETRIES = 2;
@@ -610,16 +638,24 @@ async function mergeOne(
  * （一次合并只带受影响的映射，增量会漏）；打通结果表不在或 forceIdentities（入队时发现匹配规则变了或上次打通失败）时同样重算，
  * 否则沿用上次的结果，identities 记成跳过。失败同样只记在 identities 里。rules 是租户全部 customer 映射汇总出的匹配规则（入队合并时算好，不只是这次带的映射）；
  * 打通之前统计 relations（租户全部已发布关系，同样入队时算好）的孤儿，记在 relations 里（耗时记在 relationsMs），出错不算合并失败；salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐；
- * priority 是属性取舍的名次（映射 ID → 名次，同样入队时由全部 customer 映射汇总，ADR-0027）
+ * priority 是属性取舍的名次（映射 ID → 名次，同样入队时由全部 customer 映射汇总，ADR-0027）。
+ * drop 是要撤下的停用映射（ADR-0031）：各实体的映射开始合并之前先逐个撤下（不论这次有没有带该实体的映射），记在 dropped 里；
+ * 撤下了 customer、event 或 consent 的映射时同样重算身份打通
  */
 export async function mergeToSilver(
   session: TenantLakeSession, plans: MergeMappingParam[], salt: string, redact: (message: string) => string, rules: readonly string[] = DEFAULT_RULES,
   relations: RelationParam[] = [], forceIdentities = false, sensitive: readonly string[] = [], priority: Record<string, number> = {},
-): Promise<{ mappings: MergeRecord[]; relations?: RelationStat[]; relationsMs?: number; identities?: IdentityRecord }> {
+  drop: MergeDrop[] = [],
+): Promise<{
+  mappings: MergeRecord[]; dropped?: DroppedMapping[]; relations?: RelationStat[]; relationsMs?: number; identities?: IdentityRecord;
+}> {
   const { con } = session;
   const now = new Date();
   // 老湖补 _customer_source 并回填（lake:ensure 之前的数据湖），之后各映射与身份打通都按它解析
   await ensureCustomerSourceColumns(con);
+  // 并行合并之前串行撤下，不与各实体的事务冲突
+  const dropped: DroppedMapping[] = [];
+  for (const d of drop) dropped.push(await dropMapping(con, d));
   // 每个实体一条队列，组内按 plans 的顺序串行（同一实体的映射有跨映射唯一检查，ADR-0024），组间各用一个连接并发；结果按 plans 的顺序回填
   const queues = new Map<string, number[]>();
   plans.forEach((plan, i) => queues.set(plan.entity, [...(queues.get(plan.entity) ?? []), i]));
@@ -636,13 +672,13 @@ export async function mergeToSilver(
   if (failed) throw failed.reason;
   const relationsFrom = Date.now();
   const orphans = relations.length > 0 ? await relationStats(con, relations, redact) : undefined;
-  const merged = { mappings: records, ...(orphans && { relations: orphans, relationsMs: Date.now() - relationsFrom }) };
+  const merged = { mappings: records, ...(dropped.length > 0 && { dropped }), ...(orphans && { relations: orphans, relationsMs: Date.now() - relationsFrom }) };
   if (!await tableExists(con, SILVER, 'customer')) return merged;
   const resultsExist = async () => {
     for (const t of [IDENTITIES, DEVICE_OWNER, CONSUMER, CONSUMER_CONSENT, CONSUMER_IDS]) if (!await tableExists(con, SILVER, t.split('.')[1])) return false;
     return true;
   };
-  if (!forceIdentities && !changedIdentityInputs(records) && await resultsExist()) {
+  if (!forceIdentities && !changedIdentityInputs(records, drop) && await resultsExist()) {
     return { ...merged, identities: { durationMs: 0, skipped: '本次合并没有改到 customer、event 与 consent，沿用上次的身份打通结果' } };
   }
   const startedAt = Date.now();

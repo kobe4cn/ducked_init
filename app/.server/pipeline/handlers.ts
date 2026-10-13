@@ -7,7 +7,7 @@ import { checkKeyColumns, syncOptionsFromEnv, syncSourceTables, type SyncTablePa
 import { verifySourceLake, type VerifyTableParam } from './verify-engine';
 import { inspectLake, type InspectParams } from './inspect-engine';
 import { runKeyCheck, type KeyCheckParams } from './key-check-engine';
-import { lit, mergeToSilver, type MergeMappingParam, type RelationParam } from './merge-engine';
+import { lit, mergeToSilver, type MergeDrop, type MergeMappingParam, type RelationParam } from './merge-engine';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './identity-engine';
 import { TEMPLATES } from './templates';
@@ -75,10 +75,13 @@ function verifyTables(params: Params): VerifyTableParam[] {
   return tables as VerifyTableParam[];
 }
 
-/** 合并参数里的映射：已发布的版本及其合并计划（发布时已校验过，这里只核对形状） */
-function mergeMappings(params: Params): MergeMappingParam[] {
+/**
+ * 合并参数里的映射：已发布的版本及其合并计划（发布时已校验过，这里只核对形状）。
+ * 带了要撤下的停用映射时可以为空（停用的是实体最后一个映射）
+ */
+function mergeMappings(params: Params, drop: MergeDrop[]): MergeMappingParam[] {
   const mappings = params.mappings;
-  const valid = Array.isArray(mappings) && mappings.length > 0 && mappings.every(m =>
+  const valid = Array.isArray(mappings) && (mappings.length > 0 || drop.length > 0) && mappings.every(m =>
     typeof m?.mapping === 'string' && Number.isInteger(m.version) && typeof m.sourceId === 'string'
     && typeof m.entity === 'string' && typeof m.table === 'string'
     && Array.isArray(m.columns) && m.columns.length > 0 && Array.isArray(m.entityColumns) && isStrings(m.key)
@@ -86,6 +89,16 @@ function mergeMappings(params: Params): MergeMappingParam[] {
     && (m.uniqueKey === undefined || isStrings(m.uniqueKey)) && (m.uniqueBySource === undefined || typeof m.uniqueBySource === 'boolean'));
   if (!valid) throw new Error('参数 mappings 必须是非空的已发布映射列表');
   return mappings as MergeMappingParam[];
+}
+
+/** 合并参数里要撤下的停用映射（ADR-0031）；停用之前入队的合并没有这一项 */
+function mergeDrops(params: Params): MergeDrop[] {
+  const drop = params.drop;
+  if (drop === undefined) return [];
+  if (!Array.isArray(drop) || !drop.every(d => typeof d?.mapping === 'string' && typeof d.entity === 'string')) {
+    throw new Error('参数 drop 必须是 { mapping, entity } 列表');
+  }
+  return drop as MergeDrop[];
 }
 
 /** 合并参数里身份打通的匹配规则（入队时由全部 customer 映射汇总）；早先入队的合并没有这一项，用默认规则 */
@@ -269,12 +282,17 @@ export const HANDLERS = {
   // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务，之后按参数里的匹配规则重算身份打通
   // （没改到 customer / event、结果表都在且参数没要求强制时跳过打通，结果里写明原因）。
   // 有映射或打通失败时任务记为失败，结果里保留各映射的合并结果、打通摘要（组数、记录数与已归属设备数，不带哈希）与错误；
-  // 源表还没同步进原始层的映射跳过，不算失败。结果另带各关系的孤儿统计，统计出错不算失败
+  // 源表还没同步进原始层的映射跳过，不算失败。结果另带各关系的孤儿统计，统计出错不算失败。
+  // 参数带 drop 时先撤下这些停用的映射写进标准层的行（ADR-0031），结果里记在 dropped
   'silver.merge': {
     label: '合并到标准层',
     async run(_con, params, { session, piiSalt, redact }) {
       if (!piiSalt) throw new Error('缺少敏感信息盐');
-      const result = await mergeToSilver(session, mergeMappings(params), piiSalt, redact, identityMatch(params), mergeRelations(params), identityForce(params), mergeConsumerSensitive(params), mergeSurvivorship(params));
+      const drop = mergeDrops(params);
+      const result = await mergeToSilver(
+        session, mergeMappings(params, drop), piiSalt, redact, identityMatch(params), mergeRelations(params), identityForce(params),
+        mergeConsumerSensitive(params), mergeSurvivorship(params), drop,
+      );
       const failed = result.mappings.filter(m => 'error' in m);
       const problems = [
         ...(failed.length ? [`${failed.length} 个映射合并失败：${failed.map(m => `${m.entity} ← ${m.table}（${'error' in m ? m.error : ''}）`).join('；')}`] : []),
