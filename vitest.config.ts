@@ -32,6 +32,8 @@ if (process.env.TEST_S3_LAKE_URI) {
 
 // 测试不走 vite.config.ts（reactRouter 插件由 HTTP 接缝自己起的 vite 服务加载）
 export default defineConfig({
+  // 渲染组件的纯函数测试按 tsconfig 解析 ~/ 路径
+  resolve: { tsconfigPaths: true },
   test: {
     include: ['test/**/*.test.ts'],
     globalSetup: ['test/global-setup.ts'],
