@@ -1,4 +1,4 @@
-// app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、目标自定义实体待补登、最近一次合并），
+// app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、已停用或待确认停用、目标自定义实体待补登、最近一次合并），
 // 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿，检查有提示（notices）时留在本页列出提示与新映射的入口；可按所选的表与实体按规则生成草稿填进编辑框，不保存；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
 // 手动触发一次合并到标准层，以及主键冲突体检（silver.keycheck）：任何能看映射的成员都可以运行，报告按实体列出主键重叠的映射对
 import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, PencilLine, Play, Plus, ScanSearch, X } from 'lucide-react';
@@ -78,6 +78,8 @@ export async function loader({ request }: Route.LoaderArgs) {
       entityLabel: customPages[m.entity]?.label ?? entityLabel(m.entity),
       published: m.published,
       draft: m.draft,
+      /** 停用状态（ADR-0031）：已停用、有人提议待确认、没有 */
+      disable: m.disabledAt ? 'disabled' as const : m.disableRequestedByEmail ? 'requested' as const : null,
       lastMerge: m.lastMerge,
       /** 源表列差异：没用到的新列与源端已删除的列（列名）；没有时为 null */
       drift: m.drift ? { newColumns: m.drift.newColumns.map(c => c.name), missing: m.drift.missing } : null,
@@ -266,6 +268,8 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
                   ? <span className="inline-flex items-center gap-1 text-emerald-600"><CheckCircle2 className="size-3.5" />{`已发布 v${m.published}`}</span>
                   : <span className="inline-flex items-center gap-1 text-slate-500"><CircleDashed className="size-3.5" />未发布</span>}
                 {m.draft && <span className="inline-flex items-center gap-1 text-amber-600"><PencilLine className="size-3.5" />{`草稿 v${m.draft}`}</span>}
+                {m.disable === 'disabled' && <StatusText tone="none" data-mapping-disable="disabled">已停用</StatusText>}
+                {m.disable === 'requested' && <StatusText tone="pending" data-mapping-disable="requested">待确认停用</StatusText>}
                 {m.pendingEntity && (
                   <Link to={m.pendingEntity} title="这个实体还没有已发布的登记，去确认补登" className="relative inline-flex items-center gap-1 text-amber-600 hover:underline">
                     <AlertTriangle className="size-3.5" />实体待补登

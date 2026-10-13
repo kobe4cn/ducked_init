@@ -393,6 +393,19 @@ async function assertMetricFields(tx: Tx, tenantId: string, mappingId: string, p
   if (missing.length) throw new MappingError(`发布后 ${plan.entity} 的已发布映射里不再有已发布指标引用的扩展字段，不能发布：${missing.join('、')}`);
 }
 
+/**
+ * 停用这个映射会影响的已发布指标（停用后映射的实体再没有别的已发布、未停用映射，而指标引用这个实体）与引用这些指标的已发布标签，各按键排序。
+ * 只算这次停用造成的：指标引用的别的实体本来就没有映射时不列。只用来提示，不拦停用（ADR-0031）
+ */
+export async function disableImpact(db: Tx | ReturnType<typeof getDb>, tenantId: string, mappingId: string) {
+  const { entity } = await requireMapping(tenantId, mappingId, db);
+  if ((await publishedPlans(db, tenantId)).some(p => p.mapping !== mappingId && p.entity === entity)) return { metrics: [], tags: [] };
+  const dependents = await publishedDependents(db, tenantId);
+  const metrics = dependents.filter(d => d.kind === 'metric' && d.entities.includes(entity)).map(d => d.key);
+  const tags = dependents.filter(d => d.kind === 'tag' && d.metrics.some(m => metrics.includes(m))).map(d => d.key);
+  return { metrics: metrics.map(key => ({ key })), tags: tags.map(key => ({ key })) };
+}
+
 /** 映射在报错里的叫法 */
 const mappingName = (p: { table: string; entity: string }) => `${p.table} → ${p.entity}`;
 

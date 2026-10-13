@@ -5,13 +5,18 @@
 // 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）；
 // 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）；
 // 编辑页可空跑正在查看的版本：在原始层样本上转换，编辑框下方展示样例行（敏感字段是哈希）与基础断言，不写标准层；
-// 查看草稿时在编辑框上方展示它与最新已发布版本的差异（列级与去重键、取最新字段、身份打通匹配字段），供审阅者决定是否发布
-import { AlertTriangle, ArrowRight, Boxes, CheckCircle2, FileDiff, FlaskConical, PencilLine, Play } from 'lucide-react';
+// 查看草稿时在编辑框上方展示它与最新已发布版本的差异（列级与去重键、取最新字段、身份打通匹配字段），供审阅者决定是否发布；
+// 有发布权限的成员可提议停用、由另一位确认停用（提议人看到等待原因），停用后可恢复，提议与确认前列出受影响的已发布指标与标签（只是提示，ADR-0031）
+import { AlertTriangle, ArrowRight, Ban, Boxes, CheckCircle2, FileDiff, FlaskConical, Lock, PencilLine, Play, RotateCcw } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
-import { discardDraft, draftForMapping, dryRunMapping, getMapping, ignoreColumn, MappingError, mergeMapping, publishMapping, referenceTables, saveMappingDraft, yamlWithColumns } from '~/.server/mappings';
+import { getDb } from '~/.server/db/client';
+import {
+  confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, getMapping, ignoreColumn, MappingError, mergeMapping, publishMapping, referenceTables,
+  requestDisable, restoreMapping, saveMappingDraft, yamlWithColumns,
+} from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
 import { fallbackText } from '~/lib/fallback';
@@ -61,6 +66,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     const canWrite = can(member.role, 'sources:write');
     const url = new URL(request.url);
     const customPage = (await customEntityPages(member, [m.entity]))[m.entity];
+    const live = m.versions.some(v => v.status === 'published');
     return {
       email: member.email,
       nav: navFor(member),
@@ -99,6 +105,18 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       drift: m.drift,
       /** 草稿改了主键的键空间（from → to，未声明为 null）且有要一起改的同源引用映射时才有（只是提示，不阻止发布）；否则为 null */
       keySpaceChange: m.keySpaceChange && m.keySpaceFollowers.length ? { ...m.keySpaceChange, followers: m.keySpaceFollowers } : null,
+      /** 停用（ADR-0031）：没有已发布版本时为 null */
+      disable: live ? {
+        /** 当前成员有发布权限，能提议、确认停用与恢复 */
+        canPublish: can(member.role, 'publish'),
+        disabledAt: m.disabledAt?.toISOString() ?? null,
+        disabledBy: m.disabledByEmail,
+        requestedBy: m.disableRequestedByEmail,
+        /** 当前成员确认不了停用的原因（提议的是自己）；可以确认或没人提议时为 null */
+        confirmBlocker: m.disableRequestedByEmail === member.email ? '等待另一位确认：你提议了停用，需由另一位数据工程师或管理员确认' : null,
+        /** 停用后会受影响的已发布指标与引用它们的已发布标签（只是提示，不拦停用）；已停用或没有发布权限时为空 */
+        impact: m.disabledAt || !can(member.role, 'publish') ? { metrics: [], tags: [] } : await disableImpact(getDb(), member.tenant.id, m.id),
+      } : null,
       merge: {
         status: m.merge.status,
         statusLabel: m.merge.status === 'none' ? '未合并' : TASK_STATUS_LABELS[m.merge.status],
@@ -141,6 +159,15 @@ export async function action({ request, params }: Route.ActionArgs) {
       }
       case 'publish':
         await publishMapping(await requirePermission(request, 'publish'), params.mappingId, Number(field('version')));
+        break;
+      case 'request-disable':
+        await requestDisable(await requirePermission(request, 'publish'), params.mappingId);
+        break;
+      case 'confirm-disable':
+        await confirmDisable(await requirePermission(request, 'publish'), params.mappingId);
+        break;
+      case 'restore':
+        await restoreMapping(await requirePermission(request, 'publish'), params.mappingId);
         break;
       case 'merge':
         await mergeMapping(await requirePermission(request, 'sources:write'), params.mappingId);
@@ -387,8 +414,82 @@ function DraftDiff({ entity, version, diff }: { entity: string; version: number;
   );
 }
 
+type DisableData = NonNullable<LoaderData['disable']>;
+
+const impactText = ({ impact }: DisableData) =>
+  [impact.metrics.length && `指标 ${impact.metrics.map(m => m.key).join('、')}`, impact.tags.length && `标签 ${impact.tags.map(t => t.key).join('、')}`].filter(Boolean).join('；');
+
+/** 停用的操作（ADR-0031）：没人提议时提议停用，有人提议时另一位确认（提议人看到等待原因），已停用时恢复；停用前请成员确认，并带上受影响的定义 */
+function DisableActions({ disable, submitting }: { disable: DisableData; submitting: boolean }) {
+  if (disable.disabledAt) {
+    return (
+      <Form method="post" onSubmit={e => { if (!confirm('恢复这个映射？恢复后重新合并它最新的已发布版本。')) e.preventDefault(); }}>
+        <input type="hidden" name="intent" value="restore" />
+        <Button type="submit" variant="outline" disabled={submitting}><RotateCcw />恢复</Button>
+      </Form>
+    );
+  }
+  const affected = impactText(disable);
+  const step = disable.requestedBy ? 'confirm-disable' : 'request-disable';
+  const label = disable.requestedBy ? '确认停用' : '停用';
+  if (disable.confirmBlocker) {
+    return (
+      <span className="flex items-center gap-2">
+        <Button type="button" variant="destructive" disabled><Ban />{label}</Button>
+        <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-disable-blocker><Lock className="size-3.5 shrink-0" />{disable.confirmBlocker}</span>
+      </span>
+    );
+  }
+  return (
+    <Form
+      method="post"
+      onSubmit={e => {
+        const question = disable.requestedBy ? `确认停用这个映射（${disable.requestedBy} 提议）？` : '提议停用这个映射？需由另一位数据工程师或管理员确认后生效。';
+        if (!confirm(`${question}停用后合并撤下它写进标准层的行。${affected ? `\n这些已发布的定义会受影响，下次刷新可能失败：${affected}` : ''}`)) e.preventDefault();
+      }}
+    >
+      <input type="hidden" name="intent" value={step} />
+      <Button type="submit" variant="destructive" disabled={submitting}><Ban />{label}</Button>
+    </Form>
+  );
+}
+
+/** 停用状态：已停用、待确认停用，以及停用后会受影响的已发布指标与标签（只是提示） */
+function DisableStatus({ disable }: { disable: DisableData }) {
+  const { impact } = disable;
+  const link = (kind: 'metric' | 'tag', key: string) => (
+    <Link key={key} to={`/analytics/definitions/${kind}/${key}`} className="ml-2 font-mono underline" data-disable-impact={`${kind}-${key}`}>{key}</Link>
+  );
+  if (disable.disabledAt) {
+    return (
+      <Alert role="status" data-disable-state="disabled">
+        <Ban className="text-slate-500" />
+        <AlertTitle>已停用</AlertTitle>
+        <AlertDescription>
+          <p>{`于 ${time(disable.disabledAt)} 停用（停用人 ${disable.disabledBy ?? '—'}，即提议人）。停用后它不参与合并，写进标准层的行已撤下；恢复后重新合并它最新的已发布版本。`}</p>
+        </AlertDescription>
+      </Alert>
+    );
+  }
+  const affected = impact.metrics.length > 0;
+  if (!disable.requestedBy && !(affected && disable.canPublish)) return null;
+  return (
+    <Alert role="status" data-disable-state={disable.requestedBy ? 'requested' : 'impact'}>
+      <AlertTriangle className="text-amber-600" />
+      <AlertTitle>{disable.requestedBy ? `待确认停用：${disable.requestedBy} 提议停用这个映射，等待另一位确认` : '停用这个映射会影响已发布的指标'}</AlertTitle>
+      {affected && (
+        <AlertDescription>
+          <p>停用后这些指标引用的实体再没有映射，下次刷新可能失败（只是提示，不拦停用）：</p>
+          <p>指标{impact.metrics.map(m => link('metric', m.key))}</p>
+          {impact.tags.length > 0 && <p>引用它们的标签{impact.tags.map(t => link('tag', t.key))}</p>}
+        </AlertDescription>
+      )}
+    </Alert>
+  );
+}
+
 export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, draftDiff, drift, keySpaceChange, merge } = loaderData;
+  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, draftDiff, drift, keySpaceChange, disable, merge } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -405,12 +506,13 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
         actions={
           <>
             {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : '这个映射从没发布过，将被删除'} submitting={submitting} />}
-            {canWrite && live && (
+            {canWrite && live && !disable?.disabledAt && (
               <Form method="post">
                 <input type="hidden" name="intent" value="merge" />
                 <Button type="submit" variant="outline" disabled={submitting} title="只合并这个映射已发布的最新版本"><Play />立即合并</Button>
               </Form>
             )}
+            {disable?.canPublish && <DisableActions disable={disable} submitting={submitting} />}
           </>
         }
       />
@@ -445,6 +547,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
           </AlertDescription>
         </Alert>
       )}
+      {disable && <DisableStatus disable={disable} />}
       {actionData?.error && <MappingErrors error={actionData.error} issues={actionData.issues} />}
       {actionData && 'notices' in actionData && actionData.notices && <MappingNotices title="草稿已保存，检查有以下提示（不影响发布）" notices={actionData.notices} />}
 

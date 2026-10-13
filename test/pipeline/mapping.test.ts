@@ -10,7 +10,7 @@ import { createDefinition, deleteDefinition, publishDefinition } from '../../app
 import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
 import {
   confirmDisable, createMapping, enqueueDueMerges, enqueueMerge, getMapping, listMappings, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishedPlans, publishMapping,
-  rebuildEntity, referenceTables, requestDisable, restoreMapping, saveDraft,
+  disableImpact, rebuildEntity, referenceTables, requestDisable, restoreMapping, saveDraft,
 } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
@@ -1344,5 +1344,27 @@ describe('停用映射', () => {
     await getDb().update(tasks).set({ status: 'running' }).where(eq(tasks.id, pending!.id));
     await expect(restoreMapping(author, orders)).rejects.toThrow('已有一次合并在运行');
     expect(await getMapping(author, orders)).toMatchObject({ disabledAt: expect.any(Date) });
+  });
+
+  it('停用前列出受影响的已发布指标与引用它们的已发布标签：只算这次停用让实体再没有映射的；同实体还有别的映射时为空，草稿不算', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const log = await publish(author, reviewer, id, ORDER_LOG_MAPPING);
+    const customers = await publish(author, reviewer, id, CUSTOMERS);
+    await createDefinition(author, 'metric', 'fen_total', 'base: order\nmeasure: { agg: sum, field: x_amount_fen }\n');
+    await publishDefinition(reviewer, 'metric', 'fen_total', 1);
+    await createDefinition(author, 'metric', 'order_count', 'base: order\nmeasure: { agg: count }\n');
+    await drain();
+    await createDefinition(author, 'tag', 'fen_tier', 'metric: fen_total\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n');
+    await publishDefinition(reviewer, 'tag', 'fen_tier', 1);
+    await drain();
+
+    expect(await disableImpact(getDb(), acme, orders)).toEqual({ metrics: [], tags: [] });
+    expect(await disableImpact(getDb(), acme, customers)).toEqual({ metrics: [], tags: [] });
+    await disable(author, reviewer, log);
+    expect(await disableImpact(getDb(), acme, orders)).toEqual({ metrics: [{ key: 'fen_total' }], tags: [{ key: 'fen_tier' }] });
+    // order 本来就没有映射时，停用别的实体的映射不列出引用 order 的指标
+    await disable(author, reviewer, orders);
+    expect(await disableImpact(getDb(), acme, customers)).toEqual({ metrics: [], tags: [] });
   });
 });

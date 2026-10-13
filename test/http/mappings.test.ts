@@ -2,10 +2,12 @@
 // 保存通过但检查有提示（notices）时新建与保存都留在页面上列出提示；
 // 新建页默认是按规则生成的草稿（源没有已采集的表时是模板），也能按所选的表与实体重新生成填进编辑框（不保存），详情页能把源表新增的列一键生成为扩展字段填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
 // 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射（含勾选源列加的扩展字段、映射与引用字段的键空间）照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
+// 有发布权限的成员在详情页提议停用、由另一位确认，停用后可恢复，停用前列出受影响的指标与标签，列表标出待确认与已停用（ADR-0031）
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { parseDocument } from 'yaml';
 import { closeDb } from '../../app/.server/db/client';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
+import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
@@ -496,6 +498,54 @@ describe('编写与发布映射', () => {
     await author.post(`/mappings/${id}`, { intent: 'save', yaml: ORDERS.replace('amount: amount', 'amount: amount / 100') });
     expect(editorYaml(await (await author.get(`/mappings/${id}`)).text())).toContain('amount / 100');
     expect(editorYaml(await (await author.get(`/mappings/${id}?version=1`)).text())).not.toContain('amount / 100');
+  });
+
+  it('有发布权限的成员提议停用、另一位确认，两步都先列出受影响的指标与标签；提议人看到等待另一位确认；停用后显示恢复；列表标出待确认与已停用', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await memberOf(tenantId, 'de@acme.com');
+    const reviewer = await memberOf(tenantId, 'de2@acme.com');
+    const id = await publish(engineer, reviewer, sourceId, ORDERS);
+    await createDefinition(engineer, 'metric', 'order_count', 'base: order\nmeasure: { agg: count }\n');
+    await publishDefinition(reviewer, 'metric', 'order_count', 1);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    await createDefinition(engineer, 'tag', 'buyer', 'metric: order_count\nrules:\n  - { value: yes, when: { gte: 1 } }\ndefault: no\n');
+    await publishDefinition(reviewer, 'tag', 'buyer', 1);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const author = await loginAs(app, 'de@acme.com');
+    const other = await loginAs(app, 'de2@acme.com');
+
+    const before = await (await author.get(`/mappings/${id}`)).text();
+    expect(before).toContain('name="intent" value="request-disable"');
+    expect(before).toContain('data-disable-impact="metric-order_count"');
+    expect(before).toContain('data-disable-impact="tag-buyer"');
+    // 分析师没有发布权限：看不到也做不了
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an@acme.com');
+    expect(await (await analyst.get(`/mappings/${id}`)).text()).not.toContain('request-disable');
+    expect((await analyst.post(`/mappings/${id}`, { intent: 'request-disable' })).status).toBe(403);
+
+    expect((await author.post(`/mappings/${id}`, { intent: 'request-disable' })).status).toBe(302);
+    const mine = await (await author.get(`/mappings/${id}`)).text();
+    expect(mine).toContain('等待另一位确认');
+    expect(mine).toContain('data-disable-blocker');
+    expect(mine).not.toContain('name="intent" value="confirm-disable"');
+    expect((await author.post(`/mappings/${id}`, { intent: 'confirm-disable' })).status).toBe(403);
+    const theirs = await (await other.get(`/mappings/${id}`)).text();
+    expect(theirs).toContain('name="intent" value="confirm-disable"');
+    expect(theirs).toContain('data-disable-impact="metric-order_count"');
+    expect(await (await author.get('/mappings')).text()).toMatch(/data-mapping-disable="requested">待确认停用</);
+
+    expect((await other.post(`/mappings/${id}`, { intent: 'confirm-disable' })).status).toBe(302);
+    const disabled = await (await other.get(`/mappings/${id}`)).text();
+    expect(disabled).toContain('name="intent" value="restore"');
+    expect(disabled).not.toContain('name="intent" value="merge"');
+    expect(await (await author.get('/mappings')).text()).toMatch(/data-mapping-disable="disabled">已停用</);
+
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    expect((await author.post(`/mappings/${id}`, { intent: 'restore' })).status).toBe(302);
+    const restored = await (await author.get(`/mappings/${id}`)).text();
+    expect(restored).toContain('name="intent" value="request-disable"');
+    expect(await (await author.get('/mappings')).text()).not.toContain('data-mapping-disable');
   });
 });
 
