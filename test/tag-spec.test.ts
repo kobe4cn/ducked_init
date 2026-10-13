@@ -95,7 +95,9 @@ describe('标签 DSL：编译出的 SQL 的结果', () => {
       INSERT INTO silver._identities VALUES ('s1','1','c1'), ('s2','10','c1'), ('s1','2','c2'), ('s1','3','c3'), ('s1','4','c4'), ('s1','5','c5');
       CREATE TABLE silver."order" (order_id VARCHAR, customer_id VARCHAR, amount DECIMAL(18,2), _source VARCHAR);
       INSERT INTO silver."order" VALUES
-        ('o1', '1', 100, 's1'), ('o2', '10', 900, 's2'), ('o3', '2', 150, 's1'), ('o4', '3', 20, 's1'), ('o5', '4', NULL, 's1'), ('o6', 'x', 5000, 's2');`);
+        ('o1', '1', 100, 's1'), ('o2', '10', 900, 's2'), ('o3', '2', 150, 's1'), ('o4', '3', 20, 's1'), ('o5', '4', NULL, 's1'), ('o6', 'x', 5000, 's2');
+      ALTER TABLE silver."order" ADD COLUMN _customer_source VARCHAR;
+      UPDATE silver."order" SET _customer_source = _source;`);
   });
 
   afterAll(() => {

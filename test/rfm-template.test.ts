@@ -34,7 +34,9 @@ beforeAll(async () => {
       ('o14', '5', 'completed', 50, '2023-12-01 10:00:00+00', NULL, 's1'),
       ('o15', 'x', 'paid', 999, '2024-06-15 10:00:00+00', '2024-06-15 10:00:00+00', 's2'),
       ('o16', '7', 'cancelled', 80, '2024-06-05 10:00:00+00', NULL, 's1'),
-      ('o17', '6', 'cancelled', 80, '2024-06-05 10:00:00+00', NULL, 's1');`);
+      ('o17', '6', 'cancelled', 80, '2024-06-05 10:00:00+00', NULL, 's1');
+    ALTER TABLE silver."order" ADD COLUMN _customer_source VARCHAR;
+    UPDATE silver."order" SET _customer_source = _source;`);
 });
 
 afterAll(() => {

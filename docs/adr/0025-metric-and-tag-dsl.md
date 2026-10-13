@@ -8,7 +8,7 @@ ADR-0004 决定指标与标签用平台自有的 YAML DSL 编译成 SQL；ADR-00
 
 **指标 DSL。** 每个统一消费者一行（或每个消费者 × 维度取值一行）：
 
-- `base`：基础实体，必须有引用 `customer.customer_id` 的 `customer_id` 字段（或就是 `customer`）。通过 `silver._identities`（`_source, customer_id`）关联到 `consumer_id`，关联不到的行不计入。
+- `base`：基础实体，必须有引用 `customer.customer_id` 的 `customer_id` 字段（或就是 `customer`）。通过 `silver._identities`（`_source, customer_id`）关联到 `consumer_id`，关联不到的行不计入；基础实体按 `customer_id` 的数据源列 `_customer_source` 对 `_source`（跨源引用，ADR-0030），`customer` 自己按 `_source`。
 - `measure`：`{ agg: count|count_distinct|sum|avg|min|max, field? }`，只有 `count` 可以不写 `field`；`sum`/`avg` 只能用整数、小数字段。
 - `filter`：可选，`[{ field, op, value? }]`，全部用 AND 连接；字段只能是基础实体的字段，`op` 为 `eq|ne|in|not_in|gt|gte|lt|lte|is_null|not_null`，取值按字段类型校验后用 `lit` 写入，不接受表达式。
 - `window`：可选，`{ field, days }`，`field` 是基础实体的时间或日期字段，取 `(asOf - days, asOf]`。没写时不加时间限制。

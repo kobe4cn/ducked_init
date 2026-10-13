@@ -150,6 +150,36 @@ describe('身份打通：多源消费者确定性合并', () => {
     ]));
   });
 
+  it('事件映射声明 customer_id 属于 CRM 数据源后，浏览次数指标按 CRM 那条消费者记录算到统一消费者上', async () => {
+    const { acme, author, reviewer, sources, names } = await publishedIdentitySources();
+    // 用户 3 只在 CRM 里有（埋点源只有 u1、u2、u9）
+    await grantOnSource(`INSERT INTO tracking.events (event_id, user_id, device_id, event_type, ts) VALUES ('e10', '3', 'd5', 'view', '2024-06-04 09:00')`);
+    await syncSource(author, sources.tracking);
+    await drain();
+    const ctx: DslContext = { published: new Map(), plans: [], metrics: new Map() };
+    const checked = checkMetric('base: event\nmeasure: { agg: count }\ndevice_attribution: false\nfilter:\n  - { field: event_type, op: eq, value: view }\n', ctx);
+    if (!checked.ok) throw new Error(JSON.stringify(checked.issues));
+    const views = async () => {
+      const task = await runTask(acme, 'gold.dsl', { kind: 'metric', key: 'views', asOf: '2024-07-01', sql: compileMetric(checked.spec, ctx, '2024-07-01'), entities: ['event'] });
+      expect(task.status).toBe('succeeded');
+      const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+      try {
+        const table = `gold."${(task.result as { table: string }).table.slice('gold.'.length)}"`;
+        return (await session.con.runAndReadAll(`SELECT consumer_id, value::INTEGER AS value FROM ${table}`)).getRowObjectsJson();
+      } finally {
+        session.close();
+      }
+    };
+    const consumerOf = async (who: string) => (await identities(acme)).rows.find(r => `${names[r._source]}:${r.customer_id}` === who)!.consumer_id;
+    // 不声明时 e10 按埋点源的用户 3 找，打通不到；e9 是 u1 的浏览（u1 与 crm 1 同组）
+    expect(await views()).toEqual([{ consumer_id: await consumerOf('crm:1'), value: 1 }]);
+
+    const events = (await listMappings(author)).mappings.find(m => m.entity === 'event')!;
+    await republish(author, reviewer, events.id, TRACKING_EVENTS.replace('  customer_id: user_id\n', '  customer_id: { expr: user_id, customer_source: CRM }\n'));
+    // 声明后 e10 归 crm 3 所在的统一消费者；e9 的 u1 在 CRM 里找不到
+    expect(await views()).toEqual([{ consumer_id: await consumerOf('crm:3'), value: 1 }]);
+  });
+
   it('event 指标的快照里匿名事件经设备归属计入设备主人；没有 _device_owner 的老湖给出提示', async () => {
     const { acme, names } = await publishedIdentitySources();
     const { rows } = await identities(acme);

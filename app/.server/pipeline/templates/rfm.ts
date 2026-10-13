@@ -3,6 +3,7 @@
 // 打 1–5 分后按分群规则表归入人群。交易时间取 coalesce(paid_at, created_at)，按 UTC 日期计；打通不到消费者的订单不计入。
 // SQL 移植自 src/04_crm.ts 的 gold.rfm：五分位时 R 分为 6 - ntile(5)，并列值按 consumer_id 二级排序，结果不随执行顺序变化
 import { entityOf } from '../../../lib/canonical-model';
+import { customerSourceColumn } from '../../../lib/customer-source';
 import { lit } from '../../../lib/mapping-expr';
 import { IDENTITIES } from '../identity-engine';
 
@@ -131,7 +132,7 @@ function windowOrders(p: RfmParams) {
   return `
   SELECT i.consumer_id, o.amount, ${orderDate} AS order_date
   FROM ${ORDER} o
-  LEFT JOIN ${IDENTITIES} i ON i._source = o._source AND i.customer_id = o.customer_id
+  LEFT JOIN ${IDENTITIES} i ON i._source = o.${customerSourceColumn('customer_id')} AND i.customer_id = o.customer_id
   WHERE o.status IN (${p.statuses.map(lit).join(', ')})
     AND ${orderDate} BETWEEN ${asOfDate} - ${p.lookbackDays - 1} AND ${asOfDate}`;
 }

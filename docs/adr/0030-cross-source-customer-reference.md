@@ -8,9 +8,9 @@ ADR-0019、ADR-0024 把消费者记录的身份定为 `(_source, customer_id)`�
 
 **标准层恒写数据源列。** 每个指向 customer 的引用列旁边落一列 `customerSourceColumn(字段)`：`customer_id` → `_customer_source`，其他 → `_<字段>_source`（`app/lib/customer-source.ts`，前后端共用）。值是声明的目标数据源 ID，没声明时就是行自己的 `_source`。恒写而不是「没声明时为空、读时 `coalesce`」，读的地方只认一列，不会漏写 `coalesce`。名为 `customer_id` 的列不论计划里有没有 `customerRef` 都落（`customer` 自己的主键也记，早于 `customerRef` 的老计划也能认出）。列名不固定，不进 `SILVER_SYSTEM_COLUMNS`；合并的写法 `SCHEME` 不变，不触发全量重建。
 
-**老湖补列。** 标准层里有 `customer_id` 却没有 `_customer_source` 的表（`_` 开头的系统表除外），在 `ensureLakeSchemas`（建湖与 `pnpm lake:ensure`）和每次合并开头补上这一列并按 `_source` 回填，同一个事务里，不整表重建。没有每次启动都跑的 schema 检查，所以合并开头也要补；结果层任务开头的补列随指标 / RFM 改用它时加。
+**老湖补列。** 标准层里有 `customer_id` 却没有 `_customer_source` 的表（`_` 开头的系统表除外），在 `ensureLakeSchemas`（建湖与 `pnpm lake:ensure`）和每次合并开头补上这一列并按 `_source` 回填，同一个事务里，不整表重建。没有每次启动都跑的 schema 检查，所以合并开头也要补；`gold.rfm`、`gold.dsl` 开头也补，老湖不重新合并也能算（#185）。
 
-**哪些地方改用它。** 关联 `silver._identities` 找统一消费者的地方按引用列的数据源列：设备归属（登录事件）、统一消费者的同意，以及指标、RFM、订单关联断言（#185）。主键冲突体检按 `_customer_source` 分组（#186）。
+**哪些地方改用它。** 关联 `silver._identities` 找统一消费者的地方按引用列的数据源列：设备归属（登录事件）、统一消费者的同意，以及指标、RFM、订单关联断言（#185）。指标的维度路径跳到 `customer` 时按这一跳引用列的数据源列关联；跳到主键指向 customer 的实体（如会员档案）仍按两边的 `_source`，那不是找消费者。跳到 customer 的引用列不是 `customer_id` 时，它的 `_<字段>_source` 不在老湖补列之列：没有重新合并过的老湖上这样的维度会因缺列失败，重新合并一次即可。主键冲突体检按 `_customer_source` 分组（#186）。
 
 **哪些仍用 `_source`。** 行从哪里来、在哪里唯一不变：`customer` 关联 `_identities`、写 `_identities` 本身；行主键的唯一性（`assertions.ts` 的 `uniqueKey`）与跨映射独占（`merge-engine.ts` 的 `assertUniqueAcrossMappings`，主键含 customer 引用的实体按数据源内唯一）。设备仍按 `device_id` 跨源归属，不分数据源。
 

@@ -12,6 +12,7 @@ import { CANONICAL_ENTITIES, entityOf, isCustomEntity, type EntityRelation, type
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from '../identity-engine';
 import { describeSchemaError, locator, type Path, type RegisteredEntities } from '../mapping-spec';
 import { ident, lit, silverTable, type MergeMappingParam } from '../merge-engine';
+import { customerSourceColumn } from '../../../lib/customer-source';
 
 export const AGGS = ['count', 'count_distinct', 'sum', 'avg', 'min', 'max'] as const;
 export const FILTER_OPS = ['eq', 'ne', 'in', 'not_in', 'gt', 'gte', 'lt', 'lte', 'is_null', 'not_null'] as const;
@@ -404,8 +405,9 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
       const next = resolved.steps[j + 1]!;
       const { key, bySource } = step.join!;
       const alias = `d${i}_${j + 1}`;
-      const source = bySource ? ` AND ${alias}._source = ${prev}._source` : '';
-      joins.push(`LEFT JOIN ${silverTable(next.entity)} ${alias} ON ${alias}.${ident(key)} = ${prev}.${ident(step.field)}${source}`);
+      // 跳到 customer 时按引用列的数据源列找消费者记录（跨源引用，ADR-0030）
+      const sourceOn = !bySource ? '' : ` AND ${alias}._source = ${prev}.${next.entity === 'customer' ? ident(customerSourceColumn(step.field)) : '_source'}`;
+      joins.push(`LEFT JOIN ${silverTable(next.entity)} ${alias} ON ${alias}.${ident(key)} = ${prev}.${ident(step.field)}${sourceOn}`);
       prev = alias;
     }
     const end = resolved.steps.at(-1)!;
@@ -439,13 +441,15 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
   }
 
   if (byDevice) where.unshift(`${consumer} IS NOT NULL`);
+  // customer 记录就在行自己的数据源里；其他实体按 customer_id 的数据源列找消费者记录（跨源引用，ADR-0030）
+  const identityOn = `i._source = b.${spec.base === 'customer' ? '_source' : customerSourceColumn('customer_id')} AND i.customer_id = b.customer_id`;
   return [
     `SELECT ${byDevice ? `${consumer} AS consumer_id` : consumer}, ${[...dims, `${measure} AS value`].join(', ')}`,
     `FROM ${silverTable(spec.base)} b`,
     ...(byDevice
-      ? [`LEFT JOIN ${IDENTITIES} i ON i._source = b._source AND i.customer_id = b.customer_id`,
+      ? [`LEFT JOIN ${IDENTITIES} i ON ${identityOn}`,
         `LEFT JOIN ${DEVICE_OWNER} o ON b.customer_id IS NULL AND o.device_id = b.device_id`]
-      : [`INNER JOIN ${IDENTITIES} i ON i._source = b._source AND i.customer_id = b.customer_id`]),
+      : [`INNER JOIN ${IDENTITIES} i ON ${identityOn}`]),
     ...joins,
     ...(where.length ? [`WHERE ${where.join('\n  AND ')}`] : []),
     'GROUP BY ALL',

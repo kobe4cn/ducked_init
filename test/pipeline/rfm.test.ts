@@ -3,14 +3,16 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
+import { listMappings, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { checkMetric, compileMetric, type DslContext } from '../../app/.server/pipeline/dsl/metric-spec';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, publish, runTask } from './fixtures';
-import { publishedIdentitySources } from './identity-fixtures';
-import { pgSourceInput, READER } from './source-fixtures';
+import { LOYALTY_ORDERS, publishedIdentitySources } from './identity-fixtures';
+import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -84,6 +86,64 @@ describe('gold.rfm：基于打通后的消费者计算 RFM', () => {
     const [x, y] = [await readLake(acme, a), await readLake(acme, b)];
     expect(x.rows.length).toBeGreaterThan(0);
     expect(y.text).toBe(x.text);
+  });
+
+  it('会员订单声明 customer_id 属于 CRM 后，按 CRM 的消费者记录算进 RFM 与订单关联断言，不算孤儿', async () => {
+    const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
+    const { crm, loyalty } = sources;
+    // B6 的下单人 7 只在 CRM 里有（会员只有 1-6）
+    await grantOnSource(`INSERT INTO loyalty.orders VALUES (6, 7, '已支付', 60, '2024-06-10 10:00', '2024-07-03')`);
+    await syncSource(author, loyalty);
+    await drain();
+    type Result = { table: string; unlinkedOrders: number; assertions: { name: string; orphans?: number }[] };
+    const rfm = async () => {
+      const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
+      expect(task?.status).toBe('succeeded');
+      return task!.result as Result;
+    };
+    const link = (r: Result) => r.assertions.find(a => a.name === 'order_customer_link')?.orphans;
+    // 不声明时 B6 按会员 7 找，打通不到，与 A5 一起是孤儿
+    const before = await rfm();
+    expect([before.unlinkedOrders, link(before)]).toEqual([2, 2]);
+
+    const orders = (await listMappings(author)).mappings.find(m => m.entity === 'order' && m.sourceId === loyalty)!;
+    await publishMapping(reviewer, orders.id, await saveDraft(author, orders.id,
+      LOYALTY_ORDERS.replace('  customer_id: string(member_id)\n', '  customer_id: { expr: string(member_id), customer_source: CRM }\n')));
+    await drain();
+    const after = await rfm();
+    expect([after.unlinkedOrders, link(after)]).toEqual([1, 1]);
+    const { rows, identities } = await readLake(acme, after.table);
+    const consumerOf = (customerId: string) => identities.find(i => i._source === crm && i.customer_id === customerId)!.consumer_id;
+    // 会员订单的下单人按 CRM 编号：B4（会员 6 → crm 6）归 crm 5、crm 6 那组，B6 归 crm 7
+    expect(rows.map(({ consumer_id, recency_days, frequency, monetary }) => ({ consumer_id, recency_days, frequency, monetary }))).toEqual([
+      { consumer_id: consumerOf('1'), recency_days: 1, frequency: 2, monetary: '500.00' },
+      { consumer_id: consumerOf('2'), recency_days: 61, frequency: 1, monetary: '300.00' },
+      { consumer_id: consumerOf('3'), recency_days: 122, frequency: 1, monetary: '80.00' },
+      { consumer_id: consumerOf('5'), recency_days: 6, frequency: 4, monetary: '1550.00' },
+      { consumer_id: consumerOf('7'), recency_days: 21, frequency: 1, monetary: '60.00' },
+    ].sort((a, b) => a.consumer_id.localeCompare(b.consumer_id)));
+  });
+
+  it('老湖的订单表还没有 _customer_source、也没重新合并时，gold.rfm 与 gold.dsl 开头补列后照常算', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    const dropColumn = async () => {
+      const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+      try {
+        await session.con.run('ALTER TABLE silver."order" DROP COLUMN _customer_source');
+      } finally {
+        session.close();
+      }
+    };
+    await dropColumn();
+    const rfm = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
+    expect(rfm).toMatchObject({ status: 'succeeded', result: { rows: 5, unlinkedOrders: 1 } });
+
+    await dropColumn();
+    const ctx: DslContext = { published: new Map(), plans: [], metrics: new Map() };
+    const checked = checkMetric('base: order\nmeasure: { agg: count }\n', ctx);
+    if (!checked.ok) throw new Error(JSON.stringify(checked.issues));
+    const dsl = await runTask(acme, 'gold.dsl', { kind: 'metric', key: 'orders', asOf: '2024-07-01', sql: compileMetric(checked.spec, ctx, '2024-07-01'), entities: ['order'] });
+    expect(dsl).toMatchObject({ status: 'succeeded', result: { rows: 5 } });
   });
 
   it('标准层还没有订单时任务失败并说明原因；参数不合法时任务失败', async () => {

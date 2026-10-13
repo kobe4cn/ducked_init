@@ -5,6 +5,7 @@
 // 读会员或积分流水时另跑两条积分 warn：余额与流水对账、流水余额断档
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { entityOf } from '../../lib/canonical-model';
+import { customerSourceColumn } from '../../lib/customer-source';
 import { ASSERTION_RUNS, QUARANTINE } from './lake-schemas';
 import { lit } from './merge-engine';
 import { PartialFailure } from './partial-failure';
@@ -117,12 +118,10 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
     }
     const customer = columns.get('customer');
     if (entity === 'order' && present.has('customer_id') && customer?.has('customer_id')) {
-      const bySource = present.has('_source') && customer.has('_source');
-      const result = await orderCustomerLink(con, bySource);
+      const customers = customerLookup(present, customer);
+      const result = await orderCustomerLink(con, customers);
       results.push(result);
-      samples.set(result, `
-        SELECT f.* FROM silver."order" f ANTI JOIN (SELECT DISTINCT customer_id AS k${bySource ? ', _source' : ''} FROM silver.customer) t
-          ON f.customer_id = t.k${bySource ? ' AND f._source = t._source' : ''}`);
+      samples.set(result, `SELECT f.* FROM silver."order" f ANTI JOIN ${customers}`);
     }
     const [lastRun] = await rows<{ rows: string }>(con, `SELECT rows FROM ${ASSERTION_RUNS} WHERE entity = ${lit(entity)} ORDER BY "at" DESC LIMIT 1`);
     if (lastRun) {
@@ -168,12 +167,21 @@ async function recordRuns(con: DuckDBConnection, taskId: string, rowCounts: Read
   }
 }
 
-/** 订单里 customer_id 非空且在 silver.customer 里找得到（按数据源找，同 relationStats）的比例；customer_id 为空的订单也算关联不上（orphans）。低于阈值时把关联不上的订单数记为不合格 */
-async function orderCustomerLink(con: DuckDBConnection, bySource: boolean): Promise<AssertionResult> {
+/**
+ * 订单 f 关联 silver.customer 的 JOIN 右侧与条件（关联上时 t.k 非空）：两边都有数据源列时，按订单 customer_id 的数据源列 _customer_source
+ * 对 customer 的 _source 找（跨源引用，ADR-0030；同 relationStats）
+ */
+function customerLookup(order: ReadonlySet<string>, customer: ReadonlySet<string>) {
+  const sourceColumn = customerSourceColumn('customer_id');
+  const bySource = order.has(sourceColumn) && customer.has('_source');
+  return `(SELECT DISTINCT customer_id AS k${bySource ? ', _source' : ''} FROM silver.customer) t
+    ON f.customer_id = t.k${bySource ? ` AND f.${ident(sourceColumn)} = t._source` : ''}`;
+}
+
+/** 订单里 customer_id 非空且在 silver.customer 里找得到（customers 是 customerLookup 给出的关联）的比例；customer_id 为空的订单也算关联不上（orphans）。低于阈值时把关联不上的订单数记为不合格 */
+async function orderCustomerLink(con: DuckDBConnection, customers: string): Promise<AssertionResult> {
   const [{ total, linked }] = await rows<{ total: string; linked: string }>(con, `
-    SELECT count(*) AS total, count(t.k) AS linked FROM silver."order" f
-    LEFT JOIN (SELECT DISTINCT customer_id AS k${bySource ? ', _source' : ''} FROM silver.customer) t
-      ON f.customer_id = t.k${bySource ? ' AND f._source = t._source' : ''}`);
+    SELECT count(*) AS total, count(t.k) AS linked FROM silver."order" f LEFT JOIN ${customers}`);
   const orphans = Number(total) - Number(linked);
   const ratio = Number(total) ? Number(linked) / Number(total) : 1;
   return { name: 'order_customer_link', level: 'warn', entity: 'order', failed: ratio < MIN_ORDER_LINK_RATIO ? orphans : 0, ratio: Math.round(ratio * 10000) / 10000, orphans };

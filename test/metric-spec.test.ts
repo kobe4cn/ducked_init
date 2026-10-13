@@ -16,7 +16,7 @@ const rel = (from: string, to: string): EntityRelation => {
 const entity = (name: string, fields: CustomEntityField[], relations: EntityRelation[] = []): [string, RegisteredEntity] =>
   [name, { name, label: name, kind: 'dimension', fields, primaryKey: [fields[0]!.name], relations }];
 
-// 门店 → 区域 → 国家 → 大洲；门店有指向自己的上级门店；custom_visit 是带 customer_id 的事实实体
+// 门店 → 区域 → 国家 → 大洲；门店有指向自己的上级门店；custom_visit 是带 customer_id 的事实实体，referrer_id 是另一个指向 customer 的引用
 const published = new Map<string, RegisteredEntity>([
   entity('custom_store', [field('store_id'), field('region_id'), field('name'), field('parent_id')],
     [rel('order.store_id', 'custom_store.store_id'), rel('custom_store.region_id', 'custom_region.region_id'), rel('custom_store.parent_id', 'custom_store.store_id')]),
@@ -24,8 +24,8 @@ const published = new Map<string, RegisteredEntity>([
     [rel('custom_region.country_id', 'custom_country.country_id')]),
   entity('custom_country', [field('country_id'), field('continent_id')], [rel('custom_country.continent_id', 'custom_continent.continent_id')]),
   entity('custom_continent', [field('continent_id'), field('name')]),
-  entity('custom_visit', [field('visit_id'), field('customer_id'), field('visited_on', 'date'), field('minutes', 'integer')],
-    [rel('custom_visit.customer_id', 'customer.customer_id')]),
+  entity('custom_visit', [field('visit_id'), field('customer_id'), field('visited_on', 'date'), field('minutes', 'integer'), field('referrer_id')],
+    [rel('custom_visit.customer_id', 'customer.customer_id'), rel('custom_visit.referrer_id', 'customer.customer_id')]),
   // 会员档案：主键 customer_id 指向 customer，与 customer 一样只在同一数据源内唯一
   entity('custom_profile', [field('customer_id'), field('tier')],
     [rel('custom_profile.customer_id', 'customer.customer_id'), rel('order.customer_id', 'custom_profile.customer_id')]),
@@ -141,11 +141,21 @@ describe('指标 DSL：编译', () => {
     expect(sql).toContain('未关联');
   });
 
-  it('关联到 customer 或主键指向 customer 的实体时按数据源关联，其余实体不按', () => {
-    const dim = (path: string) => compileMetric(ok(`base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: d, path: ${path} }\n`), ctx, '2024-07-01');
-    expect(dim('order.customer_id -> custom_profile.tier')).toContain('d0_1._source = b._source');
-    expect(dim('order.customer_id -> customer.city')).toContain('d0_1._source = b._source');
-    expect(dim('order.store_id -> custom_store.name')).not.toContain('d0_1._source');
+  it('关联到 customer 或主键指向 customer 的实体时按数据源关联，其余实体不按；跳到 customer 时按引用列的数据源列（跨源引用，ADR-0030）', () => {
+    const dim = (base: string, path: string) => compileMetric(ok(`base: ${base}\nmeasure: { agg: count }\ndimensions:\n  - { name: d, path: ${path} }\n`), ctx, '2024-07-01');
+    expect(dim('order', 'order.customer_id -> custom_profile.tier')).toContain('d0_1._source = b._source');
+    expect(dim('order', 'order.customer_id -> customer.city')).toContain('d0_1._source = b."_customer_source"');
+    expect(dim('custom_visit', 'custom_visit.referrer_id -> customer.city')).toContain('d0_1._source = b."_referrer_id_source"');
+    expect(dim('order', 'order.store_id -> custom_store.name')).not.toContain('d0_1._source');
+  });
+
+  it('按引用列的数据源列 _customer_source 关联 silver._identities，基础实体是 customer 时仍按 _source（跨源引用，ADR-0030）', () => {
+    for (const extra of ['', 'device_attribution: false\n']) {
+      const sql = compileMetric(ok(`base: event\nmeasure: { agg: count }\n${extra}`), ctx, '2024-07-01');
+      expect(sql).toContain('i._source = b._customer_source AND i.customer_id = b.customer_id');
+      expect(sql).not.toContain('i._source = b._source');
+    }
+    expect(compileMetric(ok('base: customer\nmeasure: { agg: count }\n'), ctx, '2024-07-01')).toContain('i._source = b._source AND i.customer_id = b.customer_id');
   });
 
   it('consumer 维度经 consumer_id 关联 silver._consumer，同一指标里只关联一次；依赖记作 customer 的字段', () => {
@@ -166,7 +176,7 @@ describe('指标 DSL：编译', () => {
     expect(sql('device_attribution: false\n')).toBe([
       'SELECT i.consumer_id, COUNT(*) AS value',
       'FROM silver."event" b',
-      'INNER JOIN silver._identities i ON i._source = b._source AND i.customer_id = b.customer_id',
+      'INNER JOIN silver._identities i ON i._source = b._customer_source AND i.customer_id = b.customer_id',
       'GROUP BY ALL',
       'ORDER BY ALL',
     ].join('\n'));
@@ -218,7 +228,11 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
         ('e4', '2', 'd1', 'login', '2024-06-20 10:00:00+00', NULL, 's1'),
         ('e5', NULL, 'd3', 'view', '2024-06-15 10:00:00+00', NULL, 's1'),
         ('e6', 'x', 'd2', 'view', '2024-06-15 10:00:00+00', NULL, 's2'),
-        ('e7', NULL, 'd2', 'view', '2024-06-15 10:00:00+00', NULL, 's1');`);
+        ('e7', NULL, 'd2', 'view', '2024-06-15 10:00:00+00', NULL, 's1');
+      ALTER TABLE silver."order" ADD COLUMN _customer_source VARCHAR;
+      UPDATE silver."order" SET _customer_source = _source;
+      ALTER TABLE silver.event ADD COLUMN _customer_source VARCHAR;
+      UPDATE silver.event SET _customer_source = _source;`);
   });
 
   afterAll(() => {

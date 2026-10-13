@@ -13,6 +13,7 @@ import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './identity-engine';
 import { TEMPLATES } from './templates';
 import { compileRfmUnlinked } from './templates/rfm';
 import { assertOrThrow, runAssertions } from './assertions';
+import { ensureCustomerSourceColumns } from './customer-source-columns';
 import { PartialFailure } from './partial-failure';
 
 type Params = Record<string, unknown>;
@@ -287,12 +288,14 @@ export const HANDLERS = {
   // 写进结果层的一张快照表 gold."rfm__<任务 ID>"，只有 consumer_id 与分值，没有明文。打通不到消费者的订单不计入，结果里报告条数。
   // 发布、重新计算或定时刷新入队的任务带上定义版本 definitionVersion 与来源 trigger（登记快照时记下），其余参数是定义的参数加上 asOf；
   // 也可以直接给参数、不带版本。
-  // 计算前先对读到的实体跑内置断言（ADR-0026），error 级失败时任务失败、不写快照表；结果带全部断言 assertions
+  // 计算前先对读到的实体跑内置断言（ADR-0026），error 级失败时任务失败、不写快照表；结果带全部断言 assertions。
+  // 开头给没重新合并过的老湖补 _customer_source（订单按它关联消费者，ADR-0030）
   'gold.rfm': {
     label: TEMPLATES.rfm.label,
     async run(con, params, { taskId }) {
       const { definitionVersion: _, trigger: __, ...rest } = params;
       const rfm = TEMPLATES.rfm.parse(rest);
+      await ensureCustomerSourceColumns(con);
       const present = await rows<{ name: string }>(con, `
         SELECT table_name AS name FROM information_schema.tables
         WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN ('order', '_identities')`);
@@ -310,7 +313,7 @@ export const HANDLERS = {
   },
   // 指标或标签（ADR-0025）：发布定义时入队，参数里带上入队时按当天编译好的 SQL 与它用到的实体（不再访问平台库）。
   // 标准层有这些实体与身份打通结果（SQL 用到设备归属时还要有 _device_owner，用到 consumer 维度时还要有 _consumer）时，把 SQL 的结果写进结果层的一张快照表 gold."<种类>__<任务 ID>"，只有 consumer_id、维度与值。
-  // 断言同 gold.rfm
+  // 断言与开头补 _customer_source 同 gold.rfm
   'gold.dsl': {
     label: '指标与标签',
     async run(con, params, { taskId }) {
@@ -318,6 +321,7 @@ export const HANDLERS = {
       if (typeof kind !== 'string' || !/^[a-z]+$/.test(kind)) throw new Error('参数 kind 不合法');
       if (typeof sql !== 'string' || !sql) throw new Error('缺少参数 sql');
       if (!isStrings(entities)) throw new Error('参数 entities 必须是非空的实体名列表');
+      await ensureCustomerSourceColumns(con);
       const present = new Set((await rows<{ name: string }>(con, `
         SELECT table_name AS name FROM information_schema.tables
         WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${[...entities, '_identities', '_device_owner', '_consumer'].map(lit).join(', ')})`)).map(t => t.name));
