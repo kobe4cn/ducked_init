@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 import { platformS3 } from '../../app/.server/s3-accounts';
-import { putObject, signedFetch, xmlTag, xmlTags } from '../../app/.server/s3-client';
+import { deleteObject, listObjects, putObject, signedFetch, xmlTag, xmlTags } from '../../app/.server/s3-client';
 
 const { values: args } = parseArgs({
   options: {
@@ -344,6 +344,8 @@ async function douyin() {
 }
 
 async function events() {
+  // 先删后建：换格式时不留另一种格式的文件；也清掉以前造过的埋点用户档案 users/（现在事件跨源引用商城的消费者）
+  for (const { path } of await listObjects(s3, `${S3_PREFIX}/events/`)) await deleteObject(s3, `${S3_PREFIX}/events/${path}`);
   await withTruth(async con => {
     await s3Secret(con);
     const select = `SELECT event_id, customer_id AS user_id, device_id, event_type AS event_name, epoch_ms(occurred_utc) AS ts_ms, page FROM t.event`;
@@ -354,13 +356,6 @@ async function events() {
       for (const { m } of await rows<{ m: string }>(con, `SELECT DISTINCT strftime(occurred_utc, '%Y-%m') AS m FROM t.event ORDER BY 1`))
         await con.run(`COPY (${select} WHERE strftime(occurred_utc, '%Y-%m') = ${lit(m)} ORDER BY event_id) TO '${S3_PREFIX}/events/events/events-${m}.parquet' (FORMAT parquet)`);
     }
-    // 埋点平台的用户档案（与事件同一格式，同一数据源只认一种格式）：登录过的商城用户，带手机与邮箱。平台只在本数据源内解析事件的 customer_id（#150），
-    // 埋点源要有自己的消费者记录，靠身份打通并到商城那个人
-    await con.run(`COPY (
-      SELECT r.customer_id AS user_id, r.phone_raw AS mobile, r.email_raw AS email, epoch_ms(min(e.occurred_utc)) AS first_login_ms
-      FROM t.event e JOIN t.rec r ON r.src = 'mall' AND r.customer_id = e.customer_id
-      WHERE e.event_type = 'login' GROUP BY ALL ORDER BY user_id
-    ) TO '${S3_PREFIX}/events/users/users.${EVENTS_FORMAT}' (FORMAT ${EVENTS_FORMAT})`);
   });
   log(`S3 ${EVENTS_FORMAT === 'json' ? 'JSON' : 'Parquet'} ${S3_PREFIX}/events/ 写好了`);
 }

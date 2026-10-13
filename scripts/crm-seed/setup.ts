@@ -107,7 +107,7 @@ async function eventsFormat() {
 const KEYS: Record<string, Record<string, string[]>> = {
   tmall_s3: { buyers: ['buyer_id'], trades: ['tid'] },
   douyin_s3: { dy_orders: ['订单编号'] },
-  events_s3: { events: ['event_id'], users: ['user_id'] },
+  events_s3: { events: ['event_id'] },
   activity_s3: { signups: ['报名编号'] },
   wecom_duckdb: { contacts: ['external_userid'], chats: ['chat_id'], mass_sends: ['send_id'] },
 };
@@ -179,8 +179,9 @@ if (step('mappings')) {
   }
   const files = readdirSync(join(HERE, 'mappings')).filter(f => f.endsWith('.yaml') && !f.includes('.k2.')).sort();
   const custom = (f: string) => f.includes('.custom_');
-  // 先发标准实体（订单在明细前），再登记自定义实体（关系要用到已发布映射里的字段类型），最后发自定义实体的映射
-  const rank = (f: string) => (f.includes('.order.') ? 0 : f.includes('.order_item.') ? 2 : 1);
+  // 先发标准实体（消费者最先：埋点事件跨源引用商城的消费者；订单在明细前），再登记自定义实体（关系要用到已发布映射里的字段类型），最后发自定义实体的映射
+  const ORDER = ['customer', 'order', '', 'order_item'];
+  const rank = (f: string) => { const i = ORDER.indexOf(f.split('.')[2]!); return i < 0 ? ORDER.indexOf('') : i; };
   await publishAll(files.filter(f => !custom(f)).sort((a, b) => rank(a) - rank(b)));
   await drain('标准实体合并');
   const registered = new Set((await listCustomEntities(eng)).map(e => e.name));

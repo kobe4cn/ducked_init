@@ -8,7 +8,7 @@ scripts/crm-seed/
   identity.sql     期望的身份打通（expected_identity）
   round2.sql       第二轮变更（T6）
   seed.ts          生成真值并写进 9 个数据源，建只读账号
-  mappings/        33 个映射（文件名：数据源.表或视图.实体[.说明].yaml）
+  mappings/        32 个映射（文件名：数据源.表或视图.实体[.说明].yaml）
   views/           3 个源视图（抖音买家、活动到场、企微删好友）
   definitions/     11 个指标、4 个标签
   check-mappings.ts 连上数据源取真实列类型，用平台的校验器离线检查映射与定义
@@ -39,7 +39,7 @@ node --env-file=.env --import tsx scripts/crm-seed/seed.ts --round 2
 ## 二、冒烟（我先跑过一遍，你也可以随时用它确认环境没问题）
 
 ```bash
-node --env-file=.env --import tsx scripts/crm-seed/check-mappings.ts        # 33 个映射 + 15 个定义，全 ✔
+node --env-file=.env --import tsx scripts/crm-seed/check-mappings.ts        # 32 个映射 + 15 个定义，全 ✔
 node --env-file=.env --import tsx scripts/crm-seed/setup.ts --tenant crmlab-smoke
 node --env-file=.env --import tsx scripts/crm-seed/verify.ts crmlab-smoke     # 期望：没有 ✘
 ```
@@ -83,12 +83,12 @@ S3 都是：端点 `localhost:8333`，区域 `us-east-1`，路径风格 path，�
 
 | # | 操作 | 期望 |
 |---|---|---|
-| T1.1 | 每个数据源选上全部表，等采集完 | 表数：pos 6、mall 4、loyalty 7、oms 1、tmall 2、douyin 1、events 2、activity 1、wecom 3 |
+| T1.1 | 每个数据源选上全部表，等采集完 | 表数：pos 6、mall 4、loyalty 7、oms 1、tmall 2、douyin 1、events 1、activity 1、wecom 3 |
 | T1.2 | 确认水位线：有 `updated_at` / `update_time` 的选它；`points_ledger` 没有候选（全量比对） | 文件类的表（S3、DuckDB）没有主键：声明业务主键，见下表 |
 | T1.3 | pos `sales` 确认软删除字段 `is_void` | |
 | T1.4 | 每个数据源点「同步」 | 原始层行数与 `verify.ts` 的「标准层」期望行数一致（映射前看 `bronze_<数据源ID>` 的表）；敏感列是密文 |
 
-业务主键：tmall `buyers`→`buyer_id`、`trades`→`tid`；douyin `dy_orders`→`订单编号`；events `events`→`event_id`、`users`→`user_id`；activity `signups`→`报名编号`；wecom `contacts`→`external_userid`、`chats`→`chat_id`、`mass_sends`→`send_id`。
+业务主键：tmall `buyers`→`buyer_id`、`trades`→`tid`；douyin `dy_orders`→`订单编号`；events `events`→`event_id`；activity `signups`→`报名编号`；wecom `contacts`→`external_userid`、`chats`→`chat_id`、`mass_sends`→`send_id`。
 
 观察点：抖店 CSV 的「买家手机号」被读成整数（DuckDB 自动推断），映射里要 `string()` 转回文本；活动表的「报名时间」是 `2026/9/1 14:05` 这种写法，被推断成了时间。
 
@@ -98,7 +98,7 @@ S3 都是：端点 `localhost:8333`，区域 `us-east-1`，路径风格 path，�
 
 | # | 操作 | 期望 |
 |---|---|---|
-| T2.1 | 消费者：pos `members`、mall `users`、loyalty `members`、tmall `buyers`、wecom `contacts`、events `users`、activity `signups`。抖音先到 douyin 数据源页建源视图 `douyin_buyers`（`views/douyin_s3.douyin_buyers.sql`），发布后映射 `douyin_s3.douyin_buyers.customer.yaml` | eng 不能发布自己的草稿；`verify.ts --only identity`：缺失、被拆开、误合并都是 0，统一消费者 59,161 |
+| T2.1 | 消费者：pos `members`、mall `users`、loyalty `members`、tmall `buyers`、wecom `contacts`、activity `signups`（埋点没有消费者表：事件的 `user_id` 跨源引用商城的消费者，见 T2.9）。抖音先到 douyin 数据源页建源视图 `douyin_buyers`（`views/douyin_s3.douyin_buyers.sql`），发布后映射 `douyin_s3.douyin_buyers.customer.yaml` | eng 不能发布自己的草稿；`verify.ts --only identity`：缺失、被拆开、误合并都是 0，统一消费者 59,161 |
 | T2.2 | **K1**：先把 pos `sales` 与 mall `orders` 的映射里的 `key_space` 删掉再发布 | 后合并的那个失败，列出冲突的订单号（两边都从 1 开始）。映射页「键体检」提示一致比例低、建议键空间 |
 | T2.3 | 加回 `key_space: pos` / `mall` 重新发布 | 合并成功；`SELECT count(*) FROM silver."order"` = pos + mall 之和 |
 | T2.4 | **K1b**：pos `sale_items` 的 `order_id` 先不写 `key_space` | 发布被拒：「引用字段要写上目标实体在同一数据源里声明的键空间」。补上后通过 |
@@ -106,7 +106,7 @@ S3 都是：端点 `localhost:8333`，区域 `us-east-1`，路径风格 path，�
 | T2.6 | 订单的其余两个源（tmall `trades`、douyin `dy_orders`）、明细（mall）、商品（只有 mall，K3） | `verify.ts --only silver` 订单、明细都是 ✔ |
 | T2.7 | **K2 / K6**：映射 `oms_mongo.orders.order.k2.yaml` 并发布 | 合并失败：订单号与天猫重复（同一批订单两路接入）。按 `tid` 去重后 P01 天猫单是 150 不是 999（K6，看空跑结果）。⚠️ 映射发布后撤不下来（#156）：发一个加了 `where: "false"` 的新版本让它不出行，合并恢复正常 |
 | T2.8 | 自定义实体：「实体」→ 登记 `custom_region`（region_id、region_name）、`custom_store`（store_id、store_name、region_id；关系 `order.store_id → custom_store.store_id`、`custom_store.region_id → custom_region.region_id`）、`custom_guide`（guide_id、guide_name 敏感、store_id；关系 `customer.x_guide_id → custom_guide.guide_id`、`custom_guide.store_id → custom_store.store_id`），都是「维度」，主键是各自的 ID。再映射 pos 的 regions、stores、guides | 关系要在订单、企微联系人的映射发布之后才能登记（要从已发布映射里取字段类型） |
-| T2.9 | 其余：loyalty 的会员、积分流水、券模板、券、同意、偏好；pos `members` 的短信同意；events `events`；wecom `chats`、`contacts` 的事件、`mass_sends`；activity `signups` 的事件。删好友与活动到场要先建源视图 `contact_deletes`、`attendances`（`views/`），再映射 | **同一张源表到同一个实体只能有一个映射**：一张表要出两类事件时用源视图拆。`verify.ts --only silver` 全部 ✔；设备归属不符 0 |
+| T2.9 | 其余：loyalty 的会员、积分流水、券模板、券、同意、偏好；pos `members` 的短信同意；events `events`（`customer_id` 声明 `customer_source: mall_pg`，商城的 customer 映射要先发布，`setup.ts` 先发消费者。以前的租户发布过埋点 `users` → customer 映射，撤不下来（#156），`seed.ts` 又不再造 `users/`：重建租户）；wecom `chats`、`contacts` 的事件、`mass_sends`；activity `signups` 的事件。删好友与活动到场要先建源视图 `contact_deletes`、`attendances`（`views/`），再映射 | **同一张源表到同一个实体只能有一个映射**：一张表要出两类事件时用源视图拆。`verify.ts --only silver` 全部 ✔；设备归属不符 0 |
 
 批量同步之后，如果有映射的「最近合并」比别的早：这是平台的既定行为（一次合并正在跑时，其他同步结束不再入队合并，等定时检查补上），点「立即合并」即可。
 
@@ -123,7 +123,7 @@ S3 都是：端点 `localhost:8333`，区域 `us-east-1`，路径风格 path，�
 | `revenue_by_city` | ⚠️ P01 分成三行：上海 300（商城）、杭州 300（POS）、未关联 150（天猫没城市）（K8，#145） |
 | `points_balance` | L1（P01）15；L2 0；L3 200（源端余额写的 999，对不上，#148） |
 | `points_earned_90d` | P01 100；L2 80 |
-| `views_7d` | E1 10；⚠️ P06 的 12 次匿名浏览不算（#154），verify 另外列出能归属到人的匿名浏览数 |
+| `views_7d` | E1 10；P06 12（匿名浏览经设备归属计入，verify 的期望也按设备全局最近一次登录的人算） |
 | `coupons_redeemed` | C1 1 |
 | `wecom_chats_30d` | P12 在导购 G0001 下 4 次 |
 | `activity_attended` | E3 1；P05、P11 各 1 |
@@ -193,7 +193,7 @@ node --env-file-if-exists=.env --import tsx scripts/rebuild-all.ts --tenant crml
 | 99000004 / 05 | P03 家人共用邮箱 | 同上 | 两个 |
 | 99000006 | P04 天猫无身份 | 没有 unionid 和手机 | 单独一个 |
 | 99000007 | P05 手机格式 | `+86 139-…`、`139…`、`139 0000 0007` | 一个 |
-| 99000008 | P06 匿名后登录 | 设备匿名浏览 12 次后登录 | 设备归属到他；⚠️ 指标里不计（#154） |
+| 99000008 | P06 匿名后登录 | 设备匿名浏览 12 次后登录 | 设备归属到他；`views_7d` = 12 |
 | 99000009 / 10 | P07 共享设备 | A 先登录、B 后登录 | 设备归 B |
 | 99000011 | P08 后来才连上 | 商城只有邮箱、POS 只有手机 | 第一轮两个，第二轮一个 |
 | 99000012 | P09 抖音未授权 | 只有 openid 与脱敏手机 | 单独一个（真实限制） |
@@ -219,7 +219,5 @@ node --env-file-if-exists=.env --import tsx scripts/rebuild-all.ts --tenant crml
 | #147 | 后来连上的人，统一消费者 ID 可能变 | T6.2 |
 | #148 | 积分余额与流水对不上发现不了 | L3 |
 | #149 | 活动报名表不能直接在页面上传 | T1 |
-| #150 | 埋点里的用户 ID 属于商城，平台只在本数据源内解析：现在靠埋点源的用户档案表 `users` 并人 | T2.1 |
-| #154 | 匿名事件不计入设备主人 | P06 |
 | #155 | 并发任务数大于 1 时，空的结果层上同时跑多个计算会冲突 | T0（并发先保持 1） |
 | #156 | 发布的映射撤不下来 | T2.7 |

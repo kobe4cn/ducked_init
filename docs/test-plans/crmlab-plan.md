@@ -19,7 +19,7 @@
 | 主键含 `customer_id` 的实体 | 同一人两个渠道的营销同意 | 按数据源内唯一，两行都留 | ⚠️ 消费者层无取舍 #145 |
 | 同一映射内的重复 | Mongo 同一订单两个版本文档 | 去重键 + 取最新 | ✅ |
 | 同一人多源属性不一致 | 商城上海、POS 杭州 | 无黄金记录，按城市做维度时此人算两行 | ❌ #145 |
-| 引用别的数据源的消费者 | 埋点的 `user_id` 是商城用户 ID | 只在本数据源内解析：埋点源要有自己的用户档案表才能并人 | ❌ #150 |
+| 引用别的数据源的消费者 | 埋点的 `user_id` 是商城用户 ID | 引用字段声明 `customer_source: mall_pg`，按 `(_customer_source, customer_id)` 在商城的消费者里找（ADR-0030） | ✅ |
 | 撤下发布错的映射 | K2 映射了重复的订单中台 | 映射发布后不能停用，只能发 `where: "false"` 的新版本 | ❌ #156 |
 
 **覆盖**（同键后到者悄悄覆盖）平台故意不做；**带来源区分**已完整；**去重**只在单个映射内完整。
@@ -66,7 +66,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | `oms_mongo` | MongoDB `crm_oms` | orders | 订单中台 | **全部天猫订单的第二份拷贝**（K2）；嵌套字段；约 2% 订单有旧版本文档 |
 | `loyalty_pg` | Postgres `crm_loyalty` | memberships、points_ledger、coupon_templates、coupons、consents、preferences | 会员中心 | 积分 earn / spend / redeem / expire / adjust，带 `balance_after`；同意按渠道 |
 | `wecom_duckdb` | DuckDB 文件（S3） | contacts、chats、mass_sends | 企业微信导购 | 外部联系人有 unionid；导购添加 / 删除好友（`add_time` / `del_time`）、聊天 → 行为事件；群发 → 营销触达（渠道 `wechat`） |
-| `events_s3` | S3 JSON（规模档 Parquet） | events、users | App / 小程序埋点 | view、add_to_cart、login；匿名事件只有 `device_id`；`user_id` 是商城用户 ID，`users` 是埋点平台的用户档案（手机、邮箱），靠它并人（#150） |
+| `events_s3` | S3 JSON（规模档 Parquet） | events | App / 小程序埋点 | view、add_to_cart、login；匿名事件只有 `device_id`；`user_id` 是商城用户 ID，映射声明 `customer_source: mall_pg` 跨源引用商城的消费者 |
 | `activity_s3` | S3 CSV | signups | 线下活动报名表 | 手填：姓名、手机（格式杂、有错号）、活动、报名时间、是否到场；有报名编号（声明为业务主键）。页面直接上传待 #149 |
 
 ### 2.3 数据如何进入各层
@@ -81,7 +81,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 
 | 标准实体 | 来自 | 关键配置 |
 |---|---|---|
-| customer | pos.members、mall.users、loyalty.members、tmall.buyers、douyin 买家（源视图）、wecom.contacts、events.users、activity.signups | 默认身份规则：手机 > 邮箱 > 外部 ID（unionid → `external_id`；抖音 openid 只当 `customer_id`，不当外部 ID） |
+| customer | pos.members、mall.users、loyalty.members、tmall.buyers、douyin 买家（源视图）、wecom.contacts、activity.signups（埋点没有消费者表，事件跨源引用商城的消费者） | 默认身份规则：手机 > 邮箱 > 外部 ID（unionid → `external_id`；抖音 openid 只当 `customer_id`，不当外部 ID） |
 | order | pos.sales（`key_space: pos`，`where: store_id <> 'T999'`）、mall.orders（`key_space: mall`）、tmall.trades、douyin.dy_orders | **不映射 oms.orders**（K2 先映射再撤下） |
 | order_item | pos.sale_items（引用 `key_space: pos`）、mall.order_items（`key_space: mall`） | `product_id` 跨源引用 mall 的商品 |
 | product | 只有 mall.products | 主数据单一来源（K3） |
@@ -128,8 +128,8 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | P03 家人共用邮箱 | 邮箱相同、手机不同 | 两个消费者 |
 | P04 天猫无身份 | 无 unionid、无手机 | 单独一个 |
 | P05 手机格式 | pos `+86 139-0000-0005`，mall `13900000005`，活动表 `139 0000 0005` | 一个 |
-| P06 匿名后登录 | 设备 D6 匿名浏览 12 次，后在该设备登录 | 设备归属到 P06；⚠️ 指标不计匿名事件（#154） |
-| P07 共享设备 | D7 先被 A、后被 B 登录 | 匿名事件全部归 B |
+| P06 匿名后登录 | 设备 D6 匿名浏览 12 次，后在该设备登录 | 登录事件经跨源引用找到 P06 的商城消费者，设备归属到 P06；12 次匿名浏览计入 P06（`views_7d` = 12） |
+| P07 共享设备 | D7 先被 A、后被 B 登录 | 两次登录都经跨源引用找到商城消费者，设备归 B，匿名事件全部归 B |
 | P08 后来才连上 | 第一轮 mall 与 pos 无共同字段；第二轮 pos 补了手机 | 第二轮合并；⚠️ `consumer_id` 可能变（#147） |
 | P09 抖音未授权 | 只有 openid | 单独一个；⚠️ 与同一人的商城记录连不上（真实限制，非缺陷） |
 | P10 抖音授权 | openid + 明文手机，与商城手机相同 | 并入商城那个人 |
@@ -158,7 +158,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | L1 积分全周期 | P01：earn +100、spend −30、redeem −50、expire −10、adjust +5 | 余额 15；近 90 天获得 100；`membership.points` = 15 |
 | L2 退款冲回 | 商城单 80 退款，积分 +80 后 adjust −80 | 余额 0；refunded 不计营收 |
 | L3 余额不一致 | `membership.points = 999`，流水求和 200 | ⚠️ 发现不了（#148） |
-| E1 浏览未购 | 近 7 天浏览 10、加购 2、无订单 | 浏览指标 10；⚠️「浏览未购」写不出（#146） |
+| E1 浏览未购 | 近 7 天浏览 10、加购 2、无订单 | 浏览经跨源引用算到商城那个消费者，浏览指标 10；⚠️「浏览未购」写不出（#146） |
 | E2 时区边界 | `--end` 前 4 天北京时间 07:30 的 POS 订单 | 标准层 `created_at` 是 UTC 前一天 23:30，按 UTC 日期计入窗口 |
 | E3 活动到场 | 报名 2 场、到场 1 场 | 到场数 1 |
 | C1 券 | 领 3 张：核销 1、过期 1、未用 1 | 核销数 1；⚠️ 核销率写不出（#146） |
@@ -201,7 +201,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | `revenue_by_region` | 维度 `order.store_id -> custom_store.region_id -> custom_region.region_name` | 线上订单「未关联」 |
 | `points_balance` | points_transaction，sum points_change | L1（P01）= 15 |
 | `points_earned_90d` | change_type = earn，90 天 | L1 = 100 |
-| `views_7d` | event_type = view，7 天 | E1 = 10；⚠️ P06 的匿名浏览不计（#154） |
+| `views_7d` | event_type = view，7 天，事件按 `_customer_source`（商城）找统一消费者 | E1 = 10；P06 = 12（匿名浏览经设备归属计入，登录事件同样跨源找到商城消费者） |
 | `coupons_redeemed` | status = redeemed | C1 = 1 |
 | `wecom_chats_30d` | event_type = wecom_chat，30 天，维度 `event.x_guide_id` | P12 在 G0001 下 4 |
 | `activity_attended` | event_type = activity_attend | E3 = 1 |
@@ -263,16 +263,14 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 
 ## 6. 交付物
 
-1. ✅ `scripts/crm-seed/`：`seed.ts`（真值 + 9 个数据源 + 第二轮变更 `--round 2`，`--persons` 控制规模，`--set` 分档）、`mappings/*.yaml`（33 个）、`views/*.sql`（3 个源视图）、`definitions/`（11 个指标、4 个标签）、`check-mappings.ts`（离线校验）、`setup.ts`（冒烟配置）、`verify.ts`（身份打通、设备归属、标准层、每个指标与标签逐行比对）、`README.md`（操作手册）。
+1. ✅ `scripts/crm-seed/`：`seed.ts`（真值 + 9 个数据源 + 第二轮变更 `--round 2`，`--persons` 控制规模，`--set` 分档）、`mappings/*.yaml`（32 个）、`views/*.sql`（3 个源视图）、`definitions/`（11 个指标、4 个标签）、`check-mappings.ts`（离线校验）、`setup.ts`（冒烟配置）、`verify.ts`（身份打通、设备归属、标准层、每个指标与标签逐行比对）、`README.md`（操作手册）。
 2. 规模档基线表 `docs/test-plans/crmlab-10m-baseline.md`。
-3. 每个 ⚠️ 用例的实测数字补到对应 issue（#143–#148、#150、#154–#156）作为证据。
+3. 每个 ⚠️ 用例的实测数字补到对应 issue（#143–#148、#155、#156）作为证据。
 
 ### 做造数与冒烟时新发现的缺口
 
 | issue | 发现于 |
 |---|---|
-| #150 跨数据源引用消费者 | 埋点的 `user_id` 是商城的 ID，单独登记的埋点源里事件归属不到人 |
-| #154 行为指标用上设备归属 | `silver._device_owner` 算出来了，但指标编译只用事件自己的 `customer_id` |
 | #155 并发结果层任务首次建 gold schema 冲突 | 冒烟租户并发数 4，`lake:reset` 后同时重算 15 个定义，1 个失败 |
 | #156 映射停用与删除 | K2 映射了重复的订单中台后撤不下来 |
 

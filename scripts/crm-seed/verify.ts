@@ -85,12 +85,8 @@ try {
   if (codes.has('oms')) console.log('⚠️ 登记了 oms_mongo：若它的订单映射还在发布状态，天猫订单会算两遍（K2）');
 
   // ---------- 1. 身份打通 ----------
-  // 期望：真值的 expected_identity；埋点的用户档案（events_s3.users）与同一人的商城记录同组
-  await con.run(`CREATE TEMP TABLE rid AS
-    SELECT src, customer_id, pid, group_rid FROM t.expected_identity
-    UNION ALL
-    SELECT 'events', e.customer_id, e.pid, e.group_rid FROM t.expected_identity e
-    WHERE e.src = 'mall' AND e.customer_id IN (SELECT customer_id FROM t.event WHERE event_type = 'login')`);
+  // 期望：真值的 expected_identity（埋点没有自己的消费者记录：事件的 user_id 跨源引用商城的消费者）
+  await con.run(`CREATE TEMP TABLE rid AS SELECT src, customer_id, pid, group_rid FROM t.expected_identity`);
   const identities = await has('_identities');
   await con.run(`CREATE TEMP TABLE act AS ${identities
     ? `SELECT m.code AS src, i.customer_id, i.consumer_id FROM lake.silver._identities i JOIN srcmap m ON m.source_id = i._source`
@@ -119,7 +115,7 @@ try {
     if (await has('_device_owner')) {
       show('设备归属（期望：不符为 0）', await q(`
         WITH last AS (SELECT device_id, arg_max(customer_id, occurred_utc) AS customer_id FROM t.event WHERE event_type = 'login' GROUP BY 1),
-        e AS (SELECT l.device_id, g.consumer_id FROM last l JOIN rid r ON r.src = 'events' AND r.customer_id = l.customer_id JOIN gcons g USING (group_rid))
+        e AS (SELECT l.device_id, g.consumer_id FROM last l JOIN rid r ON r.src = 'mall' AND r.customer_id = l.customer_id JOIN gcons g USING (group_rid))
         SELECT count(*) AS 期望设备, count(d.device_id) AS 平台有, count(*) FILTER (WHERE d.consumer_id IS DISTINCT FROM e.consumer_id) AS 不符,
           (SELECT count(*) FROM lake.silver._device_owner) AS 平台设备数
         FROM e LEFT JOIN lake.silver._device_owner d USING (device_id)`));
@@ -172,7 +168,10 @@ try {
     const facts = (table: string, src: string, key = 'customer_id', where = 'true') =>
       `(SELECT f.*, g.consumer_id FROM ${table} f JOIN rid r ON r.src = ${src} AND r.customer_id = f.${key} JOIN gcons g USING (group_rid) WHERE ${where})`;
     const orders = facts('t.ord', 'f.src', 'customer_id', 'NOT coalesce(f.test_store, false)');
-    const events = facts('t.event', `'events'`);
+    // 事件的 user_id 是商城的用户 ID（customer_source: mall_pg）；匿名事件计入设备主人：设备全局最近一次登录的人（#154，ADR-0025）
+    const events = facts(`(SELECT e.*, coalesce(e.customer_id, o.customer_id) AS owner_id FROM t.event e LEFT JOIN
+      (SELECT device_id, arg_max(customer_id, occurred_utc) AS customer_id FROM t.event WHERE event_type = 'login' GROUP BY 1) o
+      ON e.customer_id IS NULL AND o.device_id = e.device_id)`, `'mall'`, 'owner_id');
     /** 每个指标的期望：列为 consumer_id、维度…、value；dims 是维度列名 */
     const EXPECTED: Record<string, { dims: string[]; sql: (asOf: string) => string }> = {
       revenue_365d: { dims: [], sql: a => `SELECT consumer_id, sum(amount) AS value FROM ${orders} o WHERE ${PAID} AND ${win('created_utc', 365, a)} GROUP BY 1` },
@@ -250,14 +249,6 @@ try {
         await con.run(`CREATE OR REPLACE TEMP TABLE m_a AS SELECT * FROM lake.${s.table.split('.').map(ident).join('.')}`);
         await compare(label, 'm', dims, 'abs(e.value::DOUBLE - a.value::DOUBLE) >= 0.005');
         show(`${key} 探针`, await probeRows('m', dims));
-        if (key === 'views_7d') {
-          // #154：匿名浏览没有计入设备主人。这里按领域口径（设备最近一次登录的人）算出差距
-          show('views_7d 按设备归属的差距（#154：平台现在不计入匿名浏览）', await q(`
-            WITH owner AS (SELECT device_id, arg_max(customer_id, occurred_utc) AS customer_id FROM t.event WHERE event_type = 'login' GROUP BY 1)
-            SELECT count(*) AS 匿名浏览, count(o.device_id) AS 能归属到人的, count(*) FILTER (WHERE o.customer_id IS NULL) AS 从未登录的设备
-            FROM t.event e LEFT JOIN owner o USING (device_id)
-            WHERE e.customer_id IS NULL AND e.event_type = 'view' AND ${win('e.occurred_utc', 7, s.as_of)}`));
-        }
       } else {
         const tag = parse(s.yaml) as { metric: string; rules: { value: string | number; when: Record<string, number> }[]; default: string | number };
         if (!EXPECTED[tag.metric]) { console.log(`\n== ${label}：引用的指标 ${tag.metric} 不在 definitions/ 里，跳过`); continue; }
