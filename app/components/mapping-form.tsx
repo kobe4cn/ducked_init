@@ -8,7 +8,8 @@
 // 键空间（ADR-0024）：最上面是映射的键空间；指向别的实体的字段每行有键空间，没写时按同一数据源里目标实体已发布映射的键空间预填，
 // 预填值只在写这个字段时一并写进 YAML，打开表单不改 YAML；清空预填值不写进 YAML，重新打开表单时又会预填（发布时本来也要求写同源目标的键空间）。
 // 跨源引用（ADR-0030）：指向 customer 的字段在键空间旁选「所属数据源」，可选本租户有已发布 customer 映射的其他数据源，默认本数据源（不写 customer_source）
-import { useEffect, useMemo, useRef, useState } from 'react';
+// 扩展字段按当前的名字是已登记关系的起点（ADR-0019）、类型是文本且不敏感时同样有键空间（不预填），指向 customer 的还有「所属数据源」；不满足时写回删掉这两项。
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
 import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, KEY_SPACE_PATTERN, type CanonicalEntity, type CanonicalField, type FieldType } from '~/lib/canonical-model';
 import { parseExpression } from '~/lib/mapping-expr';
@@ -105,7 +106,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
           onEditYaml={onEditYaml}
         />
       ))}
-      <Extensions doc={doc} table={table} onWrite={writeExt} onEditYaml={onEditYaml} />
+      <Extensions doc={doc} table={table} origins={table?.relationOrigins[target.name] ?? {}} onWrite={writeExt} onEditYaml={onEditYaml} />
       {target.name === 'customer' && <Identity doc={doc} entity={target} onWrite={writeMatch} onEditYaml={onEditYaml} />}
     </div>
   );
@@ -218,8 +219,6 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
     setCustomerSource(source);
     if (choice) update(choice, keySpace, source);
   };
-  // YAML 里写的数据源不在可选里（没有已发布的 customer 映射、写的是本源）时也列出来，保存时由校验指出
-  const sourceNames = [...new Set([...customerSourceOptions.map(s => s.name), ...(customerSource ? [customerSource] : [])])];
   const keySpacePending = keySpace?.trim() && keySpace.trim() !== form.keySpace && choice && !problem;
   const topValues = (column?: string | null) => table?.columns.find(c => c.name === column)?.top?.map(t => t.value) ?? [];
   // 新对应的枚举字段选了源列：按常见取值新建值对照，其他取值默认记为空
@@ -294,25 +293,22 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
         </div>
       )}
       {!form.readonly && field.ref && (
-        <div data-form-key-space={field.name} className="flex flex-wrap items-center gap-2 text-xs">
-          <span className="text-muted-foreground">{`键空间（${field.ref.entity} 的主键所在）`}</span>
-          <Input className="h-7 w-40" aria-label={`${field.name} 的键空间`} placeholder="不写" value={keySpace ?? ''} onChange={e => changeKeySpace(e.target.value)} />
-          {field.ref.entity === 'customer' && (
-            <>
-              <span className="text-muted-foreground">所属数据源</span>
-              <NativeSelect size="sm" aria-label={`${field.name} 的所属数据源`} value={customerSource} onChange={e => changeCustomerSource(e.target.value)}>
-                <NativeSelectOption value="">本数据源</NativeSelectOption>
-                {sourceNames.map(name => <NativeSelectOption key={name} value={name}>{name}</NativeSelectOption>)}
-              </NativeSelect>
-            </>
-          )}
+        <ReferenceKeyControls
+          name={field.name}
+          target={field.ref.entity}
+          keySpace={keySpace ?? ''}
+          customerSource={customerSource}
+          options={customerSourceOptions}
+          onKeySpace={changeKeySpace}
+          onCustomerSource={changeCustomerSource}
+        >
           {keySpacePending && (
             <>
               <span className="text-muted-foreground">还没写进 YAML</span>
               <Button type="button" size="xs" variant="link" onClick={() => update(choice)}>写进 YAML</Button>
             </>
           )}
-        </div>
+        </ReferenceKeyControls>
       )}
       {!form.readonly && choice && form.dictionary && choice.transform !== 'fixed' && (
         <DictionaryEditor
@@ -331,10 +327,45 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
   );
 }
 
+/** 引用字段的键空间输入，指向 customer 时还有所属数据源下拉（空串是本数据源）；children 跟在后面 */
+function ReferenceKeyControls({ name, target, keySpace, customerSource, options, onKeySpace, onCustomerSource, children }: {
+  name: string;
+  /** 引用的终点实体 */
+  target: string;
+  keySpace: string;
+  customerSource: string;
+  /** 有已发布 customer 映射的其他数据源 */
+  options: { id: string; name: string }[];
+  onKeySpace: (keySpace: string) => void;
+  onCustomerSource: (source: string) => void;
+  children?: ReactNode;
+}) {
+  // YAML 里写的数据源不在可选里（没有已发布的 customer 映射、写的是本源）时也列出来，保存时由校验指出
+  const sourceNames = [...new Set([...options.map(s => s.name), ...(customerSource ? [customerSource] : [])])];
+  return (
+    <div data-form-key-space={name} className="flex flex-wrap items-center gap-2 text-xs">
+      <span className="text-muted-foreground">{`键空间（${target} 的主键所在）`}</span>
+      <Input className="h-7 w-40" aria-label={`${name} 的键空间`} placeholder="不写" value={keySpace} onChange={e => onKeySpace(e.target.value)} />
+      {target === 'customer' && (
+        <>
+          <span className="text-muted-foreground">所属数据源</span>
+          <NativeSelect size="sm" aria-label={`${name} 的所属数据源`} value={customerSource} onChange={e => onCustomerSource(e.target.value)}>
+            <NativeSelectOption value="">本数据源</NativeSelectOption>
+            {sourceNames.map(n => <NativeSelectOption key={n} value={n}>{n}</NativeSelectOption>)}
+          </NativeSelect>
+        </>
+      )}
+      {children}
+    </div>
+  );
+}
+
 /** 扩展字段区块：已有的扩展字段（可改，取消勾选即删除），以及还没用到的源列（勾选即加为扩展字段） */
-function Extensions({ doc, table, onWrite, onEditYaml }: {
+function Extensions({ doc, table, origins, onWrite, onEditYaml }: {
   doc: ReturnType<typeof parseDocument>;
   table: ReferenceTable | null;
+  /** 本实体已登记关系的起点字段 → 终点实体 */
+  origins: Record<string, string>;
   onWrite: (name: string, choice: ExtensionChoice | null) => void;
   onEditYaml: () => void;
 }) {
@@ -356,7 +387,15 @@ function Extensions({ doc, table, onWrite, onEditYaml }: {
         <>
           {/* 按位置作 key：改名时这一行不重新挂载，输入框不丢焦点 */}
           {extensions.map((form, i) => (
-            <ExtensionRow key={i} form={form} others={names.filter(n => n !== form.name)} onWrite={choice => onWrite(form.name, choice)} onEditYaml={onEditYaml} />
+            <ExtensionRow
+              key={i}
+              form={form}
+              others={names.filter(n => n !== form.name)}
+              origins={origins}
+              customerSourceOptions={table?.customerSources ?? []}
+              onWrite={choice => onWrite(form.name, choice)}
+              onEditYaml={onEditYaml}
+            />
           ))}
           {unused.length > 0 && <div className="pt-1 text-xs text-muted-foreground">没用到的源列，勾选即加为扩展字段：</div>}
           {unused.map(c => (
@@ -375,15 +414,24 @@ function Extensions({ doc, table, onWrite, onEditYaml }: {
   );
 }
 
-/** 一个已有的扩展字段：名字、类型、中文名可改，表达式只显示；名字不合格时只留在这一行，不写进 YAML */
-function ExtensionRow({ form, others, onWrite, onEditYaml }: {
+/**
+ * 一个已有的扩展字段：名字、类型、中文名可改，表达式只显示；名字或键空间不合格时只留在这一行，不写进 YAML。
+ * 按当前的名字是已登记关系的起点、类型是文本且不敏感时另有键空间（指向 customer 的还有所属数据源）；不满足时写回删掉这两项
+ */
+function ExtensionRow({ form, others, origins, customerSourceOptions, onWrite, onEditYaml }: {
   form: ExtensionForm;
   /** 其他扩展字段的名字 */
   others: string[];
+  /** 本实体已登记关系的起点字段 → 终点实体 */
+  origins: Record<string, string>;
+  /** 有已发布 customer 映射的其他数据源 */
+  customerSourceOptions: { id: string; name: string }[];
   onWrite: (choice: ExtensionChoice | null) => void;
   onEditYaml: () => void;
 }) {
-  const read = { name: form.name, type: form.type ?? 'string', label: form.label, sensitive: form.sensitive };
+  const read = {
+    name: form.name, type: form.type ?? 'string', label: form.label, sensitive: form.sensitive, keySpace: form.keySpace ?? '', customerSource: form.customerSource ?? '',
+  };
   const [draft, setDraft] = useState(read);
   // YAML 在别处改了时按 YAML 重新读出
   const current = JSON.stringify(read);
@@ -392,13 +440,18 @@ function ExtensionRow({ form, others, onWrite, onEditYaml }: {
     setSynced(current);
     setDraft(read);
   }
-  const problem = extensionNameProblem(draft.name, others);
+  const targetOf = (d: typeof draft) => (d.type === 'string' && !d.sensitive ? origins[d.name] : undefined);
+  const target = targetOf(draft);
+  const problemOf = (d: typeof draft) => extensionNameProblem(d.name, others) ?? (targetOf(d) ? keySpaceProblem(d.keySpace) : null);
+  const problem = problemOf(draft);
   const update = (next: typeof draft) => {
     setDraft(next);
-    if (extensionNameProblem(next.name, others)) return;
-    // 中文名写进 YAML 时去掉首尾空白：按写进去的样子记下，输入中的空格不被重新读出冲掉
-    setSynced(JSON.stringify({ ...next, label: next.label.trim() }));
-    onWrite({ ...next, expr: form.expr });
+    if (problemOf(next)) return;
+    const nextTarget = targetOf(next);
+    const refKeys = { keySpace: nextTarget ? next.keySpace.trim() : '', customerSource: nextTarget === 'customer' ? next.customerSource : '' };
+    // 中文名、键空间写进 YAML 时去掉首尾空白：按写进去的样子记下，输入中的空格不被重新读出冲掉
+    setSynced(JSON.stringify({ ...next, label: next.label.trim(), ...refKeys }));
+    onWrite({ ...next, expr: form.expr, ...refKeys });
   };
   return (
     <div data-form-extension={form.name} data-readonly={form.readonly || undefined} className="space-y-1 rounded-md border p-2">
@@ -437,6 +490,17 @@ function ExtensionRow({ form, others, onWrite, onEditYaml }: {
         )}
       </div>
       {form.expr && <code className="block rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap">{form.expr}</code>}
+      {!form.readonly && target && (
+        <ReferenceKeyControls
+          name={form.name}
+          target={target}
+          keySpace={draft.keySpace}
+          customerSource={draft.customerSource}
+          options={customerSourceOptions}
+          onKeySpace={keySpace => update({ ...draft, keySpace })}
+          onCustomerSource={customerSource => update({ ...draft, customerSource })}
+        />
+      )}
       {form.dictionary && !form.readonly && <div className="text-xs text-muted-foreground">带值字典或兜底，请在 YAML 里修改对照</div>}
       {form.readonly && (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">

@@ -378,14 +378,21 @@ export interface ExtensionForm {
   dictionary: boolean;
   /** 标成敏感：标准层只存加盐哈希，类型只能是文本 */
   sensitive: boolean;
+  /** 键空间与跨源引用的数据源（名字）：只有已登记关系的起点能写，没写时没有 */
+  keySpace?: string;
+  customerSource?: string;
   readonly: boolean;
   reason?: string;
 }
 
 /** 表单上对一个扩展字段的选择（name 是改名后的名字）；交给 writeExtension 写回 YAML */
-export interface ExtensionChoice { name: string; type: FieldType; expr: string; label?: string; sensitive?: boolean }
+export interface ExtensionChoice {
+  name: string; type: FieldType; expr: string; label?: string; sensitive?: boolean;
+  /** 空串或不带时删掉对应的键 */
+  keySpace?: string; customerSource?: string;
+}
 
-const EXTENSION_KEYS = ['type', 'expr', 'label', 'dictionary', 'otherwise', 'sensitive'];
+const EXTENSION_KEYS = ['type', 'expr', 'label', 'dictionary', 'otherwise', 'sensitive', 'key_space', 'customer_source'];
 
 /** extensions 下的字段表；没写时都没有，写的不是字段表时是原因 */
 function extensionsMap(doc: Document): { map?: YAMLMap; reason?: string } {
@@ -401,7 +408,7 @@ function readExtension(name: string, value: unknown): ExtensionForm {
     const node = value.get(key, true);
     return isScalar(node) ? node.value : node;
   };
-  const [type, expr, label, sensitive] = [get('type'), get('expr'), get('label'), get('sensitive')];
+  const [type, expr, label, sensitive, keySpace, customerSource] = [get('type'), get('expr'), get('label'), get('sensitive'), get('key_space'), get('customer_source')];
   const read: ExtensionForm = {
     ...form,
     type: FIELD_TYPE_NAMES.find(t => t === type) ?? null,
@@ -409,10 +416,13 @@ function readExtension(name: string, value: unknown): ExtensionForm {
     label: typeof label === 'string' ? label : '',
     dictionary: value.has('dictionary') || value.has('otherwise'),
     sensitive: sensitive === true,
+    ...(typeof keySpace === 'string' && { keySpace }),
+    ...(typeof customerSource === 'string' && { customerSource }),
   };
   const keys = value.items.map(p => (isScalar(p.key) ? p.key.value : null));
   if (keys.some(k => !EXTENSION_KEYS.includes(String(k))) || typeof expr !== 'string' || (label != null && typeof label !== 'string')
-    || (sensitive != null && typeof sensitive !== 'boolean')) {
+    || (sensitive != null && typeof sensitive !== 'boolean')
+    || (value.has('key_space') && typeof keySpace !== 'string') || (value.has('customer_source') && typeof customerSource !== 'string')) {
     return { ...read, readonly: true, reason: UNKNOWN };
   }
   if (!read.type) return { ...read, readonly: true, reason: `类型 ${String(type)} 不是标准层的类型，请在 YAML 里修改` };
@@ -468,7 +478,7 @@ export function unusedColumns<C extends { name: string }>(doc: Document, table: 
 
 /**
  * 把一个扩展字段的选择写回原 Document（null 表示删掉）。已有的改名时原位改键，类型、表达式、中文名、敏感只改变了的项，值字典、兜底与注释保留；
- * 新的以 { type, expr, label, sensitive } 追加在 extensions 末尾（不敏感时不写 sensitive），删光时去掉 extensions。只读的扩展字段、改名与已有的重名时抛错
+ * 键空间与数据源为空时删掉对应的键；新的以 { type, expr, label, sensitive, key_space, customer_source } 追加在 extensions 末尾（不敏感、没有值的不写），删光时去掉 extensions。只读的扩展字段、改名与已有的重名时抛错
  */
 export function writeExtension(doc: Document, name: string, choice: ExtensionChoice | null): void {
   const { map, reason } = extensionsMap(doc);
@@ -486,6 +496,8 @@ export function writeExtension(doc: Document, name: string, choice: ExtensionCho
   }
   if (choice.name !== name && map?.items.some(p => pairName(p.key) === choice.name)) throw new Error(nameTaken(choice.name));
   const label = choice.label?.trim();
+  const keySpace = choice.keySpace?.trim();
+  const customerSource = choice.customerSource?.trim();
   if (!pair) {
     const spec = new YAMLMap();
     spec.flow = true;
@@ -493,6 +505,8 @@ export function writeExtension(doc: Document, name: string, choice: ExtensionCho
     setKey(doc, spec, 'expr', choice.expr);
     if (label) setKey(doc, spec, 'label', label);
     if (choice.sensitive) setKey(doc, spec, 'sensitive', true);
+    if (keySpace) setKey(doc, spec, 'key_space', keySpace);
+    if (customerSource) setKey(doc, spec, 'customer_source', customerSource);
     if (map) map.items.push(doc.createPair(choice.name, spec));
     else {
       const extensions = new YAMLMap();
@@ -513,6 +527,10 @@ export function writeExtension(doc: Document, name: string, choice: ExtensionCho
   else spec.delete('label');
   if (choice.sensitive) set('sensitive', true);
   else spec.delete('sensitive');
+  if (keySpace) set('key_space', keySpace);
+  else spec.delete('key_space');
+  if (customerSource) set('customer_source', customerSource);
+  else spec.delete('customer_source');
 }
 
 /**

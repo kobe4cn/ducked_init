@@ -1,7 +1,7 @@
 // 映射表单与 YAML 互转（纯函数）：从映射 YAML 读出每个标准字段的表单状态（源列、常用转换、参数、依据、是否只读），
 // 改单个字段时在原 Document 上改，保留注释与顺序；枚举字段的值对照与兜底读出、写回；表单不认识的写法只读、原样保留；
 // 扩展字段：没用到的源列、读出已有的扩展字段、加上 / 改名 / 删除；映射与引用字段的键空间读出、写回，引用字段按同源目标实体的键空间预填；
-// 指向 customer 的引用字段的 customer_source 读出、写回
+// 指向 customer 的引用字段与扩展字段的 customer_source、扩展字段的键空间读出、写回
 import { parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
@@ -496,5 +496,40 @@ describe('跨源引用的数据源', () => {
     expect(field(readForm(doc, ORDER), 'customer_id')).not.toHaveProperty('customerSource');
     writeField(doc, ORDER, 'customer_id', { transform: 'direct', column: 'cid', customerSource: null });
     expect(doc.toString()).toBe(ORDERS_YAML);
+  });
+
+  it('扩展字段的键空间与数据源：读出、可写，写回通过校验；清空哪个删哪个，不带时两个都删', () => {
+    /** 标准订单的 x_buyer 指向消费者（关系登记在自定义实体上） */
+    const registered = new Map([['custom_buyer_note', {
+      name: 'custom_buyer_note', label: '买家备注', kind: 'fact' as const, primaryKey: ['ticket_no'], fields: [{ name: 'ticket_no', type: 'string' as const, sensitive: false }],
+      relations: [{ from: { entity: 'order', field: 'x_buyer' }, ref: { entity: 'customer', field: 'customer_id' } }],
+    }]]);
+    const yaml = `${ORDERS_YAML}extensions:\n  x_buyer: { type: string, expr: cid, key_space: crm, customer_source: crm } # 买家\n`;
+    const doc = parseDocument(yaml);
+    expect(readExtensions(doc).extensions[0]).toMatchObject({ name: 'x_buyer', keySpace: 'crm', customerSource: 'crm', readonly: false });
+    expect(readExtensions(parseDocument(yaml.replace('key_space: crm', 'key_space: 1'))).extensions[0].readonly).toBe(true);
+    expect(readExtensions(parseDocument(yaml.replace('customer_source: crm', 'customer_source: [crm]'))).extensions[0].readonly).toBe(true);
+    // 原样写回文本不变
+    writeExtension(doc, 'x_buyer', { name: 'x_buyer', type: 'string', expr: 'cid', keySpace: 'crm', customerSource: 'crm' });
+    expect(doc.toString()).toBe(yaml);
+    expect(checkMapping(doc.toString(), () => columns, registered, sources)).toMatchObject({
+      ok: true, plan: { columns: expect.arrayContaining([expect.objectContaining({ name: 'x_buyer', keySpace: 'crm', customerSource: 'src-crm' })]) },
+    });
+    // 选回本数据源：只删 customer_source
+    writeExtension(doc, 'x_buyer', { name: 'x_buyer', type: 'string', expr: 'cid', keySpace: 'crm', customerSource: '' });
+    expect(readExtensions(doc).extensions[0]).toMatchObject({ keySpace: 'crm' });
+    expect(readExtensions(doc).extensions[0]).not.toHaveProperty('customerSource');
+    // 清空键空间：只删 key_space
+    writeExtension(doc, 'x_buyer', { name: 'x_buyer', type: 'string', expr: 'cid', keySpace: ' ', customerSource: 'crm' });
+    expect(parseDocument(doc.toString()).toJS().extensions.x_buyer).toEqual({ type: 'string', expr: 'cid', customer_source: 'crm' });
+    // 不带（不再是关系起点、勾了敏感等）：两个都删，注释还在
+    writeExtension(doc, 'x_buyer', { name: 'x_buyer', type: 'string', expr: 'cid' });
+    expect(doc.toString()).toBe(`${ORDERS_YAML}extensions:\n  x_buyer: { type: string, expr: cid } # 买家\n`);
+
+    // 新的扩展字段有值时带上这两个键
+    const fresh = parseDocument(ORDERS_YAML);
+    writeExtension(fresh, 'x_buyer', { name: 'x_buyer', type: 'string', expr: 'cid', keySpace: 'crm', customerSource: 'crm' });
+    expect(fresh.toJS().extensions.x_buyer).toEqual({ type: 'string', expr: 'cid', key_space: 'crm', customer_source: 'crm' });
+    expect(checkMapping(fresh.toString(), () => columns, registered, sources)).toMatchObject({ ok: true });
   });
 });

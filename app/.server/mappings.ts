@@ -103,6 +103,8 @@ export interface ReferenceInput {
   keySpaces: Record<string, string>;
   /** 本租户有已发布 customer 映射的其他数据源（按名字排序），表单里指向 customer 的引用字段据此选所属数据源（customer_source） */
   customerSources: { id: string; name: string }[];
+  /** 已登记关系的起点（实体 → 起点字段 → 终点实体），不含标准模型内置的 ref；表单据此给扩展字段显示键空间与所属数据源 */
+  relationOrigins: Record<string, Record<string, string>>;
   columns: { name: string; type: string; nullRate: number; distinct: number; top: { value: string; rows: number }[] | null; formats: { format: string; share: number }[] }[];
 }
 
@@ -110,7 +112,7 @@ export interface ReferenceInput {
  * 编写映射时对照的源表（同步范围内、已采集的）：各列的类型、空值率、不同取值数与常见取值，
  * 主键（源端主键，没有时为声明的业务主键）与确认的水位线字段；其后是已发布的源视图（view 为真，只有列名与类型，没有列统计）。
  * 每张都带同一份键空间：同一数据源里已发布映射声明的键空间，同一实体有几个时取第一个（ADR-0024）；
- * 以及同一份跨源引用可选的数据源：有已发布 customer 映射的其他数据源（ADR-0030）
+ * 同一份跨源引用可选的数据源：有已发布 customer 映射的其他数据源（ADR-0030）；以及同一份已登记关系的起点（ADR-0019）
  */
 export async function referenceTables(actor: CurrentMember, sourceId: string): Promise<ReferenceInput[]> {
   assertCan(actor, 'sources:read');
@@ -123,10 +125,14 @@ export async function referenceTables(actor: CurrentMember, sourceId: string): P
   }
   const names = withCustomer.size ? await sourceNames(getDb(), actor.tenant.id) : new Map<string, string>();
   const otherCustomerSources = [...withCustomer].map(id => ({ id, name: names.get(id)! })).sort((a, b) => a.name.localeCompare(b.name));
+  const relationOrigins: Record<string, Record<string, string>> = {};
+  for (const r of [...(await publishedCustomEntities(getDb(), actor.tenant.id)).values()].flatMap(e => e.relations ?? [])) {
+    (relationOrigins[r.from.entity] ??= {})[r.from.field] = r.ref.entity;
+  }
   const views = (await publishedViews(getDb(), actor.tenant.id, { sourceId })).filter(v => v.columns)
     .sort((a, b) => a.name.localeCompare(b.name))
     .map(v => ({
-      name: v.name, view: true as const, sampleRows: 0, primaryKey: [] as string[], watermark: null, keySpaces, customerSources: otherCustomerSources,
+      name: v.name, view: true as const, sampleRows: 0, primaryKey: [] as string[], watermark: null, keySpaces, customerSources: otherCustomerSources, relationOrigins,
       columns: v.columns!.map(c => ({ name: c.name, type: c.type, nullRate: 0, distinct: 0, top: null, formats: [] })),
     }));
   return [...tables.map(({ table, watermark, key }) => ({
@@ -137,6 +143,7 @@ export async function referenceTables(actor: CurrentMember, sourceId: string): P
     watermark: watermark?.column ?? null,
     keySpaces,
     customerSources: otherCustomerSources,
+    relationOrigins,
     // formats：表单新建扩展字段时据此判断是否像敏感信息
     columns: table.columns.map(c => ({ name: c.name, type: c.type, nullRate: c.nullRate, distinct: c.distinct, top: c.top ?? null, formats: c.formats ?? [] })),
   })), ...views];

@@ -16,7 +16,7 @@ import { mappingTemplate } from '../../app/.server/pipeline/mapping-spec';
 import { entityOf } from '../../app/lib/canonical-model';
 import { referenceTables } from '../../app/.server/mappings';
 import {
-  keySpaceOf, newExtension, readForm, readKeySpace, unusedColumns, writeExtension, writeField, writeKeySpace, type FieldChoice,
+  keySpaceOf, newExtension, readExtensions, readForm, readKeySpace, unusedColumns, writeExtension, writeField, writeKeySpace, type FieldChoice,
 } from '../../app/lib/mapping-form';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -878,6 +878,33 @@ describe('表单式映射编辑器', () => {
     expect(saved.toJS().fields.order_id).toEqual({ expr: 'string(order_id)', key_space: 'pos' });
     expect((await author.post(`/mappings/${itemsId}`, { intent: 'save', yaml: saved.toString() })).status).toBe(302);
     expect((await reviewer.post(`/mappings/${itemsId}`, { intent: 'publish', version: '1' })).status).toBe(302);
+  });
+
+  it('键空间：已登记关系起点的扩展字段（order.x_ticket → custom_ticket）出现在对照数据的 relationOrigins 里，表单给它填的键空间能保存并发布', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const author = await loginAs(app, 'de@acme.com');
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+    // 关系起点的类型取自已发布的订单映射
+    const published = `${ORDERS}extensions:\n  x_ticket: { type: string, expr: status } # 工单号\n`;
+    const id = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: published }));
+    expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    const ticket = await createCustomEntity(await memberOf(tenantId, 'de@acme.com'), {
+      name: 'custom_ticket', label: '工单', kind: 'dimension', primaryKey: ['ticket_no'],
+      fields: [{ name: 'ticket_no', type: 'string', description: '工单号', sensitive: false }],
+      relations: [{ from: { entity: 'order', field: 'x_ticket' }, ref: { entity: 'custom_ticket', field: 'ticket_no' } }],
+    });
+    await publishCustomEntity(await memberOf(tenantId, 'de2@acme.com'), ticket, 1);
+    const table = (await referenceTables(await memberOf(tenantId, 'de@acme.com'), sourceId)).find(t => t.name === 'orders')!;
+    expect(table.relationOrigins).toEqual({ order: { x_ticket: 'custom_ticket' } });
+
+    const doc = parseDocument(editorYaml(await (await author.get(`/mappings/${id}`)).text()));
+    writeExtension(doc, 'x_ticket', { name: 'x_ticket', type: 'string', expr: 'status', keySpace: 'helpdesk' });
+    const yaml = doc.toString();
+    expect(yaml).toBe(published.replace('expr: status }', 'expr: status, key_space: helpdesk }'));
+    expect(readExtensions(doc).extensions[0]).toMatchObject({ keySpace: 'helpdesk', readonly: false });
+    expect((await author.post(`/mappings/${id}`, { intent: 'save', yaml })).status).toBe(302);
+    expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '2' })).status).toBe(302);
   });
 
   it('键空间：订单映射的草稿把键空间由 pos 改成 store 时，发布区列出同源订单明细映射与它的 order_id，这一版照常能发布', async () => {
