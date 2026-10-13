@@ -16,7 +16,8 @@ const NODE_STYLE: Record<GraphNode['kind'], React.CSSProperties> = {
   device: { background: '#f5f3ff', borderColor: '#c4b5fd' },
 };
 
-const EDGE_COLOR: Record<GraphEdge['kind'], string> = { ref: '#94a3b8', identity: '#059669', device: '#7c3aed' };
+/** 关系边的颜色；流向图的跨源边与经 _identities 的边同色 */
+export const EDGE_COLOR: Record<GraphEdge['kind'], string> = { ref: '#94a3b8', identity: '#059669', device: '#7c3aed' };
 const DISCONNECTED_NODE: React.CSSProperties = { background: '#f8fafc', borderColor: '#e2e8f0', borderStyle: 'dashed', color: '#94a3b8', opacity: 0.7 };
 const DISCONNECTED_EDGE = '#cbd5e1';
 

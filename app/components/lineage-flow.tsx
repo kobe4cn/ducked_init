@@ -10,6 +10,7 @@ import { Background, Controls, type Edge, MarkerType, type Node, type NodeChange
 import '@xyflow/react/dist/style.css';
 import { DRIFT_NODE_STYLE, DriftBadge } from '~/components/drift-badge';
 import { KindIcon } from '~/components/kind-icon';
+import { EDGE_COLOR } from '~/components/lineage-graph';
 import { driftAttrs, type DriftByTable } from '~/lib/lineage-drift';
 import { defaultCollapsed, type FlowData, type FlowInput, flowGraph, type FlowStatus, groupId, MERGE_STATUS } from '~/lib/lineage-flow';
 import { identityChangesLabel, ruleLabels } from '~/lib/lineage-graph';
@@ -24,8 +25,6 @@ const NODE_STYLE: Record<FlowData['kind'], React.CSSProperties> = {
   identity: { background: '#ecfdf5', borderColor: '#6ee7b7' },
   device: { background: '#f5f3ff', borderColor: '#c4b5fd' },
 };
-/** 跨源边与关系图里经 _identities 的边同色 */
-const CROSS_SOURCE_COLOR = '#059669';
 const FAILED: React.CSSProperties = { background: '#fef2f2', borderColor: '#fca5a5' };
 /** 变淡：悬停时与它无关的连线、反向查时没命中的节点与连线 */
 export const FADED = 0.15;
@@ -150,7 +149,7 @@ export function FlowGraphView({ flow, hits, drift }: { flow: FlowInput; hits?: S
 
   const edges = useMemo<Edge[]>(() => graph.edges.map(e => {
     const near = hovered !== null && (e.source === hovered || e.target === hovered);
-    const color = e.data?.crossSource ? CROSS_SOURCE_COLOR : '#94a3b8';
+    const color = e.data?.crossSource ? EDGE_COLOR.identity : EDGE_COLOR.ref;
     return {
       ...e,
       zIndex: 1,
