@@ -1,10 +1,12 @@
 // test/pipeline/key-check.test.ts —— 跨映射主键冲突体检的流水线接缝：checkKeysNow 入队 silver.keycheck → 调度器派发、只读挂载数据湖 → getKeyCheckStatus 读出报告；
-// 标准层与合并日志不变（ADR-0024「冲突体检」）。主键含指向 customer 的字段时按 _customer_source 比较（跨源引用，ADR-0030）
+// 标准层与合并日志不变（ADR-0024「冲突体检」）。主键含指向 customer 的字段时按 _customer_source 比较（跨源引用，ADR-0030）；
+// 同一合并组的映射对不报，组员与组外映射照报（ADR-0032）
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { checkKeysNow, getKeyCheckStatus, KeyCheckError } from '../../app/.server/key-check';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { runKeyCheck } from '../../app/.server/pipeline/key-check-engine';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
@@ -130,5 +132,27 @@ describe('主键冲突体检', () => {
     const [a, b] = [local, cross].sort();
     const consent = (await getKeyCheckStatus(author)).entities.find(e => e.entity === 'consent');
     expect(consent).toMatchObject({ bySource: true, pairs: [{ a, b, overlap: 3, suggestion: 'duplicate' }] });
+  });
+
+  it('同一合并组的映射对不报，组员与组外映射的重叠照报', async () => {
+    const { acme, author, reviewer, id, other } = await syncedSources();
+    const fromCustomers = await publish(author, reviewer, id, TOUCH_FROM_CUSTOMERS);
+    const fromOrders = await publish(author, reviewer, id, TOUCH_FROM_ORDERS);
+    // 组外的第三个映射（另一个数据源）只有 1..3 号订单，与两个组员都重叠
+    const outsider = await publish(author, reviewer, other, `${TOUCH_FROM_ORDERS}where: order_id <= 3\n`);
+    expect((await mergeUnchecked(acme, [fromOrders, outsider])).status).toBe('succeeded');
+
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      const columns = ['touch_id', 'campaign_id'];
+      const result = await runKeyCheck(session.con, { entities: [{
+        entity: 'touch', key: ['touch_id'], bySource: false,
+        mappings: [{ mapping: fromCustomers, columns, group: 'g1' }, { mapping: fromOrders, columns, group: 'g1' }, { mapping: outsider, columns }],
+      }] });
+      const pairs = result.entities[0].pairs.map(p => [[p.a, p.b].sort(), p.overlap, p.suggestion]);
+      expect(pairs.sort()).toEqual([[[fromCustomers, outsider].sort(), 3, 'duplicate'], [[fromOrders, outsider].sort(), 3, 'duplicate']].sort());
+    } finally {
+      session.close();
+    }
   });
 });

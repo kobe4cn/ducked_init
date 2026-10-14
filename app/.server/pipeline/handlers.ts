@@ -94,7 +94,7 @@ function mergeMappings(params: Params, drop: MergeDrop[]): MergeMappingParam[] {
   return mappings as MergeMappingParam[];
 }
 
-/** 合并参数里映射所在的合并组（ADR-0032）：组 ID、规则是三种之一、主键与组员（映射 ID、数据源、版本、去重键与引用列的数据源）非空 */
+/** 合并参数里映射所在的合并组（ADR-0032）：组 ID、规则是三种之一、主键与组员（映射 ID、数据源、版本、去重键、引用列的数据源与可选的敏感列）非空 */
 function isMergeGroup(group: unknown) {
   const g = group as Partial<MergeGroupParam> | null;
   const rule = g?.rule;
@@ -103,7 +103,8 @@ function isMergeGroup(group: unknown) {
     && Array.isArray(g.members) && g.members.length > 0 && g.members.every(m =>
       typeof m?.mapping === 'string' && typeof m.sourceId === 'string' && Number.isInteger(m.version) && isStrings(m.key)
       && (m.latest === null || typeof m.latest === 'string') && (m.keySpace === undefined || typeof m.keySpace === 'string')
-      && Array.isArray(m.refs) && m.refs.every(r => typeof r?.column === 'string' && typeof r.source === 'string'));
+      && Array.isArray(m.refs) && m.refs.every(r => typeof r?.column === 'string' && typeof r.source === 'string')
+      && (m.sensitive === undefined || (Array.isArray(m.sensitive) && m.sensitive.every(c => typeof c === 'string'))));
 }
 
 /** 合并参数里要撤下的停用映射（ADR-0031）；停用之前入队的合并没有这一项 */
@@ -173,13 +174,14 @@ function inspectExpected(params: Params): InspectParams['expected'] {
   return expected as InspectParams['expected'];
 }
 
-/** 主键冲突体检参数里的实体：主键、是否按数据源比较、各映射与映射出来的列（入队时由已发布映射算出） */
+/** 主键冲突体检参数里的实体：主键、是否按数据源比较、各映射与映射出来的列、所在的合并组（入队时由已发布映射算出） */
 function keyCheckTargets(params: Params): KeyCheckParams['entities'] {
   const { entities } = params;
   const valid = Array.isArray(entities) && entities.every(e =>
     typeof e?.entity === 'string' && isStrings(e.key) && typeof e.bySource === 'boolean'
-    && Array.isArray(e.mappings) && e.mappings.every((m: { mapping?: unknown; columns?: unknown }) => typeof m?.mapping === 'string' && isStrings(m.columns)));
-  if (!valid) throw new Error('参数 entities 必须是 { entity, key, bySource, mappings: { mapping, columns }[] } 列表');
+    && Array.isArray(e.mappings) && e.mappings.every((m: { mapping?: unknown; columns?: unknown; group?: unknown }) =>
+      typeof m?.mapping === 'string' && isStrings(m.columns) && (m.group === undefined || typeof m.group === 'string')));
+  if (!valid) throw new Error('参数 entities 必须是 { entity, key, bySource, mappings: { mapping, columns, group? }[] } 列表');
   return entities as KeyCheckParams['entities'];
 }
 

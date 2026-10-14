@@ -190,6 +190,10 @@ function KeyCheckSection({ keyCheck }: { keyCheck: LoaderData['keyCheck'] }) {
                   <span className="text-red-600">{`重叠 ${p.overlap.toLocaleString('zh-CN')} 个键`}</span>
                   <span className="text-slate-500">{percent(p.agreement)}</span>
                   <span className="text-slate-500">{`建议：${p.suggestionLabel}`}</span>
+                  {/* 主键按数据源比较的实体不能建合并组（ADR-0032） */}
+                  {p.suggestion === 'duplicate' && !e.bySource && (
+                    <Link to={`/merge-groups?entity=${encodeURIComponent(e.entity)}`} className="hover:underline" data-keycheck-merge-group>去建合并组</Link>
+                  )}
                 </div>
                 <div className="truncate font-mono text-xs text-slate-400">{`样本键：${p.samples.map(k => k.join(', ')).join('、')}`}</div>
               </li>

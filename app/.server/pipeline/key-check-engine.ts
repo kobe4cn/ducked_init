@@ -7,19 +7,19 @@ import { SILVER } from './lake-schemas';
 import { columnExists, ident, joinOn, keyList, lit, rows, silverTable, SILVER_SYSTEM_COLUMNS, tableExists } from './merge-engine';
 
 /**
- * 一个实体：主键、写入它的已发布映射（各带映射出来的列名）；bySource 为真时（主键含指向 customer 的字段）
- * 只在该字段指向的同一个数据源（数据源列 _customer_source / _<字段>_source）内比较主键
+ * 一个实体：主键、写入它的已发布映射（各带映射出来的列名与所在的已发布合并组 group）；bySource 为真时（主键含指向 customer 的字段）
+ * 只在该字段指向的同一个数据源（数据源列 _customer_source / _<字段>_source）内比较主键。同一合并组的映射对不报（ADR-0032）
  */
-export interface KeyCheckEntity { entity: string; key: string[]; bySource: boolean; mappings: { mapping: string; columns: string[] }[] }
+export interface KeyCheckEntity { entity: string; key: string[]; bySource: boolean; mappings: { mapping: string; columns: string[]; group?: string }[] }
 export type KeyCheckParams = { entities: KeyCheckEntity[] };
 
 /**
- * 建议：duplicate 一边的键全在另一边里，多半是重复接入；drop_one 同一批对象，去掉一边的映射；
+ * 建议：duplicate 一边的键全在另一边里，多半是重复接入，可以建合并组（ADR-0032）；drop_one 同一批对象，去掉一边的映射；
  * key_space 编号各自独立，声明键空间；review 需人工判断
  */
 export type KeyCheckSuggestion = 'duplicate' | 'drop_one' | 'key_space' | 'review';
 export const SUGGESTION_LABELS: Record<KeyCheckSuggestion, string> = {
-  duplicate: '多半是重复接入',
+  duplicate: '多半是重复接入，可以建合并组',
   drop_one: '同一批对象，去掉一边的映射',
   key_space: '编号各自独立，声明键空间',
   review: '需人工判断',
@@ -45,7 +45,7 @@ export function suggestionOf({ overlap, keysA, keysB, agreement }: { overlap: nu
 
 const SAMPLES = 5;
 
-/** 体检本租户标准层里各实体的主键。标准层还没有的表、只有一个映射写入的实体跳过；没有重叠的映射对与实体不进结果 */
+/** 体检本租户标准层里各实体的主键。标准层还没有的表、只有一个映射写入的实体跳过；没有重叠的映射对、同一合并组的映射对与没有剩下映射对的实体不进结果 */
 export async function runKeyCheck(con: DuckDBConnection, { entities }: KeyCheckParams): Promise<KeyCheckResult> {
   const result: KeyCheckResult['entities'] = [];
   for (const { entity, key, bySource, mappings } of entities) {
@@ -67,17 +67,18 @@ export async function runKeyCheck(con: DuckDBConnection, { entities }: KeyCheckP
         FROM k x JOIN k y ON ${joinOn(on, 'x', 'y')} AND x._mapping < y._mapping GROUP BY x._mapping, y._mapping)
       SELECT o.a, o.b, o.overlap, o.samples, na.n AS keys_a, nb.n AS keys_b
       FROM o JOIN n na ON na._mapping = o.a JOIN n nb ON nb._mapping = o.b ORDER BY o.a, o.b`);
-    if (!overlaps.length) continue;
     const pairs: KeyCheckPair[] = [];
     for (const o of overlaps) {
+      const [a, b] = [o.a, o.b].map(id => mappings.find(m => m.mapping === id)!);
+      if (a.group && a.group === b.group) continue;
       const overlap = Number(o.overlap);
-      const agreement = await agreementOf(con, table, on, key, mappings.find(m => m.mapping === o.a)!, mappings.find(m => m.mapping === o.b)!, overlap);
+      const agreement = await agreementOf(con, table, on, key, a, b, overlap);
       pairs.push({
         a: o.a, b: o.b, overlap, samples: o.samples, agreement,
         suggestion: suggestionOf({ overlap, keysA: Number(o.keys_a), keysB: Number(o.keys_b), agreement }),
       });
     }
-    result.push({ entity, bySource, pairs });
+    if (pairs.length) result.push({ entity, bySource, pairs });
   }
   return { entities: result.sort((x, y) => x.entity.localeCompare(y.entity)) };
 }

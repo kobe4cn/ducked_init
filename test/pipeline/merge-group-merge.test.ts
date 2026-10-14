@@ -1,5 +1,5 @@
 // test/pipeline/merge-group-merge.test.ts —— 按合并组合并的流水线接缝（ADR-0032）：publishMergeGroup / 发布组员映射 → 调度器派发合并 →
-// 标准层 silver.order 里组内同一主键只有一行，字段按存活规则取值；组外的映射撞键仍按独占失败；
+// 标准层 silver.order 里组内同一主键只有一行，字段按存活规则取值，合并记录写下重叠与不一致；组外的映射撞键仍按独占失败；
 // 同步后的增量合并只重算受影响的主键；停用、恢复组员时整组重算，组失效后各自一行
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
@@ -9,13 +9,13 @@ import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-
 import { runAssertions } from '../../app/.server/pipeline/assertions';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
-import type { MergeMappingParam, MergeRecord } from '../../app/.server/pipeline/merge-engine';
+import type { GroupStat, MergeMappingParam, MergeRecord } from '../../app/.server/pipeline/merge-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { listTasks } from '../../app/.server/tasks';
 import type { MergeRule } from '../../app/lib/merge-groups';
 import { resetDb } from '../http/harness';
 import { onLake, publish, silver } from './fixtures';
-import { LOYALTY_ORDERS, publishedIdentitySources } from './identity-fixtures';
+import { CRM_ORDERS, LOYALTY_ORDERS, publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -134,6 +134,30 @@ describe('按合并组合并', () => {
     expect(rows[5]).toMatchObject({ id: 'A6', mapping: crm, customer_source: sources.crm });
   });
 
+  it('合并记录写下组内重叠的订单号数与各字段不一致的订单号，敏感字段只计数', async () => {
+    const fixture = await withOrders();
+    const { author, reviewer, crm, loyalty } = fixture;
+    await group(fixture, [loyalty, crm], { kind: 'priority' });
+    const buyer = (expr: string) => `extensions:\n  x_buyer: { type: string, expr: '${expr}', sensitive: true }\n`;
+    await republishLoyalty(fixture, `${overlapping()}${buyer('string(member_id)')}`);
+    await publishMapping(reviewer, crm, await saveDraft(author, crm, `${CRM_ORDERS}${buyer('string(customer)')}`));
+    await drain();
+
+    const [record] = (await getMapping(author, crm)).merge.history;
+    expect(record).toMatchObject({ mode: 'rebuild' });
+    const stat = (record as { group: GroupStat }).group;
+    expect(stat.overlap).toBe(5);
+    // A1..A5 两边都有：金额、下单时间全不同，下单人只有 A1 一样，状态只有 A4（refunded / completed），更新时间只有 A5；会员没有 paid_at，不算不一致
+    expect([...stat.conflicts].sort((a, b) => a.field.localeCompare(b.field))).toEqual([
+      { field: 'amount', count: 5, samples: ['A1', 'A2', 'A3', 'A4', 'A5'] },
+      { field: 'created_at', count: 5, samples: ['A1', 'A2', 'A3', 'A4', 'A5'] },
+      { field: 'customer_id', count: 4, samples: ['A2', 'A3', 'A4', 'A5'] },
+      { field: 'status', count: 1, samples: ['A4'] },
+      { field: 'updated_at', count: 1, samples: ['A5'] },
+      { field: 'x_buyer', count: 4, samples: [] },
+    ]);
+  });
+
   it('组外的映射撞键仍按独占失败，标准层不变', async () => {
     const fixture = await withOrders();
     const { acme, author, reviewer, crm, loyalty, sources } = fixture;
@@ -193,7 +217,8 @@ describe('按合并组合并', () => {
     });
 
     for (const id of [crm, loyalty]) {
-      expect((await getMapping(author, id)).merge.history[0]).toMatchObject({ mode: 'incremental' });
+      // 只统计重算的订单号：A6 只在 CRM，会员删掉 1 号后 A1 也只剩 CRM
+      expect((await getMapping(author, id)).merge.history[0]).toMatchObject({ mode: 'incremental', group: { overlap: 0, conflicts: [] } });
     }
     const rows = await orders(acme);
     expect(rows.map(r => r.id)).toEqual(['A1', 'A2', 'A3', 'A4', 'A5', 'A6']);

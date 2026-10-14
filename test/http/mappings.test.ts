@@ -249,7 +249,8 @@ describe('编写与发布映射', () => {
     expect(page).toContain('重叠 40 个键');
     expect(page).toContain('1、10、11、12、13');
     expect(page).toContain('一致 0%');
-    expect(page).toContain('多半是重复接入');
+    expect(page).toContain('多半是重复接入，可以建合并组');
+    expect(page).toContain('href="/merge-groups?entity=touch"');
     expect(page).toContain('电商库 / customers');
 
     for (const intent of ['merge', 'create', 'draft']) {

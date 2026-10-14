@@ -24,7 +24,7 @@ import { functionList } from '~/lib/mapping-expr';
 import { isEnumField } from '~/lib/mapping-form';
 import type { ColumnField, PlanDiff } from '~/lib/mapping-diff';
 import type { DryRunResult } from '~/.server/pipeline/dry-run-engine';
-import type { FallbackStat } from '~/.server/pipeline/merge-engine';
+import type { FallbackStat, GroupStat } from '~/.server/pipeline/merge-engine';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel, entityOf, isCustomEntity } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
@@ -196,9 +196,18 @@ const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixe
 type LoaderData = Route.ComponentProps['loaderData'];
 type MergeEntry = LoaderData['merge']['history'][number];
 
+/** 字段在实体上的名称，扩展字段没有名称时用字段名 */
+const fieldLabel = (entity: string, field: string) => entityOf(entity)?.fields.find(x => x.name === field)?.label ?? field;
+
 /** 一列落入兜底的情况，字段用实体上的名称（见 fallbackText） */
-const columnFallbackText = (entity: string, f: FallbackStat, what?: string) =>
-  fallbackText(entityOf(entity)?.fields.find(x => x.name === f.column)?.label ?? f.column, f, what);
+const columnFallbackText = (entity: string, f: FallbackStat, what?: string) => fallbackText(fieldLabel(entity, f.column), f, what);
+
+/** 合并组的重叠与不一致（ADR-0032）：「合并组：重叠 N 行，不一致 字段 n 行（如 样本主键）…」 */
+const groupStatText = (entity: string, { overlap, conflicts }: GroupStat) => {
+  const conflict = (c: GroupStat['conflicts'][number]) =>
+    `${fieldLabel(entity, c.field)} ${c.count.toLocaleString('zh-CN')} 行${c.samples.length ? `（如 ${c.samples.join('、')}）` : ''}`;
+  return `合并组：重叠 ${overlap.toLocaleString('zh-CN')} 行${conflicts.length ? `，不一致 ${conflicts.map(conflict).join('，')}` : ''}`;
+};
 
 /** 把落入兜底的取值加进值对照：打开编辑标签页的表单，定位到该字段（只用于标准枚举字段） */
 const addToDictionaryHref = (base: string, f: FallbackStat) =>
@@ -231,6 +240,11 @@ function MergeRow({ e, base, canWrite }: { e: MergeEntry; base: string; canWrite
             )}
           </div>
         ))}
+        {e.group && (
+          <div className="text-sm text-muted-foreground" data-merge-overlap={e.group.overlap}>
+            {groupStatText(e.entity, e.group)}
+          </div>
+        )}
       </TableCell>
       <TableCell>{duration(e.durationMs)}</TableCell>
       <TableCell>{time(e.startedAt)}</TableCell>

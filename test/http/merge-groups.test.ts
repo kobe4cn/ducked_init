@@ -1,10 +1,14 @@
 // test/http/merge-groups.test.ts —— 合并组的 HTTP 接缝（ADR-0032）：数据工程师从映射页进合并组页，给 order 的两个已发布映射排优先级、选存活规则保存草稿（不合格时页面给出原因，什么也不存），
-// 最后保存的人发布不了，另一位成员发布；再改是新的一版草稿，可丢弃回到已发布版本。分析师只读，查看者 403
+// 最后保存的人发布不了，另一位成员发布；再改是新的一版草稿，可丢弃回到已发布版本。分析师只读，查看者 403。
+// 组员映射的合并记录显示组内重叠的行数与各字段不一致的行数
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mergeGroups } from '../../app/.server/db/schema';
+import { publishMapping, saveDraft } from '../../app/.server/mappings';
+import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-groups';
+import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { memberOf } from '../pipeline/fixtures';
-import { publishedIdentitySources } from '../pipeline/identity-fixtures';
+import { LOYALTY_ORDERS, publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
@@ -61,5 +65,19 @@ describe('合并组页', () => {
     expect((await analystBrowser.post('/merge-groups', form)).status).toBe(403);
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     expect((await (await loginAs(app, 'viewer@acme.com')).get('/merge-groups')).status).toBe(403);
+  });
+
+  it('组员映射的合并记录行显示组内重叠的行数与各字段不一致的行数（带样本主键）', async () => {
+    const { author, reviewer, orderMappings } = await publishedIdentitySources({ orders: true });
+    const { crm, loyalty } = orderMappings!;
+    await publishMergeGroup(reviewer, 'order', await saveMergeGroupDraft(author, 'order', { members: [loyalty, crm], rule: { kind: 'priority' } }));
+    // 会员订单号写成 A<id>，与 CRM 的 A1..A5 重叠
+    await publishMapping(reviewer, loyalty, await saveDraft(author, loyalty, LOYALTY_ORDERS.replace('order_id: string(id)', "order_id: concat('A', string(id))")));
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    const page = await (await (await loginAs(app, 'de@acme.com')).get(`/mappings/${loyalty}?tab=merges`)).text();
+    expect(page).toContain('data-merge-overlap="5"');
+    expect(page).toContain('合并组：重叠 5 行，不一致');
+    expect(page).toContain('订单状态 1 行（如 A4）');
   });
 });

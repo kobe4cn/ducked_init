@@ -13,14 +13,14 @@
 | 情况 | 例子 | 平台现在怎么处理 | 是否解决 |
 |---|---|---|---|
 | 编号各自独立（应**带来源区分**） | POS 与商城订单号都从 1 开始 | 默认**独占**：撞键的映射合并失败并列出冲突键；声明 `key_space` 后主键写成 `pos:1` / `mall:1`，引用字段同样声明，发布时检查一致 | ✅ |
-| 同一批对象两路进来（应**去重合并**） | 天猫订单既从 S3 导出、又经订单中台进来 | 独占拦住，冲突体检建议去掉一边 | ❌ #144 |
+| 同一批对象两路进来（应**去重合并**） | 天猫订单既从 S3 导出、又经订单中台进来 | 独占拦住，冲突体检判为重复接入、建议建合并组；两个映射建**合并组**（ADR-0032）后同一主键按存活规则并成一行，互补字段都在，合并记录显示重叠与不一致 | ✅ |
 | 共用的主数据（应**只留一份**） | 商城维护 SKU，POS 只引用 | 约定一个数据源维护、其他只引用 | ✅ 单源维护可行；多源各维护部分字段 ❌ #144 |
 | 消费者 | 两个源都有 `customer_id = 1` | 按 `(_source, customer_id)` 区分，身份打通归并 | ✅ |
 | 主键含 `customer_id` 的实体 | 同一人两个渠道的营销同意 | 按数据源内唯一，两行都留 | ⚠️ 消费者层无取舍 #145 |
 | 同一映射内的重复 | Mongo 同一订单两个版本文档 | 去重键 + 取最新 | ✅ |
 | 同一人多源属性不一致 | 商城上海、POS 杭州 | 无黄金记录，按城市做维度时此人算两行 | ❌ #145 |
 | 引用别的数据源的消费者 | 埋点的 `user_id` 是商城用户 ID | 引用字段声明 `customer_source: mall_pg`，按 `(_customer_source, customer_id)` 在商城的消费者里找（ADR-0030） | ✅ |
-| 撤下发布错的映射 | K2 映射了重复的订单中台 | 映射发布后不能停用，只能发 `where: "false"` 的新版本 | ❌ #156 |
+| 撤下发布错的映射 | 映射发错了，或源已下线 | 停用（提议与确认由两人分别做），撤下它在标准层的行，可恢复（ADR-0031）；K2 的重复接入改用合并组，不再撤下 | ✅ |
 
 **覆盖**（同键后到者悄悄覆盖）平台故意不做；**带来源区分**已完整；**去重**只在单个映射内完整。
 
@@ -63,7 +63,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | `mall_pg` | Postgres `crm_mall` | users、orders、order_items、products | 自营商城 + 小程序 | timestamptz；channel = web / miniapp；**订单号也从 1 开始**；商品主数据只在这里 |
 | `tmall_s3` | S3 Parquet | buyers、trades | 天猫旗舰店 | Unix 毫秒；只有 unionid 与掩码手机；无水位线（全量比对） |
 | `douyin_s3` | S3 CSV | dy_orders | 抖店 | 每单一行、买家信息内嵌在订单里（同一买家多行，要用源视图拆出买家）；只有抖音 openid，约 40% 授权了明文手机；金额以分计；状态码数字 |
-| `oms_mongo` | MongoDB `crm_oms` | orders | 订单中台 | **全部天猫订单的第二份拷贝**（K2）；嵌套字段；约 2% 订单有旧版本文档 |
+| `oms_mongo` | MongoDB `crm_oms` | orders | 订单中台 | **全部天猫订单的第二份拷贝**（K2），另有物流公司、物流状态；嵌套字段；约 2% 订单有旧版本文档 |
 | `loyalty_pg` | Postgres `crm_loyalty` | memberships、points_ledger、coupon_templates、coupons、consents、preferences | 会员中心 | 积分 earn / spend / redeem / expire / adjust，带 `balance_after`；同意按渠道 |
 | `wecom_duckdb` | DuckDB 文件（S3） | contacts、chats、mass_sends | 企业微信导购 | 外部联系人有 unionid；导购添加 / 删除好友（`add_time` / `del_time`）、聊天 → 行为事件；群发 → 营销触达（渠道 `wechat`） |
 | `events_s3` | S3 JSON（规模档 Parquet） | events | App / 小程序埋点 | view、add_to_cart、login；匿名事件只有 `device_id`；`user_id` 是商城用户 ID，映射声明 `customer_source: mall_pg` 跨源引用商城的消费者 |
@@ -82,7 +82,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | 标准实体 | 来自 | 关键配置 |
 |---|---|---|
 | customer | pos.members、mall.users、loyalty.members、tmall.buyers、douyin 买家（源视图）、wecom.contacts、activity.signups（埋点没有消费者表，事件跨源引用商城的消费者） | 默认身份规则：手机 > 邮箱 > 外部 ID（unionid → `external_id`；抖音 openid 只当 `customer_id`，不当外部 ID） |
-| order | pos.sales（`key_space: pos`，`where: store_id <> 'T999'`）、mall.orders（`key_space: mall`）、tmall.trades、douyin.dy_orders | **不映射 oms.orders**（K2 先映射再撤下） |
+| order | pos.sales（`key_space: pos`，`where: store_id <> 'T999'`）、mall.orders（`key_space: mall`）、tmall.trades、douyin.dy_orders、oms.orders（K2） | oms.orders 与 tmall.trades 建合并组（天猫优先、逐字段补齐），订单中台补进物流公司 / 物流状态（`x_` 扩展字段），买家 `customer_source: tmall_s3` |
 | order_item | pos.sale_items（引用 `key_space: pos`）、mall.order_items（`key_space: mall`） | `product_id` 跨源引用 mall 的商品 |
 | product | 只有 mall.products | 主数据单一来源（K3） |
 | membership / points_transaction / coupon / coupon_template / consent / preference | loyalty_pg | `points_change` 带正负 |
@@ -142,7 +142,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 |---|---|---|
 | K1 编号独立 | pos 与 mall 订单号都从 1 开始 | 不声明键空间：后合并的映射失败并列出冲突键；体检「一致比例低 → 键空间」；声明后订单数 = 两边之和 |
 | K1b 引用忘了键空间 | sale_items.order_id 不写 `key_space` | 发布被拒，列出字段 |
-| K2 重复接入 | oms.orders 与 tmall.trades 同一批 tid | 映射 oms 后合并失败；体检判为重复接入；撤下后天猫金额不翻倍；⚠️ 不能合并互补字段（#144） |
+| K2 重复接入 | oms.orders 与 tmall.trades 同一批 tid | 映射 oms 后合并失败；体检判为重复接入、建议「可以建合并组」；建组（天猫优先、逐字段补齐）后每个 tid 一行、天猫金额不翻倍，物流公司 / 物流状态由订单中台补进来，下单人仍打通到天猫买家；合并记录显示重叠行数与各字段不一致数；体检不再报这对映射 |
 | K3 共用主数据 | POS 明细引用 mall 的 SKU | 按 `order_item.product_id → product.category` 分组时 POS 明细也有品类 |
 | K4 消费者同号 | pos 与 mall 都有 `customer_id = 1`（不同人） | 两个消费者 |
 | K5 同意冲突 | P01 在会员中心同意短信（早），POS 撤回（晚） | `_consumer_consent` 里 P01 短信为 revoked |
@@ -188,7 +188,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | T2.1 | 映射 6 个消费者来源（抖音先建源视图拆买家），双人发布 | 起草人不能发布自己的；`_identities` 消费者数 = 真实人数 |
 | T2.2 | 映射 pos.sales 与 mall.orders，都不写键空间 | K1 |
 | T2.3 | 加键空间；sale_items 先不写引用键空间 | K1b，补上后通过 |
-| T2.4 | 映射 tmall.trades，再映射 oms.orders | K2、K6，然后撤下 oms |
+| T2.4 | 映射 tmall.trades，再映射 oms.orders，然后在合并组页给两者建组（天猫优先、逐字段补齐）并由另一人发布 | K2、K6 |
 | T2.5 | `where`、商品只从 mall、登记 store / region / guide 与关系 | K3、K7 |
 | T2.6 | 映射积分、券、同意、偏好、事件、企微、活动 | K5；P06、P07、P12、E3 |
 

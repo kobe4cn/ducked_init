@@ -17,7 +17,8 @@ export class KeyCheckError extends Error {}
 
 /**
  * 体检参数里的实体：按实体汇总已发布映射，带上实体主键与 bySource（主键里有字段指向 customer：标准实体看字段上内置的 ref，
- * 自定义实体与扩展字段看已发布登记上的关系）。customer 与主键未知的实体不放进去
+ * 自定义实体与扩展字段看已发布登记上的关系）。customer 与主键未知的实体不放进去。
+ * 映射在已发布合并组里时带上组 ID（publishedPlans 只给可用组员至少 2 个的组填 group），体检不报同组的映射对
  */
 export function keyCheckEntities(plans: MergeMappingParam[], published: Map<string, RegisteredEntity>): KeyCheckParams['entities'] {
   const relations = [...published.values()].flatMap(e => e.relations ?? []);
@@ -31,7 +32,7 @@ export function keyCheckEntities(plans: MergeMappingParam[], published: Map<stri
     if (!key) return [];
     return [{
       entity, key, bySource: key.some(f => toCustomer(entity, f)),
-      mappings: group.map(p => ({ mapping: p.mapping, columns: p.columns.map(c => c.name) })),
+      mappings: group.map(p => ({ mapping: p.mapping, columns: p.columns.map(c => c.name), ...(p.group && { group: p.group.id }) })),
     }];
   });
 }

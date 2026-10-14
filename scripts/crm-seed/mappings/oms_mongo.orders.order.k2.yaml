@@ -1,12 +1,14 @@
-# oms_mongo（MongoDB）orders → 订单：只在 K2 用例里临时发布，演示「同一批订单两路接入」，用完撤下（#144）。
+# oms_mongo（MongoDB）orders → 订单：只在 K2 用例里发布，演示「同一批订单两路接入」：与天猫订单 tmall_s3.trades 建合并组（ADR-0032），
+# 同一 tid 并成一行，订单中台独有的物流公司 / 物流状态补进来。
 # 嵌套字段按下划线展开（buyer.id → buyer_id，payment.total → payment_total）；约 2% 订单另有一个旧版本文档（同一 tid），
-# 按 tid 去重、取 updated_at 最新的一版（K6：P01 的天猫订单旧版本金额 999，去重后是 150）；Mongo 的 Date 是 UTC
+# 按 tid 去重、取 updated_at 最新的一版（K6：P01 的天猫订单旧版本金额 999，去重后是 150）；Mongo 的 Date 是 UTC。
+# 买家 ID 是天猫的买家，订单中台没有自己的消费者表：customer_source 指向 tmall_s3（ADR-0030）
 model: 1
 entity: order
 table: orders
 fields:
   order_id: tid
-  customer_id: buyer_id
+  customer_id: { expr: buyer_id, customer_source: tmall_s3 }
   status:
     expr: status
     dictionary:
@@ -21,4 +23,7 @@ fields:
   paid_at: payment_paid_at
   channel: "'tmall'"
   updated_at: updated_at
+extensions:
+  x_logistics_company: { type: string, expr: logistics_company, label: 物流公司 }
+  x_logistics_status: { type: string, expr: logistics_status, label: 物流状态 }
 dedupe: { key: [order_id], latest: updated_at }

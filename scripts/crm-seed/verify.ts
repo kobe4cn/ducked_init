@@ -20,7 +20,7 @@ import { tenantIdBySlug } from '../../app/.server/tenants';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-/** 登记名 → 真值里的来源代码；oms_mongo 只在 K2 里临时映射，不算进期望 */
+/** 登记名 → 真值里的来源代码；oms_mongo 只在 K2 里映射（与天猫订单建合并组），不算进期望 */
 const SOURCE_CODES: Record<string, string> = {
   pos_mysql: 'pos', mall_pg: 'mall', loyalty_pg: 'loyalty', tmall_s3: 'tmall', douyin_s3: 'douyin',
   events_s3: 'events', activity_s3: 'activity', wecom_duckdb: 'wecom', oms_mongo: 'oms',
@@ -82,7 +82,7 @@ try {
   console.log(`租户 ${slug}：真值 ${meta!.persons} 人 + 探针，数据终点 ${meta!.data_end}；已登记的数据源 ${sources.map(s => s.name).join('、') || '（无）'}`);
   const missing = PERSON_SOURCES.filter(c => !codes.has(c));
   if (missing.length) console.log(`⚠️ 没有登记 ${missing.join('、')}：期望的打通按全部数据源算，这些源上的人会显示为「被拆开」`);
-  if (codes.has('oms')) console.log('⚠️ 登记了 oms_mongo：若它的订单映射还在发布状态，天猫订单会算两遍（K2）');
+  if (codes.has('oms')) console.log('⚠️ 登记了 oms_mongo：它的订单映射要与天猫订单在同一个合并组里，否则合并失败（独占）或天猫订单算两遍（K2）');
 
   // ---------- 1. 身份打通 ----------
   // 期望：真值的 expected_identity（埋点没有自己的消费者记录：事件的 user_id 跨源引用商城的消费者）

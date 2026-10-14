@@ -72,7 +72,7 @@ node --env-file=.env --import tsx scripts/crm-seed/verify.ts crmlab            #
 | `pos_mysql` | MySQL | localhost:3306，库 `crm_pos` |
 | `mall_pg` | PostgreSQL | localhost:5432，库 `crm`，schema `crm_mall` |
 | `loyalty_pg` | PostgreSQL | 同上，schema `crm_loyalty` |
-| `oms_mongo` | MongoDB | localhost:27017，库 `crm_oms`，认证库 `admin`（只在 K2 用） |
+| `oms_mongo` | MongoDB | localhost:27017，库 `crm_oms`，认证库 `admin`（K2：与天猫订单建合并组） |
 | `tmall_s3` | S3 | 前缀 `s3://crm-source/crm/tmall/`，Parquet |
 | `douyin_s3` | S3 | 前缀 `s3://crm-source/crm/douyin/`，CSV |
 | `events_s3` | S3 | 前缀 `s3://crm-source/crm/events/`，JSON（规模档是 Parquet） |
@@ -104,7 +104,7 @@ S3 都是：端点 `localhost:8333`，区域 `us-east-1`，路径风格 path，�
 | T2.4 | **K1b**：pos `sale_items` 的 `order_id` 先不写 `key_space` | 发布被拒：「引用字段要写上目标实体在同一数据源里声明的键空间」。补上后通过 |
 | T2.5 | **K7**：pos `sales` 的 `where: store_code <> 'T999' and is_void = 0` | 标准层没有 T999 的单；合并记录里过滤掉 37 行 |
 | T2.6 | 订单的其余两个源（tmall `trades`、douyin `dy_orders`）、明细（mall）、商品（只有 mall，K3） | `verify.ts --only silver` 订单、明细都是 ✔ |
-| T2.7 | **K2 / K6**：映射 `oms_mongo.orders.order.k2.yaml` 并发布 | 合并失败：订单号与天猫重复（同一批订单两路接入）。按 `tid` 去重后 P01 天猫单是 150 不是 999（K6，看空跑结果）。⚠️ 映射发布后撤不下来（#156）：发一个加了 `where: "false"` 的新版本让它不出行，合并恢复正常 |
+| T2.7 | **K2 / K6**：映射 `oms_mongo.orders.order.k2.yaml` 并发布，跑主键冲突体检；再到合并组页给天猫订单与它建组（天猫优先、逐字段补齐），由另一人发布 | 先合并失败：订单号与天猫重复（同一批订单两路接入），体检判为重复接入、建议「可以建合并组」。按 `tid` 去重后 P01 天猫单是 150 不是 999（K6，看空跑结果）。建组后每个 tid 一行，天猫订单数与金额不翻倍（`verify.ts` 里 tmall 仍是 ✔），`x_logistics_company` / `x_logistics_status` 由订单中台补进来；映射页合并记录显示「合并组：重叠 N 行，不一致 …」；再体检不报这对映射。第二轮（T6）天猫删掉的 5 笔订单中台里还在，仍由组里的 oms 那行给出 |
 | T2.8 | 自定义实体：「实体」→ 登记 `custom_region`（region_id、region_name）、`custom_store`（store_id、store_name、region_id；关系 `order.store_id → custom_store.store_id`、`custom_store.region_id → custom_region.region_id`）、`custom_guide`（guide_id、guide_name 敏感、store_id；关系 `customer.x_guide_id → custom_guide.guide_id`、`custom_guide.store_id → custom_store.store_id`），都是「维度」，主键是各自的 ID。再映射 pos 的 regions、stores、guides | 关系要在订单、企微联系人的映射发布之后才能登记（要从已发布映射里取字段类型） |
 | T2.9 | 其余：loyalty 的会员、积分流水、券模板、券、同意、偏好；pos `members` 的短信同意；events `events`（`customer_id` 声明 `customer_source: mall_pg`，商城的 customer 映射要先发布，`setup.ts` 先发消费者。以前的租户发布过埋点 `users` → customer 映射，撤不下来（#156），`seed.ts` 又不再造 `users/`：重建租户）；wecom `chats`、`contacts` 的事件、`mass_sends`；activity `signups` 的事件。删好友与活动到场要先建源视图 `contact_deletes`、`attendances`（`views/`），再映射 | **同一张源表到同一个实体只能有一个映射**：一张表要出两类事件时用源视图拆。`verify.ts --only silver` 全部 ✔；设备归属不符 0 |
 

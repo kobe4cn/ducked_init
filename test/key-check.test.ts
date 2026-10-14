@@ -1,4 +1,4 @@
-// test/key-check.test.ts —— 主键冲突体检的入队参数（按实体汇总映射、主键与是否按数据源比较）与建议的判定顺序（纯函数）
+// test/key-check.test.ts —— 主键冲突体检的入队参数（按实体汇总映射、主键、是否按数据源比较与所在的合并组）与建议的判定顺序（纯函数）
 import { describe, expect, it } from 'vitest';
 import type { RegisteredEntity } from '../app/.server/custom-entities';
 import { keyCheckEntities } from '../app/.server/key-check';
@@ -34,6 +34,21 @@ describe('体检参数', () => {
       { entity: 'custom_visit', key: ['member_id', 'day'], bySource: true, mappings: [{ mapping: 'm5', columns: ['member_id', 'day'] }] },
       { entity: 'custom_ticket', key: ['ticket_id'], bySource: false, mappings: [{ mapping: 'm6', columns: ['ticket_id'] }] },
     ]);
+  });
+});
+
+describe('体检参数里的合并组', () => {
+  it('映射在已发布合并组里时带上组 ID，体检据此不报同组的映射对', () => {
+    const member = (mapping: string) => ({ mapping, sourceId: 's1', version: 1, key: ['order_id'], latest: null, refs: [] });
+    const group = { id: 'g1', rule: { kind: 'priority' as const }, key: ['order_id'], members: [member('m1'), member('m2')] };
+    expect(keyCheckEntities([
+      { ...plan('m1', 'order', ['order_id']), group },
+      { ...plan('m2', 'order', ['order_id']), group },
+      plan('m3', 'order', ['order_id']),
+    ], new Map())).toEqual([{
+      entity: 'order', key: ['order_id'], bySource: false,
+      mappings: [{ mapping: 'm1', columns: ['order_id'], group: 'g1' }, { mapping: 'm2', columns: ['order_id'], group: 'g1' }, { mapping: 'm3', columns: ['order_id'] }],
+    }]);
   });
 });
 

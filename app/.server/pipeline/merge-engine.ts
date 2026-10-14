@@ -40,10 +40,12 @@ export interface MergeGroupParam { id: string; rule: MergeRule; key: string[]; m
 
 /**
  * 合并组的一个组员：重算时从它的当前记录按去重键 key 与取最新字段 latest 取每个键最新的一行，
- * 系统列按映射、数据源、版本与键空间写，customer 引用列旁的数据源列按 refs（列 → 数据源 ID）写
+ * 系统列按映射、数据源、版本与键空间写，customer 引用列旁的数据源列按 refs（列 → 数据源 ID）写；
+ * sensitive 是它的敏感列（统计不一致时只计数，#200 之前入队的合并没有这一项）
  */
 export interface GroupMemberParam {
   mapping: string; sourceId: string; version: number; key: string[]; latest: string | null; keySpace?: string; refs: { column: string; source: string }[];
+  sensitive?: string[];
 }
 
 /**
@@ -70,11 +72,17 @@ export interface LiveTables { latest: string; live: string }
 /**
  * 合并一个映射的各步骤（计时用）：input 判断源表与读主键（源视图另含物化），lastMerge 读合并日志，maxBatch 取原始层最新批次，
  * live 取每条源记录的最新一版（含行过滤），unknownValues 查兜底取值，transform 转换（含敏感字段哈希），keys 算受影响的键与胜出行；
- * 事务内 ensureTable、records（写当前记录）、deleteInsert（换掉本映射在标准层的行）、unique（跨映射唯一）、mergeLog，commit 是提交本身；
- * rows 数本映射在标准层的行数
+ * 事务内 ensureTable、records（写当前记录）、deleteInsert（换掉本映射在标准层的行）、unique（跨映射唯一）、groupStats（合并组的重叠与不一致）、
+ * mergeLog，commit 是提交本身；rows 数本映射在标准层的行数
  */
 export type MergeStep = 'input' | 'lastMerge' | 'maxBatch' | 'live' | 'unknownValues' | 'transform' | 'keys'
-  | 'ensureTable' | 'records' | 'deleteInsert' | 'unique' | 'mergeLog' | 'commit' | 'rows';
+  | 'ensureTable' | 'records' | 'deleteInsert' | 'unique' | 'groupStats' | 'mergeLog' | 'commit' | 'rows';
+
+/**
+ * 合并组这次重算的主键里组员之间的差异（ADR-0032）：overlap 是有至少 2 个组员的主键数；conflicts 是其中各字段两边都非空且取值不同的主键数
+ * （只列有不一致的字段），带最多 5 个样本主键。敏感字段比较的是哈希，只计数、不带样本；主键里有敏感字段时都不带样本
+ */
+export interface GroupStat { overlap: number; conflicts: { field: string; count: number; samples: string[] }[] }
 
 /** 一个映射一次合并的结果。时间为 ISO 字符串 */
 export type MergeRecord = {
@@ -97,6 +105,8 @@ export type MergeRecord = {
     fallback?: FallbackStat[];
     /** 写了行过滤 where 时，不满足条件被滤掉的源表行数（增量合并只统计本次变更的记录） */
     filtered?: number;
+    /** 映射在合并组里时，这次重算的主键里组员之间的重叠与不一致（增量合并只统计重算的主键） */
+    group?: GroupStat;
   }
   /** skipped：源表还没有同步进原始层，等首次同步后再合并（不算失败） */
   | { skipped: string }
@@ -148,6 +158,7 @@ export const groupMemberOf = (plan: MergeMappingParam): GroupMemberParam => ({
   mapping: plan.mapping, sourceId: plan.sourceId, version: plan.version, key: plan.key, latest: plan.latest,
   ...(plan.keySpace && { keySpace: plan.keySpace }),
   refs: customerRefColumns(plan).map(c => ({ column: c.name, source: c.customerSource ?? plan.sourceId })),
+  sensitive: [...sensitiveColumns(plan)],
 });
 
 /** 合并的中间结果，暂存在会话的本机库 stage 里（落盘时压缩，ADR-0010）。按实体并行合并时每条队列一组，表名带上队列的后缀，互不覆盖 */
@@ -500,8 +511,10 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     scope = { groupKeysTable: stage.groupKeys, ownKeysTable: stage.keys };
   }
   const grouped = plan.group && {
-    key: plan.group.key, members: plan.group.members.map(m => lit(m.mapping)).join(', '), select: await groupRowsSql(con, plan, plan.group, stage.rows, now, scope),
+    key: plan.group.key, members: plan.group.members.map(m => lit(m.mapping)).join(', '), memberSensitive: plan.group.members.flatMap(m => m.sensitive ?? []),
+    ...await groupRowsSql(con, plan, plan.group, stage.rows, now, scope),
   };
+  let groupStat: GroupStat | undefined;
   lap('keys');
 
   await inTransaction(con, async () => {
@@ -546,6 +559,13 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
       FROM ${stage.winners} w`);
     }
     lap('deleteInsert');
+    // 写回之后统计：候选行读的是事务里已换成新版本的当前记录
+    if (grouped) {
+      // 本映射的敏感列另算：#200 之前入队的合并里组员没有 sensitive
+      const sensitive = new Set([...sensitiveColumns(plan), ...grouped.memberSensitive]);
+      groupStat = await groupStats(con, grouped, sensitive);
+      lap('groupStats');
+    }
     await con.run(`INSERT INTO ${MERGES} VALUES (
       ${lit(plan.mapping)}, ${plan.version}, ${lit(input.rebuildTag)}, ${from}, ${to},
       ${stats.inserted}, ${stats.updated}, ${stats.deleted}, TIMESTAMPTZ ${lit(startedAt.toISOString())}, TIMESTAMPTZ ${lit(new Date().toISOString())}, ${SCHEME})`);
@@ -568,6 +588,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     rows: silverCount,
     ...(fallback.length && { fallback }),
     ...(filtered !== undefined && { filtered }),
+    ...(groupStat && { group: groupStat }),
   };
 }
 
@@ -613,8 +634,8 @@ async function groupRowsSql(con: DuckDBConnection, plan: MergeMappingParam, grou
   const mergedAt = `TIMESTAMPTZ ${lit(now.toISOString())} AS _merged_at`;
   if (rule.kind !== 'coalesce') {
     const order = [...(rule.kind === 'latest' && data.has(rule.field) ? [`${ident(rule.field)} DESC NULLS LAST`] : []), '_rank', '_within'].join(', ');
-    return `SELECT * EXCLUDE (_src, _batch, _rank, _within), ${mergedAt} FROM ${candidates}
-      QUALIFY row_number() OVER (PARTITION BY ${groupKey} ORDER BY ${order}) = 1`;
+    return { candidates, data: [...data], select: `SELECT * EXCLUDE (_src, _batch, _rank, _within), ${mergedAt} FROM ${candidates}
+      QUALIFY row_number() OVER (PARTITION BY ${groupKey} ORDER BY ${order}) = 1` };
   }
   const first = (column: string, when?: string) => `first(${ident(column)} ORDER BY _rank, _within)${when ? ` FILTER (WHERE ${ident(when)} IS NOT NULL)` : ''} AS ${ident(column)}`;
   const columns = [
@@ -622,7 +643,30 @@ async function groupRowsSql(con: DuckDBConnection, plan: MergeMappingParam, grou
     ...Object.keys(SILVER_SYSTEM_COLUMNS).filter(c => c !== '_merged_at').map(c => first(c)),
     ...[...refOf].map(([source, ref]) => first(source, ref)),
   ];
-  return `SELECT ${keyList(key)}, ${columns.join(', ')}, ${mergedAt} FROM ${candidates} GROUP BY ${groupKey}`;
+  return { candidates, data: [...data], select: `SELECT ${keyList(key)}, ${columns.join(', ')}, ${mergedAt} FROM ${candidates} GROUP BY ${groupKey}` };
+}
+
+/** 合并组每个不一致的字段最多带几个样本主键 */
+const GROUP_SAMPLES = 5;
+
+/**
+ * 合并组的重叠与不一致（GroupStat）：候选行 candidates 里每个组员每个主键取并组时排第一的一行（_within = 1），主键有空值的不算；
+ * 一个主键有至少 2 个组员时算重叠，某个字段在这些行里有至少两种非空取值时算不一致。样本按主键排序取前 GROUP_SAMPLES 个。
+ * 第 i 个字段的别名：_d 是一个主键下的非空取值种数，_n 是不一致的主键数，_s 是样本主键
+ */
+async function groupStats(con: DuckDBConnection, { key, candidates, data }: { key: string[]; candidates: string; data: string[] }, sensitive: Set<string>) {
+  const withSamples = !key.some(k => sensitive.has(k));
+  const [stat] = await rows<Record<string, string | string[] | null>>(con, `
+    SELECT count(*) AS overlap${data.map((c, i) => `, count(*) FILTER (WHERE _d${i} >= 2) AS _n${i}${withSamples && !sensitive.has(c) ? `,
+      list(_k ORDER BY _k) FILTER (WHERE _d${i} >= 2)[1:${GROUP_SAMPLES}] AS _s${i}` : ''}`).join('')}
+    FROM (
+      SELECT concat_ws(', ', ${key.map(k => `${ident(k)}::VARCHAR`).join(', ')}) AS _k, count(*) AS _members${data.map((c, i) => `, count(DISTINCT ${ident(c)}) AS _d${i}`).join('')}
+      FROM ${candidates} WHERE _within = 1 AND NOT (${anyNull(key)}) GROUP BY ${keyList(key)})
+    WHERE _members >= 2`);
+  return {
+    overlap: Number(stat.overlap),
+    conflicts: data.map((field, i) => ({ field, count: Number(stat[`_n${i}`]), samples: (stat[`_s${i}`] as string[] | undefined) ?? [] })).filter(c => c.count > 0),
+  };
 }
 
 /**
