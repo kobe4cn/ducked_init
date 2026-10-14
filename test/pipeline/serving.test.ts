@@ -1,22 +1,28 @@
-// test/pipeline/serving.test.ts —— 生成服务库的流水线接缝：runTask('serving.build') → 调度器派发 → 打开上传到租户存储前缀 _serving/ 下的 DuckDB 文件核对
+// test/pipeline/serving.test.ts —— 生成服务库的流水线接缝：runTask('serving.build') → 调度器派发 → 打开上传到租户存储前缀 _serving/ 下的 DuckDB 文件核对；
+// 自动重建：快照登记或过期后调度器入队 serving.build → 成功后 currentServingStore 的指针切到新版本、_serving/ 下只留两版
 import { existsSync, mkdtempSync } from 'node:fs';
-import { writeFile } from 'node:fs/promises';
+import { readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
-import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
+import { and, eq } from 'drizzle-orm';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { snapshots as snapshotsTable, tasks } from '../../app/.server/db/schema';
+import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { servingPath } from '../../app/.server/pipeline/serving-engine';
 import { platformS3 } from '../../app/.server/s3-accounts';
 import { getObject } from '../../app/.server/s3-client';
-import { listSnapshots } from '../../app/.server/snapshots';
+import { currentServingStore, enqueueServingBuild } from '../../app/.server/serving-store';
+import { enqueueDueExpiries, listSnapshots } from '../../app/.server/snapshots';
+import { syncSource } from '../../app/.server/source-sync';
 import { resetDb } from '../http/harness';
-import { newTenant, runTask } from './fixtures';
+import { memberOf, newTenant, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
+import { grantOnSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -50,7 +56,7 @@ async function onLake<T = Record<string, unknown>>(tenantId: string, sql: string
 
 /** 身份打通与订单映射已发布，跑出 RFM 快照，双人发布指标 revenue、带城市维度的 revenue_by_city 与引用 revenue 的标签 value_tier */
 async function publishedDefinitions() {
-  const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+  const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
   expect(await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' })).toMatchObject({ status: 'succeeded' });
   await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
   await createDefinition(author, 'metric', 'revenue_by_city', REVENUE_BY_CITY);
@@ -63,23 +69,23 @@ async function publishedDefinitions() {
   const snapshots = await listSnapshots(acme);
   expect(snapshots.map(s => s.template).sort()).toEqual(['metric:revenue', 'metric:revenue_by_city', 'rfm', 'tag:value_tier']);
   const { dataPath } = (await lakeRow(acme))!;
-  return { acme, snapshots, dataPath };
+  return { acme, author, sources, snapshots, dataPath };
 }
 
 describe('生成服务库', () => {
   it('把各快照表写进 _serving/v<版本>.duckdb：标签、指标（维度进 dims）、RFM、退役 ID 对照与 meta，都按 consumer_id 排序，结果给出各表行数', async () => {
     const { acme, snapshots, dataPath } = await publishedDefinitions();
     const count = (template: string) => snapshots.find(s => s.template === template)!.rowCount;
-    const target = servingPath(dataPath, 1);
+    const target = servingPath(dataPath, 101);
     const task = await runTask(acme, 'serving.build', {
-      version: 1, target, snapshots: snapshots.map(s => ({ id: s.id, template: s.template, table: s.table, definitionVersion: s.definitionVersion })),
+      version: 101, target, snapshots: snapshots.map(s => ({ id: s.id, template: s.template, table: s.table, definitionVersion: s.definitionVersion })),
     });
     expect(task).toMatchObject({ status: 'succeeded' });
     // 夹具里的身份打通已有一次合并（一个退役 ID，没有链）
     const merged = await onLake(acme, `SELECT old_id AS retired_id, new_id AS consumer_id FROM silver._consumer_id_changes WHERE reason = 'merge' ORDER BY ALL`);
     expect(merged).toHaveLength(1);
     const rows = { tags: count('tag:value_tier'), metrics: count('metric:revenue') + count('metric:revenue_by_city'), rfm: count('rfm'), consumer_aliases: 1 };
-    expect(task!.result).toMatchObject({ version: 1, path: target, rows });
+    expect(task!.result).toMatchObject({ version: 101, path: target, rows });
 
     expect(await readServing(target, `SELECT table_name, string_agg(column_name, ',' ORDER BY ordinal_position) AS columns
       FROM information_schema.columns GROUP BY table_name ORDER BY table_name`)).toEqual([
@@ -99,15 +105,15 @@ describe('生成服务库', () => {
     expect(dims).toEqual([{ metric: 'revenue', keys: '[]' }, { metric: 'revenue_by_city', keys: '[city]' }]);
     expect(await readServing(target, 'SELECT DISTINCT tag FROM tags')).toEqual([{ tag: 'value_tier' }]);
     expect(await readServing(target, 'SELECT * FROM consumer_aliases')).toEqual(merged);
-    expect(await readServing(target, 'SELECT version FROM meta')).toEqual([{ version: 1 }]);
+    expect(await readServing(target, 'SELECT version FROM meta')).toEqual([{ version: 101 }]);
   });
 
   it('退役 ID 沿着 merge 链指向现在的 ID，split 不算', async () => {
     const { acme, snapshots, dataPath } = await publishedDefinitions();
     await onLake(acme, `CREATE TABLE IF NOT EXISTS silver._consumer_id_changes (old_id VARCHAR, new_id VARCHAR, reason VARCHAR, changed_at TIMESTAMPTZ);
       INSERT INTO silver._consumer_id_changes VALUES ('a', 'b', 'merge', now()), ('b', 'c', 'merge', now()), ('c', 'd', 'split', now()), ('x', 'c', 'merge', now())`);
-    const target = servingPath(dataPath, 2);
-    const task = await runTask(acme, 'serving.build', { version: 2, target, snapshots: snapshots.map(({ id, template, table }) => ({ id, template, table })) });
+    const target = servingPath(dataPath, 102);
+    const task = await runTask(acme, 'serving.build', { version: 102, target, snapshots: snapshots.map(({ id, template, table }) => ({ id, template, table })) });
     // 夹具里已有的一个退役 ID 之外再多三个
     expect(task).toMatchObject({ status: 'succeeded', result: { rows: { consumer_aliases: 4 } } });
     expect(await readServing(target, `SELECT * FROM consumer_aliases WHERE retired_id IN ('a', 'b', 'x')`)).toEqual([
@@ -123,14 +129,100 @@ describe('生成服务库', () => {
       [{ snapshots: [{ ...base, table: 'silver.customer' }] }, /参数 snapshots/],
       [{ snapshots: [{ ...base, table: 'gold.rfm__00000000-0000-0000-0000-000000000000' }] }, /结果层没有快照表/],
       [{ snapshots: [{ ...base, template: 'tag:value_tier' }] }, /不合规/],
-      [{ snapshots: [base], target: `${dataPath}elsewhere/v3.duckdb` }, /参数 target/],
+      [{ snapshots: [base], target: `${dataPath}elsewhere/v103.duckdb` }, /参数 target/],
     ];
-    const target = servingPath(dataPath, 3);
+    const target = servingPath(dataPath, 103);
     for (const [params, error] of cases) {
-      const task = await runTask(acme, 'serving.build', { version: 3, target, ...params });
+      const task = await runTask(acme, 'serving.build', { version: 103, target, ...params });
       expect(task).toMatchObject({ status: 'failed', error: expect.stringMatching(error) });
     }
     expect(existsSync(target)).toBe(false);
+  });
+});
+
+/** _serving/ 下的服务库文件版本，从小到大 */
+const servingVersions = async (dataPath: string) => (await readdir(`${dataPath}_serving/`))
+  .flatMap(f => { const m = /^v(\d+)\.duckdb$/.exec(f); return m ? [Number(m[1])] : []; }).sort((a, b) => a - b);
+
+/** 本租户的 serving.build 任务（按创建先后）的状态与版本 */
+const builds = async (tenantId: string) => (await getDb().select({ status: tasks.status, params: tasks.params }).from(tasks)
+  .where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'serving.build'))).orderBy(tasks.createdAt))
+  .map(t => ({ status: t.status, version: t.params.version as number }));
+
+describe('自动重建服务库', () => {
+  it('快照登记后自动入队并切换指针：指针指向最新一版，放的是每个模板最新的快照；_serving/ 下只留两版；已有排队中的不重复入队、改用现在的快照', async () => {
+    const { acme, author, snapshots, dataPath } = await publishedDefinitions();
+    const store = (await currentServingStore(acme))!;
+    expect(store.path).toBe(servingPath(dataPath, store.version));
+    expect(store.snapshots).toEqual(snapshots.map(s => ({
+      id: s.id, template: s.template, definitionVersion: s.definitionVersion, createdAt: s.createdAt.toISOString(), incomplete: false,
+    })).sort((a, b) => a.template.localeCompare(b.template)));
+    expect(await readServing(store.path, 'SELECT version FROM meta')).toEqual([{ version: store.version }]);
+    expect(await readServing(store.path, 'SELECT DISTINCT tag FROM tags')).toEqual([{ tag: 'value_tier' }]);
+    const done = await builds(acme);
+    expect(done.length).toBeGreaterThan(1);
+    expect(done.every(b => b.status === 'succeeded')).toBe(true);
+    expect(done.map(b => b.version)).toEqual(done.map((_, i) => i + 1));
+    expect(store.version).toBe(done.length);
+    expect(await servingVersions(dataPath)).toEqual([store.version - 1, store.version]);
+
+    // 排队中的不重复入队，但参数改用现在的快照：入队后删掉的定义不再放进服务库
+    expect(await enqueueServingBuild(acme)).toMatchObject({ id: expect.any(String) });
+    await deleteDefinition(author, 'tag', 'value_tier');
+    expect(await enqueueServingBuild(acme)).toBeNull();
+    expect(await builds(acme)).toHaveLength(done.length + 1);
+    await drain();
+    const next = (await currentServingStore(acme))!;
+    expect(next.version).toBe(store.version + 1);
+    expect(next.snapshots.map(s => s.template)).toEqual(['metric:revenue', 'metric:revenue_by_city', 'rfm']);
+    expect(await readServing(next.path, 'SELECT count(*)::INT AS n FROM tags')).toEqual([{ n: 0 }]);
+    expect(await servingVersions(dataPath)).toEqual([store.version, next.version]);
+  });
+
+  it('快照过期后自动重建，不再放过期的快照', async () => {
+    const { acme, snapshots } = await publishedDefinitions();
+    const tag = snapshots.find(s => s.template === 'tag:value_tier')!;
+    await getDb().update(snapshotsTable).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(snapshotsTable.id, tag.id));
+    const before = (await currentServingStore(acme))!;
+    expect(await enqueueDueExpiries()).toEqual([acme]);
+    await drain();
+    const after = (await currentServingStore(acme))!;
+    expect(after.version).toBe(before.version + 1);
+    expect(after.snapshots.map(s => s.template)).toEqual(['metric:revenue', 'metric:revenue_by_city', 'rfm']);
+    expect(await readServing(after.path, 'SELECT count(*)::INT AS n FROM tags')).toEqual([{ n: 0 }]);
+  });
+
+  it('生成失败时指针不变、旧版本文件仍在；只接受比当前指针新的版本', async () => {
+    const { acme, snapshots, dataPath } = await publishedDefinitions();
+    const before = (await currentServingStore(acme))!;
+    const rfm = snapshots.find(s => s.template === 'rfm')!;
+    await onLake(acme, `DROP TABLE gold."${rfm.table.slice('gold.'.length)}"`);
+    expect(await enqueueServingBuild(acme)).not.toBeNull();
+    await drain();
+    expect((await builds(acme)).at(-1)).toEqual({ status: 'failed', version: before.version + 1 });
+    expect(await currentServingStore(acme)).toEqual(before);
+    expect(existsSync(before.path)).toBe(true);
+
+    // 更新的版本先完成，旧版本之后完成也不再生效
+    const others = snapshots.filter(s => s !== rfm).map(({ id, template, table }) => ({ id, template, table }));
+    const newer = before.version + 10;
+    for (const version of [newer, newer - 1]) {
+      expect(await runTask(acme, 'serving.build', { version, target: servingPath(dataPath, version), snapshots: others })).toMatchObject({ status: 'succeeded' });
+    }
+    expect(await currentServingStore(acme)).toMatchObject({ version: newer, path: servingPath(dataPath, newer) });
+  });
+
+  it('error 级断言失败、没有登记快照时不重建，服务库仍是上一版', async () => {
+    const { acme, sources } = await publishedDefinitions();
+    await grantOnSource(`INSERT INTO crm.orders VALUES ('A7', 1, 'paid', -10, '2024-06-29 10:00', '2024-06-29 10:00', now())`);
+    await syncSource(await memberOf(acme, 'de@acme.com'), sources.crm);
+    await drain();
+    const before = (await currentServingStore(acme))!;
+    const count = (await builds(acme)).length;
+    expect(await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' })).toMatchObject({ status: 'failed', error: expect.stringContaining('金额非负') });
+    expect(await builds(acme)).toHaveLength(count);
+    expect(await currentServingStore(acme)).toEqual(before);
+    expect(existsSync(before.path)).toBe(true);
   });
 });
 

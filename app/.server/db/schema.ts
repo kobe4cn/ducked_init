@@ -451,6 +451,19 @@ export const snapshots = platform.table('snapshots', {
   uniqueIndex('snapshots_task_uq').on(t.taskId),
 ]);
 
+/** 服务库里放的一张快照：快照 ID、模板、定义版本、登记时间（ISO 字符串）与数据是否不完整 */
+export interface ServingStoreSnapshot { id: string; template: string; definitionVersion: number | null; createdAt: string; incomplete: boolean }
+
+// 服务库指针（ADR-0033）：每个租户当前生效的服务库版本与文件位置（<dataPath>_serving/v<版本>.duckdb）。
+// serving.build 上传完成、任务成功后才更新这一行，API 节点按它切换版本
+export const servingStores = platform.table('serving_stores', {
+  tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  path: text('path').notNull(),
+  snapshots: jsonb('snapshots').$type<ServingStoreSnapshot[]>().notNull(),
+  builtAt: timestamp('built_at', { withTimezone: true }).notNull(),
+});
+
 export const DSL_DEFINITION_KINDS = ['metric', 'tag'] as const;
 export const dslKindEnum = platform.enum('dsl_kind', DSL_DEFINITION_KINDS);
 
