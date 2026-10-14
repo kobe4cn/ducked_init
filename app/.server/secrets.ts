@@ -60,3 +60,11 @@ export async function decryptForTenant(tenantId: string, context: string, sealed
 export async function tenantPiiSalt(tenantId: string) {
   return createHmac('sha256', await tenantDataKey(tenantId)).update('pii-salt').digest('hex');
 }
+
+/**
+ * 租户服务库文件的加密密钥（DuckDB 数据库加密，ADR-0033）：同样由租户数据密钥派生、不另存，
+ * 只在领取生成服务库的任务时交给工作进程；读服务库时用同一个
+ */
+export async function tenantServingKey(tenantId: string) {
+  return createHmac('sha256', await tenantDataKey(tenantId)).update('serving-store').digest('base64');
+}

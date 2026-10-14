@@ -16,6 +16,7 @@ import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { servingPath } from '../../app/.server/pipeline/serving-engine';
 import { platformS3 } from '../../app/.server/s3-accounts';
 import { getObject } from '../../app/.server/s3-client';
+import { tenantServingKey } from '../../app/.server/secrets';
 import { currentServingStore, enqueueServingBuild } from '../../app/.server/serving-store';
 import { enqueueDueExpiries, listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
@@ -32,16 +33,22 @@ const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 const ALL_REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\n';
 const REVENUE_BY_CITY = `${ALL_REVENUE}dimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n`;
 
-/** 读出服务库文件里的一张表 */
-async function readServing<T = Record<string, unknown>>(file: string, sql: string) {
-  const instance = await DuckDBInstance.create(file, { access_mode: 'READ_ONLY' });
+/** 用给定密钥只读挂载服务库文件后执行 SQL（ADR-0033：文件按租户密钥加密） */
+async function attachServing<T = Record<string, unknown>>(file: string, key: string | undefined, sql: string) {
+  const instance = await DuckDBInstance.create(':memory:');
   const con = await instance.connect();
   try {
+    await con.run(`ATTACH '${file}' AS s (READ_ONLY${key ? `, ENCRYPTION_KEY '${key}'` : ''}); USE s`);
     return (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
   } finally {
     con.closeSync();
     instance.closeSync();
   }
+}
+
+/** 用本租户的服务库密钥读出服务库文件里的一张表 */
+async function readServing<T = Record<string, unknown>>(tenantId: string, file: string, sql: string) {
+  return attachServing<T>(file, await tenantServingKey(tenantId), sql);
 }
 
 /** 在本租户数据湖里执行 SQL（可写） */
@@ -87,7 +94,7 @@ describe('生成服务库', () => {
     const rows = { tags: count('tag:value_tier'), metrics: count('metric:revenue') + count('metric:revenue_by_city'), rfm: count('rfm'), consumer_aliases: 1 };
     expect(task!.result).toMatchObject({ version: 101, path: target, rows });
 
-    expect(await readServing(target, `SELECT table_name, string_agg(column_name, ',' ORDER BY ordinal_position) AS columns
+    expect(await readServing(acme, target, `SELECT table_name, string_agg(column_name, ',' ORDER BY ordinal_position) AS columns
       FROM information_schema.columns GROUP BY table_name ORDER BY table_name`)).toEqual([
       { table_name: 'consumer_aliases', columns: 'retired_id,consumer_id' },
       { table_name: 'meta', columns: 'version,built_at' },
@@ -96,16 +103,16 @@ describe('生成服务库', () => {
       { table_name: 'tags', columns: 'consumer_id,tag,tag_value' },
     ]);
     for (const table of ['tags', 'metrics', 'rfm']) {
-      const ids = (await readServing<{ consumer_id: string }>(target, `SELECT consumer_id FROM ${table}`)).map(r => r.consumer_id);
+      const ids = (await readServing<{ consumer_id: string }>(acme, target, `SELECT consumer_id FROM ${table}`)).map(r => r.consumer_id);
       expect(ids).toHaveLength(rows[table as keyof typeof rows]);
       expect(ids).toEqual([...ids].sort());
     }
-    const dims = await readServing<{ metric: string; keys: string }>(target,
+    const dims = await readServing<{ metric: string; keys: string }>(acme, target,
       `SELECT DISTINCT metric, json_keys(dims)::VARCHAR AS keys FROM metrics ORDER BY metric`);
     expect(dims).toEqual([{ metric: 'revenue', keys: '[]' }, { metric: 'revenue_by_city', keys: '[city]' }]);
-    expect(await readServing(target, 'SELECT DISTINCT tag FROM tags')).toEqual([{ tag: 'value_tier' }]);
-    expect(await readServing(target, 'SELECT * FROM consumer_aliases')).toEqual(merged);
-    expect(await readServing(target, 'SELECT version FROM meta')).toEqual([{ version: 101 }]);
+    expect(await readServing(acme, target, 'SELECT DISTINCT tag FROM tags')).toEqual([{ tag: 'value_tier' }]);
+    expect(await readServing(acme, target, 'SELECT * FROM consumer_aliases')).toEqual(merged);
+    expect(await readServing(acme, target, 'SELECT version FROM meta')).toEqual([{ version: 101 }]);
   });
 
   it('退役 ID 沿着 merge 链指向现在的 ID，split 不算', async () => {
@@ -116,7 +123,7 @@ describe('生成服务库', () => {
     const task = await runTask(acme, 'serving.build', { version: 102, target, snapshots: snapshots.map(({ id, template, table }) => ({ id, template, table })) });
     // 夹具里已有的一个退役 ID 之外再多三个
     expect(task).toMatchObject({ status: 'succeeded', result: { rows: { consumer_aliases: 4 } } });
-    expect(await readServing(target, `SELECT * FROM consumer_aliases WHERE retired_id IN ('a', 'b', 'x')`)).toEqual([
+    expect(await readServing(acme, target, `SELECT * FROM consumer_aliases WHERE retired_id IN ('a', 'b', 'x')`)).toEqual([
       { retired_id: 'a', consumer_id: 'c' }, { retired_id: 'b', consumer_id: 'c' }, { retired_id: 'x', consumer_id: 'c' },
     ]);
   });
@@ -140,6 +147,31 @@ describe('生成服务库', () => {
   });
 });
 
+describe('服务库加密', () => {
+  it('文件按租户密钥加密：不带密钥、带另一租户的密钥都挂不上，带本租户的密钥可读', async () => {
+    const acme = await newTenant('acme');
+    const globex = await newTenant('globex');
+    const target = servingPath((await lakeRow(acme))!.dataPath, 1);
+    expect(await runTask(acme, 'serving.build', { version: 1, target, snapshots: [] })).toMatchObject({ status: 'succeeded' });
+    await expect(attachServing(target, undefined, 'SELECT * FROM meta')).rejects.toThrow(/encrypt/i);
+    await expect(attachServing(target, await tenantServingKey(globex), 'SELECT * FROM meta')).rejects.toThrow();
+    expect(await readServing(acme, target, 'SELECT version FROM meta')).toEqual([{ version: 1 }]);
+  });
+
+  it('密钥不进任务参数、结果与报错', async () => {
+    const acme = await newTenant('acme');
+    const key = await tenantServingKey(acme);
+    const target = servingPath((await lakeRow(acme))!.dataPath, 1);
+    const ok = await runTask(acme, 'serving.build', { version: 1, target, snapshots: [] });
+    const failed = await runTask(acme, 'serving.build', {
+      version: 2, target: servingPath((await lakeRow(acme))!.dataPath, 2),
+      snapshots: [{ id: '00000000-0000-0000-0000-000000000000', template: 'rfm', table: 'gold.rfm__00000000-0000-0000-0000-000000000000' }],
+    });
+    expect(failed).toMatchObject({ status: 'failed' });
+    for (const task of [ok, failed]) expect(JSON.stringify(task)).not.toContain(key);
+  });
+});
+
 /** _serving/ 下的服务库文件版本，从小到大 */
 const servingVersions = async (dataPath: string) => (await readdir(`${dataPath}_serving/`))
   .flatMap(f => { const m = /^v(\d+)\.duckdb$/.exec(f); return m ? [Number(m[1])] : []; }).sort((a, b) => a - b);
@@ -157,8 +189,8 @@ describe('自动重建服务库', () => {
     expect(store.snapshots).toEqual(snapshots.map(s => ({
       id: s.id, template: s.template, definitionVersion: s.definitionVersion, createdAt: s.createdAt.toISOString(), incomplete: false,
     })).sort((a, b) => a.template.localeCompare(b.template)));
-    expect(await readServing(store.path, 'SELECT version FROM meta')).toEqual([{ version: store.version }]);
-    expect(await readServing(store.path, 'SELECT DISTINCT tag FROM tags')).toEqual([{ tag: 'value_tier' }]);
+    expect(await readServing(acme, store.path, 'SELECT version FROM meta')).toEqual([{ version: store.version }]);
+    expect(await readServing(acme, store.path, 'SELECT DISTINCT tag FROM tags')).toEqual([{ tag: 'value_tier' }]);
     const done = await builds(acme);
     expect(done.length).toBeGreaterThan(1);
     expect(done.every(b => b.status === 'succeeded')).toBe(true);
@@ -175,7 +207,7 @@ describe('自动重建服务库', () => {
     const next = (await currentServingStore(acme))!;
     expect(next.version).toBe(store.version + 1);
     expect(next.snapshots.map(s => s.template)).toEqual(['metric:revenue', 'metric:revenue_by_city', 'rfm']);
-    expect(await readServing(next.path, 'SELECT count(*)::INT AS n FROM tags')).toEqual([{ n: 0 }]);
+    expect(await readServing(acme, next.path, 'SELECT count(*)::INT AS n FROM tags')).toEqual([{ n: 0 }]);
     expect(await servingVersions(dataPath)).toEqual([store.version, next.version]);
   });
 
@@ -189,7 +221,7 @@ describe('自动重建服务库', () => {
     const after = (await currentServingStore(acme))!;
     expect(after.version).toBe(before.version + 1);
     expect(after.snapshots.map(s => s.template)).toEqual(['metric:revenue', 'metric:revenue_by_city', 'rfm']);
-    expect(await readServing(after.path, 'SELECT count(*)::INT AS n FROM tags')).toEqual([{ n: 0 }]);
+    expect(await readServing(acme, after.path, 'SELECT count(*)::INT AS n FROM tags')).toEqual([{ n: 0 }]);
   });
 
   it('生成失败时指针不变、旧版本文件仍在；只接受比当前指针新的版本', async () => {
@@ -241,7 +273,7 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('生成服务库（对象存储�
 
     const file = join(mkdtempSync(join(tmpdir(), 'serving-')), 'v1.duckdb');
     await writeFile(file, Buffer.from(await new Response(await getObject(platformS3(), target)).arrayBuffer()));
-    expect(await readServing(file, 'SELECT version FROM meta')).toEqual([{ version: 1 }]);
-    expect(await readServing(file, 'SELECT count(*)::INT AS n FROM tags')).toEqual([{ n: 0 }]);
+    expect(await readServing(acme, file, 'SELECT version FROM meta')).toEqual([{ version: 1 }]);
+    expect(await readServing(acme, file, 'SELECT count(*)::INT AS n FROM tags')).toEqual([{ n: 0 }]);
   });
 });

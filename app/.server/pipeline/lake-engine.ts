@@ -61,11 +61,11 @@ const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
  * readOnly 时数据湖只读挂载（核对任务）：任何写入都会被 DuckDB 拒绝，本机库 stage 照常可写。
  * encrypted 只在首次挂载、建元数据表时给（ADR-0020）：DuckLake 把加密记进 catalog，之后的挂载不带它也照样加密写入；
  * 已建好的未加密 catalog 带上它会报错。
- * servingFile 时在同一目录下再挂一个本机库 serving（生成服务库，ADR-0033）：锁定配置后不能再 ATTACH，所以在锁定之前挂上
+ * 给了 servingKey 时在同一目录下再挂一个按它加密的本机库 serving（生成服务库，ADR-0033）：锁定配置后不能再 ATTACH，所以在锁定之前挂上
  */
 export async function openTenantLake(
   spec: LakeSpec, limits: EngineLimits, source?: SourceSpec,
-  { readOnly = false, encrypted = false, servingFile = false }: { readOnly?: boolean; encrypted?: boolean; servingFile?: boolean } = {},
+  { readOnly = false, encrypted = false, servingKey }: { readOnly?: boolean; encrypted?: boolean; servingKey?: string } = {},
 ): Promise<TenantLakeSession> {
   const instance = await DuckDBInstance.create(':memory:', {
     memory_limit: `${limits.memoryLimitMb}MiB`,
@@ -80,7 +80,7 @@ export async function openTenantLake(
       SET temp_directory = ${lit(spill)}; SET max_temp_directory_size = '${limits.memoryLimitMb * SPILL_RATIO}MiB';
       ATTACH ${lit(join(spill, 'stage.duckdb'))} AS stage;`);
     const servingDb = join(spill, 'serving.duckdb');
-    if (servingFile) await con.run(`ATTACH ${lit(servingDb)} AS serving`);
+    if (servingKey) await con.run(`ATTACH ${lit(servingDb)} AS serving (ENCRYPTION_KEY ${lit(servingKey)})`);
     if (spec.s3) {
       const s = spec.s3;
       await con.run(`CREATE SECRET lake_s3 (TYPE s3, KEY_ID ${lit(s.key)}, SECRET ${lit(s.secret)}, REGION ${lit(s.region)},
@@ -107,7 +107,7 @@ export async function openTenantLake(
       connect,
       close,
       lake: { dataPath: spec.dataPath, metadata: `__ducklake_metadata_lake.${ident(spec.catalogSchema)}` },
-      ...(servingFile && { serving: { file: servingDb, upload: async (target: string) => {
+      ...(servingKey && { serving: { file: servingDb, upload: async (target: string) => {
         await con.run('CHECKPOINT serving; DETACH serving');
         await uploadServing(spec, servingDb, target);
       } } }),

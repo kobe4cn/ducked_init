@@ -6,17 +6,18 @@ import { openTenantLake, redactLakeSecrets, type EngineLimits, type LakeSpec } f
 import { redactSourceSecrets, type SourceSpec } from './source-engine';
 
 /**
- * source 是任务涉及的数据源（参数带 sourceId 时），凭据已由调度器解密；piiSalt 是合并到标准层时给敏感字段加盐的租户盐。
- * 两者都只在内存里使用；taskId 用来给结果层的快照表命名
+ * source 是任务涉及的数据源（参数带 sourceId 时），凭据已由调度器解密；piiSalt 是合并到标准层时给敏感字段加盐的租户盐；
+ * servingKey 是生成服务库时加密文件的租户密钥（ADR-0033）。都只在内存里使用；taskId 用来给结果层的快照表命名
  */
-export interface WorkerInput { taskId: string; kind: TaskKind; params: Record<string, unknown>; lake: LakeSpec; limits: EngineLimits; source?: SourceSpec; piiSalt?: string }
+export interface WorkerInput { taskId: string; kind: TaskKind; params: Record<string, unknown>; lake: LakeSpec; limits: EngineLimits; source?: SourceSpec; piiSalt?: string; servingKey?: string }
 /** 任务部分完成时既有错误也有结果 */
 export type WorkerOutcome = { result: Record<string, unknown> } | { error: string; result?: Record<string, unknown> };
 
 const redactor = (input: WorkerInput) => (message: string) => {
   let redacted = redactLakeSecrets(message, input.lake);
   if (input.source) redacted = redactSourceSecrets(redacted, input.source);
-  return input.piiSalt ? redacted.replaceAll(input.piiSalt, '***') : redacted;
+  for (const secret of [input.piiSalt, input.servingKey]) if (secret) redacted = redacted.replaceAll(secret, '***');
+  return redacted;
 };
 
 async function run(input: WorkerInput): Promise<WorkerOutcome> {
@@ -24,7 +25,10 @@ async function run(input: WorkerInput): Promise<WorkerOutcome> {
   const attach = 'attachSource' in handler && handler.attachSource ? input.source : undefined;
   const readOnly = 'readOnlyLake' in handler && handler.readOnlyLake;
   const servingFile = 'servingFile' in handler && handler.servingFile;
-  const session = await openTenantLake(input.lake, input.limits, attach, { readOnly, servingFile }).catch(e => {
+  // 没拿到密钥就不挂 serving：不写未加密的服务库文件
+  if (servingFile && !input.servingKey) throw new Error('缺少服务库密钥');
+  const servingKey = servingFile ? input.servingKey : undefined;
+  const session = await openTenantLake(input.lake, input.limits, attach, { readOnly, servingKey }).catch(e => {
     throw new Error(`挂载${attach ? '数据湖与数据源' : '数据湖'}失败：${(e as Error).message}`);
   });
   try {
