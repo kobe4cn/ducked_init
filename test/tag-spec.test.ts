@@ -67,6 +67,14 @@ describe('标签 DSL：校验', () => {
     expect(issues('metric: revenue\nrules:\n  - { value: high, when: { between: 1 } }\n').map(i => i.message))
       .toEqual(['缺少 default', '不认识的项 between']);
   });
+
+  it('可选的 description：写了带进定义，不写照常通过；不是字符串或超过 500 字被拒', () => {
+    expect(ok(`description: 按累计消费分层\n${TIERS}`).description).toBe('按累计消费分层');
+    expect(ok(TIERS).description).toBeUndefined();
+    expect(issues(`description: 3\n${TIERS}`)).toEqual([{ line: 1, col: 14, path: 'description', message: '应为文本' }]);
+    expect(issues(`description: ${'说'.repeat(501)}\n${TIERS}`)).toEqual([expect.objectContaining({ path: 'description', message: '不能超过 500 字' })]);
+    ok(`description: ${'说'.repeat(500)}\n${TIERS}`);
+  });
 });
 
 describe('标签 DSL：编译', () => {

@@ -5,7 +5,7 @@
 // 纯函数：不碰平台库与数据湖，同样的定义与 asOf 编译出同样的 SQL
 import { Ajv } from 'ajv';
 import { lit } from '../merge-engine';
-import { compileMetric, isNumericMetric, metricEntities, parseDsl, type Dependencies, type DslCheck, type DslContext, type MetricSpec } from './metric-spec';
+import { compileMetric, DESCRIPTION_SCHEMA, isNumericMetric, metricEntities, parseDsl, type Dependencies, type DslCheck, type DslContext, type MetricSpec } from './metric-spec';
 
 export const TAG_CONDITIONS = ['gte', 'gt', 'lte', 'lt', 'eq'] as const;
 type Condition = (typeof TAG_CONDITIONS)[number];
@@ -17,6 +17,8 @@ export interface TagSpec {
   rules: { value: string | number; when: Partial<Record<Condition, number>> }[];
   /** 没命中任何规则时的取值 */
   default: string | number;
+  /** 说明（可选，最多 500 字），目录接口返回 */
+  description?: string;
 }
 
 const tagValue = { type: ['string', 'number'] };
@@ -47,6 +49,7 @@ export const TAG_SCHEMA = {
       },
     },
     default: tagValue,
+    description: DESCRIPTION_SCHEMA,
   },
 } as const;
 

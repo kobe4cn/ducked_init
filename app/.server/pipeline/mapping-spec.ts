@@ -224,6 +224,7 @@ export function describeSchemaError(e: ErrorObject): { path: Path; message: stri
     case 'enum': return { path, message: `应为以下之一：${(p.allowedValues as string[]).join('、')}` };
     case 'minLength': case 'minItems': case 'minProperties': return { path, message: '不能为空' };
     case 'uniqueItems': return { path, message: '不能有重复项' };
+    case 'maxLength': return { path, message: `不能超过 ${p.limit} 字` };
     case 'minimum': return { path, message: `应不小于 ${p.limit}` };
     case 'pattern': return { path, message: path.at(-1) === 'key_space' ? '键空间只能用小写字母、数字与下划线' : `应符合 ${p.pattern}` };
     default: return { path, message: e.message ?? e.keyword };

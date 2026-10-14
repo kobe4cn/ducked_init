@@ -14,15 +14,18 @@ ADR-0004 决定指标与标签用平台自有的 YAML DSL 编译成 SQL；ADR-00
 - `window`：可选，`{ field, days }`，`field` 是基础实体的时间或日期字段，取 `(asOf - days, asOf]`。没写时不加时间限制。
 - `dimensions`：可选，最多 3 个，`[{ name, path, as_of? }]`。`path` 写成 `order.store_id -> custom_store.region_id -> custom_region.name`：第一段的实体是 `base`；相邻两段之间，前一段的字段必须有一条关系（内置 `ref` 或已发布登记上的关系）指向后一段实体的单列主键；最多 3 跳；不成环（沿用 `allRelations` 的全部关系判断）；终点不能是敏感字段。编译成链式 `LEFT JOIN`，结果转成 `VARCHAR`，关联不到或为空记为「未关联」，不丢行。`as_of` 是给「按时间点关联」预留的位置，只接受 `current`（默认），其他值报「暂不支持按时间点关联」。
 - `device_attribution`：可选布尔，只有 `base: event` 能写，缺省为 `true`。为真时匿名事件（`customer_id` 为空）经 `device_id` 查 `silver._device_owner`（ADR-0019）计入设备主人；写 `false` 时只经 `_identities`，编译出的 SQL 与加这个字段之前逐字节一致。
+- `description`：可选字符串，最多 500 字，给人看的说明，不参与编译（#205）。
 - 能引用的只有标准实体、已发布登记的自定义实体（推断出的、未确认的登记不算）和已发布映射里的 `x_` 字段；不读原始层。度量、过滤、窗口用到的字段都不能是敏感字段（`isSensitiveField`）。
 
-**标签 DSL。** `metric: <指标键>`、`rules: [{ value, when: { gte?, gt?, lte?, lt?, eq? } }]`（按顺序第一条命中）、`default: <取值>`。引用的指标必须已发布且没有维度（每个消费者一行）。标签结果覆盖指标结果里的每个消费者，列为 `consumer_id, tag_key, tag_value`。标签的 SQL 把它引用的指标当前已发布版本的 SQL 内联成 CTE，不读指标快照，所以标签任务与指标任务之间没有先后顺序。
+**标签 DSL。** `metric: <指标键>`、`rules: [{ value, when: { gte?, gt?, lte?, lt?, eq? } }]`（按顺序第一条命中）、`default: <取值>`，可选 `description`（同指标，#205）。引用的指标必须已发布且没有维度（每个消费者一行）。标签结果覆盖指标结果里的每个消费者，列为 `consumer_id, tag_key, tag_value`。标签的 SQL 把它引用的指标当前已发布版本的 SQL 内联成 CTE，不读指标快照，所以标签任务与指标任务之间没有先后顺序。
 
 **计算与快照。** 一个任务种类 `gold.dsl`：入队时在服务端用当时的登记与映射编译好 SQL（带上 `asOf`），参数为 `kind, key, definitionId, definitionVersion, asOf, sql, entities`；handler 建 `gold."<kind>__<taskId>"`。快照登记进 `snapshots`，`template` 写 `metric:<key>` 或 `tag:<key>`，`definition_version` 照旧。
 
 **依赖按需计算，不建依赖表。** 一份已发布版本的依赖（引用的指标键、实体、字段、关系）由它的 YAML 解析得出（`dependenciesOf`）。只有已发布版本算依赖，草稿不算。被已发布标签引用的指标不能删；被已发布指标引用的自定义实体不能删（加进 `publishedReferrers`）；映射发布后若某个被已发布指标引用的 `x_` 字段在该实体的已发布映射里不再存在，拒绝发布。关系本来就只能加不能删（`checkAdditive`）。
 
 **新版本只影响最新快照。** 发布一版指标，以当天为 `asOf` 入队这个指标和引用它的每个已发布标签；发布标签只入队它自己。已有的快照不动，仍标着旧的定义版本。手动回刷：对这个定义所有未过期、定义版本早于当前生效版本的快照，按各自的 `asOf` 以当前版本各入队一次（指标连同下游标签），产出新的快照；旧快照保留到正常过期。已过期的快照没有表，不能回刷。发布时锁定义行后对照当前的登记与映射再校验一次，并在同一事务里编译、入队，SQL 进任务参数，任务不再访问平台库。补充（#139）：上面的反查落地后，发布定义、删除定义、删除自定义实体与发布映射都先锁租户行，按租户串行，依赖检查读到的是对方提交后的结果；自定义实体登记的发布只增不减，不拿这把锁。补充（#154）：event 指标改为缺省按设备归属。`customer_id` 有值时只经 `_identities` 解析，解析不到也不退回设备；只有 `customer_id` 为空才经 `device_id` 查 `_device_owner`，两边都查不到的不计入（`LEFT JOIN` 两张表，`COALESCE` 出 `consumer_id`）。已有快照是实体表 `gold."<kind>__<taskId>"`，SQL 在入队时编进任务参数，所以老快照不变，新口径在发布新版本或回刷后出现；代价是 `dsl_versions` 只存 YAML，老版本在预览、下游标签内联、影响预览、回刷时重编都用新口径，要老口径就在 YAML 里写 `device_attribution: false`。`gold.dsl` 与预览在 SQL 用到 `_device_owner` 时检查这张表在不在（老湖可能只有 `_identities`），不在时提示重新合并；`_device_owner` 不进 `entities` 与依赖。维度路径里 `event.customer_id -> customer` 这一跳不按设备补，匿名事件仍记「未关联」。补充（#178）：依赖的实体有新合并后，调度器每天以当天为 `asOf` 按生效版本重算指标与下游标签，快照记来源，见 ADR-0028。
+
+**说明（#205）。** 指标与标签的 YAML 可写 `description`（字符串，最多 500 字，JSON Schema 校验，超长报「不能超过 500 字」）。说明是 YAML 的一部分，跟版本走，不另加列：目录接口 `GET /api/v1/catalog` 取当前（最新已发布）版本 YAML 里的 `description`，没写为 `null`，草稿里改了说明要发布后才对外可见。字段可选，加之前发布的 YAML 照常通过校验；编译不读它，SQL 不变。
 
 **影响预览。** 定义有草稿且有已发布版本时，在只读挂载的湖上以当天为 `asOf` 分别按已发布版本和草稿计算，按 `consumer_id` 对比，只给计数：指标给取值变化的消费者数；受影响的每个标签（草稿本身是标签时就是它自己）给换了取值的消费者数、新增、移出，以及按「原取值 → 新取值」分组的人数。不出消费者 ID 与明文。
 

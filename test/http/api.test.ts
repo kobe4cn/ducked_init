@@ -131,14 +131,16 @@ describe('Bearer 认证', () => {
 });
 
 describe('目录接口', () => {
-  it('返回本租户已发布的指标与标签的种类、键、当前版本与发布时间；草稿不列出，别的租户看不到', async () => {
+  it('返回本租户已发布的指标与标签的种类、键、当前版本、说明与发布时间；说明取当前版本的，没写为 null，草稿不列出，别的租户看不到', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     const engineer = await memberOf(acme, 'de@acme.com', 'data_engineer');
-    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await createDefinition(analyst, 'metric', 'revenue', `description: 旧说明\n${REVENUE}`);
     await publishDefinition(engineer, 'metric', 'revenue', 1);
-    await saveDslDraft(analyst, 'metric', 'revenue', REVENUE.replace('sum', 'avg'));
+    await saveDslDraft(analyst, 'metric', 'revenue', `description: 累计消费金额\n${REVENUE.replace('sum', 'avg')}`);
     await publishDefinition(engineer, 'metric', 'revenue', 2);
+    await saveDslDraft(analyst, 'metric', 'revenue', `description: 草稿里的说明\n${REVENUE}`);
+    await expect(saveDslDraft(analyst, 'metric', 'revenue', `description: ${'说'.repeat(501)}\n${REVENUE}`)).rejects.toMatchObject({ status: 400, issues: [expect.objectContaining({ path: 'description', message: '不能超过 500 字' })] });
     await createDefinition(analyst, 'tag', 'buyer', BUYER);
     await publishDefinition(engineer, 'tag', 'buyer', 1);
     await createDefinition(analyst, 'metric', 'draft_only', REVENUE);
@@ -154,8 +156,8 @@ describe('目录接口', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Type')).toContain('application/json');
     const { definitions } = await res.json();
-    expect(definitions.map((d: { kind: string; key: string; version: number }) => [d.kind, d.key, d.version]))
-      .toEqual([['metric', 'revenue', 2], ['tag', 'buyer', 1]]);
+    expect(definitions.map((d: { kind: string; key: string; version: number; description: string | null }) => [d.kind, d.key, d.version, d.description]))
+      .toEqual([['metric', 'revenue', 2, '累计消费金额'], ['tag', 'buyer', 1, null]]);
     for (const d of definitions) expect(new Date(d.publishedAt).getTime()).toBeGreaterThan(Date.now() - 60_000);
 
     const theirs = await (await call('/api/v1/catalog', globexKey)).json();

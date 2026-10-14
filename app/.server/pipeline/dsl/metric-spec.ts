@@ -4,7 +4,7 @@
 // 维度路径沿关系走到头：每一跳都是指向下一实体单列主键的关系，最多 3 跳，不能成环。每个问题都带 YAML 里的行列位置。
 // 校验通过后编译成 SQL：基础实体经 silver._identities 关联到 consumer_id（event 的匿名事件缺省再经 silver._device_owner 按设备归属，ADR-0019），
 // 维度路径编译成链式 LEFT JOIN，关联不到或为空记「未关联」；consumer.<字段> 的维度取统一消费者的属性（silver._consumer，ADR-0027），一个人只有一个取值。
-// 这里也放各种定义共用的部分：租户上下文 DslContext、问题 DslIssue 与校验结果 DslCheck、YAML 与 JSON Schema 的第一步 parseDsl。
+// 这里也放各种定义共用的部分：租户上下文 DslContext、问题 DslIssue 与校验结果 DslCheck、YAML 与 JSON Schema 的第一步 parseDsl、说明 description 的 Schema 片段 DESCRIPTION_SCHEMA。
 // 纯函数：不碰平台库与数据湖，同样的定义与 asOf 编译出同样的 SQL
 import { Ajv, type ValidateFunction } from 'ajv';
 import { LineCounter, parseDocument } from 'yaml';
@@ -33,6 +33,8 @@ export interface MetricSpec {
   dimensions?: { name: string; path: string; as_of?: string }[];
   /** 只有 base 为 event 时能写：customer_id 为空的匿名事件经 device_id 按设备归属计入，缺省为 true */
   device_attribution?: boolean;
+  /** 说明（可选，最多 500 字），目录接口返回 */
+  description?: string;
 }
 
 /**
@@ -53,6 +55,9 @@ export const MAX_HOPS = 3;
 export const UNLINKED = '未关联';
 
 const scalar = { type: ['string', 'number', 'boolean'] };
+
+/** 定义的说明（指标、标签共用）：可选，最多 500 字 */
+export const DESCRIPTION_SCHEMA = { type: 'string', maxLength: 500 } as const;
 
 /** 指标定义的 JSON Schema */
 export const METRIC_SCHEMA = {
@@ -92,6 +97,7 @@ export const METRIC_SCHEMA = {
       },
     },
     device_attribution: { type: 'boolean' },
+    description: DESCRIPTION_SCHEMA,
   },
 } as const;
 

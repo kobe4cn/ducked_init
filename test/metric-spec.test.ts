@@ -66,6 +66,13 @@ describe('指标 DSL：校验', () => {
     expect(DSL_KINDS.metric.entities(ok(REGION), ctx)).toEqual(['custom_region', 'custom_store', 'order']);
   });
 
+  it('可选的 description：写了带进定义，不写照常通过；不是字符串或超过 500 字被拒', () => {
+    expect(ok(`description: 近 30 天各区域销售额\n${REGION}`).description).toBe('近 30 天各区域销售额');
+    expect(ok(REGION).description).toBeUndefined();
+    expect(issues(`description: [a]\n${REGION}`)).toEqual([{ line: 1, col: 14, path: 'description', message: '应为文本' }]);
+    expect(issues(`description: ${'说'.repeat(501)}\n${REGION}`)).toEqual([expect.objectContaining({ path: 'description', message: '不能超过 500 字' })]);
+  });
+
   it('基础实体可以是 customer、带指向 customer 的 customer_id 的自定义实体；x_ 字段只认已发布映射里的', () => {
     ok('base: customer\nmeasure: { agg: count }\n');
     ok('base: custom_visit\nmeasure: { agg: sum, field: minutes }\nwindow: { field: visited_on, days: 7 }\n');
