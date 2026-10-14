@@ -2,6 +2,7 @@
 import { sql } from 'drizzle-orm';
 import { bigint, boolean, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import type { CustomEntityField, CustomEntityKind, EntityRelation } from '../../lib/canonical-model';
+import type { MergeRule } from '../../lib/merge-groups';
 import { ROLES } from '../../lib/roles';
 import { SOURCE_KINDS } from '../../lib/sources';
 import type { MergePlan } from '../pipeline/mapping-spec';
@@ -432,6 +433,38 @@ export const customEntityVersions = platform.table('custom_entity_versions', {
 }, t => [
   uniqueIndex('custom_entity_versions_entity_version_uq').on(t.entityId, t.version),
   uniqueIndex('custom_entity_versions_one_draft_uq').on(t.entityId).where(sql`status = 'draft'`),
+]);
+
+export const mergeGroupVersionStatusEnum = platform.enum('merge_group_version_status', VERSION_STATUSES);
+
+// 合并组（ADR-0032）：把同一实体下描述同一批对象的几个映射绑在一起，同一主键在标准层只留一行。每个实体最多一个合并组；第一次保存草稿时建立，从没发布过的组丢弃草稿时删除
+export const mergeGroups = platform.table('merge_groups', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  entity: text('entity').notNull(),
+  createdAt: createdAt(),
+}, t => [
+  uniqueIndex('merge_groups_tenant_entity_uq').on(t.tenantId, t.entity),
+]);
+
+// 合并组的各个版本：组员（映射 ID 的有序数组，顺序即优先级）与存活规则。草稿与双人发布的规则同映射版本（ADR-0015）：
+// 每个组同时只有一份草稿，发布后锁定；last_editor 是最后保存草稿的成员，发布者不能是这位成员。只能由成员在页面上发布，没有自动发布
+export const mergeGroupVersions = platform.table('merge_group_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  groupId: uuid('group_id').notNull().references(() => mergeGroups.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  status: mergeGroupVersionStatusEnum('status').notNull().default('draft'),
+  members: jsonb('members').$type<string[]>().notNull(),
+  rule: jsonb('rule').$type<MergeRule>().notNull(),
+  authors: text('authors').array().notNull(),
+  lastEditor: text('last_editor').notNull(),
+  publishedByEmail: text('published_by_email'),
+  publishedAt: timestamp('published_at', { withTimezone: true }),
+  createdAt: createdAt(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [
+  uniqueIndex('merge_group_versions_group_version_uq').on(t.groupId, t.version),
+  uniqueIndex('merge_group_versions_one_draft_uq').on(t.groupId).where(sql`status = 'draft'`),
 ]);
 
 /** 快照登记时最近一次合并失败的映射：源表、实体、原因摘要（不带取值）与这个映射最近一次成功合并的时间（ISO 字符串，从未成功时为空） */

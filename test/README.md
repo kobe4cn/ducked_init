@@ -61,7 +61,7 @@ npx vitest run test/pipeline/mapping.test.ts # 单个文件
 
 | helper | 作用 |
 |---|---|
-| `publishedIdentitySources({ orders?, consents? })` | 开通租户 `acme`，`de@acme.com` 登记同步三个身份打通数据源、`de2@acme.com` 审核发布三个 customer 映射与埋点事件映射（`orders` 为真时再发布两个订单映射，`consents` 为真时再发布 CRM 与会员的同意映射：crm 1 短信早同意、loyalty 1 晚撤回，crm 2 与 loyalty 2 同一时刻一个同意一个撤回），合并与打通跑完；返回 `{ acme, author, reviewer, sources, mappings, consentMappings, names }` |
+| `publishedIdentitySources({ orders?, consents? })` | 开通租户 `acme`，`de@acme.com` 登记同步三个身份打通数据源、`de2@acme.com` 审核发布三个 customer 映射与埋点事件映射（`orders` 为真时再发布两个订单映射，`consents` 为真时再发布 CRM 与会员的同意映射：crm 1 短信早同意、loyalty 1 晚撤回，crm 2 与 loyalty 2 同一时刻一个同意一个撤回），合并与打通跑完；返回 `{ acme, author, reviewer, sources, mappings, orderMappings, consentMappings, names }` |
 | `CRM` / `LOYALTY` / `TRACKING_USERS` / `TRACKING_EVENTS` / `CRM_ORDERS` / `LOYALTY_ORDERS` / `CRM_CONSENTS` / `LOYALTY_CONSENTS` | 上面发布的映射 YAML，改规则后重新发布时在其后追加内容 |
 
 PostgreSQL 源库 `shop` schema 的内容（确定性造数）：

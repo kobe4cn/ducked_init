@@ -1,7 +1,7 @@
 // app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、已停用或待确认停用、目标自定义实体待补登、最近一次合并），
 // 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿，检查有提示（notices）时留在本页列出提示与新映射的入口；可按所选的表与实体按规则生成草稿填进编辑框，不保存；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
 // 手动触发一次合并到标准层，以及主键冲突体检（silver.keycheck）：任何能看映射的成员都可以运行，报告按实体列出主键重叠的映射对
-import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, PencilLine, Play, Plus, ScanSearch, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, CircleDashed, Layers, Loader2, PencilLine, Play, Plus, ScanSearch, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { isMap, isScalar, parseDocument } from 'yaml';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
@@ -214,6 +214,7 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
         description="数据源中的表 → 标准实体与字段的对应关系，带版本。草稿由另一位数据工程师或管理员发布后锁定；已发布的映射在每次同步后把原始层的变更批次合并进标准层。"
         actions={
           <>
+            <Button asChild variant="outline"><Link to="/merge-groups"><Layers />合并组</Link></Button>
             <span className="flex flex-col items-end text-sm" data-merge-status={merge.status}>
               <span className={cn('inline-flex items-center gap-1', mergeTone)}><MergeIcon className="size-3.5" />{`最近一次合并：${merge.statusLabel}`}</span>
               <span className="text-xs text-slate-400">{time(merge.attemptedAt)}</span>

@@ -163,6 +163,18 @@ const ACTIONS = {
     describe: (d: Detail) => `${d.name}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '自定义实体已删除'}`,
   },
   'custom_entity.deleted': { label: '删除自定义实体', describe: (d: Detail) => `${d.name}` },
+  'merge_group.saved': {
+    label: '保存合并组草稿',
+    describe: (d: Detail) => `${entityLabel(String(d.entity))}，第 ${d.version} 版草稿，${(d.members as string[]).length} 个映射，${d.rule}`,
+  },
+  'merge_group.published': {
+    label: '发布合并组',
+    describe: (d: Detail) => `${entityLabel(String(d.entity))}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
+  },
+  'merge_group.draft_discarded': {
+    label: '丢弃合并组草稿',
+    describe: (d: Detail) => `${entityLabel(String(d.entity))}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '合并组已删除'}`,
+  },
   // 只记定位记录的主键与原因，不记明文
   'pii.revealed': {
     label: '解密敏感信息',

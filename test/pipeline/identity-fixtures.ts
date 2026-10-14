@@ -91,7 +91,7 @@ fields:
 
 /**
  * 开通租户 acme，由 de@acme.com 登记并同步三个身份打通数据源（seedIdentitySources），发布三个 customer 映射与埋点事件映射，
- * 由 de2@acme.com 审核发布；orders 为真时再发布 CRM 与会员的订单映射，consents 为真时再发布两边的同意映射（ID 在 consentMappings 里）。
+ * 由 de2@acme.com 审核发布；orders 为真时再发布 CRM 与会员的订单映射（ID 在 orderMappings 里），consents 为真时再发布两边的同意映射（ID 在 consentMappings 里）。
  * 返回租户、两位成员、数据源 ID、customer 映射 ID，
  * 以及数据源 ID → 简称（crm / loyalty / tracking）
  */
@@ -106,12 +106,11 @@ export async function publishedIdentitySources({ orders = false, consents = fals
     tracking: await publish(author, reviewer, tracking, TRACKING_USERS),
   };
   await publish(author, reviewer, tracking, TRACKING_EVENTS);
-  if (orders) {
-    await publish(author, reviewer, crm, CRM_ORDERS);
-    await publish(author, reviewer, loyalty, LOYALTY_ORDERS);
-  }
+  const orderMappings = orders
+    ? { crm: await publish(author, reviewer, crm, CRM_ORDERS), loyalty: await publish(author, reviewer, loyalty, LOYALTY_ORDERS) }
+    : undefined;
   const consentMappings = consents
     ? { crm: await publish(author, reviewer, crm, CRM_CONSENTS), loyalty: await publish(author, reviewer, loyalty, LOYALTY_CONSENTS) }
     : undefined;
-  return { acme, author, reviewer, sources: { crm, loyalty, tracking }, mappings, consentMappings, names: { [crm]: 'crm', [loyalty]: 'loyalty', [tracking]: 'tracking' } };
+  return { acme, author, reviewer, sources: { crm, loyalty, tracking }, mappings, orderMappings, consentMappings, names: { [crm]: 'crm', [loyalty]: 'loyalty', [tracking]: 'tracking' } };
 }
