@@ -1,9 +1,12 @@
 // app/.server/pipeline/lake-engine.ts —— 在当前进程里打开一个只挂载单个租户数据湖的 DuckDB（ADR-0001、0008）。
 // 工作进程用它执行任务，开通租户时也用它初始化 catalog。这里不碰平台 PG 的连接串：拿到的只有本租户的凭据
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createReadStream, mkdtempSync, rmSync } from 'node:fs';
+import { copyFile, mkdir, rename, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { Readable } from 'node:stream';
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
+import { putObject } from '../s3-client';
 import { attachSource, listTables, lockConfiguration, type MongoAccess, type SourceSpec, type SourceTable } from './source-engine';
 
 /** 一个租户的数据湖：数据文件所在的存储前缀，以及用本租户数据库角色连接的 DuckLake catalog */
@@ -14,6 +17,9 @@ export interface LakeSpec {
   /** 存储前缀在对象存储上时的访问凭据 */
   s3?: { endpoint: string; region: string; key: string; secret: string; urlStyle: string; useSsl: boolean };
 }
+
+/** 服务库在存储前缀下的目录（ADR-0033），不是 DuckLake 登记的文件 */
+export const SERVING_DIR = '_serving/';
 
 /** 超出内存上限时溢写到本机临时目录，溢写量以内存上限的这个倍数为限 */
 export const SPILL_RATIO = 10;
@@ -28,6 +34,11 @@ export interface TenantLakeSession {
   source?: { mongo?: MongoAccess; tables(): Promise<SourceTable[]> };
   /** 数据湖的存储前缀，以及在会话里读取 DuckLake 元数据表的位置（如 ducklake_data_file 前面加上它） */
   lake: { dataPath: string; metadata: string };
+  /**
+   * 挂载了服务库时（生成服务库的任务，ADR-0033）：本机库 serving 的文件，以及把它落盘、DETACH 后上传到本租户存储前缀下 target 的函数
+   * （对象存储用本租户的账号，本地湖先复制到旁边再改名）
+   */
+  serving?: { file: string; upload(target: string): Promise<void> };
   /** 同一实例上再开一个连接（默认库同样是 lake），与 con 共享内存与线程池，可以并发执行；由调用方 closeSync()，close() 不管 */
   connect(): Promise<DuckDBConnection>;
   close(): void;
@@ -49,11 +60,12 @@ const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
  * 同一目录下另挂一个本机库 stage，暂存同步时从源端读到的行：落盘时压缩，不占溢写配额（ADR-0010）。
  * readOnly 时数据湖只读挂载（核对任务）：任何写入都会被 DuckDB 拒绝，本机库 stage 照常可写。
  * encrypted 只在首次挂载、建元数据表时给（ADR-0020）：DuckLake 把加密记进 catalog，之后的挂载不带它也照样加密写入；
- * 已建好的未加密 catalog 带上它会报错
+ * 已建好的未加密 catalog 带上它会报错。
+ * servingFile 时在同一目录下再挂一个本机库 serving（生成服务库，ADR-0033）：锁定配置后不能再 ATTACH，所以在锁定之前挂上
  */
 export async function openTenantLake(
   spec: LakeSpec, limits: EngineLimits, source?: SourceSpec,
-  { readOnly = false, encrypted = false }: { readOnly?: boolean; encrypted?: boolean } = {},
+  { readOnly = false, encrypted = false, servingFile = false }: { readOnly?: boolean; encrypted?: boolean; servingFile?: boolean } = {},
 ): Promise<TenantLakeSession> {
   const instance = await DuckDBInstance.create(':memory:', {
     memory_limit: `${limits.memoryLimitMb}MiB`,
@@ -67,6 +79,8 @@ export async function openTenantLake(
     await con.run(`INSTALL ducklake; LOAD ducklake; INSTALL postgres; LOAD postgres; INSTALL httpfs; LOAD httpfs;
       SET temp_directory = ${lit(spill)}; SET max_temp_directory_size = '${limits.memoryLimitMb * SPILL_RATIO}MiB';
       ATTACH ${lit(join(spill, 'stage.duckdb'))} AS stage;`);
+    const servingDb = join(spill, 'serving.duckdb');
+    if (servingFile) await con.run(`ATTACH ${lit(servingDb)} AS serving`);
     if (spec.s3) {
       const s = spec.s3;
       await con.run(`CREATE SECRET lake_s3 (TYPE s3, KEY_ID ${lit(s.key)}, SECRET ${lit(s.secret)}, REGION ${lit(s.region)},
@@ -93,10 +107,27 @@ export async function openTenantLake(
       connect,
       close,
       lake: { dataPath: spec.dataPath, metadata: `__ducklake_metadata_lake.${ident(spec.catalogSchema)}` },
+      ...(servingFile && { serving: { file: servingDb, upload: async (target: string) => {
+        await con.run('CHECKPOINT serving; DETACH serving');
+        await uploadServing(spec, servingDb, target);
+      } } }),
       ...(source && { source: { mongo: attached.mongo, tables: () => listTables(con, source, attached.mongo) } }),
     };
   } catch (e) {
     close();
     throw e;
   }
+}
+
+/** 把服务库文件放到本租户存储前缀下的 target：只能在 <dataPath>_serving/ 之下 */
+async function uploadServing(spec: LakeSpec, file: string, target: string) {
+  if (!target.startsWith(spec.dataPath + SERVING_DIR)) throw new Error(`服务库只能放在本租户存储前缀的 ${SERVING_DIR} 下：${target}`);
+  if (spec.s3) {
+    const { size } = await stat(file);
+    await putObject(spec.s3, target, Readable.toWeb(createReadStream(file)) as ReadableStream<Uint8Array>, size);
+    return;
+  }
+  await mkdir(dirname(target), { recursive: true });
+  await copyFile(file, `${target}.tmp`);
+  await rename(`${target}.tmp`, target);
 }

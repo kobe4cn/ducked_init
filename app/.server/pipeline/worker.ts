@@ -23,7 +23,8 @@ async function run(input: WorkerInput): Promise<WorkerOutcome> {
   const handler = HANDLERS[input.kind];
   const attach = 'attachSource' in handler && handler.attachSource ? input.source : undefined;
   const readOnly = 'readOnlyLake' in handler && handler.readOnlyLake;
-  const session = await openTenantLake(input.lake, input.limits, attach, { readOnly }).catch(e => {
+  const servingFile = 'servingFile' in handler && handler.servingFile;
+  const session = await openTenantLake(input.lake, input.limits, attach, { readOnly, servingFile }).catch(e => {
     throw new Error(`挂载${attach ? '数据湖与数据源' : '数据湖'}失败：${(e as Error).message}`);
   });
   try {

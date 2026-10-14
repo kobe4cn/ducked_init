@@ -10,6 +10,7 @@ import { getDb, type Db } from './db/client';
 import { lakeMigrations, tenantLakes, tenants, type LakeInventory } from './db/schema';
 import { dropTenantS3Account, ensureTenantS3Account, lakeReady, lakeRow, lakeSpecOf, normalizeLakeRoot, tenantDataPath } from './lake';
 import { copyLakeFile, isS3, listLakeFiles, type LakeFile } from './lake-storage';
+import { SERVING_DIR } from './pipeline/lake-engine';
 import { inventory } from './pipeline/handlers';
 import { openTenantLake, redactLakeSecrets, type EngineLimits } from './pipeline/lake-engine';
 import { putPrefixPlaceholder, setTenantS3Prefixes } from './s3-accounts';
@@ -187,9 +188,12 @@ async function grantS3Access(m: ClaimedMigration) {
   await setTenantS3Prefixes(m.tenantId, [m.fromPath, m.toPath].filter(isS3));
 }
 
-/** 复制旧前缀下的全部文件到新前缀，再核对新前缀上每个文件都在、大小一致（新前缀上多出的残留文件不影响） */
+/**
+ * 复制旧前缀下的全部文件到新前缀，再核对新前缀上每个文件都在、大小一致（新前缀上多出的残留文件不影响）。
+ * 服务库 _serving/ 不复制、不计数：它的指针记着旧前缀的完整路径，迁移后重建（ADR-0033）
+ */
 async function copyAndVerify(from: string, to: string, signal?: AbortSignal) {
-  const files = await listLakeFiles(from);
+  const files = (await listLakeFiles(from)).filter(f => !f.path.startsWith(SERVING_DIR));
   const queue = [...files];
   await Promise.all(Array.from({ length: COPY_CONCURRENCY }, async () => {
     for (let f = queue.shift(); f; f = queue.shift()) {

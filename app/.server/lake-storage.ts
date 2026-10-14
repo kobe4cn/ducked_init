@@ -1,5 +1,6 @@
 // app/.server/lake-storage.ts —— 存储前缀下的文件：列出、复制与删除，本地目录与对象存储一视同仁。
-// 迁移、重置数据湖时使用，对象存储用平台账号访问（要读旧前缀、写新前缀），只在平台进程里使用
+// 迁移、重置数据湖时使用，对象存储用平台账号访问（要读旧前缀、写新前缀），只在平台进程里使用。
+// 前缀下除了 DuckLake 的文件还有服务库 _serving/（ADR-0033）：迁移时不复制、重置时一并删掉，都可以重建
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdir, readdir, rm, stat } from 'node:fs/promises';
 import { dirname, join, relative, sep } from 'node:path';

@@ -1,5 +1,5 @@
 // app/.server/s3-client.ts —— 用 AWS Signature V4 直接调用对象存储（S3 协议与存储服务的 IAM API），不引入 SDK。
-// 只在平台进程里使用；凭据由调用方传入（平台账号或某个租户的账号）
+// 在平台进程里使用，工作进程上传服务库时也用（ADR-0033）；凭据由调用方传入（平台账号或某个租户的账号）
 import { createHash, createHmac } from 'node:crypto';
 
 export interface S3Creds { endpoint: string; region: string; key: string; secret: string; useSsl: boolean }

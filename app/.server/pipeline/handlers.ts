@@ -15,6 +15,7 @@ import { compileRfmUnlinked } from './templates/rfm';
 import { assertOrThrow, runAssertions } from './assertions';
 import { ensureCustomerSourceColumns } from './customer-source-columns';
 import { PartialFailure } from './partial-failure';
+import { buildServingStore, servingPath, SNAPSHOT_TABLE, type ServingParams } from './serving-engine';
 
 type Params = Record<string, unknown>;
 type Result = Record<string, unknown>;
@@ -27,9 +28,9 @@ export interface TaskContext { taskId: string; limits: EngineLimits; source?: So
 
 /**
  * attachSource：数据源与数据湖挂在同一个 DuckDB 里（在两者之间搬数据或对照的任务）；
- * readOnlyLake：数据湖只读挂载（只出报告、不写湖的任务）
+ * readOnlyLake：数据湖只读挂载（只出报告、不写湖的任务）；servingFile：另挂一个本机库 serving（生成服务库，ADR-0033）
  */
-interface Handler { label: string; attachSource?: boolean; readOnlyLake?: boolean; run(con: DuckDBConnection, params: Params, ctx: TaskContext): Promise<Result> }
+interface Handler { label: string; attachSource?: boolean; readOnlyLake?: boolean; servingFile?: boolean; run(con: DuckDBConnection, params: Params, ctx: TaskContext): Promise<Result> }
 
 
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
@@ -166,6 +167,17 @@ function keyCheckTargets(params: Params): KeyCheckParams['entities'] {
     && Array.isArray(e.mappings) && e.mappings.every((m: { mapping?: unknown; columns?: unknown }) => typeof m?.mapping === 'string' && isStrings(m.columns)));
   if (!valid) throw new Error('参数 entities 必须是 { entity, key, bySource, mappings: { mapping, columns }[] } 列表');
   return entities as KeyCheckParams['entities'];
+}
+
+/** 生成服务库的参数：版本、上传位置（必须是本租户存储前缀下这一版的位置）与要放进去的快照（调用方从平台库查出） */
+function servingParams(params: Params, dataPath: string): ServingParams {
+  const { version, target, snapshots } = params;
+  if (!Number.isInteger(version) || (version as number) < 1) throw new Error('参数 version 必须是正整数');
+  if (target !== servingPath(dataPath, version as number)) throw new Error(`参数 target 必须是 ${servingPath(dataPath, version as number)}`);
+  const valid = Array.isArray(snapshots) && snapshots.every(s =>
+    typeof s?.id === 'string' && typeof s.template === 'string' && typeof s.table === 'string' && SNAPSHOT_TABLE.test(s.table));
+  if (!valid) throw new Error('参数 snapshots 必须是 { id, template, table } 列表，table 是结果层快照表名');
+  return { version: version as number, target, snapshots: snapshots as ServingParams['snapshots'] };
 }
 
 function positiveInt(params: Params, key: string, max: number) {
@@ -371,6 +383,17 @@ export const HANDLERS = {
         CALL ducklake_expire_snapshots('lake', older_than => now());
         CALL ducklake_cleanup_old_files('lake', cleanup_all => true);`);
       return { tables };
+    },
+  },
+  // 生成服务库（ADR-0033）：把参数里的快照表（各已发布定义最新、未过期的快照，调用方从平台库查出）合成一个 DuckDB 文件，
+  // 表都按 consumer_id 排序写入，再上传到本租户存储前缀下的 _serving/v<版本>.duckdb。数据湖只读挂载；表名不合规或表不在时失败、不上传
+  'serving.build': {
+    label: '生成服务库',
+    readOnlyLake: true,
+    servingFile: true,
+    async run(_con, params, { session }) {
+      const store = servingParams(params, session.lake.dataPath);
+      return { version: store.version, path: store.target, rows: await buildServingStore(session, store) };
     },
   },
 } satisfies Record<string, Handler>;
