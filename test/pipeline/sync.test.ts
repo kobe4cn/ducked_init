@@ -235,6 +235,41 @@ describe('水位线增量同步到原始层', () => {
     expect(rows[0].level).toBeNull();
   });
 
+  it('每次同步记下源表结构：第一次只存不算变化，之后列出新增、删除与改类型的列，结构存在 _schemas', async () => {
+    const { acme, engineer, id } = await pgSourceWithWatermarks();
+    await sync(engineer, id);
+    const [first] = await historyOf(engineer, id, 'customers');
+    expect(first).toMatchObject({ batch: 1, schema: { changed: false, added: [], removed: [], typeChanged: [] } });
+
+    await grantOnSource(`
+      ALTER TABLE shop.customers ADD COLUMN level text;
+      ALTER TABLE shop.customers DROP COLUMN name;
+      ALTER TABLE shop.customers ALTER COLUMN customer_id TYPE bigint;
+      UPDATE shop.customers SET level = 'gold', updated_at = '2024-07-01' WHERE customer_id = 1;`);
+    await sync(engineer, id);
+    const [second] = await historyOf(engineer, id, 'customers');
+    expect(second).toMatchObject({
+      batch: 2,
+      schema: { changed: true, added: ['level'], removed: ['name'], typeChanged: [{ name: 'customer_id', from: 'INTEGER', to: 'BIGINT', widened: true }] },
+    });
+    // 原始层只加不删：name 列还在，但下一次同步与上一次的源表结构比，不再报删除
+    await sync(engineer, id);
+    const [third] = await historyOf(engineer, id, 'customers');
+    expect(third).toMatchObject({ batch: 3, schema: { changed: false } });
+
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      const stored = (await session.con.runAndReadAll(`SELECT batch::INT AS batch, columns::VARCHAR AS columns, changed::VARCHAR AS changed
+        FROM "${bronzeSchema(id)}"._schemas WHERE table_name = 'customers' ORDER BY batch`)).getRowObjectsJson() as Record<string, string | null>[];
+      expect(stored.map(r => r.batch)).toEqual([1, 2, 3]);
+      expect(stored[0].changed).toBeNull();
+      expect(JSON.parse(stored[1].columns!)).toContainEqual({ name: 'level', type: 'VARCHAR' });
+      expect(JSON.parse(stored[1].changed!)).toMatchObject({ removed: ['name'] });
+    } finally {
+      session.close();
+    }
+  });
+
   it('DuckDB 文件数据源按自增主键增量同步', async () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');

@@ -22,6 +22,7 @@ import {
 } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import type { DataCheck, FailedCheck, FileCheck, StructureCheck, VerifyRecord } from '~/.server/pipeline/verify-engine';
+import type { SchemaDiff } from '~/.server/pipeline/schema-diff';
 import { formValues, LAKE_COVERAGE, SOURCE_KIND_LABELS, SYNC_MODES, targetOf, type LakeCoverage } from '~/lib/sources';
 import { AppShell } from '~/components/app-shell';
 import { KeyCheckFindings } from '~/components/key-check-findings';
@@ -217,7 +218,36 @@ function watermarkRange(e: Extract<SyncEntry, { batch: number }>) {
   return `${e.watermarkColumn}：${e.watermarkFrom ?? '起始'} → ${e.watermarkTo ?? '—'}${lookback}`;
 }
 
-/** 一张表的同步历史：每次同步一个变更批次（新的在前） */
+/** 批次读到的源表结构与上一次相比的变化（ADR-0034）：删除与改类型的列标红 */
+function SchemaChange({ schema }: { schema: SchemaDiff }) {
+  return (
+    <TableRow data-schema-change>
+      <TableCell />
+      <TableCell colSpan={5} className="text-xs whitespace-normal">
+        <span className="mr-2 text-slate-500">源表结构变化</span>
+        {schema.removed.length > 0 && (
+          <span data-schema-removed className="mr-3 inline-flex items-center gap-1 font-medium text-red-600">
+            <CircleAlert className="size-3.5" />
+            删除 <span className="font-mono">{schema.removed.join('、')}</span>
+          </span>
+        )}
+        {schema.typeChanged.length > 0 && (
+          <span data-schema-type-changed className="mr-3 inline-flex items-center gap-1 font-medium text-red-600">
+            <CircleAlert className="size-3.5" />
+            改类型 <span className="font-mono">
+              {schema.typeChanged.map(c => `${c.name}（${c.from} → ${c.to}${c.widened ? '，放宽' : ''}）`).join('、')}
+            </span>
+          </span>
+        )}
+        {schema.added.length > 0 && (
+          <span data-schema-added className="text-slate-600">新增 <span className="font-mono">{schema.added.join('、')}</span></span>
+        )}
+      </TableCell>
+    </TableRow>
+  );
+}
+
+/** 一张表的同步历史：每次同步一个变更批次（新的在前），源表结构有变化时在批次下面列出 */
 function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }) {
   return (
     <div data-sync-table={table} className="space-y-1">
@@ -244,14 +274,17 @@ function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }
               <TableCell>{time(e.startedAt)}</TableCell>
             </TableRow>
           ) : (
-            <TableRow key={`${e.taskId}-${i}`} data-batch={e.batch} data-batch-mode={e.mode}>
-              <TableCell>{e.batch}</TableCell>
-              <TableCell>{BATCH_MODES[e.mode]}</TableCell>
-              <TableCell>{`${count(e.rows)}（新增 ${count(e.inserted)}，更新 ${count(e.updated)}，删除 ${count(e.deleted)}）`}</TableCell>
-              <TableCell>{duration(e.durationMs)}</TableCell>
-              <TableCell className="font-mono text-xs whitespace-normal">{watermarkRange(e)}</TableCell>
-              <TableCell>{time(e.startedAt)}</TableCell>
-            </TableRow>
+            <Fragment key={`${e.taskId}-${i}`}>
+              <TableRow data-batch={e.batch} data-batch-mode={e.mode}>
+                <TableCell>{e.batch}</TableCell>
+                <TableCell>{BATCH_MODES[e.mode]}</TableCell>
+                <TableCell>{`${count(e.rows)}（新增 ${count(e.inserted)}，更新 ${count(e.updated)}，删除 ${count(e.deleted)}）`}</TableCell>
+                <TableCell>{duration(e.durationMs)}</TableCell>
+                <TableCell className="font-mono text-xs whitespace-normal">{watermarkRange(e)}</TableCell>
+                <TableCell>{time(e.startedAt)}</TableCell>
+              </TableRow>
+              {e.schema?.changed && <SchemaChange schema={e.schema} />}
+            </Fragment>
           ))}
         </TableBody>
       </Table>

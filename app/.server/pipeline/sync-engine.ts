@@ -3,11 +3,13 @@
 // 在工作进程里运行，数据湖与数据源挂在同一个 DuckDB 里（源端只读挂载为 src）。每个数据源在数据湖里一个 schema（bronzeSchema），
 // 每张源表一张原始层表：源表的全部列加上操作类型 _op、源端提交时间 _commit_ts、批次号 _batch 与同步时间 _synced_at。
 // 批次日志 _batches 与变更批次在同一个 DuckLake 事务里写入，是水位线的唯一依据：任务结果没记下来也不会重复或漏掉变化。
+// 每次同步读到的源表结构（列名与类型）及其相对上一次的变化记在 _schemas，与批次日志同一事务写入（ADR-0034）。
 // 有主键（源端主键或成员确认的业务主键）的表另在 <schema>_keys 里保存当前主键状态：每个仍存在的主键一行及其最新一版的整行哈希，
 // 用来判断新增还是更新、去掉回看重读到的未变化行，全表读取时找出源端已删除的主键，以及每天比对主键全集。
 // 没有主键的表另在 <schema>_mirror 里保存当前镜像：源表当前的每一行（重复行各一行）及其整行哈希，全表读取时按整行多重集比对
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { SPILL_RATIO, type EngineLimits, type TenantLakeSession } from './lake-engine';
+import { diffColumns, type ColumnType, type SchemaDiff } from './schema-diff';
 import { primaryKeys, writeGrants, type SourceSpec, type SourceTable, type WatermarkKind } from './source-engine';
 
 /**
@@ -56,6 +58,8 @@ export type SyncRecord = { table: string; startedAt: string; durationMs: number 
     readFrom: string | null;
     /** 同步后的水位线：起点与本次读到的最大值中较大的一个 */
     watermarkTo: string | null;
+    /** 源表结构与上一次记下的相比的变化（ADR-0034）：这张表第一次记结构时 changed 为 false；主键比对批次与较早的记录没有 */
+    schema?: SchemaDiff;
   }
   /** gone：源端已经没有这张表，跳过（不算同步失败） */
   | { error: string; gone?: true }
@@ -474,6 +478,23 @@ async function recordBatch(t: TableSync, record: Extract<SyncRecord, { batch: nu
   return record;
 }
 
+/** 第一次记结构时没有上一版：只存，不算变化 */
+const UNCHANGED: SchemaDiff = { changed: false, added: [], removed: [], typeChanged: [] };
+
+/** 这张表在 _schemas 里最近一次记下的结构指纹（源表的列名与类型）；还没记过时为 null */
+async function lastSchema(t: TableSync) {
+  const [last] = await rows<{ columns: string }>(t.con, `
+    SELECT columns::VARCHAR AS columns FROM ${ident(t.schema)}._schemas
+    WHERE table_name = ${lit(t.table.name)} ORDER BY batch DESC LIMIT 1`);
+  return last ? JSON.parse(last.columns) as ColumnType[] : null;
+}
+
+/** 在事务里：记下本批次读到的结构指纹与相对上一次的变化（第一次记时变化为 NULL） */
+async function recordSchema(t: TableSync, batch: number, columns: ColumnType[], diff: SchemaDiff | null) {
+  await t.con.run(`INSERT INTO ${ident(t.schema)}._schemas VALUES (
+    ${lit(t.table.name)}, ${batch}, ${lit(JSON.stringify(columns))}, ${diff ? lit(JSON.stringify(diff)) : 'NULL'})`);
+}
+
 /**
  * 在写入数据湖的事务之前：没有主键的表按整行多重集与当前镜像比对，结果暂存在 stage 里。
  * 各整行哈希在源端与镜像里出现次数之差按哈希分桶统计（每桶的哈希放得进内存，不必溢写），只留下有差异的哈希；
@@ -557,6 +578,10 @@ async function syncTable(t: TableSync, compare = false): Promise<Extract<SyncRec
   const batch = Number(last?.batch ?? 0) + 1;
 
   const described = await columnsOf(con, `SELECT * FROM ${table.from}`);
+  // 与上一次记下的源表结构比对（不用原始层的列：原始层只加不删，ADR-0034）
+  const structure = described.map(c => ({ name: c.column_name, type: c.column_type }));
+  const previous = await lastSchema(t);
+  const diff = previous && diffColumns(previous, structure);
   const wm = param.column ? described.find(c => c.column_name === param.column) : undefined;
   if (param.column && !wm) throw new Error(`源表中没有水位线字段 ${param.column}，请重新采集并确认`);
   const readFrom = incremental ? await lookbackStart(con, param.kind!, wm!.column_type, from!, t.options) : null;
@@ -602,6 +627,7 @@ async function syncTable(t: TableSync, compare = false): Promise<Extract<SyncRec
             SELECT ${rowHash(names, 'b')} AS _hash FROM ${target} b WHERE b._batch = ${batch}) n ON n._hash = i._hash`);
         }
       }
+      await recordSchema(t, batch, structure, diff);
       return recordBatch(t, {
         table: table.name,
         startedAt: startedAt.toISOString(),
@@ -613,6 +639,7 @@ async function syncTable(t: TableSync, compare = false): Promise<Extract<SyncRec
         watermarkFrom: from,
         readFrom,
         watermarkTo: top,
+        schema: diff ?? UNCHANGED,
       }, startedAt, new Date());
     });
   } finally {
@@ -730,7 +757,8 @@ export async function syncSourceTables(
     CREATE SCHEMA IF NOT EXISTS ${ident(`${schema}_mirror`)};
     CREATE TABLE IF NOT EXISTS ${ident(schema)}._batches (
       table_name VARCHAR, batch BIGINT, mode VARCHAR, watermark_column VARCHAR, watermark_from VARCHAR, read_from VARCHAR, watermark_to VARCHAR,
-      rows BIGINT, inserted BIGINT, updated BIGINT, deleted BIGINT, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ)`);
+      rows BIGINT, inserted BIGINT, updated BIGINT, deleted BIGINT, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ);
+    CREATE TABLE IF NOT EXISTS ${ident(schema)}._schemas (table_name VARCHAR, batch BIGINT, columns JSON, changed JSON)`);
 
   const records: SyncRecord[] = [];
   const failed = (table: string, startedAt: Date, e: unknown): SyncRecord =>

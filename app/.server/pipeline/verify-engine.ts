@@ -16,6 +16,7 @@ import { estimatedRows, primaryKeys, writeGrants, type SourceSpec, type SourceTa
 import {
   bronzeSchema, bucketCount, inBucket, joinOn, keyHash, keyList, liveCondition, onSource, PLATFORM_COLUMNS, pushdown,
 } from './sync-engine';
+import { diffColumns } from './schema-diff';
 
 /**
  * 核对任务里平台给出的一张表（最近一次列出表得到的清单）：是否在同步范围内、不在湖里时平台判断的原因，
@@ -128,39 +129,15 @@ const EXTRA = 'stage.verify_extra';
 /** 源端主键旁带上的水位线列 */
 const WM = '_verify_wm';
 
-const INTEGERS = ['TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT'];
-const UNSIGNED = ['UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT', 'UHUGEINT'];
-/** 各整数类型最多几位十进制数（放进 DECIMAL 时需要的整数位） */
-const INTEGER_DIGITS: Record<string, number> = { TINYINT: 3, SMALLINT: 5, INTEGER: 10, BIGINT: 19, UTINYINT: 3, USMALLINT: 5, UINTEGER: 10, UBIGINT: 20 };
-const decimal = (type: string) => type.match(/^DECIMAL\((\d+),(\d+)\)$/)?.slice(1).map(Number) as [number, number] | undefined;
-
-/** 源端的类型 source 是否是原始层类型 lake 的放宽：已有的值都能无损地放进新类型 */
-export function isWidened(lake: string, source: string) {
-  if (source === 'VARCHAR') return true;
-  for (const ranks of [INTEGERS, UNSIGNED]) {
-    if (ranks.includes(lake) && ranks.includes(source)) return ranks.indexOf(source) > ranks.indexOf(lake);
-  }
-  if (UNSIGNED.includes(lake) && INTEGERS.includes(source)) return INTEGERS.indexOf(source) > UNSIGNED.indexOf(lake);
-  if (lake === 'FLOAT' && source === 'DOUBLE') return true;
-  if (lake === 'DATE' && /^TIMESTAMP/.test(source)) return true;
-  const to = decimal(source);
-  if (!to) return false;
-  const from = decimal(lake);
-  if (from) return to[1] >= from[1] && to[0] - to[1] >= from[0] - from[1];
-  return lake in INTEGER_DIGITS && to[0] - to[1] >= INTEGER_DIGITS[lake];
-}
-
 /** 结构：以源端为基准与原始层的列对照（原始层里平台追加的列不算） */
 async function checkStructure(con: DuckDBConnection, table: SourceTable, bronze: string): Promise<StructureCheck> {
-  const source = await columnsOf(con, `SELECT * FROM ${table.from}`);
-  const lake = (await columnsOf(con, bronze)).filter(c => !PLATFORM_COLUMNS.includes(c.column_name));
-  const inLake = new Map(lake.map(c => [c.column_name, c.column_type]));
-  const atSource = new Set(source.map(c => c.column_name));
-  const missingInLake = source.filter(c => !inLake.has(c.column_name)).map(c => ({ name: c.column_name, type: c.column_type }));
-  const extraInLake = lake.filter(c => !atSource.has(c.column_name)).map(c => ({ name: c.column_name, type: c.column_type }));
-  const typeChanged = source
-    .filter(c => inLake.has(c.column_name) && inLake.get(c.column_name) !== c.column_type)
-    .map(c => ({ name: c.column_name, lake: inLake.get(c.column_name)!, source: c.column_type, widened: isWidened(inLake.get(c.column_name)!, c.column_type) }));
+  const named = (cs: { column_name: string; column_type: string }[]) => cs.map(c => ({ name: c.column_name, type: c.column_type }));
+  const source = named(await columnsOf(con, `SELECT * FROM ${table.from}`));
+  const lake = named((await columnsOf(con, bronze)).filter(c => !PLATFORM_COLUMNS.includes(c.column_name)));
+  const diff = diffColumns(lake, source);
+  const missingInLake = source.filter(c => diff.added.includes(c.name));
+  const extraInLake = lake.filter(c => diff.removed.includes(c.name));
+  const typeChanged = diff.typeChanged.map(c => ({ name: c.name, lake: c.from, source: c.to, widened: c.widened }));
   return { ok: !missingInLake.length && !typeChanged.length, missingInLake, extraInLake, typeChanged };
 }
 
@@ -370,7 +347,7 @@ export async function verifySourceLake(
   const estimates = await estimatedRows(con, spec);
   const schema = bronzeSchema(sourceId);
   const bronzeTables = new Set((await rows<{ name: string }>(con, `
-    SELECT table_name AS name FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = ${lit(schema)} AND table_name <> '_batches'`))
+    SELECT table_name AS name FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = ${lit(schema)} AND table_name NOT IN ('_batches', '_schemas')`))
     .map(t => t.name));
   const states = new Set((await rows<{ state: string }>(con, `
     SELECT table_schema || '.' || table_name AS state FROM information_schema.tables

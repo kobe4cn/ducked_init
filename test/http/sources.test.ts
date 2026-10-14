@@ -287,6 +287,28 @@ describe('同步', () => {
     expect(seen).not.toContain('name="intent" value="sync"');
     expect((await analyst.post(`/sources/${id}`, { intent: 'sync' })).status).toBe(403);
   });
+
+  it('源表结构变了之后，同步历史在那个批次下标出删除、改类型（红色）与新增的列；第一次同步不标', async () => {
+    const { browser } = await engineerOf('acme');
+    const id = await registerAndSelect(browser, await pgSourceInput(READER));
+    await browser.post(`/sources/${id}`, { intent: 'confirm-watermark', table: 'customers', column: 'updated_at' });
+    await browser.post(`/sources/${id}`, { intent: 'sync' });
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    expect(await (await browser.get(`/sources/${id}`)).text()).not.toContain('data-schema-change');
+
+    await grantOnSource(`
+      ALTER TABLE shop.customers ADD COLUMN level text;
+      ALTER TABLE shop.customers DROP COLUMN name;
+      ALTER TABLE shop.customers ALTER COLUMN customer_id TYPE bigint;`);
+    await browser.post(`/sources/${id}`, { intent: 'sync' });
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const html = await (await browser.get(`/sources/${id}`)).text();
+    const customers = html.slice(html.indexOf('data-sync-table="customers"'), html.indexOf('data-batch="1"', html.indexOf('data-sync-table="customers"')));
+    expect(customers).toMatch(/data-batch="2"[\s\S]*?data-schema-change[\s\S]*?data-schema-removed[^>]*text-red-600[\s\S]*?name/);
+    expect(customers).toMatch(/data-schema-type-changed[^>]*text-red-600[\s\S]*?customer_id（INTEGER → BIGINT，放宽）/);
+    expect(customers).toMatch(/data-schema-added[\s\S]*?level/);
+    expect(html.match(/data-schema-change/g)).toHaveLength(1);
+  });
 });
 
 describe('同步范围', () => {
