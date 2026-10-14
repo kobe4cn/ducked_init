@@ -7,7 +7,8 @@ import { checkKeyColumns, syncOptionsFromEnv, syncSourceTables, type SyncTablePa
 import { verifySourceLake, type VerifyTableParam } from './verify-engine';
 import { inspectLake, type InspectParams } from './inspect-engine';
 import { runKeyCheck, type KeyCheckParams } from './key-check-engine';
-import { lit, mergeToSilver, type MergeDrop, type MergeMappingParam, type RelationParam } from './merge-engine';
+import { lit, mergeToSilver, type MergeDrop, type MergeGroupParam, type MergeMappingParam, type RelationParam } from './merge-engine';
+import { MERGE_RULE_KINDS, type MergeRuleKind } from '../../lib/merge-groups';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './identity-engine';
 import { TEMPLATES } from './templates';
@@ -87,9 +88,22 @@ function mergeMappings(params: Params, drop: MergeDrop[]): MergeMappingParam[] {
     && typeof m.entity === 'string' && typeof m.table === 'string'
     && Array.isArray(m.columns) && m.columns.length > 0 && Array.isArray(m.entityColumns) && isStrings(m.key)
     && (m.latest === null || typeof m.latest === 'string') && (m.rebuild === undefined || typeof m.rebuild === 'boolean')
-    && (m.uniqueKey === undefined || isStrings(m.uniqueKey)) && (m.uniqueBySource === undefined || typeof m.uniqueBySource === 'boolean'));
+    && (m.uniqueKey === undefined || isStrings(m.uniqueKey)) && (m.uniqueBySource === undefined || typeof m.uniqueBySource === 'boolean')
+    && (m.group === undefined || isMergeGroup(m.group)));
   if (!valid) throw new Error('参数 mappings 必须是非空的已发布映射列表');
   return mappings as MergeMappingParam[];
+}
+
+/** 合并参数里映射所在的合并组（ADR-0032）：组 ID、规则是三种之一、主键与组员（映射 ID、数据源、版本、去重键与引用列的数据源）非空 */
+function isMergeGroup(group: unknown) {
+  const g = group as Partial<MergeGroupParam> | null;
+  const rule = g?.rule;
+  return typeof g?.id === 'string' && isStrings(g.key)
+    && MERGE_RULE_KINDS.includes(rule?.kind as MergeRuleKind) && (rule?.kind !== 'latest' || typeof rule.field === 'string')
+    && Array.isArray(g.members) && g.members.length > 0 && g.members.every(m =>
+      typeof m?.mapping === 'string' && typeof m.sourceId === 'string' && Number.isInteger(m.version) && isStrings(m.key)
+      && (m.latest === null || typeof m.latest === 'string') && (m.keySpace === undefined || typeof m.keySpace === 'string')
+      && Array.isArray(m.refs) && m.refs.every(r => typeof r?.column === 'string' && typeof r.source === 'string'));
 }
 
 /** 合并参数里要撤下的停用映射（ADR-0031）；停用之前入队的合并没有这一项 */

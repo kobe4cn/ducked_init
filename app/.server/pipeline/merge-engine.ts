@@ -15,6 +15,7 @@ import { entityOf, type EntityRelation, type RelationStat } from '../../lib/cano
 import { CONSUMER, CONSUMER_CONSENT, CONSUMER_IDS, consumerSensitive, DEFAULT_RULES, DEVICE_OWNER, IDENTITIES, resolveIdentities, type IdentitySummary } from './identity-engine';
 import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
 import { customerSourceColumn } from '../../lib/customer-source';
+import type { MergeRule } from '../../lib/merge-groups';
 import { ensureCustomerSourceColumns } from './customer-source-columns';
 import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
 import { bronzeTablesOf, checkViewSql } from './source-view-engine';
@@ -24,10 +25,25 @@ import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
  * 合并任务里的一个已发布映射：合并计划加上映射、版本与数据源；输入是源视图时另带视图最新的已发布版本
  * （版本号、SQL 与引用的原始层表，入队时取定）。rebuild 为真时强制由全部批次重建（数据地图上的重建合并，补上标准层缺的列）。
  * uniqueKey 是实体（customer 除外）的主键：合并后它在整个实体内跨映射唯一（ADR-0024「独占」），不是映射的去重键；
- * uniqueBySource 为真时（主键含指向 customer 的字段）只在同一个数据源内唯一
+ * uniqueBySource 为真时（主键含指向 customer 的字段）只在同一个数据源内唯一。
+ * group 是映射所在的已发布合并组（ADR-0032，可用组员至少 2 个时才带）：写标准层时按组的存活规则把组内同一主键并成一行
  */
 export interface MergeMappingParam extends MergePlan {
   mapping: string; version: number; sourceId: string; sourceView?: SourceViewParam; rebuild?: boolean; uniqueKey?: string[]; uniqueBySource?: boolean;
+  group?: MergeGroupParam;
+}
+
+/**
+ * 合并任务里的合并组（ADR-0032）：组 ID、存活规则、实体主键 key（组内按它比较，不是各映射的去重键）与可用的组员（按优先级排，入队时取定）
+ */
+export interface MergeGroupParam { id: string; rule: MergeRule; key: string[]; members: GroupMemberParam[] }
+
+/**
+ * 合并组的一个组员：重算时从它的当前记录按去重键 key 与取最新字段 latest 取每个键最新的一行，
+ * 系统列按映射、数据源、版本与键空间写，customer 引用列旁的数据源列按 refs（列 → 数据源 ID）写
+ */
+export interface GroupMemberParam {
+  mapping: string; sourceId: string; version: number; key: string[]; latest: string | null; keySpace?: string; refs: { column: string; source: string }[];
 }
 
 /**
@@ -99,9 +115,10 @@ const IDENTITY_INPUTS = ['customer', 'event', 'consent'];
 
 /**
  * 标准层的写法，记在合并日志里；上次合并的写法不同时由全部批次重建。
- * 2：敏感字段只存加盐哈希；之前的日志里没有这一列（为空），敏感字段是明文
+ * 2：敏感字段只存加盐哈希；之前的日志里没有这一列（为空），敏感字段是明文。
+ * 3：合并组（ADR-0032）的组员按存活规则并成一行
  */
-const SCHEME = 2;
+const SCHEME = 3;
 
 export const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 export const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
@@ -123,7 +140,15 @@ export const columnExists = async (con: DuckDBConnection, entity: string, column
 /** 标准层表：silver."<实体>" */
 export const silverTable = (entity: string) => `${SILVER}.${ident(entity)}`;
 /** 一个映射的当前记录 */
-const recordsOf = (mapping: string) => `${RECORDS}.${ident(`m_${mapping.replace(/-/g, '')}`)}`;
+const recordsName = (mapping: string) => `m_${mapping.replace(/-/g, '')}`;
+const recordsOf = (mapping: string) => `${RECORDS}.${ident(recordsName(mapping))}`;
+
+/** 合并组里一个组员的参数（入队时由它的合并参数得出） */
+export const groupMemberOf = (plan: MergeMappingParam): GroupMemberParam => ({
+  mapping: plan.mapping, sourceId: plan.sourceId, version: plan.version, key: plan.key, latest: plan.latest,
+  ...(plan.keySpace && { keySpace: plan.keySpace }),
+  refs: customerRefColumns(plan).map(c => ({ column: c.name, source: c.customerSource ?? plan.sourceId })),
+});
 
 /** 合并的中间结果，暂存在会话的本机库 stage 里（落盘时压缩，ADR-0010）。按实体并行合并时每条队列一组，表名带上队列的后缀，互不覆盖 */
 const stageTables = (suffix: string) => ({
@@ -405,7 +430,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   const [last] = await rows<LastMerge>(con, `
     SELECT version, source_keys, batch_to, scheme FROM ${MERGES} WHERE mapping_id = ${lit(plan.mapping)} ORDER BY started_at DESC LIMIT 1`);
   const rebuild = plan.rebuild || !last || last.version !== plan.version || last.source_keys !== input.rebuildTag || last.scheme !== SCHEME
-    || !await tableExists(con, RECORDS, `m_${plan.mapping.replace(/-/g, '')}`);
+    || !await tableExists(con, RECORDS, recordsName(plan.mapping));
   lap('lastMerge');
   const from = rebuild ? 0 : Number(last.batch_to);
   const silverRows = async () => count(con, `${silver} WHERE _mapping = ${lit(plan.mapping)}`);
@@ -461,6 +486,8 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
       FROM (SELECT ${keyList(key)}, true AS _in_winners FROM ${stage.winners}) w
       FULL OUTER JOIN (SELECT *, true AS _in_before FROM ${stage.before}) b ON ${joinOn(key, 'w', 'b')}`)
     : [{ inserted: String(await count(con, stage.winners)), updated: '0', deleted: '0' }];
+  // 合并组：事务里按存活规则从全部组员的当前记录重算（各组员的列在这时读好，本映射的列与 stage.rows 相同）
+  const grouped = plan.group && { members: plan.group.members.map(m => lit(m.mapping)).join(', '), select: await groupRowsSql(con, plan, plan.group, stage.rows, now) };
   lap('keys');
 
   await inTransaction(con, async () => {
@@ -468,24 +495,35 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     lap('ensureTable');
     // 主键有列没映射时（声明了 dedupe.key）本映射的主键在标准层全为空，不会重复
     const unique = plan.uniqueKey?.every(k => plan.columns.some(c => c.name === k)) && plan.uniqueKey;
-    if (unique) await assertUniqueAcrossMappings(con, silver, plan.mapping, unique, stage.winners, plan.uniqueBySource ? plan.sourceId : undefined);
+    // 同组的映射不查：它们的同一主键要并成一行
+    if (unique) {
+      await assertUniqueAcrossMappings(con, silver, plan.mapping, unique, stage.winners, {
+        source: plan.uniqueBySource ? plan.sourceId : undefined, grouped: plan.group?.members.map(m => m.mapping),
+      });
+    }
     lap('unique');
     if (rebuild) {
       await con.run(`DROP TABLE IF EXISTS ${records}; CREATE TABLE ${records} AS SELECT * FROM ${stage.rows}`);
       lap('records');
-      await con.run(`DELETE FROM ${silver} WHERE _mapping = ${lit(plan.mapping)}`);
+      if (!grouped) await con.run(`DELETE FROM ${silver} WHERE _mapping = ${lit(plan.mapping)}`);
     } else {
       await con.run(`DELETE FROM ${records} WHERE _src IN (SELECT _src FROM ${stage.latest})`);
       await con.run(`INSERT INTO ${records} SELECT * FROM ${stage.rows}`);
       lap('records');
-      await con.run(`DELETE FROM ${silver} USING ${stage.keys} k WHERE ${silver}._mapping = ${lit(plan.mapping)} AND ${joinOn(key, silver, 'k')}`);
+      if (!grouped) await con.run(`DELETE FROM ${silver} USING ${stage.keys} k WHERE ${silver}._mapping = ${lit(plan.mapping)} AND ${joinOn(key, silver, 'k')}`);
     }
-    await con.run(`
+    if (grouped) {
+      // 本票每次整组重算：删掉全部组员在标准层的行，再按规则写回每个主键一行
+      await con.run(`DELETE FROM ${silver} WHERE _mapping IN (${grouped.members})`);
+      await con.run(`INSERT INTO ${silver} BY NAME ${grouped.select}`);
+    } else {
+      await con.run(`
       INSERT INTO ${silver} BY NAME SELECT w.* EXCLUDE (_src, _n, _batch),
         ${lit(plan.mapping)} AS _mapping, ${lit(plan.sourceId)} AS _source, ${plan.version} AS _version, TIMESTAMPTZ ${lit(now.toISOString())} AS _merged_at,
         ${plan.keySpace ? lit(plan.keySpace) : 'NULL'} AS _key_space${customerRefColumns(plan).map(c => `,
         ${lit(c.customerSource ?? plan.sourceId)} AS ${ident(customerSourceColumn(c.name))}`).join('')}
       FROM ${stage.winners} w`);
+    }
     lap('deleteInsert');
     await con.run(`INSERT INTO ${MERGES} VALUES (
       ${lit(plan.mapping)}, ${plan.version}, ${lit(input.rebuildTag)}, ${from}, ${to},
@@ -513,6 +551,49 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
 }
 
 /**
+ * 合并组按存活规则重算标准层的 SELECT（ADR-0032）。每个组员从当前记录按自己的去重键取最新的一行（与单独合并时一样），带上系统列、
+ * 优先级 _rank 与组员内同一主键的次序 _within；再按实体主键并成一行：priority 整行取优先级最前的，latest 整行取 field 最新的（一样新时按优先级），
+ * coalesce 逐列取优先级最前的非空值，系统列记有这个键的最高优先级组员，customer 引用列旁的数据源列跟该列取值的组员（ADR-0030）。
+ * 主键有空值的行不并，各自一行。还没有当前记录的组员（没合并过或合并失败）视为空；本映射的列取 rows（与事务里写入的当前记录同构）
+ */
+async function groupRowsSql(con: DuckDBConnection, plan: MergeMappingParam, group: MergeGroupParam, rows: string, now: Date) {
+  const { key, rule } = group;
+  const nullKey = key.map(k => `${ident(k)} IS NULL`).join(' OR ');
+  const parts: string[] = [];
+  const data = new Set<string>();
+  // 数据源列 → 它旁边的 customer 引用列
+  const refOf = new Map<string, string>();
+  for (const [rank, m] of group.members.entries()) {
+    const own = m.mapping === plan.mapping;
+    if (!own && !await tableExists(con, RECORDS, recordsName(m.mapping))) continue;
+    const columns = (await columnsOf(con, own ? rows : recordsOf(m.mapping))).map(c => c.column_name).filter(c => !['_src', '_n', '_batch'].includes(c));
+    columns.filter(c => !key.includes(c)).forEach(c => data.add(c));
+    m.refs.forEach(r => refOf.set(customerSourceColumn(r.column), r.column));
+    const order = [...(m.latest ? [`${ident(m.latest)} DESC NULLS LAST`] : []), '_batch DESC', '_src'].join(', ');
+    parts.push(`SELECT *, ${rank} AS _rank, row_number() OVER (PARTITION BY ${keyList(key)}, CASE WHEN ${nullKey} THEN _src END ORDER BY ${order}) AS _within,
+      ${lit(m.mapping)} AS _mapping, ${lit(m.sourceId)} AS _source, ${m.version} AS _version, ${m.keySpace ? lit(m.keySpace) : 'NULL'} AS _key_space${m.refs.map(r => `,
+      ${lit(r.source)} AS ${ident(customerSourceColumn(r.column))}`).join('')}
+      FROM (SELECT r.* EXCLUDE (_n)${key.filter(k => !columns.includes(k)).map(k => `, NULL AS ${ident(k)}`).join('')} FROM ${recordsOf(m.mapping)} r
+        QUALIFY row_number() OVER (PARTITION BY ${keyList(m.key)} ORDER BY ${order}) = 1)`);
+  }
+  const candidates = `(${parts.join(' UNION ALL BY NAME ')}) c`;
+  const groupKey = `${keyList(key)}, CASE WHEN ${nullKey} THEN _mapping || ':' || _src::VARCHAR END`;
+  const mergedAt = `TIMESTAMPTZ ${lit(now.toISOString())} AS _merged_at`;
+  if (rule.kind !== 'coalesce') {
+    const order = [...(rule.kind === 'latest' && data.has(rule.field) ? [`${ident(rule.field)} DESC NULLS LAST`] : []), '_rank', '_within'].join(', ');
+    return `SELECT * EXCLUDE (_src, _batch, _rank, _within), ${mergedAt} FROM ${candidates}
+      QUALIFY row_number() OVER (PARTITION BY ${groupKey} ORDER BY ${order}) = 1`;
+  }
+  const first = (column: string, when?: string) => `first(${ident(column)} ORDER BY _rank, _within)${when ? ` FILTER (WHERE ${ident(when)} IS NOT NULL)` : ''} AS ${ident(column)}`;
+  const columns = [
+    ...[...data].map(c => first(c, c)),
+    ...Object.keys(SILVER_SYSTEM_COLUMNS).filter(c => c !== '_merged_at').map(c => first(c)),
+    ...[...refOf].map(([source, ref]) => first(source, ref)),
+  ];
+  return `SELECT ${keyList(key)}, ${columns.join(', ')}, ${mergedAt} FROM ${candidates} GROUP BY ${groupKey}`;
+}
+
+/**
  * 从 live 里删掉不满足 where 的记录，返回删掉的源表行数（没有主键的表一条记录可代表多行）。
  * 报错里抹掉敏感字段与 where 引用的源端取值（where 可能引用没映射的敏感列）
  */
@@ -527,17 +608,20 @@ async function filterLive(con: DuckDBConnection, plan: MergeMappingParam, live: 
 }
 
 /**
- * 本映射这次要写入的主键（winners）不能和别的映射在标准层的行重复（ADR-0024「独占」）；source 给出时只和同一个数据源的映射比较。主键为空的行不算重复。
+ * 本映射这次要写入的主键（winners）不能和别的映射在标准层的行重复（ADR-0024「独占」）；grouped 是同一合并组的映射，不比较（ADR-0032）；
+ * source 给出时只和同一个数据源的映射比较。主键为空的行不算重复。
  * 只拿本次写入的键去连接其他映射的行，不对整个实体表分组，耗时随本映射的行数增长；增量时后写进来的冲突键在别的映射合并时已经查过。
  * 要在本事务改 silver 之前调用：改过之后 DuckLake 的基数估计不准，哈希表会建在 silver 一侧，小映射要全表扫大共享表（见 crmlab-10m-baseline.md #164）。
  * 先到先得，重复时报错让本映射的事务回滚；报错列出最多 5 个冲突的键与所在的映射
  */
-async function assertUniqueAcrossMappings(con: DuckDBConnection, silver: string, mapping: string, key: string[], winners: string, source?: string) {
+async function assertUniqueAcrossMappings(
+  con: DuckDBConnection, silver: string, mapping: string, key: string[], winners: string, { source, grouped = [] }: { source?: string; grouped?: string[] },
+) {
   const conflicts = await rows<{ k: string; mappings: string[]; total: string }>(con, `
     SELECT concat_ws(', ', ${key.map(k => `w.${ident(k)}::VARCHAR`).join(', ')}) AS k,
       list_sort(list_distinct(list(o._mapping)) || [${lit(mapping)}]) AS mappings, count(*) OVER () AS total
     FROM (SELECT DISTINCT ${keyList(key)} FROM ${winners}) w
-    JOIN (SELECT ${keyList(key)}, _mapping FROM ${silver} WHERE _mapping <> ${lit(mapping)}${source ? ` AND _source = ${lit(source)}` : ''}) o ON ${joinOn(key, 'w', 'o')}
+    JOIN (SELECT ${keyList(key)}, _mapping FROM ${silver} WHERE _mapping NOT IN (${[...new Set([mapping, ...grouped])].map(lit).join(', ')})${source ? ` AND _source = ${lit(source)}` : ''}) o ON ${joinOn(key, 'w', 'o')}
     GROUP BY ${keyList(key, 'w')} ORDER BY k LIMIT 5`);
   if (!conflicts.length) return;
   const total = Number(conflicts[0].total);

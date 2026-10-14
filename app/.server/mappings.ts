@@ -16,9 +16,10 @@ import { publishedDependents } from './dsl-dependencies';
 import { dryRun } from './pipeline/dry-run-engine';
 import { consumerSensitive, identityRules, type IdentitySummary } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
-import type { MergeDrop, MergeMappingParam, MergeRecord, RelationParam } from './pipeline/merge-engine';
+import { groupMemberOf, type MergeDrop, type MergeMappingParam, type MergeRecord, type RelationParam } from './pipeline/merge-engine';
 import { draftCustomMapping, draftMapping, DraftError } from './pipeline/mapping-draft';
 import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
+import { publishedMergeGroups } from './merge-groups';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
@@ -772,21 +773,25 @@ export async function dryRunMapping(actor: CurrentMember, mappingId: string, ver
  * 租户各映射（给了 mappingIds 时只取这些；停用的映射除外，ADR-0031）最新的已发布版本及其合并计划（合并任务的参数）。
  * 输入是源视图的映射带上视图最新的已发布版本（SQL 与引用的表），工作进程不读平台库；
  * 写入全部实体（customer 除外，ADR-0024「独占」）的映射带上实体主键 uniqueKey，合并时跨映射查重；主键含指向 customer 的字段时
- * 另带 uniqueBySource，只在同一个数据源内查重
+ * 另带 uniqueBySource，只在同一个数据源内查重。在已发布合并组里、组里可用（已发布、未停用、仍写入该实体）的组员至少 2 个的映射
+ * 带上 group（ADR-0032），组员按优先级排
  */
 export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId: string, mappingIds?: string[]): Promise<MergeMappingParam[]> {
   if (mappingIds && !mappingIds.length) return [];
+  const groups = await publishedMergeGroups(db, tenantId);
+  // 合并组要看全部组员，给了 mappingIds 时把它们所在组的组员一并取出，最后再筛掉
+  const wanted = mappingIds && [...new Set([...mappingIds, ...[...groups.values()].flatMap(g => (g.members.some(m => mappingIds.includes(m)) ? g.members : []))])];
   const rows = await db
     .selectDistinctOn([mappingVersions.mappingId], {
       mapping: mappings.id, sourceId: mappings.sourceId, viewId: mappings.sourceViewId, version: mappingVersions.version, plan: mappingVersions.plan,
     })
     .from(mappingVersions)
     .innerJoin(mappings, eq(mappings.id, mappingVersions.mappingId))
-    .where(and(eq(mappings.tenantId, tenantId), isNull(mappings.disabledAt), eq(mappingVersions.status, 'published'), mappingIds && inArray(mappings.id, mappingIds)))
+    .where(and(eq(mappings.tenantId, tenantId), isNull(mappings.disabledAt), eq(mappingVersions.status, 'published'), wanted && inArray(mappings.id, wanted)))
     .orderBy(mappingVersions.mappingId, desc(mappingVersions.version));
   const views = await publishedViews(db, tenantId, { viewIds: [...new Set(rows.flatMap(r => (r.viewId ? [r.viewId] : [])))] });
   const uniqueByEntity = uniqueKeys(await publishedCustomEntities(db, tenantId));
-  return rows
+  const plans: MergeMappingParam[] = rows
     .sort((a, b) => a.mapping.localeCompare(b.mapping))
     .map(({ viewId, ...r }) => {
       const view = views.find(v => v.id === viewId);
@@ -797,6 +802,15 @@ export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId
         ...(unique && { uniqueKey: unique.key, ...(unique.bySource && { uniqueBySource: true }) }),
       };
     });
+  const withGroups = plans.map(plan => {
+    const group = groups.get(plan.entity);
+    if (!group?.members.includes(plan.mapping) || !plan.uniqueKey) return plan;
+    // 组失效（可用组员不到 2 个）时不带，组员之间照常查独占
+    const members = group.members.flatMap(id => plans.filter(p => p.mapping === id && p.entity === plan.entity));
+    if (members.length < 2) return plan;
+    return { ...plan, group: { id: group.id, rule: group.rule, key: plan.uniqueKey, members: members.map(groupMemberOf) } };
+  });
+  return mappingIds ? withGroups.filter(p => mappingIds.includes(p.mapping)) : withGroups;
 }
 
 const ofMerge = (tenantId: string) => and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'silver.merge'));

@@ -2,7 +2,7 @@
 // 每个实体最多一个组；一版登记组员（映射 ID 的有序数组，顺序即优先级）与存活规则。保存草稿与发布时都校验（checkMergeGroup）：
 // 组员至少 2 个、都是这个实体已发布且未停用的映射、键空间相同、不重复；实体不能是 customer（ADR-0027 有自己的属性取舍）或只在同一数据源内唯一的实体；
 // latest 的字段要是这个实体的字段。草稿按映射同样的规则双人发布（ADR-0015），也可以丢弃（回到最近的已发布版本，从没发布过时整个删除）。
-// 本模块只管设置的存放、编辑与发布，合并引擎按组合并另见 ADR-0032。一律限定在操作者所属租户内
+// 发布时给组员入队重建合并，合并引擎按组合并另见 ADR-0032。一律限定在操作者所属租户内
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
@@ -10,7 +10,7 @@ import type { CurrentMember } from './auth';
 import { publishedCustomEntities, uniqueKeys } from './custom-entities';
 import { getDb } from './db/client';
 import { mappings, mappingVersions, mergeGroups, mergeGroupVersions, sources } from './db/schema';
-import { lockTenant } from './mappings';
+import { enqueueMerge, lockTenant } from './mappings';
 import { isStale, publishBlocker, publisherCount, publishReason, withAuthor } from './publish-rules';
 import { entityOf } from '../lib/canonical-model';
 import { MERGE_RULE_KINDS, type MergeRule, type MergeRuleKind, ruleText } from '../lib/merge-groups';
@@ -223,7 +223,8 @@ async function requireGroup(tenantId: string, entity: string) {
 
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。只由成员在页面上调用，没有自动发布。
- * 先锁租户行（与发布、停用映射互斥）再锁组行，组员在保存后可能被停用或改了键空间，发布时再校验一次。发布后版本锁定
+ * 先锁租户行（与发布、停用映射互斥）再锁组行，组员在保存后可能被停用或改了键空间，发布时再校验一次。发布后版本锁定。
+ * 同一事务里给组员（连同上一版里被移出组的映射，它们要写回自己的行）入队带 rebuild 的合并，合并在运行时拒绝发布
  */
 export async function publishMergeGroup(actor: CurrentMember, entity: string, version: number) {
   assertCan(actor, 'publish');
@@ -239,6 +240,7 @@ export async function publishMergeGroup(actor: CurrentMember, entity: string, ve
     const [current] = await tx.select().from(mergeGroupVersions).where(eq(mergeGroupVersions.id, draft.id));
     if (isStale(current, draft)) throw new MergeGroupError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
     await assertMergeGroup(tx, actor.tenant.id, entity, current);
+    const previous = (await publishedMergeGroups(tx, actor.tenant.id)).get(entity)?.members ?? [];
     await tx.update(mergeGroupVersions)
       .set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` })
       .where(eq(mergeGroupVersions.id, draft.id));
@@ -250,6 +252,9 @@ export async function publishMergeGroup(actor: CurrentMember, entity: string, ve
       targetId: group.id,
       detail: { entity, version, members: current.members, rule: ruleText(current.rule), authors: current.authors, lastEditor: current.lastEditor },
     });
+    if (!await enqueueMerge(tx, actor.tenant.id, [...new Set([...current.members, ...previous])], { rebuild: true })) {
+      throw new MergeGroupError('已有一次合并在运行，等它结束后再发布');
+    }
   });
 }
 
