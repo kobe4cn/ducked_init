@@ -684,7 +684,8 @@ export async function requestDisable(actor: CurrentMember, mappingId: string) {
 /**
  * 确认停用（ADR-0031）：需要发布权限，确认人不能是提议人。停用后映射不再算作已发布（publishedPlans、同步后的合并与定时检查都跳过它），
  * 停用人记为提议人、确认人记在审计里，并清掉提议。被别的数据源跨源引用的 customer 映射不能停用（提议之后才有的引用也算）。
- * 同一事务里入队一次合并：撤下它写进标准层的行，同实体其余映射一起合并；已有合并在运行时报错，不停用
+ * 同一事务里入队一次合并：撤下它写进标准层的行，同实体其余映射一起合并；它在已发布合并组里时，组内其余映射带强制重建（ADR-0032：
+ * 由其余组员按规则重算它让出的主键，只剩一个组员时组失效、拆回各自的行）。已有合并在运行时报错，不停用
  */
 export async function confirmDisable(actor: CurrentMember, mappingId: string) {
   await disableStep(actor, mappingId, 'confirm', async (tx, mapping) => {
@@ -693,16 +694,27 @@ export async function confirmDisable(actor: CurrentMember, mappingId: string) {
       .where(eq(mappings.id, mappingId));
     // 撤下它写进标准层的行，同实体其余映射一起合并（失败的合并不自动重试，原先因它失败的映射要在这次补上，ADR-0015）
     const rest = (await publishedPlans(tx, actor.tenant.id)).filter(p => p.entity === mapping.entity).map(p => p.mapping);
-    const task = await enqueueMerge(tx, actor.tenant.id, rest, { drop: [{ mapping: mappingId, entity: mapping.entity }] });
-    if (!task) throw new MappingError('已有一次合并在运行，等它结束后再确认停用');
+    // 已停用的组员不在 rest 里，不入队
+    const groupRest = (await groupOthers(tx, actor.tenant.id, mapping.entity, mappingId)).filter(id => rest.includes(id));
+    const task = await enqueueMerge(tx, actor.tenant.id, rest.filter(id => !groupRest.includes(id)), { drop: [{ mapping: mappingId, entity: mapping.entity }] });
+    if (!task || (groupRest.length && !await enqueueMerge(tx, actor.tenant.id, groupRest, { rebuild: true }))) {
+      throw new MappingError('已有一次合并在运行，等它结束后再确认停用');
+    }
     return { requestedBy: mapping.disableRequestedByEmail, confirmedBy: actor.email };
   });
+}
+
+/** 映射所在实体的已发布合并组里的其余组员（不在组里时为空），含已停用的 */
+async function groupOthers(tx: Tx, tenantId: string, entity: string, mappingId: string) {
+  const members = (await publishedMergeGroups(tx, tenantId)).get(entity)?.members ?? [];
+  return members.includes(mappingId) ? members.filter(id => id !== mappingId) : [];
 }
 
 /**
  * 恢复停用的映射（ADR-0031）：需要发布权限，一人即可。停用期间别的映射可能占了它让出的位置，恢复前对照数据源当前的字段、已发布的登记与其余已发布映射
  * 重跑发布时的检查（文档校验与 assertPublishable），源表（输入是源视图时视图引用的表）移出了同步范围时拒绝，要先选回（否则重建读不到批次）。
- * 清掉停用列、记审计，在同一事务里为它入队一次重建合并（撤下时已删掉它的水位）；主键被别的映射占了时是这次合并失败，与发布时一样。已有合并在运行时报错、不恢复
+ * 清掉停用列、记审计，在同一事务里为它入队一次重建合并（撤下时已删掉它的水位）；它在已发布合并组里时组内其余映射一起重建（整组重算，ADR-0032）。
+ * 主键被别的映射占了时是这次合并失败，与发布时一样。已有合并在运行时报错、不恢复
  */
 export async function restoreMapping(actor: CurrentMember, mappingId: string) {
   assertCan(actor, 'publish');
@@ -736,7 +748,8 @@ export async function restoreMapping(actor: CurrentMember, mappingId: string) {
       targetId: mappingId,
       detail: { source: names.get(mapping.sourceId), table: mapping.tableName, entity: mapping.entity, version: published.version },
     });
-    if (!await enqueueMerge(tx, tenantId, [mappingId], { rebuild: true })) throw new MappingError('已有一次合并在运行，等它结束后再恢复');
+    const others = await groupOthers(tx, tenantId, mapping.entity, mappingId);
+    if (!await enqueueMerge(tx, tenantId, [mappingId, ...others], { rebuild: true })) throw new MappingError('已有一次合并在运行，等它结束后再恢复');
   });
 }
 

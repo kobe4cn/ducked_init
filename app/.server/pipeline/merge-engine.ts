@@ -156,6 +156,7 @@ const stageTables = (suffix: string) => ({
   live: `stage.merge_live_${suffix}`,
   rows: `stage.merge_rows_${suffix}`,
   keys: `stage.merge_keys_${suffix}`,
+  groupKeys: `stage.merge_group_keys_${suffix}`,
   before: `stage.merge_before_${suffix}`,
   winners: `stage.merge_winners_${suffix}`,
   view: `stage.merge_view_${suffix}`,
@@ -486,8 +487,21 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
       FROM (SELECT ${keyList(key)}, true AS _in_winners FROM ${stage.winners}) w
       FULL OUTER JOIN (SELECT *, true AS _in_before FROM ${stage.before}) b ON ${joinOn(key, 'w', 'b')}`)
     : [{ inserted: String(await count(con, stage.winners)), updated: '0', deleted: '0' }];
-  // 合并组：事务里按存活规则从全部组员的当前记录重算（各组员的列在这时读好，本映射的列与 stage.rows 相同）
-  const grouped = plan.group && { members: plan.group.members.map(m => lit(m.mapping)).join(', '), select: await groupRowsSql(con, plan, plan.group, stage.rows, now) };
+  // 合并组：事务里按存活规则从全部组员的当前记录重算（各组员的列在这时读好，本映射的列与 stage.rows 相同）。
+  // 增量时只重算受影响的主键：受影响的去重键下全部记录（含没改动的，去重键的胜出行换了，它们的主键也受影响）在旧版本与新版本里的实体主键；
+  // 主键有空值的行不并，按去重键 stage.keys 只重算本映射的
+  let scope: GroupScope | undefined;
+  if (plan.group && !rebuild) {
+    const groupKey = plan.group.key;
+    const writesGroupKey = groupKey.every(k => plan.columns.some(c => c.name === k));
+    await con.run(`CREATE OR REPLACE TABLE ${stage.groupKeys} AS ${writesGroupKey ? `SELECT DISTINCT * FROM (
+      SELECT ${keyList(groupKey, 'r')} FROM ${records} r SEMI JOIN ${stage.keys} k ON ${joinOn(key, 'r', 'k')} UNION ALL SELECT ${keyList(groupKey)} FROM ${stage.rows})
+      WHERE NOT (${anyNull(groupKey)})` : `SELECT ${groupKey.map(k => `NULL AS ${ident(k)}`).join(', ')} LIMIT 0`}`);
+    scope = { groupKeysTable: stage.groupKeys, ownKeysTable: stage.keys };
+  }
+  const grouped = plan.group && {
+    key: plan.group.key, members: plan.group.members.map(m => lit(m.mapping)).join(', '), select: await groupRowsSql(con, plan, plan.group, stage.rows, now, scope),
+  };
   lap('keys');
 
   await inTransaction(con, async () => {
@@ -512,8 +526,15 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
       lap('records');
       if (!grouped) await con.run(`DELETE FROM ${silver} USING ${stage.keys} k WHERE ${silver}._mapping = ${lit(plan.mapping)} AND ${joinOn(key, silver, 'k')}`);
     }
-    if (grouped) {
-      // 本票每次整组重算：删掉全部组员在标准层的行，再按规则写回每个主键一行
+    if (grouped && scope) {
+      // 增量：删掉全部组员在受影响主键上的行与本映射受影响的去重键上主键有空值的行，再按规则写回
+      const groupKey = grouped.key;
+      await con.run(`DELETE FROM ${silver} USING ${scope.groupKeysTable} g WHERE ${silver}._mapping IN (${grouped.members}) AND ${joinOn(groupKey, silver, 'g')}`);
+      await con.run(`DELETE FROM ${silver} USING ${scope.ownKeysTable} k
+        WHERE ${silver}._mapping = ${lit(plan.mapping)} AND (${anyNull(groupKey, silver)}) AND ${joinOn(key, silver, 'k')}`);
+      await con.run(`INSERT INTO ${silver} BY NAME ${grouped.select}`);
+    } else if (grouped) {
+      // 重建时整组重算：删掉全部组员在标准层的行，再按规则写回每个主键一行
       await con.run(`DELETE FROM ${silver} WHERE _mapping IN (${grouped.members})`);
       await con.run(`INSERT INTO ${silver} BY NAME ${grouped.select}`);
     } else {
@@ -551,14 +572,23 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
 }
 
 /**
+ * 增量合并时合并组只重算的范围：实体主键在 groupKeysTable 里的行，与本映射去重键在 ownKeysTable 里、主键有空值的行
+ */
+interface GroupScope { groupKeysTable: string; ownKeysTable: string }
+
+/** 主键有空值（alias 给出时带上表别名） */
+const anyNull = (keys: string[], alias?: string) => keys.map(k => `${alias ? `${alias}.` : ''}${ident(k)} IS NULL`).join(' OR ');
+
+/**
  * 合并组按存活规则重算标准层的 SELECT（ADR-0032）。每个组员从当前记录按自己的去重键取最新的一行（与单独合并时一样），带上系统列、
  * 优先级 _rank 与组员内同一主键的次序 _within；再按实体主键并成一行：priority 整行取优先级最前的，latest 整行取 field 最新的（一样新时按优先级），
  * coalesce 逐列取优先级最前的非空值，系统列记有这个键的最高优先级组员，customer 引用列旁的数据源列跟该列取值的组员（ADR-0030）。
- * 主键有空值的行不并，各自一行。还没有当前记录的组员（没合并过或合并失败）视为空；本映射的列取 rows（与事务里写入的当前记录同构）
+ * 主键有空值的行不并，各自一行。还没有当前记录的组员（没合并过或合并失败）视为空；本映射的列取 rows（与事务里写入的当前记录同构）。
+ * 给了 scope 时只算其中的行（各组员先取好每个去重键最新的一行再筛，与整组重算的结果一致）
  */
-async function groupRowsSql(con: DuckDBConnection, plan: MergeMappingParam, group: MergeGroupParam, rows: string, now: Date) {
+async function groupRowsSql(con: DuckDBConnection, plan: MergeMappingParam, group: MergeGroupParam, rows: string, now: Date, scope?: GroupScope) {
   const { key, rule } = group;
-  const nullKey = key.map(k => `${ident(k)} IS NULL`).join(' OR ');
+  const nullKey = anyNull(key);
   const parts: string[] = [];
   const data = new Set<string>();
   // 数据源列 → 它旁边的 customer 引用列
@@ -574,7 +604,9 @@ async function groupRowsSql(con: DuckDBConnection, plan: MergeMappingParam, grou
       ${lit(m.mapping)} AS _mapping, ${lit(m.sourceId)} AS _source, ${m.version} AS _version, ${m.keySpace ? lit(m.keySpace) : 'NULL'} AS _key_space${m.refs.map(r => `,
       ${lit(r.source)} AS ${ident(customerSourceColumn(r.column))}`).join('')}
       FROM (SELECT r.* EXCLUDE (_n)${key.filter(k => !columns.includes(k)).map(k => `, NULL AS ${ident(k)}`).join('')} FROM ${recordsOf(m.mapping)} r
-        QUALIFY row_number() OVER (PARTITION BY ${keyList(m.key)} ORDER BY ${order}) = 1)`);
+        QUALIFY row_number() OVER (PARTITION BY ${keyList(m.key)} ORDER BY ${order}) = 1) deduped${scope ? `
+      WHERE EXISTS (SELECT 1 FROM ${scope.groupKeysTable} g WHERE ${joinOn(key, 'g', 'deduped')})${own ? `
+        OR ((${anyNull(key, 'deduped')}) AND EXISTS (SELECT 1 FROM ${scope.ownKeysTable} k WHERE ${joinOn(plan.key, 'k', 'deduped')}))` : ''}` : ''}`);
   }
   const candidates = `(${parts.join(' UNION ALL BY NAME ')}) c`;
   const groupKey = `${keyList(key)}, CASE WHEN ${nullKey} THEN _mapping || ':' || _src::VARCHAR END`;
