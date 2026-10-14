@@ -11,6 +11,7 @@ export function navFor(member: CurrentMember) {
     ...(can(member.role, 'results:read') ? [{ to: '/analytics', label: '分析' }] : []),
     { to: '/tasks', label: '任务' },
     ...(can(member.role, 'members:manage') ? [{ to: '/members', label: '成员' }] : []),
+    ...(can(member.role, 'api_keys:manage') ? [{ to: '/api-keys', label: 'API Key' }] : []),
     ...(can(member.role, 'audit:read') ? [{ to: '/audit', label: '审计日志' }] : []),
     ...(can(member.role, 'pii:reveal') ? [{ to: '/pii/reveal', label: '解密' }] : []),
   ];

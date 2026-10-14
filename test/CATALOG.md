@@ -36,6 +36,7 @@
 | `pipeline/lake-schemas.test.ts` | 固定的 schema 与平台表（ADR-0020）：新租户的湖里有 `gold`、`silver`、`silver_records` 与 `silver._merges`（带 `scheme` 列）、`_assertion_runs`、`_quarantine`，不预建身份打通的表；并发数为 4 的租户在空的结果层上同时跑 6 个 `gold.dsl` 全部成功（确有任务同时运行），`resetTenantLake` 之后同样成立；`pnpm lake:ensure` 给缺表、缺 `gold`、缺 `scheme` 列的租户补建（`--tenant` 只处理一个，不给时处理全部） |
 | `http/login.test.ts` | 租户与 Magic Link 登录 |
 | `http/members.test.ts` | 成员邀请与角色、权限矩阵、审计日志、跨租户拒绝 |
+| `http/api.test.ts` | 外部系统接口：管理员在 `/api-keys` 创建 Key（明文只在创建那次响应里 `data-api-key`，列表只有名称、前缀、创建人与时间，库里只存 `sha256`，审计详情不含明文）、吊销（再吊销 404）、审计「创建 / 吊销 API Key」；数据工程师看不到入口、页面与提交 403；没有 Key、Key 错误、已吊销、成员 cookie、租户已暂停一律同样的 401（`WWW-Authenticate: Bearer`），成功调用记下 `last_used_at`（一分钟内再调用不再写）；`GET /api/v1/catalog` 只列本租户已发布的指标与标签（当前版本、发布时间，草稿不列）；A 租户管理员吊销 B 的 Key 404 |
 | `http/pii.test.ts` | 解密敏感信息：管理员按映射与源表主键看到明文、明文不进任务表与审计、审计 `pii.revealed`、不填原因或找不到记录不解密也不记审计、其他角色 403、其他租户 404 |
 | `http/analytics.test.ts` | 分析页：查看者看到本租户的快照列表、打开 RFM 结果（人群人数与金额、消费者明细），页面没有明文；其他租户的快照 404；已过期的快照（即使带数据不完整标记）标灰、没有链接、打开 404；登记时有映射合并失败的快照标「数据不完整」（`data-snapshot-incomplete`，源表、实体、原因摘要、数据停在的时间或从未成功合并），完整的不标；列表里带标记的快照状态显示「数据不完整」（`data-snapshot-status="incomplete"`），不带的照旧「可查看」；RFM 模板参数页的权限矩阵（查看者只读、分析师能起草不能发布、最后保存的人不能发布、数据工程师与管理员能发布并入队 `gold.rfm`、丢弃草稿）、参数不合法时报错；重新计算（没有已发布版本时不显示、重复入队与未来日期返回 400、分析师看到无权限说明且提交 403、成功后跳回带提示、入队参数带 `asOf` 与 `definitionVersion`、版本表不变） |
 | `http/quality.test.ts` | 数据质量页：注入负金额订单后 `gold.rfm` 失败，分析师在 `/quality` 看到断言结果（`data-assertion`、`data-failed`）、任务 ID 与隔离区样本（`data-quarantine-key`、行 JSON），页面没有明文；导航有入口；查看者没有入口且 403；其他租户的成员看不到这些数据 |

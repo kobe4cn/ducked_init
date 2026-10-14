@@ -11,6 +11,7 @@ type Detail = Record<string, unknown>;
 const sourceKindLabel = (kind: unknown) => SOURCE_KIND_LABELS[kind as SourceKind] ?? String(kind);
 const roleLabel = (role: unknown) => ROLE_LABELS[role as Role] ?? String(role);
 const templateLabel = (template: unknown) => TEMPLATES[template as keyof typeof TEMPLATES]?.label ?? String(template);
+const apiKeyLabel = (d: Detail) => `「${d.name}」（${d.prefix}…）`;
 const dslLabel = (d: Detail) => (d.kind === 'tag' ? '标签' : '指标');
 
 
@@ -41,6 +42,9 @@ const ACTIONS = {
   'member.invited': { label: '邀请成员', describe: (d: Detail) => `${d.email}，角色：${roleLabel(d.role)}` },
   'member.role_changed': { label: '修改角色', describe: (d: Detail) => `${d.email}：${roleLabel(d.from)} → ${roleLabel(d.to)}` },
   'member.removed': { label: '移除成员', describe: (d: Detail) => `${d.email}（原角色：${roleLabel(d.role)}）` },
+  // 只记名称与前缀，明文只在创建那次响应里出现
+  'api_key.created': { label: '创建 API Key', describe: apiKeyLabel },
+  'api_key.revoked': { label: '吊销 API Key', describe: apiKeyLabel },
   'source.registered': { label: '登记数据源', describe: (d: Detail) => `「${d.name}」（${sourceKindLabel(d.kind)}），${d.tables} 张表` },
   'source.updated': {
     label: '修改数据源',

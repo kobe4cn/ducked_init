@@ -14,7 +14,7 @@ export const normalizeEmail = (email: string) => email.trim().toLowerCase();
 
 const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 export const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** 可以展示给运营者的业务错误（输入不合法、标识重复、租户不存在等），带对应的 HTTP 状态码 */
 export class TenantError extends Error {

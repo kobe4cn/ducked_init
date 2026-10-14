@@ -15,7 +15,7 @@ export const roleEnum = platform.enum('member_role', ROLES);
 
 const createdAt = () => timestamp('created_at', { withTimezone: true }).notNull().defaultNow();
 
-// 停用（suspended_at 非空）：数据完整保留，可以恢复。拦截成员的会话与登录，排队的任务不再派发；外部系统接口随对应切片接入。
+// 停用（suspended_at 非空）：数据完整保留，可以恢复。拦截成员的会话与登录、外部系统的 API Key，排队的任务不再派发。
 // 配额由运营者设置：每个任务的 DuckDB 内存上限与线程数，以及同时运行的任务数（超出的排队）
 export const tenants = platform.table('tenants', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -95,6 +95,20 @@ export const sessions = platform.table('sessions', {
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   createdAt: createdAt(),
 });
+
+// 外部系统的 API Key：明文只在创建时给管理员看一次，库里只存 SHA-256；prefix 是明文前 8 位，用于辨认。
+// 吊销（revoked_at 非空）后立即失效；last_used_at 同一把 Key 每分钟最多更新一次
+export const apiKeys = platform.table('api_keys', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  prefix: text('prefix').notNull(),
+  tokenHash: text('token_hash').notNull().unique(),
+  createdByEmail: text('created_by_email').notNull(),
+  createdAt: createdAt(),
+  lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+}, t => [index('api_keys_tenant_idx').on(t.tenantId, t.createdAt)]);
 
 // 运营者：运行平台本身的人，独立于成员（ADR-0007）。只能由运营命令创建。
 // TOTP 密钥首次登录时生成，确认一次验证码后才算绑定；totp_last_step 记下最近用过的时间步，防止验证码重放
