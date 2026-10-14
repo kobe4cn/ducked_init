@@ -81,3 +81,13 @@ export async function silver(tenantId: string, entity: string, orderBy: string) 
     session.close();
   }
 }
+
+/** 在本租户数据湖里执行 SQL（可写），返回结果行 */
+export async function onLake<T = Record<string, unknown>>(tenantId: string, sql: string) {
+  const session = await openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 });
+  try {
+    return (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+  } finally {
+    session.close();
+  }
+}

@@ -39,6 +39,7 @@ npx vitest run test/pipeline/mapping.test.ts # 单个文件
 | `publish(author, reviewer, sourceId, yaml)` | 起草映射并由另一位成员发布，跑空调度器（合并完成），返回映射 ID |
 | `mergeUnchecked(tenantId, mappingIds)` | 不查跨映射主键，把这些已发布映射合并一次（去掉 `uniqueKey` / `uniqueBySource`），模拟独占检查上线前已存在的重叠；返回合并任务最终状态 |
 | `silver(tenantId, entity, orderBy)` | 读出标准层某个实体的表（时间按 UTC 文本、金额按文本，去掉 `_merged_at`） |
+| `onLake(tenantId, sql)` | 在本租户数据湖里执行 SQL（可写），返回结果行；结果层表名要加引号：`gold."rfm__<任务 ID>"` |
 
 跑空调度器：`createDispatcher({ maxWorkers: 2 }).runUntilIdle()`（来自 `app/.server/pipeline/dispatcher`），测试里通常包成 `const drain = () => ...`。
 
@@ -122,7 +123,7 @@ describe('<功能>', () => {
 });
 ```
 
-需要原始层有数据时，在 `tenantWithSource` 之后确认水位线并同步：`confirmWatermark(member, sourceId, 'customers', 'updated_at')`、`syncSource(member, sourceId)`，再 `drain()`（完整例子见 `mapping.test.ts` 的 `syncedSource`）。读标准层用 `silver`；读数据湖里别的表用 `openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 })`，用完 `session.close()`（例子见 `fixtures.ts` 的 `silver`、`pii.test.ts` 的 `silverDump`）。
+需要原始层有数据时，在 `tenantWithSource` 之后确认水位线并同步：`confirmWatermark(member, sourceId, 'customers', 'updated_at')`、`syncSource(member, sourceId)`，再 `drain()`（完整例子见 `mapping.test.ts` 的 `syncedSource`）。读标准层用 `silver`；读写数据湖里别的表用 `onLake`，要在同一会话里多次读时用 `openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 })`，用完 `session.close()`（例子见 `fixtures.ts` 的 `silver`、`pii.test.ts` 的 `silverDump`）。
 
 ## 新建一个 HTTP 测试
 

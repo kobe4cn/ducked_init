@@ -19,6 +19,10 @@ export const SNAPSHOT_TABLE = /^gold\.([a-z]+)__[0-9a-f-]{36}$/;
 /** 服务库在存储前缀下的位置 */
 export const servingPath = (dataPath: string, version: number) => `${dataPath}${SERVING_DIR}v${version}.duckdb`;
 
+/** 指标的维度列拼成 JSON 对象（没有维度时为 {}）：服务库的 metrics.dims 与指定快照点查时同一种拼法 */
+export const dimsJson = (columns: string[]) =>
+  columns.length ? `json_object(${columns.map(n => `${lit(n)}, ${ident(n)}`).join(', ')})` : `'{}'::JSON`;
+
 const quoted = (table: string) => `gold.${ident(table.slice('gold.'.length))}`;
 
 /** 各快照按模板分到 RFM、指标、标签；表名、模板与表名前缀不一致或重复时抛错 */
@@ -61,10 +65,8 @@ export async function buildServingStore(session: TenantLakeSession, { version, t
     SELECT table_name AS name, column_name AS "column" FROM information_schema.columns
     WHERE table_catalog = 'lake' AND table_schema = 'gold' ORDER BY ordinal_position`);
   // 指标的维度列名各不相同：按快照表的实际列拼 dims，排除 consumer_id 与 value
-  const dims = (table: string) => {
-    const names = columns.filter(c => `gold.${c.name}` === table && c.column !== 'consumer_id' && c.column !== 'value').map(c => c.column);
-    return names.length ? `json_object(${names.map(n => `${lit(n)}, ${ident(n)}`).join(', ')})` : `'{}'::JSON`;
-  };
+  const dims = (table: string) =>
+    dimsJson(columns.filter(c => `gold.${c.name}` === table && c.column !== 'consumer_id' && c.column !== 'value').map(c => c.column));
 
   await con.run(`CREATE TABLE serving.tags AS SELECT * FROM (${union(
     tag.map(s => `SELECT consumer_id::VARCHAR AS consumer_id, tag_key::VARCHAR AS tag, tag_value::VARCHAR AS tag_value FROM ${quoted(s.table)}`),
