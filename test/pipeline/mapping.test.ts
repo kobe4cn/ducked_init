@@ -468,6 +468,30 @@ describe('发布映射并合并到标准层', () => {
     expect(await silver(acme, 'customer', 'customer_id::INT')).toHaveLength(40);
   });
 
+  it('源端把映射引用的列改成文本（没有行变化）：同步后这个映射合并失败、报错写明列名；之后每次合并都失败，其他实体照常合并', async () => {
+    const { acme, author, reviewer, id } = await syncedSource();
+    const customers = await publish(author, reviewer, id, CUSTOMERS);
+    const orders = await publish(author, reviewer, id, ORDERS);
+    const before = await silver(acme, 'order', 'order_id::INT');
+    // customer_id 改成文本：写成文本后取值不变，这张表本次没有写入行；改成 VARCHAR 不算放宽（表达式按原类型写）
+    await grantOnSource('ALTER TABLE shop.orders ALTER COLUMN customer_id TYPE text;');
+    await syncSource(author, id);
+    await drain();
+    const [sync] = (await listTasks(acme)).filter(t => t.kind === 'source.sync');
+    expect((sync.result as { tables: { table: string; rows: number }[] }).tables.find(t => t.table === 'orders')).toMatchObject({ rows: 0 });
+
+    const failed = async () => ((await getMapping(author, orders)).merge.history[0] as { error: string }).error;
+    expect(await failed()).toMatch(/^映射引用的源列 customer_id 的类型由 INTEGER 改成了 VARCHAR：/);
+    expect(await silver(acme, 'order', 'order_id::INT')).toEqual(before);
+
+    await grantOnSource(`UPDATE shop.customers SET city = '杭州', updated_at = '2024-07-01' WHERE customer_id = 1;`);
+    await syncSource(author, id);
+    await drain();
+    expect((await getMapping(author, customers)).merge.history[0]).not.toHaveProperty('error');
+    expect((await silver(acme, 'customer', 'customer_id::INT')).find(c => c.customer_id === '1')).toMatchObject({ city: '杭州' });
+    expect(await failed()).toContain('customer_id');
+  });
+
   it('order 是内置 ref 的终点：order_id 与已有映射重叠的映射合并失败；customer 不查，主键重叠照常合并', async () => {
     const { acme, author, reviewer, id } = await syncedSource();
     const customers = await publish(author, reviewer, id, CUSTOMERS);

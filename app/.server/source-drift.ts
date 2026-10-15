@@ -6,10 +6,9 @@
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { getDb } from './db/client';
 import { mappingIgnoredColumns, mappings, mappingVersions, tasks } from './db/schema';
-import type { MergePlan } from './pipeline/mapping-spec';
+import { referencedSourceColumns as referenced } from './pipeline/mapping-spec';
 import type { ColumnProfile } from './pipeline/source-engine';
 import { confirmedTables } from './sources';
-import { ExprError, parseExpression, referencedColumns } from '../lib/mapping-expr';
 
 export interface MappingDrift {
   sourceId: string;
@@ -18,19 +17,6 @@ export interface MappingDrift {
   newColumns: ColumnProfile[];
   /** 最新已发布版本引用、最近一次采集里已经没有的列 */
   missing: string[];
-}
-
-/** 合并计划的列表达式与行过滤引用的源表列；解析不了的表达式跳过 */
-function referenced(plan: MergePlan) {
-  const names = new Set<string>();
-  for (const src of [...plan.columns.map(c => c.expr), ...(plan.where ? [plan.where] : [])]) {
-    try {
-      for (const c of referencedColumns(parseExpression(src))) names.add(c.name);
-    } catch (e) {
-      if (!(e instanceof ExprError)) throw e;
-    }
-  }
-  return names;
 }
 
 /**

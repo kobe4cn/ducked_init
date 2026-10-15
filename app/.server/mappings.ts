@@ -922,13 +922,15 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
 }
 
 /**
- * 同步任务 s 是否给已发布映射 m 的源表写入了变更：同一数据源、同一张表、本批次写进原始层的行数大于 0（删除也算在内）。
+ * 同步任务 s 是否给已发布映射 m 的源表写入了变更：同一数据源、同一张表、本批次写进原始层的行数大于 0（删除也算在内），
+ * 或源表有列被删除、改了类型（没有行变化也要合并，让合并前的结构检查报出来，ADR-0034）。
  * 输入是源视图的映射看视图最新的已发布版本引用的任一张表。
  * 比对周期里同一张表有两条记录，任意一条有变更即可；失败的记录没有 rows，自然排除（部分失败的任务照样参与判断）。
  * 同步后的合并与定时检查共用这个判断（ADR-0015）
  */
 const syncWroteMappingTable = (s: 's', m: 'm') => sql.raw(`${s}.kind = 'source.sync' AND ${s}.params->>'sourceId' = ${m}.source_id::text
-  AND EXISTS (SELECT 1 FROM jsonb_array_elements(${s}.result->'tables') r WHERE (r->>'rows')::int > 0 AND r->>'table' = ANY(CASE
+  AND EXISTS (SELECT 1 FROM jsonb_array_elements(${s}.result->'tables') r WHERE ((r->>'rows')::int > 0
+    OR jsonb_array_length(coalesce(r->'schema'->'removed', '[]')) > 0 OR jsonb_array_length(coalesce(r->'schema'->'typeChanged', '[]')) > 0) AND r->>'table' = ANY(CASE
     WHEN ${m}.source_view_id IS NULL THEN ARRAY[${m}.table_name]
     ELSE (SELECT vv.tables FROM platform.source_view_versions vv WHERE vv.view_id = ${m}.source_view_id AND vv.status = 'published' ORDER BY vv.version DESC LIMIT 1)
   END))`);

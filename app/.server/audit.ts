@@ -3,8 +3,10 @@ import { desc, eq } from 'drizzle-orm';
 import type { CurrentMember } from './auth';
 import { getDb, type Db } from './db/client';
 import { auditLogs, ROLE_LABELS, SOURCE_KIND_LABELS, tenants, type Role, type SourceKind } from './db/schema';
+import { describeBroken } from './pipeline/schema-diff';
 import { TEMPLATES } from './pipeline/templates';
 import { describeQuotaChange, type TenantQuota } from './quota';
+import type { BrokenMapping } from './schema-alerts';
 import { entityLabel } from '../lib/canonical-model';
 
 type Detail = Record<string, unknown>;
@@ -186,6 +188,13 @@ const ACTIONS = {
   'assertion.failed': {
     label: '断言失败',
     describe: (d: Detail) => `${d.task}：${(d.summaries as string[]).join('；')}，未产出新快照，继续使用上一版`,
+  },
+  // 平台在同步时发现源表删了列或破坏性改了类型，且已发布映射引用了这些列（ADR-0034）：只记映射、表与列名
+  'source.schema_broken': {
+    label: '源表结构变化影响映射',
+    describe: (d: Detail) => `「${d.source}」${(d.mappings as BrokenMapping[])
+      .map(m => `${m.table} → ${entityLabel(m.entity)}：${describeBroken(m)}`)
+      .join('；')}，这些映射的合并会失败`,
   },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },

@@ -1,6 +1,6 @@
-// test/schema-diff.test.ts —— 源表结构的比对：新增、删除、改类型的列，类型变化是否只是放宽（纯函数）
+// test/schema-diff.test.ts —— 源表结构的比对：新增、删除、改类型的列，类型变化是否只是放宽、是否破坏映射引用的列（纯函数）
 import { describe, expect, it } from 'vitest';
-import { diffColumns, isWidened } from '../app/.server/pipeline/schema-diff';
+import { breakingColumns, diffColumns, isBreaking, isWidened } from '../app/.server/pipeline/schema-diff';
 
 const cols = (spec: Record<string, string>) => Object.entries(spec).map(([name, type]) => ({ name, type }));
 
@@ -37,5 +37,25 @@ describe('isWidened', () => {
     expect(isWidened('DATE', 'TIMESTAMP WITH TIME ZONE')).toBe(true);
     expect(isWidened('INTEGER', 'DECIMAL(12,2)')).toBe(true);
     expect(isWidened('DECIMAL(10,2)', 'DECIMAL(10,0)')).toBe(false);
+  });
+});
+
+describe('破坏性变化', () => {
+  it('isBreaking：收窄或改成 VARCHAR（原来不是）算破坏性，放宽到别的类型不算', () => {
+    expect(isBreaking('DECIMAL(10,2)', 'INTEGER')).toBe(true);
+    expect(isBreaking('INTEGER', 'VARCHAR')).toBe(true);
+    expect(isBreaking('INTEGER', 'BIGINT')).toBe(false);
+    expect(isBreaking('VARCHAR', 'VARCHAR')).toBe(false);
+  });
+
+  it('breakingColumns：只看引用的列，对照原始层类型；删除的列与破坏性改类型的列分开列出，原始层没有的列不查', () => {
+    const bronze = cols({ id: 'INTEGER', amount: 'DECIMAL(10,2)', phone: 'VARCHAR', code: 'INTEGER', note: 'VARCHAR' });
+    // code 上一次改成了 BIGINT，这次又改成 VARCHAR：对照原始层的 INTEGER
+    const latest = cols({ id: 'BIGINT', amount: 'INTEGER', code: 'VARCHAR' });
+    expect(breakingColumns(new Set(['id', 'amount', 'phone', 'code', 'ghost']), bronze, latest)).toEqual({
+      removed: ['phone'],
+      typeChanged: [{ name: 'amount', from: 'DECIMAL(10,2)', to: 'INTEGER' }, { name: 'code', from: 'INTEGER', to: 'VARCHAR' }],
+    });
+    expect(breakingColumns(new Set(['id']), bronze, latest)).toEqual({ removed: [], typeChanged: [] });
   });
 });

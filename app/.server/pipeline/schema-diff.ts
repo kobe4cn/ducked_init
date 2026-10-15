@@ -45,3 +45,26 @@ export function diffColumns(prev: ColumnType[], next: ColumnType[]): SchemaDiff 
     .map(c => ({ name: c.name, from: before.get(c.name)!, to: c.type, widened: isWidened(before.get(c.name)!, c.type) }));
   return { changed: Boolean(added.length || removed.length || typeChanged.length), added, removed, typeChanged };
 }
+
+/**
+ * 类型从 from 改成 to 会不会破坏映射（ADR-0034）：不是放宽，或改成了 VARCHAR（isWidened 把任何类型改成 VARCHAR 算放宽，
+ * 但映射里按原类型写的表达式在文本上会出错或悄悄变了含义）
+ */
+export const isBreaking = (from: string, to: string) => from !== to && (to === 'VARCHAR' || !isWidened(from, to));
+
+/** 映射引用的列里被删除的与破坏性改了类型的 */
+export interface BrokenColumns { removed: string[]; typeChanged: { name: string; from: string; to: string }[] }
+
+/** 受影响的列：「phone 已删除、amount 类型 DECIMAL(10,2) → INTEGER」（告警邮件与审计） */
+export const describeBroken = ({ removed, typeChanged }: BrokenColumns) =>
+  [...removed.map(c => `${c} 已删除`), ...typeChanged.map(c => `${c.name} 类型 ${c.from} → ${c.to}`)].join('、');
+
+/** 映射引用的列（referenced）在源表最新结构 latest 里被删除或破坏性改类型的；原类型取原始层（bronze）的列类型，原始层没有的列不查 */
+export function breakingColumns(referenced: Set<string>, bronze: ColumnType[], latest: ColumnType[]): BrokenColumns {
+  const now = new Map(latest.map(c => [c.name, c.type]));
+  const used = bronze.filter(c => referenced.has(c.name));
+  return {
+    removed: used.filter(c => !now.has(c.name)).map(c => c.name),
+    typeChanged: used.filter(c => now.has(c.name) && isBreaking(c.type, now.get(c.name)!)).map(c => ({ name: c.name, from: c.type, to: now.get(c.name)! })),
+  };
+}

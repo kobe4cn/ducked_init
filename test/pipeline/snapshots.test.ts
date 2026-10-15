@@ -1,19 +1,25 @@
 // 结果快照登记的流水线接缝：打通后的消费者与订单 → runTask('gold.rfm') → 调度器在任务成功后登记快照 →
 // listSnapshots / getSnapshot 读出的平台元数据，readRfmSnapshot 只读挂载数据湖读出的人群汇总与消费者明细；
 // 登记时模板读到的实体有映射最近一次合并失败则在快照上记下「数据不完整」（incomplete）；
+// 源端删掉映射引用的列 → 同步（没有行变化也合并）→ 只有引用它的映射合并失败，旧快照仍可读、新快照标「数据不完整」，能改映射的成员收到邮件；
 // 到期后 enqueueDueExpiries → 调度器派发 gold.expire → 湖里的表与文件、平台元数据里的 expiredAt
 import { existsSync } from 'node:fs';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { setMailer, type Mail } from '../../app/.server/mailer';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import type { MergeRecord } from '../../app/.server/pipeline/merge-engine';
 import { enqueueDueExpiries, getSnapshot, listSnapshots, readRfmSnapshot } from '../../app/.server/snapshots';
+import { syncSource } from '../../app/.server/source-sync';
 import { resetDb } from '../http/harness';
-import { mergeUnchecked, newTenant, runTask } from './fixtures';
+import { memberOf, mergeUnchecked, newTenant, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
+import { grantOnSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -165,6 +171,44 @@ describe('数据不完整', () => {
 
     expect(await mergeUnchecked(acme, [orders])).toMatchObject({ status: 'succeeded' });
     expect((await rfmSnapshotOf(acme)).incomplete).toBeNull();
+  });
+});
+
+describe('源端结构变化', () => {
+  const outbox: Mail[] = [];
+  beforeEach(() => { outbox.length = 0; setMailer({ async send(m) { outbox.push(m); } }); });
+  afterEach(() => { setMailer(undefined); });
+
+  it('源端删掉订单表引用的列（没有行变化）：同步后只有这个映射合并失败，客户照常合并；旧快照仍可读，新快照标数据不完整；能改映射的成员收到邮件并记审计', async () => {
+    const { acme, author, sources, mappings: customers, orderMappings } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const snapshot = await rfmSnapshotOf(acme);
+    await grantOnSource(`ALTER TABLE crm.orders DROP COLUMN paid_at; UPDATE crm.customers SET name = '张三丰', updated_at = '2024-07-01' WHERE id = 1;`);
+    await syncSource(author, sources.crm);
+    await drain();
+
+    const records = ((await lastMergeOf(acme, orderMappings!.crm)).result as { mappings: MergeRecord[] }).mappings;
+    expect(records.find(r => r.mapping === orderMappings!.crm)).toMatchObject({ error: expect.stringMatching(/^映射引用的源列 paid_at 已被删除：/) });
+    expect(records.find(r => r.mapping === customers.crm)).not.toHaveProperty('error');
+    expect((await readRfmSnapshot(snapshot, { page: 1 })).consumers).toHaveLength(5);
+    expect((await rfmSnapshotOf(acme)).incomplete).toMatchObject([{ mapping: orderMappings!.crm, error: '映射引用的源列 paid_at 已被删除' }]);
+
+    expect(outbox.map(m => m.to).sort()).toEqual(['admin@acme.com', 'de2@acme.com', 'de@acme.com']);
+    expect(outbox[0].subject).toContain('源表结构变化影响映射');
+    expect(outbox[0].text).toContain(`orders → 订单（映射 ${orderMappings!.crm}）：paid_at 已删除`);
+    const audits = (await listAuditLogs(acme)).filter(a => a.action === '源表结构变化影响映射');
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({ actor: '平台', summary: expect.stringContaining('orders → 订单：paid_at 已删除') });
+
+    // 结构没再变的同步不再通知；合并仍然失败，直到映射改版或源端恢复
+    outbox.length = 0;
+    await grantOnSource(`UPDATE crm.orders SET status = 'refunded', updated_at = '2024-07-01' WHERE order_no = 'A1';`);
+    await syncSource(author, sources.crm);
+    await drain();
+    expect(outbox).toEqual([]);
+    expect((await listAuditLogs(acme)).filter(a => a.action === '源表结构变化影响映射')).toHaveLength(1);
+    expect(((await lastMergeOf(acme, orderMappings!.crm)).result as { mappings: MergeRecord[] }).mappings)
+      .toContainEqual(expect.objectContaining({ mapping: orderMappings!.crm, error: expect.stringContaining('paid_at 已被删除') }));
   });
 });
 

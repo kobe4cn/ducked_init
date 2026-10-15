@@ -17,7 +17,8 @@ import { compileExpression, parseExpression, referencedColumns } from '../../lib
 import { customerSourceColumn } from '../../lib/customer-source';
 import type { MergeRule } from '../../lib/merge-groups';
 import { ensureCustomerSourceColumns } from './customer-source-columns';
-import { sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
+import { referencedSourceColumns, sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
+import { breakingColumns, type ColumnType } from './schema-diff';
 import { bronzeTablesOf, checkViewSql } from './source-view-engine';
 import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
 
@@ -415,6 +416,24 @@ async function ensureSilverTable(con: DuckDBConnection, plan: MergeMappingParam)
   for (const name of sourceColumns.filter(name => !known.has(name))) await con.run(`ALTER TABLE ${table} ADD COLUMN ${ident(name)} VARCHAR`);
 }
 
+/**
+ * 合并前对照源表最近一次同步记下的结构指纹（ADR-0034）：映射引用的列在源端被删除或破坏性改类型（对照原始层的列类型）时报错，
+ * 不把这些列悄悄写成空值。源端恢复或映射改版之前每次合并都失败。还没记过结构（老湖还没同步过）时跳过；源视图的映射不查
+ */
+async function checkSourceSchema(con: DuckDBConnection, plan: MergeMappingParam) {
+  const schema = bronzeSchema(plan.sourceId);
+  if (!await tableExists(con, schema, '_schemas')) return;
+  const [latest] = await rows<{ columns: string }>(con, `
+    SELECT columns::VARCHAR AS columns FROM ${ident(schema)}._schemas WHERE table_name = ${lit(plan.table)} ORDER BY batch DESC LIMIT 1`);
+  if (!latest) return;
+  const bronze = (await columnsOf(con, `${ident(schema)}.${ident(plan.table)}`))
+    .filter(c => !PLATFORM_COLUMNS.includes(c.column_name)).map(c => ({ name: c.column_name, type: c.column_type }));
+  const { removed, typeChanged } = breakingColumns(referencedSourceColumns(plan), bronze, JSON.parse(latest.columns) as ColumnType[]);
+  const broken = [...removed.map(c => `${c} 已被删除`), ...typeChanged.map(c => `${c.name} 的类型由 ${c.from} 改成了 ${c.to}`)];
+  // 摘要只留冒号之前（summarizeMergeError），列名写在冒号前
+  if (broken.length) throw new Error(`映射引用的源列 ${broken.join('、')}：源表 ${plan.table} 的结构变了，请修改映射后重新发布，或在源端恢复`);
+}
+
 interface LastMerge { version: number; source_keys: string; batch_to: string; scheme: number | null }
 
 /**
@@ -435,6 +454,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   const input = await mappingInput(con, plan, plan.sourceId, plan.sourceView, stage.view, '合并');
   lap('input');
   if ('skipped' in input) return { ...base, durationMs: Date.now() - startedAt.getTime(), skipped: input.skipped };
+  if (!plan.view) await checkSourceSchema(con, plan);
   const records = recordsOf(plan.mapping);
   const silver = silverTable(plan.entity);
   // 没有主键的表按整行区分记录

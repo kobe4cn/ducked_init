@@ -691,6 +691,19 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
   };
 }
 
+/** 合并计划的列表达式与行过滤引用的源表列；解析不了的表达式跳过。源表列差异与合并前的结构检查共用 */
+export function referencedSourceColumns(plan: MergePlan) {
+  const names = new Set<string>();
+  for (const src of [...plan.columns.map(c => c.expr), ...(plan.where ? [plan.where] : [])]) {
+    try {
+      for (const c of referencedColumns(parseExpression(src))) names.add(c.name);
+    } catch (e) {
+      if (!(e instanceof ExprError)) throw e;
+    }
+  }
+  return names;
+}
+
 /** 标准层列的 DuckDB 类型 */
 export const sqlType = (type: FieldType) => FIELD_TYPES[type].sql;
 
