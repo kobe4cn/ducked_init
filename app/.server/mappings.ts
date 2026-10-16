@@ -19,6 +19,7 @@ import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { groupMemberOf, type MergeDrop, type MergeMappingParam, type MergeRecord, type RelationParam } from './pipeline/merge-engine';
 import { draftCustomMapping, draftMapping, DraftError } from './pipeline/mapping-draft';
 import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
+import type { Rename } from './pipeline/schema-repair';
 import { publishedMergeGroups } from './merge-groups';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { tenantPiiSalt } from './secrets';
@@ -365,6 +366,33 @@ export async function saveMappingDraft(actor: CurrentMember, mappingId: string, 
     return version;
   });
   return { version: saved, notices };
+}
+
+/**
+ * 平台按规则起草的修复（源列改名后，ADR-0034）存成一版草稿：校验同 saveMappingDraft，作者为空、最后保存的是 'platform'，
+ * 任何一位有发布权限的成员看过后都可以发布。映射已有草稿（成员正在改）时不覆盖，返回 null。记平台审计 mapping.repair_drafted
+ */
+export async function savePlatformDraft(tenantId: string, mappingId: string, yaml: string, renames: Pick<Rename, 'from' | 'to'>[]): Promise<{ version: number } | null> {
+  const mapping = await requireMapping(tenantId, mappingId);
+  const { plan } = await checkMappingDraft(tenantId, mapping.sourceId, yaml);
+  try {
+    return await getDb().transaction(async tx => {
+      await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
+      const [latest] = await tx.select().from(mappingVersions).where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version)).limit(1);
+      if (latest?.status === 'draft') return null;
+      const version = (latest?.version ?? 0) + 1;
+      await tx.insert(mappingVersions).values({ mappingId, version, yaml, plan, authors: [], lastEditor: 'platform' });
+      const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
+      await recordAudit(tx, {
+        tenantId, system: true, action: 'mapping.repair_drafted', targetType: 'mapping', targetId: mappingId,
+        detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version, renames },
+      });
+      return { version };
+    });
+  } catch (e) {
+    if (isUniqueViolation(e)) return null;
+    throw e;
+  }
 }
 
 /**

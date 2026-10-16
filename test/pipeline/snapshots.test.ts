@@ -2,16 +2,18 @@
 // listSnapshots / getSnapshot 读出的平台元数据，readRfmSnapshot 只读挂载数据湖读出的人群汇总与消费者明细；
 // 登记时模板读到的实体有映射最近一次合并失败则在快照上记下「数据不完整」（incomplete）；
 // 源端删掉映射引用的列 → 同步（没有行变化也合并）→ 只有引用它的映射合并失败，旧快照仍可读、新快照标「数据不完整」，能改映射的成员收到邮件；
+// 源端改名 → 重新采集后平台起草修复草稿并发带链接的邮件，成员空跑、发布后合并恢复；
 // 到期后 enqueueDueExpiries → 调度器派发 gold.expire → 湖里的表与文件、平台元数据里的 expiredAt
 import { existsSync } from 'node:fs';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { mappings, tasks } from '../../app/.server/db/schema';
+import { mappings, mappingVersions, tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { setMailer, type Mail } from '../../app/.server/mailer';
+import { dryRunMapping, publishMapping } from '../../app/.server/mappings';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import type { MergeRecord } from '../../app/.server/pipeline/merge-engine';
 import { enqueueDueExpiries, getSnapshot, listSnapshots, readRfmSnapshot } from '../../app/.server/snapshots';
@@ -193,9 +195,12 @@ describe('源端结构变化', () => {
     expect((await readRfmSnapshot(snapshot, { page: 1 })).consumers).toHaveLength(5);
     expect((await rfmSnapshotOf(acme)).incomplete).toMatchObject([{ mapping: orderMappings!.crm, error: '映射引用的源列 paid_at 已被删除' }]);
 
-    expect(outbox.map(m => m.to).sort()).toEqual(['admin@acme.com', 'de2@acme.com', 'de@acme.com']);
-    expect(outbox[0].subject).toContain('源表结构变化影响映射');
-    expect(outbox[0].text).toContain(`orders → 订单（映射 ${orderMappings!.crm}）：paid_at 已删除`);
+    const alerts = outbox.filter(m => m.subject.includes('源表结构变化影响映射'));
+    expect(alerts.map(m => m.to).sort()).toEqual(['admin@acme.com', 'de2@acme.com', 'de@acme.com']);
+    expect(alerts[0].text).toContain(`orders → 订单（映射 ${orderMappings!.crm}）：paid_at 已删除`);
+    // 删掉的列没有改名的候选：平台不起草，另一封邮件说明
+    expect(outbox.filter(m => m.subject.includes('映射修复草稿')).map(m => m.text))
+      .toEqual(Array(3).fill(expect.stringContaining(`orders → 订单（映射 ${orderMappings!.crm}）：新增的列里没有类型相同、统计相近的候选，平台没有起草`)));
     const audits = (await listAuditLogs(acme)).filter(a => a.action === '源表结构变化影响映射');
     expect(audits).toHaveLength(1);
     expect(audits[0]).toMatchObject({ actor: '平台', summary: expect.stringContaining('orders → 订单：paid_at 已删除') });
@@ -209,6 +214,34 @@ describe('源端结构变化', () => {
     expect((await listAuditLogs(acme)).filter(a => a.action === '源表结构变化影响映射')).toHaveLength(1);
     expect(((await lastMergeOf(acme, orderMappings!.crm)).result as { mappings: MergeRecord[] }).mappings)
       .toContainEqual(expect.objectContaining({ mapping: orderMappings!.crm, error: expect.stringContaining('paid_at 已被删除') }));
+  });
+
+  it('源端把订单表引用的列改名：重新采集后平台起草修复草稿（换成新列名并注释依据）、发带链接的邮件；草稿不自动发布，合并照旧失败，另一位成员空跑并发布后合并恢复', async () => {
+    const { acme, author, reviewer, sources, orderMappings } = await publishedIdentitySources({ orders: true });
+    const mappingId = orderMappings!.crm;
+    await grantOnSource(`ALTER TABLE crm.orders RENAME paid_at TO paid_time;`);
+    await syncSource(author, sources.crm);
+    await drain();
+
+    const [draft] = await getDb().select().from(mappingVersions).where(and(eq(mappingVersions.mappingId, mappingId), eq(mappingVersions.version, 2)));
+    expect(draft).toMatchObject({ status: 'draft', lastEditor: 'platform', authors: [] });
+    expect(draft.yaml).toContain(`paid_at: from_timezone(paid_time, 'UTC') # 平台猜测 paid_at 改名为 paid_time：类型相同（TIMESTAMP）、取值范围相同`);
+    expect(((await lastMergeOf(acme, mappingId)).result as { mappings: MergeRecord[] }).mappings)
+      .toContainEqual(expect.objectContaining({ mapping: mappingId, error: expect.stringContaining('paid_at 已被删除') }));
+
+    const alerts = outbox.filter(m => m.subject.includes('源表结构变化影响映射'));
+    expect(alerts[0].text).toContain('平台会按规则尝试起草修复草稿');
+    const repairs = outbox.filter(m => m.subject.includes('映射修复草稿'));
+    expect(repairs.map(m => m.to).sort()).toEqual(['admin@acme.com', 'de2@acme.com', 'de@acme.com']);
+    expect(repairs[0].text).toContain(`/mappings/${mappingId}?version=2`);
+    expect(repairs[0].text).toContain('paid_at → paid_time（类型相同（TIMESTAMP）、取值范围相同');
+    expect((await listAuditLogs(acme)).filter(a => a.action === '平台起草修复草稿'))
+      .toEqual([expect.objectContaining({ actor: '平台', summary: expect.stringContaining('第 2 版草稿：paid_at 改为 paid_time') })]);
+
+    expect((await dryRunMapping(author, mappingId, 2)).rows).toHaveLength(6);
+    await publishMapping(reviewer, mappingId, 2);
+    await drain();
+    expect(((await lastMergeOf(acme, mappingId)).result as { mappings: MergeRecord[] }).mappings.find(r => r.mapping === mappingId)).not.toHaveProperty('error');
   });
 });
 

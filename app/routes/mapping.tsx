@@ -664,7 +664,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
                   <TableRow key={v.version} data-version={v.version} data-version-status={v.status}>
                     <TableCell className="font-mono font-semibold">{`v${v.version}`}</TableCell>
                     <TableCell><VersionStatus v={v} /></TableCell>
-                    <TableCell className="text-sm">{v.authors.join('、')}</TableCell>
+                    <TableCell className="text-sm">{v.authors.join('、') || '平台'}</TableCell>
                     <TableCell className="text-sm text-slate-500">{v.publishedBy ? `${v.publishedBy}，${time(v.publishedAt)}` : '—'}</TableCell>
                     <TableCell className="text-right">
                       <Button asChild size="sm" variant="ghost"><Link to={`${base}?version=${v.version}`}>查看</Link></Button>

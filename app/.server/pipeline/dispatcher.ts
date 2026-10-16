@@ -12,6 +12,7 @@ import { enqueueDueMerges, mergeAfterSync } from '../mappings';
 import { alertAssertionFailure } from '../quality';
 import { enqueueDueRefreshes } from '../refresh';
 import { alertSchemaBreak } from '../schema-alerts';
+import { draftSchemaRepairs } from '../schema-repair-drafts';
 import { activateServingStore, enqueueServingBuild } from '../serving-store';
 import { enqueueDueExpiries, markExpired, registerSnapshot } from '../snapshots';
 import { applyKeyCheck } from '../source-key-check';
@@ -83,6 +84,8 @@ export function createDispatcher({
         if (task.kind === 'source.sync' && outcome!.result) await mergeAfterSync(task.tenantId, task.id);
         // 同步发现源表删了列或破坏性改了类型、且已发布映射引用了它们：通知能改映射的成员并记审计（ADR-0034）
         if (task.kind === 'source.sync' && outcome!.result) await alertSchemaBreak(task.tenantId, task, outcome!.result);
+        // 告警时入队的重新采集（带 repairFor）成功：按规则猜测源列改名，起草修复草稿并发带链接的邮件（ADR-0034）
+        if (task.kind === 'source.profile' && outcome!.result && !('error' in outcome!) && task.params.repairFor) await draftSchemaRepairs(task.tenantId, task);
         // 业务主键的全表检查通过：写回声明并记审计（工作进程里没有平台库）
         if (task.kind === 'source.keycheck' && outcome!.result) await applyKeyCheck(task.tenantId, task.id);
         // 分析模板任务写好了结果层的快照表：登记到平台元数据，分析页据此列出

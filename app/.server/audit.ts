@@ -75,7 +75,7 @@ const ACTIONS = {
   'mapping.published': {
     label: '发布映射',
     describe: (d: Detail) =>
-      `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
+      `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、') || '平台'}）`,
   },
   'mapping.draft_discarded': {
     label: '丢弃映射草稿',
@@ -195,6 +195,12 @@ const ACTIONS = {
     describe: (d: Detail) => `「${d.source}」${(d.mappings as BrokenMapping[])
       .map(m => `${m.table} → ${entityLabel(m.entity)}：${describeBroken(m)}`)
       .join('；')}，这些映射的合并会失败`,
+  },
+  // 平台在源列改名后按规则起草的修复草稿（ADR-0034）：只记列名，不记取值；草稿仍要成员空跑并发布
+  'mapping.repair_drafted': {
+    label: '平台起草修复草稿',
+    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版草稿：${(d.renames as { from: string; to: string }[])
+      .map(r => `${r.from} 改为 ${r.to}`).join('、')}`,
   },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
