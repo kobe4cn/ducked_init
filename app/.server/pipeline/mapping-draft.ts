@@ -2,7 +2,8 @@
 // 列名规范化后按同名与同义词对应到标准字段，再用类型与格式特征校验；按需加上分转元、毫秒时间戳、时区解读等转换，枚举字段按常见取值生成值字典骨架。
 // 每条对应的依据写在行尾注释里，没对应上的标准字段与没用到的源列列在文末。生成的只是草稿，仍要保存校验、双人发布（ADR-0015）。
 // 自定义实体（ADR-0019）对照已发布的登记：列名规范化后与登记字段同名的对应上，类型按登记，去重键是登记的主键
-import { Document, Scalar, YAMLMap } from 'yaml';
+// 源表结构与已发布映射的源表一致时（ADR-0034）复用那个映射的 YAML：改表名、注明来源（reuseMappingYaml）
+import { Document, isMap, parseDocument, Scalar, YAMLMap } from 'yaml';
 import { CUSTOM_FIELD_PATTERN, MODEL_MAJOR, type CanonicalEntity, type CanonicalField } from '../../lib/canonical-model';
 import { CENTS_SUFFIX, extensionName, fieldsForColumn, normalizeName, standardValue } from '../../lib/field-synonyms';
 import { extensionExpr, extensionSpec, kindOf, ref, textExpr } from '../../lib/mapping-expr';
@@ -269,4 +270,27 @@ export function draftCustomMapping(table: TableProfile, reg: RegisteredEntity, o
   if (unmatched.length) head.push(` 源表里没有同名列的登记字段：${unmatched.join('、')}`);
   doc.commentBefore = head.join('\n');
   return doc.toString({ lineWidth: 0, singleQuote: true });
+}
+
+/** 复用的来源：已发布映射的 ID 与版本、它的数据源名与源表；table 是要复用到的新表 */
+export interface ReuseFrom { table: string; fromSourceName: string; fromTable: string; mappingId: string; version: number }
+
+/**
+ * 源表结构指纹与某个已发布映射的源表一致时（ADR-0034）复用那个映射的 YAML：表名改成新表；字段上的 customer_source 写的是来源映射自己的数据源时删掉
+ * （写本源本来就可以省略，原样复制会指向旧源），指向别的源时保留。顶部注明来源映射与版本、两个源主键重叠时的提示，原有注释保留
+ */
+export function reuseMappingYaml(yaml: string, from: ReuseFrom): string {
+  const doc = parseDocument(yaml);
+  doc.set('table', from.table);
+  for (const section of ['fields', 'extensions']) {
+    const specs = doc.get(section, true);
+    if (!isMap(specs)) continue;
+    for (const { value } of specs.items) if (isMap(value) && value.get('customer_source') === from.fromSourceName) value.delete('customer_source');
+  }
+  const head = [
+    ` 复用已发布映射 ${from.mappingId}（数据源「${from.fromSourceName}」/ ${from.fromTable}，第 ${from.version} 版）：源表结构指纹一致`,
+    ' 两个源的主键取值重叠时合并会失败（ADR-0024），可声明 key_space 或建合并组（ADR-0032）',
+  ];
+  doc.commentBefore = [...head, ...(doc.commentBefore ? [doc.commentBefore] : [])].join('\n');
+  return doc.toString({ lineWidth: 0 });
 }

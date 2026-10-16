@@ -17,9 +17,10 @@ import { dryRun } from './pipeline/dry-run-engine';
 import { consumerSensitive, identityRules, type IdentitySummary } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { groupMemberOf, type MergeDrop, type MergeMappingParam, type MergeRecord, type RelationParam } from './pipeline/merge-engine';
-import { draftCustomMapping, draftMapping, DraftError } from './pipeline/mapping-draft';
+import { draftCustomMapping, draftMapping, DraftError, reuseMappingYaml } from './pipeline/mapping-draft';
 import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import type { Rename } from './pipeline/schema-repair';
+import { diffColumns } from './pipeline/schema-diff';
 import { publishedMergeGroups } from './merge-groups';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { tenantPiiSalt } from './secrets';
@@ -44,10 +45,16 @@ const HISTORY_TASKS = 50;
 const DRY_RUN_ROWS = 50;
 const DRY_RUN_LIMITS = { memoryLimitMb: 512, threads: 1 };
 
+/** 已采集、在同步范围内的一张表：列统计与成员确认的水位线、业务主键等 */
+type ProfiledTable = Awaited<ReturnType<typeof confirmedTables>>['tables'][number];
+
+/** 表的主键：源端主键，没有时（含旧的采集结果里没有主键信息）取成员声明的业务主键 */
+const keyOf = (t: ProfiledTable) => (t.table.primaryKey?.length ? t.table.primaryKey : (t.key ?? []));
+
 /** 数据源里各表最近一次成功采集到的列统计（带声明的业务主键）：表不在同步范围、还没采集时返回原因 */
 export async function profiledTables(tenantId: string, sourceId: string) {
   const { listing, tables } = await confirmedTables(tenantId, sourceId);
-  return (table: string) => {
+  return (table: string): ProfiledTable | string => {
     const profiled = tables.find(t => t.table.name === table);
     if (profiled) return profiled;
     const listed = listing.find(t => t.tableName === table);
@@ -137,11 +144,10 @@ export async function referenceTables(actor: CurrentMember, sourceId: string): P
       name: v.name, view: true as const, sampleRows: 0, primaryKey: [] as string[], watermark: null, keySpaces, customerSources: otherCustomerSources, relationOrigins,
       columns: v.columns!.map(c => ({ name: c.name, type: c.type, nullRate: 0, distinct: 0, top: null, formats: [] })),
     }));
-  return [...tables.map(({ table, watermark, key }) => ({
+  return [...tables.map(t => ({ ...t, primaryKey: keyOf(t) })).map(({ table, watermark, primaryKey }) => ({
     name: table.name,
     sampleRows: table.sampleRows,
-    // 旧的采集结果里没有主键信息
-    primaryKey: table.primaryKey?.length ? table.primaryKey : (key ?? []),
+    primaryKey,
     watermark: watermark?.column ?? null,
     keySpaces,
     customerSources: otherCustomerSources,
@@ -152,7 +158,34 @@ export async function referenceTables(actor: CurrentMember, sourceId: string): P
 }
 
 /**
- * 按规则生成映射草稿（ADR-0017）：对照源表最近一次采集的列统计与目标实体（标准实体，或已发布登记的自定义实体），返回 YAML 文本。不调用模型、不保存、不记审计，
+ * 复用已发布映射（ADR-0034）：本租户已发布、未停用、读源表（不是源视图）、写入同一实体的映射里，源表最近一次采集的列名与类型（不计顺序）
+ * 和主键都与这张表一致的，取映射 ID 最小的一个，返回改写后的最新已发布版本 YAML；没有时为 null。只在本租户内找，不泄露别的租户的映射
+ */
+async function reusableDraft(tenantId: string, sourceId: string, profiled: ProfiledTable, entity: string) {
+  const db = getDb();
+  const candidates = (await publishedPlans(db, tenantId))
+    .filter(p => p.entity === entity && !p.sourceView && !(p.sourceId === sourceId && p.table === profiled.table.name));
+  const key = keyOf(profiled);
+  const bySource = new Map<string, (table: string) => ProfiledTable | string>();
+  for (const plan of candidates) {
+    if (!bySource.has(plan.sourceId)) bySource.set(plan.sourceId, await profiledTables(tenantId, plan.sourceId));
+    const theirs = bySource.get(plan.sourceId)!(plan.table);
+    if (typeof theirs === 'string' || diffColumns(theirs.table.columns, profiled.table.columns).changed) continue;
+    const theirKey = keyOf(theirs);
+    if (theirKey.length !== key.length || theirKey.some((k, i) => k !== key[i])) continue;
+    const [published] = await db.select({ yaml: mappingVersions.yaml }).from(mappingVersions)
+      .where(and(eq(mappingVersions.mappingId, plan.mapping), eq(mappingVersions.version, plan.version)));
+    const [source] = await db.select({ name: sources.name }).from(sources).where(and(eq(sources.id, plan.sourceId), eq(sources.tenantId, tenantId)));
+    return reuseMappingYaml(published.yaml, {
+      table: profiled.table.name, fromSourceName: source.name, fromTable: plan.table, mappingId: plan.mapping, version: plan.version,
+    });
+  }
+  return null;
+}
+
+/**
+ * 按规则生成映射草稿（ADR-0017）：对照源表最近一次采集的列统计与目标实体（标准实体，或已发布登记的自定义实体），返回 YAML 文本；
+ * 源表结构与本租户某个已发布映射的源表一致时直接复用那个映射（ADR-0034）。不调用模型、不保存、不记审计，
  * 成员确认修改后仍走保存校验与双人发布
  */
 export async function draftFor(actor: CurrentMember, sourceId: string, table: string, entity: string) {
@@ -161,6 +194,8 @@ export async function draftFor(actor: CurrentMember, sourceId: string, table: st
   if (!table) throw new MappingError('请选择表');
   const profiled = (await profiledTables(actor.tenant.id, sourceId))(table);
   if (typeof profiled === 'string') throw new MappingError(profiled);
+  const reused = await reusableDraft(actor.tenant.id, sourceId, profiled, entity);
+  if (reused) return reused;
   const target = entityOf(entity);
   if (target) return draftMapping(profiled.table, target, { key: profiled.key ?? undefined });
   // 自定义实体只认已发布的登记，与保存校验一致（ADR-0019）

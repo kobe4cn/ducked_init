@@ -4,7 +4,7 @@ import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
 import { entityForTable, fieldsForColumn, normalizeName, standardValue } from '../app/lib/field-synonyms';
-import { draftCustomMapping, draftMapping, fieldNameFor } from '../app/.server/pipeline/mapping-draft';
+import { draftCustomMapping, draftMapping, fieldNameFor, reuseMappingYaml } from '../app/.server/pipeline/mapping-draft';
 import { checkMapping } from '../app/.server/pipeline/mapping-spec';
 import type { ColumnProfile, TableProfile } from '../app/.server/pipeline/source-engine';
 
@@ -430,5 +430,39 @@ describe('自定义实体', () => {
     expect(() => draftCustomMapping(table('stores', [column('region', 'VARCHAR')]), STORE)).toThrow('源表没有与主键字段 store_id 对应的列');
     expect(() => draftCustomMapping(table('stores', [column('store_id', 'DATE')]), { ...STORE, fields: [{ ...STORE.fields[3], name: 'store_id' }] }))
       .toThrow('主键字段的类型对不上：store_id → 源列 store_id（DATE）/ 登记 integer');
+  });
+});
+
+describe('复用已发布映射', () => {
+  const PUBLISHED = [
+    '# 订单映射，金额是分',
+    'model: 1',
+    'entity: order',
+    'table: orders',
+    'fields:',
+    '  order_id: order_id',
+    '  customer_id: { expr: customer_id, customer_source: 门店1 }',
+    '  amount: amount / 100 # 分转元',
+    'extensions:',
+    '  member_id: { type: string, expr: member_id, customer_source: 门店1 }',
+    '',
+  ].join('\n');
+  const FROM = { table: 'orders_v2', fromSourceName: '门店1', fromTable: 'orders', mappingId: 'map_7', version: 3 };
+
+  it('改表名、删掉指向来源源的 customer_source，顶部注明来源映射与版本，原注释保留', () => {
+    const yaml = reuseMappingYaml(PUBLISHED, FROM);
+    const doc = parse(yaml);
+    expect(doc.table).toBe('orders_v2');
+    expect(doc.fields).toEqual({ order_id: 'order_id', customer_id: { expr: 'customer_id' }, amount: 'amount / 100' });
+    expect(doc.extensions.member_id).toEqual({ type: 'string', expr: 'member_id' });
+    expect(yaml).toMatch(/^# 复用已发布映射 map_7（数据源「门店1」\/ orders，第 3 版）：源表结构指纹一致\n# .*ADR-0024.*ADR-0032/);
+    expect(yaml).toContain('订单映射，金额是分');
+    expect(yaml).toContain('# 分转元');
+  });
+
+  it('customer_source 指向别的源时保留', () => {
+    const doc = parse(reuseMappingYaml(PUBLISHED.replaceAll('customer_source: 门店1', 'customer_source: 会员'), FROM));
+    expect(doc.fields.customer_id.customer_source).toBe('会员');
+    expect(doc.extensions.member_id.customer_source).toBe('会员');
   });
 });
