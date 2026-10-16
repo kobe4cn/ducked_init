@@ -39,7 +39,8 @@ export default defineConfig({
     globalSetup: ['test/global-setup.ts'],
     // 所有测试共用一个测试库，串行执行避免互相清表
     fileParallelism: false,
-    testTimeout: 30_000,
+    // CI 的 runner 性能差别大：慢的机器整体慢约 1.7 倍，快机器上 20–25 s 的流水线测试在慢机器上会超过 30 s
+    testTimeout: 90_000,
     hookTimeout: 60_000,
   },
 });
