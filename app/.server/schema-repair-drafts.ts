@@ -8,7 +8,7 @@ import { mappingVersions, sources, tasks } from './db/schema';
 import { MappingError, publishedPlans, savePlatformDraft } from './mappings';
 import { referencedSourceColumns } from './pipeline/mapping-spec';
 import { isBreaking, type SchemaDiff } from './pipeline/schema-diff';
-import { mailSourceWriters } from './schema-alerts';
+import { appLink, mailSourceWriters } from './schema-alerts';
 import { describeRename, guessRenames, type Rename, rewriteMappingYaml } from './pipeline/schema-repair';
 import type { ColumnProfile, TableProfile } from './pipeline/source-engine';
 import type { SyncRecord } from './pipeline/sync-engine';
@@ -80,7 +80,6 @@ export async function draftSchemaRepairs(tenantId: string, task: { id: string; p
 
   const [source] = await getDb().select({ name: sources.name }).from(sources).where(and(eq(sources.id, sourceId), eq(sources.tenantId, tenantId)));
   const sourceName = source?.name ?? sourceId;
-  const base = process.env.APP_URL?.replace(/\/+$/, '') ?? '';
   const renameList = (renames: Rename[]) => renames.map(r => `    ${r.from} → ${r.to}（${describeRename(r)}）`);
   const lines = results.flatMap(({ mapping, entity, table, typeChanged, outcome }) => {
     const head = `- ${table} → ${entityLabel(entity)}（映射 ${mapping}）：`;
@@ -88,7 +87,7 @@ export async function draftSchemaRepairs(tenantId: string, task: { id: string; p
     const missing = 'unmatched' in outcome && outcome.unmatched.length ? [`  ${outcome.unmatched.join('、')} 没有找到改名的候选，请人工修改`] : [];
     switch (outcome.kind) {
       case 'drafted':
-        return [`${head}已起草第 ${outcome.version} 版草稿 ${base}/mappings/${mapping}?version=${outcome.version}`, ...renameList(outcome.renames), ...manual];
+        return [`${head}已起草第 ${outcome.version} 版草稿 ${appLink(`/mappings/${mapping}?version=${outcome.version}`)}`, ...renameList(outcome.renames), ...manual];
       case 'skipped':
         return [`${head}已有成员在改的草稿，平台没有起草，请在那份草稿里修改`, ...manual];
       case 'no_candidate':

@@ -7,6 +7,7 @@
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { registerDslSnapshot } from '../dsl-definitions';
+import { alertNewFallback } from '../fallback-alerts';
 import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '../lake-migration';
 import { enqueueDueMerges, mergeAfterSync } from '../mappings';
 import { alertAssertionFailure } from '../quality';
@@ -86,6 +87,8 @@ export function createDispatcher({
         if (task.kind === 'source.sync' && outcome!.result) await alertSchemaBreak(task.tenantId, task, outcome!.result);
         // 告警时入队的重新采集（带 repairFor）成功：按规则猜测源列改名，起草修复草稿并发带链接的邮件（ADR-0034）
         if (task.kind === 'source.profile' && outcome!.result && !('error' in outcome!) && task.params.repairFor) await draftSchemaRepairs(task.tenantId, task);
+        // 合并里值字典没写到的新取值落入了兜底值（以前没通知过）：通知能改映射的成员并记审计（ADR-0015）。部分映射失败时也看成功的那些
+        if (task.kind === 'silver.merge' && outcome!.result) await alertNewFallback(task.tenantId, task, outcome!.result);
         // 业务主键的全表检查通过：写回声明并记审计（工作进程里没有平台库）
         if (task.kind === 'source.keycheck' && outcome!.result) await applyKeyCheck(task.tenantId, task.id);
         // 分析模板任务写好了结果层的快照表：登记到平台元数据，分析页据此列出

@@ -7,7 +7,8 @@ import { listAuditLogs } from '../../app/.server/audit';
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
-import { mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
+import { mappingFallbackValues, mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
+import { setMailer, type Mail } from '../../app/.server/mailer';
 import {
   confirmDisable, createMapping, enqueueDueMerges, enqueueMerge, getMapping, listMappings, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishedPlans, publishMapping,
   disableImpact, rebuildEntity, referenceTables, requestDisable, restoreMapping, saveDraft,
@@ -810,6 +811,47 @@ describe('发布映射并合并到标准层', () => {
     const idle = (await getMapping(author, mapping)).merge.history[0];
     expect(idle).toMatchObject({ mode: 'incremental', batchFrom: (incremental as { batchTo: number }).batchTo });
     expect(idle).not.toHaveProperty('fallback');
+  });
+
+  it('写了兜底值时第一次落入兜底的取值通知能改映射的成员并记审计；之后的增量合并与重建只出现旧取值时不再通知，出现新取值时再通知', async () => {
+    const outbox: Mail[] = [];
+    setMailer({ async send(m) { outbox.push(m); } });
+    try {
+      const { acme, author, reviewer, id } = await syncedSource();
+      const mapping = await publish(author, reviewer, id, ORDER_LOG_MAPPING
+        .replace(', 已退款: refunded', '')
+        .replace('    expr: trim(status)\n', '    expr: trim(status)\n    otherwise: cancelled\n'));
+      const alerts = () => outbox.filter(m => m.subject.startsWith('新的兜底取值'));
+
+      // 第一次合并：已退款是新取值。邮件只写列与个数，不写取值
+      expect(alerts().map(m => m.to).sort()).toEqual(['admin@acme.com', 'de2@acme.com', 'de@acme.com']);
+      expect(alerts()[0].text).toContain(`order_log → 订单（映射 ${mapping}）：status 有 1 个新取值 /mappings/${mapping}`);
+      expect(alerts()[0].text).not.toContain('已退款');
+      expect((await listAuditLogs(acme)).filter(l => l.action === '出现新的兜底取值').map(l => l.actor + l.summary))
+        .toEqual([expect.stringMatching(/^平台.*：order_log → 订单 的 status 1 个新取值落入兜底$/)]);
+
+      // 增量合并又出现已退款、重建合并再报一遍：都是通知过的取值
+      outbox.length = 0;
+      await grantOnSource(`INSERT INTO shop.order_log VALUES ('A3', '已退款', 100, '2024-06-04 10:00');`);
+      await syncSource(author, id);
+      await drain();
+      expect((await getMapping(author, mapping)).merge.history[0]).toMatchObject({ mode: 'incremental', fallback: [{ column: 'status', values: [{ value: '已退款', rows: 1 }] }] });
+      await rebuildEntity(author, 'order');
+      await drain();
+      expect((await getMapping(author, mapping)).merge.history[0]).toMatchObject({ mode: 'rebuild', fallback: [{ column: 'status', values: [{ value: '已退款' }] }] });
+      expect(alerts()).toEqual([]);
+
+      // 新取值待审核与已关闭：再通知一次，个数只算新的
+      await grantOnSource(`INSERT INTO shop.order_log VALUES ('A4', '待审核', 200, '2024-06-05 10:00'), ('A5', '已关闭', 300, '2024-06-05 10:00'), ('A6', '已退款', 1, '2024-06-05 10:00');`);
+      await syncSource(author, id);
+      await drain();
+      expect(alerts()).toHaveLength(3);
+      expect(alerts()[0].text).toContain('status 有 2 个新取值');
+      expect(await getDb().select().from(mappingFallbackValues).where(eq(mappingFallbackValues.mappingId, mapping)).then(r => r.map(v => v.value).sort()))
+        .toEqual(['已关闭', '已退款', '待审核'].sort());
+    } finally {
+      setMailer(undefined);
+    }
   });
 
   it('草稿作者不能自己发布；发布后版本锁定，再改是新的一版草稿，发布新版本后按新版本重建', async () => {

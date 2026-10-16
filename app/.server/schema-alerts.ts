@@ -2,6 +2,7 @@
 // 给租户里能改数据源与映射（sources:write）的成员发邮件并记一条平台审计。只写映射、表与列名，不写取值。
 // 这些映射之后的合并会因合并前的结构检查失败（merge-engine.ts checkSourceSchema），邮件提前说明原因。
 // 有被删除的列时再给这些表入队一次带 repairFor 的采集，采集完后平台按规则起草修复草稿（schema-repair-drafts.ts）
+// 发信给能改映射的成员（mailSourceWriters）与邮件里的页面链接（appLink）也给修复草稿与新的兜底取值告警（fallback-alerts.ts）共用
 import { and, eq } from 'drizzle-orm';
 import { can } from './access';
 import { recordAudit } from './audit';
@@ -68,3 +69,6 @@ export async function mailSourceWriters(tenantId: string, subject: string, text:
       .catch(e => console.error(`[告警] 给 ${email} 发「${subject}」邮件出错`, e));
   }
 }
+
+/** 告警邮件里平台页面的链接：APP_URL（去掉末尾的 /）加路径；没配 APP_URL 时只有路径 */
+export const appLink = (path: string) => `${process.env.APP_URL?.replace(/\/+$/, '') ?? ''}${path}`;

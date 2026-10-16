@@ -332,6 +332,15 @@ export const mappingIgnoredColumns = platform.table('mapping_ignored_columns', {
   ignoredAt: timestamp('ignored_at', { withTimezone: true }).notNull().defaultNow(),
 }, t => [primaryKey({ columns: [t.mappingId, t.column] })]);
 
+// 映射各列已经通知过的落入兜底的取值（ADR-0015）：合并后不在这里的取值才算新取值、才发告警。与映射版本无关；task_id 是第一次见到它的合并任务
+export const mappingFallbackValues = platform.table('mapping_fallback_values', {
+  mappingId: uuid('mapping_id').notNull().references(() => mappings.id, { onDelete: 'cascade' }),
+  column: text('column').notNull(),
+  value: text('value').notNull(),
+  firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+  taskId: uuid('task_id').notNull(),
+}, t => [primaryKey({ columns: [t.mappingId, t.column, t.value] })]);
+
 export const templateVersionStatusEnum = platform.enum('template_version_status', VERSION_STATUSES);
 
 // 分析模板定义：租户对某个分析模板（如 rfm，见 pipeline/templates）的参数，每个租户每个模板一份（ADR-0004）。第一次保存草稿时建立，

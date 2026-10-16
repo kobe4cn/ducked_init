@@ -7,6 +7,7 @@ import { describeBroken } from './pipeline/schema-diff';
 import { TEMPLATES } from './pipeline/templates';
 import { describeQuotaChange, type TenantQuota } from './quota';
 import type { BrokenMapping } from './schema-alerts';
+import type { NewFallback } from './fallback-alerts';
 import { entityLabel } from '../lib/canonical-model';
 
 type Detail = Record<string, unknown>;
@@ -201,6 +202,13 @@ const ACTIONS = {
     label: '平台起草修复草稿',
     describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版草稿：${(d.renames as { from: string; to: string }[])
       .map(r => `${r.from} 改为 ${r.to}`).join('、')}`,
+  },
+  // 平台在合并后发现值字典里没写、落入兜底的新取值（ADR-0015）：只记映射、列与新取值的个数，不记取值
+  'mapping.fallback_new': {
+    label: '出现新的兜底取值',
+    describe: (d: Detail) => `${d.task}：${(d.mappings as NewFallback[])
+      .map(m => `${m.table} → ${entityLabel(m.entity)} 的 ${m.columns.map(c => `${c.column} ${c.count} 个`).join('、')}`)
+      .join('；')}新取值落入兜底`,
   },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
