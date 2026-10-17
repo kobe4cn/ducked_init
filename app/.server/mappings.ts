@@ -162,7 +162,7 @@ export async function referenceTables(actor: CurrentMember, sourceId: string): P
 
 /**
  * 复用已发布映射（ADR-0034）：本租户已发布、未停用、读源表（不是源视图）、写入同一实体的映射里，源表最近一次采集的列名与类型（不计顺序）
- * 和主键都与这张表一致的，取映射 ID 最小的一个，返回改写后的最新已发布版本 YAML；没有时为 null。只在本租户内找，不泄露别的租户的映射
+ * 和主键都与这张表一致的，取映射 ID 最小的一个，返回改写后的最新已发布版本 YAML 与来源映射的 ID；没有时为 null。只在本租户内找，不泄露别的租户的映射
  */
 async function reusableDraft(tenantId: string, sourceId: string, profiled: ProfiledTable, entity: string) {
   const db = getDb();
@@ -179,9 +179,10 @@ async function reusableDraft(tenantId: string, sourceId: string, profiled: Profi
     const [published] = await db.select({ yaml: mappingVersions.yaml }).from(mappingVersions)
       .where(and(eq(mappingVersions.mappingId, plan.mapping), eq(mappingVersions.version, plan.version)));
     const [source] = await db.select({ name: sources.name }).from(sources).where(and(eq(sources.id, plan.sourceId), eq(sources.tenantId, tenantId)));
-    return reuseMappingYaml(published.yaml, {
+    const yaml = reuseMappingYaml(published.yaml, {
       table: profiled.table.name, fromSourceName: source.name, fromTable: plan.table, mappingId: plan.mapping, version: plan.version,
     });
+    return { yaml, mappingId: plan.mapping };
   }
   return null;
 }
@@ -195,15 +196,17 @@ export async function draftFor(actor: CurrentMember, sourceId: string, table: st
   return (await draftWithOrigin(actor, sourceId, table, entity)).yaml;
 }
 
-/** draftFor 的主体，另外告诉调用方草稿是复用来的（reuse）还是按规则生成的（rules） */
-async function draftWithOrigin(actor: CurrentMember, sourceId: string, table: string, entity: string): Promise<{ yaml: string; origin: 'reuse' | 'rules' }> {
+/** draftFor 的主体，另外告诉调用方草稿是复用来的（reuse，带来源映射的 ID）还是按规则生成的（rules） */
+async function draftWithOrigin(
+  actor: CurrentMember, sourceId: string, table: string, entity: string,
+): Promise<{ yaml: string; origin: 'reuse' | 'rules'; reusedFrom?: string }> {
   assertCan(actor, 'sources:write');
   await requireSource(actor.tenant.id, sourceId).catch(() => { throw new MappingError('请选择数据源'); });
   if (!table) throw new MappingError('请选择表');
   const profiled = (await profiledTables(actor.tenant.id, sourceId))(table);
   if (typeof profiled === 'string') throw new MappingError(profiled);
   const reused = await reusableDraft(actor.tenant.id, sourceId, profiled, entity);
-  if (reused) return { yaml: reused, origin: 'reuse' };
+  if (reused) return { yaml: reused.yaml, origin: 'reuse', reusedFrom: reused.mappingId };
   const target = entityOf(entity);
   if (target) return { yaml: draftMapping(profiled.table, target, { key: profiled.key ?? undefined }), origin: 'rules' };
   // 自定义实体只认已发布的登记，与保存校验一致（ADR-0019）
@@ -216,24 +219,32 @@ async function draftWithOrigin(actor: CurrentMember, sourceId: string, table: st
   }
 }
 
-/** 用模型生成的草稿：生成记录的 ID、草稿从哪来；没配置模型服务、按规则生成时带一句提示 */
-export interface ModelDraftResult { yaml: string; generationId: string; origin: 'reuse' | 'rules' | 'model'; notice?: string }
+/**
+ * 用模型生成的草稿：生成记录的 ID、草稿从哪来、模型给的每项置信度与理由（复用与规则时为空）；复用时带来源映射的 ID；
+ * 没配置模型服务、按规则生成时带一句提示
+ */
+export interface ModelDraftResult {
+  yaml: string; generationId: string; origin: 'reuse' | 'rules' | 'model'; items: DraftItem[]; reusedFrom?: string; notice?: string;
+}
 
 /**
  * 用模型生成映射草稿（ADR-0035）：按「复用已发布映射 > 模型 > 按规则」的顺序。复用命中时不调用模型；没配置模型服务时用规则草稿并提示；
  * 否则把表上下文与规则草稿发给模型（purpose = mapping_draft），输出转成 YAML 后须过映射校验。成功时写一行生成记录，不保存映射。
- * 模型失败或转出的 YAML 不过校验时记审计 mapping.model_draft_failed（不含提示词、模型原文与取值），抛 422
+ * 模型失败或转出的 YAML 不过校验时记审计 mapping.model_draft_failed（不含提示词、模型原文与取值），抛 422。
+ * 为已有映射重新生成时传 mappingId，生成记录直接关联它
  */
-export async function modelDraftFor(actor: CurrentMember, sourceId: string, table: string, entity: string): Promise<ModelDraftResult> {
+export async function modelDraftFor(
+  actor: CurrentMember, sourceId: string, table: string, entity: string, mappingId: string | null = null,
+): Promise<ModelDraftResult> {
   const tenantId = actor.tenant.id;
   const base = await draftWithOrigin(actor, sourceId, table, entity);
   const record = async (origin: ModelDraftResult['origin'], yaml: string, items: DraftItem[] = []) => {
     const [row] = await getDb().insert(mappingGenerations).values({
-      tenantId, sourceId, tableName: table, entity, origin, yaml, items, createdByEmail: actor.email,
+      tenantId, sourceId, tableName: table, entity, mappingId, origin, yaml, items, createdByEmail: actor.email,
     }).returning({ id: mappingGenerations.id });
-    return { yaml, generationId: row.id, origin };
+    return { yaml, generationId: row.id, origin, items };
   };
-  if (base.origin === 'reuse') return record('reuse', base.yaml);
+  if (base.origin === 'reuse') return { ...await record('reuse', base.yaml), reusedFrom: base.reusedFrom };
   if (!(await resolveProvider(tenantId))) return { ...await record('rules', base.yaml), notice: '未配置模型服务，已按规则生成' };
 
   const context = await tableContextFor(tenantId, sourceId, table).catch((e: unknown) => {
@@ -285,6 +296,14 @@ export async function draftForMapping(actor: CurrentMember, mappingId: string) {
   const mapping = await requireMapping(actor.tenant.id, mappingId);
   if (mapping.sourceViewId) throw new MappingError('按规则生成草稿要用源表的列统计，读源视图的映射请直接编辑');
   return draftFor(actor, mapping.sourceId, mapping.tableName, mapping.entity);
+}
+
+/** 为已有映射（它的源表与实体）用模型重新生成草稿，同 modelDraftFor；生成记录关联这个映射 */
+export async function modelDraftForMapping(actor: CurrentMember, mappingId: string) {
+  assertCan(actor, 'sources:write');
+  const mapping = await requireMapping(actor.tenant.id, mappingId);
+  if (mapping.sourceViewId) throw new MappingError('用模型生成草稿要用源表的列统计，读源视图的映射请直接编辑');
+  return modelDraftFor(actor, mapping.sourceId, mapping.tableName, mapping.entity, mappingId);
 }
 
 /**

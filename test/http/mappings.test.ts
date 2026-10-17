@@ -5,7 +5,9 @@
 // 有发布权限的成员在详情页提议停用、由另一位确认，停用后可恢复，停用前列出受影响的指标与标签，列表标出待确认与已停用（ADR-0031）
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseDocument } from 'yaml';
-import { closeDb } from '../../app/.server/db/client';
+import { eq } from 'drizzle-orm';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { mappingGenerations } from '../../app/.server/db/schema';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -64,6 +66,14 @@ fields:
 /** 页面上映射编辑框里的 YAML */
 const editorYaml = (html: string) => html.match(/<textarea[^>]*name="yaml"[^>]*>([\s\S]*?)<\/textarea>/)![1]
   .replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+/** 配上平台默认模型服务，替身每次都返回 content */
+function modelReplies(content: unknown) {
+  vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
+  vi.stubEnv('LLM_MODEL', 'qwen-plus');
+  vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
+  app.setLlmFetch((async () => Response.json({ choices: [{ message: { content: JSON.stringify(content) } }] })) as typeof fetch);
+}
 
 const mappingIdOf = (res: Response) => res.headers.get('Location')!.match(/^\/mappings\/([0-9a-f-]{36})$/)![1];
 
@@ -690,11 +700,7 @@ describe('按规则生成映射草稿', () => {
 
   it('新建页用模型生成草稿填进编辑框，不保存；确认后保存为草稿。模型输出不合 Schema 时显示错误、编辑框保持原内容；分析师 403', async () => {
     const { tenantId, sourceId } = await tenantWithSource('acme');
-    vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
-    vi.stubEnv('LLM_MODEL', 'qwen-plus');
-    vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
-    const reply = (content: unknown) => app.setLlmFetch((async () => Response.json({ choices: [{ message: { content: JSON.stringify(content) } }] })) as typeof fetch);
-    reply({ fields: [
+    modelReplies({ fields: [
       { field: 'order_id', expr: 'string(order_id)', confidence: 0.95, reason: '源表主键' },
       { field: 'customer_id', expr: 'string(customer_id)', confidence: 0.9, reason: '同名列' },
       { field: 'amount', expr: 'amount', confidence: 0.7, reason: '金额列' },
@@ -713,7 +719,7 @@ describe('按规则生成映射草稿', () => {
     expect(saved.status).toBe(302);
     expect(await (await engineer.get(`/mappings/${mappingIdOf(saved)}?tab=versions`)).text()).toContain('data-version-status="draft"');
 
-    reply({ fields: [] });
+    modelReplies({ fields: [] });
     const rejected = await engineer.post('/mappings', { intent: 'model-draft', sourceId, table: 'customers', entity: 'customer', yaml: ORDERS });
     expect(rejected.status).toBe(422);
     const rejectedHtml = await rejected.text();
@@ -723,6 +729,84 @@ describe('按规则生成映射草稿', () => {
     await memberOf(tenantId, 'an@acme.com', 'analyst');
     const analyst = await loginAs(app, 'an@acme.com');
     expect((await analyst.post('/mappings', { intent: 'model-draft', sourceId, table: 'orders', entity: 'order' })).status).toBe(403);
+  });
+
+  it('模型草稿的「生成依据」按置信度升序列出每项，低置信度标红、中等琥珀色、其余绿色；理由照常转义；没配置模型服务时只写来源', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    const ruled = await (await engineer.post('/mappings', { intent: 'model-draft', sourceId, table: 'orders', entity: 'order', yaml: '' })).text();
+    expect(ruled).toMatch(/data-draft-origin="rules"[\s\S]*?按规则生成/);
+    expect(ruled).not.toContain('data-confidence-path');
+
+    modelReplies({ fields: [
+      { field: 'order_id', expr: 'string(order_id)', confidence: 0.95, reason: '源表主键' },
+      { field: 'amount', expr: 'amount', confidence: 0.3, reason: '<b>金额</b>，单位不确定' },
+      { field: 'customer_id', expr: 'string(customer_id)', confidence: 0.6, reason: '同名列' },
+    ] });
+    const html = await (await engineer.post('/mappings', { intent: 'model-draft', sourceId, table: 'orders', entity: 'order', yaml: '' })).text();
+    expect(html).toContain('data-draft-origin="model"');
+    expect([...html.matchAll(/data-confidence-path="([^"]+)"/g)].map(m => m[1])).toEqual(['fields.amount', 'fields.customer_id', 'fields.order_id']);
+    expect(html).toMatch(/data-confidence-path="fields.amount" data-confidence="0.3"[\s\S]*?data-confidence-level="low">低 30%/);
+    expect(html).toMatch(/data-confidence-path="fields.customer_id"[\s\S]*?data-confidence-level="medium">中 60%/);
+    expect(html).toMatch(/data-confidence-path="fields.order_id"[\s\S]*?data-confidence-level="high">高 95%/);
+    expect(html).toContain('&lt;b&gt;金额&lt;/b&gt;，单位不确定');
+  });
+
+  it('源表结构命中已发布映射时，生成依据只写来源并链接到来源映射，不列条目', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const author = await memberOf(tenantId, 'de@acme.com');
+    const published = await publish(author, await memberOf(tenantId, 'de2@acme.com'), sourceId, ORDERS);
+    const { id: shop2 } = await registerSource(author, await pgSourceInput(READER, '门店2'));
+    await selectAllTables(author, shop2);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    modelReplies({ fields: [] });
+    const engineer = await loginAs(app, 'de@acme.com');
+
+    const html = await (await engineer.post('/mappings', { intent: 'model-draft', sourceId: shop2, table: 'orders', entity: 'order', yaml: '' })).text();
+    expect(html).toMatch(new RegExp(`data-draft-origin="reuse"[\\s\\S]*?href="/mappings/${published}"`));
+    expect(html).not.toContain('data-confidence-path');
+  });
+
+  it('详情页用模型重新生成：填进编辑框、不保存，显示生成依据，生成记录关联这个映射；读源视图的映射拒绝', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    expect(await (await engineer.get(`/mappings/${id}`)).text()).toMatch(/value="model-draft"[^>]*>用模型重新生成/);
+    modelReplies({ fields: [
+      { field: 'order_id', expr: 'string(order_id)', confidence: 0.9, reason: '源表主键' },
+      { field: 'amount', expr: 'amount', confidence: 0.4, reason: '金额列' },
+    ] });
+
+    const res = await engineer.post(`/mappings/${id}`, { intent: 'model-draft' });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(editorYaml(html)).toMatch(/^# 模型生成的草稿/);
+    expect([...html.matchAll(/data-confidence-path="([^"]+)"/g)].map(m => m[1])).toEqual(['fields.amount', 'fields.order_id']);
+    expect(editorYaml(await (await engineer.get(`/mappings/${id}`)).text())).toBe(ORDERS);
+    const generations = await getDb().select().from(mappingGenerations).where(eq(mappingGenerations.tenantId, tenantId));
+    expect(generations).toEqual([expect.objectContaining({ mappingId: id, origin: 'model' })]);
+
+    // 模型输出不合 Schema：422，编辑框保持提交时的内容；分析师 403
+    modelReplies({ fields: [] });
+    const failed = await engineer.post(`/mappings/${id}`, { intent: 'model-draft', yaml: CUSTOMERS });
+    expect(failed.status).toBe(422);
+    const failedHtml = await failed.text();
+    expect(failedHtml).toContain('模型生成草稿失败');
+    expect(editorYaml(failedHtml)).toBe(CUSTOMERS);
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    expect((await (await loginAs(app, 'an@acme.com')).post(`/mappings/${id}`, { intent: 'model-draft' })).status).toBe(403);
+
+    const member = await memberOf(tenantId, 'de@acme.com');
+    const reviewer = await memberOf(tenantId, 'de2@acme.com');
+    await confirmWatermark(member, sourceId, 'orders', 'order_id');
+    await syncSource(member, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const viewId = await createSourceView(member, sourceId, { name: 'paid_orders', sql: "SELECT order_id, amount, status, _op, _batch, _commit_ts FROM orders WHERE status = 'paid'" });
+    await publishSourceView(reviewer, sourceId, viewId, 1);
+    const viewMapping = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS.replace('table: orders', 'view: paid_orders\nview_key: [order_id]') }));
+    const rejected = await engineer.post(`/mappings/${viewMapping}`, { intent: 'model-draft' });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toContain('读源视图的映射请直接编辑');
   });
 
   it('详情页用映射的表与实体重新生成，保存后替换草稿；选的表不存在时说明原因', async () => {

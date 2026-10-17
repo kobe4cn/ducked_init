@@ -85,7 +85,7 @@ const failure = (p: Promise<unknown>) => p.then(() => { throw new Error('应当�
 describe('用模型生成映射草稿', () => {
   it('源表结构命中已发布映射时直接复用，不调用模型，生成记录的来源是 reuse', async () => {
     const { acme, author, reviewer, sourceId } = await tenantWithSource();
-    await publish(author, reviewer, sourceId, ORDERS);
+    const published = await publish(author, reviewer, sourceId, ORDERS);
     const { id: shop2 } = await registerSource(author, await pgSourceInput(READER, '门店2'));
     await selectAllTables(author, shop2);
     await drain();
@@ -93,7 +93,7 @@ describe('用模型生成映射草稿', () => {
     const { f } = fakeFetch(completion(MODEL_ORDERS));
 
     const result = await modelDraftFor(author, shop2, 'orders', 'order');
-    expect(result).toMatchObject({ origin: 'reuse' });
+    expect(result).toMatchObject({ origin: 'reuse', reusedFrom: published, items: [] });
     expect(result.yaml).toMatch(/^# 复用已发布映射/);
     expect(f).not.toHaveBeenCalled();
     expect(await calls(acme)).toHaveLength(0);
@@ -139,6 +139,7 @@ describe('用模型生成映射草稿', () => {
     expect(generation).toMatchObject({ id: result.generationId, origin: 'model', yaml: result.yaml, mappingId: null });
     expect(generation.items).toContainEqual({ path: 'fields.amount', confidence: 0.7, reason: '金额列，单位看起来是元' });
     expect(generation.items).toHaveLength(5);
+    expect(result.items).toEqual(generation.items);
     expect(await failures(acme)).toHaveLength(0);
   });
 
