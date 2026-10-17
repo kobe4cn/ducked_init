@@ -550,3 +550,30 @@ export const dslVersions = platform.table('dsl_versions', {
   uniqueIndex('dsl_versions_definition_version_uq').on(t.definitionId, t.version),
   uniqueIndex('dsl_versions_one_draft_uq').on(t.definitionId).where(sql`status = 'draft'`),
 ]);
+
+// 模型服务（ADR-0035）：租户自己的 OpenAI 兼容端点、模型名与 API Key（用租户数据密钥加密，context model_provider，ADR-0009）。
+// 三列都为空时用平台默认（环境变量 LLM_*）；租户配置整套生效，不与平台默认混用。
+// allow_samples 打开后才把敏感列已哈希的样本行发给模型，默认只发表结构与列统计
+export const modelProviders = platform.table('model_providers', {
+  tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
+  baseUrl: text('base_url'),
+  model: text('model'),
+  apiKey: text('api_key'),
+  allowSamples: boolean('allow_samples').notNull().default(false),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+// 模型调用日志（ADR-0035）：每次调用一行，成功、HTTP 失败与 Schema 校验失败都记。不存提示词与返回原文（里面可能有样本行）。
+// schema_valid 为空表示没拿到可解析的 JSON（请求失败、返回不是 JSON）
+export const llmCalls = platform.table('llm_calls', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  purpose: text('purpose').notNull(),
+  model: text('model').notNull(),
+  promptTokens: integer('prompt_tokens'),
+  completionTokens: integer('completion_tokens'),
+  durationMs: integer('duration_ms').notNull(),
+  schemaValid: boolean('schema_valid'),
+  error: text('error'),
+  createdAt: createdAt(),
+}, t => [index('llm_calls_tenant_created_idx').on(t.tenantId, t.createdAt)]);
