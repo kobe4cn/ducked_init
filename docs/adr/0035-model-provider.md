@@ -20,6 +20,8 @@ ADR-0003 定下大语言模型只在设计时产出草稿。要落地（#18，�
 
 **保存时记下相对生成稿的字段级差异。** 生成后编辑框所在的表单带隐藏字段 `generationId`（action 返回的生成记录 ID；校验不过时回显继续带着，换版本、重新加载或在新建页换了数据源 / 表 / 实体后不再带）。`createMapping` / `saveMappingDraft` 收到它时在保存的同一事务里核对：生成记录属于本租户、源表与实体和保存的映射一致，否则 400、不保存；随后回填 `mapping_generations.mapping_id`，用保存时同样的自定义实体登记求生成稿的计划，与保存的计划做 `diffPlans`，有差异才记审计 `mapping.generation_edited`（ADR-0003 的「成员改了什么」）：生成记录 ID、来源、映射 ID 与版本、新增 / 删除的字段名、改了的字段名与属性名，以及去重键、取最新字段、身份规则、键空间、取舍名次、行过滤是否改了（只记布尔）——不记 YAML、表达式与字典取值。改已有草稿（不记 `mapping.drafted`）时也记。生成稿已过不了校验（源表结构变了）时按全部字段新增记，并标 `generationValid: false`。审计页只显示改动的字段数。
 
+**指标 / 标签定义草稿。** 定义新建页（先只有指标）写下自然语言需求，点「用模型生成草稿」（`modelDraftForDefinition`，dsl-definitions.ts，`definitions:draft`，分析师也能用）：没配置模型服务时 400「未配置模型服务」、不发请求，不回落到别的生成方式（定义没有规则草稿）。上下文由 `pipeline/dsl/model-draft.ts` 组织：标准实体与已发布自定义实体的字段（取自校验同源的 `fieldsFor`，剔除敏感字段与没发布的扩展字段，ADR-0005）、哪些实体能做基础实体、实体间的关系；给模型的输出 Schema 直接用该种类的定义 Schema（指标是 `METRIC_SCHEMA`），用途记为 `metric_draft`。输出转成 YAML（首行注释「模型根据需求生成，请核对」）后须过 `DSL_KINDS[kind].check`，过了只填进编辑框，不保存、不建生成记录，键由成员填写；之后照常保存草稿、双人发布（ADR-0015 / 0021）。模型失败或不过校验时 422、编辑框保持原内容，审计 `definition.model_draft_failed` 只记种类、阶段（`model` / `definition`）、已抹 Key 的错误摘要或问题数与前 10 个位置——需求原文、模型原文与过滤取值都不记。
+
 ## 已接受的取舍
 
 - 只支持 OpenAI 兼容接口，不为各家的原生 SDK 做适配；不兼容 `response_format` 的服务不能用。

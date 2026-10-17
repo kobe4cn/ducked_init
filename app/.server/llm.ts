@@ -9,7 +9,7 @@ import { llmCalls, modelProviders } from './db/schema';
 import { decryptForTenant } from './secrets';
 
 /** 调用的用途，记进调用日志 */
-export type LlmPurpose = 'connectivity' | 'mapping_draft';
+export type LlmPurpose = 'connectivity' | 'mapping_draft' | 'metric_draft' | 'tag_draft' | 'assertion_draft';
 
 export interface LlmMessage { role: 'system' | 'user'; content: string }
 

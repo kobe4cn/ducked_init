@@ -1,9 +1,10 @@
 // app/routes/analytics.definitions.new.tsx —— 新建指标或标签（有起草权限的成员）：种类放在 URL（?kind=metric|tag，默认指标），
-// 填写键与 YAML，校验通过后保存为第 1 版草稿并转到定义页；键不合规或已被占用、YAML 校验不通过时留在本页，按行列列出问题（ADR-0025）
+// 填写键与 YAML，校验通过后保存为第 1 版草稿并转到定义页；键不合规或已被占用、YAML 校验不通过时留在本页，按行列列出问题（ADR-0025）。
+// 指标可以写下需求后用模型生成草稿（intent=model-draft，ADR-0035）：生成的 YAML 填进编辑框、不保存，失败时编辑框保持原内容
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.new';
 import { requirePermission } from '~/.server/access';
-import { createDefinition, DslError } from '~/.server/dsl-definitions';
+import { createDefinition, DslError, modelDraftForDefinition } from '~/.server/dsl-definitions';
 import { DSL_KINDS, isDslKind, type DslKind } from '~/.server/pipeline/dsl';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
@@ -67,10 +68,15 @@ export async function action({ request }: Route.ActionArgs) {
   const kind = kindOf(form.get('kind') as string | null);
   const key = String(form.get('key') ?? '').trim();
   const yaml = String(form.get('yaml') ?? '');
+  const requirement = String(form.get('request') ?? '');
   try {
+    if (form.get('intent') === 'model-draft') {
+      const generated = await modelDraftForDefinition(member, kind, requirement);
+      return { error: null, issues: [], key, yaml: generated.yaml, request: requirement, generated: true };
+    }
     await createDefinition(member, kind, key, yaml);
   } catch (e) {
-    if (e instanceof DslError) return data({ error: e.message, issues: e.issues, key, yaml }, { status: e.status });
+    if (e instanceof DslError) return data({ error: e.message, issues: e.issues, key, yaml, request: requirement, generated: false }, { status: e.status });
     throw e;
   }
   throw redirect(`/analytics/definitions/${kind}/${key}`);
@@ -103,6 +109,21 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
               <Input id="key" name="key" required defaultValue={actionData?.key ?? ''} placeholder={placeholder} className="max-w-sm font-mono" />
               <FieldDescription>小写字母开头，只用小写字母、数字与下划线；建好后不能改。</FieldDescription>
             </Field>
+            {kind === 'metric' && (
+              <Field>
+                <FieldLabel htmlFor="request">需求</FieldLabel>
+                <textarea
+                  id="request" name="request" rows={3} defaultValue={actionData?.request ?? ''}
+                  placeholder="如：近 30 天每个城市已支付订单的金额合计"
+                  className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                />
+                <FieldDescription>用自然语言写下要算什么，点「用模型生成草稿」：会把需求与本租户实体的非敏感字段、关系发给模型服务，生成的定义替换编辑框里的内容，不会保存。</FieldDescription>
+                <div>
+                  <Button type="submit" name="intent" value="model-draft" variant="outline" formNoValidate disabled={submitting}>用模型生成草稿</Button>
+                </div>
+              </Field>
+            )}
+            {actionData?.generated && <p className="text-sm text-muted-foreground" data-generated>已用模型生成草稿，请核对后填写键并保存。</p>}
             <Field>
               <FieldLabel>定义（YAML）</FieldLabel>
               <MappingEditor key={actionData?.yaml ?? `example-${kind}`} defaultValue={actionData?.yaml ?? example} />

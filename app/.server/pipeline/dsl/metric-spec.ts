@@ -132,7 +132,22 @@ function entityIn(name: string, ctx: DslContext): { fields: Map<string, FieldInf
   return { fields, key: e.key.length === 1 ? e.key[0] : undefined };
 }
 
-const relationsOf = (ctx: DslContext) => [...BUILTIN_RELATIONS, ...[...ctx.published.values()].flatMap(e => e.relations ?? [])];
+/**
+ * 实体在租户里能给定义用的字段（名、类型、可选取值），剔除敏感字段（与校验同源，含 x_ 扩展字段与已发布自定义实体）；
+ * 实体不存在或不能用时返回 undefined。给模型的上下文用它（ADR-0005、ADR-0035）
+ */
+export function fieldsFor(entity: string, ctx: DslContext): { name: string; type: FieldType; enum?: readonly string[] }[] | undefined {
+  const e = entityIn(entity, ctx);
+  if (typeof e === 'string') return undefined;
+  return [...e.fields].filter(([, f]) => !f.sensitive).map(([name, f]) => ({ name, type: f.type, ...(f.enum && { enum: f.enum }) }));
+}
+
+export const relationsOf = (ctx: DslContext) => [...BUILTIN_RELATIONS, ...[...ctx.published.values()].flatMap(e => e.relations ?? [])];
+
+/** 能做指标基础实体：customer 本身，或有指向 customer.customer_id 的 customer_id */
+export const linksToConsumer = (name: string, fields: { has: (field: string) => boolean }, ctx: DslContext) => name === 'customer'
+  || (fields.has('customer_id')
+    && relationsOf(ctx).some(r => r.from.entity === name && r.from.field === 'customer_id' && r.ref.entity === 'customer' && r.ref.field === 'customer_id'));
 
 /**
  * 维度路径的一段：实体.字段。不是终点时 join 是这一段怎样关联到下一实体：下一实体的单列主键，
@@ -258,10 +273,8 @@ export function checkMetric(text: string, ctx: DslContext): DslCheck<MetricSpec>
     issue(['base'], base);
     return done(spec);
   }
-  if (spec.base !== 'customer') {
-    const linked = base.fields.has('customer_id')
-      && relationsOf(ctx).some(r => r.from.entity === spec.base && r.from.field === 'customer_id' && r.ref.entity === 'customer' && r.ref.field === 'customer_id');
-    if (!linked) issue(['base'], `基础实体 ${spec.base} 要有指向 customer.customer_id 的 customer_id，才能关联到消费者`);
+  if (!linksToConsumer(spec.base, base.fields, ctx)) {
+    issue(['base'], `基础实体 ${spec.base} 要有指向 customer.customer_id 的 customer_id，才能关联到消费者`);
   }
   if (spec.device_attribution !== undefined && spec.base !== 'event') issue(['device_attribution'], '只有基础实体为 event 时才能写 device_attribution');
 

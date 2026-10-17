@@ -4,11 +4,12 @@
 // 版本表里发布不了的成员看到原因，另一位数据工程师发布后入队 gold.dsl；丢弃草稿回到已发布版本，从没发布过时回到分析页；
 // 数据工程师看到「删除」按钮（分析师看不到、提交 403），被已发布标签引用的指标删不了，删除后回到分析页；
 // 有早于生效版本的快照时数据工程师点「回刷」入队按旧统计日的计算，分析师在按钮处看到原因、提交 403；
-// 数据工程师点「重新计算」按生效版本以今天入队（连同下游标签，来源 manual），定义页显示最近一次刷新的时间与来源，分析页快照列表显示来源
+// 数据工程师点「重新计算」按生效版本以今天入队（连同下游标签，来源 manual），定义页显示最近一次刷新的时间与来源，分析页快照列表显示来源；
+// 新建页写需求「用模型生成草稿」填进编辑框、不保存，不过校验时 422 保持原内容，未配置模型服务时 400，查看者 403
 import { eq } from 'drizzle-orm';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { snapshots, tasks } from '../../app/.server/db/schema';
+import { dslVersions, snapshots, tasks } from '../../app/.server/db/schema';
 import { createDefinition, getDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { todayUtc } from '../../app/.server/templates';
 import { memberOf, newTenant } from '../pipeline/fixtures';
@@ -19,6 +20,7 @@ let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
+afterEach(() => { app.setLlmFetch(undefined); vi.unstubAllEnvs(); });
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n';
 
@@ -317,5 +319,67 @@ describe('指标与标签定义页', () => {
     expect(queued.map(t => [t.params.key, t.params.definitionVersion, t.params.asOf, t.params.trigger]).sort())
       .toEqual([['buyer', 1, todayUtc(), 'manual'], ['revenue', 1, todayUtc(), 'manual']]);
     expect(await (await engineer.post(path, { intent: 'recompute' })).text()).toContain('已有计算在排队或运行中');
+  });
+});
+
+/** 页面上编辑框里的 YAML */
+const editorYaml = (html: string) => html.match(/<textarea[^>]*name="yaml"[^>]*>([\s\S]*?)<\/textarea>/)![1]
+  .replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+/** 配上平台默认模型服务，替身每次都返回 content */
+function modelReplies(content: unknown) {
+  vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
+  vi.stubEnv('LLM_MODEL', 'qwen-plus');
+  vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
+  app.setLlmFetch((async () => Response.json({ choices: [{ message: { content: JSON.stringify(content) } }] })) as typeof fetch);
+}
+
+describe('用模型生成指标草稿', () => {
+  it('分析师写需求生成草稿填进编辑框、不保存，填键后保存为第 1 版草稿；不过校验时 422 保持原内容', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    const request = '近 30 天已支付订单的金额合计';
+
+    const page = await (await analyst.get('/analytics/definitions/new?kind=metric')).text();
+    expect(page).toMatch(/<textarea[^>]*name="request"/);
+    expect(page).toMatch(/<button[^>]*formNoValidate=""[^>]*value="model-draft"|<button[^>]*value="model-draft"[^>]*formNoValidate=""/);
+
+    modelReplies({ base: 'order', measure: { agg: 'sum', field: 'amount' }, filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'created_at', days: 30 } });
+    const generated = await analyst.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'metric', key: '', request, yaml: REVENUE });
+    expect(generated.status).toBe(200);
+    const html = await generated.text();
+    const yaml = editorYaml(html);
+    expect(yaml).toContain('# 模型根据需求生成，请核对');
+    expect(yaml).toContain('days: 30');
+    expect(html).toContain('data-generated');
+    expect(html).toContain(request);
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
+    const saved = await analyst.post('/analytics/definitions/new', { key: 'paid_revenue_30d', yaml });
+    expect(saved.headers.get('location')).toBe('/analytics/definitions/metric/paid_revenue_30d');
+    expect((await getDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'paid_revenue_30d')).draft).toMatchObject({ version: 1, yaml });
+
+    modelReplies({ base: 'order', measure: { agg: 'sum', field: 'channel' } });
+    const bad = await analyst.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'metric', key: 'x', request, yaml: REVENUE });
+    expect(bad.status).toBe(422);
+    const badHtml = await bad.text();
+    expect(badHtml).toContain('未采用，编辑框保持原内容');
+    expect(editorYaml(badHtml)).toBe(REVENUE);
+  });
+
+  it('未配置模型服务时 400 提示；查看者提交 403', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    vi.stubEnv('LLM_BASE_URL', '');
+    vi.stubEnv('LLM_MODEL', '');
+    vi.stubEnv('LLM_API_KEY', '');
+
+    const res = await (await loginAs(app, 'analyst@acme.com')).post('/analytics/definitions/new', { intent: 'model-draft', kind: 'metric', key: '', request: '订单数', yaml: REVENUE });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('未配置模型服务');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    expect((await viewer.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'metric', request: '订单数', yaml: REVENUE })).status).toBe(403);
   });
 });

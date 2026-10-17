@@ -128,6 +128,11 @@ const ACTIONS = {
   },
   'template.drafted': { label: '起草模板参数', describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版草稿` },
   'definition.drafted': { label: '起草指标或标签', describe: (d: Detail) => `${dslLabel(d)} ${d.key}，第 ${d.version} 版草稿` },
+  // 模型输出不合 Schema、请求失败或转出的定义不过校验（ADR-0035）：只记种类、阶段、错误摘要与问题位置，不记需求原文、模型原文与取值
+  'definition.model_draft_failed': {
+    label: '模型生成定义草稿失败',
+    describe: (d: Detail) => `${dslLabel(d)}，${d.stage === 'model' ? `模型服务：${d.error}` : `定义校验有 ${d.issues} 处问题`}`,
+  },
   'definition.published': {
     label: '发布指标或标签',
     describe: (d: Detail) => `${dslLabel(d)} ${d.key}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
