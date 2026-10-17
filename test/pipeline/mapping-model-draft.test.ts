@@ -1,12 +1,13 @@
 // test/pipeline/mapping-model-draft.test.ts —— 用模型生成映射草稿的流水线接缝（ADR-0035）：modelDraftFor 按「复用已发布映射 > 模型 > 按规则」生成
-// → 注入的假 fetch（setLlmFetch）→ platform.mapping_generations 的生成记录、platform.llm_calls 的调用日志与失败时的审计 mapping.model_draft_failed
+// → 注入的假 fetch（setLlmFetch）→ platform.mapping_generations 的生成记录、platform.llm_calls 的调用日志与失败时的审计 mapping.model_draft_failed；
+// 带着生成记录保存时与生成稿比对 → 审计 mapping.generation_edited（只有字段名）
 import { and, eq } from 'drizzle-orm';
 import { parse } from 'yaml';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, mappingGenerations } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
-import { createMapping, draftFor, dryRunMapping, MappingError, modelDraftFor, publishMapping } from '../../app/.server/mappings';
+import { createMapping, draftFor, dryRunMapping, MappingError, modelDraftFor, modelDraftForMapping, publishMapping, saveMappingDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
@@ -205,5 +206,73 @@ describe('用模型生成映射草稿', () => {
     expect(audit.detail).toMatchObject({ stage: 'model' });
     expect(String(audit.detail.error)).toContain('HTTP 500');
     expect(JSON.stringify(audit.detail)).not.toContain('sk-platform-secret');
+  });
+});
+
+describe('记录成员对生成草稿的修改', () => {
+  const edits = (tenantId: string) => getDb().select().from(auditLogs)
+    .where(and(eq(auditLogs.tenantId, tenantId), eq(auditLogs.action, 'mapping.generation_edited')));
+  /** 改金额的表达式、删掉下单时间 */
+  const edited = (yaml: string) => yaml.replace('amount: amount', 'amount: amount * 100').replace(/^ {2}created_at: .*\n/m, '');
+
+  it('生成后改了字段再保存：记一条审计，只有字段名与改了哪些属性，生成记录回填映射', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    platformDefault();
+    fakeFetch(completion(MODEL_ORDERS));
+    const draft = await modelDraftFor(author, sourceId, 'orders', 'order');
+    const yaml = edited(draft.yaml);
+    expect(yaml).not.toBe(draft.yaml);
+
+    const mapping = await createMapping(author, sourceId, yaml, { generationId: draft.generationId });
+    const [audit, ...more] = await edits(acme);
+    expect(more).toHaveLength(0);
+    expect(audit).toMatchObject({ actorEmail: author.email, targetType: 'mapping', targetId: mapping.id });
+    expect(audit.detail).toEqual({
+      generationId: draft.generationId, origin: 'model', mappingId: mapping.id, version: 1, source: '门店1', table: 'orders', entity: 'order', generationValid: true,
+      added: [], removed: ['created_at'], changed: [{ name: 'amount', fields: ['expr'] }],
+      key: false, latest: false, identity: false, keySpace: false, survivorship: false, where: false,
+    });
+    expect(JSON.stringify(audit.detail)).not.toMatch(/amount \*|refunded|string\(/);
+    expect((await generations(acme))[0].mappingId).toBe(mapping.id);
+  });
+
+  it('原样保存不记审计，生成记录照样回填映射', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    const draft = await modelDraftFor(author, sourceId, 'orders', 'order');
+    expect(draft.origin).toBe('rules');
+    const mapping = await createMapping(author, sourceId, draft.yaml, { generationId: draft.generationId });
+    expect(await edits(acme)).toHaveLength(0);
+    expect((await generations(acme))[0].mappingId).toBe(mapping.id);
+  });
+
+  it('详情页重新生成后改已有草稿：同样记一条，版本是这一版草稿', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    const mapping = await createMapping(author, sourceId, ORDERS);
+    const draft = await modelDraftForMapping(author, mapping.id);
+    await saveMappingDraft(author, mapping.id, edited(draft.yaml), { generationId: draft.generationId });
+    const [audit] = await edits(acme);
+    expect(audit.detail).toMatchObject({ generationId: draft.generationId, origin: 'rules', mappingId: mapping.id, version: 1, removed: ['created_at'] });
+  });
+
+  it('别的租户的、或源表 / 实体与映射不一致的生成记录 400，不保存', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    const other = await newTenant('globex');
+    const outsider = await memberOf(other, 'de@globex.com');
+    const { id: theirSource } = await registerSource(outsider, await pgSourceInput(READER, '门店1'));
+    await selectAllTables(outsider, theirSource);
+    await drain();
+    const theirs = await modelDraftFor(outsider, theirSource, 'orders', 'order');
+    const customers = await modelDraftFor(author, sourceId, 'customers', 'customer');
+
+    for (const generationId of [theirs.generationId, customers.generationId, 'not-a-uuid']) {
+      const e = await failure(createMapping(author, sourceId, ORDERS, { generationId }));
+      expect(e).toBeInstanceOf(MappingError);
+      expect(e.status).toBe(400);
+    }
+    const mapping = await createMapping(author, sourceId, ORDERS);
+    const e = await failure(saveMappingDraft(author, mapping.id, edited(ORDERS), { generationId: customers.generationId }));
+    expect(e.status).toBe(400);
+    expect(await edits(acme)).toHaveLength(0);
+    expect((await generations(other))[0].mappingId).toBeNull();
   });
 });

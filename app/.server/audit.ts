@@ -16,6 +16,8 @@ const roleLabel = (role: unknown) => ROLE_LABELS[role as Role] ?? String(role);
 const templateLabel = (template: unknown) => TEMPLATES[template as keyof typeof TEMPLATES]?.label ?? String(template);
 const apiKeyLabel = (d: Detail) => `「${d.name}」（${d.prefix}…）`;
 const dslLabel = (d: Detail) => (d.kind === 'tag' ? '标签' : '指标');
+/** 映射生成稿的来源（mapping_generations.origin）在审计里的说法 */
+const GENERATION_ORIGIN: Record<'model' | 'rules' | 'reuse', string> = { model: '模型生成的', rules: '规则生成的', reuse: '复用已发布映射得到的' };
 
 
 // 每种审计动作的名称，以及把明细写成一句话的方式；新增动作只改这里
@@ -113,6 +115,16 @@ const ACTIONS = {
     describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，${d.stage === 'model'
       ? `模型服务：${d.error}`
       : `映射校验有 ${d.issues} 处问题`}`,
+  },
+  // 成员保存从生成草稿开始改过的映射（ADR-0003、ADR-0035）：只记字段名与哪些属性改了，这里只显示字段数
+  'mapping.generation_edited': {
+    label: '修改了模型 / 规则生成的映射草稿',
+    describe: (d: Detail) => {
+      const fields = (d.added as string[]).length + (d.removed as string[]).length + (d.changed as unknown[]).length;
+      const also = [d.key && '去重键', d.identity && '身份规则'].filter(Boolean);
+      return `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版：修改了${GENERATION_ORIGIN[d.origin as keyof typeof GENERATION_ORIGIN] ?? '生成的'}映射草稿，`
+        + `改动 ${fields} 个字段${also.length ? `，并改了${also.join('与')}` : ''}`;
+    },
   },
   'template.drafted': { label: '起草模板参数', describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版草稿` },
   'definition.drafted': { label: '起草指标或标签', describe: (d: Detail) => `${dslLabel(d)} ${d.key}，第 ${d.version} 版草稿` },

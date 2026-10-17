@@ -9,7 +9,7 @@ import type { Route } from './+types/mappings';
 import { assertCan, can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { checkKeysNow, getKeyCheckStatus, KeyCheckError } from '~/.server/key-check';
-import { createMapping, defaultDraft, draftFor, listMappings, MappingError, mergeNow, modelDraftFor, referenceTables } from '~/.server/mappings';
+import { createMapping, defaultDraft, draftFor, GenerationMismatchError, listMappings, MappingError, mergeNow, modelDraftFor, referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
 import { SUGGESTION_LABELS } from '~/.server/pipeline/key-check-engine';
@@ -118,7 +118,8 @@ export async function action({ request }: Route.ActionArgs) {
         };
       }
       case 'create': {
-        const mapping = await createMapping(member, field('sourceId'), field('yaml'));
+        // 从生成草稿开始改的，保存时比对生成稿记下改动（ADR-0035）
+        const mapping = await createMapping(member, field('sourceId'), field('yaml'), { generationId: field('generationId') || undefined });
         // 检查有提示时不跳转，在列表页列出提示并给出新映射的入口
         if (mapping.notices.length) return { error: null, issues: [], values: null, draftId: null, created: { id: mapping.id, notices: mapping.notices } };
         throw redirect(`/mappings/${mapping.id}`);
@@ -132,7 +133,9 @@ export async function action({ request }: Route.ActionArgs) {
   } catch (e) {
     if (e instanceof KeyCheckError) return data({ error: e.message, issues: [], values: null, draftId: null }, { status: 400 });
     if (e instanceof MappingError) {
-      return data({ error: e.message, issues: e.issues, values: { sourceId: field('sourceId'), yaml: field('yaml') }, draftId: null }, { status: e.status });
+      // 没保存时仍带着生成记录，改好再保存照样比对；生成记录本身不符时不再带
+      const generationId = e instanceof GenerationMismatchError ? null : field('generationId') || null;
+      return data({ error: e.message, issues: e.issues, values: { sourceId: field('sourceId'), yaml: field('yaml') }, draftId: null, generationId }, { status: e.status });
     }
     throw e;
   }
@@ -328,6 +331,7 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
               functions={functions}
               values={actionData?.values ?? { sourceId: sources[0]?.id ?? '', yaml: initialYaml }}
               generated={(actionData && 'generated' in actionData && actionData.generated) || null}
+              generationId={(actionData && 'generationId' in actionData && actionData.generationId) || null}
               submitting={submitting}
             />
           </details>
@@ -361,7 +365,7 @@ const inputValue = (t: { name: string; view?: true }) => (t.view ? `${VIEW_PREFI
  * 新建映射的表单：选数据源、用表单或 YAML 编写映射。表与目标实体两个下拉框决定表单列哪些字段、对照面板显示什么（默认取 YAML 里写的），
  * 也是「按规则生成草稿」的输入；换选时一并写进 YAML 的 table / entity，保存时以 YAML 里写的为准
  */
-function NewMapping({ sources, tables, registered, functions, values, generated, submitting }: {
+function NewMapping({ sources, tables, registered, functions, values, generated, generationId, submitting }: {
   sources: LoaderData['sources'];
   tables: LoaderData['tables'];
   registered: LoaderData['registered'];
@@ -369,9 +373,12 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
   values: { sourceId: string; yaml: string };
   /** 用模型生成草稿时的来源、每项置信度与理由、提示（如没配置模型服务、已按规则生成） */
   generated: React.ComponentProps<typeof DraftConfidence> | null;
+  /** 编辑框里是生成的草稿时它的生成记录，保存时一起提交；换了数据源、表或实体后不再带 */
+  generationId: string | null;
   submitting: boolean;
 }) {
   const [sourceId, setSourceId] = useState(values.sourceId);
+  const [currentGenerationId, setCurrentGenerationId] = useState(generationId);
   const [yaml, setYaml] = useState(values.yaml);
   const [outline] = useState(() => mappingOutline(values.yaml));
   const [inputName, setInputName] = useState(outline.view ? inputValue({ name: outline.view, view: true }) : outline.table);
@@ -386,15 +393,17 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
   const table = sourceTables.find(t => inputValue(t) === inputName) ?? sourceTables[0] ?? null;
   const selectInput = (value: string) => {
     setInputName(value);
+    setCurrentGenerationId(null);
     setYaml(y => (value.startsWith(VIEW_PREFIX) ? withTarget(y, 'view', value.slice(VIEW_PREFIX.length)) : withTarget(y, 'table', value)));
   };
   return (
     <Form method="post">
+      {currentGenerationId && <input type="hidden" name="generationId" value={currentGenerationId} />}
       <FieldGroup>
         <div className="grid gap-4 sm:grid-cols-3">
           <Field>
             <FieldLabel htmlFor="mapping-source">数据源</FieldLabel>
-            <NativeSelect id="mapping-source" name="sourceId" value={sourceId} onChange={e => setSourceId(e.target.value)}>
+            <NativeSelect id="mapping-source" name="sourceId" value={sourceId} onChange={e => { setSourceId(e.target.value); setCurrentGenerationId(null); }}>
               {sources.map(s => <NativeSelectOption key={s.id} value={s.id}>{s.name}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
@@ -406,7 +415,7 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
           </Field>
           <Field>
             <FieldLabel htmlFor="mapping-entity">目标实体</FieldLabel>
-            <NativeSelect id="mapping-entity" name="entity" value={entity} onChange={e => { setEntity(e.target.value); setYaml(y => withTarget(y, 'entity', e.target.value)); }}>
+            <NativeSelect id="mapping-entity" name="entity" value={entity} onChange={e => { setEntity(e.target.value); setCurrentGenerationId(null); setYaml(y => withTarget(y, 'entity', e.target.value)); }}>
               {entities.map(e => <NativeSelectOption key={e.name} value={e.name}>{`${e.label}（${e.name}）`}</NativeSelectOption>)}
             </NativeSelect>
           </Field>

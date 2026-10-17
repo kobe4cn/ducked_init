@@ -14,7 +14,7 @@ import { can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import {
-  confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, getMapping, ignoreColumn, MappingError, mergeMapping, modelDraftForMapping, publishMapping, referenceTables,
+  confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, GenerationMismatchError, getMapping, ignoreColumn, MappingError, mergeMapping, modelDraftForMapping, publishMapping, referenceTables,
   requestDisable, restoreMapping, saveMappingDraft, yamlWithColumns,
 } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
@@ -162,7 +162,8 @@ export async function action({ request, params }: Route.ActionArgs) {
       }
       case 'save': {
         // 检查有提示时不跳转，留在编辑页列出提示（草稿已保存）
-        const { notices } = await saveMappingDraft(await requirePermission(request, 'sources:write'), params.mappingId, field('yaml'));
+        // 从生成草稿开始改的，保存时比对生成稿记下改动（ADR-0035）
+        const { notices } = await saveMappingDraft(await requirePermission(request, 'sources:write'), params.mappingId, field('yaml'), { generationId: field('generationId') || undefined });
         if (notices.length) return { error: null, issues: [], yaml: null, draftId: null, dryRun: null, notices };
         break;
       }
@@ -191,7 +192,11 @@ export async function action({ request, params }: Route.ActionArgs) {
         return data({ error: '未知操作', issues: [], yaml: null, draftId: null, dryRun: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof MappingError) return data({ error: e.message, issues: e.issues, yaml: field('yaml') || null, draftId: null, dryRun: null }, { status: e.status });
+    if (e instanceof MappingError) {
+      // 没保存时仍带着生成记录，改好再保存照样比对；生成记录本身不符时不再带
+      const generationId = e instanceof GenerationMismatchError ? null : field('generationId') || null;
+      return data({ error: e.message, issues: e.issues, yaml: field('yaml') || null, draftId: null, dryRun: null, generationId }, { status: e.status });
+    }
     throw e;
   }
   // 回到提交时所在的标签页
@@ -515,6 +520,8 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
   const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, draftDiff, drift, keySpaceChange, disable, merge } = loaderData;
   // 用模型重新生成时的来源、每项置信度与理由
   const generated = actionData && 'generated' in actionData ? actionData.generated : null;
+  // 编辑框里是生成的草稿时它的生成记录，保存时一起提交，比对生成稿记下改动；换版本或重新加载后 actionData 没了就不再带
+  const generationId = actionData && 'generationId' in actionData ? actionData.generationId : null;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -632,6 +639,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
             {selected.status === 'draft' && draftDiff && <DraftDiff entity={mapping.entity} version={selected.version} diff={draftDiff} />}
             {editable ? (
               <Form method="post" className="space-y-3" key={`${selected.version}-${actionData?.draftId ?? ''}`}>
+                {generationId && <input type="hidden" name="generationId" value={generationId} />}
                 {generated && <DraftConfidence {...generated} />}
                 <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} registered={mapping.registered} functions={functions} focus={focus} />
                 <div className="flex gap-2">

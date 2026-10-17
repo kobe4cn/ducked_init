@@ -809,6 +809,41 @@ describe('按规则生成映射草稿', () => {
     expect(await rejected.text()).toContain('读源视图的映射请直接编辑');
   });
 
+  it('生成草稿后改了再保存：表单带着生成记录，审计页显示修改了模型 / 规则生成的映射草稿与改动的字段数；校验不过时仍带着', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    const hiddenGeneration = (html: string) => html.match(/<input type="hidden" name="generationId" value="([0-9a-f-]{36})"/)?.[1];
+    modelReplies({ fields: [
+      { field: 'order_id', expr: 'string(order_id)', confidence: 0.95, reason: '源表主键' },
+      { field: 'customer_id', expr: 'string(customer_id)', confidence: 0.9, reason: '同名列' },
+      { field: 'amount', expr: 'amount', confidence: 0.7, reason: '金额列' },
+    ] });
+
+    const html = await (await engineer.post('/mappings', { intent: 'model-draft', sourceId, table: 'orders', entity: 'order', yaml: '' })).text();
+    const generationId = hiddenGeneration(html)!;
+    expect(generationId).toBeDefined();
+    const yaml = editorYaml(html).replace(/amount: amount.*/, 'amount: amount / 100');
+    const invalid = await engineer.post('/mappings', { intent: 'create', sourceId, yaml: yaml.replace('amount / 100', 'nope'), generationId });
+    expect(invalid.status).toBe(400);
+    expect(hiddenGeneration(await invalid.text())).toBe(generationId);
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml, generationId }));
+
+    // 详情页按规则（没配置模型服务）重新生成，删掉一列保存到已有草稿
+    vi.unstubAllEnvs();
+    const regenerated = await (await engineer.post(`/mappings/${id}`, { intent: 'model-draft' })).text();
+    const again = hiddenGeneration(regenerated)!;
+    expect(again).toBeDefined();
+    expect(hiddenGeneration(await (await engineer.get(`/mappings/${id}`)).text())).toBeUndefined();
+    const trimmed = editorYaml(regenerated).replace(/^ {2}created_at: .*\n/m, '');
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: trimmed, generationId: again })).status).toBe(302);
+
+    const audit = await (await loginAs(app, 'admin@acme.com')).get('/audit').then(r => r.text());
+    expect(audit).toContain('修改了模型 / 规则生成的映射草稿');
+    expect(audit).toContain('「电商库」orders → 订单，第 1 版：修改了模型生成的映射草稿，改动 1 个字段');
+    expect(audit).toContain('「电商库」orders → 订单，第 1 版：修改了规则生成的映射草稿，改动 1 个字段');
+    expect(audit).not.toContain('amount / 100');
+  });
+
   it('详情页用映射的表与实体重新生成，保存后替换草稿；选的表不存在时说明原因', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const engineer = await loginAs(app, 'de@acme.com');

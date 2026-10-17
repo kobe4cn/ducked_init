@@ -406,14 +406,55 @@ export async function requireMapping(tenantId: string, mappingId: string, tx: Tx
   return row;
 }
 
+/** 保存时带的生成记录不属于本租户、或源表 / 实体与保存的映射不一致：页面不再带着它重试 */
+export class GenerationMismatchError extends MappingError {}
+
+/**
+ * 保存从生成草稿开始改过的映射时（ADR-0003、ADR-0035）：核对生成记录属于本租户、源表与实体和映射一致（不符抛 400，整个保存回滚），
+ * 回填它的 mapping_id；用同样的登记求生成稿的计划，与保存的计划有差异时记审计 mapping.generation_edited。
+ * 只记字段名、改了哪些属性与去重键等是否改了，不记 YAML、表达式与字典取值。生成稿已过不了校验时（例如源表结构变了）按全部重写记
+ */
+async function recordGenerationEdit(
+  tx: Tx, actor: CurrentMember, generationId: string,
+  saved: { mapping: typeof mappings.$inferSelect; version: number; plan: MergePlan; registrations: Map<string, RegisteredEntity> },
+) {
+  const tenantId = actor.tenant.id;
+  const { mapping, plan } = saved;
+  const mismatch = () => new GenerationMismatchError('生成草稿的记录与这个映射的源表或实体不一致，未保存；请重新生成或直接编辑后保存');
+  if (!/^[0-9a-f-]{36}$/i.test(generationId)) throw mismatch();
+  const [generation] = await tx.select().from(mappingGenerations)
+    .where(and(eq(mappingGenerations.id, generationId), eq(mappingGenerations.tenantId, tenantId))).for('update');
+  if (!generation || generation.sourceId !== mapping.sourceId || generation.tableName !== mapping.tableName
+    || generation.entity !== mapping.entity || mapping.sourceViewId) throw mismatch();
+  await tx.update(mappingGenerations).set({ mappingId: mapping.id }).where(eq(mappingGenerations.id, generationId));
+
+  const checked = checkMapping(generation.yaml, await sourceColumns(tenantId, mapping.sourceId), saved.registrations,
+    await customerSources(tenantId, mapping.sourceId, generation.yaml));
+  const diff = diffPlans(checked.ok ? checked.plan : { ...plan, columns: [] }, plan);
+  if (diff.first || diff.empty) return;
+  const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
+  await recordAudit(tx, {
+    tenantId, actor, action: 'mapping.generation_edited', targetType: 'mapping', targetId: mapping.id,
+    detail: {
+      generationId, origin: generation.origin, mappingId: mapping.id, version: saved.version,
+      source: source.name, table: mapping.tableName, entity: mapping.entity, generationValid: checked.ok,
+      added: diff.added, removed: diff.removed, changed: diff.changed,
+      key: !!diff.key, latest: !!diff.latest, identity: !!diff.identity, keySpace: !!diff.keySpace, survivorship: !!diff.survivorship, where: !!diff.where,
+    },
+  });
+}
+
 /**
  * 新建映射：文档校验通过后保存为第一版草稿，返回的映射行带上检查的 notices（不拦保存的提示）。同一数据源的同一张表到同一个实体只能有一个映射。
  * opts.registrations 只给一键直通（passthrough.ts）用：对照这些登记校验（含刚建、还没发布的那份），而不是只对照已发布登记
  */
-export async function createMapping(actor: CurrentMember, sourceId: string, yaml: string, opts?: { registrations: Map<string, RegisteredEntity> }) {
+export async function createMapping(
+  actor: CurrentMember, sourceId: string, yaml: string, opts?: { registrations?: Map<string, RegisteredEntity>; generationId?: string },
+) {
   assertCan(actor, 'sources:write');
   const source = await requireSource(actor.tenant.id, sourceId).catch(() => { throw new MappingError('请选择数据源'); });
-  const { plan, viewId, notices } = await checkMappingDraft(actor.tenant.id, sourceId, yaml, opts?.registrations);
+  const registrations = opts?.registrations ?? await publishedCustomEntities(getDb(), actor.tenant.id);
+  const { plan, viewId, notices } = await checkMappingDraft(actor.tenant.id, sourceId, yaml, registrations);
   try {
     return await getDb().transaction(async tx => {
       const [mapping] = await tx.insert(mappings).values({
@@ -428,6 +469,7 @@ export async function createMapping(actor: CurrentMember, sourceId: string, yaml
         targetId: mapping.id,
         detail: { source: source.name, table: plan.table, entity: plan.entity, version: 1 },
       });
+      if (opts?.generationId) await recordGenerationEdit(tx, actor, opts.generationId, { mapping, version: 1, plan, registrations });
       return { ...mapping, notices };
     });
   } catch (e) {
@@ -445,10 +487,13 @@ export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: s
 }
 
 /** 同 saveDraft，另返回检查的 notices（不拦保存的提示，编辑页显示） */
-export async function saveMappingDraft(actor: CurrentMember, mappingId: string, yaml: string): Promise<{ version: number; notices: MappingIssue[] }> {
+export async function saveMappingDraft(
+  actor: CurrentMember, mappingId: string, yaml: string, opts?: { generationId?: string },
+): Promise<{ version: number; notices: MappingIssue[] }> {
   assertCan(actor, 'sources:write');
   const mapping = await requireMapping(actor.tenant.id, mappingId);
-  const { plan, viewId, notices } = await checkMappingDraft(actor.tenant.id, mapping.sourceId, yaml);
+  const registrations = await publishedCustomEntities(getDb(), actor.tenant.id);
+  const { plan, viewId, notices } = await checkMappingDraft(actor.tenant.id, mapping.sourceId, yaml, registrations);
   if (plan.table !== mapping.tableName || viewId !== mapping.sourceViewId || plan.entity !== mapping.entity) {
     throw new MappingError(`这个映射是 ${mapping.sourceViewId ? '源视图 ' : ''}${mapping.tableName} → ${mapping.entity}，不能改表、源视图或实体；请新建映射`);
   }
@@ -457,8 +502,13 @@ export async function saveMappingDraft(actor: CurrentMember, mappingId: string, 
     const [locked] = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
     if (!locked) throw new MappingError('映射不存在', 404);
     const [latest] = await tx.select().from(mappingVersions).where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version)).limit(1);
+    // 生成稿的比对与「起草」审计无关：改已有草稿也要记
+    const recordEdit = (version: number) => opts?.generationId
+      ? recordGenerationEdit(tx, actor, opts.generationId, { mapping, version, plan, registrations })
+      : Promise.resolve();
     if (latest?.status === 'draft') {
       await tx.update(mappingVersions).set({ yaml, plan, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() }).where(eq(mappingVersions.id, latest.id));
+      await recordEdit(latest.version);
       return latest.version;
     }
     const version = (latest?.version ?? 0) + 1;
@@ -472,6 +522,7 @@ export async function saveMappingDraft(actor: CurrentMember, mappingId: string, 
       targetId: mappingId,
       detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version },
     });
+    await recordEdit(version);
     return version;
   });
   return { version: saved, notices };
