@@ -5,7 +5,7 @@
 // 数据工程师看到「删除」按钮（分析师看不到、提交 403），被已发布标签引用的指标删不了，删除后回到分析页；
 // 有早于生效版本的快照时数据工程师点「回刷」入队按旧统计日的计算，分析师在按钮处看到原因、提交 403；
 // 数据工程师点「重新计算」按生效版本以今天入队（连同下游标签，来源 manual），定义页显示最近一次刷新的时间与来源，分析页快照列表显示来源；
-// 新建页写需求「用模型生成草稿」填进编辑框、不保存，不过校验时 422 保持原内容，未配置模型服务时 400，查看者 403
+// 新建页写需求「用模型生成草稿」填进编辑框、不保存，不过校验时 422 保持原内容，未配置模型服务时 400，查看者 403；标签同样能生成，没有可引用的已发布指标时 400
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -381,5 +381,33 @@ describe('用模型生成指标草稿', () => {
     expect(await res.text()).toContain('未配置模型服务');
     const viewer = await loginAs(app, 'viewer@acme.com');
     expect((await viewer.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'metric', request: '订单数', yaml: REVENUE })).status).toBe(403);
+  });
+});
+
+describe('用模型生成标签草稿', () => {
+  it('标签新建页生成草稿填进编辑框、不保存；没有可引用的已发布指标时 400 提示，编辑框保持原内容', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    const request = '消费满 1000 的是高价值客户';
+    const tag = 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n';
+    modelReplies({ metric: 'revenue', rules: [{ value: 'high', when: { gte: 1000 } }], default: 'normal' });
+
+    expect(await (await analyst.get('/analytics/definitions/new?kind=tag')).text()).toMatch(/<textarea[^>]*name="request"/);
+    const none = await analyst.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'tag', key: '', request, yaml: tag });
+    expect(none.status).toBe(400);
+    const noneHtml = await none.text();
+    expect(noneHtml).toContain('先发布一个数值型指标');
+    expect(editorYaml(noneHtml)).toBe(tag);
+
+    await createDefinition(author, 'metric', 'revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    const generated = await analyst.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'tag', key: '', request, yaml: tag });
+    expect(generated.status).toBe(200);
+    const html = await generated.text();
+    expect(editorYaml(html)).toContain('# 模型根据需求生成，请核对');
+    expect(editorYaml(html)).toContain('gte: 1000');
+    expect(html).toContain('data-generated');
+    expect(await getDb().select().from(dslVersions)).toHaveLength(1);
   });
 });

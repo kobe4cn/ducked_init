@@ -22,7 +22,7 @@ import { chatJson, LlmError, resolveProvider } from './llm';
 import { lockTenant, publishedPlans } from './mappings';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
-import { definitionDraftMessages, definitionDraftPurpose, definitionDraftSchema, definitionOutputToYaml, isDraftableKind } from './pipeline/dsl/model-draft';
+import { definitionDraftMessages, definitionDraftPurpose, definitionDraftSchema, definitionOutputToYaml } from './pipeline/dsl/model-draft';
 import { checkMetric, type DslCheck, type DslContext, type DslIssue, type MetricSpec } from './pipeline/dsl/metric-spec';
 import { withMetric } from './pipeline/dsl/tag-spec';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './pipeline/identity-engine';
@@ -143,14 +143,14 @@ export async function createDefinition(actor: CurrentMember, kind: string, key: 
 }
 
 /**
- * 用模型按自然语言需求生成定义草稿（ADR-0003、ADR-0035）：上下文是本租户能用的实体、非敏感字段与关系，模型输出按该种类的 Schema 校验、
- * 转成 YAML 后须过该种类的校验，只返回 YAML，不保存（之后照常保存草稿、双人发布）。没配置模型服务时 400、不发请求；
+ * 用模型按自然语言需求生成定义草稿（ADR-0003、ADR-0035）：指标的上下文是本租户能用的实体、非敏感字段与关系，标签的是能引用的已发布指标；
+ * 模型输出按该种类的 Schema 校验、转成 YAML 后须过该种类的校验，只返回 YAML，不保存（之后照常保存草稿、双人发布）。
+ * 没配置模型服务、或上下文里没东西可用（标签没有可引用的指标）时 400、不发请求；
  * 模型失败或转出的 YAML 不过校验时记审计 definition.model_draft_failed（不含需求原文、模型原文与取值），抛 422
  */
 export async function modelDraftForDefinition(actor: CurrentMember, kind: string, request: string): Promise<{ yaml: string }> {
   assertCan(actor, 'definitions:draft');
   requireKind(kind);
-  if (!isDraftableKind(kind)) throw new DslError(`${DSL_KINDS[kind].label}还不能用模型生成草稿`);
   if (!request.trim()) throw new DslError('请先写下需求');
   const tenantId = actor.tenant.id;
   if (!(await resolveProvider(tenantId))) throw new DslError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务');
@@ -158,9 +158,11 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
   const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
     tenantId, actor, action: 'definition.model_draft_failed', targetType: 'definition', detail: { kind, ...detail },
   });
+  const messages = definitionDraftMessages(kind, request, ctx);
+  if (!Array.isArray(messages)) throw new DslError(messages.unavailable);
   let output: object;
   try {
-    output = await chatJson<object>(tenantId, definitionDraftPurpose(kind), definitionDraftMessages(kind, request, ctx), definitionDraftSchema(kind));
+    output = await chatJson<object>(tenantId, definitionDraftPurpose(kind), messages, definitionDraftSchema(kind));
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
     await failed({ stage: 'model', error: e.message.slice(0, 200) });

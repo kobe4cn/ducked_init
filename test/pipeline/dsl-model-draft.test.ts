@@ -1,5 +1,5 @@
-// test/pipeline/dsl-model-draft.test.ts —— 用模型按需求生成指标定义草稿的流水线接缝（ADR-0035）：modelDraftForDefinition → 注入的假 fetch（setLlmFetch）
-// → 转出的 YAML 过指标校验后返回、不写 dsl_versions；platform.llm_calls 的调用日志（purpose = metric_draft）与失败时的审计 definition.model_draft_failed；
+// test/pipeline/dsl-model-draft.test.ts —— 用模型按需求生成指标 / 标签定义草稿的流水线接缝（ADR-0035）：modelDraftForDefinition → 注入的假 fetch（setLlmFetch）
+// → 转出的 YAML 过该种类的校验后返回、不写 dsl_versions；platform.llm_calls 的调用日志（purpose = metric_draft / tag_draft）与失败时的审计 definition.model_draft_failed；
 // 生成的草稿保存后照常双人发布
 import { and, eq } from 'drizzle-orm';
 import { parse } from 'yaml';
@@ -142,5 +142,95 @@ describe('用模型生成指标定义草稿', () => {
     expect(f).not.toHaveBeenCalled();
     expect(await calls(acme)).toHaveLength(0);
     await expect(modelDraftForDefinition(viewer, 'metric', REQUEST)).rejects.toMatchObject({ init: { status: 403 } });
+  });
+});
+
+const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: created_at, days: 30 }\ndescription: 近 30 天订单金额\n';
+const REVENUE_BY_CITY = 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n';
+const TAG_REQUEST = '近 30 天消费满 1000 的是高价值客户，其余为普通';
+
+/** 模型对 TAG_REQUEST 的回答 */
+const MODEL_TIER = { metric: 'revenue_30d', rules: [{ value: 'high', when: { gte: 1000 } }], default: 'normal', description: '按近 30 天消费分层' };
+
+describe('用模型生成标签定义草稿', () => {
+  it('上下文只列已发布、无维度、数值型指标；YAML 过标签校验、不写 dsl_versions；保存后由另一位数据工程师发布', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(author, 'metric', 'revenue_30d', REVENUE);
+    await publishDefinition(reviewer, 'metric', 'revenue_30d', 1);
+    await createDefinition(author, 'metric', 'revenue_by_city', REVENUE_BY_CITY);
+    await publishDefinition(reviewer, 'metric', 'revenue_by_city', 1);
+    await createDefinition(author, 'metric', 'draft_only', REVENUE);
+    platformDefault();
+    const { received } = fakeFetch(completion(MODEL_TIER));
+
+    const { yaml } = await modelDraftForDefinition(analyst, 'tag', TAG_REQUEST);
+    expect(yaml.startsWith('# 模型根据需求生成，请核对\n')).toBe(true);
+    expect(parse(yaml)).toEqual(MODEL_TIER);
+    expect(await getDb().select().from(dslVersions)).toHaveLength(3);
+
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'tag_draft', schemaValid: true });
+    const user = JSON.parse(received[0]!.messages.find(m => m.role === 'user')!.content);
+    expect(user.request).toBe(TAG_REQUEST);
+    expect(user.context).toEqual({
+      metrics: [{ key: 'revenue_30d', description: '近 30 天订单金额', measure: { agg: 'sum', field: 'amount' } }],
+    });
+    expect(received[0]!.messages[0]!.content).toContain('标签');
+
+    await createDefinition(author, 'tag', 'value_tier', yaml);
+    await expect(publishDefinition(author, 'tag', 'value_tier', 1)).rejects.toThrow(/最后改了这一版草稿/);
+    expect(await publishDefinition(reviewer, 'tag', 'value_tier', 1)).toMatchObject({ status: 'queued' });
+  });
+
+  it('模型引用带维度或只有草稿的指标时 422，审计种类为标签', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(author, 'metric', 'revenue_30d', REVENUE);
+    await publishDefinition(reviewer, 'metric', 'revenue_30d', 1);
+    await createDefinition(author, 'metric', 'revenue_by_city', REVENUE_BY_CITY);
+    await publishDefinition(reviewer, 'metric', 'revenue_by_city', 1);
+    await createDefinition(author, 'metric', 'draft_only', REVENUE);
+    platformDefault();
+
+    for (const metric of ['revenue_by_city', 'draft_only']) {
+      fakeFetch(completion({ ...MODEL_TIER, metric }));
+      const e = await failure(modelDraftForDefinition(analyst, 'tag', TAG_REQUEST));
+      expect(e.status).toBe(422);
+      expect(e.issues.map(i => i.path)).toEqual(['metric']);
+    }
+    expect(await failures(acme)).toEqual([
+      expect.objectContaining({ detail: { kind: 'tag', stage: 'definition', issues: 1, paths: ['metric'] } }),
+      expect.objectContaining({ detail: { kind: 'tag', stage: 'definition', issues: 1, paths: ['metric'] } }),
+    ]);
+    expect((await calls(acme)).map(c => c.purpose)).toEqual(['tag_draft', 'tag_draft']);
+  });
+
+  it('模型输出不合 TAG_SCHEMA 时 422，记审计', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(author, 'metric', 'revenue_30d', REVENUE);
+    await publishDefinition(reviewer, 'metric', 'revenue_30d', 1);
+    platformDefault();
+    fakeFetch(completion({ metric: 'revenue_30d', rules: [{ value: 'high', when: { between: [1, 2] } }], default: 'normal' }));
+
+    const e = await failure(modelDraftForDefinition(analyst, 'tag', TAG_REQUEST));
+    expect(e.status).toBe(422);
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'tag_draft', schemaValid: false });
+    expect((await failures(acme))[0]!.detail).toMatchObject({ kind: 'tag', stage: 'model' });
+  });
+
+  it('没有可引用的已发布指标时 400、不发请求', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(author, 'metric', 'revenue_by_city', REVENUE_BY_CITY);
+    await publishDefinition(reviewer, 'metric', 'revenue_by_city', 1);
+    await createDefinition(author, 'metric', 'draft_only', REVENUE);
+    platformDefault();
+    const { f } = fakeFetch(completion(MODEL_TIER));
+
+    const e = await failure(modelDraftForDefinition(analyst, 'tag', TAG_REQUEST));
+    expect(e).toMatchObject({ status: 400, message: expect.stringContaining('先发布一个数值型指标') });
+    expect(f).not.toHaveBeenCalled();
+    expect(await calls(acme)).toHaveLength(0);
   });
 });

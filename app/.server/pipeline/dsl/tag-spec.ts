@@ -55,8 +55,8 @@ export const TAG_SCHEMA = {
 
 const validateSchema = new Ajv({ allErrors: true, strict: false }).compile(TAG_SCHEMA);
 
-/** 引用的指标：最新的已发布版本；不能用时返回原因 */
-function metricOf(key: string, ctx: DslContext): MetricSpec | string {
+/** 引用的指标：最新的已发布版本；不能用时返回原因（模型生成标签草稿时也按它挑可引用的指标） */
+export function metricOf(key: string, ctx: DslContext): MetricSpec | string {
   const metric = ctx.metrics.get(key);
   if (!metric) return `没有已发布的指标 ${key}`;
   if (!metric.ok) return `指标 ${key} 的已发布版本对照当前的登记与映射不再通过校验`;
