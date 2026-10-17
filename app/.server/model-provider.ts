@@ -1,6 +1,6 @@
 // app/.server/model-provider.ts —— 租户自己的模型服务配置（ADR-0035，仅管理员）：查看当前生效的来源、保存端点 / 模型名 / API Key、
 // 恢复平台默认、测试连通性。API Key 用租户数据密钥加密（ADR-0009），读出来只告诉页面「已设置」，明文与密文都不出这个模块；
-// 留空保存沿用原来的 Key，审计只记端点、模型名与是否轮换
+// 留空保存沿用原来的 Key，审计只记端点、模型名与是否轮换。是否发送脱敏样本也在这里开关，tableContextFor 按它组织给模型的表上下文
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
@@ -8,7 +8,10 @@ import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { modelProviders } from './db/schema';
 import { chatJson, LlmError, MODEL_PROVIDER_CONTEXT, providerSource, resolveProvider } from './llm';
+import { buildTableContext, type TableContext } from './pipeline/llm-context';
 import { decryptForTenant, encryptForTenant } from './secrets';
+import { maskedSample, SourceViewError } from './source-views';
+import { confirmedTables } from './sources';
 
 /** 可以展示给管理员的输入错误 */
 export class ModelProviderError extends Error {
@@ -108,4 +111,35 @@ export async function testModelProvider(actor: CurrentMember): Promise<Connectiv
     throw e;
   }
   return { ok: true, model, durationMs: Date.now() - started };
+}
+
+/** 是否允许把原始层的脱敏样本行发给模型服务（默认不允许）；没有配置行时插入一行，端点、模型名与 Key 为空。值没变时什么也不做 */
+export async function setAllowSamples(actor: CurrentMember, allow: boolean) {
+  assertCan(actor, 'model_provider:manage');
+  const tenantId = actor.tenant.id;
+  if (((await rowOf(tenantId))?.allowSamples ?? false) === allow) return;
+  await getDb().transaction(async tx => {
+    await tx.insert(modelProviders).values({ tenantId, allowSamples: allow })
+      .onConflictDoUpdate({ target: modelProviders.tenantId, set: { allowSamples: allow, updatedAt: new Date() } });
+    await recordAudit(tx, { tenantId, actor, action: 'model_provider.updated', targetType: 'model_provider', detail: { allowSamples: allow } });
+  });
+}
+
+/** 每张表发给模型几行样本 */
+export const SAMPLE_ROWS = 5;
+
+/**
+ * 给模型的表上下文：表结构与最近一次采集的列统计；租户允许发送样本时附上原始层最近提交的 SAMPLE_ROWS 行（敏感列是加盐哈希、没有平台列）。
+ * 数据湖没初始化、表还没同步时照常只给结构与统计，错误消息不往外带。表不在同步范围或还没采集过时报错
+ */
+export async function tableContextFor(tenantId: string, sourceId: string, tableName: string): Promise<TableContext> {
+  const { tables } = await confirmedTables(tenantId, sourceId);
+  const profile = tables.find(t => t.table.name === tableName)?.table;
+  if (!profile) throw new Error(`表 ${tableName} 不在同步范围内或还没有采集`);
+  if (!(await rowOf(tenantId))?.allowSamples) return buildTableContext(profile);
+  const samples = await maskedSample(tenantId, sourceId, tableName, SAMPLE_ROWS).catch((e: unknown) => {
+    if (e instanceof SourceViewError) return undefined;
+    throw e;
+  });
+  return buildTableContext(profile, samples);
 }

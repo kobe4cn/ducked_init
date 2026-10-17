@@ -1,10 +1,12 @@
 // app/routes/model-provider.tsx —— 模型服务（仅管理员）：看当前用平台默认还是本租户配置；保存端点、模型名与 API Key（Key 不回显，留空沿用）、
-// 恢复平台默认、测试连通性
+// 恢复平台默认、测试连通性、开关发送脱敏样本
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { CheckCircle2, CircleAlert } from 'lucide-react';
 import type { Route } from './+types/model-provider';
 import { requirePermission } from '~/.server/access';
-import { getModelProvider, ModelProviderError, resetModelProvider, saveModelProvider, testModelProvider } from '~/.server/model-provider';
+import {
+  getModelProvider, ModelProviderError, resetModelProvider, SAMPLE_ROWS, saveModelProvider, setAllowSamples, testModelProvider,
+} from '~/.server/model-provider';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
@@ -20,7 +22,7 @@ export function meta({}: Route.MetaArgs) {
 
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'model_provider:manage');
-  return { email: member.email, nav: navFor(member), provider: await getModelProvider(member) };
+  return { email: member.email, nav: navFor(member), provider: await getModelProvider(member), sampleRows: SAMPLE_ROWS };
 }
 
 export async function action({ request }: Route.ActionArgs) {
@@ -34,6 +36,9 @@ export async function action({ request }: Route.ActionArgs) {
         break;
       case 'reset':
         await resetModelProvider(member);
+        break;
+      case 'samples':
+        await setAllowSamples(member, form.get('allowSamples') === 'on');
         break;
       case 'test':
         // 不重定向：测试结果只在这次响应里展示
@@ -55,7 +60,7 @@ const SOURCE_LABEL = {
 } as const;
 
 export default function ModelProvider({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, provider } = loaderData;
+  const { email, nav, provider, sampleRows } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   return (
     <AppShell email={email} nav={nav}>
@@ -137,6 +142,23 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
             </Field>
             <div>
               <Button type="submit" disabled={submitting}>保存</Button>
+            </div>
+          </FieldGroup>
+        </Form>
+      </div>
+
+      <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        <SectionHeader title="发送脱敏样本">默认只把表结构与列统计发给模型服务。</SectionHeader>
+        <Form method="post">
+          <input type="hidden" name="intent" value="samples" />
+          <FieldGroup>
+            <Field orientation="horizontal">
+              <input type="checkbox" id="model-allow-samples" name="allowSamples" defaultChecked={provider.allowSamples} className="size-4" />
+              <FieldLabel htmlFor="model-allow-samples">发送脱敏样本</FieldLabel>
+            </Field>
+            <FieldDescription>打开后会把每张表最新 {sampleRows} 行发给模型服务，像手机号、邮箱、姓名的列先换成哈希。</FieldDescription>
+            <div>
+              <Button type="submit" variant="outline" disabled={submitting}>保存</Button>
             </div>
           </FieldGroup>
         </Form>

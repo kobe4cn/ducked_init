@@ -1,5 +1,6 @@
 // test/http/model-provider.test.ts —— 「模型服务」页的 HTTP 接缝：管理员在 /model-provider 保存端点、模型名与 API Key（Key 不回显、加密入库、留空沿用），
-// 测试连通性（假 fetch 经 app.setLlmFetch 注入，结果看页面与 platform.llm_calls），恢复平台默认后 resolveProvider 回到环境变量；非管理员 403
+// 测试连通性（假 fetch 经 app.setLlmFetch 注入，结果看页面与 platform.llm_calls），恢复平台默认后 resolveProvider 回到环境变量；
+// 开关发送脱敏样本（默认关、记审计）；非管理员 403
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -128,6 +129,28 @@ describe('模型服务页', () => {
     expect(await (await admin.get('/audit')).text()).toContain('恢复平台默认模型服务');
   });
 
+  it('发送脱敏样本默认关闭，管理员打开 / 关闭各记一条审计（值没变不记），不影响端点配置', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    const checkbox = async () => (await (await admin.get('/model-provider')).text()).match(/<input[^>]*name="allowSamples"[^>]*>/)![0];
+    expect(await checkbox()).not.toContain('checked');
+
+    expect((await admin.post('/model-provider', { intent: 'samples', allowSamples: 'on' })).status).toBe(302);
+    expect(await checkbox()).toContain('checked');
+    const [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
+    expect(row).toMatchObject({ allowSamples: true, baseUrl: null, model: null, apiKey: null });
+    expect(await (await admin.get('/model-provider')).text()).toContain('data-provider-source="none"');
+
+    expect((await admin.post('/model-provider', { intent: 'samples', allowSamples: 'on' })).status).toBe(302); // 没变，不记审计
+    expect((await admin.post('/model-provider', { intent: 'samples' })).status).toBe(302);
+    expect(await checkbox()).not.toContain('checked');
+    const logs = await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.updated')).orderBy(auditLogs.createdAt);
+    expect(logs.map(l => l.detail)).toEqual([{ allowSamples: true }, { allowSamples: false }]);
+    const audit = await (await admin.get('/audit')).text();
+    expect(audit).toContain('打开发送脱敏样本');
+    expect(audit).toContain('关闭发送脱敏样本');
+  });
+
   it('数据工程师看不到入口，页面与提交 403', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'de@acme.com', 'data_engineer');
@@ -136,8 +159,8 @@ describe('模型服务页', () => {
     const page = await engineer.get('/model-provider');
     expect(page.status).toBe(403);
     expect(await page.text()).toContain('配置模型服务');
-    for (const intent of ['save', 'reset', 'test']) {
-      expect((await engineer.post('/model-provider', { intent, baseUrl: 'https://x.example.com', model: 'm', apiKey: KEY })).status).toBe(403);
+    for (const intent of ['save', 'reset', 'test', 'samples']) {
+      expect((await engineer.post('/model-provider', { intent, baseUrl: 'https://x.example.com', model: 'm', apiKey: KEY, allowSamples: 'on' })).status).toBe(403);
     }
     expect(await getDb().select().from(modelProviders)).toHaveLength(0);
     expect(await connectivityCalls(acme)).toHaveLength(0);

@@ -11,7 +11,9 @@ import { mappings, sources, sourceViews, sourceViewVersions } from './db/schema'
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { enqueueMerge } from './mappings';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
+import { ident } from './pipeline/merge-engine';
 import { normalizeViewSql, previewView, VIEW_PLATFORM_COLUMNS, ViewSqlError, type ViewPreview } from './pipeline/source-view-engine';
+import { PLATFORM_COLUMNS } from './pipeline/sync-engine';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
@@ -48,7 +50,7 @@ async function requireView(tenantId: string, sourceId: string, viewId: string) {
  * 在只读挂载的数据湖上校验 SQL 并取预览（视图的列与前 PREVIEW_ROWS 行，敏感列是加盐哈希）。
  * 不合规或执行出错时抛出 SourceViewError（报错里抹掉凭据与盐）
  */
-async function checkAndPreview(tenantId: string, sourceId: string, viewSql: string) {
+async function checkAndPreview(tenantId: string, sourceId: string, viewSql: string, limit = PREVIEW_ROWS) {
   // 采集时像敏感信息的列（列名或过半取值像邮箱、手机号），预览前在原始层的同名视图里先换成哈希
   const { tables } = await confirmedTables(tenantId, sourceId);
   const sensitive = Object.fromEntries(tables.map(({ table }) => [table.name, table.columns.filter(c => looksSensitive(c)).map(c => c.name)]));
@@ -58,13 +60,23 @@ async function checkAndPreview(tenantId: string, sourceId: string, viewSql: stri
   const spec = lakeSpecOf(lake);
   const session = await openTenantLake(spec, PREVIEW_LIMITS, undefined, { readOnly: true });
   try {
-    return await previewView(session.con, viewSql, sourceId, salt, PREVIEW_ROWS, sensitive);
+    return await previewView(session.con, viewSql, sourceId, salt, limit, sensitive);
   } catch (e) {
     if (e instanceof ViewSqlError) throw new SourceViewError(e.message);
     throw new SourceViewError(`源视图执行出错：${redactLakeSecrets((e as Error).message, spec).replaceAll(salt, '***')}`);
   } finally {
     session.close();
   }
+}
+
+/**
+ * 原始层表 table 最近提交的 limit 行，敏感列与预览一样是加盐哈希，去掉平台列（_op / _batch / _commit_ts / _synced_at）（给模型的表上下文用，ADR-0035）。
+ * 数据湖没初始化、表还没同步时抛出 SourceViewError（消息已抹掉凭据与盐，调用方也不应把它发给模型）
+ */
+export async function maskedSample(tenantId: string, sourceId: string, table: string, limit: number) {
+  const preview = await checkAndPreview(tenantId, sourceId, `SELECT * FROM ${ident(table)} ORDER BY _commit_ts DESC`, limit);
+  // 用原始层的全部平台列（含 _synced_at），不是源视图必须输出的 VIEW_PLATFORM_COLUMNS
+  return preview.rows.map(r => Object.fromEntries(Object.entries(r).filter(([k]) => !PLATFORM_COLUMNS.includes(k))));
 }
 
 /** 版本里存下的形状：输出列（不含平台列，映射对照字段用）与引用的原始层表（这些表同步后合并基于视图的映射） */
