@@ -1,9 +1,9 @@
 // 标准模型与映射的 HTTP 接缝：任何成员都能浏览标准模型；数据工程师在界面上编写映射（不合格的 YAML 被拒绝并给出位置），
 // 保存通过但检查有提示（notices）时新建与保存都留在页面上列出提示；
-// 新建页默认是按规则生成的草稿（源没有已采集的表时是模板），也能按所选的表与实体重新生成填进编辑框（不保存），详情页能把源表新增的列一键生成为扩展字段填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
+// 新建页默认是按规则生成的草稿（源没有已采集的表时是模板），也能按所选的表与实体重新生成或用模型生成（模型服务替身 app.setLlmFetch）填进编辑框（不保存），详情页能把源表新增的列一键生成为扩展字段填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
 // 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射（含勾选源列加的扩展字段、映射与引用字段的键空间）照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
 // 有发布权限的成员在详情页提议停用、由另一位确认，停用后可恢复，停用前列出受影响的指标与标签，列表标出待确认与已停用（ADR-0031）
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseDocument } from 'yaml';
 import { closeDb } from '../../app/.server/db/client';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
@@ -25,6 +25,7 @@ import { loginAs, resetDb, startApp, type TestApp } from './harness';
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
+afterEach(() => { app.setLlmFetch(undefined); vi.unstubAllEnvs(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 
 /** 开通租户，登记电商库（sql 先在源库里加表）并把表全部选入同步范围、采集完；返回租户与数据源 */
@@ -685,6 +686,43 @@ describe('按规则生成映射草稿', () => {
     expect(saved.status).toBe(302);
     const id = mappingIdOf(saved);
     expect(await (await engineer.get(`/mappings/${id}?tab=versions`)).text()).toContain('data-version-status="draft"');
+  });
+
+  it('新建页用模型生成草稿填进编辑框，不保存；确认后保存为草稿。模型输出不合 Schema 时显示错误、编辑框保持原内容；分析师 403', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
+    vi.stubEnv('LLM_MODEL', 'qwen-plus');
+    vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
+    const reply = (content: unknown) => app.setLlmFetch((async () => Response.json({ choices: [{ message: { content: JSON.stringify(content) } }] })) as typeof fetch);
+    reply({ fields: [
+      { field: 'order_id', expr: 'string(order_id)', confidence: 0.95, reason: '源表主键' },
+      { field: 'customer_id', expr: 'string(customer_id)', confidence: 0.9, reason: '同名列' },
+      { field: 'amount', expr: 'amount', confidence: 0.7, reason: '金额列' },
+    ] });
+    const engineer = await loginAs(app, 'de@acme.com');
+
+    const generated = await engineer.post('/mappings', { intent: 'model-draft', sourceId, table: 'orders', entity: 'order', yaml: '' });
+    expect(generated.status).toBe(200);
+    const html = await generated.text();
+    const yaml = editorYaml(html);
+    expect(yaml).toMatch(/^# 模型生成的草稿/);
+    expect(yaml).toContain('amount: amount # 金额列');
+    expect(html).toContain('还没有映射');
+
+    const saved = await engineer.post('/mappings', { intent: 'create', sourceId, yaml });
+    expect(saved.status).toBe(302);
+    expect(await (await engineer.get(`/mappings/${mappingIdOf(saved)}?tab=versions`)).text()).toContain('data-version-status="draft"');
+
+    reply({ fields: [] });
+    const rejected = await engineer.post('/mappings', { intent: 'model-draft', sourceId, table: 'customers', entity: 'customer', yaml: ORDERS });
+    expect(rejected.status).toBe(422);
+    const rejectedHtml = await rejected.text();
+    expect(rejectedHtml).toContain('模型生成草稿失败');
+    expect(editorYaml(rejectedHtml)).toBe(ORDERS);
+
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an@acme.com');
+    expect((await analyst.post('/mappings', { intent: 'model-draft', sourceId, table: 'orders', entity: 'order' })).status).toBe(403);
   });
 
   it('详情页用映射的表与实体重新生成，保存后替换草稿；选的表不存在时说明原因', async () => {

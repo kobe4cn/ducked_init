@@ -1,5 +1,5 @@
 // app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、已停用或待确认停用、目标自定义实体待补登、最近一次合并），
-// 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿，检查有提示（notices）时留在本页列出提示与新映射的入口；可按所选的表与实体按规则生成草稿填进编辑框，不保存；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
+// 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿，检查有提示（notices）时留在本页列出提示与新映射的入口；可按所选的表与实体按规则生成草稿填进编辑框，或用模型生成（复用已发布映射 > 模型 > 规则，ADR-0035），都不保存；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
 // 手动触发一次合并到标准层，以及主键冲突体检（silver.keycheck）：任何能看映射的成员都可以运行，报告按实体列出主键重叠的映射对
 import { AlertTriangle, CheckCircle2, CircleDashed, Layers, Loader2, PencilLine, Play, Plus, ScanSearch, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
@@ -9,7 +9,7 @@ import type { Route } from './+types/mappings';
 import { assertCan, can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { checkKeysNow, getKeyCheckStatus, KeyCheckError } from '~/.server/key-check';
-import { createMapping, defaultDraft, draftFor, listMappings, MappingError, mergeNow, referenceTables } from '~/.server/mappings';
+import { createMapping, defaultDraft, draftFor, listMappings, MappingError, mergeNow, modelDraftFor, referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
 import { SUGGESTION_LABELS } from '~/.server/pipeline/key-check-engine';
@@ -107,6 +107,14 @@ export async function action({ request }: Route.ActionArgs) {
         // 只生成、填进编辑框，不保存；draftId 让编辑框换成新内容
         const yaml = await draftFor(member, field('sourceId'), field('table'), field('entity'));
         return { error: null, issues: [], values: { sourceId: field('sourceId'), yaml }, draftId: crypto.randomUUID() };
+      }
+      case 'model-draft': {
+        // 复用 > 模型 > 规则，填进编辑框、不保存；生成记录的 ID 留给之后的比对
+        const draft = await modelDraftFor(member, field('sourceId'), field('table'), field('entity'));
+        return {
+          error: null, issues: [], values: { sourceId: field('sourceId'), yaml: draft.yaml }, draftId: crypto.randomUUID(),
+          generationId: draft.generationId, origin: draft.origin, notice: draft.notice ?? null,
+        };
       }
       case 'create': {
         const mapping = await createMapping(member, field('sourceId'), field('yaml'));
@@ -318,6 +326,7 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
               registered={registered}
               functions={functions}
               values={actionData?.values ?? { sourceId: sources[0]?.id ?? '', yaml: initialYaml }}
+              notice={(actionData && 'notice' in actionData && actionData.notice) || null}
               submitting={submitting}
             />
           </details>
@@ -351,12 +360,14 @@ const inputValue = (t: { name: string; view?: true }) => (t.view ? `${VIEW_PREFI
  * 新建映射的表单：选数据源、用表单或 YAML 编写映射。表与目标实体两个下拉框决定表单列哪些字段、对照面板显示什么（默认取 YAML 里写的），
  * 也是「按规则生成草稿」的输入；换选时一并写进 YAML 的 table / entity，保存时以 YAML 里写的为准
  */
-function NewMapping({ sources, tables, registered, functions, values, submitting }: {
+function NewMapping({ sources, tables, registered, functions, values, notice, submitting }: {
   sources: LoaderData['sources'];
   tables: LoaderData['tables'];
   registered: LoaderData['registered'];
   functions: LoaderData['functions'];
   values: { sourceId: string; yaml: string };
+  /** 用模型生成草稿时的提示（如没配置模型服务、已按规则生成） */
+  notice: string | null;
   submitting: boolean;
 }) {
   const [sourceId, setSourceId] = useState(values.sourceId);
@@ -401,12 +412,21 @@ function NewMapping({ sources, tables, registered, functions, values, submitting
         </div>
         <Field>
           <FieldLabel>映射</FieldLabel>
+          {notice && <p data-notice className="flex items-center gap-1.5 text-sm text-amber-600"><AlertTriangle aria-hidden className="size-4" />{notice}</p>}
           <MappingEditorWithReference defaultValue={values.yaml} value={yaml} onValueChange={setYaml} table={table} entity={entity} registered={registered} functions={functions} />
         </Field>
         <div className="flex gap-2">
           <Button type="submit" name="intent" value="create" disabled={submitting || !sources.length}>{submitting ? '正在处理…' : '校验并保存草稿'}</Button>
           <Button type="submit" name="intent" value="draft" variant="outline" disabled={submitting || !table || !!table.view} title={table?.view ? '按规则生成草稿要用源表的列统计，源视图请直接编写' : '按列名、类型与常见取值生成，替换编辑框里的内容；不会保存'}>
             按规则生成草稿
+          </Button>
+          <Button
+            type="submit" name="intent" value="model-draft" variant="outline" disabled={submitting || !table || !!table.view}
+            title={table?.view
+              ? '用模型生成草稿要用源表的列统计，源视图请直接编写'
+              : '会把表结构与列统计发给模型服务（打开「发送脱敏样本」时附 5 行脱敏样本）；结构与已发布映射一致时直接复用、不调用模型，没配置模型服务时按规则生成。替换编辑框里的内容，不会保存'}
+          >
+            用模型生成草稿
           </Button>
         </div>
       </FieldGroup>

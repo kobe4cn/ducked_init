@@ -577,3 +577,20 @@ export const llmCalls = platform.table('llm_calls', {
   error: text('error'),
   createdAt: createdAt(),
 }, t => [index('llm_calls_tenant_created_idx').on(t.tenantId, t.createdAt)]);
+
+// 映射草稿的生成记录（ADR-0035）：新建页「用模型生成草稿」每次成功生成一行。origin 是草稿从哪来：复用已发布映射（reuse）、
+// 没配置模型服务时按规则（rules）、模型（model）；items 是模型给的每项（fields.<字段>、dedupe、identity）的置信度与理由，非模型来源为 []。
+// yaml 是生成的映射内容本身（与 mapping_versions.yaml 同级）；mapping_id 在保存成映射后回填，映射删除时置空
+export const mappingGenerations = platform.table('mapping_generations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  sourceId: uuid('source_id').notNull().references(() => sources.id, { onDelete: 'cascade' }),
+  tableName: text('table_name').notNull(),
+  entity: text('entity').notNull(),
+  mappingId: uuid('mapping_id').references(() => mappings.id, { onDelete: 'set null' }),
+  origin: text('origin').$type<'reuse' | 'rules' | 'model'>().notNull(),
+  yaml: text('yaml').notNull(),
+  items: jsonb('items').$type<{ path: string; confidence: number; reason: string }[]>().notNull().default([]),
+  createdByEmail: text('created_by_email').notNull(),
+  createdAt: createdAt(),
+}, t => [index('mapping_generations_tenant_created_idx').on(t.tenantId, t.createdAt)]);

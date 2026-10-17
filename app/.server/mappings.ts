@@ -10,14 +10,17 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { allRelations, publishedCustomEntities, type RegisteredEntity, relationsFrom, relationsTo, uniqueKeys } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
-import { mappingIgnoredColumns, mappings, mappingVersions, sources, sourceTables, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
+import { mappingGenerations, mappingIgnoredColumns, mappings, mappingVersions, sources, sourceTables, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
+import { chatJson, LlmError, resolveProvider } from './llm';
+import { tableContextFor } from './model-provider';
 import { publishedDependents } from './dsl-dependencies';
 import { dryRun } from './pipeline/dry-run-engine';
 import { consumerSensitive, identityRules, type IdentitySummary } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { groupMemberOf, type MergeDrop, type MergeMappingParam, type MergeRecord, type RelationParam } from './pipeline/merge-engine';
 import { draftCustomMapping, draftMapping, DraftError, reuseMappingYaml } from './pipeline/mapping-draft';
+import { MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type DraftItem, type ModelDraft } from './pipeline/model-draft';
 import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import type { Rename } from './pipeline/schema-repair';
 import { diffColumns } from './pipeline/schema-diff';
@@ -35,7 +38,7 @@ import { newExtension, readExtensions, writeExtension } from '../lib/mapping-for
 
 /** 可以展示给成员的业务错误；issues 是映射文档里带行列位置的问题 */
 export class MappingError extends Error {
-  constructor(message: string, readonly status: 400 | 403 | 404 = 400, readonly issues: MappingIssue[] = []) { super(message); }
+  constructor(message: string, readonly status: 400 | 403 | 404 | 422 = 400, readonly issues: MappingIssue[] = []) { super(message); }
 }
 
 /** 映射详情的合并历史取最近多少次带这个映射的合并任务 */
@@ -189,23 +192,75 @@ async function reusableDraft(tenantId: string, sourceId: string, profiled: Profi
  * 成员确认修改后仍走保存校验与双人发布
  */
 export async function draftFor(actor: CurrentMember, sourceId: string, table: string, entity: string) {
+  return (await draftWithOrigin(actor, sourceId, table, entity)).yaml;
+}
+
+/** draftFor 的主体，另外告诉调用方草稿是复用来的（reuse）还是按规则生成的（rules） */
+async function draftWithOrigin(actor: CurrentMember, sourceId: string, table: string, entity: string): Promise<{ yaml: string; origin: 'reuse' | 'rules' }> {
   assertCan(actor, 'sources:write');
   await requireSource(actor.tenant.id, sourceId).catch(() => { throw new MappingError('请选择数据源'); });
   if (!table) throw new MappingError('请选择表');
   const profiled = (await profiledTables(actor.tenant.id, sourceId))(table);
   if (typeof profiled === 'string') throw new MappingError(profiled);
   const reused = await reusableDraft(actor.tenant.id, sourceId, profiled, entity);
-  if (reused) return reused;
+  if (reused) return { yaml: reused, origin: 'reuse' };
   const target = entityOf(entity);
-  if (target) return draftMapping(profiled.table, target, { key: profiled.key ?? undefined });
+  if (target) return { yaml: draftMapping(profiled.table, target, { key: profiled.key ?? undefined }), origin: 'rules' };
   // 自定义实体只认已发布的登记，与保存校验一致（ADR-0019）
   const registration = (await publishedCustomEntities(getDb(), actor.tenant.id)).get(entity);
   if (!registration) throw new MappingError(`只能为标准实体或已发布登记的自定义实体生成草稿，${entity} 都不是`);
   try {
-    return draftCustomMapping(profiled.table, registration);
+    return { yaml: draftCustomMapping(profiled.table, registration), origin: 'rules' };
   } catch (e) {
     throw e instanceof DraftError ? new MappingError(e.message) : e;
   }
+}
+
+/** 用模型生成的草稿：生成记录的 ID、草稿从哪来；没配置模型服务、按规则生成时带一句提示 */
+export interface ModelDraftResult { yaml: string; generationId: string; origin: 'reuse' | 'rules' | 'model'; notice?: string }
+
+/**
+ * 用模型生成映射草稿（ADR-0035）：按「复用已发布映射 > 模型 > 按规则」的顺序。复用命中时不调用模型；没配置模型服务时用规则草稿并提示；
+ * 否则把表上下文与规则草稿发给模型（purpose = mapping_draft），输出转成 YAML 后须过映射校验。成功时写一行生成记录，不保存映射。
+ * 模型失败或转出的 YAML 不过校验时记审计 mapping.model_draft_failed（不含提示词、模型原文与取值），抛 422
+ */
+export async function modelDraftFor(actor: CurrentMember, sourceId: string, table: string, entity: string): Promise<ModelDraftResult> {
+  const tenantId = actor.tenant.id;
+  const base = await draftWithOrigin(actor, sourceId, table, entity);
+  const record = async (origin: ModelDraftResult['origin'], yaml: string, items: DraftItem[] = []) => {
+    const [row] = await getDb().insert(mappingGenerations).values({
+      tenantId, sourceId, tableName: table, entity, origin, yaml, items, createdByEmail: actor.email,
+    }).returning({ id: mappingGenerations.id });
+    return { yaml, generationId: row.id, origin };
+  };
+  if (base.origin === 'reuse') return record('reuse', base.yaml);
+  if (!(await resolveProvider(tenantId))) return { ...await record('rules', base.yaml), notice: '未配置模型服务，已按规则生成' };
+
+  const context = await tableContextFor(tenantId, sourceId, table).catch((e: unknown) => {
+    throw new MappingError(e instanceof Error ? e.message : String(e));
+  });
+  const source = await requireSource(tenantId, sourceId);
+  const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
+    tenantId, actor, action: 'mapping.model_draft_failed', targetType: 'source', targetId: sourceId,
+    detail: { sourceId, source: source.name, table, entity, ...detail },
+  });
+  let out: ModelDraft;
+  try {
+    out = await chatJson<ModelDraft>(tenantId, 'mapping_draft', modelDraftMessages(context, entity, base.yaml), MODEL_DRAFT_SCHEMA);
+  } catch (e) {
+    if (!(e instanceof LlmError)) throw e;
+    await failed({ stage: 'model', error: e.message.slice(0, 200) });
+    throw new MappingError(`模型生成草稿失败：${e.message}`, 422);
+  }
+  const { yaml, items } = modelOutputToYaml(base.yaml, out);
+  try {
+    await checkMappingDraft(tenantId, sourceId, yaml);
+  } catch (e) {
+    if (!(e instanceof MappingError)) throw e;
+    await failed({ stage: 'mapping', issues: e.issues.length, paths: e.issues.slice(0, 10).map(i => i.path) });
+    throw new MappingError(`模型生成的映射有 ${e.issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, e.issues);
+  }
+  return record('model', yaml, items);
 }
 
 /**

@@ -107,6 +107,13 @@ const ACTIONS = {
     label: '忽略源表新列',
     describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，忽略新列 ${d.column}`,
   },
+  // 模型输出不合 Schema、请求失败或转出的映射不过校验（ADR-0035）：只记阶段、错误摘要与问题位置，不记提示词、模型原文与取值
+  'mapping.model_draft_failed': {
+    label: '模型生成映射草稿失败',
+    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，${d.stage === 'model'
+      ? `模型服务：${d.error}`
+      : `映射校验有 ${d.issues} 处问题`}`,
+  },
   'template.drafted': { label: '起草模板参数', describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版草稿` },
   'definition.drafted': { label: '起草指标或标签', describe: (d: Detail) => `${dslLabel(d)} ${d.key}，第 ${d.version} 版草稿` },
   'definition.published': {

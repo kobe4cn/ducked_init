@@ -166,6 +166,6 @@ export async function publishPassthrough(actor: CurrentMember, entityId: string,
 
 /** 映射的问题转成实体页能回显的 CustomEntityError */
 function rethrow(e: unknown): never {
-  if (e instanceof MappingError) throw new CustomEntityError([e.message, ...e.issues.map(i => `${i.path}：${i.message}`)].join('；'), e.status);
+  if (e instanceof MappingError) throw new CustomEntityError([e.message, ...e.issues.map(i => `${i.path}：${i.message}`)].join('；'), e.status === 422 ? 400 : e.status);
   throw e;
 }
