@@ -48,6 +48,12 @@ const ACTIONS = {
   // 只记名称与前缀，明文只在创建那次响应里出现
   'api_key.created': { label: '创建 API Key', describe: apiKeyLabel },
   'api_key.revoked': { label: '吊销 API Key', describe: apiKeyLabel },
+  // 不记 API Key，只记是否轮换
+  'model_provider.updated': {
+    label: '修改模型服务',
+    describe: (d: Detail) => `${d.baseUrl}，模型 ${d.model}${d.credentialsRotated ? '，轮换 API Key' : ''}`,
+  },
+  'model_provider.reset': { label: '恢复平台默认模型服务', describe: () => '清空本租户的端点、模型名与 API Key' },
   'source.registered': { label: '登记数据源', describe: (d: Detail) => `「${d.name}」（${sourceKindLabel(d.kind)}），${d.tables} 张表` },
   'source.updated': {
     label: '修改数据源',

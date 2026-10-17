@@ -20,6 +20,8 @@ export interface TestApp {
   setMailer(mailer: { send(m: Mail): Promise<void> } | undefined): void;
   /** 重新把邮件收进 outbox */
   useTestMailer(): void;
+  /** 替换模型服务的 fetch；传 undefined 恢复默认替身（直接报错，不会真的请求填写的端点） */
+  setLlmFetch(f: typeof fetch | undefined): void;
   /** 等待后台任务（签发链接、发信）全部完成 */
   drain(): Promise<void>;
   client(): Client;
@@ -96,11 +98,15 @@ export async function startApp(): Promise<TestApp> {
   const outbox: Mail[] = [];
   const testMailer = { async send(m: Mail) { outbox.push(m); } };
   mailer.setMailer(testMailer);
+  const llm = await vite.ssrLoadModule('/app/.server/llm.ts');
+  const noLlm = (async () => { throw new Error('测试没有设置模型服务替身（app.setLlmFetch）'); }) as typeof fetch;
+  llm.setLlmFetch(noLlm);
 
   return {
     outbox,
     setMailer: m => mailer.setMailer(m),
     useTestMailer: () => mailer.setMailer(testMailer),
+    setLlmFetch: f => llm.setLlmFetch(f ?? noLlm),
     drain: () => background.drain(),
     client: () => new Client(req => handler(req)),
     async close() {

@@ -26,6 +26,7 @@ export default [
   route('audit', 'routes/audit.tsx'),
   route('pii/reveal', 'routes/pii.reveal.tsx'),
   route('api-keys', 'routes/api-keys.tsx'),
+  route('model-provider', 'routes/model-provider.tsx'),
   route('api/v1/catalog', 'routes/api.v1.catalog.tsx'),
   route('api/v1/consumers/:consumerId', 'routes/api.v1.consumers.$id.tsx'),
   route('login', 'routes/login.tsx'),

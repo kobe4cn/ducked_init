@@ -29,16 +29,26 @@ export function setLlmFetch(f: typeof fetch | undefined) { fetchOverride = f; }
 
 const llmFetch = () => fetchOverride ?? fetch;
 
-/** 租户填了端点就整套用租户的，否则三个环境变量都有才用平台默认；都没有返回 null */
+/** 选哪一套：租户填了端点就整套用租户的，否则三个环境变量都有才用平台默认；都没有返回 null。不解密，模型服务页也用它 */
+export function providerSource(row: { baseUrl: string | null } | undefined): LlmProvider['source'] | null {
+  if (row?.baseUrl) return 'tenant';
+  const { LLM_BASE_URL, LLM_MODEL, LLM_API_KEY } = process.env;
+  return LLM_BASE_URL && LLM_MODEL && LLM_API_KEY ? 'platform' : null;
+}
+
+/** 按 providerSource 选出的那一套端点、模型与 Key（租户的 Key 解密后返回）；都没有返回 null */
 export async function resolveProvider(tenantId: string): Promise<LlmProvider | null> {
   const [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, tenantId));
-  if (row?.baseUrl) {
-    const apiKey = row.apiKey ? (await decryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, row.apiKey)).apiKey : '';
-    return { baseUrl: row.baseUrl, model: row.model ?? '', apiKey, source: 'tenant' };
+  switch (providerSource(row)) {
+    case 'tenant': {
+      const apiKey = row.apiKey ? (await decryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, row.apiKey)).apiKey : '';
+      return { baseUrl: row.baseUrl!, model: row.model ?? '', apiKey, source: 'tenant' };
+    }
+    case 'platform':
+      return { baseUrl: process.env.LLM_BASE_URL!, model: process.env.LLM_MODEL!, apiKey: process.env.LLM_API_KEY!, source: 'platform' };
+    default:
+      return null;
   }
-  const { LLM_BASE_URL: baseUrl, LLM_MODEL: model, LLM_API_KEY: apiKey } = process.env;
-  if (baseUrl && model && apiKey) return { baseUrl, model, apiKey, source: 'platform' };
-  return null;
 }
 
 const ajv = new Ajv({ allErrors: true, strict: false });
