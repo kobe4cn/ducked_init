@@ -231,9 +231,23 @@ describe('记录成员对生成草稿的修改', () => {
       generationId: draft.generationId, origin: 'model', mappingId: mapping.id, version: 1, source: '门店1', table: 'orders', entity: 'order', generationValid: true,
       added: [], removed: ['created_at'], changed: [{ name: 'amount', fields: ['expr'] }],
       key: false, latest: false, identity: false, keySpace: false, survivorship: false, where: false,
+      assertions: { added: [], removed: [], changed: [] },
     });
     expect(JSON.stringify(audit.detail)).not.toMatch(/amount \*|refunded|string\(/);
     expect((await generations(acme))[0].mappingId).toBe(mapping.id);
+  });
+
+  it('生成后只加了自定义断言再保存：审计记下断言名，不记 min / max / values', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    platformDefault();
+    fakeFetch(completion(MODEL_ORDERS));
+    const draft = await modelDraftFor(author, sourceId, 'orders', 'order');
+    const yaml = `${draft.yaml}\nassertions:\n  - { field: amount, check: range, min: 12345, level: error }\n`;
+
+    await createMapping(author, sourceId, yaml, { generationId: draft.generationId });
+    const [audit] = await edits(acme);
+    expect(audit.detail).toMatchObject({ added: [], removed: [], changed: [], assertions: { added: ['custom:amount:range'], removed: [], changed: [] } });
+    expect(JSON.stringify(audit.detail)).not.toContain('12345');
   });
 
   it('原样保存不记审计，生成记录照样回填映射', async () => {

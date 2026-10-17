@@ -183,6 +183,83 @@ colour: red
   });
 });
 
+describe('映射级自定义断言 assertions', () => {
+  // x_phone 是敏感扩展字段
+  const withAssertions = (lines: string) =>
+    `${ok}extensions:\n  x_phone: { type: string, expr: string(customer_id), sensitive: true }\nassertions:\n${lines}`;
+  const paths = (lines: string) => issues(withAssertions(lines)).map(i => [i.path, i.message]);
+
+  it('合法的断言带进合并计划；不写 assertions 的映射计划里没有这一项', () => {
+    const r = checkMapping(withAssertions(`  - { field: amount, check: range, min: 0, level: error }
+  - { field: created_at, check: range, min: '2020-01-01', max: '2030-12-31T00:00:00Z', level: warn }
+  - { field: status, check: in, values: [paid, refunded], level: warn }
+  - { field: x_phone, check: not_null, level: error }
+  - { field: x_phone, check: unique, level: warn }
+`), columns);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.plan.assertions).toEqual([
+      { field: 'amount', check: 'range', min: 0, level: 'error' },
+      { field: 'created_at', check: 'range', min: '2020-01-01', max: '2030-12-31T00:00:00Z', level: 'warn' },
+      { field: 'status', check: 'in', values: ['paid', 'refunded'], level: 'warn' },
+      { field: 'x_phone', check: 'not_null', level: 'error' },
+      { field: 'x_phone', check: 'unique', level: 'warn' },
+    ]);
+    const plain = checkMapping(ok, columns);
+    expect(plain.ok && 'assertions' in plain.plan).toBe(false);
+  });
+
+  it('min / max 只配 range、values 只配 in，check 与 level 只能是给定的几种', () => {
+    expect(paths(`  - { field: amount, check: not_null, min: 0, level: error }
+  - { field: status, check: range, values: [paid], max: 1, level: error }
+  - { field: status, check: between, level: fatal }
+`)).toEqual([
+      ['assertions.0.min', 'min 只能用于 check: range'],
+      ['assertions.1.values', 'values 只能用于 check: in'],
+      ['assertions.2.check', expect.stringContaining('not_null、unique、range、in')],
+      ['assertions.2.level', expect.stringContaining('error、warn')],
+    ]);
+    expect(paths('  - { field: status, check: in, level: warn }\n')).toEqual([['assertions.0', '缺少 values']]);
+  });
+
+  it('字段必须是映射出来的；range 只用于数值、日期与时间字段，in 只用于文本字段且取值在标准枚举里', () => {
+    expect(paths(`  - { field: amout, check: not_null, level: error }
+  - { field: status, check: range, min: 0, level: error }
+  - { field: amount, check: in, values: ['1'], level: warn }
+  - { field: status, check: in, values: [paid, lost], level: warn }
+  - { field: created_at, check: range, level: warn }
+  - { field: amount, check: range, min: 10, max: 1, level: warn }
+`)).toEqual([
+      ['assertions.0.field', expect.stringMatching(/amout 不是本映射映射出来的字段.*amount/)],
+      ['assertions.1.check', expect.stringContaining('range 只能用于数值、日期或时间字段')],
+      ['assertions.2.check', expect.stringContaining('in 只能用于文本字段')],
+      ['assertions.3.values.1', expect.stringContaining('lost 不是 status 的标准取值')],
+      ['assertions.4', 'range 至少要写 min 或 max'],
+      ['assertions.5', 'min 不能大于 max'],
+    ]);
+  });
+
+  it('min / max 的写法要与字段类型一致：数值字段写数字，日期与时间字段写日期', () => {
+    expect(paths(`  - { field: amount, check: range, min: '0', level: error }
+  - { field: created_at, check: range, max: 5, level: error }
+`)).toEqual([
+      ['assertions.0.min', expect.stringContaining('数字')],
+      ['assertions.1.max', expect.stringContaining('日期')],
+    ]);
+    expect(paths('  - { field: created_at, check: range, min: not-a-date, level: error }\n')).toEqual([['assertions.0.min', expect.stringContaining('日期')]]);
+  });
+
+  it('敏感字段只允许 not_null / unique；同一字段的同一种检查只能写一次', () => {
+    expect(paths(`  - { field: x_phone, check: in, values: ['1'], level: warn }
+  - { field: amount, check: not_null, level: error }
+  - { field: amount, check: not_null, level: warn }
+`)).toEqual([
+      ['assertions.0.check', expect.stringContaining('敏感字段')],
+      ['assertions.2', expect.stringContaining('amount 的 not_null 已经写过')],
+    ]);
+  });
+});
+
 describe('键空间', () => {
   /** 订单：主键与指向消费者的 customer_id 都可以带键空间 */
   const order = `${ok}key_space: pos\n`.replace('  customer_id: customer_id\n', '  customer_id: { expr: string(customer_id), key_space: crm }\n');

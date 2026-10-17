@@ -1,7 +1,9 @@
-// app/.server/pipeline/dry-run-engine.ts —— 映射空跑：取原始层里源表最新、未删除的前 N 条记录，按合并计划转换，返回样例行与基础断言。
+// app/.server/pipeline/dry-run-engine.ts —— 映射空跑：取原始层里源表最新、未删除的前 N 条记录，按合并计划转换，返回样例行、基础断言与映射里声明的自定义断言（只有不合格行数）。
 // 中间表只放在会话的本机库 stage 里，不写标准层、当前记录与合并日志 silver._merges，可以在只读挂载的数据湖上运行。
 // 输入是源视图时样本取自视图的结果（sourceView 是视图最新的已发布版本）。转换与合并共用 merge-engine 的同一套步骤，敏感字段同样换成按租户加盐的哈希，样例行里没有明文（ADR-0005）
 import type { DuckDBConnection } from '@duckdb/node-api';
+import type { AssertionResult } from './assertions';
+import { evalCustomAssertions } from './custom-assertions';
 import type { MergePlan } from './mapping-spec';
 import { liveRecords, mappingInput, sensitiveColumns, transformRows, unknownValues, type FallbackStat, type SourceViewParam } from './merge-engine';
 
@@ -26,6 +28,8 @@ export interface DryRunResult {
     /** 必填字段各有几行为空 */
     requiredNulls: Record<string, number>;
     unknownValues: DryRunUnknown[];
+    /** 映射里声明的自定义断言，按声明顺序；老版本的计划没有断言时为空 */
+    custom: AssertionResult[];
   };
 }
 
@@ -64,6 +68,7 @@ export async function dryRun(
       if (stat) unknown.push({ ...stat, fallback: c.otherwise !== undefined });
     }
     await transformRows(con, plan, salt, { live: SAMPLE, into: ROWS });
+    const custom = await evalCustomAssertions(con, ROWS, plan.entity, plan.assertions ?? []);
 
     const names = plan.columns.map(c => c.name);
     const [stats] = await rows<Record<string, string>>(con, `SELECT count(*) AS _rows,
@@ -85,6 +90,7 @@ export async function dryRun(
         keyDuplicates: Number(keyDuplicates),
         requiredNulls: Object.fromEntries(columns.filter(c => c.required).map(c => [c.name, c.nulls])),
         unknownValues: unknown,
+        custom,
       },
     };
   } finally {

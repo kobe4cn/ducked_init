@@ -1,4 +1,4 @@
-// 映射两个版本合并计划的差异：列的新增 / 删除 / 改动（类型、表达式、值字典、兜底、敏感标记），去重键、取最新字段、身份打通匹配字段、属性取舍名次、行过滤的变化；
+// 映射两个版本合并计划的差异：列的新增 / 删除 / 改动（类型、表达式、值字典、兜底、敏感标记），去重键、取最新字段、身份打通匹配字段、属性取舍名次、行过滤的变化，自定义断言的增删改；
 // 没有已发布版本时是首个版本（纯函数）
 import { describe, expect, it } from 'vitest';
 import type { MergePlan } from '../app/.server/pipeline/mapping-spec';
@@ -28,7 +28,7 @@ describe('映射版本差异', () => {
     const next = plan({
       columns: prev.columns.map(c => (c.name === 'status' ? { ...c, dictionary: { refunded: 'refunded', paid: 'paid' }, enum: ['paid'] } : c)),
     });
-    expect(diffPlans(prev, next)).toEqual({ first: false, added: [], removed: [], changed: [], key: null, latest: null, identity: null, keySpace: null, survivorship: null, where: null, empty: true });
+    expect(diffPlans(prev, next)).toEqual({ first: false, added: [], removed: [], changed: [], key: null, latest: null, identity: null, keySpace: null, survivorship: null, where: null, assertions: { added: [], removed: [], changed: [] }, empty: true });
   });
 
   it('列出新增、删除的列和改了哪些属性的列', () => {
@@ -101,5 +101,31 @@ describe('映射版本差异', () => {
     expect(diffPlans(prev, ref)).toMatchObject({ changed: [], empty: true });
     const next = plan({ columns: ref.columns.map(c => (c.name === 'email' ? { ...c, customerSource: 'src-mall' } : c)) });
     expect(diffPlans(ref, next)).toMatchObject({ changed: [{ name: 'email', fields: ['customerSource'] }], empty: false });
+  });
+
+  it('自定义断言按 custom:<字段>:<检查> 比较增、删、改；只有已发布版本没有断言时也照常比较', () => {
+    const prev = plan({
+      assertions: [
+        { field: 'status', check: 'in', values: ['paid'], level: 'warn' },
+        { field: 'order_id', check: 'not_null', level: 'error' },
+        { field: 'email', check: 'unique', level: 'warn' },
+      ],
+    });
+    const next = plan({
+      assertions: [
+        { field: 'status', check: 'in', values: ['paid', 'refunded'], level: 'warn' },
+        { field: 'order_id', check: 'not_null', level: 'error' },
+        { field: 'order_id', check: 'unique', level: 'error' },
+      ],
+    });
+    expect(diffPlans(prev, next)).toMatchObject({
+      assertions: { added: ['custom:order_id:unique'], removed: ['custom:email:unique'], changed: ['custom:status:in'] }, empty: false,
+    });
+    expect(diffPlans(plan(), plan({ assertions: [{ field: 'order_id', check: 'not_null', level: 'warn' }] })))
+      .toMatchObject({ assertions: { added: ['custom:order_id:not_null'], removed: [], changed: [] } });
+    const range = (min: number, level: 'error' | 'warn' = 'error') => plan({ assertions: [{ field: 'amount', check: 'range', min, level }] });
+    expect(diffPlans(range(0), range(1))).toMatchObject({ assertions: { changed: ['custom:amount:range'] } });
+    expect(diffPlans(range(0), range(0, 'warn'))).toMatchObject({ assertions: { changed: ['custom:amount:range'] } });
+    expect(diffPlans(range(0), range(0))).toMatchObject({ empty: true });
   });
 });

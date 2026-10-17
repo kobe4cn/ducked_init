@@ -327,6 +327,26 @@ describe('编写与发布映射', () => {
     expect((await (await loginAs(app, 'de@globex.com')).post(`/mappings/${id}`, { intent: 'dryrun', version: '1' })).status).toBe(404);
   });
 
+  it('空跑面板逐条列出映射里的自定义断言：名称、级别与不合格行数，不显示取值', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await memberOf(tenantId, 'de@acme.com');
+    const author = await loginAs(app, 'de@acme.com');
+    const yaml = `${ORDERS}assertions:
+  - { field: order_id, check: not_null, level: error }
+  - { field: amount, check: range, max: -1, level: warn }
+`;
+    const id = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml }));
+    await confirmWatermark(engineer, sourceId, 'orders', 'order_id');
+    await syncSource(engineer, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const html = await (await author.post(`/mappings/${id}`, { intent: 'dryrun', version: '1' })).text();
+    const panel = html.slice(html.indexOf('data-dryrun="1"'));
+    expect(panel).toMatch(/data-assertion="custom:order_id:not_null" data-ok="true"/);
+    expect(panel).toContain('自定义：订单 ID 非空（错误级）：样本里都合格');
+    expect(panel).toMatch(/data-assertion="custom:amount:range" data-ok="false"/);
+    expect(panel).toMatch(/自定义：实付金额 取值范围（警告级）：样本里有 \d+ 行不合格/);
+  });
+
   it('发布者不能是最后保存草稿的人：A 起草、B 修改后 A 能发布、B 不能，反过来也一样', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const a = await loginAs(app, 'de@acme.com');
@@ -411,6 +431,12 @@ describe('编写与发布映射', () => {
     expect(filtered).not.toContain('data-diff-item="none"');
     expect(filtered).toContain('data-diff-item="where"');
     expect(filtered).toContain('amount &gt; 0');
+    // 只加自定义断言时列出断言名，不显示 min
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: `${ORDERS}assertions:\n  - { field: amount, check: range, min: 12345, level: error }\n` })).status).toBe(302);
+    const asserted = await (await reviewer.get(`/mappings/${id}`)).text();
+    const draftDiff = asserted.slice(asserted.indexOf('data-draft-diff'), asserted.indexOf('</section>', asserted.indexOf('data-draft-diff')));
+    expect(draftDiff).toContain('data-diff-item="added-custom:amount:range"');
+    expect(draftDiff).not.toContain('12345');
     // 查看已发布的 v1 时不展示
     expect(await (await reviewer.get(`/mappings/${id}?version=1`)).text()).not.toContain('data-draft-diff');
   });
@@ -809,7 +835,7 @@ describe('按规则生成映射草稿', () => {
     expect(await rejected.text()).toContain('读源视图的映射请直接编辑');
   });
 
-  it('生成草稿后改了再保存：表单带着生成记录，审计页显示修改了模型 / 规则生成的映射草稿与改动的字段数；校验不过时仍带着', async () => {
+  it('生成草稿后改了再保存：表单带着生成记录，审计页显示修改了模型 / 规则生成的映射草稿、改动的字段数与是否改了断言；校验不过时仍带着', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const engineer = await loginAs(app, 'de@acme.com');
     const hiddenGeneration = (html: string) => html.match(/<input type="hidden" name="generationId" value="([0-9a-f-]{36})"/)?.[1];
@@ -822,7 +848,7 @@ describe('按规则生成映射草稿', () => {
     const html = await (await engineer.post('/mappings', { intent: 'model-draft', sourceId, table: 'orders', entity: 'order', yaml: '' })).text();
     const generationId = hiddenGeneration(html)!;
     expect(generationId).toBeDefined();
-    const yaml = editorYaml(html).replace(/amount: amount.*/, 'amount: amount / 100');
+    const yaml = `${editorYaml(html).replace(/amount: amount.*/, 'amount: amount / 100')}\nassertions:\n  - { field: amount, check: range, min: 0, level: error }\n`;
     const invalid = await engineer.post('/mappings', { intent: 'create', sourceId, yaml: yaml.replace('amount / 100', 'nope'), generationId });
     expect(invalid.status).toBe(400);
     expect(hiddenGeneration(await invalid.text())).toBe(generationId);
@@ -839,7 +865,7 @@ describe('按规则生成映射草稿', () => {
 
     const audit = await (await loginAs(app, 'admin@acme.com')).get('/audit').then(r => r.text());
     expect(audit).toContain('修改了模型 / 规则生成的映射草稿');
-    expect(audit).toContain('「电商库」orders → 订单，第 1 版：修改了模型生成的映射草稿，改动 1 个字段');
+    expect(audit).toContain('「电商库」orders → 订单，第 1 版：修改了模型生成的映射草稿，改动 1 个字段，并改了自定义断言');
     expect(audit).toContain('「电商库」orders → 订单，第 1 版：修改了规则生成的映射草稿，改动 1 个字段');
     expect(audit).not.toContain('amount / 100');
   });

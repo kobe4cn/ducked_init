@@ -132,6 +132,27 @@ describe('映射空跑', () => {
     expect(result.assertions.unknownValues).toEqual([{ column: 'status', values: [{ value: '已退款', rows: 1 }], distinct: 1, rows: 1, fallback: true }]);
   });
 
+  it('映射里的自定义断言逐条给出样例里的不合格行数，结果不带取值与 min / max / values', async () => {
+    const { author, id } = await syncedSource();
+    const log = await createMapping(author, id, `${ORDER_LOG_MAPPING}assertions:
+  - { field: amount, check: range, min: 10, level: error }
+  - { field: status, check: not_null, level: warn }
+  - { field: status, check: in, values: [paid], level: warn }
+  - { field: order_id, check: unique, level: warn }
+`);
+    const result = await dryRunMapping(author, log.id, 1);
+    // 样本 3 条：A1 19.90 已支付、A1 19.90 已退款（落入兜底为空）、A2 5.00 已支付
+    expect(result.assertions.custom).toEqual([
+      { name: 'custom:amount:range', level: 'error', entity: 'order', failed: 1, detail: 'amount' },
+      { name: 'custom:status:not_null', level: 'warn', entity: 'order', failed: 1, detail: 'status' },
+      { name: 'custom:status:in', level: 'warn', entity: 'order', failed: 0, detail: 'status' },
+      { name: 'custom:order_id:unique', level: 'warn', entity: 'order', failed: 1, detail: 'order_id' },
+    ]);
+    // 没写断言的映射（含已发布的老版本）custom 为空
+    const plain = await createMapping(author, id, ORDERS);
+    expect((await dryRunMapping(author, plain.id, 1)).assertions.custom).toEqual([]);
+  });
+
   it('空跑前后标准层与合并日志不变', async () => {
     const { acme, author, reviewer, id } = await syncedSource();
     const orders = await publish(author, reviewer, id, ORDERS);

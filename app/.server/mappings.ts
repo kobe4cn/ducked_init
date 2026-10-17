@@ -440,6 +440,7 @@ async function recordGenerationEdit(
       source: source.name, table: mapping.tableName, entity: mapping.entity, generationValid: checked.ok,
       added: diff.added, removed: diff.removed, changed: diff.changed,
       key: !!diff.key, latest: !!diff.latest, identity: !!diff.identity, keySpace: !!diff.keySpace, survivorship: !!diff.survivorship, where: !!diff.where,
+      assertions: diff.assertions,
     },
   });
 }

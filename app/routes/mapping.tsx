@@ -23,6 +23,8 @@ import { fallbackText } from '~/lib/fallback';
 import { functionList } from '~/lib/mapping-expr';
 import { isEnumField } from '~/lib/mapping-form';
 import type { ColumnField, PlanDiff } from '~/lib/mapping-diff';
+import type { AssertionResult } from '~/.server/pipeline/assertions';
+import type { CustomCheck } from '~/.server/pipeline/custom-assertions';
 import type { DryRunResult } from '~/.server/pipeline/dry-run-engine';
 import type { FallbackStat, GroupStat } from '~/.server/pipeline/merge-engine';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
@@ -277,7 +279,20 @@ function Assertion({ name, ok, severe, children }: { name: string; ok: boolean; 
   );
 }
 
-/** 空跑结果：基础断言与转换后的样例行（敏感字段是加盐哈希，空值显示为 —） */
+const CUSTOM_CHECK_LABELS: Record<CustomCheck, string> = { not_null: '非空', unique: '唯一', range: '取值范围', in: '取值在列表内' };
+
+/** 自定义断言的结果：名称是 custom:<字段>:<检查>，只显示级别与不合格行数，不显示取值 */
+function CustomAssertionItem({ result, label }: { result: AssertionResult; label: (name: string) => string }) {
+  const [, field, check] = result.name.split(':');
+  const title = `自定义：${label(field)} ${CUSTOM_CHECK_LABELS[check as CustomCheck] ?? check}（${result.level === 'error' ? '错误级' : '警告级'}）`;
+  return (
+    <Assertion name={result.name} ok={!result.failed} severe={result.level === 'error'}>
+      {result.failed ? `${title}：样本里有 ${result.failed} 行不合格` : `${title}：样本里都合格`}
+    </Assertion>
+  );
+}
+
+/** 空跑结果：基础断言、自定义断言与转换后的样例行（敏感字段是加盐哈希，空值显示为 —） */
 function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult & { version: number } }) {
   const { assertions: a, columns, rows, sampled } = result;
   const label = (name: string) => entityOf(entity)?.fields.find(f => f.name === name)?.label ?? name;
@@ -299,6 +314,7 @@ function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult 
             {u.fallback ? columnFallbackText(entity, u) : `${columnFallbackText(entity, u, '不在值字典里')}，没写兜底值，合并会失败`}
           </Assertion>
         ))}
+        {a.custom.map(r => <CustomAssertionItem key={r.name} result={r} label={label} />)}
       </ul>
       <div className="overflow-x-auto rounded-2xl border bg-white">
         <Table>
@@ -436,6 +452,9 @@ function DraftDiff({ entity, version, diff }: { entity: string; version: number;
           {diff.keySpace && <li data-diff-item="key-space">键空间：{codeText(diff.keySpace.from)} → {codeText(diff.keySpace.to)}</li>}
           {diff.survivorship && <li data-diff-item="survivorship">属性取舍名次：{diff.survivorship.from ?? '—'} → {diff.survivorship.to ?? '—'}</li>}
           {diff.where && <li data-diff-item="where">行过滤：{codeText(diff.where.from)} → {codeText(diff.where.to)}</li>}
+          {diff.assertions.added.map(n => <li key={`added-${n}`} data-diff-item={`added-${n}`}>新增断言 {codeText(n)}</li>)}
+          {diff.assertions.removed.map(n => <li key={`removed-${n}`} data-diff-item={`removed-${n}`}>删除断言 {codeText(n)}</li>)}
+          {diff.assertions.changed.map(n => <li key={`changed-${n}`} data-diff-item={`changed-${n}`}>断言 {codeText(n)} 改了级别或取值条件</li>)}
         </ul>
       )}
     </section>

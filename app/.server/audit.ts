@@ -116,12 +116,13 @@ const ACTIONS = {
       ? `模型服务：${d.error}`
       : `映射校验有 ${d.issues} 处问题`}`,
   },
-  // 成员保存从生成草稿开始改过的映射（ADR-0003、ADR-0035）：只记字段名与哪些属性改了，这里只显示字段数
+  // 成员保存从生成草稿开始改过的映射（ADR-0003、ADR-0035）：只记字段名、哪些属性改了与增删改的断言名，这里只显示字段数与是否改了断言
   'mapping.generation_edited': {
     label: '修改了模型 / 规则生成的映射草稿',
     describe: (d: Detail) => {
       const fields = (d.added as string[]).length + (d.removed as string[]).length + (d.changed as unknown[]).length;
-      const also = [d.key && '去重键', d.identity && '身份规则'].filter(Boolean);
+      const assertions = d.assertions as { added: string[]; removed: string[]; changed: string[] } | undefined;
+      const also = [d.key && '去重键', d.identity && '身份规则', assertions && Object.values(assertions).some(l => l.length) && '自定义断言'].filter(Boolean);
       return `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版：修改了${GENERATION_ORIGIN[d.origin as keyof typeof GENERATION_ORIGIN] ?? '生成的'}映射草稿，`
         + `改动 ${fields} 个字段${also.length ? `，并改了${also.join('与')}` : ''}`;
     },

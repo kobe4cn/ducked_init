@@ -15,8 +15,11 @@
 
 **隔离区。** error 或 warn 断言失败时，每条断言最多 100 行不合格行写进湖里的 `silver._quarantine`（`assertion, level, entity, key, row JSON, task_id, at`；`key` 是标准模型主键，多列用逗号连接，`row` 是 `to_json` 的整行）。error 失败时先写隔离区再让任务失败。`order_customer_link` 写关联不上的订单（customer_id 为空的也算），`row_drop` 不写行，`points_balance` 写会员号与 `{ points, sum_change, last_balance, diff }`，`points_chain` 写断档的流水（带上一笔余额 `previous_balance`）。只从标准层取样，敏感字段只有哈希（ADR-0005），不回原始层取。没标成敏感的扩展字段在标准层里仍是明文（ADR-0005「还没做的」），会随整行进隔离区并显示在页面上。有 `sources:read` 的成员在「数据质量」页（`/quality`）看最近 20 次运行记录与最近 200 行隔离区样本，请求内只读挂载本租户数据湖。隔离区带行内容，删除请求要把该消费者在这张表里的行一起删掉（#24）；整湖擦除时两张表随湖删除（ADR-0020）。
 
+**映射级自定义断言（#221）。** 内置断言之外，成员可以在映射 YAML 里写 `assertions:`，给本映射映射出的字段声明检查，例如 `- { field: amount, check: range, min: 0, level: error }`。检查有四种：`not_null`、`unique`（出现不止一次的非空值个数）、`range`（`min` / `max`，至少一个；数值字段写数字，日期与时间字段写日期文本）、`in`（`values`，只用于文本字段，有标准枚举时取值都在枚举里）；`level` 是 `error` 或 `warn`；断言名固定为 `custom:<字段>:<检查>`，同一字段的同一种检查只能写一次。敏感字段在标准层是哈希（ADR-0005），只能用 `not_null` / `unique`。断言是映射的一部分（ADR-0015）：随映射草稿一起校验、空跑（空跑结果的 `assertions.custom` 给出样例里的不合格行数）、双人发布，写进合并计划的 `assertions`；版本差异按断言名记增删改，级别或取值条件变了算改，差异、审计与页面只出现断言名和行数，不出现 `values` / `min` / `max` 与取值。已发布的老版本计划没有这一项，读取一律按空处理。合并时执行放在下一张票，计算由 `custom-assertions.ts` 的 `evalCustomAssertions` 统一提供。
+
 ## 后果
 
 - 一次坏数据会挡住读到该实体的所有结果层任务，直到源数据修正、重新合并；告警是唯一的提示，管理员要处理。
 - 每个结果层任务多几次全表扫描（主键分组、金额过滤）；实体很大时再考虑按批次增量检查。
 - 新增断言只改 `assertions.ts`，邮件与审计按断言名的标签展示。
+- 自定义断言写在映射里，改断言要走映射的草稿与双人发布；断言的计算只在 `custom-assertions.ts`。

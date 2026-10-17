@@ -13,6 +13,7 @@ import {
 } from '../../lib/canonical-model';
 import { fieldsForColumn, normalizeName, similarFields, similarNames, standardValue } from '../../lib/field-synonyms';
 import { ExprError, FUNCTIONS, KIND_FIELD_TYPES, kindOf, parseExpression, ref, referencedColumns, type Expr } from '../../lib/mapping-expr';
+import { CUSTOM_CHECKS, customAssertionName, type CustomAssertion } from './custom-assertions';
 
 /** 字段的写法：表达式本身，或带值字典（与兜底值）、键空间的对象 */
 export type FieldSpec = string | { expr: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean; key_space?: string; customer_source?: string };
@@ -41,6 +42,8 @@ export interface MappingSpec {
   survivorship?: Survivorship;
   /** 行过滤（ADR-0024）：返回布尔的表达式，不满足（含取值为空）的源记录不进标准层 */
   where?: string;
+  /** 映射级自定义断言（ADR-0026）：给映射出的字段声明的检查，同一字段的同一种检查只能写一次 */
+  assertions?: CustomAssertion[];
 }
 
 /** 身份打通的匹配规则：按优先级排列的匹配字段 */
@@ -68,6 +71,25 @@ const fieldSpec = {
       customer_source: { type: 'string', minLength: 1 },
     },
   },
+};
+
+/** 自定义断言：min / max 只配 range，values 只配 in（写错时报在多出来的那一项上） */
+const customAssertion = {
+  type: 'object',
+  required: ['field', 'check', 'level'],
+  additionalProperties: false,
+  properties: {
+    field: { type: 'string', minLength: 1 },
+    check: { enum: CUSTOM_CHECKS },
+    level: { enum: ['error', 'warn'] },
+    min: { type: ['number', 'string'] },
+    max: { type: ['number', 'string'] },
+    values: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 } },
+  },
+  allOf: [
+    { if: { required: ['check'], properties: { check: { const: 'range' } } }, then: {}, else: { properties: { min: false, max: false } } },
+    { if: { required: ['check'], properties: { check: { const: 'in' } } }, then: { required: ['values'] }, else: { properties: { values: false } } },
+  ],
 };
 
 /** 映射文档的 JSON Schema（模型起草映射时也用它约束输出） */
@@ -128,6 +150,7 @@ export const MAPPING_SCHEMA = {
       },
     },
     where: { type: 'string', minLength: 1 },
+    assertions: { type: 'array', items: customAssertion },
   },
 } as const;
 
@@ -177,6 +200,8 @@ export interface MergePlan {
   keySpace?: string;
   /** 行过滤：返回布尔的表达式，不满足（含取值为空）的源记录视为不存在 */
   where?: string;
+  /** 映射级自定义断言（只有写了的映射才有）；已发布的老版本没有这一项 */
+  assertions?: CustomAssertion[];
 }
 
 /** 校验结果；notices 是不拦发布的提示（如 customer_source 写的就是本数据源） */
@@ -217,6 +242,10 @@ export function describeSchemaError(e: ErrorObject): { path: Path; message: stri
   const p = e.params as Record<string, unknown>;
   switch (e.keyword) {
     case 'if': return null;
+    // 只有自定义断言用 false 拦配错检查的 min / max / values
+    case 'false schema': return path[0] === 'assertions'
+      ? { path, message: `${path.at(-1)} 只能用于 check: ${path.at(-1) === 'values' ? 'in' : 'range'}` }
+      : { path, message: `不能写 ${path.at(-1)}` };
     case 'required': return { path, message: `缺少 ${p.missingProperty}` };
     case 'additionalProperties': return { path: [...path, String(p.additionalProperty)], message: `不认识的项 ${p.additionalProperty}` };
     case 'type': return { path, message: `应为${String(p.type).split(',').map(t => TYPE_LABELS[t] ?? t).join('或')}` };
@@ -669,6 +698,8 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
     issue(['survivorship'], '只有消费者（customer）映射能配置属性取舍的优先级', { atKey: true });
   }
 
+  checkAssertions(spec.assertions ?? [], mapped, issue);
+
   if (issues.length) return { ok: false, issues: issues.sort(ISSUE_ORDER) };
   const extensions = Object.entries(spec.extensions ?? {}).map(([name, e]) => ({ name, type: e.type }));
   return {
@@ -686,9 +717,71 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
       ...(spec.survivorship && { survivorship: { priority: spec.survivorship.priority } }),
       ...(spec.key_space && primaryKey && { keySpace: spec.key_space }),
       ...(spec.where && { where: spec.where }),
+      ...(spec.assertions && { assertions: spec.assertions.map(a => ({ ...a })) }),
     },
     notices: notices.sort(ISSUE_ORDER),
   };
+}
+
+const RANGE_TYPES: readonly FieldType[] = ['integer', 'decimal', 'date', 'timestamp'];
+const isDateText = (type: FieldType, v: string) =>
+  (type === 'date' ? /^\d{4}-\d{2}-\d{2}$/.test(v) : /^\d{4}-\d{2}-\d{2}/.test(v)) && !Number.isNaN(Date.parse(v));
+
+/**
+ * 自定义断言的语义校验：字段是映射出来的；敏感字段（标准层是哈希）只能 not_null / unique；range 只用于数值、日期与时间字段，
+ * min / max 的写法与字段类型一致且 min 不大于 max；in 只用于文本字段，有标准枚举时取值都在枚举里；同一字段的同一种检查只写一次
+ */
+function checkAssertions(assertions: readonly CustomAssertion[], mapped: ReadonlyMap<string, PlanColumn>, issue: (path: Path, message: string) => void) {
+  const seen = new Set<string>();
+  assertions.forEach((a, i) => {
+    const at: Path = ['assertions', i];
+    const name = customAssertionName(a);
+    if (seen.has(name)) issue(at, `${a.field} 的 ${a.check} 已经写过：同一字段的同一种检查只能写一次`);
+    seen.add(name);
+    const c = mapped.get(a.field);
+    if (!c) {
+      const [near] = similarNames(a.field, [...mapped.keys()]);
+      issue([...at, 'field'], `${a.field} 不是本映射映射出来的字段${near ? `，是不是想写 ${near}` : ''}`);
+      return;
+    }
+    if (c.sensitive && (a.check === 'range' || a.check === 'in')) {
+      issue([...at, 'check'], `${a.field} 是敏感字段，标准层只存哈希：只能用 not_null 或 unique`);
+      return;
+    }
+    if (a.check === 'range') {
+      if (!RANGE_TYPES.includes(c.type)) {
+        issue([...at, 'check'], `range 只能用于数值、日期或时间字段，${a.field} 是${FIELD_TYPES[c.type].label}`);
+        return;
+      }
+      if (a.min === undefined && a.max === undefined) {
+        issue(at, 'range 至少要写 min 或 max');
+        return;
+      }
+      const numeric = c.type === 'integer' || c.type === 'decimal';
+      let valid = true;
+      for (const bound of ['min', 'max'] as const) {
+        const v = a[bound];
+        if (v === undefined) continue;
+        if (numeric ? typeof v !== 'number' : typeof v !== 'string' || !isDateText(c.type, v)) {
+          valid = false;
+          issue([...at, bound], numeric ? `${a.field} 是数值字段，${bound} 应为数字` : `${a.field} 是${FIELD_TYPES[c.type].label}字段，${bound} 应为日期（如 2024-01-01）`);
+        }
+      }
+      if (valid && a.min !== undefined && a.max !== undefined
+        && (numeric ? (a.min as number) > (a.max as number) : Date.parse(a.min as string) > Date.parse(a.max as string))) {
+        issue(at, 'min 不能大于 max');
+      }
+    }
+    if (a.check === 'in') {
+      if (c.type !== 'string') {
+        issue([...at, 'check'], `in 只能用于文本字段，${a.field} 是${FIELD_TYPES[c.type].label}`);
+        return;
+      }
+      a.values!.forEach((v, j) => {
+        if (c.enum && !c.enum.includes(v)) issue([...at, 'values', j], `${v} 不是 ${a.field} 的标准取值：应为以下之一：${c.enum.join('、')}`);
+      });
+    }
+  });
 }
 
 /** 合并计划的列表达式与行过滤引用的源表列；解析不了的表达式跳过。源表列差异与合并前的结构检查共用 */
