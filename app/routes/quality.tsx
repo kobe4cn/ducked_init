@@ -1,10 +1,10 @@
 // app/routes/quality.tsx —— 数据质量（有 sources:read 的成员）：本租户最近的内置断言结果（来自 silver._assertion_runs）与隔离区里不合格行的样本（silver._quarantine）。
-// 每次请求只读挂载本租户的数据湖读取；样本只来自标准层，敏感字段只有哈希。失败的 error 断言标红，warn 标琥珀色
+// 合并时映射的自定义断言也记在 silver._assertion_runs，显示为「自定义：<字段> <检查>」。每次请求只读挂载本租户的数据湖读取；样本只来自标准层，敏感字段只有哈希。失败的 error 断言标红，warn 标琥珀色
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import type { Route } from './+types/quality';
 import { requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
-import { ASSERTION_LABELS, SAMPLE_LIMIT, type AssertionLevel } from '~/.server/pipeline/assertions';
+import { ASSERTION_LABELS, describeCustom, SAMPLE_LIMIT, type AssertionLevel } from '~/.server/pipeline/assertions';
 import { QUALITY_QUARANTINE, QUALITY_RUNS, readQuality } from '~/.server/quality';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
@@ -24,7 +24,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     nav: navFor(member),
     runs,
     quarantine,
-    labels: ASSERTION_LABELS,
+    labels: labelsFor(runs.flatMap(r => r.assertions).map(a => a.name)),
     limits: { runs: QUALITY_RUNS, quarantine: QUALITY_QUARANTINE, sample: SAMPLE_LIMIT },
     latest: {
       taskId: runs[0]?.taskId,
@@ -33,6 +33,12 @@ export async function loader({ request }: Route.LoaderArgs) {
     },
   };
 }
+
+/** 内置断言的中文名，加上运行记录里映射自定义断言（custom:<字段>:<检查>）现转的中文名 */
+const labelsFor = (names: string[]): Record<string, string> => ({
+  ...ASSERTION_LABELS,
+  ...Object.fromEntries(names.filter(n => n.startsWith('custom:')).map(n => [n, describeCustom(n)])),
+});
 
 const time = (iso: string) => new Date(iso).toLocaleString('zh-CN');
 

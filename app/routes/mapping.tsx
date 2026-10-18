@@ -261,6 +261,16 @@ function MergeRow({ e, base, canWrite }: { e: MergeEntry; base: string; canWrite
             {groupStatText(e.entity, e.group)}
           </div>
         )}
+        {/* 合并成功时不通过的只会是 warn：error 级不通过时这个映射合并失败（merge-engine failOnCustomErrors） */}
+        {e.assertions?.filter(r => r.failed > 0).map(r => {
+          const [, field, check] = r.name.split(':');
+          return (
+            <div key={r.name} className="flex items-center gap-1 text-sm text-amber-600" data-merge-assertion={r.name}>
+              <AlertTriangle className="size-4 shrink-0" />
+              {`自定义：${fieldLabel(e.entity, field)} ${CUSTOM_CHECK_LABELS[check as CustomCheck] ?? check}（警告级）：${r.failed.toLocaleString('zh-CN')} 行不合格`}
+            </div>
+          );
+        })}
       </TableCell>
       <TableCell>{duration(e.durationMs)}</TableCell>
       <TableCell>{time(e.startedAt)}</TableCell>

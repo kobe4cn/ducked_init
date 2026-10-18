@@ -5,9 +5,10 @@ import { closeDb } from '../../app/.server/db/client';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import { publishMapping, saveDraft } from '../../app/.server/mappings';
 import { syncSource } from '../../app/.server/source-sync';
 import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
-import { publishedIdentitySources } from '../pipeline/identity-fixtures';
+import { CRM_ORDERS, publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { grantOnSource } from '../pipeline/source-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -53,6 +54,23 @@ describe('数据质量页', () => {
     const viewer = await loginAs(app, 'viewer@acme.com');
     expect(await (await viewer.get('/')).text()).not.toContain('href="/quality"');
     expect((await viewer.get('/quality')).status).toBe(403);
+  });
+
+  it('合并时映射的自定义断言显示中文名「自定义：<字段> <检查>」与不合格行数', async () => {
+    const { acme, author, reviewer, sources, orderMappings } = await publishedIdentitySources({ orders: true });
+    await grantOnSource(`INSERT INTO crm.orders VALUES ('A7', 1, 'paid', -10, '2024-06-29 10:00', '2024-06-29 10:00', now())`);
+    await syncSource(author, sources.crm);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const version = await saveDraft(author, orderMappings!.crm, `${CRM_ORDERS}assertions:\n  - { field: amount, check: range, min: 0, level: warn }\n`);
+    await publishMapping(reviewer, orderMappings!.crm, version);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const html = await (await (await loginAs(app, 'analyst@acme.com')).get('/quality')).text();
+    expect(html).toMatch(/data-assertion="custom:amount:range"[^>]*data-failed="true"/);
+    expect(html).toContain('自定义：amount 取值范围');
+    expect(html).toMatch(/>1(<!-- -->)? 行不合格</);
+    expect(html).not.toContain('A7');
   });
 
   it('其他租户的成员只看到自己湖里的断言结果，看不到本租户的断言结果与隔离区', async () => {

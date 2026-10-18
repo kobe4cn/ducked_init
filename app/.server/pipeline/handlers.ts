@@ -314,12 +314,12 @@ export const HANDLERS = {
   // 参数带 drop 时先撤下这些停用的映射写进标准层的行（ADR-0031），结果里记在 dropped
   'silver.merge': {
     label: '合并到标准层',
-    async run(_con, params, { session, piiSalt, redact }) {
+    async run(_con, params, { taskId, session, piiSalt, redact }) {
       if (!piiSalt) throw new Error('缺少敏感信息盐');
       const drop = mergeDrops(params);
       const result = await mergeToSilver(
         session, mergeMappings(params, drop), piiSalt, redact, identityMatch(params), mergeRelations(params), identityForce(params),
-        mergeConsumerSensitive(params), mergeSurvivorship(params), drop,
+        mergeConsumerSensitive(params), mergeSurvivorship(params), drop, taskId,
       );
       const failed = result.mappings.filter(m => 'error' in m);
       const problems = [

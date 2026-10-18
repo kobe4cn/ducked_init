@@ -7,7 +7,9 @@
 // 记下每个映射合并到了原始层的哪个批次，是下一次合并起点的唯一依据（与 ADR-0012 的批次日志同理）。
 // 敏感字段（标准实体的 pii 字段与标成敏感的扩展字段）在转换时就规范化并换成按租户加盐的哈希，当前记录与标准层里都没有明文（ADR-0005）。
 // 输入是源视图的映射（ADR-0023）先把视图在原始层上执行的结果物化进会话的本机库，再照源表处理；视图的批次号来自不同的表、不能比较，
-// 所以不增量：视图版本或它引用的表有新批次时由全部批次重建，否则不动
+// 所以不增量：视图版本或它引用的表有新批次时由全部批次重建，否则不动。
+// 映射写了自定义断言（ADR-0026）时合并里一并检查：not_null / range / in 查本批转换后的行，unique 在事务里查本映射在标准层的全部行；
+// error 级不通过时这个映射合并失败、事务回滚（不写隔离区），否则结果追加进 silver._assertion_runs，记在合并任务名下
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { TenantLakeSession } from './lake-engine';
 import { MERGES, RECORDS, SILVER } from './lake-schemas';
@@ -21,6 +23,8 @@ import { referencedSourceColumns, sqlType, type MergePlan, type PlanColumn } fro
 import { breakingColumns, type ColumnType } from './schema-diff';
 import { bronzeTablesOf, checkViewSql } from './source-view-engine';
 import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
+import { recordRuns, type AssertionResult } from './assertions';
+import { customAssertionName, evalCustomAssertions } from './custom-assertions';
 
 /**
  * 合并任务里的一个已发布映射：合并计划加上映射、版本与数据源；输入是源视图时另带视图最新的已发布版本
@@ -74,10 +78,10 @@ export interface LiveTables { latest: string; live: string }
  * 合并一个映射的各步骤（计时用）：input 判断源表与读主键（源视图另含物化），lastMerge 读合并日志，maxBatch 取原始层最新批次，
  * live 取每条源记录的最新一版（含行过滤），unknownValues 查兜底取值，transform 转换（含敏感字段哈希），keys 算受影响的键与胜出行；
  * 事务内 ensureTable、records（写当前记录）、deleteInsert（换掉本映射在标准层的行）、unique（跨映射唯一）、groupStats（合并组的重叠与不一致）、
- * mergeLog，commit 是提交本身；rows 数本映射在标准层的行数
+ * mergeLog，commit 是提交本身；rows 数本映射在标准层的行数；assertions 是自定义断言（本批行与事务里的 unique 累加）
  */
 export type MergeStep = 'input' | 'lastMerge' | 'maxBatch' | 'live' | 'unknownValues' | 'transform' | 'keys'
-  | 'ensureTable' | 'records' | 'deleteInsert' | 'unique' | 'groupStats' | 'mergeLog' | 'commit' | 'rows';
+  | 'ensureTable' | 'records' | 'deleteInsert' | 'unique' | 'groupStats' | 'assertions' | 'mergeLog' | 'commit' | 'rows';
 
 /**
  * 合并组这次重算的主键里组员之间的差异（ADR-0032）：overlap 是有至少 2 个组员的主键数；conflicts 是其中各字段两边都非空且取值不同的主键数
@@ -108,6 +112,8 @@ export type MergeRecord = {
     filtered?: number;
     /** 映射在合并组里时，这次重算的主键里组员之间的重叠与不一致（增量合并只统计重算的主键） */
     group?: GroupStat;
+    /** 映射写了自定义断言时各条的结果（都没有 error 级不通过，否则合并失败） */
+    assertions?: AssertionResult[];
   }
   /** skipped：源表还没有同步进原始层，等首次同步后再合并（不算失败） */
   | { skipped: string }
@@ -440,7 +446,7 @@ interface LastMerge { version: number; source_keys: string; batch_to: string; sc
  * 合并一个映射：读出原始层里上次合并之后的批次，改当前记录，再对受影响的去重键重新取最新的一行写进标准层。
  * 首次合并、映射换了版本、源表的主键变了、标准层的写法变了或带了强制重建标记时由全部批次重建（当前记录与本映射在标准层的行都换掉）
  */
-async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date, stage: StageTables): Promise<MergeRecord> {
+async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date, stage: StageTables, taskId: string): Promise<MergeRecord> {
   const startedAt = new Date();
   // 分步计时：lap(步骤) 把上一次打点以来的耗时累加到这一步
   const steps: Partial<Record<MergeStep, number>> = {};
@@ -491,6 +497,11 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
   const key = plan.key;
   const [{ n: nullKeys }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${stage.rows} WHERE ${key.map(k => `${ident(k)} IS NULL`).join(' OR ')}`);
   if (Number(nullKeys)) throw new Error(`去重键 ${key.join('、')} 有 ${nullKeys} 行为空，请检查映射或在源端补齐`);
+  // 自定义断言的行级检查只看本批转换后的行（增量时是变更的记录）；unique 要看合并后的全部行，在事务里查
+  const custom = plan.assertions ?? [];
+  const rowChecks = await evalCustomAssertions(con, stage.rows, plan.entity, custom.filter(a => a.check !== 'unique'));
+  failOnCustomErrors(rowChecks);
+  if (custom.length) lap('assertions');
 
   // 受影响的去重键：改动的源记录在旧版本与新版本里的去重键。重建时是全部的去重键（本映射在标准层的行都换掉），不建 stage.keys
   const changed = `(SELECT _src FROM ${stage.latest})`;
@@ -535,6 +546,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     ...await groupRowsSql(con, plan, plan.group, stage.rows, now, scope),
   };
   let groupStat: GroupStat | undefined;
+  let customResults: AssertionResult[] | undefined;
   lap('keys');
 
   await inTransaction(con, async () => {
@@ -586,6 +598,15 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
       groupStat = await groupStats(con, grouped, sensitive);
       lap('groupStats');
     }
+    if (custom.length) {
+      const uniqueChecks = await evalCustomAssertions(con, `(SELECT * FROM ${silver} WHERE _mapping = ${lit(plan.mapping)})`, plan.entity, custom.filter(a => a.check === 'unique'));
+      failOnCustomErrors(uniqueChecks);
+      // 按 YAML 里的顺序；行数与内置断言一样记实体在标准层的总行数（行数骤降以它为基准）
+      const byName = new Map([...rowChecks, ...uniqueChecks].map(r => [r.name, r]));
+      customResults = custom.map(a => byName.get(customAssertionName(a))!);
+      await recordRuns(con, taskId, new Map([[plan.entity, await count(con, silver)]]), customResults);
+      lap('assertions');
+    }
     await con.run(`INSERT INTO ${MERGES} VALUES (
       ${lit(plan.mapping)}, ${plan.version}, ${lit(input.rebuildTag)}, ${from}, ${to},
       ${stats.inserted}, ${stats.updated}, ${stats.deleted}, TIMESTAMPTZ ${lit(startedAt.toISOString())}, TIMESTAMPTZ ${lit(new Date().toISOString())}, ${SCHEME})`);
@@ -609,7 +630,14 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     ...(fallback.length && { fallback }),
     ...(filtered !== undefined && { filtered }),
     ...(groupStat && { group: groupStat }),
+    ...(customResults && { assertions: customResults }),
   };
+}
+
+/** 有 error 级自定义断言不通过时报错（只带断言名与行数，不带取值），映射合并失败、事务回滚 */
+function failOnCustomErrors(results: readonly AssertionResult[]) {
+  const failed = results.filter(r => r.level === 'error' && r.failed > 0);
+  if (failed.length) throw new Error(`自定义断言 ${failed.map(r => `${r.name} 不通过：${r.failed} 行`).join('；')}`);
 }
 
 /**
@@ -789,12 +817,12 @@ const CONFLICT_RETRIES = 2;
 
 /** 合并一个映射，出错只记在它自己的合并记录上；提交冲突时重试。每次尝试之后删掉本队列的中间表（后缀是队列序号） */
 async function mergeOne(
-  con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date, stage: StageTables, redact: (message: string) => string,
+  con: DuckDBConnection, plan: MergeMappingParam, salt: string, now: Date, stage: StageTables, redact: (message: string) => string, taskId: string,
 ): Promise<MergeRecord> {
   const startedAt = new Date();
   for (let attempt = 0; ; attempt++) {
     try {
-      return await mergeMapping(con, plan, salt, now, stage);
+      return await mergeMapping(con, plan, salt, now, stage, taskId);
     } catch (e) {
       const message = redact((e as Error).message);
       if (attempt < CONFLICT_RETRIES && /conflict/i.test(message)) {
@@ -820,12 +848,12 @@ async function mergeOne(
  * 打通之前统计 relations（租户全部已发布关系，同样入队时算好）的孤儿，记在 relations 里（耗时记在 relationsMs），出错不算合并失败；salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐；
  * priority 是属性取舍的名次（映射 ID → 名次，同样入队时由全部 customer 映射汇总，ADR-0027）。
  * drop 是要撤下的停用映射（ADR-0031）：各实体的映射开始合并之前先逐个撤下（不论这次有没有带该实体的映射），记在 dropped 里；
- * 撤下了 customer、event 或 consent 的映射时同样重算身份打通
+ * 撤下了 customer、event 或 consent 的映射时同样重算身份打通。taskId 是合并任务，自定义断言的运行记录记在它名下
  */
 export async function mergeToSilver(
   session: TenantLakeSession, plans: MergeMappingParam[], salt: string, redact: (message: string) => string, rules: readonly string[] = DEFAULT_RULES,
   relations: RelationParam[] = [], forceIdentities = false, sensitive: readonly string[] = [], priority: Record<string, number> = {},
-  drop: MergeDrop[] = [],
+  drop: MergeDrop[] = [], taskId: string,
 ): Promise<{
   mappings: MergeRecord[]; dropped?: DroppedMapping[]; relations?: RelationStat[]; relationsMs?: number; identities?: IdentityRecord;
 }> {
@@ -843,7 +871,7 @@ export async function mergeToSilver(
   const settled = await Promise.allSettled([...queues.values()].map(async (indexes, q) => {
     const queueCon = await session.connect();
     try {
-      for (const i of indexes) records[i] = await mergeOne(queueCon, plans[i], salt, now, stageTables(String(q)), redact);
+      for (const i of indexes) records[i] = await mergeOne(queueCon, plans[i], salt, now, stageTables(String(q)), redact, taskId);
     } finally {
       queueCon.closeSync();
     }

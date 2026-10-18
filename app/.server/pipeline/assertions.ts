@@ -40,6 +40,15 @@ export const ASSERTION_LABELS: Record<string, string> = {
   points_chain: '积分流水断档',
 };
 
+/** 自定义断言各检查的中文名（与映射详情页空跑面板一致） */
+const CUSTOM_CHECK_LABELS: Record<string, string> = { not_null: '非空', unique: '唯一', range: '取值范围', in: '取值在列表内' };
+
+/** 映射级自定义断言 custom:<字段>:<检查> 的中文名：「自定义：<字段> <检查>」 */
+export function describeCustom(name: string) {
+  const [, field, check] = name.split(':');
+  return `自定义：${field} ${CUSTOM_CHECK_LABELS[check] ?? check}`;
+}
+
 /** 订单关联得上消费者的比例低于它时告警 */
 const MIN_ORDER_LINK_RATIO = 0.8;
 /** 行数少于上一次运行的这个比例时告警 */
@@ -159,8 +168,8 @@ async function writeQuarantine(con: DuckDBConnection, taskId: string, samples: R
   }
 }
 
-/** 给检查过的实体各追加一行运行记录：行数与这个实体的断言结果 */
-async function recordRuns(con: DuckDBConnection, taskId: string, rowCounts: ReadonlyMap<string, number>, results: readonly AssertionResult[]) {
+/** 给检查过的实体各追加一行运行记录：行数与这个实体的断言结果（合并时的自定义断言也记在这里） */
+export async function recordRuns(con: DuckDBConnection, taskId: string, rowCounts: ReadonlyMap<string, number>, results: readonly AssertionResult[]) {
   for (const [entity, rowCount] of rowCounts) {
     const json = JSON.stringify(results.filter(r => r.entity === entity));
     await con.run(`INSERT INTO ${ASSERTION_RUNS} VALUES (${lit(taskId)}, ${lit(entity)}, ${rowCount}, ${lit(json)}::JSON, now())`);
