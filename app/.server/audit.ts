@@ -17,7 +17,9 @@ const templateLabel = (template: unknown) => TEMPLATES[template as keyof typeof 
 const apiKeyLabel = (d: Detail) => `「${d.name}」（${d.prefix}…）`;
 const dslLabel = (d: Detail) => (d.kind === 'tag' ? '标签' : '指标');
 /** 映射生成稿的来源（mapping_generations.origin）在审计里的说法 */
-const GENERATION_ORIGIN: Record<'model' | 'rules' | 'reuse', string> = { model: '模型生成的', rules: '规则生成的', reuse: '复用已发布映射得到的' };
+const GENERATION_ORIGIN: Record<'model' | 'rules' | 'reuse' | 'assertions', string> = {
+  model: '模型生成的', rules: '规则生成的', reuse: '复用已发布映射得到的', assertions: '模型建议了断言的',
+};
 
 
 // 每种审计动作的名称，以及把明细写成一句话的方式；新增动作只改这里
@@ -109,10 +111,10 @@ const ACTIONS = {
     label: '忽略源表新列',
     describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，忽略新列 ${d.column}`,
   },
-  // 模型输出不合 Schema、请求失败或转出的映射不过校验（ADR-0035）：只记阶段、错误摘要与问题位置，不记提示词、模型原文与取值
+  // 模型输出不合 Schema、请求失败或转出的映射不过校验（ADR-0035；详情页建议断言时 kind = assertions）：只记阶段、错误摘要与问题位置，不记提示词、模型原文与取值
   'mapping.model_draft_failed': {
     label: '模型生成映射草稿失败',
-    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，${d.stage === 'model'
+    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，${d.kind === 'assertions' ? '建议断言，' : ''}${d.stage === 'model'
       ? `模型服务：${d.error}`
       : `映射校验有 ${d.issues} 处问题`}`,
   },

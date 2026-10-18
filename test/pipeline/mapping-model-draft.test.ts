@@ -1,13 +1,13 @@
 // test/pipeline/mapping-model-draft.test.ts —— 用模型生成映射草稿的流水线接缝（ADR-0035）：modelDraftFor 按「复用已发布映射 > 模型 > 按规则」生成
 // → 注入的假 fetch（setLlmFetch）→ platform.mapping_generations 的生成记录、platform.llm_calls 的调用日志与失败时的审计 mapping.model_draft_failed；
-// 带着生成记录保存时与生成稿比对 → 审计 mapping.generation_edited（只有字段名）
+// 带着生成记录保存时与生成稿比对 → 审计 mapping.generation_edited（只有字段名）；详情页用模型建议断言 modelAssertionsForMapping 只换 assertions 块
 import { and, eq } from 'drizzle-orm';
 import { parse } from 'yaml';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, mappingGenerations } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
-import { createMapping, draftFor, dryRunMapping, MappingError, modelDraftFor, modelDraftForMapping, publishMapping, saveMappingDraft } from '../../app/.server/mappings';
+import { createMapping, draftFor, dryRunMapping, MappingError, modelAssertionsForMapping, modelDraftFor, modelDraftForMapping, publishMapping, saveMappingDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
@@ -288,5 +288,93 @@ describe('记录成员对生成草稿的修改', () => {
     expect(e.status).toBe(400);
     expect(await edits(acme)).toHaveLength(0);
     expect((await generations(other))[0].mappingId).toBeNull();
+  });
+});
+
+/** 模型对 ORDERS 映射建议的断言 */
+const MODEL_ASSERTIONS = {
+  assertions: [
+    { field: 'order_id', check: 'not_null', level: 'error', confidence: 0.95, reason: '主键，空值率 0' },
+    { field: 'amount', check: 'range', level: 'warn', min: 0, confidence: 0.6, reason: '列统计 min 非负' },
+    { field: 'status', check: 'in', level: 'warn', values: ['paid', 'refunded'], confidence: 0.8, reason: '常见取值只有这两个' },
+  ],
+};
+
+describe('用模型建议断言', () => {
+  it('把表上下文与当前草稿发给模型，只换 assertions 块，写生成记录（origin assertions，关联映射）；保存后能空跑，保存的人不能发布、另一位能发布', async () => {
+    const { acme, author, reviewer, sourceId } = await tenantWithSource();
+    const mapping = await createMapping(author, sourceId, ORDERS);
+    platformDefault();
+    const { received } = fakeFetch(completion(MODEL_ASSERTIONS));
+
+    const result = await modelAssertionsForMapping(author, mapping.id);
+    expect(result.origin).toBe('assertions');
+    expect(result.yaml.startsWith(ORDERS)).toBe(true);
+    expect(parse(result.yaml).assertions).toEqual(MODEL_ASSERTIONS.assertions.map(({ confidence: _c, reason: _r, ...a }) => a));
+    expect(result.yaml).toContain('# 列统计 min 非负');
+    expect(result.items.map(i => i.path)).toEqual(['assertions.0', 'assertions.1', 'assertions.2']);
+
+    const [call] = await calls(acme);
+    expect(call).toMatchObject({ purpose: 'assertion_draft', schemaValid: true, error: null });
+    const user = JSON.parse((received[0].messages as { content: string }[])[1].content);
+    expect(user).toMatchObject({ table: { table: 'orders' }, mapping: ORDERS });
+    const [generation] = await generations(acme);
+    expect(generation).toMatchObject({
+      id: result.generationId, origin: 'assertions', mappingId: mapping.id, sourceId, tableName: 'orders', entity: 'order', yaml: result.yaml, items: result.items,
+    });
+    expect(await failures(acme)).toHaveLength(0);
+
+    await saveMappingDraft(author, mapping.id, result.yaml, { generationId: result.generationId });
+    await confirmWatermark(author, sourceId, 'orders', 'order_id');
+    await syncSource(author, sourceId);
+    await drain();
+    const dry = await dryRunMapping(author, mapping.id, 1);
+    expect(dry.assertions.custom.map(a => a.name)).toEqual(['custom:order_id:not_null', 'custom:amount:range', 'custom:status:in']);
+    await expect(publishMapping(author, mapping.id, 1)).rejects.toBeInstanceOf(MappingError);
+    await expect(publishMapping(reviewer, mapping.id, 1)).resolves.not.toThrow();
+  });
+
+  it('模型返回不合 Schema 时 422：记一条失败审计（kind assertions），不写生成记录', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    const mapping = await createMapping(author, sourceId, ORDERS);
+    platformDefault();
+    fakeFetch(completion({ assertions: [{ field: 'order_id', check: 'not_empty', level: 'error', confidence: 0.9, reason: '主键' }] }));
+
+    const e = await failure(modelAssertionsForMapping(author, mapping.id));
+    expect(e).toBeInstanceOf(MappingError);
+    expect(e.status).toBe(422);
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'assertion_draft', schemaValid: false });
+    expect(await generations(acme)).toHaveLength(0);
+    const [audit] = await failures(acme);
+    expect(audit).toMatchObject({ targetType: 'source', targetId: sourceId, detail: { mappingId: mapping.id, sourceId, table: 'orders', entity: 'order', kind: 'assertions', stage: 'model' } });
+  });
+
+  it('替换后的 YAML 过不了校验（不存在的字段、敏感字段用 range）时 422：审计只记阶段、问题数与位置，不含理由与取值', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    const mapping = await createMapping(author, sourceId, ORDERS);
+    platformDefault();
+    fakeFetch(completion({ assertions: [
+      { field: 'no_such_field', check: 'not_null', level: 'warn', confidence: 0.3, reason: '猜的字段' },
+      { field: 'status', check: 'in', level: 'warn', values: ['weird_value'], confidence: 0.4, reason: '猜的取值' },
+    ] }));
+
+    const e = await failure(modelAssertionsForMapping(author, mapping.id));
+    expect(e.status).toBe(422);
+    expect(e.issues.length).toBeGreaterThan(0);
+    expect(await generations(acme)).toHaveLength(0);
+    const [audit] = await failures(acme);
+    expect(audit.detail).toMatchObject({ kind: 'assertions', stage: 'mapping', issues: e.issues.length, paths: e.issues.map(i => i.path) });
+    expect(JSON.stringify(audit.detail)).not.toMatch(/weird_value|猜的/);
+  });
+
+  it('没有配置模型服务时 400、不发请求', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    const mapping = await createMapping(author, sourceId, ORDERS);
+    const { f } = fakeFetch(completion(MODEL_ASSERTIONS));
+    const e = await failure(modelAssertionsForMapping(author, mapping.id));
+    expect(e.status).toBe(400);
+    expect(e.message).toContain('未配置模型服务');
+    expect(f).not.toHaveBeenCalled();
+    expect(await generations(acme)).toHaveLength(0);
   });
 });

@@ -1,10 +1,13 @@
 // app/.server/pipeline/model-draft.ts —— 用模型生成映射草稿（ADR-0035，纯函数，不读库、不发请求）：给模型的提示词（表上下文 + 规则草稿作参考）、
 // 模型必须遵守的输出 Schema（字段对应、值字典、去重键、身份打通规则，每项带置信度与理由），以及把模型输出转成映射 YAML：
 // 以规则草稿为底，保留 table / entity / extensions 等其他顶层键，fields / dedupe / identity 整体换成模型给的，理由写成行尾注释。
-// 转出的 YAML 仍要过映射校验（checkMappingDraft），保存、空跑与双人发布照旧
-import { Document, isScalar, parseDocument, Scalar, YAMLMap } from 'yaml';
+// 转出的 YAML 仍要过映射校验（checkMappingDraft），保存、空跑与双人发布照旧。
+// 另有断言建议：把表上下文与当前映射 YAML 发给模型，模型返回自定义断言列表（每条带置信度与理由），只换掉 YAML 的 assertions 块
+import { Document, isCollection, isScalar, parseDocument, Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { FUNCTIONS } from '../../lib/mapping-expr';
 import type { LlmMessage } from '../llm';
+import type { AssertionLevel } from './assertions';
+import { CUSTOM_CHECKS, type CustomAssertion } from './custom-assertions';
 import type { TableContext } from './llm-context';
 
 /** 每一项都带的置信度（0..1）与理由 */
@@ -24,7 +27,7 @@ export interface ModelDraft {
   identity?: Reasoned & { match: string[] };
 }
 
-/** 生成记录里的一项：path 是 fields.<字段>、dedupe 或 identity */
+/** 生成记录里的一项：path 是 fields.<字段>、dedupe、identity，断言建议时是 assertions.<序号> */
 export interface DraftItem { path: string; confidence: number; reason: string }
 
 const reasoned = {
@@ -160,5 +163,88 @@ export function modelOutputToYaml(rulesYaml: string, out: ModelDraft): { yaml: s
   if (isScalar(first)) first.commentBefore = null;
   doc.commentBefore = ' 模型生成的草稿：行尾注释是模型给的依据，请逐项确认后保存';
   doc.comment = null;
+  return { yaml: doc.toString({ nullStr: 'null', lineWidth: 0 }), items };
+}
+
+/** 模型建议的一条断言：写法同映射 YAML 的 assertions，另带置信度与理由 */
+export type ModelAssertion = CustomAssertion & Reasoned;
+export interface AssertionDraft { assertions: ModelAssertion[] }
+
+const LEVELS: AssertionLevel[] = ['error', 'warn'];
+
+/** 断言建议的输出 Schema（chatJson 按它校验）；min / max / values 与检查是否相配、字段是否映射出来由映射校验把关 */
+export const ASSERTION_DRAFT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['assertions'],
+  properties: {
+    assertions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['field', 'check', 'level', 'confidence', 'reason'],
+        properties: {
+          field: { type: 'string', minLength: 1 },
+          check: { enum: [...CUSTOM_CHECKS] },
+          level: { enum: LEVELS },
+          min: { type: ['number', 'string'] },
+          max: { type: ['number', 'string'] },
+          values: { type: 'array', minItems: 1, items: { type: 'string' } },
+          ...reasoned,
+        },
+      },
+    },
+  },
+} as const;
+
+const ASSERTION_SYSTEM = [
+  '你是 CRM 数据平台的数据质量助手：为一个映射建议自定义断言，只输出一个 JSON 对象，不要输出别的文字。',
+  '输入：table 是源表的结构与列统计（nullRate 空值率、distinct 不同值个数、min / max、top 常见取值；可能带几行敏感列已哈希的样本）；mapping 是当前的映射 YAML。',
+  '输出格式：',
+  '{ "assertions": [{ "field": 目标字段名, "check": "not_null" | "unique" | "range" | "in", "level": "error" | "warn", "min"?: 下限, "max"?: 上限, "values"?: [取值], "confidence": 0 到 1, "reason": 不超过 200 字的依据 }] }',
+  '规则：',
+  '- field 只能用 mapping 的 fields 与 extensions 里映射出来的字段名；同一字段的同一种检查只写一条。',
+  '- 敏感字段（sensitive: true，或 email、phone 等身份字段）标准层只存哈希，只能用 not_null 或 unique。',
+  '- range 只用于数值、日期或时间字段，至少给 min 或 max；数值字段写数字，日期与时间字段写日期文本（如 2024-01-01），min 不大于 max。',
+  '- in 只用于文本字段，values 是该字段的标准取值（枚举字段写标准取值，不是源取值）。',
+  '- 优先依据列统计：空值率为 0 的列可以 not_null，distinct 等于行数的列可以 unique，min / max 给 range，top 覆盖了全部取值时给 in。',
+  '- 拿不准的用 warn，确定违反就是数据错误的才用 error；拿不准的断言不要输出。',
+  '- confidence 表示你对这一条的把握，reason 用中文简要说明依据。',
+].join('\n');
+
+/** 断言建议发给模型的消息：system 讲清输出格式与规则，user 是表上下文与当前映射 YAML */
+export function assertionDraftMessages(context: TableContext, yaml: string): LlmMessage[] {
+  return [
+    { role: 'system', content: ASSERTION_SYSTEM },
+    { role: 'user', content: JSON.stringify({ table: context, mapping: yaml }) },
+  ];
+}
+
+/**
+ * 模型建议的断言 → 映射 YAML 与生成记录的各项：只换掉 assertions 块（模型没给断言时删掉），其余键与注释原样保留；
+ * 每条写成单行对象，理由写成行尾注释，不带置信度与理由字段
+ */
+export function assertionsToYaml(yaml: string, out: AssertionDraft): { yaml: string; items: DraftItem[] } {
+  const doc = parseDocument(yaml);
+  const items: DraftItem[] = [];
+  const old = doc.get('assertions', true);
+  // 文档末尾的注释可能挂在原来的 assertions 块上
+  const trailing = isCollection(old) ? old.comment : null;
+  if (out.assertions.length) {
+    const seq = new YAMLSeq();
+    out.assertions.forEach(({ confidence, reason, ...a }, i) => {
+      const node = doc.createNode(a);
+      node.flow = true;
+      if (reason.trim()) node.comment = lineComment(reason);
+      seq.items.push(node);
+      items.push({ path: `assertions.${i}`, confidence, reason });
+    });
+    seq.comment = trailing ?? null;
+    doc.set('assertions', seq);
+  } else {
+    doc.delete('assertions');
+    if (trailing) doc.comment = doc.comment ? `${doc.comment}\n${trailing}` : trailing;
+  }
   return { yaml: doc.toString({ nullStr: 'null', lineWidth: 0 }), items };
 }

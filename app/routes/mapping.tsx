@@ -1,6 +1,6 @@
 // app/routes/mapping.tsx —— 单个映射：各版本（已发布的锁定、草稿可改）、编辑与丢弃草稿（数据工程师、管理员）、发布草稿（需最后保存它的人以外的
 // 另一位有发布权限的成员，最后保存的人看到不能发布的原因，租户里只有自己有发布权限时提示先邀请成员；编辑框旁对照源表的列统计与实体的标准字段（自定义实体对照它已发布登记的字段）；
-// 可按规则或用模型重新生成草稿（模型生成时编辑框上方按置信度从低到高列出每项与理由）、或把源表新增的列加为扩展字段填进编辑框，不保存；新列也可标记为忽略，不再提醒），以及这个映射每次合并到标准层的结果；实体是还没有已发布登记的自定义实体时顶部提示待补登、链接到实体页；有已发布版本时可以立即合并这一个映射。
+// 可按规则或用模型重新生成草稿、或用模型建议自定义断言（只换 assertions 块；模型生成时编辑框上方按置信度从低到高列出每项与理由）、或把源表新增的列加为扩展字段填进编辑框，不保存；新列也可标记为忽略，不再提醒），以及这个映射每次合并到标准层的结果；实体是还没有已发布登记的自定义实体时顶部提示待补登、链接到实体页；有已发布版本时可以立即合并这一个映射。
 // 保存草稿时检查有提示（notices，如 customer_source 写的就是本数据源）不跳转，留在编辑页列出提示。
 // 页面分编辑、版本、合并记录三个标签页（?tab=edit|versions|merges，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）；
 // 合并记录里落入兜底的取值可一键加进值对照（?tab=edit&field=<字段>&add=<取值>…：表单定位到该字段，取值作为待对应的行）；
@@ -14,8 +14,8 @@ import { can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import {
-  confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, GenerationMismatchError, getMapping, ignoreColumn, MappingError, mergeMapping, modelDraftForMapping, publishMapping, referenceTables,
-  requestDisable, restoreMapping, saveMappingDraft, yamlWithColumns,
+  confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, GenerationMismatchError, getMapping, ignoreColumn, MappingError, mergeMapping, modelAssertionsForMapping, modelDraftForMapping, publishMapping, referenceTables,
+  type ModelDraftResult, requestDisable, restoreMapping, saveMappingDraft, yamlWithColumns,
 } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
@@ -132,6 +132,12 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   }
 }
 
+/** 模型生成的草稿填进编辑框：带生成记录（保存时比对）与生成依据面板的内容 */
+const generatedDraft = (draft: ModelDraftResult) => ({
+  error: null, issues: [], yaml: draft.yaml, draftId: crypto.randomUUID(), dryRun: null, generationId: draft.generationId,
+  generated: { origin: draft.origin, items: draft.items, reusedFrom: draft.reusedFrom ?? null, notice: draft.notice ?? null },
+});
+
 export async function action({ request, params }: Route.ActionArgs) {
   const form = await request.formData();
   const field = (name: string) => String(form.get(name) ?? '');
@@ -140,14 +146,12 @@ export async function action({ request, params }: Route.ActionArgs) {
       case 'draft':
         // 只生成、填进编辑框，不保存；draftId 让编辑框换成新内容
         return { error: null, issues: [], yaml: await draftForMapping(await requirePermission(request, 'sources:write'), params.mappingId), draftId: crypto.randomUUID(), dryRun: null };
-      case 'model-draft': {
+      case 'model-draft':
         // 复用 > 模型 > 规则，同样只填进编辑框、不保存；编辑框上方列出每项的置信度与理由
-        const draft = await modelDraftForMapping(await requirePermission(request, 'sources:write'), params.mappingId);
-        return {
-          error: null, issues: [], yaml: draft.yaml, draftId: crypto.randomUUID(), dryRun: null, generationId: draft.generationId,
-          generated: { origin: draft.origin, items: draft.items, reusedFrom: draft.reusedFrom ?? null, notice: draft.notice ?? null },
-        };
-      }
+        return generatedDraft(await modelDraftForMapping(await requirePermission(request, 'sources:write'), params.mappingId));
+      case 'model-assertions':
+        // 只让模型换掉 assertions 块，同样只填进编辑框、不保存
+        return generatedDraft(await modelAssertionsForMapping(await requirePermission(request, 'sources:write'), params.mappingId));
       case 'add-columns': {
         // 源表新增的列加为扩展字段，同样只填进编辑框，不保存
         const yaml = await yamlWithColumns(await requirePermission(request, 'sources:write'), params.mappingId, form.getAll('column').map(String));
@@ -547,7 +551,7 @@ function DisableStatus({ disable }: { disable: DisableData }) {
 
 export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, draftDiff, drift, keySpaceChange, disable, merge } = loaderData;
-  // 用模型重新生成时的来源、每项置信度与理由
+  // 用模型重新生成或建议断言时的来源、每项置信度与理由
   const generated = actionData && 'generated' in actionData ? actionData.generated : null;
   // 编辑框里是生成的草稿时它的生成记录，保存时一起提交，比对生成稿记下改动；换版本或重新加载后 actionData 没了就不再带
   const generationId = actionData && 'generationId' in actionData ? actionData.generationId : null;
@@ -683,6 +687,12 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
                     title="会把表结构与列统计发给模型服务（打开「发送脱敏样本」时附 5 行脱敏样本）；结构与已发布映射一致时直接复用、不调用模型，没配置模型服务时按规则生成。替换编辑框里的内容，不会保存"
                   >
                     用模型重新生成
+                  </Button>
+                  <Button
+                    type="submit" name="intent" value="model-assertions" variant="outline" disabled={submitting || !mapping.reference}
+                    title="会把表结构与列统计（打开「发送脱敏样本」时附 5 行脱敏样本）和已保存的这一版映射（有草稿时是草稿）发给模型服务，以它为底只替换 assertions 块填进编辑框，编辑框里没保存的修改会被换掉；不会保存"
+                  >
+                    用模型建议断言
                   </Button>
                 </div>
               </Form>

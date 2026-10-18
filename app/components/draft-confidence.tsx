@@ -1,4 +1,4 @@
-// app/components/draft-confidence.tsx —— 用模型生成映射草稿后的「生成依据」（ADR-0035）：模型给的每项按置信度从低到高列出（路径、置信度、理由），
+// app/components/draft-confidence.tsx —— 用模型生成映射草稿或建议断言后的「生成依据」（ADR-0035）：模型给的每项按置信度从低到高列出（路径、置信度、理由），
 // 低于 0.5 标红、低于 0.8 琥珀色、其余绿色，颜色都配图标与文字；复用已发布映射或按规则生成时只写来源（复用时链接到来源映射）。
 // 只是展示，保存不依赖它；置信度来自模型，展示前夹到 0..1，理由是纯文本
 import { AlertTriangle, Sparkles } from 'lucide-react';
@@ -32,9 +32,11 @@ export function DraftConfidence({ origin, items, reusedFrom, notice }: {
         </p>
       )}
       {origin === 'rules' && <p data-notice className="flex items-center gap-1.5 text-sm text-amber-600"><AlertTriangle aria-hidden className="size-4" />{notice ?? '按规则生成'}</p>}
-      {origin === 'model' && (
+      {(origin === 'model' || origin === 'assertions') && (
         <>
-          <p className="text-sm text-slate-500">模型给的每一项按置信度从低到高排列，低置信度的请先核对。</p>
+          <p className="text-sm text-slate-500">
+            {origin === 'assertions' ? '只替换了 assertions 块（位置里的序号从 0 起），' : ''}模型给的每一项按置信度从低到高排列，低置信度的请先核对。
+          </p>
           <Table>
             <TableHeader>
               <TableRow><TableHead>位置</TableHead><TableHead>置信度</TableHead><TableHead>理由</TableHead></TableRow>

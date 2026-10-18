@@ -793,7 +793,7 @@ describe('按规则生成映射草稿', () => {
     expect(html).not.toContain('data-confidence-path');
   });
 
-  it('详情页用模型重新生成：填进编辑框、不保存，显示生成依据，生成记录关联这个映射；读源视图的映射拒绝', async () => {
+  it('详情页用模型重新生成：填进编辑框、不保存，显示生成依据，生成记录关联这个映射；读源视图的映射拒绝重新生成与建议断言', async () => {
     const { tenantId, sourceId } = await tenantWithSource('acme');
     const engineer = await loginAs(app, 'de@acme.com');
     const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
@@ -833,6 +833,43 @@ describe('按规则生成映射草稿', () => {
     const rejected = await engineer.post(`/mappings/${viewMapping}`, { intent: 'model-draft' });
     expect(rejected.status).toBe(400);
     expect(await rejected.text()).toContain('读源视图的映射请直接编辑');
+    const noAssertions = await engineer.post(`/mappings/${viewMapping}`, { intent: 'model-assertions' });
+    expect(noAssertions.status).toBe(400);
+    expect(await noAssertions.text()).toContain('用模型建议断言要用源表的列统计');
+  });
+
+  it('详情页用模型建议断言：只换 assertions 块填进编辑框、不保存，显示生成依据与隐藏的生成记录；不合 Schema 时 422 保持原内容；分析师 403', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    expect(await (await engineer.get(`/mappings/${id}`)).text()).toMatch(/value="model-assertions"[^>]*>用模型建议断言/);
+    modelReplies({ assertions: [
+      { field: 'order_id', check: 'unique', level: 'error', confidence: 0.9, reason: '主键 <不重复>' },
+      { field: 'amount', check: 'range', level: 'warn', min: 0, confidence: 0.4, reason: '金额非负' },
+    ] });
+
+    const res = await engineer.post(`/mappings/${id}`, { intent: 'model-assertions', yaml: ORDERS });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const yaml = editorYaml(html);
+    expect(yaml.startsWith(ORDERS)).toBe(true);
+    expect(yaml).toContain('- { field: amount, check: range, level: warn, min: 0 } # 金额非负');
+    expect(html).toContain('data-draft-origin="assertions"');
+    expect([...html.matchAll(/data-confidence-path="([^"]+)"/g)].map(m => m[1])).toEqual(['assertions.1', 'assertions.0']);
+    expect(html).toContain('主键 &lt;不重复&gt;');
+    expect(html).toMatch(/<input type="hidden" name="generationId" value="[0-9a-f-]{36}"/);
+    expect(editorYaml(await (await engineer.get(`/mappings/${id}`)).text())).toBe(ORDERS);
+    const generations = await getDb().select().from(mappingGenerations).where(eq(mappingGenerations.tenantId, tenantId));
+    expect(generations).toEqual([expect.objectContaining({ mappingId: id, origin: 'assertions' })]);
+
+    modelReplies({ assertions: [{ field: 'amount', check: 'range', level: 'warn', min: 0, confidence: 2, reason: '金额非负' }] });
+    const failed = await engineer.post(`/mappings/${id}`, { intent: 'model-assertions', yaml: CUSTOMERS });
+    expect(failed.status).toBe(422);
+    const failedHtml = await failed.text();
+    expect(failedHtml).toContain('模型建议断言失败');
+    expect(editorYaml(failedHtml)).toBe(CUSTOMERS);
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    expect((await (await loginAs(app, 'an@acme.com')).post(`/mappings/${id}`, { intent: 'model-assertions' })).status).toBe(403);
   });
 
   it('生成草稿后改了再保存：表单带着生成记录，审计页显示修改了模型 / 规则生成的映射草稿、改动的字段数与是否改了断言；校验不过时仍带着', async () => {

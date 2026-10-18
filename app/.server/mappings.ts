@@ -20,7 +20,9 @@ import { consumerSensitive, identityRules, type IdentitySummary } from './pipeli
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { groupMemberOf, type MergeDrop, type MergeMappingParam, type MergeRecord, type RelationParam } from './pipeline/merge-engine';
 import { draftCustomMapping, draftMapping, DraftError, reuseMappingYaml } from './pipeline/mapping-draft';
-import { MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type DraftItem, type ModelDraft } from './pipeline/model-draft';
+import {
+  ASSERTION_DRAFT_SCHEMA, assertionDraftMessages, assertionsToYaml, type AssertionDraft, MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type DraftItem, type ModelDraft,
+} from './pipeline/model-draft';
 import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import type { Rename } from './pipeline/schema-repair';
 import { diffColumns } from './pipeline/schema-diff';
@@ -220,11 +222,11 @@ async function draftWithOrigin(
 }
 
 /**
- * 用模型生成的草稿：生成记录的 ID、草稿从哪来、模型给的每项置信度与理由（复用与规则时为空）；复用时带来源映射的 ID；
- * 没配置模型服务、按规则生成时带一句提示
+ * 用模型生成的草稿：生成记录的 ID、草稿从哪来（详情页用模型建议断言时是 assertions）、模型给的每项置信度与理由（复用与规则时为空）；
+ * 复用时带来源映射的 ID；没配置模型服务、按规则生成时带一句提示
  */
 export interface ModelDraftResult {
-  yaml: string; generationId: string; origin: 'reuse' | 'rules' | 'model'; items: DraftItem[]; reusedFrom?: string; notice?: string;
+  yaml: string; generationId: string; origin: 'reuse' | 'rules' | 'model' | 'assertions'; items: DraftItem[]; reusedFrom?: string; notice?: string;
 }
 
 /**
@@ -307,6 +309,59 @@ export async function modelDraftForMapping(actor: CurrentMember, mappingId: stri
 }
 
 /**
+ * 用模型为已有映射建议自定义断言（ADR-0026、ADR-0035）：把源表的表上下文与当前 YAML（草稿，没有草稿时是最新已发布版本）发给模型
+ * （purpose = assertion_draft），只换掉 YAML 的 assertions 块，须过映射校验；成功时写一行生成记录（origin = assertions），不保存映射。
+ * 没配置模型服务时 400、不发请求；模型失败或替换后不过校验时记审计 mapping.model_draft_failed（kind = assertions，不含模型原文、理由与取值），抛 422
+ */
+export async function modelAssertionsForMapping(actor: CurrentMember, mappingId: string): Promise<ModelDraftResult> {
+  assertCan(actor, 'sources:write');
+  const tenantId = actor.tenant.id;
+  const mapping = await requireMapping(tenantId, mappingId);
+  if (mapping.sourceViewId) throw new MappingError('用模型建议断言要用源表的列统计，读源视图的映射请直接编辑');
+  const { sourceId, tableName: table, entity } = mapping;
+  const base = await latestYaml(mappingId);
+  if (!(await resolveProvider(tenantId))) throw new MappingError('未配置模型服务：请在「模型服务」页填写端点、模型与 API Key，或由平台配置默认模型服务');
+
+  const context = await tableContextFor(tenantId, sourceId, table).catch((e: unknown) => {
+    throw new MappingError(e instanceof Error ? e.message : String(e));
+  });
+  const source = await requireSource(tenantId, sourceId);
+  const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
+    tenantId, actor, action: 'mapping.model_draft_failed', targetType: 'source', targetId: sourceId,
+    detail: { mappingId, sourceId, source: source.name, table, entity, kind: 'assertions', ...detail },
+  });
+  let out: AssertionDraft;
+  try {
+    out = await chatJson<AssertionDraft>(tenantId, 'assertion_draft', assertionDraftMessages(context, base), ASSERTION_DRAFT_SCHEMA);
+  } catch (e) {
+    if (!(e instanceof LlmError)) throw e;
+    await failed({ stage: 'model', error: e.message.slice(0, 200) });
+    throw new MappingError(`模型建议断言失败：${e.message}`, 422);
+  }
+  const { yaml, items } = assertionsToYaml(base, out);
+  try {
+    await checkMappingDraft(tenantId, sourceId, yaml);
+  } catch (e) {
+    if (!(e instanceof MappingError)) throw e;
+    await failed({ stage: 'mapping', issues: e.issues.length, paths: e.issues.slice(0, 10).map(i => i.path) });
+    throw new MappingError(`模型建议的断言有 ${e.issues.length} 处问题，未采用，编辑框保持原内容（行号指替换后的那份）`, 422, e.issues);
+  }
+  const [row] = await getDb().insert(mappingGenerations).values({
+    tenantId, sourceId, tableName: table, entity, mappingId, origin: 'assertions', yaml, items, createdByEmail: actor.email,
+  }).returning({ id: mappingGenerations.id });
+  return { yaml, generationId: row.id, origin: 'assertions', items };
+}
+
+/** 映射当前在改的 YAML：草稿，没有草稿时是最新已发布版本 */
+async function latestYaml(mappingId: string) {
+  const versions = await getDb().select({ status: mappingVersions.status, yaml: mappingVersions.yaml }).from(mappingVersions)
+    .where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version));
+  const base = versions.find(v => v.status === 'draft') ?? versions.find(v => v.status === 'published');
+  if (!base) throw new MappingError('映射还没有版本');
+  return base.yaml;
+}
+
+/**
  * 把源表新增、映射还没用到的列（mappingDrift 的新列）按表单勾选源列的规则加为扩展字段（名字 x_<列名>，类型按列推断，像敏感信息的标成敏感），
  * 写进草稿（没有草稿时是最新已发布版本）的 YAML，返回文本。不保存，保存仍走校验与双人发布（ADR-0015）
  */
@@ -319,11 +374,7 @@ export async function yamlWithColumns(actor: CurrentMember, mappingId: string, c
   if (stale !== undefined) throw new MappingError(`${stale} 不是源表新增、映射还没用到的列`);
   const profiled = (await profiledTables(actor.tenant.id, mapping.sourceId))(mapping.tableName);
   if (typeof profiled === 'string') throw new MappingError(profiled);
-  const versions = await getDb().select({ status: mappingVersions.status, yaml: mappingVersions.yaml }).from(mappingVersions)
-    .where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version));
-  const base = versions.find(v => v.status === 'draft') ?? versions.find(v => v.status === 'published');
-  if (!base) throw new MappingError('映射还没有版本');
-  const doc = parseDocument(base.yaml);
+  const doc = parseDocument(await latestYaml(mappingId));
   const { extensions, reason } = readExtensions(doc);
   if (reason) throw new MappingError(reason);
   const taken = extensions.map(e => e.name);

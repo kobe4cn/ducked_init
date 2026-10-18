@@ -22,6 +22,8 @@ ADR-0003 定下大语言模型只在设计时产出草稿。要落地（#18，�
 
 **指标 / 标签定义草稿。** 定义新建页（指标、标签都有）写下自然语言需求，点「用模型生成草稿」（`modelDraftForDefinition`，dsl-definitions.ts，`definitions:draft`，分析师也能用）：没配置模型服务时 400「未配置模型服务」、不发请求，不回落到别的生成方式（定义没有规则草稿）。上下文由 `pipeline/dsl/model-draft.ts` 组织：标准实体与已发布自定义实体的字段（取自校验同源的 `fieldsFor`，剔除敏感字段与没发布的扩展字段，ADR-0005）、哪些实体能做基础实体、实体间的关系；给模型的输出 Schema 直接用该种类的定义 Schema（指标是 `METRIC_SCHEMA`），用途记为 `metric_draft`。标签的上下文只列标签能引用的指标——最新已发布版本通过校验、没有维度、取值为数字（与 `checkTag` 同一规则，ADR-0025；指标草稿与带维度的指标不出现），每个只给键、说明与度量；输出按 `TAG_SCHEMA`，用途 `tag_draft`；一个可引用的指标都没有时 400「请先发布一个数值型指标」、不发请求。输出转成 YAML（首行注释「模型根据需求生成，请核对」）后须过 `DSL_KINDS[kind].check`，过了只填进编辑框，不保存、不建生成记录，键由成员填写；之后照常保存草稿、双人发布（ADR-0015 / 0021）。模型失败或不过校验时 422、编辑框保持原内容，审计 `definition.model_draft_failed` 只记种类、阶段（`model` / `definition`）、已抹 Key 的错误摘要或问题数与前 10 个位置——需求原文、模型原文与过滤取值都不记。
 
+**断言建议。** 映射详情页点「用模型建议断言」（`modelAssertionsForMapping`，mappings.ts，`sources:write`）：把源表的表上下文（`tableContextFor`，同映射草稿；打开发送样本开关时带 5 行脱敏样本）和当前 YAML（草稿，没有草稿时是最新已发布版本）发给模型，用途 `assertion_draft`，输出按 `ASSERTION_DRAFT_SCHEMA`（`assertions` 数组，每条是映射 YAML 的自定义断言写法加置信度与理由，ADR-0026）。`assertionsToYaml` 只换掉 YAML 的 `assertions:` 块（模型没给时删掉），其余键与注释原样保留，每条写成单行对象、理由写成行尾注释；替换后须过 `checkMappingDraft`（字段须映射出来、敏感字段只能 `not_null` / `unique` 等），过了写一行生成记录（`origin = assertions`，关联映射，items 的位置是 `assertions.<序号>`），只填进编辑框、不保存，生成依据面板照常按置信度列出；之后照常带 `generationId` 保存、空跑、双人发布。没配置模型服务时 400、不发请求（不回落到规则）；读源视图的映射 400。模型失败或替换后不过校验时 422、编辑框保持原内容，审计照样记 `mapping.model_draft_failed`，`stage` 仍区分 `model` / `mapping`，另带 `kind: 'assertions'`；不记模型原文、理由与 `values` / `min` / `max`。
+
 ## 已接受的取舍
 
 - 只支持 OpenAI 兼容接口，不为各家的原生 SDK 做适配；不兼容 `response_format` 的服务不能用。

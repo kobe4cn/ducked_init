@@ -1,7 +1,7 @@
-// test/pipeline/model-draft.test.ts —— 模型输出转映射 YAML（纯函数，ADR-0035）：以规则草稿为底换掉 fields / dedupe / identity，字典数组转对象，理由成行尾注释
+// test/pipeline/model-draft.test.ts —— 模型输出转映射 YAML（纯函数，ADR-0035）：以规则草稿为底换掉 fields / dedupe / identity，字典数组转对象，理由成行尾注释；模型建议的断言只换 assertions 块
 import { parse, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
-import { modelOutputToYaml, type ModelDraft } from '../../app/.server/pipeline/model-draft';
+import { assertionsToYaml, modelOutputToYaml, type AssertionDraft, type ModelDraft } from '../../app/.server/pipeline/model-draft';
 import { readForm } from '../../app/lib/mapping-form';
 import { entityOf } from '../../app/lib/canonical-model';
 
@@ -67,5 +67,50 @@ describe('模型输出转映射 YAML', () => {
     const form = readForm(parseDocument(yaml), entityOf('order')!);
     expect(form.find(f => f.field === 'status')?.basis).toBe('常见取值 paid / refunded');
     expect(form.find(f => f.field === 'amount')?.basis).toBe('金额列');
+  });
+});
+
+const MAPPING = `# 已发布映射的头注释
+model: 1
+entity: order
+table: orders
+fields:
+  order_id: string(order_id) # 主键
+  amount: amount
+assertions:
+  - { field: order_id, check: unique, level: error }
+# 末尾注释
+`;
+
+const SUGGESTED: AssertionDraft = {
+  assertions: [
+    { field: 'order_id', check: 'not_null', level: 'error', confidence: 0.95, reason: '主键\n空值率 0' },
+    { field: 'amount', check: 'range', level: 'warn', min: 0, max: 50000, confidence: 0.6, reason: '列统计 min 0、max 4999' },
+  ],
+};
+
+describe('模型建议的断言转映射 YAML', () => {
+  it('只换掉 assertions 块，其他键与注释保留；理由写成行尾注释，items 的位置是 assertions.<i>', () => {
+    const { yaml, items } = assertionsToYaml(MAPPING, SUGGESTED);
+    const spec = parse(yaml);
+    expect(spec).toMatchObject({ model: 1, entity: 'order', table: 'orders', fields: { order_id: 'string(order_id)', amount: 'amount' } });
+    expect(spec.assertions).toEqual([
+      { field: 'order_id', check: 'not_null', level: 'error' },
+      { field: 'amount', check: 'range', level: 'warn', min: 0, max: 50000 },
+    ]);
+    expect(yaml).toMatch(/^# 已发布映射的头注释/);
+    expect(yaml).toContain('order_id: string(order_id) # 主键');
+    expect(yaml).toContain('# 主键 空值率 0');
+    expect(yaml).toContain('# 末尾注释');
+    expect(items).toEqual([
+      { path: 'assertions.0', confidence: 0.95, reason: '主键\n空值率 0' },
+      { path: 'assertions.1', confidence: 0.6, reason: '列统计 min 0、max 4999' },
+    ]);
+  });
+
+  it('in 带 values；模型没给断言时删掉 assertions 块', () => {
+    const { yaml } = assertionsToYaml(MAPPING, { assertions: [{ field: 'status', check: 'in', level: 'warn', values: ['paid', 'refunded'], confidence: 0.8, reason: '常见取值' }] });
+    expect(parse(yaml).assertions).toEqual([{ field: 'status', check: 'in', level: 'warn', values: ['paid', 'refunded'] }]);
+    expect(parse(assertionsToYaml(MAPPING, { assertions: [] }).yaml)).not.toHaveProperty('assertions');
   });
 });
