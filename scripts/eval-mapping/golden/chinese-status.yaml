@@ -1,0 +1,21 @@
+# 改写自 rfm-seed pos_mysql.sales：状态是中文，时间是不带时区的北京时间
+model: 1
+entity: order
+table: sales
+fields:
+  order_id: string(sale_id)
+  customer_id: string(member_id)
+  status:
+    expr: status
+    dictionary:
+      待支付: created
+      已支付: paid
+      已发货: shipped
+      已完成: completed
+      已取消: cancelled
+      已退款: refunded
+  amount: amount
+  created_at: from_timezone(sold_at, 'Asia/Shanghai')
+  paid_at: from_timezone(paid_at, 'Asia/Shanghai')
+  store_id: store_code
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')

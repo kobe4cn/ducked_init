@@ -1,0 +1,20 @@
+# 改写自 crm-seed douyin_s3.dy_orders：中文表头，状态是数字码，金额以分计，时间是不带时区的北京时间
+model: 1
+entity: order
+table: dy_orders
+fields:
+  order_id: string(订单编号)
+  customer_id: 买家openid
+  status:
+    expr: string(订单状态)
+    dictionary:
+      '1': created
+      '2': paid
+      '3': shipped
+      '5': completed
+      '4': cancelled
+      '21': refunded
+  amount: decimal("实付金额（分）") / 100
+  created_at: from_timezone(下单时间, 'Asia/Shanghai')
+  paid_at: from_timezone(支付时间, 'Asia/Shanghai')
+  updated_at: from_timezone(更新时间, 'Asia/Shanghai')

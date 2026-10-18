@@ -1,0 +1,23 @@
+# 改写自 rfm-seed mini_mongo.orders：同一订单号有多行（旧版本），按订单号去重、取 updated_at 最新的一行
+model: 1
+entity: order
+table: orders
+fields:
+  order_id: order_no
+  customer_id: buyer_member_no
+  status:
+    expr: status
+    dictionary:
+      UNPAID: created
+      PAID: paid
+      SHIPPED: shipped
+      DONE: completed
+      CANCELED: cancelled
+      REFUND: refunded
+  amount: pay_amount
+  created_at: created_at
+  paid_at: pay_paid_at
+  updated_at: updated_at
+dedupe:
+  key: [order_id]
+  latest: updated_at

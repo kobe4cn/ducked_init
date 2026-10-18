@@ -1,0 +1,20 @@
+# 改写自 rfm-seed live_duckdb.live_orders：金额以分为单位，状态是单字母，时间是不带时区的北京时间
+model: 1
+entity: order
+table: live_orders
+fields:
+  order_id: order_code
+  customer_id: string(viewer_id)
+  status:
+    expr: state
+    dictionary:
+      'N': created
+      'P': paid
+      'S': shipped
+      'C': completed
+      'X': cancelled
+      'R': refunded
+  amount: amount_cents / 100
+  created_at: from_timezone(ordered_at, 'Asia/Shanghai')
+  paid_at: from_timezone(paid_at, 'Asia/Shanghai')
+  updated_at: from_timezone(modified_at, 'Asia/Shanghai')

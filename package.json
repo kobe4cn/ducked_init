@@ -18,6 +18,7 @@
     "lake:migrate": "node --env-file-if-exists=.env --import tsx scripts/migrate-lake.ts",
     "lake:reset": "node --env-file-if-exists=.env --import tsx scripts/reset-lake.ts",
     "bench:serving": "node --import tsx scripts/bench-serving.ts",
+    "eval:mapping": "node --env-file-if-exists=.env --import tsx scripts/eval-mapping.ts",
     "lake:ensure": "node --env-file-if-exists=.env --import tsx scripts/ensure-lake-schemas.ts",
     "operator:reset-totp": "node --env-file-if-exists=.env --import tsx scripts/reset-operator-totp.ts",
     "check": "node --env-file=.env --import tsx src/00_check.ts",
