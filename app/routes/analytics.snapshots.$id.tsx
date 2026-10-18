@@ -1,5 +1,6 @@
-// app/routes/analytics.snapshots.$id.tsx —— RFM 快照结果（有结果层查看权限的成员）：各人群的人数与金额（?tab=segments），
-// 按 consumer_id 分页的消费者明细（?tab=consumers&page=N）。登记时有映射最近一次合并失败的快照标「数据不完整」，列出失败的映射。每次请求只读挂载本租户的数据湖读取；页面上只有 consumer_id 与分值，没有明文。
+// app/routes/analytics.snapshots.$id.tsx —— 分析模板快照结果（有结果层查看权限的成员）。RFM：各人群的人数与金额（?tab=segments），
+// 按 consumer_id 分页的消费者明细（?tab=consumers&page=N）；其他模板：按 consumer_id 分页的通用明细（?page=N），列取快照表的全部列。
+// 登记时有映射最近一次合并失败的快照标「数据不完整」，列出失败的映射。每次请求只读挂载本租户的数据湖读取；页面上只有 consumer_id 与汇总值（分值、订单汇总、各渠道同意等），没有明文。
 // 其他租户的快照、已过期的快照返回 404
 import { AlertTriangle } from 'lucide-react';
 import { data, Link } from 'react-router';
@@ -7,7 +8,7 @@ import type { Route } from './+types/analytics.snapshots.$id';
 import { requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { TEMPLATES } from '~/.server/pipeline/templates';
-import { CONSUMER_PAGE_SIZE, getSnapshot, readRfmSnapshot, SnapshotError } from '~/.server/snapshots';
+import { CONSUMER_PAGE_SIZE, getSnapshot, readRfmSnapshot, readTemplateSnapshot, SnapshotError, type SnapshotTemplate } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { PageHeader } from '~/components/page-header';
@@ -30,7 +31,10 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
   const page = Math.min(pages, Math.max(1, Math.floor(Number(url.searchParams.get('page'))) || 1));
   try {
-    const result = await readRfmSnapshot(snapshot, { page });
+    const result = snapshot.template === 'rfm'
+      ? { kind: 'rfm' as const, ...(await readRfmSnapshot(snapshot, { page })) }
+      : { kind: 'generic' as const, ...(await readTemplateSnapshot(snapshot, { page })) };
+    const lookbackDays = snapshot.params.lookbackDays;
     return {
       email: member.email,
       nav: navFor(member),
@@ -40,9 +44,10 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       pageSize: CONSUMER_PAGE_SIZE,
       snapshot: {
         id: snapshot.id,
-        templateLabel: TEMPLATES.rfm.label,
+        // readTemplateSnapshot 已确认是登记过的模板
+        templateLabel: TEMPLATES[snapshot.template as SnapshotTemplate].label,
         asOf: String(snapshot.params.asOf),
-        lookbackDays: Number(snapshot.params.lookbackDays),
+        lookbackDays: typeof lookbackDays === 'number' ? lookbackDays : null,
         rowCount: snapshot.rowCount,
         createdAt: snapshot.createdAt.toISOString(),
         expiresAt: snapshot.expiresAt.toISOString(),
@@ -59,16 +64,36 @@ export async function loader({ request, params }: Route.LoaderArgs) {
 const money = (s: string) => `¥${Number(s).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const date = (iso: string) => new Date(iso).toLocaleDateString('zh-CN');
 
+/** 通用明细里的一格：BOOLEAN 显示为是 / 否，列表用顿号连接，空值显示为 —，其余原样 */
+function cell(v: unknown): string {
+  if (v === null || v === undefined) return '—';
+  if (typeof v === 'boolean') return v ? '是' : '否';
+  if (Array.isArray(v)) return v.map(cell).join('、');
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+
+/** 上一页 / 下一页 */
+function Pager({ page, pages, pageSize, href }: { page: number; pages: number; pageSize: number; href: (p: number) => string }) {
+  return (
+    <div className="flex items-center justify-between text-sm text-slate-500">
+      <span data-page={page}>{`第 ${page} / ${pages} 页，每页 ${pageSize} 位`}</span>
+      <div className="flex gap-3">
+        {page > 1 && <Link to={href(page - 1)} className="hover:underline">← 上一页</Link>}
+        {page < pages && <Link to={href(page + 1)} className="hover:underline">下一页 →</Link>}
+      </div>
+    </div>
+  );
+}
+
 export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
-  const { email, nav, tab, page, pages, pageSize, snapshot, segments, consumers } = loaderData;
-  const base = `/analytics/snapshots/${snapshot.id}`;
-  const total = segments.reduce((sum, s) => sum + Number(s.monetary), 0);
-  const pageHref = (p: number) => `${base}?tab=consumers&page=${p}`;
+  const { email, nav, snapshot } = loaderData;
+  const lookback = snapshot.lookbackDays === null ? '' : `回看 ${snapshot.lookbackDays} 天，`;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
         title={`${snapshot.templateLabel} · ${snapshot.asOf}`}
-        description={<><Link to="/analytics" className="hover:underline">← 全部快照</Link>{`　回看 ${snapshot.lookbackDays} 天，创建于 ${date(snapshot.createdAt)}，${date(snapshot.expiresAt)} 过期`}</>}
+        description={<><Link to="/analytics" className="hover:underline">← 全部快照</Link>{`　${lookback}创建于 ${date(snapshot.createdAt)}，${date(snapshot.expiresAt)} 过期`}</>}
       />
 
       {snapshot.incomplete && (
@@ -88,6 +113,45 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
         </Alert>
       )}
 
+      {loaderData.kind === 'rfm' ? <RfmResult {...loaderData} /> : <GenericResult {...loaderData} />}
+    </AppShell>
+  );
+}
+
+function GenericResult({ page, pages, pageSize, snapshot, columns, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'generic' }>) {
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <StatTile label="消费者" value={snapshot.rowCount.toLocaleString('zh-CN')} hint="打通后的统一消费者" />
+        <StatTile label="参考日期" value={snapshot.asOf} hint="计算的基准日" />
+      </div>
+      <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              {columns.map(c => <TableHead key={c}>{c}</TableHead>)}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map(r => (
+              <TableRow key={String(r.consumer_id)} data-consumer={String(r.consumer_id)}>
+                {columns.map(c => <TableCell key={c} className={c === 'consumer_id' ? 'font-mono text-xs' : undefined}>{cell(r[c])}</TableCell>)}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+        <Pager page={page} pages={pages} pageSize={pageSize} href={p => `/analytics/snapshots/${snapshot.id}?page=${p}`} />
+      </div>
+    </>
+  );
+}
+
+function RfmResult({ tab, page, pages, pageSize, snapshot, segments, consumers }: Extract<Route.ComponentProps['loaderData'], { kind: 'rfm' }>) {
+  const base = `/analytics/snapshots/${snapshot.id}`;
+  const total = segments.reduce((sum, s) => sum + Number(s.monetary), 0);
+  const pageHref = (p: number) => `${base}?tab=consumers&page=${p}`;
+  return (
+    <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatTile label="消费者" value={snapshot.rowCount.toLocaleString('zh-CN')} hint="打通后的统一消费者" />
         <StatTile label="消费金额" value={money(String(total))} hint="回看窗口内计入的订单" />
@@ -156,15 +220,9 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
               ))}
             </TableBody>
           </Table>
-          <div className="flex items-center justify-between text-sm text-slate-500">
-            <span data-page={page}>{`第 ${page} / ${pages} 页，每页 ${pageSize} 位`}</span>
-            <div className="flex gap-3">
-              {page > 1 && <Link to={pageHref(page - 1)} className="hover:underline">← 上一页</Link>}
-              {page < pages && <Link to={pageHref(page + 1)} className="hover:underline">下一页 →</Link>}
-            </div>
-          </div>
+          <Pager page={page} pages={pages} pageSize={pageSize} href={pageHref} />
         </div>
       )}
-    </AppShell>
+    </>
   );
 }

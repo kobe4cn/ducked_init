@@ -1,11 +1,12 @@
 // 分析页的 HTTP 接缝：有结果层查看权限的成员在「分析」页看到本租户的 RFM 快照，打开看各人群与分页的消费者明细（只有 consumer_id 与分值，没有明文）；
 // 其他租户的快照 404，已过期的快照标灰、打不开；RFM 模板参数页的权限矩阵：查看者只读，分析师能起草不能发布，
-// 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm；按生效版本重新计算（分析师 403、未来日期与重复入队被拒）
+// 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm；按生效版本重新计算（分析师 403、未来日期与重复入队被拒）；
+// 用户 360 走注册表里的通用参数表单（只读、起草、校验报错、多余字段不传、发布后入队 gold.user360、未登记模板 404）与通用快照明细（全部列、是 / 否、分页、没有明文）
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
-import { listSnapshots } from '../../app/.server/snapshots';
+import { listSnapshots, readTemplateSnapshot } from '../../app/.server/snapshots';
 import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -225,5 +226,99 @@ describe('RFM 模板参数页', () => {
     const html = await (await analyst.get('/analytics/templates/rfm')).text();
     expect(html).not.toContain('草稿</span>');
     expect(html).toMatch(/name="lookbackDays"[^>]*value="400"/);
+  });
+});
+
+describe('用户 360 模板参数页与快照（通用表单与通用明细）', () => {
+  it('分析页列出每个已登记模板的参数入口；通用表单按 form 渲染，查看者只读、提交 403，未登记的模板 404', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+    const list = await (await browser.get('/analytics')).text();
+    expect(list).toContain('href="/analytics/templates/rfm"');
+    expect(list).toContain('href="/analytics/templates/user360"');
+    expect(list).toContain('用户 360 模板参数');
+
+    const res = await browser.get('/analytics/templates/user360');
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('用户 360 · 模板参数');
+    expect(html).toContain('当前生效：默认参数');
+    expect(html).toMatch(/name="lookbackDays"[^>]*value="365"/);
+    expect(html).toMatch(/name="statuses" checked="" value="paid"/);
+    expect(html).toMatch(/name="statuses"[^>]*value="cancelled"/);
+    expect(html).not.toContain('分箱方式');
+    expect(html).not.toContain('校验并保存草稿');
+    expect((await browser.post('/analytics/templates/user360', { intent: 'save', lookbackDays: '30', statuses: ['paid'] })).status).toBe(403);
+    expect((await browser.get('/analytics/templates/rfm2')).status).toBe(404);
+    expect((await browser.get('/analytics/templates/__proto__')).status).toBe(404);
+    const admin = await loginAs(app, 'admin@acme.com');
+    expect((await admin.post('/analytics/templates/rfm2', { intent: 'save', lookbackDays: '30', statuses: ['paid'] })).status).toBe(404);
+  });
+
+  it('分析师改回看天数与状态保存草稿，参数不合法时报错；分析师发布 403，另一位数据工程师发布后以新参数入队 gold.user360', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await memberOf(acme, 'de@acme.com', 'data_engineer');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+
+    const bad = await analyst.post('/analytics/templates/user360', { intent: 'save', lookbackDays: '0', statuses: ['paid'] });
+    expect(bad.status).toBe(400);
+    expect(await bad.text()).toContain('lookbackDays 必须是 1 到 3650 之间的整数');
+    const none = await analyst.post('/analytics/templates/user360', { intent: 'save', lookbackDays: '30' });
+    expect(none.status).toBe(400);
+    expect(await none.text()).toContain('statuses 必须是非空的订单状态列表');
+
+    // 表单里多出来的字段不交给 saveDraft
+    expect((await analyst.post('/analytics/templates/user360', { intent: 'save', lookbackDays: '30', statuses: ['shipped', 'paid'], binning: 'quintile' })).status).toBe(302);
+    const page = await (await analyst.get('/analytics/templates/user360')).text();
+    expect(page).toContain('第 1 版草稿');
+    expect(page).toMatch(/name="lookbackDays"[^>]*value="30"/);
+    expect(page).toMatch(/name="statuses" checked="" value="shipped"/);
+    expect(page).toMatch(/name="statuses" value="completed"/);
+    expect((await analyst.post('/analytics/templates/user360', { intent: 'publish', version: '1' })).status).toBe(403);
+
+    const de = await loginAs(app, 'de@acme.com');
+    const published = await de.post('/analytics/templates/user360', { intent: 'publish', version: '1' });
+    expect(published.status).toBe(302);
+    expect(published.headers.get('location')).toBe('/analytics/templates/user360?published=1');
+    const [task] = await getDb().select().from(tasks).where(eq(tasks.tenantId, acme));
+    expect(task).toMatchObject({ kind: 'gold.user360', status: 'queued', params: { lookbackDays: 30, statuses: ['paid', 'shipped'], definitionVersion: 1 } });
+    // RFM 的定义不受影响
+    expect(await (await de.get('/analytics/templates/rfm')).text()).toContain('当前生效：默认参数');
+  });
+
+  it('user360 快照在快照页打开，分页显示全部列的明细（同意列为是 / 否），模板名取自注册表，页面上没有明文', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true, consents: true });
+    await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
+    const [snapshot] = await listSnapshots(acme);
+    expect(snapshot!.template).toBe('user360');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    const listHtml = await (await browser.get('/analytics')).text();
+    expect(listHtml).toContain(`href="/analytics/snapshots/${snapshot!.id}"`);
+    expect(listHtml).toContain('用户 360');
+
+    const res = await browser.get(`/analytics/snapshots/${snapshot!.id}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('用户 360 · 2024-07-01');
+    expect(html).toContain('回看 365 天');
+    for (const column of ['consumer_id', 'orders', 'monetary', 'recency_days', 'consent_email']) expect(html).toMatch(new RegExp(`<th[^>]*>${column}</th>`));
+    expect(html.match(/data-consumer="/g)).toHaveLength(8);
+    expect(html).toMatch(/>是</);
+    expect(html).toMatch(/>否</);
+    expect(html).toContain('第 1 / 1 页');
+    // 页码超出时停在最后一页
+    expect(await (await browser.get(`/analytics/snapshots/${snapshot!.id}?page=9`)).text()).toContain('第 1 / 1 页');
+    for (const p of PLAINTEXT) expect(html).not.toContain(p);
+
+    // 按 consumer_id 分页：每页 3 位时第 3 页只剩 2 位，三页合起来不重不漏
+    const pages = await Promise.all([1, 2, 3].map(page => readTemplateSnapshot(snapshot!, { page, pageSize: 3 })));
+    expect(pages.map(p => p.rows.length)).toEqual([3, 3, 2]);
+    const ids = pages.flatMap(p => p.rows.map(r => String(r.consumer_id)));
+    expect(ids).toEqual([...new Set(ids)].sort());
+    expect(pages[0]!.columns[0]).toBe('consumer_id');
   });
 });

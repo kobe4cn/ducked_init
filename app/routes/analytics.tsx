@@ -1,5 +1,5 @@
 // app/routes/analytics.tsx —— 分析（有结果层查看权限的成员）：本租户分析模板任务产出的结果快照（带所用的模板定义版本与来源），最新的在前；已过期的标灰、不能打开，登记时数据不完整的标「数据不完整」（详情在快照页）。
-// 有定义查看权限的成员从这里进入 RFM 模板参数页，有起草权限的成员从这里新建指标或标签；指标与标签（template 为 metric:<键>、tag:<键>）的快照链接到它们的定义页（ADR-0025）
+// 有定义查看权限的成员从这里进入每个已登记模板的参数页，有起草权限的成员从这里新建指标或标签；指标与标签（template 为 metric:<键>、tag:<键>）的快照链接到它们的定义页（ADR-0025）
 import { Plus, SlidersHorizontal } from 'lucide-react';
 import { Link } from 'react-router';
 import type { Route } from './+types/analytics';
@@ -30,6 +30,8 @@ export async function loader({ request }: Route.LoaderArgs) {
     canReadDefinitions: can(member.role, 'definitions:read'),
     canDraftDefinitions: can(member.role, 'definitions:draft'),
     retentionDays: SNAPSHOT_RETENTION_DAYS,
+    /** 每个已登记模板的参数入口 */
+    templates: Object.entries(TEMPLATES).map(([id, t]) => ({ id, label: t.label })),
     snapshots: snapshots.map(s => {
       const dsl = DSL_TEMPLATE.exec(s.template);
       return {
@@ -54,13 +56,15 @@ export async function loader({ request }: Route.LoaderArgs) {
 const time = (iso: string) => new Date(iso).toLocaleString('zh-CN');
 
 export default function Analytics({ loaderData }: Route.ComponentProps) {
-  const { email, nav, canReadDefinitions, canDraftDefinitions, retentionDays, snapshots } = loaderData;
+  const { email, nav, canReadDefinitions, canDraftDefinitions, retentionDays, templates, snapshots } = loaderData;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader title="分析" description={`分析模板每次运行在结果层写下一份快照，只含 consumer_id 与分值，保留 ${retentionDays} 天。点开快照查看各人群与消费者明细。`}
         actions={(canReadDefinitions || canDraftDefinitions) && (
           <>
-            {canReadDefinitions && <Button asChild variant="outline"><Link to="/analytics/templates/rfm"><SlidersHorizontal />RFM 模板参数</Link></Button>}
+            {canReadDefinitions && templates.map(t => (
+              <Button key={t.id} asChild variant="outline"><Link to={`/analytics/templates/${t.id}`}><SlidersHorizontal />{`${t.label} 模板参数`}</Link></Button>
+            ))}
             {canDraftDefinitions && <Button asChild variant="outline"><Link to="/analytics/definitions/new?kind=tag"><Plus />新建标签</Link></Button>}
             {canDraftDefinitions && <Button asChild><Link to="/analytics/definitions/new?kind=metric"><Plus />新建指标</Link></Button>}
           </>

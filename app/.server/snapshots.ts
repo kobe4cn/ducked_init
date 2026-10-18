@@ -154,6 +154,20 @@ export async function getSnapshot(tenantId: string, id: string): Promise<Snapsho
   return row ?? null;
 }
 
+/**
+ * 校验快照（未过期、表名是 gold."<模板 ID>__<任务 ID>"）后只读挂载本租户的数据湖，返回会话与带引号的表名；调用方负责关闭会话
+ */
+async function openSnapshotTable(snapshot: Snapshot) {
+  if (snapshot.expiredAt) throw new SnapshotError('快照已过期', 404);
+  // 模板 ID 只含小写字母与数字（调用方已确认是登记过的模板），可以直接拼进正则
+  const match = new RegExp(`^gold\\.(${snapshot.template}__[0-9a-f-]{36})$`).exec(snapshot.table);
+  if (!match) throw new SnapshotError('快照表名不合法', 404);
+  const lake = await lakeRow(snapshot.tenantId);
+  if (!lake || !lakeReady(lake)) throw new SnapshotError('本租户的数据湖还没有初始化');
+  const session = await openTenantLake(lakeSpecOf(lake), READ_LIMITS, undefined, { readOnly: true });
+  return { session, table: `gold."${match[1]}"` };
+}
+
 export interface RfmSegmentSummary { name: string; consumers: number; monetary: string }
 export interface RfmConsumer { consumer_id: string; segment: string; r: number; f: number; m: number; recency_days: number; frequency: number; monetary: string }
 
@@ -163,14 +177,7 @@ export interface RfmConsumer { consumer_id: string; segment: string; r: number; 
  */
 export async function readRfmSnapshot(snapshot: Snapshot, { page, pageSize = CONSUMER_PAGE_SIZE }: { page: number; pageSize?: number }) {
   if (snapshot.template !== 'rfm') throw new SnapshotError('不是 RFM 快照', 404);
-  if (snapshot.expiredAt) throw new SnapshotError('快照已过期', 404);
-  const match = /^gold\.(rfm__[0-9a-f-]{36})$/.exec(snapshot.table);
-  if (!match) throw new SnapshotError('快照表名不合法', 404);
-  const lake = await lakeRow(snapshot.tenantId);
-  if (!lake || !lakeReady(lake)) throw new SnapshotError('本租户的数据湖还没有初始化');
-
-  const table = `gold."${match[1]}"`;
-  const session = await openTenantLake(lakeSpecOf(lake), READ_LIMITS, undefined, { readOnly: true });
+  const { session, table } = await openSnapshotTable(snapshot);
   const read = async <T>(sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
   try {
     const totals = await read<{ segment: string; consumers: string; monetary: string }>(
@@ -184,6 +191,21 @@ export async function readRfmSnapshot(snapshot: Snapshot, { page, pageSize = CON
       return { name, consumers: Number(t?.consumers ?? 0), monetary: t?.monetary ?? '0.00' };
     });
     return { segments, consumers: consumers.map(c => ({ ...c, r: Number(c.r), f: Number(c.f), m: Number(c.m), recency_days: Number(c.recency_days), frequency: Number(c.frequency) })) };
+  } finally {
+    session.close();
+  }
+}
+
+/**
+ * 只读挂载本租户的数据湖，读出任一已登记模板的快照（列不做筛选：模板产出的快照表不带明文，ADR-0004、0005）：快照表的全部列名（按表里的顺序），以及按 consumer_id 排序的第 page 页明细（取值按 JSON 读出）
+ */
+export async function readTemplateSnapshot(snapshot: Snapshot, { page, pageSize = CONSUMER_PAGE_SIZE }: { page: number; pageSize?: number }) {
+  if (!Object.hasOwn(TEMPLATES, snapshot.template)) throw new SnapshotError('不是模板快照', 404);
+  const { session, table } = await openSnapshotTable(snapshot);
+  try {
+    const result = await session.con.runAndReadAll(
+      `SELECT * FROM ${table} ORDER BY consumer_id LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`);
+    return { columns: result.columnNames(), rows: result.getRowObjectsJson() as Record<string, unknown>[] };
   } finally {
     session.close();
   }

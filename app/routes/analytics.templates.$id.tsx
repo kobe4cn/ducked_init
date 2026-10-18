@@ -1,6 +1,7 @@
-// app/routes/analytics.templates.$id.tsx —— 分析模板参数（有定义查看权限的成员）：RFM 的回看天数、计入的订单状态、分箱方式（五分位或固定阈值）与分群规则表。
+// app/routes/analytics.templates.$id.tsx —— 分析模板参数（有定义查看权限的成员），每个已登记模板一页：RFM 有专用表单（回看天数、计入的订单状态、
+// 分箱方式（五分位或固定阈值）与分群规则表），其他模板按注册表里的 form 渲染通用表单（整数、订单状态多选、单选）。
 // 有起草权限的成员保存草稿（参数不合法时报错）、丢弃草稿；草稿由最后保存它的人以外的另一位有发布权限的成员发布（ADR-0015），
-// 发布后以新参数入队一次 RFM 计算，产出的快照记下定义版本；有发布权限的成员也可以按生效的版本重新计算，选填不晚于今天的参考日期。
+// 发布后以新参数入队一次模板计算，产出的快照记下定义版本；有发布权限的成员也可以按生效的版本重新计算，选填不晚于今天的参考日期。
 // 没有已发布版本时生效的是模板的默认参数（不能重新计算）
 import { CheckCircle2, Lock, Plus, RefreshCw, X } from 'lucide-react';
 import { useState } from 'react';
@@ -9,6 +10,7 @@ import type { Route } from './+types/analytics.templates.$id';
 import { can, deniedReason, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
+import { TEMPLATES, type ParamField } from '~/.server/pipeline/templates';
 import type { RfmDefinition, ScoreRange, SegmentRule } from '~/.server/pipeline/templates/rfm';
 import { TaskError } from '~/.server/tasks';
 import { discardDraft, getTemplate, publishTemplate, recomputeTemplate, saveDraft, TemplateError, todayUtc } from '~/.server/templates';
@@ -31,8 +33,7 @@ const ORDER_STATUSES = entityOf('order')!.fields.find(f => f.name === 'status')!
 
 export async function loader({ request, params }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'definitions:read');
-  // 页面上的表单只有 RFM 的参数
-  if (params.templateId !== 'rfm') throw data(null, { status: 404 });
+  if (!Object.hasOwn(TEMPLATES, params.templateId)) throw data(null, { status: 404 });
   const t = await getTemplate(member, params.templateId);
   const search = new URL(request.url).searchParams;
   return {
@@ -48,8 +49,10 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     /** 刚重新计算所按的版本（重新计算后跳回本页时带上 ?recomputed=N） */
     justRecomputed: Number(search.get('recomputed')) || null,
     label: t.label,
+    /** 通用表单的各项；RFM 用专用表单，为 null */
+    fields: t.template === 'rfm' ? null : [...fieldsOf(t.template)],
     /** 表单里的参数：有草稿时是草稿，否则是生效的参数 */
-    form: (t.draft?.params ?? t.params) as RfmDefinition,
+    form: t.draft?.params ?? t.params,
     published: t.published?.version ?? null,
     versions: t.versions.map(v => ({
       version: v.version,
@@ -91,13 +94,27 @@ function rfmParamsOf(form: FormData): Record<string, unknown> {
   };
 }
 
+/** 通用表单 → 模板定义的参数：只取 form 里列出的键（多出来的字段 saveDraft 会报不认识），校验在保存时进行 */
+function formParamsOf(fields: readonly ParamField[], form: FormData): Record<string, unknown> {
+  return Object.fromEntries(fields.map(f => [
+    f.key,
+    f.kind === 'int' ? number(form.get(f.key)) : f.kind === 'statuses' ? form.getAll(f.key).map(String) : String(form.get(f.key) ?? '') || undefined,
+  ]));
+}
+
+/** 模板通用表单的各项；未登记的模板与 RFM（专用表单）为空 */
+const fieldsOf = (id: string): readonly ParamField[] =>
+  (Object.hasOwn(TEMPLATES, id) ? (TEMPLATES[id as keyof typeof TEMPLATES] as { form?: readonly ParamField[] }).form : undefined) ?? [];
+
+const paramsOf = (id: string, form: FormData) => (id === 'rfm' ? rfmParamsOf(form) : formParamsOf(fieldsOf(id), form));
+
 export async function action({ request, params }: Route.ActionArgs) {
   const form = await request.formData();
   const page = `/analytics/templates/${params.templateId}`;
   try {
     switch (String(form.get('intent') ?? '')) {
       case 'save':
-        await saveDraft(await requirePermission(request, 'definitions:draft'), params.templateId, rfmParamsOf(form));
+        await saveDraft(await requirePermission(request, 'definitions:draft'), params.templateId, paramsOf(params.templateId, form));
         break;
       case 'publish': {
         const version = Number(form.get('version'));
@@ -185,6 +202,53 @@ function SegmentTable({ segments, disabled }: { segments: SegmentRule[]; disable
   );
 }
 
+/** 按注册表里的 form 渲染的通用参数表单：int 是整数输入框（带 min / max），statuses 是订单状态多选，enum 是下拉框 */
+function GenericParamsForm({ fields, params, canDraft, submitting }: { fields: ParamField[]; params: Record<string, unknown>; canDraft: boolean; submitting: boolean }) {
+  const disabled = !canDraft;
+  return (
+    <Form method="post">
+      <FieldGroup>
+        {fields.map(f => {
+          const value = params[f.key];
+          if (f.kind === 'statuses') {
+            const checked = Array.isArray(value) ? value : [];
+            return (
+              <fieldset key={f.key} className="max-w-2xl space-y-2">
+                <legend className="text-sm font-medium">{f.label}</legend>
+                <div className="flex flex-wrap gap-4">
+                  {ORDER_STATUSES.map(s => (
+                    <label key={s} className="flex items-center gap-1.5 text-sm">
+                      <input type="checkbox" name={f.key} value={s} defaultChecked={checked.includes(s)} disabled={disabled} />{s}
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+            );
+          }
+          const id = `param-${f.key}`;
+          return (
+            <Field key={f.key} className="max-w-xs">
+              <FieldLabel htmlFor={id}>{f.label}</FieldLabel>
+              {f.kind === 'int' ? (
+                <Input id={id} name={f.key} type="number" min={f.min} max={f.max} step={1} required defaultValue={value == null ? '' : String(value)} disabled={disabled} />
+              ) : (
+                <NativeSelect id={id} name={f.key} defaultValue={value == null ? '' : String(value)} disabled={disabled}>
+                  {(f.options ?? []).map(o => <NativeSelectOption key={o.value} value={o.value}>{o.label}</NativeSelectOption>)}
+                </NativeSelect>
+              )}
+            </Field>
+          );
+        })}
+        {canDraft && (
+          <div>
+            <Button type="submit" name="intent" value="save" disabled={submitting}>{submitting ? '正在校验…' : '校验并保存草稿'}</Button>
+          </div>
+        )}
+      </FieldGroup>
+    </Form>
+  );
+}
+
 function ParamsForm({ params, canDraft, submitting }: { params: RfmDefinition; canDraft: boolean; submitting: boolean }) {
   const [method, setMethod] = useState(params.binning.method);
   const cuts = (k: 'recency' | 'frequency' | 'monetary') => (params.binning.method === 'thresholds' ? params.binning[k].join(', ') : '');
@@ -238,7 +302,7 @@ function ParamsForm({ params, canDraft, submitting }: { params: RfmDefinition; c
 }
 
 export default function TemplateParams({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canDraft, recomputeDenied, today, justPublished, justRecomputed, label, form, published, versions } = loaderData;
+  const { email, nav, canDraft, recomputeDenied, today, justPublished, justRecomputed, label, fields, form, published, versions } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   return (
@@ -270,7 +334,9 @@ export default function TemplateParams({ loaderData, actionData }: Route.Compone
 
       <div className="rounded-2xl border bg-white p-6 shadow-sm">
         <h2 className="mb-4 font-medium">{draft ? `第 ${draft.version} 版草稿` : canDraft ? '编辑参数（保存后成为新的一版草稿）' : '生效的参数'}</h2>
-        <ParamsForm key={draft?.updatedAt ?? published ?? 'defaults'} params={form} canDraft={canDraft} submitting={submitting} />
+        {fields
+          ? <GenericParamsForm key={draft?.updatedAt ?? published ?? 'defaults'} fields={fields} params={form} canDraft={canDraft} submitting={submitting} />
+          : <ParamsForm key={draft?.updatedAt ?? published ?? 'defaults'} params={form as unknown as RfmDefinition} canDraft={canDraft} submitting={submitting} />}
       </div>
 
       <div className="rounded-2xl border bg-white p-6 shadow-sm">
