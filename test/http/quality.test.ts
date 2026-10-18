@@ -22,14 +22,15 @@ const PLAINTEXT = ['张三', '钱七', '13800000002', '138 0000 0001', 'zhang@cr
 
 /** 打通好的 acme 先成功算一次 RFM，再注入一单负金额订单 A7 并重算：断言失败 */
 async function failedRfm() {
-  const { acme, sources } = await publishedIdentitySources({ orders: true });
+  const fixture = await publishedIdentitySources({ orders: true });
+  const { acme, sources } = fixture;
   await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
   await grantOnSource(`INSERT INTO crm.orders VALUES ('A7', 1, 'paid', -10, '2024-06-29 10:00', '2024-06-29 10:00', now())`);
   await syncSource(await memberOf(acme, 'de@acme.com'), sources.crm);
   await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
   const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
   expect(task).toMatchObject({ status: 'failed' });
-  return { acme, task: task! };
+  return { ...fixture, task: task! };
 }
 
 describe('数据质量页', () => {
@@ -56,11 +57,9 @@ describe('数据质量页', () => {
     expect((await viewer.get('/quality')).status).toBe(403);
   });
 
-  it('合并时映射的自定义断言显示中文名「自定义：<字段> <检查>」与不合格行数', async () => {
-    const { acme, author, reviewer, sources, orderMappings } = await publishedIdentitySources({ orders: true });
-    await grantOnSource(`INSERT INTO crm.orders VALUES ('A7', 1, 'paid', -10, '2024-06-29 10:00', '2024-06-29 10:00', now())`);
-    await syncSource(author, sources.crm);
-    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+  it('合并时映射的自定义断言显示中文名「自定义：<字段> <检查>」与不合格行数；「最近一次」统计仍是结果层任务的', async () => {
+    // 先有一次因负金额 A7 阻断失败的 RFM，再给 CRM 订单映射加 warn 级 range 并发布，合并时 A7 不通过
+    const { acme, author, reviewer, orderMappings, task } = await failedRfm();
     const version = await saveDraft(author, orderMappings!.crm, `${CRM_ORDERS}assertions:\n  - { field: amount, check: range, min: 0, level: warn }\n`);
     await publishMapping(reviewer, orderMappings!.crm, version);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
@@ -70,7 +69,8 @@ describe('数据质量页', () => {
     expect(html).toMatch(/data-assertion="custom:amount:range"[^>]*data-failed="true"/);
     expect(html).toContain('自定义：amount 取值范围');
     expect(html).toMatch(/>1(<!-- -->)? 行不合格</);
-    expect(html).not.toContain('A7');
+    expect(html).toMatch(/最近一次阻断失败<\/div><div class="[^"]*">1<\/div>/);
+    expect(html).toContain(`结果层任务 ${task.id}`);
   });
 
   it('其他租户的成员只看到自己湖里的断言结果，看不到本租户的断言结果与隔离区', async () => {

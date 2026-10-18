@@ -1,9 +1,10 @@
 // app/.server/quality.ts —— 数据质量告警（ADR-0026）：结果层任务因 error 级断言失败时，给租户管理员发邮件并记审计。
-// 邮件与审计只写断言名、实体与不合格行数，不写行内容。数据质量页只读挂载本租户数据湖，读最近的断言运行记录与隔离区样本（只来自标准层，敏感字段只有哈希）
-import { and, eq } from 'drizzle-orm';
+// 邮件与审计只写断言名、实体与不合格行数，不写行内容。数据质量页只读挂载本租户数据湖，读最近的断言运行记录与隔离区样本（只来自标准层，敏感字段只有哈希）；
+// 顶部「最近一次」统计取平台库里最近一次结果层任务的断言结果（合并任务也写运行记录，且 error 失败时回滚不留记录，不能拿湖里最近一条当准）
+import { and, desc, eq, isNotNull, like, sql } from 'drizzle-orm';
 import { recordAudit } from './audit';
 import { getDb } from './db/client';
-import { members } from './db/schema';
+import { members, tasks } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { getMailer } from './mailer';
 import { openTenantLake } from './pipeline/lake-engine';
@@ -33,6 +34,14 @@ export async function alertAssertionFailure(tenantId: string, task: { id: string
     await getMailer().send({ to: email, subject: `数据检查未通过：${label}`, text })
       .catch(e => console.error(`[告警] 给 ${email} 发断言失败邮件出错`, e));
   }
+}
+
+/** 最近一次跑过断言的结果层任务（gold.*，结果里有 assertions）的任务 ID 与断言结果；还没有时为 undefined */
+export async function latestResultCheck(tenantId: string): Promise<{ taskId: string; assertions: AssertionResult[] } | undefined> {
+  const [task] = await getDb().select({ id: tasks.id, result: tasks.result }).from(tasks)
+    .where(and(eq(tasks.tenantId, tenantId), like(tasks.kind, 'gold.%'), isNotNull(tasks.finishedAt), sql`${tasks.result} -> 'assertions' IS NOT NULL`))
+    .orderBy(desc(tasks.finishedAt)).limit(1);
+  return task && { taskId: task.id, assertions: task.result!.assertions as AssertionResult[] };
 }
 
 const READ_LIMITS = { memoryLimitMb: 256, threads: 1 };

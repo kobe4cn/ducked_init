@@ -5,7 +5,7 @@ import type { Route } from './+types/quality';
 import { requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { ASSERTION_LABELS, describeCustom, SAMPLE_LIMIT, type AssertionLevel } from '~/.server/pipeline/assertions';
-import { QUALITY_QUARANTINE, QUALITY_RUNS, readQuality } from '~/.server/quality';
+import { latestResultCheck, QUALITY_QUARANTINE, QUALITY_RUNS, readQuality } from '~/.server/quality';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
 import { StatTile } from '~/components/stat-tile';
@@ -18,7 +18,9 @@ export function meta({}: Route.MetaArgs) {
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
   const { runs, quarantine } = await readQuality(member.tenant.id);
-  const latest = runs.filter(r => r.taskId === runs[0]?.taskId).flatMap(r => r.assertions);
+  // 「最近一次」只看结果层任务：合并任务的自定义断言也写运行记录，error 失败时还会回滚、不留记录
+  const check = await latestResultCheck(member.tenant.id);
+  const latest = check?.assertions ?? [];
   return {
     email: member.email,
     nav: navFor(member),
@@ -27,7 +29,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     labels: labelsFor(runs.flatMap(r => r.assertions).map(a => a.name)),
     limits: { runs: QUALITY_RUNS, quarantine: QUALITY_QUARANTINE, sample: SAMPLE_LIMIT },
     latest: {
-      taskId: runs[0]?.taskId,
+      taskId: check?.taskId,
       errors: latest.filter(a => a.level === 'error' && a.failed > 0).length,
       warns: latest.filter(a => a.level === 'warn' && a.failed > 0).length,
     },
@@ -62,10 +64,10 @@ export default function Quality({ loaderData }: Route.ComponentProps) {
   const label = (name: string) => labels[name] ?? name;
   return (
     <AppShell email={email} nav={nav}>
-      <PageHeader title="数据质量" description="结果层任务计算前对标准层做的内置检查。阻断级失败时任务不产出新快照，告警级只记录；不合格行的样本放在隔离区，敏感字段只有哈希。" />
+      <PageHeader title="数据质量" description="结果层任务计算前对标准层做的内置检查，以及合并时映射里写的自定义断言。阻断级失败时任务不产出新快照（自定义断言则是这个映射合并失败），告警级只记录；不合格行的样本放在隔离区，敏感字段只有哈希。" />
 
       <div className="grid gap-4 sm:grid-cols-3">
-        <StatTile label="最近一次阻断失败" value={latest.errors} tone={latest.errors ? 'text-red-600' : undefined} hint={latest.taskId ? `任务 ${latest.taskId}` : '还没有运行记录'} />
+        <StatTile label="最近一次阻断失败" value={latest.errors} tone={latest.errors ? 'text-red-600' : undefined} hint={latest.taskId ? `结果层任务 ${latest.taskId}` : '还没有运行记录'} />
         <StatTile label="最近一次告警" value={latest.warns} tone={latest.warns ? 'text-amber-600' : undefined} hint="告警不阻断任务" />
         <StatTile label="隔离区样本" value={quarantine.length} hint={`最近 ${limits.quarantine} 行`} />
       </div>
