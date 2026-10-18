@@ -77,7 +77,7 @@ export const ref = (name: string) =>
 
 /** 表达式里的字符串字面量（单引号，内部的单引号写两遍） */
 export const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
-const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
+export const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 
 const isTimeZone = (tz: string) => {
   try {

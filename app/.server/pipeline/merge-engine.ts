@@ -15,7 +15,7 @@ import type { TenantLakeSession } from './lake-engine';
 import { MERGES, RECORDS, SILVER } from './lake-schemas';
 import { entityOf, type EntityRelation, type RelationStat } from '../../lib/canonical-model';
 import { CONSUMER, CONSUMER_CONSENT, CONSUMER_IDS, consumerSensitive, DEFAULT_RULES, DEVICE_OWNER, IDENTITIES, resolveIdentities, type IdentitySummary } from './identity-engine';
-import { compileExpression, parseExpression, referencedColumns } from '../../lib/mapping-expr';
+import { compileExpression, ident, lit, parseExpression, referencedColumns } from '../../lib/mapping-expr';
 import { customerSourceColumn } from '../../lib/customer-source';
 import type { MergeRule } from '../../lib/merge-groups';
 import { ensureCustomerSourceColumns } from './customer-source-columns';
@@ -137,8 +137,7 @@ const IDENTITY_INPUTS = ['customer', 'event', 'consent'];
  */
 const SCHEME = 3;
 
-export const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
-export const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
+export { ident, lit };
 export const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 const columnsOf = (con: DuckDBConnection, relation: string) => rows<{ column_name: string; column_type: string }>(con, `DESCRIBE ${relation}`);
 const count = async (con: DuckDBConnection, relation: string) => Number((await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${relation}`))[0].n);

@@ -3,7 +3,7 @@
 // 对一张已转换的表（空跑的样例、合并时的批次）逐条算不合格行数，结果只有断言名、级别、实体、字段与行数，不带取值，也不带 values / min / max
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { AssertionLevel, AssertionResult } from './assertions';
-import { ident, lit } from './merge-engine';
+import { ident, lit } from '../../lib/mapping-expr';
 
 export const CUSTOM_CHECKS = ['not_null', 'unique', 'range', 'in'] as const;
 export type CustomCheck = (typeof CUSTOM_CHECKS)[number];
