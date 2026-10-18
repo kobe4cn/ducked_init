@@ -1,5 +1,8 @@
-# 高意向：近 7 天浏览 ≥ 5 次（P15 命中）。叠加「无订单」写不出，从未有浏览的人不在结果里（#146）
-metric: views_7d
+# 高意向（浏览未购）：近 7 天浏览 ≥ 5 次且近 365 天没有订单；E1（99000018）命中
 rules:
-  - { value: 高意向, when: { gte: 5 } }
+  - value: 高意向
+    when:
+      all:
+        - { metric: views_7d, gte: 5 }
+        - { metric: order_count_365d, eq: 0 }
 default: 一般

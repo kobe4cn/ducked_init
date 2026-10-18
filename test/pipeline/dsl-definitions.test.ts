@@ -192,6 +192,9 @@ describe('样本预览', () => {
 
 // 不限时间窗口：覆盖夹具里 2024 年的订单
 const ALL_REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\n';
+const ORDERS = 'base: order\nmeasure: { agg: count }\n';
+/** 同时引用 revenue 与 orders 的多指标标签 */
+const MIXED = 'rules:\n  - { value: big, when: { all: [{ metric: revenue, gte: 100 }, { metric: orders, gte: 2 }] } }\ndefault: other\n';
 
 describe('发布与丢弃', () => {
   it('最后保存草稿的人与分析师不能发布；另一位数据工程师发布后版本锁定，以当天入队 gold.dsl，成功后登记快照；再改是新一版草稿，再发布只新增快照', async () => {
@@ -266,7 +269,7 @@ describe('发布与丢弃', () => {
 });
 
 describe('标签定义', () => {
-  it('只认指标的已发布版本；双人发布后快照为 consumer_id、tag_key、tag_value，覆盖指标结果里的每个消费者；发布第二版键不变、定义版本递增', async () => {
+  it('只认指标的已发布版本；双人发布后快照为 consumer_id、tag_key、tag_value，覆盖全部统一消费者（不在指标结果里的按 0 比较）；发布第二版键不变、定义版本递增', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
     const tiers = (threshold: number, high = 'high') => `metric: revenue\nrules:\n  - { value: ${high}, when: { gte: ${threshold} } }\ndefault: low\n`;
@@ -279,13 +282,16 @@ describe('标签定义', () => {
     const values = metric.map(m => Number(m.value)).sort((a, b) => a - b);
     const threshold = values[Math.floor(values.length / 2)]!;
     expect(values[0]).toBeLessThan(threshold);
+    const consumers = (await onLake<{ consumer_id: string }>(acme, 'SELECT DISTINCT consumer_id FROM silver._identities ORDER BY consumer_id')).map(c => c.consumer_id);
+    expect(consumers.length).toBeGreaterThan(metric.length);
+    const valueOf = new Map(metric.map(m => [m.consumer_id, Number(m.value)]));
 
     // 指标的新草稿带维度，不影响标签：标签只认已发布的第 1 版
     await saveDslDraft(author, 'metric', 'revenue', `${ALL_REVENUE}dimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n`);
     expect(await createDefinition(author, 'tag', 'value_tier', tiers(threshold))).toEqual({ kind: 'tag', key: 'value_tier', version: 1 });
     expect((await getDefinition(author, 'tag', 'value_tier')).compiled.sql).toContain(`'value_tier' AS tag_key`);
     const preview = await previewDefinition(author, 'tag', 'value_tier');
-    expect(preview).toMatchObject({ columns: ['consumer_id', 'tag_key', 'tag_value'], total: metric.length });
+    expect(preview).toMatchObject({ columns: ['consumer_id', 'tag_key', 'tag_value'], total: consumers.length });
 
     await expect(publishDefinition(author, 'tag', 'value_tier', 1)).rejects.toThrow(/最后改了这一版草稿/);
     const first = await publishDefinition(reviewer, 'tag', 'value_tier', 1);
@@ -293,7 +299,7 @@ describe('标签定义', () => {
     await drain();
     expect(await getTask(first.id)).toMatchObject({ status: 'succeeded' });
     expect(await onLake(acme, `SELECT * FROM gold."tag__${first.id}" ORDER BY consumer_id`)).toEqual(
-      metric.map(m => ({ consumer_id: m.consumer_id, tag_key: 'value_tier', tag_value: Number(m.value) >= threshold ? 'high' : 'low' })));
+      consumers.map(c => ({ consumer_id: c, tag_key: 'value_tier', tag_value: (valueOf.get(c) ?? 0) >= threshold ? 'high' : 'low' })));
 
     await saveDslDraft(author, 'tag', 'value_tier', tiers(threshold, 'vip'));
     const second = await publishDefinition(reviewer, 'tag', 'value_tier', 2);
@@ -303,8 +309,8 @@ describe('标签定义', () => {
     expect(await onLake(acme, `SELECT DISTINCT tag_key, tag_value FROM gold."tag__${second.id}" ORDER BY ALL`))
       .toEqual([{ tag_key: 'value_tier', tag_value: 'low' }, { tag_key: 'value_tier', tag_value: 'vip' }]);
     const snapshots = await listSnapshots(acme);
-    expect(snapshots.find(s => s.taskId === first.id)).toMatchObject({ template: 'tag:value_tier', definitionVersion: 1, rowCount: metric.length });
-    expect(snapshots.find(s => s.taskId === second.id)).toMatchObject({ template: 'tag:value_tier', definitionVersion: 2, rowCount: metric.length });
+    expect(snapshots.find(s => s.taskId === first.id)).toMatchObject({ template: 'tag:value_tier', definitionVersion: 1, rowCount: consumers.length });
+    expect(snapshots.find(s => s.taskId === second.id)).toMatchObject({ template: 'tag:value_tier', definitionVersion: 2, rowCount: consumers.length });
   });
 
   it('引用带维度的指标、rules 为空被拒，不写入', async () => {
@@ -338,13 +344,13 @@ describe('发布前的影响预览', () => {
     const [before] = await onLake<{ n: string }>(acme, SNAPSHOT);
     const queued = (await getDb().select().from(tasks)).length;
 
-    // 过滤掉所有订单：每个消费者都从指标与标签里移出
+    // 过滤掉所有订单：每个消费者都从指标里移出；标签的人群是全部统一消费者，按 0 比较，原来 high 的都换成 low
     await saveDslDraft(author, 'metric', 'revenue', `${ALL_REVENUE}filter:\n  - { field: amount, op: gt, value: 1000000000 }\n`);
     const gone = await impactOf(author, 'metric', 'revenue');
     expect(gone).toMatchObject({ version: 2, published: 1, asOf: new Date().toISOString().slice(0, 10), metric: { changed: 0, added: 0, removed: values.length } });
     expect(gone!.tags).toEqual([{
-      key: 'value_tier', issue: null, changed: 0, added: 0, removed: values.length,
-      transitions: [{ before: 'high', after: null, consumers: high }, { before: 'low', after: null, consumers: values.length - high }],
+      key: 'value_tier', issue: null, changed: high, added: 0, removed: 0,
+      transitions: [{ before: 'high', after: 'low', consumers: high }],
     }]);
     expect(JSON.stringify(gone)).not.toMatch(/[0-9a-f]{64}/);
 
@@ -366,6 +372,24 @@ describe('发布前的影响预览', () => {
     expect(await getDb().select().from(tasks)).toHaveLength(queued);
     const outsider = await memberOf(await newTenant('globex'), 'analyst@globex.com', 'analyst');
     await expect(impactOf(outsider, 'metric', 'revenue')).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe('多指标标签', () => {
+  it('影响预览：草稿改了其中任一指标，引用它的多指标标签都列出', async () => {
+    const { author, reviewer } = await publishedIdentitySources({ orders: true });
+    await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
+    await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    await createDefinition(author, 'metric', 'orders', ORDERS);
+    await publishDefinition(reviewer, 'metric', 'orders', 1);
+    await createDefinition(author, 'tag', 'mixed', MIXED);
+    await publishDefinition(reviewer, 'tag', 'mixed', 1);
+    await drain();
+
+    for (const key of ['revenue', 'orders']) {
+      await saveDslDraft(author, 'metric', key, `base: order\nmeasure: { agg: count }\nfilter:\n  - { field: amount, op: gt, value: 1000000000 }\n`);
+      expect((await impactOf(author, 'metric', key))!.tags).toEqual([expect.objectContaining({ key: 'mixed', issue: null })]);
+    }
   });
 });
 
@@ -402,5 +426,21 @@ describe('删除定义', () => {
     expect(await getDb().select().from(dslVersions)).toHaveLength(4);
     expect((await listAuditLogs(acme)).filter(l => l.action === '删除指标或标签').map(l => l.summary))
       .toEqual(['指标 revenue', '标签 big_spender']);
+  });
+
+  it('被已发布的多指标标签引用的任一指标都不能删，依赖方列出它', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    for (const [key, yaml] of [['revenue', REVENUE], ['orders', ORDERS]] as const) {
+      await createDefinition(analyst, 'metric', key, yaml);
+      await publishDefinition(engineer, 'metric', key, 1);
+    }
+    await createDefinition(analyst, 'tag', 'mixed', MIXED);
+    await publishDefinition(engineer, 'tag', 'mixed', 1);
+    for (const key of ['revenue', 'orders']) {
+      await expect(deleteDefinition(engineer, 'metric', key)).rejects.toThrow(`指标 ${key} 被已发布的标签引用，不能删除：mixed`);
+      expect((await getDefinition(analyst, 'metric', key)).dependents).toEqual(['mixed']);
+    }
   });
 });

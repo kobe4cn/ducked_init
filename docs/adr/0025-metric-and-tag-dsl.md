@@ -21,7 +21,13 @@ ADR-0004 决定指标与标签用平台自有的 YAML DSL 编译成 SQL；ADR-00
 - `description`：可选字符串，最多 500 字，给人看的说明，不参与编译（#205）。
 - 能引用的只有标准实体、已发布登记的自定义实体（推断出的、未确认的登记不算）和已发布映射里的 `x_` 字段；不读原始层。度量、过滤、窗口用到的字段都不能是敏感字段（`isSensitiveField`）。
 
-**标签 DSL。** `metric: <指标键>`、`rules: [{ value, when: { gte?, gt?, lte?, lt?, eq? } }]`（按顺序第一条命中）、`default: <取值>`，可选 `description`（同指标，#205）。引用的指标必须已发布且没有维度（每个消费者一行）。标签结果覆盖指标结果里的每个消费者，列为 `consumer_id, tag_key, tag_value`。标签的 SQL 把它引用的指标当前已发布版本的 SQL 内联成 CTE，不读指标快照，所以标签任务与指标任务之间没有先后顺序。
+**标签 DSL。** `metric: <指标键>`、`rules: [{ value, when: { gte?, gt?, lte?, lt?, eq? } }]`（按顺序第一条命中）、`default: <取值>`，可选 `description`（同指标，#205）。引用的指标必须已发布且没有维度（每个消费者一行）、取值是数字。标签的 SQL 把它引用的指标当前已发布版本的 SQL 内联成 CTE，不读指标快照，所以标签任务与指标任务之间没有先后顺序。
+
+- 多指标写法（#225，与上面的单指标写法二选一）：不写顶层 `metric`，每条规则的 `when` 是 `{ all: [...] }`（全部满足）或 `{ any: [...] }`（任一满足），只一层、不嵌套，每项为 `{ metric: <指标键>, gte?|gt?|lte?|lt?|eq?: 数字 }`，至少一个比较。写了 `metric` 的按单指标写法校验（`when` 不认 `all` / `any`），没写的按多指标写法校验（`when` 不认比较）。模型生成标签草稿（ADR-0035）仍只出单指标写法（`SINGLE_TAG_SCHEMA`）。
+- 人群：全部统一消费者（`SELECT DISTINCT consumer_id FROM silver._identities`），每人一行，列为 `consumer_id, tag_key, tag_value`。每个引用指标的 CTE 左连接进来。不用 `silver._consumer`：老湖可能没有这张表。
+- 缺失取值：消费者不在某指标结果里（或取值为空）时，可选顶层 `missing: { <指标键>: 数字 | null }` 写了按写的（键必须是规则里引用到的指标）；没写时该指标的 `agg` 为 `count|count_distinct|sum` 记 0，其余记空（比较为假，落到后面的规则或 `default`）。编译成 `COALESCE(m<i>.value, <缺省>)`，两种写法都适用。
+- 依赖：`tagDependencies(spec).metrics` 返回全部引用的指标（去重排序），删除指标的拒绝、发布指标的下游重算、影响预览、刷新都经过它，多指标标签自动覆盖。依赖收到的是未经 Schema 的已发布 YAML，两种写法结构不全时只取认得出的指标键。
+- 口径变化：在这之前标签只覆盖指标结果里的消费者。老标签的已发布版本不改 YAML，下次发布、刷新或回刷时人群变成全部统一消费者，多出取 `default`（或按 0 命中规则）的人，各取值的人数会跳变；已有快照不变。
 
 **计算与快照。** 一个任务种类 `gold.dsl`：入队时在服务端用当时的登记与映射编译好 SQL（带上 `asOf`），参数为 `kind, key, definitionId, definitionVersion, asOf, sql, entities`；handler 建 `gold."<kind>__<taskId>"`。快照登记进 `snapshots`，`template` 写 `metric:<key>` 或 `tag:<key>`，`definition_version` 照旧。
 

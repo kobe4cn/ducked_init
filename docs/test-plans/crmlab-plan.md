@@ -158,7 +158,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | L1 积分全周期 | P01：earn +100、spend −30、redeem −50、expire −10、adjust +5 | 余额 15；近 90 天获得 100；`membership.points` = 15 |
 | L2 退款冲回 | 商城单 80 退款，积分 +80 后 adjust −80 | 余额 0；refunded 不计营收 |
 | L3 余额不一致 | `membership.points = 999`，流水求和 200 | ⚠️ 发现不了（#148） |
-| E1 浏览未购 | 近 7 天浏览 10、加购 2、无订单 | 浏览经跨源引用算到商城那个消费者，浏览指标 10；⚠️「浏览未购」写不出（#146） |
+| E1 浏览未购 | 近 7 天浏览 10、加购 2、无订单 | 浏览经跨源引用算到商城那个消费者，浏览指标 10；命中 `high_intent`（浏览 ≥ 5 且近 365 天订单数 = 0，#225） |
 | E2 时区边界 | `--end` 前 4 天北京时间 07:30 的 POS 订单 | 标准层 `created_at` 是 UTC 前一天 23:30，按 UTC 日期计入窗口 |
 | E3 活动到场 | 报名 2 场、到场 1 场 | 到场数 1 |
 | C1 券 | 领 3 张：核销 1、过期 1、未用 1 | 核销数 1；核销率 1/3（#224） |
@@ -215,7 +215,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | `value_tier` | revenue_365d ≥ 5000 高、≥ 1000 中，默认低 | 各档人数 = 真值 |
 | `omni_channel` | channel_count ≥ 3 全渠道、≥ 2 双渠道，默认单渠道 | P01 全渠道 |
 | `points_active` | points_earned_90d ≥ 100 活跃，默认沉默 | |
-| `high_intent` | views_7d ≥ 5 | E1 命中；⚠️ 不能叠加「无订单」，从未有行为的人不在结果里（#146） |
+| `high_intent` | views_7d ≥ 5 且 order_count_365d = 0（多指标，#225） | E1 命中；人群是全部统一消费者，没有任何行为的人取「一般」 |
 
 ### T5 发布、依赖与回刷 ✅
 | # | 操作 | 期望 |

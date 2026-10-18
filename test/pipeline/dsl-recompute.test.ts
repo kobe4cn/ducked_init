@@ -35,7 +35,7 @@ async function onLake<T = Record<string, unknown>>(tenantId: string, query: stri
 }
 
 const ALL_REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\n';
-/** 第 2 版指标：过滤掉所有订单，按它算的标签没有消费者 */
+/** 第 2 版指标：过滤掉所有订单，按它算的标签人人取 low（人群是全部统一消费者，不在指标结果里的按 0 比较） */
 const NO_REVENUE = `${ALL_REVENUE}filter:\n  - { field: amount, op: gt, value: 1000000000 }\n`;
 const TIERS = (high = 'high') => `metric: revenue\nrules:\n  - { value: ${high}, when: { gte: 100 } }\ndefault: low\n`;
 const EARLIER = '2024-07-15';
@@ -87,9 +87,10 @@ describe('发布指标新版本后下游重算', () => {
     const after = await listSnapshots(acme);
     expect(after).toHaveLength(4);
     for (const s of old) expect(after.find(a => a.id === s.id)).toEqual(s);
-    expect(after.find(s => s.taskId === tagTask.id)).toMatchObject({ template: 'tag:value_tier', definitionVersion: 1, rowCount: 0, params: { asOf: today() }, trigger: 'publish' });
-    expect(old.map(s => s.trigger)).toEqual(['publish', 'publish']);
     const oldTag = old.find(s => s.template === 'tag:value_tier')!;
+    expect(after.find(s => s.taskId === tagTask.id)).toMatchObject({ template: 'tag:value_tier', definitionVersion: 1, rowCount: oldTag.rowCount, params: { asOf: today() }, trigger: 'publish' });
+    expect(await onLake(acme, `SELECT DISTINCT tag_value FROM gold."tag__${tagTask.id}"`)).toEqual([{ tag_value: 'low' }]);
+    expect(old.map(s => s.trigger)).toEqual(['publish', 'publish']);
     expect(await onLake(acme, `SELECT DISTINCT tag_key FROM gold."tag__${oldTag.taskId}"`)).toEqual([{ tag_key: 'value_tier' }]);
 
     // 回刷：旧统计日的第 1 版指标快照可回刷；今天已有第 2 版的不算
@@ -118,13 +119,37 @@ describe('发布指标新版本后下游重算', () => {
       ['metric:revenue', 1], ['metric:revenue', 2], ['tag:value_tier', 1], ['tag:value_tier', 1],
     ]);
     const newTag = backfilled.find(s => s.template === 'tag:value_tier' && s.params.asOf === EARLIER && s.id !== oldTag.id)!;
-    expect(newTag).toMatchObject({ rowCount: 0, trigger: 'backfill' });
-    expect(oldTag.rowCount).toBeGreaterThan(0);
+    expect(newTag).toMatchObject({ rowCount: oldTag.rowCount, trigger: 'backfill' });
+    expect(await onLake(acme, `SELECT DISTINCT tag_value FROM gold."tag__${newTag.taskId}"`)).toEqual([{ tag_value: 'low' }]);
+    expect(await onLake(acme, `SELECT DISTINCT tag_value FROM gold."tag__${oldTag.taskId}" ORDER BY ALL`)).toEqual([{ tag_value: 'high' }, { tag_value: 'low' }]);
     expect((await getDefinition(author, 'metric', 'revenue')).backfill).toEqual({ snapshots: 0, days: [] });
     await expect(backfillDefinition(reviewer, 'metric', 'revenue')).rejects.toThrow(/没有需要回刷的快照/);
 
     expect((await listAuditLogs(acme)).filter(l => l.action === '回刷指标或标签').map(l => [l.actor, l.summary]))
       .toEqual([[reviewer.email, `指标 revenue，按第 2 版回刷 ${EARLIER}，连同标签 value_tier`]]);
+  });
+});
+
+describe('多指标标签的下游重算', () => {
+  it('发布被多指标标签引用的任一指标，同一事务里都入队这个标签', async () => {
+    const { acme, author, reviewer } = await publishedMetricAndTag();
+    await createDefinition(author, 'metric', 'orders', 'base: order\nmeasure: { agg: count }\n');
+    await publishDefinition(reviewer, 'metric', 'orders', 1);
+    await createDefinition(author, 'tag', 'mixed', 'rules:\n  - { value: big, when: { all: [{ metric: revenue, gte: 100 }, { metric: orders, gte: 2 }] } }\ndefault: other\n');
+    await publishDefinition(reviewer, 'tag', 'mixed', 1);
+    await drain();
+
+    await saveDslDraft(author, 'metric', 'revenue', NO_REVENUE);
+    await publishDefinition(reviewer, 'metric', 'revenue', 2);
+    expect((await queuedDsl(acme)).map(t => [t.params.kind, t.params.key]).sort())
+      .toEqual([['metric', 'revenue'], ['tag', 'mixed'], ['tag', 'value_tier']]);
+    await drain();
+
+    await saveDslDraft(author, 'metric', 'orders', 'base: order\nmeasure: { agg: count_distinct, field: order_id }\n');
+    await publishDefinition(reviewer, 'metric', 'orders', 2);
+    expect((await queuedDsl(acme)).map(t => [t.params.kind, t.params.key]).sort()).toEqual([['metric', 'orders'], ['tag', 'mixed']]);
+    await drain();
+    expect((await listSnapshots(acme)).filter(s => s.template === 'tag:mixed')).toHaveLength(3);
   });
 });
 

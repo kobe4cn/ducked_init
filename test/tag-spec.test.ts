@@ -1,5 +1,5 @@
-// test/tag-spec.test.ts —— 标签 DSL：引用的指标要已发布、没有维度、取值为数字，rules 不能为空、when 要有条件、取值不能为空，按行列报错；
-// 编译出的 SQL 内联指标、带上键，在内存 DuckDB 里对手造的标准层得到已知答案；发布前的影响预览（impact.ts）按 consumer_id 对比两版结果只给计数（纯函数，不碰平台库与数据湖）
+// test/tag-spec.test.ts —— 标签 DSL：引用的指标要已发布、没有维度、取值为数字，rules 不能为空、when 要有条件、取值不能为空，多指标写法（all / any、missing）的问题按位置报，按行列报错；
+// 编译出的 SQL 内联各指标、带上键、人群为全部统一消费者，在内存 DuckDB 里对手造的标准层得到已知答案；发布前的影响预览（impact.ts）按 consumer_id 对比两版结果只给计数（纯函数，不碰平台库与数据湖）
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { DSL_KINDS } from '../app/.server/pipeline/dsl';
@@ -15,6 +15,8 @@ const ctx: DslContext = {
     ['revenue_by_city', checkMetric('base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n', base)],
     ['last_order_at', checkMetric('base: order\nmeasure: { agg: max, field: created_at }\n', base)],
     ['top_amount', checkMetric('base: order\nmeasure: { agg: max, field: amount }\n', base)],
+    ['orders', checkMetric('base: order\nmeasure: { agg: count }\n', base)],
+    ['views', checkMetric('base: event\nmeasure: { agg: count }\nfilter:\n  - { field: event_type, op: eq, value: view }\ndevice_attribution: false\n', base)],
     ['stale', { ok: false, issues: [] }],
   ]),
 };
@@ -26,6 +28,16 @@ rules:
   - value: mid
     when: { gte: 100, lt: 1000 }
 default: low
+`;
+
+// 浏览未购：近期浏览 ≥ 5 且没有订单
+const BROWSE_NO_BUY = `rules:
+  - value: 浏览未购
+    when:
+      all:
+        - { metric: views, gte: 5 }
+        - { metric: orders, eq: 0 }
+default: 一般
 `;
 
 const ok = (yaml: string): TagSpec => {
@@ -68,6 +80,44 @@ describe('标签 DSL：校验', () => {
       .toEqual(['缺少 default', '不认识的项 between']);
   });
 
+  it('多指标写法：all / any 里引用多个指标通过，用到的实体是各指标实体的并集；依赖列出全部引用的指标', () => {
+    const spec = ok(BROWSE_NO_BUY);
+    expect(spec.metric).toBeUndefined();
+    expect(DSL_KINDS.tag.entities(spec, ctx)).toEqual(['event', 'order']);
+    expect(DSL_KINDS.tag.dependencies(spec).metrics).toEqual(['orders', 'views']);
+    expect(DSL_KINDS.tag.dependencies(ok(TIERS)).metrics).toEqual(['revenue']);
+    ok('rules:\n  - { value: a, when: { any: [{ metric: revenue, gte: 1000 }, { metric: views, gt: 10 }] } }\n  - { value: b, when: { all: [{ metric: revenue, gte: 1 }] } }\nmissing: { views: 0, revenue: null }\ndefault: c\n');
+  });
+
+  it('依赖对未经 Schema 的 YAML 容错：两种写法结构不全时只取能认出的指标键', () => {
+    const deps = (v: unknown) => DSL_KINDS.tag.dependencies(v as TagSpec).metrics;
+    expect(deps({})).toEqual([]);
+    expect(deps({ rules: 'x' })).toEqual([]);
+    expect(deps({ rules: [null, { when: null }, { when: { all: 'x', any: [null, { metric: 3 }, { metric: 'b' }] } }, { when: { all: [{ metric: 'a' }, { metric: 'b' }] } }] })).toEqual(['a', 'b']);
+    expect(deps({ metric: 'revenue', rules: [{ when: { gte: 1 } }] })).toEqual(['revenue']);
+  });
+
+  it('多指标写法：引用的指标不能用、某项没有比较、all 与 any 同写、missing 写了没引用的指标被拒，按位置报', () => {
+    expect(issues('rules:\n  - value: a\n    when:\n      all:\n        - { metric: views, gte: 5 }\n        - { metric: revenue_by_city, gte: 1 }\n        - { metric: orders }\ndefault: b\n')).toEqual([
+      expect.objectContaining({ line: 6, path: 'rules.0.when.all.1.metric', message: expect.stringMatching(/带维度/) }),
+      expect.objectContaining({ line: 7, path: 'rules.0.when.all.2', message: '至少写一个比较（gte、gt、lte、lt、eq）' }),
+    ]);
+    expect(issues('rules:\n  - { value: a, when: { all: [{ metric: views, gte: 5 }], any: [{ metric: missing, gte: 1 }] } }\nmissing: { orders: 0 }\ndefault: b\n')).toEqual([
+      expect.objectContaining({ line: 2, path: 'rules.0.when', message: 'all 与 any 只能写一个' }),
+      expect.objectContaining({ line: 2, path: 'rules.0.when.any.0.metric', message: '没有已发布的指标 missing' }),
+      expect.objectContaining({ line: 3, path: 'missing.orders', message: '规则里没有引用指标 orders' }),
+    ]);
+    expect(issues(`${TIERS}missing: { views: 0 }\n`)).toEqual([expect.objectContaining({ path: 'missing.views', message: '规则里没有引用指标 views' })]);
+  });
+
+  it('两种写法不能混用：单指标写法的 when 不认 all，多指标写法的 when 不认比较、all 不能为空、missing 取值要是数字或空', () => {
+    expect(issues('metric: revenue\nrules:\n  - { value: a, when: { all: [{ metric: views, gte: 5 }] } }\ndefault: b\n').map(i => i.message)).toEqual(['不认识的项 all']);
+    expect(issues('rules:\n  - { value: a, when: { gte: 5 } }\ndefault: b\n').map(i => i.message)).toEqual(['不认识的项 gte']);
+    expect(issues('rules:\n  - { value: a, when: { all: [] } }\ndefault: b\n')).toEqual([expect.objectContaining({ path: 'rules.0.when.all', message: '不能为空' })]);
+    expect(issues('rules:\n  - { value: a, when: { all: [{ gte: 5 }] } }\ndefault: b\n').map(i => i.message)).toEqual(['缺少 metric']);
+    expect(issues(`${BROWSE_NO_BUY}missing: { views: x }\n`)).toEqual([expect.objectContaining({ path: 'missing.views', message: expect.stringMatching(/^应为/) })]);
+  });
+
   it('可选的 description：写了带进定义，不写照常通过；不是字符串或超过 500 字被拒', () => {
     expect(ok(`description: 按累计消费分层\n${TIERS}`).description).toBe('按累计消费分层');
     expect(ok(TIERS).description).toBeUndefined();
@@ -84,7 +134,15 @@ describe('标签 DSL：编译', () => {
     expect(sql).toContain('silver._identities');
     expect(sql).toContain(`'value_tier' AS tag_key`);
     expect(sql.indexOf(`THEN 'high'`)).toBeLessThan(sql.indexOf(`THEN 'mid'`));
-    expect(sql).toContain('m.value >= 100 AND m.value < 1000');
+    expect(sql).toContain('COALESCE(m0.value, 0) >= 100 AND COALESCE(m0.value, 0) < 1000');
+  });
+
+  it('人群是全部统一消费者；不在结果里的按 missing 取值，没写的计数与求和记 0、其余不补（比较为假）', () => {
+    const sql = compileTag(ok(`rules:\n  - value: x\n    when: { any: [{ metric: revenue, gte: 1 }, { metric: top_amount, gte: 1 }] }\ndefault: y\n`), ctx, '2024-07-01', 'k');
+    expect(sql).toContain('SELECT DISTINCT consumer_id FROM silver._identities');
+    expect(sql).toContain('(COALESCE(m0.value, 0) >= 1) OR (m1.value >= 1)');
+    expect(compileTag(ok(`${TIERS}missing: { revenue: 500 }\n`), ctx, '2024-07-01', 'k')).toContain('COALESCE(m0.value, 500) >= 1000');
+    expect(compileTag(ok(`${TIERS}missing: { revenue: null }\n`), ctx, '2024-07-01', 'k')).toContain('WHEN m0.value >= 1000');
   });
 });
 
@@ -93,19 +151,24 @@ describe('标签 DSL：编译出的 SQL 的结果', () => {
   let con: DuckDBConnection;
 
   // c1 有两个源的订单（100 + 900），c2 150，c3 20，c4 只有金额为空的订单（取值为空），c5 打通了但没有订单（不在指标结果里）；
-  // 订单 x 打通不到消费者，不计入
+  // 订单 x 打通不到消费者，不计入。浏览：c5 5 次（浏览未购），c2 5 次（下过单），c3 1 次浏览 1 次点击；c6 打通了但没有任何行为
   beforeAll(async () => {
     instance = await DuckDBInstance.create(':memory:');
     con = await instance.connect();
     await con.run(`SET TimeZone = 'UTC';
       CREATE SCHEMA silver;
       CREATE TABLE silver._identities (_source VARCHAR, customer_id VARCHAR, consumer_id VARCHAR);
-      INSERT INTO silver._identities VALUES ('s1','1','c1'), ('s2','10','c1'), ('s1','2','c2'), ('s1','3','c3'), ('s1','4','c4'), ('s1','5','c5');
+      INSERT INTO silver._identities VALUES ('s1','1','c1'), ('s2','10','c1'), ('s1','2','c2'), ('s1','3','c3'), ('s1','4','c4'), ('s1','5','c5'), ('s1','6','c6');
       CREATE TABLE silver."order" (order_id VARCHAR, customer_id VARCHAR, amount DECIMAL(18,2), _source VARCHAR);
       INSERT INTO silver."order" VALUES
         ('o1', '1', 100, 's1'), ('o2', '10', 900, 's2'), ('o3', '2', 150, 's1'), ('o4', '3', 20, 's1'), ('o5', '4', NULL, 's1'), ('o6', 'x', 5000, 's2');
       ALTER TABLE silver."order" ADD COLUMN _customer_source VARCHAR;
-      UPDATE silver."order" SET _customer_source = _source;`);
+      UPDATE silver."order" SET _customer_source = _source;
+      CREATE TABLE silver.event (event_id VARCHAR, customer_id VARCHAR, _customer_source VARCHAR, device_id VARCHAR, event_type VARCHAR, _source VARCHAR);
+      INSERT INTO silver.event VALUES
+        ('e1','5','s1',NULL,'view','s1'), ('e2','5','s1',NULL,'view','s1'), ('e3','5','s1',NULL,'view','s1'), ('e4','5','s1',NULL,'view','s1'), ('e5','5','s1',NULL,'view','s1'),
+        ('e6','2','s1',NULL,'view','s1'), ('e7','2','s1',NULL,'view','s1'), ('e8','2','s1',NULL,'view','s1'), ('e9','2','s1',NULL,'view','s1'), ('e10','2','s1',NULL,'view','s1'),
+        ('e11','3','s1',NULL,'view','s1'), ('e12','3','s1',NULL,'click','s1');`);
   });
 
   afterAll(() => {
@@ -115,18 +178,35 @@ describe('标签 DSL：编译出的 SQL 的结果', () => {
 
   const run = async (yaml: string) => (await con.runAndReadAll(compileTag(ok(yaml), ctx, '2024-07-01', 'value_tier'))).getRowObjectsJson();
 
-  it('多源订单合到同一消费者后取值；覆盖指标结果里的每个消费者，没命中或指标值为空的取 default；每行带键', async () => {
+  it('多源订单合到同一消费者后取值；人群是全部统一消费者，没命中、指标值为空或不在指标结果里的取 default；每行带键', async () => {
     expect(await run(TIERS)).toEqual([
       { consumer_id: 'c1', tag_key: 'value_tier', tag_value: 'high' },
       { consumer_id: 'c2', tag_key: 'value_tier', tag_value: 'mid' },
       { consumer_id: 'c3', tag_key: 'value_tier', tag_value: 'low' },
       { consumer_id: 'c4', tag_key: 'value_tier', tag_value: 'low' },
+      { consumer_id: 'c5', tag_key: 'value_tier', tag_value: 'low' },
+      { consumer_id: 'c6', tag_key: 'value_tier', tag_value: 'low' },
     ]);
+  });
+
+  it('多指标 all：从未下单但浏览过的消费者命中「浏览未购」，下过单的不命中；没有任何行为的统一消费者也有一行（取 default）', async () => {
+    expect(await run(BROWSE_NO_BUY)).toEqual(['c1', 'c2', 'c3', 'c4', 'c5', 'c6'].map(c => ({ consumer_id: c, tag_key: 'value_tier', tag_value: c === 'c5' ? '浏览未购' : '一般' })));
+  });
+
+  it('多指标 any：任一满足即命中；missing 改写缺省——写 null 时不在结果里的人比较为假', async () => {
+    const anyOf = 'rules:\n  - { value: 活跃, when: { any: [{ metric: views, gte: 5 }, { metric: revenue, gte: 1000 }] } }\ndefault: 沉默\n';
+    expect((await run(anyOf)).map(r => r.tag_value)).toEqual(['活跃', '活跃', '沉默', '沉默', '活跃', '沉默']);
+    const noOrders = 'rules:\n  - { value: 未下单, when: { all: [{ metric: orders, eq: 0 }] } }\ndefault: 下过单\n';
+    expect((await run(noOrders)).map(r => r.tag_value)).toEqual(['下过单', '下过单', '下过单', '下过单', '未下单', '未下单']);
+    expect((await run(`${noOrders}missing: { orders: null }\n`)).map(r => r.tag_value)).toEqual(['下过单', '下过单', '下过单', '下过单', '下过单', '下过单']);
+    // 取最大金额（max）不补 0：没有订单的人比较为假
+    expect((await run('metric: top_amount\nrules:\n  - { value: 小, when: { lt: 100 } }\ndefault: 其他\n')).map(r => r.tag_value))
+      .toEqual(['其他', '其他', '小', '其他', '其他', '其他']);
   });
 
   it('按顺序取第一条命中的规则', async () => {
     const rows = await run('metric: revenue\nrules:\n  - { value: buyer, when: { gte: 100 } }\n  - { value: whale, when: { gte: 1000 } }\ndefault: 0\n');
-    expect(rows.map(r => r.tag_value)).toEqual(['buyer', 'buyer', '0', '0']);
+    expect(rows.map(r => r.tag_value)).toEqual(['buyer', 'buyer', '0', '0', '0', '0']);
   });
 
   const values = (rows: string) => `SELECT * FROM (VALUES ${rows}) t(consumer_id, tag_key, tag_value)`;
@@ -148,9 +228,9 @@ describe('标签 DSL：编译出的 SQL 的结果', () => {
   it('草稿指标内联进标签：门槛不变时只有换了取值的消费者；指标加了过滤，结果里少了的消费者算移出', async () => {
     const draft = (yaml: string) => withMetric(ctx, 'revenue', checkMetric(yaml, base));
     const tag = (c: DslContext) => compileTag(ok(TIERS), c, '2024-07-01', 'value_tier');
-    // c3 只有 20 元订单、c4 的订单金额为空，过滤后都不在指标结果里；c1、c2 的订单都大于 50，取值不变
+    // c3 只有 20 元订单、c4 的订单金额为空，过滤后都不在指标结果里，仍按 0 取 default（人群是全部统一消费者）；c1、c2 的订单都大于 50，取值不变
     const filtered = draft('base: order\nmeasure: { agg: sum, field: amount }\nfilter:\n  - { field: amount, op: gt, value: 50 }\n');
-    expect(await diff(compileTagDiff(tag(ctx), tag(filtered)))).toEqual([{ before: 'low', after: null, consumers: 2 }]);
+    expect(await diff(compileTagDiff(tag(ctx), tag(filtered)))).toEqual([]);
     // 改成数订单笔数：c1 2 笔、其余 1 笔，都低于 100 → 都成 low
     const counted = draft('base: order\nmeasure: { agg: count }\n');
     expect(await diff(compileTagDiff(tag(ctx), tag(counted)))).toEqual([

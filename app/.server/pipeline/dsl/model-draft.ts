@@ -8,7 +8,7 @@ import { CANONICAL_ENTITIES, relationText } from '../../../lib/canonical-model';
 import type { LlmMessage, LlmPurpose } from '../../llm';
 import { AGGS, CONSUMER_ENTITY, FILTER_OPS, fieldsFor, linksToConsumer, MAX_DIMENSIONS, MAX_HOPS, METRIC_SCHEMA, RATIO_AGGS, relationsOf, type DslContext, type MetricSpec } from './metric-spec';
 import type { DslKind } from './index';
-import { metricOf, TAG_CONDITIONS, TAG_SCHEMA } from './tag-spec';
+import { metricOf, SINGLE_TAG_SCHEMA, TAG_CONDITIONS } from './tag-spec';
 
 /** 指标的上下文：各实体能用的字段（已剔除敏感字段）、能做基础实体的实体与实体间的关系 */
 export interface MetricDraftContext {
@@ -76,7 +76,7 @@ const TAG_SYSTEM = [
 /** 可由模型生成的定义：输出 Schema、调用用途、system 提示词与上下文（上下文里没东西可用时是给成员的提示） */
 const DRAFTS = {
   metric: { schema: METRIC_SCHEMA, purpose: 'metric_draft', system: METRIC_SYSTEM, context: metricContext },
-  tag: { schema: TAG_SCHEMA, purpose: 'tag_draft', system: TAG_SYSTEM, context: tagContext },
+  tag: { schema: SINGLE_TAG_SCHEMA, purpose: 'tag_draft', system: TAG_SYSTEM, context: tagContext },
 } satisfies Record<DslKind, { schema: object; purpose: LlmPurpose; system: string; context: (ctx: DslContext) => object | string }>;
 
 /** 模型输出必须符合的 JSON Schema 与调用用途 */

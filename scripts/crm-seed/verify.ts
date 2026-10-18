@@ -255,15 +255,38 @@ try {
         await compare(label, 'm', dims, 'abs(e.value::DOUBLE - a.value::DOUBLE) >= 0.005');
         show(`${key} 探针`, await probeRows('m', dims));
       } else {
-        const tag = parse(s.yaml) as { metric: string; rules: { value: string | number; when: Record<string, number> }[]; default: string | number };
-        if (!EXPECTED[tag.metric]) { console.log(`\n== ${label}：引用的指标 ${tag.metric} 不在 definitions/ 里，跳过`); continue; }
-        const metricYaml = publishedMetrics.get(tag.metric);
-        if (!metricYaml || !same('metric', tag.metric, metricYaml)) { console.log(`\n== ${label}：引用的指标 ${tag.metric} 最新发布版与 definitions/ 不同，跳过`); continue; }
+        type Item = { metric: string } & Record<string, number | string>;
+        type Rule = { value: string | number; when: Record<string, number> | { all?: Item[]; any?: Item[] } };
+        const tag = parse(s.yaml) as { metric?: string; rules: Rule[]; missing?: Record<string, number | null>; default: string | number };
+        // 单指标写法即 all 里一项；引用的指标去重后按出现顺序编号 tm0、tm1……
+        const conditionsOf = (r: Rule): { join: string; items: Item[] } => {
+          if (tag.metric !== undefined) return { join: 'AND', items: [{ ...(r.when as Record<string, number>), metric: tag.metric }] };
+          const w = r.when as { all?: Item[]; any?: Item[] };
+          return w.any ? { join: 'OR', items: w.any } : { join: 'AND', items: w.all ?? [] };
+        };
+        const keys = [...new Set(tag.rules.flatMap(r => conditionsOf(r).items.map(item => item.metric)))];
+        const unknown = keys.find(k => !EXPECTED[k]);
+        if (unknown) { console.log(`\n== ${label}：引用的指标 ${unknown} 不在 definitions/ 里，跳过`); continue; }
+        const changed = keys.find(k => !publishedMetrics.get(k) || !same('metric', k, publishedMetrics.get(k)!));
+        if (changed) { console.log(`\n== ${label}：引用的指标 ${changed} 最新发布版与 definitions/ 不同，跳过`); continue; }
+        // 不在指标结果里（或取值为空）的人：missing 写了按写的，没写时计数与求和记 0，其余记空（与 tag-spec 的口径各写一份，独立核对）
+        const valueOf = (k: string) => {
+          const i = keys.indexOf(k);
+          const agg = (local('metric', k)!.measure as { agg: string }).agg;
+          const missing = tag.missing && k in tag.missing ? tag.missing[k] : ['count', 'count_distinct', 'sum'].includes(agg) ? 0 : null;
+          return missing === null || missing === undefined ? `tm${i}.value::DOUBLE` : `coalesce(tm${i}.value::DOUBLE, ${missing})`;
+        };
         const OPS: Record<string, string> = { gte: '>=', gt: '>', lte: '<=', lt: '<', eq: '=' };
         const sqlv = (v: string | number) => lit(String(v));
-        const cases = tag.rules.map(r => `WHEN ${Object.entries(r.when).map(([op, n]) => `value::DOUBLE ${OPS[op]} ${n}`).join(' AND ') || 'true'} THEN ${sqlv(r.value)}`).join(' ');
-        await expectedMetric(tag.metric, s.as_of, 'tm');
-        await con.run(`CREATE OR REPLACE TEMP TABLE tg_e AS SELECT consumer_id, CASE ${cases} ELSE ${sqlv(tag.default)} END AS value FROM tm_e`);
+        const cases = tag.rules.map(r => {
+          const { join, items } = conditionsOf(r);
+          const terms = items.map(item => `(${Object.entries(item).filter(([op]) => op !== 'metric').map(([op, n]) => `${valueOf(item.metric)} ${OPS[op]} ${n}`).join(' AND ')})`);
+          return `WHEN ${terms.join(` ${join} `)} THEN ${sqlv(r.value)}`;
+        }).join(' ');
+        for (const [i, k] of keys.entries()) await expectedMetric(k, s.as_of, `tm${i}`);
+        // 人群是全部统一消费者
+        await con.run(`CREATE OR REPLACE TEMP TABLE tg_e AS SELECT u.consumer_id, CASE ${cases} ELSE ${sqlv(tag.default)} END AS value
+          FROM (SELECT DISTINCT consumer_id FROM lake.silver._identities) u ${keys.map((_, i) => `LEFT JOIN tm${i}_e tm${i} ON tm${i}.consumer_id = u.consumer_id`).join(' ')}`);
         await con.run(`CREATE OR REPLACE TEMP TABLE tg_a AS SELECT consumer_id, tag_value::VARCHAR AS value FROM lake.${s.table.split('.').map(ident).join('.')}`);
         await compare(label, 'tg', [], 'e.value IS DISTINCT FROM a.value');
         show(`${key} 各取值人数（期望 / 实际）`, await q(`SELECT coalesce(e.value, a.value) AS 取值, e.n AS 期望, a.n AS 实际 FROM

@@ -205,7 +205,7 @@ describe('用模型生成标签定义草稿', () => {
     expect((await calls(acme)).map(c => c.purpose)).toEqual(['tag_draft', 'tag_draft']);
   });
 
-  it('模型输出不合 TAG_SCHEMA 时 422，记审计', async () => {
+  it('模型输出不合 SINGLE_TAG_SCHEMA 时 422，记审计', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     await createDefinition(author, 'metric', 'revenue_30d', REVENUE);
