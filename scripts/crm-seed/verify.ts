@@ -197,6 +197,11 @@ try {
       },
       views_7d: { dims: [], sql: a => `SELECT consumer_id, count(*) AS value FROM ${events} e WHERE event_type = 'view' AND ${win('occurred_utc', 7, a)} GROUP BY 1` },
       coupons_redeemed: { dims: [], sql: () => `SELECT consumer_id, count(*) AS value FROM ${facts('t.coupon', `'loyalty'`)} WHERE status = 'redeemed' GROUP BY 1` },
+      coupon_redeem_rate: {
+        dims: [],
+        sql: () => `SELECT consumer_id, count(*) FILTER (WHERE status = 'redeemed')::DOUBLE / count(*) AS value FROM ${facts('t.coupon', `'loyalty'`)} GROUP BY 1`,
+      },
+      days_since_last_order: { dims: [], sql: a => `SELECT consumer_id, DATE ${lit(a)} - max(created_utc::DATE) AS value FROM ${orders} o WHERE ${PAID} GROUP BY 1` },
       wecom_chats_30d: {
         dims: ['guide'],
         sql: a => `SELECT consumer_id, guide_id AS guide, count(*) AS value FROM ${facts('t.wecom_chat', `'wecom'`, 'external_userid')} WHERE ${win('chat_utc', 30, a)} GROUP BY ALL`,

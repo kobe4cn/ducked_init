@@ -59,6 +59,18 @@ dimensions:
     path: order.store_id -> custom_store.region_id -> custom_region.name
 `;
 
+const RATIO = `base: order
+measure:
+  agg: ratio
+  numerator:
+    agg: count
+    filter:
+      - { field: status, op: eq, value: paid }
+  denominator: { agg: count }
+`;
+const LATEST = 'base: order\nmeasure: { agg: latest, field: amount, by: created_at }\n';
+const DAYS_SINCE = 'base: order\nmeasure: { agg: days_since, field: created_at }\n';
+
 describe('指标 DSL：校验', () => {
   it('合规的定义通过，注册表登记了 metric', () => {
     expect(ok(REGION)).toMatchObject({ base: 'order', measure: { agg: 'sum', field: 'amount' } });
@@ -113,6 +125,41 @@ describe('指标 DSL：校验', () => {
     expect(found.find(i => message.test(i.message)), JSON.stringify(found)).toMatchObject({ line });
   });
 
+  it('ratio / latest / earliest / days_since 合规时通过；分子分母的过滤、by 计入依赖', () => {
+    expect(ok(RATIO).measure).toMatchObject({ agg: 'ratio', numerator: { agg: 'count' }, denominator: { agg: 'count' } });
+    ok('base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: sum, field: amount }\n  denominator: { agg: count_distinct, field: order_id }\n');
+    ok(LATEST);
+    ok('base: order\nmeasure: { agg: earliest, field: amount, by: created_at }\n');
+    ok(DAYS_SINCE);
+    ok('base: custom_visit\nmeasure: { agg: days_since, field: visited_on }\n');
+    expect(DSL_KINDS.metric.dependencies(ok('base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: sum, field: amount, filter: [{ field: x_vip_level, op: eq, value: gold }] }\n  denominator: { agg: count_distinct, field: store_id, filter: [{ field: channel, op: not_null }] }\n')).fields)
+      .toEqual(['amount', 'channel', 'store_id', 'x_vip_level'].map(field => ({ entity: 'order', field })));
+    expect(DSL_KINDS.metric.dependencies(ok(LATEST)).fields).toEqual([{ entity: 'order', field: 'amount' }, { entity: 'order', field: 'created_at' }]);
+    // 已发布版本的 YAML 不经 Schema 直接交给 dependencies：分子缺 filter、缺分母都不出错
+    expect(DSL_KINDS.metric.dependencies({ base: 'order', measure: { agg: 'ratio', numerator: { agg: 'count' } } } as MetricSpec).fields).toEqual([]);
+  });
+
+  it.each([
+    ['latest 配文本字段', 'base: order\nmeasure:\n  agg: latest\n  field: channel\n  by: created_at\n', 'measure.field', /latest 只能用整数或小数字段/],
+    ['latest 的 by 不是时间或日期', 'base: order\nmeasure:\n  agg: latest\n  field: amount\n  by: amount\n', 'measure.by', /by 要用时间或日期字段/],
+    ['latest 缺 by', 'base: order\nmeasure:\n  agg: latest\n  field: amount\n', 'measure', /缺少 by/],
+    ['earliest 的 by 是敏感字段', 'base: order\nmeasure:\n  agg: earliest\n  field: amount\n  by: x_buyer_phone\n', 'measure.by', /敏感/],
+    ['days_since 配非时间字段', 'base: order\nmeasure:\n  agg: days_since\n  field: amount\n', 'measure.field', /days_since 要用时间或日期字段/],
+    ['days_since 缺 field', 'base: order\nmeasure:\n  agg: days_since\n', 'measure', /缺少 field/],
+    ['ratio 的分子配 avg', 'base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: avg, field: amount }\n  denominator: { agg: count }\n', 'measure.numerator.agg', /count、count_distinct、sum/],
+    ['ratio 缺分母', 'base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: count }\n', 'measure', /缺少 denominator/],
+    ['ratio 写了 field', 'base: order\nmeasure:\n  agg: ratio\n  field: amount\n  numerator: { agg: count }\n  denominator: { agg: count }\n', 'measure.field', /不能写 field/],
+    ['sum 写了 by', 'base: order\nmeasure:\n  agg: sum\n  field: amount\n  by: created_at\n', 'measure.by', /不能写 by/],
+    ['分母的 sum 用了文本字段', 'base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: count }\n  denominator: { agg: sum, field: channel }\n', 'measure.denominator.field', /sum 只能用整数或小数字段/],
+    ['分母的 count_distinct 没写字段', 'base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: count }\n  denominator: { agg: count_distinct }\n', 'measure.denominator.agg', /要写 field/],
+    ['分子的字段是敏感字段', 'base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: count_distinct, field: x_buyer_phone }\n  denominator: { agg: count }\n', 'measure.numerator.field', /敏感/],
+    ['分子的过滤用了敏感字段', 'base: customer\nmeasure:\n  agg: ratio\n  numerator:\n    agg: count\n    filter:\n      - { field: email, op: not_null }\n  denominator: { agg: count }\n', 'measure.numerator.filter.0.field', /敏感/],
+    ['分母的过滤取值不在标准枚举里', 'base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: count }\n  denominator:\n    agg: count\n    filter:\n      - { field: status, op: eq, value: lost }\n', 'measure.denominator.filter.0.value', /status.*paid/],
+  ])('%s', (_, yaml, path, message) => {
+    const found = issues(yaml);
+    expect(found.find(i => message.test(i.message)), JSON.stringify(found)).toMatchObject({ path });
+  });
+
   it('多个问题一起报出，按位置排序', () => {
     const found = issues('base: order\nmeasure: { agg: sum, field: channel }\nwindow: { field: amount, days: 30 }\n');
     expect(found.map(i => i.line)).toEqual([2, 3]);
@@ -133,9 +180,10 @@ describe('指标 DSL：编译', () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
       vi.setSystemTime(new Date('2024-01-01T00:00:00Z'));
-      const first = compileMetric(ok(REGION), ctx, '2024-07-01');
+      const first = [REGION, RATIO, LATEST, DAYS_SINCE].map(y => compileMetric(ok(y), ctx, '2024-07-01'));
       vi.setSystemTime(new Date('2030-06-01T00:00:00Z'));
-      expect(compileMetric(ok(REGION), ctx, '2024-07-01')).toBe(first);
+      expect([REGION, RATIO, LATEST, DAYS_SINCE].map(y => compileMetric(ok(y), ctx, '2024-07-01'))).toEqual(first);
+      expect(first[3]).not.toMatch(/current_date|now\(\)/i);
     } finally {
       vi.useRealTimers();
     }
@@ -248,7 +296,7 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
   });
 
   const run = async (yaml: string, asOf = '2024-07-01') => (await con.runAndReadAll(compileMetric(ok(yaml), ctx, asOf))).getRowObjectsJson()
-    .map(r => ({ ...r, value: Number(r.value) }));
+    .map(r => ({ ...r, value: r.value === null ? null : Number(r.value) }));
 
   it('按维度路径分组，关联不到或为空记为「未关联」不丢行；窗口取 (asOf - days, asOf]，打通不到的不计入', async () => {
     expect(await run(REGION)).toEqual([
@@ -264,6 +312,25 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
       { consumer_id: 'c1', value: 5 },
       { consumer_id: 'c2', value: 1 },
     ]);
+  });
+
+  it('ratio：分子分母各带过滤、与顶层过滤叠加，分母为 0 时取值为空；客单价 = sum / count', async () => {
+    expect(await run(RATIO)).toEqual([{ consumer_id: 'c1', value: 0.6 }, { consumer_id: 'c2', value: 1 }]);
+    expect(await run('base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: count }\n  denominator: { agg: count, filter: [{ field: status, op: eq, value: refunded }] }\n'))
+      .toEqual([{ consumer_id: 'c1', value: 5 }, { consumer_id: 'c2', value: null }]);
+    // 分子 sum 过滤后没有行记 0，不是空
+    expect(await run('base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: sum, field: amount, filter: [{ field: status, op: eq, value: refunded }] }\n  denominator: { agg: sum, field: amount }\n'))
+      .toEqual([{ consumer_id: 'c1', value: 2000 / 3180 }, { consumer_id: 'c2', value: 0 }]);
+    expect(await run('base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: sum, field: amount }\n  denominator: { agg: count }\nfilter:\n  - { field: status, op: eq, value: paid }\nwindow: { field: created_at, days: 30 }\n'))
+      .toEqual([{ consumer_id: 'c1', value: 65 }, { consumer_id: 'c2', value: 22 }]);
+  });
+
+  it('latest / earliest 按 by 取最新 / 最早一行的字段；days_since = asOf 减最近一天（UTC 日期）', async () => {
+    expect(await run(LATEST)).toEqual([{ consumer_id: 'c1', value: 100 }, { consumer_id: 'c2', value: 70 }]);
+    expect(await run('base: order\nmeasure: { agg: earliest, field: amount, by: created_at }\nfilter:\n  - { field: amount, op: gte, value: 30 }\n'))
+      .toEqual([{ consumer_id: 'c1', value: 1000 }, { consumer_id: 'c2', value: 70 }]);
+    expect(await run(DAYS_SINCE)).toEqual([{ consumer_id: 'c1', value: 1 }, { consumer_id: 'c2', value: 0 }]);
+    expect(await run(DAYS_SINCE, '2024-07-11')).toEqual([{ consumer_id: 'c1', value: 11 }, { consumer_id: 'c2', value: 10 }]);
   });
 
   it('指向 customer 的一跳按数据源关联；基础实体是 customer 时按自身关联到 consumer_id', async () => {

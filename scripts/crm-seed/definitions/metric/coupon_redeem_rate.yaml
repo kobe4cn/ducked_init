@@ -1,0 +1,9 @@
+# 券核销率：核销的券数 / 领到的券数（C1 = 1/3）
+base: coupon
+measure:
+  agg: ratio
+  numerator:
+    agg: count
+    filter:
+      - { field: status, op: eq, value: redeemed }
+  denominator: { agg: count }

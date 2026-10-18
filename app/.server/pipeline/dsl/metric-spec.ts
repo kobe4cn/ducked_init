@@ -1,6 +1,7 @@
 // app/.server/pipeline/dsl/metric-spec.ts —— 指标定义（YAML，ADR-0025）：基础实体上的一个度量，可带过滤、时间窗口与最多 3 个维度。
 // 先按 JSON Schema（METRIC_SCHEMA）校验结构，再对照标准模型、已发布的自定义实体登记与已发布映射的扩展字段做语义校验：
 // 基础实体要能关联到消费者（customer 本身，或有指向 customer 的 customer_id），字段要存在、类型合用、不能是敏感字段；
+// 度量除普通聚合外还有 ratio（分子 / 分母各带过滤）、latest / earliest（按 by 取最新 / 最早一行）与 days_since（asOf 减最近一天）；
 // 维度路径沿关系走到头：每一跳都是指向下一实体单列主键的关系，最多 3 跳，不能成环。每个问题都带 YAML 里的行列位置。
 // 校验通过后编译成 SQL：基础实体经 silver._identities 关联到 consumer_id（event 的匿名事件缺省再经 silver._device_owner 按设备归属，ADR-0019），
 // 维度路径编译成链式 LEFT JOIN，关联不到或为空记「未关联」；consumer.<字段> 的维度取统一消费者的属性（silver._consumer，ADR-0027），一个人只有一个取值。
@@ -14,16 +15,25 @@ import { describeSchemaError, locator, type Path, type RegisteredEntities } from
 import { ident, lit, silverTable, type MergeMappingParam } from '../merge-engine';
 import { customerSourceColumn } from '../../../lib/customer-source';
 
-export const AGGS = ['count', 'count_distinct', 'sum', 'avg', 'min', 'max'] as const;
+export const AGGS = ['count', 'count_distinct', 'sum', 'avg', 'min', 'max', 'ratio', 'latest', 'earliest', 'days_since'] as const;
+/** ratio 的分子、分母能用的聚合 */
+export const RATIO_AGGS = ['count', 'count_distinct', 'sum'] as const;
 export const FILTER_OPS = ['eq', 'ne', 'in', 'not_in', 'gt', 'gte', 'lt', 'lte', 'is_null', 'not_null'] as const;
 type Scalar = string | number | boolean;
+type Conditions = { field: string; op: (typeof FILTER_OPS)[number]; value?: Scalar | Scalar[] }[];
+/** ratio 的分子或分母：自己的 filter 与顶层 filter、window 叠加 */
+export interface RatioPart { agg: (typeof RATIO_AGGS)[number]; field?: string; filter?: Conditions }
 
 export interface MetricSpec {
   /** 基础实体：customer，或有指向 customer 的 customer_id 的实体 */
   base: string;
-  measure: { agg: (typeof AGGS)[number]; field?: string };
+  /**
+   * agg 为 ratio 时写 numerator / denominator（不写 field）；latest / earliest 按 by（时间或日期）取最新 / 最早一行的 field（数字）；
+   * days_since 是 asOf 减 field（时间或日期）最近一天的天数
+   */
+  measure: { agg: (typeof AGGS)[number]; field?: string; by?: string; numerator?: RatioPart; denominator?: RatioPart };
   /** 基础实体字段上的过滤，全部满足才计入 */
-  filter?: { field: string; op: (typeof FILTER_OPS)[number]; value?: Scalar | Scalar[] }[];
+  filter?: Conditions;
   /** 时间窗口：field（时间或日期）落在 (asOf - days, asOf] 里才计入 */
   window?: { field: string; days: number };
   /**
@@ -55,6 +65,24 @@ export const MAX_HOPS = 3;
 export const UNLINKED = '未关联';
 
 const scalar = { type: ['string', 'number', 'boolean'] };
+const nonEmpty = { type: 'string', minLength: 1 } as const;
+const filterSchema = {
+  type: 'array',
+  items: {
+    type: 'object',
+    required: ['field', 'op'],
+    additionalProperties: false,
+    properties: { field: nonEmpty, op: { enum: FILTER_OPS }, value: { anyOf: [scalar, { type: 'array', items: scalar }] } },
+  },
+} as const;
+const ratioPart = {
+  type: 'object',
+  required: ['agg'],
+  additionalProperties: false,
+  properties: { agg: { enum: RATIO_AGGS }, field: nonEmpty, filter: filterSchema },
+} as const;
+/** agg 为 values 之一时 */
+const aggIs = (...values: string[]) => ({ required: ['agg'], properties: { agg: { enum: values } } });
 
 /** 定义的说明（指标、标签共用）：可选，最多 500 字 */
 export const DESCRIPTION_SCHEMA = { type: 'string', maxLength: 500 } as const;
@@ -70,17 +98,14 @@ export const METRIC_SCHEMA = {
       type: 'object',
       required: ['agg'],
       additionalProperties: false,
-      properties: { agg: { enum: AGGS }, field: { type: 'string', minLength: 1 } },
+      properties: { agg: { enum: AGGS }, field: nonEmpty, by: nonEmpty, numerator: ratioPart, denominator: ratioPart },
+      allOf: [
+        { if: aggIs('ratio'), then: { required: ['numerator', 'denominator'], properties: { field: false, by: false } }, else: { properties: { numerator: false, denominator: false } } },
+        { if: aggIs('latest', 'earliest'), then: { required: ['field', 'by'] }, else: { properties: { by: false } } },
+        { if: aggIs('days_since'), then: { required: ['field'] } },
+      ],
     },
-    filter: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['field', 'op'],
-        additionalProperties: false,
-        properties: { field: { type: 'string', minLength: 1 }, op: { enum: FILTER_OPS }, value: { anyOf: [scalar, { type: 'array', items: scalar }] } },
-      },
-    },
+    filter: filterSchema,
     window: {
       type: 'object',
       required: ['field', 'days'],
@@ -287,34 +312,67 @@ export function checkMetric(text: string, ctx: DslContext): DslCheck<MetricSpec>
     return undefined;
   };
 
-  const { agg, field } = spec.measure;
-  if (field === undefined) {
-    if (agg !== 'count') issue(['measure', 'agg'], `agg 为 ${agg} 时要写 field`);
-  } else {
-    const f = baseField(['measure', 'field'], field, '度量');
-    if (f && (agg === 'sum' || agg === 'avg') && !NUMERIC.includes(f.type)) issue(['measure', 'field'], `${agg} 只能用整数或小数字段，${field} 不是`);
+  /** 普通聚合（或 ratio 的分子、分母）：at 是它在 YAML 里的位置 */
+  const checkAggregate = (at: Path, agg: string, field: string | undefined) => {
+    if (field === undefined) {
+      if (agg !== 'count') issue([...at, 'agg'], `agg 为 ${agg} 时要写 field`);
+      return;
+    }
+    const f = baseField([...at, 'field'], field, '度量');
+    if (f && (agg === 'sum' || agg === 'avg') && !NUMERIC.includes(f.type)) issue([...at, 'field'], `${agg} 只能用整数或小数字段，${field} 不是`);
+  };
+  const checkTemporal = (at: Path, name: string, use: string) => {
+    const f = baseField(at, name, '度量');
+    if (f && !TEMPORAL.includes(f.type)) issue(at, `${use} 要用时间或日期字段，${name} 不是`);
+  };
+
+  /** 过滤条件（顶层 filter 与 ratio 分子、分母的 filter 写法相同）：at 是 filter 数组的位置 */
+  const checkFilter = (at: Path, conds: Conditions) => {
+    for (const [i, cond] of conds.entries()) {
+      const f = baseField([...at, i, 'field'], cond.field, '过滤');
+      const valueAt = [...at, i, 'value'];
+      if (cond.op === 'is_null' || cond.op === 'not_null') {
+        if (cond.value !== undefined) issue(valueAt, `${cond.op} 不用写 value`);
+        continue;
+      }
+      if (cond.value === undefined) {
+        issue([...at, i], `op 为 ${cond.op} 时要写 value`);
+        continue;
+      }
+      const list = cond.op === 'in' || cond.op === 'not_in';
+      if (list !== Array.isArray(cond.value)) {
+        issue(valueAt, list ? `${cond.op} 的取值要写列表` : `${cond.op} 的取值不能是列表`);
+        continue;
+      }
+      if (!f) continue;
+      const problem = [cond.value].flat().map(v => valueProblem(cond.field, f, v)).find(p => p);
+      if (problem) issue(valueAt, problem);
+    }
+  };
+
+  const { agg, field, by } = spec.measure;
+  switch (agg) {
+    case 'ratio':
+      for (const part of ['numerator', 'denominator'] as const) {
+        const p = spec.measure[part]!;
+        checkAggregate(['measure', part], p.agg, p.field);
+        checkFilter(['measure', part, 'filter'], p.filter ?? []);
+      }
+      break;
+    case 'latest': case 'earliest': {
+      const f = baseField(['measure', 'field'], field!, '度量');
+      if (f && !NUMERIC.includes(f.type)) issue(['measure', 'field'], `${agg} 只能用整数或小数字段，${field} 不是（要取时间本身请用 days_since）`);
+      checkTemporal(['measure', 'by'], by!, 'by');
+      break;
+    }
+    case 'days_since':
+      checkTemporal(['measure', 'field'], field!, 'days_since');
+      break;
+    default:
+      checkAggregate(['measure'], agg, field);
   }
 
-  for (const [i, cond] of (spec.filter ?? []).entries()) {
-    const f = baseField(['filter', i, 'field'], cond.field, '过滤');
-    const valueAt = ['filter', i, 'value'];
-    if (cond.op === 'is_null' || cond.op === 'not_null') {
-      if (cond.value !== undefined) issue(valueAt, `${cond.op} 不用写 value`);
-      continue;
-    }
-    if (cond.value === undefined) {
-      issue(['filter', i], `op 为 ${cond.op} 时要写 value`);
-      continue;
-    }
-    const list = cond.op === 'in' || cond.op === 'not_in';
-    if (list !== Array.isArray(cond.value)) {
-      issue(valueAt, list ? `${cond.op} 的取值要写列表` : `${cond.op} 的取值不能是列表`);
-      continue;
-    }
-    if (!f) continue;
-    const problem = [cond.value].flat().map(v => valueProblem(cond.field, f, v)).find(p => p);
-    if (problem) issue(valueAt, problem);
-  }
+  checkFilter(['filter'], spec.filter ?? []);
 
   if (spec.window) {
     const f = baseField(['window', 'field'], spec.window.field, '时间窗口');
@@ -338,7 +396,7 @@ export function checkMetric(text: string, ctx: DslContext): DslCheck<MetricSpec>
 
 const dedupe = (issues: DslIssue[]) => issues.filter((x, i) => issues.findIndex(y => y.path === x.path && y.message === x.message) === i);
 
-/** 指标的取值是不是数字：count、count_distinct、sum、avg 总是，min、max 看度量字段的类型 */
+/** 指标的取值是不是数字：min、max 看度量字段的类型，其余（含 ratio、latest、earliest、days_since）总是 */
 export function isNumericMetric(spec: MetricSpec, ctx: DslContext): boolean {
   const { agg, field } = spec.measure;
   if (agg !== 'min' && agg !== 'max') return true;
@@ -352,7 +410,7 @@ export interface Dependencies {
   metrics: string[];
   /** 基础实体与维度路径经过的每个实体（consumer 维度记作 customer：它的属性来自 silver.customer） */
   entities: string[];
-  /** 度量、过滤、窗口的字段（在基础实体上），与维度路径的各段 */
+  /** 度量（含 by、ratio 分子分母的字段与过滤）、过滤、窗口的字段（在基础实体上），与维度路径的各段 */
   fields: { entity: string; field: string }[];
 }
 
@@ -363,6 +421,12 @@ export function metricDependencies(spec: MetricSpec): Dependencies {
     if (field !== undefined) fields.set(`${entity}.${field}`, { entity, field });
   };
   add(spec.base, spec.measure.field);
+  add(spec.base, spec.measure.by);
+  // 已发布版本的 YAML 不经 Schema 直接交来：分子、分母与各自的 filter 都可能缺
+  for (const part of [spec.measure.numerator, spec.measure.denominator]) {
+    add(spec.base, part?.field);
+    for (const f of part?.filter ?? []) add(spec.base, f.field);
+  }
   for (const f of spec.filter ?? []) add(spec.base, f.field);
   add(spec.base, spec.window?.field);
   for (const d of spec.dimensions ?? []) {
@@ -433,30 +497,40 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
     dims.push(dimension(prev, end.field, d.name));
   }
 
-  const { agg, field } = spec.measure;
-  const measure = field === undefined ? 'COUNT(*)'
-    : agg === 'count_distinct' ? `COUNT(DISTINCT ${col(field)})`
-    : `${agg.toUpperCase()}(${col(field)})`;
-
-  const where: string[] = [];
-  for (const cond of spec.filter ?? []) {
+  const conditions = (conds: Conditions) => conds.map(cond => {
     const f = base.fields.get(cond.field)!;
     const c = col(cond.field);
     switch (cond.op) {
-      case 'is_null': where.push(`${c} IS NULL`); break;
-      case 'not_null': where.push(`${c} IS NOT NULL`); break;
+      case 'is_null': return `${c} IS NULL`;
+      case 'not_null': return `${c} IS NOT NULL`;
       case 'in': case 'not_in': {
         const values = [cond.value!].flat().map(v => sqlValue(f, v)).join(', ');
-        where.push(`${c} ${cond.op === 'in' ? 'IN' : 'NOT IN'} (${values})`);
-        break;
+        return `${c} ${cond.op === 'in' ? 'IN' : 'NOT IN'} (${values})`;
       }
-      default: where.push(`${c} ${COMPARE[cond.op]} ${sqlValue(f, cond.value as Scalar)}`);
+      default: return `${c} ${COMPARE[cond.op]} ${sqlValue(f, cond.value as Scalar)}`;
     }
-  }
+  });
+  // 时间按 UTC 取日期
+  const day = (field: string) => (base.fields.get(field)!.type === 'timestamp' ? `(${col(field)} AT TIME ZONE 'UTC')::DATE` : col(field));
+  const aggregate = (agg: string, field: string | undefined, filter: Conditions = []) => {
+    const expr = field === undefined ? 'COUNT(*)'
+      : agg === 'count_distinct' ? `COUNT(DISTINCT ${col(field)})`
+      : `${agg.toUpperCase()}(${col(field)})`;
+    const conds = conditions(filter);
+    return conds.length ? `${expr} FILTER (WHERE ${conds.join(' AND ')})` : expr;
+  };
+
+  const { agg, field, by, numerator, denominator } = spec.measure;
+  // ratio 只有分母为 0 或为空时记空：分子的 sum 过滤后没有行记 0
+  const measure = agg === 'ratio' ? `CAST(COALESCE(${aggregate(numerator!.agg, numerator!.field, numerator!.filter)}, 0) AS DOUBLE) / NULLIF(${aggregate(denominator!.agg, denominator!.field, denominator!.filter)}, 0)`
+    : agg === 'latest' || agg === 'earliest' ? `${agg === 'latest' ? 'arg_max' : 'arg_min'}(${col(field!)}, ${col(by!)})`
+    : agg === 'days_since' ? `DATE ${lit(asOf)} - MAX(${day(field!)})`
+    : aggregate(agg, field);
+
+  const where = conditions(spec.filter ?? []);
   if (spec.window) {
-    const f = base.fields.get(spec.window.field)!;
-    const day = f.type === 'timestamp' ? `(${col(spec.window.field)} AT TIME ZONE 'UTC')::DATE` : col(spec.window.field);
-    where.push(`${day} > DATE ${lit(asOf)} - ${spec.window.days}`, `${day} <= DATE ${lit(asOf)}`);
+    const d = day(spec.window.field);
+    where.push(`${d} > DATE ${lit(asOf)} - ${spec.window.days}`, `${d} <= DATE ${lit(asOf)}`);
   }
 
   if (byDevice) where.unshift(`${consumer} IS NOT NULL`);

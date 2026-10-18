@@ -161,7 +161,7 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | E1 浏览未购 | 近 7 天浏览 10、加购 2、无订单 | 浏览经跨源引用算到商城那个消费者，浏览指标 10；⚠️「浏览未购」写不出（#146） |
 | E2 时区边界 | `--end` 前 4 天北京时间 07:30 的 POS 订单 | 标准层 `created_at` 是 UTC 前一天 23:30，按 UTC 日期计入窗口 |
 | E3 活动到场 | 报名 2 场、到场 1 场 | 到场数 1 |
-| C1 券 | 领 3 张：核销 1、过期 1、未用 1 | 核销数 1；⚠️ 核销率写不出（#146） |
+| C1 券 | 领 3 张：核销 1、过期 1、未用 1 | 核销数 1；核销率 1/3（#224） |
 | S1 状态探针 | 每个订单源各一人，金额 1/2/4/8/16/32 对应 6 种状态 | 默认营收只含 paid/shipped/completed = 14.00 |
 
 ---
@@ -203,6 +203,8 @@ pnpm tenant:create --slug crmlab --name "简衣 CRM 测试" --admin-email admin@
 | `points_earned_90d` | change_type = earn，90 天 | L1 = 100 |
 | `views_7d` | event_type = view，7 天，事件按 `_customer_source`（商城）找统一消费者 | E1 = 10；P06 = 12（匿名浏览经设备归属计入，登录事件同样跨源找到商城消费者） |
 | `coupons_redeemed` | status = redeemed | C1 = 1 |
+| `coupon_redeem_rate` | ratio：分子 count（status = redeemed）/ 分母 count | C1 = 1/3（0.333…）；没有券的人不在结果里 |
+| `days_since_last_order` | days_since created_at，status in paid/shipped/completed | 每人 = asOf − 最近一笔已付单的 UTC 日期（E2 的 POS 单按 UTC 前一天算） |
 | `wecom_chats_30d` | event_type = wecom_chat，30 天，维度 `event.x_guide_id` | P12 在 G0001 下 4 |
 | `activity_attended` | event_type = activity_attend | E3 = 1 |
 | `revenue_by_city` | 维度 `order.customer_id -> customer.city` | K8：P01 三行（上海、杭州、未关联）；改写维度为 `consumer.city` 后 P01 一行（ADR-0027） |

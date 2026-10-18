@@ -1,0 +1,5 @@
+# 最近一次购买距今天数：asOf 减最近一笔已付订单的 UTC 日期（状态同营收）
+base: order
+measure: { agg: days_since, field: created_at }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }

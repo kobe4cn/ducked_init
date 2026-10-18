@@ -6,7 +6,7 @@
 import { Document } from 'yaml';
 import { CANONICAL_ENTITIES, relationText } from '../../../lib/canonical-model';
 import type { LlmMessage, LlmPurpose } from '../../llm';
-import { AGGS, CONSUMER_ENTITY, FILTER_OPS, fieldsFor, linksToConsumer, MAX_DIMENSIONS, MAX_HOPS, METRIC_SCHEMA, relationsOf, type DslContext, type MetricSpec } from './metric-spec';
+import { AGGS, CONSUMER_ENTITY, FILTER_OPS, fieldsFor, linksToConsumer, MAX_DIMENSIONS, MAX_HOPS, METRIC_SCHEMA, RATIO_AGGS, relationsOf, type DslContext, type MetricSpec } from './metric-spec';
 import type { DslKind } from './index';
 import { metricOf, TAG_CONDITIONS, TAG_SCHEMA } from './tag-spec';
 
@@ -31,7 +31,8 @@ const METRIC_SYSTEM = [
   '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
   '输入：request 是成员用自然语言写的需求；context.entities 是能用的实体与字段（base 为 true 的才能做基础实体），context.relations 是实体间的关系（实体.字段 → 实体.主键）。',
   '输出格式：',
-  `{ "base": 基础实体, "measure": { "agg": ${AGGS.join(' | ')}, "field"?: 基础实体的字段（count 可不写） },`,
+  `{ "base": 基础实体, "measure": { "agg": ${AGGS.join(' | ')}, "field"?: 基础实体的字段（count 可不写）, "by"?: 时间或日期字段（只用于 latest / earliest）,`,
+  `    "numerator"?: 分子, "denominator"?: 分母（只用于 ratio，各为 { "agg": ${RATIO_AGGS.join(' | ')}, "field"?: 字段, "filter"?: 写法同下面的 filter }） },`,
   `  "filter"?: [{ "field": 基础实体的字段, "op": ${FILTER_OPS.join(' | ')}, "value"?: 取值或取值列表（in / not_in 写列表，is_null / not_null 不写） }],`,
   '  "window"?: { "field": 基础实体的时间或日期字段, "days": 正整数 },',
   `  "dimensions"?: [{ "name": 小写字母开头的列名, "path": 维度路径 }]（最多 ${MAX_DIMENSIONS} 个）,`,
@@ -39,6 +40,8 @@ const METRIC_SYSTEM = [
   '规则：',
   '- 只用 context 里给出的实体与字段，不要编造；context 里没有的字段（包括敏感字段）一律不要用。',
   '- sum / avg 只能用整数或小数字段；过滤取值按字段类型写，有 enum 的字段只能用其中的取值。',
+  `- 比率（如核销率、客单价）用 ratio：写 numerator 与 denominator，不写 field；分子、分母的 agg 只能是 ${RATIO_AGGS.join(' / ')}，各自的 filter 与顶层 filter、window 同时生效。`,
+  '- latest / earliest 按 by 取最新 / 最早一行的 field，field 只能是整数或小数字段；距今天数（如最近一次购买距今几天）用 days_since，field 是时间或日期字段。',
   `- 维度路径从基础实体出发，写成 实体.字段 -> 实体.字段，每一跳要沿 context.relations 里的一条关系走到下一实体的主键，最多 ${MAX_HOPS} 跳；`,
   `  或者写一段 ${CONSUMER_ENTITY}.字段，取统一消费者的属性（字段是 customer 的字段，基础实体要有 customer_id）。`,
   '- 需求没提到的部分不要加；不要输出 device_attribution。',
