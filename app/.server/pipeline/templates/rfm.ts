@@ -2,10 +2,8 @@
 // 按打通后的统一消费者（silver."order" join silver._identities）算最近一次购买距 as_of 的天数（R）、单数（F）与金额（M），
 // 打 1–5 分后按分群规则表归入人群。交易时间取 coalesce(paid_at, created_at)，按 UTC 日期计；打通不到消费者的订单不计入。
 // SQL 移植自 src/04_crm.ts 的 gold.rfm：五分位时 R 分为 6 - ntile(5)，并列值按 consumer_id 二级排序，结果不随执行顺序变化
-import { entityOf } from '../../../lib/canonical-model';
-import { customerSourceColumn } from '../../../lib/customer-source';
 import { lit } from '../../../lib/mapping-expr';
-import { IDENTITIES } from '../identity-engine';
+import { parseAsOf, parseLookbackDays, parseStatuses, windowOrders, type OrderWindow } from './order-window';
 
 /** 一项分值的闭区间条件（1–5），不写的一端不限 */
 export interface ScoreRange { min?: number; max?: number }
@@ -21,13 +19,8 @@ export type RfmBinning =
   | { method: 'quintile' }
   | { method: 'thresholds'; recency: number[]; frequency: number[]; monetary: number[] };
 
-export interface RfmParams {
-  /** 计算基准日（UTC，YYYY-MM-DD）：只计入这一天及之前的订单，R 是到这一天的天数 */
-  asOf: string;
-  /** 回看天数：只计入 as_of 往前这么多天内（含 as_of 当天）的订单 */
-  lookbackDays: number;
-  /** 计入的订单状态 */
-  statuses: string[];
+/** asOf：R 是到这一天的天数 */
+export interface RfmParams extends OrderWindow {
   binning: RfmBinning;
   segments: SegmentRule[];
 }
@@ -48,17 +41,9 @@ export const RFM_DEFAULTS: Omit<RfmParams, 'asOf'> = {
   ],
 };
 
-const ORDER_STATUSES = entityOf('order')!.fields.find(f => f.name === 'status')!.enum!;
 const KEYS = ['asOf', 'lookbackDays', 'statuses', 'binning', 'segments'];
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
-
-function asOf(v: unknown) {
-  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v) || new Date(`${v}T00:00:00Z`).toISOString().slice(0, 10) !== v) {
-    throw new Error('参数 asOf 必须是 YYYY-MM-DD 格式的日期');
-  }
-  return v;
-}
 
 function thresholds(v: unknown, key: string) {
   const ok = Array.isArray(v) && v.length === 4 && v.every(t => typeof t === 'number' && Number.isFinite(t) && t >= 0)
@@ -104,12 +89,10 @@ export function parseRfmParams(params: Record<string, unknown>): RfmParams {
   const unknown = Object.keys(params).filter(k => !KEYS.includes(k));
   if (unknown.length) throw new Error(`RFM 模板不认识的参数：${unknown.join('、')}`);
   const p = { ...RFM_DEFAULTS, ...params };
-  if (!Number.isInteger(p.lookbackDays) || p.lookbackDays < 1 || p.lookbackDays > 3650) throw new Error('参数 lookbackDays 必须是 1 到 3650 之间的整数');
-  const statuses = p.statuses as unknown;
-  if (!Array.isArray(statuses) || statuses.length === 0 || !statuses.every(s => ORDER_STATUSES.includes(s))) {
-    throw new Error(`参数 statuses 必须是非空的订单状态列表，可选 ${ORDER_STATUSES.join('、')}`);
-  }
-  return { asOf: asOf(params.asOf), lookbackDays: p.lookbackDays, statuses: [...new Set(statuses as string[])].sort(), binning: binning(p.binning), segments: segments(p.segments) };
+  return {
+    asOf: parseAsOf(params.asOf), lookbackDays: parseLookbackDays(p.lookbackDays), statuses: parseStatuses(p.statuses),
+    binning: binning(p.binning), segments: segments(p.segments),
+  };
 }
 
 /** 模板定义里的参数：除每次运行时给定的 asOf 以外的全部参数 */
@@ -120,21 +103,6 @@ export function parseRfmDefinition(params: Record<string, unknown>): RfmDefiniti
   if ('asOf' in params) throw new Error('参数 asOf 在每次运行时给定，不属于模板定义');
   const { asOf: _, ...definition } = parseRfmParams({ ...params, asOf: '1970-01-01' });
   return definition;
-}
-
-const ORDER = 'silver."order"';
-const day = (column: string) => `(${column} AT TIME ZONE 'UTC')::DATE`;
-
-/** 回看窗口内、状态计入的订单，带打通到的消费者（打通不到时为空） */
-function windowOrders(p: RfmParams) {
-  const asOfDate = `DATE ${lit(p.asOf)}`;
-  const orderDate = day('coalesce(o.paid_at, o.created_at)');
-  return `
-  SELECT i.consumer_id, o.amount, ${orderDate} AS order_date
-  FROM ${ORDER} o
-  LEFT JOIN ${IDENTITIES} i ON i._source = o.${customerSourceColumn('customer_id')} AND i.customer_id = o.customer_id
-  WHERE o.status IN (${p.statuses.map(lit).join(', ')})
-    AND ${orderDate} BETWEEN ${asOfDate} - ${p.lookbackDays - 1} AND ${asOfDate}`;
 }
 
 const count = (column: string, op: '<=' | '>=', cuts: number[]) => `1 + ${cuts.map(t => `(${column} ${op} ${t})::INT`).join(' + ')}`;

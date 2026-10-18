@@ -11,8 +11,7 @@ import { lit, mergeToSilver, type MergeDrop, type MergeGroupParam, type MergeMap
 import { MERGE_RULE_KINDS, type MergeRuleKind } from '../../lib/merge-groups';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './identity-engine';
-import { TEMPLATES } from './templates';
-import { compileRfmUnlinked } from './templates/rfm';
+import { TASK_KINDS, TEMPLATES, type Template, type TemplateId } from './templates';
 import { assertOrThrow, runAssertions } from './assertions';
 import { ensureCustomerSourceColumns } from './customer-source-columns';
 import { PartialFailure } from './partial-failure';
@@ -202,6 +201,53 @@ function positiveInt(params: Params, key: string, max: number) {
   return v as number;
 }
 
+/** silver 下缺了某张表时的说明：先做什么才会有它 */
+function missingTableHint(table: string) {
+  if (table === '_identities') return `标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`;
+  if (table === '_consumer') return `标准层还没有统一消费者属性（${CONSUMER}）：重新合并一次映射`;
+  if (table.startsWith('_')) return `标准层还没有 silver.${table}：重新合并一次映射`;
+  return `标准层还没有 silver.${table}：先发布 ${table} 映射并合并`;
+}
+
+/**
+ * 分析模板任务（ADR-0004）：按参数（asOf 必填，其余取模板默认值）把标准层编译成模板的 SELECT，
+ * 写进结果层的一张快照表 gold."<模板 ID>__<任务 ID>"，只有 consumer_id 与汇总值，没有明文。
+ * 发布、重新计算或定时刷新入队的任务带上定义版本 definitionVersion 与来源 trigger（登记快照时记下），其余参数是定义的参数加上 asOf；
+ * 也可以直接给参数、不带版本。开头给没重新合并过的老湖补 _customer_source（订单按它关联消费者，ADR-0030），
+ * 再查模板要求的表；计算前对读到的实体跑内置断言（ADR-0026），error 级失败时任务失败、不写快照表。
+ * 结果带表名、行数、补全后的参数、全部断言 assertions，以及模板另报的计数（如 RFM 打通不到消费者的订单数 unlinkedOrders）
+ */
+function templateTask(id: TemplateId): Handler {
+  // 各模板的参数类型不同，这里只在 parse 与 compile 之间传递
+  const template = TEMPLATES[id] as unknown as Template<unknown, unknown>;
+  return {
+    label: template.label,
+    async run(con, params, { taskId }) {
+      const { definitionVersion: _, trigger: __, ...rest } = params;
+      const p = template.parse(rest);
+      await ensureCustomerSourceColumns(con);
+      const tables = [...template.requires, ...template.optional ?? []];
+      const present = new Set((await rows<{ name: string }>(con, `
+        SELECT table_name AS name FROM information_schema.tables
+        WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${tables.map(lit).join(', ')})`)).map(t => t.name));
+      const missing = template.requires.find(t => !present.has(t));
+      if (missing) throw new Error(missingTableHint(missing));
+      const assertions = await runAssertions(con, template.entities, taskId);
+      assertOrThrow(assertions);
+      const name = `${id}__${taskId}`;
+      await con.run(`CREATE TABLE gold."${name}" AS ${template.compile(p, t => present.has(t))}`);
+      const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM gold."${name}"`);
+      const counts: Record<string, number> = {};
+      for (const [key, sql] of Object.entries(template.counts?.(p) ?? {})) counts[key] = Number((await rows<{ n: string }>(con, sql))[0].n);
+      return { table: `gold.${name}`, rows: Number(n), ...counts, params: p, assertions };
+    },
+  };
+}
+
+/** 每个模板的任务类型 → 它的任务 */
+const TEMPLATE_HANDLERS = Object.fromEntries((Object.keys(TASK_KINDS) as TemplateId[]).map(id => [TASK_KINDS[id], templateTask(id)])) as
+  { [K in TemplateId as (typeof TASK_KINDS)[K]]: Handler };
+
 export const HANDLERS = {
   'lake.inventory': {
     label: '盘点数据湖',
@@ -330,36 +376,10 @@ export const HANDLERS = {
       return result;
     },
   },
-  // RFM 分层：按参数（asOf 必填，其余取模板默认值）把打通后的统一消费者的订单编译成 R/F/M 分与人群，
-  // 写进结果层的一张快照表 gold."rfm__<任务 ID>"，只有 consumer_id 与分值，没有明文。打通不到消费者的订单不计入，结果里报告条数。
-  // 发布、重新计算或定时刷新入队的任务带上定义版本 definitionVersion 与来源 trigger（登记快照时记下），其余参数是定义的参数加上 asOf；
-  // 也可以直接给参数、不带版本。
-  // 计算前先对读到的实体跑内置断言（ADR-0026），error 级失败时任务失败、不写快照表；结果带全部断言 assertions。
-  // 开头给没重新合并过的老湖补 _customer_source（订单按它关联消费者，ADR-0030）
-  'gold.rfm': {
-    label: TEMPLATES.rfm.label,
-    async run(con, params, { taskId }) {
-      const { definitionVersion: _, trigger: __, ...rest } = params;
-      const rfm = TEMPLATES.rfm.parse(rest);
-      await ensureCustomerSourceColumns(con);
-      const present = await rows<{ name: string }>(con, `
-        SELECT table_name AS name FROM information_schema.tables
-        WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN ('order', '_identities')`);
-      const has = (name: string) => present.some(t => t.name === name);
-      if (!has('order')) throw new Error('标准层还没有订单（silver.order）：先发布 order 映射并合并');
-      if (!has('_identities')) throw new Error(`标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`);
-      const assertions = await runAssertions(con, TEMPLATES.rfm.entities, taskId);
-      assertOrThrow(assertions);
-      const name = `rfm__${taskId}`;
-      await con.run(`CREATE TABLE gold."${name}" AS ${TEMPLATES.rfm.compile(rfm)}`);
-      const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM gold."${name}"`);
-      const [{ n: unlinked }] = await rows<{ n: string }>(con, compileRfmUnlinked(rfm));
-      return { table: `gold.${name}`, rows: Number(n), unlinkedOrders: Number(unlinked), params: rfm, assertions };
-    },
-  },
+  ...TEMPLATE_HANDLERS,
   // 指标或标签（ADR-0025）：发布定义时入队，参数里带上入队时按当天编译好的 SQL 与它用到的实体（不再访问平台库）。
   // 标准层有这些实体与身份打通结果（SQL 用到设备归属时还要有 _device_owner，用到 consumer 维度时还要有 _consumer）时，把 SQL 的结果写进结果层的一张快照表 gold."<种类>__<任务 ID>"，只有 consumer_id、维度与值。
-  // 断言与开头补 _customer_source 同 gold.rfm
+  // 断言与开头补 _customer_source 同分析模板任务（templateTask）
   'gold.dsl': {
     label: '指标与标签',
     async run(con, params, { taskId }) {
@@ -391,7 +411,7 @@ export const HANDLERS = {
     label: '快照过期',
     async run(con, params) {
       const tables = params.tables;
-      if (!isStrings(tables) || !tables.every(t => /^gold\.[a-z]+__[0-9a-f-]{36}$/.test(t))) {
+      if (!isStrings(tables) || !tables.every(t => /^gold\.[a-z][a-z0-9]*__[0-9a-f-]{36}$/.test(t))) {
         throw new Error('参数 tables 必须是非空的结果层快照表名列表');
       }
       for (const t of tables) await con.run(`DROP TABLE IF EXISTS gold."${t.slice('gold.'.length)}"`);

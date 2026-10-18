@@ -10,13 +10,10 @@ import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
-import { TEMPLATES } from './pipeline/templates';
+import { TASK_KINDS, TEMPLATES, type TemplateId } from './pipeline/templates';
 import { insertTask } from './tasks';
 
-export type TemplateId = keyof typeof TEMPLATES;
-
-/** 模板 → 运行它的任务类型 */
-export const TASK_KINDS = { rfm: 'gold.rfm' } as const satisfies Record<TemplateId, string>;
+export { TASK_KINDS, templateOfKind, type TemplateId } from './pipeline/templates';
 
 /** 可以展示给成员的业务错误 */
 export class TemplateError extends Error {

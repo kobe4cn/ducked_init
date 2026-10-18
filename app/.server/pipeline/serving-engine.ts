@@ -14,7 +14,7 @@ export interface ServingParams { version: number; target: string; snapshots: Ser
 export interface ServingRows { tags: number; metrics: number; rfm: number; consumer_aliases: number }
 
 /** 结果层快照表名 gold.<种类>__<任务 ID> */
-export const SNAPSHOT_TABLE = /^gold\.([a-z]+)__[0-9a-f-]{36}$/;
+export const SNAPSHOT_TABLE = /^gold\.([a-z][a-z0-9]*)__[0-9a-f-]{36}$/;
 
 /** 服务库在存储前缀下的位置 */
 export const servingPath = (dataPath: string, version: number) => `${dataPath}${SERVING_DIR}v${version}.duckdb`;

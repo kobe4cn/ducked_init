@@ -20,6 +20,7 @@ import { applyKeyCheck } from '../source-key-check';
 import { enqueueDueSyncs } from '../source-sync';
 import { enqueueDueVerifies } from '../source-verify';
 import { claimNextTask, failStaleTasks, finishTask, heartbeatTasks, setWorkerPid, type ClaimedTask } from '../tasks';
+import { templateOfKind } from './templates';
 import type { WorkerInput, WorkerOutcome } from './worker';
 
 const WORKER_ENTRY = fileURLToPath(new URL('./worker.ts', import.meta.url));
@@ -92,13 +93,14 @@ export function createDispatcher({
         // 业务主键的全表检查通过：写回声明并记审计（工作进程里没有平台库）
         if (task.kind === 'source.keycheck' && outcome!.result) await applyKeyCheck(task.tenantId, task.id);
         // 分析模板任务写好了结果层的快照表：登记到平台元数据，分析页据此列出
-        if (task.kind === 'gold.rfm' && outcome!.result) await registerSnapshot(task.tenantId, task.id, 'rfm');
+        const template = templateOfKind(task.kind);
+        if (template && outcome!.result) await registerSnapshot(task.tenantId, task.id, template);
         if (task.kind === 'gold.dsl' && outcome!.result) await registerDslSnapshot(task.tenantId, task.id);
         // 结果层任务因 error 级断言失败（没有登记快照）：告警租户管理员并记审计
-        if ((task.kind === 'gold.rfm' || task.kind === 'gold.dsl') && 'error' in outcome!) await alertAssertionFailure(task.tenantId, task, outcome.result);
+        if ((template || task.kind === 'gold.dsl') && 'error' in outcome!) await alertAssertionFailure(task.tenantId, task, outcome.result);
         // 到期快照的表已删、旧文件已清理：标记为已过期，分析页不再打开它们
         if (task.kind === 'gold.expire' && outcome!.result) await markExpired(task.tenantId, task.id);
-        // 有了新快照或快照过期：重建服务库（ADR-0033）；断言失败的任务也带 result，要看有没有 error。生成成功后才切换指针
+        // 有了新快照或快照过期：重建服务库（ADR-0033），服务库只收 RFM 与指标、标签，其他模板的快照不触发；断言失败的任务也带 result，要看有没有 error。生成成功后才切换指针
         const succeeded = !('error' in outcome!);
         if ((task.kind === 'gold.rfm' || task.kind === 'gold.dsl' || task.kind === 'gold.expire') && succeeded) await enqueueServingBuild(task.tenantId);
         if (task.kind === 'serving.build' && succeeded) await activateServingStore(task.tenantId, task.id);
