@@ -1,6 +1,8 @@
 // app/.server/pipeline/templates/index.ts —— 分析模板注册表（ADR-0004）：模板 ID → 名称、默认参数、参数校验与编译函数，以及运行它的任务类型。
 // 编译函数是纯函数，同样的参数得到同样的 SQL；SQL 只读标准层，产出写进结果层由任务负责（handlers.ts 按注册表通用地登记任务）。
 // 加一个模板：新建模板文件，在 TEMPLATES 与 TASK_KINDS 各加一行；模板 ID 以小写字母开头、只含小写字母与数字（快照表名 <模板 ID>__<任务 ID>）
+import { CHURN_DEFAULTS, compileChurn, parseChurnDefinition, parseChurnParams, type ChurnParams } from './churn';
+import { CLV_DEFAULTS, compileClv, parseClvDefinition, parseClvParams, type ClvParams } from './clv';
 import { COHORT_DEFAULTS, compileCohort, parseCohortDefinition, parseCohortParams, type CohortParams } from './cohort';
 import { compileRepurchase, parseRepurchaseDefinition, parseRepurchaseParams, REPURCHASE_DEFAULTS, type RepurchaseParams } from './repurchase';
 import { compileRfm, compileRfmUnlinked, parseRfmDefinition, parseRfmParams, RFM_DEFAULTS, type RfmParams } from './rfm';
@@ -75,12 +77,36 @@ export const TEMPLATES = {
     ],
     parse: parseRepurchaseParams, parseDefinition: parseRepurchaseDefinition, compile: compileRepurchase,
   } satisfies Template<RepurchaseParams, Omit<RepurchaseParams, 'asOf'>>,
+  // 窗口内至少一单的消费者，按个人购买节奏衰减的存活概率预测未来价值
+  clv: {
+    label: 'CLV', entities: ['order', 'customer'], requires: ['order', '_identities'], defaults: CLV_DEFAULTS,
+    form: [
+      { key: 'lookbackDays', label: '回看天数', kind: 'int', min: 1, max: 3650 },
+      { key: 'horizonDays', label: '预测天数', kind: 'int', min: 1, max: 3650 },
+      { key: 'minTenureDays', label: '最短客龄（天）', kind: 'int', min: 1, max: 365 },
+      { key: 'decay', label: '衰减系数', kind: 'int', min: 1, max: 10 },
+      { key: 'statuses', label: '计入的订单状态', kind: 'statuses' },
+    ],
+    parse: parseClvParams, parseDefinition: parseClvDefinition, compile: compileClv,
+  } satisfies Template<ClvParams, Omit<ClvParams, 'asOf'>>,
+  // 窗口内订单数够多的消费者都在，at_risk 标出沉默超过自身节奏若干倍的；不读其他快照
+  churn: {
+    label: '流失预警', entities: ['order', 'customer'], requires: ['order', '_identities'], defaults: CHURN_DEFAULTS,
+    form: [
+      { key: 'lookbackDays', label: '回看天数', kind: 'int', min: 1, max: 3650 },
+      { key: 'minOrders', label: '最少订单数', kind: 'int', min: 2, max: 100 },
+      { key: 'silenceMultiplier', label: '沉默倍数', kind: 'int', min: 1, max: 10 },
+      { key: 'minGapDays', label: '最短间隔（天）', kind: 'int', min: 1, max: 365 },
+      { key: 'statuses', label: '计入的订单状态', kind: 'statuses' },
+    ],
+    parse: parseChurnParams, parseDefinition: parseChurnDefinition, compile: compileChurn,
+  } satisfies Template<ChurnParams, Omit<ChurnParams, 'asOf'>>,
 };
 
 export type TemplateId = keyof typeof TEMPLATES;
 
 /** 模板 → 运行它的任务类型 */
-export const TASK_KINDS = { rfm: 'gold.rfm', user360: 'gold.user360', cohort: 'gold.cohort', repurchase: 'gold.repurchase' } as const satisfies Record<TemplateId, `gold.${TemplateId}`>;
+export const TASK_KINDS = { rfm: 'gold.rfm', user360: 'gold.user360', cohort: 'gold.cohort', repurchase: 'gold.repurchase', clv: 'gold.clv', churn: 'gold.churn' } as const satisfies Record<TemplateId, `gold.${TemplateId}`>;
 
 /** 任务类型 → 模板，不是模板任务时为 undefined */
 export const templateOfKind = (kind: string) =>

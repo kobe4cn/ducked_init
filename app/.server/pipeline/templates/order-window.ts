@@ -23,10 +23,13 @@ export function parseAsOf(v: unknown) {
   return v;
 }
 
-export function parseLookbackDays(v: unknown) {
-  if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > 3650) throw new Error('参数 lookbackDays 必须是 1 到 3650 之间的整数');
+/** 模板的整数参数：min 到 max 之间（含） */
+export function parseIntParam(key: string, v: unknown, min: number, max: number) {
+  if (!Number.isInteger(v) || (v as number) < min || (v as number) > max) throw new Error(`参数 ${key} 必须是 ${min} 到 ${max} 之间的整数`);
   return v as number;
 }
+
+export const parseLookbackDays = (v: unknown) => parseIntParam('lookbackDays', v, 1, 3650);
 
 /** 去重并排序，同样的状态集合得到同样的 SQL */
 export function parseStatuses(v: unknown) {

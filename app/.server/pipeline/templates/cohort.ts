@@ -2,7 +2,7 @@
 // 按首单所在周期（月或周）把统一消费者分群，每个消费者一行，交给页面再聚合成留存矩阵。订单口径同 RFM（见 order-window.ts），
 // 但不限回看下界：首单是 as_of 及之前全部历史里的第一单。SQL 改写自 src/04_crm.ts 的同期群
 import { lit } from '../../../lib/mapping-expr';
-import { parseAsOf, parseStatuses, qualifyingOrders } from './order-window';
+import { parseAsOf, parseIntParam, parseStatuses, qualifyingOrders } from './order-window';
 
 export const GRANULARITIES = ['month', 'week'] as const;
 export type Granularity = (typeof GRANULARITIES)[number];
@@ -31,17 +31,12 @@ function parseGranularity(v: unknown) {
   return v as Granularity;
 }
 
-function parsePeriods(v: unknown) {
-  if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > 60) throw new Error('参数 periods 必须是 1 到 60 之间的整数');
-  return v as number;
-}
-
 /** 校验任务参数并补上默认值：asOf 必填，其余不写时取 COHORT_DEFAULTS */
 export function parseCohortParams(params: Record<string, unknown>): CohortParams {
   const unknown = Object.keys(params).filter(k => !KEYS.includes(k));
   if (unknown.length) throw new Error(`同期群模板不认识的参数：${unknown.join('、')}`);
   const p = { ...COHORT_DEFAULTS, ...params };
-  return { asOf: parseAsOf(params.asOf), granularity: parseGranularity(p.granularity), periods: parsePeriods(p.periods), statuses: parseStatuses(p.statuses) };
+  return { asOf: parseAsOf(params.asOf), granularity: parseGranularity(p.granularity), periods: parseIntParam('periods', p.periods, 1, 60), statuses: parseStatuses(p.statuses) };
 }
 
 /** 模板定义里的参数：除每次运行时给定的 asOf 以外的全部参数 */

@@ -1,7 +1,7 @@
 // app/.server/pipeline/templates/repurchase.ts —— 复购模板：把参数确定性地编译成 DuckDB SQL（ADR-0004），同样的参数永远得到同样的 SQL。
 // 回看窗口内（口径同 RFM，见 order-window.ts）至少下过一单的统一消费者各一行：首单、第二单（都是窗口内的）与第二单是否在首单后
 // windowDays 天内，交给页面再聚合成复购率。SQL 改写自 src/04_crm.ts 的复购
-import { parseAsOf, parseLookbackDays, parseStatuses, qualifyingOrders, type OrderWindow } from './order-window';
+import { parseAsOf, parseIntParam, parseLookbackDays, parseStatuses, qualifyingOrders, type OrderWindow } from './order-window';
 
 /** asOf：只看回看窗口内、这一天及之前的订单 */
 export interface RepurchaseParams extends OrderWindow {
@@ -17,18 +17,13 @@ export const REPURCHASE_DEFAULTS: Omit<RepurchaseParams, 'asOf'> = {
 
 const KEYS = ['asOf', 'lookbackDays', 'windowDays', 'statuses'];
 
-function parseWindowDays(v: unknown) {
-  if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > 730) throw new Error('参数 windowDays 必须是 1 到 730 之间的整数');
-  return v as number;
-}
-
 /** 校验任务参数并补上默认值：asOf 必填，其余不写时取 REPURCHASE_DEFAULTS */
 export function parseRepurchaseParams(params: Record<string, unknown>): RepurchaseParams {
   const unknown = Object.keys(params).filter(k => !KEYS.includes(k));
   if (unknown.length) throw new Error(`复购模板不认识的参数：${unknown.join('、')}`);
   const p = { ...REPURCHASE_DEFAULTS, ...params };
   return {
-    asOf: parseAsOf(params.asOf), lookbackDays: parseLookbackDays(p.lookbackDays), windowDays: parseWindowDays(p.windowDays),
+    asOf: parseAsOf(params.asOf), lookbackDays: parseLookbackDays(p.lookbackDays), windowDays: parseIntParam('windowDays', p.windowDays, 1, 730),
     statuses: parseStatuses(p.statuses),
   };
 }

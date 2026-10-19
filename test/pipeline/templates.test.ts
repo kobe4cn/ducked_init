@@ -94,6 +94,26 @@ describe('分析模板定义', () => {
     expect(await getTemplate(analyst, 'rfm')).toMatchObject({ params: PARAMS, draft: { version: 2 }, published: { version: 1 } });
   });
 
+  it('通用表单的五个模板（user360、cohort、repurchase、clv、churn）都能起草、由另一位数据工程师发布，并各产出一张快照', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const drafts = {
+      user360: { lookbackDays: 3650 },
+      cohort: { granularity: 'week', periods: 60 },
+      repurchase: { lookbackDays: 3650, windowDays: 60 },
+      clv: { lookbackDays: 3650, decay: 3 },
+      churn: { lookbackDays: 3650, minOrders: 2 },
+    } as const;
+    for (const [id, params] of Object.entries(drafts) as [keyof typeof drafts, Record<string, unknown>][]) {
+      expect(await saveDraft(author, id, params)).toBe(1);
+      expect(await publishTemplate(reviewer, id, 1)).toMatchObject({ kind: `gold.${id}`, status: 'queued', params: { ...params, definitionVersion: 1 } });
+    }
+    await drain();
+    const snapshots = await listSnapshots(acme);
+    for (const [id, params] of Object.entries(drafts)) {
+      expect(snapshots.filter(s => s.template === id)).toEqual([expect.objectContaining({ definitionVersion: 1, trigger: 'publish', params: expect.objectContaining(params) })]);
+    }
+  });
+
   it('重新计算：以当前生效版本的参数入队 gold.rfm，不产生新版本；可指定参考日期，不能晚于今天；同模板已有任务在排队或运行时拒绝', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
