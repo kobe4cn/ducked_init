@@ -3,7 +3,7 @@
 // 打 1–5 分后按分群规则表归入人群。交易时间取 coalesce(paid_at, created_at)，按 UTC 日期计；打通不到消费者的订单不计入。
 // SQL 移植自 src/04_crm.ts 的 gold.rfm：五分位时 R 分为 6 - ntile(5)，并列值按 consumer_id 二级排序，结果不随执行顺序变化
 import { lit } from '../../../lib/mapping-expr';
-import { parseAsOf, parseLookbackDays, parseStatuses, windowOrders, type OrderWindow } from './order-window';
+import { parseAsOf, parseLookbackDays, parseStatuses, qualifyingOrders, type OrderWindow } from './order-window';
 
 /** 一项分值的闭区间条件（1–5），不写的一端不限 */
 export interface ScoreRange { min?: number; max?: number }
@@ -129,7 +129,7 @@ function condition(rule: SegmentRule) {
 /** 编译成一条 SELECT：每个统一消费者一行 consumer_id, recency_days, frequency, monetary, r, f, m, segment，按 consumer_id 排序 */
 export function compileRfm(p: RfmParams): string {
   const rules = p.segments.slice(0, -1).map(s => `    WHEN ${condition(s)} THEN ${lit(s.name)}`).join('\n');
-  return `WITH o AS (${windowOrders(p)}
+  return `WITH o AS (${qualifyingOrders(p)}
 ), b AS (
   SELECT consumer_id, DATE ${lit(p.asOf)} - max(order_date) AS recency_days, count(*) AS frequency, sum(amount) AS monetary
   FROM o WHERE consumer_id IS NOT NULL GROUP BY consumer_id
@@ -149,6 +149,6 @@ FROM s ORDER BY consumer_id`;
 
 /** 编译成一条 SELECT：回看窗口内、状态计入、但打通不到消费者（所在数据源没有 customer 映射或没有这个 customer_id）的订单数 n */
 export function compileRfmUnlinked(p: RfmParams): string {
-  return `SELECT count(*) AS n FROM (${windowOrders(p)}
+  return `SELECT count(*) AS n FROM (${qualifyingOrders(p)}
 ) WHERE consumer_id IS NULL`;
 }

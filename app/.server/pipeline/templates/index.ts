@@ -1,6 +1,8 @@
 // app/.server/pipeline/templates/index.ts —— 分析模板注册表（ADR-0004）：模板 ID → 名称、默认参数、参数校验与编译函数，以及运行它的任务类型。
 // 编译函数是纯函数，同样的参数得到同样的 SQL；SQL 只读标准层，产出写进结果层由任务负责（handlers.ts 按注册表通用地登记任务）。
 // 加一个模板：新建模板文件，在 TEMPLATES 与 TASK_KINDS 各加一行；模板 ID 以小写字母开头、只含小写字母与数字（快照表名 <模板 ID>__<任务 ID>）
+import { COHORT_DEFAULTS, compileCohort, parseCohortDefinition, parseCohortParams, type CohortParams } from './cohort';
+import { compileRepurchase, parseRepurchaseDefinition, parseRepurchaseParams, REPURCHASE_DEFAULTS, type RepurchaseParams } from './repurchase';
 import { compileRfm, compileRfmUnlinked, parseRfmDefinition, parseRfmParams, RFM_DEFAULTS, type RfmParams } from './rfm';
 import { compileUser360, parseUser360Definition, parseUser360Params, USER360_DEFAULTS, type User360Params } from './user360';
 
@@ -53,12 +55,32 @@ export const TEMPLATES = {
     parse: parseUser360Params, parseDefinition: parseUser360Definition,
     compile: (p, has) => compileUser360(p, { consent: has('_consumer_consent') }),
   } satisfies Template<User360Params, Omit<User360Params, 'asOf'>>,
+  // 首单取全部历史里的第一单，只收首单在最近 periods 个周期里的消费者
+  cohort: {
+    label: '同期群', entities: ['order', 'customer'], requires: ['order', '_identities'], defaults: COHORT_DEFAULTS,
+    form: [
+      { key: 'granularity', label: '周期', kind: 'enum', options: [{ value: 'month', label: '按月' }, { value: 'week', label: '按周' }] },
+      { key: 'periods', label: '周期数', kind: 'int', min: 1, max: 60 },
+      { key: 'statuses', label: '计入的订单状态', kind: 'statuses' },
+    ],
+    parse: parseCohortParams, parseDefinition: parseCohortDefinition, compile: compileCohort,
+  } satisfies Template<CohortParams, Omit<CohortParams, 'asOf'>>,
+  // 首单与第二单都取回看窗口内的
+  repurchase: {
+    label: '复购', entities: ['order', 'customer'], requires: ['order', '_identities'], defaults: REPURCHASE_DEFAULTS,
+    form: [
+      { key: 'lookbackDays', label: '回看天数', kind: 'int', min: 1, max: 3650 },
+      { key: 'windowDays', label: '复购窗口（天）', kind: 'int', min: 1, max: 730 },
+      { key: 'statuses', label: '计入的订单状态', kind: 'statuses' },
+    ],
+    parse: parseRepurchaseParams, parseDefinition: parseRepurchaseDefinition, compile: compileRepurchase,
+  } satisfies Template<RepurchaseParams, Omit<RepurchaseParams, 'asOf'>>,
 };
 
 export type TemplateId = keyof typeof TEMPLATES;
 
 /** 模板 → 运行它的任务类型 */
-export const TASK_KINDS = { rfm: 'gold.rfm', user360: 'gold.user360' } as const satisfies Record<TemplateId, `gold.${TemplateId}`>;
+export const TASK_KINDS = { rfm: 'gold.rfm', user360: 'gold.user360', cohort: 'gold.cohort', repurchase: 'gold.repurchase' } as const satisfies Record<TemplateId, `gold.${TemplateId}`>;
 
 /** 任务类型 → 模板，不是模板任务时为 undefined */
 export const templateOfKind = (kind: string) =>

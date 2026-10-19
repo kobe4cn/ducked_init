@@ -2,10 +2,12 @@
 // 其他租户的快照 404，已过期的快照标灰、打不开；RFM 模板参数页的权限矩阵：查看者只读，分析师能起草不能发布，
 // 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm；按生效版本重新计算（分析师 403、未来日期与重复入队被拒）；
 // 用户 360 走注册表里的通用参数表单（只读、起草、校验报错、多余字段不传、发布后入队 gold.user360、未登记模板 404）与通用快照明细（全部列、是 / 否、分页、没有明文）
-import { eq } from 'drizzle-orm';
+// 同期群与复购同样走通用表单（周期下拉框、起草、双人发布入队 gold.cohort / gold.repurchase 并登记快照，周期偏移列表用顿号连接）
+import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
+import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { listSnapshots, readTemplateSnapshot } from '../../app/.server/snapshots';
 import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
@@ -320,5 +322,61 @@ describe('用户 360 模板参数页与快照（通用表单与通用明细）',
     const ids = pages.flatMap(p => p.rows.map(r => String(r.consumer_id)));
     expect(ids).toEqual([...new Set(ids)].sort());
     expect(pages[0]!.columns[0]).toBe('consumer_id');
+  });
+});
+
+describe('同期群与复购模板参数页（通用表单）', () => {
+  /** 打通好的 acme，分析师起草、另一位数据工程师发布，跑完发布入队的任务后按参考日期 2024-07-01 重新计算，返回租户、发布入队的任务与重新计算后的快照 */
+  async function publishAndRecompute(id: 'cohort' | 'repurchase', form: Record<string, string | string[]>) {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await memberOf(acme, 'de@acme.com', 'data_engineer');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    expect((await analyst.post(`/analytics/templates/${id}`, { intent: 'save', ...form })).status).toBe(302);
+    expect((await analyst.post(`/analytics/templates/${id}`, { intent: 'publish', version: '1' })).status).toBe(403);
+    const de = await loginAs(app, 'de@acme.com');
+    expect((await de.post(`/analytics/templates/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    const [published] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, `gold.${id}`)));
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    expect((await de.post(`/analytics/templates/${id}`, { intent: 'recompute', asOf: '2024-07-01' })).status).toBe(302);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const registered = await listSnapshots(acme);
+    return { acme, de, published: published!, registered, recomputed: registered.find(s => s.taskId !== published!.id)! };
+  }
+
+  it('同期群：通用表单有周期下拉框，参数不合法时报错；按周起草、双人发布后以新参数入队 gold.cohort 并登记快照，快照页偏移列表用顿号连接', async () => {
+    const other = await newTenant('other');
+    await memberOf(other, 'analyst@other.com', 'analyst');
+    const browser = await loginAs(app, 'analyst@other.com');
+    const html = await (await browser.get('/analytics/templates/cohort')).text();
+    expect(html).toContain('同期群 · 模板参数');
+    expect(html).toMatch(/value="month" selected="">按月</);
+    expect(html).toMatch(/name="periods"[^>]*value="12"/);
+    const bad = await browser.post('/analytics/templates/cohort', { intent: 'save', granularity: 'day', periods: '12', statuses: ['paid'] });
+    expect(bad.status).toBe(400);
+    expect(await bad.text()).toContain('granularity 必须是 month 或 week');
+
+    const { de, published, registered, recomputed } = await publishAndRecompute('cohort', { granularity: 'week', periods: '30', statuses: ['paid', 'shipped', 'completed'] });
+    expect(published).toMatchObject({ kind: 'gold.cohort', params: { granularity: 'week', periods: 30, definitionVersion: 1 } });
+    expect(registered.map(s => s.template)).toEqual(['cohort', 'cohort']);
+    expect(await (await de.get('/analytics/templates/cohort')).text()).toMatch(/value="week" selected="">按周</);
+
+    const page = await (await de.get(`/analytics/snapshots/${recomputed.id}`)).text();
+    expect(page).toContain('同期群 · 2024-07-01');
+    for (const column of ['consumer_id', 'cohort_start', 'orders', 'active_periods']) expect(page).toMatch(new RegExp(`<th[^>]*>${column}</th>`));
+    expect(page.match(/data-consumer="/g)).toHaveLength(5);
+    // crm 5、crm 6 + 会员 5：4-01（4-01 那周）、6-20 与 6-25（6-17 与 6-24 那周）
+    expect(page).toContain('0、11、12');
+  });
+
+  it('复购：windowDays 改成 60 起草、双人发布后入队 gold.repurchase 并登记快照，crm 5 那组 80 天才复购，不再算复购', async () => {
+    const { de, published, recomputed } = await publishAndRecompute('repurchase', { lookbackDays: '365', windowDays: '60', statuses: ['paid', 'shipped', 'completed'] });
+    expect(published).toMatchObject({ kind: 'gold.repurchase', params: { lookbackDays: 365, windowDays: 60, definitionVersion: 1 } });
+    expect(recomputed.template).toBe('repurchase');
+    const rows = (await readTemplateSnapshot(recomputed, { page: 1, pageSize: 50 })).rows;
+    expect(rows.map(r => [r.days_to_second, r.repurchased]).sort()).toEqual([[29, true], [80, false], [null, false], [null, false], [null, false]].sort());
+    const page = await (await de.get(`/analytics/snapshots/${recomputed.id}`)).text();
+    expect(page).toContain('复购 · 2024-07-01');
+    expect(page).toContain('回看 365 天');
   });
 });

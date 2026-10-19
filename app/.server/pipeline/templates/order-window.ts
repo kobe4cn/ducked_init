@@ -1,5 +1,5 @@
 // app/.server/pipeline/templates/order-window.ts —— 按订单计算的模板共用的订单口径：基准日 asOf、回看天数与计入的订单状态的校验，
-// 以及回看窗口内的订单（交易时间取 coalesce(paid_at, created_at)，按 UTC 日期计，带打通到的统一消费者）
+// 以及计入的订单（交易时间取 coalesce(paid_at, created_at)，按 UTC 日期计，带打通到的统一消费者）
 import { entityOf } from '../../../lib/canonical-model';
 import { customerSourceColumn } from '../../../lib/customer-source';
 import { lit } from '../../../lib/mapping-expr';
@@ -39,8 +39,11 @@ export function parseStatuses(v: unknown) {
 const ORDER = 'silver."order"';
 const day = (column: string) => `(${column} AT TIME ZONE 'UTC')::DATE`;
 
-/** 回看窗口内、状态计入的订单 consumer_id, amount, order_date，带打通到的消费者（打通不到时为空） */
-export function windowOrders(p: OrderWindow) {
+/**
+ * 状态计入、不晚于 as_of 的订单 consumer_id, amount, order_date，带打通到的消费者（打通不到时为空）；
+ * 给了 lookbackDays 时只取回看窗口内的，不给时不限下界（全部历史）
+ */
+export function qualifyingOrders(p: Omit<OrderWindow, 'lookbackDays'> & { lookbackDays?: number }) {
   const asOfDate = `DATE ${lit(p.asOf)}`;
   const orderDate = day('coalesce(o.paid_at, o.created_at)');
   return `
@@ -48,5 +51,5 @@ export function windowOrders(p: OrderWindow) {
   FROM ${ORDER} o
   LEFT JOIN ${IDENTITIES} i ON i._source = o.${customerSourceColumn('customer_id')} AND i.customer_id = o.customer_id
   WHERE o.status IN (${p.statuses.map(lit).join(', ')})
-    AND ${orderDate} BETWEEN ${asOfDate} - ${p.lookbackDays - 1} AND ${asOfDate}`;
+    AND ${p.lookbackDays === undefined ? `${orderDate} <= ${asOfDate}` : `${orderDate} BETWEEN ${asOfDate} - ${p.lookbackDays - 1} AND ${asOfDate}`}`;
 }

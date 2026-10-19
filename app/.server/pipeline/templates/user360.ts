@@ -4,7 +4,7 @@
 import { CHANNELS } from '../../../lib/canonical-model';
 import { ident, lit } from '../../../lib/mapping-expr';
 import { CONSUMER, CONSUMER_CONSENT } from '../identity-engine';
-import { parseAsOf, parseLookbackDays, parseStatuses, windowOrders, type OrderWindow } from './order-window';
+import { parseAsOf, parseLookbackDays, parseStatuses, qualifyingOrders, type OrderWindow } from './order-window';
 
 /** asOf：recency_days、tenure_days 是到这一天的天数 */
 export type User360Params = OrderWindow;
@@ -42,7 +42,7 @@ export function parseUser360Definition(params: Record<string, unknown>): User360
 export function compileUser360(p: User360Params, { consent }: { consent: boolean }): string {
   const asOfDate = `DATE ${lit(p.asOf)}`;
   const column = (ch: string) => ident(`consent_${ch}`);
-  return `WITH o AS (${windowOrders(p)}
+  return `WITH o AS (${qualifyingOrders(p)}
 ), b AS (
   SELECT consumer_id, count(*) AS orders, sum(amount) AS monetary, min(order_date) AS first_order_date, max(order_date) AS last_order_date
   FROM o WHERE consumer_id IS NOT NULL GROUP BY consumer_id
