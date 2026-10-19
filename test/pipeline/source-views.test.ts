@@ -78,6 +78,8 @@ describe('源视图草稿', () => {
       ['SHOW TABLES', /SHOW/],
       // 内层 CTE 的名字在外层不可见：外层同名的引用不是 CTE，是系统视图
       ['SELECT * FROM (WITH duckdb_databases AS (SELECT 1) SELECT * FROM duckdb_databases) a, duckdb_databases', /原始层没有表 duckdb_databases/],
+      // CTE 的定义体里同名的引用不是它自己，而是同名的系统视图
+      ['WITH duckdb_databases AS (SELECT * FROM duckdb_databases) SELECT * FROM duckdb_databases', /原始层没有表 duckdb_databases/],
       [`SELECT * FROM lake.${bronzeSchema(id)}.customers`, /不能读 lake\./],
       ["SELECT getenv('HOME') AS h, _op, _batch, _commit_ts FROM customers", /函数 getenv/],
       ["SELECT current_setting('allowed_directories') AS s, _op, _batch, _commit_ts FROM customers", /函数 current_setting/],

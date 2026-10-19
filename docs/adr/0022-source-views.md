@@ -6,7 +6,7 @@
 
 **写入由只读挂载挡住，跨 schema 读取另由解析器挡住。** 校验与预览都在请求内用 `openTenantLake(..., { readOnly: true })` 挂载数据湖（同映射空跑），任何写入都会被 DuckDB 拒绝。只读挂载挡不住读别的 schema，所以执行前先用 DuckDB 自己的解析器 `json_serialize_sql` 拿到解析树（`pipeline/source-view-engine.ts` 的 `checkViewSql`）：
 - 只能有一条语句，而且必须是 SELECT。`json_serialize_sql` 对 SELECT 以外的语句直接报错。
-- 解析树里每个表引用（含子查询、表达式里的子查询、CTE 里的查询）都检查一遍。基表不能带 catalog；schema 只能为空或本数据源的 `bronze_<数据源 ID>`。不带 schema 的表名要么是所在作用域里的 CTE（一个查询定义的 CTE 只在这个查询里可见，外层同名的引用不算），要么是本数据源原始层现有的表。这样 `silver`、`gold`、其他数据源的原始层、本数据源的 `_keys` / `_mirror`、会话的本机库 `stage`、DuckDB 的系统视图都读不到。
+- 解析树里每个表引用（含子查询、表达式里的子查询、CTE 里的查询）都检查一遍。基表不能带 catalog；schema 只能为空或本数据源的 `bronze_<数据源 ID>`。不带 schema 的表名要么是所在作用域里的 CTE（一个查询定义的 CTE 只在这个查询里可见，外层同名的引用不算；CTE 的定义体只看得到排在它前面的 CTE，递归 CTE 只在 UNION 右半边看得到自己，见 ADR-0036 与 `pipeline/sql-refs.ts`），要么是本数据源原始层现有的表。这样 `silver`、`gold`、其他数据源的原始层、本数据源的 `_keys` / `_mirror`、会话的本机库 `stage`、DuckDB 的系统视图都读不到。
 - 能读出会话配置或环境的标量函数（`getenv`、`current_setting`、`getvariable`）拒绝。
 - 表引用的种类按白名单放行：基表、子查询、连接、`VALUES`、`PIVOT`。表函数（`read_parquet` 等可以读任意路径）和 `SHOW` / `DESCRIBE` / `SUMMARIZE` 一律拒绝。以后 DuckDB 新增的种类也默认拒绝。
 

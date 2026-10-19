@@ -247,6 +247,14 @@ const ACTIONS = {
       .map(m => `${m.table} → ${entityLabel(m.entity)} 的 ${m.columns.map(c => `${c.column} ${c.count} 个`).join('、')}`)
       .join('；')}新取值落入兜底`,
   },
+  // 数据查询工作台与个人沙箱（ADR-0036）：查询只记 SQL、耗时与行数，不记查询结果
+  'workbench.query': {
+    label: '执行查询',
+    describe: (d: Detail) => `${d.error ? `失败：${d.error}` : `${d.rows} 行${d.truncated ? '（已截断）' : ''}`}，耗时 ${d.durationMs} 毫秒：${d.sql}`,
+  },
+  'sandbox.save': { label: '保存沙箱表', describe: (d: Detail) => `${d.name}` },
+  'sandbox.share': { label: '分享沙箱表', describe: (d: Detail) => `${d.name}` },
+  'sandbox.unshare': { label: '撤销沙箱表分享', describe: (d: Detail) => `${d.name}` },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },

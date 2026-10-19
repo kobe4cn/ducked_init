@@ -1,5 +1,5 @@
 // app/.server/pipeline/source-view-engine.ts —— 源视图：校验一段只读原始层的 SELECT，并在只读挂载的数据湖上取出视图的列与前几行样本（ADR-0022）。
-// 写入由只读挂载挡住；跨 schema 的读取另由这里挡住：用 DuckDB 自己的解析器（json_serialize_sql）拿到 SQL 引用的每一张表，
+// 写入由只读挂载挡住；跨 schema 的读取另由这里挡住：用 DuckDB 自己的解析器（json_serialize_sql）拿到 SQL 引用的每一张表（sql-refs.ts），
 // 只能是本数据源原始层（bronze_<数据源 ID>）的表或所在作用域里的 CTE，不能用表函数（read_parquet 等可以读任意路径）。
 // 视图要输出平台列 _op、_batch、_commit_ts，映射才能沿用变更批次的增量语义（ADR-0006）。
 // 样本不直接读原始层：会话的本机库 stage 里给本数据源的每张原始层表建一个同名视图，敏感列先换成按租户加盐的哈希，
@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { SENSITIVE_FORMATS, SENSITIVE_NAME } from '../../lib/sensitive';
 import { TEXT_FORMATS, type TextFormat } from './source-engine';
+import { collectRefs, normalizeSql } from './sql-refs';
 import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
 
 /** 可以展示给成员的 SQL 问题 */
@@ -20,49 +21,12 @@ export interface ViewColumn { name: string; type: string; sensitive: boolean }
 /** tables：视图引用的本数据源原始层的表（映射在这些表同步后合并） */
 export interface ViewPreview { columns: ViewColumn[]; rows: Record<string, unknown>[]; limit: number; tables: string[] }
 
-/** SQL 引用的一张表；cte 为真时它是所在作用域里定义的 CTE */
-interface TableRef { catalog: string; schema: string; table: string; cte: boolean }
-
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 
 /** 去掉首尾空白与结尾的分号 */
-export const normalizeViewSql = (sql: string) => sql.trim().replace(/[;\s]+$/, '');
-
-/** 能读出会话配置或环境的标量函数 */
-const DENIED_FUNCTIONS = new Set(['getenv', 'current_setting', 'getvariable']);
-
-/** 可以出现在 FROM 里的表引用种类；其余（表函数、SHOW / DESCRIBE 等）一律拒绝 */
-const ALLOWED_REFS = new Set(['BASE_TABLE', 'SUBQUERY', 'JOIN', 'EXPRESSION_LIST', 'EMPTY', 'PIVOT']);
-
-/**
- * 解析树里引用的表与不允许的表引用（表函数名或种类），所有层级，含子查询与表达式里的子查询。
- * ctes 是当前作用域里可见的 CTE 名：一个查询定义的 CTE 只在这个查询（含 CTE 本身，可以递归）里可见，外层同名的引用不算 CTE。
- * 表引用节点带 sample 字段，不带表达式节点的 class 字段，种类也不像查询节点那样以 _NODE 结尾
- */
-function collect(node: unknown, out: { tables: TableRef[]; forbidden: string[] }, ctes: ReadonlySet<string> = new Set()) {
-  if (Array.isArray(node)) {
-    for (const n of node) collect(n, out, ctes);
-    return;
-  }
-  if (!node || typeof node !== 'object') return;
-  const o = node as Record<string, unknown>;
-  const defined = (o.cte_map as { map?: { key: string }[] } | undefined)?.map ?? [];
-  if (defined.length) ctes = new Set([...ctes, ...defined.map(c => c.key.toLowerCase())]);
-  if (o.class === 'FUNCTION' && DENIED_FUNCTIONS.has(String(o.function_name).toLowerCase())) out.forbidden.push(`函数 ${o.function_name}`);
-  if ('sample' in o && !('class' in o) && !String(o.type).endsWith('_NODE')) {
-    if (o.type === 'BASE_TABLE') {
-      const [catalog, schema, table] = [String(o.catalog_name ?? ''), String(o.schema_name ?? ''), String(o.table_name)];
-      out.tables.push({ catalog, schema, table, cte: !catalog && !schema && ctes.has(table.toLowerCase()) });
-    } else if (o.type === 'TABLE_FUNCTION') {
-      out.forbidden.push(`表函数 ${(o.function as { function_name?: string } | undefined)?.function_name ?? ''}`.trim());
-    } else if (!ALLOWED_REFS.has(String(o.type))) {
-      out.forbidden.push(o.type === 'SHOW_REF' ? 'SHOW / DESCRIBE / SUMMARIZE' : String(o.type));
-    }
-  }
-  for (const v of Object.values(o)) collect(v, out, ctes);
-}
+export const normalizeViewSql = normalizeSql;
 
 /**
  * 校验源视图的 SQL：只能是一条 SELECT，引用的表只能是本数据源原始层的表（可以带 bronze_<数据源 ID> 前缀，也可以不带，不能带 catalog）
@@ -77,8 +41,7 @@ export async function checkViewSql(con: DuckDBConnection, sql: string, sourceId:
     throw new ViewSqlError(/only select/i.test(tree.error_message ?? '') ? '源视图只能是一条 SELECT 语句，不能写入或执行其他语句' : `SQL 有语法错误：${tree.error_message}`);
   }
   if (tree.statements?.length !== 1) throw new ViewSqlError('源视图只能是一条 SELECT 语句');
-  const found = { tables: [] as TableRef[], forbidden: [] as string[] };
-  collect(tree.statements, found);
+  const found = collectRefs(tree.statements);
   if (found.forbidden.length) throw new ViewSqlError(`源视图不能用 ${[...new Set(found.forbidden)].join('、')}，只能读本数据源原始层的表`);
   const schema = bronzeSchema(sourceId);
   const own = new Map(bronzeTables.map(t => [t.toLowerCase(), t]));

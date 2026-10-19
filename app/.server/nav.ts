@@ -9,6 +9,7 @@ export function navFor(member: CurrentMember) {
     { to: '/model', label: '标准模型' },
     { to: '/lineage', label: '数据地图' },
     ...(can(member.role, 'results:read') ? [{ to: '/analytics', label: '分析' }] : []),
+    ...(can(member.role, 'sandbox') ? [{ to: '/workbench', label: '查询' }] : []),
     { to: '/tasks', label: '任务' },
     ...(can(member.role, 'members:manage') ? [{ to: '/members', label: '成员' }] : []),
     ...(can(member.role, 'api_keys:manage') ? [{ to: '/api-keys', label: 'API Key' }] : []),
