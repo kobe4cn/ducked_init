@@ -90,15 +90,15 @@ fields:
 `;
 
 /**
- * 开通租户 acme，由 de@acme.com 登记并同步三个身份打通数据源（seedIdentitySources），发布三个 customer 映射与埋点事件映射，
- * 由 de2@acme.com 审核发布；orders 为真时再发布 CRM 与会员的订单映射（ID 在 orderMappings 里），consents 为真时再发布两边的同意映射（ID 在 consentMappings 里）。
+ * 开通租户 acme（或 slug 给定的租户，返回的租户 ID 仍在 acme 字段里），由 de@<slug>.com 登记并同步三个身份打通数据源（seedIdentitySources，重建源库里的三个 schema），
+ * 发布三个 customer 映射与埋点事件映射，由 de2@<slug>.com 审核发布；orders 为真时再发布 CRM 与会员的订单映射（ID 在 orderMappings 里），consents 为真时再发布两边的同意映射（ID 在 consentMappings 里）。
  * 返回租户、两位成员、数据源 ID、customer 映射 ID，
  * 以及数据源 ID → 简称（crm / loyalty / tracking）
  */
-export async function publishedIdentitySources({ orders = false, consents = false } = {}) {
-  const acme = await newTenant('acme');
-  const author = await memberOf(acme, 'de@acme.com');
-  const reviewer = await memberOf(acme, 'de2@acme.com');
+export async function publishedIdentitySources({ orders = false, consents = false, slug = 'acme' } = {}) {
+  const acme = await newTenant(slug);
+  const author = await memberOf(acme, `de@${slug}.com`);
+  const reviewer = await memberOf(acme, `de2@${slug}.com`);
   const { crm, loyalty, tracking } = await seedIdentitySources(author, { orders, consents });
   const mappings = {
     crm: await publish(author, reviewer, crm, CRM),

@@ -6,6 +6,7 @@ import { CLV_DEFAULTS, compileClv, parseClvDefinition, parseClvParams, type ClvP
 import { COHORT_DEFAULTS, compileCohort, parseCohortDefinition, parseCohortParams, type CohortParams } from './cohort';
 import { compileRepurchase, parseRepurchaseDefinition, parseRepurchaseParams, REPURCHASE_DEFAULTS, type RepurchaseParams } from './repurchase';
 import { compileRfm, compileRfmUnlinked, parseRfmDefinition, parseRfmParams, RFM_DEFAULTS, type RfmParams } from './rfm';
+import { TEST_VERSIONS } from './test-versions';
 import { compileUser360, parseUser360Definition, parseUser360Params, USER360_DEFAULTS, type User360Params } from './user360';
 
 /** 通用参数表单的一项：int 是整数输入框，statuses 是订单状态多选，enum 是 options 里的单选 */
@@ -117,13 +118,21 @@ export const templateOfKind = (kind: string) =>
 /** 各模板退役的旧版本（当前版本在 TEMPLATES 里），锁定了旧版本的定义仍按它编译 */
 export const TEMPLATE_HISTORY: Partial<Record<TemplateId, readonly Template<unknown, unknown>[]>> = {};
 
+/** 注册表里的当前版本（不看测试开关） */
+const registered = (id: TemplateId) => TEMPLATES[id] as unknown as Template<unknown, unknown>;
+
+/** 测试开关打开时（TEMPLATE_TEST_VERSIONS=1）模板的测试版本；每次调用时读环境变量，测试在 import 之后才设 */
+const testVersion = (id: TemplateId) => {
+  if (process.env.TEMPLATE_TEST_VERSIONS !== '1') return undefined;
+  return TEST_VERSIONS[id]?.(registered(id));
+};
+
 /** 模板的当前版本：新建定义锁定它。取当前版本一律经过这里 */
-export const latestTemplate = (id: TemplateId) => TEMPLATES[id] as unknown as Template<unknown, unknown>;
+export const latestTemplate = (id: TemplateId) => testVersion(id) ?? registered(id);
 
 /** 模板的某个版本，注册表里没有时抛错 */
 export function templateAt(id: TemplateId, version: number) {
-  const latest = latestTemplate(id);
-  const found = latest.version === version ? latest : TEMPLATE_HISTORY[id]?.find(t => t.version === version);
+  const found = [testVersion(id), registered(id), ...TEMPLATE_HISTORY[id] ?? []].find(t => t?.version === version);
   if (!found) throw new Error(`模板 ${TEMPLATES[id].label} 没有第 ${version} 版`);
   return found;
 }

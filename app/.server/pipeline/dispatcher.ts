@@ -43,6 +43,8 @@ export interface DispatcherOptions {
 const WORKER_ENV_KEYS = [
   'PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'NODE_ENV', 'SystemRoot',
   'SOURCE_SYNC_LOOKBACK_MINUTES', 'SOURCE_SYNC_LOOKBACK_IDS', 'SOURCE_RECONCILE_HOURS',
+  // 只给测试用的模板版本开关（templates/test-versions.ts）
+  'TEMPLATE_TEST_VERSIONS',
 ];
 const workerEnv = () => Object.fromEntries(WORKER_ENV_KEYS.flatMap(k => (process.env[k] === undefined ? [] : [[k, process.env[k]!]])));
 
