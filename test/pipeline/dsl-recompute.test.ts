@@ -59,10 +59,13 @@ async function publishedMetricAndTag() {
   await drain();
   await backdate(acme, 'metric:revenue');
   await backdate(acme, 'tag:value_tier');
-  const old = await listSnapshots(acme);
+  const old = await dslSnapshots(acme);
   expect(old).toHaveLength(2);
   return { acme, author, reviewer, sources, old };
 }
+
+/** 指标与标签的快照：映射合并后平台自动启用的模板也有快照，这里不看 */
+const dslSnapshots = async (tenantId: string) => (await listSnapshots(tenantId)).filter(s => s.template.includes(':'));
 
 const queuedDsl = (tenantId: string) => getDb().select().from(tasks)
   .where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'gold.dsl'), inArray(tasks.status, ['queued', 'running'])));
@@ -84,7 +87,7 @@ describe('发布指标新版本后下游重算', () => {
     expect(metricTask.params.sql).toContain('1000000000');
 
     await drain();
-    const after = await listSnapshots(acme);
+    const after = await dslSnapshots(acme);
     expect(after).toHaveLength(4);
     for (const s of old) expect(after.find(a => a.id === s.id)).toEqual(s);
     const oldTag = old.find(s => s.template === 'tag:value_tier')!;
@@ -112,7 +115,7 @@ describe('发布指标新版本后下游重算', () => {
     await expect(backfillDefinition(reviewer, 'metric', 'revenue')).rejects.toThrow(/排队或运行中/);
 
     await drain();
-    const backfilled = await listSnapshots(acme);
+    const backfilled = await dslSnapshots(acme);
     expect(backfilled).toHaveLength(6);
     for (const s of old) expect(backfilled.find(a => a.id === s.id)).toEqual(s);
     expect(backfilled.filter(s => s.params.asOf === EARLIER).map(s => [s.template, s.definitionVersion]).sort()).toEqual([
@@ -149,7 +152,7 @@ describe('多指标标签的下游重算', () => {
     await publishDefinition(reviewer, 'metric', 'orders', 2);
     expect((await queuedDsl(acme)).map(t => [t.params.kind, t.params.key]).sort()).toEqual([['metric', 'orders'], ['tag', 'mixed']]);
     await drain();
-    expect((await listSnapshots(acme)).filter(s => s.template === 'tag:mixed')).toHaveLength(3);
+    expect((await dslSnapshots(acme)).filter(s => s.template === 'tag:mixed')).toHaveLength(3);
   });
 });
 
@@ -175,7 +178,7 @@ describe('发布与回刷标签', () => {
     const { tasks: enqueued } = await backfillDefinition(reviewer, 'tag', 'value_tier');
     expect(enqueued.map(t => [t.params.kind, t.params.definitionVersion, t.params.asOf])).toEqual([['tag', 2, EARLIER]]);
     await drain();
-    const tag = (await listSnapshots(acme)).find(s => s.taskId === enqueued[0]!.id)!;
+    const tag = (await dslSnapshots(acme)).find(s => s.taskId === enqueued[0]!.id)!;
     expect(tag).toMatchObject({ template: 'tag:value_tier', definitionVersion: 2, params: { asOf: EARLIER } });
     expect(await onLake(acme, `SELECT DISTINCT tag_key FROM gold."tag__${tag.taskId}"`)).toEqual([{ tag_key: 'value_tier' }]);
   });
@@ -187,7 +190,8 @@ const syncAndMerge = async (author: Awaited<ReturnType<typeof publishedMetricAnd
   await drain();
 };
 const newOrder = (no: string) => `INSERT INTO crm.orders VALUES ('${no}', 1, 'paid', 50, '2024-07-01 10:00', '2024-07-01 10:00', '2024-07-01 ${no.slice(1).padStart(2, '0')}:00')`;
-const refreshed = async () => (await enqueueDueRefreshes()).map(t => [t.params.kind, t.params.key, t.params.definitionVersion, t.params.asOf, t.params.trigger]).sort();
+// 自动启用的模板也会定时刷新，这里只看指标与标签
+const refreshed = async () => (await enqueueDueRefreshes()).filter(t => t.kind === 'gold.dsl').map(t => [t.params.kind, t.params.key, t.params.definitionVersion, t.params.asOf, t.params.trigger]).sort();
 
 describe('定时刷新', () => {
   afterEach(() => { vi.useRealTimers(); });
@@ -195,11 +199,11 @@ describe('定时刷新', () => {
   it('依赖的实体有新合并后入队当天的指标与下游标签（来源 scheduled）；依赖没变、已在排队、当天已有当前版本的快照、租户有合并在排队时不入队', async () => {
     const { acme, author, sources } = await publishedMetricAndTag();
     // 发布之后没有新合并
-    expect(await enqueueDueRefreshes()).toEqual([]);
+    expect(await refreshed()).toEqual([]);
     // 只合并了 event：revenue 依赖 order 与 customer，不入队
     await syncAndMerge(author, sources.tracking,
       `INSERT INTO tracking.events VALUES ('e10', 'u1', 'd1', 'view', '2024-07-01 10:00', '2024-07-01')`);
-    expect(await enqueueDueRefreshes()).toEqual([]);
+    expect(await refreshed()).toEqual([]);
 
     // 新订单合并后：指标与下游标签按当天入队
     await syncAndMerge(author, sources.crm, newOrder('A7'));
@@ -208,22 +212,22 @@ describe('定时刷新', () => {
       ['tag', 'value_tier', 1, today(), 'scheduled'],
     ]);
     // 已在排队：不重复入队
-    expect(await enqueueDueRefreshes()).toEqual([]);
+    expect(await refreshed()).toEqual([]);
     await drain();
-    const fresh = (await listSnapshots(acme)).filter(s => s.trigger === 'scheduled');
+    const fresh = (await dslSnapshots(acme)).filter(s => s.trigger === 'scheduled');
     expect(fresh.map(s => [s.template, s.definitionVersion, s.params.asOf]).sort()).toEqual([
       ['metric:revenue', 1, today()], ['tag:value_tier', 1, today()],
     ]);
 
     // 又一笔订单：当天已有当前版本的快照，不再算
     await syncAndMerge(author, sources.crm, newOrder('A8'));
-    expect(await enqueueDueRefreshes()).toEqual([]);
+    expect(await refreshed()).toEqual([]);
 
     // 第二天：租户有合并在排队时整个跳过，没有时按新的一天入队
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(Date.now() + 24 * 60 * 60 * 1000));
     const [merge] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'silver.merge', params: {} }).returning();
-    expect(await enqueueDueRefreshes()).toEqual([]);
+    expect(await refreshed()).toEqual([]);
     await getDb().delete(tasks).where(eq(tasks.id, merge!.id));
     expect(await refreshed()).toEqual([
       ['metric', 'revenue', 1, today(), 'scheduled'],

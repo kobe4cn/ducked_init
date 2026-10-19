@@ -51,6 +51,9 @@ const none = { orders: 0, monetary: '0.00', avg_order_value: null, first_order_d
 describe('gold.user360：以统一消费者为粒度汇总订单与同意', () => {
   it('两个数据源的订单与同意经打通合到同一消费者，与手算一致；没下过单的也在；快照表没有明文与 __source 列，登记为 user360，不重建服务库', async () => {
     const { acme, sources } = await publishedIdentitySources({ orders: true, consents: true });
+    // 映射合并后平台自动启用的 RFM 会重建服务库，这里只看 user360 有没有再触发
+    const servingBuilds = () => getDb().select({ id: tasks.id }).from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'serving.build')));
+    const builds = await servingBuilds();
     const task = await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
     expect(task?.status).toBe('succeeded');
     const result = task!.result as { table: string; rows: number };
@@ -87,10 +90,11 @@ describe('gold.user360：以统一消费者为粒度汇总订单与同意', () =
     // A5 的下单人 99 打通不到，不进表
     expect(rows).toEqual(expected.sort((a, b) => a.consumer_id.localeCompare(b.consumer_id)));
 
-    const snapshots = await listSnapshots(acme);
+    // 映射合并后平台自动启用的模板快照来源是 publish，不算在内
+    const snapshots = (await listSnapshots(acme)).filter(s => s.trigger !== 'publish');
     expect(snapshots).toEqual([expect.objectContaining({ taskId: task!.id, template: 'user360', table: result.table, rowCount: 8 })]);
     // 服务库只收 RFM 与指标、标签（ADR-0033）
-    expect(await getDb().select({ id: tasks.id }).from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'serving.build')))).toEqual([]);
+    expect(await servingBuilds()).toEqual(builds);
     // 模板 ID 带数字，快照过期照样能删表
     expect(await runTask(acme, 'gold.expire', { tables: [result.table] })).toMatchObject({ status: 'succeeded' });
   });
@@ -111,7 +115,7 @@ describe('gold.user360：以统一消费者为粒度汇总订单与同意', () =
     await drain();
     const task = await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
     expect(task).toMatchObject({ status: 'failed', error: expect.stringContaining('金额非负') });
-    expect(await listSnapshots(acme)).toEqual([]);
+    expect((await listSnapshots(acme)).filter(s => s.trigger !== 'publish')).toEqual([]);
     expect(outbox).toHaveLength(1);
     expect(outbox[0]).toMatchObject({ to: 'admin@acme.com', subject: expect.stringContaining('数据检查未通过') });
     expect(outbox[0].text).toContain('用户 360');

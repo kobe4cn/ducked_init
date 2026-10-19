@@ -2,13 +2,15 @@
 // 由最后保存它的人以外的另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本，从没发布过时回到注册表里的默认参数）。
 // 发布后版本锁定，并以新参数（加上当天的 asOf）入队一次模板任务，快照登记时记下定义版本（ADR-0004、0015）。
 // 也可以按当前生效的版本重新计算（可指定参考日期），不产生新版本；依赖的实体有新合并后调度器按当天以生效版本重算（refresh.ts，ADR-0028）。
-// 任务参数与快照记下来源（发布、手动重新计算、定时刷新）。一律限定在操作者所属租户内
-import { and, desc, eq, getTableColumns, inArray, sql } from 'drizzle-orm';
+// 任务参数与快照记下来源（发布、手动重新计算、定时刷新、平台自动启用时的发布）。映射合并成功后，平台以注册表里的默认参数自动启用
+// 本租户还没有定义、依赖的实体都已有已发布映射的模板（enableDefaultTemplates，不经双人发布，ADR-0021）。一律限定在操作者所属租户内
+import { and, desc, eq, getTableColumns, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
-import { tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
+import { mappings, mappingVersions, tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
+import { pendingMerge } from './mappings';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { TASK_KINDS, TEMPLATES, type TemplateId } from './pipeline/templates';
 import { insertTask } from './tasks';
@@ -219,5 +221,45 @@ export async function discardDraft(actor: CurrentMember, id: string) {
       detail: { template, version: draft.version, published },
     });
     return { published };
+  });
+}
+
+/** 平台自动启用模板时的作者与发布者（不是成员） */
+const PLATFORM = 'platform';
+
+/**
+ * 映射合并成功后由调度器调用，幂等：以注册表里的默认参数自动启用本租户的模板。只启用本租户还没有定义（起过草稿也算有）、
+ * 且 entities 里每个实体都有已发布未停用映射的模板：建定义与已发布的第 1 版（作者与发布者为 platform，不经双人发布，ADR-0021），
+ * 以当天（UTC）为 asOf 入队一次模板任务（来源 publish）并记审计。依赖不全、租户已停用或还有合并在排队或运行时跳过，之后的合并会再检查。
+ * 返回这次启用的模板
+ */
+export async function enableDefaultTemplates(tenantId: string): Promise<TemplateId[]> {
+  return getDb().transaction(async tx => {
+    // 锁住租户行：同时结束的两次合并不会重复启用；定义的唯一键兜底
+    const [tenant] = await tx.select({ suspendedAt: tenants.suspendedAt }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
+    if (!tenant || tenant.suspendedAt || await pendingMerge(tx, tenantId)) return [];
+    const existing = new Set((await tx.select({ template: templateDefinitions.template }).from(templateDefinitions)
+      .where(eq(templateDefinitions.tenantId, tenantId))).map(d => d.template));
+    const mapped = new Set((await tx.selectDistinct({ entity: mappings.entity }).from(mappings)
+      .innerJoin(mappingVersions, and(eq(mappingVersions.mappingId, mappings.id), eq(mappingVersions.status, 'published')))
+      .where(and(eq(mappings.tenantId, tenantId), isNull(mappings.disabledAt)))).map(m => m.entity));
+    const enabled: TemplateId[] = [];
+    for (const template of Object.keys(TEMPLATES) as TemplateId[]) {
+      if (existing.has(template) || !TEMPLATES[template].entities.every(e => mapped.has(e))) continue;
+      const [definition] = await tx.insert(templateDefinitions).values({ tenantId, template }).onConflictDoNothing().returning({ id: templateDefinitions.id });
+      if (!definition) continue;
+      const params = checked(template, TEMPLATES[template].defaults as Record<string, unknown>);
+      await tx.insert(templateVersions).values({
+        definitionId: definition.id, version: 1, status: 'published', params, authors: [PLATFORM], lastEditor: PLATFORM,
+        publishedByEmail: PLATFORM, publishedAt: sql`now()`,
+      });
+      await recordAudit(tx, {
+        tenantId, system: true, action: 'template.auto_enabled', targetType: 'template', targetId: definition.id,
+        detail: { template, version: 1 },
+      });
+      await enqueueTemplate(tx, tenantId, template, params, 1, todayUtc(), 'publish');
+      enabled.push(template);
+    }
+    return enabled;
   });
 }

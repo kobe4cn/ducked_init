@@ -2,7 +2,7 @@
 
 分析模板（RFM 等）是平台内置的（ADR-0004），每个模板在注册表（`app/.server/pipeline/templates/index.ts`）里带一套默认参数。租户要调参数（如 RFM 的分档边界），调过的参数会决定结果快照里每个消费者落在哪个人群，和映射一样会影响下游，不能一个人改完就生效。CONTEXT.md 原来写的是「成员填参数即得到一份指标或标签定义」，但指标 DSL 还没做，#88 先把模板参数单独存成模板定义。
 
-**一个租户一个模板一份。** 定义存在 `template_definitions`，`(tenant_id, template)` 唯一；参数存在它的版本 `template_versions`（`params`）里。定义行在第一次保存草稿时建立（`saveDraft` 用 `onConflictDoNothing`），不预先建。没有已发布版本时，模板页显示的生效参数是注册表里的默认参数（`getTemplate`：`published?.params ?? TEMPLATES[t].defaults`）；任务参数里没写的项也由模板解析时补上默认值（如 `parseRfmParams`）。平台不会在没有已发布版本时自动入队模板任务。从没发布过的定义丢弃草稿时，整个定义行连同版本一起删掉，之后又回到默认参数。
+**一个租户一个模板一份。** 定义存在 `template_definitions`，`(tenant_id, template)` 唯一；参数存在它的版本 `template_versions`（`params`）里。定义行在第一次保存草稿时建立（`saveDraft` 用 `onConflictDoNothing`），不预先建。没有已发布版本时，模板页显示的生效参数是注册表里的默认参数（`getTemplate`：`published?.params ?? TEMPLATES[t].defaults`）；任务参数里没写的项也由模板解析时补上默认值（如 `parseRfmParams`）。平台不会在没有已发布版本时自动入队模板任务；映射合并成功后平台会以默认参数自动发布第 1 版（见下文的例外，#230）。从没发布过的定义丢弃草稿时，整个定义行连同版本一起删掉，之后又回到默认参数。
 
 **双人发布，规则同映射。** 每个定义同时只有一份草稿（部分唯一索引 `template_versions_one_draft_uq`），改过草稿的成员记为作者（`authors`），另记最后保存草稿的成员（`last_editor`）。发布需要 `publish` 权限，且发布者不能是最后保存草稿的人（ADR-0015）。映射和模板共用同一个判断 `publishBlocker`（`app/.server/publish-rules.ts`），两边的规则不会各改各的。发布后版本锁定，再改就是新的一版草稿。
 
@@ -16,6 +16,8 @@
 
 **参数页与快照页按注册表通用（#227）。** 每个已登记的模板在分析页有一个参数入口（`/analytics/templates/<模板 ID>`），未登记的 ID 返回 404。RFM 保留专用表单（分箱与分群规则表）和专用快照视图；其他模板按注册表里的 `form` 渲染通用表单：`int` 是带 min / max 的整数输入，`statuses` 是订单状态多选（选项取标准模型 order.status 的枚举），`enum` 是下拉框（同期群的 `granularity` 按月 / 按周）。提交时只取 `form` 里列出的键交给 `saveDraft`，校验仍由 `parseDefinition` 负责。起草、双人发布、丢弃与重新计算的流程与 RFM 相同；用户 360、同期群、复购、CLV、流失预警五个模板都走通用表单（#229）。其他模板的快照页按 `consumer_id` 排序分页，列取快照表的全部列，BOOLEAN 显示为「是 / 否」、列表用顿号连接；页面头部有模板名与 `asOf`，参数里有 `lookbackDays` 时也显示。
 
+**例外：映射合并后平台以默认参数自动启用模板（#230）。** 每次 `silver.merge` 成功结束，调度器调用 `enableDefaultTemplates(tenantId)`（`app/.server/templates.ts`，幂等）：本租户还没有这个模板的 `template_definitions` 行、且 `TEMPLATES[模板].entities` 的每个实体都有已发布未停用映射的模板，在一个锁住租户行的事务里建定义和已发布的第 1 版（`params` 为注册表默认参数，`authors: ['platform']`，`last_editor` 与 `published_by_email` 为 `platform`），以当天（UTC）为 `asOf` 入队一次模板任务（来源 `publish`），记审计 `template.auto_enabled`（操作者是平台）。这一版不经双人发布：它只是注册表默认参数的落地，没有人调过参数；之后成员的修改是第 2 版起的草稿，仍走双人发布。成员起过草稿但从没发布的模板也算已有定义，跳过、不覆盖；依赖不全的模板这次跳过，之后的合并会再检查。租户已停用或还有合并在排队、运行时整次跳过，免得模板任务读到还没合并完的标准层。同时结束的两次合并由租户行锁互斥，定义的唯一键兜底。
+
 ## 已接受的取舍
 
 - 分析师能起草和丢弃模板定义，和映射的起草权限不一致：模板参数属于分析，发布仍要有 `publish` 的另一个人看过。
@@ -25,3 +27,5 @@
 - 不带 `definitionVersion` 的任务产出的快照，看不出参数来自哪一版定义，只能看快照里存的参数。
 - 指标 DSL 做出来以后，模板是否改为生成指标或标签定义另行决定；本决定只管模板自己的参数。
 - 通用快照明细直接展示快照表的列名和原样取值，没有中文表头和数字格式化。快照表只有 consumer_id 与汇总值，没有明文（ADR-0005）。
+- 自动启用的第 1 版没有第二个人看过；默认参数随注册表变化时，已启用的租户留在当时的默认参数上，不会自动跟进。
+- 成员丢弃从没发布过的草稿后，下一次合并会把这个模板按默认参数自动启用。

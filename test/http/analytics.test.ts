@@ -326,21 +326,25 @@ describe('用户 360 模板参数页与快照（通用表单与通用明细）',
 });
 
 describe('同期群与复购模板参数页（通用表单）', () => {
-  /** 打通好的 acme，分析师起草、另一位数据工程师发布，跑完发布入队的任务后按参考日期 2024-07-01 重新计算，返回租户、发布入队的任务与重新计算后的快照 */
+  /**
+   * 打通好的 acme（映射合并后平台已按默认参数发布第 1 版），分析师起草第 2 版、另一位数据工程师发布，跑完发布入队的任务后按参考日期 2024-07-01 重新计算，
+   * 返回租户、发布入队的任务、这个模板第 2 版的快照与重新计算后的快照
+   */
   async function publishAndRecompute(id: 'cohort' | 'repurchase', form: Record<string, string | string[]>) {
     const { acme } = await publishedIdentitySources({ orders: true });
     await memberOf(acme, 'analyst@acme.com', 'analyst');
     await memberOf(acme, 'de@acme.com', 'data_engineer');
     const analyst = await loginAs(app, 'analyst@acme.com');
     expect((await analyst.post(`/analytics/templates/${id}`, { intent: 'save', ...form })).status).toBe(302);
-    expect((await analyst.post(`/analytics/templates/${id}`, { intent: 'publish', version: '1' })).status).toBe(403);
+    expect((await analyst.post(`/analytics/templates/${id}`, { intent: 'publish', version: '2' })).status).toBe(403);
     const de = await loginAs(app, 'de@acme.com');
-    expect((await de.post(`/analytics/templates/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
-    const [published] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, `gold.${id}`)));
+    expect((await de.post(`/analytics/templates/${id}`, { intent: 'publish', version: '2' })).status).toBe(302);
+    const published = (await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, `gold.${id}`))))
+      .find(t => t.params.definitionVersion === 2);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
     expect((await de.post(`/analytics/templates/${id}`, { intent: 'recompute', asOf: '2024-07-01' })).status).toBe(302);
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
-    const registered = await listSnapshots(acme);
+    const registered = (await listSnapshots(acme)).filter(s => s.template === id && s.definitionVersion === 2);
     return { acme, de, published: published!, registered, recomputed: registered.find(s => s.taskId !== published!.id)! };
   }
 
@@ -357,7 +361,7 @@ describe('同期群与复购模板参数页（通用表单）', () => {
     expect(await bad.text()).toContain('granularity 必须是 month 或 week');
 
     const { de, published, registered, recomputed } = await publishAndRecompute('cohort', { granularity: 'week', periods: '30', statuses: ['paid', 'shipped', 'completed'] });
-    expect(published).toMatchObject({ kind: 'gold.cohort', params: { granularity: 'week', periods: 30, definitionVersion: 1 } });
+    expect(published).toMatchObject({ kind: 'gold.cohort', params: { granularity: 'week', periods: 30, definitionVersion: 2 } });
     expect(registered.map(s => s.template)).toEqual(['cohort', 'cohort']);
     expect(await (await de.get('/analytics/templates/cohort')).text()).toMatch(/value="week" selected="">按周</);
 
@@ -371,7 +375,7 @@ describe('同期群与复购模板参数页（通用表单）', () => {
 
   it('复购：windowDays 改成 60 起草、双人发布后入队 gold.repurchase 并登记快照，crm 5 那组 80 天才复购，不再算复购', async () => {
     const { de, published, recomputed } = await publishAndRecompute('repurchase', { lookbackDays: '365', windowDays: '60', statuses: ['paid', 'shipped', 'completed'] });
-    expect(published).toMatchObject({ kind: 'gold.repurchase', params: { lookbackDays: 365, windowDays: 60, definitionVersion: 1 } });
+    expect(published).toMatchObject({ kind: 'gold.repurchase', params: { lookbackDays: 365, windowDays: 60, definitionVersion: 2 } });
     expect(recomputed.template).toBe('repurchase');
     const rows = (await readTemplateSnapshot(recomputed, { page: 1, pageSize: 50 })).rows;
     expect(rows.map(r => [r.days_to_second, r.repurchased]).sort()).toEqual([[29, true], [80, false], [null, false], [null, false], [null, false]].sort());

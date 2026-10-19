@@ -20,6 +20,7 @@ import { applyKeyCheck } from '../source-key-check';
 import { enqueueDueSyncs } from '../source-sync';
 import { enqueueDueVerifies } from '../source-verify';
 import { claimNextTask, failStaleTasks, finishTask, heartbeatTasks, setWorkerPid, type ClaimedTask } from '../tasks';
+import { enableDefaultTemplates } from '../templates';
 import { templateOfKind } from './templates';
 import type { WorkerInput, WorkerOutcome } from './worker';
 
@@ -90,6 +91,8 @@ export function createDispatcher({
         if (task.kind === 'source.profile' && outcome!.result && !('error' in outcome!) && task.params.repairFor) await draftSchemaRepairs(task.tenantId, task);
         // 合并里值字典没写到的新取值落入了兜底值（以前没通知过）：通知能改映射的成员并记审计（ADR-0015）。部分映射失败时也看成功的那些
         if (task.kind === 'silver.merge' && outcome!.result) await alertNewFallback(task.tenantId, task, outcome!.result);
+        // 合并成功：以默认参数自动启用依赖已齐、本租户还没有定义的模板，产出第一版快照（ADR-0021）
+        if (task.kind === 'silver.merge' && outcome!.result && !('error' in outcome!)) await enableDefaultTemplates(task.tenantId);
         // 业务主键的全表检查通过：写回声明并记审计（工作进程里没有平台库）
         if (task.kind === 'source.keycheck' && outcome!.result) await applyKeyCheck(task.tenantId, task.id);
         // 分析模板任务写好了结果层的快照表：登记到平台元数据，分析页据此列出

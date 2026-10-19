@@ -1,23 +1,25 @@
 // 分析模板定义的流水线接缝：成员保存模板参数草稿（saveDraft）→ 另一位有发布权限的成员发布（publishTemplate）→ 以新参数入队 gold.rfm →
 // 调度器派发并在成功后登记快照 → listSnapshots 读出的定义版本与参数；getTemplate 读出各版本与当前生效的参数；
 // 按当前生效的版本重新计算（recomputeTemplate），可指定参考日期；定时刷新（enqueueDueRefreshes，ADR-0028）在依赖的实体有新合并后
-// 以当天为 asOf 入队 gold.rfm；快照记来源（发布 publish、重新计算 manual、定时刷新 scheduled）
-import { eq, sql } from 'drizzle-orm';
+// 以当天为 asOf 入队 gold.rfm；快照记来源（发布 publish、重新计算 manual、定时刷新 scheduled）。映射合并成功后平台以默认参数自动启用
+// 依赖已齐、还没有定义的模板（enableDefaultTemplates，ADR-0021），所以发布了订单映射的租户里成员起草的是第 2 版
+import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { snapshots, tasks } from '../../app/.server/db/schema';
+import { snapshots, tasks, templateDefinitions, templateVersions } from '../../app/.server/db/schema';
+import { TEMPLATES, type TemplateId } from '../../app/.server/pipeline/templates';
 import { RFM_DEFAULTS } from '../../app/.server/pipeline/templates/rfm';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { enqueueDueRefreshes } from '../../app/.server/refresh';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { getTask } from '../../app/.server/tasks';
-import { discardDraft, getTemplate, publishTemplate, recomputeTemplate, saveDraft, TemplateError } from '../../app/.server/templates';
+import { discardDraft, enableDefaultTemplates, getTemplate, publishTemplate, recomputeTemplate, saveDraft, TemplateError } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant } from './fixtures';
-import { publishedIdentitySources } from './identity-fixtures';
-import { grantOnSource } from './source-fixtures';
+import { memberOf, newTenant, publish } from './fixtures';
+import { CRM, CRM_ORDERS, LOYALTY, publishedIdentitySources, TRACKING_USERS } from './identity-fixtures';
+import { grantOnSource, seedIdentitySources } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -71,27 +73,28 @@ describe('分析模板定义', () => {
   it('最后保存草稿的人不能发布，分析师没有发布权限；另一位数据工程师发布后以新参数入队 gold.rfm，快照记下定义版本', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
-    await saveDraft(author, 'rfm', PARAMS);
+    // 映射合并后平台已按默认参数发布第 1 版，成员的草稿是第 2 版
+    expect(await saveDraft(author, 'rfm', PARAMS)).toBe(2);
 
-    const error = await publishTemplate(author, 'rfm', 1).catch(e => e);
+    const error = await publishTemplate(author, 'rfm', 2).catch(e => e);
     expect(error).toBeInstanceOf(TemplateError);
     expect(error.message).toMatch(/最后改了这一版草稿/);
-    await expect(publishTemplate(analyst, 'rfm', 1)).rejects.toMatchObject({ init: { status: 403 } });
+    await expect(publishTemplate(analyst, 'rfm', 2)).rejects.toMatchObject({ init: { status: 403 } });
 
-    const task = await publishTemplate(reviewer, 'rfm', 1);
-    expect(task).toMatchObject({ kind: 'gold.rfm', status: 'queued', params: { ...PARAMS, definitionVersion: 1, asOf: new Date().toISOString().slice(0, 10) } });
+    const task = await publishTemplate(reviewer, 'rfm', 2);
+    expect(task).toMatchObject({ kind: 'gold.rfm', status: 'queued', params: { ...PARAMS, definitionVersion: 2, asOf: new Date().toISOString().slice(0, 10) } });
     const t = await getTemplate(analyst, 'rfm');
-    expect(t).toMatchObject({ draft: null, params: PARAMS, published: { version: 1, publishedByEmail: reviewer.email } });
-    await expect(publishTemplate(reviewer, 'rfm', 1)).rejects.toThrow(/已锁定/);
+    expect(t).toMatchObject({ draft: null, params: PARAMS, published: { version: 2, publishedByEmail: reviewer.email } });
+    await expect(publishTemplate(reviewer, 'rfm', 2)).rejects.toThrow(/已锁定/);
 
     await drain();
     expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
-    const [snapshot] = await listSnapshots(acme);
-    expect(snapshot).toMatchObject({ template: 'rfm', taskId: task.id, definitionVersion: 1, trigger: 'publish', params: { lookbackDays: 3650, segments: PARAMS.segments } });
+    const snapshot = (await listSnapshots(acme)).find(s => s.taskId === task.id);
+    expect(snapshot).toMatchObject({ template: 'rfm', definitionVersion: 2, trigger: 'publish', params: { lookbackDays: 3650, segments: PARAMS.segments } });
 
-    // 发布后再改是新的一版草稿，已发布的第 1 版不变
-    expect(await saveDraft(analyst, 'rfm', { ...PARAMS, lookbackDays: 400 })).toBe(2);
-    expect(await getTemplate(analyst, 'rfm')).toMatchObject({ params: PARAMS, draft: { version: 2 }, published: { version: 1 } });
+    // 发布后再改是新的一版草稿，已发布的第 2 版不变
+    expect(await saveDraft(analyst, 'rfm', { ...PARAMS, lookbackDays: 400 })).toBe(3);
+    expect(await getTemplate(analyst, 'rfm')).toMatchObject({ params: PARAMS, draft: { version: 3 }, published: { version: 2 } });
   });
 
   it('通用表单的五个模板（user360、cohort、repurchase、clv、churn）都能起草、由另一位数据工程师发布，并各产出一张快照', async () => {
@@ -104,22 +107,22 @@ describe('分析模板定义', () => {
       churn: { lookbackDays: 3650, minOrders: 2 },
     } as const;
     for (const [id, params] of Object.entries(drafts) as [keyof typeof drafts, Record<string, unknown>][]) {
-      expect(await saveDraft(author, id, params)).toBe(1);
-      expect(await publishTemplate(reviewer, id, 1)).toMatchObject({ kind: `gold.${id}`, status: 'queued', params: { ...params, definitionVersion: 1 } });
+      expect(await saveDraft(author, id, params)).toBe(2);
+      expect(await publishTemplate(reviewer, id, 2)).toMatchObject({ kind: `gold.${id}`, status: 'queued', params: { ...params, definitionVersion: 2 } });
     }
     await drain();
     const snapshots = await listSnapshots(acme);
     for (const [id, params] of Object.entries(drafts)) {
-      expect(snapshots.filter(s => s.template === id)).toEqual([expect.objectContaining({ definitionVersion: 1, trigger: 'publish', params: expect.objectContaining(params) })]);
+      expect(snapshots.filter(s => s.template === id && s.definitionVersion === 2)).toEqual([expect.objectContaining({ trigger: 'publish', params: expect.objectContaining(params) })]);
     }
   });
 
   it('重新计算：以当前生效版本的参数入队 gold.rfm，不产生新版本；可指定参考日期，不能晚于今天；同模板已有任务在排队或运行时拒绝', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
-    await expect(recomputeTemplate(reviewer, 'rfm')).rejects.toThrow(/还没有发布/);
+    await expect(recomputeTemplate(await memberOf(await newTenant('globex'), 'de@globex.com'), 'rfm')).rejects.toThrow(/还没有发布/);
     await saveDraft(author, 'rfm', PARAMS);
-    await publishTemplate(reviewer, 'rfm', 1);
+    await publishTemplate(reviewer, 'rfm', 2);
     // 发布入队的任务还在排队
     await expect(recomputeTemplate(reviewer, 'rfm')).rejects.toThrow(/已在排队或运行中/);
     await drain();
@@ -129,15 +132,15 @@ describe('分析模板定义', () => {
     await expect(recomputeTemplate(reviewer, 'rfm', '2026-02-30')).rejects.toBeInstanceOf(TemplateError);
 
     const current = await recomputeTemplate(author, 'rfm');
-    expect(current.version).toBe(1);
-    expect(current.task).toMatchObject({ kind: 'gold.rfm', status: 'queued', params: { ...PARAMS, asOf: today(), definitionVersion: 1, trigger: 'manual' } });
+    expect(current.version).toBe(2);
+    expect(current.task).toMatchObject({ kind: 'gold.rfm', status: 'queued', params: { ...PARAMS, asOf: today(), definitionVersion: 2, trigger: 'manual' } });
     await drain();
     const { task } = await recomputeTemplate(reviewer, 'rfm', '2026-09-30');
-    expect(task.params).toEqual({ ...PARAMS, asOf: '2026-09-30', definitionVersion: 1, trigger: 'manual' });
+    expect(task.params).toEqual({ ...PARAMS, asOf: '2026-09-30', definitionVersion: 2, trigger: 'manual' });
     await drain();
     expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
-    expect((await listSnapshots(acme)).find(s => s.taskId === task.id)).toMatchObject({ definitionVersion: 1, trigger: 'manual', params: { asOf: '2026-09-30', lookbackDays: 3650 } });
-    expect((await getTemplate(analyst, 'rfm')).versions).toHaveLength(1);
+    expect((await listSnapshots(acme)).find(s => s.taskId === task.id)).toMatchObject({ definitionVersion: 2, trigger: 'manual', params: { asOf: '2026-09-30', lookbackDays: 3650 } });
+    expect((await getTemplate(analyst, 'rfm')).versions).toHaveLength(2);
   });
 
   it('丢弃草稿：有已发布版本时回到它，从没发布过时回到默认参数', async () => {
@@ -165,46 +168,103 @@ describe('分析模板定义', () => {
       await drain();
     };
     const newOrder = (no: string) => `INSERT INTO crm.orders VALUES ('${no}', 1, 'paid', 50, '2024-07-01 10:00', '2024-07-01 10:00', '2024-07-01 ${no.slice(1).padStart(2, '0')}:00')`;
-    const refreshed = async () => (await enqueueDueRefreshes()).map(t => [t.kind, t.params.definitionVersion, t.params.asOf, t.params.trigger, t.params.lookbackDays]);
+    // 其他模板也已由平台自动启用，这里只看 RFM
+    const refreshed = async () => (await enqueueDueRefreshes()).filter(t => t.kind === 'gold.rfm').map(t => [t.kind, t.params.definitionVersion, t.params.asOf, t.params.trigger, t.params.lookbackDays]);
 
     it('依赖的实体有新合并后以生效版本的参数入队当天的 gold.rfm（来源 scheduled）；依赖没变、已在排队或运行、当天已有当前版本的快照时不入队', async () => {
       const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
       await saveDraft(author, 'rfm', PARAMS);
-      await publishTemplate(reviewer, 'rfm', 1);
+      await publishTemplate(reviewer, 'rfm', 2);
       await drain();
       // 发布之后没有新合并
-      expect(await enqueueDueRefreshes()).toEqual([]);
+      expect(await refreshed()).toEqual([]);
       // 只合并了 event：RFM 依赖 order 与 customer，不入队
       await syncAndMerge(author, sources.tracking,
         `INSERT INTO tracking.events VALUES ('e10', 'u1', 'd1', 'view', '2024-07-01 10:00', '2024-07-01')`);
-      expect(await enqueueDueRefreshes()).toEqual([]);
+      expect(await refreshed()).toEqual([]);
 
       await syncAndMerge(author, sources.crm, newOrder('A7'));
       // 发布那张快照就是当天当前版本的：不入队；把它改成更早的统计日后入队
-      expect(await enqueueDueRefreshes()).toEqual([]);
+      expect(await refreshed()).toEqual([]);
       await getDb().update(snapshots).set({ params: sql`jsonb_set(${snapshots.params}, '{asOf}', '"2024-07-15"'::jsonb)` }).where(eq(snapshots.tenantId, acme));
-      expect(await refreshed()).toEqual([['gold.rfm', 1, today(), 'scheduled', 3650]]);
+      expect(await refreshed()).toEqual([['gold.rfm', 2, today(), 'scheduled', 3650]]);
       // 已在排队：不重复入队
-      expect(await enqueueDueRefreshes()).toEqual([]);
+      expect(await refreshed()).toEqual([]);
       await drain();
-      expect((await listSnapshots(acme)).filter(s => s.trigger === 'scheduled').map(s => [s.template, s.definitionVersion, s.params.asOf]))
-        .toEqual([['rfm', 1, today()]]);
+      expect((await listSnapshots(acme)).filter(s => s.trigger === 'scheduled' && s.template === 'rfm').map(s => [s.template, s.definitionVersion, s.params.asOf]))
+        .toEqual([['rfm', 2, today()]]);
 
       // 又一笔订单：当天已有当前版本的快照，不再算
       await syncAndMerge(author, sources.crm, newOrder('A8'));
-      expect(await enqueueDueRefreshes()).toEqual([]);
+      expect(await refreshed()).toEqual([]);
 
       // 第二天：模板已有任务在排队时不入队，没有时按新的一天入队
       vi.useFakeTimers({ toFake: ['Date'] });
       vi.setSystemTime(new Date(Date.now() + 24 * 60 * 60 * 1000));
       const [manual] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'gold.rfm', params: {} }).returning();
-      expect(await enqueueDueRefreshes()).toEqual([]);
+      expect(await refreshed()).toEqual([]);
       await getDb().delete(tasks).where(eq(tasks.id, manual!.id));
-      expect(await refreshed()).toEqual([['gold.rfm', 1, today(), 'scheduled', 3650]]);
-      expect((await listAuditLogs(acme)).filter(l => l.action === '定时刷新模板').map(l => [l.actor, l.summary])).toEqual([
-        ['平台', `RFM 分层，按第 1 版参数刷新 ${today()}`],
-        ['平台', `RFM 分层，按第 1 版参数刷新 ${new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10)}`],
+      expect(await refreshed()).toEqual([['gold.rfm', 2, today(), 'scheduled', 3650]]);
+      expect((await listAuditLogs(acme)).filter(l => l.action === '定时刷新模板' && l.summary.startsWith('RFM')).map(l => [l.actor, l.summary])).toEqual([
+        ['平台', `RFM 分层，按第 2 版参数刷新 ${today()}`],
+        ['平台', `RFM 分层，按第 2 版参数刷新 ${new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10)}`],
       ]);
     });
+  });
+});
+
+describe('映射首次合并后自动启用默认模板', () => {
+  const ALL = Object.keys(TEMPLATES).sort();
+  const definitions = async (acme: string) => (await getDb().select({
+    template: templateDefinitions.template, version: templateVersions.version, status: templateVersions.status,
+    params: templateVersions.params, authors: templateVersions.authors, lastEditor: templateVersions.lastEditor,
+  }).from(templateDefinitions)
+    .innerJoin(templateVersions, eq(templateVersions.definitionId, templateDefinitions.id))
+    .where(eq(templateDefinitions.tenantId, acme))
+    .orderBy(templateDefinitions.template, templateVersions.version));
+  const autoEnabled = async (acme: string) => (await listAuditLogs(acme)).filter(l => l.action === '自动启用模板').map(l => [l.actor, l.summary]).sort();
+
+  it('发布订单映射并合并后，六个模板各有按默认参数发布的第 1 版与一张来源 publish 的快照，审计里有系统写的「自动启用模板」', async () => {
+    const { acme, author, sources } = await publishedIdentitySources({ orders: true });
+    expect(ALL).toHaveLength(6);
+    expect(await definitions(acme)).toEqual(ALL.map(template => ({
+      template, version: 1, status: 'published', params: TEMPLATES[template as TemplateId].parseDefinition(TEMPLATES[template as TemplateId].defaults as Record<string, unknown>), authors: ['platform'], lastEditor: 'platform',
+    })));
+    const snaps = await listSnapshots(acme);
+    expect(snaps.map(s => [s.template, s.definitionVersion, s.trigger, s.params.asOf]).sort())
+      .toEqual(ALL.map(t => [t, 1, 'publish', today()]));
+    expect(await autoEnabled(acme)).toEqual(ALL.map(t => ['平台', `${TEMPLATES[t as TemplateId].label}，按默认参数发布第 1 版`]).sort());
+
+    // 再次合并不重复启用
+    expect(await enableDefaultTemplates(acme)).toEqual([]);
+    await grantOnSource(`INSERT INTO crm.orders VALUES ('A9', 1, 'paid', 50, '2024-07-01 10:00', '2024-07-01 10:00', '2024-07-01 09:00')`);
+    await syncSource(author, sources.crm);
+    await drain();
+    expect(await getTask((await getDb().select({ id: tasks.id }).from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge'))).orderBy(sql`created_at DESC`).limit(1))[0]!.id))
+      .toMatchObject({ status: 'succeeded' });
+    expect(await definitions(acme)).toHaveLength(6);
+    expect((await listSnapshots(acme)).filter(s => s.trigger === 'publish')).toHaveLength(6);
+    expect(await autoEnabled(acme)).toHaveLength(6);
+  });
+
+  it('只有 customer 映射时不启用依赖 order 的模板；之后发布订单映射并合并再启用，成员已起草未发布的模板不被覆盖', async () => {
+    const acme = await newTenant('acme');
+    const author = await memberOf(acme, 'de@acme.com');
+    const reviewer = await memberOf(acme, 'de2@acme.com');
+    const { crm, loyalty, tracking } = await seedIdentitySources(author, { orders: true });
+    await publish(author, reviewer, crm, CRM);
+    await publish(author, reviewer, loyalty, LOYALTY);
+    await publish(author, reviewer, tracking, TRACKING_USERS);
+    expect(await definitions(acme)).toEqual([]);
+    expect(await listSnapshots(acme)).toEqual([]);
+
+    await saveDraft(author, 'cohort', { periods: 6 });
+    await publish(author, reviewer, crm, CRM_ORDERS);
+    const rows = await definitions(acme);
+    expect(rows.map(r => [r.template, r.version, r.status, r.lastEditor])).toEqual(ALL.map(t => (t === 'cohort'
+      ? [t, 1, 'draft', 'de@acme.com']
+      : [t, 1, 'published', 'platform'])));
+    expect((await listSnapshots(acme)).map(s => [s.template, s.definitionVersion, s.trigger]).sort()).toEqual(ALL.filter(t => t !== 'cohort').map(t => [t, 1, 'publish']));
+    expect(await autoEnabled(acme)).toHaveLength(5);
   });
 });

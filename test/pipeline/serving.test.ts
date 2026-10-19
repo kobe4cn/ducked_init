@@ -18,6 +18,7 @@ import { platformS3 } from '../../app/.server/s3-accounts';
 import { getObject } from '../../app/.server/s3-client';
 import { tenantServingKey } from '../../app/.server/secrets';
 import { currentServingStore, enqueueServingBuild } from '../../app/.server/serving-store';
+import { TEMPLATES } from '../../app/.server/pipeline/templates';
 import { enqueueDueExpiries, listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { resetDb } from '../http/harness';
@@ -73,7 +74,8 @@ async function publishedDefinitions() {
   await createDefinition(author, 'tag', 'value_tier', 'metric: revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n');
   await publishDefinition(reviewer, 'tag', 'value_tier', 1);
   await drain();
-  const snapshots = await listSnapshots(acme);
+  // 映射合并后平台自动启用的模板快照（来源 publish）不算在内，RFM 只取上面 runTask 跑出的那张
+  const snapshots = (await listSnapshots(acme)).filter(s => !(Object.hasOwn(TEMPLATES, s.template) && s.trigger === 'publish'));
   expect(snapshots.map(s => s.template).sort()).toEqual(['metric:revenue', 'metric:revenue_by_city', 'rfm', 'tag:value_tier']);
   const { dataPath } = (await lakeRow(acme))!;
   return { acme, author, sources, snapshots, dataPath };

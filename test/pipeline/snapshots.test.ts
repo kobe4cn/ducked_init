@@ -46,7 +46,8 @@ describe('结果快照登记', () => {
     const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
     expect(task?.status).toBe('succeeded');
 
-    const list = await listSnapshots(acme);
+    // 映射合并后平台自动启用的模板快照来源是 publish，不算在内
+    const list = (await listSnapshots(acme)).filter(s => s.trigger !== 'publish');
     expect(list).toHaveLength(1);
     const [snapshot] = list;
     expect(snapshot).toMatchObject({

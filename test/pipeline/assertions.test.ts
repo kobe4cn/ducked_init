@@ -50,6 +50,9 @@ async function insertCrmOrder(acme: string, crm: string, values: string) {
   await drain();
 }
 
+/** 本文件 runTask 跑出的快照：映射合并后平台自动启用的模板快照来源是 publish，不算在内 */
+const ranSnapshots = async (acme: string) => (await listSnapshots(acme)).filter(s => s.trigger !== 'publish');
+
 /** 先成功算一次 RFM，返回租户、数据源与这版快照 */
 async function withRfmSnapshot() {
   const fixture = await publishedIdentitySources({ orders: true });
@@ -60,14 +63,14 @@ async function withRfmSnapshot() {
     { name: 'amount_non_negative', level: 'error', entity: 'order', failed: 0, detail: 'amount' },
     { name: 'primary_key_unique', level: 'error', entity: 'customer', failed: 0, detail: 'customer_id, _source, _key_space' },
   ]));
-  const [snapshot] = await listSnapshots(fixture.acme);
+  const snapshot = (await ranSnapshots(fixture.acme)).find(s => s.taskId === task!.id)!;
   return { ...fixture, snapshot };
 }
 
 /** 断言失败后：没有新快照、没有新的快照表，旧快照仍可读；管理员收到一封只带断言名、实体与行数的邮件，审计里一条断言失败 */
 async function expectBlocked(acme: string, snapshot: Awaited<ReturnType<typeof withRfmSnapshot>>['snapshot'], summary: RegExp) {
-  expect(await listSnapshots(acme)).toEqual([snapshot]);
-  expect(await goldTables(acme)).toEqual([snapshot.table.slice('gold.'.length)]);
+  expect(await ranSnapshots(acme)).toEqual([snapshot]);
+  expect(await goldTables(acme)).toEqual((await listSnapshots(acme)).map(s => s.table.slice('gold.'.length)).sort());
   expect((await readRfmSnapshot(snapshot, { page: 1 })).consumers).toHaveLength(5);
 
   expect(outbox).toHaveLength(1);
@@ -145,7 +148,7 @@ describe('warn 断言只记录不阻断', () => {
     expect(task).toMatchObject({ status: 'succeeded' });
     const warn = { name: 'order_customer_link', level: 'warn', entity: 'order', failed: 3, ratio: 0.7692, orphans: 3 };
     expect((task!.result as { assertions: unknown[] }).assertions).toContainEqual(warn);
-    const snapshots = await listSnapshots(acme);
+    const snapshots = await ranSnapshots(acme);
     expect(snapshots).toHaveLength(3);
     expect(snapshots).toContainEqual(snapshot);
     expect(outbox).toHaveLength(0);
@@ -162,7 +165,7 @@ describe('warn 断言只记录不阻断', () => {
 
   it('实体行数比上一次运行少一半以上：记一条 warn（带前后行数），首次运行没有基准不报', async () => {
     const { acme } = await withRfmSnapshot();
-    const [firstTask] = await onLake<{ task_id: string }>(acme, `SELECT task_id FROM silver._assertion_runs`);
+    const [firstTask] = await onLake<{ task_id: string }>(acme, `SELECT task_id FROM silver._assertion_runs ORDER BY "at" LIMIT 1`);
     const [firstRun] = await assertionRuns(acme, firstTask.task_id);
     expect(JSON.parse(firstRun.assertions).map((a: { name: string }) => a.name)).not.toContain('row_drop');
 
@@ -175,7 +178,7 @@ describe('warn 断言只记录不阻断', () => {
     const assertions = (task!.result as { assertions: { name: string; entity: string }[] }).assertions;
     expect(assertions).toContainEqual({ name: 'row_drop', level: 'warn', entity: 'order', failed: 11 - Number(n), rows: Number(n), previous: 11 });
     expect(assertions).toContainEqual(expect.objectContaining({ name: 'row_drop', entity: 'customer', failed: 0 }));
-    expect(await listSnapshots(acme)).toHaveLength(2);
+    expect(await ranSnapshots(acme)).toHaveLength(2);
     const runs = await assertionRuns(acme, task!.id);
     expect(JSON.parse(runs.find(r => r.entity === 'order')!.assertions)).toContainEqual(expect.objectContaining({ name: 'row_drop', previous: 11 }));
   });

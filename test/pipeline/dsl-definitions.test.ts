@@ -218,7 +218,9 @@ describe('发布与丢弃', () => {
 
     await drain();
     expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
-    const [first] = await listSnapshots(acme);
+    // 映射合并后平台自动启用的模板也有快照，这里只看指标的
+    const metricSnapshots = async () => (await listSnapshots(acme)).filter(s => s.template.startsWith('metric:'));
+    const [first] = await metricSnapshots();
     const [{ n }] = await onLake<{ n: string }>(acme, `SELECT count(*)::VARCHAR AS n FROM gold."metric__${task.id}"`);
     expect(Number(n)).toBeGreaterThan(0);
     expect(first).toMatchObject({
@@ -233,7 +235,7 @@ describe('发布与丢弃', () => {
     const second = await publishDefinition(author, 'metric', 'revenue', 2);
     await drain();
     expect(await getTask(second.id)).toMatchObject({ status: 'succeeded' });
-    const snapshots = await listSnapshots(acme);
+    const snapshots = await metricSnapshots();
     expect(snapshots).toHaveLength(2);
     expect(snapshots.find(s => s.taskId === second.id)).toMatchObject({ template: 'metric:revenue', definitionVersion: 2 });
     expect(snapshots.find(s => s.taskId === task.id)).toEqual(first);
