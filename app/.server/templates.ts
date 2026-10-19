@@ -12,7 +12,7 @@ import { getDb } from './db/client';
 import { mappings, mappingVersions, tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
 import { pendingMerge } from './mappings';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
-import { TASK_KINDS, TEMPLATES, type TemplateId } from './pipeline/templates';
+import { latestTemplate, TASK_KINDS, templateAt, TEMPLATES, type Template, type TemplateId } from './pipeline/templates';
 import { insertTask } from './tasks';
 
 export { TASK_KINDS, templateOfKind, type TemplateId } from './pipeline/templates';
@@ -36,9 +36,12 @@ function validated<T>(parse: () => T) {
   }
 }
 
-/** 校验定义的参数并补上默认值 */
-const checked = (template: TemplateId, params: Record<string, unknown>) =>
-  validated(() => TEMPLATES[template].parseDefinition(params) as Record<string, unknown>);
+/** 按模板的某个版本校验定义的参数并补上默认值 */
+const checked = (template: Template<unknown, unknown>, params: Record<string, unknown>) =>
+  validated(() => template.parseDefinition(params) as Record<string, unknown>);
+
+/** 按锁定的模板版本取模板；注册表里没有这个版本时转成 TemplateError */
+const lockedTemplate = (template: TemplateId, templateVersion: number) => validated(() => templateAt(template, templateVersion));
 
 /** 今天（UTC），模板任务 asOf 的默认值与上限 */
 export const todayUtc = () => new Date().toISOString().slice(0, 10);
@@ -47,11 +50,18 @@ const ofDefinition = (tenantId: string, template: TemplateId) =>
   and(eq(templateDefinitions.tenantId, tenantId), eq(templateDefinitions.template, template));
 
 /**
- * 在调用方的事务里以模板定义一版的参数加上 asOf 入队一次模板任务，任务参数带上定义版本 definitionVersion 与来源 trigger（登记快照时记下）
+ * 在调用方的事务里以模板定义一版的参数加上 asOf 入队一次模板任务，任务参数带上定义版本 definitionVersion、来源 trigger（登记快照时记下）
+ * 与这一版锁定的模板版本 templateVersion（任务按它编译）
  */
-export const enqueueTemplate = (
+export async function enqueueTemplate(
   tx: Tx, tenantId: string, template: TemplateId, params: Record<string, unknown>, version: number, asOf: string, trigger: SnapshotTrigger,
-) => insertTask(tx, tenantId, TASK_KINDS[template], { ...params, asOf, definitionVersion: version, trigger });
+) {
+  const [locked] = await tx.select({ templateVersion: templateVersions.templateVersion }).from(templateVersions)
+    .innerJoin(templateDefinitions, eq(templateDefinitions.id, templateVersions.definitionId))
+    .where(and(ofDefinition(tenantId, template), eq(templateVersions.version, version)));
+  if (!locked) throw new Error(`模板 ${template} 的定义没有第 ${version} 版`);
+  return insertTask(tx, tenantId, TASK_KINDS[template], { ...params, asOf, definitionVersion: version, trigger, templateVersion: locked.templateVersion });
+}
 
 /**
  * 本租户某个模板的定义：各版本（最新的在前）、草稿与最近的已发布版本，当前生效的参数（没有已发布版本时为注册表里的默认参数），
@@ -61,7 +71,7 @@ export async function getTemplate(actor: CurrentMember, id: string) {
   assertCan(actor, 'definitions:read');
   const template = requireTemplate(id);
   const versions = await getDb().select({
-    version: templateVersions.version, status: templateVersions.status, params: templateVersions.params,
+    version: templateVersions.version, status: templateVersions.status, params: templateVersions.params, templateVersion: templateVersions.templateVersion,
     authors: templateVersions.authors, lastEditor: templateVersions.lastEditor,
     publishedByEmail: templateVersions.publishedByEmail, publishedAt: templateVersions.publishedAt, updatedAt: templateVersions.updatedAt,
   }).from(templateVersions)
@@ -69,25 +79,27 @@ export async function getTemplate(actor: CurrentMember, id: string) {
     .where(ofDefinition(actor.tenant.id, template))
     .orderBy(desc(templateVersions.version));
   const published = versions.find(v => v.status === 'published') ?? null;
+  const draft = versions.find(v => v.status === 'draft') ?? null;
   return {
     template,
     label: TEMPLATES[template].label,
     versions: versions.map(v => ({ ...v, publishBlocker: publishBlocker(actor, v) })),
-    draft: versions.find(v => v.status === 'draft') ?? null,
+    draft,
     published,
-    params: published?.params ?? (TEMPLATES[template].defaults as Record<string, unknown>),
+    // 没有已发布版本时为草稿锁定的模板版本（没有草稿时为当前版本）的默认参数
+    params: published?.params ?? (lockedTemplate(template, draft?.templateVersion ?? latestTemplate(template).version).defaults as Record<string, unknown>),
     publishers: await publisherCount(actor.tenant.id),
   };
 }
 
 /**
  * 保存草稿：已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
- * 第一次保存时建立本租户这个模板的定义。返回草稿的版本号
+ * 第一次保存时建立本租户这个模板的定义。草稿锁定的模板版本：已有草稿时不变，否则沿用最近的已发布版本锁定的，
+ * 从没发布过时为注册表的当前版本（不随注册表升级，ADR-0021）；参数按这个版本校验。返回草稿的版本号
  */
 export async function saveDraft(actor: CurrentMember, id: string, params: Record<string, unknown>) {
   assertCan(actor, 'definitions:draft');
   const template = requireTemplate(id);
-  const definition = checked(template, params);
   return getDb().transaction(async tx => {
     await tx.insert(templateDefinitions).values({ tenantId: actor.tenant.id, template }).onConflictDoNothing();
     // 锁住定义行：与发布、丢弃互斥
@@ -98,13 +110,16 @@ export async function saveDraft(actor: CurrentMember, id: string, params: Record
     const definitionId = locked.id;
     const [latest] = await tx.select().from(templateVersions)
       .where(eq(templateVersions.definitionId, definitionId)).orderBy(desc(templateVersions.version)).limit(1);
+    // 最新一版是草稿时沿用草稿的（草稿新建时已沿用最近的已发布版本），否则它就是最近的已发布版本
+    const templateVersion = latest?.templateVersion ?? latestTemplate(template).version;
+    const definition = checked(lockedTemplate(template, templateVersion), params);
     if (latest?.status === 'draft') {
       await tx.update(templateVersions).set({ params: definition, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
         .where(eq(templateVersions.id, latest.id));
       return latest.version;
     }
     const version = (latest?.version ?? 0) + 1;
-    await tx.insert(templateVersions).values({ definitionId, version, params: definition, authors: [actor.email], lastEditor: actor.email });
+    await tx.insert(templateVersions).values({ definitionId, version, params: definition, templateVersion, authors: [actor.email], lastEditor: actor.email });
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
@@ -130,7 +145,7 @@ export async function publishTemplate(actor: CurrentMember, id: string, version:
   if (!draft) throw new TemplateError(`没有第 ${version} 版`, 404);
   const blocker = publishBlocker(actor, draft);
   if (blocker) throw new TemplateError(blocker, draft.status === 'draft' ? 403 : 400);
-  const definition = checked(template, draft.params);
+  const definition = checked(lockedTemplate(template, draft.templateVersion), draft.params);
   return getDb().transaction(async tx => {
     // 锁住定义行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿。不锁租户行、不查排队中的任务：发布总要按新参数算一次（ADR-0021）
     await tx.select({ id: templateDefinitions.id }).from(templateDefinitions).where(eq(templateDefinitions.id, draft.definitionId)).for('update');
@@ -166,13 +181,17 @@ export async function recomputeTemplate(actor: CurrentMember, id: string, asOf?:
   return getDb().transaction(async tx => {
     // 锁住租户行：与另一次重新计算互斥；同时发布的入队要等这里提交（insertTask 的共享锁），锁到以后读到的就是当前生效的版本
     await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, actor.tenant.id)).for('update');
-    const [published] = await tx.select({ definitionId: templateVersions.definitionId, version: templateVersions.version, params: templateVersions.params })
+    const [published] = await tx.select({
+      definitionId: templateVersions.definitionId, version: templateVersions.version, params: templateVersions.params,
+      templateVersion: templateVersions.templateVersion,
+    })
       .from(templateVersions)
       .innerJoin(templateDefinitions, eq(templateDefinitions.id, templateVersions.definitionId))
       .where(and(ofDefinition(actor.tenant.id, template), eq(templateVersions.status, 'published')))
       .orderBy(desc(templateVersions.version)).limit(1);
     if (!published) throw new TemplateError('还没有发布过参数，发布第一版后会自动计算一次');
-    validated(() => TEMPLATES[template].parse({ ...published.params, asOf: day }));
+    const locked = lockedTemplate(template, published.templateVersion);
+    validated(() => locked.parse({ ...published.params, asOf: day }));
     // 校验过格式后两边都是 YYYY-MM-DD，可以直接比较字符串
     if (day > todayUtc()) throw new TemplateError(`参考日期 ${day} 晚于今天（UTC ${todayUtc()}）`);
     const [pending] = await tx.select({ id: tasks.id }).from(tasks)
@@ -248,9 +267,10 @@ export async function enableDefaultTemplates(tenantId: string): Promise<Template
       if (existing.has(template) || !TEMPLATES[template].entities.every(e => mapped.has(e))) continue;
       const [definition] = await tx.insert(templateDefinitions).values({ tenantId, template }).onConflictDoNothing().returning({ id: templateDefinitions.id });
       if (!definition) continue;
-      const params = checked(template, TEMPLATES[template].defaults as Record<string, unknown>);
+      const latest = latestTemplate(template);
+      const params = checked(latest, latest.defaults as Record<string, unknown>);
       await tx.insert(templateVersions).values({
-        definitionId: definition.id, version: 1, status: 'published', params, authors: [PLATFORM], lastEditor: PLATFORM,
+        definitionId: definition.id, version: 1, status: 'published', params, templateVersion: latest.version, authors: [PLATFORM], lastEditor: PLATFORM,
         publishedByEmail: PLATFORM, publishedAt: sql`now()`,
       });
       await recordAudit(tx, {

@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."template_versions" ADD COLUMN "template_version" integer DEFAULT 1 NOT NULL;

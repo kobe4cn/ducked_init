@@ -11,7 +11,7 @@ import { lit, mergeToSilver, type MergeDrop, type MergeGroupParam, type MergeMap
 import { MERGE_RULE_KINDS, type MergeRuleKind } from '../../lib/merge-groups';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './identity-engine';
-import { TASK_KINDS, TEMPLATES, type Template, type TemplateId } from './templates';
+import { TASK_KINDS, templateAt, TEMPLATES, type TemplateId } from './templates';
 import { assertOrThrow, runAssertions } from './assertions';
 import { ensureCustomerSourceColumns } from './customer-source-columns';
 import { PartialFailure } from './partial-failure';
@@ -212,18 +212,21 @@ function missingTableHint(table: string) {
 /**
  * 分析模板任务（ADR-0004）：按参数（asOf 必填，其余取模板默认值）把标准层编译成模板的 SELECT，
  * 写进结果层的一张快照表 gold."<模板 ID>__<任务 ID>"，只有 consumer_id 与汇总值，没有明文。
- * 发布、重新计算或定时刷新入队的任务带上定义版本 definitionVersion 与来源 trigger（登记快照时记下），其余参数是定义的参数加上 asOf；
+ * 发布、重新计算或定时刷新入队的任务带上定义版本 definitionVersion 与来源 trigger（登记快照时记下），以及定义锁定的模板版本
+ * templateVersion（按注册表里这个版本编译，没有这个版本时任务失败；不带时按第 1 版），其余参数是定义的参数加上 asOf；
  * 也可以直接给参数、不带版本。开头给没重新合并过的老湖补 _customer_source（订单按它关联消费者，ADR-0030），
  * 再查模板要求的表；计算前对读到的实体跑内置断言（ADR-0026），error 级失败时任务失败、不写快照表。
  * 结果带表名、行数、补全后的参数、全部断言 assertions，以及模板另报的计数（如 RFM 打通不到消费者的订单数 unlinkedOrders）
  */
 function templateTask(id: TemplateId): Handler {
-  // 各模板的参数类型不同，这里只在 parse 与 compile 之间传递
-  const template = TEMPLATES[id] as unknown as Template<unknown, unknown>;
   return {
-    label: template.label,
+    label: TEMPLATES[id].label,
     async run(con, params, { taskId }) {
-      const { definitionVersion: _, trigger: __, ...rest } = params;
+      // templateVersion 要在 parse 之前剥掉：parse 拒绝不认识的键
+      const { definitionVersion: _, trigger: __, templateVersion, ...rest } = params;
+      // 各模板的参数类型不同，这里只在 parse 与 compile 之间传递
+      if (templateVersion !== undefined && !Number.isInteger(templateVersion)) throw new Error('参数 templateVersion 必须是整数');
+      const template = templateAt(id, (templateVersion as number | undefined) ?? 1);
       const p = template.parse(rest);
       await ensureCustomerSourceColumns(con);
       const tables = [...template.requires, ...template.optional ?? []];

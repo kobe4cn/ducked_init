@@ -2,7 +2,7 @@
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { compileRfm, compileRfmUnlinked, parseRfmParams, RFM_DEFAULTS } from '../app/.server/pipeline/templates/rfm';
-import { TEMPLATES } from '../app/.server/pipeline/templates';
+import { latestTemplate, templateAt, TEMPLATES } from '../app/.server/pipeline/templates';
 
 let instance: DuckDBInstance;
 let con: DuckDBConnection;
@@ -74,6 +74,18 @@ describe('RFM 模板：参数', () => {
     const sql = compileRfm(parseRfmParams({ asOf: '2024-07-01' }));
     expect(compileRfm(parseRfmParams({ asOf: '2024-07-01' }))).toBe(sql);
     expect(sql).not.toMatch(/now\(\)|current_date|current_timestamp/i);
+  });
+});
+
+describe('模板版本', () => {
+  it('latestTemplate 是注册表里的当前版本（现在都是第 1 版），templateAt 按版本取，没有这个版本时抛错', () => {
+    for (const id of Object.keys(TEMPLATES) as (keyof typeof TEMPLATES)[]) {
+      expect(latestTemplate(id)).toBe(TEMPLATES[id]);
+      expect(latestTemplate(id).version).toBe(1);
+      expect(templateAt(id, 1)).toBe(TEMPLATES[id]);
+    }
+    expect(() => templateAt('rfm', 9)).toThrow('模板 RFM 分层 没有第 9 版');
+    expect(() => templateAt('rfm', 0)).toThrow('没有第 0 版');
   });
 });
 

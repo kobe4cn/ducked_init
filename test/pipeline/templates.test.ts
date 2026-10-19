@@ -14,7 +14,7 @@ import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { enqueueDueRefreshes } from '../../app/.server/refresh';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
-import { getTask } from '../../app/.server/tasks';
+import { getTask, insertTask } from '../../app/.server/tasks';
 import { discardDraft, enableDefaultTemplates, getTemplate, publishTemplate, recomputeTemplate, saveDraft, TemplateError } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, publish } from './fixtures';
@@ -136,7 +136,7 @@ describe('分析模板定义', () => {
     expect(current.task).toMatchObject({ kind: 'gold.rfm', status: 'queued', params: { ...PARAMS, asOf: today(), definitionVersion: 2, trigger: 'manual' } });
     await drain();
     const { task } = await recomputeTemplate(reviewer, 'rfm', '2026-09-30');
-    expect(task.params).toEqual({ ...PARAMS, asOf: '2026-09-30', definitionVersion: 2, trigger: 'manual' });
+    expect(task.params).toEqual({ ...PARAMS, asOf: '2026-09-30', definitionVersion: 2, trigger: 'manual', templateVersion: 1 });
     await drain();
     expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
     expect((await listSnapshots(acme)).find(s => s.taskId === task.id)).toMatchObject({ definitionVersion: 2, trigger: 'manual', params: { asOf: '2026-09-30', lookbackDays: 3650 } });
@@ -266,5 +266,45 @@ describe('映射首次合并后自动启用默认模板', () => {
       : [t, 1, 'published', 'platform'])));
     expect((await listSnapshots(acme)).map(s => [s.template, s.definitionVersion, s.trigger]).sort()).toEqual(ALL.filter(t => t !== 'cohort').map(t => [t, 1, 'publish']));
     expect(await autoEnabled(acme)).toHaveLength(5);
+  });
+});
+
+describe('模板版本锁定', () => {
+  const locked = async (acme: string, template: string) => (await getDb().select({ version: templateVersions.version, templateVersion: templateVersions.templateVersion })
+    .from(templateVersions).innerJoin(templateDefinitions, eq(templateDefinitions.id, templateVersions.definitionId))
+    .where(and(eq(templateDefinitions.tenantId, acme), eq(templateDefinitions.template, template)))
+    .orderBy(templateVersions.version));
+  const enqueue = (acme: string, params: Record<string, unknown>) =>
+    getDb().transaction(tx => insertTask(tx, acme, 'gold.rfm', params));
+
+  it('自动启用、起草、发布与重新计算都锁定模板第 1 版，任务参数带 templateVersion 1；getTemplate 带出锁定的版本', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    expect(await locked(acme, 'rfm')).toEqual([{ version: 1, templateVersion: 1 }]);
+    const auto = await getDb().select({ params: tasks.params }).from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'gold.rfm')));
+    expect(auto).toEqual([{ params: expect.objectContaining({ definitionVersion: 1, templateVersion: 1 }) }]);
+
+    await saveDraft(author, 'rfm', PARAMS);
+    expect((await getTemplate(author, 'rfm')).draft).toMatchObject({ version: 2, templateVersion: 1 });
+    const published = await publishTemplate(reviewer, 'rfm', 2);
+    expect(published.params).toMatchObject({ definitionVersion: 2, templateVersion: 1 });
+    await drain();
+    const { task } = await recomputeTemplate(reviewer, 'rfm');
+    expect(task.params).toMatchObject({ definitionVersion: 2, templateVersion: 1, trigger: 'manual' });
+    await drain();
+    expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
+    expect(await locked(acme, 'rfm')).toEqual([{ version: 1, templateVersion: 1 }, { version: 2, templateVersion: 1 }]);
+    expect((await getTemplate(author, 'rfm')).published).toMatchObject({ version: 2, templateVersion: 1 });
+  });
+
+  it('不带 templateVersion 的老任务按第 1 版照常成功；注册表里没有的版本任务失败并说明', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await drain();
+    const old = await enqueue(acme, { ...PARAMS, asOf: '2024-07-01' });
+    const missing = await enqueue(acme, { ...PARAMS, asOf: '2024-07-01', templateVersion: 9 });
+    const text = await enqueue(acme, { ...PARAMS, asOf: '2024-07-01', templateVersion: '1' });
+    await drain();
+    expect(await getTask(text.id)).toMatchObject({ status: 'failed', error: expect.stringContaining('templateVersion 必须是整数') });
+    expect(await getTask(old.id)).toMatchObject({ status: 'succeeded' });
+    expect(await getTask(missing.id)).toMatchObject({ status: 'failed', error: expect.stringContaining('模板 RFM 分层 没有第 9 版') });
   });
 });

@@ -360,6 +360,8 @@ export const templateVersions = platform.table('template_versions', {
   version: integer('version').notNull(),
   status: templateVersionStatusEnum('status').notNull().default('draft'),
   params: jsonb('params').$type<Record<string, unknown>>().notNull(),
+  // 锁定的模板版本（pipeline/templates 注册表）：任务按它编译，不随注册表升级（ADR-0021）
+  templateVersion: integer('template_version').notNull().default(1),
   authors: text('authors').array().notNull(),
   lastEditor: text('last_editor').notNull(),
   publishedByEmail: text('published_by_email'),
