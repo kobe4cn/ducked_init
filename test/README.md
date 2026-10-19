@@ -157,7 +157,7 @@ describe('<功能>', () => {
 - 文件第一行注释写清这条接缝：从哪个入口进、经过什么、在哪里看结果。
 - `beforeEach` 里 `resetDb()`，`afterAll` 里 `closeDb()`；每个用例从空库开始，不依赖其他用例。
 - 用例名用中文写一句可观察的行为，不写实现细节。
-- 断言看结果（任务结果、数据湖里的行、响应状态与页面内容），不 mock 模块。需要时间流逝用 `vi.useFakeTimers({ toFake: ['Date'] })`，需要改配置用 `vi.stubEnv`（`TEMPLATE_TEST_VERSIONS=1` 打开只给测试用的模板新版本，见 `app/.server/pipeline/templates/test-versions.ts`：`latestTemplate('rfm')` 变成分群带 `v2:` 前缀的第 2 版，工作进程也继承这个开关）；发信用 `app.outbox` 或 `app.setMailer` 替换；模型服务用 `app.setLlmFetch` 注入假 fetch（默认替身直接报错，HTTP 测试不会真的请求填写的端点；`afterEach` 里传 `undefined` 恢复）。
+- 断言看结果（任务结果、数据湖里的行、响应状态与页面内容），不 mock 模块。需要时间流逝用 `vi.useFakeTimers({ toFake: ['Date'] })`，需要改配置用 `vi.stubEnv`（`TEMPLATE_TEST_VERSIONS=1` 打开只给测试用的模板新版本，见 `app/.server/pipeline/templates/test-versions.ts`：`latestTemplate('rfm')` 变成分群带 `v2:` 前缀的第 2 版，`latestTemplate('churn')` 变成 `at_risk` 取反、`minOrders` 不超过 10 的第 2 版，工作进程也继承这个开关）；发信用 `app.outbox` 或 `app.setMailer` 替换；模型服务用 `app.setLlmFetch` 注入假 fetch（默认替身直接报错，HTTP 测试不会真的请求填写的端点；`afterEach` 里传 `undefined` 恢复）。
 
 ## 现有测试一览
 

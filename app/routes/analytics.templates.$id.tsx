@@ -2,8 +2,9 @@
 // 分箱方式（五分位或固定阈值）与分群规则表），其他模板按注册表里的 form 渲染通用表单（整数、订单状态多选、单选）。
 // 有起草权限的成员保存草稿（参数不合法时报错）、丢弃草稿；草稿由最后保存它的人以外的另一位有发布权限的成员发布（ADR-0015），
 // 发布后以新参数入队一次模板计算，产出的快照记下定义版本；有发布权限的成员也可以按生效的版本重新计算，选填不晚于今天的参考日期。
-// 没有已发布版本时生效的是模板的默认参数（不能重新计算）
-import { CheckCircle2, Lock, Plus, RefreshCw, X } from 'lucide-react';
+// 没有已发布版本时生效的是模板的默认参数（不能重新计算）。注册表有了比生效版本锁定的更新的模板版本时显示提示条：可以预览升级差异
+// （只有分群迁移或变化人数，没有 consumer_id），有起草权限的成员确认升级后得到一版锁定新模板版本的草稿，照常双人发布（ADR-0021）
+import { ArrowUpCircle, CheckCircle2, Eye, Lock, Plus, RefreshCw, X } from 'lucide-react';
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.templates.$id';
@@ -13,7 +14,9 @@ import { publishReason } from '~/.server/publish-rules';
 import { TEMPLATES, type ParamField } from '~/.server/pipeline/templates';
 import type { RfmDefinition, ScoreRange, SegmentRule } from '~/.server/pipeline/templates/rfm';
 import { TaskError } from '~/.server/tasks';
-import { discardDraft, getTemplate, publishTemplate, recomputeTemplate, saveDraft, TemplateError, todayUtc } from '~/.server/templates';
+import {
+  discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, saveDraft, TemplateError, todayUtc, upgradeTemplateDraft,
+} from '~/.server/templates';
 import { entityOf } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
@@ -48,6 +51,15 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     justPublished: Number(search.get('published')) || null,
     /** 刚重新计算所按的版本（重新计算后跳回本页时带上 ?recomputed=N） */
     justRecomputed: Number(search.get('recomputed')) || null,
+    /** 刚起草的升级草稿（确认升级后跳回本页时带上 ?upgraded=N） */
+    justUpgraded: Number(search.get('upgraded')) || null,
+    /** 有比生效版本锁定的更新的模板版本 */
+    upgradeAvailable: t.upgradeAvailable,
+    latestTemplateVersion: t.latestTemplateVersion,
+    /** 生效的已发布版本锁定的模板版本；没有已发布版本时为 null */
+    lockedTemplateVersion: t.published?.templateVersion ?? null,
+    /** 草稿锁定的模板版本；没有草稿时为 null */
+    draftTemplateVersion: t.draft?.templateVersion ?? null,
     label: t.label,
     /** 通用表单的各项；RFM 用专用表单，为 null */
     fields: t.template === 'rfm' ? null : [...fieldsOf(t.template)],
@@ -128,12 +140,20 @@ export async function action({ request, params }: Route.ActionArgs) {
       case 'discard':
         await discardDraft(await requirePermission(request, 'definitions:draft'), params.templateId);
         break;
+      case 'preview-upgrade': {
+        const member = await requirePermission(request, 'definitions:read');
+        return { error: null, upgradeDiff: await previewTemplateUpgrade(member, params.templateId, String(form.get('asOf') ?? '') || undefined) };
+      }
+      case 'upgrade': {
+        const { version } = await upgradeTemplateDraft(await requirePermission(request, 'definitions:draft'), params.templateId);
+        throw redirect(`${page}?upgraded=${version}`);
+      }
       default:
-        return data({ error: '未知操作' }, { status: 400 });
+        return data({ error: '未知操作', upgradeDiff: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof TemplateError) return data({ error: e.message }, { status: e.status });
-    if (e instanceof TaskError) return data({ error: e.message }, { status: 400 });
+    if (e instanceof TemplateError) return data({ error: e.message, upgradeDiff: null }, { status: e.status });
+    if (e instanceof TaskError) return data({ error: e.message, upgradeDiff: null }, { status: 400 });
     throw e;
   }
   throw redirect(page);
@@ -154,6 +174,76 @@ function RecomputeAction({ denied, today, submitting }: { denied: string | null;
       <Input type="date" name="asOf" max={today} aria-label="参考日期（不填为今天）" title="参考日期（不填为今天，UTC）" className="w-40" />
       <Button type="submit" variant="outline" disabled={submitting}><RefreshCw />重新计算</Button>
     </Form>
+  );
+}
+
+type UpgradeDiff = Awaited<ReturnType<typeof previewTemplateUpgrade>>;
+
+/**
+ * 有新模板版本时的提示条：预览升级差异（intent=preview-upgrade，选填参考日期），有起草权限时确认升级（intent=upgrade）；
+ * 草稿已锁定新版本时说明发布后生效。预览结果：RFM 是分群迁移人数表，其他模板是变化、新增、移出人数
+ */
+function UpgradeBanner({ latest, locked, draft, canDraft, today, diff, submitting }: {
+  latest: number; locked: number; draft: { version: number; templateVersion: number | null } | null; canDraft: boolean; today: string;
+  diff: UpgradeDiff | null; submitting: boolean;
+}) {
+  const upgraded = draft !== null && draft.templateVersion === latest;
+  return (
+    <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm" data-upgrade-banner>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h2 className="flex items-center gap-1.5 font-medium text-amber-600"><ArrowUpCircle className="size-4" />{`有新的模板版本 v${latest}（当前 v${locked}）`}</h2>
+          <p className="text-sm text-slate-500">
+            {upgraded
+              ? `第 ${draft.version} 版草稿已锁定模板 v${latest}，由另一位数据工程师或管理员发布后按新版本计算；发布之前仍按 v${locked} 计算。`
+              : `升级前先预览：以生效的参数分别按 v${locked} 与 v${latest} 计算，按消费者对比，只给人数。确认升级后生成一版草稿，发布之前仍按 v${locked} 计算。`}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Form method="post" className="flex items-center gap-2">
+            <input type="hidden" name="intent" value="preview-upgrade" />
+            <Input type="date" name="asOf" max={today} aria-label="参考日期（不填为今天）" title="参考日期（不填为今天，UTC）" className="w-40" />
+            <Button type="submit" variant="outline" disabled={submitting}><Eye />预览升级差异</Button>
+          </Form>
+          {canDraft && !upgraded && (
+            <Form method="post">
+              <input type="hidden" name="intent" value="upgrade" />
+              <Button type="submit" disabled={submitting}><ArrowUpCircle />升级到新版本</Button>
+            </Form>
+          )}
+        </div>
+      </div>
+      {diff && (
+        <div data-upgrade-diff className="space-y-2">
+          <p className="text-sm text-slate-500">{`v${diff.from} → v${diff.to}，统计日 ${diff.asOf}`}</p>
+          {diff.segments && (diff.segments.length
+            ? (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>原分群</TableHead>
+                    <TableHead>新分群</TableHead>
+                    <TableHead>人数</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {diff.segments.map(t => (
+                    <TableRow key={`${t.before} → ${t.after}`} data-upgrade-segment>
+                      <TableCell>{t.before ?? '（无）'}</TableCell>
+                      <TableCell>{t.after ?? '（无）'}</TableCell>
+                      <TableCell>{t.consumers}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )
+            : <p className="text-sm">没有消费者换分群。</p>)}
+          {diff.metric && (
+            <p data-upgrade-metric className="text-sm">{`取值变化 ${diff.metric.changed} 人，新增 ${diff.metric.added} 人，移出 ${diff.metric.removed} 人`}</p>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -302,7 +392,10 @@ function ParamsForm({ params, canDraft, submitting }: { params: RfmDefinition; c
 }
 
 export default function TemplateParams({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canDraft, recomputeDenied, today, justPublished, justRecomputed, label, fields, form, published, versions } = loaderData;
+  const {
+    email, nav, canDraft, recomputeDenied, today, justPublished, justRecomputed, justUpgraded, upgradeAvailable, latestTemplateVersion, lockedTemplateVersion,
+    draftTemplateVersion, label, fields, form, published, versions,
+  } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   return (
@@ -330,6 +423,19 @@ export default function TemplateParams({ loaderData, actionData }: Route.Compone
           <AlertTitle>{`已按第 ${justRecomputed} 版参数入队一次计算`}</AlertTitle>
           <AlertDescription>完成后快照出现在分析页。</AlertDescription>
         </Alert>
+      )}
+      {justUpgraded && !actionData?.error && (
+        <Alert role="status">
+          <CheckCircle2 />
+          <AlertTitle>{`已起草第 ${justUpgraded} 版，锁定模板 v${latestTemplateVersion}`}</AlertTitle>
+          <AlertDescription>由另一位数据工程师或管理员发布后按新版本计算。</AlertDescription>
+        </Alert>
+      )}
+      {upgradeAvailable && lockedTemplateVersion !== null && (
+        <UpgradeBanner
+          latest={latestTemplateVersion} locked={lockedTemplateVersion} draft={draft ? { version: draft.version, templateVersion: draftTemplateVersion } : null}
+          canDraft={canDraft} today={today} diff={actionData?.upgradeDiff ?? null} submitting={submitting}
+        />
       )}
 
       <div className="rounded-2xl border bg-white p-6 shadow-sm">

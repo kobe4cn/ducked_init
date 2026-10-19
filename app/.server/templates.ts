@@ -3,16 +3,21 @@
 // 发布后版本锁定，并以新参数（加上当天的 asOf）入队一次模板任务，快照登记时记下定义版本（ADR-0004、0015）。
 // 也可以按当前生效的版本重新计算（可指定参考日期），不产生新版本；依赖的实体有新合并后调度器按当天以生效版本重算（refresh.ts，ADR-0028）。
 // 任务参数与快照记下来源（发布、手动重新计算、定时刷新、平台自动启用时的发布）。映射合并成功后，平台以注册表里的默认参数自动启用
-// 本租户还没有定义、依赖的实体都已有已发布映射的模板（enableDefaultTemplates，不经双人发布，ADR-0021）。一律限定在操作者所属租户内
+// 本租户还没有定义、依赖的实体都已有已发布映射的模板（enableDefaultTemplates，不经双人发布，ADR-0021）。
+// 注册表有了比生效版本锁定的更新的模板版本时，成员可以预览升级后的差异（只读、只出计数），确认后起草一版锁定新模板版本的草稿，照常双人发布。
+// 一律限定在操作者所属租户内
 import { and, desc, eq, getTableColumns, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
-import { getDb } from './db/client';
+import { getDb, type Db } from './db/client';
+import { DslError, onReadOnlyLake, type DiffCounts, type TagTransition } from './dsl-definitions';
 import { mappings, mappingVersions, tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
 import { pendingMerge } from './mappings';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
-import { latestTemplate, TASK_KINDS, templateAt, TEMPLATES, type Template, type TemplateId } from './pipeline/templates';
+import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
+import { lit, rows } from './pipeline/merge-engine';
+import { latestTemplate, missingTableHint, TASK_KINDS, templateAt, TEMPLATES, type Template, type TemplateId } from './pipeline/templates';
 import { insertTask } from './tasks';
 
 export { TASK_KINDS, templateOfKind, type TemplateId } from './pipeline/templates';
@@ -27,12 +32,12 @@ function requireTemplate(id: string): TemplateId {
   return id as TemplateId;
 }
 
-/** 校验参数，不合法时把说明原因的错误转成 TemplateError */
-function validated<T>(parse: () => T) {
+/** 校验参数，不合法时把说明原因的错误转成 TemplateError（带上前缀 prefix） */
+function validated<T>(parse: () => T, prefix = '') {
   try {
     return parse();
   } catch (e) {
-    throw new TemplateError((e as Error).message);
+    throw new TemplateError(`${prefix}${(e as Error).message}`);
   }
 }
 
@@ -80,9 +85,14 @@ export async function getTemplate(actor: CurrentMember, id: string) {
     .orderBy(desc(templateVersions.version));
   const published = versions.find(v => v.status === 'published') ?? null;
   const draft = versions.find(v => v.status === 'draft') ?? null;
+  const latestTemplateVersion = latestTemplate(template).version;
   return {
     template,
     label: TEMPLATES[template].label,
+    /** 注册表里模板的当前版本 */
+    latestTemplateVersion,
+    /** 生效的已发布版本锁定的模板版本比当前版本旧：可以预览升级差异、起草升级 */
+    upgradeAvailable: published !== null && published.templateVersion < latestTemplateVersion,
     versions: versions.map(v => ({ ...v, publishBlocker: publishBlocker(actor, v) })),
     draft,
     published,
@@ -207,6 +217,106 @@ export async function recomputeTemplate(actor: CurrentMember, id: string, asOf?:
     });
     const task = await enqueueTemplate(tx, actor.tenant.id, template, published.params, published.version, day, 'manual');
     return { version: published.version, task };
+  });
+}
+
+/** 升级的起点：生效的已发布版本锁定的模板版本比当前版本旧；没有已发布版本或已是当前版本时报错 */
+async function requireUpgradable(db: Tx | Db, tenantId: string, template: TemplateId) {
+  const [published] = await db.select({ version: templateVersions.version, params: templateVersions.params, templateVersion: templateVersions.templateVersion })
+    .from(templateVersions)
+    .innerJoin(templateDefinitions, eq(templateDefinitions.id, templateVersions.definitionId))
+    .where(and(ofDefinition(tenantId, template), eq(templateVersions.status, 'published')))
+    .orderBy(desc(templateVersions.version)).limit(1);
+  const latest = latestTemplate(template);
+  if (!published || published.templateVersion >= latest.version) throw new TemplateError('已是最新模板版本');
+  return { published, latest };
+}
+
+/**
+ * 预览升级差异：需要定义查看权限。以生效版本的参数加上参考日期 asOf（不给时为当天，UTC；不能晚于今天），分别按它锁定的模板版本与当前版本编译，
+ * 在只读挂载的数据湖上按 consumer_id 对比，只给计数（ADR-0025）：RFM 是分群迁移（原分群 → 新分群的人数），其他模板是换了取值、新增、移出的人数。
+ * 不出 consumer_id，不建表、不入队任务、不登记快照。已是当前版本时报「已是最新模板版本」，当前版本不接受生效的参数时说明原因
+ */
+export async function previewTemplateUpgrade(actor: CurrentMember, id: string, asOf?: string) {
+  assertCan(actor, 'definitions:read');
+  const template = requireTemplate(id);
+  const { published, latest } = await requireUpgradable(getDb(), actor.tenant.id, template);
+  const locked = lockedTemplate(template, published.templateVersion);
+  const day = asOf || todayUtc();
+  const before = validated(() => locked.parse({ ...published.params, asOf: day }));
+  // 校验过格式后两边都是 YYYY-MM-DD，可以直接比较字符串
+  if (day > todayUtc()) throw new TemplateError(`参考日期 ${day} 晚于今天（UTC ${todayUtc()}）`);
+  const after = validated(() => latest.parse({ ...published.params, asOf: day }), `模板第 ${latest.version} 版不接受生效的参数：`);
+  const tables = [...new Set([...locked.requires, ...locked.optional ?? [], ...latest.requires, ...latest.optional ?? []])];
+  const entities = [...new Set([...locked.entities, ...latest.entities])];
+  try {
+    return await onReadOnlyLake(actor.tenant.id, entities, [], '预览升级差异', async con => {
+      const present = new Set((await rows<{ name: string }>(con, `
+        SELECT table_name AS name FROM information_schema.tables
+        WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${tables.map(lit).join(', ')})`)).map(t => t.name));
+      const missing = [...locked.requires, ...latest.requires].find(t => !present.has(t));
+      if (missing) throw new DslError(`${missingTableHint(missing)}，再预览升级差异`);
+      const has = (t: string) => present.has(t);
+      const oldSql = locked.compile(before, has), newSql = latest.compile(after, has);
+      const segment = (sql: string) => `SELECT consumer_id, segment AS tag_value FROM (${sql})`;
+      return {
+        template,
+        from: published.templateVersion,
+        to: latest.version,
+        asOf: day,
+        /** RFM：分群迁移，取值没变的人不出现 */
+        segments: template === 'rfm' ? await rows<TagTransition>(con, compileTagDiff(segment(oldSql), segment(newSql))) : null,
+        metric: template === 'rfm' ? null : (await rows<DiffCounts>(con, compileMetricDiff(oldSql, newSql)))[0]!,
+      };
+    });
+  } catch (e) {
+    if (e instanceof DslError) throw new TemplateError(e.message);
+    throw e;
+  }
+}
+
+/**
+ * 确认升级：需要起草权限。已有草稿时把它锁定的模板版本改成当前版本，没有时以生效的参数新建一版锁定当前版本的草稿；
+ * 参数按当前版本校验（不接受时说明原因），作者照常记下。之后照常双人发布，发布前计算仍按生效版本锁定的旧版本；丢弃草稿即回到旧版本。
+ * 已是当前版本时报「已是最新模板版本」，草稿已锁定当前版本时报错、不重复升级。返回草稿的版本号与升级前后的模板版本
+ */
+export async function upgradeTemplateDraft(actor: CurrentMember, id: string) {
+  assertCan(actor, 'definitions:draft');
+  const template = requireTemplate(id);
+  return getDb().transaction(async tx => {
+    // 锁住定义行：与保存、发布、丢弃互斥，一个定义只有一份草稿
+    const [definition] = await tx.select({ id: templateDefinitions.id }).from(templateDefinitions)
+      .where(ofDefinition(actor.tenant.id, template)).for('update');
+    if (!definition) throw new TemplateError('已是最新模板版本');
+    const { published, latest } = await requireUpgradable(tx, actor.tenant.id, template);
+    const [newest] = await tx.select().from(templateVersions)
+      .where(eq(templateVersions.definitionId, definition.id)).orderBy(desc(templateVersions.version)).limit(1);
+    const draft = newest?.status === 'draft' ? newest : null;
+    if (draft?.templateVersion === latest.version) throw new TemplateError(`第 ${draft.version} 版草稿已锁定模板第 ${latest.version} 版，发布后生效`);
+    const from = draft?.templateVersion ?? published.templateVersion;
+    const params = validated(() => latest.parseDefinition(draft?.params ?? published.params) as Record<string, unknown>,
+      `模板第 ${latest.version} 版不接受${draft ? '草稿' : '生效'}的参数：`);
+    let version: number;
+    if (draft) {
+      await tx.update(templateVersions).set({
+        params, templateVersion: latest.version, authors: withAuthor(draft.authors, actor.email), lastEditor: actor.email, updatedAt: new Date(),
+      }).where(eq(templateVersions.id, draft.id));
+      version = draft.version;
+    } else {
+      version = newest!.version + 1;
+      await tx.insert(templateVersions).values({
+        definitionId: definition.id, version, params, templateVersion: latest.version, authors: [actor.email], lastEditor: actor.email,
+      });
+    }
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id,
+      actor,
+      action: 'template.upgrade_drafted',
+      targetType: 'template',
+      targetId: definition.id,
+      detail: { template, version, from, to: latest.version },
+    });
+    return { version, from, to: latest.version };
   });
 }
 

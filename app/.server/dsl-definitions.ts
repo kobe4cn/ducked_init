@@ -433,7 +433,7 @@ const PREVIEW_LIMITS = { memoryLimitMb: 512, threads: 1 };
  * 没有时抛出说明（what 是操作名，如「预览」）；
  * 查询出错时报错里抹掉湖的凭据。只读：不建表、不入队任务、不登记快照
  */
-async function onReadOnlyLake<T>(tenantId: string, entities: string[], sqls: string[], what: string, run: (con: DuckDBConnection) => Promise<T>): Promise<T> {
+export async function onReadOnlyLake<T>(tenantId: string, entities: string[], sqls: string[], what: string, run: (con: DuckDBConnection) => Promise<T>): Promise<T> {
   const lake = await lakeRow(tenantId);
   if (!lake || !lakeReady(lake)) throw new DslError('本租户的数据湖还没有初始化');
   const spec = lakeSpecOf(lake);

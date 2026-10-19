@@ -171,6 +171,7 @@ const ACTIONS = {
     describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
   },
   'template.auto_enabled': { label: '自动启用模板', describe: (d: Detail) => `${templateLabel(d.template)}，按默认参数发布第 ${d.version} 版` },
+  'template.upgrade_drafted': { label: '起草模板升级', describe: (d: Detail) => `${templateLabel(d.template)} 第 ${d.version} 版草稿，模板第 ${d.from} 版 → 第 ${d.to} 版` },
   'template.recomputed': {
     label: '重新计算模板',
     describe: (d: Detail) => `${templateLabel(d.template)}，按第 ${d.version} 版参数，参考日期 ${d.asOf}`,

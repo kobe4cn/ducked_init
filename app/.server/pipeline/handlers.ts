@@ -11,7 +11,7 @@ import { lit, mergeToSilver, type MergeDrop, type MergeGroupParam, type MergeMap
 import { MERGE_RULE_KINDS, type MergeRuleKind } from '../../lib/merge-groups';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './identity-engine';
-import { TASK_KINDS, templateAt, TEMPLATES, type TemplateId } from './templates';
+import { missingTableHint, TASK_KINDS, templateAt, TEMPLATES, type TemplateId } from './templates';
 import { assertOrThrow, runAssertions } from './assertions';
 import { ensureCustomerSourceColumns } from './customer-source-columns';
 import { PartialFailure } from './partial-failure';
@@ -199,14 +199,6 @@ function positiveInt(params: Params, key: string, max: number) {
   const v = params[key];
   if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > max) throw new Error(`参数 ${key} 必须是 1 到 ${max} 之间的整数`);
   return v as number;
-}
-
-/** silver 下缺了某张表时的说明：先做什么才会有它 */
-function missingTableHint(table: string) {
-  if (table === '_identities') return `标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`;
-  if (table === '_consumer') return `标准层还没有统一消费者属性（${CONSUMER}）：重新合并一次映射`;
-  if (table.startsWith('_')) return `标准层还没有 silver.${table}：重新合并一次映射`;
-  return `标准层还没有 silver.${table}：先发布 ${table} 映射并合并`;
 }
 
 /**

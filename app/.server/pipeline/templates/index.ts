@@ -6,6 +6,7 @@ import { CLV_DEFAULTS, compileClv, parseClvDefinition, parseClvParams, type ClvP
 import { COHORT_DEFAULTS, compileCohort, parseCohortDefinition, parseCohortParams, type CohortParams } from './cohort';
 import { compileRepurchase, parseRepurchaseDefinition, parseRepurchaseParams, REPURCHASE_DEFAULTS, type RepurchaseParams } from './repurchase';
 import { compileRfm, compileRfmUnlinked, parseRfmDefinition, parseRfmParams, RFM_DEFAULTS, type RfmParams } from './rfm';
+import { CONSUMER, IDENTITIES } from '../identity-engine';
 import { TEST_VERSIONS } from './test-versions';
 import { compileUser360, parseUser360Definition, parseUser360Params, USER360_DEFAULTS, type User360Params } from './user360';
 
@@ -135,4 +136,12 @@ export function templateAt(id: TemplateId, version: number) {
   const found = [testVersion(id), registered(id), ...TEMPLATE_HISTORY[id] ?? []].find(t => t?.version === version);
   if (!found) throw new Error(`模板 ${TEMPLATES[id].label} 没有第 ${version} 版`);
   return found;
+}
+
+/** 模板要求的 silver 表缺了时的说明：先做什么才会有它（模板任务与升级预览共用） */
+export function missingTableHint(table: string) {
+  if (table === '_identities') return `标准层还没有身份打通结果（${IDENTITIES}）：先发布 customer 映射并合并`;
+  if (table === '_consumer') return `标准层还没有统一消费者属性（${CONSUMER}）：重新合并一次映射`;
+  if (table.startsWith('_')) return `标准层还没有 silver.${table}：重新合并一次映射`;
+  return `标准层还没有 silver.${table}：先发布 ${table} 映射并合并`;
 }

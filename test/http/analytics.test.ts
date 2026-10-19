@@ -2,9 +2,10 @@
 // 其他租户的快照 404，已过期的快照标灰、打不开；RFM 模板参数页的权限矩阵：查看者只读，分析师能起草不能发布，
 // 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm；按生效版本重新计算（分析师 403、未来日期与重复入队被拒）；
 // 用户 360 走注册表里的通用参数表单（只读、起草、校验报错、多余字段不传、发布后入队 gold.user360、未登记模板 404）与通用快照明细（全部列、是 / 否、分页、没有明文）
-// 同期群与复购同样走通用表单（周期下拉框、起草、双人发布入队 gold.cohort / gold.repurchase 并登记快照，周期偏移列表用顿号连接）
+// 同期群与复购同样走通用表单（周期下拉框、起草、双人发布入队 gold.cohort / gold.repurchase 并登记快照，周期偏移列表用顿号连接）；
+// 模板升级（测试开关 TEMPLATE_TEST_VERSIONS=1）：提示条、预览差异（RFM 分群迁移表、流失预警变化人数，没有 consumer_id）、分析师起草升级但发布 403
 import { and, eq } from 'drizzle-orm';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -17,6 +18,7 @@ let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
+afterEach(() => { vi.unstubAllEnvs(); });
 
 /** 打通好的 acme 跑一次 RFM，返回租户与快照 */
 async function rfmSnapshot() {
@@ -382,5 +384,57 @@ describe('同期群与复购模板参数页（通用表单）', () => {
     const page = await (await de.get(`/analytics/snapshots/${recomputed.id}`)).text();
     expect(page).toContain('复购 · 2024-07-01');
     expect(page).toContain('回看 365 天');
+  });
+});
+
+describe('模板升级', () => {
+  it('有新模板版本时显示提示条，分析师可以预览差异（只有人数）、起草升级但不能发布，另一位数据工程师发布后按新版本入队；没有新版本时没有提示条', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const analyst = await loginAs(app, 'analyst@acme.com');
+
+    // 开关关闭：没有新版本
+    expect(await (await analyst.get('/analytics/templates/rfm')).text()).not.toContain('有新的模板版本');
+    for (const intent of ['preview-upgrade', 'upgrade']) {
+      const res = await analyst.post('/analytics/templates/rfm', { intent });
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain('已是最新模板版本');
+    }
+
+    vi.stubEnv('TEMPLATE_TEST_VERSIONS', '1');
+    const page = await (await analyst.get('/analytics/templates/rfm')).text();
+    expect(page).toContain('有新的模板版本 v2（当前 v1）');
+    expect(page).toContain('预览升级差异');
+    expect(page).toContain('升级到新版本');
+
+    const preview = await analyst.post('/analytics/templates/rfm', { intent: 'preview-upgrade', asOf: '2024-12-31' });
+    expect(preview.status).toBe(200);
+    const diff = await preview.text();
+    expect(diff).toContain('data-upgrade-diff');
+    expect(diff).toContain('v1 → v2，统计日 2024-12-31');
+    expect(diff.match(/data-upgrade-segment/g)!.length).toBeGreaterThan(0);
+    expect(diff).toMatch(/<td[^>]*>v2:[^<]+<\/td>/);
+    expect(diff).not.toMatch(/[0-9a-f]{64}/);
+
+    // 流失预警：变化、新增、移出人数
+    const churn = await (await analyst.post('/analytics/templates/churn', { intent: 'preview-upgrade', asOf: '2024-10-15' })).text();
+    expect(churn).toMatch(/data-upgrade-metric[^>]*>取值变化 [1-9]\d* 人，新增 0 人，移出 0 人/);
+    expect(churn).not.toMatch(/[0-9a-f]{64}/);
+
+    const upgraded = await analyst.post('/analytics/templates/rfm', { intent: 'upgrade' });
+    expect(upgraded.status).toBe(302);
+    expect(upgraded.headers.get('location')).toBe('/analytics/templates/rfm?upgraded=2');
+    const drafted = await (await analyst.get('/analytics/templates/rfm?upgraded=2')).text();
+    expect(drafted).toContain('已起草第 2 版，锁定模板 v2');
+    expect(drafted).toContain('第 2 版草稿已锁定模板 v2');
+    expect(drafted).not.toContain('升级到新版本');
+    expect((await analyst.post('/analytics/templates/rfm', { intent: 'publish', version: '2' })).status).toBe(403);
+
+    const de = await loginAs(app, 'de@acme.com');
+    expect((await de.post('/analytics/templates/rfm', { intent: 'publish', version: '2' })).status).toBe(302);
+    const [task] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'gold.rfm'), eq(tasks.status, 'queued')));
+    expect(task!.params).toMatchObject({ definitionVersion: 2, templateVersion: 2 });
+    expect(await (await de.get('/analytics/templates/rfm')).text()).not.toContain('有新的模板版本');
   });
 });
