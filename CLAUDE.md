@@ -14,7 +14,7 @@ A `ready-for-agent` ticket has at most 3 acceptance criteria and an `## Implemen
 
 ### UI conventions
 
-Before building or changing a page, read `docs/agents/ui.md` (shell, page header, stat tiles, card grid, tabs, status colors).
+Before building or changing a page, read `docs/agents/ui.md` (shell, page header, stat tiles, card grid, tabs, status colors). After changing a page and passing its HTTP tests, check it in a real browser with the `ego-browser` skill. See "浏览器验收" in `test/README.md`.
 
 ### Domain docs
 

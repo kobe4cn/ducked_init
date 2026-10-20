@@ -152,6 +152,39 @@ describe('<功能>', () => {
 
 数据准备优先用领域函数（`newTenant`、`memberOf`、`registerSource`），只把要测的那一步走 HTTP。
 
+## 浏览器验收（ego-browser）
+
+HTTP 测试只看得到服务端渲染的 HTML。改了页面（`app/routes/*.tsx`、`app/components/`）的话，HTTP 测试通过后，再用 `ego-browser` skill 在真实浏览器里走一遍。它不进 `pnpm test`，也不能代替回归测试：能写成 HTTP 断言的就写成测试。浏览器只看测试看不到的东西：布局是否符合 `docs/agents/ui.md`、客户端交互（添加一行、Ctrl / ⌘ + Enter、展开目录等），以及页面或服务端有没有报错。
+
+### 起 dev server
+
+用户自己的 dev server 一般占着 5173，它的输出 agent 读不到。所以另起一个，用 `run_in_background` 运行，输出写进文件：
+
+```bash
+MAILER=console pnpm dev --port 5180 --strictPort > /tmp/crm-dev-5180.log 2>&1
+```
+
+- 它连的是 `.env` 里的开发库 `crm_platform`，不是测试库。里面是真实的开发数据：只操作验收用的租户，不删改别的数据。
+- 必须设 `MAILER=console`：`.env` 里配了 `RESEND_API_KEY`，不设就会真的发信。
+- 验收结束后停掉它：`lsof -tiTCP:5180 -sTCP:LISTEN | xargs kill`。
+
+### 登录
+
+租户成员只能用 Magic Link 登录：
+
+1. 打开 `http://localhost:5180/login`，填邮箱，点「发送登录链接」。
+2. 从日志里取链接：`grep -o 'http://localhost:5180/auth/verify?token=[A-Za-z0-9_-]*' /tmp/crm-dev-5180.log | tail -1`
+3. 打开链接后，**还要点页面上的按钮**（POST）才会登录；然后等地址离开 `/auth`。
+
+账号用 `crmlab-smoke` 租户的成员，按要验收的角色选：`admin@crmlab-smoke.test`（管理员）、`eng@crmlab-smoke.test`（数据工程师）、`an@crmlab-smoke.test`（分析师）。浏览器会记住登录状态，换角色前先退出登录。运营后台 `/ops` 还要过 TOTP，验收它时用 `task.handOff()` 请用户登录。
+
+### 做什么
+
+- 一次验收只用一个 TaskSpace。照 ticket 的 `## Implementation guide` 里 **Browser check** 那一行操作：打开哪页、做什么、应看到什么。
+- 截图存到 `/tmp/` 并自己看一遍，再 `grep -n -i error /tmp/crm-dev-5180.log` 查服务端报错。发现问题就修，修完重新看。
+- 浏览器里发现的 bug，修好后如果能用 HTTP 测试锁住，就补一条测试。
+- 结束时调 `task.finish({ keep: [] })`，并停掉 dev server。截图作为 PR 里的证据。
+
 ## 约定
 
 - 文件第一行注释写清这条接缝：从哪个入口进、经过什么、在哪里看结果。

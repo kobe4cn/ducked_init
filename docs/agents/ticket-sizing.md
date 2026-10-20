@@ -29,6 +29,7 @@ Every `ready-for-agent` ticket ends with this section. It holds conclusions only
 - **Reuse**: `fnName(arg: Type): Ret` in `path:line`; the table `x` with columns `a, b`.
 - **ADRs**: 0006, 0015 (only the relevant ones).
 - **Tests**: which file, which seam, which fixtures from `test/README.md`, and one similar existing test to copy (from `test/CATALOG.md`, as `file` + `it` name).
+- **Browser check** (only when the ticket changes a page): which page to open as which role, what to do, and what you should see. The `/implement` agent runs it with ego-browser after the HTTP tests pass (see "浏览器验收" in `test/README.md`).
 - **Watch out**: non-obvious constraints (privacy rules, permissions, migrations).
 ```
 
@@ -37,7 +38,7 @@ Every `ready-for-agent` ticket ends with this section. It holds conclusions only
 Don't explore in the main thread. Delegate to an `Explore` subagent with breadth "medium" and give it:
 
 1. The ticket body, or the draft of the children when splitting.
-2. A list of questions. Ask for the items in the guide template: `file:line` ranges of the functions to change, one-line signatures to reuse, table and type field names, relevant ADRs from `docs/adr/README.md`, test file and fixtures from `test/README.md`, a similar existing test from `test/CATALOG.md`, the number of existing files each slice changes, and a rough line count per slice.
+2. A list of questions. Ask for the items in the guide template: `file:line` ranges of the functions to change, one-line signatures to reuse, table and type field names, relevant ADRs from `docs/adr/README.md`, test file and fixtures from `test/README.md`, a similar existing test from `test/CATALOG.md`, for a slice that changes a page the route and the role that can reach it, the number of existing files each slice changes, and a rough line count per slice.
 3. An output rule: conclusions only, `file:line` references, no file contents, at most about 1500 words.
 
 Then use the report to draw the slice boundaries, write each child's guide, and publish with `gh issue create`. Spot-check two or three of the `file:line` references with `grep -n` before publishing.

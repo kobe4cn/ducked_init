@@ -25,7 +25,7 @@ The one exception is the workbench SQL editor (`app/components/sql-editor.tsx`),
 
 ## Forms
 
-- **Repeatable rows** (fields, conditions, columns): render existing rows plus an "添加一行" button, with no fixed row limit. Blank rows are ignored on save. HTTP tests only see the server-rendered rows, so test the controls' presence and check the page in a browser.
+- **Repeatable rows** (fields, conditions, columns): render existing rows plus an "添加一行" button, with no fixed row limit. Blank rows are ignored on save. HTTP tests only see the server-rendered rows, so test the controls' presence and check the page in a browser (see "浏览器验收" in `test/README.md`).
 
 ## Status colors
 
