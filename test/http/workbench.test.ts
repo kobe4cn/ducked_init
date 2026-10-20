@@ -2,11 +2,11 @@
 // 客户端中止请求即取消查询，同租户已有查询在运行时再提交返回 429。查看者看不到导航、打开与提交都 403。
 // 填上表名点「保存」把 SELECT 的结果存为沙箱表，「我的沙箱表」列出自己的表；别人的沙箱读不到。
 // 表的主人分享给本租户有沙箱权限的成员后，被分享人在「分享给我的」里看到、能读不能写，撤销后又读不到。
-// 左侧目录树只列能读的表（字段类型、行数、湖中位置、带引号的引用）
+// 左侧目录树只列能读的表（字段类型、行数、湖中位置、带引号的引用）；原始层按数据源名列出视图，数据源改名后别名随之变化
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, members, sandboxTables } from '../../app/.server/db/schema';
+import { auditLogs, members, sandboxTables, sources } from '../../app/.server/db/schema';
 import { memberOf, newTenant, onLake } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -246,5 +246,37 @@ describe('目录树', () => {
     const shared = catalogSection(unescape(await (await engineer.get('/workbench')).text()), 'shared');
     expect(shared).toContain(`data-ref="lake.${ownerSchema}."catalog_mine""`);
     expect(shared).toContain('customer_id');
+  });
+});
+
+describe('原始层视图', () => {
+  it('按数据源名查原始层：改名后新名字可查、旧名字不行，目录随之变化；与保留名冲突时目录里给出原因', async () => {
+    await memberOf(acme, 'an4@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an4@acme.com');
+    const raw = async () => catalogSection(unescape(await (await analyst.get('/workbench')).text()), 'raw');
+    expect(await raw()).toContain('data-ref=""CRM"."customers""');
+    const ok = await analyst.post('/workbench', { sql: 'SELECT id, email FROM crm.customers ORDER BY id' });
+    expect(ok.status).toBe(200);
+    const html = await ok.text();
+    expect(html).toMatch(/[0-9a-f]{64}/);
+    expect(html).not.toContain('zhang@crm.test');
+
+    const [crm] = await getDb().select().from(sources).where(and(eq(sources.tenantId, acme), eq(sources.name, 'CRM')));
+    const rename = (name: string) => getDb().update(sources).set({ name }).where(eq(sources.id, crm.id));
+    try {
+      await rename('客户库');
+      expect((await analyst.post('/workbench', { sql: 'SELECT count(*) AS n FROM 客户库.customers' })).status).toBe(200);
+      const old = await analyst.post('/workbench', { sql: 'SELECT * FROM crm.customers' });
+      expect(old.status).toBe(400);
+      expect(await old.text()).toContain('不能读 crm.customers');
+      const renamed = await raw();
+      expect(renamed).toContain('data-ref=""客户库"."customers""');
+      expect(renamed).not.toContain('"CRM"');
+
+      await rename('gold');
+      expect(await raw()).toMatch(/data-raw-source="gold"[\s\S]*与保留名 gold 冲突，原始层视图没有挂载/);
+    } finally {
+      await rename('CRM');
+    }
   });
 });

@@ -246,6 +246,29 @@ const bucketsFor = (t: TableSync, n: number) => bucketCount(t.limits, n);
 export const inBucket = (hashed: string, buckets: number, b: number) => (buckets > 1 ? `${hashed} % ${buckets} = ${b}` : 'true');
 export const keyHash = (keys: string[], alias: string) => `hash(${keyList(keys, alias)})`;
 
+/**
+ * 原始层表 lake.<schema>.<table> 回放后的当前状态（只给 SELECT 文本，不写表），不含平台列与整行哈希：
+ * 有主键（keys 非空）时取当前主键状态里每个主键最新的一版非删除记录（与 ensureMirror 由主键状态接续时一样：删除记录只带主键，
+ * 存在与否以主键状态为准）；没有主键时就是当前镜像的整行（重复行各一行）
+ */
+export function currentStateSql(schema: string, table: string, keys: string[]) {
+  if (!keys.length) return `SELECT * EXCLUDE (_hash) FROM lake.${ident(`${schema}_mirror`)}.${ident(table)}`;
+  return `SELECT r.* EXCLUDE (${[...PLATFORM_COLUMNS, '_rn'].map(ident).join(', ')}) FROM (
+      SELECT b.*, row_number() OVER (PARTITION BY ${keyList(keys, 'b')} ORDER BY b._batch DESC) AS _rn
+      FROM lake.${ident(schema)}.${ident(table)} b WHERE b._op <> 'delete') r
+    SEMI JOIN lake.${ident(`${schema}_keys`)}.${ident(table)} k ON ${joinOn(keys, 'r', 'k')}
+    WHERE r._rn = 1`;
+}
+
+/** 原始层表的当前状态（currentStateSql）：主键取自 <schema>_keys 里这张表的列（去掉 _hash）；既没有主键状态也没有镜像时为 null */
+export async function currentStateOf(con: DuckDBConnection, schema: string, table: string) {
+  if (await tableExists(con, `${schema}_keys`, table)) {
+    const keys = (await columnsOf(con, `lake.${ident(`${schema}_keys`)}.${ident(table)}`)).map(c => c.column_name).filter(c => c !== '_hash');
+    return currentStateSql(schema, table, keys);
+  }
+  return await tableExists(con, `${schema}_mirror`, table) ? currentStateSql(schema, table, []) : null;
+}
+
 /** 事务里执行：失败时回滚 */
 async function inTransaction<T>(con: DuckDBConnection, work: () => Promise<T>) {
   await con.run('BEGIN');

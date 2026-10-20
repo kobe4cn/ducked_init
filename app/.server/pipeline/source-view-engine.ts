@@ -3,7 +3,7 @@
 // 只能是本数据源原始层（bronze_<数据源 ID>）的表或所在作用域里的 CTE，不能用表函数（read_parquet 等可以读任意路径）。
 // 视图要输出平台列 _op、_batch、_commit_ts，映射才能沿用变更批次的增量语义（ADR-0006）。
 // 样本不直接读原始层：会话的本机库 stage 里给本数据源的每张原始层表建一个同名视图，敏感列先换成按租户加盐的哈希，
-// 视图 SQL 在这些视图上执行，任何表达式与报错都只见得到哈希（ADR-0005）
+// 视图 SQL 在这些视图上执行，任何表达式与报错都只见得到哈希（ADR-0005）。工作台的原始层视图用同一套哈希规则（createMaskedViews）
 import { createHash } from 'node:crypto';
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { SENSITIVE_FORMATS, SENSITIVE_NAME } from '../../lib/sensitive';
@@ -72,21 +72,30 @@ const HASH = /^[0-9a-f]{64}$/;
 const CONTAINS_HASH = /[0-9a-f]{64}/;
 const sensitiveName = (name: string) => !PLATFORM_COLUMNS.includes(name) && SENSITIVE_NAME.test(name);
 
+/** 要建哈希视图的一张表：视图名、它读的关系（表名或带括号的子查询）与采集时像敏感信息的列 */
+export interface MaskedTable { name: string; from: string; sensitive?: readonly string[] }
+
 /**
- * 在 stage 里建与本数据源原始层同名的 schema，每张表一个同名视图：sensitive 里列出的列（采集时像敏感信息的）与列名像敏感信息的列
- * 换成 sha256(盐 || 取值)，其余列原样。返回这个 schema 名
+ * 在 target（已加引号的 <catalog>.<schema>）里给每张表建一个视图：sensitive 里列出的列与列名像敏感信息的列（平台列不算）
+ * 换成 sha256(盐 || 取值)，其余列原样。salt 是给出盐的 SQL 表达式（字面量或标量子查询）
  */
+export async function createMaskedViews(con: DuckDBConnection, target: string, tables: readonly MaskedTable[], salt: string) {
+  for (const table of tables) {
+    const columns = await rows<{ column_name: string }>(con, `DESCRIBE SELECT * FROM ${table.from}`);
+    const masked = new Set(table.sensitive ?? []);
+    const select = columns.map(({ column_name: name }) => (masked.has(name) || sensitiveName(name)
+      ? `sha256(${salt} || CAST(${ident(name)} AS VARCHAR)) AS ${ident(name)}` : ident(name)));
+    await con.run(`CREATE OR REPLACE VIEW ${target}.${ident(table.name)} AS SELECT ${select.join(', ')} FROM ${table.from}`);
+  }
+}
+
+/** 在 stage 里建与本数据源原始层同名的 schema，每张原始层表一个哈希过敏感列的同名视图（createMaskedViews）。返回这个 schema 名 */
 async function maskedBronze(con: DuckDBConnection, sourceId: string, tables: readonly string[], sensitive: Readonly<Record<string, readonly string[]>>, salt: string) {
   const schema = bronzeSchema(sourceId);
   await con.run(`CREATE SCHEMA IF NOT EXISTS stage.${ident(schema)}`);
-  for (const table of tables) {
-    const columns = await rows<{ name: string }>(con, `SELECT column_name AS name FROM information_schema.columns
-      WHERE table_catalog = 'lake' AND table_schema = ${lit(schema)} AND table_name = ${lit(table)} ORDER BY ordinal_position`);
-    const masked = new Set(sensitive[table] ?? []);
-    const select = columns.map(({ name }) => (masked.has(name) || sensitiveName(name)
-      ? `sha256(${lit(salt)} || CAST(${ident(name)} AS VARCHAR)) AS ${ident(name)}` : ident(name)));
-    await con.run(`CREATE OR REPLACE VIEW stage.${ident(schema)}.${ident(table)} AS SELECT ${select.join(', ')} FROM lake.${ident(schema)}.${ident(table)}`);
-  }
+  await createMaskedViews(con, `stage.${ident(schema)}`, tables.map(table => ({
+    name: table, from: `lake.${ident(schema)}.${ident(table)}`, sensitive: sensitive[table],
+  })), lit(salt));
   return schema;
 }
 

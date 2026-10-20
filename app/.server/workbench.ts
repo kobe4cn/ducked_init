@@ -4,6 +4,8 @@
 // 把查询结果保存为个人沙箱表时用可写挂载，CREATE 语句由平台拼出、只写进成员自己的 sandbox_<成员>，并在平台库登记（保存后 SANDBOX_TTL_DAYS 天过期）。
 // 表的主人可以把沙箱表只读分享给本租户有沙箱权限的成员；每次查询都按被分享人当前的角色与分享登记重新算能读的表，不缓存。
 // 目录树（listCatalog）用同一套只读凭据挂载、按同一个允许集合列出表与字段，由平台查询，不拿并发锁、不记审计。
+// 原始层只给回放后的当前状态：每次挂载都按此刻的数据源名现建内存 catalog 与视图（数据源改名后别名随之变化），敏感列是加盐哈希，
+// 采集时像敏感信息的列取自数据源的列统计（与源视图预览同一套规则，ADR-0005）；报错里抹掉盐。
 // 每个租户同时只有一个交互查询（PG 事务级 advisory lock，持有到查询结束），不经任务队列、不占正式任务名额；
 // 超时或客户端中止请求时 interrupt 本进程里的这个查询。每次查询都记审计（SQL、耗时、行数，失败时加原因），不记查询结果
 import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
@@ -11,15 +13,18 @@ import { assertCan, can } from './access';
 import { recordAudit, type AuditAction, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, type Db } from './db/client';
-import { members, SANDBOX_TTL_DAYS, sandboxShares, sandboxTables, type tenantLakes } from './db/schema';
+import { members, SANDBOX_TTL_DAYS, sandboxShares, sandboxTables, sources, type tenantLakes } from './db/schema';
 import { ensureReadOnlyLakeAccess, lakeReady, lakeRow, lakeSpecOf, readOnlyAccessReady, readOnlyLakeSpecOf } from './lake';
 import { openTenantLake, redactLakeSecrets, type LakeSpec, type TenantLakeSession } from './pipeline/lake-engine';
 import {
-  checkWorkbenchSql, listReadableTables, normalizeWorkbenchSql, runWorkbenchQuery, sandboxSchema, saveSandboxTable, WorkbenchSqlError,
-  type CatalogTable, type SandboxAccess, type WorkbenchResult,
+  checkWorkbenchSql, listRawTables, listReadableTables, mountRawSources, normalizeWorkbenchSql, runWorkbenchQuery, sandboxSchema, saveSandboxTable,
+  WorkbenchSqlError, type CatalogTable, type RawMount, type RawSource, type SandboxAccess, type WorkbenchResult,
 } from './pipeline/workbench-engine';
 import { lockForSave } from './sandbox';
+import { tenantPiiSalt } from './secrets';
+import { confirmedTables } from './sources';
 import { normalizeEmail } from './tenants';
+import { looksSensitive } from '../lib/sensitive';
 
 export { SANDBOX_TTL_DAYS } from './db/schema';
 export { sandboxSchema } from './pipeline/workbench-engine';
@@ -53,8 +58,8 @@ export async function runQuery(
   actor: CurrentMember, rawSql: string, signal?: AbortSignal, { timeoutMs = WORKBENCH_TIMEOUT_MS }: { timeoutMs?: number } = {},
 ): Promise<QueryOutcome> {
   const query = normalizeWorkbenchSql(rawSql);
-  return inWorkbench(actor, { signal, timeoutMs, readOnly: true }, async ({ session, throwIfStopped, started, tx }) => {
-    const checked = await checkWorkbenchSql(session.con, query, await sandboxAccess(tx, actor));
+  return inWorkbench(actor, { signal, timeoutMs, readOnly: true }, async ({ session, throwIfStopped, started, mountAccess }) => {
+    const checked = await checkWorkbenchSql(session.con, query, await mountAccess());
     throwIfStopped();
     const read = await runWorkbenchQuery(session.con, checked, { limit: WORKBENCH_ROWS });
     return { ...read, durationMs: Date.now() - started };
@@ -83,9 +88,9 @@ export async function saveAsSandbox(
 ): Promise<SandboxTable> {
   const query = normalizeWorkbenchSql(rawSql);
   const schema = sandboxSchema(actor.memberId);
-  return inWorkbench(actor, { signal, timeoutMs, readOnly: false }, async ({ session, throwIfStopped, tx }) => {
+  return inWorkbench(actor, { signal, timeoutMs, readOnly: false }, async ({ session, throwIfStopped, tx, mountAccess }) => {
     if (!await lockForSave(tx, actor.tenant.id, actor.memberId, name)) throw new WorkbenchSqlError('这张沙箱表已到期、正在清理，请稍后再保存或换个表名');
-    const checked = await checkWorkbenchSql(session.con, query, await sandboxAccess(tx, actor));
+    const checked = await checkWorkbenchSql(session.con, query, await mountAccess());
     throwIfStopped();
     const rowCount = await saveSandboxTable(session.con, schema, name, checked);
     const now = new Date();
@@ -136,8 +141,12 @@ export async function listSharedWithMe(actor: CurrentMember): Promise<SharedWith
 
 /** 目录树里的一张表：另带插进 SQL 的引用 lake.<schema>."<表>" 与数据文件在存储前缀下的目录 */
 export interface CatalogEntry extends CatalogTable { ref: string; location: string }
-/** 工作台目录树：标准层、结果层、我的沙箱、分享给我的 */
-export interface WorkbenchCatalog { silver: CatalogEntry[]; gold: CatalogEntry[]; mine: CatalogEntry[]; shared: CatalogEntry[] }
+/** 目录树里一个数据源的原始层视图：引用是 "<数据源名>"."<表>"；没挂载时 error 是原因、没有表 */
+export interface RawCatalogSource { name: string; tables: { name: string; ref: string; columns: { name: string; type: string }[] }[]; error?: string }
+/** 工作台目录树：标准层、结果层、我的沙箱、分享给我的，与按数据源名的原始层视图 */
+export interface WorkbenchCatalog { silver: CatalogEntry[]; gold: CatalogEntry[]; mine: CatalogEntry[]; shared: CatalogEntry[]; raw: RawCatalogSource[] }
+
+const quoted = (s: string) => `"${s.replace(/"/g, '""')}"`;
 
 /**
  * 成员此刻能读的表与字段、行数、位置（工作台目录树）：用查询同一套只读凭据挂载，按查询同一个允许集合列出，不经白名单。
@@ -148,19 +157,28 @@ export async function listCatalog(actor: CurrentMember): Promise<WorkbenchCatalo
   const lake = await lakeRow(actor.tenant.id);
   if (!lake || !lakeReady(lake)) throw new WorkbenchError('本租户的数据湖还没有初始化');
   const access = await sandboxAccess(getDb(), actor);
+  const salt = await tenantPiiSalt(actor.tenant.id);
   let spec: LakeSpec | undefined;
   let session: TenantLakeSession | undefined;
   try {
     spec = await readOnlySpec(lake);
     session = await openTenantLake(spec, WORKBENCH_LIMITS, undefined, { readOnly: true });
-    const catalog: WorkbenchCatalog = { silver: [], gold: [], mine: [], shared: [] };
+    const raw = await mountRaw(session.con, actor.tenant.id, salt);
+    const catalog: WorkbenchCatalog = { silver: [], gold: [], mine: [], shared: [], raw: [] };
     for (const t of await listReadableTables(session.con, access)) {
       const section = t.schema === 'silver' || t.schema === 'gold' ? t.schema : t.schema === access.sandbox ? 'mine' : 'shared';
-      catalog[section].push({ ...t, ref: `lake.${t.schema}."${t.name.replace(/"/g, '""')}"`, location: `${spec.dataPath}${t.schema}/${t.name}/` });
+      catalog[section].push({ ...t, ref: `lake.${t.schema}.${quoted(t.name)}`, location: `${spec.dataPath}${t.schema}/${t.name}/` });
     }
+    const views = await listRawTables(session.con, raw.mounted);
+    catalog.raw = [
+      ...raw.mounted.map(name => ({
+        name, tables: views.filter(v => v.catalog === name).map(v => ({ name: v.name, ref: `${quoted(name)}.${quoted(v.name)}`, columns: v.columns })),
+      })),
+      ...raw.skipped.map(({ name, reason }) => ({ name, tables: [], error: redact(reason, spec, salt) })),
+    ].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
     return catalog;
   } catch (e) {
-    throw new WorkbenchError(`目录读取出错：${spec ? redactLakeSecrets((e as Error).message, spec) : (e as Error).message}`);
+    throw new WorkbenchError(`目录读取出错：${redact((e as Error).message, spec, salt)}`);
   } finally {
     session?.close();
   }
@@ -171,6 +189,26 @@ async function sandboxAccess(tx: Tx | Db, actor: CurrentMember): Promise<Sandbox
   const shared = (await sharedToMember(tx, actor)).map(t => ({ schema: t.schema, table: t.name }));
   return { sandbox: sandboxSchema(actor.memberId), shared };
 }
+
+/**
+ * 在会话 con 里按本租户此刻的数据源名挂上原始层视图（mountRawSources）。每个数据源只给同步范围内、采集过的表：
+ * 敏感列清单来自采集的列统计（列名或取值像敏感信息），没采集过的表不知道哪些列敏感，不建视图
+ */
+async function mountRaw(con: TenantLakeSession['con'], tenantId: string, salt: string): Promise<RawMount> {
+  const rows = await getDb().select({ id: sources.id, name: sources.name }).from(sources).where(eq(sources.tenantId, tenantId)).orderBy(asc(sources.name));
+  const raw: RawSource[] = await Promise.all(rows.map(async ({ id, name }) => ({
+    name,
+    sourceId: id,
+    tables: (await confirmedTables(tenantId, id)).tables.map(({ table }) => ({
+      name: table.name, sensitive: table.columns.filter(c => looksSensitive(c)).map(c => c.name),
+    })),
+  })));
+  return mountRawSources(con, raw, salt);
+}
+
+/** 报给成员、写进审计的出错原因：抹掉本租户的凭据与盐 */
+const redact = (message: string, spec: LakeSpec | undefined, salt: string) =>
+  (spec ? redactLakeSecrets(message, spec) : message).replaceAll(salt, '***');
 
 /**
  * 把自己的沙箱表 name 只读分享给本租户的成员 email（已分享过时不变），记审计 sandbox.share，返回规范化后的邮箱。
@@ -225,18 +263,20 @@ async function memberByEmail(tx: Tx, actor: CurrentMember, email: string) {
 /**
  * 工作台的一次操作：在 PG 事务里拿本租户的并发锁（拿不到抛 429），挂载数据湖（readOnly 时用只读凭据），执行 work，
  * 超时或 signal 中止时 interrupt；work 在两步之间调 throwIfStopped()，挂载或上一步期间已被打断时就此停下。
+ * mountAccess() 在会话里挂上原始层视图并给出这次能读的范围（每次操作只调一次）。
  * 不论成败都在同一事务里按 audit 给出的动作与详情记审计（error 是展示给成员的原因），失败时抛出 WorkbenchError
  */
 async function inWorkbench<T>(
   actor: CurrentMember,
   { signal, timeoutMs, readOnly }: { signal?: AbortSignal; timeoutMs: number; readOnly: boolean },
-  work: (ctx: { session: TenantLakeSession; throwIfStopped: () => void; started: number; tx: Tx }) => Promise<T>,
+  work: (ctx: { session: TenantLakeSession; throwIfStopped: () => void; started: number; tx: Tx; mountAccess: () => Promise<SandboxAccess> }) => Promise<T>,
   audit: (result: T | undefined, durationMs: number, error: string | undefined) => { action: AuditAction; detail: Record<string, unknown> },
 ): Promise<T> {
   assertCan(actor, 'sandbox');
   const tenantId = actor.tenant.id;
   const lake = await lakeRow(tenantId);
   if (!lake || !lakeReady(lake)) throw new WorkbenchError('本租户的数据湖还没有初始化');
+  const salt = await tenantPiiSalt(tenantId);
   const outcome = await getDb().transaction(async tx => {
     const { rows: [{ locked }] } = await tx.execute<{ locked: boolean }>(sql`SELECT pg_try_advisory_xact_lock(hashtext(${`workbench:${tenantId}`})) AS locked`);
     if (!locked) return { kind: 'busy' as const };
@@ -257,11 +297,13 @@ async function inWorkbench<T>(
       spec = readOnly ? await readOnlySpec(lake) : lakeSpecOf(lake);
       session = await openTenantLake(spec, WORKBENCH_LIMITS, undefined, { readOnly });
       throwIfStopped();
-      result = { value: await work({ session, throwIfStopped, started, tx }) };
+      const con = session.con;
+      const mountAccess = async () => ({ ...await sandboxAccess(tx, actor), raw: (await mountRaw(con, tenantId, salt)).mounted });
+      result = { value: await work({ session, throwIfStopped, started, tx, mountAccess }) };
     } catch (e) {
       error = stopped ? STOP_MESSAGES[stopped](timeoutMs)
         : e instanceof WorkbenchSqlError ? e.message
-          : `查询出错：${spec ? redactLakeSecrets((e as Error).message, spec) : (e as Error).message}`;
+          : `查询出错：${redact((e as Error).message, spec, salt)}`;
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);

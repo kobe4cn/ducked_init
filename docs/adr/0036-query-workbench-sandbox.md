@@ -6,7 +6,7 @@
 
 **写入由只读挂载挡住，读的范围由解析器挡住。** 只读挂载挡不住读会话里别的库：本机库 `stage` 可写，DuckLake 的元数据库 `__ducklake_metadata_lake` 里有加密密钥（ADR-0020）。所以执行前先用 `json_serialize_sql` 拿到解析树（`pipeline/workbench-engine.ts` 的 `checkWorkbenchSql`，做法同 ADR-0022）：
 - 只能有一条语句。`json_serialize_sql` 只认 SELECT，DESCRIBE / SHOW / SUMMARIZE 也解析成带 `SHOW_REF` 的 SELECT；EXPLAIN [ANALYZE] 先去掉前缀，检查后面的查询，执行时原样执行。INSERT、CREATE、COPY、ATTACH、SET、PRAGMA、CALL 等都报「只能执行一条 SELECT / WITH、DESCRIBE、SHOW、SUMMARIZE 或 EXPLAIN 语句」。
-- 每个表引用（含子查询、表达式里的子查询、CTE）都检查：catalog 只能不写或写 `lake`，schema 只能是 `silver` 或 `gold`，不写 schema 的只能是所在作用域里的 CTE。CTE 的可见范围按 DuckDB 绑定时的规则算（`pipeline/sql-refs.ts` 的 `collectRefs`，与源视图共用）：定义体只看得到排在它前面的 CTE，递归 CTE 只在 UNION 右半边看得到自己。否则 `WITH duckdb_databases AS (SELECT * FROM duckdb_databases) …` 里的引用会被当成 CTE 放行，实际读的是同名系统视图。原始层 `bronze_*`、`stage`、元数据库、`information_schema` 与 DuckDB 的系统视图都读不到。原始层这一票不开放：那里有明文（ADR-0005），而 silver / gold 从起就只有哈希。
+- 每个表引用（含子查询、表达式里的子查询、CTE）都检查：catalog 只能不写或写 `lake`，schema 只能是 `silver` 或 `gold`，不写 schema 的只能是所在作用域里的 CTE。CTE 的可见范围按 DuckDB 绑定时的规则算（`pipeline/sql-refs.ts` 的 `collectRefs`，与源视图共用）：定义体只看得到排在它前面的 CTE，递归 CTE 只在 UNION 右半边看得到自己。否则 `WITH duckdb_databases AS (SELECT * FROM duckdb_databases) …` 里的引用会被当成 CTE 放行，实际读的是同名系统视图。原始层 `bronze_*`、`stage`、元数据库、`information_schema` 与 DuckDB 的系统视图都读不到。原始层 `bronze_*` 一直不开放：那里有明文（ADR-0005），而 silver / gold 从起就只有哈希；原始层只以哈希过的当前状态视图给出（见「原始层视图」一节）。
 - 表函数（`read_parquet`、`postgres_query`、`duckdb_settings` 等）和读配置的标量函数（`getenv`、`current_setting`、`getvariable`）拒绝。`SHOW_REF` 只放行 DESCRIBE / SUMMARIZE 一张表或一个查询（里面的表照样检查）。
 - `SHOW TABLES`、`SHOW ALL TABLES`、不带对象的 `DESCRIBE` 原样执行会列出 `stage` 与元数据库里的表，所以整条语句是它们时换成平台自己的查询，只列 `lake` 里 silver / gold 的表；`SHOW TABLES FROM silver|gold` 只列那一个 schema，其他 schema 拒绝。`SHOW DATABASES` 等其余 SHOW 拒绝，嵌在子查询里的 SHOW TABLES 也拒绝。
 
@@ -48,6 +48,16 @@
 - 点表名在 SQL 框的光标处插入引用（客户端 `setRangeText`），展开看字段。
 - 每次打开页面（含提交后的重新加载）挂载一次，不拿并发锁、不记审计：不执行成员写的 SQL，与运行中的查询互不阻塞。读取出错时目录处显示原因，页面其余部分照常。
 
+**原始层视图（#242）。** 决定：原始层对所有有 `sandbox` 权限的角色（分析师、数据工程师、管理员）开放，前提是只给哈希视图，不给明文；`lake.bronze_*`、`bronze_*_keys`、`bronze_*_mirror` 照旧拒绝。
+- 形状：每个已登记的数据源在会话里是一个内存 catalog（`ATTACH ':memory:' AS "<数据源名>"`），每张表一个视图，按 `crm.customers`、`"客户 库".customers` 或 `crm.main.customers` 读（catalog 名不区分大小写）。视图是回放后的当前状态（`sync-engine.ts` 的 `currentStateSql` / `currentStateOf`，只给 SELECT 文本）：有主键的表取 `<schema>_keys` 里每个主键最新的一版非删除记录（主键列取自 `_keys` 表的列去掉 `_hash`，存在与否以主键状态为准，与 `ensureMirror` 由主键状态接续一样），没有主键的表取 `<schema>_mirror` 的整行（重复行各一行）；都不含 `_op` / `_batch` / `_commit_ts` / `_synced_at` 与整行哈希。原始层的变更历史不开放。
+- 哈希：与源视图预览同一套规则（`source-view-engine.ts` 的 `createMaskedViews`，ADR-0022）：采集时像敏感信息的列（列统计里列名或取值像邮箱、手机号，`looksSensitive`）与列名像敏感信息的列换成 `sha256(盐 ‖ 取值)`，盐是本租户的 `tenantPiiSalt`，同一个原值在源视图预览与这里的哈希一样（标准层先规范化再哈希，不一定相同）。只给同步范围内、采集过的表建视图：没采集过的表不知道哪些列取值敏感。
+- 盐不写进视图定义：过滤条件下推时 `EXPLAIN` 的计划会展开视图的表达式，字面量的盐会原样出现。盐放在默认库 `memory` 的一张表 `memory.main._pii_salt` 里，视图用标量子查询读它；成员的 SQL 只能引用 `lake` 与原始层 catalog，读不到它。执行出错的原因先抹掉凭据再把盐换成 `***`。
+- 引用原始层视图的 `EXPLAIN ANALYZE` 拒绝：DuckDB 1.5.5 把连接下推到表扫描的动态过滤条件（如 `phone<=13900000049`）打印在执行计划里，有主键的视图要与 `_keys` 半连接，优化器换边时会带出主键原值。普通 `EXPLAIN` 不执行查询，计划里只有视图定义里的表达式，照常放行。
+- 白名单：`checkWorkbenchSql` 的允许集合加上本次挂上的 catalog 名（`raw`）：`<数据源名>.<表>`（解析成 schema）或 `<数据源名>.main.<表>` 放行，原始层 catalog 里的 `information_schema` 等别的 schema 拒绝。`SHOW TABLES` 仍只列 `lake` 里能读的表，原始层视图看目录树。
+- 名字：每次查询（`runQuery`、`saveAsSandbox`）与每次打开目录树都按此刻 `sources.name` 现建，数据源改名后新名字可查、旧名字不行。不写 catalog 的 `<名>.<表>` 会先按 `lake` 里的 schema 解析，重名就会读到 `lake` 里的表，所以与保留名（`lake`、`stage`、`memory`、`system`、`temp`、`main`、`silver`、`gold`、`serving`、`information_schema`、`pg_catalog`）、保留前缀（`sandbox_`、`bronze_`、`__ducklake_metadata_`）、此刻 `lake` 里已有的 schema 冲突的数据源，以及与另一个数据源只差大小写的，都不挂载（`workbench-engine.ts` 的 `rawNameConflict`），目录树「原始层」一节在该数据源下给出原因。一个数据源建视图出错时只跳过它（目录里给出抹掉凭据与盐的原因），别的数据源与标准层的查询照常。
+- 视图建在内存 catalog 里，不进数据湖（查询是只读挂载，保存沙箱表时也只写成员自己的 schema）；会话关闭即消失。存沙箱表时可以读原始层视图，存下的是哈希。
+- 目录树：`listCatalog` 同样挂上原始层，`listRawTables` 查 `duckdb_columns()` 列出各数据源的视图与字段，引用是 `"<数据源名>"."<表>"`；不给行数与位置（视图没有统计，数据文件是变更历史）。
+
 ## 已接受的取舍
 
 - 白名单漏掉的读法（DuckDB 新增的读配置标量函数）仍受锁定配置与只读凭据的隔离兜底（ADR-0008）；只读凭据挡写不挡读，读得到的仍是本租户的全部 catalog（含加密密钥）与存储前缀，读的范围靠白名单。
@@ -71,3 +81,8 @@
 - 目录树的行数是估计值：合并、删除之后可能与 `count(*)` 不一致。
 - 目录树的数据目录按当前存储前缀拼出，不读 DuckLake 元数据里每个文件的实际路径；湖迁移换过前缀后，老文件的实际位置以迁移记录为准。
 - 每次打开工作台都多挂载一次数据湖（只读、只查元数据），不受每租户一个查询的限制。
+- 原始层视图每次查询都按主键窗口回放整张原始层表，大表的查询比读 silver 慢；照样受 60 秒超时约束。
+- 每次查询与打开目录树都现查数据源与列统计、现建视图，多几次平台库查询与 DuckDB 绑定。
+- 敏感列的判定只用最近一次采集：采集之后才出现敏感取值的列在下次采集前不哈希（列名像敏感信息的列不受影响），与源视图预览相同。
+- 移出同步范围或还没采集的表不出现在原始层视图里，即使原始层里还有它的数据。
+- 与保留名冲突的数据源要改名才能查原始层；数据湖里将来新增的固定 schema 若与某个数据源同名，那个数据源随之不再挂载。

@@ -1,18 +1,19 @@
 // app/routes/workbench.tsx —— 数据查询工作台（有沙箱权限的分析师、数据工程师，ADR-0036）：写一条只读 SQL，在本租户只读挂载的数据湖上执行，
-// 只能读标准层 silver、结果层 gold、自己的沙箱与分享给自己的沙箱表，结果最多 1 万行、不导出；执行中可以取消（中止请求即中断查询），每次查询都记进审计日志。
+// 只能读标准层 silver、结果层 gold、自己的沙箱、分享给自己的沙箱表与按数据源名的原始层视图（敏感列是哈希），结果最多 1 万行、不导出；执行中可以取消（中止请求即中断查询），每次查询都记进审计日志。
 // 填上表名可以把 SELECT 的结果保存为个人沙箱表（SANDBOX_TTL_DAYS 天后过期），「我的沙箱表」列出表名、行数、过期时间与分享给了谁，
 // 可以按邮箱分享给本租户有沙箱权限的成员或撤销；「分享给我的」列出别人分享来的表（只读，在查询里按 sandbox_<主人>.<表名> 读）。
-// 左侧目录树按 标准层 / 结果层 / 我的沙箱 / 分享给我的 列出能读的表、字段类型、行数与湖中位置，点表名把带引号的引用插进 SQL 框
+// 左侧目录树按 标准层 / 结果层 / 我的沙箱 / 分享给我的 列出能读的表、字段类型、行数与湖中位置，点表名把带引号的引用插进 SQL 框；
+// 「原始层」按数据源名列出回放后当前状态的视图（敏感列是哈希），名字与保留名冲突的数据源给出没挂载的原因
 import { useRef } from 'react';
 import { data, Form, Link, useNavigation } from 'react-router';
-import { AlertTriangle, CheckCircle2, ChevronRight, CircleAlert, Table2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronRight, CircleAlert, Database, Table2 } from 'lucide-react';
 import type { Route } from './+types/workbench';
 import { requirePermission } from '~/.server/access';
 import type { CurrentMember } from '~/.server/auth';
 import { navFor } from '~/.server/nav';
 import {
   listCatalog, listSandboxTables, listSharedWithMe, runQuery, SANDBOX_TTL_DAYS, sandboxSchema, saveAsSandbox, shareSandboxTable, unshareSandboxTable,
-  WORKBENCH_ROWS, WORKBENCH_TIMEOUT_MS, WorkbenchError, type CatalogEntry, type WorkbenchCatalog,
+  WORKBENCH_ROWS, WORKBENCH_TIMEOUT_MS, WorkbenchError, type CatalogEntry, type RawCatalogSource, type WorkbenchCatalog,
 } from '~/.server/workbench';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
@@ -76,7 +77,7 @@ const dateTime = (d: Date | string) => new Date(d).toLocaleString('zh-CN', { hou
 const ERROR_TITLES: Record<string, string> = { save: '沙箱表没有保存', share: '没有分享', unshare: '没有撤销分享' };
 
 /** 目录树的四节：标题与说明 */
-const CATALOG_SECTIONS: { key: keyof WorkbenchCatalog; title: string; empty: string }[] = [
+const CATALOG_SECTIONS: { key: Exclude<keyof WorkbenchCatalog, 'raw'>; title: string; empty: string }[] = [
   { key: 'silver', title: '标准层 silver', empty: '还没有标准层表' },
   { key: 'gold', title: '结果层 gold', empty: '还没有结果层表' },
   { key: 'mine', title: '我的沙箱', empty: '还没有沙箱表' },
@@ -101,12 +102,44 @@ function CatalogTree({ catalog, error, onInsert }: { catalog: WorkbenchCatalog |
           )}
         </details>
       ))}
+      {catalog && <RawSection sources={catalog.raw} onInsert={onInsert} />}
       <span hidden data-catalog-end />
     </aside>
   );
 }
 
-function CatalogTableItem({ table, onInsert }: { table: CatalogEntry; onInsert: (ref: string) => void }) {
+/** 原始层：每个数据源一组回放后当前状态的视图；没挂载的数据源给出原因 */
+function RawSection({ sources, onInsert }: { sources: RawCatalogSource[]; onInsert: (ref: string) => void }) {
+  return (
+    <details open className="group/section" data-section="raw">
+      <summary className="flex cursor-pointer list-none items-center gap-1 font-medium">
+        <ChevronRight className="size-4 transition-transform group-open/section:rotate-90" />
+        原始层<span className="text-slate-400">{sources.length}</span>
+      </summary>
+      {sources.length === 0 ? <p className="py-1 pl-5 text-slate-400">还没有数据源</p> : (
+        <ul className="space-y-1 py-1 pl-3">
+          {sources.map(source => (
+            <li key={source.name} data-raw-source={source.name}>
+              <p className="flex items-center gap-1 text-slate-600"><Database className="size-3.5 shrink-0 text-slate-500" />{source.name}</p>
+              {source.error ? <p className="flex items-start gap-1 pl-5 text-xs text-red-600" data-raw-error><CircleAlert className="size-3.5 shrink-0" />{source.error}</p> : source.tables.length === 0
+                ? <p className="pl-5 text-xs text-slate-400">还没有同步的表</p>
+                : (
+                  <ul className="space-y-1 pl-3">
+                    {source.tables.map(t => <CatalogTableItem key={t.ref} table={t} onInsert={onInsert} />)}
+                  </ul>
+                )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </details>
+  );
+}
+
+/** 目录树里的一张表；原始层视图没有行数与位置 */
+function CatalogTableItem({ table, onInsert }: { table: CatalogEntry | RawCatalogSource['tables'][number]; onInsert: (ref: string) => void }) {
+  const rows = 'rows' in table ? table.rows : undefined;
+  const location = 'location' in table ? table.location : undefined;
   return (
     <li>
       <details className="group/table">
@@ -115,15 +148,15 @@ function CatalogTableItem({ table, onInsert }: { table: CatalogEntry; onInsert: 
           <Table2 className="size-3.5 shrink-0 text-slate-500" />
           {/* 只插入引用，不展开 */}
           <button
-            type="button" title={`插入 ${table.ref}`} data-ref={table.ref} data-rows={table.rows}
+            type="button" title={`插入 ${table.ref}`} data-ref={table.ref} data-rows={rows}
             onClick={e => { e.preventDefault(); onInsert(table.ref); }}
             className="truncate font-mono text-left hover:text-primary hover:underline"
           >{table.name}</button>
-          <span className="ml-auto shrink-0 text-xs text-slate-400">{`${table.rows.toLocaleString('zh-CN')} 行`}</span>
+          {rows !== undefined && <span className="ml-auto shrink-0 text-xs text-slate-400">{`${rows.toLocaleString('zh-CN')} 行`}</span>}
         </summary>
         <div className="space-y-1 py-1 pl-8 text-xs">
           <p className="break-all font-mono text-slate-500">{table.ref}</p>
-          <p className="break-all font-mono text-slate-400" title="数据文件所在目录">{table.location}</p>
+          {location && <p className="break-all font-mono text-slate-400" title="数据文件所在目录">{location}</p>}
           <ul>
             {table.columns.map(c => (
               <li key={c.name} className="flex gap-2 font-mono"><span className="truncate">{c.name}</span><span className="ml-auto shrink-0 text-slate-400">{c.type}</span></li>
@@ -155,7 +188,7 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
     <AppShell email={email} nav={nav}>
       <PageHeader
         title="查询"
-        description={`对本租户的标准层 silver、结果层 gold 与自己的沙箱 ${sandbox} 执行只读 SQL（SELECT / WITH、DESCRIBE、SHOW、SUMMARIZE、EXPLAIN），最多显示 ${maxRows.toLocaleString('zh-CN')} 行，超过 ${timeoutSeconds} 秒自动中断。每次查询都记入审计日志。`}
+        description={`对本租户的标准层 silver、结果层 gold、自己的沙箱 ${sandbox} 与原始层视图（数据源名.表名，敏感列是哈希）执行只读 SQL（SELECT / WITH、DESCRIBE、SHOW、SUMMARIZE、EXPLAIN），最多显示 ${maxRows.toLocaleString('zh-CN')} 行，超过 ${timeoutSeconds} 秒自动中断。每次查询都记入审计日志。`}
       />
 
       <div className="grid items-start gap-6 lg:grid-cols-[20rem_minmax(0,1fr)]">

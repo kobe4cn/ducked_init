@@ -2,27 +2,34 @@
 // 返回的列与行、审计日志 workbench.query；交互查询挂起时调度器照常领取并完成正式任务；
 // 查询用本租户的只读 PG 角色与只读对象存储账号，凭据本身就写不进 catalog 与存储；
 // saveAsSandbox(name, sql) → 可写挂载上 CREATE TABLE sandbox_<成员>.name AS → 平台库 sandbox_tables 与 listSandboxTables、审计 sandbox.save
+import { createHash } from 'node:crypto';
 import { and, eq, sql } from 'drizzle-orm';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, sandboxTables, tenantLakes } from '../../app/.server/db/schema';
+import { auditLogs, sandboxTables, sources as sourcesTable, tenantLakes } from '../../app/.server/db/schema';
 import { dropTenantS3Account, ensureReadOnlyLakeAccess, ensureTenantS3Account, lakeRow, readOnlyLakeSpecOf } from '../../app/.server/lake';
 import { deleteTenantS3Account, platformS3 } from '../../app/.server/s3-accounts';
+import { tenantPiiSalt } from '../../app/.server/secrets';
+import { syncSource } from '../../app/.server/source-sync';
+import { relistSource, setSyncScope } from '../../app/.server/sources';
 import { getObject, listObjects, putObject } from '../../app/.server/s3-client';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { enqueueTask, getTask } from '../../app/.server/tasks';
-import { listSandboxTables, runQuery, saveAsSandbox, WORKBENCH_ROWS } from '../../app/.server/workbench';
+import { listCatalog, listSandboxTables, runQuery, saveAsSandbox, WORKBENCH_ROWS } from '../../app/.server/workbench';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, onLake, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
+import { grantOnSource, READER } from './source-fixtures';
 
 let acme: string;
+let crm: string;
 afterAll(async () => { await closeDb(); });
 beforeAll(async () => {
   await resetDb();
-  ({ acme } = await publishedIdentitySources({ orders: true }));
+  ({ acme, sources: { crm } } = await publishedIdentitySources({ orders: true }));
 });
 
 const analyst = () => memberOf(acme, 'analyst@acme.com', 'analyst');
@@ -335,5 +342,112 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('只读凭据（对象存储）',
     const lake = (await lakeRow(tenant))!;
     expect(await errorOf(listObjects(roCreds(lake), lake.dataPath))).toBe('成功');
     expect(await errorOf(putObject(roCreds(lake), `${lake.dataPath}evil.txt`, 'x'))).toMatch(/HTTP 403/);
+  });
+});
+
+async function withEnv(vars: Record<string, string>, fn: () => Promise<void>) {
+  const saved = Object.fromEntries(Object.keys(vars).map(k => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try {
+    await fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+/** 结果的行转成对象 */
+const objects = (r: { columns: { name: string }[]; rows: unknown[][] }) => r.rows.map(row => Object.fromEntries(r.columns.map((c, i) => [c.name, row[i]])));
+
+// 放在最后：会改 CRM 源库的数据并重新同步
+describe('原始层视图', () => {
+  it('按数据源名读回放后的当前状态：删除的行没有、更新只剩最新一版、没有平台列；无主键表返回整行', async () => {
+    const member = await analyst();
+    const de = await memberOf(acme, 'de@acme.com');
+    await grantOnSource(`
+      UPDATE crm.customers SET name = '李四改', updated_at = '2024-07-01' WHERE id = 2;
+      DELETE FROM crm.customers WHERE id = 7;
+      CREATE TABLE crm.notes (customer int, note text);
+      INSERT INTO crm.notes VALUES (1, '来电'), (1, '来电'), (2, '回访');
+      GRANT SELECT ON crm.notes TO ${READER.user};`);
+    await relistSource(de, crm);
+    await drain();
+    await setSyncScope(de, crm, { add: ['notes'] });
+    await drain();
+    await withEnv({ SOURCE_RECONCILE_HOURS: '0' }, async () => {
+      await syncSource(de, crm);
+      await drain();
+    });
+
+    const customers = await runQuery(member, 'SELECT * FROM crm.customers ORDER BY id');
+    expect(customers.columns.map(c => c.name)).toEqual(['id', 'name', 'mobile', 'email', 'unionid', 'updated_at']);
+    const rows = objects(customers);
+    expect(rows.map(r => r.id)).toEqual([1, 2, 3, 4, 5, 6]);
+    const salt = await tenantPiiSalt(acme);
+    const hash = (v: string) => createHash('sha256').update(salt + v).digest('hex');
+    expect(rows[1]).toMatchObject({ name: hash('李四改'), mobile: hash('13800000002'), email: null });
+    expect(String(rows[1].updated_at)).toContain('2024-07-01');
+    // 同一套写法：带 main、带引号、大小写不同（按 DuckDB 1.5.5 的解析树核对过：不写 catalog 的 crm.customers 里 crm 是 schema_name）
+    expect((await runQuery(member, 'SELECT count(*) FROM "CRM".main.customers')).rows).toEqual([['6']]);
+
+    const notes = await runQuery(member, 'SELECT customer, note FROM crm.notes ORDER BY 1, 2');
+    expect(notes.columns.map(c => c.name)).toEqual(['customer', 'note']);
+    expect(notes.rows).toEqual([[1, '来电'], [1, '来电'], [2, '回访']]);
+    expect((await runQuery(member, 'DESCRIBE crm.notes')).rows.map(r => r[0])).toEqual(['customer', 'note']);
+  });
+
+  it('敏感列是加盐哈希：查询结果、报错、EXPLAIN、审计里都没有明文与盐；直接读 bronze_* 仍被拒绝', async () => {
+    const member = await analyst();
+    const salt = await tenantPiiSalt(acme);
+    const before = (await audits()).length;
+    const read = await runQuery(member, "SELECT email || ' ' AS e, concat('x:', mobile) AS m, struct_pack(n := name) AS s FROM crm.customers");
+    const text = JSON.stringify(read);
+    expect(text).not.toMatch(/@|1380000|张三/);
+    // 过滤条件下推时计划里会展开视图的表达式：盐不在视图定义里
+    const explained = JSON.stringify(await runQuery(member, "EXPLAIN SELECT * FROM crm.customers WHERE email = 'x'"));
+    expect(explained).toContain('sha256');
+    expect(explained).not.toContain(salt);
+    // EXPLAIN ANALYZE 的动态过滤条件带着原始层的原值（DuckDB 1.5.5 里连接下推到表扫描时打印最小、最大值）
+    expect(await errorOf(runQuery(member, 'EXPLAIN ANALYZE SELECT * FROM crm.customers'))).toMatch(/原始层视图不能用 EXPLAIN ANALYZE/);
+    expect(await errorOf(runQuery(member, 'EXPLAIN ANALYZE SELECT * FROM silver.customer s WHERE EXISTS (SELECT 1 FROM "CRM".main.customers)'))).toMatch(/不能用 EXPLAIN ANALYZE/);
+    const cast = await errorOf(runQuery(member, 'SELECT email::INTEGER FROM crm.customers WHERE email IS NOT NULL'));
+    expect(cast).toMatch(/[0-9a-f]{64}/);
+    expect(cast).not.toContain('@');
+    expect(cast).not.toContain(salt);
+    // 盐所在的表读不到
+    expect(await errorOf(runQuery(member, 'SELECT * FROM memory.main._pii_salt'))).toMatch(/不能读 memory\.main\._pii_salt/);
+    expect(await errorOf(runQuery(member, 'SELECT * FROM crm.information_schema.views'))).toMatch(/不能读 crm\.information_schema\.views/);
+    const bronze = bronzeSchema(crm);
+    expect(await errorOf(runQuery(member, `SELECT * FROM lake.${bronze}.customers`))).toMatch(new RegExp(`不能读 lake\\.${bronze}\\.customers`));
+    expect(await errorOf(runQuery(member, `SELECT * FROM ${bronze}_mirror.notes`))).toMatch(/不能读/);
+    const logs = JSON.stringify((await audits()).slice(before));
+    expect(logs).not.toMatch(/@crm\.test|1380000/);
+    expect(logs).not.toContain(salt);
+  });
+
+  it('数据源改名后新名字可查、旧名字不行；与保留名冲突的数据源不挂载，目录里给出原因', async () => {
+    const member = await analyst();
+    const rename = (name: string) => getDb().update(sourcesTable).set({ name }).where(eq(sourcesTable.id, crm));
+    try {
+      await rename('客户 库');
+      expect((await runQuery(member, 'SELECT count(*) FROM "客户 库".customers')).rows).toEqual([['6']]);
+      expect(await errorOf(runQuery(member, 'SELECT * FROM crm.customers'))).toMatch(/不能读 crm\.customers/);
+      const catalog = await listCatalog(member);
+      expect(catalog.raw.find(s => s.name === '客户 库')?.tables.map(t => t.ref)).toContain('"客户 库"."customers"');
+
+      for (const reserved of ['silver', 'Sandbox_x', 'bronze_abc', 'MEMORY']) {
+        await rename(reserved);
+        expect(await errorOf(runQuery(member, `SELECT * FROM "${reserved}".customers`)), reserved).toMatch(/不能读|不存在|does not exist/);
+        const entry = (await listCatalog(member)).raw.find(s => s.name === reserved);
+        expect(entry, reserved).toMatchObject({ tables: [], error: expect.stringContaining('原始层视图没有挂载') });
+      }
+      // 别的数据源照常
+      expect((await runQuery(member, 'SELECT count(*) FROM 会员.members')).rows[0]).toBeDefined();
+    } finally {
+      await rename('CRM');
+    }
   });
 });

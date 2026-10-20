@@ -5,9 +5,13 @@
 // 会话里还挂着可写的本机库 stage 与 DuckLake 的元数据库 __ducklake_metadata_lake（里面有加密密钥，ADR-0020），
 // 表函数、SHOW DATABASES 之类与读配置的函数一律拒绝。
 // 保存沙箱表在可写挂载上执行：成员只给表名与一条校验过的 SELECT，CREATE 语句由这里拼出，只写进成员自己的沙箱。
-// 目录树（listReadableTables）按同一个允许集合列出能读的表与字段
+// 目录树（listReadableTables）按同一个允许集合列出能读的表与字段。
+// 原始层只给回放后的当前状态（mountRawSources）：每个数据源一个以数据源名命名的内存 catalog，每张表一个视图，敏感列是加盐哈希（ADR-0005），
+// 盐放在默认库 memory 的一张表里由视图读取，不写进视图定义（EXPLAIN 会展开视图）；lake.bronze_* 照旧拒绝
 import type { DuckDBConnection } from '@duckdb/node-api';
+import { bronzeTablesOf, createMaskedViews } from './source-view-engine';
 import { collectRefs, normalizeSql } from './sql-refs';
+import { bronzeSchema, currentStateOf } from './sync-engine';
 
 /** 可以展示给成员的 SQL 问题 */
 export class WorkbenchSqlError extends Error {}
@@ -25,8 +29,8 @@ export const SANDBOX_TABLE_NAME = /^[a-z][a-z0-9_]{0,62}$/;
 /** 别人分享给成员的一张沙箱表：主人的沙箱 schema 与表名 */
 export interface SandboxTableRef { schema: string; table: string }
 
-/** 工作台能读的沙箱：成员自己的沙箱 schema 与别人分享给他的表 */
-export interface SandboxAccess { sandbox?: string; shared?: readonly SandboxTableRef[] }
+/** 工作台能读的沙箱：成员自己的沙箱 schema 与别人分享给他的表；raw 是本次会话挂上的原始层 catalog（数据源名，mountRawSources） */
+export interface SandboxAccess { sandbox?: string; shared?: readonly SandboxTableRef[]; raw?: readonly string[] }
 
 /**
  * 校验通过的查询：sql 是实际执行的语句（SHOW TABLES 换成只列能读的 schema 的查询）；
@@ -42,13 +46,14 @@ export interface WorkbenchResult {
 }
 
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
+const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 
 export const normalizeWorkbenchSql = normalizeSql;
 
 const ALLOWED_STATEMENTS = '只能执行一条 SELECT / WITH、DESCRIBE、SHOW、SUMMARIZE 或 EXPLAIN 语句';
 /** 说明能读哪些 schema */
-const readableHint = (sandbox?: string, shared = false) =>
-  `只能读标准层 silver 与结果层 gold${sandbox ? `、自己的沙箱 ${sandbox}` : ''}${shared ? '、分享给你的沙箱表' : ''}`;
+const readableHint = (sandbox?: string, shared = false, raw = false) =>
+  `只能读标准层 silver 与结果层 gold${sandbox ? `、自己的沙箱 ${sandbox}` : ''}${shared ? '、分享给你的沙箱表' : ''}${raw ? '、原始层视图（数据源名.表名）' : ''}`;
 
 /** 放行的 SHOW_REF：DESCRIBE / SUMMARIZE 一张表或一个查询（里面的表照样检查） */
 const ALLOWED_SHOWS = new Set(['DESCRIBE', 'SUMMARY']);
@@ -86,12 +91,13 @@ const isShow = (statement: unknown) => (statement as { node?: { from_table?: { t
 
 /**
  * 校验工作台的 SQL：只能是一条 SELECT / WITH、DESCRIBE、SHOW、SUMMARIZE 或 EXPLAIN [ANALYZE]，引用的表只能是 silver / gold
- * 与 sandbox（成员自己的沙箱 schema，给了时）的表、shared 里的表（catalog 只能不写或写 lake）或所在作用域里的 CTE，
+ * 与 sandbox（成员自己的沙箱 schema，给了时）的表、shared 里的表（catalog 只能不写或写 lake）、raw 里的原始层 catalog 的视图或所在作用域里的 CTE，
  * 不能用表函数、读配置的函数。别的沙箱表一律报「不存在或没有权限」。SHOW TABLES 换成只列这些 schema 与表的查询。不合规时抛出 WorkbenchSqlError
  */
-export async function checkWorkbenchSql(con: DuckDBConnection, sql: string, { sandbox, shared = [] }: SandboxAccess = {}): Promise<CheckedQuery> {
+export async function checkWorkbenchSql(con: DuckDBConnection, sql: string, { sandbox, shared = [], raw = [] }: SandboxAccess = {}): Promise<CheckedQuery> {
   const schemas = readableSchemas(sandbox);
-  const hint = readableHint(sandbox, shared.length > 0);
+  const hint = readableHint(sandbox, shared.length > 0, raw.length > 0);
+  const rawCatalogs = new Set(raw.map(n => n.toLowerCase()));
   sql = normalizeWorkbenchSql(sql);
   if (!sql) throw new WorkbenchSqlError('请填写 SQL');
   // json_serialize_sql 只认 SELECT（DESCRIBE / SHOW / SUMMARIZE 也解析成 SELECT）：EXPLAIN 去掉前缀后检查后面的查询，执行时原样执行
@@ -110,8 +116,13 @@ export async function checkWorkbenchSql(con: DuckDBConnection, sql: string, { sa
   for (const t of found.tables) {
     if (t.cte) continue;
     const name = [t.catalog, t.schema, t.table].filter(Boolean).join('.');
-    if (t.catalog && t.catalog.toLowerCase() !== 'lake') throw new WorkbenchSqlError(`${hint}，不能读 ${name}`);
     const schema = t.schema.toLowerCase();
+    // 原始层视图：<数据源名>.<表> 或 <数据源名>.main.<表>（数据源名不会与 lake 里的 schema 重名，见 rawNameConflict）。
+    // EXPLAIN ANALYZE 的计划里有连接下推到表扫描的动态过滤条件，带着原始层的原值（如主键的最小、最大值），不放行
+    const rawRef = (t.catalog && rawCatalogs.has(t.catalog.toLowerCase()) && (!schema || schema === 'main')) || (!t.catalog && rawCatalogs.has(schema));
+    if (rawRef && explain?.[1]) throw new WorkbenchSqlError(`原始层视图不能用 EXPLAIN ANALYZE（执行计划里会带出原始取值），可以用 EXPLAIN：${name}`);
+    if (rawRef) continue;
+    if (t.catalog && t.catalog.toLowerCase() !== 'lake') throw new WorkbenchSqlError(`${hint}，不能读 ${name}`);
     if (shared.some(s => s.schema === schema && s.table === t.table.toLowerCase())) continue;
     if (schema.startsWith('sandbox_') && schema !== sandbox) throw new WorkbenchSqlError(`表 ${name} 不存在或没有权限`);
     if (!schemas.includes(schema)) {
@@ -137,6 +148,79 @@ export async function listReadableTables(con: DuckDBConnection, { sandbox, share
     WHERE t.database_name = 'lake' AND ${readableWhere('t.schema_name', 't.table_name', readableSchemas(sandbox), shared)}
     GROUP BY ALL ORDER BY 1, 2`)).getRowObjectsJson() as unknown as (Omit<CatalogTable, 'rows'> & { rows: string | number })[];
   return rows.map(r => ({ ...r, rows: Number(r.rows) }));
+}
+
+/** 要挂成原始层视图的一个数据源：名称（即 catalog 名）、ID 与要建视图的表（带采集时像敏感信息的列） */
+export interface RawSource { name: string; sourceId: string; tables: { name: string; sensitive: readonly string[] }[] }
+
+/** 挂载的结果：挂上的 catalog 名，与因重名没挂的数据源及原因 */
+export interface RawMount { mounted: string[]; skipped: { name: string; reason: string }[] }
+
+/** 不能用作原始层 catalog 名的名字与前缀（不区分大小写）：会话里的库、数据湖里的 schema、DuckDB 内置的 schema */
+const RESERVED_NAMES = ['lake', 'stage', 'memory', 'system', 'temp', 'main', 'silver', 'gold', 'serving', 'information_schema', 'pg_catalog'];
+const RESERVED_PREFIXES = ['sandbox_', 'bronze_', '__ducklake_metadata_'];
+/** 视图读盐的表：在默认库 memory 里，成员的 SQL 引用不到（catalog 只能是 lake 或原始层 catalog） */
+const SALT_TABLE = 'memory.main._pii_salt';
+
+/**
+ * 数据源名 name 不能用作原始层 catalog 时的原因，能用时为 null。others 是本租户全部数据源的名称（含它自己），
+ * existing 是会话里已有的库与数据湖里的 schema（小写）。不写 catalog 的 <名>.<表> 会先按 lake 里的 schema 解析，重名就可能读到原始层明文
+ */
+export function rawNameConflict(name: string, others: readonly string[], existing: ReadonlySet<string> = new Set()) {
+  const lower = name.toLowerCase();
+  const reserved = RESERVED_NAMES.find(r => r === lower);
+  if (reserved) return `与保留名 ${reserved} 冲突`;
+  const prefix = RESERVED_PREFIXES.find(p => lower.startsWith(p));
+  if (prefix) return `以保留前缀 ${prefix} 开头`;
+  const twin = others.find(o => o !== name && o.toLowerCase() === lower);
+  if (twin) return `与数据源「${twin}」只差大小写`;
+  if (existing.has(lower)) return '与数据湖里已有的 schema 重名';
+  return null;
+}
+
+/**
+ * 每个数据源挂一个只读用途的内存 catalog（名字就是数据源名），每张表一个视图：原始层回放后的当前状态（currentStateOf，不含平台列），
+ * 敏感列按 createMaskedViews 换成加盐哈希，盐由视图从 SALT_TABLE 读取。原始层里还没有、或既没有主键状态也没有镜像的表不建视图。
+ * 名字冲突（rawNameConflict）或建视图出错的数据源不挂载，原因在 skipped 里（出错原因未抹凭据与盐，由调用方处理）。con 须是挂载了数据湖的会话；视图不写进数据湖
+ */
+export async function mountRawSources(con: DuckDBConnection, sources: readonly RawSource[], salt: string): Promise<RawMount> {
+  const result: RawMount = { mounted: [], skipped: [] };
+  if (!sources.length) return result;
+  const existing = new Set((await con.runAndReadAll(`SELECT lower(database_name) AS n FROM duckdb_databases()
+    UNION SELECT lower(schema_name) FROM duckdb_schemas() WHERE database_name = 'lake'`)).getRowObjectsJson().map(r => String(r.n)));
+  await con.run(`CREATE OR REPLACE TABLE ${SALT_TABLE} AS SELECT ${lit(salt)} AS salt`);
+  const names = sources.map(s => s.name);
+  for (const source of sources) {
+    const reason = rawNameConflict(source.name, names, existing);
+    if (reason) {
+      result.skipped.push({ name: source.name, reason: `数据源名${reason}，原始层视图没有挂载；改名后可查` });
+      continue;
+    }
+    // 一个数据源出错（如原始层表结构异常）只跳过它，不连累别的数据源与标准层的查询
+    try {
+      await con.run(`ATTACH ':memory:' AS ${ident(source.name)}`);
+      const schema = bronzeSchema(source.sourceId);
+      const synced = new Set(await bronzeTablesOf(con, source.sourceId));
+      const tables = [];
+      for (const table of source.tables.filter(t => synced.has(t.name))) {
+        const state = await currentStateOf(con, schema, table.name);
+        if (state) tables.push({ name: table.name, from: `(${state})`, sensitive: table.sensitive });
+      }
+      await createMaskedViews(con, `${ident(source.name)}.main`, tables, `(SELECT salt FROM ${SALT_TABLE})`);
+      result.mounted.push(source.name);
+    } catch (e) {
+      result.skipped.push({ name: source.name, reason: `原始层视图建立出错，没有挂载：${(e as Error).message}` });
+    }
+  }
+  return result;
+}
+
+/** 原始层 catalog（mountRawSources 挂上的）里的视图与字段，按 catalog、视图名排序。查询由平台写，不经成员的白名单 */
+export async function listRawTables(con: DuckDBConnection, catalogs: readonly string[]) {
+  if (!catalogs.length) return [];
+  return (await con.runAndReadAll(`SELECT database_name AS catalog, table_name AS name, list({'name': column_name, 'type': data_type} ORDER BY column_index) AS columns
+    FROM duckdb_columns() WHERE database_name IN (${catalogs.map(lit).join(', ')}) AND schema_name = 'main'
+    GROUP BY ALL ORDER BY 1, 2`)).getRowObjectsJson() as unknown as { catalog: string; name: string; columns: { name: string; type: string }[] }[];
 }
 
 /** 执行校验过的查询，最多取 limit 行（多读一行判断是否截断）。取值转成 JSON 能表示的形式 */
