@@ -48,6 +48,14 @@ export async function inventory(con: DuckDBConnection) {
 
 const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.length > 0 && v.every(s => typeof s === 'string');
 
+/** 删掉这些表（已删的跳过），让此前的 DuckLake 快照全部过期，再从存储上删掉旧文件（ADR-0020）；表名须已校验 */
+async function dropAndCleanup(con: DuckDBConnection, tables: [schema: string, name: string][]) {
+  for (const [schema, name] of tables) await con.run(`DROP TABLE IF EXISTS lake."${schema}"."${name}"`);
+  await con.run(`
+    CALL ducklake_expire_snapshots('lake', older_than => now());
+    CALL ducklake_cleanup_old_files('lake', cleanup_all => true);`);
+}
+
 /** 同步参数里的表：水位线字段与种类要么都有、要么都没有（全量比对）。业务主键在旧任务里是单个字段 */
 function syncTables(params: Params): SyncTableParam[] {
   const tables = params.tables;
@@ -409,10 +417,20 @@ export const HANDLERS = {
       if (!isStrings(tables) || !tables.every(t => /^gold\.[a-z][a-z0-9]*__[0-9a-f-]{36}$/.test(t))) {
         throw new Error('参数 tables 必须是非空的结果层快照表名列表');
       }
-      for (const t of tables) await con.run(`DROP TABLE IF EXISTS gold."${t.slice('gold.'.length)}"`);
-      await con.run(`
-        CALL ducklake_expire_snapshots('lake', older_than => now());
-        CALL ducklake_cleanup_old_files('lake', cleanup_all => true);`);
+      await dropAndCleanup(con, tables.map(t => ['gold', t.slice('gold.'.length)]));
+      return { tables };
+    },
+  },
+  // 沙箱表过期（ADR-0036）：删掉参数里到期的沙箱表 sandbox_<成员>.<表名>（已删的跳过，重复执行不报错），再与 gold.expire 一样擦除湖里的数据。
+  // 表名正则是防注入的最后一道，只认沙箱 schema
+  'sandbox.expire': {
+    label: '沙箱表过期',
+    async run(con, params) {
+      const tables = params.tables;
+      if (!isStrings(tables) || !tables.every(t => /^sandbox_[0-9a-f]{32}\.[a-z][a-z0-9_]{0,62}$/.test(t))) {
+        throw new Error('参数 tables 必须是非空的沙箱表名列表');
+      }
+      await dropAndCleanup(con, tables.map(t => t.split('.') as [string, string]));
       return { tables };
     },
   },

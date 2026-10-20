@@ -2,7 +2,7 @@
 // 本机同时运行的工作进程不超过 maxWorkers；各租户的并发上限与公平调度由 claimNextTask 保证，可以部署多个调度器。
 // 数据湖迁移存储也由调度器执行（在本进程内，要用平台账号读旧前缀、写新前缀），同样占一个名额，先于任务领取。
 // 常驻运行时还定期为到期的数据源入队同步与湖中数据核对，为有新变化的租户入队标准层合并；同步给已发布映射的源表写入变更后随即入队一次合并，
-// 分析模板与指标、标签任务成功后登记结果快照，因断言失败时告警；还定期为有到期快照的租户入队快照过期，成功后标记快照已过期。
+// 分析模板与指标、标签任务成功后登记结果快照，因断言失败时告警；还定期为有到期快照的租户入队快照过期、有到期沙箱表的入队沙箱表过期，成功后标记快照、沙箱表已过期。
 // 登记了新快照或标记了过期后入队重建服务库，生成成功后把服务库指针切到新版本
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,7 @@ import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '.
 import { enqueueDueMerges, mergeAfterSync } from '../mappings';
 import { alertAssertionFailure } from '../quality';
 import { enqueueDueRefreshes } from '../refresh';
+import { enqueueDueSandboxExpiries, markSandboxExpired } from '../sandbox';
 import { alertSchemaBreak } from '../schema-alerts';
 import { draftSchemaRepairs } from '../schema-repair-drafts';
 import { activateServingStore, enqueueServingBuild } from '../serving-store';
@@ -105,6 +106,8 @@ export function createDispatcher({
         if ((template || task.kind === 'gold.dsl') && 'error' in outcome!) await alertAssertionFailure(task.tenantId, task, outcome.result);
         // 到期快照的表已删、旧文件已清理：标记为已过期，分析页不再打开它们
         if (task.kind === 'gold.expire' && outcome!.result) await markExpired(task.tenantId, task.id);
+        // 到期沙箱表已删、旧文件已清理：标记为已过期，工作台不再列出（沙箱表不进服务库，不重建）
+        if (task.kind === 'sandbox.expire' && outcome!.result) await markSandboxExpired(task.tenantId, task.id);
         // 有了新快照或快照过期：重建服务库（ADR-0033），服务库只收 RFM 与指标、标签，其他模板的快照不触发；断言失败的任务也带 result，要看有没有 error。生成成功后才切换指针
         const succeeded = !('error' in outcome!);
         if ((task.kind === 'gold.rfm' || task.kind === 'gold.dsl' || task.kind === 'gold.expire') && succeeded) await enqueueServingBuild(task.tenantId);
@@ -160,7 +163,7 @@ export function createDispatcher({
 
   let lastSyncCheck = 0;
   /**
-   * 为到期的数据源入队同步，再入队核对（有同步在排队时等下一次检查），然后为有新变化的租户入队合并，为有到期快照的租户入队快照过期，
+   * 为到期的数据源入队同步，再入队核对（有同步在排队时等下一次检查），然后为有新变化的租户入队合并，为有到期快照的租户入队快照过期、有到期沙箱表的入队沙箱表过期，
    * 最后为依赖的实体有新合并的已发布指标、标签与模板入队当天的刷新：
    * 每 syncCheckMs 一次，多个调度器同时检查也不会重复入队
    */
@@ -171,6 +174,7 @@ export function createDispatcher({
     await enqueueDueVerifies();
     await enqueueDueMerges();
     await enqueueDueExpiries();
+    await enqueueDueSandboxExpiries();
     await enqueueDueRefreshes();
   }
 
