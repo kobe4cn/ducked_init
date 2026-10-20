@@ -1,12 +1,13 @@
 // test/http/workbench.test.ts —— 数据查询工作台的 HTTP 接缝：分析师、数据工程师在 /workbench 提交 SQL，看到结果表格或拒绝原因；
 // 客户端中止请求即取消查询，同租户已有查询在运行时再提交返回 429。查看者看不到导航、打开与提交都 403。
 // 填上表名点「保存」把 SELECT 的结果存为沙箱表，「我的沙箱表」列出自己的表；别人的沙箱读不到。
-// 表的主人分享给本租户有沙箱权限的成员后，被分享人在「分享给我的」里看到、能读不能写，撤销后又读不到
+// 表的主人分享给本租户有沙箱权限的成员后，被分享人在「分享给我的」里看到、能读不能写，撤销后又读不到。
+// 左侧目录树只列能读的表（字段类型、行数、湖中位置、带引号的引用）
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, members, sandboxTables } from '../../app/.server/db/schema';
-import { memberOf, newTenant } from '../pipeline/fixtures';
+import { memberOf, newTenant, onLake } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -201,5 +202,49 @@ describe('分享', () => {
     expect(await expired.text()).toContain('不存在或没有权限');
     expect(sharedPanel(await (await other.get('/workbench')).text())).not.toContain('rules_top');
     expect((await owner.post('/workbench', { intent: 'share', name: 'rules_top', email: 'de@acme.com' })).status).toBe(400);
+  });
+});
+
+/** 页面目录树的 HTML，以及其中一节（silver、gold、mine、shared） */
+const catalogOf = (html: string) => html.split('data-catalog-tree')[1]?.split('data-catalog-end')[0] ?? '';
+const catalogSection = (html: string, section: string) => catalogOf(html).split(`data-section="${section}"`)[1]?.split('data-section=')[0] ?? '';
+const unescape = (html: string) => html.replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&amp;/g, '&');
+
+describe('目录树', () => {
+  it('列出 silver、gold、我的沙箱与分享给我的表及字段类型、行数、湖中位置与带引号的引用；他人没分享的沙箱、原始层、stage 与元数据表不出现', async () => {
+    await onLake(acme, `CREATE TABLE gold."rfm__catalog-test" AS SELECT range AS n FROM range(3)`);
+    // 登录有每邮箱的频率限制，用这里新加的成员
+    await memberOf(acme, 'an3@acme.com', 'analyst');
+    await memberOf(acme, 'de3@acme.com', 'data_engineer');
+    const owner = await loginAs(app, 'an3@acme.com');
+    await owner.post('/workbench', { intent: 'save', name: 'catalog_mine', sql: 'SELECT customer_id FROM silver.customer ORDER BY 1 LIMIT 4' });
+    const ownerSchema = sandboxOfPage(await (await owner.get('/workbench')).text(), 'catalog_mine')!;
+    const engineer = await loginAs(app, 'de3@acme.com');
+    await engineer.post('/workbench', { intent: 'save', name: 'catalog_theirs', sql: 'SELECT 1 AS x' });
+
+    const html = unescape(await (await owner.get('/workbench')).text());
+    const silver = catalogSection(html, 'silver');
+    expect(silver).toContain('data-ref="lake.silver."customer""');
+    expect(silver).toMatch(/customer_id<\/span>\s*<span[^>]*>VARCHAR/);
+    const gold = catalogSection(html, 'gold');
+    expect(gold).toContain('data-ref="lake.gold."rfm__catalog-test""');
+    expect(gold).toMatch(/data-rows="3"/);
+    const mine = catalogSection(html, 'mine');
+    expect(mine).toContain(`data-ref="lake.${ownerSchema}."catalog_mine""`);
+    expect(mine).toMatch(/data-rows="4"/);
+    expect(mine).toContain(`${ownerSchema}/catalog_mine/`);
+    const catalog = catalogOf(html);
+    expect(catalog).not.toContain('catalog_theirs');
+    // 湖里确有原始层表，下面的断言才有意义
+    expect(await onLake(acme, `SELECT 1 FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name LIKE 'bronze_%'`)).not.toHaveLength(0);
+    expect(catalog).not.toMatch(/bronze_|stage\.|ducklake_/);
+    expect(catalogSection(html, 'shared')).not.toContain('catalog_');
+
+    // 分享后出现在对方的「分享给我的」里
+    expect(catalogOf(unescape(await (await engineer.get('/workbench')).text()))).not.toContain('catalog_mine');
+    await owner.post('/workbench', { intent: 'share', name: 'catalog_mine', email: 'de3@acme.com' });
+    const shared = catalogSection(unescape(await (await engineer.get('/workbench')).text()), 'shared');
+    expect(shared).toContain(`data-ref="lake.${ownerSchema}."catalog_mine""`);
+    expect(shared).toContain('customer_id');
   });
 });

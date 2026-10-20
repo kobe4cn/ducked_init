@@ -4,7 +4,8 @@
 // 读别人没分享的沙箱表时，表在与不在报同样的话。
 // 会话里还挂着可写的本机库 stage 与 DuckLake 的元数据库 __ducklake_metadata_lake（里面有加密密钥，ADR-0020），
 // 表函数、SHOW DATABASES 之类与读配置的函数一律拒绝。
-// 保存沙箱表在可写挂载上执行：成员只给表名与一条校验过的 SELECT，CREATE 语句由这里拼出，只写进成员自己的沙箱
+// 保存沙箱表在可写挂载上执行：成员只给表名与一条校验过的 SELECT，CREATE 语句由这里拼出，只写进成员自己的沙箱。
+// 目录树（listReadableTables）按同一个允许集合列出能读的表与字段
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { collectRefs, normalizeSql } from './sql-refs';
 
@@ -55,10 +56,16 @@ const ALLOWED_SHOWS = new Set(['DESCRIBE', 'SUMMARY']);
 /** SHOW TABLES、SHOW ALL TABLES 与不带对象的 DESCRIBE 在解析树里的表名 */
 const SHOW_TABLES = new Set(['"tables"', '__show_tables_expanded']);
 
+/** 能读的表的过滤条件：schema 在 schemas 里，或是 shared 里的表（列名由调用方给出） */
+const readableWhere = (schemaCol: string, tableCol: string, schemas: readonly string[], shared: readonly SandboxTableRef[]) =>
+  `(${schemaCol} IN (${schemas.map(lit).join(', ')})${shared.map(t => ` OR (${schemaCol} = ${lit(t.schema)} AND ${tableCol} = ${lit(t.table)})`).join('')})`;
+
 /** 列出能读的表（shared 是分享来的表，SHOW TABLES 时一并列出）：代替 SHOW TABLES（原样执行会列出 stage 与元数据库里的表） */
 const listTablesSql = (schemas: readonly string[], shared: readonly SandboxTableRef[] = []) => `SELECT table_schema AS schema, table_name AS name, table_type AS type
-  FROM information_schema.tables WHERE table_catalog = 'lake' AND (table_schema IN (${schemas.map(lit).join(', ')})${
-  shared.map(t => ` OR (table_schema = ${lit(t.schema)} AND table_name = ${lit(t.table)})`).join('')}) ORDER BY 1, 2`;
+  FROM information_schema.tables WHERE table_catalog = 'lake' AND ${readableWhere('table_schema', 'table_name', schemas, shared)} ORDER BY 1, 2`;
+
+/** 可读 schema：silver、gold 与成员自己的沙箱（给了时） */
+const readableSchemas = (sandbox?: string): readonly string[] => sandbox ? [...WORKBENCH_SCHEMAS, sandbox] : WORKBENCH_SCHEMAS;
 
 /**
  * 整条语句就是 SHOW TABLES / SHOW ALL TABLES / DESCRIBE / SHOW TABLES FROM <schema> 时，要列的 schema（all：不带 FROM，能读的都列）；否则 null
@@ -83,7 +90,7 @@ const isShow = (statement: unknown) => (statement as { node?: { from_table?: { t
  * 不能用表函数、读配置的函数。别的沙箱表一律报「不存在或没有权限」。SHOW TABLES 换成只列这些 schema 与表的查询。不合规时抛出 WorkbenchSqlError
  */
 export async function checkWorkbenchSql(con: DuckDBConnection, sql: string, { sandbox, shared = [] }: SandboxAccess = {}): Promise<CheckedQuery> {
-  const schemas: readonly string[] = sandbox ? [...WORKBENCH_SCHEMAS, sandbox] : WORKBENCH_SCHEMAS;
+  const schemas = readableSchemas(sandbox);
   const hint = readableHint(sandbox, shared.length > 0);
   sql = normalizeWorkbenchSql(sql);
   if (!sql) throw new WorkbenchSqlError('请填写 SQL');
@@ -114,6 +121,22 @@ export async function checkWorkbenchSql(con: DuckDBConnection, sql: string, { sa
     }
   }
   return { sql, savable: !explain && !isShow(tree.statements[0]) };
+}
+
+/** 目录树里的一张表：schema、表名、行数（DuckLake 登记的估计值）与按顺序的字段 */
+export interface CatalogTable { schema: string; name: string; rows: number; columns: { name: string; type: string }[] }
+
+/**
+ * 列出 lake 里成员能读的表与字段，按 schema、表名排序：与 checkWorkbenchSql 同一个允许集合（silver、gold、自己的沙箱与 shared 里的表），
+ * 原始层、stage、元数据库都不在其中。查询由平台写，不经成员的白名单
+ */
+export async function listReadableTables(con: DuckDBConnection, { sandbox, shared = [] }: SandboxAccess = {}): Promise<CatalogTable[]> {
+  const rows = (await con.runAndReadAll(`SELECT t.schema_name AS schema, t.table_name AS name, t.estimated_size AS rows,
+      list({'name': c.column_name, 'type': c.data_type} ORDER BY c.column_index) AS columns
+    FROM duckdb_tables() t JOIN duckdb_columns() c USING (database_name, schema_name, table_name)
+    WHERE t.database_name = 'lake' AND ${readableWhere('t.schema_name', 't.table_name', readableSchemas(sandbox), shared)}
+    GROUP BY ALL ORDER BY 1, 2`)).getRowObjectsJson() as unknown as (Omit<CatalogTable, 'rows'> & { rows: string | number })[];
+  return rows.map(r => ({ ...r, rows: Number(r.rows) }));
 }
 
 /** 执行校验过的查询，最多取 limit 行（多读一行判断是否截断）。取值转成 JSON 能表示的形式 */

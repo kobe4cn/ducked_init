@@ -3,6 +3,7 @@
 // 查询的挂载用本租户的只读数据库角色与只读对象存储账号，凭据本身写不进 catalog 与存储；
 // 把查询结果保存为个人沙箱表时用可写挂载，CREATE 语句由平台拼出、只写进成员自己的 sandbox_<成员>，并在平台库登记（保存后 SANDBOX_TTL_DAYS 天过期）。
 // 表的主人可以把沙箱表只读分享给本租户有沙箱权限的成员；每次查询都按被分享人当前的角色与分享登记重新算能读的表，不缓存。
+// 目录树（listCatalog）用同一套只读凭据挂载、按同一个允许集合列出表与字段，由平台查询，不拿并发锁、不记审计。
 // 每个租户同时只有一个交互查询（PG 事务级 advisory lock，持有到查询结束），不经任务队列、不占正式任务名额；
 // 超时或客户端中止请求时 interrupt 本进程里的这个查询。每次查询都记审计（SQL、耗时、行数，失败时加原因），不记查询结果
 import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
@@ -14,7 +15,8 @@ import { members, SANDBOX_TTL_DAYS, sandboxShares, sandboxTables, type tenantLak
 import { ensureReadOnlyLakeAccess, lakeReady, lakeRow, lakeSpecOf, readOnlyAccessReady, readOnlyLakeSpecOf } from './lake';
 import { openTenantLake, redactLakeSecrets, type LakeSpec, type TenantLakeSession } from './pipeline/lake-engine';
 import {
-  checkWorkbenchSql, normalizeWorkbenchSql, runWorkbenchQuery, sandboxSchema, saveSandboxTable, WorkbenchSqlError, type SandboxAccess, type WorkbenchResult,
+  checkWorkbenchSql, listReadableTables, normalizeWorkbenchSql, runWorkbenchQuery, sandboxSchema, saveSandboxTable, WorkbenchSqlError,
+  type CatalogTable, type SandboxAccess, type WorkbenchResult,
 } from './pipeline/workbench-engine';
 import { lockForSave } from './sandbox';
 import { normalizeEmail } from './tenants';
@@ -132,8 +134,40 @@ export async function listSharedWithMe(actor: CurrentMember): Promise<SharedWith
   return sharedToMember(getDb(), actor);
 }
 
+/** 目录树里的一张表：另带插进 SQL 的引用 lake.<schema>."<表>" 与数据文件在存储前缀下的目录 */
+export interface CatalogEntry extends CatalogTable { ref: string; location: string }
+/** 工作台目录树：标准层、结果层、我的沙箱、分享给我的 */
+export interface WorkbenchCatalog { silver: CatalogEntry[]; gold: CatalogEntry[]; mine: CatalogEntry[]; shared: CatalogEntry[] }
+
+/**
+ * 成员此刻能读的表与字段、行数、位置（工作台目录树）：用查询同一套只读凭据挂载，按查询同一个允许集合列出，不经白名单。
+ * 不拿并发锁、不记审计（不执行成员写的 SQL）。数据湖没初始化或读取出错时抛出 WorkbenchError（报错里抹掉凭据）
+ */
+export async function listCatalog(actor: CurrentMember): Promise<WorkbenchCatalog> {
+  assertCan(actor, 'sandbox');
+  const lake = await lakeRow(actor.tenant.id);
+  if (!lake || !lakeReady(lake)) throw new WorkbenchError('本租户的数据湖还没有初始化');
+  const access = await sandboxAccess(getDb(), actor);
+  let spec: LakeSpec | undefined;
+  let session: TenantLakeSession | undefined;
+  try {
+    spec = await readOnlySpec(lake);
+    session = await openTenantLake(spec, WORKBENCH_LIMITS, undefined, { readOnly: true });
+    const catalog: WorkbenchCatalog = { silver: [], gold: [], mine: [], shared: [] };
+    for (const t of await listReadableTables(session.con, access)) {
+      const section = t.schema === 'silver' || t.schema === 'gold' ? t.schema : t.schema === access.sandbox ? 'mine' : 'shared';
+      catalog[section].push({ ...t, ref: `lake.${t.schema}."${t.name.replace(/"/g, '""')}"`, location: `${spec.dataPath}${t.schema}/${t.name}/` });
+    }
+    return catalog;
+  } catch (e) {
+    throw new WorkbenchError(`目录读取出错：${spec ? redactLakeSecrets((e as Error).message, spec) : (e as Error).message}`);
+  } finally {
+    session?.close();
+  }
+}
+
 /** 这次查询能读的沙箱：自己的沙箱 schema 与此刻分享给自己的表 */
-async function sandboxAccess(tx: Tx, actor: CurrentMember): Promise<SandboxAccess> {
+async function sandboxAccess(tx: Tx | Db, actor: CurrentMember): Promise<SandboxAccess> {
   const shared = (await sharedToMember(tx, actor)).map(t => ({ schema: t.schema, table: t.name }));
   return { sandbox: sandboxSchema(actor.memberId), shared };
 }
