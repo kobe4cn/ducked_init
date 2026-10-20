@@ -4,6 +4,8 @@ The look is direction **B** from the UI prototype, with direction A's full-width
 
 Build on the shadcn components in `app/components/ui/` and lucide icons. Don't add a new UI library.
 
+The one exception is the workbench SQL editor (`app/components/sql-editor.tsx`), which uses CodeMirror 6 (`codemirror`, `@codemirror/lang-sql` and the `@codemirror/*` packages they are built on, no React wrapper, no theme package; ADR-0036). Load it with a dynamic `import()` inside an effect, never at module top level, and keep the server-rendered textarea as the form field. Don't use CodeMirror anywhere else, including the mapping YAML editor.
+
 ## Page layout
 
 - **Shell**: `AppShell` has a white top bar with the brand, pill-shaped nav links (the active one is `bg-slate-900 text-white`), an avatar initial and a logout button. The page background is `bg-slate-50`.

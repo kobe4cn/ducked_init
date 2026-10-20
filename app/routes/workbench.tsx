@@ -3,8 +3,9 @@
 // 填上表名可以把 SELECT 的结果保存为个人沙箱表（SANDBOX_TTL_DAYS 天后过期），「我的沙箱表」列出表名、行数、过期时间与分享给了谁，
 // 可以按邮箱分享给本租户有沙箱权限的成员或撤销；「分享给我的」列出别人分享来的表（只读，在查询里按 sandbox_<主人>.<表名> 读）。
 // 左侧目录树按 标准层 / 结果层 / 我的沙箱 / 分享给我的 列出能读的表、字段类型、行数与湖中位置，点表名把带引号的引用插进 SQL 框；
-// 「原始层」按数据源名列出回放后当前状态的视图（敏感列是哈希），名字与保留名冲突的数据源给出没挂载的原因
-import { useRef } from 'react';
+// 「原始层」按数据源名列出回放后当前状态的视图（敏感列是哈希），名字与保留名冲突的数据源给出没挂载的原因。
+// SQL 框是 SqlEditor（CodeMirror，客户端加载）：DuckDB 高亮，按同一份目录补全 schema / 表 / 字段，Ctrl/⌘+Enter 执行
+import { useMemo, useRef } from 'react';
 import { data, Form, Link, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, ChevronRight, CircleAlert, Database, Table2 } from 'lucide-react';
 import type { Route } from './+types/workbench';
@@ -17,11 +18,13 @@ import {
 } from '~/.server/workbench';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
+import { SqlEditor, type SqlEditorHandle } from '~/components/sql-editor';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 import { Label } from '~/components/ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { completionSchema } from '~/lib/sql-completion';
 
 export function meta({}: Route.MetaArgs) {
   return [{ title: '查询 · CRM 数据分析平台' }];
@@ -172,14 +175,10 @@ const cell = (v: unknown) => (v === null || v === undefined ? 'NULL' : typeof v 
 
 export default function Workbench({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, maxRows, timeoutSeconds, sandbox, sandboxTables, sharedWithMe, ttlDays, catalog, catalogError } = loaderData;
-  const sqlBox = useRef<HTMLTextAreaElement>(null);
+  const sqlBox = useRef<SqlEditorHandle>(null);
   /** 在光标处插入表的引用（替换选中的文字） */
-  const insertRef = (ref: string) => {
-    const box = sqlBox.current;
-    if (!box) return;
-    box.setRangeText(ref, box.selectionStart, box.selectionEnd, 'end');
-    box.focus();
-  };
+  const insertRef = (ref: string) => sqlBox.current?.insert(ref);
+  const schema = useMemo(() => (catalog ? completionSchema(catalog) : {}), [catalog]);
   const running = useNavigation().state === 'submitting';
   const result = actionData && 'result' in actionData ? actionData.result : null;
   const saved = actionData && 'saved' in actionData ? actionData.saved : null;
@@ -196,16 +195,15 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
         <div className="min-w-0 space-y-6">
           <Form method="post" className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm">
             <label htmlFor="sql" className="text-sm font-medium">SQL</label>
-            <textarea
-              id="sql" name="sql" ref={sqlBox} rows={8} required defaultValue={actionData?.sql ?? ''} spellCheck={false}
+            <SqlEditor
+              id="sql" name="sql" ref={sqlBox} defaultValue={actionData?.sql ?? ''} schema={schema} running={running}
               placeholder={'SELECT * FROM silver.customer LIMIT 100\n-- 结果层的表名带横线，要加引号：gold."rfm__<任务 ID>"'}
-              className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
             />
             <div className="flex items-center gap-3">
               <Button type="submit" disabled={running}>{running ? '执行中…' : '执行'}</Button>
               {/* 发起新的导航会中止进行中的提交，服务端随之中断查询 */}
               {running && <Button asChild variant="outline"><Link to="/workbench" replace>取消</Link></Button>}
-              <span className="text-sm text-slate-400">同一租户同时只能运行一个查询。</span>
+              <span className="text-sm text-slate-400">Ctrl / ⌘ + Enter 执行；同一租户同时只能运行一个查询。</span>
             </div>
             <div className="flex flex-wrap items-center gap-3 border-t pt-3">
               <Label htmlFor="name">保存为沙箱表</Label>

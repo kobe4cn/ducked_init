@@ -45,7 +45,7 @@
 **目录树（#241）。** 页面左侧按 标准层 silver / 结果层 gold / 我的沙箱 / 分享给我的 列出成员此刻能读的表，每张表下列字段与类型：
 - 来源：`workbench.ts` 的 `listCatalog(actor)` 用查询同一套只读凭据挂载，`workbench-engine.ts` 的 `listReadableTables` 查 `duckdb_tables()` join `duckdb_columns()`，限定 `database_name = 'lake'`，schema / 表的过滤条件与 `checkWorkbenchSql` 共用（silver、gold、自己的沙箱 schema、此刻分享给自己的表），所以 `bronze_*`、`stage`、元数据库、别人没分享的沙箱都不出现。这条 SQL 由平台写，不经成员的白名单。
 - 行数用 `duckdb_tables().estimated_size`（DuckLake 登记的行数统计），不 `count(*)`；位置给两样：插进 SQL 的引用 `lake.<schema>."<表>"`（表名总加引号，结果层表名带 UUID 的横线），以及数据文件的目录 `<存储前缀><schema>/<表>/`（DuckLake 的默认布局；小表内联在 catalog 里时目录下没有文件）。
-- 点表名在 SQL 框的光标处插入引用（客户端 `setRangeText`），展开看字段。
+- 点表名在 SQL 框的光标处插入引用（编辑器加载后插进编辑器，没加载时 `setRangeText` 插进 textarea），展开看字段。
 - 每次打开页面（含提交后的重新加载）挂载一次，不拿并发锁、不记审计：不执行成员写的 SQL，与运行中的查询互不阻塞。读取出错时目录处显示原因，页面其余部分照常。
 
 **原始层视图（#242）。** 决定：原始层对所有有 `sandbox` 权限的角色（分析师、数据工程师、管理员）开放，前提是只给哈希视图，不给明文；`lake.bronze_*`、`bronze_*_keys`、`bronze_*_mirror` 照旧拒绝。
@@ -57,6 +57,13 @@
 - 名字：每次查询（`runQuery`、`saveAsSandbox`）与每次打开目录树都按此刻 `sources.name` 现建，数据源改名后新名字可查、旧名字不行。不写 catalog 的 `<名>.<表>` 会先按 `lake` 里的 schema 解析，重名就会读到 `lake` 里的表，所以与保留名（`lake`、`stage`、`memory`、`system`、`temp`、`main`、`silver`、`gold`、`serving`、`information_schema`、`pg_catalog`）、保留前缀（`sandbox_`、`bronze_`、`__ducklake_metadata_`）、此刻 `lake` 里已有的 schema 冲突的数据源，以及与另一个数据源只差大小写的，都不挂载（`workbench-engine.ts` 的 `rawNameConflict`），目录树「原始层」一节在该数据源下给出原因。一个数据源建视图出错时只跳过它（目录里给出抹掉凭据与盐的原因），别的数据源与标准层的查询照常。
 - 视图建在内存 catalog 里，不进数据湖（查询是只读挂载，保存沙箱表时也只写成员自己的 schema）；会话关闭即消失。存沙箱表时可以读原始层视图，存下的是哈希。
 - 目录树：`listCatalog` 同样挂上原始层，`listRawTables` 查 `duckdb_columns()` 列出各数据源的视图与字段，引用是 `"<数据源名>"."<表>"`；不给行数与位置（视图没有统计，数据文件是变更历史）。
+
+**编辑器（#243）。** SQL 框是 CodeMirror 6，这是 UI 约定「只用 shadcn、不加新 UI 库」的唯一例外（`docs/agents/ui.md`）：
+- 为什么破例：工作台的 SQL 要写多行、引用带引号的结果层表名与数据源名，textarea 没有高亮、补全与快捷键；shadcn 没有代码编辑器，自己在 textarea 上做补全不比引入 CodeMirror 省事。只限这一处，其余界面（含映射 YAML 编辑框）仍是 shadcn 与原生控件。
+- 只用 `codemirror`（`basicSetup`）、`@codemirror/lang-sql` 与它们底下的 `@codemirror/view` / `state` / `autocomplete`（pnpm 下直接引用要列为依赖），不用 React 包装库、不用主题包；`app/components/sql-editor.tsx` 是一个薄组件，外框用 Tailwind 与输入框一致。
+- 方言：`app/lib/duckdb-sql.ts` 的 `duckdbDialect` 在 PostgreSQL 方言上加 DuckDB 的关键字（`SUMMARIZE`、`DESCRIBE`、`QUALIFY`、`PIVOT`、`EXCLUDE`、`COLUMNS` 等）与类型。
+- 补全：`app/lib/sql-completion.ts` 的 `completionSchema` 把 loader 返回的目录（`listCatalog`，已按权限过滤）转成 lang-sql 的 schema：`<schema>.<表>.<字段>`（另在 `lake` 下放一份）与 `<数据源名>.<表>.<字段>`，没挂载的数据源不放。不是简单标识符的名字（结果层 `rfm__<任务 ID>`、`CRM`）由 lang-sql 在补全时加双引号，字段名按同一条规则自己加。前端不另拼对象名，补全里只有成员此刻能读的对象。
+- 渐进增强：服务端渲染带 `name="sql"` 的 textarea，客户端在 effect 里动态 `import()` CodeMirror，挂载后隐藏 textarea、去掉必填，每次改动写回它；表单提交与 HTTP 测试不变，没有 JS 或加载失败时就是 textarea。Ctrl/⌘+Enter 调 `form.requestSubmit()`，执行中与禁用的执行按钮一样不再提交。CodeMirror 只在工作台页面按需加载，不进服务端渲染与其他页面的包。
 
 ## 已接受的取舍
 
@@ -86,3 +93,5 @@
 - 敏感列的判定只用最近一次采集：采集之后才出现敏感取值的列在下次采集前不哈希（列名像敏感信息的列不受影响），与源视图预览相同。
 - 移出同步范围或还没采集的表不出现在原始层视图里，即使原始层里还有它的数据。
 - 与保留名冲突的数据源要改名才能查原始层；数据湖里将来新增的固定 schema 若与某个数据源同名，那个数据源随之不再挂载。
+- SQL 编辑器多了 CodeMirror 这一个依赖（只在工作台按需加载）；补全只认目录里的对象与关键字，不补函数名、CTE 名，也不按方言校验语法，错误仍由服务端白名单与 DuckDB 报出。
+- 补全数据在打开页面（与提交后的重新加载）时取一次，之后别人新分享或新建的表要刷新页面才补得出来。

@@ -55,6 +55,21 @@ describe('数据查询工作台', () => {
     expect(await (await viewer.get('/')).text()).not.toContain('href="/workbench"');
   });
 
+  it('没有 JS 时 SQL 框照样能提交，提交后 SQL 留在框里', async () => {
+    // 用数据工程师登录：同一邮箱的登录申请有次数限制，其他用例已经用满了分析师的次数
+    const engineer = await loginAs(app, 'de@acme.com');
+    const html = await (await engineer.get('/workbench')).text();
+    expect(html).toMatch(/<textarea[^>]*name="sql"[^>]*required/);
+    expect(html).toContain('data-sql-editor');
+    expect(html).not.toContain('cm-editor');
+
+    const res = await engineer.post('/workbench', { sql: 'SELECT 42 AS answer' });
+    expect(res.status).toBe(200);
+    const after = await res.text();
+    expect(after).toMatch(/<textarea[^>]*name="sql"[^>]*>SELECT 42 AS answer<\/textarea>/);
+    expect(after).toContain('answer');
+  });
+
   it('客户端中止请求即取消查询；运行中再提交返回 429', async () => {
     const analyst = await loginAs(app, 'an@acme.com');
     const controller = new AbortController();
