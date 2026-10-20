@@ -7,9 +7,7 @@ on:
 
 jobs:
   test:
-    # 暂用 22.04（内核 6.8）：ubuntu-24.04 镜像 20261018 起内核为 7.0.0，MongoDB 8 在 6.19 ~ 7.0.13 内核上拒绝启动
-    # （SERVER-121912 / SERVER-125742）。24.04 内核到 7.0.14+ 后改回
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:17
@@ -38,7 +36,9 @@ jobs:
           --health-retries 30
       # MongoDB 数据源的登记与只读校验测试（开启访问控制：root 账号 crm / crm）
       mongodb:
-        image: mongo:8
+        # 暂用 7.x：ubuntu-24.04 镜像 20261018 起内核为 7.0.0，MongoDB 8 在 6.19 ~ 7.0.13 内核上拒绝启动
+        # （SERVER-121912 / SERVER-125742）。Runner 内核到 7.0.14+ 后改回 mongo:8
+        image: mongo:7
         env:
           MONGO_INITDB_ROOT_USERNAME: crm
           MONGO_INITDB_ROOT_PASSWORD: crm
@@ -62,7 +62,7 @@ jobs:
         run: |
           docker run -d --name seaweedfs -p 8333:8333 -e AWS_ACCESS_KEY_ID=crm -e AWS_SECRET_ACCESS_KEY=crm-secret \
             chrislusf/seaweedfs server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=8333 -s3.iam.readOnly=false -master.volumeSizeLimitMB=1024
-          # 用 Runner 自带的 AWS CLI 建桶：ubuntu-22.04 的 curl 7.81 的 --aws-sigv4 不带 x-amz-content-sha256，S3 验签不过
+          # 用 Runner 自带的 AWS CLI 建桶，不依赖 curl 版本的 --aws-sigv4 实现
           for i in $(seq 60); do
             AWS_ACCESS_KEY_ID=crm AWS_SECRET_ACCESS_KEY=crm-secret AWS_DEFAULT_REGION=us-east-1 \
               aws --endpoint-url http://localhost:8333 s3api create-bucket --bucket crm-lake >/dev/null && exit 0
