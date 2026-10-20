@@ -34,7 +34,9 @@ export const tenants = platform.table('tenants', {
 // 由本租户独占的数据库角色拥有；任务进程只拿到这个角色的凭据，读不到其他租户的 catalog 与平台元数据。
 // 存储前缀在对象存储上时，s3_access_key / s3_secret_key 是本租户在存储服务上的账号，只能访问本租户的前缀；
 // 与数据库角色的密码同等对待。为空表示账号尚未建好（开通时失败或本功能上线前开通），此时不派发任务。
-// catalog_initialized_at 为空表示 DuckLake 元数据表尚未建好（开通时初始化失败），此时不派发任务
+// catalog_initialized_at 为空表示 DuckLake 元数据表尚未建好（开通时初始化失败），此时不派发任务。
+// ro_* 是数据查询工作台用的只读凭据（ADR-0036）：对 catalog 的表只有 SELECT 的数据库角色，与只能读、列出本租户前缀的
+// 对象存储账号。为空表示还没建好（本功能上线前开通的租户），第一次执行工作台查询时补建
 export const tenantLakes = platform.table('tenant_lakes', {
   tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
   dataPath: text('data_path').notNull(),
@@ -43,6 +45,10 @@ export const tenantLakes = platform.table('tenant_lakes', {
   dbPassword: text('db_password').notNull(),
   s3AccessKey: text('s3_access_key'),
   s3SecretKey: text('s3_secret_key'),
+  roDbRole: text('ro_db_role').unique(),
+  roDbPassword: text('ro_db_password'),
+  roS3AccessKey: text('ro_s3_access_key'),
+  roS3SecretKey: text('ro_s3_secret_key'),
   catalogInitializedAt: timestamp('catalog_initialized_at', { withTimezone: true }),
   createdAt: createdAt(),
 });

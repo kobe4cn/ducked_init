@@ -1,5 +1,6 @@
 // app/.server/workbench.ts —— 数据查询工作台：分析师、数据工程师在 web 请求内对本租户只读挂载的数据湖执行一条只读 SQL（ADR-0036）。
 // 只能读标准层 silver 与结果层 gold（白名单见 pipeline/workbench-engine.ts），最多给出 WORKBENCH_ROWS 行、不导出。
+// 挂载用本租户的只读数据库角色与只读对象存储账号，凭据本身写不进 catalog 与存储。
 // 每个租户同时只有一个交互查询（PG 事务级 advisory lock，持有到查询结束），不经任务队列、不占正式任务名额；
 // 超时或客户端中止请求时 interrupt 本进程里的这个查询。每次查询都记审计（SQL、耗时、行数，失败时加原因），不记查询结果
 import { sql } from 'drizzle-orm';
@@ -7,8 +8,9 @@ import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
-import { lakeReady, lakeRow, lakeSpecOf } from './lake';
-import { openTenantLake, redactLakeSecrets, type TenantLakeSession } from './pipeline/lake-engine';
+import type { tenantLakes } from './db/schema';
+import { ensureReadOnlyLakeAccess, lakeReady, lakeRow, readOnlyAccessReady, readOnlyLakeSpecOf } from './lake';
+import { openTenantLake, redactLakeSecrets, type LakeSpec, type TenantLakeSession } from './pipeline/lake-engine';
 import { checkWorkbenchSql, normalizeWorkbenchSql, runWorkbenchQuery, WorkbenchSqlError, type WorkbenchResult } from './pipeline/workbench-engine';
 
 /** 可以展示给成员的错误 */
@@ -20,6 +22,8 @@ export class WorkbenchError extends Error {
 export const WORKBENCH_ROWS = 10_000;
 export const WORKBENCH_TIMEOUT_MS = 60_000;
 const WORKBENCH_LIMITS = { memoryLimitMb: 1024, threads: 2 };
+
+type TenantLake = typeof tenantLakes.$inferSelect;
 
 export interface QueryOutcome extends WorkbenchResult { durationMs: number }
 
@@ -41,7 +45,6 @@ export async function runQuery(
   const tenantId = actor.tenant.id;
   const lake = await lakeRow(tenantId);
   if (!lake || !lakeReady(lake)) throw new WorkbenchError('本租户的数据湖还没有初始化');
-  const spec = lakeSpecOf(lake);
   const query = normalizeWorkbenchSql(rawSql);
   const outcome = await getDb().transaction(async tx => {
     const { rows: [{ locked }] } = await tx.execute<{ locked: boolean }>(sql`SELECT pg_try_advisory_xact_lock(hashtext(${`workbench:${tenantId}`})) AS locked`);
@@ -51,12 +54,14 @@ export async function runQuery(
     let error: string | undefined;
     let stopped: Stop | undefined;
     let session: TenantLakeSession | undefined;
+    let spec: LakeSpec | undefined;
     const interrupt = (why: Stop) => { stopped ??= why; session?.con.interrupt(); };
     const onAbort = () => interrupt('cancel');
     const timer = setTimeout(() => interrupt('timeout'), timeoutMs);
     signal?.addEventListener('abort', onAbort);
     if (signal?.aborted) onAbort();
     try {
+      spec = await readOnlySpec(lake);
       session = await openTenantLake(spec, WORKBENCH_LIMITS, undefined, { readOnly: true });
       // 挂载或校验期间到了超时、被中止：interrupt 打断不到还没开始的查询，在这里停下
       if (stopped) throw new Error(stopped);
@@ -67,7 +72,7 @@ export async function runQuery(
     } catch (e) {
       error = stopped ? STOP_MESSAGES[stopped](timeoutMs)
         : e instanceof WorkbenchSqlError ? e.message
-          : `查询出错：${redactLakeSecrets((e as Error).message, spec)}`;
+          : `查询出错：${spec ? redactLakeSecrets((e as Error).message, spec) : (e as Error).message}`;
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
@@ -83,4 +88,14 @@ export async function runQuery(
   if (outcome.kind === 'busy') throw new WorkbenchError('本租户已有查询在运行，请等它结束后再试', 429);
   if (outcome.kind === 'failed') throw new WorkbenchError(outcome.error);
   return outcome.result;
+}
+
+/**
+ * 只读凭据给出的挂载信息：即使白名单被绕过，写入也会被数据库与存储服务拒绝。
+ * 本功能上线前开通的租户还没有只读凭据，在这里补建（出错照常记审计）
+ */
+async function readOnlySpec(lake: TenantLake) {
+  if (readOnlyAccessReady(lake)) return readOnlyLakeSpecOf(lake);
+  await ensureReadOnlyLakeAccess(lake.tenantId);
+  return readOnlyLakeSpecOf((await lakeRow(lake.tenantId))!);
 }

@@ -87,7 +87,7 @@ describe('数据湖加密存储', () => {
     // 模拟加密上线前的数据湖：重建 catalog schema，用不带加密的 DuckLake 初始化元数据表
     await getDb().transaction(async tx => {
       await tx.execute(sql`DROP SCHEMA ${sql.identifier(lake.catalogSchema)} CASCADE`);
-      await createCatalogSchema(tx, lake.catalogSchema, lake.dbRole);
+      await createCatalogSchema(tx, lake.catalogSchema, lake.dbRole, lake.roDbRole);
     });
     (await openTenantLake(lakeSpecOf(lake), { memoryLimitMb: 256, threads: 1 })).close();
 

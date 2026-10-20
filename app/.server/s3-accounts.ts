@@ -18,6 +18,8 @@ export function platformS3() {
 }
 
 export const s3UserOf = (tenantId: string) => `lake-${tenantId}`;
+/** 数据查询工作台用的只读账号（ADR-0036）：只能读、列出本租户前缀下的对象 */
+export const s3ReadOnlyUserOf = (tenantId: string) => `lake-${tenantId}-ro`;
 
 /** 用平台账号调用 IAM API（表单 POST），返回响应 XML；出错时抛出带错误码的 IamError */
 async function iam(action: string, params: Record<string, string>) {
@@ -37,8 +39,16 @@ export class IamError extends Error {
   constructor(action: string, readonly code: string, message: string) { super(`对象存储 IAM ${action} 失败（${code}）：${message}`); }
 }
 
-/** 只允许读写、删除、列出本租户存储前缀下的对象。迁移存储期间同时给出新旧两个前缀（都是本租户的） */
-function prefixPolicy(dataPaths: string[]) {
+/** 吞掉错误码为 code 的 IamError（账号已存在、不存在） */
+const ignoreIamError = (code: string) => (e: unknown) => {
+  if (!(e instanceof IamError && e.code === code)) throw e;
+};
+
+const READ_WRITE = ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'];
+const READ_ONLY = ['s3:GetObject'];
+
+/** 只允许对本租户存储前缀下的对象执行 actions、列出这些对象。迁移存储期间同时给出新旧两个前缀（都是本租户的） */
+function prefixPolicy(dataPaths: string[], actions: string[]) {
   const prefixes = dataPaths.map(p => {
     const [bucket, ...rest] = p.replace(/^s3:\/\//, '').split('/');
     return { bucket, prefix: `${rest.filter(Boolean).join('/')}/*` };
@@ -46,7 +56,7 @@ function prefixPolicy(dataPaths: string[]) {
   return JSON.stringify({
     Version: '2012-10-17',
     Statement: prefixes.flatMap(({ bucket, prefix }) => [
-      { Effect: 'Allow', Action: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'], Resource: [`arn:aws:s3:::${bucket}/${prefix}`] },
+      { Effect: 'Allow', Action: actions, Resource: [`arn:aws:s3:::${bucket}/${prefix}`] },
       { Effect: 'Allow', Action: ['s3:ListBucket'], Resource: [`arn:aws:s3:::${bucket}`], Condition: { StringLike: { 's3:prefix': [prefix] } } },
     ]),
   });
@@ -57,14 +67,20 @@ function prefixPolicy(dataPaths: string[]) {
  * 此前签发、没来得及保存的密钥一并作废，策略按 dataPath 重新写入
  */
 export async function issueTenantS3Account(tenantId: string, dataPath: string) {
-  const UserName = s3UserOf(tenantId);
-  await iam('CreateUser', { UserName }).catch(e => {
-    if (!(e instanceof IamError && e.code === 'EntityAlreadyExists')) throw e;
-  });
+  return issueAccount(s3UserOf(tenantId), prefixPolicy([dataPath], READ_WRITE));
+}
+
+/** 同 issueTenantS3Account，建的是只读账号：只能读、列出 dataPath 下的对象 */
+export async function issueTenantReadOnlyS3Account(tenantId: string, dataPath: string) {
+  return issueAccount(s3ReadOnlyUserOf(tenantId), prefixPolicy([dataPath], READ_ONLY));
+}
+
+async function issueAccount(UserName: string, PolicyDocument: string) {
+  await iam('CreateUser', { UserName }).catch(ignoreIamError('EntityAlreadyExists'));
   for (const AccessKeyId of tags(await iam('ListAccessKeys', { UserName }), 'AccessKeyId')) {
     await iam('DeleteAccessKey', { UserName, AccessKeyId });
   }
-  await setTenantS3Prefixes(tenantId, [dataPath]);
+  await putPolicy(UserName, PolicyDocument);
   const xml = await iam('CreateAccessKey', { UserName });
   const accessKey = tag(xml, 'AccessKeyId');
   const secretKey = tag(xml, 'SecretAccessKey');
@@ -72,16 +88,17 @@ export async function issueTenantS3Account(tenantId: string, dataPath: string) {
   return { accessKey, secretKey };
 }
 
-/** 重写租户账号的前缀策略：只能访问给出的存储前缀（对象存储上的） */
+/** 重写租户两个账号的前缀策略：只能访问给出的存储前缀（对象存储上的）；只读账号还没建时跳过它 */
 export async function setTenantS3Prefixes(tenantId: string, dataPaths: string[]) {
-  await iam('PutUserPolicy', { UserName: s3UserOf(tenantId), PolicyName: 'tenant-lake', PolicyDocument: prefixPolicy(dataPaths) });
+  await putPolicy(s3UserOf(tenantId), prefixPolicy(dataPaths, READ_WRITE));
+  await putPolicy(s3ReadOnlyUserOf(tenantId), prefixPolicy(dataPaths, READ_ONLY)).catch(ignoreIamError('NoSuchEntity'));
 }
 
-/** 删除租户在存储服务上的账号（连同密钥与策略）；账号不存在时什么也不做 */
+const putPolicy = (UserName: string, PolicyDocument: string) => iam('PutUserPolicy', { UserName, PolicyName: 'tenant-lake', PolicyDocument });
+
+/** 删除租户在存储服务上的读写与只读账号（连同密钥与策略）；账号不存在时什么也不做 */
 export async function deleteTenantS3Account(tenantId: string) {
-  await iam('DeleteUser', { UserName: s3UserOf(tenantId) }).catch(e => {
-    if (!(e instanceof IamError && e.code === 'NoSuchEntity')) throw e;
-  });
+  for (const UserName of [s3UserOf(tenantId), s3ReadOnlyUserOf(tenantId)]) await iam('DeleteUser', { UserName }).catch(ignoreIamError('NoSuchEntity'));
 }
 
 /**

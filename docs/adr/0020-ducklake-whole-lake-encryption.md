@@ -4,7 +4,7 @@ ADR-0005 要求明文只以加密形式留在原始层。原始层（`bronze_<�
 
 **粒度与范围。** 一个文件一个密钥，按整湖开启，没法只加密原始层。标准层（`silver.*`）、批次日志、合并日志都会一并加密，比 ADR-0005 说的“仅原始层”范围更大。这样没有坏处：标准层里的敏感字段本来就是哈希，加密只是多一层保护。
 
-**密钥在哪里。** 文件密钥存在本租户 catalog 的 `ducklake_data_file.encryption_key` / `ducklake_delete_file.encryption_key` 里，也就是平台 PG 中本租户独占的 schema（ADR-0008）。所以加密防的是对象存储泄露：拿到存储前缀下的文件、备份或者旧版本对象，没有 catalog 也读不出来。它不防 catalog 泄露。拿到本租户数据库角色的人可以读出密钥；内联在 catalog 里的小批次（DuckLake 的数据内联）本来就是明文。catalog 的保护靠 ADR-0008 的独占角色和 PG 本身。
+**密钥在哪里。** 文件密钥存在本租户 catalog 的 `ducklake_data_file.encryption_key` / `ducklake_delete_file.encryption_key` 里，也就是平台 PG 中本租户独占的 schema（ADR-0008）。所以加密防的是对象存储泄露：拿到存储前缀下的文件、备份或者旧版本对象，没有 catalog 也读不出来。它不防 catalog 泄露。拿到本租户数据库角色的人可以读出密钥，工作台的只读角色（ADR-0036）同样能读：DuckLake 只读挂载也要读这些密钥，工作台靠白名单不让查询读到元数据库；内联在 catalog 里的小批次（DuckLake 的数据内联）本来就是明文。catalog 的保护靠 ADR-0008 的独占角色和 PG 本身。
 
 **怎么开启。** 加密要写进 catalog：DuckLake 在 `ducklake_metadata` 里记下 `encrypted = true`，之后的挂载不带 `ENCRYPTED` 也照样加密写入。已经建好的未加密 catalog 不能补开加密（带 `ENCRYPTED` 挂载会报错）。所以 `initTenantCatalog` 先看 catalog schema 里有没有元数据表：没有就以加密方式新建，有就照原样挂载，可以重复执行。写加密文件需要 httpfs 带来的加密模块，工作进程在本地目录模式下也加载 httpfs。
 

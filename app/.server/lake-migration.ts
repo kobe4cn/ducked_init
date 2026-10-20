@@ -8,7 +8,7 @@ import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import { recordAudit, type OperatorActor, type Tx } from './audit';
 import { getDb, type Db } from './db/client';
 import { lakeMigrations, tenantLakes, tenants, type LakeInventory } from './db/schema';
-import { dropTenantS3Account, ensureTenantS3Account, lakeReady, lakeRow, lakeSpecOf, normalizeLakeRoot, tenantDataPath } from './lake';
+import { asTenantRole, dropTenantS3Account, ensureTenantS3Account, lakeReady, lakeRow, lakeSpecOf, normalizeLakeRoot, tenantDataPath } from './lake';
 import { copyLakeFile, isS3, listLakeFiles, type LakeFile } from './lake-storage';
 import { SERVING_DIR } from './pipeline/lake-engine';
 import { inventory } from './pipeline/handlers';
@@ -219,29 +219,24 @@ async function updateIfClaimed(m: ClaimedMigration, set: PgUpdateSetSource<typeo
 
 /**
  * 一个事务里把 catalog 与 tenant_lakes 的 data_path 从 from 改为 to，不会只切一半。
- * catalog 的元数据表归租户的数据库角色所有，改它时切换到该角色；平台账号不是其成员时在本事务里临时加入、改完即收回
+ * catalog 的元数据表归租户的数据库角色所有，改它时切换到该角色（asTenantRole）
  */
 async function switchDataPath(m: ClaimedMigration, from: string, to: string) {
   await getDb().transaction(async tx => {
     await updateIfClaimed(m, {}, tx);
     const [lake] = await tx.select().from(tenantLakes).where(eq(tenantLakes.tenantId, m.tenantId)).for('update');
     if (lake.dataPath !== from) throw new Error(`数据湖当前位置 ${lake.dataPath} 不是 ${from}`);
-    const role = sql.identifier(lake.dbRole);
     const catalog = sql.identifier(lake.catalogSchema);
-    const { rows: [{ member }] } = await tx.execute<{ member: boolean }>(sql`SELECT pg_has_role(current_user, ${lake.dbRole}, 'MEMBER') AS member`);
-    if (!member) await tx.execute(sql`GRANT ${role} TO current_user`);
-    const platformRole = sql.identifier((await tx.execute<{ u: string }>(sql`SELECT current_user AS u`)).rows[0].u);
-    await tx.execute(sql`SET LOCAL ROLE ${role}`);
-    // 用绝对路径登记的文件（如 ducklake_add_data_files 加入的）不随前缀搬走，不能迁移
-    const { rows: [{ absolute }] } = await tx.execute<{ absolute: number }>(sql`
-      SELECT ((SELECT count(*) FROM ${catalog}.ducklake_data_file WHERE NOT path_is_relative)
-            + (SELECT count(*) FROM ${catalog}.ducklake_delete_file WHERE NOT path_is_relative))::int AS absolute`);
-    if (absolute) throw new Error(`catalog 里有 ${absolute} 个以绝对路径登记的文件，不能迁移`);
-    const updated = await tx.execute(sql`
-      UPDATE ${catalog}.ducklake_metadata SET value = ${to} WHERE key = 'data_path' AND scope IS NULL AND value = ${from}`);
-    if (updated.rowCount !== 1) throw new Error(`catalog 里的 data_path 不是 ${from}`);
-    await tx.execute(sql`RESET ROLE`);
-    if (!member) await tx.execute(sql`REVOKE ${role} FROM ${platformRole}`);
+    await asTenantRole(tx, lake.dbRole, async () => {
+      // 用绝对路径登记的文件（如 ducklake_add_data_files 加入的）不随前缀搬走，不能迁移
+      const { rows: [{ absolute }] } = await tx.execute<{ absolute: number }>(sql`
+        SELECT ((SELECT count(*) FROM ${catalog}.ducklake_data_file WHERE NOT path_is_relative)
+              + (SELECT count(*) FROM ${catalog}.ducklake_delete_file WHERE NOT path_is_relative))::int AS absolute`);
+      if (absolute) throw new Error(`catalog 里有 ${absolute} 个以绝对路径登记的文件，不能迁移`);
+      const updated = await tx.execute(sql`
+        UPDATE ${catalog}.ducklake_metadata SET value = ${to} WHERE key = 'data_path' AND scope IS NULL AND value = ${from}`);
+      if (updated.rowCount !== 1) throw new Error(`catalog 里的 data_path 不是 ${from}`);
+    });
     await tx.update(tenantLakes).set({ dataPath: to }).where(eq(tenantLakes.tenantId, m.tenantId));
   });
 }

@@ -20,9 +20,18 @@
 
 **权限。** 页面与 `runQuery` 都要 `sandbox` 权限（分析师、数据工程师、管理员），查看者 403、导航里没有「查询」。
 
+**只读凭据（#237）。** 真正挡住写入的是凭据，而不是白名单与 READ_ONLY 挂载。每个租户另有一对只读凭据，存在 `tenant_lakes` 的 `ro_db_role` / `ro_db_password` / `ro_s3_access_key` / `ro_s3_secret_key`，工作台只用它们挂载（`lake.ts` 的 `readOnlyLakeSpecOf`），即使白名单被绕过，写入也会被 PG 或存储服务拒绝：
+- 只读数据库角色 `lake_<租户 ID>_ro`：能登录，不是超级用户，不属于任何角色（也就不继承租户角色）；对 catalog schema 只有 USAGE，对其中的表只有 SELECT。DuckLake 只读挂载要读全部 `ducklake_*` 元数据表（含加密密钥，ADR-0020），所以 SELECT 授给整个 schema。元数据表归租户角色所有、由 DuckLake 随时新建，所以以租户角色的身份（`asTenantRole`，同 ADR-0008 切换 `data_path` 的做法）`GRANT SELECT ON ALL TABLES` 并 `ALTER DEFAULT PRIVILEGES … GRANT SELECT ON TABLES`，之后建的表也自动可读。不要求平台账号是超级用户。
+- 只读对象存储账号 `lake-<租户 ID>-ro`：策略只有本租户前缀下的 `s3:GetObject` 与以该前缀 `s3:ListBucket`（`s3-accounts.ts` 的 `issueTenantReadOnlyS3Account`）。迁移存储改前缀时 `setTenantS3Prefixes` 两个账号一起改；`deleteTenantS3Account` / `dropTenantS3Account`（迁离对象存储、收回账号）两个账号一起删、密钥一起清。
+- 开通时只读角色随租户角色在同一事务里建好（`CREATE ROLE … LOGIN`，不写 `NOSUPERUSER`：默认就不是，而 PG 16 起写了这个属性的 `ALTER ROLE` 只有超级用户能执行）；`initTenantCatalog` 再调 `ensureReadOnlyLakeAccess` 补齐对象存储账号与表权限。本功能上线前开通的租户在第一次执行工作台查询时由 `runQuery` 在拿到并发锁之后、挂载之前调 `ensureReadOnlyLakeAccess` 补建（补建失败同样记 `workbench.query` 审计）：缺什么建什么，锁住数据湖行，可重复执行；角色已存在而凭据没记下时只重设密码。重置数据湖（`lake:reset`）重建 catalog schema 时重新授予只读角色。
+- 之后的沙箱写入（存成沙箱表）仍走可写凭据：写入的 SQL 由平台拼出，成员只提供通过白名单的 SELECT。
+
 ## 已接受的取舍
 
-- 这一票没有专门的只读数据库凭据：用的是本租户读写 catalog 的角色加 READ_ONLY 挂载与白名单，凭据另票。白名单漏掉的读法（DuckDB 新增的读配置标量函数）仍受锁定配置与租户角色的隔离兜底（ADR-0008）。
+- 白名单漏掉的读法（DuckDB 新增的读配置标量函数）仍受锁定配置与只读凭据的隔离兜底（ADR-0008）；只读凭据挡写不挡读，读得到的仍是本租户的全部 catalog（含加密密钥）与存储前缀，读的范围靠白名单。
+- 只读角色与只读账号的密码、密钥与读写凭据一样明文存在 `tenant_lakes`（ADR-0008 的取舍）。
+- 建只读角色、只读账号不单独记审计（读写账号记 `tenant.s3_account_created`）：它们只能读本租户已经能读的东西，补建发生在哪次查询看 `workbench.query` 即可。
+- 数据湖从本地目录迁往对象存储时不建只读账号，切换后第一次工作台查询再补建；迁移期间工作台仍按迁移前的前缀挂载。
 - 一次查询占住一个平台 PG 连接（advisory lock 的事务）最长 60 秒。
 - 能读 silver / gold 的全部列，包括敏感字段的哈希；哈希不是明文（ADR-0005）。
 - 结果不导出、不缓存（响应 `Cache-Control: no-store`），刷新页面就没了；存成沙箱表是后续子票。

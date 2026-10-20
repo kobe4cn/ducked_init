@@ -1,15 +1,20 @@
 // test/pipeline/workbench.test.ts —— 数据查询工作台的流水线接缝：成员 runQuery(sql) → 在只读挂载的本租户数据湖上校验并执行 →
-// 返回的列与行、审计日志 workbench.query；交互查询挂起时调度器照常领取并完成正式任务
-import { and, eq } from 'drizzle-orm';
+// 返回的列与行、审计日志 workbench.query；交互查询挂起时调度器照常领取并完成正式任务；
+// 查询用本租户的只读 PG 角色与只读对象存储账号，凭据本身就写不进 catalog 与存储
+import { and, eq, sql } from 'drizzle-orm';
+import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs } from '../../app/.server/db/schema';
+import { auditLogs, tenantLakes } from '../../app/.server/db/schema';
+import { dropTenantS3Account, ensureReadOnlyLakeAccess, ensureTenantS3Account, lakeRow, readOnlyLakeSpecOf } from '../../app/.server/lake';
+import { deleteTenantS3Account, platformS3 } from '../../app/.server/s3-accounts';
+import { getObject, listObjects, putObject } from '../../app/.server/s3-client';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { enqueueTask, getTask } from '../../app/.server/tasks';
 import { runQuery, WORKBENCH_ROWS } from '../../app/.server/workbench';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { resetDb } from '../http/harness';
-import { memberOf } from './fixtures';
+import { memberOf, newTenant, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 
 let acme: string;
@@ -139,4 +144,115 @@ describe('超时、取消与并发', () => {
     expect(await first).toMatch(/查询已取消/);
     expect((await runQuery(member, 'SELECT 1 AS one')).rows).toEqual([[1]]);
   }, 120_000);
+});
+
+/** 以给定的 PG 账号连平台库执行 SQL，返回结果或报错信息 */
+async function asRole(role: string, password: string, sql: string) {
+  const url = new URL(process.env.PLATFORM_DATABASE_URL!);
+  url.username = role;
+  url.password = password;
+  const client = new pg.Client({ connectionString: url.toString() });
+  await client.connect();
+  try {
+    return await client.query(sql).then(r => r.rows, (e: Error) => e.message);
+  } finally {
+    await client.end();
+  }
+}
+
+const platformSql = (query: string) => getDb().execute(sql.raw(query));
+const clearReadOnlyColumns = (tenantId: string) => getDb().update(tenantLakes)
+  .set({ roDbRole: null, roDbPassword: null, roS3AccessKey: null, roS3SecretKey: null }).where(eq(tenantLakes.tenantId, tenantId));
+
+describe('只读凭据', () => {
+  it('开通时建好只读角色：catalog 的表只能 SELECT，INSERT、建表被拒；不是超级用户，也不继承租户角色', async () => {
+    const lake = (await lakeRow(acme))!;
+    expect(lake.roDbRole).toBe(`${lake.dbRole}_ro`);
+    const ro = (sql: string) => asRole(lake.roDbRole!, lake.roDbPassword!, sql);
+    const table = `"${lake.catalogSchema}".ducklake_metadata`;
+    expect(await ro(`SELECT count(*) AS n FROM ${table}`)).toEqual([{ n: expect.any(String) }]);
+    expect(await ro(`INSERT INTO ${table} (key, value) VALUES ('evil', '1')`)).toMatch(/permission denied/);
+    expect(await ro(`UPDATE ${table} SET value = value`)).toMatch(/permission denied/);
+    expect(await ro(`CREATE TABLE "${lake.catalogSchema}".evil (x int)`)).toMatch(/permission denied/);
+    const { rows: [role] } = await platformSql(`SELECT rolsuper, pg_has_role('${lake.roDbRole}', '${lake.dbRole}', 'USAGE') AS inherits
+      FROM pg_roles WHERE rolname = '${lake.roDbRole}'`);
+    expect(role).toEqual({ rolsuper: false, inherits: false });
+    expect(readOnlyLakeSpecOf(lake).catalogUrl).toContain(`//${lake.roDbRole}:`);
+  });
+
+  it('工作台查询用只读凭据：收回只读角色的 SELECT 后查询报权限不足', async () => {
+    const lake = (await lakeRow(acme))!;
+    await platformSql(`REVOKE SELECT ON ALL TABLES IN SCHEMA "${lake.catalogSchema}" FROM "${lake.roDbRole}"`);
+    try {
+      expect(await errorOf(runQuery(await analyst(), 'SELECT count(*) FROM silver.customer'))).toMatch(/permission denied/);
+    } finally {
+      await platformSql(`GRANT SELECT ON ALL TABLES IN SCHEMA "${lake.catalogSchema}" TO "${lake.roDbRole}"`);
+    }
+  });
+
+  it('老租户第一次查询时补建只读角色（角色不存在或只是没记下凭据），重复调用不报错', async () => {
+    const before = (await lakeRow(acme))!;
+    await clearReadOnlyColumns(acme);
+    await platformSql(`DROP OWNED BY "${before.roDbRole}"; DROP ROLE "${before.roDbRole}"`);
+    expect((await runQuery(await analyst(), 'SELECT count(*) > 0 AS ok FROM silver.customer')).rows).toEqual([[true]]);
+    const after = (await lakeRow(acme))!;
+    expect(after.roDbRole).toBe(before.roDbRole);
+
+    await clearReadOnlyColumns(acme);
+    await ensureReadOnlyLakeAccess(acme);
+    await ensureReadOnlyLakeAccess(acme);
+    // 记下了角色、没记下密码时同样补齐
+    await getDb().update(tenantLakes).set({ roDbPassword: null }).where(eq(tenantLakes.tenantId, acme));
+    await ensureReadOnlyLakeAccess(acme);
+    const again = (await lakeRow(acme))!;
+    expect(again.roDbPassword).toBeTruthy();
+    expect(await asRole(again.roDbRole!, again.roDbPassword!, `SELECT 1 AS one FROM "${again.catalogSchema}".ducklake_metadata LIMIT 1`))
+      .toEqual([{ one: 1 }]);
+    expect((await runQuery(await analyst(), 'SELECT count(*) > 0 AS ok FROM silver.customer')).rows).toEqual([[true]]);
+  });
+});
+
+describe.skipIf(!process.env.TEST_S3_LAKE_URI)('只读凭据（对象存储）', () => {
+  const defaultLakeUri = process.env.PLATFORM_LAKE_URI;
+  beforeAll(() => { process.env.PLATFORM_LAKE_URI = process.env.TEST_S3_LAKE_URI; });
+  afterAll(() => { process.env.PLATFORM_LAKE_URI = defaultLakeUri; });
+  const roCreds = (lake: { roS3AccessKey: string | null; roS3SecretKey: string | null }) =>
+    ({ ...platformS3(), key: lake.roS3AccessKey!, secret: lake.roS3SecretKey! });
+
+  it('开通时建好只读账号：GET、List 本租户前缀可用，PUT 被拒；工作台用它查询；吊销账号时一并删除', async () => {
+    const tenant = await newTenant('rolake');
+    expect((await runTask(tenant, 'demo.seed', { customers: 20 })).status).toBe('succeeded');
+    const lake = (await lakeRow(tenant))!;
+    expect(lake.roS3AccessKey).toBeTruthy();
+    expect(lake.roS3AccessKey).not.toBe(lake.s3AccessKey);
+    const creds = roCreds(lake);
+    const files = await listObjects(creds, lake.dataPath);
+    const parquet = files.find(f => f.path.endsWith('.parquet'))!;
+    expect(parquet).toBeDefined();
+    expect(await errorOf(getObject(creds, `${lake.dataPath}${parquet.path}`).then(b => new Response(b).arrayBuffer()))).toBe('成功');
+    expect(await errorOf(putObject(creds, `${lake.dataPath}evil.txt`, 'x'))).toMatch(/HTTP 403/);
+    expect(readOnlyLakeSpecOf(lake).s3!.key).toBe(lake.roS3AccessKey);
+
+    const member = await memberOf(tenant, 'analyst@rolake.com', 'analyst');
+    expect((await runQuery(member, 'SHOW TABLES')).rows).toBeDefined();
+
+    await dropTenantS3Account(tenant);
+    expect(await lakeRow(tenant)).toMatchObject({ s3AccessKey: null, roS3AccessKey: null, roS3SecretKey: null });
+    expect(await errorOf(listObjects(creds, lake.dataPath))).toMatch(/HTTP 403/);
+  });
+
+  it('老租户第一次查询时补建只读账号，重复调用不报错', async () => {
+    const tenant = await newTenant('oldlake');
+    await deleteTenantS3Account(tenant);
+    await clearReadOnlyColumns(tenant);
+    // 读写账号随 deleteTenantS3Account 一起删了，补回来（只读账号的补建不依赖它，这里只为数据湖照常可用）
+    await getDb().update(tenantLakes).set({ s3AccessKey: null, s3SecretKey: null }).where(eq(tenantLakes.tenantId, tenant));
+    await ensureTenantS3Account(tenant, null);
+
+    await runQuery(await memberOf(tenant, 'analyst@oldlake.com', 'analyst'), 'SHOW TABLES');
+    await ensureReadOnlyLakeAccess(tenant);
+    const lake = (await lakeRow(tenant))!;
+    expect(await errorOf(listObjects(roCreds(lake), lake.dataPath))).toBe('成功');
+    expect(await errorOf(putObject(roCreds(lake), `${lake.dataPath}evil.txt`, 'x'))).toMatch(/HTTP 403/);
+  });
 });

@@ -147,8 +147,8 @@ describe('本功能上线前开通的租户', () => {
     // 模拟上线前开通的租户：没有数据湖
     const db = new pg.Client({ connectionString: process.env.PLATFORM_DATABASE_URL });
     await db.connect();
-    const { rows: [lake] } = await db.query('DELETE FROM platform.tenant_lakes WHERE tenant_id = $1 RETURNING catalog_schema, db_role', [acme]);
-    await db.query(`DROP SCHEMA "${lake.catalog_schema}" CASCADE; DROP ROLE "${lake.db_role}"`);
+    const { rows: [lake] } = await db.query('DELETE FROM platform.tenant_lakes WHERE tenant_id = $1 RETURNING catalog_schema, db_role, ro_db_role', [acme]);
+    await db.query(`DROP SCHEMA "${lake.catalog_schema}" CASCADE; DROP ROLE "${lake.ro_db_role}"; DROP ROLE "${lake.db_role}"`);
     await db.end();
 
     expect((await createOperator('ops@platform.com')).code).toBe(0);
