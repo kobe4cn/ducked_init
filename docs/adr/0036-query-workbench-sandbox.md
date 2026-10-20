@@ -24,7 +24,14 @@
 - 只读数据库角色 `lake_<租户 ID>_ro`：能登录，不是超级用户，不属于任何角色（也就不继承租户角色）；对 catalog schema 只有 USAGE，对其中的表只有 SELECT。DuckLake 只读挂载要读全部 `ducklake_*` 元数据表（含加密密钥，ADR-0020），所以 SELECT 授给整个 schema。元数据表归租户角色所有、由 DuckLake 随时新建，所以以租户角色的身份（`asTenantRole`，同 ADR-0008 切换 `data_path` 的做法）`GRANT SELECT ON ALL TABLES` 并 `ALTER DEFAULT PRIVILEGES … GRANT SELECT ON TABLES`，之后建的表也自动可读。不要求平台账号是超级用户。
 - 只读对象存储账号 `lake-<租户 ID>-ro`：策略只有本租户前缀下的 `s3:GetObject` 与以该前缀 `s3:ListBucket`（`s3-accounts.ts` 的 `issueTenantReadOnlyS3Account`）。迁移存储改前缀时 `setTenantS3Prefixes` 两个账号一起改；`deleteTenantS3Account` / `dropTenantS3Account`（迁离对象存储、收回账号）两个账号一起删、密钥一起清。
 - 开通时只读角色随租户角色在同一事务里建好（`CREATE ROLE … LOGIN`，不写 `NOSUPERUSER`：默认就不是，而 PG 16 起写了这个属性的 `ALTER ROLE` 只有超级用户能执行）；`initTenantCatalog` 再调 `ensureReadOnlyLakeAccess` 补齐对象存储账号与表权限。本功能上线前开通的租户在第一次执行工作台查询时由 `runQuery` 在拿到并发锁之后、挂载之前调 `ensureReadOnlyLakeAccess` 补建（补建失败同样记 `workbench.query` 审计）：缺什么建什么，锁住数据湖行，可重复执行；角色已存在而凭据没记下时只重设密码。重置数据湖（`lake:reset`）重建 catalog schema 时重新授予只读角色。
-- 之后的沙箱写入（存成沙箱表）仍走可写凭据：写入的 SQL 由平台拼出，成员只提供通过白名单的 SELECT。
+- 沙箱写入（存成沙箱表，见下一节）仍走可写凭据：写入的 SQL 由平台拼出，成员只提供通过白名单的 SELECT。
+
+**沙箱表（#238）。** 成员可以把一条 SELECT 的结果存成自己的沙箱表，之后在查询里接着用：
+- 存储与命名：表在本租户数据湖里，每个成员一个 schema `sandbox_<成员 ID 去掉横线>`（`workbench-engine.ts` 的 `sandboxSchema`；UUID 的横线不能出现在不加引号的标识符里）。表名只允许 `[a-z][a-z0-9_]{0,62}`，同名表覆盖。平台库 `sandbox_tables` 登记 `(租户, 成员, 表名)` 唯一的一行：行数、保存时间与过期时间（保存后 7 天，`SANDBOX_TTL_DAYS`），覆盖时三者一起重置；`expired_at` 留给过期清理。页面「我的沙箱表」只列自己的、未过期的表。重置数据湖（`lake:reset`）删掉 catalog 时一并删掉本租户的登记。
+- 平台拼 DDL：`saveAsSandbox(actor, name, sql)` 与查询共用同一把每租户并发锁、同样的超时与取消（`workbench.ts` 的 `inWorkbench`），但用可写凭据挂载（`lakeSpecOf`）。在同一会话里先 `checkWorkbenchSql`（与查询同一份白名单），校验结果必须是一条 SELECT / WITH（EXPLAIN、DESCRIBE、SHOW、SUMMARIZE 不能存），再由 `saveSandboxTable` 拼出 `CREATE OR REPLACE TABLE lake."sandbox_<成员>"."<表名>" AS <校验过的 SQL>`：schema 由成员 ID 算出，表名先过正则再加引号，除此之外不拼进任何成员给的东西；执行前再用 `extractStatements` 确认拼出的仍是一条语句。schema 不存在时先 `CREATE SCHEMA IF NOT EXISTS`。所以写入只会落在成员自己的沙箱里，往 silver / gold / 别人的沙箱写一律做不到。
+- 读：查询白名单的可读 schema 是参数，`runQuery` 加上成员自己的 `sandbox_<成员>`（`SHOW TABLES` 也列出它）；别人的沙箱、其他租户（数据湖本来就隔离）都读不到。只读角色的 `ALTER DEFAULT PRIVILEGES` 覆盖 DuckLake 元数据表，沙箱表只是其中的几行，不需要另外授权。
+- 审计：`sandbox.save` 的详情是 `{ name, sql, durationMs, rows }`，失败时加 `error`，成败都记，与登记同一事务写入。
+- 沙箱 schema 不进结果快照与服务库（ADR-0033 只收 `gold`），分析页只看 `snapshots` 登记的表；湖迁移的清单（`inventory`）照常带上它们，迁移不丢数据。
 
 ## 已接受的取舍
 
@@ -34,5 +41,8 @@
 - 数据湖从本地目录迁往对象存储时不建只读账号，切换后第一次工作台查询再补建；迁移期间工作台仍按迁移前的前缀挂载。
 - 一次查询占住一个平台 PG 连接（advisory lock 的事务）最长 60 秒。
 - 能读 silver / gold 的全部列，包括敏感字段的哈希；哈希不是明文（ADR-0005）。
-- 结果不导出、不缓存（响应 `Cache-Control: no-store`），刷新页面就没了；存成沙箱表是后续子票。
+- 结果不导出、不缓存（响应 `Cache-Control: no-store`），刷新页面就没了；要留下来就存成沙箱表。
+- 存沙箱表用可写凭据，挡写入的是白名单与平台拼的 DDL，不是凭据；凭据层面一个成员能写整个湖。拆出每个成员的写角色要改 DuckLake 的 catalog 权限模型，不值得。
+- 沙箱表到期后的清理（删表、记 `expired_at`）不在这一票：先登记过期时间，页面也照样列到清理为止。
+- 平台库登记在湖里建表之后、同一 PG 事务里写入；登记失败时湖里留下一张没登记的表，下次同名保存会覆盖它。
 - `EXPLAIN ANALYZE` 会真的执行查询，照样受超时约束。

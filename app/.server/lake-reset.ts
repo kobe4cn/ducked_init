@@ -4,7 +4,7 @@
 import { and, count, eq, inArray, sql } from 'drizzle-orm';
 import { recordAudit, type OperatorActor } from './audit';
 import { getDb } from './db/client';
-import { lakeMigrations, tasks, tenantLakes } from './db/schema';
+import { lakeMigrations, sandboxTables, tasks, tenantLakes } from './db/schema';
 import { createCatalogSchema, initTenantCatalog, lakeRow } from './lake';
 import { ACTIVE_MIGRATION } from './lake-migration';
 import { deleteLakeFiles } from './lake-storage';
@@ -35,6 +35,8 @@ export async function resetTenantLake(operator: OperatorActor, tenantId: string)
   await getDb().transaction(async tx => {
     await tx.execute(sql`DROP SCHEMA IF EXISTS ${sql.identifier(lake.catalogSchema)} CASCADE`);
     await createCatalogSchema(tx, lake.catalogSchema, lake.dbRole, lake.roDbRole);
+    // 沙箱表随 catalog 一起没了，登记也删掉（ADR-0036）
+    await tx.delete(sandboxTables).where(eq(sandboxTables.tenantId, tenantId));
   });
   const files = await deleteLakeFiles(lake.dataPath);
   await initTenantCatalog(tenantId, operator);

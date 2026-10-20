@@ -1,20 +1,21 @@
 // test/pipeline/workbench.test.ts —— 数据查询工作台的流水线接缝：成员 runQuery(sql) → 在只读挂载的本租户数据湖上校验并执行 →
 // 返回的列与行、审计日志 workbench.query；交互查询挂起时调度器照常领取并完成正式任务；
-// 查询用本租户的只读 PG 角色与只读对象存储账号，凭据本身就写不进 catalog 与存储
+// 查询用本租户的只读 PG 角色与只读对象存储账号，凭据本身就写不进 catalog 与存储；
+// saveAsSandbox(name, sql) → 可写挂载上 CREATE TABLE sandbox_<成员>.name AS → 平台库 sandbox_tables 与 listSandboxTables、审计 sandbox.save
 import { and, eq, sql } from 'drizzle-orm';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, tenantLakes } from '../../app/.server/db/schema';
+import { auditLogs, sandboxTables, tenantLakes } from '../../app/.server/db/schema';
 import { dropTenantS3Account, ensureReadOnlyLakeAccess, ensureTenantS3Account, lakeRow, readOnlyLakeSpecOf } from '../../app/.server/lake';
 import { deleteTenantS3Account, platformS3 } from '../../app/.server/s3-accounts';
 import { getObject, listObjects, putObject } from '../../app/.server/s3-client';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { enqueueTask, getTask } from '../../app/.server/tasks';
-import { runQuery, WORKBENCH_ROWS } from '../../app/.server/workbench';
+import { listSandboxTables, runQuery, saveAsSandbox, WORKBENCH_ROWS } from '../../app/.server/workbench';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, runTask } from './fixtures';
+import { memberOf, newTenant, onLake, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 
 let acme: string;
@@ -144,6 +145,86 @@ describe('超时、取消与并发', () => {
     expect(await first).toMatch(/查询已取消/);
     expect((await runQuery(member, 'SELECT 1 AS one')).rows).toEqual([[1]]);
   }, 120_000);
+});
+
+const DAY = 86_400_000;
+const sandboxOf = (memberId: string) => `sandbox_${memberId.replace(/-/g, '')}`;
+/** 本租户数据湖里的全部表 */
+const lakeTables = async (tenantId: string) => (await onLake(tenantId, `SELECT table_schema || '.' || table_name AS t FROM information_schema.tables
+  WHERE table_catalog = 'lake' ORDER BY 1`)).map(r => (r as { t: string }).t);
+
+describe('沙箱表', () => {
+  it('保存查询结果为沙箱表：自己能在查询里读、列出（行数、过期时间 = 保存时间 + 7 天），同名覆盖重置过期时间，记审计', async () => {
+    const member = await analyst();
+    const schema = sandboxOf(member.memberId);
+    const saved = await saveAsSandbox(member, 'top_customers', 'SELECT customer_id FROM silver.customer ORDER BY 1 LIMIT 5;');
+    expect(saved).toMatchObject({ name: 'top_customers', rowCount: 5 });
+    expect(saved.expiresAt.getTime() - saved.createdAt.getTime()).toBe(7 * DAY);
+    expect((await runQuery(member, `SELECT count(*) AS n FROM ${schema}.top_customers`)).rows).toEqual([['5']]);
+    expect((await runQuery(member, `SELECT count(*) AS n FROM lake.${schema}."top_customers"`)).rows).toEqual([['5']]);
+    expect((await runQuery(member, 'SHOW TABLES')).rows).toContainEqual([schema, 'top_customers', 'BASE TABLE']);
+
+    // 保存时间往前拨 3 天，同名覆盖后行数与过期时间都重置
+    await getDb().update(sandboxTables).set({ createdAt: new Date(Date.now() - 3 * DAY), expiresAt: new Date(Date.now() + 4 * DAY) })
+      .where(eq(sandboxTables.memberId, member.memberId));
+    const again = await saveAsSandbox(member, 'top_customers', `SELECT * FROM ${schema}.top_customers LIMIT 2`);
+    expect(again.rowCount).toBe(2);
+    const [listed] = await listSandboxTables(member);
+    expect(listed).toMatchObject({ name: 'top_customers', rowCount: 2 });
+    expect(listed.expiresAt.getTime() - listed.createdAt.getTime()).toBe(7 * DAY);
+    expect(Date.now() - listed.createdAt.getTime()).toBeLessThan(60_000);
+    expect(await listSandboxTables(member)).toHaveLength(1);
+
+    const logs = await getDb().select().from(auditLogs).where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'sandbox.save')));
+    expect(logs.at(-1)).toMatchObject({ actorEmail: 'analyst@acme.com', detail: { name: 'top_customers', rows: 2, sql: `SELECT * FROM ${schema}.top_customers LIMIT 2` } });
+  });
+
+  it('写语句、不合规的表名、非 SELECT、读写 silver / gold 之外或他人的沙箱一律被拒，湖中不出现新表，失败也记审计', async () => {
+    const member = await analyst();
+    const other = await memberOf(acme, 'de@acme.com');
+    await saveAsSandbox(other, 'mine', 'SELECT 1 AS x');
+    const before = await lakeTables(acme);
+    const listedBefore = await listSandboxTables(member);
+    const rejected: [string, string, RegExp][] = [
+      ['t', 'CREATE TABLE gold.x AS SELECT 1', /只能执行一条 SELECT/],
+      ['t', 'INSERT INTO silver.customer SELECT * FROM silver.customer', /只能执行一条 SELECT/],
+      ['t', 'SELECT 1; DROP TABLE silver.customer', /只能执行一条 SELECT/],
+      ['t', 'EXPLAIN SELECT 1', /只能把 SELECT/],
+      ['t', 'DESCRIBE silver.customer', /只能把 SELECT/],
+      ['t', 'SHOW TABLES', /只能把 SELECT/],
+      ['t', `SELECT * FROM ${sandboxOf(other.memberId)}.mine`, /不能读 sandbox_/],
+      ['t', "SELECT * FROM read_parquet('/tmp/*.parquet')", /表函数/],
+      ['gold.x', 'SELECT 1', /表名只能用/],
+      ['silver.customer', 'SELECT 1', /表名只能用/],
+      [`${sandboxOf(other.memberId)}.mine`, 'SELECT 1', /表名只能用/],
+      ['Upper', 'SELECT 1', /表名只能用/],
+      ['1abc', 'SELECT 1', /表名只能用/],
+      ['x"; DROP TABLE silver.customer; --', 'SELECT 1', /表名只能用/],
+      ['a'.repeat(64), 'SELECT 1', /表名只能用/],
+      ['', 'SELECT 1', /表名只能用/],
+    ];
+    for (const [name, sql, message] of rejected) expect(await errorOf(saveAsSandbox(member, name, sql)), `${name} ${sql}`).toMatch(message);
+    expect(await lakeTables(acme)).toEqual(before);
+    expect(await listSandboxTables(member)).toEqual(listedBefore);
+    const logs = await getDb().select().from(auditLogs).where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'sandbox.save'), eq(auditLogs.actorEmail, 'analyst@acme.com')));
+    expect(logs.at(-1)!.detail).toMatchObject({ name: '', rows: 0, error: expect.stringMatching(/表名只能用/) });
+    // 别人的沙箱在查询里也读不到
+    expect(await errorOf(runQuery(member, `SELECT * FROM ${sandboxOf(other.memberId)}.mine`))).toMatch(/不能读 sandbox_/);
+  });
+
+  it('查看者没有沙箱权限；其他租户的成员看不到这些表', async () => {
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    await expect(saveAsSandbox(viewer, 't', 'SELECT 1')).rejects.toMatchObject({ init: { status: 403 } });
+    await expect(listSandboxTables(viewer)).rejects.toMatchObject({ init: { status: 403 } });
+
+    const member = await analyst();
+    await saveAsSandbox(member, 'shared_name', 'SELECT 1 AS x');
+    const globex = await newTenant('globex');
+    const outsider = await memberOf(globex, 'analyst@globex.com', 'analyst');
+    expect(await listSandboxTables(outsider)).toEqual([]);
+    expect(await errorOf(runQuery(outsider, `SELECT * FROM ${sandboxOf(member.memberId)}.shared_name`))).toMatch(/不能读 sandbox_/);
+    expect(await lakeTables(globex)).not.toContain(`${sandboxOf(member.memberId)}.shared_name`);
+  });
 });
 
 /** 以给定的 PG 账号连平台库执行 SQL，返回结果或报错信息 */

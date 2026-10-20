@@ -1,5 +1,6 @@
 // test/http/workbench.test.ts —— 数据查询工作台的 HTTP 接缝：分析师、数据工程师在 /workbench 提交 SQL，看到结果表格或拒绝原因；
-// 客户端中止请求即取消查询，同租户已有查询在运行时再提交返回 429。查看者看不到导航、打开与提交都 403
+// 客户端中止请求即取消查询，同租户已有查询在运行时再提交返回 429。查看者看不到导航、打开与提交都 403。
+// 填上表名点「保存」把 SELECT 的结果存为沙箱表，「我的沙箱表」列出自己的表；别人的沙箱读不到
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -68,4 +69,39 @@ describe('数据查询工作台', () => {
     await expect.poll(async () => (await lastAudit())?.detail, { timeout: 20_000 }).toMatchObject({ sql: SLOW, error: '查询已取消' });
     expect((await analyst.post('/workbench', { sql: 'SELECT 1 AS one' })).status).toBe(200);
   }, 60_000);
+});
+
+describe('沙箱表', () => {
+  it('保存 SELECT 结果后列在「我的沙箱表」里并能查询；表名不合规、写语句被拒；别的成员看不到也读不到；查看者 403', async () => {
+    const analyst = await loginAs(app, 'an@acme.com');
+    expect(await (await analyst.get('/workbench')).text()).toContain('还没有沙箱表');
+
+    const saved = await analyst.post('/workbench', { intent: 'save', name: 'my_customers', sql: 'SELECT customer_id FROM silver.customer LIMIT 3' });
+    expect(saved.status).toBe(200);
+    expect(await saved.text()).toContain('已保存沙箱表 my_customers');
+    const page = await (await analyst.get('/workbench')).text();
+    const schema = /(sandbox_[0-9a-f]{32})\.my_customers/.exec(page)?.[1];
+    expect(schema).toBeDefined();
+    expect(page).toMatch(/my_customers<\/td><td[^>]*>3<\/td>/);
+
+    const read = await analyst.post('/workbench', { sql: `SELECT count(*) AS n FROM ${schema}.my_customers` });
+    expect(await read.text()).toContain('1 行');
+
+    const badName = await analyst.post('/workbench', { intent: 'save', name: 'gold.x', sql: 'SELECT 1' });
+    expect(badName.status).toBe(400);
+    expect(await badName.text()).toContain('表名只能用');
+    const write = await analyst.post('/workbench', { intent: 'save', name: 'x', sql: 'CREATE TABLE gold.x AS SELECT 1' });
+    expect(write.status).toBe(400);
+    expect(await write.text()).toContain('只能执行一条 SELECT');
+
+    const engineer = await loginAs(app, 'de@acme.com');
+    const theirs = await (await engineer.get('/workbench')).text();
+    expect(theirs).not.toContain('my_customers');
+    const denied = await engineer.post('/workbench', { sql: `SELECT * FROM ${schema}.my_customers` });
+    expect(denied.status).toBe(400);
+    expect(await denied.text()).toContain(`不能读 ${schema}.my_customers`);
+
+    const viewer = await loginAs(app, 'vi@acme.com');
+    expect((await viewer.post('/workbench', { intent: 'save', name: 'v', sql: 'SELECT 1' })).status).toBe(403);
+  });
 });

@@ -515,6 +515,25 @@ export const snapshots = platform.table('snapshots', {
   uniqueIndex('snapshots_task_uq').on(t.taskId),
 ]);
 
+/** 沙箱表保存后保留的天数 */
+export const SANDBOX_TTL_DAYS = 7;
+
+// 个人沙箱表（ADR-0036）：成员在工作台把查询结果存进湖里自己的 schema sandbox_<成员 ID 去掉横线>，这里只登记元数据。
+// 同名表覆盖时重置行数、保存时间与过期时间（保存后 SANDBOX_TTL_DAYS 天），过期清理后记下 expired_at
+export const sandboxTables = platform.table('sandbox_tables', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  memberId: uuid('member_id').notNull().references(() => members.id, { onDelete: 'cascade' }),
+  /** 沙箱 schema 里的表名（[a-z][a-z0-9_]{0,62}） */
+  name: text('name').notNull(),
+  rowCount: bigint('row_count', { mode: 'number' }).notNull(),
+  createdAt: createdAt(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  expiredAt: timestamp('expired_at', { withTimezone: true }),
+}, t => [
+  uniqueIndex('sandbox_tables_member_name_uq').on(t.tenantId, t.memberId, t.name),
+]);
+
 /** 服务库里放的一张快照：快照 ID、模板、定义版本、登记时间（ISO 字符串）与数据是否不完整 */
 export interface ServingStoreSnapshot { id: string; template: string; definitionVersion: number | null; createdAt: string; incomplete: boolean }
 
