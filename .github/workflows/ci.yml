@@ -7,7 +7,9 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    # 暂用 22.04（内核 6.8）：ubuntu-24.04 镜像 20261018 起内核为 7.0.0，MongoDB 8 在 6.19 ~ 7.0.13 内核上拒绝启动
+    # （SERVER-121912 / SERVER-125742）。24.04 内核到 7.0.14+ 后改回
+    runs-on: ubuntu-22.04
     services:
       postgres:
         image: postgres:17
