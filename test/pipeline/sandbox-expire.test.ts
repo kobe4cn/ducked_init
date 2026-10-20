@@ -4,9 +4,9 @@ import { existsSync } from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { sandboxTables } from '../../app/.server/db/schema';
+import { sandboxTables, tasks } from '../../app/.server/db/schema';
 import { lakeRow } from '../../app/.server/lake';
-import { enqueueDueSandboxExpiries } from '../../app/.server/sandbox';
+import { enqueueDueSandboxExpiries, lockForSave } from '../../app/.server/sandbox';
 import { listSandboxTables, runQuery, sandboxSchema, saveAsSandbox } from '../../app/.server/workbench';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { resetDb } from '../http/harness';
@@ -77,6 +77,42 @@ describe('沙箱表过期', () => {
     // 过期后同名再保存：重新列出
     await saveAsSandbox(analyst, 'filed', ROWS);
     expect((await listSandboxTables(analyst)).map(t => t.name)).toEqual(['filed', 'fresh']);
+  });
+
+  it('过期任务排队时同名保存被拒（别的表名、别的成员照常），清理后可以再存；正在保存的表不入队，保存提交后才入队', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    await saveAsSandbox(analyst, 'old', ROWS);
+    await saveAsSandbox(engineer, 'old', ROWS);
+    await expire(analyst.memberId, 'old');
+    expect(await enqueueDueSandboxExpiries()).toEqual([acme]);
+
+    await expect(saveAsSandbox(analyst, 'old', ROWS)).rejects.toThrow('这张沙箱表已到期、正在清理');
+    await saveAsSandbox(analyst, 'other', ROWS);
+    await saveAsSandbox(engineer, 'old', ROWS);
+    await drain();
+    expect((await listSandboxTables(analyst)).map(t => t.name)).toEqual(['other']);
+    await saveAsSandbox(analyst, 'old', ROWS);
+    expect((await listSandboxTables(analyst)).map(t => t.name)).toEqual(['old', 'other']);
+
+    // 成员保存期间（lockForSave 锁着登记行）调度器检查：跳过这一行；保存的事务结束后才入队
+    await getDb().delete(tasks).where(eq(tasks.tenantId, acme));
+    await expire(analyst.memberId, 'old');
+    let release!: () => void;
+    const locked = new Promise<void>(resolve => { release = resolve; });
+    let held!: () => void;
+    const holding = new Promise<void>(resolve => { held = resolve; });
+    const saving = getDb().transaction(async tx => {
+      expect(await lockForSave(tx, acme, analyst.memberId, 'old')).toBe(true);
+      held();
+      await locked;
+    });
+    await holding;
+    expect(await enqueueDueSandboxExpiries()).toEqual([]);
+    release();
+    await saving;
+    expect(await enqueueDueSandboxExpiries()).toEqual([acme]);
   });
 
   it('sandbox.expire 只认沙箱 schema 里的表名', async () => {

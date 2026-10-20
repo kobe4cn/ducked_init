@@ -1,6 +1,6 @@
 // app/.server/sandbox.ts —— 沙箱表过期（ADR-0036）：沙箱表保存后 SANDBOX_TTL_DAYS 天到期，调度器为有到期沙箱表的租户入队 sandbox.expire，
 // 工作进程删表并清理湖里的旧文件（与快照过期同一套做法，ADR-0020），成功后在平台库标记 expiredAt，工作台不再列出。一律限定在给定租户内
-import { and, eq, inArray, isNull, lte } from 'drizzle-orm';
+import { and, eq, inArray, isNull, lte, sql } from 'drizzle-orm';
 import type { Tx } from './audit';
 import { getDb } from './db/client';
 import { sandboxTables, tasks, tenants } from './db/schema';
@@ -20,6 +20,8 @@ export async function enqueueDueSandboxExpiries(now = new Date()) {
     .innerJoin(tenants, and(eq(tenants.id, sandboxTables.tenantId), isNull(tenants.suspendedAt)))
     .where(and(lte(sandboxTables.expiresAt, now), isNull(sandboxTables.expiredAt), tenantId ? eq(sandboxTables.tenantId, tenantId) : undefined))
     .orderBy(sandboxTables.tenantId, sandboxTables.memberId, sandboxTables.name);
+  // 事务里的那次查询锁住到期的登记行，跳过成员正在同名保存的（lockForSave 锁着，下一次检查再看）
+  const dueLocked = (tx: Tx, tenantId: string) => due(tx, tenantId).for('update', { of: sandboxTables, skipLocked: true });
   const enqueued: string[] = [];
   for (const tenantId of [...new Set((await due(getDb())).map(d => d.tenantId))]) {
     try {
@@ -28,7 +30,7 @@ export async function enqueueDueSandboxExpiries(now = new Date()) {
         await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
         const [pending] = await tx.select({ id: tasks.id }).from(tasks)
           .where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'sandbox.expire'), inArray(tasks.status, ['queued', 'running']))).limit(1);
-        const tables = (await due(tx, tenantId)).map(sandboxLakeName);
+        const tables = (await dueLocked(tx, tenantId)).map(sandboxLakeName);
         if (pending || !tables.length) return null;
         return insertTask(tx, tenantId, 'sandbox.expire', { tables });
       });
@@ -55,4 +57,17 @@ export async function markSandboxExpired(tenantId: string, taskId: string) {
   const ids = due.filter(t => tables.has(sandboxLakeName(t))).map(t => t.id);
   // 更新时再带上到期条件：查询之后成员可能又同名保存（同一行，过期时间已重置）
   if (ids.length) await db.update(sandboxTables).set({ expiredAt: new Date() }).where(and(inArray(sandboxTables.id, ids), stillDue));
+}
+
+/**
+ * 成员同名保存沙箱表之前调用（与保存在同一事务里）：锁住这张表的登记行，本租户有排队或运行中的 sandbox.expire 要删这张表时返回 false，
+ * 不能保存（否则刚存的表会被那个任务删掉）。锁一直持有到保存提交：之后的入队跳过这一行，markSandboxExpired 等提交后按重置的过期时间不再标记
+ */
+export async function lockForSave(tx: Tx, tenantId: string, memberId: string, name: string) {
+  await tx.select({ id: sandboxTables.id }).from(sandboxTables)
+    .where(and(eq(sandboxTables.tenantId, tenantId), eq(sandboxTables.memberId, memberId), eq(sandboxTables.name, name))).for('update');
+  const [pending] = await tx.select({ id: tasks.id }).from(tasks)
+    .where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'sandbox.expire'), inArray(tasks.status, ['queued', 'running']),
+      sql`${tasks.params}->'tables' ? ${sandboxLakeName({ memberId, name })}`)).limit(1);
+  return !pending;
 }

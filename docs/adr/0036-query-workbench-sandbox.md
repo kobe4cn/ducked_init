@@ -31,7 +31,8 @@
 - 平台拼 DDL：`saveAsSandbox(actor, name, sql)` 与查询共用同一把每租户并发锁、同样的超时与取消（`workbench.ts` 的 `inWorkbench`），但用可写凭据挂载（`lakeSpecOf`）。在同一会话里先 `checkWorkbenchSql`（与查询同一份白名单），校验结果必须是一条 SELECT / WITH（EXPLAIN、DESCRIBE、SHOW、SUMMARIZE 不能存），再由 `saveSandboxTable` 拼出 `CREATE OR REPLACE TABLE lake."sandbox_<成员>"."<表名>" AS <校验过的 SQL>`：schema 由成员 ID 算出，表名先过正则再加引号，除此之外不拼进任何成员给的东西；执行前再用 `extractStatements` 确认拼出的仍是一条语句。schema 不存在时先 `CREATE SCHEMA IF NOT EXISTS`。所以写入只会落在成员自己的沙箱里，往 silver / gold / 别人的沙箱写一律做不到。
 - 读：查询白名单的可读 schema 是参数，`runQuery` 加上成员自己的 `sandbox_<成员>`（`SHOW TABLES` 也列出它）；别人的沙箱、其他租户（数据湖本来就隔离）都读不到。只读角色的 `ALTER DEFAULT PRIVILEGES` 覆盖 DuckLake 元数据表，沙箱表只是其中的几行，不需要另外授权。
 - 审计：`sandbox.save` 的详情是 `{ name, sql, durationMs, rows }`，失败时加 `error`，成败都记，与登记同一事务写入。
-- 过期（#239）：调度器每次检查时由 `sandbox.ts` 的 `enqueueDueSandboxExpiries` 为有到期沙箱表（`expires_at` 已到、`expired_at` 为空）的租户入队一个 `sandbox.expire`，参数是表在湖里的全名 `sandbox_<成员>.<表名>`；本租户已有排队或运行中的 `sandbox.expire` 时不再入队，锁住租户行再查一次，多个调度器同时检查也不重复。工作进程用可写凭据挂载，handler 只认 `^sandbox_[0-9a-f]{32}\.[a-z][a-z0-9_]{0,62}$`（防注入的最后一道），`DROP TABLE IF EXISTS` 后与 `gold.expire` 共用同一段过期 DuckLake 快照、清理旧文件（ADR-0020），已删的表跳过，重复执行不报错。成功后调度器调 `markSandboxExpired` 记 `expired_at`，只标记入队时已到期的登记；工作台列表不再列出，查询读不到（表已不在）。不触发服务库重建（沙箱表不进服务库）。
+- 过期（#239）：调度器每次检查时由 `sandbox.ts` 的 `enqueueDueSandboxExpiries` 为有到期沙箱表（`expires_at` 已到、`expired_at` 为空）的租户入队一个 `sandbox.expire`，参数是表在湖里的全名 `sandbox_<成员>.<表名>`；本租户已有排队或运行中的 `sandbox.expire` 时不再入队，锁住租户行再查一次，多个调度器同时检查也不重复；再查时 `FOR UPDATE SKIP LOCKED` 锁住到期的登记行，跳过成员正在同名保存的行。工作进程用可写凭据挂载，handler 只认 `^sandbox_[0-9a-f]{32}\.[a-z][a-z0-9_]{0,62}$`（防注入的最后一道），`DROP TABLE IF EXISTS` 后与 `gold.expire` 共用同一段过期 DuckLake 快照、清理旧文件（ADR-0020），已删的表跳过，重复执行不报错。成功后调度器调 `markSandboxExpired` 记 `expired_at`，只标记入队时已到期的登记；工作台列表不再列出，查询读不到（表已不在）。不触发服务库重建（沙箱表不进服务库）。
+- 过期与同名保存：工作进程只按表名删表，不回查平台库，所以由保存一侧让开。`saveAsSandbox` 在湖里建表之前先 `lockForSave`：锁住这张表的登记行（持有到保存提交），本租户有排队或运行中的 `sandbox.expire` 参数里带这张表时拒绝保存（「这张沙箱表已到期、正在清理」），清理完再存或换个表名。先锁行再查任务：入队先拿到行锁时保存看得到这个任务；保存先拿到时入队跳过这一行，保存提交后过期时间已重置，不再到期；`markSandboxExpired` 的 UPDATE 等到保存提交后按重置的过期时间不再命中。
 - 沙箱 schema 不进结果快照与服务库（ADR-0033 只收 `gold`），分析页只看 `snapshots` 登记的表；湖迁移的清单（`inventory`）照常带上它们，迁移不丢数据。
 
 ## 已接受的取舍
@@ -45,7 +46,8 @@
 - 结果不导出、不缓存（响应 `Cache-Control: no-store`），刷新页面就没了；要留下来就存成沙箱表。
 - 存沙箱表用可写凭据，挡写入的是白名单与平台拼的 DDL，不是凭据；凭据层面一个成员能写整个湖。拆出每个成员的写角色要改 DuckLake 的 catalog 权限模型，不值得。
 - 到期到清理之间（最长一个调度检查周期，再加任务排队）表仍可读、仍列在页面上。
-- 入队过期之后、任务删表之前成员又同名保存：新表会被删掉，而登记的过期时间已重置、不会被标记，页面列着一张已不在的表，直到再次同名保存。窗口只有一个调度周期，沙箱表本来就是临时的，不为此在工作进程里核对平台库。
+- 到期表在清理完之前不能同名保存（最长一个调度周期加排队），成员要等一会或换个表名。
+- 保存持有登记行的锁最长 60 秒：期间这张表不会入队过期，`markSandboxExpired` 等它提交。
 - 过期清理不记审计：任务本身就是记录，与快照过期一致。
 - 平台库登记在湖里建表之后、同一 PG 事务里写入；登记失败时湖里留下一张没登记的表，下次同名保存会覆盖它。
 - `EXPLAIN ANALYZE` 会真的执行查询，照样受超时约束。

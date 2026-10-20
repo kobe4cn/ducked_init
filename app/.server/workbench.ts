@@ -15,6 +15,7 @@ import { openTenantLake, redactLakeSecrets, type LakeSpec, type TenantLakeSessio
 import {
   checkWorkbenchSql, normalizeWorkbenchSql, runWorkbenchQuery, sandboxSchema, saveSandboxTable, WorkbenchSqlError, type WorkbenchResult,
 } from './pipeline/workbench-engine';
+import { lockForSave } from './sandbox';
 
 export { SANDBOX_TTL_DAYS } from './db/schema';
 export { sandboxSchema } from './pipeline/workbench-engine';
@@ -65,7 +66,7 @@ export interface SandboxTable { name: string; rowCount: number; createdAt: Date;
 /**
  * 把一条 SELECT 的结果存为成员沙箱里的表 name（湖里的 sandbox_<成员>.name；同名表覆盖，过期时间重新从现在算起），返回登记的表。
  * 在本租户可写挂载的数据湖上、与工作台查询同一把并发锁下执行：先按工作台白名单校验，再由平台拼出 CREATE 语句。
- * 成功、失败都记审计 sandbox.save；出错时与 runQuery 一样抛出 WorkbenchError
+ * 同名表已到期、正在过期清理时拒绝（lockForSave）。成功、失败都记审计 sandbox.save；出错时与 runQuery 一样抛出 WorkbenchError
  */
 export async function saveAsSandbox(
   actor: CurrentMember, name: string, rawSql: string, signal?: AbortSignal, { timeoutMs = WORKBENCH_TIMEOUT_MS }: { timeoutMs?: number } = {},
@@ -73,6 +74,7 @@ export async function saveAsSandbox(
   const query = normalizeWorkbenchSql(rawSql);
   const schema = sandboxSchema(actor.memberId);
   return inWorkbench(actor, { signal, timeoutMs, readOnly: false }, async ({ session, throwIfStopped, tx }) => {
+    if (!await lockForSave(tx, actor.tenant.id, actor.memberId, name)) throw new WorkbenchSqlError('这张沙箱表已到期、正在清理，请稍后再保存或换个表名');
     const checked = await checkWorkbenchSql(session.con, query, { sandbox: schema });
     throwIfStopped();
     const rowCount = await saveSandboxTable(session.con, schema, name, checked);
