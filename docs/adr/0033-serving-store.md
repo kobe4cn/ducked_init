@@ -2,7 +2,7 @@
 
 接口要按 `consumer_id` 点查标签、指标与 RFM（#14）。每次请求都挂载 DuckLake、查结果层的快照表太慢，也让 API 节点要拿 catalog 的连接；ADR-0002 已允许「面向接口的服务库是从结果层派生的只读副本，可随时重建」。2026-10-14 与产品确认了下面这些取舍。
 
-**内容。** 只放租户每个已发布定义（RFM、各指标、各标签）最新、未过期的快照，不放标准层或原始层的任何表。表都按 `consumer_id` 排序写入（点查时 DuckDB 的 zone map 能跳过大部分行组）：
+**内容。** 只放租户每个已发布定义（RFM、各指标、各标签）最新、未过期的快照，不放标准层或原始层的任何表，也不放成员的沙箱表（不论是否分享，ADR-0036）。表都按 `consumer_id` 排序写入（点查时 DuckDB 的 zone map 能跳过大部分行组）：
 
 - `tags(consumer_id, tag, tag_value)`：`tag` 是标签的键
 - `metrics(consumer_id, metric, dims JSON, value DOUBLE)`：维度列名各指标不同，按快照表的实际列（除 `consumer_id`、`value`）拼成 `dims`，无维度时是 `{}`；`value` 统一成 `DOUBLE`

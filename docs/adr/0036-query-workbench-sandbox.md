@@ -29,11 +29,18 @@
 **沙箱表（#238）。** 成员可以把一条 SELECT 的结果存成自己的沙箱表，之后在查询里接着用：
 - 存储与命名：表在本租户数据湖里，每个成员一个 schema `sandbox_<成员 ID 去掉横线>`（`workbench-engine.ts` 的 `sandboxSchema`；UUID 的横线不能出现在不加引号的标识符里）。表名只允许 `[a-z][a-z0-9_]{0,62}`，同名表覆盖。平台库 `sandbox_tables` 登记 `(租户, 成员, 表名)` 唯一的一行：行数、保存时间与过期时间（保存后 7 天，`SANDBOX_TTL_DAYS`），覆盖时三者一起重置；过期清理后记下 `expired_at`。页面「我的沙箱表」只列自己的、未过期的表。重置数据湖（`lake:reset`）删掉 catalog 时一并删掉本租户的登记。
 - 平台拼 DDL：`saveAsSandbox(actor, name, sql)` 与查询共用同一把每租户并发锁、同样的超时与取消（`workbench.ts` 的 `inWorkbench`），但用可写凭据挂载（`lakeSpecOf`）。在同一会话里先 `checkWorkbenchSql`（与查询同一份白名单），校验结果必须是一条 SELECT / WITH（EXPLAIN、DESCRIBE、SHOW、SUMMARIZE 不能存），再由 `saveSandboxTable` 拼出 `CREATE OR REPLACE TABLE lake."sandbox_<成员>"."<表名>" AS <校验过的 SQL>`：schema 由成员 ID 算出，表名先过正则再加引号，除此之外不拼进任何成员给的东西；执行前再用 `extractStatements` 确认拼出的仍是一条语句。schema 不存在时先 `CREATE SCHEMA IF NOT EXISTS`。所以写入只会落在成员自己的沙箱里，往 silver / gold / 别人的沙箱写一律做不到。
-- 读：查询白名单的可读 schema 是参数，`runQuery` 加上成员自己的 `sandbox_<成员>`（`SHOW TABLES` 也列出它）；别人的沙箱、其他租户（数据湖本来就隔离）都读不到。只读角色的 `ALTER DEFAULT PRIVILEGES` 覆盖 DuckLake 元数据表，沙箱表只是其中的几行，不需要另外授权。
+- 读：查询白名单的可读 schema 是参数，`runQuery` 加上成员自己的 `sandbox_<成员>`（`SHOW TABLES` 也列出它）；别人没分享的沙箱、其他租户（数据湖本来就隔离）都读不到。只读角色的 `ALTER DEFAULT PRIVILEGES` 覆盖 DuckLake 元数据表，沙箱表只是其中的几行，不需要另外授权。
 - 审计：`sandbox.save` 的详情是 `{ name, sql, durationMs, rows }`，失败时加 `error`，成败都记，与登记同一事务写入。
 - 过期（#239）：调度器每次检查时由 `sandbox.ts` 的 `enqueueDueSandboxExpiries` 为有到期沙箱表（`expires_at` 已到、`expired_at` 为空）的租户入队一个 `sandbox.expire`，参数是表在湖里的全名 `sandbox_<成员>.<表名>`；本租户已有排队或运行中的 `sandbox.expire` 时不再入队，锁住租户行再查一次，多个调度器同时检查也不重复；再查时 `FOR UPDATE SKIP LOCKED` 锁住到期的登记行，跳过成员正在同名保存的行。工作进程用可写凭据挂载，handler 只认 `^sandbox_[0-9a-f]{32}\.[a-z][a-z0-9_]{0,62}$`（防注入的最后一道），`DROP TABLE IF EXISTS` 后与 `gold.expire` 共用同一段过期 DuckLake 快照、清理旧文件（ADR-0020），已删的表跳过，重复执行不报错。成功后调度器调 `markSandboxExpired` 记 `expired_at`，只标记入队时已到期的登记；工作台列表不再列出，查询读不到（表已不在）。不触发服务库重建（沙箱表不进服务库）。
 - 过期与同名保存：工作进程只按表名删表，不回查平台库，所以由保存一侧让开。`saveAsSandbox` 在湖里建表之前先 `lockForSave`：锁住这张表的登记行（持有到保存提交），本租户有排队或运行中的 `sandbox.expire` 参数里带这张表时拒绝保存（「这张沙箱表已到期、正在清理」），清理完再存或换个表名。先锁行再查任务：入队先拿到行锁时保存看得到这个任务；保存先拿到时入队跳过这一行，保存提交后过期时间已重置，不再到期；`markSandboxExpired` 的 UPDATE 等到保存提交后按重置的过期时间不再命中。
 - 沙箱 schema 不进结果快照与服务库（ADR-0033 只收 `gold`），分析页只看 `snapshots` 登记的表；湖迁移的清单（`inventory`）照常带上它们，迁移不丢数据。
+
+**分享（#240）。** 表的主人可以把一张沙箱表只读分享给本租户的成员，也可以撤销：
+- 登记：平台库 `sandbox_shares(table_id → sandbox_tables, member_id → members, created_at)`，`(table_id, member_id)` 唯一。`shareSandboxTable(actor, name, email)` / `unshareSandboxTable` 只认成员自己、未过期的表（锁住登记行，与过期标记互斥），对方按邮箱在本租户里找：其他租户的成员、不存在的人、查看者（没有 `sandbox` 权限）、自己都 400；表已到期（还没清理）不能再分享。成功的分享 / 撤销与登记同一事务记审计 `sandbox.share` / `sandbox.unshare`，详情 `{ name, member }`；被拒的不记。页面「我的沙箱表」每行列出分享给了谁并可撤销，「分享给我的」列出主人、`sandbox_<主人>.<表名>` 与过期时间。
+- 读：白名单的允许集合在 schema 级之外加上表级的 `shared: [{ schema, table }]`。`runQuery` 与 `saveAsSandbox` 每次都在并发锁的事务里现查分享给自己、表未过期（`expired_at` 为空）、主人仍是本租户成员的表，不缓存；被分享人降为查看者时连工作台都进不了（403），被移出租户时分享随成员行级联删除。`SHOW TABLES` 一并列出分享来的表。引用别的 `sandbox_*` schema 里没分享的表时，表在与不在都报「表 … 不存在或没有权限」，不泄露别人有哪些表。
+- 写：被分享人只能读。查询本来就只放行只读语句、用只读凭据挂载；`saveAsSandbox` 的目标 schema 永远由当前成员 ID 算出，同名另存只会存进自己的沙箱，盖不到主人的表。
+- 过期：`markSandboxExpired` 标记过期时同一事务删掉这些表的分享，主人之后同名再保存是一张新表，不沿用旧分享。
+- 外部系统：`/api/v1/*` 没有通往沙箱的路径，服务库只收 `gold` 快照（ADR-0033），分享与否都一样。
 
 ## 已接受的取舍
 
@@ -49,5 +56,9 @@
 - 到期表在清理完之前不能同名保存（最长一个调度周期加排队），成员要等一会或换个表名。
 - 保存持有登记行的锁最长 60 秒：期间这张表不会入队过期，`markSandboxExpired` 等它提交。
 - 过期清理不记审计：任务本身就是记录，与快照过期一致。
+- 分享按表名记在登记行上：主人同名覆盖（未过期时同一行）后，被分享人读到的是新内容，分享不重新确认。
+- 被分享人降为查看者再恢复角色后，之前的分享照样生效（读时按当前角色判断，降级时不删分享）；主人被降为查看者时分享出去的表仍可读，直到过期。
+- 读分享来的表到期到清理之间仍可读，与主人自己一致；只是不能再分享。
+- 只读分享挡不住复制：被分享人可以把 `SELECT * FROM` 分享来的表存进自己的沙箱再分享出去，撤销分享收不回已经复制走的数据。数据始终留在本租户内、照样 7 天过期，每一步都有 `sandbox.save` / `sandbox.share` 审计可查。
 - 平台库登记在湖里建表之后、同一 PG 事务里写入；登记失败时湖里留下一张没登记的表，下次同名保存会覆盖它。
 - `EXPLAIN ANALYZE` 会真的执行查询，照样受超时约束。

@@ -534,6 +534,18 @@ export const sandboxTables = platform.table('sandbox_tables', {
   uniqueIndex('sandbox_tables_member_name_uq').on(t.tenantId, t.memberId, t.name),
 ]);
 
+// 沙箱表的只读分享（ADR-0036）：表的主人分享给本租户有沙箱权限的成员，被分享人在工作台能读、不能写。
+// 读的时候再按被分享人当前的角色判断；表过期清理时一并删掉它的分享
+export const sandboxShares = platform.table('sandbox_shares', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tableId: uuid('table_id').notNull().references(() => sandboxTables.id, { onDelete: 'cascade' }),
+  memberId: uuid('member_id').notNull().references(() => members.id, { onDelete: 'cascade' }),
+  createdAt: createdAt(),
+}, t => [
+  uniqueIndex('sandbox_shares_table_member_uq').on(t.tableId, t.memberId),
+  index('sandbox_shares_member_idx').on(t.memberId),
+]);
+
 /** 服务库里放的一张快照：快照 ID、模板、定义版本、登记时间（ISO 字符串）与数据是否不完整 */
 export interface ServingStoreSnapshot { id: string; template: string; definitionVersion: number | null; createdAt: string; incomplete: boolean }
 

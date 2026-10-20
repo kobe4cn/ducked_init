@@ -1,5 +1,5 @@
 // test/pipeline/sandbox-expire.test.ts —— 沙箱表过期的流水线接缝：saveAsSandbox 存下的沙箱表到期（直接把 expiresAt 改到过去）→ enqueueDueSandboxExpiries →
-// 调度器派发 sandbox.expire → 湖里的表、parquet 文件与内联在 catalog 的行、平台元数据里的 expiredAt、工作台的列表与查询
+// 调度器派发 sandbox.expire → 湖里的表、parquet 文件与内联在 catalog 的行、平台元数据里的 expiredAt 与分享、工作台的列表与查询
 import { existsSync } from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -7,7 +7,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { sandboxTables, tasks } from '../../app/.server/db/schema';
 import { lakeRow } from '../../app/.server/lake';
 import { enqueueDueSandboxExpiries, lockForSave } from '../../app/.server/sandbox';
-import { listSandboxTables, runQuery, sandboxSchema, saveAsSandbox } from '../../app/.server/workbench';
+import { listSandboxTables, listSharedWithMe, runQuery, sandboxSchema, saveAsSandbox, shareSandboxTable } from '../../app/.server/workbench';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, onLake, runTask } from './fixtures';
@@ -43,6 +43,8 @@ describe('沙箱表过期', () => {
       SELECT i.table_name FROM ${m}.ducklake_inlined_data_tables i JOIN ${m}.ducklake_table t USING (table_id)
       JOIN ${m}.ducklake_schema s USING (schema_id) WHERE s.schema_name = '${mine}' AND t.table_name = 'inlined'`);
     expect(await inlinedData()).toHaveLength(1);
+    await shareSandboxTable(analyst, 'filed', 'de@acme.com');
+    await shareSandboxTable(analyst, 'fresh', 'de@acme.com');
 
     await expire(analyst.memberId, 'filed');
     await expire(analyst.memberId, 'inlined');
@@ -70,6 +72,8 @@ describe('沙箱表过期', () => {
     expect((await listSandboxTables(engineer)).map(t => t.name)).toEqual(['filed']);
     await expect(runQuery(analyst, `SELECT * FROM ${mine}.filed`)).rejects.toThrow();
     expect((await runQuery(analyst, `SELECT count(*) AS n FROM ${mine}.fresh`)).rows).toEqual([['3']]);
+    // 过期的表的分享一并删掉
+    expect((await listSharedWithMe(engineer)).map(t => t.name)).toEqual(['fresh']);
 
     expect(await enqueueDueSandboxExpiries()).toEqual([]);
     expect(await runTask(acme, 'sandbox.expire', { tables: [`${mine}.filed`] })).toMatchObject({ status: 'succeeded' });
@@ -77,6 +81,9 @@ describe('沙箱表过期', () => {
     // 过期后同名再保存：重新列出
     await saveAsSandbox(analyst, 'filed', ROWS);
     expect((await listSandboxTables(analyst)).map(t => t.name)).toEqual(['filed', 'fresh']);
+    // 同名再保存的是新表，不沿用过期前的分享
+    expect((await listSharedWithMe(engineer)).map(t => t.name)).toEqual(['fresh']);
+    await expect(runQuery(engineer, `SELECT * FROM ${mine}.filed`)).rejects.toThrow('不存在或没有权限');
   });
 
   it('过期任务排队时同名保存被拒（别的表名、别的成员照常），清理后可以再存；正在保存的表不入队，保存提交后才入队', async () => {

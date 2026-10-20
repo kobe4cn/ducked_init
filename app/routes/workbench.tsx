@@ -1,12 +1,16 @@
 // app/routes/workbench.tsx —— 数据查询工作台（有沙箱权限的分析师、数据工程师，ADR-0036）：写一条只读 SQL，在本租户只读挂载的数据湖上执行，
-// 只能读标准层 silver、结果层 gold 与自己的沙箱，结果最多 1 万行、不导出；执行中可以取消（中止请求即中断查询），每次查询都记进审计日志。
-// 填上表名可以把 SELECT 的结果保存为个人沙箱表（SANDBOX_TTL_DAYS 天后过期），「我的沙箱表」列出表名、行数与过期时间
+// 只能读标准层 silver、结果层 gold、自己的沙箱与分享给自己的沙箱表，结果最多 1 万行、不导出；执行中可以取消（中止请求即中断查询），每次查询都记进审计日志。
+// 填上表名可以把 SELECT 的结果保存为个人沙箱表（SANDBOX_TTL_DAYS 天后过期），「我的沙箱表」列出表名、行数、过期时间与分享给了谁，
+// 可以按邮箱分享给本租户有沙箱权限的成员或撤销；「分享给我的」列出别人分享来的表（只读，在查询里按 sandbox_<主人>.<表名> 读）
 import { data, Form, Link, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleAlert } from 'lucide-react';
 import type { Route } from './+types/workbench';
 import { requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
-import { listSandboxTables, runQuery, SANDBOX_TTL_DAYS, sandboxSchema, saveAsSandbox, WORKBENCH_ROWS, WORKBENCH_TIMEOUT_MS, WorkbenchError } from '~/.server/workbench';
+import {
+  listSandboxTables, listSharedWithMe, runQuery, SANDBOX_TTL_DAYS, sandboxSchema, saveAsSandbox, shareSandboxTable, unshareSandboxTable,
+  WORKBENCH_ROWS, WORKBENCH_TIMEOUT_MS, WorkbenchError,
+} from '~/.server/workbench';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
@@ -26,7 +30,8 @@ export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sandbox');
   return {
     email: member.email, nav: navFor(member), maxRows: WORKBENCH_ROWS, timeoutSeconds: WORKBENCH_TIMEOUT_MS / 1000,
-    sandbox: sandboxSchema(member.memberId), sandboxTables: await listSandboxTables(member), ttlDays: SANDBOX_TTL_DAYS,
+    sandbox: sandboxSchema(member.memberId), sandboxTables: await listSandboxTables(member), sharedWithMe: await listSharedWithMe(member),
+    ttlDays: SANDBOX_TTL_DAYS,
   };
 }
 
@@ -35,25 +40,35 @@ export async function action({ request }: Route.ActionArgs) {
   const form = await request.formData();
   const sql = String(form.get('sql') ?? '');
   const name = String(form.get('name') ?? '').trim();
-  const save = form.get('intent') === 'save';
+  const intent = String(form.get('intent') ?? 'query');
+  const email = String(form.get('email') ?? '');
   try {
-    if (save) return { sql, name, saved: await saveAsSandbox(member, name, sql, request.signal) };
+    if (intent === 'save') return { sql, name, saved: await saveAsSandbox(member, name, sql, request.signal) };
+    if (intent === 'share') {
+      return { sql: '', name: '', notice: `已把 ${name} 分享给 ${await shareSandboxTable(member, name, email)}` };
+    }
+    if (intent === 'unshare') {
+      return { sql: '', name: '', notice: `已撤销 ${name} 对 ${await unshareSandboxTable(member, name, email)} 的分享` };
+    }
     return { sql, name, result: await runQuery(member, sql, request.signal) };
   } catch (e) {
-    if (e instanceof WorkbenchError) return data({ sql, name, save, error: e.message }, { status: e.status });
+    if (e instanceof WorkbenchError) return data({ sql, name, intent, error: e.message }, { status: e.status });
     throw e;
   }
 }
 
 const dateTime = (d: Date | string) => new Date(d).toLocaleString('zh-CN', { hour12: false });
 
+const ERROR_TITLES: Record<string, string> = { save: '沙箱表没有保存', share: '没有分享', unshare: '没有撤销分享' };
+
 const cell = (v: unknown) => (v === null || v === undefined ? 'NULL' : typeof v === 'object' ? JSON.stringify(v) : String(v));
 
 export default function Workbench({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, maxRows, timeoutSeconds, sandbox, sandboxTables, ttlDays } = loaderData;
+  const { email, nav, maxRows, timeoutSeconds, sandbox, sandboxTables, sharedWithMe, ttlDays } = loaderData;
   const running = useNavigation().state === 'submitting';
   const result = actionData && 'result' in actionData ? actionData.result : null;
   const saved = actionData && 'saved' in actionData ? actionData.saved : null;
+  const notice = actionData && 'notice' in actionData ? actionData.notice : null;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -93,10 +108,17 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
         </Alert>
       )}
 
+      {notice && (
+        <Alert role="status" data-sandbox-shared>
+          <CheckCircle2 className="text-emerald-600" />
+          <AlertTitle>{notice}</AlertTitle>
+        </Alert>
+      )}
+
       {actionData && 'error' in actionData && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />
-          <AlertTitle>{actionData.save ? '沙箱表没有保存' : '查询没有完成'}</AlertTitle>
+          <AlertTitle>{ERROR_TITLES[actionData.intent] ?? '查询没有完成'}</AlertTitle>
           <AlertDescription>{actionData.error}</AlertDescription>
         </Alert>
       )}
@@ -142,6 +164,7 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                 <TableHead>行数</TableHead>
                 <TableHead>保存时间</TableHead>
                 <TableHead>过期时间</TableHead>
+                <TableHead>分享给</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -150,6 +173,48 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                   <TableCell className="font-mono">{`${sandbox}.${t.name}`}</TableCell>
                   <TableCell>{t.rowCount.toLocaleString('zh-CN')}</TableCell>
                   <TableCell>{dateTime(t.createdAt)}</TableCell>
+                  <TableCell>{dateTime(t.expiresAt)}</TableCell>
+                  <TableCell className="space-y-2">
+                    {t.sharedWith.map(member => (
+                      <Form method="post" key={member} className="flex items-center gap-2">
+                        <input type="hidden" name="name" value={t.name} />
+                        <input type="hidden" name="email" value={member} />
+                        <span>{member}</span>
+                        <Button type="submit" name="intent" value="unshare" variant="outline" size="sm">撤销</Button>
+                      </Form>
+                    ))}
+                    <Form method="post" className="flex items-center gap-2">
+                      <input type="hidden" name="name" value={t.name} />
+                      <Input name="email" type="email" required placeholder="成员邮箱" aria-label={`把 ${t.name} 分享给`} className="h-8 w-48" />
+                      <Button type="submit" name="intent" value="share" variant="outline" size="sm">分享</Button>
+                    </Form>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+        <p className="text-sm text-slate-400">只能分享给本租户有沙箱权限的成员（查看者除外）。对方只能读，不能改，表过期后分享随之失效。</p>
+      </div>
+
+      <div className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm" data-shared-with-me>
+        <h2 className="text-base font-semibold">分享给我的</h2>
+        {sharedWithMe.length === 0 ? (
+          <p className="text-sm text-slate-500">还没有人分享沙箱表给你。别人分享后，表会列在这里，可以在查询里只读。</p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>主人</TableHead>
+                <TableHead>表名</TableHead>
+                <TableHead>过期时间</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {sharedWithMe.map(t => (
+                <TableRow key={`${t.schema}.${t.name}`}>
+                  <TableCell>{t.owner}</TableCell>
+                  <TableCell className="font-mono">{`${t.schema}.${t.name}`}</TableCell>
                   <TableCell>{dateTime(t.expiresAt)}</TableCell>
                 </TableRow>
               ))}

@@ -192,7 +192,7 @@ describe('沙箱表', () => {
       ['t', 'EXPLAIN SELECT 1', /只能把 SELECT/],
       ['t', 'DESCRIBE silver.customer', /只能把 SELECT/],
       ['t', 'SHOW TABLES', /只能把 SELECT/],
-      ['t', `SELECT * FROM ${sandboxOf(other.memberId)}.mine`, /不能读 sandbox_/],
+      ['t', `SELECT * FROM ${sandboxOf(other.memberId)}.mine`, /不存在或没有权限/],
       ['t', "SELECT * FROM read_parquet('/tmp/*.parquet')", /表函数/],
       ['gold.x', 'SELECT 1', /表名只能用/],
       ['silver.customer', 'SELECT 1', /表名只能用/],
@@ -209,7 +209,7 @@ describe('沙箱表', () => {
     const logs = await getDb().select().from(auditLogs).where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'sandbox.save'), eq(auditLogs.actorEmail, 'analyst@acme.com')));
     expect(logs.at(-1)!.detail).toMatchObject({ name: '', rows: 0, error: expect.stringMatching(/表名只能用/) });
     // 别人的沙箱在查询里也读不到
-    expect(await errorOf(runQuery(member, `SELECT * FROM ${sandboxOf(other.memberId)}.mine`))).toMatch(/不能读 sandbox_/);
+    expect(await errorOf(runQuery(member, `SELECT * FROM ${sandboxOf(other.memberId)}.mine`))).toMatch(/不存在或没有权限/);
   });
 
   it('查看者没有沙箱权限；其他租户的成员看不到这些表', async () => {
@@ -222,7 +222,7 @@ describe('沙箱表', () => {
     const globex = await newTenant('globex');
     const outsider = await memberOf(globex, 'analyst@globex.com', 'analyst');
     expect(await listSandboxTables(outsider)).toEqual([]);
-    expect(await errorOf(runQuery(outsider, `SELECT * FROM ${sandboxOf(member.memberId)}.shared_name`))).toMatch(/不能读 sandbox_/);
+    expect(await errorOf(runQuery(outsider, `SELECT * FROM ${sandboxOf(member.memberId)}.shared_name`))).toMatch(/不存在或没有权限/);
     expect(await lakeTables(globex)).not.toContain(`${sandboxOf(member.memberId)}.shared_name`);
   });
 });

@@ -1,8 +1,9 @@
 // test/http/api.test.ts —— 外部系统接口的 HTTP 接缝：管理员在「API Key」页创建（明文只展示一次）、吊销；外部系统带 Bearer Key 调 /api/v1/catalog。
 // 非管理员看不到页面；没有 Key、Key 错误、已吊销、租户已暂停一律同样的 401，成员的 cookie 不算数；A 租户管理员吊销不了 B 的 Key，各自的 Key 只看到本租户的目录。
 // 点查 /api/v1/consumers/:id：数据由身份打通夹具、RFM 与已发布的指标、标签跑出快照，调度器自动生成服务库；?snapshot= 只读查湖里那张快照表。
-// Bearer Key 打不开成员页面，也没有通往标准层、沙箱的接口
+// Bearer Key 打不开成员页面，也没有通往标准层、沙箱的接口；成员存下（并分享出去）的沙箱表不进服务库，也不出现在目录接口里
 import { randomUUID } from 'node:crypto';
+import { DuckDBInstance } from '@duckdb/node-api';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { sha256 } from '../../app/.server/auth';
@@ -12,9 +13,11 @@ import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } f
 import { lakeRow } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { servingPath } from '../../app/.server/pipeline/serving-engine';
-import { currentServingStore } from '../../app/.server/serving-store';
+import { tenantServingKey } from '../../app/.server/secrets';
+import { currentServingStore, enqueueServingBuild } from '../../app/.server/serving-store';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { suspendTenant } from '../../app/.server/tenants';
+import { saveAsSandbox, shareSandboxTable } from '../../app/.server/workbench';
 import { memberOf, newTenant, onLake, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
@@ -345,5 +348,40 @@ describe('点查的隔离', () => {
       expect((await call(path, key)).status, path).toBe(404);
     }
     expect(await getDb().select().from(tasks).where(eq(tasks.tenantId, acme))).toEqual([]);
+  });
+
+  it('有沙箱表（分享出去的也一样）时，重建的服务库与目录接口里都没有它', async () => {
+    const { acme, store, key } = await servedTenant();
+    const analyst = await memberOf(acme, 'an@acme.com', 'analyst');
+    await memberOf(acme, 'de2@acme.com', 'data_engineer');
+    await saveAsSandbox(analyst, 'leak_probe', "SELECT 'sandbox_only' AS segment");
+    await shareSandboxTable(analyst, 'leak_probe', 'de2@acme.com');
+    await enqueueServingBuild(acme);
+    await drain();
+
+    const next = (await currentServingStore(acme))!;
+    expect(next.version).toBeGreaterThan(store.version);
+    const builds = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'serving.build')));
+    expect(JSON.stringify(builds.map(t => t.params))).not.toMatch(/sandbox|leak_probe/);
+    expect(JSON.stringify(next.snapshots)).not.toMatch(/sandbox|leak_probe/);
+
+    const instance = await DuckDBInstance.create(':memory:');
+    const con = await instance.connect();
+    try {
+      await con.run(`ATTACH '${next.path}' AS s (READ_ONLY, ENCRYPTION_KEY '${await tenantServingKey(acme)}')`);
+      const tables = (await con.runAndReadAll(`SELECT table_schema || '.' || table_name AS t FROM information_schema.tables WHERE table_catalog = 's'`))
+        .getRowObjectsJson().map(r => String(r.t));
+      expect(tables.length).toBeGreaterThan(0);
+      expect(tables.filter(t => /sandbox|leak_probe/.test(t))).toEqual([]);
+      const segments = (await con.runAndReadAll(`SELECT count(*) AS n FROM s.rfm WHERE segment = 'sandbox_only'`)).getRowObjectsJson();
+      expect(segments).toEqual([{ n: '0' }]);
+    } finally {
+      con.closeSync();
+      instance.closeSync();
+    }
+
+    const catalog = await call('/api/v1/catalog', key);
+    expect(catalog.status).toBe(200);
+    expect(await catalog.text()).not.toMatch(/sandbox|leak_probe/);
   });
 });

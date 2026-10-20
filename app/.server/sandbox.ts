@@ -1,9 +1,9 @@
 // app/.server/sandbox.ts —— 沙箱表过期（ADR-0036）：沙箱表保存后 SANDBOX_TTL_DAYS 天到期，调度器为有到期沙箱表的租户入队 sandbox.expire，
-// 工作进程删表并清理湖里的旧文件（与快照过期同一套做法，ADR-0020），成功后在平台库标记 expiredAt，工作台不再列出。一律限定在给定租户内
+// 工作进程删表并清理湖里的旧文件（与快照过期同一套做法，ADR-0020），成功后在平台库标记 expiredAt 并删掉它的分享，工作台不再列出。一律限定在给定租户内
 import { and, eq, inArray, isNull, lte, sql } from 'drizzle-orm';
 import type { Tx } from './audit';
 import { getDb } from './db/client';
-import { sandboxTables, tasks, tenants } from './db/schema';
+import { sandboxShares, sandboxTables, tasks, tenants } from './db/schema';
 import { sandboxSchema } from './pipeline/workbench-engine';
 import { insertTask } from './tasks';
 
@@ -43,7 +43,7 @@ export async function enqueueDueSandboxExpiries(now = new Date()) {
 }
 
 /**
- * sandbox.expire 成功后把它删掉的沙箱表标记为已过期；任务没有成功时什么也不做。
+ * sandbox.expire 成功后把它删掉的沙箱表标记为已过期，并删掉这些表的分享（之后同名再保存是一张新表，不沿用旧分享）；任务没有成功时什么也不做。
  * 只标记入队时已到期的登记：入队之后成员又同名保存的（过期时间已重置）不标记
  */
 export async function markSandboxExpired(tenantId: string, taskId: string) {
@@ -56,7 +56,11 @@ export async function markSandboxExpired(tenantId: string, taskId: string) {
   const due = await db.select({ id: sandboxTables.id, memberId: sandboxTables.memberId, name: sandboxTables.name }).from(sandboxTables).where(stillDue);
   const ids = due.filter(t => tables.has(sandboxLakeName(t))).map(t => t.id);
   // 更新时再带上到期条件：查询之后成员可能又同名保存（同一行，过期时间已重置）
-  if (ids.length) await db.update(sandboxTables).set({ expiredAt: new Date() }).where(and(inArray(sandboxTables.id, ids), stillDue));
+  if (!ids.length) return;
+  await db.transaction(async tx => {
+    const marked = await tx.update(sandboxTables).set({ expiredAt: new Date() }).where(and(inArray(sandboxTables.id, ids), stillDue)).returning({ id: sandboxTables.id });
+    if (marked.length) await tx.delete(sandboxShares).where(inArray(sandboxShares.tableId, marked.map(t => t.id)));
+  });
 }
 
 /**
