@@ -498,7 +498,7 @@ describe('身份打通：可配置匹配字段与优先级', () => {
 });
 
 describe('身份打通：统一消费者 ID 分配后固定', () => {
-  type Change = { old_id: string; new_id: string; reason: string };
+  type Change = { old_id: string; new_id: string | null; reason: string };
   /** silver._consumer_id_changes 的全部行（不含时间），silver._consumer_ids 里已退役的 ID 与每个 ID 的分配时间 */
   async function idTables(tenantId: string) {
     const session = await openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 });
@@ -542,7 +542,7 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     expect((await lastMerge(acme)).result.identities).toMatchObject({ groups: 7, merged: 1, split: 0 });
   });
 
-  it('改规则使组拆开：原 ID 留给原成员最多的那组（平局取含最小源记录的组），其余组分到新 ID 并记 split', async () => {
+  it('改规则使组拆开：原 ID 留给拥有其过半原成员的那组，其余组分到新 ID 并记 split；没有哪组过半时原 ID 退役、记 retire', async () => {
     const { acme, author, reviewer, mappings, names } = await publishedIdentitySources();
     const before = idsOf((await identities(acme)).rows, names);
     const tables = await idTables(acme);
@@ -554,18 +554,18 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     expect([after['crm:5'], after['loyalty:5']]).toEqual([before['crm:5'], before['crm:5']]);
     expect(all.has(after['tracking:u2'])).toBe(false);
     expect(all.has(after['crm:6'])).toBe(false);
-    // {crm3 | loyalty3} 1 比 1：恰好一组保留原 ID
-    const three = [after['crm:3'], after['loyalty:3']];
-    expect(three.filter(id => id === before['crm:3'])).toHaveLength(1);
-    const split3 = three.find(id => id !== before['crm:3'])!;
-    expect(all.has(split3)).toBe(false);
+    // {crm3 | loyalty3} 1 比 1：没有哪组过半，两组都拿新 ID，原 ID 退役
+    for (const who of ['crm:3', 'loyalty:3']) expect(all.has(after[who])).toBe(false);
+    expect(after['crm:3']).not.toBe(after['loyalty:3']);
 
     const expected = [
       { old_id: before['crm:2'], new_id: after['tracking:u2'], reason: 'split' },
-      { old_id: before['crm:3'], new_id: split3, reason: 'split' },
+      { old_id: before['crm:3'], new_id: after['crm:3'], reason: 'split' },
+      { old_id: before['crm:3'], new_id: after['loyalty:3'], reason: 'split' },
       { old_id: before['crm:5'], new_id: after['crm:6'], reason: 'split' },
     ].sort((a, b) => a.old_id.localeCompare(b.old_id) || a.new_id.localeCompare(b.new_id));
-    expect(await idChanges(acme, tables)).toEqual({ changes: expected, retired: [] });
+    expect(await idChanges(acme, tables)).toEqual({
+      changes: [{ old_id: before['crm:3'], new_id: null, reason: 'retire' }, ...expected], retired: [before['crm:3']] });
     expect((await lastMerge(acme)).result.identities).toMatchObject({ groups: 11, merged: 0, split: 3 });
     // 其余组 ID 不变
     for (const who of ['crm:1', 'loyalty:1', 'crm:4', 'crm:7', 'loyalty:4', 'tracking:u9']) expect(after[who]).toBe(before[who]);
@@ -587,24 +587,67 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     expect(await idChanges(acme, tables)).toEqual({ changes: [], retired: [] });
   });
 
+  /** 把 size 条源记录的组里按 ID 排在前 count 个的组（各取整组）改用旧 ID x */
+  const shareX = (size: number, count: number) => `
+    UPDATE silver._identities SET consumer_id = 'x' WHERE consumer_id IN
+      (SELECT consumer_id FROM silver._identities GROUP BY 1 HAVING count(*) = ${size} ORDER BY 1 LIMIT ${count});`;
+  /** 把 x 记进分配表（未退役），重算才会给它填 retired_at */
+  const addX = `INSERT INTO silver._consumer_ids VALUES ('x', now() - INTERVAL 1 DAY, NULL);`;
+
   it('摘要的 merged、split 按组计：三个旧 ID 合成一组算 1、一个旧 ID 拆成三组算 1，变更表仍是每个 ID 一条', async () => {
     const { acme } = await publishedIdentitySources();
     const tables = await idTables(acme);
     const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
     try {
-      // 让一个三条记录的组原来分属三个 ID，再让另外三个组原来共用一个 ID
+      // 让一个三条记录的组原来分属三个 ID，再让三个单条记录的组原来共用一个 ID
       await session.con.run(`
         UPDATE silver._identities SET consumer_id = 'm-' || _source || '-' || customer_id
         WHERE consumer_id = (SELECT consumer_id FROM silver._identities GROUP BY 1 HAVING count(*) = 3 ORDER BY 1 LIMIT 1);
-        UPDATE silver._identities SET consumer_id = 'x'
-        WHERE consumer_id IN (SELECT DISTINCT consumer_id FROM silver._identities WHERE consumer_id NOT LIKE 'm-%' ORDER BY 1 LIMIT 3)`);
+        ${shareX(1, 3)}`);
       expect(await resolveIdentities(session.con)).toMatchObject({ groups: 8, merged: 1, split: 1 });
     } finally {
       session.close();
     }
     const { changes } = await idChanges(acme, tables);
     expect(changes.filter(c => c.reason === 'merge')).toHaveLength(2);
-    expect(changes.filter(c => c.reason === 'split').map(c => c.old_id)).toEqual(['x', 'x']);
+    expect(changes.filter(c => c.reason === 'split').map(c => c.old_id)).toEqual(['x', 'x', 'x']);
+  });
+
+  it('一个旧 ID 拆成 1+1+1：三组都拿新 ID、各记 split，另记一条 retire，分配表里它的 retired_at 填上', async () => {
+    const { acme } = await publishedIdentitySources();
+    const tables = await idTables(acme);
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      await session.con.run(`${shareX(1, 3)} ${addX}`);
+      expect(await resolveIdentities(session.con)).toMatchObject({ groups: 8, merged: 0, split: 1 });
+      const ids = (await session.con.runAndReadAll(`SELECT DISTINCT consumer_id FROM silver._identities`)).getRowObjectsJson();
+      expect(ids).not.toContainEqual({ consumer_id: 'x' });
+    } finally {
+      session.close();
+    }
+    const { changes, retired } = await idChanges(acme, tables);
+    expect(changes.filter(c => c.old_id === 'x').map(c => c.reason)).toEqual(['retire', 'split', 'split', 'split']);
+    expect(changes.find(c => c.reason === 'retire')).toEqual({ old_id: 'x', new_id: null, reason: 'retire' });
+    expect(new Set(changes.filter(c => c.reason === 'split').map(c => c.new_id)).size).toBe(3);
+    expect(retired).toEqual(['x']);
+  });
+
+  it('一个旧 ID 拆成 3+1：三条那组过半、留下旧 ID，另一组拿新 ID 记 split，不记 retire', async () => {
+    const { acme } = await publishedIdentitySources();
+    const tables = await idTables(acme);
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    try {
+      await session.con.run(`${shareX(3, 1)} ${shareX(1, 1)} ${addX}`);
+      expect(await resolveIdentities(session.con)).toMatchObject({ groups: 8, merged: 0, split: 1 });
+      const [{ n }] = (await session.con.runAndReadAll(`SELECT count(*)::INT AS n FROM silver._identities WHERE consumer_id = 'x'`))
+        .getRowObjectsJson() as { n: number }[];
+      expect(n).toBe(3);
+    } finally {
+      session.close();
+    }
+    const { changes, retired } = await idChanges(acme, tables);
+    expect(changes.map(c => [c.old_id, c.reason])).toEqual([['x', 'split']]);
+    expect(retired).toEqual([]);
   });
 
   it('摘要的 hot 列出连上源记录数达到阈值的匹配值（哈希、记录数、数据源），按记录数降序；低于阈值的不列', async () => {

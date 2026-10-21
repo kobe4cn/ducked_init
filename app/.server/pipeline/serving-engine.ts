@@ -52,9 +52,10 @@ const exists = (con: TenantLakeSession['con'], qualified: string) => {
 };
 
 /**
- * 退役 ID → 现在的 ID 的查询（ADR-0029）。退役的 ID 只来自 merge（split 的原 ID 留给另一组，不退役）。
+ * 退役 ID → 现在的 ID 的查询（ADR-0029）。别名只来自 merge（split 的原 ID 留给另一组，retire 的没有继承人）。
  * 有成员记录的退役 ID 按成员解析：退役时的源记录现在有过半（按退役时的条数算，删掉的仍计入分母）属于某个统一消费者就指向它，
- * 没有就不给别名——合并后又拆开时不指向留下原 ID 的那个人；_identities 不在时它们都没有别名。没有成员记录的（老湖、之前退役的）沿 merge 链走到现在的 ID
+ * 没有就不给别名——合并后又拆开时不指向留下原 ID 的那个人；_identities 不在时它们都没有别名。没有成员记录的（老湖、之前退役的）
+ * 沿 merge 链走到现在的 ID；途中走到有成员记录的 ID 就停，改用它按成员解析的结果，它没有别名时也没有
  */
 async function aliasesSql(con: TenantLakeSession['con']) {
   if (!(await exists(con, CONSUMER_ID_CHANGES))) return 'SELECT NULL::VARCHAR AS retired_id, NULL::VARCHAR AS consumer_id LIMIT 0';
@@ -66,15 +67,20 @@ async function aliasesSql(con: TenantLakeSession['con']) {
   return `WITH RECURSIVE merged AS (SELECT DISTINCT old_id, new_id FROM ${CONSUMER_ID_CHANGES} WHERE reason = 'merge'),${hasMembers ? `
     members AS (SELECT DISTINCT consumer_id AS retired_id, _source, customer_id FROM ${CONSUMER_ID_MEMBERS}),
     total AS (SELECT retired_id, count(*) AS n FROM members GROUP BY retired_id),
-    owned AS (${owned}),` : ''}
+    owned AS (${owned}),
+    by_members AS (SELECT o.retired_id, o.consumer_id FROM owned o JOIN total t USING (retired_id) WHERE o.n * 2 > t.n),` : ''}
     walk(retired_id, consumer_id, depth) AS (
       SELECT old_id, new_id, 1 FROM merged${hasMembers ? ' WHERE old_id NOT IN (SELECT retired_id FROM total)' : ''}
       UNION ALL
-      SELECT w.retired_id, m.new_id, w.depth + 1 FROM walk w JOIN merged m ON m.old_id = w.consumer_id WHERE w.depth < 1000)
+      SELECT w.retired_id, m.new_id, w.depth + 1 FROM walk w JOIN merged m ON m.old_id = w.consumer_id
+      WHERE w.depth < 1000${hasMembers ? ' AND w.consumer_id NOT IN (SELECT retired_id FROM total)' : ''})
     SELECT * FROM (
       SELECT retired_id, consumer_id FROM walk WHERE consumer_id NOT IN (SELECT old_id FROM merged)${hasMembers ? `
+        AND consumer_id NOT IN (SELECT retired_id FROM total)
       UNION ALL
-      SELECT o.retired_id, o.consumer_id FROM owned o JOIN total t USING (retired_id) WHERE o.n * 2 > t.n` : ''})
+      SELECT w.retired_id, b.consumer_id FROM walk w JOIN by_members b ON b.retired_id = w.consumer_id
+      UNION ALL
+      SELECT * FROM by_members` : ''})
     ORDER BY consumer_id, retired_id`;
 }
 

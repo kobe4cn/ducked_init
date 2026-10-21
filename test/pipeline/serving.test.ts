@@ -117,36 +117,38 @@ describe('生成服务库', () => {
     expect(await readServing(acme, target, 'SELECT version FROM meta')).toEqual([{ version: 101 }]);
   });
 
-  it('退役 ID 沿着 merge 链指向现在的 ID，split 不算', async () => {
+  it('退役 ID 沿着 merge 链指向现在的 ID，split 不算；retire 退役的 ID 没有别名', async () => {
     const { acme, snapshots, dataPath } = await publishedDefinitions();
     await onLake(acme, `CREATE TABLE IF NOT EXISTS silver._consumer_id_changes (old_id VARCHAR, new_id VARCHAR, reason VARCHAR, changed_at TIMESTAMPTZ);
-      INSERT INTO silver._consumer_id_changes VALUES ('a', 'b', 'merge', now()), ('b', 'c', 'merge', now()), ('c', 'd', 'split', now()), ('x', 'c', 'merge', now())`);
+      INSERT INTO silver._consumer_id_changes VALUES ('a', 'b', 'merge', now()), ('b', 'c', 'merge', now()), ('c', 'd', 'split', now()), ('x', 'c', 'merge', now()), ('z', NULL, 'retire', now())`);
     const target = servingPath(dataPath, 102);
     const task = await runTask(acme, 'serving.build', { version: 102, target, snapshots: snapshots.map(({ id, template, table }) => ({ id, template, table })) });
     // 夹具里已有的一个退役 ID 之外再多三个
     expect(task).toMatchObject({ status: 'succeeded', result: { rows: { consumer_aliases: 4 } } });
-    expect(await readServing(acme, target, `SELECT * FROM consumer_aliases WHERE retired_id IN ('a', 'b', 'x')`)).toEqual([
+    expect(await readServing(acme, target, `SELECT * FROM consumer_aliases WHERE retired_id IN ('a', 'b', 'x', 'z')`)).toEqual([
       { retired_id: 'a', consumer_id: 'c' }, { retired_id: 'b', consumer_id: 'c' }, { retired_id: 'x', consumer_id: 'c' },
     ]);
   });
 
-  it('有成员记录的退役 ID 指向拥有它过半源记录的消费者（先合后拆后不指向别人），恰好一半或更少时没有别名；多次合并直接指向现在的 ID', async () => {
+  it('有成员记录的退役 ID 指向拥有它过半源记录的消费者（先合后拆后不指向别人），恰好一半或更少时没有别名；多次合并直接指向现在的 ID；没有成员记录的老 ID 沿 merge 链走到有成员记录的 ID 就停、取它按成员解析的结果', async () => {
     const { acme, snapshots, dataPath } = await publishedDefinitions();
     await onLake(acme, `CREATE TABLE IF NOT EXISTS silver._consumer_id_changes (old_id VARCHAR, new_id VARCHAR, reason VARCHAR, changed_at TIMESTAMPTZ);
       CREATE TABLE IF NOT EXISTS silver._consumer_id_members (consumer_id VARCHAR, _source VARCHAR, customer_id VARCHAR);
       INSERT INTO silver._consumer_id_changes VALUES
-        ('r1', 'Q', 'merge', now()), ('r2', 'Q', 'merge', now()), ('r3', 'Q', 'merge', now()), ('r4', 'r5', 'merge', now()), ('r5', 'R', 'merge', now());
+        ('r1', 'Q', 'merge', now()), ('r2', 'Q', 'merge', now()), ('r3', 'Q', 'merge', now()), ('r4', 'r5', 'merge', now()), ('r5', 'R', 'merge', now()),
+        ('rx', 'r1', 'merge', now()), ('ry', 'r2', 'merge', now());
       INSERT INTO silver._consumer_id_members VALUES
         ('r1', 's', '1'), ('r1', 's', '2'), ('r1', 's', '3'), ('r2', 's', '4'), ('r2', 's', '5'),
         ('r3', 's', '6'), ('r3', 's', '7'), ('r3', 's', '8'), ('r4', 's', '9'), ('r5', 's', '9'), ('r5', 's', '10');
+      -- rx、ry 没有成员记录：rx 跟着 r1 指向 P 而不是 r1 的 merge 目标 Q，ry 跟着 r2 没有别名
       -- r1 并进 Q 后又拆开：三条里两条现在在 P；r2 恰好一半；r3 只剩一条（另两条已删除，分母仍是 3）；P 新增的源记录不计入
       INSERT INTO silver._identities VALUES ('s', '1', 'P'), ('s', '2', 'P'), ('s', '3', 'Q'), ('s', '4', 'P'), ('s', '5', 'Q'),
         ('s', '6', 'Q'), ('s', '9', 'R'), ('s', '10', 'R'), ('s', '11', 'P'), ('s', '12', 'P')`);
     const target = servingPath(dataPath, 102);
     const task = await runTask(acme, 'serving.build', { version: 102, target, snapshots: snapshots.map(({ id, template, table }) => ({ id, template, table })) });
-    expect(task).toMatchObject({ status: 'succeeded', result: { rows: { consumer_aliases: 4 } } });
+    expect(task).toMatchObject({ status: 'succeeded', result: { rows: { consumer_aliases: 5 } } });
     expect(await readServing(acme, target, `SELECT * FROM consumer_aliases WHERE retired_id LIKE 'r%'`)).toEqual([
-      { retired_id: 'r1', consumer_id: 'P' }, { retired_id: 'r4', consumer_id: 'R' }, { retired_id: 'r5', consumer_id: 'R' },
+      { retired_id: 'r1', consumer_id: 'P' }, { retired_id: 'rx', consumer_id: 'P' }, { retired_id: 'r4', consumer_id: 'R' }, { retired_id: 'r5', consumer_id: 'R' },
     ]);
     // _identities 被删后有成员记录的退役 ID 都没有别名，照样生成
     await onLake(acme, 'DROP TABLE silver._identities');

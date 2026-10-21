@@ -7,7 +7,7 @@
 - `tags(consumer_id, tag, tag_value)`：`tag` 是标签的键
 - `metrics(consumer_id, metric, dims JSON, value DOUBLE)`：维度列名各指标不同，按快照表的实际列（除 `consumer_id`、`value`）拼成 `dims`，无维度时是 `{}`；`value` 统一成 `DOUBLE`
 - `rfm(consumer_id, segment, r, f, m, recency_days, frequency, monetary)`
-- `consumer_aliases(retired_id, consumer_id)`：退役 ID 只来自 `silver._consumer_id_changes` 里 `merge` 的行（ADR-0029；`split` 的原 ID 不退役）。在 `silver._consumer_id_members` 有成员记录的，指向现在拥有它过半成员的统一消费者，没有就不给别名（先合后拆，#252）；没有成员记录的沿着合并链走到现在的 ID；变更表不在时为空
+- `consumer_aliases(retired_id, consumer_id)`：退役 ID 只来自 `silver._consumer_id_changes` 里 `merge` 的行（ADR-0029；`split` 的原 ID 不退役，`retire` 退役的没有继承人、没有别名）。在 `silver._consumer_id_members` 有成员记录的，指向现在拥有它过半成员的统一消费者，没有就不给别名（先合后拆，#252）；没有成员记录的沿着合并链走到现在的 ID，途中走到有成员记录的 ID 就停、改用它的结果（#259）；变更表不在时为空
 - `meta(version, built_at)`
 
 快照表里没有明文（ADR-0005），服务库因此也没有。数据不完整的快照（`snapshots.incomplete` 非空）照常放入，对外标 `incomplete: true`。指定旧快照 ID 的请求不进服务库，直接只读查湖（#206）。

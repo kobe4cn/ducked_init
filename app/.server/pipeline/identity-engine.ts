@@ -4,8 +4,8 @@
 // 比的是标准层里敏感字段的哈希（哈希前已规范化，空值不参与）：两条记录在某个匹配字段上相等、且在每个更高优先级的字段上不冲突
 // （冲突是双方都有值、没有一个相同）时相连；之后取传递闭包：A-B 手机相同、B-C 邮箱相同，则 A、B、C 是同一个消费者。
 // 匹配规则由各 customer 映射配置（identityRules），都没配置时用平台默认规则。
-// 统一消费者 ID 分配后固定（ADR-0029）：新算出的组对照上一版 _identities 沿用旧 ID，每个旧 ID 留给原成员最多的组，
-// 一组继承多个旧 ID 时留分配最早的、其余记 merge 并退役，没分到旧 ID 的组从原 ID 拆出、记 split；
+// 统一消费者 ID 分配后固定（ADR-0029）：新算出的组对照上一版 _identities 沿用旧 ID，每个旧 ID 留给拥有其过半原成员的组，
+// 没有这样的组就记 retire 并退役；一组继承多个旧 ID 时留分配最早的、其余记 merge 并退役，没分到旧 ID 的组从原 ID 拆出、记 split；
 // 全新的组取组内最小的 (_source, customer_id) 再哈希（与敏感字段的哈希无关），撞上分配过的 ID 时加盐重算。
 // merge 退役的 ID 在上一版 _identities 里的全部源记录追加进 silver._consumer_id_members（服务库按成员解析它的别名，ADR-0029）。
 // 分配表 silver._consumer_ids、变更表 silver._consumer_id_changes、成员表与 _identities 在同一个事务里写入。
@@ -242,8 +242,9 @@ const freshId = (salt: string) => `sha256(m._source || chr(31) || m.customer_id$
 
 /**
  * 在 stage 里给新算出的每个组（LABELS 的 label，即组里最小的 node）选定统一消费者 ID：对照上一版 _identities，
- * 每个旧 ID 只留给原成员最多的组（平局取 label 小的，即含最小源记录的组）；一组继承多个旧 ID 时留 assigned_at 最早的
- * （平局取较小的 ID），其余记 merge 并退役；没分到旧 ID 的组取新 ID，从它含有的每个旧 ID 拆出、记 split。
+ * 每个旧 ID 只留给拥有其过半原成员（按现在还在的源记录算）的组，没有这样的组就记 retire 并退役、不留给任何组；
+ * 一组继承多个旧 ID 时留 assigned_at 最早的（平局取较小的 ID），其余记 merge 并退役；没分到旧 ID 的组取新 ID，
+ * 从它含有的每个旧 ID 拆出、记 split。
  * 结果是 ASSIGNED(label, consumer_id)、CHANGES(old_id, new_id, reason)、写回分配表的全部行 NEXT_IDS，
  * 与本次 merge 退役的 ID 在上一版 _identities 里的全部源记录 RETIRED_MEMBERS(consumer_id, _source, customer_id)。
  * 分配表不存在时用上一版 _identities 播种（原 ID 全部保留，不记变更）。必须在写 _identities 的事务之前调用
@@ -260,10 +261,10 @@ async function assignIds(con: DuckDBConnection, hasIdentities: boolean, hasIds: 
       FROM ${NODES} n JOIN ${LABELS} l USING (node) JOIN ${IDENTITIES} i ON i._source = n._source AND i.customer_id = n.customer_id
       GROUP BY ALL`
     : `SELECT NULL::BIGINT AS label, NULL::VARCHAR AS old_id, NULL::BIGINT AS n LIMIT 0`}`);
-  // 每个旧 ID 归属的新组；组内按 assigned_at、ID 排名，第一名存活
+  // 每个旧 ID 归属的新组：拥有它过半原成员的组，没有就不归属（退役）；组内按 assigned_at、ID 排名，第一名存活
   await con.run(`CREATE OR REPLACE TABLE ${OWNER} AS
     SELECT label, old_id, row_number() OVER (PARTITION BY label ORDER BY o.assigned_at NULLS LAST, old_id) AS rank
-    FROM (SELECT * FROM ${OVERLAP} QUALIFY row_number() OVER (PARTITION BY old_id ORDER BY n DESC, label) = 1) w
+    FROM (SELECT * FROM ${OVERLAP} QUALIFY n * 2 > sum(n) OVER (PARTITION BY old_id)) w
     LEFT JOIN ${OLD_IDS} o ON o.consumer_id = w.old_id`);
   // 没分到旧 ID 的组先取组内最小源记录的哈希，撞上分配过的 ID 就在哈希输入后加盐重算
   await con.run(`CREATE OR REPLACE TABLE ${ASSIGNED} AS
@@ -282,14 +283,16 @@ async function assignIds(con: DuckDBConnection, hasIdentities: boolean, hasIds: 
   await con.run(`CREATE OR REPLACE TABLE ${CHANGES} AS
     SELECT w.old_id, a.consumer_id AS new_id, 'merge' AS reason FROM ${OWNER} w JOIN ${ASSIGNED} a USING (label) WHERE w.rank > 1
     UNION ALL
-    SELECT v.old_id, a.consumer_id, 'split' FROM ${OVERLAP} v JOIN ${ASSIGNED} a USING (label) WHERE a.fresh`);
+    SELECT v.old_id, a.consumer_id, 'split' FROM ${OVERLAP} v JOIN ${ASSIGNED} a USING (label) WHERE a.fresh
+    UNION ALL
+    SELECT DISTINCT old_id, NULL, 'retire' FROM ${OVERLAP} WHERE old_id NOT IN (SELECT old_id FROM ${OWNER})`);
   await con.run(`CREATE OR REPLACE TABLE ${NEXT_IDS} AS
     SELECT consumer_id, assigned_at,
-      CASE WHEN consumer_id IN (SELECT old_id FROM ${CHANGES} WHERE reason = 'merge') THEN ${nowSql} ELSE retired_at END AS retired_at
+      CASE WHEN consumer_id IN (SELECT old_id FROM ${CHANGES} WHERE reason IN ('merge', 'retire')) THEN ${nowSql} ELSE retired_at END AS retired_at
     FROM ${OLD_IDS}
     UNION ALL
     SELECT consumer_id, ${nowSql}, NULL FROM ${ASSIGNED} WHERE fresh`);
-  // 一个 ID 可能同时记 merge 与 split，只有 merge 退役它
+  // 一个 ID 可能同时记 merge 与 split；retire 没有继承人，不记成员
   await con.run(`CREATE OR REPLACE TABLE ${RETIRED_MEMBERS} AS ${hasIdentities
     ? `SELECT consumer_id, _source, customer_id FROM ${IDENTITIES} WHERE consumer_id IN (SELECT old_id FROM ${CHANGES} WHERE reason = 'merge')`
     : `SELECT NULL::VARCHAR AS consumer_id, NULL::VARCHAR AS _source, NULL::VARCHAR AS customer_id LIMIT 0`}`);
