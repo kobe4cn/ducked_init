@@ -870,12 +870,13 @@ async function mergeOne(
  * 打通之前统计 relations（租户全部已发布关系，同样入队时算好）的孤儿，记在 relations 里（耗时记在 relationsMs），出错不算合并失败；salt 是租户的敏感信息盐；redact 用来抹掉错误信息里的凭据与盐；
  * priority 是属性取舍的名次（映射 ID → 名次，同样入队时由全部 customer 映射汇总，ADR-0027）。
  * drop 是要撤下的停用映射（ADR-0031）：各实体的映射开始合并之前先逐个撤下（不论这次有没有带该实体的映射），记在 dropped 里；
- * 撤下了 customer、event 或 consent 的映射时同样重算身份打通。taskId 是合并任务，自定义断言的运行记录记在它名下
+ * 撤下了 customer、event 或 consent 的映射时同样重算身份打通。taskId 是合并任务，自定义断言的运行记录记在它名下。
+ * exclude 是不参与匹配的值（规范化后的加盐哈希，同样入队时算好），打通时当作没有值
  */
 export async function mergeToSilver(
   session: TenantLakeSession, plans: MergeMappingParam[], salt: string, redact: (message: string) => string, rules: readonly string[] = DEFAULT_RULES,
   relations: RelationParam[] = [], forceIdentities = false, sensitive: readonly string[] = [], priority: Record<string, number> = {},
-  drop: MergeDrop[] = [], taskId: string,
+  drop: MergeDrop[] = [], taskId: string, exclude: readonly string[] = [],
 ): Promise<{
   mappings: MergeRecord[]; dropped?: DroppedMapping[]; relations?: RelationStat[]; relationsMs?: number; identities?: IdentityRecord;
 }> {
@@ -916,6 +917,7 @@ export async function mergeToSilver(
     const summary = await resolveIdentities(con, rules, {
       sensitive: [...new Set([...sensitive, ...consumerSensitive(plans)])],
       priority,
+      exclude,
     });
     return { ...merged, identities: { ...summary, durationMs: Date.now() - startedAt } };
   } catch (e) {

@@ -142,6 +142,19 @@ function identityForce(params: Params) {
   return force ?? false;
 }
 
+/**
+ * 合并参数里不参与身份匹配的值（规范化后的加盐哈希，入队时由平台库汇总，工作进程不读平台库）；
+ * 只收 64 位十六进制，挡住误传的明文，错误信息里不带取值。早先入队的合并没有这一项，不排除
+ */
+function identityExclude(params: Params) {
+  const exclude = params.identityExclude;
+  if (exclude === undefined) return [];
+  if (!Array.isArray(exclude) || !exclude.every(h => typeof h === 'string' && /^[0-9a-f]{64}$/.test(h))) {
+    throw new Error('参数 identityExclude 必须是哈希（64 位小写十六进制）列表');
+  }
+  return exclude as string[];
+}
+
 /** 合并参数里属性取舍的名次：映射 ID → 正整数名次（入队时由全部 customer 映射汇总）；早先入队的合并没有这一项，只按 updated_at 取最新 */
 function mergeSurvivorship(params: Params): Record<string, number> {
   const { survivorship } = params;
@@ -368,7 +381,7 @@ export const HANDLERS = {
       const drop = mergeDrops(params);
       const result = await mergeToSilver(
         session, mergeMappings(params, drop), piiSalt, redact, identityMatch(params), mergeRelations(params), identityForce(params),
-        mergeConsumerSensitive(params), mergeSurvivorship(params), drop, taskId,
+        mergeConsumerSensitive(params), mergeSurvivorship(params), drop, taskId, identityExclude(params),
       );
       const failed = result.mappings.filter(m => 'error' in m);
       const problems = [

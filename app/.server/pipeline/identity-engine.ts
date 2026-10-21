@@ -94,6 +94,8 @@ export interface IdentityOptions {
   sensitive?: readonly string[];
   /** 告警阈值，默认 HOT_VALUE_THRESHOLD（测试用） */
   hotThreshold?: number;
+  /** 不参与匹配的值（规范化后的加盐哈希，不分字段）：记录上等于它们的匹配值当作没有值，与映射里写 nullif 相同，也不进 hot */
+  exclude?: readonly string[];
 }
 
 /**
@@ -118,6 +120,7 @@ export async function resolveIdentities(
   const hasIdentities = await tableExists(con, 'silver', IDENTITIES.split('.')[1]);
   const hasIds = await tableExists(con, 'silver', CONSUMER_IDS.split('.')[1]);
   const nowSql = `${lit(new Date().toISOString())}::TIMESTAMPTZ`;
+  const notExcludedSql = (r: string) => opts.exclude?.length ? ` AND c.${ident(r)} NOT IN (${opts.exclude.map(lit).join(', ')})` : '';
   try {
     // 每条源记录一个编号，按 (_source, customer_id) 排序，组里最小的编号就是组里最小的源记录
     await con.run(`CREATE OR REPLACE TABLE ${NODES} AS
@@ -125,7 +128,7 @@ export async function resolveIdentities(
       FROM (SELECT DISTINCT _source, customer_id FROM ${CUSTOMER} WHERE _source IS NOT NULL AND customer_id IS NOT NULL)`);
     await con.run(`CREATE OR REPLACE TABLE ${VALUES} AS SELECT DISTINCT * FROM (${used.length
       ? used.map(r => `SELECT n.node, ${lit(r)} AS rule, c.${ident(r)} AS value FROM ${CUSTOMER} c
-          JOIN ${NODES} n ON n._source = c._source AND n.customer_id = c.customer_id WHERE c.${ident(r)} IS NOT NULL`).join(' UNION ALL ')
+          JOIN ${NODES} n ON n._source = c._source AND n.customer_id = c.customer_id WHERE c.${ident(r)} IS NOT NULL${notExcludedSql(r)}`).join(' UNION ALL ')
       : `SELECT NULL::BIGINT AS node, NULL::VARCHAR AS rule, NULL::VARCHAR AS value LIMIT 0`})`);
     // 告警：按 (rule, 取值) 计连上的不同源记录数（不是统一消费者数），只告警，不改变打通结果
     const hot = (await rows<{ rule: string; hash: string; records: string; sources: string[] }>(con, `

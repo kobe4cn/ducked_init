@@ -521,6 +521,13 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     const seen = new Set(before.changes.map(c => JSON.stringify(c)));
     return { changes: now.changes.filter(c => !seen.has(JSON.stringify(c))), retired: now.retired.filter(id => !before.retired.includes(id)) };
   }
+  /** 让 5 条源记录共用一个已有的手机号哈希（像占位号），返回这个哈希；它原来的记录照旧用它 */
+  async function shareOnePhone(con: DuckDBConnection) {
+    const [{ hash }] = (await con.runAndReadAll(`SELECT min(phone) AS hash FROM silver.customer`)).getRowObjectsJson() as { hash: string }[];
+    await con.run(`CREATE TEMP TABLE five AS SELECT DISTINCT _source, customer_id FROM silver.customer ORDER BY ALL LIMIT 5;
+      UPDATE silver.customer c SET phone = '${hash}' FROM five f WHERE c._source = f._source AND c.customer_id = f.customer_id`);
+    return hash;
+  }
   /** 「数据源名:customer_id」→ 统一消费者 ID */
   const idsOf = (rows: Identity[], names: Record<string, string>) =>
     Object.fromEntries(rows.map(r => [`${names[r._source]}:${r.customer_id}`, r.consumer_id]));
@@ -656,10 +663,7 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     const read = async <T>(sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
     try {
       expect((await resolveIdentities(session.con)).hot).toEqual([]);
-      // 让 5 条源记录共用一个已有的手机号哈希（像占位号）
-      const [{ hash }] = await read<{ hash: string }>(`SELECT min(phone) AS hash FROM silver.customer`);
-      await session.con.run(`CREATE TEMP TABLE five AS SELECT DISTINCT _source, customer_id FROM silver.customer ORDER BY ALL LIMIT 5;
-        UPDATE silver.customer c SET phone = '${hash}' FROM five f WHERE c._source = f._source AND c.customer_id = f.customer_id`);
+      const hash = await shareOnePhone(session.con);
       // 这个哈希原来就有的记录也算在内
       const [{ records, sources }] = await read<{ records: number; sources: string[] }>(`SELECT count(DISTINCT (_source, customer_id))::INT AS records,
         list(DISTINCT _source ORDER BY _source) AS sources FROM silver.customer WHERE phone = '${hash}'`);
@@ -675,6 +679,63 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     } finally {
       session.close();
     }
+  });
+
+  it('exclude 里的哈希当作没有值：只靠它相连的记录分开并记 split，分组与把它置空时相同，不进 hot', async () => {
+    const { acme } = await publishedIdentitySources();
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    const read = async <T>(sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+    /** 分组（每组是排好序的「数据源:customer_id」） */
+    const partition = async () => (await read<{ members: string[] }>(`SELECT list(_source || ':' || customer_id ORDER BY _source, customer_id) AS members
+      FROM silver._identities GROUP BY consumer_id ORDER BY members`)).map(r => r.members);
+    try {
+      const hash = await shareOnePhone(session.con);
+      const sharing = (await read<{ who: string }>(`SELECT DISTINCT _source || ':' || customer_id AS who FROM silver.customer WHERE phone = '${hash}'`))
+        .map(r => r.who);
+      await resolveIdentities(session.con);
+      const together = await partition();
+      expect(together.filter(g => sharing.some(w => g.includes(w)))).toHaveLength(1);
+
+      const summary = await resolveIdentities(session.con, undefined, { exclude: [hash], hotThreshold: 1 });
+      expect(summary.split).toBeGreaterThan(0);
+      expect(summary.hot.length).toBeGreaterThan(0);
+      expect(summary.hot.some(h => h.hash === hash)).toBe(false);
+      const afterExclude = await partition();
+      expect(afterExclude.filter(g => sharing.some(w => g.includes(w))).length).toBeGreaterThan(1);
+
+      // 与在数据里把这个值置空（映射里写 nullif）分组相同：其他字段仍能连起来的照样合并
+      await session.con.run(`UPDATE silver.customer SET phone = NULL WHERE phone = '${hash}'`);
+      await resolveIdentities(session.con);
+      expect(afterExclude).toEqual(await partition());
+    } finally {
+      session.close();
+    }
+  });
+
+  it('合并任务参数 identityExclude 传到打通；不是 64 位十六进制哈希的列表时任务失败', async () => {
+    const { acme } = await publishedIdentitySources();
+    const { params } = await lastMerge(acme);
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    let hash: string;
+    try {
+      hash = await shareOnePhone(session.con);
+    } finally {
+      session.close();
+    }
+    for (const bad of [hash, ['13800000001'], [hash.toUpperCase()], [hash.slice(1)], [hash, 1]]) {
+      const failed = await runTask(acme, 'silver.merge', { ...params, identityExclude: bad });
+      expect(failed.status).toBe('failed');
+      expect(failed.error).toContain('identityExclude');
+      expect(failed.error).not.toContain('13800000001');
+    }
+    const groups = async (extra: Record<string, unknown>) => {
+      const task = await runTask(acme, 'silver.merge', { ...params, identityForce: true, ...extra });
+      expect(task.status).toBe('succeeded');
+      return (task.result as { identities: { groups: number } }).identities.groups;
+    };
+    const together = await groups({});
+    expect(await groups({ identityExclude: [hash] })).toBeGreaterThan(together);
+    expect(await groups({ identityExclude: [] })).toBe(together);
   });
 
   it('merge 退役的 ID 把它在上一版里的全部源记录记进 _consumer_id_members；没有 merge 的重算不写', async () => {
