@@ -14,7 +14,7 @@
 
 **同意（#175）。** 同一个事务里紧接 `_consumer` 之后整表重写 `silver._consumer_consent(consumer_id, channel, status, updated_at, _source)`：`silver.consent` 按 `(_source, customer_id)` 关联 `_identities`，每个统一消费者每个渠道一行。同意只按时间，不用数据源优先级：`updated_at` 新的在前（为空的排最后），同一时刻撤回（`revoked`）优先于同意，再按 `(_source, customer_id)` 定序，取第一条，`_source` 记下取值那条源记录的数据源。不看 `granted_at`、`revoked_at`：有的映射只给了状态与 `updated_at`（如 crmlab 的 POS 同意）。`silver.consent` 不存在时建一张空表。打通的输入因此包括 consent：只合并了 consent 映射时也会重算。
 
-**指标里的写法。** 维度路径写 `consumer.<字段>`（如 `consumer.city`）：只有一段，不从基础实体出发，字段是 customer 的非敏感字段（`customer_id` 除外）；基础实体要有 `customer_id`（或是 customer、event）。编译成按 `consumer_id` 左连接 `silver._consumer`（event 指标用设备归属后的 `consumer_id`，ADR-0025 补充 #154），一个人只有一个取值，取值为空记「未关联」；打通不到消费者的记录照 ADR-0025 不计入，不会出现在「未关联」里。`consumer` 不是标准层实体：不进任务的 `entities`（否则缺表检查与断言会找 `silver.consumer`），依赖里记作 `customer` 的字段。`gold.dsl` 与预览在 SQL 用到 `_consumer` 时检查这张表在不在，老湖没有时提示重新合并一次映射。
+**指标里的写法。** 维度路径写 `consumer.<字段>`（如 `consumer.city`）：只有一段，不从基础实体出发，字段是 customer 的非敏感字段（`customer_id` 除外）；基础实体要有 `customer_id`（或是 customer、event；修正（#263）：经一跳关联消费者的基础实体也可以，见 ADR-0038）。编译成按 `consumer_id` 左连接 `silver._consumer`（event 指标用设备归属后的 `consumer_id`，ADR-0025 补充 #154），一个人只有一个取值，取值为空记「未关联」；打通不到消费者的记录照 ADR-0025 不计入，不会出现在「未关联」里。`consumer` 不是标准层实体：不进任务的 `entities`（否则缺表检查与断言会找 `silver.consumer`），依赖里记作 `customer` 的字段。`gold.dsl` 与预览在 SQL 用到 `_consumer` 时检查这张表在不在，老湖没有时提示重新合并一次映射。
 
 ## 已接受的取舍
 

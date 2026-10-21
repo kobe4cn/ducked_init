@@ -8,13 +8,13 @@ ADR-0004 决定指标与标签用平台自有的 YAML DSL 编译成 SQL；ADR-00
 
 **指标 DSL。** 每个统一消费者一行（或每个消费者 × 维度取值一行）：
 
-- `base`：基础实体，必须有引用 `customer.customer_id` 的 `customer_id` 字段（或就是 `customer`）。通过 `silver._identities`（`_source, customer_id`）关联到 `consumer_id`，关联不到的行不计入；基础实体按 `customer_id` 的数据源列 `_customer_source` 对 `_source`（跨源引用，ADR-0030），`customer` 自己按 `_source`。
+- `base`：基础实体，必须有引用 `customer.customer_id` 的 `customer_id` 字段（或就是 `customer`）。通过 `silver._identities`（`_source, customer_id`）关联到 `consumer_id`，关联不到的行不计入；基础实体按 `customer_id` 的数据源列 `_customer_source` 对 `_source`（跨源引用，ADR-0030），`customer` 自己按 `_source`。修正（#263）：自己没有 `customer_id` 的实体可以经一跳多对一引用，到一个能关联消费者的实体（如 `order_item.order_id → order`），见 ADR-0038。
 - `measure`：`{ agg: count|count_distinct|sum|avg|min|max, field? }`，只有 `count` 可以不写 `field`；`sum`/`avg` 只能用整数、小数字段。另有三类写法（#224），结果都是数字，可被标签引用：
   - `ratio`：`{ agg: ratio, numerator: { agg, field?, filter? }, denominator: { agg, field?, filter? } }`，不写 `field`。分子、分母的 `agg` 只能是 `count|count_distinct|sum`（字段规则同上），各自的 `filter` 写法同顶层，并与顶层 `filter`、`window` 叠加（AND）。编译成 `CAST(COALESCE(<分子> FILTER (WHERE …), 0) AS DOUBLE) / NULLIF(<分母> FILTER (WHERE …), 0)`：分母为 0 或为空时取值为空，分子的 `sum` 没有行时按 0 算。
   - `latest` / `earliest`：`{ agg, field, by }`，按 `by`（时间或日期字段）取最新 / 最早一行的 `field`，编译成 `arg_max` / `arg_min`。`field` 只能是整数、小数字段：`serving.metrics.value` 是 DOUBLE，文本取值不在这一版。`by` 相同的多行取哪一行不确定。
   - `days_since`：`{ agg: days_since, field }`，`field` 是时间或日期字段，取值 = `DATE asOf - max(field 的 UTC 日期)`（整数天）。用编译时的 `asOf` 而不是 `current_date`，同一定义同一 `asOf` 编译出同样的 SQL。
   - `by`、分子分母的字段与过滤字段同样不能是敏感字段，并计入定义依赖。
-- `filter`：可选，`[{ field, op, value? }]`，全部用 AND 连接；字段只能是基础实体的字段，`op` 为 `eq|ne|in|not_in|gt|gte|lt|lte|is_null|not_null`，取值按字段类型校验后用 `lit` 写入，不接受表达式。
+- `filter`：可选，`[{ field, op, value? }]`，全部用 AND 连接；字段只能是基础实体的字段（修正（#262）：filter、measure、window 的字段也能写维度路径，见 ADR-0038），`op` 为 `eq|ne|in|not_in|gt|gte|lt|lte|is_null|not_null`，取值按字段类型校验后用 `lit` 写入，不接受表达式。
 - `window`：可选，`{ field, days }`，`field` 是基础实体的时间或日期字段，取 `(asOf - days, asOf]`。没写时不加时间限制。
 - `dimensions`：可选，最多 3 个，`[{ name, path, as_of? }]`。`path` 写成 `order.store_id -> custom_store.region_id -> custom_region.name`：第一段的实体是 `base`；相邻两段之间，前一段的字段必须有一条关系（内置 `ref` 或已发布登记上的关系）指向后一段实体的单列主键；最多 3 跳；不成环（沿用 `allRelations` 的全部关系判断）；终点不能是敏感字段。编译成链式 `LEFT JOIN`，结果转成 `VARCHAR`，关联不到或为空记为「未关联」，不丢行。`as_of` 是给「按时间点关联」预留的位置，只接受 `current`（默认），其他值报「暂不支持按时间点关联」。
 - `device_attribution`：可选布尔，只有 `base: event` 能写，缺省为 `true`。为真时匿名事件（`customer_id` 为空）经 `device_id` 查 `silver._device_owner`（ADR-0019）计入设备主人；写 `false` 时只经 `_identities`，编译出的 SQL 与加这个字段之前逐字节一致。
@@ -44,5 +44,5 @@ ADR-0004 决定指标与标签用平台自有的 YAML DSL 编译成 SQL；ADR-00
 - 每次标签计算都重算一遍它引用的指标，多算一次换来没有任务顺序。
 - 回刷后同一个 `asOf` 会有新旧两份快照，旧的保留到过期，列表上靠定义版本区分。
 - 维度取当前值；「按时间点关联」只留了语法位置。
-- 过滤只能用基础实体的字段，按维度过滤要等以后再加。
+- 过滤只能用基础实体的字段，按维度过滤要等以后再加。（已由 ADR-0038 修正：字段可写维度路径。）
 - 按统一消费者的属性做维度（`consumer.<字段>`，一个人只有一个取值）见 ADR-0027。
