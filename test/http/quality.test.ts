@@ -1,11 +1,14 @@
 // test/http/quality.test.ts —— 数据质量页的 HTTP 接缝：往源库注入负金额订单 → 同步合并 → gold.rfm 断言失败，不合格行写进隔离区；
-// 有 sources:read 的成员在 /quality 看到本租户最近的断言结果（失败标出）与隔离区样本，页面上没有明文；没有该权限的成员 403，其他租户的成员看不到
+// 有 sources:read 的成员在 /quality 看到本租户最近的断言结果（失败标出）与隔离区样本，页面上没有明文；没有该权限的成员 403，其他租户的成员看不到；
+// 最近一次成功打通的 hot（一个值连了太多源记录）在 /quality 列出哈希、记录数与数据源名，customer 映射的合并记录页顶部给出提示
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
-import { publishMapping, saveDraft } from '../../app/.server/mappings';
+import { latestIdentitySummary, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { syncSource } from '../../app/.server/source-sync';
 import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from '../pipeline/identity-fixtures';
@@ -55,6 +58,46 @@ describe('数据质量页', () => {
     const viewer = await loginAs(app, 'viewer@acme.com');
     expect(await (await viewer.get('/')).text()).not.toContain('href="/quality"');
     expect((await viewer.get('/quality')).status).toBe(403);
+  });
+
+  it('最近一次打通有 hot 时，数据质量页列出哈希前缀、记录数与数据源名，customer 映射的合并记录页顶部提示并链到 /quality；没有 hot 时是空状态、不提示', async () => {
+    const { acme, sources, mappings, orderMappings } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const browser = await loginAs(app, 'analyst@acme.com');
+    const merges = async (id: string) => (await browser.get(`/mappings/${id}?tab=merges`)).text();
+
+    const empty = await (await browser.get('/quality')).text();
+    expect(empty).toContain('身份打通：一个值连了太多记录');
+    expect(empty).toMatch(/没有发现一个值连了 (<!-- -->)?10(<!-- -->)? 条以上记录/);
+    expect(empty).not.toContain('data-hot-hash');
+    expect(await merges(mappings.crm)).not.toContain('data-hot-alert');
+
+    // 直接改最近一次打通的结果造出 hot（真实打通的统计见 identity.test.ts）
+    const { taskId } = (await latestIdentitySummary(acme))!;
+    const [task] = await getDb().select({ result: tasks.result }).from(tasks).where(eq(tasks.id, taskId));
+    const result = task.result as { identities: object };
+    const hash = 'ab12'.repeat(16);
+    const other = 'cd34'.repeat(16);
+    await getDb().update(tasks).set({ result: { ...result, identities: { ...result.identities, hot: [
+      { rule: 'phone', hash, records: 267, sources: [sources.crm, sources.loyalty] },
+      { rule: 'email', hash: other, records: 11, sources: [sources.crm] },
+    ] } } }).where(eq(tasks.id, taskId));
+
+    const html = await (await browser.get('/quality')).text();
+    expect(html).toContain(`data-hot-hash="${hash}"`);
+    expect(html).toMatch(new RegExp(`title="${hash}">${hash.slice(0, 16)}(<!-- -->)?…`));
+    expect(html).toContain('267');
+    expect(html).toContain(`>CRM、会员</td>`);
+    expect(html).not.toContain(sources.crm);
+    expect(html).not.toContain('没有发现一个值连了');
+    for (const p of PLAINTEXT) expect(html).not.toContain(p);
+
+    const page = await merges(mappings.crm);
+    expect(page).toContain('data-hot-alert');
+    expect(page).toContain('2 个匹配值各连了 10 条以上记录');
+    expect(page).toContain('href="/quality"');
+    // 不是 customer 的映射不提示
+    expect(await merges(orderMappings!.crm)).not.toContain('data-hot-alert');
   });
 
   it('合并时映射的自定义断言显示中文名「自定义：<字段> <检查>」与不合格行数；「最近一次」统计仍是结果层任务的', async () => {

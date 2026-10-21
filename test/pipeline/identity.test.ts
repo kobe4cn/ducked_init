@@ -607,6 +607,33 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     expect(changes.filter(c => c.reason === 'split').map(c => c.old_id)).toEqual(['x', 'x']);
   });
 
+  it('摘要的 hot 列出连上源记录数达到阈值的匹配值（哈希、记录数、数据源），按记录数降序；低于阈值的不列', async () => {
+    const { acme } = await publishedIdentitySources();
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    const read = async <T>(sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+    try {
+      expect((await resolveIdentities(session.con)).hot).toEqual([]);
+      // 让 5 条源记录共用一个已有的手机号哈希（像占位号）
+      const [{ hash }] = await read<{ hash: string }>(`SELECT min(phone) AS hash FROM silver.customer`);
+      await session.con.run(`CREATE TEMP TABLE five AS SELECT DISTINCT _source, customer_id FROM silver.customer ORDER BY ALL LIMIT 5;
+        UPDATE silver.customer c SET phone = '${hash}' FROM five f WHERE c._source = f._source AND c.customer_id = f.customer_id`);
+      // 这个哈希原来就有的记录也算在内
+      const [{ records, sources }] = await read<{ records: number; sources: string[] }>(`SELECT count(DISTINCT (_source, customer_id))::INT AS records,
+        list(DISTINCT _source ORDER BY _source) AS sources FROM silver.customer WHERE phone = '${hash}'`);
+      expect(records).toBeGreaterThanOrEqual(5);
+      const below = await read<{ value: string }>(`SELECT phone AS value FROM silver.customer WHERE phone IS NOT NULL
+        GROUP BY 1 HAVING count(DISTINCT (_source, customer_id)) < 3`);
+      const { hot } = await resolveIdentities(session.con, undefined, { hotThreshold: 3 });
+      expect(hot).toContainEqual({ rule: 'phone', hash, records, sources });
+      expect(hot.every(h => h.records >= 3)).toBe(true);
+      expect(hot.map(h => h.records)).toEqual(hot.map(h => h.records).sort((a, b) => b - a));
+      expect(hot.some(h => below.some(b => b.value === h.hash))).toBe(false);
+      expect((await resolveIdentities(session.con, undefined, { hotThreshold: records + 1 })).hot).toEqual([]);
+    } finally {
+      session.close();
+    }
+  });
+
   it('merge 退役的 ID 把它在上一版里的全部源记录记进 _consumer_id_members；没有 merge 的重算不写', async () => {
     const { acme } = await publishedIdentitySources();
     const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });

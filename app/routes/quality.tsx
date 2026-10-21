@@ -1,11 +1,15 @@
-// app/routes/quality.tsx —— 数据质量（有 sources:read 的成员）：本租户最近的内置断言结果（来自 silver._assertion_runs）与隔离区里不合格行的样本（silver._quarantine）。
+// app/routes/quality.tsx —— 数据质量（有 sources:read 的成员）：本租户最近的内置断言结果（来自 silver._assertion_runs）与隔离区里不合格行的样本（silver._quarantine），
+// 以及最近一次成功打通里连了太多源记录的匹配值（只有加盐哈希、记录数与数据源名，见 ADR-0039）。
 // 合并时映射的自定义断言也记在 silver._assertion_runs，显示为「自定义：<字段> <检查>」。每次请求只读挂载本租户的数据湖读取；样本只来自标准层，敏感字段只有哈希。失败的 error 断言标红，warn 标琥珀色
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import type { Route } from './+types/quality';
 import { requirePermission } from '~/.server/access';
+import { latestIdentitySummary } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
+import { HOT_VALUE_THRESHOLD } from '~/.server/pipeline/identity-engine';
 import { ASSERTION_LABELS, describeCustom, SAMPLE_LIMIT, type AssertionLevel } from '~/.server/pipeline/assertions';
 import { latestResultCheck, QUALITY_QUARANTINE, QUALITY_RUNS, readQuality } from '~/.server/quality';
+import { listSources } from '~/.server/sources';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
 import { StatTile } from '~/components/stat-tile';
@@ -21,12 +25,19 @@ export async function loader({ request }: Route.LoaderArgs) {
   // 「最近一次」只看结果层任务：合并任务的自定义断言也写运行记录，error 失败时还会回滚、不留记录
   const check = await latestResultCheck(member.tenant.id);
   const latest = check?.assertions ?? [];
+  // 结果里的 sources 是数据源 ID（工作进程不读平台库），在这里换成名字；删掉的数据源照旧显示 ID
+  const [identity, sources] = await Promise.all([latestIdentitySummary(member.tenant.id), listSources(member)]);
+  const names = new Map(sources.map(s => [s.id, s.name]));
+  const hot = (identity?.hot ?? []).map(h => ({ rule: h.rule, hash: h.hash, records: h.records, sources: h.sources.map(id => names.get(id) ?? id) }));
   return {
     email: member.email,
     nav: navFor(member),
     runs,
     quarantine,
     labels: labelsFor(runs.flatMap(r => r.assertions).map(a => a.name)),
+    /** 最近一次成功打通的热值；还没成功打通过时为 null */
+    hot: identity ? hot : null,
+    hotThreshold: HOT_VALUE_THRESHOLD,
     limits: { runs: QUALITY_RUNS, quarantine: QUALITY_QUARANTINE, sample: SAMPLE_LIMIT },
     latest: {
       taskId: check?.taskId,
@@ -60,7 +71,7 @@ function Outcome({ level, failed }: { level: AssertionLevel; failed: number }) {
 }
 
 export default function Quality({ loaderData }: Route.ComponentProps) {
-  const { email, nav, runs, quarantine, labels, limits, latest } = loaderData;
+  const { email, nav, runs, quarantine, hot, hotThreshold, labels, limits, latest } = loaderData;
   const label = (name: string) => labels[name] ?? name;
   return (
     <AppShell email={email} nav={nav}>
@@ -71,6 +82,38 @@ export default function Quality({ loaderData }: Route.ComponentProps) {
         <StatTile label="最近一次告警" value={latest.warns} tone={latest.warns ? 'text-amber-600' : undefined} hint="告警不阻断任务" />
         <StatTile label="隔离区样本" value={quarantine.length} hint={`最近 ${limits.quarantine} 行`} />
       </div>
+
+      {hot?.length ? (
+        <div className="rounded-2xl border border-amber-200 bg-white p-6 shadow-sm" data-hot-values>
+          <h2 className="mb-1 inline-flex items-center gap-2 text-lg font-semibold text-amber-700"><AlertTriangle className="size-5" />身份打通：一个值连了太多记录</h2>
+          <p className="mb-4 text-sm text-slate-500">最近一次打通里，下面的匹配值各连了 {hotThreshold} 条以上源记录，可能是占位号或代填号，会把不相干的人合成一个统一消费者。这里只告警，不改变合并结果。</p>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>匹配字段</TableHead>
+                <TableHead>哈希</TableHead>
+                <TableHead>记录数</TableHead>
+                <TableHead>数据源</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {hot.map(h => (
+                <TableRow key={`${h.rule}-${h.hash}`} data-hot-hash={h.hash}>
+                  <TableCell>{h.rule}</TableCell>
+                  <TableCell className="font-mono text-xs" title={h.hash}>{h.hash.slice(0, 16)}…</TableCell>
+                  <TableCell>{h.records.toLocaleString('zh-CN')}</TableCell>
+                  <TableCell>{h.sources.join('、')}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      ) : (
+        <div className="rounded-2xl border bg-white p-6 shadow-sm">
+          <h2 className="mb-1 text-lg font-semibold">身份打通：一个值连了太多记录</h2>
+          <p className="text-slate-500">{hot ? `没有发现一个值连了 ${hotThreshold} 条以上记录。` : '还没有成功打通过。合并 customer 映射时打通，连了太多源记录的匹配值会列在这里。'}</p>
+        </div>
+      )}
 
       {runs.length ? (
         <div className="rounded-2xl border bg-white p-6 shadow-sm">

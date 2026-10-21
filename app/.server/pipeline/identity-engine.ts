@@ -46,9 +46,17 @@ export const LOGIN_EVENT = 'login';
 
 /**
  * 一次打通的摘要：统一消费者（组）数、参与打通的源记录数、已归属的设备数；merged 是本次由多个旧 ID 合并成的组数（三合一算 1），
- * split 是本次被拆开的旧 ID 数（一拆三算 1），都按组计，不是变更表的条数
+ * split 是本次被拆开的旧 ID 数（一拆三算 1），都按组计，不是变更表的条数；hot 是连了太多源记录的匹配值（见 HotValue、ADR-0039）
  */
-export interface IdentitySummary { groups: number; records: number; devices: number; merged: number; split: number }
+export interface IdentitySummary { groups: number; records: number; devices: number; merged: number; split: number; hot: HotValue[] }
+
+/** 连了太多源记录的匹配值：rule 是匹配字段，hash 是规范化后的加盐哈希，records 是连上的源记录数，sources 是涉及的数据源 ID */
+export interface HotValue { rule: string; hash: string; records: number; sources: string[] }
+
+/** 一个匹配值连上的源记录数达到这个数就告警（真实的人一个号最多是每个 customer 源各一条），见 ADR-0039 */
+export const HOT_VALUE_THRESHOLD = 10;
+/** 摘要里最多列出的告警值个数 */
+export const HOT_VALUE_LIMIT = 20;
 
 export const IDENTITIES = 'silver._identities';
 export const DEVICE_OWNER = 'silver._device_owner';
@@ -84,6 +92,8 @@ export interface IdentityOptions {
   priority?: Record<string, number>;
   /** 另外不进 _consumer 的敏感字段（映射里标成敏感的 x_ 字段，见 consumerSensitive）；标准模型的敏感字段总是不进 */
   sensitive?: readonly string[];
+  /** 告警阈值，默认 HOT_VALUE_THRESHOLD（测试用） */
+  hotThreshold?: number;
 }
 
 /**
@@ -117,6 +127,13 @@ export async function resolveIdentities(
       ? used.map(r => `SELECT n.node, ${lit(r)} AS rule, c.${ident(r)} AS value FROM ${CUSTOMER} c
           JOIN ${NODES} n ON n._source = c._source AND n.customer_id = c.customer_id WHERE c.${ident(r)} IS NOT NULL`).join(' UNION ALL ')
       : `SELECT NULL::BIGINT AS node, NULL::VARCHAR AS rule, NULL::VARCHAR AS value LIMIT 0`})`);
+    // 告警：按 (rule, 取值) 计连上的不同源记录数（不是统一消费者数），只告警，不改变打通结果
+    const hot = (await rows<{ rule: string; hash: string; records: string; sources: string[] }>(con, `
+      SELECT v.rule, v.value AS hash, count(DISTINCT v.node) AS records, list(DISTINCT n._source ORDER BY n._source) AS sources
+      FROM ${VALUES} v JOIN ${NODES} n USING (node) GROUP BY ALL
+      HAVING count(DISTINCT v.node) >= ${Math.trunc(opts.hotThreshold ?? HOT_VALUE_THRESHOLD)}
+      ORDER BY records DESC, hash, v.rule LIMIT ${HOT_VALUE_LIMIT}`))
+      .map(h => ({ rule: h.rule, hash: h.hash, records: Number(h.records), sources: h.sources }));
     // 每条记录在各匹配字段上的取值（排好序的列表，没有值时为空）：c0 是最高优先级的字段
     const col = (j: number) => `c${j}`;
     await con.run(`CREATE OR REPLACE TABLE ${WIDE} AS SELECT node${used.map((r, j) => `,
@@ -212,7 +229,7 @@ export async function resolveIdentities(
       FROM ${IDENTITIES}`);
     return {
       groups: Number(summary.groups), records: Number(summary.records), devices: Number(summary.devices),
-      merged: Number(summary.merged), split: Number(summary.split),
+      merged: Number(summary.merged), split: Number(summary.split), hot,
     };
   } finally {
     await con.run([NODES, VALUES, WIDE, EDGES, LABELS, NEXT, OLD_IDS, OVERLAP, OWNER, ASSIGNED, CHANGES, NEXT_IDS, RETIRED_MEMBERS]

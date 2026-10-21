@@ -14,10 +14,11 @@ import { can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import {
-  confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, GenerationMismatchError, getMapping, ignoreColumn, MappingError, mergeMapping, modelAssertionsForMapping, modelDraftForMapping, publishMapping, referenceTables,
+  confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, GenerationMismatchError, getMapping, ignoreColumn, latestIdentitySummary, MappingError, mergeMapping, modelAssertionsForMapping, modelDraftForMapping, publishMapping, referenceTables,
   type ModelDraftResult, requestDisable, restoreMapping, saveMappingDraft, yamlWithColumns,
 } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
+import { HOT_VALUE_THRESHOLD } from '~/.server/pipeline/identity-engine';
 import { publishReason } from '~/.server/publish-rules';
 import { fallbackText } from '~/lib/fallback';
 import { functionList } from '~/lib/mapping-expr';
@@ -124,6 +125,9 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         status: m.merge.status,
         statusLabel: m.merge.status === 'none' ? '未合并' : TASK_STATUS_LABELS[m.merge.status],
         history: m.merge.history,
+        /** customer 映射的合并记录页：最近一次成功打通里连了 HOT_VALUE_THRESHOLD 条以上源记录的匹配值个数（详情在数据质量页）；其他实体与其他标签页为 0 */
+        hotCount: m.entity === 'customer' && tabOf(request) === 'merges' ? (await latestIdentitySummary(member.tenant.id))?.hot.length ?? 0 : 0,
+        hotThreshold: HOT_VALUE_THRESHOLD,
       },
     };
   } catch (e) {
@@ -743,6 +747,13 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
 
         {tab === 'merges' && (
           <>
+            {merge.hotCount > 0 && (
+              <p className="mb-4 flex w-fit items-center gap-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700" data-hot-alert>
+                <AlertTriangle className="size-4" />
+                {`${merge.hotCount} 个匹配值各连了 ${merge.hotThreshold} 条以上记录，可能是占位号或代填号。`}
+                <Link to="/quality" className="font-medium underline">去数据质量页查看</Link>
+              </p>
+            )}
             <p className="mb-4 max-w-2xl text-sm text-slate-500">
               {merge.status === 'failed' && <AlertTriangle className="mr-1 inline size-3.5 text-red-600" />}
               {`这个映射最近一次合并：${merge.statusLabel}。发布后、以及同步给这个映射的源表写入了变更后，已发布的最新版本把原始层的新批次合并进标准层；换了版本时由全部批次重建。写了兜底值的字段，每次合并列出本次落入兜底的取值。`}
