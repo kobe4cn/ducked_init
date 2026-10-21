@@ -31,10 +31,10 @@ const METRIC_SYSTEM = [
   '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
   '输入：request 是成员用自然语言写的需求；context.entities 是能用的实体与字段（base 为 true 的才能做基础实体），context.relations 是实体间的关系（实体.字段 → 实体.主键）。',
   '输出格式：',
-  `{ "base": 基础实体, "measure": { "agg": ${AGGS.join(' | ')}, "field"?: 基础实体的字段（count 可不写）, "by"?: 时间或日期字段（只用于 latest / earliest）,`,
-  `    "numerator"?: 分子, "denominator"?: 分母（只用于 ratio，各为 { "agg": ${RATIO_AGGS.join(' | ')}, "field"?: 字段, "filter"?: 写法同下面的 filter }） },`,
-  `  "filter"?: [{ "field": 基础实体的字段, "op": ${FILTER_OPS.join(' | ')}, "value"?: 取值或取值列表（in / not_in 写列表，is_null / not_null 不写） }],`,
-  '  "window"?: { "field": 基础实体的时间或日期字段, "days": 正整数 },',
+  `{ "base": 基础实体, "measure": { "agg": ${AGGS.join(' | ')}, "field"?: 基础实体的字段，或从基础实体出发的维度路径（取原值，关联不上为 NULL）（count 可不写）, "by"?: 时间或日期字段，写法同 field（只用于 latest / earliest）,`,
+  `    "numerator"?: 分子, "denominator"?: 分母（只用于 ratio，各为 { "agg": ${RATIO_AGGS.join(' | ')}, "field"?: 写法同 measure 的 field, "filter"?: 写法同下面的 filter }） },`,
+  `  "filter"?: [{ "field": 基础实体的字段，或从基础实体出发的维度路径（取原值，关联不上为 NULL）, "op": ${FILTER_OPS.join(' | ')}, "value"?: 取值或取值列表（in / not_in 写列表，is_null / not_null 不写） }],`,
+  '  "window"?: { "field": 时间或日期字段，基础实体的字段，或从基础实体出发的维度路径（取原值，关联不上为 NULL）, "days": 正整数 },',
   `  "dimensions"?: [{ "name": 小写字母开头的列名, "path": 维度路径 }]（最多 ${MAX_DIMENSIONS} 个）,`,
   '  "description"?: 不超过 500 字的中文说明 }',
   '规则：',
@@ -44,6 +44,7 @@ const METRIC_SYSTEM = [
   '- latest / earliest 按 by 取最新 / 最早一行的 field，field 只能是整数或小数字段；距今天数（如最近一次购买距今几天）用 days_since，field 是时间或日期字段。',
   `- 维度路径从基础实体出发，写成 实体.字段 -> 实体.字段，每一跳要沿 context.relations 里的一条关系走到下一实体的主键，最多 ${MAX_HOPS} 跳；`,
   `  或者写一段 ${CONSUMER_ENTITY}.字段，取统一消费者的属性（字段是 customer 的字段，基础实体要有 customer_id）。`,
+  `- filter、measure、window 的字段也能写同样的维度路径（如按门店的区域过滤、按商品的品类过滤），但不能写 ${CONSUMER_ENTITY}.字段。`,
   '- 需求没提到的部分不要加；不要输出 device_attribution。',
 ].join('\n');
 

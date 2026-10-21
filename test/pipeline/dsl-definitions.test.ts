@@ -3,18 +3,20 @@
 // 样本预览（previewDefinition）在只读挂载的数据湖上按今天运行编译出的 SQL，给出前 50 行与总行数，湖与任务队列不变。
 // 双人发布（publishDefinition）以当天入队 gold.dsl，调度器成功后登记快照；丢弃草稿（discardDslDraft）回到已发布版本或删除定义
 // 标签只引用指标最新的已发布版本，快照每行带不变的 tag_key。删除定义（deleteDefinition）：被已发布标签引用的指标不能删。
-// 发布前的影响预览（impactOf）在只读挂载上对比已发布版本与草稿，只给计数，湖与任务队列不变
+// 发布前的影响预览（impactOf）在只读挂载上对比已发布版本与草稿，只给计数，湖与任务队列不变。
+// filter 写字段路径（ADR-0038）的指标能发布，路径经过的实体进依赖：定时刷新与停用映射的影响都跟着变
 import { and, eq } from 'drizzle-orm';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { dslVersions, mappings, tasks } from '../../app/.server/db/schema';
 import { createDefinition, deleteDefinition, discardDslDraft, DslError, getDefinition, impactOf, previewDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { publishMapping, saveDraft } from '../../app/.server/mappings';
+import { disableImpact, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import { enqueueDueRefreshes } from '../../app/.server/refresh';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, relistSource, setSyncScope } from '../../app/.server/sources';
@@ -195,6 +197,43 @@ const ALL_REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\n';
 const ORDERS = 'base: order\nmeasure: { agg: count }\n';
 /** 同时引用 revenue 与 orders 的多指标标签 */
 const MIXED = 'rules:\n  - { value: big, when: { all: [{ metric: revenue, gte: 100 }, { metric: orders, gte: 2 }] } }\ndefault: other\n';
+
+describe('字段路径（ADR-0038）', () => {
+  it('filter 写路径的指标能发布，结果与手写 SQL 一致；只合并门店后定时刷新入队它、不入队只依赖订单的指标；停用门店映射时影响里列出它', async () => {
+    const { acme, author, reviewer, sources: { crm } } = await ordersWithStores();
+    await createDefinition(author, 'metric', 'store_one', 'base: order\nmeasure: { agg: count }\nfilter:\n  - { field: order.store_id -> custom_store.name, op: eq, value: 一店 }\n');
+    const task = await publishDefinition(reviewer, 'metric', 'store_one', 1);
+    expect(task.params).toMatchObject({ entities: ['custom_store', 'order'] });
+    await createDefinition(author, 'metric', 'all_orders', 'base: order\nmeasure: { agg: count }\n');
+    await publishDefinition(reviewer, 'metric', 'all_orders', 1);
+    await drain();
+    expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
+    const rows = await onLake(acme, `SELECT consumer_id, value::VARCHAR AS value FROM gold."metric__${task.id}" ORDER BY ALL`);
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows).toEqual(await onLake(acme, `SELECT i.consumer_id, count(*)::VARCHAR AS value FROM silver."order" b
+      JOIN silver._identities i ON i._source = b._customer_source AND i.customer_id = b.customer_id
+      JOIN silver.custom_store s ON s.store_id = b.store_id WHERE s.name = '一店' GROUP BY ALL ORDER BY ALL`));
+
+    // 第二天只改了门店：依赖 custom_store 的指标入队，只依赖订单的不入队（当天已有快照，所以拨到第二天看）
+    const refreshed = async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date(Date.now() + 24 * 60 * 60 * 1000));
+      try {
+        return (await enqueueDueRefreshes()).filter(t => t.kind === 'gold.dsl').map(t => t.params.key);
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+    expect(await refreshed()).toEqual([]);
+    await grantOnSource(`INSERT INTO crm.stores VALUES ('A3', '三店', '2024-08-01')`);
+    await syncSource(author, crm);
+    await drain();
+    expect(await refreshed()).toEqual(['store_one']);
+
+    const [stores] = await getDb().select({ id: mappings.id }).from(mappings).where(and(eq(mappings.sourceId, crm), eq(mappings.tableName, 'stores')));
+    expect(await disableImpact(getDb(), acme, stores!.id)).toEqual({ metrics: [{ key: 'store_one' }], tags: [] });
+  });
+});
 
 describe('发布与丢弃', () => {
   it('最后保存草稿的人与分析师不能发布；另一位数据工程师发布后版本锁定，以当天入队 gold.dsl，成功后登记快照；再改是新一版草稿，再发布只新增快照', async () => {

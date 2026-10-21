@@ -1,5 +1,5 @@
 // test/metric-spec.test.ts —— 指标 DSL：YAML 校验与按行列报错（基础实体、字段、敏感字段、维度路径的关系 / 跳数 / 成环、维度个数、as_of），
-// 同样的定义编译出同样的 SQL，编译出的 SQL 在内存 DuckDB 里对手造的标准层得到已知答案（纯函数，不碰平台库与数据湖）
+// filter、measure、window 的字段写维度路径（ADR-0038）的校验、依赖与 JOIN 复用；同样的定义编译出同样的 SQL，编译出的 SQL 在内存 DuckDB 里对手造的标准层得到已知答案（纯函数，不碰平台库与数据湖）
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { RegisteredEntity } from '../app/.server/custom-entities';
@@ -18,7 +18,7 @@ const entity = (name: string, fields: CustomEntityField[], relations: EntityRela
 
 // 门店 → 区域 → 国家 → 大洲；门店有指向自己的上级门店；custom_visit 是带 customer_id 的事实实体，referrer_id 是另一个指向 customer 的引用
 const published = new Map<string, RegisteredEntity>([
-  entity('custom_store', [field('store_id'), field('region_id'), field('name'), field('parent_id')],
+  entity('custom_store', [field('store_id'), field('region_id'), field('name'), field('parent_id'), field('area', 'decimal')],
     [rel('order.store_id', 'custom_store.store_id'), rel('custom_store.region_id', 'custom_region.region_id'), rel('custom_store.parent_id', 'custom_store.store_id')]),
   entity('custom_region', [field('region_id'), field('name'), field('manager_phone', 'string', true), field('country_id')],
     [rel('custom_region.country_id', 'custom_country.country_id')]),
@@ -120,6 +120,13 @@ describe('指标 DSL：校验', () => {
     ['consumer 维度没有这个字段', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: a, path: consumer.customer_id }\n', 4, /consumer 没有字段 customer_id/],
     ['consumer 维度写了多段', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: a, path: consumer.city -> custom_store.name }\n', 4, /只能写一段/],
     ['基础实体没有 customer_id 时不能按 consumer 做维度', 'base: custom_store\nmeasure: { agg: count }\ndimensions:\n  - { name: a, path: consumer.city }\n', 4, /custom_store 没有 customer_id，不能按 consumer 做维度/],
+    ['sum 的字段路径终点是文本', 'base: order\nmeasure: { agg: sum, field: order.store_id -> custom_store.name }\n', 2, /sum 只能用整数或小数字段/],
+    ['窗口的字段路径终点不是时间或日期', 'base: order\nmeasure: { agg: count }\nwindow: { field: order.store_id -> custom_store.area, days: 30 }\n', 3, /时间窗口要用时间或日期字段/],
+    ['过滤的字段路径终点是敏感字段', 'base: order\nmeasure: { agg: count }\nfilter:\n  - { field: order.store_id -> custom_store.region_id -> custom_region.manager_phone, op: not_null }\n', 4, /过滤不能用敏感字段 custom_region\.manager_phone/],
+    ['过滤用了 consumer.<字段>', 'base: order\nmeasure: { agg: count }\nfilter:\n  - { field: consumer.city, op: eq, value: 北京 }\n', 4, /consumer\.city 只能用作维度/],
+    ['过滤的字段路径终点取值不在标准枚举里', 'base: order\nmeasure: { agg: count }\nfilter:\n  - { field: order.customer_id -> customer.gender, op: eq, value: x }\n', 4, /gender.*female/],
+    ['字段路径只有一段但不是基础实体', 'base: order\nmeasure: { agg: count_distinct, field: custom_store.name }\n', 2, /路径要从基础实体 order 出发/],
+    ['度量的字段路径不是指向主键的关系', 'base: order\nmeasure: { agg: count_distinct, field: order.channel -> custom_store.name }\n', 2, /order\.channel.*custom_store/],
   ])('%s', (_, yaml, line, message) => {
     const found = issues(yaml);
     expect(found.find(i => message.test(i.message)), JSON.stringify(found)).toMatchObject({ line });
@@ -137,6 +144,28 @@ describe('指标 DSL：校验', () => {
     expect(DSL_KINDS.metric.dependencies(ok(LATEST)).fields).toEqual([{ entity: 'order', field: 'amount' }, { entity: 'order', field: 'created_at' }]);
     // 已发布版本的 YAML 不经 Schema 直接交给 dependencies：分子缺 filter、缺分母都不出错
     expect(DSL_KINDS.metric.dependencies({ base: 'order', measure: { agg: 'ratio', numerator: { agg: 'count' } } } as MetricSpec).fields).toEqual([]);
+  });
+
+  it('filter、measure、window 可写维度路径（一段的 <基础实体>.字段 等同裸字段）；依赖计入路径经过的实体与各段字段', () => {
+    const yaml = 'base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: sum, field: order.store_id -> custom_store.area, filter: [{ field: order.customer_id -> customer.gender, op: eq, value: female }] }\n  denominator: { agg: count }\n'
+      + 'filter:\n  - { field: order.store_id -> custom_store.region_id -> custom_region.name, op: eq, value: 华东 }\nwindow: { field: order.created_at, days: 30 }\n';
+    ok(yaml);
+    ok('base: order\nmeasure: { agg: latest, field: order.store_id -> custom_store.area, by: order.created_at }\n');
+    ok('base: custom_visit\nmeasure: { agg: days_since, field: custom_visit.visited_on }\n');
+    expect(DSL_KINDS.metric.dependencies(ok(yaml))).toMatchObject({
+      entities: ['custom_region', 'custom_store', 'customer', 'order'],
+      fields: [
+        { entity: 'custom_region', field: 'name' },
+        { entity: 'custom_store', field: 'area' },
+        { entity: 'custom_store', field: 'region_id' },
+        { entity: 'customer', field: 'gender' },
+        { entity: 'order', field: 'created_at' },
+        { entity: 'order', field: 'customer_id' },
+        { entity: 'order', field: 'store_id' },
+      ],
+    });
+    // 依赖只看结构：字段不是字符串时跳过，不出错
+    expect(DSL_KINDS.metric.dependencies({ base: 'order', measure: { agg: 'sum', field: 3 }, filter: [{ field: null }] } as unknown as MetricSpec).fields).toEqual([]);
   });
 
   it.each([
@@ -237,6 +266,40 @@ describe('指标 DSL：编译', () => {
     ].join('\n'));
     expect(compileMetric(ok('base: order\nmeasure: { agg: count }\n'), ctx, '2024-07-01')).not.toContain('_device_owner');
   });
+
+  it('只写裸字段、带两个同前缀维度的定义与原来逐字节一致；一段的 <基础实体>.字段 编译成裸字段', () => {
+    const yaml = (prefix: string) => `base: order\nmeasure: { agg: sum, field: ${prefix}amount }\nfilter:\n  - { field: ${prefix}status, op: in, value: [paid, completed] }\nwindow: { field: ${prefix}created_at, days: 30 }\n`
+      + 'dimensions:\n  - { name: store, path: order.store_id -> custom_store.name }\n  - { name: region, path: order.store_id -> custom_store.region_id -> custom_region.name }\n';
+    const sql = compileMetric(ok(yaml('')), ctx, '2024-07-01');
+    expect(sql).toBe([
+      'SELECT i.consumer_id, COALESCE(NULLIF(CAST(d0_1."name" AS VARCHAR), \'\'), \'未关联\') AS "store", COALESCE(NULLIF(CAST(d1_2."name" AS VARCHAR), \'\'), \'未关联\') AS "region", SUM(b."amount") AS value',
+      'FROM silver."order" b',
+      'INNER JOIN silver._identities i ON i._source = b._customer_source AND i.customer_id = b.customer_id',
+      'LEFT JOIN silver."custom_store" d0_1 ON d0_1."store_id" = b."store_id"',
+      'LEFT JOIN silver."custom_store" d1_1 ON d1_1."store_id" = b."store_id"',
+      'LEFT JOIN silver."custom_region" d1_2 ON d1_2."region_id" = d1_1."region_id"',
+      'WHERE b."status" IN (\'paid\', \'completed\')',
+      '  AND (b."created_at" AT TIME ZONE \'UTC\')::DATE > DATE \'2024-07-01\' - 30',
+      '  AND (b."created_at" AT TIME ZONE \'UTC\')::DATE <= DATE \'2024-07-01\'',
+      'GROUP BY ALL',
+      'ORDER BY ALL',
+    ].join('\n'));
+    expect(compileMetric(ok(yaml('order.')), ctx, '2024-07-01')).toBe(sql);
+  });
+
+  it('字段路径与维度前缀相同时复用维度的别名，字段路径之间也只连一次；其余段新开 p 别名、紧跟维度之后', () => {
+    const sql = compileMetric(ok('base: order\nmeasure: { agg: count_distinct, field: order.store_id -> custom_store.region_id -> custom_region.country_id }\n'
+      + 'filter:\n  - { field: order.store_id -> custom_store.region_id -> custom_region.name, op: eq, value: 华东 }\n'
+      + 'dimensions:\n  - { name: store, path: order.store_id -> custom_store.name }\n'), ctx, '2024-07-01');
+    expect(sql.match(/LEFT JOIN silver\."custom_store"/g)).toHaveLength(1);
+    expect(sql.match(/LEFT JOIN silver\."custom_region"/g)).toHaveLength(1);
+    expect(sql).toContain('LEFT JOIN silver."custom_store" d0_1 ON d0_1."store_id" = b."store_id"\nLEFT JOIN silver."custom_region" p0_2 ON p0_2."region_id" = d0_1."region_id"');
+    expect(sql).toContain('COUNT(DISTINCT p0_2."country_id")');
+    expect(sql).toContain('WHERE p0_2."name" = \'华东\'');
+    // 跳到 customer 的字段路径照维度按引用列的数据源列关联
+    expect(compileMetric(ok('base: order\nmeasure: { agg: count }\nfilter:\n  - { field: order.customer_id -> customer.gender, op: eq, value: female }\n'), ctx, '2024-07-01'))
+      .toContain('LEFT JOIN silver."customer" p0_1 ON p0_1."customer_id" = b."customer_id" AND p0_1._source = b."_customer_source"');
+  });
 });
 
 describe('指标 DSL：编译出的 SQL 的结果', () => {
@@ -287,7 +350,9 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
       ALTER TABLE silver."order" ADD COLUMN _customer_source VARCHAR;
       UPDATE silver."order" SET _customer_source = _source;
       ALTER TABLE silver.event ADD COLUMN _customer_source VARCHAR;
-      UPDATE silver.event SET _customer_source = _source;`);
+      UPDATE silver.event SET _customer_source = _source;
+      ALTER TABLE silver.custom_store ADD COLUMN area DECIMAL(18,2);
+      UPDATE silver.custom_store SET area = CASE store_id WHEN 'st1' THEN 10.5 WHEN 'st2' THEN 20 WHEN 'st3' THEN 30 END;`);
   });
 
   afterAll(() => {
@@ -372,5 +437,35 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
       { consumer_id: 'c1', city: '未关联', value: 1 },
       { consumer_id: 'c2', city: '未关联', value: 3 },
     ]);
+  });
+
+  // 门店面积 st1 10.5、st2 20、st3 30、st4 为空；o5 的门店不在表里、o6 没有门店、o7 的门店没有区域
+  it('filter 与 measure 写路径时取终点原值：关联不上为 NULL，eq / ne 不命中、is_null 命中、sum 跳过；结果与手写 SQL 一致', async () => {
+    const hand = async (select: string, where = 'TRUE') => (await con.runAndReadAll(`SELECT i.consumer_id, ${select} AS value
+      FROM silver."order" b JOIN silver._identities i ON i._source = b._customer_source AND i.customer_id = b.customer_id
+      LEFT JOIN silver.custom_store s ON s.store_id = b.store_id LEFT JOIN silver.custom_region r ON r.region_id = s.region_id
+      WHERE ${where} GROUP BY ALL ORDER BY ALL`)).getRowObjectsJson().map(r => ({ ...r, value: r.value === null ? null : Number(r.value) }));
+    const region = (op: string, value = '') => `base: order\nmeasure: { agg: count }\nfilter:\n  - { field: order.store_id -> custom_store.region_id -> custom_region.name, op: ${op}${value && `, value: ${value}`} }\n`;
+
+    expect(await run(region('eq', '华东'))).toEqual([{ consumer_id: 'c1', value: 4 }, { consumer_id: 'c2', value: 1 }]);
+    expect(await run(region('eq', '华东'))).toEqual(await hand('COUNT(*)', "r.name = '华东'"));
+    expect(await run(region('ne', '华东'))).toEqual([{ consumer_id: 'c1', value: 1 }]);
+    expect(await run(region('is_null'))).toEqual([{ consumer_id: 'c2', value: 3 }]);
+    expect(await run(region('is_null'))).toEqual(await hand('COUNT(*)', 'r.name IS NULL'));
+
+    const area = 'base: order\nmeasure: { agg: sum, field: order.store_id -> custom_store.area }\n';
+    expect(await run(area)).toEqual([{ consumer_id: 'c1', value: 81.5 }, { consumer_id: 'c2', value: 10.5 }]);
+    expect(await run(area)).toEqual(await hand('SUM(s.area)'));
+  });
+
+  it('维度与字段路径共用前缀时结果不变；ratio 分子的过滤能引用路径', async () => {
+    expect(await run('base: order\nmeasure: { agg: sum, field: order.store_id -> custom_store.area }\nfilter:\n  - { field: order.store_id -> custom_store.region_id -> custom_region.name, op: eq, value: 华东 }\n'
+      + 'dimensions:\n  - { name: store, path: order.store_id -> custom_store.name }\n')).toEqual([
+      { consumer_id: 'c1', store: '一店', value: 31.5 },
+      { consumer_id: 'c1', store: '三店', value: 30 },
+      { consumer_id: 'c2', store: '一店', value: 10.5 },
+    ]);
+    expect(await run('base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: count, filter: [{ field: order.store_id -> custom_store.region_id -> custom_region.name, op: eq, value: 华东 }] }\n  denominator: { agg: count }\n'))
+      .toEqual([{ consumer_id: 'c1', value: 0.8 }, { consumer_id: 'c2', value: 0.25 }]);
   });
 });
