@@ -607,6 +607,32 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     expect(changes.filter(c => c.reason === 'split').map(c => c.old_id)).toEqual(['x', 'x']);
   });
 
+  it('merge 退役的 ID 把它在上一版里的全部源记录记进 _consumer_id_members；没有 merge 的重算不写', async () => {
+    const { acme } = await publishedIdentitySources();
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    const read = async (sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson();
+    const members = (where = 'true') => read(`SELECT consumer_id, _source, customer_id FROM silver._consumer_id_members WHERE ${where} ORDER BY ALL`);
+    try {
+      const before = await members();
+      // 一个三条记录的组原来分属两个 ID：最小的一条用 m-1，另两条用 m-2；没在分配表里的 ID 平局取较小的，m-2 退役
+      await session.con.run(`
+        CREATE TEMP TABLE trio AS SELECT _source, customer_id, row_number() OVER (ORDER BY _source, customer_id) AS k FROM silver._identities
+        WHERE consumer_id = (SELECT consumer_id FROM silver._identities GROUP BY 1 HAVING count(*) = 3 ORDER BY 1 LIMIT 1);
+        UPDATE silver._identities i SET consumer_id = CASE WHEN t.k = 1 THEN 'm-1' ELSE 'm-2' END FROM trio t
+        WHERE i._source = t._source AND i.customer_id = t.customer_id`);
+      const expected = await read(`SELECT 'm-2' AS consumer_id, _source, customer_id FROM trio WHERE k > 1 ORDER BY ALL`);
+      expect(await resolveIdentities(session.con)).toMatchObject({ merged: 1, split: 0 });
+      expect(await members(`consumer_id LIKE 'm-%'`)).toEqual(expected);
+      expect(await members(`consumer_id NOT LIKE 'm-%'`)).toEqual(before);
+      expect(await read(`SELECT DISTINCT consumer_id FROM silver._identities i JOIN trio t USING (_source, customer_id)`)).toEqual([{ consumer_id: 'm-1' }]);
+      const all = await members();
+      expect(await resolveIdentities(session.con)).toMatchObject({ merged: 0, split: 0 });
+      expect(await members()).toEqual(all);
+    } finally {
+      session.close();
+    }
+  });
+
   it('新组的哈希撞上分配过的 ID（包括已退役的）时加盐重算，直到不撞', async () => {
     const { acme } = await publishedIdentitySources();
     const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });

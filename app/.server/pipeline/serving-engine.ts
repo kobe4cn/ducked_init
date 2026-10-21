@@ -2,7 +2,7 @@
 // 上传到本租户存储前缀下的 _serving/v<版本>.duckdb。工作进程不读平台库，读哪些快照由调用方放进参数。
 // 服务库只有 consumer_id、标签、指标与 RFM 分值，以及统一消费者 ID 的退役对照，不放标准层或原始层的表；快照表本来就没有明文（ADR-0005）
 import { SERVING_DIR, type TenantLakeSession } from './lake-engine';
-import { CONSUMER_ID_CHANGES } from './identity-engine';
+import { CONSUMER_ID_CHANGES, CONSUMER_ID_MEMBERS, IDENTITIES } from './identity-engine';
 import { ident, lit, rows, tableExists } from './merge-engine';
 
 /** 一个要放进服务库的快照：快照 ID、模板（rfm、metric:<键>、tag:<键>）与结果层表名；其余字段（定义版本等）由调用方记在指针上 */
@@ -46,6 +46,38 @@ function classify(snapshots: ServingSnapshot[]) {
 /** 各部分 UNION ALL 起来；没有部分时用 empty（只带列与类型、没有行） */
 const union = (parts: string[], empty: string) => (parts.length ? parts.join('\nUNION ALL\n') : `${empty} LIMIT 0`);
 
+const exists = (con: TenantLakeSession['con'], qualified: string) => {
+  const [schema, table] = qualified.split('.') as [string, string];
+  return tableExists(con, schema, table);
+};
+
+/**
+ * 退役 ID → 现在的 ID 的查询（ADR-0029）。退役的 ID 只来自 merge（split 的原 ID 留给另一组，不退役）。
+ * 有成员记录的退役 ID 按成员解析：退役时的源记录现在有过半（按退役时的条数算，删掉的仍计入分母）属于某个统一消费者就指向它，
+ * 没有就不给别名——合并后又拆开时不指向留下原 ID 的那个人；_identities 不在时它们都没有别名。没有成员记录的（老湖、之前退役的）沿 merge 链走到现在的 ID
+ */
+async function aliasesSql(con: TenantLakeSession['con']) {
+  if (!(await exists(con, CONSUMER_ID_CHANGES))) return 'SELECT NULL::VARCHAR AS retired_id, NULL::VARCHAR AS consumer_id LIMIT 0';
+  const hasMembers = await exists(con, CONSUMER_ID_MEMBERS);
+  const owned = await exists(con, IDENTITIES)
+    ? `SELECT m.retired_id, i.consumer_id, count(*) AS n
+      FROM members m JOIN ${IDENTITIES} i ON i._source = m._source AND i.customer_id = m.customer_id GROUP BY ALL`
+    : 'SELECT NULL::VARCHAR AS retired_id, NULL::VARCHAR AS consumer_id, NULL::BIGINT AS n LIMIT 0';
+  return `WITH RECURSIVE merged AS (SELECT DISTINCT old_id, new_id FROM ${CONSUMER_ID_CHANGES} WHERE reason = 'merge'),${hasMembers ? `
+    members AS (SELECT DISTINCT consumer_id AS retired_id, _source, customer_id FROM ${CONSUMER_ID_MEMBERS}),
+    total AS (SELECT retired_id, count(*) AS n FROM members GROUP BY retired_id),
+    owned AS (${owned}),` : ''}
+    walk(retired_id, consumer_id, depth) AS (
+      SELECT old_id, new_id, 1 FROM merged${hasMembers ? ' WHERE old_id NOT IN (SELECT retired_id FROM total)' : ''}
+      UNION ALL
+      SELECT w.retired_id, m.new_id, w.depth + 1 FROM walk w JOIN merged m ON m.old_id = w.consumer_id WHERE w.depth < 1000)
+    SELECT * FROM (
+      SELECT retired_id, consumer_id FROM walk WHERE consumer_id NOT IN (SELECT old_id FROM merged)${hasMembers ? `
+      UNION ALL
+      SELECT o.retired_id, o.consumer_id FROM owned o JOIN total t USING (retired_id) WHERE o.n * 2 > t.n` : ''})
+    ORDER BY consumer_id, retired_id`;
+}
+
 /**
  * 在会话的本机库 serving 里建好服务库的表（都按 consumer_id 排序写入），上传到 target；返回各表行数。
  * 快照表不在时抛错、不上传
@@ -82,16 +114,7 @@ export async function buildServingStore(session: TenantLakeSession, { version, t
     rfm.map(s => `SELECT ${rfmColumns} FROM ${quoted(s.table)}`),
     `SELECT ${rfmColumns} FROM (SELECT NULL AS consumer_id, NULL AS segment, NULL AS r, NULL AS f, NULL AS m, NULL AS recency_days, NULL AS frequency, NULL AS monetary)`,
   )}) ORDER BY consumer_id`);
-  // 退役的 ID 只来自 merge（split 的原 ID 留给另一组，不退役，ADR-0029）；退役 ID 合进的 ID 后来也可能退役，沿着链走到现在的 ID
-  const [schema, table] = CONSUMER_ID_CHANGES.split('.') as [string, string];
-  await con.run(`CREATE TABLE serving.consumer_aliases AS ${await tableExists(con, schema, table)
-    ? `WITH RECURSIVE merged AS (SELECT DISTINCT old_id, new_id FROM ${CONSUMER_ID_CHANGES} WHERE reason = 'merge'),
-      walk(retired_id, consumer_id, depth) AS (
-        SELECT old_id, new_id, 1 FROM merged
-        UNION ALL
-        SELECT w.retired_id, m.new_id, w.depth + 1 FROM walk w JOIN merged m ON m.old_id = w.consumer_id WHERE w.depth < 1000)
-      SELECT retired_id, consumer_id FROM walk WHERE consumer_id NOT IN (SELECT old_id FROM merged) ORDER BY consumer_id, retired_id`
-    : 'SELECT NULL::VARCHAR AS retired_id, NULL::VARCHAR AS consumer_id LIMIT 0'}`);
+  await con.run(`CREATE TABLE serving.consumer_aliases AS ${await aliasesSql(con)}`);
   await con.run(`CREATE TABLE serving.meta AS SELECT ${version}::INTEGER AS version, now() AS built_at`);
 
   const [counts] = await rows<Record<keyof ServingRows, string>>(con, `SELECT

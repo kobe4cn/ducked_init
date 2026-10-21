@@ -2,7 +2,7 @@
 
 ADR-0019 补充（#76）里，统一消费者 ID 是组内最小源记录 `(_source, customer_id)` 的哈希。组的成员一变（新记录把两个人连起来、改规则把一个人拆开、最小的那条源记录被删），ID 就跟着变，结果层的快照、下游系统按旧 ID 存的数据都对不上。#147 定下 ID 分配后固定，#181 落地。
 
-**两张表，都在湖里。** `silver._consumer_ids(consumer_id, assigned_at, retired_at)` 是分配表（包括已退役的 ID），`silver._consumer_id_changes(old_id, new_id, reason, changed_at)` 是变更表，`reason` 取 `merge` 或 `split`，只追加。「源记录 → ID」仍只存在 `silver._identities`。不放平台 PG：ADR-0002 规定业务数据只落湖，工作进程也不连平台库。两张表由 `resolveIdentities` 用 `CREATE TABLE IF NOT EXISTS` 建，与 `_identities` 在同一个 lake 事务里写入，不进 `lake-schemas.ts`（ADR-0020：不预建打通表）。合并时分配表不在也会触发重算，同 `_identities`。
+**两张表，都在湖里**（后来加了成员表，见「先合后拆」）。 `silver._consumer_ids(consumer_id, assigned_at, retired_at)` 是分配表（包括已退役的 ID），`silver._consumer_id_changes(old_id, new_id, reason, changed_at)` 是变更表，`reason` 取 `merge` 或 `split`，只追加。「源记录 → ID」仍只存在 `silver._identities`。不放平台 PG：ADR-0002 规定业务数据只落湖，工作进程也不连平台库。两张表由 `resolveIdentities` 用 `CREATE TABLE IF NOT EXISTS` 建，与 `_identities` 在同一个 lake 事务里写入，不进 `lake-schemas.ts`（ADR-0020：不预建打通表）。合并时分配表不在也会触发重算，同 `_identities`。
 
 **怎么选 ID。** 标签传播算出新的组之后、写入事务之前，在 `stage` 里对照上一版 `_identities`：
 1. 新组按 `(_source, customer_id)` 等值连接旧 `_identities`，按（新组，旧 ID）数重叠的源记录数。
@@ -17,6 +17,12 @@ ADR-0019 补充（#76）里，统一消费者 ID 是组内最小源记录 `(_sou
 
 **新 ID 仍是组内最小源记录的哈希**，新租户、新的组 ID 与以前一样；但可能撞上分配表里已有的 ID（包括已退役的，比如拆出来的组恰好以原组的最小记录为最小记录），撞了就在哈希输入后面加盐（`chr(31)` 加序号）重算，直到不撞。
 
+**先合后拆（#252）。** 发错映射再改正（占位手机号、规则改错）或一个手机号先后被两个人用，会让一些人先合进一个 ID、之后又拆开：合并时退役的 ID 记了 `merge`（旧 → A），拆开后 A 只留给其中一个人，其余人分到新 ID、记 `split`。只沿 `merge` 链解析别名时，这些退役 ID 全指向 A，点查返回的是别人的标签与指标。ID 分配规则不变，退役的 ID 不再分回去（撞号加盐照旧），改为按成员解析别名：
+- 合并时把每个被 `merge` 退役的 ID 在上一版 `_identities` 里的全部源记录记进 `silver._consumer_id_members(consumer_id, _source, customer_id)`，与 `_identities`、分配表、变更表同一事务写入、只追加（一个 ID 只退役一次）；同时记了 `split` 的 ID 只要被 `merge` 退役，成员照记。
+- 建服务库时，有成员记录的退役 ID 把成员连上当前 `_identities`：某个统一消费者拥有的成员数 × 2 **严格大于**退役时的成员总数就指向它，按源记录数算、不按人数，组里后来新增的源记录不计入，分母不因成员被删而缩小；没有这样的消费者就没有别名，点查 404。不沿 `merge` 链，多次合并也一步连到现在的 ID。
+- 没有成员记录的退役 ID（本决定之前退役的、老湖）照旧沿 `merge` 链解析；已有的坏别名不修。点查响应不加字段，调用方比较 `consumer_id` 与请求的 ID 即知是否经过别名。
+- 成员表与 `_identities` 一样是「源记录 → ID」的对照，同样敏感；删除请求（#24）要一并擦除。
+
 **老湖播种。** 有 `_identities`、没有分配表时，先用 `_identities` 里现有的 ID 播种（`assigned_at` 取当前时间），原 ID 全部保留，不记变更。
 
 摘要 `IdentitySummary` 加上本次的 `merged`、`split`，随合并任务结果保存。两者按组计、不是变更表的条数：`merged` 是由多个旧 ID 合并成的新组数（三合一记 2 条 `merge`，算 1），`split` 是被拆开的旧 ID 数（一拆三记 2 条 `split`，算 1），数据地图据此显示「合并 N 组、拆开 M 组」。
@@ -25,5 +31,6 @@ ADR-0019 补充（#76）里，统一消费者 ID 是组内最小源记录 `(_sou
 
 - 贪心对照，不求全局最优的匹配：极端的交叉拆合下，某组可能没分到本可以分到的旧 ID，记成 `split`。
 - 记录全部消失的旧 ID 不退役、不记变更，仍留在分配表里（新 ID 不会再撞上它）。
-- `_identities` 被删而分配表还在时，对照不到旧 ID，所有组都取新 ID（撞上的加盐），不记变更。
-- 用旧 ID 点查（返回新消费者并带上「已合并到」，#14）、删除请求覆盖历史 ID（#24）、在数据地图显示合并与拆开数，都不在这里，见 #147。
+- `_identities` 被删而分配表还在时，对照不到旧 ID，所有组都取新 ID（撞上的加盐），不记变更；建服务库时有成员记录的退役 ID 也都没有别名。
+- 先合后拆以后，没占到过半成员的人原来的 ID 没有别名、点查 404，下游要按新 ID 重新对上；本决定之前退役的 ID 没有成员记录，沿 `merge` 链仍可能指向别人（链途经后来有成员记录的 ID 也照样沿链走），不修。
+- 用旧 ID 点查（返回新消费者并带上「已合并到」，#14）、删除请求覆盖历史 ID 与成员表（#24）、在数据地图显示合并与拆开数，都不在这里，见 #147。

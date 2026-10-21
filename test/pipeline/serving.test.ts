@@ -130,6 +130,32 @@ describe('生成服务库', () => {
     ]);
   });
 
+  it('有成员记录的退役 ID 指向拥有它过半源记录的消费者（先合后拆后不指向别人），恰好一半或更少时没有别名；多次合并直接指向现在的 ID', async () => {
+    const { acme, snapshots, dataPath } = await publishedDefinitions();
+    await onLake(acme, `CREATE TABLE IF NOT EXISTS silver._consumer_id_changes (old_id VARCHAR, new_id VARCHAR, reason VARCHAR, changed_at TIMESTAMPTZ);
+      CREATE TABLE IF NOT EXISTS silver._consumer_id_members (consumer_id VARCHAR, _source VARCHAR, customer_id VARCHAR);
+      INSERT INTO silver._consumer_id_changes VALUES
+        ('r1', 'Q', 'merge', now()), ('r2', 'Q', 'merge', now()), ('r3', 'Q', 'merge', now()), ('r4', 'r5', 'merge', now()), ('r5', 'R', 'merge', now());
+      INSERT INTO silver._consumer_id_members VALUES
+        ('r1', 's', '1'), ('r1', 's', '2'), ('r1', 's', '3'), ('r2', 's', '4'), ('r2', 's', '5'),
+        ('r3', 's', '6'), ('r3', 's', '7'), ('r3', 's', '8'), ('r4', 's', '9'), ('r5', 's', '9'), ('r5', 's', '10');
+      -- r1 并进 Q 后又拆开：三条里两条现在在 P；r2 恰好一半；r3 只剩一条（另两条已删除，分母仍是 3）；P 新增的源记录不计入
+      INSERT INTO silver._identities VALUES ('s', '1', 'P'), ('s', '2', 'P'), ('s', '3', 'Q'), ('s', '4', 'P'), ('s', '5', 'Q'),
+        ('s', '6', 'Q'), ('s', '9', 'R'), ('s', '10', 'R'), ('s', '11', 'P'), ('s', '12', 'P')`);
+    const target = servingPath(dataPath, 102);
+    const task = await runTask(acme, 'serving.build', { version: 102, target, snapshots: snapshots.map(({ id, template, table }) => ({ id, template, table })) });
+    expect(task).toMatchObject({ status: 'succeeded', result: { rows: { consumer_aliases: 4 } } });
+    expect(await readServing(acme, target, `SELECT * FROM consumer_aliases WHERE retired_id LIKE 'r%'`)).toEqual([
+      { retired_id: 'r1', consumer_id: 'P' }, { retired_id: 'r4', consumer_id: 'R' }, { retired_id: 'r5', consumer_id: 'R' },
+    ]);
+    // _identities 被删后有成员记录的退役 ID 都没有别名，照样生成
+    await onLake(acme, 'DROP TABLE silver._identities');
+    const again = servingPath(dataPath, 103);
+    expect(await runTask(acme, 'serving.build', { version: 103, target: again, snapshots: snapshots.map(({ id, template, table }) => ({ id, template, table })) }))
+      .toMatchObject({ status: 'succeeded' });
+    expect(await readServing(acme, again, `SELECT * FROM consumer_aliases WHERE retired_id LIKE 'r%'`)).toEqual([]);
+  });
+
   it('表名不合规、表不在、模板与表名不符或 target 不是本租户这一版的位置时失败，不上传', async () => {
     const { acme, snapshots, dataPath } = await publishedDefinitions();
     const [rfm] = snapshots.filter(s => s.template === 'rfm');
