@@ -103,7 +103,7 @@ async function maskedBronze(con: DuckDBConnection, sourceId: string, tables: rea
  * 输出的一列是否当作敏感：列名像敏感信息（平台列的名字不算），样本里有取值含哈希（来自哈希过的源列），
  * 或有取值里出现邮箱、手机号（任何列，别名改成平台列也一样）
  */
-const looksSensitive = (name: string, values: unknown[]) => sensitiveName(name) || values.some(v => v !== null && v !== undefined
+export const looksSensitive = (name: string, values: unknown[]) => sensitiveName(name) || values.some(v => v !== null && v !== undefined
   && [CONTAINS_HASH, ...SENSITIVE_PATTERNS].some(p => p.test(typeof v === 'string' ? v : JSON.stringify(v))));
 
 /**

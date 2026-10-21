@@ -4,7 +4,7 @@ import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, tasks } from '../../app/.server/db/schema';
-import { createMapping, dryRunMapping, enqueueDueMerges, getMapping, mergeNow, publishMapping } from '../../app/.server/mappings';
+import { createMapping, dryRunMapping, enqueueDueMerges, getMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { revealPii } from '../../app/.server/pii';
 import { syncSource } from '../../app/.server/source-sync';
@@ -159,5 +159,32 @@ describe('基于源视图的映射', () => {
     await drain();
     expect((await getMapping(author, mapping.id)).merge.history[0]).toMatchObject({ mode: 'rebuild', rows: 100 });
     expect(await enqueueDueMerges()).toEqual([]);
+  });
+
+  it('view_key 在同一批次里不唯一时空跑与合并都报错，列出至多 5 个重复的标识与总数；标识列像敏感信息时不列取值', async () => {
+    const { author, reviewer, id } = await syncedSource();
+    await publishedView(author, reviewer, id);
+    // 100 笔订单在同一批次里，40 个客户各下了 2 到 3 笔
+    const mapping = await createMapping(author, id, MAPPING.replace('view_key: [order_id]', 'view_key: [customer_id]'));
+    const duplicated = '源视图 order_cities 的 view_key customer_id 在同一批次里不唯一（customer_id=10 出现 3 次；customer_id=11 出现 3 次；'
+      + 'customer_id=12 出现 3 次；customer_id=13 出现 3 次；customer_id=14 出现 3 次）共 40 个，'
+      + '请去掉 view_key（按整行区分记录，再由 dedupe 取最新），或换成能区分每一行的列';
+    await expect(dryRunMapping(author, mapping.id, 1)).rejects.toThrow(duplicated);
+    await publishMapping(reviewer, mapping.id, 1);
+    await drain();
+    expect((await getMapping(author, mapping.id)).merge.history[0]).toMatchObject({ error: expect.stringContaining(duplicated) });
+
+    // 邮箱像敏感信息：只给次数；没有邮箱的 10 个客户的 25 笔订单（标识为空）也算重复
+    const version = await saveDraft(author, mapping.id, MAPPING.replace('view_key: [order_id]', 'view_key: [email]'));
+    const error = await dryRunMapping(author, mapping.id, version).then(() => '', (e: Error) => e.message);
+    expect(error).toMatch(/view_key email 在同一批次里不唯一（（敏感字段，不显示取值） 出现 25 次；.*）共 31 个/);
+    expect(error).not.toContain('@');
+
+    // 列名不像敏感信息、但映射拿它算敏感字段的标识列：同样不列取值
+    const byCity = await saveDraft(author, mapping.id, MAPPING.replace('view_key: [order_id]', 'view_key: [city]')
+      .replace('x_city: { type: string, expr: city }', 'x_city: { type: string, expr: city, sensitive: true }'));
+    const cityError = await dryRunMapping(author, mapping.id, byCity).then(() => '', (e: Error) => e.message);
+    expect(cityError).toMatch(/view_key city 在同一批次里不唯一（（敏感字段，不显示取值） 出现 \d+ 次；.*）共 4 个/);
+    expect(cityError).not.toMatch(/北京|上海|广州|深圳/);
   });
 });

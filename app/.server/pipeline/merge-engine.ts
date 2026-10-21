@@ -21,7 +21,7 @@ import type { MergeRule } from '../../lib/merge-groups';
 import { ensureCustomerSourceColumns } from './customer-source-columns';
 import { referencedSourceColumns, sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
 import { breakingColumns, type ColumnType } from './schema-diff';
-import { bronzeTablesOf, checkViewSql } from './source-view-engine';
+import { bronzeTablesOf, checkViewSql, looksSensitive } from './source-view-engine';
 import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
 import { recordRuns, type AssertionResult } from './assertions';
 import { customAssertionName, evalCustomAssertions } from './custom-assertions';
@@ -259,9 +259,32 @@ export async function mappingInput(
       } finally {
         await con.run('USE lake');
       }
+      if (keys.length) await checkViewKey(con, into, plan, keys);
       return into;
     },
   };
+}
+
+/** view_key 不唯一的报错里最多列出几个重复的标识 */
+const VIEW_KEY_DUPLICATES = 5;
+
+/**
+ * 源视图的 view_key 在同一批次（视图输出的 _batch）里必须唯一：当前记录按标识取每个批次的最后一版，同一批次里标识相同的多行
+ * 只会任取一行，dedupe 也取不到最新。只看非删除行（无主键主表的一次修改是一删一增，ADR-0010）；标识为空的也算重复。
+ * 报错会进任务结果与页面（ADR-0005）：标识列的名字或列出的取值像敏感信息，或映射拿它算敏感字段时不列取值
+ */
+async function checkViewKey(con: DuckDBConnection, into: string, plan: MergePlan, keys: string[]) {
+  const duplicated = `SELECT ${keys.map(k => `${ident(k)}::VARCHAR AS ${ident(k)}`).join(', ')}, count(*) AS _n FROM ${into}
+    WHERE _op <> 'delete' GROUP BY _batch, ${keyList(keys)} HAVING count(*) > 1`;
+  const [{ total }] = await rows<{ total: string }>(con, `SELECT count(*) AS total FROM (${duplicated})`);
+  if (Number(total) === 0) return;
+  const found = await rows<Record<string, string | null> & { _n: string }>(con,
+    `${duplicated} ORDER BY _n DESC, ${keys.map(k => `${ident(k)}::VARCHAR`).join(', ')} LIMIT ${VIEW_KEY_DUPLICATES}`);
+  const feedsSensitive = new Set(sensitivePlanColumns(plan).flatMap(c => referencedColumns(parseExpression(c.expr)).map(r => r.name)));
+  const sensitive = keys.some(k => feedsSensitive.has(k) || looksSensitive(k, found.map(d => d[k])));
+  const samples = found.map(d => `${sensitive ? '（敏感字段，不显示取值）' : keys.map(k => `${k}=${d[k] ?? 'NULL'}`).join(', ')} 出现 ${Number(d._n).toLocaleString('zh-CN')} 次`);
+  throw new Error(`源视图 ${plan.table} 的 view_key ${keys.join('、')} 在同一批次里不唯一（${samples.join('；')}）共 ${Number(total).toLocaleString('zh-CN')} 个，`
+    + '请去掉 view_key（按整行区分记录，再由 dedupe 取最新），或换成能区分每一行的列');
 }
 
 /**
