@@ -107,6 +107,9 @@ const ACTIONS = {
     label: '恢复映射',
     describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，第 ${d.version} 版`,
   },
+  // 不参与身份打通匹配的值（ADR-0039）：只记加盐哈希与记录数，不记明文
+  'identity.value_excluded': { label: '标记不参与匹配的值', describe: (d: Detail) => `哈希 ${String(d.hash).slice(0, 16)}…，连了 ${d.records} 条源记录` },
+  'identity.value_included': { label: '撤销不参与匹配的值', describe: (d: Detail) => `哈希 ${String(d.hash).slice(0, 16)}…，标记时连了 ${d.records} 条源记录` },
   'mapping.column_ignored': {
     label: '忽略源表新列',
     describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，忽略新列 ${d.column}`,

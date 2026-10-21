@@ -5,11 +5,13 @@
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import type { Tx } from '../../app/.server/audit';
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { latestIdentitySummary, listMappings, mergeMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { excludeValue, includeValue } from '../../app/.server/identity-exclusions';
+import { enqueueMerge, latestIdentitySummary, listMappings, mergeMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
 import { syncSource } from '../../app/.server/source-sync';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { checkMetric, compileMetric, type DslContext } from '../../app/.server/pipeline/dsl/metric-spec';
@@ -736,6 +738,45 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     const together = await groups({});
     expect(await groups({ identityExclude: [hash] })).toBeGreaterThan(together);
     expect(await groups({ identityExclude: [] })).toBe(together);
+  });
+
+  it('标为不参与匹配后入队的合并带上排除列表并强制重算，只靠它相连的记录各自成组；列表没变的下一次合并跳过打通，撤销后又强制重算', async () => {
+    const { acme, author } = await publishedIdentitySources();
+    const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
+    let hash: string;
+    let sharing: string[];
+    try {
+      hash = await shareOnePhone(session.con);
+      sharing = ((await session.con.runAndReadAll(`SELECT DISTINCT _source || ':' || customer_id AS who FROM silver.customer WHERE phone = '${hash}'`))
+        .getRowObjectsJson() as { who: string }[]).map(r => r.who);
+      await resolveIdentities(session.con);
+    } finally {
+      session.close();
+    }
+    /** 共用这个哈希的源记录分在几个统一消费者里 */
+    const sharingGroups = async () => new Set((await identities(acme)).rows.filter(r => sharing.includes(`${r._source}:${r.customer_id}`)).map(r => r.consumer_id)).size;
+    expect(await sharingGroups()).toBe(1);
+    /** 在一个事务里改排除列表并入队合并，跑空调度器，返回这次合并 */
+    const mark = async (change: (tx: Tx) => Promise<boolean>) => {
+      await getDb().transaction(async tx => { expect(await change(tx)).toBe(true); expect(await enqueueMerge(tx, acme)).not.toBeNull(); });
+      await drain();
+      return lastMerge(acme);
+    };
+
+    const excluded = await mark(tx => excludeValue(tx, acme, author, hash, sharing.length));
+    expect(excluded).toMatchObject({ status: 'succeeded', params: { identityExclude: [hash], identityForce: true } });
+    expect(excluded.result.identities).not.toHaveProperty('skipped');
+    expect(await sharingGroups()).toBeGreaterThan(1);
+
+    await mergeNow(author);
+    await drain();
+    const unchanged = await lastMerge(acme);
+    expect(unchanged.params).toMatchObject({ identityExclude: [hash], identityForce: false });
+    expect(unchanged.result.identities).toMatchObject({ skipped: expect.any(String) });
+
+    const included = await mark(tx => includeValue(tx, acme, author, hash));
+    expect(included).toMatchObject({ status: 'succeeded', params: { identityExclude: [], identityForce: true } });
+    expect(await sharingGroups()).toBe(1);
   });
 
   it('merge 退役的 ID 把它在上一版里的全部源记录记进 _consumer_id_members；没有 merge 的重算不写', async () => {

@@ -347,6 +347,16 @@ export const mappingFallbackValues = platform.table('mapping_fallback_values', {
   taskId: uuid('task_id').notNull(),
 }, t => [primaryKey({ columns: [t.mappingId, t.column, t.value] })]);
 
+// 不参与身份打通匹配的值（ADR-0039）：成员在数据质量页从热值里标记，之后每次合并都带上（silver.merge 参数 identityExclude）。
+// 只存加盐哈希，不存明文；records 是标记时这个值连了的源记录数。撤销即删除这一行；标记人被移除后 created_by 为空
+export const identityExcludedValues = platform.table('identity_excluded_values', {
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  hash: text('hash').notNull(),
+  records: integer('records').notNull(),
+  createdBy: uuid('created_by').references(() => members.id, { onDelete: 'set null' }),
+  createdAt: createdAt(),
+}, t => [primaryKey({ columns: [t.tenantId, t.hash] })]);
+
 export const templateVersionStatusEnum = platform.enum('template_version_status', VERSION_STATUSES);
 
 // 分析模板定义：租户对某个分析模板（如 rfm，见 pipeline/templates）的参数，每个租户每个模板一份（ADR-0004）。第一次保存草稿时建立，

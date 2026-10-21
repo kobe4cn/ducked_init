@@ -10,6 +10,7 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { allRelations, publishedCustomEntities, type RegisteredEntity, relationsFrom, relationsTo, uniqueKeys } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
+import { excludedHashes } from './identity-exclusions';
 import { mappingGenerations, mappingIgnoredColumns, mappings, mappingVersions, sources, sourceTables, sourceViews, sourceViewVersions, tasks, tenants, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { chatJson, LlmError, resolveProvider } from './llm';
@@ -1077,16 +1078,18 @@ export async function pendingMerge(db: Tx | ReturnType<typeof getDb>, tenantId: 
 /**
  * 这次合并是否要强制重算身份打通（工作进程只看这次改没改到 customer / event，判断不出下面几种情况）：取本租户最近一次真正跑过打通
  * （结果里有 identities 且不是跳过）或没写结果就结束（崩溃、超时，之前提交的映射可能已改了 customer / event）的合并，
- * 它不存在、没写结果、打通失败了，或它的匹配规则与这次的 identity、属性取舍的名次与这次的 survivorship 不同时强制。多算一次没有坏处，宁可偏向强制
+ * 它不存在、没写结果、打通失败了，或它的匹配规则与这次的 identity、属性取舍的名次与这次的 survivorship、不参与匹配的值与这次的 exclude（ADR-0039）不同时强制。
+ * 多算一次没有坏处，宁可偏向强制
  */
-async function mustRecomputeIdentities(db: Tx, tenantId: string, identity: unknown, survivorship: Record<string, number>) {
+async function mustRecomputeIdentities(db: Tx, tenantId: string, identity: unknown, survivorship: Record<string, number>, exclude: string[]) {
   const [last] = await db.select({ params: tasks.params, result: tasks.result }).from(tasks)
     .where(and(ofMerge(tenantId), inArray(tasks.status, ['succeeded', 'failed']),
       sql`(${tasks.result} IS NULL OR ${tasks.result} ? 'identities' AND NOT (${tasks.result}->'identities') ? 'skipped')`))
     .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
   return !last?.result || 'error' in (last.result as { identities: object }).identities
     || JSON.stringify(last.params.identity ?? null) !== JSON.stringify(identity ?? null)
-    || JSON.stringify(rankEntries(last.params.survivorship)) !== JSON.stringify(rankEntries(survivorship));
+    || JSON.stringify(rankEntries(last.params.survivorship)) !== JSON.stringify(rankEntries(survivorship))
+    || JSON.stringify(sortedHashes(last.params.identityExclude)) !== JSON.stringify(exclude);
 }
 
 /** 属性取舍的名次（ADR-0027）：各已发布 customer 映射里配置的名次，映射 ID → 名次（没配置的映射不在里面） */
@@ -1095,6 +1098,9 @@ const survivorshipPriority = (plans: MergeMappingParam[]): Record<string, number
 
 /** 名次表按映射 ID 排好的键值对，用来比对是否变了（早先的合并参数里没有这一项，等同于空表） */
 const rankEntries = (ranks: unknown) => Object.entries((ranks ?? {}) as Record<string, number>).sort(([a], [b]) => a.localeCompare(b));
+
+/** 排好序的排除列表，用来比对是否变了（早先的合并参数里没有这一项，等同于空列表） */
+const sortedHashes = (hashes: unknown) => [...((hashes ?? []) as string[])].sort();
 
 /**
  * 合并后要统计孤儿的关系：全部已发布关系（内置 ref 与已发布登记上的），带上起点是否敏感（isSensitiveField；标准层里是哈希，不给样例键）
@@ -1126,7 +1132,7 @@ export const lockTenant = (tx: Tx, tenantId: string) => tx.select({ id: tenants.
  * 已有合并在排队时把映射补进去（同一映射换成最新版本）；已在运行（或补的时候刚被领取）时不入队，返回 null，由定时检查在它之后补上。
  * 给定的映射都没有已发布版本时也不入队。参数里另带身份打通的匹配规则、属性取舍的名次（映射 ID → 名次）与不进 _consumer 的敏感字段，由全部已发布的 customer 映射汇总（重算打通时整表重算，不只看这次的映射），
  * 与要统计孤儿的全部已发布关系（工作进程不读平台库），
- * 以及是否强制重算打通 identityForce（见 mustRecomputeIdentities；补进排队中的合并时，已为真的保留）。
+ * 本租户不参与匹配的值 identityExclude（排好序的哈希，ADR-0039），以及是否强制重算打通 identityForce（见 mustRecomputeIdentities；补进排队中的合并时，已为真的保留）。
  * opts.rebuild 时给这些映射带上强制重建标记；排队中的映射已带标记时，补进去的同一映射保留它。
  * opts.drop 是要撤下的停用映射（ADR-0031）：带上它时没有已发布的映射也入队；并进排队中的合并时，从它的映射里剔除这些映射、drop 并在一起
  */
@@ -1142,10 +1148,11 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
   const sensitive = consumerSensitive(all);
   const relations = relationParams(await publishedCustomEntities(tx, tenantId), all);
   if (pending?.status === 'running') return null;
-  const force = await mustRecomputeIdentities(tx, tenantId, identity, survivorship);
+  const identityExclude = await excludedHashes(tx, tenantId);
+  const force = await mustRecomputeIdentities(tx, tenantId, identity, survivorship, identityExclude);
   if (!pending) {
     return insertTask(tx, tenantId, 'silver.merge', {
-      mappings: plans, ...(incoming.length > 0 && { drop: incoming }), identity, survivorship, consumerSensitive: sensitive, relations, identityForce: force,
+      mappings: plans, ...(incoming.length > 0 && { drop: incoming }), identity, survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: force,
     });
   }
   const queuedDrop = (pending.params.drop ?? []) as MergeDrop[];
@@ -1156,7 +1163,7 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
     ...plans.map(p => (queued.some(q => q.mapping === p.mapping && q.rebuild) ? { ...p, rebuild: true } : p)),
   ].sort((a, b) => a.mapping.localeCompare(b.mapping));
   // 领取合并不锁租户行：只在它仍在排队时改参数
-  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, ...(drop.length > 0 && { drop }), identity, survivorship, consumerSensitive: sensitive, relations, identityForce: pending.params.identityForce === true || force } })
+  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, ...(drop.length > 0 && { drop }), identity, survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: pending.params.identityForce === true || force } })
     .where(and(eq(tasks.id, pending.id), eq(tasks.status, 'queued'))).returning();
   return task ?? null;
 }
