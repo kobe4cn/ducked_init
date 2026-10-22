@@ -99,6 +99,7 @@ describe('生成服务库', () => {
     expect(await readServing(acme, target, `SELECT table_name, string_agg(column_name, ',' ORDER BY ordinal_position) AS columns
       FROM information_schema.columns GROUP BY table_name ORDER BY table_name`)).toEqual([
       { table_name: 'consumer_aliases', columns: 'retired_id,consumer_id' },
+      { table_name: 'consumer_sources', columns: 'source_id,customer_id,consumer_id' },
       { table_name: 'meta', columns: 'version,built_at' },
       { table_name: 'metrics', columns: 'consumer_id,metric,dims,value' },
       { table_name: 'rfm', columns: 'consumer_id,segment,r,f,m,recency_days,frequency,monetary' },
@@ -156,6 +157,22 @@ describe('生成服务库', () => {
     expect(await runTask(acme, 'serving.build', { version: 103, target: again, snapshots: snapshots.map(({ id, template, table }) => ({ id, template, table })) }))
       .toMatchObject({ status: 'succeeded' });
     expect(await readServing(acme, again, `SELECT * FROM consumer_aliases WHERE retired_id LIKE 'r%'`)).toEqual([]);
+  });
+
+  it('consumer_sources 是当前 _identities 的数据源 + 源端 ID → 统一消费者 ID，按 (source_id, customer_id) 排序，rows 带行数；_identities 不在时为空表、照样生成', async () => {
+    const { acme, snapshots, dataPath } = await publishedDefinitions();
+    const params = (version: number) => ({ version, target: servingPath(dataPath, version), snapshots: snapshots.map(({ id, template, table }) => ({ id, template, table })) });
+    await onLake(acme, `DELETE FROM silver._identities;
+      INSERT INTO silver._identities VALUES ('s2', 'b', 'P'), ('s1', 'z', 'Q'), ('s2', 'a', 'Q'), ('s1', 'a/1 x', 'P')`);
+    expect(await runTask(acme, 'serving.build', params(104))).toMatchObject({ status: 'succeeded', result: { rows: { consumer_sources: 4 } } });
+    expect(await readServing(acme, servingPath(dataPath, 104), 'SELECT * FROM consumer_sources')).toEqual([
+      { source_id: 's1', customer_id: 'a/1 x', consumer_id: 'P' }, { source_id: 's1', customer_id: 'z', consumer_id: 'Q' },
+      { source_id: 's2', customer_id: 'a', consumer_id: 'Q' }, { source_id: 's2', customer_id: 'b', consumer_id: 'P' },
+    ]);
+
+    await onLake(acme, 'DROP TABLE silver._identities');
+    expect(await runTask(acme, 'serving.build', params(105))).toMatchObject({ status: 'succeeded', result: { rows: { consumer_sources: 0 } } });
+    expect(await readServing(acme, servingPath(dataPath, 105), 'SELECT * FROM consumer_sources')).toEqual([]);
   });
 
   it('表名不合规、表不在、模板与表名不符或 target 不是本租户这一版的位置时失败，不上传', async () => {

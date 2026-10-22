@@ -1,4 +1,4 @@
-// app/.server/serving-reader.ts —— 外部系统按消费者 ID 点查（ADR-0033「读」）：默认读本租户当前的服务库，指定快照时只读查湖里那一张快照表。
+// app/.server/serving-reader.ts —— 外部系统按消费者 ID（或数据源 + 源端 ID）点查（ADR-0033「读」）：默认读本租户当前的服务库，指定快照时只读查湖里那一张快照表。
 // API 节点每次请求查指针 serving_stores；进程内按租户缓存一个只读挂载了服务库的 DuckDB 实例。版本变了时先把新文件下载到本机临时目录
 // （只是缓存，多节点下目录可能是空的），挂上后再替换缓存；下载期间的请求继续用旧版，旧实例等进行中的请求结束后关闭、删掉本地文件。
 // 每个请求从头到尾只用一个版本，不会读到半新半旧。服务库与快照表里只有 consumer_id 与分值，没有明文（ADR-0005）。一律限定在给定租户内
@@ -19,6 +19,7 @@ import { getObject } from './s3-client';
 import { tenantServingKey } from './secrets';
 import { currentServingStore, type ServingStore } from './serving-store';
 import { getSnapshot } from './snapshots';
+import { sourceIdByName } from './source-config';
 
 /** 点查的响应 */
 export interface ConsumerProfile {
@@ -198,15 +199,14 @@ export async function readServing(con: DuckDBConnection, requestedId: string) {
 }
 
 /**
- * 从本租户当前的服务库点查一个消费者的标签、指标与 RFM：退役的旧 ID 先换成现在的 ID（consumer_aliases）。
- * 没有这个人时 404，还没有服务库时 503
+ * 从本租户当前的服务库点查一个消费者：resolve 在服务库连接上把请求换成要查的 ID（换不到时自己抛 404），
+ * 再按 ID 读出标签、指标与 RFM（退役的旧 ID 换成现在的 ID）。requested_id 是调用方传入的值；还没有服务库时 503
  */
-export async function lookupConsumer(tenantId: string, requestedId: string): Promise<ConsumerProfile> {
-  if (!requestedId || requestedId.length > MAX_ID_LENGTH) throw notFound();
+async function lookupResolved(tenantId: string, requestedId: string, resolve: (con: DuckDBConnection) => Promise<string>): Promise<ConsumerProfile> {
   const entry = await acquire(tenantId);
   const con = await entry.instance.connect().catch(e => { release(entry); throw e; });
   try {
-    const found = await readServing(con, requestedId);
+    const found = await readServing(con, await resolve(con));
     if (!found) throw notFound();
     const { consumer_id, ...profile } = found;
     return { consumer_id, requested_id: requestedId, serving_version: entry.version, ...profile, snapshots: entry.snapshots };
@@ -214,6 +214,33 @@ export async function lookupConsumer(tenantId: string, requestedId: string): Pro
     con.closeSync();
     release(entry);
   }
+}
+
+/**
+ * 从本租户当前的服务库点查一个消费者的标签、指标与 RFM：退役的旧 ID 先换成现在的 ID（consumer_aliases）。
+ * 没有这个人时 404，还没有服务库时 503
+ */
+export async function lookupConsumer(tenantId: string, requestedId: string): Promise<ConsumerProfile> {
+  if (!requestedId || requestedId.length > MAX_ID_LENGTH) throw notFound();
+  return lookupResolved(tenantId, requestedId, async () => requestedId);
+}
+
+const noSourceConsumer = () => new ServingError('这个数据源下没有这个消费者', 404);
+
+/**
+ * 按数据源登记名（本租户内，按原样比较）+ 源端消费者 ID 点查：在服务库的 consumer_sources 里换成统一消费者 ID 后同 lookupConsumer。
+ * 数据源名每次到平台库换成 ID，改名立刻生效。数据源不存在、源端 ID 不存在与查到人但没有结果各自 404；还没有服务库时 503
+ */
+export async function lookupConsumerBySource(tenantId: string, sourceName: string, customerId: string): Promise<ConsumerProfile> {
+  if (!customerId || customerId.length > MAX_ID_LENGTH) throw noSourceConsumer();
+  const sourceId = await sourceIdByName(tenantId, sourceName);
+  if (!sourceId) throw new ServingError('没有这个数据源', 404);
+  return lookupResolved(tenantId, customerId, async con => {
+    const [row] = await query<{ consumer_id: string }>(con,
+      'SELECT consumer_id FROM serving.consumer_sources WHERE source_id = $1 AND customer_id = $2', [sourceId, customerId]);
+    if (!row) throw noSourceConsumer();
+    return row.consumer_id;
+  });
 }
 
 /**

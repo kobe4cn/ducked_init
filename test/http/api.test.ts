@@ -8,7 +8,7 @@ import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { sha256 } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { apiKeys, auditLogs, snapshots as snapshotsTable, tasks } from '../../app/.server/db/schema';
+import { apiKeys, auditLogs, snapshots as snapshotsTable, sources as sourcesTable, spaces as spacesTable, tasks } from '../../app/.server/db/schema';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -194,10 +194,10 @@ const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /**
  * 身份打通与订单映射已发布，跑出 RFM 快照，双人发布指标 revenue、带城市维度的 revenue_by_city 与标签 value_tier，调度器跑空（服务库已生成）；
- * 返回租户、作者、快照、当前服务库指针、一个有标签的消费者、夹具里那次合并的退役 ID 与现在的 ID，以及管理员创建的 Key
+ * 返回租户、作者、数据源 ID（crm、loyalty、tracking，登记名 CRM、会员、埋点）、快照、当前服务库指针、一个有标签的消费者、夹具里那次合并的退役 ID 与现在的 ID，以及管理员创建的 Key
  */
 async function servedTenant() {
-  const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+  const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
   expect(await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' })).toMatchObject({ status: 'succeeded' });
   await createDefinition(author, 'metric', 'revenue', REVENUE);
   await createDefinition(author, 'metric', 'revenue_by_city', `${REVENUE}dimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n`);
@@ -214,11 +214,11 @@ async function servedTenant() {
     `SELECT t.consumer_id FROM ${table('tag:value_tier')} t JOIN ${table('rfm')} r USING (consumer_id) ORDER BY 1 LIMIT 1`);
   const [merged] = await onLake<{ old_id: string; new_id: string }>(acme, `SELECT old_id, new_id FROM silver._consumer_id_changes WHERE reason = 'merge'`);
   const { key } = await createKey(await loginAs(app, 'admin@acme.com'), '营销自动化');
-  return { acme, author, of, store: (await currentServingStore(acme))!, consumer, merged: merged!, key };
+  return { acme, author, sources, of, store: (await currentServingStore(acme))!, consumer, merged: merged!, key };
 }
 
 /**
- * 开通租户 globex：结果层一张 RFM 表，里面只有一个与 acme 的消费者同 ID 的人（人群 globex_only），登记成快照并生成服务库；返回快照 ID 与它的 Key
+ * 开通租户 globex：结果层一张 RFM 表，里面只有一个与 acme 的消费者同 ID 的人（人群 globex_only），登记成快照并生成服务库；返回租户、快照 ID 与它的 Key
  */
 async function otherTenant(consumer: string) {
   const globex = await newTenant('globex');
@@ -234,7 +234,7 @@ async function otherTenant(consumer: string) {
     id, tenantId: globex, template: 'rfm', taskId: task!.id, table, params: {}, rowCount: 1, expiresAt: new Date(Date.now() + 86_400_000),
   });
   const { key } = await createKey(await loginAs(app, 'admin@globex.com'), '环球');
-  return { snapshot: id, key };
+  return { tenantId: globex, snapshot: id, key };
 }
 
 const lookup = async (path: string, key: string) => {
@@ -320,6 +320,61 @@ describe('点查接口', () => {
   });
 });
 
+/** 这个消费者在会员数据源里的一个源端 ID */
+const loyaltyIdOf = async (tenantId: string, loyalty: string, consumer: string) => (await onLake<{ customer_id: string }>(tenantId,
+  `SELECT customer_id FROM silver._identities WHERE _source = '${loyalty}' AND consumer_id = '${consumer}' ORDER BY 1 LIMIT 1`))[0]!.customer_id;
+
+const bySource = (source: string, customerId: string) => `/api/v1/consumers/by-source/${encodeURIComponent(source)}/${encodeURIComponent(customerId)}`;
+
+describe('按数据源点查', () => {
+  it('按数据源登记名 + 源端 ID 查，结果与按统一消费者 ID 查的逐字段相同；被合并退役的源记录拿到现在的 ID；源端 ID 带 / 与空格时编码后能查到', async () => {
+    const { acme, sources, consumer, merged, key } = await servedTenant();
+    const own = await loyaltyIdOf(acme, sources.loyalty, consumer);
+    const byId = await lookup(`/api/v1/consumers/${consumer}`, key);
+    expect(await lookup(bySource('会员', own), key)).toEqual({ status: 200, body: { ...byId.body, requested_id: own } });
+
+    // 退役 ID 合并前的源记录：现在属于合并后的人
+    const [member] = await onLake<{ _source: string; customer_id: string }>(acme,
+      `SELECT _source, customer_id FROM silver._consumer_id_members WHERE consumer_id = '${merged.old_id}' ORDER BY ALL LIMIT 1`);
+    const [{ name }] = await getDb().select({ name: sourcesTable.name }).from(sourcesTable).where(eq(sourcesTable.id, member!._source));
+    const retired = await lookup(bySource(name, member!.customer_id), key);
+    expect(retired).toMatchObject({ status: 200, body: { consumer_id: merged.new_id, requested_id: member!.customer_id } });
+    expect(retired.body).toEqual({ ...(await lookup(`/api/v1/consumers/${merged.new_id}`, key)).body, requested_id: member!.customer_id });
+
+    await onLake(acme, `INSERT INTO silver._identities VALUES ('${sources.crm}', 'M/1 2', '${consumer}'), ('${sources.crm}', 'ghost', 'no-results')`);
+    await enqueueServingBuild(acme);
+    await drain();
+    // 等新版生效（下载完之前仍读旧版）
+    await expect.poll(async () => (await lookup(bySource('CRM', 'M/1 2'), key)).status).toBe(200);
+    expect((await lookup(bySource('CRM', 'M/1 2'), key)).body).toMatchObject({ consumer_id: consumer, requested_id: 'M/1 2' });
+    // 查到人但标签、指标、RFM 都没有：404，提示与数据源、源端 ID 不存在都不同
+    const empty = await lookup(bySource('CRM', 'ghost'), key);
+    expect(empty).toEqual({ status: 404, body: { error: expect.any(String) } });
+    expect([(await lookup(bySource('没有', 'ghost'), key)).body.error, (await lookup(bySource('CRM', 'nobody'), key)).body.error]).not.toContain(empty.body.error);
+  });
+
+  it('数据源名不存在、源端 ID 不存在一律 404 且提示不同；改名后旧名 404、新名立刻可查（不重建）；带 ?snapshot= 时 400', async () => {
+    const { acme, of, sources, consumer, key } = await servedTenant();
+    const own = await loyaltyIdOf(acme, sources.loyalty, consumer);
+    const noSource = await lookup(bySource('没有', own), key);
+    const noConsumer = await lookup(bySource('会员', 'nobody'), key);
+    expect(noSource).toEqual({ status: 404, body: { error: expect.any(String) } });
+    expect(noConsumer).toEqual({ status: 404, body: { error: expect.any(String) } });
+    expect(noSource.body.error).not.toBe(noConsumer.body.error);
+    // 按原样比较，不忽略大小写
+    expect((await lookup(bySource('crm', own), key)).body).toEqual(noSource.body);
+    expect(await lookup(bySource('会员', 'x'.repeat(257)), key)).toEqual(noConsumer);
+
+    const version = (await currentServingStore(acme))!.version;
+    await getDb().update(sourcesTable).set({ name: '会员中心' }).where(eq(sourcesTable.id, sources.loyalty));
+    expect((await lookup(bySource('会员', own), key)).body).toEqual(noSource.body);
+    expect(await lookup(bySource('会员中心', own), key)).toMatchObject({ status: 200, body: { consumer_id: consumer, serving_version: version } });
+
+    expect(await lookup(`${bySource('会员中心', own)}?snapshot=${of('rfm').id}`, key)).toEqual({ status: 400, body: { error: expect.any(String) } });
+    expect((await call(bySource('会员中心', own))).status).toBe(401);
+  });
+});
+
 describe('点查的隔离', () => {
   it('A 租户的 Key 查不到 B 租户的消费者与快照，B 的 Key 也查不到 A 的：同一个 ID 各自只读到本租户的数据', async () => {
     const { of, consumer, key } = await servedTenant();
@@ -334,6 +389,27 @@ describe('点查的隔离', () => {
     expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${of('rfm').id}`, globex.key)).status).toBe(404);
     expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${globex.snapshot}`, key)).status).toBe(404);
     expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${globex.snapshot}`, globex.key)).body.rfm.segment).toBe('globex_only');
+  });
+
+  it('A、B 两个租户有同名数据源、同一个源端 ID 时各自只查到本租户的人；A 的 Key 用只在 B 存在的数据源名 404', async () => {
+    const { acme, sources, consumer, key } = await servedTenant();
+    const own = await loyaltyIdOf(acme, sources.loyalty, consumer);
+    const globex = await otherTenant('globex-person');
+    const { tenantId } = globex;
+    const [space] = await getDb().select({ id: spacesTable.id }).from(spacesTable).where(and(eq(spacesTable.tenantId, tenantId), eq(spacesTable.isDefault, true)));
+    const [loyalty, only] = await getDb().insert(sourcesTable).values(['会员', '环球专属'].map(name => ({
+      tenantId, spaceId: space!.id, name, kind: 'postgres' as const, config: {}, credentials: '',
+    }))).returning({ id: sourcesTable.id }).then(r => r.map(x => x.id));
+    await onLake(tenantId, `CREATE TABLE silver._identities (_source VARCHAR, customer_id VARCHAR, consumer_id VARCHAR);
+      INSERT INTO silver._identities VALUES ('${loyalty}', '${own}', 'globex-person'), ('${only}', 'g1', 'globex-person')`);
+    expect(await runTask(tenantId, 'serving.build', {
+      version: 2, target: servingPath((await lakeRow(tenantId))!.dataPath, 2), snapshots: [{ id: globex.snapshot, template: 'rfm', table: `gold.rfm__${globex.snapshot}` }],
+    })).toMatchObject({ status: 'succeeded' });
+
+    expect((await lookup(bySource('会员', own), key)).body).toMatchObject({ consumer_id: consumer });
+    expect((await lookup(bySource('会员', own), globex.key)).body).toMatchObject({ consumer_id: 'globex-person', rfm: { segment: 'globex_only' } });
+    expect((await lookup(bySource('环球专属', 'g1'), globex.key)).status).toBe(200);
+    expect(await lookup(bySource('环球专属', 'g1'), key)).toEqual({ status: 404, body: { error: expect.any(String) } });
   });
 
   it('Bearer Key 打不开成员页面（跳登录），也没有通往标准层、原始层或沙箱的接口', async () => {

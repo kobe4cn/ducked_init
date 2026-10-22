@@ -183,6 +183,12 @@ export async function requireSource(tenantId: string, sourceId: string) {
   return row;
 }
 
+/** 本租户按登记名（区分大小写，按原样比较）找数据源 ID；没有时为 null */
+export async function sourceIdByName(tenantId: string, name: string): Promise<string | null> {
+  const [row] = await getDb().select({ id: sources.id }).from(sources).where(and(eq(sources.tenantId, tenantId), eq(sources.name, name)));
+  return row?.id ?? null;
+}
+
 /** 解密凭据，还原成连接参数（任务派发时交给工作进程） */
 export async function loadSourceSpec(tenantId: string, sourceId: string): Promise<SourceSpec> {
   const row = await requireSource(tenantId, sourceId);

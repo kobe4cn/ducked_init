@@ -30,6 +30,7 @@ export default [
   route('model-provider', 'routes/model-provider.tsx'),
   route('api/v1/catalog', 'routes/api.v1.catalog.tsx'),
   route('api/v1/consumers/:consumerId', 'routes/api.v1.consumers.$id.tsx'),
+  route('api/v1/consumers/by-source/:source/:customerId', 'routes/api.v1.consumers.by-source.tsx'),
   route('login', 'routes/login.tsx'),
   route('auth/verify', 'routes/auth.verify.tsx'),
   route('logout', 'routes/logout.tsx'),

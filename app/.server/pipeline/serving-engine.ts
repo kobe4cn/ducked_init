@@ -1,6 +1,7 @@
 // app/.server/pipeline/serving-engine.ts —— 生成服务库（ADR-0033）：把参数里各已发布定义的快照表合成一个 DuckDB 文件，
 // 上传到本租户存储前缀下的 _serving/v<版本>.duckdb。工作进程不读平台库，读哪些快照由调用方放进参数。
-// 服务库只有 consumer_id、标签、指标与 RFM 分值，以及统一消费者 ID 的退役对照，不放标准层或原始层的表；快照表本来就没有明文（ADR-0005）
+// 服务库只有 consumer_id、标签、指标与 RFM 分值，统一消费者 ID 的退役对照，以及数据源 + 源端 ID → 统一消费者 ID 的对照（consumer_sources），
+// 不放标准层或原始层的表；快照表本来就没有明文（ADR-0005），源端 ID 照 _identities 原样存（本身是敏感值时是已知缺口，见 ADR-0033）
 import { SERVING_DIR, type TenantLakeSession } from './lake-engine';
 import { CONSUMER_ID_CHANGES, CONSUMER_ID_MEMBERS, IDENTITIES } from './identity-engine';
 import { ident, lit, rows, tableExists } from './merge-engine';
@@ -11,7 +12,7 @@ export interface ServingSnapshot { id: string; template: string; table: string }
 export interface ServingParams { version: number; target: string; snapshots: ServingSnapshot[] }
 
 /** 服务库里各表的行数 */
-export interface ServingRows { tags: number; metrics: number; rfm: number; consumer_aliases: number }
+export interface ServingRows { tags: number; metrics: number; rfm: number; consumer_aliases: number; consumer_sources: number }
 
 /** 结果层快照表名 gold.<种类>__<任务 ID> */
 export const SNAPSHOT_TABLE = /^gold\.([a-z][a-z0-9]*)__[0-9a-f-]{36}$/;
@@ -121,11 +122,16 @@ export async function buildServingStore(session: TenantLakeSession, { version, t
     `SELECT ${rfmColumns} FROM (SELECT NULL AS consumer_id, NULL AS segment, NULL AS r, NULL AS f, NULL AS m, NULL AS recency_days, NULL AS frequency, NULL AS monetary)`,
   )}) ORDER BY consumer_id`);
   await con.run(`CREATE TABLE serving.consumer_aliases AS ${await aliasesSql(con)}`);
+  // 按源点查用：读当前的 _identities（与 consumer_aliases 同一时点），不在时为空表
+  await con.run(`CREATE TABLE serving.consumer_sources AS ${await exists(con, IDENTITIES)
+    ? `SELECT _source AS source_id, customer_id, consumer_id FROM ${IDENTITIES} ORDER BY source_id, customer_id`
+    : 'SELECT NULL::VARCHAR AS source_id, NULL::VARCHAR AS customer_id, NULL::VARCHAR AS consumer_id LIMIT 0'}`);
   await con.run(`CREATE TABLE serving.meta AS SELECT ${version}::INTEGER AS version, now() AS built_at`);
 
   const [counts] = await rows<Record<keyof ServingRows, string>>(con, `SELECT
     (SELECT count(*) FROM serving.tags) AS tags, (SELECT count(*) FROM serving.metrics) AS metrics,
-    (SELECT count(*) FROM serving.rfm) AS rfm, (SELECT count(*) FROM serving.consumer_aliases) AS consumer_aliases`);
+    (SELECT count(*) FROM serving.rfm) AS rfm, (SELECT count(*) FROM serving.consumer_aliases) AS consumer_aliases,
+    (SELECT count(*) FROM serving.consumer_sources) AS consumer_sources`);
   await session.serving.upload(target);
   return Object.fromEntries(Object.entries(counts!).map(([k, n]) => [k, Number(n)])) as unknown as ServingRows;
 }
