@@ -588,3 +588,28 @@ export function writeKeySpace(doc: Document, keySpace: string | null): void {
   if (!value) doc.delete('key_space');
   else if (readKeySpace(doc) !== value) doc.set('key_space', value);
 }
+
+/** 校验问题在表单上对应的区块：标准字段、扩展字段、映射的键空间、身份打通，其余放进表单顶部的总列表 */
+export type IssueTarget = { kind: 'field' | 'extension'; name: string } | { kind: 'key_space' | 'identity' | 'general' };
+
+/** 按问题 path（点连接，如 fields.status.dictionary）的第一段对应到表单区块；字段与扩展字段可能同名，按第一段区分 */
+export function issueTarget(path: string): IssueTarget {
+  const [head, name] = path.split('.');
+  if ((head === 'fields' || head === 'extensions') && name) return { kind: head === 'fields' ? 'field' : 'extension', name };
+  if (head === 'key_space' || head === 'identity') return { kind: head };
+  return { kind: 'general' };
+}
+
+export interface IssueGroups<I> { fields: Record<string, I[]>; extensions: Record<string, I[]>; keySpace: I[]; identity: I[]; general: I[] }
+
+/** 按 issueTarget 分组，各组内保持原来的顺序 */
+export function groupIssues<I extends { path: string }>(issues: readonly I[]): IssueGroups<I> {
+  const groups: IssueGroups<I> = { fields: {}, extensions: {}, keySpace: [], identity: [], general: [] };
+  for (const issue of issues) {
+    const target = issueTarget(issue.path);
+    if (target.kind === 'field') (groups.fields[target.name] ??= []).push(issue);
+    else if (target.kind === 'extension') (groups.extensions[target.name] ??= []).push(issue);
+    else groups[target.kind === 'key_space' ? 'keySpace' : target.kind].push(issue);
+  }
+  return groups;
+}

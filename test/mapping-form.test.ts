@@ -1,12 +1,12 @@
 // 映射表单与 YAML 互转（纯函数）：从映射 YAML 读出每个标准字段的表单状态（源列、常用转换、参数、依据、是否只读），
 // 改单个字段时在原 Document 上改，保留注释与顺序；枚举字段的值对照与兜底读出、写回；表单不认识的写法只读、原样保留；
 // 扩展字段：没用到的源列、读出已有的扩展字段、加上 / 改名 / 删除；映射与引用字段的键空间读出、写回，引用字段按同源目标实体的键空间预填；
-// 指向 customer 的引用字段与扩展字段的 customer_source、扩展字段的键空间读出、写回
+// 指向 customer 的引用字段与扩展字段的 customer_source、扩展字段的键空间读出、写回；实时校验的问题按 path 对应到表单区块
 import { parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
 import {
-  dictionaryRows, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity, readKeySpace, seedDictionary, TRANSFORMS,
+  dictionaryRows, groupIssues, identityCandidates, issueTarget, keySpaceOf, newExtension, readExtensions, readForm, readIdentity, readKeySpace, seedDictionary, TRANSFORMS,
   unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace,
   type FieldChoice, type FieldForm,
 } from '../app/lib/mapping-form';
@@ -531,5 +531,37 @@ describe('跨源引用的数据源', () => {
     writeExtension(fresh, 'x_buyer', { name: 'x_buyer', type: 'string', expr: 'cid', keySpace: 'crm', customerSource: 'crm' });
     expect(fresh.toJS().extensions.x_buyer).toEqual({ type: 'string', expr: 'cid', key_space: 'crm', customer_source: 'crm' });
     expect(checkMapping(fresh.toString(), () => columns, registered, sources)).toMatchObject({ ok: true });
+  });
+});
+
+describe('实时校验的问题对应到表单区块', () => {
+  it('issueTarget 按 path 的第一段对应：字段、扩展字段、键空间、身份打通，其余进总列表', () => {
+    expect(issueTarget('fields.status.dictionary')).toEqual({ kind: 'field', name: 'status' });
+    expect(issueTarget('fields.amount')).toEqual({ kind: 'field', name: 'amount' });
+    expect(issueTarget('extensions.x_coupon.type')).toEqual({ kind: 'extension', name: 'x_coupon' });
+    expect(issueTarget('key_space')).toEqual({ kind: 'key_space' });
+    expect(issueTarget('identity.match.0')).toEqual({ kind: 'identity' });
+    for (const path of ['table', 'entity', 'assertions.0.sql', '', 'fields', 'extensions']) expect(issueTarget(path)).toEqual({ kind: 'general' });
+  });
+
+  it('groupIssues 按目标分组，字段与扩展字段同名时按 fields / extensions 区分', () => {
+    const issue = (path: string) => ({ path, message: path });
+    const groups = groupIssues([
+      issue('fields.x_a'), issue('extensions.x_a.type'), issue('fields.x_a.dictionary'), issue('key_space'), issue('identity.match'), issue('table'), issue(''),
+    ]);
+    expect(groups.fields).toEqual({ x_a: [issue('fields.x_a'), issue('fields.x_a.dictionary')] });
+    expect(groups.extensions).toEqual({ x_a: [issue('extensions.x_a.type')] });
+    expect(groups.keySpace).toEqual([issue('key_space')]);
+    expect(groups.identity).toEqual([issue('identity.match')]);
+    expect(groups.general).toEqual([issue('table'), issue('')]);
+  });
+
+  it('真实的校验结果：amount 写错的问题对应到字段 amount', () => {
+    const r = checkMapping(HAND.replace('amount: pay_fen / 100', 'amount: pay_fen +'));
+    expect(r.ok).toBe(false);
+    const issues = r.ok ? [] : r.issues;
+    expect(issues.length).toBeGreaterThan(0);
+    expect(groupIssues(issues).fields.amount).toEqual(issues.filter(i => i.path.startsWith('fields.amount')));
+    expect(groupIssues(issues).fields.amount?.length).toBeGreaterThan(0);
   });
 });

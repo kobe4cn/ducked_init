@@ -9,15 +9,17 @@
 // 预填值只在写这个字段时一并写进 YAML，打开表单不改 YAML；清空预填值不写进 YAML，重新打开表单时又会预填（发布时本来也要求写同源目标的键空间）。
 // 跨源引用（ADR-0030）：指向 customer 的字段在键空间旁选「所属数据源」，可选本租户有已发布 customer 映射的其他数据源，默认本数据源（不写 customer_source）
 // 扩展字段按当前的名字是已登记关系的起点（ADR-0019）、类型是文本且不敏感时同样有键空间（不预填），指向 customer 的还有「所属数据源」；不满足时写回删掉这两项。
+// 实时校验的问题按 path 的第一段（groupIssues）显示在对应的区块里，只有文字、不带行列；对应不上的放在表单顶部。
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
 import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, KEY_SPACE_PATTERN, type CanonicalEntity, type CanonicalField, type FieldType } from '~/lib/canonical-model';
 import { parseExpression } from '~/lib/mapping-expr';
 import {
-  dictionaryRows, expressionOf, extensionNameProblem, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity,
+  dictionaryRows, expressionOf, extensionNameProblem, groupIssues, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity,
   readKeySpace, seedDictionary, TRANSFORMS, unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace, writtenDictionary,
   type DictionaryEntry, type ExtensionChoice, type ExtensionForm, type FieldChoice, type FieldForm, type Part, type TransformId,
 } from '~/lib/mapping-form';
+import type { MappingIssueView } from '~/components/mapping-editor';
 import type { ReferenceColumn, ReferenceFunction, ReferenceTable } from '~/components/mapping-reference';
 import { Badge } from '~/components/ui/badge';
 import { Button } from '~/components/ui/button';
@@ -34,11 +36,26 @@ function Notice({ children, onEditYaml }: { children: string; onEditYaml: () => 
   );
 }
 
+/** 实时校验对应到某个区块的问题：只显示文字（与保存校验一致）与改法，行列以 YAML 标签页为准 */
+function BlockIssues({ issues }: { issues?: MappingIssueView[] }) {
+  if (!issues?.length) return null;
+  return (
+    <div className="space-y-1 text-xs text-destructive">
+      {issues.map((i, n) => (
+        <div key={n}>
+          <p data-live-issue data-issue-path={i.path}>{i.message}</p>
+          {i.hint && <pre data-issue-hint className="mt-1 whitespace-pre-wrap rounded bg-muted px-2 py-1 font-mono text-foreground">{i.hint}</pre>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** 打开表单时定位到的字段，以及要加进它值对照表的源值（详情页「落入兜底」的取值） */
 export interface FormFocus { field: string; add: string[] }
 
-/** 表单标签页：目标实体的全部标准字段，改动写回 yaml 后交给 onChange */
-export function MappingForm({ yaml, entity, table, functions, focus, onChange, onEditYaml }: {
+/** 表单标签页：目标实体的全部标准字段，改动写回 yaml 后交给 onChange；issues 是实时校验的问题，显示在对应的区块里 */
+export function MappingForm({ yaml, entity, table, functions, focus, issues = [], onChange, onEditYaml }: {
   yaml: string;
   /** 目标实体：表单按它列出标准字段 */
   entity: string;
@@ -46,6 +63,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
   table: ReferenceTable | null;
   functions: ReferenceFunction[];
   focus?: FormFocus | null;
+  issues?: MappingIssueView[];
   onChange: (yaml: string) => void;
   /** 切到 YAML 标签页 */
   onEditYaml: () => void;
@@ -88,9 +106,25 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
     writeKeySpace(next, keySpace);
     onChange(next.toString());
   };
+  // 表单上没有那个区块（不是本实体的字段、扩展字段只读、不是 customer 的身份打通）的问题也放进顶部
+  const groups = groupIssues(issues);
+  const extensionsRead = readExtensions(doc);
+  const extensionNames = extensionsRead.reason ? [] : extensionsRead.extensions.map(e => e.name);
+  const general = [
+    ...groups.general,
+    ...Object.entries(groups.fields).flatMap(([name, list]) => (target.fields.some(f => f.name === name) ? [] : list)),
+    ...Object.entries(groups.extensions).flatMap(([name, list]) => (extensionNames.includes(name) ? [] : list)),
+    ...(target.name === 'customer' ? [] : groups.identity),
+  ];
   return (
     <div className="max-h-[48rem] divide-y overflow-y-auto rounded-lg border text-sm">
-      <KeySpace doc={doc} onWrite={writeSpace} />
+      {general.length > 0 && (
+        <div data-form-issues className="space-y-1 p-3">
+          <div className="text-xs font-medium text-destructive">实时校验发现的问题</div>
+          <BlockIssues issues={general} />
+        </div>
+      )}
+      <KeySpace doc={doc} issues={groups.keySpace} onWrite={writeSpace} />
       {readForm(doc, target).map(form => (
         <FieldRow
           key={form.field}
@@ -102,12 +136,13 @@ export function MappingForm({ yaml, entity, table, functions, focus, onChange, o
           keySpaces={table?.keySpaces ?? {}}
           customerSourceOptions={table?.customerSources ?? []}
           pending={focus?.field === form.field ? focus.add : []}
+          issues={groups.fields[form.field]}
           onWrite={choice => write(form.field, choice)}
           onEditYaml={onEditYaml}
         />
       ))}
-      <Extensions doc={doc} table={table} origins={table?.relationOrigins[target.name] ?? {}} onWrite={writeExt} onEditYaml={onEditYaml} />
-      {target.name === 'customer' && <Identity doc={doc} entity={target} onWrite={writeMatch} onEditYaml={onEditYaml} />}
+      <Extensions doc={doc} table={table} origins={table?.relationOrigins[target.name] ?? {}} issues={groups.extensions} onWrite={writeExt} onEditYaml={onEditYaml} />
+      {target.name === 'customer' && <Identity doc={doc} entity={target} issues={groups.identity} onWrite={writeMatch} onEditYaml={onEditYaml} />}
     </div>
   );
 }
@@ -157,7 +192,7 @@ function missing(choice: FieldChoice, type: FieldType): string | null {
 }
 
 /** 一个标准字段：说明、源列与转换，引用字段另有键空间，指向 customer 的还有所属数据源；只读时显示原表达式 */
-function FieldRow({ entity, form, field, table, functions, keySpaces, customerSourceOptions, pending, onWrite, onEditYaml }: {
+function FieldRow({ entity, form, field, table, functions, keySpaces, customerSourceOptions, pending, issues, onWrite, onEditYaml }: {
   entity: string;
   form: FieldForm;
   field: CanonicalField;
@@ -169,6 +204,8 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
   customerSourceOptions: { id: string; name: string }[];
   /** 要作为待对应的行加进值对照表的源值 */
   pending: string[];
+  /** 实时校验报在这个字段上的问题 */
+  issues?: MappingIssueView[];
   onWrite: (choice: FieldChoice | null) => void;
   onEditYaml: () => void;
 }) {
@@ -323,6 +360,7 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
 
       {!form.readonly && problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
       {form.basis && <div className="text-xs text-muted-foreground">{`依据：${form.basis}`}</div>}
+      <BlockIssues issues={issues} />
     </div>
   );
 }
@@ -361,11 +399,13 @@ function ReferenceKeyControls({ name, target, keySpace, customerSource, options,
 }
 
 /** 扩展字段区块：已有的扩展字段（可改，取消勾选即删除），以及还没用到的源列（勾选即加为扩展字段） */
-function Extensions({ doc, table, origins, onWrite, onEditYaml }: {
+function Extensions({ doc, table, origins, issues, onWrite, onEditYaml }: {
   doc: ReturnType<typeof parseDocument>;
   table: ReferenceTable | null;
   /** 本实体已登记关系的起点字段 → 终点实体 */
   origins: Record<string, string>;
+  /** 实时校验的问题，按扩展字段名分组 */
+  issues: Record<string, MappingIssueView[]>;
   onWrite: (name: string, choice: ExtensionChoice | null) => void;
   onEditYaml: () => void;
 }) {
@@ -393,6 +433,7 @@ function Extensions({ doc, table, origins, onWrite, onEditYaml }: {
               others={names.filter(n => n !== form.name)}
               origins={origins}
               customerSourceOptions={table?.customerSources ?? []}
+              issues={issues[form.name]}
               onWrite={choice => onWrite(form.name, choice)}
               onEditYaml={onEditYaml}
             />
@@ -418,7 +459,7 @@ function Extensions({ doc, table, origins, onWrite, onEditYaml }: {
  * 一个已有的扩展字段：名字、类型、中文名可改，表达式只显示；名字或键空间不合格时只留在这一行，不写进 YAML。
  * 按当前的名字是已登记关系的起点、类型是文本且不敏感时另有键空间（指向 customer 的还有所属数据源）；不满足时写回删掉这两项
  */
-function ExtensionRow({ form, others, origins, customerSourceOptions, onWrite, onEditYaml }: {
+function ExtensionRow({ form, others, origins, customerSourceOptions, issues, onWrite, onEditYaml }: {
   form: ExtensionForm;
   /** 其他扩展字段的名字 */
   others: string[];
@@ -426,6 +467,8 @@ function ExtensionRow({ form, others, origins, customerSourceOptions, onWrite, o
   origins: Record<string, string>;
   /** 有已发布 customer 映射的其他数据源 */
   customerSourceOptions: { id: string; name: string }[];
+  /** 实时校验报在这个扩展字段上的问题 */
+  issues?: MappingIssueView[];
   onWrite: (choice: ExtensionChoice | null) => void;
   onEditYaml: () => void;
 }) {
@@ -509,12 +552,13 @@ function ExtensionRow({ form, others, origins, customerSourceOptions, onWrite, o
         </div>
       )}
       {!form.readonly && problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
+      <BlockIssues issues={issues} />
     </div>
   );
 }
 
 /** 映射的键空间：主键在标准层带上这个前缀，同一数据源里指向本实体的引用字段要写同一个；清空时删掉 key_space */
-function KeySpace({ doc, onWrite }: { doc: ReturnType<typeof parseDocument>; onWrite: (keySpace: string | null) => void }) {
+function KeySpace({ doc, issues, onWrite }: { doc: ReturnType<typeof parseDocument>; issues: MappingIssueView[]; onWrite: (keySpace: string | null) => void }) {
   const written = readKeySpace(doc) ?? '';
   const [value, setValue] = useState(written);
   // YAML 在别处改了时按 YAML 重新读出
@@ -540,14 +584,16 @@ function KeySpace({ doc, onWrite }: { doc: ReturnType<typeof parseDocument>; onW
       </div>
       <Input className="h-7 w-40" aria-label="映射的键空间" placeholder="不写" value={value} onChange={e => change(e.target.value)} />
       {problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
+      <BlockIssues issues={issues} />
     </div>
   );
 }
 
 /** 身份打通的匹配字段：勾选已映射的敏感字段，选中的按优先级排列、可上下移动；YAML 里有但已不可选的字段标出，只能去掉 */
-function Identity({ doc, entity, onWrite, onEditYaml }: {
+function Identity({ doc, entity, issues, onWrite, onEditYaml }: {
   doc: ReturnType<typeof parseDocument>;
   entity: CanonicalEntity;
+  issues: MappingIssueView[];
   onWrite: (match: string[]) => void;
   onEditYaml: () => void;
 }) {
@@ -592,6 +638,7 @@ function Identity({ doc, entity, onWrite, onEditYaml }: {
           {!candidates.length && !match.length && <div className="text-xs text-muted-foreground">还没有映射敏感字段，映射手机号、邮箱等之后才能选</div>}
         </>
       )}
+      <BlockIssues issues={issues} />
     </div>
   );
 }
