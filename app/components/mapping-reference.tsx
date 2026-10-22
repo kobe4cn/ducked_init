@@ -1,12 +1,14 @@
 // app/components/mapping-reference.tsx —— 编写映射时放在编辑框旁的对照面板：源表各列的统计（类型、空值率、不同取值数、主键、水位线、常见取值），
 // 目标实体的标准字段（类型、是否必填、标准枚举）或自定义实体已发布登记的字段（类型、是否敏感、说明、主键）、写法速查与白名单函数。按编辑框里的 YAML 标出已对应的字段与还没对应的必填字段；
 // 点击列名、字段名、写法或函数插入到编辑框光标处。编辑区分「表单 / YAML」两个标签页，两边是同一份 YAML，始终由 YAML 框提交（ADR-0017）；
-// 给出校验接口时，输入停顿后实时校验，问题列在编辑区下方，点一条定位到 YAML 里那一处；表单标签页里另按区块显示在对应字段旁
-import { useEffect, useRef, useState } from 'react';
+// 给出校验接口时，输入停顿后实时校验，问题列在编辑区下方，点一条定位到 YAML 里那一处；表单标签页里改为按区块显示在对应字段旁，下方不逐项列出
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { parseDocument } from 'yaml';
 import { flushSync } from 'react-dom';
 import { Check } from 'lucide-react';
 import { Link } from 'react-router';
 import { type CustomEntityField, entityOf, FIELD_TYPES, isCustomEntity } from '~/lib/canonical-model';
+import { formUnavailable } from '~/lib/mapping-form';
 import { mappingOutline } from '~/lib/mapping-outline';
 import { LiveMappingIssues, MappingEditor, type MappingEditorHandle } from '~/components/mapping-editor';
 import { MappingForm, type FormFocus } from '~/components/mapping-form';
@@ -81,6 +83,8 @@ export function MappingEditorWithReference({ defaultValue, value, onValueChange,
   useEffect(() => setHydrated(true), []);
   const [chosen, setTab] = useState<(typeof TABS)[number]['id']>('form');
   const tab = hydrated ? chosen : 'yaml';
+  // 表单显示出来时问题已在各区块里，编辑区下方不再逐项列出
+  const formShown = useMemo(() => tab === 'form' && !formUnavailable(parseDocument(yaml), entity), [tab, yaml, entity]);
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       <div className="space-y-2">
@@ -108,6 +112,7 @@ export function MappingEditorWithReference({ defaultValue, value, onValueChange,
         <MappingEditor ref={editor} defaultValue={defaultValue} value={yaml} onValueChange={setYaml} hidden={tab !== 'yaml'} invalid={validation.issues.length > 0 || !!validation.error} />
         <LiveMappingIssues
           validation={validation}
+          inForm={formShown}
           onJump={(line, col) => {
             // 在表单标签页时先切到 YAML，编辑框显示出来才能定位
             flushSync(() => setTab('yaml'));

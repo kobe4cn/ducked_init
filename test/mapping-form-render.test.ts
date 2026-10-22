@@ -1,11 +1,11 @@
 // 映射表单的服务端渲染（纯函数）：扩展字段按当前名字是已登记关系的起点、类型是文本且不敏感时有键空间输入，
 // 指向 customer 的还有「所属数据源」下拉（本数据源与有已发布 customer 映射的其他数据源）；不是起点、非文本、敏感、只读的没有；
-// 实时校验的问题显示在对应区块里，对应不上的在表单顶部
+// 实时校验的问题显示在对应区块里，对应不上的在表单顶部；表单显示时编辑区下方的结果只给结论、不逐项列出
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { MappingForm } from '../app/components/mapping-form';
-import type { MappingIssueView } from '../app/components/mapping-editor';
+import { LiveMappingIssues, type MappingIssueView } from '../app/components/mapping-editor';
 import type { ReferenceTable } from '../app/components/mapping-reference';
 
 const YAML = `model: 1
@@ -94,5 +94,22 @@ describe('映射表单里的实时校验问题', () => {
     expect(identity).toContain('<p data-live-issue="true" data-issue-path="identity.match.0">匹配字段 email 没有映射</p>');
     expect(identity).toContain('identity: { match: [phone] }');
     expect(html).not.toContain('data-form-issues');
+  });
+});
+
+describe('编辑区下方的实时校验结果', () => {
+  const validation = {
+    state: 'issues' as const, error: '映射有 1 个问题', notices: [],
+    issues: [{ line: 6, col: 9, path: 'fields.name', message: '源表 signups 中没有字段 姓名_不存在' }],
+  };
+  const live = (inForm?: boolean) => renderToStaticMarkup(createElement(LiveMappingIssues, { validation, inForm, onJump: () => {} }));
+
+  it('默认逐项列出（带行列）；inForm 时只有结论与提示，不列出问题', () => {
+    expect(live()).toContain('第 6 行第 9 列（fields.name）：源表 signups 中没有字段 姓名_不存在');
+    const html = live(true);
+    expect(html).toContain('映射有 1 个问题');
+    expect(html).toContain('问题显示在表单里对应的位置');
+    expect(html).not.toContain('data-issue-path');
+    expect(html).not.toContain('姓名_不存在');
   });
 });

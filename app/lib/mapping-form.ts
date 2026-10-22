@@ -9,7 +9,7 @@
 // 没写时按同一数据源里目标实体已发布映射声明的键空间预填（只在写这个字段时一并写进 YAML）。
 // 跨源引用（ADR-0030）：指向 customer 的引用字段的 customer_source（目标消费者所在数据源的名字）随字段写成对象写法，选回本数据源时删掉
 import { isMap, isScalar, isSeq, YAMLMap, YAMLSeq, type Document, type Scalar } from 'yaml';
-import { EXTENSION_PATTERN, FIELD_TYPE_NAMES, type CanonicalEntity, type CanonicalField, type FieldType } from './canonical-model';
+import { entityOf, EXTENSION_PATTERN, FIELD_TYPE_NAMES, type CanonicalEntity, type CanonicalField, type FieldType } from './canonical-model';
 import { extensionName, standardValue } from './field-synonyms';
 import { ExprError, extensionSpec, lit, parseExpression, ref, referencedColumns, type Expr } from './mapping-expr';
 
@@ -587,6 +587,22 @@ export function writeKeySpace(doc: Document, keySpace: string | null): void {
   const value = keySpace?.trim();
   if (!value) doc.delete('key_space');
   else if (readKeySpace(doc) !== value) doc.set('key_space', value);
+}
+
+/** 表单显示不了时的说明（目标实体不是标准实体、YAML 有语法错误、写的实体与目标实体不一致）；能显示时为 null */
+export function formUnavailable(doc: Document, entity: string): string | null {
+  const target = entityOf(entity);
+  if (!target) return `${entity} 不是标准实体，表单只列标准实体的字段，请在 YAML 里编写。`;
+  if (doc.errors.length) {
+    const e = doc.errors[0];
+    const at = e.linePos ? `第 ${e.linePos[0].line} 行：` : '';
+    return `YAML 有语法错误（${at}${e.message.split('\n')[0]}），改好之前表单无法显示。`;
+  }
+  const written = doc.get('entity');
+  if (typeof written === 'string' && written !== target.name) {
+    return `YAML 里写的实体是 ${written}，与目标实体 ${target.name} 不一致；请改成一致或按规则重新生成草稿。`;
+  }
+  return null;
 }
 
 /** 校验问题在表单上对应的区块：标准字段、扩展字段、映射的键空间、身份打通，其余放进表单顶部的总列表 */

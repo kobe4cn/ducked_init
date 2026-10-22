@@ -110,8 +110,15 @@ export function MappingErrors({ error, issues, onJump }: { error: string; issues
   );
 }
 
-/** 实时校验的结果，放在编辑框下方：有问题时逐项列出（点击定位），合格时「校验通过」并列出提示；还没校验过时不显示 */
-export function LiveMappingIssues({ validation, onJump }: { validation: MappingValidationView; onJump: (line: number, col: number) => void }) {
+/**
+ * 实时校验的结果，放在编辑框下方：有问题时逐项列出（点击定位），合格时「校验通过」并列出提示；还没校验过时不显示。
+ * inForm 为真时问题已显示在表单各区块里，这里只给出结论，不逐项列出
+ */
+export function LiveMappingIssues({ validation, inForm = false, onJump }: {
+  validation: MappingValidationView;
+  inForm?: boolean;
+  onJump: (line: number, col: number) => void;
+}) {
   const { state, error, issues, notices } = validation;
   if (state === 'idle') return null;
   return (
@@ -119,7 +126,8 @@ export function LiveMappingIssues({ validation, onJump }: { validation: MappingV
       {state === 'checking' && (
         <p className="flex items-center gap-1 text-sm text-slate-500"><Loader2 className="size-3.5 animate-spin" />正在校验…</p>
       )}
-      {error && <MappingErrors error={error} issues={issues} onJump={onJump} />}
+      {error && <MappingErrors error={error} issues={inForm ? [] : issues} onJump={onJump} />}
+      {inForm && issues.length > 0 && <p className="text-sm text-slate-500">问题显示在表单里对应的位置，到 YAML 标签页可看到行列并定位</p>}
       {state === 'ok' && (
         <p className="flex items-center gap-1 text-sm text-emerald-600"><CheckCircle2 className="size-4" />校验通过</p>
       )}

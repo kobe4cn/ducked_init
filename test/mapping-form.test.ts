@@ -6,7 +6,7 @@ import { parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
 import {
-  dictionaryRows, groupIssues, identityCandidates, issueTarget, keySpaceOf, newExtension, readExtensions, readForm, readIdentity, readKeySpace, seedDictionary, TRANSFORMS,
+  dictionaryRows, formUnavailable, groupIssues, identityCandidates, issueTarget, keySpaceOf, newExtension, readExtensions, readForm, readIdentity, readKeySpace, seedDictionary, TRANSFORMS,
   unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace,
   type FieldChoice, type FieldForm,
 } from '../app/lib/mapping-form';
@@ -554,6 +554,14 @@ describe('实时校验的问题对应到表单区块', () => {
     expect(groups.keySpace).toEqual([issue('key_space')]);
     expect(groups.identity).toEqual([issue('identity.match')]);
     expect(groups.general).toEqual([issue('table'), issue('')]);
+  });
+
+  it('formUnavailable：标准实体、YAML 没有语法错误、写的实体一致时表单能显示（null），否则给出说明', () => {
+    expect(formUnavailable(parseDocument(HAND), 'order')).toBeNull();
+    expect(formUnavailable(parseDocument('model: 1\n'), 'order')).toBeNull();
+    expect(formUnavailable(parseDocument(HAND), 'custom_store')).toContain('不是标准实体');
+    expect(formUnavailable(parseDocument('fields: [\n'), 'order')).toContain('YAML 有语法错误');
+    expect(formUnavailable(parseDocument(HAND), 'customer')).toContain('YAML 里写的实体是 order');
   });
 
   it('真实的校验结果：amount 写错的问题对应到字段 amount', () => {

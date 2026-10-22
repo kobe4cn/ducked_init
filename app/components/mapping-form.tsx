@@ -15,7 +15,7 @@ import { parseDocument } from 'yaml';
 import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, KEY_SPACE_PATTERN, type CanonicalEntity, type CanonicalField, type FieldType } from '~/lib/canonical-model';
 import { parseExpression } from '~/lib/mapping-expr';
 import {
-  dictionaryRows, expressionOf, extensionNameProblem, groupIssues, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity,
+  dictionaryRows, expressionOf, extensionNameProblem, formUnavailable, groupIssues, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity,
   readKeySpace, seedDictionary, TRANSFORMS, unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace, writtenDictionary,
   type DictionaryEntry, type ExtensionChoice, type ExtensionForm, type FieldChoice, type FieldForm, type Part, type TransformId,
 } from '~/lib/mapping-form';
@@ -74,17 +74,9 @@ export function MappingForm({ yaml, entity, table, functions, focus, issues = []
   useEffect(() => {
     if (focused) document.getElementById(fieldId(focused))?.scrollIntoView({ block: 'center' });
   }, [focused]);
-  const target = entityOf(entity);
-  if (!target) return <Notice onEditYaml={onEditYaml}>{`${entity} 不是标准实体，表单只列标准实体的字段，请在 YAML 里编写。`}</Notice>;
-  if (doc.errors.length) {
-    const e = doc.errors[0];
-    const at = e.linePos ? `第 ${e.linePos[0].line} 行：` : '';
-    return <Notice onEditYaml={onEditYaml}>{`YAML 有语法错误（${at}${e.message.split('\n')[0]}），改好之前表单无法显示。`}</Notice>;
-  }
-  const written = doc.get('entity');
-  if (typeof written === 'string' && written !== target.name) {
-    return <Notice onEditYaml={onEditYaml}>{`YAML 里写的实体是 ${written}，与目标实体 ${target.name} 不一致；请改成一致或按规则重新生成草稿。`}</Notice>;
-  }
+  const unavailable = formUnavailable(doc, entity);
+  if (unavailable) return <Notice onEditYaml={onEditYaml}>{unavailable}</Notice>;
+  const target = entityOf(entity)!;
   const write = (field: string, choice: FieldChoice | null) => {
     // writeField 会改 Document，另解析一份，不动渲染用的 doc
     const next = parseDocument(yaml);
