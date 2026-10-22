@@ -1,0 +1,5 @@
+# 在订的鲜奶周期购卡数（自定义事实实体 custom_subscription）：SUB = 1（第二轮暂停后 0）
+base: custom_subscription
+measure: { agg: count }
+filter:
+  - { field: status, op: eq, value: ACTIVE }

@@ -1,0 +1,6 @@
+# 近 365 天营收：已支付、已发货、已完成的订单金额（S1 每个源 = 14.00；P01 = 650；K2a 中台记了退款不计入；E2 时区边界）
+base: order
+measure: { agg: sum, field: amount }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }
+window: { field: created_at, days: 365 }

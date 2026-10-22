@@ -1,0 +1,8 @@
+# 近 365 天按大区的营收：订单 → 奶站 → 大区（只有奶站账单有门店，线上订单记「未关联」；P01：华东 150、未关联 500）
+base: order
+measure: { agg: sum, field: amount }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }
+window: { field: created_at, days: 365 }
+dimensions:
+  - { name: region, path: order.store_id -> custom_station.region_id -> custom_region.region_name }

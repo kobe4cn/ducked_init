@@ -1,0 +1,11 @@
+# activity_s3（S3 CSV）源视图 signups_clean（views/activity_s3.signups_clean.sql）→ 消费者：地推试饮报名表，每条报名一个消费者记录，靠手机号并人。
+# 手机号手填，格式杂（空格、横线、+86），约 2% 少一位（打通不到人）；导购代填的手机号已在源视图里置空（P05）。报名时间形如 2026/9/1 14:05（北京时间）
+model: 1
+entity: customer
+view: signups_clean
+view_key: [报名编号]
+fields:
+  customer_id: 报名编号
+  name: 姓名
+  phone: 手机
+  registered_at: from_timezone(报名时间, 'Asia/Shanghai')

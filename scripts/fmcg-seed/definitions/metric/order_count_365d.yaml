@@ -1,0 +1,6 @@
+# 近 365 天订单数（状态同营收）
+base: order
+measure: { agg: count }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }
+window: { field: created_at, days: 365 }

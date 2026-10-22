@@ -1,0 +1,6 @@
+# 近 365 天下过单的渠道数：miniapp / station / tmall / jd / douyin（P01 = 5）
+base: order
+measure: { agg: count_distinct, field: channel }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }
+window: { field: created_at, days: 365 }

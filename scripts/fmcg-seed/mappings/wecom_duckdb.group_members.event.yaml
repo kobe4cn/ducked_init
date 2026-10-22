@@ -1,0 +1,10 @@
+# wecom_duckdb（S3 上的 DuckDB 文件）group_members → 行为事件：进社群（group_join）。没有成员记录 ID，用 群 ID:外部联系人 拼出；群 ID 记在 page（W1）
+model: 1
+entity: event
+table: group_members
+fields:
+  event_id: concat(group_id, ':', external_userid)
+  customer_id: external_userid
+  event_type: "'group_join'"
+  occurred_at: from_timezone(join_time, 'Asia/Shanghai')
+  page: group_id

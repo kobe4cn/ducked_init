@@ -1,0 +1,10 @@
+# station_mysql（MySQL）stations → 自定义实体 custom_station（奶站维度；关系 order.store_id → custom_station、custom_station.region_id → custom_region）
+model: 1
+entity: custom_station
+table: stations
+extensions:
+  station_id: { type: string, expr: station_id }
+  station_name: { type: string, expr: station_name }
+  city: { type: string, expr: city }
+  region_id: { type: string, expr: region_id }
+dedupe: { key: [station_id] }

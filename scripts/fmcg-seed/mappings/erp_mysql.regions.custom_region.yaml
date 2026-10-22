@@ -1,0 +1,8 @@
+# erp_mysql（MySQL）regions → 自定义实体 custom_region（大区维度）
+model: 1
+entity: custom_region
+table: regions
+extensions:
+  region_id: { type: string, expr: region_id }
+  region_name: { type: string, expr: region_name }
+dedupe: { key: [region_id] }

@@ -1,0 +1,6 @@
+# 价值分层：近 365 天营收 ≥ 2000 高、≥ 500 中，其余低（人群是全部统一消费者，没下过单的也是低）
+metric: revenue_365d
+rules:
+  - { value: 高, when: { gte: 2000 } }
+  - { value: 中, when: { gte: 500 } }
+default: 低

@@ -1,0 +1,11 @@
+# wecom_duckdb 源视图 group_quits（views/wecom_duckdb.group_quits.sql）→ 行为事件：退群（group_quit）。同一张源表到同一个实体只能有一个映射，第二类事件用源视图拆（W1）
+model: 1
+entity: event
+view: group_quits
+view_key: [group_id, external_userid]
+fields:
+  event_id: concat(group_id, ':', external_userid, ':quit')
+  customer_id: external_userid
+  event_type: "'group_quit'"
+  occurred_at: from_timezone(quit_time, 'Asia/Shanghai')
+  page: group_id

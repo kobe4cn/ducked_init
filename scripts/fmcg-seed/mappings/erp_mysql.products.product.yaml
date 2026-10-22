@@ -1,0 +1,14 @@
+# erp_mysql（MySQL）products → 商品。ERP 是商品主数据：名称、品类、标价；HC0053–HC0060 的品牌没填（K3）。
+# 与扫码平台的 sku_points 建合并组（逐字段补齐，ERP 优先）：品牌由扫码平台补上，只在扫码平台登记的新品也有一行
+model: 1
+entity: product
+table: products
+fields:
+  product_id: sku_code
+  name: name
+  category: category
+  brand: brand
+  price: list_price
+extensions:
+  x_spec: { type: string, expr: spec, label: 规格 }
+  x_barcode: { type: string, expr: barcode, label: 69 码 }

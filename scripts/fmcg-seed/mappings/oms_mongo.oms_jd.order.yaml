@@ -1,0 +1,28 @@
+# oms_mongo（MongoDB）源视图 oms_jd（views/oms_mongo.oms_jd.sql）→ 订单：订单中台里京东的单，是 jd_s3 订单的第二份拷贝（K2）。
+# 和 jd_s3 的订单映射放进同一个合并组（取最新 updated_at）：同一个订单号只留一行，整行取较新的一边——中台记了售后退款就以中台为准，
+# 平台后来确认收货就以平台为准（「覆盖」是成员显式选择的存活规则，不是平台默认）。物流公司只在中台有。
+# 约 2% 的订单另有一个旧版本文档（同一订单号、待付款）：映射内按订单号去重、取 updated_at 最新的一版（K6）。Mongo 的 Date 是 UTC
+model: 1
+entity: order
+view: oms_jd
+view_key: [doc_id]
+fields:
+  order_id: so_id
+  customer_id: { expr: buyer_id, customer_source: jd_s3 }
+  status:
+    expr: status
+    dictionary:
+      WAIT_PAY: created
+      WAIT_SEND: paid
+      SENT: shipped
+      FINISHED: completed
+      CANCELLED: cancelled
+      REFUNDED: refunded
+  amount: pay_total
+  created_at: created
+  paid_at: pay_paid_at
+  channel: "'jd'"
+  updated_at: modified
+extensions:
+  x_logistics_company: { type: string, expr: logistics_company, label: 物流公司 }
+dedupe: { key: [order_id], latest: updated_at }

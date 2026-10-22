@@ -1,0 +1,13 @@
+# member_pg（Postgres）redemptions → 行为事件。积分商城兑换单：取消的不算（where）；礼品名记在 page
+model: 1
+entity: event
+table: redemptions
+where: status <> '已取消'
+fields:
+  event_id: redeem_id
+  customer_id: member_id
+  event_type: "'points_redeem'"
+  occurred_at: created_at
+  page: gift_name
+extensions:
+  x_points_cost: { type: integer, expr: points_cost, label: 花费积分 }

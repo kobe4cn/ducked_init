@@ -1,0 +1,22 @@
+# scan_mysql（MySQL）scans → 行为事件。每次扫码一行：成功（第一次扫这个码）→ scan，重复扫码（码已被别人扫过）→ scan_duplicate，假码 → scan_invalid（K10）。
+# 测试批次 TEST 的码不进标准层（K7；假码没有批次，用 coalesce 留下）；码、商品、扫码大区作扩展字段，x_code 登记了到 custom_code 的关系（可按码的销售大区分析窜货）
+model: 1
+entity: event
+table: scans
+where: coalesce(batch_no, '') <> 'TEST'
+fields:
+  event_id: string(scan_id)
+  customer_id: openid
+  event_type:
+    expr: result
+    dictionary:
+      成功: scan
+      重复扫码: scan_duplicate
+      无效码: scan_invalid
+  occurred_at: from_timezone(scan_time, 'Asia/Shanghai')
+  page: sku
+extensions:
+  x_code: { type: string, expr: code, label: 码 }
+  x_scan_region: { type: string, expr: scan_region, label: 扫码大区 }
+  x_reward_type: { type: string, expr: reward_type, label: 奖励类型 }
+  x_reward_value: { type: decimal, expr: reward_value, label: 奖励值 }

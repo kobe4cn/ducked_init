@@ -1,0 +1,6 @@
+# 近 365 天客单价（状态同营收）
+base: order
+measure: { agg: avg, field: amount }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }
+window: { field: created_at, days: 365 }

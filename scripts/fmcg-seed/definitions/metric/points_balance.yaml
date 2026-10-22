@@ -1,0 +1,3 @@
+# 积分余额：全部流水求和（L1 = 60；L2 = 0；L3 = 200，会员卡上写的 999 对不上）
+base: points_transaction
+measure: { agg: sum, field: points_change }

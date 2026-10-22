@@ -1,0 +1,6 @@
+# 扫码活跃度：近 30 天成功扫码 ≥ 4 次高频、≥ 1 次偶尔，其余未扫码（E1 高频）
+metric: scan_count_30d
+rules:
+  - { value: 高频扫码, when: { gte: 4 } }
+  - { value: 偶尔扫码, when: { gte: 1 } }
+default: 未扫码

@@ -80,11 +80,11 @@ function flatten(name: string, type: string): SourceColumn[] {
   });
 }
 
-/** 每个数据源每张表的列（加上原始层的平台列） */
-export async function sourceColumns(names: string[]) {
+/** 每个数据源每张表的列（加上原始层的平台列）；specs 默认是本场景的数据源（scripts/fmcg-seed 传自己的） */
+export async function sourceColumns(names: string[], specs: Record<string, SourceSpec> = SOURCES) {
   const out = new Map<string, SourceColumn[]>();
   for (const name of names) {
-    const session = await openSource(SOURCES[name]!, { memoryLimitMb: 1024, threads: 2 });
+    const session = await openSource(specs[name]!, { memoryLimitMb: 1024, threads: 2 });
     try {
       for (const t of await session.tables()) {
         const described = (await session.con.runAndReadAll(`DESCRIBE SELECT * FROM ${t.from}`)).getRowObjectsJson() as { column_name: string; column_type: string }[];

@@ -1,0 +1,8 @@
+# 近 90 天成功扫码次数，按码的销售大区（事件 → 码 → 大区）：与扫码人所在大区不同的是窜货货品
+base: event
+measure: { agg: count }
+filter:
+  - { field: event_type, op: eq, value: scan }
+window: { field: occurred_at, days: 90 }
+dimensions:
+  - { name: sales_region, path: event.x_code -> custom_code.sales_region -> custom_region.region_name }

@@ -1,0 +1,11 @@
+# scan_mysql（MySQL）sku_points → 商品。扫码平台为每个 SKU 配扫码积分，也记了品牌；新品 HC0061–HC0063 只在这里（K3）。
+# 与 ERP 的商品映射同在一个合并组（逐字段补齐，ERP 优先）
+model: 1
+entity: product
+table: sku_points
+fields:
+  product_id: sku
+  name: product_name
+  brand: brand
+extensions:
+  x_scan_points: { type: integer, expr: points_per_scan, label: 每次扫码积分 }

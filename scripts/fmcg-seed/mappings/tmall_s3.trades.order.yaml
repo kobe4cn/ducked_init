@@ -1,0 +1,22 @@
+# tmall_s3（S3 Parquet）trades → 订单。与订单中台的天猫订单是同一批（K2）：与 oms 的三个视图映射、京东、抖音的订单映射同在一个合并组。
+# 售后退款不改天猫的交易状态（导出里仍是 TRADE_FINISHED），中台会记退款；时间是 Unix 毫秒；导出文件没有水位线（全量比对）
+model: 1
+entity: order
+table: trades
+fields:
+  order_id: string(tid)
+  customer_id: ouid
+  status:
+    expr: trade_status
+    dictionary:
+      WAIT_BUYER_PAY: created
+      WAIT_SELLER_SEND_GOODS: paid
+      WAIT_BUYER_CONFIRM_GOODS: shipped
+      TRADE_FINISHED: completed
+      TRADE_CLOSED: cancelled
+      REFUND_SUCCESS: refunded
+  amount: payment
+  created_at: from_epoch_millis(created_ms)
+  paid_at: from_epoch_millis(pay_ms)
+  channel: "'tmall'"
+  updated_at: from_epoch_millis(modified_ms)

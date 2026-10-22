@@ -1,0 +1,8 @@
+# 扫码未购（线下买、线上没买过：小程序拉新的目标人群）：近 30 天扫码 ≥ 3 次且近 365 天没有订单；E1 命中
+rules:
+  - value: 扫码未购
+    when:
+      all:
+        - { metric: scan_count_30d, gte: 3 }
+        - { metric: order_count_365d, eq: 0 }
+default: 其他

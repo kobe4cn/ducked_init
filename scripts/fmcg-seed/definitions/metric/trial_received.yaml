@@ -1,0 +1,6 @@
+# 领取过试饮装的次数（试饮报名事件，扩展字段 x_received = 是）：T1 = 1
+base: event
+measure: { agg: count }
+filter:
+  - { field: event_type, op: eq, value: trial_signup }
+  - { field: x_received, op: eq, value: 是 }

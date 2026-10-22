@@ -14,4 +14,5 @@ node_modules/
 # Generated RFM seed data and credentials
 scripts/rfm-seed/out/
 scripts/crm-seed/out/
+scripts/fmcg-seed/out/
 scripts/eval-mapping/out/

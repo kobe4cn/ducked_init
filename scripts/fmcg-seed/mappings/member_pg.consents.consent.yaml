@@ -1,0 +1,19 @@
+# member_pg（Postgres）consents → 营销同意：短信、微信订阅消息（K5：与奶站的短信开关可能矛盾，统一消费者上按时间取最新、撤回优先）
+model: 1
+entity: consent
+table: consents
+fields:
+  customer_id: member_id
+  channel:
+    expr: channel
+    dictionary:
+      SMS: sms
+      WECHAT: wechat
+  status:
+    expr: status
+    dictionary:
+      Y: granted
+      N: revoked
+  granted_at: granted_at
+  revoked_at: revoked_at
+  updated_at: updated_at

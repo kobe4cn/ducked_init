@@ -1,0 +1,6 @@
+# 近 90 天扫码获得的积分（流水原始类型 EARN_SCAN 在扩展字段 x_reason 上）：L1 = 30
+base: points_transaction
+measure: { agg: sum, field: points_change }
+filter:
+  - { field: x_reason, op: eq, value: EARN_SCAN }
+window: { field: occurred_at, days: 90 }

@@ -1,0 +1,6 @@
+# 近 30 天成功扫码次数（重复扫码、假码不算；测试码不进标准层）：E1 = 5，K10 先扫的 1、后扫的 0
+base: event
+measure: { agg: count }
+filter:
+  - { field: event_type, op: eq, value: scan }
+window: { field: occurred_at, days: 30 }

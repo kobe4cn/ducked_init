@@ -1,0 +1,13 @@
+# scan_mysql（MySQL）scan_users → 消费者。一物一码平台的扫码用户：openid 是扫码公众号的，与小程序不同；关注了开放平台的有 unionid（约 50–70%），
+# 领红包提现时填过手机号的约 15%。什么都没有的扫码用户打通不到人（P02，真实限制）；时间是北京时间
+model: 1
+entity: customer
+table: scan_users
+fields:
+  customer_id: openid
+  name: nickname
+  phone: phone
+  external_id: unionid
+  city: city
+  registered_at: from_timezone(first_scan_at, 'Asia/Shanghai')
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')

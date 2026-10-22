@@ -1,0 +1,14 @@
+# station_mysql（MySQL）members → 营销同意：奶站的短信通知开关（K5）。同一张表另映射成消费者（不同实体可以各有一个映射）
+model: 1
+entity: consent
+table: members
+where: notify_updated_at is not null
+fields:
+  customer_id: string(member_id)
+  channel: "'sms'"
+  status:
+    expr: string(sms_notify)
+    dictionary:
+      '1': granted
+      '0': revoked
+  updated_at: from_timezone(notify_updated_at, 'Asia/Shanghai')

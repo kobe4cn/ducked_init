@@ -1,0 +1,12 @@
+# douyin_s3（S3 CSV）源视图 dy_buyers（views/douyin_s3.dy_buyers.sql）→ 消费者。买家信息内嵌在订单里，同一买家多行，按 openid 取更新时间最新的一行（K9）。
+# 不写 view_key：同一个 openid 在视图里有多行，写成 view_key 时同一批次里平台任取一行，dedupe 的「取最新」就不起作用了（按整行区分记录，再由 dedupe 取最新）
+# 约 40% 授权了明文手机号（CSV 读成整数，转回文本）；时间是北京时间
+model: 1
+entity: customer
+view: dy_buyers
+fields:
+  customer_id: openid
+  phone: string(mobile)
+  city: city
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')
+dedupe: { key: [customer_id], latest: updated_at }

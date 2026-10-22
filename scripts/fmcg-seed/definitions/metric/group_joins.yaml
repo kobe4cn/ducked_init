@@ -1,0 +1,5 @@
+# 进过的社群数（进群事件次数，退群不扣）：W1 = 2
+base: event
+measure: { agg: count }
+filter:
+  - { field: event_type, op: eq, value: group_join }

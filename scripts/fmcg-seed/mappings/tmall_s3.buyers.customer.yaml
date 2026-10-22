@@ -1,0 +1,14 @@
+# tmall_s3（S3 Parquet）buyers → 消费者。天猫只给 OUID（品牌内唯一）；入会（品牌会员通）的约 30% 有明文手机号，其余只有脱敏号——
+# 脱敏号不是身份字段（映射成 phone 会把同号段的不同人连起来），只作展示用扩展字段；时间是 Unix 毫秒（P07）
+model: 1
+entity: customer
+table: buyers
+fields:
+  customer_id: ouid
+  name: buyer_nick
+  phone: member_mobile
+  registered_at: from_epoch_millis(first_buy_ms)
+  updated_at: from_epoch_millis(first_buy_ms)
+extensions:
+  x_tmall_member_level: { type: string, expr: member_level, label: 天猫会员等级 }
+  x_tmall_mobile_mask: { type: string, expr: mobile_mask, label: 天猫脱敏手机号, sensitive: false }

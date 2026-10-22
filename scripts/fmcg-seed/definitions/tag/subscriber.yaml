@@ -1,0 +1,5 @@
+# 周期购用户：在订卡数 ≥ 1（SUB 探针第一轮在订、第二轮暂停后不在订）
+metric: active_subscriptions
+rules:
+  - { value: 在订, when: { gte: 1 } }
+default: 未订

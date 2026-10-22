@@ -1,0 +1,6 @@
+# 近 7 天商品浏览次数：含经设备归属到人的匿名浏览（P06 = 12）
+base: event
+measure: { agg: count }
+filter:
+  - { field: event_type, op: eq, value: view_product }
+window: { field: occurred_at, days: 7 }

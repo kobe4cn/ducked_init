@@ -1,0 +1,16 @@
+# mall_pg（Postgres）subscriptions → 自定义实体 custom_subscription（事实：鲜奶周期购卡）。customer_id 登记了到 customer 的关系，
+# 能做指标的基础实体（在订卡数）；会员号属于会员中心：跨源引用 member_pg
+model: 1
+entity: custom_subscription
+table: subscriptions
+extensions:
+  sub_id: { type: string, expr: sub_id }
+  customer_id: { type: string, expr: member_id, customer_source: member_pg }
+  product_id: { type: string, expr: sku }
+  plan: { type: string, expr: plan }
+  periods: { type: integer, expr: periods }
+  delivered: { type: integer, expr: delivered }
+  status: { type: string, expr: status }
+  start_date: { type: date, expr: start_date }
+  updated_at: { type: timestamp, expr: updated_at }
+dedupe: { key: [sub_id], latest: updated_at }

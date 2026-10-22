@@ -1,0 +1,10 @@
+# jd_s3（S3 CSV）源视图 jd_buyers（views/jd_s3.jd_buyers.sql）→ 消费者。买家 PIN 内嵌在订单导出里，同一买家多行，按 PIN 取更新时间最新的一行。
+# 只有入会的买家（约 15%）有手机号，带 86- 前缀；时间是北京时间。不写 view_key（同一个 PIN 有多行，见 douyin_s3.dy_buyers.customer.yaml）
+model: 1
+entity: customer
+view: jd_buyers
+fields:
+  customer_id: pin
+  phone: mobile
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')
+dedupe: { key: [customer_id], latest: updated_at }

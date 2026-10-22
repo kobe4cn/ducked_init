@@ -1,0 +1,12 @@
+# activity_s3（S3 CSV）signups → 行为事件：试饮报名（trial_signup）；是否领取了试饮装记在扩展字段 x_received（T1）
+model: 1
+entity: event
+table: signups
+fields:
+  event_id: 报名编号
+  customer_id: 报名编号
+  event_type: "'trial_signup'"
+  occurred_at: from_timezone(报名时间, 'Asia/Shanghai')
+  page: 活动编号
+extensions:
+  x_received: { type: string, expr: 是否领取, label: 是否领取试饮装 }

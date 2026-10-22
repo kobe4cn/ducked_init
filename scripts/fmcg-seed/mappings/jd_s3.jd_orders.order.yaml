@@ -1,0 +1,21 @@
+# jd_s3（S3 CSV）jd_orders → 订单。在订单合并组里（K2）；状态是中文；时间是北京时间
+model: 1
+entity: order
+table: jd_orders
+fields:
+  order_id: string(订单号)
+  customer_id: 用户PIN
+  status:
+    expr: 订单状态
+    dictionary:
+      等待付款: created
+      等待出库: paid
+      等待确认收货: shipped
+      完成: completed
+      已取消: cancelled
+      退款成功: refunded
+  amount: 应付金额
+  created_at: from_timezone(下单时间, 'Asia/Shanghai')
+  paid_at: from_timezone(付款时间, 'Asia/Shanghai')
+  channel: "'jd'"
+  updated_at: from_timezone(更新时间, 'Asia/Shanghai')

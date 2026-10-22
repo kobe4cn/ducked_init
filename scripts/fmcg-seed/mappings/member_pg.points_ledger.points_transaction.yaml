@@ -1,0 +1,25 @@
+# member_pg（Postgres）points_ledger → 积分流水。获得有三种来源：订单（EARN_ORDER）、扫码（EARN_SCAN）、签到（SIGN_IN），都归为 earn，
+# 原始类型留在 x_reason（指标「近 90 天扫码积分」按它过滤）；兑换、过期、调整带负号（调整也可能为正）。ref_no 是订单号、码或兑换单号
+model: 1
+entity: points_transaction
+table: points_ledger
+fields:
+  points_transaction_id: txn_id
+  customer_id: member_id
+  membership_id: card_no
+  change_type:
+    expr: txn_type
+    dictionary:
+      EARN_ORDER: earn
+      EARN_SCAN: earn
+      SIGN_IN: earn
+      REDEEM: redeem
+      EXPIRE: expire
+      ADJUST: adjust
+  points_change: points
+  balance_after: balance_after
+  occurred_at: occurred_at
+  expires_at: expires_at
+extensions:
+  x_reason: { type: string, expr: txn_type, label: 积分来源 }
+  x_ref_no: { type: string, expr: ref_no, label: 关联单号 }

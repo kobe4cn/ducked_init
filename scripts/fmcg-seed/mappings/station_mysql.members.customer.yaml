@@ -1,0 +1,13 @@
+# station_mysql（MySQL）members → 消费者。奶站订奶户：手机号由奶站录入（带空格）；不用手机的老人录了占位号 13800000000，
+# 不去掉会把所有这样的老人并成一个人（P04）：nullif 把它置空。奶站会员号从 1 开始，与别的源的消费者 ID 无关（消费者按数据源区分）
+model: 1
+entity: customer
+table: members
+fields:
+  customer_id: string(member_id)
+  name: name
+  phone: nullif(phone, '13800000000')
+  city: address_city
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')
+extensions:
+  x_station_id: { type: string, expr: station_id, label: 所属奶站 }

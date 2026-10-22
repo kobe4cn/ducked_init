@@ -1,0 +1,8 @@
+# 近 365 天按城市的营收：城市取统一消费者的属性（会员中心优先，其余按更新时间取最新，ADR-0027）。K8 = 上海；第二轮 P01 改成北京
+base: order
+measure: { agg: sum, field: amount }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }
+window: { field: created_at, days: 365 }
+dimensions:
+  - { name: city, path: consumer.city }

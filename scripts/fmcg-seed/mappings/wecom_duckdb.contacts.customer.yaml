@@ -1,0 +1,12 @@
+# wecom_duckdb（S3 上的 DuckDB 文件）contacts → 消费者。社群运营添加的外部联系人：都有 unionid，约 20% 有手机号；时间是北京时间
+model: 1
+entity: customer
+table: contacts
+fields:
+  customer_id: external_userid
+  phone: mobile
+  external_id: unionid
+  registered_at: from_timezone(add_time, 'Asia/Shanghai')
+  updated_at: from_timezone(update_time, 'Asia/Shanghai')
+extensions:
+  x_owner_id: { type: string, expr: owner_id, label: 社群运营 }

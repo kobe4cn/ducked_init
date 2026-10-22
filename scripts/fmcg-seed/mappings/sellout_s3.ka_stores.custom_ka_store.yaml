@@ -1,0 +1,11 @@
+# sellout_s3（S3 CSV）ka_stores → 自定义实体 custom_ka_store（商超门店维度；关系 custom_ka_store.region_id → custom_region）
+model: 1
+entity: custom_ka_store
+table: ka_stores
+extensions:
+  store_code: { type: string, expr: 门店编码 }
+  store_name: { type: string, expr: 门店名称 }
+  chain: { type: string, expr: 系统 }
+  city: { type: string, expr: 城市 }
+  region_id: { type: string, expr: 大区 }
+dedupe: { key: [store_code] }

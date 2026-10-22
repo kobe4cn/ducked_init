@@ -1,0 +1,11 @@
+# douyin_s3（S3 CSV）dy_orders → 订单明细。同一张导出既映射订单，也映射明细（一单一行，子订单编号作明细号）；商家编码就是 ERP 的 SKU
+model: 1
+entity: order_item
+table: dy_orders
+fields:
+  order_item_id: string(子订单编号)
+  order_id: string(订单编号)
+  product_id: 商家编码
+  quantity: 数量
+  unit_price: round(decimal(实付金额（分）) / 100 / 数量, 2)
+  amount: decimal(实付金额（分）) / 100

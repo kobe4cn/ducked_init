@@ -1,0 +1,12 @@
+# scan_mysql（MySQL）codes → 自定义实体 custom_code（一物一码：码 → SKU、批次、销售大区；关系 event.x_code → custom_code、custom_code.sales_region → custom_region）。
+# 销售大区与扫码大区不一致是窜货（约 5%），在工作台里查
+model: 1
+entity: custom_code
+table: codes
+extensions:
+  code: { type: string, expr: code }
+  sku: { type: string, expr: sku }
+  batch_no: { type: string, expr: batch_no }
+  sales_region: { type: string, expr: sales_region }
+  produced_at: { type: timestamp, expr: "from_timezone(produced_at, 'Asia/Shanghai')" }
+dedupe: { key: [code] }

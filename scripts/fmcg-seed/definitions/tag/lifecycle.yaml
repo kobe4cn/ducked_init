@@ -1,0 +1,7 @@
+# 购买生命周期：最近一次购买 ≤ 30 天活跃、≤ 90 天预警、更久流失；从没下过单的取默认值「未购买」（days_since 没有结果时为空，比较都不成立）
+metric: days_since_last_order
+rules:
+  - { value: 活跃, when: { lte: 30 } }
+  - { value: 预警, when: { lte: 90 } }
+  - { value: 流失, when: { gt: 90 } }
+default: 未购买

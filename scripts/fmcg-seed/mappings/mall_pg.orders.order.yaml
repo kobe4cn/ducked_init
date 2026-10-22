@@ -1,0 +1,25 @@
+# mall_pg（Postgres）orders → 订单。小程序商城，订单号从 1 起，与奶站账单号重号：键空间 mall（K1）。
+# 商城没有自己的用户表，member_id 是会员中心的会员号：跨源引用 member_pg（ADR-0030）。周期购卡也是一笔订单（order_type = 周期购）
+model: 1
+entity: order
+table: orders
+key_space: mall
+fields:
+  order_id: string(order_id)
+  customer_id: { expr: member_id, customer_source: member_pg }
+  status:
+    expr: status
+    dictionary:
+      WAIT_PAY: created
+      PAID: paid
+      SHIPPED: shipped
+      FINISHED: completed
+      CLOSED: cancelled
+      REFUNDED: refunded
+  amount: pay_amount
+  created_at: created_at
+  paid_at: paid_at
+  channel: "'miniapp'"
+  updated_at: updated_at
+extensions:
+  x_order_type: { type: string, expr: order_type, label: 订单类型 }

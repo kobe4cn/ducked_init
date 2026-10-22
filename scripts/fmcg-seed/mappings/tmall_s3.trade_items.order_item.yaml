@@ -1,0 +1,11 @@
+# tmall_s3（S3 Parquet）trade_items → 订单明细（天猫子订单）。商家编码 outer_iid 约 5% 没填（空字符串）：置空，按品类分组时记「未关联」（K4）
+model: 1
+entity: order_item
+table: trade_items
+fields:
+  order_item_id: string(oid)
+  order_id: string(tid)
+  product_id: nullif(outer_iid, '')
+  quantity: num
+  unit_price: round(payment / num, 2)
+  amount: payment

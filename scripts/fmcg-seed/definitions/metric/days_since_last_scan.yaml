@@ -1,0 +1,5 @@
+# 最近一次成功扫码距今天数（E1 = 5）
+base: event
+measure: { agg: days_since, field: occurred_at }
+filter:
+  - { field: event_type, op: eq, value: scan }

@@ -1,0 +1,25 @@
+# station_mysql（MySQL）bills → 订单。奶站每月一张账单，账单号从 1 起，与商城订单号重号：键空间 station（K1）。
+# 测试奶站 ST999 的账单不进标准层（K7）；账单在每月 1 日北京时间 07:30 生成，是 UTC 前一天 23:30（E2）；状态是中文
+model: 1
+entity: order
+table: bills
+key_space: station
+where: station_id <> 'ST999'
+fields:
+  order_id: string(bill_id)
+  customer_id: string(member_id)
+  status:
+    expr: status
+    dictionary:
+      未缴费: created
+      已缴费: paid
+      配送中: shipped
+      已完成: completed
+      已取消: cancelled
+      已退订: refunded
+  amount: amount
+  created_at: from_timezone(created_at, 'Asia/Shanghai')
+  paid_at: from_timezone(paid_at, 'Asia/Shanghai')
+  channel: "'station'"
+  store_id: station_id
+  updated_at: from_timezone(updated_at, 'Asia/Shanghai')

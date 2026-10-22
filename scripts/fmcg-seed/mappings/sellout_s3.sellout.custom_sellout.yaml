@@ -1,0 +1,13 @@
+# sellout_s3（S3 CSV）sellout → 自定义实体 custom_sellout（事实：经销商回传的商超门店周销量，没有消费者）。
+# 主键是 周 + 门店 + 商品；关系到商超门店与商品。不能做指标（基础实体要关联到消费者），在工作台里与扫码数一起算扫码率
+model: 1
+entity: custom_sellout
+table: sellout
+extensions:
+  week: { type: string, expr: 周 }
+  week_start: { type: date, expr: 周一 }
+  store_code: { type: string, expr: 门店编码 }
+  product_id: { type: string, expr: 商家编码 }
+  qty: { type: integer, expr: 销量 }
+  amount: { type: decimal, expr: 销售额 }
+dedupe: { key: [week, store_code, product_id] }

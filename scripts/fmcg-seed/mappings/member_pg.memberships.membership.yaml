@@ -1,0 +1,15 @@
+# member_pg（Postgres）memberships → 会员。卡上的积分余额是会员中心自己维护的（L3 故意与流水对不上：断言 4 应能发现）
+model: 1
+entity: membership
+table: memberships
+fields:
+  membership_id: card_no
+  customer_id: member_id
+  level: tier
+  points: points_balance
+  status:
+    expr: status
+    dictionary:
+      正常: active
+      冻结: frozen
+  joined_at: joined_at
