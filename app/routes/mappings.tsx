@@ -4,12 +4,12 @@
 import { AlertTriangle, CheckCircle2, CircleDashed, Layers, Loader2, PencilLine, Play, Plus, ScanSearch, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { isMap, isScalar, parseDocument } from 'yaml';
-import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
+import { data, Form, Link, redirect, type ShouldRevalidateFunctionArgs, useNavigation, useRevalidator } from 'react-router';
 import type { Route } from './+types/mappings';
 import { assertCan, can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { checkKeysNow, getKeyCheckStatus, KeyCheckError } from '~/.server/key-check';
-import { createMapping, defaultDraft, draftFor, GenerationMismatchError, listMappings, MappingError, mergeNow, modelDraftFor, referenceTables } from '~/.server/mappings';
+import { createMapping, defaultDraft, draftFor, GenerationMismatchError, listMappings, MappingError, mergeNow, modelDraftFor, referenceTables, validateNewMapping } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
 import { SUGGESTION_LABELS } from '~/.server/pipeline/key-check-engine';
@@ -93,6 +93,11 @@ export async function loader({ request }: Route.LoaderArgs) {
 /** 最近一次体检任务的状态 → 页面上的状态：从没体检过、体检中（排队或运行）、失败、成功 */
 const KEYCHECK_STATUS = { none: 'never', queued: 'running', running: 'running', failed: 'failed', succeeded: 'ok' } as const;
 
+/** 只校验的提交不改数据，不重跑 loader */
+export function shouldRevalidate({ formData, defaultShouldRevalidate }: ShouldRevalidateFunctionArgs) {
+  return formData?.get('intent') === 'validate' ? false : defaultShouldRevalidate;
+}
+
 /** 运行体检（intent=keycheck）只要 sources:read，其余操作都要 sources:write */
 export async function action({ request }: Route.ActionArgs) {
   const member = await requirePermission(request, 'sources:read');
@@ -117,6 +122,9 @@ export async function action({ request }: Route.ActionArgs) {
           generationId: draft.generationId, generated: { origin: draft.origin, items: draft.items, reusedFrom: draft.reusedFrom ?? null, notice: draft.notice ?? null },
         };
       }
+      case 'validate':
+        // 只校验、不保存：与新建同一套检查，问题列表与新建被拒时相同
+        return { ...await validateNewMapping(member, field('sourceId'), field('yaml')), values: null, draftId: null };
       case 'create': {
         // 从生成草稿开始改的，保存时比对生成稿记下改动（ADR-0035）
         const mapping = await createMapping(member, field('sourceId'), field('yaml'), { generationId: field('generationId') || undefined });

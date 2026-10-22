@@ -2,7 +2,8 @@
 // 保存通过但检查有提示（notices）时新建与保存都留在页面上列出提示；
 // 新建页默认是按规则生成的草稿（源没有已采集的表时是模板），也能按所选的表与实体重新生成或用模型生成（模型服务替身 app.setLlmFetch）填进编辑框（不保存），详情页能把源表新增的列一键生成为扩展字段填进编辑框（不保存）；最后保存草稿的人不能自己发布，由另一位数据工程师或管理员发布，草稿也可以丢弃；合并时落入兜底的取值显示在详情页；
 // 编辑区分表单 / YAML 标签页（没有脚本时只有 YAML 框），用表单填出的映射（含勾选源列加的扩展字段、映射与引用字段的键空间）照常保存与发布；分析师只读，查看者看不到映射，其他租户一律 404
-// 有发布权限的成员在详情页提议停用、由另一位确认，停用后可恢复，停用前列出受影响的指标与标签，列表标出待确认与已停用（ADR-0031）
+// 有发布权限的成员在详情页提议停用、由另一位确认，停用后可恢复，停用前列出受影响的指标与标签，列表标出待确认与已停用（ADR-0031）；
+// 新建页与详情页的只校验接口（intent=validate，经 .data 接口取返回值）与保存同一套检查，不保存
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseDocument } from 'yaml';
 import { eq } from 'drizzle-orm';
@@ -22,7 +23,10 @@ import { referenceTables } from '../../app/.server/mappings';
 import {
   keySpaceOf, newExtension, readExtensions, readForm, readKeySpace, unusedColumns, writeExtension, writeField, writeKeySpace, type FieldChoice,
 } from '../../app/lib/mapping-form';
-import { loginAs, resetDb, startApp, type TestApp } from './harness';
+import { UNSAFE_decodeViaTurboStream } from 'react-router';
+import { shouldRevalidate as mappingRevalidate } from '../../app/routes/mapping';
+import { shouldRevalidate as mappingsRevalidate } from '../../app/routes/mappings';
+import { type Client, loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
@@ -76,6 +80,13 @@ function modelReplies(content: unknown) {
 }
 
 const mappingIdOf = (res: Response) => res.headers.get('Location')!.match(/^\/mappings\/([0-9a-f-]{36})$/)![1];
+
+/** 单次请求的 .data 接口提交表单，解出 action 的返回值 */
+async function actionData(client: Client, path: string, form: Record<string, string>) {
+  const res = await client.post(`${path}.data`, form);
+  const { value } = await UNSAFE_decodeViaTurboStream(res.body!, globalThis);
+  return { status: res.status, value: value as Record<string, unknown> };
+}
 
 describe('标准模型', () => {
   it('任何成员都能浏览标准模型的实体与字段说明', async () => {
@@ -1225,5 +1236,90 @@ describe('表单式映射编辑器', () => {
     const rejected = await author.post(`/mappings/${mappingIdOf(created)}`, { intent: 'save', yaml: yaml.replace('  name: name\n', '  name: { expr: name, sensitive: false }\n') });
     expect(rejected.status).toBe(400);
     expect(await rejected.text()).toContain('（fields.name.sensitive）：姓名（name）是内置敏感字段，不能取消敏感标记');
+  });
+});
+
+describe('实时校验接口', () => {
+  const BAD = ORDERS.replace('amount: amount', "amount: sql('drop table x')");
+  const SQL_ISSUE = { line: 6, col: 11, path: 'fields.amount', message: expect.stringMatching(/^表达式错误：函数 sql 不在白名单内/) };
+
+  it('新建页 intent=validate：问题与新建被拒时相同（含同表同实体已有映射），合格时 ok，都不建映射；其他租户的数据源报「请选择数据源」', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+
+    const checked = await actionData(engineer, '/mappings', { intent: 'validate', sourceId, yaml: BAD });
+    expect(checked.status).toBe(200);
+    expect(checked.value.data).toMatchObject({ ok: false, error: '映射有 1 处问题，未保存', issues: [SQL_ISSUE], notices: [] });
+    const rejected = await actionData(engineer, '/mappings', { intent: 'create', sourceId, yaml: BAD });
+    expect(rejected.status).toBe(400);
+    expect(checked.value.data).toMatchObject({ error: (rejected.value.data as { error: string }).error, issues: (rejected.value.data as { issues: unknown }).issues });
+
+    expect((await actionData(engineer, '/mappings', { intent: 'validate', sourceId, yaml: ORDERS })).value.data).toMatchObject({ ok: true, error: null, issues: [], notices: [] });
+    expect(await (await engineer.get('/mappings')).text()).toContain('还没有映射');
+    // 这张表到这个实体已有映射时，与新建一样报重复
+    mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    const duplicate = (await actionData(engineer, '/mappings', { intent: 'create', sourceId, yaml: ORDERS })).value.data as { error: string };
+    expect(duplicate.error).toBe('「电商库」的 orders 已有到 订单 的映射，请在那个映射上修改');
+    expect((await actionData(engineer, '/mappings', { intent: 'validate', sourceId, yaml: ORDERS })).value.data).toMatchObject({ ok: false, error: duplicate.error, issues: [] });
+
+    const other = await tenantWithSource('globex');
+    expect((await actionData(engineer, '/mappings', { intent: 'validate', sourceId: other.sourceId, yaml: ORDERS })).value.data)
+      .toMatchObject({ ok: false, error: '请选择数据源', issues: [] });
+  });
+
+  it('详情页 intent=validate：问题与保存被拒时相同，改实体的一致性错误放在 error；合格时带 notices；不新增版本、不写审计', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const author = await loginAs(app, 'de@acme.com');
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+    const customers = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: CUSTOMERS }));
+    expect((await reviewer.post(`/mappings/${customers}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    const id = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    // 已发布后保存会新建第 2 版草稿并写审计，校验不能
+    expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
+
+    for (const yaml of [BAD, CUSTOMERS]) {
+      const checked = await actionData(author, `/mappings/${id}`, { intent: 'validate', yaml });
+      expect(checked.status).toBe(200);
+      const saved = await actionData(author, `/mappings/${id}`, { intent: 'save', yaml });
+      expect(saved.status).toBe(400);
+      const { error, issues } = saved.value.data as { error: string; issues: unknown[] };
+      expect(checked.value.data).toMatchObject({ ok: false, error, issues, notices: [] });
+    }
+    expect((await actionData(author, `/mappings/${id}`, { intent: 'validate', yaml: BAD })).value.data).toMatchObject({ issues: [SQL_ISSUE] });
+    expect((await actionData(author, `/mappings/${id}`, { intent: 'validate', yaml: CUSTOMERS })).value.data)
+      .toMatchObject({ error: '这个映射是 orders → order，不能改表、源视图或实体；请新建映射', issues: [] });
+
+    const self = ORDERS.replace('  amount: amount\n', '  customer_id: { expr: string(customer_id), customer_source: 电商库 }\n  amount: amount\n');
+    const ok = (await actionData(author, `/mappings/${id}`, { intent: 'validate', yaml: self })).value.data as { ok: boolean; issues: unknown[]; notices: { path: string; message: string }[] };
+    expect(ok).toMatchObject({ ok: true, error: null, issues: [] });
+    expect(ok.notices).toEqual([expect.objectContaining({ path: 'fields.customer_id.customer_source', message: '电商库 就是本数据源，customer_source 可以省略' })]);
+
+    expect(await (await author.get(`/mappings/${id}?tab=versions`)).text()).toContain('版本（1）');
+    await memberOf(tenantId, 'admin@acme.com', 'admin');
+    expect(await (await (await loginAs(app, 'admin@acme.com')).get('/audit')).text()).not.toContain('第 2 版草稿');
+  });
+
+  it('要 sources:write：分析师两处都 403；其他租户的映射 404', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const author = await loginAs(app, 'de@acme.com');
+    const id = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an@acme.com');
+    expect((await analyst.post('/mappings', { intent: 'validate', sourceId, yaml: ORDERS })).status).toBe(403);
+    expect((await analyst.post(`/mappings/${id}`, { intent: 'validate', yaml: ORDERS })).status).toBe(403);
+    const other = await newTenant('globex');
+    await memberOf(other, 'de@globex.com', 'data_engineer');
+    expect((await (await loginAs(app, 'de@globex.com')).post(`/mappings/${id}`, { intent: 'validate', yaml: ORDERS })).status).toBe(404);
+  });
+
+  it('两个路由的 shouldRevalidate：intent=validate 不重跑 loader，其他提交照默认', () => {
+    const form = (intent: string) => { const f = new FormData(); f.set('intent', intent); return f; };
+    for (const shouldRevalidate of [mappingRevalidate, mappingsRevalidate]) {
+      const args = (formData?: FormData) => ({ formData, defaultShouldRevalidate: true }) as Parameters<typeof shouldRevalidate>[0];
+      expect(shouldRevalidate(args(form('validate')))).toBe(false);
+      expect(shouldRevalidate(args(form('save')))).toBe(true);
+      expect(shouldRevalidate(args())).toBe(true);
+    }
   });
 });

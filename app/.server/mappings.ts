@@ -505,9 +505,8 @@ export async function createMapping(
   actor: CurrentMember, sourceId: string, yaml: string, opts?: { registrations?: Map<string, RegisteredEntity>; generationId?: string },
 ) {
   assertCan(actor, 'sources:write');
-  const source = await requireSource(actor.tenant.id, sourceId).catch(() => { throw new MappingError('请选择数据源'); });
   const registrations = opts?.registrations ?? await publishedCustomEntities(getDb(), actor.tenant.id);
-  const { plan, viewId, notices } = await checkMappingDraft(actor.tenant.id, sourceId, yaml, registrations);
+  const { source, plan, viewId, notices } = await checkNewMapping(actor.tenant.id, sourceId, yaml, registrations);
   try {
     return await getDb().transaction(async tx => {
       const [mapping] = await tx.insert(mappings).values({
@@ -526,9 +525,58 @@ export async function createMapping(
       return { ...mapping, notices };
     });
   } catch (e) {
-    if (isUniqueViolation(e)) throw new MappingError(`「${source.name}」的 ${plan.table} 已有到 ${entityLabel(plan.entity)} 的映射，请在那个映射上修改`);
+    // 检查之后、插入之前别人建了同一个映射
+    if (isUniqueViolation(e)) throw duplicateMapping(source.name, plan);
     throw e;
   }
+}
+
+/** 新建映射的文档：数据源须是本租户的，文档校验通过，且这张表到这个实体还没有映射；不通过时抛出 MappingError */
+async function checkNewMapping(tenantId: string, sourceId: string, yaml: string, registrations: Map<string, RegisteredEntity>) {
+  const source = await requireSource(tenantId, sourceId).catch(() => { throw new MappingError('请选择数据源'); });
+  const checked = await checkMappingDraft(tenantId, sourceId, yaml, registrations);
+  const [existing] = await getDb().select({ id: mappings.id }).from(mappings)
+    .where(and(eq(mappings.sourceId, sourceId), eq(mappings.tableName, checked.plan.table), eq(mappings.entity, checked.plan.entity)));
+  if (existing) throw duplicateMapping(source.name, checked.plan);
+  return { ...checked, source };
+}
+
+const duplicateMapping = (sourceName: string, plan: { table: string; entity: string }) =>
+  new MappingError(`「${sourceName}」的 ${plan.table} 已有到 ${entityLabel(plan.entity)} 的映射，请在那个映射上修改`);
+
+/** 已有映射的新文档：文档校验之外，表、源视图与实体须与映射一致，不通过时抛出 MappingError */
+async function checkMappingEdit(tenantId: string, mapping: typeof mappings.$inferSelect, yaml: string, registrations: Map<string, RegisteredEntity>) {
+  const checked = await checkMappingDraft(tenantId, mapping.sourceId, yaml, registrations);
+  if (checked.plan.table !== mapping.tableName || checked.viewId !== mapping.sourceViewId || checked.plan.entity !== mapping.entity) {
+    throw new MappingError(`这个映射是 ${mapping.sourceViewId ? '源视图 ' : ''}${mapping.tableName} → ${mapping.entity}，不能改表、源视图或实体；请新建映射`);
+  }
+  return checked;
+}
+
+/** 只校验、不保存的结果：error 与 issues 与保存被拒时相同，合格时 ok 为 true 并带 notices（不拦保存的提示） */
+export interface MappingValidation { ok: boolean; error: string | null; issues: MappingIssue[]; notices: MappingIssue[] }
+
+/** 跑一遍保存前的检查：被拒（400）转成 ok: false，其余错误（如映射不存在 404）照常抛出 */
+async function runValidation(check: () => Promise<{ notices: MappingIssue[] }>): Promise<MappingValidation> {
+  try {
+    return { ok: true, error: null, issues: [], notices: (await check()).notices };
+  } catch (e) {
+    if (e instanceof MappingError && e.status === 400) return { ok: false, error: e.message, issues: e.issues, notices: [] };
+    throw e;
+  }
+}
+
+/** 新建映射的只校验：与 createMapping 同一套检查，不保存、不写审计 */
+export async function validateNewMapping(actor: CurrentMember, sourceId: string, yaml: string) {
+  assertCan(actor, 'sources:write');
+  return runValidation(async () => checkNewMapping(actor.tenant.id, sourceId, yaml, await publishedCustomEntities(getDb(), actor.tenant.id)));
+}
+
+/** 保存草稿的只校验：与 saveMappingDraft 同一套检查，不新增版本、不写审计；映射不存在时抛出 404 */
+export async function validateMappingDraft(actor: CurrentMember, mappingId: string, yaml: string) {
+  assertCan(actor, 'sources:write');
+  const mapping = await requireMapping(actor.tenant.id, mappingId);
+  return runValidation(async () => checkMappingEdit(actor.tenant.id, mapping, yaml, await publishedCustomEntities(getDb(), actor.tenant.id)));
 }
 
 /**
@@ -546,10 +594,7 @@ export async function saveMappingDraft(
   assertCan(actor, 'sources:write');
   const mapping = await requireMapping(actor.tenant.id, mappingId);
   const registrations = await publishedCustomEntities(getDb(), actor.tenant.id);
-  const { plan, viewId, notices } = await checkMappingDraft(actor.tenant.id, mapping.sourceId, yaml, registrations);
-  if (plan.table !== mapping.tableName || viewId !== mapping.sourceViewId || plan.entity !== mapping.entity) {
-    throw new MappingError(`这个映射是 ${mapping.sourceViewId ? '源视图 ' : ''}${mapping.tableName} → ${mapping.entity}，不能改表、源视图或实体；请新建映射`);
-  }
+  const { plan, notices } = await checkMappingEdit(actor.tenant.id, mapping, yaml, registrations);
   const saved = await getDb().transaction(async tx => {
     // 锁住映射行；等锁期间映射可能因丢弃草稿被删除
     const [locked] = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');

@@ -8,14 +8,14 @@
 // 查看草稿时在编辑框上方展示它与最新已发布版本的差异（列级与去重键、取最新字段、身份打通匹配字段），供审阅者决定是否发布；
 // 有发布权限的成员可提议停用、由另一位确认停用（提议人看到等待原因），停用后可恢复，提议与确认前列出受影响的已发布指标与标签（只是提示，ADR-0031）
 import { AlertTriangle, ArrowRight, Ban, Boxes, CheckCircle2, FileDiff, FlaskConical, Lock, PencilLine, Play, RotateCcw } from 'lucide-react';
-import { data, Form, Link, redirect, useNavigation } from 'react-router';
+import { data, Form, Link, redirect, type ShouldRevalidateFunctionArgs, useNavigation } from 'react-router';
 import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import {
   confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, GenerationMismatchError, getMapping, ignoreColumn, latestIdentitySummary, MappingError, mergeMapping, modelAssertionsForMapping, modelDraftForMapping, publishMapping, referenceTables,
-  type ModelDraftResult, requestDisable, restoreMapping, saveMappingDraft, yamlWithColumns,
+  type ModelDraftResult, requestDisable, restoreMapping, saveMappingDraft, validateMappingDraft, yamlWithColumns,
 } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { HOT_VALUE_THRESHOLD } from '~/.server/pipeline/identity-engine';
@@ -142,6 +142,11 @@ const generatedDraft = (draft: ModelDraftResult) => ({
   generated: { origin: draft.origin, items: draft.items, reusedFrom: draft.reusedFrom ?? null, notice: draft.notice ?? null },
 });
 
+/** 只校验的提交不改数据，不重跑 loader */
+export function shouldRevalidate({ formData, defaultShouldRevalidate }: ShouldRevalidateFunctionArgs) {
+  return formData?.get('intent') === 'validate' ? false : defaultShouldRevalidate;
+}
+
 export async function action({ request, params }: Route.ActionArgs) {
   const form = await request.formData();
   const field = (name: string) => String(form.get(name) ?? '');
@@ -170,6 +175,9 @@ export async function action({ request, params }: Route.ActionArgs) {
         const version = Number(field('version'));
         return { error: null, issues: [], yaml: null, draftId: null, dryRun: { version, ...await dryRunMapping(await requirePermission(request, 'sources:write'), params.mappingId, version) } };
       }
+      case 'validate':
+        // 只校验、不保存：与保存同一套检查，问题列表与保存被拒时相同
+        return { ...await validateMappingDraft(await requirePermission(request, 'sources:write'), params.mappingId, field('yaml')), yaml: null, draftId: null, dryRun: null };
       case 'save': {
         // 检查有提示时不跳转，留在编辑页列出提示（草稿已保存）
         // 从生成草稿开始改的，保存时比对生成稿记下改动（ADR-0035）
