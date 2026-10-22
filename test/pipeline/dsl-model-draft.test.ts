@@ -77,6 +77,9 @@ describe('用模型生成指标定义草稿', () => {
     expect(names).toContain('city');
     for (const pii of ['name', 'phone', 'email', 'external_id']) expect(names).not.toContain(pii);
     expect(user.context.entities.find((e: { name: string }) => e.name === 'order')).toMatchObject({ base: true });
+    // 经一跳引用关联消费者的实体也能做基础实体（ADR-0038），连不到消费者的不能
+    expect(user.context.entities.find((e: { name: string }) => e.name === 'order_item')).toMatchObject({ base: true });
+    expect(user.context.entities.find((e: { name: string }) => e.name === 'product')).toMatchObject({ base: false });
     expect(user.context.relations).toContain('order.customer_id → customer.customer_id');
 
     await createDefinition(author, 'metric', 'paid_revenue_30d', yaml);

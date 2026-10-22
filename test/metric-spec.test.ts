@@ -1,5 +1,5 @@
 // test/metric-spec.test.ts —— 指标 DSL：YAML 校验与按行列报错（基础实体、字段、敏感字段、维度路径的关系 / 跳数 / 成环、维度个数、as_of），
-// filter、measure、window 的字段写维度路径（ADR-0038）的校验、依赖与 JOIN 复用；同样的定义编译出同样的 SQL，编译出的 SQL 在内存 DuckDB 里对手造的标准层得到已知答案（纯函数，不碰平台库与数据湖）
+// filter、measure、window 的字段写维度路径（ADR-0038）的校验、依赖与 JOIN 复用；基础实体经一跳引用关联消费者（consumer_via）的校验、依赖与编译；同样的定义编译出同样的 SQL，编译出的 SQL 在内存 DuckDB 里对手造的标准层得到已知答案（纯函数，不碰平台库与数据湖）
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { RegisteredEntity } from '../app/.server/custom-entities';
@@ -16,7 +16,8 @@ const rel = (from: string, to: string): EntityRelation => {
 const entity = (name: string, fields: CustomEntityField[], relations: EntityRelation[] = []): [string, RegisteredEntity] =>
   [name, { name, label: name, kind: 'dimension', fields, primaryKey: [fields[0]!.name], relations }];
 
-// 门店 → 区域 → 国家 → 大洲；门店有指向自己的上级门店；custom_visit 是带 customer_id 的事实实体，referrer_id 是另一个指向 customer 的引用
+// 门店 → 区域 → 国家 → 大洲；门店有指向自己的上级门店；custom_visit 是带 customer_id 的事实实体，referrer_id 是另一个指向 customer 的引用；
+// custom_line 没有 customer_id，order_id、visit_id 两条引用都能连到消费者（要写 consumer_via），store_id 指向的门店连不到
 const published = new Map<string, RegisteredEntity>([
   entity('custom_store', [field('store_id'), field('region_id'), field('name'), field('parent_id'), field('area', 'decimal')],
     [rel('order.store_id', 'custom_store.store_id'), rel('custom_store.region_id', 'custom_region.region_id'), rel('custom_store.parent_id', 'custom_store.store_id')]),
@@ -29,6 +30,8 @@ const published = new Map<string, RegisteredEntity>([
   // 会员档案：主键 customer_id 指向 customer，与 customer 一样只在同一数据源内唯一
   entity('custom_profile', [field('customer_id'), field('tier')],
     [rel('custom_profile.customer_id', 'customer.customer_id'), rel('order.customer_id', 'custom_profile.customer_id')]),
+  entity('custom_line', [field('line_id'), field('order_id'), field('visit_id'), field('store_id'), field('qty', 'integer')],
+    [rel('custom_line.order_id', 'order.order_id'), rel('custom_line.visit_id', 'custom_visit.visit_id'), rel('custom_line.store_id', 'custom_store.store_id')]),
 ]);
 const plan = (entity: string, columns: { name: string; type: CustomEntityField['type']; sensitive?: true }[]) =>
   ({ entity, columns: columns.map(c => ({ ...c, expr: c.name })) }) as unknown as MergeMappingParam;
@@ -67,6 +70,23 @@ measure:
     filter:
       - { field: status, op: eq, value: paid }
   denominator: { agg: count }
+`;
+// 近 365 天各品类消费金额：order_item 经 order_id 一跳关联消费者，状态与时间取自订单，品类取自商品
+const ITEM_CATEGORY = `base: order_item
+measure: { agg: sum, field: amount }
+filter:
+  - { field: order_item.order_id -> order.status, op: in, value: [paid, shipped, completed] }
+window: { field: order_item.order_id -> order.created_at, days: 365 }
+dimensions:
+  - { name: category, path: order_item.product_id -> product.category }
+`;
+// 近 365 天奶粉消费金额：按品类过滤、没有维度，标签能引用
+const MILK = `base: order_item
+measure: { agg: sum, field: amount }
+filter:
+  - { field: order_item.order_id -> order.status, op: in, value: [paid, shipped, completed] }
+  - { field: order_item.product_id -> product.category, op: eq, value: 奶粉 }
+window: { field: order_item.order_id -> order.created_at, days: 365 }
 `;
 const LATEST = 'base: order\nmeasure: { agg: latest, field: amount, by: created_at }\n';
 const DAYS_SINCE = 'base: order\nmeasure: { agg: days_since, field: created_at }\n';
@@ -184,9 +204,36 @@ describe('指标 DSL：校验', () => {
     ['分子的字段是敏感字段', 'base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: count_distinct, field: x_buyer_phone }\n  denominator: { agg: count }\n', 'measure.numerator.field', /敏感/],
     ['分子的过滤用了敏感字段', 'base: customer\nmeasure:\n  agg: ratio\n  numerator:\n    agg: count\n    filter:\n      - { field: email, op: not_null }\n  denominator: { agg: count }\n', 'measure.numerator.filter.0.field', /敏感/],
     ['分母的过滤取值不在标准枚举里', 'base: order\nmeasure:\n  agg: ratio\n  numerator: { agg: count }\n  denominator:\n    agg: count\n    filter:\n      - { field: status, op: eq, value: lost }\n', 'measure.denominator.filter.0.value', /status.*paid/],
+    ['有多条可走的一跳却没写 consumer_via', 'base: custom_line\nmeasure: { agg: count }\n', 'consumer_via', /要写 consumer_via 选一条：order_id（→ order）、visit_id（→ custom_visit）/],
+    ['基础实体自己能关联消费者却写了 consumer_via', 'base: order\nconsumer_via: store_id\nmeasure: { agg: count }\n', 'consumer_via', /order 自己就能关联消费者，不要写 consumer_via/],
+    ['consumer_via 指向的实体连不到消费者', 'base: custom_line\nconsumer_via: store_id\nmeasure: { agg: count }\n', 'consumer_via', /custom_line\.store_id 不能关联到消费者/],
+    ['consumer_via 指向的标准实体连不到消费者', 'base: order_item\nconsumer_via: product_id\nmeasure: { agg: count }\n', 'consumer_via', /order_item\.product_id 不能关联到消费者.*order_id（→ order）/],
   ])('%s', (_, yaml, path, message) => {
     const found = issues(yaml);
     expect(found.find(i => message.test(i.message)), JSON.stringify(found)).toMatchObject({ path });
+  });
+
+  it('基础实体经一跳引用关联消费者：唯一的一跳自动走，多条时按 consumer_via；consumer 维度放行；依赖计入那一跳到的实体与字段', () => {
+    const items = ok(ITEM_CATEGORY);
+    expect(items.consumer_via).toBeUndefined();
+    ok(MILK);
+    ok('base: custom_line\nconsumer_via: visit_id\nmeasure: { agg: sum, field: qty }\n');
+    ok('base: order_item\nmeasure: { agg: count_distinct, field: order_id }\ndimensions:\n  - { name: city, path: consumer.city }\n');
+    expect(DSL_KINDS.metric.dependencies(items)).toMatchObject({
+      entities: ['order', 'order_item', 'product'],
+      fields: [
+        { entity: 'order', field: 'created_at' },
+        { entity: 'order', field: 'customer_id' },
+        { entity: 'order', field: 'status' },
+        { entity: 'order_item', field: 'amount' },
+        { entity: 'order_item', field: 'order_id' },
+        { entity: 'order_item', field: 'product_id' },
+        { entity: 'product', field: 'category' },
+      ],
+    });
+    expect(DSL_KINDS.metric.entities(ok('base: order_item\nmeasure: { agg: sum, field: amount }\n'), ctx)).toEqual(['order', 'order_item']);
+    // 关系登记在自定义实体上时，带上下文的 entities 找得到那一跳
+    expect(DSL_KINDS.metric.entities(ok('base: custom_line\nconsumer_via: visit_id\nmeasure: { agg: count }\n'), ctx)).toEqual(['custom_line', 'custom_visit']);
   });
 
   it('多个问题一起报出，按位置排序', () => {
@@ -300,6 +347,24 @@ describe('指标 DSL：编译', () => {
     expect(compileMetric(ok('base: order\nmeasure: { agg: count }\nfilter:\n  - { field: order.customer_id -> customer.gender, op: eq, value: female }\n'), ctx, '2024-07-01'))
       .toContain('LEFT JOIN silver."customer" p0_1 ON p0_1."customer_id" = b."customer_id" AND p0_1._source = b."_customer_source"');
   });
+
+  it('经一跳时先 INNER JOIN 那一跳的实体 h、再按它关联 silver._identities；同一前缀的字段路径与维度共用 h，不经设备归属', () => {
+    const sql = compileMetric(ok(ITEM_CATEGORY), ctx, '2024-07-01');
+    expect(sql).toContain([
+      'FROM silver."order_item" b',
+      'INNER JOIN silver."order" h ON h."order_id" = b."order_id"',
+      'INNER JOIN silver._identities i ON i._source = h._customer_source AND i.customer_id = h.customer_id',
+      'LEFT JOIN silver."product" d0_1 ON d0_1."product_id" = b."product_id"',
+      'WHERE h."status" IN (\'paid\', \'shipped\', \'completed\')',
+    ].join('\n'));
+    expect(sql.match(/silver\."order"/g)).toHaveLength(1);
+    expect(sql).toContain('(h."created_at" AT TIME ZONE \'UTC\')::DATE > DATE \'2024-07-01\' - 365');
+    expect(sql).not.toContain('_device_owner');
+    const dim = compileMetric(ok('base: order_item\nmeasure: { agg: count }\ndimensions:\n  - { name: s, path: order_item.order_id -> order.store_id -> custom_store.name }\n  - { name: c, path: order_item.order_id -> order.channel }\n'), ctx, '2024-07-01');
+    expect(dim.match(/silver\."order"/g)).toHaveLength(1);
+    expect(dim).toContain('LEFT JOIN silver."custom_store" d0_2 ON d0_2."store_id" = h."store_id"');
+    expect(dim).toContain('CAST(h."channel" AS VARCHAR)');
+  });
 });
 
 describe('指标 DSL：编译出的 SQL 的结果', () => {
@@ -352,7 +417,14 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
       ALTER TABLE silver.event ADD COLUMN _customer_source VARCHAR;
       UPDATE silver.event SET _customer_source = _source;
       ALTER TABLE silver.custom_store ADD COLUMN area DECIMAL(18,2);
-      UPDATE silver.custom_store SET area = CASE store_id WHEN 'st1' THEN 10.5 WHEN 'st2' THEN 20 WHEN 'st3' THEN 30 END;`);
+      UPDATE silver.custom_store SET area = CASE store_id WHEN 'st1' THEN 10.5 WHEN 'st2' THEN 20 WHEN 'st3' THEN 30 END;
+      CREATE TABLE silver.product (product_id VARCHAR, category VARCHAR, _source VARCHAR);
+      INSERT INTO silver.product VALUES ('p1', '奶粉', 's1'), ('p2', '纸尿裤', 's1');
+      CREATE TABLE silver.order_item (order_item_id VARCHAR, order_id VARCHAR, product_id VARCHAR, amount DECIMAL(18,2), _source VARCHAR);
+      INSERT INTO silver.order_item VALUES
+        ('i1', 'o1', 'p1', 60, 's1'), ('i2', 'o1', 'p2', 40, 's1'), ('i3', 'o2', 'p1', 50, 's2'), ('i4', 'o4', 'p2', 70, 's1'),
+        ('i5', 'o8', 'p1', 999, 's2'), ('i6', 'gone', 'p1', 500, 's1'), ('i7', 'o10', 'p1', 2000, 's1'), ('i8', 'o9', 'p1', 1000, 's1'),
+        ('i9', 'o3', 'p9', 30, 's1');`);
   });
 
   afterAll(() => {
@@ -437,6 +509,28 @@ describe('指标 DSL：编译出的 SQL 的结果', () => {
       { consumer_id: 'c1', city: '未关联', value: 1 },
       { consumer_id: 'c2', city: '未关联', value: 3 },
     ]);
+  });
+
+  // 明细：i5 的订单 o8 打通不到消费者、i6 的订单不在订单表里，都不计入；i7 的订单已退款；i9 的商品不在商品表里，品类记「未关联」
+  it('订单明细经订单关联消费者：各品类消费金额、奶粉消费金额与手写 SQL 一致，关联不到订单或消费者的明细不计入', async () => {
+    const hand = async (select: string, where = 'TRUE') => (await con.runAndReadAll(`SELECT i.consumer_id, ${select} AS value
+      FROM silver.order_item b JOIN silver."order" o ON o.order_id = b.order_id
+      JOIN silver._identities i ON i._source = o._customer_source AND i.customer_id = o.customer_id
+      LEFT JOIN silver.product p ON p.product_id = b.product_id
+      WHERE o.status IN ('paid', 'shipped', 'completed') AND (o.created_at AT TIME ZONE 'UTC')::DATE > DATE '2024-07-01' - 365
+        AND (o.created_at AT TIME ZONE 'UTC')::DATE <= DATE '2024-07-01' AND ${where}
+      GROUP BY ALL ORDER BY ALL`)).getRowObjectsJson().map(r => ({ ...r, value: Number(r.value) }));
+
+    expect(await run(ITEM_CATEGORY)).toEqual([
+      { consumer_id: 'c1', category: '奶粉', value: 1110 },
+      { consumer_id: 'c1', category: '未关联', value: 30 },
+      { consumer_id: 'c1', category: '纸尿裤', value: 40 },
+      { consumer_id: 'c2', category: '纸尿裤', value: 70 },
+    ]);
+    expect(await run(ITEM_CATEGORY)).toEqual(await hand("COALESCE(p.category, '未关联') AS category, SUM(b.amount)"));
+
+    expect(await run(MILK)).toEqual([{ consumer_id: 'c1', value: 1110 }]);
+    expect(await run(MILK)).toEqual(await hand('SUM(b.amount)', "p.category = '奶粉'"));
   });
 
   // 门店面积 st1 10.5、st2 20、st3 30、st4 为空；o5 的门店不在表里、o6 没有门店、o7 的门店没有区域

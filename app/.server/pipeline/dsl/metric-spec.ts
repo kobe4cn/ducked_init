@@ -1,9 +1,9 @@
 // app/.server/pipeline/dsl/metric-spec.ts —— 指标定义（YAML，ADR-0025）：基础实体上的一个度量，可带过滤、时间窗口与最多 3 个维度。
 // 先按 JSON Schema（METRIC_SCHEMA）校验结构，再对照标准模型、已发布的自定义实体登记与已发布映射的扩展字段做语义校验：
-// 基础实体要能关联到消费者（customer 本身，或有指向 customer 的 customer_id），字段要存在、类型合用、不能是敏感字段；
+// 基础实体要能关联到消费者（customer 本身，或有指向 customer 的 customer_id，或经一跳引用到这样的实体，ADR-0038），字段要存在、类型合用、不能是敏感字段；
 // 度量除普通聚合外还有 ratio（分子 / 分母各带过滤）、latest / earliest（按 by 取最新 / 最早一行）与 days_since（asOf 减最近一天）；
 // 维度路径沿关系走到头：每一跳都是指向下一实体单列主键的关系，最多 3 跳，不能成环；filter、measure、window 的字段也能写维度路径（ADR-0038）。每个问题都带 YAML 里的行列位置。
-// 校验通过后编译成 SQL：基础实体经 silver._identities 关联到 consumer_id（event 的匿名事件缺省再经 silver._device_owner 按设备归属，ADR-0019），
+// 校验通过后编译成 SQL：基础实体（经一跳时是那一跳到的实体）经 silver._identities 关联到 consumer_id（event 的匿名事件缺省再经 silver._device_owner 按设备归属，ADR-0019），
 // 维度路径编译成链式 LEFT JOIN，关联不到或为空记「未关联」；字段路径复用维度连过的前缀，取终点原值（关联不到为 NULL）；consumer.<字段> 的维度取统一消费者的属性（silver._consumer，ADR-0027），一个人只有一个取值。
 // 这里也放各种定义共用的部分：租户上下文 DslContext、问题 DslIssue 与校验结果 DslCheck、YAML 与 JSON Schema 的第一步 parseDsl、说明 description 的 Schema 片段 DESCRIPTION_SCHEMA。
 // 纯函数：不碰平台库与数据湖，同样的定义与 asOf 编译出同样的 SQL
@@ -25,8 +25,10 @@ type Conditions = { field: string; op: (typeof FILTER_OPS)[number]; value?: Scal
 export interface RatioPart { agg: (typeof RATIO_AGGS)[number]; field?: string; filter?: Conditions }
 
 export interface MetricSpec {
-  /** 基础实体：customer，或有指向 customer 的 customer_id 的实体 */
+  /** 基础实体：customer，或有指向 customer 的 customer_id 的实体，或经一跳引用到这样的实体（ADR-0038） */
   base: string;
+  /** 基础实体经哪个字段一跳关联消费者：只在有多条可走的一跳时写，基础实体自己能关联消费者时不能写 */
+  consumer_via?: string;
   /**
    * agg 为 ratio 时写 numerator / denominator（不写 field）；latest / earliest 按 by（时间或日期）取最新 / 最早一行的 field（数字）；
    * days_since 是 asOf 减 field（时间或日期）最近一天的天数
@@ -94,6 +96,7 @@ export const METRIC_SCHEMA = {
   additionalProperties: false,
   properties: {
     base: { type: 'string', minLength: 1 },
+    consumer_via: nonEmpty,
     measure: {
       type: 'object',
       required: ['agg'],
@@ -170,9 +173,44 @@ export function fieldsFor(entity: string, ctx: DslContext): { name: string; type
 export const relationsOf = (ctx: DslContext) => [...BUILTIN_RELATIONS, ...[...ctx.published.values()].flatMap(e => e.relations ?? [])];
 
 /** 能做指标基础实体：customer 本身，或有指向 customer.customer_id 的 customer_id */
-export const linksToConsumer = (name: string, fields: { has: (field: string) => boolean }, ctx: DslContext) => name === 'customer'
+const linksToConsumer = (name: string, fields: { has: (field: string) => boolean }, ctx: DslContext) => name === 'customer'
   || (fields.has('customer_id')
     && relationsOf(ctx).some(r => r.from.entity === name && r.from.field === 'customer_id' && r.ref.entity === 'customer' && r.ref.field === 'customer_id'));
+
+/** 连到 entity 的主键 key 时要不要按数据源关联：customer 本身，或主键指向 customer 的实体（只在同一数据源内唯一，ADR-0024） */
+const keyedBySource = (entity: string, key: string, relations: readonly EntityRelation[]) => entity === 'customer'
+  || relations.some(r => r.from.entity === entity && r.from.field === key && r.ref.entity === 'customer');
+
+/** 基础实体经一跳关联消费者（ADR-0038）：基础实体的 field 指向 entity 的单列主键 key，entity 自己能关联消费者；bySource 同 Step.join */
+export interface ConsumerHop { field: string; entity: string; key: string; bySource: boolean }
+
+/** 基础实体能走的一跳：字段有关系指向某个实体的单列主键，那个实体自己能关联消费者（customer 本身不算） */
+function hopCandidates(base: string, ctx: DslContext): ConsumerHop[] {
+  const relations = relationsOf(ctx);
+  const found = new Map<string, ConsumerHop>();
+  for (const r of relations) {
+    if (r.from.entity !== base || r.ref.entity === 'customer' || found.has(r.from.field)) continue;
+    const target = entityIn(r.ref.entity, ctx);
+    if (typeof target === 'string' || target.key !== r.ref.field || !linksToConsumer(r.ref.entity, target.fields, ctx)) continue;
+    found.set(r.from.field, { field: r.from.field, entity: r.ref.entity, key: target.key, bySource: keyedBySource(r.ref.entity, target.key, relations) });
+  }
+  return [...found.values()];
+}
+
+/**
+ * 基础实体怎样关联消费者：自己能关联时为 null（写了 consumer_via 是问题），否则是要走的一跳（只有一条候选时自动走，多条时按 consumer_via）；
+ * 走不通时返回问题与它在 YAML 里的位置
+ */
+export function consumerHop(base: string, via: string | undefined, ctx: DslContext): ConsumerHop | null | { at: 'base' | 'consumer_via'; message: string } {
+  const e = entityIn(base, ctx);
+  if (typeof e === 'string') return { at: 'base', message: e };
+  if (linksToConsumer(base, e.fields, ctx)) return via === undefined ? null : { at: 'consumer_via', message: `${base} 自己就能关联消费者，不要写 consumer_via` };
+  const candidates = hopCandidates(base, ctx);
+  if (!candidates.length) return { at: 'base', message: `基础实体 ${base} 要有指向 customer.customer_id 的 customer_id，才能关联到消费者` };
+  const list = candidates.map(c => `${c.field}（→ ${c.entity}）`).join('、');
+  if (via === undefined) return candidates.length === 1 ? candidates[0]! : { at: 'consumer_via', message: `${base} 有多条可关联消费者的引用，要写 consumer_via 选一条：${list}` };
+  return candidates.find(c => c.field === via) ?? { at: 'consumer_via', message: `${base}.${via} 不能关联到消费者，consumer_via 只能写：${list}` };
+}
 
 /**
  * 维度路径的一段：实体.字段。不是终点时 join 是这一段怎样关联到下一实体：下一实体的单列主键，
@@ -188,7 +226,7 @@ export type PathUse = '维度' | '过滤' | '度量' | '时间窗口';
 
 /**
  * 解析并检查维度路径：从基础实体出发，每一跳是指向下一实体单列主键的关系，最多 MAX_HOPS 跳，不能成环，终点不能是敏感字段。
- * consumer.<字段> 只有一段，字段是 customer 的非敏感字段（customer_id 除外），基础实体要有 customer_id，只能用作维度。
+ * consumer.<字段> 只有一段，字段是 customer 的非敏感字段（customer_id 除外），基础实体要有 customer_id 或能经一跳关联消费者，只能用作维度。
  * 返回各段与终点字段（info 带 enum，过滤取值按它校验）
  */
 export function resolvePath(path: string, base: string, ctx: DslContext, use: PathUse = '维度'): { steps: Step[]; type: FieldType; info: FieldInfo } | string {
@@ -204,7 +242,7 @@ export function resolvePath(path: string, base: string, ctx: DslContext, use: Pa
     if (use !== '维度') return `${CONSUMER_ENTITY}.${steps[0]!.field} 只能用作维度`;
     if (steps.length > 1) return `${CONSUMER_ENTITY} 维度只能写一段 ${CONSUMER_ENTITY}.字段`;
     const baseEntity = entityIn(base, ctx);
-    if (base !== 'customer' && base !== 'event' && (typeof baseEntity === 'string' || !baseEntity.fields.has('customer_id'))) return `${base} 没有 customer_id，不能按 ${CONSUMER_ENTITY} 做维度`;
+    if (base !== 'customer' && base !== 'event' && (typeof baseEntity === 'string' || !baseEntity.fields.has('customer_id')) && !hopCandidates(base, ctx).length) return `${base} 没有 customer_id，不能按 ${CONSUMER_ENTITY} 做维度`;
     const { field } = steps[0]!;
     const customer = entityIn('customer', ctx);
     const f = field === 'customer_id' || typeof customer === 'string' ? undefined : customer.fields.get(field);
@@ -234,9 +272,7 @@ export function resolvePath(path: string, base: string, ctx: DslContext, use: Pa
     if (typeof target === 'string') return target;
     const key = target.key;
     if (!key || !relations.some(r => r.from.entity === step.entity && r.from.field === step.field && r.ref.entity === next.entity && r.ref.field === key)) return `${step.entity}.${step.field} 没有指向 ${next.entity} 主键的关系`;
-    const bySource = next.entity === 'customer'
-      || relations.some(r => r.from.entity === next.entity && r.from.field === key && r.ref.entity === 'customer');
-    step.join = { key, bySource };
+    step.join = { key, bySource: keyedBySource(next.entity, key, relations) };
   }
   return { steps, type: info!.type, info: info! };
 }
@@ -304,9 +340,8 @@ export function checkMetric(text: string, ctx: DslContext): DslCheck<MetricSpec>
     issue(['base'], base);
     return done(spec);
   }
-  if (!linksToConsumer(spec.base, base.fields, ctx)) {
-    issue(['base'], `基础实体 ${spec.base} 要有指向 customer.customer_id 的 customer_id，才能关联到消费者`);
-  }
+  const hop = consumerHop(spec.base, spec.consumer_via, ctx);
+  if (hop && 'at' in hop) issue([hop.at], hop.message);
   if (spec.device_attribution !== undefined && spec.base !== 'event') issue(['device_attribution'], '只有基础实体为 event 时才能写 device_attribution');
 
   /** 基础实体上的字段，或从基础实体出发的路径（含 . 时，ADR-0038）的终点字段：不存在、敏感或路径不合规时报问题并返回 undefined */
@@ -427,14 +462,32 @@ export function isNumericMetric(spec: MetricSpec, ctx: DslContext): boolean {
 /** 定义的依赖（ADR-0025「依赖按需计算」）：引用的指标键、用到的实体与字段，各自去重排序 */
 export interface Dependencies {
   metrics: string[];
-  /** 基础实体与维度路径、字段路径经过的每个实体（consumer 维度记作 customer：它的属性来自 silver.customer） */
+  /** 基础实体、一跳关联消费者到的实体与维度路径、字段路径经过的每个实体（consumer 维度记作 customer：它的属性来自 silver.customer） */
   entities: string[];
-  /** 度量（含 by、ratio 分子分母的字段与过滤）、过滤、窗口的字段（裸字段在基础实体上），与维度路径、字段路径的各段 */
+  /** 度量（含 by、ratio 分子分母的字段与过滤）、过滤、窗口的字段（裸字段在基础实体上），维度路径、字段路径的各段，与一跳的引用字段和那边的 customer_id */
   fields: { entity: string; field: string }[];
 }
 
-/** 指标的依赖：只看结构（通过 JSON Schema 即可），不对照登记与映射 */
-export function metricDependencies(spec: MetricSpec): Dependencies {
+/**
+ * 只按标准模型的关系找的一跳（依赖不带租户上下文）：基础实体自己能关联消费者时没有；写了 consumer_via 取它，没写取唯一候选。
+ * 关系只登记在自定义实体上时找不到
+ */
+function builtinHop(spec: MetricSpec): { field: string; entity: string } | undefined {
+  const links = (name: string) => name === 'customer'
+    || BUILTIN_RELATIONS.some(r => r.from.entity === name && r.from.field === 'customer_id' && r.ref.entity === 'customer' && r.ref.field === 'customer_id');
+  if (links(spec.base)) return undefined;
+  const candidates = BUILTIN_RELATIONS.filter(r => {
+    const key = entityOf(r.ref.entity)?.key;
+    return r.from.entity === spec.base && r.ref.entity !== 'customer' && key?.length === 1 && key[0] === r.ref.field && links(r.ref.entity);
+  });
+  const r = spec.consumer_via !== undefined ? candidates.find(c => c.from.field === spec.consumer_via) : candidates.length === 1 ? candidates[0] : undefined;
+  return r && { field: r.from.field, entity: r.ref.entity };
+}
+
+/** 指标的依赖：只看结构（通过 JSON Schema 即可），不对照登记与映射；一跳只按标准模型的关系找（builtinHop） */
+export const metricDependencies = (spec: MetricSpec): Dependencies => dependenciesWith(spec, builtinHop(spec));
+
+function dependenciesWith(spec: MetricSpec, hop: { field: string; entity: string } | undefined): Dependencies {
   const fields = new Map<string, { entity: string; field: string }>();
   const add = (entity: string, field: string | undefined) => {
     if (field !== undefined) fields.set(`${entity}.${field}`, { entity, field });
@@ -461,6 +514,10 @@ export function metricDependencies(spec: MetricSpec): Dependencies {
   for (const f of spec.filter ?? []) addPath(f?.field);
   addPath(spec.window?.field);
   for (const d of spec.dimensions ?? []) addSteps(d.path);
+  if (hop) {
+    add(spec.base, hop.field);
+    add(hop.entity, 'customer_id');
+  }
   return {
     metrics: [],
     entities: [...new Set([spec.base, ...[...fields.values()].map(f => f.entity)])].sort(),
@@ -468,8 +525,11 @@ export function metricDependencies(spec: MetricSpec): Dependencies {
   };
 }
 
-/** 定义用到的实体（基础实体与维度路径经过的实体），排好序 */
-export const metricEntities = (spec: MetricSpec): string[] => metricDependencies(spec).entities;
+/** 定义用到的实体（基础实体、一跳到的实体与路径经过的实体），排好序；一跳按租户上下文找（含自定义实体上登记的关系） */
+export function metricEntities(spec: MetricSpec, ctx: DslContext): string[] {
+  const hop = consumerHop(spec.base, spec.consumer_via, ctx);
+  return dependenciesWith(spec, hop && !('at' in hop) ? hop : undefined).entities;
+}
 
 /** 过滤取值写成 SQL 字面量 */
 function sqlValue(f: FieldInfo, v: Scalar) {
@@ -482,6 +542,9 @@ function sqlValue(f: FieldInfo, v: Scalar) {
   }
 }
 
+/** 一跳到的实体在 SQL 里的别名 */
+const HOP = 'h';
+
 const COMPARE = { eq: '=', ne: '<>', gt: '>', gte: '>=', lt: '<', lte: '<=' } as const;
 
 /**
@@ -492,6 +555,8 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
   const base = entityIn(spec.base, ctx);
   if (typeof base === 'string') throw new Error(base);
   const col = (name: string) => `b.${ident(name)}`;
+  const hop = consumerHop(spec.base, spec.consumer_via, ctx);
+  if (hop && 'at' in hop) throw new Error(hop.message);
 
   // 设备归属（ADR-0019）：customer_id 有值只经 _identities 解析，为空才经 device_id 查 _device_owner，两边都查不到的不计入
   const byDevice = spec.base === 'event' && spec.device_attribution !== false;
@@ -501,6 +566,8 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
   /** 连上路径前缀（前 n 段 实体.字段 用 -> 连起来）的别名：维度各连一串，字段路径复用序号最小的维度的前缀（ADR-0038） */
   const prefixes = new Map<string, string>();
   const prefixKey = (steps: Step[], n: number) => steps.slice(0, n).map(s => `${s.entity}.${s.field}`).join(' -> ');
+  // 一跳到的实体别名 h，同一前缀的维度与字段路径共用它
+  if (hop) prefixes.set(`${spec.base}.${hop.field}`, HOP);
   /** 一段路径 step 从 prev 连到下一实体 next，别名 alias */
   const joinStep = (step: Step, next: Step, prev: string, alias: string) => {
     const { key, bySource } = step.join!;
@@ -521,9 +588,14 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
     }
     let prev = 'b';
     for (const [j, step] of resolved.steps.slice(0, -1).entries()) {
+      const key = prefixKey(resolved.steps, j + 1);
+      // 第一段就是那一跳时复用 h；其余仍各连一串（已发布定义的 SQL 逐字节不变）
+      if (prefixes.get(key) === HOP) {
+        prev = HOP;
+        continue;
+      }
       const alias = `d${i}_${j + 1}`;
       joins.push(joinStep(step, resolved.steps[j + 1]!, prev, alias));
-      const key = prefixKey(resolved.steps, j + 1);
       if (!prefixes.has(key)) prefixes.set(key, alias);
       prev = alias;
     }
@@ -610,11 +682,14 @@ export function compileMetric(spec: MetricSpec, ctx: DslContext, asOf: string): 
   }
 
   if (byDevice) where.unshift(`${consumer} IS NOT NULL`);
-  // customer 记录就在行自己的数据源里；其他实体按 customer_id 的数据源列找消费者记录（跨源引用，ADR-0030）
-  const identityOn = `i._source = b.${spec.base === 'customer' ? '_source' : customerSourceColumn('customer_id')} AND i.customer_id = b.customer_id`;
+  // customer 记录就在行自己的数据源里；其他实体按 customer_id 的数据源列找消费者记录（跨源引用，ADR-0030）。
+  // 经一跳时按那一跳的实体关联，关联不到它或它关联不到消费者的行都不计入（ADR-0038）
+  const owner = hop ? HOP : 'b';
+  const identityOn = `i._source = ${owner}.${spec.base === 'customer' ? '_source' : customerSourceColumn('customer_id')} AND i.customer_id = ${owner}.customer_id`;
   return [
     `SELECT ${byDevice ? `${consumer} AS consumer_id` : consumer}, ${[...dims, `${measure} AS value`].join(', ')}`,
     `FROM ${silverTable(spec.base)} b`,
+    ...(hop ? [`INNER JOIN ${silverTable(hop.entity)} ${HOP} ON ${HOP}.${ident(hop.key)} = b.${ident(hop.field)}${hop.bySource ? ` AND ${HOP}._source = b._source` : ''}`] : []),
     ...(byDevice
       ? [`LEFT JOIN ${IDENTITIES} i ON ${identityOn}`,
         `LEFT JOIN ${DEVICE_OWNER} o ON b.customer_id IS NULL AND o.device_id = b.device_id`]

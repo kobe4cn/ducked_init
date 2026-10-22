@@ -17,6 +17,14 @@ const ctx: DslContext = {
     ['top_amount', checkMetric('base: order\nmeasure: { agg: max, field: amount }\n', base)],
     ['orders', checkMetric('base: order\nmeasure: { agg: count }\n', base)],
     ['views', checkMetric('base: event\nmeasure: { agg: count }\nfilter:\n  - { field: event_type, op: eq, value: view }\ndevice_attribution: false\n', base)],
+    // 近 365 天奶粉消费金额：订单明细经订单一跳关联消费者（ADR-0038）
+    ['milk_365d', checkMetric(`base: order_item
+measure: { agg: sum, field: amount }
+filter:
+  - { field: order_item.order_id -> order.status, op: in, value: [paid, shipped, completed] }
+  - { field: order_item.product_id -> product.category, op: eq, value: 奶粉 }
+window: { field: order_item.order_id -> order.created_at, days: 365 }
+`, base)],
     ['stale', { ok: false, issues: [] }],
   ]),
 };
@@ -164,6 +172,13 @@ describe('标签 DSL：编译出的 SQL 的结果', () => {
         ('o1', '1', 100, 's1'), ('o2', '10', 900, 's2'), ('o3', '2', 150, 's1'), ('o4', '3', 20, 's1'), ('o5', '4', NULL, 's1'), ('o6', 'x', 5000, 's2');
       ALTER TABLE silver."order" ADD COLUMN _customer_source VARCHAR;
       UPDATE silver."order" SET _customer_source = _source;
+      ALTER TABLE silver."order" ADD COLUMN status VARCHAR;
+      ALTER TABLE silver."order" ADD COLUMN created_at TIMESTAMPTZ;
+      UPDATE silver."order" SET status = CASE order_id WHEN 'o4' THEN 'refunded' ELSE 'paid' END, created_at = '2024-06-01 10:00:00+00';
+      CREATE TABLE silver.product (product_id VARCHAR, category VARCHAR, _source VARCHAR);
+      INSERT INTO silver.product VALUES ('p1', '奶粉', 's1'), ('p2', '纸尿裤', 's1');
+      CREATE TABLE silver.order_item (order_item_id VARCHAR, order_id VARCHAR, product_id VARCHAR, amount DECIMAL(18,2), _source VARCHAR);
+      INSERT INTO silver.order_item VALUES ('i1', 'o1', 'p1', 80, 's1'), ('i2', 'o2', 'p1', 200, 's2'), ('i3', 'o3', 'p2', 150, 's1'), ('i4', 'o4', 'p1', 20, 's1'), ('i5', 'o6', 'p1', 5000, 's2');
       CREATE TABLE silver.event (event_id VARCHAR, customer_id VARCHAR, _customer_source VARCHAR, device_id VARCHAR, event_type VARCHAR, _source VARCHAR);
       INSERT INTO silver.event VALUES
         ('e1','5','s1',NULL,'view','s1'), ('e2','5','s1',NULL,'view','s1'), ('e3','5','s1',NULL,'view','s1'), ('e4','5','s1',NULL,'view','s1'), ('e5','5','s1',NULL,'view','s1'),
@@ -186,6 +201,19 @@ describe('标签 DSL：编译出的 SQL 的结果', () => {
       { consumer_id: 'c4', tag_key: 'value_tier', tag_value: 'low' },
       { consumer_id: 'c5', tag_key: 'value_tier', tag_value: 'low' },
       { consumer_id: 'c6', tag_key: 'value_tier', tag_value: 'low' },
+    ]);
+  });
+
+  // 奶粉明细：c1 两个源的订单各一条，c2 只买纸尿裤，c3 的订单已退款，订单 o6 打通不到消费者
+  it('奶粉人群：引用经订单明细算出的奶粉消费金额，买过奶粉的命中，只买别的品类、已退款与打通不到的不命中', async () => {
+    const MILK_FANS = 'metric: milk_365d\nrules:\n  - value: 奶粉人群\n    when: { gt: 0 }\ndefault: 其他\n';
+    expect(DSL_KINDS.tag.entities(ok(MILK_FANS), ctx)).toEqual(['order', 'order_item', 'product']);
+    const milk = ctx.metrics.get('milk_365d')!;
+    if (!milk.ok) throw new Error(JSON.stringify(milk.issues));
+    expect((await con.runAndReadAll(compileMetric(milk.spec, ctx, '2024-07-01'))).getRowObjectsJson().map(r => ({ ...r, value: Number(r.value) })))
+      .toEqual([{ consumer_id: 'c1', value: 280 }]);
+    expect((await run(MILK_FANS)).map(r => [r.consumer_id, r.tag_value])).toEqual([
+      ['c1', '奶粉人群'], ['c2', '其他'], ['c3', '其他'], ['c4', '其他'], ['c5', '其他'], ['c6', '其他'],
     ]);
   });
 

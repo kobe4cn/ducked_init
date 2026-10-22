@@ -6,7 +6,7 @@
 import { Document } from 'yaml';
 import { CANONICAL_ENTITIES, relationText } from '../../../lib/canonical-model';
 import type { LlmMessage, LlmPurpose } from '../../llm';
-import { AGGS, CONSUMER_ENTITY, FILTER_OPS, fieldsFor, linksToConsumer, MAX_DIMENSIONS, MAX_HOPS, METRIC_SCHEMA, RATIO_AGGS, relationsOf, type DslContext, type MetricSpec } from './metric-spec';
+import { AGGS, CONSUMER_ENTITY, consumerHop, FILTER_OPS, fieldsFor, MAX_DIMENSIONS, MAX_HOPS, METRIC_SCHEMA, RATIO_AGGS, relationsOf, type DslContext, type MetricSpec } from './metric-spec';
 import type { DslKind } from './index';
 import { metricOf, SINGLE_TAG_SCHEMA, TAG_CONDITIONS } from './tag-spec';
 
@@ -16,13 +16,17 @@ export interface MetricDraftContext {
   relations: string[];
 }
 
-/** 指标上下文：标准实体与已发布的自定义实体；能做基础实体的是 customer 与有指向 customer.customer_id 的 customer_id 的实体（与校验同一规则） */
+/**
+ * 指标上下文：标准实体与已发布的自定义实体；能做基础实体的是 customer、有指向 customer.customer_id 的 customer_id 的实体，
+ * 与能经一跳引用到这样的实体的实体（有多条可走时也算，要写 consumer_via；与校验同一规则，ADR-0038）
+ */
 function metricContext(ctx: DslContext): MetricDraftContext {
   const names = [...CANONICAL_ENTITIES.map(e => e.name), ...ctx.published.keys()];
   const entities = names.flatMap(name => {
     const fields = fieldsFor(name, ctx);
     if (!fields) return [];
-    return [{ name, base: linksToConsumer(name, new Set(fields.map(f => f.name)), ctx), fields }];
+    const hop = consumerHop(name, undefined, ctx);
+    return [{ name, base: !(hop && 'at' in hop && hop.at === 'base'), fields }];
   });
   return { entities, relations: relationsOf(ctx).map(relationText) };
 }
@@ -31,7 +35,7 @@ const METRIC_SYSTEM = [
   '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
   '输入：request 是成员用自然语言写的需求；context.entities 是能用的实体与字段（base 为 true 的才能做基础实体），context.relations 是实体间的关系（实体.字段 → 实体.主键）。',
   '输出格式：',
-  `{ "base": 基础实体, "measure": { "agg": ${AGGS.join(' | ')}, "field"?: 基础实体的字段，或从基础实体出发的维度路径（取原值，关联不上为 NULL）（count 可不写）, "by"?: 时间或日期字段，写法同 field（只用于 latest / earliest）,`,
+  `{ "base": 基础实体, "consumer_via"?: 基础实体经哪个字段关联消费者（只在下面说的有多条可走时写）, "measure": { "agg": ${AGGS.join(' | ')}, "field"?: 基础实体的字段，或从基础实体出发的维度路径（取原值，关联不上为 NULL）（count 可不写）, "by"?: 时间或日期字段，写法同 field（只用于 latest / earliest）,`,
   `    "numerator"?: 分子, "denominator"?: 分母（只用于 ratio，各为 { "agg": ${RATIO_AGGS.join(' | ')}, "field"?: 写法同 measure 的 field, "filter"?: 写法同下面的 filter }） },`,
   `  "filter"?: [{ "field": 基础实体的字段，或从基础实体出发的维度路径（取原值，关联不上为 NULL）, "op": ${FILTER_OPS.join(' | ')}, "value"?: 取值或取值列表（in / not_in 写列表，is_null / not_null 不写） }],`,
   '  "window"?: { "field": 时间或日期字段，基础实体的字段，或从基础实体出发的维度路径（取原值，关联不上为 NULL）, "days": 正整数 },',
@@ -43,8 +47,11 @@ const METRIC_SYSTEM = [
   `- 比率（如核销率、客单价）用 ratio：写 numerator 与 denominator，不写 field；分子、分母的 agg 只能是 ${RATIO_AGGS.join(' / ')}，各自的 filter 与顶层 filter、window 同时生效。`,
   '- latest / earliest 按 by 取最新 / 最早一行的 field，field 只能是整数或小数字段；距今天数（如最近一次购买距今几天）用 days_since，field 是时间或日期字段。',
   `- 维度路径从基础实体出发，写成 实体.字段 -> 实体.字段，每一跳要沿 context.relations 里的一条关系走到下一实体的主键，最多 ${MAX_HOPS} 跳；`,
-  `  或者写一段 ${CONSUMER_ENTITY}.字段，取统一消费者的属性（字段是 customer 的字段，基础实体要有 customer_id）。`,
+  `  或者写一段 ${CONSUMER_ENTITY}.字段，取统一消费者的属性（字段是 customer 的字段）。`,
   `- filter、measure、window 的字段也能写同样的维度路径（如按门店的区域过滤、按商品的品类过滤），但不能写 ${CONSUMER_ENTITY}.字段。`,
+  '- 基础实体自己没有 customer_id 时（如 order_item），经它指向某个有 customer_id 的实体（如 order）的那个字段关联消费者，只有一条时自动走、不写 consumer_via；',
+  '  有多条时写 consumer_via 选一条（写基础实体的字段名）。基础实体自己有 customer_id 时不要写 consumer_via。',
+  '- count 数的是基础实体的行数：base 为 order_item 时数的是明细行，要数订单写 { "agg": "count_distinct", "field": "order_id" }。',
   '- 需求没提到的部分不要加；不要输出 device_attribution。',
 ].join('\n');
 

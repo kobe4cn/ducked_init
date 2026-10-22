@@ -4,7 +4,8 @@
 // 双人发布（publishDefinition）以当天入队 gold.dsl，调度器成功后登记快照；丢弃草稿（discardDslDraft）回到已发布版本或删除定义
 // 标签只引用指标最新的已发布版本，快照每行带不变的 tag_key。删除定义（deleteDefinition）：被已发布标签引用的指标不能删。
 // 发布前的影响预览（impactOf）在只读挂载上对比已发布版本与草稿，只给计数，湖与任务队列不变。
-// filter 写字段路径（ADR-0038）的指标能发布，路径经过的实体进依赖：定时刷新与停用映射的影响都跟着变
+// filter 写字段路径（ADR-0038）的指标能发布，路径经过的实体进依赖：定时刷新与停用映射的影响都跟着变；
+// 订单明细经订单一跳关联消费者的奶粉消费金额与引用它的奶粉人群标签能发布并算出
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
@@ -232,6 +233,57 @@ describe('字段路径（ADR-0038）', () => {
 
     const [stores] = await getDb().select({ id: mappings.id }).from(mappings).where(and(eq(mappings.sourceId, crm), eq(mappings.tableName, 'stores')));
     expect(await disableImpact(getDb(), acme, stores!.id)).toEqual({ metrics: [{ key: 'store_one' }], tags: [] });
+  });
+});
+
+/** CRM 源另加商品表 products 与明细表 order_items 并发布到 product、order_item：A1 买奶粉 60 与纸尿裤 40，A3 奶粉 200，A4（已退款）、A5（下单人打通不到）、ZZ（订单不存在）各一行奶粉 */
+async function ordersWithItems() {
+  const people = await publishedIdentitySources({ orders: true });
+  const { author, reviewer, sources: { crm } } = people;
+  await grantOnSource(`
+    CREATE TABLE crm.products (sku text PRIMARY KEY, category text, updated_at timestamp NOT NULL);
+    INSERT INTO crm.products VALUES ('P1', '奶粉', '2024-06-01'), ('P2', '纸尿裤', '2024-06-01');
+    CREATE TABLE crm.order_items (item_no text PRIMARY KEY, order_no text, sku text, amount numeric(18,2), updated_at timestamp NOT NULL);
+    INSERT INTO crm.order_items VALUES ('I1', 'A1', 'P1', 60, '2024-06-30'), ('I2', 'A1', 'P2', 40, '2024-06-30'), ('I3', 'A3', 'P1', 200, '2024-06-30'),
+      ('I4', 'A4', 'P1', 999, '2024-06-30'), ('I5', 'A5', 'P1', 50, '2024-06-30'), ('I6', 'ZZ', 'P1', 10, '2024-06-30');
+    GRANT SELECT ON crm.products, crm.order_items TO ${READER.user};`);
+  await relistSource(author, crm);
+  await drain();
+  await setSyncScope(author, crm, { add: ['products', 'order_items'] });
+  await drain();
+  for (const table of ['products', 'order_items']) await confirmWatermark(author, crm, table, 'updated_at');
+  await syncSource(author, crm);
+  await drain();
+  await publish(author, reviewer, crm, 'model: 1\nentity: product\ntable: products\nfields:\n  product_id: sku\n  category: category\n');
+  await publish(author, reviewer, crm, 'model: 1\nentity: order_item\ntable: order_items\nfields:\n  order_item_id: item_no\n  order_id: order_no\n  product_id: sku\n  amount: amount\n');
+  await drain();
+  return people;
+}
+
+describe('基础实体经一跳关联消费者（ADR-0038）', () => {
+  it('订单明细的奶粉消费金额能发布，结果与手写 SQL 一致（已退款、打通不到、订单不存在的明细不计入）；引用它的奶粉人群标签能发布并算出', async () => {
+    const { acme, author, reviewer } = await ordersWithItems();
+    await createDefinition(author, 'metric', 'milk_revenue', 'base: order_item\nmeasure: { agg: sum, field: amount }\nfilter:\n'
+      + '  - { field: order_item.order_id -> order.status, op: in, value: [paid, shipped, completed] }\n'
+      + '  - { field: order_item.product_id -> product.category, op: eq, value: 奶粉 }\n'
+      + 'window: { field: order_item.order_id -> order.created_at, days: 3650 }\n');
+    const task = await publishDefinition(reviewer, 'metric', 'milk_revenue', 1);
+    expect(task.params).toMatchObject({ entities: ['order', 'order_item', 'product'] });
+    await drain();
+    expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
+    const rows = await onLake(acme, `SELECT consumer_id, value::VARCHAR AS value FROM gold."metric__${task.id}" ORDER BY ALL`);
+    expect(rows.map(r => Number(r.value)).sort((a, b) => a - b)).toEqual([60, 200]);
+    expect(rows).toEqual(await onLake(acme, `SELECT i.consumer_id, sum(b.amount)::VARCHAR AS value FROM silver.order_item b
+      JOIN silver."order" o ON o.order_id = b.order_id
+      JOIN silver._identities i ON i._source = o._customer_source AND i.customer_id = o.customer_id
+      JOIN silver.product p ON p.product_id = b.product_id WHERE o.status = 'paid' AND p.category = '奶粉' GROUP BY ALL ORDER BY ALL`));
+
+    await createDefinition(author, 'tag', 'milk_fans', 'metric: milk_revenue\nrules:\n  - value: 奶粉人群\n    when: { gt: 0 }\ndefault: 其他\n');
+    const tag = await publishDefinition(reviewer, 'tag', 'milk_fans', 1);
+    await drain();
+    expect(await getTask(tag.id)).toMatchObject({ status: 'succeeded' });
+    const fans = await onLake(acme, `SELECT consumer_id FROM gold."tag__${tag.id}" WHERE tag_value = '奶粉人群' ORDER BY ALL`);
+    expect(fans).toEqual(rows.map(r => ({ consumer_id: r.consumer_id })));
   });
 });
 

@@ -167,7 +167,7 @@ export function checkTag(text: string, ctx: DslContext): DslCheck<TagSpec> {
 
 /** 标签用到的实体：各引用指标用到的实体的并集，排好序 */
 export function tagEntities(spec: TagSpec, ctx: DslContext): string[] {
-  return [...new Set(tagMetrics(spec).flatMap(key => metricEntities(requireMetric(key, ctx))))].sort();
+  return [...new Set(tagMetrics(spec).flatMap(key => metricEntities(requireMetric(key, ctx), ctx)))].sort();
 }
 
 /** 标签的依赖：引用的全部指标键（实体与字段经由指标，指标在就删不掉） */
