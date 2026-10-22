@@ -228,7 +228,10 @@ describe('编写与发布映射', () => {
     const merges = await (await author.get(`/mappings/${clash}?tab=merges`)).text();
     expect(merges).toContain('data-merge-error');
     expect(merges).toContain(`失败：${conflict}`);
-    expect(merges).toContain('等，共 40 个，请在映射里用字段表达式对齐（如加前缀）或去掉一边的映射');
+    expect(merges).toContain('等，共 40 个。如果两边的编号各自独立（同一个号指的是不同对象），在映射里声明「键空间」（key_space）；'
+      + '如果是同一批对象从两路接入，到映射页的「合并组」（/merge-groups?entity=order）把这些映射建成一组。拿不准的话，可以先在映射页运行「主键冲突体检」看建议');
+    for (const hint of ['键空间', '/merge-groups?entity=order', '主键冲突体检']) expect(merges).toContain(hint);
+    for (const stale of ['去掉一边的映射', '加前缀']) expect(merges).not.toContain(stale);
     expect(await (await author.get(`/mappings/${orders}?tab=merges`)).text()).not.toContain('data-merge-error');
     expect(await (await author.get('/tasks')).text()).toContain(conflict);
   });

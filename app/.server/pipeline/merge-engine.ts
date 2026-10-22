@@ -578,7 +578,7 @@ async function mergeMapping(con: DuckDBConnection, plan: MergeMappingParam, salt
     const unique = plan.uniqueKey?.every(k => plan.columns.some(c => c.name === k)) && plan.uniqueKey;
     // 同组的映射不查：它们的同一主键要并成一行
     if (unique) {
-      await assertUniqueAcrossMappings(con, silver, plan.mapping, unique, stage.winners, {
+      await assertUniqueAcrossMappings(con, silver, plan.mapping, plan.entity, unique, stage.winners, {
         source: plan.uniqueBySource ? plan.sourceId : undefined, grouped: plan.group?.members.map(m => m.mapping),
       });
     }
@@ -758,10 +758,10 @@ async function filterLive(con: DuckDBConnection, plan: MergeMappingParam, live: 
  * source 给出时只和同一个数据源的映射比较。主键为空的行不算重复。
  * 只拿本次写入的键去连接其他映射的行，不对整个实体表分组，耗时随本映射的行数增长；增量时后写进来的冲突键在别的映射合并时已经查过。
  * 要在本事务改 silver 之前调用：改过之后 DuckLake 的基数估计不准，哈希表会建在 silver 一侧，小映射要全表扫大共享表（见 crmlab-10m-baseline.md #164）。
- * 先到先得，重复时报错让本映射的事务回滚；报错列出最多 5 个冲突的键与所在的映射
+ * 先到先得，重复时报错让本映射的事务回滚；报错列出最多 5 个冲突的键与所在的映射，并指向键空间、合并组（source 给出时没有）与主键冲突体检
  */
 async function assertUniqueAcrossMappings(
-  con: DuckDBConnection, silver: string, mapping: string, key: string[], winners: string, { source, grouped = [] }: { source?: string; grouped?: string[] },
+  con: DuckDBConnection, silver: string, mapping: string, entity: string, key: string[], winners: string, { source, grouped = [] }: { source?: string; grouped?: string[] },
 ) {
   const conflicts = await rows<{ k: string; mappings: string[]; total: string }>(con, `
     SELECT concat_ws(', ', ${key.map(k => `w.${ident(k)}::VARCHAR`).join(', ')}) AS k,
@@ -771,8 +771,11 @@ async function assertUniqueAcrossMappings(
     GROUP BY ${keyList(key, 'w')} ORDER BY k LIMIT 5`);
   if (!conflicts.length) return;
   const total = Number(conflicts[0].total);
-  throw new Error(`主键 ${key.join('、')} 跨映射重复：${conflicts.map(c => `${c.k}（映射 ${c.mappings.join('、')}）`).join('；')}${total > conflicts.length ? `等，共 ${total} 个` : ''}，`
-    + '请在映射里用字段表达式对齐（如加前缀）或去掉一边的映射');
+  throw new Error(`主键 ${key.join('、')} 跨映射重复：${conflicts.map(c => `${c.k}（映射 ${c.mappings.join('、')}）`).join('；')}${total > conflicts.length ? `等，共 ${total} 个` : ''}。`
+    + '如果两边的编号各自独立（同一个号指的是不同对象），在映射里声明「键空间」（key_space）；'
+    // 主键按数据源比较的实体建不了合并组
+    + (source ? '' : `如果是同一批对象从两路接入，到映射页的「合并组」（/merge-groups?entity=${encodeURIComponent(entity)}）把这些映射建成一组。`)
+    + '拿不准的话，可以先在映射页运行「主键冲突体检」看建议');
 }
 
 /**

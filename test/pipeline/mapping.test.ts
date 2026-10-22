@@ -565,7 +565,7 @@ describe('发布映射并合并到标准层', () => {
     await drain();
     const mappings = [fromOrders, fromLog].sort().join('、');
     expect((await getMapping(author, fromLog)).merge.history[0]).toMatchObject({
-      error: expect.stringContaining(`主键 event_id 跨映射重复：7（映射 ${mappings}）；8（映射 ${mappings}），请在映射里`),
+      error: expect.stringContaining(`主键 event_id 跨映射重复：7（映射 ${mappings}）；8（映射 ${mappings}）。如果两边的编号各自独立`),
     });
     expect(await silver(acme, 'event', 'event_id')).toEqual(before);
   });
@@ -607,6 +607,11 @@ describe('发布映射并合并到标准层', () => {
     expect((await getMapping(author, clash)).merge.history[0]).toMatchObject({
       error: expect.stringContaining(`主键 customer_id、channel 跨映射重复：1, email（映射 ${[first, clash].sort().join('、')}）`),
     });
+    // 主键按数据源比较的实体建不了合并组，只提键空间与体检
+    const { error } = (await getMapping(author, clash)).merge.history[0] as { error: string };
+    expect(error).toContain('键空间');
+    expect(error).toContain('主键冲突体检');
+    expect(error).not.toContain('合并组');
     expect(await silver(acme, 'consent', 'customer_id, channel, _source')).toEqual(before);
   });
 
