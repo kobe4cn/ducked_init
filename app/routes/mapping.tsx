@@ -686,7 +686,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
               <Form method="post" className="space-y-3" key={`${selected.version}-${actionData?.draftId ?? ''}`}>
                 {generationId && <input type="hidden" name="generationId" value={generationId} />}
                 {generated && <DraftConfidence {...generated} />}
-                <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} registered={mapping.registered} functions={functions} focus={focus} />
+                <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} registered={mapping.registered} functions={functions} focus={focus} validateAction={base} />
                 <div className="flex gap-2">
                   <Button type="submit" name="intent" value="save" disabled={submitting}>
                     {submitting ? '正在处理…' : selected.status === 'draft' ? '校验并保存草稿' : '校验并保存为新草稿'}

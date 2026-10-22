@@ -431,7 +431,9 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
         <Field>
           <FieldLabel>映射</FieldLabel>
           {generated && <DraftConfidence {...generated} />}
-          <MappingEditorWithReference defaultValue={values.yaml} value={yaml} onValueChange={setYaml} table={table} entity={entity} registered={registered} functions={functions} />
+          <MappingEditorWithReference defaultValue={values.yaml} value={yaml} onValueChange={setYaml} table={table} entity={entity} registered={registered} functions={functions}
+            validateAction={sources.length ? '/mappings' : undefined} validateExtra={{ sourceId }}
+          />
         </Field>
         <div className="flex gap-2">
           <Button type="submit" name="intent" value="create" disabled={submitting || !sources.length}>{submitting ? '正在处理…' : '校验并保存草稿'}</Button>

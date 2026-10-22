@@ -1,14 +1,16 @@
 // app/components/mapping-reference.tsx —— 编写映射时放在编辑框旁的对照面板：源表各列的统计（类型、空值率、不同取值数、主键、水位线、常见取值），
 // 目标实体的标准字段（类型、是否必填、标准枚举）或自定义实体已发布登记的字段（类型、是否敏感、说明、主键）、写法速查与白名单函数。按编辑框里的 YAML 标出已对应的字段与还没对应的必填字段；
-// 点击列名、字段名、写法或函数插入到编辑框光标处。编辑区分「表单 / YAML」两个标签页，两边是同一份 YAML，始终由 YAML 框提交（ADR-0017）
+// 点击列名、字段名、写法或函数插入到编辑框光标处。编辑区分「表单 / YAML」两个标签页，两边是同一份 YAML，始终由 YAML 框提交（ADR-0017）；
+// 给出校验接口时，输入停顿后实时校验，问题列在编辑区下方，点一条定位到 YAML 里那一处
 import { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { Check } from 'lucide-react';
 import { Link } from 'react-router';
 import { type CustomEntityField, entityOf, FIELD_TYPES, isCustomEntity } from '~/lib/canonical-model';
 import { mappingOutline } from '~/lib/mapping-outline';
-import { MappingEditor, type MappingEditorHandle } from '~/components/mapping-editor';
+import { LiveMappingIssues, MappingEditor, type MappingEditorHandle } from '~/components/mapping-editor';
 import { MappingForm, type FormFocus } from '~/components/mapping-form';
+import { useMappingValidation } from '~/components/use-mapping-validation';
 import { Button } from '~/components/ui/button';
 import { Badge } from '~/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
@@ -52,9 +54,10 @@ const TABS = [{ id: 'form', label: '表单' }, { id: 'yaml', label: 'YAML' }] as
 /**
  * 映射编辑区（表单 / YAML 标签页），旁边是对照面板；点击面板里的列名、字段名、写法或函数插入到 YAML 框光标处（在表单标签页时先切到 YAML）。
  * 默认打开表单；表单要脚本，hydrate 之前（及不支持脚本时）只有 YAML 框可用，照常提交。给出 value 时由外部控制内容；
- * 给出 focus 时表单定位到那个字段，把要加的源值作为待对应的行列进它的值对照表
+ * 给出 focus 时表单定位到那个字段，把要加的源值作为待对应的行列进它的值对照表。
+ * 给出 validateAction 时实时校验（validateExtra 随 YAML 一起提交）；只读的版本不用这个组件，不会校验
  */
-export function MappingEditorWithReference({ defaultValue, value, onValueChange, table, entity, registered, functions, focus }: {
+export function MappingEditorWithReference({ defaultValue, value, onValueChange, table, entity, registered, functions, focus, validateAction, validateExtra }: {
   defaultValue: string;
   value?: string;
   onValueChange?: (yaml: string) => void;
@@ -64,11 +67,16 @@ export function MappingEditorWithReference({ defaultValue, value, onValueChange,
   registered?: Record<string, RegisteredEntityView>;
   functions: ReferenceFunction[];
   focus?: FormFocus | null;
+  /** 实时校验的接口地址（新建页 /mappings、详情页 /mappings/:id） */
+  validateAction?: string;
+  /** 随 YAML 一起提交的字段（新建页的 sourceId），变了也重新校验 */
+  validateExtra?: Record<string, string>;
 }) {
   const editor = useRef<MappingEditorHandle>(null);
   const [own, setOwn] = useState(defaultValue);
   const yaml = value ?? own;
   const setYaml = onValueChange ?? setOwn;
+  const validation = useMappingValidation(validateAction, yaml, validateExtra);
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => setHydrated(true), []);
   const [chosen, setTab] = useState<(typeof TABS)[number]['id']>('form');
@@ -97,7 +105,15 @@ export function MappingEditorWithReference({ defaultValue, value, onValueChange,
         {tab === 'form' && (
           <MappingForm yaml={yaml} entity={entity} table={table} functions={functions} focus={focus} onChange={setYaml} onEditYaml={() => setTab('yaml')} />
         )}
-        <MappingEditor ref={editor} defaultValue={defaultValue} value={yaml} onValueChange={setYaml} hidden={tab !== 'yaml'} />
+        <MappingEditor ref={editor} defaultValue={defaultValue} value={yaml} onValueChange={setYaml} hidden={tab !== 'yaml'} invalid={validation.issues.length > 0 || !!validation.error} />
+        <LiveMappingIssues
+          validation={validation}
+          onJump={(line, col) => {
+            // 在表单标签页时先切到 YAML，编辑框显示出来才能定位
+            flushSync(() => setTab('yaml'));
+            editor.current?.jump(line, col);
+          }}
+        />
       </div>
       <MappingReference
         table={table}

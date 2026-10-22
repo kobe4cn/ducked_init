@@ -1033,16 +1033,21 @@ function fillForm(yaml: string, choices: Record<string, FieldChoice | null>) {
 }
 
 describe('表单式映射编辑器', () => {
-  it('编辑区有表单与 YAML 两个标签页；没有脚本时只有 YAML 框可用，照常提交', async () => {
+  it('编辑区有表单与 YAML 两个标签页；没有脚本时只有 YAML 框可用，照常提交，也没有实时问题列表', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const engineer = await loginAs(app, 'de@acme.com');
     const html = await (await engineer.get('/mappings')).text();
     expect(html).toMatch(/<button[^>]*data-editor-tab="form"[^>]*disabled=""/);
     expect(html).toMatch(/<button[^>]*data-editor-tab="yaml"/);
     expect(html).toMatch(/<textarea[^>]*name="yaml"(?![^>]*hidden)/);
+    // 实时校验只在客户端改了内容后才有，服务端渲染的页面里没有
+    expect(html).not.toContain('data-live-issues');
+    expect(html).not.toMatch(/<textarea[^>]*\saria-invalid=/);
 
     const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
-    expect(await (await engineer.get(`/mappings/${id}`)).text()).toMatch(/<button[^>]*data-editor-tab="form"/);
+    const detail = await (await engineer.get(`/mappings/${id}`)).text();
+    expect(detail).toMatch(/<button[^>]*data-editor-tab="form"/);
+    expect(detail).not.toContain('data-live-issues');
   });
 
   it('只用表单完成订单映射（选列、分换成元、时区转换）：保存的 YAML 保留注释与顺序，另一人能发布', async () => {
