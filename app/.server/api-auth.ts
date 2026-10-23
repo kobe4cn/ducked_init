@@ -6,7 +6,8 @@ import { sha256 } from './auth';
 import { getDb } from './db/client';
 import { apiKeys, tenants } from './db/schema';
 
-export interface ApiCaller { tenantId: string; keyId: string }
+/** 调用方：所属租户与 Key（prefix 是明文的前 8 位，可以写进审计） */
+export interface ApiCaller { tenantId: string; keyId: string; prefix: string }
 
 const LAST_USED_GRANULARITY = sql`interval '1 minute'`;
 
@@ -24,7 +25,7 @@ export async function requireApiKey(request: Request): Promise<ApiCaller> {
   if (!token) throw unauthorized();
   const db = getDb();
   const [row] = await db
-    .select({ keyId: apiKeys.id, tenantId: apiKeys.tenantId })
+    .select({ keyId: apiKeys.id, tenantId: apiKeys.tenantId, prefix: apiKeys.prefix })
     .from(apiKeys)
     .innerJoin(tenants, eq(tenants.id, apiKeys.tenantId))
     .where(and(eq(apiKeys.tokenHash, sha256(token)), isNull(apiKeys.revokedAt), isNull(tenants.suspendedAt)));

@@ -1,5 +1,7 @@
 // app/.server/pipeline/handlers.ts —— 各类任务在工作进程里做什么。连接只挂载了本租户的数据湖（默认库），表名不带前缀。
 // 新增任务类型只改这里；参数在工作进程里校验，不合法时任务记为失败
+import { mkdir, rm } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { EngineLimits, TenantLakeSession } from './lake-engine';
 import { profileSource, type SourceSpec } from './source-engine';
@@ -214,6 +216,23 @@ function servingParams(params: Params, dataPath: string): ServingParams {
     typeof s?.id === 'string' && typeof s.template === 'string' && typeof s.table === 'string' && SNAPSHOT_TABLE.test(s.table));
   if (!valid) throw new Error('参数 snapshots 必须是 { id, template, table } 列表，table 是结果层快照表名');
   return { version: version as number, target, snapshots: snapshots as ServingParams['snapshots'] };
+}
+
+/** 人群导出文件在存储前缀下的目录（ADR-0040），不是 DuckLake 登记的文件 */
+export const EXPORT_DIR = '_exports/';
+export const EXPORT_FORMATS = ['parquet', 'csv'] as const;
+export type ExportFormat = (typeof EXPORT_FORMATS)[number];
+/** 人群导出的一个条件：标签、取值与入队时定下的快照表（结果层里不带 schema 的表名） */
+export interface ExportCondition { tag: string; value: string; table: string }
+
+/** 人群导出的参数：格式与条件（入队时由平台库查出快照表） */
+function exportParams(params: Params): { format: ExportFormat; conditions: ExportCondition[] } {
+  const { format, conditions } = params;
+  if (!EXPORT_FORMATS.includes(format as ExportFormat)) throw new Error(`参数 format 只能是 ${EXPORT_FORMATS.join(' / ')}`);
+  const valid = Array.isArray(conditions) && conditions.length > 0 && conditions.every(c =>
+    typeof c?.tag === 'string' && typeof c.value === 'string' && typeof c.table === 'string' && /^tag__[0-9a-f-]{36}$/.test(c.table));
+  if (!valid) throw new Error('参数 conditions 必须是非空的 { tag, value, table } 列表，table 是标签快照表名');
+  return { format: format as ExportFormat, conditions };
 }
 
 function positiveInt(params: Params, key: string, max: number) {
@@ -456,6 +475,33 @@ export const HANDLERS = {
     async run(_con, params, { session }) {
       const store = servingParams(params, session.lake.dataPath);
       return { version: store.version, path: store.target, rows: await buildServingStore(session, store) };
+    },
+  },
+  // 人群导出（ADR-0040）：按入队时定下的标签快照表筛出所有条件同时满足的 consumer_id，按它排序写到本租户存储前缀下的 _exports/<任务 ID>.<格式>。
+  // 数据湖只读挂载；排队期间快照表被删掉（快照过期）时失败、不写文件，写到一半失败时删掉本地的残留文件
+  'export.tags': {
+    label: '人群导出',
+    readOnlyLake: true,
+    async run(con, params, { taskId, session }) {
+      const { format, conditions } = exportParams(params);
+      const present = new Set((await rows<{ name: string }>(con, `
+        SELECT table_name AS name FROM information_schema.tables
+        WHERE table_catalog = 'lake' AND table_schema = 'gold' AND table_name IN (${conditions.map(c => lit(c.table)).join(', ')})`)).map(t => t.name));
+      if (!conditions.every(c => present.has(c.table))) throw new Error('快照已过期，请重新发起导出');
+      const path = `${EXPORT_DIR}${taskId}.${format}`;
+      const target = session.lake.dataPath + path;
+      const local = !target.startsWith('s3://');
+      if (local) await mkdir(dirname(target), { recursive: true });
+      const from = conditions.map((c, i) => (i === 0 ? '' : 'JOIN ') + `gold."${c.table}" t${i}` + (i === 0 ? '' : ' USING (consumer_id)')).join(' ');
+      const where = conditions.map((c, i) => `t${i}.tag_value::VARCHAR = ${lit(c.value)}`).join(' AND ');
+      try {
+        const [result] = await rows<Record<string, string>>(con, `COPY (SELECT t0.consumer_id FROM ${from} WHERE ${where} ORDER BY 1)
+          TO ${lit(target)} (FORMAT ${format}${format === 'csv' ? ', HEADER' : ''})`);
+        return { rows: Number(Object.values(result)[0]), path, format };
+      } catch (e) {
+        if (local) await rm(target, { force: true });
+        throw e;
+      }
     },
   },
 } satisfies Record<string, Handler>;

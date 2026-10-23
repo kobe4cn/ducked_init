@@ -52,6 +52,11 @@ const ACTIONS = {
   // 只记名称与前缀，明文只在创建那次响应里出现
   'api_key.created': { label: '创建 API Key', describe: apiKeyLabel },
   'api_key.revoked': { label: '吊销 API Key', describe: apiKeyLabel },
+  // 外部系统经 API Key 发起（system 操作者，记 Key 的前缀）；条件与快照照原样记下（ADR-0040）
+  'export.requested': {
+    label: '发起人群导出',
+    describe: (d: Detail) => `API Key ${d.keyPrefix}…，${(d.conditions as { tag: string; value: string }[]).map(c => `${c.tag} = ${c.value}`).join(' 且 ')}，${d.format}`,
+  },
   // 不记 API Key，只记是否轮换；单独开关发送脱敏样本时只记 allowSamples
   'model_provider.updated': {
     label: '修改模型服务',
