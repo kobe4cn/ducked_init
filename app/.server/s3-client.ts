@@ -95,6 +95,13 @@ export async function getObject(creds: S3Creds, uri: string) {
   return res.body!;
 }
 
+/** 同 getObject，对象不存在时返回 null */
+export async function getObjectIfExists(creds: S3Creds, uri: string) {
+  const res = await signedFetch(creds, 's3', { method: 'GET', path: objectPath(uri), timeoutMs: TRANSFER_TIMEOUT_MS });
+  if (res.status === 404) return null;
+  return (await ensureOk(res, `读取 ${uri} `)).body!;
+}
+
 /** 删除对象；对象不存在时也算成功 */
 export async function deleteObject(creds: S3Creds, uri: string) {
   await ensureOk(await signedFetch(creds, 's3', { method: 'DELETE', path: objectPath(uri) }), `删除 ${uri} `);

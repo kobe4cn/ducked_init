@@ -569,6 +569,17 @@ export const servingStores = platform.table('serving_stores', {
   builtAt: timestamp('built_at', { withTimezone: true }).notNull(),
 });
 
+// 人群导出的下载链接（ADR-0040）：每次查到导出成功都签发一个，只存令牌的 SHA-256，15 分钟内可重复下载；
+// 导出文件被清理后、链接到期时由调度器删掉
+export const exportLinks = platform.table('export_links', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'cascade' }),
+  tokenHash: text('token_hash').notNull().unique(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  createdAt: createdAt(),
+});
+
 export const DSL_DEFINITION_KINDS = ['metric', 'tag'] as const;
 export const dslKindEnum = platform.enum('dsl_kind', DSL_DEFINITION_KINDS);
 

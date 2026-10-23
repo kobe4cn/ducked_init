@@ -1,13 +1,16 @@
 // test/http/exports.test.ts —— 人群导出接口：外部系统带 Bearer Key 调 POST /api/v1/exports 按标签条件发起导出（入队时定下每个标签的快照），
-// 工作进程写成 Parquet / CSV 文件，GET /api/v1/exports/:id 查状态与实际用到的快照（ADR-0040）。
+// 工作进程写成 Parquet / CSV 文件，GET /api/v1/exports/:id 查状态与实际用到的快照，成功后带限时下载链接，凭 token 下载；
+// 任务结束 24 小时后调度器删掉文件（ADR-0040）。
 // 快照直接在湖里建表、在平台库登记，不跑分析模板
 import { existsSync } from 'node:fs';
+import { readFile, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { DuckDBInstance } from '@duckdb/node-api';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, snapshots, tasks } from '../../app/.server/db/schema';
+import { auditLogs, exportLinks, snapshots, tasks } from '../../app/.server/db/schema';
+import { cleanupExpiredExports, EXPORT_LINK_TTL_MS } from '../../app/.server/exports';
 import { lakeRow } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { listTasks } from '../../app/.server/tasks';
@@ -65,9 +68,12 @@ const status = async (id: string, key?: string) => {
   return { status: res.status, body: await res.json() };
 };
 
+/** 导出文件在本租户存储前缀下的完整路径 */
+const exportFile = async (tenantId: string, id: string, format: string) => `${(await lakeRow(tenantId))!.dataPath}_exports/${id}.${format}`;
+
 /** 读出导出文件的 consumer_id（按文件里的顺序） */
 async function readExport(tenantId: string, id: string, format: 'parquet' | 'csv') {
-  const file = `${(await lakeRow(tenantId))!.dataPath}_exports/${id}.${format}`;
+  const file = await exportFile(tenantId, id, format);
   const instance = await DuckDBInstance.create(':memory:');
   const con = await instance.connect();
   try {
@@ -168,8 +174,12 @@ describe('导出结果与状态', () => {
     expect(await status(parquet.id, key)).toEqual({ status: 200, body: { id: parquet.id, status: 'queued', format: 'parquet', snapshots: { vip, city }, rowCount: null } });
     await drain();
 
-    expect(await status(parquet.id, key)).toEqual({ status: 200, body: { id: parquet.id, status: 'succeeded', format: 'parquet', snapshots: { vip, city }, rowCount: 2 } });
-    expect(await status(csv.id, key)).toEqual({ status: 200, body: { id: csv.id, status: 'succeeded', format: 'csv', snapshots: { vip, city }, rowCount: 2 } });
+    expect(await status(parquet.id, key)).toEqual({
+      status: 200, body: { id: parquet.id, status: 'succeeded', format: 'parquet', snapshots: { vip, city }, rowCount: 2, download: expect.any(Object) },
+    });
+    expect(await status(csv.id, key)).toEqual({
+      status: 200, body: { id: csv.id, status: 'succeeded', format: 'csv', snapshots: { vip, city }, rowCount: 2, download: expect.any(Object) },
+    });
     expect(await readExport(tenantId, parquet.id, 'parquet')).toEqual({ columns: ['consumer_id'], ids: ['c1', 'c3'] });
     expect(await readExport(tenantId, csv.id, 'csv')).toEqual({ columns: ['consumer_id'], ids: ['c1', 'c3'] });
 
@@ -214,6 +224,105 @@ describe('导出结果与状态', () => {
     expect(await status(id, key)).toEqual({
       status: 200, body: { id, status: 'failed', format: 'parquet', snapshots: { vip }, rowCount: null, error: '快照已过期，请重新发起导出' },
     });
-    expect(existsSync(`${(await lakeRow(tenantId))!.dataPath}_exports/${id}.parquet`)).toBe(false);
+    expect(existsSync(await exportFile(tenantId, id, 'parquet'))).toBe(false);
+  });
+});
+
+const download = (url: string) => app.client().request(url);
+const downloadAudits = () => getDb().select().from(auditLogs).where(eq(auditLogs.action, 'export.downloaded'));
+
+describe('下载链接', () => {
+  it('成功后每次查询都签发新链接（只存哈希），凭 token 流式下载、每次记审计；过期或文件不在 410，别的导出或不存在的 token 404', async () => {
+    const { tenantId, key } = await tenantWithKey('acme');
+    await tagSnapshot(tenantId, 'vip', VIP);
+    const parquet = (await post({ conditions: [{ tag: 'vip', value: 'yes' }] }, key)).body;
+    const csv = (await post({ conditions: [{ tag: 'vip', value: 'yes' }], format: 'csv' }, key)).body;
+    expect((await status(parquet.id, key)).body).not.toHaveProperty('download');
+    await drain();
+
+    const before = Date.now();
+    const first = (await status(parquet.id, key)).body.download;
+    const second = (await status(parquet.id, key)).body.download;
+    expect(first.url).toMatch(new RegExp(`^/api/v1/exports/${parquet.id}/download\\?token=[\\w-]+$`));
+    expect(second.url).not.toBe(first.url);
+    const expiresAt = new Date(first.expiresAt).getTime();
+    expect(expiresAt).toBeGreaterThanOrEqual(before + EXPORT_LINK_TTL_MS - 1000);
+    expect(expiresAt).toBeLessThanOrEqual(Date.now() + EXPORT_LINK_TTL_MS);
+    const tokens = [first, second].map(d => new URL(d.url, 'http://x').searchParams.get('token')!);
+    const links = await getDb().select().from(exportLinks).where(eq(exportLinks.taskId, parquet.id));
+    expect(links).toHaveLength(2);
+    expect(links.map(l => l.tokenHash)).not.toContain(tokens[0]);
+    expect(links.every(l => l.tenantId === tenantId)).toBe(true);
+
+    // 新链接不让旧链接失效；同一链接可以重复下载，不需要 Bearer
+    for (const url of [first.url, second.url, first.url]) {
+      const res = await download(url);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toBe('application/vnd.apache.parquet');
+      expect(res.headers.get('content-disposition')).toBe(`attachment; filename="export-${parquet.id}.parquet"`);
+      expect(Buffer.from(await res.arrayBuffer())).toEqual(await readFile(await exportFile(tenantId, parquet.id, 'parquet')));
+    }
+    const csvRes = await download((await status(csv.id, key)).body.download.url);
+    expect(csvRes.status).toBe(200);
+    expect(csvRes.headers.get('content-type')).toBe('text/csv; charset=utf-8');
+    expect(csvRes.headers.get('content-disposition')).toBe(`attachment; filename="export-${csv.id}.csv"`);
+    expect((await csvRes.text()).trim().split('\n')).toEqual(['consumer_id', 'c1', 'c2', 'c3']);
+
+    const audits = await downloadAudits();
+    expect(audits).toHaveLength(4);
+    expect(audits.filter(a => a.targetId === parquet.id)).toEqual(Array(3).fill(expect.objectContaining({
+      tenantId, actorType: 'system', targetType: 'task', targetId: parquet.id, detail: { id: parquet.id },
+    })));
+    expect(JSON.stringify(audits)).not.toContain(tokens[0]);
+
+    // token 属于别的导出、不存在、没给时 404
+    expect((await download(`/api/v1/exports/${csv.id}/download?token=${tokens[0]}`)).status).toBe(404);
+    expect((await download(`/api/v1/exports/${parquet.id}/download?token=nope`)).status).toBe(404);
+    expect((await download(`/api/v1/exports/${parquet.id}/download`)).status).toBe(404);
+    expect((await download(`/api/v1/exports/not-a-uuid/download?token=${tokens[0]}`)).status).toBe(404);
+
+    // 链接到期后 410，另一个链接照常
+    await getDb().execute(sql`UPDATE platform.export_links SET expires_at = now() - interval '1 minute' WHERE id = ${links[0].id}`);
+    const statuses = await Promise.all([first.url, second.url].map(async u => (await download(u)).status));
+    expect(statuses.sort()).toEqual([200, 410]);
+    expect(await downloadAudits()).toHaveLength(5);
+    // 导出还在保留期内时，到期的链接不被清理，仍是 410
+    await cleanupExpiredExports();
+    expect((await download(first.url)).status).toBe(410);
+
+    // 文件不在了（例如湖迁移后）时 410，不记审计
+    await rm(await exportFile(tenantId, parquet.id, 'parquet'));
+    expect((await download(second.url)).status).toBe(410);
+    expect(await downloadAudits()).toHaveLength(5);
+  });
+
+  it('任务结束 24 小时后状态 expired、不再签发链接、下载 410；调度器删掉文件，链接到期后也删掉，再跑一次不报错；新的导出与它的链接不受影响', async () => {
+    const { tenantId, key } = await tenantWithKey('acme');
+    await tagSnapshot(tenantId, 'vip', VIP);
+    const old = (await post({ conditions: [{ tag: 'vip', value: 'yes' }] }, key)).body;
+    const fresh = (await post({ conditions: [{ tag: 'vip', value: 'yes' }], format: 'csv' }, key)).body;
+    await drain();
+    const { url } = (await status(old.id, key)).body.download;
+    const freshUrl = (await status(fresh.id, key)).body.download.url;
+    expect((await download(url)).status).toBe(200);
+
+    await getDb().execute(sql`UPDATE platform.tasks SET finished_at = now() - interval '25 hours' WHERE id = ${old.id}`);
+    expect(await status(old.id, key)).toEqual({
+      status: 200, body: { id: old.id, status: 'expired', format: 'parquet', snapshots: old.snapshots, rowCount: 3 },
+    });
+    expect((await download(url)).status).toBe(410);
+
+    await cleanupExpiredExports();
+    expect(existsSync(await exportFile(tenantId, old.id, 'parquet'))).toBe(false);
+    expect(existsSync(await exportFile(tenantId, fresh.id, 'csv'))).toBe(true);
+    expect((await download(url)).status).toBe(410);
+    expect((await status(old.id, key)).body.status).toBe('expired');
+    expect((await download(freshUrl)).status).toBe(200);
+
+    await getDb().execute(sql`UPDATE platform.export_links SET expires_at = now() - interval '1 minute'`);
+    await cleanupExpiredExports();
+    expect((await getDb().select().from(exportLinks)).map(l => l.taskId)).toEqual([fresh.id]);
+    expect(existsSync(await exportFile(tenantId, fresh.id, 'csv'))).toBe(true);
+    expect((await download(url)).status).toBe(404);
   });
 });

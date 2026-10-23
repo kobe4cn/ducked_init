@@ -1,17 +1,36 @@
 // app/.server/exports.ts —— 人群导出（ADR-0040）：外部系统按标签条件发起导出，入队时定下每个标签用哪张快照，
-// 由工作进程的 export.tags 写文件。导出 ID 就是任务 ID；一律限定在调用方的租户内
-import { and, desc, eq, gt, isNull } from 'drizzle-orm';
+// 由工作进程的 export.tags 写文件。导出 ID 就是任务 ID；一律限定在调用方的租户内。
+// 成功后每次查询签发一个 15 分钟的下载链接（只存令牌哈希），凭令牌下载；文件在任务结束 24 小时后由调度器删掉
+import { open, rm } from 'node:fs/promises';
+import { Readable } from 'node:stream';
+import { and, desc, eq, gt, inArray, isNull, lt, lte, sql } from 'drizzle-orm';
 import type { ApiCaller } from './api-auth';
 import { recordAudit } from './audit';
+import { newToken, sha256 } from './auth';
 import { getDb } from './db/client';
-import { snapshots, tasks } from './db/schema';
+import { exportLinks, snapshots, tasks } from './db/schema';
 import { DSL_KEY_PATTERN } from './dsl-definitions';
+import { lakeRow, lakeSpecOf } from './lake';
+import { isS3 } from './lake-storage';
 import { EXPORT_FORMATS, type ExportCondition, type ExportFormat } from './pipeline/handlers';
+import { platformS3 } from './s3-accounts';
+import { deleteObject, getObjectIfExists } from './s3-client';
 import { getSnapshot } from './snapshots';
 import { insertTask, TaskError } from './tasks';
 
 export const MAX_EXPORT_CONDITIONS = 5;
 export const MAX_TAG_VALUE_LENGTH = 200;
+export const EXPORT_LINK_TTL_MS = 15 * 60_000;
+export const EXPORT_RETENTION_MS = 24 * 60 * 60_000;
+
+/** 结束时间早于它的导出文件已过保留期（已被或即将被清理） */
+const retentionCutoff = () => new Date(Date.now() - EXPORT_RETENTION_MS);
+
+/** export.tags 成功后的结果：行数、相对存储前缀的文件路径（清理后去掉）与格式 */
+interface ExportResult { rows: number; path?: string; format: ExportFormat }
+const resultOf = (task: { result: unknown }) => task.result as ExportResult;
+
+const CONTENT_TYPES: Record<ExportFormat, string> = { parquet: 'application/vnd.apache.parquet', csv: 'text/csv; charset=utf-8' };
 
 /** 请求不合法（400），信息可以原样返回给调用方 */
 export class ExportError extends Error {}
@@ -94,15 +113,87 @@ export async function createExport({ tenantId, prefix }: ApiCaller, body: unknow
   }
 }
 
-/** 本租户的一次人群导出：状态、格式、所用快照与行数（跑完之前为 null），失败时带错误；不存在、别的租户的或不是导出任务时为 null */
+/**
+ * 本租户的一次人群导出：状态、格式、所用快照与行数（跑完之前为 null），失败时带错误；不存在、别的租户的或不是导出任务时为 null。
+ * 成功且文件还在保留期内时签发一个新的下载链接（不让之前的失效）；过了保留期状态为 expired、没有链接
+ */
 export async function getExport(tenantId: string, id: string) {
   if (!/^[0-9a-f-]{36}$/i.test(id)) return null;
   const [task] = await getDb().select().from(tasks).where(and(eq(tasks.id, id), eq(tasks.tenantId, tenantId), eq(tasks.kind, 'export.tags')));
   if (!task) return null;
   const params = task.params as { format: ExportFormat; snapshots: Record<string, string> };
-  const rowCount = task.status === 'succeeded' ? (task.result as { rows: number }).rows : null;
+  const rowCount = task.status === 'succeeded' ? resultOf(task).rows : null;
+  const expired = task.status === 'succeeded' && task.finishedAt! < retentionCutoff();
   return {
-    id: task.id, status: task.status, format: params.format, snapshots: params.snapshots, rowCount,
+    id: task.id, status: expired ? 'expired' as const : task.status, format: params.format, snapshots: params.snapshots, rowCount,
     ...(task.status === 'failed' && { error: task.error }),
+    ...(task.status === 'succeeded' && !expired && { download: await issueLink(tenantId, task.id) }),
   };
+}
+
+/** 签发一个下载链接：库里只存令牌的 SHA-256，明文只出现在返回的 url 里 */
+async function issueLink(tenantId: string, taskId: string) {
+  const token = newToken();
+  const expiresAt = new Date(Date.now() + EXPORT_LINK_TTL_MS);
+  await getDb().insert(exportLinks).values({ tenantId, taskId, tokenHash: sha256(token), expiresAt });
+  return { url: `/api/v1/exports/${taskId}/download?token=${token}`, expiresAt: expiresAt.toISOString() };
+}
+
+/**
+ * 凭下载链接的令牌下载导出文件（流式），每次下载记审计 export.downloaded。令牌不存在或不是这个导出的 404；
+ * 令牌已到期、文件过了保留期或已不在 410
+ */
+export async function openExportDownload(id: string, token: string | null): Promise<Response> {
+  const notFound = () => Response.json({ error: '下载链接不存在' }, { status: 404 });
+  const gone = () => Response.json({ error: '下载链接已过期，请重新查询导出状态获取新链接' }, { status: 410 });
+  if (!token) return notFound();
+  const [found] = await getDb().select({ link: exportLinks, task: tasks }).from(exportLinks)
+    .innerJoin(tasks, eq(tasks.id, exportLinks.taskId))
+    .where(eq(exportLinks.tokenHash, sha256(token)));
+  if (!found || found.task.id !== id) return notFound();
+  const { link, task } = found;
+  const { path, format } = resultOf(task);
+  const lake = await lakeRow(task.tenantId);
+  if (link.expiresAt <= new Date() || task.finishedAt! < retentionCutoff() || !path || !lake) return gone();
+
+  const file = lake.dataPath + path;
+  // 文件不在（例如湖迁移后，_exports/ 不复制）时 410
+  const body = isS3(file)
+    ? await getObjectIfExists(lakeSpecOf(lake).s3!, file)
+    : await open(file).then(
+      h => Readable.toWeb(h.createReadStream()) as ReadableStream<Uint8Array>,
+      (e: NodeJS.ErrnoException) => { if (e.code === 'ENOENT') return null; throw e; });
+  if (!body) return gone();
+  await recordAudit(getDb(), { tenantId: task.tenantId, system: true, action: 'export.downloaded', targetType: 'task', targetId: id, detail: { id } });
+  return new Response(body, {
+    headers: { 'Content-Type': CONTENT_TYPES[format], 'Content-Disposition': `attachment; filename="export-${id}.${format}"` },
+  });
+}
+
+/**
+ * 调度器定期调用：删掉结束超过 24 小时的导出文件（文件不在也不报错），删掉后从任务结果里去掉 path，下次不再处理；
+ * 再删掉这些导出已到期的下载链接（过了保留期的导出不再签发链接，它的链接最晚 15 分钟后到期，到期前下载 410）。
+ * 保留期内的导出到期的链接不删，下载照旧 410
+ */
+export async function cleanupExpiredExports() {
+  const db = getDb();
+  const due = await db.select({ id: tasks.id, tenantId: tasks.tenantId, result: tasks.result }).from(tasks).where(and(
+    eq(tasks.kind, 'export.tags'), eq(tasks.status, 'succeeded'), lt(tasks.finishedAt, retentionCutoff()),
+    sql`${tasks.result} ->> 'path' IS NOT NULL`,
+  ));
+  for (const task of due) {
+    try {
+      const lake = await lakeRow(task.tenantId);
+      if (lake) {
+        const file = lake.dataPath + resultOf(task).path;
+        await (isS3(file) ? deleteObject(platformS3(), file) : rm(file, { force: true }));
+      }
+      await db.update(tasks).set({ result: sql`${tasks.result} - 'path'` }).where(eq(tasks.id, task.id));
+    } catch (e) {
+      // 一个删不掉不耽误别的，下一轮再试
+      console.error(`[人群导出] 删除导出文件 ${task.id} 出错`, e);
+    }
+  }
+  const pastRetention = db.select({ id: tasks.id }).from(tasks).where(lt(tasks.finishedAt, retentionCutoff()));
+  await db.delete(exportLinks).where(and(lte(exportLinks.expiresAt, new Date()), inArray(exportLinks.taskId, pastRetention)));
 }

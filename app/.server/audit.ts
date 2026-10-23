@@ -57,6 +57,11 @@ const ACTIONS = {
     label: '发起人群导出',
     describe: (d: Detail) => `API Key ${d.keyPrefix}…，${(d.conditions as { tag: string; value: string }[]).map(c => `${c.tag} = ${c.value}`).join(' 且 ')}，${d.format}`,
   },
+  // 凭下载链接下载，不记令牌
+  'export.downloaded': {
+    label: '下载人群导出',
+    describe: (d: Detail) => `导出 ${d.id}`,
+  },
   // 不记 API Key，只记是否轮换；单独开关发送脱敏样本时只记 allowSamples
   'model_provider.updated': {
     label: '修改模型服务',
