@@ -165,7 +165,7 @@ MAILER=console pnpm dev --port 5180 --strictPort > /tmp/crm-dev-5180.log 2>&1
 ```
 
 - 它连的是 `.env` 里的开发库 `crm_platform`，不是测试库。里面是真实的开发数据：只操作验收用的租户，不删改别的数据。
-- 必须设 `MAILER=console`：`.env` 里配了 `RESEND_API_KEY`，不设就会真的发信。
+- 必须设 `MAILER=console`：`.env` 里配了 `MAIL_HOST`，不设就会真的发信。
 - 验收结束后停掉它：`lsof -tiTCP:5180 -sTCP:LISTEN | xargs kill`。
 
 ### 登录

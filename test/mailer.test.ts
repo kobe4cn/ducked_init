@@ -1,27 +1,32 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { resendMailer } from '../app/.server/mailer';
+
+const sendMail = vi.fn();
+const createTransport = vi.fn((_options: unknown) => ({ sendMail }));
+vi.mock('nodemailer', () => ({ default: { createTransport: (options: unknown) => createTransport(options) } }));
+
+const { smtpMailer } = await import('../app/.server/mailer');
 
 const mail = { to: 'admin@acme.com', subject: '登录 CRM 数据分析平台', text: 'http://localhost:5173/auth/verify?token=abc' };
+const config = { host: 'smtp.qq.com', user: 'crm@qq.com', pass: 'auth-code', from: 'CRM <crm@qq.com>' };
 
-describe('Resend 发信', () => {
-  afterEach(() => { vi.unstubAllGlobals(); });
+describe('SMTP 发信', () => {
+  afterEach(() => { sendMail.mockReset(); createTransport.mockClear(); });
 
-  it('把收件人、发件人、主题与正文交给 Resend API', async () => {
-    const fetch = vi.fn(async () => Response.json({ id: 'email-1' }));
-    vi.stubGlobal('fetch', fetch);
-    await resendMailer('re_test', 'CRM <noreply@example.com>').send(mail);
+  it('用主机、端口与账号连接，把收件人、发件人、主题与正文交给 SMTP', async () => {
+    sendMail.mockResolvedValue({ messageId: 'm-1' });
+    await smtpMailer({ ...config, port: 465 }).send(mail);
 
-    expect(fetch).toHaveBeenCalledOnce();
-    const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe('https://api.resend.com/emails');
-    expect(new Headers(init.headers).get('authorization')).toBe('Bearer re_test');
-    expect(JSON.parse(init.body as string)).toMatchObject({ from: 'CRM <noreply@example.com>', ...mail });
+    expect(createTransport).toHaveBeenCalledWith({ host: 'smtp.qq.com', port: 465, secure: true, auth: { user: 'crm@qq.com', pass: 'auth-code' } });
+    expect(sendMail).toHaveBeenCalledWith({ from: 'CRM <crm@qq.com>', ...mail });
   });
 
-  it('Resend 返回错误时抛出异常', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () =>
-      Response.json({ name: 'validation_error', message: 'The from address is not verified', statusCode: 403 }, { status: 403 })));
-    await expect(resendMailer('re_test', 'CRM <noreply@example.com>').send(mail))
-      .rejects.toThrow(/Resend 发信失败（validation_error）：The from address is not verified/);
+  it('587 端口不直接走 SSL（STARTTLS）', () => {
+    smtpMailer({ ...config, port: 587 });
+    expect(createTransport).toHaveBeenCalledWith(expect.objectContaining({ port: 587, secure: false }));
+  });
+
+  it('SMTP 返回错误时抛出异常', async () => {
+    sendMail.mockRejectedValue(new Error('Invalid login: 535 Login fail'));
+    await expect(smtpMailer({ ...config, port: 465 }).send(mail)).rejects.toThrow(/SMTP 发信失败：Invalid login: 535 Login fail/);
   });
 });
