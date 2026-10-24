@@ -1,18 +1,30 @@
 // app/components/lineage-drawer.tsx —— 数据地图的标准层表字段抽屉：固定在右侧，列出表的行数与每个字段的说明；
 // 有明细时（sources:read）每个字段再列出各映射的源表、表达式与源列，标出敏感哈希、值字典、扩展字段与兜底，兜底的附上最近一次合并的兜底统计。
 // 关闭是去掉 ?node= 的链接；有明细时带「聚焦此表」链接，进入单表聚焦画布。
+// 实体登记的字段带业务说明（ADR-0041）：任何角色看得到当前说明与历史（可折叠），有 definitions:draft 的成员可以编辑，清空是保存空内容。
 // 源表抽屉（TableDrawer，只给 sources:read）按源列列出它影响的标准层字段、映射与表达式
-import { Link } from 'react-router';
-import { AlertTriangle, ArrowRight, BookOpen, Focus, Lock, Puzzle, X } from 'lucide-react';
+import { Form, Link } from 'react-router';
+import { AlertTriangle, ArrowRight, BookOpen, Focus, Lock, NotebookPen, Puzzle, X } from 'lucide-react';
+import type { NoteVersion } from '~/.server/business-notes';
 import { fallbackText } from '~/lib/fallback';
 import type { FieldDrawer, FieldSource } from '~/lib/lineage-fields';
 import type { TableImpact } from '~/lib/lineage-search';
 import { Badge } from '~/components/ui/badge';
+import { Button } from '~/components/ui/button';
 
 const ASIDE = 'fixed inset-y-0 right-0 z-50 w-[28rem] max-w-full overflow-y-auto rounded-l-2xl border bg-white shadow-xl';
 
-/** focusHref：单表聚焦画布的链接，没有 sources:read 时为 null */
-export function LineageDrawer({ drawer, closeHref, focusHref }: { drawer: FieldDrawer; closeHref: string; focusHref: string | null }) {
+/** 一个字段的业务说明：当前内容（空串为没有或已清空）与每一版，从旧到新 */
+export interface FieldNote { current: string; history: NoteVersion[] }
+
+/**
+ * focusHref：单表聚焦画布的链接，没有 sources:read 时为 null；notes：实体登记的字段的业务说明，按字段名（扩展字段没有）；
+ * canNote：能否编辑说明；noteError：上一次保存失败的字段、原因与提交的内容（编辑框里留着）
+ */
+export function LineageDrawer({ drawer, closeHref, focusHref, notes, canNote, noteError }: {
+  drawer: FieldDrawer; closeHref: string; focusHref: string | null;
+  notes: Record<string, FieldNote>; canNote: boolean; noteError: { field: string; error: string; note: string } | null;
+}) {
   return (
     <aside data-drawer={drawer.entity} aria-label={`silver.${drawer.entity} 的字段`} className={ASIDE}>
       <div className="sticky top-0 flex items-start justify-between gap-4 border-b bg-white px-6 py-4">
@@ -38,6 +50,9 @@ export function LineageDrawer({ drawer, closeHref, focusHref }: { drawer: FieldD
               {f.label !== f.name && <span className="ml-2 text-sm">{f.label}</span>}
             </div>
             {f.description && <p className="text-xs text-slate-500">{f.description}</p>}
+            {notes[f.name] && (
+              <Note entity={drawer.entity} field={f.name} note={notes[f.name]} canNote={canNote} failure={noteError?.field === f.name ? noteError : null} />
+            )}
             {'sources' in f && f.sources.map(s => <Source key={s.mapping} source={s} />)}
           </li>
         ))}
@@ -76,6 +91,52 @@ export function TableDrawer({ impact, closeHref }: { impact: TableImpact; closeH
       </ul>
       {impact.columns.length === 0 && <p className="px-6 py-4 text-sm text-slate-500">已发布的映射没有引用这张表的列。</p>}
     </aside>
+  );
+}
+
+/** 字段的业务说明、编辑表单与历史 */
+function Note({ entity, field, note, canNote, failure }: {
+  entity: string; field: string; note: FieldNote; canNote: boolean; failure: { error: string; note: string } | null;
+}) {
+  return (
+    <div className="space-y-1.5">
+      {note.current && (
+        <p data-note={note.current} className="whitespace-pre-wrap rounded-xl border border-slate-200 p-3 text-xs text-slate-700">
+          <span className="mr-1 inline-flex items-center gap-1 font-medium text-slate-900"><NotebookPen className="size-3" />业务说明</span>
+          {note.current}
+        </p>
+      )}
+      {canNote && (
+        <details open={Boolean(failure)} className="text-xs">
+          <summary className="cursor-pointer text-slate-500 hover:text-slate-900">{note.current ? '编辑业务说明' : '写业务说明'}</summary>
+          <Form method="post" preventScrollReset className="mt-2 space-y-2">
+            <input type="hidden" name="intent" value="note" />
+            <input type="hidden" name="entity" value={entity} />
+            <input type="hidden" name="field" value={field} />
+            <textarea
+              name="note" rows={3} maxLength={2000} defaultValue={failure?.note ?? note.current} aria-label={`${field} 的业务说明`}
+              placeholder="这个字段在本租户的业务口径，最多 2000 字；清空后保存即删除说明"
+              className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            />
+            {failure && <p role="alert" className="text-red-600">{failure.error}</p>}
+            <Button type="submit" size="sm" variant="outline">保存说明</Button>
+          </Form>
+        </details>
+      )}
+      {note.history.length > 0 && (
+        <details data-note-history className="text-xs text-slate-500">
+          <summary className="cursor-pointer hover:text-slate-900">{`历史（${note.history.length} 版）`}</summary>
+          <div className="mt-2 space-y-2">
+            {[...note.history].reverse().map((v, i) => (
+              <div key={`${v.at}:${i}`} data-note-version className="border-l-2 pl-2">
+                <div>{`${v.by} · ${new Date(v.at).toLocaleString('zh-CN')}`}</div>
+                <div className="whitespace-pre-wrap text-slate-700">{v.note || <span className="text-slate-400">（已清空）</span>}</div>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
   );
 }
 

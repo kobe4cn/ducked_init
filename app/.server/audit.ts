@@ -216,6 +216,10 @@ const ACTIONS = {
     describe: (d: Detail) => `${d.name}，丢弃第 ${d.version} 版草稿，${d.published ? `回到第 ${d.published} 版` : '自定义实体已删除'}`,
   },
   'custom_entity.deleted': { label: '删除自定义实体', describe: (d: Detail) => `${d.name}` },
+  'business_note.updated': {
+    label: '修改业务说明',
+    describe: (d: Detail) => `${d.entity}.${d.field}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}`,
+  },
   'merge_group.saved': {
     label: '保存合并组草稿',
     describe: (d: Detail) => `${entityLabel(String(d.entity))}，第 ${d.version} 版草稿，${(d.members as string[]).length} 个映射，${d.rule}`,

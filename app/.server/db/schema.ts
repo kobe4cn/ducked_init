@@ -655,3 +655,16 @@ export const mappingGenerations = platform.table('mapping_generations', {
   createdByEmail: text('created_by_email').notNull(),
   createdAt: createdAt(),
 }, t => [index('mapping_generations_tenant_created_idx').on(t.tenantId, t.createdAt)]);
+
+// 业务说明（ADR-0041）：成员给实体字段写的本租户通用口径，只追加、留历史，不走双人发布。当前说明取同一 (entity, field, mapping_id) 最新的一行，
+// 空串表示已清空。mapping_id 为空是实体字段的说明，非空是某个映射里这个字段的说明
+export const businessNotes = platform.table('business_notes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  entity: text('entity').notNull(),
+  field: text('field').notNull(),
+  mappingId: uuid('mapping_id').references(() => mappings.id, { onDelete: 'cascade' }),
+  note: text('note').notNull(),
+  createdByEmail: text('created_by_email').notNull(),
+  createdAt: createdAt(),
+}, t => [index('business_notes_tenant_field_idx').on(t.tenantId, t.entity, t.field, t.mappingId, t.createdAt)]);

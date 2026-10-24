@@ -6,6 +6,7 @@
 // 只对有 sources:read 的成员开放，没有权限时回到关系图，源表名与映射信息都不下发。
 // 点已接入的标准层表（关系图 ?node=<entity>，流向图 ?node=silver.<entity>）在右侧抽屉列出字段明细：有 sources:read 时带各映射的源表、源列、表达式、
 // 标记与兜底统计，否则只下发字段说明与行数（在 loader 里裁剪）。
+// 抽屉里实体登记的字段带业务说明（当前说明与历史，任何角色可见，ADR-0041），有 definitions:draft 的成员可以编辑（intent=note）。
 // 单表聚焦画布（?tab=flow&focus=<实体>，从抽屉进入）只画这张标准层表与写入它的源表，连线从源列连到字段；同样只对有 sources:read 的成员开放
 // 流向图与聚焦画布上可以反向查（?q=列 或 表.列，不区分大小写）：命中的源表、映射、标准层表与连线保持原样，其余变淡；点源表节点（?node=table:<数据源>:<表>）
 // 在抽屉里按源列列出它影响的标准层字段。两者都只对有 sources:read 的成员生效。
@@ -18,6 +19,7 @@ import { AlertTriangle, ArrowLeft, CheckCircle2, CircleAlert, Loader2, Search } 
 import type { Route } from './+types/lineage';
 import { can, requirePermission } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
+import { BusinessNoteError, entityNoteHistory, saveBusinessNote } from '~/.server/business-notes';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import { getInspectStatus, InspectError, inspectLakeNow } from '~/.server/lake-inspect';
@@ -42,7 +44,7 @@ import { StatusText } from '~/components/status-text';
 import { DriftBadge } from '~/components/drift-badge';
 import { Badge } from '~/components/ui/badge';
 import { KindIcon } from '~/components/kind-icon';
-import { LineageDrawer, TableDrawer } from '~/components/lineage-drawer';
+import { type FieldNote, LineageDrawer, TableDrawer } from '~/components/lineage-drawer';
 import { FocusGraphView } from '~/components/lineage-focus';
 import { FlowGraphView, MergeStatus } from '~/components/lineage-flow';
 import { RelationGraphView } from '~/components/lineage-graph';
@@ -123,6 +125,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   const tableNode = canFlow && node?.startsWith('table:') ? node : null;
   let flow: FlowInput | null = null;
   let drawer: FieldDrawer | null = null;
+  let notes: Record<string, FieldNote> | null = null;
   let focus: FocusInput | null = null;
   let hitIds: { nodes: string[]; edges: string[]; fields: string[] } | null = null;
   let tableDrawer: TableImpact | null = null;
@@ -151,9 +154,16 @@ export async function loader({ request }: Route.LoaderArgs) {
       const custom = canonical ? undefined : (await publishedCustomEntities(getDb(), member.tenant.id)).get(drawerEntity);
       // 兜底统计里是源端的取值，只给有 sources:read 的人
       const fallbacks = canFlow ? Object.fromEntries(Object.entries(last).map(([id, r]) => [id, 'fallback' in r ? r.fallback : undefined])) : {};
-      const fields = entityFields(lineage, drawerEntity, canonical?.fields ?? custom?.fields ?? [], fallbacks);
+      const declared = canonical?.fields ?? custom?.fields ?? [];
+      const fields = entityFields(lineage, drawerEntity, declared, fallbacks);
       const head = { entity: drawerEntity, label: canonical?.label ?? custom?.label ?? drawerEntity, rows: silverTotals(lineage.tables, merges).get(`silver.${drawerEntity}`)?.rows ?? 0 };
       drawer = canFlow ? { ...head, detail: true, fields } : { ...head, detail: false, fields: redactFields(fields) };
+      // 业务说明只写在实体登记的字段上（扩展字段没有）；当前说明是最新一版，任何角色都看得到
+      const history = await entityNoteHistory(getDb(), member.tenant.id, drawerEntity);
+      notes = Object.fromEntries(fields.filter(f => declared.some(d => d.name === f.name)).map(f => {
+        const versions = history.get(f.name) ?? [];
+        return [f.name, { current: versions.at(-1)?.note ?? '', history: versions }];
+      }));
     }
   }
   const inspect = await getInspectStatus(member);
@@ -161,6 +171,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     tab,
     canFlow,
     canWrite: can(member.role, 'sources:write'),
+    canNote: can(member.role, 'definitions:draft'),
     inspect: {
       status: INSPECT_STATUS[inspect.status],
       error: inspect.error,
@@ -171,6 +182,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     flow,
     focus,
     drawer,
+    notes,
     q,
     hitIds,
     tableDrawer,
@@ -203,14 +215,21 @@ async function relationStatsByEdge(tenantId: string, graph: { edges: GraphEdge[]
 
 /**
  * 触发一次漂移检查（intent=inspect），或重建合并一张缺列的标准层表（intent=rebuild，带 entity），都需 sources:write；
- * 不能开始时返回原因（已有检查或合并在排队或运行中、没有映射写入这张表）
+ * 不能开始时返回原因（已有检查或合并在排队或运行中、没有映射写入这张表）。
+ * 在字段抽屉里保存一个实体字段的业务说明（intent=note，带 entity、field、note，空串为清空）需 definitions:draft，保存后回到原来的抽屉
  */
 export async function action({ request }: Route.ActionArgs) {
-  const member = await requirePermission(request, 'sources:write');
   const form = await request.formData();
   const intent = String(form.get('intent') ?? '');
+  const member = await requirePermission(request, intent === 'note' ? 'definitions:draft' : 'sources:write');
   try {
     switch (intent) {
+      case 'note': {
+        const note = form.get('note');
+        await saveBusinessNote(member, { entity: String(form.get('entity') ?? ''), field: String(form.get('field') ?? ''), note: typeof note === 'string' ? note : null });
+        // 回到原来的抽屉；客户端提交时请求地址是 /lineage.data，不能照搬 pathname
+        throw redirect(`/lineage${new URL(request.url).search}`);
+      }
       case 'inspect':
         await inspectLakeNow(member);
         break;
@@ -222,6 +241,7 @@ export async function action({ request }: Route.ActionArgs) {
     }
   } catch (e) {
     if (e instanceof InspectError || e instanceof MappingError) return data({ error: e.message, intent }, { status: 400 });
+    if (e instanceof BusinessNoteError) return data({ error: e.message, intent, field: String(form.get('field') ?? ''), note: String(form.get('note') ?? '') }, { status: 400 });
     if (e instanceof TaskError) return data({ error: e.message, intent }, { status: e.status });
     throw e;
   }
@@ -229,7 +249,7 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function Lineage({ loaderData, actionData }: Route.ComponentProps) {
-  const { tab, canFlow, canWrite, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, edgeStats, showAll, node, sql } = loaderData;
+  const { tab, canFlow, canWrite, canNote, notes, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, edgeStats, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
   const [rawParams] = useSearchParams();
   // 链接里不带不生效的参数：关系图没有反向查，没有 sources:read 时不开源表抽屉
@@ -367,10 +387,15 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
         </>
       )}
 
-      {tab === 'graph' && <InspectSection inspect={inspect} canWrite={canWrite} failure={actionData ?? null} />}
+      {tab === 'graph' && <InspectSection inspect={inspect} canWrite={canWrite} failure={actionData?.intent === 'note' ? null : actionData ?? null} />}
 
       {tableDrawer && <TableDrawer impact={tableDrawer} closeHref={closeDrawerHref} />}
-      {drawer && <LineageDrawer drawer={drawer} closeHref={closeDrawerHref} focusHref={drawer.detail ? `/lineage?tab=flow&focus=${encodeURIComponent(drawer.entity)}` : null} />}
+      {drawer && (
+        <LineageDrawer
+          drawer={drawer} closeHref={closeDrawerHref} focusHref={drawer.detail ? `/lineage?tab=flow&focus=${encodeURIComponent(drawer.entity)}` : null}
+          notes={notes ?? {}} canNote={canNote} noteError={actionData?.intent === 'note' && 'field' in actionData && 'note' in actionData ? { field: String(actionData.field), error: actionData.error, note: String(actionData.note) } : null}
+        />
+      )}
     </AppShell>
   );
 }
