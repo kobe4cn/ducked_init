@@ -56,6 +56,8 @@ const input = (): CatalogInput => ({
       { name: 'manager_phone', type: 'string', expr: 'mgr', sensitive: true },
     ] }),
     plan({ mapping: 'm-erp-orders', version: 4, sourceId: 's-erp', table: 'customers', entity: 'order', columns: [{ name: 'order_id', type: 'string', expr: 'string(id)' }] }),
+    // 读的表已移出同步范围
+    plan({ mapping: 'm-legacy', version: 1, table: 'legacy_orders', columns: [{ name: 'order_id', type: 'string', expr: 'no' }] }),
   ],
   customEntities: [{
     name: 'custom_store', label: '门店', kind: 'dimension', primaryKey: ['store_id'],
@@ -130,10 +132,12 @@ describe('语义目录', () => {
     const order = expand(c, 'entity:order');
     expect(order).toMatchObject({
       kind: 'entity', name: '订单', custom: false, key: ['order_id'],
-      tables: ['table:ERP/customers', 'table:商城/orders'],
+      tables: ['table:ERP/customers', 'table:商城/legacy_orders', 'table:商城/orders'], unscoped: ['table:商城/legacy_orders'],
       mergeGroups: [{ rule: '按优先级', members: ['table:ERP/customers', 'table:商城/orders'] }],
     });
     expect(order && 'fields' in order && order.fields.map(f => f.name)).toEqual(expect.arrayContaining(['status', 'x_coupon_code']));
+    expect(toMarkdown(order!)).toContain('table:商城/legacy_orders（不在同步范围）');
+    expect(expand(c, 'table:商城/legacy_orders')).toBeNull();
     expect(expand(c, 'entity:custom_store')).toMatchObject({ kind: 'entity', name: '门店', custom: true, key: ['store_id'] });
     expect(expand(c, 'field:order.status')).toMatchObject({
       kind: 'field', entity: 'entity:order', name: '订单状态', type: 'string', enum: ['created', 'paid', 'shipped', 'completed', 'cancelled', 'refunded'],

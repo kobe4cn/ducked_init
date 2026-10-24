@@ -42,8 +42,9 @@ export interface FieldSummary { name: string; label: string; type: FieldType; de
 export interface EntityEntry extends Base {
   kind: 'entity'; entity: string; custom: boolean; key: string[];
   fields: FieldSummary[];
-  /** 映射到它的源表与源视图 */
+  /** 映射到它的源表与源视图；unscoped 是其中已不在同步范围（目录里没有这一条）的 */
   tables: string[];
+  unscoped: string[];
   relations: string[];
   /** 作用在它上面的已发布合并组：组员是源表或源视图 */
   mergeGroups: { rule: string; members: string[] }[];
@@ -111,6 +112,8 @@ export function buildCatalog(input: CatalogInput): Catalog {
   const hidden = (entity: string, field: string) => sensitive(entity, field) || isSystemColumn(field);
 
   const entries: CatalogEntry[] = [];
+  // 目录里有的源表与源视图（同步范围内的、已发布的）
+  const listed = new Set((input.tables ?? []).flatMap(t => (sourceName.has(t.sourceId) ? [tableId(sourceName.get(t.sourceId)!, t.name)] : [])));
   const planTable = (p: MergeMappingParam) => tableId(sourceName.get(p.sourceId) ?? p.sourceId, p.table);
 
   // 实体与字段：标准实体与已发布的自定义实体；字段按登记顺序，映射里的扩展字段按名字排在后面
@@ -145,13 +148,13 @@ export function buildCatalog(input: CatalogInput): Catalog {
         lineage: origins.map(s => ({ source: s.sourceName, table: s.table, expr: s.expr, sourceColumns: s.sourceColumns, dictionary: s.dictionary })),
       });
     }
-    const ofEntity = plans.filter(p => p.entity === e.name);
+    const ofEntity = [...new Set(plans.filter(p => p.entity === e.name).map(planTable))].sort(cmp);
     const group = groups.get(e.name);
     const members = group?.members.flatMap(m => plans.filter(p => p.mapping === m && p.entity === e.name).map(planTable)) ?? [];
     entries.push({
       kind: 'entity', id: entityId(e.name), name: e.label, description: e.description, entity: e.name, custom: e.custom, key: e.key,
       fields: fields.map(f => ({ name: f.name, label: f.label, type: f.type, description: f.description })),
-      tables: [...new Set(ofEntity.map(planTable))].sort(cmp),
+      tables: ofEntity, unscoped: ofEntity.filter(id => !listed.has(id)),
       relations: relations.filter(r => r.from.entity === e.name).map(r => relationId(r.from.entity, r.from.field)).sort(cmp),
       mergeGroups: group && members.length ? [{ rule: ruleText(group.rule), members: [...new Set(members)] }] : [],
     });
@@ -283,7 +286,7 @@ function entryMarkdown(e: CatalogEntry): string {
         `- 列：${e.columns.map(c => `${code(c.name)} ${c.type}`).join(', ') || '无'}`].join('\n');
     case 'entity':
       return [...head, `- ${e.custom ? '自定义实体' : '标准实体'} ${code(e.entity)}，主键 ${e.key.map(code).join(', ')}`,
-        `- 映射来源：${e.tables.join(', ') || '未映射'}`,
+        `- 映射来源：${e.tables.map(id => (e.unscoped.includes(id) ? `${id}（不在同步范围）` : id)).join(', ') || '未映射'}`,
         ...(e.relations.length ? [`- 关系：${e.relations.join(', ')}`] : []),
         ...e.mergeGroups.map(g => `- 合并组（${g.rule}）：${g.members.join(' > ')}`),
         '', '| 字段 | 名称 | 类型 | 说明 |', '|---|---|---|---|',
