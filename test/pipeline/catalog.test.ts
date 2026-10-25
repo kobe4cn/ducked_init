@@ -1,5 +1,6 @@
 // test/pipeline/catalog.test.ts —— 语义目录的加载（ADR-0041）：tenantCatalog 从平台库读出数据源、同步范围内的源表、已发布映射与自定义实体，
-// 生成总览与条目；同步范围内还没映射的源表标「未映射」，范围外的不收，敏感字段与它们引用的源列不进目录
+// 生成总览与条目；同步范围内还没映射的源表标「未映射」，范围外的不收，敏感字段与它们引用的源列不进目录；
+// 源表带采集统计，实体带合并行数，字段带所映射源列的源端样本统计
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand, overview, search, toJson, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
@@ -50,5 +51,34 @@ describe('语义目录的加载', () => {
     // 源表 customers 的敏感列：映射成 external_id 的 unionid，名字像敏感信息的 name / mobile / email
     expect(expand(c, 'table:CRM/customers')).toMatchObject({ columns: [{ name: 'id' }, { name: 'updated_at' }] });
     for (const word of ['unionid', 'mobile', 'full_name', 'external_id']) expect(all, word).not.toContain(word);
+  });
+
+  it('源表带采集统计，实体带合并行数，字段带源端样本；敏感列没有取值与范围，统计不进总览', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await drain();
+    const c = await tenantCatalog(acme);
+
+    const orders = expand(c, 'table:CRM/orders');
+    expect(orders).toMatchObject({ stats: { rows: 6, sampleRows: 6, at: expect.any(String) } });
+    const cols = orders?.kind === 'table' ? orders.stats!.columns : [];
+    expect(cols.find(col => col.name === 'status')).toMatchObject({ nullRate: 0, top: [{ value: 'paid', rows: 5 }, { value: 'refunded', rows: 1 }] });
+    expect(cols.find(col => col.name === 'created_at')).toMatchObject({ range: { min: expect.stringContaining('2024-04-01'), max: expect.stringContaining('2024-06-30') } });
+    expect(cols.find(col => col.name === 'order_no')).not.toHaveProperty('range');
+    expect(toMarkdown(orders!)).toContain('（采集时间）');
+
+    // CRM 6 行加会员 5 行
+    expect(expand(c, 'entity:order')).toMatchObject({ stats: { rows: 11, at: expect.any(String) } });
+    expect(toMarkdown(expand(c, 'entity:order')!)).toContain('（最近一次合并）');
+    expect(expand(c, 'field:order.status')).toMatchObject({ lineage: expect.arrayContaining([
+      expect.objectContaining({ source: 'CRM', table: 'orders', sample: [expect.objectContaining({ name: 'status', top: [{ value: 'paid', rows: 5 }, { value: 'refunded', rows: 1 }] })] }),
+    ]) });
+    expect(toMarkdown(expand(c, 'field:order.status')!)).toContain('源端样本 `status`');
+
+    // 映射成 external_id 的 unionid（列名不像敏感信息，采集时照样存了取值）与像敏感信息的列不出现
+    const customers = expand(c, 'table:CRM/customers');
+    expect(customers?.kind === 'table' && customers.stats!.columns.map(col => col.name)).toEqual(['id', 'updated_at']);
+    const all = [toMarkdown(overview(c)), toJson(overview(c)), ...c.entries.flatMap(e => [toMarkdown(e), toJson(e)])].join('\n');
+    for (const word of ['wx_union_8', '张三', '13800000002', 'zhang@crm.test']) expect(all, word).not.toContain(word);
+    expect(toJson(overview(c))).not.toMatch(/采集时间|最近一次合并|nullRate|sampleRows|"top"/);
   });
 });
