@@ -122,7 +122,7 @@ describe('语义目录', () => {
       'source:商城', 'source:ERP', 'table:商城/orders', 'table:ERP/v_stores', 'entity:order', 'entity:custom_store', 'field:order.status',
       'field:order.x_coupon_code', 'relation:order.customer_id',
     ]));
-    expect(a.ids.every(id => /^(source|table|entity|field|relation):/.test(id) && !/m-order|\bv\d/.test(id))).toBe(true);
+    expect(a.ids.every(id => /^(source|table|entity|field|relation|metric|tag|template|capability):/.test(id) && !/m-order|\bv\d/.test(id))).toBe(true);
   });
 
   it('总览每项一行（标识、名称、说明截到 40 字），实体附字段名，估算不超过 4000 token', () => {
@@ -249,6 +249,39 @@ describe('语义目录', () => {
     expect(ov(withStats())).toBe(ov(input()));
     expect(ov(withStats(999))).toBe(ov(withStats()));
     expect(toJson(overview(buildCatalog(withStats(999))))).toBe(toJson(overview(buildCatalog(input()))));
+  });
+
+  it('已发布的指标、标签与模板产出：总览列出，按标识展开给键、说明、度量 / 取值、依赖与产出列，搜索命中指标说明；快照变了总览不变', () => {
+    const withDefinitions = (rows = 1200): CatalogInput => ({
+      ...input(),
+      definitions: [
+        { kind: 'metric', key: 'revenue', version: 2, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\nfilter:\n  - { field: status, op: eq, value: paid }\ndescription: 已支付订单的消费金额\n' },
+        { kind: 'metric', key: 'store_orders', version: 1, yaml: 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: store, path: order.store_id -> custom_store.name }\n' },
+        { kind: 'tag', key: 'spender', version: 1, yaml: 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1000 } }\ndefault: low\n' },
+      ],
+      templates: [{ template: 'rfm', version: 1, params: { lookbackDays: 365 }, snapshot: { table: 'gold.rfm__t1', rows, at: '2026-10-01T00:00:00.000Z' } }],
+    });
+    const c = buildCatalog(withDefinitions());
+    expect(expand(c, 'metric:revenue')).toEqual({
+      kind: 'metric', id: 'metric:revenue', name: 'revenue', description: '已支付订单的消费金额', key: 'revenue', version: 2,
+      base: 'entity:order', measure: 'sum(amount)', dimensions: [],
+      dependencies: { metrics: [], entities: ['entity:order'], fields: ['field:order.amount', 'field:order.status'] },
+    });
+    expect(expand(c, 'metric:store_orders')).toMatchObject({ measure: 'count()', dimensions: ['store'], description: '' });
+    expect(expand(c, 'tag:spender')).toMatchObject({ values: ['high', 'low'], dependencies: { metrics: ['metric:revenue'], entities: [], fields: [] } });
+    expect(expand(c, 'template:rfm')).toMatchObject({
+      name: 'RFM 分层', params: { lookbackDays: 365 }, entities: ['entity:order', 'entity:customer'],
+      columns: expect.arrayContaining([{ name: 'segment', type: 'VARCHAR', description: expect.any(String) }]),
+      snapshot: { table: 'gold.rfm__t1', rows: 1200, at: '2026-10-01T00:00:00.000Z' },
+    });
+    expect(expand(c, 'template:clv')).toBeNull();
+    expect(toMarkdown(expand(c, 'metric:revenue')!)).toContain('度量 `sum(amount)`');
+    expect(toMarkdown(expand(c, 'template:rfm')!)).toContain('`gold.rfm__t1`，1200 行');
+
+    const ov = toMarkdown(overview(c));
+    for (const id of ['metric:revenue', 'metric:store_orders', 'tag:spender', 'template:rfm', 'capability:metric-dsl']) expect(ov).toContain(`- ${id} `);
+    expect(search(c, '消费金额')[0]?.id).toBe('metric:revenue');
+    expect(toJson(overview(buildCatalog(withDefinitions(5))))).toBe(toJson(overview(c)));
   });
 
   it('敏感字段、哈希列与系统列不出现在任何输出里', () => {

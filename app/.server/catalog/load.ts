@@ -1,13 +1,16 @@
 // app/.server/catalog/load.ts —— 从平台库读出生成语义目录（ADR-0041）的元数据：数据源、同步范围内的源表（带最近一次采集到的列）、
-// 已发布源视图（带输出列）、已发布映射、自定义实体与合并组，以及源表的采集统计与实体的合并行数
+// 已发布源视图（带输出列）、已发布映射、自定义实体与合并组，以及源表的采集统计与实体的合并行数；
+// 已发布的指标与标签（每个键最新的已发布版本）、已发布的模板定义与各模板最近一次没过期的快照
 import { and, desc, eq, isNull, sql } from 'drizzle-orm';
 import type { Tx } from '../audit';
 import { publishedCustomEntities } from '../custom-entities';
 import { getDb } from '../db/client';
-import { sources, sourceTables, sourceViews, sourceViewVersions, tasks } from '../db/schema';
+import { snapshots, sources, sourceTables, sourceViews, sourceViewVersions, tasks, templateDefinitions, templateVersions } from '../db/schema';
+import { publishedDependents } from '../dsl-dependencies';
 import { lastMergeByMapping, publishedPlans } from '../mappings';
 import { publishedMergeGroups } from '../merge-groups';
 import type { TableProfile } from '../pipeline/source-engine';
+import { TEMPLATES, type TemplateId } from '../pipeline/templates';
 import { buildCatalog, type CatalogInput } from './index';
 
 /** 本租户生成目录用的元数据 */
@@ -50,6 +53,22 @@ export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenant
     const s = statsByEntity.get(p.entity);
     statsByEntity.set(p.entity, { entity: p.entity, rows: (s?.rows ?? 0) + r.rows, at: s && s.at > at ? s.at : at });
   }
+  const definitions = (await publishedDependents(db, tenantId)).map(d => ({ kind: d.kind, key: d.key, version: d.version, yaml: d.yaml }));
+  const publishedTemplates = await db
+    .selectDistinctOn([templateVersions.definitionId], { template: templateDefinitions.template, version: templateVersions.version, params: templateVersions.params })
+    .from(templateVersions)
+    .innerJoin(templateDefinitions, eq(templateDefinitions.id, templateVersions.definitionId))
+    .where(and(eq(templateDefinitions.tenantId, tenantId), eq(templateVersions.status, 'published')))
+    .orderBy(templateVersions.definitionId, desc(templateVersions.version));
+  const latestSnapshots = await db
+    .selectDistinctOn([snapshots.template], { template: snapshots.template, table: snapshots.table, rows: snapshots.rowCount, at: snapshots.createdAt })
+    .from(snapshots)
+    .where(and(eq(snapshots.tenantId, tenantId), isNull(snapshots.expiredAt)))
+    .orderBy(snapshots.template, desc(snapshots.createdAt), desc(snapshots.id));
+  const templates = publishedTemplates.filter(t => Object.hasOwn(TEMPLATES, t.template)).map(t => {
+    const s = latestSnapshots.find(x => x.template === t.template);
+    return { template: t.template as TemplateId, version: t.version, params: t.params, snapshot: s ? { table: s.table, rows: s.rows, at: s.at.toISOString() } : null };
+  });
   return {
     sources: rows,
     tables,
@@ -58,6 +77,8 @@ export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenant
     plans,
     customEntities: [...(await publishedCustomEntities(db, tenantId)).values()],
     mergeGroups: [...(await publishedMergeGroups(db, tenantId)).entries()].map(([entity, g]) => ({ entity, ...g })),
+    definitions,
+    templates,
   };
 }
 

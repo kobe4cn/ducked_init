@@ -1,10 +1,11 @@
 // test/pipeline/catalog.test.ts —— 语义目录的加载（ADR-0041）：tenantCatalog 从平台库读出数据源、同步范围内的源表、已发布映射与自定义实体，
 // 生成总览与条目；同步范围内还没映射的源表标「未映射」，范围外的不收，敏感字段与它们引用的源列不进目录；
-// 源表带采集统计，实体带合并行数，字段带所映射源列的源端样本统计
+// 源表带采集统计，实体带合并行数，字段带所映射源列的源端样本统计；发布的指标能展开、能按说明搜到，模板带产出列与最近一次快照
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand, overview, search, toJson, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { closeDb } from '../../app/.server/db/client';
+import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { relistSource, setSyncScope } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
@@ -80,5 +81,30 @@ describe('语义目录的加载', () => {
     const all = [toMarkdown(overview(c)), toJson(overview(c)), ...c.entries.flatMap(e => [toMarkdown(e), toJson(e)])].join('\n');
     for (const word of ['wx_union_8', '张三', '13800000002', 'zhang@crm.test']) expect(all, word).not.toContain(word);
     expect(toJson(overview(c))).not.toMatch(/采集时间|最近一次合并|nullRate|sampleRows|"top"/);
+  });
+
+  it('发布的指标取最新发布版：能展开、能按说明搜到，草稿不算；自动启用的模板带产出列与快照', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    await createDefinition(author, 'metric', 'paid_revenue', 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 旧口径\n');
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 1);
+    await saveDslDraft(author, 'metric', 'paid_revenue', 'base: order\nmeasure: { agg: sum, field: amount }\nfilter:\n  - { field: status, op: eq, value: paid }\ndescription: 已支付订单的实付金额\n');
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 2);
+    await saveDslDraft(author, 'metric', 'paid_revenue', 'base: order\nmeasure: { agg: count }\ndescription: 草稿口径\n');
+    await drain();
+
+    const c = await tenantCatalog(acme);
+    expect(expand(c, 'metric:paid_revenue')).toMatchObject({
+      version: 2, description: '已支付订单的实付金额', measure: 'sum(amount)',
+      dependencies: { entities: ['entity:order'], fields: ['field:order.amount', 'field:order.status'] },
+    });
+    expect(search(c, '已支付 实付金额')[0]?.id).toBe('metric:paid_revenue');
+    expect(toMarkdown(overview(c))).toContain('- metric:paid_revenue paid_revenue — 已支付订单的实付金额');
+    expect(toJson(c.entries)).not.toMatch(/旧口径|草稿口径/);
+    // 映射合并后平台自动启用的模板：产出列与最近一次快照
+    expect(expand(c, 'template:rfm')).toMatchObject({
+      version: 1, entities: ['entity:order', 'entity:customer'], columns: expect.arrayContaining([expect.objectContaining({ name: 'segment' })]),
+      snapshot: { table: expect.stringMatching(/^gold\.rfm__/), rows: expect.any(Number), at: expect.any(String) },
+    });
+    expect(toMarkdown(overview(c))).toContain('- template:rfm RFM 分层');
   });
 });

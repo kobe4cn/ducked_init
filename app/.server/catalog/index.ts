@@ -1,7 +1,10 @@
 // app/.server/catalog/index.ts —— 语义目录（ADR-0041）：按本租户的元数据（数据源、同步范围内的源表与已发布源视图、已发布映射、
-// 自定义实体与合并组）确定性地生成条目，给出总览、按稳定标识展开与关键词搜索，结果可渲染成 Markdown 与 JSON。
+// 自定义实体与合并组、已发布的指标与标签、已发布的模板及其快照）与平台能力说明（capabilities.ts）确定性地生成条目，
+// 给出总览、按稳定标识展开与关键词搜索，结果可渲染成 Markdown 与 JSON。
 // 纯函数，不连库（加载见 load.ts）。敏感字段、哈希列与系统列不进目录（ADR-0005）；同步范围外的源表不收（ADR-0013）。
-// 源表、实体与字段展开时带统计与截至时间（行数、空值率、日期 / 时间列的范围与 ADR-0016 的常见取值），统计不进总览
+// 源表、实体与字段展开时带统计与截至时间（行数、空值率、日期 / 时间列的范围与 ADR-0016 的常见取值），统计不进总览。
+// 定义条目只给键、说明、度量 / 取值与依赖，不给结果数据；模板条目给产出列与最近一次快照的表名、行数与时间
+import { parse } from 'yaml';
 import { CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, type CustomEntityField, type EntityRelation, type FieldType } from '../../lib/canonical-model';
 import { cmp, deriveLineage } from '../../lib/lineage';
 import { entityFields } from '../../lib/lineage-fields';
@@ -10,11 +13,16 @@ import { looksSensitive } from '../../lib/sensitive';
 import type { RegisteredEntity } from '../custom-entities';
 import type { PublishedMergeGroup } from '../merge-groups';
 import { isSensitiveField } from '../mappings';
+import { DSL_KINDS, type DslKind } from '../pipeline/dsl';
+import type { MetricSpec } from '../pipeline/dsl/metric-spec';
+import type { TagSpec } from '../pipeline/dsl/tag-spec';
+import { TEMPLATES, type TemplateId } from '../pipeline/templates';
 import { SILVER_SYSTEM_COLUMNS, type MergeMappingParam } from '../pipeline/merge-engine';
 import type { ColumnProfile } from '../pipeline/source-engine';
 import { PLATFORM_COLUMNS } from '../pipeline/sync-engine';
+import { CAPABILITIES, TEMPLATE_OUTPUTS } from './capabilities';
 
-/** 生成目录的元数据；后续会加定义与业务说明，所以各部分都可以不给 */
+/** 生成目录的元数据；后续会加业务说明，所以各部分都可以不给 */
 export interface CatalogInput {
   sources?: { id: string; name: string; kind: string }[];
   /** 同步范围内（源端仍在且可读）的源表与已发布的源视图；columns 是最近一次采集到的列（源视图是输出列） */
@@ -32,7 +40,14 @@ export interface CatalogInput {
   }[];
   /** 各实体在标准层的行数（最近一次合并成功的各映射之和）与最近一次合并时间 */
   entityStats?: { entity: string; rows: number; at: string }[];
+  /** 已发布的指标与标签：每个键最新的已发布版本的 YAML（发布时已校验过） */
+  definitions?: { kind: DslKind; key: string; version: number; yaml: string }[];
+  /** 已发布的模板定义（最新的已发布版本的参数）与最近一次没过期的快照 */
+  templates?: { template: TemplateId; version: number; params: Record<string, unknown>; snapshot: TemplateSnapshot | null }[];
 }
+
+/** 模板最近一次没过期的快照：表名、行数与登记时间 */
+export interface TemplateSnapshot { table: string; rows: number; at: string }
 
 /** 一列在源端样本里的统计：时间范围只有日期 / 时间列有，常见取值只有低基数、不像敏感信息的文本列有 */
 export interface ColumnStats { name: string; nullRate: number; range?: { min: string; max: string }; top?: { value: string; rows: number }[] }
@@ -82,7 +97,44 @@ export interface FieldEntry extends Base {
 
 export interface RelationEntry extends Base { kind: 'relation'; from: string; to: string }
 
-export type CatalogEntry = SourceEntry | TableEntry | EntityEntry | FieldEntry | RelationEntry;
+/** 定义的依赖：引用的指标、用到的实体与字段（都是目录标识） */
+export interface DefinitionDependencies { metrics: string[]; entities: string[]; fields: string[] }
+
+export interface MetricEntry extends Base {
+  kind: 'metric'; key: string; version: number; base: string;
+  /** 度量，如 sum(amount)、ratio(count / count) */
+  measure: string;
+  dimensions: string[];
+  dependencies: DefinitionDependencies;
+}
+
+export interface TagEntry extends Base {
+  kind: 'tag'; key: string; version: number;
+  /** 规则与 default 给出的取值，按出现顺序去重 */
+  values: (string | number)[];
+  dependencies: DefinitionDependencies;
+}
+
+export interface TemplateEntry extends Base {
+  kind: 'template'; template: string; version: number; params: Record<string, unknown>; entities: string[];
+  columns: OutputColumn[];
+  /** 还没有没过期的快照时为 null */
+  snapshot: TemplateSnapshot | null;
+}
+
+/** 模板产出的一列 */
+export interface OutputColumn { name: string; type: string; description: string }
+
+export interface CapabilityItem { name: string; type?: string; description: string }
+
+export interface CapabilityEntry extends Base {
+  kind: 'capability';
+  sections: { title: string; items: CapabilityItem[] }[];
+  examples: { key: string; yaml: string; note: string }[];
+}
+
+export type CatalogEntry =
+  | SourceEntry | TableEntry | EntityEntry | FieldEntry | RelationEntry | MetricEntry | TagEntry | TemplateEntry | CapabilityEntry;
 
 /** 按标识排好序的全部条目 */
 export interface Catalog { entries: CatalogEntry[] }
@@ -118,6 +170,9 @@ const tableId = (source: string, table: string) => `table:${source}/${table}`;
 const entityId = (entity: string) => `entity:${entity}`;
 const fieldId = (entity: string, field: string) => `field:${entity}.${field}`;
 const relationId = (entity: string, field: string) => `relation:${entity}.${field}`;
+const metricId = (key: string) => `metric:${key}`;
+const tagId = (key: string) => `tag:${key}`;
+const templateEntryId = (id: string) => `template:${id}`;
 
 const byId = <T extends { id: string }>(a: T, b: T) => cmp(a.id, b.id);
 
@@ -258,7 +313,50 @@ export function buildCatalog(input: CatalogInput): Catalog {
     });
   }
 
+  // 已发布的指标与标签：YAML 发布时已校验过，可选的部分（说明、维度）没写时按缺省取
+  const dependencyIds = (d: ReturnType<(typeof DSL_KINDS)[DslKind]['dependencies']>): DefinitionDependencies => ({
+    metrics: d.metrics.map(metricId),
+    entities: d.entities.map(entityId),
+    fields: d.fields.filter(f => !hidden(f.entity, f.field)).map(f => fieldId(f.entity, f.field)),
+  });
+  const descriptionOf = (spec: { description?: unknown } | null) => (typeof spec?.description === 'string' ? spec.description : '');
+  for (const d of input.definitions ?? []) {
+    if (d.kind === 'metric') {
+      const spec = parse(d.yaml) as MetricSpec;
+      entries.push({
+        kind: 'metric', id: metricId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version,
+        base: entityId(spec.base), measure: measureText(spec.measure), dimensions: (spec.dimensions ?? []).map(x => x.name),
+        dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)),
+      });
+    } else {
+      const spec = parse(d.yaml) as TagSpec;
+      const values = [...(Array.isArray(spec.rules) ? spec.rules.map(r => r?.value) : []), spec.default].filter(v => typeof v === 'string' || typeof v === 'number');
+      entries.push({
+        kind: 'tag', id: tagId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version,
+        values: [...new Set(values)], dependencies: dependencyIds(DSL_KINDS.tag.dependencies(spec)),
+      });
+    }
+  }
+
+  for (const t of input.templates ?? []) {
+    if (!Object.hasOwn(TEMPLATES, t.template)) continue;
+    entries.push({
+      kind: 'template', id: templateEntryId(t.template), name: TEMPLATES[t.template].label, description: TEMPLATE_OUTPUTS[t.template].description,
+      template: t.template, version: t.version, params: t.params, entities: TEMPLATES[t.template].entities.map(entityId),
+      columns: TEMPLATE_OUTPUTS[t.template].columns, snapshot: t.snapshot,
+    });
+  }
+
+  entries.push(...CAPABILITIES);
   return { entries: entries.sort(byId) };
+}
+
+/** 度量的简写：agg(field)，ratio 写成 ratio(分子 / 分母)，latest / earliest 带 by */
+function measureText(m: MetricSpec['measure'] | undefined): string {
+  if (!m) return '';
+  const part = (p: { agg: string; field?: string } | undefined) => (p ? `${p.agg}${p.field ? `(${p.field})` : ''}` : '?');
+  if (m.agg === 'ratio') return `ratio(${part(m.numerator)} / ${part(m.denominator)})`;
+  return `${m.agg}(${[m.field, ...(m.by ? [`by ${m.by}`] : [])].filter(Boolean).join(', ')})`;
 }
 
 const truncate = (text: string, chars = SUMMARY_CHARS) => {
@@ -305,8 +403,13 @@ function terms(query: string): string[] {
   return [...out];
 }
 
-/** 条目参与搜索的文字：标识、名称、说明与枚举取值 */
-const haystack = (e: CatalogEntry) => [e.id, e.name, e.description, ...(e.kind === 'field' ? (e.enum ?? []) : [])].join('\n').toLowerCase();
+/** 条目参与搜索的文字：标识、名称、说明、枚举与标签取值，能力说明再加各项说明 */
+const haystack = (e: CatalogEntry) => [
+  e.id, e.name, e.description,
+  ...(e.kind === 'field' ? (e.enum ?? []) : []),
+  ...(e.kind === 'tag' ? e.values.map(String) : []),
+  ...(e.kind === 'capability' ? e.sections.flatMap(s => [s.title, ...s.items.flatMap(i => [i.name, i.description])]) : []),
+].join('\n').toLowerCase();
 
 /** 按关键词搜索：得分是命中的词数，同分按标识排；返回展开后的条目 */
 export function search(c: Catalog, query: string, limit = 20): CatalogEntry[] {
@@ -376,8 +479,28 @@ function entryMarkdown(e: CatalogEntry): string {
           : ['- 来源：未映射'])].join('\n');
     case 'relation':
       return [...head, `- ${e.from} → ${e.to}`].join('\n');
+    case 'metric':
+      return [...head, `- 指标 ${code(e.key)}（第 ${e.version} 版），基础实体 ${e.base}，度量 ${code(e.measure)}`,
+        ...(e.dimensions.length ? [`- 维度：${e.dimensions.map(code).join(', ')}`] : []), ...dependenciesMarkdown(e.dependencies)].join('\n');
+    case 'tag':
+      return [...head, `- 标签 ${code(e.key)}（第 ${e.version} 版），取值 ${e.values.map(v => code(String(v))).join(', ')}`,
+        ...dependenciesMarkdown(e.dependencies)].join('\n');
+    case 'template':
+      return [...head, `- 模板 ${code(e.template)}（定义第 ${e.version} 版），读 ${e.entities.join(', ')}`, `- 参数：${code(JSON.stringify(e.params))}`,
+        `- 快照：${e.snapshot ? `${code(e.snapshot.table)}，${e.snapshot.rows} 行，截至 ${e.snapshot.at}` : '还没有快照'}`,
+        '', '| 产出列 | 类型 | 说明 |', '|---|---|---|', ...e.columns.map(c => `| ${code(c.name)} | ${c.type} | ${c.description} |`)].join('\n');
+    case 'capability':
+      return [...head,
+        ...e.sections.flatMap(s => [`### ${s.title}`, '', ...s.items.map(i => `- ${code(i.name)}${i.type ? ` ${i.type}` : ''}：${i.description}`), '']),
+        ...e.examples.flatMap(x => [`### 示例 ${x.key}：${x.note}`, '', '```yaml', x.yaml.trimEnd(), '```', ''])].join('\n').trimEnd();
   }
 }
+
+const dependenciesMarkdown = (d: DefinitionDependencies) => [
+  ...(d.metrics.length ? [`- 引用指标：${d.metrics.join(', ')}`] : []),
+  ...(d.entities.length ? [`- 用到实体：${d.entities.join(', ')}`] : []),
+  ...(d.fields.length ? [`- 用到字段：${d.fields.join(', ')}`] : []),
+];
 
 /** 可渲染的结果：总览、单个条目或搜索结果 */
 export type Renderable = Overview | CatalogEntry | CatalogEntry[];
