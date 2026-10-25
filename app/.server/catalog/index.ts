@@ -1,11 +1,13 @@
 // app/.server/catalog/index.ts —— 语义目录（ADR-0041）：按本租户的元数据（数据源、同步范围内的源表与已发布源视图、已发布映射、
-// 自定义实体与合并组、已发布的指标与标签、已发布的模板及其快照）与平台能力说明（capabilities.ts）确定性地生成条目，
+// 自定义实体与合并组、已发布的指标与标签、已发布的模板及其快照、业务说明）与平台能力说明（capabilities.ts）确定性地生成条目，
 // 给出总览、按稳定标识展开与关键词搜索，结果可渲染成 Markdown 与 JSON。
 // 纯函数，不连库（加载见 load.ts）。敏感字段、哈希列与系统列不进目录（ADR-0005）；同步范围外的源表不收（ADR-0013）。
 // 源表、实体与字段展开时带统计与截至时间（行数、空值率、日期 / 时间列的范围与 ADR-0016 的常见取值），统计不进总览。
-// 定义条目只给键、说明、度量 / 取值与依赖，不给结果数据；模板条目给产出列与最近一次快照的表名、行数与时间
+// 定义条目只给键、说明、度量 / 取值与依赖，不给结果数据；模板条目给产出列与最近一次快照的表名、行数与时间。
+// 字段带实体字段的业务说明，各映射血缘带映射字段的业务说明（当前内容，清空的不给），都参与搜索、不进总览
 import { parse } from 'yaml';
 import { CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, type CustomEntityField, type EntityRelation, type FieldType } from '../../lib/canonical-model';
+import { noteKey } from '../../lib/business-note-key';
 import { cmp, deriveLineage } from '../../lib/lineage';
 import { entityFields } from '../../lib/lineage-fields';
 import { ruleText } from '../../lib/merge-groups';
@@ -22,7 +24,7 @@ import type { ColumnProfile } from '../pipeline/source-engine';
 import { PLATFORM_COLUMNS } from '../pipeline/sync-engine';
 import { CAPABILITIES, TEMPLATE_OUTPUTS } from './capabilities';
 
-/** 生成目录的元数据；后续会加业务说明，所以各部分都可以不给 */
+/** 生成目录的元数据；各部分都可以不给 */
 export interface CatalogInput {
   sources?: { id: string; name: string; kind: string }[];
   /** 同步范围内（源端仍在且可读）的源表与已发布的源视图；columns 是最近一次采集到的列（源视图是输出列） */
@@ -44,6 +46,8 @@ export interface CatalogInput {
   definitions?: { kind: DslKind; key: string; version: number; yaml: string }[];
   /** 已发布的模板定义（最新的已发布版本的参数）与最近一次没过期的快照 */
   templates?: { template: TemplateId; version: number; params: Record<string, unknown>; snapshot: TemplateSnapshot | null }[];
+  /** 业务说明的当前内容（currentNotes）：键是 noteKey，空串是已清空 */
+  notes?: ReadonlyMap<string, string>;
 }
 
 /** 模板最近一次没过期的快照：表名、行数与登记时间 */
@@ -89,10 +93,14 @@ export interface FieldLineageItem {
   source: string; table: string; expr: string; sourceColumns: string[]; dictionary: boolean;
   /** 所映射源列的源端样本统计（标准层字段没有自己的统计）；源表没采集过、读源视图或列不进目录时没有 */
   sample: ColumnStats[];
+  /** 映射字段的业务说明：这个数据源在这个字段上的特殊之处；没有或已清空时没有 */
+  note?: string;
 }
 
 export interface FieldEntry extends Base {
   kind: 'field'; entity: string; field: string; type: FieldType; enum?: string[]; lineage: FieldLineageItem[];
+  /** 实体字段的业务说明（本租户的口径）；没有或已清空时没有 */
+  note?: string;
 }
 
 export interface RelationEntry extends Base { kind: 'relation'; from: string; to: string }
@@ -239,6 +247,8 @@ export function buildCatalog(input: CatalogInput): Catalog {
     ...custom.flatMap(e => e.relations ?? []),
   ].filter(r => !hidden(r.from.entity, r.from.field) && !hidden(r.ref.entity, r.ref.field));
   const groups = new Map((input.mergeGroups ?? []).map(g => [g.entity, g]));
+  // 业务说明的当前内容；空串（已清空）当作没有。敏感字段整个不进目录，说明也就不进
+  const note = (entity: string, field: string, mapping: string | null = null) => input.notes?.get(noteKey(entity, field, mapping)) || undefined;
 
   for (const e of entities) {
     const mapped = entityFields(lineage, e.name, e.declared, {});
@@ -249,15 +259,18 @@ export function buildCatalog(input: CatalogInput): Catalog {
     const fields = [...e.declared, ...extensions].filter(f => !hidden(e.name, f.name));
     for (const f of fields) {
       const origins = mapped.find(m => m.name === f.name)?.sources ?? [];
+      const fieldNote = note(e.name, f.name);
       entries.push({
         kind: 'field', id: fieldId(e.name, f.name), name: f.label, description: f.description,
-        entity: entityId(e.name), field: f.name, type: f.type, ...(f.enum && { enum: f.enum }),
+        entity: entityId(e.name), field: f.name, type: f.type, ...(f.enum && { enum: f.enum }), ...(fieldNote && { note: fieldNote }),
         lineage: origins.map(s => {
           const p = plans.find(x => x.mapping === s.mapping);
           const stats = p && !p.sourceView ? statsByTable.get(tableKey(p.sourceId, p.table)) : undefined;
+          const mappingNote = note(e.name, f.name, s.mapping);
           return {
             source: s.sourceName, table: s.table, expr: s.expr, sourceColumns: s.sourceColumns, dictionary: s.dictionary,
             sample: s.sourceColumns.flatMap(name => stats?.columns.filter(c => c.name === name) ?? []),
+            ...(mappingNote && { note: mappingNote }),
           };
         }),
       });
@@ -403,10 +416,10 @@ function terms(query: string): string[] {
   return [...out];
 }
 
-/** 条目参与搜索的文字：标识、名称、说明、枚举与标签取值，能力说明再加各项说明 */
+/** 条目参与搜索的文字：标识、名称、说明、枚举与标签取值，字段再加业务说明与各映射字段说明，能力说明再加各项说明 */
 const haystack = (e: CatalogEntry) => [
   e.id, e.name, e.description,
-  ...(e.kind === 'field' ? (e.enum ?? []) : []),
+  ...(e.kind === 'field' ? [...(e.enum ?? []), e.note ?? '', ...e.lineage.map(l => l.note ?? '')] : []),
   ...(e.kind === 'tag' ? e.values.map(String) : []),
   ...(e.kind === 'capability' ? e.sections.flatMap(s => [s.title, ...s.items.flatMap(i => [i.name, i.description])]) : []),
 ].join('\n').toLowerCase();
@@ -473,8 +486,10 @@ function entryMarkdown(e: CatalogEntry): string {
     case 'field':
       return [...head, `- 实体：${e.entity}，字段 ${code(e.field)}，类型 ${e.type}`,
         ...(e.enum ? [`- 取值：${e.enum.map(code).join(', ')}`] : []),
+        ...(e.note ? [`- 业务说明：${e.note}`] : []),
         ...(e.lineage.length
           ? ['- 来源：', ...e.lineage.flatMap(l => [`  - ${l.source}/${l.table}：${code(l.expr)}${l.dictionary ? '（经值字典）' : ''}`,
+            ...(l.note ? [`    - 映射说明：${l.note}`] : []),
             ...l.sample.map(c => `    - 源端样本 ${code(c.name)}：${columnStatsText(c)}`)])]
           : ['- 来源：未映射'])].join('\n');
     case 'relation':

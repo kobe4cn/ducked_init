@@ -1,8 +1,9 @@
 // app/.server/catalog/load.ts —— 从平台库读出生成语义目录（ADR-0041）的元数据：数据源、同步范围内的源表（带最近一次采集到的列）、
 // 已发布源视图（带输出列）、已发布映射、自定义实体与合并组，以及源表的采集统计与实体的合并行数；
-// 已发布的指标与标签（每个键最新的已发布版本）、已发布的模板定义与各模板最近一次没过期的快照
+// 已发布的指标与标签（每个键最新的已发布版本）、已发布的模板定义与各模板最近一次没过期的快照，以及各业务说明的当前内容
 import { and, desc, eq, isNull, sql } from 'drizzle-orm';
 import type { Tx } from '../audit';
+import { currentNotes } from '../business-notes';
 import { publishedCustomEntities } from '../custom-entities';
 import { getDb } from '../db/client';
 import { snapshots, sources, sourceTables, sourceViews, sourceViewVersions, tasks, templateDefinitions, templateVersions } from '../db/schema';
@@ -79,6 +80,7 @@ export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenant
     mergeGroups: [...(await publishedMergeGroups(db, tenantId)).entries()].map(([entity, g]) => ({ entity, ...g })),
     definitions,
     templates,
+    notes: await currentNotes(db, tenantId),
   };
 }
 

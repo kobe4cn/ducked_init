@@ -1,9 +1,11 @@
 // test/pipeline/catalog.test.ts —— 语义目录的加载（ADR-0041）：tenantCatalog 从平台库读出数据源、同步范围内的源表、已发布映射与自定义实体，
 // 生成总览与条目；同步范围内还没映射的源表标「未映射」，范围外的不收，敏感字段与它们引用的源列不进目录；
-// 源表带采集统计，实体带合并行数，字段带所映射源列的源端样本统计；发布的指标能展开、能按说明搜到，模板带产出列与最近一次快照
+// 源表带采集统计，实体带合并行数，字段带所映射源列的源端样本统计；发布的指标能展开、能按说明搜到，模板带产出列与最近一次快照；
+// 实体字段与映射字段的业务说明保存后马上进目录、能搜到，清空后不再出现，敏感字段的说明不进目录
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand, overview, search, toJson, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
+import { saveBusinessNote } from '../../app/.server/business-notes';
 import { closeDb } from '../../app/.server/db/client';
 import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -106,5 +108,35 @@ describe('语义目录的加载', () => {
       snapshot: { table: expect.stringMatching(/^gold\.rfm__/), rows: expect.any(Number), at: expect.any(String) },
     });
     expect(toMarkdown(overview(c))).toContain('- template:rfm RFM 分层');
+  });
+
+  it('业务说明保存后不需要发布就进目录：实体字段说明在字段上，映射字段说明在各自的血缘下，能搜到；清空后不出现，敏感字段的说明不进目录', async () => {
+    const { acme, author, mappings, orderMappings } = await publishedIdentitySources({ orders: true });
+    await saveBusinessNote(author, { entity: 'order', field: 'status', note: '退款单也算一笔订单，状态记为 refunded' });
+    await saveBusinessNote(author, { entity: 'order', field: 'status', mappingId: orderMappings!.loyalty, note: '会员系统的取消单不进同步' });
+    await saveBusinessNote(author, { entity: 'customer', field: 'name', note: '机密口径甲乙丙' });
+    await saveBusinessNote(author, { entity: 'customer', field: 'name', mappingId: mappings.crm, note: '机密口径丁戊己' });
+
+    let c = await tenantCatalog(acme);
+    const status = expand(c, 'field:order.status');
+    expect(status).toMatchObject({ note: '退款单也算一笔订单，状态记为 refunded' });
+    const lineage = status?.kind === 'field' ? status.lineage : [];
+    expect(lineage.find(l => l.source === '会员')).toMatchObject({ note: '会员系统的取消单不进同步' });
+    expect(lineage.find(l => l.source === 'CRM')).not.toHaveProperty('note');
+    const md = toMarkdown(status!);
+    expect(md).toContain('退款单也算一笔订单');
+    expect(md).toContain('会员系统的取消单不进同步');
+    expect(search(c, '退款单')[0]?.id).toBe('field:order.status');
+    expect(search(c, '取消单')[0]?.id).toBe('field:order.status');
+    const all = [toMarkdown(overview(c)), toJson(overview(c)), ...c.entries.flatMap(e => [toMarkdown(e), toJson(e)])].join('\n');
+    expect(all).not.toContain('机密口径');
+    expect(search(c, '机密口径')).toEqual([]);
+
+    await saveBusinessNote(author, { entity: 'order', field: 'status', note: '' });
+    await saveBusinessNote(author, { entity: 'order', field: 'status', mappingId: orderMappings!.loyalty, note: '' });
+    c = await tenantCatalog(acme);
+    expect(expand(c, 'field:order.status')).not.toHaveProperty('note');
+    expect(toJson(c.entries)).not.toMatch(/退款单也算|取消单/);
+    expect(search(c, '取消单')).toEqual([]);
   });
 });

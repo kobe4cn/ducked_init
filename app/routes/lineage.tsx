@@ -6,7 +6,8 @@
 // 只对有 sources:read 的成员开放，没有权限时回到关系图，源表名与映射信息都不下发。
 // 点已接入的标准层表（关系图 ?node=<entity>，流向图 ?node=silver.<entity>）在右侧抽屉列出字段明细：有 sources:read 时带各映射的源表、源列、表达式、
 // 标记与兜底统计，否则只下发字段说明与行数（在 loader 里裁剪）。
-// 抽屉里实体登记的字段带业务说明（当前说明与历史，任何角色可见，ADR-0041），有 definitions:draft 的成员可以编辑（intent=note）。
+// 抽屉里实体登记的字段带业务说明（当前说明与历史，任何角色可见，ADR-0041），有 definitions:draft 的成员可以编辑（intent=note）；
+// 有明细时每个映射来源下另带映射字段说明，有 sources:write 的成员可以编辑（intent=note 带 mappingId）。
 // 单表聚焦画布（?tab=flow&focus=<实体>，从抽屉进入）只画这张标准层表与写入它的源表，连线从源列连到字段；同样只对有 sources:read 的成员开放
 // 流向图与聚焦画布上可以反向查（?q=列 或 表.列，不区分大小写）：命中的源表、映射、标准层表与连线保持原样，其余变淡；点源表节点（?node=table:<数据源>:<表>）
 // 在抽屉里按源列列出它影响的标准层字段。两者都只对有 sources:read 的成员生效。
@@ -20,6 +21,7 @@ import type { Route } from './+types/lineage';
 import { can, requirePermission } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
 import { BusinessNoteError, entityNoteHistory, saveBusinessNote } from '~/.server/business-notes';
+import { noteKey } from '~/lib/business-note-key';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import { getInspectStatus, InspectError, inspectLakeNow } from '~/.server/lake-inspect';
@@ -160,9 +162,12 @@ export async function loader({ request }: Route.LoaderArgs) {
       drawer = canFlow ? { ...head, detail: true, fields } : { ...head, detail: false, fields: redactFields(fields) };
       // 业务说明只写在实体登记的字段上（扩展字段没有）；当前说明是最新一版，任何角色都看得到
       const history = await entityNoteHistory(getDb(), member.tenant.id, drawerEntity);
-      notes = Object.fromEntries(fields.filter(f => declared.some(d => d.name === f.name)).map(f => {
-        const versions = history.get(f.name) ?? [];
-        return [f.name, { current: versions.at(-1)?.note ?? '', history: versions }];
+      // 按 noteKey；映射字段说明挂在映射来源下，只随明细（sources:read）下发
+      const keys = fields.filter(f => declared.some(d => d.name === f.name))
+        .flatMap(f => [noteKey(drawerEntity, f.name), ...(canFlow ? f.sources.map(s => noteKey(drawerEntity, f.name, s.mapping)) : [])]);
+      notes = Object.fromEntries(keys.map(key => {
+        const versions = history.get(key) ?? [];
+        return [key, { current: versions.at(-1)?.note ?? '', history: versions }];
       }));
     }
   }
@@ -172,6 +177,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     canFlow,
     canWrite: can(member.role, 'sources:write'),
     canNote: can(member.role, 'definitions:draft'),
+    canMappingNote: can(member.role, 'sources:write'),
     inspect: {
       status: INSPECT_STATUS[inspect.status],
       error: inspect.error,
@@ -216,17 +222,19 @@ async function relationStatsByEdge(tenantId: string, graph: { edges: GraphEdge[]
 /**
  * 触发一次漂移检查（intent=inspect），或重建合并一张缺列的标准层表（intent=rebuild，带 entity），都需 sources:write；
  * 不能开始时返回原因（已有检查或合并在排队或运行中、没有映射写入这张表）。
- * 在字段抽屉里保存一个实体字段的业务说明（intent=note，带 entity、field、note，空串为清空）需 definitions:draft，保存后回到原来的抽屉
+ * 在字段抽屉里保存一个实体字段的业务说明（intent=note，带 entity、field、note，空串为清空）需 definitions:draft，
+ * 带 mappingId 时是这个映射的映射字段说明，需 sources:write；保存后回到原来的抽屉
  */
 export async function action({ request }: Route.ActionArgs) {
   const form = await request.formData();
   const intent = String(form.get('intent') ?? '');
-  const member = await requirePermission(request, intent === 'note' ? 'definitions:draft' : 'sources:write');
+  const mappingId = intent === 'note' ? String(form.get('mappingId') ?? '') || null : null;
+  const member = await requirePermission(request, intent === 'note' && !mappingId ? 'definitions:draft' : 'sources:write');
   try {
     switch (intent) {
       case 'note': {
         const note = form.get('note');
-        await saveBusinessNote(member, { entity: String(form.get('entity') ?? ''), field: String(form.get('field') ?? ''), note: typeof note === 'string' ? note : null });
+        await saveBusinessNote(member, { entity: String(form.get('entity') ?? ''), field: String(form.get('field') ?? ''), mappingId, note: typeof note === 'string' ? note : null });
         // 回到原来的抽屉；客户端提交时请求地址是 /lineage.data，不能照搬 pathname
         throw redirect(`/lineage${new URL(request.url).search}`);
       }
@@ -241,7 +249,11 @@ export async function action({ request }: Route.ActionArgs) {
     }
   } catch (e) {
     if (e instanceof InspectError || e instanceof MappingError) return data({ error: e.message, intent }, { status: 400 });
-    if (e instanceof BusinessNoteError) return data({ error: e.message, intent, field: String(form.get('field') ?? ''), note: String(form.get('note') ?? '') }, { status: 400 });
+    if (e instanceof BusinessNoteError) {
+      // 保存失败的说明按 noteKey 定位，编辑框里留着提交的内容
+      const key = noteKey(String(form.get('entity') ?? ''), String(form.get('field') ?? ''), mappingId);
+      return data({ error: e.message, intent, key, note: String(form.get('note') ?? '') }, { status: 400 });
+    }
     if (e instanceof TaskError) return data({ error: e.message, intent }, { status: e.status });
     throw e;
   }
@@ -249,7 +261,7 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function Lineage({ loaderData, actionData }: Route.ComponentProps) {
-  const { tab, canFlow, canWrite, canNote, notes, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, edgeStats, showAll, node, sql } = loaderData;
+  const { tab, canFlow, canWrite, canNote, canMappingNote, notes, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, edgeStats, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
   const [rawParams] = useSearchParams();
   // 链接里不带不生效的参数：关系图没有反向查，没有 sources:read 时不开源表抽屉
@@ -393,7 +405,7 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
       {drawer && (
         <LineageDrawer
           drawer={drawer} closeHref={closeDrawerHref} focusHref={drawer.detail ? `/lineage?tab=flow&focus=${encodeURIComponent(drawer.entity)}` : null}
-          notes={notes ?? {}} canNote={canNote} noteError={actionData?.intent === 'note' && 'field' in actionData && 'note' in actionData ? { field: String(actionData.field), error: actionData.error, note: String(actionData.note) } : null}
+          notes={notes ?? {}} canNote={canNote} canMappingNote={canMappingNote} noteError={actionData?.intent === 'note' && 'key' in actionData && 'note' in actionData ? { key: String(actionData.key), error: actionData.error, note: String(actionData.note) } : null}
         />
       )}
     </AppShell>
