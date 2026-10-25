@@ -1,0 +1,6 @@
+kind: metric
+request: 每个消费者近 90 天的下单次数
+expected:
+  base: order
+  measure: { agg: count }
+  window: { field: created_at, days: 90 }

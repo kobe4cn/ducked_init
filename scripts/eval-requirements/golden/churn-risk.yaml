@@ -1,0 +1,8 @@
+kind: tag
+request: 距最近一次下单超过 90 天的消费者标为 at_risk，其余标为 active
+expected:
+  metric: days_since_last_order
+  rules:
+    - value: at_risk
+      when: { gt: 90 }
+  default: active

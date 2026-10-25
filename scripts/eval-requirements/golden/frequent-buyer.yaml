@@ -1,0 +1,8 @@
+kind: tag
+request: 近 365 天下单至少 12 次的是 frequent，其余是 normal
+expected:
+  metric: order_count_365d
+  rules:
+    - value: frequent
+      when: { gte: 12 }
+  default: normal

@@ -1,0 +1,8 @@
+kind: metric
+request: 近 7 天加购（事件类型 add_to_cart）的次数
+expected:
+  base: event
+  measure: { agg: count }
+  filter:
+    - { field: event_type, op: eq, value: add_to_cart }
+  window: { field: occurred_at, days: 7 }

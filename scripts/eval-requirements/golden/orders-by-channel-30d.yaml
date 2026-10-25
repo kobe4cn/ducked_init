@@ -1,0 +1,8 @@
+kind: metric
+request: 近 30 天各下单渠道的订单数
+expected:
+  base: order
+  measure: { agg: count }
+  window: { field: created_at, days: 30 }
+  dimensions:
+    - { name: channel, path: order.channel }

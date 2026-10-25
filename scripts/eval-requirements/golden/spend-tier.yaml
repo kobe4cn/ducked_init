@@ -1,0 +1,10 @@
+kind: tag
+request: 按近 30 天消费金额给消费者分层：1000 元及以上是 high，100 元到 1000 元是 mid，其余是 low
+expected:
+  metric: revenue_30d
+  rules:
+    - value: high
+      when: { gte: 1000 }
+    - value: mid
+      when: { gte: 100, lt: 1000 }
+  default: low

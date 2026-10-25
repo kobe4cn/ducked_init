@@ -1,0 +1,5 @@
+kind: metric
+request: 距最近一次下单过去了多少天
+expected:
+  base: order
+  measure: { agg: days_since, field: created_at }

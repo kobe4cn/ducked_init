@@ -1,0 +1,6 @@
+kind: metric
+request: 近 180 天买过的不同商品数
+expected:
+  base: order_item
+  measure: { agg: count_distinct, field: product_id }
+  window: { field: order_item.order_id -> order.created_at, days: 180 }

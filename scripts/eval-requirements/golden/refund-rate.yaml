@@ -1,0 +1,11 @@
+kind: metric
+request: 退款订单占全部订单的比例
+expected:
+  base: order
+  measure:
+    agg: ratio
+    numerator:
+      agg: count
+      filter:
+        - { field: status, op: eq, value: refunded }
+    denominator: { agg: count }

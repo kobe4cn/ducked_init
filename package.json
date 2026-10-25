@@ -20,6 +20,7 @@
     "bench:serving": "node --import tsx scripts/bench-serving.ts",
     "eval:mapping": "node --env-file-if-exists=.env --import tsx scripts/eval-mapping.ts",
     "eval:mapping:compare": "node --import tsx scripts/eval-mapping-compare.ts",
+    "eval:requirements": "node --env-file-if-exists=.env --import tsx scripts/eval-requirements.ts",
     "lake:ensure": "node --env-file-if-exists=.env --import tsx scripts/ensure-lake-schemas.ts",
     "operator:reset-totp": "node --env-file-if-exists=.env --import tsx scripts/reset-operator-totp.ts",
     "check": "node --env-file=.env --import tsx src/00_check.ts",

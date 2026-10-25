@@ -1,0 +1,10 @@
+kind: metric
+request: 近 30 天每个城市状态为已支付（paid）的订单实付金额合计
+expected:
+  base: order
+  measure: { agg: sum, field: amount }
+  filter:
+    - { field: status, op: eq, value: paid }
+  window: { field: created_at, days: 30 }
+  dimensions:
+    - { name: city, path: order.customer_id -> customer.city }
