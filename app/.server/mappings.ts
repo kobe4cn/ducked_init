@@ -8,6 +8,7 @@ import { parseDocument } from 'yaml';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
+import { tenantCatalog } from './catalog/load';
 import { allRelations, publishedCustomEntities, type RegisteredEntity, relationsFrom, relationsTo, uniqueKeys } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { excludedHashes } from './identity-exclusions';
@@ -232,7 +233,7 @@ export interface ModelDraftResult {
 
 /**
  * 用模型生成映射草稿（ADR-0035）：按「复用已发布映射 > 模型 > 按规则」的顺序。复用命中时不调用模型；没配置模型服务时用规则草稿并提示；
- * 否则把表上下文与规则草稿发给模型（purpose = mapping_draft），输出转成 YAML 后须过映射校验。成功时写一行生成记录，不保存映射。
+ * 否则把表上下文、规则草稿与本租户的语义目录（ADR-0041）发给模型（purpose = mapping_draft），输出转成 YAML 后须过映射校验。成功时写一行生成记录，不保存映射。
  * 模型失败或转出的 YAML 不过校验时记审计 mapping.model_draft_failed（不含提示词、模型原文与取值），抛 422。
  * 为已有映射重新生成时传 mappingId，生成记录直接关联它
  */
@@ -258,9 +259,10 @@ export async function modelDraftFor(
     tenantId, actor, action: 'mapping.model_draft_failed', targetType: 'source', targetId: sourceId,
     detail: { sourceId, source: source.name, table, entity, ...detail },
   });
+  const messages = modelDraftMessages(context, entity, base.yaml, await tenantCatalog(tenantId));
   let out: ModelDraft;
   try {
-    out = await chatJson<ModelDraft>(tenantId, 'mapping_draft', modelDraftMessages(context, entity, base.yaml), MODEL_DRAFT_SCHEMA);
+    out = await chatJson<ModelDraft>(tenantId, 'mapping_draft', messages, MODEL_DRAFT_SCHEMA);
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
     await failed({ stage: 'model', error: e.message.slice(0, 200) });

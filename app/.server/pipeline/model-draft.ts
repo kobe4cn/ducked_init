@@ -2,9 +2,13 @@
 // 模型必须遵守的输出 Schema（字段对应、值字典、去重键、身份打通规则，每项带置信度与理由），以及把模型输出转成映射 YAML：
 // 以规则草稿为底，保留 table / entity / extensions 等其他顶层键，fields / dedupe / identity 整体换成模型给的，理由写成行尾注释。
 // 转出的 YAML 仍要过映射校验（checkMappingDraft），保存、空跑与双人发布照旧。
+// 传了语义目录（ADR-0041）时，user 前面加上目录总览、目标实体与它的各字段条目、按表名与列名搜出的条目，字段口径以目录为准；
+// 不传时消息与原来一致（scripts/eval-mapping 照旧）。
 // 另有断言建议：把表上下文与当前映射 YAML 发给模型，模型返回自定义断言列表（每条带置信度与理由），只换掉 YAML 的 assertions 块
 import { Document, isCollection, isScalar, parseDocument, Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { FUNCTIONS } from '../../lib/mapping-expr';
+import { CAPABILITIES } from '../catalog/capabilities';
+import { estimateTokens, expand, overview, search, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
 import type { LlmMessage } from '../llm';
 import type { AssertionLevel } from './assertions';
 import { CUSTOM_CHECKS, type CustomAssertion } from './custom-assertions';
@@ -94,11 +98,39 @@ const SYSTEM = [
   '- confidence 表示你对这一项的把握，reason 用中文简要说明依据。',
 ].join('\n');
 
-/** 发给模型的消息：system 讲清输出格式与规则，user 是目标实体、表上下文与规则草稿 */
-export function modelDraftMessages(context: TableContext, entity: string, rulesYaml: string): LlmMessage[] {
+const CATALOG_SYSTEM = [
+  '- 成员的消息里先是语义目录：总览、目标实体与它的各字段条目、按表名与列名搜出的条目，最后一行是上面说的输入（JSON）。',
+  '- 字段口径以目录为准：字段的含义、标准取值与业务说明看目录里的字段条目；目录里没有的字段（包括敏感字段）照 rulesDraft 写。',
+].join('\n');
+
+/** 按表名与列名搜出的条目最多几条 */
+const SEARCH_LIMIT = 10;
+/** 搜出的条目估算最多多少 token，超过时减少条数 */
+const SEARCH_TOKENS = 4000;
+
+/** 目录各段：总览、目标实体与它的各字段条目、按「实体名 + 表名 + 列名」搜出的其余条目（不含能力说明，估算超过 SEARCH_TOKENS 时减少条数） */
+function catalogMarkdown(catalog: Catalog, context: TableContext, entity: string): string {
+  const target = [expand(catalog, `entity:${entity}`), ...catalog.entries.filter(e => e.kind === 'field' && e.entity === `entity:${entity}`)]
+    .filter((e): e is CatalogEntry => e !== null);
+  const shown = new Set(target.map(e => e.id));
+  const query = [entity, context.table, ...context.columns.map(c => c.name)].join(' ');
+  const related = search(catalog, query, SEARCH_LIMIT + shown.size + CAPABILITIES.length)
+    .filter(e => e.kind !== 'capability' && !shown.has(e.id)).slice(0, SEARCH_LIMIT);
+  let n = related.length;
+  while (n > 0 && estimateTokens(toMarkdown(related.slice(0, n))) > SEARCH_TOKENS) n--;
+  return [toMarkdown(overview(catalog)), `# 目标实体\n\n${toMarkdown(target)}`, `# 与源表相关的条目\n\n${toMarkdown(related.slice(0, n))}`].join('\n\n');
+}
+
+/**
+ * 发给模型的消息：system 讲清输出格式与规则，user 是目标实体、表上下文与规则草稿（JSON）；
+ * 传了目录时 system 加上以目录为准，user 前面加上目录各段，JSON 放在最后一行
+ */
+export function modelDraftMessages(context: TableContext, entity: string, rulesYaml: string, catalog?: Catalog): LlmMessage[] {
+  const input = JSON.stringify({ entity, table: context, rulesDraft: rulesYaml });
+  if (!catalog) return [{ role: 'system', content: SYSTEM }, { role: 'user', content: input }];
   return [
-    { role: 'system', content: SYSTEM },
-    { role: 'user', content: JSON.stringify({ entity, table: context, rulesDraft: rulesYaml }) },
+    { role: 'system', content: `${SYSTEM}\n${CATALOG_SYSTEM}` },
+    { role: 'user', content: `${catalogMarkdown(catalog, context, entity)}\n\n# 起草输入\n${input}` },
   ];
 }
 

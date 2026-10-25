@@ -4,11 +4,15 @@
 import { and, eq } from 'drizzle-orm';
 import { parse } from 'yaml';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { saveBusinessNote } from '../../app/.server/business-notes';
+import { tenantCatalog } from '../../app/.server/catalog/load';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, mappingGenerations } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
 import { createMapping, draftFor, dryRunMapping, MappingError, modelAssertionsForMapping, modelDraftFor, modelDraftForMapping, publishMapping, saveMappingDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { modelDraftMessages } from '../../app/.server/pipeline/model-draft';
+import { tableContextFor } from '../../app/.server/model-provider';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
@@ -80,6 +84,12 @@ const calls = (tenantId: string) => getDb().select().from(llmCalls).where(eq(llm
 const failures = (tenantId: string) => getDb().select().from(auditLogs)
   .where(and(eq(auditLogs.tenantId, tenantId), eq(auditLogs.action, 'mapping.model_draft_failed')));
 
+/** 起草消息的 user：前面是目录各段（Markdown），最后一行是起草输入（JSON） */
+function draftUser(content: string) {
+  const at = content.lastIndexOf('\n');
+  return { catalog: content.slice(0, at), input: JSON.parse(content.slice(at + 1)) };
+}
+
 /** 调用应当失败：返回抛出的错误 */
 const failure = (p: Promise<unknown>) => p.then(() => { throw new Error('应当失败'); }, (e: unknown) => e as MappingError);
 
@@ -116,6 +126,7 @@ describe('用模型生成映射草稿', () => {
 
   it('配置了模型服务时把表上下文与规则草稿发给模型，转出的 YAML 记进生成记录（每项的置信度与理由），不保存映射', async () => {
     const { acme, author, sourceId } = await tenantWithSource();
+    await saveBusinessNote(author, { entity: 'order', field: 'status', note: '退款单也算一笔订单，状态记为 refunded' });
     platformDefault();
     const { received } = fakeFetch(completion(MODEL_ORDERS));
 
@@ -131,10 +142,17 @@ describe('用模型生成映射草稿', () => {
     const [call] = await calls(acme);
     expect(call).toMatchObject({ purpose: 'mapping_draft', model: 'qwen-plus', schemaValid: true, error: null });
     const messages = received[0].messages as { role: string; content: string }[];
-    const user = JSON.parse(messages[1].content);
+    expect(messages[0].content).toContain('字段口径以目录为准');
+    const { catalog, input: user } = draftUser(messages[1].content);
     expect(user).toMatchObject({ entity: 'order', table: { table: 'orders', rows: 100 } });
     expect(user.table).not.toHaveProperty('samples');
     expect(user.rulesDraft).toMatch(/^# 按规则生成的草稿/);
+    // 目录总览、目标实体与它的各字段条目（带枚举与业务说明）、按表名与列名搜出的条目
+    expect(catalog).toContain('# 语义目录');
+    expect(catalog).toContain('## entity:order ');
+    expect(catalog).toMatch(/## field:order\.status [\s\S]*- 取值：[^\n]*`paid`[\s\S]*- 业务说明：退款单也算一笔订单，状态记为 refunded/);
+    for (const f of ['order_id', 'customer_id', 'amount', 'created_at']) expect(catalog).toContain(`## field:order.${f} `);
+    expect(catalog).toMatch(/# 与源表相关的条目[\s\S]*## relation:order.customer_id /);
 
     const [generation] = await generations(acme);
     expect(generation).toMatchObject({ id: result.generationId, origin: 'model', yaml: result.yaml, mappingId: null });
@@ -142,6 +160,33 @@ describe('用模型生成映射草稿', () => {
     expect(generation.items).toHaveLength(5);
     expect(result.items).toEqual(generation.items);
     expect(await failures(acme)).toHaveLength(0);
+  });
+
+  it('起草消费者映射时目录里没有敏感字段与哈希列，消息里没有敏感列的取值', async () => {
+    const { author, sourceId } = await tenantWithSource();
+    platformDefault();
+    const { received } = fakeFetch(completion(MODEL_ORDERS));
+
+    await modelDraftFor(author, sourceId, 'customers', 'customer').catch(() => undefined);
+    const content = (received[0].messages as { content: string }[])[1].content;
+    const { catalog } = draftUser(content);
+    expect(catalog).toContain('## entity:customer ');
+    expect(catalog).toContain('## field:customer.customer_id ');
+    for (const pii of ['field:customer.email', 'field:customer.phone', 'field:customer.name', '_hash']) expect(catalog).not.toContain(pii);
+    for (const value of ['@example.com', '13800000']) expect(content).not.toContain(value);
+  });
+
+  it('不传目录时消息与原来一致：system 不提目录，user 只是目标实体、表上下文与规则草稿', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    const context = await tableContextFor(acme, sourceId, 'orders');
+    const rules = await draftFor(author, sourceId, 'orders', 'order');
+
+    const plain = modelDraftMessages(context, 'order', rules);
+    expect(plain[0].content).not.toContain('目录');
+    expect(plain[1]).toEqual({ role: 'user', content: JSON.stringify({ entity: 'order', table: context, rulesDraft: rules }) });
+    const withCatalog = modelDraftMessages(context, 'order', rules, await tenantCatalog(acme));
+    expect(withCatalog[0].content.startsWith(plain[0].content)).toBe(true);
+    expect(draftUser(withCatalog[1].content).input).toEqual(JSON.parse(plain[1].content));
   });
 
   it('模型生成的草稿照常保存为成员的草稿、空跑，保存的人不能发布、另一位能发布', async () => {
