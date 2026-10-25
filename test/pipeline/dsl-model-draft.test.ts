@@ -6,6 +6,7 @@ import { parse } from 'yaml';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, dslVersions, llmCalls } from '../../app/.server/db/schema';
+import { saveBusinessNote } from '../../app/.server/business-notes';
 import { createDefinition, DslError, modelDraftForDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { setLlmFetch } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
@@ -70,21 +71,38 @@ describe('用模型生成指标定义草稿', () => {
 
     const [call] = await calls(acme);
     expect(call).toMatchObject({ purpose: 'metric_draft', schemaValid: true });
-    const user = JSON.parse(received[0]!.messages.find(m => m.role === 'user')!.content);
-    expect(user.request).toBe(REQUEST);
-    const customer = user.context.entities.find((e: { name: string }) => e.name === 'customer');
-    const names = customer.fields.map((f: { name: string }) => f.name);
-    expect(names).toContain('city');
-    for (const pii of ['name', 'phone', 'email', 'external_id']) expect(names).not.toContain(pii);
-    expect(user.context.entities.find((e: { name: string }) => e.name === 'order')).toMatchObject({ base: true });
-    // 经一跳引用关联消费者的实体也能做基础实体（ADR-0038），连不到消费者的不能
-    expect(user.context.entities.find((e: { name: string }) => e.name === 'order_item')).toMatchObject({ base: true });
-    expect(user.context.entities.find((e: { name: string }) => e.name === 'product')).toMatchObject({ base: false });
-    expect(user.context.relations).toContain('order.customer_id → customer.customer_id');
+    const [system, user] = received[0]!.messages;
+    expect(system).toMatchObject({ role: 'system', content: expect.stringContaining('## capability:metric-dsl 指标 DSL') });
+    expect(user!.role).toBe('user');
+    // 依次是目录总览、按需求搜出的条目与需求原文
+    const [overviewPart, searchPart] = user!.content.split('# 与需求相关的条目');
+    expect(overviewPart).toContain('# 语义目录');
+    for (const id of ['entity:customer', 'entity:order', 'relation:order.customer_id']) expect(overviewPart).toContain(`- ${id} `);
+    expect(searchPart).toContain('## field:order.amount');
+    expect(user!.content.endsWith(`# 需求\n\n${REQUEST}`)).toBe(true);
+    // 敏感字段、哈希列不进上下文
+    const sent = received[0]!.messages.map(m => m.content).join('\n');
+    const customerLine = overviewPart!.split('\n').find(l => l.startsWith('- entity:customer '))!;
+    expect(customerLine).toMatch(/字段：.*\bcity\b/);
+    for (const pii of ['name', 'phone', 'email', 'external_id']) expect(customerLine).not.toMatch(new RegExp(`\\b${pii}\\b`));
+    for (const pii of ['`phone`', '`email`', '`external_id`', 'customer.phone', 'customer.email', 'customer.name', '_hash']) expect(sent).not.toContain(pii);
 
     await createDefinition(author, 'metric', 'paid_revenue_30d', yaml);
     await expect(publishDefinition(author, 'metric', 'paid_revenue_30d', 1)).rejects.toThrow(/最后改了这一版草稿/);
     expect(await publishDefinition(reviewer, 'metric', 'paid_revenue_30d', 1)).toMatchObject({ kind: 'gold.dsl', status: 'queued' });
+  });
+
+  it('需求提到的字段的业务说明出现在搜出的条目里', async () => {
+    const { acme, author } = await publishedIdentitySources({ orders: true });
+    await saveBusinessNote(author, { entity: 'order', field: 'status', note: '退款单也算一笔订单，状态记为 refunded' });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    const { received } = fakeFetch(completion({ base: 'order', measure: { agg: 'count' }, filter: [{ field: 'status', op: 'eq', value: 'refunded' }] }));
+
+    await modelDraftForDefinition(analyst, 'metric', '统计退款单');
+    const searchPart = received[0]!.messages[1]!.content.split('# 与需求相关的条目')[1]!.split('# 需求')[0]!;
+    expect(searchPart).toContain('## field:order.status');
+    expect(searchPart).toContain('业务说明：退款单也算一笔订单，状态记为 refunded');
   });
 
   it('模型返回不合 Schema 时拒绝：调用日志 schema_valid = false，记一条失败审计，不含需求原文', async () => {
@@ -156,7 +174,7 @@ const TAG_REQUEST = '近 30 天消费满 1000 的是高价值客户，其余为�
 const MODEL_TIER = { metric: 'revenue_30d', rules: [{ value: 'high', when: { gte: 1000 } }], default: 'normal', description: '按近 30 天消费分层' };
 
 describe('用模型生成标签定义草稿', () => {
-  it('上下文只列已发布、无维度、数值型指标；YAML 过标签校验、不写 dsl_versions；保存后由另一位数据工程师发布', async () => {
+  it('上下文是目录与标签能力说明（只有已发布指标）；YAML 过标签校验、不写 dsl_versions；保存后由另一位数据工程师发布', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     await createDefinition(author, 'metric', 'revenue_30d', REVENUE);
@@ -173,12 +191,13 @@ describe('用模型生成标签定义草稿', () => {
     expect(await getDb().select().from(dslVersions)).toHaveLength(3);
 
     expect((await calls(acme))[0]).toMatchObject({ purpose: 'tag_draft', schemaValid: true });
-    const user = JSON.parse(received[0]!.messages.find(m => m.role === 'user')!.content);
-    expect(user.request).toBe(TAG_REQUEST);
-    expect(user.context).toEqual({
-      metrics: [{ key: 'revenue_30d', description: '近 30 天订单金额', measure: { agg: 'sum', field: 'amount' } }],
-    });
-    expect(received[0]!.messages[0]!.content).toContain('标签');
+    const [system, user] = received[0]!.messages;
+    expect(system!.content).toContain('## capability:tag-dsl 标签 DSL');
+    expect(system!.content).not.toContain('capability:metric-dsl');
+    // 目录里只有已发布的指标，草稿不出现
+    expect(user!.content).toContain('- metric:revenue_30d ');
+    expect(user!.content).not.toContain('draft_only');
+    expect(user!.content.endsWith(`# 需求\n\n${TAG_REQUEST}`)).toBe(true);
 
     await createDefinition(author, 'tag', 'value_tier', yaml);
     await expect(publishDefinition(author, 'tag', 'value_tier', 1)).rejects.toThrow(/最后改了这一版草稿/);

@@ -1,107 +1,83 @@
 // app/.server/pipeline/dsl/model-draft.ts —— 用模型按自然语言需求生成定义草稿（ADR-0035，纯函数，不读库、不发请求）：
 // 每种可生成的定义给出模型必须遵守的输出 Schema（直接用该种类的定义 Schema）、调用用途、提示词与给模型的上下文；
-// 指标的上下文只列租户里能用的实体、非敏感字段与关系（与校验同源，敏感字段不进上下文，ADR-0005）；
-// 标签的上下文只列标签能引用的指标：已发布、通过校验、没有维度、取值为数字（与 checkTag 同用 metricOf）。
+// 上下文取自语义目录（ADR-0041）：system 是简短的角色说明加该种类的能力说明，user 是目录总览、用需求原文搜出的条目与需求原文。
+// 目录里本就没有敏感字段、哈希列与明细行（ADR-0005），统计只有 ADR-0016 的常见取值。
 // 模型输出转成 YAML（首行注释提示核对）后仍要过该种类的校验（DSL_KINDS[kind].check），保存与双人发布照旧
 import { Document } from 'yaml';
-import { CANONICAL_ENTITIES, relationText } from '../../../lib/canonical-model';
+import { CAPABILITIES } from '../../catalog/capabilities';
+import { estimateTokens, overview, search, toMarkdown, type Catalog } from '../../catalog';
 import type { LlmMessage, LlmPurpose } from '../../llm';
-import { AGGS, CONSUMER_ENTITY, consumerHop, FILTER_OPS, fieldsFor, MAX_DIMENSIONS, MAX_HOPS, METRIC_SCHEMA, RATIO_AGGS, relationsOf, type DslContext, type MetricSpec } from './metric-spec';
+import { CONSUMER_ENTITY, METRIC_SCHEMA } from './metric-spec';
 import type { DslKind } from './index';
-import { metricOf, SINGLE_TAG_SCHEMA, TAG_CONDITIONS } from './tag-spec';
+import { SINGLE_TAG_SCHEMA } from './tag-spec';
 
-/** 指标的上下文：各实体能用的字段（已剔除敏感字段）、能做基础实体的实体与实体间的关系 */
-export interface MetricDraftContext {
-  entities: { name: string; base: boolean; fields: { name: string; type: string; enum?: readonly string[] }[] }[];
-  relations: string[];
-}
+/** 按需求搜出的条目最多几条 */
+const SEARCH_LIMIT = 15;
+/** 搜出的条目估算最多多少 token，超过时减少条数 */
+const SEARCH_TOKENS = 6000;
 
-/**
- * 指标上下文：标准实体与已发布的自定义实体；能做基础实体的是 customer、有指向 customer.customer_id 的 customer_id 的实体，
- * 与能经一跳引用到这样的实体的实体（有多条可走时也算，要写 consumer_via；与校验同一规则，ADR-0038）
- */
-function metricContext(ctx: DslContext): MetricDraftContext {
-  const names = [...CANONICAL_ENTITIES.map(e => e.name), ...ctx.published.keys()];
-  const entities = names.flatMap(name => {
-    const fields = fieldsFor(name, ctx);
-    if (!fields) return [];
-    const hop = consumerHop(name, undefined, ctx);
-    return [{ name, base: !(hop && 'at' in hop && hop.at === 'base'), fields }];
-  });
-  return { entities, relations: relationsOf(ctx).map(relationText) };
-}
+const capability = (id: string) => toMarkdown(CAPABILITIES.find(c => c.id === id)!);
 
 const METRIC_SYSTEM = [
-  '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
-  '输入：request 是成员用自然语言写的需求；context.entities 是能用的实体与字段（base 为 true 的才能做基础实体），context.relations 是实体间的关系（实体.字段 → 实体.主键）。',
-  '输出格式：',
-  `{ "base": 基础实体, "consumer_via"?: 基础实体经哪个字段关联消费者（只在下面说的有多条可走时写）, "measure": { "agg": ${AGGS.join(' | ')}, "field"?: 基础实体的字段，或从基础实体出发的维度路径（取原值，关联不上为 NULL）（count 可不写）, "by"?: 时间或日期字段，写法同 field（只用于 latest / earliest）,`,
-  `    "numerator"?: 分子, "denominator"?: 分母（只用于 ratio，各为 { "agg": ${RATIO_AGGS.join(' | ')}, "field"?: 写法同 measure 的 field, "filter"?: 写法同下面的 filter }） },`,
-  `  "filter"?: [{ "field": 基础实体的字段，或从基础实体出发的维度路径（取原值，关联不上为 NULL）, "op": ${FILTER_OPS.join(' | ')}, "value"?: 取值或取值列表（in / not_in 写列表，is_null / not_null 不写） }],`,
-  '  "window"?: { "field": 时间或日期字段，基础实体的字段，或从基础实体出发的维度路径（取原值，关联不上为 NULL）, "days": 正整数 },',
-  `  "dimensions"?: [{ "name": 小写字母开头的列名, "path": 维度路径 }]（最多 ${MAX_DIMENSIONS} 个）,`,
-  '  "description"?: 不超过 500 字的中文说明 }',
+  '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（与下面 YAML 示例同样的结构），不要输出别的文字。',
+  '成员的消息里依次是语义目录总览、按需求搜出的目录条目与需求原文。',
   '规则：',
-  '- 只用 context 里给出的实体与字段，不要编造；context 里没有的字段（包括敏感字段）一律不要用。',
-  '- sum / avg 只能用整数或小数字段；过滤取值按字段类型写，有 enum 的字段只能用其中的取值。',
-  `- 比率（如核销率、客单价）用 ratio：写 numerator 与 denominator，不写 field；分子、分母的 agg 只能是 ${RATIO_AGGS.join(' / ')}，各自的 filter 与顶层 filter、window 同时生效。`,
-  '- latest / earliest 按 by 取最新 / 最早一行的 field，field 只能是整数或小数字段；距今天数（如最近一次购买距今几天）用 days_since，field 是时间或日期字段。',
-  `- 维度路径从基础实体出发，写成 实体.字段 -> 实体.字段，每一跳要沿 context.relations 里的一条关系走到下一实体的主键，最多 ${MAX_HOPS} 跳；`,
-  `  或者写一段 ${CONSUMER_ENTITY}.字段，取统一消费者的属性（字段是 customer 的字段）。`,
-  `- filter、measure、window 的字段也能写同样的维度路径（如按门店的区域过滤、按商品的品类过滤），但不能写 ${CONSUMER_ENTITY}.字段。`,
-  '- 基础实体自己没有 customer_id 时（如 order_item），经它指向某个有 customer_id 的实体（如 order）的那个字段关联消费者，只有一条时自动走、不写 consumer_via；',
-  '  有多条时写 consumer_via 选一条（写基础实体的字段名）。基础实体自己有 customer_id 时不要写 consumer_via。',
+  '- 只用目录里列出的实体、字段与关系，不要编造；目录里没有的字段（包括敏感字段）一律不要用。',
+  '- sum / avg 只能用整数或小数字段；过滤取值按字段类型写，有取值列表的字段只能用其中的取值。',
+  `- filter、measure、window 的字段也能写维度路径，但不能写 ${CONSUMER_ENTITY}.字段。`,
   '- count 数的是基础实体的行数：base 为 order_item 时数的是明细行，要数订单写 { "agg": "count_distinct", "field": "order_id" }。',
   '- 需求没提到的部分不要加；不要输出 device_attribution。',
+  '',
+  capability('capability:metric-dsl'),
 ].join('\n');
-
-/** 标签的上下文：标签能引用的指标（按键排序），各带说明与度量；一个都没有时返回提示 */
-export interface TagDraftContext {
-  metrics: { key: string; description?: string; measure: MetricSpec['measure'] }[];
-}
-
-function tagContext(ctx: DslContext): TagDraftContext | string {
-  const metrics = [...ctx.metrics.keys()].flatMap(key => {
-    const spec = metricOf(key, ctx);
-    return typeof spec === 'string' ? [] : [{ key, description: spec.description, measure: spec.measure }];
-  });
-  if (!metrics.length) return '本租户还没有标签能引用的指标：请先发布一个数值型指标（没有维度）';
-  return { metrics: metrics.sort((a, b) => a.key.localeCompare(b.key)) };
-}
 
 const TAG_SYSTEM = [
   '你是 CRM 数据平台的标签助手：按成员的需求写一个标签定义，只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
-  '输入：request 是成员用自然语言写的需求；context.metrics 是能引用的指标（每个消费者一个数值），各带键、说明与度量。',
-  '输出格式：',
-  `{ "metric": 指标键, "rules": [{ "value": 标签取值（字符串或数字）, "when": { ${TAG_CONDITIONS.map(c => `"${c}"?: 数字`).join(', ')} } }],`,
-  '  "default": 没命中任何规则时的取值, "description"?: 不超过 500 字的中文说明 }',
+  '成员的消息里依次是语义目录总览、按需求搜出的目录条目与需求原文。',
   '规则：',
-  '- metric 只能是 context.metrics 里的一个键，不要编造。',
-  '- rules 按顺序取第一条命中的，when 里的条件全部满足才算命中（gte ≥、gt >、lte ≤、lt <、eq =），至少写一个条件；都没命中的取 default。',
+  '- 只用单指标写法：metric 是目录里一个没有维度的已发布指标（metric:<键> 条目里的键），不要编造；不写 missing，when 里直接写比较。',
+  '- rules 按顺序取第一条命中的，when 里的条件全部满足才算命中，至少写一个条件；都没命中的取 default。',
   '- 阈值与取值按需求写，需求没提到的部分不要加。',
+  '',
+  capability('capability:tag-dsl'),
 ].join('\n');
 
-/** 可由模型生成的定义：输出 Schema、调用用途、system 提示词与上下文（上下文里没东西可用时是给成员的提示） */
+/** 标签要有能引用的指标：目录里没有维度的已发布指标（是否数值型由校验把关） */
+const tagUnavailable = (catalog: Catalog) =>
+  catalog.entries.some(e => e.kind === 'metric' && !e.dimensions.length) ? null : '本租户还没有标签能引用的指标：请先发布一个数值型指标（没有维度）';
+
+/** 可由模型生成的定义：输出 Schema、调用用途、system 提示词与目录里没东西可用时给成员的提示 */
 const DRAFTS = {
-  metric: { schema: METRIC_SCHEMA, purpose: 'metric_draft', system: METRIC_SYSTEM, context: metricContext },
-  tag: { schema: SINGLE_TAG_SCHEMA, purpose: 'tag_draft', system: TAG_SYSTEM, context: tagContext },
-} satisfies Record<DslKind, { schema: object; purpose: LlmPurpose; system: string; context: (ctx: DslContext) => object | string }>;
+  metric: { schema: METRIC_SCHEMA, purpose: 'metric_draft', system: METRIC_SYSTEM, unavailable: () => null },
+  tag: { schema: SINGLE_TAG_SCHEMA, purpose: 'tag_draft', system: TAG_SYSTEM, unavailable: tagUnavailable },
+} satisfies Record<DslKind, { schema: object; purpose: LlmPurpose; system: string; unavailable: (catalog: Catalog) => string | null }>;
 
 /** 模型输出必须符合的 JSON Schema 与调用用途 */
 export const definitionDraftSchema = (kind: DslKind) => DRAFTS[kind].schema;
 export const definitionDraftPurpose = (kind: DslKind) => DRAFTS[kind].purpose;
 
+/** 用需求原文搜出的条目（能力说明已在 system 里，不再给）的 Markdown，估算超过 SEARCH_TOKENS 时减少条数 */
+function relevantMarkdown(catalog: Catalog, request: string): string {
+  const hits = search(catalog, request, SEARCH_LIMIT + CAPABILITIES.length).filter(e => e.kind !== 'capability').slice(0, SEARCH_LIMIT);
+  for (let n = hits.length; n > 0; n--) {
+    const md = toMarkdown(hits.slice(0, n));
+    if (estimateTokens(md) <= SEARCH_TOKENS) return md;
+  }
+  return toMarkdown([]);
+}
+
 /**
- * 发给模型的消息：system 讲清输出格式与只用给出的字段，user 是需求原文与上下文；
- * 上下文里没有可用的东西时（如标签没有可引用的指标）返回提示，调用方不发请求
+ * 发给模型的消息：system 是角色说明与该种类的能力说明，user 依次是目录总览、按需求搜出的条目与需求原文；
+ * 目录里没有可用的东西时（如标签没有可引用的指标）返回提示，调用方不发请求
  */
-export function definitionDraftMessages(kind: DslKind, request: string, ctx: DslContext): LlmMessage[] | { unavailable: string } {
-  const { system, context: contextOf } = DRAFTS[kind];
-  const context = contextOf(ctx);
-  if (typeof context === 'string') return { unavailable: context };
+export function definitionDraftMessages(kind: DslKind, request: string, catalog: Catalog): LlmMessage[] | { unavailable: string } {
+  const { system, unavailable } = DRAFTS[kind];
+  const hint = unavailable(catalog);
+  if (hint) return { unavailable: hint };
+  const user = [toMarkdown(overview(catalog)), `# 与需求相关的条目\n\n${relevantMarkdown(catalog, request)}`, `# 需求\n\n${request}`].join('\n\n');
   return [
     { role: 'system', content: system },
-    { role: 'user', content: JSON.stringify({ request, context }) },
+    { role: 'user', content: user },
   ];
 }
 

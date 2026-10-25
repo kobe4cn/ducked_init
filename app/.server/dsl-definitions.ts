@@ -13,6 +13,7 @@ import { and, desc, eq, getTableColumns, inArray, isNull, sql } from 'drizzle-or
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
+import { tenantCatalog } from './catalog/load';
 import { publishedCustomEntities } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { publishedTagsOf, publishedTagsReferencing } from './dsl-dependencies';
@@ -143,7 +144,7 @@ export async function createDefinition(actor: CurrentMember, kind: string, key: 
 }
 
 /**
- * 用模型按自然语言需求生成定义草稿（ADR-0003、ADR-0035）：指标的上下文是本租户能用的实体、非敏感字段与关系，标签的是能引用的已发布指标；
+ * 用模型按自然语言需求生成定义草稿（ADR-0003、ADR-0035）：上下文取自本租户的语义目录（ADR-0041：总览、按需求搜出的条目与该种类的能力说明）；
  * 模型输出按该种类的 Schema 校验、转成 YAML 后须过该种类的校验，只返回 YAML，不保存（之后照常保存草稿、双人发布）。
  * 没配置模型服务、或上下文里没东西可用（标签没有可引用的指标）时 400、不发请求；
  * 模型失败或转出的 YAML 不过校验时记审计 definition.model_draft_failed（不含需求原文、模型原文与取值），抛 422
@@ -158,7 +159,7 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
   const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
     tenantId, actor, action: 'definition.model_draft_failed', targetType: 'definition', detail: { kind, ...detail },
   });
-  const messages = definitionDraftMessages(kind, request, ctx);
+  const messages = definitionDraftMessages(kind, request, await tenantCatalog(tenantId));
   if (!Array.isArray(messages)) throw new DslError(messages.unavailable);
   let output: object;
   try {
