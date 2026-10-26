@@ -1,9 +1,9 @@
 // app/.server/catalog/versions.ts —— 语义目录的版本（ADR-0041）：目录的结构或含义变了才记一版，比较前去掉统计，只改统计不产生版本。
-// 版本由 recordAudit 在白名单动作的同一事务里触发：重新生成目录、去掉统计，和上一版的快照按条目标识比较，有差异才记新版本
+// 版本由 recordAudit 在白名单动作的同一事务里触发，调度器在采集与同步成功后、tenantCatalog 在读取时也各比较一次：重新生成目录、去掉统计，和上一版的快照按条目标识比较，有差异才记新版本
 import { and, desc, eq, gt, sql } from 'drizzle-orm';
 import type { AuditAction, Tx } from '../audit';
-import type { getDb } from '../db/client';
-import { catalogVersions } from '../db/schema';
+import { getDb } from '../db/client';
+import { catalogVersions, tenants } from '../db/schema';
 import { buildCatalog, type Catalog, type CatalogEntry } from './index';
 import { loadCatalogInput } from './load';
 
@@ -17,6 +17,12 @@ export const CATALOG_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   'template.published', 'template.auto_enabled',
   'business_note.updated',
 ]);
+
+/**
+ * 一版目录的原因：白名单审计动作，采集 / 同步后发现源表结构变了（source.profiled / source.synced），
+ * 或读取时补记（catalog.initial / platform.capabilities / catalog.detected，见 ensureCatalogVersion）
+ */
+export type CatalogVersionReason = AuditAction | 'source.profiled' | 'source.synced' | 'catalog.initial' | 'platform.capabilities' | 'catalog.detected';
 
 export interface DiffItem { id: string; kind: CatalogEntry['kind']; name: string }
 
@@ -79,22 +85,51 @@ async function latest(db: Tx | ReturnType<typeof getDb>, tenantId: string) {
 export const currentCatalogVersion = async (db: Tx | ReturnType<typeof getDb>, tenantId: string): Promise<number | null> =>
   (await latest(db, tenantId))?.version ?? null;
 
+/** 按当前元数据生成、去掉统计的目录条目 */
+const strippedCatalog = async (db: Tx | ReturnType<typeof getDb>, tenantId: string) =>
+  stripStats(buildCatalog(await loadCatalogInput(db, tenantId, { stats: false })));
+
 /**
  * 在事务里重新生成目录（不读统计）、去掉统计，和最新一版比较：有差异时记下一版并返回版本号，没有差异时返回 null。
+ * reason 可以是函数，按差异与有没有上一版决定原因。
  * 没有上一版时记第 1 版，全部条目都是新增。用事务级 advisory 锁按租户串行化（不用 lockTenant：它锁租户行的时机太晚，可能死锁）。
  * 这把锁之后不能再等租户行的锁：事务开头没锁租户行的白名单动作，审计要记在入队任务（insertTask 加 FOR SHARE）、lockTenant 之后，
- * 否则与先锁租户行（或已因插审计行持有 KEY SHARE）再记审计的事务互相等待
+ * 否则与先锁租户行（或已因插审计行持有 KEY SHARE）再记审计的事务互相等待。所以拿锁前先对租户行加 FOR KEY SHARE（插版本行的外键要的就是它）：
+ * 经 recordAudit 来的已经持有，调度器与读取时补记的在这里先等 lockTenant 的事务结束
  */
-export async function recordCatalogVersion(tx: Tx, tenantId: string, reason: string): Promise<number | null> {
+export async function recordCatalogVersion(
+  tx: Tx, tenantId: string, reason: CatalogVersionReason | ((diff: CatalogDiff, first: boolean) => CatalogVersionReason),
+): Promise<number | null> {
+  await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('key share');
   await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`catalog_version:${tenantId}`}, 0))`);
-  const snapshot = stripStats(buildCatalog(await loadCatalogInput(tx, tenantId, { stats: false })));
+  const snapshot = await strippedCatalog(tx, tenantId);
   const prev = await latest(tx, tenantId);
   const diff = diffCatalog(prev?.snapshot ?? [], snapshot);
   if (isEmpty(diff)) return null;
   const version = (prev?.version ?? 0) + 1;
-  await tx.insert(catalogVersions).values({ tenantId, version, reason, snapshot, diff });
+  await tx.insert(catalogVersions).values({ tenantId, version, reason: typeof reason === 'string' ? reason : reason(diff, !prev), snapshot, diff });
   return version;
 }
+
+/**
+ * 不在事务里先比较一次，目录和最新一版有差异时才开事务、加锁记一版（recordCatalogVersion 会在锁里重新比较）。
+ * 给不经成员事务的变化用：采集、同步与读取多半没有变化，这样不必锁租户行、和合并入队等成员操作抢锁
+ */
+export async function recordCatalogVersionIfChanged(tenantId: string, reason: Parameters<typeof recordCatalogVersion>[2]): Promise<number | null> {
+  const db = getDb();
+  const prev = await latest(db, tenantId);
+  if (prev && isEmpty(diffCatalog(prev.snapshot, await strippedCatalog(db, tenantId)))) return null;
+  return db.transaction(tx => recordCatalogVersion(tx, tenantId, reason));
+}
+
+/**
+ * 读目录时补记：目录和最新一版不一致而没有事件记下来（如代码升级后能力说明变了）时记一版。
+ * 原因：还没有版本时是 catalog.initial，只有能力条目变了是 platform.capabilities，否则 catalog.detected
+ */
+export const ensureCatalogVersion = (tenantId: string) => recordCatalogVersionIfChanged(tenantId, (diff, first) =>
+  first ? 'catalog.initial'
+  : [...diff.added, ...diff.removed, ...diff.changed].every(x => x.kind === 'capability') ? 'platform.capabilities'
+  : 'catalog.detected');
 
 /** 版本 since 之后的各版本（版本号、时间、原因、差异），以及版本 since 与当前之间的净差异；since 为 0 或不存在时和空目录比 */
 export async function catalogChangesSince(db: Tx | ReturnType<typeof getDb>, tenantId: string, since: number) {

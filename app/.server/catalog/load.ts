@@ -13,7 +13,7 @@ import { publishedMergeGroups } from '../merge-groups';
 import type { TableProfile } from '../pipeline/source-engine';
 import { TEMPLATES, type TemplateId } from '../pipeline/templates';
 import { buildCatalog, type Catalog, type CatalogInput } from './index';
-import { currentCatalogVersion } from './versions';
+import { currentCatalogVersion, ensureCatalogVersion } from './versions';
 
 /** 本租户生成目录用的元数据；stats: false 时不读实体行数（它另开连接、不在事务里），记目录版本时用 */
 export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenantId: string, opts: { stats?: boolean } = {}): Promise<CatalogInput> {
@@ -85,8 +85,13 @@ export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenant
   };
 }
 
-/** 本租户当前的语义目录，带当前目录版本号 */
+/**
+ * 本租户当前的语义目录，带当前目录版本号；先补记目录和最新一版的不一致（见 ensureCatalogVersion）。
+ * 先读版本号再生成目录：目录只会比版本号新，外部 Agent 下次再读就会更新缓存
+ */
 export async function tenantCatalog(tenantId: string): Promise<Catalog> {
   const db = getDb();
-  return { ...buildCatalog(await loadCatalogInput(db, tenantId)), version: await currentCatalogVersion(db, tenantId) };
+  await ensureCatalogVersion(tenantId);
+  const version = await currentCatalogVersion(db, tenantId);
+  return { ...buildCatalog(await loadCatalogInput(db, tenantId)), version };
 }

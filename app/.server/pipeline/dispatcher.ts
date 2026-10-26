@@ -4,8 +4,10 @@
 // 常驻运行时还定期为到期的数据源入队同步与湖中数据核对，为有新变化的租户入队标准层合并；同步给已发布映射的源表写入变更后随即入队一次合并，
 // 分析模板与指标、标签任务成功后登记结果快照，因断言失败时告警；还定期为有到期快照的租户入队快照过期、有到期沙箱表的入队沙箱表过期，成功后标记快照、沙箱表已过期。
 // 登记了新快照或标记了过期后入队重建服务库，生成成功后把服务库指针切到新版本
+// 源表采集与同步成功后和最新一版语义目录比较，源表的列变了记一版目录版本
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { recordCatalogVersionIfChanged } from '../catalog/versions';
 import { registerDslSnapshot } from '../dsl-definitions';
 import { cleanupExpiredExports } from '../exports';
 import { alertNewFallback } from '../fallback-alerts';
@@ -87,12 +89,18 @@ export function createDispatcher({
         // 错误已由工作进程抹掉凭据；记进调度器日志，便于在后台排查
         if ('error' in outcome!) console.warn(`[调度器] 任务 ${task.id}（${task.kind}）失败：${outcome.error}`);
         await finishTask(task.id, outcome!);
+        const succeeded = !('error' in outcome!);
         // 同步给已发布映射的源表写入了变更批次（部分失败时也可能有）：随即把它们合并进标准层
         if (task.kind === 'source.sync' && outcome!.result) await mergeAfterSync(task.tenantId, task.id);
         // 同步发现源表删了列或破坏性改了类型、且已发布映射引用了它们：通知能改映射的成员并记审计（ADR-0034）
         if (task.kind === 'source.sync' && outcome!.result) await alertSchemaBreak(task.tenantId, task, outcome!.result);
         // 告警时入队的重新采集（带 repairFor）成功：按规则猜测源列改名，起草修复草稿并发带链接的邮件（ADR-0034）
-        if (task.kind === 'source.profile' && outcome!.result && !('error' in outcome!) && task.params.repairFor) await draftSchemaRepairs(task.tenantId, task);
+        if (task.kind === 'source.profile' && outcome!.result && succeeded && task.params.repairFor) await draftSchemaRepairs(task.tenantId, task);
+        // 采集或同步成功：源表的列可能变了，和最新一版目录比较，有差异记一版（ADR-0041）；只改了统计不记。失败不影响任务状态
+        if ((task.kind === 'source.profile' || task.kind === 'source.sync') && succeeded) {
+          await recordCatalogVersionIfChanged(task.tenantId, task.kind === 'source.profile' ? 'source.profiled' : 'source.synced')
+            .catch(e => console.warn(`[调度器] 任务 ${task.id} 之后记目录版本失败`, e));
+        }
         // 合并里值字典没写到的新取值落入了兜底值（以前没通知过）：通知能改映射的成员并记审计（ADR-0015）。部分映射失败时也看成功的那些
         if (task.kind === 'silver.merge' && outcome!.result) await alertNewFallback(task.tenantId, task, outcome!.result);
         // 合并成功：以默认参数自动启用依赖已齐、本租户还没有定义的模板，产出第一版快照（ADR-0021）
@@ -110,7 +118,6 @@ export function createDispatcher({
         // 到期沙箱表已删、旧文件已清理：标记为已过期，工作台不再列出（沙箱表不进服务库，不重建）
         if (task.kind === 'sandbox.expire' && outcome!.result) await markSandboxExpired(task.tenantId, task.id);
         // 有了新快照或快照过期：重建服务库（ADR-0033），服务库只收 RFM 与指标、标签，其他模板的快照不触发；断言失败的任务也带 result，要看有没有 error。生成成功后才切换指针
-        const succeeded = !('error' in outcome!);
         if ((task.kind === 'gold.rfm' || task.kind === 'gold.dsl' || task.kind === 'gold.expire') && succeeded) await enqueueServingBuild(task.tenantId);
         if (task.kind === 'serving.build' && succeeded) await activateServingStore(task.tenantId, task.id);
       })

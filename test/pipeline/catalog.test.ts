@@ -2,18 +2,28 @@
 // 生成总览与条目；同步范围内还没映射的源表标「未映射」，范围外的不收，敏感字段与它们引用的源列不进目录；
 // 源表带采集统计，实体带合并行数，字段带所映射源列的源端样本统计；发布的指标能展开、能按说明搜到，模板带产出列与最近一次快照；
 // 实体字段与映射字段的业务说明保存后马上进目录、能搜到，清空后不再出现，敏感字段的说明不进目录；
-// 映射发布、确认停用、定义发布与业务说明保存各记一版目录版本（原因是审计动作），目录没变的不记，可以取某版以来的差异
+// 映射发布、确认停用、定义发布与业务说明保存各记一版目录版本（原因是审计动作），目录没变的不记，可以取某版以来的差异；
+// 自定义实体、合并组、源视图、同步范围、指标 / 标签 / 模板的发布也各记一版；源表加删列后重新采集记一版（source.profiled），只改统计的同步不记；
+// 目录与最新一版不一致而没有事件记录时（能力说明变了），tenantCatalog 读取时补记一版，还没有版本的租户读取时记第 1 版，补记不与先锁租户行的事务死锁
+import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand, overview, search, toJson, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
-import { catalogChangesSince } from '../../app/.server/catalog/versions';
+import { catalogChangesSince, recordCatalogVersion } from '../../app/.server/catalog/versions';
 import { saveBusinessNote } from '../../app/.server/business-notes';
+import { createCustomEntity, deleteCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
+import { catalogVersions } from '../../app/.server/db/schema';
 import { createDefinition, discardDslDraft, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
-import { confirmDisable, requestDisable } from '../../app/.server/mappings';
+import { confirmDisable, lockTenant, requestDisable } from '../../app/.server/mappings';
+import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-groups';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { syncSource } from '../../app/.server/source-sync';
+import { createSourceView, publishSourceView } from '../../app/.server/source-views';
 import { relistSource, setSyncScope } from '../../app/.server/sources';
+import { publishTemplate, saveDraft } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
+import { memberOf, newTenant } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource, READER } from './source-fixtures';
 
@@ -21,6 +31,19 @@ afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 
 const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+/** 本租户最新一版目录版本；还没有版本时为 undefined */
+const latestVersion = async (tenantId: string) => (await getDb().select().from(catalogVersions)
+  .where(eq(catalogVersions.tenantId, tenantId)).orderBy(desc(catalogVersions.version)).limit(1))[0];
+
+/** 做一件事，断言目录版本 +1、原因是 reason，返回新的一版 */
+async function expectBump(tenantId: string, reason: string, act: () => Promise<unknown>) {
+  const before = (await latestVersion(tenantId))?.version ?? 0;
+  await act();
+  const after = await latestVersion(tenantId);
+  expect(after, reason).toMatchObject({ version: before + 1, reason });
+  return after!;
+}
 
 describe('语义目录的加载', () => {
   it('收进同步范围内的源表（没映射的标未映射），不收范围外的，敏感字段与它们引用的源列不出现', async () => {
@@ -189,5 +212,142 @@ describe('语义目录的加载', () => {
     expect(c.version).toBe(v0 + 3);
     expect(overview(c).version).toBe(v0 + 3);
     expect(toMarkdown(overview(c))).toContain(`目录版本 ${v0 + 3}`);
+  });
+
+  it('自定义实体发布与删除各记一版', async () => {
+    const acme = await newTenant('acme');
+    const author = await memberOf(acme, 'de@acme.com');
+    const reviewer = await memberOf(acme, 'de2@acme.com');
+    const id = await createCustomEntity(author, {
+      name: 'custom_store', label: '门店', kind: 'dimension',
+      fields: [{ name: 'store_id', type: 'string', description: '门店编号', sensitive: false }], primaryKey: ['store_id'],
+    });
+    expect(await latestVersion(acme)).toBeUndefined();
+    const published = await expectBump(acme, 'custom_entity.published', () => publishCustomEntity(reviewer, id, 1));
+    expect(published.diff.added.map(x => x.id)).toContain('entity:custom_store');
+    const deleted = await expectBump(acme, 'custom_entity.deleted', () => deleteCustomEntity(author, id));
+    expect(deleted.diff.removed.map(x => x.id)).toContain('entity:custom_store');
+  });
+
+  it('合并组发布记一版', async () => {
+    const { acme, author, reviewer, orderMappings } = await publishedIdentitySources({ orders: true });
+    await saveMergeGroupDraft(author, 'order', { members: [orderMappings!.crm, orderMappings!.loyalty], rule: { kind: 'priority' } });
+    const v = await expectBump(acme, 'merge_group.published', () => publishMergeGroup(reviewer, 'order', 1));
+    expect(v.diff.changed.map(x => x.id)).toContain('entity:order');
+  });
+
+  it('源视图发布记一版', async () => {
+    const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
+    const viewId = await createSourceView(author, sources.crm, {
+      name: 'paid_orders', sql: "SELECT order_no, amount, _op, _batch, _commit_ts FROM orders WHERE status = 'paid'",
+    });
+    const v = await expectBump(acme, 'source_view.published', () => publishSourceView(reviewer, sources.crm, viewId, 1));
+    expect(v.diff.added.map(x => x.id)).toContain('table:CRM/paid_orders');
+  });
+
+  it('同步范围变更记一版', async () => {
+    const { acme, author, sources } = await publishedIdentitySources();
+    await grantOnSource(`CREATE TABLE crm.stores (store_id text PRIMARY KEY, updated_at timestamp NOT NULL);
+      GRANT SELECT ON ALL TABLES IN SCHEMA crm TO ${READER.user};`);
+    await relistSource(author, sources.crm);
+    await drain();
+    const v = await expectBump(acme, 'source.scope_changed', () => setSyncScope(author, sources.crm, { add: ['stores'] }));
+    expect(v.diff.added.map(x => x.id)).toContain('table:CRM/stores');
+  });
+
+  it('指标、标签与模板定义的发布各记一版，自动启用模板也记一版；之后的快照不记', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    await drain();
+    const { versions } = await catalogChangesSince(getDb(), acme, 0);
+    expect(versions.find(v => v.reason === 'template.auto_enabled')?.diff.added.map(x => x.id)).toContain('template:rfm');
+
+    await createDefinition(author, 'metric', 'revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    await expectBump(acme, 'definition.published', () => publishDefinition(reviewer, 'metric', 'revenue', 1));
+    await createDefinition(author, 'tag', 'value_tier', 'metric: revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n');
+    const tag = await expectBump(acme, 'definition.published', () => publishDefinition(reviewer, 'tag', 'value_tier', 1));
+    expect(tag.diff.added.map(x => x.id)).toEqual(['tag:value_tier']);
+    await drain();
+
+    await saveDraft(author, 'rfm', {
+      lookbackDays: 3650, statuses: ['paid'],
+      binning: { method: 'thresholds', recency: [30, 90, 180, 365], frequency: [2, 3, 5, 8], monetary: [100, 500, 1000, 5000] },
+      segments: [{ name: '高价值', m: { min: 3 } }, { name: '其他' }],
+    });
+    const template = await expectBump(acme, 'template.published', () => publishTemplate(reviewer, 'rfm', 2));
+    expect(template.diff.changed.map(x => x.id)).toContain('template:rfm');
+    await drain();
+    expect((await latestVersion(acme))?.version).toBe(template.version);
+  });
+
+  it('源表加列、删列后重新采集各记一版，差异里是该表的列；只改了行数的同步与随后的合并不记', async () => {
+    const { acme, author, sources } = await publishedIdentitySources({ orders: true });
+    await drain();
+    const v0 = (await latestVersion(acme))!.version;
+
+    await grantOnSource('ALTER TABLE crm.orders ADD COLUMN coupon text');
+    await relistSource(author, sources.crm);
+    await drain();
+    const added = await catalogChangesSince(getDb(), acme, v0);
+    expect(added.versions.map(v => [v.version, v.reason])).toEqual([[v0 + 1, 'source.profiled']]);
+    expect(added.versions[0].diff.changed).toEqual([expect.objectContaining({ id: 'table:CRM/orders', keys: expect.arrayContaining(['columns']) })]);
+    expect(expand(await tenantCatalog(acme), 'table:CRM/orders')).toMatchObject({ columns: expect.arrayContaining([expect.objectContaining({ name: 'coupon' })]) });
+
+    await grantOnSource('ALTER TABLE crm.orders DROP COLUMN coupon');
+    await relistSource(author, sources.crm);
+    await drain();
+    expect(await latestVersion(acme)).toMatchObject({ version: v0 + 2, reason: 'source.profiled' });
+
+    await grantOnSource("INSERT INTO crm.orders VALUES ('A9', 1, 'paid', 50, '2024-06-29 10:00', '2024-06-29 10:00', now())");
+    await syncSource(author, sources.crm);
+    await drain();
+    expect((await latestVersion(acme))?.version).toBe(v0 + 2);
+    expect(expand(await tenantCatalog(acme), 'entity:order')).toMatchObject({ stats: { rows: 12 } });
+    expect((await latestVersion(acme))?.version).toBe(v0 + 2);
+  });
+
+  it('目录与最新一版不一致而没有事件记录时，读取时补记一版：只有能力条目变了是 platform.capabilities，否则 catalog.detected；没有版本时记第 1 版', async () => {
+    const { acme } = await publishedIdentitySources();
+    const tamper = async (drop: string) => {
+      const row = (await latestVersion(acme))!;
+      expect(row.snapshot.map(e => e.id)).toContain(drop);
+      await getDb().update(catalogVersions).set({ snapshot: row.snapshot.filter(e => e.id !== drop) })
+        .where(and(eq(catalogVersions.tenantId, acme), eq(catalogVersions.version, row.version)));
+      return row.version;
+    };
+
+    const v0 = await tamper('capability:metric-dsl');
+    expect((await tenantCatalog(acme)).version).toBe(v0 + 1);
+    expect(await latestVersion(acme)).toMatchObject({
+      version: v0 + 1, reason: 'platform.capabilities', diff: { added: [expect.objectContaining({ id: 'capability:metric-dsl' })], removed: [], changed: [] },
+    });
+    // 一致之后再读不记
+    expect((await tenantCatalog(acme)).version).toBe(v0 + 1);
+
+    await tamper('entity:customer');
+    expect((await tenantCatalog(acme)).version).toBe(v0 + 2);
+    expect(await latestVersion(acme)).toMatchObject({ reason: 'catalog.detected' });
+
+    await getDb().delete(catalogVersions).where(eq(catalogVersions.tenantId, acme));
+    expect((await tenantCatalog(acme)).version).toBe(1);
+    expect(await latestVersion(acme)).toMatchObject({ version: 1, reason: 'catalog.initial' });
+  });
+
+  it('读取时补记不与先锁住租户行再记版本的事务互相等待', async () => {
+    const { acme } = await publishedIdentitySources();
+    const row = (await latestVersion(acme))!;
+    await getDb().update(catalogVersions).set({ snapshot: row.snapshot.filter(e => e.id !== 'capability:metric-dsl') })
+      .where(and(eq(catalogVersions.tenantId, acme), eq(catalogVersions.version, row.version)));
+
+    let reading: Promise<unknown> | undefined;
+    await getDb().transaction(async tx => {
+      await lockTenant(tx, acme);
+      reading = tenantCatalog(acme);
+      // 等读取进到补记里，再像 lockTenant 之后记审计那样记版本
+      await new Promise(r => setTimeout(r, 300));
+      await recordCatalogVersion(tx, acme, 'business_note.updated');
+    });
+    // 读取等锁住租户行的事务记完才补记，这时目录已一致，不再多记
+    expect(await reading).toMatchObject({ version: row.version + 1 });
+    expect(await latestVersion(acme)).toMatchObject({ version: row.version + 1, reason: 'business_note.updated' });
   });
 });
