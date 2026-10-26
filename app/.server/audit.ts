@@ -315,6 +315,15 @@ export async function recordAudit(tx: Tx | Db, entry: AuditEntry) {
     targetId: entry.targetId ?? null,
     detail: entry.detail ?? {},
   });
+  // 会改变目录的动作在同一事务里记目录版本（ADR-0041）；动态引入，避免 versions → load → mappings → audit 的循环引用
+  if (entry.tenantId) {
+    const { CATALOG_ACTIONS, recordCatalogVersion } = await import('./catalog/versions');
+    const tenantId = entry.tenantId;
+    // 白名单动作都在事务里记审计；万一传的是连接，另开事务记版本（advisory 锁要有事务才有意义）
+    if (CATALOG_ACTIONS.has(entry.action)) {
+      await ('rollback' in tx ? recordCatalogVersion(tx, tenantId, entry.action) : tx.transaction(t => recordCatalogVersion(t, tenantId, entry.action)));
+    }
+  }
 }
 
 type AuditRow = typeof auditLogs.$inferSelect;

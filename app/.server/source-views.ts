@@ -219,6 +219,9 @@ export async function publishSourceView(actor: CurrentMember, sourceId: string, 
     await tx.update(sourceViewVersions)
       .set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` })
       .where(eq(sourceViewVersions.id, draft.id));
+    const dependents = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.sourceViewId, viewId));
+    if (dependents.length) await enqueueMerge(tx, actor.tenant.id, dependents.map(m => m.id));
+    // 审计放在入队之后：记目录版本拿的锁要是事务里最后一个锁（见 catalog/versions.ts）
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
@@ -227,8 +230,6 @@ export async function publishSourceView(actor: CurrentMember, sourceId: string, 
       targetId: viewId,
       detail: { source: view.sourceName, name: view.name, version, authors: draft.authors, lastEditor: draft.lastEditor },
     });
-    const dependents = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.sourceViewId, viewId));
-    if (dependents.length) await enqueueMerge(tx, actor.tenant.id, dependents.map(m => m.id));
   });
 }
 

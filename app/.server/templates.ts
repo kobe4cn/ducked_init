@@ -166,6 +166,8 @@ export async function publishTemplate(actor: CurrentMember, id: string, version:
     await tx.update(templateVersions)
       .set({ status: 'published', params: definition, publishedByEmail: actor.email, publishedAt: sql`now()` })
       .where(eq(templateVersions.id, draft.id));
+    const task = await enqueueTemplate(tx, actor.tenant.id, template, definition, version, todayUtc(), 'publish');
+    // 审计放在入队之后：记目录版本拿的锁要是事务里最后一个锁（见 catalog/versions.ts）
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
@@ -174,7 +176,7 @@ export async function publishTemplate(actor: CurrentMember, id: string, version:
       targetId: draft.definitionId,
       detail: { template, version, authors: draft.authors, lastEditor: draft.lastEditor },
     });
-    return enqueueTemplate(tx, actor.tenant.id, template, definition, version, todayUtc(), 'publish');
+    return task;
   });
 }
 

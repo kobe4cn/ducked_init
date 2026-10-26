@@ -12,10 +12,11 @@ import { lastMergeByMapping, publishedPlans } from '../mappings';
 import { publishedMergeGroups } from '../merge-groups';
 import type { TableProfile } from '../pipeline/source-engine';
 import { TEMPLATES, type TemplateId } from '../pipeline/templates';
-import { buildCatalog, type CatalogInput } from './index';
+import { buildCatalog, type Catalog, type CatalogInput } from './index';
+import { currentCatalogVersion } from './versions';
 
-/** 本租户生成目录用的元数据 */
-export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenantId: string): Promise<CatalogInput> {
+/** 本租户生成目录用的元数据；stats: false 时不读实体行数（它另开连接、不在事务里），记目录版本时用 */
+export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenantId: string, opts: { stats?: boolean } = {}): Promise<CatalogInput> {
   const rows = await db.select({ id: sources.id, name: sources.name, kind: sources.kind }).from(sources)
     .where(eq(sources.tenantId, tenantId)).orderBy(sources.name);
   // 同步范围内、源端仍在且可读的表（同 sources.ts 的 isSyncable），列取各表最近一次成功采集到的
@@ -45,7 +46,7 @@ export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenant
   }));
   const plans = await publishedPlans(db, tenantId);
   // 实体行数：写入它的各映射最近一次合并成功的行数之和（同 lineage-flow.ts 的 silverTotals），截至其中最晚的一次
-  const last = await lastMergeByMapping(tenantId, plans.map(p => p.mapping));
+  const last = opts.stats === false ? {} : await lastMergeByMapping(tenantId, plans.map(p => p.mapping));
   const statsByEntity = new Map<string, { entity: string; rows: number; at: string }>();
   for (const p of plans) {
     const r = last[p.mapping];
@@ -84,5 +85,8 @@ export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenant
   };
 }
 
-/** 本租户当前的语义目录 */
-export const tenantCatalog = async (tenantId: string) => buildCatalog(await loadCatalogInput(getDb(), tenantId));
+/** 本租户当前的语义目录，带当前目录版本号 */
+export async function tenantCatalog(tenantId: string): Promise<Catalog> {
+  const db = getDb();
+  return { ...buildCatalog(await loadCatalogInput(db, tenantId)), version: await currentCatalogVersion(db, tenantId) };
+}

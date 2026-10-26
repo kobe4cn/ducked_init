@@ -144,13 +144,17 @@ export interface CapabilityEntry extends Base {
 export type CatalogEntry =
   | SourceEntry | TableEntry | EntityEntry | FieldEntry | RelationEntry | MetricEntry | TagEntry | TemplateEntry | CapabilityEntry;
 
-/** 按标识排好序的全部条目 */
-export interface Catalog { entries: CatalogEntry[] }
+/** 按标识排好序的全部条目；version 是当前目录版本号（tenantCatalog 读出，不进快照、不参与比较），还没有版本时为 null */
+export interface Catalog { entries: CatalogEntry[]; version?: number | null }
 
 /** 总览的一项；实体带字段名，放不下时只带字段数 */
 export interface OverviewItem { id: string; name: string; description: string; fields?: string[]; fieldCount?: number }
 
-export interface Overview { kind: 'overview'; items: OverviewItem[]; /** 放不下、没列出的项数（用搜索找） */ omitted: number }
+export interface Overview {
+  kind: 'overview'; items: OverviewItem[]; /** 放不下、没列出的项数（用搜索找） */ omitted: number;
+  /** 目录版本号，还没有版本时为 null */
+  version: number | null;
+}
 
 /** 总览的 token 上限（按 estimateTokens 估算 Markdown） */
 export const OVERVIEW_TOKENS = 4000;
@@ -388,10 +392,11 @@ export function overview(c: Catalog): Overview {
     ...(e.kind === 'entity' && (names ? { fields: e.fields.map(f => f.name) } : { fieldCount: e.fields.length })),
   });
   const fits = (o: Overview) => estimateTokens(toMarkdown(o)) <= OVERVIEW_TOKENS;
-  const full: Overview = { kind: 'overview', items: top.map(e => item(e, true)), omitted: 0 };
+  const version = c.version ?? null;
+  const full: Overview = { kind: 'overview', items: top.map(e => item(e, true)), omitted: 0, version };
   if (fits(full)) return full;
   const counts = top.map(e => item(e, false));
-  const first = (n: number): Overview => ({ kind: 'overview', items: counts.slice(0, n), omitted: counts.length - n });
+  const first = (n: number): Overview => ({ kind: 'overview', items: counts.slice(0, n), omitted: counts.length - n, version });
   // 放得下的最多项数（项数越多越长，二分）
   let [lo, hi] = [0, counts.length];
   while (lo < hi) {
@@ -464,7 +469,7 @@ function overviewMarkdown(o: Overview): string {
     return `- ${i.id} ${i.name}${i.description ? ` — ${i.description}` : ''}${fields}`;
   });
   if (o.omitted) lines.push(`- 另有 ${o.omitted} 项没有列出，请用搜索查找`);
-  return ['# 语义目录', '', ...lines].join('\n');
+  return ['# 语义目录', '', ...(o.version != null ? [`目录版本 ${o.version}`, ''] : []), ...lines].join('\n');
 }
 
 function entryMarkdown(e: CatalogEntry): string {

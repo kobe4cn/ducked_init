@@ -1,13 +1,16 @@
 // test/pipeline/catalog.test.ts —— 语义目录的加载（ADR-0041）：tenantCatalog 从平台库读出数据源、同步范围内的源表、已发布映射与自定义实体，
 // 生成总览与条目；同步范围内还没映射的源表标「未映射」，范围外的不收，敏感字段与它们引用的源列不进目录；
 // 源表带采集统计，实体带合并行数，字段带所映射源列的源端样本统计；发布的指标能展开、能按说明搜到，模板带产出列与最近一次快照；
-// 实体字段与映射字段的业务说明保存后马上进目录、能搜到，清空后不再出现，敏感字段的说明不进目录
+// 实体字段与映射字段的业务说明保存后马上进目录、能搜到，清空后不再出现，敏感字段的说明不进目录；
+// 映射发布、确认停用、定义发布与业务说明保存各记一版目录版本（原因是审计动作），目录没变的不记，可以取某版以来的差异
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand, overview, search, toJson, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
+import { catalogChangesSince } from '../../app/.server/catalog/versions';
 import { saveBusinessNote } from '../../app/.server/business-notes';
-import { closeDb } from '../../app/.server/db/client';
-import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { createDefinition, discardDslDraft, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
+import { confirmDisable, requestDisable } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { relistSource, setSyncScope } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
@@ -138,5 +141,53 @@ describe('语义目录的加载', () => {
     expect(expand(c, 'field:order.status')).not.toHaveProperty('note');
     expect(toJson(c.entries)).not.toMatch(/退款单也算|取消单/);
     expect(search(c, '取消单')).toEqual([]);
+  });
+
+  it('映射发布、业务说明、定义发布与确认停用各记一版，原因是审计动作；目录没变、起草与丢弃草稿不记；可取某版以来的差异，总览带版本号', async () => {
+    const { acme, author, reviewer, orderMappings } = await publishedIdentitySources({ orders: true });
+    await drain();
+    const current = async () => (await catalogChangesSince(getDb(), acme, 0)).current!;
+    const start = await catalogChangesSince(getDb(), acme, 0);
+    expect(start.versions.map(v => v.version)).toEqual(start.versions.map((_, i) => i + 1));
+    expect(start.versions[0]).toMatchObject({ version: 1, reason: 'source.registered' });
+    expect(start.versions.map(v => v.reason)).toEqual(expect.arrayContaining(['mapping.published', 'template.auto_enabled']));
+    expect(start.net.added.map(x => x.id)).toEqual(expect.arrayContaining(['entity:order', 'field:order.status', 'template:rfm']));
+    const v0 = start.current!;
+
+    await saveBusinessNote(author, { entity: 'order', field: 'status', note: '退款单也算一笔订单' });
+    expect(await current()).toBe(v0 + 1);
+    // 同一条说明再存一次：目录没变，不记
+    await saveBusinessNote(author, { entity: 'order', field: 'status', note: '退款单也算一笔订单' });
+    expect(await current()).toBe(v0 + 1);
+
+    await createDefinition(author, 'metric', 'paid_revenue', 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 实付金额\n');
+    await saveDslDraft(author, 'metric', 'paid_revenue', 'base: order\nmeasure: { agg: count }\n');
+    expect(await current()).toBe(v0 + 1);
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 1);
+    expect(await current()).toBe(v0 + 2);
+    await saveDslDraft(author, 'metric', 'paid_revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    await discardDslDraft(author, 'metric', 'paid_revenue');
+    expect(await current()).toBe(v0 + 2);
+
+    await drain();
+    await requestDisable(author, orderMappings!.loyalty);
+    expect(await current()).toBe(v0 + 2);
+    await confirmDisable(reviewer, orderMappings!.loyalty);
+    expect(await current()).toBe(v0 + 3);
+
+    const since = await catalogChangesSince(getDb(), acme, v0);
+    expect(since.current).toBe(v0 + 3);
+    expect(since.versions.map(v => [v.version, v.reason])).toEqual([
+      [v0 + 1, 'business_note.updated'], [v0 + 2, 'definition.published'], [v0 + 3, 'mapping.disabled'],
+    ]);
+    expect(since.versions[0].diff.changed).toEqual([expect.objectContaining({ id: 'field:order.status', keys: ['note'] })]);
+    expect(since.versions[0].createdAt).toBeInstanceOf(Date);
+    expect(since.net.added).toEqual([expect.objectContaining({ id: 'metric:paid_revenue', kind: 'metric' })]);
+    expect(since.net.changed.map(x => x.id)).toEqual(expect.arrayContaining(['field:order.status', 'entity:order', 'table:会员/orders']));
+
+    const c = await tenantCatalog(acme);
+    expect(c.version).toBe(v0 + 3);
+    expect(overview(c).version).toBe(v0 + 3);
+    expect(toMarkdown(overview(c))).toContain(`目录版本 ${v0 + 3}`);
   });
 });

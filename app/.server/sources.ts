@@ -418,6 +418,8 @@ export async function setSyncScope(actor: CurrentMember, sourceId: string, { add
     const named = (names: string[]) => and(eq(sourceTables.sourceId, sourceId), inArray(sourceTables.tableName, names));
     if (added.length) await tx.update(sourceTables).set({ inScope: true, ...scoped }).where(named(added));
     if (removed.length) await tx.update(sourceTables).set({ inScope: false, ...scoped }).where(named(removed));
+    const task = added.length ? await insertTask(tx, actor.tenant.id, 'source.profile', { sourceId, tables: added }) : null;
+    // 审计放在入队之后：记目录版本拿的锁要是事务里最后一个锁（见 catalog/versions.ts）
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
@@ -426,7 +428,6 @@ export async function setSyncScope(actor: CurrentMember, sourceId: string, { add
       targetId: sourceId,
       detail: { name: row.name, added, removed },
     });
-    const task = added.length ? await insertTask(tx, actor.tenant.id, 'source.profile', { sourceId, tables: added }) : null;
     return { added, removed, task };
   });
 }
@@ -468,6 +469,9 @@ export async function updateSource(actor: CurrentMember, sourceId: string, input
       ...(rotated && { credentials: await encryptForTenant(actor.tenant.id, credentialsContext(row.id), credentials), credentialsRotatedAt: new Date() }),
       updatedAt: new Date(),
     }).where(and(eq(sources.id, row.id), eq(sources.tenantId, actor.tenant.id)));
+    await recordListing(tx, row.id, listed);
+    await enqueueScopedProfile(tx, actor.tenant.id, row.id);
+    // 审计放在入队之后：记目录版本拿的锁要是事务里最后一个锁（见 catalog/versions.ts）
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
@@ -476,7 +480,5 @@ export async function updateSource(actor: CurrentMember, sourceId: string, input
       targetId: row.id,
       detail: { name, ...(name !== row.name && { renamedFrom: row.name }), changed, credentialsRotated: rotated },
     });
-    await recordListing(tx, row.id, listed);
-    await enqueueScopedProfile(tx, actor.tenant.id, row.id);
   }));
 }

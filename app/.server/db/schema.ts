@@ -5,6 +5,8 @@ import type { CustomEntityField, CustomEntityKind, EntityRelation } from '../../
 import type { MergeRule } from '../../lib/merge-groups';
 import { ROLES } from '../../lib/roles';
 import { SOURCE_KINDS } from '../../lib/sources';
+import type { CatalogEntry } from '../catalog';
+import type { CatalogDiff } from '../catalog/versions';
 import type { MergePlan } from '../pipeline/mapping-spec';
 
 export { ROLE_LABELS, ROLES, type Role } from '../../lib/roles';
@@ -668,3 +670,15 @@ export const businessNotes = platform.table('business_notes', {
   createdByEmail: text('created_by_email').notNull(),
   createdAt: createdAt(),
 }, t => [index('business_notes_tenant_field_idx').on(t.tenantId, t.entity, t.field, t.mappingId, t.createdAt)]);
+
+// 语义目录的版本（ADR-0041）：目录的结构或含义变了才记一版。snapshot 是去掉统计后的全部条目，diff 是与上一版按条目标识比出的差异；
+// reason 是触发的审计动作（或 catalog.initial 之类）
+export const catalogVersions = platform.table('catalog_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  reason: text('reason').notNull(),
+  snapshot: jsonb('snapshot').$type<CatalogEntry[]>().notNull(),
+  diff: jsonb('diff').$type<CatalogDiff>().notNull(),
+  createdAt: createdAt(),
+}, t => [uniqueIndex('catalog_versions_tenant_version_uq').on(t.tenantId, t.version)]);
