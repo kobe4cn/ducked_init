@@ -1,7 +1,8 @@
 // test/http/catalog-changes.test.ts —— 目录变更记录的 HTTP 接缝（ADR-0041）：成员从数据地图页头进入 /catalog/changes，按版本倒序看到各版的原因与条目差异，?since=N 只看 N 之后的版本；
-// 查看者看不到 source: / table: 条目，数据源相关原因的版本只显示「数据源结构变化」、不列明细（ADR-0005）；还没有版本时显示空状态
+// 查看者看不到 source: / table: 条目，数据源相关原因（含源视图发布）的版本只显示「数据源结构变化」、不列明细（ADR-0005）；还没有版本时显示空状态
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { catalogVersions } from '../../app/.server/db/schema';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -52,6 +53,29 @@ describe('目录变更记录', () => {
     expect(viewerHtml).toContain('数据源结构变化');
     expect(viewerHtml).not.toContain('data-reason="source.');
     expect(viewerHtml).toContain('data-diff-id="field:event.event_type"');
+  });
+
+  it('最多列出最新的 50 个版本；源视图发布的版本对查看者只显示「数据源结构变化」', async () => {
+    const beta = await newTenant('beta');
+    const item = { id: 'entity:order', kind: 'entity' as const, name: '订单' };
+    await getDb().insert(catalogVersions).values(Array.from({ length: 55 }, (_, i) => ({
+      tenantId: beta, version: i + 1, snapshot: [],
+      reason: i + 1 === 54 ? 'source_view.published' : 'definition.published',
+      diff: { added: [], removed: [], changed: [{ ...item, keys: ['description'] }] },
+    })));
+
+    const admin = await (await (await loginAs(app, 'admin@beta.com')).get('/catalog/changes')).text();
+    expect(versionsOf(admin)).toEqual(Array.from({ length: 50 }, (_, i) => 55 - i));
+    expect(admin).toContain('当前目录版本 55');
+    expect(admin).toContain('data-reason="source_view.published"');
+
+    await memberOf(beta, 'viewer@beta.com', 'viewer');
+    const viewer = await (await (await loginAs(app, 'viewer@beta.com')).get('/catalog/changes')).text();
+    const v54 = viewer.slice(viewer.indexOf('data-catalog-version="54"'), viewer.indexOf('data-catalog-version="53"'));
+    expect(v54).toContain('data-reason="sources"');
+    expect(v54).toContain('数据源结构变化');
+    expect(v54).not.toContain('data-diff-id=');
+    expect(viewer).not.toContain('源视图发布');
   });
 
   it('还没有任何版本时显示空状态', async () => {

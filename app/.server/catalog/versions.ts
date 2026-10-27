@@ -131,13 +131,23 @@ export const ensureCatalogVersion = (tenantId: string) => recordCatalogVersionIf
   : [...diff.added, ...diff.removed, ...diff.changed].every(x => x.kind === 'capability') ? 'platform.capabilities'
   : 'catalog.detected');
 
+const versionsAfter = (db: Tx | ReturnType<typeof getDb>, tenantId: string, since: number) => db
+  .select({ version: catalogVersions.version, reason: catalogVersions.reason, createdAt: catalogVersions.createdAt, diff: catalogVersions.diff })
+  .from(catalogVersions).where(and(eq(catalogVersions.tenantId, tenantId), gt(catalogVersions.version, since)));
+
 /** 版本 since 之后的各版本（版本号、时间、原因、差异），以及版本 since 与当前之间的净差异；since 为 0 或不存在时和空目录比 */
 export async function catalogChangesSince(db: Tx | ReturnType<typeof getDb>, tenantId: string, since: number) {
-  const versions = await db
-    .select({ version: catalogVersions.version, reason: catalogVersions.reason, createdAt: catalogVersions.createdAt, diff: catalogVersions.diff })
-    .from(catalogVersions).where(and(eq(catalogVersions.tenantId, tenantId), gt(catalogVersions.version, since))).orderBy(catalogVersions.version);
+  const versions = await versionsAfter(db, tenantId, since).orderBy(catalogVersions.version);
   const current = await latest(db, tenantId);
   const [base] = await db.select({ snapshot: catalogVersions.snapshot }).from(catalogVersions)
     .where(and(eq(catalogVersions.tenantId, tenantId), eq(catalogVersions.version, since)));
   return { current: current?.version ?? null, versions, net: diffCatalog(base?.snapshot ?? [], current?.snapshot ?? []) };
+}
+
+/** 版本 since 之后最新的 limit 个版本（新的在前）与当前版本号；不读快照、不算净差异，供变更记录页面用 */
+export async function recentCatalogChanges(db: Tx | ReturnType<typeof getDb>, tenantId: string, since: number, limit: number) {
+  const versions = await versionsAfter(db, tenantId, since).orderBy(desc(catalogVersions.version)).limit(limit);
+  const [current] = await db.select({ version: catalogVersions.version }).from(catalogVersions)
+    .where(eq(catalogVersions.tenantId, tenantId)).orderBy(desc(catalogVersions.version)).limit(1);
+  return { current: current?.version ?? null, versions };
 }

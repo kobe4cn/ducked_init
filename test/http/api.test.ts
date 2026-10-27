@@ -257,7 +257,8 @@ describe('点查接口', () => {
       recency_days: expect.any(Number), frequency: expect.any(Number), monetary: expect.stringMatching(/^\d+\.\d{2}$/),
     });
     expect(body.snapshots).toEqual(store.snapshots);
-    expect(JSON.stringify(body)).not.toMatch(/@|1[3-9]\d{9}/);
+    // 手机号前后不能紧挨数字或字母，免得哈希、UUID 里的数字串误报
+    expect(JSON.stringify(body)).not.toMatch(/@|(?<![0-9a-z])1[3-9]\d{9}(?![0-9a-z])/i);
 
     const retired = await lookup(`/api/v1/consumers/${merged.old_id}`, key);
     expect(retired).toMatchObject({ status: 200, body: { consumer_id: merged.new_id, requested_id: merged.old_id, serving_version: store.version } });
