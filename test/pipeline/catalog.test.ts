@@ -3,7 +3,7 @@
 // 源表带采集统计，实体带合并行数，字段带所映射源列的源端样本统计；发布的指标能展开、能按说明搜到，模板带产出列与最近一次快照；
 // 实体字段与映射字段的业务说明保存后马上进目录、能搜到，清空后不再出现，敏感字段的说明不进目录；
 // 映射发布、确认停用、定义发布与业务说明保存各记一版目录版本（原因是审计动作），目录没变的不记，可以取某版以来的差异；
-// 自定义实体、合并组、源视图、同步范围、指标 / 标签 / 模板的发布也各记一版；源表加删列后重新采集记一版（source.profiled），只改统计的同步不记；
+// 自定义实体、合并组、源视图、同步范围、指标 / 标签 / 模板的发布与删除数据源也各记一版（删除后它的源表与源视图不再进目录）；源表加删列后重新采集记一版（source.profiled），只改统计的同步不记；
 // 目录与最新一版不一致而没有事件记录时（能力说明变了），tenantCatalog 读取时补记一版，还没有版本的租户读取时记第 1 版，补记不与先锁租户行的事务死锁
 import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -20,12 +20,12 @@ import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
-import { relistSource, setSyncScope } from '../../app/.server/sources';
+import { confirmWatermark, deleteSource, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
 import { publishTemplate, saveDraft } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant } from './fixtures';
+import { memberOf, newTenant, publish, selectAllTables } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
-import { grantOnSource, READER } from './source-fixtures';
+import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -227,6 +227,38 @@ describe('语义目录的加载', () => {
     expect(published.diff.added.map(x => x.id)).toContain('entity:custom_store');
     const deleted = await expectBump(acme, 'custom_entity.deleted', () => deleteCustomEntity(author, id));
     expect(deleted.diff.removed.map(x => x.id)).toContain('entity:custom_store');
+  });
+
+  it('删除数据源记一版，它的数据源、源表与已发布源视图条目都删掉；同名重新登记后又出现', async () => {
+    const acme = await newTenant('acme');
+    const author = await memberOf(acme, 'de@acme.com');
+    const reviewer = await memberOf(acme, 'de2@acme.com');
+    const { id } = await registerSource(author, await pgSourceInput(READER));
+    await selectAllTables(author, id);
+    await drain();
+    await confirmWatermark(author, id, 'customers', 'updated_at');
+    await confirmWatermark(author, id, 'orders', 'order_id');
+    await syncSource(author, id);
+    await drain();
+    // 已停用的映射保留着，它写过的实体字段血缘不能再指向这个数据源
+    const customers = await publish(author, reviewer, id, 'model: 1\nentity: customer\ntable: customers\nfields:\n  customer_id: string(customer_id)\n  updated_at: updated_at\n');
+    await requestDisable(author, customers);
+    await confirmDisable(reviewer, customers);
+    await drain();
+    const viewId = await createSourceView(author, id, { name: 'paid_orders', sql: 'SELECT order_id, _op, _batch, _commit_ts FROM orders' });
+    await publishSourceView(reviewer, id, viewId, 1);
+    const before = await tenantCatalog(acme);
+    expect(before.entries.map(e => e.id)).toEqual(expect.arrayContaining(['source:电商库', 'table:电商库/orders', 'table:电商库/paid_orders']));
+
+    const deleted = await expectBump(acme, 'source.deleted', () => deleteSource(author, id));
+    const removed = deleted.diff.removed.map(x => x.id);
+    expect(removed).toEqual(expect.arrayContaining(['source:电商库', 'table:电商库/orders', 'table:电商库/customers', 'table:电商库/paid_orders']));
+    const after = await tenantCatalog(acme);
+    expect(after.entries.filter(e => e.kind === 'source' || e.kind === 'table')).toEqual([]);
+    expect(JSON.stringify(after.entries)).not.toContain('电商库');
+
+    const again = await expectBump(acme, 'source.registered', async () => registerSource(author, await pgSourceInput(READER)));
+    expect([...again.diff.added, ...again.diff.changed].map(x => x.id)).toContain('source:电商库');
   });
 
   it('合并组发布记一版', async () => {

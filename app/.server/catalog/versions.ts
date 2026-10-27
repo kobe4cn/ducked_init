@@ -12,7 +12,7 @@ export const CATALOG_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   'mapping.published', 'mapping.disabled', 'mapping.restored',
   'custom_entity.published', 'custom_entity.deleted',
   'merge_group.published', 'source_view.published',
-  'source.scope_changed', 'source.registered', 'source.updated',
+  'source.scope_changed', 'source.registered', 'source.updated', 'source.deleted',
   'definition.published', 'definition.deleted',
   'template.published', 'template.auto_enabled',
   'business_note.updated',

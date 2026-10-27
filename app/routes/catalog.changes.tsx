@@ -1,5 +1,5 @@
 // app/routes/catalog.changes.tsx —— 目录变更记录（ADR-0041）：所有成员可看，按版本倒序列出各版的原因与新增 / 删除 / 改动的条目（只有标识、类型、名称与变了的顶层键，不显示快照内容）；
-// ?since=N 只看 N 之后的版本，最多 50 个版本；没有 sources:read 的成员（查看者）看不到数据源与源表条目，数据源相关原因（含源视图发布）的版本只显示「数据源结构变化」、不列明细（ADR-0005）
+// ?since=N 只看 N 之后的版本，最多 50 个版本；没有 sources:read 的成员（查看者）看不到数据源与源表条目，数据源相关原因（含源视图发布与删除数据源）的版本只显示「数据源结构变化」、不列明细（ADR-0005）
 import type { Route } from './+types/catalog.changes';
 import { Link } from 'react-router';
 import { ArrowLeft, Minus, Pencil, Plus } from 'lucide-react';
@@ -25,6 +25,7 @@ const REASON_LABELS: Partial<Record<CatalogVersionReason, string>> = {
   'source.scope_changed': '同步范围修改',
   'source.registered': '数据源登记',
   'source.updated': '数据源修改',
+  'source.deleted': '数据源删除',
   'source.profiled': '采集发现源表结构变化',
   'source.synced': '同步发现源表结构变化',
   'definition.published': '指标或标签发布',
@@ -38,7 +39,7 @@ const REASON_LABELS: Partial<Record<CatalogVersionReason, string>> = {
 };
 
 /** 查看者只看到「数据源结构变化」、不列明细的原因 */
-const SOURCE_REASONS: ReadonlySet<string> = new Set<CatalogVersionReason>(['source_view.published', 'source.scope_changed', 'source.registered', 'source.updated', 'source.profiled', 'source.synced']);
+const SOURCE_REASONS: ReadonlySet<string> = new Set<CatalogVersionReason>(['source_view.published', 'source.scope_changed', 'source.registered', 'source.updated', 'source.deleted', 'source.profiled', 'source.synced']);
 
 const KIND_LABELS: Record<CatalogEntry['kind'], string> = {
   source: '数据源', table: '源表', entity: '实体', field: '字段', relation: '关系',

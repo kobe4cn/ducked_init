@@ -1,4 +1,4 @@
-// app/.server/catalog/load.ts —— 从平台库读出生成语义目录（ADR-0041）的元数据：数据源、同步范围内的源表（带最近一次采集到的列）、
+// app/.server/catalog/load.ts —— 从平台库读出生成语义目录（ADR-0041）的元数据：没删除的数据源（ADR-0044）、同步范围内的源表（带最近一次采集到的列）、
 // 已发布源视图（带输出列）、已发布映射、自定义实体与合并组，以及源表的采集统计与实体的合并行数；
 // 已发布的指标与标签（每个键最新的已发布版本）、已发布的模板定义与各模板最近一次没过期的快照，以及各业务说明的当前内容
 import { and, desc, eq, isNull, sql } from 'drizzle-orm';
@@ -18,11 +18,11 @@ import { currentCatalogVersion, ensureCatalogVersion } from './versions';
 /** 本租户生成目录用的元数据；stats: false 时不读实体行数（它另开连接、不在事务里），记目录版本时用 */
 export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenantId: string, opts: { stats?: boolean } = {}): Promise<CatalogInput> {
   const rows = await db.select({ id: sources.id, name: sources.name, kind: sources.kind }).from(sources)
-    .where(eq(sources.tenantId, tenantId)).orderBy(sources.name);
+    .where(and(eq(sources.tenantId, tenantId), isNull(sources.deletedAt))).orderBy(sources.name);
   // 同步范围内、源端仍在且可读的表（同 sources.ts 的 isSyncable），列取各表最近一次成功采集到的
   const scoped = await db.select({ sourceId: sourceTables.sourceId, name: sourceTables.tableName }).from(sourceTables)
     .innerJoin(sources, eq(sources.id, sourceTables.sourceId))
-    .where(and(eq(sources.tenantId, tenantId), eq(sourceTables.inScope, true), isNull(sourceTables.goneAt), eq(sourceTables.readable, true)))
+    .where(and(eq(sources.tenantId, tenantId), isNull(sources.deletedAt), eq(sourceTables.inScope, true), isNull(sourceTables.goneAt), eq(sourceTables.readable, true)))
     .orderBy(sourceTables.sourceId, sourceTables.tableName);
   const { rows: profiles } = await db.execute<{ source_id: string; profile: TableProfile; finished_at: string }>(sql`
     SELECT DISTINCT ON (t.params->>'sourceId', p->>'name') t.params->>'sourceId' AS source_id, p AS profile, t.finished_at
@@ -37,7 +37,8 @@ export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenant
     .selectDistinctOn([sourceViewVersions.viewId], { sourceId: sourceViews.sourceId, name: sourceViews.name, columns: sourceViewVersions.columns })
     .from(sourceViewVersions)
     .innerJoin(sourceViews, eq(sourceViews.id, sourceViewVersions.viewId))
-    .where(and(eq(sourceViews.tenantId, tenantId), eq(sourceViewVersions.status, 'published')))
+    .innerJoin(sources, eq(sources.id, sourceViews.sourceId))
+    .where(and(eq(sourceViews.tenantId, tenantId), isNull(sources.deletedAt), eq(sourceViewVersions.status, 'published')))
     .orderBy(sourceViewVersions.viewId, desc(sourceViewVersions.version));
   tables.push(...views.map(v => ({ sourceId: v.sourceId, name: v.name, view: true, columns: v.columns ?? [] })));
   const tableStats = profiles.map(p => ({

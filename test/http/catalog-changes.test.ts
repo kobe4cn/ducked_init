@@ -1,5 +1,5 @@
 // test/http/catalog-changes.test.ts —— 目录变更记录的 HTTP 接缝（ADR-0041）：成员从数据地图页头进入 /catalog/changes，按版本倒序看到各版的原因与条目差异，?since=N 只看 N 之后的版本；
-// 查看者看不到 source: / table: 条目，数据源相关原因（含源视图发布）的版本只显示「数据源结构变化」、不列明细（ADR-0005）；还没有版本时显示空状态
+// 查看者看不到 source: / table: 条目，数据源相关原因（含源视图发布与删除数据源）的版本只显示「数据源结构变化」、不列明细（ADR-0005）；还没有版本时显示空状态
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { catalogVersions } from '../../app/.server/db/schema';
@@ -76,6 +76,26 @@ describe('目录变更记录', () => {
     expect(v54).toContain('数据源结构变化');
     expect(v54).not.toContain('data-diff-id=');
     expect(viewer).not.toContain('源视图发布');
+  });
+
+  it('删除数据源的版本显示「数据源删除」，查看者只看到「数据源结构变化」、不列明细', async () => {
+    const beta = await newTenant('beta');
+    await getDb().insert(catalogVersions).values({
+      tenantId: beta, version: 1, snapshot: [], reason: 'source.deleted',
+      diff: { added: [], removed: [{ id: 'source:CRM', kind: 'source', name: 'CRM' }, { id: 'table:CRM/orders', kind: 'table', name: 'CRM/orders' }], changed: [] },
+    });
+
+    const admin = await (await (await loginAs(app, 'admin@beta.com')).get('/catalog/changes')).text();
+    expect(admin).toContain('data-reason="source.deleted"');
+    expect(admin).toContain('数据源删除');
+    expect(admin).toMatch(/data-diff-id="source:CRM"[^>]*data-diff-change="removed"/);
+
+    await memberOf(beta, 'viewer@beta.com', 'viewer');
+    const viewer = await (await (await loginAs(app, 'viewer@beta.com')).get('/catalog/changes')).text();
+    expect(viewer).toContain('data-reason="sources"');
+    expect(viewer).toContain('数据源结构变化');
+    expect(viewer).not.toContain('数据源删除');
+    expect(viewer).not.toContain('data-diff-id=');
   });
 
   it('还没有任何版本时显示空状态', async () => {
