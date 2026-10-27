@@ -16,7 +16,7 @@
 // 最近一次成功的检查里有差异的标准层表在两张图的节点与图下列表上标出差异种类与数量；孤表在图上没有节点，在区块里单独列出
 import { useEffect, useMemo } from 'react';
 import { data, Form, Link, redirect, useRevalidator, useSearchParams } from 'react-router';
-import { AlertTriangle, ArrowLeft, CheckCircle2, CircleAlert, Loader2, Search } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, CheckCircle2, CircleAlert, History, Loader2, Search } from 'lucide-react';
 import type { Route } from './+types/lineage';
 import { can, requirePermission } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
@@ -293,6 +293,7 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
       <PageHeader
         title="数据地图"
         description="已接入的标准层表之间怎么关联。指向消费者的关系经 _identities 按 (_customer_source, customer_id) 对应到统一消费者；匿名事件的设备经 _device_owner 按最近一次登录归到消费者。点一张表看示例 SQL。"
+        actions={<Button asChild variant="outline"><Link to="/catalog/changes"><History />目录变更记录</Link></Button>}
       />
 
       <PillTabs
