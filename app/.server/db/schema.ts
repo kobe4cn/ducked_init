@@ -254,7 +254,10 @@ export const sources = platform.table('sources', {
   credentialsRotatedAt: timestamp('credentials_rotated_at', { withTimezone: true }),
   createdAt: createdAt(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-}, t => [uniqueIndex('sources_tenant_name_uq').on(t.tenantId, t.name)]);
+  // 删除标记（ADR-0044）：只软删，删除时清掉凭据（写成空串）与同步范围；已删除的数据源各处查不到，名称可以重新登记
+  deletedAt: timestamp('deleted_at', { withTimezone: true }),
+  deletedByEmail: text('deleted_by_email'),
+}, t => [uniqueIndex('sources_tenant_name_uq').on(t.tenantId, t.name).where(sql`deleted_at is null`)]);
 
 // 数据源里的每张表：最近一次列出表得到的清单（schema、读权限、估算行数，源端删掉的表记下发现的时间），
 // 成员选定的同步范围（ADR-0013），以及成员确认的水位线字段、业务主键与软删除字段。

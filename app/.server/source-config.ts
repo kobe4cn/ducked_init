@@ -2,7 +2,7 @@
 // 以及把平台库里的一条数据源（解密凭据后）还原成连接用的 SourceSpec。登记、修改与任务派发共用
 import { realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, sep } from 'node:path';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { getDb } from './db/client';
 import { SOURCE_KINDS, sources, type SourceKind } from './db/schema';
 import { FILE_FORMATS, type FileFormat, type S3Connection, type SourceSpec } from './pipeline/source-engine';
@@ -175,17 +175,17 @@ export async function resolveSourceSpec(tenantId: string, kind: SourceKind, conf
 /** 凭据加密时绑定的用途：换到别的数据源上解不开 */
 export const credentialsContext = (sourceId: string) => `source:${sourceId}`;
 
-/** 本租户的一条数据源；不存在（或属于其他租户）时抛出 404 */
+/** 本租户的一条数据源；不存在、已删除（ADR-0044）或属于其他租户时抛出 404 */
 export async function requireSource(tenantId: string, sourceId: string) {
   if (!/^[0-9a-f-]{36}$/i.test(sourceId)) throw new SourceError('数据源不存在', 404);
-  const [row] = await getDb().select().from(sources).where(and(eq(sources.id, sourceId), eq(sources.tenantId, tenantId)));
+  const [row] = await getDb().select().from(sources).where(and(eq(sources.id, sourceId), eq(sources.tenantId, tenantId), isNull(sources.deletedAt)));
   if (!row) throw new SourceError('数据源不存在', 404);
   return row;
 }
 
-/** 本租户按登记名（区分大小写，按原样比较）找数据源 ID；没有时为 null */
+/** 本租户按登记名（区分大小写，按原样比较）找没删除的数据源 ID；没有时为 null */
 export async function sourceIdByName(tenantId: string, name: string): Promise<string | null> {
-  const [row] = await getDb().select({ id: sources.id }).from(sources).where(and(eq(sources.tenantId, tenantId), eq(sources.name, name)));
+  const [row] = await getDb().select({ id: sources.id }).from(sources).where(and(eq(sources.tenantId, tenantId), eq(sources.name, name), isNull(sources.deletedAt)));
   return row?.id ?? null;
 }
 

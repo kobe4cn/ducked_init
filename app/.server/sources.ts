@@ -9,11 +9,13 @@ import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
-import { mappings, mappingVersions, sources, sourceTables, tasks, type TaskStatus } from './db/schema';
+import { mappings, mappingVersions, sources, sourceTables, sourceViews, sourceViewVersions, tasks, type TaskStatus } from './db/schema';
+import { crossSourceReferrers, lockTenant, pendingMerge } from './mappings';
 import {
   inspectSource, isKeyType, isSoftDeleteType, mongoReadGrant, SOFT_DELETE_NAME, type ListedTable, type SourceSpec, type TableProfile,
   type WriteGrant,
 } from './pipeline/source-engine';
+import type { TaskKind } from './pipeline/handlers';
 import type { SyncTableParam } from './pipeline/sync-engine';
 import type { SyncMode } from '../lib/sources';
 import { decryptForTenant, encryptForTenant } from './secrets';
@@ -21,6 +23,7 @@ import {
   credentialsContext, isSourceKind, loadSourceSpec, parseSourceInput, requireSource, resolveSourceSpec, SourceError, type SourceInput,
 } from './source-config';
 import { enqueueKeyCheck } from './source-key-check';
+import { ofSource } from './source-sync';
 import { insertTask } from './tasks';
 import { looksSensitive } from '../lib/sensitive';
 
@@ -190,7 +193,7 @@ export async function listSources(actor: CurrentMember) {
   const rows = await getDb()
     .select({ id: sources.id, name: sources.name, kind: sources.kind, config: sources.config, createdAt: sources.createdAt })
     .from(sources)
-    .where(eq(sources.tenantId, actor.tenant.id))
+    .where(and(eq(sources.tenantId, actor.tenant.id), isNull(sources.deletedAt)))
     .orderBy(sources.createdAt, sources.name);
   return rows;
 }
@@ -481,4 +484,72 @@ export async function updateSource(actor: CurrentMember, sourceId: string, input
       detail: { name, ...(name !== row.name && { renamedFrom: row.name }), changed, credentialsRotated: rotated },
     });
   }));
+}
+
+/** 删除前要等它们结束的源任务（ADR-0044） */
+const SOURCE_TASK_LABELS: Partial<Record<TaskKind, string>> = {
+  'source.profile': '采集', 'source.sync': '同步', 'source.verify': '核对', 'source.keycheck': '业务主键检查',
+};
+
+/**
+ * 不能删除数据源的全部原因（ADR-0044），可以删时为空：有已发布且没停用的映射（先走双人停用，ADR-0031）、
+ * 被别的数据源跨源引用（ADR-0030）、有排队中或运行中的源任务或合并任务
+ */
+export async function deleteBlockers(tx: Tx, tenantId: string, sourceId: string): Promise<string[]> {
+  const reasons: string[] = [];
+  const live = await tx.selectDistinct({ table: mappings.tableName, entity: mappings.entity }).from(mappings)
+    .innerJoin(mappingVersions, eq(mappingVersions.mappingId, mappings.id))
+    .where(and(eq(mappings.sourceId, sourceId), eq(mappings.tenantId, tenantId), isNull(mappings.disabledAt), eq(mappingVersions.status, 'published')))
+    .orderBy(mappings.tableName, mappings.entity);
+  if (live.length) reasons.push(`有已发布且没停用的映射：${live.map(m => `${m.table} → ${m.entity}`).join('、')}，先停用它们`);
+
+  const referrers = (await crossSourceReferrers(tx, tenantId, sourceId)).filter(r => r.sourceId !== sourceId);
+  if (referrers.length) {
+    const names = new Map((await tx.select({ id: sources.id, name: sources.name }).from(sources)
+      .where(inArray(sources.id, referrers.map(r => r.sourceId)))).map(row => [row.id, row.name]));
+    reasons.push(`被别的数据源跨源引用：${referrers.map(r => `${names.get(r.sourceId)} 的 ${r.mapping}（${r.columns.join('、')}）`).join('；')}，先改掉或停用它们`);
+  }
+
+  const kinds = Object.keys(SOURCE_TASK_LABELS) as TaskKind[];
+  const pending = await tx.selectDistinct({ kind: tasks.kind }).from(tasks)
+    .where(and(ofSource(tenantId, sourceId, kinds), inArray(tasks.status, ['queued', 'running'])));
+  if (pending.length) reasons.push(`有排队中或运行中的任务：${kinds.filter(k => pending.some(p => p.kind === k)).map(k => SOURCE_TASK_LABELS[k]).join('、')}`);
+  if (await pendingMerge(tx, tenantId)) reasons.push('有排队中或运行中的合并任务');
+  return reasons;
+}
+
+/**
+ * 删除数据源（ADR-0044）：有发布权限的成员，deleteBlockers 没有原因时才能删（否则 400 并列出原因）。
+ * 只软删：丢弃没发布过的映射与映射草稿、再丢弃没发布过的源视图与源视图草稿（映射引用源视图，顺序不能反），清空同步范围，
+ * 凭据写成空串，打上删除标记；已停用的映射与已发布版本保留。原始层的清理不在这里
+ */
+export async function deleteSource(actor: CurrentMember, sourceId: string) {
+  assertCan(actor, 'publish');
+  const tenantId = actor.tenant.id;
+  await requireSource(tenantId, sourceId);
+  await getDb().transaction(async tx => {
+    // 先锁源表行（与修改同步范围、恢复映射同序，不死锁），再锁数据源行（与入队同步、核对同一把锁），最后锁租户行（与发布、停用、入队合并互斥）
+    await tx.select({ table: sourceTables.tableName }).from(sourceTables).where(eq(sourceTables.sourceId, sourceId)).for('update');
+    const [row] = await tx.select().from(sources)
+      .where(and(eq(sources.id, sourceId), eq(sources.tenantId, tenantId), isNull(sources.deletedAt))).for('update');
+    if (!row) throw new SourceError('数据源不存在', 404);
+    await lockTenant(tx, tenantId);
+    const reasons = await deleteBlockers(tx, tenantId, sourceId);
+    if (reasons.length) throw new SourceError(`不能删除数据源「${row.name}」：${reasons.join('；')}`);
+
+    const publishedMapping = sql`exists (select 1 from ${mappingVersions} v where v.mapping_id = ${mappings.id} and v.status = 'published')`;
+    await tx.delete(mappings).where(and(eq(mappings.sourceId, sourceId), sql`not ${publishedMapping}`));
+    await tx.delete(mappingVersions).where(and(eq(mappingVersions.status, 'draft'),
+      inArray(mappingVersions.mappingId, tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.sourceId, sourceId)))));
+    const publishedView = sql`exists (select 1 from ${sourceViewVersions} v where v.view_id = ${sourceViews.id} and v.status = 'published')`;
+    await tx.delete(sourceViews).where(and(eq(sourceViews.sourceId, sourceId), sql`not ${publishedView}`));
+    await tx.delete(sourceViewVersions).where(and(eq(sourceViewVersions.status, 'draft'),
+      inArray(sourceViewVersions.viewId, tx.select({ id: sourceViews.id }).from(sourceViews).where(eq(sourceViews.sourceId, sourceId)))));
+    await tx.delete(sourceTables).where(eq(sourceTables.sourceId, sourceId));
+    await tx.update(sources).set({ credentials: '', deletedAt: new Date(), deletedByEmail: actor.email, updatedAt: new Date() })
+      .where(eq(sources.id, sourceId));
+    await recordAudit(tx, {
+      tenantId, actor, action: 'source.deleted', targetType: 'source', targetId: sourceId, detail: { name: row.name, kind: row.kind },
+    });
+  });
 }

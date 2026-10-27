@@ -71,6 +71,8 @@ const ACTIONS = {
   },
   'model_provider.reset': { label: '恢复平台默认模型服务', describe: () => '清空本租户的端点、模型名与 API Key' },
   'source.registered': { label: '登记数据源', describe: (d: Detail) => `「${d.name}」（${sourceKindLabel(d.kind)}），${d.tables} 张表` },
+  // 不记凭据
+  'source.deleted': { label: '删除数据源', describe: (d: Detail) => `「${d.name}」（${sourceKindLabel(d.kind)}）` },
   'source.updated': {
     label: '修改数据源',
     describe: (d: Detail) => [
