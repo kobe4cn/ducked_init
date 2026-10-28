@@ -1,18 +1,21 @@
-// app/components/app-shell.tsx —— 登录后页面的外壳：白色顶栏（品牌、胶囊导航、头像首字母、退出登录），内容铺满宽度
+// app/components/app-shell.tsx —— 登录后页面的外壳：白色顶栏（品牌、胶囊导航、AI 助手、头像首字母、退出登录），内容铺满宽度；
+// 运营后台不是租户成员，不显示 AI 助手（assistant={false}）
 import { Form, Link, useLocation } from 'react-router';
 import { LogOut } from 'lucide-react';
 import { activeNavTo } from '~/lib/nav';
 import { cn } from '~/lib/utils';
 import { Button } from '~/components/ui/button';
+import { AssistantPanel } from '~/components/assistant-panel';
 
 export interface NavItem { to: string; label: string }
 
-export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台', logoutAction = '/logout' }: {
+export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台', logoutAction = '/logout', assistant = true }: {
   email: string;
   nav: NavItem[];
   children: React.ReactNode;
   brand?: string;
   logoutAction?: string;
+  assistant?: boolean;
 }) {
   const active = activeNavTo(nav, useLocation().pathname);
   return (
@@ -38,6 +41,7 @@ export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台
             </nav>
           </div>
           <div className="flex items-center gap-3 text-sm text-slate-500">
+            {assistant && <AssistantPanel />}
             <span role="img" title={email} aria-label={email} className="grid size-8 place-items-center rounded-full bg-slate-200 font-medium text-slate-700">
               {email[0]?.toUpperCase()}
             </span>

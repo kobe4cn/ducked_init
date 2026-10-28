@@ -1,4 +1,4 @@
-// app/routes.ts —— 路由表：首页、任务、标准模型、数据地图与目录变更记录（需登录）、数据源与它的源视图、映射、合并组与自定义实体（数据工程师可登记与起草，分析师只读）、数据质量（断言结果与隔离区，有数据源查看权限的成员）、分析结果快照（有结果层查看权限的成员）、分析模板参数（起草与双人发布）、数据查询工作台（有沙箱权限的成员）、成员管理、外部系统的 API Key、审计日志与解密敏感信息（仅管理员）、登录、Magic Link 确认、退出；
+// app/routes.ts —— 路由表：首页、任务、标准模型、数据地图与目录变更记录（需登录）、数据源与它的源视图、映射、合并组与自定义实体（数据工程师可登记与起草，分析师只读）、数据质量（断言结果与隔离区，有数据源查看权限的成员）、分析结果快照（有结果层查看权限的成员）、分析模板参数（起草与双人发布）、数据查询工作台（有沙箱权限的成员）、成员管理、外部系统的 API Key、审计日志与解密敏感信息（仅管理员）、AI 助手（顶栏侧栏的资源路由，任一成员）、登录、Magic Link 确认、退出；
 // 外部系统的接口在 /api/v1/ 下，用 Bearer API Key 认证、不读 cookie；
 // 运营后台集中在 /ops 前缀下，使用独立的运营者身份（ADR-0007），便于将来单独部署
 import { type RouteConfig, index, route } from '@react-router/dev/routes';
@@ -29,6 +29,7 @@ export default [
   route('pii/reveal', 'routes/pii.reveal.tsx'),
   route('api-keys', 'routes/api-keys.tsx'),
   route('model-provider', 'routes/model-provider.tsx'),
+  route('assistant', 'routes/assistant.tsx'),
   route('api/v1/catalog', 'routes/api.v1.catalog.tsx'),
   route('api/v1/consumers/:consumerId', 'routes/api.v1.consumers.$id.tsx'),
   route('api/v1/consumers/by-source/:source/:customerId', 'routes/api.v1.consumers.by-source.tsx'),
