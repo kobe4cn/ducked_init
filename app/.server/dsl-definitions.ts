@@ -61,11 +61,22 @@ export async function dslContext(db: Tx | ReturnType<typeof getDb>, tenantId: st
   return { ...base, metrics };
 }
 
+/** 对照本租户的上下文校验定义 */
+const checkDefinition = async (kind: DslKind, tenantId: string, yaml: string) => DSL_KINDS[kind].check(yaml, await dslContext(getDb(), tenantId));
+
 /** 校验定义，不通过时抛出带问题的 DslError */
 async function assertValid(kind: DslKind, tenantId: string, yaml: string) {
-  const result = DSL_KINDS[kind].check(yaml, await dslContext(getDb(), tenantId));
+  const result = await checkDefinition(kind, tenantId, yaml);
   if (!result.ok) throw new DslError(`${DSL_KINDS[kind].label}定义有 ${result.issues.length} 个问题，没有保存`, 400, result.issues);
   return result.spec;
+}
+
+/** 只校验一份定义，不保存（AI 助手的校验工具用）；要起草权限 */
+export async function validateDefinition(actor: CurrentMember, kind: string, yaml: string): Promise<{ ok: true } | { ok: false; issues: DslIssue[] }> {
+  assertCan(actor, 'definitions:draft');
+  requireKind(kind);
+  const result = await checkDefinition(kind, actor.tenant.id, yaml);
+  return result.ok ? { ok: true } : { ok: false, issues: result.issues };
 }
 
 const ofDefinition = (tenantId: string, kind: DslKind, key: string) =>

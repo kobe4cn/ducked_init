@@ -7,7 +7,7 @@ import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { modelProviders } from './db/schema';
-import { chatJson, LlmError, MODEL_PROVIDER_CONTEXT, providerSource, resolveProvider } from './llm';
+import { chatJson, chatTools, LlmError, MODEL_PROVIDER_CONTEXT, providerSource, resolveProvider } from './llm';
 import { buildTableContext, type TableContext } from './pipeline/llm-context';
 import { decryptForTenant, encryptForTenant } from './secrets';
 import { maskedSample, SourceViewError } from './source-views';
@@ -94,11 +94,27 @@ export async function resetModelProvider(actor: CurrentMember) {
   });
 }
 
-export type ConnectivityResult = { ok: true; model: string; durationMs: number } | { ok: false; error: string };
+/** tools：模型是否支持工具调用（AI 助手要用，ADR-0042） */
+export type ConnectivityResult = { ok: true; model: string; durationMs: number; tools: boolean } | { ok: false; error: string };
 
 const PING_SCHEMA = { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } };
 
-/** 用当前生效的配置发一次小请求；错误消息由 chatJson 抹掉了 Key，调用日志里记一条 connectivity */
+const PING_TOOL = { name: 'ping', description: '连通性探测：收到请求就调用它', parameters: { type: 'object', properties: {} } };
+
+/** 带一个 ping 工具问一次：返回里有工具调用视为支持；调用失败或只回了文本视为不支持。调用日志里记一条 tool_probe */
+async function probeTools(tenantId: string) {
+  try {
+    return (await chatTools(tenantId, 'tool_probe', [{ role: 'user', content: '调用 ping 工具' }], [PING_TOOL])).toolCalls.length > 0;
+  } catch (e) {
+    if (e instanceof LlmError) return false;
+    throw e;
+  }
+}
+
+/**
+ * 用当前生效的配置发一次小请求；错误消息由 chatJson 抹掉了 Key，调用日志里记一条 connectivity。
+ * 连通后再探测是否支持工具调用（不计入耗时）
+ */
 export async function testModelProvider(actor: CurrentMember): Promise<ConnectivityResult> {
   assertCan(actor, 'model_provider:manage');
   const tenantId = actor.tenant.id;
@@ -110,7 +126,8 @@ export async function testModelProvider(actor: CurrentMember): Promise<Connectiv
     if (e instanceof LlmError) return { ok: false, error: e.message };
     throw e;
   }
-  return { ok: true, model, durationMs: Date.now() - started };
+  const durationMs = Date.now() - started;
+  return { ok: true, model, durationMs, tools: await probeTools(tenantId) };
 }
 
 /** 是否允许把原始层的脱敏样本行发给模型服务（默认不允许）；没有配置行时插入一行，端点、模型名与 Key 为空。值没变时什么也不做 */

@@ -1,7 +1,7 @@
 // app/routes/model-provider.tsx —— 模型服务（仅管理员）：看当前用平台默认还是本租户配置；保存端点、模型名与 API Key（Key 不回显，留空沿用）、
-// 恢复平台默认、测试连通性、开关发送脱敏样本
+// 恢复平台默认、测试连通性（同时显示是否支持工具调用）、开关发送脱敏样本
 import { data, Form, redirect, useNavigation } from 'react-router';
-import { CheckCircle2, CircleAlert } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, CircleAlert } from 'lucide-react';
 import type { Route } from './+types/model-provider';
 import { requirePermission } from '~/.server/access';
 import {
@@ -81,8 +81,19 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
         <Alert role="status" data-connectivity="ok">
           <CheckCircle2 className="text-emerald-600" />
           <AlertTitle>连通成功</AlertTitle>
-          <AlertDescription data-model={actionData.tested.model} data-duration-ms={actionData.tested.durationMs}>
-            模型 {actionData.tested.model}，耗时 {actionData.tested.durationMs} ms
+          <AlertDescription className="space-y-1">
+            <div data-model={actionData.tested.model} data-duration-ms={actionData.tested.durationMs}>
+              模型 {actionData.tested.model}，耗时 {actionData.tested.durationMs} ms
+            </div>
+            {actionData.tested.tools ? (
+              <div data-tools="yes" className="flex items-center gap-1 text-emerald-600">
+                <CheckCircle2 className="size-4" />支持工具调用
+              </div>
+            ) : (
+              <div data-tools="no" className="flex items-center gap-1 text-amber-600">
+                <AlertTriangle className="size-4" />该模型服务不支持工具调用，AI 助手无法使用
+              </div>
+            )}
           </AlertDescription>
         </Alert>
       ) : (

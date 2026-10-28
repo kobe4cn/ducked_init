@@ -1,5 +1,5 @@
 // test/http/model-provider.test.ts —— 「模型服务」页的 HTTP 接缝：管理员在 /model-provider 保存端点、模型名与 API Key（Key 不回显、加密入库、留空沿用），
-// 测试连通性（假 fetch 经 app.setLlmFetch 注入，结果看页面与 platform.llm_calls），恢复平台默认后 resolveProvider 回到环境变量；
+// 测试连通性与工具调用探测（假 fetch 经 app.setLlmFetch 注入，结果看页面与 platform.llm_calls），恢复平台默认后 resolveProvider 回到环境变量；
 // 开关发送脱敏样本（默认关、记审计）；非管理员 403
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -93,7 +93,7 @@ describe('模型服务页', () => {
     expect(okPage).toContain('data-connectivity="ok"');
     expect(okPage).toContain('data-model="deepseek-chat"');
     expect(okPage).toMatch(/data-duration-ms="\d+"/);
-    expect(authorizations).toEqual([`Bearer ${KEY}`]);
+    expect(authorizations).toEqual([`Bearer ${KEY}`, `Bearer ${KEY}`]); // 连通性与工具调用探测各一次
 
     fakeFetch(() => new Response(`invalid api key ${KEY}`, { status: 401 }));
     const failedPage = await (await admin.post('/model-provider', { intent: 'test' })).text();
@@ -104,6 +104,45 @@ describe('模型服务页', () => {
     const calls = await connectivityCalls(acme);
     expect(calls).toHaveLength(2);
     expect(calls.map(c => c.error === null).sort()).toEqual([false, true]);
+  });
+
+  it('测试连通性时一并探测工具调用：返回 tool_calls 显示支持，只回文本或 400 提示不支持，连通结果照旧；每次记一条 tool_probe', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    await save(admin);
+    const toolCall = () => Response.json({
+      choices: [{ message: { content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'ping', arguments: '{}' } }] } }],
+    });
+    /** 第一次请求（连通性）照常返回，第二次（探测）由 respond 构造；记下第二次的请求体 */
+    const probeWith = (respond: () => Response) => {
+      const bodies: Record<string, unknown>[] = [];
+      app.setLlmFetch((async (_url: string | URL | Request, init?: RequestInit) => {
+        bodies.push(JSON.parse(init?.body as string));
+        return bodies.length === 1 ? ok() : respond();
+      }) as typeof fetch);
+      return bodies;
+    };
+
+    const bodies = probeWith(toolCall);
+    const supported = await (await admin.post('/model-provider', { intent: 'test' })).text();
+    expect(supported).toContain('data-connectivity="ok"');
+    expect(supported).toContain('data-tools="yes"');
+    expect(supported).toContain('支持工具调用');
+    expect(bodies[1]).toMatchObject({ tool_choice: 'auto', tools: [{ type: 'function', function: { name: 'ping' } }] });
+    expect(bodies[1]).not.toHaveProperty('response_format');
+
+    for (const unsupported of [() => Response.json({ choices: [{ message: { content: '好的' } }] }), () => new Response('tools not supported', { status: 400 })]) {
+      probeWith(unsupported);
+      const page = await (await admin.post('/model-provider', { intent: 'test' })).text();
+      expect(page).toContain('data-connectivity="ok"');
+      expect(page).toContain('data-tools="no"');
+      expect(page).toContain('该模型服务不支持工具调用，AI 助手无法使用');
+    }
+
+    const probeCalls = await getDb().select().from(llmCalls).where(and(eq(llmCalls.tenantId, acme), eq(llmCalls.purpose, 'tool_probe')));
+    expect(probeCalls).toHaveLength(3);
+    expect(probeCalls.filter(c => c.error !== null)).toHaveLength(1); // 只回文本的那次调用本身是成功的
+    expect(await connectivityCalls(acme)).toHaveLength(3);
   });
 
   it('恢复平台默认清空本租户的端点、模型名与 Key，之后用环境变量的配置；本来没配置时不记审计', async () => {
