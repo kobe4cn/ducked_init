@@ -80,6 +80,7 @@ export async function enqueueDueVerifies(now = new Date()) {
     .select({ id: sources.id, tenantId: sources.tenantId })
     .from(sources)
     .innerJoin(tenants, and(eq(tenants.id, sources.tenantId), isNull(tenants.suspendedAt)))
+    .where(isNull(sources.deletedAt))
     .orderBy(sources.id);
   const enqueued: string[] = [];
   for (const { id, tenantId } of candidates) {

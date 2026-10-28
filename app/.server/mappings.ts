@@ -420,13 +420,13 @@ export async function ignoreColumn(actor: CurrentMember, mappingId: string, colu
 }
 
 /**
- * 跨源引用的目标数据源（customer_source）：按名字找同租户的数据源，看它有没有已发布（且没停用）的 customer 映射。
+ * 跨源引用的目标数据源（customer_source）：按名字找同租户没删除的数据源，看它有没有已发布（且没停用）的 customer 映射。
  * YAML 里没写 customer_source 时不查平台库
  */
 async function customerSources(tenantId: string, sourceId: string, yaml: string): Promise<CustomerSources> {
   if (!yaml.includes('customer_source')) return { self: sourceId, resolve: () => 'missing' };
   const db = getDb();
-  const all = await db.select({ id: sources.id, name: sources.name }).from(sources).where(eq(sources.tenantId, tenantId));
+  const all = await db.select({ id: sources.id, name: sources.name }).from(sources).where(and(eq(sources.tenantId, tenantId), isNull(sources.deletedAt)));
   const published = new Set((await db.selectDistinct({ sourceId: mappings.sourceId }).from(mappings)
     .innerJoin(mappingVersions, eq(mappingVersions.mappingId, mappings.id))
     .where(and(eq(mappings.tenantId, tenantId), eq(mappings.entity, 'customer'), isNull(mappings.disabledAt), eq(mappingVersions.status, 'published')))).map(r => r.sourceId));
@@ -1002,7 +1002,7 @@ async function groupOthers(tx: Tx, tenantId: string, entity: string, mappingId: 
  * 恢复停用的映射（ADR-0031）：需要发布权限，一人即可。停用期间别的映射可能占了它让出的位置，恢复前对照数据源当前的字段、已发布的登记与其余已发布映射
  * 重跑发布时的检查（文档校验与 assertPublishable），源表（输入是源视图时视图引用的表）移出了同步范围时拒绝，要先选回（否则重建读不到批次）。
  * 清掉停用列、记审计，在同一事务里为它入队一次重建合并（撤下时已删掉它的水位）；它在已发布合并组里时组内其余映射一起重建（整组重算，ADR-0032）。
- * 主键被别的映射占了时是这次合并失败，与发布时一样。已有合并在运行时报错、不恢复
+ * 主键被别的映射占了时是这次合并失败，与发布时一样。已有合并在运行时报错、不恢复；所在数据源已删除时拒绝（ADR-0044）
  */
 export async function restoreMapping(actor: CurrentMember, mappingId: string) {
   assertCan(actor, 'publish');
@@ -1015,6 +1015,8 @@ export async function restoreMapping(actor: CurrentMember, mappingId: string) {
     await lockTenant(tx, tenantId);
     const [mapping] = await tx.select().from(mappings).where(eq(mappings.id, mappingId)).for('update');
     if (!mapping.disabledAt) throw new MappingError('映射没有停用');
+    const [{ deletedAt }] = await tx.select({ deletedAt: sources.deletedAt }).from(sources).where(eq(sources.id, mapping.sourceId));
+    if (deletedAt) throw new MappingError('数据源已删除');
     // 锁住映射行之后再读：停用期间也能发布新版本
     const [published] = await tx.select({ version: mappingVersions.version, yaml: mappingVersions.yaml, plan: mappingVersions.plan }).from(mappingVersions)
       .where(and(eq(mappingVersions.mappingId, mappingId), eq(mappingVersions.status, 'published'))).orderBy(desc(mappingVersions.version)).limit(1);
@@ -1425,7 +1427,7 @@ export async function listMappings(actor: CurrentMember) {
   const rows = await getDb()
     .select({ mapping: mappings, sourceName: sources.name })
     .from(mappings)
-    .innerJoin(sources, eq(sources.id, mappings.sourceId))
+    .innerJoin(sources, and(eq(sources.id, mappings.sourceId), isNull(sources.deletedAt)))
     .where(eq(mappings.tenantId, actor.tenant.id))
     .orderBy(mappings.entity, sources.name, mappings.tableName);
   const versions = rows.length

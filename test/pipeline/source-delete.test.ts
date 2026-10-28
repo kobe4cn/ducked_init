@@ -1,19 +1,21 @@
 // test/pipeline/source-delete.test.ts —— 删除数据源的接缝（ADR-0044）：deleteBlockers 列出全部拒绝原因（已发布没停用的映射、跨源引用方、排队或运行中的源任务与合并），
 // deleteSource 满足条件时丢弃没发布过的映射与源视图、清空同步范围与凭据、打上删除标记、入队 source.drop 并记审计；已删除的数据源各处查不到，可以重新登记同名的；
-// source.drop 删掉原始层的三个 schema 与文件，标准层不动
+// source.drop 删掉原始层的三个 schema 与文件，标准层不动；已删除的数据源不被定时同步与核对、工作台原始层视图、映射列表、跨源引用与恢复映射用到
 import { existsSync } from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions, sources, sourceTables, sourceViews, tasks } from '../../app/.server/db/schema';
-import { confirmDisable, createMapping, publishedPlans, publishMapping, requestDisable, saveDraft } from '../../app/.server/mappings';
+import { confirmDisable, createMapping, listMappings, publishedPlans, publishMapping, requestDisable, restoreMapping, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { requireSource, sourceIdByName } from '../../app/.server/source-config';
-import { syncSource } from '../../app/.server/source-sync';
+import { enqueueDueSyncs, syncSource } from '../../app/.server/source-sync';
+import { enqueueDueVerifies } from '../../app/.server/source-verify';
 import { createSourceView } from '../../app/.server/source-views';
 import { confirmWatermark, deleteBlockers, deleteSource, listSources, registerSource } from '../../app/.server/sources';
+import { listCatalog, runQuery } from '../../app/.server/workbench';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, onLake, publish, runTask, selectAllTables } from './fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from './identity-fixtures';
@@ -211,5 +213,36 @@ describe('删除数据源', () => {
 
     expect(await runTask(acme, 'source.drop', { schema })).toMatchObject({ status: 'succeeded' });
     expect(await runTask(acme, 'source.drop', { schema: 'silver' })).toMatchObject({ status: 'failed' });
+  });
+
+  it('已删除的数据源不再被调度与引用：定时同步与核对跳过它，工作台不挂它的原始层视图，映射列表没有它的映射，跨源引用指不到它，恢复它的映射时 400', async () => {
+    const { acme, author, reviewer, sources: ids, mappings: customerMappings, orderMappings } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'an@acme.com', 'analyst');
+    const hasRaw = async (name: string) => (await listCatalog(analyst)).raw.some(s => s.name === name);
+    expect(await hasRaw('会员')).toBe(true);
+    for (const mapping of [orderMappings!.loyalty, customerMappings.loyalty]) {
+      await requestDisable(author, mapping);
+      await confirmDisable(reviewer, mapping);
+      await drain();
+    }
+    const scope = await getDb().select().from(sourceTables).where(eq(sourceTables.sourceId, ids.loyalty));
+    await deleteSource(author, ids.loyalty);
+    await drain();
+    // 删除清空了同步范围；插回去，确认跳过它靠的是删除标记
+    await getDb().insert(sourceTables).values(scope);
+
+    const later = new Date(Date.now() + 3 * 24 * 3_600_000);
+    expect(await enqueueDueSyncs(later)).toEqual([ids.crm, ids.tracking].sort());
+    await drain();
+    expect(await enqueueDueVerifies(new Date(Date.now() + 30 * 24 * 3_600_000))).toEqual([ids.crm, ids.tracking].sort());
+
+    expect(await hasRaw('会员')).toBe(false);
+    expect((await runQuery(analyst, 'SHOW TABLES')).rows.some(r => r.includes('会员'))).toBe(false);
+    expect((await listMappings(author)).mappings.some(m => m.sourceId === ids.loyalty)).toBe(false);
+
+    const crmOrders = orderMappings!.crm;
+    await expect(saveDraft(author, crmOrders, CRM_ORDERS.replace('  customer_id: string(customer)\n', '  customer_id: { expr: string(customer), customer_source: 会员 }\n')))
+      .rejects.toMatchObject({ issues: [expect.objectContaining({ message: expect.stringContaining('没有数据源 会员') })] });
+    await expect(restoreMapping(author, customerMappings.loyalty)).rejects.toMatchObject({ status: 400, message: '数据源已删除' });
   });
 });

@@ -195,7 +195,8 @@ async function sandboxAccess(tx: Tx | Db, actor: CurrentMember): Promise<Sandbox
  * 敏感列清单来自采集的列统计（列名或取值像敏感信息），没采集过的表不知道哪些列敏感，不建视图
  */
 async function mountRaw(con: TenantLakeSession['con'], tenantId: string, salt: string): Promise<RawMount> {
-  const rows = await getDb().select({ id: sources.id, name: sources.name }).from(sources).where(eq(sources.tenantId, tenantId)).orderBy(asc(sources.name));
+  const rows = await getDb().select({ id: sources.id, name: sources.name }).from(sources)
+    .where(and(eq(sources.tenantId, tenantId), isNull(sources.deletedAt))).orderBy(asc(sources.name));
   const raw: RawSource[] = await Promise.all(rows.map(async ({ id, name }) => ({
     name,
     sourceId: id,
