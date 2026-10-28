@@ -295,7 +295,7 @@ export type AuditEntry = {
   targetId?: string;
   detail?: Record<string, unknown>;
 } & (
-  | { tenantId: string; actor: Pick<CurrentMember, 'memberId' | 'email'> }
+  | { tenantId: string; actor: Pick<CurrentMember, 'memberId' | 'email' | 'via'> }
   /** 运营者的操作；tenantId 为 null 表示与租户无关的平台级事件 */
   | { tenantId: string | null; operator: OperatorActor }
   /** 平台自己发现的事件，没有操作者 */
@@ -315,7 +315,8 @@ export async function recordAudit(tx: Tx | Db, entry: AuditEntry) {
     action: entry.action,
     targetType: entry.targetType,
     targetId: entry.targetId ?? null,
-    detail: entry.detail ?? {},
+    // 经 Agent 的操作注明通道（ADR-0042）
+    detail: 'actor' in entry && entry.actor.via ? { ...entry.detail, via: entry.actor.via } : (entry.detail ?? {}),
   });
   // 会改变目录的动作在同一事务里记目录版本（ADR-0041）；动态引入，避免 versions → load → mappings → audit 的循环引用
   if (entry.tenantId) {

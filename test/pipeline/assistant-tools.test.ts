@@ -20,8 +20,8 @@ describe('AI 助手的工具注册表', () => {
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
 
     const catalogTools = ['catalog_expand', 'catalog_overview', 'catalog_search'];
-    expect(names(toolsFor(author))).toEqual([...catalogTools, 'validate_definition', 'validate_mapping']);
-    expect(names(toolsFor(analyst))).toEqual([...catalogTools, 'validate_definition']);
+    expect(names(toolsFor(author))).toEqual([...catalogTools, 'save_definition_draft', 'save_mapping_draft', 'validate_definition', 'validate_mapping']);
+    expect(names(toolsFor(analyst))).toEqual([...catalogTools, 'save_definition_draft', 'validate_definition']);
     expect(names(toolsFor(viewer))).toEqual(catalogTools);
 
     await expect(runTool(viewer, 'validate_definition', { kind: 'metric', yaml: 'base: customer' })).rejects.toMatchObject({ init: { status: 403 } });
