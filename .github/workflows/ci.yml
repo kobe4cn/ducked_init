@@ -59,9 +59,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Start SeaweedFS
+        # 固定版本：latest 换成 4.50 后 DeleteUser 改按 AWS 语义拒绝还有密钥的账号，整批用例随之失败
         run: |
           docker run -d --name seaweedfs -p 8333:8333 -e AWS_ACCESS_KEY_ID=crm -e AWS_SECRET_ACCESS_KEY=crm-secret \
-            chrislusf/seaweedfs server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=8333 -s3.iam.readOnly=false -master.volumeSizeLimitMB=1024
+            chrislusf/seaweedfs:4.50 server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=8333 -s3.iam.readOnly=false -master.volumeSizeLimitMB=1024
           # 用 Runner 自带的 AWS CLI 建桶，不依赖 curl 版本的 --aws-sigv4 实现
           for i in $(seq 60); do
             AWS_ACCESS_KEY_ID=crm AWS_SECRET_ACCESS_KEY=crm-secret AWS_DEFAULT_REGION=us-east-1 \

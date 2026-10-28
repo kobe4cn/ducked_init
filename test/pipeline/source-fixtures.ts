@@ -7,7 +7,7 @@ import { MongoClient } from 'mongodb';
 import pg from 'pg';
 import type { CurrentMember } from '../../app/.server/auth';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
-import { signedFetch, xmlTag } from '../../app/.server/s3-client';
+import { signedFetch, xmlTag, xmlTags } from '../../app/.server/s3-client';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 
@@ -236,11 +236,20 @@ async function iam(action: string, params: Record<string, string>) {
   return xml;
 }
 
+/** 删除账号：先删密钥与策略，否则 DeleteUser 报 DeleteConflict（SeaweedFS 4.50 起）；账号不存在时什么也不做 */
+async function deleteS3User(user: string) {
+  for (const AccessKeyId of xmlTags(await iam('ListAccessKeys', { UserName: user }), 'AccessKeyId')) {
+    await iam('DeleteAccessKey', { UserName: user, AccessKeyId });
+  }
+  await iam('DeleteUserPolicy', { UserName: user, PolicyName: 'source' });
+  await iam('DeleteUser', { UserName: user });
+}
+
 /** 在对象存储上建一个只能访问 prefix 的账号：能读、列目录，另加 extra 中的权限（如 s3:PutObject），返回新签发的密钥 */
 async function s3Account(user: string, prefix: string, extra: string[] = []) {
   const [bucket, ...rest] = prefix.replace(/^s3:\/\//, '').split('/');
   const objects = `${rest.filter(Boolean).join('/')}/*`;
-  await iam('DeleteUser', { UserName: user });
+  await deleteS3User(user);
   await iam('CreateUser', { UserName: user });
   await iam('PutUserPolicy', {
     UserName: user,
@@ -281,7 +290,7 @@ export async function s3SourceFiles(tenantId: string) {
     writer: await s3Account(`src-rw-${tenantId}`, prefix, ['s3:PutObject']),
     deleter: await s3Account(`src-rd-${tenantId}`, prefix, ['s3:DeleteObject']),
     async cleanup() {
-      for (const kind of ['ro', 'rw', 'rd']) await iam('DeleteUser', { UserName: `src-${kind}-${tenantId}` });
+      for (const kind of ['ro', 'rw', 'rd']) await deleteS3User(`src-${kind}-${tenantId}`);
     },
   };
 }

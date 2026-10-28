@@ -96,9 +96,23 @@ export async function setTenantS3Prefixes(tenantId: string, dataPaths: string[])
 
 const putPolicy = (UserName: string, PolicyDocument: string) => iam('PutUserPolicy', { UserName, PolicyName: 'tenant-lake', PolicyDocument });
 
-/** 删除租户在存储服务上的读写与只读账号（连同密钥与策略）；账号不存在时什么也不做 */
+/**
+ * 删除租户在存储服务上的读写与只读账号；账号不存在时什么也不做。
+ * 与 AWS 一样，账号还有密钥或策略时 DeleteUser 报 DeleteConflict（SeaweedFS 4.50 起），先删密钥与策略
+ */
 export async function deleteTenantS3Account(tenantId: string) {
-  for (const UserName of [s3UserOf(tenantId), s3ReadOnlyUserOf(tenantId)]) await iam('DeleteUser', { UserName }).catch(ignoreIamError('NoSuchEntity'));
+  for (const UserName of [s3UserOf(tenantId), s3ReadOnlyUserOf(tenantId)]) {
+    let keys: string;
+    try {
+      keys = await iam('ListAccessKeys', { UserName });
+    } catch (e) {
+      ignoreIamError('NoSuchEntity')(e);
+      continue;
+    }
+    for (const AccessKeyId of tags(keys, 'AccessKeyId')) await iam('DeleteAccessKey', { UserName, AccessKeyId });
+    await iam('DeleteUserPolicy', { UserName, PolicyName: 'tenant-lake' }).catch(ignoreIamError('NoSuchEntity'));
+    await iam('DeleteUser', { UserName }).catch(ignoreIamError('NoSuchEntity'));
+  }
 }
 
 /**
