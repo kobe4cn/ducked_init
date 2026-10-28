@@ -16,7 +16,7 @@ import {
   type WriteGrant,
 } from './pipeline/source-engine';
 import type { TaskKind } from './pipeline/handlers';
-import type { SyncTableParam } from './pipeline/sync-engine';
+import { bronzeSchema, type SyncTableParam } from './pipeline/sync-engine';
 import type { SyncMode } from '../lib/sources';
 import { decryptForTenant, encryptForTenant } from './secrets';
 import {
@@ -518,10 +518,16 @@ export async function deleteBlockers(tx: Tx, tenantId: string, sourceId: string)
   return reasons;
 }
 
+/** 数据源页显示的删除拒绝原因（deleteBlockers，不加锁） */
+export async function sourceDeleteBlockers(actor: CurrentMember, sourceId: string) {
+  assertCan(actor, 'publish');
+  return getDb().transaction(tx => deleteBlockers(tx, actor.tenant.id, sourceId));
+}
+
 /**
  * 删除数据源（ADR-0044）：有发布权限的成员，deleteBlockers 没有原因时才能删（否则 400 并列出原因）。
  * 只软删：丢弃没发布过的映射与映射草稿、再丢弃没发布过的源视图与源视图草稿（映射引用源视图，顺序不能反），清空同步范围，
- * 凭据写成空串，打上删除标记；已停用的映射与已发布版本保留。原始层的清理不在这里
+ * 凭据写成空串，打上删除标记，入队 source.drop 删掉湖里的原始层；已停用的映射与已发布版本保留，标准层里已合并的行也保留
  */
 export async function deleteSource(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'publish');
@@ -548,6 +554,8 @@ export async function deleteSource(actor: CurrentMember, sourceId: string) {
     await tx.delete(sourceTables).where(eq(sourceTables.sourceId, sourceId));
     await tx.update(sources).set({ credentials: '', deletedAt: new Date(), deletedByEmail: actor.email, updatedAt: new Date() })
       .where(eq(sources.id, sourceId));
+    // 审计记在入队之后（catalog/versions.ts 的加锁顺序）
+    await insertTask(tx, tenantId, 'source.drop', { schema: bronzeSchema(sourceId) });
     await recordAudit(tx, {
       tenantId, actor, action: 'source.deleted', targetType: 'source', targetId: sourceId, detail: { name: row.name, kind: row.kind },
     });

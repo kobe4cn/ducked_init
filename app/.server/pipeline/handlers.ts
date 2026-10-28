@@ -453,6 +453,22 @@ export const HANDLERS = {
       return { tables };
     },
   },
+  // 删除原始层（ADR-0044）：删掉已删除数据源在湖里的 <schema>、<schema>_keys、<schema>_mirror 下的全部表（不在的跳过，重复执行不报错），
+  // 再删掉这三个 schema，并与 gold.expire 一样擦除湖里的数据。参数不叫 sourceId：派发时会去解密已清空的凭据
+  'source.drop': {
+    label: '删除原始层',
+    async run(con, params) {
+      const schema = params.schema;
+      if (typeof schema !== 'string' || !/^bronze_[0-9a-f]{32}$/.test(schema)) throw new Error('参数 schema 必须是原始层 schema 名');
+      const schemas = [schema, `${schema}_keys`, `${schema}_mirror`];
+      const tables = await rows<{ schema: string; name: string }>(con, `
+        SELECT table_schema AS schema, table_name AS name FROM information_schema.tables
+        WHERE table_catalog = 'lake' AND table_schema IN (${schemas.map(s => `'${s}'`).join(', ')}) ORDER BY ALL`);
+      await dropAndCleanup(con, tables.map(t => [t.schema, t.name]));
+      for (const s of schemas) await con.run(`DROP SCHEMA IF EXISTS lake."${s}"`);
+      return { schemas, tables: tables.map(t => `${t.schema}.${t.name}`) };
+    },
+  },
   // 沙箱表过期（ADR-0036）：删掉参数里到期的沙箱表 sandbox_<成员>.<表名>（已删的跳过，重复执行不报错），再与 gold.expire 一样擦除湖里的数据。
   // 表名正则是防注入的最后一道，只认沙箱 schema
   'sandbox.expire': {

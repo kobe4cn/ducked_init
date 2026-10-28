@@ -1,18 +1,21 @@
 // test/pipeline/source-delete.test.ts —— 删除数据源的接缝（ADR-0044）：deleteBlockers 列出全部拒绝原因（已发布没停用的映射、跨源引用方、排队或运行中的源任务与合并），
-// deleteSource 满足条件时丢弃没发布过的映射与源视图、清空同步范围与凭据、打上删除标记并记审计；已删除的数据源各处查不到，可以重新登记同名的
-import { eq } from 'drizzle-orm';
+// deleteSource 满足条件时丢弃没发布过的映射与源视图、清空同步范围与凭据、打上删除标记、入队 source.drop 并记审计；已删除的数据源各处查不到，可以重新登记同名的；
+// source.drop 删掉原始层的三个 schema 与文件，标准层不动
+import { existsSync } from 'node:fs';
+import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { mappings, mappingVersions, sources, sourceTables, sourceViews } from '../../app/.server/db/schema';
+import { mappings, mappingVersions, sources, sourceTables, sourceViews, tasks } from '../../app/.server/db/schema';
 import { confirmDisable, createMapping, publishedPlans, publishMapping, requestDisable, saveDraft } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { requireSource, sourceIdByName } from '../../app/.server/source-config';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView } from '../../app/.server/source-views';
 import { confirmWatermark, deleteBlockers, deleteSource, listSources, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables } from './fixtures';
+import { memberOf, newTenant, onLake, publish, runTask, selectAllTables } from './fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from './identity-fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
@@ -147,5 +150,66 @@ describe('删除数据源', () => {
     expect(again.id).not.toBe(id);
     expect(await sourceIdByName(acme, '电商库')).toBe(again.id);
     expect((await listSources(author)).map(s => s.id)).toEqual([again.id]);
+  });
+
+  it('删除入队 source.drop（参数是 schema）：跑完后三个 schema、其中的表与 parquet 文件都已删除，别的数据源的原始层与标准层的行不受影响；重复执行不报错', async () => {
+    const acme = await newTenant('acme');
+    const author = await memberOf(acme, 'de@acme.com');
+    const reviewer = await memberOf(acme, 'de2@acme.com');
+    // 关掉内联，原始层写成 parquet 文件
+    await onLake(acme, `CALL lake.set_option('data_inlining_row_limit', 0)`);
+    const syncAll = async (name: string) => {
+      const { id } = await registerSource(author, await pgSourceInput(READER, name));
+      await selectAllTables(author, id);
+      await drain();
+      await confirmWatermark(author, id, 'customers', 'updated_at');
+      await confirmWatermark(author, id, 'orders', 'order_id');
+      await syncSource(author, id);
+      await drain();
+      return id;
+    };
+    const kept = await syncAll('电商库');
+    const doomed = await syncAll('旧电商库');
+    await publish(author, reviewer, kept, CUSTOMERS);
+    const orders = await publish(author, reviewer, doomed, ORDERS);
+    await drain();
+    await requestDisable(author, orders);
+    await confirmDisable(reviewer, orders);
+    await drain();
+
+    const schema = bronzeSchema(doomed);
+    const schemas = [schema, `${schema}_keys`, `${schema}_mirror`];
+    const lakeTables = (s: string[]) => onLake<{ name: string }>(acme, `
+      SELECT table_schema || '.' || table_name AS name FROM information_schema.tables
+      WHERE table_catalog = 'lake' AND table_schema IN (${s.map(x => `'${x}'`).join(', ')}) ORDER BY ALL`);
+    const doomedTables = await lakeTables(schemas);
+    expect(doomedTables.map(t => t.name)).toEqual(expect.arrayContaining([`${schema}.customers`, `${schema}_keys.customers`]));
+    expect(doomedTables.some(t => t.name.startsWith(`${schema}_mirror.`))).toBe(true);
+    const files = (await Promise.all(doomedTables.map(t => {
+      const [s, name] = t.name.split('.');
+      return onLake<{ path: string }>(acme, `SELECT data_file AS path FROM ducklake_list_files('lake', '${name}', schema => '${s}')`);
+    }))).flat();
+    expect(files.length).toBeGreaterThan(0);
+    const keptTables = await lakeTables([bronzeSchema(kept)]);
+    const silverCount = async () => (await onLake<{ n: string }>(acme, 'SELECT count(*) AS n FROM silver.customer'))[0].n;
+    const customers = await silverCount();
+    expect(Number(customers)).toBeGreaterThan(0);
+
+    await deleteSource(author, doomed);
+    const [drop] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'source.drop')));
+    expect(drop).toMatchObject({ status: 'queued', params: { schema } });
+    await drain();
+    const [done] = await getDb().select().from(tasks).where(eq(tasks.id, drop.id));
+    expect(done).toMatchObject({ status: 'succeeded' });
+
+    expect(await lakeTables(schemas)).toEqual([]);
+    const left = await onLake<{ name: string }>(acme, `SELECT schema_name AS name FROM information_schema.schemata WHERE catalog_name = 'lake'`);
+    expect(left.map(s => s.name).filter(s => schemas.includes(s))).toEqual([]);
+    expect(files.filter(f => existsSync(f.path))).toEqual([]);
+    expect(await lakeTables([bronzeSchema(kept)])).toEqual(keptTables);
+    expect(await silverCount()).toBe(customers);
+
+    expect(await runTask(acme, 'source.drop', { schema })).toMatchObject({ status: 'succeeded' });
+    expect(await runTask(acme, 'source.drop', { schema: 'silver' })).toMatchObject({ status: 'failed' });
   });
 });

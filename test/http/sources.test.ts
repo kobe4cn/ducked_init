@@ -478,3 +478,50 @@ describe('湖中数据', () => {
     expect(await (await browser.get('/sources')).text()).not.toContain('data-verify-differences');
   });
 });
+
+describe('删除数据源', () => {
+  const ORDERS = `model: 1
+entity: order
+table: orders
+fields:
+  order_id: string(order_id)
+  amount: amount
+`;
+
+  it('有已发布没停用的映射时按钮禁用、旁边列出原因，提交得到 400；可以删除时删除后跳到 /sources、列表里没有它；分析师看不到按钮、提交得到 403', async () => {
+    const tenantId = await newTenant('acme');
+    const author = await memberOf(tenantId, 'de@acme.com');
+    const { id: blocked } = await registerSource(author, await pgSourceInput(READER));
+    await selectAllTables(author, blocked);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    await publish(author, await memberOf(tenantId, 'de2@acme.com'), blocked, ORDERS);
+    const { id } = await registerSource(author, await pgSourceInput(READER, '旧电商库'));
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    const browser = await loginAs(app, 'de@acme.com');
+
+    const blockedPage = await (await browser.get(`/sources/${blocked}`)).text();
+    expect(blockedPage).toMatch(/<button[^>]*disabled=""[^>]*>.*?删除数据源<\/button>/);
+    expect(blockedPage).not.toContain('name="intent" value="delete"');
+    expect(blockedPage).toMatch(/data-delete-blockers[\s\S]*?有已发布且没停用的映射：orders → order，先停用它们/);
+    const refused = await browser.post(`/sources/${blocked}`, { intent: 'delete' });
+    expect(refused.status).toBe(400);
+    expect(await refused.text()).toContain('不能删除数据源「电商库」');
+
+    const analyst = await loginAs(app, 'an@acme.com');
+    const analystPage = await (await analyst.get(`/sources/${id}`)).text();
+    expect(analystPage).not.toContain('删除数据源');
+    expect((await analyst.post(`/sources/${id}`, { intent: 'delete' })).status).toBe(403);
+
+    const page = await (await browser.get(`/sources/${id}`)).text();
+    expect(page).toContain('name="intent" value="delete"');
+    expect(page).not.toContain('data-delete-blockers');
+    const res = await browser.post(`/sources/${id}`, { intent: 'delete' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe('/sources');
+    const list = await (await browser.get('/sources')).text();
+    expect(list).not.toContain('旧电商库');
+    expect(list).toContain('电商库');
+    expect((await browser.get(`/sources/${id}`)).status).toBe(404);
+  });
+});

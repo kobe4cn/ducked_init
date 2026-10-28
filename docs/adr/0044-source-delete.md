@@ -11,7 +11,7 @@
 - **只软删**：`sources` 打上删除标记（`deleted_at`、`deleted_by_email`），不删行。`source_tables`、`mappings`、`source_views`、`mapping_generations` 都对 `sources` 设了级联删除，删行会连同已停用映射的历史一起抹掉。已删除的数据源在 `requireSource`、`sourceIdByName`、`listSources` 里都查不到；名称的唯一索引只管没删除的行，可以重新登记同名的数据源。
 - **平台库里删掉的**：凭据密文（`credentials` 非空列，写成空串）、同步范围（`source_tables`），以及没发布过的映射与映射草稿、没发布过的源视图与源视图草稿。先丢映射再丢源视图：`mappings.source_view_id` 没有级联。
 - **平台库里保留的**：已停用的映射与已发布版本、已发布的源视图版本，以及数据源记录本身。
-- **数据湖**：入队一个任务删掉原始层（`bronze_<id>`、`_keys`、`_mirror` 三个 schema）。标准层里已经合并进去的行保留，与停用映射一致。
+- **数据湖**：同一事务里入队 `source.drop`（参数 `{ schema: 'bronze_<去横线 id>' }`，不叫 `sourceId`：派发时会去解密已清空的凭据），删掉原始层（`bronze_<id>`、`_keys`、`_mirror` 三个 schema 下的表与 schema），再按 ADR-0020 让此前的 DuckLake 快照过期并清掉文件。标准层里已经合并进去的行保留，与停用映射一致。
 - **审计与目录**：记审计 `source.deleted`（detail 为 `{ name, kind }`，不记凭据），并产生一个目录版本；变更记录里这个数据源和它的源表显示为删除。
 
 另记两笔：

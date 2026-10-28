@@ -8,7 +8,7 @@
 // 页头下是类型、目标、同步表数、核对状态四张指标卡，各标签页的内容放在一个白色面板里
 import { Fragment, useEffect, useState } from 'react';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
-import { CheckCircle2, CircleAlert, CircleCheck, PencilLine, PlugZap, Plus, RefreshCw, ScrollText } from 'lucide-react';
+import { CheckCircle2, CircleAlert, CircleCheck, Lock, PencilLine, PlugZap, Plus, RefreshCw, ScrollText, Trash2 } from 'lucide-react';
 import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
@@ -18,7 +18,8 @@ import { getSyncStatus, syncSource } from '~/.server/source-sync';
 import { getVerifyStatus, notInLakeReason, verifySource } from '~/.server/source-verify';
 import { listSourceViews, type SourceViewSummary } from '~/.server/source-views';
 import {
-  confirmKey, confirmSoftDelete, confirmWatermark, getSource, relistSource, setSyncScope, SourceError, testSource, updateSource,
+  confirmKey, confirmSoftDelete, confirmWatermark, deleteSource, getSource, relistSource, setSyncScope, sourceDeleteBlockers, SourceError, testSource,
+  updateSource,
 } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import type { DataCheck, FailedCheck, FileCheck, StructureCheck, VerifyRecord } from '~/.server/pipeline/verify-engine';
@@ -71,6 +72,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     const { views } = await listSourceViews(member, params.sourceId);
     const keyChecks = await getKeyChecks(member, params.sourceId);
     const drift = await sourceDrift(member.tenant.id, params.sourceId);
+    const canDelete = can(member.role, 'publish');
     /**
      * 表最近一次业务主键检查：排队或运行中为 running，有空值或重复为 failed（带结果），任务出错为 error；
      * 通过的已写回声明，不再单独显示。检查期间与不通过时，原有声明照旧生效
@@ -95,6 +97,9 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       email: member.email,
       nav: navFor(member),
       canWrite: can(member.role, 'sources:write'),
+      // 有发布权限的成员才能删除数据源（ADR-0044），被挡时列出原因
+      canDelete,
+      deleteBlockers: canDelete ? await sourceDeleteBlockers(member, params.sourceId) : [],
       source: {
         id: source.id,
         name: source.name,
@@ -185,6 +190,10 @@ export async function action({ request, params }: Route.ActionArgs) {
       case 'confirm-soft-delete':
         await confirmSoftDelete(member, params.sourceId, field('table'), field('column'));
         break;
+      case 'delete':
+        // deleteSource 另外要求发布权限
+        await deleteSource(member, params.sourceId);
+        throw redirect('/sources');
       default:
         return data({ ok: null, error: '未知操作', values: null }, { status: 400 });
     }
@@ -785,6 +794,32 @@ function LakeData({ verify, canWrite, submitting, busy }: { verify: VerifyView; 
   );
 }
 
+/** 删除数据源：确认后提交；被挡时按钮禁用，旁边列出原因（ADR-0044） */
+function DeleteSource({ name, blockers, submitting }: { name: string; blockers: string[]; submitting: boolean }) {
+  if (blockers.length) {
+    return (
+      <span className="flex items-center gap-2">
+        <Button type="button" variant="destructive" disabled><Trash2 />删除数据源</Button>
+        <span className="flex max-w-xs items-start gap-1 text-sm text-slate-500" data-delete-blockers>
+          <Lock className="mt-0.5 size-3.5 shrink-0" />
+          <span>{blockers.map(r => <span key={r} className="block">{r}</span>)}</span>
+        </span>
+      </span>
+    );
+  }
+  return (
+    <Form
+      method="post"
+      onSubmit={e => {
+        if (!confirm(`确认删除数据源「${name}」？删除后不能恢复：同步范围、凭据与湖里的原始层都会删掉，标准层里已合并的行保留。`)) e.preventDefault();
+      }}
+    >
+      <input type="hidden" name="intent" value="delete" />
+      <Button type="submit" variant="destructive" disabled={submitting}><Trash2 />删除数据源</Button>
+    </Form>
+  );
+}
+
 /** 源视图：每个一张卡片（名称、已发布版本、草稿），可新建时末尾是虚线的新建卡片；没有源视图时说明它是什么，可新建时直接给出新建表单 */
 function SourceViews({ base, views, canWrite, submitting }: { base: string; views: SourceViewSummary[]; canWrite: boolean; submitting: boolean }) {
   const intro = '源视图是一段只读本数据源原始层的 SELECT，用来把复杂的源表整理成可映射的形状。保存时在原始层上校验并预览，按双人发布规则由另一位成员发布。';
@@ -823,7 +858,7 @@ function SourceViews({ base, views, canWrite, submitting }: { base: string; view
 }
 
 export default function Source({ loaderData, actionData }: Route.ComponentProps) {
-  const { tab, email, nav, canWrite, source, profile, listing, newTables, tables, sync, verify, views } = loaderData;
+  const { tab, email, nav, canWrite, canDelete, deleteBlockers, source, profile, listing, newTables, tables, sync, verify, views } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const profiling = profile.status === 'queued' || profile.status === 'running';
   const syncing = sync.status === 'queued' || sync.status === 'running';
@@ -844,16 +879,21 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
       <PageHeader
         title={source.name}
         description={<><Link to="/sources" className="hover:underline">← 数据源</Link>{` · 登记于 ${time(source.createdAt)}`}</>}
-        actions={canWrite && (
+        actions={(canWrite || canDelete) && (
           <>
-            <Form method="post">
-              <input type="hidden" name="intent" value="test" />
-              <Button type="submit" variant="outline" disabled={submitting}><PlugZap />测试连接</Button>
-            </Form>
-            <Form method="post">
-              <input type="hidden" name="intent" value="refresh" />
-              <Button type="submit" variant="outline" disabled={submitting}><RefreshCw />重新列出表并采集</Button>
-            </Form>
+            {canWrite && (
+              <>
+                <Form method="post">
+                  <input type="hidden" name="intent" value="test" />
+                  <Button type="submit" variant="outline" disabled={submitting}><PlugZap />测试连接</Button>
+                </Form>
+                <Form method="post">
+                  <input type="hidden" name="intent" value="refresh" />
+                  <Button type="submit" variant="outline" disabled={submitting}><RefreshCw />重新列出表并采集</Button>
+                </Form>
+              </>
+            )}
+            {canDelete && <DeleteSource name={source.name} blockers={deleteBlockers} submitting={submitting} />}
           </>
         )}
       />
