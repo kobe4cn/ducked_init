@@ -69,6 +69,25 @@ export async function runQuery(
   }));
 }
 
+/**
+ * 校验 AI 起草的 SQL（ADR-0043）：与 runQuery 同一套只读挂载、并发锁与白名单，只调 checkWorkbenchSql、不执行，
+ * 记审计 workbench.ai_drafted { sql, valid }（不记需求原文；挂载等出错时另带 error），不记 workbench.query。
+ * 返回规范化后的 SQL 与没通过白名单的原因（通过时为 null）；挂载出错、超时或已有查询在运行时与 runQuery 一样抛出 WorkbenchError
+ */
+export async function checkDraftedSql(actor: CurrentMember, rawSql: string): Promise<{ sql: string; problem: string | null }> {
+  const query = normalizeWorkbenchSql(rawSql);
+  const problem = await inWorkbench(actor, { timeoutMs: WORKBENCH_TIMEOUT_MS, readOnly: true }, async ({ session, mountAccess }) => {
+    try {
+      await checkWorkbenchSql(session.con, query, await mountAccess());
+      return null;
+    } catch (e) {
+      if (e instanceof WorkbenchSqlError) return e.message;
+      throw e;
+    }
+  }, (result, _, error) => ({ action: 'workbench.ai_drafted', detail: { sql: query, valid: result === null, ...(error && { error }) } }));
+  return { sql: query, problem };
+}
+
 /** 保存好的沙箱表 */
 export interface SandboxTable { name: string; rowCount: number; createdAt: Date; expiresAt: Date }
 /** 「我的沙箱表」里的一行：另带分享给了谁（邮箱，按字母排序） */

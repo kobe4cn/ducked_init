@@ -2,13 +2,15 @@
 // 客户端中止请求即取消查询，同租户已有查询在运行时再提交返回 429。查看者看不到导航、打开与提交都 403。
 // 填上表名点「保存」把 SELECT 的结果存为沙箱表，「我的沙箱表」列出自己的表；别人的沙箱读不到。
 // 表的主人分享给本租户有沙箱权限的成员后，被分享人在「分享给我的」里看到、能读不能写，撤销后又读不到。
+// 写下需求点「AI 起草」，起草的 SQL 填进编辑框、不执行（ADR-0043）。
 // 左侧目录树只列能读的表（字段类型、行数、湖中位置、带引号的引用）；原始层按数据源名列出视图，数据源改名后别名随之变化
 import { and, eq } from 'drizzle-orm';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, members, sandboxTables, sources } from '../../app/.server/db/schema';
 import { memberOf, newTenant, onLake } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
+import { fakeLlm, json, platformDefault } from '../pipeline/llm-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
@@ -21,6 +23,8 @@ beforeAll(async () => {
   await memberOf(acme, 'vi@acme.com', 'viewer');
 });
 afterAll(async () => { await app?.close(); await closeDb(); });
+
+afterEach(() => { app.setLlmFetch(undefined); vi.unstubAllEnvs(); });
 
 const SLOW = `SELECT count(*) FROM ${Array.from({ length: 12 }, (_, i) => `silver.customer c${i}`).join(', ')}`;
 const lastAudit = async () => (await getDb().select().from(auditLogs)
@@ -86,6 +90,33 @@ describe('数据查询工作台', () => {
     await expect.poll(async () => (await lastAudit())?.detail, { timeout: 20_000 }).toMatchObject({ sql: SLOW, error: '查询已取消' });
     expect((await analyst.post('/workbench', { sql: 'SELECT 1 AS one' })).status).toBe(200);
   }, 60_000);
+});
+
+describe('AI 起草', () => {
+  it('分析师点「AI 起草」后编辑框里是草稿，没有结果表格、不记查询；草稿没过校验时编辑框保留原来的 SQL', async () => {
+    await memberOf(acme, 'an-ai@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an-ai@acme.com');
+    const draft = 'SELECT city, count(*) AS n FROM silver.customer GROUP BY city';
+    let reply = draft;
+    platformDefault();
+    fakeLlm(f => app.setLlmFetch(f), () => json({ sql: reply }));
+    const before = await lastAudit();
+
+    const res = await analyst.post('/workbench', { intent: 'draft', request: '每个城市的客户数', sql: 'SELECT 1' });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toMatch(/<textarea[^>]*name="sql"[^>]*>SELECT city, count\(\*\) AS n FROM silver.customer GROUP BY city<\/textarea>/);
+    expect(html).toContain('data-drafted');
+    expect(html).not.toContain('data-workbench-result');
+    expect(await lastAudit()).toEqual(before);
+
+    reply = 'DELETE FROM silver.customer';
+    const rejected = await analyst.post('/workbench', { intent: 'draft', request: '清空客户', sql: 'SELECT 1' });
+    expect(rejected.status).toBe(422);
+    const page = await rejected.text();
+    expect(page).toContain('AI 起草的 SQL 没有通过校验');
+    expect(page).toMatch(/<textarea[^>]*name="sql"[^>]*>SELECT 1<\/textarea>/);
+  });
 });
 
 describe('沙箱表', () => {

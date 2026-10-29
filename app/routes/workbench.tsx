@@ -4,10 +4,11 @@
 // 可以按邮箱分享给本租户有沙箱权限的成员或撤销；「分享给我的」列出别人分享来的表（只读，在查询里按 sandbox_<主人>.<表名> 读）。
 // 左侧目录树按 标准层 / 结果层 / 我的沙箱 / 分享给我的 列出能读的表、字段类型、行数与湖中位置，点表名把带引号的引用插进 SQL 框；
 // 「原始层」按数据源名列出回放后当前状态的视图（敏感列是哈希），名字与保留名冲突的数据源给出没挂载的原因。
+// 「AI 起草」把需求与能读的表名、字段名发给模型服务，起草的 SQL 通过白名单校验后填进编辑框、不执行（ADR-0043），没通过时编辑框保留原来的 SQL。
 // SQL 框是 SqlEditor（CodeMirror，客户端加载）：DuckDB 高亮，按同一份目录补全 schema / 表 / 字段，Ctrl/⌘+Enter 执行
 import { useMemo, useRef } from 'react';
 import { data, Form, Link, useNavigation } from 'react-router';
-import { AlertTriangle, CheckCircle2, ChevronRight, CircleAlert, Database, Table2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronRight, CircleAlert, Database, Sparkles, Table2 } from 'lucide-react';
 import type { Route } from './+types/workbench';
 import { requirePermission } from '~/.server/access';
 import type { CurrentMember } from '~/.server/auth';
@@ -16,6 +17,7 @@ import {
   listCatalog, listSandboxTables, listSharedWithMe, runQuery, SANDBOX_TTL_DAYS, sandboxSchema, saveAsSandbox, shareSandboxTable, unshareSandboxTable,
   WORKBENCH_ROWS, WORKBENCH_TIMEOUT_MS, WorkbenchError, type CatalogEntry, type RawCatalogSource, type WorkbenchCatalog,
 } from '~/.server/workbench';
+import { draftWorkbenchSql, MAX_REQUEST, WorkbenchAiError } from '~/.server/workbench-ai';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
 import { SqlEditor, type SqlEditorHandle } from '~/components/sql-editor';
@@ -49,7 +51,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     ...await loadCatalog(member),
     email: member.email, nav: navFor(member), maxRows: WORKBENCH_ROWS, timeoutSeconds: WORKBENCH_TIMEOUT_MS / 1000,
     sandbox: sandboxSchema(member.memberId), sandboxTables: await listSandboxTables(member), sharedWithMe: await listSharedWithMe(member),
-    ttlDays: SANDBOX_TTL_DAYS,
+    ttlDays: SANDBOX_TTL_DAYS, maxRequest: MAX_REQUEST,
   };
 }
 
@@ -60,7 +62,10 @@ export async function action({ request }: Route.ActionArgs) {
   const name = String(form.get('name') ?? '').trim();
   const intent = String(form.get('intent') ?? 'query');
   const email = String(form.get('email') ?? '');
+  const need = String(form.get('request') ?? '');
   try {
+    // AI 起草（ADR-0043）：只把通过校验的 SQL 填进编辑框，不执行、不带结果；draftId 每次都不同，同样的草稿再起草一次也会重新填进编辑框
+    if (intent === 'draft') return { ...await draftWorkbenchSql(member, need), name, intent, request: need, draftId: crypto.randomUUID() };
     if (intent === 'save') return { sql, name, saved: await saveAsSandbox(member, name, sql, request.signal) };
     if (intent === 'share') {
       return { sql: '', name: '', notice: `已把 ${name} 分享给 ${await shareSandboxTable(member, name, email)}` };
@@ -70,14 +75,14 @@ export async function action({ request }: Route.ActionArgs) {
     }
     return { sql, name, result: await runQuery(member, sql, request.signal) };
   } catch (e) {
-    if (e instanceof WorkbenchError) return data({ sql, name, intent, error: e.message }, { status: e.status });
+    if (e instanceof WorkbenchError || e instanceof WorkbenchAiError) return data({ sql, name, intent, request: need, error: e.message }, { status: e.status });
     throw e;
   }
 }
 
 const dateTime = (d: Date | string) => new Date(d).toLocaleString('zh-CN', { hour12: false });
 
-const ERROR_TITLES: Record<string, string> = { save: '沙箱表没有保存', share: '没有分享', unshare: '没有撤销分享' };
+const ERROR_TITLES: Record<string, string> = { draft: 'AI 没有起草 SQL', save: '沙箱表没有保存', share: '没有分享', unshare: '没有撤销分享' };
 
 /** 目录树的四节：标题与说明 */
 const CATALOG_SECTIONS: { key: Exclude<keyof WorkbenchCatalog, 'raw'>; title: string; empty: string }[] = [
@@ -174,15 +179,18 @@ function CatalogTableItem({ table, onInsert }: { table: CatalogEntry | RawCatalo
 const cell = (v: unknown) => (v === null || v === undefined ? 'NULL' : typeof v === 'object' ? JSON.stringify(v) : String(v));
 
 export default function Workbench({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, maxRows, timeoutSeconds, sandbox, sandboxTables, sharedWithMe, ttlDays, catalog, catalogError } = loaderData;
+  const { email, nav, maxRows, timeoutSeconds, sandbox, sandboxTables, sharedWithMe, ttlDays, maxRequest, catalog, catalogError } = loaderData;
   const sqlBox = useRef<SqlEditorHandle>(null);
   /** 在光标处插入表的引用（替换选中的文字） */
   const insertRef = (ref: string) => sqlBox.current?.insert(ref);
   const schema = useMemo(() => (catalog ? completionSchema(catalog) : {}), [catalog]);
-  const running = useNavigation().state === 'submitting';
+  const navigation = useNavigation();
+  const running = navigation.state === 'submitting';
+  const drafting = running && navigation.formData?.get('intent') === 'draft';
   const result = actionData && 'result' in actionData ? actionData.result : null;
   const saved = actionData && 'saved' in actionData ? actionData.saved : null;
   const notice = actionData && 'notice' in actionData ? actionData.notice : null;
+  const draftId = actionData && 'draftId' in actionData ? actionData.draftId : null;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -195,15 +203,30 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
         <div className="min-w-0 space-y-6">
           <Form method="post" className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm">
             <label htmlFor="sql" className="text-sm font-medium">SQL</label>
+            {/* defaultValue 只在挂载时生效：起草后换 key 让编辑框重新挂载、填入草稿 */}
             <SqlEditor
+              key={draftId ?? 'sql'}
               id="sql" name="sql" ref={sqlBox} defaultValue={actionData?.sql ?? ''} schema={schema} running={running}
               placeholder={'SELECT * FROM silver.customer LIMIT 100\n-- 结果层的表名带横线，要加引号：gold."rfm__<任务 ID>"'}
             />
             <div className="flex items-center gap-3">
-              <Button type="submit" disabled={running}>{running ? '执行中…' : '执行'}</Button>
+              <Button type="submit" disabled={running}>{running && !drafting ? '执行中…' : '执行'}</Button>
               {/* 发起新的导航会中止进行中的提交，服务端随之中断查询 */}
               {running && <Button asChild variant="outline"><Link to="/workbench" replace>取消</Link></Button>}
               <span className="text-sm text-slate-400">Ctrl / ⌘ + Enter 执行；同一租户同时只能运行一个查询。</span>
+            </div>
+            <div className="space-y-2 border-t pt-3">
+              <Label htmlFor="request">AI 起草</Label>
+              <textarea
+                id="request" name="request" rows={2} maxLength={maxRequest} defaultValue={actionData && 'request' in actionData ? actionData.request : ''}
+                placeholder="用自然语言写下要查什么，如：每个城市的客户数"
+                className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              />
+              <div className="flex flex-wrap items-center gap-3">
+                <Button type="submit" name="intent" value="draft" variant="outline" disabled={running}>{drafting ? '起草中…' : 'AI 起草'}</Button>
+                <span className="text-sm text-slate-400">会把需求与你能读的表名、字段名发给模型服务（不发数据）；起草的 SQL 替换编辑框里的内容，不会执行。</span>
+              </div>
+              {draftId && <p className="flex items-center gap-1 text-sm text-amber-600" data-drafted><Sparkles className="size-4" />已填入 AI 起草的 SQL，请核对后点「执行」。</p>}
             </div>
             <div className="flex flex-wrap items-center gap-3 border-t pt-3">
               <Label htmlFor="name">保存为沙箱表</Label>

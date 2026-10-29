@@ -271,6 +271,8 @@ const ACTIONS = {
     label: '执行查询',
     describe: (d: Detail) => `${d.error ? `失败：${d.error}` : `${d.rows} 行${d.truncated ? '（已截断）' : ''}`}，耗时 ${d.durationMs} 毫秒：${d.sql}`,
   },
+  // AI 起草的 SQL（ADR-0043）：只记 SQL 与是否通过白名单校验，不记需求原文；不执行
+  'workbench.ai_drafted': { label: 'AI 起草查询', describe: (d: Detail) => `${d.valid ? '通过校验' : '没有通过校验'}：${d.sql}` },
   'sandbox.save': { label: '保存沙箱表', describe: (d: Detail) => `${d.name}` },
   'sandbox.share': { label: '分享沙箱表', describe: (d: Detail) => `${d.name}` },
   'sandbox.unshare': { label: '撤销沙箱表分享', describe: (d: Detail) => `${d.name}` },
