@@ -1,8 +1,9 @@
 // app/routes/assistant.tsx —— AI 助手的资源路由（ADR-0043），顶栏侧栏（AssistantPanel）用它：任一登录成员都可以用。
-// GET 返回是否配置了模型服务、最近一次探测是否支持工具调用（toolSupport：true / false / 没探测过为 null）、成员可用的工具名、「我的对话」与「分享给我的」两个列表；带 ?id= 时再返回这个对话（本人或被分享人才能读，否则 404）。
+// GET 返回是否配置了模型服务、最近一次探测是否支持工具调用（toolSupport：true / false / 没探测过为 null）、能否管理模型服务（canManageProvider，侧栏据此决定给不给「模型服务」页的链接）、成员可用的工具名、「我的对话」与「分享给我的」两个列表；带 ?id= 时再返回这个对话（本人或被分享人才能读，否则 404）。
 // POST 接 JSON：{ conversationId?, message, page } 跑一轮问答（历史从保存的对话里取，只有本人能续写），记进对话后返回 { conversationId, reply, toolsUsed }；
 // { intent: 'share' | 'unshare', conversationId, email } 分享或撤销分享自己的对话。出错返回 { error } 与对应状态码
 import type { Route } from './+types/assistant';
+import { can } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
 import { resolveProvider } from '~/.server/llm';
 import { toolSupport } from '~/.server/model-provider';
@@ -24,6 +25,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     return Response.json({
       configured: !!await resolveProvider(member.tenant.id),
       toolSupport: await toolSupport(member.tenant.id),
+      canManageProvider: can(member.role, 'model_provider:manage'),
       tools: toolsFor(member).map(t => t.name),
       mine: await listMyConversations(member),
       shared: await listSharedWithMe(member),

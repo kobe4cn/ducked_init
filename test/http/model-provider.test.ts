@@ -106,7 +106,7 @@ describe('模型服务页', () => {
     expect(calls.map(c => c.error === null).sort()).toEqual([false, true]);
   });
 
-  it('测试连通性时一并探测工具调用：返回 tool_calls 显示支持，只回文本或 400 提示不支持，连通结果照旧；每次记一条 tool_probe', async () => {
+  it('测试连通性时一并探测工具调用：返回 tool_calls 显示支持，400 提示不支持，只回文本提示没能确认，连通结果照旧；每次记一条 tool_probe', async () => {
     const acme = await newTenant('acme');
     const admin = await loginAs(app, 'admin@acme.com');
     await save(admin);
@@ -131,13 +131,17 @@ describe('模型服务页', () => {
     expect(bodies[1]).toMatchObject({ tool_choice: 'auto', tools: [{ type: 'function', function: { name: 'ping' } }] });
     expect(bodies[1]).not.toHaveProperty('response_format');
 
-    for (const unsupported of [() => Response.json({ choices: [{ message: { content: '好的' } }] }), () => new Response('tools not supported', { status: 400 })]) {
-      probeWith(unsupported);
-      const page = await (await admin.post('/model-provider', { intent: 'test' })).text();
-      expect(page).toContain('data-connectivity="ok"');
-      expect(page).toContain('data-tools="no"');
-      expect(page).toContain('该模型服务不支持工具调用，AI 助手无法使用');
-    }
+    probeWith(() => new Response('tools not supported', { status: 400 }));
+    const unsupported = await (await admin.post('/model-provider', { intent: 'test' })).text();
+    expect(unsupported).toContain('data-connectivity="ok"');
+    expect(unsupported).toContain('data-tools="no"');
+    expect(unsupported).toContain('该模型服务不支持工具调用，AI 助手无法使用');
+    // 只回了文本：tool_choice 是 auto，支持的模型也可能不调用，算没能确认
+    probeWith(() => Response.json({ choices: [{ message: { content: '好的' } }] }));
+    const unsure = await (await admin.post('/model-provider', { intent: 'test' })).text();
+    expect(unsure).toContain('data-connectivity="ok"');
+    expect(unsure).toContain('data-tools="unknown"');
+    expect(unsure).toContain('这次没能确认是否支持工具调用');
 
     const probeCalls = await getDb().select().from(llmCalls).where(and(eq(llmCalls.tenantId, acme), eq(llmCalls.purpose, 'tool_probe')));
     expect(probeCalls).toHaveLength(3);

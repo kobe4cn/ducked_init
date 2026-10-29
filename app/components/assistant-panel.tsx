@@ -11,7 +11,7 @@ import { Input } from '~/components/ui/input';
 interface Message { role: 'user' | 'assistant'; content: string; toolsUsed?: string[] }
 interface Summary { id: string; title: string; updatedAt: string; owner?: string }
 interface Conversation { id: string; title: string; messages: Message[]; owned: boolean; sharedWith: string[] }
-type Overview = { configured: boolean; toolSupport: boolean | null; tools: string[]; mine: Summary[]; shared: Summary[]; conversation?: Conversation } | { error: string };
+type Overview = { configured: boolean; toolSupport: boolean | null; canManageProvider: boolean; tools: string[]; mine: Summary[]; shared: Summary[]; conversation?: Conversation } | { error: string };
 type TurnResult = { conversationId: string; reply: string; toolsUsed: string[] } | { error: string };
 type ShareResult = { ok: true; email: string } | { error: string };
 
@@ -168,12 +168,16 @@ export function AssistantPanel() {
                 ) : unsupported ? (
                   <p data-assistant="unsupported" className="flex gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-amber-700">
                     <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-                    <span>该模型服务不支持工具调用，AI 助手无法使用。请管理员到<Link to="/model-provider" className="mx-0.5 underline">「模型服务」</Link>页换一个支持工具调用的模型。</span>
+                    <span>该模型服务不支持工具调用，AI 助手无法使用。{lists.canManageProvider
+                      ? <>请到<Link to="/model-provider" className="mx-0.5 underline">「模型服务」</Link>页换一个支持工具调用的模型。</>
+                      : '请联系管理员换一个支持工具调用的模型。'}</span>
                   </p>
                 ) : !lists.configured ? (
                   <p data-assistant="unconfigured" className="flex gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-amber-700">
                     <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-                    <span>未配置模型服务，AI 助手暂时不能用。请管理员到<Link to="/model-provider" className="mx-0.5 underline">「模型服务」</Link>页配置。</span>
+                    <span>未配置模型服务，AI 助手暂时不能用。{lists.canManageProvider
+                      ? <>请到<Link to="/model-provider" className="mx-0.5 underline">「模型服务」</Link>页配置。</>
+                      : '请联系管理员配置。'}</span>
                   </p>
                 ) : messages.length === 0 ? (
                   <p className="text-slate-500">可以问我目录里有哪些实体、字段、指标与标签，以及它们的含义。我只读目录，不执行查询、不发布。对话会保存在「历史对话」里，只有你自己能看到。</p>

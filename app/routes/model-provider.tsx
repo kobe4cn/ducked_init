@@ -89,9 +89,13 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
               <div data-tools="yes" className="flex items-center gap-1 text-emerald-600">
                 <CheckCircle2 className="size-4" />支持工具调用
               </div>
-            ) : (
+            ) : actionData.tested.tools === false ? (
               <div data-tools="no" className="flex items-center gap-1 text-amber-600">
                 <AlertTriangle className="size-4" />该模型服务不支持工具调用，AI 助手无法使用
+              </div>
+            ) : (
+              <div data-tools="unknown" className="flex items-center gap-1 text-muted-foreground">
+                <AlertTriangle className="size-4" />这次没能确认是否支持工具调用（模型没有调用探测工具，或服务暂时不可用），可以再测一次
               </div>
             )}
           </AlertDescription>

@@ -100,29 +100,30 @@ export async function resetModelProvider(actor: CurrentMember) {
   });
 }
 
-/** tools：模型是否支持工具调用（AI 助手要用，ADR-0042） */
-export type ConnectivityResult = { ok: true; model: string; durationMs: number; tools: boolean } | { ok: false; error: string };
+/** tools：模型是否支持工具调用（AI 助手要用，ADR-0042）；null 是这次没能确认（模型没调用探测工具，或临时故障） */
+export type ConnectivityResult = { ok: true; model: string; durationMs: number; tools: boolean | null } | { ok: false; error: string };
 
 const PING_SCHEMA = { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } };
 
 const PING_TOOL = { name: 'ping', description: '连通性探测：收到请求就调用它', parameters: { type: 'object', properties: {} } };
 
 /**
- * 带一个 ping 工具问一次：返回里有工具调用视为支持；调用失败或只回了文本视为不支持。调用日志里记一条 tool_probe。
- * stored：是否存下这次结果。超时、连不上、5xx、429 这类临时故障不存，免得一次抖动就把助手停掉
+ * 带一个 ping 工具问一次：返回里有工具调用视为支持；模型服务拒绝这个请求（4xx，不含 429）视为不支持。调用日志里记一条 tool_probe。
+ * 其余返回 null（不确定）：只回了文本（tool_choice 是 auto，支持工具调用的模型也可能不调用），或超时、连不上、5xx、429 这类临时故障。
+ * 不确定的结果不存，免得一次误判就把助手停掉
  */
-async function probeTools(tenantId: string): Promise<{ tools: boolean; stored: boolean }> {
+async function probeTools(tenantId: string): Promise<boolean | null> {
   try {
-    return { tools: (await chatTools(tenantId, 'tool_probe', [{ role: 'user', content: '调用 ping 工具' }], [PING_TOOL])).toolCalls.length > 0, stored: true };
+    return (await chatTools(tenantId, 'tool_probe', [{ role: 'user', content: '调用 ping 工具' }], [PING_TOOL])).toolCalls.length > 0 || null;
   } catch (e) {
-    if (e instanceof LlmError) return { tools: false, stored: !e.transient };
+    if (e instanceof LlmError) return e.transient ? null : false;
     throw e;
   }
 }
 
 /**
  * 用当前生效的配置发一次小请求；错误消息由 chatJson 抹掉了 Key，调用日志里记一条 connectivity。
- * 连通后再探测是否支持工具调用（不计入耗时），结果连同这次的端点与模型存下来（临时故障不存）（没有配置行时插入一行，端点、模型名与 Key 为空）
+ * 连通后再探测是否支持工具调用（不计入耗时），结果连同这次的端点与模型存下来（不确定时不存）（没有配置行时插入一行，端点、模型名与 Key 为空）
  */
 export async function testModelProvider(actor: CurrentMember): Promise<ConnectivityResult> {
   assertCan(actor, 'model_provider:manage');
@@ -137,8 +138,8 @@ export async function testModelProvider(actor: CurrentMember): Promise<Connectiv
     throw e;
   }
   const durationMs = Date.now() - started;
-  const { tools, stored } = await probeTools(tenantId);
-  if (stored) {
+  const tools = await probeTools(tenantId);
+  if (tools !== null) {
     const probe = { toolsSupported: tools, toolsProbedBaseUrl: provider?.baseUrl ?? '', toolsProbedModel: model };
     await getDb().insert(modelProviders).values({ tenantId, ...probe })
       .onConflictDoUpdate({ target: modelProviders.tenantId, set: probe });

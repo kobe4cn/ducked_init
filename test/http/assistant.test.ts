@@ -30,7 +30,7 @@ describe('AI 助手', () => {
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     const viewer = await loginAs(app, 'viewer@acme.com');
 
-    expect(await (await viewer.get('/assistant')).json()).toEqual({ configured: false, toolSupport: null, tools: ['catalog_overview', 'catalog_expand', 'catalog_search'], mine: [], shared: [] });
+    expect(await (await viewer.get('/assistant')).json()).toEqual({ configured: false, toolSupport: null, canManageProvider: false, tools: ['catalog_overview', 'catalog_expand', 'catalog_search'], mine: [], shared: [] });
     expect(await (await viewer.get('/')).text()).toContain('AI 助手');
 
     platformDefault();
@@ -73,21 +73,28 @@ describe('AI 助手', () => {
     const viewer = await loginAs(app, 'viewer@acme.com');
     const globex = await loginAs(app, 'admin@globex.com');
     const support = async (client = viewer) => (await (await client.get('/assistant')).json()).toolSupport;
-    /** 连通性请求回 JSON，探测请求按 tools 决定回不回 tool_calls；记下请求数 */
-    const probe = async (tools: boolean) => {
-      app.setLlmFetch((async (_url: string | URL | Request, init?: RequestInit) => JSON.parse(init?.body as string).tools && tools
-        ? Response.json({ choices: [{ message: { content: null, tool_calls: [{ id: 'p', type: 'function', function: { name: 'ping', arguments: '{}' } }] } }] })
+    /** 连通性请求回 JSON，探测请求（带 tools）由 respond 决定怎么回；返回页面上的 data-tools */
+    const probeWith = async (respond: () => Response) => {
+      app.setLlmFetch((async (_url: string | URL | Request, init?: RequestInit) => JSON.parse(init?.body as string).tools
+        ? respond()
         : Response.json({ choices: [{ message: { content: '{"ok": true}' } }] })) as typeof fetch);
-      expect(await (await admin.post('/model-provider', { intent: 'test' })).text()).toContain(`data-tools="${tools ? 'yes' : 'no'}"`);
+      return /data-tools="(\w+)"/.exec(await (await admin.post('/model-provider', { intent: 'test' })).text())?.[1];
     };
+    /** 支持：回 tool_calls；不支持：拒绝带 tools 的请求（400） */
+    const probe = async (tools: boolean) => expect(await probeWith(tools
+      ? () => Response.json({ choices: [{ message: { content: null, tool_calls: [{ id: 'p', type: 'function', function: { name: 'ping', arguments: '{}' } }] } }] })
+      : () => new Response('tools not supported', { status: 400 }))).toBe(tools ? 'yes' : 'no');
 
+    expect(await (await admin.get('/assistant')).json()).toMatchObject({ canManageProvider: true }); // 侧栏只给能管理模型服务的成员「模型服务」页链接
     expect(await support()).toBeNull();
-    // 探测时临时故障（503）：页面照旧提示不支持，但不存，助手照常可用
-    app.setLlmFetch((async (_url: string | URL | Request, init?: RequestInit) => JSON.parse(init?.body as string).tools
-      ? new Response('busy', { status: 503 })
-      : Response.json({ choices: [{ message: { content: '{"ok": true}' } }] })) as typeof fetch);
-    expect(await (await admin.post('/model-provider', { intent: 'test' })).text()).toContain('data-tools="no"');
+    // 探测时临时故障（503）或模型只回了文本（tool_choice 是 auto，支持的模型也可能不调用）：页面提示没能确认，不存，助手照常可用
+    expect(await probeWith(() => new Response('busy', { status: 503 }))).toBe('unknown');
     expect(await support()).toBeNull();
+    expect(await probeWith(() => Response.json({ choices: [{ message: { content: '好的' } }] }))).toBe('unknown');
+    expect(await support()).toBeNull();
+    await probe(true);
+    expect(await probeWith(() => Response.json({ choices: [{ message: { content: '好的' } }] }))).toBe('unknown');
+    expect(await support()).toBe(true); // 不确定的结果不覆盖上一次的
     await probe(false);
     expect(await support()).toBe(false);
     expect(await support(globex)).toBeNull(); // 别的租户不受影响
