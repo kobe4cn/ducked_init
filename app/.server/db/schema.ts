@@ -561,6 +561,31 @@ export const sandboxShares = platform.table('sandbox_shares', {
   index('sandbox_shares_member_idx').on(t.memberId),
 ]);
 
+// AI 助手的对话（ADR-0043）：按成员保存，只有本人可见、可续写。标题与消息（成员与助手的文字、用过的工具名，不存工具输出与查询结果）
+// 用租户数据密钥加密后存进 sealed，表里没有明文标题；成员被移出租户时随之删除
+export const assistantConversations = platform.table('assistant_conversations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  memberId: uuid('member_id').notNull().references(() => members.id, { onDelete: 'cascade' }),
+  /** encryptForTenant(tenantId, ASSISTANT_CONTEXT, { body: JSON.stringify({ title, messages }) }) */
+  sealed: text('sealed').notNull(),
+  createdAt: createdAt(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [
+  index('assistant_conversations_member_updated_idx').on(t.tenantId, t.memberId, t.updatedAt),
+]);
+
+// 助手对话的只读分享（ADR-0043）：本人分享给本租户的成员，被分享人能读、不能续写也不能再分享
+export const assistantConversationShares = platform.table('assistant_conversation_shares', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  conversationId: uuid('conversation_id').notNull().references(() => assistantConversations.id, { onDelete: 'cascade' }),
+  memberId: uuid('member_id').notNull().references(() => members.id, { onDelete: 'cascade' }),
+  createdAt: createdAt(),
+}, t => [
+  uniqueIndex('assistant_conversation_shares_conversation_member_uq').on(t.conversationId, t.memberId),
+  index('assistant_conversation_shares_member_idx').on(t.memberId),
+]);
+
 /** 服务库里放的一张快照：快照 ID、模板、定义版本、登记时间（ISO 字符串）与数据是否不完整 */
 export interface ServingStoreSnapshot { id: string; template: string; definitionVersion: number | null; createdAt: string; incomplete: boolean }
 

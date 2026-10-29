@@ -11,8 +11,10 @@ import { invokeTool, toolsFor, type ToolResult } from './tools';
 
 /** 每轮最多调用工具的次数，超出时结束本轮并告知成员 */
 export const MAX_TOOL_CALLS = 8;
-const MAX_HISTORY = 40;
-const MAX_CONTENT = 4000;
+/** 每轮交给模型的对话最多几条 */
+export const MAX_HISTORY = 40;
+/** 每条消息最多几个字 */
+export const MAX_CONTENT = 4000;
 /** 校验或保存不通过后，模型最多再修正的次数 */
 export const MAX_FIXES = 3;
 const LIMIT_REPLY = `本轮已调用 ${MAX_TOOL_CALLS} 次工具，达到上限，先结束本轮。可以把问题问得更具体一些再试。`;

@@ -274,6 +274,9 @@ const ACTIONS = {
   'sandbox.save': { label: '保存沙箱表', describe: (d: Detail) => `${d.name}` },
   'sandbox.share': { label: '分享沙箱表', describe: (d: Detail) => `${d.name}` },
   'sandbox.unshare': { label: '撤销沙箱表分享', describe: (d: Detail) => `${d.name}` },
+  // AI 助手对话的只读分享（ADR-0043）：只记被分享人的邮箱，不记标题与内容
+  'assistant.conversation_shared': { label: '分享助手对话', describe: (d: Detail) => `分享给 ${d.member}` },
+  'assistant.conversation_unshared': { label: '撤销分享助手对话', describe: (d: Detail) => `不再分享给 ${d.member}` },
   // 平台级事件：不属于任何租户，只在运营后台可见
   'operator.created': { label: '新增运营者', describe: (d: Detail) => `${d.email}` },
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },
