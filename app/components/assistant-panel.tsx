@@ -11,7 +11,7 @@ import { Input } from '~/components/ui/input';
 interface Message { role: 'user' | 'assistant'; content: string; toolsUsed?: string[] }
 interface Summary { id: string; title: string; updatedAt: string; owner?: string }
 interface Conversation { id: string; title: string; messages: Message[]; owned: boolean; sharedWith: string[] }
-type Overview = { configured: boolean; tools: string[]; mine: Summary[]; shared: Summary[]; conversation?: Conversation } | { error: string };
+type Overview = { configured: boolean; toolSupport: boolean | null; tools: string[]; mine: Summary[]; shared: Summary[]; conversation?: Conversation } | { error: string };
 type TurnResult = { conversationId: string; reply: string; toolsUsed: string[] } | { error: string };
 type ShareResult = { ok: true; email: string } | { error: string };
 
@@ -85,7 +85,9 @@ export function AssistantPanel() {
 
   const busy = turn.state !== 'idle';
   const lists = overview.data && !('error' in overview.data) ? overview.data : undefined;
-  const configured = lists?.configured;
+  // 最近一次探测为不支持工具调用时也不能发送；没探测过照常可用
+  const unsupported = lists?.configured && lists.toolSupport === false;
+  const usable = lists?.configured && !unsupported;
 
   function startNew() {
     setConversationId(null);
@@ -98,7 +100,7 @@ export function AssistantPanel() {
 
   function send() {
     const question = input.trim();
-    if (!question || busy || !configured || readOnlyOwner) return;
+    if (!question || busy || !usable || readOnlyOwner) return;
     setMessages(m => [...m, { role: 'user', content: question }]);
     setInput('');
     setError(null);
@@ -163,7 +165,12 @@ export function AssistantPanel() {
               <div className="flex flex-1 flex-col gap-3 overflow-y-auto p-4">
                 {!lists ? (
                   <p className="text-slate-500">加载中…</p>
-                ) : !configured ? (
+                ) : unsupported ? (
+                  <p data-assistant="unsupported" className="flex gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-amber-700">
+                    <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                    <span>该模型服务不支持工具调用，AI 助手无法使用。请管理员到<Link to="/model-provider" className="mx-0.5 underline">「模型服务」</Link>页换一个支持工具调用的模型。</span>
+                  </p>
+                ) : !lists.configured ? (
                   <p data-assistant="unconfigured" className="flex gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-amber-700">
                     <AlertTriangle className="mt-0.5 size-4 shrink-0" />
                     <span>未配置模型服务，AI 助手暂时不能用。请管理员到<Link to="/model-provider" className="mx-0.5 underline">「模型服务」</Link>页配置。</span>
@@ -215,13 +222,13 @@ export function AssistantPanel() {
                     aria-label="向 AI 助手提问"
                     rows={2}
                     value={input}
-                    disabled={!configured}
+                    disabled={!usable}
                     onChange={e => setInput(e.target.value)}
                     onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }}
                     placeholder="问点什么，Enter 发送，Shift+Enter 换行"
                     className="min-h-10 flex-1 resize-none rounded-md border px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-slate-300 disabled:bg-slate-50"
                   />
-                  <Button type="submit" size="icon" aria-label="发送" disabled={!configured || busy || !input.trim()}><Send /></Button>
+                  <Button type="submit" size="icon" aria-label="发送" disabled={!usable || busy || !input.trim()}><Send /></Button>
                 </form>
               )}
             </>

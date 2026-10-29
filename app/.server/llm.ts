@@ -22,7 +22,10 @@ export interface LlmMessage {
 
 export interface LlmProvider { baseUrl: string; model: string; apiKey: string; source: 'tenant' | 'platform' }
 
-export class LlmError extends Error {}
+/** transient：超时、连不上、HTTP 5xx 或 429，过一会儿再试可能就好了 */
+export class LlmError extends Error {
+  constructor(message: string, readonly transient = false) { super(message); }
+}
 
 /** 租户 API Key 的加密 context（ADR-0009），解密时须给出同一个 */
 export const MODEL_PROVIDER_CONTEXT = 'model_provider';
@@ -100,7 +103,7 @@ async function masked<T>(apiKey: string, run: () => Promise<T>): Promise<T> {
     const timedOut = e instanceof Error && e.name === 'TimeoutError';
     throw new LlmError(maskKey(apiKey, e instanceof LlmError ? e.message
       : timedOut ? `模型服务 ${TIMEOUT_MS / 1000} 秒内没有返回`
-      : `调用模型服务失败：${e instanceof Error ? e.message : String(e)}`));
+      : `调用模型服务失败：${e instanceof Error ? e.message : String(e)}`), e instanceof LlmError ? e.transient : true);
   }
 }
 
@@ -118,7 +121,7 @@ async function postChat(provider: LlmProvider, payload: Record<string, unknown>,
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
   // 先遮蔽再截断：Key 跨过截断处时半截 Key 就遮不住了
-  if (!res.ok) throw new LlmError(`模型服务返回 HTTP ${res.status}：${maskKey(apiKey, await res.text()).slice(0, 200)}`);
+  if (!res.ok) throw new LlmError(`模型服务返回 HTTP ${res.status}：${maskKey(apiKey, await res.text()).slice(0, 200)}`, res.status >= 500 || res.status === 429);
   const body = await res.json().catch(() => null) as { choices?: { message?: RawMessage }[]; usage?: CallStats['usage'] } | null;
   stats.usage = body?.usage;
   return body?.choices?.[0]?.message ?? {};

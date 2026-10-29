@@ -7,6 +7,7 @@
 import type { CurrentMember } from '../auth';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
 import { chatTools, LlmError, resolveProvider, type LlmMessage } from '../llm';
+import { toolSupport } from '../model-provider';
 import { invokeTool, toolsFor, type ToolResult } from './tools';
 
 /** 每轮最多调用工具的次数，超出时结束本轮并告知成员 */
@@ -29,6 +30,8 @@ function unfixedReply({ issues, yaml }: NonNullable<ToolResult['rejected']>) {
   const body = yaml.length > MAX_YAML ? `${yaml.slice(0, MAX_YAML)}\n# ……YAML 过长，只显示前 ${MAX_YAML} 字` : yaml;
   return `草稿没有通过校验，未保存（已修正 ${MAX_FIXES} 次）。问题清单：\n${listed.join('\n')}\n\n最后一版 YAML：\n\n\`\`\`yaml\n${body.endsWith('\n') ? body : `${body}\n`}\`\`\``;
 }
+
+const TOOLS_UNSUPPORTED = '该模型服务不支持工具调用，AI 助手无法使用：请管理员到「模型服务」页换一个支持工具调用的模型';
 
 export class AssistantError extends Error {
   constructor(message: string, readonly status: 400 | 409 | 422) { super(message); }
@@ -76,13 +79,14 @@ async function callTool(actor: CurrentMember, name: string, args: string): Promi
 }
 
 /**
- * 一轮问答：没配置模型服务 409；模型服务出错（包括不支持工具调用）422；对话不合格 400。
+ * 一轮问答：没配置模型服务 409；最近一次探测为不支持工具调用时 422（不发请求），模型服务出错 422；对话不合格 400。
  * 第 MAX_TOOL_CALLS 次工具调用之后模型还要调用工具时，结束本轮并告知
  */
 export async function assistantTurn(actor: CurrentMember, history: ChatTurn[], page: AssistantPage): Promise<{ reply: string; toolsUsed: string[] }> {
   checkHistory(history);
   const tenantId = actor.tenant.id;
   if (!await resolveProvider(tenantId)) throw new AssistantError('未配置模型服务：请到「模型服务」页配置端点、模型与 API Key', 409);
+  if (await toolSupport(tenantId) === false) throw new AssistantError(TOOLS_UNSUPPORTED, 422);
 
   const tools = toolsFor(actor).map(t => ({ name: t.name, description: t.description, parameters: t.inputSchema }));
   const messages: LlmMessage[] = [

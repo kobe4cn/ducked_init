@@ -650,6 +650,10 @@ export const modelProviders = platform.table('model_providers', {
   model: text('model'),
   apiKey: text('api_key'),
   allowSamples: boolean('allow_samples').notNull().default(false),
+  // 最近一次「测试连通性」的工具调用探测（AI 助手要用，ADR-0042）：结果与当时生效的端点、模型；端点或模型变了就作废
+  toolsSupported: boolean('tools_supported'),
+  toolsProbedBaseUrl: text('tools_probed_base_url'),
+  toolsProbedModel: text('tools_probed_model'),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
