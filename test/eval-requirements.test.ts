@@ -1,23 +1,17 @@
 // test/eval-requirements.test.ts —— 需求评测（#279，ADR-0041）：黄金集的期望都能对着固定上下文过校验、指标与标签都有、只引用目录里有的字段；
 // runCase 用假 fetch 跑出的校验通过与结构命中：与期望一致、字段写错、不合 Schema（纯函数，不读库）
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 import { expand } from '../app/.server/catalog';
 import { setLlmFetch } from '../app/.server/llm';
 import { DSL_KINDS } from '../app/.server/pipeline/dsl';
 import { CATALOG, CONTEXT, GOLDEN } from '../scripts/eval-requirements/golden';
 import { runCase, summarize } from '../scripts/eval-requirements/score';
+import { fakeLlm, json } from './pipeline/llm-fixtures';
 
 afterEach(() => { setLlmFetch(undefined); });
 
 const PROVIDER = { baseUrl: 'https://llm.example.com/v1', model: 'test-model', apiKey: 'sk-eval-secret', source: 'platform' as const };
-
-/** 假 fetch：OpenAI 兼容接口的返回，content 是 JSON 文本 */
-function respond(content: unknown) {
-  const f = vi.fn(async () => Response.json({ choices: [{ message: { role: 'assistant', content: JSON.stringify(content) } }] }));
-  setLlmFetch(f as unknown as typeof fetch);
-  return f;
-}
 
 const caseNamed = (id: string) => GOLDEN.find(c => c.id === id)!;
 const clone = <T>(x: T): T => structuredClone(x);
@@ -39,7 +33,7 @@ describe('需求黄金集', () => {
 describe('需求评测跑分', () => {
   it('指标：模型输出与期望一致时校验通过、命中率 1，消息与产品相同', async () => {
     const c = caseNamed('paid-revenue-by-city');
-    const f = respond(c.expected);
+    const { f } = fakeLlm(setLlmFetch, () => json(c.expected));
     const r = await runCase(PROVIDER, c);
     expect(r).toEqual({
       id: 'paid-revenue-by-city', kind: 'metric', valid: true, hits: 6, items: 6, hitRate: 1,
@@ -52,19 +46,19 @@ describe('需求评测跑分', () => {
 
   it('等价写法不扣分：eq 与单值 in、带基础实体前缀的字段、键的顺序', async () => {
     const c = caseNamed('paid-revenue-by-city');
-    respond({
+    fakeLlm(setLlmFetch, () => json({
       dimensions: [{ path: 'order.customer_id->customer.city', name: 'customer_city' }],
       window: { days: 30, field: 'order.created_at' },
       filter: [{ value: ['paid'], op: 'in', field: 'status' }],
       measure: { field: 'amount', agg: 'sum' },
       base: 'order',
-    });
+    }));
     expect(await runCase(PROVIDER, c)).toMatchObject({ valid: true, hits: 6, hitRate: 1 });
   });
 
   it('标签：模型输出与期望一致时命中率 1', async () => {
     const c = caseNamed('spend-tier');
-    respond(c.expected);
+    fakeLlm(setLlmFetch, () => json(c.expected));
     expect(await runCase(PROVIDER, c)).toEqual({
       id: 'spend-tier', kind: 'tag', valid: true, hits: 3, items: 3, hitRate: 1, structure: { kind: true, metrics: true, rules: true },
     });
@@ -74,7 +68,7 @@ describe('需求评测跑分', () => {
     const c = caseNamed('avg-completed-order-amount');
     const draft = clone(c.expected) as { measure: { field: string } };
     draft.measure.field = 'pay_amount';
-    respond(draft);
+    fakeLlm(setLlmFetch, () => json(draft));
     const r = await runCase(PROVIDER, c);
     expect(r).toMatchObject({
       valid: false, hits: 4, items: 6, hitRate: 4 / 6,
@@ -87,17 +81,17 @@ describe('需求评测跑分', () => {
     const metric = caseNamed('refund-rate');
     const draft = clone(metric.expected) as { measure: { numerator: { filter: { value: string }[] } } };
     draft.measure.numerator.filter[0]!.value = 'cancelled';
-    respond(draft);
+    fakeLlm(setLlmFetch, () => json(draft));
     expect(await runCase(PROVIDER, metric)).toMatchObject({ valid: true, hits: 5, hitRate: 5 / 6, structure: { measure: false } });
 
     const tag = caseNamed('churn-risk');
-    respond({ ...tag.expected, rules: [{ value: 'at_risk', when: { gt: 60 } }] });
+    fakeLlm(setLlmFetch, () => json({ ...tag.expected, rules: [{ value: 'at_risk', when: { gt: 60 } }] }));
     expect(await runCase(PROVIDER, tag)).toMatchObject({ valid: true, hits: 2, structure: { metrics: true, rules: false } });
   });
 
   it('模型返回不合 Schema：失败于模型调用，各项都不命中，Key 不出现在结果里', async () => {
     const c = caseNamed('order-count-90d');
-    respond({ base: 'order' });
+    fakeLlm(setLlmFetch, () => json({ base: 'order' }));
     const r = await runCase(PROVIDER, c);
     expect(r).toMatchObject({ valid: false, hits: 0, items: 6, hitRate: 0, failed: { stage: 'model' } });
     expect(r.failed!.message).toContain('不符合 Schema');

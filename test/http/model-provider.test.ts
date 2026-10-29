@@ -7,6 +7,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, modelProviders } from '../../app/.server/db/schema';
 import { resolveProvider } from '../../app/.server/llm';
 import { memberOf, newTenant } from '../pipeline/fixtures';
+import { fakeLlm, json, platformDefault, text, toolCalls } from '../pipeline/llm-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
 let app: TestApp;
@@ -21,17 +22,8 @@ const NEW_KEY = 'sk-tenant-rotated-5678';
 const save = (admin: Client, apiKey = KEY) =>
   admin.post('/model-provider', { intent: 'save', baseUrl: 'https://tenant.example.com/v1/', model: 'deepseek-chat', apiKey });
 
-/** 假 fetch：记下请求头，返回 respond 构造的 Response */
-function fakeFetch(respond: () => Response) {
-  const authorizations: (string | null)[] = [];
-  app.setLlmFetch((async (_url: string | URL | Request, init?: RequestInit) => {
-    authorizations.push(new Headers(init?.headers).get('authorization'));
-    return respond();
-  }) as typeof fetch);
-  return authorizations;
-}
-
-const ok = () => Response.json({ choices: [{ message: { content: '{"ok": true}' } }], usage: { prompt_tokens: 10, completion_tokens: 3 } });
+const setLlm = (f: typeof fetch | undefined) => app.setLlmFetch(f);
+const ok = () => json({ ok: true }, { prompt_tokens: 10, completion_tokens: 3 });
 
 const connectivityCalls = (tenantId: string) =>
   getDb().select().from(llmCalls).where(and(eq(llmCalls.tenantId, tenantId), eq(llmCalls.purpose, 'connectivity')));
@@ -86,16 +78,16 @@ describe('模型服务页', () => {
     const admin = await loginAs(app, 'admin@acme.com');
     await save(admin);
 
-    const authorizations = fakeFetch(ok);
+    const { received } = fakeLlm(setLlm, ok);
     const passed = await admin.post('/model-provider', { intent: 'test' });
     expect(passed.status).toBe(200);
     const okPage = await passed.text();
     expect(okPage).toContain('data-connectivity="ok"');
     expect(okPage).toContain('data-model="deepseek-chat"');
     expect(okPage).toMatch(/data-duration-ms="\d+"/);
-    expect(authorizations).toEqual([`Bearer ${KEY}`, `Bearer ${KEY}`]); // 连通性与工具调用探测各一次
+    expect(received.map(r => r.headers.get('authorization'))).toEqual([`Bearer ${KEY}`, `Bearer ${KEY}`]); // 连通性与工具调用探测各一次
 
-    fakeFetch(() => new Response(`invalid api key ${KEY}`, { status: 401 }));
+    fakeLlm(setLlm, () => new Response(`invalid api key ${KEY}`, { status: 401 }));
     const failedPage = await (await admin.post('/model-provider', { intent: 'test' })).text();
     expect(failedPage).toContain('data-connectivity="failed"');
     expect(failedPage).toContain('HTTP 401');
@@ -110,26 +102,16 @@ describe('模型服务页', () => {
     const acme = await newTenant('acme');
     const admin = await loginAs(app, 'admin@acme.com');
     await save(admin);
-    const toolCall = () => Response.json({
-      choices: [{ message: { content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'ping', arguments: '{}' } }] } }],
-    });
-    /** 第一次请求（连通性）照常返回，第二次（探测）由 respond 构造；记下第二次的请求体 */
-    const probeWith = (respond: () => Response) => {
-      const bodies: Record<string, unknown>[] = [];
-      app.setLlmFetch((async (_url: string | URL | Request, init?: RequestInit) => {
-        bodies.push(JSON.parse(init?.body as string));
-        return bodies.length === 1 ? ok() : respond();
-      }) as typeof fetch);
-      return bodies;
-    };
+    /** 第一次请求（连通性）照常返回，第二次（探测）由 respond 构造 */
+    const probeWith = (respond: () => Response) => fakeLlm(setLlm, n => n === 1 ? ok() : respond());
 
-    const bodies = probeWith(toolCall);
+    const { received } = probeWith(() => toolCalls({ name: 'ping', args: {} }));
     const supported = await (await admin.post('/model-provider', { intent: 'test' })).text();
     expect(supported).toContain('data-connectivity="ok"');
     expect(supported).toContain('data-tools="yes"');
     expect(supported).toContain('支持工具调用');
-    expect(bodies[1]).toMatchObject({ tool_choice: 'auto', tools: [{ type: 'function', function: { name: 'ping' } }] });
-    expect(bodies[1]).not.toHaveProperty('response_format');
+    expect(received[1].body).toMatchObject({ tool_choice: 'auto', tools: [{ type: 'function', function: { name: 'ping' } }] });
+    expect(received[1].body).not.toHaveProperty('response_format');
 
     probeWith(() => new Response('tools not supported', { status: 400 }));
     const unsupported = await (await admin.post('/model-provider', { intent: 'test' })).text();
@@ -137,7 +119,7 @@ describe('模型服务页', () => {
     expect(unsupported).toContain('data-tools="no"');
     expect(unsupported).toContain('该模型服务不支持工具调用，AI 助手无法使用');
     // 只回了文本：tool_choice 是 auto，支持的模型也可能不调用，算没能确认
-    probeWith(() => Response.json({ choices: [{ message: { content: '好的' } }] }));
+    probeWith(() => text('好的'));
     const unsure = await (await admin.post('/model-provider', { intent: 'test' })).text();
     expect(unsure).toContain('data-connectivity="ok"');
     expect(unsure).toContain('data-tools="unknown"');
@@ -150,9 +132,7 @@ describe('模型服务页', () => {
   });
 
   it('恢复平台默认清空本租户的端点、模型名与 Key，之后用环境变量的配置；本来没配置时不记审计', async () => {
-    vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
-    vi.stubEnv('LLM_MODEL', 'qwen-plus');
-    vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
+    platformDefault();
     const acme = await newTenant('acme');
     const admin = await loginAs(app, 'admin@acme.com');
     expect(await (await admin.get('/model-provider')).text()).toContain('data-provider-source="platform"');

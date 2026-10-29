@@ -11,32 +11,15 @@ import { createDefinition, DslError, modelDraftForDefinition, publishDefinition 
 import { setLlmFetch } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
+import { fakeLlm, json, platformDefault } from './llm-fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); });
 
-/** 假 fetch：记下收到的请求体，返回 respond 构造的 Response */
-function fakeFetch(respond: () => Response) {
-  const received: { messages: { role: string; content: string }[] }[] = [];
-  const f = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-    received.push(JSON.parse(init?.body as string));
-    return respond();
-  });
-  setLlmFetch(f as unknown as typeof fetch);
-  return { f, received };
-}
-
-/** OpenAI 兼容接口的成功返回：content 是 JSON 文本 */
-const completion = (content: unknown) =>
-  () => Response.json({ choices: [{ message: { role: 'assistant', content: JSON.stringify(content) } }], usage: { prompt_tokens: 600, completion_tokens: 100 } });
-
-function platformDefault() {
-  vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
-  vi.stubEnv('LLM_MODEL', 'qwen-plus');
-  vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
-}
+/** 答复带的 token 数，记进 llm_calls */
+const USAGE = { prompt_tokens: 600, completion_tokens: 100 };
 
 const REQUEST = '近 30 天每个城市已支付订单的金额合计';
 
@@ -62,7 +45,7 @@ describe('用模型生成指标定义草稿', () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     platformDefault();
-    const { received } = fakeFetch(completion(MODEL_REVENUE));
+    const { received } = fakeLlm(setLlmFetch, () => json(MODEL_REVENUE, USAGE));
 
     const { yaml } = await modelDraftForDefinition(analyst, 'metric', REQUEST);
     expect(yaml.startsWith('# 模型根据需求生成，请核对\n')).toBe(true);
@@ -71,7 +54,7 @@ describe('用模型生成指标定义草稿', () => {
 
     const [call] = await calls(acme);
     expect(call).toMatchObject({ purpose: 'metric_draft', schemaValid: true });
-    const [system, user] = received[0]!.messages;
+    const [system, user] = received[0]!.body.messages;
     expect(system).toMatchObject({ role: 'system', content: expect.stringContaining('## capability:metric-dsl 指标 DSL') });
     expect(user!.role).toBe('user');
     // 依次是目录总览、按需求搜出的条目与需求原文
@@ -81,7 +64,7 @@ describe('用模型生成指标定义草稿', () => {
     expect(searchPart).toContain('## field:order.amount');
     expect(user!.content.endsWith(`# 需求\n\n${REQUEST}`)).toBe(true);
     // 敏感字段、哈希列不进上下文
-    const sent = received[0]!.messages.map(m => m.content).join('\n');
+    const sent = received[0]!.body.messages.map(m => m.content).join('\n');
     const customerLine = overviewPart!.split('\n').find(l => l.startsWith('- entity:customer '))!;
     expect(customerLine).toMatch(/字段：.*\bcity\b/);
     for (const pii of ['name', 'phone', 'email', 'external_id']) expect(customerLine).not.toMatch(new RegExp(`\\b${pii}\\b`));
@@ -97,10 +80,10 @@ describe('用模型生成指标定义草稿', () => {
     await saveBusinessNote(author, { entity: 'order', field: 'status', note: '退款单也算一笔订单，状态记为 refunded' });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     platformDefault();
-    const { received } = fakeFetch(completion({ base: 'order', measure: { agg: 'count' }, filter: [{ field: 'status', op: 'eq', value: 'refunded' }] }));
+    const { received } = fakeLlm(setLlmFetch, () => json({ base: 'order', measure: { agg: 'count' }, filter: [{ field: 'status', op: 'eq', value: 'refunded' }] }, USAGE));
 
     await modelDraftForDefinition(analyst, 'metric', '统计退款单');
-    const searchPart = received[0]!.messages[1]!.content.split('# 与需求相关的条目')[1]!.split('# 需求')[0]!;
+    const searchPart = received[0]!.body.messages[1]!.content.split('# 与需求相关的条目')[1]!.split('# 需求')[0]!;
     expect(searchPart).toContain('## field:order.status');
     expect(searchPart).toContain('业务说明：退款单也算一笔订单，状态记为 refunded');
   });
@@ -109,7 +92,7 @@ describe('用模型生成指标定义草稿', () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     platformDefault();
-    fakeFetch(completion({ base: 'order', measure: { agg: 'median', field: 'amount' } }));
+    fakeLlm(setLlmFetch, () => json({ base: 'order', measure: { agg: 'median', field: 'amount' } }, USAGE));
 
     const e = await failure(modelDraftForDefinition(analyst, 'metric', REQUEST));
     expect(e).toBeInstanceOf(DslError);
@@ -125,7 +108,7 @@ describe('用模型生成指标定义草稿', () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     platformDefault();
-    fakeFetch(completion({ base: 'order', measure: { agg: 'count' }, filter: [{ field: 'channel_code', op: 'eq', value: 'vip-secret-42' }] }));
+    fakeLlm(setLlmFetch, () => json({ base: 'order', measure: { agg: 'count' }, filter: [{ field: 'channel_code', op: 'eq', value: 'vip-secret-42' }] }, USAGE));
 
     const e = await failure(modelDraftForDefinition(analyst, 'metric', REQUEST));
     expect(e.status).toBe(422);
@@ -140,7 +123,7 @@ describe('用模型生成指标定义草稿', () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     platformDefault();
-    fakeFetch(() => new Response('upstream sk-platform-secret exploded', { status: 500 }));
+    fakeLlm(setLlmFetch, () => new Response('upstream sk-platform-secret exploded', { status: 500 }));
 
     const e = await failure(modelDraftForDefinition(analyst, 'metric', REQUEST));
     expect(e.status).toBe(422);
@@ -156,7 +139,7 @@ describe('用模型生成指标定义草稿', () => {
     vi.stubEnv('LLM_BASE_URL', '');
     vi.stubEnv('LLM_MODEL', '');
     vi.stubEnv('LLM_API_KEY', '');
-    const { f } = fakeFetch(completion(MODEL_REVENUE));
+    const { f } = fakeLlm(setLlmFetch, () => json(MODEL_REVENUE, USAGE));
 
     const e = await failure(modelDraftForDefinition(analyst, 'metric', REQUEST));
     expect(e).toMatchObject({ status: 400, message: expect.stringContaining('未配置模型服务') });
@@ -183,7 +166,7 @@ describe('用模型生成标签定义草稿', () => {
     await publishDefinition(reviewer, 'metric', 'revenue_by_city', 1);
     await createDefinition(author, 'metric', 'draft_only', REVENUE);
     platformDefault();
-    const { received } = fakeFetch(completion(MODEL_TIER));
+    const { received } = fakeLlm(setLlmFetch, () => json(MODEL_TIER, USAGE));
 
     const { yaml } = await modelDraftForDefinition(analyst, 'tag', TAG_REQUEST);
     expect(yaml.startsWith('# 模型根据需求生成，请核对\n')).toBe(true);
@@ -191,7 +174,7 @@ describe('用模型生成标签定义草稿', () => {
     expect(await getDb().select().from(dslVersions)).toHaveLength(3);
 
     expect((await calls(acme))[0]).toMatchObject({ purpose: 'tag_draft', schemaValid: true });
-    const [system, user] = received[0]!.messages;
+    const [system, user] = received[0]!.body.messages;
     expect(system!.content).toContain('## capability:tag-dsl 标签 DSL');
     expect(system!.content).not.toContain('capability:metric-dsl');
     // 目录里只有已发布的指标，草稿不出现
@@ -215,7 +198,7 @@ describe('用模型生成标签定义草稿', () => {
     platformDefault();
 
     for (const metric of ['revenue_by_city', 'draft_only']) {
-      fakeFetch(completion({ ...MODEL_TIER, metric }));
+      fakeLlm(setLlmFetch, () => json({ ...MODEL_TIER, metric }, USAGE));
       const e = await failure(modelDraftForDefinition(analyst, 'tag', TAG_REQUEST));
       expect(e.status).toBe(422);
       expect(e.issues.map(i => i.path)).toEqual(['metric']);
@@ -233,7 +216,7 @@ describe('用模型生成标签定义草稿', () => {
     await createDefinition(author, 'metric', 'revenue_30d', REVENUE);
     await publishDefinition(reviewer, 'metric', 'revenue_30d', 1);
     platformDefault();
-    fakeFetch(completion({ metric: 'revenue_30d', rules: [{ value: 'high', when: { between: [1, 2] } }], default: 'normal' }));
+    fakeLlm(setLlmFetch, () => json({ metric: 'revenue_30d', rules: [{ value: 'high', when: { between: [1, 2] } }], default: 'normal' }, USAGE));
 
     const e = await failure(modelDraftForDefinition(analyst, 'tag', TAG_REQUEST));
     expect(e.status).toBe(422);
@@ -248,7 +231,7 @@ describe('用模型生成标签定义草稿', () => {
     await publishDefinition(reviewer, 'metric', 'revenue_by_city', 1);
     await createDefinition(author, 'metric', 'draft_only', REVENUE);
     platformDefault();
-    const { f } = fakeFetch(completion(MODEL_TIER));
+    const { f } = fakeLlm(setLlmFetch, () => json(MODEL_TIER, USAGE));
 
     const e = await failure(modelDraftForDefinition(analyst, 'tag', TAG_REQUEST));
     expect(e).toMatchObject({ status: 400, message: expect.stringContaining('先发布一个数值型指标') });

@@ -12,36 +12,16 @@ import { publishDefinition } from '../../app/.server/dsl-definitions';
 import { setLlmFetch } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
+import { fakeLlm, platformDefault, text, toolCalls } from './llm-fixtures';
 import { CRM, publishedIdentitySources } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); });
 
-type Body = { messages: { role: string; content: string; tool_call_id?: string }[]; tools: { function: { name: string } }[] };
-
-/** 假 fetch：记下收到的请求体，第 n 次请求返回 respond(n) 构造的 Response */
-function fakeFetch(respond: (n: number) => Response) {
-  const received: Body[] = [];
-  setLlmFetch((async (_url: string | URL | Request, init?: RequestInit) => {
-    received.push(JSON.parse(init?.body as string));
-    return respond(received.length);
-  }) as typeof fetch);
-  return received;
-}
-
-/** 模型要调用一个工具 */
-const toolCall = (name: string, args: unknown, id = 'call_1') =>
-  Response.json({ choices: [{ message: { content: null, tool_calls: [{ id, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }], usage: { prompt_tokens: 300, completion_tokens: 20 } });
-
-/** 模型给出文字答复 */
-const text = (content: string) => Response.json({ choices: [{ message: { role: 'assistant', content } }], usage: { prompt_tokens: 500, completion_tokens: 50 } });
-
-function platformDefault() {
-  vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
-  vi.stubEnv('LLM_MODEL', 'qwen-plus');
-  vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
-}
+/** 工具调用与文字答复带的 token 数，记进 llm_calls */
+const TOOL_USAGE = { prompt_tokens: 300, completion_tokens: 20 };
+const TEXT_USAGE = { prompt_tokens: 500, completion_tokens: 50 };
 
 const PAGE = { path: '/catalog/changes', title: '目录变更记录' };
 const QUESTION = '有哪些客户相关的字段？';
@@ -53,19 +33,19 @@ describe('AI 助手的一轮问答', () => {
     platformDefault();
     const acme = await newTenant('acme');
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const received = fakeFetch(n => n === 1 ? toolCall('catalog_search', { query: 'customer' }) : text('客户实体有城市等字段'));
+    const { received } = fakeLlm(setLlmFetch, n => n === 1 ? toolCalls({ name: 'catalog_search', args: { query: 'customer' } }, TOOL_USAGE) : text('客户实体有城市等字段', TEXT_USAGE));
 
     const turn = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
     expect(turn).toEqual({ reply: '客户实体有城市等字段', toolsUsed: ['catalog_search'] });
 
     expect(received).toHaveLength(2);
-    const [system, user] = received[0].messages;
+    const [system, user] = received[0].body.messages;
     expect(system.role).toBe('system');
     expect(system.content).toContain('/catalog/changes');
     expect(system.content).toContain('目录变更记录');
     expect(user).toMatchObject({ role: 'user', content: QUESTION });
-    expect(received[0].tools.map(t => t.function.name).sort()).toEqual(['catalog_expand', 'catalog_overview', 'catalog_search']);
-    const tool = received[1].messages.find(m => m.role === 'tool')!;
+    expect(received[0].body.tools.map(t => t.function.name).sort()).toEqual(['catalog_expand', 'catalog_overview', 'catalog_search']);
+    const tool = received[1].body.messages.find(m => m.role === 'tool')!;
     expect(tool.tool_call_id).toBe('call_1');
     expect(tool.content).toContain('entity:customer');
 
@@ -78,16 +58,16 @@ describe('AI 助手的一轮问答', () => {
     platformDefault();
     const acme = await newTenant('acme');
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const received = fakeFetch(n => n === 1
-      ? Response.json({ choices: [{ message: { content: null, tool_calls: [
-        { id: 'a', type: 'function', function: { name: 'validate_definition', arguments: '{"kind":"metric","yaml":"base: customer"}' } },
-        { id: 'b', type: 'function', function: { name: 'catalog_expand', arguments: '{oops' } },
-      ] } }] })
-      : text('好的'));
+    const { received } = fakeLlm(setLlmFetch, n => n === 1
+      ? toolCalls([
+        { id: 'a', name: 'validate_definition', args: { kind: 'metric', yaml: 'base: customer' } },
+        { id: 'b', name: 'catalog_expand', args: '{oops' },
+      ])
+      : text('好的', TEXT_USAGE));
 
     const turn = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
     expect(turn).toEqual({ reply: '好的', toolsUsed: ['validate_definition', 'catalog_expand'] });
-    const tools = received[1].messages.filter(m => m.role === 'tool');
+    const tools = received[1].body.messages.filter(m => m.role === 'tool');
     expect(tools.map(t => t.tool_call_id)).toEqual(['a', 'b']);
     expect(tools[0].content).toMatch(/^工具出错：/);
     expect(tools[1].content).toMatch(/^工具出错：.*JSON/);
@@ -97,7 +77,7 @@ describe('AI 助手的一轮问答', () => {
     platformDefault();
     const acme = await newTenant('acme');
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const received = fakeFetch(n => toolCall('catalog_overview', {}, `call_${n}`));
+    const { received } = fakeLlm(setLlmFetch, n => toolCalls({ name: 'catalog_overview', args: {}, id: `call_${n}` }, TOOL_USAGE));
 
     const turn = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
     expect(MAX_TOOL_CALLS).toBe(8);
@@ -107,8 +87,7 @@ describe('AI 助手的一轮问答', () => {
     expect(await calls(acme)).toHaveLength(MAX_TOOL_CALLS + 1);
 
     // 一次给出 9 个调用：执行满 8 个就结束本轮
-    const batch = fakeFetch(() => Response.json({ choices: [{ message: { content: null, tool_calls: Array.from({ length: 9 }, (_, i) =>
-      ({ id: `b${i}`, type: 'function', function: { name: 'catalog_overview', arguments: '{}' } })) } }] }));
+    const { received: batch } = fakeLlm(setLlmFetch, () => toolCalls(Array.from({ length: 9 }, (_, i) => ({ id: `b${i}`, name: 'catalog_overview', args: {} }))));
     const batched = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
     expect(batched.toolsUsed).toHaveLength(MAX_TOOL_CALLS);
     expect(batched.reply).toContain(`${MAX_TOOL_CALLS} 次`);
@@ -118,12 +97,12 @@ describe('AI 助手的一轮问答', () => {
   it('没配置模型服务 409、不发请求；模型服务出错 422；对话过长或格式不对 400', async () => {
     const acme = await newTenant('acme');
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const received = fakeFetch(() => text('不该调用'));
+    const { received } = fakeLlm(setLlmFetch, () => text('不该调用', TEXT_USAGE));
     await expect(assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE)).rejects.toMatchObject({ status: 409, message: expect.stringContaining('未配置模型服务') });
     expect(received).toHaveLength(0);
 
     platformDefault();
-    fakeFetch(() => new Response('tools not supported', { status: 400 }));
+    fakeLlm(setLlmFetch, () => new Response('tools not supported', { status: 400 }));
     await expect(assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE)).rejects.toMatchObject({ status: 422, message: expect.stringContaining('不支持工具调用') });
 
     const user = { role: 'user' as const, content: '问' };
@@ -147,16 +126,16 @@ describe('AI 助手起草草稿', () => {
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     platformDefault();
     const metricSteps = [
-      toolCall('catalog_search', { query: '会员' }),
-      toolCall('validate_definition', { kind: 'metric', yaml: COUNT_MEMBERS }),
-      toolCall('save_definition_draft', { kind: 'metric', key: 'member_count', yaml: COUNT_MEMBERS }),
+      toolCalls({ name: 'catalog_search', args: { query: '会员' } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_definition', args: { kind: 'metric', yaml: COUNT_MEMBERS } }, TOOL_USAGE),
+      toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'member_count', yaml: COUNT_MEMBERS } }, TOOL_USAGE),
     ];
-    const received = fakeFetch(n => metricSteps[n - 1] ?? text('已保存草稿 member_count'));
+    const { received } = fakeLlm(setLlmFetch, n => metricSteps[n - 1] ?? text('已保存草稿 member_count', TEXT_USAGE));
 
     const turn = await assistantTurn(analyst, [{ role: 'user', content: '统计会员数' }], PAGE);
     expect(turn).toEqual({ reply: '已保存草稿 member_count', toolsUsed: ['catalog_search', 'validate_definition', 'save_definition_draft'] });
-    expect(received[0].messages[0].content).toContain('validate_');
-    const saved = received[3].messages.filter(m => m.role === 'tool').at(-1)!;
+    expect(received[0].body.messages[0].content).toContain('validate_');
+    const saved = received[3].body.messages.filter(m => m.role === 'tool').at(-1)!;
     expect(saved.content).toContain('已保存为草稿：metric/member_count 第 1 版');
 
     const [version] = await getDb().select().from(dslVersions);
@@ -171,8 +150,8 @@ describe('AI 助手起草草稿', () => {
     expect(await publishDefinition(reviewer, 'metric', 'member_count', 1)).toMatchObject({ kind: 'gold.dsl' });
 
     // 基于已发布的数值指标起草标签
-    const tagSteps = [toolCall('validate_definition', { kind: 'tag', yaml: TIER }), toolCall('save_definition_draft', { kind: 'tag', key: 'member_tier', yaml: TIER })];
-    fakeFetch(n => tagSteps[n - 1] ?? text('已保存标签草稿'));
+    const tagSteps = [toolCalls({ name: 'validate_definition', args: { kind: 'tag', yaml: TIER } }, TOOL_USAGE), toolCalls({ name: 'save_definition_draft', args: { kind: 'tag', key: 'member_tier', yaml: TIER } }, TOOL_USAGE)];
+    fakeLlm(setLlmFetch, n => tagSteps[n - 1] ?? text('已保存标签草稿', TEXT_USAGE));
     await assistantTurn(analyst, [{ role: 'user', content: '按会员数分高低两档' }], PAGE);
     const tag = (await getDb().select().from(dslVersions)).find(v => v.yaml === TIER)!;
     expect(tag).toMatchObject({ authors: [analyst.email], status: 'draft' });
@@ -190,26 +169,26 @@ describe('AI 助手起草草稿', () => {
     const { acme } = await publishedIdentitySources();
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     platformDefault();
-    const received = fakeFetch(n => n % 2
-      ? toolCall('validate_definition', { kind: 'metric', yaml: BAD_METRIC }, `v${n}`)
-      : toolCall('save_definition_draft', { kind: 'metric', key: 'member_count', yaml: BAD_METRIC }, `s${n}`));
+    const { received } = fakeLlm(setLlmFetch, n => n % 2
+      ? toolCalls({ name: 'validate_definition', args: { kind: 'metric', yaml: BAD_METRIC }, id: `v${n}` }, TOOL_USAGE)
+      : toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'member_count', yaml: BAD_METRIC }, id: `s${n}` }, TOOL_USAGE));
 
     const turn = await assistantTurn(analyst, [{ role: 'user', content: '统计会员数' }], PAGE);
     expect(MAX_FIXES).toBe(3);
     expect(received).toHaveLength(MAX_FIXES + 1);
-    expect(received[1].messages.at(-1)).toMatchObject({ role: 'tool', content: expect.stringMatching(/^有 \d+ 个问题：\n- base/) });
+    expect(received[1].body.messages.at(-1)).toMatchObject({ role: 'tool', content: expect.stringMatching(/^有 \d+ 个问题：\n- base/) });
     expect(turn.reply).toContain('草稿没有通过校验，未保存');
     expect(turn.reply).toMatch(/- base（第 1 行第 \d+ 列）：/);
     expect(turn.reply).toContain('```yaml\n' + BAD_METRIC + '```');
     expect(await getDb().select().from(dslVersions)).toHaveLength(0);
 
     const fixed = [
-      toolCall('save_definition_draft', { kind: 'metric', key: 'member_count', yaml: BAD_METRIC }),
-      toolCall('save_definition_draft', { kind: 'metric', key: 'member_count', yaml: COUNT_MEMBERS }),
+      toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'member_count', yaml: BAD_METRIC } }, TOOL_USAGE),
+      toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'member_count', yaml: COUNT_MEMBERS } }, TOOL_USAGE),
     ];
-    const again = fakeFetch(n => fixed[n - 1] ?? text('改好并保存了'));
+    const { received: again } = fakeLlm(setLlmFetch, n => fixed[n - 1] ?? text('改好并保存了', TEXT_USAGE));
     expect((await assistantTurn(analyst, [{ role: 'user', content: '统计会员数' }], PAGE)).reply).toBe('改好并保存了');
-    expect(again[1].messages.at(-1)!.content).toMatch(/未保存.*\n- base/s);
+    expect(again[1].body.messages.at(-1)!.content).toMatch(/未保存.*\n- base/s);
     expect(await getDb().select().from(dslVersions)).toHaveLength(1);
   });
 

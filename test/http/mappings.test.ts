@@ -16,6 +16,7 @@ import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
 import { confirmWatermark, registerSource, relistSource } from '../../app/.server/sources';
 import { memberOf, mergeUnchecked, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
+import { fakeLlm, json, platformDefault } from '../pipeline/llm-fixtures';
 import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { mappingTemplate } from '../../app/.server/pipeline/mapping-spec';
 import { entityOf } from '../../app/lib/canonical-model';
@@ -73,10 +74,8 @@ const editorYaml = (html: string) => html.match(/<textarea[^>]*name="yaml"[^>]*>
 
 /** 配上平台默认模型服务，替身每次都返回 content */
 function modelReplies(content: unknown) {
-  vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
-  vi.stubEnv('LLM_MODEL', 'qwen-plus');
-  vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
-  app.setLlmFetch((async () => Response.json({ choices: [{ message: { content: JSON.stringify(content) } }] })) as typeof fetch);
+  platformDefault();
+  fakeLlm(f => app.setLlmFetch(f), () => json(content));
 }
 
 const mappingIdOf = (res: Response) => res.headers.get('Location')!.match(/^\/mappings\/([0-9a-f-]{36})$/)![1];

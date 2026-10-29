@@ -75,6 +75,20 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 
 需要别的形状的源表时，在测试里写一段 SQL 用 `grantOnSource` 建表并 `GRANT SELECT ... TO ${READER.user}`（参考 `mapping.test.ts` 里的 `ORDER_LOG`、`POINT_LOGS`、`CONSENTS`、`PREFERENCES`、`COUPON_TEMPLATES`、`COUPONS`）。
 
+### `test/pipeline/llm-fixtures.ts`
+
+假模型服务与平台默认配置，流水线测试与 HTTP 测试共用。注入函数由调用方传入：流水线测试传 `setLlmFetch`，HTTP 测试传 `f => app.setLlmFetch(f)`（harness 用 `ssrLoadModule` 加载的是另一个 llm 模块实例）。夹具不碰 `afterEach`，`setLlmFetch(undefined)` / `app.setLlmFetch(undefined)` 与 `vi.unstubAllEnvs()` 仍由各文件自己写。
+
+| helper | 作用 |
+|---|---|
+| `platformDefault(baseUrl?)` | `vi.stubEnv` 设平台默认模型服务：`LLM_BASE_URL`（默认 `https://platform.example.com/v1`）、`LLM_MODEL=qwen-plus`、`LLM_API_KEY=sk-platform-secret`；只配一部分或空串表示未配置时照旧内联 `vi.stubEnv` |
+| `fakeLlm(set, respond)` | 构造假 fetch（`vi.fn`）并立刻 `set(f)`；第 n 次请求（从 1 数）先记进 `received`（`{ url, headers, body }`，`body` 已解析）再返回 `respond(n, body)`；返回 `{ f, received }` |
+| `text(content, usage?)` | 模型的文字答复 |
+| `json(content, usage?)` | 模型的 JSON 文本答复（`content` 经 `JSON.stringify`） |
+| `toolCalls(calls, usage?)` | 模型要调用工具：`{ name, args, id? }` 或其数组，`id` 默认 `call_1`、`call_2`…；`args` 是字符串时原样作为 `arguments`（造不是 JSON 的参数），否则 `JSON.stringify` |
+
+`usage` 省略时返回里不带 usage 字段（`platform.llm_calls` 的 token 列为空）；要断言 token 数（或迁移前就带 usage）时显式传 `{ prompt_tokens, completion_tokens }`。非 200 的返回直接写 `new Response(..., { status })`。
+
 ### `test/http/harness.ts`
 
 | helper | 作用 |
@@ -190,7 +204,7 @@ MAILER=console pnpm dev --port 5180 --strictPort > /tmp/crm-dev-5180.log 2>&1
 - 文件第一行注释写清这条接缝：从哪个入口进、经过什么、在哪里看结果。
 - `beforeEach` 里 `resetDb()`，`afterAll` 里 `closeDb()`；每个用例从空库开始，不依赖其他用例。
 - 用例名用中文写一句可观察的行为，不写实现细节。
-- 断言看结果（任务结果、数据湖里的行、响应状态与页面内容），不 mock 模块。需要时间流逝用 `vi.useFakeTimers({ toFake: ['Date'] })`，需要改配置用 `vi.stubEnv`（`TEMPLATE_TEST_VERSIONS=1` 打开只给测试用的模板新版本，见 `app/.server/pipeline/templates/test-versions.ts`：`latestTemplate('rfm')` 变成分群带 `v2:` 前缀的第 2 版，`latestTemplate('churn')` 变成 `at_risk` 取反、`minOrders` 不超过 10 的第 2 版，工作进程也继承这个开关）；发信用 `app.outbox` 或 `app.setMailer` 替换；模型服务用 `app.setLlmFetch` 注入假 fetch（默认替身直接报错，HTTP 测试不会真的请求填写的端点；`afterEach` 里传 `undefined` 恢复）。
+- 断言看结果（任务结果、数据湖里的行、响应状态与页面内容），不 mock 模块。需要时间流逝用 `vi.useFakeTimers({ toFake: ['Date'] })`，需要改配置用 `vi.stubEnv`（`TEMPLATE_TEST_VERSIONS=1` 打开只给测试用的模板新版本，见 `app/.server/pipeline/templates/test-versions.ts`：`latestTemplate('rfm')` 变成分群带 `v2:` 前缀的第 2 版，`latestTemplate('churn')` 变成 `at_risk` 取反、`minOrders` 不超过 10 的第 2 版，工作进程也继承这个开关）；发信用 `app.outbox` 或 `app.setMailer` 替换；模型服务用 `app.setLlmFetch` 注入假 fetch（默认替身直接报错，HTTP 测试不会真的请求填写的端点；`afterEach` 里传 `undefined` 恢复），假 fetch、答复与平台默认配置用 `llm-fixtures`（见上）。
 
 ## 现有测试一览
 

@@ -9,6 +9,7 @@ import { appendTurn } from '../../app/.server/assistant/conversations';
 import { MAX_HISTORY } from '../../app/.server/assistant/loop';
 import { removeMember } from '../../app/.server/members';
 import { memberOf, newTenant } from '../pipeline/fixtures';
+import { fakeLlm, platformDefault, text, toolCalls } from '../pipeline/llm-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
 let app: TestApp;
@@ -16,9 +17,7 @@ beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => {
   await resetDb();
-  vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
-  vi.stubEnv('LLM_MODEL', 'qwen-plus');
-  vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
+  platformDefault();
 });
 afterEach(() => { app.setLlmFetch(undefined); vi.unstubAllEnvs(); });
 
@@ -26,19 +25,12 @@ const PAGE = { path: '/lineage', title: '数据地图' };
 const post = (client: Client, body: unknown) =>
   client.request('/assistant', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
 
-/** 假模型：每次请求记下收到的消息，先调一次目录工具，再按顺序给出答复 */
+/** 假模型：每次请求记下收到的请求，先调一次目录工具，再按顺序给出答复 */
 function fakeModel(replies: string[]) {
-  const requests: { role: string; content: string }[][] = [];
   let i = 0;
-  app.setLlmFetch((async (_url: string, init: RequestInit) => {
-    const { messages } = JSON.parse(String(init.body));
-    requests.push(messages);
-    if (messages.at(-1).role === 'user') {
-      return Response.json({ choices: [{ message: { content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'catalog_overview', arguments: '{}' } }] } }] });
-    }
-    return Response.json({ choices: [{ message: { content: replies[i++] } }] });
-  }) as typeof fetch);
-  return requests;
+  return fakeLlm(f => app.setLlmFetch(f), (_n, body) => body.messages.at(-1)!.role === 'user'
+    ? toolCalls({ id: 'c1', name: 'catalog_overview', args: {} })
+    : text(replies[i++])).received;
 }
 
 async function analystAndPeer() {
@@ -79,7 +71,7 @@ describe('助手对话', () => {
     // 续写时把保存的历史交给模型，不带工具输出
     const requests = fakeModel(['好的']);
     expect((await post(client, { conversationId: id, message: '谢谢', page: PAGE })).status).toBe(200);
-    expect(requests[0].filter(m => m.role !== 'system').map(m => m.content)).toEqual(['有哪些机密实体？', '有客户、订单等实体', '客户有哪些字段？', '客户有姓名、手机号等字段', '谢谢']);
+    expect(requests[0].body.messages.filter(m => m.role !== 'system').map(m => m.content)).toEqual(['有哪些机密实体？', '有客户、订单等实体', '客户有哪些字段？', '客户有姓名、手机号等字段', '谢谢']);
 
     const admin = await loginAs(app, 'admin@acme.com');
     for (const other of [peer, admin]) {
@@ -93,7 +85,7 @@ describe('助手对话', () => {
     for (let i = 0; i < MAX_HISTORY / 2; i++) await appendTurn(analyst, id, `问题 ${i}`, `答复 ${i}`, []);
     const long = fakeModel(['还能接着答']);
     expect((await post(client, { conversationId: id, message: '最后一问', page: PAGE })).status).toBe(200);
-    const sent = long[0].filter(m => m.role !== 'system');
+    const sent = long[0].body.messages.filter(m => m.role !== 'system');
     expect(sent).toHaveLength(MAX_HISTORY - 1);
     expect(sent.at(-2)?.content).toBe(`答复 ${MAX_HISTORY / 2 - 1}`);
     expect((await (await client.get(`/assistant?id=${id}`)).json()).conversation.messages).toHaveLength(6 + MAX_HISTORY + 2);

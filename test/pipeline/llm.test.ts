@@ -12,6 +12,7 @@ import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, selectAllTables } from './fixtures';
+import { fakeLlm, json, platformDefault } from './llm-fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -24,28 +25,10 @@ const MESSAGES = [
   { role: 'user' as const, content: '样本行：13800138000' },
 ];
 
-interface Received { url: string; headers: Headers; body: Record<string, unknown> }
-
-/** 假 fetch：记下收到的请求，返回 respond 构造的 Response */
-function fakeFetch(respond: () => Response) {
-  const received: Received[] = [];
-  const f = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-    received.push({ url: String(url), headers: new Headers(init?.headers), body: JSON.parse(init?.body as string) });
-    return respond();
-  });
-  setLlmFetch(f as unknown as typeof fetch);
-  return { f, received };
-}
-
-/** OpenAI 兼容接口的成功返回：content 是 JSON 文本 */
-const completion = (content: unknown, usage = { prompt_tokens: 120, completion_tokens: 30 }) =>
-  () => Response.json({ choices: [{ message: { role: 'assistant', content: JSON.stringify(content) } }], usage });
-
-function platformDefault() {
-  vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1/');
-  vi.stubEnv('LLM_MODEL', 'qwen-plus');
-  vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
-}
+/** 平台默认端点带尾 /，拼出的 URL 不应出现 // */
+const BASE_WITH_SLASH = 'https://platform.example.com/v1/';
+/** 答复带的 token 数，记进 llm_calls */
+const USAGE = { prompt_tokens: 120, completion_tokens: 30 };
 
 async function tenantProvider(tenantId: string) {
   await getDb().insert(modelProviders).values({
@@ -62,8 +45,8 @@ const calls = (tenantId: string) => getDb().select().from(llmCalls).where(eq(llm
 describe('模型服务客户端', () => {
   it('只有环境变量时用平台默认', async () => {
     const acme = await newTenant('acme');
-    platformDefault();
-    const { received } = fakeFetch(completion({ table: 'orders' }));
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
 
     expect(await resolveProvider(acme)).toMatchObject({ source: 'platform', model: 'qwen-plus' });
     expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
@@ -75,9 +58,9 @@ describe('模型服务客户端', () => {
 
   it('租户有自己的配置时整套用租户的，库里不存 Key 明文', async () => {
     const acme = await newTenant('acme');
-    platformDefault();
+    platformDefault(BASE_WITH_SLASH);
     await tenantProvider(acme);
-    const { received } = fakeFetch(completion({ table: 'orders' }));
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
 
     await chatJson(acme, 'connectivity', MESSAGES, SCHEMA);
     expect(received[0].url).toBe('https://tenant.example.com/v1/chat/completions');
@@ -91,7 +74,7 @@ describe('模型服务客户端', () => {
   it('租户与平台都没有配置时报错且不发请求', async () => {
     const acme = await newTenant('acme');
     vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');   // 只配了一部分不算
-    const { f } = fakeFetch(completion({ table: 'orders' }));
+    const { f } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
 
     expect(await resolveProvider(acme)).toBeNull();
     await expect(chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).rejects.toThrow(/未配置模型服务/);
@@ -101,8 +84,8 @@ describe('模型服务客户端', () => {
 
   it('返回不合 Schema 时记 schemaValid=false 并抛错', async () => {
     const acme = await newTenant('acme');
-    platformDefault();
-    fakeFetch(completion({ tabel: 'orders' }));
+    platformDefault(BASE_WITH_SLASH);
+    fakeLlm(setLlmFetch, () => json({ tabel: 'orders' }, USAGE));
 
     const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA));
     expect(err).toBeInstanceOf(LlmError);
@@ -114,8 +97,8 @@ describe('模型服务客户端', () => {
 
   it('HTTP 500 时记 error，消息里没有 Key', async () => {
     const acme = await newTenant('acme');
-    platformDefault();
-    fakeFetch(() => new Response(`upstream failed for key sk-platform-secret ${'x'.repeat(500)}`, { status: 500 }));
+    platformDefault(BASE_WITH_SLASH);
+    fakeLlm(setLlmFetch, () => new Response(`upstream failed for key sk-platform-secret ${'x'.repeat(500)}`, { status: 500 }));
 
     const err = await failure(chatJson(acme, 'connectivity', MESSAGES, SCHEMA));
     expect(err).toBeInstanceOf(LlmError);
@@ -130,8 +113,8 @@ describe('模型服务客户端', () => {
 
   it('成功时记令牌数与耗时，日志里没有提示词与返回原文', async () => {
     const acme = await newTenant('acme');
-    platformDefault();
-    fakeFetch(completion({ table: '13900139000' }, { prompt_tokens: 200, completion_tokens: 50 }));
+    platformDefault(BASE_WITH_SLASH);
+    fakeLlm(setLlmFetch, () => json({ table: '13900139000' }, { prompt_tokens: 200, completion_tokens: 50 }));
 
     await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
     const rows = await calls(acme);

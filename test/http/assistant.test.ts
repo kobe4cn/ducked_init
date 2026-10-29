@@ -5,6 +5,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { memberOf, newTenant } from '../pipeline/fixtures';
+import { fakeLlm, json, platformDefault, text, toolCalls } from '../pipeline/llm-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
 let app: TestApp;
@@ -13,11 +14,7 @@ afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 afterEach(() => { app.setLlmFetch(undefined); vi.unstubAllEnvs(); });
 
-function platformDefault() {
-  vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
-  vi.stubEnv('LLM_MODEL', 'qwen-plus');
-  vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
-}
+const setLlm = (f: typeof fetch | undefined) => app.setLlmFetch(f);
 
 const ask = (client: Client, body: unknown) =>
   client.request('/assistant', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
@@ -35,10 +32,7 @@ describe('AI 助手', () => {
 
     platformDefault();
     expect(await (await viewer.get('/assistant')).json()).toMatchObject({ configured: true });
-    let n = 0;
-    app.setLlmFetch((async () => ++n === 1
-      ? Response.json({ choices: [{ message: { content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'catalog_overview', arguments: '{}' } }] } }] })
-      : Response.json({ choices: [{ message: { content: '有客户、订单等实体' } }] })) as typeof fetch);
+    fakeLlm(setLlm, n => n === 1 ? toolCalls({ id: 'c1', name: 'catalog_overview', args: {} }) : text('有客户、订单等实体'));
     const res = await ask(viewer, TURN);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ conversationId: expect.any(String), reply: '有客户、订单等实体', toolsUsed: ['catalog_overview'] });
@@ -54,7 +48,7 @@ describe('AI 助手', () => {
     expect((await unconfigured.json()).error).toContain('模型服务');
 
     platformDefault();
-    app.setLlmFetch((async () => new Response('tools not supported', { status: 400 })) as typeof fetch);
+    fakeLlm(setLlm, () => new Response('tools not supported', { status: 400 }));
     const failed = await ask(viewer, TURN);
     expect(failed.status).toBe(422);
     expect((await failed.json()).error).toContain('不支持工具调用');
@@ -75,14 +69,12 @@ describe('AI 助手', () => {
     const support = async (client = viewer) => (await (await client.get('/assistant')).json()).toolSupport;
     /** 连通性请求回 JSON，探测请求（带 tools）由 respond 决定怎么回；返回页面上的 data-tools */
     const probeWith = async (respond: () => Response) => {
-      app.setLlmFetch((async (_url: string | URL | Request, init?: RequestInit) => JSON.parse(init?.body as string).tools
-        ? respond()
-        : Response.json({ choices: [{ message: { content: '{"ok": true}' } }] })) as typeof fetch);
+      fakeLlm(setLlm, (_n, body) => body.tools ? respond() : json({ ok: true }));
       return /data-tools="(\w+)"/.exec(await (await admin.post('/model-provider', { intent: 'test' })).text())?.[1];
     };
     /** 支持：回 tool_calls；不支持：拒绝带 tools 的请求（400） */
     const probe = async (tools: boolean) => expect(await probeWith(tools
-      ? () => Response.json({ choices: [{ message: { content: null, tool_calls: [{ id: 'p', type: 'function', function: { name: 'ping', arguments: '{}' } }] } }] })
+      ? () => toolCalls({ id: 'p', name: 'ping', args: {} })
       : () => new Response('tools not supported', { status: 400 }))).toBe(tools ? 'yes' : 'no');
 
     expect(await (await admin.get('/assistant')).json()).toMatchObject({ canManageProvider: true }); // 侧栏只给能管理模型服务的成员「模型服务」页链接
@@ -90,20 +82,19 @@ describe('AI 助手', () => {
     // 探测时临时故障（503）或模型只回了文本（tool_choice 是 auto，支持的模型也可能不调用）：页面提示没能确认，不存，助手照常可用
     expect(await probeWith(() => new Response('busy', { status: 503 }))).toBe('unknown');
     expect(await support()).toBeNull();
-    expect(await probeWith(() => Response.json({ choices: [{ message: { content: '好的' } }] }))).toBe('unknown');
+    expect(await probeWith(() => text('好的'))).toBe('unknown');
     expect(await support()).toBeNull();
     await probe(true);
-    expect(await probeWith(() => Response.json({ choices: [{ message: { content: '好的' } }] }))).toBe('unknown');
+    expect(await probeWith(() => text('好的'))).toBe('unknown');
     expect(await support()).toBe(true); // 不确定的结果不覆盖上一次的
     await probe(false);
     expect(await support()).toBe(false);
     expect(await support(globex)).toBeNull(); // 别的租户不受影响
-    let requests = 0;
-    app.setLlmFetch((async () => { requests++; return Response.json({ choices: [{ message: { content: '假装查过了' } }] }); }) as typeof fetch);
+    const { received } = fakeLlm(setLlm, () => text('假装查过了'));
     const refused = await ask(viewer, TURN);
     expect(refused.status).toBe(422);
     expect((await refused.json()).error).toContain('该模型服务不支持工具调用');
-    expect(requests).toBe(0);
+    expect(received.length).toBe(0);
 
     await probe(true);
     expect(await support()).toBe(true);

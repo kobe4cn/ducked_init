@@ -13,6 +13,7 @@ import { dslVersions, snapshots, tasks } from '../../app/.server/db/schema';
 import { createDefinition, getDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { todayUtc } from '../../app/.server/templates';
 import { memberOf, newTenant } from '../pipeline/fixtures';
+import { fakeLlm, json, platformDefault } from '../pipeline/llm-fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -328,10 +329,8 @@ const editorYaml = (html: string) => html.match(/<textarea[^>]*name="yaml"[^>]*>
 
 /** 配上平台默认模型服务，替身每次都返回 content */
 function modelReplies(content: unknown) {
-  vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
-  vi.stubEnv('LLM_MODEL', 'qwen-plus');
-  vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
-  app.setLlmFetch((async () => Response.json({ choices: [{ message: { content: JSON.stringify(content) } }] })) as typeof fetch);
+  platformDefault();
+  fakeLlm(f => app.setLlmFetch(f), () => json(content));
 }
 
 describe('用模型生成指标草稿', () => {

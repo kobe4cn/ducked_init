@@ -17,6 +17,7 @@ import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, publish, selectAllTables } from './fixtures';
+import { fakeLlm, json, platformDefault } from './llm-fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -25,26 +26,8 @@ afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); });
 
 const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
-/** 假 fetch：记下收到的请求体，返回 respond 构造的 Response */
-function fakeFetch(respond: () => Response) {
-  const received: Record<string, unknown>[] = [];
-  const f = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-    received.push(JSON.parse(init?.body as string));
-    return respond();
-  });
-  setLlmFetch(f as unknown as typeof fetch);
-  return { f, received };
-}
-
-/** OpenAI 兼容接口的成功返回：content 是 JSON 文本 */
-const completion = (content: unknown) =>
-  () => Response.json({ choices: [{ message: { role: 'assistant', content: JSON.stringify(content) } }], usage: { prompt_tokens: 800, completion_tokens: 200 } });
-
-function platformDefault() {
-  vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');
-  vi.stubEnv('LLM_MODEL', 'qwen-plus');
-  vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
-}
+/** 答复带的 token 数，记进 llm_calls */
+const USAGE = { prompt_tokens: 800, completion_tokens: 200 };
 
 /** 模型对 shop.orders → order 的回答 */
 const MODEL_ORDERS = {
@@ -101,7 +84,7 @@ describe('用模型生成映射草稿', () => {
     await selectAllTables(author, shop2);
     await drain();
     platformDefault();
-    const { f } = fakeFetch(completion(MODEL_ORDERS));
+    const { f } = fakeLlm(setLlmFetch, () => json(MODEL_ORDERS, USAGE));
 
     const result = await modelDraftFor(author, shop2, 'orders', 'order');
     expect(result).toMatchObject({ origin: 'reuse', reusedFrom: published, items: [] });
@@ -115,7 +98,7 @@ describe('用模型生成映射草稿', () => {
 
   it('没有配置模型服务时返回规则草稿并提示，不发请求，生成记录的来源是 rules', async () => {
     const { acme, author, sourceId } = await tenantWithSource();
-    const { f } = fakeFetch(completion(MODEL_ORDERS));
+    const { f } = fakeLlm(setLlmFetch, () => json(MODEL_ORDERS, USAGE));
 
     const result = await modelDraftFor(author, sourceId, 'orders', 'order');
     expect(result).toMatchObject({ origin: 'rules', notice: '未配置模型服务，已按规则生成', yaml: await draftFor(author, sourceId, 'orders', 'order') });
@@ -128,7 +111,7 @@ describe('用模型生成映射草稿', () => {
     const { acme, author, sourceId } = await tenantWithSource();
     await saveBusinessNote(author, { entity: 'order', field: 'status', note: '退款单也算一笔订单，状态记为 refunded' });
     platformDefault();
-    const { received } = fakeFetch(completion(MODEL_ORDERS));
+    const { received } = fakeLlm(setLlmFetch, () => json(MODEL_ORDERS, USAGE));
 
     const result = await modelDraftFor(author, sourceId, 'orders', 'order');
     expect(result.origin).toBe('model');
@@ -141,7 +124,7 @@ describe('用模型生成映射草稿', () => {
 
     const [call] = await calls(acme);
     expect(call).toMatchObject({ purpose: 'mapping_draft', model: 'qwen-plus', schemaValid: true, error: null });
-    const messages = received[0].messages as { role: string; content: string }[];
+    const messages = received[0].body.messages;
     expect(messages[0].content).toContain('字段口径以目录为准');
     const { catalog, input: user } = draftUser(messages[1].content);
     expect(user).toMatchObject({ entity: 'order', table: { table: 'orders', rows: 100 } });
@@ -165,10 +148,10 @@ describe('用模型生成映射草稿', () => {
   it('起草消费者映射时目录里没有敏感字段与哈希列，消息里没有敏感列的取值', async () => {
     const { author, sourceId } = await tenantWithSource();
     platformDefault();
-    const { received } = fakeFetch(completion(MODEL_ORDERS));
+    const { received } = fakeLlm(setLlmFetch, () => json(MODEL_ORDERS, USAGE));
 
     await modelDraftFor(author, sourceId, 'customers', 'customer').catch(() => undefined);
-    const content = (received[0].messages as { content: string }[])[1].content;
+    const content = received[0].body.messages[1].content;
     const { catalog } = draftUser(content);
     expect(catalog).toContain('## entity:customer ');
     expect(catalog).toContain('## field:customer.customer_id ');
@@ -192,7 +175,7 @@ describe('用模型生成映射草稿', () => {
   it('模型生成的草稿照常保存为成员的草稿、空跑，保存的人不能发布、另一位能发布', async () => {
     const { acme, author, reviewer, sourceId } = await tenantWithSource();
     platformDefault();
-    fakeFetch(completion(MODEL_ORDERS));
+    fakeLlm(setLlmFetch, () => json(MODEL_ORDERS, USAGE));
     const mapping = await createMapping(author, sourceId, (await modelDraftFor(author, sourceId, 'orders', 'order')).yaml);
     const [audit] = await getDb().select().from(auditLogs)
       .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'mapping.drafted'), eq(auditLogs.targetId, mapping.id)));
@@ -211,7 +194,7 @@ describe('用模型生成映射草稿', () => {
   it('模型返回不合 Schema 时拒绝：调用日志 schema_valid = false，记一条失败审计，不写生成记录', async () => {
     const { acme, author, sourceId } = await tenantWithSource();
     platformDefault();
-    fakeFetch(completion({ fields: [{ field: 'order_id', expr: 'string(order_id)', confidence: 2, reason: '主键' }] }));
+    fakeLlm(setLlmFetch, () => json({ fields: [{ field: 'order_id', expr: 'string(order_id)', confidence: 2, reason: '主键' }] }, USAGE));
 
     const e = await failure(modelDraftFor(author, sourceId, 'orders', 'order'));
     expect(e).toBeInstanceOf(MappingError);
@@ -226,7 +209,7 @@ describe('用模型生成映射草稿', () => {
   it('转出的 YAML 引用不存在的列时拒绝：带问题列表，审计只记阶段、问题数与位置，不含模型原文', async () => {
     const { acme, author, sourceId } = await tenantWithSource();
     platformDefault();
-    fakeFetch(completion({ fields: [...MODEL_ORDERS.fields, { field: 'channel', expr: 'no_such_col', confidence: 0.4, reason: '猜的渠道列' }] }));
+    fakeLlm(setLlmFetch, () => json({ fields: [...MODEL_ORDERS.fields, { field: 'channel', expr: 'no_such_col', confidence: 0.4, reason: '猜的渠道列' }] }, USAGE));
 
     const e = await failure(modelDraftFor(author, sourceId, 'orders', 'order'));
     expect(e.status).toBe(422);
@@ -241,7 +224,7 @@ describe('用模型生成映射草稿', () => {
   it('模型服务 HTTP 500 时拒绝：审计的错误摘要里没有 Key，不写生成记录', async () => {
     const { acme, author, sourceId } = await tenantWithSource();
     platformDefault();
-    fakeFetch(() => new Response('upstream error for sk-platform-secret', { status: 500 }));
+    fakeLlm(setLlmFetch, () => new Response('upstream error for sk-platform-secret', { status: 500 }));
 
     const e = await failure(modelDraftFor(author, sourceId, 'orders', 'order'));
     expect(e.status).toBe(422);
@@ -263,7 +246,7 @@ describe('记录成员对生成草稿的修改', () => {
   it('生成后改了字段再保存：记一条审计，只有字段名与改了哪些属性，生成记录回填映射', async () => {
     const { acme, author, sourceId } = await tenantWithSource();
     platformDefault();
-    fakeFetch(completion(MODEL_ORDERS));
+    fakeLlm(setLlmFetch, () => json(MODEL_ORDERS, USAGE));
     const draft = await modelDraftFor(author, sourceId, 'orders', 'order');
     const yaml = edited(draft.yaml);
     expect(yaml).not.toBe(draft.yaml);
@@ -285,7 +268,7 @@ describe('记录成员对生成草稿的修改', () => {
   it('生成后只加了自定义断言再保存：审计记下断言名，不记 min / max / values', async () => {
     const { acme, author, sourceId } = await tenantWithSource();
     platformDefault();
-    fakeFetch(completion(MODEL_ORDERS));
+    fakeLlm(setLlmFetch, () => json(MODEL_ORDERS, USAGE));
     const draft = await modelDraftFor(author, sourceId, 'orders', 'order');
     const yaml = `${draft.yaml}\nassertions:\n  - { field: amount, check: range, min: 12345, level: error }\n`;
 
@@ -350,7 +333,7 @@ describe('用模型建议断言', () => {
     const { acme, author, reviewer, sourceId } = await tenantWithSource();
     const mapping = await createMapping(author, sourceId, ORDERS);
     platformDefault();
-    const { received } = fakeFetch(completion(MODEL_ASSERTIONS));
+    const { received } = fakeLlm(setLlmFetch, () => json(MODEL_ASSERTIONS, USAGE));
 
     const result = await modelAssertionsForMapping(author, mapping.id);
     expect(result.origin).toBe('assertions');
@@ -361,7 +344,7 @@ describe('用模型建议断言', () => {
 
     const [call] = await calls(acme);
     expect(call).toMatchObject({ purpose: 'assertion_draft', schemaValid: true, error: null });
-    const user = JSON.parse((received[0].messages as { content: string }[])[1].content);
+    const user = JSON.parse(received[0].body.messages[1].content);
     expect(user).toMatchObject({ table: { table: 'orders' }, mapping: ORDERS });
     const [generation] = await generations(acme);
     expect(generation).toMatchObject({
@@ -383,7 +366,7 @@ describe('用模型建议断言', () => {
     const { acme, author, sourceId } = await tenantWithSource();
     const mapping = await createMapping(author, sourceId, ORDERS);
     platformDefault();
-    fakeFetch(completion({ assertions: [{ field: 'order_id', check: 'not_empty', level: 'error', confidence: 0.9, reason: '主键' }] }));
+    fakeLlm(setLlmFetch, () => json({ assertions: [{ field: 'order_id', check: 'not_empty', level: 'error', confidence: 0.9, reason: '主键' }] }, USAGE));
 
     const e = await failure(modelAssertionsForMapping(author, mapping.id));
     expect(e).toBeInstanceOf(MappingError);
@@ -398,10 +381,10 @@ describe('用模型建议断言', () => {
     const { acme, author, sourceId } = await tenantWithSource();
     const mapping = await createMapping(author, sourceId, ORDERS);
     platformDefault();
-    fakeFetch(completion({ assertions: [
+    fakeLlm(setLlmFetch, () => json({ assertions: [
       { field: 'no_such_field', check: 'not_null', level: 'warn', confidence: 0.3, reason: '猜的字段' },
       { field: 'status', check: 'in', level: 'warn', values: ['weird_value'], confidence: 0.4, reason: '猜的取值' },
-    ] }));
+    ] }, USAGE));
 
     const e = await failure(modelAssertionsForMapping(author, mapping.id));
     expect(e.status).toBe(422);
@@ -415,7 +398,7 @@ describe('用模型建议断言', () => {
   it('没有配置模型服务时 400、不发请求', async () => {
     const { acme, author, sourceId } = await tenantWithSource();
     const mapping = await createMapping(author, sourceId, ORDERS);
-    const { f } = fakeFetch(completion(MODEL_ASSERTIONS));
+    const { f } = fakeLlm(setLlmFetch, () => json(MODEL_ASSERTIONS, USAGE));
     const e = await failure(modelAssertionsForMapping(author, mapping.id));
     expect(e.status).toBe(400);
     expect(e.message).toContain('未配置模型服务');
