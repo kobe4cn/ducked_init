@@ -120,7 +120,7 @@ describe('AI 起草', () => {
 });
 
 describe('AI 解读', () => {
-  it('结果上方有「请 AI 解读」；预览显示确认框（发送 city、剔除哈希列 p），不请求模型；确认后显示解读', async () => {
+  it('结果上方有「请 AI 解读」；预览显示确认框（发送 city、剔除哈希列 p），不请求模型；确认后显示解读；两步都保留结果表格', async () => {
     await memberOf(acme, 'an-int@acme.com', 'analyst');
     const analyst = await loginAs(app, 'an-int@acme.com');
     const sql = 'SELECT phone AS p, city FROM silver.customer LIMIT 100';
@@ -133,6 +133,7 @@ describe('AI 解读', () => {
     expect(preview.status).toBe(200);
     const confirm = await preview.text();
     expect(confirm).toContain('data-interpret="confirm"');
+    expect(confirm).toContain('data-workbench-result');
     expect(confirm).toMatch(/data-interpret-sent="?[^>]*>city</);
     expect(confirm).toMatch(/data-interpret-dropped="?[^>]*>p</);
     expect(received).toEqual([]);
@@ -145,6 +146,7 @@ describe('AI 解读', () => {
     const html = await done.text();
     expect(html).toContain('data-interpret="result"');
     expect(html).toContain('客户集中在少数几个城市');
+    expect(html).toContain('data-workbench-result');
     expect(received).toHaveLength(1);
   });
 });

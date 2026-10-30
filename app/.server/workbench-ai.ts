@@ -10,7 +10,7 @@ import { isSystemColumn } from './catalog';
 import { getDb } from './db/client';
 import { chatJson, LlmError, resolveProvider, type LlmMessage } from './llm';
 import { normalizeWorkbenchSql, type WorkbenchResult } from './pipeline/workbench-engine';
-import { checkDraftedSql, listCatalog, runQuery, WorkbenchError, type WorkbenchCatalog } from './workbench';
+import { checkDraftedSql, listCatalog, runQuery, WorkbenchError, type QueryOutcome, type WorkbenchCatalog } from './workbench';
 import { looksSensitive } from '../lib/sensitive';
 
 /** 可以展示给成员的错误 */
@@ -127,7 +127,7 @@ export function pickColumns(result: WorkbenchResult, keep = sendable(result)): {
 const sentRows = (result: WorkbenchResult) => Math.min(result.rows.length, INTERPRET_ROWS);
 
 /** 查询出错（SQL 不合规、超时、已有查询在运行）照原状态码给出 */
-async function rerun(actor: CurrentMember, sql: string): Promise<WorkbenchResult> {
+async function rerun(actor: CurrentMember, sql: string): Promise<QueryOutcome> {
   try {
     return await runQuery(actor, sql);
   } catch (e) {
@@ -136,11 +136,13 @@ async function rerun(actor: CurrentMember, sql: string): Promise<WorkbenchResult
   }
 }
 
-/** 解读前的确认：按 SQL 重新执行，给出将发送的行数与列、剔除的列，不请求模型 */
-export async function previewInterpretation(actor: CurrentMember, sql: string): Promise<{ rows: number; sent: string[]; dropped: string[] }> {
+/** 解读前的确认：按 SQL 重新执行，给出将发送的行数与列、剔除的列，不请求模型；result 是这次执行的结果，页面照常显示表格 */
+export async function previewInterpretation(
+  actor: CurrentMember, sql: string,
+): Promise<{ rows: number; sent: string[]; dropped: string[]; result: QueryOutcome }> {
   assertCan(actor, 'sandbox');
   const result = await rerun(actor, sql);
-  return { rows: sentRows(result), ...pickColumns(result) };
+  return { rows: sentRows(result), ...pickColumns(result), result };
 }
 
 function interpretMessages(result: WorkbenchResult, indexes: number[]): LlmMessage[] {
@@ -161,11 +163,11 @@ function interpretMessages(result: WorkbenchResult, indexes: number[]): LlmMessa
 /**
  * 成员确认后解读结果（ADR-0043）：没确认时 400，没配置模型服务时 409（都不发请求）；按 SQL 重新执行，
  * 只发前 INTERPRET_ROWS 行里没被剔除的列，全部被剔除时 400；模型失败时 422。
- * 审计 workbench.result_interpreted { sql, rows, columns, dropped }，不记取值与解读
+ * 审计 workbench.result_interpreted { sql, rows, columns, dropped }，不记取值与解读。result 是这次执行的结果，只给页面显示表格，不进审计
  */
 export async function interpretResult(
   actor: CurrentMember, sql: string, confirmed: boolean,
-): Promise<{ text: string; rows: number; columns: string[]; dropped: string[] }> {
+): Promise<{ text: string; rows: number; columns: string[]; dropped: string[]; result: QueryOutcome }> {
   assertCan(actor, 'sandbox');
   if (!confirmed) throw new WorkbenchAiError('请先确认要发送给模型服务的列', 400);
   const tenantId = actor.tenant.id;
@@ -187,5 +189,5 @@ export async function interpretResult(
     tenantId, actor, action: 'workbench.result_interpreted', targetType: 'workbench',
     detail: { sql: normalizeWorkbenchSql(sql), rows, columns: sent, dropped },
   });
-  return { text: interpretation.slice(0, MAX_INTERPRETATION), rows, columns: sent, dropped };
+  return { text: interpretation.slice(0, MAX_INTERPRETATION), rows, columns: sent, dropped, result };
 }
