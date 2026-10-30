@@ -2,8 +2,10 @@
 // 在只读挂载上按工作台白名单校验（checkDraftedSql，不执行），通过后只交给页面填进编辑框，由成员自己执行。
 // 审计 workbench.ai_drafted 记 SQL 与是否通过校验，不记需求原文；不自动重试。
 // 结果解读：成员确认后服务端按 SQL 重新执行（不信客户端传来的行），把前 INTERPRET_ROWS 行发给模型服务；结果列无法回溯到字段，
-// 所以按列名与取值保守剔除系统列、名字像敏感字段的列与取值里有 64 位十六进制哈希的列。审计 workbench.result_interpreted 不记取值
+// 所以按列名与取值保守剔除系统列、名字像敏感字段的列与取值里有 64 位十六进制哈希的列。审计 workbench.result_interpreted 不记取值；
+// 解读连同 SQL、行数与发送的列名存进本人的助手对话（appendInterpretation），不存结果行
 import { assertCan } from './access';
+import { appendInterpretation, assertOwnConversation } from './assistant/conversations';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { isSystemColumn } from './catalog';
@@ -163,15 +165,17 @@ function interpretMessages(result: WorkbenchResult, indexes: number[]): LlmMessa
 /**
  * 成员确认后解读结果（ADR-0043）：没确认时 400，没配置模型服务时 409（都不发请求）；按 SQL 重新执行，
  * 只发前 INTERPRET_ROWS 行里没被剔除的列，全部被剔除时 400；模型失败时 422。
+ * 解读存进本人的助手对话 conversationId（null 时新建；不是自己的对话时 404，不发请求），返回对话 id。
  * 审计 workbench.result_interpreted { sql, rows, columns, dropped }，不记取值与解读。result 是这次执行的结果，只给页面显示表格，不进审计
  */
 export async function interpretResult(
-  actor: CurrentMember, sql: string, confirmed: boolean,
-): Promise<{ text: string; rows: number; columns: string[]; dropped: string[]; result: QueryOutcome }> {
+  actor: CurrentMember, sql: string, confirmed: boolean, conversationId: string | null,
+): Promise<{ text: string; rows: number; columns: string[]; dropped: string[]; result: QueryOutcome; conversationId: string }> {
   assertCan(actor, 'sandbox');
   if (!confirmed) throw new WorkbenchAiError('请先确认要发送给模型服务的列', 400);
   const tenantId = actor.tenant.id;
   if (!(await resolveProvider(tenantId))) throw new WorkbenchAiError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务', 409);
+  if (conversationId !== null) await assertOwnConversation(actor, conversationId);
   const result = await rerun(actor, sql);
   const keep = sendable(result);
   const { sent, dropped } = pickColumns(result, keep);
@@ -185,9 +189,12 @@ export async function interpretResult(
     throw e;
   }
   const rows = sentRows(result);
+  const text = interpretation.slice(0, MAX_INTERPRETATION);
+  const normalized = normalizeWorkbenchSql(sql);
+  const savedConversationId = await appendInterpretation(actor, conversationId, { sql: normalized, rows, columns: sent }, text);
   await recordAudit(getDb(), {
     tenantId, actor, action: 'workbench.result_interpreted', targetType: 'workbench',
-    detail: { sql: normalizeWorkbenchSql(sql), rows, columns: sent, dropped },
+    detail: { sql: normalized, rows, columns: sent, dropped },
   });
-  return { text: interpretation.slice(0, MAX_INTERPRETATION), rows, columns: sent, dropped, result };
+  return { text, rows, columns: sent, dropped, result, conversationId: savedConversationId };
 }

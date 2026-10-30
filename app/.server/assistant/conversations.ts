@@ -1,6 +1,6 @@
 // app/.server/assistant/conversations.ts —— AI 助手对话的保存与只读分享（ADR-0043）。
 // 对话按成员存在 platform.assistant_conversations：标题与消息用租户数据密钥加密后存一个字段（ADR-0009），表里没有明文。
-// 消息只有成员与助手的文字和用过的工具名，不存工具输出、不存查询结果行。只有本人能读、续写与分享；
+// 消息只有成员与助手的文字和用过的工具名，不存工具输出、不存查询结果行；工作台的结果解读另存 SQL、行数与发送的列名（query）。只有本人能读、续写与分享；
 // 被分享人（同租户成员）只能读。按 id 访问别人没分享给自己的对话一律 404（管理员也一样）。
 // 成员被移出租户时，其对话与分享经外键级联删除
 import { and, desc, eq } from 'drizzle-orm';
@@ -16,12 +16,16 @@ export const ASSISTANT_CONTEXT = 'assistant.conversation';
 /** 列表最多列出的对话数 */
 const LIST_LIMIT = 50;
 const TITLE_LENGTH = 40;
+/** 解读对话的标题里 SQL 的字数 */
+const SQL_TITLE_LENGTH = 30;
 
 export class ConversationError extends Error {
   constructor(message: string, readonly status: 400 | 403 | 404) { super(message); }
 }
 
-export interface StoredMessage { role: 'user' | 'assistant'; content: string; toolsUsed?: string[] }
+/** 工作台结果解读的查询：SQL、发给模型服务的行数与列名，不含取值 */
+export interface InterpretedQuery { sql: string; rows: number; columns: string[] }
+export interface StoredMessage { role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: InterpretedQuery }
 interface SealedBody { title: string; messages: StoredMessage[] }
 export interface ConversationSummary { id: string; title: string; updatedAt: Date }
 export interface Conversation extends SealedBody {
@@ -87,14 +91,44 @@ export async function readConversation(actor: CurrentMember, id: string): Promis
  * 返回对话 id。不是自己的对话时 404（被分享人也不能续写）
  */
 export async function appendTurn(actor: CurrentMember, id: string | null, userText: string, reply: string, toolsUsed: string[]): Promise<string> {
-  const tenantId = actor.tenant.id;
-  const turn: StoredMessage[] = [
+  return appendMessages(actor, id, titleOf(userText, TITLE_LENGTH) || '新对话', [
     { role: 'user', content: userText.slice(0, MAX_CONTENT) },
     { role: 'assistant', content: reply.slice(0, MAX_CONTENT), toolsUsed },
-  ];
+  ]);
+}
+
+/**
+ * 把工作台的一次结果解读记进自己的对话 id（ADR-0043）：成员消息带 query（SQL、行数与列名），内容里也写上 SQL，
+ * 在侧栏续写时模型能看到；助手消息是解读文字。不存结果行。id 为 null 时新建，标题是「解读：」加 SQL 的前 SQL_TITLE_LENGTH 字。
+ * 返回对话 id。不是自己的对话时 404
+ */
+export async function appendInterpretation(actor: CurrentMember, id: string | null, query: InterpretedQuery, text: string): Promise<string> {
+  const sql = query.sql.trim();
+  const prefix = '请解读这段查询的结果：\n```sql\n';
+  const suffix = '\n```';
+  return appendMessages(actor, id, `解读：${titleOf(sql, SQL_TITLE_LENGTH)}`, [
+    // 截的是 SQL，代码块照样闭合
+    { role: 'user', content: `${prefix}${sql.slice(0, MAX_CONTENT - prefix.length - suffix.length)}${suffix}`, query },
+    { role: 'assistant', content: text.slice(0, MAX_CONTENT) },
+  ]);
+}
+
+/** 标题：text 合并空白后的前 length 字 */
+const titleOf = (text: string, length: number) => text.trim().replace(/\s+/g, ' ').slice(0, length);
+
+/** 确认 id 是自己的对话（不锁行），不是自己的或没有时 404。请求模型服务之前先校验，免得结果已经发出去才报错 */
+export async function assertOwnConversation(actor: CurrentMember, id: string): Promise<void> {
+  if (!UUID.test(id)) throw NOT_FOUND();
+  const [row] = await getDb().select({ id: assistantConversations.id }).from(assistantConversations)
+    .where(and(eq(assistantConversations.id, id), eq(assistantConversations.tenantId, actor.tenant.id), eq(assistantConversations.memberId, actor.memberId)));
+  if (!row) throw NOT_FOUND();
+}
+
+/** 把 turn 追加到自己的对话 id；id 为 null 时以 title 新建。返回对话 id */
+async function appendMessages(actor: CurrentMember, id: string | null, title: string, turn: StoredMessage[]): Promise<string> {
+  const tenantId = actor.tenant.id;
   const db = getDb();
   if (id === null) {
-    const title = userText.trim().replace(/\s+/g, ' ').slice(0, TITLE_LENGTH) || '新对话';
     const [row] = await db.insert(assistantConversations)
       .values({ tenantId, memberId: actor.memberId, sealed: await seal(tenantId, { title, messages: turn }) })
       .returning({ id: assistantConversations.id });

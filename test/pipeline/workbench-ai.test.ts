@@ -94,7 +94,7 @@ describe('AI 解读结果', () => {
     expect(await previewInterpretation(await analyst(), sql)).toMatchObject({ sent: ['city', 'n'], dropped: [] });
     expect(f).not.toHaveBeenCalled();
 
-    const out = await interpretResult(await analyst(), sql, true);
+    const out = await interpretResult(await analyst(), sql, true, null);
     expect(out).toMatchObject({ text: '上海的客户最多', columns: ['city', 'n'], dropped: [] });
     expect(JSON.stringify(received[0].body)).toContain('city');
     const [detail] = await interpreted(sql);
@@ -107,7 +107,7 @@ describe('AI 解读结果', () => {
     const { received } = modelSays('客户分布在几个城市');
 
     expect(await previewInterpretation(await analyst(), sql)).toMatchObject({ sent: ['city'], dropped: ['p'] });
-    expect(await interpretResult(await analyst(), sql, true)).toMatchObject({ columns: ['city'], dropped: ['p'] });
+    expect(await interpretResult(await analyst(), sql, true, null)).toMatchObject({ columns: ['city'], dropped: ['p'] });
     expect(JSON.stringify(received[0].body)).not.toMatch(HASH);
     expect(JSON.stringify(await interpreted(sql))).not.toMatch(HASH);
   });
@@ -115,13 +115,13 @@ describe('AI 解读结果', () => {
   it('名字像敏感字段的列与系统列剔除；全部被剔除时 400，不请求模型', async () => {
     const { f } = modelSays('x');
     expect(await previewInterpretation(await analyst(), "SELECT 'a' AS contact_x, 1 AS _hash, 2 AS k")).toMatchObject({ sent: ['k'], dropped: ['contact_x', '_hash'] });
-    expect(await errorOf(interpretResult(await analyst(), 'SELECT phone, email FROM silver.customer', true))).toMatch(/^400 没有可以发送的列/);
+    expect(await errorOf(interpretResult(await analyst(), 'SELECT phone, email FROM silver.customer', true, null))).toMatch(/^400 没有可以发送的列/);
     expect(f).not.toHaveBeenCalled();
   });
 
   it('不带确认时 400，不请求模型', async () => {
     const { received } = modelSays('x');
-    expect(await errorOf(interpretResult(await analyst(), 'SELECT city FROM silver.customer', false))).toMatch(/^400 /);
+    expect(await errorOf(interpretResult(await analyst(), 'SELECT city FROM silver.customer', false, null))).toMatch(/^400 /);
     expect(received).toEqual([]);
   });
 });

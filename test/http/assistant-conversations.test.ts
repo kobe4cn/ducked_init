@@ -1,15 +1,18 @@
 // test/http/assistant-conversations.test.ts —— AI 助手对话的保存与只读分享（ADR-0043）经 /assistant 的 HTTP 接缝：
 // 每轮问答记进本人的对话（标题与消息加密存一个字段），刷新后从列表打开继续；别人（含管理员）按 id 读 404；
-// 分享给同租户成员后对方只读、不能续写，可撤销，分享与撤销记审计；成员被移出租户时其对话与分享随之删除
+// 分享给同租户成员后对方只读、不能续写，可撤销，分享与撤销记审计；成员被移出租户时其对话与分享随之删除；
+// 工作台的结果解读存进本人的对话（带 query：SQL、行数与列名，不存取值），/workbench?sql= 把 SQL 填进编辑框、不执行
 import { and, eq, like } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { assistantConversations, assistantConversationShares, auditLogs } from '../../app/.server/db/schema';
-import { appendTurn } from '../../app/.server/assistant/conversations';
+import { appendTurn, ASSISTANT_CONTEXT } from '../../app/.server/assistant/conversations';
 import { MAX_HISTORY } from '../../app/.server/assistant/loop';
 import { removeMember } from '../../app/.server/members';
+import { decryptForTenant } from '../../app/.server/secrets';
 import { memberOf, newTenant } from '../pipeline/fixtures';
-import { fakeLlm, platformDefault, text, toolCalls } from '../pipeline/llm-fixtures';
+import { publishedIdentitySources } from '../pipeline/identity-fixtures';
+import { fakeLlm, json, platformDefault, text, toolCalls } from '../pipeline/llm-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
 let app: TestApp;
@@ -145,5 +148,62 @@ describe('助手对话', () => {
     // 它自己对话的分享与别人分享给它的都没了
     expect(await getDb().select().from(assistantConversationShares)).toEqual([]);
     expect((await (await peer.get('/assistant')).json()).shared).toEqual([]);
+  });
+
+  it('工作台的解读存进本人的对话，回看时带 SQL、行数与列名；同一页面再解读追加到同一个对话；别人的对话 404 且不请求模型；保存的内容里没有结果取值', async () => {
+    const { acme } = await publishedIdentitySources();
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const client = await loginAs(app, 'analyst@acme.com');
+    const { received } = fakeLlm(f => app.setLlmFetch(f), () => json({ interpretation: '客户平均分布在四个城市' }));
+    // 结果里有 add_to_cart 等事件类型，SQL 与解读里都没有
+    const sql = 'SELECT event_type, count(*) AS n FROM 埋点.events GROUP BY event_type ORDER BY n DESC';
+    const conversationIn = (html: string) => html.match(/name="conversationId" value="([^"]+)"/)?.[1];
+
+    const first = await client.post('/workbench', { intent: 'interpret', sql, confirmed: '1' });
+    expect(first.status).toBe(200);
+    const id = conversationIn(await first.text());
+    expect(id).toBeDefined();
+
+    const list = await (await client.get('/assistant')).json();
+    expect(list.mine).toEqual([{ id, title: `解读：${sql.slice(0, 30)}`, updatedAt: expect.any(String) }]);
+    const query = { sql, rows: 3, columns: ['event_type', 'n'] };
+    const turn = [
+      { role: 'user', content: `请解读这段查询的结果：\n\`\`\`sql\n${sql}\n\`\`\``, query },
+      { role: 'assistant', content: '客户平均分布在四个城市' },
+    ];
+    expect((await (await client.get(`/assistant?id=${id}`)).json()).conversation.messages).toEqual(turn);
+
+    // 同一页面（表单带着 conversationId）先预览再确认，追加到同一个对话
+    const preview = await client.post('/workbench', { intent: 'interpret_preview', sql, conversationId: id! });
+    expect(conversationIn(await preview.text())).toBe(id);
+    const second = await client.post('/workbench', { intent: 'interpret', sql, confirmed: '1', conversationId: id! });
+    expect(conversationIn(await second.text())).toBe(id);
+    expect((await (await client.get(`/assistant?id=${id}`)).json()).conversation.messages).toEqual([...turn, ...turn]);
+    // 不是自己的对话 404，不请求模型
+    expect(received).toHaveLength(2);
+    expect((await client.post('/workbench', { intent: 'interpret', sql, confirmed: '1', conversationId: crypto.randomUUID() })).status).toBe(404);
+    expect(received).toHaveLength(2);
+
+    const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
+    const body = (await decryptForTenant(acme, ASSISTANT_CONTEXT, row.sealed)).body;
+    expect(body).toContain('埋点.events');
+    for (const value of ['add_to_cart', 'login', 'view']) expect(body).not.toContain(value);
+  });
+
+  it('从侧栏「在工作台重新执行」打开 /workbench?sql=：SQL 填进编辑框，不执行；超过 20000 字时忽略', async () => {
+    const { acme } = await publishedIdentitySources();
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const client = await loginAs(app, 'analyst@acme.com');
+    const queries = async () => (await getDb().select().from(auditLogs)
+      .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'workbench.query')))).length;
+    const before = await queries();
+    const rerun = 'SELECT event_type FROM 埋点.events';
+    const page = await (await client.get(`/workbench?sql=${encodeURIComponent(rerun)}`)).text();
+    expect(page).toMatch(new RegExp(`<textarea[^>]*name="sql"[^>]*>${rerun}</textarea>`));
+    expect(page).not.toContain('data-workbench-result');
+    expect(await queries()).toBe(before);
+    // 超过 20000 字时忽略
+    const tooLong = await (await client.get(`/workbench?sql=${encodeURIComponent(`SELECT 1 -- ${'x'.repeat(20_000)}`)}`)).text();
+    expect(tooLong).toMatch(/<textarea[^>]*name="sql"[^>]*><\/textarea>/);
   });
 });

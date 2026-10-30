@@ -6,12 +6,15 @@
 // 「原始层」按数据源名列出回放后当前状态的视图（敏感列是哈希），名字与保留名冲突的数据源给出没挂载的原因。
 // 「AI 起草」把需求与能读的表名、字段名发给模型服务，起草的 SQL 通过白名单校验后填进编辑框、不执行（ADR-0043），没通过时编辑框保留原来的 SQL。
 // 结果上方的「请 AI 解读」先由服务端重新执行、列出要发送与剔除的列，成员确认后再执行一次，把前 INTERPRET_ROWS 行（剔除敏感列与哈希列）发给模型服务，显示解读。
+// 解读存进本人的助手对话：隐藏字段 conversationId 带着这次的对话，同一页面再解读追加到同一个对话。
+// ?sql= 把 SQL 填进编辑框、不执行（助手侧栏里解读消息的「在工作台重新执行」链接到这里）；表单都提交到不带 ?sql 的 /workbench。
 // SQL 框是 SqlEditor（CodeMirror，客户端加载）：DuckDB 高亮，按同一份目录补全 schema / 表 / 字段，Ctrl/⌘+Enter 执行
 import { useMemo, useRef } from 'react';
 import { data, Form, Link, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, ChevronRight, CircleAlert, Database, Sparkles, Table2 } from 'lucide-react';
 import type { Route } from './+types/workbench';
 import { requirePermission } from '~/.server/access';
+import { ConversationError } from '~/.server/assistant/conversations';
 import type { CurrentMember } from '~/.server/auth';
 import { navFor } from '~/.server/nav';
 import {
@@ -46,9 +49,14 @@ async function loadCatalog(member: CurrentMember): Promise<{ catalog: WorkbenchC
   }
 }
 
+/** ?sql= 最多的字数，超过时忽略 */
+const MAX_SQL_PARAM = 20_000;
+
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sandbox');
+  const sqlParam = new URL(request.url).searchParams.get('sql') ?? '';
   return {
+    initialSql: sqlParam.length > MAX_SQL_PARAM ? '' : sqlParam,
     ...await loadCatalog(member),
     email: member.email, nav: navFor(member), maxRows: WORKBENCH_ROWS, timeoutSeconds: WORKBENCH_TIMEOUT_MS / 1000,
     sandbox: sandboxSchema(member.memberId), sandboxTables: await listSandboxTables(member), sharedWithMe: await listSharedWithMe(member),
@@ -64,17 +72,18 @@ export async function action({ request }: Route.ActionArgs) {
   const intent = String(form.get('intent') ?? 'query');
   const email = String(form.get('email') ?? '');
   const need = String(form.get('request') ?? '');
+  const conversationId = String(form.get('conversationId') ?? '') || null;
   try {
     // AI 起草（ADR-0043）：只把通过校验的 SQL 填进编辑框，不执行、不带结果；draftId 每次都不同，同样的草稿再起草一次也会重新填进编辑框
     if (intent === 'draft') return { ...await draftWorkbenchSql(member, need), name, intent, request: need, draftId: crypto.randomUUID() };
     // AI 解读（ADR-0043）：预览不请求模型；确认时服务端按 SQL 重新执行，不信客户端传来的行；两步都带上这次执行的结果，表格照常显示
     if (intent === 'interpret_preview') {
       const { result, ...preview } = await previewInterpretation(member, sql);
-      return { sql, name, intent, preview, result };
+      return { sql, name, intent, preview, result, conversationId };
     }
     if (intent === 'interpret') {
-      const { result, ...interpretation } = await interpretResult(member, sql, form.get('confirmed') === '1');
-      return { sql, name, intent, interpretation, result };
+      const { result, conversationId: savedConversationId, ...interpretation } = await interpretResult(member, sql, form.get('confirmed') === '1', conversationId);
+      return { sql, name, intent, interpretation, result, conversationId: savedConversationId };
     }
     if (intent === 'save') return { sql, name, saved: await saveAsSandbox(member, name, sql, request.signal) };
     if (intent === 'share') {
@@ -83,9 +92,11 @@ export async function action({ request }: Route.ActionArgs) {
     if (intent === 'unshare') {
       return { sql: '', name: '', notice: `已撤销 ${name} 对 ${await unshareSandboxTable(member, name, email)} 的分享` };
     }
-    return { sql, name, result: await runQuery(member, sql, request.signal) };
+    return { sql, name, result: await runQuery(member, sql, request.signal), conversationId };
   } catch (e) {
-    if (e instanceof WorkbenchError || e instanceof WorkbenchAiError) return data({ sql, name, intent, request: need, error: e.message }, { status: e.status });
+    if (e instanceof WorkbenchError || e instanceof WorkbenchAiError || e instanceof ConversationError) {
+      return data({ sql, name, intent, request: need, error: e.message, conversationId }, { status: e.status });
+    }
     throw e;
   }
 }
@@ -192,7 +203,7 @@ function CatalogTableItem({ table, onInsert }: { table: CatalogEntry | RawCatalo
 const cell = (v: unknown) => (v === null || v === undefined ? 'NULL' : typeof v === 'object' ? JSON.stringify(v) : String(v));
 
 export default function Workbench({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, maxRows, timeoutSeconds, sandbox, sandboxTables, sharedWithMe, ttlDays, maxRequest, catalog, catalogError } = loaderData;
+  const { email, nav, maxRows, timeoutSeconds, sandbox, sandboxTables, sharedWithMe, ttlDays, maxRequest, catalog, catalogError, initialSql } = loaderData;
   const sqlBox = useRef<SqlEditorHandle>(null);
   /** 在光标处插入表的引用（替换选中的文字） */
   const insertRef = (ref: string) => sqlBox.current?.insert(ref);
@@ -206,6 +217,9 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
   const draftId = actionData && 'draftId' in actionData ? actionData.draftId : null;
   const preview = actionData && 'preview' in actionData ? actionData.preview : null;
   const interpretation = actionData && 'interpretation' in actionData ? actionData.interpretation : null;
+  /** 这个页面上的解读存进的助手对话，表单里一直带着 */
+  const conversationId = actionData && 'conversationId' in actionData ? actionData.conversationId ?? '' : '';
+  const conversationField = conversationId && <input type="hidden" name="conversationId" value={conversationId} />;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -216,12 +230,13 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
       <div className="grid items-start gap-6 lg:grid-cols-[20rem_minmax(0,1fr)]">
         <CatalogTree catalog={catalog} error={catalogError} onInsert={insertRef} />
         <div className="min-w-0 space-y-6">
-          <Form method="post" className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm">
+          <Form method="post" action="/workbench" className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm">
+            {conversationField}
             <label htmlFor="sql" className="text-sm font-medium">SQL</label>
-            {/* defaultValue 只在挂载时生效：起草后换 key 让编辑框重新挂载、填入草稿 */}
+            {/* defaultValue 只在挂载时生效：起草后或从侧栏打开 ?sql= 时换 key，让编辑框重新挂载、填入 SQL */}
             <SqlEditor
-              key={draftId ?? 'sql'}
-              id="sql" name="sql" ref={sqlBox} defaultValue={actionData?.sql ?? ''} schema={schema} running={running}
+              key={draftId ?? `sql:${initialSql}`}
+              id="sql" name="sql" ref={sqlBox} defaultValue={actionData?.sql ?? initialSql} schema={schema} running={running}
               placeholder={'SELECT * FROM silver.customer LIMIT 100\n-- 结果层的表名带横线，要加引号：gold."rfm__<任务 ID>"'}
             />
             <div className="flex items-center gap-3">
@@ -288,9 +303,10 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                 已剔除（系统列、名字像敏感字段的列、取值是哈希的列）：
                 <span className="font-mono" data-interpret-dropped>{preview.dropped.join('、') || '（没有）'}</span>
               </p>
-              <Form method="post" className="flex flex-wrap items-center gap-3">
+              <Form method="post" action="/workbench" className="flex flex-wrap items-center gap-3">
                 <input type="hidden" name="sql" value={actionData?.sql ?? ''} />
                 <input type="hidden" name="confirmed" value="1" />
+                {conversationField}
                 <Button type="submit" name="intent" value="interpret" disabled={running || preview.sent.length === 0}>
                   {running && navigation.formData?.get('intent') === 'interpret' ? '解读中…' : '确认发送'}
                 </Button>
@@ -304,7 +320,7 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
               <h2 className="flex items-center gap-1 text-base font-semibold"><Sparkles className="size-4 text-amber-600" />AI 解读</h2>
               <p className="whitespace-pre-wrap text-sm">{interpretation.text}</p>
               <p className="text-sm text-slate-400">
-                {`依据前 ${interpretation.rows} 行的 ${interpretation.columns.join('、')}${interpretation.dropped.length ? `；已剔除 ${interpretation.dropped.join('、')}` : ''}。AI 的解读可能有误，请核对。`}
+                {`依据前 ${interpretation.rows} 行的 ${interpretation.columns.join('、')}${interpretation.dropped.length ? `；已剔除 ${interpretation.dropped.join('、')}` : ''}。AI 的解读可能有误，请核对。已存进 AI 助手的「历史对话」。`}
               </p>
             </div>
           )}
@@ -320,8 +336,9 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                     </span>
                   )}
                 </p>
-                <Form method="post">
+                <Form method="post" action="/workbench">
                   <input type="hidden" name="sql" value={actionData?.sql ?? ''} />
+                  {conversationField}
                   <Button type="submit" name="intent" value="interpret_preview" variant="outline" size="sm" disabled={running}>
                     <Sparkles />请 AI 解读
                   </Button>
@@ -370,14 +387,14 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                       <TableCell>{dateTime(t.expiresAt)}</TableCell>
                       <TableCell className="space-y-2">
                         {t.sharedWith.map(member => (
-                          <Form method="post" key={member} className="flex items-center gap-2">
+                          <Form method="post" action="/workbench" key={member} className="flex items-center gap-2">
                             <input type="hidden" name="name" value={t.name} />
                             <input type="hidden" name="email" value={member} />
                             <span>{member}</span>
                             <Button type="submit" name="intent" value="unshare" variant="outline" size="sm">撤销</Button>
                           </Form>
                         ))}
-                        <Form method="post" className="flex items-center gap-2">
+                        <Form method="post" action="/workbench" className="flex items-center gap-2">
                           <input type="hidden" name="name" value={t.name} />
                           <Input name="email" type="email" required placeholder="成员邮箱" aria-label={`把 ${t.name} 分享给`} className="h-8 w-48" />
                           <Button type="submit" name="intent" value="share" variant="outline" size="sm">分享</Button>

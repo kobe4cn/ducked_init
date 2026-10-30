@@ -1,14 +1,15 @@
 // app/components/assistant-panel.tsx —— 顶栏的「AI 助手」按钮与右侧侧栏（ADR-0043）：多轮问答，助手只能用目录等注册表里的工具。
 // 可用性、对话列表与答复都走 /assistant 资源路由（客户端组件不能 import .server 模块）。每轮问答由服务端记进本人的对话，
 // 「历史对话」里列出「我的对话」与「分享给我的」：打开自己的可以继续问、可以只读分享给同租户成员；分享给我的只能看（不显示输入框）。
-// 每次发送带上当前页面的路径与标题，答复下面列出本轮用过的工具
+// 每次发送带上当前页面的路径与标题，答复下面列出本轮用过的工具。
+// 工作台结果解读存下的消息带 query：显示 SQL、行数与列名，链接「在工作台重新执行」把 SQL 填进工作台编辑框（不执行，用的是打开者自己的权限）
 import { useEffect, useRef, useState } from 'react';
 import { Link, useFetcher, useLocation } from 'react-router';
 import { AlertTriangle, History, Send, Sparkles, X } from 'lucide-react';
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 
-interface Message { role: 'user' | 'assistant'; content: string; toolsUsed?: string[] }
+interface Message { role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: { sql: string; rows: number; columns: string[] } }
 interface Summary { id: string; title: string; updatedAt: string; owner?: string }
 interface Conversation { id: string; title: string; messages: Message[]; owned: boolean; sharedWith: string[] }
 type Overview = { configured: boolean; toolSupport: boolean | null; canManageProvider: boolean; tools: string[]; mine: Summary[]; shared: Summary[]; conversation?: Conversation } | { error: string };
@@ -187,7 +188,14 @@ export function AssistantPanel() {
                 )}
                 {messages.map((m, i) => (
                   <div key={i} data-role={m.role} className={m.role === 'user' ? 'self-end max-w-[85%] rounded-2xl bg-slate-900 px-3 py-2 text-white' : 'max-w-[95%]'}>
-                    <p className="whitespace-pre-wrap">{m.content}</p>
+                    {m.query ? (
+                      <div data-query className="space-y-1">
+                        <p>请解读这段查询的结果：</p>
+                        <pre className="overflow-x-auto rounded-lg bg-slate-800 p-2 font-mono text-xs">{m.query.sql}</pre>
+                        <p className="text-xs text-slate-300">{`${m.query.rows} 行，列：${m.query.columns.join('、')}`}</p>
+                        <Link data-rerun to={`/workbench?sql=${encodeURIComponent(m.query.sql)}`} className="text-xs underline">在工作台重新执行</Link>
+                      </div>
+                    ) : <p className="whitespace-pre-wrap">{m.content}</p>}
                     {m.toolsUsed && m.toolsUsed.length > 0 && (
                       <p data-tools-used className="mt-1 text-xs text-slate-400">用过的工具：{[...new Set(m.toolsUsed)].join('、')}</p>
                     )}
