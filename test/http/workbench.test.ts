@@ -2,7 +2,7 @@
 // 客户端中止请求即取消查询，同租户已有查询在运行时再提交返回 429。查看者看不到导航、打开与提交都 403。
 // 填上表名点「保存」把 SELECT 的结果存为沙箱表，「我的沙箱表」列出自己的表；别人的沙箱读不到。
 // 表的主人分享给本租户有沙箱权限的成员后，被分享人在「分享给我的」里看到、能读不能写，撤销后又读不到。
-// 写下需求点「AI 起草」，起草的 SQL 填进编辑框、不执行（ADR-0043）。
+// 写下需求点「AI 起草」，起草的 SQL 填进编辑框、不执行（ADR-0043）；结果上方「请 AI 解读」先显示确认框，确认后显示解读。
 // 左侧目录树只列能读的表（字段类型、行数、湖中位置、带引号的引用）；原始层按数据源名列出视图，数据源改名后别名随之变化
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -116,6 +116,36 @@ describe('AI 起草', () => {
     const page = await rejected.text();
     expect(page).toContain('AI 起草的 SQL 没有通过校验');
     expect(page).toMatch(/<textarea[^>]*name="sql"[^>]*>SELECT 1<\/textarea>/);
+  });
+});
+
+describe('AI 解读', () => {
+  it('结果上方有「请 AI 解读」；预览显示确认框（发送 city、剔除哈希列 p），不请求模型；确认后显示解读', async () => {
+    await memberOf(acme, 'an-int@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an-int@acme.com');
+    const sql = 'SELECT phone AS p, city FROM silver.customer LIMIT 100';
+    platformDefault();
+    const { received } = fakeLlm(f => app.setLlmFetch(f), () => json({ interpretation: '客户集中在少数几个城市' }));
+
+    expect(await (await analyst.post('/workbench', { sql })).text()).toContain('value="interpret_preview"');
+
+    const preview = await analyst.post('/workbench', { intent: 'interpret_preview', sql });
+    expect(preview.status).toBe(200);
+    const confirm = await preview.text();
+    expect(confirm).toContain('data-interpret="confirm"');
+    expect(confirm).toMatch(/data-interpret-sent="?[^>]*>city</);
+    expect(confirm).toMatch(/data-interpret-dropped="?[^>]*>p</);
+    expect(received).toEqual([]);
+
+    expect((await analyst.post('/workbench', { intent: 'interpret', sql })).status).toBe(400);
+    expect(received).toEqual([]);
+
+    const done = await analyst.post('/workbench', { intent: 'interpret', sql, confirmed: '1' });
+    expect(done.status).toBe(200);
+    const html = await done.text();
+    expect(html).toContain('data-interpret="result"');
+    expect(html).toContain('客户集中在少数几个城市');
+    expect(received).toHaveLength(1);
   });
 });
 

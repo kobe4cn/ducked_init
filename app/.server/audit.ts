@@ -273,6 +273,11 @@ const ACTIONS = {
   },
   // AI 起草的 SQL（ADR-0043）：只记 SQL 与是否通过白名单校验，不记需求原文；不执行
   'workbench.ai_drafted': { label: 'AI 起草查询', describe: (d: Detail) => `${d.valid ? '通过校验' : '没有通过校验'}：${d.sql}` },
+  // AI 解读查询结果（ADR-0043）：只记 SQL、发送的行数、发送与剔除的列名，不记取值与解读
+  'workbench.result_interpreted': {
+    label: 'AI 解读结果',
+    describe: (d: Detail) => `发送前 ${d.rows} 行的 ${(d.columns as string[]).join('、')}${(d.dropped as string[]).length ? `，剔除 ${(d.dropped as string[]).join('、')}` : ''}：${d.sql}`,
+  },
   'sandbox.save': { label: '保存沙箱表', describe: (d: Detail) => `${d.name}` },
   'sandbox.share': { label: '分享沙箱表', describe: (d: Detail) => `${d.name}` },
   'sandbox.unshare': { label: '撤销沙箱表分享', describe: (d: Detail) => `${d.name}` },

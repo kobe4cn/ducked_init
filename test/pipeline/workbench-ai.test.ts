@@ -1,11 +1,12 @@
 // test/pipeline/workbench-ai.test.ts —— 工作台 AI 起草 SQL 的流水线接缝（ADR-0043）：成员 draftWorkbenchSql(需求) → 按本人能读的目录请求模型 →
-// 在只读挂载上按工作台白名单校验（不执行）→ 返回的 SQL 与审计 workbench.ai_drafted { sql, valid }，没有 workbench.query
+// 在只读挂载上按工作台白名单校验（不执行）→ 返回的 SQL 与审计 workbench.ai_drafted { sql, valid }，没有 workbench.query；
+// 结果解读 previewInterpretation / interpretResult(SQL) → 服务端重新执行、剔除系统列、名字像敏感字段的列与取值是哈希的列 → 请求体与审计 workbench.result_interpreted
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
-import { draftWorkbenchSql } from '../../app/.server/workbench-ai';
+import { draftWorkbenchSql, interpretResult, previewInterpretation } from '../../app/.server/workbench-ai';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
@@ -78,5 +79,49 @@ describe('AI 起草 SQL', () => {
     modelWrites('SELECT 1');
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
     await expect(draftWorkbenchSql(viewer, '每个城市的客户数')).rejects.toMatchObject({ init: { status: 403 } });
+  });
+});
+
+describe('AI 解读结果', () => {
+  const HASH = /[0-9a-f]{64}/i;
+  const modelSays = (interpretation: string) => { platformDefault(); return fakeLlm(setLlmFetch, () => json({ interpretation })); };
+  const interpreted = async (sql: string) => (await audits('workbench.result_interpreted')).map(a => a.detail as Record<string, unknown>).filter(d => d.sql === sql);
+
+  it('预览不请求模型，列出要发送与剔除的列；确认后把聚合结果发给模型，审计的键恰好是 sql、rows、columns、dropped', async () => {
+    const sql = 'SELECT city, count(*) n FROM silver.customer GROUP BY 1 ORDER BY 1';
+    const { f, received } = modelSays('上海的客户最多');
+
+    expect(await previewInterpretation(await analyst(), sql)).toMatchObject({ sent: ['city', 'n'], dropped: [] });
+    expect(f).not.toHaveBeenCalled();
+
+    const out = await interpretResult(await analyst(), sql, true);
+    expect(out).toMatchObject({ text: '上海的客户最多', columns: ['city', 'n'], dropped: [] });
+    expect(JSON.stringify(received[0].body)).toContain('city');
+    const [detail] = await interpreted(sql);
+    expect(Object.keys(detail).sort()).toEqual(['columns', 'dropped', 'rows', 'sql']);
+    expect(detail).toEqual({ sql, rows: out.rows, columns: ['city', 'n'], dropped: [] });
+  });
+
+  it('别名改了名字的哈希列（phone AS p）按取值剔除，请求体里没有哈希值', async () => {
+    const sql = 'SELECT phone AS p, city FROM silver.customer';
+    const { received } = modelSays('客户分布在几个城市');
+
+    expect(await previewInterpretation(await analyst(), sql)).toMatchObject({ sent: ['city'], dropped: ['p'] });
+    expect(await interpretResult(await analyst(), sql, true)).toMatchObject({ columns: ['city'], dropped: ['p'] });
+    expect(JSON.stringify(received[0].body)).not.toMatch(HASH);
+    expect(JSON.stringify(await interpreted(sql))).not.toMatch(HASH);
+  });
+
+  it('名字像敏感字段的列与系统列剔除；全部被剔除时 400，不请求模型', async () => {
+    const { f } = modelSays('x');
+    expect(await previewInterpretation(await analyst(), "SELECT 'a' AS contact_x, 1 AS _hash, 2 AS k")).toMatchObject({ sent: ['k'], dropped: ['contact_x', '_hash'] });
+    expect(await errorOf(interpretResult(await analyst(), 'SELECT phone, email FROM silver.customer', true))).toMatch(/^400 没有可以发送的列/);
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it('不带确认时 400，不请求模型', async () => {
+    const { received } = modelSays('x');
+    expect(await errorOf(interpretResult(await analyst(), 'SELECT city FROM silver.customer', false))).toMatch(/^400 /);
+    expect(received).toEqual([]);
   });
 });

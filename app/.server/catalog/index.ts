@@ -175,7 +175,7 @@ export function estimateTokens(text: string): number {
 const SYSTEM_COLUMNS = new Set<string>(['_hash', '_customer_source', ...Object.keys(SILVER_SYSTEM_COLUMNS), ...PLATFORM_COLUMNS]);
 
 /** 哈希列与系统列：整行哈希、标准层系统列、原始层平台列与引用列旁的数据源列（_<字段>_source） */
-const isSystemColumn = (name: string) => SYSTEM_COLUMNS.has(name) || /^_.+_source$/.test(name);
+export const isSystemColumn = (name: string) => SYSTEM_COLUMNS.has(name) || /^_.+_source$/.test(name);
 
 const sourceId = (name: string) => `source:${name}`;
 const tableId = (source: string, table: string) => `table:${source}/${table}`;

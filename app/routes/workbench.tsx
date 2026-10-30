@@ -5,6 +5,7 @@
 // 左侧目录树按 标准层 / 结果层 / 我的沙箱 / 分享给我的 列出能读的表、字段类型、行数与湖中位置，点表名把带引号的引用插进 SQL 框；
 // 「原始层」按数据源名列出回放后当前状态的视图（敏感列是哈希），名字与保留名冲突的数据源给出没挂载的原因。
 // 「AI 起草」把需求与能读的表名、字段名发给模型服务，起草的 SQL 通过白名单校验后填进编辑框、不执行（ADR-0043），没通过时编辑框保留原来的 SQL。
+// 结果上方的「请 AI 解读」先由服务端重新执行、列出要发送与剔除的列，成员确认后再执行一次，把前 INTERPRET_ROWS 行（剔除敏感列与哈希列）发给模型服务，显示解读。
 // SQL 框是 SqlEditor（CodeMirror，客户端加载）：DuckDB 高亮，按同一份目录补全 schema / 表 / 字段，Ctrl/⌘+Enter 执行
 import { useMemo, useRef } from 'react';
 import { data, Form, Link, useNavigation } from 'react-router';
@@ -17,7 +18,7 @@ import {
   listCatalog, listSandboxTables, listSharedWithMe, runQuery, SANDBOX_TTL_DAYS, sandboxSchema, saveAsSandbox, shareSandboxTable, unshareSandboxTable,
   WORKBENCH_ROWS, WORKBENCH_TIMEOUT_MS, WorkbenchError, type CatalogEntry, type RawCatalogSource, type WorkbenchCatalog,
 } from '~/.server/workbench';
-import { draftWorkbenchSql, MAX_REQUEST, WorkbenchAiError } from '~/.server/workbench-ai';
+import { draftWorkbenchSql, interpretResult, MAX_REQUEST, previewInterpretation, WorkbenchAiError } from '~/.server/workbench-ai';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
 import { SqlEditor, type SqlEditorHandle } from '~/components/sql-editor';
@@ -66,6 +67,9 @@ export async function action({ request }: Route.ActionArgs) {
   try {
     // AI 起草（ADR-0043）：只把通过校验的 SQL 填进编辑框，不执行、不带结果；draftId 每次都不同，同样的草稿再起草一次也会重新填进编辑框
     if (intent === 'draft') return { ...await draftWorkbenchSql(member, need), name, intent, request: need, draftId: crypto.randomUUID() };
+    // AI 解读（ADR-0043）：预览不请求模型；确认时服务端按 SQL 重新执行，不信客户端传来的行
+    if (intent === 'interpret_preview') return { sql, name, intent, preview: await previewInterpretation(member, sql) };
+    if (intent === 'interpret') return { sql, name, intent, interpretation: await interpretResult(member, sql, form.get('confirmed') === '1') };
     if (intent === 'save') return { sql, name, saved: await saveAsSandbox(member, name, sql, request.signal) };
     if (intent === 'share') {
       return { sql: '', name: '', notice: `已把 ${name} 分享给 ${await shareSandboxTable(member, name, email)}` };
@@ -82,7 +86,10 @@ export async function action({ request }: Route.ActionArgs) {
 
 const dateTime = (d: Date | string) => new Date(d).toLocaleString('zh-CN', { hour12: false });
 
-const ERROR_TITLES: Record<string, string> = { draft: 'AI 没有起草 SQL', save: '沙箱表没有保存', share: '没有分享', unshare: '没有撤销分享' };
+const ERROR_TITLES: Record<string, string> = {
+  draft: 'AI 没有起草 SQL', interpret_preview: 'AI 没有解读结果', interpret: 'AI 没有解读结果',
+  save: '沙箱表没有保存', share: '没有分享', unshare: '没有撤销分享',
+};
 
 /** 目录树的四节：标题与说明 */
 const CATALOG_SECTIONS: { key: Exclude<keyof WorkbenchCatalog, 'raw'>; title: string; empty: string }[] = [
@@ -191,6 +198,8 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
   const saved = actionData && 'saved' in actionData ? actionData.saved : null;
   const notice = actionData && 'notice' in actionData ? actionData.notice : null;
   const draftId = actionData && 'draftId' in actionData ? actionData.draftId : null;
+  const preview = actionData && 'preview' in actionData ? actionData.preview : null;
+  const interpretation = actionData && 'interpretation' in actionData ? actionData.interpretation : null;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -262,16 +271,56 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
             </Alert>
           )}
 
+          {preview && (
+            <div className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm" data-interpret="confirm">
+              <h2 className="flex items-center gap-1 text-base font-semibold"><Sparkles className="size-4 text-amber-600" />请 AI 解读</h2>
+              <p className="text-sm">
+                {`将发送前 ${preview.rows} 行的这些列：`}
+                <span className="font-mono" data-interpret-sent>{preview.sent.join('、') || '（没有）'}</span>
+              </p>
+              <p className="text-sm text-slate-500">
+                已剔除（系统列、名字像敏感字段的列、取值是哈希的列）：
+                <span className="font-mono" data-interpret-dropped>{preview.dropped.join('、') || '（没有）'}</span>
+              </p>
+              <Form method="post" className="flex flex-wrap items-center gap-3">
+                <input type="hidden" name="sql" value={actionData?.sql ?? ''} />
+                <input type="hidden" name="confirmed" value="1" />
+                <Button type="submit" name="intent" value="interpret" disabled={running || preview.sent.length === 0}>
+                  {running && navigation.formData?.get('intent') === 'interpret' ? '解读中…' : '确认发送'}
+                </Button>
+                <span className="text-sm text-slate-400">确认后会重新执行这条 SQL，把上面这些列发给模型服务；解读只谈聚合规律，不点名个人。</span>
+              </Form>
+            </div>
+          )}
+
+          {interpretation && (
+            <div className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm" data-interpret="result">
+              <h2 className="flex items-center gap-1 text-base font-semibold"><Sparkles className="size-4 text-amber-600" />AI 解读</h2>
+              <p className="whitespace-pre-wrap text-sm">{interpretation.text}</p>
+              <p className="text-sm text-slate-400">
+                {`依据前 ${interpretation.rows} 行的 ${interpretation.columns.join('、')}${interpretation.dropped.length ? `；已剔除 ${interpretation.dropped.join('、')}` : ''}。AI 的解读可能有误，请核对。`}
+              </p>
+            </div>
+          )}
+
           {result && (
             <div className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm" data-workbench-result>
-              <p className="text-sm text-slate-500">
-                {`${result.rows.length.toLocaleString('zh-CN')} 行，耗时 ${result.durationMs} 毫秒`}
-                {result.truncated && (
-                  <span className="ml-2 inline-flex items-center gap-1 text-amber-600" data-truncated>
-                    <AlertTriangle className="size-4" />{`结果超过 ${maxRows.toLocaleString('zh-CN')} 行，只显示前 ${maxRows.toLocaleString('zh-CN')} 行`}
-                  </span>
-                )}
-              </p>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-sm text-slate-500">
+                  {`${result.rows.length.toLocaleString('zh-CN')} 行，耗时 ${result.durationMs} 毫秒`}
+                  {result.truncated && (
+                    <span className="ml-2 inline-flex items-center gap-1 text-amber-600" data-truncated>
+                      <AlertTriangle className="size-4" />{`结果超过 ${maxRows.toLocaleString('zh-CN')} 行，只显示前 ${maxRows.toLocaleString('zh-CN')} 行`}
+                    </span>
+                  )}
+                </p>
+                <Form method="post">
+                  <input type="hidden" name="sql" value={actionData?.sql ?? ''} />
+                  <Button type="submit" name="intent" value="interpret_preview" variant="outline" size="sm" disabled={running}>
+                    <Sparkles />请 AI 解读
+                  </Button>
+                </Form>
+              </div>
               <div className="overflow-x-auto">
                 <Table>
                   <TableHeader>
