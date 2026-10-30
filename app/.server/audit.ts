@@ -14,7 +14,7 @@ type Detail = Record<string, unknown>;
 const sourceKindLabel = (kind: unknown) => SOURCE_KIND_LABELS[kind as SourceKind] ?? String(kind);
 const roleLabel = (role: unknown) => ROLE_LABELS[role as Role] ?? String(role);
 const templateLabel = (template: unknown) => TEMPLATES[template as keyof typeof TEMPLATES]?.label ?? String(template);
-const apiKeyLabel = (d: Detail) => `「${d.name}」（${d.prefix}…）`;
+const credentialLabel = (d: Detail) => `「${d.name}」（${d.prefix}…）`;
 const dslLabel = (d: Detail) => (d.kind === 'tag' ? '标签' : '指标');
 /** 映射生成稿的来源（mapping_generations.origin）在审计里的说法 */
 const GENERATION_ORIGIN: Record<'model' | 'rules' | 'reuse' | 'assertions', string> = {
@@ -50,8 +50,11 @@ const ACTIONS = {
   'member.role_changed': { label: '修改角色', describe: (d: Detail) => `${d.email}：${roleLabel(d.from)} → ${roleLabel(d.to)}` },
   'member.removed': { label: '移除成员', describe: (d: Detail) => `${d.email}（原角色：${roleLabel(d.role)}）` },
   // 只记名称与前缀，明文只在创建那次响应里出现
-  'api_key.created': { label: '创建 API Key', describe: apiKeyLabel },
-  'api_key.revoked': { label: '吊销 API Key', describe: apiKeyLabel },
+  'api_key.created': { label: '创建 API Key', describe: credentialLabel },
+  'api_key.revoked': { label: '吊销 API Key', describe: credentialLabel },
+  // 成员个人令牌（ADR-0042）：只记名称、前缀、是否允许执行查询与有效期至，不记明文与哈希
+  'member_token.created': { label: '签发个人令牌', describe: credentialLabel },
+  'member_token.revoked': { label: '吊销个人令牌', describe: credentialLabel },
   // 外部系统经 API Key 发起（system 操作者，记 Key 的前缀）；条件与快照照原样记下（ADR-0040）
   'export.requested': {
     label: '发起人群导出',

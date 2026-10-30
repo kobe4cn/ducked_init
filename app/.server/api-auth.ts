@@ -1,6 +1,6 @@
 // app/.server/api-auth.ts —— 外部系统调用 /api/v1/ 的认证：Authorization: Bearer <API Key>。
 // 与成员会话完全分开（同 ADR-0007 的身份分开）：不读 cookie，Bearer 请求也带不出成员的任何能力。
-// 没有 Key、Key 错误、已吊销、租户已暂停一律 401，响应相同，不泄露是哪种原因
+// 没有 Key、Key 错误、已吊销、租户已暂停一律 401，响应相同，不泄露是哪种原因。bearerToken 也给 /mcp 的个人令牌认证用（member-tokens.ts）
 import { and, eq, isNull, lt, or, sql } from 'drizzle-orm';
 import { sha256 } from './auth';
 import { getDb } from './db/client';
@@ -14,7 +14,7 @@ const LAST_USED_GRANULARITY = sql`interval '1 minute'`;
 const unauthorized = () =>
   Response.json({ error: '未授权：请在 Authorization 头里带上有效的 API Key（Bearer）' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } });
 
-function bearerToken(request: Request) {
+export function bearerToken(request: Request) {
   const m = /^Bearer\s+(\S+)\s*$/i.exec(request.headers.get('Authorization') ?? '');
   return m?.[1] ?? null;
 }

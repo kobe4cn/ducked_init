@@ -1,5 +1,5 @@
-// app/components/app-shell.tsx —— 登录后页面的外壳：白色顶栏（品牌、胶囊导航、AI 助手、头像首字母、退出登录），内容铺满宽度；
-// 运营后台不是租户成员，不显示 AI 助手（assistant={false}）
+// app/components/app-shell.tsx —— 登录后页面的外壳：白色顶栏（品牌、胶囊导航、AI 助手、头像首字母（链到「我的设置」）、退出登录），内容铺满宽度；
+// 运营后台不是租户成员，不显示 AI 助手（assistant={false}），头像也不是链接（settingsHref={null}）
 import { Form, Link, useLocation } from 'react-router';
 import { LogOut } from 'lucide-react';
 import { activeNavTo } from '~/lib/nav';
@@ -9,13 +9,16 @@ import { AssistantPanel } from '~/components/assistant-panel';
 
 export interface NavItem { to: string; label: string }
 
-export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台', logoutAction = '/logout', assistant = true }: {
+const avatarClass = 'grid size-8 place-items-center rounded-full bg-slate-200 font-medium text-slate-700';
+
+export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台', logoutAction = '/logout', assistant = true, settingsHref = '/settings' }: {
   email: string;
   nav: NavItem[];
   children: React.ReactNode;
   brand?: string;
   logoutAction?: string;
   assistant?: boolean;
+  settingsHref?: string | null;
 }) {
   const active = activeNavTo(nav, useLocation().pathname);
   return (
@@ -42,9 +45,15 @@ export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台
           </div>
           <div className="flex items-center gap-3 text-sm text-slate-500">
             {assistant && <AssistantPanel />}
-            <span role="img" title={email} aria-label={email} className="grid size-8 place-items-center rounded-full bg-slate-200 font-medium text-slate-700">
-              {email[0]?.toUpperCase()}
-            </span>
+            {settingsHref ? (
+              <Link to={settingsHref} title={`我的设置（${email}）`} aria-label={`我的设置（${email}）`} className={avatarClass}>
+                {email[0]?.toUpperCase()}
+              </Link>
+            ) : (
+              <span role="img" title={email} aria-label={email} className={avatarClass}>
+                {email[0]?.toUpperCase()}
+              </span>
+            )}
             <Form method="post" action={logoutAction}>
               <Button type="submit" variant="ghost" size="sm">
                 <LogOut data-icon="inline-start" />

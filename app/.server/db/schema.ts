@@ -119,6 +119,23 @@ export const apiKeys = platform.table('api_keys', {
   revokedAt: timestamp('revoked_at', { withTimezone: true }),
 }, t => [index('api_keys_tenant_idx').on(t.tenantId, t.createdAt)]);
 
+// 成员个人令牌：平台外的 Agent 代表这位成员经 /mcp 接入（ADR-0042）。成员自己签发，明文只在签发时显示一次，库里只存 SHA-256；
+// prefix 是明文前 16 位（含 crm_pat_），用于辨认。权限不存在令牌上，每次按成员当前角色；成员被移除时级联删除。
+// allow_query：签发时单独勾选，才允许经它执行查询；last_used_at 同一个令牌每分钟最多更新一次
+export const memberTokens = platform.table('member_tokens', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  memberId: uuid('member_id').notNull().references(() => members.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  prefix: text('prefix').notNull(),
+  tokenHash: text('token_hash').notNull().unique(),
+  allowQuery: boolean('allow_query').notNull().default(false),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  createdAt: createdAt(),
+  lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+}, t => [index('member_tokens_member_idx').on(t.memberId, t.createdAt)]);
+
 // 运营者：运行平台本身的人，独立于成员（ADR-0007）。只能由运营命令创建。
 // TOTP 密钥首次登录时生成，确认一次验证码后才算绑定；totp_last_step 记下最近用过的时间步，防止验证码重放
 export const operators = platform.table('operators', {
