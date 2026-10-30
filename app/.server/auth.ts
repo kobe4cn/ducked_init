@@ -149,8 +149,8 @@ export interface CurrentMember {
   tenant: { id: string; slug: string; name: string };
   /** 本期每个租户只有一个默认空间 */
   space: { id: string; name: string };
-  /** 经 Agent 代成员操作时注明经由哪条通道（ADR-0042）：审计 detail 带上 via；只加在 Agent 调用时传的 actor 上，不写进会话 */
-  via?: 'assistant';
+  /** 经 Agent 代成员操作时注明经由哪条通道（ADR-0042）：平台内的助手或外部 Agent 经 MCP；审计 detail 带上 via。只加在调用工具时传的 actor 上，不写进会话或令牌 */
+  via?: 'assistant' | 'mcp';
 }
 
 async function readSessionToken(request: Request): Promise<string | null> {

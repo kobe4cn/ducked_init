@@ -1,15 +1,18 @@
 // test/http/mcp.test.ts —— 个人令牌与 /mcp 的 HTTP 接缝：成员在「我的设置」签发（明文只展示一次）、列出、吊销自己的令牌；
 // Agent 带 Bearer 令牌 POST /mcp 的 initialize、tools/list、tools/call。没带、错误、已吊销、已过期、租户已暂停、API Key、只带成员 cookie 一律同样的 401；
-// 别人的令牌吊销不了（404）；角色每次现查（requireMemberToken 直接调用），成员被移除后令牌失效
-import { eq } from 'drizzle-orm';
+// 别人的令牌吊销不了（404）；角色每次现查（requireMemberToken 直接调用），成员被移除后令牌失效。
+// 工具来自注册表里 external 的那部分、按成员角色过滤：没有发布工具；经 MCP 保存的草稿作者是令牌的成员、审计带 via: 'mcp'，不通过与无权限都是 isError 工具结果
+import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { deniedReason } from '../../app/.server/access';
 import { sha256 } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, memberTokens } from '../../app/.server/db/schema';
+import { auditLogs, dslVersions, memberTokens } from '../../app/.server/db/schema';
 import { requireMemberToken } from '../../app/.server/member-tokens';
 import { changeMemberRole, removeMember } from '../../app/.server/members';
 import { suspendTenant } from '../../app/.server/tenants';
 import { memberOf, newTenant } from '../pipeline/fixtures';
+import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
 let app: TestApp;
@@ -106,7 +109,7 @@ describe('我的设置：个人令牌', () => {
 });
 
 describe('/mcp', () => {
-  it('有效令牌能 initialize、tools/list（空）；通知回 202，tools/call 没有这个工具，未知方法、坏 JSON、批量各有错误码；GET 405', async () => {
+  it('有效令牌能 initialize、tools/list；通知回 202，tools/call 没有这个工具是 isError 结果，未知方法、坏 JSON、批量各有错误码；GET 405', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'an@acme.com', 'analyst');
     const { token } = await issue(await loginAs(app, 'an@acme.com'), 'Agent');
@@ -124,9 +127,11 @@ describe('/mcp', () => {
     expect(notified.status).toBe(202);
     expect(await notified.text()).toBe('');
 
-    expect(await (await rpc(token, { jsonrpc: '2.0', id: 'a', method: 'tools/list' })).json()).toEqual({ jsonrpc: '2.0', id: 'a', result: { tools: [] } });
+    const list = await (await rpc(token, { jsonrpc: '2.0', id: 'a', method: 'tools/list' })).json();
+    expect(list).toMatchObject({ jsonrpc: '2.0', id: 'a' });
+    expect(list.result.tools.length).toBeGreaterThan(0);
     const call = await (await rpc(token, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'x', arguments: {} } })).json();
-    expect(call.error).toEqual({ code: -32602, message: '没有这个工具' });
+    expect(call).toEqual({ jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text', text: '没有这个工具' }], isError: true } });
     expect((await (await rpc(token, { jsonrpc: '2.0', id: 3, method: 'resources/list' })).json()).error.code).toBe(-32601);
     expect((await (await rpc(token, '{not json')).json()).error.code).toBe(-32700);
     expect((await (await rpc(token, [INITIALIZE])).json()).error.code).toBe(-32600);
@@ -193,5 +198,83 @@ describe('/mcp', () => {
     const res = await rpc(token, INITIALIZE);
     expect(res.status).toBe(401);
     expect(await getDb().select().from(memberTokens)).toHaveLength(0);
+  });
+});
+
+const COUNT_MEMBERS = 'base: customer\nmeasure: { agg: count }\n';
+const BAD_METRIC = 'base: nope\nmeasure: { agg: count }\n';
+
+/** 调一个工具，返回 JSON-RPC 的 result */
+async function callTool(token: string, name: string, args?: unknown) {
+  const res = await rpc(token, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name, ...(args === undefined ? {} : { arguments: args }) } });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.error).toBeUndefined();
+  return body.result as { content: { type: string; text: string }[]; isError: boolean };
+}
+
+const toolNames = async (token: string): Promise<string[]> =>
+  (await (await rpc(token, { jsonrpc: '2.0', id: 1, method: 'tools/list' })).json()).result.tools.map((t: { name: string }) => t.name);
+
+describe('/mcp 工具', () => {
+  it('tools/list 是成员角色可用的 external 工具（名称、说明、inputSchema），没有发布工具；查看者看不到 save_*', async () => {
+    const { acme } = await publishedIdentitySources();
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const { token: analystToken } = await issue(await loginAs(app, 'analyst@acme.com'), 'Agent');
+    const { token: viewerToken } = await issue(await loginAs(app, 'viewer@acme.com'), 'Agent');
+    const { token: engineerToken } = await issue(await loginAs(app, 'de@acme.com'), 'Agent');
+
+    const { result } = await (await rpc(analystToken, { jsonrpc: '2.0', id: 1, method: 'tools/list' })).json();
+    const save = result.tools.find((t: { name: string }) => t.name === 'save_definition_draft');
+    expect(Object.keys(save).sort()).toEqual(['description', 'inputSchema', 'name']);
+    expect(save.inputSchema).toMatchObject({ type: 'object', required: ['kind', 'key', 'yaml'] });
+
+    const analyst = await toolNames(analystToken);
+    expect(analyst).toEqual(expect.arrayContaining(['catalog_overview', 'catalog_search', 'validate_definition', 'save_definition_draft']));
+    expect(analyst).not.toContain('save_mapping_draft');
+    expect(await toolNames(engineerToken)).toContain('save_mapping_draft');
+    const viewer = await toolNames(viewerToken);
+    expect(viewer).toContain('catalog_search');
+    expect(viewer.filter(n => n.startsWith('save_') || n.startsWith('validate_'))).toEqual([]);
+    for (const n of [...analyst, ...await toolNames(engineerToken)]) expect(n).not.toMatch(/publish/);
+  });
+
+  it('分析师经 MCP 读目录并保存指标草稿：作者是分析师、审计带 via: mcp；校验不通过是 isError 结果、不保存', async () => {
+    const { acme } = await publishedIdentitySources();
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const { token } = await issue(await loginAs(app, 'analyst@acme.com'), 'Agent');
+
+    const found = await callTool(token, 'catalog_search', { query: '会员' });
+    expect(found.isError).toBe(false);
+    expect(found.content[0].text.length).toBeGreaterThan(0);
+
+    const bad = await callTool(token, 'save_definition_draft', { kind: 'metric', key: 'member_count', yaml: BAD_METRIC });
+    expect(bad.isError).toBe(true);
+    expect(bad.content[0].text).toMatch(/base/);
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
+    const saved = await callTool(token, 'save_definition_draft', { kind: 'metric', key: 'member_count', yaml: COUNT_MEMBERS });
+    expect(saved).toEqual({ content: [{ type: 'text', text: expect.stringContaining('已保存为草稿：metric/member_count 第 1 版') }], isError: false });
+
+    const [version] = await getDb().select().from(dslVersions);
+    expect(version).toMatchObject({ authors: ['analyst@acme.com'], status: 'draft', yaml: COUNT_MEMBERS });
+    const [audit] = await getDb().select().from(auditLogs)
+      .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'definition.drafted')));
+    expect(audit).toMatchObject({ actorEmail: 'analyst@acme.com', detail: { kind: 'metric', key: 'member_count', version: 1, via: 'mcp' } });
+  });
+
+  it('无权限或输入不对的工具调用是 isError 结果（403 的说明原样给出），不是 500', async () => {
+    const { acme } = await publishedIdentitySources();
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const { token } = await issue(await loginAs(app, 'viewer@acme.com'), 'Agent');
+
+    const denied = await callTool(token, 'save_definition_draft', { kind: 'metric', key: 'member_count', yaml: COUNT_MEMBERS });
+    expect(denied).toEqual({ content: [{ type: 'text', text: deniedReason('definitions:draft') }], isError: true });
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
+    const badInput = await callTool(token, 'catalog_search', {});
+    expect(badInput.isError).toBe(true);
+    expect(badInput.content[0].text).toContain('输入不对');
   });
 });

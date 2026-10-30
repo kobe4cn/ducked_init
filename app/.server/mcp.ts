@@ -1,6 +1,8 @@
 // app/.server/mcp.ts —— /mcp 的 MCP 服务（Streamable HTTP，无状态 JSON-RPC 2.0，ADR-0042）：手写，不依赖 MCP SDK。
 // 调用方已由 requireMemberToken 认证为某位成员；只回 JSON，不开 SSE 流，不支持批量请求。
-// 本期工具列表为空，tools/call 一律「没有这个工具」（工具注册表以后接进来）
+// 工具来自助手的工具注册表里 external 的那部分，按成员当前角色过滤；注册表里没有发布工具，Agent 只能存草稿。
+// 调用时 actor 带 via: 'mcp'，审计 detail 随之带上。没有这个工具、无权限、输入不对、校验不通过都是 isError 的工具结果，不是 JSON-RPC 错误
+import { invokeTool, TOOLS, toolsFor } from './assistant/tools';
 import type { CurrentMember } from './auth';
 
 const MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -11,7 +13,7 @@ const result = (id: Id, value: unknown) => Response.json({ jsonrpc: '2.0', id, r
 const error = (id: Id, code: number, message: string) => Response.json({ jsonrpc: '2.0', id, error: { code, message } });
 
 /** 处理一条 JSON-RPC 消息；body 是请求体原文。通知（没有 id）回 202 空体 */
-export async function handleMcp(_actor: CurrentMember, body: string): Promise<Response> {
+export async function handleMcp(actor: CurrentMember, body: string): Promise<Response> {
   let msg: unknown;
   try {
     msg = JSON.parse(body);
@@ -22,7 +24,7 @@ export async function handleMcp(_actor: CurrentMember, body: string): Promise<Re
   if (!msg || typeof msg !== 'object' || (msg as { jsonrpc?: unknown }).jsonrpc !== '2.0' || typeof (msg as { method?: unknown }).method !== 'string') {
     return error(null, -32600, '不是合法的 JSON-RPC 2.0 请求');
   }
-  const { method } = msg as { method: string };
+  const { method, params } = msg as { method: string; params?: unknown };
   if (!('id' in msg)) return new Response(null, { status: 202 });
   const rawId = (msg as { id: unknown }).id;
   const id: Id = typeof rawId === 'string' || typeof rawId === 'number' ? rawId : null;
@@ -32,10 +34,30 @@ export async function handleMcp(_actor: CurrentMember, body: string): Promise<Re
     case 'ping':
       return result(id, {});
     case 'tools/list':
-      return result(id, { tools: [] });
+      return result(id, { tools: toolsFor(actor).filter(t => t.external).map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
     case 'tools/call':
-      return error(id, -32602, '没有这个工具');
+      return result(id, await callExternalTool(actor, params));
     default:
       return error(id, -32601, `不支持的方法：${method}`);
+  }
+}
+
+const toolResult = (text: string, isError: boolean) => ({ content: [{ type: 'text', text }], isError });
+
+/**
+ * tools/call：不是 external 的工具当作没有。故意不按 toolsFor 过滤：无权限时让 invokeTool 的 403 说明原样返回。
+ * invokeTool 抛的 data({ message })（4xx）转成 isError 结果，其他异常照旧抛出（500），以免掩盖缺陷
+ */
+async function callExternalTool(actor: CurrentMember, params: unknown) {
+  const { name, arguments: args } = (params ?? {}) as { name?: unknown; arguments?: unknown };
+  const tool = TOOLS.find(t => t.name === name && t.external);
+  if (!tool) return toolResult('没有这个工具', true);
+  try {
+    const r = await invokeTool({ ...actor, via: 'mcp' }, tool.name, args ?? {});
+    return toolResult(r.text, !!r.rejected);
+  } catch (e) {
+    const { data: body, init } = (e ?? {}) as { data?: { message?: unknown }; init?: { status?: number } | null };
+    if (typeof body?.message === 'string' && (init?.status ?? 500) < 500) return toolResult(body.message, true);
+    throw e;
   }
 }
