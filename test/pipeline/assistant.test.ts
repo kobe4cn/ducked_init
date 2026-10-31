@@ -192,7 +192,7 @@ describe('AI 助手起草草稿', () => {
     expect(await getDb().select().from(dslVersions)).toHaveLength(1);
   });
 
-  it('保存映射草稿要 sources:write：分析师没有、强行调用 403，数据工程师可以保存；注册表里没有发布或执行查询的工具', async () => {
+  it('保存映射草稿要 sources:write：分析师没有、强行调用 403，数据工程师可以保存；助手拿不到发布或执行查询的工具', async () => {
     const { acme, author, mappings } = await publishedIdentitySources();
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
 
@@ -200,7 +200,8 @@ describe('AI 助手起草草稿', () => {
     expect(toolsFor(analyst).map(t => t.name)).toContain('save_definition_draft');
     const input = { source: 'CRM', entity: 'customer', yaml: CRM };
     await expect(runTool(analyst, 'save_mapping_draft', input)).rejects.toMatchObject({ init: { status: 403 } });
-    expect(TOOLS.map(t => t.name).filter(n => /publish|query|run_sql|execute/.test(n))).toEqual([]);
+    expect(TOOLS.map(t => t.name).filter(n => /publish/.test(n))).toEqual([]);
+    for (const m of [analyst, author]) expect(toolsFor(m).map(t => t.name).filter(n => /publish|query|run_sql|execute/.test(n))).toEqual([]);
 
     const reply = await runTool({ ...author, via: 'assistant' }, 'save_mapping_draft', input);
     expect(reply).toContain('已保存为草稿：CRM 的 customers → customer 第 2 版');

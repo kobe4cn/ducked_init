@@ -233,6 +233,7 @@ describe('/mcp 工具', () => {
     const analyst = await toolNames(analystToken);
     expect(analyst).toEqual(expect.arrayContaining(['catalog_overview', 'catalog_search', 'validate_definition', 'save_definition_draft']));
     expect(analyst).not.toContain('save_mapping_draft');
+    expect(analyst).not.toContain('run_query');
     expect(await toolNames(engineerToken)).toContain('save_mapping_draft');
     const viewer = await toolNames(viewerToken);
     expect(viewer).toContain('catalog_search');

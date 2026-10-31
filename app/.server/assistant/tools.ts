@@ -1,7 +1,8 @@
 // app/.server/assistant/tools.ts —— AI 助手的工具注册表（ADR-0042）：每个工具登记名称、输入输出 JSON Schema、所需权限与是否允许外部调用
 // （/mcp 的工具从这张表里 external 的那部分生成，外部能用的始终是内部的子集）。成员只看得到自己有权限的工具，调用时再按登记的权限检查一次：成员没有的权限助手也用不了。
 // 工具返回给模型的是文本；校验或保存不通过时另带上问题清单与那一版 YAML（rejected），助手循环据此计数、超过修正次数时交给成员（ADR-0043）。
-// 保存类工具只存草稿，发布照旧双人；注册表里没有发布或执行查询的工具。目录按角色过滤（catalogFor）：没有 sources:read 的成员看不到数据源与源表条目、字段来源与实体映射到的源表（ADR-0005）
+// 保存类工具只存草稿，发布照旧双人；注册表里没有发布工具。执行查询的 run_query 另要令牌的授权（requires: 'allowQuery'）：只有签发时允许执行查询的令牌经 MCP 拿得到，
+// 平台内的助手拿不到（toolsFor 不含、invokeTool 不带授权时 403）；结果按工作台解读的规则剔除列，但对全部返回行判断哈希（ADR-0043）。目录按角色过滤（catalogFor）：没有 sources:read 的成员看不到数据源与源表条目、字段来源与实体映射到的源表（ADR-0005）
 import { Ajv, type ValidateFunction } from 'ajv';
 import { and, eq } from 'drizzle-orm';
 import { data } from 'react-router';
@@ -16,6 +17,8 @@ import { createDefinition, DslError, saveDslDraft, validateDefinition } from '..
 import type { DslIssue } from '../pipeline/dsl/metric-spec';
 import { createMapping, MappingError, saveMappingDraft, validateNewMapping } from '../mappings';
 import { sourceIdByName } from '../source-config';
+import { runQuery, WORKBENCH_ROWS } from '../workbench';
+import { MAX_CELL, redactResult } from '../workbench-ai';
 
 export interface AssistantTool {
   name: string;
@@ -25,6 +28,8 @@ export interface AssistantTool {
   permission: Permission;
   /** 是否允许外部（MCP）调用 */
   external: boolean;
+  /** 除权限外另要的令牌授权：allowQuery 是签发令牌时勾选的「允许执行查询」 */
+  requires?: keyof ToolGrants;
   /** input 已按 inputSchema 校验过；返回给模型的文本，不通过时带上问题清单 */
   run(actor: CurrentMember, input: Record<string, unknown>): Promise<string | ToolResult>;
 }
@@ -207,20 +212,46 @@ export const TOOLS: AssistantTool[] = [
       });
     },
   },
+  {
+    name: 'run_query',
+    description: `按数据查询工作台的规则执行一条只读 SQL（只能读 silver、gold 与自己能读的沙箱表），最多返回 ${WORKBENCH_ROWS} 行。`
+      + `返回 JSON { columns, rows, truncated, dropped }：系统列、名字像敏感字段的列与取值含哈希的列被剔除，列名在 dropped 里；每格最多 ${MAX_CELL} 字`,
+    inputSchema: { type: 'object', required: ['sql'], properties: { sql: { type: 'string' } }, additionalProperties: false },
+    outputSchema: TEXT,
+    permission: 'sandbox',
+    external: true,
+    requires: 'allowQuery',
+    run: async (actor, { sql }) => {
+      // runQuery 自己记 workbench.query（actor 带着 via）；出错时抛 WorkbenchError，由调用方转成工具错误。全部行都交出去，哈希按全部行判断
+      const result = await runQuery(actor, sql as string);
+      const { columns, rows, dropped } = redactResult(result, Infinity);
+      return JSON.stringify({ columns: columns.map(c => c.name), rows, truncated: result.truncated, dropped });
+    },
+  },
 ];
 
-/** 成员可以用的工具：有登记的权限 */
-export const toolsFor = (member: CurrentMember): AssistantTool[] => TOOLS.filter(t => can(member.role, t.permission));
+/** 调用方带着的授权：allowQuery 来自令牌的「允许执行查询」 */
+export interface ToolGrants { allowQuery?: boolean }
+
+const hasGrant = (tool: AssistantTool, tokenGrants: ToolGrants) => !tool.requires || !!tokenGrants[tool.requires];
+
+/** 平台内助手可以用的工具：有登记的权限，不另要授权 */
+export const toolsFor = (member: CurrentMember): AssistantTool[] => TOOLS.filter(t => !t.requires && can(member.role, t.permission));
+
+/** 经 MCP 可以用的工具：external、有登记的权限，另要的授权令牌上有 */
+export const externalToolsFor = (member: CurrentMember, tokenGrants: ToolGrants): AssistantTool[] =>
+  TOOLS.filter(t => t.external && hasGrant(t, tokenGrants) && can(member.role, t.permission));
 
 const ajv = new Ajv({ allErrors: true, strict: false });
 const validators = new Map<string, ValidateFunction>(TOOLS.map(t => [t.name, ajv.compile(t.inputSchema)]));
 
 const badRequest = (message: string) => data({ message }, { status: 400 });
 
-/** 按名字调用工具：没有这个工具或输入不合 Schema 时 400，成员没有登记的权限时 403 */
-export async function invokeTool(actor: CurrentMember, name: string, input: unknown): Promise<ToolResult> {
+/** 按名字调用工具：没有这个工具或输入不合 Schema 时 400，成员没有登记的权限或调用方没有另要的授权时 403 */
+export async function invokeTool(actor: CurrentMember, name: string, input: unknown, tokenGrants: ToolGrants = {}): Promise<ToolResult> {
   const tool = TOOLS.find(t => t.name === name);
   if (!tool) throw badRequest(`没有工具 ${name}`);
+  if (!hasGrant(tool, tokenGrants)) throw data({ message: '没有执行查询的授权：签发令牌时须勾选「允许执行查询」' }, { status: 403 });
   assertCan(actor, tool.permission);
   const validate = validators.get(name)!;
   if (!validate(input)) throw badRequest(`工具 ${name} 的输入不对：${ajv.errorsText(validate.errors, { dataVar: 'input' })}`);

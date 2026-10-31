@@ -10,6 +10,6 @@ export function loader() {
 
 export async function action({ request }: Route.ActionArgs) {
   if (request.method !== 'POST') return Response.json({ error: '只支持 POST' }, { status: 405, headers: { Allow: 'POST' } });
-  const { actor } = await requireMemberToken(request);
-  return handleMcp(actor, await request.text());
+  const { actor, allowQuery } = await requireMemberToken(request);
+  return handleMcp(actor, await request.text(), { allowQuery });
 }

@@ -92,7 +92,7 @@ export async function draftWorkbenchSql(actor: CurrentMember, request: string): 
 /** 解读时发给模型服务的行数 */
 export const INTERPRET_ROWS = 50;
 /** 每格最多的字数与解读最多的字数 */
-const MAX_CELL = 200;
+export const MAX_CELL = 200;
 const MAX_INTERPRETATION = 4000;
 /** 平台的哈希（加盐 sha256）：取值里出现就剔除整列，拼接、取子串等改写也躲不过 */
 const HASH = /[0-9a-f]{64}/i;
@@ -110,9 +110,9 @@ const cellText = (v: unknown): string | null =>
     : typeof v === 'object' ? JSON.stringify(v, (_, x) => (typeof x === 'bigint' ? x.toString() : x))
       : String(v);
 
-/** 每列发不发：系统列、名字像敏感字段的列、前 INTERPRET_ROWS 行里有取值含哈希的列都不发（按位置，重名的列也不会取错） */
-const sendable = (result: WorkbenchResult): boolean[] => {
-  const rows = result.rows.slice(0, INTERPRET_ROWS);
+/** 每列发不发：系统列、名字像敏感字段的列、前 limit 行里有取值含哈希的列都不发（按位置，重名的列也不会取错） */
+const sendable = (result: WorkbenchResult, limit = INTERPRET_ROWS): boolean[] => {
+  const rows = result.rows.slice(0, limit);
   return result.columns.map(({ name }, i) =>
     !isSystemColumn(name) && !looksSensitive({ name }) && !rows.some(row => HASH.test(cellText(row[i]) ?? '')));
 };
@@ -122,6 +122,20 @@ export function pickColumns(result: WorkbenchResult, keep = sendable(result)): {
   return {
     sent: result.columns.filter((_, i) => keep[i]).map(c => c.name),
     dropped: result.columns.filter((_, i) => !keep[i]).map(c => c.name),
+  };
+}
+
+/**
+ * 剔除后交出去的结果：前 limit 行里没被剔除的列，单元格转成字符串、每格最多 MAX_CELL 字；dropped 是剔除的列名。
+ * 哈希按交出去的这些行判断：解读只发前 INTERPRET_ROWS 行，MCP 的 run_query 交出全部行（limit 传 Infinity）
+ */
+export function redactResult(result: WorkbenchResult, limit = INTERPRET_ROWS): { columns: WorkbenchResult['columns']; rows: (string | null)[][]; dropped: string[] } {
+  const keep = sendable(result, limit);
+  const indexes = keep.flatMap((k, i) => (k ? [i] : []));
+  return {
+    columns: indexes.map(i => result.columns[i]),
+    rows: result.rows.slice(0, limit).map(row => indexes.map(i => cellText(row[i])?.slice(0, MAX_CELL) ?? null)),
+    dropped: pickColumns(result, keep).dropped,
   };
 }
 
@@ -147,8 +161,7 @@ export async function previewInterpretation(
   return { rows: sentRows(result), ...pickColumns(result), result };
 }
 
-function interpretMessages(result: WorkbenchResult, indexes: number[]): LlmMessage[] {
-  const rows = result.rows.slice(0, INTERPRET_ROWS).map(row => indexes.map(i => cellText(row[i])?.slice(0, MAX_CELL) ?? null));
+function interpretMessages({ columns, rows }: ReturnType<typeof redactResult>): LlmMessage[] {
   return [
     {
       role: 'system',
@@ -158,7 +171,7 @@ function interpretMessages(result: WorkbenchResult, indexes: number[]): LlmMessa
         `下面是结果的前 ${rows.length} 行（敏感列已剔除，每格最多 ${MAX_CELL} 字）。`,
       ].join('\n'),
     },
-    { role: 'user', content: JSON.stringify({ columns: indexes.map(i => result.columns[i]), rows }) },
+    { role: 'user', content: JSON.stringify({ columns, rows }) },
   ];
 }
 
@@ -177,12 +190,13 @@ export async function interpretResult(
   if (!(await resolveProvider(tenantId))) throw new WorkbenchAiError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务', 409);
   if (conversationId !== null) await assertOwnConversation(actor, conversationId);
   const result = await rerun(actor, sql);
-  const keep = sendable(result);
-  const { sent, dropped } = pickColumns(result, keep);
+  const redacted = redactResult(result);
+  const { dropped } = redacted;
+  const sent = redacted.columns.map(c => c.name);
   if (!sent.length) throw new WorkbenchAiError('没有可以发送的列：结果里的列都是系统列、敏感列或哈希', 400);
   let interpretation: string;
   try {
-    const messages = interpretMessages(result, keep.flatMap((k, i) => (k ? [i] : [])));
+    const messages = interpretMessages(redacted);
     ({ interpretation } = await chatJson<{ interpretation: string }>(tenantId, 'workbench_interpret', messages, INTERPRET_SCHEMA));
   } catch (e) {
     if (e instanceof LlmError) throw new WorkbenchAiError(`模型解读结果失败：${e.message}`, 422);
