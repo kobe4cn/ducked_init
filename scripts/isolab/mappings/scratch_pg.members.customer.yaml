@@ -1,0 +1,14 @@
+# scratch_pg（Postgres）members → 消费者。isolab 自己的上游（iso_scratch，从 crm_mall.users 取前 2000 人），给 SRC-3 改密码、SRC-10 删列、GOV-4 删数据源用
+# 与 mall_pg.users 是同一批人：同一租户里手机相同，身份打通会把两边连成一个统一消费者
+model: 1
+entity: customer
+table: members
+key_space: scratch
+fields:
+  customer_id: string(member_id)
+  name: nickname
+  phone: mobile
+  email: email
+  city: city
+  registered_at: registered_at
+  updated_at: updated_at
