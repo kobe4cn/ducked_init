@@ -37,7 +37,7 @@ async function failedRfm() {
   return { ...fixture, task: task! };
 }
 
-/** 直接改最近一次打通的结果造出 hot（真实打通的统计见 identity.test.ts） */
+/** 直接改最近一次打通的结果造出 hot（真实打通的统计见 identity-stable-id.test.ts） */
 async function fakeHot(tenantId: string, hot: { rule: string; hash: string; records: number; sources: string[] }[]) {
   const { taskId } = (await latestIdentitySummary(tenantId))!;
   const [task] = await getDb().select({ result: tasks.result }).from(tasks).where(eq(tasks.id, taskId));

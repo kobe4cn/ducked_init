@@ -7,7 +7,7 @@
 ```bash
 pnpm test                                    # 全部（按文件并行，较慢；输出写进文件再 grep）
 CRM_TEST_WORKERS=1 pnpm test                 # 只用一个 worker（串行）
-npx vitest run test/pipeline/mapping.test.ts # 单个文件
+npx vitest run test/pipeline/mapping-merge.test.ts # 单个文件
 ```
 
 - `vitest.config.ts` 设好了测试环境的基准值：平台 PG `crm_platform_test`、源库 `crm_source_test`（都在 `localhost:5432`，账号 `crm/crm`）、本地临时目录作数据湖、固定的主密钥、`MAILER=console`、`SOURCE_LARGE_TABLE_ROWS=1000`。
@@ -76,6 +76,20 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 | `seedMysqlSource()` | MySQL 源库，`orders` 带自增主键与 `updated_at`（需 `TEST_MYSQL_URL`） |
 | `seedMongoSource()` / `MONGO_USERS` | MongoDB 源库与几种权限的账号（需 `TEST_MONGO_URL`） |
 
+### `test/pipeline/mapping-fixtures.ts`
+
+映射与合并测试（`mapping-merge`、`mapping-rules`、`mapping-disable`）共用；不依赖 vitest。
+
+| helper | 作用 |
+|---|---|
+| `syncedSource(extra?)` | 开通租户 `acme`，`de@acme.com` 起草、`de2@acme.com` 发布；源库在 `shop` 里另建 `ORDER_LOG`、`POINT_LOGS`、`CONSENTS`、`PREFERENCES`、`COUPON_TEMPLATES`、`COUPONS`（`extra` 是再加的建表 SQL，如 `ORDER_ITEMS`、`CONSENTS_COPY`），登记数据源后 `syncAllTables`；返回 `{ acme, author, reviewer, id, input }` |
+| `syncAllTables(author, id)` | 选入数据源的全部表、确认各表水位线、同步一次并跑空调度器 |
+| `drain()` | 跑空调度器（`maxWorkers: 2`） |
+| `CUSTOMERS` / `ORDERS` / `ORDER_LOG_MAPPING` / `POINT_LOGS_MAPPING` / `CONSENTS_MAPPING` / `PREFERENCES_MAPPING` / `COUPON_TEMPLATES_MAPPING` / `COUPONS_MAPPING` | 上面各源表的映射 YAML |
+| `events(table, column, extra?)` | 写入 `event` 的映射 YAML：`event_id` 取 `table` 的 `column`，`extra` 追加在后 |
+| `mergedMappings(task)` | 合并任务参数里的映射 ID（排序） |
+| `withEnv(vars, fn)` | `fn` 执行期间设置环境变量（调度器派发的工作进程继承），结束后还原 |
+
 ### `test/pipeline/identity-fixtures.ts`
 
 | helper | 作用 |
@@ -92,7 +106,21 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 | `events` | 1500 | 无主键、无水位线 | 超过大表阈值 1000，全量比对、默认每天同步 |
 | `regions` | 2 | 无主键、无水位线 | 小表，全量比对 |
 
-需要别的形状的源表时，在测试里写一段 SQL 用 `grantOnSource` 建表并 `GRANT SELECT ... TO ${READER.user}`（参考 `mapping.test.ts` 里的 `ORDER_LOG`、`POINT_LOGS`、`CONSENTS`、`PREFERENCES`、`COUPON_TEMPLATES`、`COUPONS`）。
+需要别的形状的源表时，在测试里写一段 SQL 用 `grantOnSource` 建表并 `GRANT SELECT ... TO ${READER.user}`（参考 `mapping-fixtures.ts` 里的 `ORDER_LOG`、`POINT_LOGS`、`CONSENTS`、`PREFERENCES`、`COUPON_TEMPLATES`、`COUPONS`）。
+
+### `test/pipeline/identity-helpers.ts`
+
+身份打通测试（`identity-merge`、`identity-recompute`、`identity-stable-id`）共用的读取与操作；不依赖 vitest。
+
+| helper | 作用 |
+|---|---|
+| `identities(tenantId)` | `silver._identities` 的全部行（按 `_source, customer_id` 排序）、整表的 JSON 文本与 `silver._device_owner` 的全部行：`{ rows, text, devices }` |
+| `anonymousEvents(tenantId)` | 匿名事件经设备归属到的统一消费者（没归属时为 null） |
+| `consumerConsent(con, sourceId, customerId)` | 某条源记录所属统一消费者在 `silver._consumer_consent` 里的各渠道状态与来源 |
+| `groupsOf(rows, names)` | 按统一消费者分组成「数据源名:customer_id」列表，便于整体比较 |
+| `lastMerge(tenantId)` | 本租户最近一次 `silver.merge` 任务 |
+| `republish(author, reviewer, mappingId, yaml)` | 存一版新草稿、另一位成员发布并跑空调度器 |
+| `SEEDED` / `drain()` / `Identity` / `DeviceOwner` | 种子里的明文（断言表里没有明文）、跑空调度器、行类型 |
 
 ### `test/pipeline/llm-fixtures.ts`
 
@@ -156,7 +184,7 @@ describe('<功能>', () => {
 });
 ```
 
-需要原始层有数据时，在 `tenantWithSource` 之后确认水位线并同步：`confirmWatermark(member, sourceId, 'customers', 'updated_at')`、`syncSource(member, sourceId)`，再 `drain()`（完整例子见 `mapping.test.ts` 的 `syncedSource`）。读标准层用 `silver`；读写数据湖里别的表用 `onLake`，要在同一会话里多次读时用 `openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 })`，用完 `session.close()`（例子见 `fixtures.ts` 的 `silver`、`pii.test.ts` 的 `silverDump`）。
+需要原始层有数据时，在 `tenantWithSource` 之后确认水位线并同步：`confirmWatermark(member, sourceId, 'customers', 'updated_at')`、`syncSource(member, sourceId)`，再 `drain()`（完整例子见 `mapping-fixtures.ts` 的 `syncedSource`）。读标准层用 `silver`；读写数据湖里别的表用 `onLake`，要在同一会话里多次读时用 `openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 })`，用完 `session.close()`（例子见 `fixtures.ts` 的 `silver`、`pii.test.ts` 的 `silverDump`）。
 
 ## 新建一个 HTTP 测试
 
