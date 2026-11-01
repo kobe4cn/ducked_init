@@ -15,6 +15,7 @@ import { sensitivePlanColumns } from './pipeline/merge-engine';
 import { readSensitive, RevealError } from './pipeline/reveal-engine';
 import { tenantPiiSalt } from './secrets';
 import { entityLabel, entityOf } from '../lib/canonical-model';
+import { cmp, cmpName } from '../lib/compare';
 
 /** 可以展示给管理员的业务错误 */
 export class PiiError extends Error {
@@ -41,7 +42,7 @@ export async function revealableMappings(actor: CurrentMember) {
   return (await publishedMappings(actor.tenant.id))
     .map(p => ({ id: p.mapping, sourceName: p.sourceName, table: p.table, entity: entityLabel(p.entity), fields: sensitivePlanColumns(p).map(c => fieldLabel(p.entity, c.name)) }))
     .filter(m => m.fields.length)
-    .sort((a, b) => a.entity.localeCompare(b.entity) || a.sourceName.localeCompare(b.sourceName) || a.table.localeCompare(b.table));
+    .sort((a, b) => cmpName(a.entity, b.entity) || cmpName(a.sourceName, b.sourceName) || cmp(a.table, b.table));
 }
 
 /** 解密映射 mappingId 所在源表里主键为 key 的记录的敏感字段，写一条审计后返回明文 */

@@ -36,6 +36,7 @@ import { mappingDrift } from './source-drift';
 import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
 import { CANONICAL_ENTITIES, type CustomEntityField, entityLabel, entityOf, type EntityRelation, type RelationStat, relationText } from '../lib/canonical-model';
+import { cmp, cmpName } from '../lib/compare';
 import { entityForTable } from '../lib/field-synonyms';
 import { diffPlans } from '../lib/mapping-diff';
 import { newExtension, readExtensions, writeExtension } from '../lib/mapping-form';
@@ -140,13 +141,13 @@ export async function referenceTables(actor: CurrentMember, sourceId: string): P
     if (p.entity === 'customer' && p.sourceId !== sourceId) withCustomer.add(p.sourceId);
   }
   const names = withCustomer.size ? await sourceNames(getDb(), actor.tenant.id) : new Map<string, string>();
-  const otherCustomerSources = [...withCustomer].map(id => ({ id, name: names.get(id)! })).sort((a, b) => a.name.localeCompare(b.name));
+  const otherCustomerSources = [...withCustomer].map(id => ({ id, name: names.get(id)! })).sort((a, b) => cmpName(a.name, b.name));
   const relationOrigins: Record<string, Record<string, string>> = {};
   for (const r of [...(await publishedCustomEntities(getDb(), actor.tenant.id)).values()].flatMap(e => e.relations ?? [])) {
     (relationOrigins[r.from.entity] ??= {})[r.from.field] = r.ref.entity;
   }
   const views = (await publishedViews(getDb(), actor.tenant.id, { sourceId })).filter(v => v.columns)
-    .sort((a, b) => a.name.localeCompare(b.name))
+    .sort((a, b) => cmp(a.name, b.name))
     .map(v => ({
       name: v.name, view: true as const, sampleRows: 0, primaryKey: [] as string[], watermark: null, keySpaces, customerSources: otherCustomerSources, relationOrigins,
       columns: v.columns!.map(c => ({ name: c.name, type: c.type, nullRate: 0, distinct: 0, top: null, formats: [] })),
@@ -1095,7 +1096,7 @@ export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId
   const views = await publishedViews(db, tenantId, { viewIds: [...new Set(rows.flatMap(r => (r.viewId ? [r.viewId] : [])))] });
   const uniqueByEntity = uniqueKeys(await publishedCustomEntities(db, tenantId));
   const plans: MergeMappingParam[] = rows
-    .sort((a, b) => a.mapping.localeCompare(b.mapping))
+    .sort((a, b) => cmp(a.mapping, b.mapping))
     .map(({ viewId, ...r }) => {
       const view = views.find(v => v.id === viewId);
       const unique = uniqueByEntity.get(r.plan.entity);
@@ -1146,7 +1147,7 @@ const survivorshipPriority = (plans: MergeMappingParam[]): Record<string, number
   Object.fromEntries(plans.filter(p => p.entity === 'customer' && p.survivorship).map(p => [p.mapping, p.survivorship!.priority]));
 
 /** 名次表按映射 ID 排好的键值对，用来比对是否变了（早先的合并参数里没有这一项，等同于空表） */
-const rankEntries = (ranks: unknown) => Object.entries((ranks ?? {}) as Record<string, number>).sort(([a], [b]) => a.localeCompare(b));
+const rankEntries = (ranks: unknown) => Object.entries((ranks ?? {}) as Record<string, number>).sort(([a], [b]) => cmp(a, b));
 
 /** 排好序的排除列表，用来比对是否变了（早先的合并参数里没有这一项，等同于空列表） */
 const sortedHashes = (hashes: unknown) => [...((hashes ?? []) as string[])].sort();
@@ -1210,7 +1211,7 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
   const merged = [
     ...queued.filter(q => !plans.some(p => p.mapping === q.mapping) && !drop.some(d => d.mapping === q.mapping)),
     ...plans.map(p => (queued.some(q => q.mapping === p.mapping && q.rebuild) ? { ...p, rebuild: true } : p)),
-  ].sort((a, b) => a.mapping.localeCompare(b.mapping));
+  ].sort((a, b) => cmp(a.mapping, b.mapping));
   // 领取合并不锁租户行：只在它仍在排队时改参数
   const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, ...(drop.length > 0 && { drop }), identity, survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: pending.params.identityForce === true || force } })
     .where(and(eq(tasks.id, pending.id), eq(tasks.status, 'queued'))).returning();
