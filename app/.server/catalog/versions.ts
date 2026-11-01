@@ -15,7 +15,7 @@ export const CATALOG_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   'source.scope_changed', 'source.registered', 'source.updated', 'source.deleted',
   'definition.published', 'definition.deleted',
   'template.published', 'template.auto_enabled',
-  'business_note.updated',
+  'business_note.updated', 'alias.added', 'alias.retired',
 ]);
 
 /**

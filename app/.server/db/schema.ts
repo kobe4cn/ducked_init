@@ -720,6 +720,27 @@ export const businessNotes = platform.table('business_notes', {
   createdAt: createdAt(),
 }, t => [index('business_notes_tenant_field_idx').on(t.tenantId, t.entity, t.field, t.mappingId, t.createdAt)]);
 
+// 别名（ADR-0046）：成员给目录条目加的本租户说法，只加和停用、不改名，停用的行留着（retired_at）。target_id 是目录条目标识
+// （entity:x、field:e.f、metric:k、tag:k），mapping_id 非空是某个映射里这个字段的别名。based_on 是加别名时依据的摘要 [{id, hash}]：
+// 指标与标签是已发布版本 YAML 的摘要，映射字段是该映射已发布计划的摘要，实体与普通字段为空（knowledge/basis.ts）。
+// 同一目标（不分大小写）同时只有一个未停用的同名别名
+export const knowledgeAliases = platform.table('knowledge_aliases', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  targetId: text('target_id').notNull(),
+  mappingId: uuid('mapping_id').references(() => mappings.id, { onDelete: 'cascade' }),
+  alias: text('alias').notNull(),
+  basedOn: jsonb('based_on').$type<{ id: string; hash: string }[]>().notNull().default([]),
+  createdByEmail: text('created_by_email').notNull(),
+  createdAt: createdAt(),
+  retiredByEmail: text('retired_by_email'),
+  retiredAt: timestamp('retired_at', { withTimezone: true }),
+}, t => [
+  uniqueIndex('knowledge_aliases_active_uq')
+    .on(t.tenantId, t.targetId, sql`coalesce(${t.mappingId}, '00000000-0000-0000-0000-000000000000'::uuid)`, sql`lower(${t.alias})`)
+    .where(sql`retired_at is null`),
+]);
+
 // 语义目录的版本（ADR-0041）：目录的结构或含义变了才记一版。snapshot 是去掉统计后的全部条目，diff 是与上一版按条目标识比出的差异；
 // reason 是触发的审计动作（或 catalog.initial 之类）
 export const catalogVersions = platform.table('catalog_versions', {

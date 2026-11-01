@@ -225,6 +225,9 @@ const ACTIONS = {
     label: '修改业务说明',
     describe: (d: Detail) => `${d.entity}.${d.field}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}`,
   },
+  // 别名（ADR-0046）：不记别名原文
+  'alias.added': { label: '添加别名', describe: (d: Detail) => `${d.targetId}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}` },
+  'alias.retired': { label: '停用别名', describe: (d: Detail) => `${d.targetId}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}` },
   'merge_group.saved': {
     label: '保存合并组草稿',
     describe: (d: Detail) => `${entityLabel(String(d.entity))}，第 ${d.version} 版草稿，${(d.members as string[]).length} 个映射，${d.rule}`,

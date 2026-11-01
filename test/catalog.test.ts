@@ -2,6 +2,7 @@
 // 敏感字段、哈希列与系统列不进目录（纯函数，手工构造 CatalogInput）
 import { describe, expect, it } from 'vitest';
 import { buildCatalog, estimateTokens, expand, overview, search, toJson, toMarkdown, type CatalogInput } from '../app/.server/catalog';
+import { knowledgeKey } from '../app/.server/knowledge/catalog';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
 
 const plan = (over: Partial<MergeMappingParam> = {}): MergeMappingParam => ({
@@ -282,6 +283,51 @@ describe('语义目录', () => {
     for (const id of ['metric:revenue', 'metric:store_orders', 'tag:spender', 'template:rfm', 'capability:metric-dsl']) expect(ov).toContain(`- ${id} `);
     expect(search(c, '消费金额')[0]?.id).toBe('metric:revenue');
     expect(toJson(overview(buildCatalog(withDefinitions(5))))).toBe(toJson(overview(c)));
+  });
+
+  it('条目带 knowledge.aliases 时搜索与 Markdown 含别名（映射字段的在血缘项下）；挂不上的丢掉，没有知识时条目没有 knowledge 键', () => {
+    const base = (): CatalogInput => ({
+      ...input(),
+      definitions: [{ kind: 'metric', key: 'revenue', version: 2, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\n' }],
+    });
+    const plain = buildCatalog(base());
+    const c = buildCatalog({
+      ...base(),
+      knowledge: {
+        byTarget: new Map([
+          [knowledgeKey('entity:order'), { aliases: ['交易单'] }],
+          [knowledgeKey('field:order.status'), { aliases: ['单据状态'] }],
+          [knowledgeKey('field:order.status', 'm-order'), { aliases: ['商城状态'] }],
+          [knowledgeKey('metric:revenue'), { aliases: ['营收', 'GMV'] }],
+          [knowledgeKey('metric:gone'), { aliases: ['幽灵指标'] }],
+          [knowledgeKey('field:order.status', 'm-gone'), { aliases: ['幽灵映射'] }],
+          [knowledgeKey('entity:customer'), { aliases: [] }],
+        ]),
+      },
+    });
+    expect(expand(c, 'entity:order')).toMatchObject({ knowledge: { aliases: ['交易单'] } });
+    expect(expand(c, 'metric:revenue')).toMatchObject({ knowledge: { aliases: ['营收', 'GMV'] } });
+    const status = expand(c, 'field:order.status');
+    expect(status).toMatchObject({ knowledge: { aliases: ['单据状态'] } });
+    const lineage = status?.kind === 'field' ? status.lineage : [];
+    expect(lineage.find(l => l.source === '商城')).toMatchObject({ knowledge: { aliases: ['商城状态'] } });
+    const orderId = expand(c, 'field:order.order_id');
+    expect(orderId?.kind === 'field' && orderId.lineage.length > 1 && orderId.lineage.every(l => !('knowledge' in l))).toBe(true);
+    expect(expand(c, 'entity:customer')).not.toHaveProperty('knowledge');
+
+    expect(search(c, '交易单')[0]?.id).toBe('entity:order');
+    expect(search(c, '单据状态')[0]?.id).toBe('field:order.status');
+    expect(search(c, '商城状态').map(e => e.id)).toContain('field:order.status');
+    expect(search(c, 'gmv')[0]?.id).toBe('metric:revenue');
+    expect(toMarkdown(expand(c, 'metric:revenue')!)).toContain('- 别名：营收、GMV');
+    const md = toMarkdown(status!);
+    expect(md).toContain('- 别名：单据状态');
+    expect(md).toContain('    - 别名：商城状态');
+    expect(toJson(c.entries)).not.toMatch(/幽灵/);
+
+    // 没有知识时与不给 knowledge 一样
+    expect(toJson(buildCatalog({ ...base(), knowledge: { byTarget: new Map() } }).entries)).toBe(toJson(plain.entries));
+    expect(plain.entries.some(e => 'knowledge' in e || (e.kind === 'field' && e.lineage.some(l => 'knowledge' in l)))).toBe(false);
   });
 
   it('敏感字段、哈希列与系统列不出现在任何输出里', () => {

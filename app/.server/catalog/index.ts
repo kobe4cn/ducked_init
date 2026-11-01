@@ -4,7 +4,9 @@
 // 纯函数，不连库（加载见 load.ts）。敏感字段、哈希列与系统列不进目录（ADR-0005）；同步范围外的源表不收（ADR-0013）。
 // 源表、实体与字段展开时带统计与截至时间（行数、空值率、日期 / 时间列的范围与 ADR-0016 的常见取值），统计不进总览。
 // 定义条目只给键、说明、度量 / 取值与依赖，不给结果数据；模板条目给产出列与最近一次快照的表名、行数与时间。
-// 字段带实体字段的业务说明，各映射血缘带映射字段的业务说明（当前内容，清空的不给），都参与搜索、不进总览
+// 字段带实体字段的业务说明，各映射血缘带映射字段的业务说明（当前内容，清空的不给），都参与搜索、不进总览。
+// 实体、字段、指标、标签与各映射血缘可带业务知识（knowledge，见 knowledge/catalog.ts），同样参与搜索、不进总览；映射字段的知识挂在血缘项上，
+// 没有 sources:read 时随血缘一起去掉
 import { parse } from 'yaml';
 import { CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, type CustomEntityField, type EntityRelation, type FieldType } from '../../lib/canonical-model';
 import { noteKey } from '../../lib/business-note-key';
@@ -22,6 +24,7 @@ import { TEMPLATES, type TemplateId } from '../pipeline/templates';
 import { SILVER_SYSTEM_COLUMNS, type MergeMappingParam } from '../pipeline/merge-engine';
 import type { ColumnProfile } from '../pipeline/source-engine';
 import { PLATFORM_COLUMNS } from '../pipeline/sync-engine';
+import { knowledgeKey, knowledgeMarkdown, knowledgeText, presentKnowledge, type Knowledge, type KnowledgeInput } from '../knowledge/catalog';
 import { CAPABILITIES, TEMPLATE_OUTPUTS } from './capabilities';
 
 /** 生成目录的元数据；各部分都可以不给 */
@@ -48,6 +51,8 @@ export interface CatalogInput {
   templates?: { template: TemplateId; version: number; params: Record<string, unknown>; snapshot: TemplateSnapshot | null }[];
   /** 业务说明的当前内容（currentNotes）：键是 noteKey，空串是已清空 */
   notes?: ReadonlyMap<string, string>;
+  /** 业务知识（loadKnowledge）：按 knowledgeKey 挂到条目或映射血缘上，挂不上的（目标已不在目录里）丢掉 */
+  knowledge?: KnowledgeInput;
 }
 
 /** 模板最近一次没过期的快照：表名、行数与登记时间 */
@@ -86,6 +91,8 @@ export interface EntityEntry extends Base {
   mergeGroups: { rule: string; members: string[] }[];
   /** 从没合并成功过时为 null */
   stats: { rows: number; at: string } | null;
+  /** 业务知识；没有时没有 */
+  knowledge?: Knowledge;
 }
 
 /** 字段在一个映射里的来源 */
@@ -95,12 +102,16 @@ export interface FieldLineageItem {
   sample: ColumnStats[];
   /** 映射字段的业务说明：这个数据源在这个字段上的特殊之处；没有或已清空时没有 */
   note?: string;
+  /** 映射字段的业务知识；没有时没有 */
+  knowledge?: Knowledge;
 }
 
 export interface FieldEntry extends Base {
   kind: 'field'; entity: string; field: string; type: FieldType; enum?: string[]; lineage: FieldLineageItem[];
   /** 实体字段的业务说明（本租户的口径）；没有或已清空时没有 */
   note?: string;
+  /** 业务知识；没有时没有 */
+  knowledge?: Knowledge;
 }
 
 export interface RelationEntry extends Base { kind: 'relation'; from: string; to: string }
@@ -114,6 +125,8 @@ export interface MetricEntry extends Base {
   measure: string;
   dimensions: string[];
   dependencies: DefinitionDependencies;
+  /** 业务知识；没有时没有 */
+  knowledge?: Knowledge;
 }
 
 export interface TagEntry extends Base {
@@ -121,6 +134,8 @@ export interface TagEntry extends Base {
   /** 规则与 default 给出的取值，按出现顺序去重 */
   values: (string | number)[];
   dependencies: DefinitionDependencies;
+  /** 业务知识；没有时没有 */
+  knowledge?: Knowledge;
 }
 
 export interface TemplateEntry extends Base {
@@ -253,6 +268,11 @@ export function buildCatalog(input: CatalogInput): Catalog {
   const groups = new Map((input.mergeGroups ?? []).map(g => [g.entity, g]));
   // 业务说明的当前内容；空串（已清空）当作没有。敏感字段整个不进目录，说明也就不进
   const note = (entity: string, field: string, mapping: string | null = null) => input.notes?.get(noteKey(entity, field, mapping)) || undefined;
+  // 业务知识：只挂在目录里有的条目与血缘上，目标不在了（映射停用、定义删除）就不出现
+  const knowledgeOf = (targetId: string, mapping: string | null = null) => {
+    const k = presentKnowledge(input.knowledge?.byTarget.get(knowledgeKey(targetId, mapping)));
+    return k && { knowledge: k };
+  };
 
   for (const e of entities) {
     const mapped = entityFields(lineage, e.name, e.declared, {});
@@ -267,6 +287,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
       entries.push({
         kind: 'field', id: fieldId(e.name, f.name), name: f.label, description: f.description,
         entity: entityId(e.name), field: f.name, type: f.type, ...(f.enum && { enum: f.enum }), ...(fieldNote && { note: fieldNote }),
+        ...knowledgeOf(fieldId(e.name, f.name)),
         lineage: origins.map(s => {
           const p = plans.find(x => x.mapping === s.mapping);
           const stats = p && !p.sourceView ? statsByTable.get(tableKey(p.sourceId, p.table)) : undefined;
@@ -275,6 +296,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
             source: s.sourceName, table: s.table, expr: s.expr, sourceColumns: s.sourceColumns, dictionary: s.dictionary,
             sample: s.sourceColumns.flatMap(name => stats?.columns.filter(c => c.name === name) ?? []),
             ...(mappingNote && { note: mappingNote }),
+            ...knowledgeOf(fieldId(e.name, f.name), s.mapping),
           };
         }),
       });
@@ -289,6 +311,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
       relations: relations.filter(r => r.from.entity === e.name).map(r => relationId(r.from.entity, r.from.field)).sort(cmp),
       mergeGroups: group && members.length ? [{ rule: ruleText(group.rule), members: [...new Set(members)] }] : [],
       stats: statsByEntity.get(e.name) ?? null,
+      ...knowledgeOf(entityId(e.name)),
     });
   }
 
@@ -343,14 +366,14 @@ export function buildCatalog(input: CatalogInput): Catalog {
       entries.push({
         kind: 'metric', id: metricId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version,
         base: entityId(spec.base), measure: measureText(spec.measure), dimensions: (spec.dimensions ?? []).map(x => x.name),
-        dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)),
+        dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)), ...knowledgeOf(metricId(d.key)),
       });
     } else {
       const spec = parse(d.yaml) as TagSpec;
       const values = [...(Array.isArray(spec.rules) ? spec.rules.map(r => r?.value) : []), spec.default].filter(v => typeof v === 'string' || typeof v === 'number');
       entries.push({
         kind: 'tag', id: tagId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version,
-        values: [...new Set(values)], dependencies: dependencyIds(DSL_KINDS.tag.dependencies(spec)),
+        values: [...new Set(values)], dependencies: dependencyIds(DSL_KINDS.tag.dependencies(spec)), ...knowledgeOf(tagId(d.key)),
       });
     }
   }
@@ -421,10 +444,11 @@ function terms(query: string): string[] {
   return [...out];
 }
 
-/** 条目参与搜索的文字：标识、名称、说明、枚举与标签取值，字段再加业务说明与各映射字段说明，能力说明再加各项说明 */
+/** 条目参与搜索的文字：标识、名称、说明、枚举与标签取值、业务知识，字段再加业务说明与各映射字段的说明与知识，能力说明再加各项说明 */
 const haystack = (e: CatalogEntry) => [
   e.id, e.name, e.description,
-  ...(e.kind === 'field' ? [...(e.enum ?? []), e.note ?? '', ...e.lineage.map(l => l.note ?? '')] : []),
+  ...('knowledge' in e ? [knowledgeText(e.knowledge)] : []),
+  ...(e.kind === 'field' ? [...(e.enum ?? []), e.note ?? '', ...e.lineage.flatMap(l => [l.note ?? '', knowledgeText(l.knowledge)])] : []),
   ...(e.kind === 'tag' ? e.values.map(String) : []),
   ...(e.kind === 'capability' ? e.sections.flatMap(s => [s.title, ...s.items.flatMap(i => [i.name, i.description])]) : []),
 ].join('\n').toLowerCase();
@@ -473,7 +497,7 @@ function overviewMarkdown(o: Overview): string {
 }
 
 function entryMarkdown(e: CatalogEntry): string {
-  const head = [`## ${e.id} ${e.name}`, ...(e.description ? ['', e.description] : []), ''];
+  const head = [`## ${e.id} ${e.name}`, ...(e.description ? ['', e.description] : []), '', ...('knowledge' in e ? knowledgeMarkdown(e.knowledge) : [])];
   switch (e.kind) {
     case 'source':
       return [...head, `- 类型：${e.sourceKind}`, `- 源表：${e.tables.join(', ') || '无'}`].join('\n');
@@ -495,6 +519,7 @@ function entryMarkdown(e: CatalogEntry): string {
         ...(e.lineage.length
           ? ['- 来源：', ...e.lineage.flatMap(l => [`  - ${l.source}/${l.table}：${code(l.expr)}${l.dictionary ? '（经值字典）' : ''}`,
             ...(l.note ? [`    - 映射说明：${l.note}`] : []),
+            ...knowledgeMarkdown(l.knowledge, '    '),
             ...l.sample.map(c => `    - 源端样本 ${code(c.name)}：${columnStatsText(c)}`)])]
           : ['- 来源：未映射'])].join('\n');
     case 'relation':
