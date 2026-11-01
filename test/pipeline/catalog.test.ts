@@ -1,7 +1,8 @@
 // test/pipeline/catalog.test.ts —— 语义目录的加载（ADR-0041）：tenantCatalog 从平台库读出数据源、同步范围内的源表、已发布映射与自定义实体，
 // 生成总览与条目；同步范围内还没映射的源表标「未映射」，范围外的不收，敏感字段与它们引用的源列不进目录；
 // 源表带采集统计，实体带合并行数，字段带所映射源列的源端样本统计；发布的指标能展开、能按说明搜到，模板带产出列与最近一次快照；
-// 实体字段与映射字段的业务说明保存后马上进目录、能搜到，清空后不再出现，敏感字段的说明不进目录；
+// 实体字段与映射字段的业务说明保存后马上进目录、能搜到，清空后不再出现，敏感字段的说明不进目录；实体、已发布指标与标签的业务说明进 knowledge.note，
+// 记审计（detail 只有 targetId）与一版目录，每次保存都存依据摘要；
 // 映射发布、确认停用、定义发布与业务说明保存各记一版目录版本（原因是审计动作），目录没变的不记，可以取某版以来的差异；
 // 自定义实体、合并组、源视图、同步范围、指标 / 标签 / 模板的发布与删除数据源也各记一版（删除后它的源表与源视图不再进目录）；源表加删列后重新采集记一版（source.profiled），只改统计的同步不记；
 // 目录与最新一版不一致而没有事件记录时（能力说明变了），tenantCatalog 读取时补记一版，还没有版本的租户读取时记第 1 版，补记不与先锁租户行的事务死锁
@@ -10,10 +11,10 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand, overview, search, toJson, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { catalogChangesSince, recordCatalogVersion } from '../../app/.server/catalog/versions';
-import { saveBusinessNote } from '../../app/.server/business-notes';
+import { saveBusinessNote, targetNoteHistory } from '../../app/.server/business-notes';
 import { createCustomEntity, deleteCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { catalogVersions } from '../../app/.server/db/schema';
+import { auditLogs, businessNotes, catalogVersions } from '../../app/.server/db/schema';
 import { createDefinition, discardDslDraft, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { confirmDisable, lockTenant, requestDisable } from '../../app/.server/mappings';
 import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-groups';
@@ -164,6 +165,74 @@ describe('语义目录的加载', () => {
     expect(expand(c, 'field:order.status')).not.toHaveProperty('note');
     expect(toJson(c.entries)).not.toMatch(/退款单也算|取消单/);
     expect(search(c, '取消单')).toEqual([]);
+  });
+
+  it('实体、指标、标签的业务说明进 knowledge.note、能搜到、留历史，清空后不出现（标签先留着、最后再清空）；记审计与一版目录，存依据摘要；目标不存在或未发布 400，查看者 403', async () => {
+    const { acme, author, reviewer, orderMappings } = await publishedIdentitySources({ orders: true });
+    await createDefinition(author, 'metric', 'paid_revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 1);
+    await createDefinition(author, 'tag', 'spender', 'metric: paid_revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n');
+    await publishDefinition(reviewer, 'tag', 'spender', 1);
+    await createDefinition(author, 'metric', 'draft_only', 'base: order\nmeasure: { agg: count }\n');
+    const viewer = await memberOf(acme, 'view@acme.com', 'viewer');
+
+    await expectBump(acme, 'business_note.updated', () => saveBusinessNote(author, { targetId: 'entity:order', note: '  一张订单对应一次结账  ' }));
+    await saveBusinessNote(author, { targetId: 'metric:paid_revenue', note: '扣掉优惠券之后的实付' });
+    await saveBusinessNote(author, { targetId: 'tag:spender', note: '高消费人群看实付不看下单' });
+    await saveBusinessNote(author, { targetId: 'metric:paid_revenue', note: '扣掉优惠券与包邮补贴之后的实付' });
+
+    let c = await tenantCatalog(acme);
+    expect(expand(c, 'entity:order')).toMatchObject({ knowledge: { note: '一张订单对应一次结账' } });
+    expect(expand(c, 'metric:paid_revenue')).toMatchObject({ knowledge: { note: '扣掉优惠券与包邮补贴之后的实付' } });
+    expect(expand(c, 'tag:spender')).toMatchObject({ knowledge: { note: '高消费人群看实付不看下单' } });
+    expect(toMarkdown(expand(c, 'metric:paid_revenue')!)).toContain('业务说明：扣掉优惠券与包邮补贴之后的实付');
+    expect(search(c, '结账')[0]?.id).toBe('entity:order');
+    expect(search(c, '包邮补贴')[0]?.id).toBe('metric:paid_revenue');
+    expect(search(c, '高消费人群')[0]?.id).toBe('tag:spender');
+    expect((await targetNoteHistory(getDb(), acme, 'metric:paid_revenue')).map(v => [v.note, v.by]))
+      .toEqual([['扣掉优惠券之后的实付', author.email], ['扣掉优惠券与包邮补贴之后的实付', author.email]]);
+
+    // 审计 detail 只有 targetId，不含正文；依据摘要：指标与标签有已发布 YAML 的摘要，实体为 []
+    const audits = await getDb().select().from(auditLogs)
+      .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'business_note.updated'))).orderBy(auditLogs.createdAt);
+    expect(audits.map(a => [a.targetId, a.detail])).toEqual([
+      ['entity:order', { targetId: 'entity:order' }], ['metric:paid_revenue', { targetId: 'metric:paid_revenue' }],
+      ['tag:spender', { targetId: 'tag:spender' }], ['metric:paid_revenue', { targetId: 'metric:paid_revenue' }],
+    ]);
+    const rows = await getDb().select().from(businessNotes).where(eq(businessNotes.tenantId, acme)).orderBy(businessNotes.createdAt);
+    expect(rows.map(r => [r.targetId, r.entity, r.field, r.basedOn.map(b => b.id)])).toEqual([
+      ['entity:order', null, null, []], ['metric:paid_revenue', null, null, ['metric:paid_revenue']],
+      ['tag:spender', null, null, ['tag:spender']], ['metric:paid_revenue', null, null, ['metric:paid_revenue']],
+    ]);
+    // 字段与映射字段的保存也存依据摘要，且不混进实体等的说明
+    await saveBusinessNote(author, { entity: 'order', field: 'status', mappingId: orderMappings!.loyalty, note: '会员系统的取消单不进同步' });
+    const [mapped] = await getDb().select().from(businessNotes)
+      .where(and(eq(businessNotes.tenantId, acme), eq(businessNotes.field, 'status')));
+    expect(mapped!.basedOn).toEqual([{ id: `mapping:${orderMappings!.loyalty}`, hash: expect.stringMatching(/^[0-9a-f]{64}$/) }]);
+    expect(mapped!.targetId).toBeNull();
+
+    // 不合法的目标 400、查看者 403，都不留记录
+    const count = async () => (await getDb().select().from(businessNotes).where(eq(businessNotes.tenantId, acme))).length;
+    const before = await count();
+    for (const targetId of ['entity:nope', 'metric:draft_only', 'metric:nope', 'tag:nope', 'field:order.status', 'source:x', '', 42]) {
+      await expect(saveBusinessNote(author, { targetId, note: '说明' }), String(targetId)).rejects.toMatchObject({ status: 400 });
+    }
+    await expect(saveBusinessNote(viewer, { targetId: 'entity:order', note: '说明' })).rejects.toMatchObject({ init: { status: 403 } });
+    expect(await count()).toBe(before);
+
+    // 清空后不再出现
+    await saveBusinessNote(author, { targetId: 'metric:paid_revenue', note: '' });
+    await saveBusinessNote(author, { targetId: 'entity:order', note: '' });
+    c = await tenantCatalog(acme);
+    expect(expand(c, 'metric:paid_revenue')).not.toHaveProperty('knowledge');
+    expect(expand(c, 'entity:order')).not.toHaveProperty('knowledge');
+    expect(search(c, '包邮补贴')).toEqual([]);
+    expect(search(c, '结账')).toEqual([]);
+    expect(expand(c, 'tag:spender')).toMatchObject({ knowledge: { note: '高消费人群看实付不看下单' } });
+    await saveBusinessNote(author, { targetId: 'tag:spender', note: '' });
+    c = await tenantCatalog(acme);
+    expect(expand(c, 'tag:spender')).not.toHaveProperty('knowledge');
+    expect(search(c, '高消费人群').map(r => r.id)).not.toContain('tag:spender');
   });
 
   it('映射发布、业务说明、定义发布与确认停用各记一版，原因是审计动作；目录没变、起草与丢弃草稿不记；可取某版以来的差异，总览带版本号', async () => {

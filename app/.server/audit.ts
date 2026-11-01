@@ -229,7 +229,8 @@ const ACTIONS = {
   'custom_entity.deleted': { label: '删除自定义实体', describe: (d: Detail) => `${d.name}` },
   'business_note.updated': {
     label: '修改业务说明',
-    describe: (d: Detail) => `${d.entity}.${d.field}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}`,
+    // 实体、指标、标签的说明 detail 只有 targetId
+    describe: (d: Detail) => (d.targetId ? knowledgeTarget(d) : `${d.entity}.${d.field}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}`),
   },
   // 别名（ADR-0046）：不记别名原文
   'alias.added': { label: '添加别名', describe: knowledgeTarget },

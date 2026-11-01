@@ -1,6 +1,6 @@
 // app/.server/db/schema.ts —— 平台元数据（平台 PostgreSQL 的 platform schema）。业务数据不落这里（ADR-0002）
 import { sql } from 'drizzle-orm';
-import { bigint, boolean, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, check, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import type { CustomEntityField, CustomEntityKind, EntityRelation } from '../../lib/canonical-model';
 import type { MergeRule } from '../../lib/merge-groups';
 import { ROLES } from '../../lib/roles';
@@ -707,18 +707,27 @@ export const mappingGenerations = platform.table('mapping_generations', {
   createdAt: createdAt(),
 }, t => [index('mapping_generations_tenant_created_idx').on(t.tenantId, t.createdAt)]);
 
-// 业务说明（ADR-0041）：成员给实体字段写的本租户通用口径，只追加、留历史，不走双人发布。当前说明取同一 (entity, field, mapping_id) 最新的一行，
-// 空串表示已清空。mapping_id 为空是实体字段的说明，非空是某个映射里这个字段的说明
+// 业务说明（ADR-0041、ADR-0046）：成员给目录条目写的本租户通用口径，只追加、留历史，不走双人发布。两种行：
+// 字段类（实体字段与映射字段）写 entity / field / mapping_id、target_id 为空，当前说明取同一 (entity, field, mapping_id) 最新的一行，
+// mapping_id 为空是实体字段的说明，非空是某个映射里这个字段的说明；实体、指标、标签的说明只写 target_id（entity:x、metric:k、tag:k），entity 与 field 为空，
+// 取同一 target_id 最新的一行。空串表示已清空。based_on 是保存时依据的摘要（knowledge/basis.ts），旧行不回填（为 []）
 export const businessNotes = platform.table('business_notes', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
-  entity: text('entity').notNull(),
-  field: text('field').notNull(),
+  entity: text('entity'),
+  field: text('field'),
   mappingId: uuid('mapping_id').references(() => mappings.id, { onDelete: 'cascade' }),
+  targetId: text('target_id'),
   note: text('note').notNull(),
+  basedOn: jsonb('based_on').$type<{ id: string; hash: string }[]>().notNull().default([]),
   createdByEmail: text('created_by_email').notNull(),
   createdAt: createdAt(),
-}, t => [index('business_notes_tenant_field_idx').on(t.tenantId, t.entity, t.field, t.mappingId, t.createdAt)]);
+}, t => [
+  index('business_notes_tenant_field_idx').on(t.tenantId, t.entity, t.field, t.mappingId, t.createdAt),
+  index('business_notes_tenant_target_idx').on(t.tenantId, t.targetId, t.createdAt),
+  // 两种行二选一：字段类有 entity 与 field、没有 target_id；实体、指标、标签只有 target_id
+  check('business_notes_target_kind', sql`(${t.targetId} IS NULL) = (${t.entity} IS NOT NULL AND ${t.field} IS NOT NULL)`),
+]);
 
 // 别名（ADR-0046）：成员给目录条目加的本租户说法，只加和停用、不改名，停用的行留着（retired_at）。target_id 是目录条目标识
 // （entity:x、field:e.f、metric:k、tag:k），mapping_id 非空是某个映射里这个字段的别名。based_on 是加别名时依据的摘要 [{id, hash}]：

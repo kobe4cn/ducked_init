@@ -1,15 +1,16 @@
 // app/.server/knowledge/catalog.ts —— 业务知识（ADR-0046）在语义目录里的挂载点：每个目录条目（映射字段挂在字段条目下该映射的血缘项上）可选地带一份 Knowledge，
-// 参与搜索、写进 Markdown。目前有别名、口径声明与所属分析主题；业务说明扩展与需复核以后都加在这里，目录本身（catalog/index.ts）不用再改。
+// 参与搜索、写进 Markdown。目前有别名、口径声明、所属分析主题与实体、指标、标签的业务说明（字段与映射字段的说明仍由 catalog/index.ts 挂在 note 上）；需复核以后也加在这里，目录本身（catalog/index.ts）不用再改。
 // 没有知识的条目不带 knowledge 键，目录快照与没有知识时一样。没有声明的口径类型不输出（没有声明不等于声明了「未知」）
 import { and, asc, desc, eq, isNull } from 'drizzle-orm';
 import type { Tx } from '../audit';
+import { currentTargetNotes } from '../business-notes';
 import type { getDb } from '../db/client';
 import { analysisSubjects, knowledgeAliases, semanticClaims, subjectMemberships } from '../db/schema';
 import { cmpName } from '../../lib/compare';
 import { CLAIM_TYPE_ORDER, claimTypeLabel, claimValueLabel, isClaimType, isClaimValue, type ClaimType } from '../../lib/semantic-claims';
 
 /** 挂在一个目录条目（或映射字段）上的业务知识；没有的部分不给 */
-export interface Knowledge { aliases?: string[]; claims?: Claim[]; subjects?: string[] }
+export interface Knowledge { aliases?: string[]; claims?: Claim[]; subjects?: string[]; note?: string }
 
 /** 一条生效的口径声明：同一挂载点、同一类型最新的一行 */
 export interface Claim { type: ClaimType; value: string }
@@ -26,12 +27,14 @@ export function presentKnowledge(k: Knowledge | undefined): Knowledge | undefine
   if (k?.aliases?.length) out.aliases = k.aliases;
   if (k?.claims?.length) out.claims = k.claims;
   if (k?.subjects?.length) out.subjects = k.subjects;
+  if (k?.note) out.note = k.note;
   return Object.keys(out).length ? out : undefined;
 }
 
 /**
  * 本租户的业务知识，按挂载点归拢：未停用的别名（同一挂载点内按 cmpName 排，ADR-0045），
- * 每个 (挂载点, 类型) 最新的口径声明（按登记顺序排），所属分析主题名（按 cmpName 排；主题只归属到目录条目，不到映射字段）。最新一行的类型或取值已从登记表删掉时，这种类型不输出、也不退回到上一版
+ * 每个 (挂载点, 类型) 最新的口径声明（按登记顺序排），所属分析主题名（按 cmpName 排；主题只归属到目录条目，不到映射字段），
+ * 实体、指标、标签的当前业务说明（已清空的不给）。最新一行的类型或取值已从登记表删掉时，这种类型不输出、也不退回到上一版
  * （登记表只加不删，删取值要先迁移数据）
  */
 export async function loadKnowledge(db: Tx | ReturnType<typeof getDb>, tenantId: string): Promise<KnowledgeInput> {
@@ -57,6 +60,7 @@ export async function loadKnowledge(db: Tx | ReturnType<typeof getDb>, tenantId:
     if (isClaimType(r.type) && isClaimValue(r.type, r.value)) (knowledgeAt(r.targetId, r.mappingId).claims ??= []).push({ type: r.type, value: r.value });
   }
   for (const r of subjects) (knowledgeAt(r.targetId, null).subjects ??= []).push(r.name);
+  for (const [targetId, note] of await currentTargetNotes(db, tenantId)) if (note) knowledgeAt(targetId, null).note = note;
   for (const k of byTarget.values()) {
     k.aliases?.sort(cmpName);
     k.subjects?.sort(cmpName);
@@ -70,11 +74,12 @@ const claimPhrase = ({ type, value }: Claim) => `${claimTypeLabel(type)}：${cla
 
 /** 参与搜索的文字 */
 export const knowledgeText = (k: Knowledge | undefined): string =>
-  [...(k?.aliases ?? []), ...(k?.claims ?? []).map(claimPhrase), ...(k?.subjects ?? [])].join('\n');
+  [...(k?.aliases ?? []), ...(k?.claims ?? []).map(claimPhrase), ...(k?.subjects ?? []), ...(k?.note ? [k.note] : [])].join('\n');
 
 /** Markdown 行；indent 是缩进（血缘项下的知识要缩进） */
 export const knowledgeMarkdown = (k: Knowledge | undefined, indent = ''): string[] => [
   ...(k?.aliases?.length ? [`${indent}- 别名：${k.aliases.join('、')}`] : []),
   ...(k?.claims?.length ? [`${indent}- 口径：`, ...k.claims.map(c => `${indent}  - ${claimPhrase(c)}`)] : []),
   ...(k?.subjects?.length ? [`${indent}- 分析主题：${k.subjects.join('、')}`] : []),
+  ...(k?.note ? [`${indent}- 业务说明：${k.note}`] : []),
 ];
