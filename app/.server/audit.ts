@@ -240,6 +240,10 @@ const ACTIONS = {
     label: '保存口径声明',
     describe: (d: Detail) => `${knowledgeTarget(d)}：${claimTypeLabel(String(d.type))}`,
   },
+  // 知识提案（ADR-0046）：targetId 是提案 ID，detail 只有 {proposalId, kind, targetId}，不记声明原文与拒绝理由。
+  // 不进 CATALOG_ACTIONS：接受时目录版本由生成知识的那条审计（alias.added 等）记
+  'knowledge_proposal.accepted': { label: '接受知识提案', describe: knowledgeTarget },
+  'knowledge_proposal.rejected': { label: '拒绝知识提案', describe: knowledgeTarget },
   // 分析主题与主题归属（ADR-0046）：detail 只有 subjectId（与 targetId），不记主题名
   'analysis_subject.created': { label: '新建分析主题', describe: subjectTarget },
   'analysis_subject.renamed': { label: '修改分析主题名', describe: subjectTarget },

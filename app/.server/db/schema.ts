@@ -785,6 +785,37 @@ export const subjectMemberships = platform.table('subject_memberships', {
   createdAt: createdAt(),
 }, t => [primaryKey({ columns: [t.subjectId, t.targetId] }), index('subject_memberships_tenant_idx').on(t.tenantId)]);
 
+/** 知识提案的种类与声明：别名 {alias}、口径声明 {type, value}、业务说明 {note} */
+export type ProposalKind = 'alias' | 'claim' | 'note';
+export type ProposalClaim = { alias: string } | { type: string; value: string } | { note: string };
+export type ProposalStatus = 'proposed' | 'accepted' | 'rejected';
+
+// 知识提案（ADR-0046）：系统或 AI 给出的别名、口径声明、业务说明建议，接受前不进目录、检索与起草上下文（不要读进 loadKnowledge）。
+// 目标同 knowledge_aliases（target_id 是目录条目标识，mapping_id 非空是映射字段）。evidence 只存元数据引用 [{ref, version?}]，不存取值；
+// based_on 是提出时的依据摘要。fingerprint = sha256(stableJson({targetId, mappingId, kind, claim, basedOn}))，同租户唯一：
+// 同样的提案不重复存，拒绝过的不再提出。接受后 accepted_ref 是生成的知识行（别名、口径声明或业务说明）的 ID
+export const knowledgeProposals = platform.table('knowledge_proposals', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  targetId: text('target_id').notNull(),
+  mappingId: uuid('mapping_id').references(() => mappings.id, { onDelete: 'cascade' }),
+  kind: text('kind').$type<ProposalKind>().notNull(),
+  claim: jsonb('claim').$type<ProposalClaim>().notNull(),
+  evidence: jsonb('evidence').$type<{ ref: string; version?: number }[]>().notNull().default([]),
+  basedOn: jsonb('based_on').$type<{ id: string; hash: string }[]>().notNull().default([]),
+  fingerprint: text('fingerprint').notNull(),
+  status: text('status').$type<ProposalStatus>().notNull().default('proposed'),
+  generatorVersion: text('generator_version').notNull(),
+  reviewedByEmail: text('reviewed_by_email'),
+  reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+  rejectedReason: text('rejected_reason'),
+  acceptedRef: text('accepted_ref'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+}, t => [
+  uniqueIndex('knowledge_proposals_tenant_fingerprint_uq').on(t.tenantId, t.fingerprint),
+  index('knowledge_proposals_tenant_target_idx').on(t.tenantId, t.targetId),
+]);
+
 // 语义目录的版本（ADR-0041）：目录的结构或含义变了才记一版。snapshot 是去掉统计后的全部条目，diff 是与上一版按条目标识比出的差异；
 // reason 是触发的审计动作（或 catalog.initial 之类）
 export const catalogVersions = platform.table('catalog_versions', {

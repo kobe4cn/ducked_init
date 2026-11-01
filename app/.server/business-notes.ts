@@ -44,9 +44,9 @@ function normalizeNote(note: unknown): string {
 
 /**
  * 在给定事务里保存一版说明（接受知识提案时与提案在同一事务里）。实体字段、实体、指标、标签的说明需 definitions:draft，映射字段的（带 mappingId）需 sources:write；
- * 字段的说明只能用 entity / field 形式，targetId 只接受 entity:、metric:、tag:
+ * 字段的说明只能用 entity / field 形式，targetId 只接受 entity:、metric:、tag:。返回新行 ID
  */
-export async function saveBusinessNoteTx(tx: Tx, actor: CurrentMember, input: BusinessNoteInput): Promise<void> {
+export async function saveBusinessNoteTx(tx: Tx, actor: CurrentMember, input: BusinessNoteInput): Promise<string> {
   const tenantId = actor.tenant.id;
   if ('targetId' in input) {
     assertCan(actor, 'definitions:draft');
@@ -59,9 +59,11 @@ export async function saveBusinessNoteTx(tx: Tx, actor: CurrentMember, input: Bu
       throw e instanceof KnowledgeError ? new BusinessNoteError(e.message) : e;
     }
     const basedOn = await basisOf(tx, tenantId, targetId);
-    await tx.insert(businessNotes).values({ tenantId, targetId, note: trimmed, basedOn, createdByEmail: actor.email, createdAt: savedAt() });
+    const [row] = await tx.insert(businessNotes)
+      .values({ tenantId, targetId, note: trimmed, basedOn, createdByEmail: actor.email, createdAt: savedAt() })
+      .returning({ id: businessNotes.id });
     await recordAudit(tx, { tenantId, actor, action: 'business_note.updated', targetType: 'business_note', targetId, detail: { targetId } });
-    return;
+    return row.id;
   }
 
   const { entity, field, mappingId = null } = input;
@@ -80,15 +82,18 @@ export async function saveBusinessNoteTx(tx: Tx, actor: CurrentMember, input: Bu
     if (!mapped) throw new BusinessNoteError(`映射 ${mappingId} 没有写入 ${entity}.${field}`);
   }
   const basedOn = await basisOf(tx, tenantId, `field:${entity}.${field}`, mappingId);
-  await tx.insert(businessNotes).values({ tenantId, entity, field, mappingId, note: trimmed, basedOn, createdByEmail: actor.email, createdAt: savedAt() });
+  const [row] = await tx.insert(businessNotes)
+    .values({ tenantId, entity, field, mappingId, note: trimmed, basedOn, createdByEmail: actor.email, createdAt: savedAt() })
+    .returning({ id: businessNotes.id });
   await recordAudit(tx, {
     tenantId, actor, action: 'business_note.updated', targetType: 'business_note', targetId: noteKey(entity, field, mappingId),
     detail: { entity, field, mappingId },
   });
+  return row.id;
 }
 
-/** 保存一版说明 */
-export const saveBusinessNote = (actor: CurrentMember, input: BusinessNoteInput): Promise<void> =>
+/** 保存一版说明，返回新行 ID */
+export const saveBusinessNote = (actor: CurrentMember, input: BusinessNoteInput): Promise<string> =>
   getDb().transaction(tx => saveBusinessNoteTx(tx, actor, input));
 
 /** 本租户每个字段类说明的当前内容（含已清空的空串），键是 noteKey；实体、指标、标签的说明（target_id 非空）不在这里，见 currentTargetNotes */
