@@ -17,7 +17,7 @@ import { loginAs, resetDb, startApp, type TestApp } from './harness';
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
-beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
+const fresh = async () => { await resetDb(); app.outbox.length = 0; };
 afterEach(() => { vi.unstubAllEnvs(); });
 
 /** 打通好的 acme 跑一次 RFM，返回租户与快照 */
@@ -28,35 +28,23 @@ async function rfmSnapshot() {
   return { acme, snapshot };
 }
 
+/**
+ * 只读用例共用的夹具：清库、跑一次 RFM，登录 acme 的查看者与另一租户 globex 的查看者。
+ * 用它的用例不能写库、不能依赖执行顺序，也不能断言「恰好 N 条」（打开页面可能入队任务或写审计）
+ */
+async function sharedSnapshot() {
+  await fresh();
+  const { acme, snapshot } = await rfmSnapshot();
+  await memberOf(acme, 'viewer@acme.com', 'viewer');
+  await memberOf(await newTenant('globex'), 'viewer@globex.com', 'viewer');
+  return { snapshot, browser: await loginAs(app, 'viewer@acme.com'), globexBrowser: await loginAs(app, 'viewer@globex.com') };
+}
+
 // 源表里的姓名、手机、邮箱、外部 ID，页面上一个都不能出现
 const PLAINTEXT = ['张三', '钱七', '13800000002', '138 0000 0001', 'zhang@crm.test', 'qian7@example.com', 'wx_union_8'];
 
 describe('分析页', () => {
-  it('查看者在分析页看到本租户的快照，打开看各人群人数与金额、分页的消费者明细，页面上没有明文', async () => {
-    const { acme, snapshot } = await rfmSnapshot();
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const browser = await loginAs(app, 'viewer@acme.com');
-
-    const home = await (await browser.get('/')).text();
-    expect(home).toContain('href="/analytics"');
-
-    const list = await browser.get('/analytics');
-    expect(list.status).toBe(200);
-    const listHtml = await list.text();
-    expect(listHtml).toContain(`href="/analytics/snapshots/${snapshot.id}"`);
-    expect(listHtml).toContain('RFM 分层');
-    expect(listHtml).toContain('2024-07-01');
-
-    const result = await browser.get(`/analytics/snapshots/${snapshot.id}`);
-    expect(result.status).toBe(200);
-    const html = await result.text();
-    expect(html).toMatch(/data-segment="重要价值".*?data-segment-consumers="true">1</s);
-    expect(html).toMatch(/data-segment="一般挽留".*?data-segment-consumers="true">3<.*?data-segment-monetary="true">¥1,380\.00</s);
-
-    const consumers = await (await browser.get(`/analytics/snapshots/${snapshot.id}?tab=consumers`)).text();
-    expect(consumers.match(/data-consumer="/g)).toHaveLength(5);
-    for (const text of [listHtml, html, consumers]) for (const p of PLAINTEXT) expect(text).not.toContain(p);
-  });
+  beforeEach(fresh);
 
   it('登记时有映射合并失败的快照标「数据不完整」，列出源表、实体、原因摘要与数据停在的时间；完整的快照不标', async () => {
     const { acme, snapshot } = await rfmSnapshot();
@@ -91,16 +79,6 @@ describe('分析页', () => {
     expect(html).toContain(`href="/analytics/snapshots/${snapshot.id}"`);
   });
 
-  it('其他租户的快照返回 404，也不出现在它的列表里', async () => {
-    const { snapshot } = await rfmSnapshot();
-    const globex = await newTenant('globex');
-    await memberOf(globex, 'viewer@globex.com', 'viewer');
-    const browser = await loginAs(app, 'viewer@globex.com');
-    expect(await (await browser.get('/analytics')).text()).not.toContain(snapshot.id);
-    expect((await browser.get(`/analytics/snapshots/${snapshot.id}`)).status).toBe(404);
-    expect((await browser.get('/analytics/snapshots/not-a-uuid')).status).toBe(404);
-  });
-
   it('已过期的快照（即使带数据不完整标记）在列表中标为已过期、没有链接，直接打开返回 404', async () => {
     const { acme, snapshot } = await rfmSnapshot();
     // 同时带数据不完整标记：过期优先
@@ -113,6 +91,43 @@ describe('分析页', () => {
     expect(html).toContain('data-snapshot-status="expired">已过期');
     expect(html).not.toContain(`href="/analytics/snapshots/${snapshot.id}"`);
     expect((await browser.get(`/analytics/snapshots/${snapshot.id}`)).status).toBe(404);
+  });
+});
+
+describe('分析页', () => {
+  // 只读用例共用一次 RFM 快照：不改快照、不跑任务、不写库，也不断言条数
+  let shared: Awaited<ReturnType<typeof sharedSnapshot>>;
+  beforeAll(async () => { shared = await sharedSnapshot(); });
+
+  it('查看者在分析页看到本租户的快照，打开看各人群人数与金额、分页的消费者明细，页面上没有明文', async () => {
+    const { snapshot, browser } = shared;
+
+    const home = await (await browser.get('/')).text();
+    expect(home).toContain('href="/analytics"');
+
+    const list = await browser.get('/analytics');
+    expect(list.status).toBe(200);
+    const listHtml = await list.text();
+    expect(listHtml).toContain(`href="/analytics/snapshots/${snapshot.id}"`);
+    expect(listHtml).toContain('RFM 分层');
+    expect(listHtml).toContain('2024-07-01');
+
+    const result = await browser.get(`/analytics/snapshots/${snapshot.id}`);
+    expect(result.status).toBe(200);
+    const html = await result.text();
+    expect(html).toMatch(/data-segment="重要价值".*?data-segment-consumers="true">1</s);
+    expect(html).toMatch(/data-segment="一般挽留".*?data-segment-consumers="true">3<.*?data-segment-monetary="true">¥1,380\.00</s);
+
+    const consumers = await (await browser.get(`/analytics/snapshots/${snapshot.id}?tab=consumers`)).text();
+    expect(consumers.match(/data-consumer="/g)).toHaveLength(5);
+    for (const text of [listHtml, html, consumers]) for (const p of PLAINTEXT) expect(text).not.toContain(p);
+  });
+
+  it('其他租户的快照返回 404，也不出现在它的列表里', async () => {
+    const { snapshot, globexBrowser: browser } = shared;
+    expect(await (await browser.get('/analytics')).text()).not.toContain(snapshot.id);
+    expect((await browser.get(`/analytics/snapshots/${snapshot.id}`)).status).toBe(404);
+    expect((await browser.get('/analytics/snapshots/not-a-uuid')).status).toBe(404);
   });
 });
 
@@ -130,6 +145,8 @@ const FORM = {
 };
 
 describe('RFM 模板参数页', () => {
+  beforeEach(fresh);
+
   it('查看者看到生效的默认参数，没有保存按钮，提交草稿返回 403', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'viewer@acme.com', 'viewer');
@@ -234,6 +251,8 @@ describe('RFM 模板参数页', () => {
 });
 
 describe('用户 360 模板参数页与快照（通用表单与通用明细）', () => {
+  beforeEach(fresh);
+
   it('分析页列出每个已登记模板的参数入口；通用表单按 form 渲染，查看者只读、提交 403，未登记的模板 404', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'viewer@acme.com', 'viewer');
@@ -328,6 +347,8 @@ describe('用户 360 模板参数页与快照（通用表单与通用明细）',
 });
 
 describe('同期群与复购模板参数页（通用表单）', () => {
+  beforeEach(fresh);
+
   /**
    * 打通好的 acme（映射合并后平台已按默认参数发布第 1 版），分析师起草第 2 版、另一位数据工程师发布，跑完发布入队的任务后按参考日期 2024-07-01 重新计算，
    * 返回租户、发布入队的任务、这个模板第 2 版的快照与重新计算后的快照
@@ -388,6 +409,8 @@ describe('同期群与复购模板参数页（通用表单）', () => {
 });
 
 describe('模板升级', () => {
+  beforeEach(fresh);
+
   it('有新模板版本时显示提示条，分析师可以预览差异（只有人数）、起草升级但不能发布，另一位数据工程师发布后按新版本入队；没有新版本时没有提示条', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     await memberOf(acme, 'analyst@acme.com', 'analyst');

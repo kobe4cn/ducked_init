@@ -213,6 +213,31 @@ describe('<功能>', () => {
 
 数据准备优先用领域函数（`newTenant`、`memberOf`、`registerSource`），只把要测的那一步走 HTTP。
 
+### 只读用例共用夹具
+
+造数据贵的时候（`publishedIdentitySources` 一次约 27 s），只读的用例可以在 describe 级 `beforeAll` 里清库、造一次数据并登录，同组用例共用。条件：
+
+- 用例只 `get` 页面：不 `publish`、不 `.post(`、不 `runTask`、不改库（包括 `getDb().update` 改任务结果或快照）。要改的数据放进 `beforeAll` 的夹具里一次改好，例如 `sharedFixture(fallbackOnCrmOrders)`。
+- 不断言「恰好 N 条」：打开页面可能入队检查任务或写审计，同组别的用例会影响计数。
+- 不依赖执行顺序，用 `-t` 单独跑也能过。
+
+顶层 `beforeEach` 会作用到所有 describe，所以这种文件不写顶层 `beforeEach`：每个按用例造数据的 describe 自己写 `beforeEach(fresh)`，共享组写 `beforeAll`。要保持用例名不变，可以并列写多个同名的 describe。参考 `test/http/lineage.test.ts`（`sharedFixture`）与 `test/http/analytics.test.ts`（`sharedSnapshot`）：
+
+```ts
+const fresh = async () => { await resetDb(); app.outbox.length = 0; };
+
+describe('<功能>', () => {
+  beforeEach(fresh);
+  it('写数据或断言计数的用例', async () => { /* 自己造数据 */ });
+});
+
+describe('<功能>', () => {
+  let shared: Awaited<ReturnType<typeof sharedFixture>>;
+  beforeAll(async () => { shared = await sharedFixture(); }); // 内部先 fresh()，再造数据、登录
+  it('只读用例', async () => { const { viewer } = shared; /* 只 get */ });
+});
+```
+
 ## 浏览器验收（ego-browser）
 
 HTTP 测试只看得到服务端渲染的 HTML。改了页面（`app/routes/*.tsx`、`app/components/`）的话，HTTP 测试通过后，再用 `ego-browser` skill 在真实浏览器里走一遍。它不进 `pnpm test`，也不能代替回归测试：能写成 HTTP 断言的就写成测试。浏览器只看测试看不到的东西：布局是否符合 `docs/agents/ui.md`、客户端交互（添加一行、Ctrl / ⌘ + Enter、展开目录等），以及页面或服务端有没有报错。
