@@ -7,6 +7,7 @@ import { ignoreColumn } from '../../app/.server/mappings';
 import { registerSource, relistSource } from '../../app/.server/sources';
 import { memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER, WRITER } from '../pipeline/source-fixtures';
+import { dbNameOf } from '../setup-env';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
 let app: TestApp;
@@ -62,7 +63,7 @@ describe('登记数据源', () => {
     expect(list).toContain('登记新的数据源');
     const detail = await pageAndData(browser, `/sources/${id}`);
     expect(detail).toContain(READER.user);
-    expect(detail).toContain('crm_source_test');
+    expect(detail).toContain(dbNameOf(process.env.TEST_SOURCE_DATABASE_URL!));
     expect(detail).not.toContain(READER.password);
     expect(detail).not.toContain(READER.password.replace(/'/g, '&#x27;'));
     // 登记后只列出表，所有表都不在同步范围内，不采集

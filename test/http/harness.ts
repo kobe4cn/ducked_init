@@ -11,6 +11,7 @@ import type { Mail } from '../../app/.server/mailer';
 import { deleteTenantS3Account } from '../../app/.server/s3-accounts';
 import { totpCode } from '../../app/.server/totp';
 import { record, timed, timingEnabled } from '../timing';
+import { WORKER_SUFFIX } from '../setup-env';
 
 export type { Mail };
 
@@ -88,8 +89,8 @@ async function start(): Promise<TestApp> {
   const vite: ViteDevServer = await createServer({
     configFile: 'vite.config.ts',
     // 用单独的缓存目录、不做浏览器端依赖预构建：否则会改写开发服务器正在用的 node_modules/.vite/deps，
-    // 浏览器随后请求依赖时收到 504（Outdated Optimize Dep）
-    cacheDir: 'node_modules/.vite-test',
+    // 浏览器随后请求依赖时收到 504（Outdated Optimize Dep）。每个 worker 一个（见 test/setup-env.ts）
+    cacheDir: `node_modules/.vite-test${WORKER_SUFFIX}`,
     optimizeDeps: { noDiscovery: true, include: [] },
     server: { middlewareMode: true, hmr: false, watch: null },
     appType: 'custom',

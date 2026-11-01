@@ -5,16 +5,23 @@
 ## 运行
 
 ```bash
-pnpm test                                    # 全部（串行，较慢；输出写进文件再 grep）
+pnpm test                                    # 全部（按文件并行，较慢；输出写进文件再 grep）
+CRM_TEST_WORKERS=1 pnpm test                 # 只用一个 worker（串行）
 npx vitest run test/pipeline/mapping.test.ts # 单个文件
 ```
 
-- `vitest.config.ts` 设好了测试环境：平台 PG `crm_platform_test`、源库 `crm_source_test`（都在 `localhost:5432`，账号 `crm/crm`）、本地临时目录作数据湖、固定的主密钥、`MAILER=console`、`SOURCE_LARGE_TABLE_ROWS=1000`。
+- `vitest.config.ts` 设好了测试环境的基准值：平台 PG `crm_platform_test`、源库 `crm_source_test`（都在 `localhost:5432`，账号 `crm/crm`）、本地临时目录作数据湖、固定的主密钥、`MAILER=console`、`SOURCE_LARGE_TABLE_ROWS=1000`。
 - 本地的 `.env.test`（模板 `.env.test.example`）提供可选的外部依赖；没配置时相应的 `describe.skipIf(...)` 自动跳过：
   - `TEST_S3_LAKE_URI`：对象存储上的隔离测试与文件数据源
   - `TEST_MYSQL_URL`：MySQL 数据源
   - `TEST_MONGO_URL`：MongoDB 数据源
-- `test/global-setup.ts` 在开跑前建库并迁移到最新结构。所有测试共用一个库，**文件串行执行**（`fileParallelism: false`）；它还加了一把锁，已有 vitest 在跑时，再启动的 vitest 会直接报错退出。
+- **按 worker 分库，文件并行**：worker 数由 `CRM_TEST_WORKERS` 控制（默认 4，PG 默认 `max_connections` 100，不要调得太高）。`vitest.config.ts` 把基准值另存到 `CRM_TEST_BASE_*`，`test/setup-env.ts`（setupFiles）按 `VITEST_POOL_ID`（1…N）给每个 worker 加后缀 `_w<i>`：
+  - 平台库 `crm_platform_test_w<i>`、源库 `crm_source_test_w<i>`、MySQL / MongoDB 库（`TEST_MYSQL_URL` / `TEST_MONGO_URL` 的库名加后缀）
+  - 数据湖目录 `$TMPDIR/crm_platform_test_lake_w<i>`、源文件目录 `$TMPDIR/crm_platform_test_sources_w<i>`、对象存储前缀 `TEST_S3_LAKE_URI` 加后缀
+  - 集群级的源端账号 `crm_src_reader_w<i>` 等（`source-fixtures.ts`）、vite 缓存目录 `node_modules/.vite-test_w<i>`（`harness.ts`）、迁移用例的目标目录 `crm_platform_test_lake_moved_w<i>`
+  - 测试里要用到这些名字时从环境变量取，或用 `test/setup-env.ts` 导出的 `WORKER_SUFFIX`，不要写死。临时改 `PLATFORM_LAKE_URI` 的文件在 afterAll 里恢复成改之前的值（本 worker 的值）
+  - 不在 vitest 里（scripts 引用夹具）时没有 `VITEST_POOL_ID`，不加后缀
+- `test/global-setup.ts` 在开跑前对 i = 1…N 逐个建库（不存在时）并迁移到最新结构；旧库不删（库里租户的 catalog 角色是集群级的，删库会留下孤儿角色）。它还加了一把锁，已有 vitest 在跑时，再启动的 vitest 会直接报错退出。
 
 ### 测量耗时
 
@@ -60,7 +67,7 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 | helper | 作用 |
 |---|---|
 | `pgSourceInput(READER \| WRITER, name = '电商库')` | **重建源库**并返回登记 PostgreSQL 数据源的表单字段，直接传给 `registerSource(member, input)` |
-| `READER` / `WRITER` | 源库账号：只读；对 `shop.orders` 可 INSERT / UPDATE |
+| `READER` / `WRITER` | 源库账号：只读；对 `shop.orders` 可 INSERT / UPDATE。账号名带 worker 后缀（`crm_src_reader_w<i>`，`MONGO_USERS` 也一样），断言里用 `READER.user`，不要写死 |
 | `grantOnSource(sql)` | 以源库管理员执行 SQL：加表、改数据、授权（在 `pgSourceInput` 之后调用，否则会被重建清掉） |
 | `seedPgSource()` | 只重建源库，返回连接信息（`pgSourceInput` 内部已调用） |
 | `duckdbSourceFile(tenantId, file?)` | 在租户源文件目录下生成 DuckDB 文件，返回路径 |
@@ -105,13 +112,13 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 
 | helper | 作用 |
 |---|---|
-| `startApp()` | 启动服务端，返回 `TestApp`：`client()` 新浏览器、`outbox` 已发邮件、`drain()` 等后台发信完成、`close()` |
+| `startApp()` | 启动服务端（vite 缓存目录按 worker 分开：`node_modules/.vite-test_w<i>`），返回 `TestApp`：`client()` 新浏览器、`outbox` 已发邮件、`drain()` 等后台发信完成、`close()` |
 | `Client` | `get(path)`、`post(path, form)`（数组值提交多次）、`request(path, init)`、`cookie(name)`；不自动跟随重定向 |
 | `loginAs(app, email)` | 走完 Magic Link 登录，返回已登录的 `Client`（成员须已存在，可先 `memberOf` 加入） |
 | `loginAsOperator(app, email)` | 运营者登录（Magic Link + TOTP），返回 `{ browser, secret }` |
 | `createTenant(slug, name, adminEmail)` / `createOperator(email)` | 走运营命令行开通租户 / 创建运营者 |
 | `runCli(script, args, { input, env })` | 执行任意运营脚本 |
-| `resetDb()` | 清空平台元数据与租户数据湖。**流水线测试也用它** |
+| `resetDb()` | 清空平台元数据与租户数据湖（只清本 worker 的库与湖目录，只删本库登记的租户角色）。**流水线测试也用它** |
 | `extractLink(mail)` / `extractOpsLink(mail)` | 从邮件里取出登录链接 |
 
 ## 新建一个流水线测试

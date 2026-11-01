@@ -11,6 +11,7 @@ import { requestLakeMigration } from '../../app/.server/lake-migration';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { enqueueTask } from '../../app/.server/tasks';
 import { newTenant, runTask } from '../pipeline/fixtures';
+import { WORKER_SUFFIX } from '../setup-env';
 import { createOperator, loginAs, loginAsOperator, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
@@ -173,7 +174,7 @@ describe('运营后台查看数据湖迁移', () => {
   it('租户页展示当前存储位置与「迁移中」，完成后给出旧位置', async () => {
     const acme = await newTenant('acme');
     const oldPath = (await getTenantLake(acme))!.dataPath;
-    const target = join(tmpdir(), 'crm_platform_test_lake_moved');
+    const target = join(tmpdir(), `crm_platform_test_lake_moved${WORKER_SUFFIX}`);
     await rm(target, { recursive: true, force: true });
     expect((await createOperator('ops@platform.com')).code).toBe(0);
     const { browser: ops } = await loginAsOperator(app, 'ops@platform.com');

@@ -9,6 +9,7 @@ import { loadSourceSpec } from '../../app/.server/source-config';
 import { confirmWatermark, getSource, registerSource, SourceError, testSource } from '../../app/.server/sources';
 import { claimNextTask, finishTask } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
+import { dbNameOf } from '../setup-env';
 import { memberOf, newTenant, selectAllTables } from './fixtures';
 import { duckdbSourceFile, grantOnSource, MONGO_USERS, pgSourceInput, READER, s3SourceFiles, seedMongoSource, seedMysqlSource, WRITER } from './source-fixtures';
 
@@ -199,7 +200,7 @@ describe('任务运行时的数据源连接', () => {
       expect(secrets).toEqual([{ persistent: false, storage: 'memory' }]);
       expect(await attempt(`INSERT INTO src.shop.regions VALUES ('W', '西方')`)).toMatch(/read-only/);
       expect(await attempt(`CALL postgres_execute('src', 'DELETE FROM shop.regions')`)).toMatch(/read-only transaction/);
-      expect(await attempt(`ATTACH 'dbname=crm_platform_test' AS platform_db (TYPE postgres)`)).toMatch(/Permission Error/);
+      expect(await attempt(`ATTACH 'dbname=${dbNameOf(process.env.PLATFORM_DATABASE_URL!)}' AS platform_db (TYPE postgres)`)).toMatch(/Permission Error/);
       expect(await attempt(`SELECT * FROM read_csv('/etc/hosts')`)).toMatch(/Permission Error/);
       expect(await attempt('SET enable_external_access = true')).toMatch(/locked/);
       expect((await session.tables()).map(t => t.name).sort()).toEqual(['customers', 'events', 'orders', 'regions']);
@@ -314,9 +315,9 @@ describe.skipIf(!process.env.TEST_MONGO_URL)('MongoDB 数据源', () => {
     const engineer = await memberOf(acme, 'de@acme.com');
     const base = await seedMongoSource();
     await expect(registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.writer }))
-      .rejects.toThrow(/可写[\s\S]*库 crm_source_test（[^）]*insert/);
+      .rejects.toThrow(new RegExp(`可写[\\s\\S]*库 ${base.database}（[^）]*insert`));
     await expect(registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.stranger }))
-      .rejects.toThrow(/没有库 crm_source_test 的读权限[\s\S]*grantRolesToUser\('crm_src_stranger', \[\{ role: 'read', db: 'crm_source_test' \}\]\)/);
+      .rejects.toThrow(new RegExp(`没有库 ${base.database} 的读权限[\\s\\S]*grantRolesToUser\\('${MONGO_USERS.stranger.user}', \\[\\{ role: 'read', db: '${base.database}' \\}\\]\\)`));
     await expect(registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.reader, password: 'wrong' })).rejects.toThrow(/无法连接数据源/);
 
     const { id, tables } = await registerSource(engineer, { ...base, name: '商城', ...MONGO_USERS.reader });
@@ -358,7 +359,7 @@ describe.skipIf(!process.env.TEST_MONGO_URL)('MongoDB 数据源', () => {
     const spec = await loadSourceSpec(acme, id);
     const session = await openSource({ ...spec, ...MONGO_USERS.writer } as typeof spec, { memoryLimitMb: 256, threads: 1 });
     try {
-      await expect(session.con.run(`INSERT INTO src.crm_source_test.orders (customer) VALUES (1)`)).rejects.toThrow(/read-only/);
+      await expect(session.con.run(`INSERT INTO src.${base.database}.orders (customer) VALUES (1)`)).rejects.toThrow(/read-only/);
       await expect(session.con.run(`SELECT * FROM mongo_scan('mongodb://localhost:27017', 'admin', 'system.users')`)).rejects.toThrow(/Direct mongo_scan is disabled/);
     } finally {
       session.close();

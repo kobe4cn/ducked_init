@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defineConfig } from 'vitest/config';
+import { PER_WORKER_KEYS } from './test/setup-env';
 
 // 本地的 .env.test（不提交，模板见 .env.test.example）：对象存储、MongoDB、MySQL 测试的连接；命令行里设置的同名变量优先
 const envTest = join(import.meta.dirname, '.env.test');
@@ -33,6 +34,11 @@ if (process.env.TEST_S3_LAKE_URI) {
   process.env.S3_ACCESS_KEY ??= 'crm';
   process.env.S3_SECRET_KEY ??= 'crm-secret';
 }
+// 以上是基准值；每个 worker 在 test/setup-env.ts 里加后缀 _w<i> 用自己的一份（config 在主进程求值，拿不到 VITEST_POOL_ID）
+for (const key of PER_WORKER_KEYS) {
+  const value = process.env[key];
+  if (value) process.env[`CRM_TEST_BASE_${key}`] = value;
+}
 
 // 测试不走 vite.config.ts（reactRouter 插件由 HTTP 接缝自己起的 vite 服务加载）
 export default defineConfig({
@@ -41,8 +47,10 @@ export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
     globalSetup: ['test/global-setup.ts'],
-    // 所有测试共用一个测试库，串行执行避免互相清表
-    fileParallelism: false,
+    setupFiles: ['test/setup-env.ts'],
+    // 文件级并行：每个 worker 用自己的库与目录（test/setup-env.ts）。PG 默认 max_connections 100，
+    // 每个 worker 最多两个连接池（测试侧与 vite 侧各 10 个）再加 DuckLake 的连接，不要调得太高
+    maxWorkers: Number(process.env.CRM_TEST_WORKERS ?? 4),
     // CI 的 runner 性能差别大：慢的机器整体慢约 1.7 倍，快机器上 20–25 s 的流水线测试在慢机器上会超过 30 s
     testTimeout: 90_000,
     hookTimeout: 60_000,
