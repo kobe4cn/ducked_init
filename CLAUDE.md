@@ -12,6 +12,10 @@ Default canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 
 A `ready-for-agent` ticket has at most 3 acceptance criteria and an `## Implementation guide` section. Before `/implement`, run `/prep-ticket <n>` (or without a number for the next ready ticket) to split it and write the guide. See `docs/agents/ticket-sizing.md`.
 
+### Sandcastle (AFK runs)
+
+Issues labelled `Sandcastle` are prepped, implemented and reviewed by `.sandcastle/main.ts`. It merges the ones that pass the review verdict and the full-test gate, and leaves the rest as PRs. Its `sandcastle:*` labels form a state machine. See `docs/agents/sandcastle.md`.
+
 ### UI conventions
 
 Before building or changing a page, read `docs/agents/ui.md` (shell, page header, stat tiles, card grid, tabs, status colors). After changing a page and passing its HTTP tests, check it in a real browser with the `ego-browser` skill. See "浏览器验收" in `test/README.md`.

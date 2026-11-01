@@ -1,37 +1,34 @@
 # ISSUES
 
-Here are the open issues in the repo:
+下面是人工选中、且已经准备好（有新鲜的 `## Implementation guide`）的 open issue：
 
 <issues-json>
 
-!`gh issue list --state open --label Sandcastle --limit 100 --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'`
+!`gh issue list --state open --limit 100 --search '{{QUERY}}' --json number,title,body,labels --jq '[.[] | {number, title, body, labels: [.labels[].name]}]'`
 
 </issues-json>
 
-The list above has already been filtered to issues ready for work.
+已开 PR 等人审的票、需要人介入的票不在这里。
 
 # TASK
 
-Analyze the open issues and build a dependency graph. For each issue, determine whether it **blocks** or **is blocked by** any other open issue.
+找出现在就能在 `main` 上开工、并且可以并行的票。
 
-An issue B is **blocked by** issue A if:
+一张票 B **被 block**，如果：
 
-- B requires code or infrastructure that A introduces
-- B and A modify overlapping files or modules, making concurrent work likely to produce merge conflicts
-- B's requirements depend on a decision or API shape that A will establish
+- 它的 `## Blocked by` 里有任何 issue 仍是 open。不在上面列表里的 blocker 也要查：`gh issue view <n> --json state`。**blocker 已开 PR 但还没合并，仍然算 open**——它的代码还不在 `main` 上。
+- 它和列表里另一张票的 `## Implementation guide` 的 `Change` 行改同一个文件（并行会冲突）。这种情况只保留编号小的那张。
 
-An issue is **unblocked** if it has zero blocking dependencies on other open issues.
+只输出没有被 block 的票。**全部被 block 时输出空列表**，不要挑一张勉强开工。
 
-For each unblocked issue, assign a branch name using the exact format `sandcastle/issue-{id}` (no slug or other suffix). This must be deterministic so that re-planning the same issue always produces the same branch name and accumulated progress is preserved.
+分支名严格用 `sandcastle/issue-{id}`（不加后缀），这样重跑同一张票会接着原来的分支做。
 
 # OUTPUT
 
-Output your plan as a JSON object wrapped in `<plan>` tags:
+按编号从小到大：
 
 <plan>
 {"issues": [{"id": "42", "title": "Fix auth bug", "branch": "sandcastle/issue-42"}]}
 </plan>
 
-Include only unblocked issues. If every issue is blocked, include the single highest-priority candidate (the one with the fewest or weakest dependencies).
-
-Always emit the `<plan>` tags, even when there is nothing to do. If there are no issues to work on at all, output `<plan>{"issues": []}</plan>` so the run can exit cleanly.
+没有可做的票时输出 `<plan>{"issues": []}</plan>`。

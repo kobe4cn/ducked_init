@@ -1,62 +1,37 @@
 # TASK
 
-Fix issue {{TASK_ID}}: {{ISSUE_TITLE}}
+实现 issue #{{TASK_ID}}：{{ISSUE_TITLE}}。只做这一张票。分支 `{{BRANCH}}`。
 
-Pull in the issue using `gh issue view <ID>`. If it has a parent PRD, pull that in too.
+1. `gh issue view {{TASK_ID}} --comments`。评论里可能有上一次会话留下的进度——从那里接着做，不要重做。
+2. 如果这个分支已经有 PR（`gh pr view {{BRANCH}} --comments`），先处理里面的 review 意见。
+3. `git log --oneline {{BRANCH}} -n 10` 看这个分支已经提交了什么。
 
-Only work on the issue specified.
+# CONTEXT BUDGET
 
-Work on branch {{BRANCH}}. Make commits and run tests.
+这次会话要在 ~150k token 内完成。遵守 `CLAUDE.md` 的「Context budget」：
 
-# CONTEXT
-
-Here are the last 10 commits:
-
-<recent-commits>
-
-!`git log -n 10 --format="%H%n%ad%n%B---" --date=short`
-
-</recent-commits>
-
-# EXPLORATION
-
-Explore the repo and fill your context window with relevant information that will allow you to complete the task.
-
-Pay extra attention to test files that touch the relevant parts of the code.
+- 票的 `## Implementation guide` 就是你的探索结果。从它的 `file:line` 出发，`grep -n` 确认行号再改。不要做广泛探索。
+- 只整读要改的、300 行以内的文件；长文件用 `grep -n` + `sed -n` 读要改的函数。
+- 写测试前读 `test/README.md`，相似测试从 `test/CATALOG.md` 用 `grep -n` 找。
+- 指引和代码对不上（文件挪了、函数没了）或要做指引没提到的设计决定时，**停下**：在 issue 上评论说明，不输出 COMPLETE。
 
 # EXECUTION
 
-If applicable, use RGR to complete the task.
-
-1. RED: write one test
-2. GREEN: write the implementation to pass that test
-3. REPEAT until done
-4. REFACTOR the code
+红-绿循环，一次一个验收标准：写一个测试 → 跑红 → 实现 → 跑绿。全部完成后再整理。
 
 # FEEDBACK LOOPS
 
-Before committing, run `npm run typecheck` and `npm run test` to ensure the tests pass.
+- 开发中只跑相关测试文件：`npx vitest run <file>`。测试连的 PG、MySQL、MongoDB、对象存储都已经通过环境变量配好（宿主机上的容器），不要改连接配置。
+- 提交前跑 `npm run typecheck` 和你改到的、相关的测试文件。**不用跑完整测试**：review 之后编排脚本会自己跑一遍完整测试作为合并门槛，失败时会再叫你修。
+- 票里有 **Browser check**：沙箱里没有浏览器，跳过，并在 issue 评论里写「浏览器验收待人工」以及要检查什么。
 
 # COMMIT
 
-Make a git commit. The commit message must:
+按仓库现有风格写中文提交信息（看 `git log -n 3 --format=%B origin/main`）：一行说明做了什么，然后是关键决定、改动的文件、验证结果（typecheck、跑过的测试文件与用例数），末尾 `(#{{TASK_ID}})`。新增测试文件要在 `test/CATALOG.md` 加一行；加了 ADR 要更新 `docs/adr/README.md`。
 
-1. Start with `RALPH:` prefix
-2. Include task completed + PRD reference
-3. Key decisions made
-4. Files changed
-5. Blockers or notes for next iteration
+不要 push，不要开 PR，不要合并，不要关 issue——这些由编排脚本来做。
 
-Keep it concise.
+# 结束
 
-# THE ISSUE
-
-If the task is not complete, leave a comment on the issue with what was done.
-
-Do not close the issue - this will be done later.
-
-Once complete, output <promise>COMPLETE</promise>.
-
-# FINAL RULES
-
-ONLY WORK ON A SINGLE TASK.
+- 完成：输出 <promise>COMPLETE</promise>。
+- 没完成（上下文快满、卡住、指引过时）：提交已经能通过测试的部分，在 issue 上评论「已完成什么 / 还差什么 / 下一步从哪开始」，不输出 COMPLETE。下一次会话会从你的评论接着做。
