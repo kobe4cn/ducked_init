@@ -41,7 +41,7 @@ describe('合并组发布', () => {
     expect(await saveMergeGroupDraft(reviewer, 'order', { members: reordered, rule: { kind: 'latest', field: 'updated_at' } })).toBe(2);
     expect(await saveMergeGroupDraft(author, 'order', { members: reordered, rule: { kind: 'coalesce' } })).toBe(2);
     const [page] = await listMergeGroups(author);
-    expect(page).toMatchObject({ entity: 'order', candidates: [{ name: '「CRM」orders → order' }, { name: '「会员」orders → order' }] });
+    expect(page).toMatchObject({ entity: 'order', candidates: [{ name: '「会员」orders → order' }, { name: '「CRM」orders → order' }] });
     expect(page.versions).toMatchObject([
       { version: 2, status: 'draft', members: reordered, rule: { kind: 'coalesce' }, authors: ['de2@acme.com', 'de@acme.com'], lastEditor: 'de@acme.com', publishBlocker: expect.stringContaining('你最后改了') },
       { version: 1, status: 'published', publishedByEmail: 'de2@acme.com' },

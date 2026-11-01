@@ -13,6 +13,7 @@ import { mappings, mappingVersions, mergeGroups, mergeGroupVersions, sources } f
 import { enqueueMerge, lockTenant } from './mappings';
 import { isStale, publishBlocker, publisherCount, publishReason, withAuthor } from './publish-rules';
 import { entityOf } from '../lib/canonical-model';
+import { cmpName } from '../lib/compare';
 import { MERGE_RULE_KINDS, type MergeRule, type MergeRuleKind, ruleText } from '../lib/merge-groups';
 
 /** 可以展示给成员的业务错误 */
@@ -150,7 +151,7 @@ export async function listMergeGroups(actor: CurrentMember): Promise<MergeGroupE
     .where(eq(mergeGroups.tenantId, actor.tenant.id))
     .orderBy(desc(mergeGroupVersions.version));
   const publishers = await publisherCount(actor.tenant.id);
-  const live = [...ctx.mappings.values()].filter(isLive).sort((a, b) => a.name.localeCompare(b.name));
+  const live = [...ctx.mappings.values()].filter(isLive).sort((a, b) => cmpName(a.name, b.name));
   const entities = new Set([
     ...live.map(m => m.entity).filter((e, _, all) => !ungroupable(e, ctx) && all.filter(x => x === e).length >= 2),
     ...versions.map(v => v.entity),
