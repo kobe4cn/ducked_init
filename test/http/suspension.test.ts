@@ -1,17 +1,18 @@
 import { createHash } from 'node:crypto';
 import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { closeDb } from '../../app/.server/db/client';
 import { createOperator, createTenant, extractLink, loginAs, loginAsOperator, resetDb, startApp, type Client, type TestApp } from './harness';
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
-afterAll(async () => { await app?.close(); });
+afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 
 const OPS = 'ops@platform.com';
 
 async function operator() {
-  expect((await createOperator(OPS)).code).toBe(0);
+  await createOperator(OPS);
   return (await loginAsOperator(app, OPS)).browser;
 }
 

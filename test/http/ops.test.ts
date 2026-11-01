@@ -1,14 +1,15 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { closeDb } from '../../app/.server/db/client';
 import { totpCode } from '../../app/.server/totp';
 import {
-  createOperator, createTenant, extractOpsLink, loginAs, loginAsOperator, opsMagicLogin, resetDb, resetOperatorTotp, scanTotpQrOn, startApp,
+  createOperator, createTenant, extractOpsLink, loginAs, loginAsOperator, opsMagicLogin, resetDb, resetOperatorTotp, runCli, scanTotpQrOn, startApp,
   totpSecretOn,
   type Client, type TestApp,
 } from './harness';
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
-afterAll(async () => { await app?.close(); });
+afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); });
 
@@ -17,7 +18,7 @@ const OTHER_OPS = 'ops2@platform.com';
 
 /** 创建运营者并完成首次登录 */
 async function operator(email = OPS) {
-  expect((await createOperator(email)).code).toBe(0);
+  await createOperator(email);
   return loginAsOperator(app, email);
 }
 
@@ -33,10 +34,10 @@ const auditActions = (html: string) => [...html.matchAll(/data-audit-action="([^
 
 describe('运营者身份：只能由运营命令创建', () => {
   it('运营命令创建运营者，重复邮箱被拒绝；新增运营者作为平台事件记录', async () => {
-    const cli = await createOperator('Ops@Platform.com');
+    const cli = await runCli('scripts/create-operator.ts', ['--email', 'Ops@Platform.com']);
     expect(cli.code).toBe(0);
     expect(cli.stdout).toContain(OPS);
-    const dup = await createOperator(OPS);
+    const dup = await runCli('scripts/create-operator.ts', ['--email', OPS]);
     expect(dup.code).not.toBe(0);
     expect(dup.stderr).toContain('运营者已存在');
 
@@ -212,7 +213,7 @@ describe('运营后台登录：Magic Link + 强制 TOTP', () => {
 describe('运营命令：重置运营者的 TOTP', () => {
   it('重置后该运营者原有的会话失效，访问运营后台跳转到登录页', async () => {
     const { browser } = await operator();
-    const cli = await resetOperatorTotp(OPS);
+    const cli = await runCli('scripts/reset-operator-totp.ts', ['--email', OPS]);
     expect(cli.code).toBe(0);
     expect(cli.stdout).toContain(OPS);
     const res = await browser.get('/ops');
@@ -223,7 +224,7 @@ describe('运营命令：重置运营者的 TOTP', () => {
   it('重置后再次登录进入首次绑定：给出新的密钥，旧密钥的验证码不再被接受', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const { secret: old } = await operator();
-    expect((await resetOperatorTotp(OPS)).code).toBe(0);
+    await resetOperatorTotp(OPS);
 
     vi.setSystemTime(Date.now() + 30_000);
     const browser = await opsMagicLogin(app, OPS);
@@ -244,7 +245,7 @@ describe('运营命令：重置运营者的 TOTP', () => {
     await app.drain();
     const link = extractOpsLink(app.outbox.at(-1)!);
 
-    expect((await resetOperatorTotp(OPS)).code).toBe(0);
+    await resetOperatorTotp(OPS);
     expect((await pending.get('/ops/totp')).headers.get('Location')).toBe('/ops/login');
     expect(await (await app.client().post(link, {})).text()).toContain('登录链接无效、已过期或已被使用');
   });
@@ -253,7 +254,7 @@ describe('运营命令：重置运营者的 TOTP', () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     await operator();
     const other = await operator(OTHER_OPS);
-    expect((await resetOperatorTotp(OPS)).code).toBe(0);
+    await resetOperatorTotp(OPS);
 
     expect((await other.browser.get('/ops')).status).toBe(200);
     vi.setSystemTime(Date.now() + 30_000);
@@ -266,7 +267,7 @@ describe('运营命令：重置运营者的 TOTP', () => {
     await createTenant('acme', '示例商贸', 'admin@acme.com');
     await operator();
     const { browser } = await operator(OTHER_OPS);
-    expect((await resetOperatorTotp(OPS)).code).toBe(0);
+    await resetOperatorTotp(OPS);
 
     const events = await (await browser.get('/ops/audit')).text();
     expect(auditActions(events)[0]).toBe('重置 TOTP');
@@ -276,7 +277,7 @@ describe('运营命令：重置运营者的 TOTP', () => {
   });
 
   it('邮箱不存在时报错并以非零状态退出', async () => {
-    const cli = await resetOperatorTotp('nobody@platform.com');
+    const cli = await runCli('scripts/reset-operator-totp.ts', ['--email', 'nobody@platform.com']);
     expect(cli.code).not.toBe(0);
     expect(cli.stderr).toContain('重置失败：运营者不存在');
   });

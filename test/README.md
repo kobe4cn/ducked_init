@@ -144,8 +144,8 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 | `Client` | `get(path)`、`post(path, form)`（数组值提交多次）、`request(path, init)`、`cookie(name)`；不自动跟随重定向 |
 | `loginAs(app, email)` | 走完 Magic Link 登录，返回已登录的 `Client`（成员须已存在，可先 `memberOf` 加入） |
 | `loginAsOperator(app, email)` | 运营者登录（Magic Link + TOTP），返回 `{ browser, secret }` |
-| `createTenant(slug, name, adminEmail)` / `createOperator(email)` | 走运营命令行开通租户 / 创建运营者 |
-| `runCli(script, args, { input, env })` | 执行任意运营脚本 |
+| `createTenant(slug, name, adminEmail)` / `createOperator(email)` / `resetOperatorTotp(email)` | 进程内调用运营命令背后的领域函数（不起子进程）：开通租户（返回 `{ tenant, space, admin, lakeReady }`）/ 创建运营者 / 重置 TOTP；出错时抛错（如 `TenantError`），用 `rejects` 断言。用的是测试进程自己的连接池，文件的 `afterAll` 要 `closeDb()` |
+| `runCli(script, args, { input, env })` | 起子进程执行运营脚本，返回 `{ stdout, stderr, code }`（每次约 1.5 s）。只给测命令行本身（输出、退出码）的用例用，如 `login.test.ts` 的「运营命令创建租户…」「运营命令拒绝重复的租户标识」 |
 | `resetDb()` | 清空平台元数据与租户数据湖（只清本 worker 的库与湖目录，只删本库登记的租户角色）。**流水线测试也用它** |
 | `extractLink(mail)` / `extractOpsLink(mail)` | 从邮件里取出登录链接 |
 
@@ -237,6 +237,11 @@ describe('<功能>', () => {
   it('只读用例', async () => { const { viewer } = shared; /* 只 get */ });
 });
 ```
+
+两种变体：
+
+- **几个不同名的 describe 共用一份**：要保持各自的用例名，又只造一次数据时，把这几组并列写在文件末尾（中间不夹 `beforeEach(fresh)` 的组），用模块级的 `served ??= fresh().then(造数据)` 记住同一个 Promise，每组 `beforeAll` 里 await 它。参考 `test/http/api.test.ts`（`sharedServed`）。这几组的用例原则上也只读；票里点名要共用、又会改一行的（如改数据源名），在 `finally` 里改回去。
+- **用例要改的只是少量可还原的行**：在 `beforeAll` 里记下夹具造好时的那些行，组内 `beforeEach` 把它们还原、删掉之后新增的行，这样用例可以 `runTask`、改任务结果。参考 `test/pipeline/snapshots.test.ts` 的「数据不完整」（每个用例前还原本租户的 `silver.merge` 任务）。
 
 ## 浏览器验收（ego-browser）
 

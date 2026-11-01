@@ -8,7 +8,9 @@ import pg from 'pg';
 import jsQR from 'jsqr';
 import { PNG } from 'pngjs';
 import type { Mail } from '../../app/.server/mailer';
+import * as opsAuth from '../../app/.server/ops-auth';
 import { deleteTenantS3Account } from '../../app/.server/s3-accounts';
+import * as tenants from '../../app/.server/tenants';
 import { totpCode } from '../../app/.server/totp';
 import { record, timed, timingEnabled } from '../timing';
 import { WORKER_SUFFIX } from '../setup-env';
@@ -162,15 +164,21 @@ export function runCli(script: string, args: string[], { input, env }: { input?:
   });
 }
 
-/** 以运营者身份开通租户（与 pnpm tenant:create 相同的入口） */
+// 下面三个 helper 进程内调用运营命令背后的领域函数（不起子进程），用测试进程自己的 getDb() 连接池（和 vite 里的应用只共享数据库），
+// 用到的文件要在 afterAll 里 closeDb()。测命令行本身（输出、退出码）的用例用 runCli
+
+/**
+ * 以运营者身份开通租户：进程内调用 pnpm tenant:create 背后的同一个领域函数（不起子进程），返回 { tenant, space, admin, lakeReady }；
+ * 出错时抛 TenantError
+ */
 export const createTenant = (slug: string, name: string, adminEmail: string) =>
-  runCli('scripts/create-tenant.ts', ['--slug', slug, '--name', name, '--admin-email', adminEmail]);
+  timed('createTenant', () => tenants.createTenant({ slug, name, adminEmail }));
 
-/** 以服务器上的运营命令创建运营者（pnpm operator:create） */
-export const createOperator = (email: string) => runCli('scripts/create-operator.ts', ['--email', email]);
+/** 创建运营者：进程内调用 pnpm operator:create 背后的领域函数，返回运营者行；重复时抛错 */
+export const createOperator = (email: string) => timed('createOperator', () => opsAuth.createOperator(email));
 
-/** 以服务器上的运营命令重置运营者的 TOTP（pnpm operator:reset-totp） */
-export const resetOperatorTotp = (email: string) => runCli('scripts/reset-operator-totp.ts', ['--email', email]);
+/** 重置运营者的 TOTP：进程内调用 pnpm operator:reset-totp 背后的领域函数；运营者不存在时抛错 */
+export const resetOperatorTotp = (email: string) => timed('resetOperatorTotp', () => opsAuth.resetOperatorTotp(email));
 
 /** 从邮件正文里取出运营后台的登录链接（路径 + 查询串） */
 export function extractOpsLink(mail: Mail): string {

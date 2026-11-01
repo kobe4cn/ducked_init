@@ -117,7 +117,7 @@ describe('成员查看本租户的任务', () => {
 describe('运营者设置租户配额', () => {
   it('租户页展示数据湖与配额；修改配额写入该租户的审计日志，不合法的值被拒绝', async () => {
     const acme = await newTenant('acme');
-    expect((await createOperator('ops@platform.com')).code).toBe(0);
+    await createOperator('ops@platform.com');
     const { browser: ops } = await loginAsOperator(app, 'ops@platform.com');
 
     const page = await (await ops.get(`/ops/tenants/${acme}`)).text();
@@ -152,7 +152,7 @@ describe('本功能上线前开通的租户', () => {
     await db.query(`DROP SCHEMA "${lake.catalog_schema}" CASCADE; DROP ROLE "${lake.ro_db_role}"; DROP ROLE "${lake.db_role}"`);
     await db.end();
 
-    expect((await createOperator('ops@platform.com')).code).toBe(0);
+    await createOperator('ops@platform.com');
     const { browser: ops } = await loginAsOperator(app, 'ops@platform.com');
     const page = await ops.get(`/ops/tenants/${acme}`);
     expect(page.status).toBe(200);
@@ -176,7 +176,7 @@ describe('运营后台查看数据湖迁移', () => {
     const oldPath = (await getTenantLake(acme))!.dataPath;
     const target = join(tmpdir(), `crm_platform_test_lake_moved${WORKER_SUFFIX}`);
     await rm(target, { recursive: true, force: true });
-    expect((await createOperator('ops@platform.com')).code).toBe(0);
+    await createOperator('ops@platform.com');
     const { browser: ops } = await loginAsOperator(app, 'ops@platform.com');
 
     await requestLakeMigration(null, acme, target);

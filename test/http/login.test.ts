@@ -1,9 +1,10 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Client, createTenant, extractLink, resetDb, startApp, type Mail, type TestApp } from './harness';
+import { closeDb } from '../../app/.server/db/client';
+import { Client, createTenant, extractLink, resetDb, runCli, startApp, type Mail, type TestApp } from './harness';
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
-afterAll(async () => { await app?.close(); });
+afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
@@ -26,7 +27,7 @@ async function login(email: string) {
 
 describe('租户与 Magic Link 登录', () => {
   it('运营命令创建租户与首个管理员，管理员通过 Magic Link 登录后看到租户与角色', async () => {
-    const cli = await createTenant('acme', '示例商贸', 'Admin@Acme.com');
+    const cli = await runCli('scripts/create-tenant.ts', ['--slug', 'acme', '--name', '示例商贸', '--admin-email', 'Admin@Acme.com']);
     expect(cli.code).toBe(0);
 
     const { browser, res } = await login('admin@acme.com');
@@ -43,8 +44,8 @@ describe('租户与 Magic Link 登录', () => {
   });
 
   it('运营命令拒绝重复的租户标识', async () => {
-    expect((await createTenant('acme', '示例商贸', 'admin@acme.com')).code).toBe(0);
-    const dup = await createTenant('acme', '另一家', 'boss@other.com');
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const dup = await runCli('scripts/create-tenant.ts', ['--slug', 'acme', '--name', '另一家', '--admin-email', 'boss@other.com']);
     expect(dup.code).not.toBe(0);
     expect(dup.stderr).toContain('租户标识已存在');
   });

@@ -25,7 +25,7 @@ import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
-beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
+const fresh = async () => { await resetDb(); app.outbox.length = 0; };
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\n';
 const BUYER = 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n';
@@ -53,6 +53,8 @@ const call = (path: string, key?: string, browser: Client = app.client()) =>
   browser.request(path, { headers: key === undefined ? {} : { Authorization: `Bearer ${key}` } });
 
 describe('API Key 页', () => {
+  beforeEach(fresh);
+
   it('管理员创建后只展示一次明文，列表只有名称、前缀、创建人与时间，库里只存哈希；吊销后审计有记录', async () => {
     await newTenant('acme');
     const admin = await loginAs(app, 'admin@acme.com');
@@ -103,6 +105,8 @@ describe('API Key 页', () => {
 });
 
 describe('Bearer 认证', () => {
+  beforeEach(fresh);
+
   it('没有 Key、Key 错误、已吊销、租户已暂停一律同样的 401；成员的 cookie 不算数', async () => {
     const acme = await newTenant('acme');
     const admin = await loginAs(app, 'admin@acme.com');
@@ -143,6 +147,8 @@ describe('Bearer 认证', () => {
 });
 
 describe('目录接口', () => {
+  beforeEach(fresh);
+
   it('返回本租户已发布的指标与标签的种类、键、当前版本、说明与发布时间；说明取当前版本的，没写为 null，草稿不列出，别的租户看不到', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
@@ -243,30 +249,7 @@ const lookup = async (path: string, key: string) => {
 };
 
 describe('点查接口', () => {
-  it('从当前服务库返回标签、指标（带维度）、RFM 与快照信息；退役的旧 ID 换成现在的 ID；没有这个人 404；没有明文', async () => {
-    const { store, consumer, merged, key } = await servedTenant();
-    const { status, body } = await lookup(`/api/v1/consumers/${consumer}`, key);
-    expect(status).toBe(200);
-    expect(Object.keys(body)).toEqual(['consumer_id', 'requested_id', 'serving_version', 'tags', 'metrics', 'rfm', 'snapshots']);
-    expect(body).toMatchObject({ consumer_id: consumer, requested_id: consumer, serving_version: store.version });
-    expect(body.tags).toEqual({ value_tier: expect.stringMatching(/^(high|low)$/) });
-    expect(body.metrics.revenue).toEqual([{ dims: {}, value: expect.any(Number) }]);
-    expect(body.metrics.revenue_by_city).toEqual([{ dims: { city: expect.any(String) }, value: expect.any(Number) }]);
-    expect(body.rfm).toEqual({
-      segment: expect.any(String), r: expect.any(Number), f: expect.any(Number), m: expect.any(Number),
-      recency_days: expect.any(Number), frequency: expect.any(Number), monetary: expect.stringMatching(/^\d+\.\d{2}$/),
-    });
-    expect(body.snapshots).toEqual(store.snapshots);
-    // 手机号前后不能紧挨数字或字母，免得哈希、UUID 里的数字串误报
-    expect(JSON.stringify(body)).not.toMatch(/@|(?<![0-9a-z])1[3-9]\d{9}(?![0-9a-z])/i);
-
-    const retired = await lookup(`/api/v1/consumers/${merged.old_id}`, key);
-    expect(retired).toMatchObject({ status: 200, body: { consumer_id: merged.new_id, requested_id: merged.old_id, serving_version: store.version } });
-    expect(retired.body).toEqual({ ...(await lookup(`/api/v1/consumers/${merged.new_id}`, key)).body, requested_id: merged.old_id });
-
-    expect(await lookup('/api/v1/consumers/nobody', key)).toEqual({ status: 404, body: { error: expect.any(String) } });
-    expect((await call(`/api/v1/consumers/${consumer}`)).status).toBe(401);
-  });
+  beforeEach(fresh);
 
   it('还没有服务库时 503', async () => {
     await newTenant('acme');
@@ -328,6 +311,8 @@ const loyaltyIdOf = async (tenantId: string, loyalty: string, consumer: string) 
 const bySource = (source: string, customerId: string) => `/api/v1/consumers/by-source/${encodeURIComponent(source)}/${encodeURIComponent(customerId)}`;
 
 describe('按数据源点查', () => {
+  beforeEach(fresh);
+
   it('按数据源登记名 + 源端 ID 查，结果与按统一消费者 ID 查的逐字段相同；被合并退役的源记录拿到现在的 ID；源端 ID 带 / 与空格时编码后能查到', async () => {
     const { acme, sources, consumer, merged, key } = await servedTenant();
     const own = await loyaltyIdOf(acme, sources.loyalty, consumer);
@@ -353,44 +338,10 @@ describe('按数据源点查', () => {
     expect(empty).toEqual({ status: 404, body: { error: expect.any(String) } });
     expect([(await lookup(bySource('没有', 'ghost'), key)).body.error, (await lookup(bySource('CRM', 'nobody'), key)).body.error]).not.toContain(empty.body.error);
   });
-
-  it('数据源名不存在、源端 ID 不存在一律 404 且提示不同；改名后旧名 404、新名立刻可查（不重建）；带 ?snapshot= 时 400', async () => {
-    const { acme, of, sources, consumer, key } = await servedTenant();
-    const own = await loyaltyIdOf(acme, sources.loyalty, consumer);
-    const noSource = await lookup(bySource('没有', own), key);
-    const noConsumer = await lookup(bySource('会员', 'nobody'), key);
-    expect(noSource).toEqual({ status: 404, body: { error: expect.any(String) } });
-    expect(noConsumer).toEqual({ status: 404, body: { error: expect.any(String) } });
-    expect(noSource.body.error).not.toBe(noConsumer.body.error);
-    // 按原样比较，不忽略大小写
-    expect((await lookup(bySource('crm', own), key)).body).toEqual(noSource.body);
-    expect(await lookup(bySource('会员', 'x'.repeat(257)), key)).toEqual(noConsumer);
-
-    const version = (await currentServingStore(acme))!.version;
-    await getDb().update(sourcesTable).set({ name: '会员中心' }).where(eq(sourcesTable.id, sources.loyalty));
-    expect((await lookup(bySource('会员', own), key)).body).toEqual(noSource.body);
-    expect(await lookup(bySource('会员中心', own), key)).toMatchObject({ status: 200, body: { consumer_id: consumer, serving_version: version } });
-
-    expect(await lookup(`${bySource('会员中心', own)}?snapshot=${of('rfm').id}`, key)).toEqual({ status: 400, body: { error: expect.any(String) } });
-    expect((await call(bySource('会员中心', own))).status).toBe(401);
-  });
 });
 
 describe('点查的隔离', () => {
-  it('A 租户的 Key 查不到 B 租户的消费者与快照，B 的 Key 也查不到 A 的：同一个 ID 各自只读到本租户的数据', async () => {
-    const { of, consumer, key } = await servedTenant();
-    const globex = await otherTenant(consumer);
-    const ours = await lookup(`/api/v1/consumers/${consumer}`, key);
-    expect(ours.status).toBe(200);
-    expect(ours.body.rfm.segment).not.toBe('globex_only');
-    const theirs = await lookup(`/api/v1/consumers/${consumer}`, globex.key);
-    expect(theirs).toMatchObject({ status: 200, body: { tags: {}, metrics: {}, rfm: { segment: 'globex_only' }, serving_version: 1 } });
-    expect(theirs.body.snapshots.map((s: { id: string }) => s.id)).toEqual([globex.snapshot]);
-
-    expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${of('rfm').id}`, globex.key)).status).toBe(404);
-    expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${globex.snapshot}`, key)).status).toBe(404);
-    expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${globex.snapshot}`, globex.key)).body.rfm.segment).toBe('globex_only');
-  });
+  beforeEach(fresh);
 
   it('A、B 两个租户有同名数据源、同一个源端 ID 时各自只查到本租户的人；A 的 Key 用只在 B 存在的数据源名 404', async () => {
     const { acme, sources, consumer, key } = await servedTenant();
@@ -460,5 +411,93 @@ describe('点查的隔离', () => {
     const catalog = await call('/api/v1/catalog', key);
     expect(catalog.status).toBe(200);
     expect(await catalog.text()).not.toMatch(/sandbox|leak_probe/);
+  });
+});
+
+// 点查用例共用一次 servedTenant()：这三组并列写在文件末尾、中间没有每用例清库的组。哪一组先跑（-t 单独跑时就是那一组），
+// 它的 beforeAll 清库并造数据，其余组 await 同一个 Promise。用例只查接口；改数据源名的那个在 finally 里改回原名，
+// 查隔离的那个另开租户 globex（不碰 acme）；所以组里的用例不要断言 globex 不存在或租户数
+let servedOnce: ReturnType<typeof servedTenant> | undefined;
+const sharedServed = () => (servedOnce ??= fresh().then(servedTenant));
+type ServedFixture = Awaited<ReturnType<typeof servedTenant>>;
+
+describe('点查接口', () => {
+  let shared: ServedFixture;
+  beforeAll(async () => { shared = await sharedServed(); });
+
+  it('从当前服务库返回标签、指标（带维度）、RFM 与快照信息；退役的旧 ID 换成现在的 ID；没有这个人 404；没有明文', async () => {
+    const { store, consumer, merged, key } = shared;
+    const { status, body } = await lookup(`/api/v1/consumers/${consumer}`, key);
+    expect(status).toBe(200);
+    expect(Object.keys(body)).toEqual(['consumer_id', 'requested_id', 'serving_version', 'tags', 'metrics', 'rfm', 'snapshots']);
+    expect(body).toMatchObject({ consumer_id: consumer, requested_id: consumer, serving_version: store.version });
+    expect(body.tags).toEqual({ value_tier: expect.stringMatching(/^(high|low)$/) });
+    expect(body.metrics.revenue).toEqual([{ dims: {}, value: expect.any(Number) }]);
+    expect(body.metrics.revenue_by_city).toEqual([{ dims: { city: expect.any(String) }, value: expect.any(Number) }]);
+    expect(body.rfm).toEqual({
+      segment: expect.any(String), r: expect.any(Number), f: expect.any(Number), m: expect.any(Number),
+      recency_days: expect.any(Number), frequency: expect.any(Number), monetary: expect.stringMatching(/^\d+\.\d{2}$/),
+    });
+    expect(body.snapshots).toEqual(store.snapshots);
+    // 手机号前后不能紧挨数字或字母，免得哈希、UUID 里的数字串误报
+    expect(JSON.stringify(body)).not.toMatch(/@|(?<![0-9a-z])1[3-9]\d{9}(?![0-9a-z])/i);
+
+    const retired = await lookup(`/api/v1/consumers/${merged.old_id}`, key);
+    expect(retired).toMatchObject({ status: 200, body: { consumer_id: merged.new_id, requested_id: merged.old_id, serving_version: store.version } });
+    expect(retired.body).toEqual({ ...(await lookup(`/api/v1/consumers/${merged.new_id}`, key)).body, requested_id: merged.old_id });
+
+    expect(await lookup('/api/v1/consumers/nobody', key)).toEqual({ status: 404, body: { error: expect.any(String) } });
+    expect((await call(`/api/v1/consumers/${consumer}`)).status).toBe(401);
+  });
+});
+
+describe('按数据源点查', () => {
+  let shared: ServedFixture;
+  beforeAll(async () => { shared = await sharedServed(); });
+
+  it('数据源名不存在、源端 ID 不存在一律 404 且提示不同；改名后旧名 404、新名立刻可查（不重建）；带 ?snapshot= 时 400', async () => {
+    const { acme, of, sources, consumer, key } = shared;
+    const own = await loyaltyIdOf(acme, sources.loyalty, consumer);
+    const noSource = await lookup(bySource('没有', own), key);
+    const noConsumer = await lookup(bySource('会员', 'nobody'), key);
+    expect(noSource).toEqual({ status: 404, body: { error: expect.any(String) } });
+    expect(noConsumer).toEqual({ status: 404, body: { error: expect.any(String) } });
+    expect(noSource.body.error).not.toBe(noConsumer.body.error);
+    // 按原样比较，不忽略大小写
+    expect((await lookup(bySource('crm', own), key)).body).toEqual(noSource.body);
+    expect(await lookup(bySource('会员', 'x'.repeat(257)), key)).toEqual(noConsumer);
+
+    const version = (await currentServingStore(acme))!.version;
+    const rename = (name: string) => getDb().update(sourcesTable).set({ name }).where(eq(sourcesTable.id, sources.loyalty));
+    await rename('会员中心');
+    try {
+      expect((await lookup(bySource('会员', own), key)).body).toEqual(noSource.body);
+      expect(await lookup(bySource('会员中心', own), key)).toMatchObject({ status: 200, body: { consumer_id: consumer, serving_version: version } });
+
+      expect(await lookup(`${bySource('会员中心', own)}?snapshot=${of('rfm').id}`, key)).toEqual({ status: 400, body: { error: expect.any(String) } });
+      expect((await call(bySource('会员中心', own))).status).toBe(401);
+    } finally {
+      await rename('会员'); // 共用夹具：断言失败也改回原名
+    }
+  });
+});
+
+describe('点查的隔离', () => {
+  let shared: ServedFixture;
+  beforeAll(async () => { shared = await sharedServed(); });
+
+  it('A 租户的 Key 查不到 B 租户的消费者与快照，B 的 Key 也查不到 A 的：同一个 ID 各自只读到本租户的数据', async () => {
+    const { of, consumer, key } = shared;
+    const globex = await otherTenant(consumer);
+    const ours = await lookup(`/api/v1/consumers/${consumer}`, key);
+    expect(ours.status).toBe(200);
+    expect(ours.body.rfm.segment).not.toBe('globex_only');
+    const theirs = await lookup(`/api/v1/consumers/${consumer}`, globex.key);
+    expect(theirs).toMatchObject({ status: 200, body: { tags: {}, metrics: {}, rfm: { segment: 'globex_only' }, serving_version: 1 } });
+    expect(theirs.body.snapshots.map((s: { id: string }) => s.id)).toEqual([globex.snapshot]);
+
+    expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${of('rfm').id}`, globex.key)).status).toBe(404);
+    expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${globex.snapshot}`, key)).status).toBe(404);
+    expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${globex.snapshot}`, globex.key)).body.rfm.segment).toBe('globex_only');
   });
 });
