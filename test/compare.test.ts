@@ -1,4 +1,7 @@
-// test/compare.test.ts —— 共用的字符串比较（ADR-0045）：给用户看的名字按 zh-CN（拼音、汉字在拉丁字母前），内部键按码点；结果与进程的默认 locale 无关（纯函数）
+// test/compare.test.ts —— 共用的字符串比较（ADR-0045）：给用户看的名字按 zh-CN（拼音、汉字在拉丁字母前），内部键按码点；结果与进程的默认 locale 无关（纯函数）。
+// 另有一个守卫读 app/ 源码：除 compare.ts 外不许直接调用 localeCompare
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { cmp, cmpName } from '../app/lib/compare';
 
@@ -29,5 +32,25 @@ describe('cmp：内部键按码点', () => {
 
   it('相同为 0', () => {
     expect(cmp('silver.order', 'silver.order')).toBe(0);
+  });
+});
+
+describe('守卫：app/ 只经 compare.ts 比较字符串', () => {
+  const root = join(import.meta.dirname, '..');
+  const listSourceFiles = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name);
+    return entry.isDirectory() ? listSourceFiles(path) : /\.tsx?$/.test(entry.name) ? [path] : [];
+  });
+
+  it('除 app/lib/compare.ts 外不出现 localeCompare(（注释行不算）', () => {
+    const violations = listSourceFiles(join(root, 'app'))
+      .map((path) => relative(root, path))
+      .filter((file) => file !== join('app', 'lib', 'compare.ts'))
+      .flatMap((file) => readFileSync(join(root, file), 'utf8').split('\n').flatMap((line, i) => {
+        const trimmed = line.trim();
+        const isComment = trimmed.startsWith('//') || trimmed.startsWith('*');
+        return !isComment && trimmed.includes('localeCompare(') ? [`${file}:${i + 1}`] : [];
+      }));
+    expect(violations, `改用 app/lib/compare.ts 的 cmp / cmpName（ADR-0045）：\n${violations.join('\n')}`).toEqual([]);
   });
 });

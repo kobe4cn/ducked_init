@@ -24,6 +24,7 @@ import { lockForSave } from './sandbox';
 import { tenantPiiSalt } from './secrets';
 import { confirmedTables } from './sources';
 import { normalizeEmail } from './tenants';
+import { cmpName } from '../lib/compare';
 import { looksSensitive } from '../lib/sensitive';
 
 export { SANDBOX_TTL_DAYS } from './db/schema';
@@ -194,7 +195,7 @@ export async function listCatalog(actor: CurrentMember): Promise<WorkbenchCatalo
         name, tables: views.filter(v => v.catalog === name).map(v => ({ name: v.name, ref: `${quoted(name)}.${quoted(v.name)}`, columns: v.columns })),
       })),
       ...raw.skipped.map(({ name, reason }) => ({ name, tables: [], error: redact(reason, spec, salt) })),
-    ].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+    ].sort((a, b) => cmpName(a.name, b.name));
     return catalog;
   } catch (e) {
     throw new WorkbenchError(`目录读取出错：${redact((e as Error).message, spec, salt)}`);

@@ -16,9 +16,6 @@ process.env.PLATFORM_DATABASE_URL =
 process.env.PLATFORM_LAKE_URI = join(tmpdir(), 'crm_platform_test_lake');
 // 数据源夹具所在的源库（测试会重建其中的 shop schema 与两个测试账号）
 process.env.TEST_SOURCE_DATABASE_URL ??= 'postgres://crm:crm@localhost:5432/crm_source_test';
-// 排序（localeCompare）与格式化按 ICU 的默认 locale，它取自 LC_ALL / LANG：固定成 en-US，免得结果随开发者 shell 的语言变化
-// （zh_CN 下「CRM」排在「会员」之后）。worker 是 fork 出来的子进程，启动时读到这里设的值
-process.env.LC_ALL = 'en_US.UTF-8';
 // 测试不真正发信：即使 shell 里有 MAIL_HOST，默认实现也是输出到控制台（HTTP 测试另用收件箱替换）
 process.env.MAILER = 'console';
 // 测试不调用真实的模型服务：本地 .env.test 或 shell 里的平台默认配置不带进测试，要测时用 vi.stubEnv

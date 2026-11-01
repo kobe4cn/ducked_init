@@ -2,6 +2,7 @@
 // 报告缺列、多列、类型不一致与孤表。在工作进程里运行，数据湖只读挂载，只出报告、不改湖；修复走合并（ADR-0014）。
 // 应有结构在入队时由平台算好放进参数（工作进程不连平台库）。_ 开头的内部表（_merges、_identities、_device_owner）不检查
 import type { DuckDBConnection } from '@duckdb/node-api';
+import { cmp } from '../../lib/compare';
 
 /** 应有结构：表名 → 列名 → DuckDB 类型 */
 export type InspectParams = { expected: Record<string, Record<string, string>> };
@@ -49,8 +50,8 @@ export async function inspectLake(con: DuckDBConnection, { expected }: InspectPa
       if (!Object.hasOwn(want, column)) drifts.push({ table, kind: 'extra', column, actual: type });
     }
   }
-  drifts.sort((a, b) => a.table.localeCompare(b.table)
+  drifts.sort((a, b) => cmp(a.table, b.table)
     || KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind)
-    || (a.column ?? '').localeCompare(b.column ?? ''));
+    || cmp(a.column ?? '', b.column ?? ''));
   return { drifts };
 }

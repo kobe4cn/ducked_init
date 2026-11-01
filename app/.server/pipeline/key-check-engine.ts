@@ -2,6 +2,7 @@
 // 以及重叠的键里两边都映射了的字段全部一致的比例，按比例给出建议。在工作进程里运行，数据湖只读挂载，只出报告、不改标准层。
 // 实体的主键、是否按数据源比较与各映射的列在入队时由平台算好放进参数（工作进程不连平台库）
 import type { DuckDBConnection } from '@duckdb/node-api';
+import { cmp } from '../../lib/compare';
 import { customerSourceColumn } from '../../lib/customer-source';
 import { SILVER } from './lake-schemas';
 import { columnExists, ident, joinOn, keyList, lit, rows, silverTable, SILVER_SYSTEM_COLUMNS, tableExists } from './merge-engine';
@@ -80,7 +81,7 @@ export async function runKeyCheck(con: DuckDBConnection, { entities }: KeyCheckP
     }
     if (pairs.length) result.push({ entity, bySource, pairs });
   }
-  return { entities: result.sort((x, y) => x.entity.localeCompare(y.entity)) };
+  return { entities: result.sort((x, y) => cmp(x.entity, y.entity)) };
 }
 
 /**

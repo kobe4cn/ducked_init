@@ -10,7 +10,7 @@ CRM_TEST_WORKERS=1 pnpm test                 # 只用一个 worker（串行）
 npx vitest run test/pipeline/mapping-merge.test.ts # 单个文件
 ```
 
-- `vitest.config.ts` 设好了测试环境的基准值：平台 PG `crm_platform_test`、源库 `crm_source_test`（都在 `localhost:5432`，账号 `crm/crm`）、本地临时目录作数据湖、固定的主密钥、`MAILER=console`、`SOURCE_LARGE_TABLE_ROWS=1000`、`LC_ALL=en_US.UTF-8`（`localeCompare` 的排序不随 shell 的语言变化）。
+- `vitest.config.ts` 设好了测试环境的基准值：平台 PG `crm_platform_test`、源库 `crm_source_test`（都在 `localhost:5432`，账号 `crm/crm`）、本地临时目录作数据湖、固定的主密钥、`MAILER=console`、`SOURCE_LARGE_TABLE_ROWS=1000`。不固定 `LC_ALL`：`app/` 的排序一律经 `app/lib/compare.ts` 显式给出 locale（ADR-0045），由 `test/compare.test.ts` 的守卫把关。
 - 本地的 `.env.test`（模板 `.env.test.example`）提供可选的外部依赖；没配置时相应的 `describe.skipIf(...)` 自动跳过：
   - `TEST_S3_LAKE_URI`：对象存储上的隔离测试与文件数据源
   - `TEST_MYSQL_URL`：MySQL 数据源

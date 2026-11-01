@@ -10,4 +10,4 @@
 
 **合并组。** 合并组页的候选映射按 `cmpName` 排序。这只是给人看的顺序；合并组的优先级是 `members` 数组的顺序（ADR-0032），与候选列表的顺序无关。
 
-**迁移。** `app/lib/lineage.ts` 原有的 `cmp` 搬进 `compare.ts`，`lineage.ts` 仍导出它，原引用方不用改。`app/` 里其余不带 locale 参数的 `localeCompare` 由后续工单按上面的约定逐处改成 `cmp` 或 `cmpName`。全部改完后，`vitest.config.ts` 里把测试的 `LC_ALL` 固定成 `en_US.UTF-8` 的那行就该去掉，免得它掩盖新的不带 locale 的比较。
+**迁移。** `app/lib/lineage.ts` 原有的 `cmp` 搬进 `compare.ts`，`lineage.ts` 仍导出它，原引用方不用改。`app/` 里其余不带 locale 参数的 `localeCompare` 已按上面的约定逐处改成 `cmp` 或 `cmpName`（#314、#315）；`vitest.config.ts` 不再把测试的 `LC_ALL` 固定成 `en_US.UTF-8`，改由 `test/compare.test.ts` 的守卫保证 `app/` 里除 `compare.ts` 外不出现 `localeCompare(`。
