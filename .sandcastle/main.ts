@@ -13,13 +13,17 @@
 //                    最多 MAX_PARALLEL 张并行，每个沙箱用独立的测试库与前缀。
 //   Phase 3 (Land):  在宿主机上 push、开 PR（`Closes #n`）。reviewer 说 merge 且门槛通过
 //                    → `gh pr merge --rebase`，issue 自动关闭；否则打 sandcastle:pr-open 等人审。
+//                    合并不了（同一轮先合并的票造成冲突，或 drizzle 迁移链分叉）时，rebase 到
+//                    最新的 origin/main（冲突与迁移交给 agent，rebase-prompt.md），重跑门槛后再合并一次。
 //
 // 标签状态机见 docs/agents/sandcastle.md。
 //
 // Usage: npm run run:sandcastle
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import { parseEnv } from "node:util";
 import * as sandcastle from "@ai-hero/sandcastle";
 import { podman } from "@ai-hero/sandcastle/sandboxes/podman";
@@ -87,7 +91,36 @@ function testEnv(issueId: string): Record<string, string> {
   if (TEST_MONGO_URL) env.TEST_MONGO_URL = withDbSuffix(toContainer(TEST_MONGO_URL), suffix);
   if (TEST_MYSQL_URL) env.TEST_MYSQL_URL = withDbSuffix(toContainer(TEST_MYSQL_URL), suffix);
   if (TEST_S3_LAKE_URI) env.TEST_S3_LAKE_URI = TEST_S3_LAKE_URI + suffix;
-  return env;
+  return { ...env, ...browserEnv(suffix) };
+}
+
+// 浏览器验收用的 dev server 与 scripts/browser-lab.ts：独立的平台库（不碰开发库 crm_platform，也不被测试清表）、
+// 本地湖目录、固定的测试主密钥、发信打到日志。vitest.config.ts 会为测试覆盖这几个变量，门槛不受影响。
+function browserEnv(suffix: string): Record<string, string> {
+  return {
+    PLATFORM_DATABASE_URL: withDbSuffix(toContainer("postgres://crm:crm@localhost:5432/crm_platform_browser"), suffix),
+    PLATFORM_LAKE_URI: "/tmp/crm_browser_lake",
+    PLATFORM_MASTER_KEY: Buffer.alloc(32, 7).toString("base64"),
+    MAILER: "console",
+  };
+}
+
+// 浏览器验收的产物：implementer 写在 worktree 的 .browser-check/（.gitignore 忽略），
+// 关沙箱前拷到宿主机，开 PR 时把截图用 `gh --attach` 附上、RESULT.md 写进正文。
+const BROWSER_DIR = ".browser-check";
+const SHOTS_ROOT = join(tmpdir(), "sandcastle-browser-check");
+
+function collectBrowserCheck(worktreePath: string, issueId: string) {
+  const from = join(worktreePath, BROWSER_DIR);
+  if (!existsSync(from)) return undefined;
+  const to = join(SHOTS_ROOT, `issue-${issueId}`);
+  rmSync(to, { recursive: true, force: true });
+  cpSync(from, to, { recursive: true });
+  const resultFile = join(to, "RESULT.md");
+  return {
+    result: existsSync(resultFile) ? readFileSync(resultFile, "utf8").trim() : undefined,
+    shots: readdirSync(to).filter((f) => /\.(png|jpe?g)$/i.test(f)).sort().map((f) => join(to, f)),
+  };
 }
 
 const shellQuote = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
@@ -156,20 +189,24 @@ const tagged = (stdout: string, tag: string) =>
 
 type Issue = { id: string; title: string; branch: string };
 
-function pushAndOpenPr(issue: Issue, notes: string): string {
+/** 截图附件：gh 2.99+ 的 --attach 上传图片，没在正文里引用的附在末尾 */
+const attachArgs = (shots: string[]) =>
+  shots.flatMap((file) => ["--attach", `${file}#${basename(file)}`]);
+
+function pushAndOpenPr(issue: Issue, notes: string, shots: string[]): string {
   sh("git", ["push", "--force-with-lease", "-u", REMOTE, issue.branch]);
   const existing = sh("gh", [
     "pr", "list", "--head", issue.branch, "--state", "open", "--json", "number", "--jq", ".[0].number",
   ]);
   if (existing) {
-    sh("gh", ["pr", "comment", existing, "--body", `Sandcastle 更新了这个分支。\n\n${notes}`]);
+    sh("gh", ["pr", "comment", existing, "--body", `Sandcastle 更新了这个分支。\n\n${notes}`, ...attachArgs(shots)]);
     return existing;
   }
   const commits = sh("git", ["log", `${BASE_REF}..${issue.branch}`, "--format=- %B"]);
   const body = `Closes #${issue.id}\n\n${notes}\n\n## Commits\n\n${commits}`;
   const url = sh("gh", [
     "pr", "create", "--base", BASE_BRANCH, "--head", issue.branch,
-    "--title", `${issue.title} (#${issue.id})`, "--body", body,
+    "--title", `${issue.title} (#${issue.id})`, "--body", body, ...attachArgs(shots),
   ]);
   return url.split("/").pop()!;
 }
@@ -245,7 +282,94 @@ async function build(issue: Issue) {
       verdict: tagged(review.stdout, "verdict"),
       summary: tagged(review.stdout, "review-summary") ?? "（reviewer 没有给出摘要）",
       gate: { ok: gateResult.exitCode === 0, output: gateResult.stdout.slice(-3000) },
+      browser: collectBrowserCheck(sandbox.worktreePath, issue.id),
     };
+  } finally {
+    await sandbox.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rebase + retry merge（合并失败时）
+// ---------------------------------------------------------------------------
+
+const REBASE_STATE = "test -d \"$(git rev-parse --git-path rebase-merge)\" || test -d \"$(git rev-parse --git-path rebase-apply)\"";
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// drizzle 迁移按目录排序、靠 snapshot.json 的 prevIds 串成链。两张票各生成一个迁移时 rebase 没有文本冲突，
+// 但链分叉了：本票加的第一个迁移的 prevIds 必须含 origin/main 最新迁移的 id，否则要重新生成。
+const migrationChainOk = (head: string) => [
+  `MIG=$(git diff --name-only --diff-filter=A ${BASE_REF}...${head} -- 'drizzle/*/snapshot.json' | sort | head -1)`,
+  '[ -z "$MIG" ] && exit 0',
+  `LATEST=$(git ls-tree --name-only ${BASE_REF} drizzle/ | sort | tail -1)`,
+  `ID=$(git show ${BASE_REF}:$LATEST/snapshot.json | jq -r .id)`,
+  `git show ${head}:$MIG | jq -e --arg id "$ID" '.prevIds | index($id)' > /dev/null`,
+].join("; ");
+const MIGRATION_CHAIN_OK = migrationChainOk("HEAD");
+
+/**
+ * 把分支 rebase 到最新的 origin/main：没冲突直接 rebase；有冲突开一次 agent 会话按
+ * rebase-prompt.md 解决。然后重跑门槛，通过才 force-push 并再合并一次。
+ * 任何一步不成都返回原因，由调用方留 PR。
+ */
+async function rebaseAndMerge(issue: Issue, pr: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+  const env = testEnv(issue.id);
+  const sandbox = await sandcastle.createSandbox({ branch: issue.branch, baseBranch: BASE_REF, sandbox: podman(), hooks, copyToWorktree });
+  try {
+    const behind = await sandbox.exec(`git merge-base --is-ancestor ${BASE_REF} HEAD`);
+    if (behind.exitCode === 0) {
+      return { ok: false, reason: `分支已经包含最新的 ${BASE_REF}，失败不是冲突造成的，需要人看。` };
+    }
+
+    const rebase = await sandbox.exec(`git rebase ${BASE_REF}`);
+    const conflicted = rebase.exitCode !== 0;
+    const chainBroken = !conflicted && (await sandbox.exec(MIGRATION_CHAIN_OK)).exitCode !== 0;
+    if (conflicted || chainBroken) {
+      await sandbox.run({
+        name: `rebase-${issue.id}`,
+        maxIterations: 1,
+        agent: agent(env),
+        promptFile: "./.sandcastle/rebase-prompt.md",
+        promptArgs: {
+          TASK_ID: issue.id,
+          BRANCH: issue.branch,
+          BASE: BASE_REF,
+          SITUATION: conflicted
+            ? `\`git rebase ${BASE_REF}\` 停在冲突上（rebase 进行中）。`
+            : `rebase 没有冲突，但本票的 drizzle 迁移没有接在 ${BASE_REF} 最新的迁移后面，需要重新生成。`,
+        },
+      });
+      if ((await sandbox.exec(REBASE_STATE)).exitCode === 0) {
+        await sandbox.exec("git rebase --abort");
+        return { ok: false, reason: "agent 没能解决 rebase 冲突（原因见 issue 评论）。" };
+      }
+      if ((await sandbox.exec(`git merge-base --is-ancestor ${BASE_REF} HEAD`)).exitCode !== 0) {
+        return { ok: false, reason: `处理后分支仍不在 ${BASE_REF} 之上。` };
+      }
+      if ((await sandbox.exec(MIGRATION_CHAIN_OK)).exitCode !== 0) {
+        return { ok: false, reason: `drizzle 迁移仍没有接在 ${BASE_REF} 最新的迁移后面。` };
+      }
+    }
+
+    const gate = await sandbox.exec(`${envPrefix(env)} sh -c ${shellQuote(GATE_SCRIPT)}`);
+    if (gate.exitCode !== 0) {
+      return { ok: false, reason: `rebase 后门槛失败：\n\n\`\`\`\n${gate.stdout.slice(-2000)}\n\`\`\`` };
+    }
+
+    sh("git", ["push", "--force-with-lease", REMOTE, issue.branch]);
+    // GitHub 重新计算可合并状态要一点时间。
+    let last = "";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await sleep(10_000);
+      const merged = trySh("gh", ["pr", "merge", pr, "--rebase"]);
+      if (merged.ok) {
+        sh("gh", ["pr", "comment", pr, "--body", `Sandcastle 把分支 rebase 到最新的 ${BASE_REF}，门槛重跑通过后合并。`]);
+        return { ok: true };
+      }
+      last = merged.out;
+    }
+    return { ok: false, reason: `rebase 并通过门槛后仍合并失败：${last.slice(0, 300)}` };
   } finally {
     await sandbox.close();
   }
@@ -324,9 +448,13 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     const gateNote = result.gate.ok
       ? `typecheck 与完整测试通过（沙箱内）。\n\n\`\`\`\n${result.gate.output.slice(-500)}\n\`\`\``
       : `❌ 门槛失败：\n\n\`\`\`\n${result.gate.output}\n\`\`\``;
+    const browserNote = result.browser
+      ? `\n\n## Browser check\n\n${result.browser.result ?? "（implementer 没有写 RESULT.md）"}\n\n截图 ${result.browser.shots.length} 张，附在下面。`
+      : "";
     const pr = pushAndOpenPr(
       issue,
-      `## Review\n\n${result.summary}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}`,
+      `## Review\n\n${result.summary}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}`,
+      result.browser?.shots ?? [],
     );
 
     if (result.verdict !== "merge") {
@@ -339,12 +467,21 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       console.log(`  ◐ #${issue.id} 门槛失败，留 PR #${pr}`);
       continue;
     }
-    // 同一轮先合并的票可能让这张冲突：GitHub 拒绝 rebase 合并时留给人。
-    const merged = trySh("gh", ["pr", "merge", pr, "--rebase"]);
+    // 同一轮先合并的票可能让这张冲突：rebase 到最新的 origin/main（冲突交给 agent）、重跑门槛，再合并一次。
+    // 迁移链要先在宿主机上查：没有文本冲突时 GitHub 会照样合并，分叉的迁移就进了 main。
+    sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+    const chainOk = trySh("sh", ["-c", migrationChainOk(issue.branch)]).ok;
+    const merged = chainOk
+      ? trySh("gh", ["pr", "merge", pr, "--rebase"])
+      : { ok: false as const, out: `本票的 drizzle 迁移没有接在 ${BASE_REF} 最新的迁移后面。` };
     if (!merged.ok) {
-      leaveForHuman(issue, pr, `合并失败（多半与同一轮先合并的票冲突）：${merged.out.slice(0, 500)}`);
-      console.log(`  ◐ #${issue.id} 合并失败，留 PR #${pr}`);
-      continue;
+      console.log(`  ↻ #${issue.id} 没能直接合并，rebase 到最新的 ${BASE_REF} 后重试`);
+      const retry = await rebaseAndMerge(issue, pr);
+      if (!retry.ok) {
+        leaveForHuman(issue, pr, `合并失败：${merged.out.slice(0, 300)}\n\nrebase 后重试也没成：${retry.reason}`);
+        console.log(`  ◐ #${issue.id} 合并失败，留 PR #${pr}`);
+        continue;
+      }
     }
     trySh("git", ["push", REMOTE, "--delete", issue.branch]);
     trySh("git", ["branch", "-D", issue.branch]);

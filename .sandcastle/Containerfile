@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y \
   git \
   curl \
   jq \
+  fonts-noto-cjk \
   && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI
@@ -13,6 +14,15 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
   && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
   | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
   && apt-get update && apt-get install -y gh \
+  && rm -rf /var/lib/apt/lists/*
+
+# 浏览器验收（docs/agents/sandcastle.md「浏览器验收」）：playwright-cli 与无头 Chromium。
+# linux/arm64 没有 Google Chrome，所以用 Playwright 自带的 Chromium；浏览器装在共享目录，agent 用户也能用。
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PLAYWRIGHT_MCP_BROWSER=chromium
+RUN npm install -g @playwright/cli@0.1.23 \
+  && node "$(npm root -g)/@playwright/cli/node_modules/playwright/cli.js" install --with-deps chromium \
+  && chmod -R a+rX /ms-playwright \
   && rm -rf /var/lib/apt/lists/*
 
 # Build-args for UID/GID alignment: sandcastle docker build-image

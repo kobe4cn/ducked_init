@@ -255,6 +255,8 @@ describe('<功能>', () => {
 
 ## 浏览器验收（ego-browser）
 
+（Sandcastle 沙箱里没有 ego-browser，改用 playwright-cli，见 `docs/agents/sandcastle.md`「浏览器验收」。）
+
 HTTP 测试只看得到服务端渲染的 HTML。改了页面（`app/routes/*.tsx`、`app/components/`）的话，HTTP 测试通过后，再用 `ego-browser` skill 在真实浏览器里走一遍。它不进 `pnpm test`，也不能代替回归测试：能写成 HTTP 断言的就写成测试。浏览器只看测试看不到的东西：布局是否符合 `docs/agents/ui.md`、客户端交互（添加一行、Ctrl / ⌘ + Enter、展开目录等），以及页面或服务端有没有报错。
 
 ### 起 dev server

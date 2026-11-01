@@ -29,7 +29,7 @@ Every `ready-for-agent` ticket ends with this section. It holds conclusions only
 - **Reuse**: `fnName(arg: Type): Ret` in `path:line`; the table `x` with columns `a, b`.
 - **ADRs**: 0006, 0015 (only the relevant ones).
 - **Tests**: which file, which seam, which fixtures from `test/README.md`, and one similar existing test to copy (from `test/CATALOG.md`, as `file` + `it` name).
-- **Browser check** (only when the ticket changes a page): which page to open as which role, what to do, and what you should see. The `/implement` agent runs it with ego-browser after the HTTP tests pass (see "浏览器验收" in `test/README.md`).
+- **Browser check** (only when the ticket changes a page): which page to open as which role, what to do, and what you should see. The `/implement` agent runs it with ego-browser after the HTTP tests pass (see "浏览器验收" in `test/README.md`); a Sandcastle sandbox runs it with `playwright-cli` instead (see `docs/agents/sandcastle.md`).
 - **Watch out**: non-obvious constraints (privacy rules, permissions, migrations).
 ```
 
