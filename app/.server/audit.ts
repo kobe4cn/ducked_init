@@ -18,6 +18,9 @@ const templateLabel = (template: unknown) => TEMPLATES[template as keyof typeof 
 const credentialLabel = (d: Detail) => `「${d.name}」（${d.prefix}…）`;
 /** 业务知识的目标（ADR-0046）：目录条目标识，映射字段再带映射 ID */
 const knowledgeTarget = (d: Detail) => `${d.targetId}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}`;
+/** 分析主题与主题归属（ADR-0046）：只有主题 ID，不记主题名 */
+const subjectTarget = (d: Detail) => `主题 ${d.subjectId}`;
+const membershipTarget = (verb: string) => (d: Detail) => `${d.targetId} ${verb}主题 ${d.subjectId}`;
 const dslLabel = (d: Detail) => (d.kind === 'tag' ? '标签' : '指标');
 /** 映射生成稿的来源（mapping_generations.origin）在审计里的说法 */
 const GENERATION_ORIGIN: Record<'model' | 'rules' | 'reuse' | 'assertions', string> = {
@@ -236,6 +239,12 @@ const ACTIONS = {
     label: '保存口径声明',
     describe: (d: Detail) => `${knowledgeTarget(d)}：${claimTypeLabel(String(d.type))}`,
   },
+  // 分析主题与主题归属（ADR-0046）：detail 只有 subjectId（与 targetId），不记主题名
+  'analysis_subject.created': { label: '新建分析主题', describe: subjectTarget },
+  'analysis_subject.renamed': { label: '修改分析主题名', describe: subjectTarget },
+  'analysis_subject.deleted': { label: '删除分析主题', describe: subjectTarget },
+  'subject_membership.added': { label: '加入分析主题', describe: membershipTarget('加入') },
+  'subject_membership.removed': { label: '移出分析主题', describe: membershipTarget('移出') },
   'merge_group.saved': {
     label: '保存合并组草稿',
     describe: (d: Detail) => `${entityLabel(String(d.entity))}，第 ${d.version} 版草稿，${(d.members as string[]).length} 个映射，${d.rule}`,

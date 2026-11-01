@@ -758,6 +758,24 @@ export const semanticClaims = platform.table('semantic_claims', {
   index('semantic_claims_target_idx').on(t.tenantId, t.targetId, t.mappingId, t.claimType, t.createdAt),
 ]);
 
+// 分析主题（ADR-0046）：成员建的多对多分类，只用来检索加权和区分口径，本身不是目录条目。同租户主题名（不分大小写）唯一
+export const analysisSubjects = platform.table('analysis_subjects', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  createdByEmail: text('created_by_email').notNull(),
+  createdAt: createdAt(),
+}, t => [uniqueIndex('analysis_subjects_tenant_name_uq').on(t.tenantId, sql`lower(${t.name})`)]);
+
+// 主题归属：当前状态表，加入插一行、移出删掉，历史靠审计。target_id 是目录条目标识（entity:x、field:e.f、metric:k、tag:k），不到映射字段
+export const subjectMemberships = platform.table('subject_memberships', {
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  subjectId: uuid('subject_id').notNull().references(() => analysisSubjects.id, { onDelete: 'cascade' }),
+  targetId: text('target_id').notNull(),
+  createdByEmail: text('created_by_email').notNull(),
+  createdAt: createdAt(),
+}, t => [primaryKey({ columns: [t.subjectId, t.targetId] }), index('subject_memberships_tenant_idx').on(t.tenantId)]);
+
 // 语义目录的版本（ADR-0041）：目录的结构或含义变了才记一版。snapshot 是去掉统计后的全部条目，diff 是与上一版按条目标识比出的差异；
 // reason 是触发的审计动作（或 catalog.initial 之类）
 export const catalogVersions = platform.table('catalog_versions', {
