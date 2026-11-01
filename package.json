@@ -9,6 +9,8 @@
     "start": "react-router-serve ./build/server/index.js",
     "typecheck": "react-router typegen && tsc",
     "test": "vitest run",
+    "test:timing": "rm -f /tmp/crm-test-timing.jsonl && TEST_TIMING=/tmp/crm-test-timing.jsonl vitest run --reporter=default --reporter=json --outputFile.json=/tmp/crm-test-results.json",
+    "test:report": "node --import tsx scripts/test-duration-report.ts /tmp/crm-test-results.json /tmp/crm-test-timing.jsonl > /tmp/crm-test-report.md",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "tenant:create": "node --env-file-if-exists=.env --import tsx scripts/create-tenant.ts",

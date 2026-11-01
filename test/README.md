@@ -16,6 +16,18 @@ npx vitest run test/pipeline/mapping.test.ts # 单个文件
   - `TEST_MONGO_URL`：MongoDB 数据源
 - `test/global-setup.ts` 在开跑前建库并迁移到最新结构。所有测试共用一个库，**文件串行执行**（`fileParallelism: false`）；它还加了一把锁，已有 vitest 在跑时，再启动的 vitest 会直接报错退出。
 
+### 测量耗时
+
+```bash
+pnpm test:timing > /tmp/crm-test-full.log 2>&1   # 完整测试，同时记下每个文件、每个测试与夹具的耗时
+pnpm test:report                                 # 汇总成 Markdown，写到 /tmp/crm-test-report.md（最慢的文件与测试、夹具与任务的固定开销、按接缝）
+```
+
+- `test:timing` 设置 `TEST_TIMING=/tmp/crm-test-timing.jsonl`，并用 vitest 的 JSON reporter 把结果写到 `/tmp/crm-test-results.json`。测试的 `duration` 含 beforeEach / afterEach。
+- `test/timing.ts` 的 `timed(name, fn)` 包住了 `startApp`、`resetDb`、`runCli`、`newTenant`、`runTask`、`publish`、`mergeUnchecked`、`publishedIdentitySources`，每次调用追加一行 `{ name, ms, file, test }`；`resetDb` 清表前还把 `platform.tasks` 里每个任务的耗时记成 `task:<kind>`。不设 `TEST_TIMING` 时不计时，行为不变。
+- 单个文件也能用：`TEST_TIMING=/tmp/t.jsonl npx vitest run <文件> --reporter=json --outputFile.json=/tmp/t.json`，再 `node --import tsx scripts/test-duration-report.ts /tmp/t.json /tmp/t.jsonl`。
+- 上一次的实测与优化方向见 `docs/test-plans/test-duration-report.md`。
+
 ## 两种接缝，选哪个
 
 | 接缝 | 目录 | 驱动方式 | 用在 |

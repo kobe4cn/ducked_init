@@ -10,6 +10,7 @@ import { PNG } from 'pngjs';
 import type { Mail } from '../../app/.server/mailer';
 import { deleteTenantS3Account } from '../../app/.server/s3-accounts';
 import { totpCode } from '../../app/.server/totp';
+import { record, timed, timingEnabled } from '../timing';
 
 export type { Mail };
 
@@ -79,7 +80,11 @@ export class Client {
   }
 }
 
-export async function startApp(): Promise<TestApp> {
+export function startApp(): Promise<TestApp> {
+  return timed('startApp', start);
+}
+
+async function start(): Promise<TestApp> {
   const vite: ViteDevServer = await createServer({
     configFile: 'vite.config.ts',
     // 用单独的缓存目录、不做浏览器端依赖预构建：否则会改写开发服务器正在用的 node_modules/.vite/deps，
@@ -118,7 +123,11 @@ export async function startApp(): Promise<TestApp> {
 }
 
 /** 清空平台元数据与租户数据湖（catalog schema、数据库角色与只读角色、对象存储账号、本地存储前缀），保证每个用例从空库开始 */
-export async function resetDb() {
+export function resetDb() {
+  return timed('resetDb', reset);
+}
+
+async function reset() {
   const client = new pg.Client({ connectionString: process.env.PLATFORM_DATABASE_URL });
   await client.connect();
   const { rows } = await client.query<{ tenant_id: string; data_path: string; catalog_schema: string; db_role: string; ro_db_role: string | null }>(
@@ -129,6 +138,12 @@ export async function resetDb() {
     // 上一轮在对象存储上跑、这一轮没有配置对象存储时，留下的账号不清（租户 ID 每次不同，不会冲突）
     if (r.data_path.startsWith('s3://') && process.env.TEST_S3_LAKE_URI) await deleteTenantS3Account(r.tenant_id);
   }
+  // 开启计时时，清表前把各任务的耗时记下（应用内部的开销用任务表近似；beforeAll 里清库的文件，最后一批任务记在下一个文件名下）
+  if (timingEnabled()) {
+    const tasks = await client.query<{ kind: string; ms: string; status: string }>(
+      'SELECT kind, status, EXTRACT(EPOCH FROM finished_at - started_at) * 1000 AS ms FROM platform.tasks WHERE finished_at IS NOT NULL AND started_at IS NOT NULL');
+    for (const t of tasks.rows) record(`task:${t.kind}`, Number(t.ms), { status: t.status });
+  }
   await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions, platform.tenant_lakes, platform.tasks, platform.lake_migrations CASCADE');
   await client.end();
   // 对象存储上的数据不清：租户 ID 每次不同，前缀不会重叠
@@ -136,12 +151,14 @@ export async function resetDb() {
 }
 
 /** 以运营者身份执行命令行（与 pnpm tenant:create 相同的入口）；input 为标准输入（交互确认），env 覆盖环境变量 */
-export async function runCli(script: string, args: string[], { input, env }: { input?: string; env?: Record<string, string> } = {}) {
-  const run = promisify(execFile)(process.execPath, ['--import', 'tsx', script, ...args], {
-    env: { ...process.env, ...env },
+export function runCli(script: string, args: string[], { input, env }: { input?: string; env?: Record<string, string> } = {}) {
+  return timed(`runCli:${script.replace(/^scripts\//, '')}`, () => {
+    const run = promisify(execFile)(process.execPath, ['--import', 'tsx', script, ...args], {
+      env: { ...process.env, ...env },
+    });
+    run.child.stdin?.end(input ?? '');
+    return run.then(r => ({ ...r, code: 0 }), (e: { stdout: string; stderr: string; code: number }) => e);
   });
-  run.child.stdin?.end(input ?? '');
-  return run.then(r => ({ ...r, code: 0 }), (e: { stdout: string; stderr: string; code: number }) => e);
 }
 
 /** 以运营者身份开通租户（与 pnpm tenant:create 相同的入口） */
