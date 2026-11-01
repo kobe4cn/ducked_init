@@ -15,12 +15,13 @@ import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { listObjects } from '../../app/.server/s3-client';
 import { claimNextTask, enqueueTask, finishTask, getTask } from '../../app/.server/tasks';
 import { resetDb, runCli } from '../http/harness';
+import { WORKER_SUFFIX } from '../setup-env';
 import { newTenant, runTask } from './fixtures';
 
 afterAll(async () => { await closeDb(); });
 
-// 迁移的目标根：本地目录总是测，对象存储在设置了 TEST_S3_LAKE_URI 时测
-const LOCAL_TARGET = join(tmpdir(), 'crm_platform_test_lake_moved');
+// 迁移的目标根：本地目录总是测，对象存储在设置了 TEST_S3_LAKE_URI 时测。按 worker 分开（TEST_S3_LAKE_URI 已带后缀，见 test/setup-env.ts）
+const LOCAL_TARGET = join(tmpdir(), `crm_platform_test_lake_moved${WORKER_SUFFIX}`);
 const S3_TARGET = process.env.TEST_S3_LAKE_URI && `${process.env.TEST_S3_LAKE_URI}/moved`;
 
 beforeEach(async () => {

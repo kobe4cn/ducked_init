@@ -25,6 +25,7 @@ import { resetDb } from '../http/harness';
 import { memberOf, newTenant, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
+import { cmp } from '../../app/lib/compare';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -235,7 +236,7 @@ describe('自动重建服务库', () => {
     expect(store.path).toBe(servingPath(dataPath, store.version));
     expect(store.snapshots).toEqual(snapshots.map(s => ({
       id: s.id, template: s.template, definitionVersion: s.definitionVersion, createdAt: s.createdAt.toISOString(), incomplete: false,
-    })).sort((a, b) => a.template.localeCompare(b.template)));
+    })).sort((a, b) => cmp(a.template, b.template)));
     expect(await readServing(acme, store.path, 'SELECT version FROM meta')).toEqual([{ version: store.version }]);
     expect(await readServing(acme, store.path, 'SELECT DISTINCT tag FROM tags')).toEqual([{ tag: 'value_tier' }]);
     const done = await builds(acme);

@@ -8,8 +8,12 @@ import pg from 'pg';
 import jsQR from 'jsqr';
 import { PNG } from 'pngjs';
 import type { Mail } from '../../app/.server/mailer';
+import * as opsAuth from '../../app/.server/ops-auth';
 import { deleteTenantS3Account } from '../../app/.server/s3-accounts';
+import * as tenants from '../../app/.server/tenants';
 import { totpCode } from '../../app/.server/totp';
+import { record, timed, timingEnabled } from '../timing';
+import { WORKER_SUFFIX } from '../setup-env';
 
 export type { Mail };
 
@@ -79,12 +83,16 @@ export class Client {
   }
 }
 
-export async function startApp(): Promise<TestApp> {
+export function startApp(): Promise<TestApp> {
+  return timed('startApp', start);
+}
+
+async function start(): Promise<TestApp> {
   const vite: ViteDevServer = await createServer({
     configFile: 'vite.config.ts',
     // 用单独的缓存目录、不做浏览器端依赖预构建：否则会改写开发服务器正在用的 node_modules/.vite/deps，
-    // 浏览器随后请求依赖时收到 504（Outdated Optimize Dep）
-    cacheDir: 'node_modules/.vite-test',
+    // 浏览器随后请求依赖时收到 504（Outdated Optimize Dep）。每个 worker 一个（见 test/setup-env.ts）
+    cacheDir: `node_modules/.vite-test${WORKER_SUFFIX}`,
     optimizeDeps: { noDiscovery: true, include: [] },
     server: { middlewareMode: true, hmr: false, watch: null },
     appType: 'custom',
@@ -118,7 +126,11 @@ export async function startApp(): Promise<TestApp> {
 }
 
 /** 清空平台元数据与租户数据湖（catalog schema、数据库角色与只读角色、对象存储账号、本地存储前缀），保证每个用例从空库开始 */
-export async function resetDb() {
+export function resetDb() {
+  return timed('resetDb', reset);
+}
+
+async function reset() {
   const client = new pg.Client({ connectionString: process.env.PLATFORM_DATABASE_URL });
   await client.connect();
   const { rows } = await client.query<{ tenant_id: string; data_path: string; catalog_schema: string; db_role: string; ro_db_role: string | null }>(
@@ -129,6 +141,12 @@ export async function resetDb() {
     // 上一轮在对象存储上跑、这一轮没有配置对象存储时，留下的账号不清（租户 ID 每次不同，不会冲突）
     if (r.data_path.startsWith('s3://') && process.env.TEST_S3_LAKE_URI) await deleteTenantS3Account(r.tenant_id);
   }
+  // 开启计时时，清表前把各任务的耗时记下（应用内部的开销用任务表近似；beforeAll 里清库的文件，最后一批任务记在下一个文件名下）
+  if (timingEnabled()) {
+    const tasks = await client.query<{ kind: string; ms: string; status: string }>(
+      'SELECT kind, status, EXTRACT(EPOCH FROM finished_at - started_at) * 1000 AS ms FROM platform.tasks WHERE finished_at IS NOT NULL AND started_at IS NOT NULL');
+    for (const t of tasks.rows) record(`task:${t.kind}`, Number(t.ms), { status: t.status });
+  }
   await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions, platform.tenant_lakes, platform.tasks, platform.lake_migrations CASCADE');
   await client.end();
   // 对象存储上的数据不清：租户 ID 每次不同，前缀不会重叠
@@ -136,23 +154,31 @@ export async function resetDb() {
 }
 
 /** 以运营者身份执行命令行（与 pnpm tenant:create 相同的入口）；input 为标准输入（交互确认），env 覆盖环境变量 */
-export async function runCli(script: string, args: string[], { input, env }: { input?: string; env?: Record<string, string> } = {}) {
-  const run = promisify(execFile)(process.execPath, ['--import', 'tsx', script, ...args], {
-    env: { ...process.env, ...env },
+export function runCli(script: string, args: string[], { input, env }: { input?: string; env?: Record<string, string> } = {}) {
+  return timed(`runCli:${script.replace(/^scripts\//, '')}`, () => {
+    const run = promisify(execFile)(process.execPath, ['--import', 'tsx', script, ...args], {
+      env: { ...process.env, ...env },
+    });
+    run.child.stdin?.end(input ?? '');
+    return run.then(r => ({ ...r, code: 0 }), (e: { stdout: string; stderr: string; code: number }) => e);
   });
-  run.child.stdin?.end(input ?? '');
-  return run.then(r => ({ ...r, code: 0 }), (e: { stdout: string; stderr: string; code: number }) => e);
 }
 
-/** 以运营者身份开通租户（与 pnpm tenant:create 相同的入口） */
+// 下面三个 helper 进程内调用运营命令背后的领域函数（不起子进程），用测试进程自己的 getDb() 连接池（和 vite 里的应用只共享数据库），
+// 用到的文件要在 afterAll 里 closeDb()。测命令行本身（输出、退出码）的用例用 runCli
+
+/**
+ * 以运营者身份开通租户：进程内调用 pnpm tenant:create 背后的同一个领域函数（不起子进程），返回 { tenant, space, admin, lakeReady }；
+ * 出错时抛 TenantError
+ */
 export const createTenant = (slug: string, name: string, adminEmail: string) =>
-  runCli('scripts/create-tenant.ts', ['--slug', slug, '--name', name, '--admin-email', adminEmail]);
+  timed('createTenant', () => tenants.createTenant({ slug, name, adminEmail }));
 
-/** 以服务器上的运营命令创建运营者（pnpm operator:create） */
-export const createOperator = (email: string) => runCli('scripts/create-operator.ts', ['--email', email]);
+/** 创建运营者：进程内调用 pnpm operator:create 背后的领域函数，返回运营者行；重复时抛错 */
+export const createOperator = (email: string) => timed('createOperator', () => opsAuth.createOperator(email));
 
-/** 以服务器上的运营命令重置运营者的 TOTP（pnpm operator:reset-totp） */
-export const resetOperatorTotp = (email: string) => runCli('scripts/reset-operator-totp.ts', ['--email', email]);
+/** 重置运营者的 TOTP：进程内调用 pnpm operator:reset-totp 背后的领域函数；运营者不存在时抛错 */
+export const resetOperatorTotp = (email: string) => timed('resetOperatorTotp', () => opsAuth.resetOperatorTotp(email));
 
 /** 从邮件正文里取出运营后台的登录链接（路径 + 查询串） */
 export function extractOpsLink(mail: Mail): string {

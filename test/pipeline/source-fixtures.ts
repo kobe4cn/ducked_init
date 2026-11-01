@@ -10,10 +10,12 @@ import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { signedFetch, xmlTag, xmlTags } from '../../app/.server/s3-client';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
+import { WORKER_SUFFIX } from '../setup-env';
 
 export const SOURCE_DB_URL = process.env.TEST_SOURCE_DATABASE_URL!;
-export const READER = { user: 'crm_src_reader', password: 'reader-p@ss\'word' };
-export const WRITER = { user: 'crm_src_writer', password: 'writer-p@ss' };
+// 源端账号是集群级的（PG 角色、MySQL 用户），按 worker 加后缀 _w<i>（见 test/setup-env.ts）
+export const READER = { user: `crm_src_reader${WORKER_SUFFIX}`, password: 'reader-p@ss\'word' };
+export const WRITER = { user: `crm_src_writer${WORKER_SUFFIX}`, password: 'writer-p@ss' };
 
 const withClient = async <T>(url: string, run: (c: pg.Client) => Promise<T>) => {
   const client = new pg.Client({ connectionString: url });
@@ -372,6 +374,6 @@ export async function seedMongoSource() {
 export const MONGO_USERS = {
   reader: READER,
   writer: WRITER,
-  partial: { user: 'crm_src_partial', password: 'partial-p@ss' },
-  stranger: { user: 'crm_src_stranger', password: 'stranger-p@ss' },
+  partial: { user: `crm_src_partial${WORKER_SUFFIX}`, password: 'partial-p@ss' },
+  stranger: { user: `crm_src_stranger${WORKER_SUFFIX}`, password: 'stranger-p@ss' },
 };

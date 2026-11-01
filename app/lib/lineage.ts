@@ -2,6 +2,7 @@
 // 字段级（标准层字段在各映射里对应的源列与表达式）与标准实体之间的关系边（含映射里声明的跨源引用，ADR-0030）。只看表达式与列名，不读数据值，不落库（ADR-0019）
 import type { MergeMappingParam } from '~/.server/pipeline/merge-engine';
 import { CANONICAL_ENTITIES, entityOf, EXTENSION_PATTERN, isCustomEntity } from './canonical-model';
+import { cmp } from './compare';
 import { customerSourceColumn } from './customer-source';
 import { parseExpression, referencedColumns } from './mapping-expr';
 
@@ -52,7 +53,7 @@ export interface Lineage { tables: TableLineage[]; fields: FieldLineage[]; edges
 const IDENTITIES = 'silver._identities';
 const DEVICE_OWNER = 'silver._device_owner';
 
-export const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+export { cmp };
 const extensionName = new RegExp(EXTENSION_PATTERN);
 
 /** 指向 customer 的边经 _identities 关联 */

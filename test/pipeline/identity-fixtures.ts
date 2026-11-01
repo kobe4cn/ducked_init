@@ -1,6 +1,7 @@
 // test/pipeline/identity-fixtures.ts —— 身份打通的夹具：CRM、会员、埋点三个数据源的映射 YAML（含订单、同意），以及开通租户、登记同步三个源并发布映射的 publishedIdentitySources
 import { memberOf, newTenant, publish } from './fixtures';
 import { seedIdentitySources } from './source-fixtures';
+import { timed } from '../timing';
 
 export const CRM = `model: 1
 entity: customer
@@ -95,7 +96,11 @@ fields:
  * 返回租户、两位成员、数据源 ID、customer 映射 ID，
  * 以及数据源 ID → 简称（crm / loyalty / tracking）
  */
-export async function publishedIdentitySources({ orders = false, consents = false, slug = 'acme' } = {}) {
+export function publishedIdentitySources({ orders = false, consents = false, slug = 'acme' } = {}) {
+  return timed('publishedIdentitySources', () => build(orders, consents, slug));
+}
+
+async function build(orders: boolean, consents: boolean, slug: string) {
   const acme = await newTenant(slug);
   const author = await memberOf(acme, `de@${slug}.com`);
   const reviewer = await memberOf(acme, `de2@${slug}.com`);

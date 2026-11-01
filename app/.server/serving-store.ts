@@ -15,6 +15,7 @@ import { servingPath } from './pipeline/serving-engine';
 import { platformS3 } from './s3-accounts';
 import { deleteObject } from './s3-client';
 import { insertTask } from './tasks';
+import { cmp } from '../lib/compare';
 
 export type ServingStore = typeof servingStores.$inferSelect;
 
@@ -62,7 +63,7 @@ async function servingSnapshots(tx: Tx, tenantId: string): Promise<(ServingStore
   for (const s of live) if (!latest.has(s.template)) latest.set(s.template, s);
   return [...latest.values()]
     .filter(s => s.template === 'rfm' || published.has(s.template))
-    .sort((a, b) => a.template.localeCompare(b.template))
+    .sort((a, b) => cmp(a.template, b.template))
     .map(s => ({
       id: s.id, template: s.template, table: s.table, definitionVersion: s.definitionVersion,
       createdAt: s.createdAt.toISOString(), incomplete: !!s.incomplete,

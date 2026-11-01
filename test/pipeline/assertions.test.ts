@@ -223,7 +223,7 @@ describe('隔离区', () => {
 });
 
 /**
- * 积分源（shop schema）：积分流水同 mapping.test.ts 的 POINT_LOGS，M001 另有 6 笔同一时刻的 +1（id 6–11，按字符串排序 '10' 会排在 '6' 前面）；
+ * 积分源（shop schema）：积分流水同 mapping-fixtures.ts 的 POINT_LOGS，M001 另有 6 笔同一时刻的 +1（id 6–11，按字符串排序 '10' 会排在 '6' 前面）；
  * 会员表里 M001 余额 56 与流水对得上，M002 余额 20：最后一笔余额是 20，但流水求和是 -10；M003 余额 10 但没有流水（按求和 0 算）
  */
 const POINTS_SOURCE = `

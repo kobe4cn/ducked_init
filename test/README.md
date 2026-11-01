@@ -5,16 +5,36 @@
 ## 运行
 
 ```bash
-pnpm test                                    # 全部（串行，较慢；输出写进文件再 grep）
-npx vitest run test/pipeline/mapping.test.ts # 单个文件
+pnpm test                                    # 全部（默认 8 个 worker 按文件并行，本机约 14 分钟；输出写进文件再 grep）
+CRM_TEST_WORKERS=1 pnpm test                 # 只用一个 worker（串行）
+npx vitest run test/pipeline/mapping-merge.test.ts # 单个文件
 ```
 
-- `vitest.config.ts` 设好了测试环境：平台 PG `crm_platform_test`、源库 `crm_source_test`（都在 `localhost:5432`，账号 `crm/crm`）、本地临时目录作数据湖、固定的主密钥、`MAILER=console`、`SOURCE_LARGE_TABLE_ROWS=1000`。
+- `vitest.config.ts` 设好了测试环境的基准值：平台 PG `crm_platform_test`、源库 `crm_source_test`（都在 `localhost:5432`，账号 `crm/crm`）、本地临时目录作数据湖、固定的主密钥、`MAILER=console`、`SOURCE_LARGE_TABLE_ROWS=1000`。不固定 `LC_ALL`：`app/` 的排序一律经 `app/lib/compare.ts` 显式给出 locale（ADR-0045），由 `test/compare.test.ts` 的守卫把关。
 - 本地的 `.env.test`（模板 `.env.test.example`）提供可选的外部依赖；没配置时相应的 `describe.skipIf(...)` 自动跳过：
   - `TEST_S3_LAKE_URI`：对象存储上的隔离测试与文件数据源
   - `TEST_MYSQL_URL`：MySQL 数据源
   - `TEST_MONGO_URL`：MongoDB 数据源
-- `test/global-setup.ts` 在开跑前建库并迁移到最新结构。所有测试共用一个库，**文件串行执行**（`fileParallelism: false`）；它还加了一把锁，已有 vitest 在跑时，再启动的 vitest 会直接报错退出。
+- **按 worker 分库，文件并行**：worker 数由 `CRM_TEST_WORKERS` 控制（默认 8，CI 设成 4，要求 PG 的 `max_connections` ≥ 300，见 `db_script/docker-compose.yml`；PG 还是默认的 100 时用 `CRM_TEST_WORKERS=4`，约 19 分钟）。`vitest.config.ts` 把基准值另存到 `CRM_TEST_BASE_*`，`test/setup-env.ts`（setupFiles）按 `VITEST_POOL_ID`（1…N）给每个 worker 加后缀 `_w<i>`：
+  - 平台库 `crm_platform_test_w<i>`、源库 `crm_source_test_w<i>`、MySQL / MongoDB 库（`TEST_MYSQL_URL` / `TEST_MONGO_URL` 的库名加后缀）
+  - 数据湖目录 `$TMPDIR/crm_platform_test_lake_w<i>`、源文件目录 `$TMPDIR/crm_platform_test_sources_w<i>`、对象存储前缀 `TEST_S3_LAKE_URI` 加后缀
+  - 集群级的源端账号 `crm_src_reader_w<i>` 等（`source-fixtures.ts`）、vite 缓存目录 `node_modules/.vite-test_w<i>`（`harness.ts`）、迁移用例的目标目录 `crm_platform_test_lake_moved_w<i>`
+  - 测试里要用到这些名字时从环境变量取，或用 `test/setup-env.ts` 导出的 `WORKER_SUFFIX`，不要写死。临时改 `PLATFORM_LAKE_URI` 的文件在 afterAll 里恢复成改之前的值（本 worker 的值）
+  - 不在 vitest 里（scripts 引用夹具）时没有 `VITEST_POOL_ID`，不加后缀
+- `test/global-setup.ts` 在开跑前对 i = 1…N 逐个建库（不存在时）并迁移到最新结构；旧库不删（库里租户的 catalog 角色是集群级的，删库会留下孤儿角色）。它还加了一把锁，已有 vitest 在跑时，再启动的 vitest 会直接报错退出。
+
+### 测量耗时
+
+```bash
+pnpm test:timing > /tmp/crm-test-full.log 2>&1   # 完整测试，同时记下每个文件、每个测试与夹具的耗时
+pnpm test:report                                 # 汇总成 Markdown，写到 /tmp/crm-test-report.md（最慢的文件与测试、夹具与任务的固定开销、按接缝）
+```
+
+- `test:timing` 设置 `TEST_TIMING=/tmp/crm-test-timing.jsonl`，并用 vitest 的 JSON reporter 把结果写到 `/tmp/crm-test-results.json`。测试的 `duration` 含 beforeEach / afterEach。默认 8 个 worker 下本机约 14 分钟（2026-11-01 实测 803 s）。
+- 报告的口径（文件并行）：墙钟取开跑到最后一个文件结束；文件耗时取 reporter 的 `startTime` 与本文件最早一条夹具计时（含 beforeAll 里的）中较早者 → `endTime`，不含导入与 worker 启动；各文件之和是 worker 时间，「占比」以它为分母。
+- `test/timing.ts` 的 `timed(name, fn)` 包住了 `startApp`、`resetDb`、`runCli`、`newTenant`、`runTask`、`publish`、`mergeUnchecked`、`publishedIdentitySources`，每次调用追加一行 `{ name, ms, at, file, test }`（`at` 是开始时刻）；`resetDb` 清表前还把 `platform.tasks` 里每个任务的耗时记成 `task:<kind>`。不设 `TEST_TIMING` 时不计时，行为不变。
+- 单个文件也能用：`TEST_TIMING=/tmp/t.jsonl npx vitest run <文件> --reporter=json --outputFile.json=/tmp/t.json`，再 `node --import tsx scripts/test-duration-report.ts /tmp/t.json /tmp/t.jsonl`。
+- 上一次的实测与优化方向见 `docs/test-plans/test-duration-report.md`。
 
 ## 两种接缝，选哪个
 
@@ -48,7 +68,7 @@ npx vitest run test/pipeline/mapping.test.ts # 单个文件
 | helper | 作用 |
 |---|---|
 | `pgSourceInput(READER \| WRITER, name = '电商库')` | **重建源库**并返回登记 PostgreSQL 数据源的表单字段，直接传给 `registerSource(member, input)` |
-| `READER` / `WRITER` | 源库账号：只读；对 `shop.orders` 可 INSERT / UPDATE |
+| `READER` / `WRITER` | 源库账号：只读；对 `shop.orders` 可 INSERT / UPDATE。账号名带 worker 后缀（`crm_src_reader_w<i>`，`MONGO_USERS` 也一样），断言里用 `READER.user`，不要写死 |
 | `grantOnSource(sql)` | 以源库管理员执行 SQL：加表、改数据、授权（在 `pgSourceInput` 之后调用，否则会被重建清掉） |
 | `seedPgSource()` | 只重建源库，返回连接信息（`pgSourceInput` 内部已调用） |
 | `duckdbSourceFile(tenantId, file?)` | 在租户源文件目录下生成 DuckDB 文件，返回路径 |
@@ -56,6 +76,20 @@ npx vitest run test/pipeline/mapping.test.ts # 单个文件
 | `seedIdentitySources(member)` | 重建源库并建 `crm.customers`、`loyalty.members`、`tracking.users` + `tracking.events` 三个 schema，各登记为一个数据源（CRM、会员、埋点）、选表、确认水位线（`updated_at`）、同步完，返回 `{ crm, loyalty, tracking }`；两边同一个人的手机写法不同、只有邮箱相同、外部 ID 相同、手机-邮箱成链，另有空手机 / 空邮箱的记录；埋点用户与 CRM 重叠，事件含 login 与匿名事件，一台设备先后被两个人登录、一台同一时刻被两人登录（详见函数注释）。`{ orders: true }` 时 CRM 与会员源各多一张订单表（`crm.orders`、`loyalty.orders`，列名与状态写法不同，含一笔打通不到消费者的订单与一笔晚于 2024-07-01 的订单）一并同步 |
 | `seedMysqlSource()` | MySQL 源库，`orders` 带自增主键与 `updated_at`（需 `TEST_MYSQL_URL`） |
 | `seedMongoSource()` / `MONGO_USERS` | MongoDB 源库与几种权限的账号（需 `TEST_MONGO_URL`） |
+
+### `test/pipeline/mapping-fixtures.ts`
+
+映射与合并测试（`mapping-merge`、`mapping-rules`、`mapping-disable`）共用；不依赖 vitest。
+
+| helper | 作用 |
+|---|---|
+| `syncedSource(extra?)` | 开通租户 `acme`，`de@acme.com` 起草、`de2@acme.com` 发布；源库在 `shop` 里另建 `ORDER_LOG`、`POINT_LOGS`、`CONSENTS`、`PREFERENCES`、`COUPON_TEMPLATES`、`COUPONS`（`extra` 是再加的建表 SQL，如 `ORDER_ITEMS`、`CONSENTS_COPY`），登记数据源后 `syncAllTables`；返回 `{ acme, author, reviewer, id, input }` |
+| `syncAllTables(author, id)` | 选入数据源的全部表、确认各表水位线、同步一次并跑空调度器 |
+| `drain()` | 跑空调度器（`maxWorkers: 2`） |
+| `CUSTOMERS` / `ORDERS` / `ORDER_LOG_MAPPING` / `POINT_LOGS_MAPPING` / `CONSENTS_MAPPING` / `PREFERENCES_MAPPING` / `COUPON_TEMPLATES_MAPPING` / `COUPONS_MAPPING` | 上面各源表的映射 YAML |
+| `events(table, column, extra?)` | 写入 `event` 的映射 YAML：`event_id` 取 `table` 的 `column`，`extra` 追加在后 |
+| `mergedMappings(task)` | 合并任务参数里的映射 ID（排序） |
+| `withEnv(vars, fn)` | `fn` 执行期间设置环境变量（调度器派发的工作进程继承），结束后还原 |
 
 ### `test/pipeline/identity-fixtures.ts`
 
@@ -73,7 +107,21 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 | `events` | 1500 | 无主键、无水位线 | 超过大表阈值 1000，全量比对、默认每天同步 |
 | `regions` | 2 | 无主键、无水位线 | 小表，全量比对 |
 
-需要别的形状的源表时，在测试里写一段 SQL 用 `grantOnSource` 建表并 `GRANT SELECT ... TO ${READER.user}`（参考 `mapping.test.ts` 里的 `ORDER_LOG`、`POINT_LOGS`、`CONSENTS`、`PREFERENCES`、`COUPON_TEMPLATES`、`COUPONS`）。
+需要别的形状的源表时，在测试里写一段 SQL 用 `grantOnSource` 建表并 `GRANT SELECT ... TO ${READER.user}`（参考 `mapping-fixtures.ts` 里的 `ORDER_LOG`、`POINT_LOGS`、`CONSENTS`、`PREFERENCES`、`COUPON_TEMPLATES`、`COUPONS`）。
+
+### `test/pipeline/identity-helpers.ts`
+
+身份打通测试（`identity-merge`、`identity-recompute`、`identity-stable-id`）共用的读取与操作；不依赖 vitest。
+
+| helper | 作用 |
+|---|---|
+| `identities(tenantId)` | `silver._identities` 的全部行（按 `_source, customer_id` 排序）、整表的 JSON 文本与 `silver._device_owner` 的全部行：`{ rows, text, devices }` |
+| `anonymousEvents(tenantId)` | 匿名事件经设备归属到的统一消费者（没归属时为 null） |
+| `consumerConsent(con, sourceId, customerId)` | 某条源记录所属统一消费者在 `silver._consumer_consent` 里的各渠道状态与来源 |
+| `groupsOf(rows, names)` | 按统一消费者分组成「数据源名:customer_id」列表，便于整体比较 |
+| `lastMerge(tenantId)` | 本租户最近一次 `silver.merge` 任务 |
+| `republish(author, reviewer, mappingId, yaml)` | 存一版新草稿、另一位成员发布并跑空调度器 |
+| `SEEDED` / `drain()` / `Identity` / `DeviceOwner` | 种子里的明文（断言表里没有明文）、跑空调度器、行类型 |
 
 ### `test/pipeline/llm-fixtures.ts`
 
@@ -93,13 +141,13 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 
 | helper | 作用 |
 |---|---|
-| `startApp()` | 启动服务端，返回 `TestApp`：`client()` 新浏览器、`outbox` 已发邮件、`drain()` 等后台发信完成、`close()` |
+| `startApp()` | 启动服务端（vite 缓存目录按 worker 分开：`node_modules/.vite-test_w<i>`），返回 `TestApp`：`client()` 新浏览器、`outbox` 已发邮件、`drain()` 等后台发信完成、`close()` |
 | `Client` | `get(path)`、`post(path, form)`（数组值提交多次）、`request(path, init)`、`cookie(name)`；不自动跟随重定向 |
 | `loginAs(app, email)` | 走完 Magic Link 登录，返回已登录的 `Client`（成员须已存在，可先 `memberOf` 加入） |
 | `loginAsOperator(app, email)` | 运营者登录（Magic Link + TOTP），返回 `{ browser, secret }` |
-| `createTenant(slug, name, adminEmail)` / `createOperator(email)` | 走运营命令行开通租户 / 创建运营者 |
-| `runCli(script, args, { input, env })` | 执行任意运营脚本 |
-| `resetDb()` | 清空平台元数据与租户数据湖。**流水线测试也用它** |
+| `createTenant(slug, name, adminEmail)` / `createOperator(email)` / `resetOperatorTotp(email)` | 进程内调用运营命令背后的领域函数（不起子进程）：开通租户（返回 `{ tenant, space, admin, lakeReady }`）/ 创建运营者 / 重置 TOTP；出错时抛错（如 `TenantError`），用 `rejects` 断言。用的是测试进程自己的连接池，文件的 `afterAll` 要 `closeDb()` |
+| `runCli(script, args, { input, env })` | 起子进程执行运营脚本，返回 `{ stdout, stderr, code }`（每次约 1.5 s）。只给测命令行本身（输出、退出码）的用例用，如 `login.test.ts` 的「运营命令创建租户…」「运营命令拒绝重复的租户标识」 |
+| `resetDb()` | 清空平台元数据与租户数据湖（只清本 worker 的库与湖目录，只删本库登记的租户角色）。**流水线测试也用它** |
 | `extractLink(mail)` / `extractOpsLink(mail)` | 从邮件里取出登录链接 |
 
 ## 新建一个流水线测试
@@ -137,7 +185,7 @@ describe('<功能>', () => {
 });
 ```
 
-需要原始层有数据时，在 `tenantWithSource` 之后确认水位线并同步：`confirmWatermark(member, sourceId, 'customers', 'updated_at')`、`syncSource(member, sourceId)`，再 `drain()`（完整例子见 `mapping.test.ts` 的 `syncedSource`）。读标准层用 `silver`；读写数据湖里别的表用 `onLake`，要在同一会话里多次读时用 `openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 })`，用完 `session.close()`（例子见 `fixtures.ts` 的 `silver`、`pii.test.ts` 的 `silverDump`）。
+需要原始层有数据时，在 `tenantWithSource` 之后确认水位线并同步：`confirmWatermark(member, sourceId, 'customers', 'updated_at')`、`syncSource(member, sourceId)`，再 `drain()`（完整例子见 `mapping-fixtures.ts` 的 `syncedSource`）。读标准层用 `silver`；读写数据湖里别的表用 `onLake`，要在同一会话里多次读时用 `openTenantLake(lakeSpecOf((await lakeRow(tenantId))!), { memoryLimitMb: 256, threads: 1 })`，用完 `session.close()`（例子见 `fixtures.ts` 的 `silver`、`pii.test.ts` 的 `silverDump`）。
 
 ## 新建一个 HTTP 测试
 
@@ -165,6 +213,36 @@ describe('<功能>', () => {
 ```
 
 数据准备优先用领域函数（`newTenant`、`memberOf`、`registerSource`），只把要测的那一步走 HTTP。
+
+### 只读用例共用夹具
+
+造数据贵的时候（`publishedIdentitySources` 一次约 27 s），只读的用例可以在 describe 级 `beforeAll` 里清库、造一次数据并登录，同组用例共用。条件：
+
+- 用例只 `get` 页面：不 `publish`、不 `.post(`、不 `runTask`、不改库（包括 `getDb().update` 改任务结果或快照）。要改的数据放进 `beforeAll` 的夹具里一次改好，例如 `sharedFixture(fallbackOnCrmOrders)`。
+- 不断言「恰好 N 条」：打开页面可能入队检查任务或写审计，同组别的用例会影响计数。
+- 不依赖执行顺序，用 `-t` 单独跑也能过。
+
+顶层 `beforeEach` 会作用到所有 describe，所以这种文件不写顶层 `beforeEach`：每个按用例造数据的 describe 自己写 `beforeEach(fresh)`，共享组写 `beforeAll`。要保持用例名不变，可以并列写多个同名的 describe。参考 `test/http/lineage.test.ts`（`sharedFixture`）与 `test/http/analytics.test.ts`（`sharedSnapshot`）：
+
+```ts
+const fresh = async () => { await resetDb(); app.outbox.length = 0; };
+
+describe('<功能>', () => {
+  beforeEach(fresh);
+  it('写数据或断言计数的用例', async () => { /* 自己造数据 */ });
+});
+
+describe('<功能>', () => {
+  let shared: Awaited<ReturnType<typeof sharedFixture>>;
+  beforeAll(async () => { shared = await sharedFixture(); }); // 内部先 fresh()，再造数据、登录
+  it('只读用例', async () => { const { viewer } = shared; /* 只 get */ });
+});
+```
+
+两种变体：
+
+- **几个不同名的 describe 共用一份**：要保持各自的用例名，又只造一次数据时，把这几组并列写在文件末尾（中间不夹 `beforeEach(fresh)` 的组），用模块级的 `served ??= fresh().then(造数据)` 记住同一个 Promise，每组 `beforeAll` 里 await 它。参考 `test/http/api.test.ts`（`sharedServed`）。这几组的用例原则上也只读；票里点名要共用、又会改一行的（如改数据源名），在 `finally` 里改回去。
+- **用例要改的只是少量可还原的行**：在 `beforeAll` 里记下夹具造好时的那些行，组内 `beforeEach` 把它们还原、删掉之后新增的行，这样用例可以 `runTask`、改任务结果。参考 `test/pipeline/snapshots.test.ts` 的「数据不完整」（每个用例前还原本租户的 `silver.merge` 任务）。
 
 ## 浏览器验收（ego-browser）
 

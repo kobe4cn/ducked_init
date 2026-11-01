@@ -5,8 +5,8 @@
 // 源端改名 → 重新采集后平台起草修复草稿并发带链接的邮件，成员空跑、发布后合并恢复；
 // 到期后 enqueueDueExpiries → 调度器派发 gold.expire → 湖里的表与文件、平台元数据里的 expiredAt
 import { existsSync } from 'node:fs';
-import { and, desc, eq, sql } from 'drizzle-orm';
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { and, desc, eq, notInArray, sql } from 'drizzle-orm';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions, tasks } from '../../app/.server/db/schema';
@@ -24,7 +24,6 @@ import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
-beforeEach(async () => { await resetDb(); });
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -41,6 +40,8 @@ async function onLake<T = Record<string, unknown>>(tenantId: string, sql: string
 }
 
 describe('结果快照登记', () => {
+  beforeEach(resetDb);
+
   it('gold.rfm 成功后登记快照：模板、完整参数、表名、行数、创建后 90 天过期；只在本租户可见', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
@@ -126,9 +127,25 @@ const rfmSnapshotOf = async (tenantId: string) => {
   return (await listSnapshots(tenantId)).find(s => s.taskId === task!.id)!;
 };
 
+// 三个用例共用一次 publishedIdentitySources；它们只改合并任务（改结果、改结束时间、再合并）与登记新快照，
+// 每个用例前把本租户的合并任务恢复成夹具造好时的样子：删掉之后新建的合并，原有合并的结果与结束时间改回去
+// 不还原的：再合并写回湖里的 silver 数据（源数据没变，合并结果相同，所以 rowCount 照旧是 5）、各用例登记的 gold.rfm 快照（rfmSnapshotOf 按任务 ID 取）
 describe('数据不完整', () => {
+  let shared: Awaited<ReturnType<typeof publishedIdentitySources>>;
+  let merges: Pick<typeof tasks.$inferSelect, 'id' | 'result' | 'finishedAt'>[];
+  beforeAll(async () => {
+    await resetDb();
+    shared = await publishedIdentitySources({ orders: true });
+    merges = await getDb().select({ id: tasks.id, result: tasks.result, finishedAt: tasks.finishedAt }).from(tasks)
+      .where(and(eq(tasks.tenantId, shared.acme), eq(tasks.kind, 'silver.merge')));
+  });
+  beforeEach(async () => {
+    await getDb().delete(tasks).where(and(eq(tasks.tenantId, shared.acme), eq(tasks.kind, 'silver.merge'), notInArray(tasks.id, merges.map(m => m.id))));
+    for (const { id, result, finishedAt } of merges) await getDb().update(tasks).set({ result, finishedAt }).where(eq(tasks.id, id));
+  });
+
   it('order 与 customer 的映射最近一次合并失败：照常登记快照，记下失败的映射、源表、原因摘要（不带源端取值）与最近一次成功合并的时间', async () => {
-    const { acme, sources, mappings: customers } = await publishedIdentitySources({ orders: true });
+    const { acme, sources, mappings: customers } = shared;
     const orders = await mappingsOf(acme, 'order');
     const [crmOrders, loyaltyOrders] = [orders[sources.crm], orders[sources.loyalty]];
     const succeeded = await lastMergeOf(acme, crmOrders);
@@ -151,7 +168,7 @@ describe('数据不完整', () => {
   });
 
   it('只看模板读到的实体与任务开始前结束的合并：event 映射失败、计算开始后才结束的失败都不标记；完整时 incomplete 为 null', async () => {
-    const { acme, sources } = await publishedIdentitySources({ orders: true });
+    const { acme, sources } = shared;
     expect((await rfmSnapshotOf(acme)).incomplete).toBeNull();
 
     const [event] = Object.values(await mappingsOf(acme, 'event'));
@@ -165,7 +182,7 @@ describe('数据不完整', () => {
   });
 
   it('跳过的合并不算失败也不盖掉之前的失败；失败的映射之后合并成功，再算的快照不再带标记', async () => {
-    const { acme, sources } = await publishedIdentitySources({ orders: true });
+    const { acme, sources } = shared;
     const orders = (await mappingsOf(acme, 'order'))[sources.crm];
     await overrideMerge(acme, orders, { error: '源表读取失败' });
     await mergeUnchecked(acme, [orders]);
@@ -179,7 +196,7 @@ describe('数据不完整', () => {
 
 describe('源端结构变化', () => {
   const outbox: Mail[] = [];
-  beforeEach(() => { outbox.length = 0; setMailer({ async send(m) { outbox.push(m); } }); });
+  beforeEach(async () => { await resetDb(); outbox.length = 0; setMailer({ async send(m) { outbox.push(m); } }); });
   afterEach(() => { setMailer(undefined); });
 
   it('源端删掉订单表引用的列（没有行变化）：同步后只有这个映射合并失败，客户照常合并；旧快照仍可读，新快照标数据不完整；能改映射的成员收到邮件并记审计', async () => {
@@ -247,6 +264,7 @@ describe('源端结构变化', () => {
 });
 
 describe('快照过期', () => {
+  beforeEach(resetDb);
   afterEach(() => { vi.useRealTimers(); });
 
   it('到期的快照删表、清掉湖里的数据（parquet 文件与内联在 catalog 的行）并标记 expiredAt；未到期的不受影响，重复执行不报错', async () => {

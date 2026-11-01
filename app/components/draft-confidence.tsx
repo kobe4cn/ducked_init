@@ -5,6 +5,7 @@ import { AlertTriangle, Sparkles } from 'lucide-react';
 import { Link } from 'react-router';
 import { StatusText, type StatusTone } from '~/components/status-text';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { cmp } from '~/lib/compare';
 import type { ModelDraftResult } from '~/.server/mappings';
 
 const clamp = (n: number) => (Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0);
@@ -22,7 +23,7 @@ export function DraftConfidence({ origin, items, reusedFrom, notice }: {
 }) {
   const rows = items
     .map(i => ({ ...i, confidence: clamp(i.confidence) }))
-    .sort((a, b) => a.confidence - b.confidence || a.path.localeCompare(b.path));
+    .sort((a, b) => a.confidence - b.confidence || cmp(a.path, b.path));
   return (
     <div data-draft-origin={origin} className="space-y-2 rounded-xl border bg-slate-50/60 p-4">
       <div className="flex items-center gap-1.5 text-sm font-medium"><Sparkles aria-hidden className="size-4 text-slate-400" />生成依据</div>

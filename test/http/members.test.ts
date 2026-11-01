@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { closeDb } from '../../app/.server/db/client';
 import { createTenant, extractLink, loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
-afterAll(async () => { await app?.close(); });
+afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 
 /** 从成员页取出某个邮箱对应的成员 ID */

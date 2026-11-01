@@ -11,18 +11,23 @@ import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { enqueueTask, getTask, type TaskKind } from '../../app/.server/tasks';
 import { getSource, setSyncScope } from '../../app/.server/sources';
 import { createTenant } from '../../app/.server/tenants';
+import { timed } from '../timing';
 
 /** 开通一个租户，返回租户 ID */
-export async function newTenant(slug: string) {
-  const { tenant } = await createTenant({ slug, name: slug, adminEmail: `admin@${slug}.com` });
-  return tenant.id;
+export function newTenant(slug: string) {
+  return timed('newTenant', async () => {
+    const { tenant } = await createTenant({ slug, name: slug, adminEmail: `admin@${slug}.com` });
+    return tenant.id;
+  });
 }
 
 /** 入队一个任务并让调度器把队列跑空，返回该任务的最终状态 */
-export async function runTask(tenantId: string, kind: TaskKind, params: Record<string, unknown> = {}) {
-  const { id } = await enqueueTask(tenantId, kind, params);
-  await createDispatcher({ maxWorkers: 4 }).runUntilIdle();
-  return getTask(id);
+export function runTask(tenantId: string, kind: TaskKind, params: Record<string, unknown> = {}) {
+  return timed(`runTask:${kind}`, async () => {
+    const { id } = await enqueueTask(tenantId, kind, params);
+    await createDispatcher({ maxWorkers: 4 }).runUntilIdle();
+    return getTask(id);
+  });
 }
 
 /** 以某个成员的身份调用领域函数（与登录后服务端拿到的当前成员相同）；成员不存在时以给定角色加入租户 */
@@ -51,20 +56,24 @@ export async function selectAllTables(member: CurrentMember, sourceId: string) {
 }
 
 /** 起草并由另一位成员发布，让调度器跑完合并 */
-export async function publish(author: CurrentMember, reviewer: CurrentMember, sourceId: string, yaml: string) {
-  const mapping = await createMapping(author, sourceId, yaml);
-  await publishMapping(reviewer, mapping.id, 1);
-  await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
-  return mapping.id;
+export function publish(author: CurrentMember, reviewer: CurrentMember, sourceId: string, yaml: string) {
+  return timed('publish', async () => {
+    const mapping = await createMapping(author, sourceId, yaml);
+    await publishMapping(reviewer, mapping.id, 1);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    return mapping.id;
+  });
 }
 
 /**
  * 不查跨映射主键，把这些已发布映射合并一次（参数里去掉 uniqueKey 与 uniqueBySource），模拟独占检查上线前就已存在的重叠（ADR-0024）；
  * 返回合并任务的最终状态
  */
-export async function mergeUnchecked(tenantId: string, mappingIds: string[]) {
-  const mappings = (await publishedPlans(getDb(), tenantId, mappingIds)).map(({ uniqueKey: _k, uniqueBySource: _s, ...plan }) => plan);
-  return runTask(tenantId, 'silver.merge', { mappings });
+export function mergeUnchecked(tenantId: string, mappingIds: string[]) {
+  return timed('mergeUnchecked', async () => {
+    const mappings = (await publishedPlans(getDb(), tenantId, mappingIds)).map(({ uniqueKey: _k, uniqueBySource: _s, ...plan }) => plan);
+    return runTask(tenantId, 'silver.merge', { mappings });
+  });
 }
 
 /** 读取本租户标准层某个实体的表（时间按 UTC 文本、金额按文本显示） */

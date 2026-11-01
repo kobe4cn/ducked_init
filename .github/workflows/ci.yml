@@ -51,6 +51,8 @@ jobs:
           --health-retries 30
     env:
       TEST_PLATFORM_DATABASE_URL: postgres://crm:crm@localhost:5432/crm_platform_test
+      # 本地默认 8 个 worker 要求 PG max_connections ≥ 300；这里的 postgres service 是默认的 100，runner 也只有 4 核
+      CRM_TEST_WORKERS: 4
       # 租户隔离测试在对象存储上再跑一遍（SeaweedFS，平台账号 crm / crm-secret，租户账号由测试开通租户时经 IAM API 创建）
       TEST_S3_LAKE_URI: s3://crm-lake/platform-test
       # 用 127.0.0.1 而不是 localhost：MySQL 客户端把 localhost 当作本机 socket
