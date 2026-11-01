@@ -1,0 +1,15 @@
+kind: metric
+request: 近 365 天按支付时间算的下单次数，只算已支付、已发货、已完成的订单
+expected:
+  base: order
+  measure: { agg: count }
+  filter:
+    - { field: status, op: in, value: [paid, shipped, completed] }
+  window: { field: paid_at, days: 365 }
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [metric:paid_order_count_365d]
+  forbidden: [metric:order_count_365d]
+  ambiguous: false
+clarify: null

@@ -1,0 +1,8 @@
+request: 近 30 天营收是多少
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [metric:revenue_30d, metric:revenue_paid_30d, metric:gross_revenue_30d, metric:item_revenue_30d]
+  forbidden: []
+  ambiguous: true
+clarify: 营收按下单时间还是支付时间算？含不含已退款的订单？按订单实付金额还是订单明细金额合计？

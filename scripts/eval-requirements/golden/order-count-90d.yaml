@@ -4,3 +4,9 @@ expected:
   base: order
   measure: { agg: count }
   window: { field: created_at, days: 90 }
+failure_type: b
+retrieval:
+  candidates: [entity:order, field:order.created_at]
+  forbidden: [metric:order_count_365d, metric:paid_order_count_365d]
+  ambiguous: false
+clarify: null

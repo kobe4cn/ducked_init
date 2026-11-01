@@ -3,3 +3,9 @@ request: 距最近一次下单过去了多少天
 expected:
   base: order
   measure: { agg: days_since, field: created_at }
+failure_type: a
+retrieval:
+  candidates: [metric:days_since_last_order]
+  forbidden: []
+  ambiguous: false
+clarify: null

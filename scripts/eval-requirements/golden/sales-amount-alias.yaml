@@ -1,0 +1,10 @@
+request: 近 30 天的销售额
+failure_type: c
+covers: [alias, same-name]
+retrieval:
+  # 只用别名本身检索：带上「近 30 天」会碰巧命中所有 30 天的指标
+  query: 销售额
+  candidates: [metric:revenue_30d, metric:revenue_paid_30d, metric:gross_revenue_30d, metric:item_revenue_30d]
+  forbidden: []
+  ambiguous: true
+clarify: 销售额按下单时间还是支付时间算？含不含已退款的订单？按订单实付金额还是订单明细金额合计？

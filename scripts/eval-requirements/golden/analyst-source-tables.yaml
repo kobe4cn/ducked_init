@@ -1,0 +1,8 @@
+request: 商城数据源有哪些源表
+failure_type: a
+covers: [role]
+retrieval:
+  candidates: [source:商城, table:商城/orders, table:商城/order_items, table:商城/members]
+  forbidden: [source:门店POS, table:门店POS/pos_sales]
+  ambiguous: false
+clarify: null

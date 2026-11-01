@@ -1,0 +1,15 @@
+kind: metric
+request: 近 365 天客单价：已支付、已发货、已完成的每笔订单实付金额的平均
+expected:
+  base: order
+  measure: { agg: avg, field: amount }
+  filter:
+    - { field: status, op: in, value: [paid, shipped, completed] }
+  window: { field: created_at, days: 365 }
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [metric:aov_365d]
+  forbidden: [metric:item_aov_365d]
+  ambiguous: false
+clarify: null

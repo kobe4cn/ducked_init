@@ -1,0 +1,8 @@
+request: 近 30 天的活跃次数
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [metric:login_count_30d, metric:view_count_30d]
+  forbidden: []
+  ambiguous: true
+clarify: 活跃按登录事件算还是按浏览事件算？

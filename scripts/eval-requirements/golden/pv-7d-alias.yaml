@@ -1,0 +1,15 @@
+kind: metric
+request: 近 7 天的 PV
+expected:
+  base: event
+  measure: { agg: count }
+  filter:
+    - { field: event_type, op: eq, value: view }
+  window: { field: occurred_at, days: 7 }
+failure_type: c
+covers: [alias]
+retrieval:
+  candidates: [field:event.event_type, field:event.occurred_at]
+  forbidden: [metric:view_count_30d]
+  ambiguous: false
+clarify: null

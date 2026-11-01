@@ -1,0 +1,13 @@
+kind: metric
+request: 近 30 天按订单明细金额合计的营收（按下单时间）
+expected:
+  base: order_item
+  measure: { agg: sum, field: amount }
+  window: { field: order_item.order_id -> order.created_at, days: 30 }
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [metric:item_revenue_30d]
+  forbidden: [metric:revenue_30d, metric:gross_revenue_30d]
+  ambiguous: false
+clarify: null

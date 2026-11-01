@@ -1,0 +1,8 @@
+request: 门店POS 的 pos_sales 源表
+failure_type: a
+covers: [role]
+retrieval:
+  candidates: [table:门店POS/pos_sales, source:门店POS]
+  forbidden: [table:商城/orders]
+  ambiguous: false
+clarify: null

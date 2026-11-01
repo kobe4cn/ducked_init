@@ -8,3 +8,9 @@ expected:
   window: { field: created_at, days: 30 }
   dimensions:
     - { name: city, path: order.customer_id -> customer.city }
+failure_type: b
+retrieval:
+  candidates: [field:order.amount, field:order.status, field:customer.city, relation:order.customer_id]
+  forbidden: [metric:revenue_paid_30d, metric:revenue_30d]
+  ambiguous: false
+clarify: null

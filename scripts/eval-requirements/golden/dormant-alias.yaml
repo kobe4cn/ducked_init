@@ -1,0 +1,8 @@
+request: 找出沉睡客户
+failure_type: c
+covers: [alias]
+retrieval:
+  candidates: [metric:days_since_last_order]
+  forbidden: []
+  ambiguous: false
+clarify: 多久没下单算沉睡？比如距最近一次下单超过 180 天？

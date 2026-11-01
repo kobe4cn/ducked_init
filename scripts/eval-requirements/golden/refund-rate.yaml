@@ -9,3 +9,9 @@ expected:
       filter:
         - { field: status, op: eq, value: refunded }
     denominator: { agg: count }
+failure_type: a
+retrieval:
+  candidates: [field:order.status]
+  forbidden: []
+  ambiguous: false
+clarify: null

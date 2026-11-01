@@ -1,0 +1,8 @@
+request: 各地区的消费者人数
+failure_type: c
+covers: [alias]
+retrieval:
+  candidates: [field:customer.city]
+  forbidden: []
+  ambiguous: false
+clarify: null

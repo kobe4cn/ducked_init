@@ -1,0 +1,8 @@
+request: 近一年每个消费者的购买频次
+failure_type: c
+covers: [alias]
+retrieval:
+  candidates: [metric:order_count_365d, metric:paid_order_count_365d]
+  forbidden: []
+  ambiguous: true
+clarify: 按下单时间算全部订单，还是按支付时间只算已支付、已发货、已完成的订单？

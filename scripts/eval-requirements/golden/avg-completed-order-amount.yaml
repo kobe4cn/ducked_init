@@ -6,3 +6,9 @@ expected:
   filter:
     - { field: status, op: eq, value: completed }
   window: { field: created_at, days: 365 }
+failure_type: b
+retrieval:
+  candidates: [field:order.amount, field:order.status, field:order.created_at]
+  forbidden: [metric:aov_365d, field:order_item.amount]
+  ambiguous: false
+clarify: null

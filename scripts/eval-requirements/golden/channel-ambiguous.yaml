@@ -1,0 +1,8 @@
+request: 各渠道的数量
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [field:order.channel, field:touch.channel, field:consent.channel]
+  forbidden: []
+  ambiguous: true
+clarify: 是订单的下单渠道、营销触达的渠道，还是营销同意的渠道？数的是订单、触达还是同意记录？

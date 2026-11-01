@@ -1,0 +1,8 @@
+request: 近 30 天营收同比去年同期增长多少
+failure_type: d
+covers: [same-name]
+retrieval:
+  candidates: [metric:revenue_30d, metric:revenue_paid_30d, metric:gross_revenue_30d, metric:item_revenue_30d]
+  forbidden: []
+  ambiguous: true
+clarify: 指标只能算一个窗口，不能直接算同比；营收又按哪个口径（下单 / 支付时间、含不含退款、订单还是明细金额）？

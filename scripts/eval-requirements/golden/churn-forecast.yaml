@@ -1,0 +1,7 @@
+request: 预测下个月每个消费者的流失概率
+failure_type: d
+retrieval:
+  candidates: [metric:days_since_last_order]
+  forbidden: []
+  ambiguous: false
+clarify: 目前的指标不能做预测，改用距最近一次下单的天数给消费者分层可以吗？

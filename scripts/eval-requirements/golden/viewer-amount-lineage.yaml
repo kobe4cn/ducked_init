@@ -1,0 +1,9 @@
+request: 订单实付金额来自哪个源表
+failure_type: a
+role: viewer
+covers: [role]
+retrieval:
+  candidates: [field:order.amount]
+  forbidden: [table:商城/orders, field:order_item.amount]
+  ambiguous: false
+clarify: null

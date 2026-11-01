@@ -1,0 +1,7 @@
+request: 给每个消费者推荐下一件最可能买的商品
+failure_type: d
+retrieval:
+  candidates: [entity:product, field:order_item.product_id]
+  forbidden: []
+  ambiguous: false
+clarify: 目前不能做商品推荐；改看每个消费者近 180 天买过的不同商品数，或源端记录的偏好品类可以吗？

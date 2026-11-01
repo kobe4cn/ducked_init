@@ -1,0 +1,8 @@
+request: VIP 等级是 gold 的消费者有多少
+failure_type: c
+covers: [alias]
+retrieval:
+  candidates: [field:membership.level]
+  forbidden: [tag:high_spender]
+  ambiguous: false
+clarify: null

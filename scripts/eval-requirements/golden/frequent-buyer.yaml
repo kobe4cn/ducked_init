@@ -6,3 +6,10 @@ expected:
     - value: frequent
       when: { gte: 12 }
   default: normal
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [metric:order_count_365d]
+  forbidden: [metric:paid_order_count_365d]
+  ambiguous: false
+clarify: null

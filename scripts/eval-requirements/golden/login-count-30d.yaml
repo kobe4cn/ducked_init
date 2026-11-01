@@ -1,0 +1,15 @@
+kind: metric
+request: 近 30 天登录（事件类型 login）的次数
+expected:
+  base: event
+  measure: { agg: count }
+  filter:
+    - { field: event_type, op: eq, value: login }
+  window: { field: occurred_at, days: 30 }
+failure_type: a
+covers: [same-name]
+retrieval:
+  candidates: [metric:login_count_30d]
+  forbidden: [metric:view_count_30d]
+  ambiguous: false
+clarify: null

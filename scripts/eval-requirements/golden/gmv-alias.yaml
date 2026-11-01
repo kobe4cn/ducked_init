@@ -1,0 +1,10 @@
+request: 近 30 天的 GMV
+failure_type: c
+covers: [alias]
+retrieval:
+  # 只用别名本身检索：带上「近 30 天」会碰巧命中所有 30 天的指标
+  query: GMV
+  candidates: [metric:gross_revenue_30d]
+  forbidden: [metric:revenue_30d, metric:revenue_paid_30d]
+  ambiguous: false
+clarify: null

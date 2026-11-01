@@ -4,3 +4,9 @@ expected:
   base: order_item
   measure: { agg: count_distinct, field: product_id }
   window: { field: order_item.order_id -> order.created_at, days: 180 }
+failure_type: a
+retrieval:
+  candidates: [field:order_item.product_id, relation:order_item.order_id, field:order.created_at]
+  forbidden: []
+  ambiguous: false
+clarify: null

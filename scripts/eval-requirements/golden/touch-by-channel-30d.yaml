@@ -1,0 +1,15 @@
+kind: metric
+request: 近 30 天各触达渠道发出的触达次数
+expected:
+  base: touch
+  measure: { agg: count }
+  window: { field: sent_at, days: 30 }
+  dimensions:
+    - { name: channel, path: touch.channel }
+failure_type: a
+covers: [same-name]
+retrieval:
+  candidates: [field:touch.channel, field:touch.sent_at]
+  forbidden: [field:order.channel, field:consent.channel]
+  ambiguous: false
+clarify: null

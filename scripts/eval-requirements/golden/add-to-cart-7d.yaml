@@ -6,3 +6,9 @@ expected:
   filter:
     - { field: event_type, op: eq, value: add_to_cart }
   window: { field: occurred_at, days: 7 }
+failure_type: a
+retrieval:
+  candidates: [field:event.event_type, field:event.occurred_at]
+  forbidden: []
+  ambiguous: false
+clarify: null

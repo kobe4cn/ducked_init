@@ -8,3 +8,10 @@ expected:
     - value: mid
       when: { gte: 100, lt: 1000 }
   default: low
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [metric:revenue_30d]
+  forbidden: [metric:gross_revenue_30d, metric:revenue_paid_30d, tag:high_spender]
+  ambiguous: false
+clarify: null

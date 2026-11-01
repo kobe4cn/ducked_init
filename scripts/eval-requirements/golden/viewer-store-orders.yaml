@@ -1,0 +1,9 @@
+request: 门店POS 收银的订单是哪个门店成交的
+failure_type: a
+role: viewer
+covers: [role]
+retrieval:
+  candidates: [field:order.store_id]
+  forbidden: [source:门店POS, table:门店POS/pos_sales]
+  ambiguous: false
+clarify: null

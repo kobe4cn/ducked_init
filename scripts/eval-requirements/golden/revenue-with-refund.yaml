@@ -1,0 +1,15 @@
+kind: metric
+request: 近 30 天按下单时间、含已退款订单的营收（已支付、已发货、已完成与已退款的订单）
+expected:
+  base: order
+  measure: { agg: sum, field: amount }
+  filter:
+    - { field: status, op: in, value: [paid, shipped, completed, refunded] }
+  window: { field: created_at, days: 30 }
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [metric:gross_revenue_30d]
+  forbidden: [metric:revenue_30d, metric:revenue_paid_30d]
+  ambiguous: false
+clarify: null

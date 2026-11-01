@@ -1,0 +1,8 @@
+request: 每个消费者的积分
+failure_type: b
+covers: [alias, same-name]
+retrieval:
+  candidates: [field:membership.points, field:points_transaction.points_change]
+  forbidden: []
+  ambiguous: true
+clarify: 是会员当前的积分余额，还是一段时间内积分流水的变动合计？

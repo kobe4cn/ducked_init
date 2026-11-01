@@ -1,0 +1,7 @@
+request: 今天每小时的下单量趋势
+failure_type: d
+retrieval:
+  candidates: [field:order.created_at]
+  forbidden: []
+  ambiguous: false
+clarify: 指标按消费者汇总、窗口按天计，不能出按小时的趋势；改看每个消费者近 1 天的下单次数可以吗？

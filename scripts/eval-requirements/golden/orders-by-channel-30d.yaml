@@ -6,3 +6,10 @@ expected:
   window: { field: created_at, days: 30 }
   dimensions:
     - { name: channel, path: order.channel }
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [field:order.channel, field:order.created_at]
+  forbidden: [field:touch.channel, field:consent.channel]
+  ambiguous: false
+clarify: null

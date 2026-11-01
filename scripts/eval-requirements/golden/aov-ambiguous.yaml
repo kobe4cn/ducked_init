@@ -1,0 +1,8 @@
+request: 近 365 天的客单价
+failure_type: b
+covers: [same-name]
+retrieval:
+  candidates: [metric:aov_365d, metric:item_aov_365d]
+  forbidden: []
+  ambiguous: true
+clarify: 客单价按每笔订单的实付金额平均，还是按每个订单明细行的金额平均？
