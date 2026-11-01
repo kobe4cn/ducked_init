@@ -741,6 +741,23 @@ export const knowledgeAliases = platform.table('knowledge_aliases', {
     .where(sql`retired_at is null`),
 ]);
 
+// 口径声明（ADR-0046）：目标与 knowledge_aliases 相同（target_id 是目录条目标识，mapping_id 非空是映射字段）。只追加不改，
+// 每个 (目标, 映射, 类型) 最新的一行生效，旧行是历史。claim_type 与 value 是 app/lib/semantic-claims.ts 登记的枚举；based_on 是依据摘要
+export const semanticClaims = platform.table('semantic_claims', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  targetId: text('target_id').notNull(),
+  mappingId: uuid('mapping_id').references(() => mappings.id, { onDelete: 'cascade' }),
+  claimType: text('claim_type').notNull(),
+  value: text('value').notNull(),
+  basedOn: jsonb('based_on').$type<{ id: string; hash: string }[]>().notNull().default([]),
+  createdByEmail: text('created_by_email').notNull(),
+  // 用语句执行时的 clock_timestamp() 而不是事务开始时的 now()：同一事务里给同一目标、同一类型存两次时，后存的才是最新
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+}, t => [
+  index('semantic_claims_target_idx').on(t.tenantId, t.targetId, t.mappingId, t.claimType, t.createdAt),
+]);
+
 // 语义目录的版本（ADR-0041）：目录的结构或含义变了才记一版。snapshot 是去掉统计后的全部条目，diff 是与上一版按条目标识比出的差异；
 // reason 是触发的审计动作（或 catalog.initial 之类）
 export const catalogVersions = platform.table('catalog_versions', {

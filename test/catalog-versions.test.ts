@@ -70,6 +70,14 @@ describe('目录版本的比较', () => {
     expect(d.changed).toEqual([expect.objectContaining({ id: 'field:order.status', kind: 'field', keys: ['note'] })]);
   });
 
+  it('加口径声明是条目的改动，变了的顶层键是 knowledge', () => {
+    const claimed = input({ knowledge: { byTarget: new Map([['field:order.status', { claims: [{ type: 'time_meaning', value: 'pay_time' }] }]]) } });
+    const d = diffCatalog(snap(input()), snap(claimed));
+    expect(d.added).toEqual([]);
+    expect(d.removed).toEqual([]);
+    expect(d.changed).toEqual([expect.objectContaining({ id: 'field:order.status', kind: 'field', keys: ['knowledge'] })]);
+  });
+
   it('删掉数据源：它的条目是删除；没有上一版时全部条目都是新增', () => {
     const d = diffCatalog(snap(input()), snap(input({ sources: [{ id: 's-shop', name: '商城', kind: 'postgres' }] })));
     expect(d).toEqual({ added: [], removed: [{ id: 'source:ERP', kind: 'source', name: 'ERP' }], changed: [] });

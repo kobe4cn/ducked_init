@@ -9,12 +9,15 @@ import { describeQuotaChange, type TenantQuota } from './quota';
 import type { BrokenMapping } from './schema-alerts';
 import type { NewFallback } from './fallback-alerts';
 import { entityLabel } from '../lib/canonical-model';
+import { claimTypeLabel } from '../lib/semantic-claims';
 
 type Detail = Record<string, unknown>;
 const sourceKindLabel = (kind: unknown) => SOURCE_KIND_LABELS[kind as SourceKind] ?? String(kind);
 const roleLabel = (role: unknown) => ROLE_LABELS[role as Role] ?? String(role);
 const templateLabel = (template: unknown) => TEMPLATES[template as keyof typeof TEMPLATES]?.label ?? String(template);
 const credentialLabel = (d: Detail) => `「${d.name}」（${d.prefix}…）`;
+/** 业务知识的目标（ADR-0046）：目录条目标识，映射字段再带映射 ID */
+const knowledgeTarget = (d: Detail) => `${d.targetId}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}`;
 const dslLabel = (d: Detail) => (d.kind === 'tag' ? '标签' : '指标');
 /** 映射生成稿的来源（mapping_generations.origin）在审计里的说法 */
 const GENERATION_ORIGIN: Record<'model' | 'rules' | 'reuse' | 'assertions', string> = {
@@ -226,8 +229,13 @@ const ACTIONS = {
     describe: (d: Detail) => `${d.entity}.${d.field}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}`,
   },
   // 别名（ADR-0046）：不记别名原文
-  'alias.added': { label: '添加别名', describe: (d: Detail) => `${d.targetId}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}` },
-  'alias.retired': { label: '停用别名', describe: (d: Detail) => `${d.targetId}${d.mappingId ? `（映射 ${d.mappingId}）` : ''}` },
+  'alias.added': { label: '添加别名', describe: knowledgeTarget },
+  'alias.retired': { label: '停用别名', describe: knowledgeTarget },
+  // 口径声明（ADR-0046）：detail 只有目标与类型，不记取值
+  'semantic_claim.saved': {
+    label: '保存口径声明',
+    describe: (d: Detail) => `${knowledgeTarget(d)}：${claimTypeLabel(String(d.type))}`,
+  },
   'merge_group.saved': {
     label: '保存合并组草稿',
     describe: (d: Detail) => `${entityLabel(String(d.entity))}，第 ${d.version} 版草稿，${(d.members as string[]).length} 个映射，${d.rule}`,
