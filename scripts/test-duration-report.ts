@@ -6,7 +6,8 @@ import { relative } from 'node:path';
 interface AssertionResult { fullName: string; duration?: number | null; status: string }
 interface FileResult { name: string; startTime: number; endTime: number; status: string; assertionResults: AssertionResult[] }
 interface Results { numTotalTests: number; numPassedTests: number; numFailedTests: number; numPendingTests: number; startTime: number; testResults: FileResult[] }
-interface Timing { name: string; ms: number; file: string | null; test: string | null; status?: string }
+/** at：开始时刻的 epoch 毫秒（record 用结束时刻倒推；task:* 行的 ms 来自 platform.tasks，at 没有意义） */
+interface Timing { name: string; ms: number; at?: number; file: string | null; test: string | null; status?: string }
 
 const [resultsPath = '/tmp/crm-test-results.json', timingPath = '/tmp/crm-test-timing.jsonl'] = process.argv.slice(2);
 const results = JSON.parse(readFileSync(resultsPath, 'utf8')) as Results;
@@ -22,6 +23,7 @@ function groupBy<T>(items: T[], key: (t: T) => string) {
 
 /** 超过它的任务耗时视为用例改写了时间戳（测试的 testTimeout 是 90 s） */
 const MAX_TASK_MS = 10 * 60_000;
+const isTask = (t: Timing) => t.name.startsWith('task:');
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor((xs.length - 1) / 2)];
 
 const sec = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
@@ -29,15 +31,24 @@ const pct = (ms: number, total: number) => `${((ms / total) * 100).toFixed(1)}%`
 const rel = (p: string) => relative(process.cwd(), p);
 const seamOf = (file: string) => (file.startsWith('test/http/') ? 'test/http' : file.startsWith('test/pipeline/') ? 'test/pipeline' : '其他');
 
-// reporter 的 endTime − startTime 只含各测试（含 beforeEach / afterEach），不含 beforeAll / afterAll 与 worker 启动、导入。
-// 文件串行执行，所以按结束时间排序，从上一个文件结束到本文件结束算作本文件的耗时（第一个文件从开跑算起），各文件之和等于墙钟时间
-const byEnd = [...results.testResults].sort((a, b) => a.endTime - b.endTime);
-const files = byEnd.map((f, i) => ({
-  file: rel(f.name),
-  ms: f.endTime - (i ? byEnd[i - 1].endTime : results.startTime),
-  tests: f.assertionResults.length,
-  testMs: f.assertionResults.reduce((s, t) => s + (t.duration ?? 0), 0),
-}));
+// 文件按 worker 并行执行，墙钟取开跑到最后一个文件结束。reporter 的 endTime − startTime 只含各测试（含 beforeEach / afterEach），
+// 不含 beforeAll / afterAll 与 worker 启动、导入；所以文件的起点取 reporter 的 startTime 与本文件最早一条夹具计时（at，含 beforeAll 里的）中较早的那个，
+// 文件耗时 = 起点 → endTime（含 beforeAll 里的夹具，不含导入与 worker 启动）。各文件耗时之和是 worker 时间，大于墙钟
+const wall = Math.max(...results.testResults.map(f => f.endTime)) - results.startTime;
+const firstAt = new Map<string, number>();
+for (const t of timings) {
+  if (!t.file || t.at == null || isTask(t)) continue;
+  firstAt.set(t.file, Math.min(firstAt.get(t.file) ?? Infinity, t.at));
+}
+const files = results.testResults.map(f => {
+  const file = rel(f.name);
+  return {
+    file,
+    ms: f.endTime - Math.min(f.startTime, firstAt.get(file) ?? Infinity),
+    tests: f.assertionResults.length,
+    testMs: f.assertionResults.reduce((s, t) => s + (t.duration ?? 0), 0),
+  };
+});
 const total = files.reduce((s, f) => s + f.ms, 0);
 
 const out: string[] = [];
@@ -49,7 +60,9 @@ out.push('## 总览', '');
 table(['项', '值'], [
   ['文件数', files.length],
   ['测试数（通过 / 失败 / 跳过）', `${results.numTotalTests}（${results.numPassedTests} / ${results.numFailedTests} / ${results.numPendingTests}）`],
-  ['墙钟时间（各文件耗时之和，含 global-setup）', sec(total)],
+  ['墙钟时间（开跑 → 最后一个文件结束，含 global-setup）', sec(wall)],
+  ['各文件耗时之和（worker 时间；下文的「占比」都以它为分母）', sec(total)],
+  ['平均并行度（worker 时间 / 墙钟）', (total / wall).toFixed(2)],
   ['各测试 duration 之和（含 beforeEach / afterEach，不含 beforeAll / afterAll）', sec(files.reduce((s, f) => s + f.testMs, 0))],
 ]);
 
@@ -59,7 +72,7 @@ table(['接缝', '文件', '测试', '耗时', '占比', '平均每文件'], [..
   [seam, fs.length, fs.reduce((s, f) => s + f.tests, 0), sec(sum(fs)), pct(sum(fs), total), sec(sum(fs) / fs.length)]));
 function sum(fs: { ms: number }[]) { return fs.reduce((s, f) => s + f.ms, 0); }
 
-out.push('## 最慢的 15 个文件', '', '耗时含 worker 启动、导入、beforeAll 与各测试；「测试 duration 之和」不含 beforeAll。', '');
+out.push('## 最慢的 15 个文件', '', '耗时含 beforeAll 里的夹具与各测试，不含导入与 worker 启动；「测试 duration 之和」不含 beforeAll。', '');
 table(['#', '文件', '测试', '耗时', '占比', '测试 duration 之和'], [...files].sort((a, b) => b.ms - a.ms).slice(0, 15).map((f, i) =>
   [i + 1, `\`${f.file}\``, f.tests, sec(f.ms), pct(f.ms, total), sec(f.testMs)]));
 
@@ -74,21 +87,21 @@ if (timings.length) {
     .sort((a, b) => b.ms - a.ms);
   out.push('## 夹具的固定开销', '',
     '测试侧包装（test/timing.ts）量到的外层耗时。有嵌套：`publishedIdentitySources` 含 `newTenant` 与 `publish`，`mergeUnchecked` 含 `runTask:silver.merge`，各行不能相加。', '');
-  table(['名字', '次数', '涉及文件', '总耗时', '平均', '中位数', '占总耗时'], aggregate(timings.filter(t => !t.name.startsWith('task:'))).map(a =>
+  table(['名字', '次数', '涉及文件', '总耗时', '平均', '中位数', '占 worker 时间'], aggregate(timings.filter(t => !isTask(t))).map(a =>
     [`\`${a.name}\``, a.count, a.files, sec(a.ms), `${Math.round(a.ms / a.count)} ms`, `${a.median} ms`, pct(a.ms, total)]));
 
   out.push('## 各种任务的耗时', '',
     '由 resetDb 清表前从 platform.tasks 读出（finished_at − started_at，应用内部的耗时）。只覆盖调用 resetDb 的文件；beforeAll 里清库的文件，最后一批任务记在下一个文件名下，所以只按种类整体统计。', '');
   // 有的用例直接改写任务的 started_at / finished_at（模拟过期、失联），算出的耗时为负或长得离谱，不计入
   const isReal = (t: Timing) => t.ms >= 0 && t.ms <= MAX_TASK_MS;
-  const tasks = timings.filter(t => t.name.startsWith('task:') && isReal(t));
-  const dropped = timings.filter(t => t.name.startsWith('task:') && !isReal(t)).length;
-  table(['任务', '次数', '失败', '总耗时', '平均', '中位数', '占总耗时'], aggregate(tasks).map(a =>
+  const tasks = timings.filter(t => isTask(t) && isReal(t));
+  const dropped = timings.filter(t => isTask(t) && !isReal(t)).length;
+  table(['任务', '次数', '失败', '总耗时', '平均', '中位数', '占 worker 时间'], aggregate(tasks).map(a =>
     [`\`${a.name.slice(5)}\``, a.count, tasks.filter(t => t.name === a.name && t.status !== 'succeeded').length, sec(a.ms), `${Math.round(a.ms / a.count)} ms`, `${a.median} ms`, pct(a.ms, total)]));
   out.push(`另有 ${dropped} 个任务的耗时为负或超过 ${MAX_TASK_MS / 60_000} 分钟（用例改写了时间戳），未计入。`, '');
 
   out.push('## 固定开销按接缝', '');
-  const bySeam = [...groupBy(timings.filter(t => t.file && !t.name.startsWith('task:')), t => `${seamOf(t.file!)}\t${t.name}`)]
+  const bySeam = [...groupBy(timings.filter(t => t.file && !isTask(t)), t => `${seamOf(t.file!)}\t${t.name}`)]
     .map(([k, ts]) => ({ seam: k.split('\t')[0], name: k.split('\t')[1], count: ts.length, ms: ts.reduce((s, t) => s + t.ms, 0) }))
     .sort((a, b) => a.seam.localeCompare(b.seam) || b.ms - a.ms);
   table(['接缝', '名字', '次数', '总耗时', '占该接缝耗时'], bySeam.map(r => [r.seam, `\`${r.name}\``, r.count, sec(r.ms), pct(r.ms, sum(seams.get(r.seam) ?? []))]));

@@ -5,17 +5,17 @@
 ## 运行
 
 ```bash
-pnpm test                                    # 全部（按文件并行，较慢；输出写进文件再 grep）
+pnpm test                                    # 全部（默认 8 个 worker 按文件并行，本机约 14 分钟；输出写进文件再 grep）
 CRM_TEST_WORKERS=1 pnpm test                 # 只用一个 worker（串行）
 npx vitest run test/pipeline/mapping-merge.test.ts # 单个文件
 ```
 
-- `vitest.config.ts` 设好了测试环境的基准值：平台 PG `crm_platform_test`、源库 `crm_source_test`（都在 `localhost:5432`，账号 `crm/crm`）、本地临时目录作数据湖、固定的主密钥、`MAILER=console`、`SOURCE_LARGE_TABLE_ROWS=1000`。
+- `vitest.config.ts` 设好了测试环境的基准值：平台 PG `crm_platform_test`、源库 `crm_source_test`（都在 `localhost:5432`，账号 `crm/crm`）、本地临时目录作数据湖、固定的主密钥、`MAILER=console`、`SOURCE_LARGE_TABLE_ROWS=1000`、`LC_ALL=en_US.UTF-8`（`localeCompare` 的排序不随 shell 的语言变化）。
 - 本地的 `.env.test`（模板 `.env.test.example`）提供可选的外部依赖；没配置时相应的 `describe.skipIf(...)` 自动跳过：
   - `TEST_S3_LAKE_URI`：对象存储上的隔离测试与文件数据源
   - `TEST_MYSQL_URL`：MySQL 数据源
   - `TEST_MONGO_URL`：MongoDB 数据源
-- **按 worker 分库，文件并行**：worker 数由 `CRM_TEST_WORKERS` 控制（默认 4，PG 默认 `max_connections` 100，不要调得太高）。`vitest.config.ts` 把基准值另存到 `CRM_TEST_BASE_*`，`test/setup-env.ts`（setupFiles）按 `VITEST_POOL_ID`（1…N）给每个 worker 加后缀 `_w<i>`：
+- **按 worker 分库，文件并行**：worker 数由 `CRM_TEST_WORKERS` 控制（默认 8，CI 设成 4，要求 PG 的 `max_connections` ≥ 300，见 `db_script/docker-compose.yml`；PG 还是默认的 100 时用 `CRM_TEST_WORKERS=4`，约 19 分钟）。`vitest.config.ts` 把基准值另存到 `CRM_TEST_BASE_*`，`test/setup-env.ts`（setupFiles）按 `VITEST_POOL_ID`（1…N）给每个 worker 加后缀 `_w<i>`：
   - 平台库 `crm_platform_test_w<i>`、源库 `crm_source_test_w<i>`、MySQL / MongoDB 库（`TEST_MYSQL_URL` / `TEST_MONGO_URL` 的库名加后缀）
   - 数据湖目录 `$TMPDIR/crm_platform_test_lake_w<i>`、源文件目录 `$TMPDIR/crm_platform_test_sources_w<i>`、对象存储前缀 `TEST_S3_LAKE_URI` 加后缀
   - 集群级的源端账号 `crm_src_reader_w<i>` 等（`source-fixtures.ts`）、vite 缓存目录 `node_modules/.vite-test_w<i>`（`harness.ts`）、迁移用例的目标目录 `crm_platform_test_lake_moved_w<i>`
@@ -30,8 +30,9 @@ pnpm test:timing > /tmp/crm-test-full.log 2>&1   # 完整测试，同时记下�
 pnpm test:report                                 # 汇总成 Markdown，写到 /tmp/crm-test-report.md（最慢的文件与测试、夹具与任务的固定开销、按接缝）
 ```
 
-- `test:timing` 设置 `TEST_TIMING=/tmp/crm-test-timing.jsonl`，并用 vitest 的 JSON reporter 把结果写到 `/tmp/crm-test-results.json`。测试的 `duration` 含 beforeEach / afterEach。
-- `test/timing.ts` 的 `timed(name, fn)` 包住了 `startApp`、`resetDb`、`runCli`、`newTenant`、`runTask`、`publish`、`mergeUnchecked`、`publishedIdentitySources`，每次调用追加一行 `{ name, ms, file, test }`；`resetDb` 清表前还把 `platform.tasks` 里每个任务的耗时记成 `task:<kind>`。不设 `TEST_TIMING` 时不计时，行为不变。
+- `test:timing` 设置 `TEST_TIMING=/tmp/crm-test-timing.jsonl`，并用 vitest 的 JSON reporter 把结果写到 `/tmp/crm-test-results.json`。测试的 `duration` 含 beforeEach / afterEach。默认 8 个 worker 下本机约 14 分钟（2026-11-01 实测 803 s）。
+- 报告的口径（文件并行）：墙钟取开跑到最后一个文件结束；文件耗时取 reporter 的 `startTime` 与本文件最早一条夹具计时（含 beforeAll 里的）中较早者 → `endTime`，不含导入与 worker 启动；各文件之和是 worker 时间，「占比」以它为分母。
+- `test/timing.ts` 的 `timed(name, fn)` 包住了 `startApp`、`resetDb`、`runCli`、`newTenant`、`runTask`、`publish`、`mergeUnchecked`、`publishedIdentitySources`，每次调用追加一行 `{ name, ms, at, file, test }`（`at` 是开始时刻）；`resetDb` 清表前还把 `platform.tasks` 里每个任务的耗时记成 `task:<kind>`。不设 `TEST_TIMING` 时不计时，行为不变。
 - 单个文件也能用：`TEST_TIMING=/tmp/t.jsonl npx vitest run <文件> --reporter=json --outputFile.json=/tmp/t.json`，再 `node --import tsx scripts/test-duration-report.ts /tmp/t.json /tmp/t.jsonl`。
 - 上一次的实测与优化方向见 `docs/test-plans/test-duration-report.md`。
 

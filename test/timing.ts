@@ -1,4 +1,4 @@
-// test/timing.ts —— 测量夹具的固定开销：设置 TEST_TIMING=<jsonl 路径> 时，每次调用追加一行 { name, ms, file, test }；
+// test/timing.ts —— 测量夹具的固定开销：设置 TEST_TIMING=<jsonl 路径> 时，每次调用追加一行 { name, ms, at, file, test }（at 是开始时刻的 epoch 毫秒）；
 // 没设置时直接执行，行为不变。用追加写：每个测试文件在不同的 worker 进程里跑。汇总见 scripts/test-duration-report.ts
 import { appendFileSync } from 'node:fs';
 import { relative } from 'node:path';
@@ -14,7 +14,8 @@ function where() {
 
 /** 写一行计时记录（只在开启计时时调用）；extra 是附带的字段（如任务的 status） */
 export function record(name: string, ms: number, extra: Record<string, unknown> = {}) {
-  appendFileSync(process.env.TEST_TIMING!, `${JSON.stringify({ name, ms: Math.round(ms), ...where(), ...extra })}\n`);
+  const at = Math.round(Date.now() - ms);
+  appendFileSync(process.env.TEST_TIMING!, `${JSON.stringify({ name, ms: Math.round(ms), at, ...where(), ...extra })}\n`);
 }
 
 export const timingEnabled = () => !!process.env.TEST_TIMING;

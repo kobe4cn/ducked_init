@@ -267,3 +267,70 @@
 
 - `publishedIdentitySources` 的结果对同样的参数是一样的。造一次后把这个租户的平台表行、catalog schema、数据湖目录与源库 schema 保存下来，之后每次清库后恢复，估计每次 2–3 s，代替 27 s，最多省约 4,500 s。
 - 风险高：租户 ID、数据库角色与密码、加密的数据密钥、DuckLake catalog 里的绝对路径都要原样恢复；`slug` 参数不同的调用要分别造；夹具一改就要让快照失效。3.1 与 3.4 做完仍不够快时再考虑。
+
+## 4. 优化后（#309）
+
+> 测量于 2026-11-01，#305–#308 合入后加上 #309（默认 8 个 worker、PG `max_connections=300`），本机 16 核、128 GB，`pnpm test:timing`。118 个文件、1200 个测试全部通过，**墙钟 803 s（约 13 分 23 秒）**，串行时是 9,974 s，约快 12.4 倍。同一份代码用 `CRM_TEST_WORKERS=4` 再跑一次：1200 个全过，墙钟 1,160 s。
+
+口径（`scripts/test-duration-report.ts` 已按并行改过）：
+
+- 文件并行后「上一个文件结束 → 本文件结束」不再是本文件的耗时。墙钟取 JSON reporter 的 `startTime` 到最后一个文件的 `endTime`。
+- 文件耗时取 reporter 的 `startTime` 与本文件最早一条夹具计时（`test/timing.ts` 现在记下开始时刻 `at`，含 beforeAll 里的）中较早者 → `endTime`：含 beforeAll 里的夹具与各测试，不含导入与 worker 启动。
+- 各文件耗时之和是 worker 时间（6,305 s），比墙钟大；下表的「占比」以它为分母。平均并行度 = worker 时间 / 墙钟 = 7.86。
+- 第 1 节的数据保持原样，是串行时的口径。
+
+### 各票的贡献
+
+| 票 | 改动 | 墙钟 | 说明 |
+|---|---|---|---|
+| — | 串行（#300 测量） | 9,974 s | 基线 |
+| #305 | 按 worker 分库，4 个 worker 文件并行 | 1,439 s | −8,535 s，主要收益 |
+| #306–#308 | 拆分 mapping / identity，只读用例共用夹具，HTTP 进程内开租户 | 1,160 s（4 个 worker） | −279 s；单文件耗时见各票（如 lineage 471 → 275 s、api 197 → 140 s）。worker 时间 4,565 s，串行时就是墙钟 9,974 s |
+| #309 | 默认 8 个 worker、PG `max_connections=300` | 803 s | −357 s。worker 时间从 4,565 s 涨到 6,305 s（+38%）：16 核上 8 个测试进程再各自 fork 任务工作进程，CPU 与 PG 争用让每个文件变慢，所以 8 个 worker 只比 4 个快 1.45 倍 |
+
+12 与 10 个 worker 没有试：8 个已在 30 分钟以内，票里只在超过时才要求试。
+
+### 按接缝
+
+| 接缝 | 文件 | 测试 | 耗时（worker 时间） | 占比 | 平均每文件 | 串行时 |
+|---|---|---|---|---|---|---|
+| test/pipeline | 54 | 495 | 4,951.6 s | 78.5% | 91.7 s | 7,576.4 s（50 个文件） |
+| test/http | 24 | 274 | 1,349.4 s | 21.4% | 56.2 s | 2,384.6 s |
+| 其他 | 40 | 431 | 4.1 s | 0.1% | 0.1 s | 13.2 s |
+
+### 最慢的 10 个文件
+
+| # | 文件 | 测试 | 耗时（8 个 worker） | 4 个 worker 时 | 串行时 |
+|---|---|---|---|---|---|
+| 1 | `test/pipeline/sync.test.ts` | 26 | 394.1 s | 301.5 s | 439.4 s |
+| 2 | `test/pipeline/mapping-rules.test.ts` | 24 | 245.7 s | 153.0 s | （`mapping.test.ts` 949 s 拆出） |
+| 3 | `test/pipeline/catalog.test.ts` | 14 | 240.7 s | 154.8 s | 353.6 s |
+| 4 | `test/pipeline/serving.test.ts` | 12 | 222.3 s | 172.7 s | 387.0 s |
+| 5 | `test/http/lineage.test.ts` | 18 | 211.2 s | 124.5 s | 503.6 s |
+| 6 | `test/pipeline/dsl-definitions.test.ts` | 18 | 203.1 s | 162.6 s | 366.8 s |
+| 7 | `test/pipeline/mapping-merge.test.ts` | 20 | 201.8 s | 136.7 s | （`mapping.test.ts` 拆出） |
+| 8 | `test/pipeline/assertions.test.ts` | 10 | 199.8 s | 158.1 s | 385.5 s |
+| 9 | `test/pipeline/merge-group-merge.test.ts` | 9 | 187.9 s | 155.8 s | 366.2 s |
+| 10 | `test/pipeline/identity-stable-id.test.ts` | 13 | 181.3 s | 115.9 s | （`identity.test.ts` 741 s 拆出） |
+
+串行时的数取第 1 节（文件间隔口径），并行时的取本节口径，两者含的东西略有不同（串行口径还含导入与 worker 启动，几秒）。最慢的文件 `sync.test.ts`（394 s，其中两个大表全量比对用例 160 s 与 94 s）远小于墙钟，现在的墙钟不受单个文件限制，受 CPU 限制（整轮 `user + sys` 6,656 s，平均占用约 8.3 核）。
+
+### 夹具的固定开销（8 个 worker）
+
+| 名字 | 次数 | 涉及文件 | 总耗时 | 平均 | 占 worker 时间 |
+|---|---|---|---|---|---|
+| `publishedIdentitySources` | 193 | 39 | 3,135.1 s | 16.2 s | 49.7% |
+| `publish` | 1,219 | 53 | 2,311.7 s | 1.9 s | 36.7% |
+| `newTenant` | 709 | 73 | 417.6 s | 0.59 s | 6.6% |
+| `resetDb` | 709 | 77 | 413.8 s | 0.58 s | 6.6% |
+| `startApp` | 24 | 24 | 57.8 s | 2.4 s | 0.9% |
+
+`publishedIdentitySources` 从 205 次降到 193 次（#307、#308 共用夹具），它仍占一半的 worker 时间。
+
+### 顺带修的问题
+
+第一轮 8 个 worker 时 `merge-groups.test.ts` 的「双人发布…」失败，单独跑也失败，与并行无关：`listMergeGroups` 用 `localeCompare` 给候选映射排序，结果取决于进程的 ICU 默认 locale（来自 `LC_ALL` / `LANG`）。shell 是 `zh_CN.UTF-8` 时「CRM」排在「会员」之后。`vitest.config.ts` 把测试的 `LC_ALL` 固定成 `en_US.UTF-8`，不改 `app/`。
+
+### 下一步
+
+已经降到 30 分钟以内，#301 的目标达成。还想更快时，按第 3 节：预热工作进程（3.3，CPU 是瓶颈，省掉每个任务约 250 ms 的 fork + tsx 最直接），或夹具快照（3.6，`publishedIdentitySources` 仍占 worker 时间的一半）。
