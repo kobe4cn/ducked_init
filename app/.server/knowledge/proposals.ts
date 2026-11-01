@@ -33,7 +33,6 @@ export interface ProposalInput {
   generatorVersion: string;
 }
 
-const KINDS: readonly ProposalKind[] = ['alias', 'claim', 'note'];
 const REASON_MAX_LENGTH = 500;
 
 /** 校验种类与声明的形状，只留下该种类的键；不合法时抛 KnowledgeError */
@@ -72,8 +71,8 @@ function evidenceOf(evidence: unknown): Evidence[] {
 export async function proposeKnowledge(tx: Tx, tenantId: string, input: ProposalInput): Promise<Proposal | null> {
   const { targetId, generatorVersion } = input;
   const mappingId = input.mappingId ?? null;
-  if (!KINDS.includes(input.kind)) throw new KnowledgeError(`没有这种提案：${String(input.kind)}`);
-  const kind = input.kind;
+  const { kind } = input;
+  // 未知种类由 claimOf 抛 400
   const claim = claimOf(kind, input.claim);
   const evidence = evidenceOf(input.evidence);
   if (typeof targetId !== 'string' || !targetId) throw new KnowledgeError('缺少目标');
