@@ -292,6 +292,15 @@ describe('字段抽屉与自定义实体详情页里的业务知识面板', () =
     expect(html).not.toContain('value="field:customer.email"');
   });
 
+  it('数据工程师、管理员同样能在字段抽屉里给实体加别名', async () => {
+    const { acme } = await setup();
+    const de = await loginAs(app, 'de@acme.com');
+    expect((await de.post('/lineage?node=customer', { intent: 'alias.add', targetId: 'entity:customer', alias: '顾客' })).status).toBe(302);
+    const admin = await loginAs(app, 'admin@acme.com');
+    expect((await admin.post('/lineage?node=customer', { intent: 'alias.add', targetId: 'entity:customer', alias: '客户档案' })).status).toBe(302);
+    expect((await knowledgeOf(acme, 'entity:customer'))?.aliases).toEqual(expect.arrayContaining(['顾客', '客户档案']));
+  });
+
   it('查看者在字段抽屉里看得到实体与字段面板，没有表单，字段面板没有来源，提交 403', async () => {
     await setup();
     const viewer = await loginAs(app, 'view@acme.com');
