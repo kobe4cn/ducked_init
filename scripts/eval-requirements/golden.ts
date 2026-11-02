@@ -41,6 +41,8 @@ export interface GoldenEntry {
   covers: (typeof COVERS)[number][];
   retrieval: GoldenRetrieval;
   clarify: string | null;
+  /** 属于验收集（HOLDOUT）：不参与调参，只在验收时看 */
+  holdout: boolean;
 }
 
 /** 已发布的指标：标签样例只引用它们 */
@@ -87,21 +89,34 @@ export const CONTEXT: DslContext = {
   metrics: new Map(Object.entries(PUBLISHED_METRICS).map(([key, yaml]): [string, DslCheck<MetricSpec>] => [key, checkMetric(yaml, empty)])),
 };
 
+/**
+ * 验收集：每类 2 条，不参与调参，eval:requirements 单独列出（#318）。只在这里标，不改 YAML；
+ * test/retrieval-golden.test.ts 的 BASELINE / KNOWN_GAPS 是回归下限，仍覆盖全部条目
+ */
+export const HOLDOUT: ReadonlySet<string> = new Set([
+  'churn-risk', 'viewer-store-orders',
+  'aov-ambiguous', 'revenue-by-paid-time',
+  'sales-amount-alias', 'region-alias',
+  'revenue-yoy', 'viewer-source-tables',
+]);
+
 const dir = join(import.meta.dirname, 'golden');
 
-type GoldenFile = Omit<GoldenEntry, 'id' | 'role' | 'covers' | 'retrieval'> & {
+type GoldenFile = Omit<GoldenEntry, 'id' | 'role' | 'covers' | 'retrieval' | 'holdout'> & {
   role?: GoldenEntry['role']; covers?: GoldenEntry['covers']; retrieval: Omit<GoldenRetrieval, 'query'> & { query?: string };
 };
 
 /** 全部条目（按文件名排），带检索标注 */
 export const GOLDEN_ALL: GoldenEntry[] = readdirSync(dir).filter(f => f.endsWith('.yaml')).sort(cmp).map(f => {
   const file = parse(readFileSync(join(dir, f), 'utf8')) as GoldenFile;
+  const id = f.replace(/\.yaml$/, '');
   return {
-    id: f.replace(/\.yaml$/, ''), request: file.request,
+    id, request: file.request,
     ...(file.kind && { kind: file.kind }), ...(file.expected && { expected: file.expected }),
     failure_type: file.failure_type, role: file.role ?? 'analyst', covers: file.covers ?? [],
     retrieval: { ...file.retrieval, query: file.retrieval.query ?? file.request },
     clarify: file.clarify,
+    holdout: HOLDOUT.has(id),
   };
 });
 

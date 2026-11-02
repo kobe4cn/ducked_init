@@ -143,7 +143,9 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 
 - `GOLDEN_ALL`（`golden.ts`）：全部 40 条，每份 YAML 除 `request` 外有 `failure_type: a|b|c|d`（召回失败 / 选错口径 / 知识缺失 / 超出能力）、`role: analyst|viewer`（缺省 analyst）、可选的 `covers: [same-name, alias, role]`、`retrieval: { query?, candidates, forbidden, ambiguous }`（`query` 缺省用 `request`，id 是目录条目标识）与 `clarify`（期望的追问，不需要写 `null`，键必须在）。`kind` / `expected` 可选：拿不出合法 DSL、要先追问或与别的条目重复的不写。`GOLDEN` 只含有 `kind` 与 `expected` 的条目，给 `pnpm eval:requirements` 与 `eval-requirements.test.ts`。
 - `failure_type` 标的是这条主要考哪类失败，不是现有 `search()` 的结果；`clarify` 与 `ambiguous` 各管各的：候选只有一个但缺阈值等信息时也可以有追问。查看者条目另断言前 20 里没有数据源与源表（`source:` / `table:`）。
-- `RETRIEVAL_CATALOG`（`retrieval-catalog.ts`）：在 `CATALOG_INPUT` 上加几组近义指标（营收按下单 / 支付时间、含不含退款、订单 / 明细金额；客单价、活跃次数、下单次数各两种口径）、一个标签、两个数据源（商城、门店POS）与四张源表。新加的定义放 `EXTRA_DEFINITIONS`，要能对着 `CONTEXT` 过校验（测试里断言）；不要改 `PUBLISHED_METRICS`，否则模型评测的上下文会变。查看者条目在测试里的 `viewerView`（照抄 `catalogFor`）上搜。
+- `RETRIEVAL_CATALOG`（`retrieval-catalog.ts`）：在 `CATALOG_INPUT` 上加几组近义指标（营收按下单 / 支付时间、含不含退款、订单 / 明细金额；客单价、活跃次数、下单次数各两种口径）、一个标签、两个数据源（商城、门店POS）与四张源表。新加的定义放 `EXTRA_DEFINITIONS`，要能对着 `CONTEXT` 过校验（测试里断言）；不要改 `PUBLISHED_METRICS`，否则模型评测的上下文会变。查看者条目在 `retrieval.ts` 的 `viewerView` 上搜。
+- `retrieval.ts`：`viewerView`（照抄 `catalogFor`）、`retrieve(g)`（前 20，先去掉能力说明）、`recallAt`、`retrievalRows` 与 `groupByType`，`retrieval-golden.test.ts` 与 `pnpm eval:requirements` 共用，两边的 Recall@20 是同一算法。追问按服务端的歧义判定算，「该追问」= `clarify` 不为 null。
+- 调参集 / 验收集：`golden.ts` 的 `HOLDOUT`（每类 2 条，不写进 YAML）标出验收集，条目上是 `holdout: true`。调参只看调参集，验收集只在验收时看；`pnpm eval:requirements` 两张表分开列，基线在 `docs/test-plans/requirements-eval-baseline.md`。`BASELINE` / `KNOWN_GAPS` 是回归下限，仍覆盖全部条目。
 - 约定：现有 `search()` 做不到的条目记在测试的 `KNOWN_GAPS`（`it.fails`），汇总用例断言总 Recall@20 ≥ `BASELINE`（实测值向下取两位小数）。改好一条后它会变红：从 `KNOWN_GAPS` 删掉，并按汇总用例打出的新值抬高 `BASELINE`（`--silent=false` 才看得到 `console.table`）。新增条目时守住分布：a、b、c、d 每类 ≥ 4 条，`covers` 每种 ≥ 5 条。
 
 ### `test/http/harness.ts`

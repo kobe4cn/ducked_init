@@ -3,9 +3,10 @@
 // 现有 search() 没有歧义概念（判定恒为 false），做不到的记在 KNOWN_GAPS（用 it.fails，改好后会变红，提醒从清单删掉并抬高 BASELINE）。
 // 纯函数，不读库、不走模型
 import { describe, expect, it } from 'vitest';
-import { expand, search, type Catalog, type CatalogEntry } from '../app/.server/catalog';
+import { expand } from '../app/.server/catalog';
 import { DSL_KINDS } from '../app/.server/pipeline/dsl';
-import { CONTEXT, COVERS, FAILURE_TYPES, GOLDEN, GOLDEN_ALL, ROLES, type GoldenEntry } from '../scripts/eval-requirements/golden';
+import { CONTEXT, COVERS, FAILURE_TYPES, GOLDEN, GOLDEN_ALL, HOLDOUT, ROLES } from '../scripts/eval-requirements/golden';
+import { recallAt, retrieve, viewerView } from '../scripts/eval-requirements/retrieval';
 import { EXTRA_DEFINITIONS, RETRIEVAL_CATALOG } from '../scripts/eval-requirements/retrieval-catalog';
 
 /** 总 Recall@20 的下限：本票实测值向下取两位小数；改好一条后抬高 */
@@ -36,41 +37,7 @@ const KNOWN_GAPS = new Map<string, string>([
   ['vip-level-alias', '没有别名：VIP → 会员等级'],
 ]);
 
-/**
- * 查看者（没有 sources:read）看到的目录：去掉数据源与源表，字段不带血缘，实体不带来源表与合并组。
- * 照抄 app/.server/assistant/tools.ts 的 catalogFor（本票不改 app/，抽成纯函数留给 P2）
- */
-function viewerView(c: Catalog): Catalog {
-  const entries = c.entries.flatMap((e): CatalogEntry[] => {
-    switch (e.kind) {
-      case 'source':
-      case 'table':
-        return [];
-      case 'field':
-        return [{ ...e, lineage: [] }];
-      case 'entity':
-        return [{ ...e, tables: [], unscoped: [], mergeGroups: [] }];
-      default:
-        return [e];
-    }
-  });
-  return { ...c, entries };
-}
-
-const LIMIT = 20;
 const VIEWER = viewerView(RETRIEVAL_CATALOG);
-
-/** 一条的检索结果：前 20（先去掉能力说明，与 model-draft 的 relevantMarkdown 一致）、命中的候选数与歧义判定 */
-function run(g: GoldenEntry) {
-  const c = g.role === 'viewer' ? VIEWER : RETRIEVAL_CATALOG;
-  const top = search(c, g.retrieval.query, c.entries.length).filter(e => e.kind !== 'capability').slice(0, LIMIT).map(e => e.id);
-  const hits = g.retrieval.candidates.filter(id => top.includes(id)).length;
-  // 现有 search() 不判歧义
-  const ambiguous = false;
-  return { top, hits, ambiguous };
-}
-
-const recall = (g: GoldenEntry, r: ReturnType<typeof run>) => (g.retrieval.candidates.length ? r.hits / g.retrieval.candidates.length : null);
 
 describe('检索黄金集的标注', () => {
   it('40 条都有失败类型、正确候选、不能选的近义项与追问键，引用的条目都在目录里', () => {
@@ -97,6 +64,15 @@ describe('检索黄金集的标注', () => {
     expect(GOLDEN.map(c => c.id)).toEqual(GOLDEN_ALL.filter(g => g.kind && g.expected).map(g => g.id));
   });
 
+  it('验收集（HOLDOUT）共 8 条、都在黄金集里，a–d 每类至少 1 条，holdout 字段与集合一致', () => {
+    const ids = GOLDEN_ALL.map(g => g.id);
+    expect(HOLDOUT.size).toBe(8);
+    for (const id of HOLDOUT) expect(ids, id).toContain(id);
+    const holdout = GOLDEN_ALL.filter(g => HOLDOUT.has(g.id));
+    for (const t of FAILURE_TYPES) expect(holdout.filter(g => g.failure_type === t).length, t).toBeGreaterThanOrEqual(1);
+    for (const g of GOLDEN_ALL) expect(g.holdout, g.id).toBe(HOLDOUT.has(g.id));
+  });
+
   it('额外的近义定义都能对着固定上下文过校验，目录里有它们', () => {
     for (const [key, d] of Object.entries(EXTRA_DEFINITIONS)) {
       const r = DSL_KINDS[d.kind].check(d.yaml, CONTEXT);
@@ -116,7 +92,7 @@ describe('确定性检索（现有 search()）', () => {
   for (const g of GOLDEN_ALL) {
     const gap = KNOWN_GAPS.get(g.id);
     (gap ? it.fails : it)(`${g.id}：候选都进前 20，第 1 名不是近义项，歧义判定一致${gap ? `（已知差距：${gap}）` : ''}`, () => {
-      const r = run(g);
+      const r = retrieve(g);
       // 跨角色可见性：查看者看不到数据源与源表，一条都不能出现
       if (g.role === 'viewer') expect(r.top.filter(id => /^(source|table):/.test(id)), '查看者搜到了数据源或源表').toEqual([]);
       expect(g.retrieval.candidates.filter(id => !r.top.includes(id)), '没进前 20 的候选').toEqual([]);
@@ -127,8 +103,8 @@ describe('确定性检索（现有 search()）', () => {
 
   it(`总 Recall@20 不低于 BASELINE（${BASELINE}）`, () => {
     const rows = GOLDEN_ALL.map(g => {
-      const r = run(g);
-      return { id: g.id, type: g.failure_type, recall: recall(g, r), top1: r.top[0] ?? null, ambiguous: r.ambiguous, expected: g.retrieval.ambiguous };
+      const r = retrieve(g);
+      return { id: g.id, type: g.failure_type, recall: recallAt(g, r), top1: r.top[0] ?? null, ambiguous: r.ambiguous, expected: g.retrieval.ambiguous };
     });
     console.table(rows);
     const scored = rows.flatMap(x => (x.recall === null ? [] : [x.recall]));
