@@ -12,8 +12,17 @@
 | 已准备 | + `sandcastle:prepped` | prep agent（指引新鲜、≤3 条验收标准、blocker 都已关闭） | plan 选中后实现 |
 | 已拆分 | 父票去掉 `Sandcastle`；子票带 `Sandcastle` + `ready-for-agent` | prep agent | 子票下一轮各自 prep |
 | 已合并 | issue 关闭（PR 正文 `Closes #n`） | 脚本 | 依赖它的票下一轮开工 |
-| 等人审 | + `sandcastle:pr-open` | 脚本（没能自动合并时） | 人审 PR；合并后 issue 自动关闭 |
+| 等人审 | + `sandcastle:pr-open` | 脚本（没能自动合并时） | 人审 PR：没问题就合并（issue 自动关闭）；要改就在 PR 上发 `/sandcastle` 开头的评论或 review |
+| 打回 | 去掉 `sandcastle:pr-open` | 脚本（每轮开头看到打回信号时） | 本轮重新 plan，implementer 在原分支上先处理 PR 意见 |
 | 需要人 | + `sandcastle:stuck`（评论里写原因） | 脚本或 agent | 人处理后去掉 `sandcastle:stuck` |
+
+## reviewer 打回（revise）
+
+reviewer 的结论有三种：`merge`、`revise`、`pr`（规则在 `.sandcastle/review-prompt.md`）。
+
+- `revise`：有要改行为、但正确做法明确的问题，比如漏了验收标准或测试、测试缺断言、重复已有 helper、术语不对。reviewer 在 `<revise>` 里逐条写位置、改法和验证方式。脚本把这些意见交给一个新的 implementer 会话，改完后再审一次。最多打回 `REVISE_MAX = 2` 次。
+- 两次之后仍是 `revise`，就留 PR 给人审。PR 正文的 Review 一节会附上每次的意见。
+- 要人判断的问题会决定怎么改时，reviewer 直接给 `pr`，不打回。
 
 ## 什么时候自动合并
 
@@ -36,7 +45,7 @@ GitHub CI 不作为门槛。
 - 有 open blocker 的票不会被 prep，也不会被 plan 选中。blocker 留成 PR 时，依赖它的票要等你合并之后的下一次运行。
 - 拆出来的子票会在**下一轮**被看到（每轮开头重新查询 issue）。
 - 每轮开头 `git fetch origin main`，新分支从 `origin/main` 建，不动宿主机本地 `main` 的工作区；跑完后本地 `main` 要自己 `git pull`。
-- 要修改留下的 PR：在 PR 上留 review 意见，去掉 issue 的 `sandcastle:pr-open`，再运行。implementer 会接着同一个分支 `sandcastle/issue-<n>` 做，并先读 PR 评论。
+- 要修改留下的 PR：在 PR 上留意见（普通评论、review 正文、行内意见都行），再发一条**以 `/sandcastle` 开头**的评论或 review（意见可以直接写在它后面），然后运行。每轮开头，脚本看到晚于分支最新提交的 `/sandcastle`，或别人点的 Request changes，就去掉 `sandcastle:pr-open`，把票放回 plan。PR 是用你的 gh 凭据开的，GitHub 不让作者对自己的 PR 点 Request changes，所以要用 `/sandcastle`。implementer 接着同一个分支 `sandcastle/issue-<n>` 做，并先读 PR 评论和行内意见。reviewer 会逐条确认这些意见都处理了，才给 `merge`。手动去掉 `sandcastle:pr-open` 的老办法也还能用。
 - 已经有指引、但写于 blocker 合并之前的票，prep 会按 `docs/agents/ticket-sizing.md` 重写指引。
 
 ## 上下文预算

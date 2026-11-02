@@ -8,13 +8,17 @@
 //   Phase 1 (Plan):  只看 `Sandcastle` + `sandcastle:prepped`、且没有 pr-open / stuck
 //                    的票，排除仍有未关闭 blocker 的票。
 //   Phase 2 (Build): 每张票一个沙箱，从 origin/main 建分支：implementer（每次迭代
-//                    都是全新的 Claude 会话）→ reviewer（给出 merge / pr 结论）→
+//                    都是全新的 Claude 会话）→ reviewer（给出 merge / revise / pr 结论；revise
+//                    时把修改意见交给新的 implementer 会话改完再审，最多 REVISE_MAX 次）→
 //                    门槛（脚本自己跑 typecheck + 完整测试，失败时让 implementer 修一次）。
 //                    最多 MAX_PARALLEL 张并行，每个沙箱用独立的测试库与前缀。
 //   Phase 3 (Land):  在宿主机上 push、开 PR（`Closes #n`）。reviewer 说 merge 且门槛通过
 //                    → `gh pr merge --rebase`，issue 自动关闭；否则打 sandcastle:pr-open 等人审。
 //                    合并不了（同一轮先合并的票造成冲突，或 drizzle 迁移链分叉）时，rebase 到
 //                    最新的 origin/main（冲突与迁移交给 agent，rebase-prompt.md），重跑门槛后再合并一次。
+//   每轮开头：等人审的 PR 上有晚于分支最新提交的打回信号（`/sandcastle` 开头的评论或 review，
+//                    或别人点的 Request changes）→ 去掉 issue 的 sandcastle:pr-open，这张票本轮
+//                    重新进入 plan，implementer 先读 PR 上的意见。
 //
 // 标签状态机见 docs/agents/sandcastle.md。
 //
@@ -37,6 +41,7 @@ import { z } from "zod";
 const MAX_ITERATIONS = 10; // prep→plan→build→land 的轮数上限
 const MAX_PARALLEL = 2; // 同时实现的票数：受 PG max_connections 与机器负载限制
 const IMPLEMENT_MAX_ITERATIONS = 3; // 一张票最多开几次全新会话；超过说明票太大，交给人
+const REVISE_MAX = 2; // reviewer 给 revise 时最多打回几次；之后仍不行就留 PR 给人
 const CONTEXT_BUDGET = 150_000; // 单个会话的上下文预算（CLAUDE.md「Context budget」）
 const REMOTE = "origin";
 const BASE_BRANCH = "main";
@@ -249,6 +254,41 @@ function markStuck(issueId: string, reason: string) {
   sh("gh", ["issue", "comment", issueId, "--body", `Sandcastle 停下了：${reason}`]);
 }
 
+/** PR 上以这个开头的评论或 review 正文表示「打回 Sandcastle」（作者不能对自己的 PR 点 Request changes）。 */
+const REVISE_COMMAND = "/sandcastle";
+
+/**
+ * 等人审的票：PR 上有晚于分支最新提交的打回信号（`/sandcastle` 开头的评论或 review，或别人点的
+ * Request changes）→ 去掉 issue 的 pr-open，让它回到 plan。比较时间是为了不重复回流：
+ * Sandcastle 改完推上新提交后，同一条意见不再算数。
+ */
+function reopenRequestedRevisions() {
+  for (const { number: issueId } of searchIssues(`${q(LABEL.prOpen)} ${notIn(LABEL.stuck)}`)) {
+    if (!allowed(issueId)) continue;
+    const view = trySh("gh", ["pr", "view", `sandcastle/issue-${issueId}`, "--json", "number,state,reviews,comments,commits"]);
+    if (!view.ok) continue;
+    const pr: {
+      number: number;
+      state: string;
+      reviews: { state: string; body: string; submittedAt: string }[];
+      comments: { body: string; createdAt: string }[];
+      commits: { committedDate: string }[];
+    } = JSON.parse(view.out);
+    if (pr.state !== "OPEN") continue;
+    const lastCommit = pr.commits.map((c) => c.committedDate).sort().at(-1) ?? "";
+    const signals = [
+      ...pr.reviews
+        .filter((r) => r.state === "CHANGES_REQUESTED" || r.body.trim().startsWith(REVISE_COMMAND))
+        .map((r) => r.submittedAt),
+      ...pr.comments.filter((c) => c.body.trim().startsWith(REVISE_COMMAND)).map((c) => c.createdAt),
+    ];
+    if (!signals.some((at) => at > lastCommit)) continue;
+    sh("gh", ["issue", "edit", String(issueId), "--remove-label", LABEL.prOpen]);
+    sh("gh", ["pr", "comment", String(pr.number), "--body", "收到打回，这张票重新进入 Sandcastle：implementer 会先处理这个 PR 上的意见。"]);
+    console.log(`  ↺ #${issueId} 收到打回（PR #${pr.number}），重新排队`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Build one issue inside its own sandbox
 // ---------------------------------------------------------------------------
@@ -274,13 +314,37 @@ async function build(issue: Issue) {
       return { done: false as const, implement };
     }
 
-    const review = await sandbox.run({
-      name: `review-${issue.id}`,
-      maxIterations: 1,
-      agent: agent(env),
-      promptFile: "./.sandcastle/review-prompt.md",
-      promptArgs: { TASK_ID: issue.id, BRANCH: issue.branch },
-    });
+    const runReview = (round: number) =>
+      sandbox.run({
+        name: `review-${issue.id}-${round}`,
+        maxIterations: 1,
+        agent: agent(env),
+        promptFile: "./.sandcastle/review-prompt.md",
+        promptArgs: { TASK_ID: issue.id, BRANCH: issue.branch, ROUND: round, REVISE_MAX },
+      });
+    // reviewer 给 revise：修改意见交给新的 implementer 会话，改完再审一次。
+    const reviews = [await runReview(0)];
+    const revisions: { items: string; run: sandcastle.SandboxRunResult }[] = [];
+    while (revisions.length < REVISE_MAX && tagged(reviews.at(-1)!.stdout, "verdict") === "revise") {
+      const items = tagged(reviews.at(-1)!.stdout, "revise") ?? "（reviewer 没有列出修改意见）";
+      const run = await sandbox.run({
+        name: `revise-${issue.id}-${revisions.length + 1}`,
+        maxIterations: 1,
+        agent: agent(env),
+        prompt: [
+          `分支 ${issue.branch}（issue #${issue.id}：${issue.title}）的 review 打回了，修改意见如下。`,
+          "", items, "",
+          `先 \`gh issue view ${issue.id}\` 看验收标准，再逐条处理上面的意见。遵守 CLAUDE.md 的「Context budget」：从意见给的 file:line 出发，grep -n 定位，不要广泛探索。`,
+          "改行为的意见先写或改测试（跑红再跑绿）。只跑改到的测试文件（`npx vitest run <file>`）和 `npm run typecheck`，不要跑完整测试。",
+          `每条意见处理完提交一次，按仓库风格写中文提交信息、末尾 (#${issue.id})。`,
+          "某条意见你判断不该改（与票冲突、要人拍板），不要改，在输出里写明哪条、为什么。",
+          "最后输出 <promise>COMPLETE</promise>。",
+        ].join("\n"),
+      });
+      revisions.push({ items, run });
+      reviews.push(await runReview(revisions.length));
+    }
+    const review = reviews.at(-1)!;
 
     const gate = () => sandbox.exec(`${envPrefix(env)} sh -c ${shellQuote(GATE_SCRIPT)}`);
     let gateResult = await gate();
@@ -305,8 +369,8 @@ async function build(issue: Issue) {
     return {
       done: true as const,
       implement,
-      review,
-      fix,
+      runs: [...reviews, ...revisions.map((r) => r.run), fix],
+      revisions: revisions.map((r) => r.items),
       verdict: tagged(review.stdout, "verdict"),
       summary: tagged(review.stdout, "review-summary") ?? "（reviewer 没有给出摘要）",
       gate: { ok: gateResult.exitCode === 0, output: gateResult.stdout.slice(-3000) },
@@ -410,6 +474,7 @@ async function rebaseAndMerge(issue: Issue, pr: string): Promise<{ ok: true } | 
 for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
   sh("git", ["fetch", REMOTE, BASE_BRANCH]); // 上一轮合并进远端 main 的代码
+  reopenRequestedRevisions();
 
   // Phase 0: Prep —— 串行，因为拆票会改别的票的 Blocked by。
   // 每轮重新查询，所以上一轮拆出来的子票（继承了 Sandcastle 标签）这里会被看到。
@@ -461,7 +526,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     }
     const result = outcome.value;
     const peak = result.done
-      ? peakContext(result.implement, result.review, result.fix)
+      ? peakContext(result.implement, ...result.runs)
       : peakContext(result.implement);
     const budgetNote = `上下文峰值约 ${Math.round(peak / 1000)}k / ${CONTEXT_BUDGET / 1000}k，implement 用了 ${result.implement.iterations.length} 次会话。`;
     if (!result.done) {
@@ -482,14 +547,25 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     const browserNote = result.browser
       ? `\n\n## Browser check\n\n${result.browser.result ?? "（implementer 没有写 RESULT.md）"}\n\n截图 ${result.browser.shots.length} 张，附在下面。`
       : "";
+    const revisionNote = result.revisions.length
+      ? `\n\n**reviewer 打回过 ${result.revisions.length} 次**（implementer 已按意见修改）：\n\n${result.revisions
+          .map((items, n) => `<details><summary>第 ${n + 1} 次的意见</summary>\n\n${items}\n\n</details>`)
+          .join("\n\n")}`
+      : "";
     const pr = pushAndOpenPr(
       issue,
-      `## Review\n\n${result.summary}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}`,
+      `## Review\n\n${result.summary}${revisionNote}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}`,
       result.browser?.shots ?? [],
     );
 
     if (result.verdict !== "merge") {
-      leaveForHuman(issue, pr, "reviewer 认为需要人审（见 PR 正文的 Review）。");
+      leaveForHuman(
+        issue,
+        pr,
+        result.verdict === "revise"
+          ? `reviewer 打回 ${REVISE_MAX} 次后仍有要改的问题（见最新的 Review）。`
+          : "reviewer 认为需要人审（见 PR 正文的 Review）。",
+      );
       console.log(`  ◐ #${issue.id} 留 PR #${pr} 等人审`);
       continue;
     }

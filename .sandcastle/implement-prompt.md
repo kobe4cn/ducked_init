@@ -3,7 +3,7 @@
 实现 issue #{{TASK_ID}}：{{ISSUE_TITLE}}。只做这一张票。分支 `{{BRANCH}}`。
 
 1. `gh issue view {{TASK_ID}} --comments`。评论里可能有上一次会话留下的进度——从那里接着做，不要重做。
-2. 如果这个分支已经有 PR（`gh pr view {{BRANCH}} --comments`），先处理里面的 review 意见。
+2. 如果这个分支已经有 PR（`gh pr view {{BRANCH}} --comments`），先逐条处理里面的 review 意见，包括行内意见：`gh api "repos/{owner}/{repo}/pulls/$(gh pr view {{BRANCH}} --json number -q .number)/comments" --jq '.[] | "\(.path):\(.line) \(.body)"'`。
 3. `git log --oneline {{BRANCH}} -n 10` 看这个分支已经提交了什么。
 
 # CONTEXT BUDGET
