@@ -45,7 +45,8 @@
     "dbt": "cd dbt && CRM_DB_FILE=${CRM_DB_FILE:-../data/crm.duckdb} dbt build --profiles-dir .",
     "all": "pnpm check && pnpm seed && pnpm ingest && pnpm ingest:incr && pnpm model && pnpm crm && pnpm journey && pnpm realtime && pnpm federation",
     "report": "node --import tsx src/report.ts",
-    "run:sandcastle": "npx tsx .sandcastle/main.ts"
+    "run:sandcastle": "npx tsx .sandcastle/main.ts",
+    "sandcastle:cleanup": "node --env-file-if-exists=.env --env-file-if-exists=.env.test --import tsx scripts/drop-test-resources.ts"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.4",

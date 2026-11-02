@@ -1,5 +1,5 @@
 // test/global-setup.ts —— 测试用平台 PG：每个 worker 一个库（基准库名加 _w<i>，见 test/setup-env.ts），不存在就建库，
-// 然后迁移到最新结构；同时只允许一个 vitest 使用这组测试库。旧库不删：库里租户的 catalog 角色 lake_<id> 是集群级的，删库会留下孤儿角色
+// 然后迁移到最新结构；同时只允许一个 vitest 使用这组测试库。旧库不删：库里租户的 catalog 角色 lake_<id> 是集群级的，删库会留下孤儿角色（Sandcastle 按票加 _i<n> 的库由 scripts/drop-test-resources.ts 连同角色一起回收）
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

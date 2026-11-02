@@ -25,11 +25,11 @@
 // Usage: npm run run:sandcastle
 //        SANDCASTLE_ONLY=328,329 npm run run:sandcastle   只处理这几张票（试跑、单独补跑）
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { cpSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { parseEnv } from "node:util";
+import { parseEnv, promisify } from "node:util";
 import * as sandcastle from "@ai-hero/sandcastle";
 import { podman } from "@ai-hero/sandcastle/sandboxes/podman";
 import { z } from "zod";
@@ -104,6 +104,21 @@ function testEnv(issueId: string): Record<string, string> {
   if (TEST_MYSQL_URL) env.TEST_MYSQL_URL = withDbSuffix(toContainer(TEST_MYSQL_URL), suffix);
   if (TEST_S3_LAKE_URI) env.TEST_S3_LAKE_URI = TEST_S3_LAKE_URI + suffix;
   return { ...env, ...browserEnv(suffix) };
+}
+
+// 关沙箱后回收这张票的测试资源（scripts/drop-test-resources.ts：PG 库与租户角色、MySQL / MongoDB 库、对象存储前缀与账号）。
+// 每次关沙箱都收，不等票合并：再跑这张票（revise、rebase）时 global-setup 与夹具会重新建库。
+// 在宿主机上跑，连接取自宿主机的 .env / .env.test（不做 host.containers.internal 替换）；异步执行，不卡住并行的另一张票。
+// 回收失败只打日志，不影响票的结果；留下的可以之后 `pnpm sandcastle:cleanup -- --all` 补收。
+async function dropTestResources(issueId: string) {
+  const args = ["--env-file-if-exists=.env", "--env-file-if-exists=.env.test", "--import", "tsx", "scripts/drop-test-resources.ts", `_i${issueId}`];
+  try {
+    const { stdout } = await promisify(execFile)("node", args, { encoding: "utf8" });
+    console.log(`  🧹 #${issueId} ${stdout.trim().split("\n").slice(1).join("；")}`);
+  } catch (e) {
+    const { stdout, stderr } = e as { stdout?: string; stderr?: string };
+    console.warn(`  ⚠ #${issueId} 测试资源回收失败（之后可用 pnpm sandcastle:cleanup -- _i${issueId} 补收）：${(stderr || stdout || String(e)).trim().slice(0, 500)}`);
+  }
 }
 
 // 浏览器验收用的 dev server 与 scripts/browser-lab.ts：独立的平台库（不碰开发库 crm_platform，也不被测试清表）、
@@ -427,6 +442,7 @@ async function build(issue: Issue) {
     };
   } finally {
     await sandbox.close();
+    await dropTestResources(issue.id);
   }
 }
 
@@ -513,6 +529,7 @@ async function rebaseAndMerge(issue: Issue, pr: string): Promise<{ ok: true } | 
     return { ok: false, reason: `rebase 并通过门槛后仍合并失败：${last.slice(0, 300)}` };
   } finally {
     await sandbox.close();
+    await dropTestResources(issue.id);
   }
 }
 
