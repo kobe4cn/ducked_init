@@ -211,6 +211,25 @@ const trySh = (cmd: string, args: string[]) => {
   }
 };
 
+/**
+ * prep 与 plan 不建分支，podman 是挂载型沙箱，默认挂的是宿主机工作区（本地 HEAD），
+ * 不是 origin/main。本地 main 落后时，prep 的 Explore 读到旧代码：指引的 file:line 对不上，
+ * 刚合并的 blocker 也看不到。所以每轮 fetch 后把本地 main 快进到 origin/main。
+ * 只在当前分支是 main 时做；--ff-only 遇到本地领先或分叉、或会覆盖未提交改动时 git 自己拒绝，
+ * 这时只打警告，不动工作区。
+ */
+function syncHostBase() {
+  const branch = trySh("git", ["rev-parse", "--abbrev-ref", "HEAD"]).out;
+  if (branch !== BASE_BRANCH) {
+    console.warn(`  ⚠ 宿主机当前在 ${branch}，不是 ${BASE_BRANCH}：prep / plan 读到的是这个分支的代码，可能不是 ${BASE_REF}`);
+    return;
+  }
+  const merged = trySh("git", ["merge", "--ff-only", "--quiet", BASE_REF]);
+  if (!merged.ok) {
+    console.warn(`  ⚠ 本地 ${BASE_BRANCH} 没能快进到 ${BASE_REF}，prep / plan 可能读到旧代码：${merged.out.slice(0, 300)}`);
+  }
+}
+
 const searchIssues = (query: string): { number: number; title: string }[] =>
   JSON.parse(
     sh("gh", [
@@ -615,6 +634,7 @@ function pushIfAhead(issue: Issue) {
 for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
   sh("git", ["fetch", REMOTE, BASE_BRANCH]); // 上一轮合并进远端 main 的代码
+  syncHostBase();
   reopenRequestedRevisions();
 
   // Phase 0: Prep —— 串行，因为拆票会改别的票的 Blocked by。
@@ -771,4 +791,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   }
 }
 
-console.log(`\nAll done. 本地 main 落后于 ${BASE_REF} 时记得 git pull；带 ${LABEL.prOpen} 的票在 GitHub 上等你审。`);
+// 最后一轮合并的票在这次 fetch 之后才进远端，收尾再同步一次。
+sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+syncHostBase();
+console.log(`\nAll done. 本地 main 已快进到 ${BASE_REF}（不在 main 上时除外，见上面的警告）；带 ${LABEL.prOpen} 的票在 GitHub 上等你审。`);
