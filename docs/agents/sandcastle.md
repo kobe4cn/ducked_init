@@ -44,7 +44,7 @@ GitHub CI 不作为门槛。
 
 - 只跑指定的票：`SANDCASTLE_ONLY=328,329 npm run run:sandcastle`（prep 与 plan 都只看名单里的票；拆出来的子票不在名单里，要另外加）。
 - 有 open blocker 的票不会被 prep，也不会被 plan 选中。blocker 留成 PR 时，依赖它的票要等你合并之后的下一次运行。
-- 拆出来的子票会在**下一轮**被看到（每轮开头重新查询 issue）。
+- 拆出来的子票会在**下一轮**被看到（每轮开头重新查询 issue）。某一轮 plan 选不出票时，如果这一轮拆出了还没 prep 的子票，就进入下一轮；没有才结束运行。
 - 每轮开头 `git fetch origin main`，新分支从 `origin/main` 建，不动宿主机本地 `main` 的工作区；跑完后本地 `main` 要自己 `git pull`。
 - 要修改留下的 PR：在 PR 上留意见（普通评论、review 正文、行内意见都行），再发一条**以 `/sandcastle` 开头**的评论或 review（意见可以直接写在它后面），然后运行。每轮开头，脚本看到晚于分支最新提交的 `/sandcastle`，或别人点的 Request changes，就去掉 `sandcastle:pr-open`，把票放回 plan。PR 是用你的 gh 凭据开的，GitHub 不让作者对自己的 PR 点 Request changes，所以要用 `/sandcastle`。implementer 接着同一个分支 `sandcastle/issue-<n>` 做，并先读 PR 评论和行内意见。reviewer 会逐条确认这些意见都处理了，才给 `merge`。手动去掉 `sandcastle:pr-open` 的老办法也还能用。
 - 已经有指引、但写于 blocker 合并之前的票，prep 会按 `docs/agents/ticket-sizing.md` 重写指引。

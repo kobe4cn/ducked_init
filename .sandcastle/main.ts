@@ -560,6 +560,15 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
   const issues = plan.output.issues.filter((issue) => allowed(issue.id)).slice(0, MAX_PARALLEL);
   if (issues.length === 0) {
+    // 本轮 prep 拆出的子票还没 prep 过（下一轮才看到），这时停下会漏掉能开工的子票。
+    // 只认本轮新出现的票：留在 toPrep 里的票（如等 blocker）下一轮仍不会有新票，循环照常结束。
+    const prepped = new Set(toPrep.map((issue) => issue.number));
+    const split = searchIssues(`${q(LABEL.picked)} ${notIn(LABEL.prepped, LABEL.prOpen, LABEL.stuck)}`)
+      .filter((issue) => allowed(issue.number) && !prepped.has(issue.number));
+    if (split.length > 0) {
+      console.log(`本轮没有可以开工的票，但拆出了子票 ${split.map((issue) => `#${issue.number}`).join("、")}，下一轮 prep。`);
+      continue;
+    }
     console.log("没有可以开工的票（都在等 blocker、等人审 PR，或需要人处理）。");
     break;
   }
