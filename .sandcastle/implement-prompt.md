@@ -42,6 +42,8 @@
 
 # COMMIT
 
+提交前按 `.sandcastle/CODING_STANDARDS.md` 和根目录的 `CODING_STANDARDS.md` 自查一遍改动（两份都很短），review 会按它们打回。
+
 按仓库现有风格写中文提交信息（看 `git log -n 3 --format=%B origin/main`）：一行说明做了什么，然后是关键决定、改动的文件、验证结果（typecheck、跑过的测试文件与用例数），末尾 `(#{{TASK_ID}})`。新增测试文件要在 `test/CATALOG.md` 加一行；加了 ADR 要更新 `docs/adr/README.md`。
 
 不要 push，不要开 PR，不要合并，不要关 issue——这些由编排脚本来做。

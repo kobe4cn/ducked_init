@@ -22,7 +22,7 @@
 
 **人的 review 意见**：这个分支已经有 PR 时（`gh pr view {{BRANCH}} --comments`，行内意见用 `gh api "repos/{owner}/{repo}/pulls/$(gh pr view {{BRANCH}} --json number -q .number)/comments" --jq '.[] | "\(.path):\(.line) \(.body)"'`），逐条确认 implementer 处理了。没有 PR 就跳过。没处理的算 revise 的意见。
 
-**Standards**：按 @.sandcastle/CODING_STANDARDS.md 和 `CONTEXT.md` 的术语检查。另外看：
+**Standards**：按 @.sandcastle/CODING_STANDARDS.md、@CODING_STANDARDS.md 和 `CONTEXT.md` 的术语检查。另外看：
 
 - 和仓库已有函数重复的逻辑（grep 一下有没有现成的 helper）
 - 不安全的类型断言、`any`、没校验的假设

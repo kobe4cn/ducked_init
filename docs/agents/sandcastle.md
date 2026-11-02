@@ -14,7 +14,8 @@
 | 已合并 | issue 关闭（PR 正文 `Closes #n`） | 脚本 | 依赖它的票下一轮开工 |
 | 等人审 | + `sandcastle:pr-open` | 脚本（没能自动合并时） | 人审 PR：没问题就合并（issue 自动关闭）；要改就在 PR 上发 `/sandcastle` 开头的评论或 review |
 | 打回 | 去掉 `sandcastle:pr-open` | 脚本（每轮开头看到打回信号时） | 本轮重新 plan，implementer 在原分支上先处理 PR 意见 |
-| 需要人 | + `sandcastle:stuck`（评论里写原因） | 脚本或 agent | 人处理后去掉 `sandcastle:stuck` |
+| 退回重新准备 | 去掉 `sandcastle:prepped`，issue 上留 `<!-- sandcastle:reprep -->` 评论 | 脚本（implementer 第一次用完会话没做完时） | 下一轮 prep 按进度：指引不对就重写；票太大就把没完成的验收标准拆成子票（被本票 block），本票只留已完成的部分，在原分支上收尾合并 |
+| 需要人 | + `sandcastle:stuck`（评论里写原因） | 脚本（重新准备后仍没做完、沙箱出错）或 agent | 人处理后去掉 `sandcastle:stuck` |
 
 ## reviewer 打回（revise）
 
@@ -50,7 +51,9 @@ GitHub CI 不作为门槛。
 
 ## 上下文预算
 
-- implementer 的每次迭代都是全新的 Claude 会话；`IMPLEMENT_MAX_ITERATIONS = 3`，超过就打 `sandcastle:stuck`，通常说明票太大。
+- implementer 的每次迭代都是全新的 Claude 会话；`IMPLEMENT_MAX_ITERATIONS = 3`。第一次超过时退回 prep 重新准备（见标签状态机），分支先推到远端，已有提交列在评论里；重新准备后再超过才打 `sandcastle:stuck`。
+- 判断「做没做」看分支上领先 `origin/main` 的提交，不看这次会话有没有新提交：重新准备后父票只剩已完成的部分，收尾时可能不再提交。
+- 编码规范：reviewer 按 `.sandcastle/CODING_STANDARDS.md` 和根目录的 `CODING_STANDARDS.md` 审，implementer 提交前按这两份自查。review 里反复出现的问题补进 `.sandcastle/CODING_STANDARDS.md`。
 - 每个会话设 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=150000`。真正保证预算的是 prep 把票切小（`docs/agents/ticket-sizing.md`）。
 - implementer 不跑完整测试（沙箱里约 40 分钟），完整测试由门槛跑。
 - PR 正文的 **Budget** 一节记录上下文峰值，超过 150k 时会标出来。

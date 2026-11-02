@@ -41,6 +41,8 @@ import { z } from "zod";
 const MAX_ITERATIONS = 10; // prep→plan→build→land 的轮数上限
 const MAX_PARALLEL = 2; // 同时实现的票数：受 PG max_connections 与机器负载限制
 const IMPLEMENT_MAX_ITERATIONS = 3; // 一张票最多开几次全新会话；超过说明票太大，交给人
+/** 第一次没做完时脚本留在 issue 上的标记；prep 看到它就按「实现没做完」重新准备，再没做完才打 stuck。 */
+const REPREP_MARK = "<!-- sandcastle:reprep -->";
 const REVISE_MAX = 2; // reviewer 给 revise 时最多打回几次；之后仍不行就留 PR 给人
 const CONTEXT_BUDGET = 150_000; // 单个会话的上下文预算（CLAUDE.md「Context budget」）
 const REMOTE = "origin";
@@ -355,7 +357,9 @@ async function build(issue: Issue) {
       promptFile: "./.sandcastle/implement-prompt.md",
       promptArgs: { TASK_ID: issue.id, ISSUE_TITLE: issue.title, BRANCH: issue.branch },
     });
-    if (!implement.completionSignal || implement.commits.length === 0) {
+    // 看分支上的提交，不看这次会话的：重新准备后父票只剩已完成的部分，收尾时可能不再提交。
+    const ahead = Number((await sandbox.exec(`git rev-list --count ${BASE_REF}..HEAD`)).stdout.trim()) || 0;
+    if (!implement.completionSignal || ahead === 0) {
       return { done: false as const, implement };
     }
 
@@ -534,7 +538,10 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       maxIterations: 1,
       agent: agent(),
       promptFile: "./.sandcastle/prep-prompt.md",
-      promptArgs: { TASK_ID: issue.number, LABEL_PICKED: LABEL.picked, LABEL_PREPPED: LABEL.prepped, LABEL_STUCK: LABEL.stuck },
+      promptArgs: {
+        TASK_ID: issue.number, LABEL_PICKED: LABEL.picked, LABEL_PREPPED: LABEL.prepped, LABEL_STUCK: LABEL.stuck,
+        REPREP_MARK,
+      },
     });
   }
 
@@ -575,10 +582,24 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       : peakContext(result.implement);
     const budgetNote = `上下文峰值约 ${Math.round(peak / 1000)}k / ${CONTEXT_BUDGET / 1000}k，implement 用了 ${result.implement.iterations.length} 次会话。`;
     if (!result.done) {
-      markStuck(
-        issue.id,
-        `${IMPLEMENT_MAX_ITERATIONS} 次会话内没有完成（见上面 implementer 的评论）。${budgetNote} 通常说明票太大，请重新 /prep-ticket 后去掉 ${LABEL.stuck}。`,
-      );
+      const comments = sh("gh", ["issue", "view", issue.id, "--json", "comments", "--jq", "[.comments[].body] | join(\"\\n\")"]);
+      if (comments.includes(REPREP_MARK)) {
+        markStuck(
+          issue.id,
+          `重新准备过一次，${IMPLEMENT_MAX_ITERATIONS} 次会话内仍没有完成（见上面 implementer 的评论）。${budgetNote} 请人看一下票怎么拆。`,
+        );
+        continue;
+      }
+      // 第一次没做完：分支推上去免得部分提交只留在宿主机，提交列表写进评论给 prep 看，退回 prep 重新准备。
+      const pushed = trySh("git", ["push", "--force-with-lease", "-u", REMOTE, issue.branch]).ok;
+      const log = trySh("git", ["log", "--format=- %h %s", `${BASE_REF}..${issue.branch}`]);
+      const commits = log.ok && log.out ? `\n\n分支 \`${issue.branch}\` 上已有的提交：\n\n${log.out}` : "\n\n分支上还没有提交。";
+      sh("gh", ["issue", "edit", issue.id, "--remove-label", LABEL.prepped]);
+      sh("gh", [
+        "issue", "comment", issue.id, "--body",
+        `${REPREP_MARK}\n${IMPLEMENT_MAX_ITERATIONS} 次会话内没有完成。${budgetNote} 下一轮 prep 会按上面 implementer 的进度评论重新准备：指引不对就重写，票太大就把没完成的验收标准拆成子票。再没做完就打 ${LABEL.stuck}。${commits}${pushed ? "" : "\n\n（分支没能推到远端，下一轮会在本地的同名分支上接着做。）"}`,
+      ]);
+      console.log(`  ↺ #${issue.id} 没做完，退回 prep 重新准备`);
       continue;
     }
 
