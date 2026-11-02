@@ -126,6 +126,8 @@ describe('业务知识面板', () => {
     expect(panel).not.toContain('<button');
     expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'alias.add', alias: '年营收' })).status).toBe(403);
     expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'note.save', note: '改掉' })).status).toBe(403);
+    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'claim.save', type: 'currency', value: 'CNY' })).status).toBe(403);
+    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'subject.create', name: '营收' })).status).toBe(403);
     expect(await knowledgeOf(acme)).toEqual({ aliases: ['营收'], note: '只算已支付' });
   });
 
