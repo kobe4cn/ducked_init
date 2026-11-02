@@ -3,7 +3,7 @@
 // 给出总览、按稳定标识展开与关键词搜索，结果可渲染成 Markdown 与 JSON。
 // 纯函数，不连库（加载见 load.ts）。敏感字段、哈希列与系统列不进目录（ADR-0005）；同步范围外的源表不收（ADR-0013）。
 // 源表、实体与字段展开时带统计与截至时间（行数、空值率、日期 / 时间列的范围与 ADR-0016 的常见取值），统计不进总览。
-// 定义条目只给键、说明、度量 / 取值与依赖，不给结果数据；模板条目给产出列与最近一次快照的表名、行数与时间。
+// 定义条目只给键、说明、度量 / 取值、依赖与系统生成的口径文字（knowledge/derive.ts，读目录时现算），不给结果数据；模板条目给产出列与最近一次快照的表名、行数与时间。
 // 字段带实体字段的业务说明，各映射血缘带映射字段的业务说明（当前内容，清空的不给），都参与搜索、不进总览。
 // 实体、字段、指标、标签与各映射血缘可带业务知识（knowledge，见 knowledge/catalog.ts），同样参与搜索、不进总览；映射字段的知识挂在血缘项上，
 // 没有 sources:read 时随血缘一起去掉
@@ -25,6 +25,7 @@ import { SILVER_SYSTEM_COLUMNS, type MergeMappingParam } from '../pipeline/merge
 import type { ColumnProfile } from '../pipeline/source-engine';
 import { PLATFORM_COLUMNS } from '../pipeline/sync-engine';
 import { knowledgeKey, knowledgeMarkdown, knowledgeText, presentKnowledge, type Knowledge, type KnowledgeInput } from '../knowledge/catalog';
+import { metricText, tagText, type SystemFacts } from '../knowledge/derive';
 import { CAPABILITIES, TEMPLATE_OUTPUTS } from './capabilities';
 
 /** 生成目录的元数据；各部分都可以不给 */
@@ -127,6 +128,8 @@ export interface MetricEntry extends Base {
   measure: string;
   dimensions: string[];
   dependencies: DefinitionDependencies;
+  /** 系统事实：从 DSL 确定性生成的口径文字（knowledge/derive.ts） */
+  system: SystemFacts;
   /** 业务知识；没有时没有 */
   knowledge?: Knowledge;
 }
@@ -136,6 +139,8 @@ export interface TagEntry extends Base {
   /** 规则与 default 给出的取值，按出现顺序去重 */
   values: (string | number)[];
   dependencies: DefinitionDependencies;
+  /** 系统事实：从 DSL 确定性生成的口径文字（knowledge/derive.ts） */
+  system: SystemFacts;
   /** 业务知识；没有时没有 */
   knowledge?: Knowledge;
 }
@@ -369,14 +374,15 @@ export function buildCatalog(input: CatalogInput): Catalog {
       entries.push({
         kind: 'metric', id: metricId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version,
         base: entityId(spec.base), measure: measureText(spec.measure), dimensions: (spec.dimensions ?? []).map(x => x.name),
-        dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)), ...knowledgeOf(metricId(d.key)),
+        dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)), system: { text: metricText(spec) }, ...knowledgeOf(metricId(d.key)),
       });
     } else {
       const spec = parse(d.yaml) as TagSpec;
       const values = [...(Array.isArray(spec.rules) ? spec.rules.map(r => r?.value) : []), spec.default].filter(v => typeof v === 'string' || typeof v === 'number');
       entries.push({
         kind: 'tag', id: tagId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version,
-        values: [...new Set(values)], dependencies: dependencyIds(DSL_KINDS.tag.dependencies(spec)), ...knowledgeOf(tagId(d.key)),
+        values: [...new Set(values)], dependencies: dependencyIds(DSL_KINDS.tag.dependencies(spec)), system: { text: tagText(spec) },
+        ...knowledgeOf(tagId(d.key)),
       });
     }
   }
@@ -447,10 +453,11 @@ function terms(query: string): string[] {
   return [...out];
 }
 
-/** 条目参与搜索的文字：标识、名称、说明、枚举与标签取值、业务知识，字段再加业务说明与各映射字段的说明与知识，能力说明再加各项说明 */
+/** 条目参与搜索的文字：标识、名称、说明、枚举与标签取值、业务知识、指标与标签的口径文字，字段再加业务说明与各映射字段的说明与知识，能力说明再加各项说明 */
 const haystack = (e: CatalogEntry) => [
   e.id, e.name, e.description,
   ...('knowledge' in e ? [knowledgeText(e.knowledge)] : []),
+  ...(e.kind === 'metric' || e.kind === 'tag' ? [e.system.text] : []),
   ...(e.kind === 'field' ? [...(e.enum ?? []), e.note ?? '', ...e.lineage.flatMap(l => [l.note ?? '', knowledgeText(l.knowledge)])] : []),
   ...(e.kind === 'tag' ? e.values.map(String) : []),
   ...(e.kind === 'capability' ? e.sections.flatMap(s => [s.title, ...s.items.flatMap(i => [i.name, i.description])]) : []),
@@ -528,10 +535,10 @@ function entryMarkdown(e: CatalogEntry): string {
     case 'relation':
       return [...head, `- ${e.from} → ${e.to}`].join('\n');
     case 'metric':
-      return [...head, `- 指标 ${code(e.key)}（第 ${e.version} 版），基础实体 ${e.base}，度量 ${code(e.measure)}`,
+      return [...head, `- 指标 ${code(e.key)}（第 ${e.version} 版），基础实体 ${e.base}，度量 ${code(e.measure)}`, `- 口径（系统生成）：${e.system.text}`,
         ...(e.dimensions.length ? [`- 维度：${e.dimensions.map(code).join(', ')}`] : []), ...dependenciesMarkdown(e.dependencies)].join('\n');
     case 'tag':
-      return [...head, `- 标签 ${code(e.key)}（第 ${e.version} 版），取值 ${e.values.map(v => code(String(v))).join(', ')}`,
+      return [...head, `- 标签 ${code(e.key)}（第 ${e.version} 版），取值 ${e.values.map(v => code(String(v))).join(', ')}`, `- 口径（系统生成）：${e.system.text}`,
         ...dependenciesMarkdown(e.dependencies)].join('\n');
     case 'template':
       return [...head, `- 模板 ${code(e.template)}（定义第 ${e.version} 版），读 ${e.entities.join(', ')}`, `- 参数：${code(JSON.stringify(e.params))}`,
