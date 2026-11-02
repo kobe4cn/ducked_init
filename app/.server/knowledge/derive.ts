@@ -1,6 +1,7 @@
 // app/.server/knowledge/derive.ts —— 系统事实：从已发布的指标与标签 DSL 结构确定性派生的口径文字（ADR-0046 入口①），不用模型。
 // 指标：「<实体>中 <过滤>、<窗口>的行，<度量>」，没有过滤与窗口时是「<实体>中所有行，<度量>」；ratio 的度量写「分子：…；分母：…」，各带自己的过滤。
-// 标签：「按指标 <指标>：<条件> 时为 <取值>；…；指标 <指标> 为空时为 <missing>；其余为 <default>」，all 用「且」、any 用「或」连接；
+// 标签：「按指标 <指标>：<条件> 时为 <取值>；…；指标 <指标> 为空时按 <missing> 比较；其余为 <default>」，all 用「且」、any 用「或」连接；
+// missing 是指标为空时拿去和规则比较的值（COALESCE），不是标签取值；为 null 时不替换，写「指标 <指标> 为空时不满足任何比较」；
 // 标签的窗口与过滤在被引用的指标里，这里只写指标键，不展开。字段用原名、不翻译；实体用 entityLabel。
 // 每种 agg、过滤运算与标签条件的模板写成 satisfies Record<注册表的项, …>，注册表新增一项没写模板时类型检查不通过。
 // 纯函数、不碰库：输出只依赖 spec 的内容（比较按 TAG_CONDITIONS 的顺序、missing 按指标键排序），同一份定义每次结果相同，不存表、读目录时现算
@@ -95,6 +96,9 @@ function tagMetrics(spec: TagSpec): string[] {
 /** 标签的口径文字 */
 export function tagText(spec: TagSpec): string {
   const rules = spec.rules.map(r => `${whenText(r.when)} 时为 ${r.value}`);
-  const missing = Object.keys(spec.missing ?? {}).sort(cmp).map(k => `指标 ${k} 为空时为 ${spec.missing?.[k] ?? '空值'}`);
+  const missing = Object.keys(spec.missing ?? {}).sort(cmp).map(k => {
+    const v = spec.missing?.[k];
+    return v === null || v === undefined ? `指标 ${k} 为空时不满足任何比较` : `指标 ${k} 为空时按 ${v} 比较`;
+  });
   return `按指标 ${tagMetrics(spec).join('、')}：${[...rules, ...missing, `其余为 ${spec.default}`].join('；')}`;
 }
