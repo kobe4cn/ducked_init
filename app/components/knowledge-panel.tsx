@@ -108,7 +108,7 @@ function Claims({ panel, targetId }: { panel: Panel; targetId: string }) {
               {panel.canEdit && (
                 <KnowledgeForm intent="claim.save" targetId={targetId} className="ml-auto flex gap-2">
                   <input type="hidden" name="type" value={type} />
-                  <NativeSelect name="value" size="sm" required defaultValue={claim?.needsReview ? '' : (claim?.value ?? '')} aria-label={claimTypeLabel(type)}>
+                  <NativeSelect name="value" size="sm" className="w-48" required defaultValue={claim?.needsReview ? '' : (claim?.value ?? '')} aria-label={claimTypeLabel(type)}>
                     <NativeSelectOption value="" disabled>选择取值</NativeSelectOption>
                     {CLAIM_TYPES[type].values.map(v => <NativeSelectOption key={v.value} value={v.value}>{v.label}</NativeSelectOption>)}
                   </NativeSelect>
