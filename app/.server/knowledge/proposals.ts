@@ -1,6 +1,6 @@
 // app/.server/knowledge/proposals.ts —— 知识提案（ADR-0046）：系统或 AI 生成的别名、口径声明、业务说明先存成提案（proposed），等成员确认，
 // 接受前不进目录、检索与起草上下文（这里的表不读进 loadKnowledge）。成员接受（可以先改值）后在同一事务里变成对应的知识，作者是接受的成员，
-// 目录版本由生成知识的那条审计记；拒绝时记下理由，按指纹（目标 + 映射 + 种类 + 声明 + 依据摘要）记住，同样的提案不再提出。
+// 目录版本由生成知识的那条审计记；拒绝时记下理由，按指纹（目标 + 映射 + 种类 + 内容 + 依据摘要）记住，同样的提案不再提出。
 // 权限同别名：映射字段（带 mappingId）要 sources:write，其余要 definitions:draft。依据已变化的提案不能接受（409）。一律限定在操作者所属租户内
 import { and, desc, eq, type SQL } from 'drizzle-orm';
 import { assertCan } from '../access';
@@ -8,7 +8,9 @@ import { recordAudit, type Tx } from '../audit';
 import { sha256, type CurrentMember } from '../auth';
 import { saveBusinessNoteTx } from '../business-notes';
 import { getDb } from '../db/client';
-import { knowledgeProposals, type ProposalClaim, type ProposalEvidence, type ProposalKind, type ProposalStatus } from '../db/schema';
+import {
+  knowledgeProposals, type ProposalContent, type ProposalContentOf, type ProposalEvidence, type ProposalKind, type ProposalStatus,
+} from '../db/schema';
 import { isClaimType, isClaimValue } from '../../lib/semantic-claims';
 import { addAliasTx } from './aliases';
 import { assertTarget, basisOf, KnowledgeError, stableJson } from './basis';
@@ -26,7 +28,7 @@ export interface ProposalInput {
   targetId: string;
   mappingId?: string | null;
   kind: ProposalKind;
-  claim: unknown;
+  content: unknown;
   /** 元数据引用，不放取值 */
   evidence: ProposalEvidence[];
   generatorVersion: string;
@@ -34,24 +36,62 @@ export interface ProposalInput {
 
 const REASON_MAX_LENGTH = 500;
 
-/** 校验种类与声明的形状，只留下该种类的键，别名与业务说明去掉首尾空白（与生成的知识一致，再进指纹）；不合法时抛 KnowledgeError */
-function claimOf(kind: unknown, claim: unknown): ProposalClaim {
-  const c = (claim && typeof claim === 'object' ? claim : {}) as Record<string, unknown>;
-  if (kind === 'alias') {
-    const alias = typeof c.alias === 'string' ? c.alias.trim() : '';
-    if (!alias) throw new KnowledgeError('别名提案缺少别名');
-    return { alias };
-  }
-  if (kind === 'claim') {
-    if (!isClaimType(c.type)) throw new KnowledgeError('没有这种口径类型');
-    if (!isClaimValue(c.type, c.value)) throw new KnowledgeError('这种口径没有这个取值');
-    return { type: c.type, value: c.value };
-  }
-  if (kind === 'note') {
-    if (typeof c.note !== 'string') throw new KnowledgeError('业务说明提案缺少说明');
-    return { note: c.note.trim() };
-  }
-  throw new KnowledgeError(`没有这种提案：${String(kind)}`);
+/** 一个种类的提案：parse 校验内容形状、只留下该种类的键（不合法时抛 KnowledgeError），materialize 把内容写成对应的知识、返回知识行 ID */
+interface KindSpec<K extends ProposalKind> {
+  parse(c: Record<string, unknown>): ProposalContentOf[K];
+  materialize(tx: Tx, actor: CurrentMember, p: Proposal, content: ProposalContentOf[K]): Promise<string>;
+}
+
+// 每个种类一项，新增种类只在这里加。别名与业务说明去掉首尾空白（与生成的知识一致，再进指纹）
+const KINDS: { [K in ProposalKind]: KindSpec<K> } = {
+  alias: {
+    parse(c) {
+      const alias = typeof c.alias === 'string' ? c.alias.trim() : '';
+      if (!alias) throw new KnowledgeError('别名提案缺少别名');
+      return { alias };
+    },
+    async materialize(tx, actor, { targetId, mappingId }, { alias }) {
+      // 并发加了同一个别名：唯一索引兜底（只改写别名的，其他种类的唯一冲突原样抛出）
+      try { return await addAliasTx(tx, actor, { targetId, mappingId, alias }); } catch (e) { rethrowDuplicateAlias(e); }
+    },
+  },
+  claim: {
+    parse(c) {
+      if (!isClaimType(c.type)) throw new KnowledgeError('没有这种口径类型');
+      if (!isClaimValue(c.type, c.value)) throw new KnowledgeError('这种口径没有这个取值');
+      return { type: c.type, value: c.value };
+    },
+    materialize: (tx, actor, { targetId, mappingId }, { type, value }) => saveClaimTx(tx, actor, { targetId, mappingId, type, value }),
+  },
+  note: {
+    parse(c) {
+      if (typeof c.note !== 'string') throw new KnowledgeError('业务说明提案缺少说明');
+      return { note: c.note.trim() };
+    },
+    materialize(tx, actor, { targetId, mappingId }, { note }) {
+      // 字段（含映射字段）的说明按 entity / field 存，实体、指标、标签的按 targetId 存
+      const field = /^field:([^.]+)\.(.+)$/.exec(targetId);
+      return field
+        ? saveBusinessNoteTx(tx, actor, { entity: field[1]!, field: field[2]!, mappingId, note })
+        : saveBusinessNoteTx(tx, actor, { targetId, note });
+    },
+  },
+};
+
+function isProposalKind(kind: unknown): kind is ProposalKind {
+  return typeof kind === 'string' && Object.hasOwn(KINDS, kind);
+}
+
+/** 按种类校验提案内容；未知种类或内容不合法时抛 KnowledgeError */
+function contentOf(kind: unknown, content: unknown): ProposalContent {
+  if (!isProposalKind(kind)) throw new KnowledgeError(`没有这种提案：${String(kind)}`);
+  return KINDS[kind].parse((content && typeof content === 'object' ? content : {}) as Record<string, unknown>);
+}
+
+/** 提案指纹。键名 claim 是改名前的写法，改了已有提案的指纹全变、拒绝过的会再出现，不能改 */
+export function proposalFingerprint(input: Pick<Proposal, 'targetId' | 'mappingId' | 'kind' | 'content' | 'basedOn'>): string {
+  const { targetId, mappingId, kind, content, basedOn } = input;
+  return sha256(stableJson({ targetId, mappingId, kind, claim: content, basedOn }));
 }
 
 function evidenceOf(evidence: unknown): ProposalEvidence[] {
@@ -70,16 +110,16 @@ function evidenceOf(evidence: unknown): ProposalEvidence[] {
  */
 export async function proposeKnowledge(tx: Tx, tenantId: string, input: ProposalInput): Promise<Proposal | null> {
   const { targetId, mappingId = null, kind, generatorVersion } = input;
-  // 未知种类由 claimOf 抛 400
-  const claim = claimOf(kind, input.claim);
+  // 未知种类由 contentOf 抛 400
+  const content = contentOf(kind, input.content);
   const evidence = evidenceOf(input.evidence);
   if (typeof targetId !== 'string' || !targetId) throw new KnowledgeError('缺少目标');
   await assertTarget(tx, tenantId, targetId, mappingId);
   const basedOn = await basisOf(tx, tenantId, targetId, mappingId);
-  const fingerprint = sha256(stableJson({ targetId, mappingId, kind, claim, basedOn }));
+  const fingerprint = proposalFingerprint({ targetId, mappingId, kind, content, basedOn });
   // 并发提出同一条时唯一索引兜底，之后按指纹读回
   await tx.insert(knowledgeProposals)
-    .values({ tenantId, targetId, mappingId, kind, claim, evidence, basedOn, fingerprint, generatorVersion })
+    .values({ tenantId, targetId, mappingId, kind, content, evidence, basedOn, fingerprint, generatorVersion })
     .onConflictDoNothing();
   const [row] = await tx.select().from(knowledgeProposals)
     .where(and(eq(knowledgeProposals.tenantId, tenantId), eq(knowledgeProposals.fingerprint, fingerprint)));
@@ -95,23 +135,13 @@ async function lockPending(tx: Tx, actor: CurrentMember, id: string): Promise<Pr
   return row;
 }
 
-/** 把（改过的）声明写成对应的知识，返回知识行 ID */
-async function materialize(tx: Tx, actor: CurrentMember, p: Proposal, claim: ProposalClaim): Promise<string> {
-  const { targetId, mappingId } = p;
-  if ('alias' in claim) {
-    // 并发加了同一个别名：唯一索引兜底（只改写别名的，其他种类的唯一冲突原样抛出）
-    try { return await addAliasTx(tx, actor, { targetId, mappingId, alias: claim.alias }); } catch (e) { rethrowDuplicateAlias(e); }
-  }
-  if ('type' in claim) return saveClaimTx(tx, actor, { targetId, mappingId, type: claim.type, value: claim.value });
-  // 字段（含映射字段）的说明按 entity / field 存，实体、指标、标签的按 targetId 存
-  const field = /^field:([^.]+)\.(.+)$/.exec(targetId);
-  return field
-    ? saveBusinessNoteTx(tx, actor, { entity: field[1]!, field: field[2]!, mappingId, note: claim.note })
-    : saveBusinessNoteTx(tx, actor, { targetId, note: claim.note });
+/** 把（改过的）内容按种类写成对应的知识，返回知识行 ID。泛型 K 把种类与内容绑在一起，查表时不用断言 */
+function materialize<K extends ProposalKind>(tx: Tx, actor: CurrentMember, p: Proposal, kind: K, content: ProposalContentOf[K]): Promise<string> {
+  return KINDS[kind].materialize(tx, actor, p, content);
 }
 
 /**
- * 接受提案：可以先改值（edits 是同种类的声明），生成的知识用改后的值，提案行的声明与指纹保持原样。
+ * 接受提案：可以先改值（edits 是同种类的内容），生成的知识用改后的值，提案行的内容与指纹保持原样。
  * 依据与提出时不同时 409「依据已变化」；生成知识出错（如别名重复）时整个事务回滚，提案仍待处理
  */
 export async function acceptProposal(actor: CurrentMember, id: string, edits?: unknown): Promise<Proposal> {
@@ -119,12 +149,12 @@ export async function acceptProposal(actor: CurrentMember, id: string, edits?: u
   const tenantId = actor.tenant.id;
   return getDb().transaction(async tx => {
     const p = await lockPending(tx, actor, id);
-    const claim = edits === undefined ? p.claim : claimOf(p.kind, edits);
+    const content = edits === undefined ? p.content : contentOf(p.kind, edits);
     // 先校验目标（映射字段会锁住映射行，与发布、停用互斥），再比依据
     await assertTarget(tx, tenantId, p.targetId, p.mappingId);
     const basedOn = await basisOf(tx, tenantId, p.targetId, p.mappingId);
     if (stableJson(basedOn) !== stableJson(p.basedOn)) throw new ProposalError('依据已变化', 409);
-    const ref = await materialize(tx, actor, p, claim);
+    const ref = await materialize(tx, actor, p, p.kind, content);
     const [row] = await tx.update(knowledgeProposals)
       .set({ status: 'accepted', reviewedByEmail: actor.email, reviewedAt: new Date(), acceptedRef: ref })
       .where(eq(knowledgeProposals.id, p.id)).returning();
