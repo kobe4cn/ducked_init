@@ -10,7 +10,8 @@ import type { CurrentMember } from '../../app/.server/auth';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { objectPath, signedFetch, xmlTag, xmlTags, type S3Creds } from '../../app/.server/s3-client';
 import { syncSource } from '../../app/.server/source-sync';
-import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
+import { confirmWatermark, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
+import { getTask } from '../../app/.server/tasks';
 import { WORKER_SUFFIX } from '../setup-env';
 
 export const SOURCE_DB_URL = process.env.TEST_SOURCE_DATABASE_URL!;
@@ -188,14 +189,27 @@ export async function seedIdentitySources(member: CurrentMember, { orders = fals
   const ids: string[] = [];
   const extra = [...orders ? ['orders'] : [], ...consents ? ['consents'] : []];
   const sources: [string, string, string[]][] = [['CRM', 'crm', ['customers', ...extra]], ['会员', 'loyalty', ['members', ...extra]], ['埋点', 'tracking', ['users', 'events']]];
+  // 完整测试时多个 worker 共用一台 PG，任务的 DuckDB 子进程偶尔连不上源库而失败（#346）：
+  // drain 后检查任务状态，失败就重新入队，最多 3 次，仍失败就抛出任务的原始错误
+  const drainUntilSucceeded = async (name: string, task: { id: string } | null, retry: () => Promise<{ id: string } | null>) => {
+    for (let attempt = 0; ; attempt++) {
+      await drain();
+      if (!task) throw new Error(`${name}：没有入队任务`);
+      const done = await getTask(task.id);
+      if (done.status === 'succeeded') return;
+      if (done.status !== 'failed' || attempt >= 3) {
+        throw new Error(`${name} 的 ${done.kind} 任务 ${done.status}（已重试 ${attempt} 次）：${done.error ?? ''}`);
+      }
+      task = await retry();
+    }
+  };
   for (const [name, schema, tables] of sources) {
     const { id } = await registerSource(member, { ...input, name, schema });
     await drain();
-    await setSyncScope(member, id, { add: tables });
-    await drain();
+    const { task } = await setSyncScope(member, id, { add: tables });
+    await drainUntilSucceeded(name, task, () => relistSource(member, id));
     for (const table of tables) await confirmWatermark(member, id, table, 'updated_at');
-    await syncSource(member, id);
-    await drain();
+    await drainUntilSucceeded(name, await syncSource(member, id), () => syncSource(member, id));
     ids.push(id);
   }
   return { crm: ids[0], loyalty: ids[1], tracking: ids[2] };
