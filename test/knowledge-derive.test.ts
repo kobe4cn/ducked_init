@@ -84,10 +84,10 @@ describe('标签口径文字', () => {
       expect(tag(`metric: revenue\nrules: [{ value: 是, when: ${when} }]\ndefault: 否\n`)).toBe(`按指标 revenue：${text} 时为 是；其余为 否`);
     }
     expect(tag('metric: revenue\nrules:\n  - { value: 高, when: { gte: 1000 } }\n  - { value: 中, when: { lt: 1000, gte: 100 } }\nmissing: { revenue: 0 }\ndefault: 低\n'))
-      .toBe('按指标 revenue：大于等于 1000 时为 高；大于等于 100且小于 1000 时为 中；指标 revenue 为空时为 0；其余为 低');
+      .toBe('按指标 revenue：大于等于 1000 时为 高；大于等于 100且小于 1000 时为 中；指标 revenue 为空时按 0 比较；其余为 低');
   });
 
-  it('多指标写法：all 用「且」、any 用「或」连接，missing 按指标键排序，为 null 时写空值', () => {
+  it('多指标写法：all 用「且」、any 用「或」连接，missing 按指标键排序，为 null 时不满足任何比较', () => {
     expect(tag([
       'rules:',
       '  - { value: 忠诚, when: { all: [{ metric: revenue, gte: 1000 }, { metric: orders, gte: 5 }] } }',
@@ -95,7 +95,7 @@ describe('标签口径文字', () => {
       'missing: { visits: null, orders: 0 }',
       'default: 普通',
     ].join('\n'))).toBe('按指标 revenue、orders、visits：revenue 大于等于 1000 且 orders 大于等于 5 时为 忠诚；orders 大于 0 或 visits 大于等于 3 时为 活跃；'
-      + '指标 orders 为空时为 0；指标 visits 为空时为 空值；其余为 普通');
+      + '指标 orders 为空时按 0 比较；指标 visits 为空时不满足任何比较；其余为 普通');
   });
 
   it('键顺序不同的 yaml 结果相同', () => {

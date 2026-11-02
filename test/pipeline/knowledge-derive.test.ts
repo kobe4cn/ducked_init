@@ -39,7 +39,7 @@ describe('系统口径进目录', () => {
     expect(metric).toMatchObject({ system: { text } });
     expect(toMarkdown(metric)).toContain(`- 口径（系统生成）：${text}`);
     const tag = expand(c, 'tag:high_value')!;
-    const tagLine = '按指标 paid_revenue：大于等于 1000 时为 高；指标 paid_revenue 为空时为 0；其余为 低';
+    const tagLine = '按指标 paid_revenue：大于等于 1000 时为 高；指标 paid_revenue 为空时按 0 比较；其余为 低';
     expect(tag).toMatchObject({ system: { text: tagLine } });
     expect(toMarkdown(tag)).toContain(`- 口径（系统生成）：${tagLine}`);
     expect(search(c, '最近 30 天内').map(x => x.id)).toContain('metric:paid_revenue');
