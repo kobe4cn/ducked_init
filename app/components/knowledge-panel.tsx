@@ -3,7 +3,7 @@
 // 需复核的知识配 amber 图标与「待复核」，生效的配 emerald。panel 为 null（定义从未发布过）时只提示发布后才能添加
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { Form } from 'react-router';
-import type { MetricEntry, TagEntry } from '~/.server/catalog';
+import type { EntityEntry, FieldEntry, MetricEntry, TagEntry } from '~/.server/catalog';
 import type { KnowledgePanel as Panel, PanelProposal } from '~/.server/knowledge/panel';
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
@@ -40,8 +40,12 @@ function Fact({ label, value }: { label: string; value: string }) {
   );
 }
 
-function SystemFacts({ system }: { system: MetricEntry | TagEntry | null }) {
-  const deps = system ? [...system.dependencies.metrics, ...system.dependencies.entities, ...system.dependencies.fields] : [];
+/** 面板左边展示的目录条目 */
+export type PanelSystem = MetricEntry | TagEntry | EntityEntry | FieldEntry | null;
+
+function SystemFacts({ system }: { system: PanelSystem }) {
+  const definition = system?.kind === 'metric' || system?.kind === 'tag';
+  const deps = definition ? [...system.dependencies.metrics, ...system.dependencies.entities, ...system.dependencies.fields] : [];
   return (
     <div className="space-y-4">
       <h3 className="text-sm font-medium">系统事实</h3>
@@ -54,19 +58,42 @@ function SystemFacts({ system }: { system: MetricEntry | TagEntry | null }) {
           </>
         )}
         {system?.kind === 'tag' && <Fact label="取值" value={system.values.join('、')} />}
-        <Fact label="依赖" value={deps.join('、')} />
-      </dl>
-      <div>
-        <h4 className="text-sm text-slate-500">系统口径</h4>
-        {system ? (
+        {definition && <Fact label="依赖" value={deps.join('、')} />}
+        {system?.kind === 'entity' && (
           <>
-            <p className="text-sm">{system.system.text}</p>
-            <ul className="mt-2 space-y-1">
-              {system.system.claims.map(c => <li key={c.type} data-system-claim={c.type} className="text-sm">{phrase(c.type, c.value)}</li>)}
-            </ul>
+            <Fact label="字段" value={system.fields.map((f) => f.label ? `${f.label}（${f.name}）` : f.name).join('、')} />
+            <Fact label="关系" value={system.relations.join('、')} />
           </>
-        ) : <p className="text-sm text-slate-400">—</p>}
-      </div>
+        )}
+        {system?.kind === 'field' && (
+          <>
+            <Fact label="类型" value={system.type} />
+            {system.enum && <Fact label="枚举" value={system.enum.join('、')} />}
+            {system.lineage.length > 0 && (
+              <div data-field-lineage className="grid grid-cols-[6rem_1fr] gap-2 text-sm">
+                <dt className="text-slate-500">来源</dt>
+                <dd className="space-y-1 break-all">
+                  {system.lineage.map((l, i) => <p key={i}>{l.source} · {l.table} · <code>{l.expr}</code></p>)}
+                </dd>
+              </div>
+            )}
+          </>
+        )}
+      </dl>
+      {/* 依赖与系统口径只属于指标、标签；没有目录条目时照旧显示占位 */}
+      {(definition || !system) && (
+        <div>
+          <h4 className="text-sm text-slate-500">系统口径</h4>
+          {definition ? (
+            <>
+              <p className="text-sm">{system.system.text}</p>
+              <ul className="mt-2 space-y-1">
+                {system.system.claims.map(c => <li key={c.type} data-system-claim={c.type} className="text-sm">{phrase(c.type, c.value)}</li>)}
+              </ul>
+            </>
+          ) : <p className="text-sm text-slate-400">—</p>}
+        </div>
+      )}
     </div>
   );
 }
@@ -308,23 +335,24 @@ function Subjects({ panel, targetId }: { panel: Panel; targetId: string }) {
   );
 }
 
-/** 详情页里的业务知识面板；error 是上一次面板提交的错误消息 */
-export function KnowledgePanel({ panel, system, targetId, error }: {
-  panel: Panel | null; system: MetricEntry | TagEntry | null; targetId: string; error: string | null;
+/** 详情页里的业务知识面板；error 是上一次面板提交的错误消息。
+ * hideNote：字段面板不显示说明区（字段说明由数据地图抽屉里的 Note 编辑）；compact：抽屉里用，单列、窄内边距 */
+export function KnowledgePanel({ panel, system, targetId, error, hideNote = false, compact = false }: {
+  panel: Panel | null; system: PanelSystem; targetId: string; error: string | null; hideNote?: boolean; compact?: boolean;
 }) {
   return (
-    <section data-knowledge-panel className="rounded-2xl border bg-white p-6 shadow-sm">
+    <section data-knowledge-panel={targetId} className={`rounded-2xl border bg-white shadow-sm ${compact ? 'p-4' : 'p-6'}`}>
       <h2 className="mb-4 font-medium">业务知识</h2>
       {panel ? (
-        <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+        <div className={compact ? 'grid gap-6' : 'grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]'}>
           <SystemFacts system={system} />
-          <div className="space-y-6">
+          <div className="min-w-0 space-y-6">
             <h3 className="text-sm font-medium">成员写的知识</h3>
             {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
             <Proposals panel={panel} targetId={targetId} />
             <Aliases panel={panel} targetId={targetId} />
             <Claims panel={panel} targetId={targetId} />
-            <Note panel={panel} targetId={targetId} />
+            {!hideNote && <Note panel={panel} targetId={targetId} />}
             <Subjects panel={panel} targetId={targetId} />
           </div>
         </div>

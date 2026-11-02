@@ -20,10 +20,13 @@ import { AlertTriangle, ArrowLeft, CheckCircle2, CircleAlert, History, Loader2, 
 import type { Route } from './+types/lineage';
 import { can, requirePermission } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
+import { catalogFor } from '~/.server/assistant/tools';
 import { BusinessNoteError, entityNoteHistory, saveBusinessNote } from '~/.server/business-notes';
+import { expand } from '~/.server/catalog';
 import { noteKey } from '~/lib/business-note-key';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
+import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
 import { getInspectStatus, InspectError, inspectLakeNow } from '~/.server/lake-inspect';
 import { lastMergeByMapping, latestIdentitySummary, latestRelationStats, MappingError, type MergeHistoryEntry, publishedPlans, rebuildEntity } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
@@ -46,7 +49,7 @@ import { StatusText } from '~/components/status-text';
 import { DriftBadge } from '~/components/drift-badge';
 import { Badge } from '~/components/ui/badge';
 import { KindIcon } from '~/components/kind-icon';
-import { type FieldNote, LineageDrawer, TableDrawer } from '~/components/lineage-drawer';
+import { type DrawerKnowledge, type FieldNote, LineageDrawer, TableDrawer } from '~/components/lineage-drawer';
 import { FocusGraphView } from '~/components/lineage-focus';
 import { FlowGraphView, MergeStatus } from '~/components/lineage-flow';
 import { RelationGraphView } from '~/components/lineage-graph';
@@ -131,6 +134,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   let focus: FocusInput | null = null;
   let hitIds: { nodes: string[]; edges: string[]; fields: string[] } | null = null;
   let tableDrawer: TableImpact | null = null;
+  let knowledge: { entity: DrawerKnowledge | null; field: DrawerKnowledge | null } = { entity: null, field: null };
   if (tab === 'flow' || drawerEntity || tableNode) {
     const last = await lastMergeByMapping(member.tenant.id, plans.map(p => p.mapping));
     const merges = Object.fromEntries(Object.entries(last).map(([id, r]) => [id, flowMerge(r)]));
@@ -169,6 +173,19 @@ export async function loader({ request }: Route.LoaderArgs) {
         const versions = history.get(key) ?? [];
         return [key, { current: versions.at(-1)?.note ?? '', history: versions }];
       }));
+      // 业务知识面板（ADR-0046）：实体的，和 ?field= 指定的那一个字段的（每个面板都要读全租户的知识，不给每个字段都算）。
+      // 不在目录里的（已接入但未登记的自定义实体、敏感字段、系统列）不给面板，免得提交出 400
+      const catalog = await catalogFor(member);
+      const panelOf = async (targetId: string): Promise<DrawerKnowledge | null> => {
+        const system = expand(catalog, targetId);
+        if (system?.kind !== 'entity' && system?.kind !== 'field') return null;
+        return { targetId, system, panel: await knowledgePanel(member, targetId) };
+      };
+      const field = searchParams.get('field');
+      knowledge = {
+        entity: await panelOf(`entity:${drawerEntity}`),
+        field: field && fields.some(f => f.name === field) ? await panelOf(`field:${drawerEntity}.${field}`) : null,
+      };
     }
   }
   const inspect = await getInspectStatus(member);
@@ -189,6 +206,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     focus,
     drawer,
     notes,
+    knowledge,
     q,
     hitIds,
     tableDrawer,
@@ -223,11 +241,18 @@ async function relationStatsByEdge(tenantId: string, graph: { edges: GraphEdge[]
  * 触发一次漂移检查（intent=inspect），或重建合并一张缺列的标准层表（intent=rebuild，带 entity），都需 sources:write；
  * 不能开始时返回原因（已有检查或合并在排队或运行中、没有映射写入这张表）。
  * 在字段抽屉里保存一个实体字段的业务说明（intent=note，带 entity、field、note，空串为清空）需 definitions:draft，
- * 带 mappingId 时是这个映射的映射字段说明，需 sources:write；保存后回到原来的抽屉
+ * 带 mappingId 时是这个映射的映射字段说明，需 sources:write；保存后回到原来的抽屉。
+ * 抽屉里业务知识面板的提交（alias.* / claim.* / note.* / subject.* / proposal.*）交给 handleKnowledgeIntent，权限由它按 definitions:draft 判断；
+ * 出错时带 intent=knowledge 与 targetId 返回，成功后回到原来的抽屉（保留 node、field）
  */
 export async function action({ request }: Route.ActionArgs) {
   const form = await request.formData();
   const intent = String(form.get('intent') ?? '');
+  if (isKnowledgeIntent(intent)) {
+    const result = await handleKnowledgeIntent(await requirePermission(request, 'definitions:read'), form);
+    if ('error' in result) return data({ error: result.error, intent: 'knowledge', targetId: String(form.get('targetId') ?? '') }, { status: result.status });
+    throw redirect(`/lineage${new URL(request.url).search}`);
+  }
   const mappingId = intent === 'note' ? String(form.get('mappingId') ?? '') || null : null;
   const member = await requirePermission(request, intent === 'note' && !mappingId ? 'definitions:draft' : 'sources:write');
   try {
@@ -261,7 +286,7 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function Lineage({ loaderData, actionData }: Route.ComponentProps) {
-  const { tab, canFlow, canWrite, canNote, canMappingNote, notes, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, edgeStats, showAll, node, sql } = loaderData;
+  const { tab, canFlow, canWrite, canNote, canMappingNote, notes, knowledge, inspect, drift, flow, focus, drawer, q, hitIds, tableDrawer, email, nav, graph, edgeStats, showAll, node, sql } = loaderData;
   const labelOf = (id: string) => graph.nodes.find(n => n.id === id)?.label ?? id;
   const [rawParams] = useSearchParams();
   // 链接里不带不生效的参数：关系图没有反向查，没有 sources:read 时不开源表抽屉
@@ -275,13 +300,23 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
   const nodeHref = (id: string) => {
     const next = new URLSearchParams(searchParams);
     next.set('node', id);
+    next.delete('field');
     return `?${next}`;
   };
   const closeDrawerHref = (() => {
     const next = new URLSearchParams(searchParams);
     next.delete('node');
+    next.delete('field');
     return next.size ? `/lineage?${next}` : '/lineage';
   })();
+  // 抽屉里展开 / 收起一个字段的业务知识面板
+  const fieldHref = (field: string | null) => {
+    const next = new URLSearchParams(searchParams);
+    if (field) next.set('field', field);
+    else next.delete('field');
+    return `/lineage?${next}`;
+  };
+  const knowledgeError = (targetId: string) => actionData?.intent === 'knowledge' && 'targetId' in actionData && actionData.targetId === targetId ? actionData.error : null;
   const showAllHref = (() => {
     const next = new URLSearchParams(searchParams);
     if (showAll) next.delete('all');
@@ -400,12 +435,13 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
         </>
       )}
 
-      {tab === 'graph' && <InspectSection inspect={inspect} canWrite={canWrite} failure={actionData?.intent === 'note' ? null : actionData ?? null} />}
+      {tab === 'graph' && <InspectSection inspect={inspect} canWrite={canWrite} failure={actionData?.intent === 'note' || actionData?.intent === 'knowledge' ? null : actionData ?? null} />}
 
       {tableDrawer && <TableDrawer impact={tableDrawer} closeHref={closeDrawerHref} />}
       {drawer && (
         <LineageDrawer
           drawer={drawer} closeHref={closeDrawerHref} focusHref={drawer.detail ? `/lineage?tab=flow&focus=${encodeURIComponent(drawer.entity)}` : null}
+          knowledge={knowledge} openField={rawParams.get('field')} fieldHref={fieldHref} knowledgeError={knowledgeError}
           notes={notes ?? {}} canNote={canNote} canMappingNote={canMappingNote} noteError={actionData?.intent === 'note' && 'key' in actionData && 'note' in actionData ? { key: String(actionData.key), error: actionData.error, note: String(actionData.note) } : null}
         />
       )}
