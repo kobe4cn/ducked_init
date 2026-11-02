@@ -57,6 +57,7 @@ const LABEL = {
   prepped: "sandcastle:prepped", // prep 已确认可实现
   prOpen: "sandcastle:pr-open", // 已开 PR，等人审
   stuck: "sandcastle:stuck", // 需要人介入（见 issue 评论）
+  flaky: "flaky", // 门槛里重跑才通过的测试文件，脚本自动开票
 } as const;
 
 // 同一会话超过预算前自动压缩；预算本身靠 prep 把票切小来保证。
@@ -287,6 +288,50 @@ function reopenRequestedRevisions() {
     sh("gh", ["pr", "comment", String(pr.number), "--body", "收到打回，这张票重新进入 Sandcastle：implementer 会先处理这个 PR 上的意见。"]);
     console.log(`  ↺ #${issueId} 收到打回（PR #${pr.number}），重新排队`);
   }
+}
+
+/**
+ * 门槛里重跑才通过的测试文件：每个文件一张票（带 Sandcastle，下一轮自动 prep + 修）。
+ * 已有同名的 open 票就在那张票上追加一次出现记录，不重复开票。返回票号，写进 PR 的 Gate 一节。
+ */
+function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
+  const [before, after = ""] = gateOutput.split("GATE_FLAKY");
+  const files = [...new Set(before!.match(/^test\/\S+\.test\.tsx?$/gm) ?? [])];
+  if (files.length === 0) return [];
+  trySh("gh", ["label", "create", LABEL.flaky, "--color", "fbca04", "--description", "偶发失败的测试（Sandcastle 门槛自动开票）"]);
+  const open: { number: number; title: string }[] = JSON.parse(
+    sh("gh", ["issue", "list", "--state", "open", "--label", LABEL.flaky, "--limit", "100", "--json", "number,title"]),
+  );
+  const seen = `#${issue.id} 的门槛（PR #${pr}）`;
+  const summary = `\`\`\`\n${after.trim().slice(0, 3000)}\n\`\`\``;
+  return files.map((file) => {
+    const title = `偶发失败：${file}`;
+    const existing = open.find((i) => i.title === title);
+    if (existing) {
+      sh("gh", ["issue", "comment", String(existing.number), "--body", `又出现一次：${seen}。第一次的失败：\n\n${summary}`]);
+      return `#${existing.number}`;
+    }
+    const body = [
+      `\`${file}\` 在 ${seen}的完整测试里失败，单独重跑通过。沙箱里完整测试用 4 个 worker 并行（\`CRM_TEST_WORKERS=4\`），约 40 分钟。`,
+      "", "## 第一次的失败", "", summary, "",
+      "## 怎么修", "",
+      "按诊断难 bug 的做法：先有一条能让它稳定变红的命令，再改。",
+      "",
+      "- 先读失败摘要判断类型：超时（hook / 用例在负载下变慢）、随机数据撞上断言、用例之间共享状态或顺序依赖、外部服务连接。",
+      `- 复现：\`for i in $(seq 10); do npx vitest run ${file} || break; done\`；单跑稳定通过时，和同时跑的重夹具文件一起跑，或在后台占满 CPU 再跑。复现不了就照摘要从代码推断原因，并在提交信息里写明推断依据。`,
+      "- 超时类：确认是负载下变慢才给单个 hook / 用例放宽超时（照 2bcb07a 的写法），不改全局配置。随机数据类：改断言或数据，让它不可能撞上。",
+      "",
+      "## Acceptance criteria", "",
+      "- [ ] 失败原因写进提交信息（复现命令，或推断的依据）",
+      `- [ ] 修复后 \`${file}\` 连续单跑 10 次通过`,
+      "- [ ] 不放宽全局超时，不删除或改弱断言",
+    ].join("\n");
+    const url = sh("gh", [
+      "issue", "create", "--title", title, "--body", body,
+      "--label", LABEL.flaky, "--label", LABEL.picked, "--label", "ready-for-agent",
+    ]);
+    return `#${url.split("/").pop()}`;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -539,10 +584,11 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
     const overBudget = peak > CONTEXT_BUDGET ? "\n\n⚠️ 超过上下文预算，考虑把同类票切得更小。" : "";
     const flaky = result.gate.output.includes("GATE_FLAKY");
+    // 先 push 开 PR 才有 PR 号；开票放在后面，票号用评论补到 PR 上。
     const gateNote = !result.gate.ok
       ? `❌ 门槛失败：\n\n\`\`\`\n${result.gate.output}\n\`\`\``
       : flaky
-        ? `typecheck 通过；⚠️ 完整测试有偶发失败，失败的文件单独重跑通过（沙箱内）。偶发用例请另开票修。\n\n\`\`\`\n${result.gate.output}\n\`\`\``
+        ? `typecheck 通过；⚠️ 完整测试有偶发失败，失败的文件单独重跑通过（沙箱内）。已自动开票修（见 PR 评论）。\n\n\`\`\`\n${result.gate.output}\n\`\`\``
         : `typecheck 与完整测试通过（沙箱内）。\n\n\`\`\`\n${result.gate.output.slice(-500)}\n\`\`\``;
     const browserNote = result.browser
       ? `\n\n## Browser check\n\n${result.browser.result ?? "（implementer 没有写 RESULT.md）"}\n\n截图 ${result.browser.shots.length} 张，附在下面。`
@@ -557,6 +603,10 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       `## Review\n\n${result.summary}${revisionNote}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}`,
       result.browser?.shots ?? [],
     );
+    if (flaky && result.gate.ok) {
+      const tickets = reportFlaky(issue, pr, result.gate.output);
+      if (tickets.length) sh("gh", ["pr", "comment", pr, "--body", `门槛里的偶发失败已开票：${tickets.join("、")}`]);
+    }
 
     if (result.verdict !== "merge") {
       leaveForHuman(
