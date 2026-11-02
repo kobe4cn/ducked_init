@@ -121,6 +121,13 @@ async function dropTestResources(issueId: string) {
   }
 }
 
+// 本机 seaweedfs 的 filer 元数据日志会一直占卷，卷数到上限后门槛里对象存储全部超时（见 docs/agents/sandcastle.md）。
+// 每轮开头删两天前的日志目录和已清空的整卷；失败只打日志。
+function pruneSeaweedMetalog() {
+  const r = trySh("scripts/prune-seaweed-metalog.sh", []);
+  console.log(r.ok ? `  🧹 ${r.out}` : `  ⚠ 元数据日志清理失败：${r.out.slice(0, 300)}`);
+}
+
 // 浏览器验收用的 dev server 与 scripts/browser-lab.ts：独立的平台库（不碰开发库 crm_platform，也不被测试清表）、
 // 本地湖目录、固定的测试主密钥、发信打到日志。vitest.config.ts 会为测试覆盖这几个变量，门槛不受影响。
 function browserEnv(suffix: string): Record<string, string> {
@@ -692,6 +699,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   sh("git", ["fetch", REMOTE, BASE_BRANCH]); // 上一轮合并进远端 main 的代码
   syncHostBase();
   reopenRequestedRevisions();
+  pruneSeaweedMetalog();
 
   // Phase 0: Prep —— 串行，因为拆票会改别的票的 Blocked by。
   // 每轮重新查询，所以上一轮拆出来的子票（继承了 Sandcastle 标签）这里会被看到。
