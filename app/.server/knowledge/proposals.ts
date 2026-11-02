@@ -1,27 +1,26 @@
-// app/.server/knowledge/proposals.ts —— 知识提案（ADR-0046）：系统或 AI 给出的别名、口径声明、业务说明建议先存成提案（proposed），
+// app/.server/knowledge/proposals.ts —— 知识提案（ADR-0046）：系统或 AI 生成的别名、口径声明、业务说明先存成提案（proposed），等成员确认，
 // 接受前不进目录、检索与起草上下文（这里的表不读进 loadKnowledge）。成员接受（可以先改值）后在同一事务里变成对应的知识，作者是接受的成员，
 // 目录版本由生成知识的那条审计记；拒绝时记下理由，按指纹（目标 + 映射 + 种类 + 声明 + 依据摘要）记住，同样的提案不再提出。
 // 权限同别名：映射字段（带 mappingId）要 sources:write，其余要 definitions:draft。依据已变化的提案不能接受（409）。一律限定在操作者所属租户内
 import { and, desc, eq, type SQL } from 'drizzle-orm';
-import { assertCan, can } from '../access';
+import { assertCan } from '../access';
 import { recordAudit, type Tx } from '../audit';
 import { sha256, type CurrentMember } from '../auth';
 import { saveBusinessNoteTx } from '../business-notes';
-import { getDb, isUniqueViolation } from '../db/client';
-import { knowledgeProposals, type ProposalClaim, type ProposalKind, type ProposalStatus } from '../db/schema';
-import { UUID } from '../tenants';
+import { getDb } from '../db/client';
+import { knowledgeProposals, type ProposalClaim, type ProposalEvidence, type ProposalKind, type ProposalStatus } from '../db/schema';
 import { isClaimType, isClaimValue } from '../../lib/semantic-claims';
 import { addAliasTx } from './aliases';
 import { assertTarget, basisOf, KnowledgeError, stableJson } from './basis';
 import { saveClaimTx } from './claims';
+import { assertCanTouchKnowledge, lockTenantRow, rethrowDuplicateAlias } from './guards';
 
-/** 可以展示给成员的错误：提案不存在 404，已处理过或依据已变化 409 */
+/** 可以展示给成员的错误：提案不存在 404，已处理过或依据已变化 409（输入不合法的 400 一律是 KnowledgeError） */
 export class ProposalError extends Error {
-  constructor(message: string, readonly status: 400 | 404 | 409 = 400) { super(message); }
+  constructor(message: string, readonly status: 404 | 409) { super(message); }
 }
 
 export type Proposal = typeof knowledgeProposals.$inferSelect;
-export interface Evidence { ref: string; version?: number }
 
 export interface ProposalInput {
   targetId: string;
@@ -29,18 +28,19 @@ export interface ProposalInput {
   kind: ProposalKind;
   claim: unknown;
   /** 元数据引用，不放取值 */
-  evidence: Evidence[];
+  evidence: ProposalEvidence[];
   generatorVersion: string;
 }
 
 const REASON_MAX_LENGTH = 500;
 
-/** 校验种类与声明的形状，只留下该种类的键；不合法时抛 KnowledgeError */
+/** 校验种类与声明的形状，只留下该种类的键，别名与业务说明去掉首尾空白（与生成的知识一致，再进指纹）；不合法时抛 KnowledgeError */
 function claimOf(kind: unknown, claim: unknown): ProposalClaim {
   const c = (claim && typeof claim === 'object' ? claim : {}) as Record<string, unknown>;
   if (kind === 'alias') {
-    if (typeof c.alias !== 'string' || !c.alias.trim()) throw new KnowledgeError('别名提案缺少别名');
-    return { alias: c.alias };
+    const alias = typeof c.alias === 'string' ? c.alias.trim() : '';
+    if (!alias) throw new KnowledgeError('别名提案缺少别名');
+    return { alias };
   }
   if (kind === 'claim') {
     if (!isClaimType(c.type)) throw new KnowledgeError('没有这种口径类型');
@@ -49,12 +49,12 @@ function claimOf(kind: unknown, claim: unknown): ProposalClaim {
   }
   if (kind === 'note') {
     if (typeof c.note !== 'string') throw new KnowledgeError('业务说明提案缺少说明');
-    return { note: c.note };
+    return { note: c.note.trim() };
   }
   throw new KnowledgeError(`没有这种提案：${String(kind)}`);
 }
 
-function evidenceOf(evidence: unknown): Evidence[] {
+function evidenceOf(evidence: unknown): ProposalEvidence[] {
   if (!Array.isArray(evidence)) throw new KnowledgeError('证据要是列表');
   return evidence.map(e => {
     const { ref, version } = (e ?? {}) as Record<string, unknown>;
@@ -69,9 +69,7 @@ function evidenceOf(evidence: unknown): Evidence[] {
  * 命中已拒绝的返回 null。目标不合法（不存在、敏感字段、映射没写入）或声明形状不对时抛 KnowledgeError（400）
  */
 export async function proposeKnowledge(tx: Tx, tenantId: string, input: ProposalInput): Promise<Proposal | null> {
-  const { targetId, generatorVersion } = input;
-  const mappingId = input.mappingId ?? null;
-  const { kind } = input;
+  const { targetId, mappingId = null, kind, generatorVersion } = input;
   // 未知种类由 claimOf 抛 400
   const claim = claimOf(kind, input.claim);
   const evidence = evidenceOf(input.evidence);
@@ -88,17 +86,9 @@ export async function proposeKnowledge(tx: Tx, tenantId: string, input: Proposal
   return row!.status === 'rejected' ? null : row!;
 }
 
-/** 查看者（两种权限都没有）不必读行就 403；有其中一种的，读出行后按是不是映射字段再查 */
-function assertCanReview(actor: CurrentMember) {
-  if (!can(actor.role, 'definitions:draft') && !can(actor.role, 'sources:write')) assertCan(actor, 'definitions:draft');
-}
-
 /** 锁住本租户待处理的提案并查权限：不存在 404，已处理过 409 */
 async function lockPending(tx: Tx, actor: CurrentMember, id: string): Promise<Proposal> {
-  const [row] = UUID.test(id)
-    ? await tx.select().from(knowledgeProposals)
-      .where(and(eq(knowledgeProposals.id, id), eq(knowledgeProposals.tenantId, actor.tenant.id))).for('update')
-    : [];
+  const row = await lockTenantRow(tx, knowledgeProposals, id, actor.tenant.id);
   if (!row) throw new ProposalError('没有这个提案', 404);
   if (row.status !== 'proposed') throw new ProposalError(row.status === 'accepted' ? '提案已接受' : '提案已拒绝', 409);
   assertCan(actor, row.mappingId ? 'sources:write' : 'definitions:draft');
@@ -108,7 +98,10 @@ async function lockPending(tx: Tx, actor: CurrentMember, id: string): Promise<Pr
 /** 把（改过的）声明写成对应的知识，返回知识行 ID */
 async function materialize(tx: Tx, actor: CurrentMember, p: Proposal, claim: ProposalClaim): Promise<string> {
   const { targetId, mappingId } = p;
-  if ('alias' in claim) return addAliasTx(tx, actor, { targetId, mappingId, alias: claim.alias });
+  if ('alias' in claim) {
+    // 并发加了同一个别名：唯一索引兜底（只改写别名的，其他种类的唯一冲突原样抛出）
+    try { return await addAliasTx(tx, actor, { targetId, mappingId, alias: claim.alias }); } catch (e) { rethrowDuplicateAlias(e); }
+  }
   if ('type' in claim) return saveClaimTx(tx, actor, { targetId, mappingId, type: claim.type, value: claim.value });
   // 字段（含映射字段）的说明按 entity / field 存，实体、指标、标签的按 targetId 存
   const field = /^field:([^.]+)\.(.+)$/.exec(targetId);
@@ -122,39 +115,33 @@ async function materialize(tx: Tx, actor: CurrentMember, p: Proposal, claim: Pro
  * 依据与提出时不同时 409「依据已变化」；生成知识出错（如别名重复）时整个事务回滚，提案仍待处理
  */
 export async function acceptProposal(actor: CurrentMember, id: string, edits?: unknown): Promise<Proposal> {
-  assertCanReview(actor);
+  assertCanTouchKnowledge(actor);
   const tenantId = actor.tenant.id;
-  try {
-    return await getDb().transaction(async tx => {
-      const p = await lockPending(tx, actor, id);
-      const claim = edits === undefined ? p.claim : claimOf(p.kind, edits);
-      // 先校验目标（映射字段会锁住映射行，与发布、停用互斥），再比依据
-      await assertTarget(tx, tenantId, p.targetId, p.mappingId);
-      const basedOn = await basisOf(tx, tenantId, p.targetId, p.mappingId);
-      if (stableJson(basedOn) !== stableJson(p.basedOn)) throw new ProposalError('依据已变化', 409);
-      const ref = await materialize(tx, actor, p, claim);
-      const [row] = await tx.update(knowledgeProposals)
-        .set({ status: 'accepted', reviewedByEmail: actor.email, reviewedAt: new Date(), acceptedRef: ref })
-        .where(eq(knowledgeProposals.id, p.id)).returning();
-      await recordAudit(tx, {
-        tenantId, actor, action: 'knowledge_proposal.accepted', targetType: 'knowledge_proposal', targetId: p.id,
-        detail: { proposalId: p.id, kind: p.kind, targetId: p.targetId },
-      });
-      return row!;
+  return getDb().transaction(async tx => {
+    const p = await lockPending(tx, actor, id);
+    const claim = edits === undefined ? p.claim : claimOf(p.kind, edits);
+    // 先校验目标（映射字段会锁住映射行，与发布、停用互斥），再比依据
+    await assertTarget(tx, tenantId, p.targetId, p.mappingId);
+    const basedOn = await basisOf(tx, tenantId, p.targetId, p.mappingId);
+    if (stableJson(basedOn) !== stableJson(p.basedOn)) throw new ProposalError('依据已变化', 409);
+    const ref = await materialize(tx, actor, p, claim);
+    const [row] = await tx.update(knowledgeProposals)
+      .set({ status: 'accepted', reviewedByEmail: actor.email, reviewedAt: new Date(), acceptedRef: ref })
+      .where(eq(knowledgeProposals.id, p.id)).returning();
+    await recordAudit(tx, {
+      tenantId, actor, action: 'knowledge_proposal.accepted', targetType: 'knowledge_proposal', targetId: p.id,
+      detail: { proposalId: p.id, kind: p.kind, targetId: p.targetId },
     });
-  } catch (e) {
-    // 并发加了同一个别名：唯一索引兜底
-    if (isUniqueViolation(e)) throw new KnowledgeError('已有同样的别名');
-    throw e;
-  }
+    return row!;
+  });
 }
 
 /** 拒绝提案：理由（去掉首尾空白，最多 500 字）只存在表里、不进审计；指纹留着，同样的提案不再提出 */
 export async function rejectProposal(actor: CurrentMember, id: string, reason: unknown): Promise<Proposal> {
-  assertCanReview(actor);
-  if (typeof reason !== 'string') throw new ProposalError('缺少拒绝理由');
+  assertCanTouchKnowledge(actor);
+  if (typeof reason !== 'string') throw new KnowledgeError('缺少拒绝理由');
   const trimmed = reason.trim();
-  if ([...trimmed].length > REASON_MAX_LENGTH) throw new ProposalError(`拒绝理由最多 ${REASON_MAX_LENGTH} 字`);
+  if ([...trimmed].length > REASON_MAX_LENGTH) throw new KnowledgeError(`拒绝理由最多 ${REASON_MAX_LENGTH} 字`);
   const tenantId = actor.tenant.id;
   return getDb().transaction(async tx => {
     const p = await lockPending(tx, actor, id);
@@ -173,9 +160,9 @@ export async function rejectProposal(actor: CurrentMember, id: string, reason: u
 export async function listProposals(
   db: Tx | ReturnType<typeof getDb>, tenantId: string, filter: { targetId?: string; status?: ProposalStatus } = {},
 ): Promise<Proposal[]> {
-  const k = knowledgeProposals;
-  const conds: SQL[] = [eq(k.tenantId, tenantId)];
-  if (filter.targetId) conds.push(eq(k.targetId, filter.targetId));
-  if (filter.status) conds.push(eq(k.status, filter.status));
-  return db.select().from(k).where(and(...conds)).orderBy(desc(k.createdAt), desc(k.id));
+  const conds: SQL[] = [eq(knowledgeProposals.tenantId, tenantId)];
+  if (filter.targetId) conds.push(eq(knowledgeProposals.targetId, filter.targetId));
+  if (filter.status) conds.push(eq(knowledgeProposals.status, filter.status));
+  return db.select().from(knowledgeProposals).where(and(...conds))
+    .orderBy(desc(knowledgeProposals.createdAt), desc(knowledgeProposals.id));
 }

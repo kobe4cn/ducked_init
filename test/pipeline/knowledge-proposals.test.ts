@@ -53,11 +53,11 @@ async function setup() {
   return { ...s, analyst, viewer };
 }
 
-/** 让模型起草「统计退款单」，返回发给模型的消息里「与需求相关的条目」一段 */
+/** 让模型起草「统计退款单的流水暗号」，返回发给模型的消息里「与需求相关的条目」一段 */
 async function draftContext(analyst: Awaited<ReturnType<typeof setup>>['analyst']) {
   platformDefault();
   const { received } = fakeLlm(setLlmFetch, () => json({ base: 'order', measure: { agg: 'count' } }, { prompt_tokens: 10, completion_tokens: 10 }));
-  await modelDraftForDefinition(analyst, 'metric', '统计退款单');
+  await modelDraftForDefinition(analyst, 'metric', '统计退款单的流水暗号');
   return received[0]!.body.messages[1]!.content.split('# 与需求相关的条目')[1]!.split('# 需求')[0]!;
 }
 
@@ -73,7 +73,9 @@ describe('知识提案', () => {
     expect(expand(c, 'metric:paid_revenue')).not.toHaveProperty('knowledge');
     expect(toMarkdown(expand(c, 'field:order.status')!)).not.toContain('退款单也算');
     expect(search(c, '流水暗号').map(e => toMarkdown(e)).join('\n')).not.toContain('流水暗号');
-    expect(await draftContext(analyst)).not.toContain('退款单也算');
+    const before = await draftContext(analyst);
+    expect(before).not.toContain('退款单也算');
+    expect(before).not.toContain('流水暗号');
 
     // 同样的提案再次提出：返回已有的那条，不写入（声明里多余的键不影响指纹）
     expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'alias', claim: { alias: '流水暗号', extra: 1 }, generatorVersion: 'other' })).toMatchObject({ id: alias.id });
@@ -100,7 +102,9 @@ describe('知识提案', () => {
     c = await tenantCatalog(acme);
     expect(expand(c, 'metric:paid_revenue')).toMatchObject({ knowledge: { aliases: ['流水暗号'] } });
     expect(search(c, '流水暗号')[0]?.id).toBe('metric:paid_revenue');
-    expect(await draftContext(analyst)).toContain('业务说明：退款单也算一笔订单，状态记为 refunded');
+    const after = await draftContext(analyst);
+    expect(after).toContain('业务说明：退款单也算一笔订单，状态记为 refunded');
+    expect(after).toContain('流水暗号');
     expect((await listProposals(getDb(), acme, { status: 'proposed' }))).toHaveLength(0);
     expect((await listProposals(getDb(), acme, { targetId: 'metric:paid_revenue' })).map(p => p.status).sort()).toEqual(['accepted', 'rejected']);
   });
@@ -134,6 +138,9 @@ describe('知识提案', () => {
     const [tagRow] = await getDb().select().from(businessNotes).where(eq(businessNotes.id, t.acceptedRef!));
     expect(tagRow).toMatchObject({ targetId: 'tag:spender', note: '近一年高消费人群', createdByEmail: 'an@acme.com' });
     expect(r).toMatchObject({ status: 'rejected', rejectedReason: '不是这个意思', reviewedByEmail: 'an@acme.com', acceptedRef: null });
+    // 别名与业务说明先去首尾空白再算指纹：拒绝过「暗号」，再提「 暗号 」也不再提出；业务说明同理
+    expect(await propose(acme, { targetId: 'entity:order', kind: 'alias', claim: { alias: ' 暗号 ' } })).toBeNull();
+    expect(await propose(acme, { targetId: 'tag:spender', kind: 'note', claim: { note: ' 高消费人群\n' } })).toMatchObject({ id: tagNote.id });
 
     const c = await tenantCatalog(acme);
     expect(expand(c, 'entity:order')).toMatchObject({ knowledge: { aliases: ['交易订单'] } });
