@@ -1,6 +1,6 @@
 // test/pipeline/knowledge-derive.test.ts —— 系统事实（ADR-0046 入口①）进目录：已发布的指标与标签条目带 system.text（DSL 确定性生成的口径文字），
 // search 能用口径里的词搜到，Markdown 有「- 口径（系统生成）：…」；指标改 yaml 发布新版本后文字随之更新，记进 definition.published 那一版目录的 diff。
-// 派生的口径声明（system.claims）同样进检索与 Markdown、随发布更新，和成员写的口径声明（knowledge.claims）分开
+// 派生的口径声明（system.claims）进 Markdown、随发布更新，取值不是未知的才进检索，和成员写的口径声明（knowledge.claims）分开
 import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand, search, toMarkdown } from '../../app/.server/catalog';
@@ -57,6 +57,9 @@ describe('系统口径进目录', () => {
     expect(toMarkdown(metric)).toContain('- 口径声明（系统生成）：单位：未知、币种：未知、是否含税：未知、是否扣除退款：未知、时间含义：支付时间');
     expect(toMarkdown(tag)).toContain('- 口径声明（系统生成）：单位：不适用、');
     expect(search(c, '支付时间').map(x => x.id)).toEqual(expect.arrayContaining(['metric:paid_revenue', 'tag:high_value']));
+    // 取值为未知的声明不进检索：「退款」不会只因「是否扣除退款：未知」命中
+    expect(search(c, '退款').map(x => x.id)).not.toContain('metric:paid_revenue');
+    expect(search(c, '退款').map(x => x.id)).not.toContain('tag:high_value');
 
     await saveDslDraft(analyst, 'metric', 'paid_revenue', REVENUE_V2);
     await publishDefinition(reviewer, 'metric', 'paid_revenue', 2);
