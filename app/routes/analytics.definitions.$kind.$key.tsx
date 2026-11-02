@@ -5,7 +5,7 @@
 // 发布过的定义显示最近一次刷新的时间与来源；有发布权限的成员可以按今天以生效版本重新计算，有早于生效版本的未过期快照时可以按各自的统计日以生效版本回刷
 // （都连同下游标签），没有权限时说明原因。
 // 有修改与删除权限的成员可以删除定义（被已发布标签引用的指标删不了）。
-// 已发布过的定义带业务知识面板（ADR-0046）：alias.* / claim.* / note.* / subject.* 的提交交给 handleKnowledgeIntent，权限由领域函数检查，查看者看得到、提交 403
+// 已发布过的定义带业务知识面板（ADR-0046）：alias.* / claim.* / note.* / subject.* / proposal.* 的提交交给 handleKnowledgeIntent，权限由领域函数检查，查看者看得到、提交 403
 import { AlertTriangle, CheckCircle2, Lock, RefreshCw, Trash2 } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.$kind.$key';

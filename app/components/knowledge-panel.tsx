@@ -1,14 +1,14 @@
 // app/components/knowledge-panel.tsx —— 业务知识面板（ADR-0046）：左边是系统事实（目录条目的只读内容与系统口径的空位），右边是成员写的知识
-// （别名、口径声明、业务说明、分析主题）。每个表单都带 intent 与 targetId，交给路由 action 里的 handleKnowledgeIntent；不能编辑时不渲染任何表单和按钮。
+// （待确认的知识提案、别名、口径声明、业务说明、分析主题）。提案可以接受、修改后接受、填理由拒绝。每个表单都带 intent 与 targetId，交给路由 action 里的 handleKnowledgeIntent；不能编辑时不渲染任何表单和按钮。
 // 需复核的知识配 amber 图标与「待复核」，生效的配 emerald。panel 为 null（定义从未发布过）时只提示发布后才能添加
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { Form } from 'react-router';
 import type { MetricEntry, TagEntry } from '~/.server/catalog';
-import type { KnowledgePanel as Panel } from '~/.server/knowledge/panel';
+import type { KnowledgePanel as Panel, PanelProposal } from '~/.server/knowledge/panel';
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
-import { CLAIM_TYPE_ORDER, CLAIM_TYPES, claimTypeLabel, claimValueLabel } from '~/lib/semantic-claims';
+import { CLAIM_TYPE_ORDER, CLAIM_TYPES, claimTypeLabel, claimValueLabel, isClaimType } from '~/lib/semantic-claims';
 
 /** 一个面板表单：带上 intent 与 targetId */
 function KnowledgeForm({ intent, targetId, className, children }: { intent: string; targetId: string; className?: string; children: React.ReactNode }) {
@@ -57,6 +57,92 @@ function SystemFacts({ system }: { system: MetricEntry | TagEntry | null }) {
         <h4 className="text-sm text-slate-500">系统口径</h4>
         <p className="text-sm text-slate-400">系统扫描尚未生成</p>
       </div>
+    </div>
+  );
+}
+
+const PROPOSAL_KIND_LABEL = { alias: '别名', claim: '口径声明', note: '业务说明' } as const;
+
+function proposalText(p: PanelProposal): string {
+  switch (p.kind) {
+    case 'alias': return p.content.alias;
+    case 'claim': return `${claimTypeLabel(p.content.type)}：${claimValueLabel(p.content.type, p.content.value)}`;
+    case 'note': return p.content.note;
+  }
+}
+
+/** 修改后接受：按种类给一个预填原值的输入 */
+function EditedValue({ proposal: p }: { proposal: PanelProposal }) {
+  switch (p.kind) {
+    case 'alias':
+      return <Input name="alias" required maxLength={50} defaultValue={p.content.alias} aria-label="改后的别名" className="w-48" />;
+    case 'claim': {
+      const { type } = p.content;
+      return (
+        <>
+          <input type="hidden" name="type" value={type} />
+          <NativeSelect name="value" size="sm" className="w-48" required defaultValue={p.content.value} aria-label={`改后的${claimTypeLabel(type)}`}>
+            {(isClaimType(type) ? CLAIM_TYPES[type].values : []).map(v => <NativeSelectOption key={v.value} value={v.value}>{v.label}</NativeSelectOption>)}
+          </NativeSelect>
+        </>
+      );
+    }
+    case 'note':
+      return (
+        <textarea
+          name="note" rows={3} maxLength={2000} required defaultValue={p.content.note} aria-label="改后的业务说明"
+          className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+        />
+      );
+  }
+}
+
+/** 待确认的知识提案：没有时整块不渲染 */
+function Proposals({ panel, targetId }: { panel: Panel; targetId: string }) {
+  if (!panel.proposals.length) return null;
+  return (
+    <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50/50 p-3">
+      <h4 className="flex items-center gap-2 text-sm text-slate-500">
+        待确认的知识提案
+        <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="size-3" />待确认</span>
+      </h4>
+      <ul className="space-y-3">
+        {panel.proposals.map(p => (
+          <li key={p.id} data-proposal={p.id} className="space-y-1 text-sm">
+            <div className="whitespace-pre-wrap">{`${PROPOSAL_KIND_LABEL[p.kind]}：${proposalText(p)}`}</div>
+            {p.evidence.length > 0 && (
+              <div className="text-xs text-slate-500">
+                {'证据：'}{p.evidence.map(e => (e.version === undefined ? e.ref : `${e.ref} v${e.version}`)).join('、')}
+              </div>
+            )}
+            {panel.canEdit && (
+              <div className="flex flex-wrap items-start gap-3">
+                <KnowledgeForm intent="proposal.accept" targetId={targetId}>
+                  <input type="hidden" name="proposalId" value={p.id} />
+                  <Button type="submit" size="xs" variant="outline">接受</Button>
+                </KnowledgeForm>
+                <details className="text-xs">
+                  <summary className="cursor-pointer py-1 text-slate-500 hover:text-slate-900">修改后接受</summary>
+                  <KnowledgeForm intent="proposal.acceptEdited" targetId={targetId} className="mt-2 flex max-w-2xl flex-wrap items-start gap-2">
+                    <input type="hidden" name="proposalId" value={p.id} />
+                    <input type="hidden" name="kind" value={p.kind} />
+                    <EditedValue proposal={p} />
+                    <Button type="submit" size="sm" variant="outline">接受修改</Button>
+                  </KnowledgeForm>
+                </details>
+                <details className="text-xs">
+                  <summary className="cursor-pointer py-1 text-slate-500 hover:text-slate-900">拒绝</summary>
+                  <KnowledgeForm intent="proposal.reject" targetId={targetId} className="mt-2 flex gap-2">
+                    <input type="hidden" name="proposalId" value={p.id} />
+                    <Input name="reason" required maxLength={500} placeholder="拒绝理由，最多 500 字" aria-label="拒绝理由" className="w-64" />
+                    <Button type="submit" size="sm" variant="outline">拒绝</Button>
+                  </KnowledgeForm>
+                </details>
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -225,6 +311,7 @@ export function KnowledgePanel({ panel, system, targetId, error }: {
           <div className="space-y-6">
             <h3 className="text-sm font-medium">成员写的知识</h3>
             {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+            <Proposals panel={panel} targetId={targetId} />
             <Aliases panel={panel} targetId={targetId} />
             <Claims panel={panel} targetId={targetId} />
             <Note panel={panel} targetId={targetId} />

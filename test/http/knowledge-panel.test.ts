@@ -1,6 +1,6 @@
 // test/http/knowledge-panel.test.ts —— 业务知识面板（ADR-0046）的 HTTP 接缝：指标 / 标签详情页（analytics.definitions.$kind.$key）的面板显示系统事实与成员写的知识，
 // 分析师、数据工程师、管理员提交 alias.* / claim.* / note.* / subject.* 后面板与目录（expand 的 knowledge）立即反映；查看者看得到、没有编辑入口、提交 403；
-// 依据变了的知识显示「待复核」；从未发布过的定义只提示发布后才能添加
+// 依据变了的知识显示「待复核」；从未发布过的定义只提示发布后才能添加；待确认的知识提案可以接受、修改后接受、拒绝（理由必填），已处理或依据已变化时 409、显示错误
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand } from '../../app/.server/catalog';
@@ -11,6 +11,7 @@ import { saveBusinessNote } from '../../app/.server/business-notes';
 import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { addAlias } from '../../app/.server/knowledge/aliases';
 import { saveClaim } from '../../app/.server/knowledge/claims';
+import { proposeKnowledge, type ProposalInput } from '../../app/.server/knowledge/proposals';
 import { createSubject } from '../../app/.server/knowledge/subjects';
 import { memberOf } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
@@ -38,6 +39,10 @@ const knowledgeOf = async (tenantId: string, id = TARGET) => {
   const e = expand(await tenantCatalog(tenantId), id);
   return e && 'knowledge' in e ? e.knowledge : undefined;
 };
+
+const propose = (tenantId: string, input: Pick<ProposalInput, 'kind' | 'content'>) => getDb().transaction(tx => proposeKnowledge(tx, tenantId, {
+  targetId: TARGET, evidence: [{ ref: 'metric:paid_revenue', version: 1 }], generatorVersion: 'test-gen-1', ...input,
+})).then(p => p!);
 
 /** 身份打通数据源与订单映射，加一位分析师、一位查看者，发布指标 paid_revenue 与标签 spender（作者与发布者是两个人） */
 async function setup() {
@@ -150,5 +155,83 @@ describe('业务知识面板', () => {
     const draft = await panelOf(an, '/analytics/definitions/metric/draft_only');
     expect(draft).toContain('发布后才能添加业务知识');
     expect(draft).not.toContain('name="intent"');
+  });
+
+  it('待确认的提案显示种类、内容、证据，接受前不进知识区与目录；直接接受别名、改值后接受口径声明与业务说明，提案消失、知识区与目录是改后的值', async () => {
+    const { acme } = await setup();
+    const alias = await propose(acme, { kind: 'alias', content: { alias: '流水' } });
+    const claim = await propose(acme, { kind: 'claim', content: { type: 'currency', value: 'USD' } });
+    const note = await propose(acme, { kind: 'note', content: { note: '含退款' } });
+    const an = await loginAs(app, 'an@acme.com');
+    const post = (form: Record<string, string>) => an.post(METRIC, { targetId: TARGET, ...form });
+
+    let panel = await panelOf(an, METRIC);
+    expect(panel).toContain('待确认的知识提案');
+    expect(panel).toContain('待确认');
+    for (const p of [alias, claim, note]) expect(panel).toContain(`data-proposal="${p.id}"`);
+    expect(panel).toContain('别名：流水');
+    expect(panel).toContain('口径声明：币种：美元');
+    expect(panel).toContain('业务说明：含退款');
+    expect(panel).toContain('metric:paid_revenue v1');
+    for (const intent of ['proposal.accept', 'proposal.acceptEdited', 'proposal.reject']) expect(panel).toContain(`name="intent" value="${intent}"`);
+    expect(panel).not.toContain('data-alias=');
+    expect(panel).not.toContain('data-note=');
+    expect(await knowledgeOf(acme)).toBeUndefined();
+
+    expect((await post({ intent: 'proposal.accept', proposalId: alias.id })).status).toBe(302);
+    panel = await panelOf(an, METRIC);
+    expect(panel).not.toContain(`data-proposal="${alias.id}"`);
+    expect(panel).toContain('data-alias="流水"');
+    expect(await knowledgeOf(acme)).toEqual({ aliases: ['流水'] });
+
+    expect((await post({ intent: 'proposal.acceptEdited', proposalId: claim.id, kind: 'claim', type: 'currency', value: 'CNY' })).status).toBe(302);
+    expect((await post({ intent: 'proposal.acceptEdited', proposalId: note.id, kind: 'note', note: '不含退款' })).status).toBe(302);
+    panel = await panelOf(an, METRIC);
+    expect(panel).not.toContain('data-proposal=');
+    expect(panel).not.toContain('待确认的知识提案');
+    expect(panel).toContain('币种：人民币');
+    expect(panel).toContain('data-note="不含退款"');
+    expect(await knowledgeOf(acme)).toEqual({ aliases: ['流水'], claims: [{ type: 'currency', value: 'CNY' }], note: '不含退款' });
+
+    // 别名也能改词后接受
+    const other = await propose(acme, { kind: 'alias', content: { alias: '营业额' } });
+    expect((await post({ intent: 'proposal.acceptEdited', proposalId: other.id, kind: 'alias', alias: '年营业额' })).status).toBe(302);
+    expect((await knowledgeOf(acme))?.aliases).toEqual(expect.arrayContaining(['年营业额', '流水']));
+  });
+
+  it('拒绝要填理由，拒绝后提案消失、目录不变；已处理或依据已变化时接受 409 并显示错误；查看者没有处理入口，提交 403', async () => {
+    const { acme, reviewer, analyst } = await setup();
+    const alias = await propose(acme, { kind: 'alias', content: { alias: '流水' } });
+    const an = await loginAs(app, 'an@acme.com');
+    const post = (form: Record<string, string>) => an.post(METRIC, { targetId: TARGET, ...form });
+
+    const empty = await post({ intent: 'proposal.reject', proposalId: alias.id, reason: '  ' });
+    expect(empty.status).toBe(400);
+    expect(decode(await empty.text())).toContain('请填写拒绝理由');
+    expect(await panelOf(an, METRIC)).toContain(`data-proposal="${alias.id}"`);
+
+    expect((await post({ intent: 'proposal.reject', proposalId: alias.id, reason: '不是这个意思' })).status).toBe(302);
+    expect(await panelOf(an, METRIC)).not.toContain(`data-proposal="${alias.id}"`);
+    expect(await knowledgeOf(acme)).toBeUndefined();
+
+    const handled = await post({ intent: 'proposal.accept', proposalId: alias.id });
+    expect(handled.status).toBe(409);
+    expect(decode(await handled.text())).toMatch(/role="alert"[^>]*>[^<]+</);
+
+    const stale = await propose(acme, { kind: 'note', content: { note: '含退款' } });
+    await saveDslDraft(analyst, 'metric', 'paid_revenue', REVENUE_V2);
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 2);
+    const changed = await post({ intent: 'proposal.accept', proposalId: stale.id });
+    expect(changed.status).toBe(409);
+    expect(decode(await changed.text())).toContain('依据已变化');
+    expect(await knowledgeOf(acme)).toBeUndefined();
+
+    const viewer = await loginAs(app, 'view@acme.com');
+    const panel = await panelOf(viewer, METRIC);
+    expect(panel).toContain(`data-proposal="${stale.id}"`);
+    expect(panel).not.toContain('name="intent"');
+    expect(panel).not.toContain('<button');
+    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'proposal.accept', proposalId: stale.id })).status).toBe(403);
+    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'proposal.reject', proposalId: stale.id, reason: 'x' })).status).toBe(403);
   });
 });
