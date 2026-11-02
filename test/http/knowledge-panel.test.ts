@@ -301,6 +301,39 @@ describe('字段抽屉与自定义实体详情页里的业务知识面板', () =
     expect((await knowledgeOf(acme, 'entity:customer'))?.aliases).toEqual(expect.arrayContaining(['顾客', '客户档案']));
   });
 
+  it('重复的别名 400：抽屉里错误只显示在对应面板、不算漂移检查失败；自定义实体详情页错误显示在面板里、不显示「未保存」', async () => {
+    const { author, reviewer } = await setup();
+    const an = await loginAs(app, 'an@acme.com');
+    const page = '/lineage?node=customer&field=customer_id';
+    expect((await an.post(page, { intent: 'alias.add', targetId: 'entity:customer', alias: '会员' })).status).toBe(302);
+    const dup = await an.post(page, { intent: 'alias.add', targetId: 'entity:customer', alias: '会员' });
+    expect(dup.status).toBe(400);
+    const html = decode(await dup.text());
+    const entity = panelFor(html, 'entity:customer');
+    const field = panelFor(html, 'field:customer.customer_id');
+    expect(field).not.toBe('');
+    expect(entity).toContain('role="alert"');
+    expect(entity).toContain('已有别名「会员」');
+    expect(field).not.toContain('role="alert"');
+    expect(field).not.toContain('已有别名');
+    expect(html).not.toContain('没有开始检查');
+    expect(html).not.toContain('没有开始重建');
+
+    const id = await createCustomEntity(author, {
+      name: 'custom_member_card', label: '会员卡', kind: 'dimension', primaryKey: ['card_id'],
+      fields: [{ name: 'card_id', type: 'string', description: '会员卡号', sensitive: false }],
+    });
+    await publishCustomEntity(reviewer, id, 1);
+    const de = await loginAs(app, 'de@acme.com');
+    const detail = `/entities/${id}`;
+    expect((await de.post(detail, { intent: 'alias.add', targetId: 'entity:custom_member_card', alias: '储值卡' })).status).toBe(302);
+    const again = await de.post(detail, { intent: 'alias.add', targetId: 'entity:custom_member_card', alias: '储值卡' });
+    expect(again.status).toBe(400);
+    const detailHtml = decode(await again.text());
+    expect(panelFor(detailHtml, 'entity:custom_member_card')).toContain('已有别名「储值卡」');
+    expect(detailHtml).not.toContain('未保存');
+  });
+
   it('查看者在字段抽屉里看得到实体与字段面板，没有表单，字段面板没有来源，提交 403', async () => {
     await setup();
     const viewer = await loginAs(app, 'view@acme.com');
