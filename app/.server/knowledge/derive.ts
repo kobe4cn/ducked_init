@@ -4,14 +4,21 @@
 // missing 是指标为空时拿去和规则比较的值（COALESCE），不是标签取值；为 null 时不替换，写「指标 <指标> 为空时不满足任何比较」；
 // 标签的窗口与过滤在被引用的指标里，这里只写指标键，不展开。字段用原名、不翻译；实体用 entityLabel。
 // 每种 agg、过滤运算与标签条件的模板写成 satisfies Record<注册表的项, …>，注册表新增一项没写模板时类型检查不通过。
+// 口径声明（system.claims）：只派生能从结构证明的，其余一律 unknown，不按字段名或字段说明猜；总是按登记表顺序输出五种。
+// unit 只看 agg（count / count_distinct → count，days_since → day，ratio → ratio），标签为 not_applicable（取值是分类）；
+// time_meaning 只看 window.field 是否命中 TIME_FIELDS（标准实体 + 字段，updated_at 只认确有该字段的标准实体），没有 window 为 unknown；
+// 标签的 time_meaning：引用的全部指标都在本批 definitions 里、都推出同一个非 unknown 值时取该值，否则 unknown；currency / tax_included / refund_deducted 永远 unknown。
+// 派生声明和成员写的声明（semantic_claims）分开，不写表、不参与需复核。
 // 纯函数、不碰库：输出只依赖 spec 的内容（比较按 TAG_CONDITIONS 的顺序、missing 按指标键排序），同一份定义每次结果相同，不存表、读目录时现算
-import { entityLabel } from '../../lib/canonical-model';
+import { entityOf, entityLabel } from '../../lib/canonical-model';
+import { CLAIM_TYPE_ORDER, type ClaimType } from '../../lib/semantic-claims';
 import { cmp } from '../../lib/compare';
 import type { AGGS, FILTER_OPS, MetricSpec, RATIO_AGGS, RatioPart } from '../pipeline/dsl/metric-spec';
+import type { Claim } from './catalog';
 import { TAG_CONDITIONS, type MetricCondition, type TagSpec, type TagWhen } from '../pipeline/dsl/tag-spec';
 
-/** 目录条目上的系统事实：口径文字 */
-export interface SystemFacts { text: string }
+/** 目录条目上的系统事实：口径文字与派生的口径声明（五种都有，按登记表顺序） */
+export interface SystemFacts { text: string; claims: Claim[] }
 
 type Measure = MetricSpec['measure'];
 type Filter = NonNullable<MetricSpec['filter']>[number];
@@ -101,4 +108,48 @@ export function tagText(spec: TagSpec): string {
     return v === null || v === undefined ? `指标 ${k} 为空时不满足任何比较` : `指标 ${k} 为空时按 ${v} 比较`;
   });
   return `按指标 ${tagMetrics(spec).join('、')}：${[...rules, ...missing, `其余为 ${spec.default}`].join('；')}`;
+}
+
+/** 每种 agg 的单位：只有聚合本身决定量纲的才给值 */
+const AGG_UNIT = {
+  count: 'count',
+  count_distinct: 'count',
+  sum: 'unknown',
+  avg: 'unknown',
+  min: 'unknown',
+  max: 'unknown',
+  ratio: 'ratio',
+  latest: 'unknown',
+  earliest: 'unknown',
+  days_since: 'day',
+} satisfies Record<(typeof AGGS)[number], string>;
+
+/** 时间含义能从结构证明的标准字段（<实体>.<字段>）；各实体的 updated_at 另外按 entityOf 判断 */
+export const TIME_FIELDS: Readonly<Record<string, string>> = {
+  'order.created_at': 'order_time',
+  'order.paid_at': 'pay_time',
+  'event.occurred_at': 'event_time',
+};
+
+function timeMeaning(spec: MetricSpec): string {
+  const field = spec.window?.field;
+  if (!field) return 'unknown';
+  const listed = TIME_FIELDS[`${spec.base}.${field}`];
+  if (listed) return listed;
+  return field === 'updated_at' && entityOf(spec.base)?.fields.some(f => f.name === 'updated_at') ? 'record_time' : 'unknown';
+}
+
+const claimsFrom = (known: Partial<Record<ClaimType, string>>): Claim[] =>
+  CLAIM_TYPE_ORDER.map(type => ({ type, value: known[type] ?? 'unknown' }));
+
+/** 指标的派生口径声明 */
+export function metricClaims(spec: MetricSpec): Claim[] {
+  return claimsFrom({ unit: AGG_UNIT[spec.measure.agg], time_meaning: timeMeaning(spec) });
+}
+
+/** 标签的派生口径声明：metrics 是本批全部指标的 spec（键是指标键），引用的指标缺失或时间含义不一致时为 unknown */
+export function tagClaims(spec: TagSpec, metrics: ReadonlyMap<string, MetricSpec>): Claim[] {
+  const times = tagMetrics(spec).map(k => metrics.get(k)).map(m => (m ? timeMeaning(m) : 'unknown'));
+  const time = times.length && times.every(t => t === times[0]) ? times[0] : 'unknown';
+  return claimsFrom({ unit: 'not_applicable', time_meaning: time });
 }

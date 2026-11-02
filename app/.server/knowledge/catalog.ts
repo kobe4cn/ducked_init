@@ -102,7 +102,7 @@ export async function loadKnowledge(db: Tx | ReturnType<typeof getDb>, tenantId:
 }
 
 /** 一条口径声明的中文说法：「币种：人民币」；需复核的「币种：未知（待复核，原为 人民币）」 */
-const claimPhrase = ({ type, value, previous, needsReview }: Claim) => `${claimTypeLabel(type)}：${claimValueLabel(type, value)}`
+export const claimPhrase = ({ type, value, previous, needsReview }: Claim) => `${claimTypeLabel(type)}：${claimValueLabel(type, value)}`
   + (needsReview ? `（待复核，原为 ${claimValueLabel(type, previous ?? '')}）` : '');
 
 /** 需复核的别名后面加「（待复核）」 */

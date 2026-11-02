@@ -65,7 +65,12 @@ describe('业务知识面板', () => {
     let panel = await panelOf(an, METRIC);
     expect(panel).toContain('系统事实');
     expect(panel).toContain('sum(amount)');
-    expect(panel).toContain('系统扫描尚未生成');
+    expect(panel).not.toContain('系统扫描尚未生成');
+    expect(panel).toContain('订单中所有行，amount 求和');
+    expect(panel).toContain('data-system-claim="unit" class="text-sm">单位：未知<');
+    expect(panel).toContain('data-system-claim="time_meaning" class="text-sm">时间含义：未知<');
+    expect(panel.match(/data-system-claim=/g)).toHaveLength(5);
+    expect(panel).not.toContain('data-claim=');
     expect(panel).toContain('还没有别名');
     for (const intent of ['alias.add', 'claim.save', 'note.save', 'subject.create']) expect(panel).toContain(`name="intent" value="${intent}"`);
 
@@ -78,6 +83,7 @@ describe('业务知识面板', () => {
     panel = await panelOf(an, METRIC);
     expect(panel).toContain('data-alias="近一年营收"');
     expect(panel).toContain('data-claim="currency"');
+    expect(panel).toContain('data-system-claim="currency" class="text-sm">币种：未知<');
     expect(panel).toContain('币种：人民币');
     expect(panel).toContain('data-note="只算已支付"');
     expect(panel).toContain(`data-member-of="${subject!.id}"`);
@@ -113,6 +119,7 @@ describe('业务知识面板', () => {
     // 标签页：系统事实是取值，表单同样在
     panel = await panelOf(an, TAG);
     expect(panel).toContain('high');
+    expect(panel).toContain('data-system-claim="unit" class="text-sm">单位：不适用<');
     expect(panel).toContain('name="intent" value="alias.add"');
     expect((await post({ intent: 'alias.add', alias: '高消费', targetId: 'tag:spender' }, TAG)).status).toBe(302);
     expect(await knowledgeOf(acme, 'tag:spender')).toEqual({ aliases: ['高消费'] });
