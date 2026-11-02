@@ -96,7 +96,7 @@ describe('模板升级', () => {
     expect(Object.values(globexSegments).flat().every(s => s.startsWith('v2:'))).toBe(true);
     // 第一个租户的结果仍是第 1 版的
     expect(Object.values(await segmentsByTask(acme)).flat().filter(s => s.startsWith('v2:'))).toEqual([]);
-  });
+  }, 240_000); // 本地约 81 s（docs/test-plans/test-duration-report.md），CI 的 4 核 runner 上超过默认的 90 s
 });
 
 const LAKE_SNAPSHOT = `SELECT max(snapshot_id)::VARCHAR AS n FROM ducklake_snapshots('lake')`;
