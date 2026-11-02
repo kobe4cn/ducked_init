@@ -5,8 +5,9 @@
 //                    `sandcastle:prepped` 的选中票逐张（串行）跑 prep-ticket：
 //                    够小且指引新鲜 → 打 prepped；太大 → 拆成子票（子票继承
 //                    `Sandcastle`，父票去掉）；要人拍板 → 打 sandcastle:stuck。
-//   Phase 1 (Plan):  只看 `Sandcastle` + `sandcastle:prepped`、且没有 pr-open / stuck
-//                    的票，排除仍有未关闭 blocker 的票。
+//   Phase 1 (Plan):  脚本自己算（不用 agent）：只看 `Sandcastle` + `sandcastle:prepped`、且没有
+//                    pr-open / stuck 的票，排除仍有未关闭 blocker 的票；剩下的按编号从小到大，
+//                    和已选的票改同一个文件（指引的 Change 行）就跳过。
 //   Phase 2 (Build): 每张票一个沙箱，从 origin/main 建分支：implementer（每次迭代
 //                    都是全新的 Claude 会话）→ reviewer（给出 merge / revise / pr 结论；revise
 //                    时把修改意见交给新的 implementer 会话改完再审，最多 REVISE_MAX 次）→
@@ -32,7 +33,6 @@ import { basename, join } from "node:path";
 import { parseEnv, promisify } from "node:util";
 import * as sandcastle from "@ai-hero/sandcastle";
 import { podman } from "@ai-hero/sandcastle/sandboxes/podman";
-import { z } from "zod";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -190,12 +190,6 @@ const copyToWorktree = ["node_modules"];
 // 才进得了 agent 的 shell，所以测试库连接与上下文预算都在这里注入。
 const sandboxFor = (env: Record<string, string>) => podman({ env: { ...claudeEnv, ...env } });
 
-const planSchema = z.object({
-  issues: z.array(
-    z.object({ id: z.string(), title: z.string(), branch: z.string() }),
-  ),
-});
-
 // ---------------------------------------------------------------------------
 // Host helpers
 // ---------------------------------------------------------------------------
@@ -240,6 +234,68 @@ const searchIssues = (query: string): { number: number; title: string }[] =>
 
 const q = (label: string) => `label:"${label}"`;
 const notIn = (...labels: string[]) => labels.map((l) => `-${q(l)}`).join(" ");
+
+// ---------------------------------------------------------------------------
+// Plan：确定性计算，不交给 agent（planner agent 曾把「同文件只留编号小的」比反）
+// ---------------------------------------------------------------------------
+
+/** 正文里 `## <title>` 一节的内容（到下一个 `## ` 为止），没有这一节时为空串。 */
+const section = (body: string, title: string) => {
+  const m = body.match(new RegExp(`^##\\s*${title}[^\\n]*\\n([\\s\\S]*?)(?=^##\\s|(?![\\s\\S]))`, "mi"));
+  return m?.[1] ?? "";
+};
+
+/** `## Blocked by` 里引用的票号。 */
+const blockersOf = (body: string) =>
+  [...section(body, "Blocked by").matchAll(/#(\d+)/g)].map((m) => Number(m[1]));
+
+/** 指引里 `- **Change**: \`path…\`` 行的文件路径（去掉 `:行号`）。 */
+const changedFiles = (body: string) =>
+  [...section(body, "Implementation guide").matchAll(/^\s*[-*]\s*\*\*Change\*\*\s*[:：]\s*`([^`]+)`/gm)]
+    .map((m) => m[1]!.trim().split(/[:\s]/)[0]!);
+
+/**
+ * 能在 main 上开工、且可以并行的票，按编号从小到大，最多 MAX_PARALLEL 张。
+ * blocker 没关（包括已开 PR 未合并）的跳过；和已选的票改同一个文件的跳过，所以冲突时总是编号小的先做。
+ * 被 blocker 挡住的票不占文件，不会连带挡住编号大的票。
+ */
+function plan(): Issue[] {
+  const candidates: { number: number; title: string; body: string }[] = JSON.parse(
+    sh("gh", [
+      "issue", "list", "--state", "open", "--limit", "100",
+      "--search", `${q(LABEL.picked)} ${q(LABEL.prepped)} ${notIn(LABEL.prOpen, LABEL.stuck)}`,
+      "--json", "number,title,body",
+    ]),
+  );
+  const states = new Map<number, string>();
+  const isOpen = (n: number) => {
+    if (!states.has(n)) {
+      const r = trySh("gh", ["issue", "view", String(n), "--json", "state", "--jq", ".state"]);
+      states.set(n, r.ok ? r.out : "OPEN"); // 查不到时当作 open，宁可少做
+    }
+    return states.get(n) === "OPEN";
+  };
+  const taken = new Map<string, number>();
+  const picked: Issue[] = [];
+  for (const issue of candidates.filter((c) => allowed(c.number)).sort((a, b) => a.number - b.number)) {
+    const open = blockersOf(issue.body).filter(isOpen);
+    if (open.length > 0) {
+      console.log(`  跳过 #${issue.number}：blocker ${open.map((n) => `#${n}`).join("、")} 还没关`);
+      continue;
+    }
+    const files = changedFiles(issue.body);
+    if (files.length === 0) console.warn(`  ⚠ #${issue.number} 的指引里没认出 Change 行，按不改已有文件处理`);
+    const clash = files.find((f) => taken.has(f));
+    if (clash) {
+      console.log(`  跳过 #${issue.number}：和 #${taken.get(clash)} 都改 ${clash}`);
+      continue;
+    }
+    if (picked.length >= MAX_PARALLEL) break;
+    for (const f of files) taken.set(f, issue.number);
+    picked.push({ id: String(issue.number), title: issue.title, branch: `sandcastle/issue-${issue.number}` });
+  }
+  return picked;
+}
 
 /** 每次迭代结束时的上下文大小（最后一条 assistant 消息的输入 token）。 */
 const peakContext = (...runs: (sandcastle.SandboxRunResult | undefined)[]) =>
@@ -601,7 +657,7 @@ async function sleepUntil(at: number) {
 
 /**
  * 跑 fn，撞上用量限额就等到重置后重跑；其他错误照抛。
- * fn 要能从头重跑：prep / plan 本来就幂等；build 重跑时在原分支上接着做（implementer 先看已有提交）。
+ * fn 要能从头重跑：prep 本来就幂等；build 重跑时在原分支上接着做（implementer 先看已有提交）。
  * onLimit 在等之前调用，比如把分支推到远端。
  */
 async function untilAfterLimit<T>(what: string, fn: () => Promise<T>, onLimit?: () => void): Promise<T> {
@@ -658,19 +714,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   }
 
   // Phase 1: Plan
-  const plan = await untilAfterLimit("plan", () => sandcastle.run({
-    sandbox: podman(),
-    name: "planner",
-    maxIterations: 1,
-    agent: agent(),
-    promptFile: "./.sandcastle/plan-prompt.md",
-    promptArgs: {
-      QUERY: `${q(LABEL.picked)} ${q(LABEL.prepped)} ${notIn(LABEL.prOpen, LABEL.stuck)}`,
-    },
-    output: sandcastle.Output.object({ tag: "plan", schema: planSchema }),
-  }));
-
-  const issues = plan.output.issues.filter((issue) => allowed(issue.id)).slice(0, MAX_PARALLEL);
+  const issues = plan();
   if (issues.length === 0) {
     // 本轮 prep 拆出的子票还没 prep 过（下一轮才看到），这时停下会漏掉能开工的子票。
     // 只认本轮新出现的票：留在 toPrep 里的票（如等 blocker）下一轮仍不会有新票，循环照常结束。
