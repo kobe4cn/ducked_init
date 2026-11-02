@@ -3,15 +3,19 @@
 // 没有自动发布。有发布权限的成员可以删除没被已发布映射、关系或指标引用的实体。平台推断出的登记草稿提示成员核对后保存确认，确认前发布不了。
 // 从没发布过的登记有配套的映射草稿（一键直通生成的）时，显示这个映射，可以把登记与映射一起发布（passthrough.ts）。
 // 编辑页列出本实体相关的已发布关系在最近一次合并后的孤儿比例与样例键。
+// 已发布的实体在页尾有业务知识面板（ADR-0046，目标 entity:<实体名>），和数据地图抽屉里的是同一个；能否编辑看 definitions:draft。
 // 分编辑、版本两个标签页（?tab=edit|versions，默认编辑），编辑页显示 ?version=N 选中的版本（默认最新）
 import { ArrowRight, CircleAlert, Info, Lock, Trash2, Upload } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entity';
 import { can, requirePermission } from '~/.server/access';
+import { catalogFor } from '~/.server/assistant/tools';
+import { expand } from '~/.server/catalog';
 import {
   adoptRelation, CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, relationTargets, saveCustomEntityDraft,
   unpublishedMappingsOf,
 } from '~/.server/custom-entities';
+import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
 import { entityRelationStats } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { passthroughPair, publishPassthrough } from '~/.server/passthrough';
@@ -20,6 +24,7 @@ import { relationSuggestions } from '~/.server/relation-suggest';
 import { AppShell } from '~/components/app-shell';
 import { CustomEntityForm, EntityFieldsTable, EntityRelationsTable } from '~/components/custom-entity-form';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
+import { KnowledgePanel } from '~/components/knowledge-panel';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { RelationStatsCard } from '~/components/relation-stats-card';
@@ -44,6 +49,9 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     const pair = firstDraft && await passthroughPair(member.tenant.id, found.entity.name);
     const pairDraft = { status: 'draft', lastEditor: pair?.lastEditor ?? '' };
     const unpublishedMappings = found.published ? [] : await unpublishedMappingsOf(member.tenant.id, found.entity.name);
+    // 目录里用实体名，不用 UUID；从没发布过的不在目录里，没有面板
+    const targetId = `entity:${found.entity.name}`;
+    const system = found.published ? expand(await catalogFor(member), targetId) : null;
     return {
       email: member.email,
       nav: navFor(member),
@@ -74,6 +82,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       })),
       /** 丢弃从没发布过的登记时一并丢弃的映射（目标是它、从没发布过） */
       unpublishedMappings: unpublishedMappings.map(m => `「${m.source}」${m.table}`),
+      /** 业务知识面板；从没发布过（不在目录里）时为 null */
+      knowledge: system?.kind === 'entity' ? { targetId, system, panel: await knowledgePanel(member, targetId) } : null,
       /** 配套的映射草稿；登记发布过或没有时为 null。publishBlocker 是当前成员不能把两份一起发布的原因 */
       pair: pair && {
         ...pair,
@@ -91,6 +101,13 @@ export async function action({ request, params }: Route.ActionArgs) {
   const form = await request.formData();
   const input = customEntityInputOf(form);
   const base = `/entities/${params.entityId}`;
+  const intent = String(form.get('intent') ?? '');
+  if (isKnowledgeIntent(intent)) {
+    // 面板的错误单独放 knowledgeError：放进 error 会显示成登记「未保存」
+    const result = await handleKnowledgeIntent(await requirePermission(request, 'definitions:read'), form);
+    if ('error' in result) return data({ error: null, intent: null, input: null, knowledgeError: result.error }, { status: result.status });
+    throw redirect(base);
+  }
   try {
     switch (form.get('intent')) {
       case 'save':
@@ -144,7 +161,7 @@ function editHint(canWrite: boolean, selected: { status: string }, draft: { vers
 }
 
 export default function Entity({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, canWrite, canDelete, entity, targets, suggestions, relationStats, inferred, referrers, version, versions, pair, unpublishedMappings } = loaderData;
+  const { email, nav, tab, canWrite, canDelete, entity, targets, suggestions, relationStats, inferred, referrers, version, versions, pair, unpublishedMappings, knowledge } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -277,6 +294,12 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
       </div>
       {tab === 'edit' && relationStats.relations.length > 0 && <RelationStatsCard {...relationStats} />}
       {tab === 'edit' && suggestions.length > 0 && <RelationSuggestionsCard suggestions={suggestions} submitting={submitting} />}
+      {knowledge && (
+        <KnowledgePanel
+          panel={knowledge.panel} system={knowledge.system} targetId={knowledge.targetId}
+          error={actionData && 'knowledgeError' in actionData ? actionData.knowledgeError : null}
+        />
+      )}
     </AppShell>
   );
 }

@@ -1,10 +1,12 @@
 // test/http/knowledge-panel.test.ts —— 业务知识面板（ADR-0046）的 HTTP 接缝：指标 / 标签详情页（analytics.definitions.$kind.$key）的面板显示系统事实与成员写的知识，
 // 分析师、数据工程师、管理员提交 alias.* / claim.* / note.* / subject.* 后面板与目录（expand 的 knowledge）立即反映；查看者看得到、没有编辑入口、提交 403；
-// 依据变了的知识显示「待复核」；从未发布过的定义只提示发布后才能添加；待确认的知识提案可以接受、修改后接受、拒绝（理由必填），已处理或依据已变化时 409、显示错误
+// 依据变了的知识显示「待复核」；从未发布过的定义只提示发布后才能添加；待确认的知识提案可以接受、修改后接受、拒绝（理由必填），已处理或依据已变化时 409、显示错误；
+// 数据地图字段抽屉（lineage）里有实体面板与 ?field= 展开的字段面板（不带说明区，敏感字段没有面板），自定义实体详情页（entity）有同一个实体面板
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
+import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { analysisSubjects, knowledgeAliases } from '../../app/.server/db/schema';
 import { saveBusinessNote } from '../../app/.server/business-notes';
@@ -13,7 +15,7 @@ import { addAlias } from '../../app/.server/knowledge/aliases';
 import { saveClaim } from '../../app/.server/knowledge/claims';
 import { proposeKnowledge, type ProposalInput } from '../../app/.server/knowledge/proposals';
 import { createSubject } from '../../app/.server/knowledge/subjects';
-import { memberOf } from '../pipeline/fixtures';
+import { memberOf, publish } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -240,5 +242,90 @@ describe('业务知识面板', () => {
     expect(panel).not.toContain('<button');
     expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'proposal.accept', proposalId: stale.id })).status).toBe(403);
     expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'proposal.reject', proposalId: stale.id, reason: 'x' })).status).toBe(403);
+  });
+});
+
+/** 页面里 targetId 的业务知识面板 */
+const panelFor = (html: string, targetId: string) =>
+  html.match(new RegExp(`<section[^>]*data-knowledge-panel="${targetId}"[\\s\\S]*?</section>`))?.[0] ?? '';
+const pageOf = async (browser: Awaited<ReturnType<typeof loginAs>>, path: string) => decode(await (await browser.get(path)).text());
+
+describe('字段抽屉与自定义实体详情页里的业务知识面板', () => {
+  it('分析师在字段抽屉里编辑实体与普通字段的知识：实体面板列字段与关系，字段面板没有说明区、有类型与来源，敏感字段没有面板', async () => {
+    const { acme } = await setup();
+    const an = await loginAs(app, 'an@acme.com');
+
+    let html = await pageOf(an, '/lineage?node=customer');
+    let entity = panelFor(html, 'entity:customer');
+    expect(entity).toContain('系统事实');
+    expect(entity).toMatch(/字段[\s\S]*（customer_id）/);
+    expect(entity).toContain('关系');
+    expect(entity).toContain('name="intent" value="note.save"');
+    expect(entity).not.toContain('系统扫描尚未生成');
+    expect(html).not.toContain('data-field-knowledge=');
+    expect(html).toContain('href="/lineage?node=customer&field=customer_id"');
+
+    const res = await an.post('/lineage?node=customer', { intent: 'alias.add', targetId: 'entity:customer', alias: '会员' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/lineage?node=customer');
+    expect(panelFor(await pageOf(an, '/lineage?node=customer'), 'entity:customer')).toContain('data-alias="会员"');
+
+    const page = '/lineage?node=customer&field=customer_id';
+    html = await pageOf(an, page);
+    const field = panelFor(html, 'field:customer.customer_id');
+    expect(html).toContain('data-field-knowledge="customer_id"');
+    expect(field).toContain('name="intent" value="claim.save"');
+    expect(field).not.toContain('value="note.save"');
+    expect(field).toContain('string');
+    expect(field).toContain('data-field-lineage');
+    expect(html).toContain('href="/lineage?node=customer"');
+
+    const saved = await an.post(page, { intent: 'claim.save', targetId: 'field:customer.customer_id', type: 'unit', value: 'count' });
+    expect(saved.status).toBe(302);
+    expect(saved.headers.get('location')).toBe(page);
+    expect((await knowledgeOf(acme, 'field:customer.customer_id'))).toMatchObject({ claims: [{ type: 'unit', value: 'count' }] });
+    expect(panelFor(await pageOf(an, page), 'field:customer.customer_id')).toContain('data-claim="unit"');
+
+    html = await pageOf(an, '/lineage?node=customer&field=email');
+    expect(html).toContain('data-field-knowledge="email"');
+    expect(panelFor(html, 'field:customer.email')).toBe('');
+    expect(html).not.toContain('value="field:customer.email"');
+  });
+
+  it('查看者在字段抽屉里看得到实体与字段面板，没有表单，字段面板没有来源，提交 403', async () => {
+    await setup();
+    const viewer = await loginAs(app, 'view@acme.com');
+    const html = await pageOf(viewer, '/lineage?node=customer&field=customer_id');
+    const entity = panelFor(html, 'entity:customer');
+    const field = panelFor(html, 'field:customer.customer_id');
+    expect(entity).toContain('系统事实');
+    expect(field).toContain('系统事实');
+    for (const panel of [entity, field]) {
+      expect(panel).not.toContain('value="alias.add"');
+      expect(panel).not.toContain('<form');
+    }
+    expect(field).not.toContain('data-field-lineage');
+    expect((await viewer.post('/lineage?node=customer', { intent: 'alias.add', targetId: 'entity:customer', alias: '会员' })).status).toBe(403);
+    expect((await viewer.post('/lineage?node=customer&field=customer_id', { intent: 'claim.save', targetId: 'field:customer.customer_id', type: 'unit', value: 'count' })).status).toBe(403);
+  });
+
+  it('数据工程师在自定义实体详情页的面板里加别名，数据地图抽屉里的实体面板显示同一个别名', async () => {
+    const { acme, author, reviewer, sources } = await setup();
+    const id = await createCustomEntity(author, {
+      name: 'custom_member_card', label: '会员卡', kind: 'dimension', primaryKey: ['card_id'],
+      fields: [{ name: 'card_id', type: 'string', description: '会员卡号', sensitive: false }],
+    });
+    await publishCustomEntity(reviewer, id, 1);
+    await publish(author, reviewer, sources.loyalty, 'model: 1\nentity: custom_member_card\ntable: members\nextensions:\n  card_id: { type: string, expr: string(member_id) }\ndedupe: { key: [card_id] }\n');
+    const de = await loginAs(app, 'de@acme.com');
+    const page = `/entities/${id}`;
+    expect(panelFor(await pageOf(de, page), 'entity:custom_member_card')).toContain('card_id');
+
+    const res = await de.post(page, { intent: 'alias.add', targetId: 'entity:custom_member_card', alias: '储值卡' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe(page);
+    expect(panelFor(await pageOf(de, page), 'entity:custom_member_card')).toContain('data-alias="储值卡"');
+    expect((await knowledgeOf(acme, 'entity:custom_member_card'))).toMatchObject({ aliases: ['储值卡'] });
+    expect(panelFor(await pageOf(de, '/lineage?node=custom_member_card'), 'entity:custom_member_card')).toContain('data-alias="储值卡"');
   });
 });

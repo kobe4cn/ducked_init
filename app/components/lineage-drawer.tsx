@@ -3,11 +3,15 @@
 // 关闭是去掉 ?node= 的链接；有明细时带「聚焦此表」链接，进入单表聚焦画布。
 // 实体登记的字段带业务说明（ADR-0041）：任何角色看得到当前说明与历史（可折叠），有 definitions:draft 的成员可以编辑，清空是保存空内容；
 // 有明细时每个映射来源下另有映射字段说明（这个数据源在这个字段上的特殊之处），有 sources:write 的成员可以编辑。
+// 头部下面是实体的业务知识面板（ADR-0046）；每个字段行有「业务知识」链接（?field=），展开的那个字段在行后面接一个字段面板（不带说明区，说明由上面的 Note 编辑）。
 // 源表抽屉（TableDrawer，只给 sources:read）按源列列出它影响的标准层字段、映射与表达式
-import type { ReactNode } from 'react';
+import { Fragment, type ReactNode } from 'react';
 import { Form, Link } from 'react-router';
-import { AlertTriangle, ArrowRight, BookOpen, Focus, Lock, NotebookPen, Puzzle, X } from 'lucide-react';
+import { AlertTriangle, ArrowRight, BookOpen, Focus, Lightbulb, Lock, NotebookPen, Puzzle, X } from 'lucide-react';
 import type { NoteVersion } from '~/.server/business-notes';
+import type { EntityEntry, FieldEntry } from '~/.server/catalog';
+import type { KnowledgePanel as Panel } from '~/.server/knowledge/panel';
+import { KnowledgePanel } from '~/components/knowledge-panel';
 import { noteKey } from '~/lib/business-note-key';
 import { fallbackText } from '~/lib/fallback';
 import type { FieldDrawer, FieldSource } from '~/lib/lineage-fields';
@@ -20,14 +24,23 @@ const ASIDE = 'fixed inset-y-0 right-0 z-50 w-[28rem] max-w-full overflow-y-auto
 /** 一个字段的业务说明：当前内容（空串为没有或已清空）与每一版，从旧到新 */
 export interface FieldNote { current: string; history: NoteVersion[] }
 
+/** 抽屉里一个业务知识面板：目标、目录条目与面板内容 */
+export interface DrawerKnowledge { targetId: string; system: EntityEntry | FieldEntry; panel: Panel }
+
 /**
  * focusHref：单表聚焦画布的链接，没有 sources:read 时为 null；notes：实体登记的字段的业务说明与其各映射来源的映射字段说明，键是 noteKey（扩展字段没有）；
- * canNote / canMappingNote：能否编辑实体字段 / 映射字段的说明；noteError：上一次保存失败的说明（noteKey）、原因与提交的内容（编辑框里留着）
+ * canNote / canMappingNote：能否编辑实体字段 / 映射字段的说明；noteError：上一次保存失败的说明（noteKey）、原因与提交的内容（编辑框里留着）；
+ * knowledge：实体与展开字段（openField）的业务知识面板，不在目录里时为 null；fieldHref：展开某个字段（null 为收起）的链接；knowledgeError：按 targetId 取上一次面板提交的错误
  */
-export function LineageDrawer({ drawer, closeHref, focusHref, notes, canNote, canMappingNote, noteError }: {
+export function LineageDrawer({ drawer, closeHref, focusHref, notes, canNote, canMappingNote, noteError, knowledge, openField, fieldHref, knowledgeError }: {
   drawer: FieldDrawer; closeHref: string; focusHref: string | null;
   notes: Record<string, FieldNote>; canNote: boolean; canMappingNote: boolean; noteError: { key: string; error: string; note: string } | null;
+  knowledge: { entity: DrawerKnowledge | null; field: DrawerKnowledge | null };
+  openField: string | null; fieldHref: (field: string | null) => string; knowledgeError: (targetId: string) => string | null;
 }) {
+  const panelOf = (k: DrawerKnowledge, hideNote = false) => (
+    <KnowledgePanel compact hideNote={hideNote} panel={k.panel} system={k.system} targetId={k.targetId} error={knowledgeError(k.targetId)} />
+  );
   // 实体字段的说明，或给了 mappingId 时这个映射来源下的映射字段说明；没有下发的（扩展字段、没有明细）不显示
   const noteOf = (field: string, mappingId: string | null = null) => {
     const key = noteKey(drawer.entity, field, mappingId);
@@ -55,17 +68,31 @@ export function LineageDrawer({ drawer, closeHref, focusHref, notes, canNote, ca
         </div>
         <Close href={closeHref} />
       </div>
+      {knowledge.entity && <div className="px-6 pt-4">{panelOf(knowledge.entity)}</div>}
       <ul className="divide-y px-6">
         {drawer.fields.map(f => (
-          <li key={f.name} data-field={f.name} className="space-y-2 py-4">
-            <div>
-              <span className="font-mono text-xs font-semibold">{f.name}</span>
-              {f.label !== f.name && <span className="ml-2 text-sm">{f.label}</span>}
+          <Fragment key={f.name}>
+          <li data-field={f.name} className="space-y-2 py-4">
+            <div className="flex items-baseline justify-between gap-2">
+              <div>
+                <span className="font-mono text-xs font-semibold">{f.name}</span>
+                {f.label !== f.name && <span className="ml-2 text-sm">{f.label}</span>}
+              </div>
+              <Link to={fieldHref(openField === f.name ? null : f.name)} preventScrollReset aria-expanded={openField === f.name} className="inline-flex shrink-0 items-center gap-1 text-xs text-slate-600 hover:underline">
+                <Lightbulb className="size-3" />业务知识
+              </Link>
             </div>
             {f.description && <p className="text-xs text-slate-500">{f.description}</p>}
             {noteOf(f.name)}
             {'sources' in f && f.sources.map(s => <Source key={s.mapping} source={s}>{noteOf(f.name, s.mapping)}</Source>)}
           </li>
+          {/* 另起一个 <li>，不放进上面的字段行：面板里也有 <li> */}
+          {openField === f.name && (
+            <li data-field-knowledge={f.name} className="pb-4 pt-2">
+              {knowledge.field ? panelOf(knowledge.field, true) : <p className="text-sm text-slate-500">这个字段不在语义目录里（敏感字段或系统列），没有业务知识。</p>}
+            </li>
+          )}
+          </Fragment>
         ))}
       </ul>
       {drawer.fields.length === 0 && <p className="px-6 py-4 text-sm text-slate-500">已发布的映射还没有写入这张表的字段。</p>}
