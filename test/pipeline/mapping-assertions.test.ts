@@ -85,7 +85,7 @@ describe('合并时执行映射的自定义断言', () => {
     expect(merge.records.find(r => r.mapping === customers)).toMatchObject({ mode: 'incremental', inserted: 1 });
     expect(await assertionRuns(acme, merge.id)).toEqual([]);
     expect(await onLake(acme, `SELECT * FROM silver._quarantine`)).toEqual([]);
-  });
+  }, 180_000); // 两次发布后自动启用默认模板，6 个 gold 任务与 serving.build 在同一次 drain 里跑完，4 个 worker 并行时超过默认 90 s
 
   it('warn 级不通过：照常合并，合并记录与 silver._assertion_runs 都带自定义断言的结果', async () => {
     const { acme, author, reviewer, id } = await syncedSource();
@@ -126,5 +126,5 @@ describe('合并时执行映射的自定义断言', () => {
     expect(plain).toMatchObject({ mode: 'incremental', inserted: 1 });
     expect('assertions' in plain).toBe(false);
     expect((await assertionRuns(acme, merge.id)).map(r => r.entity)).toEqual(['order']);
-  });
+  }, 180_000); // 两次发布后自动启用默认模板，6 个 gold 任务与 serving.build 在同一次 drain 里跑完，4 个 worker 并行时超过默认 90 s
 });
