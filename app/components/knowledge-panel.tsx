@@ -35,7 +35,7 @@ function Fact({ label, value }: { label: string; value: string }) {
   return (
     <div className="grid grid-cols-[6rem_1fr] gap-2 text-sm">
       <dt className="text-slate-500">{label}</dt>
-      <dd className="break-all">{value || '—'}</dd>
+      <dd className="break-words">{value || '—'}</dd>
     </div>
   );
 }
@@ -61,7 +61,7 @@ function SystemFacts({ system }: { system: PanelSystem }) {
         {definition && <Fact label="依赖" value={deps.join('、')} />}
         {system?.kind === 'entity' && (
           <>
-            <Fact label="字段" value={system.fields.map((f) => f.label ? `${f.label}（${f.name}）` : f.name).join('、')} />
+            <Fact label="字段" value={system.fields.map((f) => f.label && f.label !== f.name ? `${f.label}（${f.name}）` : f.name).join('、')} />
             <Fact label="关系" value={system.relations.join('、')} />
           </>
         )}
