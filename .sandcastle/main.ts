@@ -19,6 +19,7 @@
 // 标签状态机见 docs/agents/sandcastle.md。
 //
 // Usage: npm run run:sandcastle
+//        SANDCASTLE_ONLY=328,329 npm run run:sandcastle   只处理这几张票（试跑、单独补跑）
 
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -42,6 +43,9 @@ const BASE_BRANCH = "main";
 // 从远端 main 建分支：上一轮合并的代码在远端，不动宿主机本地 main 的工作区。
 const BASE_REF = `${REMOTE}/${BASE_BRANCH}`;
 const MODEL = "claude-opus-5-5";
+// 只处理这几张票（逗号分隔）；不设则处理全部带 Sandcastle 标签的票。拆出来的子票不在名单里，要另外加。
+const ONLY = new Set((process.env.SANDCASTLE_ONLY ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+const allowed = (id: string | number) => ONLY.size === 0 || ONLY.has(String(id).replace(/^#/, ""));
 
 const LABEL = {
   picked: "Sandcastle", // 人工选中
@@ -128,16 +132,40 @@ const envPrefix = (env: Record<string, string>) =>
   `env ${Object.entries(env).map(([k, v]) => `${k}=${shellQuote(v)}`).join(" ")}`;
 
 // 合并门槛：脚本自己跑，不信 agent 的口头结论。retrieval-golden 的 KNOWN_GAPS 是 it.fails，不影响退出码。
-const GATE_SCRIPT = [
-  "npm run typecheck > /tmp/gate-typecheck.log 2>&1 || { tail -40 /tmp/gate-typecheck.log; exit 1; }",
-  'npm run test > /tmp/gate-test.log 2>&1 || { grep -nE "FAIL|Test Files|Tests |Error" /tmp/gate-test.log | tail -60; exit 1; }',
-  'grep -E "Test Files|Tests " /tmp/gate-test.log | tail -2',
-].join("; ");
+// 完整测试在沙箱里要跑 ~40 分钟，负载下个别用例会偶发失败（hook 超时、随机数据撞上断言）：
+// 失败的文件不超过 GATE_RERUN_MAX 个时单独重跑一次，重跑通过算通过，但输出 GATE_FLAKY 让 PR 上标出来。
+// 失败摘要只取 vitest 的 Failed Tests / Failed Suites 一节（去掉颜色、每行截断），不 grep 日志里的 Error。
+const GATE_RERUN_MAX = 3;
+const GATE_SCRIPT = String.raw`
+plain() { sed 's/\[[0-9;]*m//g' "$1"; }
+failures() { plain "$1" | sed -n '/Failed \(Tests\|Suites\)/,/Test Files/p' | grep -v 'Test Files' | cut -c1-300 | head -80; }
+totals() { plain "$1" | grep -E "Test Files|Tests " | tail -2; }
+npm run typecheck > /tmp/gate-typecheck.log 2>&1 || { plain /tmp/gate-typecheck.log | tail -40; exit 1; }
+npm run test > /tmp/gate-test.log 2>&1 && { totals /tmp/gate-test.log; exit 0; }
+files=$(plain /tmp/gate-test.log | grep -oE "FAIL +test/[^ ]+\.test\.tsx?" | awk '{print $2}' | sort -u)
+count=$(printf '%s
+' "$files" | grep -c .)
+if [ "$count" -eq 0 ] || [ "$count" -gt ${GATE_RERUN_MAX} ]; then
+  echo "完整测试失败（失败文件 $count 个，不重跑）："; failures /tmp/gate-test.log; totals /tmp/gate-test.log; exit 1
+fi
+echo "完整测试有 $count 个文件失败，单独重跑一次："; echo "$files"
+npx vitest run $files > /tmp/gate-rerun.log 2>&1 || {
+  echo "重跑仍失败："; failures /tmp/gate-rerun.log; totals /tmp/gate-rerun.log; exit 1
+}
+echo "GATE_FLAKY: 重跑通过。第一次的失败："; failures /tmp/gate-test.log; totals /tmp/gate-test.log
+`;
 
+// 仓库用 pnpm（package.json 的 packageManager）。拷进来的 node_modules 是宿主机 darwin 的，
+// 缺 linux 原生包（rolldown、typescript-go），npm install 补不上，要用 pnpm 按锁文件重装。
+const PNPM = JSON.parse(readFileSync("package.json", "utf8")).packageManager as string;
 const hooks = {
-  sandbox: { onSandboxReady: [{ command: "npm install" }] },
+  sandbox: { onSandboxReady: [{ command: `npx -y ${PNPM} install --frozen-lockfile` }] },
 };
 const copyToWorktree = ["node_modules"];
+
+// createSandbox 里的 sandbox.run 不使用 agent provider 的 env，只有容器启动时 podman({env}) 的 env
+// 才进得了 agent 的 shell，所以测试库连接与上下文预算都在这里注入。
+const sandboxFor = (env: Record<string, string>) => podman({ env: { ...claudeEnv, ...env } });
 
 const planSchema = z.object({
   issues: z.array(
@@ -230,7 +258,7 @@ async function build(issue: Issue) {
   const sandbox = await sandcastle.createSandbox({
     branch: issue.branch,
     baseBranch: BASE_REF,
-    sandbox: podman(),
+    sandbox: sandboxFor(env),
     hooks,
     copyToWorktree,
   });
@@ -264,7 +292,7 @@ async function build(issue: Issue) {
         maxIterations: 1,
         agent: agent(env),
         prompt: [
-          `分支 ${issue.branch}（issue #${issue.id}）在合并门槛上失败，摘要如下；完整日志在 /tmp/gate-typecheck.log 与 /tmp/gate-test.log（用 grep 看，不要整读）。`,
+          `分支 ${issue.branch}（issue #${issue.id}）在合并门槛上失败，摘要如下；完整日志在 /tmp/gate-typecheck.log、/tmp/gate-test.log 与重跑的 /tmp/gate-rerun.log（用 grep 看，不要整读）。测试失败的文件不超过 ${GATE_RERUN_MAX} 个时已经单独重跑过一次，仍失败才到你这里。`,
           "```", gateResult.stdout.slice(-4000), "```",
           "只修这些失败：用 `npx vitest run <file>` 跑失败的文件确认变绿，按仓库风格写中文提交信息、末尾 (#" + issue.id + ")。",
           "如果失败与本票改动无关（偶发、环境问题）或不能确定怎么修，不要改代码，在输出里说明原因。",
@@ -315,7 +343,7 @@ const MIGRATION_CHAIN_OK = migrationChainOk("HEAD");
 async function rebaseAndMerge(issue: Issue, pr: string): Promise<{ ok: true } | { ok: false; reason: string }> {
   sh("git", ["fetch", REMOTE, BASE_BRANCH]);
   const env = testEnv(issue.id);
-  const sandbox = await sandcastle.createSandbox({ branch: issue.branch, baseBranch: BASE_REF, sandbox: podman(), hooks, copyToWorktree });
+  const sandbox = await sandcastle.createSandbox({ branch: issue.branch, baseBranch: BASE_REF, sandbox: sandboxFor(env), hooks, copyToWorktree });
   try {
     const behind = await sandbox.exec(`git merge-base --is-ancestor ${BASE_REF} HEAD`);
     if (behind.exitCode === 0) {
@@ -387,7 +415,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // 每轮重新查询，所以上一轮拆出来的子票（继承了 Sandcastle 标签）这里会被看到。
   const toPrep = searchIssues(
     `${q(LABEL.picked)} ${notIn(LABEL.prepped, LABEL.prOpen, LABEL.stuck)}`,
-  );
+  ).filter((issue) => allowed(issue.number));
   for (const issue of toPrep) {
     console.log(`Prep #${issue.number}: ${issue.title}`);
     await sandcastle.run({
@@ -413,7 +441,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     output: sandcastle.Output.object({ tag: "plan", schema: planSchema }),
   });
 
-  const issues = plan.output.issues.slice(0, MAX_PARALLEL);
+  const issues = plan.output.issues.filter((issue) => allowed(issue.id)).slice(0, MAX_PARALLEL);
   if (issues.length === 0) {
     console.log("没有可以开工的票（都在等 blocker、等人审 PR，或需要人处理）。");
     break;
@@ -445,9 +473,12 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     }
 
     const overBudget = peak > CONTEXT_BUDGET ? "\n\n⚠️ 超过上下文预算，考虑把同类票切得更小。" : "";
-    const gateNote = result.gate.ok
-      ? `typecheck 与完整测试通过（沙箱内）。\n\n\`\`\`\n${result.gate.output.slice(-500)}\n\`\`\``
-      : `❌ 门槛失败：\n\n\`\`\`\n${result.gate.output}\n\`\`\``;
+    const flaky = result.gate.output.includes("GATE_FLAKY");
+    const gateNote = !result.gate.ok
+      ? `❌ 门槛失败：\n\n\`\`\`\n${result.gate.output}\n\`\`\``
+      : flaky
+        ? `typecheck 通过；⚠️ 完整测试有偶发失败，失败的文件单独重跑通过（沙箱内）。偶发用例请另开票修。\n\n\`\`\`\n${result.gate.output}\n\`\`\``
+        : `typecheck 与完整测试通过（沙箱内）。\n\n\`\`\`\n${result.gate.output.slice(-500)}\n\`\`\``;
     const browserNote = result.browser
       ? `\n\n## Browser check\n\n${result.browser.result ?? "（implementer 没有写 RESULT.md）"}\n\n截图 ${result.browser.shots.length} 张，附在下面。`
       : "";

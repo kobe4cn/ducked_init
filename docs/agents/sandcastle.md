@@ -20,7 +20,10 @@
 全部满足才合并（`gh pr merge --rebase`），否则留 PR 并在 PR 上评论原因：
 
 1. reviewer 给出 `<verdict>merge</verdict>`：验收标准都实现且有测试、没有要人判断的问题、没改页面（改了页面留 PR 附截图，见「浏览器验收」）、没动 ADR / 权限 / 敏感字段处理、没改弱已有测试（规则在 `.sandcastle/review-prompt.md`）。
-2. 门槛通过：脚本在沙箱里自己跑 `npm run typecheck` 与完整测试。失败时让 implementer 用新会话修一次，再跑一次。
+2. 门槛通过：脚本在沙箱里自己跑 `npm run typecheck` 与完整测试（沙箱里 4 个 worker，约 40 分钟）。
+   - 完整测试失败、且失败的文件不超过 3 个时，先把这几个文件单独重跑一次：重跑通过算通过，PR 的 **Gate** 一节标出「偶发失败」和第一次的失败摘要，偶发用例另开票修。重跑仍失败、或失败文件更多，才算门槛失败。
+   - 门槛失败时让 implementer 用新会话修一次，再跑一次门槛。
+   - 失败摘要只取 vitest 的 Failed Tests / Failed Suites 一节。
 3. GitHub 能 rebase 合并，且本票的 drizzle 迁移接在 `origin/main` 最新的迁移后面（两张票各加一个迁移时没有文本冲突，但迁移链会分叉，所以合并前脚本先查）。
 
    不满足时脚本自动补救一次：在原分支上开沙箱 `git rebase origin/main`；有冲突或迁移链分叉就开一次 agent 会话按 `.sandcastle/rebase-prompt.md` 处理（追加型文件两边都留，迁移删掉重新 `db:generate`，要做判断的放弃并在 issue 上评论）；然后**重跑完整门槛**，通过才 force-push 再合并。补救不成就留 PR 并写原因。代价是这张票多跑一遍完整测试。
@@ -29,6 +32,7 @@ GitHub CI 不作为门槛。
 
 ## 其他规则
 
+- 只跑指定的票：`SANDCASTLE_ONLY=328,329 npm run run:sandcastle`（prep 与 plan 都只看名单里的票；拆出来的子票不在名单里，要另外加）。
 - 有 open blocker 的票不会被 prep，也不会被 plan 选中。blocker 留成 PR 时，依赖它的票要等你合并之后的下一次运行。
 - 拆出来的子票会在**下一轮**被看到（每轮开头重新查询 issue）。
 - 每轮开头 `git fetch origin main`，新分支从 `origin/main` 建，不动宿主机本地 `main` 的工作区；跑完后本地 `main` 要自己 `git pull`。
@@ -39,13 +43,15 @@ GitHub CI 不作为门槛。
 
 - implementer 的每次迭代都是全新的 Claude 会话；`IMPLEMENT_MAX_ITERATIONS = 3`，超过就打 `sandcastle:stuck`，通常说明票太大。
 - 每个会话设 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=150000`。真正保证预算的是 prep 把票切小（`docs/agents/ticket-sizing.md`）。
-- implementer 不跑完整测试（省掉 14 分钟的输出与等待），完整测试由门槛跑。
+- implementer 不跑完整测试（沙箱里约 40 分钟），完整测试由门槛跑。
 - PR 正文的 **Budget** 一节记录上下文峰值，超过 150k 时会标出来。
 
 ## 运行前提
 
 - `.sandcastle/`、`.claude/skills/prep-ticket/`、`CLAUDE.md`、`docs/` 要**先提交并 push**：沙箱从 `origin/main` 建 worktree，看不到未提交的改动。
 - 测试依赖的服务在宿主机的 apple container 里（PG、MySQL、MongoDB、SeaweedFS），端口发布在宿主机上，podman 容器经 `host.containers.internal` 访问。脚本读宿主机的 `.env`（`S3_*`）与 `.env.test`（`TEST_*`），把 `localhost` / `127.0.0.1` 换成 `host.containers.internal` 后传进沙箱。
+- 测试库连接、上下文预算等环境变量在建沙箱时经 `podman({env})` 注入（`sandboxFor`）。`createSandbox` 里的 `sandbox.run` 不使用 `agent(env)` 的 env，放在那里进不了 agent 的 shell。
+- 沙箱建好后用 `package.json` 的 `packageManager`（pnpm）按锁文件重装依赖：拷进来的 `node_modules` 是宿主机 darwin 的，缺 linux 原生包。
 - 每张票的库名与前缀加 `_i<n>`（`crm_platform_test_i<n>`、`crm_source_test_i<n>`、MySQL / MongoDB 库、`TEST_S3_LAKE_URI`），并行的沙箱互不清表；`CRM_TEST_WORKERS=4`，`MAX_PARALLEL × 4` 个 worker 的连接数要在 PG `max_connections` 以内。
 - `GH_TOKEN` 需要 Issues 读写与 Pull requests 只读；push、开 PR、合并在宿主机上用你自己的 git / gh 凭据完成。宿主机的 `gh` 要 2.99+（`--attach` 上传截图）。
 - 改了 `.sandcastle/Containerfile` 要重建镜像。podman 读 `~/.config/containers/registries.conf`（Podman Desktop 还会把它同步进虚拟机），这个文件不合法时构建会失败。
