@@ -102,6 +102,8 @@ export interface FieldLineageItem {
   sample: ColumnStats[];
   /** 映射字段的业务说明：这个数据源在这个字段上的特殊之处；没有或已清空时没有 */
   note?: string;
+  /** 映射字段的业务说明需复核（依据的映射计划变了，ADR-0046）；不需复核或没有说明时没有 */
+  noteNeedsReview?: true;
   /** 映射字段的业务知识；没有时没有 */
   knowledge?: Knowledge;
 }
@@ -296,6 +298,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
             source: s.sourceName, table: s.table, expr: s.expr, sourceColumns: s.sourceColumns, dictionary: s.dictionary,
             sample: s.sourceColumns.flatMap(name => stats?.columns.filter(c => c.name === name) ?? []),
             ...(mappingNote && { note: mappingNote }),
+            ...(mappingNote && input.knowledge?.staleNotes?.has(noteKey(e.name, f.name, s.mapping)) && { noteNeedsReview: true as const }),
             ...knowledgeOf(fieldId(e.name, f.name), s.mapping),
           };
         }),
@@ -518,7 +521,7 @@ function entryMarkdown(e: CatalogEntry): string {
         ...(e.note ? [`- 业务说明：${e.note}`] : []),
         ...(e.lineage.length
           ? ['- 来源：', ...e.lineage.flatMap(l => [`  - ${l.source}/${l.table}：${code(l.expr)}${l.dictionary ? '（经值字典）' : ''}`,
-            ...(l.note ? [`    - 映射说明：${l.note}`] : []),
+            ...(l.note ? [`    - 映射说明${l.noteNeedsReview ? '（待复核）' : ''}：${l.note}`] : []),
             ...knowledgeMarkdown(l.knowledge, '    '),
             ...l.sample.map(c => `    - 源端样本 ${code(c.name)}：${columnStatsText(c)}`)])]
           : ['- 来源：未映射'])].join('\n');

@@ -10,7 +10,7 @@ import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { businessNotes, mappings } from './db/schema';
 import { publishedCustomEntities } from './custom-entities';
-import { assertTarget, basisOf, KnowledgeError } from './knowledge/basis';
+import { assertTarget, basisOf, KnowledgeError, type Basis } from './knowledge/basis';
 import { publishedPlans } from './mappings';
 import { UUID } from './tenants';
 import { noteKey } from '../lib/business-note-key';
@@ -108,13 +108,25 @@ export async function currentNotes(db: Tx | ReturnType<typeof getDb>, tenantId: 
   return new Map(rows.map(r => [noteKey(r.entity!, r.field!, r.mappingId), r.note]));
 }
 
-/** 本租户实体、指标、标签说明的当前内容（含已清空的空串），键是 targetId */
-export async function currentTargetNotes(db: Tx | ReturnType<typeof getDb>, tenantId: string): Promise<Map<string, string>> {
-  const rows = await db.selectDistinctOn([businessNotes.targetId], { targetId: businessNotes.targetId, note: businessNotes.note })
+/** 本租户每个映射字段说明当前那一版的依据摘要，键是 noteKey；已清空的不给。给需复核比较用（knowledge/catalog.ts） */
+export async function currentMappingNoteBases(db: Tx | ReturnType<typeof getDb>, tenantId: string): Promise<Map<string, Basis[]>> {
+  const rows = await db
+    .selectDistinctOn([businessNotes.entity, businessNotes.field, businessNotes.mappingId], {
+      entity: businessNotes.entity, field: businessNotes.field, mappingId: businessNotes.mappingId, note: businessNotes.note, basedOn: businessNotes.basedOn,
+    })
+    .from(businessNotes)
+    .where(and(eq(businessNotes.tenantId, tenantId), isNull(businessNotes.targetId), isNotNull(businessNotes.mappingId)))
+    .orderBy(businessNotes.entity, businessNotes.field, businessNotes.mappingId, desc(businessNotes.createdAt));
+  return new Map(rows.filter(r => r.note).map(r => [noteKey(r.entity!, r.field!, r.mappingId), r.basedOn]));
+}
+
+/** 本租户实体、指标、标签说明的当前内容（含已清空的空串）与那一版的依据摘要，键是 targetId */
+export async function currentTargetNotes(db: Tx | ReturnType<typeof getDb>, tenantId: string): Promise<Map<string, { note: string; basedOn: Basis[] }>> {
+  const rows = await db.selectDistinctOn([businessNotes.targetId], { targetId: businessNotes.targetId, note: businessNotes.note, basedOn: businessNotes.basedOn })
     .from(businessNotes)
     .where(and(eq(businessNotes.tenantId, tenantId), isNotNull(businessNotes.targetId)))
     .orderBy(businessNotes.targetId, desc(businessNotes.createdAt));
-  return new Map(rows.map(r => [r.targetId!, r.note]));
+  return new Map(rows.map(r => [r.targetId!, { note: r.note, basedOn: r.basedOn }]));
 }
 
 const versionColumns = { field: businessNotes.field, note: businessNotes.note, by: businessNotes.createdByEmail, at: businessNotes.createdAt };
