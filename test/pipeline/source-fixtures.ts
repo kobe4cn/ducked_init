@@ -1,5 +1,6 @@
 // test/pipeline/source-fixtures.ts —— 数据源夹具：本地 PostgreSQL 上的源库（与 src/01_seed.ts 一样用 hash 确定性造数），
 // 一个只读账号与一个对订单表可写的账号；放在租户源文件目录下的 DuckDB 文件；以及身份打通用的三个已登记并同步完的数据源
+import { randomUUID } from 'node:crypto';
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DuckDBInstance } from '@duckdb/node-api';
@@ -7,7 +8,7 @@ import { MongoClient } from 'mongodb';
 import pg from 'pg';
 import type { CurrentMember } from '../../app/.server/auth';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
-import { signedFetch, xmlTag, xmlTags } from '../../app/.server/s3-client';
+import { objectPath, signedFetch, xmlTag, xmlTags, type S3Creds } from '../../app/.server/s3-client';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 import { WORKER_SUFFIX } from '../setup-env';
@@ -265,7 +266,40 @@ async function s3Account(user: string, prefix: string, extra: string[] = []) {
     }),
   });
   const xml = await iam('CreateAccessKey', { UserName: user });
-  return { keyId: xmlTag(xml, 'AccessKeyId')!, secret: xmlTag(xml, 'SecretAccessKey')! };
+  const account = { keyId: xmlTag(xml, 'AccessKeyId')!, secret: xmlTag(xml, 'SecretAccessKey')! };
+  await untilGrantsApplied(user, { ...platformS3Creds(), key: account.keyId, secret: account.secret }, prefix, extra);
+  return account;
+}
+
+/**
+ * 对象存储（SeaweedFS）的 S3 网关异步加载共享的 IAM 配置，并行的 worker 又都在改这份配置（建删租户账号）：
+ * 刚签发的密钥可能还在用过期的权限（如可删除的账号仍能发起分段上传），登记时的写入探测就会报错权限。
+ * 这里按登记时探测的同一方式（发起分段上传并立即取消、删除一个随机键）轮询，直到观察到的权限与策略一致；
+ * 另要求能列出 prefix，免得账号还没生效、什么都被拒时被当作只读已生效。不在 prefix 下留下任何对象
+ */
+async function untilGrantsApplied(user: string, creds: S3Creds, prefix: string, extra: string[]) {
+  const [bucket, ...rest] = prefix.replace(/^s3:\/\//, '').split('/');
+  const expected = { list: true, put: extra.includes('s3:PutObject'), delete: extra.includes('s3:DeleteObject') };
+  /** 受理为 true、拒绝（403）为 false，其他结果记下状态码、继续等 */
+  const status = (res: Response): boolean | string => {
+    if (res.status === 403) return false;
+    return res.ok || `HTTP ${res.status}`;
+  };
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    const path = objectPath(`${prefix}.crm-grant-probe-${randomUUID()}`);
+    const list = await signedFetch(creds, 's3', { method: 'GET', path: objectPath(bucket), query: { 'list-type': '2', prefix: rest.join('/') } });
+    await list.text();
+    const upload = await signedFetch(creds, 's3', { method: 'POST', path, query: { uploads: '' } });
+    const uploadId = xmlTag(await upload.text(), 'UploadId');
+    if (uploadId) await (await signedFetch(platformS3Creds(), 's3', { method: 'DELETE', path, query: { uploadId } })).text();
+    const removal = await signedFetch(creds, 's3', { method: 'DELETE', path });
+    await removal.text();
+    const observed = { list: status(list), put: status(upload), delete: status(removal) };
+    if (observed.list === expected.list && observed.put === expected.put && observed.delete === expected.delete) return;
+    if (Date.now() > deadline) throw new Error(`对象存储账号 ${user} 的权限 30 s 内未生效：预期 ${JSON.stringify(expected)}，最后观察到 ${JSON.stringify(observed)}`);
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
 }
 
 /**
