@@ -690,6 +690,114 @@ function pushIfAhead(issue: Issue) {
   if (ahead.ok && Number(ahead.out) > 0) trySh("git", ["push", "--force-with-lease", "-u", REMOTE, issue.branch]);
 }
 
+/** issue 已关闭（人在运行中途合并了 PR、或手动关了票）。查不到时当作没关。 */
+function issueClosed(id: string) {
+  const r = trySh("gh", ["issue", "view", id, "--json", "state", "--jq", ".state"]);
+  return r.ok && r.out === "CLOSED";
+}
+
+/** Phase 3：一张票的落地。在宿主机上做，用宿主机的 git / gh 凭据，沙箱没有写仓库的权限。 */
+async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnType<typeof build>>>) {
+  // 运行期间人已经合并了这张票的 PR 或关了票：不再 push、开 PR、打标签，本地分支留着备查。
+  if (issueClosed(issue.id)) {
+    console.log(`  ⏭ #${issue.id} 已被关闭（运行期间有人合并了 PR 或关了票），跳过落地`);
+    return;
+  }
+  if (outcome.status === "rejected") {
+    console.error(`  ✗ #${issue.id} 失败：${outcome.reason}`);
+    markStuck(issue.id, `沙箱出错：${String(outcome.reason).slice(0, 500)}`);
+    return;
+  }
+  const result = outcome.value;
+  const peak = result.done
+    ? peakContext(result.implement, ...result.runs)
+    : peakContext(result.implement);
+  const budgetNote = `上下文峰值约 ${Math.round(peak / 1000)}k / ${CONTEXT_BUDGET / 1000}k，implement 用了 ${result.implement.iterations.length} 次会话。`;
+  if (!result.done) {
+    const comments = sh("gh", ["issue", "view", issue.id, "--json", "comments", "--jq", "[.comments[].body] | join(\"\\n\")"]);
+    if (comments.includes(REPREP_MARK)) {
+      markStuck(
+        issue.id,
+        `重新准备过一次，${IMPLEMENT_MAX_ITERATIONS} 次会话内仍没有完成（见上面 implementer 的评论）。${budgetNote} 请人看一下票怎么拆。`,
+      );
+      return;
+    }
+    // 第一次没做完：分支推上去免得部分提交只留在宿主机，提交列表写进评论给 prep 看，退回 prep 重新准备。
+    const pushed = trySh("git", ["push", "--force-with-lease", "-u", REMOTE, issue.branch]).ok;
+    const log = trySh("git", ["log", "--format=- %h %s", `${BASE_REF}..${issue.branch}`]);
+    const commits = log.ok && log.out ? `\n\n分支 \`${issue.branch}\` 上已有的提交：\n\n${log.out}` : "\n\n分支上还没有提交。";
+    sh("gh", ["issue", "edit", issue.id, "--remove-label", LABEL.prepped]);
+    sh("gh", [
+      "issue", "comment", issue.id, "--body",
+      `${REPREP_MARK}\n${IMPLEMENT_MAX_ITERATIONS} 次会话内没有完成。${budgetNote} 下一轮 prep 会按上面 implementer 的进度评论重新准备：指引不对就重写，票太大就把没完成的验收标准拆成子票。再没做完就打 ${LABEL.stuck}。${commits}${pushed ? "" : "\n\n（分支没能推到远端，下一轮会在本地的同名分支上接着做。）"}`,
+    ]);
+    console.log(`  ↺ #${issue.id} 没做完，退回 prep 重新准备`);
+    return;
+  }
+
+  const overBudget = peak > CONTEXT_BUDGET ? "\n\n⚠️ 超过上下文预算，考虑把同类票切得更小。" : "";
+  const flaky = result.gate.output.includes("GATE_FLAKY");
+  // 先 push 开 PR 才有 PR 号；开票放在后面，票号用评论补到 PR 上。
+  const gateNote = !result.gate.ok
+    ? `❌ 门槛失败：\n\n\`\`\`\n${result.gate.output}\n\`\`\``
+    : flaky
+      ? `typecheck 通过；⚠️ 完整测试有偶发失败，失败的文件单独重跑通过（沙箱内）。已自动开票修（见 PR 评论）。\n\n\`\`\`\n${result.gate.output}\n\`\`\``
+      : `typecheck 与完整测试通过（沙箱内）。\n\n\`\`\`\n${result.gate.output.slice(-500)}\n\`\`\``;
+  const browserNote = result.browser
+    ? `\n\n## Browser check\n\n${result.browser.result ?? "（implementer 没有写 RESULT.md）"}\n\n截图 ${result.browser.shots.length} 张，附在下面。`
+    : "";
+  const revisionNote = result.revisions.length
+    ? `\n\n**reviewer 打回过 ${result.revisions.length} 次**（implementer 已按意见修改）：\n\n${result.revisions
+        .map((items, n) => `<details><summary>第 ${n + 1} 次的意见</summary>\n\n${items}\n\n</details>`)
+        .join("\n\n")}`
+    : "";
+  const pr = pushAndOpenPr(
+    issue,
+    `## Review\n\n${result.summary}${revisionNote}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}`,
+    result.browser?.shots ?? [],
+  );
+  if (flaky && result.gate.ok) {
+    const tickets = reportFlaky(issue, pr, result.gate.output);
+    if (tickets.length) sh("gh", ["pr", "comment", pr, "--body", `门槛里的偶发失败已开票：${tickets.join("、")}`]);
+  }
+
+  if (result.verdict !== "merge") {
+    leaveForHuman(
+      issue,
+      pr,
+      result.verdict === "revise"
+        ? `reviewer 打回 ${REVISE_MAX} 次后仍有要改的问题（见最新的 Review）。`
+        : "reviewer 认为需要人审（见 PR 正文的 Review）。",
+    );
+    console.log(`  ◐ #${issue.id} 留 PR #${pr} 等人审`);
+    return;
+  }
+  if (!result.gate.ok) {
+    leaveForHuman(issue, pr, "typecheck 或完整测试没通过（见 PR 正文的 Gate）。");
+    console.log(`  ◐ #${issue.id} 门槛失败，留 PR #${pr}`);
+    return;
+  }
+  // 同一轮先合并的票可能让这张冲突：rebase 到最新的 origin/main（冲突交给 agent）、重跑门槛，再合并一次。
+  // 迁移链要先在宿主机上查：没有文本冲突时 GitHub 会照样合并，分叉的迁移就进了 main。
+  sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+  const chainOk = trySh("sh", ["-c", migrationChainOk(issue.branch)]).ok;
+  const merged = chainOk
+    ? trySh("gh", ["pr", "merge", pr, "--rebase"])
+    : { ok: false as const, out: `本票的 drizzle 迁移没有接在 ${BASE_REF} 最新的迁移后面。` };
+  if (!merged.ok) {
+    console.log(`  ↻ #${issue.id} 没能直接合并，rebase 到最新的 ${BASE_REF} 后重试`);
+    const retry = await untilAfterLimit(`rebase #${issue.id}`, () => rebaseAndMerge(issue, pr));
+    if (!retry.ok) {
+      leaveForHuman(issue, pr, `合并失败：${merged.out.slice(0, 300)}\n\nrebase 后重试也没成：${retry.reason}`);
+      console.log(`  ◐ #${issue.id} 合并失败，留 PR #${pr}`);
+      return;
+    }
+  }
+  trySh("git", ["push", REMOTE, "--delete", issue.branch]);
+  trySh("git", ["branch", "-D", issue.branch]);
+  console.log(`  ✓ #${issue.id} 已合并（PR #${pr}）`);
+}
+
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
@@ -745,101 +853,18 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   );
 
   // Phase 3: Land —— 在宿主机上逐个做：用宿主机的 git / gh 凭据，沙箱没有写仓库的权限。
+  // 每张票单独兜底：一张票落地出错（网络、人在运行中途合并或删了分支等）不让整个运行崩掉。
   for (const [i, outcome] of settled.entries()) {
     const issue = issues[i]!;
-    if (outcome.status === "rejected") {
-      console.error(`  ✗ #${issue.id} 失败：${outcome.reason}`);
-      markStuck(issue.id, `沙箱出错：${String(outcome.reason).slice(0, 500)}`);
-      continue;
+    try {
+      await land(issue, outcome);
+    } catch (e) {
+      const reason = String((e as { stderr?: unknown }).stderr || e).trim().slice(0, 500);
+      console.error(`  ✗ #${issue.id} 落地出错：${reason}`);
+      // 打 stuck 不让下一轮重做；本地分支保留，人看过后去掉 stuck 即可接着跑。
+      if (!issueClosed(issue.id)) trySh("gh", ["issue", "edit", issue.id, "--add-label", LABEL.stuck]);
+      if (!issueClosed(issue.id)) trySh("gh", ["issue", "comment", issue.id, "--body", `Sandcastle 停下了：落地（push / 开 PR / 合并）出错，本地分支 \`${issue.branch}\` 保留。\n\n\`\`\`\n${reason}\n\`\`\`\n\n处理后去掉 ${LABEL.stuck} 再运行。`]);
     }
-    const result = outcome.value;
-    const peak = result.done
-      ? peakContext(result.implement, ...result.runs)
-      : peakContext(result.implement);
-    const budgetNote = `上下文峰值约 ${Math.round(peak / 1000)}k / ${CONTEXT_BUDGET / 1000}k，implement 用了 ${result.implement.iterations.length} 次会话。`;
-    if (!result.done) {
-      const comments = sh("gh", ["issue", "view", issue.id, "--json", "comments", "--jq", "[.comments[].body] | join(\"\\n\")"]);
-      if (comments.includes(REPREP_MARK)) {
-        markStuck(
-          issue.id,
-          `重新准备过一次，${IMPLEMENT_MAX_ITERATIONS} 次会话内仍没有完成（见上面 implementer 的评论）。${budgetNote} 请人看一下票怎么拆。`,
-        );
-        continue;
-      }
-      // 第一次没做完：分支推上去免得部分提交只留在宿主机，提交列表写进评论给 prep 看，退回 prep 重新准备。
-      const pushed = trySh("git", ["push", "--force-with-lease", "-u", REMOTE, issue.branch]).ok;
-      const log = trySh("git", ["log", "--format=- %h %s", `${BASE_REF}..${issue.branch}`]);
-      const commits = log.ok && log.out ? `\n\n分支 \`${issue.branch}\` 上已有的提交：\n\n${log.out}` : "\n\n分支上还没有提交。";
-      sh("gh", ["issue", "edit", issue.id, "--remove-label", LABEL.prepped]);
-      sh("gh", [
-        "issue", "comment", issue.id, "--body",
-        `${REPREP_MARK}\n${IMPLEMENT_MAX_ITERATIONS} 次会话内没有完成。${budgetNote} 下一轮 prep 会按上面 implementer 的进度评论重新准备：指引不对就重写，票太大就把没完成的验收标准拆成子票。再没做完就打 ${LABEL.stuck}。${commits}${pushed ? "" : "\n\n（分支没能推到远端，下一轮会在本地的同名分支上接着做。）"}`,
-      ]);
-      console.log(`  ↺ #${issue.id} 没做完，退回 prep 重新准备`);
-      continue;
-    }
-
-    const overBudget = peak > CONTEXT_BUDGET ? "\n\n⚠️ 超过上下文预算，考虑把同类票切得更小。" : "";
-    const flaky = result.gate.output.includes("GATE_FLAKY");
-    // 先 push 开 PR 才有 PR 号；开票放在后面，票号用评论补到 PR 上。
-    const gateNote = !result.gate.ok
-      ? `❌ 门槛失败：\n\n\`\`\`\n${result.gate.output}\n\`\`\``
-      : flaky
-        ? `typecheck 通过；⚠️ 完整测试有偶发失败，失败的文件单独重跑通过（沙箱内）。已自动开票修（见 PR 评论）。\n\n\`\`\`\n${result.gate.output}\n\`\`\``
-        : `typecheck 与完整测试通过（沙箱内）。\n\n\`\`\`\n${result.gate.output.slice(-500)}\n\`\`\``;
-    const browserNote = result.browser
-      ? `\n\n## Browser check\n\n${result.browser.result ?? "（implementer 没有写 RESULT.md）"}\n\n截图 ${result.browser.shots.length} 张，附在下面。`
-      : "";
-    const revisionNote = result.revisions.length
-      ? `\n\n**reviewer 打回过 ${result.revisions.length} 次**（implementer 已按意见修改）：\n\n${result.revisions
-          .map((items, n) => `<details><summary>第 ${n + 1} 次的意见</summary>\n\n${items}\n\n</details>`)
-          .join("\n\n")}`
-      : "";
-    const pr = pushAndOpenPr(
-      issue,
-      `## Review\n\n${result.summary}${revisionNote}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}`,
-      result.browser?.shots ?? [],
-    );
-    if (flaky && result.gate.ok) {
-      const tickets = reportFlaky(issue, pr, result.gate.output);
-      if (tickets.length) sh("gh", ["pr", "comment", pr, "--body", `门槛里的偶发失败已开票：${tickets.join("、")}`]);
-    }
-
-    if (result.verdict !== "merge") {
-      leaveForHuman(
-        issue,
-        pr,
-        result.verdict === "revise"
-          ? `reviewer 打回 ${REVISE_MAX} 次后仍有要改的问题（见最新的 Review）。`
-          : "reviewer 认为需要人审（见 PR 正文的 Review）。",
-      );
-      console.log(`  ◐ #${issue.id} 留 PR #${pr} 等人审`);
-      continue;
-    }
-    if (!result.gate.ok) {
-      leaveForHuman(issue, pr, "typecheck 或完整测试没通过（见 PR 正文的 Gate）。");
-      console.log(`  ◐ #${issue.id} 门槛失败，留 PR #${pr}`);
-      continue;
-    }
-    // 同一轮先合并的票可能让这张冲突：rebase 到最新的 origin/main（冲突交给 agent）、重跑门槛，再合并一次。
-    // 迁移链要先在宿主机上查：没有文本冲突时 GitHub 会照样合并，分叉的迁移就进了 main。
-    sh("git", ["fetch", REMOTE, BASE_BRANCH]);
-    const chainOk = trySh("sh", ["-c", migrationChainOk(issue.branch)]).ok;
-    const merged = chainOk
-      ? trySh("gh", ["pr", "merge", pr, "--rebase"])
-      : { ok: false as const, out: `本票的 drizzle 迁移没有接在 ${BASE_REF} 最新的迁移后面。` };
-    if (!merged.ok) {
-      console.log(`  ↻ #${issue.id} 没能直接合并，rebase 到最新的 ${BASE_REF} 后重试`);
-      const retry = await untilAfterLimit(`rebase #${issue.id}`, () => rebaseAndMerge(issue, pr));
-      if (!retry.ok) {
-        leaveForHuman(issue, pr, `合并失败：${merged.out.slice(0, 300)}\n\nrebase 后重试也没成：${retry.reason}`);
-        console.log(`  ◐ #${issue.id} 合并失败，留 PR #${pr}`);
-        continue;
-      }
-    }
-    trySh("git", ["push", REMOTE, "--delete", issue.branch]);
-    trySh("git", ["branch", "-D", issue.branch]);
-    console.log(`  ✓ #${issue.id} 已合并（PR #${pr}）`);
   }
 }
 
