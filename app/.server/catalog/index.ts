@@ -24,8 +24,8 @@ import { TEMPLATES, type TemplateId } from '../pipeline/templates';
 import { SILVER_SYSTEM_COLUMNS, type MergeMappingParam } from '../pipeline/merge-engine';
 import type { ColumnProfile } from '../pipeline/source-engine';
 import { PLATFORM_COLUMNS } from '../pipeline/sync-engine';
-import { knowledgeKey, knowledgeMarkdown, knowledgeText, presentKnowledge, type Knowledge, type KnowledgeInput } from '../knowledge/catalog';
-import { metricText, tagText, type SystemFacts } from '../knowledge/derive';
+import { claimPhrase, knowledgeKey, knowledgeMarkdown, knowledgeText, presentKnowledge, type Knowledge, type KnowledgeInput } from '../knowledge/catalog';
+import { metricClaims, metricText, tagClaims, tagText, type SystemFacts } from '../knowledge/derive';
 import { CAPABILITIES, TEMPLATE_OUTPUTS } from './capabilities';
 
 /** 生成目录的元数据；各部分都可以不给 */
@@ -368,20 +368,22 @@ export function buildCatalog(input: CatalogInput): Catalog {
     fields: d.fields.filter(f => !hidden(f.entity, f.field)).map(f => fieldId(f.entity, f.field)),
   });
   const descriptionOf = (spec: { description?: unknown } | null) => (typeof spec?.description === 'string' ? spec.description : '');
+  // 标签的派生声明要看被引用指标的 spec：先把本批全部指标解析出来（循环里不保证指标排在标签前）
+  const metricSpecs = new Map((input.definitions ?? []).filter(d => d.kind === 'metric').map(d => [d.key, parse(d.yaml) as MetricSpec]));
   for (const d of input.definitions ?? []) {
     if (d.kind === 'metric') {
       const spec = parse(d.yaml) as MetricSpec;
       entries.push({
         kind: 'metric', id: metricId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version,
         base: entityId(spec.base), measure: measureText(spec.measure), dimensions: (spec.dimensions ?? []).map(x => x.name),
-        dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)), system: { text: metricText(spec) }, ...knowledgeOf(metricId(d.key)),
+        dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)), system: { text: metricText(spec), claims: metricClaims(spec) }, ...knowledgeOf(metricId(d.key)),
       });
     } else {
       const spec = parse(d.yaml) as TagSpec;
       const values = [...(Array.isArray(spec.rules) ? spec.rules.map(r => r?.value) : []), spec.default].filter(v => typeof v === 'string' || typeof v === 'number');
       entries.push({
         kind: 'tag', id: tagId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version,
-        values: [...new Set(values)], dependencies: dependencyIds(DSL_KINDS.tag.dependencies(spec)), system: { text: tagText(spec) },
+        values: [...new Set(values)], dependencies: dependencyIds(DSL_KINDS.tag.dependencies(spec)), system: { text: tagText(spec), claims: tagClaims(spec, metricSpecs) },
         ...knowledgeOf(tagId(d.key)),
       });
     }
@@ -457,7 +459,7 @@ function terms(query: string): string[] {
 const haystack = (e: CatalogEntry) => [
   e.id, e.name, e.description,
   ...('knowledge' in e ? [knowledgeText(e.knowledge)] : []),
-  ...(e.kind === 'metric' || e.kind === 'tag' ? [e.system.text] : []),
+  ...(e.kind === 'metric' || e.kind === 'tag' ? [e.system.text, ...e.system.claims.map(claimPhrase)] : []),
   ...(e.kind === 'field' ? [...(e.enum ?? []), e.note ?? '', ...e.lineage.flatMap(l => [l.note ?? '', knowledgeText(l.knowledge)])] : []),
   ...(e.kind === 'tag' ? e.values.map(String) : []),
   ...(e.kind === 'capability' ? e.sections.flatMap(s => [s.title, ...s.items.flatMap(i => [i.name, i.description])]) : []),
@@ -535,10 +537,10 @@ function entryMarkdown(e: CatalogEntry): string {
     case 'relation':
       return [...head, `- ${e.from} → ${e.to}`].join('\n');
     case 'metric':
-      return [...head, `- 指标 ${code(e.key)}（第 ${e.version} 版），基础实体 ${e.base}，度量 ${code(e.measure)}`, `- 口径（系统生成）：${e.system.text}`,
+      return [...head, `- 指标 ${code(e.key)}（第 ${e.version} 版），基础实体 ${e.base}，度量 ${code(e.measure)}`, `- 口径（系统生成）：${e.system.text}`, `- 口径声明（系统生成）：${e.system.claims.map(claimPhrase).join('、')}`,
         ...(e.dimensions.length ? [`- 维度：${e.dimensions.map(code).join(', ')}`] : []), ...dependenciesMarkdown(e.dependencies)].join('\n');
     case 'tag':
-      return [...head, `- 标签 ${code(e.key)}（第 ${e.version} 版），取值 ${e.values.map(v => code(String(v))).join(', ')}`, `- 口径（系统生成）：${e.system.text}`,
+      return [...head, `- 标签 ${code(e.key)}（第 ${e.version} 版），取值 ${e.values.map(v => code(String(v))).join(', ')}`, `- 口径（系统生成）：${e.system.text}`, `- 口径声明（系统生成）：${e.system.claims.map(claimPhrase).join('、')}`,
         ...dependenciesMarkdown(e.dependencies)].join('\n');
     case 'template':
       return [...head, `- 模板 ${code(e.template)}（定义第 ${e.version} 版），读 ${e.entities.join(', ')}`, `- 参数：${code(JSON.stringify(e.params))}`,

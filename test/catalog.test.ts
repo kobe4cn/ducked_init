@@ -267,7 +267,13 @@ describe('语义目录', () => {
       kind: 'metric', id: 'metric:revenue', name: 'revenue', description: '已支付订单的消费金额', key: 'revenue', version: 2,
       base: 'entity:order', measure: 'sum(amount)', dimensions: [],
       dependencies: { metrics: [], entities: ['entity:order'], fields: ['field:order.amount', 'field:order.status'] },
-      system: { text: '订单中 status 等于 paid的行，amount 求和' },
+      system: {
+        text: '订单中 status 等于 paid的行，amount 求和',
+        claims: [
+          { type: 'unit', value: 'unknown' }, { type: 'currency', value: 'unknown' }, { type: 'tax_included', value: 'unknown' },
+          { type: 'refund_deducted', value: 'unknown' }, { type: 'time_meaning', value: 'unknown' },
+        ],
+      },
     });
     expect(expand(c, 'metric:store_orders')).toMatchObject({ measure: 'count()', dimensions: ['store'], description: '' });
     expect(expand(c, 'tag:spender')).toMatchObject({ values: ['high', 'low'], dependencies: { metrics: ['metric:revenue'], entities: [], fields: [] } });

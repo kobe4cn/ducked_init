@@ -1,4 +1,4 @@
-// app/components/knowledge-panel.tsx —— 业务知识面板（ADR-0046）：左边是系统事实（目录条目的只读内容与系统口径的空位），右边是成员写的知识
+// app/components/knowledge-panel.tsx —— 业务知识面板（ADR-0046）：左边是系统事实（目录条目的只读内容、系统口径文字与派生的口径声明），右边是成员写的知识
 // （待确认的知识提案、别名、口径声明、业务说明、分析主题）。提案可以接受、修改后接受、填理由拒绝。每个表单都带 intent 与 targetId，交给路由 action 里的 handleKnowledgeIntent；不能编辑时不渲染任何表单和按钮。
 // 需复核的知识配 amber 图标与「待复核」，生效的配 emerald。panel 为 null（定义从未发布过）时只提示发布后才能添加
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
@@ -8,7 +8,7 @@ import type { KnowledgePanel as Panel, PanelProposal } from '~/.server/knowledge
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
-import { CLAIM_TYPE_ORDER, CLAIM_TYPES, claimTypeLabel, claimValueLabel, isClaimType } from '~/lib/semantic-claims';
+import { CLAIM_TYPE_ORDER, CLAIM_TYPES, claimTypeLabel, claimValueLabel, isClaimType, type ClaimType } from '~/lib/semantic-claims';
 
 /** 一个面板表单：带上 intent 与 targetId */
 function KnowledgeForm({ intent, targetId, className, children }: { intent: string; targetId: string; className?: string; children: React.ReactNode }) {
@@ -27,6 +27,9 @@ function Status({ needsReview }: { needsReview: boolean }) {
     ? <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="size-3" />待复核</span>
     : <span className="inline-flex items-center gap-1 text-xs text-emerald-600"><CheckCircle2 className="size-3" />已生效</span>;
 }
+
+/** 一条口径声明的说法：「币种：人民币」。claimPhrase 在 .server 下进不了客户端，这里用同一套标签 */
+const phrase = (type: ClaimType, value: string) => `${claimTypeLabel(type)}：${claimValueLabel(type, value)}`;
 
 function Fact({ label, value }: { label: string; value: string }) {
   return (
@@ -55,7 +58,14 @@ function SystemFacts({ system }: { system: MetricEntry | TagEntry | null }) {
       </dl>
       <div>
         <h4 className="text-sm text-slate-500">系统口径</h4>
-        <p className="text-sm text-slate-400">系统扫描尚未生成</p>
+        {system ? (
+          <>
+            <p className="text-sm">{system.system.text}</p>
+            <ul className="mt-2 space-y-1">
+              {system.system.claims.map(c => <li key={c.type} data-system-claim={c.type} className="text-sm">{phrase(c.type, c.value)}</li>)}
+            </ul>
+          </>
+        ) : <p className="text-sm text-slate-400">—</p>}
       </div>
     </div>
   );
@@ -185,8 +195,8 @@ function Claims({ panel, targetId }: { panel: Panel; targetId: string }) {
         {CLAIM_TYPE_ORDER.map(type => {
           const claim = panel.claims.find(c => c.type === type);
           const text = claim?.needsReview
-            ? `${claimTypeLabel(type)}：${claimValueLabel(type, claim.value)}（待复核，原为 ${claimValueLabel(type, claim.previous ?? '')}）`
-            : `${claimTypeLabel(type)}：${claim ? claimValueLabel(type, claim.value) : '未声明'}`;
+            ? `${phrase(type, claim.value)}（待复核，原为 ${claimValueLabel(type, claim.previous ?? '')}）`
+            : (claim ? phrase(type, claim.value) : `${claimTypeLabel(type)}：未声明`);
           return (
             <li key={type} data-claim={claim ? type : undefined} className="flex flex-wrap items-center gap-3 text-sm">
               <span className={claim ? '' : 'text-slate-400'}>{text}</span>

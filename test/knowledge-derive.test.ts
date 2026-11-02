@@ -3,7 +3,9 @@
 // 同一份定义两次结果相同、键顺序不同的 yaml 结果相同（纯函数，不碰库）
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
-import { metricText, tagText } from '../app/.server/knowledge/derive';
+import { metricClaims, metricText, tagClaims, tagText, TIME_FIELDS } from '../app/.server/knowledge/derive';
+import { CANONICAL_ENTITIES } from '../app/lib/canonical-model';
+import { CLAIM_TYPE_ORDER } from '../app/lib/semantic-claims';
 import { AGGS, FILTER_OPS, type MetricSpec } from '../app/.server/pipeline/dsl/metric-spec';
 import { TAG_CONDITIONS, type TagSpec } from '../app/.server/pipeline/dsl/tag-spec';
 
@@ -103,5 +105,85 @@ describe('标签口径文字', () => {
     const b = 'default: 低\nmissing: { revenue: 0 }\nrules: [{ when: { lt: 1000, gte: 100 }, value: 高 }]\nmetric: revenue\n';
     expect(tag(a)).toBe(tag(a));
     expect(tag(b)).toBe(tag(a));
+  });
+});
+
+describe('系统口径声明', () => {
+  const spec = (yaml: string) => parse(yaml) as MetricSpec;
+  const claimsOf = (yaml: string) => Object.fromEntries(metricClaims(spec(yaml)).map(c => [c.type, c.value]));
+  const timeOf = (base: string, field?: string) =>
+    claimsOf(`base: ${base}\n${field ? `window: { field: ${field}, days: 30 }\n` : ''}measure: { agg: count }\n`).time_meaning;
+  const tagSpec = (yaml: string) => parse(yaml) as TagSpec;
+  const tagClaim = (yaml: string, metrics: Record<string, string>) =>
+    Object.fromEntries(tagClaims(tagSpec(yaml), new Map(Object.entries(metrics).map(([k, y]) => [k, spec(y)]))).map(c => [c.type, c.value]));
+
+  it('五项按登记表顺序，每项都有值，派生声明不带 previous / needsReview', () => {
+    const claims = metricClaims(spec('base: order\nmeasure: { agg: sum, field: amount }\n'));
+    expect(claims.map(c => c.type)).toEqual(CLAIM_TYPE_ORDER);
+    for (const c of claims) expect(Object.keys(c).sort()).toEqual(['type', 'value']);
+    const tc = tagClaims(tagSpec('metric: revenue\nrules: [{ value: 是, when: { gte: 1 } }]\ndefault: 否\n'), new Map());
+    expect(tc.map(c => c.type)).toEqual(CLAIM_TYPE_ORDER);
+  });
+
+  it('每种度量的单位：count / count_distinct → count，days_since → day，ratio → ratio，其余未知', () => {
+    const expected: Record<(typeof AGGS)[number], string> = {
+      count: 'count', count_distinct: 'count', sum: 'unknown', avg: 'unknown', min: 'unknown', max: 'unknown',
+      ratio: 'ratio', latest: 'unknown', earliest: 'unknown', days_since: 'day',
+    };
+    expect(Object.keys(expected).sort()).toEqual([...AGGS].sort());
+    for (const [agg, cases] of Object.entries(AGG_CASES)) {
+      for (const [measure] of cases) expect(claimsOf(`base: order\nmeasure: ${measure}\n`).unit, measure).toBe(expected[agg as (typeof AGGS)[number]]);
+    }
+  });
+
+  it('时间含义只来自 window.field 命中标准字段表', () => {
+    expect(timeOf('order', 'created_at')).toBe('order_time');
+    expect(timeOf('order', 'paid_at')).toBe('pay_time');
+    expect(timeOf('event', 'occurred_at')).toBe('event_time');
+    expect(timeOf('order', 'updated_at')).toBe('record_time');
+    expect(timeOf('customer', 'updated_at')).toBe('record_time');
+  });
+
+  it('扩展字段、自定义实体（含其 updated_at）、表外的标准字段、没有 window 都是未知', () => {
+    expect(timeOf('order', 'x_settle_at')).toBe('unknown');
+    expect(timeOf('custom_store', 'updated_at')).toBe('unknown');
+    expect(timeOf('custom_store', 'created_at')).toBe('unknown');
+    expect(timeOf('coupon', 'issued_at')).toBe('unknown');
+    expect(timeOf('order')).toBe('unknown');
+  });
+
+  it('币种、含税、扣退款永远未知：字段说明里写「元」也不算依据', () => {
+    const c = claimsOf('base: order\ndescription: 订单金额（元，含税，已扣退款）\nwindow: { field: paid_at, days: 30 }\nmeasure: { agg: sum, field: amount }\n');
+    expect(c).toEqual({ unit: 'unknown', currency: 'unknown', tax_included: 'unknown', refund_deducted: 'unknown', time_meaning: 'pay_time' });
+  });
+
+  it('时间字段表的每项都是标准实体的 timestamp 字段', () => {
+    expect(Object.keys(TIME_FIELDS).length).toBeGreaterThan(0);
+    for (const key of Object.keys(TIME_FIELDS)) {
+      const [entity, field] = key.split('.');
+      expect(CANONICAL_ENTITIES.find(e => e.name === entity)?.fields.find(f => f.name === field)?.type, key).toBe('timestamp');
+    }
+    for (const e of CANONICAL_ENTITIES) {
+      if (e.fields.some(f => f.name === 'updated_at')) expect(timeOf(e.name, 'updated_at'), e.name).toBe('record_time');
+    }
+  });
+
+  const PAID = 'base: order\nwindow: { field: paid_at, days: 30 }\nmeasure: { agg: sum, field: amount }\n';
+  const CREATED = 'base: order\nwindow: { field: created_at, days: 30 }\nmeasure: { agg: count }\n';
+
+  it('标签：单位不适用；单指标取被引用指标的时间含义，被引用指标不在本批时未知', () => {
+    const single = 'metric: revenue\nrules: [{ value: 高, when: { gte: 1000 } }]\ndefault: 低\n';
+    expect(tagClaim(single, { revenue: PAID })).toEqual({
+      unit: 'not_applicable', currency: 'unknown', tax_included: 'unknown', refund_deducted: 'unknown', time_meaning: 'pay_time',
+    });
+    expect(tagClaim(single, {}).time_meaning).toBe('unknown');
+  });
+
+  it('标签：多指标全部在本批且一致时取该值，有一个缺失或不一致时未知', () => {
+    const multi = 'rules:\n  - { value: 忠诚, when: { all: [{ metric: revenue, gte: 1000 }, { metric: orders, gte: 5 }] } }\ndefault: 普通\n';
+    expect(tagClaim(multi, { revenue: PAID, orders: PAID }).time_meaning).toBe('pay_time');
+    expect(tagClaim(multi, { revenue: PAID, orders: CREATED }).time_meaning).toBe('unknown');
+    expect(tagClaim(multi, { revenue: PAID }).time_meaning).toBe('unknown');
+    expect(tagClaim(multi, { revenue: 'base: order\nmeasure: { agg: count }\n', orders: 'base: order\nmeasure: { agg: count }\n' }).time_meaning).toBe('unknown');
   });
 });
