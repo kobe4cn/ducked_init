@@ -35,7 +35,7 @@ afterAll(async () => { await closeDb(); });
 beforeAll(async () => {
   await resetDb();
   ({ acme, sources: { crm, loyalty } } = await publishedIdentitySources({ orders: true }));
-});
+}, 180_000); // 两个数据源同步、发布、打通加订单，并行跑满时会超过默认 hookTimeout 60 s
 
 // 消费者（打通组）：crm 1 + 会员 1 + u1；crm 2 + 会员 2 + u2；crm 3 + 会员 3；crm 4；会员 4；crm 5、crm 6 + 会员 5；crm 7 + 会员 6；u9。as_of 2024-07-01
 describe('gold.cohort / gold.repurchase：每个统一消费者一行，交给页面再聚合', () => {

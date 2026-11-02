@@ -168,7 +168,8 @@ describe('给模型的表上下文', () => {
     const sent = JSON.stringify(samples);
     expect(sent).not.toContain('@example.com');
     expect(sent).not.toContain('消费者');
-    expect(sent).not.toMatch(/138\d{8}/);
+    // 样本里其余列是 64 位十六进制哈希，会碰巧含有 138 加 8 位数字；只认前后不是十六进制字符的明文手机号
+    expect(sent).not.toMatch(/(?<![0-9a-f])138\d{8}(?![0-9a-f])/);
   });
 
   it('打开发送样本但表还没同步时只有结构，不报错', async () => {
