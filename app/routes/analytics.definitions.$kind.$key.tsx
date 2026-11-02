@@ -4,20 +4,25 @@
 // 有草稿且有已发布版本时可以预览发布的影响：指标与受影响的下游标签按两版结果对比的消费者计数（只读挂载上按今天算，不出消费者 ID）。
 // 发布过的定义显示最近一次刷新的时间与来源；有发布权限的成员可以按今天以生效版本重新计算，有早于生效版本的未过期快照时可以按各自的统计日以生效版本回刷
 // （都连同下游标签），没有权限时说明原因。
-// 有修改与删除权限的成员可以删除定义（被已发布标签引用的指标删不了）
+// 有修改与删除权限的成员可以删除定义（被已发布标签引用的指标删不了）。
+// 已发布过的定义带业务知识面板（ADR-0046）：alias.* / claim.* / note.* / subject.* 的提交交给 handleKnowledgeIntent，权限由领域函数检查，查看者看得到、提交 403
 import { AlertTriangle, CheckCircle2, Lock, RefreshCw, Trash2 } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.$kind.$key';
 import { can, deniedReason, requirePermission } from '~/.server/access';
+import { catalogFor } from '~/.server/assistant/tools';
+import { expand } from '~/.server/catalog';
 import {
   backfillDefinition, deleteDefinition, discardDslDraft, DslError, getDefinition, impactOf, previewDefinition, publishDefinition, recomputeDefinition, saveDslDraft,
 } from '~/.server/dsl-definitions';
+import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
 import { navFor } from '~/.server/nav';
 import { UNLINKED } from '~/.server/pipeline/dsl/metric-spec';
 import { publishReason } from '~/.server/publish-rules';
 import { triggerLabel } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
+import { KnowledgePanel } from '~/components/knowledge-panel';
 import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
 import { PageHeader } from '~/components/page-header';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
@@ -38,6 +43,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     throw e;
   }
   const search = new URL(request.url).searchParams;
+  const targetId = `${d.kind}:${d.key}`;
+  const entry = d.published ? expand(await catalogFor(member), targetId) : null;
   return {
     email: member.email,
     nav: navFor(member),
@@ -65,6 +72,11 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     /** 编辑框里的 YAML：最新一版（有草稿时是草稿） */
     yaml: d.versions[0]!.yaml,
     published: d.published?.version ?? null,
+    targetId,
+    /** 业务知识面板；从未发布过时为 null（知识只能挂在已发布的定义上） */
+    panel: d.published ? await knowledgePanel(member, targetId) : null,
+    /** 面板里的系统事实：目录条目 */
+    system: entry?.kind === 'metric' || entry?.kind === 'tag' ? entry : null,
     compiled: d.compiled,
     /** 维度关联不到时的取值，预览结果里淡显 */
     unlinked: UNLINKED,
@@ -87,6 +99,11 @@ export async function action({ request, params }: Route.ActionArgs) {
   const yaml = String(form.get('yaml') ?? '');
   const intent = String(form.get('intent') ?? '');
   const page = `/analytics/definitions/${params.kind}/${params.key}`;
+  if (isKnowledgeIntent(intent)) {
+    const result = await handleKnowledgeIntent(await requirePermission(request, 'definitions:read'), form);
+    if ('error' in result) return data({ error: null, issues: [], yaml: null, preview: null, impact: null, knowledgeError: result.error }, { status: result.status });
+    throw redirect(page);
+  }
   try {
     switch (intent) {
       case 'save': {
@@ -152,7 +169,7 @@ function PublishAction({ denied, intent, disabled, children }: { denied: string 
 export default function Definition({ loaderData, actionData }: Route.ComponentProps) {
   const {
     email, nav, canDraft, canDelete, dependents, justSaved, justPublished, justBackfilled, justRecomputed, backfill, lastRefresh, publishDenied,
-    kind, key, label, yaml, published, compiled, unlinked, versions,
+    kind, key, label, yaml, published, compiled, unlinked, versions, targetId, panel, system,
   } = loaderData;
   const navigation = useNavigation();
   const submitting = navigation.state === 'submitting';
@@ -374,6 +391,11 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
           </div>
         </div>
       )}
+
+      <KnowledgePanel
+        panel={panel} system={system} targetId={targetId}
+        error={actionData && 'knowledgeError' in actionData ? actionData.knowledgeError : null}
+      />
 
       <div className="rounded-2xl border bg-white p-6 shadow-sm">
         <h2 className="mb-4 font-medium">版本</h2>
