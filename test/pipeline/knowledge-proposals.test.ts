@@ -64,9 +64,9 @@ async function draftContext(analyst: Awaited<ReturnType<typeof setup>>['analyst'
 describe('知识提案', () => {
   it('提案接受前不进目录、检索与起草上下文，接受后才进；指纹相同返回已有的那条，命中已拒绝的返回 null 且不写入；目标或声明不合法 400', async () => {
     const { acme, analyst, mappings } = await setup();
-    const alias = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'alias', claim: { alias: '流水暗号' } }))!;
-    const claim = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'claim', claim: { type: 'currency', value: 'USD' } }))!;
-    const note = (await propose(acme, { targetId: 'field:order.status', kind: 'note', claim: { note: '退款单也算一笔订单，状态记为 refunded' } }))!;
+    const alias = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'alias', content: { alias: '流水暗号' } }))!;
+    const claim = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'claim', content: { type: 'currency', value: 'USD' } }))!;
+    const note = (await propose(acme, { targetId: 'field:order.status', kind: 'note', content: { note: '退款单也算一笔订单，状态记为 refunded' } }))!;
     expect(alias).toMatchObject({ status: 'proposed', kind: 'alias', evidence: EVIDENCE, generatorVersion: GEN, basedOn: [{ id: 'metric:paid_revenue' }] });
 
     let c = await tenantCatalog(acme);
@@ -78,21 +78,21 @@ describe('知识提案', () => {
     expect(before).not.toContain('流水暗号');
 
     // 同样的提案再次提出：返回已有的那条，不写入（声明里多余的键不影响指纹）
-    expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'alias', claim: { alias: '流水暗号', extra: 1 }, generatorVersion: 'other' })).toMatchObject({ id: alias.id });
+    expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'alias', content: { alias: '流水暗号', extra: 1 }, generatorVersion: 'other' })).toMatchObject({ id: alias.id });
     await rejectProposal(analyst, claim.id, '币种不对');
-    expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'claim', claim: { type: 'currency', value: 'USD' } })).toBeNull();
+    expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'claim', content: { type: 'currency', value: 'USD' } })).toBeNull();
     expect(await proposalRows(acme)).toHaveLength(3);
 
     // 不合法的提案 400、不写入
     const bad: Parameters<typeof propose>[1][] = [
-      { targetId: 'metric:nope', kind: 'alias', claim: { alias: 'x' } },
-      { targetId: 'field:customer.phone', kind: 'note', claim: { note: 'x' } },
-      { targetId: 'field:order.status', mappingId: mappings.tracking, kind: 'alias', claim: { alias: 'x' } },
-      { targetId: 'entity:order', kind: 'alias', claim: { alias: '  ' } },
-      { targetId: 'entity:order', kind: 'claim', claim: { type: 'currency', value: 'XYZ' } },
-      { targetId: 'entity:order', kind: 'note', claim: { note: 1 } },
-      { targetId: 'entity:order', kind: 'subject' as never, claim: {} },
-      { targetId: 'entity:order', kind: 'alias', claim: { alias: 'x' }, evidence: [{ ref: '' }] },
+      { targetId: 'metric:nope', kind: 'alias', content: { alias: 'x' } },
+      { targetId: 'field:customer.phone', kind: 'note', content: { note: 'x' } },
+      { targetId: 'field:order.status', mappingId: mappings.tracking, kind: 'alias', content: { alias: 'x' } },
+      { targetId: 'entity:order', kind: 'alias', content: { alias: '  ' } },
+      { targetId: 'entity:order', kind: 'claim', content: { type: 'currency', value: 'XYZ' } },
+      { targetId: 'entity:order', kind: 'note', content: { note: 1 } },
+      { targetId: 'entity:order', kind: 'subject' as never, content: {} },
+      { targetId: 'entity:order', kind: 'alias', content: { alias: 'x' }, evidence: [{ ref: '' }] },
     ];
     for (const input of bad) await expect(propose(acme, input), JSON.stringify(input)).rejects.toMatchObject({ status: 400 });
     expect(await proposalRows(acme)).toHaveLength(3);
@@ -112,11 +112,11 @@ describe('知识提案', () => {
   it('接受（可以先改值）生成别名、口径声明、业务说明，作者是接受的成员，提案关联到生成的知识并记审计与目录版本；拒绝记理由与审计', async () => {
     const { acme, author, analyst, orderMappings } = await setup();
     const loyalty = orderMappings!.loyalty;
-    const alias = (await propose(acme, { targetId: 'entity:order', kind: 'alias', claim: { alias: '交易单' } }))!;
-    const claim = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'claim', claim: { type: 'currency', value: 'USD' } }))!;
-    const fieldNote = (await propose(acme, { targetId: 'field:order.status', mappingId: loyalty, kind: 'note', claim: { note: '会员单的状态' } }))!;
-    const tagNote = (await propose(acme, { targetId: 'tag:spender', kind: 'note', claim: { note: '高消费人群' } }))!;
-    const rejected = (await propose(acme, { targetId: 'entity:order', kind: 'alias', claim: { alias: '暗号' } }))!;
+    const alias = (await propose(acme, { targetId: 'entity:order', kind: 'alias', content: { alias: '交易单' } }))!;
+    const claim = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'claim', content: { type: 'currency', value: 'USD' } }))!;
+    const fieldNote = (await propose(acme, { targetId: 'field:order.status', mappingId: loyalty, kind: 'note', content: { note: '会员单的状态' } }))!;
+    const tagNote = (await propose(acme, { targetId: 'tag:spender', kind: 'note', content: { note: '高消费人群' } }))!;
+    const rejected = (await propose(acme, { targetId: 'entity:order', kind: 'alias', content: { alias: '暗号' } }))!;
 
     const a = await expectBump(acme, 'alias.added', () => acceptProposal(analyst, alias.id, { alias: '交易订单' }));
     const b = await expectBump(acme, 'semantic_claim.saved', () => acceptProposal(analyst, claim.id));
@@ -127,7 +127,7 @@ describe('知识提案', () => {
     expect((await latestVersion(acme))!.version).toBe(before);
 
     // 改过值的：生成的知识用改后的值，提案的声明与指纹不变
-    expect(a).toMatchObject({ status: 'accepted', reviewedByEmail: 'an@acme.com', claim: { alias: '交易单' }, fingerprint: alias.fingerprint });
+    expect(a).toMatchObject({ status: 'accepted', reviewedByEmail: 'an@acme.com', content: { alias: '交易单' }, fingerprint: alias.fingerprint });
     expect(a.reviewedAt).toBeInstanceOf(Date);
     const [aliasRow] = await getDb().select().from(knowledgeAliases).where(eq(knowledgeAliases.id, a.acceptedRef!));
     expect(aliasRow).toMatchObject({ tenantId: acme, targetId: 'entity:order', alias: '交易订单', createdByEmail: 'an@acme.com' });
@@ -139,8 +139,8 @@ describe('知识提案', () => {
     expect(tagRow).toMatchObject({ targetId: 'tag:spender', note: '近一年高消费人群', createdByEmail: 'an@acme.com' });
     expect(r).toMatchObject({ status: 'rejected', rejectedReason: '不是这个意思', reviewedByEmail: 'an@acme.com', acceptedRef: null });
     // 别名与业务说明先去首尾空白再算指纹：拒绝过「暗号」，再提「 暗号 」也不再提出；业务说明同理
-    expect(await propose(acme, { targetId: 'entity:order', kind: 'alias', claim: { alias: ' 暗号 ' } })).toBeNull();
-    expect(await propose(acme, { targetId: 'tag:spender', kind: 'note', claim: { note: ' 高消费人群\n' } })).toMatchObject({ id: tagNote.id });
+    expect(await propose(acme, { targetId: 'entity:order', kind: 'alias', content: { alias: ' 暗号 ' } })).toBeNull();
+    expect(await propose(acme, { targetId: 'tag:spender', kind: 'note', content: { note: ' 高消费人群\n' } })).toMatchObject({ id: tagNote.id });
 
     const c = await tenantCatalog(acme);
     expect(expand(c, 'entity:order')).toMatchObject({ knowledge: { aliases: ['交易订单'] } });
@@ -160,13 +160,13 @@ describe('知识提案', () => {
 
   it('依据已变化时接受 409，已处理的再处理 409，不存在或别的租户的 404；查看者 403，分析师处理映射字段提案 403；生成知识出错时提案仍待处理', async () => {
     const { acme, author, reviewer, analyst, viewer, orderMappings } = await setup();
-    const stale = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'alias', claim: { alias: '营收' } }))!;
+    const stale = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'alias', content: { alias: '营收' } }))!;
     await saveDslDraft(analyst, 'metric', 'paid_revenue', 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 新口径\n');
     await publishDefinition(reviewer, 'metric', 'paid_revenue', 2);
     await expect(acceptProposal(analyst, stale.id)).rejects.toMatchObject({ status: 409, message: '依据已变化' });
 
-    const mapped = (await propose(acme, { targetId: 'field:order.status', mappingId: orderMappings!.loyalty, kind: 'alias', claim: { alias: '会员单状态' } }))!;
-    const plain = (await propose(acme, { targetId: 'entity:order', kind: 'alias', claim: { alias: '交易单' } }))!;
+    const mapped = (await propose(acme, { targetId: 'field:order.status', mappingId: orderMappings!.loyalty, kind: 'alias', content: { alias: '会员单状态' } }))!;
+    const plain = (await propose(acme, { targetId: 'entity:order', kind: 'alias', content: { alias: '交易单' } }))!;
     await expect(acceptProposal(viewer, plain.id)).rejects.toMatchObject({ init: { status: 403 } });
     await expect(rejectProposal(viewer, plain.id, 'x')).rejects.toMatchObject({ init: { status: 403 } });
     await expect(acceptProposal(analyst, mapped.id)).rejects.toMatchObject({ init: { status: 403 } });

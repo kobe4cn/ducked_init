@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { definitionHash, planHash, stableJson } from '../app/.server/knowledge/basis';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
+import { proposalFingerprint } from '../app/.server/knowledge/proposals';
 
 const plan = (over: Partial<MergeMappingParam> = {}): MergeMappingParam => ({
   mapping: 'm-order', version: 3, sourceId: 's-shop', entity: 'order', table: 'orders',
@@ -18,6 +19,16 @@ describe('依据摘要', () => {
     expect(stableJson({ b: 1, a: { d: [2, 1], c: null } })).toBe(stableJson({ a: { c: null, d: [2, 1] }, b: 1 }));
     expect(stableJson({ a: { c: null, d: [2, 1] }, b: 1 })).toBe('{"a":{"c":null,"d":[2,1]},"b":1}');
     expect(stableJson([1, 2])).not.toBe(stableJson([2, 1]));
+  });
+
+  it('提案指纹：改名为 content 后对同样输入不变', () => {
+    // 写死的哈希在改名前的代码上算出：sha256(stableJson({ targetId, mappingId, kind, claim, basedOn }))
+    expect(proposalFingerprint({ targetId: 'metric:x', mappingId: null, kind: 'alias', content: { alias: '营收' }, basedOn: [] }))
+      .toBe('32381770ecabeb2857c73f142bbfe8ea722ea7e2dbaf559226069e000794555c');
+    expect(proposalFingerprint({
+      targetId: 'field:order.amount', mappingId: '00000000-0000-0000-0000-000000000001', kind: 'claim',
+      content: { type: 'time_basis', value: 'paid_at' }, basedOn: [{ id: 'metric:x', hash: 'abc' }],
+    })).toBe('97fd4d9f0e6134283c7188ae6601987b35a33989142ab7389ddd6023cc60f66c');
   });
 
   it('指标与标签的摘要：同一份 YAML 不变，内容一改就变', () => {

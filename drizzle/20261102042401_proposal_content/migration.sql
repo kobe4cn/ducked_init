@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."knowledge_proposals" RENAME COLUMN "claim" TO "content";
