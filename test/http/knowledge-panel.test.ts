@@ -251,7 +251,7 @@ const panelFor = (html: string, targetId: string) =>
 const pageOf = async (browser: Awaited<ReturnType<typeof loginAs>>, path: string) => decode(await (await browser.get(path)).text());
 
 describe('字段抽屉与自定义实体详情页里的业务知识面板', () => {
-  it('分析师在字段抽屉里编辑实体与普通字段的知识：实体面板列字段与关系，字段面板没有说明区、有类型与来源，敏感字段没有面板', async () => {
+  it('分析师在字段抽屉里编辑实体与普通字段的知识：实体面板列字段与关系，字段面板没有说明区、有类型、枚举与来源，敏感字段没有面板', async () => {
     const { acme } = await setup();
     const an = await loginAs(app, 'an@acme.com');
 
@@ -276,7 +276,8 @@ describe('字段抽屉与自定义实体详情页里的业务知识面板', () =
     expect(html).toContain('data-field-knowledge="customer_id"');
     expect(field).toContain('name="intent" value="claim.save"');
     expect(field).not.toContain('value="note.save"');
-    expect(field).toContain('string');
+    expect(field).toMatch(/类型[\s\S]*?string/);
+    expect(field).not.toContain('枚举');
     expect(field).toContain('data-field-lineage');
     expect(html).toContain('href="/lineage?node=customer"');
 
@@ -285,6 +286,10 @@ describe('字段抽屉与自定义实体详情页里的业务知识面板', () =
     expect(saved.headers.get('location')).toBe(page);
     expect((await knowledgeOf(acme, 'field:customer.customer_id'))).toMatchObject({ claims: [{ type: 'unit', value: 'count' }] });
     expect(panelFor(await pageOf(an, page), 'field:customer.customer_id')).toContain('data-claim="unit"');
+
+    const status = panelFor(await pageOf(an, '/lineage?node=order&field=status'), 'field:order.status');
+    expect(status).toContain('枚举');
+    expect(status).toContain('created、paid、shipped、completed、cancelled、refunded');
 
     html = await pageOf(an, '/lineage?node=customer&field=email');
     expect(html).toContain('data-field-knowledge="email"');
