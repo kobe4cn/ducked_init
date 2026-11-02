@@ -7,7 +7,7 @@
 //                    `Sandcastle`，父票去掉）；要人拍板 → 打 sandcastle:stuck。
 //   Phase 1 (Plan):  脚本自己算（不用 agent）：只看 `Sandcastle` + `sandcastle:prepped`、且没有
 //                    pr-open / stuck 的票，排除仍有未关闭 blocker 的票；剩下的按编号从小到大，
-//                    和已选的票改同一个文件（指引的 Change 行）就跳过。
+//                    和已选的票或等人审（pr-open）的票改同一个文件（指引的 Change 行）就跳过。
 //   Phase 2 (Build): 每张票一个沙箱，从 origin/main 建分支：implementer（每次迭代
 //                    都是全新的 Claude 会话）→ reviewer（给出 merge / revise / pr 结论；revise
 //                    时把修改意见交给新的 implementer 会话改完再审，最多 REVISE_MAX 次）→
@@ -263,7 +263,8 @@ const changedFiles = (body: string) =>
 
 /**
  * 能在 main 上开工、且可以并行的票，按编号从小到大，最多 MAX_PARALLEL 张。
- * blocker 没关（包括已开 PR 未合并）的跳过；和已选的票改同一个文件的跳过，所以冲突时总是编号小的先做。
+ * blocker 没关（包括已开 PR 未合并）的跳过；和已选的票、或等人审（pr-open）的票改同一个文件的跳过，
+ * 所以冲突时总是编号小的先做，等人审的 PR 合入或关闭前不会有第二个 PR 改同一个文件。
  * 被 blocker 挡住的票不占文件，不会连带挡住编号大的票。
  */
 function plan(): Issue[] {
@@ -282,7 +283,20 @@ function plan(): Issue[] {
     }
     return states.get(n) === "OPEN";
   };
+  // 等人审的 PR 还没合进 main：它们改的文件先占上，免得新票在旧 main 上改同一个文件，两个 PR 互相冲突。
+  const waiting: { number: number; body: string }[] = JSON.parse(
+    sh("gh", [
+      "issue", "list", "--state", "open", "--limit", "100",
+      "--search", `${q(LABEL.picked)} ${q(LABEL.prOpen)}`,
+      "--json", "number,body",
+    ]),
+  );
   const taken = new Map<string, number>();
+  const awaitingReview = new Set<number>();
+  for (const w of waiting.sort((a, b) => a.number - b.number)) {
+    awaitingReview.add(w.number);
+    for (const f of changedFiles(w.body)) if (!taken.has(f)) taken.set(f, w.number);
+  }
   const picked: Issue[] = [];
   for (const issue of candidates.filter((c) => allowed(c.number)).sort((a, b) => a.number - b.number)) {
     const open = blockersOf(issue.body).filter(isOpen);
@@ -294,7 +308,9 @@ function plan(): Issue[] {
     if (files.length === 0) console.warn(`  ⚠ #${issue.number} 的指引里没认出 Change 行，按不改已有文件处理`);
     const clash = files.find((f) => taken.has(f));
     if (clash) {
-      console.log(`  跳过 #${issue.number}：和 #${taken.get(clash)} 都改 ${clash}`);
+      const owner = taken.get(clash)!;
+      const why = awaitingReview.has(owner) ? `等人审的 #${owner}（PR 合入或关闭后再做）` : `#${owner}`;
+      console.log(`  跳过 #${issue.number}：和${why}都改 ${clash}`);
       continue;
     }
     if (picked.length >= MAX_PARALLEL) break;
