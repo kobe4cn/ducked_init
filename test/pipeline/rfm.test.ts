@@ -74,7 +74,7 @@ describe('gold.rfm：基于打通后的消费者计算 RFM', () => {
     ];
     expect(rows).toEqual(expected.sort((a, b) => a.consumer_id.localeCompare(b.consumer_id)));
     expect(consumerOf(crm, '6')).toBe(consumerOf(crm, '5'));
-  });
+  }, 180_000); // 夹具同步、发布三个数据源并跑完打通与 gold 快照：本地单跑约 31–34 s，并行加压时约 35–49 s，完整测试跑满时会超过默认的 90 s
 
   it('同一份定义、同一个 as_of 重复运行，两张快照表的内容完全一致', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
@@ -86,7 +86,7 @@ describe('gold.rfm：基于打通后的消费者计算 RFM', () => {
     const [x, y] = [await readLake(acme, a), await readLake(acme, b)];
     expect(x.rows.length).toBeGreaterThan(0);
     expect(y.text).toBe(x.text);
-  });
+  }, 180_000); // 夹具同步、发布三个数据源并跑完打通与 gold 快照：本地单跑约 31–34 s，并行加压时约 35–49 s，完整测试跑满时会超过默认的 90 s
 
   it('会员订单声明 customer_id 属于 CRM 后，按 CRM 的消费者记录算进 RFM 与订单关联断言，不算孤儿', async () => {
     const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
@@ -122,7 +122,7 @@ describe('gold.rfm：基于打通后的消费者计算 RFM', () => {
       { consumer_id: consumerOf('5'), recency_days: 6, frequency: 4, monetary: '1550.00' },
       { consumer_id: consumerOf('7'), recency_days: 21, frequency: 1, monetary: '60.00' },
     ].sort((a, b) => a.consumer_id.localeCompare(b.consumer_id)));
-  });
+  }, 180_000); // 夹具同步、发布三个数据源并跑完打通与 gold 快照：本地单跑约 31–34 s，并行加压时约 35–49 s，完整测试跑满时会超过默认的 90 s
 
   it('老湖的订单表还没有 _customer_source、也没重新合并时，gold.rfm 与 gold.dsl 开头补列后照常算', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
@@ -144,7 +144,7 @@ describe('gold.rfm：基于打通后的消费者计算 RFM', () => {
     if (!checked.ok) throw new Error(JSON.stringify(checked.issues));
     const dsl = await runTask(acme, 'gold.dsl', { kind: 'metric', key: 'orders', asOf: '2024-07-01', sql: compileMetric(checked.spec, ctx, '2024-07-01'), entities: ['order'] });
     expect(dsl).toMatchObject({ status: 'succeeded', result: { rows: 5 } });
-  });
+  }, 180_000); // 夹具同步、发布三个数据源并跑完打通与 gold 快照：本地单跑约 31–34 s，并行加压时约 35–49 s，完整测试跑满时会超过默认的 90 s
 
   it('标准层还没有订单时任务失败并说明原因；参数不合法时任务失败', async () => {
     const acme = await newTenant('acme');
