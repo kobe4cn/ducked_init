@@ -90,7 +90,7 @@ describe('口径声明', () => {
       await saveClaimTx(tx, analyst, { targetId: 'entity:order', type: 'time_meaning', value: 'order_time' });
     });
     expect(expand(await tenantCatalog(acme), 'entity:order')).toMatchObject({ knowledge: { claims: [{ type: 'time_meaning', value: 'order_time' }] } });
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 
   it('保存记审计 semantic_claim.saved，detail 为 {targetId, mappingId, type}；based_on 是依据摘要', async () => {
     const { acme, author, analyst, orderMappings } = await setup();
@@ -115,7 +115,7 @@ describe('口径声明', () => {
       [b]: [{ id: `mapping:${loyalty}`, hash: planHash(plan) }],
       [c]: [],
     });
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 
   it('类型或取值不在登记表里、目标不合法（含敏感字段）时 400 且不留记录；查看者 403，分析师给映射字段保存 403', async () => {
     const { acme, author, analyst, viewer, mappings, orderMappings } = await setup();
@@ -149,5 +149,5 @@ describe('口径声明', () => {
     expect(await claimRows(acme)).toEqual([]);
     expect(await audits(acme)).toEqual([]);
     expect((await latestVersion(acme))!.version).toBe(before);
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 });
