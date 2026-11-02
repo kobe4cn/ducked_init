@@ -517,6 +517,81 @@ async function rebaseAndMerge(issue: Issue, pr: string): Promise<{ ok: true } | 
 }
 
 // ---------------------------------------------------------------------------
+// 用量限额：等到重置后接着跑，不当成票的失败
+// ---------------------------------------------------------------------------
+
+const LIMIT_PATTERN = /hit your .*?limit/i; // claude-code 的报错，如「You've hit your 5-hour limit · resets 6:20am (UTC)」
+const LIMIT_RESUME_SLACK_MS = 2 * 60_000; // 重置时间之后再多等一会儿
+const LIMIT_FALLBACK_WAIT_MS = 30 * 60_000; // 认不出重置时间时每次等这么久再试
+
+/** 某时刻在 timeZone 里比 UTC 快多少毫秒；timeZone 不合法时抛 RangeError。 */
+function tzOffsetMs(at: number, timeZone: string) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric",
+    }).formatToParts(at).map((p) => [p.type, Number(p.value)]),
+  );
+  const wall = Date.UTC(parts.year!, parts.month! - 1, parts.day!, parts.hour!, parts.minute!);
+  return Math.round((wall - at) / 60_000) * 60_000;
+}
+
+/**
+ * 报错里的「resets 6:20am (UTC)」→ 下一次到这个钟点的时刻；认不出返回 null。
+ * 只认钟点：带日期的（每周限额）可能算早，醒来再撞上限额会重新等，代价是多一次失败的调用。
+ */
+function limitResetAt(message: string, now = Date.now()): number | null {
+  const m = /resets\b.*?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)/i.exec(message);
+  if (!m) return null;
+  const hour = (Number(m[1]) % 12) + (m[3]!.toLowerCase() === "pm" ? 12 : 0);
+  const minute = Number(m[2] ?? 0);
+  const timeZone = m[4]!.trim();
+  try {
+    const today = new Date(now + tzOffsetMs(now, timeZone));
+    for (let day = 0; day <= 1; day++) {
+      const wall = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + day, hour, minute);
+      const at = wall - tzOffsetMs(wall, timeZone);
+      if (at > now) return at;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/** 分步睡：笔记本合盖时计时器会停，醒来按墙上时间判断。 */
+async function sleepUntil(at: number) {
+  while (Date.now() < at) await sleep(Math.min(60_000, at - Date.now()));
+}
+
+/**
+ * 跑 fn，撞上用量限额就等到重置后重跑；其他错误照抛。
+ * fn 要能从头重跑：prep / plan 本来就幂等；build 重跑时在原分支上接着做（implementer 先看已有提交）。
+ * onLimit 在等之前调用，比如把分支推到远端。
+ */
+async function untilAfterLimit<T>(what: string, fn: () => Promise<T>, onLimit?: () => void): Promise<T> {
+  for (;;) {
+    try {
+      return await fn();
+    } catch (e) {
+      const message = String(e);
+      if (!LIMIT_PATTERN.test(message)) throw e;
+      onLimit?.();
+      const resetAt = limitResetAt(message);
+      const until = resetAt === null ? Date.now() + LIMIT_FALLBACK_WAIT_MS : resetAt + LIMIT_RESUME_SLACK_MS;
+      const why = resetAt === null ? `认不出重置时间（${message.slice(0, 200)}），` : "";
+      console.log(`  ⏸ ${what} 撞上用量限额，${why}等到 ${new Date(until).toLocaleString()} 再接着跑`);
+      await sleepUntil(until);
+    }
+  }
+}
+
+/** 分支上已有提交时推到远端，免得只留在宿主机上。 */
+function pushIfAhead(issue: Issue) {
+  const ahead = trySh("git", ["rev-list", "--count", `${BASE_REF}..${issue.branch}`]);
+  if (ahead.ok && Number(ahead.out) > 0) trySh("git", ["push", "--force-with-lease", "-u", REMOTE, issue.branch]);
+}
+
+// ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
@@ -532,7 +607,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   ).filter((issue) => allowed(issue.number));
   for (const issue of toPrep) {
     console.log(`Prep #${issue.number}: ${issue.title}`);
-    await sandcastle.run({
+    await untilAfterLimit(`prep #${issue.number}`, () => sandcastle.run({
       sandbox: podman(),
       name: `prep-${issue.number}`,
       maxIterations: 1,
@@ -542,11 +617,11 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         TASK_ID: issue.number, LABEL_PICKED: LABEL.picked, LABEL_PREPPED: LABEL.prepped, LABEL_STUCK: LABEL.stuck,
         REPREP_MARK,
       },
-    });
+    }));
   }
 
   // Phase 1: Plan
-  const plan = await sandcastle.run({
+  const plan = await untilAfterLimit("plan", () => sandcastle.run({
     sandbox: podman(),
     name: "planner",
     maxIterations: 1,
@@ -556,7 +631,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       QUERY: `${q(LABEL.picked)} ${q(LABEL.prepped)} ${notIn(LABEL.prOpen, LABEL.stuck)}`,
     },
     output: sandcastle.Output.object({ tag: "plan", schema: planSchema }),
-  });
+  }));
 
   const issues = plan.output.issues.filter((issue) => allowed(issue.id)).slice(0, MAX_PARALLEL);
   if (issues.length === 0) {
@@ -575,7 +650,10 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   for (const issue of issues) console.log(`  #${issue.id}: ${issue.title} → ${issue.branch}`);
 
   // Phase 2: Build
-  const settled = await Promise.allSettled(issues.map(build));
+  // 撞上限额的票等重置后在原分支上重跑，不打 stuck。
+  const settled = await Promise.allSettled(
+    issues.map((issue) => untilAfterLimit(`#${issue.id}`, () => build(issue), () => pushIfAhead(issue))),
+  );
 
   // Phase 3: Land —— 在宿主机上逐个做：用宿主机的 git / gh 凭据，沙箱没有写仓库的权限。
   for (const [i, outcome] of settled.entries()) {
@@ -663,7 +741,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       : { ok: false as const, out: `本票的 drizzle 迁移没有接在 ${BASE_REF} 最新的迁移后面。` };
     if (!merged.ok) {
       console.log(`  ↻ #${issue.id} 没能直接合并，rebase 到最新的 ${BASE_REF} 后重试`);
-      const retry = await rebaseAndMerge(issue, pr);
+      const retry = await untilAfterLimit(`rebase #${issue.id}`, () => rebaseAndMerge(issue, pr));
       if (!retry.ok) {
         leaveForHuman(issue, pr, `合并失败：${merged.out.slice(0, 300)}\n\nrebase 后重试也没成：${retry.reason}`);
         console.log(`  ◐ #${issue.id} 合并失败，留 PR #${pr}`);
