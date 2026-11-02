@@ -109,7 +109,7 @@ function testEnv(issueId: string): Record<string, string> {
 // 关沙箱后回收这张票的测试资源（scripts/drop-test-resources.ts：PG 库与租户角色、MySQL / MongoDB 库、对象存储前缀与账号）。
 // 每次关沙箱都收，不等票合并：再跑这张票（revise、rebase）时 global-setup 与夹具会重新建库。
 // 在宿主机上跑，连接取自宿主机的 .env / .env.test（不做 host.containers.internal 替换）；异步执行，不卡住并行的另一张票。
-// 回收失败只打日志，不影响票的结果；留下的可以之后 `pnpm sandcastle:cleanup -- --all` 补收。
+// 回收失败只打日志，不影响票的结果；留下的可以之后 `pnpm sandcastle:cleanup --all` 补收。
 async function dropTestResources(issueId: string) {
   const args = ["--env-file-if-exists=.env", "--env-file-if-exists=.env.test", "--import", "tsx", "scripts/drop-test-resources.ts", `_i${issueId}`];
   try {
@@ -117,7 +117,7 @@ async function dropTestResources(issueId: string) {
     console.log(`  🧹 #${issueId} ${stdout.trim().split("\n").slice(1).join("；")}`);
   } catch (e) {
     const { stdout, stderr } = e as { stdout?: string; stderr?: string };
-    console.warn(`  ⚠ #${issueId} 测试资源回收失败（之后可用 pnpm sandcastle:cleanup -- _i${issueId} 补收）：${(stderr || stdout || String(e)).trim().slice(0, 500)}`);
+    console.warn(`  ⚠ #${issueId} 测试资源回收失败（之后可用 pnpm sandcastle:cleanup _i${issueId} 补收）：${(stderr || stdout || String(e)).trim().slice(0, 500)}`);
   }
 }
 
