@@ -420,7 +420,7 @@ type ServedFixture = Awaited<ReturnType<typeof servedTenant>>;
 
 describe('点查接口', () => {
   let shared: ServedFixture;
-  beforeAll(async () => { shared = await sharedServed(); });
+  beforeAll(async () => { shared = await sharedServed(); }, 180_000); // 共用的点查夹具（打通、RFM、发布指标与标签、生成服务库），并行跑满时超过默认 hookTimeout 60 s
 
   it('从当前服务库返回标签、指标（带维度）、RFM 与快照信息；退役的旧 ID 换成现在的 ID；没有这个人 404；没有明文', async () => {
     const { store, consumer, merged, key } = shared;
@@ -450,7 +450,7 @@ describe('点查接口', () => {
 
 describe('按数据源点查', () => {
   let shared: ServedFixture;
-  beforeAll(async () => { shared = await sharedServed(); });
+  beforeAll(async () => { shared = await sharedServed(); }, 180_000); // 共用的点查夹具（打通、RFM、发布指标与标签、生成服务库），并行跑满时超过默认 hookTimeout 60 s
 
   it('数据源名不存在、源端 ID 不存在一律 404 且提示不同；改名后旧名 404、新名立刻可查（不重建）；带 ?snapshot= 时 400', async () => {
     const { acme, of, sources, consumer, key } = shared;
@@ -481,7 +481,7 @@ describe('按数据源点查', () => {
 
 describe('点查的隔离', () => {
   let shared: ServedFixture;
-  beforeAll(async () => { shared = await sharedServed(); });
+  beforeAll(async () => { shared = await sharedServed(); }, 180_000); // 共用的点查夹具（打通、RFM、发布指标与标签、生成服务库），并行跑满时超过默认 hookTimeout 60 s
 
   it('A 租户的 Key 查不到 B 租户的消费者与快照，B 的 Key 也查不到 A 的：同一个 ID 各自只读到本租户的数据', async () => {
     const { of, consumer, key } = shared;
