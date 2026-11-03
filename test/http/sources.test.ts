@@ -128,13 +128,14 @@ describe('登记数据源', () => {
     expect(await (await browser.get('/sources')).text()).toContain('活动报名');
   });
 
-  it('上传登记失败（表名不合法、文件为空、不是 .csv、名称为空）时 400，不留下数据源与文件；没有 sources:write 的角色 403', async () => {
+  it('上传登记失败（表名不合法、文件为空、不是 .csv、不是 UTF-8、名称为空）时 400，不留下数据源与文件；没有 sources:write 的角色 403', async () => {
     const { tenantId, browser } = await engineerOf('acme');
     const csv = (name = 'a.csv', body = 'id\n1\n') => new File([body], name);
     for (const [name, table, file, message] of [
       ['活动报名', '../escape', csv(), '表名只能包含小写字母'],
       ['活动报名', 'signups', csv('a.csv', ''), '文件是空的'],
       ['活动报名', 'signups', csv('a.txt'), '.csv 文件'],
+      ['活动报名', 'signups', new File([new Uint8Array([0xd5, 0xc5])], 'a.csv'), '不是 UTF-8'],
       // 通过前面的校验、文件已写进上传目录，registerSource 才失败：目录要删掉
       ['', 'signups', csv(), '请填写数据源名称'],
     ] as const) {
