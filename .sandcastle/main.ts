@@ -2,7 +2,8 @@
 //
 // 每一轮：
 //   Phase 0 (Prep):  人工给 issue 打上 `Sandcastle` 标签即为「选中」。还没有
-//                    `sandcastle:prepped` 的选中票逐张（串行）跑 prep-ticket：
+//                    `sandcastle:prepped` 的选中票逐张（串行）跑 prep-ticket（`## Blocked by` 里
+//                    还有 open 票的脚本直接跳过，不开会话）：
 //                    够小且指引新鲜 → 打 prepped；太大 → 拆成子票（子票继承
 //                    `Sandcastle`，父票去掉）；要人拍板 → 打 sandcastle:stuck。
 //   Phase 1 (Plan):  脚本自己算（不用 agent）：只看 `Sandcastle` + `sandcastle:prepped`、且没有
@@ -233,11 +234,11 @@ function syncHostBase() {
   }
 }
 
-const searchIssues = (query: string): { number: number; title: string }[] =>
+const searchIssues = (query: string): { number: number; title: string; body: string }[] =>
   JSON.parse(
     sh("gh", [
       "issue", "list", "--state", "open", "--limit", "100",
-      "--search", query, "--json", "number,title",
+      "--search", query, "--json", "number,title,body",
     ]),
   );
 
@@ -258,6 +259,19 @@ const section = (body: string, title: string) => {
 const blockersOf = (body: string) =>
   [...section(body, "Blocked by").matchAll(/#(\d+)/g)].map((m) => Number(m[1]));
 
+/** 票的 open 状态，每轮开头清空（blocker 可能在两轮之间被合并）。 */
+const openStates = new Map<number, boolean>();
+function isOpen(n: number): boolean {
+  if (!openStates.has(n)) {
+    const r = trySh("gh", ["issue", "view", String(n), "--json", "state", "--jq", ".state"]);
+    openStates.set(n, !r.ok || r.out === "OPEN"); // 查不到时当作 open，宁可少做
+  }
+  return openStates.get(n)!;
+}
+
+/** `## Blocked by` 里还没关的票。 */
+const openBlockers = (body: string) => blockersOf(body).filter(isOpen);
+
 /** 指引里 `- **Change**: \`path…\`` 行的文件路径（去掉 `:行号`）。 */
 const changedFiles = (body: string) =>
   [...section(body, "Implementation guide").matchAll(/^\s*[-*]\s*\*\*Change\*\*\s*[:：]\s*`([^`]+)`/gm)]
@@ -277,14 +291,6 @@ function plan(): Issue[] {
       "--json", "number,title,body",
     ]),
   );
-  const states = new Map<number, string>();
-  const isOpen = (n: number) => {
-    if (!states.has(n)) {
-      const r = trySh("gh", ["issue", "view", String(n), "--json", "state", "--jq", ".state"]);
-      states.set(n, r.ok ? r.out : "OPEN"); // 查不到时当作 open，宁可少做
-    }
-    return states.get(n) === "OPEN";
-  };
   // 等人审的 PR 还没合进 main：它们改的文件先占上，免得新票在旧 main 上改同一个文件，两个 PR 互相冲突。
   const waiting: { number: number; body: string }[] = JSON.parse(
     sh("gh", [
@@ -301,7 +307,7 @@ function plan(): Issue[] {
   }
   const picked: Issue[] = [];
   for (const issue of candidates.filter((c) => allowed(c.number)).sort((a, b) => a.number - b.number)) {
-    const open = blockersOf(issue.body).filter(isOpen);
+    const open = openBlockers(issue.body);
     if (open.length > 0) {
       console.log(`  跳过 #${issue.number}：blocker ${open.map((n) => `#${n}`).join("、")} 还没关`);
       continue;
@@ -932,16 +938,24 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
 for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
   sh("git", ["fetch", REMOTE, BASE_BRANCH]); // 上一轮合并进远端 main 的代码
+  openStates.clear();
   syncHostBase();
   reopenRequestedRevisions();
   pruneSeaweedMetalog();
 
   // Phase 0: Prep —— 串行，因为拆票会改别的票的 Blocked by。
   // 每轮重新查询，所以上一轮拆出来的子票（继承了 Sandcastle 标签）这里会被看到。
+  // 有 open blocker 的票脚本直接跳过，不开会话（prep agent 遇到这种票也只会什么都不改就结束）；
+  // 跳过的票仍留在 toPrep 里，下面判断「本轮拆出了新子票」时不会把它当成新票。
   const toPrep = searchIssues(
     `${q(LABEL.picked)} ${notIn(LABEL.prepped, LABEL.prOpen, LABEL.stuck)}`,
   ).filter((issue) => allowed(issue.number));
   for (const issue of toPrep) {
+    const open = openBlockers(issue.body);
+    if (open.length > 0) {
+      console.log(`  跳过 prep #${issue.number}：blocker ${open.map((n) => `#${n}`).join("、")} 还没关`);
+      continue;
+    }
     console.log(`Prep #${issue.number}: ${issue.title}`);
     await untilAfterLimit(`prep #${issue.number}`, () => sandcastle.run({
       sandbox: podman(),
