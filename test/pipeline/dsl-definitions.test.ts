@@ -15,7 +15,6 @@ import { dslVersions, mappings, tasks } from '../../app/.server/db/schema';
 import { createDefinition, deleteDefinition, discardDslDraft, DslError, getDefinition, impactOf, previewDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { disableImpact, publishMapping, saveDraft } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { enqueueDueRefreshes } from '../../app/.server/refresh';
 import { listSnapshots } from '../../app/.server/snapshots';
@@ -23,7 +22,7 @@ import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, relistSource, setSyncScope } from '../../app/.server/sources';
 import { getTask } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish } from './fixtures';
+import { drain, memberOf, newTenant, publish } from './fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource, READER } from './source-fixtures';
 
@@ -92,8 +91,6 @@ describe('指标定义', () => {
     expect((await getDefinition(viewer, 'metric', 'revenue')).draft).toMatchObject({ yaml: REVENUE, authors: ['analyst@acme.com'] });
   });
 });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 在本租户数据湖里执行 SQL（查看快照） */
 async function onLake<T = Record<string, unknown>>(tenantId: string, sql: string) {

@@ -11,15 +11,12 @@ import {
   confirmWatermark, getSource, registerSource, relistSource, setSyncScope, syncTables,
 } from '../../app/.server/sources';
 import { enqueueTask, listTasks } from '../../app/.server/tasks';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant } from './fixtures';
+import { drain, memberOf, newTenant } from './fixtures';
 import { duckdbSourceFile, grantOnSource, MONGO_USERS, pgSourceInput, READER, seedMongoSource, seedMysqlSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 type Member = Parameters<typeof getSource>[0];
 

@@ -5,20 +5,17 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, tasks } from '../../app/.server/db/schema';
 import { createMapping, dryRunMapping, enqueueDueMerges, getMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { revealPii } from '../../app/.server/pii';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView, saveSourceViewDraft } from '../../app/.server/source-views';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, selectAllTables, silver } from './fixtures';
+import { drain, memberOf, newTenant, selectAllTables, silver } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 两位数据工程师；登记电商库、选入全部表，确认 customers 与 orders 的水位线并同步一次 */
 async function syncedSource() {

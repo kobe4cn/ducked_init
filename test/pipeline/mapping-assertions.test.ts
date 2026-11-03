@@ -3,19 +3,16 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { getMapping } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { lit, type MergeRecord } from '../../app/.server/pipeline/merge-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, onLake, publish, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, onLake, publish, selectAllTables } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 两位数据工程师；登记电商库、选入全部表、确认水位线并同步一次 */
 async function syncedSource() {

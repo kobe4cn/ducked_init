@@ -7,18 +7,15 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs } from '../../app/.server/db/schema';
 import { createMapping, draftFor, dryRunMapping, MappingError, profiledTables, publishMapping } from '../../app/.server/mappings';
 import { draftMapping } from '../../app/.server/pipeline/mapping-draft';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { entityOf } from '../../app/lib/canonical-model';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, publish, selectAllTables } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 const ORDERS = `# 门店订单
 model: 1

@@ -8,7 +8,6 @@ import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions, sources, sourceTables, sourceViews, tasks } from '../../app/.server/db/schema';
 import { confirmDisable, createMapping, listMappings, publishedPlans, publishMapping, requestDisable, restoreMapping, saveDraft } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { requireSource, sourceIdByName } from '../../app/.server/source-config';
 import { enqueueDueSyncs, syncSource } from '../../app/.server/source-sync';
@@ -17,14 +16,12 @@ import { createSourceView } from '../../app/.server/source-views';
 import { confirmWatermark, deleteBlockers, deleteSource, listSources, registerSource } from '../../app/.server/sources';
 import { listCatalog, runQuery } from '../../app/.server/workbench';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, onLake, publish, runTask, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, onLake, publish, runTask, selectAllTables } from './fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from './identity-fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 const CUSTOMERS = `model: 1
 entity: customer

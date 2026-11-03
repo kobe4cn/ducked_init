@@ -1,13 +1,10 @@
 // test/pipeline/mapping-fixtures.ts —— 映射与合并测试的夹具（mapping-merge / mapping-rules / mapping-disable 共用）：带订单流水、积分、同意、偏好、券等源表的
 // 数据源 syncedSource 与 syncAllTables，各实体的映射 YAML，事件映射 events，合并任务带的映射 mergedMappings，以及临时设环境变量的 withEnv
 import type { CurrentMember } from '../../app/.server/auth';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
-import { memberOf, newTenant, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
-
-export const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /**
  * 没有主键的订单流水：同一订单的多个版本（含完全相同的重复行），状态是中文

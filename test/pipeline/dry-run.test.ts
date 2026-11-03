@@ -4,18 +4,15 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createMapping, dryRunMapping, saveDraft } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
+import { drain, memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 没有主键的订单流水：A1 有两行完全相同 */
 const ORDER_LOG = `

@@ -5,19 +5,16 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { checkKeysNow, getKeyCheckStatus, KeyCheckError } from '../../app/.server/key-check';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { runKeyCheck } from '../../app/.server/pipeline/key-check-engine';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, mergeUnchecked, newTenant, publish, selectAllTables, silver } from './fixtures';
+import { drain, memberOf, mergeUnchecked, newTenant, publish, selectAllTables, silver } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 营销同意：一位消费者一个渠道一行（主键含指向 customer 的 customer_id，按数据源比较）；副本 consents_copy 里 1 号的邮件改成了同意 */
 const CONSENTS = `

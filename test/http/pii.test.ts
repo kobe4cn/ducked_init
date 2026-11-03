@@ -4,10 +4,9 @@ import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, tasks } from '../../app/.server/db/schema';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
-import { memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
+import { drain, memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -15,8 +14,6 @@ let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 const LEADS = `
   CREATE TABLE shop.leads (id int PRIMARY KEY, full_name text, mobile text, mail text, wechat text, channel text);

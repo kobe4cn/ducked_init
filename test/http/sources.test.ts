@@ -5,7 +5,7 @@ import { tasks } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { ignoreColumn } from '../../app/.server/mappings';
 import { registerSource, relistSource } from '../../app/.server/sources';
-import { memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
+import { drain, memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER, WRITER } from '../pipeline/source-fixtures';
 import { dbNameOf } from '../setup-env';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
@@ -410,7 +410,6 @@ describe('湖中数据', () => {
     const id = await registerAndSelect(browser, await pgSourceInput(READER), ['customers', 'orders', 'regions']);
     await browser.post(`/sources/${id}`, { intent: 'confirm-watermark', table: 'orders', column: 'order_id' });
     await browser.post(`/sources/${id}`, { intent: 'sync' });
-    const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
     await drain();
 
     const lake = `/sources/${id}?tab=lake`;

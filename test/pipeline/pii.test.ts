@@ -7,19 +7,16 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { ensureTenantLakeSchemas, lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { mergeNow } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { tenantPiiSalt } from '../../app/.server/secrets';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
+import { drain, memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 线索表：同一批人换了写法（空格、大小写、+86 与分隔符），第 2 位的姓名一栏误填了邮箱；微信号是租户特有的敏感信息 */
 const LEADS = `

@@ -6,16 +6,13 @@ import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { expectedTables, getInspectStatus, inspectLakeNow } from '../../app/.server/lake-inspect';
 import type { InspectParams } from '../../app/.server/pipeline/inspect-engine';
 import { publishedPlans } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { resetDb } from '../http/harness';
-import { runTask } from './fixtures';
+import { drain, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 async function inspect(tenantId: string, expected?: InspectParams['expected']) {
   const task = await runTask(tenantId, 'lake.inspect', { expected: expected ?? expectedTables(await publishedPlans(getDb(), tenantId)) });

@@ -8,10 +8,10 @@ import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { publish, silver } from './fixtures';
+import { drain, publish, silver } from './fixtures';
 import { grantOnSource } from './source-fixtures';
 import {
-  drain, CONSENTS_COPY, syncedSource, syncAllTables, CUSTOMERS, ORDERS, ORDER_LOG_MAPPING, POINT_LOGS_MAPPING, CONSENTS_MAPPING, PREFERENCES_MAPPING, COUPON_TEMPLATES_MAPPING, COUPONS_MAPPING, withEnv, events,
+  CONSENTS_COPY, syncedSource, syncAllTables, CUSTOMERS, ORDERS, ORDER_LOG_MAPPING, POINT_LOGS_MAPPING, CONSENTS_MAPPING, PREFERENCES_MAPPING, COUPON_TEMPLATES_MAPPING, COUPONS_MAPPING, withEnv, events,
 } from './mapping-fixtures';
 
 afterAll(async () => { await closeDb(); });

@@ -17,9 +17,9 @@ import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, silver } from './fixtures';
+import { drain, memberOf, newTenant, publish, silver } from './fixtures';
 import { grantOnSource } from './source-fixtures';
-import { drain, ORDER_ITEMS, syncedSource, CUSTOMERS, ORDERS, ORDER_LOG_MAPPING, mergedMappings, withEnv, events } from './mapping-fixtures';
+import { ORDER_ITEMS, syncedSource, CUSTOMERS, ORDERS, ORDER_LOG_MAPPING, mergedMappings, withEnv, events } from './mapping-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });

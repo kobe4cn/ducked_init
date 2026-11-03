@@ -55,13 +55,14 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 | `newTenant(slug)` | 开通租户（含管理员 `admin@<slug>.com`），返回租户 ID |
 | `memberOf(tenantId, email, role = 'data_engineer')` | 返回该成员的 `CurrentMember`，不存在则以给定角色加入；用作领域函数的第一个参数 |
 | `runTask(tenantId, kind, params?)` | 入队一个任务并让调度器跑空，返回任务最终状态 |
+| `drain()` | 跑空调度器（`maxWorkers: 2`）：同步、合并等任务入队后调用 |
 | `selectAllTables(member, sourceId)` | 把数据源里可读的表全部选入同步范围（会入队采集，之后要跑空调度器） |
 | `publish(author, reviewer, sourceId, yaml)` | 起草映射并由另一位成员发布，跑空调度器（合并完成），返回映射 ID |
 | `mergeUnchecked(tenantId, mappingIds)` | 不查跨映射主键，把这些已发布映射合并一次（去掉 `uniqueKey` / `uniqueBySource`），模拟独占检查上线前已存在的重叠；返回合并任务最终状态 |
 | `silver(tenantId, entity, orderBy)` | 读出标准层某个实体的表（时间按 UTC 文本、金额按文本，去掉 `_merged_at`） |
 | `onLake(tenantId, sql)` | 在本租户数据湖里执行 SQL（可写），返回结果行；结果层表名要加引号：`gold."rfm__<任务 ID>"` |
 
-跑空调度器：`createDispatcher({ maxWorkers: 2 }).runUntilIdle()`（来自 `app/.server/pipeline/dispatcher`），测试里通常包成 `const drain = () => ...`。
+跑空调度器：用 `fixtures.ts` 的 `drain()`。
 
 ### `test/pipeline/source-fixtures.ts`
 
@@ -85,7 +86,6 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 |---|---|
 | `syncedSource(extra?)` | 开通租户 `acme`，`de@acme.com` 起草、`de2@acme.com` 发布；源库在 `shop` 里另建 `ORDER_LOG`、`POINT_LOGS`、`CONSENTS`、`PREFERENCES`、`COUPON_TEMPLATES`、`COUPONS`（`extra` 是再加的建表 SQL，如 `ORDER_ITEMS`、`CONSENTS_COPY`），登记数据源后 `syncAllTables`；返回 `{ acme, author, reviewer, id, input }` |
 | `syncAllTables(author, id)` | 选入数据源的全部表、确认各表水位线、同步一次并跑空调度器 |
-| `drain()` | 跑空调度器（`maxWorkers: 2`） |
 | `CUSTOMERS` / `ORDERS` / `ORDER_LOG_MAPPING` / `POINT_LOGS_MAPPING` / `CONSENTS_MAPPING` / `PREFERENCES_MAPPING` / `COUPON_TEMPLATES_MAPPING` / `COUPONS_MAPPING` | 上面各源表的映射 YAML |
 | `events(table, column, extra?)` | 写入 `event` 的映射 YAML：`event_id` 取 `table` 的 `column`，`extra` 追加在后 |
 | `mergedMappings(task)` | 合并任务参数里的映射 ID（排序） |
@@ -121,7 +121,7 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 | `groupsOf(rows, names)` | 按统一消费者分组成「数据源名:customer_id」列表，便于整体比较 |
 | `lastMerge(tenantId)` | 本租户最近一次 `silver.merge` 任务 |
 | `republish(author, reviewer, mappingId, yaml)` | 存一版新草稿、另一位成员发布并跑空调度器 |
-| `SEEDED` / `drain()` / `Identity` / `DeviceOwner` | 种子里的明文（断言表里没有明文）、跑空调度器、行类型 |
+| `SEEDED` / `Identity` / `DeviceOwner` | 种子里的明文（断言表里没有明文）、行类型 |
 
 ### `test/pipeline/llm-fixtures.ts`
 
@@ -167,16 +167,13 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 // test/pipeline/<主题>.test.ts —— <主题>的流水线接缝：<入口> → <调度器派发> → <在哪里看到结果>
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 开通租户、登记电商库、选入全部表并采集完 */
 async function tenantWithSource() {

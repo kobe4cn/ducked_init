@@ -8,14 +8,11 @@ import { sandboxTables, tasks } from '../../app/.server/db/schema';
 import { lakeRow } from '../../app/.server/lake';
 import { enqueueDueSandboxExpiries, lockForSave } from '../../app/.server/sandbox';
 import { listSandboxTables, listSharedWithMe, runQuery, sandboxSchema, saveAsSandbox, shareSandboxTable } from '../../app/.server/workbench';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, onLake, runTask } from './fixtures';
+import { drain, memberOf, newTenant, onLake, runTask } from './fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 const ROWS = 'SELECT * FROM (VALUES (1, \'a\'), (2, \'b\'), (3, \'c\')) t(id, label)';
 
 /** 把成员的这张沙箱表登记为已到期 */

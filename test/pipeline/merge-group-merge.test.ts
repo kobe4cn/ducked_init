@@ -7,21 +7,18 @@ import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { confirmDisable, getMapping, publishMapping, requestDisable, restoreMapping, saveDraft } from '../../app/.server/mappings';
 import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-groups';
 import { runAssertions } from '../../app/.server/pipeline/assertions';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import type { GroupStat, MergeMappingParam, MergeRecord } from '../../app/.server/pipeline/merge-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { listTasks } from '../../app/.server/tasks';
 import type { MergeRule } from '../../app/lib/merge-groups';
 import { resetDb } from '../http/harness';
-import { onLake, publish, silver } from './fixtures';
+import { drain, onLake, publish, silver } from './fixtures';
 import { CRM_ORDERS, LOYALTY_ORDERS, publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 会员订单的 order_id 写成 A<id>，与 CRM 的 A1..A5 重叠（A6 只在 CRM，会员没有 paid_at）；replace 再替换掉别的行（原文 → 新文） */
 const overlapping = (replace: Record<string, string> = {}) => Object.entries({ 'order_id: string(id)': "order_id: concat('A', string(id))", ...replace })

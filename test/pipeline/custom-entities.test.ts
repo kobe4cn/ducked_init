@@ -14,19 +14,16 @@ import { createDefinition, deleteDefinition, publishDefinition } from '../../app
 import { customEntities, customEntityVersions } from '../../app/.server/db/schema';
 import type { EntityRelation } from '../../app/lib/canonical-model';
 import { confirmDisable, createMapping, draftFor, getMapping, requestDisable, saveDraft } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { relationSuggestions } from '../../app/.server/relation-suggest';
 import { syncSource } from '../../app/.server/source-sync';
 import { listTasks } from '../../app/.server/tasks';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
+import { drain, memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 两位数据工程师 */
 async function engineers() {

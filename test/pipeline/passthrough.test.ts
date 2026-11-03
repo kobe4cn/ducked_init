@@ -10,17 +10,14 @@ import { customEntities, customEntityVersions } from '../../app/.server/db/schem
 import { discardDraft, getMapping, listMappings } from '../../app/.server/mappings';
 import { createPassthrough, passthroughPair, passthroughRegistration, publishPassthrough } from '../../app/.server/passthrough';
 import type { TableProfile } from '../../app/.server/pipeline/source-engine';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, selectAllTables, silver } from './fixtures';
+import { drain, memberOf, newTenant, selectAllTables, silver } from './fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 一位数据工程师与一个已采集的 PostgreSQL 数据源 */
 async function profiledSource() {

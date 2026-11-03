@@ -10,21 +10,18 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks, templateDefinitions, templateVersions } from '../../app/.server/db/schema';
 import { TEMPLATES, type TemplateId } from '../../app/.server/pipeline/templates';
 import { RFM_DEFAULTS } from '../../app/.server/pipeline/templates/rfm';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { enqueueDueRefreshes } from '../../app/.server/refresh';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { getTask, insertTask } from '../../app/.server/tasks';
 import { discardDraft, enableDefaultTemplates, getTemplate, publishTemplate, recomputeTemplate, saveDraft, TemplateError } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish } from './fixtures';
+import { drain, memberOf, newTenant, publish } from './fixtures';
 import { CRM, CRM_ORDERS, LOYALTY, publishedIdentitySources, TRACKING_USERS } from './identity-fixtures';
 import { grantOnSource, seedIdentitySources } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 const today = () => new Date().toISOString().slice(0, 10);
 
 // 回看窗口放到最长，覆盖夹具里 2024 年的订单（发布时 asOf 取当天）

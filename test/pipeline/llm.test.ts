@@ -6,12 +6,11 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { llmCalls, modelProviders } from '../../app/.server/db/schema';
 import { chatJson, LlmError, MODEL_PROVIDER_CONTEXT, resolveProvider, setLlmFetch } from '../../app/.server/llm';
 import { tableContextFor } from '../../app/.server/model-provider';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { encryptForTenant } from '../../app/.server/secrets';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
 import { fakeLlm, json, platformDefault } from './llm-fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
@@ -126,8 +125,6 @@ describe('模型服务客户端', () => {
     expect(logged).not.toContain('13900139000');
   });
 });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 登记电商库、选入全部表并采集；synced 时确认 customers 的水位线并同步一次 */
 async function profiledSource(synced: boolean) {
