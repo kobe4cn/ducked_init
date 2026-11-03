@@ -1,4 +1,5 @@
 // 数据源登记的流水线接缝：成员登记数据源（领域函数）→ 平台探测只读、加密保存凭据、列出表 → 选入同步范围后调度器派发采集任务 → 查看列统计与水位线候选
+import { randomUUID } from 'node:crypto';
 import { rm, symlink } from 'node:fs/promises';
 import pg from 'pg';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -7,10 +8,13 @@ import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openSource } from '../../app/.server/pipeline/source-engine';
 import { loadSourceSpec } from '../../app/.server/source-config';
 import { confirmWatermark, getSource, registerSource, SourceError, testSource } from '../../app/.server/sources';
+import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
+import { syncSource } from '../../app/.server/source-sync';
 import { claimNextTask, finishTask } from '../../app/.server/tasks';
+import { storeUpload } from '../../app/.server/uploads';
 import { resetDb } from '../http/harness';
 import { dbNameOf } from '../setup-env';
-import { memberOf, newTenant, selectAllTables } from './fixtures';
+import { memberOf, newTenant, onLake, selectAllTables } from './fixtures';
 import { duckdbSourceFile, grantOnSource, MONGO_USERS, pgSourceInput, READER, s3SourceFiles, seedMongoSource, seedMysqlSource, WRITER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -222,6 +226,28 @@ describe('任务运行时的数据源连接', () => {
     expect(profile.status).toBe('failed');
     expect(profile.error).toContain('shop.regions');
     expect(profile.error).not.toContain(READER.password);
+  });
+});
+
+describe('文件上传数据源', () => {
+  it('上传的 UTF-8 CSV 登记后采集不算水位线候选、表不待确认，同步后原始层有这些行', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const dir = randomUUID();
+    await storeUpload(acme, dir, 'signups', 'id,name,updated_at\n1,张三,2026-10-01 08:00:00\n2,李四,2026-10-02 09:30:00\n3,王五,2026-10-03 10:00:00\n');
+    const { id, tables } = await registerSource(engineer, { kind: 'upload', name: '活动报名', dir, table: 'signups' });
+    expect(tables).toEqual(['signups']);
+    await selectAllTables(engineer, id);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    const [signups] = (await getSource(engineer, id)).tables;
+    expect(signups).toMatchObject({ name: 'signups', rows: 3, syncMode: 'full_compare', watermarkCandidates: [] });
+    expect(signups.columns.find(c => c.name === 'updated_at')!.type).toMatch(/^TIMESTAMP/);
+
+    await syncSource(engineer, id);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const rows = await onLake<{ id: string; name: string }>(acme, `SELECT id::VARCHAR AS id, name FROM "${bronzeSchema(id)}"."signups" ORDER BY id`);
+    expect(rows).toEqual([{ id: '1', name: '张三' }, { id: '2', name: '李四' }, { id: '3', name: '王五' }]);
   });
 });
 

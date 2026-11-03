@@ -7,20 +7,21 @@ import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select'
 
 type Values = Record<string, string | undefined>;
 
-function TextField({ name, label, values, placeholder, type = 'text', required, hint }: {
+function TextField({ name, label, values, placeholder, type = 'text', required, readOnly, hint }: {
   name: string;
   label: string;
   values: Values;
   placeholder?: string;
   type?: string;
   required?: boolean;
+  readOnly?: boolean;
   hint?: string;
 }) {
   const id = `source-${name}`;
   return (
     <Field>
       <FieldLabel htmlFor={id}>{label}</FieldLabel>
-      <Input id={id} name={name} type={type} required={required} placeholder={placeholder} defaultValue={values[name] ?? ''}
+      <Input id={id} name={name} type={type} required={required} readOnly={readOnly} placeholder={placeholder} defaultValue={values[name] ?? ''}
         autoComplete={type === 'password' ? 'new-password' : 'off'} />
       {hint && <FieldDescription>{hint}</FieldDescription>}
     </Field>
@@ -148,6 +149,19 @@ export function SourceFields({ kind, values, editing = false }: { kind: SourceKi
             hint="本机文件须放在本租户的源文件目录中，填相对路径；以只读方式挂载" />
           <S3Fields values={values} editing={editing} optional />
         </>
+      )}
+      {kind === 'upload' && (
+        <div className="grid grid-cols-2 gap-4">
+          <TextField name="table" label="表名" values={values} required readOnly={editing}
+            hint={editing ? '上传后不能修改' : '小写字母、数字与下划线，以字母开头'} placeholder="如：signups" />
+          {!editing && (
+            <Field>
+              <FieldLabel htmlFor="source-file">CSV 文件</FieldLabel>
+              <Input id="source-file" name="file" type="file" accept=".csv" required />
+              <FieldDescription>UTF-8 编码，第一行是表头</FieldDescription>
+            </Field>
+          )}
+        </div>
       )}
     </FieldGroup>
   );
