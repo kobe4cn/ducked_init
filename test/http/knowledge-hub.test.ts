@@ -29,6 +29,8 @@ const groupOf = (html: string, subject: string) =>
 /** 组里的一个条目（data-hub-item 的 li） */
 const itemOf = (group: string, targetId: string) =>
   group.match(new RegExp(`<li[^>]*data-hub-item="${targetId}"[\\s\\S]*?</li>`))?.[0] ?? '';
+/** 页顶统计卡（StatTile）里 label 后面的数值 */
+const statOf = (html: string, label: string) => html.match(new RegExp(`>${label}</div><div[^>]*>(\\d+)</div>`))?.[1];
 const panelOf = (html: string, targetId: string) =>
   html.match(new RegExp(`<section[^>]*data-knowledge-panel="${targetId}"[\\s\\S]*?</section>`))?.[0] ?? '';
 
@@ -51,13 +53,18 @@ describe('业务知识集中页', () => {
     const { acme, analyst } = await setup();
     const subject = await createSubject(analyst, '营收');
     await addMembership(analyst, subject, TARGET);
+    await addMembership(analyst, await createSubject(analyst, '订单'), TARGET);
     await propose(acme, { kind: 'alias', content: { alias: '流水' } });
     const an = await loginAs(app, 'an@acme.com');
 
     let html = await pageOf(an);
     expect(html).toContain('业务知识');
-    expect(html).toContain('待确认提案');
-    expect(html).toContain('缺失项');
+    // 指标同属「订单」「营收」两组（1 条提案、单位 1 个缺失，按条目只算一次）；未归入主题：order.amount 的单位、币种 2 个缺失
+    expect(statOf(html, '待确认提案')).toBe('1');
+    expect(statOf(html, '缺失项')).toBe('3');
+    expect(statOf(html, '有条目的主题')).toBe('2');
+    expect(itemOf(groupOf(html, '订单'), TARGET)).toContain('1 条待确认');
+    expect(html.indexOf('data-hub-group="订单"')).toBeLessThan(html.indexOf('data-hub-group="营收"'));
     const revenue = groupOf(html, '营收');
     expect(revenue).toContain('1 条待确认提案');
     expect(revenue).toContain('1 个缺失项');
@@ -77,8 +84,10 @@ describe('业务知识集中页', () => {
 
     await saveClaim(analyst, { targetId: AMOUNT, type: 'currency', value: 'unknown' });
     await saveClaim(analyst, { targetId: AMOUNT, type: 'unit', value: 'not_applicable' });
-    item = itemOf(groupOf(await pageOf(an), 'none'), AMOUNT);
+    html = await pageOf(an);
+    item = itemOf(groupOf(html, 'none'), AMOUNT);
     expect(item).toMatch(/data-missing="currency"[^>]*>[\s\S]*?币种：未知/);
+    expect(statOf(html, '缺失项')).toBe('2');
     expect(item).not.toContain('data-missing="unit"');
 
     await saveClaim(analyst, { targetId: AMOUNT, type: 'currency', value: 'CNY' });
