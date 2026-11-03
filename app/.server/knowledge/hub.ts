@@ -14,7 +14,8 @@ import { cmpName } from '../../lib/compare';
 import type { Claim } from './catalog';
 import { listProposals, type Proposal } from './proposals';
 
-type HubEntry = EntityEntry | FieldEntry | MetricEntry | TagEntry;
+/** 集中页与业务知识面板处理的目录条目 */
+export type HubEntry = EntityEntry | FieldEntry | MetricEntry | TagEntry;
 type MissingType = 'unit' | 'currency';
 
 export interface HubItem {
@@ -30,7 +31,7 @@ export interface HubGroup { subject: string | null; proposals: number; missing: 
 
 export interface KnowledgeHub { totals: { proposals: number; missing: number; subjects: number }; groups: HubGroup[] }
 
-const isHubEntry = (e: CatalogEntry): e is HubEntry => e.kind === 'entity' || e.kind === 'field' || e.kind === 'metric' || e.kind === 'tag';
+export const isHubEntry = (e: CatalogEntry): e is HubEntry => e.kind === 'entity' || e.kind === 'field' || e.kind === 'metric' || e.kind === 'tag';
 
 /** 这个条目要检查的声明类型；connected 是已接入实体的目录标识（字段的 entity 也是实体的目录标识） */
 function checkedTypes(e: HubEntry, connected: ReadonlySet<string>): MissingType[] {

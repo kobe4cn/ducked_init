@@ -6,8 +6,8 @@ import { data, Link, redirect } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleHelp, Inbox } from 'lucide-react';
 import { requirePermission } from '~/.server/access';
 import { catalogFor } from '~/.server/assistant/tools';
-import { expand, type EntityEntry, type FieldEntry, type MetricEntry, type TagEntry } from '~/.server/catalog';
-import { knowledgeHub, type HubItem } from '~/.server/knowledge/hub';
+import { expand } from '~/.server/catalog';
+import { isHubEntry, knowledgeHub, type HubEntry, type HubItem } from '~/.server/knowledge/hub';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel, type KnowledgePanel as Panel } from '~/.server/knowledge/panel';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
@@ -32,8 +32,8 @@ export async function loader({ request }: Route.LoaderArgs) {
   const itemId = new URL(request.url).searchParams.get('item');
   const system = itemId ? expand(catalog, itemId) : null;
   // 只给 ?item= 那一个条目算面板（每个面板都要读全租户的知识）
-  let selected: { targetId: string; system: EntityEntry | FieldEntry | MetricEntry | TagEntry; panel: Panel } | null = null;
-  if (system && (system.kind === 'entity' || system.kind === 'field' || system.kind === 'metric' || system.kind === 'tag')) {
+  let selected: { targetId: string; system: HubEntry; panel: Panel } | null = null;
+  if (system && isHubEntry(system)) {
     selected = { targetId: system.id, system, panel: await knowledgePanel(member, system.id) };
   }
   return { email: member.email, nav: navFor(member), hub, selected };
