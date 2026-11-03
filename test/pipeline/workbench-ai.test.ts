@@ -19,7 +19,7 @@ afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); });
 beforeAll(async () => {
   await resetDb();
   ({ acme } = await publishedIdentitySources({ orders: true }));
-});
+}, 180_000); // 两个数据源同步、发布、打通加订单，并行跑满时会超过默认 hookTimeout 60 s
 
 const analyst = () => memberOf(acme, 'analyst@acme.com', 'analyst');
 const audits = (action: string) => getDb().select().from(auditLogs).where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, action)));
