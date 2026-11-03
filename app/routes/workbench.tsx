@@ -117,7 +117,6 @@ const CATALOG_SECTIONS: { key: Exclude<keyof WorkbenchCatalog, 'raw'>; title: st
   { key: 'shared', title: '分享给我的', empty: '没有人分享表给你' },
 ];
 
-/** 左侧目录树：schema → 表（行数、位置）→ 字段（类型）；点表名调用 onInsert 插入引用 */
 /** 租户没打开「发送脱敏样本」时的说明：分析师打不开「模型服务」页，所以请租户管理员去开，链接只是辅助 */
 function SamplesOff() {
   return (
@@ -127,6 +126,7 @@ function SamplesOff() {
   );
 }
 
+/** 左侧目录树：schema → 表（行数、位置）→ 字段（类型）；点表名调用 onInsert 插入引用 */
 function CatalogTree({ catalog, error, onInsert }: { catalog: WorkbenchCatalog | null; error?: string; onInsert: (ref: string) => void }) {
   return (
     <aside className="space-y-3 self-start rounded-2xl border bg-white p-4 text-sm shadow-sm" data-catalog-tree>
