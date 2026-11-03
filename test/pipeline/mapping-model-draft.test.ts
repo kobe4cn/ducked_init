@@ -10,21 +10,18 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, mappingGenerations } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
 import { createMapping, draftFor, dryRunMapping, MappingError, modelAssertionsForMapping, modelDraftFor, modelDraftForMapping, publishMapping, saveMappingDraft } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { modelDraftMessages } from '../../app/.server/pipeline/model-draft';
 import { tableContextFor } from '../../app/.server/model-provider';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, publish, selectAllTables } from './fixtures';
 import { fakeLlm, json, platformDefault } from './llm-fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 答复带的 token 数，记进 llm_calls */
 const USAGE = { prompt_tokens: 800, completion_tokens: 200 };

@@ -11,14 +11,13 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { apiKeys, auditLogs, snapshots as snapshotsTable, sources as sourcesTable, spaces as spacesTable, tasks } from '../../app/.server/db/schema';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow } from '../../app/.server/lake';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { servingPath } from '../../app/.server/pipeline/serving-engine';
 import { tenantServingKey } from '../../app/.server/secrets';
 import { currentServingStore, enqueueServingBuild } from '../../app/.server/serving-store';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { suspendTenant } from '../../app/.server/tenants';
 import { saveAsSandbox, shareSandboxTable } from '../../app/.server/workbench';
-import { memberOf, newTenant, onLake, runTask } from '../pipeline/fixtures';
+import { drain, memberOf, newTenant, onLake, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
@@ -195,8 +194,6 @@ describe('目录接口', () => {
     expect((await call('/api/v1/catalog', key)).status).toBe(200);
   });
 });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /**
  * 身份打通与订单映射已发布，跑出 RFM 快照，双人发布指标 revenue、带城市维度的 revenue_by_city 与标签 value_tier，调度器跑空（服务库已生成）；

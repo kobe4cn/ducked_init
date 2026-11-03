@@ -9,15 +9,12 @@ import { confirmDisable, publishMapping, requestDisable, saveDraft } from '../..
 import {
   checkMergeGroup, discardMergeGroupDraft, listMergeGroups, type MergeCandidate, publishedMergeGroups, publishMergeGroup, saveMergeGroupDraft,
 } from '../../app/.server/merge-groups';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { resetDb } from '../http/harness';
-import { memberOf } from './fixtures';
+import { drain, memberOf } from './fixtures';
 import { LOYALTY_ORDERS, publishedIdentitySources } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 发布了两个订单映射的租户；orders 按 CRM、会员排 */
 async function withOrders() {

@@ -11,10 +11,10 @@ import { syncSource } from '../../app/.server/source-sync';
 import { resolveIdentities } from '../../app/.server/pipeline/identity-engine';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { resetDb } from '../http/harness';
-import { runTask } from './fixtures';
+import { drain, runTask } from './fixtures';
 import { CRM, publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
-import { drain, type Identity, identities, lastMerge, republish } from './identity-helpers';
+import { type Identity, identities, lastMerge, republish } from './identity-helpers';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });

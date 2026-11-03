@@ -3,18 +3,15 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb } from '../../app/.server/db/client';
 import { confirmDisable, ignoreColumn, MappingError, requestDisable, saveDraft } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { mappingDrift } from '../../app/.server/source-drift';
 import { confirmWatermark, registerSource, relistSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, publish, selectAllTables } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 // phone 发布时就在，有意不映射
 const CUSTOMERS = `model: 1

@@ -16,10 +16,10 @@ import { syncSource } from '../../app/.server/source-sync';
 import { setSyncScope } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { memberOf, mergeUnchecked, publish, silver } from './fixtures';
+import { drain, memberOf, mergeUnchecked, publish, silver } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
-import { drain, syncedSource, CUSTOMERS, ORDERS, ORDER_LOG_MAPPING, mergedMappings } from './mapping-fixtures';
+import { syncedSource, CUSTOMERS, ORDERS, ORDER_LOG_MAPPING, mergedMappings } from './mapping-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });

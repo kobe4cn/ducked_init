@@ -11,7 +11,6 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots as snapshotsTable, tasks } from '../../app/.server/db/schema';
 import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { servingPath } from '../../app/.server/pipeline/serving-engine';
 import { platformS3 } from '../../app/.server/s3-accounts';
@@ -22,15 +21,13 @@ import { TEMPLATES } from '../../app/.server/pipeline/templates';
 import { enqueueDueExpiries, listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, runTask } from './fixtures';
+import { drain, memberOf, newTenant, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 import { cmp } from '../../app/lib/compare';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 const ALL_REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\n';
 const REVENUE_BY_CITY = `${ALL_REVENUE}dimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n`;

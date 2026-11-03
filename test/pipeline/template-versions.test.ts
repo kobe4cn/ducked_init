@@ -6,22 +6,19 @@ import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, snapshots, tasks, templateDefinitions, templateVersions } from '../../app/.server/db/schema';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { latestTemplate, templateAt } from '../../app/.server/pipeline/templates';
 import { enqueueDueRefreshes } from '../../app/.server/refresh';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, saveDraft, upgradeTemplateDraft } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
-import { onLake } from './fixtures';
+import { drain, onLake } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 afterEach(() => { vi.unstubAllEnvs(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 // 回看窗口放到最长，覆盖夹具里 2024 年的订单（发布时 asOf 取当天）
 const PARAMS = {

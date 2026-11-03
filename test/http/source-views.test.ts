@@ -2,10 +2,9 @@
 // 最后保存草稿的人不能自己发布，由另一位数据工程师或管理员在页面上发布；没有登录会话的请求发布不了。分析师只读，查看者看不到，其他租户与别的数据源路径一律 404
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
-import { memberOf, newTenant, selectAllTables } from '../pipeline/fixtures';
+import { drain, memberOf, newTenant, selectAllTables } from '../pipeline/fixtures';
 import { pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -13,8 +12,6 @@ let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 开通租户 acme，de@acme.com 登记电商库、选入全部表，确认 customers 的水位线并同步一次 */
 async function syncedSource() {

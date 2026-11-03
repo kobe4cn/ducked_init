@@ -7,13 +7,12 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { setMailer, type Mail } from '../../app/.server/mailer';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { CHANNELS } from '../../app/lib/canonical-model';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, runTask } from './fixtures';
+import { drain, memberOf, newTenant, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 
@@ -25,8 +24,6 @@ beforeEach(async () => {
   setMailer({ async send(m) { outbox.push(m); } });
 });
 afterEach(() => { setMailer(undefined); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 type Row = Record<string, unknown> & { consumer_id: string };
 

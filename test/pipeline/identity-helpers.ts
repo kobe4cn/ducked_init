@@ -8,10 +8,8 @@ import { getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { publishMapping, saveDraft } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
-
-export const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+import { drain } from './fixtures';
 
 /** 种子里的明文：手机号（规范化前后）、邮箱、外部 ID 与姓名 */
 export const SEEDED = ['13800000001', '138 0000', '138-0000', '13800000002', '13900000005', '139 0000', 'zhang@crm', 'wang5@example', 'qian7@example',

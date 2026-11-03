@@ -7,19 +7,16 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { createCatalogSchema, initTenantCatalog, lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { listLakeFiles } from '../../app/.server/lake-storage';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 登记电商库、确认 customers 按更新时间同步（其余表全量比对），同步一次 */
 async function synced(tenantId: string) {

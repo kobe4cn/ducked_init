@@ -30,6 +30,9 @@ export function runTask(tenantId: string, kind: TaskKind, params: Record<string,
   });
 }
 
+/** 让调度器把队列跑空（2 个 worker），测试里同步、合并等任务入队后调用 */
+export const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
 /** 以某个成员的身份调用领域函数（与登录后服务端拿到的当前成员相同）；成员不存在时以给定角色加入租户 */
 export async function memberOf(tenantId: string, email: string, role: Role = 'data_engineer'): Promise<CurrentMember> {
   const db = getDb();

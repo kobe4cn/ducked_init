@@ -11,10 +11,10 @@ import { resolveIdentities } from '../../app/.server/pipeline/identity-engine';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { runTask, silver } from './fixtures';
+import { drain, runTask, silver } from './fixtures';
 import { publishedIdentitySources, TRACKING_EVENTS } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
-import { drain, SEEDED, identities, anonymousEvents, consumerConsent, groupsOf, republish } from './identity-helpers';
+import { SEEDED, identities, anonymousEvents, consumerConsent, groupsOf, republish } from './identity-helpers';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });

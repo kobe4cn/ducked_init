@@ -8,7 +8,6 @@ import { closeDb } from '../../app/.server/db/client';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { platformS3 } from '../../app/.server/s3-accounts';
 import { deleteObject } from '../../app/.server/s3-client';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { getSyncStatus, syncSource } from '../../app/.server/source-sync';
@@ -17,13 +16,11 @@ import { confirmKey, confirmWatermark, registerSource, SourceError, setSyncScope
 import { listTasks } from '../../app/.server/tasks';
 import { suspendTenant } from '../../app/.server/tenants';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
 import { duckdbSourceFile, grantOnSource, MONGO_USERS, pgSourceInput, READER, seedMongoSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 在本租户数据湖里执行 SQL（测试里模拟湖被意外改动、查看快照） */
 async function onLake<T = Record<string, unknown>>(tenantId: string, sql: string) {

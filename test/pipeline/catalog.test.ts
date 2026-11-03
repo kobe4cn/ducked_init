@@ -18,20 +18,17 @@ import { auditLogs, businessNotes, catalogVersions } from '../../app/.server/db/
 import { createDefinition, discardDslDraft, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { confirmDisable, lockTenant, requestDisable } from '../../app/.server/mappings';
 import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-groups';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
 import { confirmWatermark, deleteSource, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
 import { publishTemplate, saveDraft } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, publish, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, publish, selectAllTables } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 本租户最新一版目录版本；还没有版本时为 undefined */
 const latestVersion = async (tenantId: string) => (await getDb().select().from(catalogVersions)

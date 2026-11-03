@@ -12,17 +12,14 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, exportLinks, snapshots, tasks } from '../../app/.server/db/schema';
 import { cleanupExpiredExports, EXPORT_LINK_TTL_MS } from '../../app/.server/exports';
 import { lakeRow } from '../../app/.server/lake';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { listTasks } from '../../app/.server/tasks';
-import { newTenant, onLake } from '../pipeline/fixtures';
+import { drain, newTenant, onLake } from '../pipeline/fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 管理员在页面上创建一把 Key，返回明文 */
 async function createKey(admin: Client, name: string) {

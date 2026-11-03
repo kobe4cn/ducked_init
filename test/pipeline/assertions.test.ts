@@ -8,14 +8,13 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { setMailer, type Mail } from '../../app/.server/mailer';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { lit } from '../../app/.server/pipeline/merge-engine';
 import { listSnapshots, readRfmSnapshot } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { memberOf, mergeUnchecked, publish, runTask } from './fixtures';
+import { drain, memberOf, mergeUnchecked, publish, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
@@ -27,8 +26,6 @@ beforeEach(async () => {
   setMailer({ async send(m) { outbox.push(m); } });
 });
 afterEach(() => { setMailer(undefined); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 在本租户数据湖里执行 SQL（查看表与文件） */
 async function onLake<T = Record<string, unknown>>(tenantId: string, sql: string) {

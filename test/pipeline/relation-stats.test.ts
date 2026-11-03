@@ -6,19 +6,16 @@ import { createCustomEntity, publishCustomEntity } from '../../app/.server/custo
 import { closeDb } from '../../app/.server/db/client';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { entityRelationStats, listMappings, publishMapping, saveDraft } from '../../app/.server/mappings';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { relationStats } from '../../app/.server/pipeline/merge-engine';
 import { type RelationStat, relationText } from '../../app/lib/canonical-model';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { publish } from './fixtures';
+import { drain, publish } from './fixtures';
 import { publishedIdentitySources, TRACKING_EVENTS } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 最近一次合并任务的参数与结果里的关系，按「起点 → 终点」取 */
 async function lastMerge(tenantId: string) {

@@ -20,7 +20,7 @@ import { listCatalog, listSandboxTables, runQuery, saveAsSandbox, WORKBENCH_ROWS
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, onLake, runTask } from './fixtures';
+import { drain, memberOf, newTenant, onLake, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource, READER } from './source-fixtures';
 
@@ -358,7 +358,6 @@ async function withEnv(vars: Record<string, string>, fn: () => Promise<void>) {
   }
 }
 
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 /** 结果的行转成对象 */
 const objects = (r: { columns: { name: string }[]; rows: unknown[][] }) => r.rows.map(row => Object.fromEntries(r.columns.map((c, i) => [c.name, row[i]])));
 

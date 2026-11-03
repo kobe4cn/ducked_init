@@ -7,12 +7,12 @@ import { DuckDBInstance } from '@duckdb/node-api';
 import { MongoClient } from 'mongodb';
 import pg from 'pg';
 import type { CurrentMember } from '../../app/.server/auth';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { objectPath, signedFetch, xmlTag, xmlTags, type S3Creds } from '../../app/.server/s3-client';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
 import { getTask } from '../../app/.server/tasks';
 import { WORKER_SUFFIX } from '../setup-env';
+import { drain } from './fixtures';
 
 export const SOURCE_DB_URL = process.env.TEST_SOURCE_DATABASE_URL!;
 // 源端账号是集群级的（PG 角色、MySQL 用户），按 worker 加后缀 _w<i>（见 test/setup-env.ts）
@@ -185,7 +185,6 @@ export async function seedIdentitySources(member: CurrentMember, { orders = fals
     INSERT INTO loyalty.consents VALUES (1, '短信', '撤回', '2024-06-05 10:00'), (2, '短信', '撤回', '2024-06-03 10:00');` : ''}
     GRANT USAGE ON SCHEMA crm, loyalty, tracking TO ${READER.user};
     GRANT SELECT ON ALL TABLES IN SCHEMA crm, loyalty, tracking TO ${READER.user};`);
-  const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
   const ids: string[] = [];
   const extra = [...orders ? ['orders'] : [], ...consents ? ['consents'] : []];
   const sources: [string, string, string[]][] = [['CRM', 'crm', ['customers', ...extra]], ['会员', 'loyalty', ['members', ...extra]], ['埋点', 'tracking', ['users', 'events']]];

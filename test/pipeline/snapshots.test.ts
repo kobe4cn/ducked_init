@@ -11,7 +11,6 @@ import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions, tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { setMailer, type Mail } from '../../app/.server/mailer';
 import { dryRunMapping, publishMapping } from '../../app/.server/mappings';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -19,15 +18,13 @@ import type { MergeRecord } from '../../app/.server/pipeline/merge-engine';
 import { enqueueDueExpiries, getSnapshot, listSnapshots, readRfmSnapshot } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { resetDb } from '../http/harness';
-import { memberOf, mergeUnchecked, newTenant, runTask } from './fixtures';
+import { drain, memberOf, mergeUnchecked, newTenant, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 
 const DAY = 24 * 60 * 60 * 1000;
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 在本租户数据湖里执行 SQL（查看表与文件） */
 async function onLake<T = Record<string, unknown>>(tenantId: string, sql: string) {

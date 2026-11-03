@@ -5,7 +5,6 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tenants } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { enqueueDueSyncs, getSyncStatus, syncSource } from '../../app/.server/source-sync';
@@ -14,14 +13,12 @@ import { confirmKey, confirmSoftDelete, confirmWatermark, getSource, registerSou
 import { listAuditLogs } from '../../app/.server/audit';
 import { getTask, listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { memberOf, newTenant, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { duckdbSourceFile, grantOnSource, MONGO_USERS, pgSourceInput, READER, s3SourceFiles, seedMongoSource, seedMysqlSource } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-
-const drain = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 /** 声明业务主键并等全表检查结束，返回这张表最近一次检查的结果 */
 async function declareKey(engineer: Parameters<typeof getSource>[0], id: string, table: string, columns: string[]) {
