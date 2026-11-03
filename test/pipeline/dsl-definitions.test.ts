@@ -230,7 +230,7 @@ describe('字段路径（ADR-0038）', () => {
 
     const [stores] = await getDb().select({ id: mappings.id }).from(mappings).where(and(eq(mappings.sourceId, crm), eq(mappings.tableName, 'stores')));
     expect(await disableImpact(getDb(), acme, stores!.id)).toEqual({ metrics: [{ key: 'store_one' }], tags: [] });
-  });
+  }, 180_000); // 夹具同步、发布三个数据源与门店并跑完打通与 gold 快照：沙箱里单跑约 60–73 s，8 worker 完整测试里约 59 s，沙箱 4 worker 完整测试比那慢约一倍，会超过默认的 90 s
 });
 
 /** CRM 源另加商品表 products 与明细表 order_items 并发布到 product、order_item：A1 买奶粉 60 与纸尿裤 40，A3 奶粉 200，A4（已退款）、A5（下单人打通不到）、ZZ（订单不存在）各一行奶粉 */
