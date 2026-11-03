@@ -71,6 +71,7 @@ write_env_files() {
     echo "MAGIC_LINK_RATE_LIMIT=$(verify_sq 50)"
     echo "MAGIC_LINK_RATE_WINDOW_MINUTES=$(verify_sq 15)"
     echo "NODE_ENV=$(verify_sq development)"
+    echo "APP_ORIGIN=$(verify_sq "$BASE_URL")"
   } >"$STATE_DIR/app.env"
   {
     echo "RUN_ID=$(verify_sq "$RUN_ID")"
@@ -102,7 +103,11 @@ set -a
 # shellcheck disable=SC1090
 source "$STATE_DIR/app.env"
 set +a
-unset APP_ORIGIN MAIL_HOST MAIL_USER MAIL_PASS
+# APP_ORIGIN is exported (from app.env), not unset: React Router dev merges vite.loadEnv(mode, root, "")
+# into process.env, and loadEnv lets an already-set variable win over .env. An unset one is refilled
+# from .env, so unsetting would let a repo .env redirect magic links to another host.
+export APP_ORIGIN="$BASE_URL"
+unset MAIL_HOST MAIL_USER MAIL_PASS
 
 echo "migrating $DB_NAME"
 if ! (cd "$ROOT" && pnpm db:migrate) >"$STATE_DIR/migrate.log" 2>&1; then
@@ -132,7 +137,7 @@ write_env_files
 
 echo "starting dev server on $BASE_URL"
 # Record this pid and kill only its descendant tree in cleanup.sh. nohup keeps it alive if the caller exits.
-nohup bash -c "set -a; source $(verify_sq "$STATE_DIR/app.env"); set +a; unset APP_ORIGIN MAIL_HOST MAIL_USER MAIL_PASS; cd $(verify_sq "$ROOT"); exec pnpm dev --host 127.0.0.1 --port $(verify_sq "$PORT") --strictPort" \
+nohup bash -c "set -a; source $(verify_sq "$STATE_DIR/app.env"); set +a; unset MAIL_HOST MAIL_USER MAIL_PASS; cd $(verify_sq "$ROOT"); exec pnpm dev --host 127.0.0.1 --port $(verify_sq "$PORT") --strictPort" \
   >"$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" >"$PID_FILE"

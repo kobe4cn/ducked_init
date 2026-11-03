@@ -15,4 +15,7 @@ if [[ $# -ne 1 ]]; then
   echo "usage: scripts/sql.sh [run-id] \"SQL\"" >&2
   exit 2
 fi
-exec psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tA -F'|' -c "$1"
+# Every statement runs in a read-only transaction, so INSERT/UPDATE/DDL fail with
+# "cannot execute ... in a read-only transaction".
+PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c default_transaction_read_only=on" \
+  exec psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tA -F'|' -c "$1"

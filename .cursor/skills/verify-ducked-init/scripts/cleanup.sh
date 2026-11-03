@@ -29,7 +29,8 @@ if [[ -n ${SERVER_PID:-} ]]; then
 fi
 
 if [[ -n ${STATE_DIR:-} && -d ${STATE_DIR}/chrome-profile ]]; then
-  # Match the profile path we passed to Chrome, not the process name.
+  # Match the profile path we passed to Chrome, not the process name. STATE_DIR is the real path
+  # (verify_load_state) and browser.mjs realpaths it too, so the `current` symlink never appears here.
   pids=$(ps -eo pid=,args= | awk -v dir="${STATE_DIR}/chrome-profile" 'index($0, dir) && $2 !~ /awk/ { print $1 }')
   for pid in $pids; do
     kill "$pid" 2>/dev/null || true

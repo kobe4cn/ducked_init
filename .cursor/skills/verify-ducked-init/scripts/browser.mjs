@@ -11,7 +11,7 @@
 //   node .cursor/skills/verify-ducked-init/scripts/browser.mjs magic-link --email admin@verify.test --offset 0
 import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,7 +44,8 @@ function stateDirFromEnv() {
 function loadState(dir) {
   const file = join(dir, 'state.env');
   try {
-    return { ...parseEnvFile(file), STATE_DIR: dir };
+    // Resolve the `current` symlink so the Chrome --user-data-dir matches the path cleanup.sh greps for.
+    return { ...parseEnvFile(file), STATE_DIR: realpathSync(dir) };
   } catch (e) {
     console.error(`cannot read ${file}: ${e.message}`);
     process.exit(1);

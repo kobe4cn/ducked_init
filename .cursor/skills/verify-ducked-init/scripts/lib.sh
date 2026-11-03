@@ -39,7 +39,8 @@ verify_load_state() {
   set -a
   source "$dir/state.env"
   set +a
-  STATE_DIR=$dir
+  # Real path, never the `current` symlink: browser.mjs uses the same path for Chrome's profile.
+  STATE_DIR=$(readlink -f "$dir")
 }
 
 verify_repo_root() {

@@ -31,7 +31,7 @@ Optional environment: `VERIFY_RUN_ID` (`^[a-z][a-z0-9]{0,30}$`), `VERIFY_PORT`, 
 What it does, in order:
 
 1. Create empty database `crm_platform_verify_<run-id>` and empty lake directory `$STATE_DIR/lake`.
-2. Write `$STATE_DIR/app.env` with `PLATFORM_DATABASE_URL`, `PLATFORM_LAKE_URI` (that lake directory), a new `PLATFORM_MASTER_KEY`, `MAILER=console`, and `MAGIC_LINK_RATE_LIMIT=50`. It unsets `APP_ORIGIN`, `MAIL_HOST`, `MAIL_USER`, and `MAIL_PASS` for migrate, tenant create, and the dev server, so a repo `.env` cannot redirect mail or links. Vite and Node `--env-file` do not override variables that are already set.
+2. Write `$STATE_DIR/app.env` with `PLATFORM_DATABASE_URL`, `PLATFORM_LAKE_URI` (that lake directory), a new `PLATFORM_MASTER_KEY`, `MAILER=console`, and `MAGIC_LINK_RATE_LIMIT=50`. It also writes `APP_ORIGIN=<base url>` there and exports it for migrate, tenant create, and the dev server, so magic links point at this run's server. It unsets `MAIL_HOST`, `MAIL_USER`, and `MAIL_PASS`. Explicitly exported variables win: Vite's `loadEnv` (which React Router dev merges into `process.env`) and Node `--env-file` only fill variables that are not set. An unset variable is not set, so a repo `.env` fills it back in. That is why `APP_ORIGIN` is exported rather than unset; the unset `MAIL_*` variables may be refilled from a repo `.env`, but the exported `MAILER=console` wins, so mail stays in `server.log`.
 3. `pnpm db:migrate` then `pnpm tenant:create --slug verify --name 验收租户 --admin-email admin@verify.test`. Launch fails if the log contains `初始化失败` or `catalog_initialized_at` is null.
 4. Start `pnpm dev --host 127.0.0.1 --port <port> --strictPort` and record its pid. Stdout is redirected to the state directory's `server.log`, so Vite's clear-screen is not a TTY and does not erase the log.
 
@@ -60,7 +60,7 @@ It exits 0 only when all of these are true, and writes the same lines to `$EVIDE
 
 - The recorded server pid is alive.
 - `/proc/net/tcp` shows `$PORT` in `LISTEN`, and the process that owns that socket is a descendant of the recorded pid. (`ss` is not required.)
-- `curl -sS -o /tmp/login.html -w '%{http_code}' $BASE_URL/login` is `200` and the body contains `登录 CRM 数据分析平台`.
+- `curl -sS -o $STATE_DIR/doctor-login.html -w '%{http_code}' $BASE_URL/login` is `200` and the body contains `登录 CRM 数据分析平台`.
 - This query returns `verify|验收租户|默认空间|admin@verify.test|admin`:
 
 ```sql
@@ -74,7 +74,7 @@ WHERE t.slug = 'verify' AND m.email = 'admin@verify.test'
 - The tenant lake has `catalog_initialized_at` set, `data_path` under the run's lake directory, and `db_role` equal to the role recorded at launch.
 - The server log does not contain `[后台任务失败]`.
 
-`scripts/sql.sh "SELECT ..."` runs a single read-only query against that database (`-tA -F'|'`).
+`scripts/sql.sh "SELECT ..."` runs a single query against that database (`-tA -F'|'`) with `default_transaction_read_only=on`, so writes fail with `cannot execute … in a read-only transaction`.
 
 ## Drive
 
@@ -127,7 +127,7 @@ Do not mock SMTP. `MAILER=console` is the app's real development mailer. Do not 
 .cursor/skills/verify-ducked-init/scripts/cleanup.sh <run-id>
 ```
 
-This kills the recorded server pid and its descendants, kills Chrome only when its command line contains this run's `chrome-profile` path, drops that run's database, drops the recorded `lake_<id>` and `lake_<id>_ro` roles, and deletes the state directory (lake files, server log, browser profile). It does not delete the evidence directory. A second cleanup with the same id fails because the state file is gone; the evidence remains.
+This kills the recorded server pid and its descendants, kills Chrome only when its command line contains this run's `chrome-profile` path (the real state directory, not the `current` symlink; `browser.mjs` resolves it the same way), drops that run's database, drops the recorded `lake_<id>` and `lake_<id>_ro` roles, and deletes the state directory (lake files, server log, browser profile). It does not delete the evidence directory. A second cleanup with the same id fails because the state file is gone; the evidence remains.
 
 Run cleanup after every failed launch or drive so ports, databases, and roles are not left behind.
 
