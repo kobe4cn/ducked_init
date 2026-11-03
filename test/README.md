@@ -75,6 +75,7 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 | `duckdbSourceFile(tenantId, file?)` | 在租户源文件目录下生成 DuckDB 文件，返回路径 |
 | `s3SourceFiles(tenantId)` | 对象存储上的 parquet 源文件与三个受限账号（需 `TEST_S3_LAKE_URI`） |
 | `seedIdentitySources(member)` | 重建源库并建 `crm.customers`、`loyalty.members`、`tracking.users` + `tracking.events` 三个 schema，各登记为一个数据源（CRM、会员、埋点）、选表、确认水位线（`updated_at`）、同步完，返回 `{ crm, loyalty, tracking }`；两边同一个人的手机写法不同、只有邮箱相同、外部 ID 相同、手机-邮箱成链，另有空手机 / 空邮箱的记录；埋点用户与 CRM 重叠，事件含 login 与匿名事件，一台设备先后被两个人登录、一台同一时刻被两人登录（详见函数注释）。`{ orders: true }` 时 CRM 与会员源各多一张订单表（`crm.orders`、`loyalty.orders`，列名与状态写法不同，含一笔打通不到消费者的订单与一笔晚于 2024-07-01 的订单）一并同步。采集 / 同步任务失败时会重新入队，最多 3 次，仍失败就抛出任务错误 |
+| `drainUntilSucceeded(name, task, retry)` | 跑空调度器后查任务状态，failed 时调 `retry` 重新入队，最多 3 次，仍失败就抛出任务原始错误（错误里带 `name`、任务 kind、状态、重试次数）；`task` 为 null 时直接抛错。采集任务重试用 `relistSource`（表已在同步范围内时 `setSyncScope` 返回 `task: null`），同步任务重试再调 `syncSource` |
 | `seedMysqlSource()` | MySQL 源库，`orders` 带自增主键与 `updated_at`（需 `TEST_MYSQL_URL`） |
 | `seedMongoSource()` / `MONGO_USERS` | MongoDB 源库与几种权限的账号（需 `TEST_MONGO_URL`） |
 

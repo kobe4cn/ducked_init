@@ -108,6 +108,23 @@ export async function pgSourceInput(account: { user: string; password: string },
 }
 
 /**
+ * 跑空调度器后检查任务状态：完整测试时多个 worker 共用一台 PG，任务的 DuckDB 子进程偶尔连不上源库而失败（#346、#360），
+ * 失败就调 retry 重新入队，最多 3 次，仍失败就抛出任务的原始错误。采集任务重试用 relistSource（表已在同步范围内时 setSyncScope 不再入队）
+ */
+export async function drainUntilSucceeded(name: string, task: { id: string } | null, retry: () => Promise<{ id: string } | null>) {
+  for (let attempt = 0; ; attempt++) {
+    await drain();
+    if (!task) throw new Error(`${name}：没有入队任务`);
+    const done = await getTask(task.id);
+    if (done.status === 'succeeded') return;
+    if (done.status !== 'failed' || attempt >= 3) {
+      throw new Error(`${name} 的 ${done.kind} 任务 ${done.status}（已重试 ${attempt} 次）：${done.error ?? ''}`);
+    }
+    task = await retry();
+  }
+}
+
+/**
  * 身份打通用的三个数据源（重建源库后在其中建 crm、loyalty、tracking 三个 schema），登记、选表、确认水位线并同步一次，返回三个数据源的 ID。
  * 两边的 ID 都从 1 编起（同一个 customer_id 在两个源里是不同的人），同一个人的写法不同：
  * - crm 1 ↔ loyalty 1：手机号 +86 带空格 / 带横线；crm 2 ↔ loyalty 2：0086 前缀
@@ -188,20 +205,6 @@ export async function seedIdentitySources(member: CurrentMember, { orders = fals
   const ids: string[] = [];
   const extra = [...orders ? ['orders'] : [], ...consents ? ['consents'] : []];
   const sources: [string, string, string[]][] = [['CRM', 'crm', ['customers', ...extra]], ['会员', 'loyalty', ['members', ...extra]], ['埋点', 'tracking', ['users', 'events']]];
-  // 完整测试时多个 worker 共用一台 PG，任务的 DuckDB 子进程偶尔连不上源库而失败（#346）：
-  // drain 后检查任务状态，失败就重新入队，最多 3 次，仍失败就抛出任务的原始错误
-  const drainUntilSucceeded = async (name: string, task: { id: string } | null, retry: () => Promise<{ id: string } | null>) => {
-    for (let attempt = 0; ; attempt++) {
-      await drain();
-      if (!task) throw new Error(`${name}：没有入队任务`);
-      const done = await getTask(task.id);
-      if (done.status === 'succeeded') return;
-      if (done.status !== 'failed' || attempt >= 3) {
-        throw new Error(`${name} 的 ${done.kind} 任务 ${done.status}（已重试 ${attempt} 次）：${done.error ?? ''}`);
-      }
-      task = await retry();
-    }
-  };
   for (const [name, schema, tables] of sources) {
     const { id } = await registerSource(member, { ...input, name, schema });
     await drain();
