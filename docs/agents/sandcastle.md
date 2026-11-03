@@ -54,6 +54,23 @@ GitHub CI 不作为门槛。
 - 要修改留下的 PR：在 PR 上留意见（普通评论、review 正文、行内意见都行），再发一条**以 `/sandcastle` 开头**的评论或 review（意见可以直接写在它后面），然后运行。每轮开头，脚本看到晚于分支最新提交的 `/sandcastle`，或别人点的 Request changes，就去掉 `sandcastle:pr-open`，把票放回 plan。PR 是用你的 gh 凭据开的，GitHub 不让作者对自己的 PR 点 Request changes，所以要用 `/sandcastle`。implementer 接着同一个分支 `sandcastle/issue-<n>` 做，并先读 PR 评论和行内意见。reviewer 会逐条确认这些意见都处理了，才给 `merge`。手动去掉 `sandcastle:pr-open` 的老办法也还能用。
 - 已经有指引、但写于 blocker 合并之前的票，prep 会按 `docs/agents/ticket-sizing.md` 重写指引。
 
+## 外部 PR：让 Sandcastle 接手别人开的 PR
+
+其他 agent 或人开的 PR，满足下面几条，就能像 Sandcastle 自己的 PR 一样用 `/sandcastle` 打回：
+
+- PR 正文写 `Closes #<n>`，关联一张 issue。分支在本仓库，不能来自 fork，因为 Sandcastle 要往这个分支推提交。
+- 这张 issue 带 `Sandcastle`、`ready-for-agent`、`sandcastle:prepped`、`sandcastle:pr-open`，表示 PR 已开、等人审，不再 prep。正文按 `ticket-sizing.md` 写：验收标准最多 3 条，而且 agent 能自己验证；有 `## Implementation guide`，要改的文件各写一行 `- **Change**:`。
+- 打回的写法和上面一样：发一条以 `/sandcastle` 开头的评论或 review，时间要晚于分支的最新提交。
+
+脚本按 issue 关联的 open PR 找分支，同一张票同时有 `sandcastle/issue-<n>` 时优先用它；关联了多个外部 PR 时跳过这张票。对外部 PR，脚本会：
+
+- 把远端分支同步到本地，在对方的提交上接着改。
+- review 和完整测试照常跑。
+- 只做普通 push，不 force、不 rebase、不删分支。
+- 不自动合并：在 PR 上评论 review 结论和测试结果，重新打上 `sandcastle:pr-open`，由人合并。
+
+Sandcastle 处理期间，PR 作者不要往这个分支推提交。本地和远端分叉时，这张票会失败并打 `sandcastle:stuck`。如果 3 次会话内没改完，脚本会推上已有的提交并打 `sandcastle:stuck`，不退回 prep。
+
 ## 上下文预算
 
 - implementer 的每次迭代都是全新的 Claude 会话；`IMPLEMENT_MAX_ITERATIONS = 3`。第一次超过时退回 prep 重新准备（见标签状态机），分支先推到远端，已有提交列在评论里；重新准备后再超过才打 `sandcastle:stuck`。

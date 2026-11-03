@@ -20,6 +20,8 @@
 //   每轮开头：等人审的 PR 上有晚于分支最新提交的打回信号（`/sandcastle` 开头的评论或 review，
 //                    或别人点的 Request changes）→ 去掉 issue 的 sandcastle:pr-open，这张票本轮
 //                    重新进入 plan，implementer 先读 PR 上的意见。
+//   外部 PR：别人开的、`Closes` 了 Sandcastle 票的 PR（分支不是 `sandcastle/` 开头），打回后在它的分支上
+//                    接着改：只做普通 push，不 rebase、不合并、不删分支，结果评论在 PR 上留给人合并。
 //
 // 标签状态机见 docs/agents/sandcastle.md。
 //
@@ -315,7 +317,10 @@ function plan(): Issue[] {
     }
     if (picked.length >= MAX_PARALLEL) break;
     for (const f of files) taken.set(f, issue.number);
-    picked.push({ id: String(issue.number), title: issue.title, branch: `sandcastle/issue-${issue.number}` });
+    // 已有外部 PR（`Closes` 了这张票）时在它的分支上接着改；否则照旧用自己的分支。
+    const pr = prFor(issue.number);
+    const branch = pr && !pr.headRefName.startsWith("sandcastle/") ? pr.headRefName : ownBranch(issue.number);
+    picked.push({ id: String(issue.number), title: issue.title, branch });
   }
   return picked;
 }
@@ -338,12 +343,80 @@ const tagged = (stdout: string, tag: string) =>
 
 type Issue = { id: string; title: string; branch: string };
 
+const ownBranch = (issueId: string | number) => `sandcastle/issue-${issueId}`;
+/**
+ * 外部 PR：别人（其他 agent、人）开的、`Closes` 了这张票的 PR，分支不是 `sandcastle/` 开头。
+ * Sandcastle 在它的分支上接着改，但只做普通 push：不 force、不 rebase、不合并、不删分支，合并留给人。
+ */
+const isExternal = (issue: Issue) => !issue.branch.startsWith("sandcastle/");
+
+/** 推分支：自己的分支照旧 force-with-lease（rebase 过）；外部分支只做普通 push，被拒就报错。 */
+function pushBranch(issue: Issue) {
+  return trySh("git", isExternal(issue)
+    ? ["push", REMOTE, `${issue.branch}:${issue.branch}`]
+    : ["push", "--force-with-lease", "-u", REMOTE, issue.branch]);
+}
+
+type LinkedPr = {
+  number: number;
+  state: string;
+  headRefName: string;
+  isCrossRepository: boolean;
+  reviews: { state: string; body: string; submittedAt: string }[];
+  comments: { body: string; createdAt: string }[];
+  commits: { committedDate: string }[];
+};
+const PR_FIELDS = "number,state,headRefName,isCrossRepository,reviews,comments,commits";
+
+/**
+ * 这张票的 open PR：先按 issue 关联（PR 正文的 `Closes #n`），同时有自己的分支时用自己的；
+ * 关联里只有一个本仓库的外部 PR 时用它；有多个外部 PR 时不猜，返回 null 并打日志。
+ * 关联查不到（接口出错、没有关联）时退回按分支名 `sandcastle/issue-n` 查，和改之前一样。
+ */
+function prFor(issueId: string | number): LinkedPr | null {
+  const view = (ref: string): LinkedPr | null => {
+    const r = trySh("gh", ["pr", "view", ref, "--json", PR_FIELDS]);
+    if (!r.ok) return null;
+    const pr = JSON.parse(r.out) as LinkedPr;
+    return pr.state === "OPEN" ? pr : null;
+  };
+  const linked = trySh("gh", ["issue", "view", String(issueId), "--json", "closedByPullRequestsReferences", "--jq", ".closedByPullRequestsReferences[].number"]);
+  const prs = linked.ok
+    ? linked.out.split("\n").filter(Boolean).map(view).filter((pr): pr is LinkedPr => pr !== null && !pr.isCrossRepository)
+    : [];
+  const own = prs.find((pr) => pr.headRefName === ownBranch(issueId));
+  if (own) return own;
+  const external = prs.filter((pr) => !pr.headRefName.startsWith("sandcastle/"));
+  if (external.length > 1) {
+    console.warn(`  ⚠ #${issueId} 关联了多个外部 PR（${external.map((pr) => `#${pr.number}`).join("、")}），不知道在哪个上改，跳过`);
+    return null;
+  }
+  return external[0] ?? view(ownBranch(issueId));
+}
+
+/**
+ * 外部 PR 的分支：开沙箱前同步到宿主机本地（沙箱从本地分支建 worktree，本地没有就会从 main 新建，丢掉对方的提交）。
+ * 本地没有就从远端建；本地落后就快进；本地领先（上次没推上去）就保留；两边分叉就报错，交给人。
+ */
+function syncExternalBranch(issue: Issue) {
+  sh("git", ["fetch", REMOTE, issue.branch]);
+  const remote = `${REMOTE}/${issue.branch}`;
+  if (!trySh("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${issue.branch}`]).ok) {
+    sh("git", ["branch", issue.branch, remote]);
+  } else if (trySh("git", ["merge-base", "--is-ancestor", issue.branch, remote]).ok) {
+    sh("git", ["branch", "-f", issue.branch, remote]);
+  } else if (!trySh("git", ["merge-base", "--is-ancestor", remote, issue.branch]).ok) {
+    throw new Error(`本地分支 ${issue.branch} 和 ${remote} 分叉了（PR 作者在 Sandcastle 处理期间推过提交？），请人合并后再跑。`);
+  }
+}
+
 /** 截图附件：gh 2.99+ 的 --attach 上传图片，没在正文里引用的附在末尾 */
 const attachArgs = (shots: string[]) =>
   shots.flatMap((file) => ["--attach", `${file}#${basename(file)}`]);
 
 function pushAndOpenPr(issue: Issue, notes: string, shots: string[]): string {
-  sh("git", ["push", "--force-with-lease", "-u", REMOTE, issue.branch]);
+  const pushed = pushBranch(issue);
+  if (!pushed.ok) throw new Error(`push ${issue.branch} 失败：${pushed.out.slice(0, 500)}`);
   const existing = sh("gh", [
     "pr", "list", "--head", issue.branch, "--state", "open", "--json", "number", "--jq", ".[0].number",
   ]);
@@ -351,6 +424,8 @@ function pushAndOpenPr(issue: Issue, notes: string, shots: string[]): string {
     sh("gh", ["pr", "comment", existing, "--body", `Sandcastle 更新了这个分支。\n\n${notes}`, ...attachArgs(shots)]);
     return existing;
   }
+  // 外部 PR 不在这里新开：它被关了就说明人不要了。
+  if (isExternal(issue)) throw new Error(`分支 ${issue.branch} 上已经没有 open 的 PR，外部 PR 不由 Sandcastle 重开。`);
   const commits = sh("git", ["log", `${BASE_REF}..${issue.branch}`, "--format=- %B"]);
   const body = `Closes #${issue.id}\n\n${notes}\n\n## Commits\n\n${commits}`;
   const url = sh("gh", [
@@ -381,16 +456,8 @@ const REVISE_COMMAND = "/sandcastle";
 function reopenRequestedRevisions() {
   for (const { number: issueId } of searchIssues(`${q(LABEL.prOpen)} ${notIn(LABEL.stuck)}`)) {
     if (!allowed(issueId)) continue;
-    const view = trySh("gh", ["pr", "view", `sandcastle/issue-${issueId}`, "--json", "number,state,reviews,comments,commits"]);
-    if (!view.ok) continue;
-    const pr: {
-      number: number;
-      state: string;
-      reviews: { state: string; body: string; submittedAt: string }[];
-      comments: { body: string; createdAt: string }[];
-      commits: { committedDate: string }[];
-    } = JSON.parse(view.out);
-    if (pr.state !== "OPEN") continue;
+    const pr = prFor(issueId);
+    if (!pr) continue;
     const lastCommit = pr.commits.map((c) => c.committedDate).sort().at(-1) ?? "";
     const signals = [
       ...pr.reviews
@@ -454,6 +521,7 @@ function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
 // ---------------------------------------------------------------------------
 
 async function build(issue: Issue) {
+  if (isExternal(issue)) syncExternalBranch(issue);
   const env = testEnv(issue.id);
   const sandbox = await sandcastle.createSandbox({
     branch: issue.branch,
@@ -569,6 +637,7 @@ const MIGRATION_CHAIN_OK = migrationChainOk("HEAD");
  * 任何一步不成都返回原因，由调用方留 PR。
  */
 async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (isExternal(issue)) return { ok: false, reason: `外部 PR 的分支 ${issue.branch} 不由 Sandcastle rebase 或合并。` };
   sh("git", ["fetch", REMOTE, BASE_BRANCH]);
   const env = testEnv(issue.id);
   const sandbox = await sandcastle.createSandbox({ branch: issue.branch, baseBranch: BASE_REF, sandbox: sandboxFor(env), hooks, copyToWorktree });
@@ -708,7 +777,7 @@ async function untilAfterLimit<T>(what: string, fn: () => Promise<T>, onLimit?: 
 /** 分支上已有提交时推到远端，免得只留在宿主机上。 */
 function pushIfAhead(issue: Issue) {
   const ahead = trySh("git", ["rev-list", "--count", `${BASE_REF}..${issue.branch}`]);
-  if (ahead.ok && Number(ahead.out) > 0) trySh("git", ["push", "--force-with-lease", "-u", REMOTE, issue.branch]);
+  if (ahead.ok && Number(ahead.out) > 0) pushBranch(issue);
 }
 
 /** issue 已关闭（人在运行中途合并了 PR、或手动关了票）。查不到时当作没关。 */
@@ -759,8 +828,14 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
       );
       return;
     }
+    // 外部 PR 不退回 prep（prep 会按 sandcastle/issue-n 拆票）：推上已有的提交，交给人。
+    if (isExternal(issue)) {
+      const pushed = pushBranch(issue).ok;
+      markStuck(issue.id, `在外部 PR 的分支 \`${issue.branch}\` 上 ${IMPLEMENT_MAX_ITERATIONS} 次会话内没有改完（见上面 implementer 的评论）。${budgetNote}${pushed ? "已有的提交推到了这个分支。" : "提交没能推上去，留在宿主机的本地分支上。"}`);
+      return;
+    }
     // 第一次没做完：分支推上去免得部分提交只留在宿主机，提交列表写进评论给 prep 看，退回 prep 重新准备。
-    const pushed = trySh("git", ["push", "--force-with-lease", "-u", REMOTE, issue.branch]).ok;
+    const pushed = pushBranch(issue).ok;
     const log = trySh("git", ["log", "--format=- %h %s", `${BASE_REF}..${issue.branch}`]);
     const commits = log.ok && log.out ? `\n\n分支 \`${issue.branch}\` 上已有的提交：\n\n${log.out}` : "\n\n分支上还没有提交。";
     sh("gh", ["issue", "edit", issue.id, "--remove-label", LABEL.prepped]);
@@ -798,6 +873,19 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     if (tickets.length) sh("gh", ["pr", "comment", pr, "--body", `门槛里的偶发失败已开票：${tickets.join("、")}`]);
   }
 
+  // 外部 PR 一律留给人合并：不 rebase、不合并，只报告 review 与门槛结果。
+  if (isExternal(issue)) {
+    sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+    const clean = trySh("git", ["merge-tree", "--write-tree", "--name-only", BASE_REF, issue.branch]).ok;
+    leaveForHuman(
+      issue,
+      pr,
+      `这是外部 PR，Sandcastle 只负责修改，合并由人决定。reviewer 结论：${result.verdict}；门槛${result.gate.ok ? "通过" : "没通过"}（见上面的评论）。` +
+        (clean ? "" : `\n\n⚠️ 分支和最新的 ${BASE_REF} 有冲突，需要先把 ${BASE_BRANCH} 合进来。`),
+    );
+    console.log(`  ◐ #${issue.id} 外部 PR #${pr}，留给人合并`);
+    return;
+  }
   if (result.verdict !== "merge") {
     // 开工后 main 上合进了改同一处的票：先 rebase 好再交给人，免得人审的是一个合不进去的 PR。
     const rebaseNote = result.gate.ok ? await rebaseIfConflicting(issue, pr) : "";
