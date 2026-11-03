@@ -48,11 +48,11 @@ services:
       POSTGRES_USER: crm
       POSTGRES_PASSWORD: crm
       POSTGRES_DB: crm
-    # 批量导入亿级数据时的推荐参数（仅限开发/压测环境）；max_connections=300 供测试的 8 个 worker 并行（vitest.config.ts）
+    # 批量导入亿级数据时的推荐参数（仅限开发/压测环境）；max_connections=450：Sandcastle 3 个沙箱 × 4 个 worker 同时跑完整测试（本地默认 8 个 worker 要 300，vitest.config.ts）
     command: >
       postgres -c shared_buffers=2GB -c max_wal_size=16GB -c checkpoint_timeout=30min
                -c synchronous_commit=off -c maintenance_work_mem=2GB -c max_parallel_maintenance_workers=4
-               -c max_connections=300
+               -c max_connections=450
     ports:
       - "5432:5432"
     volumes:

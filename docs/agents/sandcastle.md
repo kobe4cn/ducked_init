@@ -45,7 +45,7 @@ GitHub CI 不作为门槛。
 ## 其他规则
 
 - 只跑指定的票：`SANDCASTLE_ONLY=328,329 npm run run:sandcastle`（prep 与 plan 都只看名单里的票；拆出来的子票不在名单里，要另外加）。
-- plan 由脚本自己算，不用 agent：在已准备的票里排除 `## Blocked by` 里还有 open 票的，剩下的按编号从小到大选，和已选的票改同一个文件（指引里 `- **Change**: \`path\`` 行的路径）就跳过，所以冲突时总是编号小的先做，最多 2 张。被 blocker 挡住的票不占文件。等人审（`sandcastle:pr-open`）的票也占着它的文件：PR 合入或关闭之前，改同一个文件的票不会开工，免得两个 PR 在同一个文件上冲突；代价是 PR 一直不审，这些票就一直排不上。跳过原因会打在日志里。
+- plan 由脚本自己算，不用 agent：在已准备的票里排除 `## Blocked by` 里还有 open 票的，剩下的按编号从小到大选，和已选的票改同一个文件（指引里 `- **Change**: \`path\`` 行的路径）就跳过，所以冲突时总是编号小的先做，最多 `MAX_PARALLEL`（3）张。被 blocker 挡住的票不占文件。等人审（`sandcastle:pr-open`）的票也占着它的文件：PR 合入或关闭之前，改同一个文件的票不会开工，免得两个 PR 在同一个文件上冲突；代价是 PR 一直不审，这些票就一直排不上。跳过原因会打在日志里。
 - 有 open blocker 的票不会被 prep，也不会被 plan 选中。blocker 留成 PR 时，依赖它的票要等你合并之后的下一次运行。
 - 拆出来的子票会在**下一轮**被看到（每轮开头重新查询 issue）。某一轮 plan 选不出票时，如果这一轮拆出了还没 prep 的子票，就进入下一轮；没有才结束运行。
 - 撞上 Claude 用量限额（`You've hit your … limit · resets 6:20am (UTC)`）不算票失败，不打 `sandcastle:stuck`：脚本从报错里解析重置时间，等到那之后再多等 2 分钟，然后重跑撞上的那一步。prep 原样重跑；实现中的票先把已有提交推到远端，再在原分支上从 implement 重跑，implementer 看到已有提交会直接收尾，review 与门槛从头跑；rebase 补救同样重跑。认不出重置时间就每 30 分钟试一次。进程被中断（Ctrl-C、关机）时，已有提交在本地同名分支上，重跑 `npm run run:sandcastle` 会接着做。
@@ -69,7 +69,7 @@ GitHub CI 不作为门槛。
 - 测试依赖的服务在宿主机的 apple container 里（PG、MySQL、MongoDB、SeaweedFS），端口发布在宿主机上，podman 容器经 `host.containers.internal` 访问。脚本读宿主机的 `.env`（`S3_*`）与 `.env.test`（`TEST_*`），把 `localhost` / `127.0.0.1` 换成 `host.containers.internal` 后传进沙箱。
 - 测试库连接、上下文预算等环境变量在建沙箱时经 `podman({env})` 注入（`sandboxFor`）。`createSandbox` 里的 `sandbox.run` 不使用 `agent(env)` 的 env，放在那里进不了 agent 的 shell。
 - 沙箱建好后用 `package.json` 的 `packageManager`（pnpm）按锁文件重装依赖：拷进来的 `node_modules` 是宿主机 darwin 的，缺 linux 原生包。
-- 每张票的库名与前缀加 `_i<n>`（`crm_platform_test_i<n>`、`crm_source_test_i<n>`、MySQL / MongoDB 库、`TEST_S3_LAKE_URI`），并行的沙箱互不清表；`CRM_TEST_WORKERS=4`，`MAX_PARALLEL × 4` 个 worker 的连接数要在 PG `max_connections` 以内。
+- 每张票的库名与前缀加 `_i<n>`（`crm_platform_test_i<n>`、`crm_source_test_i<n>`、MySQL / MongoDB 库、`TEST_S3_LAKE_URI`），并行的沙箱互不清表；`CRM_TEST_WORKERS=4`，`MAX_PARALLEL × 4` 个 worker 的连接数要在 PG `max_connections` 以内（`MAX_PARALLEL=3` 要 450，见 `db_script/docker-compose.yml`）。
 - 这些资源在每次关沙箱后（`build`、`rebaseAndMerge` 的收尾）由 `scripts/drop-test-resources.ts _i<n>` 在宿主机上回收：PG 的测试库、验收库及其中租户的 catalog 角色 `lake_<id>`（集群级，删库带不走，没有别的库再依赖时才删），MySQL / MongoDB 库（Mongo 连库里的用户与角色），`TEST_S3_LAKE_URI_i<n>*` 下的对象和策略只授权这些前缀的对象存储账号。不等票合并：再跑这张票时 global-setup 与夹具会重新建库。回收失败只打日志、不影响票；留下的用 `pnpm sandcastle:cleanup _i<n>` 补收（pnpm 会把 `--` 原样传给脚本，不要加），没有 Sandcastle 在跑时可用 `--all` 收全部 `_i<数字>`。
 - 门槛里大量用例在 `s3-accounts.ts` 的 IAM 调用上 `TimeoutError`、资源回收也超时时，先看对象存储：`curl -s localhost:9333/dir/status` 的 `Free` 为 0、`container logs seaweedfs` 里有 `No writable volumes and no free volumes left`，就是卷数到了上限。filer 的元数据日志（`/topics/.system/log`，每天一个目录）会一直占新卷，测试越跑越多。本机的 seaweedfs 以 `-volume.max=1000 -master.volumeSizeLimitMB=1024` 启动（2026-11-03 从自动算出的 505 调上来），数据在命名卷 `seaweedfs-data`，重建容器不丢数据。元数据日志由 `scripts/prune-seaweed-metalog.sh [保留天数，默认 2]`（`pnpm sandcastle:prune-metalog`）清理：删早于保留天数的日期目录，再删默认 collection 里已写满且文件全部已删的整卷（立即收回卷位和磁盘）；Sandcastle 每轮开头会自动跑一次。`fs.configure` 给这个路径设 TTL 不生效（filer 写自己的日志不走路径规则）。
 - `GH_TOKEN` 需要 Issues 读写与 Pull requests 只读；push、开 PR、合并在宿主机上用你自己的 git / gh 凭据完成。宿主机的 `gh` 要 2.99+（`--attach` 上传截图）。
