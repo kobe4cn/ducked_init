@@ -356,7 +356,7 @@ describe('字段抽屉与自定义实体详情页里的业务知识面板', () =
     expect((await viewer.post('/lineage?node=customer&field=customer_id', { intent: 'claim.save', targetId: 'field:customer.customer_id', type: 'unit', value: 'count' })).status).toBe(403);
   });
 
-  it('数据工程师在自定义实体详情页的面板里加别名，数据地图抽屉里的实体面板显示同一个别名', async () => {
+  it('数据工程师在自定义实体详情页的面板里加别名，数据地图抽屉里的实体面板显示同一个别名；在版本页提交后回到版本页', async () => {
     const { acme, author, reviewer, sources } = await setup();
     const id = await createCustomEntity(author, {
       name: 'custom_member_card', label: '会员卡', kind: 'dimension', primaryKey: ['card_id'],
@@ -374,5 +374,11 @@ describe('字段抽屉与自定义实体详情页里的业务知识面板', () =
     expect(panelFor(await pageOf(de, page), 'entity:custom_member_card')).toContain('data-alias="储值卡"');
     expect((await knowledgeOf(acme, 'entity:custom_member_card'))).toMatchObject({ aliases: ['储值卡'] });
     expect(panelFor(await pageOf(de, '/lineage?node=custom_member_card'), 'entity:custom_member_card')).toContain('data-alias="储值卡"');
+
+    // 版本页上的面板提交后回到版本页
+    const versions = `${page}?tab=versions`;
+    const again = await de.post(versions, { intent: 'alias.add', targetId: 'entity:custom_member_card', alias: '会员储值卡' });
+    expect(again.status).toBe(302);
+    expect(again.headers.get('location')).toBe(versions);
   });
 });

@@ -106,7 +106,8 @@ export async function action({ request, params }: Route.ActionArgs) {
     // 面板的错误单独放 knowledgeError：放进 error 会显示成登记「未保存」
     const result = await handleKnowledgeIntent(await requirePermission(request, 'definitions:read'), form);
     if ('error' in result) return data({ error: null, intent: null, input: null, knowledgeError: result.error }, { status: result.status });
-    throw redirect(base);
+    // 面板在两个标签页都有，回到提交时所在的标签页
+    throw redirect(`${base}${tabOf(request) === 'edit' ? '' : '?tab=versions'}`);
   }
   try {
     switch (form.get('intent')) {
