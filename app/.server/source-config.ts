@@ -5,8 +5,10 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 import { and, eq, isNull } from 'drizzle-orm';
 import { getDb } from './db/client';
 import { SOURCE_KINDS, sources, type SourceKind } from './db/schema';
+import { lakeRow, lakeSpecOf } from './lake';
 import { FILE_FORMATS, type FileFormat, type S3Connection, type SourceSpec } from './pipeline/source-engine';
 import { decryptForTenant } from './secrets';
+import { UPLOAD_DIR, UPLOAD_TABLE, UPLOAD_TABLE_RULE, uploadDirOf } from './uploads';
 
 /** 可以展示给成员的业务错误（输入不合法、连接失败、账号可写、数据源不存在等），带对应的 HTTP 状态码 */
 export class SourceError extends Error {
@@ -126,6 +128,16 @@ export async function parseSourceInput(tenantId: string, kind: SourceKind, input
       }
       break;
     }
+    case 'upload': {
+      // 修改时上传目录与表名不变：文件已经存在那里（ADR-0037）
+      const dir = previous?.config.dir ?? text(input, 'dir', '上传目录');
+      const table = previous?.config.table ?? text(input, 'table', '表名');
+      if (!UPLOAD_DIR.test(dir)) throw new SourceError('上传目录不合法');
+      if (!UPLOAD_TABLE.test(table)) throw new SourceError(UPLOAD_TABLE_RULE);
+      config = { dir, table };
+      secretKeys = [];
+      break;
+    }
   }
   const sameTarget = previous && JSON.stringify(connectionTarget(previous.config)) === JSON.stringify(connectionTarget(config));
   const credentials: Record<string, string> = {};
@@ -169,7 +181,25 @@ export async function resolveSourceSpec(tenantId: string, kind: SourceKind, conf
       return { kind, path: config.path, format: config.format as FileFormat, s3: s3() };
     case 'duckdb':
       return isS3Path(config.path) ? { kind, path: config.path, s3: s3() } : { kind, path: (await localFile(tenantId, config.path)).full };
+    case 'upload':
+      return uploadSpec(tenantId, config.dir);
   }
+}
+
+/** 上传目录按当前数据湖前缀拼出；数据湖在对象存储时带上租户数据湖的凭据（平台账号不能进 SourceSpec） */
+async function uploadSpec(tenantId: string, dir: string): Promise<SourceSpec> {
+  const lake = await lakeRow(tenantId);
+  if (!lake) throw new SourceError('本租户还没有开通数据湖，读不到上传的文件');
+  const path = uploadDirOf(lake.dataPath, dir);
+  const s3 = (() => {
+    try {
+      return lakeSpecOf(lake).s3;
+    } catch (e) {
+      throw new SourceError((e as Error).message);
+    }
+  })();
+  if (!s3) return { kind: 'upload', path };
+  return { kind: 'upload', path, s3: { endpoint: s3.endpoint, region: s3.region, urlStyle: s3.urlStyle, useSsl: s3.useSsl, keyId: s3.key, secret: s3.secret } };
 }
 
 /** 凭据加密时绑定的用途：换到别的数据源上解不开 */

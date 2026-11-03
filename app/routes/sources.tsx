@@ -1,11 +1,15 @@
-// app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：指标卡、本租户的数据源卡片（标出未核对与最近一次核对有差异的）与登记表单
+// app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：指标卡、本租户的数据源卡片（标出未核对与最近一次核对有差异的）与登记表单。
+// 表单按 multipart 提交：文件上传数据源带着 CSV 文件
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import { CircleAlert, Plus, X } from 'lucide-react';
 import type { Route } from './+types/sources';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
+import type { CurrentMember } from '~/.server/auth';
 import { listSources, registerSource, SourceError } from '~/.server/sources';
+import type { SourceInput } from '~/.server/source-config';
+import { decodeUtf8, removeUpload, storeUpload, UPLOAD_TABLE, UPLOAD_TABLE_RULE } from '~/.server/uploads';
 import { verifyDifferences } from '~/.server/source-verify';
 import { formValues, SOURCE_KIND_LABELS, SOURCE_KINDS, targetOf, type SourceKind } from '~/lib/sources';
 import { cn } from '~/lib/utils';
@@ -46,12 +50,34 @@ export async function action({ request }: Route.ActionArgs) {
   const member = await requirePermission(request, 'sources:write');
   const form = await request.formData();
   if (form.get('intent') !== 'register') return data({ error: '未知操作', values: {} }, { status: 400 });
-  const input = Object.fromEntries([...form].map(([k, v]) => [k, String(v)]));
+  // 先剔出文件：File 经 String() 会变成 "[object File]"
+  const file = form.get('file');
+  const input = Object.fromEntries([...form].filter(([k]) => k !== 'file').map(([k, v]) => [k, String(v)]));
   try {
-    const { id } = await registerSource(member, input);
+    const { id } = input.kind === 'upload' ? await registerUpload(member, input, file) : await registerSource(member, input);
     throw redirect(`/sources/${id}`);
   } catch (e) {
     if (e instanceof SourceError) return data({ error: e.message, values: formValues(form) }, { status: e.status });
+    throw e;
+  }
+}
+
+/**
+ * 文件上传数据源（ADR-0037）：先校验文件与表名，把文件写进服务端生成的上传目录（登记时要列出这张表），再登记。
+ * 登记失败（含探测失败）时删掉目录，不留文件
+ */
+async function registerUpload(member: CurrentMember, input: SourceInput, file: FormDataEntryValue | null) {
+  if (!(file instanceof File) || !file.name.toLowerCase().endsWith('.csv')) throw new SourceError('请选择一份 .csv 文件');
+  if (file.size === 0) throw new SourceError('文件是空的');
+  const table = (input.table ?? '').trim();
+  if (!UPLOAD_TABLE.test(table)) throw new SourceError(UPLOAD_TABLE_RULE);
+  const text = decodeUtf8(new Uint8Array(await file.arrayBuffer()));
+  const dir = crypto.randomUUID();
+  try {
+    await storeUpload(member.tenant.id, dir, table, text);
+    return await registerSource(member, { ...input, table, dir });
+  } catch (e) {
+    await removeUpload(member.tenant.id, dir);
     throw e;
   }
 }
@@ -120,7 +146,7 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
                 <AlertDescription>{actionData.error}</AlertDescription>
               </Alert>
             )}
-            <Form method="post" className="max-w-2xl">
+            <Form method="post" encType="multipart/form-data" className="max-w-2xl">
               <input type="hidden" name="intent" value="register" />
               <FieldGroup>
                 <div className="grid grid-cols-2 gap-4">

@@ -1,7 +1,7 @@
-// app/lib/sources.ts —— 数据源类型五种：PostgreSQL、MySQL、MongoDB、对象存储文件、DuckDB 文件。前后端共用（页面组件也要显示类型名称）
+// app/lib/sources.ts —— 数据源类型六种：PostgreSQL、MySQL、MongoDB、对象存储文件、DuckDB 文件、文件上传。前后端共用（页面组件也要显示类型名称）
 import type { KeyCheckTaskResult } from '~/.server/source-key-check';
 
-export const SOURCE_KINDS = ['postgres', 'mysql', 'mongodb', 's3', 'duckdb'] as const;
+export const SOURCE_KINDS = ['postgres', 'mysql', 'mongodb', 's3', 'duckdb', 'upload'] as const;
 export type SourceKind = (typeof SOURCE_KINDS)[number];
 export const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
   postgres: 'PostgreSQL',
@@ -9,11 +9,14 @@ export const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
   mongodb: 'MongoDB',
   s3: '对象存储文件（S3）',
   duckdb: 'DuckDB 文件',
+  upload: '文件上传',
 };
 
 /** 数据源连接的目标（一行摘要），不含凭据 */
 export const targetOf = (kind: SourceKind, c: Record<string, string>) =>
-  kind === 'postgres' || kind === 'mysql' || kind === 'mongodb' ? `${c.user}@${c.host}:${c.port}/${c.database}${c.schema ? `（${c.schema}）` : ''}` : c.path;
+  kind === 'postgres' || kind === 'mysql' || kind === 'mongodb' ? `${c.user}@${c.host}:${c.port}/${c.database}${c.schema ? `（${c.schema}）` : ''}`
+    : kind === 'upload' ? `_uploads/${c.dir}/`
+    : c.path;
 
 /** 源表的同步方式（由平台根据水位线候选与行数判断） */
 export const SYNC_MODES = {

@@ -24,7 +24,9 @@ export type SourceSpec =
   /** path 是以 / 结尾的前缀：其下每个子目录（或顶层的每个文件）是一张表 */
   | { kind: 's3'; path: string; format: FileFormat; s3: S3Connection }
   /** path 是对象存储上的文件（带 s3）或平台本机上租户源文件目录里的文件 */
-  | { kind: 'duckdb'; path: string; s3?: S3Connection };
+  | { kind: 'duckdb'; path: string; s3?: S3Connection }
+  /** 文件上传（ADR-0037）：path 是租户数据湖里以 / 结尾的上传目录，其下每个 <表名>.csv 是一张表；数据湖在对象存储时带 s3 */
+  | { kind: 'upload'; path: string; s3?: S3Connection };
 
 /** 账号在源端可以写入的对象与权限 */
 export interface WriteGrant { object: string; privileges: string[] }
@@ -158,6 +160,9 @@ export async function attachSource(con: DuckDBConnection, spec: SourceSpec): Pro
       if (spec.s3) await con.run(s3Secret(spec.s3, spec.path));
       await con.run(`ATTACH ${lit(spec.path)} AS src (READ_ONLY)`);
       return { allowed: [spec.path] };
+    case 'upload':
+      if (spec.s3) await con.run(s3Secret(spec.s3, spec.path));
+      return { allowed: [spec.path] };
   }
 }
 
@@ -199,6 +204,13 @@ export async function listTables(con: DuckDBConnection, spec: SourceSpec, mongo?
       byTable.set(name, [...(byTable.get(name) ?? []), file]);
     }
     return [...byTable].map(([name, list]) => ({ name, schema: '', table: name, from: `${READERS[spec.format]}([${list.map(lit).join(', ')}])`, readable: true }));
+  }
+  if (spec.kind === 'upload') {
+    const files = await rows<{ file: string }>(con, `SELECT file FROM glob(${lit(`${spec.path}*.csv`)}) ORDER BY file`);
+    return files.map(({ file }) => {
+      const name = file.slice(spec.path.length).replace(/\.csv$/, '');
+      return { name, schema: '', table: name, from: `read_csv(${lit(file)})`, readable: true };
+    });
   }
   if (spec.kind === 'mongodb' && !mongo!.can('listCollections', spec.database, '')) {
     throw new Error(`账号 ${spec.user} 没有库 ${spec.database} 的读权限，列不出集合。请在 MongoDB 授予：${mongoReadGrant(spec)}`);
@@ -376,6 +388,9 @@ export async function writeGrants(session: Pick<SourceSession, 'con' | 'mongo'>,
       return s3WriteGrants(spec.s3, spec.path);
     case 'duckdb':
       return spec.s3 ? s3WriteGrants(spec.s3, spec.path.slice(0, spec.path.lastIndexOf('/') + 1)) : [];
+    case 'upload':
+      // 凭据是租户数据湖的读写账号，本来就能写这个前缀；文件只由平台写（ADR-0037）
+      return [];
   }
 }
 
@@ -494,9 +509,12 @@ export const SOFT_DELETE_NAME = /delet|remov/i;
 /** 样本中不同取值的个数（近似计数）至少占样本行数的这个比例，才算取值唯一 */
 const KEY_DISTINCT_SHARE = 0.98;
 
-/** 在会话里采集一张表：总行数，以及基于前 sampleRows 行样本的列统计、水位线候选与业务主键候选 */
+/**
+ * 在会话里采集一张表：总行数，以及基于前 sampleRows 行样本的列统计、水位线候选与业务主键候选。
+ * noWatermark：不算水位线候选（上传的文件每次都是整份，ADR-0037）
+ */
 async function profileTable(
-  con: DuckDBConnection, table: SourceTable, keys: { increment?: string; primary: string[] }, sampleRows: number, objectIdKey = false,
+  con: DuckDBConnection, table: SourceTable, keys: { increment?: string; primary: string[] }, sampleRows: number, objectIdKey = false, noWatermark = false,
 ): Promise<TableProfile> {
   const { increment, primary } = keys;
   const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${table.from}`);
@@ -542,7 +560,7 @@ async function profileTable(
         SELECT ${ident(c.column_name)} AS value, count(*) AS rows FROM profile_sample WHERE ${ident(c.column_name)} IS NOT NULL
         GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT ${TOP_MAX_DISTINCT}`)).map(r => ({ value: r.value, rows: Number(r.rows) }));
     }
-    const candidates: WatermarkCandidate[] = columns
+    const candidates: WatermarkCandidate[] = noWatermark ? [] : columns
       .filter(c => c.type.startsWith('TIMESTAMP') && UPDATED_AT_NAME.test(c.name) && c.nullRate === 0)
       .map(c => ({ column: c.name, kind: 'updated_at', reason: `时间类型、按命名是更新时间，样本中无空值` }));
     if (increment) candidates.push({ column: increment, kind: 'increment', reason: '由自增序列生成的主键' });
@@ -576,7 +594,7 @@ export async function profileSource(spec: SourceSpec, limits: EngineLimits, { ta
     const tables: TableProfile[] = [];
     for (const t of selected.filter(t => t.readable)) {
       const keys = { increment: increments.get(t.name), primary: primary.get(t.name) ?? [] };
-      tables.push(await profileTable(session.con, t, keys, sampleRows, spec.kind === 'mongodb'));
+      tables.push(await profileTable(session.con, t, keys, sampleRows, spec.kind === 'mongodb', spec.kind === 'upload'));
     }
     return { tables, unreadable: selected.filter(t => !t.readable).map(t => t.name) };
   } catch (e) {

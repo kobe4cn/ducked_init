@@ -1,7 +1,10 @@
 // 数据源的 HTTP 接缝：数据工程师在界面上登记、修改与轮换凭据、测试连接、选定同步范围、查看列统计并确认水位线；凭据在任何页面与接口里都不回显
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { tasks } from '../../app/.server/db/schema';
+import { sources, tasks } from '../../app/.server/db/schema';
+import { lakeRow } from '../../app/.server/lake';
+import { listLakeFiles } from '../../app/.server/lake-storage';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { ignoreColumn } from '../../app/.server/mappings';
 import { registerSource, relistSource } from '../../app/.server/sources';
@@ -109,7 +112,52 @@ describe('登记数据源', () => {
     expect((await other.get(`/sources/${id}`)).status).toBe(404);
     expect((await other.post(`/sources/${id}`, { intent: 'test' })).status).toBe(404);
   });
+
+  it('有 sources:write 的成员上传 UTF-8 CSV 登记为文件上传数据源：文件存在数据湖 _uploads/<dir>/ 下，数据源页列出这张表', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+    const res = await upload(browser, { name: '活动报名', table: 'signups' }, new File(['id,name\n1,张三\n2,李四\n'], 'signups.csv'));
+    expect(res.status).toBe(302);
+    const id = sourceIdOf(res);
+
+    const [source] = await getDb().select().from(sources).where(eq(sources.id, id));
+    expect(source).toMatchObject({ kind: 'upload', config: { dir: expect.stringMatching(/^[0-9a-f-]{36}$/), table: 'signups' } });
+    expect(await listLakeFiles(await uploadsOf(tenantId))).toEqual([{ path: `${source.config.dir}/signups.csv`, size: expect.any(Number) }]);
+    const detail = await (await browser.get(`/sources/${id}`)).text();
+    expect(detail).toContain('文件上传');
+    expect(detail).toContain('signups');
+    expect(await (await browser.get('/sources')).text()).toContain('活动报名');
+  });
+
+  it('上传登记失败（表名不合法、文件为空、不是 .csv）时 400，不留下数据源与文件；没有 sources:write 的角色 403', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+    const csv = (name = 'a.csv', body = 'id\n1\n') => new File([body], name);
+    for (const [table, file, message] of [
+      ['../escape', csv(), '表名只能包含小写字母'],
+      ['signups', csv('a.csv', ''), '文件是空的'],
+      ['signups', csv('a.txt'), '.csv 文件'],
+    ] as const) {
+      const res = await upload(browser, { name: '活动报名', table }, file);
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain(message);
+    }
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    expect((await upload(await loginAs(app, 'an@acme.com'), { name: '活动报名', table: 'signups' }, csv())).status).toBe(403);
+
+    expect(await getDb().select().from(sources).where(eq(sources.tenantId, tenantId))).toEqual([]);
+    expect(await listLakeFiles(await uploadsOf(tenantId))).toEqual([]);
+  });
 });
+
+/** multipart 提交登记表单，kind 为 upload，带上文件 */
+function upload(browser: Client, fields: Record<string, string>, file: File) {
+  const body = new FormData();
+  for (const [k, v] of Object.entries({ intent: 'register', kind: 'upload', ...fields })) body.set(k, v);
+  body.set('file', file);
+  return browser.request('/sources', { method: 'POST', body });
+}
+
+/** 租户数据湖里的上传根目录 */
+const uploadsOf = async (tenantId: string) => `${(await lakeRow(tenantId))!.dataPath}_uploads/`;
 
 describe('测试连接与轮换凭据', () => {
   it('测试连接列出表数；源端改密码后测试失败，填入新密码保存即恢复，审计记下轮换', async () => {
