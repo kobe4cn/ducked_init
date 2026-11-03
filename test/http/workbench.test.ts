@@ -149,6 +149,37 @@ describe('AI 解读', () => {
     expect(html).toContain('data-workbench-result');
     expect(received).toHaveLength(1);
   });
+
+  it('租户没打开「发送脱敏样本」时确认框与解读结果都说明只发送结构与统计、没有发送样本行，并指向「模型服务」页；管理员打开后文案回到「将发送前 N 行」', async () => {
+    await memberOf(acme, 'an-int2@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an-int2@acme.com');
+    const admin = await loginAs(app, 'admin@acme.com');
+    const sql = 'SELECT city, count(*) n FROM silver.customer GROUP BY 1';
+    platformDefault();
+    fakeLlm(f => app.setLlmFetch(f), () => json({ interpretation: '上海的客户最多' }));
+    const off = /data-interpret-samples="off"[\s\S]*?请租户管理员在[\s\S]*?href="\/model-provider"/;
+
+    const confirm = await (await analyst.post('/workbench', { intent: 'interpret_preview', sql })).text();
+    expect(confirm).toContain('不发送样本行');
+    expect(confirm).toMatch(off);
+    expect(confirm).not.toContain('将发送前');
+    const done = await (await analyst.post('/workbench', { intent: 'interpret', sql, confirmed: '1' })).text();
+    expect(done).toContain('没有发送样本行');
+    expect(done).toMatch(off);
+    expect(done).not.toContain('依据前');
+
+    await admin.post('/model-provider', { intent: 'samples', allowSamples: 'on' });
+    try {
+      const on = await (await analyst.post('/workbench', { intent: 'interpret_preview', sql })).text();
+      expect(on).toContain('将发送前');
+      expect(on).not.toContain('data-interpret-samples');
+      const onDone = await (await analyst.post('/workbench', { intent: 'interpret', sql, confirmed: '1' })).text();
+      expect(onDone).toContain('依据前');
+      expect(onDone).not.toContain('data-interpret-samples');
+    } finally {
+      await admin.post('/model-provider', { intent: 'samples' });
+    }
+  });
 });
 
 describe('沙箱表', () => {
