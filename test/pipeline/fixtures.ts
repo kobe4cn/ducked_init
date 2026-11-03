@@ -63,7 +63,7 @@ export function publish(author: CurrentMember, reviewer: CurrentMember, sourceId
   return timed('publish', async () => {
     const mapping = await createMapping(author, sourceId, yaml);
     await publishMapping(reviewer, mapping.id, 1);
-    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    await drain();
     return mapping.id;
   });
 }
