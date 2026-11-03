@@ -564,10 +564,11 @@ const MIGRATION_CHAIN_OK = migrationChainOk("HEAD");
 
 /**
  * 把分支 rebase 到最新的 origin/main：没冲突直接 rebase；有冲突开一次 agent 会话按
- * rebase-prompt.md 解决。然后重跑门槛，通过才 force-push 并再合并一次。
+ * rebase-prompt.md 解决。然后重跑门槛，通过才 force-push；merge 为 true 时再合并一次，
+ * 为 false 时只更新 PR（留给人审的 PR 不和 main 冲突）。
  * 任何一步不成都返回原因，由调用方留 PR。
  */
-async function rebaseAndMerge(issue: Issue, pr: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{ ok: true } | { ok: false; reason: string }> {
   sh("git", ["fetch", REMOTE, BASE_BRANCH]);
   const env = testEnv(issue.id);
   const sandbox = await sandcastle.createSandbox({ branch: issue.branch, baseBranch: BASE_REF, sandbox: sandboxFor(env), hooks, copyToWorktree });
@@ -613,6 +614,10 @@ async function rebaseAndMerge(issue: Issue, pr: string): Promise<{ ok: true } | 
     }
 
     sh("git", ["push", "--force-with-lease", REMOTE, issue.branch]);
+    if (!merge) {
+      sh("gh", ["pr", "comment", pr, "--body", `Sandcastle 把分支 rebase 到最新的 ${BASE_REF}（原来和它冲突），门槛重跑通过。`]);
+      return { ok: true };
+    }
     // GitHub 重新计算可合并状态要一点时间。
     let last = "";
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -713,6 +718,22 @@ function issueClosed(id: string) {
 }
 
 /** Phase 3：一张票的落地。在宿主机上做，用宿主机的 git / gh 凭据，沙箱没有写仓库的权限。 */
+/**
+ * 要留给人审的分支如果和最新的 origin/main 有文本冲突（或 drizzle 迁移链分叉），走 rebaseAndMerge 但不合并。
+ * 返回附在 leaveForHuman 说明后面的一句话；不需要 rebase 时为空串。
+ */
+async function rebaseIfConflicting(issue: Issue, pr: string): Promise<string> {
+  sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+  const clean = trySh("git", ["merge-tree", "--write-tree", "--name-only", BASE_REF, issue.branch]).ok;
+  const chainOk = trySh("sh", ["-c", migrationChainOk(issue.branch)]).ok;
+  if (clean && chainOk) return "";
+  console.log(`  ↻ #${issue.id} 和最新的 ${BASE_REF} 冲突，rebase 后再留给人审`);
+  const r = await untilAfterLimit(`rebase #${issue.id}`, () => rebaseAndMerge(issue, pr, false));
+  return r.ok
+    ? `\n\n分支和最新的 ${BASE_REF} 冲突，已 rebase 并重跑门槛通过。`
+    : `\n\n⚠️ 分支和最新的 ${BASE_REF} 冲突，自动 rebase 没成：${r.reason}`;
+}
+
 async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnType<typeof build>>>) {
   // 运行期间人已经合并了这张票的 PR 或关了票：不再 push、开 PR、打标签，本地分支留着备查。
   if (issueClosed(issue.id)) {
@@ -778,12 +799,14 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
   }
 
   if (result.verdict !== "merge") {
+    // 开工后 main 上合进了改同一处的票：先 rebase 好再交给人，免得人审的是一个合不进去的 PR。
+    const rebaseNote = result.gate.ok ? await rebaseIfConflicting(issue, pr) : "";
     leaveForHuman(
       issue,
       pr,
-      result.verdict === "revise"
+      (result.verdict === "revise"
         ? `reviewer 打回 ${REVISE_MAX} 次后仍有要改的问题（见最新的 Review）。`
-        : "reviewer 认为需要人审（见 PR 正文的 Review）。",
+        : "reviewer 认为需要人审（见 PR 正文的 Review）。") + rebaseNote,
     );
     console.log(`  ◐ #${issue.id} 留 PR #${pr} 等人审`);
     return;
