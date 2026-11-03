@@ -79,7 +79,7 @@ describe('需复核', () => {
     expect(JSON.stringify(after)).not.toContain('needsReview');
     expect(JSON.stringify(after)).not.toContain('previous');
     expect(after).toMatchObject({ knowledge: { aliases: ['营收'], note: '只算已支付', claims: [{ type: 'currency', value: 'CNY' }] } });
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 
   it('映射发布改了计划的新版本后，映射字段上的别名、口径声明、映射说明带需复核，说明的标记在血缘项上；内容不变的重新发布不触发', async () => {
     const { acme, author, reviewer, orderMappings } = await setup();
@@ -108,5 +108,5 @@ describe('需复核', () => {
 
     await saveBusinessNote(author, { entity: 'order', field: 'status', mappingId: crm, note: 'CRM 手工改状态' });
     expect(crmLineage(expand(await tenantCatalog(acme), target))).not.toHaveProperty('noteNeedsReview');
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），还有两次 republish 的 drain（合并、gold.dsl、serving.build），4 个 worker 并行时超过默认的 90 s
 });
