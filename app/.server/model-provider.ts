@@ -31,6 +31,9 @@ export interface ModelProviderView {
 const rowOf = async (tenantId: string) =>
   (await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, tenantId)))[0];
 
+/** 租户是否允许把脱敏样本行发给模型服务（默认否）；不查权限，给分析师发起的调用（如工作台结果解读）判断发什么 */
+export const samplesAllowed = async (tenantId: string): Promise<boolean> => (await rowOf(tenantId))?.allowSamples ?? false;
+
 /** 本租户填写的端点与模型名、Key 是否已设置，以及当前实际用哪套（providerSource，与调用模型时的选取一致） */
 export async function getModelProvider(actor: CurrentMember): Promise<ModelProviderView> {
   assertCan(actor, 'model_provider:manage');

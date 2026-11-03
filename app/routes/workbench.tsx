@@ -5,7 +5,8 @@
 // 左侧目录树按 标准层 / 结果层 / 我的沙箱 / 分享给我的 列出能读的表、字段类型、行数与湖中位置，点表名把带引号的引用插进 SQL 框；
 // 「原始层」按数据源名列出回放后当前状态的视图（敏感列是哈希），名字与保留名冲突的数据源给出没挂载的原因。
 // 「AI 起草」把需求与能读的表名、字段名发给模型服务，起草的 SQL 通过白名单校验后填进编辑框、不执行（ADR-0043），没通过时编辑框保留原来的 SQL。
-// 结果上方的「请 AI 解读」先由服务端重新执行、列出要发送与剔除的列，成员确认后再执行一次，把前 INTERPRET_ROWS 行（剔除敏感列与哈希列）发给模型服务，显示解读。
+// 结果上方的「请 AI 解读」先由服务端重新执行、列出要发送与剔除的列，成员确认后再执行一次，把前 INTERPRET_ROWS 行（剔除敏感列与哈希列）发给模型服务，显示解读；
+// 租户没打开「发送脱敏样本」时只发 SQL、列名与类型、行数和列统计，确认框与解读结果都写明没有发送样本行，并请租户管理员到「模型服务」页打开。
 // 解读存进本人的助手对话：隐藏字段 conversationId 带着这次的对话，同一页面再解读追加到同一个对话。
 // ?sql= 把 SQL 填进编辑框、不执行（助手侧栏里解读消息的「在工作台重新执行」链接到这里）；表单都提交到不带 ?sql 的 /workbench。
 // SQL 框是 SqlEditor（CodeMirror，客户端加载）：DuckDB 高亮，按同一份目录补全 schema / 表 / 字段，Ctrl/⌘+Enter 执行
@@ -117,6 +118,15 @@ const CATALOG_SECTIONS: { key: Exclude<keyof WorkbenchCatalog, 'raw'>; title: st
 ];
 
 /** 左侧目录树：schema → 表（行数、位置）→ 字段（类型）；点表名调用 onInsert 插入引用 */
+/** 租户没打开「发送脱敏样本」时的说明：分析师打不开「模型服务」页，所以请租户管理员去开，链接只是辅助 */
+function SamplesOff() {
+  return (
+    <p className="text-sm text-slate-500" data-interpret-samples="off">
+      本次没有发送样本行。如需让 AI 参考脱敏后的样本行，请租户管理员在<Link to="/model-provider" className="mx-0.5 underline">「模型服务」</Link>页打开「发送脱敏样本」。
+    </p>
+  );
+}
+
 function CatalogTree({ catalog, error, onInsert }: { catalog: WorkbenchCatalog | null; error?: string; onInsert: (ref: string) => void }) {
   return (
     <aside className="space-y-3 self-start rounded-2xl border bg-white p-4 text-sm shadow-sm" data-catalog-tree>
@@ -296,13 +306,14 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
             <div className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm" data-interpret="confirm">
               <h2 className="flex items-center gap-1 text-base font-semibold"><Sparkles className="size-4 text-amber-600" />请 AI 解读</h2>
               <p className="text-sm">
-                {`将发送前 ${preview.rows} 行的这些列：`}
+                {preview.samples ? `将发送前 ${preview.rows} 行的这些列：` : '只发送 SQL、列名与类型、行数和这些列的统计，不发送样本行：'}
                 <span className="font-mono" data-interpret-sent>{preview.sent.join('、') || '（没有）'}</span>
               </p>
               <p className="text-sm text-slate-500">
                 已剔除（系统列、名字像敏感字段的列、取值是哈希的列）：
                 <span className="font-mono" data-interpret-dropped>{preview.dropped.join('、') || '（没有）'}</span>
               </p>
+              {!preview.samples && <SamplesOff />}
               <Form method="post" action="/workbench" className="flex flex-wrap items-center gap-3">
                 <input type="hidden" name="sql" value={actionData?.sql ?? ''} />
                 <input type="hidden" name="confirmed" value="1" />
@@ -320,8 +331,9 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
               <h2 className="flex items-center gap-1 text-base font-semibold"><Sparkles className="size-4 text-amber-600" />AI 解读</h2>
               <p className="whitespace-pre-wrap text-sm">{interpretation.text}</p>
               <p className="text-sm text-slate-400">
-                {`依据前 ${interpretation.rows} 行的 ${interpretation.columns.join('、')}${interpretation.dropped.length ? `；已剔除 ${interpretation.dropped.join('、')}` : ''}。AI 的解读可能有误，请核对。已存进 AI 助手的「历史对话」。`}
+                {`${interpretation.samples ? `依据前 ${interpretation.rows} 行的` : `依据 ${interpretation.rows} 行结果的结构与统计（没有发送样本行）：`} ${interpretation.columns.join('、')}${interpretation.dropped.length ? `；已剔除 ${interpretation.dropped.join('、')}` : ''}。AI 的解读可能有误，请核对。已存进 AI 助手的「历史对话」。`}
               </p>
+              {!interpretation.samples && <SamplesOff />}
             </div>
           )}
 

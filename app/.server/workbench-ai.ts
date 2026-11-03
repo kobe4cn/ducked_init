@@ -1,8 +1,9 @@
 // app/.server/workbench-ai.ts —— 工作台 AI 起草 SQL（ADR-0043）：按成员此刻能读的目录（listCatalog：表、字段与类型，不含取值）请模型写一条只读 SQL，
 // 在只读挂载上按工作台白名单校验（checkDraftedSql，不执行），通过后只交给页面填进编辑框，由成员自己执行。
 // 审计 workbench.ai_drafted 记 SQL 与是否通过校验，不记需求原文；不自动重试。
-// 结果解读：成员确认后服务端按 SQL 重新执行（不信客户端传来的行），把前 INTERPRET_ROWS 行发给模型服务；结果列无法回溯到字段，
-// 所以按列名与取值保守剔除系统列、名字像敏感字段的列与取值里有 64 位十六进制哈希的列。审计 workbench.result_interpreted 不记取值；
+// 结果解读：成员确认后服务端按 SQL 重新执行（不信客户端传来的行），租户打开「发送脱敏样本」时把前 INTERPRET_ROWS 行发给模型服务，
+// 没打开时只发 SQL、列名与类型、行数和每列统计（按全部结果行算），不发任何行；结果列无法回溯到字段，
+// 所以按列名与取值保守剔除系统列、名字像敏感字段的列与取值里有 64 位十六进制哈希的列（统计也只算留下的列）。审计 workbench.result_interpreted 不记取值，记 samples；
 // 解读连同 SQL、行数与发送的列名存进本人的助手对话（appendInterpretation），不存结果行
 import { assertCan } from './access';
 import { appendInterpretation, assertOwnConversation } from './assistant/conversations';
@@ -13,6 +14,7 @@ import { getDb } from './db/client';
 import { chatJson, LlmError, resolveProvider, type LlmMessage } from './llm';
 import { normalizeWorkbenchSql, type WorkbenchResult } from './pipeline/workbench-engine';
 import { checkDraftedSql, listCatalog, runQuery, WorkbenchError, type QueryOutcome, type WorkbenchCatalog } from './workbench';
+import { samplesAllowed } from './model-provider';
 import { looksSensitive } from '../lib/sensitive';
 
 /** 可以展示给成员的错误 */
@@ -142,6 +144,29 @@ export function redactResult(result: WorkbenchResult, limit = INTERPRET_ROWS): {
 /** 发给模型服务的行数 */
 const sentRows = (result: WorkbenchResult) => Math.min(result.rows.length, INTERPRET_ROWS);
 
+/** DuckDB 的数值类型（DECIMAL(18,2) 之类带参数的按前缀判断） */
+const NUMERIC = /^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|UHUGEINT|FLOAT|REAL|DOUBLE|DECIMAL|NUMERIC)\b/i;
+
+interface ColumnStats { name: string; type: string; nonNull: number; distinct: number; min?: number; max?: number; avg?: number }
+
+/** 不发样本时交出去的结构：SQL、行数与 keep 留下的列的统计（按全部结果行算）；文本、日期等只给非空数与去重数（ADR-0016），数值列再给最小 / 最大 / 平均 */
+function columnStats(sql: string, result: WorkbenchResult, keep: boolean[]) {
+  const columns = result.columns.flatMap(({ name, type }, i): ColumnStats[] => {
+    if (!keep[i]) return [];
+    const cells = result.rows.map(row => row[i]).filter(v => v !== null && v !== undefined);
+    const stats: ColumnStats = { name, type, nonNull: cells.length, distinct: new Set(cells.map(cellText)).size };
+    const numbers = NUMERIC.test(type) ? cells.map(Number).filter(Number.isFinite) : [];
+    if (!numbers.length) return [stats];
+    return [{
+      ...stats,
+      min: numbers.reduce((a, b) => Math.min(a, b)),
+      max: numbers.reduce((a, b) => Math.max(a, b)),
+      avg: numbers.reduce((a, b) => a + b, 0) / numbers.length,
+    }];
+  });
+  return { sql, rowCount: result.rows.length, truncated: result.truncated, columns };
+}
+
 /** 查询出错（SQL 不合规、超时、已有查询在运行）照原状态码给出 */
 async function rerun(actor: CurrentMember, sql: string): Promise<QueryOutcome> {
   try {
@@ -152,13 +177,37 @@ async function rerun(actor: CurrentMember, sql: string): Promise<QueryOutcome> {
   }
 }
 
-/** 解读前的确认：按 SQL 重新执行，给出将发送的行数与列、剔除的列，不请求模型；result 是这次执行的结果，页面照常显示表格 */
+/**
+ * 解读前的确认：按 SQL 重新执行，给出将发送的行数与列、剔除的列，不请求模型；result 是这次执行的结果，页面照常显示表格。
+ * samples 为假（租户没打开「发送脱敏样本」）时只发结构与统计：rows 是统计覆盖的结果行数，哈希按全部结果行判断
+ */
 export async function previewInterpretation(
   actor: CurrentMember, sql: string,
-): Promise<{ rows: number; sent: string[]; dropped: string[]; result: QueryOutcome }> {
+): Promise<{ rows: number; sent: string[]; dropped: string[]; samples: boolean; result: QueryOutcome }> {
   assertCan(actor, 'sandbox');
+  const samples = await samplesAllowed(actor.tenant.id);
   const result = await rerun(actor, sql);
-  return { rows: sentRows(result), ...pickColumns(result), result };
+  if (!samples) return { rows: result.rows.length, ...pickColumns(result, sendable(result, Infinity)), samples, result };
+  return { rows: sentRows(result), ...pickColumns(result), samples, result };
+}
+
+const INTERPRET_INTRO = [
+  '你帮数据分析师解读一条 SQL 查询的结果，回答 JSON 对象 {"interpretation": "..."}，用中文写几段简短的文字。',
+  '只描述聚合规律与分布（总体趋势、占比、集中与离散、异常的分组），不要复述或点名任何单个个人，不要逐行引用取值。',
+];
+
+/** 不发样本时的提示：只有 SQL、列名与类型、行数和每列统计 */
+function statsMessages(stats: ReturnType<typeof columnStats>): LlmMessage[] {
+  return [
+    {
+      role: 'system',
+      content: [
+        ...INTERPRET_INTRO,
+        '下面只有 SQL、列名与类型、行数和每列统计（非空数 nonNull、去重数 distinct，数值列还有 min / max / avg；敏感列已剔除），没有任何数据行。',
+      ].join('\n'),
+    },
+    { role: 'user', content: JSON.stringify(stats) },
+  ];
 }
 
 function interpretMessages({ columns, rows }: ReturnType<typeof redactResult>): LlmMessage[] {
@@ -166,8 +215,7 @@ function interpretMessages({ columns, rows }: ReturnType<typeof redactResult>): 
     {
       role: 'system',
       content: [
-        '你帮数据分析师解读一条 SQL 查询的结果，回答 JSON 对象 {"interpretation": "..."}，用中文写几段简短的文字。',
-        '只描述聚合规律与分布（总体趋势、占比、集中与离散、异常的分组），不要复述或点名任何单个个人，不要逐行引用取值。',
+        ...INTERPRET_INTRO,
         `下面是结果的前 ${rows.length} 行（敏感列已剔除，每格最多 ${MAX_CELL} 字）。`,
       ].join('\n'),
     },
@@ -177,38 +225,49 @@ function interpretMessages({ columns, rows }: ReturnType<typeof redactResult>): 
 
 /**
  * 成员确认后解读结果（ADR-0043）：没确认时 400，没配置模型服务时 409（都不发请求）；按 SQL 重新执行，
- * 只发前 INTERPRET_ROWS 行里没被剔除的列，全部被剔除时 400；模型失败时 422。
+ * 租户打开「发送脱敏样本」时只发前 INTERPRET_ROWS 行里没被剔除的列，没打开时只发 SQL、行数与留下的列的类型和统计（samples: false，不发任何行）；
+ * 全部被剔除时 400；模型失败时 422。
  * 解读存进本人的助手对话 conversationId（null 时新建；不是自己的对话时 404，不发请求），返回对话 id。
- * 审计 workbench.result_interpreted { sql, rows, columns, dropped }，不记取值与解读。result 是这次执行的结果，只给页面显示表格，不进审计
+ * 审计 workbench.result_interpreted { sql, rows, columns, dropped, samples }，不记取值与解读。result 是这次执行的结果，只给页面显示表格，不进审计
  */
 export async function interpretResult(
   actor: CurrentMember, sql: string, confirmed: boolean, conversationId: string | null,
-): Promise<{ text: string; rows: number; columns: string[]; dropped: string[]; result: QueryOutcome; conversationId: string }> {
+): Promise<{ text: string; rows: number; columns: string[]; dropped: string[]; samples: boolean; result: QueryOutcome; conversationId: string }> {
   assertCan(actor, 'sandbox');
   if (!confirmed) throw new WorkbenchAiError('请先确认要发送给模型服务的列', 400);
   const tenantId = actor.tenant.id;
   if (!(await resolveProvider(tenantId))) throw new WorkbenchAiError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务', 409);
   if (conversationId !== null) await assertOwnConversation(actor, conversationId);
+  const samples = await samplesAllowed(tenantId);
   const result = await rerun(actor, sql);
-  const redacted = redactResult(result);
-  const { dropped } = redacted;
-  const sent = redacted.columns.map(c => c.name);
+  const normalized = normalizeWorkbenchSql(sql);
+  let messages: LlmMessage[];
+  let sent: string[];
+  let dropped: string[];
+  if (samples) {
+    const redacted = redactResult(result);
+    ({ dropped } = redacted);
+    sent = redacted.columns.map(c => c.name);
+    messages = interpretMessages(redacted);
+  } else {
+    const keep = sendable(result, Infinity);
+    ({ sent, dropped } = pickColumns(result, keep));
+    messages = statsMessages(columnStats(normalized, result, keep));
+  }
   if (!sent.length) throw new WorkbenchAiError('没有可以发送的列：结果里的列都是系统列、敏感列或哈希', 400);
   let interpretation: string;
   try {
-    const messages = interpretMessages(redacted);
     ({ interpretation } = await chatJson<{ interpretation: string }>(tenantId, 'workbench_interpret', messages, INTERPRET_SCHEMA));
   } catch (e) {
     if (e instanceof LlmError) throw new WorkbenchAiError(`模型解读结果失败：${e.message}`, 422);
     throw e;
   }
-  const rows = sentRows(result);
+  const rows = samples ? sentRows(result) : result.rows.length;
   const text = interpretation.slice(0, MAX_INTERPRETATION);
-  const normalized = normalizeWorkbenchSql(sql);
   const savedConversationId = await appendInterpretation(actor, conversationId, { sql: normalized, rows, columns: sent }, text);
   await recordAudit(getDb(), {
     tenantId, actor, action: 'workbench.result_interpreted', targetType: 'workbench',
-    detail: { sql: normalized, rows, columns: sent, dropped },
+    detail: { sql: normalized, rows, columns: sent, dropped, samples },
   });
-  return { text, rows, columns: sent, dropped, result, conversationId: savedConversationId };
+  return { text, rows, columns: sent, dropped, samples, result, conversationId: savedConversationId };
 }
