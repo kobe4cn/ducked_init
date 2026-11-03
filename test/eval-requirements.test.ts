@@ -89,6 +89,14 @@ describe('需求评测跑分', () => {
     expect(await runCase(PROVIDER, tag)).toMatchObject({ valid: true, hits: 2, structure: { metrics: true, rules: false } });
   });
 
+  it('只多一条过滤：仍过校验，只有过滤项不命中，字段项不重复计', async () => {
+    const c = caseNamed('paid-revenue-by-city');
+    const draft = clone(c.expected) as { filter: { field: string; op: string; value: unknown }[] };
+    draft.filter.push({ field: 'channel', op: 'in', value: ['store'] });
+    fakeLlm(setLlmFetch, () => json(draft));
+    expect(await runCase(PROVIDER, c)).toMatchObject({ valid: true, hits: 5, hitRate: 5 / 6, structure: { filter: false, fields: true } });
+  });
+
   it('模型返回不合 Schema：失败于模型调用，各项都不命中，Key 不出现在结果里', async () => {
     const c = caseNamed('order-count-90d');
     fakeLlm(setLlmFetch, () => json({ base: 'order' }));

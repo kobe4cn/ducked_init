@@ -4,6 +4,7 @@ expected:
   base: order_item
   measure: { agg: sum, field: amount }
   window: { field: order_item.order_id -> order.created_at, days: 30 }
+  filter: [{ field: order_item.order_id -> order.status, op: in, value: [paid, shipped, completed] }]
 failure_type: b
 covers: [same-name]
 retrieval:

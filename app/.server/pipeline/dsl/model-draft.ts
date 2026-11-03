@@ -7,7 +7,7 @@ import { Document } from 'yaml';
 import { CAPABILITIES } from '../../catalog/capabilities';
 import { estimateTokens, overview, search, toMarkdown, type Catalog } from '../../catalog';
 import type { LlmMessage, LlmPurpose } from '../../llm';
-import { CONSUMER_ENTITY, METRIC_SCHEMA } from './metric-spec';
+import { CONSUMER_ENTITY, METRIC_SCHEMA, type MetricSpec, type RatioPart } from './metric-spec';
 import type { DslKind } from './index';
 import { SINGLE_TAG_SCHEMA } from './tag-spec';
 
@@ -81,9 +81,47 @@ export function definitionDraftMessages(kind: DslKind, request: string, catalog:
   ];
 }
 
-/** 模型输出（已按 Schema 校验）转成定义 YAML，首行注释提示核对 */
-export function definitionOutputToYaml(_kind: DslKind, output: object): string {
-  const doc = new Document(output);
+/** `->` 路径首段没写实体名时补成 <base>.<字段>；首段已有 `.`、不含 `->` 的裸字段原样返回（留给校验） */
+function completePath(base: string, p: string): string {
+  if (!p.includes('->')) return p;
+  const parts = p.split('->').map(s => s.trim());
+  if (parts[0]!.includes('.')) return p;
+  parts[0] = `${base}.${parts[0]}`;
+  return parts.join(' -> ');
+}
+
+/**
+ * 模型起草的指标里 `->` 路径首段常漏写实体名（customer_id -> customer.city），按 base 补全后再转 YAML；返回新对象，不改传入的。
+ * 补 filter / window / dimensions 的路径、measure 与 ratio 分子分母的字段与过滤字段；consumer_via 是字段名不是路径，不动。
+ * 只改模型输出这一侧，校验不放宽（人手写的定义照旧报错）；标签原样返回。
+ * output 已按 METRIC_SCHEMA 校验过，形状就是 MetricSpec；没写的键不补成 undefined
+ */
+export function completeDraftPaths(kind: DslKind, output: object): object {
+  if (kind !== 'metric') return output;
+  const spec = output as MetricSpec;
+  const fix = (p: string) => completePath(spec.base, p);
+  const fields = <T extends { field?: string }>(o: T): T => (o.field === undefined ? { ...o } : { ...o, field: fix(o.field) });
+  const conditions = (cs: MetricSpec['filter']) => cs?.map(fields);
+  const part = (p: RatioPart | undefined) => p && { ...fields(p), ...(p.filter && { filter: conditions(p.filter) }) };
+  const m = spec.measure;
+  const measure: MetricSpec['measure'] = {
+    ...fields(m),
+    ...(m.by !== undefined && { by: fix(m.by) }),
+    ...(m.numerator && { numerator: part(m.numerator) }),
+    ...(m.denominator && { denominator: part(m.denominator) }),
+  };
+  return {
+    ...spec,
+    measure,
+    ...(spec.filter && { filter: conditions(spec.filter) }),
+    ...(spec.window && { window: fields(spec.window) }),
+    ...(spec.dimensions && { dimensions: spec.dimensions.map(d => ({ ...d, path: fix(d.path) })) }),
+  };
+}
+
+/** 模型输出（已按 Schema 校验）补全路径首段的实体名后转成定义 YAML，首行注释提示核对 */
+export function definitionOutputToYaml(kind: DslKind, output: object): string {
+  const doc = new Document(completeDraftPaths(kind, output));
   doc.commentBefore = ' 模型根据需求生成，请核对';
   return doc.toString();
 }
