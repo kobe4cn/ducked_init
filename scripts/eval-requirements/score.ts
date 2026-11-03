@@ -4,14 +4,15 @@ import { stringify } from 'yaml';
 import { callModel, LlmError, type LlmProvider } from '../../app/.server/llm';
 import { DSL_KINDS, type DslKind } from '../../app/.server/pipeline/dsl';
 import type { MetricSpec, RatioPart } from '../../app/.server/pipeline/dsl/metric-spec';
-import { definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml } from '../../app/.server/pipeline/dsl/model-draft';
+import { completeDraftPaths, definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml } from '../../app/.server/pipeline/dsl/model-draft';
 import { tagMetrics, type TagSpec } from '../../app/.server/pipeline/dsl/tag-spec';
 import { CATALOG, CONTEXT, type GoldenCase } from './golden';
 
 /**
  * 逐项比较的结构：指标比种类、实体（base、consumer_via 与 device_attribution）、度量（agg、字段与 ratio 的分子分母）、用到的字段、过滤条件（含时间窗口）与维度路径；
  * 标签没有实体、字段与维度，比种类、引用的指标与规则（rules、default 与 missing）。
- * 字段项与度量、过滤项有意重叠：写错一个字段会在两项上都不命中
+ * 字段项只收度量与时间窗口的字段（与度量项有意重叠：写错度量字段会在两项上都不命中）；过滤字段只由过滤项评，
+ * ratio 分子分母的过滤在度量项里评，多一条或少一条过滤只扣一项
  */
 const STRUCTURE = {
   metric: ['kind', 'entity', 'measure', 'fields', 'filter', 'dimensions'],
@@ -81,8 +82,7 @@ const part = (base: string, p: RatioPart | undefined) => p && ({ agg: p.agg, fie
 /** 用到的字段自己收集而不用 metricDependencies：模型输出可能没过校验，依赖分析要的是校验过的 spec */
 function metricStructure(s: MetricSpec): Record<string, string> {
   const { base, measure: m } = s;
-  const fields = [m.field, m.by, m.numerator?.field, m.denominator?.field, s.window?.field,
-    ...[...(s.filter ?? []), ...(m.numerator?.filter ?? []), ...(m.denominator?.filter ?? [])].map(c => c.field)];
+  const fields = [m.field, m.by, m.numerator?.field, m.denominator?.field, s.window?.field];
   return {
     kind: 'metric',
     entity: canonical({ base, consumer_via: path(base, s.consumer_via), device_attribution: s.device_attribution }),
@@ -126,8 +126,10 @@ export async function runCase(provider: LlmProvider, c: GoldenCase): Promise<Cas
     if (!(e instanceof LlmError)) throw e;
     return { id: c.id, kind: c.kind, valid: false, ...scoreStructure(c.kind, c.expected, null), failed: { stage: 'model', message: e.message } };
   }
-  const got = DSL_KINDS[c.kind].check(definitionOutputToYaml(c.kind, out), CONTEXT);
-  const result = { id: c.id, kind: c.kind, valid: got.ok, ...scoreStructure(c.kind, c.expected, out) };
+  // 按产品实际存下的定义打分：路径首段补过实体名的（definitionOutputToYaml 内部也补）
+  const completed = completeDraftPaths(c.kind, out);
+  const got = DSL_KINDS[c.kind].check(definitionOutputToYaml(c.kind, completed), CONTEXT);
+  const result = { id: c.id, kind: c.kind, valid: got.ok, ...scoreStructure(c.kind, c.expected, completed) };
   return got.ok ? result : { ...result, failed: { stage: 'definition', message: `定义校验不过：${got.issues.length} 个问题`, issues: got.issues.length } };
 }
 
