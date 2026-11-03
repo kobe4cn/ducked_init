@@ -106,6 +106,13 @@ export async function tenantIdBySlug(slug: string) {
   return tenant.id;
 }
 
+/** 租户单个上传文件的大小上限（MiB，ADR-0037）；不存在时抛出 404 */
+export async function uploadLimitOf(tenantId: string): Promise<number> {
+  const [tenant] = await getDb().select({ maxUploadMb: tenants.maxUploadMb }).from(tenants).where(eq(tenants.id, tenantId));
+  if (!tenant) throw new TenantError(`租户不存在：${tenantId}`, 404);
+  return tenant.maxUploadMb;
+}
+
 async function tryInitTenantCatalog(tenantId: string, operator: OperatorActor) {
   try {
     await initTenantCatalog(tenantId, operator);
@@ -129,6 +136,7 @@ const tenantSummaries = () =>
       memoryLimitMb: tenants.memoryLimitMb,
       threads: tenants.threads,
       maxConcurrentTasks: tenants.maxConcurrentTasks,
+      maxUploadMb: tenants.maxUploadMb,
       memberCount: sql<number>`count(${members.id})::int`,
       adminEmails: sql<string[]>`coalesce(array_agg(${members.email} order by ${members.email}) filter (where ${members.role} = 'admin'), '{}')`,
     })

@@ -57,7 +57,7 @@ async function runDslConcurrently(tenantId: string) {
 /** 开通租户并把最多同时运行的任务调到 4 */
 async function concurrentTenant() {
   const acme = await newTenant('acme');
-  await setTenantQuota(null, acme, { memoryLimitMb: 256, threads: 1, maxConcurrentTasks: 4 });
+  await setTenantQuota(null, acme, { memoryLimitMb: 256, threads: 1, maxConcurrentTasks: 4, maxUploadMb: 100 });
   return acme;
 }
 

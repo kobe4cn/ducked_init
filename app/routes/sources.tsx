@@ -11,6 +11,7 @@ import { listSources, registerSource, SourceError } from '~/.server/sources';
 import type { SourceInput } from '~/.server/source-config';
 import { decodeUtf8, removeUpload, storeUpload, UPLOAD_TABLE, UPLOAD_TABLE_RULE } from '~/.server/uploads';
 import { verifyDifferences } from '~/.server/source-verify';
+import { uploadLimitOf } from '~/.server/tenants';
 import { formValues, SOURCE_KIND_LABELS, SOURCE_KINDS, targetOf, type SourceKind } from '~/lib/sources';
 import { cn } from '~/lib/utils';
 import { AppShell } from '~/components/app-shell';
@@ -48,7 +49,9 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 export async function action({ request }: Route.ActionArgs) {
   const member = await requirePermission(request, 'sources:write');
-  const form = await request.formData();
+  const mb = await uploadLimitOf(member.tenant.id);
+  const form = await readLimitedForm(request, mb * 1024 * 1024);
+  if (!form) return data({ error: `文件超过本租户上传上限 ${mb} MiB`, values: {} }, { status: 413 });
   if (form.get('intent') !== 'register') return data({ error: '未知操作', values: {} }, { status: 400 });
   // 先剔出文件：File 经 String() 会变成 "[object File]"
   const file = form.get('file');
@@ -58,6 +61,36 @@ export async function action({ request }: Route.ActionArgs) {
     throw redirect(`/sources/${id}`);
   } catch (e) {
     if (e instanceof SourceError) return data({ error: e.message, values: formValues(form) }, { status: e.status });
+    throw e;
+  }
+}
+
+/**
+ * 读 multipart 表单，整个请求体超过 maxBytes 时返回 null（ADR-0037）。formData() 会把请求体全读进内存，
+ * 所以先看 Content-Length，超了不读；没有或没超时边读边计数，超过即中止（分块上传没有 Content-Length）
+ */
+async function readLimitedForm(request: Request, maxBytes: number): Promise<FormData | null> {
+  if (Number(request.headers.get('content-length') ?? 0) > maxBytes) return null;
+  if (!request.body) return request.formData();
+  let read = 0;
+  let exceeded = false;
+  const counter = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      read += chunk.byteLength;
+      if (read > maxBytes) {
+        exceeded = true;
+        controller.error(new Error('请求体超过上传上限'));
+      } else controller.enqueue(chunk);
+    },
+  });
+  // 重建请求后原 request 不能再读
+  const limited = new Request(request.url, {
+    method: request.method, headers: request.headers, body: request.body.pipeThrough(counter), duplex: 'half',
+  } as RequestInit);
+  try {
+    return await limited.formData();
+  } catch (e) {
+    if (exceeded) return null;
     throw e;
   }
 }

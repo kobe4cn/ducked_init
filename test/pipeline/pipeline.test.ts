@@ -38,7 +38,7 @@ describe('开通租户时初始化数据湖', () => {
 describe('任务在独立进程中按租户配额运行', () => {
   it('工作进程是独立进程，DuckDB 的内存上限与线程数取自租户配额', async () => {
     const acme = await newTenant('acme');
-    await setTenantQuota(null, acme, { memoryLimitMb: 300, threads: 1, maxConcurrentTasks: 1 });
+    await setTenantQuota(null, acme, { memoryLimitMb: 300, threads: 1, maxConcurrentTasks: 1, maxUploadMb: 100 });
     const first = await runTask(acme, 'lake.inventory');
     const second = await runTask(acme, 'lake.inventory');
 
