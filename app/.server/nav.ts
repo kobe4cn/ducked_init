@@ -8,6 +8,7 @@ export function navFor(member: CurrentMember) {
     ...(can(member.role, 'sources:read') ? [{ to: '/sources', label: '数据源' }, { to: '/mappings', label: '映射' }, { to: '/entities', label: '自定义实体' }, { to: '/quality', label: '数据质量' }] : []),
     { to: '/model', label: '标准模型' },
     { to: '/lineage', label: '数据地图' },
+    { to: '/knowledge', label: '业务知识' },
     ...(can(member.role, 'results:read') ? [{ to: '/analytics', label: '分析' }] : []),
     ...(can(member.role, 'sandbox') ? [{ to: '/workbench', label: '查询' }] : []),
     { to: '/tasks', label: '任务' },
