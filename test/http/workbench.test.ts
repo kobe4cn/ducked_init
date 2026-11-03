@@ -161,10 +161,11 @@ describe('AI 解读', () => {
 
     const confirm = await (await analyst.post('/workbench', { intent: 'interpret_preview', sql })).text();
     expect(confirm).toContain('不发送样本行');
+    expect(confirm).toContain('把上面这些列的统计发给模型服务');
     expect(confirm).toMatch(off);
     expect(confirm).not.toContain('将发送前');
     const done = await (await analyst.post('/workbench', { intent: 'interpret', sql, confirmed: '1' })).text();
-    expect(done).toContain('没有发送样本行');
+    expect(done).toContain('结果的结构与统计（没有发送样本行）：city、n');
     expect(done).toMatch(off);
     expect(done).not.toContain('依据前');
 
@@ -173,6 +174,7 @@ describe('AI 解读', () => {
       const on = await (await analyst.post('/workbench', { intent: 'interpret_preview', sql })).text();
       expect(on).toContain('将发送前');
       expect(on).not.toContain('data-interpret-samples');
+      expect(on).toContain('把上面这些列发给模型服务');
       const onDone = await (await analyst.post('/workbench', { intent: 'interpret', sql, confirmed: '1' })).text();
       expect(onDone).toContain('依据前');
       expect(onDone).not.toContain('data-interpret-samples');

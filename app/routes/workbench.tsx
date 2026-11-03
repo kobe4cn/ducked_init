@@ -321,7 +321,7 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                 <Button type="submit" name="intent" value="interpret" disabled={running || preview.sent.length === 0}>
                   {running && navigation.formData?.get('intent') === 'interpret' ? '解读中…' : '确认发送'}
                 </Button>
-                <span className="text-sm text-slate-400">确认后会重新执行这条 SQL，把上面这些列发给模型服务；解读只谈聚合规律，不点名个人。</span>
+                <span className="text-sm text-slate-400">{`确认后会重新执行这条 SQL，把上面这些列${preview.samples ? '' : '的统计'}发给模型服务；解读只谈聚合规律，不点名个人。`}</span>
               </Form>
             </div>
           )}
@@ -331,7 +331,7 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
               <h2 className="flex items-center gap-1 text-base font-semibold"><Sparkles className="size-4 text-amber-600" />AI 解读</h2>
               <p className="whitespace-pre-wrap text-sm">{interpretation.text}</p>
               <p className="text-sm text-slate-400">
-                {`${interpretation.samples ? `依据前 ${interpretation.rows} 行的` : `依据 ${interpretation.rows} 行结果的结构与统计（没有发送样本行）：`} ${interpretation.columns.join('、')}${interpretation.dropped.length ? `；已剔除 ${interpretation.dropped.join('、')}` : ''}。AI 的解读可能有误，请核对。已存进 AI 助手的「历史对话」。`}
+                {`${interpretation.samples ? `依据前 ${interpretation.rows} 行的 ` : `依据 ${interpretation.rows} 行结果的结构与统计（没有发送样本行）：`}${interpretation.columns.join('、')}${interpretation.dropped.length ? `；已剔除 ${interpretation.dropped.join('、')}` : ''}。AI 的解读可能有误，请核对。已存进 AI 助手的「历史对话」。`}
               </p>
               {!interpretation.samples && <SamplesOff />}
             </div>
