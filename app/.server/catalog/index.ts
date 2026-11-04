@@ -450,7 +450,7 @@ export function overview(c: Catalog): Overview {
 export const expand = (c: Catalog, id: string): CatalogEntry | null => c.entries.find(e => e.id === id) ?? null;
 
 /** 查询分词：ASCII 单词转小写、至少 2 个字符；连续的中日韩字符切成二元组（只有一个字时取这个字） */
-function terms(query: string): string[] {
+export function terms(query: string): string[] {
   const out = new Set<string>();
   for (const w of query.match(/[A-Za-z0-9]+/g) ?? []) if (w.length >= 2) out.add(w.toLowerCase());
   for (const run of query.match(CJK_RUN) ?? []) {

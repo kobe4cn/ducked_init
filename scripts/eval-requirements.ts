@@ -30,7 +30,7 @@ const startedAt = new Date();
 const rows = retrievalRows(GOLDEN_ALL);
 const split = (rs: RetrievalRow[]) => ({ tuning: groupByType(rs.filter(r => !r.holdout)), holdout: groupByType(rs.filter(r => r.holdout)) });
 const retrieval = split(rows);
-console.log(`检索与追问：${GOLDEN_ALL.length} 条（调参集 ${GOLDEN_ALL.length - HOLDOUT.size}，验收集 ${HOLDOUT.size}），确定性 search()`);
+console.log(`检索与追问：${GOLDEN_ALL.length} 条（调参集 ${GOLDEN_ALL.length - HOLDOUT.size}，验收集 ${HOLDOUT.size}），确定性 rank()`);
 table('调参集', retrieval.tuning);
 table('验收集（不参与调参，只在验收时看）', retrieval.holdout);
 

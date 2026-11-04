@@ -1,9 +1,10 @@
 // scripts/eval-requirements/retrieval-catalog.ts —— 检索黄金集的固定目录（#317，ADR-0047）：在需求评测的目录输入（CATALOG_INPUT）上
 // 加几组近义的指标与标签（同为「营收」却按下单 / 支付时间、含不含退款、按订单还是明细金额；同为「客单价」「活跃次数」「下单次数」口径不同），
-// 再加两个数据源与几张源表（有 source: / table: 条目，供跨角色可见性的条目用）。
+// 再加两个数据源与几张源表（有 source: / table: 条目，供跨角色可见性的条目用），并给 GMV、沉睡、购买频次、PV、地区、VIP 挂上别名知识。
 // 不改 PUBLISHED_METRICS：模型评测的上下文保持不变。纯函数构造，不连库
 import { buildCatalog } from '../../app/.server/catalog';
 import type { DslKind } from '../../app/.server/pipeline/dsl';
+import { knowledgeKey } from '../../app/.server/knowledge/catalog';
 import { CATALOG_INPUT, SPACE } from './golden';
 
 /** 额外的已发布定义（键 → 种类与 YAML），都要能对着 CONTEXT 过校验（测试里断言） */
@@ -69,8 +70,20 @@ description: 高消费消费者：近 30 天消费金额 1000 元及以上
 ` },
 };
 
+/** 别名知识（ADR-0046）：目标 → 别名。PV 挂在浏览事件的事件类型上，不挂近 30 天浏览次数（它是 pv-7d-alias 不能选的近义项） */
+export const ALIASES: Record<string, string[]> = {
+  'metric:gross_revenue_30d': ['GMV'],
+  'metric:days_since_last_order': ['沉睡'],
+  'metric:order_count_365d': ['购买频次'],
+  'metric:paid_order_count_365d': ['购买频次'],
+  'field:event.event_type': ['PV'],
+  'field:customer.city': ['地区'],
+  'field:membership.level': ['VIP'],
+};
+
 export const RETRIEVAL_CATALOG = buildCatalog({
   ...CATALOG_INPUT,
+  knowledge: { byTarget: new Map(Object.entries(ALIASES).map(([id, aliases]) => [knowledgeKey(id), { aliases }])) },
   definitions: [
     ...CATALOG_INPUT.definitions!,
     ...Object.entries(EXTRA_DEFINITIONS).map(([key, d]) => ({ kind: d.kind, key, version: 1, yaml: d.yaml, spaceId: SPACE })),
