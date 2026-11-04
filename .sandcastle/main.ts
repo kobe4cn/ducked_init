@@ -215,6 +215,29 @@ const trySh = (cmd: string, args: string[]) => {
   }
 };
 
+// 连远端的 git（fetch / push）偶尔撞上 SSH、DNS、网络抖动（2026-11-04 一次
+// `Permission denied (publickey)` 让 #390 落地失败、下一轮开头的 fetch 直接让进程崩了）。
+// 这类错误等一会儿重试，最多等约半小时；被拒（non-fast-forward、lease 过期）之类的照常立即失败。
+const REMOTE_TRANSIENT = /Permission denied \(publickey\)|Could not read from remote repository|Could not resolve host|Connection (timed out|reset|refused|closed)|Operation timed out|Network is unreachable|early EOF|unexpected disconnect|kex_exchange_identification|ssh_exchange_identification|unable to access|RPC failed|HTTP 5\d\d/;
+const REMOTE_RETRY_WAITS_MS = [30_000, 60_000, 120_000, 300_000, 600_000, 900_000];
+
+async function gitRemote(args: string[]) {
+  for (let attempt = 0; ; attempt++) {
+    const result = trySh("git", args);
+    const wait = REMOTE_RETRY_WAITS_MS[attempt];
+    if (result.ok || wait === undefined || !REMOTE_TRANSIENT.test(result.out)) return result;
+    console.warn(`  ⚠ git ${args.join(" ")} 连不上远端（${result.out.split("\n")[0].slice(0, 160)}），${wait / 1000} 秒后重试（第 ${attempt + 1}/${REMOTE_RETRY_WAITS_MS.length} 次）`);
+    await new Promise((resolve) => setTimeout(resolve, wait));
+  }
+}
+
+/** 同 gitRemote，重试用完仍失败就抛错（原来直接用 sh 的地方）。 */
+async function gitRemoteOrThrow(args: string[]) {
+  const result = await gitRemote(args);
+  if (!result.ok) throw new Error(`git ${args.join(" ")} 失败：${result.out.slice(0, 500)}`);
+  return result.out;
+}
+
 /**
  * prep 与 plan 不建分支，podman 是挂载型沙箱，默认挂的是宿主机工作区（本地 HEAD），
  * 不是 origin/main。本地 main 落后时，prep 的 Explore 读到旧代码：指引的 file:line 对不上，
@@ -358,7 +381,7 @@ const isExternal = (issue: Issue) => !issue.branch.startsWith("sandcastle/");
 
 /** 推分支：自己的分支照旧 force-with-lease（rebase 过）；外部分支只做普通 push，被拒就报错。 */
 function pushBranch(issue: Issue) {
-  return trySh("git", isExternal(issue)
+  return gitRemote(isExternal(issue)
     ? ["push", REMOTE, `${issue.branch}:${issue.branch}`]
     : ["push", "--force-with-lease", "-u", REMOTE, issue.branch]);
 }
@@ -404,8 +427,8 @@ function prFor(issueId: string | number): LinkedPr | null {
  * 外部 PR 的分支：开沙箱前同步到宿主机本地（沙箱从本地分支建 worktree，本地没有就会从 main 新建，丢掉对方的提交）。
  * 本地没有就从远端建；本地落后就快进；本地领先（上次没推上去）就保留；两边分叉就报错，交给人。
  */
-function syncExternalBranch(issue: Issue) {
-  sh("git", ["fetch", REMOTE, issue.branch]);
+async function syncExternalBranch(issue: Issue) {
+  await gitRemoteOrThrow(["fetch", REMOTE, issue.branch]);
   const remote = `${REMOTE}/${issue.branch}`;
   if (!trySh("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${issue.branch}`]).ok) {
     sh("git", ["branch", issue.branch, remote]);
@@ -420,8 +443,8 @@ function syncExternalBranch(issue: Issue) {
 const attachArgs = (shots: string[]) =>
   shots.flatMap((file) => ["--attach", `${file}#${basename(file)}`]);
 
-function pushAndOpenPr(issue: Issue, notes: string, shots: string[]): string {
-  const pushed = pushBranch(issue);
+async function pushAndOpenPr(issue: Issue, notes: string, shots: string[]): Promise<string> {
+  const pushed = await pushBranch(issue);
   if (!pushed.ok) throw new Error(`push ${issue.branch} 失败：${pushed.out.slice(0, 500)}`);
   const existing = sh("gh", [
     "pr", "list", "--head", issue.branch, "--state", "open", "--json", "number", "--jq", ".[0].number",
@@ -527,7 +550,7 @@ function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
 // ---------------------------------------------------------------------------
 
 async function build(issue: Issue) {
-  if (isExternal(issue)) syncExternalBranch(issue);
+  if (isExternal(issue)) await syncExternalBranch(issue);
   const env = testEnv(issue.id);
   const sandbox = await sandcastle.createSandbox({
     branch: issue.branch,
@@ -644,7 +667,7 @@ const MIGRATION_CHAIN_OK = migrationChainOk("HEAD");
  */
 async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (isExternal(issue)) return { ok: false, reason: `外部 PR 的分支 ${issue.branch} 不由 Sandcastle rebase 或合并。` };
-  sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+  await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]);
   const env = testEnv(issue.id);
   const sandbox = await sandcastle.createSandbox({ branch: issue.branch, baseBranch: BASE_REF, sandbox: sandboxFor(env), hooks, copyToWorktree });
   try {
@@ -688,7 +711,7 @@ async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{
       return { ok: false, reason: `rebase 后门槛失败：\n\n\`\`\`\n${gate.stdout.slice(-2000)}\n\`\`\`` };
     }
 
-    sh("git", ["push", "--force-with-lease", REMOTE, issue.branch]);
+    await gitRemoteOrThrow(["push", "--force-with-lease", REMOTE, issue.branch]);
     if (!merge) {
       sh("gh", ["pr", "comment", pr, "--body", `Sandcastle 把分支 rebase 到最新的 ${BASE_REF}（原来和它冲突），门槛重跑通过。`]);
       return { ok: true };
@@ -763,14 +786,14 @@ async function sleepUntil(at: number) {
  * fn 要能从头重跑：prep 本来就幂等；build 重跑时在原分支上接着做（implementer 先看已有提交）。
  * onLimit 在等之前调用，比如把分支推到远端。
  */
-async function untilAfterLimit<T>(what: string, fn: () => Promise<T>, onLimit?: () => void): Promise<T> {
+async function untilAfterLimit<T>(what: string, fn: () => Promise<T>, onLimit?: () => void | Promise<void>): Promise<T> {
   for (;;) {
     try {
       return await fn();
     } catch (e) {
       const message = String(e);
       if (!LIMIT_PATTERN.test(message)) throw e;
-      onLimit?.();
+      await onLimit?.();
       const resetAt = limitResetAt(message);
       const until = resetAt === null ? Date.now() + LIMIT_FALLBACK_WAIT_MS : resetAt + LIMIT_RESUME_SLACK_MS;
       const why = resetAt === null ? `认不出重置时间（${message.slice(0, 200)}），` : "";
@@ -781,9 +804,9 @@ async function untilAfterLimit<T>(what: string, fn: () => Promise<T>, onLimit?: 
 }
 
 /** 分支上已有提交时推到远端，免得只留在宿主机上。 */
-function pushIfAhead(issue: Issue) {
+async function pushIfAhead(issue: Issue) {
   const ahead = trySh("git", ["rev-list", "--count", `${BASE_REF}..${issue.branch}`]);
-  if (ahead.ok && Number(ahead.out) > 0) pushBranch(issue);
+  if (ahead.ok && Number(ahead.out) > 0) await pushBranch(issue);
 }
 
 /** issue 已关闭（人在运行中途合并了 PR、或手动关了票）。查不到时当作没关。 */
@@ -798,7 +821,7 @@ function issueClosed(id: string) {
  * 返回附在 leaveForHuman 说明后面的一句话；不需要 rebase 时为空串。
  */
 async function rebaseIfConflicting(issue: Issue, pr: string): Promise<string> {
-  sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+  await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]);
   const clean = trySh("git", ["merge-tree", "--write-tree", "--name-only", BASE_REF, issue.branch]).ok;
   const chainOk = trySh("sh", ["-c", migrationChainOk(issue.branch)]).ok;
   if (clean && chainOk) return "";
@@ -836,12 +859,12 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     }
     // 外部 PR 不退回 prep（prep 会按 sandcastle/issue-n 拆票）：推上已有的提交，交给人。
     if (isExternal(issue)) {
-      const pushed = pushBranch(issue).ok;
+      const pushed = (await pushBranch(issue)).ok;
       markStuck(issue.id, `在外部 PR 的分支 \`${issue.branch}\` 上 ${IMPLEMENT_MAX_ITERATIONS} 次会话内没有改完（见上面 implementer 的评论）。${budgetNote}${pushed ? "已有的提交推到了这个分支。" : "提交没能推上去，留在宿主机的本地分支上。"}`);
       return;
     }
     // 第一次没做完：分支推上去免得部分提交只留在宿主机，提交列表写进评论给 prep 看，退回 prep 重新准备。
-    const pushed = pushBranch(issue).ok;
+    const pushed = (await pushBranch(issue)).ok;
     const log = trySh("git", ["log", "--format=- %h %s", `${BASE_REF}..${issue.branch}`]);
     const commits = log.ok && log.out ? `\n\n分支 \`${issue.branch}\` 上已有的提交：\n\n${log.out}` : "\n\n分支上还没有提交。";
     sh("gh", ["issue", "edit", issue.id, "--remove-label", LABEL.prepped]);
@@ -869,7 +892,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
         .map((items, n) => `<details><summary>第 ${n + 1} 次的意见</summary>\n\n${items}\n\n</details>`)
         .join("\n\n")}`
     : "";
-  const pr = pushAndOpenPr(
+  const pr = await pushAndOpenPr(
     issue,
     `## Review\n\n${result.summary}${revisionNote}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}`,
     result.browser?.shots ?? [],
@@ -881,7 +904,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
 
   // 外部 PR 一律留给人合并：不 rebase、不合并，只报告 review 与门槛结果。
   if (isExternal(issue)) {
-    sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+    await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]);
     const clean = trySh("git", ["merge-tree", "--write-tree", "--name-only", BASE_REF, issue.branch]).ok;
     leaveForHuman(
       issue,
@@ -912,7 +935,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
   }
   // 同一轮先合并的票可能让这张冲突：rebase 到最新的 origin/main（冲突交给 agent）、重跑门槛，再合并一次。
   // 迁移链要先在宿主机上查：没有文本冲突时 GitHub 会照样合并，分叉的迁移就进了 main。
-  sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+  await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]);
   const chainOk = trySh("sh", ["-c", migrationChainOk(issue.branch)]).ok;
   const merged = chainOk
     ? trySh("gh", ["pr", "merge", pr, "--rebase"])
@@ -926,7 +949,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
       return;
     }
   }
-  trySh("git", ["push", REMOTE, "--delete", issue.branch]);
+  await gitRemote(["push", REMOTE, "--delete", issue.branch]);
   trySh("git", ["branch", "-D", issue.branch]);
   console.log(`  ✓ #${issue.id} 已合并（PR #${pr}）`);
 }
@@ -937,7 +960,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
 
 for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
-  sh("git", ["fetch", REMOTE, BASE_BRANCH]); // 上一轮合并进远端 main 的代码
+  await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]); // 上一轮合并进远端 main 的代码
   openStates.clear();
   syncHostBase();
   reopenRequestedRevisions();
@@ -1010,6 +1033,6 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 }
 
 // 最后一轮合并的票在这次 fetch 之后才进远端，收尾再同步一次。
-sh("git", ["fetch", REMOTE, BASE_BRANCH]);
+await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]);
 syncHostBase();
 console.log(`\nAll done. 本地 main 已快进到 ${BASE_REF}（不在 main 上时除外，见上面的警告）；带 ${LABEL.prOpen} 的票在 GitHub 上等你审。`);
