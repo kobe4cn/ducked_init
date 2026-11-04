@@ -58,9 +58,9 @@ const DRAFTS = {
 export const definitionDraftSchema = (kind: DslKind) => DRAFTS[kind].schema;
 export const definitionDraftPurpose = (kind: DslKind) => DRAFTS[kind].purpose;
 
-/** 用需求原文排序（rank，内存里派生的 full 投影）出的条目（能力说明已在 system 里，不再给）的 Markdown，估算超过 SEARCH_TOKENS 时减少条数 */
+/** 用需求原文排序（rank，内存里派生的 full 投影）出的条目的 Markdown，估算超过 SEARCH_TOKENS 时减少条数；能力说明已在 system 里，排序前就去掉它的投影行，不占依赖展开的名额 */
 function relevantMarkdown(catalog: Catalog, request: string): string {
-  const hits = rank(deriveProjection(catalog, 'full'), catalog, request, {}, SEARCH_LIMIT + CAPABILITIES.length).map(r => r.entry).filter(e => e.kind !== 'capability').slice(0, SEARCH_LIMIT);
+  const hits = rank(deriveProjection(catalog, 'full').filter(r => !r.entryId.startsWith('capability:')), catalog, request, {}, SEARCH_LIMIT).map(r => r.entry);
   for (let n = hits.length; n > 0; n--) {
     const md = toMarkdown(hits.slice(0, n));
     if (estimateTokens(md) <= SEARCH_TOKENS) return md;

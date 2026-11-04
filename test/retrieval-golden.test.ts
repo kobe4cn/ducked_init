@@ -1,5 +1,5 @@
 // test/retrieval-golden.test.ts —— 检索黄金集（#317，ADR-0047 的确定性层）：40 条黄金集的标注齐全、分布达标、引用的条目都在固定目录里；
-// 对 rank()（检索投影上的多路召回 + RRF 融合）逐条断言候选都在前 20、第 1 名不是不能选的近义项、歧义判定与标注一致，汇总 Recall@20 不低于 BASELINE；
+// 对 rank()（检索投影上的多路召回 + RRF 融合 + 依赖展开）逐条断言候选都在前 20、第 1 名不是不能选的近义项、歧义判定与标注一致，汇总 Recall@20 不低于 BASELINE；
 // 别名类 6 条另断言别名指向的条目进前 20。rank() 还不判歧义（判定恒为 false），做不到的记在 KNOWN_GAPS（用 it.fails，改好后会变红，提醒从清单删掉并抬高 BASELINE）。
 // 纯函数，不读库、不走模型
 import { describe, expect, it } from 'vitest';
@@ -10,7 +10,7 @@ import { recallAt, retrieve, viewerView } from '../scripts/eval-requirements/ret
 import { EXTRA_DEFINITIONS, RETRIEVAL_CATALOG } from '../scripts/eval-requirements/retrieval-catalog';
 
 /** 总 Recall@20 的下限：本票实测值向下取两位小数；改好一条后抬高 */
-const BASELINE = 0.86;
+const BASELINE = 0.92;
 
 /** rank() 做不到的条目与原因 */
 const NO_AMBIGUITY = 'rank() 不判歧义';
@@ -21,15 +21,10 @@ const KNOWN_GAPS = new Map<string, string>([
   ['revenue-ambiguous', NO_AMBIGUITY],
   ['revenue-yoy', NO_AMBIGUITY],
   ['sales-amount-alias', NO_AMBIGUITY],
-  ['add-to-cart-7d', '需求里没有「发生时间」，event.occurred_at 没进前 20'],
-  ['avg-completed-order-amount', '需求里没有「下单时间」，order.created_at 没进前 20；第 1 名是口径不同的客单价 aov_365d'],
-  ['order-count-90d', '需求里没有「下单时间」，order.created_at 没进前 20'],
-  ['distinct-products-180d', '只召回到 product_id，经 order_item.order_id 取下单时间的关系与字段没进前 20'],
-  ['paid-revenue-by-city', '城市与 order → customer 的关系被带「近 30 天」的指标挤出前 20'],
   ['points-ambiguous', '「每个消费者」的二元组把带消费者 ID 的条目排在前面，积分字段没进前 20；也不判歧义'],
   ['churn-forecast', '「流失」没有出现在任何说明里，days_since_last_order 没进前 20'],
   ['purchase-frequency-alias', NO_AMBIGUITY],
-  ['pv-7d-alias', '需求里没有「发生时间」，event.occurred_at 没进前 20'],
+  ['pv-7d-alias', '锚点投票：前 5 名里 order 与 consent 各两票（「近」的关键词命中），event 只有 event_type 一票、不是锚点，依赖展开没补 event.occurred_at'],
 ]);
 
 /** 别名类条目 → 别名指向的条目（RETRIEVAL_CATALOG 的 ALIASES） */

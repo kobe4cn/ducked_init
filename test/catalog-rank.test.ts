@@ -1,6 +1,7 @@
 // test/catalog-rank.test.ts —— 检索排序 rank()（ADR-0047）：纯函数，手工构造 CatalogInput。两个指标用同一个别名、挂在不同主题与不同空间，
 // 另一个指标只有说明里有这个词：别名命中排在只有正文命中的前面；不给作用域、只给 memberSpaceId 时分数等于按常量算的 RRF；
-// 查询里说了主题名、scope.subjects 或 scope.spaceIds 给了其中一个时它排第一，另一个仍在结果里
+// 查询里说了主题名、scope.subjects 或 scope.spaceIds 给了其中一个时它排第一，另一个仍在结果里。
+// 依赖展开（expand.ts）：带「近 7 天」时补锚点实体的时间字段，「每个城市」补锚点到 customer 的关系，都标 expand、排在直接命中之后；两种词都没有时与不截断的结果的前 limit 个相同
 import { describe, expect, it } from 'vitest';
 import { buildCatalog, type CatalogInput } from '../app/.server/catalog';
 import { deriveProjection } from '../app/.server/catalog/projection';
@@ -64,5 +65,34 @@ describe('检索排序 rank()', () => {
       .toEqual(['metric:revenue_b', 'metric:aaa_note']);
     expect(rank(rows, c, '营收', {}, 1)).toHaveLength(1);
     expect(rank(rows, c, '完全不相关')).toEqual([]);
+  });
+
+  it('依赖展开：带「近 7 天」时补上锚点 event 的时间字段，标 expand、排在所有直接命中之后', () => {
+    const r = rank(rows, c, '近 7 天加购次数');
+    const at = r.findIndex(x => x.entry.id === 'field:event.occurred_at');
+    expect(at).toBe(r.length - 1);
+    expect(r[at]!.reasons).toEqual([{ lane: 'expand', matched: ['entity:event 的时间字段'] }]);
+    const direct = r.slice(0, at);
+    expect(direct.map(x => x.entry.id)).toContain('entity:event');
+    expect(direct.every(x => x.reasons.every(h => h.lane !== 'expand') && x.score > r[at]!.score)).toBe(true);
+  });
+
+  it('依赖展开：「每个城市」命中 customer 上的字段，补上锚点 order 到 customer 的关系；已在前面的 customer.city 不重复、不标 expand', () => {
+    const r = rank(rows, c, '每个城市的订单数');
+    const relation = r.find(x => x.entry.id === 'relation:order.customer_id');
+    expect(relation?.reasons).toEqual([{ lane: 'expand', matched: ['entity:order → relation:order.customer_id'] }]);
+    const city = r.filter(x => x.entry.id === 'field:customer.city');
+    expect(city).toHaveLength(1);
+    expect(city[0]!.reasons.map(h => h.lane)).not.toContain('expand');
+    const first = r.findIndex(x => x.reasons.some(h => h.lane === 'expand'));
+    expect(r.slice(first).every(x => x.reasons.some(h => h.lane === 'expand'))).toBe(true);
+  });
+
+  it('依赖展开：没有窗口词也没有维度词时，结果是不截断排序的前 limit 个，不带 expand', () => {
+    for (const q of ['营收', '订单金额合计', '加购次数']) {
+      const r = rank(rows, c, q, {}, 5);
+      expect(r, q).toEqual(rank(rows, c, q, {}, 10_000).slice(0, 5));
+      expect(r.flatMap(x => x.reasons).filter(h => h.lane === 'expand'), q).toEqual([]);
+    }
   });
 });

@@ -28,8 +28,8 @@ describe('eval:requirements 的检索与追问指标', () => {
     const rows = retrievalRows(GOLDEN_ALL);
     const total = groupByType(rows).合计;
     expect(total.cases).toBe(40);
-    expect(total.recall).toBeGreaterThanOrEqual(0.86);
-    expect(total.recall!.toFixed(4)).toBe('0.8654');
+    expect(total.recall).toBeGreaterThanOrEqual(0.92);
+    expect(total.recall!.toFixed(4)).toBe('0.9231');
     expect(rows.filter(r => r.shouldAsk)).toHaveLength(12);
     expect(rows.some(r => r.asked)).toBe(false);
     expect(total.clarifyRecall).toBe(0);
