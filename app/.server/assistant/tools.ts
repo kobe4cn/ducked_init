@@ -11,6 +11,7 @@ import { assertCan, can, type Permission } from '../access';
 import type { CurrentMember } from '../auth';
 import { expand, overview, search, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
 import { tenantCatalog } from '../catalog/load';
+import { refreshProjection, visibilityClass, visibleCatalog } from '../catalog/projection';
 import { getDb } from '../db/client';
 import { dslDefinitions, mappings } from '../db/schema';
 import { createDefinition, DslError, saveDslDraft, validateDefinition } from '../dsl-definitions';
@@ -37,25 +38,9 @@ export interface AssistantTool {
 /** 工具的结果：rejected 表示校验或保存没有通过，issues 是问题清单的文本、yaml 是被拒的那一版；saved 表示保存了一份草稿 */
 export interface ToolResult { text: string; rejected?: { issues: string; yaml: string }; saved?: true }
 
-/** 本租户的目录，按成员角色过滤：没有 sources:read 时去掉数据源与源表条目，字段不带来源、实体不列映射到它的源表与合并组 */
-export async function catalogFor(member: CurrentMember): Promise<Catalog> {
-  const c = await tenantCatalog(member.tenant.id);
-  if (can(member.role, 'sources:read')) return c;
-  const entries = c.entries.flatMap((e): CatalogEntry[] => {
-    switch (e.kind) {
-      case 'source':
-      case 'table':
-        return [];
-      case 'field':
-        return [{ ...e, lineage: [] }];
-      case 'entity':
-        return [{ ...e, tables: [], unscoped: [], mergeGroups: [] }];
-      default:
-        return [e];
-    }
-  });
-  return { ...c, entries };
-}
+/** 本租户的目录，按成员角色过滤（visibleCatalog）：没有 sources:read 时去掉数据源与源表条目，字段不带来源、实体不列映射到它的源表与合并组 */
+export const catalogFor = async (member: CurrentMember): Promise<Catalog> =>
+  visibleCatalog(await tenantCatalog(member.tenant.id), visibilityClass(member.role));
 
 const TEXT = { type: 'string' };
 
@@ -118,7 +103,11 @@ export const TOOLS: AssistantTool[] = [
     outputSchema: TEXT,
     permission: 'definitions:read',
     external: true,
-    run: async (actor, { query, limit }) => toMarkdown(search(await catalogFor(actor), query as string, limit as number | undefined)),
+    run: async (actor, { query, limit }) => {
+      // 先在请求里把检索投影刷到最新目录版本（ADR-0047）；刷新失败不影响搜索，结果照旧来自实时目录
+      await refreshProjection(actor.tenant.id).catch(e => console.warn('检索投影刷新失败', actor.tenant.id, e));
+      return toMarkdown(search(await catalogFor(actor), query as string, limit as number | undefined));
+    },
   },
   {
     name: 'validate_definition',

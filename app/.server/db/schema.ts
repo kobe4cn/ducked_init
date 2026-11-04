@@ -838,3 +838,18 @@ export const catalogVersions = platform.table('catalog_versions', {
   diff: jsonb('diff').$type<CatalogDiff>().notNull(),
   createdAt: createdAt(),
 }, t => [uniqueIndex('catalog_versions_tenant_version_uq').on(t.tenantId, t.version)]);
+
+// 目录的检索投影（ADR-0047）：每个目录条目在每个可见性类别（full / restricted，按角色算）下参与检索的文字与别名、主题、所属空间。
+// 这是从目录派生的数据，可随时从零重建（catalog/projection.ts）；不存条目原 JSON。所有行带同一个目录版本号，max(catalog_version) 就是投影版本。
+// space_id 不加外键：空间删了会让目录变化、触发刷新
+export const catalogProjection = platform.table('catalog_projection', {
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  visibilityClass: text('visibility_class').notNull(),
+  entryId: text('entry_id').notNull(),
+  text: text('text').notNull(),
+  textHash: text('text_hash').notNull(),
+  subjects: jsonb('subjects').$type<string[]>().notNull(),
+  aliases: jsonb('aliases').$type<string[]>().notNull(),
+  spaceId: uuid('space_id'),
+  catalogVersion: integer('catalog_version').notNull(),
+}, t => [uniqueIndex('catalog_projection_tenant_class_entry_uq').on(t.tenantId, t.visibilityClass, t.entryId)]);

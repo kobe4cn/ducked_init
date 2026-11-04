@@ -462,7 +462,7 @@ function terms(query: string): string[] {
 }
 
 /** 条目参与搜索的文字：标识、名称、说明、枚举与标签取值、业务知识、指标与标签的口径文字与取值不是未知的系统口径声明（「币种：未知」之类不带信息，进检索会让「退款」等词命中所有指标），字段再加业务说明与各映射字段的说明与知识，能力说明再加各项说明 */
-const haystack = (e: CatalogEntry) => [
+export const haystack = (e: CatalogEntry) => [
   e.id, e.name, e.description,
   ...('knowledge' in e ? [knowledgeText(e.knowledge)] : []),
   ...(e.kind === 'metric' || e.kind === 'tag' ? [e.system.text, ...e.system.claims.filter(c => c.value !== 'unknown').map(claimPhrase)] : []),
