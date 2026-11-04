@@ -72,42 +72,50 @@ function rowsOf(c: Catalog, tenantId: string, ids?: Set<string>) {
     .map(r => ({ ...r, tenantId, visibilityClass: cls, catalogVersion: c.version ?? 0 })));
 }
 
+/**
+ * 在已拿锁的事务里把投影从版本 now 刷到目录 c：now 为 null（还没有投影）时删掉全部行、插入两类；
+ * 否则按 now 到当前的净差异只重写变了的条目，再把所有行的版本号改成 c 的版本。只供 refreshProjection、rebuildProjection 与测试用
+ */
+export async function refreshFrom(tx: Tx, tenantId: string, now: number | null, c: Catalog): Promise<void> {
+  if (now === null) {
+    await tx.delete(catalogProjection).where(eq(catalogProjection.tenantId, tenantId));
+    const rows = rowsOf(c, tenantId);
+    if (rows.length) await tx.insert(catalogProjection).values(rows);
+    return;
+  }
+  const { net } = await catalogChangesSince(tx, tenantId, now);
+  const ids = new Set([...net.added, ...net.changed, ...net.removed].map(x => x.id));
+  if (ids.size) {
+    await tx.delete(catalogProjection).where(and(eq(catalogProjection.tenantId, tenantId), inArray(catalogProjection.entryId, [...ids])));
+    const rows = rowsOf(c, tenantId, ids);
+    if (rows.length) await tx.insert(catalogProjection).values(rows);
+  }
+  await tx.update(catalogProjection).set({ catalogVersion: c.version ?? 0 }).where(eq(catalogProjection.tenantId, tenantId));
+}
+
 /** 从零重建：按当前目录删掉该租户的全部投影行、重新插入两类 */
 export async function rebuildProjection(tenantId: string): Promise<void> {
   const c = await tenantCatalog(tenantId);
   await getDb().transaction(async tx => {
     await lock(tx, tenantId);
-    await tx.delete(catalogProjection).where(eq(catalogProjection.tenantId, tenantId));
-    const rows = rowsOf(c, tenantId);
-    if (rows.length) await tx.insert(catalogProjection).values(rows);
+    await refreshFrom(tx, tenantId, null, c);
   });
 }
 
 /**
- * 把投影刷到当前目录版本：已是最新返回 fresh；还没有投影时从零重建；否则按投影版本到当前的净差异只重写变了的条目，
- * 再把所有行的版本号改成当前版本。版本号用 tenantCatalog 返回的那个（目录只会比它新，下一轮会收敛）
+ * 把投影刷到当前目录版本：已是最新返回 fresh；否则在锁里重读投影版本，按它刷新（还没有投影时从零重建）。
+ * 版本号用 tenantCatalog 返回的那个（目录只会比它新，下一轮会收敛）
  */
 export async function refreshProjection(tenantId: string): Promise<'fresh' | 'refreshed'> {
   const db = getDb();
   const v = await projectionVersion(db, tenantId);
   const c = await tenantCatalog(tenantId);
   if (v === (c.version ?? 0)) return 'fresh';
-  if (v === null) {
-    await rebuildProjection(tenantId);
-    return 'refreshed';
-  }
-  const { net } = await catalogChangesSince(db, tenantId, v);
-  const ids = new Set([...net.added, ...net.changed, ...net.removed].map(x => x.id));
   await db.transaction(async tx => {
     await lock(tx, tenantId);
     const now = await projectionVersion(tx, tenantId);
     if (now !== null && now >= (c.version ?? 0)) return;
-    if (ids.size) {
-      await tx.delete(catalogProjection).where(and(eq(catalogProjection.tenantId, tenantId), inArray(catalogProjection.entryId, [...ids])));
-      const rows = rowsOf(c, tenantId, ids);
-      if (rows.length) await tx.insert(catalogProjection).values(rows);
-    }
-    await tx.update(catalogProjection).set({ catalogVersion: c.version ?? 0 }).where(eq(catalogProjection.tenantId, tenantId));
+    await refreshFrom(tx, tenantId, now, c);
   });
   return 'refreshed';
 }

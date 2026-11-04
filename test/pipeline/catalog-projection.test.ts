@@ -5,7 +5,7 @@ import { asc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { catalogFor, runTool } from '../../app/.server/assistant/tools';
 import { tenantCatalog } from '../../app/.server/catalog/load';
-import { projectionVersion, rebuildProjection, refreshProjection } from '../../app/.server/catalog/projection';
+import { projectionVersion, rebuildProjection, refreshFrom, refreshProjection } from '../../app/.server/catalog/projection';
 import { currentCatalogVersion } from '../../app/.server/catalog/versions';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -76,6 +76,27 @@ describe('检索投影', () => {
     expect(all.find(r => r.visibilityClass === 'full' && r.entryId === 'entity:order')).toMatchObject({ subjects: ['交易分析'] });
     expect(all.find(r => r.entryId === 'metric:paid_revenue')?.spaceId).toBe(analyst.space.id);
     expect(all.some(r => r.entryId === 'metric:refund_count')).toBe(false);
+  });
+
+  it('锁外读到旧版本、锁里投影已被并发刷新推进：按锁里的版本算净差异，之后删掉的条目不会留在投影里', async () => {
+    const { acme, analyst, reviewer, author } = await setup();
+    await refreshProjection(acme);
+    const a = (await projectionVersion(getDb(), acme))!;
+    await createDefinition(analyst, 'metric', 'refund_count', REFUND);
+    await publishDefinition(reviewer, 'metric', 'refund_count', 1);
+    await refreshProjection(acme);
+    const b = (await projectionVersion(getDb(), acme))!;
+    expect((await rows(acme)).some(r => r.entryId === 'metric:refund_count')).toBe(true);
+
+    // 模拟锁外读到的是 A：把投影行的版本号改回 A；然后删掉 X，在锁里按 B 刷新
+    await getDb().update(catalogProjection).set({ catalogVersion: a }).where(eq(catalogProjection.tenantId, acme));
+    await deleteDefinition(author, 'metric', 'refund_count');
+    const c = await tenantCatalog(acme);
+    await getDb().transaction(tx => refreshFrom(tx, acme, b, c));
+    const incremental = await rows(acme);
+    expect(incremental.some(r => r.entryId === 'metric:refund_count')).toBe(false);
+    await rebuildProjection(acme);
+    expect(await rows(acme)).toEqual(incremental);
   });
 
   it('两类投影的条目集合与 catalogFor 一致；restricted 的文字不带源表、数据源与源表条目、映射说明与映射别名', async () => {
