@@ -10,13 +10,13 @@ import * as rankModule from '../../app/.server/catalog/rank';
 import { currentCatalogVersion } from '../../app/.server/catalog/versions';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { catalogProjection, tasks } from '../../app/.server/db/schema';
+import { catalogProjection, spaces, tasks } from '../../app/.server/db/schema';
 import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { addAlias } from '../../app/.server/knowledge/aliases';
 import { addMembership, createSubject } from '../../app/.server/knowledge/subjects';
 import { confirmDisable, requestDisable } from '../../app/.server/mappings';
 import { resetDb } from '../http/harness';
-import { drain, memberOf } from './fixtures';
+import { drain, memberInNewSpace, memberOf, newTenant } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -218,5 +218,28 @@ describe('检索投影', () => {
     const out = await runTool(viewer, 'catalog_search', { query: '退货笔数' });
     expect(out).toContain('metric:refund_count');
     expect(out).not.toContain('命中：');
+  });
+
+  it('catalog_search 的排序作用域是查询里点名的本租户空间与成员所属空间：没点名的本租户空间、别的租户的同名空间都不算', async () => {
+    const { acme, viewer } = await setup();
+    const [home] = await getDb().select({ id: spaces.id, name: spaces.name }).from(spaces)
+      .where(and(eq(spaces.tenantId, acme), eq(spaces.isDefault, true)));
+    const other = await memberInNewSpace(acme, 'b@acme.com', 'viewer', '事业部B'); // 本租户的另一个空间，查询里不提
+    const globex = await newTenant('globex'); // 开通时自带同名的默认空间
+    const [twin] = await getDb().select({ id: spaces.id }).from(spaces)
+      .where(and(eq(spaces.tenantId, globex), eq(spaces.name, home!.name)));
+    expect(twin).toBeDefined();
+    const spy = vi.spyOn(rankModule, 'rank');
+
+    await runTool(viewer, 'catalog_search', { query: `${home!.name}的订单金额` });
+    expect(spy).toHaveBeenCalled();
+    expect(spy.mock.lastCall![3]).toEqual({ spaceIds: [home!.id], memberSpaceId: viewer.space.id });
+    expect(spy.mock.lastCall![3]!.spaceIds).not.toContain(other.space.id);
+    expect(spy.mock.lastCall![3]!.spaceIds).not.toContain(twin!.id);
+
+    spy.mockClear();
+    await runTool(viewer, 'catalog_search', { query: '订单金额' });
+    expect(spy).toHaveBeenCalled();
+    expect(spy.mock.lastCall![3]).toEqual({ spaceIds: [], memberSpaceId: viewer.space.id });
   });
 });
