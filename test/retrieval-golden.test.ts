@@ -1,6 +1,6 @@
 // test/retrieval-golden.test.ts —— 检索黄金集（#317，ADR-0047 的确定性层）：40 条黄金集的标注齐全、分布达标、引用的条目都在固定目录里；
 // 对 rank()（检索投影上的多路召回 + RRF 融合 + 依赖展开）逐条断言候选都在前 20、第 1 名不是不能选的近义项、歧义判定与标注一致，汇总 Recall@20 不低于 BASELINE；
-// 别名类 6 条另断言别名指向的条目进前 20。rank() 还不判歧义（判定恒为 false），做不到的记在 KNOWN_GAPS（用 it.fails，改好后会变红，提醒从清单删掉并抬高 BASELINE）。
+// 别名类 6 条另断言别名指向的条目进前 20。歧义按 judgeAmbiguity()（点名排除 + 口径对比，#398）判，做不到的记在 KNOWN_GAPS（用 it.fails，改好后会变红，提醒从清单删掉并抬高 BASELINE）。
 // 纯函数，不读库、不走模型
 import { describe, expect, it } from 'vitest';
 import { expand } from '../app/.server/catalog';
@@ -10,20 +10,14 @@ import { recallAt, retrieve, viewerView } from '../scripts/eval-requirements/ret
 import { EXTRA_DEFINITIONS, RETRIEVAL_CATALOG } from '../scripts/eval-requirements/retrieval-catalog';
 
 /** 总 Recall@20 的下限：本票实测值向下取两位小数；改好一条后抬高 */
-const BASELINE = 0.92;
+const BASELINE = 0.96;
 
-/** rank() 做不到的条目与原因 */
-const NO_AMBIGUITY = 'rank() 不判歧义';
+/** rank() 与歧义判定做不到的条目与原因 */
+const NO_REVENUE_ALIAS = '营收指标没挂「营收」别名（挂了会让 item-revenue-30d 等条目的第 1 名变成近义项，#398 评论），名称路命不中中文，凑不成组';
 const KNOWN_GAPS = new Map<string, string>([
-  ['active-ambiguous', NO_AMBIGUITY],
-  ['aov-ambiguous', NO_AMBIGUITY],
-  ['channel-ambiguous', NO_AMBIGUITY],
-  ['revenue-ambiguous', NO_AMBIGUITY],
-  ['revenue-yoy', NO_AMBIGUITY],
-  ['sales-amount-alias', NO_AMBIGUITY],
-  ['points-ambiguous', '「每个消费者」的二元组把带消费者 ID 的条目排在前面，积分字段没进前 20；也不判歧义'],
+  ['revenue-ambiguous', NO_REVENUE_ALIAS],
+  ['revenue-yoy', NO_REVENUE_ALIAS],
   ['churn-forecast', '「流失」没有出现在任何说明里，days_since_last_order 没进前 20'],
-  ['purchase-frequency-alias', NO_AMBIGUITY],
   ['pv-7d-alias', '锚点投票：前 5 名里 order 与 consent 各两票（「近」的关键词命中），event 只有 event_type 一票、不是锚点，依赖展开没补 event.occurred_at'],
 ]);
 

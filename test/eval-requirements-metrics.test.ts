@@ -24,16 +24,16 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(g.合计).toEqual({ cases: 4, recall: 0.5, clarifyAccuracy: 0.5, clarifyRecall: 0.5 });
   });
 
-  it('真实黄金集：合计 Recall@20 与 retrieval-golden 的汇总一致，应追问 12 条、召回 0（rank() 不判歧义），验收集 8 条', () => {
+  it('真实黄金集：合计 Recall@20 与 retrieval-golden 的汇总一致，应追问 12 条、判出 6 条（4 条不是检索歧义，revenue-ambiguous、revenue-yoy 缺「营收」别名），验收集 8 条', () => {
     const rows = retrievalRows(GOLDEN_ALL);
     const total = groupByType(rows).合计;
     expect(total.cases).toBe(40);
-    expect(total.recall).toBeGreaterThanOrEqual(0.92);
-    expect(total.recall!.toFixed(4)).toBe('0.9231');
+    expect(total.recall).toBeGreaterThanOrEqual(0.96);
+    expect(total.recall!.toFixed(4)).toBe('0.9615');
     expect(rows.filter(r => r.shouldAsk)).toHaveLength(12);
-    expect(rows.some(r => r.asked)).toBe(false);
-    expect(total.clarifyRecall).toBe(0);
-    expect(total.clarifyAccuracy).toBe(28 / 40);
+    expect(rows.filter(r => r.asked)).toHaveLength(6);
+    expect(total.clarifyRecall).toBe(6 / 12);
+    expect(total.clarifyAccuracy).toBe(34 / 40);
     expect(rows.filter(r => r.holdout)).toHaveLength(8);
   });
 });

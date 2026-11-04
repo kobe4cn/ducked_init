@@ -4,6 +4,7 @@
 // 纯函数，不读库、不走模型
 import type { Catalog } from '../../app/.server/catalog';
 import { deriveProjection, visibleCatalog, type ProjectionClass } from '../../app/.server/catalog/projection';
+import { judgeAmbiguity, type Ambiguity } from '../../app/.server/catalog/ambiguity';
 import { rank } from '../../app/.server/catalog/rank';
 import { FAILURE_TYPES, type GoldenEntry } from './golden';
 import { RETRIEVAL_CATALOG } from './retrieval-catalog';
@@ -15,16 +16,17 @@ export const LIMIT = 20;
 const view = (cls: ProjectionClass) => ({ rows: deriveProjection(RETRIEVAL_CATALOG, cls), catalog: visibleCatalog(RETRIEVAL_CATALOG, cls) });
 const VIEWS = { full: view('full'), restricted: view('restricted') };
 
-export interface Retrieved { top: string[]; hits: number; ambiguous: boolean }
+export interface Retrieved { top: string[]; hits: number; ambiguous: boolean; ambiguity: Ambiguity }
 
-/** 一条的检索结果：前 20（排序前先去掉能力说明的投影行，与 model-draft 的 relevantMarkdown 一致：否则能力说明占着直接命中的名额，依赖展开补进来的候选会落到第 20 名之后）、命中的候选数与歧义判定 */
+/** 一条的检索结果与歧义判定：前 20（排序前先去掉能力说明的投影行，与 model-draft 的 relevantMarkdown 一致：否则能力说明占着直接命中的名额，依赖展开补进来的候选会落到第 20 名之后）、命中的候选数与歧义判定 */
 export function retrieve(g: GoldenEntry): Retrieved {
   const v = VIEWS[g.role === 'viewer' ? 'restricted' : 'full'];
-  const top = rank(v.rows.filter(r => !r.entryId.startsWith('capability:')), v.catalog, g.retrieval.query, {}, LIMIT).map(r => r.entry.id);
+  const ranked = rank(v.rows.filter(r => !r.entryId.startsWith('capability:')), v.catalog, g.retrieval.query, {}, LIMIT);
+  const top = ranked.map(r => r.entry.id);
   const hits = g.retrieval.candidates.filter(id => top.includes(id)).length;
-  // rank() 不判歧义（留给 ⑨）
-  const ambiguous = false;
-  return { top, hits, ambiguous };
+  // 歧义判定用同一个排序结果（ambiguity.ts）
+  const ambiguity = judgeAmbiguity(ranked, v.catalog, g.retrieval.query);
+  return { top, hits, ambiguous: ambiguity.ambiguous, ambiguity };
 }
 
 /** 前 20 里命中的候选数 / 候选数；没有候选的条目为 null，不计入平均 */
