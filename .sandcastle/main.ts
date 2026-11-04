@@ -257,13 +257,21 @@ function syncHostBase() {
   }
 }
 
-const searchIssues = (query: string): { number: number; title: string; body: string }[] =>
-  JSON.parse(
+/**
+ * 带全部 `include` 标签、不带任何 `exclude` 标签的 open 票。
+ * 用 `--label`（issues 列表接口，实时）而不是 `--search`（搜索索引）：索引有延迟，刚打上的标签要过一阵
+ * 才查得到。2026-11-05 #393 刚打上 prepped，plan 用 --search 没查到，脚本以为没票可做就退出了。
+ * 排除的标签在本地过滤。
+ */
+const listIssues = (include: string[], exclude: string[] = []): { number: number; title: string; body: string }[] =>
+  (JSON.parse(
     sh("gh", [
-      "issue", "list", "--state", "open", "--limit", "100",
-      "--search", query, "--json", "number,title,body",
+      "issue", "list", "--state", "open", "--limit", "200",
+      ...include.flatMap((label) => ["--label", label]), "--json", "number,title,body,labels",
     ]),
-  );
+  ) as { number: number; title: string; body: string; labels: { name: string }[] }[])
+    .filter((issue) => !issue.labels.some((label) => exclude.includes(label.name)))
+    .map(({ number, title, body }) => ({ number, title, body }));
 
 const q = (label: string) => `label:"${label}"`;
 const notIn = (...labels: string[]) => labels.map((l) => `-${q(l)}`).join(" ");
@@ -280,7 +288,7 @@ const section = (body: string, title: string) => {
 
 /** `## Blocked by` 里引用的票号。 */
 const blockersOf = (body: string) =>
-  [...section(body, "Blocked by").matchAll(/#(\d+)/g)].map((m) => Number(m[1]));
+  [...new Set([...section(body, "Blocked by").matchAll(/#(\d+)/g)].map((m) => Number(m[1])))];
 
 /** 票的 open 状态，每轮开头清空（blocker 可能在两轮之间被合并）。 */
 const openStates = new Map<number, boolean>();
@@ -311,7 +319,7 @@ function closeFinishedParents() {
     return;
   }
   for (const parent of JSON.parse(parents.out) as { number: number; body: string }[]) {
-    const children = [...section(parent.body, "Split into").matchAll(/#(\d+)/g)].map((m) => Number(m[1]));
+    const children = [...new Set([...section(parent.body, "Split into").matchAll(/#(\d+)/g)].map((m) => Number(m[1])))];
     if (children.length === 0 || children.some(isOpen)) continue;
     const body = parent.body.replace(/^(\s*[-*]\s*)\[ \](?=\s*#\d+)/gm, "$1[x]");
     const list = children.map((n) => `#${n}`).join("、");
@@ -338,21 +346,9 @@ const changedFiles = (body: string) =>
  * 被 blocker 挡住的票不占文件，不会连带挡住编号大的票。
  */
 function plan(): Issue[] {
-  const candidates: { number: number; title: string; body: string }[] = JSON.parse(
-    sh("gh", [
-      "issue", "list", "--state", "open", "--limit", "100",
-      "--search", `${q(LABEL.picked)} ${q(LABEL.prepped)} ${notIn(LABEL.prOpen, LABEL.stuck)}`,
-      "--json", "number,title,body",
-    ]),
-  );
+  const candidates = listIssues([LABEL.picked, LABEL.prepped], [LABEL.prOpen, LABEL.stuck]);
   // 等人审的 PR 还没合进 main：它们改的文件先占上，免得新票在旧 main 上改同一个文件，两个 PR 互相冲突。
-  const waiting: { number: number; body: string }[] = JSON.parse(
-    sh("gh", [
-      "issue", "list", "--state", "open", "--limit", "100",
-      "--search", `${q(LABEL.picked)} ${q(LABEL.prOpen)}`,
-      "--json", "number,body",
-    ]),
-  );
+  const waiting = listIssues([LABEL.picked, LABEL.prOpen]);
   const taken = new Map<string, number>();
   const awaitingReview = new Set<number>();
   for (const w of waiting.sort((a, b) => a.number - b.number)) {
@@ -514,7 +510,7 @@ const REVISE_COMMAND = "/sandcastle";
  * Sandcastle 改完推上新提交后，同一条意见不再算数。
  */
 function reopenRequestedRevisions() {
-  for (const { number: issueId } of searchIssues(`${q(LABEL.prOpen)} ${notIn(LABEL.stuck)}`)) {
+  for (const { number: issueId } of listIssues([LABEL.prOpen], [LABEL.stuck])) {
     if (!allowed(issueId)) continue;
     const pr = prFor(issueId);
     if (!pr) continue;
@@ -1002,9 +998,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // 每轮重新查询，所以上一轮拆出来的子票（继承了 Sandcastle 标签）这里会被看到。
   // 有 open blocker 的票脚本直接跳过，不开会话（prep agent 遇到这种票也只会什么都不改就结束）；
   // 跳过的票仍留在 toPrep 里，下面判断「本轮拆出了新子票」时不会把它当成新票。
-  const toPrep = searchIssues(
-    `${q(LABEL.picked)} ${notIn(LABEL.prepped, LABEL.prOpen, LABEL.stuck)}`,
-  ).filter((issue) => allowed(issue.number));
+  const toPrep = listIssues([LABEL.picked], [LABEL.prepped, LABEL.prOpen, LABEL.stuck]).filter((issue) => allowed(issue.number));
   for (const issue of toPrep) {
     const open = openBlockers(issue.body);
     if (open.length > 0) {
@@ -1031,7 +1025,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     // 本轮 prep 拆出的子票还没 prep 过（下一轮才看到），这时停下会漏掉能开工的子票。
     // 只认本轮新出现的票：留在 toPrep 里的票（如等 blocker）下一轮仍不会有新票，循环照常结束。
     const prepped = new Set(toPrep.map((issue) => issue.number));
-    const split = searchIssues(`${q(LABEL.picked)} ${notIn(LABEL.prepped, LABEL.prOpen, LABEL.stuck)}`)
+    const split = listIssues([LABEL.picked], [LABEL.prepped, LABEL.prOpen, LABEL.stuck])
       .filter((issue) => allowed(issue.number) && !prepped.has(issue.number));
     if (split.length > 0) {
       console.log(`本轮没有可以开工的票，但拆出了子票 ${split.map((issue) => `#${issue.number}`).join("、")}，下一轮 prep。`);
