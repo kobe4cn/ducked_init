@@ -284,6 +284,12 @@ const TEMPLATE_HANDLERS = Object.fromEntries((Object.keys(TASK_KINDS) as Templat
   { [K in TemplateId as (typeof TASK_KINDS)[K]]: Handler };
 
 export const HANDLERS = {
+  // 检索投影刷新（ADR-0047）：工作进程里没有平台库，什么也不做；成功后由调度器结束钩子从零重建投影
+  'catalog.projection': {
+    label: '刷新检索投影',
+    readOnlyLake: true,
+    run: async () => ({}),
+  },
   'lake.inventory': {
     label: '盘点数据湖',
     run: async con => ({ tables: await inventory(con) }),

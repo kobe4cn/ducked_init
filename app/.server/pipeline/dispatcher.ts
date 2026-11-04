@@ -4,9 +4,10 @@
 // 常驻运行时还定期为到期的数据源入队同步与湖中数据核对，为有新变化的租户入队标准层合并；同步给已发布映射的源表写入变更后随即入队一次合并，
 // 分析模板与指标、标签任务成功后登记结果快照，因断言失败时告警；还定期为有到期快照的租户入队快照过期、有到期沙箱表的入队沙箱表过期，成功后标记快照、沙箱表已过期。
 // 登记了新快照或标记了过期后入队重建服务库，生成成功后把服务库指针切到新版本
-// 源表采集与同步成功后和最新一版语义目录比较，源表的列变了记一版目录版本
+// 源表采集与同步成功后和最新一版语义目录比较，源表的列变了记一版目录版本；检索投影刷新任务成功后在这里从零重建投影
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { rebuildProjection } from '../catalog/projection';
 import { recordCatalogVersionIfChanged } from '../catalog/versions';
 import { registerDslSnapshot } from '../dsl-definitions';
 import { cleanupExpiredExports } from '../exports';
@@ -111,6 +112,8 @@ export function createDispatcher({
         const template = templateOfKind(task.kind);
         if (template && outcome!.result) await registerSnapshot(task.tenantId, task.id, template);
         if (task.kind === 'gold.dsl' && outcome!.result) await registerDslSnapshot(task.tenantId, task.id);
+        // 检索投影差异太大、交给了任务（ADR-0047）：在这里按当前目录从零重建。失败不影响任务状态，下次检索会再入队
+        if (task.kind === 'catalog.projection' && succeeded) await rebuildProjection(task.tenantId).catch(e => console.warn('检索投影重建失败', task.tenantId, e));
         // 结果层任务因 error 级断言失败（没有登记快照）：告警租户管理员并记审计
         if ((template || task.kind === 'gold.dsl') && 'error' in outcome!) await alertAssertionFailure(task.tenantId, task, outcome.result);
         // 到期快照的表已删、旧文件已清理：标记为已过期，分析页不再打开它们

@@ -1,7 +1,7 @@
 // test/pipeline/catalog-projection.test.ts —— 目录检索投影（ADR-0047）的接缝：refreshProjection / rebuildProjection → catalog_projection。
 // 一串目录变化后逐版增量刷新与从零重建得到的投影完全相同；两类投影的条目集合与 catalogFor 一致、restricted 不带数据源、源表与映射血缘的文字；
-// catalog_search 先在请求里把投影刷到最新目录版本，结果来自实时目录
-import { asc, eq } from 'drizzle-orm';
+// catalog_search 先在请求里把投影刷到最新目录版本，结果来自实时目录；差异超过阈值时只入队一个 catalog.projection，任务成功后重建
+import { and, asc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { catalogFor, runTool } from '../../app/.server/assistant/tools';
 import { tenantCatalog } from '../../app/.server/catalog/load';
@@ -9,13 +9,13 @@ import { projectionVersion, rebuildProjection, refreshFrom, refreshProjection } 
 import { currentCatalogVersion } from '../../app/.server/catalog/versions';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { catalogProjection } from '../../app/.server/db/schema';
+import { catalogProjection, tasks } from '../../app/.server/db/schema';
 import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { addAlias } from '../../app/.server/knowledge/aliases';
 import { addMembership, createSubject } from '../../app/.server/knowledge/subjects';
 import { confirmDisable, requestDisable } from '../../app/.server/mappings';
 import { resetDb } from '../http/harness';
-import { memberOf } from './fixtures';
+import { drain, memberOf } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -136,5 +136,34 @@ describe('检索投影', () => {
     expect(await runTool(viewer, 'catalog_search', { query: '退货笔数' })).not.toContain('metric:refund_count');
     expect(await projectionVersion(getDb(), acme)).toBe(await currentCatalogVersion(getDb(), acme));
     expect((await rows(acme)).some(r => r.entryId === 'metric:refund_count')).toBe(false);
+  });
+
+  it('净差异超过阈值：只入队一个 catalog.projection、不改投影，排队期间检索走实时目录、搜不到投影里还在的已删指标，任务成功后投影与从零重建相同', async () => {
+    const { acme, author, reviewer, analyst, viewer } = await setup();
+    await createDefinition(analyst, 'metric', 'refund_count', REFUND);
+    await publishDefinition(reviewer, 'metric', 'refund_count', 1);
+    await rebuildProjection(acme);
+    const before = await projectionVersion(getDb(), acme);
+    const beforeRows = await rows(acme);
+    expect(beforeRows.some(r => r.entryId === 'metric:refund_count')).toBe(true);
+    await deleteDefinition(author, 'metric', 'refund_count');
+
+    expect(await refreshProjection(acme, { syncLimit: 0 })).toBe('queued');
+    expect(await refreshProjection(acme, { syncLimit: 0 })).toBe('queued');
+    const queued = () => getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'catalog.projection')));
+    expect(await queued()).toHaveLength(1);
+    expect(await projectionVersion(getDb(), acme)).toBe(before);
+    expect(await rows(acme)).toEqual(beforeRows);
+
+    expect(await runTool(viewer, 'catalog_search', { query: '退货笔数' })).not.toContain('metric:refund_count');
+
+    await drain();
+    expect((await queued()).map(t => t.status)).toEqual(['succeeded']);
+    expect(await projectionVersion(getDb(), acme)).toBe(await currentCatalogVersion(getDb(), acme));
+    const rebuilt = await rows(acme);
+    await rebuildProjection(acme);
+    expect(rebuilt.some(r => r.entryId === 'metric:refund_count')).toBe(false);
+    await rebuildProjection(acme);
+    expect(await rows(acme)).toEqual(rebuilt);
   });
 });
