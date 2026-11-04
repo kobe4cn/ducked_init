@@ -9,7 +9,7 @@ import { newTenant } from './fixtures';
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 
-const quota = (maxConcurrentTasks: number) => ({ memoryLimitMb: 512, threads: 1, maxConcurrentTasks });
+const quota = (maxConcurrentTasks: number) => ({ memoryLimitMb: 512, threads: 1, maxConcurrentTasks, maxUploadMb: 100 });
 
 async function enqueue(tenantId: string, n: number) {
   for (let i = 0; i < n; i++) await enqueueTask(tenantId, 'lake.inventory', { i });
@@ -42,7 +42,7 @@ describe('按租户的并发上限', () => {
 
   it('领到的任务带上本租户配额', async () => {
     const acme = await newTenant('acme');
-    await setTenantQuota(null, acme, { memoryLimitMb: 4096, threads: 8, maxConcurrentTasks: 1 });
+    await setTenantQuota(null, acme, { memoryLimitMb: 4096, threads: 8, maxConcurrentTasks: 1, maxUploadMb: 100 });
     await enqueue(acme, 1);
     expect((await claimNextTask())!.limits).toEqual({ memoryLimitMb: 4096, threads: 8 });
   });

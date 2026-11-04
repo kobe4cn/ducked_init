@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."tenants" ADD COLUMN "max_upload_mb" integer DEFAULT 100 NOT NULL;

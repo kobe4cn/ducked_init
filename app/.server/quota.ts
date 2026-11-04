@@ -1,9 +1,10 @@
-// app/.server/quota.ts —— 租户配额：单任务的内存上限与线程数、并发任务数。字段的名称、单位与取值范围只在这里定义；
+// app/.server/quota.ts —— 租户配额：单任务的内存上限与线程数、并发任务数、单个上传文件的大小上限。字段的名称、单位与取值范围只在这里定义；
 // 校验、运营后台表单与审计描述都由它生成，新增配额字段只改这里与 schema
 export const QUOTA_FIELDS = {
   memoryLimitMb: { label: '单任务内存上限', short: '内存', unit: ' MiB', min: 128, max: 1024 * 1024 },
   threads: { label: '单任务线程数', short: '线程', unit: '', min: 1, max: 256 },
   maxConcurrentTasks: { label: '并发任务数', short: '并发任务', unit: '', min: 1, max: 64 },
+  maxUploadMb: { label: '单个上传文件上限', short: '上传', unit: ' MiB', min: 1, max: 2048 },
 } as const;
 
 export type QuotaKey = keyof typeof QUOTA_FIELDS;

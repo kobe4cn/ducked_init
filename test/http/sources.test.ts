@@ -8,6 +8,7 @@ import { listLakeFiles } from '../../app/.server/lake-storage';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { ignoreColumn } from '../../app/.server/mappings';
 import { registerSource, relistSource } from '../../app/.server/sources';
+import { setTenantQuota } from '../../app/.server/tenants';
 import { drain, memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
 import { grantOnSource, pgSourceInput, READER, WRITER } from '../pipeline/source-fixtures';
 import { dbNameOf } from '../setup-env';
@@ -148,6 +149,42 @@ describe('登记数据源', () => {
 
     expect(await getDb().select().from(sources).where(eq(sources.tenantId, tenantId))).toEqual([]);
     expect(await listLakeFiles(await uploadsOf(tenantId))).toEqual([]);
+  });
+
+  it('超过租户上传上限的文件 413：边读边计数与 Content-Length 预检都拒；上限改小后原来能传的文件被拒；被拒的不留数据源与文件', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+    const MiB = 1024 * 1024;
+    const limit = (maxUploadMb: number) => setTenantQuota(null, tenantId, { memoryLimitMb: 2048, threads: 2, maxConcurrentTasks: 1, maxUploadMb });
+    const csvOf = (bytes: number) => new File(['id\n' + '1\n'.repeat(Math.ceil((bytes - 3) / 2))], 'big.csv');
+    const sourceCount = async () => (await getDb().select().from(sources).where(eq(sources.tenantId, tenantId))).length;
+    const expectRejected = async (res: Response, mb: number) => {
+      expect(res.status).toBe(413);
+      expect(await res.text()).toContain(`文件超过本租户上传上限 ${mb} MiB`);
+    };
+
+    // 边读边计数：harness 用 FormData 作请求体时没有 Content-Length
+    await limit(1);
+    await expectRejected(await upload(browser, { name: '大文件', table: 'big' }, csvOf(2 * MiB)), 1);
+
+    // Content-Length 预检：声明的长度超限，不读请求体
+    const body = new FormData();
+    for (const [k, v] of Object.entries({ intent: 'register', kind: 'upload', name: '小文件', table: 'small' })) body.set(k, v);
+    body.set('file', new File(['id\n1\n'], 'small.csv'));
+    await expectRejected(await browser.request('/sources', { method: 'POST', body, headers: { 'content-length': String(2 * MiB) } }), 1);
+    expect(await sourceCount()).toBe(0);
+    expect(await listLakeFiles(await uploadsOf(tenantId))).toEqual([]);
+
+    // 上限 2 时 1.5 MiB 的文件能登记；改成 1 后同一份文件被拒
+    const file = csvOf(1.5 * MiB);
+    await limit(2);
+    expect((await upload(browser, { name: '第一次', table: 'mid' }, file)).status).toBe(302);
+    expect(await sourceCount()).toBe(1);
+    const stored = await listLakeFiles(await uploadsOf(tenantId));
+    expect(stored).toHaveLength(1);
+    await limit(1);
+    await expectRejected(await upload(browser, { name: '第二次', table: 'mid' }, file), 1);
+    expect(await sourceCount()).toBe(1);
+    expect(await listLakeFiles(await uploadsOf(tenantId))).toEqual(stored);
   });
 });
 
