@@ -13,7 +13,7 @@ import { EXTRA_DEFINITIONS, RETRIEVAL_CATALOG } from '../scripts/eval-requiremen
 const BASELINE = 0.96;
 
 /** rank() 与歧义判定做不到的条目与原因 */
-const NO_REVENUE_ALIAS = '营收指标没挂「营收」别名（挂了会让 item-revenue-30d 等条目的第 1 名变成近义项，#398 评论），名称路命不中中文，凑不成组';
+const NO_REVENUE_ALIAS = '营收指标没挂「营收」别名：挂上后别名一路同分按标识排，item-revenue-30d 等条目的第 1 名会变成近义项，由 #400 修 rank() 后挂回；不挂时名称路命不中中文，凑不成组';
 const KNOWN_GAPS = new Map<string, string>([
   ['revenue-ambiguous', NO_REVENUE_ALIAS],
   ['revenue-yoy', NO_REVENUE_ALIAS],
