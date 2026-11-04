@@ -47,9 +47,9 @@ export interface CatalogInput {
   /** 各实体在标准层的行数（最近一次合并成功的各映射之和）与最近一次合并时间 */
   entityStats?: { entity: string; rows: number; at: string }[];
   /** 已发布的指标与标签：每个键最新的已发布版本的 YAML（发布时已校验过） */
-  definitions?: { kind: DslKind; key: string; version: number; yaml: string }[];
+  definitions?: { kind: DslKind; key: string; version: number; yaml: string; spaceId: string }[];
   /** 已发布的模板定义（最新的已发布版本的参数）与最近一次没过期的快照 */
-  templates?: { template: TemplateId; version: number; params: Record<string, unknown>; snapshot: TemplateSnapshot | null }[];
+  templates?: { template: TemplateId; version: number; params: Record<string, unknown>; snapshot: TemplateSnapshot | null; spaceId: string }[];
   /** 业务说明的当前内容（currentNotes）：键是 noteKey，空串是已清空 */
   notes?: ReadonlyMap<string, string>;
   /** 业务知识（loadKnowledge）：按 knowledgeKey 挂到条目或映射血缘上，挂不上的（目标已不在目录里）丢掉 */
@@ -124,6 +124,8 @@ export interface DefinitionDependencies { metrics: string[]; entities: string[];
 
 export interface MetricEntry extends Base {
   kind: 'metric'; key: string; version: number; base: string;
+  /** 定义所属空间，只作记录，不按它过滤（ADR-0048） */
+  spaceId: string;
   /** 度量，如 sum(amount)、ratio(count / count) */
   measure: string;
   dimensions: string[];
@@ -136,6 +138,8 @@ export interface MetricEntry extends Base {
 
 export interface TagEntry extends Base {
   kind: 'tag'; key: string; version: number;
+  /** 定义所属空间，只作记录，不按它过滤（ADR-0048） */
+  spaceId: string;
   /** 规则与 default 给出的取值，按出现顺序去重 */
   values: (string | number)[];
   dependencies: DefinitionDependencies;
@@ -147,6 +151,8 @@ export interface TagEntry extends Base {
 
 export interface TemplateEntry extends Base {
   kind: 'template'; template: string; version: number; params: Record<string, unknown>; entities: string[];
+  /** 定义所属空间，只作记录，不按它过滤（ADR-0048） */
+  spaceId: string;
   columns: OutputColumn[];
   /** 还没有没过期的快照时为 null */
   snapshot: TemplateSnapshot | null;
@@ -374,7 +380,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
     if (d.kind === 'metric') {
       const spec = parse(d.yaml) as MetricSpec;
       entries.push({
-        kind: 'metric', id: metricId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version,
+        kind: 'metric', id: metricId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version, spaceId: d.spaceId,
         base: entityId(spec.base), measure: measureText(spec.measure), dimensions: (spec.dimensions ?? []).map(x => x.name),
         dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)), system: { text: metricText(spec), claims: metricClaims(spec) }, ...knowledgeOf(metricId(d.key)),
       });
@@ -382,7 +388,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
       const spec = parse(d.yaml) as TagSpec;
       const values = [...(Array.isArray(spec.rules) ? spec.rules.map(r => r?.value) : []), spec.default].filter(v => typeof v === 'string' || typeof v === 'number');
       entries.push({
-        kind: 'tag', id: tagId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version,
+        kind: 'tag', id: tagId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version, spaceId: d.spaceId,
         values: [...new Set(values)], dependencies: dependencyIds(DSL_KINDS.tag.dependencies(spec)), system: { text: tagText(spec), claims: tagClaims(spec, metricSpecs) },
         ...knowledgeOf(tagId(d.key)),
       });
@@ -393,7 +399,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
     if (!Object.hasOwn(TEMPLATES, t.template)) continue;
     entries.push({
       kind: 'template', id: templateEntryId(t.template), name: TEMPLATES[t.template].label, description: TEMPLATE_OUTPUTS[t.template].description,
-      template: t.template, version: t.version, params: t.params, entities: TEMPLATES[t.template].entities.map(entityId),
+      template: t.template, version: t.version, spaceId: t.spaceId, params: t.params, entities: TEMPLATES[t.template].entities.map(entityId),
       columns: TEMPLATE_OUTPUTS[t.template].columns, snapshot: t.snapshot,
     });
   }

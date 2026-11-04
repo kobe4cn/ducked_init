@@ -4,7 +4,7 @@
 // 不改 PUBLISHED_METRICS：模型评测的上下文保持不变。纯函数构造，不连库
 import { buildCatalog } from '../../app/.server/catalog';
 import type { DslKind } from '../../app/.server/pipeline/dsl';
-import { CATALOG_INPUT } from './golden';
+import { CATALOG_INPUT, SPACE } from './golden';
 
 /** 额外的已发布定义（键 → 种类与 YAML），都要能对着 CONTEXT 过校验（测试里断言） */
 export const EXTRA_DEFINITIONS: Record<string, { kind: DslKind; yaml: string }> = {
@@ -73,7 +73,7 @@ export const RETRIEVAL_CATALOG = buildCatalog({
   ...CATALOG_INPUT,
   definitions: [
     ...CATALOG_INPUT.definitions!,
-    ...Object.entries(EXTRA_DEFINITIONS).map(([key, d]) => ({ kind: d.kind, key, version: 1, yaml: d.yaml })),
+    ...Object.entries(EXTRA_DEFINITIONS).map(([key, d]) => ({ kind: d.kind, key, version: 1, yaml: d.yaml, spaceId: SPACE })),
   ],
   sources: [
     { id: 's-shop', name: '商城', kind: 'postgres' },
