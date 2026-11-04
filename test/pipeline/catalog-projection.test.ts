@@ -1,11 +1,12 @@
 // test/pipeline/catalog-projection.test.ts —— 目录检索投影（ADR-0047）的接缝：refreshProjection / rebuildProjection → catalog_projection。
 // 一串目录变化后逐版增量刷新与从零重建得到的投影完全相同；两类投影的条目集合与 catalogFor 一致、restricted 不带数据源、源表与映射血缘的文字；
-// catalog_search 先在请求里把投影刷到最新目录版本，结果来自实时目录；差异超过阈值时只入队一个 catalog.projection，任务成功后重建
+// catalog_search 先在请求里把投影刷到最新目录版本，在投影上排序并带命中理由；差异超过阈值时只入队一个 catalog.projection，任务成功后重建；投影不可用时回退到实时目录搜索
 import { and, asc, eq } from 'drizzle-orm';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { catalogFor, runTool } from '../../app/.server/assistant/tools';
 import { tenantCatalog } from '../../app/.server/catalog/load';
-import { projectionVersion, rebuildProjection, refreshFrom, refreshProjection } from '../../app/.server/catalog/projection';
+import { projectionVersion, rankedSearch, rebuildProjection, refreshFrom, refreshProjection } from '../../app/.server/catalog/projection';
+import * as rankModule from '../../app/.server/catalog/rank';
 import { currentCatalogVersion } from '../../app/.server/catalog/versions';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -20,6 +21,7 @@ import { publishedIdentitySources } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
+afterEach(() => { vi.restoreAllMocks(); });
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 实付金额\n';
 const REFUND = 'base: order\nmeasure: { agg: count }\ndescription: 退货笔数统计\n';
@@ -155,7 +157,9 @@ describe('检索投影', () => {
     expect(await projectionVersion(getDb(), acme)).toBe(before);
     expect(await rows(acme)).toEqual(beforeRows);
 
-    expect(await runTool(viewer, 'catalog_search', { query: '退货笔数' })).not.toContain('metric:refund_count');
+    const during = await runTool(viewer, 'catalog_search', { query: '退货笔数' });
+    expect(during).not.toContain('metric:refund_count');
+    expect(during).not.toContain('命中：');
 
     await drain();
     expect((await queued()).map(t => t.status)).toEqual(['succeeded']);
@@ -164,5 +168,51 @@ describe('检索投影', () => {
     expect(rebuilt.some(r => r.entryId === 'metric:refund_count')).toBe(false);
     await rebuildProjection(acme);
     expect(await rows(acme)).toEqual(rebuilt);
+  });
+
+  it('catalog_search 按投影排序：别名命中的指标排在前面，条目下带「命中：」理由', async () => {
+    const { acme, reviewer, analyst, viewer } = await setup();
+    await createDefinition(analyst, 'metric', 'refund_count', REFUND);
+    await publishDefinition(reviewer, 'metric', 'refund_count', 1);
+    await addAlias(analyst, { targetId: 'metric:refund_count', alias: '退单量' });
+    const out = await runTool(viewer, 'catalog_search', { query: '退单量' });
+    // 第一个候选是别名命中的指标，它的条目后面接着命中理由
+    const first = out.slice(0, out.indexOf('命中：'));
+    expect(first).toContain('metric:refund_count');
+    expect(out).toContain('命中：别名「退单量」');
+    expect(await projectionVersion(getDb(), acme)).toBe(await currentCatalogVersion(getDb(), acme));
+  });
+
+  it('投影不可用时回退到实时目录搜索、不带理由：刷新抛错、投影版本不等于目录版本、排序抛错', async () => {
+    const { acme, reviewer, analyst, viewer } = await setup();
+    await createDefinition(analyst, 'metric', 'refund_count', REFUND);
+    await publishDefinition(reviewer, 'metric', 'refund_count', 1);
+    const c = await catalogFor(viewer);
+    const found = (r: Awaited<ReturnType<typeof rankedSearch>>) => r.ranked.map(x => x.entry.id);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const ok = await rankedSearch(acme, 'restricted', c, '退货笔数', {});
+    expect(ok.fallback).toBe(false);
+    expect(found(ok)).toContain('metric:refund_count');
+    expect(ok.ranked.find(x => x.entry.id === 'metric:refund_count')!.reasons.length).toBeGreaterThan(0);
+
+    // 刷新抛错：租户 id 不是 uuid
+    const thrown = await rankedSearch('not-a-uuid', 'restricted', c, '退货笔数', {});
+    expect(thrown).toMatchObject({ fallback: true });
+    expect(found(thrown)).toContain('metric:refund_count');
+    expect(thrown.ranked.every(x => x.reasons.length === 0)).toBe(true);
+
+    // 投影版本不等于调用方目录的版本（投影已是最新、不会入队）
+    const stale = await rankedSearch(acme, 'restricted', { ...c, version: (c.version ?? 0) + 1 }, '退货笔数', {});
+    expect(stale.fallback).toBe(true);
+    expect(found(stale)).toContain('metric:refund_count');
+    expect(await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'catalog.projection')))).toHaveLength(0);
+
+    // 排序抛错：catalog_search 的输出仍有实时目录里的条目、没有「命中：」
+    vi.spyOn(rankModule, 'rank').mockImplementation(() => { throw new Error('boom'); });
+    expect(await rankedSearch(acme, 'restricted', c, '退货笔数', {})).toMatchObject({ fallback: true });
+    const out = await runTool(viewer, 'catalog_search', { query: '退货笔数' });
+    expect(out).toContain('metric:refund_count');
+    expect(out).not.toContain('命中：');
   });
 });

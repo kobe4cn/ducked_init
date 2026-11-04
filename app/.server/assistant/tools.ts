@@ -9,11 +9,12 @@ import { data } from 'react-router';
 import { parse } from 'yaml';
 import { assertCan, can, type Permission } from '../access';
 import type { CurrentMember } from '../auth';
-import { expand, overview, search, toMarkdown, type Catalog } from '../catalog';
+import { expand, overview, toMarkdown, type Catalog } from '../catalog';
 import { tenantCatalog } from '../catalog/load';
-import { refreshProjection, visibilityClass, visibleCatalog } from '../catalog/projection';
+import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
+import type { HitReason, Lane } from '../catalog/rank';
 import { getDb } from '../db/client';
-import { dslDefinitions, mappings } from '../db/schema';
+import { dslDefinitions, mappings, spaces } from '../db/schema';
 import { createDefinition, DslError, saveDslDraft, validateDefinition } from '../dsl-definitions';
 import type { DslIssue } from '../pipeline/dsl/metric-spec';
 import { createMapping, MappingError, saveMappingDraft, validateNewMapping } from '../mappings';
@@ -43,6 +44,12 @@ export const catalogFor = async (member: CurrentMember): Promise<Catalog> =>
   visibleCatalog(await tenantCatalog(member.tenant.id), visibilityClass(member.role));
 
 const TEXT = { type: 'string' };
+
+const LANE_NAMES: Record<Lane, string> = { id: '标识', alias: '别名', name: '名称', keyword: '关键词' };
+
+/** 命中理由一行：「命中：别名「GMV」；关键词「营收」、「30天」」 */
+const hitLine = (reasons: HitReason[]) =>
+  `命中：${reasons.map(r => LANE_NAMES[r.lane] + r.matched.map(m => `「${m}」`).join('、')).join('；')}`;
 
 const issueLines = (issues: DslIssue[]) =>
   issues.map(i => `- ${i.path || '（文档）'}（第 ${i.line} 行第 ${i.col} 列）：${i.message}`).join('\n');
@@ -94,7 +101,7 @@ export const TOOLS: AssistantTool[] = [
   },
   {
     name: 'catalog_search',
-    description: '按关键词搜索目录条目，返回展开后的条目',
+    description: '按关键词、别名与名称搜索目录条目，返回展开后的条目与命中理由',
     inputSchema: {
       type: 'object', required: ['query'],
       properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 } },
@@ -104,9 +111,14 @@ export const TOOLS: AssistantTool[] = [
     permission: 'definitions:read',
     external: true,
     run: async (actor, { query, limit }) => {
-      // 先在请求里把检索投影刷到最新目录版本（ADR-0047）；刷新失败不影响搜索，结果照旧来自实时目录
-      await refreshProjection(actor.tenant.id).catch(e => console.warn('检索投影刷新失败', actor.tenant.id, e));
-      return toMarkdown(search(await catalogFor(actor), query as string, limit as number | undefined));
+      // 在检索投影上排序（ADR-0047），作用域是查询里点名的本租户空间与成员所属空间；投影不可用时回退到实时目录搜索、不带命中理由
+      const q = query as string;
+      const spaceIds = (await getDb().select({ id: spaces.id, name: spaces.name }).from(spaces).where(eq(spaces.tenantId, actor.tenant.id)))
+        .filter(s => q.includes(s.name)).map(s => s.id);
+      const { ranked } = await rankedSearch(actor.tenant.id, visibilityClass(actor.role), await catalogFor(actor), q,
+        { spaceIds, memberSpaceId: actor.space.id }, limit as number | undefined);
+      if (!ranked.length) return toMarkdown([]);
+      return ranked.map(r => r.reasons.length ? `${toMarkdown(r.entry)}\n${hitLine(r.reasons)}` : toMarkdown(r.entry)).join('\n\n');
     },
   },
   {
