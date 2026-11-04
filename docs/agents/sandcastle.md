@@ -10,7 +10,7 @@
 |---|---|---|---|
 | 选中 | `Sandcastle` + `ready-for-agent` | 人 | 下一轮 prep |
 | 已准备 | + `sandcastle:prepped` | prep agent（指引新鲜、≤3 条验收标准、blocker 都已关闭） | plan 选中后实现 |
-| 已拆分 | 父票去掉 `Sandcastle`；子票带 `Sandcastle` + `ready-for-agent` | prep agent | 子票下一轮各自 prep |
+| 已拆分 | 父票去掉 `Sandcastle`；子票带 `Sandcastle` + `ready-for-agent` | prep agent | 子票下一轮各自 prep；子票全关后，脚本在下一轮开头勾上 `## Split into` 清单并关掉父票 |
 | 已合并 | issue 关闭（PR 正文 `Closes #n`） | 脚本 | 依赖它的票下一轮开工 |
 | 等人审 | + `sandcastle:pr-open` | 脚本（没能自动合并时） | 人审 PR：没问题就合并（issue 自动关闭）；要改就在 PR 上发 `/sandcastle` 开头的评论或 review |
 | 打回 | 去掉 `sandcastle:pr-open` | 脚本（每轮开头看到打回信号时） | 本轮重新 plan，implementer 在原分支上先处理 PR 意见 |

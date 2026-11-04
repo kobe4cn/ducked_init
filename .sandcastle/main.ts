@@ -295,6 +295,37 @@ function isOpen(n: number): boolean {
 /** `## Blocked by` 里还没关的票。 */
 const openBlockers = (body: string) => blockersOf(body).filter(isOpen);
 
+/**
+ * 拆过的父票：prep 拆票时去掉父票的 Sandcastle，正文加 `## Split into`，之后没人管它，
+ * 被它 block 的票就一直排不上（2026-11-04 #381 的子票 #389、#390 都合并了，#382 仍在等 #381）。
+ * 每轮开头查不带 Sandcastle、有 `## Split into` 的 open 票，子票全关了就勾上清单、关掉父票。
+ * 「上下文不够」那种父票保留 Sandcastle、由自己的 PR 关，不在这里处理。gh 出错只打警告。
+ */
+function closeFinishedParents() {
+  const parents = trySh("gh", [
+    "issue", "list", "--state", "open", "--limit", "100",
+    "--search", `"Split into" in:body ${notIn(LABEL.picked)}`, "--json", "number,body",
+  ]);
+  if (!parents.ok) {
+    console.warn(`  ⚠ 查拆过的父票失败：${parents.out.slice(0, 200)}`);
+    return;
+  }
+  for (const parent of JSON.parse(parents.out) as { number: number; body: string }[]) {
+    const children = [...section(parent.body, "Split into").matchAll(/#(\d+)/g)].map((m) => Number(m[1]));
+    if (children.length === 0 || children.some(isOpen)) continue;
+    const body = parent.body.replace(/^(\s*[-*]\s*)\[ \](?=\s*#\d+)/gm, "$1[x]");
+    const list = children.map((n) => `#${n}`).join("、");
+    if (body !== parent.body) trySh("gh", ["issue", "edit", String(parent.number), "--body", body]);
+    const closed = trySh("gh", ["issue", "close", String(parent.number), "--comment", `子票 ${list} 都已关闭，Sandcastle 关闭父票。`]);
+    if (closed.ok) {
+      openStates.set(parent.number, false);
+      console.log(`  ✓ 父票 #${parent.number} 的子票 ${list} 都已关闭，已关闭父票`);
+    } else {
+      console.warn(`  ⚠ 关闭父票 #${parent.number} 失败：${closed.out.slice(0, 200)}`);
+    }
+  }
+}
+
 /** 指引里 `- **Change**: \`path…\`` 行的文件路径（去掉 `:行号`）。 */
 const changedFiles = (body: string) =>
   [...section(body, "Implementation guide").matchAll(/^\s*[-*]\s*\*\*Change\*\*\s*[:：]\s*`([^`]+)`/gm)]
@@ -964,6 +995,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   openStates.clear();
   syncHostBase();
   reopenRequestedRevisions();
+  closeFinishedParents();
   pruneSeaweedMetalog();
 
   // Phase 0: Prep —— 串行，因为拆票会改别的票的 Blocked by。
