@@ -5,7 +5,7 @@
 //                    `sandcastle:prepped` 的选中票逐张（串行）跑 prep-ticket（`## Blocked by` 里
 //                    还有 open 票的脚本直接跳过，不开会话）：
 //                    够小且指引新鲜 → 打 prepped；太大 → 拆成子票（子票继承
-//                    `Sandcastle`，父票去掉）；要人拍板 → 打 sandcastle:stuck。
+//                    `Sandcastle`，父票去掉）；要人拍板 → 打 sandcastle:stuck（能代拍板的按 .sandcastle/DECISIONS.md 自己定）。
 //   Phase 1 (Plan):  脚本自己算（不用 agent）：只看 `Sandcastle` + `sandcastle:prepped`、且没有
 //                    pr-open / stuck 的票，排除仍有未关闭 blocker 的票；剩下的按编号从小到大，
 //                    和已选的票或等人审（pr-open）的票改同一个文件（指引的 Change 行）就跳过。
@@ -46,6 +46,11 @@ const MAX_PARALLEL = 3; // 同时实现的票数：受 PG max_connections（3 ×
 const IMPLEMENT_MAX_ITERATIONS = 3; // 一张票最多开几次全新会话；超过说明票太大，交给人
 /** 第一次没做完时脚本留在 issue 上的标记；prep 看到它就按「实现没做完」重新准备，再没做完才打 stuck。 */
 const REPREP_MARK = "<!-- sandcastle:reprep -->";
+/** implementer 的两个完成信号：做完了；遇到必须由人拍板的设计决定（.sandcastle/DECISIONS.md），票直接交给人，不再开新会话。 */
+const COMPLETE = "<promise>COMPLETE</promise>";
+const NEEDS_DECISION = "<promise>NEEDS_DECISION</promise>";
+/** agent 代拍板时 issue 评论的第一行（.sandcastle/DECISIONS.md）；落地时脚本据此打 sandcastle:decided 并把评论贴到 PR 上。 */
+const DECIDED_MARK = "<!-- sandcastle:decided -->";
 const REVISE_MAX = 2; // reviewer 给 revise 时最多打回几次；之后仍不行就留 PR 给人
 const CONTEXT_BUDGET = 150_000; // 单个会话的上下文预算（CLAUDE.md「Context budget」）
 const REMOTE = "origin";
@@ -62,6 +67,7 @@ const LABEL = {
   prepped: "sandcastle:prepped", // prep 已确认可实现
   prOpen: "sandcastle:pr-open", // 已开 PR，等人审
   stuck: "sandcastle:stuck", // 需要人介入（见 issue 评论）
+  decided: "sandcastle:decided", // agent 代拍板过设计决定，等人事后确认（人看过后去掉）
   flaky: "flaky", // 门槛里重跑才通过的测试文件，脚本自动开票
 } as const;
 
@@ -496,6 +502,18 @@ function leaveForHuman(issue: Issue, pr: string, reason: string) {
   sh("gh", ["pr", "comment", pr, "--body", `没有自动合并：${reason}`]);
 }
 
+/** agent 代拍板过的票：打 sandcastle:decided，把那些评论贴到 PR 上，人事后确认。gh 出错只警告，不影响落地。 */
+function reportDecisions(issueId: string, pr: string) {
+  const r = trySh("gh", ["issue", "view", issueId, "--json", "comments", "--jq", ".comments[].body | select(startswith(\"" + DECIDED_MARK + "\")) | @json"]);
+  if (!r.ok) return console.warn(`  ⚠ 读 #${issueId} 的代拍板评论失败：${r.out.slice(0, 200)}`);
+  const decisions = r.out.split("\n").filter(Boolean).map((line) => (JSON.parse(line) as string).slice(DECIDED_MARK.length).trim());
+  if (!decisions.length) return;
+  const label = trySh("gh", ["issue", "edit", issueId, "--add-label", LABEL.decided]);
+  const comment = trySh("gh", ["pr", "comment", pr, "--body", `## 代拍板\n\nagent 按 \`.sandcastle/DECISIONS.md\` 自己定了 ${decisions.length} 个设计决定，请事后确认（不同意就在 issue 上回复，确认后去掉 #${issueId} 的 \`${LABEL.decided}\`）：\n\n${decisions.map((d, n) => `<details><summary>第 ${n + 1} 个</summary>\n\n${d}\n\n</details>`).join("\n\n")}`]);
+  for (const x of [label, comment]) if (!x.ok) console.warn(`  ⚠ #${issueId} 代拍板标记失败：${x.out.slice(0, 200)}`);
+  console.log(`  📝 #${issueId} 有 ${decisions.length} 个代拍板，打 ${LABEL.decided}`);
+}
+
 function markStuck(issueId: string, reason: string) {
   sh("gh", ["issue", "edit", issueId, "--add-label", LABEL.stuck]);
   sh("gh", ["issue", "comment", issueId, "--body", `Sandcastle 停下了：${reason}`]);
@@ -590,13 +608,14 @@ async function build(issue: Issue) {
     const implement = await sandbox.run({
       name: `implement-${issue.id}`,
       maxIterations: IMPLEMENT_MAX_ITERATIONS,
+      completionSignal: [COMPLETE, NEEDS_DECISION],
       agent: agent(env),
       promptFile: "./.sandcastle/implement-prompt.md",
       promptArgs: { TASK_ID: issue.id, ISSUE_TITLE: issue.title, BRANCH: issue.branch },
     });
     // 看分支上的提交，不看这次会话的：重新准备后父票只剩已完成的部分，收尾时可能不再提交。
     const ahead = Number((await sandbox.exec(`git rev-list --count ${BASE_REF}..HEAD`)).stdout.trim()) || 0;
-    if (!implement.completionSignal || ahead === 0) {
+    if (implement.completionSignal !== COMPLETE || ahead === 0) {
       return { done: false as const, implement };
     }
 
@@ -876,6 +895,14 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     : peakContext(result.implement);
   const budgetNote = `上下文峰值约 ${Math.round(peak / 1000)}k / ${CONTEXT_BUDGET / 1000}k，implement 用了 ${result.implement.iterations.length} 次会话。`;
   if (!result.done) {
+    // implementer 判断必须由人拍板：推上已有的提交，直接交给人，不退回 prep。
+    if (result.implement.completionSignal === NEEDS_DECISION) {
+      const pushed = (await pushBranch(issue)).ok;
+      trySh("gh", ["issue", "edit", issue.id, "--add-label", "ready-for-human"]);
+      markStuck(issue.id, `implementer 遇到必须由人拍板的设计决定（见上面 implementer 的评论）。${budgetNote}${pushed ? `已有的提交推到了分支 \`${issue.branch}\`。` : "提交没能推上去，留在宿主机的本地分支上。"}拍板后在票上回复，去掉 ${LABEL.stuck} 即可接着跑。`);
+      console.log(`  ✋ #${issue.id} 要人拍板，打 ${LABEL.stuck}`);
+      return;
+    }
     const comments = sh("gh", ["issue", "view", issue.id, "--json", "comments", "--jq", "[.comments[].body] | join(\"\\n\")"]);
     if (comments.includes(REPREP_MARK)) {
       markStuck(
@@ -924,6 +951,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     `## Review\n\n${result.summary}${revisionNote}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}`,
     result.browser?.shots ?? [],
   );
+  reportDecisions(issue.id, pr);
   if (flaky && result.gate.ok) {
     const tickets = reportFlaky(issue, pr, result.gate.output);
     if (tickets.length) sh("gh", ["pr", "comment", pr, "--body", `门槛里的偶发失败已开票：${tickets.join("、")}`]);

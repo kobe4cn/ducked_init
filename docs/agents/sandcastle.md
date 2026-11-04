@@ -4,7 +4,7 @@
 
 ## 标签状态机
 
-人只需要做两件事：给要做的票打 `Sandcastle`，以及处理带 `sandcastle:pr-open` / `sandcastle:stuck` 的票。其余标签由脚本和 agent 维护。
+人只需要做两件事：给要做的票打 `Sandcastle`，以及处理带 `sandcastle:pr-open` / `sandcastle:stuck` 的票。带 `sandcastle:decided` 的票不阻塞运行，有空时事后确认即可。其余标签由脚本和 agent 维护。
 
 | 状态 | 标签 | 谁设置 | 下一步 |
 |---|---|---|---|
@@ -15,7 +15,17 @@
 | 等人审 | + `sandcastle:pr-open` | 脚本（没能自动合并时） | 人审 PR：没问题就合并（issue 自动关闭）；要改就在 PR 上发 `/sandcastle` 开头的评论或 review |
 | 打回 | 去掉 `sandcastle:pr-open` | 脚本（每轮开头看到打回信号时） | 本轮重新 plan，implementer 在原分支上先处理 PR 意见 |
 | 退回重新准备 | 去掉 `sandcastle:prepped`，issue 上留 `<!-- sandcastle:reprep -->` 评论 | 脚本（implementer 第一次用完会话没做完时） | 下一轮 prep 按进度：指引不对就重写；票太大就把没完成的验收标准拆成子票（被本票 block），本票只留已完成的部分，在原分支上收尾合并 |
-| 需要人 | + `sandcastle:stuck`（评论里写原因） | 脚本（重新准备后仍没做完、沙箱出错）或 agent | 人处理后去掉 `sandcastle:stuck` |
+| 需要人 | + `sandcastle:stuck`（评论里写原因） | 脚本（重新准备后仍没做完、沙箱出错、implementer 输出 `NEEDS_DECISION`）或 agent | 人处理后去掉 `sandcastle:stuck` |
+| 代拍板 | + `sandcastle:decided`（票仍照常合并或留 PR） | 脚本（落地时 issue 上有 `<!-- sandcastle:decided -->` 开头的评论） | 人看 PR 上的「代拍板」评论：同意就去掉标签；不同意在 issue 上回复，另开票改 |
+
+## 设计决定：代拍板还是停下
+
+prep、implementer、reviewer 遇到票和指引都没写到的设计决定时，按 `.sandcastle/DECISIONS.md` 分两类处理：
+
+- **必须停下**：要改 ADR 的方向、改公共接口语义或数据库 schema、涉及权限和敏感字段、删改用户数据、选项都难以撤回或给不出推荐。prep 打 `sandcastle:stuck` + `ready-for-human`；implementer 提交已完成的部分、评论选项后输出 `<promise>NEEDS_DECISION</promise>`，脚本推上分支、直接打 stuck，不再开新会话，也不退回 prep。
+- **可以代拍板**：收窄范围（没做到的部分记进 `KNOWN_GAPS`、另开后续票）或可以撤回的局部取舍。agent 按推荐做，在 issue 上留 `<!-- sandcastle:decided -->` 开头的评论，写清选项和理由，照常做完。落地时脚本给票打 `sandcastle:decided`，把这些评论贴到 PR 上。reviewer 会核对代拍板属于这一类，不属于的写进「需要人判断」，留 PR。
+
+找所有待确认的代拍板：`gh issue list --state all --label sandcastle:decided`。
 
 ## reviewer 打回（revise）
 

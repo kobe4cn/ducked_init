@@ -13,7 +13,10 @@
 - 票的 `## Implementation guide` 就是你的探索结果。从它的 `file:line` 出发，`grep -n` 确认行号再改。不要做广泛探索。
 - 只整读要改的、300 行以内的文件；长文件用 `grep -n` + `sed -n` 读要改的函数。
 - 写测试前读 `test/README.md`，相似测试从 `test/CATALOG.md` 用 `grep -n` 找。
-- 指引和代码对不上（文件挪了、函数没了）或要做指引没提到的设计决定时，**停下**：在 issue 上评论说明，不输出 COMPLETE。
+- 指引和代码对不上（文件挪了、函数没了）时，**停下**：在 issue 上评论说明，不输出 COMPLETE。
+- 要做指引没提到的设计决定时，按 `.sandcastle/DECISIONS.md` 判断：
+  - 可以代拍板：按它做完，照常输出 COMPLETE。
+  - 必须停下：提交已经能通过测试的部分，在 issue 上评论要决定什么、有哪几个选项、你的建议，然后输出 `<promise>NEEDS_DECISION</promise>` 结束。脚本会直接把票交给人，不再开新会话。
 
 # EXECUTION
 
@@ -52,4 +55,5 @@
 # 结束
 
 - 完成：输出 <promise>COMPLETE</promise>。
+- 必须由人拍板：见上面 CONTEXT BUDGET 一节，输出 `<promise>NEEDS_DECISION</promise>`。
 - 没完成（上下文快满、卡住、指引过时）：提交已经能通过测试的部分，在 issue 上评论「已完成什么 / 还差什么 / 下一步从哪开始」，不输出 COMPLETE。下一次会话会从你的评论接着做。
