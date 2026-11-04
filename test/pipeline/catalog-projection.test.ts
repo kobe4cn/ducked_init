@@ -181,6 +181,10 @@ describe('检索投影', () => {
     expect(first).toContain('metric:refund_count');
     expect(out).toContain('命中：别名「退单量」');
     expect(await projectionVersion(getDb(), acme)).toBe(await currentCatalogVersion(getDb(), acme));
+    // ASCII 别名：小写查询也命中，理由里显示别名原文
+    await addAlias(analyst, { targetId: 'metric:refund_count', alias: 'RefundCnt' });
+    const ascii = await runTool(viewer, 'catalog_search', { query: 'refundcnt' });
+    expect(ascii).toContain('命中：别名「RefundCnt」');
   });
 
   it('投影不可用时回退到实时目录搜索、不带理由：刷新抛错、投影版本不等于目录版本、排序抛错', async () => {
