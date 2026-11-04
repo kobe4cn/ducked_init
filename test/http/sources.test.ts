@@ -1,8 +1,8 @@
 // 数据源的 HTTP 接缝：数据工程师在界面上登记、修改与轮换凭据、测试连接、选定同步范围、查看列统计并确认水位线；凭据在任何页面与接口里都不回显
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { sources, tasks } from '../../app/.server/db/schema';
+import { auditLogs, sources, tasks } from '../../app/.server/db/schema';
 import { lakeRow } from '../../app/.server/lake';
 import { listLakeFiles } from '../../app/.server/lake-storage';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -116,7 +116,8 @@ describe('登记数据源', () => {
 
   it('有 sources:write 的成员上传 UTF-8 CSV 登记为文件上传数据源：文件存在数据湖 _uploads/<dir>/ 下，数据源页列出这张表', async () => {
     const { tenantId, browser } = await engineerOf('acme');
-    const res = await upload(browser, { name: '活动报名', table: 'signups' }, new File(['id,name\n1,张三\n2,李四\n'], 'signups.csv'));
+    const content = 'id,name\n1,张三\n2,李四\n';
+    const res = await upload(browser, { name: '活动报名', table: 'signups' }, new File([content], 'signups.csv'));
     expect(res.status).toBe(302);
     const id = sourceIdOf(res);
 
@@ -127,6 +128,18 @@ describe('登记数据源', () => {
     expect(detail).toContain('文件上传');
     expect(detail).toContain('signups');
     expect(await (await browser.get('/sources')).text()).toContain('活动报名');
+
+    // 上传记审计，只记元数据，不含文件内容（ADR-0037）
+    const audits = await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'source.file_uploaded'));
+    expect(audits).toHaveLength(1);
+    expect(audits[0].targetId).toBe(id);
+    expect(audits[0].detail).toEqual({ table: 'signups', file: 'signups.csv', bytes: new TextEncoder().encode(content).length, encoding: 'utf-8' });
+    expect(JSON.stringify(audits[0].detail)).not.toContain('张三');
+    await memberOf(tenantId, 'admin@acme.com', 'admin');
+    const audit = await (await (await loginAs(app, 'admin@acme.com')).get('/audit')).text();
+    expect(audit).toContain('上传文件');
+    expect(audit).toContain('signups：signups.csv（');
+    expect(audit).not.toContain('张三');
   });
 
   it('上传登记失败（表名不合法、文件为空、不是 .csv、不是 UTF-8、名称为空）时 400，不留下数据源与文件；没有 sources:write 的角色 403', async () => {
@@ -144,6 +157,7 @@ describe('登记数据源', () => {
       expect(res.status).toBe(400);
       expect(await res.text()).toContain(message);
     }
+    expect(await getDb().select().from(auditLogs).where(and(eq(auditLogs.tenantId, tenantId), eq(auditLogs.action, 'source.file_uploaded')))).toEqual([]);
     await memberOf(tenantId, 'an@acme.com', 'analyst');
     expect((await upload(await loginAs(app, 'an@acme.com'), { name: '活动报名', table: 'signups' }, csv())).status).toBe(403);
 

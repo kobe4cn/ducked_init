@@ -117,8 +117,14 @@ const parseName = (raw: string | undefined) => {
   return name;
 };
 
-/** 登记数据源：校验连接与只读后加密保存凭据，记下列出的表。所有表都不在同步范围内，等成员选表后才采集与同步 */
-export async function registerSource(actor: CurrentMember, input: SourceInput) {
+/** 上传文件的元数据，随登记一起记审计 source.file_uploaded（不含文件内容） */
+type UploadMeta = { table: string; file: string; bytes: number; encoding: 'utf-8' };
+
+/**
+ * 登记数据源：校验连接与只读后加密保存凭据，记下列出的表。所有表都不在同步范围内，等成员选表后才采集与同步。
+ * 文件上传数据源传 upload：与 source.registered 在同一事务里记 source.file_uploaded
+ */
+export async function registerSource(actor: CurrentMember, input: SourceInput, upload?: UploadMeta) {
   assertCan(actor, 'sources:write');
   const kind = input.kind ?? '';
   if (!isSourceKind(kind)) throw new SourceError('请选择数据源类型');
@@ -139,6 +145,9 @@ export async function registerSource(actor: CurrentMember, input: SourceInput) {
       targetId: id,
       detail: { name, kind, tables: tables.length },
     });
+    if (upload) {
+      await recordAudit(tx, { tenantId: actor.tenant.id, actor, action: 'source.file_uploaded', targetType: 'source', targetId: id, detail: upload });
+    }
   }));
   return { id, tables, unreadable };
 }
