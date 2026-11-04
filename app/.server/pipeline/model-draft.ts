@@ -8,7 +8,9 @@
 import { Document, isCollection, isScalar, parseDocument, Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { FUNCTIONS } from '../../lib/mapping-expr';
 import { CAPABILITIES } from '../catalog/capabilities';
-import { estimateTokens, expand, overview, search, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
+import { estimateTokens, expand, overview, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
+import { deriveProjection } from '../catalog/projection';
+import { rank } from '../catalog/rank';
 import type { LlmMessage } from '../llm';
 import type { AssertionLevel } from './assertions';
 import { CUSTOM_CHECKS, type CustomAssertion } from './custom-assertions';
@@ -108,13 +110,13 @@ const SEARCH_LIMIT = 10;
 /** 搜出的条目估算最多多少 token，超过时减少条数 */
 const SEARCH_TOKENS = 4000;
 
-/** 目录各段：总览、目标实体与它的各字段条目、按「实体名 + 表名 + 列名」搜出的其余条目（不含能力说明，估算超过 SEARCH_TOKENS 时减少条数） */
+/** 目录各段：总览、目标实体与它的各字段条目、按「实体名 + 表名 + 列名」排序（rank，内存里派生的 full 投影）出的其余条目（不含能力说明，估算超过 SEARCH_TOKENS 时减少条数） */
 function catalogMarkdown(catalog: Catalog, context: TableContext, entity: string): string {
   const target = [expand(catalog, `entity:${entity}`), ...catalog.entries.filter(e => e.kind === 'field' && e.entity === `entity:${entity}`)]
     .filter((e): e is CatalogEntry => e !== null);
   const shown = new Set(target.map(e => e.id));
   const query = [entity, context.table, ...context.columns.map(c => c.name)].join(' ');
-  const related = search(catalog, query, SEARCH_LIMIT + shown.size + CAPABILITIES.length)
+  const related = rank(deriveProjection(catalog, 'full'), catalog, query, {}, SEARCH_LIMIT + shown.size + CAPABILITIES.length).map(r => r.entry)
     .filter(e => e.kind !== 'capability' && !shown.has(e.id)).slice(0, SEARCH_LIMIT);
   let n = related.length;
   while (n > 0 && estimateTokens(toMarkdown(related.slice(0, n))) > SEARCH_TOKENS) n--;

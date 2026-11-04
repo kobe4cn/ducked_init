@@ -1,17 +1,19 @@
 // app/.server/catalog/projection.ts —— 目录的检索投影（ADR-0047，部分修订 ADR-0041）：每个条目在每个可见性类别下参与检索的文字、别名、主题与所属空间。
 // 投影是派生数据：deriveProjection 是纯函数，从已裁剪的目录生成行，能从零重建（rebuildProjection），也能按 catalogChangesSince 的净差异增量刷新（refreshProjection）。
 // 可见性类别只由服务端按角色算（visibilityClass），任何对外接口都不收这个参数；restricted 里没有数据源、源表与映射血缘（ADR-0005）。
-// 净差异不超过 PROJECTION_SYNC_LIMIT 时在请求里同步刷新，超过时入队 catalog.projection，由调度器结束钩子从零重建；所有行带同一个目录版本号，增量刷新与从零重建得到的投影完全相同
+// 净差异不超过 PROJECTION_SYNC_LIMIT 时在请求里同步刷新，超过时入队 catalog.projection，由调度器结束钩子从零重建；所有行带同一个目录版本号，增量刷新与从零重建得到的投影完全相同。
+// rankedSearch 在投影上排序（rank）；投影不可用时回退到旧 search()，P2 不设租户开关，靠这个回退兜底
 import { createHash } from 'node:crypto';
-import { and, eq, inArray, max, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, max, sql } from 'drizzle-orm';
 import { cmp } from '../../lib/compare';
 import { can } from '../access';
 import type { Tx } from '../audit';
 import { getDb } from '../db/client';
 import { catalogProjection, tasks, type Role } from '../db/schema';
 import { insertTask } from '../tasks';
-import { haystack, type Catalog, type CatalogEntry } from './index';
+import { haystack, search, type Catalog, type CatalogEntry } from './index';
 import { tenantCatalog } from './load';
+import { rank, type Ranked, type RankScope } from './rank';
 import { catalogChangesSince, stripStats } from './versions';
 
 /** 请求里同步刷新的净差异条目数上限，超过时交给调度器任务 */
@@ -134,4 +136,29 @@ export async function refreshProjection(tenantId: string, { syncLimit = PROJECTI
     if (now !== null && now >= (c.version ?? 0)) return 'refreshed';
     return refreshFrom(tx, tenantId, now, c, { syncLimit });
   });
+}
+
+/** 读某一类别的投影：行（不含租户、类别与版本号，按 entryId 排序）与行的最大目录版本号（没有行时为 null） */
+export async function readProjection(db: Tx | ReturnType<typeof getDb>, tenantId: string, cls: ProjectionClass): Promise<{ version: number | null; rows: ProjectionRow[] }> {
+  const p = catalogProjection;
+  const found = await db.select({ entryId: p.entryId, text: p.text, textHash: p.textHash, aliases: p.aliases, subjects: p.subjects, spaceId: p.spaceId, catalogVersion: p.catalogVersion })
+    .from(p).where(and(eq(p.tenantId, tenantId), eq(p.visibilityClass, cls))).orderBy(asc(p.entryId));
+  const version = found.length ? Math.max(...found.map(r => r.catalogVersion)) : null;
+  return { version, rows: found.map(({ catalogVersion: _, ...row }) => row) };
+}
+
+/**
+ * 在持久投影上排序（rank）：先把投影刷到最新，再读 cls 类的行，按调用方的可见目录 c 排序。
+ * 投影不可用时回退到旧 search()、理由为空、fallback 为 true：刷新抛错、刷新交给了调度器（queued）、投影版本不等于 c 的版本、读投影或排序抛错（ADR-0047）
+ */
+export async function rankedSearch(tenantId: string, cls: ProjectionClass, c: Catalog, query: string, scope: RankScope, limit = 20): Promise<{ ranked: Ranked[]; fallback: boolean }> {
+  try {
+    if (await refreshProjection(tenantId) !== 'queued') {
+      const { version, rows } = await readProjection(getDb(), tenantId, cls);
+      if (version === (c.version ?? 0)) return { ranked: rank(rows, c, query, scope, limit), fallback: false };
+    }
+  } catch (e) {
+    console.warn('检索投影不可用，回退到实时目录搜索', tenantId, e);
+  }
+  return { ranked: search(c, query, limit).map(entry => ({ entry, score: 0, reasons: [] })), fallback: true };
 }

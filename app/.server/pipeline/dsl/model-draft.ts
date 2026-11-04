@@ -5,7 +5,9 @@
 // 模型输出转成 YAML（首行注释提示核对）后仍要过该种类的校验（DSL_KINDS[kind].check），保存与双人发布照旧
 import { Document } from 'yaml';
 import { CAPABILITIES } from '../../catalog/capabilities';
-import { estimateTokens, overview, search, toMarkdown, type Catalog } from '../../catalog';
+import { estimateTokens, overview, toMarkdown, type Catalog } from '../../catalog';
+import { deriveProjection } from '../../catalog/projection';
+import { rank } from '../../catalog/rank';
 import type { LlmMessage, LlmPurpose } from '../../llm';
 import { CONSUMER_ENTITY, METRIC_SCHEMA, type MetricSpec, type RatioPart } from './metric-spec';
 import type { DslKind } from './index';
@@ -56,9 +58,9 @@ const DRAFTS = {
 export const definitionDraftSchema = (kind: DslKind) => DRAFTS[kind].schema;
 export const definitionDraftPurpose = (kind: DslKind) => DRAFTS[kind].purpose;
 
-/** 用需求原文搜出的条目（能力说明已在 system 里，不再给）的 Markdown，估算超过 SEARCH_TOKENS 时减少条数 */
+/** 用需求原文排序（rank，内存里派生的 full 投影）出的条目（能力说明已在 system 里，不再给）的 Markdown，估算超过 SEARCH_TOKENS 时减少条数 */
 function relevantMarkdown(catalog: Catalog, request: string): string {
-  const hits = search(catalog, request, SEARCH_LIMIT + CAPABILITIES.length).filter(e => e.kind !== 'capability').slice(0, SEARCH_LIMIT);
+  const hits = rank(deriveProjection(catalog, 'full'), catalog, request, {}, SEARCH_LIMIT + CAPABILITIES.length).map(r => r.entry).filter(e => e.kind !== 'capability').slice(0, SEARCH_LIMIT);
   for (let n = hits.length; n > 0; n--) {
     const md = toMarkdown(hits.slice(0, n));
     if (estimateTokens(md) <= SEARCH_TOKENS) return md;
