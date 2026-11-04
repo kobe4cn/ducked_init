@@ -125,10 +125,11 @@ export function expand(direct: Ranked[], present: { row: ProjectionRow; entry: C
 function pathBetween(from: string, to: string, relations: RelationEntry[]): RelationEntry[] | null {
   let frontier: { entity: string; path: RelationEntry[] }[] = [{ entity: from, path: [] }];
   const seen = new Set([from]);
+  const sorted = [...relations].sort((a, b) => cmp(a.id, b.id));
   for (let hop = 0; hop < MAX_HOPS; hop++) {
     const next: typeof frontier = [];
     for (const { entity, path } of frontier) {
-      for (const rel of [...relations].sort((a, b) => cmp(a.id, b.id))) {
+      for (const rel of sorted) {
         const [x, y] = [entityOf(rel.from), entityOf(rel.to)];
         const other = x === entity ? y : y === entity ? x : null;
         if (other === null || seen.has(other)) continue;
