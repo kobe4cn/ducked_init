@@ -141,7 +141,7 @@ export async function createDefinition(actor: CurrentMember, kind: string, key: 
   await assertValid(kind, actor.tenant.id, yaml);
   try {
     return await getDb().transaction(async tx => {
-      const [definition] = await tx.insert(dslDefinitions).values({ tenantId: actor.tenant.id, kind, key }).returning({ id: dslDefinitions.id });
+      const [definition] = await tx.insert(dslDefinitions).values({ tenantId: actor.tenant.id, spaceId: actor.space.id, kind, key }).returning({ id: dslDefinitions.id });
       await tx.insert(dslVersions).values({ definitionId: definition!.id, version: 1, yaml, authors: [actor.email], lastEditor: actor.email });
       await recordAudit(tx, {
         tenantId: actor.tenant.id, actor, action: 'definition.drafted', targetType: 'definition', targetId: definition!.id, detail: { kind, key, version: 1 },

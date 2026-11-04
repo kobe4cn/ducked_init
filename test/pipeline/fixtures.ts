@@ -52,6 +52,18 @@ export async function memberOf(tenantId: string, email: string, role: Role = 'da
   return row;
 }
 
+/** 在租户里新建一个非默认空间（默认空间每个租户只有一个），返回以该空间为当前空间的成员；空间不是安全边界（ADR-0048） */
+export async function memberInNewSpace(tenantId: string, email: string, role: Role = 'data_engineer', name = '事业部B'): Promise<CurrentMember> {
+  const [space] = await getDb().insert(spaces).values({ tenantId, name, isDefault: false }).returning({ id: spaces.id, name: spaces.name });
+  return { ...await memberOf(tenantId, email, role), space: space! };
+}
+
+/** 租户默认空间的 ID */
+export async function defaultSpaceOf(tenantId: string) {
+  const [space] = await getDb().select({ id: spaces.id }).from(spaces).where(and(eq(spaces.tenantId, tenantId), eq(spaces.isDefault, true)));
+  return space!.id;
+}
+
 /** 把数据源列出的、账号可读的表全部选入同步范围（选入后入队采集，调用方再让调度器跑空） */
 export async function selectAllTables(member: CurrentMember, sourceId: string) {
   const { listing } = await getSource(member, sourceId);

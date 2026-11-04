@@ -12,7 +12,7 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, type Db } from './db/client';
 import { DslError, onReadOnlyLake, type DiffCounts, type TagTransition } from './dsl-definitions';
-import { mappings, mappingVersions, tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
+import { mappings, mappingVersions, spaces, tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
 import { pendingMerge } from './mappings';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
@@ -111,7 +111,7 @@ export async function saveDraft(actor: CurrentMember, id: string, params: Record
   assertCan(actor, 'definitions:draft');
   const template = requireTemplate(id);
   return getDb().transaction(async tx => {
-    await tx.insert(templateDefinitions).values({ tenantId: actor.tenant.id, template }).onConflictDoNothing();
+    await tx.insert(templateDefinitions).values({ tenantId: actor.tenant.id, spaceId: actor.space.id, template }).onConflictDoNothing();
     // 锁住定义行：与发布、丢弃互斥
     const [locked] = await tx.select({ id: templateDefinitions.id }).from(templateDefinitions)
       .where(ofDefinition(actor.tenant.id, template)).for('update');
@@ -374,10 +374,12 @@ export async function enableDefaultTemplates(tenantId: string): Promise<Template
     const mapped = new Set((await tx.selectDistinct({ entity: mappings.entity }).from(mappings)
       .innerJoin(mappingVersions, and(eq(mappingVersions.mappingId, mappings.id), eq(mappingVersions.status, 'published')))
       .where(and(eq(mappings.tenantId, tenantId), isNull(mappings.disabledAt)))).map(m => m.entity));
+    // 自动启用的模板没有操作成员，记在本租户的默认空间（ADR-0048）
+    const [defaultSpace] = await tx.select({ id: spaces.id }).from(spaces).where(and(eq(spaces.tenantId, tenantId), eq(spaces.isDefault, true)));
     const enabled: TemplateId[] = [];
     for (const template of Object.keys(TEMPLATES) as TemplateId[]) {
       if (existing.has(template) || !TEMPLATES[template].entities.every(e => mapped.has(e))) continue;
-      const [definition] = await tx.insert(templateDefinitions).values({ tenantId, template }).onConflictDoNothing().returning({ id: templateDefinitions.id });
+      const [definition] = await tx.insert(templateDefinitions).values({ tenantId, spaceId: defaultSpace!.id, template }).onConflictDoNothing().returning({ id: templateDefinitions.id });
       if (!definition) continue;
       const latest = latestTemplate(template);
       const params = checked(latest, latest.defaults as Record<string, unknown>);

@@ -16,7 +16,7 @@ import { syncSource } from '../../app/.server/source-sync';
 import { getTask, insertTask } from '../../app/.server/tasks';
 import { discardDraft, enableDefaultTemplates, getTemplate, publishTemplate, recomputeTemplate, saveDraft, TemplateError } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
-import { drain, memberOf, newTenant, publish } from './fixtures';
+import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish } from './fixtures';
 import { CRM, CRM_ORDERS, LOYALTY, publishedIdentitySources, TRACKING_USERS } from './identity-fixtures';
 import { grantOnSource, seedIdentitySources } from './source-fixtures';
 
@@ -65,6 +65,15 @@ describe('分析模板定义', () => {
     expect((await getTemplate(analyst, 'rfm')).draft).toMatchObject({
       version: 1, params: { lookbackDays: 400 }, authors: ['analyst@acme.com', 'de@acme.com'], lastEditor: 'de@acme.com',
     });
+  });
+
+  it('第一次保存草稿记为保存者的当前空间（ADR-0048），别的空间的成员再存一版不改', async () => {
+    const acme = await newTenant('acme');
+    const other = await memberInNewSpace(acme, 'b@acme.com', 'analyst');
+    await saveDraft(other, 'rfm', PARAMS);
+    await saveDraft(await memberOf(acme, 'de@acme.com'), 'rfm', { ...PARAMS, lookbackDays: 400 });
+    expect(await getDb().select({ spaceId: templateDefinitions.spaceId }).from(templateDefinitions).where(eq(templateDefinitions.tenantId, acme)))
+      .toEqual([{ spaceId: other.space.id }]);
   });
 
   it('最后保存草稿的人不能发布，分析师没有发布权限；另一位数据工程师发布后以新参数入队 gold.rfm，快照记下定义版本', async () => {
@@ -231,6 +240,9 @@ describe('映射首次合并后自动启用默认模板', () => {
     expect(snaps.map(s => [s.template, s.definitionVersion, s.trigger, s.params.asOf]).sort())
       .toEqual(ALL.map(t => [t, 1, 'publish', today()]));
     expect(await autoEnabled(acme)).toEqual(ALL.map(t => ['平台', `${TEMPLATES[t as TemplateId].label}，按默认参数发布第 1 版`]).sort());
+    // 自动启用的模板没有操作成员，记在本租户的默认空间
+    expect(new Set((await getDb().select({ spaceId: templateDefinitions.spaceId }).from(templateDefinitions).where(eq(templateDefinitions.tenantId, acme))).map(d => d.spaceId)))
+      .toEqual(new Set([await defaultSpaceOf(acme)]));
 
     // 再次合并不重复启用
     expect(await enableDefaultTemplates(acme)).toEqual([]);
