@@ -108,7 +108,7 @@ async function registerUpload(member: CurrentMember, input: SourceInput, file: F
   const dir = crypto.randomUUID();
   try {
     await storeUpload(member.tenant.id, dir, table, text);
-    return await registerSource(member, { ...input, table, dir });
+    return await registerSource(member, { ...input, table, dir }, { table, file: file.name, bytes: file.size, encoding: 'utf-8' });
   } catch (e) {
     await removeUpload(member.tenant.id, dir);
     throw e;

@@ -80,6 +80,11 @@ const ACTIONS = {
   },
   'model_provider.reset': { label: '恢复平台默认模型服务', describe: () => '清空本租户的端点、模型名与 API Key' },
   'source.registered': { label: '登记数据源', describe: (d: Detail) => `「${d.name}」（${sourceKindLabel(d.kind)}），${d.tables} 张表` },
+  // 只记元数据，不记文件内容（ADR-0037）
+  'source.file_uploaded': {
+    label: '上传文件',
+    describe: (d: Detail) => `${d.table}：${d.file}（${Number(d.bytes).toLocaleString('en-US')} 字节，${d.encoding}）`,
+  },
   // 不记凭据
   'source.deleted': { label: '删除数据源', describe: (d: Detail) => `「${d.name}」（${sourceKindLabel(d.kind)}）` },
   'source.updated': {
