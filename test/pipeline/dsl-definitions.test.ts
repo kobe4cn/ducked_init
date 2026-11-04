@@ -6,13 +6,15 @@
 // 发布前的影响预览（impactOf）在只读挂载上对比已发布版本与草稿，只给计数，湖与任务队列不变。
 // filter 写字段路径（ADR-0038）的指标能发布，路径经过的实体进依赖：定时刷新与停用映射的影响都跟着变；
 // 订单明细经订单一跳关联消费者的奶粉消费金额与引用它的奶粉人群标签能发布并算出
-// 所属空间（ADR-0048）：新建记为创建者的空间、之后不改，迁移把已有定义归入默认空间；别的空间的成员照样能读、展开、引用（不隔离）
+// 所属空间（ADR-0048）：新建记为创建者的空间、之后不改，迁移（读 migration.sql 的 UPDATE）把已有的指标、标签、模板定义归入默认空间；别的空间的成员照样能读、展开、引用（不隔离）
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { dslDefinitions, dslVersions, mappings, tasks } from '../../app/.server/db/schema';
+import { dslDefinitions, dslVersions, mappings, tasks, templateDefinitions } from '../../app/.server/db/schema';
 import { createDefinition, deleteDefinition, discardDslDraft, DslError, getDefinition, impactOf, previewDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { disableImpact, publishMapping, saveDraft } from '../../app/.server/mappings';
@@ -22,6 +24,7 @@ import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, relistSource, setSyncScope } from '../../app/.server/sources';
 import { getTask } from '../../app/.server/tasks';
+import { saveDraft as saveTemplateDraft } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
 import { runTool } from '../../app/.server/assistant/tools';
 import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish } from './fixtures';
@@ -537,6 +540,14 @@ describe('删除定义', () => {
   });
 });
 
+// 模板草稿参数，同 test/pipeline/templates.test.ts 的 PARAMS
+const RFM_PARAMS = {
+  lookbackDays: 3650,
+  statuses: ['completed', 'paid', 'shipped'],
+  binning: { method: 'thresholds', recency: [30, 90, 180, 365], frequency: [2, 3, 5, 8], monetary: [100, 500, 1000, 5000] },
+  segments: [{ name: '高价值', m: { min: 3 } }, { name: '其他' }],
+};
+
 describe('所属空间（ADR-0048）', () => {
   const spaceOf = async (tenantId: string, key: string) => (await getDb().select({ spaceId: dslDefinitions.spaceId }).from(dslDefinitions)
     .where(and(eq(dslDefinitions.tenantId, tenantId), eq(dslDefinitions.key, key))))[0]?.spaceId;
@@ -553,30 +564,43 @@ describe('所属空间（ADR-0048）', () => {
     expect(await spaceOf(acme, 'revenue')).toBe(await defaultSpaceOf(acme));
   });
 
-  it('迁移的回填语句把已有定义归入本租户的默认空间；列非空、外键指向 spaces', async () => {
+  it('迁移的回填语句把已有的指标、标签、模板定义归入本租户的默认空间；两张表的列非空、外键指向 spaces', async () => {
     const acme = await newTenant('acme');
     const globex = await newTenant('globex');
-    await createDefinition(await memberInNewSpace(acme, 'b@acme.com'), 'metric', 'revenue', REVENUE);
+    const other = await memberInNewSpace(acme, 'b@acme.com');
+    await createDefinition(other, 'metric', 'revenue', REVENUE);
     await createDefinition(await memberOf(globex, 'de@globex.com'), 'metric', 'revenue', REVENUE);
+    await saveTemplateDraft(other, 'rfm', RFM_PARAMS);
     const db = getDb();
-    const [column] = (await db.execute(sql`SELECT is_nullable FROM information_schema.columns
-      WHERE table_schema = 'platform' AND table_name = 'dsl_definitions' AND column_name = 'space_id'`)).rows;
-    expect(column).toEqual({ is_nullable: 'NO' });
-    const [fk] = (await db.execute(sql`SELECT confrelid::regclass::text AS target FROM pg_constraint
-      WHERE conrelid = 'platform.dsl_definitions'::regclass AND contype = 'f' AND conkey = ARRAY[(SELECT attnum FROM pg_attribute
-        WHERE attrelid = 'platform.dsl_definitions'::regclass AND attname = 'space_id')]`)).rows;
-    expect(fk).toEqual({ target: 'platform.spaces' });
+    const templateSpaceOf = async (tenantId: string) => (await db.select({ spaceId: templateDefinitions.spaceId }).from(templateDefinitions)
+      .where(and(eq(templateDefinitions.tenantId, tenantId), eq(templateDefinitions.template, 'rfm'))))[0]?.spaceId;
+    expect(await templateSpaceOf(acme)).toBe(other.space.id);
 
-    // 回到迁移前的状态（列为空）再跑一遍迁移里的 UPDATE
-    await db.execute(sql`ALTER TABLE platform.dsl_definitions ALTER COLUMN space_id DROP NOT NULL`);
+    const tables = ['dsl_definitions', 'template_definitions'];
+    for (const table of tables) {
+      const [column] = (await db.execute(sql`SELECT is_nullable FROM information_schema.columns
+        WHERE table_schema = 'platform' AND table_name = ${table} AND column_name = 'space_id'`)).rows;
+      expect(column, table).toEqual({ is_nullable: 'NO' });
+      const [fk] = (await db.execute(sql`SELECT confrelid::regclass::text AS target FROM pg_constraint
+        WHERE conrelid = ${`platform.${table}`}::regclass AND contype = 'f' AND conkey = ARRAY[(SELECT attnum FROM pg_attribute
+          WHERE attrelid = ${`platform.${table}`}::regclass AND attname = 'space_id')]`)).rows;
+      expect(fk, table).toEqual({ target: 'platform.spaces' });
+    }
+
+    // 回到迁移前的状态（列为空），再执行迁移文件里的 UPDATE 语句（直接读 migration.sql，迁移改了这里跟着变）
+    const updates = readFileSync(join(process.cwd(), 'drizzle/20261104051927_definition_space/migration.sql'), 'utf8')
+      .split('--> statement-breakpoint').map(s => s.trim()).filter(s => /^UPDATE\b/i.test(s));
+    expect(updates).toHaveLength(2);
+    for (const table of tables) await db.execute(sql.raw(`ALTER TABLE platform.${table} ALTER COLUMN space_id DROP NOT NULL`));
     try {
-      await db.execute(sql`UPDATE platform.dsl_definitions SET space_id = NULL`);
-      await db.execute(sql`UPDATE "platform"."dsl_definitions" d SET "space_id" = (SELECT s."id" FROM "platform"."spaces" s WHERE s."tenant_id" = d."tenant_id" AND s."is_default")`);
+      for (const table of tables) await db.execute(sql.raw(`UPDATE platform.${table} SET space_id = NULL`));
+      for (const update of updates) await db.execute(sql.raw(update));
     } finally {
-      await db.execute(sql`ALTER TABLE platform.dsl_definitions ALTER COLUMN space_id SET NOT NULL`);
+      for (const table of tables) await db.execute(sql.raw(`ALTER TABLE platform.${table} ALTER COLUMN space_id SET NOT NULL`));
     }
     expect(await spaceOf(acme, 'revenue')).toBe(await defaultSpaceOf(acme));
     expect(await spaceOf(globex, 'revenue')).toBe(await defaultSpaceOf(globex));
+    expect(await templateSpaceOf(acme)).toBe(await defaultSpaceOf(acme));
   });
 
   it('不按空间隔离：别的空间的成员能读到、在目录里展开、引用另一个空间建的指标', async () => {
