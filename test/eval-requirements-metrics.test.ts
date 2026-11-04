@@ -24,12 +24,12 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(g.合计).toEqual({ cases: 4, recall: 0.5, clarifyAccuracy: 0.5, clarifyRecall: 0.5 });
   });
 
-  it('真实黄金集：合计 Recall@20 与 retrieval-golden 的汇总一致，应追问 12 条、召回 0（search() 不判歧义），验收集 8 条', () => {
+  it('真实黄金集：合计 Recall@20 与 retrieval-golden 的汇总一致，应追问 12 条、召回 0（rank() 不判歧义），验收集 8 条', () => {
     const rows = retrievalRows(GOLDEN_ALL);
     const total = groupByType(rows).合计;
     expect(total.cases).toBe(40);
-    expect(total.recall).toBeGreaterThanOrEqual(0.7);
-    expect(total.recall!.toFixed(4)).toBe('0.7051');
+    expect(total.recall).toBeGreaterThanOrEqual(0.86);
+    expect(total.recall!.toFixed(4)).toBe('0.8654');
     expect(rows.filter(r => r.shouldAsk)).toHaveLength(12);
     expect(rows.some(r => r.asked)).toBe(false);
     expect(total.clarifyRecall).toBe(0);

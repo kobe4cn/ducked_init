@@ -1,43 +1,29 @@
-// scripts/eval-requirements/retrieval.ts —— 黄金集的检索与追问指标（#318，ADR-0047）：对 retrieval-catalog.ts 的固定目录跑 search()，
+// scripts/eval-requirements/retrieval.ts —— 黄金集的检索与追问指标（#318，ADR-0047）：对 retrieval-catalog.ts 的固定目录按角色的可见性类别派生检索投影、跑 rank()，
 // 每条算 Recall@20 与追问判定，再按失败类型 a–d 与合计分组。test/retrieval-golden.test.ts 的逐条断言与 pnpm eval:requirements 共用这里，
 // 两边的 Recall@20 是同一算法。追问按服务端的歧义判定算（ADR-0047：歧义由服务端发现，不交给模型），「该追问」= 标注了 clarify。
 // 纯函数，不读库、不走模型
-import { search, type Catalog, type CatalogEntry } from '../../app/.server/catalog';
+import type { Catalog } from '../../app/.server/catalog';
+import { deriveProjection, visibleCatalog, type ProjectionClass } from '../../app/.server/catalog/projection';
+import { rank } from '../../app/.server/catalog/rank';
 import { FAILURE_TYPES, type GoldenEntry } from './golden';
 import { RETRIEVAL_CATALOG } from './retrieval-catalog';
 
-/**
- * 查看者（没有 sources:read）看到的目录：去掉数据源与源表，字段不带血缘，实体不带来源表与合并组。
- * 照抄 app/.server/assistant/tools.ts 的 catalogFor（抽成纯函数留给 P2）
- */
-export function viewerView(c: Catalog): Catalog {
-  const entries = c.entries.flatMap((e): CatalogEntry[] => {
-    switch (e.kind) {
-      case 'source':
-      case 'table':
-        return [];
-      case 'field':
-        return [{ ...e, lineage: [] }];
-      case 'entity':
-        return [{ ...e, tables: [], unscoped: [], mergeGroups: [] }];
-      default:
-        return [e];
-    }
-  });
-  return { ...c, entries };
-}
+/** 查看者（没有 sources:read）看到的目录：restricted 类，去掉数据源与源表，字段不带血缘，实体不带来源表与合并组 */
+export const viewerView = (c: Catalog): Catalog => visibleCatalog(c, 'restricted');
 
 export const LIMIT = 20;
-const VIEWER = viewerView(RETRIEVAL_CATALOG);
+const view = (cls: ProjectionClass) => ({ rows: deriveProjection(RETRIEVAL_CATALOG, cls), catalog: visibleCatalog(RETRIEVAL_CATALOG, cls) });
+const VIEWS = { full: view('full'), restricted: view('restricted') };
 
 export interface Retrieved { top: string[]; hits: number; ambiguous: boolean }
 
 /** 一条的检索结果：前 20（先去掉能力说明，与 model-draft 的 relevantMarkdown 一致）、命中的候选数与歧义判定 */
 export function retrieve(g: GoldenEntry): Retrieved {
-  const c = g.role === 'viewer' ? VIEWER : RETRIEVAL_CATALOG;
-  const top = search(c, g.retrieval.query, c.entries.length).filter(e => e.kind !== 'capability').slice(0, LIMIT).map(e => e.id);
+  const v = VIEWS[g.role === 'viewer' ? 'restricted' : 'full'];
+  const top = rank(v.rows, v.catalog, g.retrieval.query, {}, v.catalog.entries.length)
+    .filter(r => r.entry.kind !== 'capability').slice(0, LIMIT).map(r => r.entry.id);
   const hits = g.retrieval.candidates.filter(id => top.includes(id)).length;
-  // 现有 search() 不判歧义
+  // rank() 不判歧义（留给 ⑨）
   const ambiguous = false;
   return { top, hits, ambiguous };
 }
