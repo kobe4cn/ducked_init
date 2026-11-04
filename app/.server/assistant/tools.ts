@@ -9,7 +9,7 @@ import { data } from 'react-router';
 import { parse } from 'yaml';
 import { assertCan, can, type Permission } from '../access';
 import type { CurrentMember } from '../auth';
-import { expand, overview, search, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
+import { expand, overview, search, toMarkdown, type Catalog } from '../catalog';
 import { tenantCatalog } from '../catalog/load';
 import { refreshProjection, visibilityClass, visibleCatalog } from '../catalog/projection';
 import { getDb } from '../db/client';
