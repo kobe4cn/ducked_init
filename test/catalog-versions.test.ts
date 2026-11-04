@@ -4,6 +4,9 @@ import { buildCatalog, overview, toMarkdown, type CatalogInput } from '../app/.s
 import { diffCatalog, stripStats } from '../app/.server/catalog/versions';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
 
+/** 手写目录输入里定义与模板所属的空间：目录只记录它，不按它过滤（ADR-0048） */
+const SPACE = '00000000-0000-0000-0000-000000000000';
+
 const plan: MergeMappingParam = {
   mapping: 'm-order', version: 3, sourceId: 's-shop', entity: 'order', table: 'orders',
   columns: [
@@ -22,7 +25,7 @@ const input = (over: Partial<CatalogInput> = {}): CatalogInput => ({
     fields: [{ name: 'store_id', type: 'string', description: '门店编码', sensitive: false }],
     relations: [],
   }],
-  templates: [{ template: 'rfm', version: 1, params: { lookbackDays: 365 }, snapshot: null }],
+  templates: [{ template: 'rfm', version: 1, params: { lookbackDays: 365 }, spaceId: SPACE, snapshot: null }],
   ...over,
 });
 
@@ -37,7 +40,7 @@ const withStats = (rows = 120, over: Partial<CatalogInput> = {}): CatalogInput =
     ],
   }],
   entityStats: [{ entity: 'order', rows: rows - 2, at: '2024-07-03T08:00:00.000Z' }],
-  templates: [{ template: 'rfm', version: 1, params: { lookbackDays: 365 }, snapshot: { table: 'gold.rfm__t1', rows, at: '2026-10-01T00:00:00.000Z' } }],
+  templates: [{ template: 'rfm', version: 1, params: { lookbackDays: 365 }, spaceId: SPACE, snapshot: { table: 'gold.rfm__t1', rows, at: '2026-10-01T00:00:00.000Z' } }],
 });
 
 const snap = (i: CatalogInput) => stripStats(buildCatalog(i));

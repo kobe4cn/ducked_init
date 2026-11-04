@@ -6,11 +6,12 @@
 // 映射发布、确认停用、定义发布与业务说明保存各记一版目录版本（原因是审计动作），目录没变的不记，可以取某版以来的差异；
 // 自定义实体、合并组、源视图、同步范围、指标 / 标签 / 模板的发布与删除数据源也各记一版（删除后它的源表与源视图不再进目录）；源表加删列后重新采集记一版（source.profiled），只改统计的同步不记；
 // 目录与最新一版不一致而没有事件记录时（能力说明变了），tenantCatalog 读取时补记一版，还没有版本的租户读取时记第 1 版，补记不与先锁租户行的事务死锁
+// 指标、标签、模板条目带定义所属空间 spaceId（只作记录，不按它过滤，ADR-0048）；加这个键前后的差异只有它，已发布过定义或模板的租户读取时补记一版 catalog.detected
 import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { expand, overview, search, toJson, toMarkdown } from '../../app/.server/catalog';
+import { type CatalogEntry, expand, overview, search, toJson, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
-import { catalogChangesSince, recordCatalogVersion } from '../../app/.server/catalog/versions';
+import { catalogChangesSince, diffCatalog, recordCatalogVersion, stripStats } from '../../app/.server/catalog/versions';
 import { saveBusinessNote, targetNoteHistory } from '../../app/.server/business-notes';
 import { createCustomEntity, deleteCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -23,7 +24,7 @@ import { createSourceView, publishSourceView } from '../../app/.server/source-vi
 import { confirmWatermark, deleteSource, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
 import { publishTemplate, saveDraft } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
-import { drain, memberOf, newTenant, publish, selectAllTables } from './fixtures';
+import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish, selectAllTables } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
@@ -132,6 +133,64 @@ describe('语义目录的加载', () => {
       snapshot: { table: expect.stringMatching(/^gold\.rfm__/), rows: expect.any(Number), at: expect.any(String) },
     });
     expect(toMarkdown(overview(c))).toContain('- template:rfm RFM 分层');
+  });
+
+  it('指标、标签、模板条目带定义所属空间 spaceId，只作记录：另一个空间的成员发布的标签也在目录里', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const other = await memberInNewSpace(acme, 'b@acme.com');
+    await createDefinition(author, 'metric', 'paid_revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 1);
+    await createDefinition(other, 'tag', 'spender', 'metric: paid_revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n');
+    await publishDefinition(reviewer, 'tag', 'spender', 1);
+    await drain();
+
+    const c = await tenantCatalog(acme);
+    const space = await defaultSpaceOf(acme);
+    expect(expand(c, 'metric:paid_revenue')).toMatchObject({ spaceId: space });
+    expect(expand(c, 'tag:spender')).toMatchObject({ spaceId: other.space.id });
+    expect(expand(c, 'template:rfm')).toMatchObject({ spaceId: space });
+  });
+
+  it('加 spaceId 前后的目录差异只有这一个键；最新一版没有 spaceId 时读取补记一版，原因是 catalog.detected', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    await createDefinition(author, 'metric', 'paid_revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 1);
+    await createDefinition(author, 'tag', 'spender', 'metric: paid_revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n');
+    await publishDefinition(reviewer, 'tag', 'spender', 1);
+    await drain();
+
+    const withoutSpaceId = (entries: CatalogEntry[]) => entries.map(e => {
+      if (!('spaceId' in e)) return e;
+      const { spaceId: _, ...rest } = e;
+      return rest as CatalogEntry;
+    });
+    const current = stripStats(await tenantCatalog(acme));
+    // 已发布的每个指标、标签、模板（含合并后自动启用的模板）
+    const withSpace = new Set(current.filter(e => e.kind === 'metric' || e.kind === 'tag' || e.kind === 'template').map(e => e.id));
+    expect([...withSpace]).toEqual(expect.arrayContaining(['metric:paid_revenue', 'tag:spender', 'template:rfm']));
+    const diff = diffCatalog(withoutSpaceId(current), current);
+    expect(diff.added).toEqual([]);
+    expect(diff.removed).toEqual([]);
+    expect(new Set(diff.changed.map(x => x.id))).toEqual(withSpace);
+    for (const x of diff.changed) expect(x.keys, x.id).toEqual(['spaceId']);
+
+    // 已发布过定义与模板的租户：最新一版还是加键前的样子，下次读目录补记一版
+    const row = (await latestVersion(acme))!;
+    await getDb().update(catalogVersions).set({ snapshot: withoutSpaceId(row.snapshot) })
+      .where(and(eq(catalogVersions.tenantId, acme), eq(catalogVersions.version, row.version)));
+    expect((await tenantCatalog(acme)).version).toBe(row.version + 1);
+    const bumped = (await latestVersion(acme))!;
+    expect(bumped).toMatchObject({ reason: 'catalog.detected', diff: { added: [], removed: [] } });
+    expect(bumped.diff.changed.map(x => [x.id, x.keys])).toEqual(expect.arrayContaining([...withSpace].map(id => [id, ['spaceId']])));
+    expect(bumped.diff.changed).toHaveLength(withSpace.size);
+  });
+
+  it('没有已发布定义和模板的租户，加 spaceId 前后的目录一样，读取不补记', async () => {
+    const { acme } = await publishedIdentitySources();
+    const row = (await latestVersion(acme))!;
+    expect(row.snapshot.filter(e => ['metric', 'tag', 'template'].includes(e.kind))).toEqual([]);
+    expect((await tenantCatalog(acme)).version).toBe(row.version);
+    expect((await latestVersion(acme))!.version).toBe(row.version);
   });
 
   it('业务说明保存后不需要发布就进目录：实体字段说明在字段上，映射字段说明在各自的血缘下，能搜到；清空后不出现，敏感字段的说明不进目录', async () => {

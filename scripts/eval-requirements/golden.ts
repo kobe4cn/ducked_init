@@ -65,8 +65,11 @@ description: 距最近一次下单的天数
 `,
 };
 
+/** 手写目录输入里定义与模板所属的空间：目录只记录它，不按它过滤（ADR-0048） */
+export const SPACE = '00000000-0000-0000-0000-000000000000';
+
 export const CATALOG_INPUT: CatalogInput = {
-  definitions: Object.entries(PUBLISHED_METRICS).map(([key, yaml]) => ({ kind: 'metric' as const, key, version: 1, yaml })),
+  definitions: Object.entries(PUBLISHED_METRICS).map(([key, yaml]) => ({ kind: 'metric' as const, key, version: 1, yaml, spaceId: SPACE })),
   entityStats: [
     { entity: 'customer', rows: 5000, at: '2024-12-01T00:00:00.000Z' },
     { entity: 'order', rows: 32000, at: '2024-12-01T00:00:00.000Z' },

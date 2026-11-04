@@ -5,6 +5,9 @@ import { buildCatalog, estimateTokens, expand, overview, search, toJson, toMarkd
 import { knowledgeKey } from '../app/.server/knowledge/catalog';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
 
+/** 手写目录输入里定义与模板所属的空间：目录只记录它，不按它过滤（ADR-0048） */
+const SPACE = '00000000-0000-0000-0000-000000000000';
+
 const plan = (over: Partial<MergeMappingParam> = {}): MergeMappingParam => ({
   mapping: 'm-order',
   version: 3,
@@ -256,15 +259,15 @@ describe('语义目录', () => {
     const withDefinitions = (rows = 1200): CatalogInput => ({
       ...input(),
       definitions: [
-        { kind: 'metric', key: 'revenue', version: 2, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\nfilter:\n  - { field: status, op: eq, value: paid }\ndescription: 已支付订单的消费金额\n' },
-        { kind: 'metric', key: 'store_orders', version: 1, yaml: 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: store, path: order.store_id -> custom_store.name }\n' },
-        { kind: 'tag', key: 'spender', version: 1, yaml: 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1000 } }\ndefault: low\n' },
+        { kind: 'metric', key: 'revenue', version: 2, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\nfilter:\n  - { field: status, op: eq, value: paid }\ndescription: 已支付订单的消费金额\n', spaceId: SPACE },
+        { kind: 'metric', key: 'store_orders', version: 1, yaml: 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: store, path: order.store_id -> custom_store.name }\n', spaceId: SPACE },
+        { kind: 'tag', key: 'spender', version: 1, yaml: 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1000 } }\ndefault: low\n', spaceId: SPACE },
       ],
-      templates: [{ template: 'rfm', version: 1, params: { lookbackDays: 365 }, snapshot: { table: 'gold.rfm__t1', rows, at: '2026-10-01T00:00:00.000Z' } }],
+      templates: [{ template: 'rfm', version: 1, params: { lookbackDays: 365 }, spaceId: SPACE, snapshot: { table: 'gold.rfm__t1', rows, at: '2026-10-01T00:00:00.000Z' } }],
     });
     const c = buildCatalog(withDefinitions());
     expect(expand(c, 'metric:revenue')).toEqual({
-      kind: 'metric', id: 'metric:revenue', name: 'revenue', description: '已支付订单的消费金额', key: 'revenue', version: 2,
+      kind: 'metric', id: 'metric:revenue', name: 'revenue', description: '已支付订单的消费金额', key: 'revenue', version: 2, spaceId: SPACE,
       base: 'entity:order', measure: 'sum(amount)', dimensions: [],
       dependencies: { metrics: [], entities: ['entity:order'], fields: ['field:order.amount', 'field:order.status'] },
       system: {
@@ -295,7 +298,7 @@ describe('语义目录', () => {
   it('条目带 knowledge.aliases 时搜索与 Markdown 含别名（映射字段的在血缘项下）；挂不上的丢掉，没有知识时条目没有 knowledge 键', () => {
     const base = (): CatalogInput => ({
       ...input(),
-      definitions: [{ kind: 'metric', key: 'revenue', version: 2, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\n' }],
+      definitions: [{ kind: 'metric', key: 'revenue', version: 2, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\n', spaceId: SPACE }],
     });
     const plain = buildCatalog(base());
     const c = buildCatalog({

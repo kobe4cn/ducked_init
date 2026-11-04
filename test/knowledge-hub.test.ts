@@ -7,6 +7,9 @@ import type { Claim, Knowledge } from '../app/.server/knowledge/catalog';
 import { buildKnowledgeHub } from '../app/.server/knowledge/hub';
 import type { Proposal } from '../app/.server/knowledge/proposals';
 
+/** 手写目录输入里定义与模板所属的空间：目录只记录它，不按它过滤（ADR-0048） */
+const SPACE = '00000000-0000-0000-0000-000000000000';
+
 const entity = (name: string, tables: string[], knowledge?: Knowledge): EntityEntry => ({
   kind: 'entity', id: `entity:${name}`, name, description: '', entity: name, custom: false, key: ['id'], fields: [],
   tables, unscoped: [], relations: [], mergeGroups: [], stats: null, ...(knowledge ? { knowledge } : {}),
@@ -18,7 +21,7 @@ const field = (entityName: string, name: string, knowledge?: Knowledge): FieldEn
 });
 
 const metric = (key: string, system: Claim[], knowledge?: Knowledge): MetricEntry => ({
-  kind: 'metric', id: `metric:${key}`, name: key, description: '', key, version: 1, base: 'order', measure: 'sum(amount)',
+  kind: 'metric', id: `metric:${key}`, name: key, description: '', key, version: 1, spaceId: SPACE, base: 'order', measure: 'sum(amount)',
   dimensions: [], dependencies: { metrics: [], entities: [], fields: [] }, system: { text: '', claims: system },
   ...(knowledge ? { knowledge } : {}),
 });
