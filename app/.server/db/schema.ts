@@ -384,9 +384,11 @@ export const templateVersionStatusEnum = platform.enum('template_version_status'
 
 // 分析模板定义：租户对某个分析模板（如 rfm，见 pipeline/templates）的参数，每个租户每个模板一份（ADR-0004）。第一次保存草稿时建立，
 // 从没发布过的定义丢弃草稿时删除；没有已发布版本时模板用注册表里的默认参数
+// space_id 是第一次保存草稿者的空间（平台自动启用的记为默认空间），之后不改；只作记录，不按空间隔离（ADR-0048）
 export const templateDefinitions = platform.table('template_definitions', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  spaceId: uuid('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
   template: text('template').notNull(),
   createdAt: createdAt(),
 }, t => [uniqueIndex('template_definitions_tenant_template_uq').on(t.tenantId, t.template)]);
@@ -632,9 +634,11 @@ export const DSL_DEFINITION_KINDS = ['metric', 'tag'] as const;
 export const dslKindEnum = platform.enum('dsl_kind', DSL_DEFINITION_KINDS);
 
 // DSL 定义：租户自己写的指标或标签（ADR-0025），键在租户与种类内唯一。在新建页起草时建立，之后的保存都改同一份草稿
+// space_id 是创建者当时的空间，之后保存、发布都不改；只作记录，读与引用不按空间隔离（ADR-0048）
 export const dslDefinitions = platform.table('dsl_definitions', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  spaceId: uuid('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
   kind: dslKindEnum('kind').notNull(),
   key: text('key').notNull(),
   createdAt: createdAt(),

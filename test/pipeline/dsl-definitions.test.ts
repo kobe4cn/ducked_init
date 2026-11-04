@@ -6,12 +6,13 @@
 // 发布前的影响预览（impactOf）在只读挂载上对比已发布版本与草稿，只给计数，湖与任务队列不变。
 // filter 写字段路径（ADR-0038）的指标能发布，路径经过的实体进依赖：定时刷新与停用映射的影响都跟着变；
 // 订单明细经订单一跳关联消费者的奶粉消费金额与引用它的奶粉人群标签能发布并算出
-import { and, eq } from 'drizzle-orm';
+// 所属空间（ADR-0048）：新建记为创建者的空间、之后不改，迁移把已有定义归入默认空间；别的空间的成员照样能读、展开、引用（不隔离）
+import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { dslVersions, mappings, tasks } from '../../app/.server/db/schema';
+import { dslDefinitions, dslVersions, mappings, tasks } from '../../app/.server/db/schema';
 import { createDefinition, deleteDefinition, discardDslDraft, DslError, getDefinition, impactOf, previewDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { disableImpact, publishMapping, saveDraft } from '../../app/.server/mappings';
@@ -22,7 +23,8 @@ import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, relistSource, setSyncScope } from '../../app/.server/sources';
 import { getTask } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
-import { drain, memberOf, newTenant, publish } from './fixtures';
+import { runTool } from '../../app/.server/assistant/tools';
+import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish } from './fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource, READER } from './source-fixtures';
 
@@ -532,5 +534,64 @@ describe('删除定义', () => {
       await expect(deleteDefinition(engineer, 'metric', key)).rejects.toThrow(`指标 ${key} 被已发布的标签引用，不能删除：mixed`);
       expect((await getDefinition(analyst, 'metric', key)).dependents).toEqual(['mixed']);
     }
+  });
+});
+
+describe('所属空间（ADR-0048）', () => {
+  const spaceOf = async (tenantId: string, key: string) => (await getDb().select({ spaceId: dslDefinitions.spaceId }).from(dslDefinitions)
+    .where(and(eq(dslDefinitions.tenantId, tenantId), eq(dslDefinitions.key, key))))[0]?.spaceId;
+
+  it('新建的定义记为创建者的当前空间，别的空间的成员再存一版草稿不改', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const other = await memberInNewSpace(acme, 'b@acme.com');
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await createDefinition(other, 'metric', 'revenue_b', REVENUE);
+    expect(await spaceOf(acme, 'revenue')).toBe(await defaultSpaceOf(acme));
+    expect(await spaceOf(acme, 'revenue_b')).toBe(other.space.id);
+    await saveDslDraft(other, 'metric', 'revenue', REVENUE_BY_CITY);
+    expect(await spaceOf(acme, 'revenue')).toBe(await defaultSpaceOf(acme));
+  });
+
+  it('迁移的回填语句把已有定义归入本租户的默认空间；列非空、外键指向 spaces', async () => {
+    const acme = await newTenant('acme');
+    const globex = await newTenant('globex');
+    await createDefinition(await memberInNewSpace(acme, 'b@acme.com'), 'metric', 'revenue', REVENUE);
+    await createDefinition(await memberOf(globex, 'de@globex.com'), 'metric', 'revenue', REVENUE);
+    const db = getDb();
+    const [column] = (await db.execute(sql`SELECT is_nullable FROM information_schema.columns
+      WHERE table_schema = 'platform' AND table_name = 'dsl_definitions' AND column_name = 'space_id'`)).rows;
+    expect(column).toEqual({ is_nullable: 'NO' });
+    const [fk] = (await db.execute(sql`SELECT confrelid::regclass::text AS target FROM pg_constraint
+      WHERE conrelid = 'platform.dsl_definitions'::regclass AND contype = 'f' AND conkey = ARRAY[(SELECT attnum FROM pg_attribute
+        WHERE attrelid = 'platform.dsl_definitions'::regclass AND attname = 'space_id')]`)).rows;
+    expect(fk).toEqual({ target: 'platform.spaces' });
+
+    // 回到迁移前的状态（列为空）再跑一遍迁移里的 UPDATE
+    await db.execute(sql`ALTER TABLE platform.dsl_definitions ALTER COLUMN space_id DROP NOT NULL`);
+    try {
+      await db.execute(sql`UPDATE platform.dsl_definitions SET space_id = NULL`);
+      await db.execute(sql`UPDATE "platform"."dsl_definitions" d SET "space_id" = (SELECT s."id" FROM "platform"."spaces" s WHERE s."tenant_id" = d."tenant_id" AND s."is_default")`);
+    } finally {
+      await db.execute(sql`ALTER TABLE platform.dsl_definitions ALTER COLUMN space_id SET NOT NULL`);
+    }
+    expect(await spaceOf(acme, 'revenue')).toBe(await defaultSpaceOf(acme));
+    expect(await spaceOf(globex, 'revenue')).toBe(await defaultSpaceOf(globex));
+  });
+
+  it('不按空间隔离：别的空间的成员能读到、在目录里展开、引用另一个空间建的指标', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
+    await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    const other = await memberInNewSpace(acme, 'b@acme.com');
+    expect(other.space.id).not.toBe(author.space.id);
+
+    expect(await getDefinition(other, 'metric', 'revenue')).toMatchObject({ key: 'revenue', published: { version: 1, yaml: ALL_REVENUE } });
+    const expanded = await runTool(other, 'catalog_expand', { id: 'metric:revenue' });
+    expect(expanded).not.toBe('没有这个条目');
+    expect(expanded).toContain('revenue');
+    expect(await createDefinition(other, 'tag', 'value_tier', 'metric: revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n'))
+      .toEqual({ kind: 'tag', key: 'value_tier', version: 1 });
+    expect(await spaceOf(acme, 'value_tier')).toBe(other.space.id);
   });
 });

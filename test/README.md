@@ -54,6 +54,8 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 |---|---|
 | `newTenant(slug)` | 开通租户（含管理员 `admin@<slug>.com`），返回租户 ID |
 | `memberOf(tenantId, email, role = 'data_engineer')` | 返回该成员的 `CurrentMember`，不存在则以给定角色加入；用作领域函数的第一个参数 |
+| `memberInNewSpace(tenantId, email, role = 'data_engineer', name = '事业部B')` | 新建一个非默认空间，返回以它为当前空间的成员（同 `memberOf`，只换 `space`） |
+| `defaultSpaceOf(tenantId)` | 租户默认空间的 ID |
 | `runTask(tenantId, kind, params?)` | 入队一个任务并让调度器跑空，返回任务最终状态 |
 | `drain()` | 跑空调度器（`maxWorkers: 2`）：同步、合并等任务入队后调用 |
 | `selectAllTables(member, sourceId)` | 把数据源里可读的表全部选入同步范围（会入队采集，之后要跑空调度器） |
