@@ -161,7 +161,6 @@ describe('检索投影', () => {
     expect((await queued()).map(t => t.status)).toEqual(['succeeded']);
     expect(await projectionVersion(getDb(), acme)).toBe(await currentCatalogVersion(getDb(), acme));
     const rebuilt = await rows(acme);
-    await rebuildProjection(acme);
     expect(rebuilt.some(r => r.entryId === 'metric:refund_count')).toBe(false);
     await rebuildProjection(acme);
     expect(await rows(acme)).toEqual(rebuilt);
