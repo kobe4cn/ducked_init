@@ -1,17 +1,21 @@
 // app/.server/catalog/projection.ts —— 目录的检索投影（ADR-0047，部分修订 ADR-0041）：每个条目在每个可见性类别下参与检索的文字、别名、主题与所属空间。
 // 投影是派生数据：deriveProjection 是纯函数，从已裁剪的目录生成行，能从零重建（rebuildProjection），也能按 catalogChangesSince 的净差异增量刷新（refreshProjection）。
 // 可见性类别只由服务端按角色算（visibilityClass），任何对外接口都不收这个参数；restricted 里没有数据源、源表与映射血缘（ADR-0005）。
-// 本片总在请求里同步刷新；所有行带同一个目录版本号，增量刷新与从零重建得到的投影完全相同
+// 净差异不超过 PROJECTION_SYNC_LIMIT 时在请求里同步刷新，超过时入队 catalog.projection，由调度器结束钩子从零重建；所有行带同一个目录版本号，增量刷新与从零重建得到的投影完全相同
 import { createHash } from 'node:crypto';
 import { and, eq, inArray, max, sql } from 'drizzle-orm';
 import { cmp } from '../../lib/compare';
 import { can } from '../access';
 import type { Tx } from '../audit';
 import { getDb } from '../db/client';
-import { catalogProjection, type Role } from '../db/schema';
+import { catalogProjection, tasks, type Role } from '../db/schema';
+import { insertTask } from '../tasks';
 import { haystack, type Catalog, type CatalogEntry } from './index';
 import { tenantCatalog } from './load';
 import { catalogChangesSince, stripStats } from './versions';
+
+/** 请求里同步刷新的净差异条目数上限，超过时交给调度器任务 */
+export const PROJECTION_SYNC_LIMIT = 200;
 
 export const PROJECTION_CLASSES = ['full', 'restricted'] as const;
 export type ProjectionClass = typeof PROJECTION_CLASSES[number];
@@ -74,23 +78,36 @@ function rowsOf(c: Catalog, tenantId: string, ids?: Set<string>) {
 
 /**
  * 在已拿锁的事务里把投影从版本 now 刷到目录 c：now 为 null（还没有投影）时删掉全部行、插入两类；
- * 否则按 now 到当前的净差异只重写变了的条目，再把所有行的版本号改成 c 的版本。只供 refreshProjection、rebuildProjection 与测试用
+ * 否则按 now 到当前的净差异只重写变了的条目，再把所有行的版本号改成 c 的版本。
+ * 传了 syncLimit 时（从零重建除外）：同租户已有排队中或运行中的 catalog.projection 就不动投影；净差异条目数超过它时只入队一个，返回 queued。
+ * 只供 refreshProjection、rebuildProjection 与测试用
  */
-export async function refreshFrom(tx: Tx, tenantId: string, now: number | null, c: Catalog): Promise<void> {
+export async function refreshFrom(tx: Tx, tenantId: string, now: number | null, c: Catalog, opts: { syncLimit?: number } = {}): Promise<'refreshed' | 'queued'> {
   if (now === null) {
     await tx.delete(catalogProjection).where(eq(catalogProjection.tenantId, tenantId));
     const rows = rowsOf(c, tenantId);
     if (rows.length) await tx.insert(catalogProjection).values(rows);
-    return;
+    return 'refreshed';
+  }
+  const { syncLimit } = opts;
+  if (syncLimit !== undefined) {
+    const [pending] = await tx.select({ id: tasks.id }).from(tasks)
+      .where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'catalog.projection'), inArray(tasks.status, ['queued', 'running']))).limit(1);
+    if (pending) return 'queued';
   }
   const { net } = await catalogChangesSince(tx, tenantId, now);
   const ids = new Set([...net.added, ...net.changed, ...net.removed].map(x => x.id));
+  if (syncLimit !== undefined && ids.size > syncLimit) {
+    await insertTask(tx, tenantId, 'catalog.projection');
+    return 'queued';
+  }
   if (ids.size) {
     await tx.delete(catalogProjection).where(and(eq(catalogProjection.tenantId, tenantId), inArray(catalogProjection.entryId, [...ids])));
     const rows = rowsOf(c, tenantId, ids);
     if (rows.length) await tx.insert(catalogProjection).values(rows);
   }
   await tx.update(catalogProjection).set({ catalogVersion: c.version ?? 0 }).where(eq(catalogProjection.tenantId, tenantId));
+  return 'refreshed';
 }
 
 /** 从零重建：按当前目录删掉该租户的全部投影行、重新插入两类 */
@@ -104,18 +121,17 @@ export async function rebuildProjection(tenantId: string): Promise<void> {
 
 /**
  * 把投影刷到当前目录版本：已是最新返回 fresh；否则在锁里重读投影版本，按它刷新（还没有投影时从零重建）。
- * 版本号用 tenantCatalog 返回的那个（目录只会比它新，下一轮会收敛）
+ * 版本号用 tenantCatalog 返回的那个（目录只会比它新，下一轮会收敛）。净差异超过 syncLimit 或已有刷新任务时返回 queued（见 refreshFrom）
  */
-export async function refreshProjection(tenantId: string): Promise<'fresh' | 'refreshed'> {
+export async function refreshProjection(tenantId: string, { syncLimit = PROJECTION_SYNC_LIMIT }: { syncLimit?: number } = {}): Promise<'fresh' | 'refreshed' | 'queued'> {
   const db = getDb();
   const v = await projectionVersion(db, tenantId);
   const c = await tenantCatalog(tenantId);
   if (v === (c.version ?? 0)) return 'fresh';
-  await db.transaction(async tx => {
+  return db.transaction(async tx => {
     await lock(tx, tenantId);
     const now = await projectionVersion(tx, tenantId);
-    if (now !== null && now >= (c.version ?? 0)) return;
-    await refreshFrom(tx, tenantId, now, c);
+    if (now !== null && now >= (c.version ?? 0)) return 'refreshed';
+    return refreshFrom(tx, tenantId, now, c, { syncLimit });
   });
-  return 'refreshed';
 }
