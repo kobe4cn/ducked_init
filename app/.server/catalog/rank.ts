@@ -3,6 +3,7 @@
 // 作用域只加权不排除：成员这次明确说的（scope.subjects、scope.spaceIds、查询里出现的主题名）> 页面上下文 > 对话里已确定的主题 > 成员所属空间，
 // 一个条目只取命中的最高一级；不命中作用域的不扣分、不去掉。纯函数，不读库；能力条目不特殊处理，由调用方过滤
 import { cmp } from '../../lib/compare';
+import { expand } from './expand';
 import { terms, type Catalog, type CatalogEntry } from './index';
 import type { ProjectionRow } from './projection';
 
@@ -13,7 +14,8 @@ export const LANE_LIMIT = 30;
 export const SCOPE_BOOST = { explicit: 1, page: 0.5, conversation: 0.25, member: 0.1 } as const;
 
 export type Lane = keyof typeof LANE_WEIGHTS;
-export interface HitReason { lane: Lane; matched: string[] }
+/** expand 是依赖展开补进来的（expand.ts），不是一路召回，不进 LANE_WEIGHTS */
+export interface HitReason { lane: Lane | 'expand'; matched: string[] }
 export interface Ranked { entry: CatalogEntry; score: number; reasons: HitReason[] }
 /** 作用域：page / conversation 先留接口 */
 export interface RankScope {
@@ -88,11 +90,11 @@ export function rank(rows: ProjectionRow[], c: Catalog, query: string, scope: Ra
     return 0;
   };
 
-  return present
+  const direct = present
     .flatMap(({ row, entry }) => {
       const f = fused.get(row.entryId);
       return f ? [{ entry, score: f.score * (1 + boost(row)), reasons: f.reasons }] : [];
     })
-    .sort((a, b) => b.score - a.score || cmp(a.entry.id, b.entry.id))
-    .slice(0, limit);
+    .sort((a, b) => b.score - a.score || cmp(a.entry.id, b.entry.id));
+  return expand(direct, present, c, query, limit);
 }

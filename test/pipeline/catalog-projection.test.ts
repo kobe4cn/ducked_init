@@ -1,6 +1,6 @@
 // test/pipeline/catalog-projection.test.ts —— 目录检索投影（ADR-0047）的接缝：refreshProjection / rebuildProjection → catalog_projection。
 // 一串目录变化后逐版增量刷新与从零重建得到的投影完全相同；两类投影的条目集合与 catalogFor 一致、restricted 不带数据源、源表与映射血缘的文字；
-// catalog_search 先在请求里把投影刷到最新目录版本，在投影上排序并带命中理由；差异超过阈值时只入队一个 catalog.projection，任务成功后重建；投影不可用时回退到实时目录搜索
+// catalog_search 先在请求里把投影刷到最新目录版本，在投影上排序并带命中理由（带窗口词时有依赖展开）；差异超过阈值时只入队一个 catalog.projection，任务成功后重建；投影不可用时回退到实时目录搜索
 import { and, asc, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { catalogFor, runTool } from '../../app/.server/assistant/tools';
@@ -185,6 +185,9 @@ describe('检索投影', () => {
     await addAlias(analyst, { targetId: 'metric:refund_count', alias: 'RefundCnt' });
     const ascii = await runTool(viewer, 'catalog_search', { query: 'refundcnt' });
     expect(ascii).toContain('命中：别名「RefundCnt」');
+    // 带窗口词：补上锚点实体的时间字段，理由是依赖展开
+    const window = await runTool(viewer, 'catalog_search', { query: '近 7 天退单量' });
+    expect(window).toMatch(/命中：依赖展开「entity:\w+ 的时间字段」/);
   });
 
   it('投影不可用时回退到实时目录搜索、不带理由：刷新抛错、投影版本不等于目录版本、排序抛错', async () => {

@@ -17,11 +17,10 @@ const VIEWS = { full: view('full'), restricted: view('restricted') };
 
 export interface Retrieved { top: string[]; hits: number; ambiguous: boolean }
 
-/** 一条的检索结果：前 20（先去掉能力说明，与 model-draft 的 relevantMarkdown 一致）、命中的候选数与歧义判定 */
+/** 一条的检索结果：前 20（排序前先去掉能力说明的投影行，与 model-draft 的 relevantMarkdown 一致：否则能力说明占着直接命中的名额，依赖展开补进来的候选会落到第 20 名之后）、命中的候选数与歧义判定 */
 export function retrieve(g: GoldenEntry): Retrieved {
   const v = VIEWS[g.role === 'viewer' ? 'restricted' : 'full'];
-  const top = rank(v.rows, v.catalog, g.retrieval.query, {}, v.catalog.entries.length)
-    .filter(r => r.entry.kind !== 'capability').slice(0, LIMIT).map(r => r.entry.id);
+  const top = rank(v.rows.filter(r => !r.entryId.startsWith('capability:')), v.catalog, g.retrieval.query, {}, LIMIT).map(r => r.entry.id);
   const hits = g.retrieval.candidates.filter(id => top.includes(id)).length;
   // rank() 不判歧义（留给 ⑨）
   const ambiguous = false;

@@ -12,7 +12,7 @@ import type { CurrentMember } from '../auth';
 import { expand, overview, toMarkdown, type Catalog } from '../catalog';
 import { tenantCatalog } from '../catalog/load';
 import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
-import type { HitReason, Lane } from '../catalog/rank';
+import type { HitReason } from '../catalog/rank';
 import { getDb } from '../db/client';
 import { dslDefinitions, mappings, spaces } from '../db/schema';
 import { createDefinition, DslError, saveDslDraft, validateDefinition } from '../dsl-definitions';
@@ -45,9 +45,9 @@ export const catalogFor = async (member: CurrentMember): Promise<Catalog> =>
 
 const TEXT = { type: 'string' };
 
-const LANE_NAMES: Record<Lane, string> = { id: '标识', alias: '别名', name: '名称', keyword: '关键词' };
+const LANE_NAMES: Record<HitReason['lane'], string> = { id: '标识', alias: '别名', name: '名称', keyword: '关键词', expand: '依赖展开' };
 
-/** 命中理由一行：「命中：别名「GMV」；关键词「营收」、「30天」」 */
+/** 命中理由一行：「命中：别名「GMV」；关键词「营收」、「30天」」，补召回的是「依赖展开「entity:order 的时间字段」」 */
 const hitLine = (reasons: HitReason[]) =>
   `命中：${reasons.map(r => LANE_NAMES[r.lane] + r.matched.map(m => `「${m}」`).join('、')).join('；')}`;
 
