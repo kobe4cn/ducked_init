@@ -33,9 +33,14 @@ const ordered = (hits: LaneHit[]) => hits
   .sort((a, b) => b.score - a.score || cmp(a.entryId, b.entryId))
   .slice(0, LANE_LIMIT);
 
-/** 文字列表里出现在 q 中的那些（q 已小写），按长度降序；分是最长的长度 */
+/** 文字列表里出现在 q 中的那些（q 已小写，比较不分大小写），matched 放原文、按小写去重、按长度降序；分是最长的长度 */
 function contained(entryId: string, texts: string[], q: string): LaneHit {
-  const matched = [...new Set(texts.map(t => t.toLowerCase()).filter(t => t && q.includes(t)))].sort((a, b) => b.length - a.length);
+  const seen = new Map<string, string>();
+  for (const t of texts) {
+    const lower = t.toLowerCase();
+    if (lower && q.includes(lower) && !seen.has(lower)) seen.set(lower, t);
+  }
+  const matched = [...seen.values()].sort((a, b) => b.length - a.length);
   return { entryId, score: matched[0]?.length ?? 0, matched };
 }
 
