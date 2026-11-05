@@ -10,6 +10,7 @@ import { parse } from 'yaml';
 import { assertCan, can, type Permission } from '../access';
 import type { CurrentMember } from '../auth';
 import { expand, overview, toMarkdown, type Catalog } from '../catalog';
+import { judgeAmbiguity, type AmbiguityGroup } from '../catalog/ambiguity';
 import { tenantCatalog } from '../catalog/load';
 import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
 import type { HitReason } from '../catalog/rank';
@@ -50,6 +51,15 @@ const LANE_NAMES: Record<HitReason['lane'], string> = { id: '标识', alias: '�
 /** 命中理由一行：「命中：别名「GMV」；关键词「营收」、「30天」」，补召回的是「依赖展开「entity:order 的时间字段」」 */
 const hitLine = (reasons: HitReason[]) =>
   `命中：${reasons.map(r => LANE_NAMES[r.lane] + r.matched.map(m => `「${m}」`).join('、')).join('；')}`;
+
+/** 一个歧义组的口径对比段：标题、维度 × 候选的表（只列不同的维度）、每句追问一行 */
+const comparison = (g: AmbiguityGroup) => [
+  `## 口径对比：${g.term}`,
+  `| 维度 | ${g.candidates.join(' | ')} |`,
+  `|${' --- |'.repeat(g.candidates.length + 1)}`,
+  ...g.diffs.map(d => `| ${d.label} | ${g.candidates.map(id => d.values[id] ?? '').join(' | ')} |`),
+  ...g.questions.map(q => `追问：${q}`),
+].join('\n');
 
 const issueLines = (issues: DslIssue[]) =>
   issues.map(i => `- ${i.path || '（文档）'}（第 ${i.line} 行第 ${i.col} 列）：${i.message}`).join('\n');
@@ -101,7 +111,7 @@ export const TOOLS: AssistantTool[] = [
   },
   {
     name: 'catalog_search',
-    description: '按关键词、别名与名称搜索目录条目，返回展开后的条目与命中理由',
+    description: '按关键词、别名与名称搜索目录条目，返回展开后的条目、命中理由与歧义判定；ambiguous 为 true 时，先用给出的追问问清楚口径，再继续',
     inputSchema: {
       type: 'object', required: ['query'],
       properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 } },
@@ -111,14 +121,19 @@ export const TOOLS: AssistantTool[] = [
     permission: 'definitions:read',
     external: true,
     run: async (actor, { query, limit }) => {
-      // 在检索投影上排序（ADR-0047），作用域是查询里点名的本租户空间与成员所属空间；投影不可用时回退到实时目录搜索、不带命中理由
+      // 在检索投影上排序（ADR-0047），排序与歧义判定用同一份可见目录，作用域是查询里点名的本租户空间与成员所属空间；投影不可用时回退到实时目录搜索、不带命中理由
       const q = query as string;
       const spaceIds = (await getDb().select({ id: spaces.id, name: spaces.name }).from(spaces).where(eq(spaces.tenantId, actor.tenant.id)))
         .filter(s => q.includes(s.name)).map(s => s.id);
-      const { ranked } = await rankedSearch(actor.tenant.id, visibilityClass(actor.role), await catalogFor(actor), q,
+      const c = await catalogFor(actor);
+      const { ranked } = await rankedSearch(actor.tenant.id, visibilityClass(actor.role), c, q,
         { spaceIds, memberSpaceId: actor.space.id }, limit as number | undefined);
-      if (!ranked.length) return toMarkdown([]);
-      return ranked.map(r => r.reasons.length ? `${toMarkdown(r.entry)}\n${hitLine(r.reasons)}` : toMarkdown(r.entry)).join('\n\n');
+      // 回退时得分全为 0，照样判定（一律按差异追问）
+      const { ambiguous, groups } = judgeAmbiguity(ranked, c, q);
+      const entries = ranked.length
+        ? ranked.map(r => r.reasons.length ? `${toMarkdown(r.entry)}\n${hitLine(r.reasons)}` : toMarkdown(r.entry)).join('\n\n')
+        : toMarkdown([]);
+      return [`ambiguous: ${ambiguous}`, entries, ...(ambiguous ? groups.map(comparison) : [])].join('\n\n');
     },
   },
   {
