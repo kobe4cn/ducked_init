@@ -3,7 +3,7 @@
 // catalog_search 先在请求里把投影刷到最新目录版本，在投影上排序并带命中理由（带窗口词时有依赖展开）；差异超过阈值时只入队一个 catalog.projection，任务成功后重建；投影不可用时回退到实时目录搜索
 import { and, asc, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { catalogFor, runTool } from '../../app/.server/assistant/tools';
+import { catalogFor, runTool, TOOLS } from '../../app/.server/assistant/tools';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { projectionVersion, rankedSearch, rebuildProjection, refreshFrom, refreshProjection } from '../../app/.server/catalog/projection';
 import * as rankModule from '../../app/.server/catalog/rank';
@@ -188,6 +188,32 @@ describe('检索投影', () => {
     // 带窗口词：补上锚点实体的时间字段，理由是依赖展开
     const window = await runTool(viewer, 'catalog_search', { query: '近 7 天退单量' });
     expect(window).toMatch(/命中：依赖展开「entity:\w+ 的时间字段」/);
+  });
+
+  it('catalog_search 判出歧义：第一行 ambiguous: true，附口径对比表（只列不同的维度）与追问；点名支付时间后只剩一个候选，ambiguous: false、没有口径对比', async () => {
+    const { reviewer, analyst, viewer } = await setup();
+    const windowed = (field: string) => `${REVENUE}window: { field: ${field}, days: 30 }\n`;
+    for (const [key, field] of [['created_revenue', 'created_at'], ['paid_revenue', 'paid_at']]) {
+      await createDefinition(analyst, 'metric', key, windowed(field));
+      await publishDefinition(reviewer, 'metric', key, 1);
+      await addAlias(analyst, { targetId: `metric:${key}`, alias: '成交额' });
+    }
+    const out = await runTool(viewer, 'catalog_search', { query: '成交额' });
+    const lines = out.split('\n');
+    expect(lines.slice(0, 2)).toEqual(['ambiguous: true', '']);
+    expect(out).toContain('## 口径对比：成交额');
+    const table = lines.filter(l => l.startsWith('| '));
+    expect(table[0]).toMatch(/^\| 维度 \| metric:(created|paid)_revenue \| metric:(created|paid)_revenue \|$/);
+    expect(table.some(l => l.startsWith('| 时间字段 |'))).toBe(true);
+    expect(table.some(l => l.startsWith('| 窗口 |'))).toBe(false);
+    expect(lines.some(l => l.startsWith('追问：'))).toBe(true);
+
+    const paid = (await catalogFor(viewer)).entries.find(e => e.id === 'field:order.paid_at')!.name;
+    const named = await runTool(viewer, 'catalog_search', { query: `按${paid}算的成交额` });
+    expect(named.split('\n')[0]).toBe('ambiguous: false');
+    expect(named).not.toContain('口径对比');
+    // 工具描述要求模型拿到 ambiguous: true 后先追问
+    expect(TOOLS.find(t => t.name === 'catalog_search')!.description).toContain('ambiguous 为 true 时，先用给出的追问问清楚口径，再继续');
   });
 
   it('投影不可用时回退到实时目录搜索、不带理由：刷新抛错、投影版本不等于目录版本、排序抛错', async () => {
