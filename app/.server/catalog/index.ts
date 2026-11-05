@@ -129,6 +129,10 @@ export interface MetricEntry extends Base {
   /** 度量，如 sum(amount)、ratio(count / count) */
   measure: string;
   dimensions: string[];
+  /** 时间窗口（DSL 原样，field 可以是 a.b -> c.d 的路径）；没有窗口时没有。歧义判定比较用（ambiguity.ts），不进检索文字 */
+  window?: { field: string; days: number };
+  /** 基础实体字段上的过滤（DSL 原样）；没有过滤时没有。歧义判定比较用（ambiguity.ts），不进检索文字 */
+  filter?: MetricSpec['filter'];
   dependencies: DefinitionDependencies;
   /** 系统事实：从 DSL 确定性生成的口径文字（knowledge/derive.ts） */
   system: SystemFacts;
@@ -382,6 +386,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
       entries.push({
         kind: 'metric', id: metricId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version, spaceId: d.spaceId,
         base: entityId(spec.base), measure: measureText(spec.measure), dimensions: (spec.dimensions ?? []).map(x => x.name),
+        ...(spec.window && { window: { field: spec.window.field, days: spec.window.days } }), ...(spec.filter?.length && { filter: spec.filter }),
         dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)), system: { text: metricText(spec), claims: metricClaims(spec) }, ...knowledgeOf(metricId(d.key)),
       });
     } else {

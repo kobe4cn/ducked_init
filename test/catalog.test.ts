@@ -268,7 +268,7 @@ describe('语义目录', () => {
     const c = buildCatalog(withDefinitions());
     expect(expand(c, 'metric:revenue')).toEqual({
       kind: 'metric', id: 'metric:revenue', name: 'revenue', description: '已支付订单的消费金额', key: 'revenue', version: 2, spaceId: SPACE,
-      base: 'entity:order', measure: 'sum(amount)', dimensions: [],
+      base: 'entity:order', measure: 'sum(amount)', dimensions: [], filter: [{ field: 'status', op: 'eq', value: 'paid' }],
       dependencies: { metrics: [], entities: ['entity:order'], fields: ['field:order.amount', 'field:order.status'] },
       system: {
         text: '订单中 status 等于 paid的行，amount 求和',
