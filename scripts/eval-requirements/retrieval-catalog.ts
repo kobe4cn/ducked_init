@@ -1,7 +1,7 @@
 // scripts/eval-requirements/retrieval-catalog.ts —— 检索黄金集的固定目录（#317，ADR-0047）：在需求评测的目录输入（CATALOG_INPUT）上
 // 加几组近义的指标与标签（同为「营收」却按下单 / 支付时间、含不含退款、按订单还是明细金额；同为「客单价」「活跃次数」「下单次数」口径不同），
 // 再加两个数据源与几张源表（有 source: / table: 条目，供跨角色可见性的条目用），并给 GMV、沉睡、购买频次、PV、地区、VIP、触达渠道的「渠道」与近义组的销售额、营收、客单价、活跃次数、积分挂上别名知识（指标名称是键名，中文只能靠别名命中）。
-// 「营收」与「渠道」在 #400 修好 rank() 的别名同分排序后挂回
+// 「营收」与「渠道」由 #400 挂回（rank() 别名一路同分按别名以外的关键词命中数排、被更长名称覆盖的别名出现不算）
 // 不改 PUBLISHED_METRICS：模型评测的上下文保持不变。纯函数构造，不连库
 import { buildCatalog } from '../../app/.server/catalog';
 import type { DslKind } from '../../app/.server/pipeline/dsl';
