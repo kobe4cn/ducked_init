@@ -14,10 +14,10 @@ import { createDefinition, publishDefinition } from '../../app/.server/dsl-defin
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
-import { confirmWatermark, registerSource, relistSource } from '../../app/.server/sources';
-import { memberOf, mergeUnchecked, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
+import { confirmWatermark, getSource, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
+import { memberOf, mergeUnchecked, newTenant, publish } from '../pipeline/fixtures';
 import { fakeLlm, json, platformDefault } from '../pipeline/llm-fixtures';
-import { grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
+import { drainUntilSucceeded, grantOnSource, pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { mappingTemplate } from '../../app/.server/pipeline/mapping-spec';
 import { entityOf } from '../../app/lib/canonical-model';
 import { referenceTables } from '../../app/.server/mappings';
@@ -42,9 +42,15 @@ async function tenantWithSource(slug: string, sql?: string) {
   const input = await pgSourceInput(READER);
   if (sql) await grantOnSource(sql);
   const { id } = await registerSource(engineer, input);
-  await selectAllTables(engineer, id);
-  await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+  await profileAllTables(engineer, id, slug);
   return { tenantId, sourceId: id };
+}
+
+/** 把数据源的可读表全部选入同步范围并采集完。采集任务偶尔因连不上源库失败（#403，同 #360），检查状态、失败就重新采集 */
+async function profileAllTables(member: Awaited<ReturnType<typeof memberOf>>, sourceId: string, name: string) {
+  const { listing } = await getSource(member, sourceId);
+  const { task } = await setSyncScope(member, sourceId, { add: listing.filter(t => t.readable && !t.gone).map(t => t.name) });
+  await drainUntilSucceeded(name, task, () => relistSource(member, sourceId));
 }
 
 const ORDERS = `model: 1
@@ -78,7 +84,10 @@ function modelReplies(content: unknown) {
   fakeLlm(f => app.setLlmFetch(f), () => json(content));
 }
 
-const mappingIdOf = (res: Response) => res.headers.get('Location')!.match(/^\/mappings\/([0-9a-f-]{36})$/)![1];
+const mappingIdOf = (res: Response) => {
+  expect(res.status).toBe(302);
+  return res.headers.get('Location')!.match(/^\/mappings\/([0-9a-f-]{36})$/)![1];
+};
 
 /** 单次请求的 .data 接口提交表单，解出 action 的返回值 */
 async function actionData(client: Client, path: string, form: Record<string, string>) {
@@ -479,8 +488,7 @@ describe('编写与发布映射', () => {
     const tenantId = await newTenant('solo');
     const admin = await memberOf(tenantId, 'admin@solo.com', 'admin');
     const { id: sourceId } = await registerSource(admin, await pgSourceInput(READER));
-    await selectAllTables(admin, sourceId);
-    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    await profileAllTables(admin, sourceId, 'solo');
     const browser = await loginAs(app, 'admin@solo.com');
     const id = mappingIdOf(await browser.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
 
@@ -796,8 +804,7 @@ describe('按规则生成映射草稿', () => {
     const author = await memberOf(tenantId, 'de@acme.com');
     const published = await publish(author, await memberOf(tenantId, 'de2@acme.com'), sourceId, ORDERS);
     const { id: shop2 } = await registerSource(author, await pgSourceInput(READER, '门店2'));
-    await selectAllTables(author, shop2);
-    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    await profileAllTables(author, shop2, '门店2');
     modelReplies({ fields: [] });
     const engineer = await loginAs(app, 'de@acme.com');
 
