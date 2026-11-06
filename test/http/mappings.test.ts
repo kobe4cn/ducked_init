@@ -11,6 +11,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappingGenerations } from '../../app/.server/db/schema';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
+import type { CurrentMember } from '../../app/.server/auth';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
@@ -47,7 +48,7 @@ async function tenantWithSource(slug: string, sql?: string) {
 }
 
 /** 把数据源的可读表全部选入同步范围并采集完。采集任务偶尔因连不上源库失败（#403，同 #360），检查状态、失败就重新采集 */
-async function profileAllTables(member: Awaited<ReturnType<typeof memberOf>>, sourceId: string, name: string) {
+async function profileAllTables(member: CurrentMember, sourceId: string, name: string) {
   const { listing } = await getSource(member, sourceId);
   const { task } = await setSyncScope(member, sourceId, { add: listing.filter(t => t.readable && !t.gone).map(t => t.name) });
   await drainUntilSucceeded(name, task, () => relistSource(member, sourceId));
