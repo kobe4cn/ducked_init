@@ -54,7 +54,7 @@ describe('分析计划校验 validatePlan()：结构', () => {
     const clarify = check(planOf(undefined, { mode: 'clarify', questions: [] }));
     expect(clarify.status).toBe('invalid');
     expect(clarify.plan).toBeNull();
-    expect(clarify.issues.some(i => i.message === '不能为空' && (i.path === 'questions' || i.message.includes('questions')))).toBe(true);
+    expect(clarify.issues.some(i => i.path === 'questions' && i.message === '不能为空')).toBe(true);
 
     const unsupported = check(planOf(undefined, { mode: 'unsupported' }));
     expect(unsupported.status).toBe('invalid');
