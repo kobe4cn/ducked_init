@@ -210,26 +210,45 @@ const sandboxFor = (env: Record<string, string>) => podman({ env: { ...claudeEnv
 // Host helpers
 // ---------------------------------------------------------------------------
 
-const sh = (cmd: string, args: string[]) =>
-  execFileSync(cmd, args, { encoding: "utf8" }).trim();
-
-const trySh = (cmd: string, args: string[]) => {
+// 宿主机命令一律带超时：2026-11-07 机器睡眠醒来后一个 git fetch 挂了一个多小时不返回，整个运行停在那里。
+// 超时抛的错带 TIMEOUT_TEXT，被 TRANSIENT 认作临时错误。
+const SH_TIMEOUT_MS = 10 * 60_000;
+const GIT_REMOTE_TIMEOUT_MS = 5 * 60_000;
+const TIMEOUT_TEXT = "命令超时";
+const sh = (cmd: string, args: string[], timeout = SH_TIMEOUT_MS) => {
   try {
-    return { ok: true as const, out: sh(cmd, args) };
+    return execFileSync(cmd, args, { encoding: "utf8", timeout, killSignal: "SIGKILL" }).trim();
   } catch (e) {
-    return { ok: false as const, out: String((e as { stderr?: unknown }).stderr ?? e) };
+    if ((e as { code?: unknown }).code === "ETIMEDOUT") throw new Error(`${TIMEOUT_TEXT}（${timeout / 1000} 秒）：${cmd} ${args.join(" ").slice(0, 200)}`);
+    throw e;
+  }
+};
+
+const trySh = (cmd: string, args: string[], timeout?: number) => {
+  try {
+    return { ok: true as const, out: sh(cmd, args, timeout) };
+  } catch (e) {
+    return { ok: false as const, out: String((e as { stderr?: unknown }).stderr || e) };
   }
 };
 
 // 连远端的 git（fetch / push）偶尔撞上 SSH、DNS、网络抖动（2026-11-04 一次
 // `Permission denied (publickey)` 让 #390 落地失败、下一轮开头的 fetch 直接让进程崩了）。
 // 这类错误等一会儿重试，最多等约半小时；被拒（non-fast-forward、lease 过期）之类的照常立即失败。
-const REMOTE_TRANSIENT = /Permission denied \(publickey\)|Could not read from remote repository|Could not resolve host|Connection (timed out|reset|refused|closed)|Operation timed out|Network is unreachable|early EOF|unexpected disconnect|kex_exchange_identification|ssh_exchange_identification|unable to access|RPC failed|HTTP 5\d\d/;
+const REMOTE_TRANSIENT = new RegExp(
+  [
+    "Permission denied \\(publickey\\)", "Could not read from remote repository", "Could not resolve host",
+    "Connection (timed out|reset|refused|closed)", "Operation timed out", "Network is unreachable", "early EOF",
+    "unexpected disconnect", "kex_exchange_identification", "ssh_exchange_identification", "unable to access",
+    "RPC failed", "HTTP 5\\d\\d", "ETIMEDOUT", "ECONNRESET", "EAI_AGAIN", "TLS handshake timeout", TIMEOUT_TEXT,
+  ].join("|"),
+  "i",
+);
 const REMOTE_RETRY_WAITS_MS = [30_000, 60_000, 120_000, 300_000, 600_000, 900_000];
 
 async function gitRemote(args: string[]) {
   for (let attempt = 0; ; attempt++) {
-    const result = trySh("git", args);
+    const result = trySh("git", args, GIT_REMOTE_TIMEOUT_MS);
     const wait = REMOTE_RETRY_WAITS_MS[attempt];
     if (result.ok || wait === undefined || !REMOTE_TRANSIENT.test(result.out)) return result;
     console.warn(`  ⚠ git ${args.join(" ")} 连不上远端（${result.out.split("\n")[0].slice(0, 160)}），${wait / 1000} 秒后重试（第 ${attempt + 1}/${REMOTE_RETRY_WAITS_MS.length} 次）`);
@@ -242,6 +261,26 @@ async function gitRemoteOrThrow(args: string[]) {
   const result = await gitRemote(args);
   if (!result.ok) throw new Error(`git ${args.join(" ")} 失败：${result.out.slice(0, 500)}`);
   return result.out;
+}
+
+// 沙箱和落地里的临时错误（2026-11-07 机器睡眠醒来后：复制 node_modules 到工作区超过 60 秒、
+// GitHub API 读超时）不直接打 stuck：等一会儿整步重跑。build 在原分支上重跑，implementer 会接着已有提交做；
+// land 开头会查 issue 是否已关、PR 是否已开，重跑最多多出一条评论。
+const TRANSIENT = new RegExp(`${REMOTE_TRANSIENT.source}|CopyToWorktreeTimeoutError|timed out`, "i");
+const TRANSIENT_RETRY_WAITS_MS = [60_000, 300_000, 900_000];
+
+async function retryTransient<T>(what: string, fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const message = String((e as { stderr?: unknown }).stderr || e);
+      const wait = TRANSIENT_RETRY_WAITS_MS[attempt];
+      if (wait === undefined || !TRANSIENT.test(message)) throw e;
+      console.warn(`  ⚠ ${what} 撞上临时错误（${message.split("\n")[0].slice(0, 160)}），${wait / 1000} 秒后重跑（第 ${attempt + 1}/${TRANSIENT_RETRY_WAITS_MS.length} 次）`);
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  }
 }
 
 /**
@@ -1067,7 +1106,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // Phase 2: Build
   // 撞上限额的票等重置后在原分支上重跑，不打 stuck。
   const settled = await Promise.allSettled(
-    issues.map((issue) => untilAfterLimit(`#${issue.id}`, () => build(issue), () => pushIfAhead(issue))),
+    issues.map((issue) => untilAfterLimit(`#${issue.id}`, () => retryTransient(`#${issue.id}`, () => build(issue)), () => pushIfAhead(issue))),
   );
 
   // Phase 3: Land —— 在宿主机上逐个做：用宿主机的 git / gh 凭据，沙箱没有写仓库的权限。
@@ -1075,7 +1114,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   for (const [i, outcome] of settled.entries()) {
     const issue = issues[i]!;
     try {
-      await land(issue, outcome);
+      await retryTransient(`落地 #${issue.id}`, () => land(issue, outcome));
     } catch (e) {
       const reason = String((e as { stderr?: unknown }).stderr || e).trim().slice(0, 500);
       console.error(`  ✗ #${issue.id} 落地出错：${reason}`);
