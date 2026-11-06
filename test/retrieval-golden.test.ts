@@ -13,10 +13,7 @@ import { EXTRA_DEFINITIONS, RETRIEVAL_CATALOG } from '../scripts/eval-requiremen
 const BASELINE = 0.96;
 
 /** rank() 与歧义判定做不到的条目与原因 */
-const NO_REVENUE_ALIAS = '营收指标没挂「营收」别名：挂上后别名一路同分按标识排，item-revenue-30d 等条目的第 1 名会变成近义项，由 #400 修 rank() 后挂回；不挂时名称路命不中中文，凑不成组';
 const KNOWN_GAPS = new Map<string, string>([
-  ['revenue-ambiguous', NO_REVENUE_ALIAS],
-  ['revenue-yoy', NO_REVENUE_ALIAS],
   ['churn-forecast', '「流失」没有出现在任何说明里，days_since_last_order 没进前 20'],
   ['pv-7d-alias', '锚点投票：前 5 名里 order 与 consent 各两票（「近」的关键词命中），event 只有 event_type 一票、不是锚点，依赖展开没补 event.occurred_at'],
 ]);

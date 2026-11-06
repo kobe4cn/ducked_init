@@ -1,6 +1,7 @@
 // test/catalog-rank.test.ts —— 检索排序 rank()（ADR-0047）：纯函数，手工构造 CatalogInput。两个指标用同一个别名、挂在不同主题与不同空间，
 // 另一个指标只有说明里有这个词：别名命中排在只有正文命中的前面；不给作用域、只给 memberSpaceId 时分数等于按常量算的 RRF；
 // 查询里说了主题名、scope.subjects 或 scope.spaceIds 给了其中一个时它排第一，另一个仍在结果里。
+// 别名一路同分时按别名以外的文字里的关键词命中数排；别名出现被别的条目更长的名称命中覆盖时不算（#400）。
 // 依赖展开（expand.ts）：带「近 7 天」时补锚点实体的时间字段，「每个城市」补锚点到 customer 的关系，都标 expand、排在直接命中之后；两种词都没有时与不截断的结果的前 limit 个相同
 import { describe, expect, it } from 'vitest';
 import { buildCatalog, type CatalogInput } from '../app/.server/catalog';
@@ -94,5 +95,45 @@ describe('检索排序 rank()', () => {
       expect(r, q).toEqual(rank(rows, c, q, {}, 10_000).slice(0, 5));
       expect(r.flatMap(x => x.reasons).filter(h => h.lane === 'expand'), q).toEqual([]);
     }
+  });
+
+  it('别名一路同分时按关键词命中数排，不按标识：三个指标同挂「营收」，关键词命中多的在前', () => {
+    const tie = buildCatalog({
+      definitions: [
+        metric('aaa', '金额合计', SPACE_A),
+        metric('mmm', '门店金额合计', SPACE_A),
+        metric('zzz', '门店营收金额', SPACE_A),
+      ],
+      knowledge: { byTarget: new Map(['metric:aaa', 'metric:mmm', 'metric:zzz'].map(id => [id, { aliases: ['营收'] }])) },
+    });
+    const r = rank(deriveProjection(tie, 'full'), tie, '门店营收');
+    expect(r.map(x => x.entry.id).slice(0, 3)).toEqual(['metric:zzz', 'metric:mmm', 'metric:aaa']);
+    // 关键词：zzz 命中 门店 / 店营 / 营收，mmm 命中 门店 / 营收，aaa 只命中 营收（与只命中「门店」的 order.channel、order.store_id 同分，按标识排第 5）
+    expect(r[0]!.score).toBeCloseTo(rrf(LANE_WEIGHTS.alias, 1) + rrf(LANE_WEIGHTS.keyword, 1), 12);
+    expect(r[2]!.score).toBeCloseTo(rrf(LANE_WEIGHTS.alias, 3) + rrf(LANE_WEIGHTS.keyword, 5), 12);
+  });
+
+  it('别名一路的次级比较不算别名本身带来的关键词：只靠别名带上「营收」的条目不多占一票', () => {
+    const tie = buildCatalog({
+      definitions: [metric('aaa', '门店营', SPACE_A), metric('zzz', '门店营收', SPACE_A)],
+      knowledge: { byTarget: new Map(['metric:aaa', 'metric:zzz'].map(id => [id, { aliases: ['营收'] }])) },
+    });
+    const r = rank(deriveProjection(tie, 'full'), tie, '门店营收');
+    // 连别名算，两个都命中 门店 / 店营 / 营收，关键词一路按标识 aaa 在前；别名以外 aaa 只命中 门店 / 店营，别名一路 zzz 在前
+    expect(r.map(x => x.entry.id).slice(0, 2)).toEqual(['metric:zzz', 'metric:aaa']);
+    expect(r[0]!.score).toBeCloseTo(rrf(LANE_WEIGHTS.alias, 1) + rrf(LANE_WEIGHTS.keyword, 2), 12);
+  });
+
+  it('别名出现被别的条目更长的名称命中覆盖时不算：order.channel 的名称「渠道」在自身说明里延长成「下单渠道」，盖住 touch.channel 的别名「渠道」', () => {
+    const ch = buildCatalog({ definitions: [], knowledge: { byTarget: new Map([['field:touch.channel', { aliases: ['渠道'] }]]) } });
+    const r = rank(deriveProjection(ch, 'full'), ch, '各下单渠道的订单数');
+    const touch = r.find(x => x.entry.id === 'field:touch.channel');
+    expect(touch?.reasons.some(h => h.lane === 'alias') ?? false).toBe(false);
+    const at = (id: string) => r.findIndex(x => x.entry.id === id);
+    expect(at('field:order.channel')).toBeGreaterThanOrEqual(0);
+    if (touch) expect(at('field:order.channel')).toBeLessThan(at('field:touch.channel'));
+    // 查询没有被更长名称覆盖时别名照常命中
+    expect(rank(deriveProjection(ch, 'full'), ch, '各渠道触达次数').find(x => x.entry.id === 'field:touch.channel')?.reasons)
+      .toContainEqual({ lane: 'alias', matched: ['渠道'] });
   });
 });
