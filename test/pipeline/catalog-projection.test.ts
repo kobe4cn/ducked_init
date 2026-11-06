@@ -203,7 +203,7 @@ describe('检索投影', () => {
     expect(lines.slice(0, 2)).toEqual(['ambiguous: true', '']);
     expect(out).toContain('## 口径对比：成交额');
     const table = lines.filter(l => l.startsWith('| '));
-    expect(table[0]).toMatch(/^\| 维度 \| metric:(created|paid)_revenue \| metric:(created|paid)_revenue \|$/);
+    expect(table[0].split('|').map(c => c.trim()).filter(Boolean).sort()).toEqual(['metric:created_revenue', 'metric:paid_revenue', '维度']);
     expect(table.some(l => l.startsWith('| 时间字段 |'))).toBe(true);
     expect(table.some(l => l.startsWith('| 窗口 |'))).toBe(false);
     expect(lines.some(l => l.startsWith('追问：'))).toBe(true);
