@@ -140,19 +140,25 @@ async function masked<T>(apiKey: string, run: () => Promise<T>): Promise<T> {
 /** 返回里的 choices[0].message，字段都没校验 */
 interface RawMessage { content?: unknown; tool_calls?: unknown }
 
-/** 发一次 /chat/completions（payload 之外补上模型名与 temperature 0），返回 choices[0].message；令牌数填进 stats */
-async function postChat(provider: LlmProvider, payload: Record<string, unknown>, stats: CallStats): Promise<RawMessage> {
-  const { baseUrl, model, apiKey } = provider;
-  if (!model) throw new LlmError('模型服务配置不完整：没有填写模型名');
-  const res = await llmFetch()(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+/** POST 一个 JSON 请求到 {baseUrl}{path}（带 Bearer Key 与超时），非 2xx 抛 LlmError（5xx 与 429 算 transient），返回解析后的 JSON，不是 JSON 时返回 null */
+async function postJson(provider: LlmProvider, path: string, payload: Record<string, unknown>): Promise<unknown> {
+  const { baseUrl, apiKey } = provider;
+  const res = await llmFetch()(`${baseUrl.replace(/\/+$/, '')}${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
-    body: JSON.stringify({ model, ...payload, temperature: 0 }),
+    body: JSON.stringify(payload),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
   // 先遮蔽再截断：Key 跨过截断处时半截 Key 就遮不住了
   if (!res.ok) throw new LlmError(`模型服务返回 HTTP ${res.status}：${maskKey(apiKey, await res.text()).slice(0, 200)}`, res.status >= 500 || res.status === 429);
-  const body = await res.json().catch(() => null) as { choices?: { message?: RawMessage }[]; usage?: CallStats['usage'] } | null;
+  return res.json().catch(() => null);
+}
+
+/** 发一次 /chat/completions（payload 之外补上模型名与 temperature 0），返回 choices[0].message；令牌数填进 stats */
+async function postChat(provider: LlmProvider, payload: Record<string, unknown>, stats: CallStats): Promise<RawMessage> {
+  if (!provider.model) throw new LlmError('模型服务配置不完整：没有填写模型名');
+  const body = await postJson(provider, '/chat/completions', { model: provider.model, ...payload, temperature: 0 }) as
+    { choices?: { message?: RawMessage }[]; usage?: CallStats['usage'] } | null;
   stats.usage = body?.usage;
   return body?.choices?.[0]?.message ?? {};
 }
@@ -160,16 +166,8 @@ async function postChat(provider: LlmProvider, payload: Record<string, unknown>,
 /** 发一次 /embeddings（body 是模型名与输入文本），按 data[].index 排好序返回每条输入的向量；usage 的 prompt_tokens 填进 stats。
  *  返回里缺某条输入的向量时算失败，不把错位的向量交给调用方 */
 async function postEmbeddings(provider: LlmProvider, texts: string[], stats: CallStats): Promise<number[][]> {
-  const { baseUrl, model, apiKey } = provider;
-  const res = await llmFetch()(`${baseUrl.replace(/\/+$/, '')}/embeddings`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
-    body: JSON.stringify({ model, input: texts }),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  // 先遮蔽再截断：Key 跨过截断处时半截 Key 就遮不住了
-  if (!res.ok) throw new LlmError(`模型服务返回 HTTP ${res.status}：${maskKey(apiKey, await res.text()).slice(0, 200)}`, res.status >= 500 || res.status === 429);
-  const body = await res.json().catch(() => null) as { data?: { index?: unknown; embedding?: unknown }[]; usage?: CallStats['usage'] } | null;
+  const body = await postJson(provider, '/embeddings', { model: provider.model, input: texts }) as
+    { data?: { index?: unknown; embedding?: unknown }[]; usage?: CallStats['usage'] } | null;
   stats.usage = body?.usage;
   const byIndex = new Map<number, number[]>();
   for (const d of body?.data ?? []) {
@@ -265,7 +263,7 @@ export const chatTools = (tenantId: string, purpose: LlmPurpose, messages: LlmMe
  * 按租户的 embedding 端点（resolveEmbeddingProvider）调 /embeddings，返回按输入顺序排好的向量，记调用日志
  * （purpose embedding、模型、条数、prompt_tokens 与耗时；不记请求文本与向量，completion_tokens 与 schema_valid 为空）。
  * 超时与网络错误和 chat 走同一套 masked（transient 的 LlmError，消息里 Key 遮掉）。
- * chat 与 embedding 都没配置时返回 null：不发请求、不记日志，调用方只走关键词检索
+ * 租户与平台都没配置 embedding 时返回 null（chat 配没配不影响）：不发请求、不记日志，调用方只走关键词检索
  */
 export async function embed(tenantId: string, texts: string[]): Promise<number[][] | null> {
   const provider = await resolveEmbeddingProvider(tenantId);
