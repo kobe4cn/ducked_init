@@ -2,6 +2,8 @@
 // 要求返回 JSON 对象并按调用方给的 JSON Schema 校验，不合格就报错，不把半成品交给调用方。
 // 端点按「租户自己的配置（platform.model_providers，Key 用租户数据密钥加密）> 平台默认（环境变量 LLM_*）」整套选取，不混用。
 // chatTools 带工具调用模型（AI 助手，ADR-0042），不要求 JSON。
+// embed（ADR-0049）走可选的 embedding 端点：租户的 embedding 三项 > 平台环境变量 LLM_EMBEDDING_*，与 chat 互不影响；
+// 都没配置时返回 null（不发请求、不记日志），调用方只走关键词检索。
 // chatJson 与 chatTools 的每次调用（成功、HTTP 失败、校验失败）都在 platform.llm_calls 记一行：用途、模型、令牌数、耗时、校验结果与错误摘要，不存提示词与返回原文；评测命令用不查库、不记日志的 callModel
 import { Ajv, type ErrorObject, type ValidateFunction } from 'ajv';
 import { eq } from 'drizzle-orm';
@@ -11,7 +13,7 @@ import { decryptForTenant } from './secrets';
 
 /** 调用的用途，记进调用日志 */
 export type LlmPurpose = 'connectivity' | 'tool_probe' | 'assistant' | 'mapping_draft' | 'metric_draft' | 'tag_draft' | 'assertion_draft'
-  | 'workbench_draft' | 'workbench_interpret';
+  | 'workbench_draft' | 'workbench_interpret' | 'embedding';
 
 /** 对话里的一条消息（OpenAI 兼容格式）：assistant 要调用工具时带 tool_calls（content 可为空串），工具结果是 role 为 tool、带 tool_call_id 的一条 */
 export interface LlmMessage {
@@ -61,6 +63,33 @@ export async function resolveProvider(tenantId: string): Promise<LlmProvider | n
     }
     case 'platform':
       return platformProvider();
+    default:
+      return null;
+  }
+}
+
+/** embedding 选哪一套（ADR-0049）：规则与 chat 的 providerSource 相同但互不影响——租户填了 embedding 端点就整套用租户的，
+ *  否则三个 LLM_EMBEDDING_* 环境变量都有才用平台默认；都没有返回 null */
+function embeddingSource(row: { embeddingBaseUrl: string | null } | undefined): LlmProvider['source'] | null {
+  if (row?.embeddingBaseUrl) return 'tenant';
+  const { LLM_EMBEDDING_BASE_URL, LLM_EMBEDDING_MODEL, LLM_EMBEDDING_API_KEY } = process.env;
+  return LLM_EMBEDDING_BASE_URL && LLM_EMBEDDING_MODEL && LLM_EMBEDDING_API_KEY ? 'platform' : null;
+}
+
+/** 平台默认的 embedding 端点、模型与 Key（环境变量 LLM_EMBEDDING_*）；只在三个变量都有时调用 */
+const platformEmbeddingProvider = (): LlmProvider =>
+  ({ baseUrl: process.env.LLM_EMBEDDING_BASE_URL!, model: process.env.LLM_EMBEDDING_MODEL!, apiKey: process.env.LLM_EMBEDDING_API_KEY!, source: 'platform' });
+
+/** 按 embeddingSource 选出的那一套端点、模型与 Key（租户的 Key 用与 chat 相同的 context 解密后返回）；都没配置返回 null */
+export async function resolveEmbeddingProvider(tenantId: string): Promise<LlmProvider | null> {
+  const [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, tenantId));
+  switch (embeddingSource(row)) {
+    case 'tenant': {
+      const apiKey = row.embeddingApiKey ? (await decryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, row.embeddingApiKey)).apiKey : '';
+      return { baseUrl: row.embeddingBaseUrl!, model: row.embeddingModel ?? '', apiKey, source: 'tenant' };
+    }
+    case 'platform':
+      return platformEmbeddingProvider();
     default:
       return null;
   }
@@ -128,6 +157,28 @@ async function postChat(provider: LlmProvider, payload: Record<string, unknown>,
   return body?.choices?.[0]?.message ?? {};
 }
 
+/** 发一次 /embeddings（body 是模型名与输入文本），按 data[].index 排好序返回每条输入的向量；usage 的 prompt_tokens 填进 stats。
+ *  返回里缺某条输入的向量时算失败，不把错位的向量交给调用方 */
+async function postEmbeddings(provider: LlmProvider, texts: string[], stats: CallStats): Promise<number[][]> {
+  const { baseUrl, model, apiKey } = provider;
+  const res = await llmFetch()(`${baseUrl.replace(/\/+$/, '')}/embeddings`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
+    body: JSON.stringify({ model, input: texts }),
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  // 先遮蔽再截断：Key 跨过截断处时半截 Key 就遮不住了
+  if (!res.ok) throw new LlmError(`模型服务返回 HTTP ${res.status}：${maskKey(apiKey, await res.text()).slice(0, 200)}`, res.status >= 500 || res.status === 429);
+  const body = await res.json().catch(() => null) as { data?: { index?: unknown; embedding?: unknown }[]; usage?: CallStats['usage'] } | null;
+  stats.usage = body?.usage;
+  const byIndex = new Map<number, number[]>();
+  for (const d of body?.data ?? []) {
+    if (typeof d?.index === 'number' && Array.isArray(d.embedding) && d.embedding.every(v => typeof v === 'number')) byIndex.set(d.index, d.embedding);
+  }
+  if (!texts.every((_, i) => byIndex.has(i))) throw new LlmError(`模型服务的返回里没有全部 ${texts.length} 条输入的向量`);
+  return texts.map((_, i) => byIndex.get(i)!);
+}
+
 /**
  * 用给定的端点调用模型，返回按 schema 校验过的 JSON。不查库、不记日志（评测命令直接用它，产品走 chatJson）。
  * 失败都抛 LlmError（消息里的 API Key 换成 ***，HTTP 错误只带状态码与前 200 字的响应体）；stats 由调用方传入时顺带填上令牌数与校验结果
@@ -175,11 +226,12 @@ export async function callTools(provider: LlmProvider, messages: LlmMessage[], t
 }
 
 /**
- * 按租户选端点（resolveProvider）后调用 call。没配置模型服务或没填模型名时直接报错、不发请求、不记日志；
- * 其余调用（成功或失败）都记日志。日志直接写平台库，不进调用方的事务：调用方回滚时调用记录也要留下
+ * 按租户选端点（resolve，默认 chat 的 resolveProvider）后调用 call。没配置模型服务或没填模型名时直接报错、不发请求、不记日志；
+ * 其余调用（成功或失败）都记日志，embedding 调用带上条数 inputCount。日志直接写平台库，不进调用方的事务：调用方回滚时调用记录也要留下
  */
-async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider: LlmProvider, stats: CallStats) => Promise<T>): Promise<T> {
-  const provider = await resolveProvider(tenantId);
+async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider: LlmProvider, stats: CallStats) => Promise<T>,
+  resolve: (tenantId: string) => Promise<LlmProvider | null> = resolveProvider, inputCount: number | null = null): Promise<T> {
+  const provider = await resolve(tenantId);
   if (!provider) throw new LlmError('未配置模型服务：请在「模型服务」页填写端点、模型与 API Key，或由平台配置默认模型服务');
   const { model } = provider;
   if (!model) throw new LlmError('模型服务配置不完整：没有填写模型名');
@@ -194,7 +246,7 @@ async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider:
     throw e;
   } finally {
     await getDb().insert(llmCalls).values({
-      tenantId, purpose, model, schemaValid: stats.schemaValid, error,
+      tenantId, purpose, model, schemaValid: stats.schemaValid, error, inputCount,
       promptTokens: stats.usage?.prompt_tokens ?? null, completionTokens: stats.usage?.completion_tokens ?? null,
       durationMs: Date.now() - started,
     }).catch(e => console.error('记录模型调用日志失败', e));
@@ -208,3 +260,17 @@ export const chatJson = <T>(tenantId: string, purpose: LlmPurpose, messages: Llm
 /** 按租户的模型服务 callTools，记调用日志（logged；schema_valid 为 null） */
 export const chatTools = (tenantId: string, purpose: LlmPurpose, messages: LlmMessage[], tools: LlmTool[]): Promise<ToolReply> =>
   logged(tenantId, purpose, (provider, stats) => callTools(provider, messages, tools, stats));
+
+/**
+ * 按租户的 embedding 端点（resolveEmbeddingProvider）调 /embeddings，返回按输入顺序排好的向量，记调用日志
+ * （purpose embedding、模型、条数、prompt_tokens 与耗时；不记请求文本与向量，completion_tokens 与 schema_valid 为空）。
+ * 超时与网络错误和 chat 走同一套 masked（transient 的 LlmError，消息里 Key 遮掉）。
+ * chat 与 embedding 都没配置时返回 null：不发请求、不记日志，调用方只走关键词检索
+ */
+export async function embed(tenantId: string, texts: string[]): Promise<number[][] | null> {
+  const provider = await resolveEmbeddingProvider(tenantId);
+  if (!provider) return null;
+  return logged(tenantId, 'embedding',
+    (p, stats) => masked(p.apiKey, () => postEmbeddings(p, texts, stats)),
+    async () => provider, texts.length);
+}

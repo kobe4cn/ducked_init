@@ -5,11 +5,23 @@ import { type Mock, vi } from 'vitest';
 
 type Usage = { prompt_tokens: number; completion_tokens: number };
 
+/** embedding 端点的答复：每个向量按出现顺序给 index（要测乱序返回时在测试里自己构造 Response）；
+ *  /embeddings 的 usage 没有 completion_tokens，这里只带 prompt_tokens（llm_calls 的 completion_tokens 为空） */
+export const embeddings = (vectors: number[][], usage?: Pick<Usage, 'prompt_tokens'>) =>
+  Response.json({ data: vectors.map((embedding, index) => ({ index, embedding })), ...(usage && { usage }) });
+
 /** 平台默认模型服务（环境变量三项都设）；不调 unstubAllEnvs */
 export function platformDefault(baseUrl = 'https://platform.example.com/v1'): void {
   vi.stubEnv('LLM_BASE_URL', baseUrl);
   vi.stubEnv('LLM_MODEL', 'qwen-plus');
   vi.stubEnv('LLM_API_KEY', 'sk-platform-secret');
+}
+
+/** 平台默认 embedding 端点（环境变量三项都设，与 chat 的互不影响）；不调 unstubAllEnvs */
+export function platformEmbedding(baseUrl = 'https://embed.example.com/v1'): void {
+  vi.stubEnv('LLM_EMBEDDING_BASE_URL', baseUrl);
+  vi.stubEnv('LLM_EMBEDDING_MODEL', 'text-embedding-v3');
+  vi.stubEnv('LLM_EMBEDDING_API_KEY', 'sk-embed-secret');
 }
 
 /** 请求体（已 JSON.parse）：常用的 messages 与 tools 带类型，其余字段（model、response_format…）不限 */
