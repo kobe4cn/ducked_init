@@ -665,12 +665,17 @@ export const dslVersions = platform.table('dsl_versions', {
 
 // 模型服务（ADR-0035）：租户自己的 OpenAI 兼容端点、模型名与 API Key（用租户数据密钥加密，context model_provider，ADR-0009）。
 // 三列都为空时用平台默认（环境变量 LLM_*）；租户配置整套生效，不与平台默认混用。
+// embedding 三列（ADR-0049）自成一套，选取规则同 chat 但互不影响：租户填了 embedding_* 就整套用租户的，
+// 否则用平台的 LLM_EMBEDDING_*，都没有时向量检索关闭；Key 用同一个 context 加密，存法同 chat 的 api_key。
 // allow_samples 打开后才把敏感列已哈希的样本行发给模型，默认只发表结构与列统计
 export const modelProviders = platform.table('model_providers', {
   tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
   baseUrl: text('base_url'),
   model: text('model'),
   apiKey: text('api_key'),
+  embeddingBaseUrl: text('embedding_base_url'),
+  embeddingModel: text('embedding_model'),
+  embeddingApiKey: text('embedding_api_key'),
   allowSamples: boolean('allow_samples').notNull().default(false),
   // 最近一次「测试连通性」的工具调用探测（AI 助手要用，ADR-0042）：结果与当时生效的端点、模型；端点或模型变了就作废
   toolsSupported: boolean('tools_supported'),
@@ -679,13 +684,15 @@ export const modelProviders = platform.table('model_providers', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
-// 模型调用日志（ADR-0035）：每次调用一行，成功、HTTP 失败与 Schema 校验失败都记。不存提示词与返回原文（里面可能有样本行）。
+// 模型调用日志（ADR-0035）：每次调用一行，成功、HTTP 失败与 Schema 校验失败都记。不存提示词与返回原文（里面可能有样本行），
+// embedding 调用（ADR-0049）也不存请求文本与向量，只记条数 input_count。
 // schema_valid 为空表示没拿到可解析的 JSON（请求失败、返回不是 JSON）
 export const llmCalls = platform.table('llm_calls', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
   purpose: text('purpose').notNull(),
   model: text('model').notNull(),
+  inputCount: integer('input_count'),
   promptTokens: integer('prompt_tokens'),
   completionTokens: integer('completion_tokens'),
   durationMs: integer('duration_ms').notNull(),
