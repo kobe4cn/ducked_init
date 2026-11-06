@@ -24,6 +24,7 @@
 //   外部 PR：别人开的、`Closes` 了 Sandcastle 票的 PR（分支不是 `sandcastle/` 开头），打回后在它的分支上
 //                    接着改：只做普通 push，不 rebase、不合并、不删分支，结果评论在 PR 上留给人合并。
 //
+// 每个阶段用哪个模型（Claude 订阅或别家的 Anthropic 兼容接口）、撞限额时换哪个：.sandcastle/models.json（models.ts）。
 // 标签状态机见 docs/agents/sandcastle.md。
 //
 // Usage: npm run run:sandcastle
@@ -36,6 +37,10 @@ import { basename, join } from "node:path";
 import { parseEnv, promisify } from "node:util";
 import * as sandcastle from "@ai-hero/sandcastle";
 import { podman } from "@ai-hero/sandcastle/sandboxes/podman";
+import {
+  AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, usageTable,
+  type AgentRun, type Phase, type UsageRecord,
+} from "./models.ts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -57,7 +62,6 @@ const REMOTE = "origin";
 const BASE_BRANCH = "main";
 // 从远端 main 建分支：上一轮合并的代码在远端，不动宿主机本地 main 的工作区。
 const BASE_REF = `${REMOTE}/${BASE_BRANCH}`;
-const MODEL = "claude-opus-5-5";
 // 只处理这几张票（逗号分隔）；不设则处理全部带 Sandcastle 标签的票。拆出来的子票不在名单里，要另外加。
 const ONLY = new Set((process.env.SANDCASTLE_ONLY ?? "").split(",").map((s) => s.trim()).filter(Boolean));
 const allowed = (id: string | number) => ONLY.size === 0 || ONLY.has(String(id).replace(/^#/, ""));
@@ -73,8 +77,23 @@ const LABEL = {
 
 // 同一会话超过预算前自动压缩；预算本身靠 prep 把票切小来保证。
 const claudeEnv = { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(CONTEXT_BUDGET) };
-const agent = (env: Record<string, string> = {}) =>
-  sandcastle.claudeCode(MODEL, { env: { ...claudeEnv, ...env } });
+
+/**
+ * 跑一次 agent 会话：阶段用哪个档案（模型、厂商）由 .sandcastle/models.json 决定，撞限额换下一个（models.ts）。
+ * 用量追加到 .sandcastle/logs/usage.jsonl，也放进 usage（落地时写进 PR）。
+ */
+async function runAgent<T extends AgentRun>(
+  phase: Phase,
+  issue: string,
+  name: string,
+  env: Record<string, string>,
+  usage: UsageRecord[],
+  fn: (agent: sandcastle.AgentProvider) => Promise<T>,
+): Promise<T> {
+  const { run, profile } = await runWithProfile(phase, name, (p) => fn(agentFor(p, { ...claudeEnv, ...env })));
+  usage.push(recordUsage(issue, phase, run, name, profile));
+  return run;
+}
 
 // ---------------------------------------------------------------------------
 // 测试依赖的服务：宿主机 apple container 里的 PG / MySQL / MongoDB / SeaweedFS，
@@ -427,7 +446,9 @@ function plan(): Issue[] {
 }
 
 /** 每次迭代结束时的上下文大小（最后一条 assistant 消息的输入 token）。 */
-const peakContext = (...runs: (sandcastle.SandboxRunResult | undefined)[]) =>
+/** implement 的几次会话合在一起（每次会话单独挑档案，分开跑）。 */
+type Sessions = { iterations: sandcastle.IterationResult[]; stdout: string; completionSignal?: string };
+const peakContext = (...runs: ({ readonly iterations: readonly sandcastle.IterationResult[] } | undefined)[]) =>
   Math.max(
     0,
     ...runs.flatMap((run) =>
@@ -643,38 +664,50 @@ async function build(issue: Issue) {
     hooks,
     copyToWorktree,
   });
+  const usage: UsageRecord[] = [];
+  const run = (phase: Phase, name: string, fn: (agent: sandcastle.AgentProvider) => Promise<sandcastle.SandboxRunResult>) =>
+    runAgent(phase, issue.id, name, env, usage, fn);
   try {
-    const implement = await sandbox.run({
-      name: `implement-${issue.id}`,
-      maxIterations: IMPLEMENT_MAX_ITERATIONS,
-      completionSignal: [COMPLETE, NEEDS_DECISION],
-      agent: agent(env),
-      promptFile: "./.sandcastle/implement-prompt.md",
-      promptArgs: { TASK_ID: issue.id, ISSUE_TITLE: issue.title, BRANCH: issue.branch },
-    });
+    // 每次会话单独挑档案：撞了限额，下一次会话就换下一个档案接着做（交接靠 issue 上的进度评论）。
+    // 档案名经环境变量 SANDCASTLE_PROFILE 给 implementer，不走 promptArgs：运行中的旧进程也会读到新提示词，多出的占位符会让它报错。
+    const implement: Sessions = { iterations: [], stdout: "" };
+    for (let session = 1; session <= IMPLEMENT_MAX_ITERATIONS && implement.completionSignal === undefined; session++) {
+      const r = await run("implement", `implement-${issue.id}-${session}`, (agent) => sandbox.run({
+        name: `implement-${issue.id}-${session}`,
+        maxIterations: 1,
+        completionSignal: [COMPLETE, NEEDS_DECISION],
+        agent,
+        promptFile: "./.sandcastle/implement-prompt.md",
+        promptArgs: { TASK_ID: issue.id, ISSUE_TITLE: issue.title, BRANCH: issue.branch },
+      }));
+      implement.iterations.push(...r.iterations);
+      implement.stdout += r.stdout;
+      implement.completionSignal = r.completionSignal;
+    }
     // 看分支上的提交，不看这次会话的：重新准备后父票只剩已完成的部分，收尾时可能不再提交。
     const ahead = Number((await sandbox.exec(`git rev-list --count ${BASE_REF}..HEAD`)).stdout.trim()) || 0;
     if (implement.completionSignal !== COMPLETE || ahead === 0) {
-      return { done: false as const, implement };
+      return { done: false as const, implement, usage };
     }
 
     const runReview = (round: number) =>
-      sandbox.run({
+      run("review", `review-${issue.id}-${round}`, (agent) => sandbox.run({
         name: `review-${issue.id}-${round}`,
         maxIterations: 1,
-        agent: agent(env),
+        agent,
         promptFile: "./.sandcastle/review-prompt.md",
         promptArgs: { TASK_ID: issue.id, BRANCH: issue.branch, ROUND: round, REVISE_MAX },
-      });
+      }));
     // reviewer 给 revise：修改意见交给新的 implementer 会话，改完再审一次。
     const reviews = [await runReview(0)];
     const revisions: { items: string; run: sandcastle.SandboxRunResult }[] = [];
     while (revisions.length < REVISE_MAX && tagged(reviews.at(-1)!.stdout, "verdict") === "revise") {
       const items = tagged(reviews.at(-1)!.stdout, "revise") ?? "（reviewer 没有列出修改意见）";
-      const run = await sandbox.run({
-        name: `revise-${issue.id}-${revisions.length + 1}`,
+      const name = `revise-${issue.id}-${revisions.length + 1}`;
+      const revise = await run("revise", name, (agent) => sandbox.run({
+        name,
         maxIterations: 1,
-        agent: agent(env),
+        agent,
         prompt: [
           `分支 ${issue.branch}（issue #${issue.id}：${issue.title}）的 review 打回了，修改意见如下。`,
           "", items, "",
@@ -684,8 +717,8 @@ async function build(issue: Issue) {
           "某条意见你判断不该改（与票冲突、要人拍板），不要改，在输出里写明哪条、为什么。",
           "最后输出 <promise>COMPLETE</promise>。",
         ].join("\n"),
-      });
-      revisions.push({ items, run });
+      }));
+      revisions.push({ items, run: revise });
       reviews.push(await runReview(revisions.length));
     }
     const review = reviews.at(-1)!;
@@ -695,10 +728,10 @@ async function build(issue: Issue) {
     let fix: sandcastle.SandboxRunResult | undefined;
     if (gateResult.exitCode !== 0) {
       // 给 implementer 一次修的机会（新会话），再跑一次门槛。
-      fix = await sandbox.run({
+      fix = await run("fix", `fix-${issue.id}`, (agent) => sandbox.run({
         name: `fix-${issue.id}`,
         maxIterations: 1,
-        agent: agent(env),
+        agent,
         prompt: [
           `分支 ${issue.branch}（issue #${issue.id}）在合并门槛上失败，摘要如下；完整日志在 /tmp/gate-typecheck.log、/tmp/gate-test.log 与重跑的 /tmp/gate-rerun.log（用 grep 看，不要整读）。测试失败的文件不超过 ${GATE_RERUN_MAX} 个时已经单独重跑过一次，仍失败才到你这里。`,
           "```", gateResult.stdout.slice(-4000), "```",
@@ -706,7 +739,7 @@ async function build(issue: Issue) {
           "如果失败与本票改动无关（偶发、环境问题）或不能确定怎么修，不要改代码，在输出里说明原因。",
           "最后输出 <promise>COMPLETE</promise>。",
         ].join("\n"),
-      });
+      }));
       gateResult = await gate();
     }
 
@@ -719,6 +752,7 @@ async function build(issue: Issue) {
       summary: tagged(review.stdout, "review-summary") ?? "（reviewer 没有给出摘要）",
       gate: { ok: gateResult.exitCode === 0, output: gateResult.stdout.slice(-3000) },
       browser: collectBrowserCheck(sandbox.worktreePath, issue.id),
+      usage,
     };
   } finally {
     await sandbox.close();
@@ -765,10 +799,11 @@ async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{
     const conflicted = rebase.exitCode !== 0;
     const chainBroken = !conflicted && (await sandbox.exec(MIGRATION_CHAIN_OK)).exitCode !== 0;
     if (conflicted || chainBroken) {
-      await sandbox.run({
+      // 用量只进 usage.jsonl：这时 PR 已经开了。
+      await runAgent("rebase", issue.id, `rebase-${issue.id}`, env, [], (agent) => sandbox.run({
         name: `rebase-${issue.id}`,
         maxIterations: 1,
-        agent: agent(env),
+        agent,
         promptFile: "./.sandcastle/rebase-prompt.md",
         promptArgs: {
           TASK_ID: issue.id,
@@ -778,7 +813,7 @@ async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{
             ? `\`git rebase ${BASE_REF}\` 停在冲突上（rebase 进行中）。`
             : `rebase 没有冲突，但本票的 drizzle 迁移没有接在 ${BASE_REF} 最新的迁移后面，需要重新生成。`,
         },
-      });
+      }));
       if ((await sandbox.exec(REBASE_STATE)).exitCode === 0) {
         await sandbox.exec("git rebase --abort");
         return { ok: false, reason: "agent 没能解决 rebase 冲突（原因见 issue 评论）。" };
@@ -823,43 +858,9 @@ async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{
 // 用量限额：等到重置后接着跑，不当成票的失败
 // ---------------------------------------------------------------------------
 
-const LIMIT_PATTERN = /hit your .*?limit/i; // claude-code 的报错，如「You've hit your 5-hour limit · resets 6:20am (UTC)」
+// 撞限额的识别、重置时间的解析和换档案在 models.ts；这里处理「这个阶段的档案都在等」：等到最早恢复的那个再从头跑。
 const LIMIT_RESUME_SLACK_MS = 2 * 60_000; // 重置时间之后再多等一会儿
 const LIMIT_FALLBACK_WAIT_MS = 30 * 60_000; // 认不出重置时间时每次等这么久再试
-
-/** 某时刻在 timeZone 里比 UTC 快多少毫秒；timeZone 不合法时抛 RangeError。 */
-function tzOffsetMs(at: number, timeZone: string) {
-  const parts = Object.fromEntries(
-    new Intl.DateTimeFormat("en-US", {
-      timeZone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric",
-    }).formatToParts(at).map((p) => [p.type, Number(p.value)]),
-  );
-  const wall = Date.UTC(parts.year!, parts.month! - 1, parts.day!, parts.hour!, parts.minute!);
-  return Math.round((wall - at) / 60_000) * 60_000;
-}
-
-/**
- * 报错里的「resets 6:20am (UTC)」→ 下一次到这个钟点的时刻；认不出返回 null。
- * 只认钟点：带日期的（每周限额）可能算早，醒来再撞上限额会重新等，代价是多一次失败的调用。
- */
-function limitResetAt(message: string, now = Date.now()): number | null {
-  const m = /resets\b.*?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)/i.exec(message);
-  if (!m) return null;
-  const hour = (Number(m[1]) % 12) + (m[3]!.toLowerCase() === "pm" ? 12 : 0);
-  const minute = Number(m[2] ?? 0);
-  const timeZone = m[4]!.trim();
-  try {
-    const today = new Date(now + tzOffsetMs(now, timeZone));
-    for (let day = 0; day <= 1; day++) {
-      const wall = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + day, hour, minute);
-      const at = wall - tzOffsetMs(wall, timeZone);
-      if (at > now) return at;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
 
 /** 分步睡：笔记本合盖时计时器会停，醒来按墙上时间判断。 */
 async function sleepUntil(at: number) {
@@ -877,11 +878,16 @@ async function untilAfterLimit<T>(what: string, fn: () => Promise<T>, onLimit?: 
       return await fn();
     } catch (e) {
       const message = String(e);
-      if (!LIMIT_PATTERN.test(message)) throw e;
+      if (!(e instanceof AllProfilesLimited) && !CLAUDE_LIMIT_PATTERN.test(message)) throw e;
       await onLimit?.();
-      const resetAt = limitResetAt(message);
-      const until = resetAt === null ? Date.now() + LIMIT_FALLBACK_WAIT_MS : resetAt + LIMIT_RESUME_SLACK_MS;
-      const why = resetAt === null ? `认不出重置时间（${message.slice(0, 200)}），` : "";
+      // AllProfilesLimited 的 until 已经含了余量。
+      let until = e instanceof AllProfilesLimited ? e.until : 0;
+      let why = "";
+      if (!(e instanceof AllProfilesLimited)) {
+        const resetAt = limitResetAt(message);
+        until = resetAt === null ? Date.now() + LIMIT_FALLBACK_WAIT_MS : resetAt + LIMIT_RESUME_SLACK_MS;
+        if (resetAt === null) why = `认不出重置时间（${message.slice(0, 200)}），`;
+      }
       console.log(`  ⏸ ${what} 撞上用量限额，${why}等到 ${new Date(until).toLocaleString()} 再接着跑`);
       await sleepUntil(until);
     }
@@ -987,7 +993,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     : "";
   const pr = await pushAndOpenPr(
     issue,
-    `## Review\n\n${result.summary}${revisionNote}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}`,
+    `## Review\n\n${result.summary}${revisionNote}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}\n\n## Usage\n\n${usageTable(result.usage)}`,
     result.browser?.shots ?? [],
   );
   reportDecisions(issue.id, pr);
@@ -1054,6 +1060,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
 
 for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
+  reloadModels(); // 每轮读一次 .sandcastle/models.json：改了配置不用重启，下一轮生效
   await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]); // 上一轮合并进远端 main 的代码
   openStates.clear();
   syncHostBase();
@@ -1073,17 +1080,17 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       continue;
     }
     console.log(`Prep #${issue.number}: ${issue.title}`);
-    await untilAfterLimit(`prep #${issue.number}`, () => sandcastle.run({
+    await untilAfterLimit(`prep #${issue.number}`, () => runAgent("prep", String(issue.number), `prep-${issue.number}`, {}, [], (agent) => sandcastle.run({
       sandbox: podman(),
       name: `prep-${issue.number}`,
       maxIterations: 1,
-      agent: agent(),
+      agent,
       promptFile: "./.sandcastle/prep-prompt.md",
       promptArgs: {
         TASK_ID: issue.number, LABEL_PICKED: LABEL.picked, LABEL_PREPPED: LABEL.prepped, LABEL_STUCK: LABEL.stuck,
         REPREP_MARK,
       },
-    }));
+    })));
   }
 
   // Phase 1: Plan

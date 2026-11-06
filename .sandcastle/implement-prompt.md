@@ -6,6 +6,8 @@
 2. 如果这个分支已经有 PR（`gh pr view {{BRANCH}} --comments`），先逐条处理里面的 review 意见，包括行内意见：`gh api "repos/{owner}/{repo}/pulls/$(gh pr view {{BRANCH}} --json number -q .number)/comments" --jq '.[] | "\(.path):\(.line) \(.body)"'`。
 3. `git log --oneline {{BRANCH}} -n 10` 看这个分支已经提交了什么。
 
+在 issue 上留进度评论时，第一行写这次会话用的模型档案：`echo "$SANDCASTLE_PROFILE"`（为空就不写）。
+
 # CONTEXT BUDGET
 
 这次会话要在 ~150k token 内完成。遵守 `CLAUDE.md` 的「Context budget」：
