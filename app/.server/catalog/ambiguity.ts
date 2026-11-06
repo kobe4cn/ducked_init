@@ -73,8 +73,8 @@ function named(labels: Iterable<string>, q: string): Set<string> {
 /** values 是口径声明以外各维度的取值文字（字段只有粒度）；claims 是每种口径声明的取值，没声明的是 unknown */
 interface Facts { grain: string; values: Partial<Record<Dimension, string>>; timeField?: string; filterLabels: string[]; claims: Map<ClaimType, string> }
 
-/** 口径声明：指标用 system.claims，按类型用 knowledge.claims 覆盖；字段只有 knowledge.claims。没声明的类型记为 unknown（未声明即未知） */
-function claimsOf(e: MetricEntry | FieldEntry): Map<ClaimType, string> {
+/** 口径声明：指标用 system.claims，按类型用 knowledge.claims 覆盖；字段只有 knowledge.claims。没声明的类型记为 unknown（未声明即未知）。plan.ts 的口径检查也用它 */
+export function claimsOf(e: MetricEntry | FieldEntry): Map<ClaimType, string> {
   const out = new Map<ClaimType, string>(CLAIM_TYPE_ORDER.map(t => [t, 'unknown']));
   for (const x of [...(e.kind === 'metric' ? e.system.claims : []), ...(e.knowledge?.claims ?? [])]) out.set(x.type, x.value);
   return out;
