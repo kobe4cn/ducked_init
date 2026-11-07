@@ -4,7 +4,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 import { expand } from '../app/.server/catalog';
-import { semanticHash, type PlanMode } from '../app/.server/catalog/plan';
+import { AGGREGATE_FNS, semanticHash, type PlanMode } from '../app/.server/catalog/plan';
+import { CLAIM_TYPES } from '../app/lib/semantic-claims';
 import { setLlmFetch } from '../app/.server/llm';
 import { DSL_KINDS } from '../app/.server/pipeline/dsl';
 import { CATALOG, CONTEXT, GOLDEN, GOLDEN_ALL } from '../scripts/eval-requirements/golden';
@@ -131,6 +132,10 @@ describe('计划模式评测', () => {
     const body = JSON.parse(JSON.stringify(received[0]!.body));
     expect(body.messages[0].content).toContain('reuse_result');
     expect(body.messages[0].content).toContain('unsupported');
+    // Schema 的三个枚举字段要把可选值告诉模型，否则格式失败会混进模式正确率
+    const system = body.messages[0].content as string;
+    for (const fn of AGGREGATE_FNS) expect(system).toContain(fn);
+    for (const { value } of [...CLAIM_TYPES.unit.values, ...CLAIM_TYPES.time_meaning.values]) expect(system).toContain(value);
     const user = body.messages[1].content as string;
     expect(user.endsWith(`# 需求\n\n${g.request}`)).toBe(true);
     expect(user).toContain('metric:gross_revenue_30d');
