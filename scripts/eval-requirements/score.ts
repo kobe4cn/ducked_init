@@ -4,7 +4,8 @@
 // 与 plan-modes.ts 的期望比对。产品的 validate_plan 工具还没接入助手（P4⑮），这里的消息是评测自己拼的，接入后对齐
 import { stringify } from 'yaml';
 import { expand, overview, toMarkdown, type Catalog, type CatalogEntry } from '../../app/.server/catalog';
-import { PLAN_MODES, PLAN_SCHEMA, semanticHash, validatePlan, type PlanMode } from '../../app/.server/catalog/plan';
+import { AGGREGATE_FNS, PLAN_MODES, PLAN_SCHEMA, semanticHash, validatePlan, type PlanMode } from '../../app/.server/catalog/plan';
+import { CLAIM_TYPES } from '../../app/lib/semantic-claims';
 import { callModel, LlmError, type LlmMessage, type LlmProvider } from '../../app/.server/llm';
 import { DSL_KINDS, type DslKind } from '../../app/.server/pipeline/dsl';
 import type { MetricSpec, RatioPart } from '../../app/.server/pipeline/dsl/metric-spec';
@@ -158,6 +159,9 @@ const MODE_HELP: Record<PlanMode, string> = {
 };
 
 /** system 提示词：五种模式与计划 JSON 的字段（对齐 PLAN_SCHEMA 的约束） */
+/** request.unit / timeMeaning 的可选值：取自 semantic-claims 登记表（PLAN_SCHEMA 的 claimEnum 同源） */
+const claimValues = (t: 'unit' | 'time_meaning') => CLAIM_TYPES[t].values.map(v => v.value).join(' / ');
+
 const PLAN_SYSTEM = [
   '你是 CRM 数据平台的分析助手：成员提一条数据分析需求，你先判断怎么回答，输出一份分析计划。只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
   '成员的消息里依次是语义目录总览、按需求搜出的目录条目、可选中条目的版本与语义哈希、需求原文。',
@@ -165,8 +169,8 @@ const PLAN_SYSTEM = [
   ...PLAN_MODES.map(m => `- ${m}：${MODE_HELP[m]}。`),
   '计划 JSON 的字段（schemaVersion 恒为 1）：',
   '- selected：计划要用到的目录条目，每项 { id, version, semanticHash }——id 只能取「与需求相关的条目」里出现的，version 与 semanticHash 照抄「可选中条目」清单（实体、字段条目没有版本，不写 version）；用不上条目时给空数组。',
-  '- request：成员的要求。dimensions 必填（按什么分组、汇总到什么粒度）；unit、timeMeaning、windowDays、grain 只在成员明确说了才写。',
-  '- steps：计划步骤，每项 { id, action, inputs }。action 是 fetch（取 selected 条目的逐消费者结果，inputs 只能是条目）、filter（收窄人群）、aggregate（分组汇总，必带 agg，inputs 恰好一个）、compare（对比，inputs 至少两个）、answer（给出回答）之一；inputs 只能引用前面出现的步骤或 selected 里的条目。',
+  `- request：成员的要求。dimensions 必填（按什么分组、汇总到什么粒度）；unit、timeMeaning、windowDays、grain 只在成员明确说了才写。unit 只能取 ${claimValues('unit')}，timeMeaning 只能取 ${claimValues('time_meaning')}；拿不准就不写 unit / timeMeaning。`,
+  `- steps：计划步骤，每项 { id, action, inputs }。action 是 fetch（取 selected 条目的逐消费者结果，inputs 只能是条目）、filter（收窄人群）、aggregate（分组汇总，必带 agg，agg 只能取 ${AGGREGATE_FNS.join(' / ')} 之一，inputs 恰好一个）、compare（对比，inputs 至少两个）、answer（给出回答）之一；inputs 只能引用前面出现的步骤或 selected 里的条目。`,
   '- assumptions：你的假设，每项 { text, confirmed }，没有就空数组。',
   '- questions：要追问的问题，clarify 至少一条，其他模式空数组。',
   '- reason：mode 为 unsupported 时必填，其他模式不要写。',
