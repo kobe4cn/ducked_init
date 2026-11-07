@@ -5,11 +5,12 @@
 import { and, eq, like } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { assistantConversations, assistantConversationShares, auditLogs } from '../../app/.server/db/schema';
+import { assistantConversations, assistantConversationShares, auditLogs, dslVersions } from '../../app/.server/db/schema';
 import { appendTurn, ASSISTANT_CONTEXT } from '../../app/.server/assistant/conversations';
 import { MAX_HISTORY } from '../../app/.server/assistant/loop';
 import { catalogFor } from '../../app/.server/assistant/tools';
 import { semanticHash } from '../../app/.server/catalog/plan';
+import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { removeMember } from '../../app/.server/members';
 import { decryptForTenant } from '../../app/.server/secrets';
 import { memberOf, newTenant } from '../pipeline/fixtures';
@@ -143,6 +144,52 @@ describe('助手对话', () => {
     // 库里只有密文：计划里的条目 id 不在 sealed 里
     const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
     expect(row.sealed).not.toContain('entity:customer');
+  });
+
+  it('续写时路由从完整对话里取最近一份计划作存草稿前重新校验的依据：两次请求之间发布了新版本，第二次直接保存被拒、不写 dsl_versions（ADR-0050）', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const client = await loginAs(app, 'analyst@acme.com');
+    const COUNT_MEMBERS = 'base: customer\nmeasure: { agg: count }\n';
+    await createDefinition(author, 'metric', 'member_count', COUNT_MEMBERS);
+    await publishDefinition(reviewer, 'metric', 'member_count', 1);
+    const entry = (await catalogFor(analyst)).entries.find(e => e.id === 'metric:member_count')!;
+    if (entry.kind !== 'metric') throw new Error('member_count 发布后不在目录里');
+    const plan = {
+      schemaVersion: 1, mode: 'reuse_result',
+      selected: [{ id: 'metric:member_count', version: entry.version, semanticHash: semanticHash(entry) }],
+      request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: ['metric:member_count'] }],
+      assumptions: [], questions: [],
+    };
+    const replies = [
+      toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }),
+      toolCalls({ name: 'validate_plan', args: { plan } }),
+      text('计划可用'),
+      // 第二次请求：模型不再检索校验，直接保存
+      toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'member_count', yaml: COUNT_MEMBERS } }),
+      text('好的，先重新检索'),
+    ];
+    const { received } = fakeLlm(f => app.setLlmFetch(f), n => replies[n - 1]);
+    const first = await (await post(client, { message: '统计会员数', page: PAGE })).json();
+    expect(first).toMatchObject({ reply: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'] });
+
+    // 带计划的那轮之后再问满 MAX_HISTORY 条：它落在交给模型的 history 截断范围之外，路由只能在完整消息列表里找到它
+    for (let i = 0; i < MAX_HISTORY / 2; i++) await appendTurn(analyst, first.conversationId, `问题 ${i}`, `答复 ${i}`, []);
+
+    // 两次请求之间另一位成员存了第 2 版并发布：计划里的 v1 过期
+    await saveDslDraft(author, 'metric', 'member_count', `# 换个说法\n${COUNT_MEMBERS}`);
+    await publishDefinition(reviewer, 'metric', 'member_count', 2);
+    const before = (await getDb().select().from(dslVersions)).length;
+
+    const second = await (await post(client, { conversationId: first.conversationId, message: '把它保存为草稿', page: PAGE })).json();
+    expect(second).toMatchObject({ conversationId: first.conversationId, reply: '好的，先重新检索', toolsUsed: ['save_definition_draft'] });
+    const sentHistory = received[3].body.messages.filter(m => m.role !== 'system' && m.role !== 'tool').map(m => m.content);
+    expect(sentHistory).not.toContain('计划可用');
+    const tool = received[4].body.messages.filter(m => m.role === 'tool').at(-1)!;
+    expect(tool.content).toContain('未保存：计划已过期');
+    expect(tool.content).toContain('依赖变了');
+    expect((await getDb().select().from(dslVersions)).length).toBe(before);
   });
 
   it('本人只读分享给同租户成员：对方在「分享给我的」里能读、不能续写也不能再分享；不能分享给自己或外租户；撤销后 404；分享与撤销记审计', async () => {
