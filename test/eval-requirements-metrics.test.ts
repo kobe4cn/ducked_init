@@ -9,8 +9,8 @@ import { GOLDEN_ALL } from '../scripts/eval-requirements/golden';
 import { PLAN_MODE_BY_ID, expectedMode } from '../scripts/eval-requirements/plan-modes';
 import { groupByType, retrievalRows, VIEWS, type RetrievalRow, type RetrievalVectors } from '../scripts/eval-requirements/retrieval';
 
-const row = (id: string, type: RetrievalRow['type'], recall: number | null, asked: boolean, shouldAsk: boolean, mode: PlanMode | null = null, expected: PlanMode = 'draft_query'): RetrievalRow =>
-  ({ id, type, holdout: false, recall, top1: null, asked, shouldAsk, mode, expectedMode: expected });
+const row = (id: string, type: RetrievalRow['type'], recall: number | null, asked: boolean, shouldAsk: boolean, mode: PlanMode | null = null, expected: PlanMode = 'draft_query', planned = mode !== null): RetrievalRow =>
+  ({ id, type, holdout: false, recall, top1: null, asked, shouldAsk, planned, mode, expectedMode: expected });
 
 describe('eval:requirements 的检索与追问指标', () => {
   it('分组：Recall@20 组内平均且没有候选的不计，追问正确率按条数，应追问召回只看应追问的条目，合计覆盖全部', () => {
@@ -28,17 +28,21 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(g.合计).toEqual({ cases: 4, recall: 0.5, clarifyAccuracy: 0.5, clarifyRecall: 0.5, modeAccuracy: null });
   });
 
-  it('计划模式正确率：模式一致的条数 / 有模型结果的条数，没有结果为 null 且不计入', () => {
+  it('计划模式正确率：模式一致的条数 / 跑过模型的条数，跑了但失败（mode 为 null）算错，没跑的不计入，一条都没跑为 null', () => {
     const g = groupByType([
       row('p1', 'a', null, false, false, 'clarify', 'clarify'), // 一致
       row('p2', 'a', null, false, false, 'reuse_result', 'clarify'), // 不一致
       row('p3', 'a', null, false, false), // 没跑模型：不计入
+      row('p4', 'a', null, false, false, null, 'clarify', true), // 跑了但失败：算错、进分母
       row('b1', 'b', 0, false, false, 'draft_definition', 'draft_definition'), // 一致
+      row('c1', 'c', null, false, false, null, 'draft_query', true), // 组里只有失败行
     ]);
-    expect(g.a.modeAccuracy).toBe(0.5);
+    expect(g.a.modeAccuracy).toBe(1 / 3);
     expect(g.b.modeAccuracy).toBe(1);
-    expect(g.c.modeAccuracy).toBeNull();
-    expect(g.合计.modeAccuracy).toBe(2 / 3);
+    // 只有失败行：0 而不是 null（不显示成「未运行」）
+    expect(g.c.modeAccuracy).toBe(0);
+    expect(g.d.modeAccuracy).toBeNull();
+    expect(g.合计.modeAccuracy).toBe(2 / 5);
   });
 
   it('真实黄金集：合计 Recall@20 与 retrieval-golden 的汇总一致，应追问 12 条、判出 8 条（4 条不是检索歧义），验收集 8 条', () => {
@@ -51,8 +55,8 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(rows.filter(r => r.asked)).toHaveLength(8);
     expect(total.clarifyRecall).toBe(8 / 12);
     expect(total.clarifyAccuracy).toBe(36 / 40);
-    // 没跑模型：每条的 mode 为 null，正确率不可算
-    expect(rows.every(r => r.mode === null)).toBe(true);
+    // 没跑模型：每条的 planned 为 false、mode 为 null，正确率不可算
+    expect(rows.every(r => !r.planned && r.mode === null)).toBe(true);
     expect(rows.every(r => r.expectedMode === PLAN_MODE_BY_ID[r.id])).toBe(true);
     expect(total.modeAccuracy).toBeNull();
     expect(rows.filter(r => r.holdout)).toHaveLength(8);
