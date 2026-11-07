@@ -1,13 +1,15 @@
 // test/pipeline/catalog-hybrid.test.ts —— 混合检索（ADR-0047、0049）的接缝：rankedSearch({ hybrid: true }) → vectorHits（查询 embedding + catalog_embeddings 缓存）→ rank 的向量一路；
-// embedding 超时（短超时）、5xx 或没配置时只去掉向量这一路（fallback 仍为 false、结果与关键词检索逐项相同）；换模型后缺向量的条目只走关键词并入队补算，drain 后向量一路恢复
+// embedding 超时（短超时）、5xx 或没配置时只去掉向量这一路（fallback 仍为 false、结果与关键词检索逐项相同）；换模型后缺向量的条目只走关键词并入队补算，drain 后向量一路恢复；
+// catalog_search（内部与 MCP 同一入口）按租户 hybrid_search 开关决定是否走混合（#432）
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { runTool } from '../../app/.server/assistant/tools';
 import { ensureEmbeddings, QUERY_EMBED_TIMEOUT_MS } from '../../app/.server/catalog/embeddings';
 import { haystack, terms } from '../../app/.server/catalog/index';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { rankedSearch, refreshProjection } from '../../app/.server/catalog/projection';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { llmCalls, modelProviders, tasks } from '../../app/.server/db/schema';
+import { llmCalls, modelProviders, tasks, tenants } from '../../app/.server/db/schema';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { MODEL_PROVIDER_CONTEXT, setLlmFetch } from '../../app/.server/llm';
 import { encryptForTenant } from '../../app/.server/secrets';
@@ -43,7 +45,7 @@ async function hybridReady() {
   const { received } = fakeLlm(setLlmFetch, (_n, body: LlmBody) => embeddings(body.input.map((t: string) => vec(t)), { prompt_tokens: 3 }));
   await ensureEmbeddings(acme);
   await drain();
-  return { acme, c: await tenantCatalog(acme), received };
+  return { acme, c: await tenantCatalog(acme), received, analyst };
 }
 
 /** 给租户配自己的 embedding 三项（chat 三列为空），换模型用 */
@@ -139,5 +141,26 @@ describe('混合检索', () => {
     expect(hit).toBeDefined();
     expect(hit.reasons).toContainEqual({ lane: 'vector', matched: ['1.00'] });
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('catalog_search 按租户 hybrid_search 开关走混合 / 原有路径（MCP 是同一入口，开关同样作用）：关着时排到的条目与不传 hybrid 的 rankedSearch 一致、不发 embedding 请求；打开后向量一路生效', async () => {
+    const { acme, c, received, analyst } = await hybridReady();
+    const callsBefore = received.length;
+
+    // 开关关着（列默认 false）：输出就是关键词一路——排到的条目 id 顺序与直接 rankedSearch 不传 hybrid 时一致，不发 embedding 请求、不含只靠向量命中的条目
+    const plain = await rankedSearch(acme, 'full', c, QUERY, { memberSpaceId: analyst.space.id });
+    const off = await runTool(analyst, 'catalog_search', { query: QUERY });
+    expect(off).not.toContain('churn_forecast');
+    expect(off).not.toContain(MARK);
+    expect(off.startsWith('ambiguous: ')).toBe(true);
+    expect([...off.matchAll(/^## (\S+)/gm)].map(m => m[1])).toEqual(plain.ranked.map(r => r.entry.id));
+    expect(received.length).toBe(callsBefore);
+
+    // 打开同一租户的开关（直接改库即可，审计与权限已由 #431 的 ops 测试覆盖）：同一查询走混合，多一条查询 embedding 请求、只靠向量命中的条目带「语义」理由进结果
+    await getDb().update(tenants).set({ hybridSearch: true }).where(eq(tenants.id, acme));
+    const on = await runTool(analyst, 'catalog_search', { query: QUERY });
+    expect(on).toContain('churn_forecast');
+    expect(on).toContain('语义');
+    expect(received.slice(callsBefore).map(r => r.body.input)).toEqual([[QUERY]]);
   });
 });

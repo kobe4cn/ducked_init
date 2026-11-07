@@ -22,7 +22,7 @@ import { semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type Pla
 import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
 import type { HitReason } from '../catalog/rank';
 import { getDb } from '../db/client';
-import { dslDefinitions, mappings, spaces } from '../db/schema';
+import { dslDefinitions, mappings, spaces, tenants } from '../db/schema';
 import { createDefinition, DslError, saveDslDraft, validateDefinition } from '../dsl-definitions';
 import type { DslIssue } from '../pipeline/dsl/metric-spec';
 import { createMapping, MappingError, saveMappingDraft, validateNewMapping } from '../mappings';
@@ -192,13 +192,15 @@ export const TOOLS: AssistantTool[] = [
     permission: 'definitions:read',
     external: true,
     run: async (actor, { query, limit }, ctx) => {
-      // 在检索投影上排序（ADR-0047），排序与歧义判定用同一份可见目录，作用域是查询里点名的本租户空间与成员所属空间；投影不可用时回退到实时目录搜索、不带命中理由
+      // 在检索投影上排序（ADR-0047），排序与歧义判定用同一份可见目录，作用域是查询里点名的本租户空间与成员所属空间；投影不可用时回退到实时目录搜索、不带命中理由；
+      // 租户开了 hybrid_search（运营切换，默认关）时加向量一路（ADR-0049）
       const q = query as string;
       const spaceIds = (await getDb().select({ id: spaces.id, name: spaces.name }).from(spaces).where(eq(spaces.tenantId, actor.tenant.id)))
         .filter(s => q.includes(s.name)).map(s => s.id);
       const c = await catalogFor(actor);
+      const [tenant] = await getDb().select({ hybridSearch: tenants.hybridSearch }).from(tenants).where(eq(tenants.id, actor.tenant.id));
       const { ranked } = await rankedSearch(actor.tenant.id, visibilityClass(actor.role), c, q,
-        { spaceIds, memberSpaceId: actor.space.id }, limit as number | undefined);
+        { spaceIds, memberSpaceId: actor.space.id }, limit as number | undefined, { hybrid: tenant?.hybridSearch ?? false });
       // 排到的条目都算本轮检索到（含投影不可用回退的那部分），每个都带语义哈希
       for (const r of ranked) ctx?.retrieved.add(r.entry.id);
       // 回退时得分全为 0，照样判定（一律按差异追问）
