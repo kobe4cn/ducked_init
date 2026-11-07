@@ -1,4 +1,4 @@
-// app/routes/ops.tenant.tsx —— 运营后台的单个租户：改名、指定管理员（用于管理员邮箱失效时的恢复）、停用与恢复、配额与数据湖
+// app/routes/ops.tenant.tsx —— 运营后台的单个租户：改名、指定管理员（用于管理员邮箱失效时的恢复）、停用与恢复、配额与数据湖、混合检索开关
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import { CircleAlert } from 'lucide-react';
 import type { Route } from './+types/ops.tenant';
@@ -6,7 +6,7 @@ import { requireOperator } from '~/.server/ops-auth';
 import { getTenantLake } from '~/.server/lake';
 import { QUOTA_FIELDS, QUOTA_KEYS, type QuotaKey } from '~/.server/quota';
 import {
-  assignTenantAdmin, getTenant, initTenantLake, renameTenant, resumeTenant, setTenantQuota, suspendTenant, TenantError,
+  assignTenantAdmin, getTenant, initTenantLake, renameTenant, resumeTenant, setTenantHybridSearch, setTenantQuota, suspendTenant, TenantError,
 } from '~/.server/tenants';
 import { OpsShell } from '~/components/ops-shell';
 import { PageHeader } from '~/components/page-header';
@@ -66,6 +66,9 @@ export async function action({ request, params }: Route.ActionArgs) {
         break;
       case 'set-quota':
         await setTenantQuota(operator, params.tenantId, Object.fromEntries(QUOTA_KEYS.map(k => [k, field(k)])) as Record<QuotaKey, string>);
+        break;
+      case 'set-hybrid-search':
+        await setTenantHybridSearch(operator, params.tenantId, field('enabled') === 'true');
         break;
       case 'init-lake':
         await initTenantLake(operator, params.tenantId);
@@ -208,6 +211,21 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
             ))}
             <Button type="submit" disabled={submitting}>保存</Button>
           </FieldGroup>
+        </Form>
+      </div>
+
+      <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm" data-hybrid-search={tenant.hybridSearch ? 'on' : 'off'}>
+        <SectionHeader title="混合检索">
+          开启后该租户的目录检索在关键词之外加语义向量一路，需要已配置 embedding；切换记入租户审计日志。
+        </SectionHeader>
+        <p className="text-sm">
+          当前状态：
+          <StatusText tone={tenant.hybridSearch ? 'ok' : 'pending'}>{tenant.hybridSearch ? '已开启' : '已关闭'}</StatusText>
+        </p>
+        <Form method="post" className="max-w-2xl">
+          <input type="hidden" name="intent" value="set-hybrid-search" />
+          <input type="hidden" name="enabled" value={tenant.hybridSearch ? 'false' : 'true'} />
+          <Button type="submit" variant="outline" disabled={submitting}>{tenant.hybridSearch ? '关闭' : '开启'}</Button>
         </Form>
       </div>
 

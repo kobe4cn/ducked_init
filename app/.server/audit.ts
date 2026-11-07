@@ -52,6 +52,7 @@ const ACTIONS = {
     describe: (d: Detail) => `清空 catalog ${d.catalogSchema} 与 ${d.dataPath} 下的 ${d.files} 个文件，已重新初始化`,
   },
   'tenant.quota_changed': { label: '调整配额', describe: (d: Detail) => describeQuotaChange(d.from as TenantQuota, d.to as TenantQuota) },
+  'tenant.hybrid_search_changed': { label: '切换混合检索', describe: (d: Detail) => `${d.from ? '开' : '关'} → ${d.to ? '开' : '关'}` },
   'member.invited': { label: '邀请成员', describe: (d: Detail) => `${d.email}，角色：${roleLabel(d.role)}` },
   'member.role_changed': { label: '修改角色', describe: (d: Detail) => `${d.email}：${roleLabel(d.from)} → ${roleLabel(d.to)}` },
   'member.removed': { label: '移除成员', describe: (d: Detail) => `${d.email}（原角色：${roleLabel(d.role)}）` },
