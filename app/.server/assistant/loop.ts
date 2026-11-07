@@ -3,9 +3,11 @@
 // 助手只能用注册表里的工具，不能执行查询、不能发布；工具出错时把错误文本回填给模型，由它决定怎么继续。
 // 起草（ADR-0042）：校验、保存类工具以「经助手」的成员身份调用（审计带 via: 'assistant'），不通过时问题清单回填给模型修正，
 // 最多再修正 MAX_FIXES 次；仍不通过时不再请求模型，由服务端把问题清单与最后一版 YAML 交给成员。
-// 分析计划（ADR-0050）：每轮新建一个检索候选集合（ToolCtx.retrieved）传给每次工具调用，validate_plan 只认本轮 catalog_search / catalog_expand 返回过的条目
-// 返回给前端的只有文字答复与用过的工具名，不回传工具原文；每次请求在 platform.llm_calls 记一条 assistant（chatTools），不存提示词与答复原文
+// 分析计划（ADR-0050）：每轮新建一个检索候选集合（ToolCtx.retrieved）传给每次工具调用，validate_plan 只认本轮 catalog_search / catalog_expand 返回过的条目；
+// 本轮校验过的最后一份结构合法的计划（ToolCtx.plan）随答复返回、由路由存进对话，对话里最近一份作为 priorPlan 带进下一轮，存草稿前重新校验
+// 返回给前端的只有文字答复、用过的工具名与本轮的计划，不回传工具原文；每次请求在 platform.llm_calls 记一条 assistant（chatTools），不存提示词与答复原文
 import type { CurrentMember } from '../auth';
+import type { AnalysisPlan } from '../catalog/plan';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
 import { chatTools, LlmError, resolveProvider, type LlmMessage } from '../llm';
 import { toolSupport } from '../model-provider';
@@ -83,9 +85,13 @@ async function callTool(actor: CurrentMember, name: string, args: string, ctx: T
 
 /**
  * 一轮问答：没配置模型服务 409；最近一次探测为不支持工具调用时 422（不发请求），模型服务出错 422；对话不合格 400。
- * 第 MAX_TOOL_CALLS 次工具调用之后模型还要调用工具时，结束本轮并告知
+ * 第 MAX_TOOL_CALLS 次工具调用之后模型还要调用工具时，结束本轮并告知。
+ * priorPlan 是对话里最近一份计划（ADR-0050）：不带进发给模型的历史，只经 ToolCtx 给存草稿前的重新校验兜底；
+ * 返回的 plan 只来自本轮 validate_plan（不回传 priorPlan），没有时缺省
  */
-export async function assistantTurn(actor: CurrentMember, history: ChatTurn[], page: AssistantPage): Promise<{ reply: string; toolsUsed: string[] }> {
+export async function assistantTurn(
+  actor: CurrentMember, history: ChatTurn[], page: AssistantPage, priorPlan?: AnalysisPlan,
+): Promise<{ reply: string; toolsUsed: string[]; plan?: AnalysisPlan }> {
   checkHistory(history);
   const tenantId = actor.tenant.id;
   if (!await resolveProvider(tenantId)) throw new AssistantError('未配置模型服务：请到「模型服务」页配置端点、模型与 API Key', 409);
@@ -97,8 +103,9 @@ export async function assistantTurn(actor: CurrentMember, history: ChatTurn[], p
     ...history.map(m => ({ role: m.role, content: m.content })),
   ];
   const toolsUsed: string[] = [];
-  // 本轮检索到的候选条目：catalog_search / catalog_expand 记进来，validate_plan 只认这些；每轮新建
-  const retrieved = new Set<string>();
+  // 本轮的上下文：retrieved 是本轮检索到的候选条目（catalog_search / catalog_expand 记进来，validate_plan 只认这些，每轮新建），
+  // priorPlan 是对话里最近一份计划，plan 由本轮 validate_plan 写进（不带 priorPlan 初始化，免得每轮把旧计划再存一遍）
+  const ctx: ToolCtx = { retrieved: new Set(), priorPlan };
   // 经助手的操作在审计里注明（只加在这里传给工具的 actor 上）
   const via: CurrentMember = { ...actor, via: 'assistant' };
   let failures = 0;
@@ -110,17 +117,17 @@ export async function assistantTurn(actor: CurrentMember, history: ChatTurn[], p
       if (e instanceof LlmError) throw new AssistantError(`该模型服务不支持工具调用或调用失败：${e.message}`, 422);
       throw e;
     }
-    if (!response.toolCalls.length) return { reply: response.content!, toolsUsed };
-    if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed };
+    if (!response.toolCalls.length) return { reply: response.content!, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}) };
+    if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}) };
     // 一次给出的调用超出剩下的次数时只执行到上限就结束本轮
     messages.push({
       role: 'assistant', content: response.content ?? '',
       tool_calls: response.toolCalls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })),
     });
     for (const c of response.toolCalls) {
-      if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed };
+      if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}) };
       toolsUsed.push(c.name);
-      const result = await callTool(via, c.name, c.arguments, { retrieved });
+      const result = await callTool(via, c.name, c.arguments, ctx);
       if (result.rejected && ++failures > MAX_FIXES) return { reply: unfixedReply(result.rejected), toolsUsed };
       // 保存成功后再起草下一份，重新计修正次数
       if (result.saved) failures = 0;

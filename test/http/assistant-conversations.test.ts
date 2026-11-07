@@ -8,6 +8,8 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { assistantConversations, assistantConversationShares, auditLogs } from '../../app/.server/db/schema';
 import { appendTurn, ASSISTANT_CONTEXT } from '../../app/.server/assistant/conversations';
 import { MAX_HISTORY } from '../../app/.server/assistant/loop';
+import { catalogFor } from '../../app/.server/assistant/tools';
+import { semanticHash } from '../../app/.server/catalog/plan';
 import { removeMember } from '../../app/.server/members';
 import { decryptForTenant } from '../../app/.server/secrets';
 import { memberOf, newTenant } from '../pipeline/fixtures';
@@ -97,6 +99,50 @@ describe('助手对话', () => {
     expect(rows).toHaveLength(1);
     for (const text of ['机密', '客户', 'catalog_overview']) expect(rows[0].sealed).not.toContain(text);
     expect(Object.keys(rows[0]).sort()).toEqual(['createdAt', 'id', 'memberId', 'sealed', 'tenantId', 'updatedAt']);
+  });
+
+  it('校验过的计划随对话加密保存（ADR-0050）：?id= 读回的 assistant 消息带 plan、sealed 里没有条目 id 明文；续写时发给模型的历史不带计划', async () => {
+    const { acme } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const client = await loginAs(app, 'analyst@acme.com');
+    // 计划选中 entity:customer，哈希按分析师自己的目录算（写法照 pipeline/assistant 的「先检索再校验计划」）
+    const hash = semanticHash((await catalogFor(analyst)).entries.find(e => e.id === 'entity:customer')!);
+    const plan = {
+      schemaVersion: 1, mode: 'reuse_result',
+      selected: [{ id: 'entity:customer', semanticHash: hash }],
+      request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: ['entity:customer'] }],
+      assumptions: [], questions: [],
+    };
+    const replies = [
+      toolCalls({ name: 'catalog_search', args: { query: 'customer' } }),
+      toolCalls({ name: 'validate_plan', args: { plan } }),
+      text('计划可用'),
+      text('不客气'), // 第二轮直接文字答复，不再检索校验
+    ];
+    const { received } = fakeLlm(f => app.setLlmFetch(f), n => replies[n - 1]);
+    const first = await (await post(client, { message: '消费者分析能用现有目录吗', page: PAGE })).json();
+    expect(first).toMatchObject({ reply: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'] });
+
+    // 读回：校验计划的那轮 assistant 消息带 plan，只有条目 id、版本与哈希，没有检索结果与工具原文
+    const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(conversation.messages).toEqual([
+      { role: 'user', content: '消费者分析能用现有目录吗' },
+      { role: 'assistant', content: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'], plan },
+    ]);
+
+    // 续写：交给模型的历史只有文字（不含计划，比如哈希值与 schemaVersion）；本轮没再校验，新消息不带 plan
+    const second = await (await post(client, { conversationId: first.conversationId, message: '谢谢', page: PAGE })).json();
+    expect(second).toMatchObject({ conversationId: first.conversationId, reply: '不客气', toolsUsed: [] });
+    const sent = JSON.stringify(received[3].body.messages);
+    expect(sent).not.toContain(hash);
+    expect(sent).not.toContain('schemaVersion');
+    const after = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(after.conversation.messages.at(-1)).toEqual({ role: 'assistant', content: '不客气', toolsUsed: [] });
+
+    // 库里只有密文：计划里的条目 id 不在 sealed 里
+    const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
+    expect(row.sealed).not.toContain('entity:customer');
   });
 
   it('本人只读分享给同租户成员：对方在「分享给我的」里能读、不能续写也不能再分享；不能分享给自己或外租户；撤销后 404；分享与撤销记审计', async () => {

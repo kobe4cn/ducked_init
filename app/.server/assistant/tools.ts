@@ -4,7 +4,9 @@
 // 保存类工具只存草稿，发布照旧双人；注册表里没有发布工具。执行查询的 run_query 另要令牌的授权（requires: 'allowQuery'）：只有签发时允许执行查询的令牌经 MCP 拿得到，
 // 平台内的助手拿不到（toolsFor 不含、invokeTool 不带授权时 403）；结果按工作台解读的规则剔除列，但对全部返回行判断哈希（ADR-0043）。目录按角色过滤（catalogFor）：没有 sources:read 的成员看不到数据源与源表条目、字段来源与实体映射到的源表（ADR-0005）。
 // 分析计划（ADR-0050）：目录检索工具的输出给每个条目带语义哈希（同一份按角色裁剪的目录上算），并把条目 id 记进 ToolCtx.retrieved（助手循环每轮新建）；
-// validate_plan 只认本轮检索到的条目，校验结果渲染成文本、不带 rejected（不计修正次数）；它不对外开放（external: false），外部没有这个上下文
+// validate_plan 只认本轮检索到的条目，校验结果渲染成文本、不带 rejected（不计修正次数）；它不对外开放（external: false），外部没有这个上下文。
+// 本轮校验过的计划经 ToolCtx 带走随对话保存；save_definition_draft 存草稿前对最新目录重新校验（本轮的优先，其次对话里最近一份），
+// 不是 valid 就不保存、按问题说明原因（依赖变了 / 看不到所选条目），不带 rejected；外部经 MCP 调用不带 ctx，没有计划，行为与不带计划时一致
 import { Ajv, type ValidateFunction } from 'ajv';
 import { and, eq } from 'drizzle-orm';
 import { data } from 'react-router';
@@ -14,7 +16,7 @@ import type { CurrentMember } from '../auth';
 import { expand, overview, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
 import { judgeAmbiguity, type AmbiguityGroup } from '../catalog/ambiguity';
 import { tenantCatalog } from '../catalog/load';
-import { semanticHash, validatePlan } from '../catalog/plan';
+import { semanticHash, validatePlan, type AnalysisPlan, type PlanIssue } from '../catalog/plan';
 import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
 import type { HitReason } from '../catalog/rank';
 import { getDb } from '../db/client';
@@ -47,8 +49,9 @@ export interface ToolResult { text: string; rejected?: { issues: string; yaml: s
 export const catalogFor = async (member: CurrentMember): Promise<Catalog> =>
   visibleCatalog(await tenantCatalog(member.tenant.id), visibilityClass(member.role));
 
-/** 一次助手对话轮的上下文：retrieved 是本轮 catalog_search / catalog_expand 返回过的条目 id，validate_plan 只认这些（防止模型引用没检索过的条目） */
-export interface ToolCtx { retrieved: Set<string> }
+/** 一次助手对话轮的上下文：retrieved 是本轮 catalog_search / catalog_expand 返回过的条目 id，validate_plan 只认这些（防止模型引用没检索过的条目）；
+ * plan 是本轮 validate_plan 收到的最后一份结构合法的计划，priorPlan 是对话里最近一份（助手循环带入）；存草稿前优先用 plan、其次 priorPlan 重新校验 */
+export interface ToolCtx { retrieved: Set<string>; plan?: AnalysisPlan; priorPlan?: AnalysisPlan }
 
 const TEXT = { type: 'string' };
 
@@ -72,6 +75,23 @@ const comparison = (g: AmbiguityGroup) => [
 
 const issueLines = (issues: DslIssue[]) =>
   issues.map(i => `- ${i.path || '（文档）'}（第 ${i.line} 行第 ${i.col} 列）：${i.message}`).join('\n');
+
+/** 计划一条问题的引用：path（entryId） */
+const planIssueRef = (i: PlanIssue) => `${i.path}${i.entryId ? `（${i.entryId}）` : ''}`;
+
+/** 计划问题逐条一行：- path（entryId）：message；下一步：next（validate_plan 的输出与存草稿前重新校验共用） */
+const planIssueLines = (issues: PlanIssue[]) =>
+  issues.map(i => `- ${planIssueRef(i)}：${i.message}${i.next ? `；下一步：${i.next}` : ''}`).join('\n');
+
+/** 存草稿前重新校验没有通过：不保存，按问题说明是依赖变了、看不到所选条目还是别的，最后提示重新检索（不带 rejected，不计修正次数） */
+function stalePlanReply(issues: PlanIssue[]): string {
+  const lines = issues.map(i => {
+    if (i.path.endsWith('.version') || i.path.endsWith('.semanticHash')) return `- ${planIssueRef(i)}：依赖变了（版本或语义哈希与当前目录不一致）——${i.message}`;
+    if (i.path.endsWith('.id') && i.message.includes('可见目录')) return `- ${planIssueRef(i)}：看不到所选条目（权限变了，或条目已停用 / 删除）`;
+    return `- ${planIssueRef(i)}：${i.message}${i.next ? `；下一步：${i.next}` : ''}`;
+  });
+  return ['未保存：计划已过期，存草稿前用当前目录重新校验没有通过。', ...lines, '请重新检索并校验计划后再保存'].join('\n');
+}
 
 /** 不通过：给模型的文本与交给成员的问题清单 */
 function rejected(text: string, issues: string, yaml: string): ToolResult {
@@ -159,8 +179,10 @@ export const TOOLS: AssistantTool[] = [
     external: false,
     run: async (actor, { plan }, ctx) => {
       const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: ctx?.retrieved ?? new Set() });
-      const issues = check.issues.map(i => `- ${i.path}${i.entryId ? `（${i.entryId}）` : ''}：${i.message}${i.next ? `；下一步：${i.next}` : ''}`);
-      return [`status: ${check.status}`, ...issues].join('\n');
+      // 本轮收到的最后一份结构合法的计划（status 不是 valid 也算）带走：随对话保存，存草稿前重新校验用（ADR-0050）
+      if (check.plan && ctx) ctx.plan = check.plan;
+      const issues = planIssueLines(check.issues);
+      return [`status: ${check.status}`, ...(issues ? [issues] : [])].join('\n');
     },
   },
   {
@@ -213,8 +235,15 @@ export const TOOLS: AssistantTool[] = [
     outputSchema: TEXT,
     permission: 'definitions:draft',
     external: true,
-    run: async (actor, input) => {
+    run: async (actor, input, ctx) => {
       const { kind, key, yaml } = input as { kind: 'metric' | 'tag'; key: string; yaml: string };
+      // 存草稿前用当前目录重新校验（ADR-0050）：优先本轮刚校验过的计划，其次对话里最近一份。selected 里的条目都当作检索过，
+      // 这样拦下来的只有依赖变了（版本或哈希不一致）与看不到所选条目，不会报「不在本次检索结果里」。没有计划（外部经 MCP 或本轮和对话里都没有）时不校验，与原来一致
+      const plan = ctx?.plan ?? ctx?.priorPlan;
+      if (plan) {
+        const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: new Set(plan.selected.map(s => s.id)) });
+        if (check.status !== 'valid') return stalePlanReply(check.issues);
+      }
       return savedOrRejected(yaml, async () => {
         // createDefinition 键重复时拒绝：已存在的定义改草稿。查与存之间别人新建了同键定义时 createDefinition 报键重复（不通过），模型重试即走改草稿
         const [existing] = await getDb().select({ id: dslDefinitions.id }).from(dslDefinitions)
