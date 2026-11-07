@@ -19,6 +19,7 @@ npx vitest run test/pipeline/mapping-merge.test.ts # 单个文件
   - 平台库 `crm_platform_test_w<i>`、源库 `crm_source_test_w<i>`、MySQL / MongoDB 库（`TEST_MYSQL_URL` / `TEST_MONGO_URL` 的库名加后缀）
   - 数据湖目录 `$TMPDIR/crm_platform_test_lake_w<i>`、源文件目录 `$TMPDIR/crm_platform_test_sources_w<i>`、对象存储前缀 `TEST_S3_LAKE_URI` 加后缀
   - 集群级的源端账号 `crm_src_reader_w<i>` 等（`source-fixtures.ts`；Sandcastle 沙箱里再按票加运行后缀 `_i<n>`，即 `crm_src_reader_i<n>_w<i>`，由 `CRM_TEST_RUN_SUFFIX` 控制，见 `scripts/test-resource-names.ts`）、vite 缓存目录 `node_modules/.vite-test_w<i>`（`harness.ts`）、迁移用例的目标目录 `crm_platform_test_lake_moved_w<i>`
+  - 建、改账号时按账号名加 advisory lock（`ensurePgAccounts`），防止跨运行的同名角色并发 ALTER 报 `tuple concurrently updated`（#439）
   - 测试里要用到这些名字时从环境变量取，或用 `test/setup-env.ts` 导出的 `WORKER_SUFFIX`，不要写死。临时改 `PLATFORM_LAKE_URI` 的文件在 afterAll 里恢复成改之前的值（本 worker 的值）
   - 不在 vitest 里（scripts 引用夹具）时没有 `VITEST_POOL_ID`，不加后缀
 - `test/global-setup.ts` 在开跑前对 i = 1…N 逐个建库（不存在时）并迁移到最新结构；旧库不删（库里租户的 catalog 角色是集群级的，删库会留下孤儿角色）。它还加了一把锁，已有 vitest 在跑时，再启动的 vitest 会直接报错退出。
@@ -71,7 +72,7 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 | helper | 作用 |
 |---|---|
 | `pgSourceInput(READER \| WRITER, name = '电商库')` | **重建源库**并返回登记 PostgreSQL 数据源的表单字段，直接传给 `registerSource(member, input)` |
-| `READER` / `WRITER` | 源库账号：只读；对 `shop.orders` 可 INSERT / UPDATE。账号名带运行后缀（沙箱里 `_i<n>`，`CRM_TEST_RUN_SUFFIX`）与 worker 后缀（`crm_src_reader_i<n>_w<i>`，本地不设运行后缀时是 `crm_src_reader_w<i>`；`MONGO_USERS` 的 reader / writer 用同一名字，partial / stranger 只带 worker 后缀），断言里用 `READER.user`，不要写死 |
+| `READER` / `WRITER` | 源库账号：只读；对 `shop.orders` 可 INSERT / UPDATE。账号名带运行后缀（沙箱里 `_i<n>`，`CRM_TEST_RUN_SUFFIX`）与 worker 后缀（`crm_src_reader_i<n>_w<i>`，本地不设运行后缀时是 `crm_src_reader_w<i>`；`MONGO_USERS` 的 reader / writer 用同一名字，partial / stranger 只带 worker 后缀），断言里用 `READER.user`，不要写死。建、改账号时按账号名加 advisory lock（`ensurePgAccounts`），防止跨运行的同名角色并发 ALTER |
 | `grantOnSource(sql)` | 以源库管理员执行 SQL：加表、改数据、授权（在 `pgSourceInput` 之后调用，否则会被重建清掉） |
 | `seedPgSource()` | 只重建源库，返回连接信息（`pgSourceInput` 内部已调用） |
 | `duckdbSourceFile(tenantId, file?)` | 在租户源文件目录下生成 DuckDB 文件，返回路径 |

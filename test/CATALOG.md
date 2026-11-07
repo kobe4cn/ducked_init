@@ -6,7 +6,7 @@
 |---|---|
 | `pipeline/pipeline.test.ts` | 开通租户 → 入队任务 → 独立工作进程 → 任务结果；租户隔离 |
 | `pipeline/scheduling.test.ts` | 队列的领取顺序与名额（不启动工作进程） |
-| `pipeline/sources.test.ts` | 登记数据源、只读探测、凭据加密、采集与水位线候选；MySQL / MongoDB / 对象存储文件源；文件上传数据源（上传的 CSV 不算水位线候选、全量比对，同步后 `bronze_<id>` 有这些行） |
+| `pipeline/sources.test.ts` | 登记数据源、只读探测、凭据加密、采集与水位线候选；MySQL / MongoDB / 对象存储文件源；文件上传数据源（上传的 CSV 不算水位线候选、全量比对，同步后 `bronze_<id>` 有这些行）；并发建源端账号不报错 |
 | `pipeline/scope.test.ts` | 同步范围：逐张选表、只采集与同步范围内的表 |
 | `pipeline/sync.test.ts` | 水位线增量与全量比对、变更批次、同步历史、源表结构记在 `_schemas` 并与上一次比对（第一次只存不报，新增 / 删除 / 改类型，原始层保留的旧列不再报删除） |
 | `pipeline/verify.test.ts` | 湖中数据核对（覆盖、位置、文件、结构、数据量） |

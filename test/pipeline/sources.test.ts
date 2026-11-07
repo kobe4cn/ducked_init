@@ -15,7 +15,7 @@ import { storeUpload } from '../../app/.server/uploads';
 import { resetDb } from '../http/harness';
 import { dbNameOf } from '../setup-env';
 import { memberOf, newTenant, onLake, selectAllTables } from './fixtures';
-import { duckdbSourceFile, grantOnSource, MONGO_USERS, pgSourceInput, READER, s3SourceFiles, seedMongoSource, seedMysqlSource, WRITER } from './source-fixtures';
+import { duckdbSourceFile, ensurePgAccounts, grantOnSource, MONGO_USERS, pgSourceInput, READER, s3SourceFiles, seedMongoSource, seedMysqlSource, SOURCE_DB_URL, WRITER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -68,6 +68,21 @@ describe('登记时校验账号只读', () => {
     const engineer = await memberOf(acme, 'de@acme.com');
     const source = await registerSource(engineer, await pgSourceInput(READER));
     expect(source.id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('并发建源端账号不报错', async () => {
+    // 集群级角色会被跨运行的同名 worker 同时建 / 改（#439）：8 个连接各循环 10 次 ensurePgAccounts，
+    // 靠按账号名的 advisory lock 串行化，不再报 tuple concurrently updated
+    const url = Object.assign(new URL(SOURCE_DB_URL), { pathname: '/postgres' }).toString();
+    await Promise.all(Array.from({ length: 8 }, async () => {
+      const c = new pg.Client({ connectionString: url });
+      await c.connect();
+      try {
+        for (let i = 0; i < 10; i++) await ensurePgAccounts(c);
+      } finally {
+        await c.end();
+      }
+    }));
   });
 });
 

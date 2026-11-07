@@ -31,6 +31,24 @@ const withClient = async <T>(url: string, run: (c: pg.Client) => Promise<T>) => 
   }
 };
 
+// 源端账号是集群级的，跨运行的同名角色（如并行沙箱的同号 worker）会对同一角色同时 CREATE / ALTER，
+// PG 报 tuple concurrently updated；这里按账号名加 advisory lock 串行化（#439）。连接须指向 /postgres 库（所有运行共用锁空间）
+export async function ensurePgAccounts(c: pg.Client): Promise<void> {
+  for (const { user, password } of [READER, WRITER]) {
+    try {
+      await c.query('BEGIN');
+      await c.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', ['crm_src_account:' + user]);
+      const { rowCount: exists } = await c.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [user]);
+      const pw = password.replace(/'/g, "''");
+      await c.query(exists ? `ALTER ROLE ${user} LOGIN PASSWORD '${pw}'` : `CREATE ROLE ${user} LOGIN PASSWORD '${pw}'`);
+      await c.query('COMMIT');
+    } catch (err) {
+      await c.query('ROLLBACK').catch(() => {}); // 连接已断时 ROLLBACK 自身也会抛，别让它盖掉原始错误
+      throw err;
+    }
+  }
+}
+
 /**
  * 重建源库 shop schema：
  * - customers：自增主键 + updated_at（水位线候选：更新时间与自增主键）
@@ -44,11 +62,7 @@ export async function seedPgSource() {
   await withClient(Object.assign(new URL(url), { pathname: '/postgres' }).toString(), async c => {
     const { rowCount } = await c.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
     if (!rowCount) await c.query(`CREATE DATABASE "${dbName}"`);
-    for (const { user, password } of [READER, WRITER]) {
-      const { rowCount: exists } = await c.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [user]);
-      const pw = password.replace(/'/g, "''");
-      await c.query(exists ? `ALTER ROLE ${user} LOGIN PASSWORD '${pw}'` : `CREATE ROLE ${user} LOGIN PASSWORD '${pw}'`);
-    }
+    await ensurePgAccounts(c);
   });
   await withClient(SOURCE_DB_URL, async c => {
     await c.query(`
