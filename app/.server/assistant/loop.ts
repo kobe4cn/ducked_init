@@ -128,7 +128,7 @@ export async function assistantTurn(
       if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}) };
       toolsUsed.push(c.name);
       const result = await callTool(via, c.name, c.arguments, ctx);
-      if (result.rejected && ++failures > MAX_FIXES) return { reply: unfixedReply(result.rejected), toolsUsed };
+      if (result.rejected && ++failures > MAX_FIXES) return { reply: unfixedReply(result.rejected), toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}) };
       // 保存成功后再起草下一份，重新计修正次数
       if (result.saved) failures = 0;
       messages.push({ role: 'tool', tool_call_id: c.id, content: result.text });
