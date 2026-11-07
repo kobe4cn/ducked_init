@@ -1,7 +1,11 @@
 {
   "profiles": {
     "opus": { "harness": "claude-code", "model": "claude-opus-5-5" },
-    "sonnet": { "harness": "claude-code", "model": "claude-sonnet-5-5", "effort": "medium" },
+    "sonnet": {
+      "harness": "claude-code",
+      "model": "claude-sonnet-5-5",
+      "effort": "medium"
+    },
     "glm": {
       "harness": "claude-code",
       "model": "opus",
@@ -20,7 +24,7 @@
   },
   "phases": {
     "prep": ["opus"],
-    "implement": ["opus"],
+    "implement": ["glm"],
     "review": ["opus"],
     "revise": ["opus"],
     "fix": ["opus"],
