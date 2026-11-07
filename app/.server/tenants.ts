@@ -1,4 +1,4 @@
-// app/.server/tenants.ts —— 运营者管理租户元数据：开通（租户 + 默认空间 + 首个管理员 + 数据湖）、改名、指定管理员、停用与恢复、配额。
+// app/.server/tenants.ts —— 运营者管理租户元数据：开通（租户 + 默认空间 + 首个管理员 + 数据湖）、改名、指定管理员、停用与恢复、配额、混合检索开关。
 // 运营命令与运营后台调用同一套函数；每次操作都在同一事务里写入该租户的审计日志
 import { and, asc, eq, sql } from 'drizzle-orm';
 import { recordAudit, type OperatorActor, type Tx } from './audit';
@@ -137,6 +137,7 @@ const tenantSummaries = () =>
       threads: tenants.threads,
       maxConcurrentTasks: tenants.maxConcurrentTasks,
       maxUploadMb: tenants.maxUploadMb,
+      hybridSearch: tenants.hybridSearch,
       memberCount: sql<number>`count(${members.id})::int`,
       adminEmails: sql<string[]>`coalesce(array_agg(${members.email} order by ${members.email}) filter (where ${members.role} = 'admin'), '{}')`,
     })
@@ -285,6 +286,23 @@ export async function setTenantQuota(operator: OperatorActor, tenantId: string, 
       targetType: 'tenant',
       targetId: tenant.id,
       detail: { from, to },
+    });
+  });
+}
+
+/** 切换租户的混合检索开关（ADR-0049）：只有运营者能切，默认关；对之后该租户的 catalog_search 生效 */
+export async function setTenantHybridSearch(operator: OperatorActor, tenantId: string, enabled: boolean) {
+  await getDb().transaction(async tx => {
+    const tenant = await lockTenant(tx, tenantId);
+    if (tenant.hybridSearch === enabled) return;
+    await tx.update(tenants).set({ hybridSearch: enabled }).where(eq(tenants.id, tenant.id));
+    await recordAudit(tx, {
+      tenantId: tenant.id,
+      operator,
+      action: 'tenant.hybrid_search_changed',
+      targetType: 'tenant',
+      targetId: tenant.id,
+      detail: { from: tenant.hybridSearch, to: enabled },
     });
   });
 }

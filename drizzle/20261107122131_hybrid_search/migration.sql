@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."tenants" ADD COLUMN "hybrid_search" boolean DEFAULT false NOT NULL;
