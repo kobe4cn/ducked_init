@@ -47,7 +47,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const MAX_ITERATIONS = 10; // prep→plan→build→land 的轮数上限
-const MAX_PARALLEL = 3; // 同时实现的票数：受 PG max_connections（3 × 4 个 worker 要 450）与机器负载限制
+const MAX_PARALLEL = 2; // 同时实现的票数：受 PG max_connections（每个沙箱 4 个 worker 约 150 个连接，2 个要 300）与机器负载限制；3 个门槛同时跑完整测试会大面积超时（2026-11-07）
 const IMPLEMENT_MAX_ITERATIONS = 3; // 一张票最多开几次全新会话；超过说明票太大，交给人
 /** 第一次没做完时脚本留在 issue 上的标记；prep 看到它就按「实现没做完」重新准备，再没做完才打 stuck。 */
 const REPREP_MARK = "<!-- sandcastle:reprep -->";
