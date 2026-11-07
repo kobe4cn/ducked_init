@@ -6,7 +6,7 @@
 // 分析计划（ADR-0050）：目录检索工具的输出给每个条目带语义哈希（同一份按角色裁剪的目录上算），并把条目 id 记进 ToolCtx.retrieved（助手循环每轮新建）；
 // validate_plan 只认本轮检索到的条目，校验结果渲染成文本、不带 rejected（不计修正次数）；它不对外开放（external: false），外部没有这个上下文。
 // 本轮校验过的计划经 ToolCtx 带走随对话保存；save_definition_draft 存草稿前对最新目录重新校验（本轮的优先，其次对话里最近一份），
-// 不是 valid 就不保存、按问题说明原因（依赖变了 / 看不到所选条目），不带 rejected；外部经 MCP 调用不带 ctx，没有计划，行为与不带计划时一致
+// 不是 valid 就不保存、说明原因（依赖变了 / 看不到所选条目时说计划已过期，否则写明计划状态，如 clarify 计划的 needs_clarification），不带 rejected；外部经 MCP 调用不带 ctx，没有计划，行为与不带计划时一致
 import { Ajv, type ValidateFunction } from 'ajv';
 import { and, eq } from 'drizzle-orm';
 import { data } from 'react-router';
@@ -16,7 +16,7 @@ import type { CurrentMember } from '../auth';
 import { expand, overview, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
 import { judgeAmbiguity, type AmbiguityGroup } from '../catalog/ambiguity';
 import { tenantCatalog } from '../catalog/load';
-import { semanticHash, validatePlan, type AnalysisPlan, type PlanIssue } from '../catalog/plan';
+import { semanticHash, validatePlan, type AnalysisPlan, type PlanCheck, type PlanIssue, type PlanStatus } from '../catalog/plan';
 import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
 import type { HitReason } from '../catalog/rank';
 import { getDb } from '../db/client';
@@ -84,11 +84,29 @@ const planIssueLine = (i: PlanIssue) => `- ${planIssueRef(i)}：${i.message}${i.
 
 const planIssueLines = (issues: PlanIssue[]) => issues.map(planIssueLine).join('\n');
 
-/** 存草稿前重新校验没有通过：不保存，按问题说明是依赖变了、看不到所选条目还是别的，最后提示重新检索（不带 rejected，不计修正次数） */
-function stalePlanReply(issues: PlanIssue[]): string {
+const isDependencyIssue = (i: PlanIssue) => i.path.endsWith('.version') || i.path.endsWith('.semanticHash');
+const isHiddenIssue = (i: PlanIssue) => i.path.endsWith('.id') && i.message.includes('可见目录');
+
+/** 计划本身不是 valid 时存草稿的下一步（非 valid 一律不存，见 #422 的 sandcastle:decided） */
+const STATUS_NEXT: Record<Exclude<PlanStatus, 'valid'>, string> = {
+  needs_clarification: '要先向用户澄清，澄清后重新检索并校验计划，valid 了再保存',
+  unsupported: '要向用户说明做不到，不能存草稿',
+  invalid: '先修正计划并重新校验，valid 了再保存',
+};
+
+/**
+ * 存草稿前重新校验没有通过：不保存，说明原因（不带 rejected，不计修正次数）。有依赖变了 / 看不到所选条目的问题时
+ * 说计划已过期并提示重新检索；没有这两类问题时是计划本身就不是 valid（比如 clarify / unsupported 模式），写明计划状态，不说过期
+ */
+function stalePlanReply(check: PlanCheck & { plan: AnalysisPlan }): string {
+  const { status, plan, issues } = check;
+  if (!issues.some(i => isDependencyIssue(i) || isHiddenIssue(i))) {
+    const s = status as Exclude<PlanStatus, 'valid'>;
+    return [`未保存：计划状态是 ${s}（mode 是 ${plan.mode}），${STATUS_NEXT[s]}。`, ...issues.map(planIssueLine)].join('\n');
+  }
   const lines = issues.map(i => {
-    if (i.path.endsWith('.version') || i.path.endsWith('.semanticHash')) return `- ${planIssueRef(i)}：依赖变了（版本或语义哈希与当前目录不一致）——${i.message}`;
-    if (i.path.endsWith('.id') && i.message.includes('可见目录')) return `- ${planIssueRef(i)}：看不到所选条目（权限变了，或条目已停用 / 删除）`;
+    if (isDependencyIssue(i)) return `- ${planIssueRef(i)}：依赖变了（版本或语义哈希与当前目录不一致）——${i.message}`;
+    if (isHiddenIssue(i)) return `- ${planIssueRef(i)}：看不到所选条目（权限变了，或条目已停用 / 删除）`;
     return planIssueLine(i);
   });
   return ['未保存：计划已过期，存草稿前用当前目录重新校验没有通过。', ...lines, '请重新检索并校验计划后再保存'].join('\n');
@@ -243,7 +261,7 @@ export const TOOLS: AssistantTool[] = [
       const plan = ctx?.plan ?? ctx?.priorPlan;
       if (plan) {
         const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: new Set(plan.selected.map(s => s.id)) });
-        if (check.status !== 'valid') return stalePlanReply(check.issues);
+        if (check.status !== 'valid') return stalePlanReply({ ...check, plan });
       }
       return savedOrRejected(yaml, async () => {
         // createDefinition 键重复时拒绝：已存在的定义改草稿。查与存之间别人新建了同键定义时 createDefinition 报键重复（不通过），模型重试即走改草稿
