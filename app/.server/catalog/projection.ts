@@ -2,7 +2,8 @@
 // 投影是派生数据：deriveProjection 是纯函数，从已裁剪的目录生成行，能从零重建（rebuildProjection），也能按 catalogChangesSince 的净差异增量刷新（refreshProjection）。
 // 可见性类别只由服务端按角色算（visibilityClass），任何对外接口都不收这个参数；restricted 里没有数据源、源表与映射血缘（ADR-0005）。
 // 净差异不超过 PROJECTION_SYNC_LIMIT 时在请求里同步刷新，超过时入队 catalog.projection，由调度器结束钩子从零重建；所有行带同一个目录版本号，增量刷新与从零重建得到的投影完全相同。
-// rankedSearch 在投影上排序（rank）；投影不可用时回退到旧 search()，P2 不设租户开关，靠这个回退兜底
+// rankedSearch 在投影上排序（rank），hybrid 时并入向量一路（vectorHits，ADR-0047、0049：embedding 失败只去掉这一路，不影响其余各路）；
+// 投影不可用时回退到旧 search()，P2 不设租户开关，靠这个回退兜底
 import { createHash } from 'node:crypto';
 import { and, asc, eq, inArray, max, sql } from 'drizzle-orm';
 import { cmp } from '../../lib/compare';
@@ -11,6 +12,7 @@ import type { Tx } from '../audit';
 import { getDb } from '../db/client';
 import { catalogProjection, tasks, type Role } from '../db/schema';
 import { insertTask } from '../tasks';
+import { vectorHits } from './embeddings';
 import { haystack, search, type Catalog, type CatalogEntry } from './index';
 import { tenantCatalog } from './load';
 import { rank, type Ranked, type RankScope } from './rank';
@@ -149,13 +151,18 @@ export async function readProjection(db: Tx | ReturnType<typeof getDb>, tenantId
 
 /**
  * 在持久投影上排序（rank）：先把投影刷到最新，再读 cls 类的行，按调用方的可见目录 c 排序。
+ * opts.hybrid 为真时并入向量一路（vectorHits：查询 embedding + 向量缓存）；embedding 没配置、超时或失败只去掉这一路，不落进整体回退。
  * 投影不可用时回退到旧 search()、理由为空、fallback 为 true：刷新抛错、刷新交给了调度器（queued）、投影版本不等于 c 的版本、读投影或排序抛错（ADR-0047）
  */
-export async function rankedSearch(tenantId: string, cls: ProjectionClass, c: Catalog, query: string, scope: RankScope, limit = 20): Promise<{ ranked: Ranked[]; fallback: boolean }> {
+export async function rankedSearch(tenantId: string, cls: ProjectionClass, c: Catalog, query: string, scope: RankScope, limit = 20, opts: { hybrid?: boolean } = {}): Promise<{ ranked: Ranked[]; fallback: boolean }> {
   try {
     if (await refreshProjection(tenantId) !== 'queued') {
       const { version, rows } = await readProjection(getDb(), tenantId, cls);
-      if (version === (c.version ?? 0)) return { ranked: rank(rows, c, query, scope, limit), fallback: false };
+      if (version === (c.version ?? 0)) {
+        // vectorHits 自己吞掉所有错误，这里只会拿到 undefined，不会落进下面的整体回退
+        const vector = opts.hybrid ? await vectorHits(tenantId, rows, query) ?? [] : [];
+        return { ranked: rank(rows, c, query, scope, limit, vector), fallback: false };
+      }
     }
   } catch (e) {
     console.warn('检索投影不可用，回退到实时目录搜索', tenantId, e);
