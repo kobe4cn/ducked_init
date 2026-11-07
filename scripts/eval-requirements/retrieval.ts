@@ -6,6 +6,7 @@ import type { Catalog } from '../../app/.server/catalog';
 import { deriveProjection, visibleCatalog, type ProjectionClass } from '../../app/.server/catalog/projection';
 import { judgeAmbiguity, type Ambiguity } from '../../app/.server/catalog/ambiguity';
 import { rank } from '../../app/.server/catalog/rank';
+import { vectorLane } from '../../app/.server/catalog/vector';
 import { FAILURE_TYPES, type GoldenEntry } from './golden';
 import { RETRIEVAL_CATALOG } from './retrieval-catalog';
 
@@ -14,14 +15,21 @@ export const viewerView = (c: Catalog): Catalog => visibleCatalog(c, 'restricted
 
 export const LIMIT = 20;
 const view = (cls: ProjectionClass) => ({ rows: deriveProjection(RETRIEVAL_CATALOG, cls), catalog: visibleCatalog(RETRIEVAL_CATALOG, cls) });
-const VIEWS = { full: view('full'), restricted: view('restricted') };
+/** 两类视图的投影行与裁剪后目录（#416 开关对比要给两边视图的行算向量，导出） */
+export const VIEWS = { full: view('full'), restricted: view('restricted') };
+
+/** 向量一路的输入（#416）：rows 是文本哈希 → 行向量（与 embeddings.ts 的缓存同键），queries 是黄金集 id → 查询向量 */
+export interface RetrievalVectors { rows: Map<string, number[]>; queries: Map<string, number[]> }
 
 export interface Retrieved { top: string[]; hits: number; ambiguous: boolean; ambiguity: Ambiguity }
 
-/** 一条的检索结果与歧义判定：前 20（排序前先去掉能力说明的投影行，与 model-draft 的 relevantMarkdown 一致：否则能力说明占着直接命中的名额，依赖展开补进来的候选会落到第 20 名之后）、命中的候选数与歧义判定 */
-export function retrieve(g: GoldenEntry): Retrieved {
+/** 一条的检索结果与歧义判定：前 20（排序前先去掉能力说明的投影行，与 model-draft 的 relevantMarkdown 一致：否则能力说明占着直接命中的名额，依赖展开补进来的候选会落到第 20 名之后）、命中的候选数与歧义判定。
+ *  vectors 给了且该条有查询向量时多融合一路向量命中（vector.ts）；没有查询向量时与不带 vectors 完全相同 */
+export function retrieve(g: GoldenEntry, vectors?: RetrievalVectors): Retrieved {
   const v = VIEWS[g.role === 'viewer' ? 'restricted' : 'full'];
-  const ranked = rank(v.rows.filter(r => !r.entryId.startsWith('capability:')), v.catalog, g.retrieval.query, {}, LIMIT);
+  const viewRows = v.rows.filter(r => !r.entryId.startsWith('capability:'));
+  const queryVec = vectors?.queries.get(g.id);
+  const ranked = rank(viewRows, v.catalog, g.retrieval.query, {}, LIMIT, queryVec ? vectorLane(queryVec, viewRows, vectors!.rows) : []);
   const top = ranked.map(r => r.entry.id);
   const hits = g.retrieval.candidates.filter(id => top.includes(id)).length;
   // 歧义判定用同一个排序结果（ambiguity.ts）
@@ -45,8 +53,8 @@ export interface RetrievalRow {
   shouldAsk: boolean;
 }
 
-export const retrievalRows = (gs: GoldenEntry[]): RetrievalRow[] => gs.map(g => {
-  const r = retrieve(g);
+export const retrievalRows = (gs: GoldenEntry[], vectors?: RetrievalVectors): RetrievalRow[] => gs.map(g => {
+  const r = retrieve(g, vectors);
   return { id: g.id, type: g.failure_type, holdout: g.holdout, recall: recallAt(g, r), top1: r.top[0] ?? null, asked: r.ambiguous, shouldAsk: g.clarify !== null };
 });
 

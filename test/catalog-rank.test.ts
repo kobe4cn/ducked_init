@@ -124,6 +124,23 @@ describe('检索排序 rank()', () => {
     expect(r[0]!.score).toBeCloseTo(rrf(LANE_WEIGHTS.alias, 1) + rrf(LANE_WEIGHTS.keyword, 2), 12);
   });
 
+  it('带向量一路：分数多出 vector 的 RRF、理由带两位相似度，只靠向量命中的条目也进结果，不在目录里的被忽略；不传与传空数组逐项相同', () => {
+    // 向量按相似度降序传入（vectorLane 的输出）：revenue_b 第 1、entity:order 第 2；metric:gone 不在目录里
+    const vector = [
+      { entryId: 'metric:revenue_b', similarity: 0.83 },
+      { entryId: 'entity:order', similarity: 0.4 },
+      { entryId: 'metric:gone', similarity: 0.99 },
+    ];
+    const r = rank(rows, c, '营收', {}, 20, vector);
+    const b = r.find(x => x.entry.id === 'metric:revenue_b')!;
+    expect(b.score).toBeCloseTo(rrf(LANE_WEIGHTS.alias, 2) + rrf(LANE_WEIGHTS.keyword, 3) + rrf(LANE_WEIGHTS.vector, 1), 12);
+    expect(b.reasons).toContainEqual({ lane: 'vector', matched: ['0.83'] });
+    // 「营收」命不中 entity:order 的任何文字路，只有向量理由
+    expect(r.find(x => x.entry.id === 'entity:order')?.reasons).toEqual([{ lane: 'vector', matched: ['0.40'] }]);
+    expect(r.map(x => x.entry.id)).not.toContain('metric:gone');
+    expect(rank(rows, c, '营收')).toEqual(rank(rows, c, '营收', {}, 20, []));
+  });
+
   it('别名出现被别的条目更长的名称命中覆盖时不算：order.channel 的名称「渠道」在自身说明里延长成「下单渠道」，盖住 touch.channel 的别名「渠道」', () => {
     const ch = buildCatalog({ definitions: [], knowledge: { byTarget: new Map([['field:touch.channel', { aliases: ['渠道'] }]]) } });
     const r = rank(deriveProjection(ch, 'full'), ch, '各下单渠道的订单数');
