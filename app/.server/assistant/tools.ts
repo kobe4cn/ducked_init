@@ -6,7 +6,9 @@
 // 分析计划（ADR-0050）：目录检索工具的输出给每个条目带语义哈希（同一份按角色裁剪的目录上算），并把条目 id 记进 ToolCtx.retrieved（助手循环每轮新建）；
 // validate_plan 只认本轮检索到的条目，校验结果渲染成文本、不带 rejected（不计修正次数）；它不对外开放（external: false），外部没有这个上下文。
 // 本轮校验过的计划经 ToolCtx 带走随对话保存；save_definition_draft 存草稿前对最新目录重新校验（本轮的优先，其次对话里最近一份），
-// 不是 valid 就不保存、说明原因（依赖变了 / 看不到所选条目时说计划已过期，否则写明计划状态，如 clarify 计划的 needs_clarification），不带 rejected；外部经 MCP 调用不带 ctx，没有计划，行为与不带计划时一致
+// 不是 valid 就不保存、说明原因（依赖变了 / 看不到所选条目时说计划已过期，否则写明计划状态，如 clarify 计划的 needs_clarification），不带 rejected；外部经 MCP 调用不带 ctx，没有计划，行为与不带计划时一致。
+// prefill_workbench（#424 选 A）把 draft_query 计划写好的 SQL 准备填进工作台：同样对最新目录重新校验计划（没有计划时拒绝，与存草稿不同），
+// SQL 经 checkDraftedSql 按工作台白名单检查、不执行（ADR-0043），通过后经 ToolCtx.workbenchSql 随本轮返回，由成员自己执行；它不对外开放（external: false，外部没有计划上下文）
 import { Ajv, type ValidateFunction } from 'ajv';
 import { and, eq } from 'drizzle-orm';
 import { data } from 'react-router';
@@ -25,7 +27,7 @@ import { createDefinition, DslError, saveDslDraft, validateDefinition } from '..
 import type { DslIssue } from '../pipeline/dsl/metric-spec';
 import { createMapping, MappingError, saveMappingDraft, validateNewMapping } from '../mappings';
 import { sourceIdByName } from '../source-config';
-import { runQuery, WORKBENCH_ROWS } from '../workbench';
+import { checkDraftedSql, runQuery, WORKBENCH_ROWS } from '../workbench';
 import { MAX_CELL, redactResult } from '../workbench-ai';
 
 export interface AssistantTool {
@@ -50,8 +52,9 @@ export const catalogFor = async (member: CurrentMember): Promise<Catalog> =>
   visibleCatalog(await tenantCatalog(member.tenant.id), visibilityClass(member.role));
 
 /** 一次助手对话轮的上下文：retrieved 是本轮 catalog_search / catalog_expand 返回过的条目 id，validate_plan 只认这些（防止模型引用没检索过的条目）；
- * plan 是本轮 validate_plan 收到的最后一份结构合法的计划，priorPlan 是对话里最近一份（助手循环带入）；存草稿前优先用 plan、其次 priorPlan 重新校验 */
-export interface ToolCtx { retrieved: Set<string>; plan?: AnalysisPlan; priorPlan?: AnalysisPlan }
+ * plan 是本轮 validate_plan 收到的最后一份结构合法的计划，priorPlan 是对话里最近一份（助手循环带入）；存草稿与填工作台前都优先用 plan、其次 priorPlan 重新校验；
+ * workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（多次通过以最后一次为准，之后的拒绝不清掉之前通过的值） */
+export interface ToolCtx { retrieved: Set<string>; plan?: AnalysisPlan; priorPlan?: AnalysisPlan; workbenchSql?: string }
 
 const TEXT = { type: 'string' };
 
@@ -87,27 +90,44 @@ const planIssueLines = (issues: PlanIssue[]) => issues.map(planIssueLine).join('
 const isDependencyIssue = (i: PlanIssue) => i.path.endsWith('.version') || i.path.endsWith('.semanticHash');
 const isHiddenIssue = (i: PlanIssue) => i.path.endsWith('.id') && i.message.includes('可见目录');
 
-/** 计划本身不是 valid 时存草稿的下一步（非 valid 一律不存，见 #422 的 sandcastle:decided） */
-const STATUS_NEXT: Record<Exclude<PlanStatus, 'valid'>, string> = {
-  needs_clarification: '要先向用户澄清，澄清后重新检索并校验计划，valid 了再保存',
-  unsupported: '要向用户说明做不到，不能存草稿',
-  invalid: '先修正计划并重新校验，valid 了再保存',
+/** 重新校验没通过时的两种动作：存草稿与把 SQL 填进工作台，文案只差「保存 / 填入」那几个词（save 的逐字文案有历史用例断言） */
+type StaleAction = 'save' | 'prefill';
+
+/** 计划本身不是 valid 时的下一步（非 valid 一律不保存 / 不填入，见 #422 的 sandcastle:decided） */
+const STATUS_NEXT: Record<StaleAction, Record<Exclude<PlanStatus, 'valid'>, string>> = {
+  save: {
+    needs_clarification: '要先向用户澄清，澄清后重新检索并校验计划，valid 了再保存',
+    unsupported: '要向用户说明做不到，不能存草稿',
+    invalid: '先修正计划并重新校验，valid 了再保存',
+  },
+  prefill: {
+    needs_clarification: '要先向用户澄清，澄清后重新检索并校验计划，valid 了再填入',
+    unsupported: '要向用户说明做不到，不能填入工作台',
+    invalid: '先修正计划并重新校验，valid 了再填入',
+  },
+};
+
+/** stalePlanReply 里随动作换的三个词：开头（未保存 / 未填入）、校验时机（存草稿前 / 填入工作台前）、结尾（再保存 / 再填入） */
+const STALE_WORDS: Record<StaleAction, { failed: string; before: string; again: string }> = {
+  save: { failed: '未保存', before: '存草稿前', again: '再保存' },
+  prefill: { failed: '未填入', before: '填入工作台前', again: '再填入' },
 };
 
 /**
- * 存草稿前重新校验没有通过：不保存，说明原因（不带 rejected，不计修正次数）。有依赖变了 / 看不到所选条目的问题时
+ * 重新校验没有通过：不保存 / 不填入，说明原因（不带 rejected，不计修正次数）。有依赖变了 / 看不到所选条目的问题时
  * 说计划已过期并提示重新检索；没有这两类问题时是计划本身就不是 valid（比如 clarify / unsupported 模式），写明计划状态，不说过期
  */
-function stalePlanReply(status: Exclude<PlanStatus, 'valid'>, plan: AnalysisPlan, issues: PlanIssue[]): string {
+function stalePlanReply(status: Exclude<PlanStatus, 'valid'>, plan: AnalysisPlan, issues: PlanIssue[], action: StaleAction = 'save'): string {
+  const words = STALE_WORDS[action];
   if (!issues.some(i => isDependencyIssue(i) || isHiddenIssue(i))) {
-    return [`未保存：计划状态是 ${status}（mode 是 ${plan.mode}），${STATUS_NEXT[status]}。`, ...issues.map(planIssueLine)].join('\n');
+    return [`${words.failed}：计划状态是 ${status}（mode 是 ${plan.mode}），${STATUS_NEXT[action][status]}。`, ...issues.map(planIssueLine)].join('\n');
   }
   const lines = issues.map(i => {
     if (isDependencyIssue(i)) return `- ${planIssueRef(i)}：依赖变了（版本或语义哈希与当前目录不一致）——${i.message}`;
     if (isHiddenIssue(i)) return `- ${planIssueRef(i)}：看不到所选条目（权限变了，或条目已停用 / 删除）`;
     return planIssueLine(i);
   });
-  return ['未保存：计划已过期，存草稿前用当前目录重新校验没有通过。', ...lines, '请重新检索并校验计划后再保存'].join('\n');
+  return [`${words.failed}：计划已过期，${words.before}用当前目录重新校验没有通过。`, ...lines, `请重新检索并校验计划后${words.again}`].join('\n');
 }
 
 /** 不通过：给模型的文本与交给成员的问题清单 */
@@ -132,6 +152,9 @@ const PUBLISH_HINT = '需由另一位有发布权限的成员发布';
 function mappingTable(yaml: string): unknown {
   try { return (parse(yaml) as { table?: unknown } | null)?.table; } catch { return undefined; }
 }
+
+/** prefill_workbench 接受的 SQL 上限：工作台路由 ?sql= 超过这个字数会被忽略（app/routes/workbench.tsx 的 MAX_SQL_PARAM 同值，不从路由文件导入） */
+const MAX_PREFILL_SQL = 20_000;
 
 export const TOOLS: AssistantTool[] = [
   {
@@ -315,6 +338,31 @@ export const TOOLS: AssistantTool[] = [
       const result = await runQuery(actor, sql as string);
       const { columns, rows, dropped } = redactResult(result, Infinity);
       return JSON.stringify({ columns: columns.map(c => c.name), rows, truncated: result.truncated, dropped });
+    },
+  },
+  {
+    name: 'prefill_workbench',
+    description: '把按 draft_query 计划写好的一条只读 SQL 准备填进数据查询工作台：先用当前目录重新校验计划，再按工作台白名单检查 SQL（不执行）。'
+      + '通过后成员在工作台点链接把 SQL 放进编辑器，由成员自己执行',
+    inputSchema: { type: 'object', required: ['sql'], properties: { sql: { type: 'string' } }, additionalProperties: false },
+    outputSchema: TEXT,
+    permission: 'sandbox',
+    external: false,
+    run: async (actor, { sql }, ctx) => {
+      // 与存草稿不同：没有计划（外部经 MCP 或本轮和对话里都没有）时拒绝，不放过未校验的 SQL
+      const plan = ctx?.plan ?? ctx?.priorPlan;
+      if (!plan) return '未填入：本轮和对话里都没有校验过的分析计划，先检索并用 validate_plan 校验一份 draft_query 计划';
+      if (plan.mode !== 'draft_query') return `未填入：计划的 mode 是 ${plan.mode}，只有 draft_query 的计划能填入工作台`;
+      // 填入前对当前目录重新校验（ADR-0050）：selected 都当作检索过，拦下来的只有依赖变了与看不到所选条目
+      const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: new Set(plan.selected.map(s => s.id)) });
+      if (check.status !== 'valid') return stalePlanReply(check.status, plan, check.issues, 'prefill');
+      if ((sql as string).length > MAX_PREFILL_SQL) return `未填入：SQL 超过 ${MAX_PREFILL_SQL} 字，工作台的链接放不下，请精简后重试`;
+      // 只按工作台白名单检查、不执行（ADR-0043）；挂载出错时抛 WorkbenchError，由助手循环转成工具错误
+      const { sql: normalized, problem } = await checkDraftedSql(actor, sql as string);
+      if (problem) return `未填入：SQL 没有通过工作台校验：${problem}`;
+      // SQL 只进 ctx 与返回值，不写进 tool 文本；拒绝不清掉之前通过的值，多次通过以最后一次为准
+      if (ctx) ctx.workbenchSql = normalized;
+      return '已准备好填入工作台：成员点链接把 SQL 放进编辑器，自己执行';
     },
   },
 ];
