@@ -7,6 +7,7 @@
 // 源表采集与同步成功后和最新一版语义目录比较，源表的列变了记一版目录版本；检索投影刷新任务成功后在这里从零重建投影
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { ensureEmbeddings, fillEmbeddings } from '../catalog/embeddings';
 import { rebuildProjection } from '../catalog/projection';
 import { recordCatalogVersionIfChanged } from '../catalog/versions';
 import { registerDslSnapshot } from '../dsl-definitions';
@@ -113,7 +114,14 @@ export function createDispatcher({
         if (template && outcome!.result) await registerSnapshot(task.tenantId, task.id, template);
         if (task.kind === 'gold.dsl' && outcome!.result) await registerDslSnapshot(task.tenantId, task.id);
         // 检索投影差异太大、交给了任务（ADR-0047）：在这里按当前目录从零重建。失败不影响任务状态，下次检索会再入队
-        if (task.kind === 'catalog.projection' && succeeded) await rebuildProjection(task.tenantId).catch(e => console.warn('检索投影重建失败', task.tenantId, e));
+        if (task.kind === 'catalog.projection' && succeeded) {
+          await rebuildProjection(task.tenantId).catch(e => console.warn('检索投影重建失败', task.tenantId, e));
+          // 重建后投影文字可能变了：顺带入队补算缺的向量（ADR-0049）。失败只打日志
+          await ensureEmbeddings(task.tenantId).catch(e => console.warn('检索向量补算入队失败', task.tenantId, e));
+        }
+        // 检索向量补算（ADR-0047、0049）：工作进程只占位（没有平台库），在这里补齐当前模型缺的向量并清掉旧模型的行。
+        // 失败不影响任务状态，下次有人调 ensureEmbeddings 时会再入队
+        if (task.kind === 'catalog.embed' && succeeded) await fillEmbeddings(task.tenantId).catch(e => console.warn('检索向量补算失败', task.tenantId, e));
         // 结果层任务因 error 级断言失败（没有登记快照）：告警租户管理员并记审计
         if ((template || task.kind === 'gold.dsl') && 'error' in outcome!) await alertAssertionFailure(task.tenantId, task, outcome.result);
         // 到期快照的表已删、旧文件已清理：标记为已过期，分析页不再打开它们

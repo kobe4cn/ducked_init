@@ -1,6 +1,6 @@
 // app/.server/db/schema.ts —— 平台元数据（平台 PostgreSQL 的 platform schema）。业务数据不落这里（ADR-0002）
 import { sql } from 'drizzle-orm';
-import { bigint, boolean, check, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, check, index, integer, jsonb, pgSchema, primaryKey, real, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import type { CustomEntityField, CustomEntityKind, EntityRelation } from '../../lib/canonical-model';
 import type { MergeRule } from '../../lib/merge-groups';
 import { ROLES } from '../../lib/roles';
@@ -860,3 +860,15 @@ export const catalogProjection = platform.table('catalog_projection', {
   spaceId: uuid('space_id'),
   catalogVersion: integer('catalog_version').notNull(),
 }, t => [uniqueIndex('catalog_projection_tenant_class_entry_uq').on(t.tenantId, t.visibilityClass, t.entryId)]);
+
+// 检索投影文字的向量缓存（ADR-0047、0049）：按（租户, 模型, 文本哈希）一行。embedding 是昂贵的派生计算，丢了可以重算、不参与权限判断；
+// 键里含模型标识：换模型后旧模型的行命中不了，补算时删掉（catalog/embeddings.ts）。仓库没有 pgvector，向量存 real[]。
+// 缓存读写一律带 tenant_id，哈希相同也不跨租户共用
+export const catalogEmbeddings = platform.table('catalog_embeddings', {
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  modelId: text('model_id').notNull(),
+  textHash: text('text_hash').notNull(),
+  dimension: integer('dimension').notNull(),
+  vector: real('vector').array().notNull(),
+  createdAt: createdAt(),
+}, t => [primaryKey({ columns: [t.tenantId, t.modelId, t.textHash] })]);

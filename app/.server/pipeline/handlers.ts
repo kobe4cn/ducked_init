@@ -290,6 +290,12 @@ export const HANDLERS = {
     readOnlyLake: true,
     run: async () => ({}),
   },
+  // 检索向量补算（ADR-0047、0049）：同上，工作进程里没有平台库；成功后由调度器结束钩子补齐当前模型缺的向量
+  'catalog.embed': {
+    label: '补算检索向量',
+    readOnlyLake: true,
+    run: async () => ({}),
+  },
   'lake.inventory': {
     label: '盘点数据湖',
     run: async con => ({ tables: await inventory(con) }),
