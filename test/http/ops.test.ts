@@ -1,6 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { eq } from 'drizzle-orm';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { tenants } from '../../app/.server/db/schema';
 import { totpCode } from '../../app/.server/totp';
+import { newTenant } from '../pipeline/fixtures';
 import {
   createOperator, createTenant, extractOpsLink, loginAs, loginAsOperator, opsMagicLogin, resetDb, resetOperatorTotp, runCli, scanTotpQrOn, startApp,
   totpSecretOn,
@@ -428,6 +431,52 @@ describe('租户管理', () => {
       expect((await browser.get(`/ops/tenants/${id}`)).status).toBe(404);
       expect((await browser.post(`/ops/tenants/${id}`, { intent: 'rename', name: 'x' })).status).toBe(404);
     }
+  });
+});
+
+describe('运营者切换租户混合检索', () => {
+  it('打开再关闭各写一条审计；同值切换是 no-op、不写审计', async () => {
+    const acme = await newTenant('acme');
+    await createOperator('ops@platform.com');
+    const { browser: ops } = await loginAsOperator(app, 'ops@platform.com');
+
+    // 默认关闭：状态有文字，按钮是「开启」，提交目标值 true
+    const before = await (await ops.get(`/ops/tenants/${acme}`)).text();
+    expect(before).toContain('data-hybrid-search="off"');
+    expect(before).toContain('已关闭');
+    expect(before).toContain('name="enabled" value="true"');
+    expect(before).toContain('>开启</button>');
+
+    const on = await ops.post(`/ops/tenants/${acme}`, { intent: 'set-hybrid-search', enabled: 'true' });
+    expect(on.status).toBe(302);
+    const onPage = await (await ops.get(`/ops/tenants/${acme}`)).text();
+    expect(onPage).toContain('data-hybrid-search="on"');
+    expect(onPage).toContain('已开启');
+    expect(onPage).toContain('name="enabled" value="false"');
+    expect(onPage).toContain('>关闭</button>');
+
+    // 同值切换：不报错、不写审计
+    expect((await ops.post(`/ops/tenants/${acme}`, { intent: 'set-hybrid-search', enabled: 'true' })).status).toBe(302);
+    const off = await ops.post(`/ops/tenants/${acme}`, { intent: 'set-hybrid-search', enabled: 'false' });
+    expect(off.status).toBe(302);
+    expect(await (await ops.get(`/ops/tenants/${acme}`)).text()).toContain('data-hybrid-search="off"');
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const audit = await (await admin.get('/audit')).text();
+    expect(auditActions(audit)).toEqual(['切换混合检索', '切换混合检索', '开通租户']);
+    expect(audit).toContain('关 → 开');
+    expect(audit).toContain('开 → 关');
+    expect(audit).toContain(`运营者 ${OPS}`);
+  });
+
+  it('租户管理员（成员会话）直接 POST 被重定向到运营登录页，开关不变', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    const res = await admin.post(`/ops/tenants/${acme}`, { intent: 'set-hybrid-search', enabled: 'true' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe('/ops/login');
+    const [row] = await getDb().select({ hybridSearch: tenants.hybridSearch }).from(tenants).where(eq(tenants.id, acme));
+    expect(row.hybridSearch).toBe(false);
   });
 });
 
