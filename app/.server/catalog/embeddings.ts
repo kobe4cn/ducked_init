@@ -1,6 +1,7 @@
 // app/.server/catalog/embeddings.ts —— 检索投影文字的向量缓存（ADR-0047、0049）：按（租户, 模型, 文本哈希）缓存 embedding，由调度器在后台补算。
 // 向量是昂贵的派生计算：丢了可以重算、不参与权限判断；换 embedding 模型后旧模型的行命中不了，补算时删掉。
-// 本票不改检索路径（查询时的向量召回想在后面的子票）：这里只负责把缓存补齐——ensureEmbeddings 入队去重，fillEmbeddings 在任务的调度器结束钩子里补算
+// vectorHits 是查询时的向量一路：对查询算一次 embedding（短超时）后读缓存排行次，失败只去掉这一路、不拖垮关键词检索；
+// 缓存补齐由 ensureEmbeddings 入队去重，fillEmbeddings 在任务的调度器结束钩子里补算
 import { and, eq, inArray, ne, notInArray } from 'drizzle-orm';
 import { cmp } from '../../lib/compare';
 import type { Tx } from '../audit';
@@ -8,9 +9,14 @@ import { getDb } from '../db/client';
 import { catalogEmbeddings, catalogProjection, tasks } from '../db/schema';
 import { embedWith, resolveEmbeddingProvider } from '../llm';
 import { insertTask } from '../tasks';
+import type { ProjectionRow } from './projection';
+import { vectorLane, type VectorHit } from './vector';
 
 /** 每批补算的条数：一次 /embeddings 请求的输入条数 */
 export const EMBED_BATCH = 64;
+
+/** 查询向量一次 embedding 的短超时：检索在请求路径上，宁可只走关键词也不让成员等一个完整超时（默认 60 秒） */
+export const QUERY_EMBED_TIMEOUT_MS = 3000;
 
 /** 读当前模型下这些文本哈希的向量：只按（租户, 模型, 文本哈希）命中，旧模型与别的租户的行不算 */
 export async function readEmbeddings(tenantId: string, model: string, hashes: string[]): Promise<Map<string, number[]>> {
@@ -79,4 +85,27 @@ export async function fillEmbeddings(tenantId: string): Promise<void> {
   const hashes = wanted.map(r => r.textHash);
   if (hashes.length) await db.delete(catalogEmbeddings).where(and(
     eq(catalogEmbeddings.tenantId, tenantId), eq(catalogEmbeddings.modelId, provider.model), notInArray(catalogEmbeddings.textHash, hashes)));
+}
+
+/**
+ * 检索查询的向量一路（ADR-0047、0049）：对查询文本算一次 embedding（QUERY_EMBED_TIMEOUT_MS 短超时），从缓存读出当前模型下这些投影行的向量，
+ * 交给 vectorLane 排出名次。查询向量不缓存、不落库；调用日志（embedWith 经 logged）只记条数与 token，不含查询文本。
+ * 行只用调用方按可见类读出的那批（restricted 不另按 full 类读），缓存一律带租户与当前模型。
+ * embedding 没配置、超时或失败时返回 undefined——调用方只去掉向量这一路，不落进整体回退；任何错误都吞在这里（不打查询文本）。
+ * 缓存里缺向量的哈希（刚换模型、后台还在补算）入队补算，去重由 ensureEmbeddings 的事务保证
+ */
+export async function vectorHits(tenantId: string, rows: ProjectionRow[], query: string): Promise<VectorHit[] | undefined> {
+  try {
+    const provider = await resolveEmbeddingProvider(tenantId);
+    if (!provider) return undefined;
+    const [queryVec] = await embedWith(tenantId, provider, [query], { timeoutMs: QUERY_EMBED_TIMEOUT_MS });
+    const vectors = await readEmbeddings(tenantId, provider.model, [...new Set(rows.map(r => r.textHash))]);
+    if (rows.some(r => !vectors.has(r.textHash))) {
+      await ensureEmbeddings(tenantId).catch(e => console.warn('混合检索入队补算向量失败', tenantId, e instanceof Error ? e.message : e));
+    }
+    return vectorLane(queryVec, rows, vectors);
+  } catch (e) {
+    console.warn('混合检索的向量一路不可用，只走关键词', tenantId, e instanceof Error ? e.message : e);
+    return undefined;
+  }
 }

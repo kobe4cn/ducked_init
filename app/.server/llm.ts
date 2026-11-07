@@ -125,14 +125,14 @@ export interface CallStats { usage?: { prompt_tokens?: number; completion_tokens
 
 const maskKey = (apiKey: string, s: string) => (apiKey ? s.replaceAll(apiKey, '***') : s);
 
-/** 跑 run，失败都转成 LlmError，消息里的 API Key 换成 *** */
-async function masked<T>(apiKey: string, run: () => Promise<T>): Promise<T> {
+/** 跑 run，失败都转成 LlmError，消息里的 API Key 换成 ***；timeoutMs 只是超时消息里的秒数，中断本身由 postJson 的 AbortSignal 负责 */
+async function masked<T>(apiKey: string, run: () => Promise<T>, timeoutMs = TIMEOUT_MS): Promise<T> {
   try {
     return await run();
   } catch (e) {
     const timedOut = e instanceof Error && e.name === 'TimeoutError';
     throw new LlmError(maskKey(apiKey, e instanceof LlmError ? e.message
-      : timedOut ? `模型服务 ${TIMEOUT_MS / 1000} 秒内没有返回`
+      : timedOut ? `模型服务 ${timeoutMs / 1000} 秒内没有返回`
       : `调用模型服务失败：${e instanceof Error ? e.message : String(e)}`), e instanceof LlmError ? e.transient : true);
   }
 }
@@ -141,13 +141,13 @@ async function masked<T>(apiKey: string, run: () => Promise<T>): Promise<T> {
 interface RawMessage { content?: unknown; tool_calls?: unknown }
 
 /** POST 一个 JSON 请求到 {baseUrl}{path}（带 Bearer Key 与超时），非 2xx 抛 LlmError（5xx 与 429 算 transient），返回解析后的 JSON，不是 JSON 时返回 null */
-async function postJson(provider: LlmProvider, path: string, payload: Record<string, unknown>): Promise<unknown> {
+async function postJson(provider: LlmProvider, path: string, payload: Record<string, unknown>, timeoutMs = TIMEOUT_MS): Promise<unknown> {
   const { baseUrl, apiKey } = provider;
   const res = await llmFetch()(`${baseUrl.replace(/\/+$/, '')}${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   // 先遮蔽再截断：Key 跨过截断处时半截 Key 就遮不住了
   if (!res.ok) throw new LlmError(`模型服务返回 HTTP ${res.status}：${maskKey(apiKey, await res.text()).slice(0, 200)}`, res.status >= 500 || res.status === 429);
@@ -164,9 +164,9 @@ async function postChat(provider: LlmProvider, payload: Record<string, unknown>,
 }
 
 /** 发一次 /embeddings（body 是模型名与输入文本），按 data[].index 排好序返回每条输入的向量；usage 的 prompt_tokens 填进 stats。
- *  返回里缺某条输入的向量时算失败，不把错位的向量交给调用方 */
-async function postEmbeddings(provider: LlmProvider, texts: string[], stats: CallStats): Promise<number[][]> {
-  const body = await postJson(provider, '/embeddings', { model: provider.model, input: texts }) as
+ *  返回里缺某条输入的向量时算失败，不把错位的向量交给调用方。检索的查询向量传更短的 timeoutMs（catalog/embeddings.ts） */
+async function postEmbeddings(provider: LlmProvider, texts: string[], stats: CallStats, opts: { timeoutMs?: number } = {}): Promise<number[][]> {
+  const body = await postJson(provider, '/embeddings', { model: provider.model, input: texts }, opts.timeoutMs) as
     { data?: { index?: unknown; embedding?: unknown }[]; usage?: CallStats['usage'] } | null;
   stats.usage = body?.usage;
   const byIndex = new Map<number, number[]>();
@@ -277,13 +277,14 @@ export async function embed(tenantId: string, texts: string[]): Promise<number[]
  * 用给定的端点调一次 /embeddings，返回按输入顺序排好的向量。不查库、不记日志（评测脚本直接用它，产品走 embed / embedWith）；
  * 失败与 callModel 一样抛抹掉 Key 的 LlmError
  */
-export async function callEmbeddings(provider: LlmProvider, texts: string[], stats: CallStats = { schemaValid: null }): Promise<number[][]> {
-  return masked(provider.apiKey, () => postEmbeddings(provider, texts, stats));
+export async function callEmbeddings(provider: LlmProvider, texts: string[], stats: CallStats = { schemaValid: null }, opts: { timeoutMs?: number } = {}): Promise<number[][]> {
+  return masked(provider.apiKey, () => postEmbeddings(provider, texts, stats, opts), opts.timeoutMs);
 }
 
 /**
  * 按调用方传入的 embedding 端点调 /embeddings 并记调用日志（日志口径同 embed：purpose embedding、模型、条数、prompt_tokens 与耗时，
- * 不记请求文本与向量）。补算用 provider 由调用方在开始时解析一次传入，保证一次补算只用一个模型，不会中途换端点
+ * 不记请求文本与向量）。补算用 provider 由调用方在开始时解析一次传入，保证一次补算只用一个模型，不会中途换端点；
+ * 检索的查询向量一路传更短的 timeoutMs（catalog/embeddings.ts 的 QUERY_EMBED_TIMEOUT_MS），补算不传、仍是默认超时
  */
-export const embedWith = (tenantId: string, provider: LlmProvider, texts: string[]): Promise<number[][]> =>
-  logged(tenantId, 'embedding', (p, stats) => callEmbeddings(p, texts, stats), async () => provider, texts.length);
+export const embedWith = (tenantId: string, provider: LlmProvider, texts: string[], opts: { timeoutMs?: number } = {}): Promise<number[][]> =>
+  logged(tenantId, 'embedding', (p, stats) => callEmbeddings(p, texts, stats, opts), async () => provider, texts.length);
