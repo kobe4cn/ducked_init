@@ -150,8 +150,8 @@ const BAD_METRIC = 'base: nope\nmeasure: { agg: count }\n';
 const TIER = 'metric: member_count\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n';
 
 describe('计划随对话，存草稿前重新校验（ADR-0050）', () => {
-  /** 数据工程师建、另一位发布 member_count v1；分析师检索并校验选中它的计划（valid），返回这轮与计划 */
-  async function validatedPlan() {
+  /** 数据工程师建、另一位发布 member_count v1；返回分析师与选中它的计划 */
+  async function memberCountPlan() {
     const { acme, author, reviewer } = await publishedIdentitySources();
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     platformDefault();
@@ -166,6 +166,12 @@ describe('计划随对话，存草稿前重新校验（ADR-0050）', () => {
       steps: [{ id: 's1', action: 'answer' as const, inputs: ['metric:member_count'] }],
       assumptions: [], questions: [],
     };
+    return { acme, author, reviewer, analyst, plan };
+  }
+
+  /** 分析师检索并校验选中 member_count 的计划（valid），返回这轮与计划 */
+  async function validatedPlan() {
+    const { acme, author, reviewer, analyst, plan } = await memberCountPlan();
     const steps = [
       toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }, TOOL_USAGE),
       toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
@@ -186,6 +192,26 @@ describe('计划随对话，存草稿前重新校验（ADR-0050）', () => {
       },
     };
   }
+
+  it(`同一轮校验了计划、起草连续 ${MAX_FIXES + 1} 次被拒：答复是问题清单与最后一版 YAML，计划仍随这一轮返回`, async () => {
+    const { analyst, plan } = await memberCountPlan();
+    const before = (await getDb().select().from(dslVersions)).length;
+    const steps = [
+      toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+    ];
+    const { received } = fakeLlm(setLlmFetch, n => steps[n - 1]
+      ?? toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'member_count', yaml: BAD_METRIC }, id: `s${n}` }, TOOL_USAGE));
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '统计会员数并保存' }], PAGE);
+    expect(received).toHaveLength(steps.length + MAX_FIXES + 1);
+    expect(turn).toEqual({
+      reply: expect.stringContaining('草稿没有通过校验，未保存（已修正 3 次）'),
+      toolsUsed: ['catalog_search', 'validate_plan', ...Array(MAX_FIXES + 1).fill('save_definition_draft')],
+      plan,
+    });
+    expect(turn.reply).toContain('```yaml\n' + BAD_METRIC + '```');
+    expect(await getDb().select().from(dslVersions)).toHaveLength(before);
+  });
 
   it('两次请求之间发布了新版本指标（依赖变了）：拒绝保存、不写 dsl_versions，答复说明原因并提示重新检索', async () => {
     const { author, reviewer, saveDirectly, versions } = await validatedPlan();
