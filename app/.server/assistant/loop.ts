@@ -4,8 +4,8 @@
 // 起草（ADR-0042）：校验、保存类工具以「经助手」的成员身份调用（审计带 via: 'assistant'），不通过时问题清单回填给模型修正，
 // 最多再修正 MAX_FIXES 次；仍不通过时不再请求模型，由服务端把问题清单与最后一版 YAML 交给成员。
 // 分析计划（ADR-0050）：每轮新建一个检索候选集合（ToolCtx.retrieved）传给每次工具调用，validate_plan 只认本轮 catalog_search / catalog_expand 返回过的条目；
-// 本轮校验过的最后一份结构合法的计划（ToolCtx.plan）随答复返回、由路由存进对话，对话里最近一份作为 priorPlan 带进下一轮，存草稿前重新校验
-// 返回给前端的只有文字答复、用过的工具名与本轮的计划，不回传工具原文；每次请求在 platform.llm_calls 记一条 assistant（chatTools），不存提示词与答复原文
+// 本轮校验过的最后一份结构合法的计划（ToolCtx.plan）随答复返回、由路由存进对话，对话里最近一份作为 priorPlan 带进下一轮，存草稿 / 填工作台前重新校验
+// 本轮 prefill_workbench 通过校验的 SQL（ToolCtx.workbenchSql）随答复返回；返回给前端的只有文字答复、用过的工具名、本轮的计划与这份 SQL，不回传工具原文；每次请求在 platform.llm_calls 记一条 assistant（chatTools），不存提示词与答复原文
 import type { CurrentMember } from '../auth';
 import type { AnalysisPlan } from '../catalog/plan';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
@@ -58,10 +58,11 @@ const clip = (s: unknown) => (typeof s === 'string' ? s.slice(0, 200) : '');
 
 const systemPrompt = (page: AssistantPage) => [
   '你是本租户 CRM 数据分析平台的数据助手，用中文回答成员的问题。',
-  '你只能用给定的工具读语义目录（实体、字段、关系、指标、标签与模板）、校验并保存草稿，不能执行查询、不能发布任何东西；需要这些操作时告诉成员去对应页面自己做。',
+  '你只能用给定的工具读语义目录（实体、字段、关系、指标、标签与模板）、校验并保存草稿，不能执行查询，只能把 draft_query 计划的 SQL 用 prefill_workbench 填进工作台，由成员自己执行；不能发布任何东西，需要这些操作时告诉成员去对应页面自己做。',
   '先用目录工具查清楚再回答，不要编造目录里没有的实体、字段或指标。',
   '回答成员的数据分析问题前，先用 catalog_search / catalog_expand 检索相关条目，再把分析计划 JSON 交给 validate_plan 校验：计划只能引用本轮检索到的条目，并带上返回的 semanticHash（指标、标签、模板还要带 version）。',
   'validate_plan 返回 needs_clarification 时，把计划里的问题逐条向成员追问，本轮不再继续；返回 unsupported 时，向成员说明做不到的原因与问题里建议的下一步。',
+  '把 SQL 填进工作台前，先用 validate_plan 校验一份 draft_query 计划，通过后再调 prefill_workbench。',
   '起草指标、标签或映射时，先用 validate_* 校验，通过后再用 save_* 保存为草稿；不通过时按问题清单修改后重试。保存后提醒成员草稿要由另一位有发布权限的成员发布。',
   `定义的 key 只能用小写字母、数字与下划线，以小写字母开头（${DSL_KEY_PATTERN.source}）。`,
   `成员当前在页面 ${clip(page.path)}「${clip(page.title)}」。`,
@@ -86,12 +87,12 @@ async function callTool(actor: CurrentMember, name: string, args: string, ctx: T
 /**
  * 一轮问答：没配置模型服务 409；最近一次探测为不支持工具调用时 422（不发请求），模型服务出错 422；对话不合格 400。
  * 第 MAX_TOOL_CALLS 次工具调用之后模型还要调用工具时，结束本轮并告知。
- * priorPlan 是对话里最近一份计划（ADR-0050）：不带进发给模型的历史，只经 ToolCtx 给存草稿前的重新校验兜底；
- * 返回的 plan 只来自本轮 validate_plan（不回传 priorPlan），没有时缺省
+ * priorPlan 是对话里最近一份计划（ADR-0050）：不带进发给模型的历史，只经 ToolCtx 给存草稿 / 填工作台前的重新校验兜底；
+ * 返回的 plan 只来自本轮 validate_plan（不回传 priorPlan），workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（没有时都缺省）
  */
 export async function assistantTurn(
   actor: CurrentMember, history: ChatTurn[], page: AssistantPage, priorPlan?: AnalysisPlan,
-): Promise<{ reply: string; toolsUsed: string[]; plan?: AnalysisPlan }> {
+): Promise<{ reply: string; toolsUsed: string[]; plan?: AnalysisPlan; workbenchSql?: string }> {
   checkHistory(history);
   const tenantId = actor.tenant.id;
   if (!await resolveProvider(tenantId)) throw new AssistantError('未配置模型服务：请到「模型服务」页配置端点、模型与 API Key', 409);
@@ -117,18 +118,18 @@ export async function assistantTurn(
       if (e instanceof LlmError) throw new AssistantError(`该模型服务不支持工具调用或调用失败：${e.message}`, 422);
       throw e;
     }
-    if (!response.toolCalls.length) return { reply: response.content!, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}) };
-    if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}) };
+    if (!response.toolCalls.length) return { reply: response.content!, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}), ...(ctx.workbenchSql ? { workbenchSql: ctx.workbenchSql } : {}) };
+    if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}), ...(ctx.workbenchSql ? { workbenchSql: ctx.workbenchSql } : {}) };
     // 一次给出的调用超出剩下的次数时只执行到上限就结束本轮
     messages.push({
       role: 'assistant', content: response.content ?? '',
       tool_calls: response.toolCalls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })),
     });
     for (const c of response.toolCalls) {
-      if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}) };
+      if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}), ...(ctx.workbenchSql ? { workbenchSql: ctx.workbenchSql } : {}) };
       toolsUsed.push(c.name);
       const result = await callTool(via, c.name, c.arguments, ctx);
-      if (result.rejected && ++failures > MAX_FIXES) return { reply: unfixedReply(result.rejected), toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}) };
+      if (result.rejected && ++failures > MAX_FIXES) return { reply: unfixedReply(result.rejected), toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}), ...(ctx.workbenchSql ? { workbenchSql: ctx.workbenchSql } : {}) };
       // 保存成功后再起草下一份，重新计修正次数
       if (result.saved) failures = 0;
       messages.push({ role: 'tool', tool_call_id: c.id, content: result.text });

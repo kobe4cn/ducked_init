@@ -4,7 +4,7 @@
 // search / expand 的输出给每个条目带按角色裁剪的目录上算出的语义哈希
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
-import { catalogFor, invokeTool, runTool, toolsFor } from '../../app/.server/assistant/tools';
+import { catalogFor, invokeTool, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { semanticHash } from '../../app/.server/catalog/plan';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
@@ -22,9 +22,11 @@ describe('AI 助手的工具注册表', () => {
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
 
     const catalogTools = ['catalog_expand', 'catalog_overview', 'catalog_search', 'validate_plan'];
-    expect(names(toolsFor(author))).toEqual([...catalogTools, 'save_definition_draft', 'save_mapping_draft', 'validate_definition', 'validate_mapping'].sort());
-    expect(names(toolsFor(analyst))).toEqual([...catalogTools, 'save_definition_draft', 'validate_definition'].sort());
+    expect(names(toolsFor(author))).toEqual([...catalogTools, 'prefill_workbench', 'save_definition_draft', 'save_mapping_draft', 'validate_definition', 'validate_mapping'].sort());
+    expect(names(toolsFor(analyst))).toEqual([...catalogTools, 'prefill_workbench', 'save_definition_draft', 'validate_definition'].sort());
     expect(names(toolsFor(viewer))).toEqual(catalogTools);
+    // prefill_workbench 要 sandbox 权限（查看者没有）、不对外开放：外部经 MCP 调用没有本轮 / 对话里的计划上下文（#436）
+    expect(TOOLS.find(t => t.name === 'prefill_workbench')).toMatchObject({ permission: 'sandbox', external: false });
 
     await expect(runTool(viewer, 'validate_definition', { kind: 'metric', yaml: 'base: customer' })).rejects.toMatchObject({ init: { status: 403 } });
     await expect(runTool(analyst, 'validate_mapping', { source: 'CRM', yaml: 'x: 1' })).rejects.toMatchObject({ init: { status: 403 } });

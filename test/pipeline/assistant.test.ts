@@ -3,13 +3,15 @@
 // 没配置模型服务 409、模型服务出错 422、对话过长 400；platform.llm_calls 每次请求记一条 assistant。
 // 分析计划（ADR-0050）：同一轮的检索结果进同一个候选集合，validate_plan 只认这些条目，校验结果（status）回填给模型
 // 起草（ADR-0042、ADR-0043）：助手校验后保存指标 / 标签 / 映射草稿，作者是成员、审计带 via: 'assistant'，照常双人发布；不通过时最多再修正 MAX_FIXES 次
+// 填工作台（#436，ADR-0050 / 0043）：draft_query 计划对当前目录重新校验通过后，prefill_workbench 把白名单检查过的 SQL 经 ToolCtx.workbenchSql 随本轮返回
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, dslVersions, llmCalls, mappingVersions } from '../../app/.server/db/schema';
 import { assistantTurn, MAX_FIXES, MAX_TOOL_CALLS } from '../../app/.server/assistant/loop';
 import { catalogFor, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
-import { semanticHash } from '../../app/.server/catalog/plan';
+import { semanticHash, type AnalysisPlan } from '../../app/.server/catalog/plan';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { setLlmFetch } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
@@ -149,7 +151,7 @@ const COUNT_MEMBERS = 'base: customer\nmeasure: { agg: count }\n';
 const BAD_METRIC = 'base: nope\nmeasure: { agg: count }\n';
 const TIER = 'metric: member_count\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n';
 
-describe('计划随对话，存草稿前重新校验（ADR-0050）', () => {
+describe('计划随对话，存草稿 / 填工作台前重新校验（ADR-0050）', () => {
   /** 数据工程师建、另一位发布 member_count v1；返回分析师与选中它的计划 */
   async function memberCountPlan() {
     const { acme, author, reviewer } = await publishedIdentitySources();
@@ -255,6 +257,102 @@ describe('计划随对话，存草稿前重新校验（ADR-0050）', () => {
     expect(tool.content).toContain('未保存：计划已过期，存草稿前用当前目录重新校验没有通过。');
     expect(tool.content).toContain('看不到所选条目');
     expect(await versions()).toBe(before);
+  });
+
+  /** 选中 member_count 的 draft_query 计划：draft_query 不做口径与粒度检查，校验仍是 valid */
+  async function draftQueryPlan() {
+    const { acme, author, reviewer, analyst, plan } = await memberCountPlan();
+    return { acme, author, reviewer, analyst, plan: { ...plan, mode: 'draft_query' as const } };
+  }
+
+  /** 工作台 AI 用过的按城市统计 SQL（test/pipeline/workbench-ai.test.ts） */
+  const CITY_COUNT = 'SELECT city, count(*) AS n FROM silver.customer GROUP BY city';
+
+  /** 第二轮：模型不再检索校验，直接拿着对话里的计划填工作台（priorPlan 由调用方传入），返回这轮与 prefill 的 tool 消息 */
+  async function prefillDirectly(analyst: CurrentMember, plan: AnalysisPlan, sql: string) {
+    const direct = fakeLlm(setLlmFetch, n => n === 1
+      ? toolCalls({ name: 'prefill_workbench', args: { sql } }, TOOL_USAGE)
+      : text('好的，先重新检索', TEXT_USAGE));
+    const second = await assistantTurn(analyst, [{ role: 'user', content: '把它填进工作台' }], PAGE, plan);
+    return { second, tool: direct.received[1].body.messages.filter(m => m.role === 'tool').at(-1)! };
+  }
+
+  it('先校验 draft_query 计划再调 prefill_workbench：返回规范化后的 workbenchSql、记 ai_drafted 审计；白名单不过或超长被拒、之前通过的保留', async () => {
+    const { acme, analyst, plan } = await draftQueryPlan();
+    const steps = [
+      toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+      toolCalls({ name: 'prefill_workbench', args: { sql: `  ${CITY_COUNT};\n` } }, TOOL_USAGE),
+      toolCalls({ name: 'prefill_workbench', args: { sql: 'SELECT * FROM bronze.x' } }, TOOL_USAGE),
+      toolCalls({ name: 'prefill_workbench', args: { sql: 'x'.repeat(20_001) } }, TOOL_USAGE),
+    ];
+    const { received } = fakeLlm(setLlmFetch, n => steps[n - 1] ?? text('已准备好，去工作台执行', TEXT_USAGE));
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '按城市统计客户数，填进工作台' }], PAGE);
+    // workbenchSql 是规范化（去首尾空白与结尾分号）后的 SQL；之后的拒绝不清掉同一轮之前通过的值
+    expect(turn).toEqual({
+      reply: '已准备好，去工作台执行',
+      toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench', 'prefill_workbench', 'prefill_workbench'],
+      plan, workbenchSql: CITY_COUNT,
+    });
+    const tools = received.at(-1)!.body.messages.filter(m => m.role === 'tool');
+    expect(tools.at(-3)!.content).toBe('已准备好填入工作台：成员点链接把 SQL 放进编辑器，自己执行');
+    expect(tools.at(-2)!.content).toMatch(/^未填入：SQL 没有通过工作台校验：/);
+    expect(tools.at(-1)!.content).toBe('未填入：SQL 超过 20000 字，工作台的链接放不下，请精简后重试');
+    // 系统提示词说明 prefill_workbench 的用法
+    expect(received[0].body.messages[0].content).toContain('prefill_workbench');
+    // 审计 workbench.ai_drafted：通过与被拒各一条，SQL 是规范化后的，带 via、不带需求原文；超长的在 checkDraftedSql 之前就拒绝，不记审计
+    expect((await drafted(acme, 'workbench.ai_drafted')).map(a => a.detail)).toEqual([
+      { sql: CITY_COUNT, valid: true, via: 'assistant' },
+      { sql: 'SELECT * FROM bronze.x', valid: false, via: 'assistant' },
+    ]);
+  });
+
+  it('两次请求之间发布了新版本指标（依赖变了）：拒绝填入、返回不带 workbenchSql，说明原因并提示重新检索', async () => {
+    const { author, reviewer, analyst, plan } = await draftQueryPlan();
+    await saveDslDraft(author, 'metric', 'member_count', `# 换个说法\n${COUNT_MEMBERS}`);
+    await publishDefinition(reviewer, 'metric', 'member_count', 2);
+    const { second, tool } = await prefillDirectly(analyst, plan, CITY_COUNT);
+    expect(second.workbenchSql).toBeUndefined();
+    expect(tool.content).toContain('未填入：计划已过期，填入工作台前用当前目录重新校验没有通过。');
+    expect(tool.content).toContain('依赖变了');
+    expect(tool.content).toContain('请重新检索并校验计划后再填入');
+  });
+
+  it('两次请求之间指标被删除（看不到所选条目）：拒绝填入、返回不带 workbenchSql', async () => {
+    const { acme, analyst, plan } = await draftQueryPlan();
+    await deleteDefinition(await memberOf(acme, 'admin@acme.com', 'admin'), 'metric', 'member_count');
+    const { second, tool } = await prefillDirectly(analyst, plan, CITY_COUNT);
+    expect(second.workbenchSql).toBeUndefined();
+    expect(tool.content).toContain('未填入：计划已过期，填入工作台前用当前目录重新校验没有通过。');
+    expect(tool.content).toContain('看不到所选条目');
+  });
+
+  it('校验过的是 clarify 计划（mode 不是 draft_query）：填入被拒、返回不带 workbenchSql', async () => {
+    const { analyst, plan: draft } = await draftQueryPlan();
+    const plan = { ...draft, mode: 'clarify' as const, steps: [], questions: ['按城市统计是全量客户还是某时间段的？'] };
+    const steps = [
+      toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+      toolCalls({ name: 'prefill_workbench', args: { sql: CITY_COUNT } }, TOOL_USAGE),
+    ];
+    const { received } = fakeLlm(setLlmFetch, n => steps[n - 1] ?? text('先澄清', TEXT_USAGE));
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '按城市统计客户数并填进工作台' }], PAGE);
+    expect(turn.workbenchSql).toBeUndefined();
+    const tool = received[3].body.messages.filter(m => m.role === 'tool').at(-1)!;
+    expect(tool.content).toBe('未填入：计划的 mode 是 clarify，只有 draft_query 的计划能填入工作台');
+  });
+
+  it('本轮和对话里都没有计划：填入被拒、提示先校验 draft_query 计划', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    const { received } = fakeLlm(setLlmFetch, n => n === 1
+      ? toolCalls({ name: 'prefill_workbench', args: { sql: CITY_COUNT } }, TOOL_USAGE)
+      : text('先校验计划', TEXT_USAGE));
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '把这条 SQL 填进工作台' }], PAGE);
+    expect(turn).toEqual({ reply: '先校验计划', toolsUsed: ['prefill_workbench'] });
+    expect(received[1].body.messages.filter(m => m.role === 'tool').at(-1)!.content)
+      .toBe('未填入：本轮和对话里都没有校验过的分析计划，先检索并用 validate_plan 校验一份 draft_query 计划');
   });
 });
 
