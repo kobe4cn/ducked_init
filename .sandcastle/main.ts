@@ -125,6 +125,8 @@ function testEnv(issueId: string): Record<string, string> {
     ...serviceEnv,
     TEST_PLATFORM_DATABASE_URL: withDbSuffix(toContainer("postgres://crm:crm@localhost:5432/crm_platform_test"), suffix),
     TEST_SOURCE_DATABASE_URL: withDbSuffix(toContainer("postgres://crm:crm@localhost:5432/crm_source_test"), suffix),
+    // 源端测试账号名按票区分（scripts/test-resource-names.ts 的 CRM_TEST_RUN_SUFFIX），并行的沙箱不共用账号
+    CRM_TEST_RUN_SUFFIX: suffix,
     CRM_TEST_WORKERS: "4",
   };
   const { TEST_MONGO_URL, TEST_MYSQL_URL, TEST_S3_LAKE_URI } = hostEnv;
@@ -134,7 +136,7 @@ function testEnv(issueId: string): Record<string, string> {
   return { ...env, ...browserEnv(suffix) };
 }
 
-// 关沙箱后回收这张票的测试资源（scripts/drop-test-resources.ts：PG 库与租户角色、MySQL / MongoDB 库、对象存储前缀与账号）。
+// 关沙箱后回收这张票的测试资源（scripts/drop-test-resources.ts：PG 库与租户角色、PG / MySQL 源端测试账号、MySQL / MongoDB 库、对象存储前缀与账号）。
 // 每次关沙箱都收，不等票合并：再跑这张票（revise、rebase）时 global-setup 与夹具会重新建库。
 // 在宿主机上跑，连接取自宿主机的 .env / .env.test（不做 host.containers.internal 替换）；异步执行，不卡住并行的另一张票。
 // 回收失败只打日志，不影响票的结果；留下的可以之后 `pnpm sandcastle:cleanup --all` 补收。

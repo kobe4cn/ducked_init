@@ -11,13 +11,15 @@ import { objectPath, signedFetch, xmlTag, xmlTags, type S3Creds } from '../../ap
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
 import { getTask } from '../../app/.server/tasks';
+import { srcAccountName } from '../../scripts/test-resource-names';
 import { WORKER_SUFFIX } from '../setup-env';
 import { drain } from './fixtures';
 
 export const SOURCE_DB_URL = process.env.TEST_SOURCE_DATABASE_URL!;
-// 源端账号是集群级的（PG 角色、MySQL 用户），按 worker 加后缀 _w<i>（见 test/setup-env.ts）
-export const READER = { user: `crm_src_reader${WORKER_SUFFIX}`, password: 'reader-p@ss\'word' };
-export const WRITER = { user: `crm_src_writer${WORKER_SUFFIX}`, password: 'writer-p@ss' };
+// 源端账号是集群级的（PG 角色、MySQL 用户），名字 = 基准名 + 运行后缀（沙箱里 _i<票号>，CRM_TEST_RUN_SUFFIX）+ worker 后缀
+// _w<i>（scripts/test-resource-names.ts；本地不设运行后缀，名字与原来一致）
+export const READER = { user: srcAccountName('crm_src_reader'), password: 'reader-p@ss\'word' };
+export const WRITER = { user: srcAccountName('crm_src_writer'), password: 'writer-p@ss' };
 
 const withClient = async <T>(url: string, run: (c: pg.Client) => Promise<T>) => {
   const client = new pg.Client({ connectionString: url });

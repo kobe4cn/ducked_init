@@ -5,6 +5,9 @@
 //   删库不会带走）。先记下依赖在库里的角色，删库后没有其他库再依赖的才删
 // - 对象存储：TEST_S3_LAKE_URI 加后缀的前缀下的全部对象，以及策略只授权这些前缀的账号（租户的 lake-<id>[-ro]、源文件的 src-*-<id>）
 // - MySQL / MongoDB：TEST_MYSQL_URL、TEST_MONGO_URL 的库名加后缀的库（MongoDB 删库不删库里的用户与角色，先删它们）
+// - PG / MySQL：源端测试账号 crm_src_reader|writer_i<n>_w<i>（集群级，test/pipeline/source-fixtures.ts 建的，
+//   名字见 scripts/test-resource-names.ts；只在删库之后回收，还有依赖（如开发库在用）就跳过。MongoDB 的同名账号
+//   与 crm_src_partial|stranger 建在各自票的源库里，删库时已一并清掉，这里不回收）
 // 某一类回收失败时照样回收其余各类，最后以退出码 1 报告。
 // 用法：node --env-file-if-exists=.env --env-file-if-exists=.env.test --import tsx scripts/drop-test-resources.ts _i336 [_i337 …]
 //       加 --all 回收全部 _i<数字> 的资源（没有 Sandcastle 在跑时用）
@@ -13,6 +16,7 @@ import { MongoClient } from 'mongodb';
 import pg from 'pg';
 import { platformS3 } from '../app/.server/s3-accounts';
 import { deleteObject, listObjects, signedFetch, xmlTag, xmlTags } from '../app/.server/s3-client';
+import { accountsToDrop, escapeRe, nameMatcher, suffixPattern } from './test-resource-names';
 
 const PG_URL = process.env.TEST_PLATFORM_DATABASE_URL ?? 'postgres://crm:crm@localhost:5432/crm_platform_test';
 const PG_BASES = ['crm_platform_test', 'crm_source_test', 'crm_platform_browser'];
@@ -25,10 +29,9 @@ if (!all && (suffixes.length === 0 || suffixes.some(s => !/^_i\w+$/.test(s)))) {
   process.exit(2);
 }
 
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const suffixRe = all ? '_i\\d+' : `(?:${suffixes.map(escapeRe).join('|')})`;
+const suffixRe = suffixPattern(all ? 'all' : suffixes);
 /** base 加票后缀、可能再加 worker 后缀的名字 */
-const matcher = (bases: string[]) => new RegExp(`^(?:${bases.map(escapeRe).join('|')})${suffixRe}(?:_w\\d+)?$`);
+const matcher = (bases: string[]) => nameMatcher(bases, suffixRe);
 const dbNameOf = (url: string) => new URL(url).pathname.slice(1);
 
 async function dropPg() {
@@ -45,14 +48,23 @@ async function dropPg() {
       for (const { rolname } of rows) roles.add(rolname);
       await admin.query(`DROP DATABASE IF EXISTS "${db.replace(/"/g, '""')}" WITH (FORCE)`);
     }
-    let dropped = 0;
-    for (const role of roles) {
+    /** 集群级角色：还有库依赖（如开发库在用）就跳过，不 DROP OWNED */
+    const dropRoleIfUnused = async (role: string) => {
       const { rowCount } = await admin.query('SELECT 1 FROM pg_shdepend s JOIN pg_roles r ON r.oid = s.refobjid WHERE r.rolname = $1', [role]);
-      if (rowCount) continue; // 别的库（如开发库）还在用
+      if (rowCount) return false;
       await admin.query(`DROP ROLE IF EXISTS "${role.replace(/"/g, '""')}"`);
-      dropped++;
-    }
-    console.log(`PG：删除 ${dbs.length} 个库、${dropped} 个角色`);
+      return true;
+    };
+    let dropped = 0;
+    for (const role of roles) if (await dropRoleIfUnused(role)) dropped++;
+    // 源端测试账号（集群级，删库带不走）：LIKE 里的 _ 要转义粗筛，最终以带锚点的 accountsToDrop 为准
+    const accounts = accountsToDrop(
+      (await admin.query<{ rolname: string }>(`SELECT rolname FROM pg_roles WHERE rolname LIKE 'crm\\_src\\_%'`)).rows.map(r => r.rolname),
+      suffixRe,
+    );
+    let accountsDropped = 0;
+    for (const account of accounts) if (await dropRoleIfUnused(account)) accountsDropped++;
+    console.log(`PG：删除 ${dbs.length} 个库、${dropped} 个 lake 角色、${accountsDropped} 个源端账号`);
   } finally {
     await admin.end();
   }
@@ -118,7 +130,20 @@ async function dropMysql() {
     const rows = (await con.runAndReadAll(`SELECT * FROM mysql_query('admin', 'SHOW DATABASES')`)).getRowObjects();
     const dbs = rows.map(r => String(Object.values(r)[0])).filter(n => re.test(n));
     for (const db of dbs) await con.run(`CALL mysql_execute('admin', 'DROP DATABASE IF EXISTS \`${db}\`')`);
-    console.log(`MySQL：删除 ${dbs.length} 个库`);
+    // 源端测试账号（集群级，与 PG 共用名字）：LIKE 里的 _ 要转义粗筛，最终以带锚点的 accountsToDrop 为准；
+    // 用户是 'user'@'host'，按查出来的 host 逐个删，不假定是 %
+    const users = (await con.runAndReadAll(
+      `SELECT * FROM mysql_query('admin', 'SELECT user, host FROM mysql.user WHERE user LIKE ''crm\\_src\\_%''')`,
+    )).getRowObjects();
+    const sqlStr = (v: unknown) => String(v).replace(/'/g, "''");
+    let usersDropped = 0;
+    for (const user of accountsToDrop(users.map(r => String(r.user)), suffixRe)) {
+      for (const host of new Set(users.filter(r => String(r.user) === user).map(r => String(r.host)))) {
+        await con.run(`CALL mysql_execute('admin', 'DROP USER IF EXISTS ''${sqlStr(user)}''@''${sqlStr(host)}''')`);
+        usersDropped++;
+      }
+    }
+    console.log(`MySQL：删除 ${dbs.length} 个库、${usersDropped} 个源端账号`);
   } finally {
     con.closeSync();
     instance.closeSync();
