@@ -80,7 +80,7 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(groupByType(withVector).合计.recall!).toBeGreaterThan(0.9615);
   });
 
-  it('计划模式期望：PLAN_MODE_BY_ID 覆盖全部条目且没有多余 id，d 类是 unsupported、其余标注追问的是 clarify、有期望定义的是 draft_definition，五种模式至少出现四种', () => {
+  it('计划模式期望：PLAN_MODE_BY_ID 覆盖全部条目且没有多余 id，d 类是 unsupported、其余标注追问的是 clarify、有期望定义的是 draft_definition、手工标的 reuse_result 与查看者问血缘的 unsupported，五种模式至少出现四种', () => {
     expect(new Set(Object.keys(PLAN_MODE_BY_ID))).toEqual(new Set(GOLDEN_ALL.map(g => g.id)));
     for (const g of GOLDEN_ALL) {
       expect(expectedMode(g), g.id).toBe(PLAN_MODE_BY_ID[g.id]);
@@ -88,9 +88,11 @@ describe('eval:requirements 的检索与追问指标', () => {
       else if (g.clarify !== null) expect(PLAN_MODE_BY_ID[g.id], g.id).toBe('clarify');
       else if (g.kind) expect(PLAN_MODE_BY_ID[g.id], g.id).toBe('draft_definition');
     }
-    // 手工标的 reuse_result：固定目录里已有能直接回答的发布指标（GMV → gross_revenue_30d、按支付时间的营收 → revenue_paid_30d），其余逐条标的都是 draft_query
+    // 手工标的 reuse_result：固定目录里已有能直接回答的发布指标（GMV → gross_revenue_30d、按支付时间的营收 → revenue_paid_30d），
+    // 查看者问血缘的是 unsupported（问的是血缘，写 SQL 回答不了；查看者目录不带血缘、没有源表，权限做不到，同 viewer-source-tables），其余逐条标的都是 draft_query
     expect(PLAN_MODE_BY_ID['gmv-alias']).toBe('reuse_result');
     expect(PLAN_MODE_BY_ID['viewer-paid-revenue']).toBe('reuse_result');
+    expect(PLAN_MODE_BY_ID['viewer-amount-lineage']).toBe('unsupported');
     expect(new Set(Object.values(PLAN_MODE_BY_ID)).size).toBeGreaterThanOrEqual(4);
   });
 });
