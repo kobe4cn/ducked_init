@@ -27,7 +27,7 @@ describe('AI 助手', () => {
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     const viewer = await loginAs(app, 'viewer@acme.com');
 
-    expect(await (await viewer.get('/assistant')).json()).toEqual({ configured: false, toolSupport: null, canManageProvider: false, tools: ['catalog_overview', 'catalog_expand', 'catalog_search'], mine: [], shared: [] });
+    expect(await (await viewer.get('/assistant')).json()).toEqual({ configured: false, toolSupport: null, canManageProvider: false, tools: ['catalog_overview', 'catalog_expand', 'catalog_search', 'validate_plan'], mine: [], shared: [] });
     expect(await (await viewer.get('/')).text()).toContain('AI 助手');
 
     platformDefault();

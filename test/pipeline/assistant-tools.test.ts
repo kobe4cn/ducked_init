@@ -1,9 +1,11 @@
 // test/pipeline/assistant-tools.test.ts —— AI 助手的工具注册表（ADR-0042）：toolsFor 按角色列出可用工具，runTool 按登记的权限检查（403）、
 // 没有的工具与不合 Schema 的输入 400；目录工具按角色过滤（catalogFor：查看者看不到 source: / table: 条目与字段来源，ADR-0005）；
-// 校验工具（定义、映射）把问题转成给模型的文本
+// 校验工具（定义、映射）把问题转成给模型的文本；validate_plan 校验分析计划（ADR-0050）：只认本轮 catalog_search / catalog_expand 检索到的条目，
+// search / expand 的输出给每个条目带按角色裁剪的目录上算出的语义哈希
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
-import { catalogFor, runTool, toolsFor } from '../../app/.server/assistant/tools';
+import { catalogFor, invokeTool, runTool, toolsFor } from '../../app/.server/assistant/tools';
+import { semanticHash } from '../../app/.server/catalog/plan';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
@@ -19,9 +21,9 @@ describe('AI 助手的工具注册表', () => {
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
 
-    const catalogTools = ['catalog_expand', 'catalog_overview', 'catalog_search'];
-    expect(names(toolsFor(author))).toEqual([...catalogTools, 'save_definition_draft', 'save_mapping_draft', 'validate_definition', 'validate_mapping']);
-    expect(names(toolsFor(analyst))).toEqual([...catalogTools, 'save_definition_draft', 'validate_definition']);
+    const catalogTools = ['catalog_expand', 'catalog_overview', 'catalog_search', 'validate_plan'];
+    expect(names(toolsFor(author))).toEqual([...catalogTools, 'save_definition_draft', 'save_mapping_draft', 'validate_definition', 'validate_mapping'].sort());
+    expect(names(toolsFor(analyst))).toEqual([...catalogTools, 'save_definition_draft', 'validate_definition'].sort());
     expect(names(toolsFor(viewer))).toEqual(catalogTools);
 
     await expect(runTool(viewer, 'validate_definition', { kind: 'metric', yaml: 'base: customer' })).rejects.toMatchObject({ init: { status: 403 } });
@@ -58,5 +60,46 @@ describe('AI 助手的工具注册表', () => {
     const mapping = await runTool(author, 'validate_mapping', { source: 'CRM', yaml: 'table: customers\n' });
     expect(mapping).toMatch(/^映射有 2 处问题/);
     expect(mapping).toContain('- （文档）（第 1 行第 1 列）：缺少 entity');
+  });
+
+  it('validate_plan：引用本轮检索到的条目通过、没检索到的被拒；search / expand 的输出带按角色裁剪的语义哈希', async () => {
+    const { acme, author } = await publishedIdentitySources();
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const hashOf = async (member: typeof author, id: string) =>
+      semanticHash((await catalogFor(member)).entries.find(e => e.id === id)!);
+
+    // expand / search 的输出带语义哈希，条目记进本轮检索到的候选集合（validate_plan 只认这些）
+    const retrieved = new Set<string>();
+    const expanded = await invokeTool(author, 'catalog_expand', { id: 'entity:customer' }, {}, { retrieved });
+    expect(expanded.text).toContain(`semanticHash: ${await hashOf(author, 'entity:customer')}`);
+    expect(retrieved.has('entity:customer')).toBe(true);
+    const searched = await invokeTool(author, 'catalog_search', { query: 'coupon' }, {}, { retrieved });
+    expect(searched.text).toContain(`semanticHash: ${await hashOf(author, 'entity:coupon')}`);
+    expect(retrieved.has('entity:coupon')).toBe(true);
+
+    // 哈希在成员自己那份按角色裁剪的目录上算：查看者看不到映射到实体的源表，同一实体的哈希不同
+    const asViewer = await invokeTool(viewer, 'catalog_expand', { id: 'entity:customer' }, {});
+    expect(asViewer.text).toContain(`semanticHash: ${await hashOf(viewer, 'entity:customer')}`);
+    expect(await hashOf(viewer, 'entity:customer')).not.toBe(await hashOf(author, 'entity:customer'));
+
+    /** 一份选了 id 的合法 reuse_result 计划（实体没有版本，不带 version） */
+    const plan = (id: string, hash: string) => ({
+      schemaVersion: 1,
+      mode: 'reuse_result',
+      selected: [{ id, semanticHash: hash }],
+      request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: [id] }],
+      assumptions: [],
+      questions: [],
+    });
+
+    // 刚检索到的 entity:coupon 通过；在目录里但本轮没检索到的 entity:order 被拒，问题带 path 与 entryId
+    const valid = await invokeTool(author, 'validate_plan', { plan: plan('entity:coupon', await hashOf(author, 'entity:coupon')) }, {}, { retrieved });
+    expect(valid.text).toBe('status: valid');
+    expect(valid.rejected).toBeUndefined();
+    const invalid = await invokeTool(author, 'validate_plan', { plan: plan('entity:order', await hashOf(author, 'entity:order')) }, {}, { retrieved });
+    expect(invalid.text).toContain('status: invalid');
+    expect(invalid.text).toContain('- selected.0.id（entity:order）：选中的条目不在本次检索结果里');
+    expect(invalid.rejected).toBeUndefined(); // 不用 rejected：计划的校验结果不算修正次数
   });
 });

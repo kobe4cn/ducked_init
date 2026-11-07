@@ -1,13 +1,15 @@
 // test/pipeline/assistant.test.ts —— AI 助手的一轮问答（ADR-0043）：assistantTurn → 注入的假 fetch（setLlmFetch）。模型的 tool_calls 按注册表调用工具、
 // 结果作为 role: tool 回填，直到模型给出文字答复；系统提示带当前页面；每轮最多 MAX_TOOL_CALLS 次工具调用；工具出错时把错误文本回填给模型；
 // 没配置模型服务 409、模型服务出错 422、对话过长 400；platform.llm_calls 每次请求记一条 assistant。
+// 分析计划（ADR-0050）：同一轮的检索结果进同一个候选集合，validate_plan 只认这些条目，校验结果（status）回填给模型
 // 起草（ADR-0042、ADR-0043）：助手校验后保存指标 / 标签 / 映射草稿，作者是成员、审计带 via: 'assistant'，照常双人发布；不通过时最多再修正 MAX_FIXES 次
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, dslVersions, llmCalls, mappingVersions } from '../../app/.server/db/schema';
 import { assistantTurn, MAX_FIXES, MAX_TOOL_CALLS } from '../../app/.server/assistant/loop';
-import { runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
+import { catalogFor, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
+import { semanticHash } from '../../app/.server/catalog/plan';
 import { publishDefinition } from '../../app/.server/dsl-definitions';
 import { setLlmFetch } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
@@ -44,7 +46,7 @@ describe('AI 助手的一轮问答', () => {
     expect(system.content).toContain('/catalog/changes');
     expect(system.content).toContain('目录变更记录');
     expect(user).toMatchObject({ role: 'user', content: QUESTION });
-    expect(received[0].body.tools.map(t => t.function.name).sort()).toEqual(['catalog_expand', 'catalog_overview', 'catalog_search']);
+    expect(received[0].body.tools.map(t => t.function.name).sort()).toEqual(['catalog_expand', 'catalog_overview', 'catalog_search', 'validate_plan']);
     const tool = received[1].body.messages.find(m => m.role === 'tool')!;
     expect(tool.tool_call_id).toBe('call_1');
     expect(tool.content).toContain('entity:customer');
@@ -73,6 +75,35 @@ describe('AI 助手的一轮问答', () => {
     expect(tools[1].content).toMatch(/^工具出错：.*JSON/);
   });
 
+  it('回答分析问题先检索再校验计划：validate_plan 回填校验结果；系统提示要求回答前先校验、needs_clarification 追问、unsupported 说明原因', async () => {
+    platformDefault();
+    const { author } = await publishedIdentitySources();
+    const hash = semanticHash((await catalogFor(author)).entries.find(e => e.id === 'entity:customer')!);
+    const plan = {
+      schemaVersion: 1, mode: 'reuse_result',
+      selected: [{ id: 'entity:customer', semanticHash: hash }],
+      request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: ['entity:customer'] }],
+      assumptions: [], questions: [],
+    };
+    const steps = [
+      toolCalls({ name: 'catalog_search', args: { query: 'customer' } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+    ];
+    const { received } = fakeLlm(setLlmFetch, n => steps[n - 1] ?? text('计划可用，可以按它回答', TEXT_USAGE));
+
+    const turn = await assistantTurn(author, [{ role: 'user', content: '消费者分析能直接用现有目录吗' }], PAGE);
+    expect(turn).toEqual({ reply: '计划可用，可以按它回答', toolsUsed: ['catalog_search', 'validate_plan'] });
+    // 检索到的条目在同一个候选集合里：第二轮的 validate_plan 认第一轮 catalog_search 返回的 entity:customer
+    const tool = received[2].body.messages.filter(m => m.role === 'tool').at(-1)!;
+    expect(tool.content).toContain('status: valid');
+
+    const system = received[0].body.messages[0].content;
+    expect(system).toContain('validate_plan');
+    expect(system).toContain('needs_clarification');
+    expect(system).toContain('unsupported');
+  });
+
   it(`连续要求调用工具时，第 ${MAX_TOOL_CALLS} 次之后结束本轮并告知`, async () => {
     platformDefault();
     const acme = await newTenant('acme');
@@ -80,14 +111,14 @@ describe('AI 助手的一轮问答', () => {
     const { received } = fakeLlm(setLlmFetch, n => toolCalls({ name: 'catalog_overview', args: {}, id: `call_${n}` }, TOOL_USAGE));
 
     const turn = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
-    expect(MAX_TOOL_CALLS).toBe(8);
+    expect(MAX_TOOL_CALLS).toBe(12);
     expect(turn.toolsUsed).toHaveLength(MAX_TOOL_CALLS);
     expect(turn.reply).toContain(`${MAX_TOOL_CALLS} 次`);
     expect(received).toHaveLength(MAX_TOOL_CALLS + 1);
     expect(await calls(acme)).toHaveLength(MAX_TOOL_CALLS + 1);
 
-    // 一次给出 9 个调用：执行满 8 个就结束本轮
-    const { received: batch } = fakeLlm(setLlmFetch, () => toolCalls(Array.from({ length: 9 }, (_, i) => ({ id: `b${i}`, name: 'catalog_overview', args: {} }))));
+    // 一次给出 MAX_TOOL_CALLS + 1 个调用：执行满 MAX_TOOL_CALLS 个就结束本轮
+    const { received: batch } = fakeLlm(setLlmFetch, () => toolCalls(Array.from({ length: MAX_TOOL_CALLS + 1 }, (_, i) => ({ id: `b${i}`, name: 'catalog_overview', args: {} }))));
     const batched = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
     expect(batched.toolsUsed).toHaveLength(MAX_TOOL_CALLS);
     expect(batched.reply).toContain(`${MAX_TOOL_CALLS} 次`);
