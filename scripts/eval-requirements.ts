@@ -1,11 +1,13 @@
-// scripts/eval-requirements.ts —— 用法：pnpm eval:requirements（起草部分要 .env 或环境变量里有 LLM_BASE_URL、LLM_MODEL、LLM_API_KEY）
+// scripts/eval-requirements.ts —— 用法：pnpm eval:requirements（调模型的部分要 .env 或环境变量里有 LLM_BASE_URL、LLM_MODEL、LLM_API_KEY）
 // 指标与标签起草的评测（ADR-0041，与 pnpm eval:mapping 并列）。先对全部黄金集跑检索（不调模型，总是输出）：按失败类型 a–d 与合计
-// 打印 Recall@20、追问正确率、应追问召回（追问 = 服务端的歧义判定，ADR-0047），计划模式还没上线只留一列（ADR-0050）；调参集与验收集
+// 打印 Recall@20、追问正确率、应追问召回（追问 = 服务端的歧义判定，ADR-0047）与计划模式正确率（ADR-0050：runPlanCase 让真实模型对每条
+// 需求选五种模式之一，validatePlan 解析出的 mode 与 plan-modes.ts 的期望比对；没配 LLM_* 时这一列是「未运行」）；调参集与验收集
 // （golden.ts 的 HOLDOUT，不参与调参）各一张 Markdown 表，可直接贴进 docs/test-plans/requirements-eval-baseline.md。
+// 有 LLM_* 时先用真实模型对全部条目跑计划模式（runPlanCase）再打这两张表。
 // 再在配了 LLM_EMBEDDING_*（三项都有，与 chat 的 LLM_* 互不影响）时对固定目录真实算一次向量，调参集与验收集各打印「向量关 / 向量开」
 // 两组指标与合计 Recall@20 的差值（#416，ADR-0049）；没配只跳过开关对比。
 // 最后在有 LLM_* 时对有 expected 的样例用真实模型服务走与产品相同的起草消息（固定目录）、输出 Schema 与转 YAML，打印每例与调参集 / 验收集
-// 的校验通过率与结构命中率；缺密钥只跳过起草。结果另存到 scripts/eval-requirements/out/<时间戳>-<模型名或 deterministic>.json。
+// 的校验通过率与结构命中率；缺密钥跳过计划模式与起草。结果另存到 scripts/eval-requirements/out/<时间戳>-<模型名或 deterministic>.json。
 // 不连平台库，不进 CI；不打印也不保存 Key、完整 URL、请求与模型原文
 import { execSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -14,11 +16,13 @@ import { cmp } from '../app/lib/compare';
 import { callEmbeddings, platformEmbeddingProvider, platformProvider } from '../app/.server/llm';
 import { GOLDEN, GOLDEN_ALL, HOLDOUT } from './eval-requirements/golden';
 import { GROUP_KEYS, groupByType, retrievalRows, VIEWS, type GroupKey, type GroupStats, type RetrievalRow, type RetrievalVectors } from './eval-requirements/retrieval';
-import { runCase, summarize, type CaseResult, type Summary } from './eval-requirements/score';
+import { runCase, runPlanCase, summarize, type CaseResult, type Summary } from './eval-requirements/score';
 
 const pct = (x: number | null) => (x === null ? '—' : `${(x * 100).toFixed(1)}%`);
 /** 百分点差值（开 − 关），正数带 + */
 const pp = (x: number | null) => (x === null ? '—' : `${x >= 0 ? '+' : ''}${(x * 100).toFixed(1)}pp`);
+/** 没跑模型时模式正确率不可算，与 pct 的「—」区分开 */
+const modePct = (x: number | null) => (x === null ? '未运行' : pct(x));
 
 /** 分组表（Markdown）：每类一行加合计 */
 function table(title: string, groups: Record<GroupKey, GroupStats>) {
@@ -27,15 +31,32 @@ function table(title: string, groups: Record<GroupKey, GroupStats>) {
   console.log('|---|---|---|---|---|---|');
   for (const k of GROUP_KEYS) {
     const g = groups[k];
-    console.log(`| ${k} | ${g.cases} | ${pct(g.recall)} | ${pct(g.clarifyAccuracy)} | ${pct(g.clarifyRecall)} | 未上线 |`);
+    console.log(`| ${k} | ${g.cases} | ${pct(g.recall)} | ${pct(g.clarifyAccuracy)} | ${pct(g.clarifyRecall)} | ${modePct(g.modeAccuracy)} |`);
   }
 }
 
 const startedAt = new Date();
 const rows = retrievalRows(GOLDEN_ALL);
 const split = (rs: RetrievalRow[]) => ({ tuning: groupByType(rs.filter(r => !r.holdout)), holdout: groupByType(rs.filter(r => r.holdout)) });
-const retrieval = split(rows);
+const VARS = ['LLM_BASE_URL', 'LLM_MODEL', 'LLM_API_KEY'] as const;
+const missing = VARS.filter(v => !process.env[v]);
+let model = 'deterministic';
+const provider = missing.length ? null : platformProvider();
+
 console.log(`检索与追问：${GOLDEN_ALL.length} 条（调参集 ${GOLDEN_ALL.length - HOLDOUT.size}，验收集 ${HOLDOUT.size}），确定性 rank()`);
+if (!provider) {
+  console.log(`\n计划模式：跳过（缺少环境变量 ${missing.join('、')}，写进 .env 或在命令前设置）`);
+} else {
+  model = provider.model;
+  console.log(`\n计划模式：模型 ${provider.model}，${GOLDEN_ALL.length} 条（期望模式标在 scripts/eval-requirements/plan-modes.ts）`);
+  for (const [i, g] of GOLDEN_ALL.entries()) {
+    const p = await runPlanCase(provider, g);
+    rows[i]!.mode = p.mode;
+    const failed = p.failed ? `  失败于${p.failed.stage === 'model' ? '模型调用' : '计划解析'}：${p.failed.message}` : '';
+    console.log(`${p.id.padEnd(24)} 期望 ${p.expected.padEnd(16)} 模型 ${(p.mode ?? '—').padEnd(16)} ${p.correct ? '对' : '错'}${failed}`);
+  }
+}
+const retrieval = split(rows);
 table('调参集', retrieval.tuning);
 table('验收集（不参与调参，只在验收时看）', retrieval.holdout);
 
@@ -81,16 +102,11 @@ if (EMBED_VARS.some(v => !process.env[v])) {
   retrievalHybrid = { off: retrieval, on, recallDelta };
 }
 
-const VARS = ['LLM_BASE_URL', 'LLM_MODEL', 'LLM_API_KEY'] as const;
-const missing = VARS.filter(v => !process.env[v]);
-let model = 'deterministic';
 const drafts: CaseResult[] = [];
 let draftTotals: { tuning: Summary; holdout: Summary } | null = null;
-if (missing.length) {
+if (!provider) {
   console.log(`\n起草：跳过（缺少环境变量 ${missing.join('、')}，写进 .env 或在命令前设置）`);
 } else {
-  const provider = platformProvider();
-  model = provider.model;
   console.log(`\n起草：模型 ${provider.model}，${GOLDEN.length} 个样例`);
   for (const c of GOLDEN) {
     const r = await runCase(provider, c);
@@ -122,8 +138,8 @@ const report = {
   retrievalHybrid,
   drafts: draftTotals,
   // rows 与 GOLDEN_ALL 按下标一一对应
-  cases: rows.map(({ id, type, holdout, recall, top1, asked, shouldAsk }, i) =>
-    ({ id, type, holdout, recall, top1, ambiguous: asked, shouldAsk, clarify: GOLDEN_ALL[i].clarify, draft: byId.get(id) ?? null })),
+  cases: rows.map(({ id, type, holdout, recall, top1, asked, shouldAsk, mode, expectedMode }, i) =>
+    ({ id, type, holdout, recall, top1, ambiguous: asked, shouldAsk, mode, expectedMode, clarify: GOLDEN_ALL[i].clarify, draft: byId.get(id) ?? null })),
 };
 const outDir = join(import.meta.dirname, 'eval-requirements', 'out');
 mkdirSync(outDir, { recursive: true });

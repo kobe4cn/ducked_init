@@ -1,13 +1,16 @@
 // scripts/eval-requirements/retrieval.ts —— 黄金集的检索与追问指标（#318，ADR-0047）：对 retrieval-catalog.ts 的固定目录按角色的可见性类别派生检索投影、跑 rank()，
 // 每条算 Recall@20 与追问判定，再按失败类型 a–d 与合计分组。test/retrieval-golden.test.ts 的逐条断言与 pnpm eval:requirements 共用这里，
 // 两边的 Recall@20 是同一算法。追问按服务端的歧义判定算（ADR-0047：歧义由服务端发现，不交给模型），「该追问」= 标注了 clarify。
+// 行里另带计划模式的期望（plan-modes.ts）与模型结果（runPlanCase 填进 mode，#423、ADR-0050），分组多算一个模式正确率。
 // 纯函数，不读库、不走模型
 import type { Catalog } from '../../app/.server/catalog';
 import { deriveProjection, visibleCatalog, type ProjectionClass } from '../../app/.server/catalog/projection';
 import { judgeAmbiguity, type Ambiguity } from '../../app/.server/catalog/ambiguity';
 import { rank } from '../../app/.server/catalog/rank';
 import { vectorLane } from '../../app/.server/catalog/vector';
+import type { PlanMode } from '../../app/.server/catalog/plan';
 import { FAILURE_TYPES, type GoldenEntry } from './golden';
+import { expectedMode } from './plan-modes';
 import { RETRIEVAL_CATALOG } from './retrieval-catalog';
 
 /** 查看者（没有 sources:read）看到的目录：restricted 类，去掉数据源与源表，字段不带血缘，实体不带来源表与合并组 */
@@ -51,11 +54,18 @@ export interface RetrievalRow {
   asked: boolean;
   /** 标注了期望的追问 */
   shouldAsk: boolean;
+  /** 模型选的计划模式（runPlanCase 解析出的 plan.mode）；没跑模型为 null */
+  mode: PlanMode | null;
+  /** 期望的计划模式（plan-modes.ts 的标注） */
+  expectedMode: PlanMode;
 }
 
 export const retrievalRows = (gs: GoldenEntry[], vectors?: RetrievalVectors): RetrievalRow[] => gs.map(g => {
   const r = retrieve(g, vectors);
-  return { id: g.id, type: g.failure_type, holdout: g.holdout, recall: recallAt(g, r), top1: r.top[0] ?? null, asked: r.ambiguous, shouldAsk: g.clarify !== null };
+  return {
+    id: g.id, type: g.failure_type, holdout: g.holdout, recall: recallAt(g, r), top1: r.top[0] ?? null,
+    asked: r.ambiguous, shouldAsk: g.clarify !== null, mode: null, expectedMode: expectedMode(g),
+  };
 });
 
 export interface GroupStats {
@@ -66,6 +76,8 @@ export interface GroupStats {
   clarifyAccuracy: number;
   /** 应追问的条目里追问了的比例；组里没有应追问的条目时为 null */
   clarifyRecall: number | null;
+  /** 计划模式与期望一致的条数 / 有模型结果的条数（#423，ADR-0050）；组里一条都没跑模型时为 null */
+  modeAccuracy: number | null;
 }
 
 export type GroupKey = (typeof FAILURE_TYPES)[number] | '合计';
@@ -75,11 +87,13 @@ const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.l
 
 function stats(rows: RetrievalRow[]): GroupStats {
   const should = rows.filter(r => r.shouldAsk);
+  const planned = rows.filter(r => r.mode !== null);
   return {
     cases: rows.length,
     recall: mean(rows.flatMap(r => (r.recall === null ? [] : [r.recall]))),
     clarifyAccuracy: rows.length ? rows.filter(r => r.asked === r.shouldAsk).length / rows.length : 1,
     clarifyRecall: should.length ? should.filter(r => r.asked).length / should.length : null,
+    modeAccuracy: planned.length ? planned.filter(r => r.mode === r.expectedMode).length / planned.length : null,
   };
 }
 

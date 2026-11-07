@@ -1,12 +1,15 @@
 // test/eval-requirements.test.ts —— 需求评测（#279，ADR-0041）：黄金集的期望都能对着固定上下文过校验、指标与标签都有、只引用目录里有的字段；
-// runCase 用假 fetch 跑出的校验通过与结构命中：与期望一致、字段写错、不合 Schema（纯函数，不读库）
+// runCase 用假 fetch 跑出的校验通过与结构命中：与期望一致、字段写错、不合 Schema；runPlanCase（#423，ADR-0050）用假模型选计划模式：
+// 一致记对、不一致或解析失败记错，查看者条目用查看者目录（纯函数，不读库）
 import { afterEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 import { expand } from '../app/.server/catalog';
+import { semanticHash, type PlanMode } from '../app/.server/catalog/plan';
 import { setLlmFetch } from '../app/.server/llm';
 import { DSL_KINDS } from '../app/.server/pipeline/dsl';
-import { CATALOG, CONTEXT, GOLDEN } from '../scripts/eval-requirements/golden';
-import { runCase, summarize } from '../scripts/eval-requirements/score';
+import { CATALOG, CONTEXT, GOLDEN, GOLDEN_ALL } from '../scripts/eval-requirements/golden';
+import { RETRIEVAL_CATALOG } from '../scripts/eval-requirements/retrieval-catalog';
+import { runCase, runPlanCase, summarize } from '../scripts/eval-requirements/score';
 import { fakeLlm, json } from './pipeline/llm-fixtures';
 
 afterEach(() => { setLlmFetch(undefined); });
@@ -14,6 +17,7 @@ afterEach(() => { setLlmFetch(undefined); });
 const PROVIDER = { baseUrl: 'https://llm.example.com/v1', model: 'test-model', apiKey: 'sk-eval-secret', source: 'platform' as const };
 
 const caseNamed = (id: string) => GOLDEN.find(c => c.id === id)!;
+const entryNamed = (id: string) => GOLDEN_ALL.find(g => g.id === id)!;
 const clone = <T>(x: T): T => structuredClone(x);
 
 describe('需求黄金集', () => {
@@ -112,5 +116,49 @@ describe('需求评测跑分', () => {
       { id: 'a', kind: 'metric', valid: true, structure, hits: 6, items: 6, hitRate: 1 },
       { id: 'b', kind: 'tag', valid: false, structure, hits: 1, items: 3, hitRate: 1 / 3, failed: { stage: 'definition', message: 'x' } },
     ])).toEqual({ cases: 2, valid: 1, validRate: 0.5, hits: 7, items: 9, hitRate: 7 / 9 });
+  });
+});
+
+describe('计划模式评测', () => {
+  /** 合 Schema 的最小计划：模式可换，clarify 要带问题、unsupported 要带 reason */
+  const plan = (mode: PlanMode, extra: Record<string, unknown> = {}) =>
+    ({ schemaVersion: 1, mode, selected: [], request: { dimensions: [] }, steps: [], assumptions: [], questions: [], ...extra });
+
+  it('模式一致记对：user 消息带前 20 条目、可选中条目的版本与语义哈希、需求原文', async () => {
+    const g = entryNamed('gmv-alias'); // 期望 reuse_result：gross_revenue_30d 挂着 GMV 别名
+    const { received } = fakeLlm(setLlmFetch, () => json(plan('reuse_result')));
+    expect(await runPlanCase(PROVIDER, g)).toEqual({ id: 'gmv-alias', mode: 'reuse_result', expected: 'reuse_result', correct: true });
+    const body = JSON.parse(JSON.stringify(received[0]!.body));
+    expect(body.messages[0].content).toContain('reuse_result');
+    expect(body.messages[0].content).toContain('unsupported');
+    const user = body.messages[1].content as string;
+    expect(user.endsWith(`# 需求\n\n${g.request}`)).toBe(true);
+    expect(user).toContain('metric:gross_revenue_30d');
+    expect(user).toContain(semanticHash(expand(RETRIEVAL_CATALOG, 'metric:gross_revenue_30d')!));
+  });
+
+  it('查看者条目用查看者目录：消息里没有数据源与源表', async () => {
+    const g = entryNamed('viewer-paid-revenue'); // 期望 reuse_result：revenue_paid_30d 查看者也可见
+    const { received } = fakeLlm(setLlmFetch, () => json(plan('reuse_result')));
+    expect(await runPlanCase(PROVIDER, g)).toEqual({ id: 'viewer-paid-revenue', mode: 'reuse_result', expected: 'reuse_result', correct: true });
+    expect(received[0]!.body.messages[1].content).not.toContain('source:');
+    expect(received[0]!.body.messages[1].content).not.toContain('table:');
+  });
+
+  it('模式不一致记错；不合 Schema 或计划结构不合法时 mode 为 null 也记错，Key 不出现在结果里', async () => {
+    const g = entryNamed('gmv-alias');
+    fakeLlm(setLlmFetch, () => json(plan('draft_query')));
+    expect(await runPlanCase(PROVIDER, g)).toMatchObject({ mode: 'draft_query', expected: 'reuse_result', correct: false });
+
+    fakeLlm(setLlmFetch, () => json({ schemaVersion: 1, mode: 'reuse_result' })); // 缺必填项，不合 Schema
+    const bad = await runPlanCase(PROVIDER, g);
+    expect(bad).toMatchObject({ mode: null, expected: 'reuse_result', correct: false, failed: { stage: 'model' } });
+    expect(JSON.stringify(bad)).not.toContain(PROVIDER.apiKey);
+
+    // 合 Schema 但步骤引用不存在的步骤：validatePlan 解析不出计划
+    fakeLlm(setLlmFetch, () => json(plan('clarify', { questions: ['按哪个口径？'], steps: [{ id: 's1', action: 'answer', inputs: ['nope'] }] })));
+    const broken = await runPlanCase(PROVIDER, g);
+    expect(broken).toMatchObject({ mode: null, correct: false, failed: { stage: 'plan' } });
+    expect(broken.failed!.message).toContain('inputs 引用了不存在的步骤或条目');
   });
 });
