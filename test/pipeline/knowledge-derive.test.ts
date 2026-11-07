@@ -73,7 +73,9 @@ describe('系统口径进目录', () => {
     const c3 = await tenantCatalog(acme);
     expect(expand(c3, 'metric:paid_revenue')).toMatchObject({ system: { claims: claims('unknown', 'order_time') } });
     expect(expand(c3, 'tag:high_value')).toMatchObject({ system: { claims: claims('not_applicable', 'order_time') } });
-  });
+    // 每个用例都跑一次 publishedIdentitySources({ orders: true })（3 个源登记 / 采集 / 同步 + 6 次映射发布，夹具平均 26.8 s、中位 30.1 s，
+    // docs/test-plans/test-duration-report.md），再叠加 resetDb、4 次 publishDefinition、6 次 search，完整测试 4 个 worker 共用一台 PG 时超过默认的 90 s
+  }, 180_000);
 
   it('成员写的口径声明在 knowledge.claims，派生声明在 system.claims，两边分开不合并', async () => {
     const { acme, reviewer } = await publishedIdentitySources({ orders: true });
@@ -85,5 +87,6 @@ describe('系统口径进目录', () => {
     const metric = expand(await tenantCatalog(acme), 'metric:paid_revenue')!;
     expect(metric).toMatchObject({ knowledge: { claims: [{ type: 'currency', value: 'CNY' }] } });
     expect(metric.kind === 'metric' && metric.system.claims.find(x => x.type === 'currency')).toEqual({ type: 'currency', value: 'unknown' });
-  });
+    // 同一重夹具 publishedIdentitySources({ orders: true })，负载下与上一个用例一样会逼近 90 s，一并放宽
+  }, 180_000);
 });
