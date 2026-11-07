@@ -227,6 +227,24 @@ describe('计划随对话，存草稿前重新校验（ADR-0050）', () => {
     expect(await versions()).toBe(before);
   });
 
+  it('校验过的是 clarify 计划（needs_clarification）：存草稿被拒、不写 dsl_versions，答复写明计划状态，不说「已过期」', async () => {
+    const { analyst, plan: reuse } = await memberCountPlan();
+    const plan = { ...reuse, mode: 'clarify' as const, steps: [], questions: ['会员数按注册时间还是按最近活跃统计？'] };
+    const before = (await getDb().select().from(dslVersions)).length;
+    const steps = [
+      toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+      toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'member_count', yaml: COUNT_MEMBERS } }, TOOL_USAGE),
+    ];
+    const { received } = fakeLlm(setLlmFetch, n => steps[n - 1] ?? text('先澄清', TEXT_USAGE));
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '统计会员数并保存' }], PAGE);
+    expect(turn).toEqual({ reply: '先澄清', toolsUsed: ['catalog_search', 'validate_plan', 'save_definition_draft'], plan });
+    const tool = received[3].body.messages.filter(m => m.role === 'tool').at(-1)!;
+    expect(tool.content).toContain('计划状态是 needs_clarification（mode 是 clarify）');
+    expect(tool.content).not.toContain('已过期');
+    expect(await getDb().select().from(dslVersions)).toHaveLength(before);
+  });
+
   it('两次请求之间指标被删除（看不到所选条目）：拒绝保存、不写 dsl_versions，答复说明原因', async () => {
     const { acme, saveDirectly, versions } = await validatedPlan();
     // deleteDefinition 要 definitions:write，分析师没有，由管理员删
