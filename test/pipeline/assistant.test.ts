@@ -10,7 +10,7 @@ import { auditLogs, dslVersions, llmCalls, mappingVersions } from '../../app/.se
 import { assistantTurn, MAX_FIXES, MAX_TOOL_CALLS } from '../../app/.server/assistant/loop';
 import { catalogFor, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { semanticHash } from '../../app/.server/catalog/plan';
-import { publishDefinition } from '../../app/.server/dsl-definitions';
+import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { setLlmFetch } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
@@ -93,7 +93,8 @@ describe('AI 助手的一轮问答', () => {
     const { received } = fakeLlm(setLlmFetch, n => steps[n - 1] ?? text('计划可用，可以按它回答', TEXT_USAGE));
 
     const turn = await assistantTurn(author, [{ role: 'user', content: '消费者分析能直接用现有目录吗' }], PAGE);
-    expect(turn).toEqual({ reply: '计划可用，可以按它回答', toolsUsed: ['catalog_search', 'validate_plan'] });
+    // 本轮校验过的计划随答复返回（ADR-0050，路由存进对话），不传 priorPlan 时也只是没有兜底
+    expect(turn).toEqual({ reply: '计划可用，可以按它回答', toolsUsed: ['catalog_search', 'validate_plan'], plan });
     // 检索到的条目在同一个候选集合里：第二轮的 validate_plan 认第一轮 catalog_search 返回的 entity:customer
     const tool = received[2].body.messages.filter(m => m.role === 'tool').at(-1)!;
     expect(tool.content).toContain('status: valid');
@@ -147,6 +148,71 @@ describe('AI 助手的一轮问答', () => {
 const COUNT_MEMBERS = 'base: customer\nmeasure: { agg: count }\n';
 const BAD_METRIC = 'base: nope\nmeasure: { agg: count }\n';
 const TIER = 'metric: member_count\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n';
+
+describe('计划随对话，存草稿前重新校验（ADR-0050）', () => {
+  /** 数据工程师建、另一位发布 member_count v1；分析师检索并校验选中它的计划（valid），返回这轮与计划 */
+  async function validatedPlan() {
+    const { acme, author, reviewer } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    await createDefinition(author, 'metric', 'member_count', COUNT_MEMBERS);
+    await publishDefinition(reviewer, 'metric', 'member_count', 1);
+    const entry = (await catalogFor(analyst)).entries.find(e => e.id === 'metric:member_count')!;
+    if (entry.kind !== 'metric') throw new Error('member_count 发布后不在目录里');
+    const plan = {
+      schemaVersion: 1 as const, mode: 'reuse_result' as const,
+      selected: [{ id: 'metric:member_count', version: entry.version, semanticHash: semanticHash(entry) }],
+      request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer' as const, inputs: ['metric:member_count'] }],
+      assumptions: [], questions: [],
+    };
+    const steps = [
+      toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+    ];
+    const { received } = fakeLlm(setLlmFetch, n => steps[n - 1] ?? text('计划可用', TEXT_USAGE));
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '统计会员数' }], PAGE);
+    expect(turn).toEqual({ reply: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'], plan });
+    return {
+      acme, analyst, author, reviewer, plan,
+      versions: async () => (await getDb().select().from(dslVersions)).length,
+      // 第二轮：模型不再检索校验，直接拿着对话里的计划保存（priorPlan 由调用方传入）
+      saveDirectly: async () => {
+        const direct = fakeLlm(setLlmFetch, n => n === 1
+          ? toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'member_count', yaml: COUNT_MEMBERS } }, TOOL_USAGE)
+          : text('好的，先重新检索', TEXT_USAGE));
+        const second = await assistantTurn(analyst, [{ role: 'user', content: '把它保存为草稿' }], PAGE, plan);
+        return { second, tool: direct.received[1].body.messages.filter(m => m.role === 'tool').at(-1)! };
+      },
+    };
+  }
+
+  it('两次请求之间发布了新版本指标（依赖变了）：拒绝保存、不写 dsl_versions，答复说明原因并提示重新检索', async () => {
+    const { author, reviewer, saveDirectly, versions } = await validatedPlan();
+    // 两次请求之间另一位成员存了第 2 版并发布：目录里是 v2，计划里的 v1 过期
+    await saveDslDraft(author, 'metric', 'member_count', `# 换个说法\n${COUNT_MEMBERS}`);
+    await publishDefinition(reviewer, 'metric', 'member_count', 2);
+    const before = await versions();
+    const { second, tool } = await saveDirectly();
+    expect(second.plan).toBeUndefined();
+    expect(tool.content).toContain('未保存：计划已过期，存草稿前用当前目录重新校验没有通过。');
+    expect(tool.content).toContain('依赖变了');
+    expect(tool.content).toContain('请重新检索并校验计划后再保存');
+    expect(await versions()).toBe(before);
+  });
+
+  it('两次请求之间指标被删除（看不到所选条目）：拒绝保存、不写 dsl_versions，答复说明原因', async () => {
+    const { acme, saveDirectly, versions } = await validatedPlan();
+    // deleteDefinition 要 definitions:write，分析师没有，由管理员删
+    await deleteDefinition(await memberOf(acme, 'admin@acme.com', 'admin'), 'metric', 'member_count');
+    const before = await versions();
+    const { second, tool } = await saveDirectly();
+    expect(second.reply).toBe('好的，先重新检索');
+    expect(tool.content).toContain('未保存：计划已过期，存草稿前用当前目录重新校验没有通过。');
+    expect(tool.content).toContain('看不到所选条目');
+    expect(await versions()).toBe(before);
+  });
+});
 
 const drafted = (tenantId: string, action: string) =>
   getDb().select().from(auditLogs).where(and(eq(auditLogs.tenantId, tenantId), eq(auditLogs.action, action as never)));
