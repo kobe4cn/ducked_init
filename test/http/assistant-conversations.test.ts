@@ -235,6 +235,7 @@ describe('助手对话', () => {
       toolCalls({ name: 'catalog_search', args: { query: '订单金额' } }),
       toolCalls({ name: 'validate_plan', args: { plan } }),
       text('可以复用现有结果'),
+      text('收到'),
     ];
     const { received } = fakeLlm(f => app.setLlmFetch(f), n => replies[n - 1]);
     const first = await (await post(client, { message: '统计各金额的订单', page: PAGE })).json();
@@ -269,10 +270,23 @@ describe('助手对话', () => {
     expect(JSON.stringify(viewerCard)).not.toContain(table.description);
     expect(JSON.stringify(viewerCard)).not.toContain('源表');
 
-    // 卡片只读时组装、不写库，也不进发给模型的历史（「暂无快照」只出现在组装出的卡片里，计划原文经工具调用参数另说）
+    // 卡片只读时组装、不写库：解密后的消息体仍存着 plan，但没有 planCard，也没有卡片才有的文字
     const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
-    expect(row.sealed).not.toContain('计划');
-    expect(JSON.stringify(received[2].body.messages)).not.toContain('暂无快照');
+    const body = (await decryptForTenant(acme, ASSISTANT_CONTEXT, row.sealed)).body;
+    expect(JSON.parse(body).messages[1].plan).toEqual(plan);
+    expect(body).not.toContain('planCard');
+    expect(body).not.toContain('暂无快照');
+    expect(body).not.toContain('计划已通过校验');
+
+    // 也不进发给模型的历史：续写一轮，这轮发给模型的历史里上一条 assistant 的 content 原样是答复正文，不带卡片
+    const next = await (await post(client, { conversationId: first.conversationId, message: '好的', page: PAGE })).json();
+    expect(next).toMatchObject({ reply: '收到' });
+    const history = received[3].body.messages;
+    const sent = JSON.stringify(history);
+    expect(sent).not.toContain('暂无快照');
+    expect(sent).not.toContain('planCard');
+    expect(sent).not.toContain(customer.description);
+    expect(history.find((m: { role: string }) => m.role === 'assistant')?.content).toBe('可以复用现有结果');
   });
 
   it('续写时路由从完整对话里取最近一份计划作存草稿前重新校验的依据：两次请求之间发布了新版本，第二次直接保存被拒、不写 dsl_versions（ADR-0050）', async () => {
