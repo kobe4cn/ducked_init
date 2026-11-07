@@ -1,6 +1,7 @@
 // app/routes/assistant.tsx —— AI 助手的资源路由（ADR-0043），顶栏侧栏（AssistantPanel）用它：任一登录成员都可以用。
 // GET 返回是否配置了模型服务、最近一次探测是否支持工具调用（toolSupport：true / false / 没探测过为 null）、能否管理模型服务（canManageProvider，侧栏据此决定给不给「模型服务」页的链接）、成员可用的工具名、「我的对话」与「分享给我的」两个列表；带 ?id= 时再返回这个对话（本人或被分享人才能读，否则 404）。
-// POST 接 JSON：{ conversationId?, message, page } 跑一轮问答（历史从保存的对话里取，只有本人能续写），记进对话后返回 { conversationId, reply, toolsUsed }；
+// POST 接 JSON：{ conversationId?, message, page } 跑一轮问答（历史从保存的对话里取，只有本人能续写），记进对话后返回 { conversationId, reply, toolsUsed, workbenchSql? }
+// （workbenchSql 是本轮 prefill_workbench 通过校验的 SQL，有值时才带，前端拿它渲染「填入工作台」链接）；
 // 计划随对话保存（ADR-0050）：本轮校验过的计划存进 assistant 消息，续写时把对话里最近一份带给 assistantTurn 作 priorPlan（存草稿前重新校验用），发给模型的只有文字；
 // { intent: 'share' | 'unshare', conversationId, email } 分享或撤销分享自己的对话。出错返回 { error } 与对应状态码
 import type { Route } from './+types/assistant';
@@ -66,8 +67,11 @@ export async function action({ request }: Route.ActionArgs) {
       priorPlan = conversation.messages.filter(m => m.plan).at(-1)?.plan;
     }
     const page = { path: String(body?.page?.path ?? ''), title: String(body?.page?.title ?? '') };
-    const { reply, toolsUsed, plan } = await assistantTurn(member, [...history, { role: 'user', content: message }], page, priorPlan);
-    return Response.json({ conversationId: await appendTurn(member, id, message, reply, toolsUsed, plan), reply, toolsUsed });
+    const { reply, toolsUsed, plan, workbenchSql } = await assistantTurn(member, [...history, { role: 'user', content: message }], page, priorPlan);
+    return Response.json({
+      conversationId: await appendTurn(member, id, message, reply, toolsUsed, plan, workbenchSql),
+      reply, toolsUsed, ...(workbenchSql ? { workbenchSql } : {}),
+    });
   } catch (e) {
     return errorResponse(e);
   }
