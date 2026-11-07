@@ -146,6 +146,55 @@ describe('助手对话', () => {
     expect(row.sealed).not.toContain('entity:customer');
   });
 
+  it('填入工作台通过的 SQL 随对话加密保存：POST 返回与 ?id= 读回的 assistant 消息都带 workbenchSql、sealed 里没有明文；被拒的那轮不带（#437）', async () => {
+    const { acme } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const client = await loginAs(app, 'analyst@acme.com');
+    // 计划照上一条用例选中 entity:customer，mode 改成 draft_query（draft_query 不做口径与粒度检查，校验仍是 valid）
+    const hash = semanticHash((await catalogFor(analyst)).entries.find(e => e.id === 'entity:customer')!);
+    const plan = {
+      schemaVersion: 1, mode: 'draft_query',
+      selected: [{ id: 'entity:customer', semanticHash: hash }],
+      request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: ['entity:customer'] }],
+      assumptions: [], questions: [],
+    };
+    // 工作台 AI 用过的按城市统计 SQL（test/pipeline/workbench-ai.test.ts）
+    const CITY_COUNT = 'SELECT city, count(*) AS n FROM silver.customer GROUP BY city';
+    const replies = [
+      toolCalls({ name: 'catalog_search', args: { query: 'customer' } }),
+      toolCalls({ name: 'validate_plan', args: { plan } }),
+      toolCalls({ name: 'prefill_workbench', args: { sql: `  ${CITY_COUNT};\n` } }),
+      text('SQL 已准备好'),
+      // 第二轮：校验 reuse_result 计划后填工作台被拒（只有 draft_query 的计划能填）
+      toolCalls({ name: 'catalog_search', args: { query: 'customer' } }),
+      toolCalls({ name: 'validate_plan', args: { plan: { ...plan, mode: 'reuse_result' as const } } }),
+      toolCalls({ name: 'prefill_workbench', args: { sql: CITY_COUNT } }),
+      text('这次没有填入'),
+    ];
+    const { received } = fakeLlm(f => app.setLlmFetch(f), n => replies[n - 1]);
+    // 通过的那轮：返回的 workbenchSql 是去掉首尾空白与结尾分号后的 SQL
+    const first = await (await post(client, { message: '按城市统计客户', page: PAGE })).json();
+    expect(first).toMatchObject({ reply: 'SQL 已准备好', toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench'], workbenchSql: CITY_COUNT });
+
+    // ?id= 读回：assistant 消息带 workbenchSql，content 里只有答复文字
+    const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(conversation.messages).toEqual([
+      { role: 'user', content: '按城市统计客户' },
+      { role: 'assistant', content: 'SQL 已准备好', toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench'], plan, workbenchSql: CITY_COUNT },
+    ]);
+    // 库里只有密文
+    const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
+    expect(row.sealed).not.toContain('silver.customer');
+
+    // 被拒的那轮：POST 返回与读回的 assistant 消息都没有 workbenchSql；发给模型的历史也不带 SQL（content 里不写 SQL）
+    const second = await (await post(client, { conversationId: first.conversationId, message: '再按会员数统计', page: PAGE })).json();
+    expect(second).toEqual({ conversationId: first.conversationId, reply: '这次没有填入', toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench'] });
+    const after = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(after.conversation.messages.at(-1)).not.toHaveProperty('workbenchSql');
+    expect(JSON.stringify(received[4].body.messages)).not.toContain('silver.customer');
+  });
+
   it('续写时路由从完整对话里取最近一份计划作存草稿前重新校验的依据：两次请求之间发布了新版本，第二次直接保存被拒、不写 dsl_versions（ADR-0050）', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources();
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
