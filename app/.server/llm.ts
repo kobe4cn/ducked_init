@@ -76,8 +76,8 @@ export function embeddingSource(row: { embeddingBaseUrl: string | null } | undef
   return LLM_EMBEDDING_BASE_URL && LLM_EMBEDDING_MODEL && LLM_EMBEDDING_API_KEY ? 'platform' : null;
 }
 
-/** 平台默认的 embedding 端点、模型与 Key（环境变量 LLM_EMBEDDING_*）；只在三个变量都有时调用 */
-const platformEmbeddingProvider = (): LlmProvider =>
+/** 平台默认的 embedding 端点、模型与 Key（环境变量 LLM_EMBEDDING_*）；只在三个变量都有时调用。导出给评测脚本与测试直接用 */
+export const platformEmbeddingProvider = (): LlmProvider =>
   ({ baseUrl: process.env.LLM_EMBEDDING_BASE_URL!, model: process.env.LLM_EMBEDDING_MODEL!, apiKey: process.env.LLM_EMBEDDING_API_KEY!, source: 'platform' });
 
 /** 按 embeddingSource 选出的那一套端点、模型与 Key（租户的 Key 用与 chat 相同的 context 解密后返回）；都没配置返回 null */
@@ -272,3 +272,18 @@ export async function embed(tenantId: string, texts: string[]): Promise<number[]
     (p, stats) => masked(p.apiKey, () => postEmbeddings(p, texts, stats)),
     async () => provider, texts.length);
 }
+
+/**
+ * 用给定的端点调一次 /embeddings，返回按输入顺序排好的向量。不查库、不记日志（评测脚本直接用它，产品走 embed / embedWith）；
+ * 失败与 callModel 一样抛抹掉 Key 的 LlmError
+ */
+export async function callEmbeddings(provider: LlmProvider, texts: string[], stats: CallStats = { schemaValid: null }): Promise<number[][]> {
+  return masked(provider.apiKey, () => postEmbeddings(provider, texts, stats));
+}
+
+/**
+ * 按调用方传入的 embedding 端点调 /embeddings 并记调用日志（日志口径同 embed：purpose embedding、模型、条数、prompt_tokens 与耗时，
+ * 不记请求文本与向量）。补算用 provider 由调用方在开始时解析一次传入，保证一次补算只用一个模型，不会中途换端点
+ */
+export const embedWith = (tenantId: string, provider: LlmProvider, texts: string[]): Promise<number[][]> =>
+  logged(tenantId, 'embedding', (p, stats) => callEmbeddings(p, texts, stats), async () => provider, texts.length);
