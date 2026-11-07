@@ -29,7 +29,7 @@ export function retrieve(g: GoldenEntry, vectors?: RetrievalVectors): Retrieved 
   const v = VIEWS[g.role === 'viewer' ? 'restricted' : 'full'];
   const viewRows = v.rows.filter(r => !r.entryId.startsWith('capability:'));
   const queryVec = vectors?.queries.get(g.id);
-  const ranked = rank(viewRows, v.catalog, g.retrieval.query, {}, LIMIT, queryVec ? vectorLane(queryVec, viewRows, vectors!.rows) : []);
+  const ranked = rank(viewRows, v.catalog, g.retrieval.query, {}, LIMIT, vectors && queryVec ? vectorLane(queryVec, viewRows, vectors.rows) : []);
   const top = ranked.map(r => r.entry.id);
   const hits = g.retrieval.candidates.filter(id => top.includes(id)).length;
   // 歧义判定用同一个排序结果（ambiguity.ts）
