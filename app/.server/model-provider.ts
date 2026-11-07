@@ -1,14 +1,15 @@
 // app/.server/model-provider.ts —— 租户自己的模型服务配置（ADR-0035，仅管理员）：查看当前生效的来源、保存端点 / 模型名 / API Key、
 // 恢复平台默认、测试连通性。API Key 用租户数据密钥加密（ADR-0009），读出来只告诉页面「已设置」，明文与密文都不出这个模块；
 // 留空保存沿用原来的 Key，审计只记端点、模型名与是否轮换。是否发送脱敏样本也在这里开关，tableContextFor 按它组织给模型的表上下文。
-// 测试连通性时的工具调用探测结果连同当时的端点、模型存下来，toolSupport 给 AI 助手判断能不能用
+// 测试连通性时的工具调用探测结果连同当时的端点、模型存下来，toolSupport 给 AI 助手判断能不能用。
+// embedding 端点（ADR-0049）自成一套同样的保存 / 恢复 / 测试，与 chat 互不影响
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { modelProviders } from './db/schema';
-import { chatJson, chatTools, LlmError, MODEL_PROVIDER_CONTEXT, platformProvider, providerSource, resolveProvider } from './llm';
+import { chatJson, chatTools, embed, embeddingSource, LlmError, MODEL_PROVIDER_CONTEXT, platformProvider, providerSource, resolveEmbeddingProvider, resolveProvider } from './llm';
 import { buildTableContext, type TableContext } from './pipeline/llm-context';
 import { decryptForTenant, encryptForTenant } from './secrets';
 import { maskedSample, SourceViewError } from './source-views';
@@ -26,6 +27,8 @@ export interface ModelProviderView {
   model: string | null;
   apiKeySet: boolean;
   allowSamples: boolean;
+  /** embedding 端点（ADR-0049）自成一套，与 chat 互不影响：来源按 embeddingSource 另算，没有版本共用一个租户 */
+  embedding: { source: 'tenant' | 'platform' | 'none'; baseUrl: string | null; model: string | null; apiKeySet: boolean };
 }
 
 const rowOf = async (tenantId: string) =>
@@ -44,6 +47,12 @@ export async function getModelProvider(actor: CurrentMember): Promise<ModelProvi
     model: row?.model ?? null,
     apiKeySet: Boolean(row?.apiKey),
     allowSamples: row?.allowSamples ?? false,
+    embedding: {
+      source: embeddingSource(row) ?? 'none',
+      baseUrl: row?.embeddingBaseUrl ?? null,
+      model: row?.embeddingModel ?? null,
+      apiKeySet: Boolean(row?.embeddingApiKey),
+    },
   };
 }
 
@@ -59,8 +68,21 @@ function parseBaseUrl(raw: string) {
 const NO_PROBE = { toolsSupported: null, toolsProbedBaseUrl: null, toolsProbedModel: null };
 
 /**
- * 保存本租户的模型服务：apiKey 留空沿用原来的 Key，填了新值就加密保存并在审计里记轮换。
+ * 决定 API Key 怎么存（chat 与 embedding 共用）：留空且端点没变就沿用密文，填了新值就加密保存并报轮换。
  * 第一次配置与改了端点时必须填 Key：否则拿到管理员会话就能把已存的 Key 发到自己的主机上（ADR-0035）
+ */
+async function sealApiKey(tenantId: string, existing: string | null, existingBaseUrl: string | null, baseUrl: string, apiKey: string) {
+  if (!apiKey && !(existing && existingBaseUrl === baseUrl)) {
+    throw new ModelProviderError(existing ? '改了端点须重新填写 API Key' : '第一次配置须填写 API Key');
+  }
+  const previous = existing ? (await decryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, existing)).apiKey : null;
+  const rotated = Boolean(apiKey) && apiKey !== previous;
+  // 没轮换时 existing 一定有：留空要求沿用，填了同一个值说明原来就有
+  return { sealed: rotated ? await encryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, { apiKey }) : existing ?? null, rotated };
+}
+
+/**
+ * 保存本租户的模型服务：apiKey 留空沿用原来的 Key，填了新值就加密保存并在审计里记轮换
  */
 export async function saveModelProvider(actor: CurrentMember, input: { baseUrl: string; model: string; apiKey: string }) {
   assertCan(actor, 'model_provider:manage');
@@ -68,15 +90,8 @@ export async function saveModelProvider(actor: CurrentMember, input: { baseUrl: 
   const baseUrl = parseBaseUrl(input.baseUrl);
   const model = input.model.trim();
   if (!model) throw new ModelProviderError('请填写模型名');
-  const apiKey = input.apiKey.trim();
   const row = await rowOf(tenantId);
-  const kept = row?.apiKey && row.baseUrl === baseUrl ? row.apiKey : null;
-  if (!apiKey && !kept) throw new ModelProviderError(row?.apiKey ? '改了端点须重新填写 API Key' : '第一次配置须填写 API Key');
-
-  const previous = row?.apiKey ? (await decryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, row.apiKey)).apiKey : null;
-  const rotated = Boolean(apiKey) && apiKey !== previous;
-  // 没轮换时 row.apiKey 一定有：留空要求 kept，填了同一个值说明原来就有
-  const sealed = rotated ? await encryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, { apiKey }) : row?.apiKey ?? null;
+  const { sealed, rotated } = await sealApiKey(tenantId, row?.apiKey ?? null, row?.baseUrl ?? null, baseUrl, input.apiKey.trim());
   // 端点或模型变了，旧的工具调用探测结果作废
   const probe = row?.baseUrl === baseUrl && row.model === model ? {} : NO_PROBE;
   await getDb().transaction(async tx => {
@@ -91,6 +106,27 @@ export async function saveModelProvider(actor: CurrentMember, input: { baseUrl: 
   });
 }
 
+/** 保存本租户的 embedding 端点（ADR-0049）：Key 规则与 chat 相同；只写 embedding 三列，不动 chat 配置与工具调用探测结果 */
+export async function saveEmbeddingProvider(actor: CurrentMember, input: { baseUrl: string; model: string; apiKey: string }) {
+  assertCan(actor, 'model_provider:manage');
+  const tenantId = actor.tenant.id;
+  const baseUrl = parseBaseUrl(input.baseUrl);
+  const model = input.model.trim();
+  if (!model) throw new ModelProviderError('请填写模型名');
+  const row = await rowOf(tenantId);
+  const { sealed, rotated } = await sealApiKey(tenantId, row?.embeddingApiKey ?? null, row?.embeddingBaseUrl ?? null, baseUrl, input.apiKey.trim());
+  await getDb().transaction(async tx => {
+    await tx.insert(modelProviders).values({ tenantId, embeddingBaseUrl: baseUrl, embeddingModel: model, embeddingApiKey: sealed })
+      .onConflictDoUpdate({ target: modelProviders.tenantId, set: { embeddingBaseUrl: baseUrl, embeddingModel: model, embeddingApiKey: sealed, updatedAt: new Date() } });
+    await recordAudit(tx, {
+      tenantId, actor,
+      action: 'model_provider.updated',
+      targetType: 'model_provider',
+      detail: { embedding: true, baseUrl, model, credentialsRotated: rotated },
+    });
+  });
+}
+
 /** 恢复平台默认：清空端点、模型名、Key 与工具调用探测结果（是否允许发送样本行保留），之后 resolveProvider 回到环境变量的配置。本来就没配置时什么也不做 */
 export async function resetModelProvider(actor: CurrentMember) {
   assertCan(actor, 'model_provider:manage');
@@ -100,6 +136,18 @@ export async function resetModelProvider(actor: CurrentMember) {
       .where(and(eq(modelProviders.tenantId, tenantId), isNotNull(modelProviders.baseUrl)))
       .returning({ tenantId: modelProviders.tenantId });
     if (cleared.length) await recordAudit(tx, { tenantId, actor, action: 'model_provider.reset', targetType: 'model_provider' });
+  });
+}
+
+/** 恢复 embedding 的平台默认（ADR-0049）：只清空 embedding 三列，chat 的配置与探测结果不动；本来就没配置时不记审计 */
+export async function resetEmbeddingProvider(actor: CurrentMember) {
+  assertCan(actor, 'model_provider:manage');
+  const tenantId = actor.tenant.id;
+  await getDb().transaction(async tx => {
+    const cleared = await tx.update(modelProviders).set({ embeddingBaseUrl: null, embeddingModel: null, embeddingApiKey: null, updatedAt: new Date() })
+      .where(and(eq(modelProviders.tenantId, tenantId), isNotNull(modelProviders.embeddingBaseUrl)))
+      .returning({ tenantId: modelProviders.tenantId });
+    if (cleared.length) await recordAudit(tx, { tenantId, actor, action: 'model_provider.reset', targetType: 'model_provider', detail: { embedding: true } });
   });
 }
 
@@ -148,6 +196,29 @@ export async function testModelProvider(actor: CurrentMember): Promise<Connectiv
       .onConflictDoUpdate({ target: modelProviders.tenantId, set: probe });
   }
   return { ok: true, model, durationMs, tools };
+}
+
+/** 测试 embedding：向量维度是第一条样例的长度 */
+export type EmbeddingTestResult = { ok: true; model: string; dimensions: number; durationMs: number } | { ok: false; error: string };
+
+/**
+ * 用当前生效的 embedding 配置发一条样例文本（embed 自己记 purpose=embedding 的调用日志），显示模型、维度与耗时。
+ * 错误消息由 embed 抹掉了 Key；不写探测结果、不改配置行。租户与平台都没配置时说明原因、不发请求
+ */
+export async function testEmbeddingProvider(actor: CurrentMember): Promise<EmbeddingTestResult> {
+  assertCan(actor, 'model_provider:manage');
+  const tenantId = actor.tenant.id;
+  const model = (await resolveEmbeddingProvider(tenantId))?.model ?? '';
+  const started = Date.now();
+  let vectors: number[][] | null;
+  try {
+    vectors = await embed(tenantId, ['连通测试']);
+  } catch (e) {
+    if (e instanceof LlmError) return { ok: false, error: e.message };
+    throw e;
+  }
+  if (!vectors) return { ok: false, error: '没有可用的 embedding 配置：平台没有配置默认，请先填写' };
+  return { ok: true, model, dimensions: vectors[0].length, durationMs: Date.now() - started };
 }
 
 /**

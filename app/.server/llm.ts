@@ -69,8 +69,8 @@ export async function resolveProvider(tenantId: string): Promise<LlmProvider | n
 }
 
 /** embedding 选哪一套（ADR-0049）：规则与 chat 的 providerSource 相同但互不影响——租户填了 embedding 端点就整套用租户的，
- *  否则三个 LLM_EMBEDDING_* 环境变量都有才用平台默认；都没有返回 null */
-function embeddingSource(row: { embeddingBaseUrl: string | null } | undefined): LlmProvider['source'] | null {
+ *  否则三个 LLM_EMBEDDING_* 环境变量都有才用平台默认；都没有返回 null。导出给模型服务页显示当前来源（与 chat 的 providerSource 对称） */
+export function embeddingSource(row: { embeddingBaseUrl: string | null } | undefined): LlmProvider['source'] | null {
   if (row?.embeddingBaseUrl) return 'tenant';
   const { LLM_EMBEDDING_BASE_URL, LLM_EMBEDDING_MODEL, LLM_EMBEDDING_API_KEY } = process.env;
   return LLM_EMBEDDING_BASE_URL && LLM_EMBEDDING_MODEL && LLM_EMBEDDING_API_KEY ? 'platform' : null;

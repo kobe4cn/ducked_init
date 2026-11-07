@@ -1,11 +1,12 @@
 // app/routes/model-provider.tsx —— 模型服务（仅管理员）：看当前用平台默认还是本租户配置；保存端点、模型名与 API Key（Key 不回显，留空沿用）、
-// 恢复平台默认、测试连通性（同时显示是否支持工具调用）、开关发送脱敏样本
+// 恢复平台默认、测试连通性（同时显示是否支持工具调用）、开关发送脱敏样本；embedding 端点（ADR-0049）单独一张卡，与 chat 互不影响
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleAlert } from 'lucide-react';
 import type { Route } from './+types/model-provider';
 import { requirePermission } from '~/.server/access';
 import {
-  getModelProvider, ModelProviderError, resetModelProvider, SAMPLE_ROWS, saveModelProvider, setAllowSamples, testModelProvider,
+  getModelProvider, ModelProviderError, resetEmbeddingProvider, resetModelProvider, SAMPLE_ROWS, saveEmbeddingProvider, saveModelProvider,
+  setAllowSamples, testEmbeddingProvider, testModelProvider,
 } from '~/.server/model-provider';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
@@ -34,6 +35,15 @@ export async function action({ request }: Route.ActionArgs) {
       case 'save':
         await saveModelProvider(member, { baseUrl: field('baseUrl'), model: field('model'), apiKey: field('apiKey') });
         break;
+      case 'embedding_save':
+        await saveEmbeddingProvider(member, { baseUrl: field('embeddingBaseUrl'), model: field('embeddingModel'), apiKey: field('embeddingApiKey') });
+        break;
+      case 'embedding_reset':
+        await resetEmbeddingProvider(member);
+        break;
+      case 'embedding_test':
+        // 不重定向：测试结果只在这次响应里展示
+        return { embeddingTested: await testEmbeddingProvider(member) };
       case 'reset':
         await resetModelProvider(member);
         break;
@@ -59,9 +69,18 @@ const SOURCE_LABEL = {
   none: '还没有可用的模型服务：平台没有配置默认，请在下面填写',
 } as const;
 
+const EMBEDDING_SOURCE_LABEL = {
+  tenant: '当前使用本租户的 embedding 配置',
+  platform: '当前使用平台默认的 embedding 端点',
+  none: '还没有配置 embedding：不配置时目录检索只用关键词',
+} as const;
+
 export default function ModelProvider({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, provider, sampleRows } = loaderData;
   const submitting = useNavigation().state === 'submitting';
+  // 三个成员的联合会被 TS 规范化成带交叉可选属性的形状（tested?: undefined），in 之后属性仍可能 undefined，先收进局部再判空
+  const tested = actionData && 'tested' in actionData ? actionData.tested : null;
+  const embeddingTested = actionData && 'embeddingTested' in actionData ? actionData.embeddingTested : null;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -77,19 +96,19 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
         </Alert>
       )}
 
-      {actionData && 'tested' in actionData && (actionData.tested.ok ? (
+      {tested && (tested.ok ? (
         <Alert role="status" data-connectivity="ok">
           <CheckCircle2 className="text-emerald-600" />
           <AlertTitle>连通成功</AlertTitle>
           <AlertDescription className="space-y-1">
-            <div data-model={actionData.tested.model} data-duration-ms={actionData.tested.durationMs}>
-              模型 {actionData.tested.model}，耗时 {actionData.tested.durationMs} ms
+            <div data-model={tested.model} data-duration-ms={tested.durationMs}>
+              模型 {tested.model}，耗时 {tested.durationMs} ms
             </div>
-            {actionData.tested.tools ? (
+            {tested.tools ? (
               <div data-tools="yes" className="flex items-center gap-1 text-emerald-600">
                 <CheckCircle2 className="size-4" />支持工具调用
               </div>
-            ) : actionData.tested.tools === false ? (
+            ) : tested.tools === false ? (
               <div data-tools="no" className="flex items-center gap-1 text-amber-600">
                 <AlertTriangle className="size-4" />该模型服务不支持工具调用，AI 助手无法使用
               </div>
@@ -104,7 +123,29 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
         <Alert variant="destructive" role="alert" data-connectivity="failed">
           <CircleAlert />
           <AlertTitle>连通失败</AlertTitle>
-          <AlertDescription>{actionData.tested.error}</AlertDescription>
+          <AlertDescription>{tested.error}</AlertDescription>
+        </Alert>
+      ))}
+
+      {embeddingTested && (embeddingTested.ok ? (
+        <Alert role="status" data-embedding-test="ok">
+          <CheckCircle2 className="text-emerald-600" />
+          <AlertTitle>连通成功</AlertTitle>
+          <AlertDescription>
+            <div
+              data-embedding-model={embeddingTested.model}
+              data-embedding-dimensions={embeddingTested.dimensions}
+              data-embedding-duration-ms={embeddingTested.durationMs}
+            >
+              模型 {embeddingTested.model}，维度 {embeddingTested.dimensions}，耗时 {embeddingTested.durationMs} ms
+            </div>
+          </AlertDescription>
+        </Alert>
+      ) : (
+        <Alert variant="destructive" role="alert" data-embedding-test="failed">
+          <CircleAlert />
+          <AlertTitle>连通失败</AlertTitle>
+          <AlertDescription>{embeddingTested.error}</AlertDescription>
         </Alert>
       ))}
 
@@ -154,6 +195,56 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
                 placeholder={provider.apiKeySet ? '已设置，留空不修改' : '未设置'}
               />
               {provider.apiKeySet && <FieldDescription>改了端点须重新填写，原来的 Key 不会发给新的端点。</FieldDescription>}
+            </Field>
+            <div>
+              <Button type="submit" disabled={submitting}>保存</Button>
+            </div>
+          </FieldGroup>
+        </Form>
+      </div>
+
+      <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        <SectionHeader title="向量检索（可选）">
+          <span data-embedding-source={provider.embedding.source}>{EMBEDDING_SOURCE_LABEL[provider.embedding.source]}</span>
+        </SectionHeader>
+        <div className="flex flex-wrap gap-2">
+          <Form method="post">
+            <input type="hidden" name="intent" value="embedding_test" />
+            <Button type="submit" variant="outline" disabled={submitting || provider.embedding.source === 'none'}>测试 embedding</Button>
+          </Form>
+          {provider.embedding.source === 'tenant' && (
+            <Form
+              method="post"
+              onSubmit={e => { if (!confirm('确定恢复平台默认？将清空本租户填写的 embedding 端点、模型名与 API Key。')) e.preventDefault(); }}
+            >
+              <input type="hidden" name="intent" value="embedding_reset" />
+              <Button type="submit" variant="destructive" disabled={submitting}>恢复平台默认</Button>
+            </Form>
+          )}
+        </div>
+        <Form method="post">
+          <input type="hidden" name="intent" value="embedding_save" />
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="embedding-base-url">端点</FieldLabel>
+              <Input id="embedding-base-url" name="embeddingBaseUrl" required defaultValue={provider.embedding.baseUrl ?? ''} placeholder="https://api.openai.com/v1" />
+              <FieldDescription>平台会请求「端点/embeddings」，配置后语义检索把文字转成向量比对。</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="embedding-model">模型名</FieldLabel>
+              <Input id="embedding-model" name="embeddingModel" required defaultValue={provider.embedding.model ?? ''} placeholder="如：text-embedding-v3" />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="embedding-api-key">API Key</FieldLabel>
+              <Input
+                id="embedding-api-key"
+                name="embeddingApiKey"
+                type="password"
+                autoComplete="off"
+                required={!provider.embedding.apiKeySet}
+                placeholder={provider.embedding.apiKeySet ? '已设置，留空不修改' : '未设置'}
+              />
+              {provider.embedding.apiKeySet && <FieldDescription>改了端点须重新填写，原来的 Key 不会发给新的端点。</FieldDescription>}
             </Field>
             <div>
               <Button type="submit" disabled={submitting}>保存</Button>
