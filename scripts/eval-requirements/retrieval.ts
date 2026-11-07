@@ -1,7 +1,8 @@
 // scripts/eval-requirements/retrieval.ts —— 黄金集的检索与追问指标（#318，ADR-0047）：对 retrieval-catalog.ts 的固定目录按角色的可见性类别派生检索投影、跑 rank()，
 // 每条算 Recall@20 与追问判定，再按失败类型 a–d 与合计分组。test/retrieval-golden.test.ts 的逐条断言与 pnpm eval:requirements 共用这里，
 // 两边的 Recall@20 是同一算法。追问按服务端的歧义判定算（ADR-0047：歧义由服务端发现，不交给模型），「该追问」= 标注了 clarify。
-// 行里另带计划模式的期望（plan-modes.ts）与模型结果（runPlanCase 填进 mode，#423、ADR-0050），分组多算一个模式正确率。
+// 行里另带计划模式的期望（plan-modes.ts）与模型结果（跑过 runPlanCase 的 planned 为 true、解析出的模式填进 mode，失败时 mode 为 null 但仍算跑过，#423、ADR-0050），
+// 分组多算一个模式正确率。
 // 纯函数，不读库、不走模型
 import type { Catalog } from '../../app/.server/catalog';
 import { deriveProjection, visibleCatalog, type ProjectionClass } from '../../app/.server/catalog/projection';
@@ -54,7 +55,9 @@ export interface RetrievalRow {
   asked: boolean;
   /** 标注了期望的追问 */
   shouldAsk: boolean;
-  /** 模型选的计划模式（runPlanCase 解析出的 plan.mode）；没跑模型为 null */
+  /** 跑过 runPlanCase（不管成没成功）；没跑模型为 false */
+  planned: boolean;
+  /** 模型选的计划模式（runPlanCase 解析出的 plan.mode）；没跑模型，或跑了但模型调用 / Schema / 计划结构失败，为 null（后者 planned 为 true，算错） */
   mode: PlanMode | null;
   /** 期望的计划模式（plan-modes.ts 的标注） */
   expectedMode: PlanMode;
@@ -64,7 +67,7 @@ export const retrievalRows = (gs: GoldenEntry[], vectors?: RetrievalVectors): Re
   const r = retrieve(g, vectors);
   return {
     id: g.id, type: g.failure_type, holdout: g.holdout, recall: recallAt(g, r), top1: r.top[0] ?? null,
-    asked: r.ambiguous, shouldAsk: g.clarify !== null, mode: null, expectedMode: expectedMode(g),
+    asked: r.ambiguous, shouldAsk: g.clarify !== null, planned: false, mode: null, expectedMode: expectedMode(g),
   };
 });
 
@@ -76,7 +79,7 @@ export interface GroupStats {
   clarifyAccuracy: number;
   /** 应追问的条目里追问了的比例；组里没有应追问的条目时为 null */
   clarifyRecall: number | null;
-  /** 计划模式与期望一致的条数 / 有模型结果的条数（#423，ADR-0050）；组里一条都没跑模型时为 null */
+  /** 计划模式与期望一致的条数 / 跑过模型的条数（planned，#423，ADR-0050；跑了但失败的 mode 为 null，算错、进分母）；组里一条都没跑模型时为 null */
   modeAccuracy: number | null;
 }
 
@@ -87,7 +90,7 @@ const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.l
 
 function stats(rows: RetrievalRow[]): GroupStats {
   const should = rows.filter(r => r.shouldAsk);
-  const planned = rows.filter(r => r.mode !== null);
+  const planned = rows.filter(r => r.planned);
   return {
     cases: rows.length,
     recall: mean(rows.flatMap(r => (r.recall === null ? [] : [r.recall]))),

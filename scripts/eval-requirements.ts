@@ -1,7 +1,7 @@
 // scripts/eval-requirements.ts —— 用法：pnpm eval:requirements（调模型的部分要 .env 或环境变量里有 LLM_BASE_URL、LLM_MODEL、LLM_API_KEY）
 // 指标与标签起草的评测（ADR-0041，与 pnpm eval:mapping 并列）。先对全部黄金集跑检索（不调模型，总是输出）：按失败类型 a–d 与合计
 // 打印 Recall@20、追问正确率、应追问召回（追问 = 服务端的歧义判定，ADR-0047）与计划模式正确率（ADR-0050：runPlanCase 让真实模型对每条
-// 需求选五种模式之一，validatePlan 解析出的 mode 与 plan-modes.ts 的期望比对；没配 LLM_* 时这一列是「未运行」）；调参集与验收集
+// 需求选五种模式之一，validatePlan 解析出的 mode 与 plan-modes.ts 的期望比对，调用或解析失败也算跑过、记错；没配 LLM_* 时这一列是「未运行」）；调参集与验收集
 // （golden.ts 的 HOLDOUT，不参与调参）各一张 Markdown 表，可直接贴进 docs/test-plans/requirements-eval-baseline.md。
 // 有 LLM_* 时先用真实模型对全部条目跑计划模式（runPlanCase）再打这两张表。
 // 再在配了 LLM_EMBEDDING_*（三项都有，与 chat 的 LLM_* 互不影响）时对固定目录真实算一次向量，调参集与验收集各打印「向量关 / 向量开」
@@ -51,6 +51,7 @@ if (!provider) {
   console.log(`\n计划模式：模型 ${provider.model}，${GOLDEN_ALL.length} 条（期望模式标在 scripts/eval-requirements/plan-modes.ts）`);
   for (const [i, g] of GOLDEN_ALL.entries()) {
     const p = await runPlanCase(provider, g);
+    rows[i]!.planned = true;
     rows[i]!.mode = p.mode;
     const failed = p.failed ? `  失败于${p.failed.stage === 'model' ? '模型调用' : '计划解析'}：${p.failed.message}` : '';
     console.log(`${p.id.padEnd(24)} 期望 ${p.expected.padEnd(16)} 模型 ${(p.mode ?? '—').padEnd(16)} ${p.correct ? '对' : '错'}${failed}`);
@@ -138,8 +139,8 @@ const report = {
   retrievalHybrid,
   drafts: draftTotals,
   // rows 与 GOLDEN_ALL 按下标一一对应
-  cases: rows.map(({ id, type, holdout, recall, top1, asked, shouldAsk, mode, expectedMode }, i) =>
-    ({ id, type, holdout, recall, top1, ambiguous: asked, shouldAsk, mode, expectedMode, clarify: GOLDEN_ALL[i].clarify, draft: byId.get(id) ?? null })),
+  cases: rows.map(({ id, type, holdout, recall, top1, asked, shouldAsk, planned, mode, expectedMode }, i) =>
+    ({ id, type, holdout, recall, top1, ambiguous: asked, shouldAsk, planned, mode, expectedMode, clarify: GOLDEN_ALL[i].clarify, draft: byId.get(id) ?? null })),
 };
 const outDir = join(import.meta.dirname, 'eval-requirements', 'out');
 mkdirSync(outDir, { recursive: true });
