@@ -79,16 +79,17 @@ const issueLines = (issues: DslIssue[]) =>
 /** 计划一条问题的引用：path（entryId） */
 const planIssueRef = (i: PlanIssue) => `${i.path}${i.entryId ? `（${i.entryId}）` : ''}`;
 
-/** 计划问题逐条一行：- path（entryId）：message；下一步：next（validate_plan 的输出与存草稿前重新校验共用） */
-const planIssueLines = (issues: PlanIssue[]) =>
-  issues.map(i => `- ${planIssueRef(i)}：${i.message}${i.next ? `；下一步：${i.next}` : ''}`).join('\n');
+/** 计划的一条问题：- path（entryId）：message；下一步：next（validate_plan 的输出与存草稿前重新校验共用） */
+const planIssueLine = (i: PlanIssue) => `- ${planIssueRef(i)}：${i.message}${i.next ? `；下一步：${i.next}` : ''}`;
+
+const planIssueLines = (issues: PlanIssue[]) => issues.map(planIssueLine).join('\n');
 
 /** 存草稿前重新校验没有通过：不保存，按问题说明是依赖变了、看不到所选条目还是别的，最后提示重新检索（不带 rejected，不计修正次数） */
 function stalePlanReply(issues: PlanIssue[]): string {
   const lines = issues.map(i => {
     if (i.path.endsWith('.version') || i.path.endsWith('.semanticHash')) return `- ${planIssueRef(i)}：依赖变了（版本或语义哈希与当前目录不一致）——${i.message}`;
     if (i.path.endsWith('.id') && i.message.includes('可见目录')) return `- ${planIssueRef(i)}：看不到所选条目（权限变了，或条目已停用 / 删除）`;
-    return `- ${planIssueRef(i)}：${i.message}${i.next ? `；下一步：${i.next}` : ''}`;
+    return planIssueLine(i);
   });
   return ['未保存：计划已过期，存草稿前用当前目录重新校验没有通过。', ...lines, '请重新检索并校验计划后再保存'].join('\n');
 }
