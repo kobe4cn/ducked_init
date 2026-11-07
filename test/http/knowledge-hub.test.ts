@@ -94,7 +94,7 @@ describe('业务知识集中页', () => {
     html = await pageOf(an);
     expect(html).not.toContain(`data-hub-item="${AMOUNT}"`);
     expect(html).toContain(`data-hub-item="${TARGET}"`);
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 
   it('点开条目在本页展开同一个面板；接受提案、声明单位后 302 回原 URL，列表随之更新；重复别名 400 错误在面板里；查看者只读、提交 403', async () => {
     const { acme, analyst } = await setup();
@@ -139,5 +139,5 @@ describe('业务知识集中页', () => {
     html = await pageOf(an, ITEM);
     expect(html).not.toContain(`data-hub-item="${TARGET}"`);
     expect(panelOf(html, TARGET)).toContain('data-claim="unit"');
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），还有 2 次登录与约 14 次请求，4 个 worker 并行时超过默认的 90 s
 });
