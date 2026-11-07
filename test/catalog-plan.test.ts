@@ -1,6 +1,8 @@
-// test/catalog-plan.test.ts —— 分析计划校验 validatePlan()（ADR-0050，#409）：纯函数，不起库。
-// 结构校验（JSON Schema 与步骤业务检查）、硬性检查（本次检索、可见目录、版本、语义哈希）、口径检查（单位 / 时间含义 / 窗口，只对 reuse_result 选中的指标）。
-// 口径用例的固定目录是检索黄金集的 RETRIEVAL_CATALOG（「营收」别名挂在 revenue_30d 等指标上），成员声明的用例手工构造 CatalogInput
+// test/catalog-plan.test.ts —— 分析计划校验 validatePlan()（ADR-0050，#409 / #410）：纯函数，不起库。
+// 结构校验（JSON Schema 与步骤业务检查、动作受控枚举）、硬性检查（本次检索、可见目录、版本、语义哈希）、
+// 口径检查（单位 / 时间含义 / 窗口，只对 reuse_result 选中的指标）、可加性与平台能力检查（#410）。
+// 口径用例的固定目录是检索黄金集的 RETRIEVAL_CATALOG（「营收」别名挂在 revenue_30d 等指标上），
+// 成员声明与可加性的用例手工构造 CatalogInput（不动黄金集的目录）
 import { describe, expect, it } from 'vitest';
 import { buildCatalog, type Catalog, type MetricEntry } from '../app/.server/catalog';
 import { semanticHash, validatePlan, type AnalysisPlan } from '../app/.server/catalog/plan';
@@ -64,7 +66,7 @@ describe('分析计划校验 validatePlan()：结构', () => {
 
   it('步骤 id 重复、inputs 引用不存在的步骤或条目、引用自己或后面的步骤（成环）都返回 invalid', () => {
     const dup = check(planOf(undefined, { steps: [
-      { id: 's1', action: 'answer', inputs: [] }, { id: 's1', action: 'again', inputs: [] },
+      { id: 's1', action: 'answer', inputs: ['metric:revenue_30d'] }, { id: 's1', action: 'filter', inputs: ['metric:revenue_30d'] },
     ] }));
     expect(dup.status).toBe('invalid');
     expect(dup.plan).toBeNull();
@@ -75,12 +77,12 @@ describe('分析计划校验 validatePlan()：结构', () => {
     expect(missing.issues.some(i => i.path === 'steps.0.inputs.0' && i.message.includes('nope'))).toBe(true);
 
     const cycle = check(planOf(undefined, { steps: [
-      { id: 'a', action: 'x', inputs: ['b'] }, { id: 'b', action: 'y', inputs: ['a'] },
+      { id: 'a', action: 'filter', inputs: ['b'] }, { id: 'b', action: 'filter', inputs: ['a'] },
     ] }));
     expect(cycle.status).toBe('invalid');
     expect(cycle.issues.some(i => i.path === 'steps.0.inputs.0' && i.message.includes('环'))).toBe(true);
 
-    const self = check(planOf(undefined, { steps: [{ id: 'a', action: 'x', inputs: ['a'] }] }));
+    const self = check(planOf(undefined, { steps: [{ id: 'a', action: 'answer', inputs: ['a'] }] }));
     expect(self.status).toBe('invalid');
     expect(self.issues.some(i => i.path === 'steps.0.inputs.0' && i.message.includes('环'))).toBe(true);
   });
@@ -217,5 +219,138 @@ describe('分析计划校验 validatePlan()：口径检查', () => {
     const unsupported = check(planOf(undefined, { mode: 'unsupported', reason: 'DSL 只能算到统一消费者粒度', selected: [], steps: [] }));
     expect(unsupported.status).toBe('unsupported');
     expect(unsupported.issues).toEqual([]);
+  });
+});
+
+describe('分析计划校验 validatePlan()：可加性与平台能力', () => {
+  /** 度量各异的四个指标：比率、去重计数、最新值不可加，求和是对照（YAML 写法参考能力说明的示例，不进黄金集目录） */
+  const ADD = buildCatalog({
+    definitions: [
+      { kind: 'metric', key: 'paid_rate', version: 1, spaceId: SPACE, yaml:
+        'base: order\nmeasure:\n  agg: ratio\n  numerator:\n    agg: count\n    filter:\n      - { field: status, op: eq, value: paid }\n  denominator: { agg: count }\n' },
+      { kind: 'metric', key: 'buyer_count', version: 1, spaceId: SPACE, yaml: 'base: order\nmeasure: { agg: count_distinct, field: customer_id }\n' },
+      { kind: 'metric', key: 'last_amount', version: 1, spaceId: SPACE, yaml: 'base: order\nmeasure: { agg: latest, field: amount, by: created_at }\n' },
+      { kind: 'metric', key: 'revenue', version: 1, spaceId: SPACE, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\n' },
+    ],
+  });
+  const ADD_IDS = new Set(['metric:paid_rate', 'metric:buyer_count', 'metric:last_amount', 'metric:revenue']);
+  /** 选 id 并对它做一次汇总的计划；over 整块覆盖 steps / request / mode */
+  const aggPlan = (id: string, agg: 'sum' | 'avg' | 'count' | 'max' = 'sum', over: Partial<AnalysisPlan> = {}): AnalysisPlan => ({
+    schemaVersion: 1,
+    mode: 'reuse_result',
+    selected: [{ id, version: 1, semanticHash: semanticHash(entryOf(ADD, id)) }],
+    request: { dimensions: [] },
+    steps: [{ id: 'a1', action: 'aggregate', agg, inputs: [id] }],
+    assumptions: [],
+    questions: [],
+    ...over,
+  });
+  const checkAdd = (plan: AnalysisPlan) => validatePlan(plan, { catalog: ADD, retrieved: ADD_IDS });
+
+  it('比率 / 去重计数 / 最新值做 sum 或 avg 返回 invalid，path 是 steps.N.agg，message 说明原因与可行做法', () => {
+    const ratio = checkAdd(aggPlan('metric:paid_rate'));
+    expect(ratio.status).toBe('invalid');
+    expect(ratio.issues).toHaveLength(1);
+    expect(ratio.issues[0]).toMatchObject({ path: 'steps.0.agg', entryId: 'metric:paid_rate' });
+    expect(ratio.issues[0]!.message).toContain('比率');
+    expect(ratio.issues[0]!.message).toContain('分子');
+    expect(ratio.issues[0]!.message).toContain('draft_query');
+
+    const distinct = checkAdd(aggPlan('metric:buyer_count'));
+    expect(distinct.status).toBe('invalid');
+    expect(distinct.issues[0]).toMatchObject({ path: 'steps.0.agg', entryId: 'metric:buyer_count' });
+    expect(distinct.issues[0]!.message).toContain('去重');
+
+    const latest = checkAdd(aggPlan('metric:last_amount', 'avg'));
+    expect(latest.status).toBe('invalid');
+    expect(latest.issues[0]).toMatchObject({ path: 'steps.0.agg', entryId: 'metric:last_amount' });
+    expect(latest.issues[0]!.message).toContain('min / max');
+  });
+
+  it('可加的度量做 sum、不可加的做 count / max 时通过；dimensions 带分组同样拦、为全体汇总（dimensions 为空）也拦', () => {
+    expect(checkAdd(aggPlan('metric:revenue')).status).toBe('valid');
+    expect(checkAdd(aggPlan('metric:paid_rate', 'count')).status).toBe('valid');
+    expect(checkAdd(aggPlan('metric:last_amount', 'max')).status).toBe('valid');
+
+    const grouped = checkAdd(aggPlan('metric:buyer_count', 'sum', { request: { dimensions: ['consumer.city'] } }));
+    expect(grouped.status).toBe('invalid');
+    expect(grouped.issues[0]!.path).toBe('steps.0.agg');
+  });
+
+  it('经 fetch 步骤间接引用不可加指标也能查出来；检查对所有 mode 生效', () => {
+    const viaFetch = checkAdd(aggPlan('metric:paid_rate', 'sum', {
+      steps: [
+        { id: 'f1', action: 'fetch', inputs: ['metric:paid_rate'] },
+        { id: 'a1', action: 'aggregate', agg: 'sum', inputs: ['f1'] },
+      ],
+    }));
+    expect(viaFetch.status).toBe('invalid');
+    expect(viaFetch.issues[0]).toMatchObject({ path: 'steps.1.agg', entryId: 'metric:paid_rate' });
+
+    expect(checkAdd(aggPlan('metric:paid_rate', 'sum', { mode: 'draft_query' })).status).toBe('invalid');
+    expect(checkAdd(aggPlan('metric:paid_rate', 'sum', { mode: 'clarify', questions: ['按哪个口径算？'] })).status).toBe('invalid');
+  });
+
+  it('reuse_result / draft_definition 要求消费者以外的粒度返回 unsupported，next 提示改用 draft_query；draft_query 同样的请求通过', () => {
+    const reuse = check(planOf(undefined, { request: { dimensions: [], grain: 'city' } }));
+    expect(reuse.status).toBe('unsupported');
+    expect(reuse.issues).toHaveLength(1);
+    expect(reuse.issues[0]).toMatchObject({ path: 'request.grain' });
+    expect(reuse.issues[0]!.message).toContain('消费者');
+    expect(reuse.issues[0]!.next).toContain('draft_query');
+
+    const draft = check(planOf(undefined, { mode: 'draft_definition', request: { dimensions: [], grain: 'city' } }));
+    expect(draft.status).toBe('unsupported');
+    expect(draft.issues[0]!.path).toBe('request.grain');
+
+    const sql = check(planOf(undefined, { mode: 'draft_query', request: { dimensions: [], grain: 'city' } }));
+    expect(sql.status).toBe('valid');
+    expect(sql.issues).toEqual([]);
+  });
+
+  it('grain 省略或等于 consumer、dimensions 用消费者属性维度不触发；clarify / unsupported 模式不查粒度', () => {
+    expect(check(planOf(undefined, { request: { dimensions: [] } })).status).toBe('valid');
+    expect(check(planOf(undefined, { request: { dimensions: [], grain: 'consumer' } })).status).toBe('valid');
+    expect(check(planOf(undefined, { request: { dimensions: ['consumer.city'] } })).status).toBe('valid');
+
+    const clarify = check(planOf(undefined, { mode: 'clarify', questions: ['按哪个粒度算？'], request: { dimensions: [], grain: 'city' } }));
+    expect(clarify.status).toBe('needs_clarification');
+    expect(clarify.issues).toEqual([]);
+  });
+
+  it('未知 action 返回 invalid、plan 为 null，问题指到 steps.N.action 并列出可选动作', () => {
+    const r = check(planOf(undefined, { steps: [{ id: 's1', action: 'run' as never, inputs: ['metric:revenue_30d'] }] }));
+    expect(r.status).toBe('invalid');
+    expect(r.plan).toBeNull();
+    expect(r.issues.some(i => i.path === 'steps.0.action' && i.message.includes('fetch') && i.message.includes('answer'))).toBe(true);
+  });
+
+  it('aggregate 缺 agg、inputs 不是恰好 1 个，非 aggregate 带 agg、compare 不足 2 个输入都返回 invalid', () => {
+    const noAgg = check(planOf(undefined, { steps: [{ id: 'a1', action: 'aggregate', inputs: ['metric:revenue_30d'] }] }));
+    expect(noAgg.status).toBe('invalid');
+    expect(noAgg.plan).toBeNull();
+    expect(noAgg.issues.some(i => i.message === '缺少 agg')).toBe(true);
+
+    const twoInputs = check(planOf(undefined, { steps: [{ id: 'a1', action: 'aggregate', agg: 'sum', inputs: ['metric:revenue_30d', 'field:order.amount'] }] }));
+    expect(twoInputs.status).toBe('invalid');
+    expect(twoInputs.plan).toBeNull();
+
+    const extraAgg = check(planOf(undefined, { steps: [{ id: 's1', action: 'answer', inputs: ['metric:revenue_30d'], agg: 'sum' }] }));
+    expect(extraAgg.status).toBe('invalid');
+    expect(extraAgg.plan).toBeNull();
+
+    const lonelyCompare = check(planOf(undefined, { steps: [{ id: 'c1', action: 'compare', inputs: ['metric:revenue_30d'] }] }));
+    expect(lonelyCompare.status).toBe('invalid');
+    expect(lonelyCompare.plan).toBeNull();
+  });
+
+  it('fetch 只能引用 selected 里的条目，引用步骤返回 invalid', () => {
+    const r = check(planOf(undefined, { steps: [
+      { id: 'f1', action: 'fetch', inputs: ['metric:revenue_30d'] },
+      { id: 'f2', action: 'fetch', inputs: ['f1'] },
+    ] }));
+    expect(r.status).toBe('invalid');
+    expect(r.plan).toBeNull();
+    expect(r.issues.some(i => i.path === 'steps.1.inputs.0' && i.message.includes('fetch'))).toBe(true);
   });
 });

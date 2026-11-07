@@ -1,8 +1,10 @@
-// app/.server/catalog/plan.ts —— 分析计划的确定性校验（ADR-0050，#409，设计文档 9.1 / 9.2）：助手提交计划 JSON，
+// app/.server/catalog/plan.ts —— 分析计划的确定性校验（ADR-0050，#409 / #410，设计文档 9.1 / 9.2）：助手提交计划 JSON，
 // 这里只吃传入的可见目录（catalogFor 已按角色裁剪：条目在目录里就等于已发布且有权限）与本次检索到的候选 id，
-// 不读库、不信任 JSON 里的租户与操作者（出现也忽略）。校验分三层：结构（JSON Schema + 步骤业务检查）、
-// 硬性（选中条目必须来自本次检索、在目录里，版本与语义哈希和当前一致）、口径（只对 reuse_result 选中的指标，
-// 用户明确要求的单位 / 时间含义 / 窗口与口径声明比较）。可加性与平台能力检查在 ⑭，接入助手工具在 ⑮。
+// 不读库、不信任 JSON 里的租户与操作者（出现也忽略）。校验分五层：结构（JSON Schema + 步骤业务检查，步骤动作是受控枚举
+// PLAN_ACTIONS、每种动作有自己的输入约束）、硬性（选中条目必须来自本次检索、在目录里，版本与语义哈希和当前一致）、
+// 口径（只对 reuse_result 选中的指标，用户明确要求的单位 / 时间含义 / 窗口与口径声明比较）、可加性（aggregate 的
+// sum / avg 不能作用在比率 / 去重计数 / 最新值这类不可加的度量上）、平台能力（DSL 只能算到统一消费者粒度）。
+// 接入助手工具在 ⑮。
 // 结果 status：invalid（结构或硬性不过、口径不相容）> unsupported（mode 是 unsupported）> needs_clarification
 // （mode 是 clarify，或口径声明未知 / 需复核）> valid；mode 是 clarify / unsupported 时计划本身合法，
 // 但对话的下一步是追问或说明做不到，所以 status 直接取这两种。request 里 unit / timeMeaning 写 unknown /
@@ -13,6 +15,7 @@ import { CLAIM_TYPES, claimTypeLabel, claimValueLabel, type ClaimType } from '..
 import { sha256 } from '../auth';
 import { stableJson } from '../knowledge/basis';
 import { describeSchemaError } from '../pipeline/mapping-spec';
+import { CONSUMER_ENTITY } from '../pipeline/dsl/metric-spec';
 import { claimsOf } from './ambiguity';
 import { expand, type Catalog, type CatalogEntry, type MetricEntry } from './index';
 import { stripEntryStats } from './versions';
@@ -35,7 +38,22 @@ export interface PlanRequest {
   windowDays?: number;
 }
 
-export interface PlanStep { id: string; action: string; inputs: string[] }
+/** aggregate 步骤的汇总方式：计划只声明「分组汇总」这一个动作，怎么汇总集中写在 agg 上 */
+export const AGGREGATE_FNS = ['sum', 'avg', 'count', 'min', 'max'] as const;
+export type AggregateFn = (typeof AGGREGATE_FNS)[number];
+
+/**
+ * 步骤的动作（受控枚举，设计文档 9.1），各自的输入输出：
+ * - fetch：selected 里条目的逐消费者结果——inputs ≥1，只能引用 selected 条目，不能引用步骤；
+ * - filter：按标签 / 条件收窄人群——inputs ≥1（步骤或条目）；
+ * - aggregate：把逐消费者的值按 request.dimensions 分组汇总（dimensions 为空就是全体汇总）——必带 agg，inputs 恰好 1 个；
+ * - compare：对比几个结果——inputs ≥2；
+ * - answer：给出回答——inputs ≥1（步骤或条目）
+ */
+export const PLAN_ACTIONS = ['fetch', 'filter', 'aggregate', 'compare', 'answer'] as const;
+export type PlanAction = (typeof PLAN_ACTIONS)[number];
+
+export interface PlanStep { id: string; action: PlanAction; inputs: string[]; agg?: AggregateFn }
 export interface PlanAssumption { text: string; evidenceId?: string; confirmed: boolean }
 
 /** 计划结构（设计文档 9.1），另加 request.unit / windowDays 与 unsupported 模式的 reason */
@@ -100,9 +118,17 @@ export const PLAN_SCHEMA = {
         required: ['id', 'action', 'inputs'],
         properties: {
           id: { type: 'string', minLength: 1 },
-          action: { type: 'string', minLength: 1 },
+          action: { enum: PLAN_ACTIONS },
           inputs: { type: 'array', items: { type: 'string', minLength: 1 } },
+          agg: { enum: AGGREGATE_FNS },
         },
+        // 每种动作的输入约束（见 PLAN_ACTIONS 的注释）；aggregate 的 agg 必带、其他动作不许带
+        allOf: [
+          { if: { properties: { action: { const: 'aggregate' } }, required: ['action'] }, then: { required: ['agg'], properties: { inputs: { minItems: 1, maxItems: 1 } } } },
+          { if: { properties: { action: { not: { const: 'aggregate' } } }, required: ['action'] }, then: { not: { required: ['agg'] } } },
+          { if: { properties: { action: { enum: ['fetch', 'filter', 'answer'] } }, required: ['action'] }, then: { properties: { inputs: { minItems: 1 } } } },
+          { if: { properties: { action: { const: 'compare' } }, required: ['action'] }, then: { properties: { inputs: { minItems: 2 } } } },
+        ],
       },
     },
     assumptions: {
@@ -169,6 +195,8 @@ export function validatePlan(input: unknown, ctx: { catalog: Catalog; retrieved:
         structural(`steps.${i}.inputs.${j}`, at === i
           ? `inputs 不能引用步骤自己（${dep}），会成环`
           : `inputs 引用了第 ${at} 步才定义的步骤 ${dep}，会成环；只能引用前面出现的步骤或 selected 里的条目`);
+      } else if (step.action === 'fetch' && at !== undefined) {
+        structural(`steps.${i}.inputs.${j}`, `fetch 只能引用 selected 里的条目，${dep} 是步骤`);
       }
     }
   }
@@ -247,6 +275,56 @@ export function validatePlan(input: unknown, ctx: { catalog: Catalog; retrieved:
         raise('invalid');
       }
     }
+  }
+
+  // 可加性检查（ADR-0050）：比率、去重计数、最新 / 最早值不能在分组上直接求和或平均——沿 inputs 追到 selected 条目
+  // （传递闭包；结构检查已保证只引用前面的步骤或条目，天然无环），度量前缀（measureText 的 agg(…)）不可加就报。
+  // dimensions 为空（对全体汇总）同样算，所有 mode 都查
+  const NON_ADDITIVE: Record<string, { label: string; remedy: string }> = {
+    ratio: { label: '比率', remedy: '要分别汇总分子与分母再相除，改用 draft_query' },
+    count_distinct: { label: '去重计数', remedy: '要在分组上重新去重，改用 draft_query' },
+    latest: { label: '最新值', remedy: '要改用 min / max，或改用 draft_query' },
+    earliest: { label: '最早值', remedy: '要改用 min / max，或改用 draft_query' },
+  };
+  /** 从步骤或条目出发沿 inputs 可达的 selected 条目（seen 只作兜底，结构检查已保证无环） */
+  const reachedEntries = (id: string, seen: Set<string> = new Set()): string[] => {
+    if (seen.has(id)) return [];
+    seen.add(id);
+    const at = stepAt.get(id);
+    return at === undefined ? [id] : plan.steps[at]!.inputs.flatMap(dep => reachedEntries(dep, seen));
+  };
+  for (const [i, step] of plan.steps.entries()) {
+    if (step.action !== 'aggregate' || (step.agg !== 'sum' && step.agg !== 'avg')) continue;
+    const bad = new Map<string, { kind: string; measure: string }>();
+    for (const dep of step.inputs) {
+      for (const id of reachedEntries(dep)) {
+        if (bad.has(id)) continue;
+        const e = expand(ctx.catalog, id);
+        if (e?.kind !== 'metric') continue;
+        const kind = /^(\w+)\(/.exec(e.measure)?.[1];
+        if (kind && NON_ADDITIVE[kind]) bad.set(id, { kind, measure: e.measure });
+      }
+    }
+    for (const [id, { kind, measure }] of bad) {
+      issues.push({
+        path: `steps.${i}.agg`,
+        entryId: id,
+        message: `${NON_ADDITIVE[kind]!.label}不能${step.agg === 'sum' ? '在分组上求和' : '在分组上求平均'}（${id} 的度量是 ${measure}）：${NON_ADDITIVE[kind]!.remedy}`,
+      });
+      raise('invalid');
+    }
+  }
+
+  // 平台能力检查（ADR-0050）：DSL 只能算到统一消费者粒度，消费者以外的粒度只能走 draft_query 起草工作台 SQL。
+  // 只看 request.grain——consumer.city 这类消费者属性维度是 DSL 支持的，不算换粒度；clarify / unsupported 模式的计划本身就是在追问或说明做不到，不查
+  if ((plan.mode === 'reuse_result' || plan.mode === 'draft_definition')
+    && plan.request.grain !== undefined && plan.request.grain !== CONSUMER_ENTITY) {
+    issues.push({
+      path: 'request.grain',
+      message: `DSL 只能算到统一消费者粒度，算不了「${plan.request.grain}」粒度`,
+      next: '改用 draft_query 起草工作台 SQL，按这个粒度汇总',
+    });
+    raise('unsupported');
   }
 
   return { status, plan, issues };
