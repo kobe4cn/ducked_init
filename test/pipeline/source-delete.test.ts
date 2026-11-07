@@ -13,12 +13,12 @@ import { requireSource, sourceIdByName } from '../../app/.server/source-config';
 import { enqueueDueSyncs, syncSource } from '../../app/.server/source-sync';
 import { enqueueDueVerifies } from '../../app/.server/source-verify';
 import { createSourceView } from '../../app/.server/source-views';
-import { confirmWatermark, deleteBlockers, deleteSource, listSources, registerSource } from '../../app/.server/sources';
+import { confirmWatermark, deleteBlockers, deleteSource, getSource, listSources, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
 import { listCatalog, runQuery } from '../../app/.server/workbench';
 import { resetDb } from '../http/harness';
-import { drain, memberOf, newTenant, onLake, publish, runTask, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, onLake, publish, runTask } from './fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from './identity-fixtures';
-import { pgSourceInput, READER } from './source-fixtures';
+import { drainUntilSucceeded, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -50,12 +50,14 @@ async function syncedSource() {
   const author = await memberOf(acme, 'de@acme.com');
   const reviewer = await memberOf(acme, 'de2@acme.com');
   const { id } = await registerSource(author, await pgSourceInput(READER));
-  await selectAllTables(author, id);
   await drain();
+  // 采集任务偶尔因连不上源库失败（#450，同 #360、#403），检查状态、失败就重新采集
+  const { listing } = await getSource(author, id);
+  const { task } = await setSyncScope(author, id, { add: listing.filter(t => t.readable && !t.gone).map(t => t.name) });
+  await drainUntilSucceeded('电商库', task, () => relistSource(author, id));
   await confirmWatermark(author, id, 'customers', 'updated_at');
   await confirmWatermark(author, id, 'orders', 'order_id');
-  await syncSource(author, id);
-  await drain();
+  await drainUntilSucceeded('电商库', await syncSource(author, id), () => syncSource(author, id));
   return { acme, author, reviewer, id };
 }
 
@@ -159,12 +161,14 @@ describe('删除数据源', () => {
     await onLake(acme, `CALL lake.set_option('data_inlining_row_limit', 0)`);
     const syncAll = async (name: string) => {
       const { id } = await registerSource(author, await pgSourceInput(READER, name));
-      await selectAllTables(author, id);
       await drain();
+      // 采集任务偶尔因连不上源库失败（#450，同 #360、#403），检查状态、失败就重新采集
+      const { listing } = await getSource(author, id);
+      const { task } = await setSyncScope(author, id, { add: listing.filter(t => t.readable && !t.gone).map(t => t.name) });
+      await drainUntilSucceeded(name, task, () => relistSource(author, id));
       await confirmWatermark(author, id, 'customers', 'updated_at');
       await confirmWatermark(author, id, 'orders', 'order_id');
-      await syncSource(author, id);
-      await drain();
+      await drainUntilSucceeded(name, await syncSource(author, id), () => syncSource(author, id));
       return id;
     };
     const kept = await syncAll('电商库');
