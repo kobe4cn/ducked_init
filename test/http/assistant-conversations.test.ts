@@ -1,7 +1,8 @@
 // test/http/assistant-conversations.test.ts —— AI 助手对话的保存与只读分享（ADR-0043）经 /assistant 的 HTTP 接缝：
 // 每轮问答记进本人的对话（标题与消息加密存一个字段），刷新后从列表打开继续；别人（含管理员）按 id 读 404；
 // 分享给同租户成员后对方只读、不能续写，可撤销，分享与撤销记审计；成员被移出租户时其对话与分享随之删除；
-// 工作台的结果解读存进本人的对话（带 query：SQL、行数与列名，不存取值），/workbench?sql= 把 SQL 填进编辑框、不执行
+// 工作台的结果解读存进本人的对话（带 query：SQL、行数与列名，不存取值），/workbench?sql= 把 SQL 填进编辑框、不执行；
+// 带 plan 的消息在读时按读者自己的目录组装计划卡（#452，ADR-0050：读时再校验；ADR-0005：被分享人按自己的目录，看不到的条目只留 id）
 import { and, eq, like } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -9,6 +10,7 @@ import { assistantConversations, assistantConversationShares, auditLogs, dslVers
 import { appendTurn, ASSISTANT_CONTEXT } from '../../app/.server/assistant/conversations';
 import { MAX_HISTORY } from '../../app/.server/assistant/loop';
 import { catalogFor } from '../../app/.server/assistant/tools';
+import type { PlanCardView } from '../../app/.server/assistant/plan-card';
 import { semanticHash } from '../../app/.server/catalog/plan';
 import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { removeMember } from '../../app/.server/members';
@@ -125,11 +127,12 @@ describe('助手对话', () => {
     const first = await (await post(client, { message: '消费者分析能用现有目录吗', page: PAGE })).json();
     expect(first).toMatchObject({ reply: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'] });
 
-    // 读回：校验计划的那轮 assistant 消息带 plan，只有条目 id、版本与哈希，没有检索结果与工具原文
+    // 读回：校验计划的那轮 assistant 消息带 plan，只有条目 id、版本与哈希，没有检索结果与工具原文；
+    // 另带读时组装的 planCard（#452：卡片的名称、数据截至是动态的，用 objectContaining 收敛断言）
     const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
     expect(conversation.messages).toEqual([
       { role: 'user', content: '消费者分析能用现有目录吗' },
-      { role: 'assistant', content: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'], plan },
+      { role: 'assistant', content: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'], plan, planCard: expect.objectContaining({ status: 'valid', mode: 'reuse_result' }) },
     ]);
 
     // 续写：交给模型的历史只有文字（不含计划，比如哈希值与 schemaVersion）；本轮没再校验，新消息不带 plan
@@ -177,22 +180,99 @@ describe('助手对话', () => {
     const first = await (await post(client, { message: '按城市统计客户', page: PAGE })).json();
     expect(first).toMatchObject({ reply: 'SQL 已准备好', toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench'], workbenchSql: CITY_COUNT });
 
-    // ?id= 读回：assistant 消息带 workbenchSql，content 里只有答复文字
+    // ?id= 读回：assistant 消息带 workbenchSql，content 里只有答复文字；planCard 照 #452 读时组装
     const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
     expect(conversation.messages).toEqual([
       { role: 'user', content: '按城市统计客户' },
-      { role: 'assistant', content: 'SQL 已准备好', toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench'], plan, workbenchSql: CITY_COUNT },
+      { role: 'assistant', content: 'SQL 已准备好', toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench'], plan, workbenchSql: CITY_COUNT, planCard: expect.objectContaining({ status: 'valid', mode: 'draft_query' }) },
     ]);
     // 库里只有密文
     const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
     expect(row.sealed).not.toContain('silver.customer');
 
-    // 被拒的那轮：POST 返回与读回的 assistant 消息都没有 workbenchSql；发给模型的历史也不带 SQL（content 里不写 SQL）
+    // 被拒的那轮：POST 返回与读回的 assistant 消息都没有 workbenchSql；发给模型的历史也不带 SQL（content 里不写 SQL）。
+    // 本轮校验过计划，返回照带 planCard（#452）
     const second = await (await post(client, { conversationId: first.conversationId, message: '再按会员数统计', page: PAGE })).json();
-    expect(second).toEqual({ conversationId: first.conversationId, reply: '这次没有填入', toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench'] });
+    expect(second).toEqual({ conversationId: first.conversationId, reply: '这次没有填入', toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench'], planCard: expect.objectContaining({ status: 'valid', mode: 'reuse_result' }) });
     const after = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
     expect(after.conversation.messages.at(-1)).not.toHaveProperty('workbenchSql');
     expect(JSON.stringify(received[4].body.messages)).not.toContain('silver.customer');
+  });
+
+  it('答复下的计划卡按读者的目录在读时组装（#452，ADR-0050 / 0005）：POST 返回与 ?id= 读回都带 planCard、不带 plan 的消息没有；被分享的查看者看不到源表条目，卡片只留 id、状态不是 valid、不出现源表名称', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const client = await loginAs(app, 'analyst@acme.com');
+    const peer = await loginAs(app, 'viewer@acme.com');
+    // 带时间窗口的指标：request 没写 windowDays，卡片的窗口取指标的 window.days
+    const REVENUE_30D = 'base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: created_at, days: 30 }\n';
+    await createDefinition(author, 'metric', 'revenue_30d', REVENUE_30D);
+    await publishDefinition(reviewer, 'metric', 'revenue_30d', 1);
+    const catalog = await catalogFor(analyst);
+    const entry = (id: string) => {
+      const e = catalog.entries.find(x => x.id === id);
+      if (!e) throw new Error(`${id} 不在分析师目录里`);
+      return e;
+    };
+    // 查看者没有 sources:read，目录里没有 table: 条目（ADR-0005）
+    expect((await catalogFor(viewer)).entries.some(e => e.kind === 'table')).toBe(false);
+    const [customer, metric, table] = ['entity:customer', 'metric:revenue_30d', 'table:CRM/orders'].map(entry);
+    if (customer.kind !== 'entity' || metric.kind !== 'metric' || table.kind !== 'table') throw new Error('目录条目种类不对');
+    const plan = {
+      schemaVersion: 1, mode: 'reuse_result',
+      selected: [
+        { id: 'entity:customer', semanticHash: semanticHash(customer) },
+        { id: 'metric:revenue_30d', version: metric.version, semanticHash: semanticHash(metric) },
+        { id: 'table:CRM/orders', semanticHash: semanticHash(table) },
+      ],
+      request: { dimensions: ['order.amount'], population: '全部订单' },
+      steps: [{ id: 's1', action: 'answer', inputs: ['entity:customer', 'metric:revenue_30d', 'table:CRM/orders'] }],
+      assumptions: [{ text: '金额按下单时间统计', confirmed: true }, { text: '退款另算', confirmed: false }],
+      questions: [],
+    };
+    const replies = [
+      toolCalls({ name: 'catalog_search', args: { query: '订单金额' } }),
+      toolCalls({ name: 'validate_plan', args: { plan } }),
+      text('可以复用现有结果'),
+    ];
+    const { received } = fakeLlm(f => app.setLlmFetch(f), n => replies[n - 1]);
+    const first = await (await post(client, { message: '统计各金额的订单', page: PAGE })).json();
+    // POST 返回的卡片：按分析师自己的目录重新校验是 valid，条目带名称与说明、数据截至（实体取最近一次合并时间），窗口取指标的 window.days
+    expect(first).toMatchObject({ reply: '可以复用现有结果', toolsUsed: ['catalog_search', 'validate_plan'] });
+    expect(first.planCard).toEqual({
+      status: 'valid', mode: 'reuse_result',
+      selected: [
+        { id: 'entity:customer', name: customer.name, description: customer.description, asOf: customer.stats?.at ?? '暂无快照' },
+        { id: 'metric:revenue_30d', name: metric.name, description: metric.description, asOf: '暂无快照' },
+        { id: 'table:CRM/orders', name: table.name, description: table.description, asOf: table.stats?.at ?? '暂无快照' },
+      ],
+      assumptions: [{ text: '金额按下单时间统计', confirmed: true }, { text: '退款另算', confirmed: false }],
+      request: { windowDays: 30, dimensions: ['order.amount'], population: '全部订单' },
+      issues: [], questions: [],
+    });
+
+    // ?id= 读回：同一条 assistant 消息带一样的卡片，user 消息没有这个键
+    const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(conversation.messages[0]).not.toHaveProperty('planCard');
+    expect(conversation.messages[1].planCard).toEqual(first.planCard);
+
+    // 只读分享给查看者：卡片按查看者自己的目录组装，源表条目只留 id、状态不是 valid、不出现源表名称与说明；
+    // 看得到的实体与指标照常带名称
+    expect((await post(client, { intent: 'share', conversationId: first.conversationId, email: 'viewer@acme.com' })).status).toBe(200);
+    const shared = await (await peer.get(`/assistant?id=${first.conversationId}`)).json();
+    const viewerCard: PlanCardView = shared.conversation.messages[1].planCard;
+    expect(viewerCard.status).toBe('invalid');
+    expect(viewerCard.issues.map(i => i.message)).toContain('选中的条目不在可见目录里（无权限、未发布或已停用）');
+    expect(viewerCard.selected.find(s => s.id === 'table:CRM/orders')).toEqual({ id: 'table:CRM/orders' });
+    expect(viewerCard.selected.find(s => s.id === 'metric:revenue_30d')?.name).toBe(metric.name);
+    expect(JSON.stringify(viewerCard)).not.toContain(table.description);
+    expect(JSON.stringify(viewerCard)).not.toContain('源表');
+
+    // 卡片只读时组装、不写库，也不进发给模型的历史（「暂无快照」只出现在组装出的卡片里，计划原文经工具调用参数另说）
+    const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
+    expect(row.sealed).not.toContain('计划');
+    expect(JSON.stringify(received[2].body.messages)).not.toContain('暂无快照');
   });
 
   it('续写时路由从完整对话里取最近一份计划作存草稿前重新校验的依据：两次请求之间发布了新版本，第二次直接保存被拒、不写 dsl_versions（ADR-0050）', async () => {
