@@ -16,7 +16,7 @@ import type { CurrentMember } from '../auth';
 import { expand, overview, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
 import { judgeAmbiguity, type AmbiguityGroup } from '../catalog/ambiguity';
 import { tenantCatalog } from '../catalog/load';
-import { semanticHash, validatePlan, type AnalysisPlan, type PlanCheck, type PlanIssue, type PlanStatus } from '../catalog/plan';
+import { semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type PlanStatus } from '../catalog/plan';
 import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
 import type { HitReason } from '../catalog/rank';
 import { getDb } from '../db/client';
@@ -98,11 +98,9 @@ const STATUS_NEXT: Record<Exclude<PlanStatus, 'valid'>, string> = {
  * 存草稿前重新校验没有通过：不保存，说明原因（不带 rejected，不计修正次数）。有依赖变了 / 看不到所选条目的问题时
  * 说计划已过期并提示重新检索；没有这两类问题时是计划本身就不是 valid（比如 clarify / unsupported 模式），写明计划状态，不说过期
  */
-function stalePlanReply(check: PlanCheck & { plan: AnalysisPlan }): string {
-  const { status, plan, issues } = check;
+function stalePlanReply(status: Exclude<PlanStatus, 'valid'>, plan: AnalysisPlan, issues: PlanIssue[]): string {
   if (!issues.some(i => isDependencyIssue(i) || isHiddenIssue(i))) {
-    const s = status as Exclude<PlanStatus, 'valid'>;
-    return [`未保存：计划状态是 ${s}（mode 是 ${plan.mode}），${STATUS_NEXT[s]}。`, ...issues.map(planIssueLine)].join('\n');
+    return [`未保存：计划状态是 ${status}（mode 是 ${plan.mode}），${STATUS_NEXT[status]}。`, ...issues.map(planIssueLine)].join('\n');
   }
   const lines = issues.map(i => {
     if (isDependencyIssue(i)) return `- ${planIssueRef(i)}：依赖变了（版本或语义哈希与当前目录不一致）——${i.message}`;
@@ -261,7 +259,7 @@ export const TOOLS: AssistantTool[] = [
       const plan = ctx?.plan ?? ctx?.priorPlan;
       if (plan) {
         const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: new Set(plan.selected.map(s => s.id)) });
-        if (check.status !== 'valid') return stalePlanReply({ ...check, plan });
+        if (check.status !== 'valid') return stalePlanReply(check.status, plan, check.issues);
       }
       return savedOrRejected(yaml, async () => {
         // createDefinition 键重复时拒绝：已存在的定义改草稿。查与存之间别人新建了同键定义时 createDefinition 报键重复（不通过），模型重试即走改草稿
