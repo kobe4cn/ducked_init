@@ -316,6 +316,10 @@ describe('分析计划校验 validatePlan()：可加性与平台能力', () => {
     const clarify = check(planOf(undefined, { mode: 'clarify', questions: ['按哪个粒度算？'], request: { dimensions: [], grain: 'city' } }));
     expect(clarify.status).toBe('needs_clarification');
     expect(clarify.issues).toEqual([]);
+
+    const unsupported = check(planOf(undefined, { mode: 'unsupported', reason: '数据里没有城市粒度的结果', request: { dimensions: [], grain: 'city' } }));
+    expect(unsupported.status).toBe('unsupported');
+    expect(unsupported.issues).toEqual([]);
   });
 
   it('未知 action 返回 invalid、plan 为 null，问题指到 steps.N.action 并列出可选动作', () => {
