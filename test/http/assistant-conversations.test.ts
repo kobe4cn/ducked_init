@@ -219,6 +219,8 @@ describe('助手对话', () => {
     expect((await catalogFor(viewer)).entries.some(e => e.kind === 'table')).toBe(false);
     const [customer, metric, table] = ['entity:customer', 'metric:revenue_30d', 'table:CRM/orders'].map(entry);
     if (customer.kind !== 'entity' || metric.kind !== 'metric' || table.kind !== 'table') throw new Error('目录条目种类不对');
+    // publishedIdentitySources 已跑过合并，实体必须有最近一次合并时间，下面卡片的 asOf 才测得到「实体取 stats.at」
+    if (!customer.stats) throw new Error('实体没有合并时间');
     const plan = {
       schemaVersion: 1, mode: 'reuse_result',
       selected: [
@@ -244,7 +246,7 @@ describe('助手对话', () => {
     expect(first.planCard).toEqual({
       status: 'valid', mode: 'reuse_result',
       selected: [
-        { id: 'entity:customer', name: customer.name, description: customer.description, asOf: customer.stats?.at ?? '暂无快照' },
+        { id: 'entity:customer', name: customer.name, description: customer.description, asOf: customer.stats.at },
         { id: 'metric:revenue_30d', name: metric.name, description: metric.description, asOf: '暂无快照' },
         { id: 'table:CRM/orders', name: table.name, description: table.description, asOf: table.stats?.at ?? '暂无快照' },
       ],
