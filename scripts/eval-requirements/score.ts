@@ -158,10 +158,10 @@ const MODE_HELP: Record<PlanMode, string> = {
   unsupported: '平台做不到（如预测、推荐、跨窗口同比），说明原因（reason 必填）并给可行的下一步',
 };
 
-/** system 提示词：五种模式与计划 JSON 的字段（对齐 PLAN_SCHEMA 的约束） */
 /** request.unit / timeMeaning 的可选值：取自 semantic-claims 登记表（PLAN_SCHEMA 的 claimEnum 同源） */
 const claimValues = (t: 'unit' | 'time_meaning') => CLAIM_TYPES[t].values.map(v => v.value).join(' / ');
 
+/** system 提示词：五种模式与计划 JSON 的字段（对齐 PLAN_SCHEMA 的约束） */
 const PLAN_SYSTEM = [
   '你是 CRM 数据平台的分析助手：成员提一条数据分析需求，你先判断怎么回答，输出一份分析计划。只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
   '成员的消息里依次是语义目录总览、按需求搜出的目录条目、可选中条目的版本与语义哈希、需求原文。',
