@@ -52,7 +52,7 @@ export interface ToolCtx { retrieved: Set<string> }
 
 const TEXT = { type: 'string' };
 
-const LANE_NAMES: Record<HitReason['lane'], string> = { id: '标识', alias: '别名', name: '名称', keyword: '关键词', expand: '依赖展开' };
+const LANE_NAMES: Record<HitReason['lane'], string> = { id: '标识', alias: '别名', name: '名称', keyword: '关键词', vector: '语义', expand: '依赖展开' };
 
 /** 条目的 Markdown 加一行语义哈希：模型把哈希带进计划，validatePlan 用它发现条目内容变了（哈希在成员自己那份按角色裁剪的目录上算） */
 const withHash = (e: CatalogEntry) => `${toMarkdown(e)}\nsemanticHash: ${semanticHash(e)}`;

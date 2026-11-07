@@ -1,5 +1,6 @@
-// app/.server/catalog/rank.ts —— 检索排序（ADR-0047，设计文档 8.2–8.3）：在检索投影行上多路召回（精确标识、别名、名称、中文关键词二元组），
-// 用 RRF（Σ 权重 / (k + 名次)）融合。别名已经拼进了投影文字，单靠关键词分不出「别名命中」与「正文命中」，所以别名单独一路、权重高于关键词。
+// app/.server/catalog/rank.ts —— 检索排序（ADR-0047，设计文档 8.2–8.3）：在检索投影行上多路召回（精确标识、别名、名称、中文关键词二元组，加可选的向量一路），
+// 用 RRF（Σ 权重 / (k + 名次)）融合。别名已经拼进了投影文字，单靠关键词分不出「别名命中」与「正文命中」，所以别名单独一路、权重高于关键词；
+// 向量一路由调用方按余弦相似度排好传入（vector.ts，没配 embedding 时不传），rank 只融合不排序。
 // 别名一路同分时先按别名以外的文字里的关键词命中数、再按标识排（多个近义指标挂同一别名很常见，按标识排会让近义项占第 1）；
 // 查询里的别名出现如果落在别的条目更长的名称命中里（名称在查询里按该条目自身文字往两边延长，如 order.channel 的「渠道」延长成「下单渠道」），就不算，与点名排除的「最长匹配」一致。
 // 作用域只加权不排除：成员这次明确说的（scope.subjects、scope.spaceIds、查询里出现的主题名）> 页面上下文 > 对话里已确定的主题 > 成员所属空间，
@@ -8,9 +9,11 @@ import { cmp } from '../../lib/compare';
 import { expand } from './expand';
 import { terms, type Catalog, type CatalogEntry } from './index';
 import type { ProjectionRow } from './projection';
+import type { VectorHit } from './vector';
 
 export const RRF_K = 60;
-export const LANE_WEIGHTS = { id: 4, alias: 3, name: 2, keyword: 1 } as const;
+// vector 放最后一个键：计分循环按 Object.keys(lanes) 遍历，放最后原有各路的理由顺序不变
+export const LANE_WEIGHTS = { id: 4, alias: 3, name: 2, keyword: 1, vector: 1 } as const;
 /** 每一路最多取的名次 */
 export const LANE_LIMIT = 30;
 export const SCOPE_BOOST = { explicit: 1, page: 0.5, conversation: 0.25, member: 0.1 } as const;
@@ -82,13 +85,14 @@ function contained(entryId: string, texts: string[], q: string): LaneHit {
 
 const intersects = (a: readonly string[], b: ReadonlySet<string>) => a.some(x => b.has(x.toLowerCase()));
 
-export function rank(rows: ProjectionRow[], c: Catalog, query: string, scope: RankScope = {}, limit = 20): Ranked[] {
+export function rank(rows: ProjectionRow[], c: Catalog, query: string, scope: RankScope = {}, limit = 20, vector: VectorHit[] = []): Ranked[] {
   const q = query.toLowerCase();
   const byId = new Map(c.entries.map(e => [e.id, e]));
   const present = rows.flatMap(row => {
     const entry = byId.get(row.entryId);
     return entry ? [{ row, entry }] : [];
   });
+  const presentIds = new Set(present.map(p => p.row.entryId));
   const words = terms(query);
   const keywordHits = present.map(({ row: r }) => {
     const matched = words.filter(w => r.text.includes(w));
@@ -109,6 +113,8 @@ export function rank(rows: ProjectionRow[], c: Catalog, query: string, scope: Ra
     alias: ordered(present.map(({ row: r }) => uncovered(contained(r.entryId, r.aliases, q), r.text, spans, q)), id => evidence.get(id) ?? 0),
     name: ordered(nameHits),
     keyword: ordered(keywordHits),
+    // 向量一路的名次就是传入顺序（vectorLane 已按相似度排好）：过滤不在本目录里的 entryId，保持顺序截到 LANE_LIMIT；matched 是两位相似度
+    vector: vector.filter(h => presentIds.has(h.entryId)).slice(0, LANE_LIMIT).map(h => ({ entryId: h.entryId, score: h.similarity, matched: [h.similarity.toFixed(2)] })),
   };
 
   const fused = new Map<string, { score: number; reasons: HitReason[] }>();
