@@ -1,6 +1,11 @@
 // Sandcastle：prep → plan → implement + review → 门槛 → 合并（不能合并的留 PR）
 //
-// 每一轮：
+// 调度（不分轮）：最多 MAX_PARALLEL 个空位。有空位时做一次「整理 → prep → plan」，把空位补满；每张票
+// 独立跑 build → land，做完马上让出空位并触发下一次调度。有空位但开不了工时每 POLL_INTERVAL_MS 轮询一次
+// （人合并了 PR、blocker 关了、去掉了 stuck，都能在下一次轮询开工）；没票在做、也开不出新票算一次空转，
+// 连续 MAX_ITERATIONS 次空转就结束。宿主机上的 git / 标签操作（调度与落地）串行，build 在沙箱里并行。
+//
+// 每次调度与每张票：
 //   Phase 0 (Prep):  人工给 issue 打上 `Sandcastle` 标签即为「选中」。还没有
 //                    `sandcastle:prepped` 的选中票逐张（串行）跑 prep-ticket（`## Blocked by` 里
 //                    还有 open 票的脚本直接跳过，不开会话）：
@@ -16,10 +21,10 @@
 //                    最多 MAX_PARALLEL 张并行，每个沙箱用独立的测试库与前缀。
 //   Phase 3 (Land):  在宿主机上 push、开 PR（`Closes #n`）。reviewer 说 merge 且门槛通过
 //                    → `gh pr merge --rebase`，issue 自动关闭；否则打 sandcastle:pr-open 等人审。
-//                    合并不了（同一轮先合并的票造成冲突，或 drizzle 迁移链分叉）时，rebase 到
+//                    合并不了（先合并的票造成冲突，或 drizzle 迁移链分叉）时，rebase 到
 //                    最新的 origin/main（冲突与迁移交给 agent，rebase-prompt.md），重跑门槛后再合并一次。
-//   每轮开头：等人审的 PR 上有晚于分支最新提交的打回信号（`/sandcastle` 开头的评论或 review，
-//                    或别人点的 Request changes）→ 去掉 issue 的 sandcastle:pr-open，这张票本轮
+//   每次调度开头：等人审的 PR 上有晚于分支最新提交的打回信号（`/sandcastle` 开头的评论或 review，
+//                    或别人点的 Request changes）→ 去掉 issue 的 sandcastle:pr-open，这张票这次
 //                    重新进入 plan，implementer 先读 PR 上的意见。
 //   外部 PR：别人开的、`Closes` 了 Sandcastle 票的 PR（分支不是 `sandcastle/` 开头），打回后在它的分支上
 //                    接着改：只做普通 push，不 rebase、不合并、不删分支，结果评论在 PR 上留给人合并。
@@ -47,7 +52,8 @@ import { changedFiles, section } from "./guide.ts";
 // Configuration
 // ---------------------------------------------------------------------------
 
-const MAX_ITERATIONS = 10; // prep→plan→build→land 的轮数上限
+const POLL_INTERVAL_MS = 10 * 60_000; // 有空位时隔多久重新调度一次（整理 → prep → plan），看有没有新开得了工的票
+const MAX_ITERATIONS = 12; // 连续空转（没有票在做、也开不出新票）多少次就结束运行：12 × 10 分钟，等人审 PR 最多等约 2 小时
 const MAX_PARALLEL = 2; // 同时实现的票数：受 PG max_connections（每个沙箱 4 个 worker 约 150 个连接，2 个要 300）与机器负载限制；3 个门槛同时跑完整测试会大面积超时（2026-11-07）
 const IMPLEMENT_MAX_ITERATIONS = 3; // 一张票最多开几次全新会话；超过说明票太大，交给人
 /** 第一次没做完时脚本留在 issue 上的标记；prep 看到它就按「实现没做完」重新准备，再没做完才打 stuck。 */
@@ -61,7 +67,7 @@ const REVISE_MAX = 2; // reviewer 给 revise 时最多打回几次；之后仍�
 const CONTEXT_BUDGET = 150_000; // 单个会话的上下文预算（CLAUDE.md「Context budget」）
 const REMOTE = "origin";
 const BASE_BRANCH = "main";
-// 从远端 main 建分支：上一轮合并的代码在远端，不动宿主机本地 main 的工作区。
+// 从远端 main 建分支：已合并的代码在远端，不动宿主机本地 main 的工作区。
 const BASE_REF = `${REMOTE}/${BASE_BRANCH}`;
 // 只处理这几张票（逗号分隔）；不设则处理全部带 Sandcastle 标签的票。拆出来的子票不在名单里，要另外加。
 const ONLY = new Set((process.env.SANDCASTLE_ONLY ?? "").split(",").map((s) => s.trim()).filter(Boolean));
@@ -155,7 +161,7 @@ async function dropTestResources(issueId: string) {
 }
 
 // 本机 seaweedfs 的 filer 元数据日志会一直占卷，卷数到上限后门槛里对象存储全部超时（见 docs/agents/sandcastle.md）。
-// 每轮开头删两天前的日志目录和已清空的整卷；失败只打日志。
+// 每次调度开头删两天前的日志目录和已清空的整卷；失败只打日志。
 function pruneSeaweedMetalog() {
   const r = trySh("scripts/prune-seaweed-metalog.sh", []);
   console.log(r.ok ? `  🧹 ${r.out}` : `  ⚠ 元数据日志清理失败：${r.out.slice(0, 300)}`);
@@ -257,7 +263,7 @@ const trySh = (cmd: string, args: string[], timeout?: number) => {
 };
 
 // 连远端的 git（fetch / push）偶尔撞上 SSH、DNS、网络抖动（2026-11-04 一次
-// `Permission denied (publickey)` 让 #390 落地失败、下一轮开头的 fetch 直接让进程崩了）。
+// `Permission denied (publickey)` 让 #390 落地失败、下次开头的 fetch 直接让进程崩了）。
 // 这类错误等一会儿重试，最多等约半小时；被拒（non-fast-forward、lease 过期）之类的照常立即失败。
 const REMOTE_TRANSIENT = new RegExp(
   [
@@ -310,7 +316,7 @@ async function retryTransient<T>(what: string, fn: () => Promise<T>): Promise<T>
 /**
  * prep 与 plan 不建分支，podman 是挂载型沙箱，默认挂的是宿主机工作区（本地 HEAD），
  * 不是 origin/main。本地 main 落后时，prep 的 Explore 读到旧代码：指引的 file:line 对不上，
- * 刚合并的 blocker 也看不到。所以每轮 fetch 后把本地 main 快进到 origin/main。
+ * 刚合并的 blocker 也看不到。所以每次调度 fetch 后把本地 main 快进到 origin/main。
  * 只在当前分支是 main 时做；--ff-only 遇到本地领先或分叉、或会覆盖未提交改动时 git 自己拒绝，
  * 这时只打警告，不动工作区。
  */
@@ -332,15 +338,15 @@ function syncHostBase() {
  * 才查得到。2026-11-05 #393 刚打上 prepped，plan 用 --search 没查到，脚本以为没票可做就退出了。
  * 排除的标签在本地过滤。
  */
-const listIssues = (include: string[], exclude: string[] = []): { number: number; title: string; body: string }[] =>
+const listIssues = (include: string[], exclude: string[] = []): { number: number; title: string; body: string; updatedAt: string }[] =>
   (JSON.parse(
     sh("gh", [
       "issue", "list", "--state", "open", "--limit", "200",
-      ...include.flatMap((label) => ["--label", label]), "--json", "number,title,body,labels",
+      ...include.flatMap((label) => ["--label", label]), "--json", "number,title,body,labels,updatedAt",
     ]),
-  ) as { number: number; title: string; body: string; labels: { name: string }[] }[])
+  ) as { number: number; title: string; body: string; labels: { name: string }[]; updatedAt: string }[])
     .filter((issue) => !issue.labels.some((label) => exclude.includes(label.name)))
-    .map(({ number, title, body }) => ({ number, title, body }));
+    .map(({ number, title, body, updatedAt }) => ({ number, title, body, updatedAt }));
 
 const q = (label: string) => `label:"${label}"`;
 const notIn = (...labels: string[]) => labels.map((l) => `-${q(l)}`).join(" ");
@@ -353,7 +359,7 @@ const notIn = (...labels: string[]) => labels.map((l) => `-${q(l)}`).join(" ");
 const blockersOf = (body: string) =>
   [...new Set([...section(body, "Blocked by").matchAll(/#(\d+)/g)].map((m) => Number(m[1])))];
 
-/** 票的 open 状态，每轮开头清空（blocker 可能在两轮之间被合并）。 */
+/** 票的 open 状态，每次调度开头清空（blocker 可能在两次调度之间被合并）。 */
 const openStates = new Map<number, boolean>();
 function isOpen(n: number): boolean {
   if (!openStates.has(n)) {
@@ -369,7 +375,7 @@ const openBlockers = (body: string) => blockersOf(body).filter(isOpen);
 /**
  * 拆过的父票：prep 拆票时去掉父票的 Sandcastle，正文加 `## Split into`，之后没人管它，
  * 被它 block 的票就一直排不上（2026-11-04 #381 的子票 #389、#390 都合并了，#382 仍在等 #381）。
- * 每轮开头查不带 Sandcastle、有 `## Split into` 的 open 票，子票全关了就勾上清单、关掉父票。
+ * 每次调度开头查不带 Sandcastle、有 `## Split into` 的 open 票，子票全关了就勾上清单、关掉父票。
  * 「上下文不够」那种父票保留 Sandcastle、由自己的 PR 关，不在这里处理。gh 出错只打警告。
  */
 function closeFinishedParents() {
@@ -400,7 +406,7 @@ function closeFinishedParents() {
 /**
  * 已关闭票的残留：人在 GitHub 上手动合并 Sandcastle 的 PR、或在运行中途合并 / 关掉正在做的票时，
  * land 不会走到删分支那一步（2026-11-08 #450：PR #456 由人合并），远端分支、本地 worktree 与分支、
- * sandcastle:* 状态标签都留着。每轮开头清一次：
+ * sandcastle:* 状态标签都留着。每次调度开头清一次：
  * - 已关闭票上的 prepped / pr-open / stuck 去掉（decided 等人事后确认、flaky 是分类，不动）；
  * - `sandcastle/issue-<n>` 只在票已关闭、且这个分支有已合并的 PR 时删：远端分支、本地 worktree、本地分支。
  *   worktree 有未提交改动时 git 拒绝删除，留着并警告。没合并就关掉的票（不做了）分支留着，里面的提交可能还有人要看。
@@ -466,12 +472,13 @@ async function cleanupClosedIssues() {
 }
 
 /**
- * 能在 main 上开工、且可以并行的票，按编号从小到大，最多 MAX_PARALLEL 张。
+ * 能在 main 上开工、且可以并行的票，按编号从小到大。
  * blocker 没关（包括已开 PR 未合并）的跳过；和已选的票、或等人审（pr-open）的票改同一个文件的跳过，
  * 所以冲突时总是编号小的先做，等人审的 PR 合入或关闭前不会有第二个 PR 改同一个文件。
  * 被 blocker 挡住的票不占文件，不会连带挡住编号大的票。
+ * running 是正在 build / 落地的票：不再选，它们改的文件和等人审的票一样先占上；最多补满 slots 张。
  */
-function plan(): Issue[] {
+function plan(running: ReadonlySet<string>, slots: number): Issue[] {
   const candidates = listIssues([LABEL.picked, LABEL.prepped], [LABEL.prOpen, LABEL.stuck]);
   // 等人审的 PR 还没合进 main：它们改的文件先占上，免得新票在旧 main 上改同一个文件，两个 PR 互相冲突。
   const waiting = listIssues([LABEL.picked, LABEL.prOpen]);
@@ -481,8 +488,11 @@ function plan(): Issue[] {
     awaitingReview.add(w.number);
     for (const f of changedFiles(w.body).files) if (!taken.has(f)) taken.set(f, w.number);
   }
+  for (const r of candidates.filter((c) => running.has(String(c.number)))) {
+    for (const f of changedFiles(r.body).files) if (!taken.has(f)) taken.set(f, r.number);
+  }
   const picked: Issue[] = [];
-  for (const issue of candidates.filter((c) => allowed(c.number)).sort((a, b) => a.number - b.number)) {
+  for (const issue of candidates.filter((c) => allowed(c.number) && !running.has(String(c.number))).sort((a, b) => a.number - b.number)) {
     const open = openBlockers(issue.body);
     if (open.length > 0) {
       console.log(`  跳过 #${issue.number}：blocker ${open.map((n) => `#${n}`).join("、")} 还没关`);
@@ -494,11 +504,13 @@ function plan(): Issue[] {
     const clash = files.find((f) => taken.has(f));
     if (clash) {
       const owner = taken.get(clash)!;
-      const why = awaitingReview.has(owner) ? `等人审的 #${owner}（PR 合入或关闭后再做）` : `#${owner}`;
+      const why = awaitingReview.has(owner)
+        ? `等人审的 #${owner}（PR 合入或关闭后再做）`
+        : running.has(String(owner)) ? `正在做的 #${owner}` : `#${owner}`;
       console.log(`  跳过 #${issue.number}：和${why}都改 ${clash}`);
       continue;
     }
-    if (picked.length >= MAX_PARALLEL) break;
+    if (picked.length >= slots) break;
     for (const f of files) taken.set(f, issue.number);
     // 已有外部 PR（`Closes` 了这张票）时在它的分支上接着改；否则照旧用自己的分支。
     const pr = prFor(issue.number);
@@ -670,7 +682,7 @@ function reopenRequestedRevisions() {
 }
 
 /**
- * 门槛里重跑才通过的测试文件：每个文件一张票（带 Sandcastle，下一轮自动 prep + 修）。
+ * 门槛里重跑才通过的测试文件：每个文件一张票（带 Sandcastle，下次调度自动 prep + 修）。
  * 已有同名的 open 票就在那张票上追加一次出现记录，不重复开票。返回票号，写进 PR 的 Gate 一节。
  */
 function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
@@ -942,21 +954,25 @@ async function untilAfterLimit<T>(what: string, fn: () => Promise<T>, onLimit?: 
     try {
       return await fn();
     } catch (e) {
-      const message = String(e);
-      if (!(e instanceof AllProfilesLimited) && !CLAUDE_LIMIT_PATTERN.test(message)) throw e;
+      const limit = limitWait(e);
+      if (!limit) throw e;
       await onLimit?.();
-      // AllProfilesLimited 的 until 已经含了余量。
-      let until = e instanceof AllProfilesLimited ? e.until : 0;
-      let why = "";
-      if (!(e instanceof AllProfilesLimited)) {
-        const resetAt = limitResetAt(message);
-        until = resetAt === null ? Date.now() + LIMIT_FALLBACK_WAIT_MS : resetAt + LIMIT_RESUME_SLACK_MS;
-        if (resetAt === null) why = `认不出重置时间（${message.slice(0, 200)}），`;
-      }
-      console.log(`  ⏸ ${what} 撞上用量限额，${why}等到 ${new Date(until).toLocaleString()} 再接着跑`);
-      await sleepUntil(until);
+      console.log(`  ⏸ ${what} 撞上用量限额，${limit.why}等到 ${new Date(limit.until).toLocaleString()} 再接着跑`);
+      await sleepUntil(limit.until);
     }
   }
+}
+
+/** 错误是用量限额时，该等到什么时候（含余量）；不是限额返回 null。 */
+function limitWait(e: unknown): { until: number; why: string } | null {
+  // AllProfilesLimited 的 until 已经含了余量。
+  if (e instanceof AllProfilesLimited) return { until: e.until, why: "" };
+  const message = String(e);
+  if (!CLAUDE_LIMIT_PATTERN.test(message)) return null;
+  const resetAt = limitResetAt(message);
+  return resetAt === null
+    ? { until: Date.now() + LIMIT_FALLBACK_WAIT_MS, why: `认不出重置时间（${message.slice(0, 200)}），` }
+    : { until: resetAt + LIMIT_RESUME_SLACK_MS, why: "" };
 }
 
 /** 分支上已有提交时推到远端，免得只留在宿主机上。 */
@@ -1034,7 +1050,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     sh("gh", ["issue", "edit", issue.id, "--remove-label", LABEL.prepped]);
     sh("gh", [
       "issue", "comment", issue.id, "--body",
-      `${REPREP_MARK}\n${IMPLEMENT_MAX_ITERATIONS} 次会话内没有完成。${budgetNote} 下一轮 prep 会按上面 implementer 的进度评论重新准备：指引不对就重写，票太大就把没完成的验收标准拆成子票。再没做完就打 ${LABEL.stuck}。${commits}${pushed ? "" : "\n\n（分支没能推到远端，下一轮会在本地的同名分支上接着做。）"}`,
+      `${REPREP_MARK}\n${IMPLEMENT_MAX_ITERATIONS} 次会话内没有完成。${budgetNote} 下次调度时 prep 会按上面 implementer 的进度评论重新准备：指引不对就重写，票太大就把没完成的验收标准拆成子票。再没做完就打 ${LABEL.stuck}。${commits}${pushed ? "" : "\n\n（分支没能推到远端，下一轮会在本地的同名分支上接着做。）"}`,
     ]);
     console.log(`  ↺ #${issue.id} 没做完，退回 prep 重新准备`);
     return;
@@ -1098,7 +1114,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     console.log(`  ◐ #${issue.id} 门槛失败，留 PR #${pr}`);
     return;
   }
-  // 同一轮先合并的票可能让这张冲突：rebase 到最新的 origin/main（冲突交给 agent）、重跑门槛，再合并一次。
+  // 先合并的票可能让这张冲突：rebase 到最新的 origin/main（冲突交给 agent）、重跑门槛，再合并一次。
   // 迁移链要先在宿主机上查：没有文本冲突时 GitHub 会照样合并，分叉的迁移就进了 main。
   await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]);
   const chainOk = trySh("sh", ["-c", migrationChainOk(issue.branch)]).ok;
@@ -1123,10 +1139,86 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
 // Main loop
 // ---------------------------------------------------------------------------
 
-for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
-  console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
-  reloadModels(); // 每轮读一次 .sandcastle/models.json：改了配置不用重启，下一轮生效
-  await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]); // 上一轮合并进远端 main 的代码
+/**
+ * 宿主机上的 git 与 GitHub 标签操作串行做：调度（整理、prep、plan）和落地不交错，
+ * 免得落地合并的同时清理删掉它的 worktree，或 prep 挂着的工作区被快进。build 在沙箱里跑，不占锁。
+ */
+let hostQueue: Promise<unknown> = Promise.resolve();
+function withHost<T>(fn: () => Promise<T>): Promise<T> {
+  const run = hostQueue.then(fn);
+  hostQueue = run.catch(() => {});
+  return run;
+}
+
+/** 有票做完、让出空位时叫醒主循环；主循环没在等时记下来，下次等的时候立刻返回。 */
+let notify: (() => void) | null = null;
+let slotFreed = false;
+function signalSlotFreed() {
+  if (notify) notify();
+  else slotFreed = true;
+}
+async function waitForSlotOrPoll(ms: number) {
+  if (slotFreed) {
+    slotFreed = false;
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const done = () => {
+      notify = null;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    notify = done;
+  });
+  slotFreed = false;
+}
+
+/** 正在 build 或落地的票。一张票从开工到落地完一直占着空位：落地里的 rebase 补救也要跑门槛。 */
+const running = new Map<string, Issue>();
+
+/** 一张票独立跑完 build → 落地，做完就让出空位，不等同批的其他票。 */
+function start(issue: Issue) {
+  running.set(issue.id, issue);
+  void (async () => {
+    // 撞上限额的票等重置后在原分支上重跑，不打 stuck。
+    const [outcome] = await Promise.allSettled([
+      untilAfterLimit(`#${issue.id}`, () => retryTransient(`#${issue.id}`, () => build(issue)), () => pushIfAhead(issue)),
+    ]);
+    // 落地在宿主机上做：用宿主机的 git / gh 凭据，沙箱没有写仓库的权限。
+    // 每张票单独兜底：一张票落地出错（网络、人在运行中途合并或删了分支等）不让整个运行崩掉。
+    await withHost(async () => {
+      try {
+        await retryTransient(`落地 #${issue.id}`, () => land(issue, outcome!));
+      } catch (e) {
+        const reason = String((e as { stderr?: unknown }).stderr || e).trim().slice(0, 500);
+        console.error(`  ✗ #${issue.id} 落地出错：${reason}`);
+        // 打 stuck 不让下次再做；本地分支保留，人看过后去掉 stuck 即可接着跑。
+        if (!issueClosed(issue.id)) trySh("gh", ["issue", "edit", issue.id, "--add-label", LABEL.stuck]);
+        if (!issueClosed(issue.id)) trySh("gh", ["issue", "comment", issue.id, "--body", `Sandcastle 停下了：落地（push / 开 PR / 合并）出错，本地分支 \`${issue.branch}\` 保留。\n\n\`\`\`\n${reason}\n\`\`\`\n\n处理后去掉 ${LABEL.stuck} 再运行。`]);
+      }
+    });
+  })()
+    .catch((e) => console.error(`  ✗ #${issue.id} 出错：${String(e).slice(0, 500)}`))
+    .finally(() => {
+      running.delete(issue.id);
+      console.log(`  ⇢ #${issue.id} 让出空位（还有 ${running.size} 张在做）`);
+      signalSlotFreed();
+    });
+}
+
+/**
+ * 本次运行里 prep 过、但没打上 prepped 也没拆的票，记下 prep 结束时 issue 的 updatedAt。
+ * 轮询比原来按轮跑频繁得多，issue 没变就不再开 prep 会话；有人评论、改正文或改标签后再试。
+ */
+const prepTried = new Map<number, string>();
+
+type ScheduleResult = { started: number; split: boolean; prepLimitedUntil?: number };
+
+/** 一次调度：整理 → prep → plan，把空位补满。在 withHost 里跑。 */
+async function schedule(): Promise<ScheduleResult> {
+  reloadModels(); // 每次调度读一次 .sandcastle/models.json：改了配置不用重启，下次生效
+  await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]); // 刚合并进远端 main 的代码
   openStates.clear();
   syncHostBase();
   reopenRequestedRevisions();
@@ -1134,71 +1226,93 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   await cleanupClosedIssues();
   pruneSeaweedMetalog();
 
-  // Phase 0: Prep —— 串行，因为拆票会改别的票的 Blocked by。
-  // 每轮重新查询，所以上一轮拆出来的子票（继承了 Sandcastle 标签）这里会被看到。
+  // Prep —— 串行，因为拆票会改别的票的 Blocked by。
+  // 每次重新查询，所以上次拆出来的子票（继承了 Sandcastle 标签）这里会被看到。
   // 有 open blocker 的票脚本直接跳过，不开会话（prep agent 遇到这种票也只会什么都不改就结束）；
-  // 跳过的票仍留在 toPrep 里，下面判断「本轮拆出了新子票」时不会把它当成新票。
+  // 跳过的票仍留在 toPrep 里，下面判断「这次拆出了新子票」时不会把它当成新票。
+  // 撞上用量限额不在这里等（会占着宿主机锁，做完的票落不了地）：停止这次 prep，交给主循环决定等多久。
   const toPrep = listIssues([LABEL.picked], [LABEL.prepped, LABEL.prOpen, LABEL.stuck]).filter((issue) => allowed(issue.number));
+  let prepLimitedUntil: number | undefined;
   for (const issue of toPrep) {
     const open = openBlockers(issue.body);
     if (open.length > 0) {
       console.log(`  跳过 prep #${issue.number}：blocker ${open.map((n) => `#${n}`).join("、")} 还没关`);
       continue;
     }
+    if (prepTried.get(issue.number) === issue.updatedAt) continue;
     console.log(`Prep #${issue.number}: ${issue.title}`);
-    await untilAfterLimit(`prep #${issue.number}`, () => runAgent("prep", String(issue.number), `prep-${issue.number}`, {}, [], (agent) => sandcastle.run({
-      sandbox: podman(),
-      name: `prep-${issue.number}`,
-      maxIterations: 1,
-      agent,
-      promptFile: "./.sandcastle/prep-prompt.md",
-      promptArgs: {
-        TASK_ID: issue.number, LABEL_PICKED: LABEL.picked, LABEL_PREPPED: LABEL.prepped, LABEL_STUCK: LABEL.stuck,
-        REPREP_MARK,
-      },
-    })));
+    try {
+      await runAgent("prep", String(issue.number), `prep-${issue.number}`, {}, [], (agent) => sandcastle.run({
+        sandbox: podman(),
+        name: `prep-${issue.number}`,
+        maxIterations: 1,
+        agent,
+        promptFile: "./.sandcastle/prep-prompt.md",
+        promptArgs: {
+          TASK_ID: issue.number, LABEL_PICKED: LABEL.picked, LABEL_PREPPED: LABEL.prepped, LABEL_STUCK: LABEL.stuck,
+          REPREP_MARK,
+        },
+      }));
+    } catch (e) {
+      const limit = limitWait(e);
+      if (limit) {
+        console.log(`  ⏸ prep #${issue.number} 撞上用量限额，${limit.why}${new Date(limit.until).toLocaleString()} 前不再 prep`);
+        prepLimitedUntil = limit.until;
+        break;
+      }
+      console.error(`  ✗ prep #${issue.number} 出错：${String(e).slice(0, 500)}`);
+    }
+    const after = trySh("gh", ["issue", "view", String(issue.number), "--json", "updatedAt", "--jq", ".updatedAt"]);
+    if (after.ok) prepTried.set(issue.number, after.out);
   }
 
-  // Phase 1: Plan
-  const issues = plan();
+  // Plan
+  const issues = plan(new Set(running.keys()), MAX_PARALLEL - running.size);
   if (issues.length === 0) {
-    // 本轮 prep 拆出的子票还没 prep 过（下一轮才看到），这时停下会漏掉能开工的子票。
-    // 只认本轮新出现的票：留在 toPrep 里的票（如等 blocker）下一轮仍不会有新票，循环照常结束。
+    // 这次 prep 拆出的子票还没 prep 过（下次才看到），这时不能当作没活可做。
+    // 只认这次新出现的票：留在 toPrep 里的票（如等 blocker）下次仍不会有新票。
     const prepped = new Set(toPrep.map((issue) => issue.number));
     const split = listIssues([LABEL.picked], [LABEL.prepped, LABEL.prOpen, LABEL.stuck])
       .filter((issue) => allowed(issue.number) && !prepped.has(issue.number));
-    if (split.length > 0) {
-      console.log(`本轮没有可以开工的票，但拆出了子票 ${split.map((issue) => `#${issue.number}`).join("、")}，下一轮 prep。`);
-      continue;
-    }
-    console.log("没有可以开工的票（都在等 blocker、等人审 PR，或需要人处理）。");
-    break;
+    if (split.length > 0) console.log(`拆出了子票 ${split.map((issue) => `#${issue.number}`).join("、")}，马上 prep。`);
+    return { started: 0, split: split.length > 0 && prepLimitedUntil === undefined, prepLimitedUntil };
   }
-  for (const issue of issues) console.log(`  #${issue.id}: ${issue.title} → ${issue.branch}`);
-
-  // Phase 2: Build
-  // 撞上限额的票等重置后在原分支上重跑，不打 stuck。
-  const settled = await Promise.allSettled(
-    issues.map((issue) => untilAfterLimit(`#${issue.id}`, () => retryTransient(`#${issue.id}`, () => build(issue)), () => pushIfAhead(issue))),
-  );
-
-  // Phase 3: Land —— 在宿主机上逐个做：用宿主机的 git / gh 凭据，沙箱没有写仓库的权限。
-  // 每张票单独兜底：一张票落地出错（网络、人在运行中途合并或删了分支等）不让整个运行崩掉。
-  for (const [i, outcome] of settled.entries()) {
-    const issue = issues[i]!;
-    try {
-      await retryTransient(`落地 #${issue.id}`, () => land(issue, outcome));
-    } catch (e) {
-      const reason = String((e as { stderr?: unknown }).stderr || e).trim().slice(0, 500);
-      console.error(`  ✗ #${issue.id} 落地出错：${reason}`);
-      // 打 stuck 不让下一轮重做；本地分支保留，人看过后去掉 stuck 即可接着跑。
-      if (!issueClosed(issue.id)) trySh("gh", ["issue", "edit", issue.id, "--add-label", LABEL.stuck]);
-      if (!issueClosed(issue.id)) trySh("gh", ["issue", "comment", issue.id, "--body", `Sandcastle 停下了：落地（push / 开 PR / 合并）出错，本地分支 \`${issue.branch}\` 保留。\n\n\`\`\`\n${reason}\n\`\`\`\n\n处理后去掉 ${LABEL.stuck} 再运行。`]);
-    }
+  for (const issue of issues) {
+    console.log(`  开工 #${issue.id}: ${issue.title} → ${issue.branch}`);
+    start(issue);
   }
+  return { started: issues.length, split: false, prepLimitedUntil };
 }
 
-// 最后一轮合并的票在这次 fetch 之后才进远端，收尾再同步一次。
+// 有空位就调度一次；然后等「有票做完」或「过了 POLL_INTERVAL_MS」，先到哪个算哪个。
+// 等人审的 PR 合入、blocker 关闭、人去掉 stuck 之后，下一次轮询就能开工，不用等正在做的票做完。
+// 没有票在做、也开不出新票时算一次空转；连续 MAX_ITERATIONS 次空转就结束运行。
+let idlePolls = 0;
+for (let pass = 1; ; pass++) {
+  if (running.size < MAX_PARALLEL) {
+    console.log(`\n=== 调度 ${pass}（${new Date().toLocaleString()}，${running.size}/${MAX_PARALLEL} 个空位已占）===\n`);
+    const r = await withHost(schedule);
+    if (r.split) continue;
+    if (running.size > 0 || r.started > 0) {
+      idlePolls = 0;
+    } else if (r.prepLimitedUntil !== undefined) {
+      // 没票在做、prep 在等限额：等到重置再来，不算空转。
+      console.log(`没有票在做，等 prep 的用量限额到 ${new Date(r.prepLimitedUntil).toLocaleString()} 重置`);
+      await sleepUntil(r.prepLimitedUntil);
+      continue;
+    } else {
+      idlePolls++;
+      if (idlePolls >= MAX_ITERATIONS) {
+        console.log(`没有可以开工的票（都在等 blocker、等人审 PR，或需要人处理），连续空转 ${idlePolls} 次，结束运行。`);
+        break;
+      }
+      console.log(`没有可以开工的票（都在等 blocker、等人审 PR，或需要人处理），${POLL_INTERVAL_MS / 60_000} 分钟后再查（空转 ${idlePolls}/${MAX_ITERATIONS}）。`);
+    }
+  }
+  await waitForSlotOrPoll(POLL_INTERVAL_MS);
+}
+
+// 最后合并的票在上次 fetch 之后才进远端，收尾再同步一次。
 await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]);
 syncHostBase();
 console.log(`\nAll done. 本地 main 已快进到 ${BASE_REF}（不在 main 上时除外，见上面的警告）；带 ${LABEL.prOpen} 的票在 GitHub 上等你审。`);
