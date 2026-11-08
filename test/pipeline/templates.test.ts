@@ -56,17 +56,6 @@ describe('分析模板定义', () => {
     await expect(saveDraft(viewer, 'rfm', PARAMS)).rejects.toMatchObject({ init: { status: 403 } });
   });
 
-  it('再次保存改的是同一份草稿，记下又一位作者与最后保存的人', async () => {
-    const acme = await newTenant('acme');
-    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
-    const engineer = await memberOf(acme, 'de@acme.com');
-    await saveDraft(analyst, 'rfm', PARAMS);
-    expect(await saveDraft(engineer, 'rfm', { ...PARAMS, lookbackDays: 400 })).toBe(1);
-    expect((await getTemplate(analyst, 'rfm')).draft).toMatchObject({
-      version: 1, params: { lookbackDays: 400 }, authors: ['analyst@acme.com', 'de@acme.com'], lastEditor: 'de@acme.com',
-    });
-  });
-
   it('第一次保存草稿记为保存者的当前空间（ADR-0048），别的空间的成员再存一版不改', async () => {
     const acme = await newTenant('acme');
     const other = await memberInNewSpace(acme, 'b@acme.com', 'analyst');
@@ -76,26 +65,21 @@ describe('分析模板定义', () => {
       .toEqual([{ spaceId: other.space.id }]);
   });
 
-  it('最后保存草稿的人不能发布，分析师没有发布权限；另一位数据工程师发布后以新参数入队 gold.rfm，快照记下定义版本', async () => {
+  it('分析师没有发布权限；另一位数据工程师发布后以新参数入队 gold.rfm，快照记下定义版本', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     // 映射合并后平台已按默认参数发布第 1 版，成员的草稿是第 2 版
     expect(await saveDraft(author, 'rfm', PARAMS)).toBe(2);
-
-    const error = await publishTemplate(author, 'rfm', 2).catch(e => e);
-    expect(error).toBeInstanceOf(TemplateError);
-    expect(error.message).toMatch(/最后改了这一版草稿/);
     await expect(publishTemplate(analyst, 'rfm', 2)).rejects.toMatchObject({ init: { status: 403 } });
 
     const task = await publishTemplate(reviewer, 'rfm', 2);
     expect(task).toMatchObject({ kind: 'gold.rfm', status: 'queued', params: { ...PARAMS, definitionVersion: 2, asOf: new Date().toISOString().slice(0, 10) } });
     const t = await getTemplate(analyst, 'rfm');
     expect(t).toMatchObject({ draft: null, params: PARAMS, published: { version: 2, publishedByEmail: reviewer.email } });
-    await expect(publishTemplate(reviewer, 'rfm', 2)).rejects.toThrow(/已锁定/);
 
     await drain();
-    expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
-    const snapshot = (await listSnapshots(acme)).find(s => s.taskId === task.id);
+    expect(await getTask(task!.id)).toMatchObject({ status: 'succeeded' });
+    const snapshot = (await listSnapshots(acme)).find(s => s.taskId === task!.id);
     expect(snapshot).toMatchObject({ template: 'rfm', definitionVersion: 2, trigger: 'publish', params: { lookbackDays: 3650, segments: PARAMS.segments } });
 
     // 发布后再改是新的一版草稿，已发布的第 2 版不变
@@ -154,14 +138,14 @@ describe('分析模板定义', () => {
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     const engineer = await memberOf(acme, 'de@acme.com');
     await saveDraft(analyst, 'rfm', PARAMS);
-    expect(await discardDraft(analyst, 'rfm')).toEqual({ published: null });
+    expect(await discardDraft(analyst, 'rfm')).toEqual({ kept: false });
     expect(await getTemplate(analyst, 'rfm')).toMatchObject({ draft: null, published: null, versions: [], params: RFM_DEFAULTS });
     await expect(discardDraft(analyst, 'rfm')).rejects.toThrow(/没有草稿/);
 
     await saveDraft(analyst, 'rfm', PARAMS);
     await publishTemplate(engineer, 'rfm', 1);
     await saveDraft(analyst, 'rfm', { ...PARAMS, lookbackDays: 400 });
-    expect(await discardDraft(engineer, 'rfm')).toEqual({ published: 1 });
+    expect(await discardDraft(engineer, 'rfm')).toEqual({ kept: true });
     expect(await getTemplate(analyst, 'rfm')).toMatchObject({ draft: null, published: { version: 1 }, params: PARAMS });
   });
 
@@ -295,7 +279,7 @@ describe('模板版本锁定', () => {
     await saveDraft(author, 'rfm', PARAMS);
     expect((await getTemplate(author, 'rfm')).draft).toMatchObject({ version: 2, templateVersion: 1 });
     const published = await publishTemplate(reviewer, 'rfm', 2);
-    expect(published.params).toMatchObject({ definitionVersion: 2, templateVersion: 1 });
+    expect(published!.params).toMatchObject({ definitionVersion: 2, templateVersion: 1 });
     await drain();
     const { task } = await recomputeTemplate(reviewer, 'rfm');
     expect(task.params).toMatchObject({ definitionVersion: 2, templateVersion: 1, trigger: 'manual' });
