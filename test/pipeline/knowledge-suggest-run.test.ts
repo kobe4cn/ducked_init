@@ -60,7 +60,7 @@ describe('按主题生成知识提案', () => {
   it('成功：提案带证据与 basedOn，llm_calls 记一条 knowledge_proposal，返回各类计数并记 generated 审计；代次行记提案数', async () => {
     const { acme, analyst, subjectId } = await setup();
     platformDefault();
-    const { f, received } = fakeLlm(setLlmFetch, () => json(modelOutput(), USAGE));
+    const { f } = fakeLlm(setLlmFetch, () => json(modelOutput(), USAGE));
 
     const out = await suggestForSubject(analyst, subjectId);
     expect(out).toEqual({ fresh: true, created: 4, existing: 0, rejected: 0, invalid: 0, stale: 0 });
