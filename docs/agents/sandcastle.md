@@ -1,6 +1,8 @@
 # Sandcastle：无人值守地实现 issue
 
-`npm run run:sandcastle` 跑 `.sandcastle/main.ts`：每一轮 prep → plan → implement + review → 门槛 → 合并。能合并的直接 rebase 合并进 `main`；不能合并的留 PR 给人审。
+`npm run run:sandcastle` 跑 `.sandcastle/main.ts`：每张票 prep → plan → implement + review → 门槛 → 合并。能合并的直接 rebase 合并进 `main`；不能合并的留 PR 给人审。
+
+脚本不分轮，按空位调度：最多 `MAX_PARALLEL`（2）张票同时在做，一张票从开工到落地完一直占着一个空位。有空位时做一次调度（整理 → prep → plan），把空位补满；每张票独立跑完 build 和落地，做完马上让出空位，再调度一次，不等同批的另一张。有空位但开不了工时，每 `POLL_INTERVAL_MS`（10 分钟）重新调度一次，所以人合并了 PR、blocker 关了、去掉了 stuck，最晚 10 分钟后就能开工，不用等正在做的票做完。没有票在做、也开不出新票算一次空转，连续 `MAX_ITERATIONS`（12）次空转（约 2 小时）就结束运行。调度和落地都在宿主机上动 git 与标签，两者串行；build 在沙箱里并行。
 
 ## 标签状态机
 
@@ -8,13 +10,13 @@
 
 | 状态 | 标签 | 谁设置 | 下一步 |
 |---|---|---|---|
-| 选中 | `Sandcastle` + `ready-for-agent` | 人 | 下一轮 prep |
+| 选中 | `Sandcastle` + `ready-for-agent` | 人 | 下次调度 prep |
 | 已准备 | + `sandcastle:prepped` | prep agent（指引新鲜、≤3 条验收标准、blocker 都已关闭） | plan 选中后实现 |
-| 已拆分 | 父票去掉 `Sandcastle`；子票带 `Sandcastle` + `ready-for-agent` | prep agent | 子票下一轮各自 prep；子票全关后，脚本在下一轮开头勾上 `## Split into` 清单并关掉父票 |
-| 已合并 | issue 关闭（PR 正文 `Closes #n`） | 脚本 | 依赖它的票下一轮开工 |
+| 已拆分 | 父票去掉 `Sandcastle`；子票带 `Sandcastle` + `ready-for-agent` | prep agent | 子票马上各自 prep；子票全关后，脚本在下次调度开头勾上 `## Split into` 清单并关掉父票 |
+| 已合并 | issue 关闭（PR 正文 `Closes #n`） | 脚本 | 依赖它的票下次调度开工 |
 | 等人审 | + `sandcastle:pr-open` | 脚本（没能自动合并时） | 人审 PR：没问题就合并（issue 自动关闭）；要改就在 PR 上发 `/sandcastle` 开头的评论或 review |
-| 打回 | 去掉 `sandcastle:pr-open` | 脚本（每轮开头看到打回信号时） | 本轮重新 plan，implementer 在原分支上先处理 PR 意见 |
-| 退回重新准备 | 去掉 `sandcastle:prepped`，issue 上留 `<!-- sandcastle:reprep -->` 评论 | 脚本（implementer 第一次用完会话没做完时） | 下一轮 prep 按进度：指引不对就重写；票太大就把没完成的验收标准拆成子票（被本票 block），本票只留已完成的部分，在原分支上收尾合并 |
+| 打回 | 去掉 `sandcastle:pr-open` | 脚本（每次调度开头看到打回信号时） | 这次调度重新 plan，implementer 在原分支上先处理 PR 意见 |
+| 退回重新准备 | 去掉 `sandcastle:prepped`，issue 上留 `<!-- sandcastle:reprep -->` 评论 | 脚本（implementer 第一次用完会话没做完时） | 下次调度 prep 按进度：指引不对就重写；票太大就把没完成的验收标准拆成子票（被本票 block），本票只留已完成的部分，在原分支上收尾合并 |
 | 需要人 | + `sandcastle:stuck`（评论里写原因） | 脚本（重新准备后仍没做完、沙箱出错、implementer 输出 `NEEDS_DECISION`）或 agent | 人处理后去掉 `sandcastle:stuck` |
 | 代拍板 | + `sandcastle:decided`（票仍照常合并或留 PR） | 脚本（落地时 issue 上有 `<!-- sandcastle:decided -->` 开头的评论） | 人看 PR 上的「代拍板」评论：同意就去掉标签；不同意在 issue 上回复，另开票改 |
 
@@ -41,7 +43,7 @@ reviewer 的结论有三种：`merge`、`revise`、`pr`（规则在 `.sandcastle
 
 1. reviewer 给出 `<verdict>merge</verdict>`：验收标准都实现且有测试、没有要人判断的问题、没改页面（改了页面留 PR 附截图，见「浏览器验收」）、没动 ADR / 权限 / 敏感字段处理、没改弱已有测试（规则在 `.sandcastle/review-prompt.md`）。
 2. 门槛通过：脚本在沙箱里自己跑 `npm run typecheck` 与完整测试（沙箱里 4 个 worker，约 40 分钟）。
-   - 完整测试失败、且失败的文件不超过 3 个时，先把这几个文件单独重跑一次：重跑通过算通过，PR 的 **Gate** 一节标出「偶发失败」和第一次的失败摘要。脚本还会给每个偶发失败的文件开一张票，标题是 `偶发失败：<文件>`，带 `flaky`、`Sandcastle`、`ready-for-agent` 标签，正文附失败摘要、复现方法和验收标准；下一轮会自动 prep 并修：prep 先查同样的报错是否已被别的提交修掉，修掉了就只核实、不改代码；没修掉要给出修复前变红、修复后变绿的复现（跨沙箱竞争写并发用例），重复单跑总共不超过 20 分钟。已经有同名的 open 票时，就在那张票上追加一次出现记录。票号会评论到 PR 上。重跑仍失败、或失败文件更多，才算门槛失败。
+   - 完整测试失败、且失败的文件不超过 3 个时，先把这几个文件单独重跑一次：重跑通过算通过，PR 的 **Gate** 一节标出「偶发失败」和第一次的失败摘要。脚本还会给每个偶发失败的文件开一张票，标题是 `偶发失败：<文件>`，带 `flaky`、`Sandcastle`、`ready-for-agent` 标签，正文附失败摘要、复现方法和验收标准；下次调度会自动 prep 并修：prep 先查同样的报错是否已被别的提交修掉，修掉了就只核实、不改代码；没修掉要给出修复前变红、修复后变绿的复现（跨沙箱竞争写并发用例），重复单跑总共不超过 20 分钟。已经有同名的 open 票时，就在那张票上追加一次出现记录。票号会评论到 PR 上。重跑仍失败、或失败文件更多，才算门槛失败。
    - 门槛失败时让 implementer 用新会话修一次，再跑一次门槛。
    - 失败摘要只取 vitest 的 Failed Tests / Failed Suites 一节。
 3. GitHub 能 rebase 合并，且本票的 drizzle 迁移接在 `origin/main` 最新的迁移后面（两张票各加一个迁移时没有文本冲突，但迁移链会分叉，所以合并前脚本先查）。
@@ -56,12 +58,13 @@ GitHub CI 不作为门槛。
 
 - 只跑指定的票：`SANDCASTLE_ONLY=328,329 npm run run:sandcastle`（prep 与 plan 都只看名单里的票；拆出来的子票不在名单里，要另外加）。
 - plan 由脚本自己算，不用 agent：在已准备的票里排除 `## Blocked by` 里还有 open 票的，剩下的按编号从小到大选，和已选的票改同一个文件（指引里 `- **Change**: \`path\`` 行的路径，以及 `**Change**` 下缩进子条目开头的路径；一条 Change 都没有时兜底取指引里 New / Reuse / ADRs / Tests 之外的 `path:行号` 引用，并在日志里警告；解析在 `.sandcastle/guide.ts`）就跳过，所以冲突时总是编号小的先做，最多 `MAX_PARALLEL`（2）张。被 blocker 挡住的票不占文件。等人审（`sandcastle:pr-open`）的票也占着它的文件：PR 合入或关闭之前，改同一个文件的票不会开工，免得两个 PR 在同一个文件上冲突；代价是 PR 一直不审，这些票就一直排不上。跳过原因会打在日志里。
-- 有 open blocker 的票不会被 prep（脚本直接跳过，不开 prep 会话，日志打「跳过 prep #n」），也不会被 plan 选中。blocker 留成 PR 时，依赖它的票要等你合并之后的下一次运行。
-- 拆出来的子票会在**下一轮**被看到（每轮开头重新查询 issue）。某一轮 plan 选不出票时，如果这一轮拆出了还没 prep 的子票，就进入下一轮；没有才结束运行。
-- 撞上 Claude 用量限额（`You've hit your … limit · resets 6:20am (UTC)`）不算票失败，不打 `sandcastle:stuck`：脚本从报错里解析重置时间，等到那之后再多等 2 分钟，然后重跑撞上的那一步。prep 原样重跑；实现中的票先把已有提交推到远端，再在原分支上从 implement 重跑，implementer 看到已有提交会直接收尾，review 与门槛从头跑；rebase 补救同样重跑。认不出重置时间就每 30 分钟试一次。进程被中断（Ctrl-C、关机）时，已有提交在本地同名分支上，重跑 `npm run run:sandcastle` 会接着做。
-- 每轮开头 `git fetch origin main`，新分支从 `origin/main` 建。prep 与 plan 不建分支，沙箱挂的是宿主机工作区（本地 HEAD），所以 fetch 后宿主机在 `main` 上时把本地 `main` 快进到 `origin/main`（`git merge --ff-only`），prep 的 Explore 才看得到已合并的代码；不在 `main` 上、本地领先或分叉、或快进会覆盖未提交的改动时只打警告、不动工作区，这时 prep 读到的是旧代码。运行时宿主机留在 `main` 上，不要在本地 `main` 上做未推送的提交。
-- 运行中途可以手动合并或关掉正在做的票：落地前脚本会查 issue，已关闭就跳过（不 push、不开 PR、不打标签），本地分支先留着。每轮开头清一次已关闭票的残留：去掉 `sandcastle:prepped` / `pr-open` / `stuck`（`decided`、`flaky` 不动）；票已关闭、且分支有已合并的 PR 时，删掉 `sandcastle/issue-<n>` 的远端分支、本地 worktree（有未提交改动就留着并警告）和本地分支。没合并就关掉的票，分支留着。连远端的 git（每轮开头和落地时的 fetch、push）撞上 SSH、DNS 或网络错误（`Permission denied (publickey)`、`Could not resolve host` 等）时，等 30 秒到 15 分钟逐步加长，共重试 6 次（约半小时）；被拒（non-fast-forward、lease 过期）不重试。宿主机上的命令都有超时：连远端的 git 5 分钟，其余 10 分钟，超时算网络错误，照样重试。建沙箱或落地时撞上临时错误（复制 `node_modules` 到工作区超时、GitHub API 读超时、连接被重置等）也不直接打 stuck：分别等 1、5、15 分钟后整步重跑，3 次都不行才算失败。build 在原分支上重跑，落地重跑时已合并的票会跳过。某张票落地时出错（重试用完仍连不上、分支被删等）只影响这张：打 `sandcastle:stuck` 并在票上评论报错，本地分支保留，其余的票照常落地，运行继续。
-- 要修改留下的 PR：在 PR 上留意见（普通评论、review 正文、行内意见都行），再发一条**以 `/sandcastle` 开头**的评论或 review（意见可以直接写在它后面），然后运行。每轮开头，脚本看到晚于分支最新提交的 `/sandcastle`，或别人点的 Request changes，就去掉 `sandcastle:pr-open`，把票放回 plan。PR 是用你的 gh 凭据开的，GitHub 不让作者对自己的 PR 点 Request changes，所以要用 `/sandcastle`。implementer 接着同一个分支 `sandcastle/issue-<n>` 做，并先读 PR 评论和行内意见。reviewer 会逐条确认这些意见都处理了，才给 `merge`。手动去掉 `sandcastle:pr-open` 的老办法也还能用。
+- 有 open blocker 的票不会被 prep（脚本直接跳过，不开 prep 会话，日志打「跳过 prep #n」），也不会被 plan 选中。blocker 留成 PR 时，依赖它的票在你合并之后的下一次轮询开工（运行已结束时要重新运行）。
+- 每次调度开头重新查询 issue，拆出来的子票在下次调度被看到。plan 选不出票、但这次拆出了还没 prep 的子票时，马上再调度一次，不算空转。
+- 轮询比原来按轮跑频繁，所以本次运行里 prep 过、却既没打上 prepped 也没拆的票（比如 prep 会话出错），只有 issue 有了变化（评论、正文、标签）才再开 prep 会话。
+- 撞上 Claude 用量限额（`You've hit your … limit · resets 6:20am (UTC)`）不算票失败，不打 `sandcastle:stuck`：脚本从报错里解析重置时间，等到那之后再多等 2 分钟，然后重跑撞上的那一步。prep 不在调度里等（会占着宿主机，做完的票落不了地）：停下这次的 prep，下次调度再试；没有票在做时，主循环等到重置再调度，不算空转。实现中的票先把已有提交推到远端，再在原分支上从 implement 重跑，implementer 看到已有提交会直接收尾，review 与门槛从头跑；rebase 补救同样重跑。认不出重置时间就每 30 分钟试一次。进程被中断（Ctrl-C、关机）时，已有提交在本地同名分支上，重跑 `npm run run:sandcastle` 会接着做。
+- 每次调度开头 `git fetch origin main`，新分支从 `origin/main` 建。prep 与 plan 不建分支，沙箱挂的是宿主机工作区（本地 HEAD），所以 fetch 后宿主机在 `main` 上时把本地 `main` 快进到 `origin/main`（`git merge --ff-only`），prep 的 Explore 才看得到已合并的代码；不在 `main` 上、本地领先或分叉、或快进会覆盖未提交的改动时只打警告、不动工作区，这时 prep 读到的是旧代码。运行时宿主机留在 `main` 上，不要在本地 `main` 上做未推送的提交。
+- 运行中途可以手动合并或关掉正在做的票：落地前脚本会查 issue，已关闭就跳过（不 push、不开 PR、不打标签），本地分支先留着。每次调度开头清一次已关闭票的残留：去掉 `sandcastle:prepped` / `pr-open` / `stuck`（`decided`、`flaky` 不动）；票已关闭、且分支有已合并的 PR 时，删掉 `sandcastle/issue-<n>` 的远端分支、本地 worktree（有未提交改动就留着并警告）和本地分支。没合并就关掉的票，分支留着。连远端的 git（每次调度开头和落地时的 fetch、push）撞上 SSH、DNS 或网络错误（`Permission denied (publickey)`、`Could not resolve host` 等）时，等 30 秒到 15 分钟逐步加长，共重试 6 次（约半小时）；被拒（non-fast-forward、lease 过期）不重试。宿主机上的命令都有超时：连远端的 git 5 分钟，其余 10 分钟，超时算网络错误，照样重试。建沙箱或落地时撞上临时错误（复制 `node_modules` 到工作区超时、GitHub API 读超时、连接被重置等）也不直接打 stuck：分别等 1、5、15 分钟后整步重跑，3 次都不行才算失败。build 在原分支上重跑，落地重跑时已合并的票会跳过。某张票落地时出错（重试用完仍连不上、分支被删等）只影响这张：打 `sandcastle:stuck` 并在票上评论报错，本地分支保留，其余的票照常落地，运行继续。
+- 要修改留下的 PR：在 PR 上留意见（普通评论、review 正文、行内意见都行），再发一条**以 `/sandcastle` 开头**的评论或 review（意见可以直接写在它后面），然后运行（Sandcastle 正在跑就不用重启）。每次调度开头，脚本看到晚于分支最新提交的 `/sandcastle`，或别人点的 Request changes，就去掉 `sandcastle:pr-open`，把票放回 plan。PR 是用你的 gh 凭据开的，GitHub 不让作者对自己的 PR 点 Request changes，所以要用 `/sandcastle`。implementer 接着同一个分支 `sandcastle/issue-<n>` 做，并先读 PR 评论和行内意见。reviewer 会逐条确认这些意见都处理了，才给 `merge`。手动去掉 `sandcastle:pr-open` 的老办法也还能用。
 - 已经有指引、但写于 blocker 合并之前的票，prep 会按 `docs/agents/ticket-sizing.md` 重写指引。
 
 ## 外部 PR：让 Sandcastle 接手别人开的 PR
@@ -99,7 +102,7 @@ Sandcastle 处理期间，PR 作者不要往这个分支推提交。本地和远
 - 密钥不写进 `models.json`：值写成 `"${GLM_API_KEY}"`，在容器里从同名环境变量取。变量要列在 `.sandcastle/.env` 里，sandcastle 只把那里列出的变量带进容器。
 - 档案设了 `ANTHROPIC_BASE_URL` 就算别家：命令前 `env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY`，Claude 的凭据不会发到别家的接口。别家档案没设 `ANTHROPIC_DEFAULT_HAIKU_MODEL`（后台小任务和子 agent 用）或 `limitPattern` 时启动会警告。
 - 上下文预算统一 150k：档案里的 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 警告后忽略。
-- `phases` 给每个阶段一个有序的档案列表，6 个阶段都要写。每轮开头读一次：改了配置下一轮生效，不用重启。第一次就读不成（JSON 坏了、档案名不存在、阶段用到的档案引用的变量不在 `.sandcastle/.env` 里）直接退出；运行中途改坏了就警告并沿用上一份。
+- `phases` 给每个阶段一个有序的档案列表，6 个阶段都要写。每次调度开头读一次：改了配置下次调度生效，不用重启。第一次就读不成（JSON 坏了、档案名不存在、阶段用到的档案引用的变量不在 `.sandcastle/.env` 里）直接退出；运行中途改坏了就警告并沿用上一份。
 - 换档案以一次会话为单位：implement 的每次会话单独挑档案，档案名经环境变量 `SANDCASTLE_PROFILE` 给 implementer，进度评论第一行写明。不用 promptArgs：运行中的旧进程也会读到新提示词，多出的占位符会让它报错。撞上限额（Claude 档案认 `hit your … limit`，别家认 `limitPattern`）就记下这个档案的重置时间，重置前所有票都跳过它，用列表里的下一个；认不出重置时间就跳过 1 小时。重置时间认「resets 6:20am (UTC)」和「2026-11-07 15:30:00」两种，后一种按 `resetTimeZone` 解析。列表里的都在等时，分支推到远端，等最早恢复的那个，不打 stuck。其他报错照常走临时错误重试。
 - 智谱 coding plan 撞限额的错误码是 1308（5 小时额度）和 1310（周 / 月额度），报错是「已达到…的使用上限。您的限额将在 … 重置」；1302 是并发过高，1113 多半是 Key 或 Base URL 配错，都不算限额。
 
@@ -113,7 +116,7 @@ Sandcastle 处理期间，PR 作者不要往这个分支推提交。本地和远
 - 沙箱建好后用 `package.json` 的 `packageManager`（pnpm）按锁文件重装依赖：拷进来的 `node_modules` 是宿主机 darwin 的，缺 linux 原生包。
 - 每张票的库名与前缀加 `_i<n>`（`crm_platform_test_i<n>`、`crm_source_test_i<n>`、MySQL / MongoDB 库、`TEST_S3_LAKE_URI`），源端测试账号也按票加运行后缀（`CRM_TEST_RUN_SUFFIX`，`crm_src_reader_i<n>_w<i>`，见 `scripts/test-resource-names.ts`），并行的沙箱互不清表、不共用集群级账号；`CRM_TEST_WORKERS=4`，`MAX_PARALLEL × 4` 个 worker 的连接数要在 PG `max_connections` 以内（`MAX_PARALLEL=2` 要 300，见 `db_script/docker-compose.yml`）。2026-11-07 试过 3：三个门槛同时跑完整测试，每个都有 8～10 个文件 60 / 90 秒超时，和改动无关，单跑能过；所以降回 2。沙箱里还设 `CRM_TEST_TIMEOUT_SCALE=2`，`vitest.config.ts` 把 testTimeout / hookTimeout 乘成 180 s / 120 s（沙箱负载比本地约慢一倍，#439；这类负载超时出过 #357 / #440 / #459 三张偶发失败票后统一放宽，#461），本地与 CI 仍是 90 s / 60 s。
 - 这些资源在每次关沙箱后（`build`、`rebaseAndMerge` 的收尾）由 `scripts/drop-test-resources.ts _i<n>` 在宿主机上回收：PG 的测试库、验收库及其中租户的 catalog 角色 `lake_<id>`（集群级，删库带不走，没有别的库再依赖时才删），PG / MySQL 的源端测试账号 `crm_src_reader|writer_i<n>_w<i>`（集群级，同样没有依赖才删），MySQL / MongoDB 库（Mongo 连库里的用户与角色），`TEST_S3_LAKE_URI_i<n>*` 下的对象和策略只授权这些前缀的对象存储账号。不等票合并：再跑这张票时 global-setup 与夹具会重新建库。回收失败只打日志、不影响票；留下的用 `pnpm sandcastle:cleanup _i<n>` 补收（pnpm 会把 `--` 原样传给脚本，不要加），没有 Sandcastle 在跑时可用 `--all` 收全部 `_i<数字>`。
-- 门槛里大量用例在 `s3-accounts.ts` 的 IAM 调用上 `TimeoutError`、资源回收也超时时，先看对象存储：`curl -s localhost:9333/dir/status` 的 `Free` 为 0、`container logs seaweedfs` 里有 `No writable volumes and no free volumes left`，就是卷数到了上限。filer 的元数据日志（`/topics/.system/log`，每天一个目录）会一直占新卷，测试越跑越多。本机的 seaweedfs 以 `-volume.max=1000 -master.volumeSizeLimitMB=1024` 启动（2026-11-03 从自动算出的 505 调上来），数据在命名卷 `seaweedfs-data`，重建容器不丢数据。元数据日志由 `scripts/prune-seaweed-metalog.sh [保留天数，默认 2]`（`pnpm sandcastle:prune-metalog`）清理：删早于保留天数的日期目录，再删默认 collection 里已写满且文件全部已删的整卷（立即收回卷位和磁盘）；Sandcastle 每轮开头会自动跑一次。`fs.configure` 给这个路径设 TTL 不生效（filer 写自己的日志不走路径规则）。
+- 门槛里大量用例在 `s3-accounts.ts` 的 IAM 调用上 `TimeoutError`、资源回收也超时时，先看对象存储：`curl -s localhost:9333/dir/status` 的 `Free` 为 0、`container logs seaweedfs` 里有 `No writable volumes and no free volumes left`，就是卷数到了上限。filer 的元数据日志（`/topics/.system/log`，每天一个目录）会一直占新卷，测试越跑越多。本机的 seaweedfs 以 `-volume.max=1000 -master.volumeSizeLimitMB=1024` 启动（2026-11-03 从自动算出的 505 调上来），数据在命名卷 `seaweedfs-data`，重建容器不丢数据。元数据日志由 `scripts/prune-seaweed-metalog.sh [保留天数，默认 2]`（`pnpm sandcastle:prune-metalog`）清理：删早于保留天数的日期目录，再删默认 collection 里已写满且文件全部已删的整卷（立即收回卷位和磁盘）；Sandcastle 每次调度开头会自动跑一次。`fs.configure` 给这个路径设 TTL 不生效（filer 写自己的日志不走路径规则）。
 - `GH_TOKEN` 需要 Issues 读写与 Pull requests 只读；push、开 PR、合并在宿主机上用你自己的 git / gh 凭据完成。宿主机的 `gh` 要 2.99+（`--attach` 上传截图）。
 - 改了 `.sandcastle/Containerfile` 要重建镜像。podman 读 `~/.config/containers/registries.conf`（Podman Desktop 还会把它同步进虚拟机），这个文件不合法时构建会失败。
 
