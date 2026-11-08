@@ -20,6 +20,7 @@ import {
 import { navFor } from '~/.server/nav';
 import { HOT_VALUE_THRESHOLD } from '~/.server/pipeline/identity-engine';
 import { publishReason } from '~/.server/publish-rules';
+import { PublishError } from '~/.server/publishing';
 import { fallbackText } from '~/lib/fallback';
 import { functionList } from '~/lib/mapping-expr';
 import { isEnumField } from '~/lib/mapping-form';
@@ -210,10 +211,11 @@ export async function action({ request, params }: Route.ActionArgs) {
         return data({ error: '未知操作', issues: [], yaml: null, draftId: null, dryRun: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof MappingError) {
+    // 保存、发布、丢弃经 publishing.ts（ADR-0051）：流程错误（双人 403、草稿过期、没有草稿）也是 PublishError；issues 只有映射校验错误（MappingError）带
+    if (e instanceof PublishError) {
       // 没保存时仍带着生成记录，改好再保存照样比对；生成记录本身不符时不再带
       const generationId = e instanceof GenerationMismatchError ? null : field('generationId') || null;
-      return data({ error: e.message, issues: e.issues, yaml: field('yaml') || null, draftId: null, dryRun: null, generationId }, { status: e.status });
+      return data({ error: e.message, issues: e instanceof MappingError ? e.issues : [], yaml: field('yaml') || null, draftId: null, dryRun: null, generationId }, { status: e.status });
     }
     throw e;
   }

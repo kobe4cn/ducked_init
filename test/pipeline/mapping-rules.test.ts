@@ -11,6 +11,7 @@ import {
   createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, rebuildEntity, referenceTables, saveDraft,
 } from '../../app/.server/mappings';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
+import { PublishError } from '../../app/.server/publishing';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { ensureLakeSchemas } from '../../app/.server/pipeline/lake-schemas';
 import { syncSource } from '../../app/.server/source-sync';
@@ -275,7 +276,8 @@ describe('发布映射并合并到标准层', () => {
     await expect(publishMapping(author, mapping.id, 1)).rejects.toMatchObject({ status: 403, message: expect.stringContaining('另一位') });
     // 最后保存草稿的成员不能发布
     await saveDraft(reviewer, mapping.id, CUSTOMERS.replace('city: city', 'city: upper(city)'));
-    await expect(publishMapping(reviewer, mapping.id, 1)).rejects.toBeInstanceOf(MappingError);
+    // 双人 403 由 publishing.ts 抛（PublishError，ADR-0051），不再是 MappingError
+    await expect(publishMapping(reviewer, mapping.id, 1)).rejects.toBeInstanceOf(PublishError);
     const third = await memberOf(acme, 'admin@acme.com', 'admin');
     await publishMapping(third, mapping.id, 1);
     await drain();
@@ -323,8 +325,8 @@ describe('发布映射并合并到标准层', () => {
     });
     // 提交后发布才拿到锁
     const error = await publishing;
-    expect(error).toBeInstanceOf(MappingError);
-    expect((error as MappingError).message).toMatch(/请刷新/);
+    expect(error).toBeInstanceOf(PublishError);
+    expect((error as PublishError).message).toMatch(/请刷新/);
   });
 
   it('已被已发布映射引用的表不能移出同步范围；映射引用的字段在源表里没有时不能保存；扩展字段不能换类型', async () => {
