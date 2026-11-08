@@ -244,7 +244,7 @@ describe('助手对话', () => {
     // POST 返回的卡片：按分析师自己的目录重新校验是 valid，条目带名称与说明、数据截至（实体取最近一次合并时间），窗口取指标的 window.days
     expect(first).toMatchObject({ reply: '可以复用现有结果', toolsUsed: ['catalog_search', 'validate_plan'] });
     expect(first.planCard).toEqual({
-      status: 'valid', mode: 'reuse_result',
+      status: 'valid', mode: 'reuse_result', resultHref: '/analytics/definitions/metric/revenue_30d',
       selected: [
         { id: 'entity:customer', name: customer.name, description: customer.description, asOf: customer.stats.at },
         { id: 'metric:revenue_30d', name: metric.name, description: metric.description, asOf: '暂无快照' },
@@ -266,6 +266,8 @@ describe('助手对话', () => {
     const shared = await (await peer.get(`/assistant?id=${first.conversationId}`)).json();
     const viewerCard: PlanCardView = shared.conversation.messages[1].planCard;
     expect(viewerCard.status).toBe('invalid');
+    // 不是 valid 就不给现有结果的入口（#453）
+    expect(viewerCard.resultHref).toBeUndefined();
     expect(viewerCard.issues.map(i => i.message)).toContain('选中的条目不在可见目录里（无权限、未发布或已停用）');
     expect(viewerCard.selected.find(s => s.id === 'table:CRM/orders')).toEqual({ id: 'table:CRM/orders' });
     expect(viewerCard.selected.find(s => s.id === 'metric:revenue_30d')?.name).toBe(metric.name);
@@ -335,6 +337,39 @@ describe('助手对话', () => {
     expect(tool.content).toContain('未保存：计划已过期');
     expect(tool.content).toContain('依赖变了');
     expect((await getDb().select().from(dslVersions)).length).toBe(before);
+  });
+
+  it('计划卡的 resultHref 只在重新校验通过时给：两次读取之间另一位成员发布了新版本，?id= 读回的卡片不是 valid、没有 resultHref（#453，ADR-0050）', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const client = await loginAs(app, 'analyst@acme.com');
+    const COUNT_MEMBERS = 'base: customer\nmeasure: { agg: count }\n';
+    await createDefinition(author, 'metric', 'member_total', COUNT_MEMBERS);
+    await publishDefinition(reviewer, 'metric', 'member_total', 1);
+    const entry = (await catalogFor(analyst)).entries.find(e => e.id === 'metric:member_total')!;
+    if (entry.kind !== 'metric') throw new Error('member_total 发布后不在目录里');
+    const plan = {
+      schemaVersion: 1, mode: 'reuse_result',
+      selected: [{ id: 'metric:member_total', version: entry.version, semanticHash: semanticHash(entry) }],
+      request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: ['metric:member_total'] }],
+      assumptions: [], questions: [],
+    };
+    const replies = [
+      toolCalls({ name: 'catalog_search', args: { query: '会员总数' } }),
+      toolCalls({ name: 'validate_plan', args: { plan } }),
+      text('可以复用现有结果'),
+    ];
+    fakeLlm(f => app.setLlmFetch(f), n => replies[n - 1]);
+    // POST 返回的卡片按当时目录校验是 valid：链到所选指标（第一个有结果页的条目）的结果页
+    const first = await (await post(client, { message: '统计会员总数', page: PAGE })).json();
+    expect(first.planCard).toMatchObject({ status: 'valid', mode: 'reuse_result', resultHref: '/analytics/definitions/metric/member_total' });
+    // 两次读取之间另一位成员存了第 2 版并发布：卡片读时重新校验不再通过，不给入口
+    await saveDslDraft(author, 'metric', 'member_total', `# 换个说法\n${COUNT_MEMBERS}`);
+    await publishDefinition(reviewer, 'metric', 'member_total', 2);
+    const after = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(after.conversation.messages[1].planCard.status).not.toBe('valid');
+    expect(after.conversation.messages[1].planCard.resultHref).toBeUndefined();
   });
 
   it('本人只读分享给同租户成员：对方在「分享给我的」里能读、不能续写也不能再分享；不能分享给自己或外租户；撤销后 404；分享与撤销记审计', async () => {

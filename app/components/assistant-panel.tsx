@@ -5,7 +5,9 @@
 // 工作台结果解读存下的消息带 query：显示 SQL、行数与列名，链接「在工作台重新执行」把 SQL 填进工作台编辑框（不执行，用的是打开者自己的权限）。
 // 本轮 prefill_workbench 通过校验的答复带 workbenchSql（#437）：正文下有「填入工作台」链接，点开只把 SQL 放进工作台编辑框（?sql= 不重新校验、不执行，由成员自己执行）
 // 带 plan 的答复在读时按读者自己的目录另带 planCard（#452，P4⑯a）：正文下渲染一张计划卡（PlanCard，校验结果、所选条目、依据、
-// 窗口 / 粒度 / 维度 / 人群与数据截至），新发的回答与打开历史对话都显示；卡片只进响应，不进发给模型的历史
+// 窗口 / 粒度 / 维度 / 人群与数据截至），新发的回答与打开历史对话都显示；卡片只进响应，不进发给模型的历史。
+// 计划卡的下一步入口（#453，P4⑯b）：通过的卡按 mode 给结果页链接或续写按钮，按钮替本人发一句固定续写（send(text)，不动
+// 输入框），由助手工具重新校验后再存草稿 / 填工作台；没有 planCard 只有 workbenchSql 的消息照旧给「填入工作台」链接
 import { useEffect, useRef, useState } from 'react';
 import { Link, useFetcher, useLocation } from 'react-router';
 import { AlertTriangle, History, Send, Sparkles, X } from 'lucide-react';
@@ -42,6 +44,8 @@ export function AssistantPanel() {
   const handledResult = useRef<TurnResult | undefined>(undefined);
   const handledLoad = useRef<Overview | undefined>(undefined);
   const handledShare = useRef<ShareResult | undefined>(undefined);
+  /** 最近一次发送是不是计划卡按钮发的固定续写：出错的回填只在用输入框发送时做，续写文字不放回输入框 */
+  const sentFollowUp = useRef(false);
   const scrollEnd = useRef<HTMLDivElement>(null);
 
   // 每次打开都重新取：管理员可能刚在「模型服务」页配置好
@@ -54,10 +58,10 @@ export function AssistantPanel() {
     if (turn.state !== 'idle' || !data || handledResult.current === data) return;
     handledResult.current = data;
     if ('error' in data) {
-      // 没答上的问题放回输入框，免得下次发送时出现两条连续的提问
+      // 没答上的问题放回输入框，免得下次发送时出现两条连续的提问；计划卡按钮发的固定续写不放回
       setError(data.error);
       setMessages(m => m.slice(0, -1));
-      setInput(current => current || messages.at(-1)?.content || '');
+      if (!sentFollowUp.current) setInput(current => current || messages.at(-1)?.content || '');
     } else {
       setConversationId(data.conversationId);
       setMessages(m => [...m, { role: 'assistant', content: data.reply, toolsUsed: data.toolsUsed, ...(data.workbenchSql ? { workbenchSql: data.workbenchSql } : {}), ...(data.planCard ? { planCard: data.planCard } : {}) }]);
@@ -104,11 +108,13 @@ export function AssistantPanel() {
     setShowHistory(false);
   }
 
-  function send() {
-    const question = input.trim();
+  /** 发送：不带参数用输入框（发完清空）；带固定文本（计划卡按钮的续写）直接发这句，不动输入框 */
+  function send(text?: string) {
+    const question = (text ?? input).trim();
     if (!question || busy || !usable || readOnlyOwner) return;
+    sentFollowUp.current = text !== undefined;
     setMessages(m => [...m, { role: 'user', content: question }]);
-    setInput('');
+    if (text === undefined) setInput('');
     setError(null);
     turn.submit(
       { conversationId, message: question, page: { path: pathname, title: document.title } },
@@ -203,8 +209,8 @@ export function AssistantPanel() {
                     ) : (
                       <>
                         <p className="whitespace-pre-wrap">{m.content}</p>
-                        {m.planCard && <PlanCard card={m.planCard} />}
-                        {m.workbenchSql && <Link data-prefill to={`/workbench?sql=${encodeURIComponent(m.workbenchSql)}`} className="text-xs underline">填入工作台</Link>}
+                        {m.planCard && <PlanCard card={m.planCard} workbenchSql={m.workbenchSql} onFollowUp={readOnlyOwner ? undefined : t => send(t)} />}
+                        {!m.planCard && m.workbenchSql && <Link data-prefill to={`/workbench?sql=${encodeURIComponent(m.workbenchSql)}`} className="text-xs underline">填入工作台</Link>}
                       </>
                     )}
                     {m.toolsUsed && m.toolsUsed.length > 0 && (

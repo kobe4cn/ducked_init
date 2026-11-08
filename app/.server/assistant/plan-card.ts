@@ -3,7 +3,9 @@
 // （selected 都当作检索过，拦下来的只有依赖变了与看不到所选条目），列出校验结果、所选条目（名称、说明、数据截至）、依据、
 // 窗口 / 粒度 / 维度 / 人群与模式。读者看不到的条目（expand 返回 null，目录按角色过滤，ADR-0005）只留 id、不带名称与说明，
 // 状态按重新校验的结果给出（不是 valid）、不报错。卡片只进响应：不写库（sealed 里存的是 plan 本身），也不拼进发给模型的
-// content（ADR-0043）。questions / reason 本票原样带上，下一步按钮与追问卡片在兄弟票里用。纯函数：同一份目录与计划每次相同
+// content（ADR-0043）。questions / reason 原样带上；重新校验通过且 mode 是 reuse_result 时给 resultHref——所选条目里第一个
+// 有结果页的条目（模板 / 指标 / 标签，实体与源表没有结果页，路由见 app/routes.ts），找不到就不给（#453）。纯函数：
+// 同一份目录与计划每次相同
 import { expand, type Catalog, type CatalogEntry, type MetricEntry } from '../catalog';
 import { validatePlan, type AnalysisPlan, type PlanMode, type PlanStatus } from '../catalog/plan';
 
@@ -17,6 +19,8 @@ export interface PlanCardView {
   issues: { message: string; next?: string }[];
   questions: string[];
   reason?: string;
+  /** 重新校验通过且 reuse_result 时链到现有结果页；所选条目都没有结果页或没通过时不带 */
+  resultHref?: string;
 }
 
 /** 条目的数据截至：模板取快照时间，实体取最近一次合并时间，源表取采样时间，指标与其他条目或没有快照时写「暂无快照」 */
@@ -35,6 +39,17 @@ export function planCardView(catalog: Catalog, plan: AnalysisPlan): PlanCardView
     .find((e): e is MetricEntry => e?.kind === 'metric' && e.window !== undefined)?.window;
   const windowDays = plan.request.windowDays ?? metricWindow?.days;
   const r = plan.request;
+  // 现有结果的入口：只在重新校验通过且 reuse_result 时给，取所选条目里第一个有结果页的（模板 / 指标 / 标签）；
+  // 实体与源表没有结果页、读者看不到的条目（expand 为 null）都跳过，跳完还没有就不给
+  let resultHref: string | undefined;
+  if (check.status === 'valid' && plan.mode === 'reuse_result') {
+    for (const s of plan.selected) {
+      const e = expand(catalog, s.id);
+      if (e === null) continue;
+      if (e.kind === 'template') { resultHref = `/analytics/templates/${e.template}`; break; }
+      if (e.kind === 'metric' || e.kind === 'tag') { resultHref = `/analytics/definitions/${e.kind}/${e.key}`; break; }
+    }
+  }
   return {
     status: check.status,
     mode: plan.mode,
@@ -53,5 +68,6 @@ export function planCardView(catalog: Catalog, plan: AnalysisPlan): PlanCardView
     issues: check.issues.map(i => ({ message: i.message, ...(i.next ? { next: i.next } : {}) })),
     questions: plan.questions,
     ...(plan.reason ? { reason: plan.reason } : {}),
+    ...(resultHref ? { resultHref } : {}),
   };
 }
