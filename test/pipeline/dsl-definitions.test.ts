@@ -1,7 +1,8 @@
 // test/pipeline/dsl-definitions.test.ts —— 指标与标签定义的流水线接缝：成员新建定义（createDefinition）→ 再次保存改同一份草稿（saveDslDraft）→ getDefinition 读出各版本、
 // 作者与最后保存的人，以及编译出的 SQL；键不合规或重复、YAML 校验不通过、没有起草权限时拒绝且不写入。
 // 样本预览（previewDefinition）在只读挂载的数据湖上按今天运行编译出的 SQL，给出前 50 行与总行数，湖与任务队列不变。
-// 双人发布（publishDefinition）以当天入队 gold.dsl，调度器成功后登记快照；丢弃草稿（discardDslDraft）回到已发布版本或删除定义
+// 双人发布与版本流程在 publishing.ts（见 publishing.test.ts），发布（publishDefinition）以当天入队 gold.dsl（指标连同引用它的已发布标签），
+// 调度器成功后登记快照；丢弃草稿（discardDslDraft）回到已发布版本（{ kept: true }）或删除定义（{ kept: false }），没有草稿 400
 // 标签只引用指标最新的已发布版本，快照每行带不变的 tag_key。删除定义（deleteDefinition）：被已发布标签引用的指标不能删。
 // 发布前的影响预览（impactOf）在只读挂载上对比已发布版本与草稿，只给计数，湖与任务队列不变。
 // filter 写字段路径（ADR-0038）的指标能发布，路径经过的实体进依赖：定时刷新与停用映射的影响都跟着变；
@@ -14,7 +15,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { dslDefinitions, dslVersions, mappings, tasks, templateDefinitions } from '../../app/.server/db/schema';
+import { auditLogs, dslDefinitions, dslVersions, mappings, tasks, templateDefinitions } from '../../app/.server/db/schema';
 import { createDefinition, deleteDefinition, discardDslDraft, DslError, getDefinition, impactOf, previewDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { disableImpact, publishMapping, saveDraft } from '../../app/.server/mappings';
@@ -290,14 +291,11 @@ describe('基础实体经一跳关联消费者（ADR-0038）', () => {
 });
 
 describe('发布与丢弃', () => {
-  it('最后保存草稿的人与分析师不能发布；另一位数据工程师发布后版本锁定，以当天入队 gold.dsl，成功后登记快照；再改是新一版草稿，再发布只新增快照', async () => {
+  it('分析师不能发布；另一位数据工程师发布后以当天入队 gold.dsl，成功后登记快照；再改是新一版草稿，再发布只新增快照（双人规则见 publishing.test.ts）', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
 
-    const error = await publishDefinition(author, 'metric', 'revenue', 1).catch(e => e);
-    expect(error).toBeInstanceOf(DslError);
-    expect(error.message).toMatch(/最后改了这一版草稿/);
     await expect(publishDefinition(analyst, 'metric', 'revenue', 1)).rejects.toMatchObject({ init: { status: 403 } });
 
     const today = new Date().toISOString().slice(0, 10);
@@ -307,7 +305,6 @@ describe('发布与丢弃', () => {
       params: { kind: 'metric', key: 'revenue', definitionId: expect.any(String), definitionVersion: 1, asOf: today, entities: ['order'], sql: expect.stringContaining('silver._identities') },
     });
     expect(await getDefinition(analyst, 'metric', 'revenue')).toMatchObject({ draft: null, published: { version: 1, publishedByEmail: reviewer.email } });
-    await expect(publishDefinition(author, 'metric', 'revenue', 1)).rejects.toThrow(/已锁定/);
 
     await drain();
     expect(await getTask(task.id)).toMatchObject({ status: 'succeeded' });
@@ -343,23 +340,66 @@ describe('发布与丢弃', () => {
     expect(await listSnapshots(acme)).toEqual([]);
   });
 
-  it('丢弃草稿：有已发布版本时回到它，从没发布过时删除整个定义', async () => {
+  it('丢弃草稿：查看者 403；从没发布过返回 { kept: false } 并删除定义；没有草稿 400；有已发布版本返回 { kept: true }，回到它', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     const engineer = await memberOf(acme, 'de@acme.com');
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    await expect(discardDslDraft(viewer, 'metric', 'revenue')).rejects.toMatchObject({ init: { status: 403 } });
     await createDefinition(analyst, 'metric', 'revenue', REVENUE);
-    expect(await discardDslDraft(analyst, 'metric', 'revenue')).toEqual({ published: null });
+    expect(await discardDslDraft(analyst, 'metric', 'revenue')).toEqual({ kept: false });
     await expect(getDefinition(analyst, 'metric', 'revenue')).rejects.toMatchObject({ status: 404 });
-    await expect(discardDslDraft(analyst, 'metric', 'revenue')).rejects.toMatchObject({ status: 404 });
 
     await createDefinition(analyst, 'metric', 'revenue', REVENUE);
     await publishDefinition(engineer, 'metric', 'revenue', 1);
-    await expect(discardDslDraft(analyst, 'metric', 'revenue')).rejects.toMatchObject({ status: 404, message: expect.stringMatching(/没有草稿/) });
+    await expect(discardDslDraft(analyst, 'metric', 'revenue')).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/没有草稿/) });
     await saveDslDraft(analyst, 'metric', 'revenue', REVENUE_BY_CITY);
-    expect(await discardDslDraft(engineer, 'metric', 'revenue')).toEqual({ published: 1 });
+    expect(await discardDslDraft(engineer, 'metric', 'revenue')).toEqual({ kept: true });
     expect(await getDefinition(analyst, 'metric', 'revenue')).toMatchObject({ draft: null, published: { version: 1, yaml: REVENUE } });
-    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
-    await expect(discardDslDraft(viewer, 'metric', 'revenue')).rejects.toMatchObject({ init: { status: 403 } });
+  });
+
+  it('发布指标时引用它的已发布标签一起入队（按新版本不再通过校验的跳过）；definition.published 审计带 tags 与 skippedTags', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const tier = 'metric: revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n';
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await publishDefinition(engineer, 'metric', 'revenue', 1);
+    await createDefinition(analyst, 'tag', 'value_tier', tier);
+    await publishDefinition(engineer, 'tag', 'value_tier', 1);
+
+    // 两次采样之间新增的任务（按键排序：revenue 在前、value_tier 在后）
+    const addedSince = async (before: Set<string>) => (await getDb().select({
+      id: tasks.id, key: sql<string>`${tasks.params}->>'key'`, definitionVersion: sql<number>`(${tasks.params}->>'definitionVersion')::int`,
+    }).from(tasks)).filter(t => !before.has(t.id)).sort((a, b) => a.key.localeCompare(b.key));
+    const ids = async () => new Set((await getDb().select({ id: tasks.id }).from(tasks)).map(t => t.id));
+    const publishAudits = async () => (await getDb().select({ detail: auditLogs.detail }).from(auditLogs)
+      .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'definition.published')))).map(l => l.detail);
+
+    // 第二版改了聚合方式：标签照样引用得了，发布指标时它跟着一起入队
+    await saveDslDraft(analyst, 'metric', 'revenue', REVENUE.replace('sum', 'count'));
+    const before = await ids();
+    const task = await publishDefinition(engineer, 'metric', 'revenue', 2);
+    expect(task.params).toMatchObject({ kind: 'metric', key: 'revenue', definitionVersion: 2 });
+    expect(await addedSince(before)).toEqual([
+      { id: task.id, key: 'revenue', definitionVersion: 2 },
+      { id: expect.any(String), key: 'value_tier', definitionVersion: 1 },
+    ]);
+    expect(await publishAudits()).toContainEqual({
+      kind: 'metric', key: 'revenue', version: 2, authors: ['analyst@acme.com'], lastEditor: 'analyst@acme.com',
+      tags: ['value_tier'], skippedTags: [],
+    });
+
+    // 第三版加了维度：标签引用不了带维度的指标，不入队、记进 skippedTags
+    const beforeSkip = await ids();
+    await saveDslDraft(analyst, 'metric', 'revenue', REVENUE_BY_CITY);
+    const skipped = await publishDefinition(engineer, 'metric', 'revenue', 3);
+    expect(skipped.params).toMatchObject({ kind: 'metric', key: 'revenue', definitionVersion: 3 });
+    expect(await addedSince(beforeSkip)).toEqual([{ id: skipped.id, key: 'revenue', definitionVersion: 3 }]);
+    expect(await publishAudits()).toContainEqual({
+      kind: 'metric', key: 'revenue', version: 3, authors: ['analyst@acme.com'], lastEditor: 'analyst@acme.com',
+      tags: [], skippedTags: ['value_tier'],
+    });
   });
 });
 

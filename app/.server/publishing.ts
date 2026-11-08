@@ -14,7 +14,7 @@ import { members, ROLES, tenants } from './db/schema';
 
 /** 发布流程本身的错误（ADR-0051 一律 400，双人规则在草稿状态下拦下时报 403）；可发布项自己的错误类继承它，保留各自的 status 与文案 */
 export class PublishError extends Error {
-  constructor(message: string, readonly status: 400 | 403 | 404 = 400) { super(message); }
+  constructor(message: string, readonly status: 400 | 403 | 404 | 422 = 400) { super(message); }
 }
 
 // —— 双人发布规则（ADR-0015），原在 publish-rules.ts，由本模块导出；调用方改从那里导入是 #500 ——
@@ -81,7 +81,7 @@ export interface PublishableAdapter<Ctx, Input, Inside = undefined, After = null
   versions: PgTable;
   versionsFk: AnyPgColumn;
 
-  /** 保存 / 发布 / 丢弃要不要先锁租户行（按租户串行，入队合并也锁它）：映射与合并组要，其余不要 */
+  /** 保存 / 发布 / 丢弃要不要先锁租户行（按租户串行，入队合并也锁它）：映射、合并组与指标 / 标签要，其余不要 */
   lockTenant: boolean;
 
   /** 锁住父行并返回父行 ID，与保存、发布、丢弃互斥；不存在时抛可发布项自己的 404 */
@@ -109,10 +109,11 @@ export interface PublishableAdapter<Ctx, Input, Inside = undefined, After = null
   /** 丢弃后动作（回到的已发布版本还在时 kept 为真）；连带丢弃别的东西（如自定义实体的孤儿映射）要记审计，所以给 actor */
   afterDiscard?(tx: Tx, actor: CurrentMember, ctx: Ctx, kept: boolean): Promise<void>;
 
-  /** 审计：三个动作名与目标类型；detail 带上这一步看到的字段（版本号、作者这些），上下文里的公共字段（如所属数据源与名称）由它补 */
+  /** 审计：三个动作名与目标类型；detail 带上这一步看到的字段（版本号、作者这些；published 还收到 checkInside 的结果，如下游标签），
+   * 上下文里的公共字段（如所属数据源与名称）由它补 */
   audit: {
     drafted: { action: AuditAction; detail(ctx: Ctx, columns: Record<string, unknown>, version: number): Record<string, unknown> };
-    published: { action: AuditAction; detail(ctx: Ctx, draft: DraftRow): Record<string, unknown> };
+    published: { action: AuditAction; detail(ctx: Ctx, draft: DraftRow, inside: Inside): Record<string, unknown> };
     discarded: { action: AuditAction; detail(ctx: Ctx, version: number, published: number | null): Record<string, unknown> };
     targetType: string;
   };
@@ -212,7 +213,7 @@ export async function publish<Ctx, Input, Inside, After>(
       action: adapter.audit.published.action,
       targetType: adapter.audit.targetType,
       targetId: ctx.parentId,
-      detail: adapter.audit.published.detail(ctx, draft),
+      detail: adapter.audit.published.detail(ctx, draft, inside),
     });
     return task;
   });
