@@ -41,6 +41,7 @@ import {
   AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, usageTable,
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
+import { changedFiles, section } from "./guide.ts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -346,12 +347,6 @@ const notIn = (...labels: string[]) => labels.map((l) => `-${q(l)}`).join(" ");
 // Plan：确定性计算，不交给 agent（planner agent 曾把「同文件只留编号小的」比反）
 // ---------------------------------------------------------------------------
 
-/** 正文里 `## <title>` 一节的内容（到下一个 `## ` 为止），没有这一节时为空串。 */
-const section = (body: string, title: string) => {
-  const m = body.match(new RegExp(`^##\\s*${title}[^\\n]*\\n([\\s\\S]*?)(?=^##\\s|(?![\\s\\S]))`, "mi"));
-  return m?.[1] ?? "";
-};
-
 /** `## Blocked by` 里引用的票号。 */
 const blockersOf = (body: string) =>
   [...new Set([...section(body, "Blocked by").matchAll(/#(\d+)/g)].map((m) => Number(m[1])))];
@@ -468,11 +463,6 @@ async function cleanupClosedIssues() {
   }
 }
 
-/** 指引里 `- **Change**: \`path…\`` 行的文件路径（去掉 `:行号`）。 */
-const changedFiles = (body: string) =>
-  [...section(body, "Implementation guide").matchAll(/^\s*[-*]\s*\*\*Change\*\*\s*[:：]\s*`([^`]+)`/gm)]
-    .map((m) => m[1]!.trim().split(/[:\s]/)[0]!);
-
 /**
  * 能在 main 上开工、且可以并行的票，按编号从小到大，最多 MAX_PARALLEL 张。
  * blocker 没关（包括已开 PR 未合并）的跳过；和已选的票、或等人审（pr-open）的票改同一个文件的跳过，
@@ -487,7 +477,7 @@ function plan(): Issue[] {
   const awaitingReview = new Set<number>();
   for (const w of waiting.sort((a, b) => a.number - b.number)) {
     awaitingReview.add(w.number);
-    for (const f of changedFiles(w.body)) if (!taken.has(f)) taken.set(f, w.number);
+    for (const f of changedFiles(w.body).files) if (!taken.has(f)) taken.set(f, w.number);
   }
   const picked: Issue[] = [];
   for (const issue of candidates.filter((c) => allowed(c.number)).sort((a, b) => a.number - b.number)) {
@@ -496,8 +486,9 @@ function plan(): Issue[] {
       console.log(`  跳过 #${issue.number}：blocker ${open.map((n) => `#${n}`).join("、")} 还没关`);
       continue;
     }
-    const files = changedFiles(issue.body);
-    if (files.length === 0) console.warn(`  ⚠ #${issue.number} 的指引里没认出 Change 行，按不改已有文件处理`);
+    const { files, fallback } = changedFiles(issue.body);
+    if (fallback) console.warn(`  ⚠ #${issue.number} 的指引里没认出 Change 行，按指引引用的文件处理：${files.join("、")}`);
+    else if (files.length === 0) console.warn(`  ⚠ #${issue.number} 的指引里没认出要改的文件，按不改已有文件处理`);
     const clash = files.find((f) => taken.has(f));
     if (clash) {
       const owner = taken.get(clash)!;

@@ -24,7 +24,7 @@ Every `ready-for-agent` ticket ends with this section. It holds conclusions only
 ```markdown
 ## Implementation guide
 
-- **Change**: `path/file.ts:123-180` `functionName`: what to change. One line per file. Give the line range of each function to change, so the implementer reads only that range of a long file.
+- **Change**: `path/file.ts:123-180` `functionName`: what to change. One line per file. Give the line range of each function to change, so the implementer reads only that range of a long file. Every existing file the ticket changes must appear on a `Change` line, path first in backticks: Sandcastle reads these lines to keep two parallel tickets off the same file. For many one-line edits, write `- **Change** (note):` and list the files as indented sub-bullets, one `` `path:line` `` each.
 - **New**: `path/new-module.ts`: what it exports.
 - **Reuse**: `fnName(arg: Type): Ret` in `path:line`; the table `x` with columns `a, b`.
 - **ADRs**: 0006, 0015 (only the relevant ones).
