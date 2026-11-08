@@ -7,10 +7,10 @@ import { TASK_STATUSES, tasks, tenantLakes, tenants, type TaskStatus } from './d
 import { lakeSpecOf } from './lake';
 import { tenantPiiSalt, tenantServingKey } from './secrets';
 import { loadSourceSpec, SourceError } from './source-config';
-import { HANDLERS, isTaskKind, type TaskKind } from './pipeline/handlers';
+import { CONTRACTS, isTaskKind, type TaskContract, type TaskKind } from './pipeline/task-contracts';
 import type { WorkerInput, WorkerOutcome } from './pipeline/worker';
 
-export type { TaskKind } from './pipeline/handlers';
+export type { TaskKind } from './pipeline/task-contracts';
 
 export const TASK_STATUS_LABELS = { queued: '排队中', running: '运行中', succeeded: '成功', failed: '失败' } as const;
 export const TASK_PAGE_SIZE = 200;
@@ -48,7 +48,7 @@ export async function listTasks(tenantId: string) {
     .where(eq(tasks.tenantId, tenantId))
     .orderBy(desc(tasks.createdAt), desc(tasks.id))
     .limit(TASK_PAGE_SIZE);
-  return rows.map(t => ({ ...t, kindLabel: HANDLERS[t.kind as TaskKind]?.label ?? t.kind }));
+  return rows.map(t => ({ ...t, kindLabel: isTaskKind(t.kind) ? CONTRACTS[t.kind].label : t.kind }));
 }
 
 /** 本租户各状态的任务数（不限于最近 TASK_PAGE_SIZE 个），没有任务的状态为 0 */
@@ -74,21 +74,28 @@ export async function lockClaims(tx: Tx) {
 }
 
 /**
- * 领取下一个任务并标为运行中；参数带 sourceId 的任务同时解密该数据源的凭据交给工作进程，合并到标准层的任务同时派生
- * 租户的敏感信息盐，生成服务库的任务同时派生服务库密钥（都不写进任务记录）。数据源已不存在或凭据、盐、密钥无法取得时，该任务直接记为失败，接着领取下一个。
+ * 领取下一个任务并标为运行中，按契约声明的 needs 准备凭据（都不写进任务记录）：声明源连接的任务解密该数据源的凭据
+ * 交给工作进程，声明盐的任务派生租户的敏感信息盐，声明密钥的任务派生服务库密钥。数据源已不存在或凭据、盐、密钥无法取得时，
+ * 该任务直接记为失败，接着领取下一个。
  */
 export async function claimNextTask(): Promise<ClaimedTask | null> {
   for (;;) {
     const task = await claimQueuedTask();
     if (!task) return null;
+    // 队列里可能有旧数据的未知 kind：没有契约就不准备任何凭据（经接口类型读 needs，字面量联合上直接取可选项编译不过）
+    const contract: TaskContract<unknown, unknown> | undefined = isTaskKind(task.kind) ? CONTRACTS[task.kind] : undefined;
+    const needs = contract?.needs;
     let reading = '数据源的凭据';
     try {
-      const { sourceId } = task.params;
-      if (typeof sourceId === 'string') task.source = await loadSourceSpec(task.tenantId, sourceId);
+      if (needs?.source) {
+        const { sourceId } = task.params;
+        if (typeof sourceId !== 'string') throw new SourceError('任务参数缺少 sourceId');
+        task.source = await loadSourceSpec(task.tenantId, sourceId);
+      }
       reading = '敏感信息盐';
-      if (task.kind === 'silver.merge') task.piiSalt = await tenantPiiSalt(task.tenantId);
+      if (needs?.piiSalt) task.piiSalt = await tenantPiiSalt(task.tenantId);
       reading = '服务库密钥';
-      if (task.kind === 'serving.build') task.servingKey = await tenantServingKey(task.tenantId);
+      if (needs?.servingKey) task.servingKey = await tenantServingKey(task.tenantId);
       return task;
     } catch (e) {
       const error = e instanceof SourceError ? e.message : `无法读取${reading}：${(e as Error).message}`;

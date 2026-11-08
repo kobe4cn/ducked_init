@@ -9,13 +9,13 @@ import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { getMailer } from './mailer';
 import { openTenantLake } from './pipeline/lake-engine';
 import { describeAssertion, failedErrors, type AssertionLevel, type AssertionResult } from './pipeline/assertions';
-import { HANDLERS, type TaskKind } from './pipeline/handlers';
+import { CONTRACTS, type TaskKind } from './pipeline/task-contracts';
 
 /** 任务结果里有失败的 error 级断言时告警；没有时什么也不做。单个管理员发信失败只记日志，不影响其他人 */
 export async function alertAssertionFailure(tenantId: string, task: { id: string; kind: TaskKind }, result: Record<string, unknown> | undefined) {
   const failed = failedErrors((result?.assertions as AssertionResult[] | undefined) ?? []);
   if (!failed.length) return;
-  const { label } = HANDLERS[task.kind];
+  const { label } = CONTRACTS[task.kind];
   const summaries = failed.map(describeAssertion);
   await recordAudit(getDb(), {
     tenantId, system: true, action: 'assertion.failed', targetType: 'task', targetId: task.id,
