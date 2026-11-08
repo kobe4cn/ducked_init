@@ -25,7 +25,7 @@ export { EXPORT_DIR, EXPORT_FORMATS, isTaskKind } from './task-contracts';
 export type { ExportCondition, ExportFormat, TaskKind } from './task-contracts';
 
 /**
- * 任务的运行环境：任务 ID，配额，任务涉及数据源时（参数带 sourceId）派发时解密好的连接参数，合并到标准层时租户的敏感信息盐，
+ * 任务的运行环境：任务 ID，配额，契约声明 needs.source 时派发时解密好的连接参数，合并到标准层时租户的敏感信息盐，
  * 本租户数据湖的会话（attachSource 的任务里数据源也挂在其中），以及抹掉错误信息中凭据的函数
  */
 export interface TaskContext { taskId: string; limits: EngineLimits; source?: SourceSpec; piiSalt?: string; session: TenantLakeSession; redact(message: string): string }
@@ -271,7 +271,7 @@ export const HANDLERS = {
     },
   },
   // 删除原始层（ADR-0044）：删掉已删除数据源在湖里的 <schema>、<schema>_keys、<schema>_mirror 下的全部表（不在的跳过，重复执行不报错），
-  // 再删掉这三个 schema，并与 gold.expire 一样擦除湖里的数据。参数不叫 sourceId：派发时会去解密已清空的凭据
+  // 再删掉这三个 schema，并与 gold.expire 一样擦除湖里的数据。没有声明 needs.source，领取时不读凭据（数据源已删）
   'source.drop': {
     label: CONTRACTS['source.drop'].label,
     async run(con, raw) {

@@ -1,6 +1,6 @@
 // 任务契约：参数 schema 接受的参数、拒绝的参数与报错文案（纯函数，不碰平台库与数据湖）
 import { describe, expect, it } from 'vitest';
-import { CONTRACTS, isTaskKind, type TaskKind } from '../app/.server/pipeline/task-contracts';
+import { CONTRACTS, isTaskKind, type TaskContract, type TaskKind, type TaskNeeds } from '../app/.server/pipeline/task-contracts';
 
 /** 一个已发布映射的最小参数（深层形状发布时已校验过，契约只核对形状） */
 const mapping = { mapping: 'm1', version: 1, sourceId: 's1', entity: 'customer', table: 'crm.customers', columns: [{ name: 'id' }], entityColumns: [{ name: 'id' }], key: ['id'], latest: null };
@@ -119,6 +119,15 @@ describe('任务契约', () => {
     for (const kind of Object.keys(CONTRACTS)) expect(isTaskKind(kind)).toBe(true);
     expect(isTaskKind('demo.seeds')).toBe(false);
     expect(isTaskKind('constructor')).toBe(false);
+  });
+
+  it('契约声明领取时要准备的凭据（needs）：源连接只有四个源任务，盐只有合并，密钥只有服务库', () => {
+    const needsOf = (contract: TaskContract<unknown, unknown>) => contract.needs;
+    const kindsWith = (need: keyof TaskNeeds) =>
+      Object.entries(CONTRACTS).filter(([, contract]) => needsOf(contract)?.[need] === true).map(([kind]) => kind);
+    expect(kindsWith('source')).toEqual(['source.profile', 'source.sync', 'source.keycheck', 'source.verify']);
+    expect(kindsWith('piiSalt')).toEqual(['silver.merge']);
+    expect(kindsWith('servingKey')).toEqual(['serving.build']);
   });
 
   it.each(accepted)('接受 %s 的参数 %j', (kind, raw) => {

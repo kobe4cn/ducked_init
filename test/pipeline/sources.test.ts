@@ -10,7 +10,7 @@ import { loadSourceSpec } from '../../app/.server/source-config';
 import { confirmWatermark, getSource, registerSource, SourceError, testSource } from '../../app/.server/sources';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { syncSource } from '../../app/.server/source-sync';
-import { claimNextTask, finishTask } from '../../app/.server/tasks';
+import { claimNextTask, enqueueTask, finishTask } from '../../app/.server/tasks';
 import { storeUpload } from '../../app/.server/uploads';
 import { resetDb } from '../http/harness';
 import { dbNameOf } from '../setup-env';
@@ -241,6 +241,42 @@ describe('任务运行时的数据源连接', () => {
     expect(profile.status).toBe('failed');
     expect(profile.error).toContain('shop.regions');
     expect(profile.error).not.toContain(READER.password);
+  });
+
+  it('领取时照契约声明的 needs 准备：没声明源连接的不管参数里的 sourceId，盐只给合并任务，别的任务什么都不拿', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+
+    // 参数里带 sourceId 但契约没有声明源连接（source.drop，数据源已删）：领取时不读凭据，任务照常派发
+    const { id: dropId } = await enqueueTask(acme, 'source.drop', { schema: `bronze_${'0'.repeat(32)}`, sourceId: randomUUID() });
+    const drop = (await claimNextTask())!;
+    expect(drop.id).toBe(dropId);
+    expect(drop.source).toBeUndefined();
+    await finishTask(dropId, { result: {} });
+
+    // 声明了源连接的采集任务照常解密凭据
+    const { id: sourceId } = await registerSource(engineer, await pgSourceInput(READER));
+    await selectAllTables(engineer, sourceId);
+    const profile = (await claimNextTask())!;
+    expect(profile.kind).toBe('source.profile');
+    expect(profile.source).toMatchObject({ kind: 'postgres', user: READER.user, password: READER.password });
+    await finishTask(profile.id, { result: {} });
+
+    // 合并任务领取时拿到租户的敏感信息盐（64 位十六进制）
+    const { id: mergeId } = await enqueueTask(acme, 'silver.merge', {});
+    const merge = (await claimNextTask())!;
+    expect(merge.id).toBe(mergeId);
+    expect(merge.piiSalt).toMatch(/^[0-9a-f]{64}$/);
+    await finishTask(mergeId, { result: {} });
+
+    // 没声明的任务（盘点数据湖）领取时源连接、盐、密钥都不准备
+    const { id: inventoryId } = await enqueueTask(acme, 'lake.inventory', {});
+    const inventory = (await claimNextTask())!;
+    expect(inventory.id).toBe(inventoryId);
+    expect(inventory.source).toBeUndefined();
+    expect(inventory.piiSalt).toBeUndefined();
+    expect(inventory.servingKey).toBeUndefined();
+    await finishTask(inventoryId, { result: {} });
   });
 });
 

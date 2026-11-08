@@ -6,7 +6,7 @@
 |---|---|
 | `pipeline/pipeline.test.ts` | 开通租户 → 入队任务 → 独立工作进程 → 任务结果；租户隔离 |
 | `pipeline/scheduling.test.ts` | 队列的领取顺序与名额（不启动工作进程） |
-| `pipeline/sources.test.ts` | 登记数据源、只读探测、凭据加密、采集与水位线候选；MySQL / MongoDB / 对象存储文件源；文件上传数据源（上传的 CSV 不算水位线候选、全量比对，同步后 `bronze_<id>` 有这些行）；并发建源端账号不报错 |
+| `pipeline/sources.test.ts` | 登记数据源、只读探测、凭据加密、采集与水位线候选；领取时按契约 needs 准备凭据与盐（没声明源连接的不管参数里的 sourceId）；MySQL / MongoDB / 对象存储文件源；文件上传数据源（上传的 CSV 不算水位线候选、全量比对，同步后 `bronze_<id>` 有这些行）；并发建源端账号不报错 |
 | `pipeline/scope.test.ts` | 同步范围：逐张选表、只采集与同步范围内的表 |
 | `pipeline/sync.test.ts` | 水位线增量与全量比对、变更批次、同步历史、源表结构记在 `_schemas` 并与上一次比对（第一次只存不报，新增 / 删除 / 改类型，原始层保留的旧列不再报删除） |
 | `pipeline/verify.test.ts` | 湖中数据核对（覆盖、位置、文件、结构、数据量） |
@@ -135,7 +135,7 @@
 | `lineage-search.test.ts` | 数据地图反向查 `searchImpact`：列名匹配所有源表、`表.列` 匹配所有同名源表（两张 `orders` 都命中），不区分大小写、忽略首尾空白；命中的节点 / 连线 id 与 `flowGraph`（含折叠时从分组出发的边）、`focusGraph` 一致，字段行用 `fieldKey`；没有命中时集合为空，空输入为 null；源表抽屉 `tableImpact` 按源列排序列出影响的字段、映射版本与表达式，非源表节点或未用到的表为 null（纯函数） |
 | `lake-inspect.test.ts` | 漂移检查的应有结构 `expectedTables`：按实体汇总各映射的列（并集），敏感字段一律 `VARCHAR`，带系统列 `_mapping`、`_source`、`_version`、`_merged_at` 与跨源引用的数据源列（`_customer_source`、`_<字段>_source`）；`normalizeType` 去空白、转大写、`TIMESTAMP WITH TIME ZONE` 写成 `TIMESTAMPTZ`（纯函数） |
 | `key-check.test.ts` | 主键冲突体检的入队参数 `keyCheckEntities`：按实体汇总映射与列，`customer` 与主键未知的实体不放进去，主键含指向 `customer` 的字段（内置 `ref` 或登记上的关系）时 `bySource`；有 `group` 的合并参数带上组 ID；建议 `suggestionOf` 的判定顺序（纯函数） |
-| `task-contracts.test.ts` | 任务契约（`task-contracts.ts`，ADR-0052）：契约表登记全部任务（非模板与模板占位），`isTaskKind` 只认表里的 kind；每类任务接受的参数（含入队时实际带的形状与多余字段）与拒绝的参数按原先的手写校验一字不差地报一句话；解析出的形状（业务主键单个字段转成数组、缺省项补上默认值、`.loose()` 原样保留调用方带上 engine 还要用的字段）；`identityExclude` 拒绝非 64 位十六进制的取值时错误信息里不带明文（纯函数） |
+| `task-contracts.test.ts` | 任务契约（`task-contracts.ts`，ADR-0052）：契约表登记全部任务（非模板与模板占位），`isTaskKind` 只认表里的 kind；needs 声明的领取时凭据（源连接只有四个源任务、盐只有合并、密钥只有服务库）；每类任务接受的参数（含入队时实际带的形状与多余字段）与拒绝的参数按原先的手写校验一字不差地报一句话；解析出的形状（业务主键单个字段转成数组、缺省项补上默认值、`.loose()` 原样保留调用方带上 engine 还要用的字段）；`identityExclude` 拒绝非 64 位十六进制的取值时错误信息里不带明文（纯函数） |
 | `sandcastle-guide.test.ts` | Sandcastle 选票时从指引认出要改的已有文件 `changedFiles`（`.sandcastle/guide.ts`）：一行一个 `**Change**`（去掉行号、括号说明与全角冒号也认）、`**Change**` 下缩进子条目各算一个文件，New / Reuse 不算；一条 Change 都没有时兜底取 `path:行号` 引用并标记 `fallback`（纯函数） |
 | `relation-suggest.test.ts` | 关系推荐规则（纯函数 `suggestRelations`）：起点字段名等于终点主键或「去掉 `custom_` 的实体名_主键」时推荐，标准实体的 `x_` 字段去掉前缀再比；本实体的字段不指向本实体、标准字段只指向本实体；类型不一致、两端敏感性不一致、已有关系不推荐；取值核对全部找到标已核对、有找不到的丢弃、没核对的标未核对 |
 | `cohort-template.test.ts` | 同期群模板：参数校验与默认值、定义不含 `asOf`、注册表与通用表单项、同样参数编译出同样 SQL；在内存 DuckDB 里多源订单合到同一消费者、首单取全部历史、只收最近 `periods` 个周期的首单、按月与按周（周一起）的周期偏移在周期起点上算、去重升序（纯函数） |

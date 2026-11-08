@@ -1,4 +1,4 @@
-// app/.server/pipeline/task-contracts.ts —— 任务契约（ADR-0052）：每个任务的 kind、label、参数 schema、结果类型与挂载标志。
+// app/.server/pipeline/task-contracts.ts —— 任务契约（ADR-0052）：每个任务的 kind、label、参数 schema、结果类型、挂载标志与领取时要准备的凭据（needs）。
 // 工作进程的 HANDLERS 按契约实现 run；入队侧的参数校验也按契约来（下一张子票）。参数校验发生在工作进程的 run 里，
 // 不合法时报一句话。本文件不连平台库、不建 DuckDB：只运行时依赖 zod 与纯模块（templates、sources），
 // engine 一律 import type（ADR-0008），所以入队侧也能安全地引它
@@ -20,7 +20,9 @@ z.config(z.locales.zhCN());
 
 /**
  * attachSource：数据源与数据湖挂同一个 DuckDB 里（在两者之间搬数据或对照的任务）；
- * readOnlyLake：数据湖只读挂载（只出报告、不写湖的任务）；servingFile：另挂一个本机库 serving（生成服务库，ADR-0033）
+ * readOnlyLake：数据湖只读挂载（只出报告、不写湖的任务）；servingFile：另挂一个本机库 serving（生成服务库，ADR-0033）。
+ * needs 是领取时（tasks.ts 的 claimNextTask）要准备什么：源连接、piiSalt、servingKey。契约只声明，自己去读平台库的
+ * 是 tasks.ts（ADR-0008），工作进程与入队侧 import 本文件不会带进平台模块
  */
 export interface TaskContract<P, R> {
   /** 任务页显示的名称 */
@@ -31,7 +33,12 @@ export interface TaskContract<P, R> {
   attachSource?: boolean;
   readOnlyLake?: boolean;
   servingFile?: boolean;
+  /** 领取任务时要由 tasks.ts 准备的凭据：源连接（照参数 sourceId 解密）、敏感信息盐、服务库密钥 */
+  needs?: TaskNeeds;
 }
+
+/** 契约声明的领取时凭据：字段为 true 才准备，没声明的什么都不读 */
+export interface TaskNeeds { source?: true; piiSalt?: true; servingKey?: true }
 
 /** ResultType 的载体，见 TaskContract.result */
 export interface ResultType<R> { readonly __result?: R }
@@ -215,7 +222,8 @@ export const CONTRACTS = {
   // 数据源只读挂载在另一个 DuckDB 里，不碰本租户的数据湖。repairFor 是告警后重新采集的来源（调度器读）
   'source.profile': {
     label: '采集数据源',
-    params: params<{ tables: string[] }>(z.looseObject({ tables: strings('参数 tables 必须是非空的表名列表') })),
+    needs: { source: true },
+    params: params<{ sourceId: string; tables: string[] }>(z.looseObject({ tables: strings('参数 tables 必须是非空的表名列表') })),
     result: resultType<Awaited<ReturnType<typeof profileSource>>>(),
   },
   // 同步：每张表一个变更批次追加到原始层。有水位线的表增量读取，到了比对周期再比对一次主键全集（没有主键时整行全量比对）；
@@ -223,6 +231,7 @@ export const CONTRACTS = {
   // 有表失败时任务记为失败，结果里保留各表的批次与错误；源端已经没有的表跳过，不算失败
   'source.sync': {
     label: '同步数据源',
+    needs: { source: true },
     attachSource: true,
     params: params<{ sourceId: string; tables: import('./sync-engine').SyncTableParam[]; reconcile?: unknown }>(z.looseObject({
       sourceId: z.string(error('缺少参数 sourceId')),
@@ -236,6 +245,7 @@ export const CONTRACTS = {
   // 有空值或重复时任务仍记为成功，ok 为假；通过时调度器写回声明（source-key-check.ts）。主键列像敏感信息时重复键不带取值（ADR-0005）
   'source.keycheck': {
     label: '校验业务主键',
+    needs: { source: true },
     attachSource: true,
     readOnlyLake: true,
     params: params<import('../source-key-check').KeyCheckTaskParams>(z.looseObject({
@@ -250,6 +260,7 @@ export const CONTRACTS = {
   // 数据湖只读挂载，只出报告不写湖；differences 是已进湖、四项有不一致的表数
   'source.verify': {
     label: '核对湖中数据',
+    needs: { source: true },
     attachSource: true,
     readOnlyLake: true,
     params: params<{ sourceId: string; tables: import('./verify-engine').VerifyTableParam[] }>(z.looseObject({
@@ -283,6 +294,7 @@ export const CONTRACTS = {
   // 有映射或打通失败时任务记为失败，结果里保留各映射的合并结果、打通摘要与错误；参数带 drop 时先撤下这些停用的映射（ADR-0031）
   'silver.merge': {
     label: '合并到标准层',
+    needs: { piiSalt: true },
     params: params<MergeParams>(z.looseObject({
       drop: z.array(stringFields(['mapping', 'entity'], '参数 drop 必须是 { mapping, entity } 列表'), error('参数 drop 必须是 { mapping, entity } 列表')).default([]),
       mappings: z.array(mergeMapping, error(MAPPINGS)),
@@ -321,7 +333,7 @@ export const CONTRACTS = {
     result: resultType<{ tables: string[] }>(),
   },
   // 删除原始层（ADR-0044）：删掉已删除数据源在湖里的 <schema>、<schema>_keys、<schema>_mirror 下的全部表，再删掉这三个 schema，
-  // 并与 gold.expire 一样擦除湖里的数据。参数不叫 sourceId：派发时会去解密已清空的凭据
+  // 并与 gold.expire 一样擦除湖里的数据。没有声明 needs.source，领取时不读凭据（数据源已删）
   'source.drop': {
     label: '删除原始层',
     params: params<{ schema: string }>(z.object({
@@ -343,6 +355,7 @@ export const CONTRACTS = {
   // target 是否本租户这一版的位置要和 session.lake.dataPath 比对，留在 run 里
   'serving.build': {
     label: '生成服务库',
+    needs: { servingKey: true },
     readOnlyLake: true,
     servingFile: true,
     params: params<ServingParams>(z.looseObject({
@@ -382,6 +395,15 @@ export const isTaskKind = (kind: string): kind is TaskKind => Object.hasOwn(CONT
 
 /** 一个任务的参数类型：契约 schema 解析出的 */
 export type ParamsOf<K extends TaskKind> = (typeof CONTRACTS)[K]['params'] extends { parse(raw: unknown): infer P } ? P : never;
+
+/** 声明了 needs.source 的任务 kind：领取时照参数 sourceId 解密源连接 */
+type SourceNeedKinds = { [K in TaskKind]: (typeof CONTRACTS)[K] extends { needs: { source: true } } ? K : never }[TaskKind];
+
+// 编译期断言（只在这里核对，不出现在运行时）：声明了 needs.source 的任务，参数里都带 sourceId（claimNextTask 照它读连接，
+// 不再按参数名判断）；attachSource 的任务都声明了 needs.source（挂载数据源之前先得有连接）。哪条不满足，取值出现 false、这里编译报错
+type AssertTrue<T extends true> = T;
+type _needsSourceInParams = AssertTrue<{ [K in SourceNeedKinds]: [ParamsOf<K>] extends [{ sourceId: string }] ? true : false }[SourceNeedKinds] extends true ? true : false>;
+type _attachDeclaresSource = AssertTrue<{ [K in TaskKind]: (typeof CONTRACTS)[K] extends { attachSource: true } ? (K extends SourceNeedKinds ? true : false) : true }[TaskKind] extends true ? true : false>;
 
 /** 一个任务的结果类型 */
 export type ResultOf<K extends TaskKind> = NonNullable<(typeof CONTRACTS)[K]['result']['__result']>;
