@@ -5,13 +5,17 @@
 // 数据工程师看到「删除」按钮（分析师看不到、提交 403），被已发布标签引用的指标删不了，删除后回到分析页；
 // 有早于生效版本的快照时数据工程师点「回刷」入队按旧统计日的计算，分析师在按钮处看到原因、提交 403；
 // 数据工程师点「重新计算」按生效版本以今天入队（连同下游标签，来源 manual），定义页显示最近一次刷新的时间与来源，分析页快照列表显示来源；
-// 新建页写需求「用模型生成草稿」填进编辑框、不保存，不过校验时 422 保持原内容，未配置模型服务时 400，查看者 403；标签同样能生成，没有可引用的已发布指标时 400
+// 新建页写需求「用模型生成草稿」填进编辑框、不保存，不过校验时 422 保持原内容，未配置模型服务时 400，查看者 403；标签同样能生成，没有可引用的已发布指标时 400；
+// 指标新建页默认是条件构建器（?mode=builder|yaml）：「检查」只编译给出摘要与编译出的 SQL、不保存（YAML 模式也能检查），
+// 不合法按行列 400（行列号指向生成的 YAML，一并显示；fieldsFor 里没有的字段服务端兜底拦下），保存得到与手写 YAML 一样的草稿
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { dslVersions, snapshots, tasks } from '../../app/.server/db/schema';
 import { createDefinition, getDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { todayUtc } from '../../app/.server/templates';
+import { entityOf } from '../../app/lib/canonical-model';
+import { formToYaml, type MetricForm } from '../../app/lib/metric-form';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { fakeLlm, json, platformDefault } from '../pipeline/llm-fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
@@ -61,6 +65,57 @@ describe('指标与标签定义页', () => {
 
     expect((await engineer.get('/analytics/definitions/metric/missing')).status).toBe(404);
     expect((await engineer.get('/analytics/definitions/nope/revenue')).status).toBe(404);
+  });
+
+  it('新建页的条件构建器：检查给出四句摘要与编译出的 SQL、不保存；不合法按行列返回 400；保存得到与手写 YAML 一样的草稿', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+
+    // 指标默认进构建器：有模式切换、实体下拉、「添加一行」与隐藏字段 form
+    const page = await (await analyst.get('/analytics/definitions/new?kind=metric')).text();
+    expect(page).toContain('data-tab="builder"');
+    expect(page).toContain('订单（order）');
+    expect(page).toContain('添加一行');
+    expect(page).toContain('name="form"');
+
+    const form: MetricForm = { base: 'order', agg: 'sum', field: 'amount', filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'paid_at', days: 30 }, dimensions: [], readonly: [] };
+    const post = (body: Record<string, string>) => analyst.post('/analytics/definitions/new', { kind: 'metric', key: 'paid_amount_30d', form: JSON.stringify(form), ...body });
+
+    // 检查：三句摘要（非 ratio）与编译出的 SQL，只编译不保存
+    const check = await post({ intent: 'check' });
+    expect(check.status).toBe(200);
+    const checked = await check.text();
+    expect(checked).toContain('data-summary');
+    expect(checked).toContain('<li>计算实付金额求和。</li>');
+    expect(checked).toContain('<li>只算 订单状态 等于 paid 的记录。</li>');
+    expect(checked).toContain('<li>近 30 天，按支付时间。</li>');
+    expect(checked).toMatch(/data-compiled-sql[^>]*>[^<]*SUM\(b\.\D*quot;amount/);
+    expect(checked).toContain('data-generated-yaml');
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
+    // sum 用了文本字段：400 与按行列的问题（行列号指向生成的 YAML），同时把它显示出来
+    const bad = await post({ intent: 'check', form: JSON.stringify({ ...form, field: 'channel' }) });
+    expect(bad.status).toBe(400);
+    expect(await bad.text()).toMatch(/data-issue-line="4"[^>]*>第 4 行第 \d+ 列（measure\.field）：sum 只能用整数或小数字段/);
+
+    // fieldsFor 里没有的字段：服务端兜底拦下
+    expect((await post({ intent: 'check', form: JSON.stringify({ ...form, field: 'not_a_field' }) })).status).toBe(400);
+
+    // YAML 模式也能只检查不保存
+    const yamlCheck = await analyst.post('/analytics/definitions/new', { kind: 'metric', intent: 'check', yaml: 'base: order\nmeasure: { agg: count }\n' });
+    expect(yamlCheck.status).toBe(200);
+    expect(await yamlCheck.text()).toContain('<li>计算行数。</li>');
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
+    // 保存：第 1 版草稿，YAML 与手写保存的一致（同一个 formToYaml 结果）
+    const saved = await post({ intent: 'save' });
+    expect(saved.status).toBe(302);
+    expect(saved.headers.get('location')).toBe('/analytics/definitions/metric/paid_amount_30d');
+    const detail = await (await analyst.get('/analytics/definitions/metric/paid_amount_30d')).text();
+    const fields = entityOf('order')!.fields.map(f => ({ name: f.name, type: f.type }));
+    expect(detail).toContain(formToYaml(form, fields));
+    expect(detail).toContain('SUM(b.&quot;amount&quot;)');
   });
 
   it('分析页「新建标签」进到标签种类的新建页；引用未发布的指标时按行列列出问题，种类不存在时 404', async () => {
@@ -340,12 +395,13 @@ describe('用模型生成指标草稿', () => {
     const analyst = await loginAs(app, 'analyst@acme.com');
     const request = '近 30 天已支付订单的金额合计';
 
-    const page = await (await analyst.get('/analytics/definitions/new?kind=metric')).text();
+    // 用模型生成草稿在 YAML 模式（构建器是指标的默认模式）
+    const page = await (await analyst.get('/analytics/definitions/new?kind=metric&mode=yaml')).text();
     expect(page).toMatch(/<textarea[^>]*name="request"/);
     expect(page).toMatch(/<button[^>]*formNoValidate=""[^>]*value="model-draft"|<button[^>]*value="model-draft"[^>]*formNoValidate=""/);
 
     modelReplies({ base: 'order', measure: { agg: 'sum', field: 'amount' }, filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'created_at', days: 30 } });
-    const generated = await analyst.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'metric', key: '', request, yaml: REVENUE });
+    const generated = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request, yaml: REVENUE });
     expect(generated.status).toBe(200);
     const html = await generated.text();
     const yaml = editorYaml(html);
@@ -360,7 +416,7 @@ describe('用模型生成指标草稿', () => {
     expect((await getDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'paid_revenue_30d')).draft).toMatchObject({ version: 1, yaml });
 
     modelReplies({ base: 'order', measure: { agg: 'sum', field: 'channel' } });
-    const bad = await analyst.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'metric', key: 'x', request, yaml: REVENUE });
+    const bad = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: 'x', request, yaml: REVENUE });
     expect(bad.status).toBe(422);
     const badHtml = await bad.text();
     expect(badHtml).toContain('未采用，编辑框保持原内容');
@@ -393,7 +449,7 @@ describe('用模型生成标签草稿', () => {
     modelReplies({ metric: 'revenue', rules: [{ value: 'high', when: { gte: 1000 } }], default: 'normal' });
 
     expect(await (await analyst.get('/analytics/definitions/new?kind=tag')).text()).toMatch(/<textarea[^>]*name="request"/);
-    const none = await analyst.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'tag', key: '', request, yaml: tag });
+    const none = await analyst.post('/analytics/definitions/new?kind=tag', { intent: 'model-draft', kind: 'tag', key: '', request, yaml: tag });
     expect(none.status).toBe(400);
     const noneHtml = await none.text();
     expect(noneHtml).toContain('先发布一个数值型指标');
@@ -401,7 +457,7 @@ describe('用模型生成标签草稿', () => {
 
     await createDefinition(author, 'metric', 'revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
     await publishDefinition(reviewer, 'metric', 'revenue', 1);
-    const generated = await analyst.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'tag', key: '', request, yaml: tag });
+    const generated = await analyst.post('/analytics/definitions/new?kind=tag', { intent: 'model-draft', kind: 'tag', key: '', request, yaml: tag });
     expect(generated.status).toBe(200);
     const html = await generated.text();
     expect(editorYaml(html)).toContain('# 模型根据需求生成，请核对');
