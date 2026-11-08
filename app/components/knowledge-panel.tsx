@@ -1,10 +1,11 @@
 // app/components/knowledge-panel.tsx —— 业务知识面板（ADR-0046）：左边是系统事实（目录条目的只读内容、系统口径文字与派生的口径声明），右边是成员写的知识
-// （待确认的知识提案、别名、口径声明、业务说明、分析主题）。提案可以接受、修改后接受、填理由拒绝。每个表单都带 intent 与 targetId，交给路由 action 里的 handleKnowledgeIntent；不能编辑时不渲染任何表单和按钮。
+// （待确认的知识提案、别名、口径声明、业务说明、分析主题）。提案可以接受、修改后接受、填理由拒绝（主题归属只有接受与拒绝，显示主题名）。每个表单都带 intent 与 targetId，交给路由 action 里的 handleKnowledgeIntent；不能编辑时不渲染任何表单和按钮。
 // 需复核的知识配 amber 图标与「待复核」，生效的配 emerald。panel 为 null（定义从未发布过）时只提示发布后才能添加
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { Form } from 'react-router';
 import type { EntityEntry, FieldEntry, MetricEntry, TagEntry } from '~/.server/catalog';
 import type { KnowledgePanel as Panel, PanelProposal } from '~/.server/knowledge/panel';
+import type { Subject } from '~/.server/knowledge/subjects';
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
@@ -98,19 +99,23 @@ function SystemFacts({ system }: { system: PanelSystem }) {
   );
 }
 
-const PROPOSAL_KIND_LABEL = { alias: '别名', claim: '口径声明', note: '业务说明' } as const;
+const PROPOSAL_KIND_LABEL = { alias: '别名', claim: '口径声明', note: '业务说明', subject: '归入主题' } as const;
 
-function proposalText(p: PanelProposal): string {
+/** 一条提案内容的说法；主题归属显示主题名，主题已删除时显示占位 */
+function proposalText(p: PanelProposal, subjects: Subject[]): string {
   switch (p.kind) {
     case 'alias': return p.content.alias;
     case 'claim': return `${claimTypeLabel(p.content.type)}：${claimValueLabel(p.content.type, p.content.value)}`;
     case 'note': return p.content.note;
+    case 'subject': return subjects.find(s => s.id === p.content.subjectId)?.name ?? '已删除的主题';
   }
 }
 
-/** 修改后接受：按种类给一个预填原值的输入 */
+/** 修改后接受：按种类给一个预填原值的输入；主题归属没有这个入口（服务端也拦），返回 null 让 switch 保持穷尽 */
 function EditedValue({ proposal: p }: { proposal: PanelProposal }) {
   switch (p.kind) {
+    case 'subject':
+      return null;
     case 'alias':
       return <Input name="alias" required maxLength={50} defaultValue={p.content.alias} aria-label="改后的别名" className="w-48" />;
     case 'claim': {
@@ -146,7 +151,7 @@ function Proposals({ panel, targetId }: { panel: Panel; targetId: string }) {
       <ul className="space-y-3">
         {panel.proposals.map(p => (
           <li key={p.id} data-proposal={p.id} className="space-y-1 text-sm">
-            <div className="whitespace-pre-wrap">{`${PROPOSAL_KIND_LABEL[p.kind]}：${proposalText(p)}`}</div>
+            <div className="whitespace-pre-wrap">{`${PROPOSAL_KIND_LABEL[p.kind]}：${proposalText(p, panel.subjects.all)}`}</div>
             {p.evidence.length > 0 && (
               <div className="text-xs text-slate-500">
                 {'证据：'}{p.evidence.map(e => (e.version === undefined ? e.ref : `${e.ref} v${e.version}`)).join('、')}
@@ -158,15 +163,17 @@ function Proposals({ panel, targetId }: { panel: Panel; targetId: string }) {
                   <input type="hidden" name="proposalId" value={p.id} />
                   <Button type="submit" size="xs" variant="outline">接受</Button>
                 </KnowledgeForm>
-                <details className="text-xs">
-                  <summary className="cursor-pointer py-1 text-slate-500 hover:text-slate-900">修改后接受</summary>
-                  <KnowledgeForm intent="proposal.acceptEdited" targetId={targetId} className="mt-2 flex max-w-2xl flex-wrap items-start gap-2">
-                    <input type="hidden" name="proposalId" value={p.id} />
-                    <input type="hidden" name="kind" value={p.kind} />
-                    <EditedValue proposal={p} />
-                    <Button type="submit" size="sm" variant="outline">接受修改</Button>
-                  </KnowledgeForm>
-                </details>
+                {p.kind !== 'subject' && (
+                  <details className="text-xs">
+                    <summary className="cursor-pointer py-1 text-slate-500 hover:text-slate-900">修改后接受</summary>
+                    <KnowledgeForm intent="proposal.acceptEdited" targetId={targetId} className="mt-2 flex max-w-2xl flex-wrap items-start gap-2">
+                      <input type="hidden" name="proposalId" value={p.id} />
+                      <input type="hidden" name="kind" value={p.kind} />
+                      <EditedValue proposal={p} />
+                      <Button type="submit" size="sm" variant="outline">接受修改</Button>
+                    </KnowledgeForm>
+                  </details>
+                )}
                 <details className="text-xs">
                   <summary className="cursor-pointer py-1 text-slate-500 hover:text-slate-900">拒绝</summary>
                   <KnowledgeForm intent="proposal.reject" targetId={targetId} className="mt-2 flex gap-2">

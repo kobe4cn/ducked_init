@@ -14,7 +14,7 @@ import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.se
 import { addAlias } from '../../app/.server/knowledge/aliases';
 import { saveClaim } from '../../app/.server/knowledge/claims';
 import { proposeKnowledge, type ProposalInput } from '../../app/.server/knowledge/proposals';
-import { createSubject } from '../../app/.server/knowledge/subjects';
+import { createSubject, deleteSubject } from '../../app/.server/knowledge/subjects';
 import { memberOf, publish } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -206,6 +206,40 @@ describe('业务知识面板', () => {
     const other = await propose(acme, { kind: 'alias', content: { alias: '营业额' } });
     expect((await post({ intent: 'proposal.acceptEdited', proposalId: other.id, kind: 'alias', alias: '年营业额' })).status).toBe(302);
     expect((await knowledgeOf(acme))?.aliases).toEqual(expect.arrayContaining(['年营业额', '流水']));
+  });
+
+  it('主题归属提案显示主题名，没有「修改后接受」；接受后提案消失、条目进入主题；主题删除后显示「已删除的主题」，改值接受被服务端拦下', async () => {
+    const { acme, analyst } = await setup();
+    const subjectId = await createSubject(analyst, '营收');
+    const p = await propose(acme, { kind: 'subject', content: { subjectId } });
+    const an = await loginAs(app, 'an@acme.com');
+    const post = (form: Record<string, string>) => an.post(METRIC, { targetId: TARGET, ...form });
+
+    let panel = await panelOf(an, METRIC);
+    expect(panel).toContain('归入主题：营收');
+    // 这条提案只有「接受」与「拒绝」，没有「修改后接受」的入口
+    const li = panel.match(new RegExp(`<li[^>]*data-proposal="${p.id}"[\\s\\S]*?</li>`))![0];
+    expect(li).toContain('name="intent" value="proposal.accept"');
+    expect(li).toContain('name="intent" value="proposal.reject"');
+    expect(li).not.toContain('修改后接受');
+    expect(panel).not.toContain('proposal.acceptEdited');
+
+    expect((await post({ intent: 'proposal.accept', proposalId: p.id })).status).toBe(302);
+    panel = await panelOf(an, METRIC);
+    expect(panel).not.toContain(`data-proposal="${p.id}"`);
+    expect(panel).toContain(`data-member-of="${subjectId}"`);
+    expect(await knowledgeOf(acme)).toEqual({ subjects: ['营收'] });
+
+    // 主题在提出后被删：显示占位；直接 POST 改值接受 400，提案仍是待确认
+    const gone = await createSubject(analyst, '复购');
+    const q = await propose(acme, { kind: 'subject', content: { subjectId: gone } });
+    await deleteSubject(analyst, gone);
+    panel = await panelOf(an, METRIC);
+    expect(panel).toContain('归入主题：已删除的主题');
+    const edited = await post({ intent: 'proposal.acceptEdited', proposalId: q.id, kind: 'subject', subjectId });
+    expect(edited.status).toBe(400);
+    expect(decode(await edited.text())).toContain('主题归属提案不能修改后接受');
+    expect(await panelOf(an, METRIC)).toContain(`data-proposal="${q.id}"`);
   });
 
   it('拒绝要填理由，拒绝后提案消失、目录不变；已处理或依据已变化时接受 409 并显示错误；查看者没有处理入口，提交 403', async () => {
