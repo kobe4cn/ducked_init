@@ -19,6 +19,7 @@ import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.ser
 import { entityRelationStats } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { passthroughPair, publishPassthrough } from '~/.server/passthrough';
+import { PublishError } from '~/.server/publishing';
 import { publishBlocker, publishReason } from '~/.server/publish-rules';
 import { relationSuggestions } from '~/.server/relation-suggest';
 import { AppShell } from '~/components/app-shell';
@@ -141,7 +142,8 @@ export async function action({ request, params }: Route.ActionArgs) {
         return data({ error: '未知操作', intent: null, input: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof CustomEntityError) {
+    // 保存、发布、丢弃经 publishing.ts（ADR-0051）：流程错误是 PublishError，CustomEntityError 是它的子类
+    if (e instanceof PublishError) {
       const intent = String(form.get('intent'));
       return data({ error: e.message, intent, input: intent === 'save' ? input : null }, { status: e.status });
     }

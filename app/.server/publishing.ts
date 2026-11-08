@@ -1,5 +1,5 @@
 // app/.server/publishing.ts —— 可发布项（映射、源视图、指标 / 标签 / 模板定义、自定义实体、合并组）的保存草稿、发布、丢弃由这一个模块负责（ADR-0051）：
-// 每种可发布项通过适配器接入：两张表、要不要先锁租户行、事务外与事务内检查、发布后与丢弃后动作、审计与文案。
+// 每种可发布项通过适配器接入：两张表、要不要先锁租户行、事务外、事务内与锁内检查、发布后与丢弃后动作、审计与文案。
 // 发布顺序固定：读草稿 → publishBlocker → 事务外检查 → 开事务 → 加锁 → 过期检查 → 事务内检查 → 改状态 → 发布后动作 → 审计
 // （审计放在最后：记目录版本拿的锁要是事务里最后一个锁，ADR-0047）。流程本身的错误（不是草稿、已发布、草稿被改过、没有草稿可丢弃）
 // 抛 PublishError，各可发布项自己的错误类继承它。不能 import mappings.ts（它经 publish-rules.ts 导入这里，循环依赖）：
@@ -90,6 +90,10 @@ export interface PublishableAdapter<Ctx, Input, Inside = undefined, After = null
   /** 保存的事务外检查（可以访问 DuckDB 或数据湖），把输入变成要写进版本表的内容列（sql、columns、tables 这些） */
   checkSave(ctx: Ctx, input: Input): Promise<Record<string, unknown>>;
 
+  /** 保存的锁内检查：锁父行、读出最新一版之后调用，按最新一版得出要写进版本表的内容列，返回值取代 checkSave 的结果
+   * （采纳这类要基于同时保存的修改做的保存在这里，如自定义实体）。latest 是最新一版，一行都没有时 undefined */
+  saveLocked?(tx: Tx, ctx: Ctx, input: Input, latest: DraftRow | undefined): Promise<Record<string, unknown>>;
+
   /** 保存的事务内检查（只查 PG）：合并组的校验与懒建父行在这里做 */
   saveInside?(tx: Tx, ctx: Ctx): Promise<void>;
 
@@ -102,8 +106,8 @@ export interface PublishableAdapter<Ctx, Input, Inside = undefined, After = null
   /** 发布后动作（入队任务），返回任务或 null；在审计之前执行 */
   afterPublish?(tx: Tx, draft: DraftRow, ctx: Ctx, inside: Inside): Promise<After | null>;
 
-  /** 丢弃后动作（回到的已发布版本还在时 kept 为真） */
-  afterDiscard?(tx: Tx, ctx: Ctx, kept: boolean): Promise<void>;
+  /** 丢弃后动作（回到的已发布版本还在时 kept 为真）；连带丢弃别的东西（如自定义实体的孤儿映射）要记审计，所以给 actor */
+  afterDiscard?(tx: Tx, actor: CurrentMember, ctx: Ctx, kept: boolean): Promise<void>;
 
   /** 审计：三个动作名与目标类型；detail 带上这一步看到的字段（版本号、作者这些），上下文里的公共字段（如所属数据源与名称）由它补 */
   audit: {
@@ -138,20 +142,21 @@ const inTx = <T>(tx: Tx | undefined, run: (tx: Tx) => Promise<T>): Promise<T> =>
 
 /**
  * 保存草稿：事务外检查（适配器的 checkSave，可以访问 DuckDB 或数据湖）→ 开事务 →（锁租户行）→ 保存的事务内检查 → 锁父行 →
- * 最新一版是草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）并记 *.drafted 审计。
- * 返回草稿的版本号
+ * 锁内检查（适配器的 saveLocked，有它时结果取代 checkSave 的）→ 最新一版是草稿时改它（记下又一位作者与最后保存的人），
+ * 否则在最新版本之上新建一版草稿（已发布的版本不变）并记 *.drafted 审计。返回草稿的版本号
  */
 export async function saveDraft<Ctx, Input, Inside, After>(
   adapter: PublishableAdapter<Ctx, Input, Inside, After>, actor: CurrentMember, ctx: Ctx, input: Input, tx?: Tx,
 ) {
-  const columns = await adapter.checkSave(ctx, input);
+  let columns = await adapter.checkSave(ctx, input);
   return inTx(tx, async tx => {
     if (adapter.lockTenant) await lockTenantRow(tx, actor.tenant.id);
     await adapter.saveInside?.(tx, ctx);
     const parentId = await adapter.lockParent(tx, ctx);
     const { id, version: versionCol } = sharedOf(adapter.versions);
     const [latest] = (await tx.select().from(adapter.versions).where(eq(adapter.versionsFk, parentId))
-      .orderBy(desc(versionCol)).limit(1)) as unknown as VersionRow[];
+      .orderBy(desc(versionCol)).limit(1)) as unknown as DraftRow[];
+    if (adapter.saveLocked) columns = await adapter.saveLocked(tx, ctx, input, latest);
     if (latest?.status === 'draft') {
       await tx.update(adapter.versions)
         .set({ ...columns, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
@@ -228,7 +233,7 @@ export async function discard<Ctx, Input, Inside, After>(
     const published = versions.find(v => v.status === 'published')?.version ?? null;
     if (published) await tx.delete(adapter.versions).where(eq(id, draft.id));
     else await tx.delete(adapter.parent).where(eq(sharedOf(adapter.parent).id, parentId));
-    await adapter.afterDiscard?.(tx, ctx, published !== null);
+    await adapter.afterDiscard?.(tx, actor, ctx, published !== null);
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
