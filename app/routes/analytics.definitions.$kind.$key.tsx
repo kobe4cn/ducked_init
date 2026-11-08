@@ -19,6 +19,7 @@ import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.ser
 import { navFor } from '~/.server/nav';
 import { UNLINKED } from '~/.server/pipeline/dsl/metric-spec';
 import { publishReason } from '~/.server/publish-rules';
+import { PublishError } from '~/.server/publishing';
 import { triggerLabel } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
@@ -124,9 +125,9 @@ export async function action({ request, params }: Route.ActionArgs) {
         throw redirect(`${page}?recomputed=${version}`);
       }
       case 'discard': {
-        const { published } = await discardDslDraft(await requirePermission(request, 'definitions:draft'), params.kind, params.key);
+        const { kept } = await discardDslDraft(await requirePermission(request, 'definitions:draft'), params.kind, params.key);
         // 从没发布过时定义已删除，回到分析页
-        throw redirect(published ? page : '/analytics');
+        throw redirect(kept ? page : '/analytics');
       }
       case 'delete':
         await deleteDefinition(await requirePermission(request, 'definitions:write'), params.kind, params.key);
@@ -146,7 +147,8 @@ export async function action({ request, params }: Route.ActionArgs) {
         return data({ error: '未知操作', issues: [], yaml: null, preview: null, impact: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof DslError) return data({ error: e.message, issues: e.issues, yaml: intent === 'save' ? yaml : null, preview: null, impact: null }, { status: e.status });
+    // 发布流程抛的 PublishError（如双人规则的 403）也要按状态码展示给成员，只有 DslError 带按行列的问题
+    if (e instanceof PublishError) return data({ error: e.message, issues: e instanceof DslError ? e.issues : [], yaml: intent === 'save' ? yaml : null, preview: null, impact: null }, { status: e.status });
     throw e;
   }
 }

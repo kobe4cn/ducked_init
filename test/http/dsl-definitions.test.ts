@@ -194,7 +194,7 @@ describe('指标与标签定义页', () => {
     await analyst.post(path, { intent: 'save', yaml: REVENUE });
     expect((await analyst.post(path, { intent: 'discard' })).headers.get('location')).toBe(path);
     expect(await getDefinition(analystMember, 'metric', 'revenue')).toMatchObject({ draft: null, published: { version: 1 } });
-    expect((await analyst.post(path, { intent: 'discard' })).status).toBe(404);
+    expect((await analyst.post(path, { intent: 'discard' })).status).toBe(400);
 
     await createDefinition(analystMember, 'metric', 'orders', REVENUE);
     expect((await analyst.post('/analytics/definitions/metric/orders', { intent: 'discard' })).headers.get('location')).toBe('/analytics');

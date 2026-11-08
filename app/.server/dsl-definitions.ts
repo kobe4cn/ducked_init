@@ -1,5 +1,6 @@
 // app/.server/dsl-definitions.ts —— 指标与标签定义（ADR-0025）：成员用 YAML 写定义，按种类（pipeline/dsl 的注册表）校验通过才能保存为草稿。
 // 键在租户与种类内唯一；每个定义同时只有一份草稿，再次保存改的是同一份，记下作者与最后保存的人，之后按映射同样的规则双人发布（ADR-0015）。
+// 保存草稿、发布与丢弃的流程（双人发布、版本与审计）在 publishing.ts（ADR-0051），本文件提供 dslDefinitionAdapter 接入。
 // 校验对照本租户已发布的自定义实体登记与已发布映射的扩展字段（标签另对照各指标最新的已发布版本）；定义页展示编译出的 SQL，并可在只读挂载的数据湖上预览前 50 行，
 // 有草稿且有已发布版本时还能预览发布的影响（两版结果按消费者对比，只给计数）。
 // 发布后版本锁定，并以当天为 asOf 入队一次 gold.dsl（编译在入队时完成，SQL 进任务参数），成功后登记为一张快照（template 为 <种类>:<键>）；
@@ -9,7 +10,7 @@
 // 有修改与删除权限的成员可以删除定义；被已发布标签引用的指标不能删（依赖由已发布版本按需解析，dsl-dependencies.ts）。
 // 一律限定在操作者所属租户内
 import type { DuckDBConnection } from '@duckdb/node-api';
-import { and, desc, eq, getTableColumns, inArray, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
@@ -30,7 +31,7 @@ import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { lit } from '../lib/mapping-expr';
 import { rows } from './pipeline/duck-sql';
-import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
+import { discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, saveDraft, type PublishableAdapter } from './publishing';
 import { registerTaskSnapshot } from './snapshots';
 import { insertTask } from './tasks';
 import { todayUtc } from './templates';
@@ -38,9 +39,9 @@ import { todayUtc } from './templates';
 /** 定义的键：小写字母开头，只用小写字母、数字与下划线 */
 export const DSL_KEY_PATTERN = /^[a-z][a-z0-9_]{0,62}$/;
 
-/** 可以展示给成员的业务错误；定义校验不通过时带上按行列的问题 */
-export class DslError extends Error {
-  constructor(message: string, readonly status: 400 | 403 | 404 | 422 = 400, readonly issues: DslIssue[] = []) { super(message); }
+/** 可以展示给成员的业务错误；定义校验不通过时带上按行列的问题。发布流程本身的错误（PublishError）由它继承（ADR-0051） */
+export class DslError extends PublishError {
+  constructor(message: string, status: 400 | 403 | 404 | 422 = 400, readonly issues: DslIssue[] = []) { super(message, status); }
 }
 
 function requireKind(kind: string): asserts kind is DslKind {
@@ -190,32 +191,91 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
   return { yaml };
 }
 
+/** dslDefinitionAdapter 的上下文：租户、种类与键；parentId 是定义行 ID */
+export interface DslDefinitionCtx { tenantId: string; kind: DslKind; key: string; parentId: string }
+
+/** 定位本租户的一个定义（存在时），给 publishing.ts 的流程当上下文；不存在时 404 */
+export async function dslDefinitionCtx(actor: CurrentMember, kind: DslKind, key: string): Promise<DslDefinitionCtx> {
+  const [definition] = await getDb().select({ id: dslDefinitions.id }).from(dslDefinitions).where(ofDefinition(actor.tenant.id, kind, key));
+  if (!definition) throw new DslError(`没有键为 ${key} 的${DSL_KINDS[kind].label}`, 404);
+  return { tenantId: actor.tenant.id, kind, key, parentId: definition.id };
+}
+
+/** checkInside 传给 afterPublish 与审计的值：这一版校验出的 spec（不通过校验时 checkInside 已抛出）、自身与下游标签各自编译要用的上下文、下游标签与当天的 asOf */
+interface DslInside {
+  checked: { ok: true; spec: unknown };
+  dslCtx: DslContext;
+  tagCtx: DslContext;
+  downstream: Awaited<ReturnType<typeof downstreamTags>>;
+  asOf: string;
+}
+
+/** enqueueDsl 入队的计算任务（publishDefinition 返回它） */
+type QueuedDsl = Awaited<ReturnType<typeof enqueueDsl>>;
+
+/** dslVersions 的内容列：发布流程里 checkInside、afterPublish 与审计收到的草稿带上它 */
+type DslDraft = DraftRow & { yaml: string };
+
 /**
- * 保存草稿：已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
+ * 指标与标签定义接入 publishing.ts 的适配器（ADR-0051）：保存的事务外检查是 YAML 校验（对照当时的登记与映射），
+ * 发布的事务内检查再校验一次（保存后登记与映射可能变了）。锁租户行：与发布映射、删除定义与自定义实体互斥，
+ * 它们按已发布定义的依赖做检查。发布后同一事务里以当天入队一次 gold.dsl（自身用 dslCtx 编译）；
+ * 指标另为引用它的每个已发布标签入队一次（用换上了刚发布这一版的 tagCtx 编译，不再通过校验的跳过、记进审计）。
+ * 审计在入队之后（ADR-0047）
+ */
+export const dslDefinitionAdapter: PublishableAdapter<DslDefinitionCtx, string, DslInside, QueuedDsl> = {
+  parent: dslDefinitions,
+  versions: dslVersions,
+  versionsFk: dslVersions.definitionId,
+  lockTenant: true,
+  lockParent: async (tx, ctx) => {
+    const [locked] = await tx.select({ id: dslDefinitions.id }).from(dslDefinitions).where(ofDefinition(ctx.tenantId, ctx.kind, ctx.key)).for('update');
+    if (!locked) throw new DslError(`没有键为 ${ctx.key} 的${DSL_KINDS[ctx.kind].label}`, 404);
+    return locked.id;
+  },
+  checkSave: async (ctx, yaml) => {
+    await assertValid(ctx.kind, ctx.tenantId, yaml);
+    return { yaml };
+  },
+  checkInside: async (tx, draft, ctx) => {
+    const { yaml } = draft as DslDraft;
+    const dslCtx = await dslContext(tx, ctx.tenantId);
+    const checked = DSL_KINDS[ctx.kind].check(yaml, dslCtx);
+    if (!checked.ok) throw new DslError('对照当前已发布的登记与映射，这一版不再通过校验，不能发布', 400, checked.issues);
+    // 下游标签按刚发布的这一版指标校验与编译（dslCtx 里的还是之前的已发布版本）
+    const tagCtx = ctx.kind === 'metric' ? withMetric(dslCtx, ctx.key, checked as DslCheck<MetricSpec>) : dslCtx;
+    const downstream = ctx.kind === 'metric' ? await downstreamTags(tx, ctx.tenantId, ctx.key, tagCtx) : { ready: [], skipped: [] };
+    return { checked, dslCtx, tagCtx, downstream, asOf: todayUtc() };
+  },
+  afterPublish: async (tx, draft, ctx, inside) => {
+    const task = await enqueueDsl(tx, ctx.tenantId, { kind: ctx.kind, key: ctx.key, definitionId: ctx.parentId, version: draft.version }, inside.checked.spec, inside.dslCtx, inside.asOf, 'publish');
+    for (const { tag, spec } of inside.downstream.ready) await enqueueDsl(tx, ctx.tenantId, tag, spec, inside.tagCtx, inside.asOf, 'publish');
+    return task;
+  },
+  audit: {
+    drafted: { action: 'definition.drafted', detail: (ctx, _columns, version) => ({ kind: ctx.kind, key: ctx.key, version }) },
+    published: {
+      action: 'definition.published',
+      detail: (ctx, draft, inside) => ({
+        kind: ctx.kind, key: ctx.key, version: draft.version, authors: draft.authors, lastEditor: draft.lastEditor,
+        tags: inside.downstream.ready.map(t => t.tag.key), skippedTags: inside.downstream.skipped,
+      }),
+    },
+    discarded: { action: 'definition.draft_discarded', detail: (ctx, version, published) => ({ kind: ctx.kind, key: ctx.key, version, published }) },
+    targetType: 'definition',
+  },
+  missingVersion: version => `没有第 ${version} 版`,
+  noDraft: ctx => `这个${DSL_KINDS[ctx.kind].label}没有草稿`,
+};
+
+/**
+ * 保存草稿：YAML 校验通过后，已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
  * 定义要已经存在（新建走 createDefinition）。返回草稿的版本号
  */
 export async function saveDslDraft(actor: CurrentMember, kind: string, key: string, yaml: string) {
   assertCan(actor, 'definitions:draft');
   requireKind(kind);
-  await assertValid(kind, actor.tenant.id, yaml);
-  return getDb().transaction(async tx => {
-    // 锁住定义行：与发布、丢弃互斥
-    const [locked] = await tx.select({ id: dslDefinitions.id }).from(dslDefinitions).where(ofDefinition(actor.tenant.id, kind, key)).for('update');
-    if (!locked) throw new DslError(`没有键为 ${key} 的${DSL_KINDS[kind].label}`, 404);
-    const [latest] = await tx.select().from(dslVersions)
-      .where(eq(dslVersions.definitionId, locked.id)).orderBy(desc(dslVersions.version)).limit(1);
-    if (latest?.status === 'draft') {
-      await tx.update(dslVersions).set({ yaml, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
-        .where(eq(dslVersions.id, latest.id));
-      return latest.version;
-    }
-    const version = (latest?.version ?? 0) + 1;
-    await tx.insert(dslVersions).values({ definitionId: locked.id, version, yaml, authors: [actor.email], lastEditor: actor.email });
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id, actor, action: 'definition.drafted', targetType: 'definition', targetId: locked.id, detail: { kind, key, version },
-    });
-    return version;
-  });
+  return saveDraft(dslDefinitionAdapter, actor, await dslDefinitionCtx(actor, kind, key), yaml);
 }
 
 /**
@@ -267,35 +327,8 @@ export async function getDefinition(actor: CurrentMember, kind: string, key: str
 export async function publishDefinition(actor: CurrentMember, kind: string, key: string, version: number) {
   assertCan(actor, 'publish');
   requireKind(kind);
-  const [draft] = await getDb().select(getTableColumns(dslVersions)).from(dslVersions)
-    .innerJoin(dslDefinitions, eq(dslDefinitions.id, dslVersions.definitionId))
-    .where(and(ofDefinition(actor.tenant.id, kind, key), eq(dslVersions.version, version)));
-  if (!draft) throw new DslError(`没有第 ${version} 版`, 404);
-  const blocker = publishBlocker(actor, draft);
-  if (blocker) throw new DslError(blocker, draft.status === 'draft' ? 403 : 400);
-  return getDb().transaction(async tx => {
-    // 先锁住租户行：与映射发布、删除定义与自定义实体互斥，它们按已发布定义的依赖做检查
-    await lockTenant(tx, actor.tenant.id);
-    // 锁住定义行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿
-    await tx.select({ id: dslDefinitions.id }).from(dslDefinitions).where(eq(dslDefinitions.id, draft.definitionId)).for('update');
-    const [current] = await tx.select().from(dslVersions).where(eq(dslVersions.id, draft.id));
-    if (isStale(current, draft)) throw new DslError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
-    const ctx = await dslContext(tx, actor.tenant.id);
-    const checked = DSL_KINDS[kind].check(draft.yaml, ctx);
-    if (!checked.ok) throw new DslError('对照当前已发布的登记与映射，这一版不再通过校验，不能发布', 400, checked.issues);
-    const asOf = todayUtc();
-    // 下游标签按刚发布的这一版指标校验与编译（ctx 里的还是之前的已发布版本）
-    const tagCtx = kind === 'metric' ? withMetric(ctx, key, checked as DslCheck<MetricSpec>) : ctx;
-    const downstream = kind === 'metric' ? await downstreamTags(tx, actor.tenant.id, key, tagCtx) : { ready: [], skipped: [] };
-    await tx.update(dslVersions).set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` }).where(eq(dslVersions.id, draft.id));
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id, actor, action: 'definition.published', targetType: 'definition', targetId: draft.definitionId,
-      detail: { kind, key, version, authors: draft.authors, lastEditor: draft.lastEditor, tags: downstream.ready.map(t => t.tag.key), skippedTags: downstream.skipped },
-    });
-    const task = await enqueueDsl(tx, actor.tenant.id, { kind, key, definitionId: draft.definitionId, version }, checked.spec, ctx, asOf, 'publish');
-    for (const { tag, spec } of downstream.ready) await enqueueDsl(tx, actor.tenant.id, tag, spec, tagCtx, asOf, 'publish');
-    return task;
-  });
+  // afterPublish 一定入队：返回的就是自身入队的任务
+  return (await publish(dslDefinitionAdapter, actor, await dslDefinitionCtx(actor, kind, key), version))!;
 }
 
 /** 本定义最新的已发布版本（锁住租户行后在事务里读）；还没发布过时拒绝并附上 whyNot，定义不存在时 404 */
@@ -385,29 +418,12 @@ export async function recomputeDefinition(actor: CurrentMember, kind: string, ke
 
 /**
  * 丢弃草稿：回到最近的已发布版本；从没发布过的定义整个删除。用于草稿卡住（如最后保存的人离职）的情况。
- * 返回回到的已发布版本号（没有时为 null）
+ * 返回定义是否还在
  */
 export async function discardDslDraft(actor: CurrentMember, kind: string, key: string) {
   assertCan(actor, 'definitions:draft');
   requireKind(kind);
-  return getDb().transaction(async tx => {
-    // 锁住定义行：与保存、发布互斥
-    const [definition] = await tx.select({ id: dslDefinitions.id }).from(dslDefinitions).where(ofDefinition(actor.tenant.id, kind, key)).for('update');
-    if (!definition) throw new DslError(`没有键为 ${key} 的${DSL_KINDS[kind].label}`, 404);
-    const versions = await tx.select({ id: dslVersions.id, version: dslVersions.version, status: dslVersions.status })
-      .from(dslVersions).where(eq(dslVersions.definitionId, definition.id)).orderBy(desc(dslVersions.version));
-    const draft = versions.find(v => v.status === 'draft');
-    if (!draft) throw new DslError(`这个${DSL_KINDS[kind].label}没有草稿`, 404);
-    const published = versions.find(v => v.status === 'published')?.version ?? null;
-    // 从没发布过时删除定义，各版本随之级联删除
-    if (published) await tx.delete(dslVersions).where(eq(dslVersions.id, draft.id));
-    else await tx.delete(dslDefinitions).where(eq(dslDefinitions.id, definition.id));
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id, actor, action: 'definition.draft_discarded', targetType: 'definition', targetId: definition.id,
-      detail: { kind, key, version: draft.version, published },
-    });
-    return { published };
-  });
+  return discard(dslDefinitionAdapter, actor, await dslDefinitionCtx(actor, kind, key));
 }
 
 /**
