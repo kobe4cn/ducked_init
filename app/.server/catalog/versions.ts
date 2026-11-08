@@ -1,24 +1,12 @@
 // app/.server/catalog/versions.ts —— 语义目录的版本（ADR-0041）：目录的结构或含义变了才记一版，比较前去掉统计，只改统计不产生版本。
-// 版本由 recordAudit 在白名单动作的同一事务里触发，调度器在采集与同步成功后、tenantCatalog 在读取时也各比较一次：重新生成目录、去掉统计，和上一版的快照按条目标识比较，有差异才记新版本
+// 版本由 catalogTx 在成员事务的收尾记一次（ADR-0054；recordAudit 只登记白名单动作，见 catalog/tx.ts），
+// 调度器在采集与同步成功后、tenantCatalog 在读取时也各比较一次：重新生成目录、去掉统计，和上一版的快照按条目标识比较，有差异才记新版本
 import { and, desc, eq, gt, sql } from 'drizzle-orm';
 import type { AuditAction, Tx } from '../audit';
 import { getDb } from '../db/client';
 import { catalogVersions, tenants } from '../db/schema';
 import { buildCatalog, type Catalog, type CatalogEntry } from './index';
 import { loadCatalogInput } from './load';
-
-/** 会改变目录结构或含义的审计动作；只发起停用（mapping.disable_requested）目录不变，不在里面 */
-export const CATALOG_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
-  'mapping.published', 'mapping.disabled', 'mapping.restored',
-  'custom_entity.published', 'custom_entity.deleted',
-  'merge_group.published', 'source_view.published',
-  'source.scope_changed', 'source.registered', 'source.updated', 'source.deleted',
-  'definition.published', 'definition.deleted',
-  'template.published', 'template.auto_enabled',
-  'business_note.updated', 'alias.added', 'alias.retired', 'semantic_claim.saved',
-  'analysis_subject.created', 'analysis_subject.renamed', 'analysis_subject.deleted',
-  'subject_membership.added', 'subject_membership.removed',
-]);
 
 /**
  * 一版目录的原因：白名单审计动作，采集 / 同步后发现源表结构变了（source.profiled / source.synced），
@@ -96,9 +84,9 @@ const strippedCatalog = async (db: Tx | ReturnType<typeof getDb>, tenantId: stri
  * 在事务里重新生成目录（不读统计）、去掉统计，和最新一版比较：有差异时记下一版并返回版本号，没有差异时返回 null。
  * reason 可以是函数，按差异与有没有上一版决定原因。
  * 没有上一版时记第 1 版，全部条目都是新增。用事务级 advisory 锁按租户串行化（不用 lockTenant：它锁租户行的时机太晚，可能死锁）。
- * 这把锁之后不能再等租户行的锁：事务开头没锁租户行的白名单动作，审计要记在入队任务（insertTask 加 FOR SHARE）、lockTenant 之后，
- * 否则与先锁租户行（或已因插审计行持有 KEY SHARE）再记审计的事务互相等待。所以拿锁前先对租户行加 FOR KEY SHARE（插版本行的外键要的就是它）：
- * 经 recordAudit 来的已经持有，调度器与读取时补记的在这里先等 lockTenant 的事务结束
+ * 这把锁之后不能再等租户行的锁，所以拿锁前先对租户行加 FOR KEY SHARE（插版本行的外键要的就是它），
+ * 与先锁租户行（或已因插审计行持有 KEY SHARE）的事务就不会互相等待：经 catalogTx（ADR-0054）来的在收尾记版本前已插过审计行（已持有），
+ * 调度器与读取时补记的在这里先等 lockTenant 的事务结束
  */
 export async function recordCatalogVersion(
   tx: Tx, tenantId: string, reason: CatalogVersionReason | ((diff: CatalogDiff, first: boolean) => CatalogVersionReason),

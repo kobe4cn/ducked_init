@@ -1,6 +1,7 @@
 // app/.server/audit.ts —— 审计日志：记录关键操作。租户管理员按租户查看；运营者的操作与平台级事件在运营后台查看
 import { desc, eq } from 'drizzle-orm';
 import type { CurrentMember } from './auth';
+import { CATALOG_ACTIONS, currentCatalogTx, recordCatalogVersionNow } from './catalog/tx';
 import { getDb, type Db } from './db/client';
 import { auditLogs, ROLE_LABELS, SOURCE_KIND_LABELS, tenants, type Role, type SourceKind } from './db/schema';
 import { describeBroken } from './pipeline/schema-diff';
@@ -366,13 +367,19 @@ export async function recordAudit(tx: Tx | Db, entry: AuditEntry) {
     // 经 Agent 的操作注明通道（ADR-0042）
     detail: 'actor' in entry && entry.actor.via ? { ...entry.detail, via: entry.actor.via } : (entry.detail ?? {}),
   });
-  // 会改变目录的动作在同一事务里记目录版本（ADR-0041）；动态引入，避免 versions → load → mappings → audit 的循环引用
-  if (entry.tenantId) {
-    const { CATALOG_ACTIONS, recordCatalogVersion } = await import('./catalog/versions');
-    const tenantId = entry.tenantId;
-    // 白名单动作都在事务里记审计；万一传的是连接，另开事务记版本（advisory 锁要有事务才有意义）
-    if (CATALOG_ACTIONS.has(entry.action)) {
-      await ('rollback' in tx ? recordCatalogVersion(tx, tenantId, entry.action) : tx.transaction(t => recordCatalogVersion(t, tenantId, entry.action)));
+  // 会改变目录的动作在 catalogTx 里只登记进上下文，版本由 catalogTx 在事务收尾时记一版（ADR-0054）；
+  // 不在 catalogTx 里时暂时保留当场记版本的做法，#495 起改为抛错
+  if (CATALOG_ACTIONS.has(entry.action)) {
+    const ctx = currentCatalogTx();
+    if (ctx) {
+      // 租户不一致（含平台级 tenantId 为 null 的事件）是写代码时的错误，抛错让事务回滚
+      if (entry.tenantId !== ctx.tenantId) {
+        throw new Error(`catalogTx（租户 ${ctx.tenantId}）里审计了租户 ${entry.tenantId ?? '（平台级）'} 的目录动作 ${entry.action}`);
+      }
+      ctx.actions.push(entry.action);
+    } else if (entry.tenantId) {
+      // TODO #495：catalogTx 外审计白名单动作改为抛错（ADR-0054）
+      await recordCatalogVersionNow(tx, entry.tenantId, entry.action);
     }
   }
 }
