@@ -1,6 +1,7 @@
 // app/.server/pipeline/worker.ts —— 工作进程入口：由调度器为每个任务单独启动，执行完即退出（ADR-0001）。
 // 通过 IPC 收到任务（类型、参数、本租户数据湖的凭据、配额），回传结果或错误。环境变量里没有平台 PG 的连接串
 import { HANDLERS, type TaskKind } from './handlers';
+import { CONTRACTS, type TaskContract } from './task-contracts';
 import { PartialFailure } from './partial-failure';
 import { openTenantLake, redactLakeSecrets, type EngineLimits, type LakeSpec } from './lake-engine';
 import { redactSourceSecrets, type SourceSpec } from './source-engine';
@@ -22,9 +23,11 @@ const redactor = (input: WorkerInput) => (message: string) => {
 
 async function run(input: WorkerInput): Promise<WorkerOutcome> {
   const handler = HANDLERS[input.kind];
-  const attach = 'attachSource' in handler && handler.attachSource ? input.source : undefined;
-  const readOnly = 'readOnlyLake' in handler && handler.readOnlyLake;
-  const servingFile = 'servingFile' in handler && handler.servingFile;
+  // 挂载标志读契约：attachSource 的任务数据源与数据湖挂同一个 DuckDB，readOnlyLake 只读挂载数据湖，servingFile 另挂本机库 serving
+  const contract: TaskContract<unknown, unknown> = CONTRACTS[input.kind];
+  const attach = contract.attachSource ? input.source : undefined;
+  const readOnly = contract.readOnlyLake === true;
+  const servingFile = contract.servingFile === true;
   // 没拿到密钥就不挂 serving：不写未加密的服务库文件
   if (servingFile && !input.servingKey) throw new Error('缺少服务库密钥');
   const servingKey = servingFile ? input.servingKey : undefined;
