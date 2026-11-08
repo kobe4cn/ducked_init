@@ -1,13 +1,12 @@
 // app/routes/catalog.changes.tsx —— 目录变更记录（ADR-0041）：所有成员可看，按版本倒序列出各版的原因与新增 / 删除 / 改动的条目（只有标识、类型、名称与变了的顶层键，不显示快照内容）；
-// ?since=N 只看 N 之后的版本，最多 50 个版本；没有 sources:read 的成员（查看者）看不到数据源与源表条目，数据源相关原因（含源视图发布与删除数据源）的版本只显示「数据源结构变化」、不列明细（ADR-0005）
+// ?since=N 只看 N 之后的版本，最多 50 个版本；裁剪由 catalogChangesFor 按成员的可见性类别负责（与 visibleCatalog 共用规则）：没有 sources:read 的成员（查看者）看不到数据源与源表条目，
+// 数据源相关原因（含源视图发布与删除数据源）的版本只显示「数据源结构变化」、不列明细（ADR-0005）
 import type { Route } from './+types/catalog.changes';
 import { Link } from 'react-router';
 import { ArrowLeft, Minus, Pencil, Plus } from 'lucide-react';
-import { can } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
 import type { CatalogEntry } from '~/.server/catalog';
-import { recentCatalogChanges, type CatalogDiff, type CatalogVersionReason } from '~/.server/catalog/versions';
-import { getDb } from '~/.server/db/client';
+import { catalogChangesFor, type CatalogVersionReason } from '~/.server/catalog/versions';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
@@ -38,9 +37,6 @@ const REASON_LABELS: Partial<Record<CatalogVersionReason, string>> = {
   'catalog.detected': '读取目录时发现变化',
 };
 
-/** 查看者只看到「数据源结构变化」、不列明细的原因 */
-const SOURCE_REASONS: ReadonlySet<string> = new Set<CatalogVersionReason>(['source_view.published', 'source.scope_changed', 'source.registered', 'source.updated', 'source.deleted', 'source.profiled', 'source.synced']);
-
 const KIND_LABELS: Record<CatalogEntry['kind'], string> = {
   source: '数据源', table: '源表', entity: '实体', field: '字段', relation: '关系',
   metric: '指标', tag: '标签', template: '模板', capability: '平台能力',
@@ -60,29 +56,21 @@ export function meta({}: Route.MetaArgs) {
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requireMember(request);
   const since = Math.max(0, Number.parseInt(new URL(request.url).searchParams.get('since') ?? '', 10) || 0);
-  const canSources = can(member.role, 'sources:read');
-  const { current, versions } = await recentCatalogChanges(getDb(), member.tenant.id, since, MAX_VERSIONS);
-  const visible = (x: { kind: CatalogEntry['kind'] }) => canSources || (x.kind !== 'source' && x.kind !== 'table');
+  const { current, versions } = await catalogChangesFor(member, since, MAX_VERSIONS);
   return {
     email: member.email,
     nav: navFor(member),
     current,
     since,
-    versions: versions.map(v => {
-      const masked = !canSources && SOURCE_REASONS.has(v.reason);
-      const diff: CatalogDiff = masked
-        ? { added: [], removed: [], changed: [] }
-        : { added: v.diff.added.filter(visible), removed: v.diff.removed.filter(visible), changed: v.diff.changed.filter(visible) };
-      return {
-        version: v.version,
-        at: v.createdAt.toISOString(),
-        /** 查看者看到的数据源相关原因统一为 sources，不暴露具体动作 */
-        reason: masked ? 'sources' : v.reason,
-        reasonLabel: masked ? '数据源结构变化' : REASON_LABELS[v.reason as CatalogVersionReason] ?? v.reason,
-        masked,
-        diff,
-      };
-    }),
+    versions: versions.map(v => ({
+      version: v.version,
+      at: v.createdAt.toISOString(),
+      /** 查看者看到的数据源相关原因统一为 sources，不暴露具体动作 */
+      reason: v.reason,
+      reasonLabel: v.masked ? '数据源结构变化' : REASON_LABELS[v.reason as CatalogVersionReason] ?? v.reason,
+      masked: v.masked,
+      diff: v.diff,
+    })),
   };
 }
 
