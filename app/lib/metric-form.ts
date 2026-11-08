@@ -40,15 +40,22 @@ export interface MetricForm {
 
 /** 按字段类型可用的过滤运算（label 取词汇表的中文说明）：boolean 只有等于 / 不等于 / 判空，string 没有大小比较，数字与时间全部 */
 export function opsFor(type: FieldType): { op: (typeof FILTER_OPS)[number]; label: string }[] {
-  const ops: readonly (typeof FILTER_OPS)[number][] = type === 'boolean'
-    ? ['eq', 'ne', 'is_null', 'not_null']
-    : type === 'string' ? ['eq', 'ne', 'in', 'not_in', 'is_null', 'not_null'] : FILTER_OPS;
-  return ops.map(op => ({ op, label: FILTER_OP_TEXT[op] }));
+  const ops: Partial<Record<FieldType, readonly (typeof FILTER_OPS)[number][]>> = {
+    boolean: ['eq', 'ne', 'is_null', 'not_null'],
+    string: ['eq', 'ne', 'in', 'not_in', 'is_null', 'not_null'],
+  };
+  return (ops[type] ?? FILTER_OPS).map(op => ({ op, label: FILTER_OP_TEXT[op] }));
 }
 
 const UNKNOWN = '这种写法表单不认识，请在 YAML 里修改';
 const PATH_REASON = '字段是路径（沿关系走到别的实体，ADR-0038），请在 YAML 里修改';
 const DIM_PATH_REASON = '维度路径沿关系走（-> 或 consumer.），请在 YAML 里修改';
+
+/** 表单表达不了、但认识的顶层键 */
+const TOP_REASON: Record<string, string> = {
+  consumer_via: '基础实体经哪个字段一跳关联消费者（consumer_via），请在 YAML 里修改',
+  device_attribution: '匿名事件的设备归属（device_attribution），请在 YAML 里修改',
+};
 
 /** measure / filter / window 的字段里含 . 或 -> 就是路径，不是基础实体上的裸字段名 */
 const fieldIsPath = (s: string) => s.includes('.') || s.includes('->');
@@ -132,13 +139,7 @@ export function yamlToForm(text: string, fields: FormField[]): MetricForm {
   const form: MetricForm = { base: baseName, agg: 'count', filter: [], dimensions: [], readonly };
   for (const [k, val] of Object.entries(top)) {
     if (['base', 'measure', 'filter', 'window', 'dimensions', 'description'].includes(k)) continue;
-    readonly.push({
-      key: k,
-      reason: k === 'consumer_via' ? '基础实体经哪个字段一跳关联消费者（consumer_via），请在 YAML 里修改'
-        : k === 'device_attribution' ? '匿名事件的设备归属（device_attribution），请在 YAML 里修改'
-        : `不认识的键 ${k}，请在 YAML 里修改`,
-      raw: val,
-    });
+    readonly.push({ key: k, reason: TOP_REASON[k] ?? `不认识的键 ${k}，请在 YAML 里修改`, raw: val });
   }
   const m = top.measure;
   if (typeof m !== 'object' || m === null || Array.isArray(m)) {
@@ -197,7 +198,8 @@ function valueOf(cond: Cond, fields: Map<string, FormField>): string | number | 
     if (type === 'boolean' && (v === 'true' || v === 'false')) return v === 'true';
     return v;
   };
-  return Array.isArray(cond.value) ? cond.value.map(one) : cond.value !== undefined ? one(cond.value) : undefined;
+  if (Array.isArray(cond.value)) return cond.value.map(one);
+  return cond.value === undefined ? undefined : one(cond.value);
 }
 
 /** 过滤列表写成 YAML：每条 field、op，要写 value 的按字段类型转换后带上 */
@@ -292,10 +294,11 @@ function measurePhrase(form: MetricForm, fields: readonly FormField[]): string {
   const label = (name: string | undefined) => name === undefined ? '' : labelOf(name, fields);
   const count = (field: string | undefined) => field === undefined ? '行数' : `${label(field)}不为空的行数`;
   if (form.agg === 'ratio') {
-    const part = (p: RatioForm | undefined) => p === undefined ? ''
-      : p.agg === 'count' ? count(p.field)
-      : p.agg === 'count_distinct' ? `${label(p.field)}的不同取值个数`
-      : `${label(p.field)}求和`;
+    const part = (p: RatioForm | undefined) => {
+      if (p === undefined) return '';
+      if (p.agg === 'count') return count(p.field);
+      return p.agg === 'count_distinct' ? `${label(p.field)}的不同取值个数` : `${label(p.field)}求和`;
+    };
     return `分子${part(form.numerator)} ÷ 分母${part(form.denominator)}`;
   }
   const phrase: Record<Exclude<(typeof AGGS)[number], 'ratio'>, () => string> = {
