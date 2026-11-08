@@ -16,7 +16,7 @@ import { vectorHits } from './embeddings';
 import { haystack, search, type Catalog, type CatalogEntry } from './index';
 import { tenantCatalog } from './load';
 import { rank, type Ranked, type RankScope } from './rank';
-import { catalogChangesSince, stripStats } from './versions';
+import { catalogChangesSince, stripStats, type CatalogVersionReason } from './versions';
 
 /** 请求里同步刷新的净差异条目数上限，超过时交给调度器任务 */
 export const PROJECTION_SYNC_LIMIT = 200;
@@ -30,21 +30,25 @@ export type ProjectionRow = Omit<typeof catalogProjection.$inferSelect, 'tenantI
 /** 成员角色对应的可见性类别：有 sources:read 是 full，否则 restricted */
 export const visibilityClass = (role: Role): ProjectionClass => can(role, 'sources:read') ? 'full' : 'restricted';
 
-/** 按可见性类别裁剪目录：restricted 去掉数据源与源表条目，字段不带来源、实体不列映射到它的源表与合并组 */
+/** restricted 类别整个看不到的条目种类：数据源与源表（ADR-0005）。visibleCatalog 与 catalogChangesFor 共用 */
+export const RESTRICTED_HIDDEN_KINDS: ReadonlySet<CatalogEntry['kind']> = new Set(['source', 'table']);
+
+/** restricted 类别要清空的顶层键，按条目种类区分：实体不列映射到它的源表与合并组，字段不带来源 */
+export const RESTRICTED_CLEARED_KEYS: Partial<Record<CatalogEntry['kind'], ReadonlySet<string>>> = {
+  entity: new Set(['tables', 'unscoped', 'mergeGroups']),
+  field: new Set(['lineage']),
+};
+
+/** restricted 里只显示「数据源结构变化」、不列明细的版本原因（变更记录页共用这套规则） */
+export const SOURCE_REASONS: ReadonlySet<CatalogVersionReason> = new Set<CatalogVersionReason>(['source_view.published', 'source.scope_changed', 'source.registered', 'source.updated', 'source.deleted', 'source.profiled', 'source.synced']);
+
+/** 按可见性类别裁剪目录：restricted 按 RESTRICTED_HIDDEN_KINDS 去掉条目、按 RESTRICTED_CLEARED_KEYS 清空顶层键 */
 export function visibleCatalog(c: Catalog, cls: ProjectionClass): Catalog {
   if (cls === 'full') return c;
   const entries = c.entries.flatMap((e): CatalogEntry[] => {
-    switch (e.kind) {
-      case 'source':
-      case 'table':
-        return [];
-      case 'field':
-        return [{ ...e, lineage: [] }];
-      case 'entity':
-        return [{ ...e, tables: [], unscoped: [], mergeGroups: [] }];
-      default:
-        return [e];
-    }
+    if (RESTRICTED_HIDDEN_KINDS.has(e.kind)) return [];
+    const cleared = RESTRICTED_CLEARED_KEYS[e.kind];
+    return [cleared ? { ...e, ...Object.fromEntries([...cleared].map(k => [k, []])) } as CatalogEntry : e];
   });
   return { ...c, entries };
 }

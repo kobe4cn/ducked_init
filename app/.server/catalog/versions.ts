@@ -2,11 +2,14 @@
 // 版本由 catalogTx 在成员事务的收尾记一次（ADR-0054；recordAudit 只登记白名单动作，见 catalog/tx.ts），
 // 调度器在采集与同步成功后、tenantCatalog 在读取时也各比较一次：重新生成目录、去掉统计，和上一版的快照按条目标识比较，有差异才记新版本
 import { and, desc, eq, gt, sql } from 'drizzle-orm';
+import type { CurrentMember } from '../auth';
 import type { AuditAction, Tx } from '../audit';
 import { getDb } from '../db/client';
 import { catalogVersions, tenants } from '../db/schema';
 import { buildCatalog, type Catalog, type CatalogEntry } from './index';
 import { loadCatalogInput } from './load';
+// projection.ts 也从本文件导入：这个环只能在函数体里用它的绑定，不能在模块顶层求值
+import { RESTRICTED_CLEARED_KEYS, RESTRICTED_HIDDEN_KINDS, SOURCE_REASONS, visibilityClass } from './projection';
 
 /**
  * 一版目录的原因：白名单审计动作，采集 / 同步后发现源表结构变了（source.profiled / source.synced），
@@ -135,10 +138,52 @@ export async function catalogChangesSince(db: Tx | ReturnType<typeof getDb>, ten
   return { current: current?.version ?? null, versions, net: diffCatalog(base?.snapshot ?? [], current?.snapshot ?? []) };
 }
 
-/** 版本 since 之后最新的 limit 个版本（新的在前）与当前版本号；不读快照、不算净差异，供变更记录页面用 */
-export async function recentCatalogChanges(db: Tx | ReturnType<typeof getDb>, tenantId: string, since: number, limit: number) {
+/** 版本 since 之后最新的 limit 个版本（新的在前）与当前版本号；不读快照、不算净差异，只供 catalogChangesFor 用 */
+async function recentCatalogChanges(db: Tx | ReturnType<typeof getDb>, tenantId: string, since: number, limit: number) {
   const versions = await versionsAfter(db, tenantId, since).orderBy(desc(catalogVersions.version)).limit(limit);
   const [current] = await db.select({ version: catalogVersions.version }).from(catalogVersions)
     .where(eq(catalogVersions.tenantId, tenantId)).orderBy(desc(catalogVersions.version)).limit(1);
   return { current: current?.version ?? null, versions };
+}
+
+/** 变更记录页给成员看的一版：查看者的数据源相关原因统一为 sources（masked，不列明细）；差异按 visibleCatalog 的规则裁剪 */
+export interface CatalogChangesForMember {
+  current: number | null;
+  versions: { version: number; reason: CatalogVersionReason | 'sources'; masked: boolean; createdAt: Date; diff: CatalogDiff }[];
+}
+
+/**
+ * 按成员的可见性类别裁剪的变更记录（与 visibleCatalog 共用规则，ADR-0047）：full 原样返回；
+ * restricted 去掉数据源与源表条目，changed 的 keys 去掉该种类要清空的键、去掉后为空的条目整条不显示，
+ * 与数据源有关的原因（SOURCE_REASONS）统一返回 sources 并清空差异（ADR-0005）
+ */
+export async function catalogChangesFor(member: CurrentMember, since: number, limit: number): Promise<CatalogChangesForMember> {
+  const { current, versions } = await recentCatalogChanges(getDb(), member.tenant.id, since, limit);
+  // reason 列是 text，写进去的原因都来自白名单（recordCatalogVersion 的 reason 参数），这里收窄回 CatalogVersionReason
+  const rows = versions.map(({ reason, ...v }) => ({ ...v, reason: reason as CatalogVersionReason }));
+  if (visibilityClass(member.role) === 'full') {
+    return { current, versions: rows.map(v => ({ ...v, masked: false })) };
+  }
+  return {
+    current,
+    versions: rows.map(v => {
+      if (SOURCE_REASONS.has(v.reason)) {
+        // 查看者看到的数据源相关原因统一为 sources，不暴露具体动作与明细
+        return { ...v, reason: 'sources' as const, masked: true, diff: { added: [], removed: [], changed: [] } };
+      }
+      return {
+        ...v,
+        masked: false,
+        diff: {
+          added: v.diff.added.filter(x => !RESTRICTED_HIDDEN_KINDS.has(x.kind)),
+          removed: v.diff.removed.filter(x => !RESTRICTED_HIDDEN_KINDS.has(x.kind)),
+          changed: v.diff.changed.flatMap(x => {
+            if (RESTRICTED_HIDDEN_KINDS.has(x.kind)) return [];
+            const keys = x.keys.filter(k => !RESTRICTED_CLEARED_KEYS[x.kind]?.has(k));
+            return keys.length ? [{ ...x, keys }] : [];
+          }),
+        },
+      };
+    }),
+  };
 }

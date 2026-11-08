@@ -78,6 +78,27 @@ describe('目录变更记录', () => {
     expect(viewer).not.toContain('源视图发布');
   });
 
+  it('查看者看不到只有 tables 变了的实体改动；tables 与其他键一起变时只显示其他键', async () => {
+    const gamma = await newTenant('gamma');
+    await getDb().insert(catalogVersions).values([
+      { tenantId: gamma, version: 1, snapshot: [], reason: 'mapping.published',
+        diff: { added: [], removed: [], changed: [{ id: 'entity:order', kind: 'entity' as const, name: '订单', keys: ['tables'] }] } },
+      { tenantId: gamma, version: 2, snapshot: [], reason: 'mapping.published',
+        diff: { added: [], removed: [], changed: [{ id: 'entity:customer', kind: 'entity' as const, name: '客户', keys: ['tables', 'description'] }] } },
+    ]);
+
+    const admin = await (await (await loginAs(app, 'admin@gamma.com')).get('/catalog/changes')).text();
+    expect(admin).toContain('data-diff-id="entity:order"');
+    expect(admin).toContain('变了：tables');
+
+    await memberOf(gamma, 'viewer@gamma.com', 'viewer');
+    const viewer = await (await (await loginAs(app, 'viewer@gamma.com')).get('/catalog/changes')).text();
+    expect(viewer).not.toContain('data-diff-id="entity:order"');
+    expect(viewer).toContain('data-diff-id="entity:customer"');
+    expect(viewer).toContain('变了：description');
+    expect(viewer).not.toContain('变了：tables');
+  });
+
   it('删除数据源的版本显示「数据源删除」，查看者只看到「数据源结构变化」、不列明细', async () => {
     const beta = await newTenant('beta');
     await getDb().insert(catalogVersions).values({
