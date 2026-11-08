@@ -36,9 +36,10 @@ export const currentCatalogTx = (): CatalogTxContext | undefined => storage.getS
 export async function catalogTx<T>(tenantId: string, fn: (tx: Tx) => Promise<T>): Promise<T> {
   const outer = storage.getStore();
   if (outer) throw new Error(`嵌套 catalogTx：外层租户 ${outer.tenantId}，内层租户 ${tenantId}`);
-  return getDb().transaction(tx => storage.run({ tenantId, actions: [] }, async () => {
+  const ctx: CatalogTxContext = { tenantId, actions: [] };
+  return getDb().transaction(tx => storage.run(ctx, async () => {
     const result = await fn(tx);
-    const { actions } = storage.getStore()!;
+    const { actions } = ctx;
     if (actions.length) {
       const { recordCatalogVersion } = await import('./versions'); // 为什么动态 import：见头注释
       await recordCatalogVersion(tx, tenantId, actions[0]!);

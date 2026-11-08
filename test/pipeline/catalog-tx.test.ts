@@ -74,7 +74,7 @@ describe('catalogTx：成员事务收尾时记一版目录版本', () => {
     const other = await setup('globex');
     await expect(catalogTx(tenantId, tx =>
       addAliasTx(tx, other.analyst, { targetId: 'entity:order', alias: '交易单' }),
-    )).rejects.toThrow(/租户/);
+    )).rejects.toThrow(/审计了租户/);
     expect(await latestVersion(tenantId)).toBeUndefined();
     expect(await latestVersion(other.tenantId)).toBeUndefined();
     expect((await getDb().select().from(auditLogs).where(eq(auditLogs.tenantId, other.tenantId)))
