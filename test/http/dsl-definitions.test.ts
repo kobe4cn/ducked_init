@@ -141,7 +141,9 @@ describe('指标与标签定义页', () => {
     const detail = await (await analyst.get('/analytics/definitions/metric/paid_amount_30d')).text();
     const fields = entityOf('order')!.fields.map(f => ({ name: f.name, type: f.type }));
     expect(detail).toContain(formToYaml(form, fields));
+    expect(detail).toContain('第 1 版草稿');
     expect(detail).toContain('SUM(b.&quot;amount&quot;)');
+    expect((await getDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'paid_amount_30d')).draft).toMatchObject({ version: 1, yaml: formToYaml(form, fields) });
   });
 
   it('分析页「新建标签」进到标签种类的新建页；引用未发布的指标时按行列列出问题，种类不存在时 404', async () => {
