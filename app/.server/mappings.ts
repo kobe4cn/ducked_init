@@ -1,5 +1,6 @@
 // app/.server/mappings.ts —— 映射：数据工程师用 YAML 编写“源表（或已发布的源视图，ADR-0023）→ 标准实体”的映射，校验通过才能保存为草稿；草稿由最后保存它的人以外的
-// 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。发布后为这个映射入队合并任务（silver.merge），同步给已发布映射的源表写入变更后也为这些映射再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
+// 另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本），发布后版本锁定（再改是新的一版草稿）。保存草稿、发布与丢弃的流程（双人发布、版本与审计）在
+// publishing.ts（ADR-0051），本文件提供 mappingAdapter 接入。发布后为这个映射入队合并任务（silver.merge），同步给已发布映射的源表写入变更后也为这些映射再合并一次，把原始层的变更批次合并进标准层（ADR-0015）。
 // 源表新增的列可一键加为扩展字段，写进草稿（或最新已发布版本）的 YAML 填进编辑框，不保存；也可标记为有意不映射（忽略），不再提醒并记审计。
 // 编辑时可对任一版本空跑：在请求内只读挂载本租户的数据湖，转换原始层的样本，返回样例行与基础断言，不写标准层（pipeline/dry-run-engine.ts）。
 // 一律限定在操作者所属租户内；合并本身在工作进程里进行（pipeline/merge-engine.ts）
@@ -29,7 +30,9 @@ import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue,
 import type { Rename } from './pipeline/schema-repair';
 import { diffColumns } from './pipeline/schema-diff';
 import { publishedMergeGroups } from './merge-groups';
-import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
+import {
+  discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, saveDraft as savePublishable, type PublishableAdapter,
+} from './publishing';
 import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
 import { mappingDrift } from './source-drift';
@@ -41,9 +44,9 @@ import { entityForTable } from '../lib/field-synonyms';
 import { diffPlans } from '../lib/mapping-diff';
 import { newExtension, readExtensions, writeExtension } from '../lib/mapping-form';
 
-/** 可以展示给成员的业务错误；issues 是映射文档里带行列位置的问题 */
-export class MappingError extends Error {
-  constructor(message: string, readonly status: 400 | 403 | 404 | 422 = 400, readonly issues: MappingIssue[] = []) { super(message); }
+/** 可以展示给成员的业务错误；issues 是映射文档里带行列位置的问题。发布流程本身的错误（PublishError）由它继承（ADR-0051） */
+export class MappingError extends PublishError {
+  constructor(message: string, status: 400 | 403 | 404 | 422 = 400, readonly issues: MappingIssue[] = []) { super(message, status); }
 }
 
 /** 映射详情的合并历史取最近多少次带这个映射的合并任务 */
@@ -590,43 +593,26 @@ export async function saveDraft(actor: CurrentMember, mappingId: string, yaml: s
   return (await saveMappingDraft(actor, mappingId, yaml)).version;
 }
 
-/** 同 saveDraft，另返回检查的 notices（不拦保存的提示，编辑页显示） */
+/**
+ * 同 saveDraft，另返回检查的 notices（不拦保存的提示，编辑页显示）。版本与审计经 publishing.ts（mappingAdapter），
+ * 校验（checkMappingEdit）照旧在事务外、校验出的 plan 放进 ctx 由 checkSave 写进版本表；
+ * 从生成草稿开始改过的（ADR-0003、ADR-0035）在同一事务里比对生成稿记审计（在起草审计之后，不符时整个保存回滚）
+ */
 export async function saveMappingDraft(
   actor: CurrentMember, mappingId: string, yaml: string, opts?: { generationId?: string },
 ): Promise<{ version: number; notices: MappingIssue[] }> {
   assertCan(actor, 'sources:write');
-  const mapping = await requireMapping(actor.tenant.id, mappingId);
+  const ctx = await mappingCtx(actor, mappingId);
   const registrations = await publishedCustomEntities(getDb(), actor.tenant.id);
-  const { plan, notices } = await checkMappingEdit(actor.tenant.id, mapping, yaml, registrations);
-  const saved = await getDb().transaction(async tx => {
-    // 锁住映射行；等锁期间映射可能因丢弃草稿被删除
-    const [locked] = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
-    if (!locked) throw new MappingError('映射不存在', 404);
-    const [latest] = await tx.select().from(mappingVersions).where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version)).limit(1);
+  const { plan, notices } = await checkMappingEdit(actor.tenant.id, ctx.mapping, yaml, registrations);
+  ctx.plan = plan;
+  const version = await getDb().transaction(async tx => {
+    const saved = await savePublishable(mappingAdapter, actor, ctx, yaml, tx);
     // 生成稿的比对与「起草」审计无关：改已有草稿也要记
-    const recordEdit = (version: number) => opts?.generationId
-      ? recordGenerationEdit(tx, actor, opts.generationId, { mapping, version, plan, registrations })
-      : Promise.resolve();
-    if (latest?.status === 'draft') {
-      await tx.update(mappingVersions).set({ yaml, plan, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() }).where(eq(mappingVersions.id, latest.id));
-      await recordEdit(latest.version);
-      return latest.version;
-    }
-    const version = (latest?.version ?? 0) + 1;
-    await tx.insert(mappingVersions).values({ mappingId, version, yaml, plan, authors: [actor.email], lastEditor: actor.email });
-    const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'mapping.drafted',
-      targetType: 'mapping',
-      targetId: mappingId,
-      detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version },
-    });
-    await recordEdit(version);
-    return version;
+    if (opts?.generationId) await recordGenerationEdit(tx, actor, opts.generationId, { mapping: ctx.mapping, version: saved, plan, registrations });
+    return saved;
   });
-  return { version: saved, notices };
+  return { version, notices };
 }
 
 /**
@@ -826,55 +812,85 @@ async function assertPublishable(tx: Tx, tenantId: string, mapping: typeof mappi
   await assertMetricFields(tx, tenantId, mapping.id, plan);
 }
 
+/** mappingAdapter 的上下文：租户、映射行（parentId 是它的 ID）与所属数据源名（审计用）。plan 是校验出的合并计划：入口算好或 checkOutside 重校验时写进 ctx，checkInside 读它（同一个 ctx 对象，见 #468 决定评论）；registrations 只有一键直通带上（对照同一事务里刚发布的登记） */
+export interface MappingCtx {
+  tenantId: string;
+  parentId: string;
+  mapping: typeof mappings.$inferSelect;
+  sourceName: string;
+  registrations?: Map<string, RegisteredEntity>;
+  plan?: MergePlan;
+}
+
+/** 定位本租户的一个映射并带上所属数据源名，给 publishing.ts 的流程当上下文；不存在时 404 */
+export async function mappingCtx(actor: CurrentMember, mappingId: string): Promise<MappingCtx> {
+  const mapping = await requireMapping(actor.tenant.id, mappingId);
+  const [source] = await getDb().select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
+  return { tenantId: actor.tenant.id, parentId: mapping.id, mapping, sourceName: source.name };
+}
+
+/** enqueueMerge 入队的合并任务；合并在运行时返回 null，由调度器在它之后补上（publishMapping 的返回值） */
+type QueuedMerge = Awaited<ReturnType<typeof enqueueMerge>>;
+
+/** mappingVersions 的内容列：发布流程里 checkOutside 收到的草稿带上它 */
+type MappingDraft = DraftRow & { yaml: string };
+
+/**
+ * 映射接入 publishing.ts 的适配器（ADR-0051）：保存的事务外检查（checkMappingEdit）由入口完成，校验出的 plan 经 ctx 带进 checkSave 写进版本表；
+ * 发布的事务外检查（checkOutside）重新校验文档并把重校验出的 plan 写回 ctx，事务内检查（锁内）跑 assertPublishable 并把 plan 写回版本行
+ * （publish() 只改状态列）。发布后同一事务里为这个映射入队一次合并（返回 null 时由调度器补上，不拦发布），审计在入队之后（ADR-0047）。
+ * 锁租户行：保存、丢弃也与发布、入队合并互斥
+ */
+export const mappingAdapter: PublishableAdapter<MappingCtx, string, void, QueuedMerge> = {
+  parent: mappings,
+  versions: mappingVersions,
+  versionsFk: mappingVersions.mappingId,
+  lockTenant: true,
+  lockParent: async (tx, ctx) => {
+    const [locked] = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, ctx.parentId)).for('update');
+    if (!locked) throw new MappingError('映射不存在', 404);
+    return locked.id;
+  },
+  checkSave: async (ctx, yaml) => ({ yaml, plan: ctx.plan }),
+  checkOutside: async (draft, ctx) => {
+    const { plan } = await checkMappingDraft(ctx.tenantId, ctx.mapping.sourceId, (draft as MappingDraft).yaml, ctx.registrations);
+    ctx.plan = plan;
+  },
+  checkInside: async (tx, draft, ctx) => {
+    await assertPublishable(tx, ctx.tenantId, ctx.mapping, ctx.plan!);
+    await tx.update(mappingVersions).set({ plan: ctx.plan }).where(eq(mappingVersions.id, draft.id));
+  },
+  afterPublish: (tx, _draft, ctx) => enqueueMerge(tx, ctx.tenantId, [ctx.mapping.id]),
+  audit: {
+    drafted: {
+      action: 'mapping.drafted',
+      detail: (ctx, _columns, version) => ({ source: ctx.sourceName, table: ctx.mapping.tableName, entity: ctx.mapping.entity, version }),
+    },
+    published: {
+      action: 'mapping.published',
+      detail: (ctx, draft) => ({
+        source: ctx.sourceName, table: ctx.mapping.tableName, entity: ctx.mapping.entity,
+        version: draft.version, authors: draft.authors, lastEditor: draft.lastEditor,
+      }),
+    },
+    discarded: {
+      action: 'mapping.draft_discarded',
+      detail: (ctx, version, published) => ({ source: ctx.sourceName, table: ctx.mapping.tableName, entity: ctx.mapping.entity, version, published }),
+    },
+    targetType: 'mapping',
+  },
+  missingVersion: version => `没有第 ${version} 版`,
+  noDraft: () => '这个映射没有草稿',
+};
+
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。发布前对照数据源当前的字段再校验一次。
- * 发布后版本锁定，并为这个映射入队一次合并（已有合并在排队时补进那个合并，在运行时由调度器在它之后补上）
+ * 发布后版本锁定，并为这个映射入队一次合并（已有合并在排队时补进那个合并，在运行时由调度器在它之后补上）。
+ * 流程（双人规则、过期检查、审计）在 publishing.ts；返回入队的合并任务或 null
  */
 export async function publishMapping(actor: CurrentMember, mappingId: string, version: number) {
   assertCan(actor, 'publish');
-  const mapping = await requireMapping(actor.tenant.id, mappingId);
-  const [draft] = await getDb().select().from(mappingVersions)
-    .where(and(eq(mappingVersions.mappingId, mappingId), eq(mappingVersions.version, version)));
-  if (!draft) throw new MappingError(`没有第 ${version} 版`, 404);
-  const blocker = publishBlocker(actor, draft);
-  if (blocker) throw new MappingError(blocker, draft.status === 'draft' ? 403 : 400);
-  const { plan } = await checkMappingDraft(actor.tenant.id, mapping.sourceId, draft.yaml);
-  return getDb().transaction(async tx => {
-    // 先锁住租户行（入队合并也锁它）：与入队合并、定时检查互斥
-    await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, actor.tenant.id)).for('update');
-    return publishMappingDraft(tx, actor, mapping, draft, plan);
-  });
-}
-
-/**
- * 在调用方的事务里发布检查过的这份草稿（plan 是发布前对照数据源当前的字段校验出的），记审计并入队合并，返回合并任务（同 enqueueMerge）。
- * 调用方须已锁住租户行；这里锁映射行。等锁期间草稿被修改、发布或丢弃，或扩展字段类型、身份打通规则与已发布映射冲突、引用字段没写同源目标实体（跨源引用为目标数据源 customer）的键空间、改了 customer 键空间使别的数据源的跨源引用失效时抛出 MappingError。
- * 发布权限与双人发布由调用方检查（publishMapping，以及一键直通里登记与映射一起发布）
- */
-export async function publishMappingDraft(
-  tx: Tx, actor: CurrentMember, mapping: typeof mappings.$inferSelect, draft: typeof mappingVersions.$inferSelect, plan: MergePlan,
-) {
-  // 锁住映射行：与保存草稿互斥，发布的正是检查过的那份草稿
-  await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mapping.id)).for('update');
-  // 等锁期间草稿可能已被丢弃
-  const [current] = await tx.select().from(mappingVersions).where(eq(mappingVersions.id, draft.id));
-  if (isStale(current, draft)) {
-    throw new MappingError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
-  }
-  await assertPublishable(tx, actor.tenant.id, mapping, plan);
-  await tx.update(mappingVersions)
-    .set({ status: 'published', plan, publishedByEmail: actor.email, publishedAt: sql`now()` })
-    .where(eq(mappingVersions.id, draft.id));
-  const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
-  await recordAudit(tx, {
-    tenantId: actor.tenant.id,
-    actor,
-    action: 'mapping.published',
-    targetType: 'mapping',
-    targetId: mapping.id,
-    detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version: draft.version, authors: draft.authors, lastEditor: draft.lastEditor },
-  });
-  return enqueueMerge(tx, actor.tenant.id, [mapping.id]);
+  return publish(mappingAdapter, actor, await mappingCtx(actor, mappingId), version);
 }
 
 /**
@@ -883,29 +899,7 @@ export async function publishMappingDraft(
  */
 export async function discardDraft(actor: CurrentMember, mappingId: string) {
   assertCan(actor, 'sources:write');
-  return getDb().transaction(async tx => {
-    const mapping = await requireMapping(actor.tenant.id, mappingId, tx);
-    // 锁住映射行：与保存、发布互斥
-    await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.id, mappingId)).for('update');
-    const versions = await tx.select({ id: mappingVersions.id, version: mappingVersions.version, status: mappingVersions.status })
-      .from(mappingVersions).where(eq(mappingVersions.mappingId, mappingId)).orderBy(desc(mappingVersions.version));
-    const draft = versions.find(v => v.status === 'draft');
-    if (!draft) throw new MappingError('这个映射没有草稿');
-    const published = versions.find(v => v.status === 'published')?.version ?? null;
-    // 从没发布过时删除映射，各版本随之级联删除
-    if (published) await tx.delete(mappingVersions).where(eq(mappingVersions.id, draft.id));
-    else await tx.delete(mappings).where(eq(mappings.id, mappingId));
-    const [source] = await tx.select({ name: sources.name }).from(sources).where(eq(sources.id, mapping.sourceId));
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'mapping.draft_discarded',
-      targetType: 'mapping',
-      targetId: mappingId,
-      detail: { source: source.name, table: mapping.tableName, entity: mapping.entity, version: draft.version, published },
-    });
-    return { kept: published !== null };
-  });
+  return discard(mappingAdapter, actor, await mappingCtx(actor, mappingId));
 }
 
 /**

@@ -15,7 +15,7 @@ import {
 } from './custom-entities';
 import { getDb } from './db/client';
 import { customEntities, customEntityVersions, mappings, mappingVersions, sources, tenants } from './db/schema';
-import { checkMappingDraft, createMapping, MappingError, profiledTables, publishMappingDraft, requireMapping } from './mappings';
+import { checkMappingDraft, createMapping, mappingAdapter, mappingCtx, MappingError, profiledTables } from './mappings';
 import { draftCustomMapping, DraftError, fieldNameFor } from './pipeline/mapping-draft';
 import type { TableProfile } from './pipeline/source-engine';
 import { isStale, publish } from './publishing';
@@ -135,7 +135,8 @@ export async function publishPassthrough(actor: CurrentMember, entityId: string,
   assertCan(actor, 'publish');
   const tenantId = actor.tenant.id;
   const entity = await requireEntity(tenantId, entityId);
-  const mapping = await requireMapping(tenantId, mappingId).catch(rethrow);
+  const ctx = await mappingCtx(actor, mappingId).catch(rethrow);
+  const { mapping } = ctx;
   if (mapping.entity !== entity.name) throw new CustomEntityError(`映射的目标是 ${mapping.entity}，不是 ${entity.name}`);
   const [entityDraft] = await getDb().select(getTableColumns(customEntityVersions)).from(customEntityVersions)
     .where(and(eq(customEntityVersions.entityId, entityId), eq(customEntityVersions.version, entityVersion)));
@@ -155,16 +156,18 @@ export async function publishPassthrough(actor: CurrentMember, entityId: string,
     name: entity.name, label: entityDraft.label, kind: entityDraft.kind, fields: entityDraft.fields, primaryKey: entityDraft.primaryKey,
   };
   const registry = new Map(await publishedCustomEntities(getDb(), tenantId)).set(entity.name, draftRegistration);
-  const { plan } = await checkMappingDraft(tenantId, mapping.sourceId, mappingDraft.yaml, registry).catch(rethrow);
+  // 只为提前报错（发布哪一版在事务里还会再查一次）；plan 不带出去，mappingAdapter 的 checkOutside 重校验出新的
+  await checkMappingDraft(tenantId, mapping.sourceId, mappingDraft.yaml, registry).catch(rethrow);
   return getDb().transaction(async tx => {
-    // 锁的顺序同单独发布：租户行（入队合并也锁它）、实体行、映射行（publishMappingDraft 里）
+    // 锁的顺序同单独发布：租户行（入队合并也锁它）、实体行、映射行（mappingAdapter 的 lockParent 里）
     await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
     await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
     // publish() 的草稿是在拿到锁之后才读的，等锁期间草稿被改就发现不了：拿锁后先对照预检过的这份查一次过期
     const [current] = await tx.select().from(customEntityVersions).where(eq(customEntityVersions.id, entityDraft.id));
     if (isStale(current, entityDraft)) throw new CustomEntityError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
     await publish(customEntityAdapter, actor, { tenantId, parentId: entity.id, name: entity.name }, entityVersion, tx);
-    return publishMappingDraft(tx, actor, mapping, mappingDraft, plan).catch(rethrow);
+    // registrations 要带上：checkOutside 用 getDb() 读，看不到同一事务里刚发布的登记
+    return publish(mappingAdapter, actor, { ...ctx, registrations: registry }, mappingVersion, tx).catch(rethrow);
   });
 }
 
