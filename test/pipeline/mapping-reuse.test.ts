@@ -5,7 +5,8 @@ import { parse } from 'yaml';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs } from '../../app/.server/db/schema';
-import { createMapping, draftFor, dryRunMapping, MappingError, profiledTables, publishMapping } from '../../app/.server/mappings';
+import { createMapping, draftFor, dryRunMapping, profiledTables, publishMapping } from '../../app/.server/mappings';
+import { PublishError } from '../../app/.server/publishing';
 import { draftMapping } from '../../app/.server/pipeline/mapping-draft';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, getSource, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
@@ -103,7 +104,7 @@ describe('复用已发布映射', () => {
     const dry = await dryRunMapping(author, mapping.id, 1);
     expect(dry.rows).toHaveLength(50);
 
-    await expect(publishMapping(author, mapping.id, 1)).rejects.toBeInstanceOf(MappingError);
+    await expect(publishMapping(author, mapping.id, 1)).rejects.toBeInstanceOf(PublishError);
     await expect(publishMapping(reviewer, mapping.id, 1)).resolves.not.toThrow();
   });
 });

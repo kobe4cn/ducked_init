@@ -10,6 +10,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, mappingGenerations } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
 import { createMapping, draftFor, dryRunMapping, MappingError, modelAssertionsForMapping, modelDraftFor, modelDraftForMapping, publishMapping, saveMappingDraft } from '../../app/.server/mappings';
+import { PublishError } from '../../app/.server/publishing';
 import { modelDraftMessages } from '../../app/.server/pipeline/model-draft';
 import { tableContextFor } from '../../app/.server/model-provider';
 import { syncSource } from '../../app/.server/source-sync';
@@ -184,7 +185,7 @@ describe('用模型生成映射草稿', () => {
     const dry = await dryRunMapping(author, mapping.id, 1);
     expect(dry.rows).toHaveLength(50);
 
-    await expect(publishMapping(author, mapping.id, 1)).rejects.toBeInstanceOf(MappingError);
+    await expect(publishMapping(author, mapping.id, 1)).rejects.toBeInstanceOf(PublishError);
     await expect(publishMapping(reviewer, mapping.id, 1)).resolves.not.toThrow();
   });
 
@@ -355,7 +356,7 @@ describe('用模型建议断言', () => {
     await drain();
     const dry = await dryRunMapping(author, mapping.id, 1);
     expect(dry.assertions.custom.map(a => a.name)).toEqual(['custom:order_id:not_null', 'custom:amount:range', 'custom:status:in']);
-    await expect(publishMapping(author, mapping.id, 1)).rejects.toBeInstanceOf(MappingError);
+    await expect(publishMapping(author, mapping.id, 1)).rejects.toBeInstanceOf(PublishError);
     await expect(publishMapping(reviewer, mapping.id, 1)).resolves.not.toThrow();
   });
 
