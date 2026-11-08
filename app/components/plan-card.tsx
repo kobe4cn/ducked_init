@@ -32,12 +32,13 @@ export function PlanCard({ card, workbenchSql, onFollowUp }: { card: PlanCardVie
   // 整卡的颜色与标题跟着分支走（颜色不是唯一信号，标题与图标同时区分）
   let tone = '';
   let title = '计划需要重新确认';
-  if (unsupported) { tone = 'border-red-200 bg-red-50 text-red-600'; title = '这个要求做不到'; }
+  let titleColor = 'text-amber-700';
+  if (unsupported) { tone = 'border-red-200 bg-red-50 text-red-600'; title = '这个要求做不到'; titleColor = 'text-red-600'; }
   else if (clarify) { tone = 'border-amber-200 bg-amber-50 text-amber-700'; title = '计划需要补充信息'; }
-  else if (ok) { title = '计划已通过校验'; }
+  else if (ok) { title = '计划已通过校验'; titleColor = 'text-emerald-600'; }
   return (
     <div data-plan-card data-status={card.status} className={`mt-2 space-y-2 rounded-lg border p-3 text-xs ${tone}`}>
-      <p className={`flex items-center gap-1.5 font-medium ${unsupported ? 'text-red-600' : ok ? 'text-emerald-600' : 'text-amber-700'}`}>
+      <p className={`flex items-center gap-1.5 font-medium ${titleColor}`}>
         {ok ? <CheckCircle2 className="size-4 shrink-0" /> : <AlertTriangle className="size-4 shrink-0" />}
         {title}
       </p>
@@ -72,58 +73,74 @@ export function PlanCard({ card, workbenchSql, onFollowUp }: { card: PlanCardVie
         {`；维度：${card.request.dimensions.length ? card.request.dimensions.join('、') : '全体'}`}
         {card.request.population && `；人群：${card.request.population}`}
       </p>
-      {unsupported ? (
-        <>
-          {/* 做不到：说明原因与每条问题的可行下一步，链到新建定义（表达不了时先定义） */}
-          {card.reason && <p>原因：{card.reason}</p>}
-          {card.issues.some(i => i.next) && (
-            <ul className="list-disc space-y-0.5 pl-5">
-              {card.issues.filter(i => i.next).map((i, j) => <li key={j}>{i.next}</li>)}
-            </ul>
-          )}
-          <Link to="/analytics/definitions/new" data-next="new-definition" className="underline">新建定义</Link>
-        </>
-      ) : clarify ? (
-        <>
-          {card.issues.length > 0 && (
-            <ul className="list-disc space-y-0.5 pl-5 text-amber-700">
-              {card.issues.map((i, j) => <li key={j}>{i.next ? `${i.message}（${i.next}）` : i.message}</li>)}
-            </ul>
-          )}
-          {/* 要回答的问题（mode 是 clarify 时计划一定带）；提示在下方输入框回答 */}
-          {card.questions.length > 0 && (
-            <div>
-              <h4 className="text-slate-400">待澄清</h4>
-              <ul className="mt-0.5 list-disc space-y-0.5 pl-5">
-                {card.questions.map((q, j) => <li key={j}>{q}</li>)}
-              </ul>
-            </div>
-          )}
-          <p>请在下方输入框回答</p>
-        </>
-      ) : ok ? (
-        <>
-          {/* 下一步入口（#453）：通过时按 mode 给（按钮只替本人发续写）；存草稿与填入工作台都会在助手工具里重新校验 */}
-          {card.mode === 'reuse_result' && card.resultHref && (
-            <Link to={card.resultHref} data-next="result" className="underline">查看已有结果</Link>
-          )}
-          {card.mode === 'draft_definition' && onFollowUp && (
-            <button type="button" data-next="draft" onClick={() => onFollowUp(DRAFT_FOLLOW_UP)} className="underline">存草稿</button>
-          )}
-          {card.mode === 'draft_query' && (workbenchSql
-            ? <Link to={`/workbench?sql=${encodeURIComponent(workbenchSql)}`} data-prefill data-next="workbench" className="underline">填入工作台</Link>
-            : onFollowUp && <button type="button" data-next="workbench" onClick={() => onFollowUp(WORKBENCH_FOLLOW_UP)} className="underline">填入工作台</button>)}
-        </>
-      ) : (
-        <>
-          {card.issues.length > 0 && (
-            <ul className="list-disc space-y-0.5 pl-5 text-amber-700">
-              {card.issues.map((i, j) => <li key={j}>{i.next ? `${i.message}（${i.next}）` : i.message}</li>)}
-            </ul>
-          )}
-          <p>计划已过期或不再适用，请重新提问</p>
-        </>
-      )}
+      <NextSteps card={card} unsupported={unsupported} clarify={clarify} workbenchSql={workbenchSql} onFollowUp={onFollowUp} />
     </div>
+  );
+}
+
+/** 卡片底部按分支给出的内容：做不到 > 追问澄清 > 通过（下一步入口）> 过期（只提示重新提问） */
+function NextSteps({ card, unsupported, clarify, workbenchSql, onFollowUp }: {
+  card: PlanCardView; unsupported: boolean; clarify: boolean; workbenchSql?: string; onFollowUp?: (text: string) => void;
+}) {
+  if (unsupported) {
+    return (
+      <>
+        {/* 做不到：说明原因与每条问题的可行下一步，链到新建定义（表达不了时先定义） */}
+        {card.reason && <p>原因：{card.reason}</p>}
+        {card.issues.some(i => i.next) && (
+          <ul className="list-disc space-y-0.5 pl-5">
+            {card.issues.filter(i => i.next).map((i, j) => <li key={j}>{i.next}</li>)}
+          </ul>
+        )}
+        <Link to="/analytics/definitions/new" data-next="new-definition" className="underline">新建定义</Link>
+      </>
+    );
+  }
+  if (clarify) {
+    return (
+      <>
+        {card.issues.length > 0 && (
+          <ul className="list-disc space-y-0.5 pl-5 text-amber-700">
+            {card.issues.map((i, j) => <li key={j}>{i.next ? `${i.message}（${i.next}）` : i.message}</li>)}
+          </ul>
+        )}
+        {/* 要回答的问题（mode 是 clarify 时计划一定带）；提示在下方输入框回答 */}
+        {card.questions.length > 0 && (
+          <div>
+            <h4 className="text-slate-400">待澄清</h4>
+            <ul className="mt-0.5 list-disc space-y-0.5 pl-5">
+              {card.questions.map((q, j) => <li key={j}>{q}</li>)}
+            </ul>
+          </div>
+        )}
+        <p>请在下方输入框回答</p>
+      </>
+    );
+  }
+  if (card.status === 'valid') {
+    return (
+      <>
+        {/* 下一步入口（#453）：通过时按 mode 给（按钮只替本人发续写）；存草稿与填入工作台都会在助手工具里重新校验 */}
+        {card.mode === 'reuse_result' && card.resultHref && (
+          <Link to={card.resultHref} data-next="result" className="underline">查看已有结果</Link>
+        )}
+        {card.mode === 'draft_definition' && onFollowUp && (
+          <button type="button" data-next="draft" onClick={() => onFollowUp(DRAFT_FOLLOW_UP)} className="underline">存草稿</button>
+        )}
+        {card.mode === 'draft_query' && (workbenchSql
+          ? <Link to={`/workbench?sql=${encodeURIComponent(workbenchSql)}`} data-prefill data-next="workbench" className="underline">填入工作台</Link>
+          : onFollowUp && <button type="button" data-next="workbench" onClick={() => onFollowUp(WORKBENCH_FOLLOW_UP)} className="underline">填入工作台</button>)}
+      </>
+    );
+  }
+  return (
+    <>
+      {card.issues.length > 0 && (
+        <ul className="list-disc space-y-0.5 pl-5 text-amber-700">
+          {card.issues.map((i, j) => <li key={j}>{i.next ? `${i.message}（${i.next}）` : i.message}</li>)}
+        </ul>
+      )}
+      <p>计划已过期或不再适用，请重新提问</p>
+    </>
   );
 }
