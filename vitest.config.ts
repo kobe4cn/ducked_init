@@ -40,6 +40,14 @@ for (const key of PER_WORKER_KEYS) {
   if (value) process.env[`CRM_TEST_BASE_${key}`] = value;
 }
 
+// 测试超时的统一放宽倍数 CRM_TEST_TIMEOUT_SCALE（本地与 CI 不设，按 1）：沙箱门槛的完整测试里
+// 4 个 worker 共用一台 PG 与 CPU、还有并行沙箱同时跑，负载下比本地约慢一倍（#439 实测），用例体里的
+// publishedIdentitySources 平均就要 26.8 s（docs/test-plans/test-duration-report.md），整体逼近、超过 90 s，
+// 已出过 3 张「负载下变慢、单跑能过」的偶发失败票（#357 / #440 / #459）。Sandcastle 沙箱设 2（180 s / 120 s），
+// 之后的超时票先查是否真卡住，不再逐文件放宽。非数字或 ≤0 时按 1。
+const parsedTimeoutScale = Number(process.env.CRM_TEST_TIMEOUT_SCALE ?? 1);
+const timeoutScale = Number.isFinite(parsedTimeoutScale) && parsedTimeoutScale > 0 ? parsedTimeoutScale : 1;
+
 // 测试不走 vite.config.ts（reactRouter 插件由 HTTP 接缝自己起的 vite 服务加载）
 export default defineConfig({
   // 渲染组件的纯函数测试按 tsconfig 解析 ~/ 路径
@@ -52,8 +60,9 @@ export default defineConfig({
     // （测试侧与 vite 侧各 10 个）再加 DuckLake 的连接；默认 8 个 worker 要求 PG 的 max_connections ≥ 300
     // （db_script/docker-compose.yml），PG 还是默认的 100 时用 CRM_TEST_WORKERS=4
     maxWorkers: Number(process.env.CRM_TEST_WORKERS ?? 8),
-    // CI 的 runner 性能差别大：慢的机器整体慢约 1.7 倍，快机器上 20–25 s 的流水线测试在慢机器上会超过 30 s
-    testTimeout: 90_000,
-    hookTimeout: 60_000,
+    // CI 的 runner 性能差别大：慢的机器整体慢约 1.7 倍，快机器上 20–25 s 的流水线测试在慢机器上会超过 30 s。
+    // timeoutScale：沙箱门槛经 CRM_TEST_TIMEOUT_SCALE 统一放宽（见上面的注释）
+    testTimeout: 90_000 * timeoutScale,
+    hookTimeout: 60_000 * timeoutScale,
   },
 });

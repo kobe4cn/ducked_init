@@ -128,6 +128,8 @@ function testEnv(issueId: string): Record<string, string> {
     // 源端测试账号名按票区分（scripts/test-resource-names.ts 的 CRM_TEST_RUN_SUFFIX），并行的沙箱不共用账号
     CRM_TEST_RUN_SUFFIX: suffix,
     CRM_TEST_WORKERS: "4",
+    // 沙箱负载比本地约慢一倍（#439），vitest.config.ts 把 testTimeout / hookTimeout 乘成 180 s / 120 s，超时类偶发失败不再逐文件放宽（#461）
+    CRM_TEST_TIMEOUT_SCALE: "2",
   };
   const { TEST_MONGO_URL, TEST_MYSQL_URL, TEST_S3_LAKE_URI } = hostEnv;
   if (TEST_MONGO_URL) env.TEST_MONGO_URL = withDbSuffix(toContainer(TEST_MONGO_URL), suffix);
@@ -706,6 +708,7 @@ function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
       "- 先读失败摘要判断类型：超时（hook / 用例在负载下变慢）、随机数据撞上断言、用例之间共享状态或顺序依赖、外部服务连接。",
       "- 先查同样的报错是不是已经修过：`gh issue list --label flaky --state closed --search \"<报错关键句>\"`，再 `git log --oneline -S` / `--grep` 找对应提交。已经修过（失败的分支早于那个提交）就不用复现，提交信息写明是哪个提交修的、依据是什么。",
       "- 复现：要的是一条修复前变红、修复后变绿的命令。超时、随机数据类可以单跑这个文件，或和重夹具文件一起跑、在后台占满 CPU 再跑；跨进程 / 跨沙箱的竞争（共用的 PG 角色、库、对象等）单跑复现不了，照 #439 写一个并发用例让它稳定变红。重复单跑只作补充，总共不超过 20 分钟。复现不了就照摘要从代码推断原因，并在提交信息里写明推断依据。",
+      "- 沙箱里全局超时已是 180 s / 120 s（`CRM_TEST_TIMEOUT_SCALE=2`），再超时先查是否真卡住，不要只是继续放宽。",
       "- 超时类：确认是负载下变慢才给单个 hook / 用例放宽超时（照 2bcb07a 的写法），不改全局配置。随机数据类：改断言或数据，让它不可能撞上。",
       "",
       "## Acceptance criteria", "",
