@@ -333,7 +333,7 @@ function measurePhrase(form: MetricForm, fields: readonly FormField[]): string {
  */
 export function summarize(form: MetricForm, fields: readonly FormField[]): string[] {
   // filter 只保留满足条件的行（全部满足）；分子、分母自己的 filter 只限制分子或分母，各自写明范围
-  const scope = (who: string, conds: readonly Cond[]) => conds.length ? [`${who}只算 ${filterTexts(conds, fields).join('并且')} 的记录`] : [];
+  const scope = (who: string, conds: readonly Cond[]) => conds.length ? [`${who}只算 ${filterTexts(conds, fields).join(' 并且 ')} 的记录`] : [];
   const scopes = [
     ...scope('', form.filter),
     ...(form.agg === 'ratio' ? [...scope('分子', form.numerator?.filter ?? []), ...scope('分母', form.denominator?.filter ?? [])] : []),
