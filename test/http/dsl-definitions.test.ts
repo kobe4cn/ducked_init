@@ -67,7 +67,7 @@ describe('指标与标签定义页', () => {
     expect((await engineer.get('/analytics/definitions/nope/revenue')).status).toBe(404);
   });
 
-  it('新建页的条件构建器：检查给出四句摘要与编译出的 SQL、不保存；不合法按行列返回 400；保存得到与手写 YAML 一样的草稿', async () => {
+  it('新建页的条件构建器：检查给出三 / 四句摘要（ratio 四句）与编译出的 SQL、不保存；不合法按行列返回 400；保存得到与手写 YAML 一样的草稿', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'analyst@acme.com', 'analyst');
     const analyst = await loginAs(app, 'analyst@acme.com');
@@ -100,6 +100,19 @@ describe('指标与标签定义页', () => {
     expect(checked).toMatch(/data-compiled-sql[^>]*>[^<]*SUM\(b\.\D*quot;amount/);
     expect(checked).toContain('data-generated-yaml');
     expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
+    // ratio：分子、分母各带一条过滤，四句摘要（第二句写各自的过滤范围）
+    const ratio: MetricForm = {
+      base: 'order', agg: 'ratio',
+      numerator: { agg: 'count', filter: [{ field: 'status', op: 'eq', value: 'refunded' }] },
+      denominator: { agg: 'count', filter: [{ field: 'status', op: 'in', value: ['paid', 'refunded'] }] },
+      filter: [], dimensions: [], readonly: [],
+    };
+    const ratioCheck = await post({ intent: 'check', form: JSON.stringify(ratio) });
+    expect(ratioCheck.status).toBe(200);
+    const ratioSummary = (await ratioCheck.text()).match(/<ul data-summary[^>]*>([\s\S]*?)<\/ul>/)![1];
+    expect(ratioSummary.match(/<li>/g)).toHaveLength(4);
+    expect(ratioSummary).toContain('refunded');
 
     // sum 用了文本字段：400 与按行列的问题（行列号指向生成的 YAML），同时把它显示出来
     const bad = await post({ intent: 'check', form: JSON.stringify({ ...form, field: 'channel' }) });
