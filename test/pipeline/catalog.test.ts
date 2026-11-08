@@ -17,12 +17,13 @@ import { createCustomEntity, deleteCustomEntity, publishCustomEntity } from '../
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, businessNotes, catalogVersions } from '../../app/.server/db/schema';
 import { createDefinition, discardDslDraft, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
-import { confirmDisable, lockTenant, requestDisable } from '../../app/.server/mappings';
+import { confirmDisable, requestDisable } from '../../app/.server/mappings';
 import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-groups';
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, publishSourceView } from '../../app/.server/source-views';
 import { confirmWatermark, deleteSource, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
 import { publishTemplate, saveDraft } from '../../app/.server/templates';
+import { lockTenant } from '../../app/.server/tenant-lock';
 import { resetDb } from '../http/harness';
 import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish, selectAllTables } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';

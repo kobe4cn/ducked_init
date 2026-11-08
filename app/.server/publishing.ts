@@ -3,14 +3,15 @@
 // 发布顺序固定：读草稿 → publishBlocker → 事务外检查 → 开事务 → 加锁 → 过期检查 → 事务内检查 → 改状态 → 发布后动作 → 审计
 // （审计放在最后：记目录版本拿的锁要是事务里最后一个锁，ADR-0047）。流程本身的错误（不是草稿、已发布、草稿被改过、没有草稿可丢弃）
 // 抛 PublishError，各可发布项自己的错误类继承它。不能 import mappings.ts（它经 publish-rules.ts 导入这里，循环依赖）：
-// 锁租户行在这里内联一份私有的，写法同 mappings.ts 的 lockTenant；enqueueMerge 只由各适配器的 afterPublish 调
+// 锁租户行用 tenant-lock.ts 的 lockTenant；enqueueMerge 只由各适配器的 afterPublish 调
 import { and, desc, eq, getTableColumns, inArray, sql } from 'drizzle-orm';
 import type { AnyPgColumn, PgTable } from 'drizzle-orm/pg-core';
 import { recordAudit, type AuditAction, type Tx } from './audit';
 import { can, deniedReason } from './access';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
-import { members, ROLES, tenants } from './db/schema';
+import { members, ROLES } from './db/schema';
+import { lockTenant } from './tenant-lock';
 
 /** 发布流程本身的错误（ADR-0051 一律 400，双人规则在草稿状态下拦下时报 403）；可发布项自己的错误类继承它，保留各自的 status 与文案 */
 export class PublishError extends Error {
@@ -123,10 +124,6 @@ export interface PublishableAdapter<Ctx, Input, Inside = undefined, After = null
   noDraft(ctx: Ctx): string;
 }
 
-/** 锁住租户行（按租户串行）：写法同 mappings.ts 的 lockTenant，这里私有内联一份（不能 import mappings.ts，见文件头） */
-const lockTenantRow = (tx: Tx, tenantId: string) =>
-  tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
-
 /** 版本表 / 父表的共有列（各可发布项形状相同、名字相同，ADR-0051）：按名字从具体表上取 */
 const sharedOf = (table: PgTable) => {
   const cols = getTableColumns(table) as Record<string, AnyPgColumn>;
@@ -151,7 +148,7 @@ export async function saveDraft<Ctx, Input, Inside, After>(
 ) {
   let columns = await adapter.checkSave(ctx, input);
   return inTx(tx, async tx => {
-    if (adapter.lockTenant) await lockTenantRow(tx, actor.tenant.id);
+    if (adapter.lockTenant) await lockTenant(tx, actor.tenant.id);
     await adapter.saveInside?.(tx, ctx);
     const parentId = await adapter.lockParent(tx, ctx);
     const { id, version: versionCol } = sharedOf(adapter.versions);
@@ -194,7 +191,7 @@ export async function publish<Ctx, Input, Inside, After>(
   if (blocker) throw new PublishError(blocker, draft.status === 'draft' ? 403 : 400);
   await adapter.checkOutside?.(draft, ctx);
   return inTx(tx, async tx => {
-    if (adapter.lockTenant) await lockTenantRow(tx, actor.tenant.id);
+    if (adapter.lockTenant) await lockTenant(tx, actor.tenant.id);
     await adapter.lockParent(tx, ctx);
     const [current] = (await tx.select().from(adapter.versions).where(eq(id, draft.id))) as unknown as VersionRow[];
     if (isStale(current, draft)) {
@@ -224,7 +221,7 @@ export async function discard<Ctx, Input, Inside, After>(
   adapter: PublishableAdapter<Ctx, Input, Inside, After>, actor: CurrentMember, ctx: Ctx,
 ): Promise<{ kept: boolean }> {
   return getDb().transaction(async tx => {
-    if (adapter.lockTenant) await lockTenantRow(tx, actor.tenant.id);
+    if (adapter.lockTenant) await lockTenant(tx, actor.tenant.id);
     const parentId = await adapter.lockParent(tx, ctx);
     const { id, version: versionCol, status } = sharedOf(adapter.versions);
     const versions = (await tx.select({ id, version: versionCol, status }).from(adapter.versions)

@@ -21,7 +21,7 @@ import { publishedTagsOf, publishedTagsReferencing } from './dsl-dependencies';
 import { dslDefinitions, dslVersions, snapshots, tasks, type SnapshotTrigger } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { chatJson, LlmError, resolveProvider } from './llm';
-import { lockTenant, publishedPlans } from './mappings';
+import { publishedPlans } from './mappings';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
 import { definitionDraftMessages, definitionDraftPurpose, definitionDraftSchema, definitionOutputToYaml } from './pipeline/dsl/model-draft';
@@ -35,6 +35,7 @@ import { discard, type DraftRow, publish, PublishError, publishBlocker, publishe
 import { registerTaskSnapshot } from './snapshots';
 import { insertTask } from './tasks';
 import { todayUtc } from './templates';
+import { lockTenant } from './tenant-lock';
 
 /** 定义的键：小写字母开头，只用小写字母、数字与下划线 */
 export const DSL_KEY_PATTERN = /^[a-z][a-z0-9_]{0,62}$/;

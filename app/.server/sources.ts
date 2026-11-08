@@ -10,7 +10,7 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceTables, sourceViews, sourceViewVersions, tasks, type TaskStatus } from './db/schema';
-import { crossSourceReferrers, lockTenant, pendingMerge } from './mappings';
+import { crossSourceReferrers, pendingMerge } from './mappings';
 import {
   inspectSource, isKeyType, isSoftDeleteType, mongoReadGrant, SOFT_DELETE_NAME, type ListedTable, type SourceSpec, type TableProfile,
   type WriteGrant,
@@ -25,6 +25,7 @@ import {
 import { enqueueKeyCheck } from './source-key-check';
 import { ofSource } from './source-sync';
 import { insertTask } from './tasks';
+import { lockTenant } from './tenant-lock';
 import { looksSensitive } from '../lib/sensitive';
 
 export { SourceError, type SourceInput } from './source-config';

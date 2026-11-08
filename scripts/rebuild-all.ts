@@ -2,7 +2,8 @@
 // 为某个租户的全部已发布映射入队一次强制重建的合并（由调度器派发执行）。已有合并在排队或运行中时不入队
 import { parseArgs } from 'node:util';
 import { closeDb, getDb } from '../app/.server/db/client';
-import { enqueueMerge, lockTenant, pendingMerge } from '../app/.server/mappings';
+import { enqueueMerge, pendingMerge } from '../app/.server/mappings';
+import { lockTenant } from '../app/.server/tenant-lock';
 import { tenantIdBySlug } from '../app/.server/tenants';
 
 const { values } = parseArgs({ options: { tenant: { type: 'string' } } });

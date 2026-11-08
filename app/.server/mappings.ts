@@ -38,6 +38,7 @@ import { requireSource } from './source-config';
 import { mappingDrift } from './source-drift';
 import { confirmedTables } from './sources';
 import { insertTask } from './tasks';
+import { lockTenant } from './tenant-lock';
 import { CANONICAL_ENTITIES, type CustomEntityField, entityLabel, entityOf, type EntityRelation, type RelationStat, relationText } from '../lib/canonical-model';
 import { cmp, cmpName } from '../lib/compare';
 import { entityForTable } from '../lib/field-synonyms';
@@ -1167,9 +1168,6 @@ export function isSensitiveField(
     || plans.some(p => p.entity === entity && p.columns.some(c => c.name === field && c.sensitive));
 }
 
-/** 锁住租户行：入队合并、发布映射与定义、删除定义与自定义实体先拿它，按租户串行 */
-export const lockTenant = (tx: Tx, tenantId: string) => tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
-
 /**
  * 在调用方的事务里为给定映射（不给时为全部已发布映射）的最新已发布版本入队一次合并，返回带上它们的合并任务。
  * 锁住租户行后检查：同一租户同时只有一个合并在排队或运行（两个合并同时写同一张标准层表会冲突）。
@@ -1327,7 +1325,7 @@ export async function enqueueDueMerges() {
     try {
       const task = await getDb().transaction(async tx => {
         // 先锁住租户行再算一次（enqueueMerge 里再锁是同一把锁）：查询之后可能已有发布、同步或合并入队
-        await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
+        await lockTenant(tx, tenantId);
         return enqueueMerge(tx, tenantId, (await dueMappings(tx, tenantId)).map(r => r.mapping_id));
       });
       if (task) enqueued.push(tenantId);

@@ -9,12 +9,12 @@ import { getDb } from './db/client';
 import { dslDefinitions, dslVersions, servingStores, snapshots, tasks, type ServingStoreSnapshot } from './db/schema';
 import { lakeReady, lakeRow } from './lake';
 import { isS3, listLakeFiles } from './lake-storage';
-import { lockTenant } from './mappings';
 import { SERVING_DIR } from './pipeline/lake-engine';
 import { servingPath } from './pipeline/serving-engine';
 import { platformS3 } from './s3-accounts';
 import { deleteObject } from './s3-client';
 import { insertTask } from './tasks';
+import { lockTenant } from './tenant-lock';
 import { cmp } from '../lib/compare';
 
 export type ServingStore = typeof servingStores.$inferSelect;
