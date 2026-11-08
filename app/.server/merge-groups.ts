@@ -1,25 +1,23 @@
 // app/.server/merge-groups.ts —— 合并组（ADR-0032）：把同一实体下描述同一批对象的几个映射绑在一起，同一主键在标准层只留一行。
 // 每个实体最多一个组；一版登记组员（映射 ID 的有序数组，顺序即优先级）与存活规则。保存草稿与发布时都校验（checkMergeGroup）：
 // 组员至少 2 个、都是这个实体已发布且未停用的映射、键空间相同、不重复；实体不能是 customer（ADR-0027 有自己的属性取舍）或只在同一数据源内唯一的实体；
-// latest 的字段要是这个实体的字段。草稿按映射同样的规则双人发布（ADR-0015），也可以丢弃（回到最近的已发布版本，从没发布过时整个删除）。
+// latest 的字段要是这个实体的字段。保存草稿、发布与丢弃的流程（双人发布 ADR-0015、版本与审计）经 publishing.ts（ADR-0051），本文件给适配器与校验。
 // 发布时给组员入队重建合并，合并引擎按组合并另见 ADR-0032。一律限定在操作者所属租户内
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { assertCan } from './access';
-import { recordAudit, type Tx } from './audit';
+import type { Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { publishedCustomEntities, uniqueKeys } from './custom-entities';
 import { getDb } from './db/client';
 import { mappings, mappingVersions, mergeGroups, mergeGroupVersions, sources } from './db/schema';
-import { enqueueMerge, lockTenant } from './mappings';
-import { isStale, publishBlocker, publisherCount, publishReason, withAuthor } from './publish-rules';
+import { enqueueMerge } from './mappings';
+import { discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, publishReason, saveDraft, type PublishableAdapter } from './publishing';
 import { entityOf } from '../lib/canonical-model';
 import { cmpName } from '../lib/compare';
 import { MERGE_RULE_KINDS, type MergeRule, type MergeRuleKind, ruleText } from '../lib/merge-groups';
 
-/** 可以展示给成员的业务错误 */
-export class MergeGroupError extends Error {
-  constructor(message: string, readonly status: 400 | 403 | 404 = 400) { super(message); }
-}
+/** 可以展示给成员的业务错误：流程错误继承 PublishError（ADR-0051） */
+export class MergeGroupError extends PublishError {}
 
 export type { MergeRule };
 
@@ -178,41 +176,85 @@ async function lockGroup(tx: Tx, tenantId: string, entity: string) {
   return group;
 }
 
+/** mergeGroupAdapter 的上下文：租户与实体；保存时另带规范化后的组员与规则（保存的校验在事务里要用，发布 / 丢弃用不到） */
+export interface MergeGroupCtx { tenantId: string; entity: string; members?: string[]; rule?: MergeRule }
+
+/** 保存时的上下文：入口把组员与规则规范化后带上（checkSave 与 saveInside 从中取；publishing.ts 的 saveInside 收不到保存的输入，见 #497） */
+type MergeGroupSaveCtx = MergeGroupCtx & { members: string[]; rule: MergeRule };
+
+/** 合并组版本的内容列：发布流程里 checkInside、afterPublish 与审计收到的草稿带上它们 */
+type GroupDraft = DraftRow & { members: string[]; rule: MergeRule };
+
+/** enqueueMerge 入队的合并任务（publishMergeGroup 返回它或 null） */
+type QueuedMerge = NonNullable<Awaited<ReturnType<typeof enqueueMerge>>>;
+
 /**
- * 保存草稿：校验通过后，已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）；
- * 这个实体还没有合并组时先建立。不通过时什么也不存。先锁租户行再校验，与停用、发布映射互斥，存下的组员在保存时一定合格。返回草稿的版本号
+ * 合并组接入 publishing.ts 的适配器（ADR-0051）：保存的校验在事务内（先锁租户行，与停用、发布映射互斥，存下的组员在保存时一定合格）、
+ * 懒建父行。发布时再校验一次（组员在保存后可能被停用或改了键空间），并给组员连同上一版里被移出组的映射（它们要写回自己的行）
+ * 入队带 rebuild 的合并；合并在运行时入队返回 null，发布被拒并回滚。审计在入队之后
  */
-export async function saveMergeGroupDraft(actor: CurrentMember, entity: string, { members, rule: input }: MergeGroupInput) {
+export const mergeGroupAdapter: PublishableAdapter<MergeGroupCtx, MergeGroupInput, string[], QueuedMerge> = {
+  parent: mergeGroups,
+  versions: mergeGroupVersions,
+  versionsFk: mergeGroupVersions.groupId,
+  lockTenant: true,
+  lockParent: async (tx, ctx) => {
+    const group = await lockGroup(tx, ctx.tenantId, ctx.entity);
+    if (!group) throw new MergeGroupError(`${ctx.entity} 没有合并组`, 404);
+    return group.id;
+  },
+  checkSave: async ctx => {
+    const { members, rule } = ctx as MergeGroupSaveCtx;
+    return { members, rule };
+  },
+  saveInside: async (tx, ctx) => {
+    const { members, rule } = ctx as MergeGroupSaveCtx;
+    await assertMergeGroup(tx, ctx.tenantId, ctx.entity, { members, rule });
+    await tx.insert(mergeGroups).values({ tenantId: ctx.tenantId, entity: ctx.entity }).onConflictDoNothing();
+  },
+  checkInside: async (tx, draft, ctx) => {
+    const { members, rule } = draft as GroupDraft;
+    await assertMergeGroup(tx, ctx.tenantId, ctx.entity, { members, rule });
+    // checkInside 在改状态之前执行，读到的还是上一版的组员
+    return (await publishedMergeGroups(tx, ctx.tenantId)).get(ctx.entity)?.members ?? [];
+  },
+  afterPublish: async (tx, draft, ctx, previous) => {
+    const task = await enqueueMerge(tx, ctx.tenantId, [...new Set([...(draft as GroupDraft).members, ...previous])], { rebuild: true });
+    if (!task) throw new MergeGroupError('已有一次合并在运行，等它结束后再发布');
+    return task;
+  },
+  audit: {
+    drafted: {
+      action: 'merge_group.saved',
+      detail: (ctx, columns, version) => {
+        const { members, rule } = columns as { members: string[]; rule: MergeRule };
+        return { entity: ctx.entity, version, members, rule: ruleText(rule) };
+      },
+    },
+    published: {
+      action: 'merge_group.published',
+      detail: (ctx, draft) => {
+        const { members, rule, authors, lastEditor } = draft as GroupDraft;
+        return { entity: ctx.entity, version: draft.version, members, rule: ruleText(rule), authors, lastEditor };
+      },
+    },
+    discarded: { action: 'merge_group.draft_discarded', detail: (ctx, version, published) => ({ entity: ctx.entity, version, published }) },
+    targetType: 'merge_group',
+  },
+  missingVersion: version => `没有第 ${version} 版`,
+  noDraft: ctx => `${ctx.entity} 的合并组没有草稿`,
+};
+
+/**
+ * 保存草稿：校验（在事务里、先锁租户行，与停用、发布映射互斥）通过后，已有草稿时改它（记下又一位作者与最后保存的人），
+ * 否则在最新版本之上新建一版草稿（已发布的版本不变，只有这时写 merge_group.saved 审计）；这个实体还没有合并组时先建立。
+ * 不通过时什么也不存。返回草稿的版本号
+ */
+export async function saveMergeGroupDraft(actor: CurrentMember, entity: string, input: MergeGroupInput) {
   assertCan(actor, 'sources:write');
   // 只存规则认得的键
-  const rule: MergeRule = input.kind === 'latest' ? { kind: 'latest', field: input.field } : { kind: input.kind };
-  return getDb().transaction(async tx => {
-    await lockTenant(tx, actor.tenant.id);
-    await assertMergeGroup(tx, actor.tenant.id, entity, { members, rule });
-    await tx.insert(mergeGroups).values({ tenantId: actor.tenant.id, entity }).onConflictDoNothing();
-    const group = (await lockGroup(tx, actor.tenant.id, entity))!;
-    const [latest] = await tx.select().from(mergeGroupVersions)
-      .where(eq(mergeGroupVersions.groupId, group.id)).orderBy(desc(mergeGroupVersions.version)).limit(1);
-    let version: number;
-    if (latest?.status === 'draft') {
-      version = latest.version;
-      await tx.update(mergeGroupVersions)
-        .set({ members, rule, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
-        .where(eq(mergeGroupVersions.id, latest.id));
-    } else {
-      version = (latest?.version ?? 0) + 1;
-      await tx.insert(mergeGroupVersions).values({ groupId: group.id, version, members, rule, authors: [actor.email], lastEditor: actor.email });
-    }
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'merge_group.saved',
-      targetType: 'merge_group',
-      targetId: group.id,
-      detail: { entity, version, members, rule: ruleText(rule) },
-    });
-    return version;
-  });
+  const rule: MergeRule = input.rule.kind === 'latest' ? { kind: 'latest', field: input.rule.field } : { kind: input.rule.kind };
+  return saveDraft(mergeGroupAdapter, actor, { tenantId: actor.tenant.id, entity, members: input.members, rule }, input);
 }
 
 /** 本租户这个实体的合并组；没有时 404 */
@@ -224,64 +266,18 @@ async function requireGroup(tenantId: string, entity: string) {
 
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。只由成员在页面上调用，没有自动发布。
- * 先锁租户行（与发布、停用映射互斥）再锁组行，组员在保存后可能被停用或改了键空间，发布时再校验一次。发布后版本锁定。
- * 同一事务里给组员（连同上一版里被移出组的映射，它们要写回自己的行）入队带 rebuild 的合并，合并在运行时拒绝发布
+ * 发布时再校验一次（组员在保存后可能被停用或改了键空间），发布后版本锁定，同一事务里入队带 rebuild 的合并（审计在入队之后）。
+ * 返回入队的合并任务；合并在运行时不入队，发布被拒并回滚
  */
 export async function publishMergeGroup(actor: CurrentMember, entity: string, version: number) {
   assertCan(actor, 'publish');
-  const group = await requireGroup(actor.tenant.id, entity);
-  const [draft] = await getDb().select().from(mergeGroupVersions)
-    .where(and(eq(mergeGroupVersions.groupId, group.id), eq(mergeGroupVersions.version, version)));
-  if (!draft) throw new MergeGroupError(`没有第 ${version} 版`, 404);
-  const blocker = publishBlocker(actor, draft);
-  if (blocker) throw new MergeGroupError(blocker, draft.status === 'draft' ? 403 : 400);
-  await getDb().transaction(async tx => {
-    await lockTenant(tx, actor.tenant.id);
-    await lockGroup(tx, actor.tenant.id, entity);
-    const [current] = await tx.select().from(mergeGroupVersions).where(eq(mergeGroupVersions.id, draft.id));
-    if (isStale(current, draft)) throw new MergeGroupError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
-    await assertMergeGroup(tx, actor.tenant.id, entity, current);
-    const previous = (await publishedMergeGroups(tx, actor.tenant.id)).get(entity)?.members ?? [];
-    await tx.update(mergeGroupVersions)
-      .set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` })
-      .where(eq(mergeGroupVersions.id, draft.id));
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'merge_group.published',
-      targetType: 'merge_group',
-      targetId: group.id,
-      detail: { entity, version, members: current.members, rule: ruleText(current.rule), authors: current.authors, lastEditor: current.lastEditor },
-    });
-    if (!await enqueueMerge(tx, actor.tenant.id, [...new Set([...current.members, ...previous])], { rebuild: true })) {
-      throw new MergeGroupError('已有一次合并在运行，等它结束后再发布');
-    }
-  });
+  return publish(mergeGroupAdapter, actor, { tenantId: actor.tenant.id, entity, parentId: (await requireGroup(actor.tenant.id, entity)).id }, version);
 }
 
 /** 丢弃草稿：回到最近的已发布版本；从没发布过的合并组整个删除。返回合并组是否还在 */
 export async function discardMergeGroupDraft(actor: CurrentMember, entity: string) {
   assertCan(actor, 'sources:write');
-  return getDb().transaction(async tx => {
-    const group = await lockGroup(tx, actor.tenant.id, entity);
-    if (!group) throw new MergeGroupError(`${entity} 没有合并组`, 404);
-    const versions = await tx.select({ id: mergeGroupVersions.id, version: mergeGroupVersions.version, status: mergeGroupVersions.status })
-      .from(mergeGroupVersions).where(eq(mergeGroupVersions.groupId, group.id)).orderBy(desc(mergeGroupVersions.version));
-    const draft = versions.find(v => v.status === 'draft');
-    if (!draft) throw new MergeGroupError(`${entity} 的合并组没有草稿`);
-    const published = versions.find(v => v.status === 'published')?.version ?? null;
-    if (published) await tx.delete(mergeGroupVersions).where(eq(mergeGroupVersions.id, draft.id));
-    else await tx.delete(mergeGroups).where(eq(mergeGroups.id, group.id));
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'merge_group.draft_discarded',
-      targetType: 'merge_group',
-      targetId: group.id,
-      detail: { entity, version: draft.version, published },
-    });
-    return { kept: published !== null };
-  });
+  return discard(mergeGroupAdapter, actor, { tenantId: actor.tenant.id, entity });
 }
 
 /** 一个实体的合并组最新的已发布版本：组 ID、版本号、组员（按优先级）与存活规则 */

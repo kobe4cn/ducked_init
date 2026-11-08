@@ -1,17 +1,19 @@
-// test/pipeline/merge-groups.test.ts —— 合并组的接缝（ADR-0032）：saveMergeGroupDraft 校验后保存草稿，publishMergeGroup 双人发布，discardMergeGroupDraft 丢弃；
+// test/pipeline/merge-groups.test.ts —— 合并组的接缝（ADR-0032；保存 / 发布 / 丢弃经 publishing.ts 接入 ADR-0051，发布流程本身的用例见 publishing.test.ts）：
+// 发布后入队带 rebuild 的合并（新旧组员的并集）、更新草稿不写审计、已有合并在运行时发布被拒并回滚；
 // publishedMergeGroups 给出每个实体最新的已发布组；checkMergeGroup 是保存与发布共用的纯函数校验
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { mergeGroups, mergeGroupVersions } from '../../app/.server/db/schema';
-import { confirmDisable, publishMapping, requestDisable, saveDraft } from '../../app/.server/mappings';
+import { mergeGroups, mergeGroupVersions, tasks } from '../../app/.server/db/schema';
+import { confirmDisable, enqueueMerge, publishMapping, requestDisable, saveDraft } from '../../app/.server/mappings';
 import {
   checkMergeGroup, discardMergeGroupDraft, listMergeGroups, type MergeCandidate, publishedMergeGroups, publishMergeGroup, saveMergeGroupDraft,
 } from '../../app/.server/merge-groups';
 import { resetDb } from '../http/harness';
 import { drain, memberOf } from './fixtures';
 import { LOYALTY_ORDERS, publishedIdentitySources } from './identity-fixtures';
+import { mergedMappings } from './mapping-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -23,19 +25,26 @@ async function withOrders() {
 }
 
 describe('合并组发布', () => {
-  it('双人发布：最后保存的人发布不了，另一位发布后锁定；再改是新的一版草稿，丢弃回到已发布版本', async () => {
+  it('发布合并组：只给最新已发布版本、页面列出候选与发布不了的原因，发布后入队带 rebuild 的合并，更新草稿不写审计', async () => {
     const { acme, author, reviewer, orders } = await withOrders();
+    const analyst = await memberOf(acme, 'an@acme.com', 'analyst');
+    // 入口权限：分析师不能起草与发布
+    await expect(saveMergeGroupDraft(analyst, 'order', { members: orders, rule: { kind: 'priority' } })).rejects.toMatchObject({ init: { status: 403 } });
     expect(await saveMergeGroupDraft(author, 'order', { members: orders, rule: { kind: 'priority' } })).toBe(1);
-
-    await expect(publishMergeGroup(author, 'order', 1)).rejects.toMatchObject({ status: 403, message: expect.stringContaining('你最后改了这一版草稿') });
+    await expect(publishMergeGroup(analyst, 'order', 1)).rejects.toMatchObject({ init: { status: 403 } });
+    // 草稿不算已发布
     expect(await publishedMergeGroups(getDb(), acme)).toEqual(new Map());
-    await publishMergeGroup(reviewer, 'order', 1);
-    await expect(publishMergeGroup(author, 'order', 1)).rejects.toMatchObject({ status: 400, message: '已发布的版本已锁定' });
+
+    const queued = await publishMergeGroup(reviewer, 'order', 1);
+    expect(mergedMappings(queued!)).toEqual([...orders].sort());
+    expect((queued!.params.mappings as { rebuild: boolean }[]).every(m => m.rebuild)).toBe(true);
+    await drain();
     const [group] = await getDb().select().from(mergeGroups).where(eq(mergeGroups.tenantId, acme));
     expect(await publishedMergeGroups(getDb(), acme)).toEqual(new Map([['order', { id: group.id, version: 1, members: orders, rule: { kind: 'priority' } }]]));
 
     const reordered = [orders[1], orders[0]];
     expect(await saveMergeGroupDraft(reviewer, 'order', { members: reordered, rule: { kind: 'latest', field: 'updated_at' } })).toBe(2);
+    // 另一个人保存同一版草稿是更新，不写审计
     expect(await saveMergeGroupDraft(author, 'order', { members: reordered, rule: { kind: 'coalesce' } })).toBe(2);
     const [page] = await listMergeGroups(author);
     expect(page).toMatchObject({ entity: 'order', candidates: [{ name: '「会员」orders → order' }, { name: '「CRM」orders → order' }] });
@@ -48,21 +57,28 @@ describe('合并组发布', () => {
 
     expect(await discardMergeGroupDraft(author, 'order')).toEqual({ kept: true });
     expect((await listMergeGroups(author))[0].versions.map(v => v.version)).toEqual([1]);
+    // 只在新建版本时写「保存合并组草稿」：第二次保存 v2 是更新草稿，不再写
     expect((await listAuditLogs(acme)).filter(l => l.action.includes('合并组')).map(l => l.action))
-      .toEqual(['丢弃合并组草稿', '保存合并组草稿', '保存合并组草稿', '发布合并组', '保存合并组草稿']);
+      .toEqual(['丢弃合并组草稿', '保存合并组草稿', '发布合并组', '保存合并组草稿']);
+
+    // 发布成员改了的一版：入队的任务带 rebuild，组员是新旧组员的并集
+    expect(await saveMergeGroupDraft(author, 'order', { members: reordered, rule: { kind: 'coalesce' } })).toBe(2);
+    const rebuilt = await publishMergeGroup(reviewer, 'order', 2);
+    expect(mergedMappings(rebuilt!)).toEqual([...new Set([...reordered, ...orders])].sort());
+    expect((rebuilt!.params.mappings as { rebuild: boolean }[]).every(m => m.rebuild)).toBe(true);
   });
 
-  it('丢弃从没发布过的组会删除它；分析师不能起草与发布', async () => {
+  it('已有合并在运行时发布被拒并回滚', async () => {
     const { acme, author, reviewer, orders } = await withOrders();
-    const analyst = await memberOf(acme, 'an@acme.com', 'analyst');
-    await expect(saveMergeGroupDraft(analyst, 'order', { members: orders, rule: { kind: 'priority' } })).rejects.toMatchObject({ init: { status: 403 } });
     await saveMergeGroupDraft(author, 'order', { members: orders, rule: { kind: 'priority' } });
-    await expect(publishMergeGroup(analyst, 'order', 1)).rejects.toMatchObject({ init: { status: 403 } });
-    expect(await listMergeGroups(analyst)).toHaveLength(1);
-
-    expect(await discardMergeGroupDraft(reviewer, 'order')).toEqual({ kept: false });
-    expect(await getDb().select().from(mergeGroups)).toEqual([]);
-    expect((await listMergeGroups(author))[0].versions).toEqual([]);
+    const pending = await getDb().transaction(tx => enqueueMerge(tx, acme));
+    await getDb().update(tasks).set({ status: 'running' }).where(eq(tasks.id, pending!.id));
+    await expect(publishMergeGroup(reviewer, 'order', 1)).rejects.toThrow('已有一次合并在运行');
+    // 事务回滚：v1 仍是草稿、没有已发布的组，也没有「发布合并组」审计
+    expect(await getDb().select({ version: mergeGroupVersions.version, status: mergeGroupVersions.status }).from(mergeGroupVersions))
+      .toEqual([{ version: 1, status: 'draft' }]);
+    expect(await publishedMergeGroups(getDb(), acme)).toEqual(new Map());
+    expect((await listAuditLogs(acme)).filter(l => l.action === '发布合并组')).toEqual([]);
   });
 });
 
