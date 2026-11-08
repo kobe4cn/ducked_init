@@ -9,9 +9,10 @@ import type { Route } from './+types/source-view';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
+import { PublishError } from '~/.server/publishing';
 import type { ViewPreview } from '~/.server/pipeline/source-view-engine';
 import {
-  createSourceView, discardSourceViewDraft, getSourceView, listSourceViews, previewSourceView, publishSourceView, saveSourceViewDraft, SourceViewError,
+  createSourceView, discardSourceViewDraft, getSourceView, listSourceViews, previewSourceView, publishSourceView, saveSourceViewDraft,
 } from '~/.server/source-views';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
@@ -49,7 +50,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       try {
         preview = { version: previewVersion, result: await previewSourceView(member, params.sourceId, params.viewId, previewVersion), error: null };
       } catch (e) {
-        if (!(e instanceof SourceViewError)) throw e;
+        if (!(e instanceof PublishError)) throw e;
         preview = { version: previewVersion, result: null, error: e.message };
       }
     }
@@ -69,7 +70,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       preview,
     };
   } catch (e) {
-    if (e instanceof SourceViewError) throw data(null, { status: e.status });
+    if (e instanceof PublishError) throw data(null, { status: e.status });
     throw e;
   }
 }
@@ -101,7 +102,7 @@ export async function action({ request, params }: Route.ActionArgs) {
         return data({ error: '未知操作', sql: null, name: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof SourceViewError) return data({ error: e.message, sql: field('sql') || null, name: field('name') || null }, { status: e.status });
+    if (e instanceof PublishError) return data({ error: e.message, sql: field('sql') || null, name: field('name') || null }, { status: e.status });
     throw e;
   }
   const tab = tabOf(request);
