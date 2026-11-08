@@ -2,6 +2,7 @@
 import { sql } from 'drizzle-orm';
 import { bigint, boolean, check, index, integer, jsonb, pgSchema, primaryKey, real, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import type { CustomEntityField, CustomEntityKind, EntityRelation } from '../../lib/canonical-model';
+import type { KnowledgeSourceKind } from '../../lib/knowledge-source';
 import type { MergeRule } from '../../lib/merge-groups';
 import { ROLES } from '../../lib/roles';
 import { SOURCE_KINDS } from '../../lib/sources';
@@ -11,6 +12,7 @@ import type { MergePlan } from '../pipeline/mapping-spec';
 
 export { ROLE_LABELS, ROLES, type Role } from '../../lib/roles';
 export { SOURCE_KIND_LABELS, SOURCE_KINDS, type SourceKind } from '../../lib/sources';
+export { KNOWLEDGE_SOURCE_KIND_LABELS, KNOWLEDGE_SOURCE_KINDS, type KnowledgeSourceKind } from '../../lib/knowledge-source';
 
 export const platform = pgSchema('platform');
 
@@ -835,6 +837,23 @@ export const knowledgeProposals = platform.table('knowledge_proposals', {
   uniqueIndex('knowledge_proposals_tenant_fingerprint_uq').on(t.tenantId, t.fingerprint),
   index('knowledge_proposals_tenant_target_idx').on(t.tenantId, t.targetId),
 ]);
+
+// 知识来源（ADR-0046 入口③）：成员粘贴的来源原文（数据字典、指标说明或 SQL），按段落切分、带版本地保存（#525）；不调模型，
+// 解析成知识提案是 #526。body 是去掉首尾空白后的原文，body_hash 是它的 sha256：同租户同标题再粘贴时按它判断正文有没有变，
+// 变了（种类也会一起更新）版本 +1，没变不加版本也不记审计。段落不落库，读的时候按种类现切（paragraphsOf）；
+// 证据 ref 是 source:<id>#p<段号>，版本在提案 evidence 的 version 里。服务端不做内容识别，只限长度与段数
+export const knowledgeSources = platform.table('knowledge_sources', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  title: text('title').notNull(),
+  kind: text('kind').$type<KnowledgeSourceKind>().notNull(),
+  body: text('body').notNull(),
+  bodyHash: text('body_hash').notNull(),
+  version: integer('version').notNull().default(1),
+  createdByEmail: text('created_by_email').notNull(),
+  createdAt: createdAt(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [uniqueIndex('knowledge_sources_tenant_title_uq').on(t.tenantId, t.title)]);
 
 // 按主题生成提案的代次记录（ADR-0046 入口③）：每次成功生成一行。input_hash 是 subjectInput 的 inputHash（含主题名），同一个
 // (租户, 主题, 输入, 生成器版本) 再点不再调模型（直接返回没有新内容）；主题名、条目或知识变了（hash 不同）会再生成。
