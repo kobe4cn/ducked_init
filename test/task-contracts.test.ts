@@ -26,11 +26,14 @@ const accepted: [TaskKind, Record<string, unknown>][] = [
   ['lake.inspect', { expected: { customer: { id: 'VARCHAR', name: 'VARCHAR' } } }],
   ['lake.inspect', { expected: {} }],
   ['silver.keycheck', { entities: [{ entity: 'customer', key: ['id'], bySource: false, mappings: [{ mapping: 'm1', columns: ['id'], group: 'g1' }] }] }],
+  // entities 允许为空列表（原校验只查每一项的形状，没有长度要求）
+  ['silver.keycheck', { entities: [] }],
   ['silver.merge', { mappings: [mapping], identity: ['phone'], identityForce: true, survivorship: { m1: 1 }, consumerSensitive: ['phone'], relations: [{ from: { entity: 'order', field: 'customer_id' }, ref: { entity: 'customer', field: 'id' }, sensitive: false }], identityExclude: [hash] }],
   // 只撤下停用映射（停用的是实体最后一个映射）时 mappings 可以为空
   ['silver.merge', { mappings: [], drop: [{ mapping: 'm1', entity: 'customer' }], identityForce: false, identityExclude: [] }],
   // 早先入队的合并没有这些项
   ['silver.merge', { mappings: [{ ...mapping, group: { id: 'g1', rule: { kind: 'latest', field: 'updated_at' }, key: ['id'], members: [{ mapping: 'm1', sourceId: 's1', version: 1, key: ['id'], latest: 'updated_at', refs: [{ column: 'customer_id', source: 's1' }], sensitive: ['phone'] }] } }] }],
+  ['silver.merge', { mappings: [{ ...mapping, group: { id: 'g1', rule: { kind: 'priority' }, key: ['id'], members: [{ mapping: 'm1', sourceId: 's1', version: 1, key: ['id'], latest: null, refs: [] }] } }] }],
   ['gold.dsl', { kind: 'metric', key: 'amount', definitionId: 'd1', definitionVersion: 2, asOf: '2026-01-01', sql: 'SELECT 1', entities: ['order'], trigger: 'publish' }],
   ['gold.expire', { tables: [`gold.metric__${uuid}`] }],
   ['source.drop', { schema: `bronze_${'0'.repeat(32)}` }],
@@ -70,7 +73,6 @@ const rejected: [TaskKind, unknown, string][] = [
   ['lake.inspect', { expected: [] }, '参数 expected 必须是 表名 → 列名 → 类型 的对象'],
   ['lake.inspect', {}, '参数 expected 必须是 表名 → 列名 → 类型 的对象'],
   ['silver.keycheck', { entities: [{ entity: 'customer', key: ['id'], bySource: false, mappings: [{ mapping: 'm1', columns: [] }] }] }, '参数 entities 必须是 { entity, key, bySource, mappings: { mapping, columns, group? }[] } 列表'],
-  // entities 允许为空列表（原校验只查每一项的形状，没有长度要求）
   ['silver.merge', { mappings: [], drop: [{ mapping: 'm1' }] }, '参数 drop 必须是 { mapping, entity } 列表'],
   ['silver.merge', { drop: [{ mapping: 'm1', entity: 'customer' }] }, '参数 mappings 必须是非空的已发布映射列表'],
   ['silver.merge', { mappings: [{ ...mapping, mapping: 1 }] }, '参数 mappings 必须是非空的已发布映射列表'],
@@ -79,6 +81,7 @@ const rejected: [TaskKind, unknown, string][] = [
   ['silver.merge', { mappings: [{ ...mapping, latest: 'u', uniqueKey: [] }] }, '参数 mappings 必须是非空的已发布映射列表'],
   ['silver.merge', { mappings: [{ ...mapping, group: { id: 'g1', rule: { kind: 'latest' }, key: ['id'], members: [] } }] }, '参数 mappings 必须是非空的已发布映射列表'],
   ['silver.merge', { mappings: [{ ...mapping, group: { id: 'g1', rule: { kind: 'weekly' }, key: ['id'], members: [{ mapping: 'm1', sourceId: 's1', version: 1, key: ['id'], latest: null, refs: [] }] } }] }, '参数 mappings 必须是非空的已发布映射列表'],
+  ['silver.merge', { mappings: [{ ...mapping, group: { id: 'g1', rule: { kind: 'latest' }, key: ['id'], members: [{ mapping: 'm1', sourceId: 's1', version: 1, key: ['id'], latest: null, refs: [] }] } }] }, '参数 mappings 必须是非空的已发布映射列表'],
   ['silver.merge', { mappings: [mapping], identity: [] }, '参数 identity 必须是非空的字段名列表'],
   ['silver.merge', { mappings: [mapping], identityForce: 'yes' }, '参数 identityForce 必须是布尔值'],
   ['silver.merge', { mappings: [mapping], survivorship: { m1: 0 } }, '参数 survivorship 必须是映射 ID 到正整数名次的对照'],
@@ -144,7 +147,7 @@ describe('任务契约', () => {
   });
 
   it('identityExclude 拒绝非哈希的取值时，报错里不带出明文', () => {
-    for (const bad of ['13800000001', 'A'.repeat(64), hash.slice(1), [hash, 1]]) {
+    for (const bad of ['13800000001', ['13800000001'], 'A'.repeat(64), hash.slice(1), [hash, 1]]) {
       expect(() => CONTRACTS['silver.merge'].params.parse({ mappings: [mapping], identityExclude: bad }))
         .toThrow('参数 identityExclude 必须是哈希（64 位小写十六进制）列表');
       try {
