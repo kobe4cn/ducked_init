@@ -11,11 +11,12 @@ import type { Route } from './+types/analytics.templates.$id';
 import { can, deniedReason, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { publishReason } from '~/.server/publish-rules';
+import { PublishError } from '~/.server/publishing';
 import { TEMPLATES, type ParamField } from '~/.server/pipeline/templates';
 import type { RfmDefinition, ScoreRange, SegmentRule } from '~/.server/pipeline/templates/rfm';
 import { TaskError } from '~/.server/tasks';
 import {
-  discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, saveDraft, TemplateError, todayUtc, upgradeTemplateDraft,
+  discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, saveDraft, todayUtc, upgradeTemplateDraft,
 } from '~/.server/templates';
 import { entityOf } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
@@ -152,7 +153,8 @@ export async function action({ request, params }: Route.ActionArgs) {
         return data({ error: '未知操作', upgradeDiff: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof TemplateError) return data({ error: e.message, upgradeDiff: null }, { status: e.status });
+    // 模板与发布流程的业务错误（TemplateError 是 PublishError 的子类，ADR-0051）
+    if (e instanceof PublishError) return data({ error: e.message, upgradeDiff: null }, { status: e.status });
     if (e instanceof TaskError) return data({ error: e.message, upgradeDiff: null }, { status: 400 });
     throw e;
   }

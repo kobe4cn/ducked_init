@@ -60,7 +60,7 @@ describe('模板升级', () => {
 
     await saveDraft(author, 'rfm', PARAMS);
     const published = await publishTemplate(reviewer, 'rfm', 2);
-    expect(published.params).toMatchObject({ definitionVersion: 2, templateVersion: 1 });
+    expect(published!.params).toMatchObject({ definitionVersion: 2, templateVersion: 1 });
     await drain();
     const { task: recomputed } = await recomputeTemplate(reviewer, 'rfm', '2024-12-31');
     expect(recomputed.params).toMatchObject({ templateVersion: 1 });
@@ -77,7 +77,7 @@ describe('模板升级', () => {
 
     expect(await lockedVersions(acme)).toEqual([{ version: 1, templateVersion: 1 }, { version: 2, templateVersion: 1 }]);
     const acmeSegments = await segmentsByTask(acme);
-    for (const id of [published.id, recomputed.id, scheduled[0]!.id]) expect(acmeSegments[id]).toEqual(['其他', '高价值']);
+    for (const id of [published!.id, recomputed.id, scheduled[0]!.id]) expect(acmeSegments[id]).toEqual(['其他', '高价值']);
     expect(Object.values(acmeSegments).flat().filter(s => s.startsWith('v2:'))).toEqual([]);
 
     // 开关打开后才发布映射的租户：自动启用的 RFM 锁定第 2 版，分群带 v2:
@@ -154,7 +154,7 @@ describe('升级预览与确认', () => {
     await drain();
     // 另一位成员发布后按第 2 版计算，分群带 v2:
     const upgraded = await publishTemplate(reviewer, 'rfm', 3);
-    expect(upgraded.params).toMatchObject({ definitionVersion: 3, templateVersion: 2 });
+    expect(upgraded!.params).toMatchObject({ definitionVersion: 3, templateVersion: 2 });
     await drain();
     const { task: after } = await recomputeTemplate(reviewer, 'rfm', '2024-12-31');
     expect(after.params).toMatchObject({ definitionVersion: 3, templateVersion: 2 });

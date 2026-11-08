@@ -1,12 +1,13 @@
 // app/.server/templates.ts —— 分析模板定义：成员调整分析模板（如 RFM）的参数，校验通过才能保存为草稿；草稿按映射同样的规则双人发布——
 // 由最后保存它的人以外的另一位有发布权限的成员发布，也可以丢弃（回到最近的已发布版本，从没发布过时回到注册表里的默认参数）。
 // 发布后版本锁定，并以新参数（加上当天的 asOf）入队一次模板任务，快照登记时记下定义版本（ADR-0004、0015）。
+// 保存草稿、发布与丢弃的流程（双人发布、版本与审计）经 publishing.ts（ADR-0051），本文件给适配器、校验与各入口。
 // 也可以按当前生效的版本重新计算（可指定参考日期），不产生新版本；依赖的实体有新合并后调度器按当天以生效版本重算（refresh.ts，ADR-0028）。
 // 任务参数与快照记下来源（发布、手动重新计算、定时刷新、平台自动启用时的发布）。映射合并成功后，平台以注册表里的默认参数自动启用
 // 本租户还没有定义、依赖的实体都已有已发布映射的模板（enableDefaultTemplates，不经双人发布，ADR-0021）。
 // 注册表有了比生效版本锁定的更新的模板版本时，成员可以预览升级后的差异（只读、只出计数），确认后起草一版锁定新模板版本的草稿，照常双人发布。
 // 一律限定在操作者所属租户内
-import { and, desc, eq, getTableColumns, inArray, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
@@ -14,7 +15,8 @@ import { getDb, type Db } from './db/client';
 import { DslError, onReadOnlyLake, type DiffCounts, type TagTransition } from './dsl-definitions';
 import { mappings, mappingVersions, spaces, tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
 import { pendingMerge } from './mappings';
-import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
+import { discard, type DraftRow, publish, PublishError, saveDraft as savePublishable, type PublishableAdapter } from './publishing';
+import { publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
 import { lit } from '../lib/mapping-expr';
 import { rows } from './pipeline/duck-sql';
@@ -23,10 +25,8 @@ import { insertTask } from './tasks';
 
 export { TASK_KINDS, templateOfKind, type TemplateId } from './pipeline/templates';
 
-/** 可以展示给成员的业务错误 */
-export class TemplateError extends Error {
-  constructor(message: string, readonly status: 400 | 403 | 404 = 400) { super(message); }
-}
+/** 可以展示给成员的业务错误：发布流程的错误继承 PublishError（ADR-0051） */
+export class TemplateError extends PublishError {}
 
 function requireTemplate(id: string): TemplateId {
   if (!Object.hasOwn(TEMPLATES, id)) throw new TemplateError(`没有分析模板 ${id}`, 404);
@@ -103,6 +103,78 @@ export async function getTemplate(actor: CurrentMember, id: string) {
   };
 }
 
+/** templateAdapter 的上下文：租户、空间与模板；保存时另带这一版草稿锁定的模板版本（checkSave 与 saveInside 要用，发布 / 丢弃用不到） */
+interface TemplateCtx { tenantId: string; spaceId: string; template: TemplateId; templateVersion?: number }
+
+/** 保存时的上下文：入口读出最新一版锁定的模板版本后带上（publishing.ts 的 saveInside 收不到保存的输入，见 #497） */
+type TemplateSaveCtx = TemplateCtx & { templateVersion: number };
+
+/** 模板版本的内容列：发布流程里 checkOutside、afterPublish 与审计收到的草稿带上它们 */
+type TemplateDraft = DraftRow & { params: Record<string, unknown>; templateVersion: number };
+
+/** enqueueTemplate 入队的模板任务（publishTemplate 返回它） */
+type QueuedTemplate = Awaited<ReturnType<typeof enqueueTemplate>>;
+
+/**
+ * 模板定义接入 publishing.ts 的适配器（ADR-0051）：第一次保存时懒建定义父行，保存要用的值（草稿锁定的模板版本、
+ * 第一次保存记下的空间，ADR-0048）放在 ctx 里传。发布不锁租户行、不查排队中的任务：发布总要按新参数算一次（ADR-0021）。
+ * 发布后以这一版的参数加上当天的 asOf 入队一次模板任务（来源 publish），审计在入队之后
+ */
+export const templateAdapter: PublishableAdapter<TemplateCtx, Record<string, unknown>, undefined, QueuedTemplate> = {
+  parent: templateDefinitions,
+  versions: templateVersions,
+  versionsFk: templateVersions.definitionId,
+  lockTenant: false,
+  // 丢弃从没发布过的定义会删除它：拿不到锁住的行说明没有草稿可丢
+  lockParent: async (tx, ctx) => {
+    const [locked] = await tx.select({ id: templateDefinitions.id }).from(templateDefinitions)
+      .where(ofDefinition(ctx.tenantId, ctx.template)).for('update');
+    if (!locked) throw new TemplateError('这个模板没有草稿');
+    return locked.id;
+  },
+  checkSave: async (ctx, params) => {
+    const { template, templateVersion } = ctx as TemplateSaveCtx;
+    // templateVersion 一定要放进返回的列：publishing.ts 插入新版本时只写这些列，漏了它就会取列默认值 1
+    return { params: checked(lockedTemplate(template, templateVersion), params), templateVersion };
+  },
+  saveInside: async (tx, ctx) => {
+    const { templateVersion } = ctx as TemplateSaveCtx;
+    await tx.insert(templateDefinitions).values({ tenantId: ctx.tenantId, spaceId: ctx.spaceId, template: ctx.template }).onConflictDoNothing();
+    // 锁住定义行：与发布、丢弃互斥；插入与加锁之间定义可能因丢弃草稿被删除
+    const [locked] = await tx.select({ id: templateDefinitions.id }).from(templateDefinitions)
+      .where(ofDefinition(ctx.tenantId, ctx.template)).for('update');
+    if (!locked) throw new TemplateError('模板定义刚被修改，请刷新后重试');
+    // checkSave 在事务外按当时最新一版锁定的模板版本校验，这里再读一次：防止校验之后 upgradeTemplateDraft 改了草稿锁定的版本。
+    // 随后 lockParent 会对同一行再加一次锁，没有影响
+    const [latest] = await tx.select({ templateVersion: templateVersions.templateVersion }).from(templateVersions)
+      .where(eq(templateVersions.definitionId, locked.id)).orderBy(desc(templateVersions.version)).limit(1);
+    if ((latest?.templateVersion ?? latestTemplate(ctx.template).version) !== templateVersion) {
+      throw new TemplateError('模板定义刚被修改，请刷新后重试');
+    }
+  },
+  // 发布前再校验一次参数（对应发布入口原来的再次校验）；publishing.ts 改状态时不写 params，存的就是校验后的参数
+  checkOutside: async (draft, ctx) => {
+    const { params, templateVersion } = draft as TemplateDraft;
+    checked(lockedTemplate(ctx.template, templateVersion), params);
+  },
+  afterPublish: async (tx, draft, ctx) => {
+    const { params, templateVersion } = draft as TemplateDraft;
+    return enqueueTemplate(tx, ctx.tenantId, ctx.template, checked(lockedTemplate(ctx.template, templateVersion), params), draft.version, todayUtc(), 'publish');
+  },
+  audit: {
+    drafted: { action: 'template.drafted', detail: (ctx, _columns, version) => ({ template: ctx.template, version }) },
+    published: {
+      action: 'template.published',
+      detail: (ctx, draft) => ({ template: ctx.template, version: draft.version, authors: draft.authors, lastEditor: draft.lastEditor }),
+    },
+    // audit.ts 的文案读 detail 里的 published，这个字段名不能改
+    discarded: { action: 'template.draft_discarded', detail: (ctx, version, published) => ({ template: ctx.template, version, published }) },
+    targetType: 'template',
+  },
+  missingVersion: version => `没有第 ${version} 版`,
+  noDraft: () => '这个模板没有草稿',
+};
+
 /**
  * 保存草稿：已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
  * 第一次保存时建立本租户这个模板的定义。草稿锁定的模板版本：已有草稿时不变，否则沿用最近的已发布版本锁定的，
@@ -111,36 +183,14 @@ export async function getTemplate(actor: CurrentMember, id: string) {
 export async function saveDraft(actor: CurrentMember, id: string, params: Record<string, unknown>) {
   assertCan(actor, 'definitions:draft');
   const template = requireTemplate(id);
-  return getDb().transaction(async tx => {
-    await tx.insert(templateDefinitions).values({ tenantId: actor.tenant.id, spaceId: actor.space.id, template }).onConflictDoNothing();
-    // 锁住定义行：与发布、丢弃互斥
-    const [locked] = await tx.select({ id: templateDefinitions.id }).from(templateDefinitions)
-      .where(ofDefinition(actor.tenant.id, template)).for('update');
-    // 插入与加锁之间定义可能因丢弃草稿被删除
-    if (!locked) throw new TemplateError('模板定义刚被修改，请刷新后重试');
-    const definitionId = locked.id;
-    const [latest] = await tx.select().from(templateVersions)
-      .where(eq(templateVersions.definitionId, definitionId)).orderBy(desc(templateVersions.version)).limit(1);
-    // 最新一版是草稿时沿用草稿的（草稿新建时已沿用最近的已发布版本），否则它就是最近的已发布版本
-    const templateVersion = latest?.templateVersion ?? latestTemplate(template).version;
-    const definition = checked(lockedTemplate(template, templateVersion), params);
-    if (latest?.status === 'draft') {
-      await tx.update(templateVersions).set({ params: definition, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
-        .where(eq(templateVersions.id, latest.id));
-      return latest.version;
-    }
-    const version = (latest?.version ?? 0) + 1;
-    await tx.insert(templateVersions).values({ definitionId, version, params: definition, templateVersion, authors: [actor.email], lastEditor: actor.email });
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'template.drafted',
-      targetType: 'template',
-      targetId: definitionId,
-      detail: { template, version },
-    });
-    return version;
-  });
+  // 最新一版是草稿时沿用草稿的（草稿新建时已沿用最近的已发布版本），否则它就是最近的已发布版本；
+  // 事务外的这次读取只定校验用的版本，并发下的一致性由 saveInside 里的比对保证
+  const [latest] = await getDb().select({ templateVersion: templateVersions.templateVersion }).from(templateVersions)
+    .innerJoin(templateDefinitions, eq(templateDefinitions.id, templateVersions.definitionId))
+    .where(ofDefinition(actor.tenant.id, template))
+    .orderBy(desc(templateVersions.version)).limit(1);
+  const templateVersion = latest?.templateVersion ?? latestTemplate(template).version;
+  return savePublishable(templateAdapter, actor, { tenantId: actor.tenant.id, spaceId: actor.space.id, template, templateVersion }, params);
 }
 
 /**
@@ -150,35 +200,10 @@ export async function saveDraft(actor: CurrentMember, id: string, params: Record
 export async function publishTemplate(actor: CurrentMember, id: string, version: number) {
   assertCan(actor, 'publish');
   const template = requireTemplate(id);
-  const [draft] = await getDb().select(getTableColumns(templateVersions)).from(templateVersions)
-    .innerJoin(templateDefinitions, eq(templateDefinitions.id, templateVersions.definitionId))
-    .where(and(ofDefinition(actor.tenant.id, template), eq(templateVersions.version, version)));
-  if (!draft) throw new TemplateError(`没有第 ${version} 版`, 404);
-  const blocker = publishBlocker(actor, draft);
-  if (blocker) throw new TemplateError(blocker, draft.status === 'draft' ? 403 : 400);
-  const definition = checked(lockedTemplate(template, draft.templateVersion), draft.params);
-  return getDb().transaction(async tx => {
-    // 锁住定义行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿。不锁租户行、不查排队中的任务：发布总要按新参数算一次（ADR-0021）
-    await tx.select({ id: templateDefinitions.id }).from(templateDefinitions).where(eq(templateDefinitions.id, draft.definitionId)).for('update');
-    const [current] = await tx.select().from(templateVersions).where(eq(templateVersions.id, draft.id));
-    if (isStale(current, draft)) {
-      throw new TemplateError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
-    }
-    await tx.update(templateVersions)
-      .set({ status: 'published', params: definition, publishedByEmail: actor.email, publishedAt: sql`now()` })
-      .where(eq(templateVersions.id, draft.id));
-    const task = await enqueueTemplate(tx, actor.tenant.id, template, definition, version, todayUtc(), 'publish');
-    // 审计放在入队之后：记目录版本拿的锁要是事务里最后一个锁（见 catalog/versions.ts）
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'template.published',
-      targetType: 'template',
-      targetId: draft.definitionId,
-      detail: { template, version, authors: draft.authors, lastEditor: draft.lastEditor },
-    });
-    return task;
-  });
+  const [definition] = await getDb().select({ id: templateDefinitions.id }).from(templateDefinitions)
+    .where(ofDefinition(actor.tenant.id, template));
+  if (!definition) throw new TemplateError(`没有第 ${version} 版`, 404);
+  return publish(templateAdapter, actor, { tenantId: actor.tenant.id, spaceId: actor.space.id, template, parentId: definition.id }, version);
 }
 
 /**
@@ -325,35 +350,12 @@ export async function upgradeTemplateDraft(actor: CurrentMember, id: string) {
 
 /**
  * 丢弃草稿：回到最近的已发布版本；从没发布过的定义整个删除（回到注册表里的默认参数）。
- * 用于草稿卡住（如最后保存的人离职）的情况。返回回到的已发布版本号（没有时为 null）
+ * 用于草稿卡住（如最后保存的人离职）的情况。返回定义是否还在
  */
 export async function discardDraft(actor: CurrentMember, id: string) {
   assertCan(actor, 'definitions:draft');
   const template = requireTemplate(id);
-  return getDb().transaction(async tx => {
-    // 锁住定义行：与保存、发布互斥
-    const [definition] = await tx.select({ id: templateDefinitions.id }).from(templateDefinitions)
-      .where(ofDefinition(actor.tenant.id, template)).for('update');
-    const versions = definition
-      ? await tx.select({ id: templateVersions.id, version: templateVersions.version, status: templateVersions.status })
-        .from(templateVersions).where(eq(templateVersions.definitionId, definition.id)).orderBy(desc(templateVersions.version))
-      : [];
-    const draft = versions.find(v => v.status === 'draft');
-    if (!definition || !draft) throw new TemplateError('这个模板没有草稿');
-    const published = versions.find(v => v.status === 'published')?.version ?? null;
-    // 从没发布过时删除定义，各版本随之级联删除
-    if (published) await tx.delete(templateVersions).where(eq(templateVersions.id, draft.id));
-    else await tx.delete(templateDefinitions).where(eq(templateDefinitions.id, definition.id));
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'template.draft_discarded',
-      targetType: 'template',
-      targetId: definition.id,
-      detail: { template, version: draft.version, published },
-    });
-    return { published };
-  });
+  return discard(templateAdapter, actor, { tenantId: actor.tenant.id, spaceId: actor.space.id, template });
 }
 
 /** 平台自动启用模板时的作者与发布者（不是成员） */
