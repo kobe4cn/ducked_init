@@ -1,5 +1,5 @@
 // test/pipeline/merge-groups.test.ts —— 合并组的接缝（ADR-0032；保存 / 发布 / 丢弃经 publishing.ts 接入 ADR-0051，发布流程本身的用例见 publishing.test.ts）：
-// 发布后入队带 rebuild 的合并（新旧组员的并集）、更新草稿不写审计、已有合并在运行时发布被拒并回滚；
+// 发布后入队带 rebuild 的合并（组员改了时取新旧组员的并集，被移出组的映射也重建）、更新草稿不写审计、已有合并在运行时发布被拒并回滚；
 // publishedMergeGroups 给出每个实体最新的已发布组；checkMergeGroup 是保存与发布共用的纯函数校验
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -11,7 +11,7 @@ import {
   checkMergeGroup, discardMergeGroupDraft, listMergeGroups, type MergeCandidate, publishedMergeGroups, publishMergeGroup, saveMergeGroupDraft,
 } from '../../app/.server/merge-groups';
 import { resetDb } from '../http/harness';
-import { drain, memberOf } from './fixtures';
+import { drain, memberOf, publish } from './fixtures';
 import { LOYALTY_ORDERS, publishedIdentitySources } from './identity-fixtures';
 import { mergedMappings } from './mapping-fixtures';
 
@@ -25,8 +25,8 @@ async function withOrders() {
 }
 
 describe('合并组发布', () => {
-  it('发布合并组：只给最新已发布版本、页面列出候选与发布不了的原因，发布后入队带 rebuild 的合并，更新草稿不写审计', async () => {
-    const { acme, author, reviewer, orders } = await withOrders();
+  it('发布合并组：只给最新已发布版本、页面列出候选与发布不了的原因，发布后入队带 rebuild 的合并（新旧组员的并集），更新草稿不写审计', async () => {
+    const { acme, author, reviewer, orders, sources } = await withOrders();
     const analyst = await memberOf(acme, 'an@acme.com', 'analyst');
     // 入口权限：分析师不能起草与发布
     await expect(saveMergeGroupDraft(analyst, 'order', { members: orders, rule: { kind: 'priority' } })).rejects.toMatchObject({ init: { status: 403 } });
@@ -61,10 +61,14 @@ describe('合并组发布', () => {
     expect((await listAuditLogs(acme)).filter(l => l.action.includes('合并组')).map(l => l.action))
       .toEqual(['丢弃合并组草稿', '保存合并组草稿', '发布合并组', '保存合并组草稿']);
 
-    // 发布成员改了的一版：入队的任务带 rebuild，组员是新旧组员的并集
-    expect(await saveMergeGroupDraft(author, 'order', { members: reordered, rule: { kind: 'coalesce' } })).toBe(2);
+    // 发布组员改了的一版：v2 去掉 CRM 订单、加入第三个订单映射（CRM 的 customers 表写成 A1..A7）；
+    // 入队的任务带 rebuild，组员是新旧组员的并集，含被移出组的 CRM 订单
+    const third = await publish(author, reviewer, sources.crm, "model: 1\nentity: order\ntable: customers\nfields:\n  order_id: concat('A', string(id))\n");
+    await drain();
+    const [crmOrders, loyaltyOrders] = orders;
+    expect(await saveMergeGroupDraft(author, 'order', { members: [loyaltyOrders, third], rule: { kind: 'coalesce' } })).toBe(2);
     const rebuilt = await publishMergeGroup(reviewer, 'order', 2);
-    expect(mergedMappings(rebuilt!)).toEqual([...new Set([...reordered, ...orders])].sort());
+    expect(mergedMappings(rebuilt!)).toEqual([crmOrders, loyaltyOrders, third].sort());
     expect((rebuilt!.params.mappings as { rebuild: boolean }[]).every(m => m.rebuild)).toBe(true);
   });
 
