@@ -836,6 +836,20 @@ export const knowledgeProposals = platform.table('knowledge_proposals', {
   index('knowledge_proposals_tenant_target_idx').on(t.tenantId, t.targetId),
 ]);
 
+// 按主题生成提案的代次记录（ADR-0046 入口③）：每次成功生成一行。input_hash 是 subjectInput 的 inputHash（含主题名），同一个
+// (租户, 主题, 输入, 生成器版本) 再点不再调模型（直接返回没有新内容）；主题名、条目或知识变了（hash 不同）会再生成。
+// proposal_count 是这次新建的提案数；模型失败不记行，再点还会调模型
+export const knowledgeGenerations = platform.table('knowledge_generations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  subjectId: uuid('subject_id').notNull().references(() => analysisSubjects.id, { onDelete: 'cascade' }),
+  inputHash: text('input_hash').notNull(),
+  generatorVersion: text('generator_version').notNull(),
+  proposalCount: integer('proposal_count').notNull(),
+  createdByEmail: text('created_by_email').notNull(),
+  createdAt: createdAt(),
+}, t => [uniqueIndex('knowledge_generations_tenant_subject_hash_version_uq').on(t.tenantId, t.subjectId, t.inputHash, t.generatorVersion)]);
+
 // 语义目录的版本（ADR-0041）：目录的结构或含义变了才记一版。snapshot 是去掉统计后的全部条目，diff 是与上一版按条目标识比出的差异；
 // reason 是触发的审计动作（或 catalog.initial 之类）
 export const catalogVersions = platform.table('catalog_versions', {
