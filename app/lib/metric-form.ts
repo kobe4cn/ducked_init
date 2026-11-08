@@ -208,6 +208,24 @@ const condsOut = (conds: readonly Cond[], fields: Map<string, FormField>) => con
   return { field: c.field, op: c.op, ...(value !== undefined ? { value } : {}) };
 });
 
+/** 列表里只读的条目（key 为 `${at}.<下标>`）按原下标放回 holder[key]，表单里的条目按顺序填进剩下的位置 */
+function placeBack(holder: Record<string, unknown>, key: string, at: string, readonly: readonly ReadonlyItem[]): void {
+  const raws = new Map<number, unknown>();
+  for (const r of readonly) {
+    const i = r.key.startsWith(`${at}.`) ? r.key.slice(at.length + 1) : '';
+    if (/^\d+$/.test(i)) raws.set(Number(i), r.raw);
+  }
+  if (!raws.size) return;
+  const built = ((holder[key] as unknown[] | undefined) ?? []).slice();
+  const out: unknown[] = [];
+  for (let i = 0; i <= Math.max(...raws.keys()); i++) {
+    const raw = raws.get(i);
+    if (raw !== undefined) out.push(raw);
+    else if (built.length) out.push(built.shift()!);
+  }
+  holder[key] = [...out, ...built];
+}
+
 /** 表单 → 指标定义 YAML：只写当前 agg 适用的键（切换 agg 后不适用的键自然丢掉），只读项用 raw 原样写回 */
 export function formToYaml(form: MetricForm, fields: FormField[]): string {
   const whole = form.readonly.find(r => r.key === '$yaml');
@@ -227,40 +245,34 @@ export function formToYaml(form: MetricForm, fields: FormField[]): string {
     ...(form.dimensions.length ? { dimensions: form.dimensions.map(d => ({ name: d.name, path: d.path })) } : {}),
     ...(form.description !== undefined ? { description: form.description } : {}),
   };
-  // 只读的过滤 / 维度条目按原下标放回，表单里的条目填进剩下的位置
-  for (const key of ['filter', 'dimensions'] as const) {
-    const raws = new Map<number, unknown>();
-    for (const r of form.readonly) {
-      const m = new RegExp(`^${key}\\.(\\d+)$`).exec(r.key);
-      if (m) raws.set(Number(m[1]), r.raw);
-    }
-    if (!raws.size) continue;
-    const built = ((spec[key] as unknown[] | undefined) ?? []).slice();
-    const out: unknown[] = [];
-    for (let i = 0; i <= Math.max(...raws.keys()); i++) {
-      const raw = raws.get(i);
-      if (raw !== undefined) out.push(raw);
-      else if (built.length) out.push(built.shift()!);
-    }
-    spec[key] = [...out, ...built];
-  }
-  // 其余只读项放回：整个 measure 直接写回时它里面的条目不放；measure.field / by / 分子分母只在当前 agg 还用得上时放
-  const wholeMeasure = form.readonly.find(r => r.key === 'measure');
+  for (const key of ['filter', 'dimensions'] as const) placeBack(spec, key, key, form.readonly);
+  // measure 里的只读项放回：整个 measure 只读时直接写回；否则只放当前 agg 还用得上的位置（ratio 放分子、分母，别的放 field / by）
+  const find = (key: string) => form.readonly.find(r => r.key === key);
+  const wholeMeasure = find('measure');
   if (wholeMeasure) spec.measure = wholeMeasure.raw;
-  for (const r of form.readonly) {
-    if (r.key === '$yaml' || r.key === 'measure' || /^(filter|dimensions)\.\d+$/.test(r.key)) continue;
-    if (r.key.startsWith('measure.')) {
-      if (wholeMeasure) continue;
-      const name = r.key.slice('measure.'.length);
-      const stale = (name === 'field' && form.agg === 'ratio')
-        || (name === 'by' && form.agg !== 'latest' && form.agg !== 'earliest')
-        || ((name.startsWith('numerator') || name.startsWith('denominator')) && form.agg !== 'ratio');
-      if (stale) continue;
-      const parts = name.split('.');
-      const holder = (parts.length === 2 ? (measure[parts[0]!] as Record<string, unknown> | undefined) : measure);
-      if (holder) holder[parts[parts.length - 1]!] = r.raw;
-      continue;
+  else if (form.agg === 'ratio') {
+    for (const at of ['numerator', 'denominator'] as const) {
+      const wholePart = find(`measure.${at}`);
+      if (wholePart) {
+        measure[at] = wholePart.raw;
+        continue;
+      }
+      const part = measure[at] as Record<string, unknown>;
+      for (const k of ['field', 'filter'] as const) {
+        const r = find(`measure.${at}.${k}`);
+        if (r) part[k] = r.raw;
+      }
+      placeBack(part, 'filter', `measure.${at}.filter`, form.readonly);
     }
+  } else {
+    const field = find('measure.field');
+    if (field) measure.field = field.raw;
+    const by = find('measure.by');
+    if (by && (form.agg === 'latest' || form.agg === 'earliest')) measure.by = by.raw;
+  }
+  // 其余只读项是顶层键，原样写回
+  for (const r of form.readonly) {
+    if (r.key === '$yaml' || r.key === 'measure' || r.key.startsWith('measure.') || /^(filter|dimensions)\.\d+$/.test(r.key)) continue;
     spec[r.key] = r.raw;
   }
   return stringify(spec);
