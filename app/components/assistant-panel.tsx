@@ -4,17 +4,21 @@
 // 每次发送带上当前页面的路径与标题，答复下面列出本轮用过的工具。
 // 工作台结果解读存下的消息带 query：显示 SQL、行数与列名，链接「在工作台重新执行」把 SQL 填进工作台编辑框（不执行，用的是打开者自己的权限）。
 // 本轮 prefill_workbench 通过校验的答复带 workbenchSql（#437）：正文下有「填入工作台」链接，点开只把 SQL 放进工作台编辑框（?sql= 不重新校验、不执行，由成员自己执行）
+// 带 plan 的答复在读时按读者自己的目录另带 planCard（#452，P4⑯a）：正文下渲染一张计划卡（PlanCard，校验结果、所选条目、依据、
+// 窗口 / 粒度 / 维度 / 人群与数据截至），新发的回答与打开历史对话都显示；卡片只进响应，不进发给模型的历史
 import { useEffect, useRef, useState } from 'react';
 import { Link, useFetcher, useLocation } from 'react-router';
 import { AlertTriangle, History, Send, Sparkles, X } from 'lucide-react';
+import { PlanCard } from '~/components/plan-card';
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
+import type { PlanCardView } from '~/.server/assistant/plan-card';
 
-interface Message { role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: { sql: string; rows: number; columns: string[] }; workbenchSql?: string }
+interface Message { role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: { sql: string; rows: number; columns: string[] }; workbenchSql?: string; planCard?: PlanCardView }
 interface Summary { id: string; title: string; updatedAt: string; owner?: string }
 interface Conversation { id: string; title: string; messages: Message[]; owned: boolean; sharedWith: string[] }
 type Overview = { configured: boolean; toolSupport: boolean | null; canManageProvider: boolean; tools: string[]; mine: Summary[]; shared: Summary[]; conversation?: Conversation } | { error: string };
-type TurnResult = { conversationId: string; reply: string; toolsUsed: string[]; workbenchSql?: string } | { error: string };
+type TurnResult = { conversationId: string; reply: string; toolsUsed: string[]; workbenchSql?: string; planCard?: PlanCardView } | { error: string };
 type ShareResult = { ok: true; email: string } | { error: string };
 
 const JSON_POST = { method: 'post', action: '/assistant', encType: 'application/json' } as const;
@@ -56,7 +60,7 @@ export function AssistantPanel() {
       setInput(current => current || messages.at(-1)?.content || '');
     } else {
       setConversationId(data.conversationId);
-      setMessages(m => [...m, { role: 'assistant', content: data.reply, toolsUsed: data.toolsUsed, ...(data.workbenchSql ? { workbenchSql: data.workbenchSql } : {}) }]);
+      setMessages(m => [...m, { role: 'assistant', content: data.reply, toolsUsed: data.toolsUsed, ...(data.workbenchSql ? { workbenchSql: data.workbenchSql } : {}), ...(data.planCard ? { planCard: data.planCard } : {}) }]);
       overview.load('/assistant');
     }
   }, [turn.state, turn.data]);
@@ -199,6 +203,7 @@ export function AssistantPanel() {
                     ) : (
                       <>
                         <p className="whitespace-pre-wrap">{m.content}</p>
+                        {m.planCard && <PlanCard card={m.planCard} />}
                         {m.workbenchSql && <Link data-prefill to={`/workbench?sql=${encodeURIComponent(m.workbenchSql)}`} className="text-xs underline">填入工作台</Link>}
                       </>
                     )}
