@@ -3,6 +3,7 @@
 // 不合法时报一句话。本文件不连平台库、不建 DuckDB：只运行时依赖 zod 与纯模块（templates、sources），
 // engine 一律 import type（ADR-0008），所以入队侧也能安全地引它
 import { z } from 'zod';
+import { MERGE_RULE_KINDS } from '../../lib/merge-groups';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { TASK_KINDS, TEMPLATES, type TemplateId } from './templates';
 import type { AssertionResult } from './assertions';
@@ -110,10 +111,9 @@ const nullableString = (message: string) => z.union([z.string(error(message)), z
 /** 合并参数里的映射（原 mergeMappings + isMergeGroup）：已发布的版本及其合并计划，发布时已校验过，这里只核对形状 */
 const MAPPINGS = '参数 mappings 必须是非空的已发布映射列表';
 /** 合并组的存活规则（ADR-0032）：latest 另带取最新的字段 */
-const mergeRule = z.union([
-  z.object({ kind: z.literal('latest', error(MAPPINGS)), field: z.string(error(MAPPINGS)) }, error(MAPPINGS)).loose(),
-  z.object({ kind: z.enum(['priority', 'coalesce'], error(MAPPINGS)) }, error(MAPPINGS)).loose(),
-], error(MAPPINGS));
+const mergeRule = z.object({ kind: z.enum(MERGE_RULE_KINDS, error(MAPPINGS)), field: z.unknown().optional() }, error(MAPPINGS))
+  .refine(r => r.kind !== 'latest' || typeof r.field === 'string', error(MAPPINGS))
+  .loose();
 /** 合并组的一个组员（ADR-0032）：从它的当前记录按去重键与取最新字段取每个键最新的一行，refs 是引用列旁的数据源列 */
 const groupMember = z.object({
   mapping: z.string(error(MAPPINGS)),

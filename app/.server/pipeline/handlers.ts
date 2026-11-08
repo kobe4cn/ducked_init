@@ -75,7 +75,7 @@ function templateTask(id: TemplateId): Handler<TemplateKind> {
     async run(con, raw, { taskId }) {
       // 契约是占位的：只查参数是个对象，真正的模板契约在 #473
       const params = CONTRACTS[TASK_KINDS[id]].params.parse(raw) as Record<string, unknown>;
-      // templateVersion 要在 parse 之前剥掉：parse 拒绝不认识的键
+      // templateVersion 要在 template.parse 之前剥掉：模板的 parse 拒绝不认识的键
       const { definitionVersion: _, trigger: __, templateVersion, ...rest } = params;
       // 各模板的参数类型不同，这里只在 parse 与 compile 之间传递
       if (templateVersion !== undefined && !Number.isInteger(templateVersion)) throw new Error('参数 templateVersion 必须是整数');
