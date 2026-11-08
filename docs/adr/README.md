@@ -54,3 +54,4 @@
 | [0048](0048-definitions-carry-space.md) | `dsl_definitions` 加 `space_id`，记为当前空间（与数据源、映射一样），检索用它加权和过滤；不按空间隔离，空间不是安全边界；完整的多空间另立项目 | 空间、`space_id`、定义的归属、多空间 |
 | [0049](0049-optional-embedding-endpoint.md) | `model_providers` 加可选的 embedding 端点（平台默认与租户两级，整套覆盖、不混用，Key 按租户信封加密）；外发的只有已经发给 chat 的可见性投影文本，不另设外发政策；embed 与 chat 走同一套超时与调用记录；换模型就由调度器重算；没配置或失败时只走关键词检索 | embedding、模型服务配置、向量检索、`llm.ts` |
 | [0050](0050-analysis-plan-validation.md) | 分析计划是对话里的结构化产物（不建表、不做状态机），助手经 `validate_plan` 提交；五种模式 `reuse_result` / `draft_definition` / `draft_query` / `clarify` / `unsupported`；四类检查（硬性、口径、可加性、平台能力），结果为 valid / needs_clarification / unsupported / invalid；执行前用当前元数据重新校验；执行仍走现有入口 | 分析计划、`validate_plan`、助手工具、选择复用还是起草、可加性 |
+| [0051](0051-one-publishing-module.md) | 可发布项的保存、发布、丢弃由 `publishing.ts` 一个模块负责，各种可发布项通过适配器接入（表、租户锁、事务外 / 事务内检查、发布后 / 丢弃后动作）；审计永远是发布事务里最后一步；流程错误继承 `PublishError`；不合并版本表 | 任何可发布项的保存、发布、丢弃，新增一种可发布项，`publish-rules.ts`、`publishing.ts` |
