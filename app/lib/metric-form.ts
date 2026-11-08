@@ -4,7 +4,7 @@
 // in / not_in 写列表），只写当前 agg 适用的键（切换 agg 后不适用的键自然丢掉，METRIC_SCHEMA 的 allOf），维度最多 MAX_DIMENSIONS 个。
 // YAML → 表单：认不出的写法（consumer_via、device_attribution、维度的 as_of、含 -> 或 consumer. 前缀的路径、Schema 之外的键或非标量取值、不认识的顶层键）
 // 标成只读并说明原因，原始值原样保存在 readonly[].raw 里，formToYaml 原样写回，保证往返不丢信息（ADR-0017：YAML 仍是唯一格式）。
-// summarize 是四句摘要：计算什么 / 排除什么 / 按什么时间 / ratio 时分母为 0 或为空怎么办（ADR-0025，措辞参考 .server/knowledge/derive.ts 的口径文字，那是 .server 的不能 import）。
+// summarize 是四句摘要：计算什么 / 只算哪些记录 / 按什么时间 / ratio 时分母为 0 或为空怎么办（ADR-0025，措辞参考 .server/knowledge/derive.ts 的口径文字，那是 .server 的不能 import）。
 // 只能 import app/lib 里的东西（.server 的只能 import type）
 import { parseDocument, stringify } from 'yaml';
 import type { FieldType } from './canonical-model';
@@ -297,9 +297,9 @@ const FILTER_TEXT = {
   not_null: () => '不为空',
 } satisfies Record<(typeof FILTER_OPS)[number], (v: string) => string>;
 
-/** 过滤条件逐条中文化；mark 给 ratio 分子、分母自己的过滤加前缀 */
-const filterTexts = (conds: readonly Cond[], fields: readonly FormField[], mark = '') =>
-  conds.map(c => `${mark}${labelOf(c.field, fields)} ${FILTER_TEXT[c.op](show(c.value))}`.trim());
+/** 过滤条件逐条中文化 */
+const filterTexts = (conds: readonly Cond[], fields: readonly FormField[]) =>
+  conds.map(c => `${labelOf(c.field, fields)} ${FILTER_TEXT[c.op](show(c.value))}`.trim());
 
 /** 第一句的主体：聚合与字段（用中文名）；ratio 写成「分子…÷ 分母…」 */
 function measurePhrase(form: MetricForm, fields: readonly FormField[]): string {
@@ -328,18 +328,19 @@ function measurePhrase(form: MetricForm, fields: readonly FormField[]): string {
 }
 
 /**
- * 指标表单的四句摘要：① 计算什么（聚合与字段）② 排除什么（顶层与 ratio 分子、分母的过滤逐条中文化，多条用「并且」，没有时「不排除任何记录」）
+ * 指标表单的四句摘要：① 计算什么（聚合与字段）② 只算哪些记录（filter 只保留满足条件的行：顶层写「只算 … 的记录」，ratio 分子、分母自己的过滤写「分子只算 … 的记录」，多条用「并且」，没有任何过滤时「不排除任何记录」）
  * ③ 按什么时间（「近 N 天，按 xx 时间」，没有时「不限时间」）④ ratio 时「分母为 0 或为空时结果记为空」（与 compileMetric 的 NULLIF 一致）；非 ratio 时省略，返回三句
  */
 export function summarize(form: MetricForm, fields: readonly FormField[]): string[] {
-  const conds = [
-    ...filterTexts(form.filter, fields),
-    ...filterTexts(form.numerator?.filter ?? [], fields, '分子里 '),
-    ...filterTexts(form.denominator?.filter ?? [], fields, '分母里 '),
+  // filter 只保留满足条件的行（全部满足）；分子、分母自己的 filter 只限制分子或分母，各自写明范围
+  const scope = (who: string, conds: readonly Cond[]) => conds.length ? [`${who}只算 ${filterTexts(conds, fields).join('并且')} 的记录`] : [];
+  const scopes = [
+    ...scope('', form.filter),
+    ...(form.agg === 'ratio' ? [...scope('分子', form.numerator?.filter ?? []), ...scope('分母', form.denominator?.filter ?? [])] : []),
   ];
   return [
     `计算${measurePhrase(form, fields)}。`,
-    conds.length ? `排除${conds.join('并且')}的记录。` : '不排除任何记录。',
+    scopes.length ? `${scopes.join('；')}。` : '不排除任何记录。',
     form.window ? `近 ${form.window.days} 天，按${labelOf(form.window.field, fields)}。` : '不限时间。',
     ...(form.agg === 'ratio' ? ['分母为 0 或为空时结果记为空。'] : []),
   ];

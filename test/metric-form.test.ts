@@ -1,7 +1,7 @@
 // test/metric-form.test.ts —— 指标表单 ↔ MetricSpec YAML 互转与四句摘要（纯函数，不碰库）：opsFor 按字段类型给出可用运算（boolean / string 受限，没有 OR / any）；
 // count / sum / ratio / latest 的表单写成 YAML 过 checkMetric，读回与原表单相等（往返不丢信息，取值按字段类型转换）；
 // consumer_via、device_attribution、路径（-> / consumer.）、维度的 as_of 与不认识的键标成只读并说明原因，raw 原样写回后仍过 checkMetric、与原定义深相等；
-// summarize 四句（ratio + 过滤 + 窗口）与非 ratio 三句的全文
+// summarize 四句（ratio + 过滤 + 窗口）与非 ratio 三句的全文；过滤句写「只算…的记录」，分子、分母的过滤各自写明范围
 import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf, type CustomEntityField, type EntityRelation } from '../app/lib/canonical-model';
@@ -158,7 +158,7 @@ describe('四句摘要', () => {
       window: { field: 'created_at', days: 30 },
     }, ORDER)).toEqual([
       '计算分子行数 ÷ 分母实付金额求和。',
-      '排除渠道 不为空并且分子里 订单状态 等于 paid的记录。',
+      '只算 渠道 不为空 的记录；分子只算 订单状态 等于 paid 的记录。',
       '近 30 天，按下单时间。',
       '分母为 0 或为空时结果记为空。',
     ]);
@@ -166,6 +166,15 @@ describe('四句摘要', () => {
 
   it('非 ratio、无窗口时三句：聚合、过滤、不限时间', () => {
     expect(summarize({ base: 'order', agg: 'count', ...empty, filter: [{ field: 'status', op: 'eq', value: 'paid' }] }, ORDER))
-      .toEqual(['计算行数。', '排除订单状态 等于 paid的记录。', '不限时间。']);
+      .toEqual(['计算行数。', '只算 订单状态 等于 paid 的记录。', '不限时间。']);
+  });
+
+  it('ratio 只有分母过滤时第二句只说分母的范围，不说成排除整个指标的记录', () => {
+    expect(summarize({
+      base: 'order', agg: 'ratio', ...empty,
+      numerator: { agg: 'count', filter: [] },
+      denominator: { agg: 'count', filter: [{ field: 'status', op: 'in', value: ['paid', 'completed'] }, { field: 'channel', op: 'not_null' }] },
+    }, ORDER)[1]).toBe('分母只算 订单状态 在 paid、completed 中并且渠道 不为空 的记录。');
+    expect(summarize({ base: 'order', agg: 'count', ...empty }, ORDER)[1]).toBe('不排除任何记录。');
   });
 });
