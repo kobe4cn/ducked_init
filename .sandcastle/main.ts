@@ -1231,7 +1231,10 @@ async function schedule(): Promise<ScheduleResult> {
   // 有 open blocker 的票脚本直接跳过，不开会话（prep agent 遇到这种票也只会什么都不改就结束）；
   // 跳过的票仍留在 toPrep 里，下面判断「这次拆出了新子票」时不会把它当成新票。
   // 撞上用量限额不在这里等（会占着宿主机锁，做完的票落不了地）：停止这次 prep，交给主循环决定等多久。
-  const toPrep = listIssues([LABEL.picked], [LABEL.prepped, LABEL.prOpen, LABEL.stuck]).filter((issue) => allowed(issue.number));
+  // 按编号从小到大：和 plan 的顺序一致，早建的票（通常是后面票的 blocker）先 prep、先开工。
+  const toPrep = listIssues([LABEL.picked], [LABEL.prepped, LABEL.prOpen, LABEL.stuck])
+    .filter((issue) => allowed(issue.number))
+    .sort((a, b) => a.number - b.number);
   let prepLimitedUntil: number | undefined;
   for (const issue of toPrep) {
     const open = openBlockers(issue.body);
