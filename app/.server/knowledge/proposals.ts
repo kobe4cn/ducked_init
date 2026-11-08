@@ -1,5 +1,5 @@
-// app/.server/knowledge/proposals.ts —— 知识提案（ADR-0046）：系统或 AI 生成的别名、口径声明、业务说明先存成提案（proposed），等成员确认，
-// 接受前不进目录、检索与起草上下文（这里的表不读进 loadKnowledge）。成员接受（可以先改值）后在同一事务里变成对应的知识，作者是接受的成员，
+// app/.server/knowledge/proposals.ts —— 知识提案（ADR-0046）：系统或 AI 生成的别名、口径声明、业务说明、主题归属先存成提案（proposed），等成员确认，
+// 接受前不进目录、检索与起草上下文（这里的表不读进 loadKnowledge）。成员接受（主题归属不能改值）后在同一事务里变成对应的知识，作者是接受的成员，
 // 目录版本由生成知识的那条审计记；拒绝时记下理由，按指纹（目标 + 映射 + 种类 + 内容 + 依据摘要）记住，同样的提案不再提出。
 // 权限同别名：映射字段（带 mappingId）要 sources:write，其余要 definitions:draft。依据已变化的提案不能接受（409）。一律限定在操作者所属租户内。
 // 批量入口 proposeMany 逐条在保存点里提出：单条不合法只回滚这一条、不连累整批，可选按生成前的依据快照跳过依据已变的目标
@@ -13,10 +13,12 @@ import {
   knowledgeProposals, type ProposalContent, type ProposalContentOf, type ProposalEvidence, type ProposalKind, type ProposalStatus,
 } from '../db/schema';
 import { isClaimType, isClaimValue } from '../../lib/semantic-claims';
+import { UUID } from '../tenants';
 import { addAliasTx, ALIAS_MAX_LENGTH } from './aliases';
 import { assertTarget, basisOf, KnowledgeError, stableJson } from './basis';
 import { saveClaimTx } from './claims';
 import { assertCanTouchKnowledge, lockTenantRow, rethrowDuplicateAlias } from './guards';
+import { addMembershipTx, assertSubject } from './subjects';
 
 /** 可以展示给成员的错误：提案不存在 404，已处理过或依据已变化 409（输入不合法的 400 一律是 KnowledgeError） */
 export class ProposalError extends Error {
@@ -37,9 +39,11 @@ export interface ProposalInput {
 
 const REASON_MAX_LENGTH = 500;
 
-/** 一个种类的提案：parse 校验内容形状、只留下该种类的键（不合法时抛 KnowledgeError），materialize 把内容写成对应的知识、返回知识行 ID */
+/** 一个种类的提案：parse 校验内容形状、只留下该种类的键（不合法时抛 KnowledgeError），materialize 把内容写成对应的知识、返回知识行 ID。
+ *  check 是提出时要查库的额外校验（如主题归属要主题属于本租户），不合法时抛 KnowledgeError */
 interface KindSpec<K extends ProposalKind> {
   parse(c: Record<string, unknown>): ProposalContentOf[K];
+  check?(tx: Tx, tenantId: string, input: { mappingId: string | null; content: ProposalContentOf[K] }): Promise<void>;
   materialize(tx: Tx, actor: CurrentMember, p: Proposal, content: ProposalContentOf[K]): Promise<string>;
 }
 
@@ -80,6 +84,20 @@ const KINDS: { [K in ProposalKind]: KindSpec<K> } = {
         ? saveBusinessNoteTx(tx, actor, { entity: field[1]!, field: field[2]!, mappingId, note })
         : saveBusinessNoteTx(tx, actor, { targetId, note });
     },
+  },
+  subject: {
+    parse(c) {
+      // 主题是否属于本租户、是否已删除要查库，放在 check；这里只校验形状，多余的键不进指纹
+      if (typeof c.subjectId !== 'string' || !UUID.test(c.subjectId)) throw new KnowledgeError('主题归属提案缺少主题');
+      return { subjectId: c.subjectId };
+    },
+    async check(tx, tenantId, { mappingId, content }) {
+      // 主题归属和 addMembership 一样只挂目录条目，不挂映射字段
+      if (mappingId) throw new KnowledgeError('映射字段不能归入主题');
+      await assertSubject(tx, tenantId, content.subjectId);
+    },
+    // 条目已在主题里（被手动加过）时接受也成功：ifAbsent 不重复插入、不记审计，返回主题 ID 作为 acceptedRef
+    materialize: (tx, actor, { targetId }, { subjectId }) => addMembershipTx(tx, actor, subjectId, targetId, { ifAbsent: true }),
   },
 };
 
@@ -128,6 +146,8 @@ async function proposeOne(
   const evidence = evidenceOf(input.evidence);
   if (typeof targetId !== 'string' || !targetId) throw new KnowledgeError('缺少目标');
   await assertTarget(tx, tenantId, targetId, mappingId);
+  // 种类自己的校验（主题归属查主题）在目标校验之后、算指纹之前，不合法时 400 不写入
+  await checkKind(tx, tenantId, kind, { mappingId, content });
   const basedOn = await basisOf(tx, tenantId, targetId, mappingId);
   if (expectedBases && basedOn.some(b => expectedBases.get(b.id) !== b.hash)) return { proposal: null, outcome: 'stale' };
   const fingerprint = proposalFingerprint({ targetId, mappingId, kind, content, basedOn });
@@ -197,6 +217,13 @@ function materialize<K extends ProposalKind>(tx: Tx, actor: CurrentMember, p: Pr
   return KINDS[kind].materialize(tx, actor, p, content);
 }
 
+/** 提出时按种类做要查库的额外校验（没有 check 的种类直接过）。泛型 K 把种类与内容绑在一起，查表时不用断言 */
+function checkKind<K extends ProposalKind>(
+  tx: Tx, tenantId: string, kind: K, input: { mappingId: string | null; content: ProposalContentOf[K] },
+): Promise<void> {
+  return KINDS[kind].check?.(tx, tenantId, input) ?? Promise.resolve();
+}
+
 /**
  * 接受提案：可以先改值（edits 是同种类的内容），生成的知识用改后的值，提案行的内容与指纹保持原样。
  * 依据与提出时不同时 409「依据已变化」；生成知识出错（如别名重复）时整个事务回滚，提案仍待处理
@@ -206,6 +233,8 @@ export async function acceptProposal(actor: CurrentMember, id: string, edits?: u
   const tenantId = actor.tenant.id;
   return getDb().transaction(async tx => {
     const p = await lockPending(tx, actor, id);
+    // 主题归属不提供修改后接受：改 subjectId 等于把条目改归别的主题，面板不渲染入口，这里挡住直接提交
+    if (p.kind === 'subject' && edits !== undefined) throw new KnowledgeError('主题归属提案不能修改后接受');
     const content = edits === undefined ? p.content : contentOf(p.kind, edits);
     // 先校验目标（映射字段会锁住映射行，与发布、停用互斥），再比依据
     await assertTarget(tx, tenantId, p.targetId, p.mappingId);

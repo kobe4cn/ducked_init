@@ -799,10 +799,10 @@ export const subjectMemberships = platform.table('subject_memberships', {
   createdAt: createdAt(),
 }, t => [primaryKey({ columns: [t.subjectId, t.targetId] }), index('subject_memberships_tenant_idx').on(t.tenantId)]);
 
-/** 知识提案的种类：别名、口径声明、业务说明 */
-export type ProposalKind = 'alias' | 'claim' | 'note';
-/** 知识提案的内容，按种类：别名 {alias}、口径声明 {type, value}、业务说明 {note}。jsonb 里只存这些键，种类在 kind 列 */
-export type ProposalContentOf = { alias: { alias: string }; claim: { type: string; value: string }; note: { note: string } };
+/** 知识提案的种类：别名、口径声明、业务说明、主题归属 */
+export type ProposalKind = 'alias' | 'claim' | 'note' | 'subject';
+/** 知识提案的内容，按种类：别名 {alias}、口径声明 {type, value}、业务说明 {note}、主题归属 {subjectId}。jsonb 里只存这些键，种类在 kind 列 */
+export type ProposalContentOf = { alias: { alias: string }; claim: { type: string; value: string }; note: { note: string }; subject: { subjectId: string } };
 /** 任意种类知识提案的内容 */
 export type ProposalContent = ProposalContentOf[ProposalKind];
 /** 知识提案的状态：待处理、已接受、已拒绝 */
@@ -810,10 +810,10 @@ export type ProposalStatus = 'proposed' | 'accepted' | 'rejected';
 /** 知识提案的一条证据：元数据引用（可带版本），不放取值 */
 export type ProposalEvidence = { ref: string; version?: number };
 
-// 知识提案（ADR-0046）：系统或 AI 生成、等成员确认的别名、口径声明、业务说明，接受前不进目录、检索与起草上下文（不要读进 loadKnowledge）。
-// 目标同 knowledge_aliases（target_id 是目录条目标识，mapping_id 非空是映射字段）。evidence 只存元数据引用 [{ref, version?}]，不存取值；
+// 知识提案（ADR-0046）：系统或 AI 生成、等成员确认的别名、口径声明、业务说明、主题归属，接受前不进目录、检索与起草上下文（不要读进 loadKnowledge）。
+// 目标同 knowledge_aliases（target_id 是目录条目标识，mapping_id 非空是映射字段；主题归属只挂目录条目，mapping_id 一定是空）。evidence 只存元数据引用 [{ref, version?}]，不存取值；
 // based_on 是提出时的依据摘要。fingerprint = sha256(stableJson({targetId, mappingId, kind, claim: content, basedOn}))（proposalFingerprint），
-// 键名仍是改名前的 claim，指纹才不变；同租户唯一：同样的提案不重复存，拒绝过的不再提出。接受后 accepted_ref 是生成的知识行（别名、口径声明或业务说明）的 ID
+// 键名仍是改名前的 claim，指纹才不变；同租户唯一：同样的提案不重复存，拒绝过的不再提出。接受后 accepted_ref 是生成的知识行（别名、口径声明、业务说明）的 ID，主题归属是主题 ID
 export const knowledgeProposals = platform.table('knowledge_proposals', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),

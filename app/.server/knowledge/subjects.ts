@@ -44,6 +44,11 @@ async function subjectOf(tx: Tx, tenantId: string, subjectId: unknown) {
   return row;
 }
 
+/** 校验主题存在且属于本租户（主题是硬删除，行在就是未删除）；供主题归属提案在提出时调用，错误转 400 */
+export async function assertSubject(tx: Tx, tenantId: string, subjectId: unknown): Promise<void> {
+  await subjectOf(tx, tenantId, subjectId);
+}
+
 /** 在事务里跑；并发造成的唯一冲突转成 400 */
 async function inTx<T>(dupMessage: string, fn: (tx: Tx) => Promise<T>): Promise<T> {
   try {
@@ -92,20 +97,44 @@ export async function deleteSubject(actor: CurrentMember, subjectId: unknown): P
   });
 }
 
+/**
+ * 在事务里把目录条目（实体、字段、已发布指标或标签）加入主题，返回主题 ID；调用方负责权限检查与开事务。
+ * 默认已在主题里时 400，并发撞主键 (subject_id, target_id) 由调用方的事务转成 400（addMembership 的 inTx）。
+ * ifAbsent：已在主题里时直接返回、不插入不记审计（目录没变，也不记目录版本）——接受主题归属提案时条目可能已被手动加入；
+ * 插入用 onConflictDoNothing 挡住并发，只在真的插入了一行时记审计
+ */
+export async function addMembershipTx(
+  tx: Tx, actor: CurrentMember, subjectId: unknown, targetId: string, opts: { ifAbsent?: boolean } = {},
+): Promise<string> {
+  const tenantId = actor.tenant.id;
+  const row = await subjectOf(tx, tenantId, subjectId);
+  await assertTarget(tx, tenantId, targetId, null);
+  const [dup] = await tx.select({ targetId: subjectMemberships.targetId }).from(subjectMemberships)
+    .where(and(eq(subjectMemberships.subjectId, row.id), eq(subjectMemberships.targetId, targetId)));
+  if (dup) {
+    if (opts.ifAbsent) return row.id;
+    throw new KnowledgeError(`${targetId} 已在这个主题里`);
+  }
+  const values = { tenantId, subjectId: row.id, targetId, createdByEmail: actor.email };
+  const audit = () => recordAudit(tx, {
+    tenantId, actor, action: 'subject_membership.added', targetType: 'analysis_subject', targetId: row.id, detail: { subjectId: row.id, targetId },
+  });
+  if (opts.ifAbsent) {
+    const inserted = await tx.insert(subjectMemberships).values(values)
+      .onConflictDoNothing().returning({ subjectId: subjectMemberships.subjectId });
+    if (inserted.length) await audit();
+  } else {
+    await tx.insert(subjectMemberships).values(values);
+    await audit();
+  }
+  return row.id;
+}
+
 /** 把目录条目（实体、字段、已发布指标或标签）加入主题；目标不合法（含敏感字段）或已在主题里时 400 */
 export async function addMembership(actor: CurrentMember, subjectId: unknown, targetId: unknown): Promise<void> {
   assertCan(actor, 'definitions:draft');
   if (typeof targetId !== 'string' || !targetId) throw new KnowledgeError('缺少目标');
-  const tenantId = actor.tenant.id;
-  await inTx(`${targetId} 已在这个主题里`, async tx => {
-    const row = await subjectOf(tx, tenantId, subjectId);
-    await assertTarget(tx, tenantId, targetId, null);
-    const [dup] = await tx.select({ targetId: subjectMemberships.targetId }).from(subjectMemberships)
-      .where(and(eq(subjectMemberships.subjectId, row.id), eq(subjectMemberships.targetId, targetId)));
-    if (dup) throw new KnowledgeError(`${targetId} 已在这个主题里`);
-    await tx.insert(subjectMemberships).values({ tenantId, subjectId: row.id, targetId, createdByEmail: actor.email });
-    await recordAudit(tx, { tenantId, actor, action: 'subject_membership.added', targetType: 'analysis_subject', targetId: row.id, detail: { subjectId: row.id, targetId } });
-  });
+  await inTx(`${targetId} 已在这个主题里`, tx => addMembershipTx(tx, actor, subjectId, targetId));
 }
 
 /** 把目录条目移出主题；不在主题里时 400 */
