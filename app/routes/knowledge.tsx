@@ -1,19 +1,26 @@
 // app/routes/knowledge.tsx —— 业务知识集中页（ADR-0046）：所有成员可看（definitions:read，不新增权限），按分析主题分组列出有待确认提案或缺失项的目录条目
 // （规则见 knowledge/hub.ts），没有主题的条目在最后的「未归入主题」组。点条目（?item=<targetId>）在本页展开与详情页相同的业务知识面板（字段不带说明区），
-// 能不能编辑沿用面板的 canEdit（definitions:draft）；提交成功后回到原 URL，列表与计数随之更新
+// 能不能编辑沿用面板的 canEdit（definitions:draft）；提交成功后回到原 URL，列表与计数随之更新。
+// 主题组的「生成建议」（ADR-0046 入口③，#513）同步按主题生成一批提案：成功 302 回集中页带计数，查看者由 suggestForSubject 内部抛 403
 import type { Route } from './+types/knowledge';
-import { data, Link, redirect } from 'react-router';
-import { AlertTriangle, CheckCircle2, CircleHelp, Inbox } from 'lucide-react';
-import { requirePermission } from '~/.server/access';
+import { data, Form, Link, redirect, useNavigation } from 'react-router';
+import { AlertTriangle, CheckCircle2, CircleHelp, Inbox, Sparkles } from 'lucide-react';
+import { can, requirePermission } from '~/.server/access';
 import { catalogFor } from '~/.server/assistant/tools';
 import { expand } from '~/.server/catalog';
+import { getDb } from '~/.server/db/client';
+import { KnowledgeError } from '~/.server/knowledge/basis';
 import { isHubEntry, knowledgeHub, type HubEntry, type HubItem } from '~/.server/knowledge/hub';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel, type KnowledgePanel as Panel } from '~/.server/knowledge/panel';
+import { suggestForSubject, SuggestError, type SuggestResult } from '~/.server/knowledge/suggest-run';
+import { listSubjects } from '~/.server/knowledge/subjects';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { KnowledgePanel } from '~/components/knowledge-panel';
 import { PageHeader } from '~/components/page-header';
 import { StatTile } from '~/components/stat-tile';
+import { Alert, AlertTitle } from '~/components/ui/alert';
+import { Button } from '~/components/ui/button';
 import { claimTypeLabel } from '~/lib/semantic-claims';
 
 const KIND_LABELS: Record<HubItem['kind'], string> = { entity: '实体', field: '字段', metric: '指标', tag: '标签' };
@@ -29,20 +36,55 @@ export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'definitions:read');
   const catalog = await catalogFor(member);
   const hub = await knowledgeHub(member, catalog);
-  const itemId = new URL(request.url).searchParams.get('item');
+  const search = new URL(request.url).searchParams;
+  const itemId = search.get('item');
   const system = itemId ? expand(catalog, itemId) : null;
   // 只给 ?item= 那一个条目算面板（每个面板都要读全租户的知识）
   let selected: { targetId: string; system: HubEntry; panel: Panel } | null = null;
   if (system && isHubEntry(system)) {
     selected = { targetId: system.id, system, panel: await knowledgePanel(member, system.id) };
   }
-  return { email: member.email, nav: navFor(member), hub, selected };
+  // 主题名 → id（主题名租户内不分大小写唯一，组的标题就是主题名）；每次现查，不缓存
+  const subjectIds: Record<string, string> = {};
+  for (const s of await listSubjects(getDb(), member.tenant.id)) subjectIds[s.name] = s.id;
+  // 刚生成完 302 回来（?suggested=）带出的计数；fresh=0 表示同样的输入已经生成过、没有新提案
+  const suggestedName = search.get('suggested');
+  const suggested = suggestedName === null ? null : {
+    subject: suggestedName,
+    created: Number(search.get('created')) || 0,
+    skipped: Number(search.get('skipped')) || 0,
+    fresh: search.get('fresh') !== '0',
+  };
+  return { email: member.email, nav: navFor(member), hub, selected, subjectIds, canSuggest: can(member.role, 'definitions:draft'), suggested };
 }
 
-/** 面板提交（alias.* / claim.* / note.* / subject.* / proposal.*）交给 handleKnowledgeIntent，权限由它按 definitions:draft 判断；出错带 targetId 返回，成功回到原 URL */
+/** 面板提交（alias.* / claim.* / note.* / subject.* / proposal.*）交给 handleKnowledgeIntent，权限由它按 definitions:draft 判断；出错带 targetId 返回，成功回到原 URL。
+ *  intent=suggest 按主题生成一批提案：成功 302 回集中页带计数，可展示的错误（未配置模型、模型失败、没有这个主题）显示在页顶 */
 export async function action({ request }: Route.ActionArgs) {
   const form = await request.formData();
   const intent = String(form.get('intent') ?? '');
+  if (intent === 'suggest') {
+    // 不能叫 subject.suggest：会被 isKnowledgeIntent 交给面板。403 由 suggestForSubject 里的 assertCan 抛出，这里不接
+    const member = await requirePermission(request, 'definitions:read');
+    const subjectId = String(form.get('subjectId') ?? '');
+    let outcome: SuggestResult;
+    try {
+      outcome = await suggestForSubject(member, subjectId);
+    } catch (e) {
+      if (e instanceof SuggestError || e instanceof KnowledgeError) return data({ error: e.message, targetId: '' }, { status: e.status });
+      throw e;
+    }
+    const params = new URLSearchParams({ suggested: (await listSubjects(getDb(), member.tenant.id)).find(s => s.id === subjectId)?.name ?? '' });
+    if (outcome.fresh) {
+      params.set('created', String(outcome.created));
+      params.set('skipped', String(outcome.existing + outcome.rejected + outcome.invalid + outcome.stale));
+    } else {
+      params.set('fresh', '0');
+    }
+    const item = new URL(request.url).searchParams.get('item');
+    if (item) params.set('item', item);
+    throw redirect(`/knowledge?${params.toString()}`);
+  }
   if (!isKnowledgeIntent(intent)) return data({ error: '未知操作', targetId: '' }, { status: 400 });
   const result = await handleKnowledgeIntent(await requirePermission(request, 'definitions:read'), form);
   if ('error' in result) return data({ error: result.error, targetId: String(form.get('targetId') ?? '') }, { status: result.status });
@@ -70,7 +112,9 @@ function Item({ item, active }: { item: HubItem; active: boolean }) {
 }
 
 export default function Knowledge({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, hub, selected } = loaderData;
+  const { email, nav, hub, selected, subjectIds, canSuggest, suggested } = loaderData;
+  // 生成建议同步调模型，提交期间禁用按钮防重复点
+  const submitting = useNavigation().state === 'submitting';
   const list = hub.groups.length === 0 ? (
     <section className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">
       <p className="inline-flex items-center gap-2"><CheckCircle2 className="size-4 text-emerald-600" />没有待确认的提案或缺失项。</p>
@@ -80,10 +124,19 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
     <div className="space-y-4">
       {hub.groups.map(g => (
         <section key={g.subject ?? ''} data-hub-group={g.subject ?? 'none'} className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm">
-          <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
             <h2 className="text-lg font-semibold">{g.subject ?? '未归入主题'}</h2>
             {g.proposals > 0 && <span className="inline-flex items-center gap-1 text-sm text-amber-600"><Inbox className="size-4" />{`${g.proposals} 条待确认提案`}</span>}
             {g.missing > 0 && <span className="inline-flex items-center gap-1 text-sm text-red-600"><AlertTriangle className="size-4" />{`${g.missing} 个缺失项`}</span>}
+            {g.subject !== null && canSuggest && (
+              <Form method="post" className="ml-auto">
+                <input type="hidden" name="intent" value="suggest" />
+                <input type="hidden" name="subjectId" value={subjectIds[g.subject] ?? ''} />
+                <Button type="submit" variant="outline" size="sm" disabled={submitting}>
+                  <Sparkles />{submitting ? '生成中…' : '生成建议'}
+                </Button>
+              </Form>
+            )}
           </div>
           <ul className="space-y-1">
             {g.items.map(i => <Item key={i.targetId} item={i} active={i.targetId === selected?.targetId} />)}
@@ -95,6 +148,22 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader title="业务知识" description="按分析主题列出待确认的知识提案与缺失的口径声明，点开条目在本页处理" />
+      {suggested && !actionData?.error && (
+        <Alert role="status" className="mb-4">
+          <CheckCircle2 className="text-emerald-600" />
+          <AlertTitle>
+            {suggested.fresh
+              ? `主题「${suggested.subject}」新建 ${suggested.created} 条提案，跳过 ${suggested.skipped} 条`
+              : `主题「${suggested.subject}」已按当前内容生成过，没有新提案`}
+          </AlertTitle>
+        </Alert>
+      )}
+      {actionData?.error && !actionData.targetId && (
+        <Alert variant="destructive" role="alert" className="mb-4">
+          <AlertTriangle />
+          <AlertTitle>{actionData.error}</AlertTitle>
+        </Alert>
+      )}
       <div className="mb-6 grid gap-4 sm:grid-cols-3">
         <StatTile label="待确认提案" value={hub.totals.proposals} tone={hub.totals.proposals ? 'text-amber-600' : undefined} hint="等待成员确认的知识提案" />
         <StatTile label="缺失项" value={hub.totals.missing} tone={hub.totals.missing ? 'text-red-600' : undefined} hint="未声明或声明为未知的单位、币种" />
