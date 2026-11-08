@@ -400,6 +400,74 @@ function closeFinishedParents() {
   }
 }
 
+/**
+ * 已关闭票的残留：人在 GitHub 上手动合并 Sandcastle 的 PR、或在运行中途合并 / 关掉正在做的票时，
+ * land 不会走到删分支那一步（2026-11-08 #450：PR #456 由人合并），远端分支、本地 worktree 与分支、
+ * sandcastle:* 状态标签都留着。每轮开头清一次：
+ * - 已关闭票上的 prepped / pr-open / stuck 去掉（decided 等人事后确认、flaky 是分类，不动）；
+ * - `sandcastle/issue-<n>` 只在票已关闭、且这个分支有已合并的 PR 时删：远端分支、本地 worktree、本地分支。
+ *   worktree 有未提交改动时 git 拒绝删除，留着并警告。没合并就关掉的票（不做了）分支留着，里面的提交可能还有人要看。
+ * 出错只打警告。
+ */
+async function cleanupClosedIssues() {
+  for (const label of [LABEL.prepped, LABEL.prOpen, LABEL.stuck]) {
+    const closed = trySh("gh", [
+      "issue", "list", "--state", "closed", "--label", label, "--limit", "100", "--json", "number", "--jq", ".[].number",
+    ]);
+    if (!closed.ok) {
+      console.warn(`  ⚠ 查带 ${label} 的已关闭票失败：${closed.out.slice(0, 200)}`);
+      continue;
+    }
+    const cleared: string[] = [];
+    for (const n of closed.out.split("\n").filter(Boolean)) {
+      const edited = trySh("gh", ["issue", "edit", n, "--remove-label", label]);
+      if (edited.ok) cleared.push(`#${n}`);
+      else console.warn(`  ⚠ 去掉 #${n} 的 ${label} 失败：${edited.out.slice(0, 200)}`);
+    }
+    if (cleared.length > 0) console.log(`  🧹 已关闭的票去掉 ${label}：${cleared.join("、")}`);
+  }
+
+  const branchOf = /^sandcastle\/issue-(\d+)$/;
+  const remote = await gitRemote(["ls-remote", "--heads", REMOTE, "sandcastle/issue-*"]);
+  if (!remote.ok) console.warn(`  ⚠ 列远端的 sandcastle 分支失败：${remote.out.slice(0, 200)}`);
+  const remoteBranches = remote.ok
+    ? remote.out.split("\n").map((line) => line.split("\t")[1]?.replace(/^refs\/heads\//, "") ?? "").filter((b) => branchOf.test(b))
+    : [];
+  const local = trySh("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads/sandcastle/"]);
+  const localBranches = local.ok ? local.out.split("\n").filter((b) => branchOf.test(b)) : [];
+  // git worktree list --porcelain：每个 worktree 一段，`worktree <path>` 后面跟 `branch refs/heads/<name>`
+  const worktrees = new Map<string, string>();
+  let path = "";
+  for (const line of trySh("git", ["worktree", "list", "--porcelain"]).out.split("\n")) {
+    if (line.startsWith("worktree ")) path = line.slice("worktree ".length);
+    else if (line.startsWith("branch refs/heads/")) worktrees.set(line.slice("branch refs/heads/".length), path);
+  }
+
+  for (const branch of new Set([...remoteBranches, ...localBranches])) {
+    const id = branch.match(branchOf)![1]!;
+    if (!issueClosed(id)) continue;
+    const pr = trySh("gh", ["pr", "list", "--head", branch, "--state", "merged", "--json", "number", "--jq", ".[0].number"]);
+    if (!pr.ok || !pr.out) continue;
+    const removed: string[] = [];
+    if (remoteBranches.includes(branch)) {
+      const deleted = await gitRemote(["push", REMOTE, "--delete", branch]);
+      if (deleted.ok) removed.push("远端分支");
+      else console.warn(`  ⚠ 删除远端分支 ${branch} 失败：${deleted.out.slice(0, 200)}`);
+    }
+    const worktree = worktrees.get(branch);
+    if (worktree) {
+      const gone = trySh("git", ["worktree", "remove", worktree]);
+      if (!gone.ok) {
+        console.warn(`  ⚠ #${id} 的 worktree ${worktree} 没删（有未提交改动？）：${gone.out.slice(0, 200)}`);
+        continue;
+      }
+      removed.push("worktree");
+    }
+    if (localBranches.includes(branch) && trySh("git", ["branch", "-D", branch]).ok) removed.push("本地分支");
+    if (removed.length > 0) console.log(`  🧹 #${id} 已关闭、PR #${pr.out} 已合并，删除${removed.join("、")}`);
+  }
+}
+
 /** 指引里 `- **Change**: \`path…\`` 行的文件路径（去掉 `:行号`）。 */
 const changedFiles = (body: string) =>
   [...section(body, "Implementation guide").matchAll(/^\s*[-*]\s*\*\*Change\*\*\s*[:：]\s*`([^`]+)`/gm)]
@@ -1069,6 +1137,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   syncHostBase();
   reopenRequestedRevisions();
   closeFinishedParents();
+  await cleanupClosedIssues();
   pruneSeaweedMetalog();
 
   // Phase 0: Prep —— 串行，因为拆票会改别的票的 Blocked by。
