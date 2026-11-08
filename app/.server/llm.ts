@@ -13,7 +13,7 @@ import { decryptForTenant } from './secrets';
 
 /** 调用的用途，记进调用日志 */
 export type LlmPurpose = 'connectivity' | 'tool_probe' | 'assistant' | 'mapping_draft' | 'metric_draft' | 'tag_draft' | 'assertion_draft'
-  | 'workbench_draft' | 'workbench_interpret' | 'embedding';
+  | 'workbench_draft' | 'workbench_interpret' | 'knowledge_proposal' | 'embedding';
 
 /** 对话里的一条消息（OpenAI 兼容格式）：assistant 要调用工具时带 tool_calls（content 可为空串），工具结果是 role 为 tool、带 tool_call_id 的一条 */
 export interface LlmMessage {
