@@ -1,8 +1,9 @@
 // app/.server/source-views.ts —— 源视图：数据工程师在某个数据源下手写一段只读原始层的 SELECT，把复杂源表整理成可映射的形状（ADR-0022）。
 // 保存草稿时在请求内只读挂载本租户的数据湖校验 SQL（只能读本数据源原始层的表，见 pipeline/source-view-engine.ts），并取出视图的列与前几行样本。
 // 草稿按映射同样的规则双人发布：由最后保存它的人以外的另一位有发布权限的成员在页面上发布，也可以丢弃（回到最近的已发布版本，
-// 从没发布过时整个删除）；发布后版本锁定，并为基于它的已发布映射入队合并（ADR-0023）。没有任何自动发布的路径。一律限定在操作者所属租户内
-import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
+// 从没发布过时整个删除）；发布后版本锁定，并为基于它的已发布映射入队合并（ADR-0023）。保存 / 发布 / 丢弃的流程在 publishing.ts（ADR-0051），
+// 本文件提供 sourceViewAdapter 接入。没有任何自动发布的路径。一律限定在操作者所属租户内
+import { and, desc, eq } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
@@ -14,16 +15,14 @@ import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { ident } from '../lib/mapping-expr';
 import { normalizeViewSql, previewView, VIEW_PLATFORM_COLUMNS, ViewSqlError, type ViewPreview } from './pipeline/source-view-engine';
 import { PLATFORM_COLUMNS } from './pipeline/sync-engine';
-import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
+import { discard, publish, PublishError, publisherCount, publishBlocker, saveDraft, type PublishableAdapter } from './publishing';
 import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
 import { confirmedTables } from './sources';
 import { looksSensitive } from '../lib/sensitive';
 
-/** 可以展示给成员的业务错误 */
-export class SourceViewError extends Error {
-  constructor(message: string, readonly status: 400 | 403 | 404 = 400) { super(message); }
-}
+/** 可以展示给成员的业务错误；发布流程本身的错误（PublishError）也算它的同族（ADR-0051） */
+export class SourceViewError extends PublishError {}
 
 /** 预览取多少行样本，与所用的计算资源 */
 export const PREVIEW_ROWS = 20;
@@ -163,74 +162,74 @@ export async function createSourceView(actor: CurrentMember, sourceId: string, i
   }
 }
 
+/** sourceViewAdapter 的上下文：一份已确认存在的源视图（requireView 的结果），parentId 是视图 ID */
+export interface SourceViewCtx { tenantId: string; parentId: string; sourceId: string; name: string; sourceName: string }
+
+/** 定位一份源视图（存在时），给 publishing.ts 的流程当上下文；不存在（含属于别的数据源）时 404 */
+export async function sourceViewCtx(actor: CurrentMember, sourceId: string, viewId: string): Promise<SourceViewCtx> {
+  const view = await requireView(actor.tenant.id, sourceId, viewId);
+  return { tenantId: actor.tenant.id, parentId: view.id, sourceId: view.sourceId, name: view.name, sourceName: view.sourceName };
+}
+
+/** enqueueMerge 入队的合并任务（publishSourceView 返回它或 null） */
+type QueuedMerge = NonNullable<Awaited<ReturnType<typeof enqueueMerge>>>;
+
+/**
+ * 源视图接入 publishing.ts 的适配器（ADR-0051）：保存的事务外检查在只读挂载的数据湖上校验 SQL（checkAndPreview），
+ * 发布后为基于这个源视图的映射入队一次合并（按新版本重建，ADR-0023）。不锁租户行：发布源视图不查排队中的合并，总要按新版本重建
+ */
+export const sourceViewAdapter: PublishableAdapter<SourceViewCtx, string, undefined, QueuedMerge> = {
+  parent: sourceViews,
+  versions: sourceViewVersions,
+  versionsFk: sourceViewVersions.viewId,
+  lockTenant: false,
+  lockParent: async (tx, ctx) => {
+    // 丢弃从没发布过的源视图会删除它：拿不到锁住的行说明已被删除
+    const [locked] = await tx.select({ id: sourceViews.id }).from(sourceViews).where(eq(sourceViews.id, ctx.parentId)).for('update');
+    if (!locked) throw new SourceViewError('源视图已被删除', 404);
+    return locked.id;
+  },
+  checkSave: async (ctx, input) => {
+    const viewSql = normalizeViewSql(input);
+    return { sql: viewSql, ...shapeOf(await checkAndPreview(ctx.tenantId, ctx.sourceId, viewSql)) };
+  },
+  // 早于映射读源视图（#96）保存的草稿没有输出列与引用的表，映射对照不了、同步后也触发不了合并
+  checkOutside: async draft => {
+    if (!draft.columns || !draft.tables) throw new SourceViewError('这份草稿保存得较早，没有记下视图的列与引用的表：请重新保存一次再发布');
+  },
+  afterPublish: async (tx, _draft, ctx) => {
+    const dependents = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.sourceViewId, ctx.parentId));
+    return dependents.length ? enqueueMerge(tx, ctx.tenantId, dependents.map(m => m.id)) : null;
+  },
+  audit: {
+    drafted: { action: 'source_view.drafted', detail: (ctx, _columns, version) => ({ source: ctx.sourceName, name: ctx.name, version }) },
+    published: {
+      action: 'source_view.published',
+      detail: (ctx, draft) => ({ source: ctx.sourceName, name: ctx.name, version: draft.version, authors: draft.authors, lastEditor: draft.lastEditor }),
+    },
+    discarded: { action: 'source_view.draft_discarded', detail: (ctx, version, published) => ({ source: ctx.sourceName, name: ctx.name, version, published }) },
+    targetType: 'source_view',
+  },
+  missingVersion: version => `没有第 ${version} 版`,
+  noDraft: () => '这个源视图没有草稿',
+};
+
 /**
  * 保存草稿：SQL 在数据湖上校验通过后，已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
  * 返回草稿的版本号
  */
 export async function saveSourceViewDraft(actor: CurrentMember, sourceId: string, viewId: string, input: string) {
   assertCan(actor, 'sources:write');
-  const view = await requireView(actor.tenant.id, sourceId, viewId);
-  const viewSql = normalizeViewSql(input);
-  const shape = shapeOf(await checkAndPreview(actor.tenant.id, view.sourceId, viewSql));
-  return getDb().transaction(async tx => {
-    // 锁住源视图行：与发布、丢弃互斥；丢弃从没发布过的源视图会删除它
-    const [locked] = await tx.select({ id: sourceViews.id }).from(sourceViews).where(eq(sourceViews.id, viewId)).for('update');
-    if (!locked) throw new SourceViewError('源视图已被删除', 404);
-    const [latest] = await tx.select().from(sourceViewVersions)
-      .where(eq(sourceViewVersions.viewId, viewId)).orderBy(desc(sourceViewVersions.version)).limit(1);
-    if (latest?.status === 'draft') {
-      await tx.update(sourceViewVersions).set({ sql: viewSql, ...shape, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
-        .where(eq(sourceViewVersions.id, latest.id));
-      return latest.version;
-    }
-    const version = (latest?.version ?? 0) + 1;
-    await tx.insert(sourceViewVersions).values({ viewId, version, sql: viewSql, ...shape, authors: [actor.email], lastEditor: actor.email });
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'source_view.drafted',
-      targetType: 'source_view',
-      targetId: viewId,
-      detail: { source: view.sourceName, name: view.name, version },
-    });
-    return version;
-  });
+  return saveDraft(sourceViewAdapter, actor, await sourceViewCtx(actor, sourceId, viewId), input);
 }
 
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。只由成员在页面上调用，没有自动发布。
- * 发布后版本锁定，并为基于这个源视图的已发布映射入队一次合并（按新版本重建）
+ * 发布后版本锁定，并为基于这个源视图的映射入队一次合并（按新版本重建）。返回入队的合并任务，没有映射依赖或已在运行时为 null
  */
 export async function publishSourceView(actor: CurrentMember, sourceId: string, viewId: string, version: number) {
   assertCan(actor, 'publish');
-  const view = await requireView(actor.tenant.id, sourceId, viewId);
-  const [draft] = await getDb().select(getTableColumns(sourceViewVersions)).from(sourceViewVersions)
-    .where(and(eq(sourceViewVersions.viewId, viewId), eq(sourceViewVersions.version, version)));
-  if (!draft) throw new SourceViewError(`没有第 ${version} 版`, 404);
-  const blocker = publishBlocker(actor, draft);
-  if (blocker) throw new SourceViewError(blocker, draft.status === 'draft' ? 403 : 400);
-  // 早于映射读源视图（#96）保存的草稿没有输出列与引用的表，映射对照不了、同步后也触发不了合并
-  if (!draft.columns || !draft.tables) throw new SourceViewError('这份草稿保存得较早，没有记下视图的列与引用的表：请重新保存一次再发布');
-  await getDb().transaction(async tx => {
-    // 锁住源视图行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿
-    await tx.select({ id: sourceViews.id }).from(sourceViews).where(eq(sourceViews.id, viewId)).for('update');
-    const [current] = await tx.select().from(sourceViewVersions).where(eq(sourceViewVersions.id, draft.id));
-    if (isStale(current, draft)) throw new SourceViewError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
-    await tx.update(sourceViewVersions)
-      .set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` })
-      .where(eq(sourceViewVersions.id, draft.id));
-    const dependents = await tx.select({ id: mappings.id }).from(mappings).where(eq(mappings.sourceViewId, viewId));
-    if (dependents.length) await enqueueMerge(tx, actor.tenant.id, dependents.map(m => m.id));
-    // 审计放在入队之后：记目录版本拿的锁要是事务里最后一个锁（见 catalog/versions.ts）
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'source_view.published',
-      targetType: 'source_view',
-      targetId: viewId,
-      detail: { source: view.sourceName, name: view.name, version, authors: draft.authors, lastEditor: draft.lastEditor },
-    });
-  });
+  return publish(sourceViewAdapter, actor, await sourceViewCtx(actor, sourceId, viewId), version);
 }
 
 /**
@@ -239,27 +238,5 @@ export async function publishSourceView(actor: CurrentMember, sourceId: string, 
  */
 export async function discardSourceViewDraft(actor: CurrentMember, sourceId: string, viewId: string) {
   assertCan(actor, 'sources:write');
-  const view = await requireView(actor.tenant.id, sourceId, viewId);
-  return getDb().transaction(async tx => {
-    // 锁住源视图行：与保存、发布互斥
-    const [locked] = await tx.select({ id: sourceViews.id }).from(sourceViews).where(eq(sourceViews.id, viewId)).for('update');
-    if (!locked) throw new SourceViewError('源视图已被删除', 404);
-    const versions = await tx.select({ id: sourceViewVersions.id, version: sourceViewVersions.version, status: sourceViewVersions.status })
-      .from(sourceViewVersions).where(eq(sourceViewVersions.viewId, viewId)).orderBy(desc(sourceViewVersions.version));
-    const draft = versions.find(v => v.status === 'draft');
-    if (!draft) throw new SourceViewError('这个源视图没有草稿');
-    const published = versions.find(v => v.status === 'published')?.version ?? null;
-    // 从没发布过时删除源视图，各版本随之级联删除
-    if (published) await tx.delete(sourceViewVersions).where(eq(sourceViewVersions.id, draft.id));
-    else await tx.delete(sourceViews).where(eq(sourceViews.id, viewId));
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'source_view.draft_discarded',
-      targetType: 'source_view',
-      targetId: viewId,
-      detail: { source: view.sourceName, name: view.name, version: draft.version, published },
-    });
-    return { kept: published !== null };
-  });
+  return discard(sourceViewAdapter, actor, await sourceViewCtx(actor, sourceId, viewId));
 }

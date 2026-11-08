@@ -1,12 +1,10 @@
 // 源视图的流水线接缝：同步到原始层 → createSourceView / saveSourceViewDraft 在只读挂载的数据湖上校验 SQL 并返回列与样本 →
-// 只能读本数据源原始层的表；双人发布与丢弃
+// 只能读本数据源原始层的表。保存 / 发布 / 丢弃的流程在 publishing.test.ts（ADR-0051）
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { syncSource } from '../../app/.server/source-sync';
-import {
-  createSourceView, discardSourceViewDraft, getSourceView, listSourceViews, previewSourceView, publishSourceView, saveSourceViewDraft,
-} from '../../app/.server/source-views';
+import { createSourceView, getSourceView, listSourceViews, previewSourceView, saveSourceViewDraft } from '../../app/.server/source-views';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
@@ -115,38 +113,5 @@ describe('源视图草稿', () => {
       .then(() => '已保存', (e: Error) => e.message);
     expect(error).toMatch(/源视图执行出错.*[0-9a-f]{64}/);
     expect(error).not.toContain('@');
-  });
-});
-
-describe('源视图发布', () => {
-  it('双人发布：最后保存的人发布不了，另一位发布后锁定；再改是新的一版草稿，丢弃回到已发布版本', async () => {
-    const { author, reviewer, id } = await syncedSource();
-    const viewId = await createSourceView(author, id, { name: 'customer_orders', sql: CUSTOMER_ORDERS });
-
-    await expect(publishSourceView(author, id, viewId, 1)).rejects.toMatchObject({ status: 403, message: expect.stringContaining('你最后改了这一版草稿') });
-    await publishSourceView(reviewer, id, viewId, 1);
-    await expect(publishSourceView(reviewer, id, viewId, 1)).rejects.toMatchObject({ status: 400, message: '已发布的版本已锁定' });
-    expect((await getSourceView(author, id, viewId)).published).toMatchObject({ version: 1, publishedByEmail: 'de2@acme.com' });
-
-    expect(await saveSourceViewDraft(reviewer, id, viewId, 'SELECT customer_id, city, _op, _batch, _commit_ts FROM customers')).toBe(2);
-    // 作者也改过之后，最后保存的是作者，审核人可以发布
-    expect(await saveSourceViewDraft(author, id, viewId, 'SELECT customer_id, city, _op, _batch, _commit_ts FROM customers WHERE city IS NOT NULL')).toBe(2);
-    expect((await getSourceView(author, id, viewId)).draft).toMatchObject({ authors: ['de2@acme.com', 'de@acme.com'], lastEditor: 'de@acme.com' });
-    expect(await discardSourceViewDraft(author, id, viewId)).toEqual({ kept: true });
-    const view = await getSourceView(author, id, viewId);
-    expect(view.draft).toBeNull();
-    expect(view.versions.map(v => v.version)).toEqual([1]);
-    expect((await listSourceViews(author, id)).views).toEqual([{ id: viewId, name: 'customer_orders', published: 1, draft: null }]);
-  });
-
-  it('丢弃从没发布过的源视图会删除它；分析师不能起草与发布', async () => {
-    const { acme, author, id } = await syncedSource();
-    const viewId = await createSourceView(author, id, { name: 'customer_orders', sql: CUSTOMER_ORDERS });
-    const analyst = await memberOf(acme, 'an@acme.com', 'analyst');
-    await expect(publishSourceView(analyst, id, viewId, 1)).rejects.toMatchObject({ init: { status: 403 } });
-    await expect(saveSourceViewDraft(analyst, id, viewId, CUSTOMER_ORDERS)).rejects.toMatchObject({ init: { status: 403 } });
-
-    expect(await discardSourceViewDraft(author, id, viewId)).toEqual({ kept: false });
-    await expect(getSourceView(author, id, viewId)).rejects.toMatchObject({ status: 404 });
   });
 });
