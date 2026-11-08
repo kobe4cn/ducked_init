@@ -3,7 +3,7 @@ import { desc, eq } from 'drizzle-orm';
 import type { CurrentMember } from './auth';
 import { CATALOG_ACTIONS, currentCatalogTx, recordCatalogVersionNow } from './catalog/tx';
 import { getDb, type Db } from './db/client';
-import { auditLogs, ROLE_LABELS, SOURCE_KIND_LABELS, tenants, type Role, type SourceKind } from './db/schema';
+import { auditLogs, KNOWLEDGE_SOURCE_KIND_LABELS, ROLE_LABELS, SOURCE_KIND_LABELS, tenants, type KnowledgeSourceKind, type Role, type SourceKind } from './db/schema';
 import { describeBroken } from './pipeline/schema-diff';
 import { TEMPLATES } from './pipeline/templates';
 import { describeQuotaChange, type TenantQuota } from './quota';
@@ -14,6 +14,8 @@ import { claimTypeLabel } from '../lib/semantic-claims';
 
 type Detail = Record<string, unknown>;
 const sourceKindLabel = (kind: unknown) => SOURCE_KIND_LABELS[kind as SourceKind] ?? String(kind);
+/** 知识来源的种类（ADR-0046 入口③）：粘贴的数据字典、指标说明或 SQL */
+const knowledgeSourceKindLabel = (kind: unknown) => KNOWLEDGE_SOURCE_KIND_LABELS[kind as KnowledgeSourceKind] ?? String(kind);
 const roleLabel = (role: unknown) => ROLE_LABELS[role as Role] ?? String(role);
 const templateLabel = (template: unknown) => TEMPLATES[template as keyof typeof TEMPLATES]?.label ?? String(template);
 const credentialLabel = (d: Detail) => `「${d.name}」（${d.prefix}…）`;
@@ -264,6 +266,12 @@ const ACTIONS = {
   'knowledge_proposal.generate_failed': {
     label: '按主题生成知识提案失败',
     describe: (d: Detail) => `${subjectTarget(d)}，模型服务：${d.error}`,
+  },
+  // 知识来源（ADR-0046 入口③）：成员粘贴的原文按段落、版本保存（#525）。detail 只有标题、种类、版本与段数，不记原文；
+  // 同标题再粘贴版本 +1 也记这条（版本号不同），正文没变不加版本、不记。也不进 CATALOG_ACTIONS（来源不是目录条目）
+  'knowledge_source.created': {
+    label: '粘贴知识来源',
+    describe: (d: Detail) => `「${d.title}」（${knowledgeSourceKindLabel(d.kind)}），第 ${d.version} 版，${d.paragraphs} 段`,
   },
   // 分析主题与主题归属（ADR-0046）：detail 只有 subjectId（与 targetId），不记主题名
   'analysis_subject.created': { label: '新建分析主题', describe: subjectTarget },
