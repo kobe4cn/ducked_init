@@ -79,6 +79,13 @@ describe('指标与标签定义页', () => {
     expect(page).toContain('添加一行');
     expect(page).toContain('name="form"');
 
+    // 字段列表只来自 fieldsFor：customer 能选作基础实体、它的普通字段随页面下发，敏感字段一个都不出现
+    expect(page).toContain('消费者（customer）');
+    expect(page).toContain('生日');
+    for (const f of entityOf('customer')!.fields.filter(f => f.pii)) expect(page).not.toContain(`${f.label}（${f.name}）`);
+    expect(page).not.toContain('手机号');
+    expect(page).not.toContain('邮箱');
+
     const form: MetricForm = { base: 'order', agg: 'sum', field: 'amount', filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'paid_at', days: 30 }, dimensions: [], readonly: [] };
     const post = (body: Record<string, string>) => analyst.post('/analytics/definitions/new', { kind: 'metric', key: 'paid_amount_30d', form: JSON.stringify(form), ...body });
 
@@ -101,6 +108,8 @@ describe('指标与标签定义页', () => {
 
     // fieldsFor 里没有的字段：服务端兜底拦下
     expect((await post({ intent: 'check', form: JSON.stringify({ ...form, field: 'not_a_field' }) })).status).toBe(400);
+    // 敏感字段不在 fieldsFor 里，手工提交也被拦下
+    expect((await post({ intent: 'check', form: JSON.stringify({ base: 'customer', agg: 'count_distinct', field: 'phone', filter: [], dimensions: [], readonly: [] }) })).status).toBe(400);
 
     // 不信客户端：分子缺 filter、没有分母、条件行缺 op 或取值是对象，都按读不出来的内容 400，不是 500
     expect((await post({ intent: 'check', form: JSON.stringify({ base: 'order', agg: 'ratio', numerator: { agg: 'count' } }) })).status).toBe(400);
