@@ -124,7 +124,7 @@ describe('指标与标签定义页', () => {
     // 敏感字段不在 fieldsFor 里，手工提交也被拦下
     expect((await post({ intent: 'check', form: JSON.stringify({ base: 'customer', agg: 'count_distinct', field: 'phone', filter: [], dimensions: [], readonly: [] }) })).status).toBe(400);
 
-    // 不信客户端：分子缺 filter、没有分母、条件行缺 op 或取值是对象，都按读不出来的内容 400，不是 500
+    // 不信客户端：ratio 没有分母按读不出来的内容 400（不是 500）；缺 op 或取值是对象的条件行丢掉，其余照常检查
     expect((await post({ intent: 'check', form: JSON.stringify({ base: 'order', agg: 'ratio', numerator: { agg: 'count' } }) })).status).toBe(400);
     expect((await post({ intent: 'check', form: JSON.stringify({ ...form, filter: [{ field: 'status' }, { field: 'status', op: 'eq', value: { x: 1 } }] }) })).status).toBe(200);
 
