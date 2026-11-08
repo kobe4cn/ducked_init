@@ -9,7 +9,8 @@ import { checkKeyColumns, syncOptionsFromEnv, syncSourceTables, type SyncTablePa
 import { verifySourceLake, type VerifyTableParam } from './verify-engine';
 import { inspectLake, type InspectParams } from './inspect-engine';
 import { runKeyCheck, type KeyCheckParams } from './key-check-engine';
-import { lit, mergeToSilver, type MergeDrop, type MergeGroupParam, type MergeMappingParam, type RelationParam } from './merge-engine';
+import { lit } from '../../lib/mapping-expr';
+import { mergeToSilver, type MergeDrop, type MergeGroupParam, type MergeMappingParam, type RelationParam } from './merge-engine';
 import { MERGE_RULE_KINDS, type MergeRuleKind } from '../../lib/merge-groups';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './identity-engine';

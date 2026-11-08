@@ -5,7 +5,9 @@ import type { DuckDBConnection } from '@duckdb/node-api';
 import { cmp } from '../../lib/compare';
 import { customerSourceColumn } from '../../lib/customer-source';
 import { SILVER } from './lake-schemas';
-import { columnExists, ident, joinOn, keyList, lit, rows, silverTable, SILVER_SYSTEM_COLUMNS, tableExists } from './merge-engine';
+import { ident, lit } from '../../lib/mapping-expr';
+import { columnExists, joinOn, keyList, rows, silverTable, tableExists } from './duck-sql';
+import { SILVER_SYSTEM_COLUMNS } from './merge-engine';
 
 /**
  * 一个实体：主键、写入它的已发布映射（各带映射出来的列名与所在的已发布合并组 group）；bySource 为真时（主键含指向 customer 的字段）

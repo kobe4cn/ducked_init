@@ -17,7 +17,8 @@
 // 与 silver._consumer_consent：每个统一消费者每个渠道一行，取各源里 updated_at 最新的同意状态，同一时刻撤回优先，记下来源 _source
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { entityOf } from '../../lib/canonical-model';
-import { SILVER_SYSTEM_COLUMNS, tableExists } from './merge-engine';
+import { tableExists } from './duck-sql';
+import { SILVER_SYSTEM_COLUMNS } from './merge-engine';
 
 /** 默认的匹配规则：按优先级是手机号、邮箱、外部 ID 的哈希精确相等 */
 export const DEFAULT_RULES: readonly string[] = ['phone', 'email', 'external_id'];

@@ -7,7 +7,7 @@ import type { DuckDBConnection } from '@duckdb/node-api';
 import { entityOf } from '../../lib/canonical-model';
 import { customerSourceColumn } from '../../lib/customer-source';
 import { ASSERTION_RUNS, QUARANTINE } from './lake-schemas';
-import { lit } from './merge-engine';
+import { lit } from '../../lib/mapping-expr';
 import { PartialFailure } from './partial-failure';
 
 /** error 失败时阻断任务，warn 只记录 */

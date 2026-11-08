@@ -4,7 +4,8 @@
 // 不放标准层或原始层的表；快照表本来就没有明文（ADR-0005），源端 ID 照 _identities 原样存（本身是敏感值时是已知缺口，见 ADR-0033）
 import { SERVING_DIR, type TenantLakeSession } from './lake-engine';
 import { CONSUMER_ID_CHANGES, CONSUMER_ID_MEMBERS, IDENTITIES } from './identity-engine';
-import { ident, lit, rows, tableExists } from './merge-engine';
+import { ident, lit } from '../../lib/mapping-expr';
+import { rows, tableExists } from './duck-sql';
 
 /** 一个要放进服务库的快照：快照 ID、模板（rfm、metric:<键>、tag:<键>）与结果层表名；其余字段（定义版本等）由调用方记在指针上 */
 export interface ServingSnapshot { id: string; template: string; table: string }

@@ -6,7 +6,7 @@
 // 纯函数：不碰平台库与数据湖，同样的定义与 asOf 编译出同样的 SQL
 import { Ajv } from 'ajv';
 import { IDENTITIES } from '../identity-engine';
-import { lit } from '../merge-engine';
+import { lit } from '../../../lib/mapping-expr';
 import { compileMetric, DESCRIPTION_SCHEMA, isNumericMetric, metricEntities, parseDsl, type Dependencies, type DslCheck, type DslContext, type MetricSpec } from './metric-spec';
 
 export const TAG_CONDITIONS = ['gte', 'gt', 'lte', 'lt', 'eq'] as const;
