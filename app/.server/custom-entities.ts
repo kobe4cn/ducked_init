@@ -13,9 +13,10 @@ import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { customEntities, customEntityVersions, mappings, mappingVersions, sources } from './db/schema';
-import { isSensitiveField, lockTenant, publishedPlans } from './mappings';
+import { isSensitiveField, publishedPlans } from './mappings';
 import { publishedDependents } from './dsl-dependencies';
 import { discard, publish, PublishError, publishBlocker, publisherCount, saveDraft, type DraftRow, type PublishableAdapter } from './publishing';
+import { lockTenant } from './tenant-lock';
 import {
   CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, type EntityRelation, entityOf,
   EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType, isCustomEntity, relationText,
