@@ -4,7 +4,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { getMapping } from '../../app/.server/mappings';
 import { lit } from '../../app/lib/mapping-expr';
-import { type MergeRecord } from '../../app/.server/pipeline/merge-engine';
+import type { MergeRecord } from '../../app/.server/pipeline/merge-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { listTasks } from '../../app/.server/tasks';
