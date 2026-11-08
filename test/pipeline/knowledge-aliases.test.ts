@@ -89,7 +89,7 @@ describe('别名', () => {
     // 停用后可以再加同名的
     await addAlias(analyst, { targetId: 'entity:order', alias: '交易单' });
     expect(expand(await tenantCatalog(acme), 'entity:order')).toMatchObject({ knowledge: { aliases: ['交易单'] } });
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 
   it('加与停用记审计 alias.added / alias.retired，detail 只有 targetId 与 mappingId，不含别名原文', async () => {
     const { acme, author, analyst, orderMappings } = await setup();
@@ -104,7 +104,7 @@ describe('别名', () => {
     ]));
     expect(logs).toHaveLength(3);
     expect(JSON.stringify(logs)).not.toMatch(/暗号/);
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 
   it('based_on：指标与标签是已发布 YAML 的摘要，映射字段是该映射已发布计划的摘要，实体与普通字段为空', async () => {
     const { acme, author, analyst, orderMappings } = await setup();
@@ -123,7 +123,7 @@ describe('别名', () => {
       高消费: [{ id: 'tag:spender', hash: definitionHash(SPENDER) }],
       会员单状态: [{ id: `mapping:${loyalty}`, hash: planHash(plan) }],
     });
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 
   it('重复、目标不存在、敏感字段、映射没写入该字段时 400 且不留记录；查看者 403，分析师给映射字段加别名或停用映射字段别名 403', async () => {
     const { acme, author, analyst, viewer, mappings, orderMappings } = await setup();
@@ -169,5 +169,5 @@ describe('别名', () => {
     expect(rows.find(r => r.id === mapped)?.retiredAt).toBeNull();
     expect((await audits(acme)).map(l => l.action).sort()).toEqual(['alias.added', 'alias.added', 'alias.added', 'alias.added', 'alias.retired']);
     expect((await latestVersion(acme))!.version).toBe(before + 2);
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 });
