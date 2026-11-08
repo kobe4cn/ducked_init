@@ -16,11 +16,10 @@ import { ident, lit } from '../../../lib/mapping-expr';
 import { silverTable } from '../duck-sql';
 import type { MergeMappingParam } from '../merge-engine';
 import { customerSourceColumn } from '../../../lib/customer-source';
+import { AGGS, FILTER_OPS, MAX_DIMENSIONS, MAX_HOPS, RATIO_AGGS } from '../../../lib/metric-vocab';
 
-export const AGGS = ['count', 'count_distinct', 'sum', 'avg', 'min', 'max', 'ratio', 'latest', 'earliest', 'days_since'] as const;
-/** ratio 的分子、分母能用的聚合 */
-export const RATIO_AGGS = ['count', 'count_distinct', 'sum'] as const;
-export const FILTER_OPS = ['eq', 'ne', 'in', 'not_in', 'gt', 'gte', 'lt', 'lte', 'is_null', 'not_null'] as const;
+// 词汇表搬到了 ~/lib/metric-vocab（指标表单也要用），这里原名 re-export，原有 import 不用改
+export { AGGS, RATIO_AGGS, FILTER_OPS, MAX_DIMENSIONS, MAX_HOPS };
 type Scalar = string | number | boolean;
 type Conditions = { field: string; op: (typeof FILTER_OPS)[number]; value?: Scalar | Scalar[] }[];
 /** ratio 的分子或分母：自己的 filter 与顶层 filter、window 叠加 */
@@ -62,9 +61,6 @@ export interface DslIssue { line: number; col: number; path: string; message: st
 
 export type DslCheck<S> = { ok: true; spec: S } | { ok: false; issues: DslIssue[] };
 
-/** 维度最多几个、维度路径最多几跳 */
-export const MAX_DIMENSIONS = 3;
-export const MAX_HOPS = 3;
 /** 关联不到或为空的维度取值 */
 export const UNLINKED = '未关联';
 

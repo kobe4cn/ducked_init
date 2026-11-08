@@ -3,43 +3,12 @@
 // 每项的说明写成 satisfies Record<注册表的项, …>，注册表新增一项却没写说明时类型检查不通过。
 // 手写示例只用标准实体的非敏感字段，测试里逐个过 checkMetric / checkTag；模板产出列按各模板 compile 出来的 SELECT 写，测试里对照 DESCRIBE
 import { CHANNELS } from '../../lib/canonical-model';
-import { AGGS, FILTER_OPS, MAX_DIMENSIONS, MAX_HOPS, METRIC_SCHEMA, RATIO_AGGS } from '../pipeline/dsl/metric-spec';
+import { AGG_TEXT, FILTER_OP_TEXT, MAX_DIMENSIONS, MAX_HOPS, RATIO_AGG_TEXT } from '../../lib/metric-vocab';
+import { METRIC_SCHEMA } from '../pipeline/dsl/metric-spec';
 import { TAG_CONDITIONS, TAG_SCHEMA } from '../pipeline/dsl/tag-spec';
 import { TEMPLATES, type TemplateId } from '../pipeline/templates';
 import type { DslKind } from '../pipeline/dsl';
 import type { CapabilityEntry, CapabilityItem, OutputColumn } from './index';
-
-const AGG_TEXT = {
-  count: '行数；写了 field 时只数 field 不为空的行',
-  count_distinct: 'field 的不同取值个数',
-  sum: 'field（数字）求和',
-  avg: 'field（数字）平均值',
-  min: 'field 的最小值（数字、日期或时间）',
-  max: 'field 的最大值（数字、日期或时间）',
-  ratio: '比率：numerator / denominator，分子、分母各写 agg（只能是 count、count_distinct、sum）、field 与自己的 filter，与顶层 filter、window 叠加',
-  latest: '按 by（日期或时间）取最新一行的 field（数字）',
-  earliest: '按 by（日期或时间）取最早一行的 field（数字）',
-  days_since: 'asOf 减 field（日期或时间）最近一天的天数',
-} satisfies Record<(typeof AGGS)[number], string>;
-
-const RATIO_AGG_TEXT = {
-  count: '分子或分母为行数',
-  count_distinct: '分子或分母为 field 的不同取值个数',
-  sum: '分子或分母为 field 求和',
-} satisfies Record<(typeof RATIO_AGGS)[number], string>;
-
-const FILTER_OP_TEXT = {
-  eq: '等于 value',
-  ne: '不等于 value',
-  in: '在 value 列表里',
-  not_in: '不在 value 列表里',
-  gt: '大于 value',
-  gte: '大于等于 value',
-  lt: '小于 value',
-  lte: '小于等于 value',
-  is_null: '为空（不写 value）',
-  not_null: '不为空（不写 value）',
-} satisfies Record<(typeof FILTER_OPS)[number], string>;
 
 const METRIC_KEY_TEXT = {
   base: '基础实体：customer，或有指向 customer 的 customer_id 的实体，或经一跳引用关联到这样的实体',
