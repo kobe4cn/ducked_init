@@ -6,6 +6,7 @@ import { SERVING_DIR, type TenantLakeSession } from './lake-engine';
 import { CONSUMER_ID_CHANGES, CONSUMER_ID_MEMBERS, IDENTITIES } from './identity-engine';
 import { ident, lit } from '../../lib/mapping-expr';
 import { rows, tableExists } from './duck-sql';
+import { SNAPSHOT_TABLE } from './task-contracts';
 
 /** 一个要放进服务库的快照：快照 ID、模板（rfm、metric:<键>、tag:<键>）与结果层表名；其余字段（定义版本等）由调用方记在指针上 */
 export interface ServingSnapshot { id: string; template: string; table: string }
@@ -15,8 +16,8 @@ export interface ServingParams { version: number; target: string; snapshots: Ser
 /** 服务库里各表的行数 */
 export interface ServingRows { tags: number; metrics: number; rfm: number; consumer_aliases: number; consumer_sources: number }
 
-/** 结果层快照表名 gold.<种类>__<任务 ID> */
-export const SNAPSHOT_TABLE = /^gold\.([a-z][a-z0-9]*)__[0-9a-f-]{36}$/;
+/** 结果层快照表名 gold.<种类>__<任务 ID>：定义在任务契约（task-contracts.ts），这里转出给 serving-reader 与内部使用 */
+export { SNAPSHOT_TABLE };
 
 /** 服务库在存储前缀下的位置 */
 export const servingPath = (dataPath: string, version: number) => `${dataPath}${SERVING_DIR}v${version}.duckdb`;
