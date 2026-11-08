@@ -6,9 +6,10 @@ import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/merge-groups';
 import { can, requirePermission } from '~/.server/access';
 import {
-  discardMergeGroupDraft, listMergeGroups, MergeGroupError, type MergeGroupInput, mergeGroupInputOf, publishMergeGroup, saveMergeGroupDraft,
+  discardMergeGroupDraft, listMergeGroups, type MergeGroupInput, mergeGroupInputOf, publishMergeGroup, saveMergeGroupDraft,
 } from '~/.server/merge-groups';
 import { navFor } from '~/.server/nav';
+import { PublishError } from '~/.server/publishing';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { PageHeader } from '~/components/page-header';
@@ -64,7 +65,7 @@ export async function action({ request }: Route.ActionArgs) {
         return data({ error: '未知操作', intent: null, input: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof MergeGroupError) {
+    if (e instanceof PublishError) {
       const intent = String(form.get('intent'));
       return data({ error: e.message, intent, input }, { status: e.status });
     }
