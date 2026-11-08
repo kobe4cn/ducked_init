@@ -113,8 +113,12 @@ function Item({ item, active }: { item: HubItem; active: boolean }) {
 
 export default function Knowledge({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, hub, selected, subjectIds, canSuggest, suggested } = loaderData;
-  // 生成建议同步调模型，提交期间禁用按钮防重复点
-  const submitting = useNavigation().state === 'submitting';
+  // 生成建议同步调模型：生成期间禁用所有「生成建议」防止再起一次调用，只有被点的那组显示「生成中…」；
+  // 面板里的提交（alias.add、proposal.accept 等）不影响这些按钮
+  const navigation = useNavigation();
+  const pendingSubject = navigation.state === 'submitting' && navigation.formData?.get('intent') === 'suggest'
+    ? String(navigation.formData.get('subjectId'))
+    : null;
   const list = hub.groups.length === 0 ? (
     <section className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">
       <p className="inline-flex items-center gap-2"><CheckCircle2 className="size-4 text-emerald-600" />没有待确认的提案或缺失项。</p>
@@ -132,8 +136,8 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
               <Form method="post" className="ml-auto">
                 <input type="hidden" name="intent" value="suggest" />
                 <input type="hidden" name="subjectId" value={subjectIds[g.subject] ?? ''} />
-                <Button type="submit" variant="outline" size="sm" disabled={submitting}>
-                  <Sparkles />{submitting ? '生成中…' : '生成建议'}
+                <Button type="submit" variant="outline" size="sm" disabled={pendingSubject !== null}>
+                  <Sparkles />{pendingSubject !== null && pendingSubject === subjectIds[g.subject] ? '生成中…' : '生成建议'}
                 </Button>
               </Form>
             )}
