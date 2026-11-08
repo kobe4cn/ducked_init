@@ -1,13 +1,34 @@
 name: CI
 
+# 只改文档、agent 配置的提交不跑。app/ 下没有 .md，测试里提到 docs/ 的只是注释；没有必需的检查，跳过不会卡住 PR
 on:
   push:
     branches: [main]
+    paths-ignore: &docs-only
+      - 'docs/**'
+      - '*.md'
+      - '.sandcastle/**/*.md'
+      - '.claude/**'
+      - '.agents/**'
+      - '.cursor/**'
   pull_request:
+    paths-ignore: *docs-only
+
+# PR 分支再推送时取消旧的运行；main 的 push 用 run_id 各自成组，每个提交都跑完
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   test:
+    name: test (${{ matrix.shard }}/5)
     runs-on: ubuntu-24.04
+    # 分片并行：单个 4 核 runner、2 个 worker 跑完整测试要 70 分钟以上。每片自带一套服务，片之间互不影响。
+    # 片数受账号同时运行 20 个 job 的上限约束，多个运行同时排队时片太多反而更慢
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
     services:
       postgres:
         image: postgres:17
@@ -80,5 +101,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm run typecheck
-      - run: pnpm test
+      # typecheck 与分片无关，只在第 1 片跑
+      - if: matrix.shard == 1
+        run: pnpm run typecheck
+      - run: pnpm test --shard=${{ matrix.shard }}/5
