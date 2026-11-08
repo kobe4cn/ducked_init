@@ -22,6 +22,7 @@ npx vitest run test/pipeline/mapping-merge.test.ts # 单个文件
   - 建、改账号时按账号名加 advisory lock（`ensurePgAccounts`），防止跨运行的同名角色并发 ALTER 报 `tuple concurrently updated`（#439）
   - 测试里要用到这些名字时从环境变量取，或用 `test/setup-env.ts` 导出的 `WORKER_SUFFIX`，不要写死。临时改 `PLATFORM_LAKE_URI` 的文件在 afterAll 里恢复成改之前的值（本 worker 的值）
   - 不在 vitest 里（scripts 引用夹具）时没有 `VITEST_POOL_ID`，不加后缀
+- **测试超时倍数 `CRM_TEST_TIMEOUT_SCALE`**（本地默认 1，即 `vitest.config.ts` 的 90 s / 60 s）：`testTimeout` 与 `hookTimeout` 都乘上它（非数字或 ≤0 按 1）。Sandcastle 沙箱设 2（180 s / 120 s）：沙箱负载比本地约慢一倍（#439），`publishedIdentitySources` 平均 26.8 s，90 s 会被整体逼近、超过（#357 / #440 / #459 三张偶发失败票）。用例第三参的单个放宽不受倍数影响、照常生效。
 - `test/global-setup.ts` 在开跑前对 i = 1…N 逐个建库（不存在时）并迁移到最新结构；旧库不删（库里租户的 catalog 角色是集群级的，删库会留下孤儿角色）。它还加了一把锁，已有 vitest 在跑时，再启动的 vitest 会直接报错退出。
 
 ### 测量耗时
