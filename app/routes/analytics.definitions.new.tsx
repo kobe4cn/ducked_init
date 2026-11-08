@@ -14,7 +14,7 @@ import { checkMetric, compileMetric, fieldsFor } from '~/.server/pipeline/dsl/me
 import { getDb } from '~/.server/db/client';
 import { todayUtc } from '~/.server/templates';
 import { CANONICAL_ENTITIES, entityOf, type FieldType } from '~/lib/canonical-model';
-import { formToYaml, summarize, yamlToForm, type FormField, type MetricForm } from '~/lib/metric-form';
+import { formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
@@ -73,22 +73,55 @@ function labelledFields(base: string, fields: readonly { name: string; type: Fie
   return fields.map(f => ({ ...f, label: canonical?.find(c => c.name === f.name)?.label ?? f.name }));
 }
 
+/** 字符串或 undefined：客户端传来的其他类型一律当没填 */
+function strOf(v: unknown): string | undefined {
+  return typeof v === 'string' && v !== '' ? v : undefined;
+}
+
+/** 条件行：只留 field、op 都是非空字符串，且 value 是 undefined、字符串或字符串数组的行；op 是否合法交给 checkMetric */
+function condsOf(v: unknown): Cond[] {
+  if (!Array.isArray(v)) return [];
+  return v.flatMap((c): Cond[] => {
+    if (!c || typeof c !== 'object') return [];
+    const { field, op, value } = c as Record<string, unknown>;
+    if (strOf(field) === undefined || strOf(op) === undefined) return [];
+    const okValue = value === undefined || typeof value === 'string' || (Array.isArray(value) && value.every(x => typeof x === 'string'));
+    if (!okValue) return [];
+    return [{ field: field as string, op: op as Cond['op'], ...(value !== undefined ? { value: value as string | string[] } : {}) }];
+  });
+}
+
+/** 分子 / 分母：不是对象当 undefined；agg 必须是字符串（是否合法交给 checkMetric），field 取字符串，filter 不是数组当空 */
+function ratioOf(v: unknown): RatioForm | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r.agg !== 'string') return undefined;
+  return { agg: r.agg as RatioForm['agg'], field: strOf(r.field), filter: condsOf(r.filter) };
+}
+
 /**
  * 构建器隐藏字段 form（MetricForm 的 JSON）→ 表单状态：只收构建器有的控件（dimensions、readonly 一律为空），
- * 没选字段的条件行丢掉；读不出来（不是 JSON、没有 base）按业务错误 400。字段是否可用不在这里判断，交给 checkMetric
+ * 不信客户端：每一层都按类型规整，读不出来的条件行丢掉；没有 base、ratio 缺分子或分母按业务错误 400。字段、运算是否可用不在这里判断，交给 checkMetric
  */
 function builderFormOf(text: string): MetricForm {
-  let v: Partial<MetricForm> = {};
-  try { v = JSON.parse(text) as Partial<MetricForm>; } catch { /* 按没有 base 处理 */ }
-  if (typeof v.base !== 'string' || v.base === '') throw new DslError('构建器的内容读不出来，请刷新页面重试');
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch { /* 按没有 base 处理 */ }
+  const v = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  const base = strOf(v.base);
+  if (base === undefined) throw new DslError('构建器的内容读不出来，请刷新页面重试');
+  const agg = (typeof v.agg === 'string' ? v.agg : 'count') as MetricForm['agg'];
+  const parts = agg === 'ratio' ? { numerator: ratioOf(v.numerator), denominator: ratioOf(v.denominator) } : undefined;
+  // ratio 缺分子或分母：formToYaml 会默认补成 count，等于替客户端猜了一半，按读不出来处理
+  if (parts && (parts.numerator === undefined || parts.denominator === undefined)) throw new DslError('构建器的内容读不出来：比例要有分子和分母，请刷新页面重试');
+  const w = v.window && typeof v.window === 'object' ? (v.window as Record<string, unknown>) : undefined;
   return {
-    base: v.base,
-    agg: v.agg ?? 'count',
-    field: v.field || undefined,
-    by: v.by || undefined,
-    ...(v.agg === 'ratio' ? { numerator: v.numerator, denominator: v.denominator } : {}),
-    filter: (Array.isArray(v.filter) ? v.filter : []).filter(c => !!c && typeof c.field === 'string' && c.field !== ''),
-    window: v.window && typeof v.window.field === 'string' && v.window.field !== '' && typeof v.window.days === 'number' ? v.window : undefined,
+    base,
+    agg,
+    field: strOf(v.field),
+    by: strOf(v.by),
+    ...parts,
+    filter: condsOf(v.filter),
+    window: w && strOf(w.field) !== undefined && typeof w.days === 'number' ? { field: w.field as string, days: w.days } : undefined,
     dimensions: [],
     readonly: [],
   };
@@ -136,7 +169,9 @@ export async function action({ request }: Route.ActionArgs) {
   const intent = form.get('intent');
   /** 构建器模式：隐藏字段 form 是 MetricForm 的 JSON（YAML 模式不提交它） */
   const builder = kind === 'metric' && form.has('form') ? String(form.get('form')) : undefined;
-  const keep = { key, request: requirement, generated: false, form: builder };
+  /** 回显给构建器的是服务端规整过的表单，不原样回传客户端的内容（读不出来就不回显） */
+  const echo = builder === undefined ? undefined : (() => { try { return JSON.stringify(builderFormOf(builder)); } catch { return undefined; } })();
+  const keep = { key, request: requirement, generated: false, form: echo };
   let yaml = yamlInput;
   try {
     if (intent === 'model-draft') {

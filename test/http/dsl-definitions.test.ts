@@ -102,6 +102,10 @@ describe('指标与标签定义页', () => {
     // fieldsFor 里没有的字段：服务端兜底拦下
     expect((await post({ intent: 'check', form: JSON.stringify({ ...form, field: 'not_a_field' }) })).status).toBe(400);
 
+    // 不信客户端：分子缺 filter、没有分母、条件行缺 op 或取值是对象，都按读不出来的内容 400，不是 500
+    expect((await post({ intent: 'check', form: JSON.stringify({ base: 'order', agg: 'ratio', numerator: { agg: 'count' } }) })).status).toBe(400);
+    expect((await post({ intent: 'check', form: JSON.stringify({ ...form, filter: [{ field: 'status' }, { field: 'status', op: 'eq', value: { x: 1 } }] }) })).status).toBe(200);
+
     // YAML 模式也能只检查不保存
     const yamlCheck = await analyst.post('/analytics/definitions/new', { kind: 'metric', intent: 'check', yaml: 'base: order\nmeasure: { agg: count }\n' });
     expect(yamlCheck.status).toBe(200);
