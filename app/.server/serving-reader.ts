@@ -13,7 +13,7 @@ import type { ServingStoreSnapshot } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { isS3 } from './lake-storage';
 import { openTenantLake } from './pipeline/lake-engine';
-import { ident, lit } from './pipeline/merge-engine';
+import { ident, lit } from '../lib/mapping-expr';
 import { dimsJson, SNAPSHOT_TABLE } from './pipeline/serving-engine';
 import { getObject } from './s3-client';
 import { tenantServingKey } from './secrets';

@@ -16,6 +16,7 @@ import { MERGES, RECORDS, SILVER } from './lake-schemas';
 import { entityOf, type EntityRelation, type RelationStat } from '../../lib/canonical-model';
 import { CONSUMER, CONSUMER_CONSENT, CONSUMER_IDS, consumerSensitive, DEFAULT_RULES, DEVICE_OWNER, IDENTITIES, resolveIdentities, type IdentitySummary } from './identity-engine';
 import { compileExpression, ident, lit, parseExpression, referencedColumns } from '../../lib/mapping-expr';
+import { columnExists, joinOn, keyList, rows, silverTable, tableExists } from './duck-sql';
 import { customerSourceColumn } from '../../lib/customer-source';
 import type { MergeRule } from '../../lib/merge-groups';
 import { ensureCustomerSourceColumns } from './customer-source-columns';
@@ -137,24 +138,11 @@ const IDENTITY_INPUTS = ['customer', 'event', 'consent'];
  */
 const SCHEME = 3;
 
-export { ident, lit };
-export const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 const columnsOf = (con: DuckDBConnection, relation: string) => rows<{ column_name: string; column_type: string }>(con, `DESCRIBE ${relation}`);
 const count = async (con: DuckDBConnection, relation: string) => Number((await rows<{ n: string }>(con, `SELECT count(*) AS n FROM ${relation}`))[0].n);
-export const tableExists = async (con: DuckDBConnection, schema: string, name: string) => (await rows(con, `
-  SELECT 1 FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = ${lit(schema)} AND table_name = ${lit(name)}`)).length > 0;
-export const keyList = (keys: string[], alias?: string) => keys.map(k => (alias ? `${alias}.${ident(k)}` : ident(k))).join(', ');
-export const joinOn = (keys: string[], a: string, b: string) => keys.map(k => `${a}.${ident(k)} = ${b}.${ident(k)}`).join(' AND ');
 /** 整行哈希（与同步时的算法相同）：“列名=取值”按列名排序后拼接，空值不参与 */
 const rowHash = (columns: string[], alias: string) =>
   `hash(concat_ws(chr(31), ${[...columns].sort().map(c => `${lit(`${c}=`)} || ${alias}.${ident(c)}::VARCHAR`).join(', ')}))`;
-
-export const columnExists = async (con: DuckDBConnection, entity: string, column: string) => (await rows(con, `
-  SELECT 1 FROM information_schema.columns WHERE table_catalog = 'lake' AND table_schema = ${lit(SILVER)} AND table_name = ${lit(entity)}
-    AND column_name = ${lit(column)}`)).length > 0;
-
-/** 标准层表：silver."<实体>" */
-export const silverTable = (entity: string) => `${SILVER}.${ident(entity)}`;
 /** 一个映射的当前记录 */
 const recordsName = (mapping: string) => `m_${mapping.replace(/-/g, '')}`;
 const recordsOf = (mapping: string) => `${RECORDS}.${ident(recordsName(mapping))}`;

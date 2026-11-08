@@ -28,7 +28,8 @@ import { checkMetric, type DslCheck, type DslContext, type DslIssue, type Metric
 import { withMetric } from './pipeline/dsl/tag-spec';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
-import { lit, rows } from './pipeline/merge-engine';
+import { lit } from '../lib/mapping-expr';
+import { rows } from './pipeline/duck-sql';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { registerTaskSnapshot } from './snapshots';
 import { insertTask } from './tasks';

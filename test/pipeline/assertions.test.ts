@@ -9,7 +9,7 @@ import { mappings } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { setMailer, type Mail } from '../../app/.server/mailer';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
-import { lit } from '../../app/.server/pipeline/merge-engine';
+import { lit } from '../../app/lib/mapping-expr';
 import { listSnapshots, readRfmSnapshot } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource, setSyncScope } from '../../app/.server/sources';

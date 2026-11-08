@@ -12,7 +12,9 @@ import { LineCounter, parseDocument } from 'yaml';
 import { CANONICAL_ENTITIES, entityOf, isCustomEntity, type EntityRelation, type FieldType } from '../../../lib/canonical-model';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from '../identity-engine';
 import { describeSchemaError, locator, type Path, type RegisteredEntities } from '../mapping-spec';
-import { ident, lit, silverTable, type MergeMappingParam } from '../merge-engine';
+import { ident, lit } from '../../../lib/mapping-expr';
+import { silverTable } from '../duck-sql';
+import { type MergeMappingParam } from '../merge-engine';
 import { customerSourceColumn } from '../../../lib/customer-source';
 
 export const AGGS = ['count', 'count_distinct', 'sum', 'avg', 'min', 'max', 'ratio', 'latest', 'earliest', 'days_since'] as const;

@@ -11,7 +11,7 @@ import { mappings, sources, sourceViews, sourceViewVersions } from './db/schema'
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { enqueueMerge } from './mappings';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
-import { ident } from './pipeline/merge-engine';
+import { ident } from '../lib/mapping-expr';
 import { normalizeViewSql, previewView, VIEW_PLATFORM_COLUMNS, ViewSqlError, type ViewPreview } from './pipeline/source-view-engine';
 import { PLATFORM_COLUMNS } from './pipeline/sync-engine';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';

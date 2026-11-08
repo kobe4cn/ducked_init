@@ -16,7 +16,8 @@ import { mappings, mappingVersions, spaces, tasks, templateDefinitions, template
 import { pendingMerge } from './mappings';
 import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
-import { lit, rows } from './pipeline/merge-engine';
+import { lit } from '../lib/mapping-expr';
+import { rows } from './pipeline/duck-sql';
 import { latestTemplate, missingTableHint, TASK_KINDS, templateAt, TEMPLATES, type Template, type TemplateId } from './pipeline/templates';
 import { insertTask } from './tasks';
 
