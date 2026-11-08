@@ -174,7 +174,7 @@ describe('四句摘要', () => {
       base: 'order', agg: 'ratio', ...empty,
       numerator: { agg: 'count', filter: [] },
       denominator: { agg: 'count', filter: [{ field: 'status', op: 'in', value: ['paid', 'completed'] }, { field: 'channel', op: 'not_null' }] },
-    }, ORDER)[1]).toBe('分母只算 订单状态 在 paid、completed 中并且渠道 不为空 的记录。');
+    }, ORDER)[1]).toBe('分母只算 订单状态 在 paid、completed 中 并且 渠道 不为空 的记录。');
     expect(summarize({ base: 'order', agg: 'count', ...empty }, ORDER)[1]).toBe('不排除任何记录。');
   });
 });
