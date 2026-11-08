@@ -6,7 +6,7 @@ import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import {
-  adoptRelation, createCustomEntity, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, inferCustomEntityDrafts, listCustomEntities, publishCustomEntity,
+  adoptRelation, createCustomEntity, CustomEntityError, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, inferCustomEntityDrafts, listCustomEntities, publishCustomEntity,
   publishedCustomEntities, saveCustomEntityDraft, type CustomEntityInput,
 } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -14,6 +14,7 @@ import { createDefinition, deleteDefinition, publishDefinition } from '../../app
 import { customEntities, customEntityVersions } from '../../app/.server/db/schema';
 import type { EntityRelation } from '../../app/lib/canonical-model';
 import { confirmDisable, createMapping, draftFor, getMapping, requestDisable, saveDraft } from '../../app/.server/mappings';
+import { PublishError } from '../../app/.server/publishing';
 import { relationSuggestions } from '../../app/.server/relation-suggest';
 import { syncSource } from '../../app/.server/source-sync';
 import { listTasks } from '../../app/.server/tasks';
@@ -46,6 +47,8 @@ const STORE: CustomEntityInput = {
 describe('自定义实体草稿', () => {
   it('保存后列表与详情能看到草稿', async () => {
     const { author } = await engineers();
+    // 保存、发布、丢弃经 publishing.ts 接入（ADR-0051）：业务错误是发布流程错误的同族，路由按 PublishError 回显
+    expect(new CustomEntityError('x')).toBeInstanceOf(PublishError);
     const id = await createCustomEntity(author, STORE);
     expect(await listCustomEntities(author)).toEqual([{ id, name: 'custom_store', label: '门店', kind: 'dimension', published: null, draft: 1, inferred: false }]);
     const entity = await getCustomEntity(author, id);

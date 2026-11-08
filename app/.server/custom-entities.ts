@@ -1,11 +1,13 @@
 // app/.server/custom-entities.ts —— 自定义实体登记（ADR-0019）：成员在标准模型之外登记的实体，名称 custom_ 开头、租户内唯一（建实体时定下，之后不能改），
 // 每一版登记中文名、类型（维度 / 事实，只用于引导）、字段（名称、类型、说明、是否敏感）、主键与关系（本实体或标准实体的字段 → 另一个实体的单列主键，
 // 至少一端是本实体，ADR-0019「关系」）。保存草稿时校验登记本身、关系的两端与成环，发布时再校验一次。
+// 保存 / 发布 / 丢弃的流程在 publishing.ts（ADR-0051），本文件提供 customEntityAdapter 接入：保存的登记要在锁内按最新一版得出（saveLocked），
+// 推断出、还没成员确认的草稿在 checkOutside 拦下，关系在 checkInside 于事务内再校验一次；从没发布过的实体丢弃时连带丢弃孤儿映射（afterDiscard）。
 // 草稿按映射同样的规则双人发布：由最后保存它的人以外的另一位有发布权限的成员在页面上发布，也可以丢弃（回到最近的已发布版本，
 // 从没发布过时整个删除）；发布后版本锁定。没有任何自动发布的路径。发布过的实体只能新增字段与关系（规则同 ADR-0018），
 // 没被已发布映射、已发布指标引用，也没被别的实体的已发布关系指向的实体可以由有发布权限的成员删除。已发布映射在用、但没登记的实体由平台推断一份登记草稿（ADR-0019「已有自定义实体怎么迁」），
 // 先由一位成员确认（保存），再由另一位成员发布；登记发布前映射页提示实体待补登，映射页的实体链接到实体页。一律限定在操作者所属租户内
-import { and, desc, eq, exists, getTableColumns, inArray, isNull, notExists, sql } from 'drizzle-orm';
+import { and, desc, eq, exists, inArray, isNull, notExists } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
@@ -13,16 +15,14 @@ import { getDb, isUniqueViolation } from './db/client';
 import { customEntities, customEntityVersions, mappings, mappingVersions, sources } from './db/schema';
 import { isSensitiveField, lockTenant, publishedPlans } from './mappings';
 import { publishedDependents } from './dsl-dependencies';
-import { isStale, publishBlocker, publisherCount, withAuthor } from './publish-rules';
+import { discard, publish, PublishError, publishBlocker, publisherCount, saveDraft, type DraftRow, type PublishableAdapter } from './publishing';
 import {
   CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, CUSTOM_ENTITY_PATTERN, CUSTOM_FIELD_PATTERN, type CustomEntityField, type CustomEntityKind, type EntityRelation, entityOf,
   EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType, isCustomEntity, relationText,
 } from '../lib/canonical-model';
 
-/** 可以展示给成员的业务错误 */
-export class CustomEntityError extends Error {
-  constructor(message: string, readonly status: 400 | 403 | 404 = 400) { super(message); }
-}
+/** 可以展示给成员的业务错误；发布流程本身的错误（PublishError）也算它的同族（ADR-0051） */
+export class CustomEntityError extends PublishError {}
 
 /** 一个自定义实体的一版登记；没有关系时 relations 可以不填 */
 export interface RegisteredEntity { name: string; label: string; kind: CustomEntityKind; fields: CustomEntityField[]; primaryKey: string[]; relations?: EntityRelation[] }
@@ -371,12 +371,92 @@ export async function createCustomEntity(actor: CurrentMember, input: CustomEnti
   }
 }
 
+/** customEntityCtx 定位的一个自定义实体；parentId 是实体 ID */
+export interface CustomEntityCtx { tenantId: string; parentId: string; name: string }
+
+/** 定位一个自定义实体（存在时），给 publishing.ts 的流程当上下文；不存在（含属于别的租户）时 404 */
+export async function customEntityCtx(actor: CurrentMember, entityId: string): Promise<CustomEntityCtx> {
+  const entity = await requireEntity(actor.tenant.id, entityId);
+  return { tenantId: actor.tenant.id, parentId: entity.id, name: entity.name };
+}
+
+/** customEntityVersions 的一整行；publishing.ts 给适配器的 DraftRow 按这个形状断言 */
+type EntityVersionRow = typeof customEntityVersions.$inferSelect;
+
+/** 保存草稿的输入：锁内读到的最新一版与实体名 → 要保存的登记（采纳关系这类要基于最新一版的输入在这里拿到它） */
+export type CustomEntityDraftInput = (latest: EntityVersionRow, name: string) => CustomEntityInput;
+
+/**
+ * 自定义实体接入 publishing.ts 的适配器（ADR-0051）。不锁租户行：发布实体不查排队中的合并。保存没有事务外检查，
+ * 登记在 saveLocked 里按锁内读到的最新一版得出（checkRegistration、checkAdditive、checkRelations 都在锁内，采纳关系不覆盖同时保存的修改）；
+ * 推断出、还没成员确认的草稿在 checkOutside 拦下；关系在发布的事务内再校验一次（checkInside），
+ * 因为终点可能在保存后被删，别的实体发布的关系也可能与它成环。
+ * 从没发布过的实体丢弃时连父行删除，afterDiscard 把目标是它、从没发布过的映射（一键直通的配套映射草稿）一并丢弃
+ */
+export const customEntityAdapter: PublishableAdapter<CustomEntityCtx, CustomEntityDraftInput, void> = {
+  parent: customEntities,
+  versions: customEntityVersions,
+  versionsFk: customEntityVersions.entityId,
+  lockTenant: false,
+  lockParent: async (tx, ctx) => {
+    // 丢弃从没发布过的实体会删除它：拿不到锁住的行说明已被删除
+    const [locked] = await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, ctx.parentId)).for('update');
+    if (!locked) throw new CustomEntityError('自定义实体已被删除', 404);
+    return locked.id;
+  },
+  checkSave: async () => ({}),
+  saveLocked: async (tx, ctx, input, latest) => {
+    if (!latest) throw new CustomEntityError('自定义实体已被删除', 404);
+    const registration = checkRegistration(input(latest as EntityVersionRow, ctx.name), ctx.name);
+    const [published] = await tx.select().from(customEntityVersions)
+      .where(and(eq(customEntityVersions.entityId, ctx.parentId), eq(customEntityVersions.status, 'published')))
+      .orderBy(desc(customEntityVersions.version)).limit(1);
+    if (published) checkAdditive(published, registration);
+    await checkRelations(tx, ctx.tenantId, ctx.name, registration);
+    return { ...registration };
+  },
+  checkOutside: async draft => {
+    // 推断出的登记草稿（lastEditor 是 platform，publishBlocker 不认识它）要先由一位成员确认（保存）
+    if (isInferredDraft(draft)) throw new CustomEntityError(UNCONFIRMED);
+  },
+  checkInside: (tx, draft, ctx) => checkRelations(tx, ctx.tenantId, ctx.name, draft as EntityVersionRow),
+  afterDiscard: async (tx, actor, ctx, kept) => {
+    if (kept) return;
+    const orphans = await unpublishedMappingsOf(ctx.tenantId, ctx.name, tx);
+    if (orphans.length) {
+      // 实体行之后锁映射行，与一起发布的加锁顺序一致；锁住后再确认仍没有已发布版本
+      await tx.select({ id: mappings.id }).from(mappings).where(inArray(mappings.id, orphans.map(m => m.id))).for('update');
+      for (const m of await unpublishedMappingsOf(ctx.tenantId, ctx.name, tx)) {
+        const [{ version }] = await tx.select({ version: mappingVersions.version }).from(mappingVersions)
+          .where(eq(mappingVersions.mappingId, m.id)).orderBy(desc(mappingVersions.version)).limit(1);
+        await tx.delete(mappings).where(eq(mappings.id, m.id));
+        await recordAudit(tx, {
+          tenantId: ctx.tenantId, actor, action: 'mapping.draft_discarded', targetType: 'mapping', targetId: m.id,
+          detail: { source: m.source, table: m.table, entity: ctx.name, version, published: null },
+        });
+      }
+    }
+  },
+  audit: {
+    drafted: { action: 'custom_entity.drafted', detail: (ctx, _columns, version) => ({ name: ctx.name, version }) },
+    published: {
+      action: 'custom_entity.published',
+      detail: (ctx, draft) => ({ name: ctx.name, version: draft.version, authors: draft.authors, lastEditor: draft.lastEditor }),
+    },
+    discarded: { action: 'custom_entity.draft_discarded', detail: (ctx, version, published) => ({ name: ctx.name, version, published }) },
+    targetType: 'custom_entity',
+  },
+  missingVersion: version => `没有第 ${version} 版`,
+  noDraft: () => '这个自定义实体没有草稿',
+};
+
 /**
  * 保存草稿：登记与关系的终点校验通过、且发布过时只新增了字段与关系（checkAdditive）后，已有草稿时改它（记下又一位作者与最后保存的人），否则在最新版本之上新建一版草稿（已发布的版本不变）。
  * 名称不能改，input.name 被忽略。返回草稿的版本号
  */
 export async function saveCustomEntityDraft(actor: CurrentMember, entityId: string, input: CustomEntityInput) {
-  return saveDraft(actor, entityId, () => input);
+  assertCan(actor, 'sources:write');
+  return saveDraft(customEntityAdapter, actor, await customEntityCtx(actor, entityId), () => input);
 }
 
 /**
@@ -384,7 +464,8 @@ export async function saveCustomEntityDraft(actor: CurrentMember, entityId: stri
  * 采纳的人成为最后保存的人；只有推断出的草稿时，采纳即确认这份登记。起点、终点实体留空即本实体。关系已登记时报错。返回草稿的版本号
  */
 export async function adoptRelation(actor: CurrentMember, entityId: string, relation: EntityRelation) {
-  return saveDraft(actor, entityId, (latest, name) => {
+  assertCan(actor, 'sources:write');
+  return saveDraft(customEntityAdapter, actor, await customEntityCtx(actor, entityId), (latest, name) => {
     const end = ({ entity, field }: EntityRelation['from']) => ({ entity: entity.trim() || name, field: field.trim() });
     const adopted = { from: end(relation.from), ref: end(relation.ref) };
     if (latest.relations.some(r => relationText(r) === relationText(adopted))) throw new CustomEntityError(`关系 ${relationText(adopted)} 已经登记`);
@@ -392,133 +473,22 @@ export async function adoptRelation(actor: CurrentMember, entityId: string, rela
   });
 }
 
-/** 保存草稿与采纳关系共用：锁住实体行后按最新一版得出要保存的登记，在同一个事务里校验、保存 */
-async function saveDraft(
-  actor: CurrentMember, entityId: string, inputOf: (latest: typeof customEntityVersions.$inferSelect, name: string) => CustomEntityInput,
-) {
-  assertCan(actor, 'sources:write');
-  const entity = await requireEntity(actor.tenant.id, entityId);
-  return getDb().transaction(async tx => {
-    // 锁住实体行：与发布、丢弃互斥；丢弃从没发布过的实体会删除它。采纳关系在锁里读最新一版，不覆盖同时保存的修改
-    const [locked] = await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
-    if (!locked) throw new CustomEntityError('自定义实体已被删除', 404);
-    const [latest] = await tx.select().from(customEntityVersions)
-      .where(eq(customEntityVersions.entityId, entityId)).orderBy(desc(customEntityVersions.version)).limit(1);
-    if (!latest) throw new CustomEntityError('自定义实体已被删除', 404);
-    const registration = checkRegistration(inputOf(latest, entity.name), entity.name);
-    const [published] = await tx.select().from(customEntityVersions)
-      .where(and(eq(customEntityVersions.entityId, entityId), eq(customEntityVersions.status, 'published')))
-      .orderBy(desc(customEntityVersions.version)).limit(1);
-    if (published) checkAdditive(published, registration);
-    await checkRelations(tx, actor.tenant.id, entity.name, registration);
-    if (latest.status === 'draft') {
-      await tx.update(customEntityVersions)
-        .set({ ...registration, authors: withAuthor(latest.authors, actor.email), lastEditor: actor.email, updatedAt: new Date() })
-        .where(eq(customEntityVersions.id, latest.id));
-      return latest.version;
-    }
-    const version = latest.version + 1;
-    await tx.insert(customEntityVersions).values({ entityId, version, ...registration, authors: [actor.email], lastEditor: actor.email });
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'custom_entity.drafted',
-      targetType: 'custom_entity',
-      targetId: entityId,
-      detail: { name: entity.name, version },
-    });
-    return version;
-  });
-}
-
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。只由成员在页面上调用，没有自动发布。发布后版本锁定。
- * 关系在发布时再校验一次（publishEntityDraft），因为终点可能在保存后被删，别的实体发布的关系也可能与它成环
+ * 关系在发布的事务内再校验一次，因为终点可能在保存后被删，别的实体发布的关系也可能与它成环
  */
 export async function publishCustomEntity(actor: CurrentMember, entityId: string, version: number) {
   assertCan(actor, 'publish');
-  const entity = await requireEntity(actor.tenant.id, entityId);
-  const [draft] = await getDb().select(getTableColumns(customEntityVersions)).from(customEntityVersions)
-    .where(and(eq(customEntityVersions.entityId, entityId), eq(customEntityVersions.version, version)));
-  if (!draft) throw new CustomEntityError(`没有第 ${version} 版`, 404);
-  if (isInferredDraft(draft)) throw new CustomEntityError(UNCONFIRMED);
-  const blocker = publishBlocker(actor, draft);
-  if (blocker) throw new CustomEntityError(blocker, draft.status === 'draft' ? 403 : 400);
-  await getDb().transaction(async tx => {
-    // 锁住实体行：与保存草稿、丢弃互斥，发布的正是检查过的那份草稿
-    await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
-    await publishEntityDraft(tx, actor, entity, draft);
-  });
+  return publish(customEntityAdapter, actor, await customEntityCtx(actor, entityId), version);
 }
 
 /**
- * 在调用方的事务里再校验关系，发布检查过的这份草稿并记审计；调用方须已锁住实体行。等锁期间草稿被修改、发布或丢弃，或关系不再合格时抛出 CustomEntityError。
- * 发布权限与双人发布由调用方检查（publishCustomEntity，以及一键直通里登记与映射一起发布）
- */
-export async function publishEntityDraft(
-  tx: Tx, actor: CurrentMember, entity: { id: string; name: string }, draft: typeof customEntityVersions.$inferSelect,
-) {
-  const [current] = await tx.select().from(customEntityVersions).where(eq(customEntityVersions.id, draft.id));
-  if (isStale(current, draft)) throw new CustomEntityError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
-  await checkRelations(tx, actor.tenant.id, entity.name, current);
-  await tx.update(customEntityVersions)
-    .set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` })
-    .where(eq(customEntityVersions.id, draft.id));
-  await recordAudit(tx, {
-    tenantId: actor.tenant.id,
-    actor,
-    action: 'custom_entity.published',
-    targetType: 'custom_entity',
-    targetId: entity.id,
-    detail: { name: entity.name, version: draft.version, authors: draft.authors, lastEditor: draft.lastEditor },
-  });
-}
-
-/**
- * 丢弃草稿：回到最近的已发布版本；从没发布过的实体整个删除。用于草稿卡住（如最后保存的人离职）的情况。
- * 返回实体是否还在
+ * 丢弃草稿：回到最近的已发布版本；从没发布过的实体整个删除（配套的孤儿映射草稿由适配器的 afterDiscard 一并丢弃）。
+ * 用于草稿卡住（如最后保存的人离职）的情况。返回实体是否还在
  */
 export async function discardCustomEntityDraft(actor: CurrentMember, entityId: string) {
   assertCan(actor, 'sources:write');
-  const entity = await requireEntity(actor.tenant.id, entityId);
-  return getDb().transaction(async tx => {
-    // 锁住实体行：与保存、发布互斥
-    const [locked] = await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
-    if (!locked) throw new CustomEntityError('自定义实体已被删除', 404);
-    const versions = await tx.select({ id: customEntityVersions.id, version: customEntityVersions.version, status: customEntityVersions.status })
-      .from(customEntityVersions).where(eq(customEntityVersions.entityId, entityId)).orderBy(desc(customEntityVersions.version));
-    const draft = versions.find(v => v.status === 'draft');
-    if (!draft) throw new CustomEntityError('这个自定义实体没有草稿');
-    const published = versions.find(v => v.status === 'published')?.version ?? null;
-    // 从没发布过时删除实体，各版本随之级联删除；目标是它、从没发布过的映射一并丢弃，免得留下指向不存在实体的映射
-    if (published) await tx.delete(customEntityVersions).where(eq(customEntityVersions.id, draft.id));
-    else {
-      await tx.delete(customEntities).where(eq(customEntities.id, entityId));
-      const orphans = await unpublishedMappingsOf(actor.tenant.id, entity.name, tx);
-      if (orphans.length) {
-        // 实体行之后锁映射行，与一起发布的加锁顺序一致；锁住后再确认仍没有已发布版本
-        await tx.select({ id: mappings.id }).from(mappings).where(inArray(mappings.id, orphans.map(m => m.id))).for('update');
-        for (const m of await unpublishedMappingsOf(actor.tenant.id, entity.name, tx)) {
-          const [{ version }] = await tx.select({ version: mappingVersions.version }).from(mappingVersions)
-            .where(eq(mappingVersions.mappingId, m.id)).orderBy(desc(mappingVersions.version)).limit(1);
-          await tx.delete(mappings).where(eq(mappings.id, m.id));
-          await recordAudit(tx, {
-            tenantId: actor.tenant.id, actor, action: 'mapping.draft_discarded', targetType: 'mapping', targetId: m.id,
-            detail: { source: m.source, table: m.table, entity: entity.name, version, published: null },
-          });
-        }
-      }
-    }
-    await recordAudit(tx, {
-      tenantId: actor.tenant.id,
-      actor,
-      action: 'custom_entity.draft_discarded',
-      targetType: 'custom_entity',
-      targetId: entityId,
-      detail: { name: entity.name, version: draft.version, published },
-    });
-    return { kept: published !== null };
-  });
+  return discard(customEntityAdapter, actor, await customEntityCtx(actor, entityId));
 }
 
 /**

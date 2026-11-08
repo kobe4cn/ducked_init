@@ -1,9 +1,10 @@
 // test/pipeline/passthrough.test.ts —— 一键直通的接缝（ADR-0019）：createPassthrough 从一张已采集的源表一次生成自定义实体的登记草稿与恒等映射草稿，
 // 字段的类型与敏感标记取自源列，主键取源表主键（没有时取声明的业务主键）；实体名默认 custom_<表名>，撞名时建议带数据源名，可以另填；预检不过时两份草稿都不写。
-// 丢弃从没发布过的登记时配套的映射草稿一并丢弃。
+// 丢弃从没发布过的登记时配套的映射草稿一并丢弃（保存、发布、丢弃经 publishing.ts 接入，ADR-0051），各记一条丢弃审计。
 // publishPassthrough 由另一位成员把两份草稿一起双人发布并入队合并，任一份不满足发布条件时都不发布
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
+import { listAuditLogs } from '../../app/.server/audit';
 import { discardCustomEntityDraft, getCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { customEntities, customEntityVersions } from '../../app/.server/db/schema';
@@ -89,6 +90,20 @@ describe('一键直通', () => {
     const again = await createPassthrough(author, sourceId, 'customers');
     expect((await getCustomEntity(author, again.entityId)).entity.name).toBe('custom_customers');
     expect(await getMapping(author, again.mappingId)).toMatchObject({ entity: 'custom_customers' });
+  });
+
+  it('丢弃从没发布过的登记与配套映射时记两条丢弃审计：一条映射的、一条登记的', async () => {
+    const { author, sourceId } = await profiledSource();
+    const { entityId } = await createPassthrough(author, sourceId, 'customers');
+    await discardCustomEntityDraft(author, entityId);
+    // 同一个事务里写的两条审计时间相同（now() 是事务开始时刻），先后顺序不保证，按动作各断言一条与摘要
+    const discards = Object.fromEntries((await listAuditLogs(author.tenant.id))
+      .filter(l => l.action === '丢弃映射草稿' || l.action === '丢弃自定义实体草稿')
+      .map(l => [l.action, l.summary]));
+    expect(discards).toEqual({
+      '丢弃映射草稿': '「电商库」customers → custom_customers，丢弃第 1 版草稿，映射已删除',
+      '丢弃自定义实体草稿': 'custom_customers，丢弃第 1 版草稿，自定义实体已删除',
+    });
   });
 
   it('表不在同步范围或没采集时给出原因；分析师不能生成', async () => {

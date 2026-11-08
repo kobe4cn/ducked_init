@@ -10,14 +10,15 @@ import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import {
-  checkRegistration, createCustomEntity, CustomEntityError, type CustomEntityInput, ENTITY_NAME, isInferredDraft, publishedCustomEntities,
-  publishEntityDraft, type RegisteredEntity, requireEntity, UNCONFIRMED,
+  checkRegistration, createCustomEntity, customEntityAdapter, CustomEntityError, type CustomEntityInput, ENTITY_NAME, isInferredDraft, publishedCustomEntities,
+  type RegisteredEntity, requireEntity, UNCONFIRMED,
 } from './custom-entities';
 import { getDb } from './db/client';
 import { customEntities, customEntityVersions, mappings, mappingVersions, sources, tenants } from './db/schema';
 import { checkMappingDraft, createMapping, MappingError, profiledTables, publishMappingDraft, requireMapping } from './mappings';
 import { draftCustomMapping, DraftError, fieldNameFor } from './pipeline/mapping-draft';
 import type { TableProfile } from './pipeline/source-engine';
+import { isStale, publish } from './publishing';
 import { publishBlocker } from './publish-rules';
 import { requireSource } from './source-config';
 import { extensionSpec } from '../lib/mapping-expr';
@@ -159,7 +160,10 @@ export async function publishPassthrough(actor: CurrentMember, entityId: string,
     // 锁的顺序同单独发布：租户行（入队合并也锁它）、实体行、映射行（publishMappingDraft 里）
     await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
     await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
-    await publishEntityDraft(tx, actor, entity, entityDraft);
+    // publish() 的草稿是在拿到锁之后才读的，等锁期间草稿被改就发现不了：拿锁后先对照预检过的这份查一次过期
+    const [current] = await tx.select().from(customEntityVersions).where(eq(customEntityVersions.id, entityDraft.id));
+    if (isStale(current, entityDraft)) throw new CustomEntityError('草稿在你发布前被修改、发布或丢弃，请刷新后重新检查');
+    await publish(customEntityAdapter, actor, { tenantId, parentId: entity.id, name: entity.name }, entityVersion, tx);
     return publishMappingDraft(tx, actor, mapping, mappingDraft, plan).catch(rethrow);
   });
 }
