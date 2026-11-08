@@ -128,6 +128,24 @@ measure: { agg: count, field: order.store_id -> custom_store.name }
     for (const r of form.readonly) expect(r.reason, r.key).toContain('请在 YAML 里修改');
     expect(parse(formToYaml(form, ORDER))).toEqual(parse(yaml));
   });
+
+  it('ratio 分子 filter 里的路径条目只读，写回时放回分子 filter 的原下标', () => {
+    const yaml = `base: order
+measure:
+  agg: ratio
+  numerator:
+    agg: count
+    filter:
+      - { field: status, op: eq, value: paid }
+      - { field: order.store_id -> custom_store.name, op: eq, value: milk }
+  denominator: { agg: count }
+`;
+    const form = yamlToForm(yaml, ORDER);
+    expect(form.readonly.map(r => r.key)).toEqual(['measure.numerator.filter.1']);
+    const out = formToYaml(form, ORDER);
+    expect(checkMetric(out, ctx).ok, out).toBe(true);
+    expect(parse(out), out).toEqual(parse(yaml));
+  });
 });
 
 describe('四句摘要', () => {
