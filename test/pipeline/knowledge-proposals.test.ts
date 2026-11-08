@@ -1,14 +1,17 @@
 // test/pipeline/knowledge-proposals.test.ts —— 知识提案（ADR-0046）的接缝：proposeKnowledge → knowledge_proposals（接受前不进 tenantCatalog、search
-// 与 modelDraftForDefinition 发给模型的消息）→ acceptProposal 生成别名 / 口径声明 / 业务说明（审计、目录版本），rejectProposal 按指纹记下、不再提出
+// 与 modelDraftForDefinition 发给模型的消息）→ acceptProposal 生成别名 / 口径声明 / 业务说明（审计、目录版本），rejectProposal 按指纹记下、不再提出；
+// proposeMany 批量提出（单条不合法计 invalid 不作废整批、依据与快照不同计 stale），提出时就按别名 / 说明的长度上限校验
 import { desc, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { NOTE_MAX_LENGTH } from '../../app/.server/business-notes';
 import { expand, search, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, businessNotes, catalogVersions, knowledgeAliases, knowledgeProposals, semanticClaims } from '../../app/.server/db/schema';
 import { createDefinition, modelDraftForDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
-import { addAlias } from '../../app/.server/knowledge/aliases';
-import { acceptProposal, listProposals, proposeKnowledge, rejectProposal, type ProposalInput } from '../../app/.server/knowledge/proposals';
+import { addAlias, ALIAS_MAX_LENGTH } from '../../app/.server/knowledge/aliases';
+import { currentBases } from '../../app/.server/knowledge/basis';
+import { acceptProposal, listProposals, proposeKnowledge, proposeMany, rejectProposal, type ProposalInput } from '../../app/.server/knowledge/proposals';
 import { setLlmFetch } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
@@ -31,6 +34,9 @@ const audits = (tenantId: string) => getDb().select().from(auditLogs)
   .where(eq(auditLogs.tenantId, tenantId)).then(rows => rows.filter(r => r.action.startsWith('knowledge_proposal.')));
 const propose = (tenantId: string, input: Omit<ProposalInput, 'evidence' | 'generatorVersion'> & Partial<ProposalInput>) =>
   getDb().transaction(tx => proposeKnowledge(tx, tenantId, { evidence: EVIDENCE, generatorVersion: GEN, ...input }));
+type BatchInput = Parameters<typeof propose>[1];
+const batch = (tenantId: string, inputs: BatchInput[], opts?: { expectedBases?: Map<string, string> }) =>
+  getDb().transaction(tx => proposeMany(tx, tenantId, inputs.map(i => ({ evidence: EVIDENCE, generatorVersion: GEN, ...i })), opts));
 
 /** 做一件事，断言目录版本 +1、原因是 reason */
 async function expectBump<T>(tenantId: string, reason: string, act: () => Promise<T>): Promise<T> {
@@ -191,5 +197,82 @@ describe('知识提案', () => {
     await expect(acceptProposal(other, stale.id)).rejects.toMatchObject({ status: 404 });
 
     expect((await audits(acme)).map(l => l.action).sort()).toEqual(['knowledge_proposal.accepted', 'knowledge_proposal.rejected']);
+  });
+
+  it('proposeMany 批量提出：单条不合法只回滚这一条计 invalid、事务不作废；重复提交计 existing，拒绝过的计 rejected；依据与快照不同计 stale 不写入', async () => {
+    const { acme, analyst } = await setup();
+    // 一条先进拒绝名单（指纹命中计 rejected 用）
+    const rejected = (await propose(acme, { targetId: 'entity:order', kind: 'alias', content: { alias: '暗号' } }))!;
+    await rejectProposal(analyst, rejected.id, '不是这个意思');
+
+    const inputs: BatchInput[] = [
+      { targetId: 'metric:paid_revenue', kind: 'alias', content: { alias: '流水暗号' } },
+      { targetId: 'field:customer.phone', kind: 'note', content: { note: '手机号' } },
+      { targetId: 'metric:nope', kind: 'alias', content: { alias: 'x' } },
+      { targetId: 'entity:order', kind: 'alias', content: { alias: '暗号' } },
+      { targetId: 'tag:spender', kind: 'note', content: { note: '高消费人群' } },
+    ];
+    const first = await batch(acme, inputs);
+    expect(first.created.map(p => [p.kind, p.targetId, p.content])).toEqual([
+      ['alias', 'metric:paid_revenue', { alias: '流水暗号' }],
+      ['note', 'tag:spender', { note: '高消费人群' }],
+    ]);
+    expect(first.created[0]).toMatchObject({ status: 'proposed', evidence: EVIDENCE, generatorVersion: GEN });
+    expect(first.invalid).toEqual([
+      { index: 1, reason: expect.stringContaining('敏感字段') },
+      { index: 2, reason: expect.stringContaining('没有已发布的版本') },
+    ]);
+    expect(first).toMatchObject({ existing: 0, rejected: 1, stale: 0 });
+    // 敏感字段与不存在目标的都没写入，库里只有两条新建 + 拒绝过的那条
+    expect(await proposalRows(acme)).toHaveLength(3);
+
+    // 单条失败不作废外层事务：同一事务里夹着失败项，后面的写入照常进行
+    const after = await getDb().transaction(async tx => {
+      await proposeMany(tx, acme, [{ targetId: 'field:customer.phone', kind: 'note', content: { note: '手机号' }, evidence: EVIDENCE, generatorVersion: GEN }]);
+      return proposeKnowledge(tx, acme, { targetId: 'entity:order', kind: 'note', content: { note: '订单是交易记录' }, evidence: EVIDENCE, generatorVersion: GEN });
+    });
+    expect(after).toMatchObject({ status: 'proposed' });
+
+    // 同一批再提一遍：新建的都计 existing，拒绝过的还是 rejected，不合法的还是 invalid
+    const again = await batch(acme, inputs);
+    expect(again).toMatchObject({ created: [], existing: 2, rejected: 1, stale: 0 });
+    expect(again.invalid.map(i => i.index)).toEqual([1, 2]);
+    expect(await proposalRows(acme)).toHaveLength(4);
+
+    // 依据快照（生成前 currentBases）：摘要不同（含快照里没有这个 id）计 stale、不写入；entity 目标没有依据、永不过期
+    const stale = await batch(acme, [
+      { targetId: 'metric:paid_revenue', kind: 'alias', content: { alias: '实付金额' } },
+      { targetId: 'entity:order', kind: 'alias', content: { alias: '交易单' } },
+    ], { expectedBases: new Map([['metric:paid_revenue', 'not-the-hash']]) });
+    expect(stale.created.map(p => p.content)).toEqual([{ alias: '交易单' }]);
+    expect(stale.stale).toBe(1);
+    expect(await batch(acme, [{ targetId: 'tag:spender', kind: 'note', content: { note: '消费力标签' } }], { expectedBases: new Map() }))
+      .toMatchObject({ created: [], stale: 1 });
+    expect((await listProposals(getDb(), acme, { targetId: 'metric:paid_revenue' })).map(p => p.content)).toEqual([{ alias: '流水暗号' }]);
+    // 快照与当前一致就照常写入
+    const snapshot = await currentBases(getDb(), acme);
+    expect(await batch(acme, [{ targetId: 'metric:paid_revenue', kind: 'alias', content: { alias: '实付金额' } }], { expectedBases: snapshot }))
+      .toMatchObject({ created: [expect.objectContaining({ content: { alias: '实付金额' } })], stale: 0 });
+  });
+
+  it('提出时就校验长度：别名超过 50 字、说明超过 2000 字在提出时 400 不写入；上限本身可提出可接受，批量里计 invalid', async () => {
+    const { acme, analyst } = await setup();
+    await expect(propose(acme, { targetId: 'entity:order', kind: 'alias', content: { alias: '长'.repeat(ALIAS_MAX_LENGTH + 1) } }))
+      .rejects.toMatchObject({ status: 400, message: expect.stringContaining(`${ALIAS_MAX_LENGTH}`) });
+    await expect(propose(acme, { targetId: 'entity:order', kind: 'note', content: { note: '长'.repeat(NOTE_MAX_LENGTH + 1) } }))
+      .rejects.toMatchObject({ status: 400, message: expect.stringContaining(`${NOTE_MAX_LENGTH}`) });
+    expect(await proposalRows(acme)).toHaveLength(0);
+
+    // 上限本身可以通过，接受流程照旧（与 addAlias / saveBusinessNote 的上限一致）
+    const atLimit = (await propose(acme, { targetId: 'entity:order', kind: 'alias', content: { alias: '长'.repeat(ALIAS_MAX_LENGTH) } }))!;
+    expect(await acceptProposal(analyst, atLimit.id)).toMatchObject({ status: 'accepted' });
+
+    // 批量里超长只算这一条 invalid，不连累整批
+    const mixed = await batch(acme, [
+      { targetId: 'entity:order', kind: 'note', content: { note: '长'.repeat(NOTE_MAX_LENGTH + 1) } },
+      { targetId: 'entity:order', kind: 'alias', content: { alias: '交易单' } },
+    ]);
+    expect(mixed.created).toHaveLength(1);
+    expect(mixed.invalid).toEqual([{ index: 0, reason: expect.stringContaining(`${NOTE_MAX_LENGTH}`) }]);
   });
 });
