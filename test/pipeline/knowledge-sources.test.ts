@@ -123,7 +123,8 @@ describe('权限与审计', () => {
 
   it('审计 knowledge_source.created 的 detail 只有标题、种类、版本、段数，不含原文；正文没变的那次不记；摘要显示中文', async () => {
     const [row] = (await rows()).filter(r => r.title === '会员口径');
-    const logs = (await audits('knowledge_source.created')).filter(l => l.targetId === row.id);
+    const logs = (await audits('knowledge_source.created')).filter(l => l.targetId === row.id)
+      .sort((a, b) => Number(a.detail.version) - Number(b.detail.version));
     expect(logs.map(l => [l.targetType, l.detail])).toEqual([
       ['knowledge_source', { title: '会员口径', kind: 'dictionary', version: 1, paragraphs: 2 }],
       ['knowledge_source', { title: '会员口径', kind: 'dictionary', version: 2, paragraphs: 2 }],
