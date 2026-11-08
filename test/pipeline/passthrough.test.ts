@@ -97,9 +97,11 @@ describe('一键直通', () => {
     const { entityId } = await createPassthrough(author, sourceId, 'customers');
     await discardCustomEntityDraft(author, entityId);
     // 同一个事务里写的两条审计时间相同（now() 是事务开始时刻），先后顺序不保证，按动作各断言一条与摘要
-    const discards = Object.fromEntries((await listAuditLogs(author.tenant.id))
-      .filter(l => l.action === '丢弃映射草稿' || l.action === '丢弃自定义实体草稿')
-      .map(l => [l.action, l.summary]));
+    const logs = (await listAuditLogs(author.tenant.id))
+      .filter(l => l.action === '丢弃映射草稿' || l.action === '丢弃自定义实体草稿');
+    // 先断言条数：重复记的审计在下面按动作收集时会被覆盖，这里要能发现
+    expect(logs).toHaveLength(2);
+    const discards = Object.fromEntries(logs.map(l => [l.action, l.summary]));
     expect(discards).toEqual({
       '丢弃映射草稿': '「电商库」customers → custom_customers，丢弃第 1 版草稿，映射已删除',
       '丢弃自定义实体草稿': 'custom_customers，丢弃第 1 版草稿，自定义实体已删除',
