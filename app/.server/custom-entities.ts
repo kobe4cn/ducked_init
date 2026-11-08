@@ -21,7 +21,7 @@ import {
   EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, type FieldType, isCustomEntity, relationText,
 } from '../lib/canonical-model';
 
-/** 可以展示给成员的业务错误；发布流程本身的错误（PublishError）也算它的同族（ADR-0051） */
+/** 可以展示给成员的业务错误；继承 PublishError，与发布流程本身的错误一样由路由按 PublishError 回显（ADR-0051） */
 export class CustomEntityError extends PublishError {}
 
 /** 一个自定义实体的一版登记；没有关系时 relations 可以不填 */
