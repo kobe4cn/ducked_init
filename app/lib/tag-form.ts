@@ -65,9 +65,8 @@ export function yamlToForm(text: string): TagForm {
   const whole = (reason: string): TagForm => ({ single: true, rules: [], missing: {}, default: '', readonly: [{ key: '$yaml', reason, raw: text }] });
   const doc = parseDocument(text);
   if (doc.errors.length) return whole(`YAML 语法错误：${doc.errors[0]!.message.split('\n')[0]}，请在 YAML 里修改`);
-  const v = doc.toJS();
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) return whole('定义要写成带 rules（规则）的对象，请在 YAML 里修改');
-  const top = v as Record<string, unknown>;
+  const top: unknown = doc.toJS();
+  if (!isObj(top)) return whole('定义要写成带 rules（规则）的对象，请在 YAML 里修改');
   const readonly: ReadonlyItem[] = [];
   const form: TagForm = { single: typeof top.metric === 'string', rules: [], missing: {}, default: '', readonly };
   for (const [k, val] of Object.entries(top)) {
@@ -81,12 +80,12 @@ export function yamlToForm(text: string): TagForm {
     const read = ((): TagRule | string => {
       if (!isObj(rule)) return UNKNOWN;
       const { value, when, ...rest } = rule;
-      if (Object.keys(rest).length || typeof value !== 'string' && typeof value !== 'number' || typeof when !== 'object' || when === null) return UNKNOWN;
+      if (Object.keys(rest).length || typeof value !== 'string' && typeof value !== 'number' || !isObj(when)) return UNKNOWN;
       if (form.single) {
         const cmp = readCmp(when);
         return cmp === undefined ? UNKNOWN : { value, combinator: 'all', items: [{ metric: form.metric ?? '', cmp }] };
       }
-      const { all, any, ...whenRest } = when as Record<string, unknown>;
+      const { all, any, ...whenRest } = when;
       if (Object.keys(whenRest).length || all !== undefined && any !== undefined) return UNKNOWN;
       const items = (all !== undefined ? all : any);
       if (items === undefined || !Array.isArray(items)) return UNKNOWN;
@@ -97,8 +96,7 @@ export function yamlToForm(text: string): TagForm {
     else form.rules.push(read);
   });
   if (top.missing !== undefined) {
-    const ok = typeof top.missing === 'object' && top.missing !== null && !Array.isArray(top.missing)
-      && Object.values(top.missing as Record<string, unknown>).every(x => x === null || typeof x === 'number');
+    const ok = isObj(top.missing) && Object.values(top.missing).every(x => x === null || typeof x === 'number');
     if (ok) form.missing = top.missing as Record<string, number | null>;
     else readonly.push({ key: 'missing', reason: UNKNOWN, raw: top.missing });
   }
@@ -128,7 +126,8 @@ const cmpOf = (cmp: readonly TagItem['cmp'][number][]) => cmp.filter(c => isCond
  * 只读项用 raw 原样写回（整条规则只读的按原下标放回 rules）
  */
 export function formToYaml(form: TagForm): string {
-  if (form.readonly.some(r => r.key === '$yaml')) return String(form.readonly.find(r => r.key === '$yaml')!.raw);
+  const unreadable = form.readonly.find(r => r.key === '$yaml');
+  if (unreadable) return String(unreadable.raw);
   const clean = form.rules.flatMap(rule => {
     if (typeof rule.value !== 'string' && typeof rule.value !== 'number') return [];
     if (blank(rule.value)) return [];
