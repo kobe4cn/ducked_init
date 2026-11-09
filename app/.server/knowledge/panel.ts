@@ -1,12 +1,12 @@
 // app/.server/knowledge/panel.ts —— 业务知识面板（ADR-0046）的读模型与表单分发：一个目录条目上成员写的知识（别名带 ID 以便停用、每种类型最新的口径声明、
 // 当前业务说明与历史、本租户全部主题与已加入的那些）和待确认的知识提案，需复核标记取自 loadKnowledge，不另写一套规则。目录里的 Knowledge 只有别名字符串，所以别名直接查表。
 // 表单按 intent（alias.* / claim.* / note.* / subject.* / proposal.*）交给各领域函数，权限由它们检查（403 照抛）；输入不合法转成 400 和中文消息。本期只做 mappingId 为空的目标
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { can } from '../access';
 import type { CurrentMember } from '../auth';
 import { BusinessNoteError, saveBusinessNote, targetNoteHistory, type NoteVersion } from '../business-notes';
 import { getDb } from '../db/client';
-import { knowledgeAliases, subjectMemberships, type ProposalContentOf, type ProposalEvidence } from '../db/schema';
+import { knowledgeAliases, sources, subjectMemberships, type ProposalContentOf, type ProposalEvidence } from '../db/schema';
 import { cmpName } from '../../lib/compare';
 import { addAlias, retireAlias } from './aliases';
 import { KnowledgeError } from './basis';
@@ -15,8 +15,50 @@ import { saveClaim } from './claims';
 import { acceptProposal, listProposals, ProposalError, rejectProposal } from './proposals';
 import { addMembership, createSubject, listSubjects, removeMembership, type Subject } from './subjects';
 
+/** 面板里一条提案证据的展示文字与可选链接（#524）：ref 不直接下发，source_comment 在服务端按权限换成脱敏文字 */
+export interface PanelEvidence {
+  text: string;
+  href?: string;
+}
+
 /** 面板里的一条待确认提案：只带展示与处理要的列（不带时间列与指纹），content 按 kind 收窄 */
-export type PanelProposal = { [K in keyof ProposalContentOf]: { id: string; kind: K; content: ProposalContentOf[K]; evidence: ProposalEvidence[] } }[keyof ProposalContentOf];
+export type PanelProposal = { [K in keyof ProposalContentOf]: { id: string; kind: K; content: ProposalContentOf[K]; evidence: PanelEvidence[] } }[keyof ProposalContentOf];
+
+/** source:<id>#p<段号> 的证据（#527）：链到来源原文页的对应段落，带上证据记下的版本；不是这种 ref 时返回 null */
+function sourceDocHref(ref: string, version?: number): string | null {
+  const m = /^source:([^#]+)#p(\d+)$/.exec(ref);
+  return m ? `/knowledge/sources/${m[1]}${version === undefined ? '' : `?v=${version}`}#p${m[2]}` : null;
+}
+
+/**
+ * 各提案的证据转成展示文字与链接（#524）：普通证据原样显示（有版本加 vN）；source_comment:<源 ID>/<schema.表.列> 在成员有
+ * sources:read 且源没有被软删时显示源名并链到数据源页「源端注释」的锚点，否则只给「源端注释 vN」——没有权限的成员
+ * 不能从 HTML 里看到源、表与列名，所以必须在服务端替换，不能只在组件里隐藏。涉及的源一次查出，不逐条查
+ */
+async function evidenceOf(member: CurrentMember, proposals: { evidence: ProposalEvidence[] }[]): Promise<PanelEvidence[][]> {
+  // 源 ID 在第一个 / 之前；key 是 <schema>.<表>.<列>，不再按 . 切
+  const ids = [...new Set(proposals.flatMap(p => p.evidence)
+    .map(e => /^source_comment:([^/]+)/.exec(e.ref)?.[1]).filter((id): id is string => !!id))];
+  const names = new Map<string, string>();
+  if (ids.length && can(member.role, 'sources:read')) {
+    const rows = await getDb().select({ id: sources.id, name: sources.name }).from(sources)
+      .where(and(eq(sources.tenantId, member.tenant.id), inArray(sources.id, ids), isNull(sources.deletedAt)));
+    for (const r of rows) names.set(r.id, r.name);
+  }
+  return proposals.map(({ evidence }) => evidence.map(e => {
+    const v = e.version === undefined ? '' : ` v${e.version}`;
+    const comment = /^source_comment:([^/]*)\/(.+)$/.exec(e.ref);
+    if (comment) {
+      const [, id, key] = comment;
+      const name = names.get(id);
+      return name === undefined
+        ? { text: `源端注释${v}` }
+        : { text: `源端注释 ${name} ${key}${v}`, href: `/sources/${id}#comment-${encodeURIComponent(key)}` };
+    }
+    const href = sourceDocHref(e.ref, e.version);
+    return { text: `${e.ref}${v}`, ...(href ? { href } : {}) };
+  }));
+}
 
 export interface KnowledgePanel {
   aliases: { id: string; alias: string; needsReview: boolean }[];
@@ -44,6 +86,7 @@ export async function knowledgePanel(member: CurrentMember, targetId: string, ma
     .where(and(eq(subjectMemberships.tenantId, tenantId), eq(subjectMemberships.targetId, targetId)));
   const history = await targetNoteHistory(db, tenantId, targetId);
   const proposals = (await listProposals(db, tenantId, { targetId, status: 'proposed' })).filter(p => p.mappingId === mappingId);
+  const evidence = await evidenceOf(member, proposals);
   return {
     aliases: aliases.sort((a, b) => cmpName(a.alias, b.alias))
       .map(a => ({ ...a, needsReview: Boolean(k.aliasesNeedReview?.includes(a.alias)) })),
@@ -51,7 +94,7 @@ export async function knowledgePanel(member: CurrentMember, targetId: string, ma
     note: { current: history.at(-1)?.note ?? '', history, needsReview: Boolean(k.noteNeedsReview) },
     subjects: { all: await listSubjects(db, tenantId), memberOf: memberOf.map(r => r.id) },
     // kind 与 content 的对应在 proposeKnowledge 写入时已校验，表列类型表达不了，这里按它收窄
-    proposals: proposals.map(p => ({ id: p.id, kind: p.kind, content: p.content, evidence: p.evidence }) as PanelProposal),
+    proposals: proposals.map((p, i) => ({ id: p.id, kind: p.kind, content: p.content, evidence: evidence[i] }) as PanelProposal),
     canEdit: can(member.role, mappingId ? 'sources:write' : 'definitions:draft'),
   };
 }

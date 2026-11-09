@@ -42,9 +42,10 @@ const knowledgeOf = async (tenantId: string, id = TARGET) => {
   return e && 'knowledge' in e ? e.knowledge : undefined;
 };
 
-const propose = (tenantId: string, input: Pick<ProposalInput, 'kind' | 'content'>) => getDb().transaction(tx => proposeKnowledge(tx, tenantId, {
-  targetId: TARGET, evidence: [{ ref: 'metric:paid_revenue', version: 1 }], generatorVersion: 'test-gen-1', ...input,
-})).then(p => p!);
+const propose = (tenantId: string, input: Pick<ProposalInput, 'kind' | 'content'> & { evidence?: ProposalInput['evidence'] }) =>
+  getDb().transaction(tx => proposeKnowledge(tx, tenantId, {
+    targetId: TARGET, evidence: [{ ref: 'metric:paid_revenue', version: 1 }], generatorVersion: 'test-gen-1', ...input,
+  })).then(p => p!);
 
 /** 身份打通数据源与订单映射，加一位分析师、一位查看者，发布指标 paid_revenue 与标签 spender（作者与发布者是两个人） */
 async function setup() {
@@ -206,6 +207,35 @@ describe('业务知识面板', () => {
     const other = await propose(acme, { kind: 'alias', content: { alias: '营业额' } });
     expect((await post({ intent: 'proposal.acceptEdited', proposalId: other.id, kind: 'alias', alias: '年营业额' })).status).toBe(302);
     expect((await knowledgeOf(acme))?.aliases).toEqual(expect.arrayContaining(['年营业额', '流水']));
+  });
+
+  it('source_comment 证据（#524）：有 sources:read 的成员看到链到数据源页锚点的链接与源名，不存在的源只有文字；查看者只看到「源端注释 vN」，HTML 里没有源、表与列名', async () => {
+    const { acme, sources } = await setup();
+    const gone = '00000000-0000-0000-0000-000000000000';
+    const linked = await propose(acme, {
+      kind: 'note', content: { note: '含退款' },
+      evidence: [{ ref: 'metric:paid_revenue', version: 1 }, { ref: `source_comment:${sources.crm}/public.x.y`, version: 2 }],
+    });
+    await propose(acme, { kind: 'alias', content: { alias: '流水' }, evidence: [{ ref: `source_comment:${gone}/public.z.w`, version: 1 }] });
+
+    const an = await loginAs(app, 'an@acme.com');
+    const panel = await panelOf(an, METRIC);
+    expect(panel).toContain('metric:paid_revenue v1');
+    expect(panel).toContain('源端注释 CRM public.x.y v2');
+    expect(panel).toContain(`href="/sources/${sources.crm}#comment-public.x.y"`);
+    // 不存在的源（或没有 sources:read 的成员）：只有文字，没有链接
+    expect(panel).toContain('源端注释 v1');
+    expect(panel).not.toContain(`href="/sources/${gone}`);
+
+    // 查看者：文字里不带源与表列名，链接与源 ID 都不在 HTML 里
+    const view = await loginAs(app, 'view@acme.com');
+    const viewerPanel = await panelOf(view, METRIC);
+    expect(viewerPanel).toContain(`data-proposal="${linked.id}"`);
+    expect(viewerPanel).toContain('源端注释 v2');
+    expect(viewerPanel).not.toContain('源端注释 CRM');
+    expect(viewerPanel).not.toContain('public.x');
+    expect(viewerPanel).not.toContain(sources.crm);
+    expect(viewerPanel).not.toContain('href="/sources/');
   });
 
   it('主题归属提案显示主题名，没有「修改后接受」；接受后提案消失、条目进入主题；主题删除后显示「已删除的主题」，改值接受被服务端拦下', async () => {

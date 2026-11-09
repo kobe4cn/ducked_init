@@ -140,15 +140,6 @@ function EditedValue({ proposal: p }: { proposal: PanelProposal }) {
   }
 }
 
-/** source:<id>#p<段号> 的证据：跳到来源原文页的对应段落，带上证据记下的版本（#527）；不是这种 ref 时返回 null，仍是纯文本 */
-function sourceHref(e: PanelProposal['evidence'][number]): string | null {
-  const m = /^source:([^#]+)#p(\d+)$/.exec(e.ref);
-  if (!m) return null;
-  const [, id, no] = m;
-  const version = e.version === undefined ? '' : `?v=${e.version}`;
-  return `/knowledge/sources/${id}${version}#p${no}`;
-}
-
 /** 待确认的知识提案：没有时整块不渲染 */
 function Proposals({ panel, targetId }: { panel: Panel; targetId: string }) {
   if (!panel.proposals.length) return null;
@@ -164,16 +155,13 @@ function Proposals({ panel, targetId }: { panel: Panel; targetId: string }) {
             <div className="whitespace-pre-wrap">{`${PROPOSAL_KIND_LABEL[p.kind]}：${proposalText(p, panel.subjects.all)}`}</div>
             {p.evidence.length > 0 && (
               <div className="text-xs text-slate-500">
-                {'证据：'}{p.evidence.map((e, i) => {
-                  const text = e.version === undefined ? e.ref : `${e.ref} v${e.version}`;
-                  const href = sourceHref(e);
-                  return (
-                    <Fragment key={`${e.ref}:${i}`}>
-                      {i > 0 && '、'}
-                      {href ? <Link to={href} className="hover:underline">{text}</Link> : text}
-                    </Fragment>
-                  );
-                })}
+                {'证据：'}{p.evidence.map((e, i) => (
+                  // 证据的 ref 不进客户端（#524）：panel.ts 在服务端换成展示文字，source_comment / source 证据带链接
+                  <Fragment key={`${e.text}:${i}`}>
+                    {i > 0 && '、'}
+                    {e.href ? <Link to={e.href} className="hover:underline">{e.text}</Link> : e.text}
+                  </Fragment>
+                ))}
               </div>
             )}
             {panel.canEdit && (

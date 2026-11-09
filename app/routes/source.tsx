@@ -5,6 +5,7 @@
 // 「湖中数据」标签页（?tab=lake）：最近一次核对的结果，每表一行显示覆盖、位置与文件、结构、数据量四项，可展开明细；
 // 手动触发核对，有差异时触发一次主键比对同步。
 // 「源视图」标签页（?tab=views）：这个数据源下的源视图（只读原始层的 SELECT，ADR-0022）及其发布状态，数据工程师、管理员可以新建。
+// 概览页还有「源端注释」区块（#524）：列出采集到的表注释与列注释（原文、版本、采集时间），组与行带锚点，知识面板的 source_comment 证据链回这里。
 // 页头下是类型、目标、同步表数、核对状态四张指标卡，各标签页的内容放在一个白色面板里
 import { Fragment, useEffect, useState } from 'react';
 import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react-router';
@@ -123,6 +124,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       })),
       newTables: source.newTables,
       tables: source.tables.map(t => ({ ...t, notInLake: notInLake(t.name), keyCheck: t.primaryKey.length ? null : keyCheckOf(t.name), drift: drift.get(t.name) ?? [] })),
+      comments: source.comments.map(c => ({ ...c, collectedAt: c.collectedAt.toISOString() })),
       sync: {
         status: sync.status,
         statusLabel: sync.status === 'none' ? '未同步' : TASK_STATUS_LABELS[sync.status],
@@ -213,6 +215,7 @@ const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN'
 
 type TableView = Route.ComponentProps['loaderData']['tables'][number];
 type ListedView = Route.ComponentProps['loaderData']['listing'][number];
+type CommentView = Route.ComponentProps['loaderData']['comments'][number];
 type SyncEntry = Route.ComponentProps['loaderData']['sync']['history'][string][number];
 
 const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
@@ -857,8 +860,49 @@ function SourceViews({ base, views, canWrite, submitting }: { base: string; view
   );
 }
 
+/** 概览页的「源端注释」区块（#524）：按 schema.表 分组，每组一张表列出列注释（表注释标「（表注释）」）；组与每行列注释带锚点，知识面板的证据链回这里 */
+function SourceComments({ comments }: { comments: CommentView[] }) {
+  if (!comments.length) return <div className="text-sm text-muted-foreground">还没有采集到源端注释</div>;
+  // comments 已按 schema、表、列排好序，这里顺序分组
+  const groups: [string, CommentView[]][] = [];
+  for (const c of comments) {
+    const group = `${c.tableSchema}.${c.tableName}`;
+    if (groups.at(-1)?.[0] !== group) groups.push([group, []]);
+    groups.at(-1)![1].push(c);
+  }
+  return (
+    <div className="space-y-6">
+      {groups.map(([group, rows]) => (
+        <div key={group} className="space-y-2">
+          <h3 id={`comment-${group}`} className="font-mono text-sm font-medium">{group}</h3>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>列</TableHead>
+                <TableHead>原文</TableHead>
+                <TableHead>版本</TableHead>
+                <TableHead>采集时间</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map(c => (
+                <TableRow key={`${c.tableName}:${c.columnName}`} id={c.columnName ? `comment-${group}.${c.columnName}` : undefined}>
+                  <TableCell className="font-mono">{c.columnName || '（表注释）'}</TableCell>
+                  <TableCell className="max-w-xl whitespace-pre-wrap">{c.commentText}</TableCell>
+                  <TableCell>{`v${c.version}`}</TableCell>
+                  <TableCell>{time(c.collectedAt)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function Source({ loaderData, actionData }: Route.ComponentProps) {
-  const { tab, email, nav, canWrite, canDelete, deleteBlockers, source, profile, listing, newTables, tables, sync, verify, views } = loaderData;
+  const { tab, email, nav, canWrite, canDelete, deleteBlockers, source, profile, listing, newTables, tables, sync, verify, views, comments } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const profiling = profile.status === 'queued' || profile.status === 'running';
   const syncing = sync.status === 'queued' || sync.status === 'running';
@@ -1034,6 +1078,11 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
                   )}
                 </TableBody>
               </Table>
+            </section>
+
+            <section className="space-y-3">
+              <SectionHeader title="源端注释" />
+              <SourceComments comments={comments} />
             </section>
 
             <section className="space-y-4">
