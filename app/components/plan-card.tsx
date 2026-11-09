@@ -56,9 +56,17 @@ export function PlanCard({ card, workbenchSql, onFollowUp }: { card: PlanCardVie
           </ul>
         </div>
       )}
+      {/* 「为何选」：有 rationale（模型写的选条目理由，#538）时单独成块，assumptions 照旧列在「依据」下；
+          没有时（旧计划）assumptions 退回列在「为何选」下，不重复出「依据」；两者都没有不渲染（对所有 status 都显示） */}
+      {card.rationale && (
+        <div>
+          <h4 className="text-slate-400">为何选</h4>
+          <p className="mt-0.5">{card.rationale}</p>
+        </div>
+      )}
       {card.assumptions.length > 0 && (
         <div>
-          <h4 className="text-slate-400">依据</h4>
+          <h4 className="text-slate-400">{card.rationale ? '依据' : '为何选'}</h4>
           <ul className="mt-0.5 space-y-0.5">
             {card.assumptions.map((a, j) => (
               <li key={j}>{a.text}<span className="text-slate-400">（{a.confirmed ? '已确认' : '未确认'}）</span></li>

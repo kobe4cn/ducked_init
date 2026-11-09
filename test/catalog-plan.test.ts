@@ -94,6 +94,24 @@ describe('分析计划校验 validatePlan()：结构', () => {
     expect(r.issues).toEqual([]);
     expect(r.plan).toEqual(plan);
   });
+
+  it('带 rationale 的合法计划原样解析回 plan；rationale 不是字符串或是空串返回 invalid，path 是 rationale', () => {
+    const plan = planOf(undefined, { rationale: '成员问的是近 30 天的营收，revenue_30d 的窗口与口径正好对上' });
+    const r = check(plan);
+    expect(r.status).toBe('valid');
+    expect(r.issues).toEqual([]);
+    expect(r.plan).toEqual(plan);
+
+    const notString = check(planOf(undefined, { rationale: 1 as unknown as string }));
+    expect(notString.status).toBe('invalid');
+    expect(notString.plan).toBeNull();
+    expect(notString.issues.some(i => i.path === 'rationale')).toBe(true);
+
+    const empty = check(planOf(undefined, { rationale: '' }));
+    expect(empty.status).toBe('invalid');
+    expect(empty.plan).toBeNull();
+    expect(empty.issues.some(i => i.path === 'rationale')).toBe(true);
+  });
 });
 
 describe('分析计划校验 validatePlan()：硬性检查', () => {

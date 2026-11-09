@@ -95,3 +95,36 @@ describe('追问与做不到的卡片', () => {
     expect(byStatus).toContain('data-next="new-definition"');
   });
 });
+
+describe('为何选与依据', () => {
+  const assumptions = [{ text: '营收按下单时间统计', confirmed: true }, { text: '只算已支付订单', confirmed: false }];
+
+  it('有 rationale 时「为何选」给 rationale 文字，「依据」照旧列出 assumptions', () => {
+    const html = render(card({ assumptions, rationale: '成员问的是近 30 天的营收，revenue_30d 的窗口正好对上' }));
+    expect(html).toContain('为何选');
+    expect(html).toContain('成员问的是近 30 天的营收，revenue_30d 的窗口正好对上');
+    expect(html).toContain('依据');
+    expect(html).toContain('营收按下单时间统计');
+    expect(html).toContain('只算已支付订单');
+  });
+
+  it('没有 rationale 时「为何选」下面是 assumptions，不再另出「依据」；对所有 status 都显示', () => {
+    const html = render(card({ assumptions }));
+    expect(html).toContain('为何选');
+    expect(html).toContain('营收按下单时间统计');
+    expect(html).toContain('已确认');
+    expect(html).toContain('只算已支付订单');
+    expect(html).toContain('未确认');
+    expect(html).not.toContain('依据');
+    // 这一块对所有 status 都显示，和现在的「依据」一样：过期卡也带
+    const stale = render(card({ status: 'invalid', assumptions }));
+    expect(stale).toContain('为何选');
+    expect(stale).toContain('营收按下单时间统计');
+  });
+
+  it('两者都没有时不渲染这一块，两个标题都没有', () => {
+    const html = render(card({ assumptions: [] }));
+    expect(html).not.toContain('为何选');
+    expect(html).not.toContain('依据');
+  });
+});

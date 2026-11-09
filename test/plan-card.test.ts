@@ -89,4 +89,16 @@ describe('计划卡视图 planCardView', () => {
     expect(planCardView(RETRIEVAL_CATALOG, planOf([ref(metric)], { mode: 'unsupported', reason: '平台只能算到统一消费者粒度' })))
       .toMatchObject({ status: 'unsupported', reason: '平台只能算到统一消费者粒度' });
   });
+
+  it('plan 带 rationale 时卡片带同样的 rationale；不带时卡片没有 rationale 键（旧计划照旧）', () => {
+    const e = RETRIEVAL_CATALOG.entries.find(x => x.id === 'metric:revenue_30d')!;
+    const ref = { id: e.id, version: 1, semanticHash: semanticHash(e) };
+    const planOf = (over: Partial<AnalysisPlan> = {}): AnalysisPlan => ({
+      schemaVersion: 1, mode: 'reuse_result', selected: [ref], request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: [ref.id] }], assumptions: [], questions: [], ...over,
+    });
+    expect(planCardView(RETRIEVAL_CATALOG, planOf({ rationale: '成员问的是近 30 天的营收，revenue_30d 的窗口与口径正好对上' })))
+      .toMatchObject({ rationale: '成员问的是近 30 天的营收，revenue_30d 的窗口与口径正好对上' });
+    expect(planCardView(RETRIEVAL_CATALOG, planOf())).not.toHaveProperty('rationale');
+  });
 });
