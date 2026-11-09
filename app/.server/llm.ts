@@ -245,6 +245,8 @@ async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider:
   } finally {
     await getDb().insert(llmCalls).values({
       tenantId, purpose, model, schemaValid: stats.schemaValid, error, inputCount,
+      // 档位与回落原因（#528 路由①）：先写死 null，路由选档在下一张票接上
+      route: null, fallbackReason: null,
       promptTokens: stats.usage?.prompt_tokens ?? null, completionTokens: stats.usage?.completion_tokens ?? null,
       durationMs: Date.now() - started,
     }).catch(e => console.error('记录模型调用日志失败', e));
