@@ -39,19 +39,19 @@ const numOf = (v: string | number): string | number => (typeof v === 'string' &&
 
 /** 一段比较（when 平铺或 item 里除 metric 外的部分）：键都在词表里、取值都是数字才算认得；认得的比较按词表顺序读回 */
 function readCmp(v: unknown): { op: TagCondition; value: number }[] | undefined {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined;
-  const entries = Object.entries(v as Record<string, unknown>);
+  if (!isObj(v)) return undefined;
+  const entries = Object.entries(v);
   if (!entries.length || entries.some(([k, val]) => !isCondition(k) || typeof val !== 'number')) return undefined;
   return TAG_CONDITIONS.flatMap(op => {
-    const val = (v as Record<string, unknown>)[op];
+    const val = v[op];
     return typeof val === 'number' ? [{ op, value: val }] : [];
   });
 }
 
 /** 多指标写法的一个 item：metric 是非空字符串 + 认得的比较 */
 function readItem(v: unknown): TagItem | undefined {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined;
-  const { metric, ...cmp } = v as Record<string, unknown>;
+  if (!isObj(v)) return undefined;
+  const { metric, ...cmp } = v;
   if (typeof metric !== 'string' || metric === '') return undefined;
   const read = readCmp(cmp);
   return read === undefined ? undefined : { metric, cmp: read };
@@ -79,8 +79,8 @@ export function yamlToForm(text: string): TagForm {
   else if (!Array.isArray(top.rules)) readonly.push({ key: 'rules', reason: UNKNOWN, raw: top.rules });
   else top.rules.forEach((rule, i) => {
     const read = ((): TagRule | string => {
-      if (typeof rule !== 'object' || rule === null || Array.isArray(rule)) return UNKNOWN;
-      const { value, when, ...rest } = rule as Record<string, unknown>;
+      if (!isObj(rule)) return UNKNOWN;
+      const { value, when, ...rest } = rule;
       if (Object.keys(rest).length || typeof value !== 'string' && typeof value !== 'number' || typeof when !== 'object' || when === null) return UNKNOWN;
       if (form.single) {
         const cmp = readCmp(when);
