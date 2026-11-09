@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { changedFiles } from '../.sandcastle/guide';
+import { blockersOf, changedFiles, splitChildren } from '../.sandcastle/guide';
 
 const guide = (lines: string) => `## What to build\n\n改 \`app/x.ts:1\`。\n\n## Implementation guide\n\n${lines}\n\n## Blocked by\n\n- #1\n`;
 
@@ -44,5 +44,39 @@ describe('Sandcastle 指引里要改的文件 changedFiles', () => {
   it('没有指引、或指引里没有文件引用时为空；正文别处的路径不算', () => {
     expect(changedFiles('## What to build\n\n改 `app/x.ts:1`。\n')).toEqual({ files: [], fallback: false });
     expect(changedFiles(guide('- 照着做就行。'))).toEqual({ files: [], fallback: false });
+  });
+});
+
+describe('Sandcastle 的 blocker 与子票 blockersOf / splitChildren', () => {
+  it('Blocked by：括号里的票号是说明不算，括号外一行几个都算', () => {
+    const body = [
+      '## What to build', '', '见 #1。', '',
+      '## Blocked by', '',
+      '- #487（原为 #472，已拆票）',
+      '- #548 (原为 #489，已拆票)',
+      '- #275、#276（#267 已拆分）',
+      '- #305, #306',
+      '- 无（#280 已关闭）',
+      '- #548',
+      '', '## Implementation guide', '', '- 等 #999 合并后再做。',
+    ].join('\n');
+    expect(blockersOf(body)).toEqual([487, 548, 275, 276, 305, 306]);
+  });
+
+  it('Blocked by：没有这一节时为空', () => {
+    expect(blockersOf('## What to build\n\n依赖 #12。\n')).toEqual([]);
+  });
+
+  it('Split into：只认列表项开头的票号，同一行后面的票、不以票号开头的列表项和说明段落都不算', () => {
+    const body = [
+      '## Split into', '',
+      '- [ ] #496 ①a：新建 publishing.ts（blocked by #495）',
+      '- [x] #497 ①b：合并组接入，已拆成 #510、#511',
+      '- #68 推断登记（blocked by #67）',
+      '- 删除 `publish-rules.ts` 挪到 #500，排在 #468 之后。',
+      '',
+      '上面的检查点改为在 #496、#497 都合并后执行。#465–#468 改为被 #497 block。',
+    ].join('\n');
+    expect(splitChildren(body)).toEqual([496, 497, 68]);
   });
 });

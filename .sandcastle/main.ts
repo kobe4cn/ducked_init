@@ -46,7 +46,7 @@ import {
   AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, usageTable,
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
-import { changedFiles, section } from "./guide.ts";
+import { blockersOf, changedFiles, splitChildren } from "./guide.ts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -355,10 +355,6 @@ const notIn = (...labels: string[]) => labels.map((l) => `-${q(l)}`).join(" ");
 // Plan：确定性计算，不交给 agent（planner agent 曾把「同文件只留编号小的」比反）
 // ---------------------------------------------------------------------------
 
-/** `## Blocked by` 里引用的票号。 */
-const blockersOf = (body: string) =>
-  [...new Set([...section(body, "Blocked by").matchAll(/#(\d+)/g)].map((m) => Number(m[1])))];
-
 /** 票的 open 状态，每次调度开头清空（blocker 可能在两次调度之间被合并）。 */
 const openStates = new Map<number, boolean>();
 function isOpen(n: number): boolean {
@@ -388,7 +384,7 @@ function closeFinishedParents() {
     return;
   }
   for (const parent of JSON.parse(parents.out) as { number: number; body: string }[]) {
-    const children = [...new Set([...section(parent.body, "Split into").matchAll(/#(\d+)/g)].map((m) => Number(m[1])))];
+    const children = splitChildren(parent.body);
     if (children.length === 0 || children.some(isOpen)) continue;
     const body = parent.body.replace(/^(\s*[-*]\s*)\[ \](?=\s*#\d+)/gm, "$1[x]");
     const list = children.map((n) => `#${n}`).join("、");

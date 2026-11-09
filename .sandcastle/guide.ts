@@ -59,3 +59,39 @@ export const changedFiles = (body: string): { files: string[]; fallback: boolean
   }
   return { files: [...files], fallback: files.size > 0 };
 };
+
+/** 去掉括号（全角、半角）里的说明，比如「（原为 #472，已拆票）」「(#267 已拆分)」。 */
+const stripParens = (line: string) => {
+  let prev;
+  do {
+    prev = line;
+    line = line.replace(/[（(][^（）()]*[）)]/g, "");
+  } while (line !== prev);
+  return line;
+};
+
+/**
+ * `## Blocked by` 里的 blocker 票号。括号里的票号是说明（「#487（原为 #472，已拆票）」「无（#275 已关闭）」），不算；
+ * 括号外的都算，所以一行写几个（「#275、#276」「#305, #306」）也认。曾经把括号里拆过的父票也算成 blocker，
+ * 父票拆完一直 open，这些票就永远排不上（2026-11-09 #473–#476）。
+ */
+export const blockersOf = (body: string): number[] => {
+  const refs = section(body, "Blocked by")
+    .split("\n")
+    .flatMap((line) => [...stripParens(line).matchAll(/#(\d+)/g)].map((m) => Number(m[1])));
+  return [...new Set(refs)];
+};
+
+/**
+ * `## Split into` 里的子票：只认列表项开头的票号（`- [ ] #496 …`、`- #68 …`），同一行后面提到的票、
+ * 不以票号开头的列表项（「- 删除 … 挪到 #500，排在 #468 之后」）和说明段落都不算。曾经把这些也算成子票，
+ * 其中有一张 open，父票就一直不自动关（2026-11-09 #464 被 #500 挡住，#500 又被 #464 挡住）。
+ */
+export const splitChildren = (body: string): number[] => {
+  const refs = section(body, "Split into")
+    .split("\n")
+    .map((line) => line.match(/^\s*[-*+]\s+(?:\[[ xX]\]\s*)?#(\d+)/)?.[1])
+    .filter((n): n is string => n !== undefined)
+    .map(Number);
+  return [...new Set(refs)];
+};
