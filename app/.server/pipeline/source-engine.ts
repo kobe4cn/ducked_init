@@ -420,7 +420,8 @@ export interface SourceComment { schema: string; table: string; column: string |
 
 /**
  * 源端的表注释与列注释，不读任何行：PostgreSQL 取 obj_description / col_description（与列读权限同一套判定，只采 spec.schema
- * 里账号可读的表），MySQL 取 information_schema 的 TABLE_COMMENT / COLUMN_COMMENT（空串视为没有注释；列注释在源端先
+ * 里账号可读的表），MySQL 取 information_schema 的 TABLE_COMMENT / COLUMN_COMMENT（空串视为没有注释；表注释只取 BASE TABLE，视图的
+ * TABLE_COMMENT 固定是 VIEW、不是注释；列注释在源端先
  * CONVERT 成 utf8mb4，否则 DuckDB 的 mysql 扩展把它当二进制读回，中文成 \xHH 转义）。其他数据源没有注释。
  * 结果按表、列排序，调用方（sources.ts）据此做单源上限；原文的截断也在保存时做
  */
@@ -446,7 +447,7 @@ export async function sourceComments(con: DuckDBConnection, spec: SourceSpec): P
   } else if (spec.kind === 'mysql') {
     found = await rows(con, `SELECT * FROM mysql_query('src', ${lit(`
       SELECT TABLE_SCHEMA AS schema_name, TABLE_NAME AS table_name, NULL AS column_name, TABLE_COMMENT AS comment_text
-      FROM information_schema.TABLES WHERE TABLE_SCHEMA = ${lit(spec.database)} AND TABLE_COMMENT <> ''
+      FROM information_schema.TABLES WHERE TABLE_SCHEMA = ${lit(spec.database)} AND TABLE_TYPE = 'BASE TABLE' AND TABLE_COMMENT <> ''
       UNION ALL
       SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, CONVERT(COLUMN_COMMENT USING utf8mb4) AS comment_text
       FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ${lit(spec.database)} AND COLUMN_COMMENT <> ''
