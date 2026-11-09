@@ -24,6 +24,15 @@ export function platformEmbedding(baseUrl = 'https://embed.example.com/v1'): voi
   vi.stubEnv('LLM_EMBEDDING_API_KEY', 'sk-embed-secret');
 }
 
+/** 平台档位（ADR-0055，环境变量 LLM_<TIER>_*）：设 MODEL，opts 里给到的项才设（BASE_URL 与 API_KEY 要一起给才生效）；
+ *  要测「填了又算没填」时传空串。不调 unstubAllEnvs */
+export function platformTier(tier: 'fast' | 'reasoning', model: string, opts: { baseUrl?: string; apiKey?: string } = {}): void {
+  const name = `LLM_${tier.toUpperCase()}`;
+  vi.stubEnv(`${name}_MODEL`, model);
+  if (opts.baseUrl !== undefined) vi.stubEnv(`${name}_BASE_URL`, opts.baseUrl);
+  if (opts.apiKey !== undefined) vi.stubEnv(`${name}_API_KEY`, opts.apiKey);
+}
+
 /** 请求体（已 JSON.parse）：常用的 messages 与 tools 带类型，其余字段（model、response_format…）不限 */
 export interface LlmBody {
   messages: { role: string; content: string; tool_call_id?: string }[];
