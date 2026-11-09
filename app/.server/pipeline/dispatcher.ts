@@ -48,7 +48,7 @@ export interface DispatcherOptions {
 // 工作进程只继承运行所需的环境变量（平台 PG 连接串等不在其中）；本租户数据湖的凭据经 IPC 单独传入
 const WORKER_ENV_KEYS = [
   'PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'NODE_ENV', 'SystemRoot',
-  'SOURCE_SYNC_LOOKBACK_MINUTES', 'SOURCE_SYNC_LOOKBACK_IDS', 'SOURCE_RECONCILE_HOURS',
+  'SOURCE_SYNC_LOOKBACK_MINUTES', 'SOURCE_SYNC_LOOKBACK_IDS', 'SOURCE_RECONCILE_HOURS', 'SOURCE_CONNECT_TIMEOUT_SECONDS',
   // 只给测试用的模板版本开关（templates/test-versions.ts）
   'TEMPLATE_TEST_VERSIONS',
 ];

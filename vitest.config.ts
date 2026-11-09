@@ -32,6 +32,8 @@ process.env.PLATFORM_MASTER_KEY = Buffer.alloc(32, 7).toString('base64');
 process.env.PLATFORM_SOURCE_FILES_DIR = join(tmpdir(), 'crm_platform_test_sources');
 // 没有水位线字段、行数达到这个值的大表全量比对时默认每天同步；测试调低，夹具里的 events 表即为大表
 process.env.SOURCE_LARGE_TABLE_ROWS = '1000';
+// 连接 PostgreSQL 源库的建连超时（秒）：沙箱经 podman 网关连源库，负载下建连会超过产品默认的 10 秒（#545），调到 30；命令行已设时以它为准
+process.env.SOURCE_CONNECT_TIMEOUT_SECONDS ??= '30';
 // 设置 TEST_S3_LAKE_URI（如 s3://crm-lake/platform-test）后，隔离测试在对象存储上再跑一遍。
 // 平台账号取 S3_*，未设置时用本地 SeaweedFS 的开发账号（db_script/docker-compose.yml）；租户账号由测试开通租户时经 IAM API 创建
 if (process.env.TEST_S3_LAKE_URI) {

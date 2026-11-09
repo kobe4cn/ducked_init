@@ -127,6 +127,12 @@ function s3Secret(s3: S3Connection, scope: string) {
       ENDPOINT ${lit(s3.endpoint)}, URL_STYLE ${lit(s3.urlStyle)}, USE_SSL ${s3.useSsl}, SCOPE ${lit(scope)})`;
 }
 
+/** 连接 PostgreSQL 源库的建连超时秒数（SOURCE_CONNECT_TIMEOUT_SECONDS，默认 10）：高负载环境下建连可能超过 10 秒（#545），不是正整数时按默认 */
+export function sourceConnectTimeout(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.SOURCE_CONNECT_TIMEOUT_SECONDS;
+  return /^\d+$/.test(raw ?? '') && Number(raw) > 0 ? Number(raw) : 10;
+}
+
 /** 在已有的 DuckDB 里以 src 只读挂载数据源，返回锁定配置时要放行的路径。调用方负责随后锁住配置 */
 export async function attachSource(con: DuckDBConnection, spec: SourceSpec): Promise<{ allowed: string[]; mongo?: MongoAccess }> {
   switch (spec.kind) {
@@ -134,7 +140,7 @@ export async function attachSource(con: DuckDBConnection, spec: SourceSpec): Pro
       await con.run(`INSTALL postgres; LOAD postgres;
         CREATE TEMPORARY SECRET src_pg (TYPE postgres, HOST ${lit(spec.host)}, PORT ${spec.port}, DATABASE ${lit(spec.database)},
           USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)});
-        ATTACH 'connect_timeout=10' AS src (TYPE postgres, SECRET src_pg, SCHEMA ${lit(spec.schema)}, READ_ONLY)`);
+        ATTACH 'connect_timeout=${sourceConnectTimeout()}' AS src (TYPE postgres, SECRET src_pg, SCHEMA ${lit(spec.schema)}, READ_ONLY)`);
       return { allowed: [] };
     case 'mysql':
       await con.run(`INSTALL mysql; LOAD mysql;
