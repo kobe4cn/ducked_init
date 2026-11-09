@@ -709,12 +709,15 @@ export const modelProviders = platform.table('model_providers', {
 
 // 模型调用日志（ADR-0035）：每次调用一行，成功、HTTP 失败与 Schema 校验失败都记。不存提示词与返回原文（里面可能有样本行），
 // embedding 调用（ADR-0049）也不存请求文本与向量，只记条数 input_count。
-// schema_valid 为空表示没拿到可解析的 JSON（请求失败、返回不是 JSON）
+// schema_valid 为空表示没拿到可解析的 JSON（请求失败、返回不是 JSON）。
+// route / fallback_reason（#528 路由①）记这一档用的档位与从更高档回落的原因，为空表示没有分档（现有调用都记 null，下一张票接上）
 export const llmCalls = platform.table('llm_calls', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
   purpose: text('purpose').notNull(),
   model: text('model').notNull(),
+  route: text('route'),
+  fallbackReason: text('fallback_reason'),
   inputCount: integer('input_count'),
   promptTokens: integer('prompt_tokens'),
   completionTokens: integer('completion_tokens'),

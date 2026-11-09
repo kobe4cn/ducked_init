@@ -120,6 +120,9 @@ describe('模型服务客户端', () => {
     const rows = await calls(acme);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ purpose: 'mapping_draft', model: 'qwen-plus', promptTokens: 200, completionTokens: 50, schemaValid: true, error: null });
+    // 档位与回落原因（#528 路由①）：这一张只加列与写入通道，现有调用都记 null
+    expect(rows[0].route).toBeNull();
+    expect(rows[0].fallbackReason).toBeNull();
     expect(rows[0].durationMs).toBeGreaterThanOrEqual(0);
     const logged = JSON.stringify(rows);
     expect(logged).not.toContain('13800138000');
