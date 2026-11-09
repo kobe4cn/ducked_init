@@ -52,11 +52,9 @@ describe('任务在独立进程中按租户配额运行', () => {
     expect((await listTasks(acme)).map(t => t.status)).toEqual(['succeeded', 'succeeded']);
   });
 
-  it('任务出错时记为失败并保留错误信息', async () => {
+  it('入队时参数不合法直接报错，不进队列（文案与工作进程里的一致）', async () => {
     const acme = await newTenant('acme');
-    const task = await runTask(acme, 'demo.seed', { customers: -1 });
-    expect(task.status).toBe('failed');
-    expect(task.error).toContain('customers');
+    await expect(enqueueTask(acme, 'demo.seed', { customers: -1 })).rejects.toThrow('参数 customers 必须是 1 到 1000000 之间的整数');
   });
 });
 

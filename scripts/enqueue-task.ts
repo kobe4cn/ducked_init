@@ -2,6 +2,7 @@
 // 为某个租户提交一个任务（由调度器派发执行）。任务类型见 app/.server/pipeline/handlers.ts
 import { parseArgs } from 'node:util';
 import { closeDb } from '../app/.server/db/client';
+import { isTaskKind } from '../app/.server/pipeline/task-contracts';
 import { enqueueTask } from '../app/.server/tasks';
 import { tenantIdBySlug } from '../app/.server/tenants';
 
@@ -15,6 +16,10 @@ const { values } = parseArgs({
 
 if (!values.tenant || !values.kind) {
   console.error('用法：pnpm task:enqueue --tenant <租户标识> --kind <任务类型> [--params <JSON>]');
+  process.exit(2);
+}
+if (!isTaskKind(values.kind)) {
+  console.error(`未知的任务类型：${values.kind}`);
   process.exit(2);
 }
 

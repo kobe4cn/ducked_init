@@ -7,10 +7,10 @@ import { TASK_STATUSES, tasks, tenantLakes, tenants, type TaskStatus } from './d
 import { lakeSpecOf } from './lake';
 import { tenantPiiSalt, tenantServingKey } from './secrets';
 import { loadSourceSpec, SourceError } from './source-config';
-import { CONTRACTS, isTaskKind, type TaskContract, type TaskKind } from './pipeline/task-contracts';
+import { CONTRACTS, isTaskKind, type InputOf, type TaskContract, type TaskKind } from './pipeline/task-contracts';
 import type { WorkerInput, WorkerOutcome } from './pipeline/worker';
 
-export type { TaskKind } from './pipeline/task-contracts';
+export type { InputOf, TaskKind } from './pipeline/task-contracts';
 
 export const TASK_STATUS_LABELS = { queued: '排队中', running: '运行中', succeeded: '成功', failed: '失败' } as const;
 export const TASK_PAGE_SIZE = 200;
@@ -19,18 +19,28 @@ export class TaskError extends Error {
   constructor(message: string, readonly status: 400 | 404 = 400) { super(message); }
 }
 
-/** 入队一个任务。停用中的租户不能提交任务；共享锁与停用互斥，不会在停用的同时插进新任务 */
-export async function enqueueTask(tenantId: string, kind: string, params: Record<string, unknown> = {}) {
+/**
+ * 入队一个任务。停用中的租户不能提交任务；共享锁与停用互斥，不会在停用的同时插进新任务。
+ * 参数按 kind 对应的契约校验（InputOf），不合法时抛 TaskError（400）
+ */
+export async function enqueueTask<K extends TaskKind>(tenantId: string, kind: K, params: InputOf<K> = {} as InputOf<K>) {
   return getDb().transaction(tx => insertTask(tx, tenantId, kind, params));
 }
 
 /** 在调用方的事务里入队（调用方要在同一事务里先做检查时使用），规则同 enqueueTask */
-export async function insertTask(tx: Tx, tenantId: string, kind: string, params: Record<string, unknown> = {}) {
+export async function insertTask<K extends TaskKind>(tx: Tx, tenantId: string, kind: K, params: InputOf<K> = {} as InputOf<K>) {
+  // isTaskKind 是运行时检查：kind 来自脚本参数或历史数据时兜底（类型上 K 已是登记过的 kind）
   if (!isTaskKind(kind)) throw new TaskError(`未知的任务类型：${kind}`);
   const [tenant] = await tx.select({ suspendedAt: tenants.suspendedAt }).from(tenants).where(eq(tenants.id, tenantId)).for('share');
   if (!tenant) throw new TaskError('租户不存在', 404);
   if (tenant.suspendedAt) throw new TaskError('租户已停用，不能提交任务');
-  const [task] = await tx.insert(tasks).values({ tenantId, kind, params }).returning();
+  // 入队时按契约 parse 一次（ADR-0052）：报错文案与工作进程里的一致，不带出参数原值；入库的是调用方传入的原始 params
+  try {
+    CONTRACTS[kind].params.parse(params);
+  } catch (e) {
+    throw new TaskError((e as Error).message);
+  }
+  const [task] = await tx.insert(tasks).values({ tenantId, kind, params: params as Record<string, unknown> }).returning();
   return task;
 }
 

@@ -8,6 +8,7 @@ import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { sources, tasks, tenants, type TaskStatus } from './db/schema';
 import type { TaskKind } from './pipeline/handlers';
+import type { InputOf } from './pipeline/task-contracts';
 import type { SyncRecord } from './pipeline/sync-engine';
 import { requireSource, SourceError } from './source-config';
 import { largeTableSyncHours, syncIntervalMinutes, syncTables } from './sources';
@@ -29,8 +30,8 @@ export const ofSource = (tenantId: string, sourceId: string, kinds: TaskKind[] =
  * 核对与同步同时进行时读到的是写了一半的结果）。dueBefore 给出时，只有最近一次同类任务早于这个时间才入队（按周期）。
  * 不入队时返回 null 与原因
  */
-export async function enqueueSourceTask(
-  tx: Tx, tenantId: string, sourceId: string, kind: SourceTaskKind, params: Record<string, unknown>, dueBefore?: Date,
+export async function enqueueSourceTask<K extends SourceTaskKind>(
+  tx: Tx, tenantId: string, sourceId: string, kind: K, params: Omit<InputOf<K>, 'sourceId'>, dueBefore?: Date,
 ) {
   await tx.select({ id: sources.id }).from(sources).where(eq(sources.id, sourceId)).for('update');
   const [pending] = await tx.select({ kind: tasks.kind }).from(tasks)
@@ -39,7 +40,8 @@ export async function enqueueSourceTask(
   const [latest] = await tx.select({ createdAt: tasks.createdAt }).from(tasks)
     .where(ofSource(tenantId, sourceId, [kind])).orderBy(desc(tasks.createdAt)).limit(1);
   if (dueBefore && latest && latest.createdAt > dueBefore) return { task: null, reason: `本周期已经${SOURCE_TASK_LABELS[kind]}过` };
-  return { task: await insertTask(tx, tenantId, kind, { sourceId, ...params }), reason: null };
+  // sourceId 由这里合进参数：泛型展开 TS 推不出来，断言成该 kind 的入参类型
+  return { task: await insertTask(tx, tenantId, kind, { sourceId, ...params } as InputOf<K>), reason: null };
 }
 
 /**

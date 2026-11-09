@@ -18,8 +18,10 @@ import { getObject } from '../../app/.server/s3-client';
 import { tenantServingKey } from '../../app/.server/secrets';
 import { currentServingStore, enqueueServingBuild } from '../../app/.server/serving-store';
 import { TEMPLATES } from '../../app/.server/pipeline/templates';
+import type { InputOf } from '../../app/.server/pipeline/task-contracts';
 import { enqueueDueExpiries, listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
+import { enqueueTask, getTask } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, runTask } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
@@ -177,15 +179,22 @@ describe('生成服务库', () => {
     const { acme, snapshots, dataPath } = await publishedDefinitions();
     const [rfm] = snapshots.filter(s => s.template === 'rfm');
     const base = { id: rfm!.id, template: 'rfm', table: rfm!.table };
+    // 表名不是结果层快照表名：入队时就被契约拦下，不进队列
+    const badTable = { version: 103, target: servingPath(dataPath, 103), snapshots: [{ ...base, table: 'silver.customer' }] };
+    await expect(enqueueTask(acme, 'serving.build', badTable)).rejects.toThrow('参数 snapshots 必须是 { id, template, table } 列表，table 是结果层快照表名');
+    // 入队校验之前已排队的旧任务（裸插）：工作进程一侧同样校验，记为失败且不上传
+    const [bare] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'serving.build', params: badTable }).returning();
+    await drain();
+    expect(await getTask(bare.id)).toMatchObject({ status: 'failed', error: expect.stringMatching(/参数 snapshots/) });
+    // 形状合法、run 里才发现的问题照旧失败
     const cases: [Record<string, unknown>, RegExp][] = [
-      [{ snapshots: [{ ...base, table: 'silver.customer' }] }, /参数 snapshots/],
       [{ snapshots: [{ ...base, table: 'gold.rfm__00000000-0000-0000-0000-000000000000' }] }, /结果层没有快照表/],
       [{ snapshots: [{ ...base, template: 'tag:value_tier' }] }, /不合规/],
       [{ snapshots: [base], target: `${dataPath}elsewhere/v103.duckdb` }, /参数 target/],
     ];
     const target = servingPath(dataPath, 103);
     for (const [params, error] of cases) {
-      const task = await runTask(acme, 'serving.build', { version: 103, target, ...params });
+      const task = await runTask(acme, 'serving.build', { version: 103, target, ...params } as InputOf<'serving.build'>);
       expect(task).toMatchObject({ status: 'failed', error: expect.stringMatching(error) });
     }
     expect(existsSync(target)).toBe(false);

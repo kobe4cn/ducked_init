@@ -13,6 +13,7 @@ import { requireSource, sourceIdByName } from '../../app/.server/source-config';
 import { enqueueDueSyncs, syncSource } from '../../app/.server/source-sync';
 import { enqueueDueVerifies } from '../../app/.server/source-verify';
 import { createSourceView } from '../../app/.server/source-views';
+import { enqueueTask } from '../../app/.server/tasks';
 import { confirmWatermark, deleteBlockers, deleteSource, getSource, listSources, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
 import { listCatalog, runQuery } from '../../app/.server/workbench';
 import { resetDb } from '../http/harness';
@@ -213,7 +214,7 @@ describe('删除数据源', () => {
     expect(await silverCount()).toBe(customers);
 
     expect(await runTask(acme, 'source.drop', { schema })).toMatchObject({ status: 'succeeded' });
-    expect(await runTask(acme, 'source.drop', { schema: 'silver' })).toMatchObject({ status: 'failed' });
+    await expect(enqueueTask(acme, 'source.drop', { schema: 'silver' })).rejects.toThrow('参数 schema 必须是原始层 schema 名');
   });
 
   it('已删除的数据源不再被调度与引用：定时同步与核对跳过它，工作台不挂它的原始层视图，映射列表没有它的映射，跨源引用指不到它，恢复它的映射时 400', async () => {

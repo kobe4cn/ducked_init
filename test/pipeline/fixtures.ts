@@ -8,6 +8,7 @@ import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createMapping, publishedPlans, publishMapping } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import type { InputOf } from '../../app/.server/pipeline/task-contracts';
 import { enqueueTask, getTask, type TaskKind } from '../../app/.server/tasks';
 import { getSource, setSyncScope } from '../../app/.server/sources';
 import { createTenant } from '../../app/.server/tenants';
@@ -22,7 +23,7 @@ export function newTenant(slug: string) {
 }
 
 /** 入队一个任务并让调度器把队列跑空，返回该任务的最终状态 */
-export function runTask(tenantId: string, kind: TaskKind, params: Record<string, unknown> = {}) {
+export function runTask<K extends TaskKind>(tenantId: string, kind: K, params: InputOf<K> = {} as InputOf<K>) {
   return timed(`runTask:${kind}`, async () => {
     const { id } = await enqueueTask(tenantId, kind, params);
     await createDispatcher({ maxWorkers: 4 }).runUntilIdle();

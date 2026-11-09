@@ -4,12 +4,15 @@ import type { DuckDBConnection } from '@duckdb/node-api';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Tx } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
+import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { excludeValue, includeValue } from '../../app/.server/identity-exclusions';
 import { enqueueMerge, mergeNow } from '../../app/.server/mappings';
 import { syncSource } from '../../app/.server/source-sync';
 import { resolveIdentities } from '../../app/.server/pipeline/identity-engine';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
+import type { InputOf } from '../../app/.server/pipeline/task-contracts';
+import { enqueueTask, getTask } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { drain, runTask } from './fixtures';
 import { CRM, publishedIdentitySources } from './identity-fixtures';
@@ -234,7 +237,7 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     }
   });
 
-  it('合并任务参数 identityExclude 传到打通；不是 64 位十六进制哈希的列表时任务失败', async () => {
+  it('合并任务参数 identityExclude 传到打通；不是 64 位十六进制哈希的列表时入队报错，报错里不带明文', async () => {
     const { acme } = await publishedIdentitySources();
     const { params } = await lastMerge(acme);
     const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
@@ -245,13 +248,20 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
       session.close();
     }
     for (const bad of [hash, ['13800000001'], [hash.toUpperCase()], [hash.slice(1)], [hash, 1]]) {
-      const failed = await runTask(acme, 'silver.merge', { ...params, identityExclude: bad });
-      expect(failed.status).toBe('failed');
-      expect(failed.error).toContain('identityExclude');
-      expect(failed.error).not.toContain('13800000001');
+      const message = await enqueueTask(acme, 'silver.merge', { ...params, identityExclude: bad } as InputOf<'silver.merge'>)
+        .catch((e: Error) => e.message);
+      expect(message).toContain('identityExclude');
+      expect(message).not.toContain('13800000001');
     }
+    // 入队校验之前已排队的旧任务（裸插）：工作进程一侧同样校验，报错里也不带明文
+    const [bare] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'silver.merge', params: { ...params, identityExclude: ['13800000001'] } }).returning();
+    await drain();
+    const bareTask = await getTask(bare.id);
+    expect(bareTask.status).toBe('failed');
+    expect(bareTask.error).toContain('identityExclude');
+    expect(bareTask.error).not.toContain('13800000001');
     const groups = async (extra: Record<string, unknown>) => {
-      const task = await runTask(acme, 'silver.merge', { ...params, identityForce: true, ...extra });
+      const task = await runTask(acme, 'silver.merge', { ...params, identityForce: true, ...extra } as InputOf<'silver.merge'>);
       expect(task.status).toBe('succeeded');
       return (task.result as { identities: { groups: number } }).identities.groups;
     };
