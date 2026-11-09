@@ -6,7 +6,8 @@
 // message 与 next，提示在下方输入框回答）> 通过（按 mode 给下一步入口：reuse_result 链到所选条目的结果页 resultHref、
 // draft_definition 给「存草稿」、draft_query 有 workbenchSql 给「填入工作台」链接、没有给按钮；按钮只替本人发一句固定
 // 续写 onFollowUp，存草稿与填入工作台都会在助手工具里重新校验；不传 onFollowUp（被分享人只读）时不渲染按钮，链接照样
-// 渲染）> 过期（只提示重新提问，不给任何执行入口）
+// 渲染）> 过期（只提示重新提问，不给任何执行入口）。「排除了哪些口径」（excluded，#539）对所有 status 都显示，
+// 读者看不到的条目服务端只给原因，这里显示「你看不到的条目」
 import type { PlanCardView } from '~/.server/assistant/plan-card';
 import { Link } from 'react-router';
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
@@ -74,6 +75,16 @@ export function PlanCard({ card, workbenchSql, onFollowUp }: { card: PlanCardVie
           </ul>
         </div>
       )}
+      {/* 排除了哪些口径（#539）：检索到但没选的条目与原因；读者看不到的服务端已裁掉名称与 id，只显示「你看不到的条目」。
+          对所有 status 都显示，和「为何选 / 依据」一样；旧计划没有 excluded，不渲染 */}
+      {card.excluded?.length ? (
+        <div>
+          <h4 className="text-slate-400">排除了哪些口径</h4>
+          <ul className="mt-0.5 space-y-0.5">
+            {card.excluded.map((x, j) => <li key={j}>{`${x.name ?? '你看不到的条目'}：${x.reason}`}</li>)}
+          </ul>
+        </div>
+      ) : null}
       <p className="text-slate-500">
         {`模式：${MODE_LABEL[card.mode]}`}
         {card.request.windowDays !== undefined && `；窗口：近 ${card.request.windowDays} 天`}

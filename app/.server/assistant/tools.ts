@@ -18,7 +18,7 @@ import type { CurrentMember } from '../auth';
 import { expand, overview, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
 import { judgeAmbiguity, type AmbiguityGroup } from '../catalog/ambiguity';
 import { tenantCatalog } from '../catalog/load';
-import { semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type PlanStatus } from '../catalog/plan';
+import { planRetrievedIds, semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type PlanStatus } from '../catalog/plan';
 import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
 import type { HitReason } from '../catalog/rank';
 import { getDb } from '../db/client';
@@ -214,7 +214,8 @@ export const TOOLS: AssistantTool[] = [
   {
     name: 'validate_plan',
     description: '校验一份分析计划（JSON）：结构、步骤与选中的目录条目、口径可加性与平台能力。计划只能引用本轮 catalog_search / catalog_expand 返回过的条目，'
-      + '并带上返回的 semanticHash（指标、标签、模板还要带 version）；返回 status（valid / needs_clarification / unsupported / invalid）与逐条问题',
+      + '并带上返回的 semanticHash（指标、标签、模板还要带 version）；可选的 excluded 列出检索到但没选的口径（id 也必须来自本轮检索）和原因，'
+      + '可选的 rationale 说明为何选；原因里不要写目录以外的名称。返回 status（valid / needs_clarification / unsupported / invalid）与逐条问题',
     inputSchema: { type: 'object', required: ['plan'], properties: { plan: { type: 'object' } }, additionalProperties: false },
     outputSchema: TEXT,
     permission: 'definitions:read',
@@ -279,11 +280,12 @@ export const TOOLS: AssistantTool[] = [
     external: true,
     run: async (actor, input, ctx) => {
       const { kind, key, yaml } = input as { kind: 'metric' | 'tag'; key: string; yaml: string };
-      // 存草稿前用当前目录重新校验（ADR-0050）：优先本轮刚校验过的计划，其次对话里最近一份。selected 里的条目都当作检索过，
-      // 这样拦下来的只有依赖变了（版本或哈希不一致）与看不到所选条目，不会报「不在本次检索结果里」。没有计划（外部经 MCP 或本轮和对话里都没有）时不校验，与原来一致
+      // 存草稿前用当前目录重新校验（ADR-0050）：优先本轮刚校验过的计划，其次对话里最近一份。selected 与 excluded 的条目都当作
+      // 检索过（planRetrievedIds），这样拦下来的只有依赖变了（版本或哈希不一致）与看不到所选条目，不会报「不在本次检索结果里」。
+      // 没有计划（外部经 MCP 或本轮和对话里都没有）时不校验，与原来一致
       const plan = ctx?.plan ?? ctx?.priorPlan;
       if (plan) {
-        const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: new Set(plan.selected.map(s => s.id)) });
+        const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: planRetrievedIds(plan) });
         if (check.status !== 'valid') return stalePlanReply(check.status, plan, check.issues);
       }
       return savedOrRejected(yaml, async () => {
@@ -355,8 +357,8 @@ export const TOOLS: AssistantTool[] = [
       const plan = ctx?.plan ?? ctx?.priorPlan;
       if (!plan) return '未填入：本轮和对话里都没有校验过的分析计划，先检索并用 validate_plan 校验一份 draft_query 计划';
       if (plan.mode !== 'draft_query') return `未填入：计划的 mode 是 ${plan.mode}，只有 draft_query 的计划能填入工作台`;
-      // 填入前对当前目录重新校验（ADR-0050）：selected 都当作检索过，拦下来的只有依赖变了与看不到所选条目
-      const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: new Set(plan.selected.map(s => s.id)) });
+      // 填入前对当前目录重新校验（ADR-0050）：selected 与 excluded 都当作检索过（planRetrievedIds），拦下来的只有依赖变了与看不到所选条目
+      const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: planRetrievedIds(plan) });
       if (check.status !== 'valid') return stalePlanReply(check.status, plan, check.issues, 'prefill');
       if ((sql as string).length > MAX_PREFILL_SQL) return `未填入：SQL 超过 ${MAX_PREFILL_SQL} 字，工作台的链接放不下，请精简后重试`;
       // 只按工作台白名单检查、不执行（ADR-0043）；挂载出错时抛 WorkbenchError，由助手循环转成工具错误

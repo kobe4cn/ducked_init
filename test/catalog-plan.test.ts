@@ -1,11 +1,11 @@
 // test/catalog-plan.test.ts —— 分析计划校验 validatePlan()（ADR-0050，#409 / #410）：纯函数，不起库。
-// 结构校验（JSON Schema 与步骤业务检查、动作受控枚举）、硬性检查（本次检索、可见目录、版本、语义哈希）、
+// 结构校验（JSON Schema 与步骤业务检查、动作受控枚举）、硬性检查（本次检索、可见目录、版本、语义哈希；excluded 只查本次检索与不与 selected 重复，#539）、
 // 口径检查（单位 / 时间含义 / 窗口，只对 reuse_result 选中的指标）、可加性与平台能力检查（#410）。
 // 口径用例的固定目录是检索黄金集的 RETRIEVAL_CATALOG（「营收」别名挂在 revenue_30d 等指标上），
 // 成员声明与可加性的用例手工构造 CatalogInput（不动黄金集的目录）
 import { describe, expect, it } from 'vitest';
 import { buildCatalog, type Catalog, type MetricEntry } from '../app/.server/catalog';
-import { semanticHash, validatePlan, type AnalysisPlan } from '../app/.server/catalog/plan';
+import { planRetrievedIds, semanticHash, validatePlan, type AnalysisPlan } from '../app/.server/catalog/plan';
 import type { Claim } from '../app/.server/knowledge/catalog';
 import { RETRIEVAL_CATALOG } from '../scripts/eval-requirements/retrieval-catalog';
 
@@ -128,6 +128,41 @@ describe('分析计划校验 validatePlan()：硬性检查', () => {
       { catalog: RETRIEVAL_CATALOG, retrieved: new Set(['metric:nope']) });
     expect(absent.status).toBe('invalid');
     expect(absent.issues).toEqual([{ path: 'selected.0.id', entryId: 'metric:nope', message: '选中的条目不在可见目录里（无权限、未发布或已停用）' }]);
+  });
+
+  it('excluded 的 id 不在本次检索结果里返回 invalid（path excluded.N.id、带 entryId）；在检索结果里就合法、不查可见目录；与 selected 重复、缺 reason、步骤 inputs 引用 excluded 的条目都 invalid（#539）', () => {
+    // 不在检索结果里（默认 retrieved 只有选中的 revenue_30d）
+    const notRetrieved = check(planOf(undefined, { excluded: [{ id: 'metric:revenue_paid_30d', reason: '按支付时间统计，与问的下单时间不符' }] }));
+    expect(notRetrieved.status).toBe('invalid');
+    expect(notRetrieved.issues).toEqual([{ path: 'excluded.0.id', entryId: 'metric:revenue_paid_30d', message: '排除的条目不在本次检索结果里' }]);
+
+    // 在检索结果里就合法：excluded 只是说明，不查可见目录、版本与哈希（metric:ghost 不在目录里也 valid）；
+    // planRetrievedIds 给 selected 与 excluded 的 id 并集，读回重新校验（卡片 / 存草稿 / 填工作台）都拿它当检索结果
+    const withBoth = validatePlan(planOf(undefined, {
+      excluded: [{ id: 'metric:revenue_paid_30d', reason: '按支付时间统计，与问的下单时间不符' }, { id: 'metric:ghost', reason: '口径与提问不符' }],
+    }), { catalog: RETRIEVAL_CATALOG, retrieved: new Set(['metric:revenue_30d', 'metric:revenue_paid_30d', 'metric:ghost']) });
+    expect(withBoth).toMatchObject({ status: 'valid', issues: [] });
+    expect(planRetrievedIds(withBoth.plan!)).toEqual(new Set(['metric:revenue_30d', 'metric:revenue_paid_30d', 'metric:ghost']));
+
+    // 同一条目不能既选中又排除（id 在检索结果里，只报重复这一条）
+    const dup = check(planOf(undefined, { excluded: [{ id: 'metric:revenue_30d', reason: '窗口对不上' }] }));
+    expect(dup.status).toBe('invalid');
+    expect(dup.issues).toEqual([{ path: 'excluded.0.id', entryId: 'metric:revenue_30d', message: '同一条目不能既选中又排除' }]);
+
+    // items 缺 reason：结构不合法，plan 为 null
+    const noReason = check(planOf(undefined, { excluded: [{ id: 'metric:revenue_paid_30d' } as { id: string; reason: string }] }));
+    expect(noReason.status).toBe('invalid');
+    expect(noReason.plan).toBeNull();
+    expect(noReason.issues.some(i => i.path === 'excluded.0' && i.message === '缺少 reason')).toBe(true);
+
+    // 步骤 inputs 不能引用被排除的条目（entryIds 只算 selected）
+    const referenced = validatePlan({
+      ...planOf(), excluded: [{ id: 'metric:revenue_paid_30d', reason: '口径与提问不符' }],
+      steps: [{ id: 's1', action: 'answer', inputs: ['metric:revenue_paid_30d'] }],
+    }, { catalog: RETRIEVAL_CATALOG, retrieved: new Set(['metric:revenue_30d', 'metric:revenue_paid_30d']) });
+    expect(referenced.status).toBe('invalid');
+    expect(referenced.plan).toBeNull();
+    expect(referenced.issues.some(i => i.path === 'steps.0.inputs.0' && i.message.includes('不存在的步骤或条目'))).toBe(true);
   });
 
   it('版本不一致、指标没带 version 返回 invalid；字段没有版本，带了也忽略', () => {

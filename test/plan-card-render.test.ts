@@ -2,7 +2,8 @@
 // renderToStaticMarkup，Link 要包在 MemoryRouter 里，onClick 不会被渲染，按钮按 data-next 断言）：valid 时按 mode
 // 给下一步入口——reuse_result 链到所选条目的结果页、draft_definition 给「存草稿」按钮、draft_query 有 workbenchSql
 // 给「填入工作台」链接、没有给按钮；不传 onFollowUp（被分享人只读）时没有按钮、链接照样渲染；invalid 只提示重新提问；
-// clarify / needs_clarification 用 amber 列出问题与建议；unsupported 用 red 给出原因与「新建定义」
+// clarify / needs_clarification 用 amber 列出问题与建议；unsupported 用 red 给出原因与「新建定义」；「排除了哪些口径」
+// （#539）有名称的项显示名称与原因、没名称的显示「你看不到的条目」，没有 excluded 时没有这个标题
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router';
@@ -126,5 +127,19 @@ describe('为何选与依据', () => {
     const html = render(card({ assumptions: [] }));
     expect(html).not.toContain('为何选');
     expect(html).not.toContain('依据');
+  });
+});
+
+describe('排除了哪些口径', () => {
+  it('有 excluded 时列出名称与原因，没名称的（读者看不到的条目）显示「你看不到的条目」；没有 excluded 时没有这个标题（#539）', () => {
+    const html = render(card({ excluded: [
+      { id: 'metric:revenue_paid_30d', name: '近 30 天营收（支付口径）', reason: '按支付时间统计，与问的下单时间不符' },
+      { reason: '口径与提问不符' },
+    ] }));
+    expect(html).toContain('排除了哪些口径');
+    expect(html).toContain('近 30 天营收（支付口径）：按支付时间统计，与问的下单时间不符');
+    expect(html).toContain('你看不到的条目：口径与提问不符');
+    // 没有时（旧计划）不渲染这一块
+    expect(render(card({}))).not.toContain('排除了哪些口径');
   });
 });

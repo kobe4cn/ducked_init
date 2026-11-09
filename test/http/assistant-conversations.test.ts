@@ -2,7 +2,8 @@
 // 每轮问答记进本人的对话（标题与消息加密存一个字段），刷新后从列表打开继续；别人（含管理员）按 id 读 404；
 // 分享给同租户成员后对方只读、不能续写，可撤销，分享与撤销记审计；成员被移出租户时其对话与分享随之删除；
 // 工作台的结果解读存进本人的对话（带 query：SQL、行数与列名，不存取值），/workbench?sql= 把 SQL 填进编辑框、不执行；
-// 带 plan 的消息在读时按读者自己的目录组装计划卡（#452，ADR-0050：读时再校验；ADR-0005：被分享人按自己的目录，看不到的条目只留 id）
+// 带 plan 的消息在读时按读者自己的目录组装计划卡（#452，ADR-0050：读时再校验；ADR-0005：被分享人按自己的目录，看不到的条目只留 id）；
+// 「排除了哪些口径」（#539）：被分享人看不到的条目只有原因、id 与名称都不进卡片，带 excluded 的计划存草稿不判过期
 import { and, eq, like } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -337,6 +338,76 @@ describe('助手对话', () => {
     expect(tool.content).toContain('未保存：计划已过期');
     expect(tool.content).toContain('依赖变了');
     expect((await getDb().select().from(dslVersions)).length).toBe(before);
+  });
+
+  it('计划卡的「排除了哪些口径」按读者的目录组装（#539）：主人读回两项都带名称；被分享的查看者看不到的源表只有原因，响应里不出现它的 id 与名称；带 excluded 的计划续写存草稿不报「计划已过期」', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const client = await loginAs(app, 'analyst@acme.com');
+    const peer = await loginAs(app, 'viewer@acme.com');
+    const REVENUE_30D = 'base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: created_at, days: 30 }\n';
+    await createDefinition(author, 'metric', 'revenue_30d', REVENUE_30D);
+    await publishDefinition(reviewer, 'metric', 'revenue_30d', 1);
+    const catalog = await catalogFor(analyst);
+    const entry = (id: string) => {
+      const e = catalog.entries.find(x => x.id === id);
+      if (!e) throw new Error(`${id} 不在分析师目录里`);
+      return e;
+    };
+    const [customer, metric, table] = ['entity:customer', 'metric:revenue_30d', 'table:CRM/orders'].map(entry);
+    if (metric.kind !== 'metric') throw new Error('revenue_30d 不是指标');
+    // selected 只有指标，excluded 带源表（查看者看不到）与消费者实体（查看者看得到）：三个 id 都要出现在 catalog_search 结果里
+    const plan = {
+      schemaVersion: 1, mode: 'reuse_result',
+      selected: [{ id: 'metric:revenue_30d', version: metric.version, semanticHash: semanticHash(metric) }],
+      request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: ['metric:revenue_30d'] }],
+      assumptions: [], questions: [],
+      excluded: [
+        { id: 'table:CRM/orders', reason: '原始订单表还要自己算口径，不如现成指标' },
+        { id: 'entity:customer', reason: '消费者实体不带金额，回答用不着' },
+      ],
+    };
+    const replies = [
+      toolCalls({ name: 'catalog_search', args: { query: '订单金额' } }),
+      toolCalls({ name: 'validate_plan', args: { plan } }),
+      text('可以复用现有结果'),
+      // 第二轮：不再检索校验，直接存草稿（走对话里最近一份计划重新校验）
+      toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'revenue_30d', yaml: REVENUE_30D } }),
+      text('草稿已保存'),
+    ];
+    const { received } = fakeLlm(f => app.setLlmFetch(f), n => replies[n - 1]);
+    const first = await (await post(client, { message: '统计近 30 天的订单金额', page: PAGE })).json();
+    expect(first).toMatchObject({ reply: '可以复用现有结果', toolsUsed: ['catalog_search', 'validate_plan'] });
+    // 主人的卡片：重新校验 valid（excluded 的 id 也算检索过），两项 excluded 都带 id 与名称
+    expect(first.planCard.status).toBe('valid');
+    expect(first.planCard.excluded).toEqual([
+      { id: 'table:CRM/orders', name: table.name, reason: '原始订单表还要自己算口径，不如现成指标' },
+      { id: 'entity:customer', name: customer.name, reason: '消费者实体不带金额，回答用不着' },
+    ]);
+    const own = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(own.conversation.messages[1].planCard.excluded).toEqual(first.planCard.excluded);
+
+    // 只读分享给查看者：源表条目他看不到，excluded 里只有原因（id 与名称都不出现，id 自带数据源名）；
+    // 看得到的实体照常带名称；excluded 不查可见目录，计划对他也是 valid
+    expect((await post(client, { intent: 'share', conversationId: first.conversationId, email: 'viewer@acme.com' })).status).toBe(200);
+    const shared = await (await peer.get(`/assistant?id=${first.conversationId}`)).json();
+    const viewerCard: PlanCardView = shared.conversation.messages[1].planCard;
+    expect(viewerCard.status).toBe('valid');
+    expect(viewerCard.excluded).toEqual([
+      { reason: '原始订单表还要自己算口径，不如现成指标' },
+      { id: 'entity:customer', name: customer.name, reason: '消费者实体不带金额，回答用不着' },
+    ]);
+    expect(JSON.stringify(viewerCard)).not.toContain('table:CRM/orders');
+    expect(JSON.stringify(viewerCard)).not.toContain(table.name);
+
+    // 带 excluded 的计划存草稿（tools.ts 重新校验时 excluded 也算检索过）：不报「计划已过期」，草稿真的存下
+    const second = await (await post(client, { conversationId: first.conversationId, message: '把它保存为草稿', page: PAGE })).json();
+    expect(second).toMatchObject({ conversationId: first.conversationId, reply: '草稿已保存', toolsUsed: ['save_definition_draft'] });
+    const tool = received[4].body.messages.filter((m: { role: string }) => m.role === 'tool').at(-1)!;
+    expect(tool.content).toContain('已保存为草稿');
+    expect(tool.content).not.toContain('计划已过期');
   });
 
   it('计划卡的 resultHref 只在重新校验通过时给：两次读取之间另一位成员发布了新版本，?id= 读回的卡片不是 valid、没有 resultHref（#453，ADR-0050）', async () => {
