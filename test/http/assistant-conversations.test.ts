@@ -105,7 +105,7 @@ describe('助手对话', () => {
     expect(Object.keys(rows[0]).sort()).toEqual(['createdAt', 'id', 'memberId', 'sealed', 'tenantId', 'updatedAt']);
   });
 
-  it('校验过的计划随对话加密保存（ADR-0050）：?id= 读回的 assistant 消息带 plan、sealed 里没有条目 id 明文；续写时发给模型的历史不带计划', async () => {
+  it('校验过的计划随对话加密保存（ADR-0050）：?id= 读回的 assistant 消息只带 planCard、不带原始 plan（#539），sealed 里没有条目 id 明文；续写时发给模型的历史不带计划', async () => {
     const { acme } = await publishedIdentitySources();
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     const client = await loginAs(app, 'analyst@acme.com');
@@ -128,12 +128,12 @@ describe('助手对话', () => {
     const first = await (await post(client, { message: '消费者分析能用现有目录吗', page: PAGE })).json();
     expect(first).toMatchObject({ reply: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'] });
 
-    // 读回：校验计划的那轮 assistant 消息带 plan，只有条目 id、版本与哈希，没有检索结果与工具原文；
-    // 另带读时组装的 planCard（#452：卡片的名称、数据截至是动态的，用 objectContaining 收敛断言）
+    // 读回：校验计划的那轮 assistant 消息不带原始 plan（#539：看不到的 excluded 条目 id 不能经它泄露），
+    // 只带读时组装的 planCard（#452：卡片的名称、数据截至是动态的，用 objectContaining 收敛断言）
     const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
     expect(conversation.messages).toEqual([
       { role: 'user', content: '消费者分析能用现有目录吗' },
-      { role: 'assistant', content: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'], plan, planCard: expect.objectContaining({ status: 'valid', mode: 'reuse_result' }) },
+      { role: 'assistant', content: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'], planCard: expect.objectContaining({ status: 'valid', mode: 'reuse_result' }) },
     ]);
 
     // 续写：交给模型的历史只有文字（不含计划，比如哈希值与 schemaVersion）；本轮没再校验，新消息不带 plan
@@ -185,7 +185,7 @@ describe('助手对话', () => {
     const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
     expect(conversation.messages).toEqual([
       { role: 'user', content: '按城市统计客户' },
-      { role: 'assistant', content: 'SQL 已准备好', toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench'], plan, workbenchSql: CITY_COUNT, planCard: expect.objectContaining({ status: 'valid', mode: 'draft_query' }) },
+      { role: 'assistant', content: 'SQL 已准备好', toolsUsed: ['catalog_search', 'validate_plan', 'prefill_workbench'], workbenchSql: CITY_COUNT, planCard: expect.objectContaining({ status: 'valid', mode: 'draft_query' }) },
     ]);
     // 库里只有密文
     const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
@@ -388,6 +388,7 @@ describe('助手对话', () => {
     ]);
     const own = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
     expect(own.conversation.messages[1].planCard.excluded).toEqual(first.planCard.excluded);
+    expect(own.conversation.messages[1]).not.toHaveProperty('plan');
 
     // 只读分享给查看者：源表条目他看不到，excluded 里只有原因（id 与名称都不出现，id 自带数据源名）；
     // 看得到的实体照常带名称；excluded 不查可见目录，计划对他也是 valid
@@ -400,6 +401,7 @@ describe('助手对话', () => {
       { id: 'entity:customer', name: customer.name, reason: '消费者实体不带金额，回答用不着' },
     ]);
     expect(JSON.stringify(viewerCard)).not.toContain('table:CRM/orders');
+    expect(JSON.stringify(shared)).not.toContain('table:CRM/orders');
     expect(JSON.stringify(viewerCard)).not.toContain(table.name);
 
     // 带 excluded 的计划存草稿（tools.ts 重新校验时 excluded 也算检索过）：不报「计划已过期」，草稿真的存下
