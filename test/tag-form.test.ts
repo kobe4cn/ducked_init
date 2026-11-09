@@ -181,6 +181,19 @@ default: c
     expect(form.readonly.map(r => r.key)).toEqual(['rules.0']);
     expect(parse(formToYaml(form))).toEqual(parse(yaml));
   });
+
+  it('顶层 metric 不是字符串时只读，写回原样保留（非法值交给 checkTag 拦）', () => {
+    const yaml = `metric: 5
+rules:
+  - value: a
+    when: { all: [{ metric: foo, gte: 1 }] }
+default: c
+`;
+    const form = yamlToForm(yaml);
+    expect(form.readonly.map(r => r.key)).toContain('metric');
+    const out = formToYaml(form);
+    expect(parse(out), out).toEqual(parse(yaml));
+  });
 });
 
 describe('词汇表', () => {
