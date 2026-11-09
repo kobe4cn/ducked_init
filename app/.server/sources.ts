@@ -48,6 +48,11 @@ const COMMENT_ROW_LIMIT = 5000;
 /** 注释原文的最大长度：超出截断（截断后的原文才参与版本比较） */
 const COMMENT_TEXT_LIMIT = 2000;
 
+/** 按码点截断到 COMMENT_TEXT_LIMIT 字：String.slice 按 UTF-16 码元截，会把 emoji 这类代理对切成半个。码元数不超限的直接返回，免得每条都转数组 */
+function truncateComment(text: string) {
+  return text.length <= COMMENT_TEXT_LIMIT ? text : Array.from(text).slice(0, COMMENT_TEXT_LIMIT).join('');
+}
+
 function describeWriteGrants(user: string | undefined, grants: WriteGrant[]) {
   const shown = grants.slice(0, GRANT_EXAMPLES).map(g => `${g.object}（${g.privileges.join('、')}）`).join('；');
   const more = grants.length > GRANT_EXAMPLES ? `等 ${grants.length} 项` : '';
@@ -98,7 +103,7 @@ async function recordListing(tx: Tx, tenantId: string, sourceId: string, listed:
   ));
   await tx.update(sourceComments).set({ goneAt: new Date() })
     .where(and(eq(sourceComments.sourceId, sourceId), isNull(sourceComments.goneAt)));
-  const kept = comments.slice(0, COMMENT_ROW_LIMIT).map(c => ({ ...c, text: c.text.slice(0, COMMENT_TEXT_LIMIT) }));
+  const kept = comments.slice(0, COMMENT_ROW_LIMIT).map(c => ({ ...c, text: truncateComment(c.text) }));
   if (kept.length) {
     await tx.insert(sourceComments)
       .values(kept.map(c => ({
