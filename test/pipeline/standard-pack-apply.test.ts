@@ -81,16 +81,27 @@ describe('应用标准模板包', () => {
     const { acme, analyst } = await setup();
     const first = await apply(acme);
     await acceptProposal(analyst, first.created[2]!.id); // 「所在城市」
-    // 版本 2 的包：city 的条目多了一个新别名，其余没变
+    // 版本 2 的包：city 的条目多了一个新别名；未处理的 registered_at 条目内容变了（注册日期 → 开户日期）；customer_id 没变
     const out = await apply(acme, [
       { targetId: 'field:customer.customer_id', aliases: ['客户 ID', '用户 ID'] },
       { targetId: 'field:customer.city', aliases: ['所在城市', '用户城市'] },
-      { targetId: 'field:customer.registered_at', aliases: ['注册日期'] },
+      { targetId: 'field:customer.registered_at', aliases: ['开户日期'] },
     ], 2);
-    // 内容没变的照旧计 existing；「所在城市」已接受成知识、被跳过；新别名「用户城市」是内容变了的新提案
-    expect(out).toMatchObject({ existing: 3, skipped: 1, rejected: 0, invalid: [] });
-    expect(out.created.map(p => [p.targetId, p.content])).toEqual([['field:customer.city', { alias: '用户城市' }]]);
-    expect(out.created[0]).toMatchObject({ generatorVersion: 'standard-pack@2', evidence: [{ ref: 'pack:standard', version: 2 }] });
+    // 内容没变的照旧计 existing；「所在城市」已接受成知识、被跳过；「用户城市」「开户日期」是内容变了的新提案
+    expect(out).toMatchObject({ existing: 2, skipped: 1, rejected: 0, invalid: [] });
+    expect(out.created.map(p => [p.targetId, p.content])).toEqual([
+      ['field:customer.city', { alias: '用户城市' }],
+      ['field:customer.registered_at', { alias: '开户日期' }],
+    ]);
+    for (const p of out.created) {
+      expect(p).toMatchObject({ generatorVersion: 'standard-pack@2', evidence: [{ ref: 'pack:standard', version: 2 }] });
+    }
+    // 内容变了的条目：旧的未处理提案（注册日期）仍是 proposed、内容与版本号都没变，新提案另起一行
+    expect((await proposalRows(acme)).filter(p => p.targetId === 'field:customer.registered_at')
+      .map(p => [p.status, p.content, p.generatorVersion])).toEqual([
+      ['proposed', { alias: '注册日期' }, `standard-pack@${PACK_VERSION}`],
+      ['proposed', { alias: '开户日期' }, 'standard-pack@2'],
+    ]);
     // 旧的未处理提案保留，已接受的没被覆盖、也没有再提「所在城市」
     expect((await proposalRows(acme)).filter(p => p.targetId === 'field:customer.city')
       .map(p => [p.status, p.content])).toEqual([['accepted', { alias: '所在城市' }], ['proposed', { alias: '用户城市' }]]);
