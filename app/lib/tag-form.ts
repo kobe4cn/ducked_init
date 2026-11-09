@@ -179,7 +179,6 @@ export function formToYaml(form: TagForm): string {
   // 其余只读项是顶层键，原样写回（源定义里没写的键不补）
   for (const r of form.readonly) {
     if (r.key === '$yaml' || /^rules\.\d+$/.test(r.key) || r.raw === undefined) continue;
-    if (r.key === 'metric' && !form.single) continue;
     spec[r.key] = r.raw;
   }
   return stringify(spec);
