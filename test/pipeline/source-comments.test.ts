@@ -79,9 +79,11 @@ describe('PostgreSQL 表注释与列注释', () => {
     const columns = (n: number) => Array.from({ length: n }, (_, i) => `c${i} int`).join(', ');
     const commentAll = (table: string, n: number) =>
       Array.from({ length: n }, (_, i) => `COMMENT ON COLUMN shop.${table}.c${i} IS '注';`).join('');
-    // 4 张表各 1251 个带注释的列，加上 regions 的长表注释共 5005 条：regions 排最前，随后是 zcap0…zcap3 的列注释
+    // 4 张表各 1251 个带注释的列，加上 regions 的长表注释、regions.code 的列注释共 5006 条：regions 排最前，随后是 zcap0…zcap3 的列注释
+    // regions.code 的第 2000 个字是 emoji（UTF-16 里占两个码元），按字截断时整个保留，不留半个代理对
     await grantOnSource(`
       COMMENT ON TABLE shop.regions IS '${'长'.repeat(2500)}';
+      COMMENT ON COLUMN shop.regions.code IS '${'长'.repeat(1999)}😀尾';
       CREATE TABLE shop.zcap0 (${columns(1251)}); CREATE TABLE shop.zcap1 (${columns(1251)});
       CREATE TABLE shop.zcap2 (${columns(1251)}); CREATE TABLE shop.zcap3 (${columns(1251)});
       GRANT SELECT ON ALL TABLES IN SCHEMA shop TO ${READER.user};
@@ -91,7 +93,8 @@ describe('PostgreSQL 表注释与列注释', () => {
     const saved = await savedComments(id);
     expect(saved.length).toBe(5000);
     expect(saved.filter(c => c.at === 'shop.regions').map(c => c.text)).toEqual(['长'.repeat(2000)]);
-    expect(saved.filter(c => c.at.startsWith('shop.zcap')).length).toBe(4999);
+    expect(saved.filter(c => c.at === 'shop.regions.code').map(c => c.text)).toEqual(['长'.repeat(1999) + '😀']);
+    expect(saved.filter(c => c.at.startsWith('shop.zcap')).length).toBe(4998);
   });
 });
 
