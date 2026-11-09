@@ -6,7 +6,7 @@ import { and, eq, isNull, sql } from 'drizzle-orm';
 import { assertCan } from '../access';
 import { recordAudit, type Tx } from '../audit';
 import type { CurrentMember } from '../auth';
-import { getDb } from '../db/client';
+import { catalogTx } from '../catalog/tx';
 import { knowledgeAliases } from '../db/schema';
 import { assertTarget, basisOf, KnowledgeError } from './basis';
 import { assertCanTouchKnowledge, lockTenantRow, rethrowDuplicateAlias } from './guards';
@@ -16,7 +16,8 @@ export const ALIAS_MAX_LENGTH = 50;
 export interface AliasInput { targetId: unknown; mappingId?: string | null; alias: unknown }
 
 /**
- * 在给定事务里加一个别名（接受知识提案时与提案在同一事务里），返回别名 ID。
+ * 在给定事务里加一个别名（接受知识提案时与提案在同一事务里），返回别名 ID。不开 catalogTx，
+ * 调用方必须已经在 catalogTx 里（目录版本由最外层的 catalogTx 记一版）。
  * 并发加了同一个别名时唯一索引报 23505（不转成 KnowledgeError），调用方像 addAlias 那样处理
  */
 export async function addAliasTx(tx: Tx, actor: CurrentMember, { targetId, mappingId = null, alias }: AliasInput): Promise<string> {
@@ -45,7 +46,7 @@ export async function addAliasTx(tx: Tx, actor: CurrentMember, { targetId, mappi
 /** 给目录条目加一个别名，返回别名 ID */
 export async function addAlias(actor: CurrentMember, input: AliasInput): Promise<string> {
   try {
-    return await getDb().transaction(tx => addAliasTx(tx, actor, input));
+    return await catalogTx(actor.tenant.id, tx => addAliasTx(tx, actor, input));
   } catch (e) {
     rethrowDuplicateAlias(e);
   }
@@ -55,7 +56,7 @@ export async function addAlias(actor: CurrentMember, input: AliasInput): Promise
 export async function retireAlias(actor: CurrentMember, aliasId: string): Promise<void> {
   assertCanTouchKnowledge(actor);
   const tenantId = actor.tenant.id;
-  await getDb().transaction(async tx => {
+  await catalogTx(tenantId, async tx => {
     const row = await lockTenantRow(tx, knowledgeAliases, aliasId, tenantId);
     if (!row) throw new KnowledgeError('没有这个别名');
     assertCan(actor, row.mappingId ? 'sources:write' : 'definitions:draft');

@@ -6,6 +6,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { assertCan } from '../access';
 import { recordAudit, type Tx } from '../audit';
 import type { CurrentMember } from '../auth';
+import { catalogTx } from '../catalog/tx';
 import { getDb, isUniqueViolation } from '../db/client';
 import { analysisSubjects, subjectMemberships } from '../db/schema';
 import { UUID } from '../tenants';
@@ -49,10 +50,10 @@ export async function assertSubject(tx: Tx, tenantId: string, subjectId: unknown
   await subjectOf(tx, tenantId, subjectId);
 }
 
-/** 在事务里跑；并发造成的唯一冲突转成 400 */
-async function inTx<T>(dupMessage: string, fn: (tx: Tx) => Promise<T>): Promise<T> {
+/** 在 catalogTx 里跑；并发造成的唯一冲突转成 400 */
+async function inTx<T>(tenantId: string, dupMessage: string, fn: (tx: Tx) => Promise<T>): Promise<T> {
   try {
-    return await getDb().transaction(fn);
+    return await catalogTx(tenantId, fn);
   } catch (e) {
     if (isUniqueViolation(e)) throw new KnowledgeError(dupMessage);
     throw e;
@@ -64,7 +65,7 @@ export async function createSubject(actor: CurrentMember, name: unknown): Promis
   assertCan(actor, 'definitions:draft');
   const trimmed = subjectName(name);
   const tenantId = actor.tenant.id;
-  return inTx(`已有主题「${trimmed}」`, async tx => {
+  return inTx(tenantId, `已有主题「${trimmed}」`, async tx => {
     await assertNameFree(tx, tenantId, trimmed);
     const [row] = await tx.insert(analysisSubjects).values({ tenantId, name: trimmed, createdByEmail: actor.email })
       .returning({ id: analysisSubjects.id });
@@ -78,7 +79,7 @@ export async function renameSubject(actor: CurrentMember, subjectId: unknown, na
   assertCan(actor, 'definitions:draft');
   const trimmed = subjectName(name);
   const tenantId = actor.tenant.id;
-  await inTx(`已有主题「${trimmed}」`, async tx => {
+  await inTx(tenantId, `已有主题「${trimmed}」`, async tx => {
     const row = await subjectOf(tx, tenantId, subjectId);
     await assertNameFree(tx, tenantId, trimmed, row.id);
     await tx.update(analysisSubjects).set({ name: trimmed }).where(eq(analysisSubjects.id, row.id));
@@ -90,7 +91,7 @@ export async function renameSubject(actor: CurrentMember, subjectId: unknown, na
 export async function deleteSubject(actor: CurrentMember, subjectId: unknown): Promise<void> {
   assertCan(actor, 'definitions:draft');
   const tenantId = actor.tenant.id;
-  await getDb().transaction(async tx => {
+  await catalogTx(tenantId, async tx => {
     const row = await subjectOf(tx, tenantId, subjectId);
     await tx.delete(analysisSubjects).where(eq(analysisSubjects.id, row.id));
     await recordAudit(tx, { tenantId, actor, action: 'analysis_subject.deleted', targetType: 'analysis_subject', targetId: row.id, detail: { subjectId: row.id } });
@@ -98,7 +99,8 @@ export async function deleteSubject(actor: CurrentMember, subjectId: unknown): P
 }
 
 /**
- * 在事务里把目录条目（实体、字段、已发布指标或标签）加入主题，返回主题 ID；调用方负责权限检查与开事务。
+ * 在事务里把目录条目（实体、字段、已发布指标或标签）加入主题，返回主题 ID；调用方负责权限检查与开事务，
+ * 且不开 catalogTx：调用方必须已经在 catalogTx 里（addMembership 的 inTx 或接受主题归属提案的事务）。
  * 默认已在主题里时 400，并发撞主键 (subject_id, target_id) 由调用方的事务转成 400（addMembership 的 inTx）。
  * ifAbsent：已在主题里时直接返回、不插入不记审计（目录没变，也不记目录版本）——接受主题归属提案时条目可能已被手动加入；
  * 插入用 onConflictDoNothing 挡住并发，只在真的插入了一行时记审计
@@ -134,7 +136,8 @@ export async function addMembershipTx(
 export async function addMembership(actor: CurrentMember, subjectId: unknown, targetId: unknown): Promise<void> {
   assertCan(actor, 'definitions:draft');
   if (typeof targetId !== 'string' || !targetId) throw new KnowledgeError('缺少目标');
-  await inTx(`${targetId} 已在这个主题里`, tx => addMembershipTx(tx, actor, subjectId, targetId));
+  const tenantId = actor.tenant.id;
+  await inTx(tenantId, `${targetId} 已在这个主题里`, tx => addMembershipTx(tx, actor, subjectId, targetId));
 }
 
 /** 把目录条目移出主题；不在主题里时 400 */
@@ -142,7 +145,7 @@ export async function removeMembership(actor: CurrentMember, subjectId: unknown,
   assertCan(actor, 'definitions:draft');
   if (typeof targetId !== 'string' || !targetId) throw new KnowledgeError('缺少目标');
   const tenantId = actor.tenant.id;
-  await getDb().transaction(async tx => {
+  await catalogTx(tenantId, async tx => {
     const row = await subjectOf(tx, tenantId, subjectId);
     const removed = await tx.delete(subjectMemberships)
       .where(and(eq(subjectMemberships.subjectId, row.id), eq(subjectMemberships.targetId, targetId)))

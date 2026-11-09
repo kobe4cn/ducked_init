@@ -6,6 +6,7 @@ import { and, desc, eq, isNull } from 'drizzle-orm';
 import { assertCan } from '../access';
 import { recordAudit, type Tx } from '../audit';
 import type { CurrentMember } from '../auth';
+import { catalogTx } from '../catalog/tx';
 import { getDb } from '../db/client';
 import { semanticClaims } from '../db/schema';
 import { isClaimType, isClaimValue } from '../../lib/semantic-claims';
@@ -16,7 +17,7 @@ export interface ClaimInput { targetId: unknown; mappingId?: string | null; type
 /** 一版口径声明 */
 export interface ClaimVersion { id: string; type: string; value: string; createdByEmail: string; createdAt: Date }
 
-/** 在给定事务里保存一条口径声明（接受知识提案时与提案在同一事务里），返回声明 ID */
+/** 在给定事务里保存一条口径声明（接受知识提案时与提案在同一事务里），返回声明 ID。不开 catalogTx，调用方必须已经在 catalogTx 里 */
 export async function saveClaimTx(tx: Tx, actor: CurrentMember, { targetId, mappingId = null, type, value }: ClaimInput): Promise<string> {
   assertCan(actor, mappingId ? 'sources:write' : 'definitions:draft');
   if (typeof targetId !== 'string' || !targetId) throw new KnowledgeError('缺少目标');
@@ -34,7 +35,7 @@ export async function saveClaimTx(tx: Tx, actor: CurrentMember, { targetId, mapp
 
 /** 保存一条口径声明，返回声明 ID */
 export const saveClaim = (actor: CurrentMember, input: ClaimInput): Promise<string> =>
-  getDb().transaction(tx => saveClaimTx(tx, actor, input));
+  catalogTx(actor.tenant.id, tx => saveClaimTx(tx, actor, input));
 
 /** 一个挂载点的口径声明历史：每一版的类型、取值、作者与时间，新的在前 */
 export async function claimHistory(db: Tx | ReturnType<typeof getDb>, tenantId: string, targetId: string, mappingId: string | null = null): Promise<ClaimVersion[]> {
