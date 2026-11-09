@@ -20,7 +20,7 @@ Two-person publish exists for mappings, templates, source views and custom entit
 
 - Same status codes for the same failure (missing entity 404, missing draft 404 after a lock wait, invalid input 400, permission 403).
 - Same display conventions (for example the mapping name `table → entity`).
-- Reuse the shared pieces (`publish-rules.ts`, existing field and column types) before writing a fourth copy. If the skeleton must be copied, flag it in the review as a deepening candidate.
+- Reuse the shared pieces (`publishing.ts`, existing field and column types) before writing a fourth copy. If the skeleton must be copied, flag it in the review as a deepening candidate.
 
 ## Comments and names
 

@@ -8,8 +8,7 @@ import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/source-view';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
-import { publishReason } from '~/.server/publish-rules';
-import { PublishError } from '~/.server/publishing';
+import { PublishError, publishReason } from '~/.server/publishing';
 import type { ViewPreview } from '~/.server/pipeline/source-view-engine';
 import {
   createSourceView, discardSourceViewDraft, getSourceView, listSourceViews, previewSourceView, publishSourceView, saveSourceViewDraft,
