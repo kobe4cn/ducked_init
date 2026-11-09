@@ -43,7 +43,7 @@ describe('身份打通：多源消费者确定性合并', () => {
     const [merge] = (await listTasks(acme)).filter(t => t.kind === 'silver.merge');
     expect(merge.status).toBe('succeeded');
     expect((merge.result as { identities: unknown }).identities).toMatchObject({ groups: 8, records: 16, devices: 2 });
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources：采集同步三个数据源、发布映射并合并，单跑每个约 24 s，并行加压时会超过默认的 90 s
 
   it('登录过的设备归属到最近一次登录的统一消费者，同一时刻登录并列时取较小的 consumer_id；匿名事件经设备归属', async () => {
     const { acme, names } = await publishedIdentitySources();
@@ -64,7 +64,7 @@ describe('身份打通：多源消费者确定性合并', () => {
       { event_id: 'e7', consumer_id: [u1, u9].sort()[0] },
       { event_id: 'e8', consumer_id: null },
     ]);
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources：采集同步三个数据源、发布映射并合并，单跑每个约 24 s，并行加压时会超过默认的 90 s
 
   it('事件映射声明 customer_id 属于 CRM 数据源后，登录事件按 CRM 那条消费者记录所在的统一消费者给设备定主人', async () => {
     const { acme, author, reviewer, sources, names } = await publishedIdentitySources();
@@ -83,7 +83,7 @@ describe('身份打通：多源消费者确定性合并', () => {
     expect(await silver(acme, 'event', 'event_id')).toEqual(expect.arrayContaining([
       expect.objectContaining({ event_id: 'e1', _source: sources.tracking, _customer_source: sources.crm }),
     ]));
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources：采集同步三个数据源、发布映射并合并，单跑每个约 24 s，并行加压时会超过默认的 90 s
 
   it('事件映射声明 customer_id 属于 CRM 数据源后，浏览次数指标按 CRM 那条消费者记录算到统一消费者上', async () => {
     const { acme, author, reviewer, sources, names } = await publishedIdentitySources();
@@ -113,7 +113,7 @@ describe('身份打通：多源消费者确定性合并', () => {
     await republish(author, reviewer, events.id, TRACKING_EVENTS.replace('  customer_id: user_id\n', '  customer_id: { expr: user_id, customer_source: CRM }\n'));
     // 声明后 e10 归 crm 3 所在的统一消费者；e9 的 u1 在 CRM 里找不到
     expect(await views()).toEqual([{ consumer_id: await consumerOf('crm:3'), value: 1 }]);
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources：采集同步三个数据源、发布映射并合并，单跑每个约 24 s，并行加压时会超过默认的 90 s
 
   it('event 指标的快照里匿名事件经设备归属计入设备主人；没有 _device_owner 的老湖给出提示', async () => {
     const { acme, names } = await publishedIdentitySources();
@@ -144,7 +144,7 @@ describe('身份打通：多源消费者确定性合并', () => {
     const failed = await runTask(acme, 'gold.dsl', params);
     expect(failed.status).toBe('failed');
     expect(failed.error).toContain('silver._device_owner');
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources：采集同步三个数据源、发布映射并合并，单跑每个约 24 s，并行加压时会超过默认的 90 s
 
   it('统一消费者属性：每人一行，按 updated_at 取最新的非空值并记来源，名次优先于 updated_at；不收敏感字段', async () => {
     const { acme, names, mappings } = await publishedIdentitySources();
@@ -180,7 +180,7 @@ describe('身份打通：多源消费者确定性合并', () => {
     } finally {
       session.close();
     }
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources：采集同步三个数据源、发布映射并合并，单跑每个约 24 s，并行加压时会超过默认的 90 s
 
   it('统一消费者的同意：每人每渠道一行，取各源里最新的状态并记来源，不看数据源名次；同一时刻撤回优先', async () => {
     const { acme, names } = await publishedIdentitySources({ consents: true });
@@ -200,7 +200,7 @@ describe('身份打通：多源消费者确定性合并', () => {
     } finally {
       session.close();
     }
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources：采集同步三个数据源、发布映射并合并，单跑每个约 24 s，并行加压时会超过默认的 90 s
 
   it('consumer.city 维度的指标里一个人只出现一次；没有 _consumer 的老湖给出重新合并的提示', async () => {
     const { acme, names } = await publishedIdentitySources();
@@ -237,7 +237,7 @@ describe('身份打通：多源消费者确定性合并', () => {
     expect(failed.status).toBe('failed');
     expect(failed.error).toContain('silver._consumer');
     expect(failed.error).toContain('重新合并一次映射');
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources：采集同步三个数据源、发布映射并合并，单跑每个约 24 s，并行加压时会超过默认的 90 s
 
   it('同样的输入再合并一次，打通表与设备归属表的内容完全一致', async () => {
     const { acme, author } = await publishedIdentitySources();
@@ -247,5 +247,5 @@ describe('身份打通：多源消费者确定性合并', () => {
     const after = await identities(acme);
     expect(after.rows).toEqual(before.rows);
     expect(after.devices).toEqual(before.devices);
-  });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources：采集同步三个数据源、发布映射并合并，单跑每个约 24 s，并行加压时会超过默认的 90 s
 });
