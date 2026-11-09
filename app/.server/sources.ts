@@ -11,6 +11,7 @@ import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceComments, sourceTables, sourceViews, sourceViewVersions, tasks, type TaskStatus } from './db/schema';
 import { crossSourceReferrers, pendingMerge } from './mappings';
+import { proposeFromComments } from './knowledge/source-comments';
 import {
   inspectSource, isKeyType, isSoftDeleteType, mongoReadGrant, SOFT_DELETE_NAME, type ListedTable, type SourceComment, type SourceSpec,
   type TableProfile, type WriteGrant,
@@ -120,6 +121,8 @@ async function recordListing(tx: Tx, tenantId: string, sourceId: string, listed:
         },
       });
   }
+  // 注释保存完就在同一事务里生成业务说明提案：失败连同本次列出一起回滚
+  await proposeFromComments(tx, tenantId, sourceId);
 }
 
 /** 同步范围内、源端仍在且可读的表：采集与同步的对象 */
