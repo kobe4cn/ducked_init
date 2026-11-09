@@ -9,11 +9,11 @@ import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb, isUniqueViolation } from './db/client';
-import { mappings, mappingVersions, sources, sourceTables, sourceViews, sourceViewVersions, tasks, type TaskStatus } from './db/schema';
+import { mappings, mappingVersions, sources, sourceComments, sourceTables, sourceViews, sourceViewVersions, tasks, type TaskStatus } from './db/schema';
 import { crossSourceReferrers, pendingMerge } from './mappings';
 import {
-  inspectSource, isKeyType, isSoftDeleteType, mongoReadGrant, SOFT_DELETE_NAME, type ListedTable, type SourceSpec, type TableProfile,
-  type WriteGrant,
+  inspectSource, isKeyType, isSoftDeleteType, mongoReadGrant, SOFT_DELETE_NAME, type ListedTable, type SourceComment, type SourceSpec,
+  type TableProfile, type WriteGrant,
 } from './pipeline/source-engine';
 import type { TaskKind } from './pipeline/handlers';
 import { bronzeSchema, type SyncTableParam } from './pipeline/sync-engine';
@@ -43,6 +43,11 @@ export const largeTableSyncHours = () => Number(process.env.SOURCE_LARGE_TABLE_S
 /** 列出可写对象时最多举几个例子 */
 const GRANT_EXAMPLES = 5;
 
+/** 单个数据源保存的注释条数上限（表注释加列注释）：源端超出时按表、列的顺序取前面的 */
+const COMMENT_ROW_LIMIT = 5000;
+/** 注释原文的最大长度：超出截断（截断后的原文才参与版本比较） */
+const COMMENT_TEXT_LIMIT = 2000;
+
 function describeWriteGrants(user: string | undefined, grants: WriteGrant[]) {
   const shown = grants.slice(0, GRANT_EXAMPLES).map(g => `${g.object}（${g.privileges.join('、')}）`).join('；');
   const more = grants.length > GRANT_EXAMPLES ? `等 ${grants.length} 项` : '';
@@ -63,20 +68,21 @@ function describeNoReadGrants(spec: SourceSpec, unreadable: string[], schemas: s
  * 部分表没有读权限时照常通过，返回这些表（不能选入同步范围）
  */
 async function probe(spec: SourceSpec) {
-  const { tables, unreadable, unreadableSchemas, listed, writable } = await inspectSource(spec, PROBE_LIMITS).catch(e => {
+  const { tables, unreadable, unreadableSchemas, listed, writable, comments } = await inspectSource(spec, PROBE_LIMITS).catch(e => {
     throw new SourceError(`无法连接数据源：${(e as Error).message}`);
   });
   const user = 'user' in spec ? spec.user : undefined;
   if (writable.length) throw new SourceError(describeWriteGrants(user, writable));
   if (!tables.length && unreadable.length) throw new SourceError(describeNoReadGrants(spec, unreadable, unreadableSchemas));
-  return { tables, unreadable, listed };
+  return { tables, unreadable, listed, comments };
 }
 
 /**
  * 把列出表的结果记进 source_tables：新出现的表默认不在同步范围内；源端已经没有的表记下发现的时间，
- * 不移出范围（又出现时清空）。同步范围与成员确认的设置都不变
+ * 不移出范围（又出现时清空）。同步范围与成员确认的设置都不变。
+ * 注释记进 source_comments：先把还活着的都标成消失，下面的写入把仍然存在的清回来，没有清回来的就是源端删掉的
  */
-async function recordListing(tx: Tx, sourceId: string, listed: ListedTable[]) {
+async function recordListing(tx: Tx, tenantId: string, sourceId: string, listed: ListedTable[], comments: SourceComment[]) {
   if (listed.length) {
     await tx.insert(sourceTables)
       .values(listed.map(t => ({ sourceId, tableName: t.name, tableSchema: t.schema, readable: t.readable, estimatedRows: t.estimatedRows })))
@@ -90,6 +96,25 @@ async function recordListing(tx: Tx, sourceId: string, listed: ListedTable[]) {
     isNull(sourceTables.goneAt),
     ...(listed.length ? [notInArray(sourceTables.tableName, listed.map(t => t.name))] : []),
   ));
+  await tx.update(sourceComments).set({ goneAt: new Date() })
+    .where(and(eq(sourceComments.sourceId, sourceId), isNull(sourceComments.goneAt)));
+  const kept = comments.slice(0, COMMENT_ROW_LIMIT).map(c => ({ ...c, text: c.text.slice(0, COMMENT_TEXT_LIMIT) }));
+  if (kept.length) {
+    await tx.insert(sourceComments)
+      .values(kept.map(c => ({
+        tenantId, sourceId, tableSchema: c.schema, tableName: c.table, columnName: c.column ?? '', commentText: c.text, version: 1,
+      })))
+      .onConflictDoUpdate({
+        target: [sourceComments.sourceId, sourceComments.tableSchema, sourceComments.tableName, sourceComments.columnName],
+        set: {
+          commentText: sql`excluded.comment_text`,
+          // 原文没变版本不变，变了 +1；消失又以同原文回来的只清掉消失时间
+          version: sql`case when ${sourceComments.commentText} = excluded.comment_text then ${sourceComments.version} else ${sourceComments.version} + 1 end`,
+          collectedAt: sql`now()`,
+          goneAt: null,
+        },
+      });
+  }
 }
 
 /** 同步范围内、源端仍在且可读的表：采集与同步的对象 */
@@ -131,13 +156,13 @@ export async function registerSource(actor: CurrentMember, input: SourceInput, u
   if (!isSourceKind(kind)) throw new SourceError('请选择数据源类型');
   const name = parseName(input.name);
   const { config, credentials } = await parseSourceInput(actor.tenant.id, kind, input);
-  const { tables, unreadable, listed } = await probe(await resolveSourceSpec(actor.tenant.id, kind, config, credentials));
+  const { tables, unreadable, listed, comments } = await probe(await resolveSourceSpec(actor.tenant.id, kind, config, credentials));
 
   const id = randomUUID();
   const sealed = await encryptForTenant(actor.tenant.id, credentialsContext(id), credentials);
   await uniqueName(name, () => getDb().transaction(async tx => {
     await tx.insert(sources).values({ id, tenantId: actor.tenant.id, spaceId: actor.space.id, name, kind, config, credentials: sealed });
-    await recordListing(tx, id, listed);
+    await recordListing(tx, actor.tenant.id, id, listed, comments);
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
@@ -448,9 +473,9 @@ export async function setSyncScope(actor: CurrentMember, sourceId: string, { add
 /** 重新列出表（源端加了表、删了表或改了权限后），并重新采集同步范围内的表（源表结构变化后）。范围内没有表时只列出表 */
 export async function relistSource(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'sources:write');
-  const { listed } = await probe(await loadSourceSpec(actor.tenant.id, sourceId));
+  const { listed, comments } = await probe(await loadSourceSpec(actor.tenant.id, sourceId));
   return getDb().transaction(async tx => {
-    await recordListing(tx, sourceId, listed);
+    await recordListing(tx, actor.tenant.id, sourceId, listed, comments);
     return enqueueScopedProfile(tx, actor.tenant.id, sourceId);
   });
 }
@@ -471,7 +496,7 @@ export async function updateSource(actor: CurrentMember, sourceId: string, input
   const name = parseName(input.name);
   const previous = await decryptForTenant(actor.tenant.id, credentialsContext(row.id), row.credentials);
   const { config, credentials } = await parseSourceInput(actor.tenant.id, row.kind, input, { config: row.config, credentials: previous });
-  const { listed } = await probe(await resolveSourceSpec(actor.tenant.id, row.kind, config, credentials));
+  const { listed, comments } = await probe(await resolveSourceSpec(actor.tenant.id, row.kind, config, credentials));
 
   const rotated = JSON.stringify(credentials) !== JSON.stringify(previous);
   const changed = Object.keys({ ...row.config, ...config }).filter(k => row.config[k] !== config[k]);
@@ -482,7 +507,7 @@ export async function updateSource(actor: CurrentMember, sourceId: string, input
       ...(rotated && { credentials: await encryptForTenant(actor.tenant.id, credentialsContext(row.id), credentials), credentialsRotatedAt: new Date() }),
       updatedAt: new Date(),
     }).where(and(eq(sources.id, row.id), eq(sources.tenantId, actor.tenant.id)));
-    await recordListing(tx, row.id, listed);
+    await recordListing(tx, row.tenantId, row.id, listed, comments);
     await enqueueScopedProfile(tx, actor.tenant.id, row.id);
     // 审计放在入队之后：记目录版本拿的锁要是事务里最后一个锁（见 catalog/versions.ts）
     await recordAudit(tx, {
