@@ -8,6 +8,7 @@
 // 新建页写需求「用模型生成草稿」填进编辑框、不保存，不过校验时 422 保持原内容，未配置模型服务时 400，查看者 403；标签同样能生成，没有可引用的已发布指标时 400；
 // 指标新建页默认是条件构建器（?mode=builder|yaml）：「检查」只编译给出摘要与编译出的 SQL、不保存（YAML 模式也能检查），
 // 不合法按行列 400（行列号指向生成的 YAML，一并显示；fieldsFor 里没有的字段服务端兜底拦下），保存得到与手写 YAML 一样的草稿；
+// 词表外的聚合也回显进构建器（下拉多一个当前值选项、标出「不支持」）；时间窗口天数 0 / 负数按 window.days 400（客户端不再静默丢掉窗口）；
 // 构建器模式还有一句话解析（intent=parse，#517）：解析结果填进构建器（隐藏字段 form 回显）并逐项说明、未知项与不支持的说法（固定原因说明）、
 // 构建器装不下的维度名显式提示；已有内容时先列差异（intent=applyParse 确认后才覆盖、parsed 不信客户端），失败（422 / 409）表单保持原内容
 import { eq } from 'drizzle-orm';
@@ -131,17 +132,30 @@ describe('指标与标签定义页', () => {
     expect((await post({ intent: 'check', form: JSON.stringify({ base: 'order', agg: 'ratio', numerator: { agg: 'count' } }) })).status).toBe(400);
     expect((await post({ intent: 'check', form: JSON.stringify({ ...form, filter: [{ field: 'status' }, { field: 'status', op: 'eq', value: { x: 1 } }] }) })).status).toBe(200);
 
-    // 聚合在词表外（手工提交才有）：词表外的聚合仍进生成的 YAML、由检查按 measure.agg 报出；回显不进构建器的渲染，整页照常 400 而不是 500
+    // 聚合在词表外（手工提交才有）：词表外的聚合仍进生成的 YAML、由检查按 measure.agg 报出；也回显进构建器（下拉多一个当前值的选项、标出「不支持」），整页照常 400 而不是 500
     const badAgg = await post({ intent: 'check', form: JSON.stringify({ ...form, agg: 'median' }) });
     expect(badAgg.status).toBe(400);
     const badAggPage = await badAgg.text();
     expect(badAggPage).toMatch(/第 \d+ 行第 \d+ 列（measure\.agg）：应为以下之一：/);
     expect(badAggPage).toContain('data-metric-builder');
+    expect(badAggPage).toMatch(/<option[^>]*value="median"[^>]*>median（不支持，请改选）</);
     expect(badAggPage).not.toContain('出错了');
-    // ratio 分子的聚合在词表外也一样：measure.numerator.agg 按行列报出，不落库
+    // ratio 分子的聚合在词表外也一样：measure.numerator.agg 按行列报出，回显进构建器，不落库
     const badPart = await post({ intent: 'check', form: JSON.stringify({ ...ratio, numerator: { agg: 'median', filter: [] } }) });
     expect(badPart.status).toBe(400);
-    expect(await badPart.text()).toMatch(/（measure\.numerator\.agg）：应为以下之一：/);
+    const badPartPage = await badPart.text();
+    expect(badPartPage).toMatch(/（measure\.numerator\.agg）：应为以下之一：/);
+    expect(badPartPage).toMatch(/<option[^>]*value="median"[^>]*>median（不支持，请改选）</);
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
+    // 天数 0 / 负数：客户端不再静默丢掉时间窗口（与直接 POST 同样的值一致），检查与保存都按 window.days 400、不落库
+    for (const days of [0, -1]) {
+      for (const intent of ['check', 'save'] as const) {
+        const badDays = await post({ intent, form: JSON.stringify({ ...form, window: { field: 'paid_at', days } }) });
+        expect(badDays.status).toBe(400);
+        expect(await badDays.text()).toMatch(/（window\.days）：应不小于 1/);
+      }
+    }
     expect(await getDb().select().from(dslVersions)).toHaveLength(0);
 
     // YAML 模式也能只检查不保存
