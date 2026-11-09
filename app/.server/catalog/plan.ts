@@ -67,6 +67,8 @@ export interface AnalysisPlan {
   questions: string[];
   /** mode 为 unsupported 时必填：平台表达不了的原因与可行的下一步 */
   reason?: string;
+  /** 为何选这些条目，给成员看（计划卡「为何选」） */
+  rationale?: string;
 }
 
 export type PlanStatus = 'valid' | 'needs_clarification' | 'unsupported' | 'invalid';
@@ -141,6 +143,7 @@ export const PLAN_SCHEMA = {
     },
     questions: { type: 'array', items: { type: 'string', minLength: 1 } },
     reason: { type: 'string', minLength: 1 },
+    rationale: { type: 'string', minLength: 1 },
   },
   allOf: [
     { if: { properties: { mode: { const: 'clarify' } }, required: ['mode'] }, then: { required: ['questions'], properties: { questions: { minItems: 1 } } } },

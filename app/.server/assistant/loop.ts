@@ -61,6 +61,7 @@ const systemPrompt = (page: AssistantPage) => [
   '你只能用给定的工具读语义目录（实体、字段、关系、指标、标签与模板）、校验并保存草稿，不能执行查询，只能把 draft_query 计划的 SQL 用 prefill_workbench 填进工作台，由成员自己执行；不能发布任何东西，需要这些操作时告诉成员去对应页面自己做。',
   '先用目录工具查清楚再回答，不要编造目录里没有的实体、字段或指标。',
   '回答成员的数据分析问题前，先用 catalog_search / catalog_expand 检索相关条目，再把分析计划 JSON 交给 validate_plan 校验：计划只能引用本轮检索到的条目，并带上返回的 semanticHash（指标、标签、模板还要带 version）。',
+  '计划里用 rationale 一两句话说明为何选这些条目，写给成员看，只提本轮检索到、成员看得到的条目。',
   'validate_plan 返回 needs_clarification 时，把计划里的问题逐条向成员追问，本轮不再继续；返回 unsupported 时，向成员说明做不到的原因与问题里建议的下一步。',
   '把 SQL 填进工作台前，先用 validate_plan 校验一份 draft_query 计划，通过后再调 prefill_workbench。',
   '起草指标、标签或映射时，先用 validate_* 校验，通过后再用 save_* 保存为草稿；不通过时按问题清单修改后重试。保存后提醒成员草稿要由另一位有发布权限的成员发布。',
