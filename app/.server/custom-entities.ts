@@ -11,6 +11,7 @@ import { and, desc, eq, exists, inArray, isNull, notExists } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
+import { catalogTx } from './catalog/tx';
 import { getDb, isUniqueViolation } from './db/client';
 import { customEntities, customEntityVersions, mappings, mappingVersions, sources } from './db/schema';
 import { isSensitiveField, publishedPlans } from './mappings';
@@ -499,7 +500,7 @@ export async function discardCustomEntityDraft(actor: CurrentMember, entityId: s
 export async function deleteCustomEntity(actor: CurrentMember, entityId: string) {
   assertCan(actor, 'publish');
   const entity = await requireEntity(actor.tenant.id, entityId);
-  await getDb().transaction(async tx => {
+  await catalogTx(actor.tenant.id, async tx => {
     await lockTenant(tx, actor.tenant.id);
     const [locked] = await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');
     if (!locked) throw new CustomEntityError('自定义实体已被删除', 404);

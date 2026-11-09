@@ -7,6 +7,7 @@ import { and, asc, desc, eq, isNotNull, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
+import { catalogTx } from './catalog/tx';
 import { getDb } from './db/client';
 import { businessNotes, mappings } from './db/schema';
 import { publishedCustomEntities } from './custom-entities';
@@ -43,8 +44,9 @@ function normalizeNote(note: unknown): string {
 }
 
 /**
- * 在给定事务里保存一版说明（接受知识提案时与提案在同一事务里）。实体字段、实体、指标、标签的说明需 definitions:draft，映射字段的（带 mappingId）需 sources:write；
- * 字段的说明只能用 entity / field 形式，targetId 只接受 entity:、metric:、tag:。返回新行 ID
+ * 在给定事务里保存一版说明（接受知识提案时与提案在同一事务里）：自己不开 catalogTx，调用方必须已经在 catalogTx 里，
+ * business_note.updated 这一目录动作才能在事务收尾记一版目录版本（ADR-0054）。实体字段、实体、指标、标签的说明需 definitions:draft，
+ * 映射字段的（带 mappingId）需 sources:write；字段的说明只能用 entity / field 形式，targetId 只接受 entity:、metric:、tag:。返回新行 ID
  */
 export async function saveBusinessNoteTx(tx: Tx, actor: CurrentMember, input: BusinessNoteInput): Promise<string> {
   const tenantId = actor.tenant.id;
@@ -94,7 +96,7 @@ export async function saveBusinessNoteTx(tx: Tx, actor: CurrentMember, input: Bu
 
 /** 保存一版说明，返回新行 ID */
 export const saveBusinessNote = (actor: CurrentMember, input: BusinessNoteInput): Promise<string> =>
-  getDb().transaction(tx => saveBusinessNoteTx(tx, actor, input));
+  catalogTx(actor.tenant.id, tx => saveBusinessNoteTx(tx, actor, input));
 
 /** 本租户每个字段类说明的当前内容（含已清空的空串），键是 noteKey；实体、指标、标签的说明（target_id 非空）不在这里，见 currentTargetNotes */
 export async function currentNotes(db: Tx | ReturnType<typeof getDb>, tenantId: string): Promise<Map<string, string>> {
