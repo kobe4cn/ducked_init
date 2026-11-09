@@ -185,7 +185,7 @@ describe('把知识来源解析成知识提案', () => {
     vi.stubEnv('LLM_API_KEY', '');
     const none = await failure(importFromSource(analyst, source.id));
     expect(none).toMatchObject({ status: 409, message: expect.stringContaining('未配置模型服务') });
-    expect((await calls(acme)).filter(c => c.error === null)).toHaveLength(0); // 409 不发请求，llm_calls 只有 500 那条失败记录
+    expect(await calls(acme)).toHaveLength(1); // 409 不发请求，llm_calls 只有 500 那条失败记录
     await expect(importFromSource(analyst, '00000000-0000-0000-0000-000000000000')).rejects.toMatchObject({ status: 400, message: '没有这个来源' });
   });
 });
