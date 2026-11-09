@@ -46,4 +46,5 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 - [Invite a member](./members.md) covers inviting a data engineer, the members table, the audit row, the console mail, and signing in as that person.
 - [Task list](./tasks.md) covers the empty task list on a freshly seeded tenant.
 - [新建指标（条件构建器）](./metric-builder.md) covers building a metric with the condition builder: check without saving (summary + SQL), save as draft v1, ignored empty rows, invalid forms 400, YAML mode, and handmade `form` submissions.
+- [新建标签（条件构建器）](./tag-builder.md) covers building a tag from published numeric metrics: single/multi-metric rules with one level of all / any, missing-value strategy, default, save as draft v1 with the same YAML as handwritten, and YAML mode.
 - [Audit log](./audit.md) covers the tenant-creation row written by launch. Lake init during launch does not add an audit row.

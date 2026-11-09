@@ -1,10 +1,11 @@
 // app/routes/analytics.definitions.new.tsx —— 新建指标或标签（有起草权限的成员）：种类放在 URL（?kind=metric|tag，默认指标），
 // 填写键与 YAML，校验通过后保存为第 1 版草稿并转到定义页；键不合规或已被占用、YAML 校验不通过时留在本页，按行列列出问题（ADR-0025）。
-// 指标还可以用条件构建器（?mode=builder|yaml，默认构建器；标签只有 YAML）：选实体与字段拼出表单，「检查」只编译给出四句摘要与 SQL、不保存，
-// 保存仍走同一套校验与双人发布。构建器模式下表单只提交键、intent 与隐藏字段 form（MetricForm 的 JSON），字段表不信客户端，服务端按
-// form.base 用 fieldsFor 重取（敏感字段已剔除，ADR-0005）再 formToYaml 成 YAML——与手写 YAML 走完全一样的路（ADR-0017）。
-// 可以写下需求后用模型生成草稿（intent=model-draft，ADR-0035）：生成的 YAML 填进编辑框、不保存，失败时编辑框保持原内容
-// 构建器模式还能写一句话解析（intent=parse，#517）：parseMetricSentence 把句子解析成表单填进构建器并逐项说明，
+// 指标与标签还可以用条件构建器（?mode=builder|yaml，默认构建器）：指标选实体与字段拼出表单，「检查」只编译给出四句摘要与 SQL、不保存；
+// 标签选已发布的数值指标拼规则（单指标 / 多指标，all / any 一层），不加「检查」——保存时 checkTag 按行列报问题。保存仍走同一套校验与双人发布。
+// 构建器模式下表单只提交键、intent 与隐藏字段 form（MetricForm / TagForm 的 JSON），字段表与指标表不信客户端：指标按 form.base
+// 用 fieldsFor 重取（敏感字段已剔除，ADR-0005），标签按 tagFormOf 逐层规整（构建器没有的 readonly 清空），再 formToYaml 成 YAML——与手写 YAML 走完全一样的路（ADR-0017）。
+// 可以写下需求后用模型生成草稿（intent=model-draft，ADR-0035，只在 YAML 模式）：生成的 YAML 填进编辑框、不保存，失败时编辑框保持原内容
+// 指标的构建器模式还能写一句话解析（intent=parse，#517）：parseMetricSentence 把句子解析成表单填进构建器并逐项说明，
 // 已有内容时先列出差异（intent=applyParse 确认后才覆盖），解析失败时表单保持原样
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.new';
@@ -14,15 +15,20 @@ import { createDefinition, DslError, dslContext, modelDraftForDefinition } from 
 import { MetricParseError, parseMetricSentence } from '~/.server/metric-parse';
 import { DSL_KINDS, isDslKind, type DslKind } from '~/.server/pipeline/dsl';
 import { checkMetric, compileMetric, fieldsFor } from '~/.server/pipeline/dsl/metric-spec';
+import { metricOf } from '~/.server/pipeline/dsl/tag-spec';
 import { getDb } from '~/.server/db/client';
 import { todayUtc } from '~/.server/templates';
 import { CANONICAL_ENTITIES, entityOf, type FieldType } from '~/lib/canonical-model';
+import { cmp } from '~/lib/compare';
+import { formToYaml as tagFormToYaml, type TagForm } from '~/lib/tag-form';
 import { diffForms, formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
 import { AGGS, RATIO_AGGS } from '~/lib/metric-vocab';
+import { TAG_CONDITIONS, type TagCondition } from '~/lib/tag-vocab';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
 import { formOfEcho, MetricBuilder, type BuilderEntity } from '~/components/metric-builder';
+import { formOfTagEcho, TagBuilder, type TagMetricOption } from '~/components/tag-builder';
 import { MetricParsePanel } from '~/components/metric-parse-panel';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
@@ -132,6 +138,48 @@ function builderFormOf(text: string): MetricForm {
   };
 }
 
+/**
+ * 标签构建器隐藏字段 form（TagForm 的 JSON）→ 表单状态：只收构建器有的控件（readonly 一律清空——构建器没有这种控件，也不回传客户端的只读项），
+ * 不信客户端：每一层都按类型规整，读不出来的规则、条件行丢掉，空表单交给 checkTag 按行列报问题（不在这里替客户端猜）
+ */
+function tagFormOf(text: string): TagForm {
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch { throw new DslError('构建器的内容读不出来，请刷新页面重试'); }
+  const v = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  const cmpOf = (c: unknown) => (Array.isArray(c) ? c.flatMap((x): { op: TagCondition; value: number }[] => {
+    if (!x || typeof x !== 'object' || Array.isArray(x)) return [];
+    const { op, value } = x as Record<string, unknown>;
+    // 比较运算是否合法交给 checkTag；这里只收构建器能产生的形状（词表内的 op + 有限数字）
+    return typeof op === 'string' && (TAG_CONDITIONS as readonly string[]).includes(op) && typeof value === 'number' && Number.isFinite(value)
+      ? [{ op: op as TagCondition, value }]
+      : [];
+  }) : []);
+  const rules = (Array.isArray(v.rules) ? v.rules : []).flatMap((r): TagForm['rules'] => {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return [];
+    const { value, combinator, items } = r as Record<string, unknown>;
+    if (typeof value !== 'string' && typeof value !== 'number') return [];
+    const read = (Array.isArray(items) ? items : []).flatMap((it): TagForm['rules'][number]['items'] => {
+      if (!it || typeof it !== 'object' || Array.isArray(it)) return [];
+      const { metric, cmp } = it as Record<string, unknown>;
+      const c = cmpOf(cmp);
+      return typeof metric === 'string' && c.length ? [{ metric, cmp: c }] : [];
+    });
+    return read.length ? [{ value, combinator: combinator === 'any' ? 'any' : 'all', items: read }] : [];
+  });
+  const missing = (v.missing && typeof v.missing === 'object' && !Array.isArray(v.missing) ? v.missing : {}) as Record<string, unknown>;
+  const scalar = (x: unknown): string | number | '' => (typeof x === 'number' && Number.isFinite(x) ? x : typeof x === 'string' ? x : '');
+  return {
+    single: v.single !== false,
+    ...(typeof v.metric === 'string' && v.metric ? { metric: v.metric } : {}),
+    rules,
+    missing: Object.fromEntries(Object.entries(missing).flatMap(([key, x]): [string, number | null][] =>
+      x === null || typeof x === 'number' && Number.isFinite(x) ? [[key, x]] : [])),
+    default: scalar(v.default),
+    ...(typeof v.description === 'string' ? { description: v.description } : {}),
+    readonly: [],
+  };
+}
+
 /** 指标构建器可选的基础实体：标准实体与已发布的自定义实体，字段取 fieldsFor（undefined 不列出）；不做 consumerHop 过滤，不能做基础实体的交给检查报错 */
 function builderEntities(
   published: Iterable<{ name: string }>,
@@ -156,17 +204,26 @@ export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'definitions:draft');
   const url = new URL(request.url);
   const kind = kindOf(url.searchParams.get('kind'));
-  // 指标的编辑模式放在 URL（&mode=builder|yaml，默认构建器）；标签只有 YAML，不显示切换
-  const mode = kind === 'metric' && url.searchParams.get('mode') === 'yaml' ? 'yaml' : 'builder';
+  // 指标与标签的编辑模式都放在 URL（&mode=builder|yaml，默认构建器）
+  const mode = url.searchParams.get('mode') === 'yaml' ? 'yaml' : 'builder';
   let entities: BuilderEntity[] | undefined;
   if (kind === 'metric') {
     const ctx = await dslContext(getDb(), member.tenant.id);
     entities = builderEntities(ctx.published.values(), await publishedCustomEntities(getDb(), member.tenant.id), ctx);
   }
+  // 标签构建器可选的指标：本租户已发布、没有维度、取值为数字的（metricOf），显示名用指标说明
+  let tagMetrics: TagMetricOption[] | undefined;
+  if (kind === 'tag') {
+    const ctx = await dslContext(getDb(), member.tenant.id);
+    tagMetrics = [...ctx.metrics.keys()].sort(cmp).flatMap(key => {
+      const metric = metricOf(key, ctx);
+      return typeof metric === 'string' ? [] : [{ key, label: metric.description ?? key }];
+    });
+  }
   return {
     email: member.email, nav: navFor(member), kind, label: DSL_KINDS[kind].label,
     kinds: (Object.keys(DSL_KINDS) as DslKind[]).map(k => ({ key: k, label: DSL_KINDS[k].label })),
-    mode, entities,
+    mode, entities, tagMetrics,
   };
 }
 
@@ -180,12 +237,14 @@ export async function action({ request }: Route.ActionArgs) {
   const intent = form.get('intent');
   /** 一句话解析的句子（构建器模式的「一句话」框；YAML 模式的需求框是 request，两边各回显各的） */
   const sentence = String(form.get('sentence') ?? '');
-  /** 构建器模式：隐藏字段 form 是 MetricForm 的 JSON（YAML 模式不提交它） */
-  const builder = kind === 'metric' && form.has('form') ? String(form.get('form')) : undefined;
+  /** 构建器模式：隐藏字段 form 是 MetricForm（指标）或 TagForm（标签）的 JSON（YAML 模式不提交它） */
+  const builder = (kind === 'metric' || kind === 'tag') && form.has('form') ? String(form.get('form')) : undefined;
   /** 回显给构建器的是服务端规整过的表单，不原样回传客户端的内容（读不出来、聚合在词表外就不回显） */
-  const echo = builder === undefined ? undefined : (() => { try { return echoable(builderFormOf(builder)); } catch { return undefined; } })();
+  const echo = kind !== 'metric' || builder === undefined ? undefined : (() => { try { return echoable(builderFormOf(builder)); } catch { return undefined; } })();
+  /** 标签构建器的回显同样是服务端规整过的表单（tagFormOf 只在 JSON 读不出时不回显） */
+  const tagEcho = kind !== 'tag' || builder === undefined ? undefined : (() => { try { return JSON.stringify(tagFormOf(builder)); } catch { return undefined; } })();
   /** 各分支共有的回显；parse / parsed / diff 只在 intent=parse 的应答里有，这里占位让组件能统一读 */
-  const keep = { key, request: requirement, generated: false, form: echo, sentence, parse: undefined, parsed: undefined, diff: undefined };
+  const keep = { key, request: requirement, generated: false, form: echo, tagForm: tagEcho, sentence, parse: undefined, parsed: undefined, diff: undefined };
   let yaml = yamlInput;
   try {
     if (intent === 'model-draft') {
@@ -243,6 +302,8 @@ export async function action({ request }: Route.ActionArgs) {
         return { error: null, issues: [], yaml, summary: summarize(formState, labelled), sql: compileMetric(result.spec, ctx, todayUtc()), ...keep };
       }
     }
+    // 标签的构建器提交：规整成表单后生成 YAML，落到下面同一套校验与保存（标签没有「检查」：不合法由 createDefinition 按行列 400）
+    if (kind === 'tag' && builder !== undefined) yaml = tagFormToYaml(tagFormOf(builder));
     await createDefinition(member, kind, key, yaml);
   } catch (e) {
     // MetricParseError（空句 / 超长 400、未配置模型服务 409、模型失败或不过校验 422）不是 DslError，不补会变成 500；表单保持原样
@@ -253,11 +314,11 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function NewDefinition({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, kind, label, kinds, mode, entities } = loaderData;
+  const { email, nav, kind, label, kinds, mode, entities, tagMetrics } = loaderData;
   const { placeholder, example, request, sends } = EXAMPLES[kind];
   const submitting = useNavigation().state === 'submitting';
-  // 指标在构建器与 YAML 间切换（切换不带内容过去：新建页不做 YAML → 构建器的转换）；标签只有 YAML
-  const builder = kind === 'metric' && mode !== 'yaml';
+  // 指标与标签都在构建器与 YAML 间切换（切换不带内容过去：新建页不做 YAML → 构建器的转换）
+  const builder = (kind === 'metric' || kind === 'tag') && mode !== 'yaml';
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -269,12 +330,12 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
         current={kind}
         tabs={kinds.map(k => ({ ...k, href: `/analytics/definitions/new?kind=${k.key}` }))}
       />
-      {kind === 'metric' && (
+      {(kind === 'metric' || kind === 'tag') && (
         <PillTabs
           current={builder ? 'builder' : 'yaml'}
           tabs={[
-            { key: 'builder', label: '构建器', href: '/analytics/definitions/new?kind=metric&mode=builder' },
-            { key: 'yaml', label: 'YAML', href: '/analytics/definitions/new?kind=metric&mode=yaml' },
+            { key: 'builder', label: '构建器', href: `/analytics/definitions/new?kind=${kind}&mode=builder` },
+            { key: 'yaml', label: 'YAML', href: `/analytics/definitions/new?kind=${kind}&mode=yaml` },
           ]}
         />
       )}
@@ -292,20 +353,22 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
             </Field>
             {builder ? (
               <>
-                <Field>
-                  <FieldLabel htmlFor="sentence">一句话</FieldLabel>
-                  <textarea
-                    id="sentence" name="sentence" rows={2} defaultValue={actionData?.sentence ?? ''}
-                    placeholder={request}
-                    className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                  />
-                  <FieldDescription>写下要算什么，点「解析一句话」：会把这句话与{sends}发给模型服务，解析结果填进下面的构建器并逐项说明，不会保存；构建器已有内容时先列出差异，确认后才覆盖。</FieldDescription>
-                  <div>
-                    <Button type="submit" name="intent" value="parse" variant="outline" formNoValidate disabled={submitting}>解析一句话</Button>
-                  </div>
-                </Field>
-                {actionData?.parse && <MetricParsePanel parse={actionData.parse} diff={actionData.diff} />}
-                {actionData?.parsed && (
+                {kind === 'metric' && (
+                  <Field>
+                    <FieldLabel htmlFor="sentence">一句话</FieldLabel>
+                    <textarea
+                      id="sentence" name="sentence" rows={2} defaultValue={actionData?.sentence ?? ''}
+                      placeholder={request}
+                      className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                    />
+                    <FieldDescription>写下要算什么，点「解析一句话」：会把这句话与{sends}发给模型服务，解析结果填进下面的构建器并逐项说明，不会保存；构建器已有内容时先列出差异，确认后才覆盖。</FieldDescription>
+                    <div>
+                      <Button type="submit" name="intent" value="parse" variant="outline" formNoValidate disabled={submitting}>解析一句话</Button>
+                    </div>
+                  </Field>
+                )}
+                {kind === 'metric' && actionData?.parse && <MetricParsePanel parse={actionData.parse} diff={actionData.diff} />}
+                {kind === 'metric' && actionData?.parsed && (
                   <div className="flex items-center gap-2">
                     {/* parse 应答里那份解析结果 JSON，确认覆盖时原样提交（服务端仍会规整，不信客户端） */}
                     <input type="hidden" name="parsed" value={actionData.parsed} />
@@ -313,8 +376,10 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
                     <span className="text-sm text-slate-500">把构建器当前内容换成解析出的表单。</span>
                   </div>
                 )}
-                {/* MetricBuilder 的 useState 只在挂载时初始化，不换 key 时开着 JS 填不进解析结果 */}
-                <MetricBuilder key={actionData?.form ?? 'empty'} entities={entities ?? []} defaultForm={formOfEcho(actionData?.form)} />
+                {/* 构建器的 useState 只在挂载时初始化，不换 key 时开着 JS 回显填不进规整后的表单 */}
+                {kind === 'metric'
+                  ? <MetricBuilder key={actionData?.form ?? 'empty'} entities={entities ?? []} defaultForm={formOfEcho(actionData?.form)} />
+                  : <TagBuilder key={actionData?.tagForm ?? 'empty'} metrics={tagMetrics ?? []} defaultForm={formOfTagEcho(actionData?.tagForm)} />}
               </>
             ) : (
               <>
