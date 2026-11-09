@@ -2,7 +2,8 @@
 // （规则见 knowledge/hub.ts），没有主题的条目在最后的「未归入主题」组。点条目（?item=<targetId>）在本页展开与详情页相同的业务知识面板（字段不带说明区），
 // 能不能编辑沿用面板的 canEdit（definitions:draft）；提交成功后回到原 URL，列表与计数随之更新。
 // 主题组的「生成建议」（ADR-0046 入口③，#513）同步按主题生成一批提案：成功 302 回集中页带计数，查看者由 suggestForSubject 内部抛 403。
-// 页头的「应用标准模板包」（ADR-0046 入口②，#521）把标准包按租户用到的实体展开成提案：成功同样 302 回集中页带计数，查看者由 applyStandardPackFor 抛 403
+// 页头的「应用标准模板包」（ADR-0046 入口②，#521）把标准包按租户用到的实体展开成提案：成功同样 302 回集中页带计数，查看者由 applyStandardPackFor 抛 403。
+// 页头的「粘贴导入」（ADR-0046 入口③，#527）进 /knowledge/import 粘贴文档原文：成功 302 回集中页带《标题》与计数，入口只对有起草权限的成员显示
 import type { Route } from './+types/knowledge';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleHelp, Inbox, PackageCheck, Sparkles } from 'lucide-react';
@@ -64,7 +65,14 @@ export async function loader({ request }: Route.LoaderArgs) {
     created: Number(search.get('created')) || 0,
     skipped: Number(search.get('skipped')) || 0,
   };
-  return { email: member.email, nav: navFor(member), hub, selected, subjectIds, canSuggest: can(member.role, 'definitions:draft'), suggested, packApplied };
+  // 刚粘贴导入完 302 回来（?imported=）带出的标题与计数
+  const importedName = search.get('imported');
+  const imported = importedName === null ? null : {
+    title: importedName,
+    created: Number(search.get('created')) || 0,
+    skipped: Number(search.get('skipped')) || 0,
+  };
+  return { email: member.email, nav: navFor(member), hub, selected, subjectIds, canSuggest: can(member.role, 'definitions:draft'), suggested, packApplied, imported };
 }
 
 /** 面板提交（alias.* / claim.* / note.* / subject.* / proposal.*）交给 handleKnowledgeIntent，权限由它按 definitions:draft 判断；出错带 targetId 返回，成功回到原 URL。
@@ -132,7 +140,7 @@ function Item({ item, active }: { item: HubItem; active: boolean }) {
 }
 
 export default function Knowledge({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, hub, selected, subjectIds, canSuggest, suggested, packApplied } = loaderData;
+  const { email, nav, hub, selected, subjectIds, canSuggest, suggested, packApplied, imported } = loaderData;
   // 生成建议同步调模型：生成期间禁用所有「生成建议」防止再起一次调用，只有被点的那组显示「生成中…」；
   // 应用标准模板包同理禁用；面板里的提交（alias.add、proposal.accept 等）不影响这些按钮
   const navigation = useNavigation();
@@ -175,12 +183,15 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
       <PageHeader
         title="业务知识" description="按分析主题列出待确认的知识提案与缺失的口径声明，点开条目在本页处理"
         actions={canSuggest && (
-          <Form method="post">
-            <input type="hidden" name="intent" value="apply-pack" />
-            <Button type="submit" disabled={pendingPack}>
-              <PackageCheck />{pendingPack ? '应用中…' : '应用标准模板包'}
-            </Button>
-          </Form>
+          <div className="flex gap-2">
+            <Button asChild variant="outline"><Link to="/knowledge/import">粘贴导入</Link></Button>
+            <Form method="post">
+              <input type="hidden" name="intent" value="apply-pack" />
+              <Button type="submit" disabled={pendingPack}>
+                <PackageCheck />{pendingPack ? '应用中…' : '应用标准模板包'}
+              </Button>
+            </Form>
+          </div>
         )}
       />
       {packApplied && !actionData?.error && (
@@ -197,6 +208,12 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
               ? `主题「${suggested.subject}」新建 ${suggested.created} 条提案，跳过 ${suggested.skipped} 条`
               : `主题「${suggested.subject}」已按当前内容生成过，没有新提案`}
           </AlertTitle>
+        </Alert>
+      )}
+      {imported && !actionData?.error && (
+        <Alert role="status" className="mb-4">
+          <CheckCircle2 className="text-emerald-600" />
+          <AlertTitle>{`已从《${imported.title}》新建 ${imported.created} 条提案，跳过 ${imported.skipped} 条`}</AlertTitle>
         </Alert>
       )}
       {actionData?.error && !actionData.targetId && (
