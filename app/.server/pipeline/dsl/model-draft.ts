@@ -20,17 +20,41 @@ const SEARCH_TOKENS = 6000;
 
 const capability = (id: string) => toMarkdown(CAPABILITIES.find(c => c.id === id)!);
 
-const METRIC_SYSTEM = [
-  '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（与下面 YAML 示例同样的结构），不要输出别的文字。',
-  '成员的消息里依次是语义目录总览、按需求搜出的目录条目与需求原文。',
+/** 指标能力说明（怎么写指标定义，含 YAML 示例），起草与一句话解析共用 */
+const METRIC_CAPABILITY = capability('capability:metric-dsl');
+
+/** 怎么写指标（起草与一句话解析共用）：只用目录里的东西、类型与取值规则 */
+const METRIC_RULES = [
   '规则：',
   '- 只用目录里列出的实体、字段与关系，不要编造；目录里没有的字段（包括敏感字段）一律不要用。',
   '- sum / avg 只能用整数或小数字段；过滤取值按字段类型写，有取值列表的字段只能用其中的取值。',
   `- filter、measure、window 的字段也能写维度路径，但不能写 ${CONSUMER_ENTITY}.字段。`,
   '- count 数的是基础实体的行数：base 为 order_item 时数的是明细行，要数订单写 { "agg": "count_distinct", "field": "order_id" }。',
   '- 需求没提到的部分不要加；不要输出 device_attribution。',
+];
+
+const METRIC_SYSTEM = [
+  '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（与下面 YAML 示例同样的结构），不要输出别的文字。',
+  '成员的消息里依次是语义目录总览、按需求搜出的目录条目与需求原文。',
+  ...METRIC_RULES,
   '',
-  capability('capability:metric-dsl'),
+  METRIC_CAPABILITY,
+].join('\n');
+
+/** 一句话解析（#516）：spec 是指标定义，另有逐项说明、认不出的词与不支持的说法 */
+const METRIC_PARSE_SYSTEM = [
+  '你是 CRM 数据平台的指标助手：把成员的一句话解析成一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（spec 是指标定义，与下面 YAML 示例同样的结构），不要输出别的文字。',
+  '成员的消息里依次是语义目录总览、按句子搜出的目录条目与句子原文。',
+  ...METRIC_RULES,
+  '解析说明：',
+  '- items 逐项说明 spec 的每个部分是怎么从句子来的：path 用它在 spec 里的位置（如 measure.field、filter.0、window），reason 一句话。',
+  '- 句子里认不出的词照原话进 unknowns（如目录里没有的字段、对应不上的说法），不要猜。',
+  '- 「或」只在同一字段的不同取值时改写成一个 in 过滤（value 是列表）；跨字段的「或」表达不了，整句原话进 unsupported，不写进 spec。',
+  '- 时间只认「近 N 天」，写成 window；「上个月」「今年」等其他时间说法整句原话进 unsupported，不写进 spec。',
+  '- 「分母为 0 时算 0」整句原话进 unsupported：编译用 NULLIF，分母为 0 时结果是空，不是 0。',
+  '- 句子支撑不了的写法不要写进 spec；unsupported 里的说法一律不进 spec。',
+  '',
+  METRIC_CAPABILITY,
 ].join('\n');
 
 const TAG_SYSTEM = [
@@ -79,6 +103,39 @@ export function definitionDraftMessages(kind: DslKind, request: string, catalog:
   const user = [toMarkdown(overview(catalog)), `# 与需求相关的条目\n\n${relevantMarkdown(catalog, request)}`, `# 需求\n\n${request}`].join('\n\n');
   return [
     { role: 'system', content: system },
+    { role: 'user', content: user },
+  ];
+}
+
+/** 一句话解析的输出 Schema（#516）：spec 是指标定义（METRIC_SCHEMA），另有逐项说明、认不出的词与不支持的说法，四个键都必填 */
+export const METRIC_PARSE_SCHEMA = {
+  type: 'object',
+  required: ['spec', 'items', 'unknowns', 'unsupported'],
+  additionalProperties: false,
+  properties: {
+    spec: METRIC_SCHEMA,
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['path', 'reason'],
+        additionalProperties: false,
+        properties: { path: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } },
+      },
+    },
+    unknowns: { type: 'array', items: { type: 'string' } },
+    unsupported: { type: 'array', items: { type: 'string' } },
+  },
+} as const;
+
+/**
+ * 一句话解析成指标表单（#516）发给模型的消息，结构与 definitionDraftMessages 相同：
+ * system 是指标规则（共用）加解析说明，user 依次是目录总览、按句子搜出的条目与句子原文
+ */
+export function metricParseMessages(sentence: string, catalog: Catalog): LlmMessage[] {
+  const user = [toMarkdown(overview(catalog)), `# 与需求相关的条目\n\n${relevantMarkdown(catalog, sentence)}`, `# 句子\n\n${sentence}`].join('\n\n');
+  return [
+    { role: 'system', content: METRIC_PARSE_SYSTEM },
     { role: 'user', content: user },
   ];
 }

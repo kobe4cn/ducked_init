@@ -173,6 +173,11 @@ const ACTIONS = {
     label: '模型生成定义草稿失败',
     describe: (d: Detail) => `${dslLabel(d)}，${d.stage === 'model' ? `模型服务：${d.error}` : `定义校验有 ${d.issues} 处问题`}`,
   },
+  // 一句话解析失败（#516）：口径同 definition.model_draft_failed，只记阶段、错误摘要与问题位置，不记原句、解析说明与取值
+  'definition.metric_parse_failed': {
+    label: '一句话解析成指标表单失败',
+    describe: (d: Detail) => d.stage === 'model' ? `模型服务：${d.error}` : `定义校验有 ${d.issues} 处问题`,
+  },
   'definition.published': {
     label: '发布指标或标签',
     describe: (d: Detail) => `${dslLabel(d)} ${d.key}，第 ${d.version} 版（作者 ${(d.authors as string[]).join('、')}）`,
