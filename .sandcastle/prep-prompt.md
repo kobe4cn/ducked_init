@@ -15,6 +15,7 @@
    - 每张子票都加 `{{LABEL_PICKED}}` 和 `ready-for-agent`，**不加** `{{LABEL_PREPPED}}`（下一轮按上面的 blocker 规则逐张准备，第一张通常没有 open blocker，下一轮会直接确认）。
    - 父票去掉 `{{LABEL_PICKED}}` 和 `ready-for-agent`，正文加 `## Split into`。
    - 别的票若被父票 block，改成被对应子票 block。
+   - 拆票时新开的票（包括从父票挪出去、排在别的票后面的那部分）不能把父票写进 `## Blocked by`：父票拆完只留作容器，不会自动关闭，写了就永远卡住。要等的是哪张子票就写哪张。
 3. **有设计决定要人拍板**：加 `{{LABEL_STUCK}}` 和 `ready-for-human`，评论里写清楚要决定什么、有哪几个选项、你的建议。
 
 遇到设计决定时先按 `.sandcastle/DECISIONS.md` 判断。属于「可以代拍板」的，按那里的步骤留评论、改票（必要时开后续票），然后按结果 1 或 2 继续，不是 3。只有「必须停下」才是 3。
