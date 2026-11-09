@@ -4,6 +4,7 @@ import { desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand, search, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
+import { catalogTx } from '../../app/.server/catalog/tx';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, catalogVersions, semanticClaims } from '../../app/.server/db/schema';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
@@ -84,8 +85,8 @@ describe('口径声明', () => {
       .toEqual([['time_meaning', 'pay_time', author.email]]);
     expect(await claimHistory(getDb(), acme, 'field:order.status')).toHaveLength(1);
 
-    // 同一事务里同一类型存两次（接受知识提案时可能发生）：后存的生效
-    await getDb().transaction(async tx => {
+    // 同一 catalogTx 里同一类型存两次（接受知识提案时可能发生）：后存的生效，也只记一版目录
+    await catalogTx(acme, async tx => {
       await saveClaimTx(tx, analyst, { targetId: 'entity:order', type: 'time_meaning', value: 'ship_time' });
       await saveClaimTx(tx, analyst, { targetId: 'entity:order', type: 'time_meaning', value: 'order_time' });
     });

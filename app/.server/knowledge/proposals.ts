@@ -8,6 +8,7 @@ import { assertCan } from '../access';
 import { recordAudit, type Tx } from '../audit';
 import { sha256, type CurrentMember } from '../auth';
 import { NOTE_MAX_LENGTH, saveBusinessNoteTx } from '../business-notes';
+import { catalogTx } from '../catalog/tx';
 import { getDb } from '../db/client';
 import {
   knowledgeProposals, type ProposalContent, type ProposalContentOf, type ProposalEvidence, type ProposalKind, type ProposalStatus,
@@ -231,7 +232,7 @@ function checkKind<K extends ProposalKind>(
 export async function acceptProposal(actor: CurrentMember, id: string, edits?: unknown): Promise<Proposal> {
   assertCanTouchKnowledge(actor);
   const tenantId = actor.tenant.id;
-  return getDb().transaction(async tx => {
+  return catalogTx(tenantId, async tx => {
     const p = await lockPending(tx, actor, id);
     // 主题归属不提供修改后接受：改 subjectId 等于把条目改归别的主题，面板不渲染入口，这里挡住直接提交
     if (p.kind === 'subject' && edits !== undefined) throw new KnowledgeError('主题归属提案不能修改后接受');
