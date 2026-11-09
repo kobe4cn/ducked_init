@@ -368,7 +368,7 @@ export async function s3SourceFiles(tenantId: string) {
  * orders 表带自增主键与 updated_at，表与 order_id 列带注释（amount、updated_at 没有：空串视为没有注释）；
  * 只读账号与对 orders 可写的账号。返回登记时提交的公共字段（不含账号）
  */
-export async function seedMysqlSource() {
+export async function seedMysqlSource(opts: { withView?: boolean } = {}) {
   const url = new URL(process.env.TEST_MYSQL_URL!);
   const db = url.pathname.slice(1);
   const instance = await DuckDBInstance.create(':memory:');
@@ -381,6 +381,7 @@ export async function seedMysqlSource() {
     await exec(`CREATE DATABASE ${db}`);
     await exec(`CREATE TABLE ${db}.orders (order_id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '订单号', amount DECIMAL(10, 2) NOT NULL, updated_at DATETIME NOT NULL) COMMENT='订单表'`);
     await exec(`INSERT INTO ${db}.orders (amount, updated_at) VALUES (10, '2024-06-01 10:00:00'), (20, '2024-06-02 10:00:00'), (30, '2024-06-03 10:00:00')`);
+    if (opts.withView) await exec(`CREATE VIEW ${db}.orders_v AS SELECT order_id FROM ${db}.orders`);
     for (const { user, password } of [READER, WRITER]) {
       await exec(`DROP USER IF EXISTS '${user}'@'%'`);
       await exec(`CREATE USER '${user}'@'%' IDENTIFIED BY '${password.replace(/'/g, "''")}'`);

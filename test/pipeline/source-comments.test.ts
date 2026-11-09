@@ -96,14 +96,16 @@ describe('PostgreSQL 表注释与列注释', () => {
 });
 
 describe.skipIf(!process.env.TEST_MYSQL_URL)('MySQL 表注释与列注释', () => {
-  it('登记时采到 TABLE_COMMENT / COLUMN_COMMENT；空串视为没有注释', async () => {
+  it('登记时采到 TABLE_COMMENT / COLUMN_COMMENT；空串视为没有注释；视图的 TABLE_COMMENT（固定为 VIEW）不算注释', async () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
-    const base = await seedMysqlSource();
+    const base = await seedMysqlSource({ withView: true });
     const { id } = await registerSource(engineer, { ...base, name: '订单库', ...READER });
+    // orders_v 没有表注释；它的 order_id 列注释继承自基表 orders.order_id，是真注释，照样采
     expect(await savedComments(id)).toEqual([
       { at: `${base.database}.orders`, text: '订单表' },
       { at: `${base.database}.orders.order_id`, text: '订单号' },
+      { at: `${base.database}.orders_v.order_id`, text: '订单号' },
     ]);
   });
 });
