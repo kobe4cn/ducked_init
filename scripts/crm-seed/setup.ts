@@ -20,6 +20,7 @@ import { type KeyCheckTaskParams, type KeyCheckTaskResult } from '../../app/.ser
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, listSourceViews, publishSourceView } from '../../app/.server/source-views';
 import { confirmKey, confirmSoftDelete, confirmedTables, confirmWatermark, getSource, listSources, registerSource, setSyncScope, updateSource } from '../../app/.server/sources';
+import { enqueueTask, type InputOf } from '../../app/.server/tasks';
 import { createTenant, tenantIdBySlug } from '../../app/.server/tenants';
 import { duplicateKeyText } from '../../app/lib/sources';
 import { memberOf } from '../../test/pipeline/fixtures';
@@ -229,7 +230,7 @@ if (step('recompute')) {
     .where(and(eq(tasks.tenantId, tenantId!), eq(tasks.kind, 'gold.dsl')))
     .orderBy(sql`${tasks.params}->>'kind'`, sql`${tasks.params}->>'key'`, desc(tasks.createdAt));
   const asOf = new Date().toISOString().slice(0, 10);
-  for (const { params } of last) await getDb().insert(tasks).values({ tenantId: tenantId!, kind: 'gold.dsl', params: { ...params, asOf } });
+  for (const { params } of last) await enqueueTask(tenantId!, 'gold.dsl', { ...(params as InputOf<'gold.dsl'>), asOf });
   log(`重新入队 ${last.length} 个指标与标签（asOf ${asOf}）`);
   await drain('指标与标签计算');
 }
