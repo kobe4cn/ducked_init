@@ -2,10 +2,14 @@
 // 实际用到的实体展开成知识提案，成员在集中页接受（可以先改值）才生效，包不直接写知识。只处理已发布映射写入的实体的条目——tenantCatalog 不论有没有映射
 // 都列出全部标准实体，不能用它判断实体在不在用。目标上已有同类知识的跳过（计 skipped）：别名与已有别名去首尾空白、不分大小写地相同；口径该类型已有声明
 // （不管取值，成员声明过的优先于包）；说明已有非空值（清空过的空串不算）。重跑不重复、拒绝过的不再出现、内容变了提新提案、旧的未处理提案保留，
-// 都由 proposeMany 的指纹（目标 + 种类 + 内容 + 依据摘要，不含 generatorVersion 与证据）保证。调用方负责权限与事务；包是代码数据，
-// packErrors 校验不过说明包本身有 bug，直接抛错不用温和的 invalid 计数
-import { type Tx } from '../audit';
+// 都由 proposeMany 的指纹（目标 + 种类 + 内容 + 依据摘要，不含 generatorVersion 与证据）保证。包是代码数据，
+// packErrors 校验不过说明包本身有 bug，直接抛错不用温和的 invalid 计数。
+// applyStandardPack 不查权限、不开事务；集中页按钮的入口是 #521 的 applyStandardPackFor：查权限后在同一事务里应用并记审计
+import { assertCan } from '../access';
+import { recordAudit, type Tx } from '../audit';
+import type { CurrentMember } from '../auth';
 import { currentNotes, NOTE_MAX_LENGTH } from '../business-notes';
+import { getDb } from '../db/client';
 import { publishedPlans } from '../mappings';
 import { noteKey } from '../../lib/business-note-key';
 import { PACK_VERSION, packErrors, packTargetOf, STANDARD_PACK, type PackEntry } from '../../lib/standard-pack';
@@ -55,4 +59,31 @@ export async function applyStandardPack(
     }
   }
   return { ...await proposeMany(tx, tenantId, inputs), skipped };
+}
+
+/** 集中页「应用标准模板包」的结果（#521）：包版本与各类计数；skipped 汇总包里跳过的、已有的、拒绝过的、不合法与依据已变的 */
+export interface PackApplied {
+  version: number;
+  created: number;
+  existing: number;
+  rejected: number;
+  skipped: number;
+}
+
+/**
+ * 集中页「应用标准模板包」按钮的入口（#521）：查权限（要 definitions:draft，查看者 403）后在同一事务里应用当前包并记审计，
+ * 返回版本与计数供页面提示；detail 只有版本与计数，不记包内容（ADR-0046，不进 CATALOG_ACTIONS——提案接受前不进目录）
+ */
+export async function applyStandardPackFor(member: CurrentMember): Promise<PackApplied> {
+  assertCan(member, 'definitions:draft');
+  return getDb().transaction(async tx => {
+    const r = await applyStandardPack(tx, member.tenant.id);
+    const skipped = r.skipped + r.existing + r.rejected + r.invalid.length + r.stale;
+    await recordAudit(tx, {
+      tenantId: member.tenant.id, actor: member, action: 'knowledge_proposal.pack_applied',
+      targetType: 'tenant', targetId: member.tenant.id,
+      detail: { packVersion: PACK_VERSION, created: r.created.length, existing: r.existing, rejected: r.rejected, skipped },
+    });
+    return { version: PACK_VERSION, created: r.created.length, existing: r.existing, rejected: r.rejected, skipped };
+  });
 }

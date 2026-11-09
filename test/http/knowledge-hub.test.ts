@@ -1,7 +1,10 @@
 // test/http/knowledge-hub.test.ts —— 业务知识集中页 /knowledge（ADR-0046）的 HTTP 接缝：按分析主题分组列出待确认提案数与缺失项（金额字段的单位与币种、指标的单位），
 // 「未声明」与「未知」分开写，没有主题的条目进「未归入主题」组；?item= 在本页展开同一个业务知识面板，处理后 302 回原 URL、列表随之更新；查看者只读、提交 403；
-// 主题组的「生成建议」按钮按主题同步生成提案（#513），302 回集中页带计数，未配置模型服务 409
+// 主题组的「生成建议」按钮按主题同步生成提案（#513），302 回集中页带计数，未配置模型服务 409；
+// 页头的「应用标准模板包」按钮（#521）把标准包按租户用到的实体生成提案，302 回集中页带计数
+import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { auditLogs } from '../../app/.server/db/schema';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { addAlias } from '../../app/.server/knowledge/aliases';
 import { saveClaim } from '../../app/.server/knowledge/claims';
@@ -202,4 +205,42 @@ describe('业务知识集中页', () => {
     expect(html).not.toContain('生成建议');
     expect((await viewer.post('/knowledge', { intent: 'suggest', subjectId })).status).toBe(403);
   }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），还有 2 次登录、1 次模型替身与约 10 次请求，4 个 worker 并行时超过默认的 90 s
+
+  it('页头有「应用标准模板包」按钮：提交 302 回集中页带计数、提案都落在「未归入主题」组；再点全部计入跳过；审计记 pack_applied；查看者没有按钮、提交 403', async () => {
+    const { acme } = await setup();
+    const an = await loginAs(app, 'an@acme.com');
+
+    const html = await pageOf(an);
+    expect(html).toContain('name="intent" value="apply-pack"');
+
+    // 第一次：租户用到的 order、customer 两个字段族全部生成（order 16 条 + customer 4 条，以包内容为准）
+    let res = await an.post('/knowledge', { intent: 'apply-pack' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/knowledge?pack=1&created=20&skipped=0');
+    let applied = await pageOf(an, res.headers.get('location')!);
+    expect(applied).toContain('已应用标准模板包：新建 20 条提案，跳过 0 条');
+    expect(statOf(applied, '待确认提案')).toBe('20');
+    // 标准包的目标是 field:order.* / field:customer.*，不属于任何主题，提案都在「未归入主题」组
+    const none = groupOf(applied, 'none');
+    expect(none).toContain('20 条待确认提案');
+    expect(itemOf(none, 'field:order.amount')).toContain('5 条待确认');
+    const audits = await getDb().select().from(auditLogs)
+      .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'knowledge_proposal.pack_applied')));
+    expect(audits).toHaveLength(1);
+    expect(audits[0].detail).toMatchObject({ packVersion: 1, created: 20, existing: 0, rejected: 0, skipped: 0 });
+
+    // 同样的内容已经提过：没有新提案，全部计入跳过
+    res = await an.post('/knowledge', { intent: 'apply-pack' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/knowledge?pack=1&created=0&skipped=20');
+    applied = await pageOf(an, res.headers.get('location')!);
+    expect(applied).toContain('已应用标准模板包：新建 0 条提案，跳过 20 条');
+
+    // 查看者看不到按钮，直接提交 403
+    const viewer = await loginAs(app, 'view@acme.com');
+    const viewerHtml = await pageOf(viewer);
+    expect(viewerHtml).not.toContain('name="intent" value="apply-pack"');
+    expect(viewerHtml).not.toContain('应用标准模板包');
+    expect((await viewer.post('/knowledge', { intent: 'apply-pack' })).status).toBe(403);
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），还有 2 次登录与约 7 次请求，4 个 worker 并行时超过默认的 90 s
 });
