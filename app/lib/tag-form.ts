@@ -30,6 +30,7 @@ export interface TagForm {
 }
 
 const UNKNOWN = '这种写法表单不认识，请在 YAML 里修改';
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isCondition = (v: unknown): v is TagCondition => typeof v === 'string' && (TAG_CONDITIONS as readonly string[]).includes(v);
 /** 取值或默认值为空（checkTag 的 blank：字符串去空白后是空串） */
 const blank = (v: string | number | '') => String(v).trim() === '';
@@ -111,6 +112,14 @@ export function yamlToForm(text: string): TagForm {
   return form;
 }
 
+/** 只读规则 raw 里能读到的指标键：when.all / when.any 里各 item 的 metric（读不出的跳过） */
+function rawMetricsOf(raw: unknown): string[] {
+  const when = isObj(raw) ? raw.when : undefined;
+  if (!isObj(when)) return [];
+  return [when.all, when.any].flatMap(list => (Array.isArray(list) ? list : []))
+    .flatMap(item => (isObj(item) && typeof item.metric === 'string' ? [item.metric] : []));
+}
+
 /** 表单里留下来的条件行（比较的取值是有限数字）；NaN / Infinity 丢掉 */
 const cmpOf = (cmp: readonly TagItem['cmp'][number][]) => cmp.filter(c => isCondition(c.op) && typeof c.value === 'number' && Number.isFinite(c.value));
 
@@ -134,6 +143,12 @@ export function formToYaml(form: TagForm): string {
   });
   const cmpObj = (item: TagItem) => Object.fromEntries(item.cmp.map(c => [c.op, c.value]));
   const referenced = new Set(clean.flatMap(rule => rule.items.map(item => item.metric)));
+  // 只读的整条规则也可能引用指标（单指标看顶层 metric，多指标看 when.all / when.any 里各 item 的 metric），它们的 missing 不能丢
+  for (const r of form.readonly) {
+    if (!/^rules\.\d+$/.test(r.key)) continue;
+    if (form.single) { if (form.metric) referenced.add(form.metric); continue; }
+    for (const metric of rawMetricsOf(r.raw)) referenced.add(metric);
+  }
   const missing = Object.fromEntries(Object.entries(form.missing).filter(([key]) => referenced.has(key)));
   const spec: Record<string, unknown> = {
     ...(form.single ? { metric: form.metric ?? '' } : {}),

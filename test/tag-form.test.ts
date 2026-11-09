@@ -167,6 +167,20 @@ default: low
     expect(form.readonly.map(r => r.key)).toEqual(['rules.0']);
     expect(parse(formToYaml(form))).toEqual(parse(yaml));
   });
+
+  it('只被只读规则引用的指标，missing 里的取值写回不丢', () => {
+    const yaml = `rules:
+  - value: a
+    when: { all: [{ metric: foo, gte: 1 }, { any: [] }] }
+  - value: b
+    when: { any: [{ metric: bar, gte: 2 }] }
+missing: { foo: 0, bar: null }
+default: c
+`;
+    const form = yamlToForm(yaml);
+    expect(form.readonly.map(r => r.key)).toEqual(['rules.0']);
+    expect(parse(formToYaml(form))).toEqual(parse(yaml));
+  });
 });
 
 describe('词汇表', () => {
