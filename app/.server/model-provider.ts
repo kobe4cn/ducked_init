@@ -239,7 +239,7 @@ export async function testEmbeddingProvider(actor: CurrentMember): Promise<Embed
  * 平台默认或档位换了模型）返回 null。没配置模型服务、没探测过时也是 null。route 由助手一轮开始时传入，
  * 与本轮用的同一套；其他调用方不传、在这里解析
  */
-export async function toolSupport(tenantId: string, route?: LlmRoute | null): Promise<boolean | null> {
+export async function toolSupport(tenantId: string, route?: LlmRoute): Promise<boolean | null> {
   const row = await rowOf(tenantId);
   if (row?.toolsSupported == null) return null;
   const { provider } = route ?? await resolveRoute(tenantId, 'assistant') ?? {};
