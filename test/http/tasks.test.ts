@@ -9,8 +9,8 @@ import { tasks } from '../../app/.server/db/schema';
 import { getTenantLake, tenantDataPath } from '../../app/.server/lake';
 import { requestLakeMigration } from '../../app/.server/lake-migration';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
-import { enqueueTask } from '../../app/.server/tasks';
-import { newTenant, runTask } from '../pipeline/fixtures';
+import { enqueueTask, type TaskKind } from '../../app/.server/tasks';
+import { drain, newTenant, runTask } from '../pipeline/fixtures';
 import { WORKER_SUFFIX } from '../setup-env';
 import { createOperator, loginAs, loginAsOperator, resetDb, startApp, type TestApp } from './harness';
 
@@ -28,7 +28,9 @@ describe('成员查看本租户的任务', () => {
     const acme = await newTenant('acme');
     const globex = await newTenant('globex');
     await runTask(acme, 'lake.inventory');
-    await runTask(acme, 'demo.seed', { customers: 0 });
+    // 参数不合法：入队校验上线前的任务直接插进队列（裸插），工作进程一侧照样校验并记为失败
+    await getDb().insert(tasks).values({ tenantId: acme, kind: 'demo.seed', params: { customers: 0 } });
+    await drain();
     await runTask(globex, 'lake.inventory');
     // 最后入队、不再派发：保持排队中
     await enqueueTask(acme, 'demo.seed', { customers: 10 });
@@ -73,12 +75,13 @@ describe('成员查看本租户的任务', () => {
 
   it('同步与核对任务的结果按表展示，读不到行数的表不报错', async () => {
     const acme = await newTenant('acme');
-    const finish = async (kind: string, result: Record<string, unknown>) => {
-      const task = await enqueueTask(acme, kind, { sourceId: 'x' });
+    // 参数只够领取（sourceId）、不够入队校验：裸插再直接改状态
+    const finish = async (kind: TaskKind, params: Record<string, unknown>, result: Record<string, unknown>) => {
+      const [task] = await getDb().insert(tasks).values({ tenantId: acme, kind, params }).returning();
       await getDb().update(tasks).set({ status: 'succeeded', result, finishedAt: new Date() }).where(eq(tasks.id, task.id));
     };
-    await finish('source.sync', { tables: [{ table: 'orders', rows: 3 }, { table: 'gone_table', error: '源端已没有这张表', gone: true }] });
-    await finish('source.verify', { tables: [{ table: 'customers', sourceRows: 12, ok: true }, { table: 'secret', sourceRows: null, ok: null }], differences: 0 });
+    await finish('source.sync', { sourceId: 'x' }, { tables: [{ table: 'orders', rows: 3 }, { table: 'gone_table', error: '源端已没有这张表', gone: true }] });
+    await finish('source.verify', { sourceId: 'x' }, { tables: [{ table: 'customers', sourceRows: 12, ok: true }, { table: 'secret', sourceRows: null, ok: null }], differences: 0 });
 
     const admin = await loginAs(app, 'admin@acme.com');
     const res = await admin.get('/tasks');
@@ -92,8 +95,9 @@ describe('成员查看本租户的任务', () => {
 
   it('RFM 分层任务展示快照表与打通不到消费者的订单，快照过期任务列出删除的表', async () => {
     const acme = await newTenant('acme');
-    const finish = async (kind: string, result: Record<string, unknown>) => {
-      const task = await enqueueTask(acme, kind, {});
+    // gold.expire 的 {} 过不了入队校验：裸插再直接改状态
+    const finish = async (kind: TaskKind, result: Record<string, unknown>) => {
+      const [task] = await getDb().insert(tasks).values({ tenantId: acme, kind, params: {} }).returning();
       await getDb().update(tasks).set({ status: 'succeeded', result, finishedAt: new Date() }).where(eq(tasks.id, task.id));
     };
     const rfmTable = 'gold.rfm__791a674d-0000-4000-8000-000000000000';

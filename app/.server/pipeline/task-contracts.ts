@@ -49,9 +49,11 @@ const error = (message: string) => ({ error: message });
 
 /**
  * 契约的参数 schema：zod 校验，不合法时抛第一条文案；通过后按 T（工作进程要用的参数类型）返回。
- * 深层形状（如合并计划里各列的表达式）发布时已校验过，这里与原手写校验一样只核对形状，T 里更深的类型由发布侧保证
+ * 深层形状（如合并计划里各列的表达式）发布时已校验过，这里与原手写校验一样只核对形状，T 里更深的类型由发布侧保证。
+ * I 是入参类型（insertTask / enqueueTask 的参数，InputOf 从这里取）：schema 里带 .default 的项在入参上可省略，
+ * 只是个类型载体，运行时不变
  */
-const params = <T>(schema: z.ZodType): { parse(raw: unknown): T } => ({
+const params = <T, I = T>(schema: z.ZodType): { parse(raw: unknown): T; readonly __input?: I } => ({
   parse(raw: unknown): T {
     const parsed = schema.safeParse(raw);
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? '参数不合法');
@@ -171,6 +173,17 @@ export interface MergeParams {
   relations: RelationParam[];
 }
 
+/** silver.merge 的入参（insertTask 用）：schema 里带缺省值的项可省略；identity 是入队时汇总出的只读列表 */
+export type MergeInput = Omit<MergeParams, 'identity' | 'drop' | 'identityForce' | 'consumerSensitive' | 'survivorship' | 'identityExclude' | 'relations'> & {
+  identity?: readonly string[];
+  drop?: MergeDrop[];
+  identityForce?: boolean;
+  consumerSensitive?: string[];
+  survivorship?: Record<string, number>;
+  identityExclude?: string[];
+  relations?: RelationParam[];
+};
+
 /** 漂移检查参数里的应有结构：表名 → 列名 → 类型（入队时由已发布映射算出） */
 const EXPECTED = '参数 expected 必须是 表名 → 列名 → 类型 的对象';
 
@@ -223,7 +236,7 @@ export const CONTRACTS = {
   'source.profile': {
     label: '采集数据源',
     needs: { source: true },
-    params: params<{ sourceId: string; tables: string[] }>(z.looseObject({ tables: strings('参数 tables 必须是非空的表名列表') })),
+    params: params<{ sourceId: string; tables: string[]; repairFor?: string }>(z.looseObject({ tables: strings('参数 tables 必须是非空的表名列表') })),
     result: resultType<Awaited<ReturnType<typeof profileSource>>>(),
   },
   // 同步：每张表一个变更批次追加到原始层。有水位线的表增量读取，到了比对周期再比对一次主键全集（没有主键时整行全量比对）；
@@ -295,7 +308,7 @@ export const CONTRACTS = {
   'silver.merge': {
     label: '合并到标准层',
     needs: { piiSalt: true },
-    params: params<MergeParams>(z.looseObject({
+    params: params<MergeParams, MergeInput>(z.looseObject({
       drop: z.array(stringFields(['mapping', 'entity'], '参数 drop 必须是 { mapping, entity } 列表'), error('参数 drop 必须是 { mapping, entity } 列表')).default([]),
       mappings: z.array(mergeMapping, error(MAPPINGS)),
       identity: strings('参数 identity 必须是非空的字段名列表').optional(),
@@ -395,6 +408,10 @@ export const isTaskKind = (kind: string): kind is TaskKind => Object.hasOwn(CONT
 
 /** 一个任务的参数类型：契约 schema 解析出的 */
 export type ParamsOf<K extends TaskKind> = (typeof CONTRACTS)[K]['params'] extends { parse(raw: unknown): infer P } ? P : never;
+
+/** 一个任务的入参类型（insertTask / enqueueTask 的参数）：契约接受的原始形状，带缺省值的项可省略；
+ * 模板占位契约的 params 没带 __input，退回解析类型（Record） */
+export type InputOf<K extends TaskKind> = (typeof CONTRACTS)[K]['params'] extends { readonly __input?: infer I } ? NonNullable<I> : ParamsOf<K>;
 
 /** 声明了 needs.source 的任务 kind：领取时照参数 sourceId 解密源连接 */
 type SourceNeedKinds = { [K in TaskKind]: (typeof CONTRACTS)[K] extends { needs: { source: true } } ? K : never }[TaskKind];

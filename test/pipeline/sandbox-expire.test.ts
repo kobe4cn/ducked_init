@@ -7,6 +7,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { sandboxTables, tasks } from '../../app/.server/db/schema';
 import { lakeRow } from '../../app/.server/lake';
 import { enqueueDueSandboxExpiries, lockForSave } from '../../app/.server/sandbox';
+import { enqueueTask } from '../../app/.server/tasks';
 import { listSandboxTables, listSharedWithMe, runQuery, sandboxSchema, saveAsSandbox, shareSandboxTable } from '../../app/.server/workbench';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, onLake, runTask } from './fixtures';
@@ -123,9 +124,10 @@ describe('沙箱表过期', () => {
     const acme = await newTenant('acme');
     const schema = sandboxSchema((await memberOf(acme, 'analyst@acme.com', 'analyst')).memberId);
     for (const table of ['gold.rfm__x', 'silver.customer', 'sandbox_abc.t', `${schema}.T`, `${schema}."t"`, `${schema}.t; DROP SCHEMA silver`, schema, `${schema}.t.u`]) {
-      expect(await runTask(acme, 'sandbox.expire', { tables: [table] }), table).toMatchObject({ status: 'failed' });
+      await expect(enqueueTask(acme, 'sandbox.expire', { tables: [table] }), table)
+        .rejects.toThrow('参数 tables 必须是非空的沙箱表名列表');
     }
-    expect(await runTask(acme, 'sandbox.expire', { tables: [] })).toMatchObject({ status: 'failed' });
+    await expect(enqueueTask(acme, 'sandbox.expire', { tables: [] })).rejects.toThrow('参数 tables 必须是非空的沙箱表名列表');
     expect(await runTask(acme, 'sandbox.expire', { tables: [`${schema}.never_saved`] })).toMatchObject({ status: 'succeeded' });
   });
 });

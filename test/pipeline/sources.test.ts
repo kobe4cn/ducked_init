@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { rm, symlink } from 'node:fs/promises';
 import pg from 'pg';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { tasks } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openSource } from '../../app/.server/pipeline/source-engine';
 import { loadSourceSpec } from '../../app/.server/source-config';
@@ -247,8 +248,10 @@ describe('任务运行时的数据源连接', () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');
 
-    // 参数里带 sourceId 但契约没有声明源连接（source.drop，数据源已删）：领取时不读凭据，任务照常派发
-    const { id: dropId } = await enqueueTask(acme, 'source.drop', { schema: `bronze_${'0'.repeat(32)}`, sourceId: randomUUID() });
+    // 参数里带 sourceId 但契约没有声明源连接（source.drop，数据源已删）：领取时不读凭据，任务照常派发。
+    // sourceId 是 source.drop 的多余字段、过不了入队校验，这里裸插
+    const [dropTask] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'source.drop', params: { schema: `bronze_${'0'.repeat(32)}`, sourceId: randomUUID() } }).returning();
+    const dropId = dropTask.id;
     const drop = (await claimNextTask())!;
     expect(drop.id).toBe(dropId);
     expect(drop.source).toBeUndefined();
@@ -262,8 +265,8 @@ describe('任务运行时的数据源连接', () => {
     expect(profile.source).toMatchObject({ kind: 'postgres', user: READER.user, password: READER.password });
     await finishTask(profile.id, { result: {} });
 
-    // 合并任务领取时拿到租户的敏感信息盐（64 位十六进制）
-    const { id: mergeId } = await enqueueTask(acme, 'silver.merge', {});
+    // 合并任务领取时拿到租户的敏感信息盐（64 位十六进制）；参数只要过得了契约（只撤下停用映射，不跑工作进程）
+    const { id: mergeId } = await enqueueTask(acme, 'silver.merge', { mappings: [], drop: [{ mapping: 'm1', entity: 'customer' }] });
     const merge = (await claimNextTask())!;
     expect(merge.id).toBe(mergeId);
     expect(merge.piiSalt).toMatch(/^[0-9a-f]{64}$/);
