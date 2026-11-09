@@ -24,16 +24,17 @@ export async function proposeFromComments(tx: Tx, tenantId: string, sourceId: st
   ))).filter(c => c.commentText.trim() !== '');
   if (!comments.length) return { created: [], existing: 0, rejected: 0, invalid: [], stale: 0 };
 
-  // 已发布映射里直接读本源源表的：源视图输入的没有源列可言（plan 带 sourceView）
-  const plans = (await publishedPlans(tx, tenantId)).filter(p => p.sourceId === sourceId && !p.sourceView);
+  // 已发布映射里直接读本源源表的：源视图输入的没有源列可言（plan 带 sourceView）。敏感口径仍看全部已发布映射（all）
+  const all = await publishedPlans(tx, tenantId);
+  const plans = all.filter(p => p.sourceId === sourceId && !p.sourceView);
   if (!plans.length) return { created: [], existing: 0, rejected: 0, invalid: [], stale: 0 };
 
   const custom = await publishedCustomEntities(tx, tenantId);
   const inputs: ProposalInput[] = [];
   for (const plan of plans) {
     for (const column of plan.columns) {
-      // 敏感字段先自己过滤掉，不能只靠 assertTarget 落进 invalid
-      if (isSensitiveField({ entity: plan.entity, field: column.name }, e => custom.get(e)?.fields, plans)) continue;
+      // 敏感字段先自己过滤掉，不能只靠 assertTarget 落进 invalid；任一已发布映射（别的源、源视图映射）标了就算敏感
+      if (isSensitiveField({ entity: plan.entity, field: column.name }, e => custom.get(e)?.fields, all)) continue;
       // expr 恰好是源列名才算直接引用：解析失败（不该发生）与函数调用、运算都不算
       let expr;
       try {
