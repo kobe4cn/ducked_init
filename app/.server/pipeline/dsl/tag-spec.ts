@@ -7,9 +7,11 @@
 import { Ajv } from 'ajv';
 import { IDENTITIES } from '../identity-engine';
 import { lit } from '../../../lib/mapping-expr';
+import { TAG_CONDITIONS } from '../../../lib/tag-vocab';
 import { compileMetric, DESCRIPTION_SCHEMA, isNumericMetric, metricEntities, parseDsl, type Dependencies, type DslCheck, type DslContext, type MetricSpec } from './metric-spec';
 
-export const TAG_CONDITIONS = ['gte', 'gt', 'lte', 'lt', 'eq'] as const;
+// 词汇表搬到了 ~/lib/tag-vocab（标签表单也要用），这里原名 re-export，原有 import 不用改
+export { TAG_CONDITIONS };
 type Condition = (typeof TAG_CONDITIONS)[number];
 type Comparison = Partial<Record<Condition, number>>;
 

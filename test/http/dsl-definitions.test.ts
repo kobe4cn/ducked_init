@@ -18,6 +18,7 @@ import { createDefinition, getDefinition, publishDefinition, saveDslDraft } from
 import { todayUtc } from '../../app/.server/templates';
 import { entityOf } from '../../app/lib/canonical-model';
 import { formToYaml, type MetricForm } from '../../app/lib/metric-form';
+import { formToYaml as tagFormToYaml, type TagForm } from '../../app/lib/tag-form';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { fakeLlm, json, platformDefault } from '../pipeline/llm-fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
@@ -159,6 +160,66 @@ describe('指标与标签定义页', () => {
     expect(detail).toContain('第 1 版草稿');
     expect(detail).toContain('SUM(b.&quot;amount&quot;)');
     expect((await getDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'paid_amount_30d')).draft).toMatchObject({ version: 1, yaml: formToYaml(form, fields) });
+  });
+
+  it('新建标签页的条件构建器：可选指标只有本租户已发布的数值指标；保存得到与手写 YAML 一样的草稿；default 为空 400', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+
+    // 可选指标只来自本租户已发布的数值指标：带维度的、只有草稿的、别的租户的都不出现
+    await createDefinition(author, 'metric', 'revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    await createDefinition(author, 'metric', 'order_count', 'base: order\nmeasure: { agg: count }\n');
+    await publishDefinition(reviewer, 'metric', 'order_count', 1);
+    await createDefinition(author, 'metric', 'revenue_by_city', 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n');
+    await publishDefinition(reviewer, 'metric', 'revenue_by_city', 1);
+    await createDefinition(author, 'metric', 'orders_draft', 'base: order\nmeasure: { agg: count }\n'); // 只有草稿
+    const globex = await newTenant('globex');
+    const gAuthor = await memberOf(globex, 'de@globex.com');
+    const gReviewer = await memberOf(globex, 'de2@globex.com');
+    await createDefinition(gAuthor, 'metric', 'other_tenant_metric', 'base: order\nmeasure: { agg: count }\n');
+    await publishDefinition(gReviewer, 'metric', 'other_tenant_metric', 1);
+
+    // 标签默认进构建器：有模式切换、单指标 / 多指标切换与隐藏字段 form；需求框只在 YAML 模式
+    const page = await (await analyst.get('/analytics/definitions/new?kind=tag')).text();
+    expect(page).toContain('data-tag-builder');
+    expect(page).toContain('data-tab="builder"');
+    expect(page).toContain('单指标 / 多指标');
+    expect(page).toContain('name="form"');
+    expect(page).not.toMatch(/<textarea[^>]*name="request"/);
+    expect(page).toMatch(/<option[^>]*value="revenue">/);
+    expect(page).toMatch(/<option[^>]*value="order_count">/);
+    for (const absent of ['revenue_by_city', 'orders_draft', 'other_tenant_metric']) expect(page).not.toContain(absent);
+    const yamlMode = await (await analyst.get('/analytics/definitions/new?kind=tag&mode=yaml')).text();
+    expect(yamlMode).toMatch(/<textarea[^>]*name="request"/);
+    expect(yamlMode).not.toContain('data-tag-builder');
+
+    // 保存：隐藏字段 form 规整成 YAML 后走同一套校验，第 1 版草稿与手写 YAML 的结果一致
+    const form: TagForm = {
+      single: false,
+      rules: [{ value: 'high', combinator: 'all', items: [
+        { metric: 'revenue', cmp: [{ op: 'gte', value: 1000 }] },
+        { metric: 'order_count', cmp: [{ op: 'gte', value: 3 }] },
+      ] }],
+      missing: { order_count: 0 }, default: 'normal', readonly: [],
+    };
+    const post = (body: Record<string, string>) => analyst.post('/analytics/definitions/new', { kind: 'tag', ...body });
+    const saved = await post({ key: 'value_tier', form: JSON.stringify(form) });
+    expect(saved.status).toBe(302);
+    expect(saved.headers.get('location')).toBe('/analytics/definitions/tag/value_tier');
+    const detail = await (await analyst.get('/analytics/definitions/tag/value_tier')).text();
+    expect(detail).toContain('第 1 版草稿');
+    expect(detail).toContain(tagFormToYaml(form));
+    expect((await getDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'tag', 'value_tier')).draft)
+      .toMatchObject({ version: 1, yaml: tagFormToYaml(form) });
+
+    // default 为空：生成的 YAML 过不了校验，按行列返回 400（取值不能为空），不落库
+    const bad = await post({ key: 'bad_tier', form: JSON.stringify({ ...form, default: '' }) });
+    expect(bad.status).toBe(400);
+    expect(await bad.text()).toMatch(/（default）：取值不能为空/);
+    // 本租户 4 个指标定义 + 1 个标签 + globex 的 1 个指标
+    expect(await getDb().select().from(dslVersions)).toHaveLength(6);
   });
 
   it('分析页「新建标签」进到标签种类的新建页；引用未发布的指标时按行列列出问题，种类不存在时 404', async () => {
@@ -622,8 +683,8 @@ describe('用模型生成标签草稿', () => {
     const tag = 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n';
     modelReplies({ metric: 'revenue', rules: [{ value: 'high', when: { gte: 1000 } }], default: 'normal' });
 
-    expect(await (await analyst.get('/analytics/definitions/new?kind=tag')).text()).toMatch(/<textarea[^>]*name="request"/);
-    const none = await analyst.post('/analytics/definitions/new?kind=tag', { intent: 'model-draft', kind: 'tag', key: '', request, yaml: tag });
+    expect(await (await analyst.get('/analytics/definitions/new?kind=tag&mode=yaml')).text()).toMatch(/<textarea[^>]*name="request"/);
+    const none = await analyst.post('/analytics/definitions/new?kind=tag&mode=yaml', { intent: 'model-draft', kind: 'tag', key: '', request, yaml: tag });
     expect(none.status).toBe(400);
     const noneHtml = await none.text();
     expect(noneHtml).toContain('先发布一个数值型指标');
@@ -631,7 +692,7 @@ describe('用模型生成标签草稿', () => {
 
     await createDefinition(author, 'metric', 'revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
     await publishDefinition(reviewer, 'metric', 'revenue', 1);
-    const generated = await analyst.post('/analytics/definitions/new?kind=tag', { intent: 'model-draft', kind: 'tag', key: '', request, yaml: tag });
+    const generated = await analyst.post('/analytics/definitions/new?kind=tag&mode=yaml', { intent: 'model-draft', kind: 'tag', key: '', request, yaml: tag });
     expect(generated.status).toBe(200);
     const html = await generated.text();
     expect(editorYaml(html)).toContain('# 模型根据需求生成，请核对');
