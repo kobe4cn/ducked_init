@@ -3,7 +3,8 @@
 // POST 接 JSON：{ conversationId?, message, page } 跑一轮问答（历史从保存的对话里取，只有本人能续写），记进对话后返回 { conversationId, reply, toolsUsed, workbenchSql?, planCard? }
 // （workbenchSql 是本轮 prefill_workbench 通过校验的 SQL，有值时才带，前端拿它渲染「填入工作台」链接）；
 // 计划随对话保存（ADR-0050）：本轮校验过的计划存进 assistant 消息，续写时把对话里最近一份带给 assistantTurn 作 priorPlan（存草稿前重新校验用），发给模型的只有文字；
-// 计划卡（#452，P4⑯a）：带 plan 的消息在读时按读者自己的目录组装 planCard（读时再校验、不存状态），POST 返回与 ?id= 读回都带，
+// 计划卡（#452，P4⑯a）：带 plan 的消息在读时按读者自己的目录组装 planCard（读时再校验、不存状态），POST 返回与 ?id= 读回都带；
+// 读回响应只给 planCard、不给原始 plan（#539：被分享人看不到的 excluded 条目 id 不能出现在 HTML / JSON 里），
 // 被分享人看到的卡片按他自己的目录组装（ADR-0005），卡片只进响应、不写库、不进发给模型的 content；
 // { intent: 'share' | 'unshare', conversationId, email } 分享或撤销分享自己的对话。出错返回 { error } 与对应状态码
 import type { Route } from './+types/assistant';
@@ -14,11 +15,14 @@ import { resolveProvider } from '~/.server/llm';
 import { toolSupport } from '~/.server/model-provider';
 import {
   appendTurn, ConversationError, listMyConversations, listSharedWithMe, readConversation, shareConversation, unshareConversation,
-  type Conversation,
+  type Conversation, type StoredMessage,
 } from '~/.server/assistant/conversations';
 import { AssistantError, assistantTurn, MAX_HISTORY, type ChatTurn } from '~/.server/assistant/loop';
-import { planCardView } from '~/.server/assistant/plan-card';
+import { planCardView, type PlanCardView } from '~/.server/assistant/plan-card';
 import { catalogFor, toolsFor } from '~/.server/assistant/tools';
+
+/** ?id= 读回的对话：消息不带原始 plan，只带读时组装的 planCard（#539） */
+type ConversationView = Omit<Conversation, 'messages'> & { messages: (Omit<StoredMessage, 'plan'> & { planCard?: PlanCardView })[] };
 
 const errorResponse = (e: unknown) => {
   if (e instanceof AssistantError || e instanceof ConversationError) return Response.json({ error: e.message }, { status: e.status });
@@ -29,14 +33,13 @@ export async function loader({ request }: Route.LoaderArgs) {
   const member = await requireMember(request);
   const id = new URL(request.url).searchParams.get('id');
   try {
-    let conversation: Conversation | undefined;
+    let conversation: ConversationView | undefined;
     if (id) {
       const read = await readConversation(member, id);
-      // 只有对话里有 plan 时才查目录（每个请求一次），卡片按读者自己的目录组装：本人和被分享人看到的可以不同（ADR-0005）
-      if (read.messages.some(m => m.plan)) {
-        const catalog = await catalogFor(member);
-        conversation = { ...read, messages: read.messages.map(m => (m.plan ? { ...m, planCard: planCardView(catalog, m.plan) } : m)) };
-      } else conversation = read;
+      // 只有对话里有 plan 时才查目录（每个请求一次），卡片按读者自己的目录组装：本人和被分享人看到的可以不同（ADR-0005）；
+      // 读回只给 planCard、不给原始 plan（#539：plan.excluded 里有读者看不到的条目 id，比如自带数据源名的 table:…，不能经它泄露）
+      const catalog = read.messages.some(m => m.plan) ? await catalogFor(member) : null;
+      conversation = { ...read, messages: read.messages.map(({ plan, ...m }) => (plan && catalog ? { ...m, planCard: planCardView(catalog, plan) } : m)) };
     }
     return Response.json({
       configured: !!await resolveProvider(member.tenant.id),
