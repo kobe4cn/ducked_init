@@ -5,6 +5,7 @@
 // YAML → 表单：认不出的写法（consumer_via、device_attribution、维度的 as_of、含 -> 或 consumer. 前缀的路径、Schema 之外的键或非标量取值、不认识的顶层键）
 // 标成只读并说明原因，原始值原样保存在 readonly[].raw 里，formToYaml 原样写回，保证往返不丢信息（ADR-0017：YAML 仍是唯一格式）。
 // summarize 是四句摘要：计算什么 / 只算哪些记录 / 按什么时间 / ratio 时分母为 0 或为空怎么办（ADR-0025，措辞参考 .server/knowledge/derive.ts 的口径文字，那是 .server 的不能 import）。
+// diffForms 比两张表单的摘要句子（按位置配对、只留不相等的项）：新建指标页解析一句话后展示和当前表单的差异。
 // 只能 import app/lib 里的东西（.server 的只能 import type）
 import { parseDocument, stringify } from 'yaml';
 import type { FieldType } from './canonical-model';
@@ -344,4 +345,20 @@ export function summarize(form: MetricForm, fields: readonly FormField[]): strin
     form.window ? `近 ${form.window.days} 天，按${labelOf(form.window.field, fields)}。` : '不限时间。',
     ...(form.agg === 'ratio' ? ['分母为 0 或为空时结果记为空。'] : []),
   ];
+}
+
+/**
+ * 两张表单的差异（新建指标页一句话解析后展示「哪些项会被替换」）：两边各取 summarize 的句子按位置配对，
+ * 只留不相等的项，缺的一边记 ''（如 ratio 比非 ratio 多一句分母说明）。字段表用解析结果那张的基础实体
+ * （换基础实体时两张的字段名对不上，中文名显示不出来就退回字段名）
+ */
+export function diffForms(current: MetricForm, next: MetricForm, fields: readonly FormField[]): { before: string; after: string }[] {
+  const before = summarize(current, fields);
+  const after = summarize(next, fields);
+  const out: { before: string; after: string }[] = [];
+  for (let i = 0; i < Math.max(before.length, after.length); i++) {
+    const b = before[i] ?? '', a = after[i] ?? '';
+    if (b !== a) out.push({ before: b, after: a });
+  }
+  return out;
 }

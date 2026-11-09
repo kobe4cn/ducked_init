@@ -4,22 +4,26 @@
 // 保存仍走同一套校验与双人发布。构建器模式下表单只提交键、intent 与隐藏字段 form（MetricForm 的 JSON），字段表不信客户端，服务端按
 // form.base 用 fieldsFor 重取（敏感字段已剔除，ADR-0005）再 formToYaml 成 YAML——与手写 YAML 走完全一样的路（ADR-0017）。
 // 可以写下需求后用模型生成草稿（intent=model-draft，ADR-0035）：生成的 YAML 填进编辑框、不保存，失败时编辑框保持原内容
+// 构建器模式还能写一句话解析（intent=parse，#517）：parseMetricSentence 把句子解析成表单填进构建器并逐项说明，
+// 已有内容时先列出差异（intent=applyParse 确认后才覆盖），解析失败时表单保持原样
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.new';
 import { requirePermission } from '~/.server/access';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { createDefinition, DslError, dslContext, modelDraftForDefinition } from '~/.server/dsl-definitions';
+import { MetricParseError, parseMetricSentence } from '~/.server/metric-parse';
 import { DSL_KINDS, isDslKind, type DslKind } from '~/.server/pipeline/dsl';
 import { checkMetric, compileMetric, fieldsFor } from '~/.server/pipeline/dsl/metric-spec';
 import { getDb } from '~/.server/db/client';
 import { todayUtc } from '~/.server/templates';
 import { CANONICAL_ENTITIES, entityOf, type FieldType } from '~/lib/canonical-model';
-import { formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
+import { diffForms, formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
 import { AGGS, RATIO_AGGS } from '~/lib/metric-vocab';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
 import { formOfEcho, MetricBuilder, type BuilderEntity } from '~/components/metric-builder';
+import { MetricParsePanel } from '~/components/metric-parse-panel';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { Button } from '~/components/ui/button';
@@ -174,16 +178,56 @@ export async function action({ request }: Route.ActionArgs) {
   const yamlInput = String(form.get('yaml') ?? '');
   const requirement = String(form.get('request') ?? '');
   const intent = form.get('intent');
+  /** 一句话解析的句子（构建器模式的「一句话」框；YAML 模式的需求框是 request，两边各回显各的） */
+  const sentence = String(form.get('sentence') ?? '');
   /** 构建器模式：隐藏字段 form 是 MetricForm 的 JSON（YAML 模式不提交它） */
   const builder = kind === 'metric' && form.has('form') ? String(form.get('form')) : undefined;
   /** 回显给构建器的是服务端规整过的表单，不原样回传客户端的内容（读不出来、聚合在词表外就不回显） */
   const echo = builder === undefined ? undefined : (() => { try { return echoable(builderFormOf(builder)); } catch { return undefined; } })();
-  const keep = { key, request: requirement, generated: false, form: echo };
+  /** 各分支共有的回显；parse / parsed / diff 只在 intent=parse 的应答里有，这里占位让组件能统一读 */
+  const keep = { key, request: requirement, generated: false, form: echo, sentence, parse: undefined, parsed: undefined, diff: undefined };
   let yaml = yamlInput;
   try {
     if (intent === 'model-draft') {
       const generated = await modelDraftForDefinition(member, kind, requirement);
       return { error: null, issues: [], yaml: generated.yaml, summary: null, sql: null, ...keep, generated: true };
+    }
+    if (kind === 'metric' && intent === 'parse') {
+      const parsed = await parseMetricSentence(member, sentence);
+      // 解析出的表单先 JSON.stringify 再过 builderFormOf 规整（构建器不收 dimensions / readonly），再过 echoable（聚合在词表外构建器显示不了）
+      const normalized = builderFormOf(JSON.stringify(parsed.form));
+      const shown = echoable(normalized);
+      if (shown === undefined) throw new DslError('解析结果构建器显示不了', 422);
+      const parse = {
+        items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported,
+        // 构建器没有维度控件，builderFormOf 把 dimensions / readonly 都清空了：维度的名字显式提示，不能悄悄丢
+        // （单段路径的维度在 form.dimensions，多跳或 as_of 的在 readonly 里、key 是 dimensions.N、raw 是原维度对象）
+        dropped: [
+          ...parsed.form.dimensions.map(d => d.name),
+          ...parsed.form.readonly.flatMap(r => {
+            const raw = /^dimensions\.\d+$/.test(r.key) && r.raw && typeof r.raw === 'object' && !Array.isArray(r.raw) ? (r.raw as { name?: unknown }).name : undefined;
+            return typeof raw === 'string' ? [raw] : [];
+          }),
+        ],
+      };
+      // 当前构建器有内容（选了基础实体）才比差异；摘要的中文名按解析结果的基础实体取（换实体时旧字段名对不上就显示字段名）
+      let current: MetricForm | undefined;
+      if (builder !== undefined) { try { current = builderFormOf(builder); } catch { current = undefined; } }
+      const diff = current === undefined ? [] : diffForms(
+        current, normalized,
+        labelledFields(normalized.base, fieldsFor(normalized.base, await dslContext(getDb(), member.tenant.id)) ?? []),
+      );
+      // 构建器是空的或解析结果与当前内容一样：直接填入；否则先列出差异等成员确认（form 仍是当前内容）
+      return diff.length === 0
+        ? { error: null, issues: [], yaml, summary: null, sql: null, ...keep, form: shown, parse }
+        : { error: null, issues: [], yaml, summary: null, sql: null, ...keep, parsed: shown, diff, parse };
+    }
+    if (kind === 'metric' && intent === 'applyParse') {
+      // 确认覆盖：读隐藏字段 parsed（parse 应答里那份 JSON），同样不信客户端，过一遍规整再回显
+      let shown: string | undefined;
+      try { shown = echoable(builderFormOf(String(form.get('parsed') ?? ''))); } catch { /* 按读不出来处理 */ }
+      if (shown === undefined) throw new DslError('解析结果读不出来，请重新点「解析一句话」');
+      return { error: null, issues: [], yaml, summary: null, sql: null, ...keep, form: shown };
     }
     if (kind === 'metric' && (intent === 'check' || builder !== undefined)) {
       const ctx = await dslContext(getDb(), member.tenant.id);
@@ -201,7 +245,8 @@ export async function action({ request }: Route.ActionArgs) {
     }
     await createDefinition(member, kind, key, yaml);
   } catch (e) {
-    if (e instanceof DslError) return data({ error: e.message, issues: e.issues, yaml, summary: null, sql: null, ...keep }, { status: e.status });
+    // MetricParseError（空句 / 超长 400、未配置模型服务 409、模型失败或不过校验 422）不是 DslError，不补会变成 500；表单保持原样
+    if (e instanceof DslError || e instanceof MetricParseError) return data({ error: e.message, issues: e.issues ?? [], yaml, summary: null, sql: null, ...keep }, { status: e.status });
     throw e;
   }
   throw redirect(`/analytics/definitions/${kind}/${key}`);
@@ -246,7 +291,31 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
               <FieldDescription>小写字母开头，只用小写字母、数字与下划线；建好后不能改。</FieldDescription>
             </Field>
             {builder ? (
-              <MetricBuilder entities={entities ?? []} defaultForm={formOfEcho(actionData?.form)} />
+              <>
+                <Field>
+                  <FieldLabel htmlFor="sentence">一句话</FieldLabel>
+                  <textarea
+                    id="sentence" name="sentence" rows={2} defaultValue={actionData?.sentence ?? ''}
+                    placeholder={request}
+                    className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                  />
+                  <FieldDescription>写下要算什么，点「解析一句话」：会把这句话与{sends}发给模型服务，解析结果填进下面的构建器并逐项说明，不会保存；构建器已有内容时先列出差异，确认后才覆盖。</FieldDescription>
+                  <div>
+                    <Button type="submit" name="intent" value="parse" variant="outline" formNoValidate disabled={submitting}>解析一句话</Button>
+                  </div>
+                </Field>
+                {actionData?.parse && <MetricParsePanel parse={actionData.parse} diff={actionData.diff} />}
+                {actionData?.parsed && (
+                  <div className="flex items-center gap-2">
+                    {/* parse 应答里那份解析结果 JSON，确认覆盖时原样提交（服务端仍会规整，不信客户端） */}
+                    <input type="hidden" name="parsed" value={actionData.parsed} />
+                    <Button type="submit" name="intent" value="applyParse" variant="outline" formNoValidate disabled={submitting}>确认覆盖</Button>
+                    <span className="text-sm text-slate-500">把构建器当前内容换成解析出的表单。</span>
+                  </div>
+                )}
+                {/* MetricBuilder 的 useState 只在挂载时初始化，不换 key 时开着 JS 填不进解析结果 */}
+                <MetricBuilder key={actionData?.form ?? 'empty'} entities={entities ?? []} defaultForm={formOfEcho(actionData?.form)} />
+              </>
             ) : (
               <>
                 <Field>
