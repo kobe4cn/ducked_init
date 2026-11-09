@@ -146,10 +146,10 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
   const [form, setForm] = useState<MetricForm>(() => ({ ...emptyForm(), ...defaultForm }));
   const fields = entities.find(e => e.name === form.base)?.fields ?? [];
   const typeOf = (name: string | undefined) => fields.find(f => f.name === name)?.type;
-  /** 字段类型是否还能用在某聚合上（换聚合时保留还适用的字段，清掉不适用的） */
-  const fits = (name: string | undefined, allowed: readonly FieldType[] | typeof ANY) => {
+  /** 字段类型是否还能用在某聚合上（换聚合时保留还适用的字段，清掉不适用的）；allowed 可能是词表外聚合查出来的 undefined，视为不适用 */
+  const fits = (name: string | undefined, allowed: readonly FieldType[] | typeof ANY | undefined) => {
     const type = typeOf(name);
-    return name !== undefined && type !== undefined && (allowed === ANY || allowed.includes(type));
+    return name !== undefined && type !== undefined && (allowed === ANY || allowed?.includes(type));
   };
   const patch = (p: Partial<MetricForm>) => setForm(f => ({ ...f, ...p }));
   const setPart = (at: 'numerator' | 'denominator', p: Partial<RatioForm>) => setForm(f => ({ ...f, [at]: { ...(f[at] ?? { agg: 'count', filter: [] }), ...p } }));
@@ -163,11 +163,11 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
     by: (agg === 'latest' || agg === 'earliest') && fits(f.by, TEMPORAL_TYPES) ? f.by : undefined,
   }));
 
-  /** 某聚合能选的字段下拉选项（count / count_distinct 不限类型，sum / avg 只列数字，min / max 也列日期时间，days_since 与 by 只列时间） */
-  const fieldOptions = (allowed: readonly FieldType[] | typeof ANY, empty: string) => (
+  /** 某聚合能选的字段下拉选项（count / count_distinct 不限类型，sum / avg 只列数字，min / max 也列日期时间，days_since 与 by 只列时间）；词表外的聚合查不到类型表，不列任何字段 */
+  const fieldOptions = (allowed: readonly FieldType[] | typeof ANY | undefined, empty: string) => (
     <>
       <NativeSelectOption value="">{empty}</NativeSelectOption>
-      {fields.filter(f => allowed === ANY || allowed.includes(f.type)).map(f => <NativeSelectOption key={f.name} value={f.name}>{show(f)}</NativeSelectOption>)}
+      {fields.filter(f => allowed === ANY || allowed?.includes(f.type)).map(f => <NativeSelectOption key={f.name} value={f.name}>{show(f)}</NativeSelectOption>)}
     </>
   );
 

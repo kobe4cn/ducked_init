@@ -128,6 +128,19 @@ describe('指标与标签定义页', () => {
     expect((await post({ intent: 'check', form: JSON.stringify({ base: 'order', agg: 'ratio', numerator: { agg: 'count' } }) })).status).toBe(400);
     expect((await post({ intent: 'check', form: JSON.stringify({ ...form, filter: [{ field: 'status' }, { field: 'status', op: 'eq', value: { x: 1 } }] }) })).status).toBe(200);
 
+    // 聚合在词表外（手工提交才有）：词表外的聚合仍进生成的 YAML、由检查按 measure.agg 报出；回显不进构建器的渲染，整页照常 400 而不是 500
+    const badAgg = await post({ intent: 'check', form: JSON.stringify({ ...form, agg: 'median' }) });
+    expect(badAgg.status).toBe(400);
+    const badAggPage = await badAgg.text();
+    expect(badAggPage).toMatch(/第 \d+ 行第 \d+ 列（measure\.agg）：应为以下之一：/);
+    expect(badAggPage).toContain('data-metric-builder');
+    expect(badAggPage).not.toContain('出错了');
+    // ratio 分子的聚合在词表外也一样：measure.numerator.agg 按行列报出，不落库
+    const badPart = await post({ intent: 'check', form: JSON.stringify({ ...ratio, numerator: { agg: 'median', filter: [] } }) });
+    expect(badPart.status).toBe(400);
+    expect(await badPart.text()).toMatch(/（measure\.numerator\.agg）：应为以下之一：/);
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
     // YAML 模式也能只检查不保存
     const yamlCheck = await analyst.post('/analytics/definitions/new', { kind: 'metric', intent: 'check', yaml: 'base: order\nmeasure: { agg: count }\n' });
     expect(yamlCheck.status).toBe(200);

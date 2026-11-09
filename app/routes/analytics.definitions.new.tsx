@@ -15,6 +15,7 @@ import { getDb } from '~/.server/db/client';
 import { todayUtc } from '~/.server/templates';
 import { CANONICAL_ENTITIES, entityOf, type FieldType } from '~/lib/canonical-model';
 import { formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
+import { AGGS, RATIO_AGGS } from '~/lib/metric-vocab';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { MappingEditor, MappingErrors } from '~/components/mapping-editor';
@@ -141,6 +142,12 @@ function builderEntities(
   });
 }
 
+/** 回显用的表单：聚合在词表外就不回显——构建器的控件只认合法聚合（词表外的聚合仍进生成的 YAML、由检查按 measure.agg 报出，不替客户端猜成别的聚合） */
+function echoable(form: MetricForm): string | undefined {
+  const parts = form.agg === 'ratio' ? [form.numerator, form.denominator] : [];
+  return AGGS.includes(form.agg) && parts.every(p => p !== undefined && RATIO_AGGS.includes(p.agg)) ? JSON.stringify(form) : undefined;
+}
+
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'definitions:draft');
   const url = new URL(request.url);
@@ -169,8 +176,8 @@ export async function action({ request }: Route.ActionArgs) {
   const intent = form.get('intent');
   /** 构建器模式：隐藏字段 form 是 MetricForm 的 JSON（YAML 模式不提交它） */
   const builder = kind === 'metric' && form.has('form') ? String(form.get('form')) : undefined;
-  /** 回显给构建器的是服务端规整过的表单，不原样回传客户端的内容（读不出来就不回显） */
-  const echo = builder === undefined ? undefined : (() => { try { return JSON.stringify(builderFormOf(builder)); } catch { return undefined; } })();
+  /** 回显给构建器的是服务端规整过的表单，不原样回传客户端的内容（读不出来、聚合在词表外就不回显） */
+  const echo = builder === undefined ? undefined : (() => { try { return echoable(builderFormOf(builder)); } catch { return undefined; } })();
   const keep = { key, request: requirement, generated: false, form: echo };
   let yaml = yamlInput;
   try {

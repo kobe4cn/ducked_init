@@ -137,6 +137,8 @@ async function handle(page, state, req) {
   const timeout = Number(req.timeout ?? 20000);
   page.setDefaultTimeout(timeout);
   const cmd = req.cmd;
+  // --within 把 fill / click / select / value 限定在一个 CSS 选择器内部，用于区分页面里重名的控件（如多个「添加一行」）
+  const scope = req.within ? page.locator(req.within) : page;
   if (cmd === 'goto') {
     const raw = req.positionals?.[0];
     if (!raw) throw new Error('goto requires a path or URL');
@@ -146,17 +148,17 @@ async function handle(page, state, req) {
   }
   if (cmd === 'fill') {
     if (!req.label || req.value === undefined) throw new Error('fill requires --label and --value');
-    await page.getByLabel(req.label, { exact: true }).fill(req.value);
+    await scope.getByLabel(req.label, { exact: true }).fill(req.value);
     return {};
   }
   if (cmd === 'click') {
     if (!req.role || !req.name) throw new Error('click requires --role and --name');
-    await page.getByRole(req.role, { name: req.name, exact: true }).click();
+    await scope.getByRole(req.role, { name: req.name, exact: true }).click();
     return {};
   }
   if (cmd === 'select') {
     if (!req.label || req.value === undefined) throw new Error('select requires --label and --value');
-    await page.getByLabel(req.label, { exact: true }).selectOption(req.value);
+    await scope.getByLabel(req.label, { exact: true }).selectOption(req.value);
     return {};
   }
   if (cmd === 'wait-text') {
@@ -202,7 +204,7 @@ async function handle(page, state, req) {
   }
   if (cmd === 'value') {
     if (!req.label) throw new Error('value requires --label');
-    return { stdout: await page.getByLabel(req.label, { exact: true }).inputValue() };
+    return { stdout: await scope.getByLabel(req.label, { exact: true }).inputValue() };
   }
   if (cmd === 'count') {
     if (!req.selector) throw new Error('count requires --selector');
@@ -229,6 +231,7 @@ async function runClient() {
       offset: { type: 'string' },
       timeout: { type: 'string' },
       selector: { type: 'string' },
+      within: { type: 'string' },
     },
   });
   const cmd = positionals[0];
@@ -272,6 +275,7 @@ async function runClient() {
     value: values.value,
     path: values.path,
     selector: values.selector,
+    within: values.within,
     timeout: values.timeout,
   });
   if (!response.ok) {
