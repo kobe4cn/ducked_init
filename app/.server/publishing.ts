@@ -1,14 +1,17 @@
 // app/.server/publishing.ts —— 可发布项（映射、源视图、指标 / 标签 / 模板定义、自定义实体、合并组）的保存草稿、发布、丢弃由这一个模块负责（ADR-0051）：
 // 每种可发布项通过适配器接入：两张表、要不要先锁租户行、事务外、事务内与锁内检查、发布后与丢弃后动作、审计与文案。
 // 发布顺序固定：读草稿 → publishBlocker → 事务外检查 → 开事务 → 加锁 → 过期检查 → 事务内检查 → 改状态 → 发布后动作 → 审计
-// （审计放在最后：记目录版本拿的锁要是事务里最后一个锁，ADR-0047）。流程本身的错误（不是草稿、已发布、草稿被改过、没有草稿可丢弃）
-// 抛 PublishError，各可发布项自己的错误类继承它。不能 import mappings.ts（它经 publish-rules.ts 导入这里，循环依赖）：
-// 锁租户行用 tenant-lock.ts 的 lockTenant；enqueueMerge 只由各适配器的 afterPublish 调
+// （审计放在最后：记目录版本拿的锁要是事务里最后一个锁，ADR-0047）。自己开的事务用 catalogTx（ADR-0054）：发布等目录动作在事务收尾记一版目录版本；
+// 调用方传入 tx 时不另开事务：发布时调用方必须已经在 catalogTx 里（publishPassthrough 一个事务里发布登记与映射就是），
+// saveDraft 传普通事务也允许（如 saveMappingDraft，保存只审计不在白名单里的 mapping.drafted，记不上目录版本）。
+// 流程本身的错误（不是草稿、已发布、草稿被改过、没有草稿可丢弃）抛 PublishError，各可发布项自己的错误类继承它。
+// 不能 import mappings.ts（它经 publish-rules.ts 导入这里，循环依赖）：锁租户行用 tenant-lock.ts 的 lockTenant；enqueueMerge 只由各适配器的 afterPublish 调
 import { and, desc, eq, getTableColumns, inArray, sql } from 'drizzle-orm';
 import type { AnyPgColumn, PgTable } from 'drizzle-orm/pg-core';
 import { recordAudit, type AuditAction, type Tx } from './audit';
 import { can, deniedReason } from './access';
 import type { CurrentMember } from './auth';
+import { catalogTx } from './catalog/tx';
 import { getDb } from './db/client';
 import { members, ROLES } from './db/schema';
 import { lockTenant } from './tenant-lock';
@@ -134,9 +137,9 @@ const sharedOf = (table: PgTable) => {
 const fkKeyOf = (versions: PgTable, versionsFk: AnyPgColumn) =>
   Object.entries(getTableColumns(versions)).find(([, column]) => column === versionsFk)![0];
 
-/** 在调用方的事务里执行，没给时自己开一个 */
-const inTx = <T>(tx: Tx | undefined, run: (tx: Tx) => Promise<T>): Promise<T> =>
-  tx ? run(tx) : getDb().transaction(run);
+/** 在调用方的事务里执行，没给时自己开一个 catalogTx（ADR-0054，目录动作收尾记一版目录版本） */
+const inTx = <T>(tenantId: string, tx: Tx | undefined, run: (tx: Tx) => Promise<T>): Promise<T> =>
+  tx ? run(tx) : catalogTx(tenantId, run);
 
 /**
  * 保存草稿：事务外检查（适配器的 checkSave，可以访问 DuckDB 或数据湖）→ 开事务 →（锁租户行）→ 保存的事务内检查 → 锁父行 →
@@ -147,7 +150,7 @@ export async function saveDraft<Ctx, Input, Inside, After>(
   adapter: PublishableAdapter<Ctx, Input, Inside, After>, actor: CurrentMember, ctx: Ctx, input: Input, tx?: Tx,
 ) {
   let columns = await adapter.checkSave(ctx, input);
-  return inTx(tx, async tx => {
+  return inTx(actor.tenant.id, tx, async tx => {
     if (adapter.lockTenant) await lockTenant(tx, actor.tenant.id);
     await adapter.saveInside?.(tx, ctx);
     const parentId = await adapter.lockParent(tx, ctx);
@@ -178,7 +181,9 @@ export async function saveDraft<Ctx, Input, Inside, After>(
 
 /**
  * 发布草稿：读草稿 → publishBlocker → 事务外检查 → 开事务 →（锁租户行）→ 锁父行 → 过期检查 → 事务内检查 → 改状态 → 发布后动作 → 审计。
- * 可以在调用方传入的事务里执行（publishPassthrough 一个事务里发布登记与映射）。返回发布后动作的结果（入队的任务）或 null
+ * 自己开的事务是 catalogTx（ADR-0054），发布这一目录动作在事务收尾记一版目录版本；调用方传入 tx 时不另开，
+ * 但调用方必须已经在 catalogTx 里（publishPassthrough 一个事务里发布登记与映射就是），否则目录动作记不上目录版本。
+ * 返回发布后动作的结果（入队的任务）或 null
  */
 export async function publish<Ctx, Input, Inside, After>(
   adapter: PublishableAdapter<Ctx, Input, Inside, After>, actor: CurrentMember, ctx: Ctx & { parentId: string }, version: number, tx?: Tx,
@@ -190,7 +195,7 @@ export async function publish<Ctx, Input, Inside, After>(
   const blocker = publishBlocker(actor, draft);
   if (blocker) throw new PublishError(blocker, draft.status === 'draft' ? 403 : 400);
   await adapter.checkOutside?.(draft, ctx);
-  return inTx(tx, async tx => {
+  return inTx(actor.tenant.id, tx, async tx => {
     if (adapter.lockTenant) await lockTenant(tx, actor.tenant.id);
     await adapter.lockParent(tx, ctx);
     const [current] = (await tx.select().from(adapter.versions).where(eq(id, draft.id))) as unknown as VersionRow[];
@@ -220,7 +225,7 @@ export async function publish<Ctx, Input, Inside, After>(
 export async function discard<Ctx, Input, Inside, After>(
   adapter: PublishableAdapter<Ctx, Input, Inside, After>, actor: CurrentMember, ctx: Ctx,
 ): Promise<{ kept: boolean }> {
-  return getDb().transaction(async tx => {
+  return catalogTx(actor.tenant.id, async tx => {
     if (adapter.lockTenant) await lockTenant(tx, actor.tenant.id);
     const parentId = await adapter.lockParent(tx, ctx);
     const { id, version: versionCol, status } = sharedOf(adapter.versions);
