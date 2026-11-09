@@ -1,11 +1,12 @@
 // test/pipeline/identity-recompute.test.ts —— 身份打通何时重算：改到 customer、event 或 consent、打通结果表不在或上次失败时整表重算，否则跳过并写明原因；
 // customer 映射里可配置的匹配字段与 survivorship 优先级（ADR-0019）
 import { eq } from 'drizzle-orm';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { latestIdentitySummary, listMappings, mergeMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
+import * as mappingsModule from '../../app/.server/mappings';
 import { syncSource } from '../../app/.server/source-sync';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { listTasks } from '../../app/.server/tasks';
@@ -178,17 +179,33 @@ describe('身份打通：可配置匹配字段与优先级', () => {
     // 同一个手机号、不同的邮箱
     await grantOnSource(`INSERT INTO crm.customers VALUES (8, '吴十', '13600000008', 'wu@crm.test', NULL, '2024-06-02');
       INSERT INTO loyalty.members VALUES (7, '吴十', '136 0000 0008', 'wu10@loyalty.test', NULL, '2024-06-02');`);
-    for (const id of [sources.crm, sources.loyalty]) await syncSource(author, id);
-    await drain();
-    const together = (rows: Identity[]) => groupsOf(rows, names).find(g => g.includes('crm:8'));
-    // 默认规则里手机号优先：合并
-    expect(together((await identities(acme)).rows)).toEqual(['crm:8', 'loyalty:7']);
+    // 放大调度器收尾的竞争窗口（#563）：同步任务先 finishTask（释放租户名额）后 mergeAfterSync（入队合并），
+    // 在这里先等 1500 ms（比 pollMs 1 s 长），runUntilIdle 的轮询就会趁窗口领走排队中的下一个同步；
+    // 后一个同步收尾时 enqueueMerge 撞上正在跑的合并返回 null，runUntilIdle 又不跑 enqueueDueMerges 补漏，变更就丢了
+    const originalMergeAfterSync = mappingsModule.mergeAfterSync;
+    vi.spyOn(mappingsModule, 'mergeAfterSync').mockImplementation(async (tenantId, syncTaskId) => {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      return originalMergeAfterSync(tenantId, syncTaskId);
+    });
+    try {
+      // 每个源同步完就 drain：等这次同步带出的合并跑完，再同步下一个源；两个同步压进同一次 drain 时，
+      // 后一个源的合并可能撞上正在跑的合并被丢弃（上面的放大器就是让它必然发生）
+      for (const id of [sources.crm, sources.loyalty]) {
+        await syncSource(author, id);
+        await drain();
+      }
+      const together = (rows: Identity[]) => groupsOf(rows, names).find(g => g.includes('crm:8'));
+      // 默认规则里手机号优先：合并
+      expect(together((await identities(acme)).rows)).toEqual(['crm:8', 'loyalty:7']);
 
-    // 邮箱优先于手机号：邮箱冲突，不再按手机号合并；其余记录照旧
-    await republish(author, reviewer, mappings.crm, `${CRM}identity:\n  match: [email, phone, external_id]\n`);
-    const { rows } = await identities(acme);
-    expect(together(rows)).toEqual(['crm:8']);
-    expect(groupsOf(rows, names).find(g => g.includes('crm:5'))).toEqual(['crm:5', 'crm:6', 'loyalty:5']);
+      // 邮箱优先于手机号：邮箱冲突，不再按手机号合并；其余记录照旧
+      await republish(author, reviewer, mappings.crm, `${CRM}identity:\n  match: [email, phone, external_id]\n`);
+      const { rows } = await identities(acme);
+      expect(together(rows)).toEqual(['crm:8']);
+      expect(groupsOf(rows, names).find(g => g.includes('crm:5'))).toEqual(['crm:5', 'crm:6', 'loyalty:5']);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   it('两个 customer 映射配置的规则不一致时发布被拒绝；规则一致或另一个没配置时可以发布', async () => {
