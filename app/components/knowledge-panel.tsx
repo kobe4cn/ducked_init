@@ -2,7 +2,8 @@
 // （待确认的知识提案、别名、口径声明、业务说明、分析主题）。提案可以接受、修改后接受、填理由拒绝（主题归属只有接受与拒绝，显示主题名）。每个表单都带 intent 与 targetId，交给路由 action 里的 handleKnowledgeIntent；不能编辑时不渲染任何表单和按钮。
 // 需复核的知识配 amber 图标与「待复核」，生效的配 emerald。panel 为 null（定义从未发布过）时只提示发布后才能添加
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
-import { Form } from 'react-router';
+import { Fragment } from 'react';
+import { Form, Link } from 'react-router';
 import type { EntityEntry, FieldEntry, MetricEntry, TagEntry } from '~/.server/catalog';
 import type { KnowledgePanel as Panel, PanelProposal } from '~/.server/knowledge/panel';
 import type { Subject } from '~/.server/knowledge/subjects';
@@ -139,6 +140,15 @@ function EditedValue({ proposal: p }: { proposal: PanelProposal }) {
   }
 }
 
+/** source:<id>#p<段号> 的证据：跳到来源原文页的对应段落，带上证据记下的版本（#527）；不是这种 ref 时返回 null，仍是纯文本 */
+function sourceLink(e: PanelProposal['evidence'][number]): { to: string; text: string } | null {
+  const m = /^source:([^#]+)#p(\d+)$/.exec(e.ref);
+  if (!m) return null;
+  const [, id, no] = m;
+  const version = e.version === undefined ? '' : `?v=${e.version}`;
+  return { to: `/knowledge/sources/${id}${version}#p${no}`, text: e.version === undefined ? e.ref : `${e.ref} v${e.version}` };
+}
+
 /** 待确认的知识提案：没有时整块不渲染 */
 function Proposals({ panel, targetId }: { panel: Panel; targetId: string }) {
   if (!panel.proposals.length) return null;
@@ -154,7 +164,15 @@ function Proposals({ panel, targetId }: { panel: Panel; targetId: string }) {
             <div className="whitespace-pre-wrap">{`${PROPOSAL_KIND_LABEL[p.kind]}：${proposalText(p, panel.subjects.all)}`}</div>
             {p.evidence.length > 0 && (
               <div className="text-xs text-slate-500">
-                {'证据：'}{p.evidence.map(e => (e.version === undefined ? e.ref : `${e.ref} v${e.version}`)).join('、')}
+                {'证据：'}{p.evidence.map((e, i) => {
+                  const link = sourceLink(e);
+                  return (
+                    <Fragment key={`${e.ref}:${i}`}>
+                      {i > 0 && '、'}
+                      {link ? <Link to={link.to} className="hover:underline">{link.text}</Link> : (e.version === undefined ? e.ref : `${e.ref} v${e.version}`)}
+                    </Fragment>
+                  );
+                })}
               </div>
             )}
             {panel.canEdit && (
