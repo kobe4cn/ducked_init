@@ -506,6 +506,48 @@ fields:
   });
 });
 
+describe('源端注释', () => {
+  it('重新列出表后：概览页有「源端注释」区块，按表分组列出表注释与列注释（原文、版本、采集时间），带锚点；还没有注释时显示空状态；查看者打不开页面', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+    const author = await memberOf(tenantId, 'de@acme.com');
+    const id = sourceIdOf(await register(browser, await pgSourceInput(READER)));
+    // 登记时源库还没有任何注释：先看到空状态
+    const empty = await (await browser.get(`/sources/${id}`)).text();
+    expect(empty).toContain('源端注释');
+    expect(empty).toContain('还没有采集到源端注释');
+
+    await grantOnSource(`
+      COMMENT ON TABLE shop.customers IS '消费者主档';
+      COMMENT ON COLUMN shop.customers.city IS '客户常驻城市';
+      COMMENT ON COLUMN shop.customers.email IS '登录邮箱';`);
+    await relistSource(author, id);
+
+    const html = await (await browser.get(`/sources/${id}`)).text();
+    expect(html).not.toContain('还没有采集到源端注释');
+    expect(html).toContain('消费者主档');
+    expect(html).toContain('客户常驻城市');
+    expect(html).toContain('（表注释）');
+    expect(html).toContain('v1');
+    // 组与列都有锚点（写原文），表注释行不带列锚点
+    expect(html).toContain('id="comment-shop.customers"');
+    expect(html).toContain('id="comment-shop.customers.city"');
+    expect(html).toContain('id="comment-shop.customers.email"');
+
+    // 源端删掉注释、原文变了：重新列出后删掉的不列出，变了的是 v2
+    await grantOnSource(`COMMENT ON COLUMN shop.customers.email IS NULL; COMMENT ON COLUMN shop.customers.city IS '常驻城市';`);
+    await relistSource(author, id);
+    const changed = await (await browser.get(`/sources/${id}`)).text();
+    expect(changed).toContain('常驻城市');
+    expect(changed).toContain('v2');
+    expect(changed).not.toContain('登录邮箱');
+    expect(changed).not.toContain('id="comment-shop.customers.email"');
+
+    await memberOf(tenantId, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    expect((await viewer.get(`/sources/${id}`)).status).toBe(403);
+  });
+});
+
 describe('湖中数据', () => {
   it('数据工程师触发核对；「湖中数据」标签页每表一行显示覆盖、位置与四项状态，汇总计入未进湖的表；有差异时可立即主键比对，列表标出有差异的数据源', async () => {
     const { tenantId, browser } = await engineerOf('acme');

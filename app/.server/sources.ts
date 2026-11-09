@@ -293,13 +293,30 @@ export async function syncTables(tenantId: string, sourceId: string): Promise<{ 
 
 /**
  * 数据源详情：连接参数（不含凭据）、最近一次采集的状态、表清单与同步范围（账号读不了的表、源端已不存在的范围内的表、
- * 有几张新表未选），以及范围内各表的列统计、水位线候选与同步方式。
+ * 有几张新表未选），以及范围内各表的列统计、水位线候选与同步方式，和源端还活着的表 / 列注释（#524）。
  * 新表：不在范围内、在成员最近一次修改同步范围之后才列出的表（成员还没看过）
  */
 export async function getSource(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'sources:read');
   const { credentials: _sealed, ...row } = await requireSource(actor.tenant.id, sourceId);
   const { latest, listing, tables, profiledAt } = await confirmedTables(actor.tenant.id, sourceId);
+  // 源端还活着的注释（#524）：源端删掉的（goneAt 非空）不再列出
+  const comments = await getDb()
+    .select({
+      tableSchema: sourceComments.tableSchema,
+      tableName: sourceComments.tableName,
+      columnName: sourceComments.columnName,
+      commentText: sourceComments.commentText,
+      version: sourceComments.version,
+      collectedAt: sourceComments.collectedAt,
+    })
+    .from(sourceComments)
+    .where(and(
+      eq(sourceComments.tenantId, actor.tenant.id),
+      eq(sourceComments.sourceId, sourceId),
+      isNull(sourceComments.goneAt),
+    ))
+    .orderBy(sourceComments.tableSchema, sourceComments.tableName, sourceComments.columnName);
   const reviewedAt = Math.max(0, ...listing.map(t => t.scopedAt?.getTime() ?? 0));
   // 源端已不存在、不在范围内的表不再列出
   const listed = listing.filter(t => t.inScope || !t.goneAt).map(t => ({
@@ -343,6 +360,7 @@ export async function getSource(actor: CurrentMember, sourceId: string) {
       softDeleteConfirmedBy,
       ...syncModeOf(table, watermark?.column ?? null),
     })),
+    comments,
   };
 }
 
