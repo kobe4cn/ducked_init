@@ -22,7 +22,7 @@ process.env.MAILER = 'console';
 delete process.env.LLM_BASE_URL;
 delete process.env.LLM_MODEL;
 delete process.env.LLM_API_KEY;
-// 平台档位（ADR-0055）同理，四个变量一起清
+// 平台档位（ADR-0055）同理，两档各三个变量一起清
 for (const tier of ['FAST', 'REASONING']) {
   for (const suffix of ['MODEL', 'BASE_URL', 'API_KEY']) delete process.env[`LLM_${tier}_${suffix}`];
 }
