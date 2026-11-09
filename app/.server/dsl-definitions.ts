@@ -15,6 +15,7 @@ import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { tenantCatalog } from './catalog/load';
+import { catalogTx } from './catalog/tx';
 import { publishedCustomEntities } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { publishedTagsOf, publishedTagsReferencing } from './dsl-dependencies';
@@ -434,7 +435,7 @@ export async function discardDslDraft(actor: CurrentMember, kind: string, key: s
 export async function deleteDefinition(actor: CurrentMember, kind: string, key: string) {
   assertCan(actor, 'definitions:write');
   requireKind(kind);
-  await getDb().transaction(async tx => {
+  await catalogTx(actor.tenant.id, async tx => {
     // 先锁租户行（与发布定义、映射互斥，同时发布的标签要么已提交、要么看不到这个指标），再锁定义行后查依赖
     await lockTenant(tx, actor.tenant.id);
     const [definition] = await tx.select({ id: dslDefinitions.id }).from(dslDefinitions).where(ofDefinition(actor.tenant.id, kind, key)).for('update');
