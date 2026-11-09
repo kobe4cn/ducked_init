@@ -7,6 +7,7 @@
 | `pipeline/pipeline.test.ts` | 开通租户 → 入队任务 → 独立工作进程 → 任务结果；租户隔离 |
 | `pipeline/scheduling.test.ts` | 队列的领取顺序与名额（不启动工作进程） |
 | `pipeline/sources.test.ts` | 登记数据源、只读探测、凭据加密、采集与水位线候选；领取时按契约 needs 准备凭据与盐（没声明源连接的不管参数里的 sourceId）；MySQL / MongoDB / 对象存储文件源；文件上传数据源（上传的 CSV 不算水位线候选、全量比对，同步后 `bronze_<id>` 有这些行）；并发建源端账号不报错 |
+| `pipeline/source-comments.test.ts` | 表注释与列注释的采集（#522）：PG 登记时采到 `COMMENT ON TABLE / COLUMN`（带 schema、表、列定位与采集时间；只采 spec.schema 里有读权限的表，别的 schema 与不可读的表不采）；重新列出表原文没变版本不变、变了 +1，源端删掉的记消失时间、同原文回来清掉且版本不变；原文截断到 2000 字、单源最多 5000 条（按表、列顺序保留）；MySQL 采到 `TABLE_COMMENT` / `COLUMN_COMMENT`，空串视为没有注释（列注释经 `CONVERT(… USING utf8mb4)`，中文不变成 `\xHH` 转义） |
 | `pipeline/scope.test.ts` | 同步范围：逐张选表、只采集与同步范围内的表 |
 | `pipeline/sync.test.ts` | 水位线增量与全量比对、变更批次、同步历史、源表结构记在 `_schemas` 并与上一次比对（第一次只存不报，新增 / 删除 / 改类型，原始层保留的旧列不再报删除） |
 | `pipeline/verify.test.ts` | 湖中数据核对（覆盖、位置、文件、结构、数据量） |

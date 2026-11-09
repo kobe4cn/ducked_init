@@ -415,7 +415,47 @@ export async function estimatedRows(con: DuckDBConnection, spec: SourceSpec): Pr
   return new Map(found.map(r => [r.name, Number(r.n)]));
 }
 
-/** 测试连接与列出表：能否挂载、各表（含读权限与估算行数）、哪些表没有读权限（及其 schema）、账号是否可写。不读任何行 */
+/** 源端的一条注释：column 为 null 表示表注释本身 */
+export interface SourceComment { schema: string; table: string; column: string | null; text: string }
+
+/**
+ * 源端的表注释与列注释，不读任何行：PostgreSQL 取 obj_description / col_description（与列读权限同一套判定，只采 spec.schema
+ * 里账号可读的表），MySQL 取 information_schema 的 TABLE_COMMENT / COLUMN_COMMENT（空串视为没有注释；列注释在源端先
+ * CONVERT 成 utf8mb4，否则 DuckDB 的 mysql 扩展把它当二进制读回，中文成 \xHH 转义）。其他数据源没有注释。
+ * 结果按表、列排序，调用方（sources.ts）据此做单源上限；原文的截断也在保存时做
+ */
+export async function sourceComments(con: DuckDBConnection, spec: SourceSpec): Promise<SourceComment[]> {
+  let found: { schema_name: string; table_name: string; column_name: string | null; comment_text: string }[] = [];
+  if (spec.kind === 'postgres') {
+    found = await rows(con, `SELECT * FROM postgres_query('src', ${lit(`
+      SELECT n.nspname::text AS schema_name, c.relname::text AS table_name, NULL::text AS column_name,
+             obj_description(c.oid, 'pg_class') AS comment_text
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = ${lit(spec.schema)} AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        AND has_schema_privilege(n.oid, 'USAGE') AND has_table_privilege(c.oid, 'SELECT')
+        AND obj_description(c.oid, 'pg_class') IS NOT NULL
+      UNION ALL
+      SELECT n.nspname::text, c.relname::text, a.attname::text, col_description(a.attrelid, a.attnum)
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+      WHERE n.nspname = ${lit(spec.schema)} AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        AND has_schema_privilege(n.oid, 'USAGE') AND has_table_privilege(c.oid, 'SELECT')
+        AND col_description(a.attrelid, a.attnum) IS NOT NULL
+      ORDER BY 1, 2, 3 NULLS FIRST`)})`);
+  } else if (spec.kind === 'mysql') {
+    found = await rows(con, `SELECT * FROM mysql_query('src', ${lit(`
+      SELECT TABLE_SCHEMA AS schema_name, TABLE_NAME AS table_name, NULL AS column_name, TABLE_COMMENT AS comment_text
+      FROM information_schema.TABLES WHERE TABLE_SCHEMA = ${lit(spec.database)} AND TABLE_COMMENT <> ''
+      UNION ALL
+      SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, CONVERT(COLUMN_COMMENT USING utf8mb4) AS comment_text
+      FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ${lit(spec.database)} AND COLUMN_COMMENT <> ''
+      ORDER BY 1, 2, 3`)})`);
+  }
+  return found.map(r => ({ schema: r.schema_name, table: r.table_name, column: r.column_name, text: r.comment_text }));
+}
+
+/** 测试连接与列出表：能否挂载、各表（含读权限、估算行数与注释）、哪些表没有读权限（及其 schema）、账号是否可写。不读任何行 */
 export async function inspectSource(spec: SourceSpec, limits: EngineLimits) {
   const session = await openSource(spec, limits);
   try {
@@ -427,6 +467,7 @@ export async function inspectSource(spec: SourceSpec, limits: EngineLimits) {
       unreadable: unreadable.map(t => t.name),
       unreadableSchemas: [...new Set(unreadable.map(t => t.schema))],
       listed: all.map((t): ListedTable => ({ name: t.name, schema: t.schema, readable: t.readable, estimatedRows: estimates.get(t.table) ?? null })),
+      comments: await sourceComments(session.con, spec),
       writable: await writeGrants(session, spec),
     };
   } catch (e) {

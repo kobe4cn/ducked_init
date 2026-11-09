@@ -311,6 +311,25 @@ export const sourceTables = platform.table('source_tables', {
   softDeleteConfirmedByEmail: text('soft_delete_confirmed_by_email'),
 }, t => [primaryKey({ columns: [t.sourceId, t.tableName] })]);
 
+// 源端的表注释与列注释（#522）：登记与重新列出表时用同一个只读连接采回。原文没变版本不变、变了 +1；
+// 源端删掉的记下发现的时间（又出现时清空）。列名空串表示表注释本身的行。保存时的截断与单源上限见 sources.ts
+export const sourceComments = platform.table('source_comments', {
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  sourceId: uuid('source_id').notNull().references(() => sources.id, { onDelete: 'cascade' }),
+  /** 注释所在的 schema（与 source_tables.table_schema 同口径） */
+  tableSchema: text('table_schema').notNull(),
+  tableName: text('table_name').notNull(),
+  /** 空串表示这是表注释；非空是这一列的注释 */
+  columnName: text('column_name').notNull().default(''),
+  commentText: text('comment_text').notNull(),
+  /** 这条注释的第几版：第一次采集为 1，原文变了 +1（消失又以同原文回来不变） */
+  version: integer('version').notNull(),
+  /** 最近一次采到这条注释的时间 */
+  collectedAt: timestamp('collected_at', { withTimezone: true }).notNull().defaultNow(),
+  /** 源端删掉了这条注释：发现的时间（又出现时清空） */
+  goneAt: timestamp('gone_at', { withTimezone: true }),
+}, t => [primaryKey({ columns: [t.sourceId, t.tableSchema, t.tableName, t.columnName] })]);
+
 /** 双人发布的版本状态（映射、模板定义、源视图共用，ADR-0015）：草稿可改，已发布的锁定 */
 export const VERSION_STATUSES = ['draft', 'published'] as const;
 export type VersionStatus = (typeof VERSION_STATUSES)[number];

@@ -365,7 +365,8 @@ export async function s3SourceFiles(tenantId: string) {
 
 /**
  * MySQL 源库（TEST_MYSQL_URL，如 mysql://root:密码@localhost:3306/crm_source_test，账号须能建库建用户）：
- * orders 表带自增主键与 updated_at；只读账号与对 orders 可写的账号。返回登记时提交的公共字段（不含账号）
+ * orders 表带自增主键与 updated_at，表与 order_id 列带注释（amount、updated_at 没有：空串视为没有注释）；
+ * 只读账号与对 orders 可写的账号。返回登记时提交的公共字段（不含账号）
  */
 export async function seedMysqlSource() {
   const url = new URL(process.env.TEST_MYSQL_URL!);
@@ -378,7 +379,7 @@ export async function seedMysqlSource() {
       ATTACH 'host=${url.hostname} port=${url.port || 3306} user=${decodeURIComponent(url.username)} password=${decodeURIComponent(url.password)}' AS admin (TYPE mysql)`);
     await exec(`DROP DATABASE IF EXISTS ${db}`);
     await exec(`CREATE DATABASE ${db}`);
-    await exec(`CREATE TABLE ${db}.orders (order_id BIGINT AUTO_INCREMENT PRIMARY KEY, amount DECIMAL(10, 2) NOT NULL, updated_at DATETIME NOT NULL)`);
+    await exec(`CREATE TABLE ${db}.orders (order_id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '订单号', amount DECIMAL(10, 2) NOT NULL, updated_at DATETIME NOT NULL) COMMENT='订单表'`);
     await exec(`INSERT INTO ${db}.orders (amount, updated_at) VALUES (10, '2024-06-01 10:00:00'), (20, '2024-06-02 10:00:00'), (30, '2024-06-03 10:00:00')`);
     for (const { user, password } of [READER, WRITER]) {
       await exec(`DROP USER IF EXISTS '${user}'@'%'`);
