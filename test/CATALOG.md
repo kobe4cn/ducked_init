@@ -163,5 +163,6 @@
 | `publishing-rules.test.ts` | 双人发布规则（映射、模板定义与源视图共用）：当前成员发布不了草稿的原因——不是草稿、没有发布权限、最后保存的是自己、租户里只有自己能发布（纯函数） |
 | `duckdb-sql.test.ts` | 工作台 SQL 编辑器（纯函数）：`completionSchema` 把目录转成补全 schema（silver、gold 带横线的表名补全时加引号且之后照样补出字段、我的沙箱、分享来的表、`lake.` 前缀、数据源名带引号与名字里的点，不是简单标识符的字段名带引号，没挂载的数据源不出现），lang-sql 按它在 `silver.` 后补表名、`表.` / 别名后补字段；`duckdbDialect` 把 `SUMMARIZE` / `DESCRIBE` / `QUALIFY` / `PIVOT` / `EXCLUDE` / `COLUMNS` 解析为关键字 |
 | `nav.test.ts` | 顶栏导航高亮：子页面高亮所属导航项（如快照结果页高亮「分析」），按完整路径段匹配，运营后台审计日志不连带租户（纯函数） |
+| `enqueue-task-script.test.ts` | 提交任务命令行 `scripts/enqueue-task.ts`（#548，`runCli` 起子进程）：不认识的任务类型 `no.such.kind` 在查库之前报「未知的任务类型：no.such.kind」退出 2；开通租户后 `demo.seed` 传 `{"customers":-1}` 入队时 parse 报「参数 customers 必须是 1 到 1000000 之间的整数」退出 1 |
 | `client-build.test.ts` | 真实客户端构建，兜底页面误引 `.server` 模块 |
 | `mailer.test.ts` / `totp.test.ts` | 发信、TOTP（纯函数） |
