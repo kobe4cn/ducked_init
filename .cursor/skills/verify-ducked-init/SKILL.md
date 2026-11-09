@@ -144,6 +144,6 @@ Run cleanup after every failed launch or drive so ports, databases, and roles ar
 | `scripts/ensure-browser.sh` | `.cursor/skills/verify-ducked-init/scripts/ensure-browser.sh` |
 | `scripts/lib.sh` | Sourced by the shell scripts. Do not execute it. |
 
-`browser.mjs` calls `ensure-browser.sh` before opening Chrome. Commands: `goto`, `fill --label --value`, `click --role --name`, `select --label --value`, `wait-text`, `wait-url`, `wait-selector`, `screenshot --path`, `snapshot --path`, `title`, `url`, `text --selector`, `value --label`, `count --selector`, `magic-link --email [--offset]`. `goto /path` resolves against `BASE_URL`.
+`browser.mjs` calls `ensure-browser.sh` before opening Chrome. Commands: `goto`, `fill --label --value`, `click --role --name`, `select --label --value`, `wait-text`, `wait-url`, `wait-selector`, `screenshot --path`, `snapshot --path`, `title`, `url`, `text --selector`, `value --label`, `count --selector`, `magic-link --email [--offset]`. `goto /path` resolves against `BASE_URL`. `fill` / `click` / `select` / `value` also take `--within <css>` to scope the lookup inside one container — the metric builder repeats the same labels (several `添加一行` buttons, one per filter block), so scope with the container: `--within '[data-cond-rows="numerator"]'`.
 
 Keep the map honest as the app changes with `/maintain-verification-skill`.
