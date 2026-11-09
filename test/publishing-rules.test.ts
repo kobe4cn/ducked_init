@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CurrentMember } from '../app/.server/auth';
 import type { Role } from '../app/.server/db/schema';
-import { publishBlocker, publishReason } from '../app/.server/publish-rules';
+import { publishBlocker, publishReason } from '../app/.server/publishing';
 
 const member = (email: string, role: Role): CurrentMember => ({
   memberId: email,

@@ -5,7 +5,7 @@
 // 调用方传入 tx 时不另开事务：发布时调用方必须已经在 catalogTx 里（publishPassthrough 一个事务里发布登记与映射就是），
 // saveDraft 传普通事务也允许（如 saveMappingDraft，保存只审计不在白名单里的 mapping.drafted，记不上目录版本）。
 // 流程本身的错误（不是草稿、已发布、草稿被改过、没有草稿可丢弃）抛 PublishError，各可发布项自己的错误类继承它。
-// 不能 import mappings.ts（它经 publish-rules.ts 导入这里，循环依赖）：锁租户行用 tenant-lock.ts 的 lockTenant；enqueueMerge 只由各适配器的 afterPublish 调
+// 不能 import mappings.ts（它导入这里，循环依赖）：锁租户行用 tenant-lock.ts 的 lockTenant；enqueueMerge 只由各适配器的 afterPublish 调
 import { and, desc, eq, getTableColumns, inArray, sql } from 'drizzle-orm';
 import type { AnyPgColumn, PgTable } from 'drizzle-orm/pg-core';
 import { recordAudit, type AuditAction, type Tx } from './audit';
@@ -21,7 +21,7 @@ export class PublishError extends Error {
   constructor(message: string, readonly status: 400 | 403 | 404 | 422 = 400) { super(message); }
 }
 
-// —— 双人发布规则（ADR-0015），原在 publish-rules.ts，由本模块导出；调用方改从那里导入是 #500 ——
+// —— 双人发布规则（ADR-0015） ——
 
 /**
  * 有发布权限的成员发布不了某一版的原因（不是草稿、最后保存这一版草稿的是自己）；可以发布时为 null。发布权限由调用方另行检查。

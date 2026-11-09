@@ -18,8 +18,7 @@ import {
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
 import { navFor } from '~/.server/nav';
 import { UNLINKED } from '~/.server/pipeline/dsl/metric-spec';
-import { publishReason } from '~/.server/publish-rules';
-import { PublishError } from '~/.server/publishing';
+import { PublishError, publishReason } from '~/.server/publishing';
 import { triggerLabel } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';

@@ -19,8 +19,7 @@ import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.ser
 import { entityRelationStats } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { passthroughPair, publishPassthrough } from '~/.server/passthrough';
-import { PublishError } from '~/.server/publishing';
-import { publishBlocker, publishReason } from '~/.server/publish-rules';
+import { PublishError, publishBlocker, publishReason } from '~/.server/publishing';
 import { relationSuggestions } from '~/.server/relation-suggest';
 import { AppShell } from '~/components/app-shell';
 import { CustomEntityForm, EntityFieldsTable, EntityRelationsTable } from '~/components/custom-entity-form';

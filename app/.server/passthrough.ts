@@ -19,8 +19,7 @@ import { customEntities, customEntityVersions, mappings, mappingVersions, source
 import { checkMappingDraft, createMapping, mappingAdapter, mappingCtx, MappingError, profiledTables } from './mappings';
 import { draftCustomMapping, DraftError, fieldNameFor } from './pipeline/mapping-draft';
 import type { TableProfile } from './pipeline/source-engine';
-import { isStale, publish } from './publishing';
-import { publishBlocker } from './publish-rules';
+import { isStale, publish, publishBlocker } from './publishing';
 import { requireSource } from './source-config';
 import { extensionSpec } from '../lib/mapping-expr';
 
