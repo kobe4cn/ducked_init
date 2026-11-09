@@ -1,6 +1,6 @@
 // app/components/metric-builder.tsx —— 新建指标页的条件构建器（ADR-0017：表单为主、YAML 仍是唯一格式）：基础实体、聚合、度量字段、
 // latest / earliest 的取行字段、ratio 的分子分母、过滤条件与时间窗口，全部选自服务端 loader 给的字段表（fieldsFor 生成，已剔除敏感字段）。
-// 状态是 MetricForm，序列化（没选字段的条件行、没填完的时间窗口丢掉）进隐藏字段 form，服务端按 form.base 重取字段再 formToYaml；
+// 状态是 MetricForm，序列化（没选字段的条件行丢掉；选了字段的时间窗口总带上，天数空输入按 0，<1 交给服务端校验）进隐藏字段 form，服务端按 form.base 重取字段再 formToYaml；
 // 本组件不做校验（sum 选了文本字段之类的问题在「检查」或保存时由服务端 checkMetric 按行列报出），也不接收用户手输的字段名
 import { Plus, X } from 'lucide-react';
 import { useState } from 'react';
@@ -41,8 +41,8 @@ const emptyForm = (): MetricForm => ({
 });
 
 /**
- * 序列化进隐藏字段 form：没选字段的条件行、没填完的时间窗口（字段或天数 <1）丢掉（ui.md「空行保存时忽略」），
- * 空字符串归一成缺省；dimensions 与 readonly 构建器没有控件，永远为空（服务端也不信客户端传来的这两项）
+ * 序列化进隐藏字段 form：没选字段的条件行丢掉（ui.md「空行保存时忽略」），空字符串归一成缺省；选了字段的时间窗口总是带上
+ * （天数 <1 不丢、空输入按 0，交给服务端按 window.days 校验，与直接 POST 同样的值结果一致）；dimensions 与 readonly 构建器没有控件，永远为空（服务端也不信客户端传来的这两项）
  */
 function serialize(form: MetricForm): string {
   const conds = (list: readonly Cond[]) => list.filter(c => c.field !== '');
@@ -55,7 +55,7 @@ function serialize(form: MetricForm): string {
     ...(form.by ? { by: form.by } : {}),
     ...(form.agg === 'ratio' ? { numerator: part(form.numerator), denominator: part(form.denominator) } : {}),
     filter: conds(form.filter),
-    ...(form.window && form.window.field && form.window.days >= 1 ? { window: form.window } : {}),
+    ...(form.window?.field ? { window: { field: form.window.field, days: Number.isFinite(form.window.days) ? form.window.days : 0 } } : {}),
     dimensions: [],
     readonly: [],
   });
@@ -171,6 +171,10 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
     </>
   );
 
+  /** 词表外的聚合（只有手工改隐藏字段 form 才会出现）：下拉多渲染一个当前值的选项并标出「不支持」，与生成的 YAML 一致，不替客户端猜成别的聚合 */
+  const unsupportedAggOption = (agg: string, vocab: readonly string[]) =>
+    vocab.includes(agg) ? null : <NativeSelectOption value={agg}>{`${agg}（不支持，请改选）`}</NativeSelectOption>;
+
   return (
     <div className="space-y-5" data-metric-builder>
       <input type="hidden" name="form" value={serialize(form)} />
@@ -186,6 +190,7 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
         <FieldLabel htmlFor="builder-agg">聚合</FieldLabel>
         <NativeSelect id="builder-agg" value={form.agg} onChange={e => changeAgg(e.target.value as MetricForm['agg'])}>
           {AGGS.map(a => <NativeSelectOption key={a} value={a}>{AGG_TEXT[a]}</NativeSelectOption>)}
+          {unsupportedAggOption(form.agg, AGGS)}
         </NativeSelect>
       </Field>
       {form.agg !== 'ratio' && (
@@ -194,7 +199,7 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
           <NativeSelect id="builder-field" value={form.field ?? ''} onChange={e => patch({ field: e.target.value || undefined })}>
             {fieldOptions(FIELD_TYPES[form.agg], form.agg === 'count' ? '不选（数行数）' : '（请选择）')}
           </NativeSelect>
-          <FieldDescription>{AGG_TEXT[form.agg]}</FieldDescription>
+          <FieldDescription>{AGGS.includes(form.agg) ? AGG_TEXT[form.agg] : `${form.agg}（不支持，请改选）`}</FieldDescription>
         </Field>
       )}
       {(form.agg === 'latest' || form.agg === 'earliest') && (
@@ -215,6 +220,7 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
               setPart(at, { agg, field: fits(form[at]?.field, RATIO_FIELD_TYPES[agg]) ? form[at]?.field : undefined });
             }}>
               {RATIO_AGGS.map(a => <NativeSelectOption key={a} value={a}>{RATIO_AGG_TEXT[a]}</NativeSelectOption>)}
+              {unsupportedAggOption(form[at]?.agg ?? 'count', RATIO_AGGS)}
             </NativeSelect>
             <NativeSelect aria-label={`${at === 'numerator' ? '分子' : '分母'}字段`} value={form[at]?.field ?? ''} onChange={e => setPart(at, { field: e.target.value || undefined })}>
               {fieldOptions(RATIO_FIELD_TYPES[form[at]?.agg ?? 'count'], '不选（数行数）')}
@@ -231,7 +237,7 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
         <FieldLabel>时间窗口（可不填）</FieldLabel>
         <div className="flex flex-wrap items-center gap-2">
           <NativeSelect aria-label="时间窗口字段" value={form.window?.field ?? ''} onChange={e => setForm(f => (e.target.value
-            ? { ...f, window: { field: e.target.value, days: f.window?.days && f.window.days >= 1 ? f.window.days : 30 } }
+            ? { ...f, window: { field: e.target.value, days: f.window ? f.window.days : 30 } }
             : { ...f, window: undefined }))}>
             <NativeSelectOption value="">不限时间</NativeSelectOption>
             {fields.filter(f => TEMPORAL_TYPES.includes(f.type)).map(f => <NativeSelectOption key={f.name} value={f.name}>{show(f)}</NativeSelectOption>)}
@@ -240,9 +246,9 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
             <>
               <span className="text-sm text-slate-500">近</span>
               <Input
-                type="number" min={1} aria-label="时间窗口天数" className="w-24"
-                value={form.window.days >= 1 ? String(form.window.days) : ''}
-                onChange={e => setForm(f => (f.window ? { ...f, window: { ...f.window, days: Math.trunc(Number(e.target.value)) } } : f))}
+                type="number" aria-label="时间窗口天数" className="w-24"
+                value={Number.isFinite(form.window.days) ? String(form.window.days) : ''}
+                onChange={e => setForm(f => (f.window ? { ...f, window: { ...f.window, days: e.target.value === '' ? Number.NaN : Math.trunc(Number(e.target.value)) } } : f))}
               />
               <span className="text-sm text-slate-500">天</span>
             </>

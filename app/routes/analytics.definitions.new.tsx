@@ -22,7 +22,6 @@ import { CANONICAL_ENTITIES, entityOf, type FieldType } from '~/lib/canonical-mo
 import { cmp } from '~/lib/compare';
 import { formToYaml as tagFormToYaml, type TagForm } from '~/lib/tag-form';
 import { diffForms, formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
-import { AGGS, RATIO_AGGS } from '~/lib/metric-vocab';
 import { TAG_CONDITIONS, type TagCondition } from '~/lib/tag-vocab';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
@@ -197,10 +196,9 @@ function builderEntities(
   });
 }
 
-/** 回显用的表单：聚合在词表外就不回显——构建器的控件只认合法聚合（词表外的聚合仍进生成的 YAML、由检查按 measure.agg 报出，不替客户端猜成别的聚合） */
-function echoable(form: MetricForm): string | undefined {
-  const parts = form.agg === 'ratio' ? [form.numerator, form.denominator] : [];
-  return AGGS.includes(form.agg) && parts.every(p => p !== undefined && RATIO_AGGS.includes(p.agg)) ? JSON.stringify(form) : undefined;
+/** 回显用的表单：总是回显（builderFormOf 已逐层规整、丢掉读不出来的条件行）；词表外的聚合也回显——构建器下拉多渲染一个「不支持，请改选」的选项，与生成的 YAML 一致，不替客户端猜成别的聚合 */
+function echoable(form: MetricForm): string {
+  return JSON.stringify(form);
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -242,12 +240,12 @@ export async function action({ request }: Route.ActionArgs) {
   const sentence = String(form.get('sentence') ?? '');
   /** 构建器模式：隐藏字段 form 是 MetricForm（指标）或 TagForm（标签）的 JSON（YAML 模式不提交它） */
   const builder = (kind === 'metric' || kind === 'tag') && form.has('form') ? String(form.get('form')) : undefined;
-  /** 回显给构建器的是服务端规整过的表单，不原样回传客户端的内容（读不出来、聚合在词表外就不回显） */
+  /** 回显给构建器的是服务端规整过的表单，不原样回传客户端的内容（读不出来才不回显） */
   const echo = kind !== 'metric' || builder === undefined ? undefined : (() => { try { return echoable(builderFormOf(builder)); } catch { return undefined; } })();
   /** 标签构建器的回显同样是服务端规整过的表单（tagFormOf 只在 JSON 读不出时不回显） */
   const tagEcho = kind !== 'tag' || builder === undefined ? undefined : (() => { try { return JSON.stringify(tagFormOf(builder)); } catch { return undefined; } })();
-  /** 各分支共有的回显；parse / parsed / diff 只在 intent=parse 的应答里有，这里占位让组件能统一读 */
-  const keep = { key, request: requirement, generated: false, form: echo, tagForm: tagEcho, sentence, parse: undefined, parsed: undefined, diff: undefined };
+  /** 各分支共有的回显；echoId 每次提交都变——回显字符串相同时（只多了一条空条件行被丢掉）也换 key 重挂载构建器，控件跟着回显走；parse / parsed / diff 只在 intent=parse 的应答里有，这里占位让组件能统一读 */
+  const keep = { key, request: requirement, generated: false, form: echo, tagForm: tagEcho, echoId: crypto.randomUUID(), sentence, parse: undefined, parsed: undefined, diff: undefined };
   let yaml = yamlInput;
   try {
     if (intent === 'model-draft') {
@@ -256,10 +254,9 @@ export async function action({ request }: Route.ActionArgs) {
     }
     if (kind === 'metric' && intent === 'parse') {
       const parsed = await parseMetricSentence(member, sentence);
-      // 解析出的表单先 JSON.stringify 再过 builderFormOf 规整（构建器不收 dimensions / readonly），再过 echoable（聚合在词表外构建器显示不了）
+      // 解析出的表单先 JSON.stringify 再过 builderFormOf 规整（构建器不收 dimensions / readonly），再过 echoable（词表外的聚合也回显，构建器下拉标出「不支持」）
       const normalized = builderFormOf(JSON.stringify(parsed.form));
       const shown = echoable(normalized);
-      if (shown === undefined) throw new DslError('解析结果构建器显示不了', 422);
       const parse = {
         items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported,
         // 构建器没有维度控件，builderFormOf 把 dimensions / readonly 都清空了：维度的名字显式提示，不能悄悄丢
@@ -379,9 +376,9 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
                     <span className="text-sm text-slate-500">把构建器当前内容换成解析出的表单。</span>
                   </div>
                 )}
-                {/* 构建器的 useState 只在挂载时初始化，不换 key 时开着 JS 回显填不进规整后的表单 */}
+                {/* 构建器的 useState 只在挂载时初始化：key 用每次提交新生成的 echoId，回显字符串相同（只多了一条空条件行被丢掉）也重挂载，控件跟着回显走 */}
                 {kind === 'metric'
-                  ? <MetricBuilder key={actionData?.form ?? 'empty'} entities={entities ?? []} defaultForm={formOfEcho(actionData?.form)} />
+                  ? <MetricBuilder key={actionData?.echoId ?? 'blank'} entities={entities ?? []} defaultForm={formOfEcho(actionData?.form)} />
                   : <TagBuilder key={actionData?.tagForm ?? 'empty'} metrics={tagMetrics ?? []} defaultForm={formOfTagEcho(actionData?.tagForm)} />}
               </>
             ) : (
