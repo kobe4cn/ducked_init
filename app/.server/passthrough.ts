@@ -9,6 +9,7 @@ import { alias } from 'drizzle-orm/pg-core';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
+import { catalogTx } from './catalog/tx';
 import {
   checkRegistration, createCustomEntity, customEntityAdapter, CustomEntityError, type CustomEntityInput, ENTITY_NAME, isInferredDraft, publishedCustomEntities,
   type RegisteredEntity, requireEntity, UNCONFIRMED,
@@ -96,8 +97,9 @@ export async function createPassthrough(
     const mapping = await createMapping(actor, sourceId, yaml, { registrations });
     return { entityId, mappingId: mapping.id };
   } catch (e) {
-    // 预检之后（如并发）映射仍然写不进：删掉刚建的登记，两份都不留
-    await getDb().transaction(async tx => {
+    // 预检之后（如并发）映射仍然写不进：删掉刚建的登记，两份都不留（createCustomEntity 与 createMapping 的事务都已结束，不嵌套）；
+    // 用 catalogTx：删除登记是目录动作（custom_entity.deleted），在事务收尾记一版目录版本（ADR-0054）
+    await catalogTx(tenantId, async tx => {
       await tx.delete(customEntities).where(eq(customEntities.id, entityId));
       await recordAudit(tx, {
         tenantId, actor, action: 'custom_entity.deleted', targetType: 'custom_entity', targetId: entityId, detail: { name: entity.name },
@@ -158,7 +160,8 @@ export async function publishPassthrough(actor: CurrentMember, entityId: string,
   const registry = new Map(await publishedCustomEntities(getDb(), tenantId)).set(entity.name, draftRegistration);
   // 只为提前报错（发布哪一版在事务里还会再查一次）；plan 不带出去，mappingAdapter 的 checkOutside 重校验出新的
   await checkMappingDraft(tenantId, mapping.sourceId, mappingDraft.yaml, registry).catch(rethrow);
-  return getDb().transaction(async tx => {
+  // catalogTx：两份发布的目录动作在事务收尾只记一版目录版本（ADR-0054），里面传 tx 的 publish 不再另开
+  return catalogTx(tenantId, async tx => {
     // 锁的顺序同单独发布：租户行（入队合并也锁它）、实体行、映射行（mappingAdapter 的 lockParent 里）
     await tx.select({ id: tenants.id }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
     await tx.select({ id: customEntities.id }).from(customEntities).where(eq(customEntities.id, entityId)).for('update');

@@ -7,7 +7,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { listAuditLogs } from '../../app/.server/audit';
 import { discardCustomEntityDraft, getCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { customEntities, customEntityVersions } from '../../app/.server/db/schema';
+import { catalogVersions, customEntities, customEntityVersions } from '../../app/.server/db/schema';
 import { discardDraft, getMapping, listMappings } from '../../app/.server/mappings';
 import { createPassthrough, passthroughPair, passthroughRegistration, publishPassthrough } from '../../app/.server/passthrough';
 import type { TableProfile } from '../../app/.server/pipeline/source-engine';
@@ -154,6 +154,21 @@ describe('登记与映射一起发布', () => {
     const rows = await silver(author.tenant.id, 'custom_customers', 'customer_id');
     expect(rows).toHaveLength(40);
     expect(rows[0].email).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('一起发布后目录版本只多一版，原因是第一个动作 custom_entity.published，快照里同时有该实体与映射', async () => {
+    const { author, reviewer, entityId, mappingId } = await drafts();
+    // 本租户的目录版本行，按版本号排（登记数据源等此前已记过几版，只比这次发布多出的）
+    const versionsOf = () => getDb().select().from(catalogVersions)
+      .where(eq(catalogVersions.tenantId, author.tenant.id)).orderBy(catalogVersions.version);
+    const before = await versionsOf();
+    await publishPassthrough(reviewer, entityId, 1, mappingId, 1);
+    const rows = await versionsOf();
+    expect(rows).toHaveLength(before.length + 1);
+    expect(rows.at(-1)).toMatchObject({ version: (before.at(-1)?.version ?? 0) + 1, reason: 'custom_entity.published' });
+    // 版本在事务收尾记：同一事务里发布的登记与映射都在这一版快照里
+    expect(rows.at(-1)!.snapshot.find(e => e.id === 'entity:custom_customers'))
+      .toMatchObject({ tables: ['table:电商库/customers'] });
   });
 
   it('最后保存人 403、分析师 403、其他租户 404；单独丢弃映射草稿后再一起发布被拒，登记仍是草稿', async () => {
