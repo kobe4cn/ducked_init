@@ -20,6 +20,12 @@ const show = (m: TagMetricOption) => (m.label && m.label !== m.key ? `${m.label}
 /** 空表单（单指标写法）；loader 没给可选指标时也是它 */
 const emptyForm = (): TagForm => ({ single: true, rules: [], missing: {}, default: '', readonly: [] });
 
+/**
+ * 数字框的输入 → 状态：清空（以及输负数时只打了「-」，number 框读出来也是 ''）记 NaN，不记 0——
+ * 否则框清不空、负数打不进去；NaN 的比较序列化时丢掉，NaN 的 missing 当缺省
+ */
+const numOfInput = (text: string): number => (text === '' ? Number.NaN : Number(text));
+
 /** 缺值策略的三态：缺省（不写）、按数值（number）、记空（null）；数值没填完整按缺省 */
 type MissingChoice = 'default' | 'value' | 'null';
 function choiceOf(v: number | null | undefined): MissingChoice {
@@ -46,7 +52,8 @@ function serialize(form: TagForm): string {
   // 留下来的规则行都带非空 metric（单指标写法已取顶层 metric），引用到的指标就是这些
   const referenced = new Set(rules.flatMap(rule => rule.items.map(item => item.metric)));
   const missing = Object.fromEntries([...referenced]
-    .filter(key => form.missing[key] === null || typeof form.missing[key] === 'number')
+    // 「按数值」框清空时是 NaN：当缺省不写（JSON 会把 NaN 写成 null，变成「记空」）
+    .filter(key => form.missing[key] === null || Number.isFinite(form.missing[key]))
     .map(key => [key, form.missing[key]]));
   return JSON.stringify({
     single: form.single,
@@ -131,8 +138,8 @@ function RuleRows({ form, metrics, onChange }: {
                 </NativeSelect>
                 <Input
                   type="number" aria-label="比较数字" className="w-28" placeholder="数字"
-                  value={item.cmp[0]?.value ?? ''}
-                  onChange={e => setItem(i, j, { ...item, cmp: [{ op: item.cmp[0]?.op ?? 'gte', value: Number(e.target.value) }] })}
+                  value={Number.isFinite(item.cmp[0]?.value) ? item.cmp[0]!.value : ''}
+                  onChange={e => setItem(i, j, { ...item, cmp: [{ op: item.cmp[0]?.op ?? 'gte', value: numOfInput(e.target.value) }] })}
                 />
                 {!form.single && (
                   <Button type="button" variant="ghost" size="icon" aria-label="删除这一行" onClick={() => set(i, { ...rule, items: rule.items.filter((_, n) => n !== j) })}><X /></Button>
@@ -216,8 +223,8 @@ export function TagBuilder({ metrics, defaultForm }: { metrics: TagMetricOption[
               {choice === 'value' && (
                 <Input
                   type="number" aria-label={`${labelOf(key)} 的缺省数值`} className="w-24" placeholder="数字"
-                  value={typeof form.missing[key] === 'number' ? String(form.missing[key]) : ''}
-                  onChange={e => patch({ missing: { ...form.missing, [key]: Number(e.target.value) } })}
+                  value={Number.isFinite(form.missing[key]) ? String(form.missing[key]) : ''}
+                  onChange={e => patch({ missing: { ...form.missing, [key]: numOfInput(e.target.value) } })}
                 />
               )}
             </div>
