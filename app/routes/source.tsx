@@ -867,8 +867,9 @@ function SourceComments({ comments }: { comments: CommentView[] }) {
   const groups: [string, CommentView[]][] = [];
   for (const c of comments) {
     const group = `${c.tableSchema}.${c.tableName}`;
-    if (groups.at(-1)?.[0] !== group) groups.push([group, []]);
-    groups.at(-1)![1].push(c);
+    let last = groups.at(-1);
+    if (last?.[0] !== group) groups.push(last = [group, []]);
+    last[1].push(c);
   }
   return (
     <div className="space-y-6">
