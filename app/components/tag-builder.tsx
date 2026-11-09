@@ -22,7 +22,11 @@ const emptyForm = (): TagForm => ({ single: true, rules: [], missing: {}, defaul
 
 /** 缺值策略的三态：缺省（不写）、按数值（number）、记空（null）；数值没填完整按缺省 */
 type MissingChoice = 'default' | 'value' | 'null';
-const choiceOf = (v: number | null | undefined): MissingChoice => (v === undefined ? 'default' : v === null ? 'null' : 'value');
+function choiceOf(v: number | null | undefined): MissingChoice {
+  if (v === undefined) return 'default';
+  if (v === null) return 'null';
+  return 'value';
+}
 
 /**
  * 序列化进隐藏字段 form：空规则（取值为空或没有留下条件行）、空条件行（没选指标或比较的数字没填成有限数）丢掉

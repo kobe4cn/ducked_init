@@ -167,7 +167,10 @@ function tagFormOf(text: string): TagForm {
     return read.length ? [{ value, combinator: combinator === 'any' ? 'any' : 'all', items: read }] : [];
   });
   const missing = (v.missing && typeof v.missing === 'object' && !Array.isArray(v.missing) ? v.missing : {}) as Record<string, unknown>;
-  const scalar = (x: unknown): string | number | '' => (typeof x === 'number' && Number.isFinite(x) ? x : typeof x === 'string' ? x : '');
+  const scalar = (x: unknown): string | number | '' => {
+    if (typeof x === 'number' && Number.isFinite(x)) return x;
+    return typeof x === 'string' ? x : '';
+  };
   return {
     single: v.single !== false,
     ...(typeof v.metric === 'string' && v.metric ? { metric: v.metric } : {}),
