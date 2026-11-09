@@ -5,11 +5,12 @@
 // 最多再修正 MAX_FIXES 次；仍不通过时不再请求模型，由服务端把问题清单与最后一版 YAML 交给成员。
 // 分析计划（ADR-0050）：每轮新建一个检索候选集合（ToolCtx.retrieved）传给每次工具调用，validate_plan 只认本轮 catalog_search / catalog_expand 返回过的条目；
 // 本轮校验过的最后一份结构合法的计划（ToolCtx.plan）随答复返回、由路由存进对话，对话里最近一份作为 priorPlan 带进下一轮，存草稿 / 填工作台前重新校验
-// 本轮 prefill_workbench 通过校验的 SQL（ToolCtx.workbenchSql）随答复返回；返回给前端的只有文字答复、用过的工具名、本轮的计划与这份 SQL，不回传工具原文；每次请求在 platform.llm_calls 记一条 assistant（chatTools），不存提示词与答复原文
+// 本轮 prefill_workbench 通过校验的 SQL（ToolCtx.workbenchSql）随答复返回；返回给前端的只有文字答复、用过的工具名、本轮的计划与这份 SQL，不回传工具原文；
+// 一轮开始时解析一次 reasoning 档位的路由（#531），整轮每次请求都用同一套端点与模型（chatToolsWith）、在 platform.llm_calls 记一条 assistant（route=reasoning），不存提示词与答复原文
 import type { CurrentMember } from '../auth';
 import type { AnalysisPlan } from '../catalog/plan';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
-import { chatTools, LlmError, resolveProvider, type LlmMessage } from '../llm';
+import { chatToolsWith, LlmError, resolveRoute, type LlmMessage } from '../llm';
 import { toolSupport } from '../model-provider';
 import { invokeTool, toolsFor, type ToolCtx, type ToolResult } from './tools';
 
@@ -89,15 +90,18 @@ async function callTool(actor: CurrentMember, name: string, args: string, ctx: T
  * 一轮问答：没配置模型服务 409；最近一次探测为不支持工具调用时 422（不发请求），模型服务出错 422；对话不合格 400。
  * 第 MAX_TOOL_CALLS 次工具调用之后模型还要调用工具时，结束本轮并告知。
  * priorPlan 是对话里最近一份计划（ADR-0050）：不带进发给模型的历史，只经 ToolCtx 给存草稿 / 填工作台前的重新校验兜底；
- * 返回的 plan 只来自本轮 validate_plan（不回传 priorPlan），workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（没有时都缺省）
+ * 返回的 plan 只来自本轮 validate_plan（不回传 priorPlan），workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（没有时都缺省）。
+ * 一轮开始时解析一次 reasoning 档位的路由（#531）：整轮所有请求用同一个模型，中途改配置不影响本轮（tool_call 历史对模型敏感）
  */
 export async function assistantTurn(
   actor: CurrentMember, history: ChatTurn[], page: AssistantPage, priorPlan?: AnalysisPlan,
 ): Promise<{ reply: string; toolsUsed: string[]; plan?: AnalysisPlan; workbenchSql?: string }> {
   checkHistory(history);
   const tenantId = actor.tenant.id;
-  if (!await resolveProvider(tenantId)) throw new AssistantError('未配置模型服务：请到「模型服务」页配置端点、模型与 API Key', 409);
-  if (await toolSupport(tenantId) === false) throw new AssistantError(TOOLS_UNSUPPORTED, 422);
+  // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮所有 chatToolsWith 都用它：中途改配置不影响本轮
+  const route = await resolveRoute(tenantId, 'assistant');
+  if (!route) throw new AssistantError('未配置模型服务：请到「模型服务」页配置端点、模型与 API Key', 409);
+  if (await toolSupport(tenantId, route) === false) throw new AssistantError(TOOLS_UNSUPPORTED, 422);
 
   const tools = toolsFor(actor).map(t => ({ name: t.name, description: t.description, parameters: t.inputSchema }));
   const messages: LlmMessage[] = [
@@ -114,7 +118,7 @@ export async function assistantTurn(
   for (;;) {
     let response;
     try {
-      response = await chatTools(tenantId, 'assistant', messages, tools);
+      response = await chatToolsWith(tenantId, 'assistant', route, messages, tools);
     } catch (e) {
       if (e instanceof LlmError) throw new AssistantError(`该模型服务不支持工具调用或调用失败：${e.message}`, 422);
       throw e;

@@ -16,7 +16,7 @@ import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } f
 import { setLlmFetch } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
-import { fakeLlm, platformDefault, text, toolCalls } from './llm-fixtures';
+import { fakeLlm, platformDefault, platformTier, text, toolCalls } from './llm-fixtures';
 import { CRM, publishedIdentitySources } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -56,6 +56,30 @@ describe('AI 助手的一轮问答', () => {
     const logged = await calls(acme);
     expect(logged).toHaveLength(2);
     expect(logged.every(c => c.purpose === 'assistant' && c.error === null)).toBe(true);
+  });
+
+  it('一轮开始时解析一次档位模型，整轮所有请求都用它：中途改档位配置不影响本轮；llm_calls 每条都记 route reasoning', async () => {
+    platformDefault();
+    platformTier('reasoning', 'model-a');
+    const acme = await newTenant('acme');
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const { received } = fakeLlm(setLlmFetch, n => {
+      if (n === 1) {
+        platformTier('reasoning', 'model-b'); // 第一次请求后改档位配置（模拟另一进程中途换模型）
+        return toolCalls({ name: 'catalog_search', args: { query: 'customer' } }, TOOL_USAGE);
+      }
+      return text('客户实体有城市等字段', TEXT_USAGE);
+    });
+
+    const turn = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
+    expect(turn).toEqual({ reply: '客户实体有城市等字段', toolsUsed: ['catalog_search'] });
+    expect(received).toHaveLength(2);
+    // 第二次请求仍用开始时解析的 model-a：tool_call 历史对模型不兼容，中途换模型会断
+    expect(received.map(r => r.body.model)).toEqual(['model-a', 'model-a']);
+
+    const logged = await calls(acme);
+    expect(logged).toHaveLength(2);
+    expect(logged.every(c => c.purpose === 'assistant' && c.route === 'reasoning' && c.error === null)).toBe(true);
   });
 
   it('工具出错（没有权限、参数不是 JSON）时把错误文本回填给模型，本轮继续', async () => {
