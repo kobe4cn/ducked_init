@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 选中 | `Sandcastle` + `ready-for-agent` | 人 | 下次调度 prep |
 | 已准备 | + `sandcastle:prepped` | prep agent（指引新鲜、≤3 条验收标准、blocker 都已关闭） | plan 选中后实现 |
-| 已拆分 | 父票去掉 `Sandcastle`；子票带 `Sandcastle` + `ready-for-agent` | prep agent | 子票马上各自 prep；子票全关后，脚本在下次调度开头勾上 `## Split into` 清单并关掉父票 |
+| 已拆分 | 父票去掉 `Sandcastle`；子票带 `Sandcastle` + `ready-for-agent` | prep agent | 子票马上各自 prep；子票全关后，脚本在下次调度开头勾上 `## Split into` 清单并关掉父票（子票只认列表项开头的票号） |
 | 已合并 | issue 关闭（PR 正文 `Closes #n`） | 脚本 | 依赖它的票下次调度开工 |
 | 等人审 | + `sandcastle:pr-open` | 脚本（没能自动合并时） | 人审 PR：没问题就合并（issue 自动关闭）；要改就在 PR 上发 `/sandcastle` 开头的评论或 review |
 | 打回 | 去掉 `sandcastle:pr-open` | 脚本（每次调度开头看到打回信号时） | 这次调度重新 plan，implementer 在原分支上先处理 PR 意见 |
@@ -57,7 +57,7 @@ GitHub CI 不作为门槛。
 ## 其他规则
 
 - 只跑指定的票：`SANDCASTLE_ONLY=328,329 npm run run:sandcastle`（prep 与 plan 都只看名单里的票；拆出来的子票不在名单里，要另外加）。
-- plan 由脚本自己算，不用 agent：在已准备的票里排除 `## Blocked by` 里还有 open 票的，剩下的按编号从小到大选，和已选的票改同一个文件（指引里 `- **Change**: \`path\`` 行的路径，以及 `**Change**` 下缩进子条目开头的路径；一条 Change 都没有时兜底取指引里 New / Reuse / ADRs / Tests 之外的 `path:行号` 引用，并在日志里警告；解析在 `.sandcastle/guide.ts`）就跳过，所以冲突时总是编号小的先做，最多 `MAX_PARALLEL`（2）张。被 blocker 挡住的票不占文件。等人审（`sandcastle:pr-open`）的票也占着它的文件：PR 合入或关闭之前，改同一个文件的票不会开工，免得两个 PR 在同一个文件上冲突；代价是 PR 一直不审，这些票就一直排不上。跳过原因会打在日志里。
+- plan 由脚本自己算，不用 agent：在已准备的票里排除 `## Blocked by` 里还有 open 票的（括号里的票号是说明，不算），剩下的按编号从小到大选，和已选的票改同一个文件（指引里 `- **Change**: \`path\`` 行的路径，以及 `**Change**` 下缩进子条目开头的路径；一条 Change 都没有时兜底取指引里 New / Reuse / ADRs / Tests 之外的 `path:行号` 引用，并在日志里警告；解析在 `.sandcastle/guide.ts`）就跳过，所以冲突时总是编号小的先做，最多 `MAX_PARALLEL`（2）张。被 blocker 挡住的票不占文件。等人审（`sandcastle:pr-open`）的票也占着它的文件：PR 合入或关闭之前，改同一个文件的票不会开工，免得两个 PR 在同一个文件上冲突；代价是 PR 一直不审，这些票就一直排不上。跳过原因会打在日志里。
 - prep 和 plan 都按票号从小到大处理：prep 一张接一张串行跑完，plan 才开始选票。
 - 有 open blocker 的票不会被 prep（脚本直接跳过，不开 prep 会话，日志打「跳过 prep #n」），也不会被 plan 选中。blocker 留成 PR 时，依赖它的票在你合并之后的下一次轮询开工（运行已结束时要重新运行）。
 - 每次调度开头重新查询 issue，拆出来的子票在下次调度被看到。plan 选不出票、但这次拆出了还没 prep 的子票时，马上再调度一次，不算空转。
