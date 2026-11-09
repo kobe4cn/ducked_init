@@ -1,14 +1,16 @@
 // app/routes/knowledge.tsx —— 业务知识集中页（ADR-0046）：所有成员可看（definitions:read，不新增权限），按分析主题分组列出有待确认提案或缺失项的目录条目
 // （规则见 knowledge/hub.ts），没有主题的条目在最后的「未归入主题」组。点条目（?item=<targetId>）在本页展开与详情页相同的业务知识面板（字段不带说明区），
 // 能不能编辑沿用面板的 canEdit（definitions:draft）；提交成功后回到原 URL，列表与计数随之更新。
-// 主题组的「生成建议」（ADR-0046 入口③，#513）同步按主题生成一批提案：成功 302 回集中页带计数，查看者由 suggestForSubject 内部抛 403
+// 主题组的「生成建议」（ADR-0046 入口③，#513）同步按主题生成一批提案：成功 302 回集中页带计数，查看者由 suggestForSubject 内部抛 403。
+// 页头的「应用标准模板包」（ADR-0046 入口②，#521）把标准包按租户用到的实体展开成提案：成功同样 302 回集中页带计数，查看者由 applyStandardPackFor 抛 403
 import type { Route } from './+types/knowledge';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
-import { AlertTriangle, CheckCircle2, CircleHelp, Inbox, Sparkles } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, CircleHelp, Inbox, PackageCheck, Sparkles } from 'lucide-react';
 import { can, requirePermission } from '~/.server/access';
 import { catalogFor } from '~/.server/assistant/tools';
 import { expand } from '~/.server/catalog';
 import { getDb } from '~/.server/db/client';
+import { applyStandardPackFor } from '~/.server/knowledge/apply-pack';
 import { KnowledgeError } from '~/.server/knowledge/basis';
 import { isHubEntry, knowledgeHub, type HubEntry, type HubItem } from '~/.server/knowledge/hub';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel, type KnowledgePanel as Panel } from '~/.server/knowledge/panel';
@@ -55,14 +57,32 @@ export async function loader({ request }: Route.LoaderArgs) {
     skipped: Number(search.get('skipped')) || 0,
     fresh: search.get('fresh') !== '0',
   };
-  return { email: member.email, nav: navFor(member), hub, selected, subjectIds, canSuggest: can(member.role, 'definitions:draft'), suggested };
+  // 刚应用完标准模板包 302 回来（?pack=）带出的计数
+  const packVersion = search.get('pack');
+  const packApplied = packVersion === null ? null : {
+    version: Number(packVersion) || 0,
+    created: Number(search.get('created')) || 0,
+    skipped: Number(search.get('skipped')) || 0,
+  };
+  return { email: member.email, nav: navFor(member), hub, selected, subjectIds, canSuggest: can(member.role, 'definitions:draft'), suggested, packApplied };
 }
 
 /** 面板提交（alias.* / claim.* / note.* / subject.* / proposal.*）交给 handleKnowledgeIntent，权限由它按 definitions:draft 判断；出错带 targetId 返回，成功回到原 URL。
- *  intent=suggest 按主题生成一批提案：成功 302 回集中页带计数，可展示的错误（未配置模型、模型失败、没有这个主题）显示在页顶 */
+ *  intent=suggest 按主题生成一批提案、intent=apply-pack 应用标准模板包：成功都 302 回集中页带计数，可展示的错误（未配置模型、模型失败、没有这个主题）显示在页顶 */
 export async function action({ request }: Route.ActionArgs) {
   const form = await request.formData();
   const intent = String(form.get('intent') ?? '');
+  if (intent === 'apply-pack') {
+    // 不能叫 proposal.apply-pack：会被 isKnowledgeIntent 交给面板（实体 / 血缘 / 定义详情页共用那个面板）。403 由 applyStandardPackFor 里的 assertCan 抛出，这里不接
+    const member = await requirePermission(request, 'definitions:read');
+    const outcome = await applyStandardPackFor(member);
+    const params = new URLSearchParams({
+      pack: String(outcome.version), created: String(outcome.created), skipped: String(outcome.skipped),
+    });
+    const item = new URL(request.url).searchParams.get('item');
+    if (item) params.set('item', item);
+    throw redirect(`/knowledge?${params.toString()}`);
+  }
   if (intent === 'suggest') {
     // 不能叫 subject.suggest：会被 isKnowledgeIntent 交给面板。403 由 suggestForSubject 里的 assertCan 抛出，这里不接
     const member = await requirePermission(request, 'definitions:read');
@@ -112,13 +132,14 @@ function Item({ item, active }: { item: HubItem; active: boolean }) {
 }
 
 export default function Knowledge({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, hub, selected, subjectIds, canSuggest, suggested } = loaderData;
+  const { email, nav, hub, selected, subjectIds, canSuggest, suggested, packApplied } = loaderData;
   // 生成建议同步调模型：生成期间禁用所有「生成建议」防止再起一次调用，只有被点的那组显示「生成中…」；
-  // 面板里的提交（alias.add、proposal.accept 等）不影响这些按钮
+  // 应用标准模板包同理禁用；面板里的提交（alias.add、proposal.accept 等）不影响这些按钮
   const navigation = useNavigation();
   const pendingSubject = navigation.state === 'submitting' && navigation.formData?.get('intent') === 'suggest'
     ? String(navigation.formData.get('subjectId'))
     : null;
+  const pendingPack = navigation.state === 'submitting' && navigation.formData?.get('intent') === 'apply-pack';
   const list = hub.groups.length === 0 ? (
     <section className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">
       <p className="inline-flex items-center gap-2"><CheckCircle2 className="size-4 text-emerald-600" />没有待确认的提案或缺失项。</p>
@@ -151,7 +172,23 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
   );
   return (
     <AppShell email={email} nav={nav}>
-      <PageHeader title="业务知识" description="按分析主题列出待确认的知识提案与缺失的口径声明，点开条目在本页处理" />
+      <PageHeader
+        title="业务知识" description="按分析主题列出待确认的知识提案与缺失的口径声明，点开条目在本页处理"
+        actions={canSuggest && (
+          <Form method="post">
+            <input type="hidden" name="intent" value="apply-pack" />
+            <Button type="submit" disabled={pendingPack}>
+              <PackageCheck />{pendingPack ? '应用中…' : '应用标准模板包'}
+            </Button>
+          </Form>
+        )}
+      />
+      {packApplied && !actionData?.error && (
+        <Alert role="status" className="mb-4">
+          <CheckCircle2 className="text-emerald-600" />
+          <AlertTitle>{`已应用标准模板包：新建 ${packApplied.created} 条提案，跳过 ${packApplied.skipped} 条`}</AlertTitle>
+        </Alert>
+      )}
       {suggested && !actionData?.error && (
         <Alert role="status" className="mb-4">
           <CheckCircle2 className="text-emerald-600" />

@@ -272,6 +272,12 @@ const ACTIONS = {
     label: '按主题生成知识提案失败',
     describe: (d: Detail) => `${subjectTarget(d)}，模型服务：${d.error}`,
   },
+  // 应用标准模板包（ADR-0046 入口②，#521）：targetType 是租户，detail 只有包版本与各类计数（skipped 已汇总各类跳过），不记包内容；
+  // 也不进 CATALOG_ACTIONS（提案接受前不进目录）
+  'knowledge_proposal.pack_applied': {
+    label: '应用标准模板包',
+    describe: (d: Detail) => `第 ${d.packVersion} 版：新建 ${d.created} 条，已有 ${d.existing}、拒绝过 ${d.rejected}、跳过 ${d.skipped}`,
+  },
   // 知识来源（ADR-0046 入口③）：成员粘贴的原文按段落、版本保存（#525）。detail 只有标题、种类、版本与段数，不记原文；
   // 同标题再粘贴版本 +1 也记这条（版本号不同），正文没变不加版本、不记。也不进 CATALOG_ACTIONS（来源不是目录条目）
   'knowledge_source.created': {
