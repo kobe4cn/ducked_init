@@ -5,14 +5,17 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { desc, eq } from 'drizzle-orm';
 import { listAuditLogs } from '../../app/.server/audit';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { lakeMigrations } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf, getTenantLake, tenantDataPath } from '../../app/.server/lake';
 import { claimLakeMigration, requestLakeMigration, requestLakeMigrations } from '../../app/.server/lake-migration';
 import { listLakeFiles } from '../../app/.server/lake-storage';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
-import { listObjects } from '../../app/.server/s3-client';
+import { setTenantS3Prefixes } from '../../app/.server/s3-accounts';
+import { listObjects, type S3Creds } from '../../app/.server/s3-client';
 import { claimNextTask, enqueueTask, finishTask, getTask } from '../../app/.server/tasks';
 import { resetDb, runCli } from '../http/harness';
 import { WORKER_SUFFIX } from '../setup-env';
@@ -49,6 +52,34 @@ const inventoryOf = async (tenantId: string) => {
 const runDispatcher = () => createDispatcher({ maxWorkers: 2 }).runUntilIdle();
 
 const auditOf = async (tenantId: string) => (await listAuditLogs(tenantId)).reverse().map(l => `${l.action}：${l.summary}`);
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/** 最近一次迁移存储的整行：`getTenantLake` 的 migration 不含 result，而收回旧前缀失败会写进 result 的 warning */
+const lastMigrationOf = async (tenantId: string) =>
+  (await getDb().select().from(lakeMigrations).where(eq(lakeMigrations.tenantId, tenantId))
+    .orderBy(desc(lakeMigrations.createdAt)).limit(1))[0]!;
+
+/**
+ * 等存储服务开始拒绝该账号访问旧前缀。SeaweedFS 的 S3 网关异步加载共享的 IAM 配置，完整测试里多个 worker
+ * 又都在改这份配置（resetDb 删租户账号、各用例建 lake-<id> 账号，与 #343 的 untilGrantsApplied 同一机制）：
+ * 迁移把租户策略收窄到新前缀后，网关可能仍在用「新旧前缀都放行」的旧策略。每 200 ms 用租户账号列一次旧前缀，
+ * 被拒即返回；其他错误直接抛；30 s 仍可访问则抛错（并发写把收窄覆盖掉是丢失更新，属生产问题，不在这里掩盖）
+ */
+async function untilPrefixDenied(creds: S3Creds, prefixUri: string) {
+  const deadline = Date.now() + 30_000;
+  let lastCount = 0;
+  for (;;) {
+    try {
+      lastCount = (await listObjects(creds, prefixUri)).length;
+    } catch (e) {
+      if (/AccessDenied|HTTP 403/.test((e as Error).message)) return;
+      throw e;
+    }
+    if (Date.now() > deadline) throw new Error(`等了 30 s 旧前缀仍可访问：${prefixUri}（最后一次列出 ${lastCount} 个对象）`);
+    await sleep(200);
+  }
+}
 
 /** 造出有数据文件、多个快照、内联数据的数据湖，返回用于时间旅行比对的早期快照号 */
 async function seedLake(tenantId: string) {
@@ -156,11 +187,58 @@ describe.skipIf(!S3_TARGET)('对象存储上的数据湖迁移到另一个前缀
     expect(await inventoryOf(acme)).toEqual(before.inventory);
     expect(await timeTravel(acme, version)).toEqual(before.timeTravel);
 
+    // 收回旧前缀失败会写成迁移结果 result 里的 warning（不影响迁移状态）：先排除它，剩下的失败才是策略生效延迟
+    expect((await lastMigrationOf(acme)).result?.warning).toBeUndefined();
+
     // 不经 DuckDB 的限制，直接用租户账号访问存储服务
     const creds = lakeSpecOf(lake).s3!;
     expect((await listObjects(creds, lake.dataPath)).some(f => f.path === '.keep')).toBe(true);
+    await untilPrefixDenied(creds, oldPath);
     await expect(listObjects(creds, oldPath)).rejects.toThrow(/AccessDenied|HTTP 403/);
   });
+
+  it('并发迁移后租户账号被拒绝访问旧前缀', async () => {
+    // 完整测试时多个 worker 同时改共享的 IAM 配置（#541）：6 个租户同时迁移，另外 2 个无关租户的策略在迁移期间被反复重写加压
+    const ids: string[] = [];
+    for (const slug of ['co1', 'co2', 'co3', 'co4', 'co5', 'co6']) ids.push(await newTenant(slug));
+    // 开通租户时 catalog 与 S3 账号就建好了：数据文件直接挂湖用 SQL 造（不经 demo.seed 的 worker，6 个租户快得多），
+    // 表足够大才不内联在 catalog 里；这里不比对时间旅行，不用 seedLake
+    await Promise.all(ids.map(id =>
+      withLake(id, sql => sql(`CREATE TABLE payload AS SELECT i AS id, '数据文件' || i AS body FROM range(1, 2001) t(i)`))));
+    const oldPaths = new Map(await Promise.all(ids.map(async id => [id, (await getTenantLake(id))!.dataPath] as const)));
+    for (const id of ids) expect((await listLakeFiles(oldPaths.get(id)!)).some(f => f.path.endsWith('.parquet'))).toBe(true);
+
+    const { requested } = await requestLakeMigrations(null, S3_TARGET!);
+    expect(requested.map(r => r.tenantId).sort()).toEqual([...ids].sort());
+
+    // 无关租户不迁移：迁移进行时反复重写它们的前缀策略，模拟其他 worker 对共享 IAM 配置的并发写
+    const churn: { id: string; path: string }[] = [];
+    for (const slug of ['churn1', 'churn2']) {
+      const id = await newTenant(slug);
+      churn.push({ id, path: (await getTenantLake(id))!.dataPath });
+    }
+
+    const drained = { done: false };
+    await Promise.all([
+      createDispatcher({ maxWorkers: 8 }).runUntilIdle().then(() => { drained.done = true; }),
+      ...churn.map(({ id, path }) => (async () => {
+        while (!drained.done) {
+          await setTenantS3Prefixes(id, [path]).catch(e => console.error('[并发迁移加压] 重写策略失败，继续', e));
+          await sleep(100);
+        }
+      })()),
+    ]);
+
+    // 各租户互不依赖，等策略生效与断言并发进行（等待上限 30 s 是合计，不是每租户叠加）
+    await Promise.all(ids.map(async id => {
+      const migration = await lastMigrationOf(id);
+      expect(migration).toMatchObject({ status: 'succeeded' });
+      expect(migration.result?.warning).toBeUndefined();
+      const creds = lakeSpecOf((await lakeRow(id))!).s3!;
+      await untilPrefixDenied(creds, oldPaths.get(id)!);
+      await expect(listObjects(creds, oldPaths.get(id)!)).rejects.toThrow(/AccessDenied|HTTP 403/);
+    }));
+  }, 420_000); // 8 个租户开通（S3 上各 ~10 s）加 6 个并发迁移，单独跑 ~140 s；4 个 worker 并行跑满时约慢一倍，会超过默认 180 s
 
   it('迁回本地目录后数据完整，之后的写入落在本地', async () => {
     const acme = await newTenant('acme');
