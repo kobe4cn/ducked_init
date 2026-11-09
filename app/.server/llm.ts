@@ -1,6 +1,8 @@
 // app/.server/llm.ts —— 模型服务客户端（ADR-0003、ADR-0035）。模型只在设计时产出草稿：调用 OpenAI 兼容的 /chat/completions，
 // 要求返回 JSON 对象并按调用方给的 JSON Schema 校验，不合格就报错，不把半成品交给调用方。
 // 端点按「租户自己的配置（platform.model_providers，Key 用租户数据密钥加密）> 平台默认（环境变量 LLM_*）」整套选取，不混用。
+// 在选出的一套上按用途分档（ADR-0055）：PURPOSE_TIER 写死每个用途属 fast / reasoning 哪档，平台档位用 LLM_<TIER>_* 环境变量换模型，
+// 租户整套自配时平台档位不生效；档位没绑定模型就回落默认并记 fallbackReason='unbound'。
 // chatTools 带工具调用模型（AI 助手，ADR-0042），不要求 JSON。
 // embed（ADR-0049）走可选的 embedding 端点：租户的 embedding 三项 > 平台环境变量 LLM_EMBEDDING_*，与 chat 互不影响；
 // 都没配置时返回 null（不发请求、不记日志），调用方只走关键词检索。
@@ -14,6 +16,13 @@ import { decryptForTenant } from './secrets';
 /** 调用的用途，记进调用日志 */
 export type LlmPurpose = 'connectivity' | 'tool_probe' | 'assistant' | 'mapping_draft' | 'metric_draft' | 'tag_draft' | 'assertion_draft'
   | 'workbench_draft' | 'workbench_interpret' | 'knowledge_proposal' | 'knowledge_import' | 'metric_parse' | 'embedding';
+
+/** 每个用途属于哪一档（ADR-0055）：写死在这里，不进库。null 的用途不分档，永远用解析出的那一套 provider */
+export const PURPOSE_TIER: Record<LlmPurpose, 'fast' | 'reasoning' | null> = {
+  assistant: 'reasoning', mapping_draft: 'reasoning', metric_draft: 'reasoning', tag_draft: 'reasoning', workbench_draft: 'reasoning',
+  assertion_draft: 'fast', workbench_interpret: 'fast', knowledge_proposal: 'fast', knowledge_import: 'fast', metric_parse: 'fast',
+  connectivity: null, tool_probe: null, embedding: null,
+};
 
 /** 对话里的一条消息（OpenAI 兼容格式）：assistant 要调用工具时带 tool_calls（content 可为空串），工具结果是 role 为 tool、带 tool_call_id 的一条 */
 export interface LlmMessage {
@@ -66,6 +75,40 @@ export async function resolveProvider(tenantId: string): Promise<LlmProvider | n
     default:
       return null;
   }
+}
+
+/** 按用途选档位的结果（ADR-0055）：route 是这次调用所属的档位（不分档为 null），fallbackReason 为 'unbound' 表示
+ *  该档位没绑定模型、用了回落的那一套；provider.model 是实际要调的模型名 */
+export interface LlmRoute { provider: LlmProvider; route: 'fast' | 'reasoning' | null; fallbackReason: 'unbound' | null }
+
+/** 平台档位的某一项环境变量（LLM_<TIER>_*），空串算没填 */
+const tierEnv = (tier: 'fast' | 'reasoning', suffix: 'MODEL' | 'BASE_URL' | 'API_KEY') => process.env[`LLM_${tier.toUpperCase()}_${suffix}`] || undefined;
+
+/**
+ * 解析一次调用走哪一档（ADR-0055）：先按 ADR-0035 选出整套 provider（都没有返回 null）。
+ * 用途不分档、或租户整套自配时不看平台档位，直接用那一套（租户自己的档位绑定另行处理，未绑定时记 unbound）。
+ * 平台默认时 LLM_<TIER>_MODEL 有值就把模型换成它；BASE_URL 与 API_KEY 必须一起填才用档位自己的端点与 Key
+ * （只填一个按没绑定处理并 console.warn，不把默认 Key 发到档位的端点），只填 MODEL 时端点与 Key 复用默认的。
+ */
+export async function resolveRoute(tenantId: string, purpose: LlmPurpose): Promise<LlmRoute | null> {
+  const provider = await resolveProvider(tenantId);
+  if (!provider) return null;
+  const tier = PURPOSE_TIER[purpose];
+  if (!tier) return { provider, route: null, fallbackReason: null };
+  if (provider.source === 'tenant') return { provider, route: tier, fallbackReason: 'unbound' };
+
+  const model = tierEnv(tier, 'MODEL');
+  const baseUrl = tierEnv(tier, 'BASE_URL');
+  const apiKey = tierEnv(tier, 'API_KEY');
+  if ((baseUrl || apiKey) && !(baseUrl && apiKey)) {
+    console.warn(`LLM_${tier.toUpperCase()}_BASE_URL 与 LLM_${tier.toUpperCase()}_API_KEY 要一起填才生效，现在按未配置档位处理`);
+    return { provider, route: tier, fallbackReason: 'unbound' };
+  }
+  if (!model) return { provider, route: tier, fallbackReason: 'unbound' };
+  return {
+    provider: { baseUrl: baseUrl ?? provider.baseUrl, model, apiKey: apiKey ?? provider.apiKey, source: 'platform' },
+    route: tier, fallbackReason: null,
+  };
 }
 
 /** embedding 选哪一套（ADR-0049）：规则与 chat 的 providerSource 相同但互不影响——租户填了 embedding 端点就整套用租户的，
@@ -224,12 +267,12 @@ export async function callTools(provider: LlmProvider, messages: LlmMessage[], t
 }
 
 /**
- * 按租户选端点（resolve，默认 chat 的 resolveProvider）后调用 call。没配置模型服务或没填模型名时直接报错、不发请求、不记日志；
+ * 按租户与用途选档位（resolve，默认 chat 的 resolveRoute）后调用 call。没配置模型服务或没填模型名时直接报错、不发请求、不记日志；
  * 其余调用（成功或失败）都记日志，embedding 调用带上条数 inputCount。日志直接写平台库，不进调用方的事务：调用方回滚时调用记录也要留下
  */
 async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider: LlmProvider, stats: CallStats) => Promise<T>,
-  resolve: (tenantId: string) => Promise<LlmProvider | null> = resolveProvider, inputCount: number | null = null): Promise<T> {
-  const provider = await resolve(tenantId);
+  resolve: (tenantId: string, purpose: LlmPurpose) => Promise<LlmRoute | null> = resolveRoute, inputCount: number | null = null): Promise<T> {
+  const { provider, route, fallbackReason } = (await resolve(tenantId, purpose)) ?? {};
   if (!provider) throw new LlmError('未配置模型服务：请在「模型服务」页填写端点、模型与 API Key，或由平台配置默认模型服务');
   const { model } = provider;
   if (!model) throw new LlmError('模型服务配置不完整：没有填写模型名');
@@ -245,8 +288,8 @@ async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider:
   } finally {
     await getDb().insert(llmCalls).values({
       tenantId, purpose, model, schemaValid: stats.schemaValid, error, inputCount,
-      // 档位与回落原因（#528 路由①）：先写死 null，路由选档在下一张票接上
-      route: null, fallbackReason: null,
+      // 档位与回落原因（ADR-0055）：route 是这次调用所属的档位，fallbackReason 为 'unbound' 表示该档位没绑定模型
+      route, fallbackReason,
       promptTokens: stats.usage?.prompt_tokens ?? null, completionTokens: stats.usage?.completion_tokens ?? null,
       durationMs: Date.now() - started,
     }).catch(e => console.error('记录模型调用日志失败', e));
@@ -272,7 +315,7 @@ export async function embed(tenantId: string, texts: string[]): Promise<number[]
   if (!provider) return null;
   return logged(tenantId, 'embedding',
     (p, stats) => masked(p.apiKey, () => postEmbeddings(p, texts, stats)),
-    async () => provider, texts.length);
+    async () => ({ provider, route: null, fallbackReason: null }), texts.length);
 }
 
 /**
@@ -289,4 +332,4 @@ export async function callEmbeddings(provider: LlmProvider, texts: string[], sta
  * 检索的查询向量一路传更短的 timeoutMs（catalog/embeddings.ts 的 QUERY_EMBED_TIMEOUT_MS），补算不传、仍是默认超时
  */
 export const embedWith = (tenantId: string, provider: LlmProvider, texts: string[], opts: { timeoutMs?: number } = {}): Promise<number[][]> =>
-  logged(tenantId, 'embedding', (p, stats) => callEmbeddings(p, texts, stats, opts), async () => provider, texts.length);
+  logged(tenantId, 'embedding', (p, stats) => callEmbeddings(p, texts, stats, opts), async () => ({ provider, route: null, fallbackReason: null }), texts.length);

@@ -5,14 +5,14 @@ import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { llmCalls, modelProviders } from '../../app/.server/db/schema';
-import { chatJson, embed, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, setLlmFetch } from '../../app/.server/llm';
+import { chatJson, embed, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch } from '../../app/.server/llm';
 import { tableContextFor } from '../../app/.server/model-provider';
 import { encryptForTenant } from '../../app/.server/secrets';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
-import { embeddings, fakeLlm, json, platformDefault, platformEmbedding } from './llm-fixtures';
+import { embeddings, fakeLlm, json, platformDefault, platformEmbedding, platformTier } from './llm-fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -120,13 +120,137 @@ describe('模型服务客户端', () => {
     const rows = await calls(acme);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ purpose: 'mapping_draft', model: 'qwen-plus', promptTokens: 200, completionTokens: 50, schemaValid: true, error: null });
-    // 档位与回落原因（#528 路由①）：这一张只加列与写入通道，现有调用都记 null
-    expect(rows[0].route).toBeNull();
-    expect(rows[0].fallbackReason).toBeNull();
+    // 档位与回落原因（ADR-0055）：mapping_draft 属 reasoning 档，没配档位时记 unbound
+    expect(rows[0].route).toBe('reasoning');
+    expect(rows[0].fallbackReason).toBe('unbound');
     expect(rows[0].durationMs).toBeGreaterThanOrEqual(0);
     const logged = JSON.stringify(rows);
     expect(logged).not.toContain('13800138000');
     expect(logged).not.toContain('13900139000');
+  });
+});
+
+describe('按用途选档位（ADR-0055）', () => {
+  it('没配任何档位时请求与现在完全一样，日志 route 记档位、fallbackReason=unbound，不分档的用途为 null', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    platformEmbedding();
+    // chat 与 embedding 都走同一个假 fetch：按请求体有没有 input 分流答复
+    const { received } = fakeLlm(setLlmFetch, (n, body) => (body.input ? embeddings([[0.5]]) : json({ table: 'orders' }, USAGE)));
+
+    await chatJson(acme, 'metric_draft', MESSAGES, SCHEMA);
+    await chatJson(acme, 'assertion_draft', MESSAGES, SCHEMA);
+    await chatJson(acme, 'connectivity', MESSAGES, SCHEMA);
+    await embed(acme, ['成交额']);
+
+    expect(received).toHaveLength(4);
+    for (const r of received.slice(0, 3)) {
+      expect(r.url).toBe('https://platform.example.com/v1/chat/completions');
+      expect(r.headers.get('authorization')).toBe('Bearer sk-platform-secret');
+      expect(r.body.model).toBe('qwen-plus');
+    }
+    const rows = await calls(acme);
+    expect(rows.map(r => [r.purpose, r.route, r.fallbackReason])).toEqual([
+      ['metric_draft', 'reasoning', 'unbound'],
+      ['assertion_draft', 'fast', 'unbound'],
+      ['connectivity', null, null],
+      ['embedding', null, null],
+    ]);
+  });
+
+  it('平台只填 LLM_REASONING_MODEL 时 reasoning 用途换模型、复用默认端点与 Key，fast 用途照旧用默认模型', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    platformTier('reasoning', 'qwen-max');
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+    await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
+
+    expect(received[0].url).toBe('https://platform.example.com/v1/chat/completions');
+    expect(received[0].headers.get('authorization')).toBe('Bearer sk-platform-secret');
+    expect(received[0].body.model).toBe('qwen-max');
+    expect(received[1].body.model).toBe('qwen-plus');
+    const rows = await calls(acme);
+    expect(rows[0]).toMatchObject({ purpose: 'mapping_draft', model: 'qwen-max', route: 'reasoning', fallbackReason: null });
+    expect(rows[1]).toMatchObject({ purpose: 'metric_parse', model: 'qwen-plus', route: 'fast', fallbackReason: 'unbound' });
+  });
+
+  it('档位的 BASE_URL 与 API_KEY 一起填时整套用档位自己的端点与 Key', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    platformTier('reasoning', 'qwen-max', { baseUrl: 'https://reasoning.example.com/v1', apiKey: 'sk-reasoning-secret' });
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+
+    expect(received[0].url).toBe('https://reasoning.example.com/v1/chat/completions');
+    expect(received[0].headers.get('authorization')).toBe('Bearer sk-reasoning-secret');
+    expect(received[0].body.model).toBe('qwen-max');
+    expect((await calls(acme))[0]).toMatchObject({ model: 'qwen-max', route: 'reasoning', fallbackReason: null });
+  });
+
+  it('BASE_URL 与 API_KEY 只填一个时按没绑定处理：默认 Key 不发到档位端点，console.warn，记 unbound', async () => {
+    const acme = await newTenant('acme');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    platformDefault(BASE_WITH_SLASH);
+    platformTier('reasoning', 'qwen-max', { baseUrl: 'https://reasoning.example.com/v1' });   // 只填了 BASE_URL
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+
+    expect(received[0].url).toBe('https://platform.example.com/v1/chat/completions');
+    expect(received[0].headers.get('authorization')).toBe('Bearer sk-platform-secret');
+    expect(received[0].body.model).toBe('qwen-plus');
+    expect((await calls(acme))[0]).toMatchObject({ model: 'qwen-plus', route: 'reasoning', fallbackReason: 'unbound' });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('LLM_REASONING');
+    warn.mockRestore();
+  });
+
+  it('租户整套自配时平台档位不生效：请求租户的端点与模型，记 unbound', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    platformTier('reasoning', 'qwen-max');
+    await tenantProvider(acme);
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+
+    expect(received[0].url).toBe('https://tenant.example.com/v1/chat/completions');
+    expect(received[0].headers.get('authorization')).toBe('Bearer sk-tenant-secret');
+    expect(received[0].body.model).toBe('deepseek-chat');
+    expect((await calls(acme))[0]).toMatchObject({ model: 'deepseek-chat', route: 'reasoning', fallbackReason: 'unbound' });
+  });
+
+  it('配了档位、返回 500 或 429 时只发一次请求，抛 transient 的 LlmError，不换模型不重试', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    platformTier('reasoning', 'qwen-max');
+    for (const status of [500, 429]) {
+      const { f, received } = fakeLlm(setLlmFetch, () => new Response('upstream failed', { status }));
+
+      const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)) as LlmError;
+      expect(err).toBeInstanceOf(LlmError);
+      expect(err.transient).toBe(true);
+      expect(err.message).toMatch(new RegExp(String(status)));
+      expect(f).toHaveBeenCalledTimes(1);
+      expect(received[0].body.model).toBe('qwen-max');
+      const rows = await calls(acme);
+      expect(rows.at(-1)).toMatchObject({ model: 'qwen-max', route: 'reasoning', fallbackReason: null, error: expect.stringMatching(new RegExp(String(status))) });
+    }
+  });
+
+  it('平台默认三项不全时就算配了档位也报「未配置模型服务」，不发请求、不记日志', async () => {
+    const acme = await newTenant('acme');
+    vi.stubEnv('LLM_BASE_URL', 'https://platform.example.com/v1');   // 只配了一部分不算
+    platformTier('reasoning', 'qwen-max');
+    const { f } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    expect(await resolveRoute(acme, 'mapping_draft')).toBeNull();
+    await expect(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)).rejects.toThrow(/未配置模型服务/);
+    expect(f).not.toHaveBeenCalled();
+    expect(await calls(acme)).toHaveLength(0);
   });
 });
 

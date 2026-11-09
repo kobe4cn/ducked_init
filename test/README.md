@@ -140,6 +140,7 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 | `json(content, usage?)` | 模型的 JSON 文本答复（`content` 经 `JSON.stringify`） |
 | `toolCalls(calls, usage?)` | 模型要调用工具：`{ name, args, id? }` 或其数组，`id` 默认 `call_1`、`call_2`…；`args` 是字符串时原样作为 `arguments`（造不是 JSON 的参数），否则 `JSON.stringify` |
 | `platformEmbedding(baseUrl?)` | `vi.stubEnv` 设平台默认 embedding 端点（ADR-0049，与 chat 的互不影响）：`LLM_EMBEDDING_BASE_URL`（默认 `https://embed.example.com/v1`）、`LLM_EMBEDDING_MODEL=text-embedding-v3`、`LLM_EMBEDDING_API_KEY=sk-embed-secret`；只配一部分时照旧内联 `vi.stubEnv` |
+| `platformTier(tier, model, opts?)` | `vi.stubEnv` 设平台档位（ADR-0055）：`LLM_FAST_*` / `LLM_REASONING_*` 的 `MODEL`，`opts` 里给到的 `baseUrl` / `apiKey` 才设对应变量（要一起给才生效，测「填了又算没填」传空串） |
 | `embeddings(vectors, usage?)` | embedding 端点的答复：每个向量按出现顺序给 `{ index, embedding }`；要测乱序返回（index 1 在前）时在测试里自己构造 `Response`；`usage` 只带 `prompt_tokens`（/embeddings 没有 completion_tokens） |
 
 `usage` 省略时返回里不带 usage 字段（`platform.llm_calls` 的 token 列为空）；要断言 token 数（或迁移前就带 usage）时显式传 `{ prompt_tokens, completion_tokens }`（`embeddings` 只需 `prompt_tokens`）。非 200 的返回直接写 `new Response(..., { status })`。

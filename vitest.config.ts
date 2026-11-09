@@ -22,6 +22,10 @@ process.env.MAILER = 'console';
 delete process.env.LLM_BASE_URL;
 delete process.env.LLM_MODEL;
 delete process.env.LLM_API_KEY;
+// 平台档位（ADR-0055）同理，四个变量一起清
+for (const tier of ['FAST', 'REASONING']) {
+  for (const suffix of ['MODEL', 'BASE_URL', 'API_KEY']) delete process.env[`LLM_${tier}_${suffix}`];
+}
 // 凭据信封加密的主密钥：测试用固定值
 process.env.PLATFORM_MASTER_KEY = Buffer.alloc(32, 7).toString('base64');
 // DuckDB 文件类数据源所在的本地目录（每个租户一个子目录）
