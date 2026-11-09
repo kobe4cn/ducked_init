@@ -69,7 +69,7 @@ describe('一句话解析成指标表单', () => {
     const [system, user] = received[0]!.body.messages;
     expect(system).toMatchObject({ role: 'system' });
     expect(system!.content).toContain('capability:metric-dsl');
-    for (const rule of ['近 N 天', 'in', '分母为 0', 'unknowns', 'unsupported']) expect(system!.content).toContain(rule);
+    for (const rule of ['同一字段的不同取值时改写成一个 in', '近 N 天', '上个月', '分母为 0 时算 0', 'unknowns', 'unsupported']) expect(system!.content).toContain(rule);
     // user 依次是目录总览、按句子搜出的条目与句子原文
     expect(user!.role).toBe('user');
     const [overviewPart, searchPart] = user!.content.split('# 与需求相关的条目');
