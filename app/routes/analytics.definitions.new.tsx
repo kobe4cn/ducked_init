@@ -196,11 +196,6 @@ function builderEntities(
   });
 }
 
-/** 回显用的表单：总是回显（builderFormOf 已逐层规整、丢掉读不出来的条件行）；词表外的聚合也回显——构建器下拉多渲染一个「不支持，请改选」的选项，与生成的 YAML 一致，不替客户端猜成别的聚合 */
-function echoable(form: MetricForm): string {
-  return JSON.stringify(form);
-}
-
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'definitions:draft');
   const url = new URL(request.url);
@@ -240,8 +235,9 @@ export async function action({ request }: Route.ActionArgs) {
   const sentence = String(form.get('sentence') ?? '');
   /** 构建器模式：隐藏字段 form 是 MetricForm（指标）或 TagForm（标签）的 JSON（YAML 模式不提交它） */
   const builder = (kind === 'metric' || kind === 'tag') && form.has('form') ? String(form.get('form')) : undefined;
-  /** 回显给构建器的是服务端规整过的表单，不原样回传客户端的内容（读不出来才不回显） */
-  const echo = kind !== 'metric' || builder === undefined ? undefined : (() => { try { return echoable(builderFormOf(builder)); } catch { return undefined; } })();
+  /** 回显给构建器的是服务端规整过的表单（builderFormOf 逐层规整、丢掉读不出来的条件行），不原样回传客户端的内容，读不出来才不回显；
+   *  词表外的聚合也回显——构建器下拉多渲染一个「不支持，请改选」的选项，与生成的 YAML 一致，不替客户端猜成别的聚合 */
+  const echo = kind !== 'metric' || builder === undefined ? undefined : (() => { try { return JSON.stringify(builderFormOf(builder)); } catch { return undefined; } })();
   /** 标签构建器的回显同样是服务端规整过的表单（tagFormOf 只在 JSON 读不出时不回显） */
   const tagEcho = kind !== 'tag' || builder === undefined ? undefined : (() => { try { return JSON.stringify(tagFormOf(builder)); } catch { return undefined; } })();
   /** 各分支共有的回显；echoId 每次提交都变——回显字符串相同时（只多了一条空条件行被丢掉）也换 key 重挂载构建器，控件跟着回显走；parse / parsed / diff 只在 intent=parse 的应答里有，这里占位让组件能统一读 */
@@ -254,9 +250,9 @@ export async function action({ request }: Route.ActionArgs) {
     }
     if (kind === 'metric' && intent === 'parse') {
       const parsed = await parseMetricSentence(member, sentence);
-      // 解析出的表单先 JSON.stringify 再过 builderFormOf 规整（构建器不收 dimensions / readonly），再过 echoable（词表外的聚合也回显，构建器下拉标出「不支持」）
+      // 解析出的表单先 JSON.stringify 再过 builderFormOf 规整（构建器不收 dimensions / readonly），再回显（词表外的聚合也回显，构建器下拉标出「不支持」）
       const normalized = builderFormOf(JSON.stringify(parsed.form));
-      const shown = echoable(normalized);
+      const shown = JSON.stringify(normalized);
       const parse = {
         items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported,
         // 构建器没有维度控件，builderFormOf 把 dimensions / readonly 都清空了：维度的名字显式提示，不能悄悄丢
@@ -284,7 +280,7 @@ export async function action({ request }: Route.ActionArgs) {
     if (kind === 'metric' && intent === 'applyParse') {
       // 确认覆盖：读隐藏字段 parsed（parse 应答里那份 JSON），同样不信客户端，过一遍规整再回显
       let shown: string | undefined;
-      try { shown = echoable(builderFormOf(String(form.get('parsed') ?? ''))); } catch { /* 按读不出来处理 */ }
+      try { shown = JSON.stringify(builderFormOf(String(form.get('parsed') ?? ''))); } catch { /* 按读不出来处理 */ }
       if (shown === undefined) throw new DslError('解析结果读不出来，请重新点「解析一句话」');
       return { error: null, issues: [], yaml, summary: null, sql: null, ...keep, form: shown };
     }
