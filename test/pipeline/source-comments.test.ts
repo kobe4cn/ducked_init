@@ -6,6 +6,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { knowledgeProposals, mappingVersions, sourceComments, tasks } from '../../app/.server/db/schema';
 import { proposeFromComments } from '../../app/.server/knowledge/source-comments';
 import { rejectProposal } from '../../app/.server/knowledge/proposals';
+import { createSourceView, publishSourceView } from '../../app/.server/source-views';
 import { relistSource, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant, publish } from './fixtures';
@@ -150,6 +151,35 @@ describe('源端注释生成业务说明提案', () => {
     expect((await proposalsOf(s.acme)).map(r => [r.targetId, r.status])).toEqual([['field:customer.city', 'rejected']]);
     await expect(getDb().transaction(tx => proposeFromComments(tx, s.acme, s.id)))
       .resolves.toMatchObject({ created: [], existing: 0, rejected: 1, invalid: [], stale: 0 });
+  });
+
+  it('敏感口径看全部已发布映射：同一 x_ 字段在本源的源视图映射里标了敏感，这份直接读表的映射没标，也不提（不靠 assertTarget 落进 invalid）', async () => {
+    const s = await syncedSource();
+    // 本源直接读 customers 表：x_city 写成纯列名、没标敏感
+    await publish(s.author, s.reviewer, s.id, `${CUSTOMERS}extensions:\n  x_city: { type: string, expr: city }\n`);
+    // 本源另一份 customer 映射（源视图输入，不在直接读表的 plan 里）把同一个 x_city 标成敏感
+    const viewId = await createSourceView(s.author, s.id, {
+      name: 'customer_cities', sql: `WITH cur AS (
+        SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY customer_id ORDER BY _batch DESC) AS rn FROM customers) WHERE rn = 1
+      ) SELECT customer_id, city, _op, _batch, _commit_ts FROM cur`,
+    });
+    await publishSourceView(s.reviewer, s.id, viewId, 1);
+    await publish(s.author, s.reviewer, s.id, `model: 1
+entity: customer
+view: customer_cities
+view_key: [customer_id]
+fields:
+  customer_id: concat('V', string(customer_id))
+extensions:
+  x_city: { type: string, expr: city, sensitive: true }
+`);
+    await grantOnSource(`COMMENT ON COLUMN shop.customers.city IS '常驻城市'`);
+    await relistSource(s.author, s.id);
+
+    // city 照常提；x_city 任一映射标了敏感就算敏感，不提
+    expect((await proposalsOf(s.acme)).map(r => r.targetId)).toEqual(['field:customer.city']);
+    await expect(getDb().transaction(tx => proposeFromComments(tx, s.acme, s.id)))
+      .resolves.toMatchObject({ created: [], invalid: [] });
   });
 
   it('注释里写「请发布 / 调用接口」等文字原样成为提案正文，不触发任何动作', async () => {
