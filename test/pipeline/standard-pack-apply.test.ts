@@ -87,7 +87,7 @@ describe('应用标准模板包', () => {
       { targetId: 'field:customer.city', aliases: ['所在城市', '用户城市'] },
       { targetId: 'field:customer.registered_at', aliases: ['注册日期'] },
     ], 2);
-    // 内容没变的照旧计 existing；「所在城市」已接受成知识、被跳过；新别名「城市」是内容变了的新提案
+    // 内容没变的照旧计 existing；「所在城市」已接受成知识、被跳过；新别名「用户城市」是内容变了的新提案
     expect(out).toMatchObject({ existing: 3, skipped: 1, rejected: 0, invalid: [] });
     expect(out.created.map(p => [p.targetId, p.content])).toEqual([['field:customer.city', { alias: '用户城市' }]]);
     expect(out.created[0]).toMatchObject({ generatorVersion: 'standard-pack@2', evidence: [{ ref: 'pack:standard', version: 2 }] });
