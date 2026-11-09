@@ -1,7 +1,8 @@
 // app/.server/catalog/plan.ts —— 分析计划的确定性校验（ADR-0050，#409 / #410，设计文档 9.1 / 9.2）：助手提交计划 JSON，
 // 这里只吃传入的可见目录（catalogFor 已按角色裁剪：条目在目录里就等于已发布且有权限）与本次检索到的候选 id，
 // 不读库、不信任 JSON 里的租户与操作者（出现也忽略）。校验分五层：结构（JSON Schema + 步骤业务检查，步骤动作是受控枚举
-// PLAN_ACTIONS、每种动作有自己的输入约束）、硬性（选中条目必须来自本次检索、在目录里，版本与语义哈希和当前一致）、
+// PLAN_ACTIONS、每种动作有自己的输入约束）、硬性（选中条目必须来自本次检索、在目录里，版本与语义哈希和当前一致；
+// excluded 只查 id 来自本次检索且不与 selected 重复，不查目录，#539）、
 // 口径（只对 reuse_result 选中的指标，用户明确要求的单位 / 时间含义 / 窗口与口径声明比较）、可加性（aggregate 的
 // sum / avg 不能作用在比率 / 去重计数 / 最新值这类不可加的度量上）、平台能力（DSL 只能算到统一消费者粒度）。
 // 接入助手工具在 ⑮。
@@ -69,6 +70,8 @@ export interface AnalysisPlan {
   reason?: string;
   /** 为何选这些条目，给成员看（计划卡「为何选」） */
   rationale?: string;
+  /** 检索到但没选的口径及原因，给成员看（计划卡「排除了哪些口径」）；id 也必须来自本轮检索，但不查可见目录、版本与哈希 */
+  excluded?: { id: string; reason: string }[];
 }
 
 export type PlanStatus = 'valid' | 'needs_clarification' | 'unsupported' | 'invalid';
@@ -144,6 +147,14 @@ export const PLAN_SCHEMA = {
     questions: { type: 'array', items: { type: 'string', minLength: 1 } },
     reason: { type: 'string', minLength: 1 },
     rationale: { type: 'string', minLength: 1 },
+    excluded: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['id', 'reason'],
+        properties: { id: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } },
+      },
+    },
   },
   allOf: [
     { if: { properties: { mode: { const: 'clarify' } }, required: ['mode'] }, then: { required: ['questions'], properties: { questions: { minItems: 1 } } } },
@@ -154,6 +165,10 @@ export const PLAN_SCHEMA = {
 const validateSchema: ValidateFunction = new Ajv({ allErrors: true, strict: false }).compile(PLAN_SCHEMA);
 
 const SEVERITY: Record<PlanStatus, number> = { valid: 0, needs_clarification: 1, unsupported: 2, invalid: 3 };
+
+/** selected 与 excluded 的 id 并集：读回重新校验（计划卡、存草稿、填入工作台）把两类都当作检索过，带 excluded 的计划不会因此被判「不在本次检索结果里」 */
+export const planRetrievedIds = (plan: AnalysisPlan): Set<string> =>
+  new Set([...plan.selected.map(s => s.id), ...(plan.excluded ?? []).map(x => x.id)]);
 
 /** 计划合法时对话的下一步：clarify 要追问，unsupported 说明做不到，其余模式校验过了就是 valid */
 const modeStatus = (mode: PlanMode): PlanStatus => {
@@ -231,6 +246,19 @@ export function validatePlan(input: unknown, ctx: { catalog: Catalog; retrieved:
     }
     if (s.semanticHash !== semanticHash(e)) {
       issues.push({ path: `selected.${i}.semanticHash`, entryId: s.id, message: '语义哈希与当前目录不一致（条目内容变了）' });
+      raise('invalid');
+    }
+  }
+
+  // excluded（#539）只是说明检索到但没选的口径：只查 id 来自本次检索、不与 selected 重复；不查可见目录、版本与哈希，
+  // id 也不进 entryIds——步骤 inputs 不能引用被排除的条目（上面的结构检查只认 selected）
+  for (const [i, x] of plan.excluded?.entries() ?? []) {
+    if (!ctx.retrieved.has(x.id)) {
+      issues.push({ path: `excluded.${i}.id`, entryId: x.id, message: '排除的条目不在本次检索结果里' });
+      raise('invalid');
+    }
+    if (entryIds.has(x.id)) {
+      issues.push({ path: `excluded.${i}.id`, entryId: x.id, message: '同一条目不能既选中又排除' });
       raise('invalid');
     }
   }

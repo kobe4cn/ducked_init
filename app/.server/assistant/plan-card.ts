@@ -1,13 +1,14 @@
 // app/.server/assistant/plan-card.ts —— 助手答复下计划卡的视图（#452，分析计划 P4⑯a，ADR-0050 / 0043 / 0005）：带 plan 的
 // assistant 消息在读时（POST 返回与 ?id= 读回）按读者自己的目录组装一张卡片：不存状态、用当前元数据重新 validatePlan 一次
 // （selected 都当作检索过，拦下来的只有依赖变了与看不到所选条目），列出校验结果、所选条目（名称、说明、数据截至）、为何选
-// （rationale，#538，计划里没有就不带这个键）、依据、窗口 / 粒度 / 维度 / 人群与模式。读者看不到的条目（expand 返回 null，目录按角色过滤，ADR-0005）只留 id、不带名称与说明，
+// （rationale，#538，计划里没有就不带这个键）、依据、排除了哪些口径（excluded，#539，读者看不到的条目只有原因，id 与名称
+// 都不给——id 自带数据源名）、窗口 / 粒度 / 维度 / 人群与模式。读者看不到的条目（expand 返回 null，目录按角色过滤，ADR-0005）只留 id、不带名称与说明，
 // 状态按重新校验的结果给出（不是 valid）、不报错。卡片只进响应：不写库（sealed 里存的是 plan 本身），也不拼进发给模型的
 // content（ADR-0043）。questions / reason 原样带上；重新校验通过且 mode 是 reuse_result 时给 resultHref——所选条目里第一个
 // 有结果页的条目（模板 / 指标 / 标签，实体与源表没有结果页，路由见 app/routes.ts），找不到就不给（#453）。纯函数：
 // 同一份目录与计划每次相同
 import { expand, type Catalog, type CatalogEntry, type MetricEntry } from '../catalog';
-import { validatePlan, type AnalysisPlan, type PlanMode, type PlanStatus } from '../catalog/plan';
+import { planRetrievedIds, validatePlan, type AnalysisPlan, type PlanMode, type PlanStatus } from '../catalog/plan';
 
 /** 计划卡视图：字段从计划与重新校验的结果组装，客户端组件（app/components/plan-card.tsx）只读 */
 export interface PlanCardView {
@@ -21,6 +22,8 @@ export interface PlanCardView {
   reason?: string;
   /** 为何选这些条目（计划里模型写的，给成员看）；旧计划没有，卡片上也没有这个键 */
   rationale?: string;
+  /** 排除了哪些口径（检索到但没选，#539）：读者看得到的条目带 id 与名称，看不到的只有 reason（id 与名称都不给）；旧计划没有这个键 */
+  excluded?: { id?: string; name?: string; reason: string }[];
   /** 重新校验通过且 reuse_result 时链到现有结果页；所选条目都没有结果页或没通过时不带 */
   resultHref?: string;
 }
@@ -33,8 +36,8 @@ const asOfOf = (e: CatalogEntry): string => {
 };
 
 export function planCardView(catalog: Catalog, plan: AnalysisPlan): PlanCardView {
-  // 重新校验的写法照 tools.ts 存草稿前那次：selected 都当作检索过，只看当前目录里还成不成立
-  const check = validatePlan(plan, { catalog, retrieved: new Set(plan.selected.map(s => s.id)) });
+  // 重新校验的写法照 tools.ts 存草稿前那次：selected 与 excluded 都当作检索过（planRetrievedIds），只看当前目录里还成不成立
+  const check = validatePlan(plan, { catalog, retrieved: planRetrievedIds(plan) });
   // request 没写窗口时取所选指标声明的窗口（第一个带窗口的指标）
   const metricWindow = plan.selected
     .map(s => expand(catalog, s.id))
@@ -71,6 +74,13 @@ export function planCardView(catalog: Catalog, plan: AnalysisPlan): PlanCardView
     questions: plan.questions,
     ...(plan.reason ? { reason: plan.reason } : {}),
     ...(plan.rationale ? { rationale: plan.rationale } : {}),
+    ...(plan.excluded?.length ? {
+      // 读者看不到的条目只给 reason：名称和 id 都不出现（像 table:CRM/orders 这样的 id 自带数据源名）
+      excluded: plan.excluded.map(x => {
+        const e = expand(catalog, x.id);
+        return e === null ? { reason: x.reason } : { id: x.id, name: e.name, reason: x.reason };
+      }),
+    } : {}),
     ...(resultHref ? { resultHref } : {}),
   };
 }

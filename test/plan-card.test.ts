@@ -1,6 +1,7 @@
 // test/plan-card.test.ts —— 计划卡视图 planCardView()（#452 / #453，ADR-0050 / 0005，纯函数，不连库）：模板条目的数据截至取快照时间，
 // 没有快照写「暂无快照」；目录里没有的所选条目只留 id，状态按重新校验给出（不是 valid）；重新校验通过且 reuse_result 时
-// 给 resultHref（所选条目里第一个有结果页的：模板 / 指标 / 标签），clarify / unsupported 原样带上 questions / reason
+// 给 resultHref（所选条目里第一个有结果页的：模板 / 指标 / 标签），clarify / unsupported 原样带上 questions / reason；
+// excluded（#539）目录里有的条目带 id 与名称、没有的只有 reason，excluded 的 id 也算检索过（状态可仍为 valid）
 import { describe, expect, it } from 'vitest';
 import { buildCatalog, type Catalog, type CatalogEntry } from '../app/.server/catalog';
 import { semanticHash, type AnalysisPlan, type SelectedRef } from '../app/.server/catalog/plan';
@@ -100,5 +101,26 @@ describe('计划卡视图 planCardView', () => {
     expect(planCardView(RETRIEVAL_CATALOG, planOf({ rationale: '成员问的是近 30 天的营收，revenue_30d 的窗口与口径正好对上' })))
       .toMatchObject({ rationale: '成员问的是近 30 天的营收，revenue_30d 的窗口与口径正好对上' });
     expect(planCardView(RETRIEVAL_CATALOG, planOf())).not.toHaveProperty('rationale');
+  });
+
+  it('plan 带 excluded 时卡片带「排除了哪些口径」：目录里有的条目带 id 与名称，没有的只有 reason（不带 id 与名称）；selected 都有效时状态仍是 valid（excluded 算作检索过）；不带 excluded 的计划没有这个键（#539）', () => {
+    const e = RETRIEVAL_CATALOG.entries.find(x => x.id === 'metric:revenue_30d')!;
+    const paid = RETRIEVAL_CATALOG.entries.find(x => x.id === 'metric:revenue_paid_30d')!;
+    const ref = { id: e.id, version: 1, semanticHash: semanticHash(e) };
+    const planOf = (over: Partial<AnalysisPlan> = {}): AnalysisPlan => ({
+      schemaVersion: 1, mode: 'reuse_result', selected: [ref], request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: [ref.id] }], assumptions: [], questions: [], ...over,
+    });
+    const card = planCardView(RETRIEVAL_CATALOG, planOf({ excluded: [
+      { id: 'metric:revenue_paid_30d', reason: '按支付时间统计，与问的下单时间不符' },
+      { id: 'metric:missing', reason: '口径与提问不符' },
+    ] }));
+    expect(card.status).toBe('valid');
+    expect(card.excluded).toEqual([
+      { id: 'metric:revenue_paid_30d', name: paid.name, reason: '按支付时间统计，与问的下单时间不符' },
+      { reason: '口径与提问不符' },
+    ]);
+    expect(JSON.stringify(card.excluded)).not.toContain('metric:missing');
+    expect(planCardView(RETRIEVAL_CATALOG, planOf())).not.toHaveProperty('excluded');
   });
 });
