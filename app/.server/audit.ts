@@ -284,6 +284,12 @@ const ACTIONS = {
     label: '粘贴知识来源',
     describe: (d: Detail) => `「${d.title}」（${knowledgeSourceKindLabel(d.kind)}），第 ${d.version} 版，${d.paragraphs} 段`,
   },
+  // 把来源解析成知识提案（ADR-0046 入口③，#526）：targetType 是来源，detail 只有 sourceId、标题、种类、版本与各类计数，
+  // 不记段落原文与提示词。也不进 CATALOG_ACTIONS（提案接受前不进目录）
+  'knowledge_source.parsed': {
+    label: '解析知识来源',
+    describe: (d: Detail) => `「${d.title}」（${knowledgeSourceKindLabel(d.kind)}，第 ${d.version} 版）：新建 ${d.created} 条，已有 ${d.existing}、拒绝过 ${d.rejected}、不合法 ${d.invalid}、依据已变 ${d.stale}`,
+  },
   // 分析主题与主题归属（ADR-0046）：detail 只有 subjectId（与 targetId），不记主题名
   'analysis_subject.created': { label: '新建分析主题', describe: subjectTarget },
   'analysis_subject.renamed': { label: '修改分析主题名', describe: subjectTarget },
