@@ -2,10 +2,12 @@
 // POST JSON { message, page } 跑一轮问答（假 fetch 经 app.setLlmFetch 注入）；模型服务不支持工具调用时返回提示而不是 500；
 // 「测试连通性」探测为不支持时 POST 422 且不发请求，临时故障不存，改了端点或模型、恢复平台默认后探测结果作废；
 // 顶栏有「AI 助手」按钮；未登录跳转登录页
+import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { llmCalls } from '../../app/.server/db/schema';
 import { memberOf, newTenant } from '../pipeline/fixtures';
-import { fakeLlm, json, platformDefault, text, toolCalls } from '../pipeline/llm-fixtures';
+import { fakeLlm, json, platformDefault, platformTier, text, toolCalls } from '../pipeline/llm-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
 let app: TestApp;
@@ -115,6 +117,48 @@ describe('AI 助手', () => {
     await probe(false);
     await admin.post('/model-provider', { intent: 'reset' });
     expect(await support()).toBeNull();
+  });
+
+  it('reasoning 档位绑定不同模型时：toolSupport 按档位那一套比对（没探测过为 null，不误报不支持）；测试连通性会多探测一次档位模型，结果按档位存', async () => {
+    platformDefault();
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const admin = await loginAs(app, 'admin@acme.com');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    const support = async () => (await (await viewer.get('/assistant')).json()).toolSupport;
+    /** 连通性请求回 JSON、默认模型（qwen-plus）的探测回 tool_calls，档位模型（qwen-max）的探测由 tierRespond 决定；返回页面上的 data-tools */
+    const probeTier = async (tierRespond: () => Response) => {
+      const { received } = fakeLlm(setLlm, (_n, body) => body.tools
+        ? (body.model === 'qwen-max' ? tierRespond() : toolCalls({ id: 'p', name: 'ping', args: {} }))
+        : json({ ok: true }));
+      const tools = /data-tools="(\w+)"/.exec(await (await admin.post('/model-provider', { intent: 'test' })).text())?.[1];
+      return { tools, received };
+    };
+
+    // 没设档位时探测过、得到 true；设了档位（只换模型名）以后 GET 为 null：档位模型没探测过，不算「不支持」
+    expect((await probeTier(() => text('好的'))).tools).toBe('yes');
+    expect(await support()).toBe(true);
+    platformTier('reasoning', 'qwen-max');
+    expect(await support()).toBeNull();
+
+    // 管理员「测试连通性」发 3 次请求：connectivity、默认模型的 tool_probe、档位模型的 tool_probe；存进三列的是档位那一套的结果
+    const probed = await probeTier(() => toolCalls({ id: 'p', name: 'ping', args: {} }));
+    expect(probed.received.map(({ body }) => [body.model, Boolean(body.tools)])).toEqual([
+      ['qwen-plus', false], ['qwen-plus', true], ['qwen-max', true],
+    ]);
+    expect(await support()).toBe(true);
+    const probes = await getDb().select().from(llmCalls).where(and(eq(llmCalls.tenantId, acme), eq(llmCalls.purpose, 'tool_probe')));
+    expect(probes).toHaveLength(3);
+    expect(probes.filter(c => c.route === 'reasoning')).toHaveLength(1);
+
+    // 档位探测返回 400：结果按档位存为 false，GET 为 false、POST 422 不发请求；默认探测仍是支持的，页面 data-tools 不变
+    expect((await probeTier(() => new Response('tools not supported', { status: 400 }))).tools).toBe('yes');
+    expect(await support()).toBe(false);
+    const { received } = fakeLlm(setLlm, () => text('假装查过了'));
+    const refused = await ask(viewer, TURN);
+    expect(refused.status).toBe(422);
+    expect((await refused.json()).error).toContain('该模型服务不支持工具调用');
+    expect(received.length).toBe(0);
   });
 
   it('未登录跳转登录页', async () => {

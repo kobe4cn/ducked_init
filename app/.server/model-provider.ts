@@ -1,7 +1,7 @@
 // app/.server/model-provider.ts —— 租户自己的模型服务配置（ADR-0035，仅管理员）：查看当前生效的来源、保存端点 / 模型名 / API Key、
 // 恢复平台默认、测试连通性。API Key 用租户数据密钥加密（ADR-0009），读出来只告诉页面「已设置」，明文与密文都不出这个模块；
 // 留空保存沿用原来的 Key，审计只记端点、模型名与是否轮换。是否发送脱敏样本也在这里开关，tableContextFor 按它组织给模型的表上下文。
-// 测试连通性时的工具调用探测结果连同当时的端点、模型存下来，toolSupport 给 AI 助手判断能不能用。
+// 测试连通性时的工具调用探测结果连同当时的端点、模型存下来（#531：存助手实际要用的 reasoning 档位那一套），toolSupport 给 AI 助手判断能不能用。
 // embedding 端点（ADR-0049）自成一套同样的保存 / 恢复 / 测试，与 chat 互不影响
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -9,7 +9,7 @@ import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { modelProviders } from './db/schema';
-import { chatJson, chatTools, embed, embeddingSource, LlmError, MODEL_PROVIDER_CONTEXT, platformProvider, providerSource, resolveEmbeddingProvider, resolveProvider } from './llm';
+import { chatJson, chatTools, chatToolsWith, embed, embeddingSource, LlmError, MODEL_PROVIDER_CONTEXT, providerSource, resolveEmbeddingProvider, resolveProvider, resolveRoute, type LlmRoute } from './llm';
 import { buildTableContext, type TableContext } from './pipeline/llm-context';
 import { decryptForTenant, encryptForTenant } from './secrets';
 import { maskedSample, SourceViewError } from './source-views';
@@ -160,12 +160,17 @@ const PING_TOOL = { name: 'ping', description: '连通性探测：收到请求�
 
 /**
  * 带一个 ping 工具问一次：返回里有工具调用视为支持；模型服务拒绝这个请求（4xx，不含 429）视为不支持。调用日志里记一条 tool_probe。
+ * 传入 route（#531，探测 reasoning 档位的模型）时经 chatToolsWith 用那一套发、日志 route 记档位；没传时用解析出的默认那一套。
  * 其余返回 null（不确定）：只回了文本（tool_choice 是 auto，支持工具调用的模型也可能不调用），或超时、连不上、5xx、429 这类临时故障。
  * 不确定的结果不存，免得一次误判就把助手停掉
  */
-async function probeTools(tenantId: string): Promise<boolean | null> {
+async function probeTools(tenantId: string, route?: LlmRoute): Promise<boolean | null> {
+  const ask = [{ role: 'user' as const, content: '调用 ping 工具' }];
   try {
-    return (await chatTools(tenantId, 'tool_probe', [{ role: 'user', content: '调用 ping 工具' }], [PING_TOOL])).toolCalls.length > 0 || null;
+    const reply = route
+      ? await chatToolsWith(tenantId, 'tool_probe', route, ask, [PING_TOOL])
+      : await chatTools(tenantId, 'tool_probe', ask, [PING_TOOL]);
+    return reply.toolCalls.length > 0 || null;
   } catch (e) {
     if (e instanceof LlmError) return e.transient ? null : false;
     throw e;
@@ -174,7 +179,9 @@ async function probeTools(tenantId: string): Promise<boolean | null> {
 
 /**
  * 用当前生效的配置发一次小请求；错误消息由 chatJson 抹掉了 Key，调用日志里记一条 connectivity。
- * 连通后再探测是否支持工具调用（不计入耗时），结果连同这次的端点与模型存下来（不确定时不存）（没有配置行时插入一行，端点、模型名与 Key 为空）
+ * 连通后再探测是否支持工具调用（不计入耗时），结果连同这次的端点与模型存下来（不确定时不存）（没有配置行时插入一行，端点、模型名与 Key 为空）。
+ * reasoning 档位绑定了不同模型时（#531，只有平台档位会这样）再探一次档位模型：三列里存的是助手实际要用的那一套的结果
+ * （没有不同模型时就是默认这一套），返回给页面的 tools 仍显示默认这一次的
  */
 export async function testModelProvider(actor: CurrentMember): Promise<ConnectivityResult> {
   assertCan(actor, 'model_provider:manage');
@@ -190,8 +197,13 @@ export async function testModelProvider(actor: CurrentMember): Promise<Connectiv
   }
   const durationMs = Date.now() - started;
   const tools = await probeTools(tenantId);
-  if (tools !== null) {
-    const probe = { toolsSupported: tools, toolsProbedBaseUrl: provider?.baseUrl ?? '', toolsProbedModel: model };
+  let probe = tools !== null ? { toolsSupported: tools, toolsProbedBaseUrl: provider?.baseUrl ?? '', toolsProbedModel: model } : null;
+  const tier = await resolveRoute(tenantId, 'assistant');
+  if (tier && (tier.provider.baseUrl !== provider?.baseUrl || tier.provider.model !== model)) {
+    const tierTools = await probeTools(tenantId, tier);
+    probe = tierTools !== null ? { toolsSupported: tierTools, toolsProbedBaseUrl: tier.provider.baseUrl, toolsProbedModel: tier.provider.model } : null;
+  }
+  if (probe) {
     await getDb().insert(modelProviders).values({ tenantId, ...probe })
       .onConflictDoUpdate({ target: modelProviders.tenantId, set: probe });
   }
@@ -222,15 +234,17 @@ export async function testEmbeddingProvider(actor: CurrentMember): Promise<Embed
 }
 
 /**
- * 当前生效的模型服务是否支持工具调用：最近一次探测时的端点与模型和现在生效的一致才算数，
- * 否则（没探测过、改过配置、恢复了平台默认、平台默认换了）返回 null。没配置模型服务时也是 null
+ * 助手实际要用的模型服务是否支持工具调用（#531，按 reasoning 档位比对）：最近一次探测时的端点与模型和
+ * resolveRoute(tenantId, 'assistant') 解析出的一致才算数，否则（没探测过、改过配置、恢复了平台默认、
+ * 平台默认或档位换了模型）返回 null。没配置模型服务、没探测过时也是 null。route 由助手一轮开始时传入，
+ * 与本轮用的同一套；其他调用方不传、在这里解析
  */
-export async function toolSupport(tenantId: string): Promise<boolean | null> {
+export async function toolSupport(tenantId: string, route?: LlmRoute | null): Promise<boolean | null> {
   const row = await rowOf(tenantId);
-  const source = providerSource(row);
-  if (!source || row?.toolsSupported == null) return null;
-  const current = source === 'tenant' ? { baseUrl: row.baseUrl, model: row.model ?? '' } : platformProvider();
-  return row.toolsProbedBaseUrl === current.baseUrl && row.toolsProbedModel === current.model ? row.toolsSupported : null;
+  if (row?.toolsSupported == null) return null;
+  const { provider } = route ?? await resolveRoute(tenantId, 'assistant') ?? {};
+  if (!provider) return null;
+  return row.toolsProbedBaseUrl === provider.baseUrl && row.toolsProbedModel === provider.model ? row.toolsSupported : null;
 }
 
 /** 是否允许把原始层的脱敏样本行发给模型服务（默认不允许）；没有配置行时插入一行，端点、模型名与 Key 为空。值没变时什么也不做 */

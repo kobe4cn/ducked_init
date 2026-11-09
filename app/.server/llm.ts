@@ -305,6 +305,14 @@ export const chatTools = (tenantId: string, purpose: LlmPurpose, messages: LlmMe
   logged(tenantId, purpose, (provider, stats) => callTools(provider, messages, tools, stats));
 
 /**
+ * 按调用方解析好的档位路由（route）调 callTools 并记调用日志（口径同 chatTools，route / fallback_reason 用传入的 route 的值）。
+ * 助手一轮问答开始时解析一次、整轮复用（#531）：tool_call 历史对模型敏感，一次调用中途换模型会不兼容，
+ * 路由不再由 logged 每次自己解析（照 embedWith 的写法）
+ */
+export const chatToolsWith = (tenantId: string, purpose: LlmPurpose, route: LlmRoute, messages: LlmMessage[], tools: LlmTool[]): Promise<ToolReply> =>
+  logged(tenantId, purpose, (provider, stats) => callTools(provider, messages, tools, stats), async () => route);
+
+/**
  * 按租户的 embedding 端点（resolveEmbeddingProvider）调 /embeddings，返回按输入顺序排好的向量，记调用日志
  * （purpose embedding、模型、条数、prompt_tokens 与耗时；不记请求文本与向量，completion_tokens 与 schema_valid 为空）。
  * 超时与网络错误和 chat 走同一套 masked（transient 的 LlmError，消息里 Key 遮掉）。
