@@ -46,7 +46,7 @@ import {
   AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, usageTable,
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
-import { blockersOf, changedFiles, splitChildren } from "./guide.ts";
+import { blockersOf, changedFiles, flakyFailures, splitChildren } from "./guide.ts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -678,28 +678,46 @@ function reopenRequestedRevisions() {
 }
 
 /**
- * 门槛里重跑才通过的测试文件：每个文件一张票（带 Sandcastle，下次调度自动 prep + 修）。
- * 已有同名的 open 票就在那张票上追加一次出现记录，不重复开票。返回票号，写进 PR 的 Gate 一节。
+ * 门槛里重跑才通过的测试文件：按报错签名去重开票（带 Sandcastle，下次调度自动 prep + 修）。
+ * 同签名（同根因落在不同文件）只开一张；已有同签名、或标题 `偶发失败：<文件>` 相同的老票，
+ * 就在那张票上追加一次出现记录，不重复开票。返回票号，写进 PR 的 Gate 一节。
  */
 function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
   const [before, after = ""] = gateOutput.split("GATE_FLAKY");
   const files = [...new Set(before!.match(/^test\/\S+\.test\.tsx?$/gm) ?? [])];
   if (files.length === 0) return [];
   trySh("gh", ["label", "create", LABEL.flaky, "--color", "fbca04", "--description", "偶发失败的测试（Sandcastle 门槛自动开票）"]);
-  const open: { number: number; title: string }[] = JSON.parse(
-    sh("gh", ["issue", "list", "--state", "open", "--label", LABEL.flaky, "--limit", "100", "--json", "number,title"]),
+  const open: { number: number; title: string; body: string }[] = JSON.parse(
+    sh("gh", ["issue", "list", "--state", "open", "--label", LABEL.flaky, "--limit", "100", "--json", "number,title,body"]),
   );
   const seen = `#${issue.id} 的门槛（PR #${pr}）`;
   const summary = `\`\`\`\n${after.trim().slice(0, 3000)}\n\`\`\``;
-  return files.map((file) => {
-    const title = `偶发失败：${file}`;
-    const existing = open.find((i) => i.title === title);
+  // 按签名分组：同签名的文件共用一张票；解析不到报错（摘要被 head 截断）的文件签名为空串，各自一组，退回只按标题去重。
+  const signatures = new Map(flakyFailures(after).map((f) => [f.file, f.signature]));
+  const groups = new Map<string, string[]>();
+  for (const file of files) {
+    const key = signatures.get(file) || `按标题：${file}`;
+    const group = groups.get(key);
+    if (group) group.push(file);
+    else groups.set(key, [file]);
+  }
+  return [...groups.values()].map((groupFiles) => {
+    const signature = signatures.get(groupFiles[0]!) ?? "";
+    // 新票正文末尾的隐藏签名标记，同签名的失败以后只追加评论。签名里的 `-->` 先替换掉，免得提前收掉注释。
+    const marker = signature ? `<!-- flaky-sig: ${signature.replaceAll("-->", "--›")} -->` : undefined;
+    const list = groupFiles.map((f) => `\`${f}\``).join("、");
+    const title = `偶发失败：${groupFiles[0]!}${groupFiles.length > 1 ? ` 等 ${groupFiles.length} 个文件` : ""}`;
+    const existing = (marker ? open.find((i) => i.body.includes(marker)) : undefined)
+      ?? open.find((i) => groupFiles.some((f) => i.title === `偶发失败：${f}`));
     if (existing) {
-      sh("gh", ["issue", "comment", String(existing.number), "--body", `又出现一次：${seen}。第一次的失败：\n\n${summary}`]);
+      const again = marker
+        ? `又出现一次：${seen}，这次失败的文件：${list}。`
+        : `又出现一次：${seen}。`;
+      sh("gh", ["issue", "comment", String(existing.number), "--body", `${again}第一次的失败：\n\n${summary}`]);
       return `#${existing.number}`;
     }
     const body = [
-      `\`${file}\` 在 ${seen}的完整测试里失败，单独重跑通过。沙箱里完整测试用 4 个 worker 并行（\`CRM_TEST_WORKERS=4\`），约 40 分钟。`,
+      `${list} 在 ${seen}的完整测试里失败，单独重跑通过。沙箱里完整测试用 4 个 worker 并行（\`CRM_TEST_WORKERS=4\`），约 40 分钟。`,
       "", "## 第一次的失败", "", summary, "",
       "## 怎么修", "",
       "按诊断难 bug 的做法：先有一条能让它稳定变红的命令，再改。",
@@ -712,11 +730,11 @@ function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
       "",
       "## Acceptance criteria", "",
       "- [ ] 失败原因写进提交信息（复现命令，或推断的依据）",
-      `- [ ] 修复后复现命令变绿、\`${file}\` 单跑通过（重复单跑总共不超过 20 分钟）；根因已被别的提交修掉时只核实、不改代码`,
+      `- [ ] 修复后复现命令变绿、${list} 单跑通过（重复单跑总共不超过 20 分钟）；根因已被别的提交修掉时只核实、不改代码`,
       "- [ ] 不放宽全局超时，不删除或改弱断言",
     ].join("\n");
     const url = sh("gh", [
-      "issue", "create", "--title", title, "--body", body,
+      "issue", "create", "--title", title, "--body", marker ? `${body}\n${marker}` : body,
       "--label", LABEL.flaky, "--label", LABEL.picked, "--label", "ready-for-agent",
     ]);
     return `#${url.split("/").pop()}`;
