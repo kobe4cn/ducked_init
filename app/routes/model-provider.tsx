@@ -129,7 +129,8 @@ function TierSection({ tier, state, chatReady, submitting }: {
           </Form>
         )}
       </div>
-      <Form method="post">
+      {/* 输入框是非受控的：保存 / 恢复默认后 loader 给的是新值，但已挂载的输入框不会跟着 defaultValue 刷新。key 只用已保存值拼，值一变表单重挂载显示新值；提交失败（400）时这些值不变，用户改到一半的内容不会丢 */}
+      <Form method="post" key={`${state.model ?? ''}|${state.baseUrl ?? ''}|${state.apiKeySet}`}>
         <input type="hidden" name="intent" value="tier_save" />
         <input type="hidden" name="tier" value={tier} />
         <FieldGroup>
@@ -260,7 +261,8 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
 
       <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
         <SectionHeader title="本租户的模型服务">API Key 加密保存，保存后不再显示。</SectionHeader>
-        <Form method="post">
+        {/* 同档位表单：非受控输入框不跟着新 defaultValue 刷新，恢复平台默认后靠 key 重挂载回服务端新值 */}
+        <Form method="post" key={`${provider.baseUrl ?? ''}|${provider.model ?? ''}|${provider.apiKeySet}`}>
           <input type="hidden" name="intent" value="save" />
           <FieldGroup>
             <Field>
@@ -310,7 +312,8 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
             </Form>
           )}
         </div>
-        <Form method="post">
+        {/* 同上：恢复平台默认后靠 key 重挂载，输入框回服务端新值 */}
+        <Form method="post" key={`${provider.embedding.baseUrl ?? ''}|${provider.embedding.model ?? ''}|${provider.embedding.apiKeySet}`}>
           <input type="hidden" name="intent" value="embedding_save" />
           <FieldGroup>
             <Field>
