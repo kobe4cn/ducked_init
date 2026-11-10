@@ -15,6 +15,7 @@ npx vitest run test/pipeline/mapping-merge.test.ts # 单个文件
   - `TEST_S3_LAKE_URI`：对象存储上的隔离测试与文件数据源
   - `TEST_MYSQL_URL`：MySQL 数据源
   - `TEST_MONGO_URL`：MongoDB 数据源
+- `CRM_TEST_IAM_STRESS=1` 才跑 `test/pipeline/pipeline.test.ts` 的并发 IAM 改写用例（#560 的复现）：8 路并发建删一次性账号，压测期间已有租户的 ListBucket 前缀隔离应仍生效。默认关闭，因为压测打乱的是全局 IAM，会把同一存储服务上其他 worker 的 S3 用例一起搞成偶发失败；根因结论见 #569
 - **按 worker 分库，文件并行**：worker 数由 `CRM_TEST_WORKERS` 控制（默认 8，CI 设成 4，要求 PG 的 `max_connections` ≥ 300，见 `db_script/docker-compose.yml`；PG 还是默认的 100 时用 `CRM_TEST_WORKERS=4`，约 19 分钟）。`vitest.config.ts` 把基准值另存到 `CRM_TEST_BASE_*`，`test/setup-env.ts`（setupFiles）按 `VITEST_POOL_ID`（1…N）给每个 worker 加后缀 `_w<i>`：
   - 平台库 `crm_platform_test_w<i>`、源库 `crm_source_test_w<i>`、MySQL / MongoDB 库（`TEST_MYSQL_URL` / `TEST_MONGO_URL` 的库名加后缀）
   - 数据湖目录 `$TMPDIR/crm_platform_test_lake_w<i>`、源文件目录 `$TMPDIR/crm_platform_test_sources_w<i>`、对象存储前缀 `TEST_S3_LAKE_URI` 加后缀
