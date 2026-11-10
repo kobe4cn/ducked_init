@@ -1,4 +1,5 @@
 // 租户流水线接缝：开通租户 → 入队任务 → 调度器派发到独立工作进程 → 读取任务结果。数据用 seed 造数夹具生成
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
@@ -8,13 +9,18 @@ import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tenantLakes } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
-import { deleteTenantS3Account } from '../../app/.server/s3-accounts';
+import { deleteTenantS3Account, issueTenantS3Account } from '../../app/.server/s3-accounts';
 import { getTenantLake } from '../../app/.server/lake';
 import { openTenantLake, type LakeSpec } from '../../app/.server/pipeline/lake-engine';
 import { claimNextTask, enqueueTask, finishTask, getTask, listTasks } from '../../app/.server/tasks';
 import { initTenantLake, setTenantQuota } from '../../app/.server/tenants';
 import { resetDb } from '../http/harness';
 import { newTenant, runTask } from './fixtures';
+
+/** 本文件的已知差距（用 it.fails 标预期失败，改好后会变红，提醒从清单删掉；写法照 test/retrieval-golden.test.ts） */
+const KNOWN_GAPS = new Map<string, string>([
+  ['iam-concurrent', 'SeaweedFS 网关重载 IAM 期间 ListBucket 的前缀条件毫秒级失效（#569）'],
+]);
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -273,4 +279,71 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储上的越权访问',
       await worker.close();
     }
   });
+
+  // #560：完整测试里多个 worker 同时建删租户账号（resetDb / newTenant），每次 IAM 写都让存储服务网关重载整份内存里的
+  // IAM 配置，重载窗口内已有租户的 ListBucket 前缀隔离毫秒级失效（list 单个请求被放行，read / write / 列桶根仍被拒，
+  // 同一连接立即重试即恢复拒绝——存储里的策略文档在泄露当下读回是完好的，排除丢更新；10/10 次运行复现，全在
+  // SeaweedFS 4.47 上）。默认跳过：并发改写打乱的是全局 IAM，会把其他 worker 的 S3 用例一起搞成偶发失败（等于自己
+  // 制造 #560）。修复在 #569，根因结论也贴在那里
+  const gap = KNOWN_GAPS.get('iam-concurrent');
+  const iamStress = it.skipIf(!process.env.CRM_TEST_IAM_STRESS);
+  (gap ? iamStress.fails : iamStress)(
+    `并发建删账号期间，已有租户的凭据仍读写、列不到其他租户的前缀${gap ? `（已知差距：${gap}）` : ''}`,
+    async () => {
+      const acme = await newTenant('acme');
+      const globex = await newTenant('globex');
+      await runTask(acme, 'demo.seed', { customers: 20 });
+      const acmeLake = (await getTenantLake(acme))!;
+
+      const worker = await openAsWorker(globex);
+      await worker.close();
+      const { lake } = worker.task;
+      const [acmeFile] = await parquetUnder(lake, acmeLake.dataPath);
+      expect(acmeFile).toBeDefined();
+      const bucket = acmeLake.dataPath.split('/').slice(0, 3).join('/');
+
+      // 压测：8 路各对一次性账号建删 10 轮（照 sources.test.ts「并发建源端账号不报错」），每轮都是多次整份 IAM 配置
+      // 读改写；另加 180 s 墙钟上限——并发下 IAM 延时波动大（同样 8×10 轮实测 340 s 到 480 s+），不设上限本用例
+      // 会偶发超时。一次性 tenantId 不进 tenant_lakes，resetDb 删不到，每路 finally 兜底再删一次
+      let stressDone = false;
+      const stressDeadline = Date.now() + 180_000;
+      const stress = Promise.all(Array.from({ length: 8 }, async () => {
+        const id = randomUUID();
+        const dataPath = `${process.env.PLATFORM_LAKE_URI}/tenants/${id}/`;
+        try {
+          for (let i = 0; i < 10 && Date.now() < stressDeadline; i++) {
+            await issueTenantS3Account(id, dataPath);
+            await deleteTenantS3Account(id);
+          }
+        } finally {
+          await deleteTenantS3Account(id).catch(() => {});
+        }
+      })).finally(() => { stressDone = true; });
+
+      // 探测：压测期间用 globex 的凭据在同一个连接上串行读写、列出 acme 的前缀，每一轮都应仍被前缀策略拒绝
+      const cycles = await unlocked(lake.s3, async con => {
+        const tryRun = (sql: string) => con.run(sql).then(() => 'allowed', e => (e as Error).message);
+        const probed: { i: number; read: string; write: string; list: string; listBucket: string }[] = [];
+        for (let i = 0; !stressDone; i++) {
+          probed.push({
+            i,
+            read: await tryRun(`SELECT count(*) FROM read_parquet('${acmeFile}')`),
+            write: await tryRun(`COPY (SELECT 1 AS x) TO '${acmeLake.dataPath}evil.parquet'`),
+            list: await tryRun(`SELECT * FROM glob('${acmeLake.dataPath}*')`),
+            listBucket: await tryRun(`SELECT * FROM glob('${bucket}/*')`),
+          });
+        }
+        return probed;
+      });
+      await stress;
+      expect(cycles.length, '压测期间至少完成一轮探测').toBeGreaterThan(0);
+      // 列出被放行的探测（第几轮、哪种操作、返回什么），方便对照时序判断根因
+      const leaked = cycles.flatMap(({ i, ...attempts }) =>
+        Object.entries(attempts).filter(([, r]) => !/AccessDenied/.test(r)).map(([k, r]) => `第${i}轮 ${k}: ${r}`));
+      expect(leaked, '压测期间被放行的探测').toEqual([]);
+      expect(await filesUnder(lake, acmeLake.dataPath)).not.toContain(`${acmeLake.dataPath}evil.parquet`);
+    },
+    // 单独放宽本用例：准备（建租户、造数）加压测（8 路 × 最多 10 轮、180 s 封顶）加收尾，实测最慢 ~8 分钟
+    600_000,
+  );
 });
