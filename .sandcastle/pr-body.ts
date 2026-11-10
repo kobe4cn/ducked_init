@@ -35,9 +35,16 @@ export const checkAcceptanceNotes = (md: string | undefined): string[] => {
   return problems;
 };
 
+/** 二级标题行降成 `###`：格式不对的原文照样进正文，但不能有 `## ` 行留在这一节里，否则重做时 replaceSection 在它那儿切断、旧尾巴永远留着。 */
+const demoteHeadings = (md: string): string =>
+  md
+    .split("\n")
+    .map((line) => (headingOf(line) === undefined ? line : `#${line}`))
+    .join("\n");
+
 /**
  * PR 正文 `## 验收说明` 一节的内容（标题由 main.ts 的 pushAndOpenPr 加）：固定准备段落 + 文件内容，
- * 让验收的人能在宿主机上照做。不合格时给警告（文件不存在）或「格式不对」+ 问题列表 + 原文，照样进正文让人看见。
+ * 让验收的人能在宿主机上照做。不合格时给警告（文件不存在）或「格式不对」+ 问题列表 + 原文（二级标题降成 `###`），照样进正文让人看见。
  * pageChanged：有 `.browser-check/`（改了页面）的票给完整四步准备；其余只要 checkout，不用起 dev server。
  */
 export const acceptanceSection = (branch: string, md: string | undefined, opts: { pageChanged: boolean }): string => {
@@ -45,7 +52,7 @@ export const acceptanceSection = (branch: string, md: string | undefined, opts: 
   if (problems.length > 0) {
     return md === undefined
       ? "⚠️ implementer 没有写验收说明"
-      : `⚠️ 验收说明格式不对：${problems.join("；")}\n\n${md}`;
+      : `⚠️ 验收说明格式不对：${problems.join("；")}\n\n${demoteHeadings(md)}`;
   }
   const prep = opts.pageChanged
     ? [
