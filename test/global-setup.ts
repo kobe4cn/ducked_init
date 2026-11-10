@@ -7,6 +7,7 @@ import pg from 'pg';
 import type { TestProject } from 'vitest/node';
 import { closeDb } from '../app/.server/db/client';
 import { migratePlatformDb } from '../app/.server/db/migrate';
+import { isProcessAlive } from './process-alive';
 import { dbNameOf, withDbSuffix } from './setup-env';
 
 /** 两个 vitest 同时跑会互相清表、清数据湖目录，报出与代码无关的失败，所以第二个直接退出（锁的是基准库名，即整组库） */
@@ -16,12 +17,7 @@ function lockTestDb(dbName: string) {
     writeFileSync(file, String(process.pid), { flag: 'wx' });
   } catch {
     const pid = Number(readFileSync(file, 'utf8'));
-    let alive = true;
-    try {
-      process.kill(pid, 0);
-    } catch {
-      alive = false;
-    }
+    const alive = isProcessAlive(pid);
     if (alive && pid !== process.pid) {
       throw new Error(`另一个 vitest（pid ${pid}）正在使用测试库 ${dbName}：等它结束再跑（锁文件 ${file}）`);
     }
