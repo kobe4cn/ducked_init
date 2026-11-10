@@ -1,6 +1,6 @@
 ---
 name: verify-ducked-init
-description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, model provider, or the AI assistant, and capture evidence."
+description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, model provider, or the AI assistant, and capture evidence. When the diff changes no page, skip the browser launch. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class."
 ---
 
 # Verify CRM 数据分析平台
@@ -12,6 +12,19 @@ Do not drive a server you did not start. Do not point this flow at the developer
 Two instances can run side by side. Each `launch.sh` picks its own port, PostgreSQL database (`crm_platform_verify_<run-id>`), and lake directory. Cluster-wide lake roles are named from the tenant id, so they do not collide. Both processes share the checkout's `node_modules/.vite` cache. Pass the run id to `doctor.sh`, `drive-members.sh`, `browser.mjs` is pinned to the `current` symlink unless `VERIFY_STATE_DIR` is set. The symlink always points at the latest launch.
 
 `/ops` (operator Magic Link plus TOTP) is not in this map. The dispatcher is not started. Registering a data source needs a separate read-only database, which this launch does not create.
+
+## Changes that do not touch a page
+
+If the diff changes no route, page, or client state, skip `launch.sh`. The browser map does not exercise that diff.
+
+Record the command output for each check. Record a skipped file as skipped.
+
+- Run the test files named in the ticket. `vitest.config.ts` always runs `test/global-setup.ts`, which needs PostgreSQL even when the test is a pure function. If PostgreSQL refuses the connection, report that the vitest file was not run. A temporary `node --import tsx` script may call the pure function. Label that run as a temporary script.
+- Point a script that rewrites an external file at a temporary server you started. Do not point it at a filer that was already listening, including the developer's SeaweedFS and a shared `policies.json`. Show one orphan removed, one live entry left as it was, malformed input and an empty body left unwritten, a second run that does not write, and a read-back that disagrees with the write followed by a restore of the backup.
+- Run `sh -n` on each changed shell script.
+- Say whether the change is high-risk, and why. The classes are an auth or core authorization change, production secrets or high-privilege access, payments, a destructive database migration, mass data deletion, a core security control, and production infrastructure.
+
+When CI for this exact commit is already green, adopt that run. Leave the full suite unrun. Still run the targeted files when they can run.
 
 ## Launch
 
