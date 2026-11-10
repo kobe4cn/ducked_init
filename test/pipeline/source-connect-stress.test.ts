@@ -12,7 +12,7 @@ import type { EngineLimits } from '../../app/.server/pipeline/lake-engine';
 import { openSource, sourceConnectTimeout, type SourceSpec } from '../../app/.server/pipeline/source-engine';
 import { READER, seedPgSource } from './source-fixtures';
 
-// 并发路数：默认 32，CRM_TEST_CONNECT_STRESS_N 可调（不是正整数时按默认）
+// 并发路数：默认 32，CRM_TEST_CONNECT_STRESS_N 可调（小数取整数部分，不是数字或取整后不大于 0 时按默认）
 const parsedN = Math.floor(Number(process.env.CRM_TEST_CONNECT_STRESS_N ?? 32));
 const N = parsedN > 0 ? parsedN : 32;
 // 压测 DuckDB 实例给小资源：建连路径本身用不了多少内存与线程
