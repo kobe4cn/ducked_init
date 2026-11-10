@@ -46,7 +46,7 @@ import {
   AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, usageTable,
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
-import { blockersOf, changedFiles, flakyFailures, splitChildren } from "./guide.ts";
+import { blockersOf, changedFiles, flakyTickets, splitChildren } from "./guide.ts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -692,29 +692,15 @@ function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
   );
   const seen = `#${issue.id} 的门槛（PR #${pr}）`;
   const summary = `\`\`\`\n${after.trim().slice(0, 3000)}\n\`\`\``;
-  // 按签名分组：同签名的文件共用一张票；解析不到报错（摘要被 head 截断）的文件签名为空串，各自一组，退回只按标题去重。
-  const signatures = new Map(flakyFailures(after).map((f) => [f.file, f.signature]));
-  const groups = new Map<string, string[]>();
-  for (const file of files) {
-    const key = signatures.get(file) || `按标题：${file}`;
-    const group = groups.get(key);
-    if (group) group.push(file);
-    else groups.set(key, [file]);
-  }
-  return [...groups.values()].map((groupFiles) => {
-    const signature = signatures.get(groupFiles[0]!) ?? "";
-    // 新票正文末尾的隐藏签名标记，同签名的失败以后只追加评论。签名里的 `-->` 先替换掉，免得提前收掉注释。
-    const marker = signature ? `<!-- flaky-sig: ${signature.replaceAll("-->", "--›")} -->` : undefined;
+  // 分组、签名标记、标题与已有票的匹配见 guide.ts 的 flakyTickets；这里只拼正文 / 评论并调 gh。
+  return flakyTickets(files, after, open).map(({ files: groupFiles, marker, title, existing }) => {
     const list = groupFiles.map((f) => `\`${f}\``).join("、");
-    const title = `偶发失败：${groupFiles[0]!}${groupFiles.length > 1 ? ` 等 ${groupFiles.length} 个文件` : ""}`;
-    const existing = (marker ? open.find((i) => i.body.includes(marker)) : undefined)
-      ?? open.find((i) => groupFiles.some((f) => i.title === `偶发失败：${f}`));
-    if (existing) {
+    if (existing !== undefined) {
       const again = marker
         ? `又出现一次：${seen}，这次失败的文件：${list}。`
         : `又出现一次：${seen}。`;
-      sh("gh", ["issue", "comment", String(existing.number), "--body", `${again}第一次的失败：\n\n${summary}`]);
-      return `#${existing.number}`;
+      sh("gh", ["issue", "comment", String(existing), "--body", `${again}第一次的失败：\n\n${summary}`]);
+      return `#${existing}`;
     }
     const body = [
       `${list} 在 ${seen}的完整测试里失败，单独重跑通过。沙箱里完整测试用 4 个 worker 并行（\`CRM_TEST_WORKERS=4\`），约 40 分钟。`,
