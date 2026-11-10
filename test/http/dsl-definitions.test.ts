@@ -139,13 +139,18 @@ describe('指标与标签定义页', () => {
     expect(badAggPage).toMatch(/第 \d+ 行第 \d+ 列（measure\.agg）：应为以下之一：/);
     expect(badAggPage).toContain('data-metric-builder');
     expect(badAggPage).toMatch(/<option[^>]*value="median"[^>]*>median（不支持，请改选）</);
+    // 字段下拉不按类型过滤：列出全部字段、当前字段 amount 仍选中，与生成的 YAML（field: amount）一致
+    const fieldSelect = badAggPage.match(/id="builder-field"[\s\S]*?<\/select>/)![0];
+    expect(fieldSelect).toMatch(/<option[^>]*value="amount"[^>]*selected/);
     expect(badAggPage).not.toContain('出错了');
-    // ratio 分子的聚合在词表外也一样：measure.numerator.agg 按行列报出，回显进构建器，不落库
-    const badPart = await post({ intent: 'check', form: JSON.stringify({ ...ratio, numerator: { agg: 'median', filter: [] } }) });
+    // ratio 分子的聚合在词表外也一样：measure.numerator.agg 按行列报出，回显进构建器，不落库；分子字段下拉同样不按类型过滤
+    const badPart = await post({ intent: 'check', form: JSON.stringify({ ...ratio, numerator: { agg: 'median', field: 'amount', filter: [] } }) });
     expect(badPart.status).toBe(400);
     const badPartPage = await badPart.text();
     expect(badPartPage).toMatch(/（measure\.numerator\.agg）：应为以下之一：/);
     expect(badPartPage).toMatch(/<option[^>]*value="median"[^>]*>median（不支持，请改选）</);
+    const numeratorPart = badPartPage.match(/data-ratio-part="numerator"[\s\S]*?data-ratio-part="denominator"/)![0];
+    expect(numeratorPart).toMatch(/<option[^>]*value="amount"[^>]*selected/);
     expect(await getDb().select().from(dslVersions)).toHaveLength(0);
 
     // 天数 0 / 负数：客户端不再静默丢掉时间窗口（与直接 POST 同样的值一致），检查与保存都按 window.days 400、不落库

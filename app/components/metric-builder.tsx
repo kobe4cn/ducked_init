@@ -163,7 +163,7 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
     by: (agg === 'latest' || agg === 'earliest') && fits(f.by, TEMPORAL_TYPES) ? f.by : undefined,
   }));
 
-  /** 某聚合能选的字段下拉选项（count / count_distinct 不限类型，sum / avg 只列数字，min / max 也列日期时间，days_since 与 by 只列时间）；词表外的聚合查不到类型表，不列任何字段 */
+  /** 某聚合能选的字段下拉选项（count / count_distinct 不限类型，sum / avg 只列数字，min / max 也列日期时间，days_since 与 by 只列时间）；词表外的聚合不按类型过滤，列出全部字段（当前字段仍能选中回显） */
   const fieldOptions = (allowed: readonly FieldType[] | typeof ANY | undefined, empty: string) => (
     <>
       <NativeSelectOption value="">{empty}</NativeSelectOption>
@@ -197,9 +197,9 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
         <Field>
           <FieldLabel htmlFor="builder-field">字段</FieldLabel>
           <NativeSelect id="builder-field" value={form.field ?? ''} onChange={e => patch({ field: e.target.value || undefined })}>
-            {fieldOptions(FIELD_TYPES[form.agg], form.agg === 'count' ? '不选（数行数）' : '（请选择）')}
+            {fieldOptions(FIELD_TYPES[form.agg] ?? ANY, form.agg === 'count' ? '不选（数行数）' : '（请选择）')}
           </NativeSelect>
-          <FieldDescription>{AGGS.includes(form.agg) ? AGG_TEXT[form.agg] : `${form.agg}（不支持，请改选）`}</FieldDescription>
+          <FieldDescription>{AGGS.includes(form.agg) ? AGG_TEXT[form.agg] : '先在上面改选支持的聚合'}</FieldDescription>
         </Field>
       )}
       {(form.agg === 'latest' || form.agg === 'earliest') && (
@@ -223,7 +223,7 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
               {unsupportedAggOption(form[at]?.agg ?? 'count', RATIO_AGGS)}
             </NativeSelect>
             <NativeSelect aria-label={`${at === 'numerator' ? '分子' : '分母'}字段`} value={form[at]?.field ?? ''} onChange={e => setPart(at, { field: e.target.value || undefined })}>
-              {fieldOptions(RATIO_FIELD_TYPES[form[at]?.agg ?? 'count'], '不选（数行数）')}
+              {fieldOptions(RATIO_FIELD_TYPES[form[at]?.agg ?? 'count'] ?? ANY, '不选（数行数）')}
             </NativeSelect>
           </div>
           <CondRows at={at} fields={fields} conds={form[at]?.filter ?? []} onChange={filter => setPart(at, { filter })} />
