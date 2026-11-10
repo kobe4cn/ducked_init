@@ -46,8 +46,8 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 - [Tenant overview](./overview.md) covers the signed-in home page: tenant, space, role, task counts, and the permission list.
 - [Invite a member](./members.md) covers inviting a data engineer, the members table, the audit row, the console mail, and signing in as that person.
 - [Task list](./tasks.md) covers the empty task list on a freshly seeded tenant.
-- [新建指标（条件构建器）](./metric-builder.md) covers building a metric with the condition builder: check without saving (summary + SQL), save as draft v1, ignored empty rows, invalid forms 400, YAML mode, and handmade `form` submissions.
+- [新建指标（条件构建器）](./metric-builder.md) covers building a metric with the condition builder: check without saving (summary + SQL), save as draft v1, ignored empty rows, invalid forms 400, YAML mode, handmade `form` submissions, and the out-of-vocabulary agg field dropdown (every field stays listed, the current field stays selected, and a supported agg filters by type again).
 - [新建标签（条件构建器）](./tag-builder.md) covers building a tag from published numeric metrics: single/multi-metric rules with one level of all / any, missing-value strategy, default, save as draft v1 with the same YAML as handwritten, and YAML mode.
 - [Audit log](./audit.md) covers the tenant-creation row written by launch. Lake init during launch does not add an audit row.
-- [模型服务](./model-provider.md) covers the tenant provider, the fast and reasoning cards, 测试连通性, confirm-accept reset, and a dirty tier row.
+- [模型服务](./model-provider.md) covers the tenant provider, the fast and reasoning cards, input values after save and after 恢复默认 (the other card unchanged, API Key not echoed), a rejected tier draft, embedding 恢复平台默认, 测试连通性, and a dirty tier row.
 - [AI 助手](./assistant.md) covers sending a message and checking the stub request plus the `llm_calls` row (model, route, fallback_reason).

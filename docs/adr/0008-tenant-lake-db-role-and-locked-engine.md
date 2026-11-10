@@ -17,6 +17,7 @@ ADR-0001 要求每个任务只挂载本租户的数据。实测发现只“挂�
 - 租户对象存储账号的密钥同样明文存在 `tenant_lakes`，与数据库角色的密码同等对待。账号是长期有效的，没有按任务签发的临时凭据（STS `GetFederationToken` 带会话策略同样实测可用，但要给 SeaweedFS 另配 STS 签名密钥）；凭据获取收在 `app/.server/s3-accounts.ts` 一处，以后可以替换。
 - 对象存储须支持 IAM API 与按前缀的用户策略。SeaweedFS 上账号必须由它自己保存在 filer 中（不能来自静态 `-s3.config` 文件），并开启 `-s3.iam.readOnly=false`；换用其他对象存储时要确认同等能力。
   在 SeaweedFS 4.47 上实测（`test/pipeline/pipeline.test.ts`）：不锁 DuckDB 配置、只用租户账号时，其他租户前缀的读 / 写 / 列目录、列整个桶都被前缀策略拒绝（AccessDenied）。
+  删账号必须先删策略：`DeleteUser` 只删身份文件、不清 `policies.json` 里该账号的内联策略，`DeleteUserPolicy` 对已不存在的账号只回 `NoSuchEntity`，「账号没了、策略还在」就成了 IAM API 删不掉的孤儿；SeaweedFS 每次 IAM 改动又整份重写这个文件，孤儿条目把它和 filer 元数据日志一起撑大（2026-11-10 实测攒到 8022 条、文件 6 MB，#621）。`app/.server/s3-accounts.ts` 删号时对已消失的账号也补删一次策略，存量和增量残留由 `scripts/prune-seaweed-iam-policies.ts` 兜底（随 `pnpm sandcastle:prune-metalog` 每轮清理）。
   `<本租户前缀>../<其他租户 ID>/…` 路径穿越（DuckDB 不规范化 S3 路径里的 `..`，`allowed_directories` 挡不住它）同样被存储服务拒绝，但靠的不是前缀策略：SeaweedFS 对路径里带 `..` 的请求一律返回 400（签名正确、用平台账号也一样），DuckDB 发出的这类请求则因签名对不上返回 403。换用其他对象存储时，要确认它规范化路径后再按策略判断，或同样拒绝 `..`。
 - 平台 PG 需要 15 及以上版本（更早的版本默认允许所有角色在 `public` schema 建表，租户之间会多出一条互通的渠道），平台账号需要 CREATEROLE 权限。
 - 迁移存储（`pnpm lake:migrate`，由调度器执行）期间，租户的对象存储账号策略同时放行新旧两个前缀——两者都属于本租户，不引入跨租户访问；此时该租户不派发任务。完成后策略只留新前缀（迁离对象存储时删除账号），失败时回到只放行旧前缀（为本地目录租户新建的账号删除）。收回失败时迁移照常完成，并在审计日志里提示。

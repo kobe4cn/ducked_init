@@ -18,6 +18,10 @@ process.env.PLATFORM_LAKE_URI = join(tmpdir(), 'crm_platform_test_lake');
 process.env.TEST_SOURCE_DATABASE_URL ??= 'postgres://crm:crm@localhost:5432/crm_source_test';
 // 测试不真正发信：即使 shell 里有 MAIL_HOST，默认实现也是输出到控制台（HTTP 测试另用收件箱替换）
 process.env.MAILER = 'console';
+// 测试起的开发服务器不做路由类型生成：多个 worker 并发删写 .react-router/types 会报 ENOTEMPTY（#615）。
+// 插件没有官方开关，靠补丁加的这个变量关闭（patches/@react-router__dev.patch）；本地 pnpm dev 不设，行为不变。
+// 必须在顶层设：开关在插件的 config 钩子里读，worker 进程继承这个变量
+process.env.REACT_ROUTER_SKIP_TYPEGEN = '1';
 // 测试不调用真实的模型服务：本地 .env.test 或 shell 里的平台默认配置不带进测试，要测时用 vi.stubEnv
 delete process.env.LLM_BASE_URL;
 delete process.env.LLM_MODEL;
@@ -32,8 +36,9 @@ process.env.PLATFORM_MASTER_KEY = Buffer.alloc(32, 7).toString('base64');
 process.env.PLATFORM_SOURCE_FILES_DIR = join(tmpdir(), 'crm_platform_test_sources');
 // 没有水位线字段、行数达到这个值的大表全量比对时默认每天同步；测试调低，夹具里的 events 表即为大表
 process.env.SOURCE_LARGE_TABLE_ROWS = '1000';
-// 连接 PostgreSQL 源库的建连超时（秒）：沙箱经 podman 网关连源库，负载下建连会超过产品默认的 10 秒（#545），调到 30；命令行已设时以它为准
-process.env.SOURCE_CONNECT_TIMEOUT_SECONDS ??= '30';
+// 连接 PostgreSQL 源库的建连超时（秒）：沙箱经 podman 网关连源库，负载下建连会超过产品默认的 10 秒（#545）调到 30 仍超时（#627），调到 60 止血——
+// 只降低概率不算修复，根因定位见 test/pipeline/source-connect-stress.test.ts；命令行已设时以它为准
+process.env.SOURCE_CONNECT_TIMEOUT_SECONDS ??= '60';
 // 设置 TEST_S3_LAKE_URI（如 s3://crm-lake/platform-test）后，隔离测试在对象存储上再跑一遍。
 // 平台账号取 S3_*，未设置时用本地 SeaweedFS 的开发账号（db_script/docker-compose.yml）；租户账号由测试开通租户时经 IAM API 创建
 if (process.env.TEST_S3_LAKE_URI) {

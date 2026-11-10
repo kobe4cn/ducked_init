@@ -1,0 +1,13 @@
+diff --git a/dist/vite.js b/dist/vite.js
+index cd9bc980219bf76c38ec05778841b403c83639a4..2352b295f0338db1ea0321b942609d21184770a3 100644
+--- a/dist/vite.js
++++ b/dist/vite.js
+@@ -1469,7 +1469,7 @@ const reactRouterVitePlugin = () => {
+ 				logger = vite.createLogger(viteUserConfig.logLevel, { prefix: "[react-router]" });
+ 				rootDirectory = viteUserConfig.root ?? process.env.REACT_ROUTER_ROOT ?? process.cwd();
+ 				let mode = _viteConfigEnv.mode;
+-				if (viteCommand === "serve") typegenWatcherPromise = watch(rootDirectory, {
++				if (viteCommand === "serve" && !process.env.REACT_ROUTER_SKIP_TYPEGEN) typegenWatcherPromise = watch(rootDirectory, {
+ 					mode,
+ 					rsc: false,
+ 					logger: vite.createLogger("warn", { prefix: "[react-router]" })

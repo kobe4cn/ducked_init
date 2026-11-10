@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Sign in as the seeded admin, save the tenant model provider and both tier cards against the local stub,
-# accept the confirm dialogs for 恢复默认 and 恢复平台默认, send AI 助手 messages, and write one dirty tier row.
+# read the inputs after each save and after 恢复默认 / 恢复平台默认, keep a rejected tier draft,
+# accept the confirm dialogs, send AI 助手 messages, and write one dirty tier row.
 # Usage: VERIFY_LLM_LOG=<stub jsonl> scripts/drive-model.sh [run-id-or-state-dir]
 set -euo pipefail
 DIR=$(cd "$(dirname "$0")" && pwd)
@@ -17,6 +18,20 @@ log() { printf '%s\n' "$*" | tee -a "$EV/drive-model.log" >&2; }
 run() { log "+ $*"; "$@"; }
 B() { node "$DIR/browser.mjs" "$@"; }
 die() { log "drive-model: $*"; exit 1; }
+
+expect_value() {
+  local within=$1 label=$2 want=$3 got
+  got=$(B value --within "$within" --label "$label")
+  log "value label=$label got=$(printf %q "$got")"
+  [[ $got == "$want" ]] || die "value [$label] got [$got] want [$want]"
+}
+
+expect_text() {
+  local selector=$1 want=$2 got
+  got=$(B text --selector "$selector")
+  log "text $selector got=$(printf %q "$got")"
+  [[ $got == "$want" ]] || die "text [$selector] got [$got] want [$want]"
+}
 
 expect_title() {
   local want=$1 got
@@ -58,14 +73,20 @@ log "app.env LLM_* matches the server process (keys recorded as last4 only)"
 TENANT_URL=$origin/tenant/v1
 TIER_URL=$origin/tier-reason/v1
 DIRTY_URL=$origin/dirty/v1
+EMBED_URL=$origin/embed/v1
+DRAFT_URL=$origin/half-draft/v1
 TENANT_KEY=sk-tenant-AAAA
 REASON_KEY=sk-reason-BBBB
+EMBED_KEY=sk-embed-FFFF
+DRAFT_KEY=sk-half-GGGG
 WITHIN_TENANT='form:has(#model-base-url)'
 WITHIN_FAST='form:has(#fast-model)'
 WITHIN_REASON='form:has(#reasoning-model)'
+WITHIN_EMBED='form:has(#embedding-model)'
 WITHIN_RESET_FAST='form:has(input[name="intent"][value="tier_reset"]):has(input[name="tier"][value="fast"])'
 WITHIN_RESET_REASON='form:has(input[name="intent"][value="tier_reset"]):has(input[name="tier"][value="reasoning"])'
 WITHIN_RESET_PLATFORM='form:has(input[name="intent"][value="reset"])'
+WITHIN_RESET_EMBED='form:has(input[name="intent"][value="embedding_reset"])'
 
 login_as() {
   local email=$1 offset url
@@ -135,11 +156,17 @@ run B fill --within "$WITHIN_TENANT" --label "模型名" --value "tenant-default
 run B fill --within "$WITHIN_TENANT" --label "API Key" --value "$TENANT_KEY"
 run B click --within "$WITHIN_TENANT" --role button --name "保存"
 run B wait-text "当前使用本租户的配置"
+expect_value "$WITHIN_TENANT" "模型名" "tenant-default"
+expect_value "$WITHIN_TENANT" "端点" "$TENANT_URL"
+expect_value "$WITHIN_TENANT" "API Key" ""
 
 run B fill --within "$WITHIN_FAST" --label "模型名" --value "fast-model"
 run B click --within "$WITHIN_FAST" --role button --name "保存"
 run B wait-text "模型 fast-model，端点沿用本租户默认"
 run B wait-selector '[data-tier-fast="tenant"]'
+expect_value "$WITHIN_FAST" "模型名" "fast-model"
+expect_value "$WITHIN_FAST" "端点" ""
+expect_value "$WITHIN_FAST" "API Key" ""
 
 run B fill --within "$WITHIN_REASON" --label "模型名" --value "reason-model"
 run B fill --within "$WITHIN_REASON" --label "端点" --value "$TIER_URL"
@@ -147,8 +174,36 @@ run B fill --within "$WITHIN_REASON" --label "API Key" --value "$REASON_KEY"
 run B click --within "$WITHIN_REASON" --role button --name "保存"
 run B wait-text "模型 reason-model，端点 ${TIER_URL}"
 run B wait-selector '[data-tier-reasoning="tenant"]'
+expect_value "$WITHIN_REASON" "模型名" "reason-model"
+expect_value "$WITHIN_REASON" "端点" "$TIER_URL"
+expect_value "$WITHIN_REASON" "API Key" ""
+expect_text '[data-tier-reasoning="tenant"]' "模型 reason-model，端点 ${TIER_URL}"
+expect_value "$WITHIN_FAST" "模型名" "fast-model"
 run B screenshot --path "$EV/model-provider-saved.png"
 run B snapshot --path "$EV/model-provider-saved.aria.txt"
+
+# Reset fast while reasoning is still saved, so the reasoning inputs prove the other card was not touched.
+run B click --within "$WITHIN_RESET_FAST" --role button --name "恢复默认" --confirm accept
+run B wait-selector '[data-tier-fast="default"]'
+expect_text '[data-tier-fast="default"]' "使用默认"
+expect_value "$WITHIN_FAST" "模型名" ""
+expect_value "$WITHIN_FAST" "端点" ""
+expect_value "$WITHIN_FAST" "API Key" ""
+expect_value "$WITHIN_REASON" "模型名" "reason-model"
+expect_value "$WITHIN_REASON" "端点" "$TIER_URL"
+expect_value "$WITHIN_REASON" "API Key" ""
+
+# A 400 does not change the saved key, so the half-filled draft stays on screen.
+run B fill --within "$WITHIN_REASON" --label "模型名" --value "qwen-plus-draft"
+run B fill --within "$WITHIN_REASON" --label "端点" --value "$DRAFT_URL"
+run B fill --within "$WITHIN_REASON" --label "API Key" --value "$DRAFT_KEY"
+run B set-hidden --within "$WITHIN_REASON" --name tier --value nope
+run B click --within "$WITHIN_REASON" --role button --name "保存"
+run B wait-text "档位须是 fast 或 reasoning"
+expect_value "$WITHIN_REASON" "模型名" "qwen-plus-draft"
+expect_value "$WITHIN_REASON" "端点" "$DRAFT_URL"
+expect_value "$WITHIN_REASON" "API Key" "$DRAFT_KEY"
+expect_text '[data-tier-reasoning="tenant"]' "模型 reason-model，端点 ${TIER_URL}"
 
 run B click --role button --name "测试连通性"
 run B wait-text "连通成功" --timeout 60000
@@ -159,8 +214,12 @@ ask "档位推理" assistant-bound.png
 
 run B click --within "$WITHIN_RESET_REASON" --role button --name "恢复默认" --confirm accept
 run B wait-selector '[data-tier-reasoning="default"]'
-run B click --within "$WITHIN_RESET_FAST" --role button --name "恢复默认" --confirm accept
-run B wait-selector '[data-tier-fast="default"]'
+expect_text '[data-tier-reasoning="default"]' "使用默认"
+expect_value "$WITHIN_REASON" "模型名" ""
+expect_value "$WITHIN_REASON" "端点" ""
+expect_value "$WITHIN_REASON" "API Key" ""
+expect_text '[data-tier-fast="default"]' "使用默认"
+expect_value "$WITHIN_FAST" "模型名" ""
 run B screenshot --path "$EV/model-provider-tier-reset.png"
 
 ask "恢复后回落" assistant-unbound.png
@@ -185,8 +244,31 @@ if ! grep -F 'model_providers 的 reasoning 档位有端点但没有 Key，按�
   grep -F 'model_providers 的 reasoning 档位有端点但没有 Key，按未绑定该档位处理' "$LOG_FILE" >"$EV/dirty-warn.txt" || die "server log has no dirty-tier warning"
 fi
 
+run B fill --within "$WITHIN_EMBED" --label "端点" --value "$EMBED_URL"
+run B fill --within "$WITHIN_EMBED" --label "模型名" --value "text-embedding-v3"
+run B fill --within "$WITHIN_EMBED" --label "API Key" --value "$EMBED_KEY"
+run B click --within "$WITHIN_EMBED" --role button --name "保存"
+run B wait-text "当前使用本租户的 embedding 配置"
+expect_value "$WITHIN_EMBED" "模型名" "text-embedding-v3"
+expect_value "$WITHIN_EMBED" "端点" "$EMBED_URL"
+expect_value "$WITHIN_EMBED" "API Key" ""
+expect_value "$WITHIN_TENANT" "模型名" "tenant-default"
+run B click --within "$WITHIN_RESET_EMBED" --role button --name "恢复平台默认" --confirm accept
+run B wait-text "还没有配置 embedding：不配置时目录检索只用关键词"
+expect_value "$WITHIN_EMBED" "模型名" ""
+expect_value "$WITHIN_EMBED" "端点" ""
+expect_value "$WITHIN_EMBED" "API Key" ""
+expect_value "$WITHIN_TENANT" "模型名" "tenant-default"
+expect_value "$WITHIN_TENANT" "端点" "$TENANT_URL"
+expect_value "$WITHIN_TENANT" "API Key" ""
+
 run B click --within "$WITHIN_RESET_PLATFORM" --role button --name "恢复平台默认" --confirm accept
 run B wait-text "当前使用平台默认的模型服务"
+expect_value "$WITHIN_TENANT" "模型名" ""
+expect_value "$WITHIN_TENANT" "端点" ""
+expect_value "$WITHIN_TENANT" "API Key" ""
+expect_value "$WITHIN_EMBED" "模型名" ""
+expect_value "$WITHIN_EMBED" "端点" ""
 run B screenshot --path "$EV/model-provider-platform-reset.png"
 
 ask "平台推理" assistant-platform.png
