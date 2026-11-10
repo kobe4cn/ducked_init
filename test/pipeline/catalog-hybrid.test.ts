@@ -1,15 +1,17 @@
 // test/pipeline/catalog-hybrid.test.ts —— 混合检索（ADR-0047、0049）的接缝：rankedSearch({ hybrid: true }) → vectorHits（查询 embedding + catalog_embeddings 缓存）→ rank 的向量一路；
 // embedding 超时（短超时）、5xx 或没配置时只去掉向量这一路（fallback 仍为 false、结果与关键词检索逐项相同）；换模型后缺向量的条目只走关键词并入队补算，drain 后向量一路恢复；
-// catalog_search（内部与 MCP 同一入口）按租户 hybrid_search 开关决定是否走混合（#432）
+// catalog_search（内部与 MCP 同一入口）按租户 hybrid_search 开关决定是否走混合（#432）；
+// hybridReady 断言向量缓存齐全，缺了就在报错里列出诊断（#610）
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runTool } from '../../app/.server/assistant/tools';
 import { ensureEmbeddings, QUERY_EMBED_TIMEOUT_MS } from '../../app/.server/catalog/embeddings';
 import { haystack, terms } from '../../app/.server/catalog/index';
 import { tenantCatalog } from '../../app/.server/catalog/load';
-import { rankedSearch, refreshProjection } from '../../app/.server/catalog/projection';
+import { projectionVersion, rankedSearch, refreshProjection } from '../../app/.server/catalog/projection';
+import { currentCatalogVersion } from '../../app/.server/catalog/versions';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { llmCalls, modelProviders, tasks, tenants } from '../../app/.server/db/schema';
+import { catalogEmbeddings, catalogProjection, llmCalls, modelProviders, tasks, tenants } from '../../app/.server/db/schema';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { MODEL_PROVIDER_CONTEXT, setLlmFetch } from '../../app/.server/llm';
 import { encryptForTenant } from '../../app/.server/secrets';
@@ -33,7 +35,28 @@ const vec = (t: string): number[] => t === QUERY || t.includes(MARK) ? [1, 0] : 
 const embedTasks = (tenantId: string) =>
   getDb().select().from(tasks).where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'catalog.embed')));
 
-/** 开通租户、发布只靠向量命中的指标、建投影、配平台 embedding 并 drain 补齐向量缓存，读出调用方的目录 */
+/** drain 之后该有的向量缓存：text-embedding-v3（platformEmbedding 设的模型）下，投影的每个文本哈希都有向量。
+ *  缺了就带着诊断报错（#610）：缺向量的行、租户全部任务、投影版本、当前目录版本——分不清「缓存没写全」还是「排序截断」时，报错里直接能看出根因。
+ *  只断言、不补救：不调 ensureEmbeddings、不重跑 drain（会多入队任务，破坏用例对任务个数的精确断言），也不轮询（没有证据说明等一下就好） */
+async function assertEmbeddingsComplete(tenantId: string) {
+  const db = getDb();
+  const rows = await db.select({ entryId: catalogProjection.entryId, visibilityClass: catalogProjection.visibilityClass, textHash: catalogProjection.textHash })
+    .from(catalogProjection).where(eq(catalogProjection.tenantId, tenantId));
+  const existing = new Set((await db.select({ textHash: catalogEmbeddings.textHash }).from(catalogEmbeddings)
+    .where(and(eq(catalogEmbeddings.tenantId, tenantId), eq(catalogEmbeddings.modelId, 'text-embedding-v3'))))
+    .map(v => v.textHash));
+  const missing = rows.filter(r => !existing.has(r.textHash));
+  if (!missing.length) return;
+  const allTasks = await db.select({ kind: tasks.kind, status: tasks.status }).from(tasks).where(eq(tasks.tenantId, tenantId));
+  const diag = `hybridReady 结束时向量缓存不全（#610）`
+    + `；缺向量的投影行 ${missing.map(r => `${r.entryId}/${r.visibilityClass}/${r.textHash.slice(0, 8)}`).join(' ')}`
+    + `；租户全部任务 ${allTasks.map(t => `${t.kind}/${t.status}`).join(' ') || '(无)'}`
+    + `；投影版本 ${await projectionVersion(db, tenantId)}`
+    + `；当前目录版本 ${await currentCatalogVersion(db, tenantId)}`;
+  expect(missing, diag).toEqual([]);
+}
+
+/** 开通租户、发布只靠向量命中的指标、建投影、配平台 embedding 并 drain 补齐向量缓存（assertEmbeddingsComplete 把缓存齐全钉住），读出调用方的目录 */
 async function hybridReady() {
   const acme = await newTenant('acme');
   const analyst = await memberOf(acme, 'an@acme.com', 'analyst');
@@ -45,6 +68,7 @@ async function hybridReady() {
   const { received } = fakeLlm(setLlmFetch, (_n, body: LlmBody) => embeddings(body.input.map((t: string) => vec(t)), { prompt_tokens: 3 }));
   await ensureEmbeddings(acme);
   await drain();
+  await assertEmbeddingsComplete(acme);
   return { acme, c: await tenantCatalog(acme), received, analyst };
 }
 
@@ -73,7 +97,7 @@ describe('混合检索', () => {
     const hybrid = await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true });
     expect(hybrid.fallback).toBe(false);
     const hit = hybrid.ranked.find(r => r.entry.id === 'metric:churn_forecast')!;
-    expect(hit).toBeDefined();
+    expect(hit, JSON.stringify(hybrid.ranked.map(r => [r.entry.id, r.reasons.map(x => x.lane)]))).toBeDefined();
     expect(hit.reasons).toContainEqual({ lane: 'vector', matched: ['1.00'] });
     expect(received.slice(callsBefore).map(r => r.body.input)).toEqual([[QUERY]]); // 只为查询算一次向量
 
