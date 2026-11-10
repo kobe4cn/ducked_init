@@ -161,6 +161,13 @@ async function handle(page, state, req) {
     await scope.getByLabel(req.label, { exact: true }).selectOption(req.value);
     return {};
   }
+  if (cmd === 'set-hidden') {
+    // 直接写隐藏字段的 DOM 值，绕过 React：手工构造构建器的 form 提交用。
+    // 隐藏字段是受控的，下一次重渲染会把值覆盖回去，设完要立刻提交。
+    if (!req.name || req.value === undefined) throw new Error('set-hidden requires --name and --value');
+    await scope.locator(`input[type="hidden"][name="${req.name}"]`).first().evaluate((el, v) => { el.value = v; }, req.value);
+    return {};
+  }
   if (cmd === 'wait-text') {
     const text = req.positionals?.[0];
     if (!text) throw new Error('wait-text requires the text');
@@ -214,7 +221,7 @@ async function handle(page, state, req) {
 }
 
 function usage() {
-  console.error(`usage: browser.mjs <goto|fill|click|select|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|magic-link> [args]`);
+  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|magic-link> [args]`);
 }
 
 async function runClient() {

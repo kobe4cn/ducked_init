@@ -19,7 +19,7 @@ Preconditions, once per machine, not done by the script:
 
 - From the repo root: `pnpm install --frozen-lockfile`
 - PostgreSQL 15 or newer reachable by a role that has `CREATEDB` and `CREATEROLE`. Default admin URL: `postgres://crm:crm@127.0.0.1:5432/postgres` (the `postgres` service in `db_script/docker-compose.yml`, started with `docker compose --profile pg up -d postgres`). Override with `VERIFY_PG_ADMIN_URL`.
-- For Drive: Google Chrome or Chromium on `PATH`, or `CHROME_PATH` set to the executable. The first browser command installs `playwright-core@1.64.1` into `.cursor/skills/verify-ducked-init/.tools` (gitignored). It does not download a Playwright browser.
+- For Drive: Google Chrome or Chromium on `PATH`, or `CHROME_PATH` set to the executable. On macOS the system Chrome is not on `PATH`: set `CHROME_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`. The first browser command installs `playwright-core@1.64.1` into `.cursor/skills/verify-ducked-init/.tools` (gitignored). It does not download a Playwright browser.
 - First tenant creation downloads DuckDB extensions (`ducklake`, `postgres`, `httpfs`) from `extensions.duckdb.org`.
 
 ```bash
@@ -131,6 +131,10 @@ This kills the recorded server pid and its descendants, kills Chrome only when i
 
 Run cleanup after every failed launch or drive so ports, databases, and roles are not left behind.
 
+## Gotchas
+
+- 刚起来的 dev server 第一次被访问时，Vite 会做一次依赖优化并整页重载：第一次登录可能卡在「请查收邮件」后等待超时。重试一次即可，或先 `goto /login` 等几秒再开始填邮箱。
+
 ## Helpers
 
 | Script | Invocation |
@@ -144,6 +148,6 @@ Run cleanup after every failed launch or drive so ports, databases, and roles ar
 | `scripts/ensure-browser.sh` | `.cursor/skills/verify-ducked-init/scripts/ensure-browser.sh` |
 | `scripts/lib.sh` | Sourced by the shell scripts. Do not execute it. |
 
-`browser.mjs` calls `ensure-browser.sh` before opening Chrome. Commands: `goto`, `fill --label --value`, `click --role --name`, `select --label --value`, `wait-text`, `wait-url`, `wait-selector`, `screenshot --path`, `snapshot --path`, `title`, `url`, `text --selector`, `value --label`, `count --selector`, `magic-link --email [--offset]`. `goto /path` resolves against `BASE_URL`. `fill` / `click` / `select` / `value` also take `--within <css>` to scope the lookup inside one container — the metric builder repeats the same labels (several `添加一行` buttons, one per filter block), so scope with the container: `--within '[data-cond-rows="numerator"]'`.
+`browser.mjs` calls `ensure-browser.sh` before opening Chrome. Commands: `goto`, `fill --label --value`, `click --role --name`, `select --label --value`, `set-hidden --name --value`, `wait-text`, `wait-url`, `wait-selector`, `screenshot --path`, `snapshot --path`, `title`, `url`, `text --selector`, `value --label`, `count --selector`, `magic-link --email [--offset]`. `goto /path` resolves against `BASE_URL`. `fill` / `click` / `select` / `set-hidden` / `value` also take `--within <css>` to scope the lookup inside one container — the metric builder repeats the same labels (several `添加一行` buttons, one per filter block), so scope with the container: `--within '[data-cond-rows="numerator"]'`. `set-hidden` writes a hidden input's DOM value directly, bypassing React — used to hand-craft the builder's `form` (see [新建指标（条件构建器）](./features/metric-builder.md)); the value survives only until the next render, so click 检查 right after.
 
 Keep the map honest as the app changes with `/maintain-verification-skill`.
