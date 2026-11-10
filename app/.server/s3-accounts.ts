@@ -97,7 +97,9 @@ export async function setTenantS3Prefixes(tenantId: string, dataPaths: string[])
 const putPolicy = (UserName: string, PolicyDocument: string) => iam('PutUserPolicy', { UserName, PolicyName: 'tenant-lake', PolicyDocument });
 
 /**
- * 删除租户在存储服务上的读写与只读账号；账号不存在时什么也不做。
+ * 删除租户在存储服务上的读写与只读账号；账号不存在时补删一次策略（#621：SeaweedFS 的 DeleteUser 只删
+ * 身份文件、不清 policies.json 里的内联策略，DeleteUserPolicy 对已不存在的账号又只会回 NoSuchEntity，
+ * 「账号没了、策略还在」就成了 IAM API 删不掉的孤儿，只能由 prune-seaweed-iam-policies.ts 兜底）。
  * 与 AWS 一样，账号还有密钥或策略时 DeleteUser 报 DeleteConflict（SeaweedFS 4.50 起），先删密钥与策略
  */
 export async function deleteTenantS3Account(tenantId: string) {
@@ -107,6 +109,8 @@ export async function deleteTenantS3Account(tenantId: string) {
       keys = await iam('ListAccessKeys', { UserName });
     } catch (e) {
       ignoreIamError('NoSuchEntity')(e);
+      // 账号不在也可能只是密钥先没了：仍尝试删一次策略（账号确实不在时存储服务回 NoSuchEntity，忽略）
+      await iam('DeleteUserPolicy', { UserName, PolicyName: 'tenant-lake' }).catch(ignoreIamError('NoSuchEntity'));
       continue;
     }
     for (const AccessKeyId of tags(keys, 'AccessKeyId')) await iam('DeleteAccessKey', { UserName, AccessKeyId });
