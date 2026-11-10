@@ -1,5 +1,6 @@
 /**
- * 解析 issue 正文的纯函数：plan() 靠它们判断 blocker 和「两张票改同一个文件」，单独放出来是为了能测。
+ * 解析 issue 正文与门槛失败摘要的纯函数：plan() 靠它们判断 blocker 和「两张票改同一个文件」，
+ * reportFlaky() 靠 flakyFailures 按报错签名去重开偶发失败的票。单独放出来是为了能测。
  * 指引的写法见 docs/agents/ticket-sizing.md 的 `## Implementation guide` 模板。
  */
 
@@ -94,4 +95,46 @@ export const splitChildren = (body: string): number[] => {
     .filter((n): n is string => n !== undefined)
     .map(Number);
   return [...new Set(refs)];
+};
+
+/** 门槛失败摘要里的 FAIL 行：` FAIL  test/….test.ts > 用例名`（与 GATE_SCRIPT `failures()` 的输出格式一致）。 */
+const FAIL_LINE = /^ FAIL +(test\/\S+\.test\.tsx?)/;
+/** 报错行之后不该当成报错的行：下一条 FAIL、分隔线（⎯ / = 等）、结尾的统计行、缩进的堆栈上下文。 */
+const NOT_ERROR = /^(?: FAIL |[\s⎯━─=*]{3,}| *(?:Test Files|Tests) )/;
+
+/**
+ * 报错行的归一化签名：去掉首尾空白，把 `host.containers.internal`、IP、UUID 这类易变值换成占位，
+ * 数字串（端口、行号、随机数）换成 `N`，截到 160 字。同一根因只有 IP / 端口 / 行号不同的报错
+ * 得到同一个签名，reportFlaky 靠它认出「又出现一次」，不再一个文件开一张票（#607）。
+ */
+export const flakySignature = (errorLine: string): string =>
+  errorLine
+    .trim()
+    .replace(/host\.containers\.internal/g, "<host>")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<uuid>")
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, "<ip>")
+    .replace(/\d+/g, "N")
+    .slice(0, 160);
+
+/**
+ * 门槛失败摘要里每个失败文件的报错签名：对每个 FAIL 行取它后面第一条非空行当报错（NOT_ERROR 的行跳过并停），
+ * 归一化后作为签名；同一个文件只取第一条报错。摘要可能被门槛脚本的 `head -80` 截断，最后一个文件
+ * 只剩 FAIL 行、没有报错时签名为空串，reportFlaky 让它退回只按标题去重的老逻辑。
+ */
+export const flakyFailures = (summary: string): { file: string; signature: string }[] => {
+  const lines = summary.split("\n");
+  const firsts = new Map<string, string>();
+  for (let i = 0; i < lines.length; i++) {
+    const file = lines[i]!.match(FAIL_LINE)?.[1];
+    if (!file || firsts.has(file)) continue;
+    let error: string | undefined;
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j]!;
+      if (!line.trim()) continue;
+      if (!NOT_ERROR.test(line)) error = line;
+      break;
+    }
+    firsts.set(file, error === undefined ? "" : flakySignature(error));
+  }
+  return [...firsts].map(([file, signature]) => ({ file, signature }));
 };

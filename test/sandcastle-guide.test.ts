@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { blockersOf, changedFiles, splitChildren } from '../.sandcastle/guide';
+import { blockersOf, changedFiles, flakyFailures, flakySignature, splitChildren } from '../.sandcastle/guide';
 
 const guide = (lines: string) => `## What to build\n\n改 \`app/x.ts:1\`。\n\n## Implementation guide\n\n${lines}\n\n## Blocked by\n\n- #1\n`;
 
@@ -78,5 +78,73 @@ describe('Sandcastle 的 blocker 与子票 blockersOf / splitChildren', () => {
       '上面的检查点改为在 #496、#497 都合并后执行。#465–#468 改为被 #497 block。',
     ].join('\n');
     expect(splitChildren(body)).toEqual([496, 497, 68]);
+  });
+});
+
+// #545 正文「第一次的失败」一节的原样摘要：两个文件、两种根因（源库连接超时 / TypeError）。
+const flakySummary = [
+  '重跑通过。第一次的失败：',
+  '⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯',
+  '',
+  ' FAIL  test/http/mcp.test.ts > /mcp 工具 > 无权限或输入不对的工具调用是 isError 结果（403 的说明原样给出），不是 500',
+  'Error: 无法连接数据源：IO Error: Unable to connect to Postgres at "connect_timeout=10": connection to server at "host.containers.internal" (192.168.127.254), port 5432 failed: timeout expired',
+  '',
+  ' ❯ app/.server/sources.ts:66:11',
+  '     64| async function probe(spec: SourceSpec) {',
+  '',
+  '⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯',
+  '',
+  ' FAIL  test/http/sources.test.ts > 同步范围 > 登记后列出表与估算行数',
+  'TypeError: Cannot read properties of null (reading \'match\')',
+  ' ❯ sourceIdOf test/http/sources.test.ts:40:66',
+  '',
+  '⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯',
+  '',
+  '',
+  ' Test Files  2 failed | 145 passed (147)',
+  '      Tests  2 failed | 1541 passed | 2 expected fail (1545)',
+].join('\n');
+
+describe('Sandcastle 偶发失败的报错签名 flakyFailures / flakySignature', () => {
+  it('每个 FAIL 行后面第一条非空行是报错：连接超时和 TypeError 各得一个签名，统计行不算', () => {
+    expect(flakyFailures(flakySummary)).toEqual([
+      {
+        file: 'test/http/mcp.test.ts',
+        signature:
+          'Error: 无法连接数据源：IO Error: Unable to connect to Postgres at "connect_timeout=N": connection to server at "<host>" (<ip>), port N failed: timeout expired',
+      },
+      { file: 'test/http/sources.test.ts', signature: "TypeError: Cannot read properties of null (reading 'match')" },
+    ]);
+  });
+
+  it('只有 IP、端口、行号不同的报错得到同一个签名；超长报错截到 160 字', () => {
+    const first = flakySignature('Error: 连接超时 at "host.containers.internal" (192.168.127.254), port 5432 ❯ app/.server/sources.ts:66:11');
+    expect(first).toBe('Error: 连接超时 at "<host>" (<ip>), port N ❯ app/.server/sources.ts:N:N');
+    expect(
+      flakySignature('Error: 连接超时 at "host.containers.internal" (192.168.100.1), port 5555 ❯ app/.server/sources.ts:99:1'),
+    ).toBe(first);
+    expect(flakySignature(`${'x'.repeat(200)} 12.34.56.78 12345678-1234-1234-1234-123456789012`)).toBe(
+      'x'.repeat(200).slice(0, 160),
+    );
+  });
+
+  it('同一个文件多条 FAIL 只取第一条报错；UUID 换占位；摘要被截断只剩 FAIL 行时签名为空串', () => {
+    const twice = [
+      ' FAIL  test/a.test.ts > 用例一',
+      'AssertionError: expected 1 to be 2',
+      ' FAIL  test/a.test.ts > 用例二',
+      'Error: 第二条的报错不该取到',
+      '',
+      ' FAIL  test/trunc.test.ts > 只有 FAIL 行，摘要被 head 截断',
+      '',
+      ' Test Files  2 failed | 145 passed (147)',
+    ].join('\n');
+    expect(flakyFailures(twice)).toEqual([
+      { file: 'test/a.test.ts', signature: 'AssertionError: expected N to be N' },
+      { file: 'test/trunc.test.ts', signature: '' },
+    ]);
+    expect(flakySignature('upsert 冲突：7c9e6679-7425-40de-944b-e07fc1f90ae7 已存在')).toBe(
+      'upsert 冲突：<uuid> 已存在',
+    );
   });
 });
