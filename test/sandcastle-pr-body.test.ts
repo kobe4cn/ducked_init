@@ -117,6 +117,19 @@ describe('Sandcastle 只替换正文一节 replaceSection', () => {
     expect(replaceSection(without, '验收说明', '## 验收说明\n\n新的验收说明。')).toBe(body.replace('旧的验收说明。', '新的验收说明。'));
   });
 
+  it('格式不对的原文里有 `## 附注`：降成 `###` 进正文，重做替换时整节换掉，Review 及以后逐字不变', () => {
+    const bad = `${notes}\n## 附注\n\n旧的附注文字。\n##\n`;
+    const section = acceptanceSection('b', bad, { pageChanged: false });
+    expect(section.split('\n').filter((line) => /^##(\s|$)/.test(line))).toEqual([]);
+    expect(section).toContain('### 附注');
+    const tail = ['## Review', '', '旧的摘要。', '', '## Gate', '', '旧的门槛。'].join('\n');
+    const first = replaceSection(`Closes #7\n\n${tail}`, '验收说明', `## 验收说明\n\n${section}`);
+    expect(first).toContain('旧的附注文字。');
+    const redone = replaceSection(first, '验收说明', '## 验收说明\n\n新的验收说明。');
+    expect(redone).toBe(`Closes #7\n\n## 验收说明\n\n新的验收说明。\n\n${tail}`);
+    expect(redone).not.toContain('附注');
+  });
+
   it('正文只有 Closes #n 时也能插入；`###` 小标题不会被当成节边界', () => {
     expect(replaceSection('Closes #7', '验收说明', '## 验收说明\n\n内容\n\n### 做了什么\n\n…')).toBe(
       'Closes #7\n\n## 验收说明\n\n内容\n\n### 做了什么\n\n…',
