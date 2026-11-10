@@ -38,7 +38,7 @@ The whole recipe is `.cursor/skills/verify-ducked-init/scripts/drive-members.sh`
 
 - Inviting an email that is already a member shows `操作未完成` and `已是本租户成员`. The table does not gain a second row. Treat a second run on the same database as a failed precondition, not as a product bug.
 - The role `<select>` option value is `data_engineer`. The visible label is `数据工程师`. Selecting by the Chinese label through `select --value` will not match.
-- Removing a member or changing your own role opens a `confirm()` dialog. This recipe does not do either. Accepting or dismissing that dialog is required before those buttons will submit.
+- Removing a member or changing your own role opens a `confirm()` dialog. This recipe does not do either. Accepting or dismissing that dialog is required before those buttons will submit. `browser.mjs click --confirm accept` accepts the dialog. Without `--confirm`, the dialog is dismissed and the submit does not run.
 - The invite mail is queued after the redirect. Wait until the block appears in the log. The members table is already updated before the mail is printed.
 - The invite mail tells the person to use `/login`. It is not itself a Magic Link. Signing in as the invitee is a separate login request.
 - `邮箱` is the invite field's label. Row role controls are named `<email> 的角色`, not `角色`.

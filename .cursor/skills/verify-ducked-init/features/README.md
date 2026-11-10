@@ -16,7 +16,8 @@ This directory is the maintained source for verifying the user-facing behavior o
 
 - Start every recipe from the baseline state unless its preconditions say otherwise.
 - Drive the browser with `node .cursor/skills/verify-ducked-init/scripts/browser.mjs`. Names and labels are exact accessible names.
-- Read or write SQL only as a second view of something the UI already did. Use `scripts/sql.sh`. Do not insert members, sessions, or audit rows.
+- Read stored rows with `scripts/sql.sh`. It is read-only.
+- A state the form rejects, such as a tier endpoint with no API key, is written with `scripts/sql-write.sh`. It runs only against `crm_platform_verify_<run-id>` and refuses any other database name before connecting. Do not use it to insert members, sessions, or audit rows.
 - Copy log excerpts into the evidence directory before cleanup. Cleanup deletes the server log.
 - Restore nothing by deleting proof files. Cleanup may drop the database; it must not delete evidence.
 
@@ -48,3 +49,5 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 - [新建指标（条件构建器）](./metric-builder.md) covers building a metric with the condition builder: check without saving (summary + SQL), save as draft v1, ignored empty rows, invalid forms 400, YAML mode, and handmade `form` submissions.
 - [新建标签（条件构建器）](./tag-builder.md) covers building a tag from published numeric metrics: single/multi-metric rules with one level of all / any, missing-value strategy, default, save as draft v1 with the same YAML as handwritten, and YAML mode.
 - [Audit log](./audit.md) covers the tenant-creation row written by launch. Lake init during launch does not add an audit row.
+- [模型服务](./model-provider.md) covers the tenant provider, the fast and reasoning cards, 测试连通性, confirm-accept reset, and a dirty tier row.
+- [AI 助手](./assistant.md) covers sending a message and checking the stub request plus the `llm_calls` row (model, route, fallback_reason).

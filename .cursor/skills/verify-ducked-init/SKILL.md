@@ -1,6 +1,6 @@
 ---
 name: verify-ducked-init
-description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, or audit, and capture evidence."
+description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, model provider, or the AI assistant, and capture evidence."
 ---
 
 # Verify CRM 数据分析平台
@@ -31,7 +31,7 @@ Optional environment: `VERIFY_RUN_ID` (`^[a-z][a-z0-9]{0,30}$`), `VERIFY_PORT`, 
 What it does, in order:
 
 1. Create empty database `crm_platform_verify_<run-id>` and empty lake directory `$STATE_DIR/lake`.
-2. Write `$STATE_DIR/app.env` with `PLATFORM_DATABASE_URL`, `PLATFORM_LAKE_URI` (that lake directory), a new `PLATFORM_MASTER_KEY`, `MAILER=console`, and `MAGIC_LINK_RATE_LIMIT=50`. It also writes `APP_ORIGIN=<base url>` there and exports it for migrate, tenant create, and the dev server, so magic links point at this run's server. It unsets `MAIL_HOST`, `MAIL_USER`, and `MAIL_PASS`. Explicitly exported variables win: Vite's `loadEnv` (which React Router dev merges into `process.env`) and Node `--env-file` only fill variables that are not set. An unset variable is not set, so a repo `.env` fills it back in. That is why `APP_ORIGIN` is exported rather than unset; the unset `MAIL_*` variables may be refilled from a repo `.env`, but the exported `MAILER=console` wins, so mail stays in `server.log`.
+2. Write `$STATE_DIR/app.env` with `PLATFORM_DATABASE_URL`, `PLATFORM_LAKE_URI` (that lake directory), a new `PLATFORM_MASTER_KEY`, `MAILER=console`, and `MAGIC_LINK_RATE_LIMIT=50`. It also writes `APP_ORIGIN=<base url>` there and exports it for migrate, tenant create, and the dev server, so magic links point at this run's server. It unsets `MAIL_HOST`, `MAIL_USER`, and `MAIL_PASS`. Explicitly exported variables win: Vite's `loadEnv` (which React Router dev merges into `process.env`) and Node `--env-file` only fill variables that are not set. An unset variable is not set, so a repo `.env` fills it back in. That is why `APP_ORIGIN` is exported rather than unset; the unset `MAIL_*` variables may be refilled from a repo `.env`, but the exported `MAILER=console` wins, so mail stays in `server.log`. Every `LLM_*` variable that is set in the launch shell is copied into the same file, including an empty value. The dev server sources `app.env`, so a local stub does not depend on the server process inheriting the parent shell. Leave a name unset only when a repo `.env` is allowed to fill it. Model-provider and assistant drives export the stub's `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, and `LLM_REASONING_*` before launch, and export `LLM_FAST_*` and `LLM_EMBEDDING_*` as empty. Use fake keys aimed at `127.0.0.1`.
 3. `pnpm db:migrate` then `pnpm tenant:create --slug verify --name 验收租户 --admin-email admin@verify.test`. Launch fails if the log contains `初始化失败` or `catalog_initialized_at` is null.
 4. Start `pnpm dev --host 127.0.0.1 --port <port> --strictPort` and record its pid. Stdout is redirected to the state directory's `server.log`, so Vite's clear-screen is not a TTY and does not erase the log.
 
@@ -76,6 +76,8 @@ WHERE t.slug = 'verify' AND m.email = 'admin@verify.test'
 
 `scripts/sql.sh "SELECT ..."` runs a single query against that database (`-tA -F'|'`) with `default_transaction_read_only=on`, so writes fail with `cannot execute … in a read-only transaction`.
 
+`scripts/sql-write.sh "UPDATE ..."` runs one statement against the same database with writes allowed. It refuses, before connecting, when the run id, `DB_NAME`, or the database name in `DATABASE_URL` is not `crm_platform_verify_<run-id>` (`^[a-z][a-z0-9]{0,30}$` for the run id). After connecting it checks `current_database()` and still refuses a mismatch, so the statement is not run. Use it for a state the form rejects, such as a tier endpoint with a null key. Do not use it to insert members, sessions, or audit rows.
+
 ## Drive
 
 Prefer `scripts/browser.mjs`. The first command starts one system Chrome (1440×900) and leaves its pid in `$STATE_DIR/browser.pid`. Later commands reconnect to that same page, so a client-rendered result such as `请查收邮件` is still there for the next command. Labels and accessible names are exact. At this width the admin nav wraps, and the link name is still the full label (`概览`, `成员`, `审计日志`). Do not click by coordinates. Cleanup kills that pid and its children.
@@ -100,6 +102,8 @@ Stable handles used by the map:
 - Members: label `邮箱`, label `角色` (option values `admin`, `data_engineer`, `analyst`, `viewer`), button `邀请`, row `[data-email="<email>"]`, role control label `<email> 的角色`.
 - Audit rows: `[data-audit-action="<Chinese action label>"]`. `邀请成员` is the label for `member.invited`.
 - Tasks rows: `[data-task-kind]` and `[data-task-status]`.
+- Model provider: nav `模型服务`, path `/model-provider`, heading `模型服务`, button `测试连通性`, button `恢复平台默认`, button `恢复默认`. `端点`, `模型名`, `API Key`, and `保存` repeat across cards. Scope them with `--within 'form:has(#...)'`. `恢复默认` and `恢复平台默认` need `--confirm accept`.
+- Assistant: button `AI 助手` (it toggles the panel), textarea label `向 AI 助手提问`, button `发送`.
 
 The members journey, including login, invite, audit, SQL, the console mail, logout, and a second login as the invitee:
 
@@ -144,10 +148,13 @@ Run cleanup after every failed launch or drive so ports, databases, and roles ar
 | `scripts/drive-members.sh` | `.cursor/skills/verify-ducked-init/scripts/drive-members.sh [run-id]` |
 | `scripts/browser.mjs` | `node .cursor/skills/verify-ducked-init/scripts/browser.mjs <command> ...` |
 | `scripts/sql.sh` | `.cursor/skills/verify-ducked-init/scripts/sql.sh [run-id] "SQL"` |
+| `scripts/sql-write.sh` | `.cursor/skills/verify-ducked-init/scripts/sql-write.sh [run-id] "SQL"` |
+| `scripts/llm-stub.mjs` | `node .cursor/skills/verify-ducked-init/scripts/llm-stub.mjs --port 0 --log <file> --origin-file <file>` |
+| `scripts/drive-model.sh` | `VERIFY_LLM_LOG=<stub jsonl> .cursor/skills/verify-ducked-init/scripts/drive-model.sh [run-id]` |
 | `scripts/cleanup.sh` | `.cursor/skills/verify-ducked-init/scripts/cleanup.sh [run-id]` |
 | `scripts/ensure-browser.sh` | `.cursor/skills/verify-ducked-init/scripts/ensure-browser.sh` |
 | `scripts/lib.sh` | Sourced by the shell scripts. Do not execute it. |
 
-`browser.mjs` calls `ensure-browser.sh` before opening Chrome. Commands: `goto`, `fill --label --value`, `click --role --name`, `select --label --value`, `set-hidden --name --value`, `wait-text`, `wait-url`, `wait-selector`, `screenshot --path`, `snapshot --path`, `title`, `url`, `text --selector`, `value --label`, `count --selector`, `magic-link --email [--offset]`. `goto /path` resolves against `BASE_URL`. `fill` / `click` / `select` / `set-hidden` / `value` also take `--within <css>` to scope the lookup inside one container — the metric builder repeats the same labels (several `添加一行` buttons, one per filter block), so scope with the container: `--within '[data-cond-rows="numerator"]'`. `set-hidden` writes a hidden input's DOM value directly, bypassing React — used to hand-craft the builder's `form` (see [新建指标（条件构建器）](./features/metric-builder.md)); the value survives only until the next render, so click 检查 right after.
+`browser.mjs` calls `ensure-browser.sh` before opening Chrome. Commands: `goto`, `fill --label --value`, `click --role --name [--confirm accept|dismiss]`, `select --label --value`, `set-hidden --name --value`, `wait-text`, `wait-url`, `wait-selector`, `screenshot --path`, `snapshot --path`, `title`, `url`, `text --selector`, `value --label`, `count --selector`, `magic-link --email [--offset]`. `goto /path` resolves against `BASE_URL`. `fill` / `click` / `select` / `set-hidden` / `value` also take `--within <css>` to scope the lookup inside one container — the metric builder repeats the same labels (several `添加一行` buttons, one per filter block), so scope with the container: `--within '[data-cond-rows="numerator"]'`. `click --confirm accept` accepts one `window.confirm` opened by that click (恢复默认, 恢复平台默认, removing a member). `click --confirm dismiss` cancels it. Without `--confirm`, the dialog is dismissed and a submit guarded by `confirm()` does not run. `set-hidden` writes a hidden input's DOM value directly, bypassing React — used to hand-craft the builder's `form` (see [新建指标（条件构建器）](./features/metric-builder.md)); the value survives only until the next render, so click 检查 right after.
 
 Keep the map honest as the app changes with `/maintain-verification-skill`.

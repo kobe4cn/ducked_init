@@ -63,6 +63,7 @@ ADMIN_EMAIL=admin@verify.test
 MASTER_KEY=$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('base64'))")
 
 write_env_files() {
+  local llm_name
   {
     echo "PLATFORM_DATABASE_URL=$(verify_sq "$DATABASE_URL")"
     echo "PLATFORM_LAKE_URI=$(verify_sq "$LAKE_DIR")"
@@ -72,6 +73,13 @@ write_env_files() {
     echo "MAGIC_LINK_RATE_WINDOW_MINUTES=$(verify_sq 15)"
     echo "NODE_ENV=$(verify_sq development)"
     echo "APP_ORIGIN=$(verify_sq "$BASE_URL")"
+    # Copy every LLM_* variable that is set in this shell, including an empty value.
+    # The dev server sources app.env, so a stub endpoint survives without the parent shell's exports.
+    # An unset name is omitted on purpose: Vite loadEnv would otherwise refill it from a repo .env.
+    while IFS= read -r llm_name; do
+      [[ $llm_name == LLM_* ]] || continue
+      echo "$llm_name=$(verify_sq "${!llm_name}")"
+    done < <(compgen -v LLM_ || true)
   } >"$STATE_DIR/app.env"
   {
     echo "RUN_ID=$(verify_sq "$RUN_ID")"
