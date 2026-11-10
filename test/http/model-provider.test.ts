@@ -192,7 +192,7 @@ describe('模型服务页', () => {
     expect(audit).toContain('fast 档 https://fast.example.com/v1，模型 qwen-flash');
   });
 
-  it('恢复档位只清该档三列：另一档、chat 与 embedding 的配置、工具调用探测结果都不动；本来没绑定时不记审计；chat 的恢复不动档位列', async () => {
+  it('保存档位不清探测结果、不改 chat 与 embedding；恢复档位只清该档三列：另一档、chat 与 embedding 的配置、工具调用探测结果都不动；本来没绑定时不记审计；chat 的恢复不动档位列', async () => {
     const acme = await newTenant('acme');
     const admin = await loginAs(app, 'admin@acme.com');
     await save(admin);
@@ -207,9 +207,23 @@ describe('模型服务页', () => {
     };
     expect(await probed()).toMatchObject({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat' });
 
-    expect((await tierReset(admin, 'fast')).status).toBe(302);
+    // 探测之后再保存档位：探测结果、chat 与 embedding 的配置都不动
+    const chatAndEmbedding = (r: typeof modelProviders.$inferSelect) => ({
+      baseUrl: r.baseUrl, model: r.model, apiKey: r.apiKey,
+      embeddingBaseUrl: r.embeddingBaseUrl, embeddingModel: r.embeddingModel, embeddingApiKey: r.embeddingApiKey,
+    });
     let [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
-    expect(row).toMatchObject({ fastModel: null, fastBaseUrl: null, fastApiKey: null, reasoningModel: 'qwen-max' });
+    const beforeTierSave = chatAndEmbedding(row);
+    expect((await tierSave(admin, 'reasoning', 'qwen-max-2')).status).toBe(302);
+    expect((await tierSave(admin, 'fast', 'qwen-flash', 'https://fast.example.com/v1', NEW_TKEY)).status).toBe(302);
+    expect(await probed()).toEqual({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat' });
+    [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
+    expect(chatAndEmbedding(row)).toEqual(beforeTierSave);
+    expect(row).toMatchObject({ baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat', embeddingModel: 'bge-m3', reasoningModel: 'qwen-max-2' });
+
+    expect((await tierReset(admin, 'fast')).status).toBe(302);
+    [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
+    expect(row).toMatchObject({ fastModel: null, fastBaseUrl: null, fastApiKey: null, reasoningModel: 'qwen-max-2' });
     expect(row).toMatchObject({ baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat', embeddingModel: 'bge-m3' });
     expect(await probed()).toMatchObject({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat' });
     const page = await (await admin.get('/model-provider')).text();
@@ -229,7 +243,7 @@ describe('模型服务页', () => {
     // 恢复 chat 的平台默认不动档位列（与档位恢复互不影响）
     expect((await admin.post('/model-provider', { intent: 'reset' })).status).toBe(302);
     [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
-    expect(row).toMatchObject({ baseUrl: null, model: null, apiKey: null, reasoningModel: 'qwen-max', embeddingModel: 'bge-m3' });
+    expect(row).toMatchObject({ baseUrl: null, model: null, apiKey: null, reasoningModel: 'qwen-max-2', embeddingModel: 'bge-m3' });
   });
 
   it('测试 embedding：没配置时说明原因；成功显示模型、维度与耗时，失败显示抹掉 Key 的错误；恢复平台默认清掉 embedding 三项、chat 配置不动', async () => {
