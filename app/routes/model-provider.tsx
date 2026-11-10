@@ -1,12 +1,13 @@
 // app/routes/model-provider.tsx —— 模型服务（仅管理员）：看当前用平台默认还是本租户配置；保存端点、模型名与 API Key（Key 不回显，留空沿用）、
-// 恢复平台默认、测试连通性（同时显示是否支持工具调用）、开关发送脱敏样本；embedding 端点（ADR-0049）单独一张卡，与 chat 互不影响
+// 恢复平台默认、测试连通性（同时显示是否支持工具调用）、开关发送脱敏样本；embedding 端点（ADR-0049）单独一张卡，与 chat 互不影响；
+// fast / reasoning 档位（ADR-0055 路由③a）再一张卡，按用途换模型，端点留空沿用本租户的端点与 Key
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleAlert } from 'lucide-react';
 import type { Route } from './+types/model-provider';
 import { requirePermission } from '~/.server/access';
 import {
-  getModelProvider, ModelProviderError, resetEmbeddingProvider, resetModelProvider, SAMPLE_ROWS, saveEmbeddingProvider, saveModelProvider,
-  setAllowSamples, testEmbeddingProvider, testModelProvider,
+  getModelProvider, ModelProviderError, resetEmbeddingProvider, resetModelProvider, resetTierProvider, SAMPLE_ROWS, saveEmbeddingProvider,
+  saveModelProvider, saveTierProvider, setAllowSamples, testEmbeddingProvider, testModelProvider,
 } from '~/.server/model-provider';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
@@ -30,11 +31,28 @@ export async function action({ request }: Route.ActionArgs) {
   const member = await requirePermission(request, 'model_provider:manage');
   const form = await request.formData();
   const field = (name: string) => String(form.get(name) ?? '');
+  // 档位表单带的 tier 字段，取值不是 fast / reasoning 时按不合法输入返回 400
+  const tierField = () => {
+    const tier = field('tier');
+    return tier === 'fast' || tier === 'reasoning' ? tier : null;
+  };
   try {
     switch (field('intent')) {
       case 'save':
         await saveModelProvider(member, { baseUrl: field('baseUrl'), model: field('model'), apiKey: field('apiKey') });
         break;
+      case 'tier_save': {
+        const tier = tierField();
+        if (!tier) return data({ error: '档位须是 fast 或 reasoning' }, { status: 400 });
+        await saveTierProvider(member, tier, { baseUrl: field('baseUrl'), model: field('model'), apiKey: field('apiKey') });
+        break;
+      }
+      case 'tier_reset': {
+        const tier = tierField();
+        if (!tier) return data({ error: '档位须是 fast 或 reasoning' }, { status: 400 });
+        await resetTierProvider(member, tier);
+        break;
+      }
       case 'embedding_save':
         await saveEmbeddingProvider(member, { baseUrl: field('embeddingBaseUrl'), model: field('embeddingModel'), apiKey: field('embeddingApiKey') });
         break;
@@ -74,6 +92,76 @@ const EMBEDDING_SOURCE_LABEL = {
   platform: '当前使用平台默认的 embedding 端点',
   none: '还没有配置 embedding：不配置时目录检索只用关键词',
 } as const;
+
+/** 每档的名字与它管哪些用途（ADR-0055 的 PURPOSE_TIER 决定，页面只做说明） */
+const TIER_LABEL: Record<'fast' | 'reasoning', { title: string; hint: string }> = {
+  fast: { title: '快速档（fast）', hint: '断言草稿、工作台结果解读、一句话解析这类要快的用途' },
+  reasoning: { title: '推理档（reasoning）', hint: 'AI 助手、起草映射、指标、标签这类要推理的用途' },
+};
+
+/** 「按用途选模型」卡片里的一档：当前绑定 + 换模型的表单。chatReady 是本租户的模型服务（chat 三项）是否已保存，没有时档位无从生效 */
+function TierSection({ tier, state, chatReady, submitting }: {
+  tier: 'fast' | 'reasoning';
+  state: { model: string | null; baseUrl: string | null; apiKeySet: boolean };
+  chatReady: boolean;
+  submitting: boolean;
+}) {
+  const label = TIER_LABEL[tier];
+  const bound = Boolean(state.model);
+  return (
+    <div className="space-y-3 border-t pt-4 first:border-t-0 first:pt-0">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h3 className="font-medium">{label.title}</h3>
+          <p className="text-sm text-slate-500" {...{ [`data-tier-${tier}`]: bound ? 'tenant' : 'default' }}>
+            {bound ? `模型 ${state.model}，${state.baseUrl ? `端点 ${state.baseUrl}` : '端点沿用本租户默认'}` : '使用默认'}
+          </p>
+          <p className="text-sm text-slate-400">{label.hint}</p>
+        </div>
+        {bound && (
+          <Form
+            method="post"
+            onSubmit={e => { if (!confirm(`确定恢复${label.title}的默认？将清空该档的模型、端点与 API Key。`)) e.preventDefault(); }}
+          >
+            <input type="hidden" name="intent" value="tier_reset" />
+            <input type="hidden" name="tier" value={tier} />
+            <Button type="submit" variant="destructive" disabled={submitting}>恢复默认</Button>
+          </Form>
+        )}
+      </div>
+      <Form method="post">
+        <input type="hidden" name="intent" value="tier_save" />
+        <input type="hidden" name="tier" value={tier} />
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor={`${tier}-model`}>模型名</FieldLabel>
+            <Input id={`${tier}-model`} name="model" required defaultValue={state.model ?? ''} placeholder="如：qwen-max" />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor={`${tier}-base-url`}>端点</FieldLabel>
+            <Input id={`${tier}-base-url`} name="baseUrl" defaultValue={state.baseUrl ?? ''} placeholder="留空沿用本租户的端点与 Key" />
+            <FieldDescription>只换模型名时留空；填写后平台请求「端点/chat/completions」。</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor={`${tier}-api-key`}>API Key</FieldLabel>
+            <Input
+              id={`${tier}-api-key`}
+              name="apiKey"
+              type="password"
+              autoComplete="off"
+              placeholder={state.apiKeySet ? '已设置，留空不修改' : '端点留空时不需要'}
+            />
+            {state.apiKeySet && <FieldDescription>改了端点须重新填写，原来的 Key 不会发给新的端点。</FieldDescription>}
+          </Field>
+          <div className="flex items-center gap-3">
+            <Button type="submit" disabled={submitting || !chatReady}>保存</Button>
+            {!chatReady && <span className="text-sm text-slate-400">先保存本租户的模型服务后档位才生效</span>}
+          </div>
+        </FieldGroup>
+      </Form>
+    </div>
+  );
+}
 
 export default function ModelProvider({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, provider, sampleRows } = loaderData;
@@ -251,6 +339,16 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
             </div>
           </FieldGroup>
         </Form>
+      </div>
+
+      <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        <SectionHeader title="按用途选模型">
+          {provider.source === 'tenant'
+            ? '两档可各自换模型；端点留空时沿用本租户的端点与 Key。'
+            : '先保存本租户的模型服务后档位才生效。'}
+        </SectionHeader>
+        <TierSection tier="fast" state={provider.tiers.fast} chatReady={provider.source === 'tenant'} submitting={submitting} />
+        <TierSection tier="reasoning" state={provider.tiers.reasoning} chatReady={provider.source === 'tenant'} submitting={submitting} />
       </div>
 
       <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">

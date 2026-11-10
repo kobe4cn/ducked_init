@@ -691,6 +691,8 @@ export const dslVersions = platform.table('dsl_versions', {
 // embedding 三列（ADR-0049）自成一套，选取规则同 chat 但互不影响：租户填了 embedding_* 就整套用租户的，
 // 否则用平台的 LLM_EMBEDDING_*，都没有时向量检索关闭；Key 用同一个 context 加密，存法同 chat 的 api_key。
 // allow_samples 打开后才把敏感列已哈希的样本行发给模型，默认只发表结构与列统计
+// fast / reasoning 档位三列（ADR-0055）：租户按档位绑的模型，只在 chat 三列整套生效时才起作用。模型名必填；
+// 端点留空表示沿用本租户默认的端点与 Key（这时档位的端点与 Key 都存 null），要换端点时端点与 Key 一起填，Key 用同一个 context 加密
 export const modelProviders = platform.table('model_providers', {
   tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
   baseUrl: text('base_url'),
@@ -699,6 +701,12 @@ export const modelProviders = platform.table('model_providers', {
   embeddingBaseUrl: text('embedding_base_url'),
   embeddingModel: text('embedding_model'),
   embeddingApiKey: text('embedding_api_key'),
+  fastModel: text('fast_model'),
+  fastBaseUrl: text('fast_base_url'),
+  fastApiKey: text('fast_api_key'),
+  reasoningModel: text('reasoning_model'),
+  reasoningBaseUrl: text('reasoning_base_url'),
+  reasoningApiKey: text('reasoning_api_key'),
   allowSamples: boolean('allow_samples').notNull().default(false),
   // 最近一次「测试连通性」的工具调用探测（AI 助手要用，ADR-0042）：结果与当时生效的端点、模型；端点或模型变了就作废
   toolsSupported: boolean('tools_supported'),

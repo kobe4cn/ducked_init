@@ -75,17 +75,22 @@ const ACTIONS = {
     label: '下载人群导出',
     describe: (d: Detail) => `导出 ${d.id}`,
   },
-  // 不记 API Key，只记是否轮换；单独开关发送脱敏样本时只记 allowSamples；embedding 的保存 / 恢复（ADR-0049）带 embedding: true
+  // 不记 API Key，只记是否轮换；单独开关发送脱敏样本时只记 allowSamples；embedding 的保存 / 恢复（ADR-0049）带 embedding: true；
+  // 档位的保存 / 恢复（ADR-0055 路由③a）带 tier，摘要写明是哪一档
   'model_provider.updated': {
     label: '修改模型服务',
     describe: (d: Detail) => {
       if ('allowSamples' in d) return `${d.allowSamples ? '打开' : '关闭'}发送脱敏样本`;
+      if (d.tier) return `${d.tier} 档 ${d.baseUrl ?? '沿用默认端点'}，模型 ${d.model}${d.credentialsRotated ? '，轮换 API Key' : ''}`;
       return `${d.embedding ? '向量检索 ' : ''}${d.baseUrl}，模型 ${d.model}${d.credentialsRotated ? '，轮换 API Key' : ''}`;
     },
   },
   'model_provider.reset': {
     label: '恢复平台默认模型服务',
-    describe: (d: Detail) => (d.embedding ? '清空本租户的 embedding 端点、模型名与 API Key' : '清空本租户的端点、模型名与 API Key'),
+    describe: (d: Detail) => {
+      if (d.tier) return `清空 ${d.tier} 档的模型、端点与 API Key`;
+      return d.embedding ? '清空本租户的 embedding 端点、模型名与 API Key' : '清空本租户的端点、模型名与 API Key';
+    },
   },
   'source.registered': { label: '登记数据源', describe: (d: Detail) => `「${d.name}」（${sourceKindLabel(d.kind)}），${d.tables} 张表` },
   // 只记元数据，不记文件内容（ADR-0037）
