@@ -47,6 +47,7 @@ import {
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
 import { blockersOf, changedFiles, flakyTickets, splitChildren } from "./guide.ts";
+import { acceptanceSection, checkAcceptanceNotes, replaceSection, restSections } from "./pr-body.ts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -194,6 +195,13 @@ function collectBrowserCheck(worktreePath: string, issueId: string) {
     result: existsSync(resultFile) ? readFileSync(resultFile, "utf8").trim() : undefined,
     shots: readdirSync(to).filter((f) => /\.(png|jpe?g)$/i.test(f)).sort().map((f) => join(to, f)),
   };
+}
+
+/** 验收说明（implementer 写在 worktree 的 `.pr-notes/验收说明.md`，不提交）：必须在关沙箱前读——
+ *  close 在 worktree 没有未提交改动时会删掉 worktree，被 gitignore 的文件不算改动。 */
+function readAcceptanceNotes(worktreePath: string): string | undefined {
+  const file = join(worktreePath, ".pr-notes", "验收说明.md");
+  return existsSync(file) ? readFileSync(file, "utf8").trim() : undefined;
 }
 
 const shellQuote = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
@@ -607,20 +615,31 @@ async function syncExternalBranch(issue: Issue) {
 const attachArgs = (shots: string[]) =>
   shots.flatMap((file) => ["--attach", `${file}#${basename(file)}`]);
 
-async function pushAndOpenPr(issue: Issue, notes: string, shots: string[]): Promise<string> {
+/** PR 正文的两大块：验收说明（最前面的一节，准备段落 + `.pr-notes/验收说明.md`）与其余各节（restSections 的结果）。 */
+type PrNotes = { acceptance: string; rest: string };
+
+async function pushAndOpenPr(issue: Issue, notes: PrNotes, shots: string[]): Promise<string> {
   const pushed = await pushBranch(issue);
   if (!pushed.ok) throw new Error(`push ${issue.branch} 失败：${pushed.out.slice(0, 500)}`);
   const existing = sh("gh", [
     "pr", "list", "--head", issue.branch, "--state", "open", "--json", "number", "--jq", ".[0].number",
   ]);
   if (existing) {
-    sh("gh", ["pr", "comment", existing, "--body", `Sandcastle 更新了这个分支。\n\n${notes}`, ...attachArgs(shots)]);
+    // 已有 PR：自己的分支只替换正文里的「验收说明」一节，其余（上次的 Review / Gate 记录）逐字保留；
+    // 外部 PR 不动别人写的正文，验收说明贴在评论里。
+    if (isExternal(issue)) {
+      sh("gh", ["pr", "comment", existing, "--body", `Sandcastle 更新了这个分支。\n\n## 验收说明\n\n${notes.acceptance}\n\n${notes.rest}`, ...attachArgs(shots)]);
+    } else {
+      const body = sh("gh", ["pr", "view", existing, "--json", "body", "--jq", ".body"]);
+      sh("gh", ["pr", "edit", existing, "--body", replaceSection(body, "验收说明", `## 验收说明\n\n${notes.acceptance}`)]);
+      sh("gh", ["pr", "comment", existing, "--body", `Sandcastle 更新了这个分支（验收说明已更新）。\n\n${notes.rest}`, ...attachArgs(shots)]);
+    }
     return existing;
   }
   // 外部 PR 不在这里新开：它被关了就说明人不要了。
   if (isExternal(issue)) throw new Error(`分支 ${issue.branch} 上已经没有 open 的 PR，外部 PR 不由 Sandcastle 重开。`);
   const commits = sh("git", ["log", `${BASE_REF}..${issue.branch}`, "--format=- %B"]);
-  const body = `Closes #${issue.id}\n\n${notes}\n\n## Commits\n\n${commits}`;
+  const body = `Closes #${issue.id}\n\n## 验收说明\n\n${notes.acceptance}\n\n${notes.rest}\n\n## Commits\n\n${commits}`;
   const url = sh("gh", [
     "pr", "create", "--base", BASE_BRANCH, "--head", issue.branch,
     "--title", `${issue.title} (#${issue.id})`, "--body", body, ...attachArgs(shots),
@@ -829,6 +848,7 @@ async function build(issue: Issue) {
       summary: tagged(review.stdout, "review-summary") ?? "（reviewer 没有给出摘要）",
       gate: { ok: gateResult.exitCode === 0, output: gateResult.stdout.slice(-3000) },
       browser: collectBrowserCheck(sandbox.worktreePath, issue.id),
+      notes: readAcceptanceNotes(sandbox.worktreePath),
       usage,
     };
   } finally {
@@ -1064,17 +1084,27 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     : flaky
       ? `typecheck 通过；⚠️ 完整测试有偶发失败，失败的文件单独重跑通过（沙箱内）。已自动开票修（见 PR 评论）。\n\n\`\`\`\n${result.gate.output}\n\`\`\``
       : `typecheck 与完整测试通过（沙箱内）。\n\n\`\`\`\n${result.gate.output.slice(-500)}\n\`\`\``;
-  const browserNote = result.browser
-    ? `\n\n## Browser check\n\n${result.browser.result ?? "（implementer 没有写 RESULT.md）"}\n\n截图 ${result.browser.shots.length} 张，附在下面。`
-    : "";
+  const browserSection = result.browser
+    ? `${result.browser.result ?? "（implementer 没有写 RESULT.md）"}\n\n截图 ${result.browser.shots.length} 张，附在下面。`
+    : undefined;
   const revisionNote = result.revisions.length
     ? `\n\n**reviewer 打回过 ${result.revisions.length} 次**（implementer 已按意见修改）：\n\n${result.revisions
         .map((items, n) => `<details><summary>第 ${n + 1} 次的意见</summary>\n\n${items}\n\n</details>`)
         .join("\n\n")}`
     : "";
+  const notesProblems = checkAcceptanceNotes(result.notes);
   const pr = await pushAndOpenPr(
     issue,
-    `## Review\n\n${result.summary}${revisionNote}${browserNote}\n\n## Gate\n\n${gateNote}\n\n## Budget\n\n${budgetNote}${overBudget}\n\n## Usage\n\n${usageTable(result.usage)}`,
+    {
+      acceptance: acceptanceSection(issue.branch, result.notes, { pageChanged: result.browser !== undefined }),
+      rest: restSections({
+        review: `${result.summary}${revisionNote}`,
+        browser: browserSection,
+        gate: gateNote,
+        budget: `${budgetNote}${overBudget}`,
+        usage: usageTable(result.usage),
+      }),
+    },
     result.browser?.shots ?? [],
   );
   reportDecisions(issue.id, pr);
@@ -1094,6 +1124,12 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
         (clean ? "" : `\n\n⚠️ 分支和最新的 ${BASE_REF} 有冲突，需要先把 ${BASE_BRANCH} 合进来。`),
     );
     console.log(`  ◐ #${issue.id} 外部 PR #${pr}，留给人合并`);
+    return;
+  }
+  // 验收说明缺失或格式不对：正文里已经有警告，这里不自动合并，留给人看（外部 PR 本来就不自动合并，不走这里）。
+  if (notesProblems.length > 0) {
+    leaveForHuman(issue, pr, `验收说明缺失或格式不对：${notesProblems.join("；")}（见 PR 正文的「验收说明」一节）。`);
+    console.log(`  ◐ #${issue.id} 验收说明${result.notes === undefined ? "缺失" : "格式不对"}，留 PR #${pr}`);
     return;
   }
   if (result.verdict !== "merge") {

@@ -22,6 +22,8 @@
 
 **人的 review 意见**：这个分支已经有 PR 时（`gh pr view {{BRANCH}} --comments`，行内意见用 `gh api "repos/{owner}/{repo}/pulls/$(gh pr view {{BRANCH}} --json number -q .number)/comments" --jq '.[] | "\(.path):\(.line) \(.body)"'`），逐条确认 implementer 处理了。没有 PR 就跳过。没处理的算 revise 的意见。
 
+**验收说明**：对照 diff 和验收标准核对 worktree 里的 `.pr-notes/验收说明.md`（格式：三个 `###` 小标题、「怎么验证」有编号步骤、「做了什么」和 diff 对得上、「怎么验证」每条验收标准至少一步、步骤里提到的路由 / 按钮 / 命令在代码里存在、没有用户可见变化的票写明了「无用户可见变化」）。**不实际执行步骤**，只核对内容。不合格的写进 `<revise>`。
+
 **Standards**：按 @.sandcastle/CODING_STANDARDS.md、@CODING_STANDARDS.md 和 `CONTEXT.md` 的术语检查。另外看：
 
 - 和仓库已有函数重复的逻辑（grep 一下有没有现成的 helper）
@@ -43,7 +45,7 @@
 
 先给结论，三选一：
 
-- `<verdict>revise</verdict>`：有能交给 implementer 改的问题（上面「执行」的第二类）。即使还有要人判断的问题、或改了页面，也先打回；只有当要人判断的问题会决定这些修改怎么做时，才直接写 `pr`。
+- `<verdict>revise</verdict>`：有能交给 implementer 改的问题（上面「执行」的第二类）。验收说明不合格也算：文件缺失、步骤里的路由 / 按钮 / 命令在代码里不存在、「做了什么」和 diff 对不上、漏了某条验收标准（每条至少一步）、属于无用户可见变化的票没写明。即使还有要人判断的问题、或改了页面，也先打回；只有当要人判断的问题会决定这些修改怎么做时，才直接写 `pr`。
 - `<verdict>merge</verdict>`：没有要打回的问题，且下面几条**全部**满足。
 - `<verdict>pr</verdict>`：其余情况，留 PR 给人审。
 
@@ -71,6 +73,7 @@ typecheck 和完整测试由脚本另外把关，不用你判断。
 **代拍板**：…（这张票里 agent 自己定的设计决定，各一句：选了什么；没有就写「无」）
 **需要人判断**：…（没有就写「无」）
 **浏览器验收**：不需要 / 已做（看 `.browser-check/RESULT.md`，结论里有 ❌ 或没验证到的写出来）/ 需要但没做（写检查什么）
+**验收说明**：合格 / 问题（缺失、步骤对不上代码、「做了什么」和 diff 对不上、漏验收标准、无用户可见变化没写明，写出来）
 </review-summary>
 
 然后输出 <promise>COMPLETE</promise>。
