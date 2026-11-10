@@ -102,7 +102,7 @@ Stable handles used by the map:
 - Members: label `邮箱`, label `角色` (option values `admin`, `data_engineer`, `analyst`, `viewer`), button `邀请`, row `[data-email="<email>"]`, role control label `<email> 的角色`.
 - Audit rows: `[data-audit-action="<Chinese action label>"]`. `邀请成员` is the label for `member.invited`.
 - Tasks rows: `[data-task-kind]` and `[data-task-status]`.
-- Model provider: nav `模型服务`, path `/model-provider`, heading `模型服务`, button `测试连通性`, button `恢复平台默认`, button `恢复默认`. `端点`, `模型名`, `API Key`, and `保存` repeat across cards. Scope them with `--within 'form:has(#...)'`. `恢复默认` and `恢复平台默认` need `--confirm accept`.
+- Model provider: nav `模型服务`, path `/model-provider`, heading `模型服务`, button `测试连通性`, button `恢复平台默认`, button `恢复默认`. `端点`, `模型名`, `API Key`, and `保存` repeat across cards. Scope them with `--within 'form:has(#...)'`. `恢复默认` and `恢复平台默认` need `--confirm accept`. After a save or a reset, read the inputs with `value --label`. A successful save leaves `API Key` empty. A 400 from `set-hidden` on `tier` leaves the typed draft in place.
 - Assistant: button `AI 助手` (it toggles the panel), textarea label `向 AI 助手提问`, button `发送`.
 
 The members journey, including login, invite, audit, SQL, the console mail, logout, and a second login as the invitee:
