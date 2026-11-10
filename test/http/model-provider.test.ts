@@ -1,6 +1,7 @@
 // test/http/model-provider.test.ts —— 「模型服务」页的 HTTP 接缝：管理员在 /model-provider 保存端点、模型名与 API Key（Key 不回显、加密入库、留空沿用），
 // 测试连通性与工具调用探测（假 fetch 经 app.setLlmFetch 注入，结果看页面与 platform.llm_calls），恢复平台默认后 resolveProvider 回到环境变量；
-// 开关发送脱敏样本（默认关、记审计）；embedding 三项（ADR-0049）自成一张卡，与 chat 互不影响（不动 chat 配置与探测结果）；非管理员 403
+// 开关发送脱敏样本（默认关、记审计）；embedding 三项（ADR-0049）自成一张卡，与 chat 互不影响（不动 chat 配置与探测结果）；
+// fast / reasoning 档位（ADR-0055 路由③a）一张卡：只填模型名时沿用租户端点与 Key，没有自己的模型服务 400，恢复只清该档三列；非管理员 403
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -20,12 +21,19 @@ const KEY = 'sk-tenant-secret-1234';
 const NEW_KEY = 'sk-tenant-rotated-5678';
 const EKEY = 'sk-embed-tenant-1234';
 const NEW_EKEY = 'sk-embed-rotated-5678';
+const TKEY = 'sk-tier-fast-1234';
+const NEW_TKEY = 'sk-tier-rotated-5678';
 
 const save = (admin: Client, apiKey = KEY) =>
   admin.post('/model-provider', { intent: 'save', baseUrl: 'https://tenant.example.com/v1/', model: 'deepseek-chat', apiKey });
 
 const saveEmbedding = (admin: Client, apiKey = EKEY, baseUrl = 'https://embed-tenant.example.com/v1/') =>
   admin.post('/model-provider', { intent: 'embedding_save', embeddingBaseUrl: baseUrl, embeddingModel: 'bge-m3', embeddingApiKey: apiKey });
+
+const tierSave = (admin: Client, tier: 'fast' | 'reasoning', model: string, baseUrl = '', apiKey = '') =>
+  admin.post('/model-provider', { intent: 'tier_save', tier, model, baseUrl, apiKey });
+
+const tierReset = (admin: Client, tier: 'fast' | 'reasoning') => admin.post('/model-provider', { intent: 'tier_reset', tier });
 
 const setLlm = (f: typeof fetch | undefined) => app.setLlmFetch(f);
 const ok = () => json({ ok: true }, { prompt_tokens: 10, completion_tokens: 3 });
@@ -122,6 +130,106 @@ describe('模型服务页', () => {
     expect(JSON.stringify(logs)).not.toContain(NEW_EKEY);
     const audit = await (await admin.get('/audit')).text();
     expect(audit).toContain('向量检索 https://embed-tenant.example.com/v1');
+  });
+
+  it('管理员保存档位：没有自己的模型服务 400；只填模型名时端点与 Key 存 null；填端点按现有规则要 Key、Key 加密不回显；审计写明是哪一档', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+
+    // 本租户还没有自己的模型服务（chat 三项）时保存档位 400
+    const noChat = await tierSave(admin, 'reasoning', 'qwen-max');
+    expect(noChat.status).toBe(400);
+    expect(await noChat.text()).toContain('先保存本租户的模型服务');
+
+    await save(admin);
+    // 只填模型名：档位的端点和 Key 都存 null
+    expect((await tierSave(admin, 'reasoning', 'qwen-max')).status).toBe(302);
+    let [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
+    expect(row).toMatchObject({ reasoningModel: 'qwen-max', reasoningBaseUrl: null, reasoningApiKey: null, fastModel: null });
+    let page = await (await admin.get('/model-provider')).text();
+    expect(page).toContain('data-tier-reasoning="tenant"');
+    expect(page).toContain('data-tier-fast="default"');
+    expect(page).toContain('qwen-max');
+    expect(page).toContain('端点沿用本租户默认');
+    expect(page).toContain('使用默认');
+
+    // 填了端点：第一次必须填 Key，端点不是 http(s) 400；填 Key 不填端点、模型名为空、tier 不合法都 400
+    expect((await tierSave(admin, 'fast', 'qwen-flash', 'https://fast.example.com/v1', '')).status).toBe(400);
+    expect((await tierSave(admin, 'fast', 'qwen-flash', 'ftp://x', TKEY)).status).toBe(400);
+    expect((await tierSave(admin, 'fast', 'qwen-flash', '', TKEY)).status).toBe(400);
+    expect((await tierSave(admin, 'fast', ' ', '', '')).status).toBe(400);
+    expect((await admin.post('/model-provider', { intent: 'tier_save', tier: 'slow', model: 'm', baseUrl: '', apiKey: '' })).status).toBe(400);
+
+    expect((await tierSave(admin, 'fast', 'qwen-flash', 'https://fast.example.com/v1/', TKEY)).status).toBe(302);
+    [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
+    expect(row).toMatchObject({ fastModel: 'qwen-flash', fastBaseUrl: 'https://fast.example.com/v1' });
+    expect(row.fastApiKey).toBeTruthy();
+    expect(row.fastApiKey).not.toContain(TKEY);
+    page = await (await admin.get('/model-provider')).text();
+    expect(page).not.toContain(TKEY);
+    expect(page).toContain('data-tier-fast="tenant"');
+    expect(page).toContain('value="qwen-flash"');
+    expect(page).toContain('value="https://fast.example.com/v1"');
+    expect(page).toMatch(/<input[^>]*id="fast-api-key"[^>]*placeholder="已设置，留空不修改"/);
+
+    // 留空沿用；改了端点必须重填 Key；填新值记轮换
+    expect((await tierSave(admin, 'fast', 'qwen-flash', 'https://fast.example.com/v1', '')).status).toBe(302);
+    const moved = await tierSave(admin, 'fast', 'qwen-flash', 'https://attacker.example.com/v1', '');
+    expect(moved.status).toBe(400);
+    expect(await moved.text()).toContain('改了端点须重新填写 API Key');
+    expect((await tierSave(admin, 'fast', 'qwen-flash', 'https://fast.example.com/v1', NEW_TKEY)).status).toBe(302);
+
+    // 审计：detail 带 tier，摘要写明是哪一档，没有 Key 明文
+    const logs = (await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.updated')).orderBy(auditLogs.createdAt))
+      .filter(l => l.detail.tier);
+    expect(logs.map(l => l.detail.tier)).toEqual(['reasoning', 'fast', 'fast', 'fast']);
+    expect(logs.map(l => l.detail.credentialsRotated)).toEqual([false, true, false, true]);
+    expect(logs[0].detail).toMatchObject({ tier: 'reasoning', model: 'qwen-max', baseUrl: null });
+    expect(JSON.stringify(logs)).not.toContain(TKEY);
+    expect(JSON.stringify(logs)).not.toContain(NEW_TKEY);
+    const audit = await (await admin.get('/audit')).text();
+    expect(audit).toContain('reasoning 档 沿用默认端点，模型 qwen-max');
+    expect(audit).toContain('fast 档 https://fast.example.com/v1，模型 qwen-flash');
+  });
+
+  it('恢复档位只清该档三列：另一档、chat 与 embedding 的配置、工具调用探测结果都不动；本来没绑定时不记审计；chat 的恢复不动档位列', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    await save(admin);
+    await saveEmbedding(admin);
+    await tierSave(admin, 'fast', 'qwen-flash', 'https://fast.example.com/v1', TKEY);
+    await tierSave(admin, 'reasoning', 'qwen-max');
+    fakeLlm(setLlm, n => n === 1 ? ok() : toolCalls({ name: 'ping', args: {} }));
+    await admin.post('/model-provider', { intent: 'test' });
+    const probed = async () => {
+      const [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
+      return { supported: row.toolsSupported, baseUrl: row.toolsProbedBaseUrl, model: row.toolsProbedModel };
+    };
+    expect(await probed()).toMatchObject({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat' });
+
+    expect((await tierReset(admin, 'fast')).status).toBe(302);
+    let [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
+    expect(row).toMatchObject({ fastModel: null, fastBaseUrl: null, fastApiKey: null, reasoningModel: 'qwen-max' });
+    expect(row).toMatchObject({ baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat', embeddingModel: 'bge-m3' });
+    expect(await probed()).toMatchObject({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat' });
+    const page = await (await admin.get('/model-provider')).text();
+    expect(page).toContain('data-tier-fast="default"');
+    expect(page).toContain('使用默认');
+    expect(page).toContain('data-tier-reasoning="tenant"');
+
+    const resets = await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.reset'));
+    expect(resets).toHaveLength(1);
+    expect(resets[0].detail).toEqual({ tier: 'fast' });
+    expect(await (await admin.get('/audit')).text()).toContain('清空 fast 档的模型、端点与 API Key');
+
+    // 本来就没绑定时再恢复：不记审计
+    expect((await tierReset(admin, 'fast')).status).toBe(302);
+    expect(await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.reset'))).toHaveLength(1);
+
+    // 恢复 chat 的平台默认不动档位列（与档位恢复互不影响）
+    expect((await admin.post('/model-provider', { intent: 'reset' })).status).toBe(302);
+    [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
+    expect(row).toMatchObject({ baseUrl: null, model: null, apiKey: null, reasoningModel: 'qwen-max', embeddingModel: 'bge-m3' });
   });
 
   it('测试 embedding：没配置时说明原因；成功显示模型、维度与耗时，失败显示抹掉 Key 的错误；恢复平台默认清掉 embedding 三项、chat 配置不动', async () => {
@@ -291,9 +399,9 @@ describe('模型服务页', () => {
     const page = await engineer.get('/model-provider');
     expect(page.status).toBe(403);
     expect(await page.text()).toContain('配置模型服务');
-    for (const intent of ['save', 'reset', 'test', 'samples', 'embedding_save', 'embedding_reset', 'embedding_test']) {
+    for (const intent of ['save', 'reset', 'test', 'samples', 'embedding_save', 'embedding_reset', 'embedding_test', 'tier_save', 'tier_reset']) {
       expect((await engineer.post('/model-provider', {
-        intent, baseUrl: 'https://x.example.com', model: 'm', apiKey: KEY, allowSamples: 'on',
+        intent, baseUrl: 'https://x.example.com', model: 'm', apiKey: KEY, allowSamples: 'on', tier: 'fast',
         embeddingBaseUrl: 'https://x.example.com', embeddingModel: 'm', embeddingApiKey: KEY,
       })).status).toBe(403);
     }
