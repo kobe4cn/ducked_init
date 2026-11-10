@@ -5,9 +5,12 @@
 # 跑完整测试的日子一天 20G 以上，卷数到上限后对象存储写不进去，门槛里 IAM 调用全部超时。
 # fs.configure 的路径 TTL 对 filer 自己写的日志不生效（2026-11-03 试过），所以用这个脚本删。
 #
-# 做两件事：
-#   1. 删掉早于 KEEP_DAYS 天（UTC 日期）的日期目录；
-#   2. 删掉默认 collection 里已写满（> 1000MB，不会再被写入）且文件全部已删的卷，立即收回卷位和磁盘。
+# 做三件事：
+#   1. 删掉 /etc/iam/policies.json 里账号已不在 /etc/iam/identities/ 的内联策略（#621：每次 IAM 改动都
+#      整份重写这个文件，孤儿条目会把它和元数据日志一起撑大；scripts/prune-seaweed-iam-policies.ts，
+#      失败只记进输出，不拦后面的清理）；
+#   2. 删掉早于 KEEP_DAYS 天（UTC 日期）的日期目录；
+#   3. 删掉默认 collection 里已写满（> 1000MB，不会再被写入）且文件全部已删的卷，立即收回卷位和磁盘。
 #      没写满的卷里删掉的部分要等 seaweedfs 自己 vacuum。
 #
 # 用法：scripts/prune-seaweed-metalog.sh [KEEP_DAYS，默认 2]
@@ -17,11 +20,16 @@ set -eu
 
 keep="${1:-2}"
 c="${SEAWEED_CONTAINER:-seaweedfs}"
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 command -v container >/dev/null 2>&1 || { echo "跳过：没有 container 命令"; exit 0; }
 container exec "$c" true >/dev/null 2>&1 || { echo "跳过：容器 $c 没在运行"; exit 0; }
 
-container exec "$c" sh -c '
+# 先清 policies.json 的孤儿内联策略：文件小下来，这一轮元数据日志里的重写也跟着小
+policies=$(node --import tsx "$root/scripts/prune-seaweed-iam-policies.ts" 2>&1) \
+  || policies="内联策略清理失败：$policies"
+
+metalog=$(container exec "$c" sh -c '
 set -eu
 keep=$1
 ws() { weed shell -master=localhost:9333 -filer=localhost:8888 2>/dev/null; }
@@ -58,4 +66,6 @@ if [ -n "$dead" ]; then
 fi
 
 echo "元数据日志：删除 $dirs 个早于 $cutoff 的日期目录，删除 $vols 个已清空的卷；/data 已用 $(df -h /data | awk "NR == 2 { print \$3 }")"
-' _ "$keep"
+' _ "$keep")
+
+echo "$metalog；$policies"
