@@ -21,3 +21,6 @@ scripts/eval-requirements/out/
 # Sandcastle 沙箱里的浏览器验收：截图与结论（由 .sandcastle/main.ts 拷出附到 PR），playwright-cli 的会话文件
 .browser-check/
 .playwright-cli/
+
+# Sandcastle 沙箱里 implementer 写的验收说明（由 .sandcastle/main.ts 读进 PR 正文）
+.pr-notes/

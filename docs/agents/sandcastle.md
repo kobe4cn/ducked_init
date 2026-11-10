@@ -47,6 +47,7 @@ reviewer 的结论有三种：`merge`、`revise`、`pr`（规则在 `.sandcastle
    - 门槛失败时让 implementer 用新会话修一次，再跑一次门槛。
    - 失败摘要只取 vitest 的 Failed Tests / Failed Suites 一节。
 3. GitHub 能 rebase 合并，且本票的 drizzle 迁移接在 `origin/main` 最新的迁移后面（两张票各加一个迁移时没有文本冲突，但迁移链会分叉，所以合并前脚本先查）。
+4. 验收说明齐全：implementer 写了 `.pr-notes/验收说明.md` 且格式对（三个小标题、「怎么验证」有编号步骤，检查在 `.sandcastle/pr-body.ts` 的 `checkAcceptanceNotes`）。缺失或格式不对时正文写警告、留 PR（见「验收说明」）。
 
    不满足时脚本自动补救一次：在原分支上开沙箱 `git rebase origin/main`；有冲突或迁移链分叉就开一次 agent 会话按 `.sandcastle/rebase-prompt.md` 处理（追加型文件两边都留，迁移删掉重新 `db:generate`，要做判断的放弃并在 issue 上评论）；然后**重跑完整门槛**，通过才 force-push 再合并。补救不成就留 PR 并写原因。代价是这张票多跑一遍完整测试。
 
@@ -132,3 +133,13 @@ Sandcastle 处理期间，PR 作者不要往这个分支推提交。本地和远
 截图和 `RESULT.md`（每一步的结论）写在 worktree 的 `.browser-check/`，不提交。关沙箱前脚本把它拷到宿主机 `$TMPDIR/sandcastle-browser-check/issue-<n>/`，开 PR 时把 `RESULT.md` 写进正文的 **Browser check** 一节，截图用 `gh --attach` 附上。
 
 改了页面的票**一律留 PR**（reviewer 给 `pr`）。你看截图和结论，没问题就合并。等确认这套验收靠得住，再考虑放宽成验收通过就自动合并。
+
+## 验收说明
+
+每个 Sandcastle PR 的正文都以 `## 验收说明` 一节开头，写给验收 PR 的人：这个 PR 做了什么、在宿主机上怎么一步步验证、最终效果。来源是 implementer 写在 worktree `.pr-notes/验收说明.md`（不提交）的中文说明，格式要求在 `.sandcastle/implement-prompt.md`：`### 做了什么`、`### 怎么验证`（编号步骤，每条验收标准至少一步）、`### 最终效果` 三个小标题，不能出现 `## ` 二级标题（替换这一节时会切错）。
+
+和 Browser check 的区别：Browser check 是 implementer **在沙箱里**做过的验证记录（临时验收库、playwright 截图），沙箱关掉就没法照着重做；验收说明是写给**人在宿主机上照做**的步骤（开发库 `crm_platform`、`npm run dev`）。脚本把固定的准备段落拼在文件内容前面——`git checkout <分支>`；改了页面的票（worktree 里有 `.browser-check/`）再加起 dev server、`scripts/browser-lab.ts` 建验收租户、Magic Link 登录——拼装与格式检查是 `.sandcastle/pr-body.ts` 的纯函数。
+
+- 缺失或格式不对：正文该节写「⚠️ implementer 没有写验收说明」或「⚠️ 验收说明格式不对：<问题>」，**不自动合并**（「什么时候自动合并」的第 4 条），打 `sandcastle:pr-open` 并在 PR 上评论原因。reviewer 也会独立核对验收说明（对照 diff 和验收标准，不执行步骤），不合格给 `revise`——两道检查互不替代。
+- 重做（人在 PR 上打回）时：implementer 每次会话完整重写这个文件（新 worktree 里旧文件已经没了），脚本用 `gh pr edit` **只替换**正文里的 `## 验收说明` 一节，其余逐字保留，更新评论里注明「验收说明已更新」。
+- 外部 PR：不改正文（那是 PR 作者写的），验收说明贴在「Sandcastle 更新了这个分支」的评论里。
