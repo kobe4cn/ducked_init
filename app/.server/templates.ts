@@ -57,7 +57,8 @@ const ofDefinition = (tenantId: string, template: TemplateId) =>
 
 /**
  * 在调用方的事务里以模板定义一版的参数加上 asOf 入队一次模板任务，任务参数带上定义版本 definitionVersion、来源 trigger（登记快照时记下）
- * 与这一版锁定的模板版本 templateVersion（任务按它编译）
+ * 与这一版锁定的模板版本 templateVersion（任务按它编译）。这里的对象按契约的入参类型（InputOf）做编译期检查；
+ * 模板参数在 insertTask 里由契约 parse 运行时检查（定义参数来自 jsonb，静态类型只能是 Record）
  */
 export async function enqueueTemplate(
   tx: Tx, tenantId: string, template: TemplateId, params: Record<string, unknown>, version: number, asOf: string, trigger: SnapshotTrigger,

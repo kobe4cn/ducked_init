@@ -36,9 +36,6 @@ interface Handler<K extends TaskKind = TaskKind> {
   run(con: DuckDBConnection, params: Record<string, unknown>, ctx: TaskContext): Promise<ResultOf<K>>;
 }
 
-/** 模板任务（ADR-0004）的 kind：gold.<模板 ID> */
-type TemplateKind = Extract<TaskKind, (typeof TASK_KINDS)[TemplateId]>;
-
 const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 
 /** 本租户数据湖里的全部表与行数 */
@@ -64,23 +61,20 @@ async function dropAndCleanup(con: DuckDBConnection, tables: [schema: string, na
  * 分析模板任务（ADR-0004）：按参数（asOf 必填，其余取模板默认值）把标准层编译成模板的 SELECT，
  * 写进结果层的一张快照表 gold."<模板 ID>__<任务 ID>"，只有 consumer_id 与汇总值，没有明文。
  * 发布、重新计算或定时刷新入队的任务带上定义版本 definitionVersion 与来源 trigger（登记快照时记下），以及定义锁定的模板版本
- * templateVersion（按注册表里这个版本编译，没有这个版本时任务失败；不带时按第 1 版），其余参数是定义的参数加上 asOf；
- * 也可以直接给参数、不带版本。开头给没重新合并过的老湖补 _customer_source（订单按它关联消费者，ADR-0030），
+ * templateVersion（按注册表里这个版本编译，缺省第 1 版），其余参数是定义的参数加上 asOf；也可以直接给参数、不带版本。
+ * 参数由契约解析：公共部分（asOf、definitionVersion、trigger、templateVersion）一个 schema，模板部分按 templateAt(id, 版本).parse；
+ * 版本不是整数或注册表里没有时，新任务在入队时就被拒（insertTask 的契约 parse），队列里已有的老任务仍在这里失败。
+ * 开头给没重新合并过的老湖补 _customer_source（订单按它关联消费者，ADR-0030），
  * 再查模板要求的表；计算前对读到的实体跑内置断言（ADR-0026），error 级失败时任务失败、不写快照表。
- * 结果带表名、行数、补全后的参数、全部断言 assertions，以及模板另报的计数（如 RFM 打通不到消费者的订单数 unlinkedOrders）
+ * 结果带表名、行数、解析后的模板参数、全部断言 assertions，以及模板另报的计数（如 RFM 打通不到消费者的订单数 unlinkedOrders）
  */
-function templateTask(id: TemplateId): Handler<TemplateKind> {
+function templateTask<T extends TemplateId>(id: T): Handler<(typeof TASK_KINDS)[T]> {
   return {
     label: CONTRACTS[TASK_KINDS[id]].label,
     async run(con, raw, { taskId }) {
-      // 契约是占位的：只查参数是个对象，真正的模板契约在 #473
-      const params = CONTRACTS[TASK_KINDS[id]].params.parse(raw) as Record<string, unknown>;
-      // templateVersion 要在 template.parse 之前剥掉：模板的 parse 拒绝不认识的键
-      const { definitionVersion: _, trigger: __, templateVersion, ...rest } = params;
-      // 各模板的参数类型不同，这里只在 parse 与 compile 之间传递
-      if (templateVersion !== undefined && !Number.isInteger(templateVersion)) throw new Error('参数 templateVersion 必须是整数');
-      const template = templateAt(id, (templateVersion as number | undefined) ?? 1);
-      const p = template.parse(rest);
+      // 契约按 templateVersion 选注册表里的版本解析参数；公共三项剥掉后 p 只剩模板参数（含 asOf）
+      const { definitionVersion: _, trigger: __, templateVersion, ...p } = CONTRACTS[TASK_KINDS[id]].params.parse(raw);
+      const template = templateAt(id, templateVersion);
       await ensureCustomerSourceColumns(con);
       const tables = [...template.requires, ...template.optional ?? []];
       const present = new Set((await rows<{ name: string }>(con, `
@@ -102,10 +96,10 @@ function templateTask(id: TemplateId): Handler<TemplateKind> {
 
 /** 每个模板的任务类型 → 它的任务 */
 const TEMPLATE_HANDLERS = Object.fromEntries((Object.keys(TASK_KINDS) as TemplateId[]).map(id => [TASK_KINDS[id], templateTask(id)])) as
-  { [K in TemplateId as (typeof TASK_KINDS)[K]]: Handler<TemplateKind> };
+  { [K in TemplateId as (typeof TASK_KINDS)[K]]: Handler<(typeof TASK_KINDS)[K]> };
 
-/** HANDLERS 的形状：非模板任务每类一个按契约定型的实现；模板任务的契约还是占位的，参数与结果都是普通对象（#473 之前） */
-type HandlerTable = { [K in Exclude<TaskKind, TemplateKind>]: Handler<K> } & { [K in TemplateKind]: Handler<TemplateKind> };
+/** HANDLERS 的形状：每类任务一个按契约定型的实现 */
+type HandlerTable = { [K in TaskKind]: Handler<K> };
 
 export const HANDLERS = {
   // 检索投影刷新（ADR-0047）：工作进程里没有平台库，什么也不做；成功后由调度器结束钩子从零重建投影

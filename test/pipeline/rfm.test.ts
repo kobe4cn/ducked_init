@@ -143,10 +143,10 @@ describe('gold.rfm：基于打通后的消费者计算 RFM', () => {
     expect(dsl).toMatchObject({ status: 'succeeded', result: { rows: 5 } });
   }, 180_000); // 夹具同步、发布三个数据源并跑完打通与 gold 快照：本地单跑约 31–34 s，并行加压时约 35–49 s，完整测试跑满时会超过默认的 90 s
 
-  it('标准层还没有订单时任务失败并说明原因；参数不合法时任务失败', async () => {
+  it('标准层还没有订单时任务失败并说明原因；参数不合法时入队被拒', async () => {
     const acme = await newTenant('acme');
     expect(await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' })).toMatchObject({ status: 'failed', error: expect.stringContaining('silver.order') });
-    expect(await runTask(acme, 'gold.rfm', {})).toMatchObject({ status: 'failed', error: expect.stringContaining('asOf') });
+    await expect(runTask(acme, 'gold.rfm', {} as never)).rejects.toThrow('asOf');
   });
 
   it('有订单、还没有 customer 映射（没有打通结果）时任务失败并说明原因', async () => {

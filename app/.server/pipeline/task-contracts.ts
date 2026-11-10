@@ -5,7 +5,7 @@
 import { z } from 'zod';
 import { MERGE_RULE_KINDS } from '../../lib/merge-groups';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
-import { TASK_KINDS, TEMPLATES, type TemplateId } from './templates';
+import { TASK_KINDS, TEMPLATES, templateAt, type TemplateId } from './templates';
 import type { AssertionResult } from './assertions';
 import type { profileSource } from './source-engine';
 import type { syncSourceTables } from './sync-engine';
@@ -207,13 +207,48 @@ const SNAPSHOTS = '参数 snapshots 必须是 { id, template, table } 列表，t
 const CONDITIONS = '参数 conditions 必须是非空的 { tag, value, table } 列表，table 是标签快照表名';
 const FORMAT = `参数 format 只能是 ${EXPORT_FORMATS.join(' / ')}`;
 
+/** 模板任务（ADR-0004）公共参数的报错文案：asOf 的这句与各模板 parseAsOf 的一字不差 */
+const ASOF = '参数 asOf 必须是 YYYY-MM-DD 格式的日期';
+const TV = '参数 templateVersion 必须是整数';
+
 /**
- * 模板任务（ADR-0004）的占位契约：只检查参数是一个对象，label 沿用注册表里模板的 label；
- * 真正的模板契约在 #473，run 里由模板自己解析参数
+ * 模板任务的公共参数：asOf 必填（日期格式由模板的 parse 校验），定义版本与来源可缺省（老任务不带，ADR-0021），
+ * 模板版本缺省第 1 版；多余键（模板参数）原样放行，交给模板自己的 parse
+ */
+export const TEMPLATE_COMMON = z.looseObject({
+  asOf: z.string(error(ASOF)),
+  definitionVersion: z.number().int().optional(),
+  trigger: z.string().optional(),
+  templateVersion: z.number(error(TV)).int(error(TV)).default(1),
+});
+
+/** 模板任务的参数类型：公共部分 & 模板参数 P（P 已含 asOf） */
+type TemplateParams<T extends TemplateId> = z.output<typeof TEMPLATE_COMMON> & ReturnType<(typeof TEMPLATES)[T]['parse']>;
+/** 模板任务的入参类型：公共部分在编译期检查，模板部分入队时由契约 parse 检查（定义参数来自 jsonb，只能是 Record） */
+type TemplateInput = { asOf: string; definitionVersion?: number; trigger?: string; templateVersion?: number } & Record<string, unknown>;
+
+/**
+ * 模板任务的参数契约（ADR-0004：加模板仍只改 TEMPLATES 与 TASK_KINDS 两处）：公共部分按 TEMPLATE_COMMON，
+ * 模板部分按 templateAt(id, 版本).parse。公共三项先剥掉再传给模板（模板的 parse 拒绝不认识的键），
+ * 注册表里没有这个版本时在这里抛错（入队时被 insertTask 包成 TaskError）
+ */
+const templateParams = <T extends TemplateId>(id: T): { parse(raw: unknown): TemplateParams<T>; readonly __input?: TemplateInput } => ({
+  parse(raw: unknown): TemplateParams<T> {
+    const common = TEMPLATE_COMMON.safeParse(raw);
+    if (!common.success) throw new Error(common.error.issues[0]?.message ?? '参数不合法');
+    const { definitionVersion, trigger, templateVersion, ...rest } = common.data;
+    const p = templateAt(id, templateVersion).parse(rest) as ReturnType<(typeof TEMPLATES)[T]['parse']>;
+    return { ...p, definitionVersion, trigger, templateVersion } as TemplateParams<T>;
+  },
+});
+
+/**
+ * 模板任务（ADR-0004）的契约：由注册表（TEMPLATES 与 TASK_KINDS）生成，label 沿用模板的 label；
+ * 结果类型仍是普通对象，收紧留给 #474、#477（钩子与 readResult）
  */
 const TEMPLATE_CONTRACTS = Object.fromEntries((Object.keys(TASK_KINDS) as TemplateId[]).map(id => [TASK_KINDS[id], {
-  label: TEMPLATES[id].label, params: noParams, result: resultType<Record<string, unknown>>(),
-}])) as { [K in TemplateId as (typeof TASK_KINDS)[K]]: TaskContract<Record<string, unknown>, Record<string, unknown>> };
+  label: TEMPLATES[id].label, params: templateParams(id), result: resultType<Record<string, unknown>>(),
+}])) as { [K in TemplateId as (typeof TASK_KINDS)[K]]: TaskContract<TemplateParams<K>, Record<string, unknown>> & { params: { readonly __input?: TemplateInput } } };
 
 /**
  * 全部任务的契约表。新增任务先在这里登记契约，再去 handlers.ts 实现 run。
@@ -410,7 +445,7 @@ export const isTaskKind = (kind: string): kind is TaskKind => Object.hasOwn(CONT
 export type ParamsOf<K extends TaskKind> = (typeof CONTRACTS)[K]['params'] extends { parse(raw: unknown): infer P } ? P : never;
 
 /** 一个任务的入参类型（insertTask / enqueueTask 的参数）：契约接受的原始形状，带缺省值的项可省略；
- * 模板占位契约的 params 没带 __input，退回解析类型（Record） */
+ * 模板任务只按公共部分定型，模板参数是宽松的 Record，真正的校验在入队时由契约 parse 做 */
 export type InputOf<K extends TaskKind> = (typeof CONTRACTS)[K]['params'] extends { readonly __input?: infer I } ? NonNullable<I> : ParamsOf<K>;
 
 /** 声明了 needs.source 的任务 kind：领取时照参数 sourceId 解密源连接 */
