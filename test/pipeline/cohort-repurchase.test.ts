@@ -88,12 +88,12 @@ describe('gold.cohort / gold.repurchase：每个统一消费者一行，交给�
     expect((await readLake(acme, (narrow!.result as { table: string }).table)).rows).toEqual(expected(false));
   });
 
-  it('标准层还没有订单时任务失败并说明原因；参数不合法时任务失败', async () => {
+  it('标准层还没有订单时任务失败并说明原因；参数不合法时入队被拒', async () => {
     const other = await newTenant('other');
     for (const kind of ['gold.cohort', 'gold.repurchase'] as const) {
       expect(await runTask(other, kind, { asOf: '2024-07-01' })).toMatchObject({ status: 'failed', error: expect.stringContaining('silver.order') });
     }
-    expect(await runTask(acme, 'gold.cohort', { asOf: '2024-07-01', periods: 0 })).toMatchObject({ status: 'failed', error: expect.stringContaining('periods') });
-    expect(await runTask(acme, 'gold.repurchase', { asOf: '2024-07-01', windowDays: 731 })).toMatchObject({ status: 'failed', error: expect.stringContaining('windowDays') });
+    await expect(runTask(acme, 'gold.cohort', { asOf: '2024-07-01', periods: 0 })).rejects.toThrow('periods');
+    await expect(runTask(acme, 'gold.repurchase', { asOf: '2024-07-01', windowDays: 731 })).rejects.toThrow('windowDays');
   });
 });

@@ -1,6 +1,6 @@
 // 任务契约：参数 schema 接受的参数、拒绝的参数与报错文案（纯函数，不碰平台库与数据湖）
 import { describe, expect, it } from 'vitest';
-import { CONTRACTS, isTaskKind, type TaskContract, type TaskKind, type TaskNeeds } from '../app/.server/pipeline/task-contracts';
+import { CONTRACTS, TEMPLATE_COMMON, isTaskKind, type TaskContract, type TaskKind, type TaskNeeds } from '../app/.server/pipeline/task-contracts';
 
 /** 一个已发布映射的最小参数（深层形状发布时已校验过，契约只核对形状） */
 const mapping = { mapping: 'm1', version: 1, sourceId: 's1', entity: 'customer', table: 'crm.customers', columns: [{ name: 'id' }], entityColumns: [{ name: 'id' }], key: ['id'], latest: null };
@@ -41,11 +41,11 @@ const accepted: [TaskKind, Record<string, unknown>][] = [
   ['serving.build', { version: 3, target: '/lake/_serving/v3.duckdb', snapshots: [{ id: 'snap1', template: 'rfm', table: `gold.rfm__${uuid}` }] }],
   ['export.tags', { format: 'csv', conditions: [{ tag: 'tier', value: '高', table: `tag__${uuid}` }], snapshots: [{ id: 'snap1' }] }],
   ['gold.rfm', { asOf: '2026-01-01', definitionVersion: 1, trigger: 'publish' }],
-  ['gold.user360', {}],
-  ['gold.cohort', {}],
-  ['gold.repurchase', {}],
-  ['gold.clv', {}],
-  ['gold.churn', {}],
+  ['gold.user360', { asOf: '2026-01-01' }],
+  ['gold.cohort', { asOf: '2026-01-01' }],
+  ['gold.repurchase', { asOf: '2026-01-01' }],
+  ['gold.clv', { asOf: '2026-01-01' }],
+  ['gold.churn', { asOf: '2026-01-01' }],
 ];
 
 /** 每个任务契约拒绝的参数与报出的文案（与原来的手写校验一字不差） */
@@ -107,10 +107,13 @@ const rejected: [TaskKind, unknown, string][] = [
   ['export.tags', { format: 'csv', conditions: [] }, '参数 conditions 必须是非空的 { tag, value, table } 列表，table 是标签快照表名'],
   ['export.tags', { format: 'csv', conditions: [{ tag: 'tier', value: '高', table: 'tag_wrong' }] }, '参数 conditions 必须是非空的 { tag, value, table } 列表，table 是标签快照表名'],
   ['gold.rfm', null, ''],
+  ['gold.rfm', {}, '参数 asOf 必须是 YYYY-MM-DD 格式的日期'],
+  ['gold.rfm', { asOf: '2026-01-01', templateVersion: '1' }, '参数 templateVersion 必须是整数'],
+  ['gold.rfm', { asOf: '2026-01-01', templateVersion: 9 }, '模板 RFM 分层 没有第 9 版'],
 ];
 
 describe('任务契约', () => {
-  it('契约表登记了全部任务（非模板与模板占位），isTaskKind 只认表里的 kind', () => {
+  it('契约表登记了全部任务（非模板与模板），isTaskKind 只认表里的 kind', () => {
     expect(Object.keys(CONTRACTS).sort()).toEqual([
       'catalog.embed', 'catalog.projection', 'demo.seed', 'export.tags', 'gold.churn', 'gold.clv', 'gold.cohort', 'gold.dsl', 'gold.expire',
       'gold.repurchase', 'gold.rfm', 'gold.user360', 'lake.inspect', 'lake.inventory', 'sandbox.expire', 'serving.build', 'silver.keycheck',
@@ -144,6 +147,15 @@ describe('任务契约', () => {
     expect(sync).toMatchObject({ sourceId: 's1', tables: [{ name: 'orders', key: ['id'] }, { name: 'events', key: ['a'] }] });
     const merge = CONTRACTS['silver.merge'].params.parse({ mappings: [mapping] });
     expect(merge).toMatchObject({ identityForce: false, identityExclude: [], survivorship: {}, consumerSensitive: [], relations: [], drop: [] });
+  });
+
+  it('模板契约的公共部分 schema：templateVersion 缺省补成 1、非整数报那句文案、多余键原样保留；模板部分按 templateAt 解析并补模板默认值', () => {
+    const common = TEMPLATE_COMMON.parse({ asOf: '2026-01-01', lookbackDays: 30 });
+    expect(common).toMatchObject({ asOf: '2026-01-01', templateVersion: 1, lookbackDays: 30 });
+    expect(() => TEMPLATE_COMMON.parse({ asOf: '2026-01-01', templateVersion: '1' })).toThrow('参数 templateVersion 必须是整数');
+    const rfm = CONTRACTS['gold.rfm'].params.parse({ asOf: '2026-01-01', definitionVersion: 2, trigger: 'publish', templateVersion: 1 });
+    // 模板部分经 templateAt(1).parse 补上 RFM 默认值（statuses 去重排序），公共三项原样带出
+    expect(rfm).toMatchObject({ asOf: '2026-01-01', lookbackDays: 365, statuses: ['completed', 'paid', 'shipped'], definitionVersion: 2, trigger: 'publish', templateVersion: 1 });
   });
 
   it('schema 原样保留调用方带上、engine 还要用的多余字段（快照指针、导出的快照、定义与触发来源）', () => {

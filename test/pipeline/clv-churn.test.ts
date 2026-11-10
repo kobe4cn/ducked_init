@@ -93,12 +93,12 @@ describe('gold.clv / gold.churn', () => {
     expect((await at('2024-10-15')).rows).toEqual([{ consumer_id: crm5, orders: 3, avg_gap_days: 42.5, recency_days: 112, silence_ratio: 2.64, at_risk: true }]);
   });
 
-  it('标准层还没有订单时任务失败并说明原因；参数不合法时任务失败', async () => {
+  it('标准层还没有订单时任务失败并说明原因；参数不合法时入队被拒', async () => {
     const other = await newTenant('other');
     for (const kind of ['gold.clv', 'gold.churn'] as const) {
       expect(await runTask(other, kind, { asOf: '2024-07-01' })).toMatchObject({ status: 'failed', error: expect.stringContaining('silver.order') });
     }
-    expect(await runTask(acme, 'gold.clv', { asOf: '2024-07-01', decay: 0 })).toMatchObject({ status: 'failed', error: expect.stringContaining('decay') });
-    expect(await runTask(acme, 'gold.churn', { asOf: '2024-07-01', minOrders: 1 })).toMatchObject({ status: 'failed', error: expect.stringContaining('minOrders') });
+    await expect(runTask(acme, 'gold.clv', { asOf: '2024-07-01', decay: 0 })).rejects.toThrow('decay');
+    await expect(runTask(acme, 'gold.churn', { asOf: '2024-07-01', minOrders: 1 })).rejects.toThrow('minOrders');
   });
 });

@@ -119,9 +119,9 @@ describe('gold.user360：以统一消费者为粒度汇总订单与同意', () =
     expect((await listAuditLogs(acme)).filter(a => a.action === '断言失败')).toHaveLength(1);
   });
 
-  it('标准层还没有订单时任务失败并说明原因；参数不合法时任务失败', async () => {
+  it('标准层还没有订单时任务失败并说明原因；参数不合法时入队被拒', async () => {
     const acme = await newTenant('acme');
     expect(await runTask(acme, 'gold.user360', { asOf: '2024-07-01' })).toMatchObject({ status: 'failed', error: expect.stringContaining('silver.order') });
-    expect(await runTask(acme, 'gold.user360', {})).toMatchObject({ status: 'failed', error: expect.stringContaining('asOf') });
+    await expect(runTask(acme, 'gold.user360', {} as never)).rejects.toThrow('asOf');
   });
 });
