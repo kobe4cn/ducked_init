@@ -138,3 +138,32 @@ export const flakyFailures = (summary: string): { file: string; signature: strin
   }
   return [...firsts].map(([file, signature]) => ({ file, signature }));
 };
+
+/**
+ * reportFlaky 的分组与匹配（#607）：门槛里重跑才通过的文件按 flakyFailures 的签名分组，同签名共用一张票；
+ * 解析不到报错（摘要被截断）的文件签名为空串，各自一组、没有标记，只按标题去重。每组生成新票标题
+ * （组里第一个文件，多文件加「等 N 个文件」）和正文末尾的隐藏标记 `<!-- flaky-sig: … -->`（签名里的 `-->`
+ * 换成 `--›`，免得提前收掉注释），再在已开的 flaky 票里按 ①正文含标记 → ②标题 `偶发失败：<文件>` 找 existing。
+ */
+export const flakyTickets = (
+  files: string[],
+  after: string,
+  open: { number: number; title: string; body: string }[],
+): { files: string[]; signature: string; marker?: string; title: string; existing?: number }[] => {
+  const signatures = new Map(flakyFailures(after).map((f) => [f.file, f.signature]));
+  const groups = new Map<string, string[]>();
+  for (const file of files) {
+    const key = signatures.get(file) || `按标题：${file}`;
+    const group = groups.get(key);
+    if (group) group.push(file);
+    else groups.set(key, [file]);
+  }
+  return [...groups.values()].map((groupFiles) => {
+    const signature = signatures.get(groupFiles[0]!) ?? "";
+    const marker = signature ? `<!-- flaky-sig: ${signature.replaceAll("-->", "--›")} -->` : undefined;
+    const title = `偶发失败：${groupFiles[0]!}${groupFiles.length > 1 ? ` 等 ${groupFiles.length} 个文件` : ""}`;
+    const existing = (marker ? open.find((i) => i.body.includes(marker)) : undefined)
+      ?? open.find((i) => groupFiles.some((f) => i.title === `偶发失败：${f}`));
+    return { files: groupFiles, signature, marker, title, existing: existing?.number };
+  });
+};

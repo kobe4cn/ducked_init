@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { blockersOf, changedFiles, flakyFailures, flakySignature, splitChildren } from '../.sandcastle/guide';
+import { blockersOf, changedFiles, flakyFailures, flakySignature, flakyTickets, splitChildren } from '../.sandcastle/guide';
 
 const guide = (lines: string) => `## What to build\n\n改 \`app/x.ts:1\`。\n\n## Implementation guide\n\n${lines}\n\n## Blocked by\n\n- #1\n`;
 
@@ -146,5 +146,46 @@ describe('Sandcastle 偶发失败的报错签名 flakyFailures / flakySignature'
     expect(flakySignature('upsert 冲突：7c9e6679-7425-40de-944b-e07fc1f90ae7 已存在')).toBe(
       'upsert 冲突：<uuid> 已存在',
     );
+  });
+});
+
+describe('Sandcastle 偶发失败按签名分组开票 flakyTickets', () => {
+  const timeout = 'Error: connect ETIMEDOUT 10.88.0.1:5432';
+  const sig = flakySignature(timeout);
+  const marker = `<!-- flaky-sig: ${sig} -->`;
+  const summary = [' FAIL  test/a.test.ts > x', timeout, ' FAIL  test/b.test.ts > y', 'Error: connect ETIMEDOUT 10.88.0.2:6543'].join('\n');
+  const ticket = (number: number, title: string, body = '') => ({ number, title, body });
+
+  it('(a) 同签名的两个文件只出一组，标题带「等 2 个文件」，带签名标记', () => {
+    expect(flakyTickets(['test/a.test.ts', 'test/b.test.ts'], summary, [])).toEqual([
+      { files: ['test/a.test.ts', 'test/b.test.ts'], signature: sig, marker, title: '偶发失败：test/a.test.ts 等 2 个文件', existing: undefined },
+    ]);
+  });
+
+  it('(b) 正文含签名标记的票优先于标题能匹配上的票', () => {
+    const open = [ticket(10, '偶发失败：test/b.test.ts'), ticket(11, '偶发失败：test/z.test.ts', `正文\n${marker}`)];
+    expect(flakyTickets(['test/a.test.ts', 'test/b.test.ts'], summary, open).map((t) => t.existing)).toEqual([11]);
+  });
+
+  it('(c) 没有标记时，老标题 `偶发失败：<文件>` 能匹配就用老票', () => {
+    const open = [ticket(12, '偶发失败：test/b.test.ts', '老票没有标记')];
+    expect(flakyTickets(['test/a.test.ts', 'test/b.test.ts'], summary, open)[0]!.existing).toBe(12);
+  });
+
+  it('(d) 签名为空（摘要截断）的文件各成一组、没有标记，只按标题匹配', () => {
+    const cut = ' FAIL  test/a.test.ts > x\n FAIL  test/b.test.ts > y';
+    const open = [ticket(13, '偶发失败：test/b.test.ts'), ticket(14, '别的', '<!-- flaky-sig:  -->')];
+    expect(flakyTickets(['test/a.test.ts', 'test/b.test.ts'], cut, open)).toEqual([
+      { files: ['test/a.test.ts'], signature: '', marker: undefined, title: '偶发失败：test/a.test.ts', existing: undefined },
+      { files: ['test/b.test.ts'], signature: '', marker: undefined, title: '偶发失败：test/b.test.ts', existing: 13 },
+    ]);
+  });
+
+  it('(e) 签名里的 `-->` 在标记里换成 `--›`，正文含该标记的票能认出来', () => {
+    const arrow = ' FAIL  test/a.test.ts > x\nError: expected --> got';
+    const [t] = flakyTickets(['test/a.test.ts'], arrow, [ticket(15, '无关', '<!-- flaky-sig: Error: expected --› got -->')]);
+    expect(t!.signature).toBe('Error: expected --> got');
+    expect(t!.marker).toBe('<!-- flaky-sig: Error: expected --› got -->');
+    expect(t!.existing).toBe(15);
   });
 });
