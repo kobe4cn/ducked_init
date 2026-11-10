@@ -9,6 +9,7 @@
 //   node .cursor/skills/verify-ducked-init/scripts/browser.mjs click --role button --name "发送登录链接"
 //   node .cursor/skills/verify-ducked-init/scripts/browser.mjs wait-text "请查收邮件"
 //   node .cursor/skills/verify-ducked-init/scripts/browser.mjs magic-link --email admin@verify.test --offset 0
+//   node .cursor/skills/verify-ducked-init/scripts/browser.mjs click --role button --name "恢复默认" --confirm accept
 import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -153,7 +154,23 @@ async function handle(page, state, req) {
   }
   if (cmd === 'click') {
     if (!req.role || !req.name) throw new Error('click requires --role and --name');
-    await scope.getByRole(req.role, { name: req.name, exact: true }).click();
+    if (req.confirm != null && req.confirm !== 'accept' && req.confirm !== 'dismiss') {
+      throw new Error('--confirm must be accept or dismiss');
+    }
+    let onDialog = null;
+    if (req.confirm) {
+      const decision = req.confirm;
+      onDialog = async dialog => {
+        if (decision === 'accept') await dialog.accept();
+        else await dialog.dismiss();
+      };
+      page.once('dialog', onDialog);
+    }
+    try {
+      await scope.getByRole(req.role, { name: req.name, exact: true }).click();
+    } finally {
+      if (onDialog) page.off('dialog', onDialog);
+    }
     return {};
   }
   if (cmd === 'select') {
@@ -222,6 +239,7 @@ async function handle(page, state, req) {
 
 function usage() {
   console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|magic-link> [args]`);
+  console.error('click accepts --confirm accept|dismiss for a window.confirm dialog');
 }
 
 async function runClient() {
@@ -239,6 +257,7 @@ async function runClient() {
       timeout: { type: 'string' },
       selector: { type: 'string' },
       within: { type: 'string' },
+      confirm: { type: 'string' },
     },
   });
   const cmd = positionals[0];
@@ -283,6 +302,7 @@ async function runClient() {
     path: values.path,
     selector: values.selector,
     within: values.within,
+    confirm: values.confirm,
     timeout: values.timeout,
   });
   if (!response.ok) {
