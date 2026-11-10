@@ -253,7 +253,7 @@ async function probeTools(tenantId: string, route?: LlmRoute): Promise<boolean |
 /**
  * 用当前生效的配置发一次小请求；错误消息由 chatJson 抹掉了 Key，调用日志里记一条 connectivity。
  * 连通后再探测是否支持工具调用（不计入耗时），结果连同这次的端点与模型存下来（不确定时不存）（没有配置行时插入一行，端点、模型名与 Key 为空）。
- * reasoning 档位绑定了不同模型时（#531，只有平台档位会这样）再探一次档位模型：三列里存的是助手实际要用的那一套的结果
+ * reasoning 档位绑定了不同模型时（#531；平台与租户档位都会，租户档位自路由③b 起生效）再探一次档位模型：三列里存的是助手实际要用的那一套的结果
  * （没有不同模型时就是默认这一套），返回给页面的 tools 仍显示默认这一次的
  */
 export async function testModelProvider(actor: CurrentMember): Promise<ConnectivityResult> {

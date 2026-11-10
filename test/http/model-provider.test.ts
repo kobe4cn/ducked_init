@@ -205,7 +205,8 @@ describe('模型服务页', () => {
       const [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
       return { supported: row.toolsSupported, baseUrl: row.toolsProbedBaseUrl, model: row.toolsProbedModel };
     };
-    expect(await probed()).toMatchObject({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat' });
+    // 路由③b（#606）后租户的 reasoning 档位也生效：探测按档位再探一次，三列存的是助手实际要用的那一套（qwen-max，沿用租户端点）
+    expect(await probed()).toMatchObject({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'qwen-max' });
 
     // 探测之后再保存档位：探测结果、chat 与 embedding 的配置都不动
     const chatAndEmbedding = (r: typeof modelProviders.$inferSelect) => ({
@@ -216,7 +217,7 @@ describe('模型服务页', () => {
     const beforeTierSave = chatAndEmbedding(row);
     expect((await tierSave(admin, 'reasoning', 'qwen-max-2')).status).toBe(302);
     expect((await tierSave(admin, 'fast', 'qwen-flash', 'https://fast.example.com/v1', NEW_TKEY)).status).toBe(302);
-    expect(await probed()).toEqual({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat' });
+    expect(await probed()).toEqual({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'qwen-max' });
     [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
     expect(chatAndEmbedding(row)).toEqual(beforeTierSave);
     expect(row).toMatchObject({ baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat', embeddingModel: 'bge-m3', reasoningModel: 'qwen-max-2' });
@@ -225,7 +226,7 @@ describe('模型服务页', () => {
     [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
     expect(row).toMatchObject({ fastModel: null, fastBaseUrl: null, fastApiKey: null, reasoningModel: 'qwen-max-2' });
     expect(row).toMatchObject({ baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat', embeddingModel: 'bge-m3' });
-    expect(await probed()).toMatchObject({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat' });
+    expect(await probed()).toMatchObject({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'qwen-max' });
     const page = await (await admin.get('/model-provider')).text();
     expect(page).toContain('data-tier-fast="default"');
     expect(page).toContain('使用默认');
