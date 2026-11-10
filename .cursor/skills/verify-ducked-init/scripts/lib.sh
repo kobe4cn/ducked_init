@@ -60,9 +60,16 @@ verify_kill_tree() {
   kill "$pid" 2>/dev/null || true
 }
 
-# Print pids that are listening on TCP $1. Uses /proc because ss/lsof are not required.
+# Print pids that are listening on TCP $1. On Linux read /proc (ss/lsof are not required);
+# without /proc (macOS) fall back to lsof.
 verify_listener_pids() {
   local port=$1
+  if [[ ! -d /proc/net ]]; then
+    # lsof exits 1 when nothing listens and may print one pid per line (parent and child both
+    # hold the socket): sort -u and swallow the failure so `set -e` does not abort the caller.
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | sort -u || true
+    return 0
+  fi
   python3 - "$port" <<'PY'
 import os, sys
 port = int(sys.argv[1])
@@ -103,7 +110,12 @@ verify_pid_is_descendant() {
   local pid=$1 root=$2 hops=0 ppid
   while [[ -n $pid && $pid != 0 && $pid != 1 && $hops -lt 40 ]]; do
     [[ $pid == "$root" ]] && return 0
-    ppid=$(awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || true)
+    if [[ -e /proc/$pid/status ]]; then
+      ppid=$(awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || true)
+    else
+      # No /proc (macOS): ask ps. BSD ps pads `ppid=` output with spaces; empty when the pid is gone.
+      ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    fi
     [[ -n $ppid ]] || return 1
     pid=$ppid
     hops=$((hops + 1))
