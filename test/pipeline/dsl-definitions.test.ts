@@ -298,11 +298,14 @@ describe('发布与丢弃', () => {
 
     await expect(publishDefinition(analyst, 'metric', 'revenue', 1)).rejects.toMatchObject({ init: { status: 403 } });
 
-    const today = new Date().toISOString().slice(0, 10);
+    const before = new Date().toISOString().slice(0, 10);
     const task = await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    // asOf 是发布那一刻的 UTC 当天：调用前后各取一次日期夹住实际值，跨午夜也不会偶发失败
+    const after = new Date().toISOString().slice(0, 10);
+    expect([before, after]).toContain(task.params.asOf as string);
     expect(task).toMatchObject({
       kind: 'gold.dsl', status: 'queued',
-      params: { kind: 'metric', key: 'revenue', definitionId: expect.any(String), definitionVersion: 1, asOf: today, entities: ['order'], sql: expect.stringContaining('silver._identities') },
+      params: { kind: 'metric', key: 'revenue', definitionId: expect.any(String), definitionVersion: 1, asOf: expect.any(String), entities: ['order'], sql: expect.stringContaining('silver._identities') },
     });
     expect(await getDefinition(analyst, 'metric', 'revenue')).toMatchObject({ draft: null, published: { version: 1, publishedByEmail: reviewer.email } });
 
@@ -315,7 +318,7 @@ describe('发布与丢弃', () => {
     expect(Number(n)).toBeGreaterThan(0);
     expect(first).toMatchObject({
       template: 'metric:revenue', taskId: task.id, table: `gold.metric__${task.id}`, definitionVersion: 1, rowCount: Number(n), incomplete: null,
-      params: { kind: 'metric', key: 'revenue', asOf: today, definitionVersion: 1 },
+      params: { kind: 'metric', key: 'revenue', asOf: task.params.asOf, definitionVersion: 1 },
     });
     expect(first!.expiresAt.getTime() - first!.createdAt.getTime()).toBe(90 * 24 * 60 * 60 * 1000);
 
