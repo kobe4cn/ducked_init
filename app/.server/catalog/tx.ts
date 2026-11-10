@@ -1,11 +1,11 @@
 // app/.server/catalog/tx.ts —— 成员事务与目录版本（ADR-0054）：catalogTx(tenantId, fn) 开事务，用 AsyncLocalStorage 放上下文，
 // recordAudit 只把白名单目录动作登记进上下文；fn 正常返回后如果登记过，就在同一事务的最后一步记一版目录版本（原因取第一个目录动作），
-// 所以快照包含事务里的全部写入，多个目录动作也只记一版。嵌套 catalogTx 与审计别的租户的目录动作是写代码时的错误，生产环境也抛错。
-// versions.ts 只在记版本时动态 import：它静态 import ./load，load 又静态 import mappings、custom-entities 等
-// 之后（#493/#494）会 import 本模块的模块，静态引入就成环；全代码库只此一处动态 import（ADR-0054）
+// 所以快照包含事务里的全部写入，多个目录动作也只记一版。嵌套 catalogTx、审计别的租户的目录动作与在 catalogTx 外审计目录动作
+// 都是写代码时的错误，生产环境也抛错。versions.ts 只在记版本时动态 import：它静态 import ./load，load 又静态 import mappings、
+// custom-entities 等会 import 本模块的模块，静态引入就成环；全代码库只此一处动态 import（ADR-0054）
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AuditAction, Tx } from '../audit';
-import { getDb, type Db } from '../db/client';
+import { getDb } from '../db/client';
 
 /** 会改变目录结构或含义的审计动作；只发起停用（mapping.disable_requested）目录不变，不在里面 */
 export const CATALOG_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
@@ -46,15 +46,4 @@ export async function catalogTx<T>(tenantId: string, fn: (tx: Tx) => Promise<T>)
     }
     return result;
   }));
-}
-
-/** catalogTx 外审计白名单动作时当场记一版（#493/#494 把调用方搬进 catalogTx 后由 #495 改为抛错，ADR-0054） */
-export async function recordCatalogVersionNow(tx: Tx | Db, tenantId: string, action: AuditAction): Promise<void> {
-  const { recordCatalogVersion } = await import('./versions'); // 同 catalogTx：静态引入会成环，见头注释
-  if ('rollback' in tx) {
-    await recordCatalogVersion(tx, tenantId, action);
-    return;
-  }
-  // 传的是连接：advisory 锁要有事务才有意义，另开事务记
-  await tx.transaction(t => recordCatalogVersion(t, tenantId, action));
 }

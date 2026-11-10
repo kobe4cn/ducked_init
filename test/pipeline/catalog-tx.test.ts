@@ -1,6 +1,7 @@
 // test/pipeline/catalog-tx.test.ts —— catalogTx（ADR-0054）：成员事务的目录版本由 catalogTx 在事务收尾时记一次，
 // recordAudit 只把白名单动作登记进上下文；审计之后再改目录，这一版快照包含那部分改动；多个目录动作只记一版、原因取第一个；
-// 没有目录动作不记版本；嵌套 catalogTx 与审计别的租户抛错，事务回滚、不留版本与审计行
+// 没有目录动作不记版本；嵌套 catalogTx、审计别的租户与 catalogTx 外审计目录动作抛错，事务回滚、不留版本与审计行；
+// 非目录动作在 catalogTx 外照常写入
 import { desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { recordAudit } from '../../app/.server/audit';
@@ -79,5 +80,19 @@ describe('catalogTx：成员事务收尾时记一版目录版本', () => {
     expect(await latestVersion(other.tenantId)).toBeUndefined();
     expect((await getDb().select().from(auditLogs).where(eq(auditLogs.tenantId, other.tenantId)))
       .filter(r => r.action === 'alias.added')).toHaveLength(0);
+  });
+
+  it('catalogTx 外（普通事务里）审计目录动作抛错，事务回滚不留版本与审计行；非目录动作照常写入', async () => {
+    const { tenantId, analyst } = await setup();
+    await expect(getDb().transaction(tx =>
+      addAliasTx(tx, analyst, { targetId: 'entity:order', alias: '交易单' }),
+    )).rejects.toThrow(/catalogTx 外/);
+    expect(await latestVersion(tenantId)).toBeUndefined();
+    expect((await getDb().select().from(auditLogs).where(eq(auditLogs.tenantId, tenantId)))
+      .filter(r => r.action === 'alias.added')).toHaveLength(0);
+    // 非目录动作不在白名单里，不经 catalogTx 直接 recordAudit（传连接）也照常写入
+    await recordAudit(getDb(), { tenantId, system: true, action: 'workbench.query', targetType: 'workbench' });
+    expect((await getDb().select().from(auditLogs).where(eq(auditLogs.tenantId, tenantId)))
+      .filter(r => r.action === 'workbench.query')).toHaveLength(1);
   });
 });

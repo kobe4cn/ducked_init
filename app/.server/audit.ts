@@ -1,7 +1,7 @@
 // app/.server/audit.ts —— 审计日志：记录关键操作。租户管理员按租户查看；运营者的操作与平台级事件在运营后台查看
 import { desc, eq } from 'drizzle-orm';
 import type { CurrentMember } from './auth';
-import { CATALOG_ACTIONS, currentCatalogTx, recordCatalogVersionNow } from './catalog/tx';
+import { CATALOG_ACTIONS, currentCatalogTx } from './catalog/tx';
 import { getDb, type Db } from './db/client';
 import { auditLogs, KNOWLEDGE_SOURCE_KIND_LABELS, ROLE_LABELS, SOURCE_KIND_LABELS, tenants, type KnowledgeSourceKind, type Role, type SourceKind } from './db/schema';
 import { describeBroken } from './pipeline/schema-diff';
@@ -408,7 +408,7 @@ export async function recordAudit(tx: Tx | Db, entry: AuditEntry) {
     detail: 'actor' in entry && entry.actor.via ? { ...entry.detail, via: entry.actor.via } : (entry.detail ?? {}),
   });
   // 会改变目录的动作在 catalogTx 里只登记进上下文，版本由 catalogTx 在事务收尾时记一版（ADR-0054）；
-  // 不在 catalogTx 里时暂时保留当场记版本的做法，#495 起改为抛错
+  // 不在 catalogTx 里审计（含平台级 tenantId 为 null）是写代码时的错误，生产环境也抛错
   if (CATALOG_ACTIONS.has(entry.action)) {
     const ctx = currentCatalogTx();
     if (ctx) {
@@ -417,9 +417,8 @@ export async function recordAudit(tx: Tx | Db, entry: AuditEntry) {
         throw new Error(`catalogTx（租户 ${ctx.tenantId}）里审计了租户 ${entry.tenantId ?? '（平台级）'} 的目录动作 ${entry.action}`);
       }
       ctx.actions.push(entry.action);
-    } else if (entry.tenantId) {
-      // TODO #495：catalogTx 外审计白名单动作改为抛错（ADR-0054）
-      await recordCatalogVersionNow(tx, entry.tenantId, entry.action);
+    } else {
+      throw new Error(`catalogTx 外审计了租户 ${entry.tenantId ?? '（平台级）'} 的目录动作 ${entry.action}：目录动作必须在 catalogTx 里审计（ADR-0054）`);
     }
   }
 }
