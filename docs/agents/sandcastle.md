@@ -47,11 +47,12 @@ reviewer 的结论有三种：`merge`、`revise`、`pr`（规则在 `.sandcastle
    - 门槛失败时让 implementer 用新会话修一次，再跑一次门槛。
    - 失败摘要只取 vitest 的 Failed Tests / Failed Suites 一节。
 3. GitHub 能 rebase 合并，且本票的 drizzle 迁移接在 `origin/main` 最新的迁移后面（两张票各加一个迁移时没有文本冲突，但迁移链会分叉，所以合并前脚本先查）。
-4. 验收说明齐全：implementer 写了 `.pr-notes/验收说明.md` 且格式对（三个小标题、「怎么验证」有编号步骤，检查在 `.sandcastle/pr-body.ts` 的 `checkAcceptanceNotes`）。缺失或格式不对时正文写警告、留 PR（见「验收说明」）。
 
    不满足时脚本自动补救一次：在原分支上开沙箱 `git rebase origin/main`；有冲突或迁移链分叉就开一次 agent 会话按 `.sandcastle/rebase-prompt.md` 处理（追加型文件两边都留，迁移删掉重新 `db:generate`，要做判断的放弃并在 issue 上评论）；然后**重跑完整门槛**，通过才 force-push 再合并。补救不成就留 PR 并写原因。代价是这张票多跑一遍完整测试。
 
    reviewer 不给 `merge`、但门槛通过、要留 PR 给人审的票，也先查一次：和最新的 `origin/main` 有文本冲突或迁移链分叉（开工后 main 上合进了改同一处的票）时，同样 rebase、处理冲突、重跑门槛、force-push，只是不合并，PR 上评论一句。这样人审到的 PR 能直接合并。补救不成就在「没有自动合并」的评论里写上原因。
+
+4. 验收说明齐全：implementer 写了 `.pr-notes/验收说明.md` 且格式对（三个小标题、「怎么验证」有编号步骤，检查在 `.sandcastle/pr-body.ts` 的 `checkAcceptanceNotes`）。缺失或格式不对时正文写警告、留 PR（见「验收说明」）。
 
 GitHub CI 不作为门槛。
 
