@@ -215,10 +215,10 @@ export async function saveTierProvider(actor: CurrentMember, tier: 'fast' | 'rea
 export async function resetTierProvider(actor: CurrentMember, tier: 'fast' | 'reasoning') {
   assertCan(actor, 'model_provider:manage');
   const tenantId = actor.tenant.id;
-  const columns = tier === 'fast' ? { model: modelProviders.fastModel } : { model: modelProviders.reasoningModel };
+  const modelColumn = tier === 'fast' ? modelProviders.fastModel : modelProviders.reasoningModel;
   await getDb().transaction(async tx => {
     const cleared = await tx.update(modelProviders).set({ ...tierColumns(tier, { model: null, baseUrl: null, apiKey: null }), updatedAt: new Date() })
-      .where(and(eq(modelProviders.tenantId, tenantId), isNotNull(columns.model)))
+      .where(and(eq(modelProviders.tenantId, tenantId), isNotNull(modelColumn)))
       .returning({ tenantId: modelProviders.tenantId });
     if (cleared.length) await recordAudit(tx, { tenantId, actor, action: 'model_provider.reset', targetType: 'model_provider', detail: { tier } });
   });
