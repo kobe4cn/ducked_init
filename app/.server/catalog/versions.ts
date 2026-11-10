@@ -87,9 +87,8 @@ const strippedCatalog = async (db: Tx | ReturnType<typeof getDb>, tenantId: stri
  * 在事务里重新生成目录（不读统计）、去掉统计，和最新一版比较：有差异时记下一版并返回版本号，没有差异时返回 null。
  * reason 可以是函数，按差异与有没有上一版决定原因。
  * 没有上一版时记第 1 版，全部条目都是新增。用事务级 advisory 锁按租户串行化（不用 lockTenant：它锁租户行的时机太晚，可能死锁）。
- * 这把锁之后不能再等租户行的锁，所以拿锁前先对租户行加 FOR KEY SHARE（插版本行的外键要的就是它），
- * 与先锁租户行（或已因插审计行持有 KEY SHARE）的事务就不会互相等待：经 catalogTx（ADR-0054）来的在收尾记版本前已插过审计行（已持有），
- * 调度器与读取时补记的在这里先等 lockTenant 的事务结束
+ * 成员操作经 catalogTx 在事务收尾记版本：是事务里最后一步，之后不再拿锁（ADR-0054），不会拿了这把锁再等租户行的锁。
+ * 拿锁前先对租户行加 FOR KEY SHARE（插版本行的外键要的就是它）为不经 catalogTx 的路径保留：调度器与读取时补记的在这里先等 lockTenant 的事务结束
  */
 export async function recordCatalogVersion(
   tx: Tx, tenantId: string, reason: CatalogVersionReason | ((diff: CatalogDiff, first: boolean) => CatalogVersionReason),
