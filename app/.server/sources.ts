@@ -8,6 +8,7 @@ import { and, desc, eq, inArray, isNull, notInArray, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
+import { catalogTx } from './catalog/tx';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceComments, sourceTables, sourceViews, sourceViewVersions, tasks, type TaskStatus } from './db/schema';
 import { crossSourceReferrers, pendingMerge } from './mappings';
@@ -168,7 +169,7 @@ export async function registerSource(actor: CurrentMember, input: SourceInput, u
 
   const id = randomUUID();
   const sealed = await encryptForTenant(actor.tenant.id, credentialsContext(id), credentials);
-  await uniqueName(name, () => getDb().transaction(async tx => {
+  await uniqueName(name, () => catalogTx(actor.tenant.id, async tx => {
     await tx.insert(sources).values({ id, tenantId: actor.tenant.id, spaceId: actor.space.id, name, kind, config, credentials: sealed });
     await recordListing(tx, actor.tenant.id, id, listed, comments);
     await recordAudit(tx, {
@@ -457,7 +458,7 @@ export async function confirmSoftDelete(actor: CurrentMember, sourceId: string, 
 export async function setSyncScope(actor: CurrentMember, sourceId: string, { add = [], remove = [] }: { add?: string[]; remove?: string[] }) {
   assertCan(actor, 'sources:write');
   const row = await requireSource(actor.tenant.id, sourceId);
-  return getDb().transaction(async tx => {
+  return catalogTx(actor.tenant.id, async tx => {
     const listing = new Map((await tx.select().from(sourceTables).where(eq(sourceTables.sourceId, sourceId)).for('update')).map(t => [t.tableName, t]));
     for (const name of [...add, ...remove]) {
       const t = listing.get(name);
@@ -526,7 +527,7 @@ export async function updateSource(actor: CurrentMember, sourceId: string, input
 
   const rotated = JSON.stringify(credentials) !== JSON.stringify(previous);
   const changed = Object.keys({ ...row.config, ...config }).filter(k => row.config[k] !== config[k]);
-  await uniqueName(name, () => getDb().transaction(async tx => {
+  await uniqueName(name, () => catalogTx(actor.tenant.id, async tx => {
     await tx.update(sources).set({
       name,
       config,
@@ -594,7 +595,7 @@ export async function deleteSource(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'publish');
   const tenantId = actor.tenant.id;
   await requireSource(tenantId, sourceId);
-  await getDb().transaction(async tx => {
+  await catalogTx(tenantId, async tx => {
     // 先锁源表行（与修改同步范围、恢复映射同序，不死锁），再锁数据源行（与入队同步、核对同一把锁），最后锁租户行（与发布、停用、入队合并互斥）
     await tx.select({ table: sourceTables.tableName }).from(sourceTables).where(eq(sourceTables.sourceId, sourceId)).for('update');
     const [row] = await tx.select().from(sources)

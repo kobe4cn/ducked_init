@@ -10,6 +10,7 @@ import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
 import { tenantCatalog } from './catalog/load';
+import { catalogTx } from './catalog/tx';
 import { allRelations, publishedCustomEntities, type RegisteredEntity, relationsFrom, relationsTo, uniqueKeys } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { excludedHashes } from './identity-exclusions';
@@ -928,7 +929,7 @@ async function disableStep(
   apply: (tx: Tx, mapping: typeof mappings.$inferSelect) => Promise<Record<string, unknown> | void>,
 ) {
   assertCan(actor, 'publish');
-  await getDb().transaction(async tx => {
+  await catalogTx(actor.tenant.id, async tx => {
     await lockTenant(tx, actor.tenant.id);
     await requireMapping(actor.tenant.id, mappingId, tx);
     const [mapping] = await tx.select().from(mappings).where(eq(mappings.id, mappingId)).for('update');
@@ -1004,7 +1005,7 @@ export async function restoreMapping(actor: CurrentMember, mappingId: string) {
   assertCan(actor, 'publish');
   const tenantId = actor.tenant.id;
   const { sourceId } = await requireMapping(tenantId, mappingId);
-  await getDb().transaction(async tx => {
+  await catalogTx(tenantId, async tx => {
     // 先锁源表行再锁租户行，与修改同步范围（锁源表行后入队任务共享锁租户行）同序，不死锁
     const scoped = new Set((await tx.select({ table: sourceTables.tableName, inScope: sourceTables.inScope }).from(sourceTables)
       .where(eq(sourceTables.sourceId, sourceId)).for('update')).flatMap(t => (t.inScope ? [t.table] : [])));

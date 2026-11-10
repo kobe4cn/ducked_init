@@ -11,6 +11,7 @@ import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
+import { catalogTx } from './catalog/tx';
 import { getDb, type Db } from './db/client';
 import { DslError, onReadOnlyLake, type DiffCounts, type TagTransition } from './dsl-definitions';
 import { mappings, mappingVersions, spaces, tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
@@ -367,7 +368,7 @@ const PLATFORM = 'platform';
  * 返回这次启用的模板
  */
 export async function enableDefaultTemplates(tenantId: string): Promise<TemplateId[]> {
-  return getDb().transaction(async tx => {
+  return catalogTx(tenantId, async tx => {
     // 锁住租户行：同时结束的两次合并不会重复启用；定义的唯一键兜底
     const [tenant] = await tx.select({ suspendedAt: tenants.suspendedAt }).from(tenants).where(eq(tenants.id, tenantId)).for('update');
     if (!tenant || tenant.suspendedAt || await pendingMerge(tx, tenantId)) return [];
