@@ -2,7 +2,8 @@
 // 要求返回 JSON 对象并按调用方给的 JSON Schema 校验，不合格就报错，不把半成品交给调用方。
 // 端点按「租户自己的配置（platform.model_providers，Key 用租户数据密钥加密）> 平台默认（环境变量 LLM_*）」整套选取，不混用。
 // 在选出的一套上按用途分档（ADR-0055）：PURPOSE_TIER 写死每个用途属 fast / reasoning 哪档，平台档位用 LLM_<TIER>_* 环境变量换模型，
-// 租户整套自配时平台档位不生效；档位没绑定模型就回落默认并记 fallbackReason='unbound'。
+// 租户整套自配时读租户自己的档位列（只填模型沿用租户默认端点与 Key，带端点用档位自己的 Key），平台档位不生效；
+// 档位没绑定模型就回落默认并记 fallbackReason='unbound'。
 // chatTools 带工具调用模型（AI 助手，ADR-0042），不要求 JSON。
 // embed（ADR-0049）走可选的 embedding 端点：租户的 embedding 三项 > 平台环境变量 LLM_EMBEDDING_*，与 chat 互不影响；
 // 都没配置时返回 null（不发请求、不记日志），调用方只走关键词检索。
@@ -62,19 +63,32 @@ export function providerSource(row: { baseUrl: string | null } | undefined): Llm
 export const platformProvider = (): LlmProvider =>
   ({ baseUrl: process.env.LLM_BASE_URL!, model: process.env.LLM_MODEL!, apiKey: process.env.LLM_API_KEY!, source: 'platform' });
 
-/** 按 providerSource 选出的那一套端点、模型与 Key（租户的 Key 解密后返回）；都没有返回 null */
-export async function resolveProvider(tenantId: string): Promise<LlmProvider | null> {
+/** 行上某一档的三列（与 model-provider.ts 的 tierOf 同样的取法，不 import 它：那边已 import 本文件，反向会循环）：
+ *  没绑定时 model 为 null，端点与 Key 为 null 表示沿用本租户默认的那一套 */
+function tierOf(row: typeof modelProviders.$inferSelect | undefined, tier: 'fast' | 'reasoning') {
+  if (tier === 'fast') return { model: row?.fastModel ?? null, baseUrl: row?.fastBaseUrl ?? null, apiKey: row?.fastApiKey ?? null };
+  return { model: row?.reasoningModel ?? null, baseUrl: row?.reasoningBaseUrl ?? null, apiKey: row?.reasoningApiKey ?? null };
+}
+
+/** 查一次 modelProviders 行并按 providerSource 算出那一套 provider（租户的 Key 解密后返回）；都没有时 provider 为 null。
+ *  resolveProvider 与 resolveRoute 共用它，各自不再查第二次库 */
+async function providerRow(tenantId: string): Promise<{ row: typeof modelProviders.$inferSelect | undefined; provider: LlmProvider | null }> {
   const [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, tenantId));
   switch (providerSource(row)) {
     case 'tenant': {
       const apiKey = row.apiKey ? (await decryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, row.apiKey)).apiKey : '';
-      return { baseUrl: row.baseUrl!, model: row.model ?? '', apiKey, source: 'tenant' };
+      return { row, provider: { baseUrl: row.baseUrl!, model: row.model ?? '', apiKey, source: 'tenant' } };
     }
     case 'platform':
-      return platformProvider();
+      return { row, provider: platformProvider() };
     default:
-      return null;
+      return { row, provider: null };
   }
+}
+
+/** 按 providerSource 选出的那一套端点、模型与 Key（租户的 Key 解密后返回）；都没有返回 null */
+export async function resolveProvider(tenantId: string): Promise<LlmProvider | null> {
+  return (await providerRow(tenantId)).provider;
 }
 
 /** 按用途选档位的结果（ADR-0055）：route 是这次调用所属的档位（不分档为 null），fallbackReason 为 'unbound' 表示
@@ -86,16 +100,29 @@ const tierEnv = (tier: 'fast' | 'reasoning', suffix: 'MODEL' | 'BASE_URL' | 'API
 
 /**
  * 解析一次调用走哪一档（ADR-0055）：先按 ADR-0035 选出整套 provider（都没有返回 null）。
- * 用途不分档、或租户整套自配时不看平台档位，直接用那一套（租户自己的档位绑定另行处理，未绑定时记 unbound）。
- * 平台默认时 LLM_<TIER>_MODEL 有值就把模型换成它；BASE_URL 与 API_KEY 必须一起填才用档位自己的端点与 Key
- * （只填一个按没绑定处理并 console.warn，不把默认 Key 发到档位的端点），只填 MODEL 时端点与 Key 复用默认的。
+ * 用途不分档时直接用那一套。租户整套自配时读租户自己的档位列、平台档位不生效：只填模型名沿用租户默认的端点与 Key，
+ * 档位有自己的端点时用档位的端点与 Key（端点与 Key 须一起填，只填端点按没绑定处理并 console.warn，不把租户默认
+ * Key 发到档位的端点）。平台默认时 LLM_<TIER>_MODEL 有值就把模型换成它；BASE_URL 与 API_KEY 必须一起填才用
+ * 档位自己的端点与 Key（只填一个同样按没绑定处理并 console.warn），只填 MODEL 时端点与 Key 复用默认的。
  */
 export async function resolveRoute(tenantId: string, purpose: LlmPurpose): Promise<LlmRoute | null> {
-  const provider = await resolveProvider(tenantId);
+  const { row, provider } = await providerRow(tenantId);
   if (!provider) return null;
   const tier = PURPOSE_TIER[purpose];
   if (!tier) return { provider, route: null, fallbackReason: null };
-  if (provider.source === 'tenant') return { provider, route: tier, fallbackReason: 'unbound' };
+
+  if (provider.source === 'tenant') {
+    const { model, baseUrl, apiKey } = tierOf(row, tier);
+    if (!model) return { provider, route: tier, fallbackReason: 'unbound' };
+    if (!baseUrl) return { provider: { ...provider, model }, route: tier, fallbackReason: null };   // 只填模型名：沿用租户默认端点与 Key
+    if (!apiKey) {
+      // 保存校验（#605）不允许只填端点，这里只防脏数据：按没绑定处理，不把租户默认 Key 发到档位端点
+      console.warn(`model_providers 的 ${tier} 档位有端点但没有 Key，按未绑定该档位处理`);
+      return { provider, route: tier, fallbackReason: 'unbound' };
+    }
+    const decrypted = (await decryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, apiKey)).apiKey;
+    return { provider: { baseUrl, model, apiKey: decrypted, source: 'tenant' }, route: tier, fallbackReason: null };
+  }
 
   const model = tierEnv(tier, 'MODEL');
   const baseUrl = tierEnv(tier, 'BASE_URL');

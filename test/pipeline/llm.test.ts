@@ -30,10 +30,18 @@ const BASE_WITH_SLASH = 'https://platform.example.com/v1/';
 /** 答复带的 token 数，记进 llm_calls */
 const USAGE = { prompt_tokens: 120, completion_tokens: 30 };
 
-async function tenantProvider(tenantId: string) {
+/** 档位列（tenantProvider 的第二个参数）：model 必填；要换端点时 baseUrl 与 apiKey 一起给，Key 明文进来、插库前加密 */
+interface TierCols { model: string; baseUrl?: string; apiKey?: string }
+
+async function tenantProvider(tenantId: string, tiers: { fast?: TierCols; reasoning?: TierCols } = {}) {
+  const tier = (t: 'fast' | 'reasoning') => ({ model: tiers[t]?.model ?? null, baseUrl: tiers[t]?.baseUrl ?? null, apiKey: tiers[t]?.apiKey ?? null });
+  const fast = tier('fast'), reasoning = tier('reasoning');
+  const seal = (k: string | null) => k ? encryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, { apiKey: k }) : null;
   await getDb().insert(modelProviders).values({
     tenantId, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat',
     apiKey: await encryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, { apiKey: 'sk-tenant-secret' }),
+    fastModel: fast.model, fastBaseUrl: fast.baseUrl, fastApiKey: await seal(fast.apiKey),
+    reasoningModel: reasoning.model, reasoningBaseUrl: reasoning.baseUrl, reasoningApiKey: await seal(reasoning.apiKey),
   });
 }
 
@@ -221,6 +229,102 @@ describe('按用途选档位（ADR-0055）', () => {
     expect(received[0].headers.get('authorization')).toBe('Bearer sk-tenant-secret');
     expect(received[0].body.model).toBe('deepseek-chat');
     expect((await calls(acme))[0]).toMatchObject({ model: 'deepseek-chat', route: 'reasoning', fallbackReason: 'unbound' });
+  });
+
+  it('租户 reasoning 档只填模型名时：端点与 Key 沿用租户默认、模型换档位的，不分档的用途照旧，平台档位不生效', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    platformTier('reasoning', 'qwen-max');   // 平台的档位不作用于租户
+    await tenantProvider(acme, { reasoning: { model: 'deepseek-reasoner' } });
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+    await chatJson(acme, 'connectivity', MESSAGES, SCHEMA);
+
+    expect(received[0].url).toBe('https://tenant.example.com/v1/chat/completions');
+    expect(received[0].headers.get('authorization')).toBe('Bearer sk-tenant-secret');
+    expect(received[0].body.model).toBe('deepseek-reasoner');
+    expect(received[1].url).toBe('https://tenant.example.com/v1/chat/completions');   // connectivity 不分档，照旧租户默认
+    expect(received[1].body.model).toBe('deepseek-chat');
+    const rows = await calls(acme);
+    expect(rows[0]).toMatchObject({ model: 'deepseek-reasoner', route: 'reasoning', fallbackReason: null });
+    expect(rows[1]).toMatchObject({ model: 'deepseek-chat', route: null, fallbackReason: null });
+  });
+
+  it('租户 reasoning 档带自己的端点与 Key 时：整套用档位自己的端点与 Key，不发租户默认的 Key', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    await tenantProvider(acme, { reasoning: { model: 'deepseek-reasoner', baseUrl: 'https://tenant-reasoning.example.com/v1', apiKey: 'sk-tenant-reasoning-secret' } });
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+
+    expect(received[0].url).toBe('https://tenant-reasoning.example.com/v1/chat/completions');
+    expect(received[0].headers.get('authorization')).toBe('Bearer sk-tenant-reasoning-secret');
+    expect(received[0].body.model).toBe('deepseek-reasoner');
+    expect((await calls(acme))[0]).toMatchObject({ model: 'deepseek-reasoner', route: 'reasoning', fallbackReason: null });
+  });
+
+  it('租户只绑了 fast 档时：reasoning 用途仍用租户默认并记 unbound，fast 用途用 fast 档的模型', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    await tenantProvider(acme, { fast: { model: 'deepseek-chat-fast' } });
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+    await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
+
+    expect(received[0].url).toBe('https://tenant.example.com/v1/chat/completions');
+    expect(received[0].headers.get('authorization')).toBe('Bearer sk-tenant-secret');
+    expect(received[0].body.model).toBe('deepseek-chat');
+    expect(received[1].body.model).toBe('deepseek-chat-fast');
+    const rows = await calls(acme);
+    expect(rows[0]).toMatchObject({ model: 'deepseek-chat', route: 'reasoning', fallbackReason: 'unbound' });
+    expect(rows[1]).toMatchObject({ model: 'deepseek-chat-fast', route: 'fast', fallbackReason: null });
+  });
+
+  it('租户档位有端点但没有 Key（保存校验不允许，脏数据）时按没绑定处理：默认 Key 不发到档位端点，console.warn，记 unbound', async () => {
+    const acme = await newTenant('acme');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    platformDefault(BASE_WITH_SLASH);
+    await getDb().insert(modelProviders).values({
+      tenantId: acme, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat',
+      apiKey: await encryptForTenant(acme, MODEL_PROVIDER_CONTEXT, { apiKey: 'sk-tenant-secret' }),
+      reasoningModel: 'deepseek-reasoner', reasoningBaseUrl: 'https://tenant-reasoning.example.com/v1',   // 只有端点没有 Key
+    });
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+
+    expect(received[0].url).toBe('https://tenant.example.com/v1/chat/completions');
+    expect(received[0].headers.get('authorization')).toBe('Bearer sk-tenant-secret');
+    expect(received[0].body.model).toBe('deepseek-chat');
+    expect((await calls(acme))[0]).toMatchObject({ model: 'deepseek-chat', route: 'reasoning', fallbackReason: 'unbound' });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('reasoning');
+    warn.mockRestore();
+  });
+
+  it('平台来源的租户：库里留着档位列也不生效，照旧走 LLM_<TIER>_*，不出现租户档位的模型或 Key', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    platformTier('reasoning', 'qwen-max');
+    // 只插档位列、chat 三项为空：providerSource 为 platform，档位列不生效
+    await getDb().insert(modelProviders).values({
+      tenantId: acme, reasoningModel: 'deepseek-reasoner', reasoningBaseUrl: 'https://tenant-reasoning.example.com/v1',
+      reasoningApiKey: await encryptForTenant(acme, MODEL_PROVIDER_CONTEXT, { apiKey: 'sk-tenant-reasoning-secret' }),
+    });
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+
+    expect(received[0].url).toBe('https://platform.example.com/v1/chat/completions');
+    expect(received[0].headers.get('authorization')).toBe('Bearer sk-platform-secret');
+    expect(received[0].body.model).toBe('qwen-max');
+    expect((await calls(acme))[0]).toMatchObject({ model: 'qwen-max', route: 'reasoning', fallbackReason: null });
+    const logged = JSON.stringify(received);
+    expect(logged).not.toContain('deepseek-reasoner');
+    expect(logged).not.toContain('sk-tenant-reasoning-secret');
   });
 
   it('配了档位、返回 500 或 429 时只发一次请求，抛 transient 的 LlmError，不换模型不重试', async () => {
