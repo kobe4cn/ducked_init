@@ -1,6 +1,6 @@
 // test/prune-seaweed-iam-policies.test.ts —— policies.json 孤儿内联策略清理的纯函数：只删账号不存在的那一侧，别的字段一律不动
 import { describe, expect, it } from 'vitest';
-import { prunePolicies } from '../scripts/prune-seaweed-iam-policies';
+import { prunePolicies } from '../scripts/seaweed-iam-policies';
 
 const doc = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: ['s3:GetObject'], Resource: ['arn:aws:s3:::crm-lake/a/*'] }] };
 

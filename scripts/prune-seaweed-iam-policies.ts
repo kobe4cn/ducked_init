@@ -9,24 +9,7 @@
 // - 写回前重新读一次文件、重列一次账号，对着最新的内容删，把丢更新的时间窗压到毫秒级；
 // - 写回用 PUT 整份 JSON（不要用 multipart，2026-11-10 手工清理时 multipart 把文件写成过 0 字节）；
 // - 写回后必须再读一次核对：文件能解析、保留的策略与写回前逐条一致，不一致立刻用备份原文写回。
-import { cmp } from '../app/lib/compare';
-
-/** filer 上 policies.json 的形状（SeaweedFS credential/filer_etc 的 PoliciesCollection），未知字段原样保留 */
-export type PoliciesCollection = { [key: string]: unknown };
-
-export function prunePolicies(collection: PoliciesCollection, existingUsers: ReadonlySet<string>): {
-  pruned: PoliciesCollection;
-  removedUsers: string[];
-} {
-  const inline = collection.inlinePolicies;
-  if (inline === null || typeof inline !== 'object' || Array.isArray(inline)) return { pruned: collection, removedUsers: [] };
-  const entries = inline as Record<string, unknown>;
-  const removedUsers = Object.keys(entries).filter(user => !existingUsers.has(user)).sort(cmp);
-  if (removedUsers.length === 0) return { pruned: collection, removedUsers: [] };
-  const prunedInline: Record<string, unknown> = { ...entries };
-  for (const user of removedUsers) delete prunedInline[user];
-  return { pruned: { ...collection, inlinePolicies: prunedInline }, removedUsers };
-}
+import { prunePolicies, type PoliciesCollection } from './seaweed-iam-policies';
 
 const FILER = process.env.SEAWEED_FILER_URL ?? 'http://localhost:8888';
 const POLICIES_URL = `${FILER}/etc/iam/policies.json`;
