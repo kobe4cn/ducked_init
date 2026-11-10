@@ -1126,12 +1126,10 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     console.log(`  ◐ #${issue.id} 外部 PR #${pr}，留给人合并`);
     return;
   }
-  // 验收说明缺失或格式不对：正文里已经有警告，这里不自动合并，留给人看（外部 PR 本来就不自动合并，不走这里）。
-  if (notesProblems.length > 0) {
-    leaveForHuman(issue, pr, `验收说明缺失或格式不对：${notesProblems.join("；")}（见 PR 正文的「验收说明」一节）。`);
-    console.log(`  ◐ #${issue.id} 验收说明${result.notes === undefined ? "缺失" : "格式不对"}，留 PR #${pr}`);
-    return;
-  }
+  // 验收说明缺失或格式不对：正文里已经有警告，下面每条留给人的路径都把它附进原因（外部 PR 本来就不自动合并，不走这里）。
+  const notesNote = notesProblems.length
+    ? `\n\n验收说明缺失或格式不对：${notesProblems.join("；")}（见 PR 正文的「验收说明」一节）。`
+    : "";
   if (result.verdict !== "merge") {
     // 开工后 main 上合进了改同一处的票：先 rebase 好再交给人，免得人审的是一个合不进去的 PR。
     const rebaseNote = result.gate.ok ? await rebaseIfConflicting(issue, pr) : "";
@@ -1140,14 +1138,22 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
       pr,
       (result.verdict === "revise"
         ? `reviewer 打回 ${REVISE_MAX} 次后仍有要改的问题（见最新的 Review）。`
-        : "reviewer 认为需要人审（见 PR 正文的 Review）。") + rebaseNote,
+        : "reviewer 认为需要人审（见 PR 正文的 Review）。") +
+        rebaseNote +
+        notesNote,
     );
     console.log(`  ◐ #${issue.id} 留 PR #${pr} 等人审`);
     return;
   }
   if (!result.gate.ok) {
-    leaveForHuman(issue, pr, "typecheck 或完整测试没通过（见 PR 正文的 Gate）。");
+    leaveForHuman(issue, pr, `typecheck 或完整测试没通过（见 PR 正文的 Gate）。${notesNote}`);
     console.log(`  ◐ #${issue.id} 门槛失败，留 PR #${pr}`);
+    return;
+  }
+  // reviewer 给了 merge、门槛也过了，但验收说明不合格：照样不自动合并。
+  if (notesProblems.length > 0) {
+    leaveForHuman(issue, pr, notesNote.trimStart());
+    console.log(`  ◐ #${issue.id} 验收说明${result.notes === undefined ? "缺失" : "格式不对"}，留 PR #${pr}`);
     return;
   }
   // 先合并的票可能让这张冲突：rebase 到最新的 origin/main（冲突交给 agent）、重跑门槛，再合并一次。
