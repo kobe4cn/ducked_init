@@ -168,4 +168,5 @@
 | `nav.test.ts` | 顶栏导航高亮：子页面高亮所属导航项（如快照结果页高亮「分析」），按完整路径段匹配，运营后台审计日志不连带租户（纯函数） |
 | `enqueue-task-script.test.ts` | 提交任务命令行 `scripts/enqueue-task.ts`（#548，`runCli` 起子进程）：不认识的任务类型 `no.such.kind` 在查库之前报「未知的任务类型：no.such.kind」退出 2；开通租户后 `demo.seed` 传 `{"customers":-1}` 入队时 parse 报「参数 customers 必须是 1 到 1000000 之间的整数」退出 1 |
 | `client-build.test.ts` | 真实客户端构建，兜底页面误引 `.server` 模块 |
+| `dev-server-typegen.test.ts` | #615：测试起的 dev 服务器（4 个并发）不删、不重写 `.react-router/types`（`REACT_ROUTER_SKIP_TYPEGEN` 补丁生效） |
 | `mailer.test.ts` / `totp.test.ts` | 发信、TOTP（纯函数） |

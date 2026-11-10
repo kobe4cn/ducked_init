@@ -161,7 +161,7 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 
 | helper | 作用 |
 |---|---|
-| `startApp()` | 启动服务端（vite 缓存目录按 worker 分开：`node_modules/.vite-test_w<i>`），返回 `TestApp`：`client()` 新浏览器、`outbox` 已发邮件、`drain()` 等后台发信完成、`close()` |
+| `startApp()` | 启动服务端（vite 缓存目录按 worker 分开：`node_modules/.vite-test_w<i>`；测试进程设了 `REACT_ROUTER_SKIP_TYPEGEN=1`，开发服务器不生成路由类型，#615，补丁见 `patches/`），返回 `TestApp`：`client()` 新浏览器、`outbox` 已发邮件、`drain()` 等后台发信完成、`close()` |
 | `Client` | `get(path)`、`post(path, form)`（数组值提交多次）、`request(path, init)`、`cookie(name)`；不自动跟随重定向 |
 | `loginAs(app, email)` | 走完 Magic Link 登录，返回已登录的 `Client`（成员须已存在，可先 `memberOf` 加入） |
 | `loginAsOperator(app, email)` | 运营者登录（Magic Link + TOTP），返回 `{ browser, secret }` |

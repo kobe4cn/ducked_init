@@ -1,2 +1,4 @@
 allowBuilds:
   esbuild: true
+patchedDependencies:
+  '@react-router/dev': patches/@react-router__dev.patch
