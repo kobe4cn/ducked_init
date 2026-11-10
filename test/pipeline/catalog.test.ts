@@ -26,8 +26,8 @@ import { publishTemplate, saveDraft } from '../../app/.server/templates';
 import { lockTenant } from '../../app/.server/tenant-lock';
 import { resetDb } from '../http/harness';
 import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish, selectAllTables } from './fixtures';
-import { publishedIdentitySources } from './identity-fixtures';
-import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
+import { CRM, CRM_ORDERS, LOYALTY, publishedIdentitySources, TRACKING_USERS } from './identity-fixtures';
+import { grantOnSource, pgSourceInput, READER, seedIdentitySources } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -435,6 +435,24 @@ describe('语义目录的加载', () => {
     expect(template.diff.changed.map(x => x.id)).toContain('template:rfm');
     await drain();
     expect((await latestVersion(acme))?.version).toBe(template.version);
+  });
+
+  it('一次自动启用多个模板只记一版（ADR-0054）：订单映射合并后六个模板同时启用', async () => {
+    const acme = await newTenant('acme');
+    const author = await memberOf(acme, 'de@acme.com');
+    const reviewer = await memberOf(acme, 'de2@acme.com');
+    const { crm, loyalty, tracking } = await seedIdentitySources(author, { orders: true });
+    await publish(author, reviewer, crm, CRM);
+    await publish(author, reviewer, loyalty, LOYALTY);
+    await publish(author, reviewer, tracking, TRACKING_USERS);
+    // 六个模板都要求 order 与 customer：只有 customer 时一次也启用不了，还没有 template.auto_enabled 的版本
+    await publish(author, reviewer, crm, CRM_ORDERS);
+    const auto = await getDb().select().from(catalogVersions)
+      .where(and(eq(catalogVersions.tenantId, acme), eq(catalogVersions.reason, 'template.auto_enabled')));
+    // 一次 enableDefaultTemplates 启用六个模板只记这一版（改之前每个模板各记一版），差异里六个模板一起新增
+    expect(auto).toHaveLength(1);
+    expect(auto[0]!.diff.added.map(x => x.id).sort()).toEqual(
+      ['template:churn', 'template:clv', 'template:cohort', 'template:repurchase', 'template:rfm', 'template:user360']);
   });
 
   it('源表加列、删列后重新采集各记一版，差异里是该表的列；只改了行数的同步与随后的合并不记', async () => {
