@@ -1,7 +1,7 @@
 // app/.server/publishing.ts —— 可发布项（映射、源视图、指标 / 标签 / 模板定义、自定义实体、合并组）的保存草稿、发布、丢弃由这一个模块负责（ADR-0051）：
 // 每种可发布项通过适配器接入：两张表、要不要先锁租户行、事务外、事务内与锁内检查、发布后与丢弃后动作、审计与文案。
 // 发布顺序固定：读草稿 → publishBlocker → 事务外检查 → 开事务 → 加锁 → 过期检查 → 事务内检查 → 改状态 → 发布后动作 → 审计
-// （审计放在最后：记目录版本拿的锁要是事务里最后一个锁，ADR-0047）。自己开的事务用 catalogTx（ADR-0054）：发布等目录动作在事务收尾记一版目录版本；
+// （审计永远在最后，ADR-0051）。自己开的事务用 catalogTx（ADR-0054）：发布等目录动作在事务收尾记一版目录版本；
 // 调用方传入 tx 时不另开事务：发布时调用方必须已经在 catalogTx 里（publishPassthrough 一个事务里发布登记与映射就是），
 // saveDraft 传普通事务也允许（如 saveMappingDraft，保存只审计不在白名单里的 mapping.drafted，记不上目录版本）。
 // 流程本身的错误（不是草稿、已发布、草稿被改过、没有草稿可丢弃）抛 PublishError，各可发布项自己的错误类继承它。
@@ -182,7 +182,7 @@ export async function saveDraft<Ctx, Input, Inside, After>(
 /**
  * 发布草稿：读草稿 → publishBlocker → 事务外检查 → 开事务 →（锁租户行）→ 锁父行 → 过期检查 → 事务内检查 → 改状态 → 发布后动作 → 审计。
  * 自己开的事务是 catalogTx（ADR-0054），发布这一目录动作在事务收尾记一版目录版本；调用方传入 tx 时不另开，
- * 但调用方必须已经在 catalogTx 里（publishPassthrough 一个事务里发布登记与映射就是），否则目录动作记不上目录版本。
+ * 但调用方必须已经在 catalogTx 里（publishPassthrough 一个事务里发布登记与映射就是），否则审计目录动作时抛错。
  * 返回发布后动作的结果（入队的任务）或 null
  */
 export async function publish<Ctx, Input, Inside, After>(
@@ -208,7 +208,7 @@ export async function publish<Ctx, Input, Inside, After>(
       .set({ status: 'published', publishedByEmail: actor.email, publishedAt: sql`now()` })
       .where(eq(id, draft.id));
     const task = await adapter.afterPublish?.(tx, draft, ctx, inside) ?? null;
-    // 审计放在发布后动作（入队）之后：记目录版本拿的锁要是事务里最后一个锁（ADR-0047）
+    // 审计永远是最后一步（ADR-0051）
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
