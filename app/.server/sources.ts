@@ -484,7 +484,6 @@ export async function setSyncScope(actor: CurrentMember, sourceId: string, { add
     if (added.length) await tx.update(sourceTables).set({ inScope: true, ...scoped }).where(named(added));
     if (removed.length) await tx.update(sourceTables).set({ inScope: false, ...scoped }).where(named(removed));
     const task = added.length ? await insertTask(tx, actor.tenant.id, 'source.profile', { sourceId, tables: added }) : null;
-    // 审计放在入队之后：记目录版本拿的锁要是事务里最后一个锁（见 catalog/versions.ts）
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
@@ -536,7 +535,6 @@ export async function updateSource(actor: CurrentMember, sourceId: string, input
     }).where(and(eq(sources.id, row.id), eq(sources.tenantId, actor.tenant.id)));
     await recordListing(tx, row.tenantId, row.id, listed, comments);
     await enqueueScopedProfile(tx, actor.tenant.id, row.id);
-    // 审计放在入队之后：记目录版本拿的锁要是事务里最后一个锁（见 catalog/versions.ts）
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
       actor,
@@ -616,7 +614,6 @@ export async function deleteSource(actor: CurrentMember, sourceId: string) {
     await tx.delete(sourceTables).where(eq(sourceTables.sourceId, sourceId));
     await tx.update(sources).set({ credentials: '', deletedAt: new Date(), deletedByEmail: actor.email, updatedAt: new Date() })
       .where(eq(sources.id, sourceId));
-    // 审计记在入队之后（catalog/versions.ts 的加锁顺序）
     await insertTask(tx, tenantId, 'source.drop', { schema: bronzeSchema(sourceId) });
     await recordAudit(tx, {
       tenantId, actor, action: 'source.deleted', targetType: 'source', targetId: sourceId, detail: { name: row.name, kind: row.kind },

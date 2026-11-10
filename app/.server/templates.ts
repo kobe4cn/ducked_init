@@ -118,7 +118,7 @@ type QueuedTemplate = Awaited<ReturnType<typeof enqueueTemplate>>;
 /**
  * 模板定义接入 publishing.ts 的适配器（ADR-0051）：第一次保存时懒建定义父行，保存要用的值（草稿锁定的模板版本、
  * 第一次保存记下的空间，ADR-0048）放在 ctx 里传。发布不锁租户行、不查排队中的任务：发布总要按新参数算一次（ADR-0021）。
- * 发布后以这一版的参数加上当天的 asOf 入队一次模板任务（来源 publish），审计在入队之后
+ * 发布后以这一版的参数加上当天的 asOf 入队一次模板任务（来源 publish）
  */
 export const templateAdapter: PublishableAdapter<TemplateCtx, Record<string, unknown>, undefined, QueuedTemplate> = {
   parent: templateDefinitions,
