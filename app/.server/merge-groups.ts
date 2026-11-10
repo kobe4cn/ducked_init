@@ -191,7 +191,7 @@ type QueuedMerge = NonNullable<Awaited<ReturnType<typeof enqueueMerge>>>;
 /**
  * 合并组接入 publishing.ts 的适配器（ADR-0051）：保存的校验在事务内（先锁租户行，与停用、发布映射互斥，存下的组员在保存时一定合格）、
  * 懒建父行。发布时再校验一次（组员在保存后可能被停用或改了键空间），并给组员连同上一版里被移出组的映射（它们要写回自己的行）
- * 入队带 rebuild 的合并；合并在运行时入队返回 null，发布被拒并回滚。审计在入队之后
+ * 入队带 rebuild 的合并；合并在运行时入队返回 null，发布被拒并回滚
  */
 export const mergeGroupAdapter: PublishableAdapter<MergeGroupCtx, MergeGroupInput, string[], QueuedMerge> = {
   parent: mergeGroups,
@@ -266,7 +266,7 @@ async function requireGroup(tenantId: string, entity: string) {
 
 /**
  * 发布草稿：需要发布权限，且发布者不能是最后保存这一版草稿的人（双人发布）。只由成员在页面上调用，没有自动发布。
- * 发布时再校验一次（组员在保存后可能被停用或改了键空间），发布后版本锁定，同一事务里入队带 rebuild 的合并（审计在入队之后）。
+ * 发布时再校验一次（组员在保存后可能被停用或改了键空间），发布后版本锁定，同一事务里入队带 rebuild 的合并。
  * 返回入队的合并任务；合并在运行时不入队，发布被拒并回滚
  */
 export async function publishMergeGroup(actor: CurrentMember, entity: string, version: number) {

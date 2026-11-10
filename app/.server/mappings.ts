@@ -840,7 +840,7 @@ type MappingDraft = DraftRow & { yaml: string };
 /**
  * 映射接入 publishing.ts 的适配器（ADR-0051）：保存的事务外检查（checkMappingEdit）由入口完成，校验出的 plan 经 ctx 带进 checkSave 写进版本表；
  * 发布的事务外检查（checkOutside）重新校验文档并把重校验出的 plan 写回 ctx，事务内检查（锁内）跑 assertPublishable 并把 plan 写回版本行
- * （publish() 只改状态列）。发布后同一事务里为这个映射入队一次合并（返回 null 时由调度器补上，不拦发布），审计在入队之后（ADR-0047）。
+ * （publish() 只改状态列）。发布后同一事务里为这个映射入队一次合并（返回 null 时由调度器补上，不拦发布）。
  * 锁租户行：保存、丢弃也与发布、入队合并互斥
  */
 export const mappingAdapter: PublishableAdapter<MappingCtx, string, void, QueuedMerge> = {

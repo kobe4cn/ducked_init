@@ -223,7 +223,6 @@ type DslDraft = DraftRow & { yaml: string };
  * 发布的事务内检查再校验一次（保存后登记与映射可能变了）。锁租户行：与发布映射、删除定义与自定义实体互斥，
  * 它们按已发布定义的依赖做检查。发布后同一事务里以当天入队一次 gold.dsl（自身用 dslCtx 编译）；
  * 指标另为引用它的每个已发布标签入队一次（用换上了刚发布这一版的 tagCtx 编译，不再通过校验的跳过、记进审计）。
- * 审计在入队之后（ADR-0047）
  */
 export const dslDefinitionAdapter: PublishableAdapter<DslDefinitionCtx, string, DslInside, QueuedDsl> = {
   parent: dslDefinitions,
