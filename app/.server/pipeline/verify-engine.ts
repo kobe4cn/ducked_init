@@ -10,27 +10,21 @@
 // - 结构：以核对时实时读取的源表结构为基准，与原始层的列对照。
 // - 数据量：有主键的表比对源端主键全集与原始层回放后的当前主键（与每日主键比对同一机制，但不写入）；没有主键的表比较行数
 import type { DuckDBConnection } from '@duckdb/node-api';
-import type { LakeCoverage, NotInLakeReason } from '../../lib/sources';
+import type { LakeCoverage } from '../../lib/sources';
 import type { EngineLimits, TenantLakeSession } from './lake-engine';
-import { estimatedRows, primaryKeys, writeGrants, type SourceSpec, type SourceTable, type WatermarkKind } from './source-engine';
+import { estimatedRows, primaryKeys, writeGrants, type SourceSpec, type SourceTable } from './source-engine';
 import {
   bronzeSchema, bucketCount, inBucket, joinOn, keyHash, keyList, liveCondition, onSource, PLATFORM_COLUMNS, pushdown,
 } from './sync-engine';
 import { diffColumns } from './schema-diff';
+import type { VerifyTableParam } from './task-contracts';
 
 /**
- * 核对任务里平台给出的一张表（最近一次列出表得到的清单）：是否在同步范围内、不在湖里时平台判断的原因，
- * 以及同步用的设置（业务主键、软删除字段、已确认的水位线字段及其种类）
+ * 核对任务里平台给出的一张表（最近一次列出表得到的清单）：类型由契约推出（task-contracts 的 verifyTable schema，
+ * 含 inScope 与 reason，ADR-0052），只在这里转出，调用方 import 不变。工作进程不带平台模块，
+ * 引擎对契约只能 import type / export type（ADR-0008）
  */
-export interface VerifyTableParam {
-  name: string;
-  inScope: boolean;
-  reason: NotInLakeReason;
-  key?: string[];
-  softDelete?: string;
-  column?: string;
-  kind?: WatermarkKind;
-}
+export type { VerifyTableParam } from './task-contracts';
 
 /** 缺失与多出的主键各给出前几个样例 */
 export const KEY_SAMPLES = 20;

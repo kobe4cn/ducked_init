@@ -11,12 +11,13 @@ import type { DuckDBConnection } from '@duckdb/node-api';
 import { SPILL_RATIO, type EngineLimits, type TenantLakeSession } from './lake-engine';
 import { diffColumns, type ColumnType, type SchemaDiff } from './schema-diff';
 import { primaryKeys, writeGrants, type SourceSpec, type SourceTable, type WatermarkKind } from './source-engine';
+import type { SyncTableParam } from './task-contracts';
 
 /**
- * 同步任务里的一张表：成员确认的水位线字段及其种类（没有时全量比对）；源表没有主键时可带成员声明的业务主键（一列或多列），
- * 有主键（源端主键或业务主键）时可带软删除字段
+ * 同步任务里的一张表：类型由契约推出（task-contracts 的 syncTable schema，ADR-0052），只在这里转出，调用方 import 不变。
+ * 工作进程不带平台模块，引擎对契约只能 import type / export type（ADR-0008）
  */
-export interface SyncTableParam { name: string; column?: string; kind?: WatermarkKind; key?: string[]; softDelete?: string }
+export type { SyncTableParam } from './task-contracts';
 
 /**
  * 批次的来源：水位线表的全表读取（首次同步或换了水位线字段）、按水位线增量读取、比对主键全集（有主键的水位线表，补上删除与漏掉的行），
