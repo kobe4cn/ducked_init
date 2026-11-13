@@ -38,7 +38,7 @@ import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
 import { mappingDrift } from './source-drift';
 import { confirmedTables } from './sources';
-import { insertTask } from './tasks';
+import { insertTask, updateQueuedParams } from './tasks';
 import { lockTenant } from './tenant-lock';
 import { CANONICAL_ENTITIES, type CustomEntityField, entityLabel, entityOf, type EntityRelation, type RelationStat, relationText } from '../lib/canonical-model';
 import { cmp, cmpName } from '../lib/compare';
@@ -1198,17 +1198,17 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
       mappings: plans, ...(incoming.length > 0 && { drop: incoming }), identity, survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: force,
     });
   }
-  const queuedDrop = (pending.params.drop ?? []) as MergeDrop[];
-  const drop = [...queuedDrop, ...incoming.filter(d => !queuedDrop.some(q => q.mapping === d.mapping))];
-  const queued = (pending.params.mappings ?? []) as MergeMappingParam[];
-  const merged = [
-    ...queued.filter(q => !plans.some(p => p.mapping === q.mapping) && !drop.some(d => d.mapping === q.mapping)),
-    ...plans.map(p => (queued.some(q => q.mapping === p.mapping && q.rebuild) ? { ...p, rebuild: true } : p)),
-  ].sort((a, b) => cmp(a.mapping, b.mapping));
-  // 领取合并不锁租户行：只在它仍在排队时改参数
-  const [task] = await tx.update(tasks).set({ params: { ...pending.params, mappings: merged, ...(drop.length > 0 && { drop }), identity, survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: pending.params.identityForce === true || force } })
-    .where(and(eq(tasks.id, pending.id), eq(tasks.status, 'queued'))).returning();
-  return task ?? null;
+  // 已在排队：并进同一个任务。领取合并不锁租户行，updateQueuedParams 只在它仍在排队时改参数（刚被领取时返回 null，由定时检查补上）
+  return updateQueuedParams(tx, pending.id, 'silver.merge', p => {
+    const queuedDrop = p.drop;
+    const drop = [...queuedDrop, ...incoming.filter(d => !queuedDrop.some(q => q.mapping === d.mapping))];
+    const queued = p.mappings;
+    const merged = [
+      ...queued.filter(q => !plans.some(pl => pl.mapping === q.mapping) && !drop.some(d => d.mapping === q.mapping)),
+      ...plans.map(pl => (queued.some(q => q.mapping === pl.mapping && q.rebuild) ? { ...pl, rebuild: true } : pl)),
+    ].sort((a, b) => cmp(a.mapping, b.mapping));
+    return { ...p, mappings: merged, drop, identity, survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: p.identityForce || force };
+  });
 }
 
 /**

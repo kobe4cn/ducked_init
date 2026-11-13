@@ -13,7 +13,7 @@ import { SERVING_DIR } from './pipeline/lake-engine';
 import { servingPath } from './pipeline/serving-engine';
 import { platformS3 } from './s3-accounts';
 import { deleteObject } from './s3-client';
-import { insertTask } from './tasks';
+import { insertTask, updateQueuedParams } from './tasks';
 import { lockTenant } from './tenant-lock';
 import { cmp } from '../lib/compare';
 
@@ -38,10 +38,12 @@ export async function enqueueServingBuild(tenantId: string) {
     await lockTenant(tx, tenantId);
     const picked = await servingSnapshots(tx, tenantId);
     const ofBuilds = and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'serving.build'));
-    // 只改仍在排队的：已被领取的任务按原参数运行，这里另入队一个
-    const [refreshed] = await tx.update(tasks).set({ params: sql`${tasks.params} || jsonb_build_object('snapshots', ${JSON.stringify(picked)}::jsonb)` })
-      .where(and(ofBuilds, eq(tasks.status, 'queued'))).returning({ id: tasks.id });
-    if (refreshed) return null;
+    // 只改仍在排队的：已被领取的任务按原参数运行，这里另入队一个（改写时刚被领取、updateQueuedParams 返回 null 时也一样）
+    const [refreshing] = await tx.select({ id: tasks.id }).from(tasks).where(and(ofBuilds, eq(tasks.status, 'queued'))).limit(1);
+    if (refreshing) {
+      const refreshed = await updateQueuedParams(tx, refreshing.id, 'serving.build', p => ({ ...p, snapshots: picked }));
+      if (refreshed) return null;
+    }
 
     const [{ used }] = await tx.select({ used: sql<number>`coalesce(max((${tasks.params}->>'version')::int), 0)` }).from(tasks).where(ofBuilds);
     const [pointer] = await tx.select({ version: servingStores.version }).from(servingStores).where(eq(servingStores.tenantId, tenantId));
