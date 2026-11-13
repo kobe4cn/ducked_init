@@ -61,6 +61,22 @@ const params = <T, I = T>(schema: z.ZodType): { parse(raw: unknown): T; readonly
   },
 });
 
+/**
+ * 同 params，但参数类型不用手写，直接从 schema 推出（参数 schema 是具名常量时用，如 source.sync 的 syncParams）：
+ * parse 的返回与 __input（入参类型，InputOf 从这里取）分别是 z.output / z.input。z.looseObject 推出的类型带索引签名，
+ * Known 把顶层的索引签名去掉，只留具名字段——Omit 这类按键操作对索引签名会把具名字段全丢掉，且不报错
+ */
+const schemaParams = <S extends z.ZodType>(schema: S): { parse(raw: unknown): Known<z.output<S>>; readonly __input?: Known<z.input<S>> } => ({
+  parse(raw: unknown): Known<z.output<S>> {
+    const parsed = schema.safeParse(raw);
+    if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? '参数不合法');
+    return parsed.data as Known<z.output<S>>;
+  },
+});
+
+/** 去掉顶层的字符串与数字索引签名（运行时照旧 .loose() 放行多余键，这只是类型层面的收窄） */
+type Known<T> = { [K in keyof T as string extends K ? never : number extends K ? never : K]: T[K] };
+
 /** 非空字符串列表（原 isStrings）：任何形状不对都报同一句话 */
 const strings = (message: string) => z.array(z.string(error(message)), error(message)).min(1, error(message));
 /** 字符串列表，可以为空（原 consumerSensitive 的检查） */
@@ -95,24 +111,13 @@ const WATERMARKS = ['updated_at', 'increment'] as const;
 
 const SURVIVORSHIP = '参数 survivorship 必须是映射 ID 到正整数名次的对照';
 
-/** 同步的一张表（原 syncTables）：水位线字段与种类要么都有、要么都没有；业务主键在旧任务里是单个字段，这里转成数组。
- * extra 补核对任务（source.verify）另带的字段：是否在同步范围内与平台判断的未进湖原因 */
-function tableWithWatermark(message: string, keyAsString: boolean, extra: Record<string, z.ZodType> = {}) {
-  return z.object({
-    name: z.string(error(message)),
-    column: z.string(error(message)).optional(),
-    kind: z.enum(WATERMARKS, error(message)).optional(),
-    key: (keyAsString
-      ? z.union([z.string(error(message)), strings(message)], error(message))
-        .optional()
-        .transform(k => (typeof k === 'string' ? [k] : k))
-      : strings(message).optional()),
-    softDelete: z.string(error(message)).optional(),
-    ...extra,
-  }, error(message))
-    .refine(t => (t.column === undefined) === (t.kind === undefined), error(message))
-    .loose();
-}
+/** 同步 / 核对一张表的公共字段（key 两边形状不同，各自带）：表名、已确认的水位线字段及其种类、软删除字段 */
+const tableFields = (message: string) => ({
+  name: z.string(error(message)),
+  column: z.string(error(message)).optional(),
+  kind: z.enum(WATERMARKS, error(message)).optional(),
+  softDelete: z.string(error(message)).optional(),
+});
 
 /** 可空字符串（如取最新字段 latest）：null 表示没有 */
 const nullableString = (message: string) => z.union([z.string(error(message)), z.null(error(message))], error(message));
@@ -250,6 +255,63 @@ const TEMPLATE_CONTRACTS = Object.fromEntries((Object.keys(TASK_KINDS) as Templa
   label: TEMPLATES[id].label, params: templateParams(id), result: resultType<Record<string, unknown>>(),
 }])) as { [K in TemplateId as (typeof TASK_KINDS)[K]]: TaskContract<TemplateParams<K>, Record<string, unknown>> & { params: { readonly __input?: TemplateInput } } };
 
+/** 同步 / 核对 / 业务主键校验的参数 schema：抽成具名常量，参数类型（z.infer）从这里导出，引擎不再手写（ADR-0052） */
+const SYNC_TABLES = '参数 tables 必须是非空的 { name, column?, kind?, key?, softDelete? } 列表';
+/** 同步任务里的一张表（原 syncTables，sync-engine 的 SyncTableParam 从它推出）：成员确认的水位线字段及其种类
+ * （没有时全量比对）、软删除字段；源表没有主键时可带成员声明的业务主键——旧任务里是单个字段，schema 里转成列表
+ * （入参类型仍是 string | string[]）。key 的 .optional() 必须在 .transform() 外面：转列表是 pipe，pipe 里再包
+ * optional 时 zod 不把 key 标成可选，推出的类型就成了必填的 string[] | undefined，与原来手写的 key?: string[] 不符。
+ * 水位线字段与种类要么都有、要么都没有 */
+const syncTable = z.object({
+  ...tableFields(SYNC_TABLES),
+  key: z.union([z.string(error(SYNC_TABLES)), strings(SYNC_TABLES)], error(SYNC_TABLES))
+    .transform(k => (typeof k === 'string' ? [k] : k))
+    .optional(),
+}, error(SYNC_TABLES))
+  .refine(t => (t.column === undefined) === (t.kind === undefined), error(SYNC_TABLES))
+  .loose();
+const syncParams = z.looseObject({
+  sourceId: z.string(error('缺少参数 sourceId')),
+  tables: z.array(syncTable, error(SYNC_TABLES)).min(1, error(SYNC_TABLES)),
+  // 原 run 只认 true，别的取值照原样放行
+  reconcile: z.unknown().optional(),
+});
+
+/** 业务主键校验的参数（原 source-key-check 的 KeyCheckTaskParams）：tableName 与 keyColumns 校验形状并定文案，
+ * 其余四个只定型（不带检查函数的 z.custom 对值不设限，与原来的原样放行等价），调度器与 run 自己读。
+ * 必须排在 keyColumns 之后：报错只取第一条，不带这几个字段的失败用例先轮到 tableName / keyColumns 的文案 */
+const keyCheckParams = z.looseObject({
+  tableName: z.string(error('缺少参数 tableName')),
+  keyColumns: strings('参数 keyColumns 必须是非空的字段列表'),
+  sourceId: z.custom<string>(),
+  memberId: z.custom<string>(),
+  email: z.custom<string>(),
+  sensitive: z.custom<boolean>(),
+});
+
+const VERIFY_TABLES = '参数 tables 必须是 { name, inScope, reason, key?, softDelete?, column?, kind? } 列表';
+/** 核对任务里平台给出的一张表（原 verify-engine 的 VerifyTableParam）：是否在同步范围内、不在湖里时平台判断的原因，
+ * 以及同步用的设置（业务主键、软删除字段、已确认的水位线字段及其种类）。水位线字段与种类要么都有、要么都没有 */
+const verifyTable = z.object({
+  ...tableFields(VERIFY_TABLES),
+  key: strings(VERIFY_TABLES).optional(),
+  inScope: z.boolean(error(VERIFY_TABLES)),
+  reason: z.enum(NOT_IN_LAKE_REASONS, error(VERIFY_TABLES)),
+}, error(VERIFY_TABLES))
+  .refine(t => (t.column === undefined) === (t.kind === undefined), error(VERIFY_TABLES))
+  .loose();
+const verifyParams = z.looseObject({
+  sourceId: z.string(error('缺少参数 sourceId')),
+  tables: z.array(verifyTable, error(VERIFY_TABLES)),
+});
+
+/** 同步任务里的一张表的参数类型：由 syncTable schema 推出（Known 去掉 .loose() 的索引签名），sync-engine 转出 */
+export type SyncTableParam = Known<z.infer<typeof syncTable>>;
+/** 业务主键校验的入队参数类型：由 keyCheckParams schema 推出，source-key-check.ts 转出 */
+export type KeyCheckTaskParams = Known<z.infer<typeof keyCheckParams>>;
+/** 核对任务里一张表的参数类型：由 verifyTable schema 推出（保留 inScope 与 reason），verify-engine 转出 */
+export type VerifyTableParam = Known<z.infer<typeof verifyTable>>;
+
 /**
  * 全部任务的契约表。新增任务先在这里登记契约，再去 handlers.ts 实现 run。
  * 拿不准入队侧会不会带上多余字段时，schema 用 .loose()：zod 对象默认会剥掉未声明的字段
@@ -281,12 +343,7 @@ export const CONTRACTS = {
     label: '同步数据源',
     needs: { source: true },
     attachSource: true,
-    params: params<{ sourceId: string; tables: import('./sync-engine').SyncTableParam[]; reconcile?: unknown }>(z.looseObject({
-      sourceId: z.string(error('缺少参数 sourceId')),
-      tables: z.array(tableWithWatermark('参数 tables 必须是非空的 { name, column?, kind?, key?, softDelete? } 列表', true), error('参数 tables 必须是非空的 { name, column?, kind?, key?, softDelete? } 列表')).min(1, error('参数 tables 必须是非空的 { name, column?, kind?, key?, softDelete? } 列表')),
-      // 原 run 只认 true，别的取值照原样放行
-      reconcile: z.unknown().optional(),
-    })),
+    params: schemaParams(syncParams),
     result: resultType<{ tables: Awaited<ReturnType<typeof syncSourceTables>> }>(),
   },
   // 校验业务主键：成员声明的组合在源表全表上是否非空且唯一，按租户配额分桶检查（源端只读，数据湖只给溢写目录）。
@@ -296,12 +353,7 @@ export const CONTRACTS = {
     needs: { source: true },
     attachSource: true,
     readOnlyLake: true,
-    params: params<import('../source-key-check').KeyCheckTaskParams>(z.looseObject({
-      tableName: z.string(error('缺少参数 tableName')),
-      keyColumns: strings('参数 keyColumns 必须是非空的字段列表'),
-      // memberId、email（写回时记审计）与 sourceId、sensitive 原样放行，调度器与 run 自己读
-      sensitive: z.unknown().optional(),
-    })),
+    params: schemaParams(keyCheckParams),
     result: resultType<KeyCheckTaskResult>(),
   },
   // 核对湖中数据：源端的全部表标出是否进湖与源端行数，已进湖的表再核对位置、文件、结构与数据量。
@@ -311,13 +363,7 @@ export const CONTRACTS = {
     needs: { source: true },
     attachSource: true,
     readOnlyLake: true,
-    params: params<{ sourceId: string; tables: import('./verify-engine').VerifyTableParam[] }>(z.looseObject({
-      sourceId: z.string(error('缺少参数 sourceId')),
-      tables: z.array(tableWithWatermark('参数 tables 必须是 { name, inScope, reason, key?, softDelete?, column?, kind? } 列表', false, {
-        inScope: z.boolean(error('参数 tables 必须是 { name, inScope, reason, key?, softDelete?, column?, kind? } 列表')),
-        reason: z.enum(NOT_IN_LAKE_REASONS, error('参数 tables 必须是 { name, inScope, reason, key?, softDelete?, column?, kind? } 列表')),
-      }), error('参数 tables 必须是 { name, inScope, reason, key?, softDelete?, column?, kind? } 列表')),
-    })),
+    params: schemaParams(verifyParams),
     result: resultType<{ tables: Awaited<ReturnType<typeof verifySourceLake>>; differences: number }>(),
   },
   // 漂移检查：对比标准层表的实际结构与参数里的应有结构（入队时由已发布映射算出），报告缺列、多列、类型不一致与孤表。
@@ -456,6 +502,10 @@ type SourceNeedKinds = { [K in TaskKind]: (typeof CONTRACTS)[K] extends { needs:
 type AssertTrue<T extends true> = T;
 type _needsSourceInParams = AssertTrue<{ [K in SourceNeedKinds]: [ParamsOf<K>] extends [{ sourceId: string }] ? true : false }[SourceNeedKinds] extends true ? true : false>;
 type _attachDeclaresSource = AssertTrue<{ [K in TaskKind]: (typeof CONTRACTS)[K] extends { attachSource: true } ? (K extends SourceNeedKinds ? true : false) : true }[TaskKind] extends true ? true : false>;
+// schemaParams 推出的类型（z.custom 定型、Known 去索引签名）：keycheck 的 sensitive 推出必填 boolean（不是 boolean | undefined）；
+// sync 的入参不带字符串索引签名——带了的话 source-sync 的 Omit<InputOf<K>, 'sourceId'> 会丢掉全部具名字段，入队参数不再做类型检查
+type _keycheckSensitive = AssertTrue<[ParamsOf<'source.keycheck'>['sensitive']] extends [boolean] ? true : false>;
+type _syncInputKnown = AssertTrue<string extends keyof InputOf<'source.sync'> ? false : true>;
 
 /** 一个任务的结果类型 */
 export type ResultOf<K extends TaskKind> = NonNullable<(typeof CONTRACTS)[K]['result']['__result']>;

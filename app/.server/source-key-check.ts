@@ -11,9 +11,11 @@ import { sources, sourceTables, tasks, type TaskStatus } from './db/schema';
 import { requireSource, SourceError } from './source-config';
 import { ofSource } from './source-sync';
 import { insertTask } from './tasks';
+import type { KeyCheckTaskParams } from './pipeline/task-contracts';
 
-/** 入队参数；memberId 与 email 是声明的成员，写回时据此记审计 */
-export interface KeyCheckTaskParams { sourceId: string; tableName: string; keyColumns: string[]; sensitive: boolean; memberId: string; email: string }
+/** 入队参数：类型由契约推出（task-contracts 的 keyCheckParams schema，ADR-0052），只在这里转出，调用方 import 不变。
+ * memberId 与 email 是声明的成员，写回时据此记审计 */
+export type { KeyCheckTaskParams } from './pipeline/task-contracts';
 
 /** 任务结果：ok 为假时有空值或重复；主键列像敏感信息时重复键的 key 为 null，只给次数 */
 export interface KeyCheckTaskResult {
