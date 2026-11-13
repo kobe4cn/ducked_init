@@ -68,4 +68,4 @@ fi
 echo "元数据日志：删除 $dirs 个早于 $cutoff 的日期目录，删除 $vols 个已清空的卷；/data 已用 $(df -h /data | awk "NR == 2 { print \$3 }")"
 ' _ "$keep")
 
-echo "$metalog；$policies"
+echo "${metalog}；${policies}"
