@@ -1,33 +1,20 @@
 // app/.server/pipeline/dispatcher.ts —— 调度器：从平台 PG 的队列领取任务，每个任务启动一个独立的工作进程（ADR-0001）。
 // 本机同时运行的工作进程不超过 maxWorkers；各租户的并发上限与公平调度由 claimNextTask 保证，可以部署多个调度器。
 // 数据湖迁移存储也由调度器执行（在本进程内，要用平台账号读旧前缀、写新前缀），同样占一个名额，先于任务领取。
-// 常驻运行时还定期为到期的数据源入队同步与湖中数据核对，为有新变化的租户入队标准层合并；同步给已发布映射的源表写入变更后随即入队一次合并，
-// 分析模板与指标、标签任务成功后登记结果快照，因断言失败时告警；还定期为有到期快照的租户入队快照过期、有到期沙箱表的入队沙箱表过期，成功后标记快照、沙箱表已过期。
-// 登记了新快照或标记了过期后入队重建服务库，生成成功后把服务库指针切到新版本
-// 源表采集与同步成功后和最新一版语义目录比较，源表的列变了记一版目录版本；检索投影刷新任务成功后在这里从零重建投影
+// 常驻运行时还定期为到期的数据源入队同步与湖中数据核对，为有新变化的租户入队标准层合并，为有到期快照的租户入队快照过期、有到期沙箱表的入队沙箱表过期。
+// 任务结束后的钩子（登记快照、告警、入队服务库构建等）登记在 task-hooks.ts（ADR-0052），在 finishTask 之后按表执行
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureEmbeddings, fillEmbeddings } from '../catalog/embeddings';
-import { rebuildProjection } from '../catalog/projection';
-import { recordCatalogVersionIfChanged } from '../catalog/versions';
-import { registerDslSnapshot } from '../dsl-definitions';
 import { cleanupExpiredExports } from '../exports';
-import { alertNewFallback } from '../fallback-alerts';
 import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '../lake-migration';
-import { enqueueDueMerges, mergeAfterSync } from '../mappings';
-import { alertAssertionFailure } from '../quality';
+import { enqueueDueMerges } from '../mappings';
 import { enqueueDueRefreshes } from '../refresh';
-import { enqueueDueSandboxExpiries, markSandboxExpired } from '../sandbox';
-import { alertSchemaBreak } from '../schema-alerts';
-import { draftSchemaRepairs } from '../schema-repair-drafts';
-import { activateServingStore, enqueueServingBuild } from '../serving-store';
-import { enqueueDueExpiries, markExpired, registerSnapshot } from '../snapshots';
-import { applyKeyCheck } from '../source-key-check';
+import { enqueueDueSandboxExpiries } from '../sandbox';
+import { enqueueDueExpiries } from '../snapshots';
 import { enqueueDueSyncs } from '../source-sync';
 import { enqueueDueVerifies } from '../source-verify';
 import { claimNextTask, failStaleTasks, finishTask, heartbeatTasks, setWorkerPid, type ClaimedTask } from '../tasks';
-import { enableDefaultTemplates } from '../templates';
-import { templateOfKind } from './templates';
+import { runHooks, TASK_HOOKS, type TaskHookTable } from './task-hooks';
 import type { WorkerInput, WorkerOutcome } from './worker';
 
 const WORKER_ENTRY = fileURLToPath(new URL('./worker.ts', import.meta.url));
@@ -43,6 +30,8 @@ export interface DispatcherOptions {
   timeoutMs?: number;
   /** 常驻运行时检查哪些数据源到了同步或核对周期的间隔 */
   syncCheckMs?: number;
+  /** 任务结束后的钩子表：默认正式钩子表 TASK_HOOKS；传了就整张替换（缺的 kind 视为没有钩子），测试传假钩子用 */
+  hooks?: Partial<TaskHookTable>;
 }
 
 // 工作进程只继承运行所需的环境变量（平台 PG 连接串等不在其中）；本租户数据湖的凭据经 IPC 单独传入
@@ -57,7 +46,7 @@ const workerEnv = () => Object.fromEntries(WORKER_ENV_KEYS.flatMap(k => (process
 interface RunningTask { child: ChildProcess; done: Promise<void>; abort(reason: string): void }
 
 export function createDispatcher({
-  maxWorkers, pollMs = 1000, staleAfterMs = 60_000, timeoutMs = 2 * 60 * 60_000, syncCheckMs = 60_000,
+  maxWorkers, pollMs = 1000, staleAfterMs = 60_000, timeoutMs = 2 * 60 * 60_000, syncCheckMs = 60_000, hooks = TASK_HOOKS,
 }: DispatcherOptions) {
   const running = new Map<string, RunningTask>();
   /** 本调度器执行中的数据湖迁移，按领取凭据（claim）索引；abort 让它就此放弃（已被其他调度器接手） */
@@ -91,46 +80,8 @@ export function createDispatcher({
         // 错误已由工作进程抹掉凭据；记进调度器日志，便于在后台排查
         if ('error' in outcome!) console.warn(`[调度器] 任务 ${task.id}（${task.kind}）失败：${outcome.error}`);
         await finishTask(task.id, outcome!);
-        const succeeded = !('error' in outcome!);
-        // 同步给已发布映射的源表写入了变更批次（部分失败时也可能有）：随即把它们合并进标准层
-        if (task.kind === 'source.sync' && outcome!.result) await mergeAfterSync(task.tenantId, task.id);
-        // 同步发现源表删了列或破坏性改了类型、且已发布映射引用了它们：通知能改映射的成员并记审计（ADR-0034）
-        if (task.kind === 'source.sync' && outcome!.result) await alertSchemaBreak(task.tenantId, task, outcome!.result);
-        // 告警时入队的重新采集（带 repairFor）成功：按规则猜测源列改名，起草修复草稿并发带链接的邮件（ADR-0034）
-        if (task.kind === 'source.profile' && outcome!.result && succeeded && task.params.repairFor) await draftSchemaRepairs(task.tenantId, task);
-        // 采集或同步成功：源表的列可能变了，和最新一版目录比较，有差异记一版（ADR-0041）；只改了统计不记。失败不影响任务状态
-        if ((task.kind === 'source.profile' || task.kind === 'source.sync') && succeeded) {
-          await recordCatalogVersionIfChanged(task.tenantId, task.kind === 'source.profile' ? 'source.profiled' : 'source.synced')
-            .catch(e => console.warn(`[调度器] 任务 ${task.id} 之后记目录版本失败`, e));
-        }
-        // 合并里值字典没写到的新取值落入了兜底值（以前没通知过）：通知能改映射的成员并记审计（ADR-0015）。部分映射失败时也看成功的那些
-        if (task.kind === 'silver.merge' && outcome!.result) await alertNewFallback(task.tenantId, task, outcome!.result);
-        // 合并成功：以默认参数自动启用依赖已齐、本租户还没有定义的模板，产出第一版快照（ADR-0021）
-        if (task.kind === 'silver.merge' && outcome!.result && !('error' in outcome!)) await enableDefaultTemplates(task.tenantId);
-        // 业务主键的全表检查通过：写回声明并记审计（工作进程里没有平台库）
-        if (task.kind === 'source.keycheck' && outcome!.result) await applyKeyCheck(task.tenantId, task.id);
-        // 分析模板任务写好了结果层的快照表：登记到平台元数据，分析页据此列出
-        const template = templateOfKind(task.kind);
-        if (template && outcome!.result) await registerSnapshot(task.tenantId, task.id, template);
-        if (task.kind === 'gold.dsl' && outcome!.result) await registerDslSnapshot(task.tenantId, task.id);
-        // 检索投影差异太大、交给了任务（ADR-0047）：在这里按当前目录从零重建。失败不影响任务状态，下次检索会再入队
-        if (task.kind === 'catalog.projection' && succeeded) {
-          await rebuildProjection(task.tenantId).catch(e => console.warn('检索投影重建失败', task.tenantId, e));
-          // 重建后投影文字可能变了：顺带入队补算缺的向量（ADR-0049）。失败只打日志
-          await ensureEmbeddings(task.tenantId).catch(e => console.warn('检索向量补算入队失败', task.tenantId, e));
-        }
-        // 检索向量补算（ADR-0047、0049）：工作进程只占位（没有平台库），在这里补齐当前模型缺的向量并清掉旧模型的行。
-        // 失败不影响任务状态，下次有人调 ensureEmbeddings 时会再入队
-        if (task.kind === 'catalog.embed' && succeeded) await fillEmbeddings(task.tenantId).catch(e => console.warn('检索向量补算失败', task.tenantId, e));
-        // 结果层任务因 error 级断言失败（没有登记快照）：告警租户管理员并记审计
-        if ((template || task.kind === 'gold.dsl') && 'error' in outcome!) await alertAssertionFailure(task.tenantId, task, outcome.result);
-        // 到期快照的表已删、旧文件已清理：标记为已过期，分析页不再打开它们
-        if (task.kind === 'gold.expire' && outcome!.result) await markExpired(task.tenantId, task.id);
-        // 到期沙箱表已删、旧文件已清理：标记为已过期，工作台不再列出（沙箱表不进服务库，不重建）
-        if (task.kind === 'sandbox.expire' && outcome!.result) await markSandboxExpired(task.tenantId, task.id);
-        // 有了新快照或快照过期：重建服务库（ADR-0033），服务库只收 RFM 与指标、标签，其他模板的快照不触发；断言失败的任务也带 result，要看有没有 error。生成成功后才切换指针
-        if ((task.kind === 'gold.rfm' || task.kind === 'gold.dsl' || task.kind === 'gold.expire') && succeeded) await enqueueServingBuild(task.tenantId);
-        if (task.kind === 'serving.build' && succeeded) await activateServingStore(task.tenantId, task.id);
+        // 结束后的钩子（登记快照、告警、入队服务库构建等，ADR-0052）在 finishTask 之后按表执行：registerSnapshot 等要回库读到最终状态
+        await runHooks(hooks, task, outcome!);
       })
       .catch(e => console.error(`[调度器] 任务 ${task.id} 结束时出错`, e))
       .finally(() => { running.delete(task.id); wake?.(); });

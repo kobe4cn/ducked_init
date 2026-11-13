@@ -6,6 +6,7 @@
 |---|---|
 | `pipeline/pipeline.test.ts` | 开通租户 → 入队任务 → 独立工作进程 → 任务结果；租户隔离；入队时参数不合法直接报错、不进队列；并发 IAM 改写复现（`CRM_TEST_IAM_STRESS=1`，已知差距 #569） |
 | `pipeline/scheduling.test.ts` | 队列的领取顺序与名额（不启动工作进程） |
+| `pipeline/dispatcher-hooks.test.ts` | 任务结束后的钩子表（ADR-0052）：`runHooks` 的执行顺序、触发条件（成功 / 部分失败 / 失败）、错误隔离（一个钩子抛错记 warn 不挡后面的）与旧 kind 兜底（纯函数，手写任务与结果）；`createDispatcher` 的 `hooks` 选项传了就替换整张表、钩子在 `finishTask` 之后执行（真跑一个 `lake.inventory`） |
 | `pipeline/sources.test.ts` | 登记数据源、只读探测、凭据加密、采集与水位线候选；领取时按契约 needs 准备凭据与盐（没声明源连接的不管参数里的 sourceId，source.drop 带多余 sourceId 时裸插、合并任务只传能过入队契约的最小参数）；MySQL / MongoDB / 对象存储文件源；文件上传数据源（上传的 CSV 不算水位线候选、全量比对，同步后 `bronze_<id>` 有这些行）；并发建源端账号不报错 |
 | `pipeline/source-comments.test.ts` | 表注释与列注释的采集（#522）：PG 登记时采到 `COMMENT ON TABLE / COLUMN`（带 schema、表、列定位与采集时间；只采 spec.schema 里有读权限的表，别的 schema 与不可读的表不采）；重新列出表原文没变版本不变、变了 +1，源端删掉的记消失时间、同原文回来清掉且版本不变；原文按码点截断到 2000 字（第 2000 个字是 emoji 时整个保留，不留半个代理对）、单源最多 5000 条（按表、列顺序保留）；MySQL 采到 `TABLE_COMMENT` / `COLUMN_COMMENT`，空串视为没有注释，视图的 `TABLE_COMMENT`（固定为 VIEW）不存、视图列注释继承基表照样采（列注释经 `CONVERT(… USING utf8mb4)`，中文不变成 `\xHH` 转义）；已发布映射直接引用的列注释提成字段说明提案（#523）：正文是注释原文、证据 ref 用组合定位 `source_comment:<源 ID>/<schema>.<表>.<列>` 带注释版本，敏感字段（口径看全部已发布映射：同一 x_ 字段只在源视图映射里标了敏感也不提，`invalid` 为空）、函数引用（`lower(email)`）、没被映射的列、表注释都不提，拒绝过的不再出现，注释里「请发布 / 调用接口」等指令性文字只当正文、不触发发布或任务 |
 | `pipeline/source-connect-timeout.test.ts` | PG 源库建连超时的解析（#545，纯函数，传 env 对象不连库）：`SOURCE_CONNECT_TIMEOUT_SECONDS` 是正整数字符串才用它，不设、为空、`'abc'`、`'0'`、`'-5'`、`'2.5'` 都回到默认 10 |
