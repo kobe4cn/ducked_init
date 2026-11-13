@@ -221,7 +221,7 @@ export async function initTenantCatalog(tenantId: string, operator: OperatorActo
   } finally {
     session.close();
   }
-  await getDb().update(tenantLakes).set({ catalogInitializedAt: new Date() }).where(eq(tenantLakes.tenantId, tenantId));
+  await getDb().update(tenantLakes).set({ catalogInitializedAt: sql`now()` }).where(eq(tenantLakes.tenantId, tenantId));
 }
 
 /** 给已初始化的数据湖补建名字固定的 schema 与平台表（pnpm lake:ensure）：初始化时还不建这些对象的时候开通的租户靠它补上 */
