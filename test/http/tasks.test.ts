@@ -93,6 +93,34 @@ describe('成员查看本租户的任务', () => {
     expect(sync.html).toMatch(/data-result-table="gone_table"[\s\S]*?>—</);
   });
 
+  it('结果形状相近的不同 kind 任务各自按 kind 显示结果，不再按结果形状猜', async () => {
+    const acme = await newTenant('acme');
+    // 参数过不了入队校验：裸插再直接改状态（任务页只读结果，不读参数）
+    const finish = async (kind: TaskKind, params: Record<string, unknown>, result: Record<string, unknown>) => {
+      const [task] = await getDb().insert(tasks).values({ tenantId: acme, kind, params }).returning();
+      await getDb().update(tasks).set({ status: 'succeeded', result, finishedAt: new Date() }).where(eq(tasks.id, task.id));
+    };
+    const engine = { memoryLimit: '2 GiB', threads: 2 };
+    const keyCheckShape = { tableName: 'shop.customers', keyColumns: ['customer_id'], ok: true, nullRows: 0, duplicates: [] };
+    // serving.build 的结果顶层带 table / rows，形状像快照表结果，任务页只显示运行配额
+    await finish('serving.build', {}, { table: 'gold.metric__791a674d-0000-4000-8000-000000000000', rows: 5, engine });
+    // silver.keycheck 的结果带 tableName / ok 等，形状像业务主键检查，任务页不渲染检查结果
+    await finish('silver.keycheck', {}, { ...keyCheckShape, engine });
+    // source.keycheck 的结果同形，这个 kind 显示主键检查结果
+    await finish('source.keycheck', { sourceId: 'x', tableName: 'shop.customers', keyColumns: ['customer_id'], sensitive: false }, { ...keyCheckShape, engine });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const res = await admin.get('/tasks');
+    expect(res.status).toBe(200);
+    const byKind = Object.fromEntries(taskRows(await res.text()).map(r => [r.kind, r]));
+    expect(byKind['serving.build'].html).toContain('运行配额');
+    expect(byKind['serving.build'].html).not.toContain('data-result-table');
+    expect(byKind['silver.keycheck'].html).toContain('运行配额');
+    expect(byKind['silver.keycheck'].html).not.toContain('data-keycheck-result');
+    expect(byKind['source.keycheck'].html).toMatch(/data-keycheck-result="shop\.customers"/);
+    expect(byKind['source.keycheck'].html).toContain('通过');
+  });
+
   it('RFM 分层任务展示快照表与打通不到消费者的订单，快照过期任务列出删除的表', async () => {
     const acme = await newTenant('acme');
     // gold.expire 的 {} 过不了入队校验：裸插再直接改状态
