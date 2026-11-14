@@ -123,7 +123,8 @@ const COPY_CONCURRENCY = 4;
 /**
  * 执行一次迁移。复制与核对期间数据湖仍指向旧位置；切换之后盘点不一致时切回旧位置。
  * 切换后收回旧前缀并等存储网关开始拒绝旧凭据（网关重载 IAM 配置有毫秒级窗口，#560），等不到只记 warning。
- * 上一个执行者切换后失联时，接手的执行从新位置继续（盘点、收回旧前缀）；迁离对象存储时账号已被删的，收回视为完成。
+ * 上一个执行者切换后失联时，接手的执行从新位置继续（盘点、收回旧前缀）；迁离对象存储时账号已被删的，收回视为完成，
+ * 没法探测网关已拒绝旧凭据就记进 warning。
  * 出错时记为失败并写入审计：数据湖仍指向旧位置，可以重新申请，新位置上已复制的文件下次覆盖；
  * 旧前缀上的账号已删的不能切回去（那里已没有租户能用的账号），数据留在新位置。
  * signal 中止表示迁移已被其他调度器接手（本调度器续期失败），就此放弃、不再写库。
@@ -157,6 +158,12 @@ export async function runLakeMigration(
     // 上一个执行者切换后失联时，接手的调度器从这里继续
     switched = true;
 
+    // 旧前缀上的账号是否已删要在盘点之前判断：接手时上一个执行者已删账号，之后盘点抛错或对不上，也不能把数据湖指回旧前缀、
+    // 再去改那个账号的策略（NoSuchEntity 会被失败处理吞掉，迁移永远停在 running）。首次执行到这里账号还在，算出来是 false
+    const lakeNow = (await lakeRow(m.tenantId))!;
+    fromAccountGone = isS3(m.fromPath) && !lakeNow.s3AccessKey;
+    const goneOnTakeover = fromAccountGone; // 接手时账号就已删；本次执行里删的不算，那种情况凭据还在、等得到网关拒绝
+
     const after = await lakeInventory(m.tenantId, m.limits);
     if (summarize(after) !== summarize(inventoryBefore!)) {
       throw new Error(`迁移后的盘点与迁移前不一致：迁移前 ${summarize(inventoryBefore!)}，迁移后 ${summarize(after)}`);
@@ -164,8 +171,6 @@ export async function runLakeMigration(
     // 收回租户账号对旧前缀的访问：迁往对象存储时策略只留新前缀，迁离对象存储时删掉账号。失败不影响迁移结果，写进审计提醒运营者
     // 迁离对象存储时删账号会连凭据列一起删掉，探测要用的旧凭据得在删之前取出来。
     // 上一个执行者删完账号、还在等网关拒绝旧凭据时失联：接手的执行取不出凭据（列已清空），也不必再收回——账号删了比网关开始拒绝更彻底
-    const lakeNow = (await lakeRow(m.tenantId))!;
-    fromAccountGone = isS3(m.fromPath) && !lakeNow.s3AccessKey;
     const fromCreds = isS3(m.fromPath) && !fromAccountGone ? lakeSpecOf({ ...lakeNow, dataPath: m.fromPath }).s3! : null;
     const dropping = !isS3(m.toPath) && !!fromCreds; // 迁离对象存储：删账号收回
     let revoke: (() => Promise<unknown>) | null;
@@ -183,6 +188,8 @@ export async function runLakeMigration(
       }
     }
     if (!warning && fromCreds) warning = await waitPrefixDenied(m, fromCreds, signal, opts);
+    // 接手时账号就已删、取不出旧凭据：等不到网关拒绝旧凭据（账号删了比网关开始拒绝更彻底，只是没法探测），不能静默记成功，写进 warning 备查
+    if (!warning && goneOnTakeover) warning = `账号已删，但没有等到网关拒绝旧凭据（接手时凭据已清空，无法探测）：旧前缀 ${m.fromPath}`;
     await finish(m, 'succeeded', null, { ...result!, ...(warning && { warning }) });
   } catch (e) {
     if (e instanceof LostClaim) return;

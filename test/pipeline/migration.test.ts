@@ -304,13 +304,54 @@ describe.skipIf(!S3_TARGET)('对象存储上的数据湖迁移到另一个前缀
 
     const migration = await lastMigrationOf(acme);
     expect(migration).toMatchObject({ status: 'succeeded', error: null });
-    expect(migration.result?.warning).toBeUndefined();
+    // 接手时凭据已清空，无法确认网关已开始拒绝旧凭据：不能静默记成功，要写 warning 备查
+    expect(migration.result?.warning).toContain('没有等到网关拒绝旧凭据');
     const lake = (await lakeRow(acme))!;
     expect(lake.dataPath).toBe(toPath);
     expect(lake.dataPath).not.toBe(oldPath); // 不得指回已没有账号的旧 s3 前缀
     expect(lake.s3AccessKey).toBeNull();
     expect(await inventoryOf(acme)).toEqual(before.inventory);
     expect(await timeTravel(acme, version)).toEqual(before.timeTravel);
+  });
+
+  it('删账号后失联，接手时盘点对不上：记 failed，不把数据湖指回旧前缀', async () => {
+    const acme = await newTenant('acme');
+    await seedLake(acme);
+    const oldPath = (await getTenantLake(acme))!.dataPath;
+    await requestLakeMigration(null, acme, LOCAL_TARGET);
+
+    // 第一次执行：注入恒成功的探测（旧前缀一直列得动），迁移就停在等待网关拒绝里
+    const first = (await claimLakeMigration())!;
+    const controller = new AbortController();
+    const stuck = runLakeMigration(first, controller.signal, { probe: async () => [{ path: '.keep', size: 0 }] });
+    // 等它复制、切换、删完账号（数据湖已指向本地、凭据列已清空）再像失联的调度器一样中止
+    const toPath = tenantDataPath(LOCAL_TARGET, acme);
+    const accountDropped = async () => {
+      const lake = (await lakeRow(acme))!;
+      return lake.dataPath === toPath && !lake.s3AccessKey;
+    };
+    for (let i = 0; i < 150 && !(await accountDropped()); i++) await sleep(200);
+    expect(await accountDropped()).toBe(true);
+    controller.abort();
+    await stuck; // LostClaim：不写完成状态，迁移停在 running，数据湖已指向本地
+    expect((await lastMigrationOf(acme)).status).toBe('running');
+
+    // 接手的调度器领取之前把存的盘点改成对不上的（领取时 m.inventory 从行里读，必须改在领取之前）
+    await getDb().update(lakeMigrations).set({ inventory: [{ name: 'no_such_table', rows: 1 }] }).where(eq(lakeMigrations.id, first.id));
+    const takeover = (await claimLakeMigration(0))!;
+    expect(takeover.id).toBe(first.id);
+    await runLakeMigration(takeover);
+
+    // 旧前缀上的账号已删：盘点对不上也不能指回旧前缀、不再改那个账号的策略，只把迁移记为失败，数据湖留在新位置
+    const migration = await lastMigrationOf(acme);
+    expect(migration.status).toBe('failed');
+    expect(migration.error).toContain('盘点与迁移前不一致');
+    const lake = (await lakeRow(acme))!;
+    expect(lake.dataPath).toBe(toPath);
+    expect(lake.dataPath).not.toBe(oldPath);
+    expect(lake.s3AccessKey).toBeNull();
+    // 失败已落库，不会再被失联判定重新领取、永远出不来
+    expect((await claimLakeMigration(0))?.id).not.toBe(first.id);
   });
 });
 
