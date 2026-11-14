@@ -37,13 +37,26 @@ const { values } = parseArgs({
     'max-minutes': { type: 'string', default: '30' }, // 建桶阶段的墙钟上限，超了就停在当前桶数
   },
 });
-const backend = values.backend!;
-const endpoint = values.endpoint!;
-const platform: S3Creds = {
-  endpoint, region: values.region!, key: values['access-key']!, secret: values['secret-key']!, useSsl: false,
-};
+const USAGE = `用法：node --import tsx scripts/bench-bucket-per-tenant.ts --backend seaweedfs|rustfs --endpoint <host:port>
+  --access-key <平台账号> --secret-key <平台密钥> [--buckets <正整数，默认 1000>] [--checkpoints 100,500,1000]
+  [--filer <http://host:port>（seaweedfs 必填）] [--master <host:port>] [--mc <mc 路径>] [--out <json>] [--keep] [--max-minutes 30]`;
+/** 外部输入先校验再用（.sandcastle/CODING_STANDARDS.md）：缺参数或取值不对就打印用法、退出码 2 */
+function usageExit(why: string): never {
+  console.error(`参数错误：${why}\n${USAGE}`);
+  process.exit(2);
+}
+const BACKENDS = ['seaweedfs', 'rustfs'] as const;
+const backendArg = values.backend;
+if (!backendArg || !(BACKENDS as readonly string[]).includes(backendArg)) usageExit(`--backend 必须是 ${BACKENDS.join(' 或 ')}，收到 ${backendArg ?? '（缺）'}`);
+const backend = backendArg as (typeof BACKENDS)[number];
+const { endpoint, 'access-key': accessKey, 'secret-key': secretKey } = values;
+if (!endpoint) usageExit('缺 --endpoint');
+if (!accessKey || !secretKey) usageExit('缺 --access-key 或 --secret-key');
+if (backend === 'seaweedfs' && !values.filer) usageExit('--backend seaweedfs 必须带 --filer（读 /etc/iam/policies.json）');
 const bucketCount = Number(values.buckets);
-const checkpoints = values.checkpoints!.split(',').map(Number).filter(n => n > 0 && n <= bucketCount);
+if (!Number.isInteger(bucketCount) || bucketCount <= 0) usageExit(`--buckets 必须是正整数，收到 ${values.buckets}`);
+const platform: S3Creds = { endpoint, region: values.region, key: accessKey, secret: secretKey, useSsl: false };
+const checkpoints = values.checkpoints.split(',').map(Number).filter(n => n > 0 && n <= bucketCount);
 const maxMs = Number(values['max-minutes']) * 60_000;
 const POLICY_NAME = 'tenant-lake';          // 与产品一致的内联策略名（app/.server/s3-accounts.ts）
 const mcPath = values.mc ?? '/tmp/rustfs/mc';
