@@ -811,6 +811,7 @@ async function build(issue: Issue) {
           "改行为的意见先写或改测试（跑红再跑绿）。只跑改到的测试文件（`npx vitest run <file>`）和 `npm run typecheck`，不要跑完整测试。",
           `每条意见处理完提交一次，按仓库风格写中文提交信息、末尾 (#${issue.id})。`,
           "某条意见你判断不该改（与票冲突、要人拍板），不要改，在输出里写明哪条、为什么。",
+          `除了本票（issue #${issue.id}）和本次会话里自己新开的 issue，不要改其他 issue 的标签或正文（评论除外）；本次会话之前开出的票（包括本票早先会话开的）也不能改。`,
           "最后输出 <promise>COMPLETE</promise>。",
         ].join("\n"),
       }));
@@ -833,6 +834,7 @@ async function build(issue: Issue) {
           "```", gateResult.stdout.slice(-4000), "```",
           "只修这些失败：用 `npx vitest run <file>` 跑失败的文件确认变绿，按仓库风格写中文提交信息、末尾 (#" + issue.id + ")。",
           "如果失败与本票改动无关（偶发、环境问题）或不能确定怎么修，不要改代码，在输出里说明原因。",
+          `除了本票（issue #${issue.id}）和本次会话里自己新开的 issue，不要改其他 issue 的标签或正文（评论除外）；本次会话之前开出的票（包括本票早先会话开的）也不能改。`,
           "最后输出 <promise>COMPLETE</promise>。",
         ].join("\n"),
       }));

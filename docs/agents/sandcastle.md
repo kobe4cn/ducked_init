@@ -36,6 +36,7 @@ reviewer 的结论有三种：`merge`、`revise`、`pr`（规则在 `.sandcastle
 - `revise`：有要改行为、但正确做法明确的问题，比如漏了验收标准或测试、测试缺断言、重复已有 helper、术语不对。reviewer 在 `<revise>` 里逐条写位置、改法和验证方式。脚本把这些意见交给一个新的 implementer 会话，改完后再审一次。最多打回 `REVISE_MAX = 2` 次。
 - 两次之后仍是 `revise`，就留 PR 给人审。PR 正文的 Review 一节会附上每次的意见。
 - 要人判断的问题会决定怎么改时，reviewer 直接给 `pr`，不打回。
+- review 只验本票：验收标准涉及别的 issue 时（开新票、给别的票加评论或标签），只核对本票确实做过这件事，不拿那张票当前的标签和状态去比对指引——对不上视为人后来改过。review / revise / fix / implement 会话不改本票和本次会话里自己新开的 issue 以外任何 issue 的标签或正文（评论除外）；本次会话之前开出的票也不能改。
 
 ## 什么时候自动合并
 
