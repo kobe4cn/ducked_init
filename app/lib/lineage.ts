@@ -1,6 +1,6 @@
 // app/lib/lineage.ts —— 数据地图的血缘：由已发布映射推出表级（数据源 → 源表或源视图 → 映射及版本 → 标准层表）、
 // 字段级（标准层字段在各映射里对应的源列与表达式）与标准实体之间的关系边（含映射里声明的跨源引用，ADR-0030）。只看表达式与列名，不读数据值，不落库（ADR-0019）
-import type { MergeMappingParam } from '~/.server/pipeline/merge-engine';
+import type { PublishedPlan } from '~/.server/pipeline/mapping-spec';
 import { CANONICAL_ENTITIES, entityOf, EXTENSION_PATTERN, isCustomEntity } from './canonical-model';
 import { cmp } from './compare';
 import { customerSourceColumn } from './customer-source';
@@ -79,7 +79,7 @@ function edges(): LineageEdge[] {
  * 计划里声明了 customer_source 的列各出一条指向 customer 的边，经 _identities 按（引用列旁的数据源列, 引用列）关联；
  * 同一实体字段指向同一数据源的只留一条（ADR-0030）
  */
-function crossSourceEdges(plans: MergeMappingParam[], sources: Map<string, { name: string }>): LineageEdge[] {
+function crossSourceEdges(plans: PublishedPlan[], sources: Map<string, { name: string }>): LineageEdge[] {
   const out = new Map<string, LineageEdge>();
   for (const p of plans) {
     for (const c of p.columns) {
@@ -95,7 +95,7 @@ function crossSourceEdges(plans: MergeMappingParam[], sources: Map<string, { nam
 }
 
 /** 由已发布映射（publishedPlans 的结果）与数据源推出血缘；结果按实体、字段、映射排序 */
-export function deriveLineage(input: { plans: MergeMappingParam[]; sources: { id: string; name: string; kind: string }[] }): Lineage {
+export function deriveLineage(input: { plans: PublishedPlan[]; sources: { id: string; name: string; kind: string }[] }): Lineage {
   const sources = new Map(input.sources.map(s => [s.id, s]));
   const tables: TableLineage[] = input.plans.map(p => {
     const s = sources.get(p.sourceId);

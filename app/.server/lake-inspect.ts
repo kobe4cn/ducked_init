@@ -8,9 +8,9 @@ import { getDb } from './db/client';
 import { tasks, tenants, type TaskStatus } from './db/schema';
 import { publishedPlans } from './mappings';
 import type { InspectParams } from './pipeline/inspect-engine';
-import { sourceColumnsForPlan, sensitiveColumns, SILVER_SYSTEM_COLUMNS, type MergeMappingParam } from './pipeline/merge-engine';
+import { sourceColumnsForPlan, sensitiveColumns, SILVER_SYSTEM_COLUMNS } from './pipeline/merge-engine';
 import { readResult } from './pipeline/task-contracts';
-import { sqlType } from './pipeline/mapping-spec';
+import { sqlType, type PublishedPlan } from './pipeline/mapping-spec';
 import { insertTask } from './tasks';
 
 export class InspectError extends Error {}
@@ -19,7 +19,7 @@ export class InspectError extends Error {}
  * 标准层各表应有的结构（与 merge-engine.ts 的 ensureSilverTable 建表一致）：按实体汇总各映射的列（并集），敏感字段存哈希、一律 VARCHAR，
  * 再加上系统列与跨源引用的数据源列（ADR-0030）。同名列在不同映射里类型不同时取第一个映射的
  */
-export function expectedTables(plans: MergeMappingParam[]): InspectParams['expected'] {
+export function expectedTables(plans: PublishedPlan[]): InspectParams['expected'] {
   const expected: InspectParams['expected'] = {};
   for (const plan of plans) {
     const pii = sensitiveColumns(plan);
