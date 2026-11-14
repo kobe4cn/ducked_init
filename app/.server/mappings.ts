@@ -41,7 +41,7 @@ import { mappingDrift } from './source-drift';
 import { confirmedTables } from './sources';
 import { insertTask, updateQueuedParams } from './tasks';
 import { lockTenant } from './tenant-lock';
-import { CANONICAL_ENTITIES, type CustomEntityField, entityLabel, entityOf, type EntityRelation, type RelationStat, relationText } from '../lib/canonical-model';
+import { CANONICAL_ENTITIES, entityLabel, entityOf, type EntityRelation, type RelationStat, relationText } from '../lib/canonical-model';
 import { cmp, cmpName } from '../lib/compare';
 import { entityForTable } from '../lib/field-synonyms';
 import { diffPlans } from '../lib/mapping-diff';
