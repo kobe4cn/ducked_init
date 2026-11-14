@@ -5,7 +5,7 @@ set -euo pipefail
 
 CONTAINER_NAME="seaweedfs"
 VOLUME_NAME="seaweedfs-data"
-IMAGE="docker.io/chrislusf/seaweedfs:latest"
+IMAGE="docker.io/chrislusf/seaweedfs:4.50"
 
 # 平台账号经 AWS_* 注入，租户账号由平台经 IAM API 创建、保存在 filer 中（ADR-0008）
 # SeaweedFS 资源
@@ -41,6 +41,7 @@ container run -d \
     -e AWS_ACCESS_KEY_ID=crm \
     -e AWS_SECRET_ACCESS_KEY=crm-secret \
     -v "$VOLUME_NAME:/data" \
+    -v "$(cd "$(dirname "$0")" && pwd)/seaweedfs:/etc/seaweedfs:ro" \
     "$IMAGE" \
     server \
         -dir=/data \
@@ -49,7 +50,7 @@ container run -d \
         -s3.port=8333 \
         -s3.iam.readOnly=false \
         -master.volumeSizeLimitMB=1024 \
-        -volume.max=0 || {
+        -volume.max=2000 || {
     echo "ERROR: Failed to start SeaweedFS."
     exit 1
 }

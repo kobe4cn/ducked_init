@@ -10,12 +10,13 @@ services:
   # ---------------- SeaweedFS（Apache-2.0，推荐）----------------
   # 账号由 SeaweedFS 自己保存在 filer 中（不用静态 -s3.config 文件），平台账号经 AWS_* 注入；
   # 开启 IAM API 写入，平台开通租户时用它建每个租户只能访问自己前缀的账号（ADR-0008）
+  # 卷配置三处一致：compose / CI / start.sh（每桶首写 1 卷、-volume.max=2000），见 #687
   seaweedfs:
     image: chrislusf/seaweedfs:4.50
     command: >
       server -dir=/data -ip.bind=0.0.0.0
       -s3 -s3.port=8333 -s3.iam.readOnly=false
-      -master.volumeSizeLimitMB=1024 -volume.max=0
+      -master.volumeSizeLimitMB=1024 -volume.max=2000
     environment:
       AWS_ACCESS_KEY_ID: crm
       AWS_SECRET_ACCESS_KEY: crm-secret
@@ -25,6 +26,7 @@ services:
       - "8888:8888"   # filer 浏览页
     volumes:
       - seaweedfs-data:/data
+      - ./seaweedfs:/etc/seaweedfs:ro   # master.toml：每桶首写 1 卷（#687）
     restart: unless-stopped
 
   # 创建存储桶 crm-lake（执行一次后退出）

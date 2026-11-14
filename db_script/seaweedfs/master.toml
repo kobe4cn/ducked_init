@@ -1,0 +1,6 @@
+# weed server 启动时从当前目录或 /etc/seaweedfs 读本文件（#687）。
+# 每个新 collection（桶）首写只预分配 1 个卷（默认 7），卷大小不变（1024 MB），
+# 让约 1000 个写过的桶不撞卷数上限；实测见 docs/test-plans/bucket-per-tenant-scale.md。
+# 三处挂载保持一致：db_script/docker-compose.yml / .github/workflows/ci.yml / db_script/start.sh。
+[master.volume_growth]
+copy_1 = 1
