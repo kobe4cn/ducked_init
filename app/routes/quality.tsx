@@ -9,7 +9,7 @@ import { can, requirePermission } from '~/.server/access';
 import type { Tx } from '~/.server/audit';
 import { getDb } from '~/.server/db/client';
 import { excludeValue, includeValue, listExcludedValues } from '~/.server/identity-exclusions';
-import { enqueueMerge, latestIdentitySummary } from '~/.server/mappings';
+import { enqueueMerge, latestIdentitySummary } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
 import { HOT_VALUE_THRESHOLD } from '~/.server/pipeline/identity-engine';
 import { ASSERTION_LABELS, describeCustom, SAMPLE_LIMIT, type AssertionLevel } from '~/.server/pipeline/assertions';

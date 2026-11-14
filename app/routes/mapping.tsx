@@ -13,8 +13,9 @@ import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
+import { latestIdentitySummary, mergeMapping } from '~/.server/merges';
 import {
-  confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, GenerationMismatchError, getMapping, ignoreColumn, latestIdentitySummary, MappingError, mergeMapping, modelAssertionsForMapping, modelDraftForMapping, publishMapping, referenceTables,
+  confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, GenerationMismatchError, getMapping, ignoreColumn, MappingError, modelAssertionsForMapping, modelDraftForMapping, publishMapping, referenceTables,
   type ModelDraftResult, requestDisable, restoreMapping, saveMappingDraft, validateMappingDraft, yamlWithColumns,
 } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';

@@ -16,7 +16,7 @@ import {
   unpublishedMappingsOf,
 } from '~/.server/custom-entities';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
-import { entityRelationStats } from '~/.server/mappings';
+import { entityRelationStats } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
 import { passthroughPair, publishPassthrough } from '~/.server/passthrough';
 import { PublishError, publishBlocker, publishReason } from '~/.server/publishing';
