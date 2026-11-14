@@ -22,7 +22,7 @@
 
 **只读凭据（#237）。** 真正挡住写入的是凭据，而不是白名单与 READ_ONLY 挂载。每个租户另有一对只读凭据，存在 `tenant_lakes` 的 `ro_db_role` / `ro_db_password` / `ro_s3_access_key` / `ro_s3_secret_key`，工作台只用它们挂载（`lake.ts` 的 `readOnlyLakeSpecOf`），即使白名单被绕过，写入也会被 PG 或存储服务拒绝：
 - 只读数据库角色 `lake_<租户 ID>_ro`：能登录，不是超级用户，不属于任何角色（也就不继承租户角色）；对 catalog schema 只有 USAGE，对其中的表只有 SELECT。DuckLake 只读挂载要读全部 `ducklake_*` 元数据表（含加密密钥，ADR-0020），所以 SELECT 授给整个 schema。元数据表归租户角色所有、由 DuckLake 随时新建，所以以租户角色的身份（`asTenantRole`，同 ADR-0008 切换 `data_path` 的做法）`GRANT SELECT ON ALL TABLES` 并 `ALTER DEFAULT PRIVILEGES … GRANT SELECT ON TABLES`，之后建的表也自动可读。不要求平台账号是超级用户。
-- 只读对象存储账号 `lake-<租户 ID>-ro`：策略只有本租户前缀下的 `s3:GetObject` 与以该前缀 `s3:ListBucket`（`s3-accounts.ts` 的 `issueTenantReadOnlyS3Account`）。迁移存储改前缀时 `setTenantS3Prefixes` 两个账号一起改；`deleteTenantS3Account` / `dropTenantS3Account`（迁离对象存储、收回账号）两个账号一起删、密钥一起清。
+- 只读对象存储账号 `lake-<租户 ID>-ro`：策略只有本租户桶的 `s3:GetObject` 与 `s3:ListBucket`（每租户一桶、不带前缀 Condition，ADR-0008；`s3-accounts.ts` 的 `issueTenantReadOnlyS3Account`）。迁移存储换存储位置时 `setTenantS3Prefixes` 两个账号一起改；`deleteTenantS3Account` / `dropTenantS3Account`（迁离对象存储、收回账号）两个账号一起删、密钥一起清。
 - 开通时只读角色随租户角色在同一事务里建好（`CREATE ROLE … LOGIN`，不写 `NOSUPERUSER`：默认就不是，而 PG 16 起写了这个属性的 `ALTER ROLE` 只有超级用户能执行）；`initTenantCatalog` 再调 `ensureReadOnlyLakeAccess` 补齐对象存储账号与表权限。本功能上线前开通的租户在第一次执行工作台查询时由 `runQuery` 在拿到并发锁之后、挂载之前调 `ensureReadOnlyLakeAccess` 补建（补建失败同样记 `workbench.query` 审计）：缺什么建什么，锁住数据湖行，可重复执行；角色已存在而凭据没记下时只重设密码。重置数据湖（`lake:reset`）重建 catalog schema 时重新授予只读角色。
 - 沙箱写入（存成沙箱表，见下一节）仍走可写凭据：写入的 SQL 由平台拼出，成员只提供通过白名单的 SELECT。
 

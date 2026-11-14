@@ -80,7 +80,7 @@ pnpm dev                                          # 打开 /login，用管理员
 
 #### 数据湖与任务
 
-- 开通租户时自动建好数据湖（ADR-0001、0002、0008）：存储前缀 `<PLATFORM_LAKE_URI>/tenants/<租户 ID>/`，平台 PG 中独占的 catalog schema 与数据库角色 `lake_<租户 ID>`（平台 PG 需要 15 及以上版本，平台账号需要 CREATEROLE 权限）。本功能上线前开通的租户没有数据湖，由运营者在租户页点“初始化数据湖”补建。
+- 开通租户时自动建好数据湖（ADR-0001、0002、0008）：存储位置在对象存储上是独占桶 `s3://lake-<租户 ID>/`，本地目录是 `<PLATFORM_LAKE_URI>/tenants/<租户 ID>/`，平台 PG 中独占的 catalog schema 与数据库角色 `lake_<租户 ID>`（平台 PG 需要 15 及以上版本，平台账号需要 CREATEROLE 权限）。本功能上线前开通的租户没有数据湖，由运营者在租户页点“初始化数据湖”补建。
 - 数据湖根在对象存储上时，开通租户还会经存储服务的 IAM API（SeaweedFS 内置在 S3 端口上）建好租户账号 `lake-<租户 ID>`，绑定只允许读写、删除、列出本租户前缀的策略；工作进程只拿到这个账号的密钥，拿不到 `S3_*` 平台账号。建账号失败时租户照常开通、不派发任务，运营者在租户页点“初始化数据湖”重试；早于此功能开通、还没有账号的租户同样由此补建，补建记入审计日志。本地目录模式不建账号。
 - SeaweedFS 部署要求：账号由 SeaweedFS 自己保存在 filer 中（**不能**用静态 `-s3.config` 文件，否则 IAM API 无法写入），开启 `-s3.iam.readOnly=false`，平台账号经 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` 注入（见 `db_script/docker-compose.yml`，与 `.env` 里的 `S3_ACCESS_KEY` / `S3_SECRET_KEY` 一致）。原先用 `-s3.config` 启动的实例改为上述方式重启即可，存储桶与数据不受影响。
 - 任务队列在平台 PG（`platform.tasks`）。`pnpm dispatcher` 领取任务，每个任务启动一个独立的工作进程：只拿到本租户角色的凭据，挂载后锁定 DuckDB 配置（只能访问本租户前缀、不能再挂载其他库），内存与线程按租户配额限制。
