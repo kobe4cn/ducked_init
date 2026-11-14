@@ -15,7 +15,7 @@
 
 **生成。** 任务种类 `serving.build`（#201），参数 `{ version, target, snapshots: [{ id, template, table, ... }] }`：工作进程不连平台库（ADR-0001），读哪些快照只能由调用方查好放进参数。工作进程只读挂载数据湖，在锁定配置之前另挂一个本机库 `serving`（会话临时目录里，`openTenantLake` 的 `servingKey`，任务种类上的标志是 `servingFile`），`CREATE TABLE … AS SELECT … ORDER BY consumer_id` 写完、`CHECKPOINT` 并 `DETACH` 后用 Node 上传：对象存储用本租户的账号 `putObject`，本地湖复制到旁边再改名。`target` 必须正好是 `<dataPath>_serving/v<version>.duckdb`；表名不合规（`gold.<种类>__<任务 ID>`，种类与模板 `rfm` / `metric:<键>` / `tag:<键>` 一致，同一模板只能有一个）或表不在时任务失败、不上传。结果是 `{ version, path, rows }`，`rows` 是各表行数（含 `consumer_sources`）。
 
-**存放。** 正本在租户存储前缀内的 `<dataPath>_serving/v<版本>.duckdb`（`dataPath` 以 `/` 结尾，即 `tenants/<租户 ID>/_serving/`；租户的对象存储账号只对这个前缀有权限，ADR-0008），本地湖时同样在本地路径。不放在任何节点的本机磁盘：API 节点可以随时增减。对象存储上保留最近 2 版（#202）。`_serving/` 不是 DuckLake 登记的文件，`ducklake_cleanup_old_files` 不会碰它；迁移数据湖时不复制、不计入文件数（指针记的是旧前缀的完整路径，迁移后重建），重置数据湖时一并删掉，都可以重建。
+**存放。** 正本在租户存储前缀内的 `<dataPath>_serving/v<版本>.duckdb`（`dataPath` 以 `/` 结尾，对象存储上即 `s3://lake-<租户 ID>/_serving/`；租户的对象存储账号只对本租户桶有权限，ADR-0008），本地湖时同样在本地路径。不放在任何节点的本机磁盘：API 节点可以随时增减。对象存储上保留最近 2 版（#202）。`_serving/` 不是 DuckLake 登记的文件，`ducklake_cleanup_old_files` 不会碰它；迁移数据湖时不复制、不计入文件数（指针记的是旧前缀的完整路径，迁移后重建），重置数据湖时一并删掉，都可以重建。
 
 **指针（#202）。** 平台库新表 `serving_stores(tenant_id pk, version int, path, snapshots jsonb, built_at)`，`snapshots` 是 `[{ id, template, definitionVersion, createdAt, incomplete }]`。文件上传完成、任务成功后才更新这一行，切换是原子的：上传到一半的文件没有指针指向它。
 

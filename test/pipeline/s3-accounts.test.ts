@@ -2,9 +2,10 @@
 // 删除接缝：IAM 建号 → deleteTenantS3Account → 账号与内联策略都不留（#621）
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
-import { initTenantCatalog, lakeRow } from '../../app/.server/lake';
+import { initTenantCatalog, lakeRow, tenantBucketRoot } from '../../app/.server/lake';
 import {
-  deleteTenantS3Account, issueTenantReadOnlyS3Account, issueTenantS3Account, platformS3, s3ReadOnlyUserOf, s3UserOf,
+  deleteTenantS3Account, issueTenantReadOnlyS3Account, issueTenantS3Account, platformS3, s3ReadOnlyUserOf,
+  setTenantS3Prefixes, s3UserOf,
 } from '../../app/.server/s3-accounts';
 import { signedFetch, xmlTag, xmlTags } from '../../app/.server/s3-client';
 import { resetDb } from '../http/harness';
@@ -34,8 +35,6 @@ async function inlinePolicyUsers(): Promise<string[] | null> {
   }
 }
 
-const lakePathOf = (tenantId: string) => `${process.env.TEST_S3_LAKE_URI}/tenants/${tenantId}`;
-
 /** GetUserPolicy 拿回的策略文档：还原 XML 转义（含 &#34; 这类数字实体），URL 编码过时再解码 */
 async function policyDocOf(UserName: string) {
   const { xml } = await iam('GetUserPolicy', { UserName, PolicyName: 'tenant-lake' });
@@ -50,8 +49,8 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI || !process.env.S3_ACCESS_KEY)('�
   it('删掉租户的读写与只读账号后，GetUserPolicy 返回 NoSuchEntity，filer 的 policies.json 里也没有这两个用户', async () => {
     const tenantId = crypto.randomUUID();
     const users = [s3UserOf(tenantId), s3ReadOnlyUserOf(tenantId)];
-    await issueTenantS3Account(tenantId, lakePathOf(tenantId));
-    await issueTenantReadOnlyS3Account(tenantId, lakePathOf(tenantId));
+    await issueTenantS3Account(tenantId, tenantBucketRoot(tenantId));
+    await issueTenantReadOnlyS3Account(tenantId, tenantBucketRoot(tenantId));
     // 账号还在时策略要真的挂上（CI 的 4.50 上它会写进 policies.json 的 inlinePolicies，删号后才谈得上不留残留）
     for (const UserName of users) {
       expect((await iam('GetUserPolicy', { UserName, PolicyName: 'tenant-lake' })).ok).toBe(true);
@@ -74,7 +73,7 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI || !process.env.S3_ACCESS_KEY)('�
   it('账号被别的路径删掉一半（密钥没了、策略没删）时，再删一次不报错，账号与策略查询都是 NoSuchEntity', async () => {
     const tenantId = crypto.randomUUID();
     const UserName = s3UserOf(tenantId);
-    const { accessKey } = await issueTenantS3Account(tenantId, lakePathOf(tenantId));
+    const { accessKey } = await issueTenantS3Account(tenantId, tenantBucketRoot(tenantId));
     // 模拟中断或别处删除：密钥与账号先删、策略留下。4.47 上账号真被删掉（策略不落盘），
     // 走「账号不在」分支；4.50 上策略还在会让 DeleteUser 报 DeleteConflict、账号仍在，走正常删除分支
     await iam('DeleteAccessKey', { UserName, AccessKeyId: accessKey });
@@ -120,5 +119,13 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI || !process.env.S3_ACCESS_KEY)('�
 
     // 桶已存在时再初始化（重试补建账号的路径）也算成功
     await expect(initTenantCatalog(acme, null)).resolves.toBeUndefined();
+  });
+
+  it('共享桶前缀已退场（#691）：对它签发 / 重写策略都在 IAM 调用之前报错，不留账号', async () => {
+    const id = crypto.randomUUID();
+    const sharedPrefix = `${process.env.TEST_S3_LAKE_URI}/tenants/${id}/`;
+    await expect(issueTenantS3Account(id, sharedPrefix)).rejects.toThrow('共享桶前缀已退场');
+    await expect(setTenantS3Prefixes(id, [sharedPrefix])).rejects.toThrow('共享桶前缀已退场');
+    expect(xmlTags((await iam('ListUsers', {})).xml, 'UserName')).not.toContain(s3UserOf(id));
   });
 });

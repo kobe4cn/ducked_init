@@ -1,4 +1,4 @@
-// app/.server/lake-migration.ts —— 租户数据湖迁移存储（本地目录 ⇄ 对象存储、共享前缀 → 独占桶）。
+// app/.server/lake-migration.ts —— 租户数据湖迁移存储（本地目录 ⇄ 对象存储独占桶）。
 // 运营者用 pnpm lake:migrate 申请，调度器执行：等该租户运行中的任务结束 → 复制存储前缀下的全部文件 → 核对清单与大小 →
 // 一个事务里切换 catalog（ducklake_metadata）与 tenant_lakes 的 data_path → 盘点比对。迁移中不派发该租户的任务。
 // 迁移目标（lakeTargetOf）：对象存储上是本租户独占的桶 s3://lake-<租户 ID>/（--to 的 s3 根只用来选「对象存储」，
@@ -25,25 +25,33 @@ type LakeMigrationRow = typeof lakeMigrations.$inferSelect;
 
 export const ACTIVE_MIGRATION = ['pending', 'running'] as const;
 
+/** 数据湖还在 #688 之前的共享桶前缀上（在对象存储上、但不是本租户的桶根）：已随 #691 退场，签发策略与申请迁移都拒绝 */
+const onSharedPrefix = (dataPath: string) => isS3(dataPath) && !isTenantBucketRoot(dataPath);
+
 /**
  * 申请把租户的数据湖迁到 root 下：root 在对象存储上（任意 s3 根）时目标是本租户独占的桶 s3://lake-<租户 ID>/
- * （桶名与前缀被忽略，只用来选「对象存储」），本地目录时仍是 <根>/tenants/<租户 ID>/。数据湖须已初始化；已在目标
- * 位置时拒绝，正在迁往同一位置时返回进行中的那次迁移（created 为 false），正在迁往别处时拒绝。
+ * （桶名与前缀被忽略，只用来选「对象存储」），本地目录时仍是 <根>/tenants/<租户 ID>/。数据湖须已初始化；数据湖还在
+ * 共享桶前缀上时拒绝（ADR-0008 已退场，先用 #689 所在版本迁入独占的桶）；已在目标位置时拒绝，正在迁往同一位置时
+ * 返回进行中的那次迁移（created 为 false），正在迁往别处时拒绝。
  * 目标是独占桶时在事务之前建好桶（runLakeMigration 切换前写占位对象依赖桶已存在，租户账号又没有建桶权限）：
- * 不在持行锁的事务里发网络请求，建桶前的预检查（已初始化且不在目标位置）是为了不给会被拒的申请留空桶。
+ * 不在持行锁的事务里发网络请求，建桶前的预检查（已初始化、不在目标位置且会被受理）是为了不给会被拒的申请留空桶。
  * 申请即标记「迁移中」，记入租户的审计日志
  */
 export async function requestLakeMigration(operator: OperatorActor, tenantId: string, root: string) {
   const toPath = lakeTargetOf(root, tenantId);
   if (isTenantBucketRoot(toPath)) {
     const lake = await lakeRow(tenantId);
-    if (lake && lakeReady(lake) && lake.dataPath !== toPath) await createBucket(platformS3(), toPath);
+    // 预检查跳过会被事务拒绝的申请（共享桶前缀上的租户），不给它留空桶
+    if (lake && lakeReady(lake) && lake.dataPath !== toPath && !onSharedPrefix(lake.dataPath)) {
+      await createBucket(platformS3(), toPath);
+    }
   }
   return getDb().transaction(async tx => {
     // 锁住数据湖行：与同一租户的并发申请、切换互斥
     const [lake] = await tx.select().from(tenantLakes).where(eq(tenantLakes.tenantId, tenantId)).for('update');
     if (!lake) throw new TenantError('租户还没有数据湖');
     if (!lakeReady(lake)) throw new TenantError('数据湖未初始化，请先在运营后台初始化数据湖');
+    if (onSharedPrefix(lake.dataPath)) throw new TenantError('数据湖还在共享桶前缀上（ADR-0008 已退场），请先用 #689 所在版本迁入独占的桶');
     const [active] = await tx.select().from(lakeMigrations)
       .where(and(eq(lakeMigrations.tenantId, tenantId), inArray(lakeMigrations.status, ACTIVE_MIGRATION)));
     if (active?.toPath === toPath) return { migration: active, created: false };

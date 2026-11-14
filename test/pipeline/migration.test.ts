@@ -8,8 +8,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { desc, eq } from 'drizzle-orm';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { lakeMigrations, members, spaces, tenantLakes, tenants } from '../../app/.server/db/schema';
-import { lakeRow, lakeSpecOf, getTenantLake, lakeTargetOf, provisionTenantLake, tenantBucketRoot, tenantDataPath } from '../../app/.server/lake';
+import { lakeMigrations, tenantLakes } from '../../app/.server/db/schema';
+import { lakeRow, lakeSpecOf, getTenantLake, lakeTargetOf, tenantDataPath } from '../../app/.server/lake';
 import { claimLakeMigration, requestLakeMigration, requestLakeMigrations, runLakeMigration } from '../../app/.server/lake-migration';
 import { listLakeFiles } from '../../app/.server/lake-storage';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -17,7 +17,7 @@ import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { setTenantS3Prefixes } from '../../app/.server/s3-accounts';
 import { listObjects, type S3Creds } from '../../app/.server/s3-client';
 import { claimNextTask, enqueueTask, finishTask, getTask } from '../../app/.server/tasks';
-import { initTenantLake } from '../../app/.server/tenants';
+import { TenantError } from '../../app/.server/tenants';
 import { resetDb, runCli } from '../http/harness';
 import { WORKER_SUFFIX } from '../setup-env';
 import { newTenant, runTask } from './fixtures';
@@ -169,74 +169,17 @@ for (const { storage, target } of [
   });
 }
 
-/**
- * 造「#688 之前在共享桶前缀上」的老租户（ADR-0008）：一个事务里照 createTenant 插租户、默认空间、管理员并
- * provisionTenantLake，再把 data_path 改回共享桶前缀 <TEST_S3_LAKE_URI>/tenants/<ID>/；事务外 initTenantLake
- * 初始化——data_path 不是桶根，不建桶，发的是前缀策略的账号。迁入独占桶的用例从这里出发
- */
-async function newSharedPrefixTenant(slug: string) {
-  const { tenant } = await getDb().transaction(async tx => {
-    const [tenant] = await tx.insert(tenants).values({ slug, name: slug }).returning();
-    await tx.insert(spaces).values({ tenantId: tenant.id, name: '默认空间', isDefault: true });
-    await tx.insert(members).values({ tenantId: tenant.id, email: `admin@${slug}.com`, role: 'admin' });
-    await provisionTenantLake(tx, tenant.id);
-    await tx.update(tenantLakes).set({ dataPath: tenantDataPath(process.env.TEST_S3_LAKE_URI!, tenant.id) })
-      .where(eq(tenantLakes.tenantId, tenant.id));
-    return { tenant };
-  });
-  await initTenantLake(null, tenant.id);
-  return tenant.id;
-}
-
-// 对象存储上的迁移目标是各租户独占的桶（--to 的 s3 根只选「对象存储」）：共享桶前缀上的老租户由此迁过去
-describe.skipIf(!S3_TARGET)('共享桶前缀上的数据湖迁移到独占桶', () => {
+// 对象存储独占桶上的数据湖（每租户一桶，ADR-0008；PLATFORM_LAKE_URI 指到 s3 根，newTenant 直接开在桶根）
+describe.skipIf(!S3_TARGET)('对象存储独占桶上的数据湖迁移', () => {
   const defaultLakeUri = process.env.PLATFORM_LAKE_URI;
   beforeAll(() => { process.env.PLATFORM_LAKE_URI = process.env.TEST_S3_LAKE_URI; });
   afterAll(() => { process.env.PLATFORM_LAKE_URI = defaultLakeUri; });
 
-  it('从共享桶前缀迁到独占桶：数据完整，迁移前已建桶，旧前缀被拒', async () => {
-    const acme = await newSharedPrefixTenant('acme');
-    const version = await seedLake(acme);
-    const oldPath = (await getTenantLake(acme))!.dataPath;
-    expect(oldPath).toBe(tenantDataPath(process.env.TEST_S3_LAKE_URI!, acme));
-    const before = { inventory: await inventoryOf(acme), timeTravel: await timeTravel(acme, version) };
-
-    await requestLakeMigration(null, acme, S3_TARGET!);
-    // 申请时就建好目标桶（runLakeMigration 切换前写占位对象依赖桶已存在）：调度器还没跑，桶已存在且为空
-    expect(await listLakeFiles(tenantBucketRoot(acme))).toEqual([]);
-    await runDispatcher();
-    const lake = (await lakeRow(acme))!;
-    expect(lake.dataPath).toBe(tenantBucketRoot(acme));
-    expect(await inventoryOf(acme)).toEqual(before.inventory);
-    expect(await timeTravel(acme, version)).toEqual(before.timeTravel);
-
-    // 收回旧前缀失败会写成迁移结果 result 里的 warning（不影响迁移状态）：先排除它，剩下的失败才是策略生效延迟
-    expect((await lastMigrationOf(acme)).result?.warning).toBeUndefined();
-
-    // 不经 DuckDB 的限制，直接用租户账号访问存储服务：新桶可列出（占位对象在内），旧前缀等网关拒绝后被拒
-    const creds = lakeSpecOf(lake).s3!;
-    expect((await listObjects(creds, lake.dataPath)).some(f => f.path === '.keep')).toBe(true);
-    await untilPrefixDenied(creds, oldPath);
-    await expect(listObjects(creds, oldPath)).rejects.toThrow(/AccessDenied|HTTP 403/);
-  });
-
-  it('--all --to 对象存储根：已是独占桶的租户跳过，共享前缀的租户申请迁到独占桶', async () => {
-    const bucketTenant = await newTenant('co-bucket'); // #688 后开通：直接在独占桶上
-    const sharedTenant = await newSharedPrefixTenant('co-shared');
-    const { requested, skipped } = await requestLakeMigrations(null, S3_TARGET!);
-    expect(requested.map(r => [r.tenantId, r.toPath])).toEqual([[sharedTenant, tenantBucketRoot(sharedTenant)]]);
-    expect(skipped).toEqual([]);
-    await runDispatcher();
-    expect((await getTenantLake(sharedTenant))!.dataPath).toBe(tenantBucketRoot(sharedTenant));
-    // 已在独占桶上的租户不动
-    expect((await getTenantLake(bucketTenant))!.dataPath).toBe(tenantBucketRoot(bucketTenant));
-  });
-
   it('旧前缀迟迟收不回时迁移仍然成功并记 warning', async () => {
-    const acme = await newSharedPrefixTenant('acme');
+    const acme = await newTenant('acme');
     await seedLake(acme);
-    const oldPath = (await getTenantLake(acme))!.dataPath;
-    await requestLakeMigration(null, acme, S3_TARGET!);
+    const oldPath = (await getTenantLake(acme))!.dataPath; // 开通在独占桶上
+    await requestLakeMigration(null, acme, LOCAL_TARGET);
     // 不经调度器直接执行：注入恒成功的探测（代表网关一直没加载收窄后的新策略），60 s 超时缩成 500 ms
     await runLakeMigration((await claimLakeMigration())!, undefined, {
       revokeTimeoutMs: 500,
@@ -247,10 +190,10 @@ describe.skipIf(!S3_TARGET)('共享桶前缀上的数据湖迁移到独占桶', 
     expect(migration.result?.warning).toContain(oldPath);
   });
 
-  it('并发迁移后租户账号被拒绝访问旧前缀', async () => {
-    // 完整测试时多个 worker 同时改共享的 IAM 配置（#541）：6 个租户同时迁移，另外 2 个无关租户的策略在迁移期间被反复重写加压
+  it('并发迁移后租户账号被拒绝访问旧前缀（迁回本地目录、删账号收回）', async () => {
+    // 完整测试时多个 worker 同时改共享的 IAM 配置（#541）：6 个租户同时迁回本地目录，另外 2 个无关租户的策略在迁移期间被反复重写加压
     const ids: string[] = [];
-    for (const slug of ['co1', 'co2', 'co3', 'co4', 'co5', 'co6']) ids.push(await newSharedPrefixTenant(slug));
+    for (const slug of ['co1', 'co2', 'co3', 'co4', 'co5', 'co6']) ids.push(await newTenant(slug));
     // 开通租户时 catalog 与 S3 账号就建好了：数据文件直接挂湖用 SQL 造（不经 demo.seed 的 worker，6 个租户快得多），
     // 表足够大才不内联在 catalog 里；这里不比对时间旅行，不用 seedLake
     await Promise.all(ids.map(id =>
@@ -258,15 +201,18 @@ describe.skipIf(!S3_TARGET)('共享桶前缀上的数据湖迁移到独占桶', 
     const oldPaths = new Map(await Promise.all(ids.map(async id => [id, (await getTenantLake(id))!.dataPath] as const)));
     for (const id of ids) expect((await listLakeFiles(oldPaths.get(id)!)).some(f => f.path.endsWith('.parquet'))).toBe(true);
 
-    const { requested } = await requestLakeMigrations(null, S3_TARGET!);
+    const { requested } = await requestLakeMigrations(null, LOCAL_TARGET);
     expect(requested.map(r => r.tenantId).sort()).toEqual([...ids].sort());
 
-    // 无关租户不迁移：迁移进行时反复重写它们的前缀策略，模拟其他 worker 对共享 IAM 配置的并发写
+    // 无关租户不迁移：迁移进行时反复重写它们的桶策略，模拟其他 worker 对共享 IAM 配置的并发写
     const churn: { id: string; path: string }[] = [];
     for (const slug of ['churn1', 'churn2']) {
       const id = await newTenant(slug);
       churn.push({ id, path: (await getTenantLake(id))!.dataPath });
     }
+
+    // 迁回本地目录会删掉租户账号、清空凭据列：等旧凭据被拒用的凭据要在迁移开始前取出来
+    const oldCreds = new Map(await Promise.all(ids.map(async id => [id, lakeSpecOf((await lakeRow(id))!).s3!] as const)));
 
     const drained = { done: false };
     await Promise.all([
@@ -284,14 +230,14 @@ describe.skipIf(!S3_TARGET)('共享桶前缀上的数据湖迁移到独占桶', 
       const migration = await lastMigrationOf(id);
       expect(migration).toMatchObject({ status: 'succeeded' });
       expect(migration.result?.warning).toBeUndefined();
-      const creds = lakeSpecOf((await lakeRow(id))!).s3!;
+      const creds = oldCreds.get(id)!;
       await untilPrefixDenied(creds, oldPaths.get(id)!);
       await expect(listObjects(creds, oldPaths.get(id)!)).rejects.toThrow(/AccessDenied|HTTP 403/);
     }));
   }, 420_000); // 8 个租户开通（S3 上各 ~10 s）加 6 个并发迁移，单独跑 ~140 s；4 个 worker 并行跑满时约慢一倍，会超过默认 180 s
 
   it('迁回本地目录后数据完整，之后的写入落在本地', async () => {
-    const acme = await newSharedPrefixTenant('acme');
+    const acme = await newTenant('acme');
     const version = await seedLake(acme);
     const before = { inventory: await inventoryOf(acme), timeTravel: await timeTravel(acme, version) };
 
@@ -310,7 +256,7 @@ describe.skipIf(!S3_TARGET)('共享桶前缀上的数据湖迁移到独占桶', 
   });
 
   it('删账号后等旧凭据被拒期间失联，接手的执行幂等地完成，不把数据湖指回旧前缀', async () => {
-    const acme = await newSharedPrefixTenant('acme');
+    const acme = await newTenant('acme');
     const version = await seedLake(acme);
     const before = { inventory: await inventoryOf(acme), timeTravel: await timeTravel(acme, version) };
     const oldPath = (await getTenantLake(acme))!.dataPath;
@@ -350,7 +296,7 @@ describe.skipIf(!S3_TARGET)('共享桶前缀上的数据湖迁移到独占桶', 
   });
 
   it('删账号后失联，接手时盘点对不上：记 failed，不把数据湖指回旧前缀', async () => {
-    const acme = await newSharedPrefixTenant('acme');
+    const acme = await newTenant('acme');
     await seedLake(acme);
     const oldPath = (await getTenantLake(acme))!.dataPath;
     await requestLakeMigration(null, acme, LOCAL_TARGET);
@@ -387,6 +333,23 @@ describe.skipIf(!S3_TARGET)('共享桶前缀上的数据湖迁移到独占桶', 
     expect(lake.s3AccessKey).toBeNull();
     // 失败已落库，不会再被失联判定重新领取、永远出不来
     expect((await claimLakeMigration(0))?.id).not.toBe(first.id);
+  });
+
+  it('共享桶前缀上的租户（#691 已退场）：申请迁移直接拒绝，不写迁移行，--all 记入 skipped', async () => {
+    const acme = await newTenant('acme');
+    const sharedPrefix = `${process.env.TEST_S3_LAKE_URI}/tenants/${acme}/`;
+    await getDb().update(tenantLakes).set({ dataPath: sharedPrefix }).where(eq(tenantLakes.tenantId, acme));
+
+    // tenantDataPath 不再接受 s3 根：对象存储上的租户路径只有独占的桶根
+    expect(() => tenantDataPath(process.env.TEST_S3_LAKE_URI!, acme)).toThrow('独占的桶');
+    await expect(requestLakeMigration(null, acme, LOCAL_TARGET)).rejects.toThrow(TenantError);
+    await expect(requestLakeMigration(null, acme, LOCAL_TARGET)).rejects.toThrow('共享桶前缀');
+    expect(await getDb().select().from(lakeMigrations).where(eq(lakeMigrations.tenantId, acme))).toEqual([]);
+
+    // --all：单个租户申请不了的收进 skipped，理由就是拒绝原因
+    const { requested, skipped } = await requestLakeMigrations(null, S3_TARGET!);
+    expect(requested).toEqual([]);
+    expect(skipped).toEqual([{ tenantId: acme, slug: 'acme', reason: expect.stringContaining('共享桶前缀') }]);
   });
 });
 

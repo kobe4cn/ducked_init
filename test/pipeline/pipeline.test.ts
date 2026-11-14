@@ -10,7 +10,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { tenantLakes } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { deleteTenantS3Account, issueTenantS3Account } from '../../app/.server/s3-accounts';
-import { getTenantLake } from '../../app/.server/lake';
+import { getTenantLake, tenantBucketRoot } from '../../app/.server/lake';
 import { openTenantLake, type LakeSpec } from '../../app/.server/pipeline/lake-engine';
 import { isS3 } from '../../app/.server/lake-storage';
 import { claimNextTask, enqueueTask, finishTask, getTask, listTasks } from '../../app/.server/tasks';
@@ -303,7 +303,7 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储上的越权访问',
       const stressDeadline = Date.now() + 180_000;
       const stress = Promise.all(Array.from({ length: 8 }, async () => {
         const id = randomUUID();
-        const dataPath = `${process.env.PLATFORM_LAKE_URI}/tenants/${id}/`;
+        const dataPath = tenantBucketRoot(id);
         try {
           for (let i = 0; i < 10 && Date.now() < stressDeadline; i++) {
             await issueTenantS3Account(id, dataPath);

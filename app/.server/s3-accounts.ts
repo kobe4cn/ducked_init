@@ -1,6 +1,7 @@
-// app/.server/s3-accounts.ts —— 租户在对象存储上的账号（ADR-0008）：由存储服务按前缀策略执行租户隔离。
-// 经存储服务的 IAM API（SeaweedFS 内置在 S3 端口上）用平台账号建用户、签发密钥、绑定只允许本租户前缀的策略。
+// app/.server/s3-accounts.ts —— 租户在对象存储上的账号（ADR-0008）：每租户独占一个桶，策略只放行本租户的桶，隔离由存储服务执行。
+// 经存储服务的 IAM API（SeaweedFS 内置在 S3 端口上）用平台账号建用户、签发密钥、绑定只允许访问本租户桶的策略。
 // 凭据获取只在这里；以后换成按任务签发的临时凭据（STS）时只改这个模块
+import { isTenantBucketRoot } from './lake-storage';
 import { putObject, signedFetch, xmlTag as tag, xmlTags as tags, type S3Creds } from './s3-client';
 
 const env = (k: string, d: string) => process.env[k] ?? d;
@@ -18,7 +19,7 @@ export function platformS3() {
 }
 
 export const s3UserOf = (tenantId: string) => `lake-${tenantId}`;
-/** 数据查询工作台用的只读账号（ADR-0036）：只能读、列出本租户前缀下的对象 */
+/** 数据查询工作台用的只读账号（ADR-0036）：只能读、列出本租户桶里的对象 */
 export const s3ReadOnlyUserOf = (tenantId: string) => `lake-${tenantId}-ro`;
 
 /** 用平台账号调用 IAM API（表单 POST），返回响应 XML；出错时抛出带错误码的 IamError */
@@ -48,32 +49,26 @@ const READ_WRITE = ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'];
 const READ_ONLY = ['s3:GetObject'];
 
 /**
- * 只允许对本租户存储路径下的对象执行 actions、列出这些对象。路径是桶根（每租户一桶，ADR-0008）时放行整个桶：
- * 对象权限与 s3:ListBucket 都只指到本桶，不需要前缀 Condition。共享桶里的前缀租户（迁移目标、本功能上线前的租户）
- * 仍用前缀 + Condition 收窄。迁移存储期间两种写法会混在一个策略里（新旧两个路径，lake-migration.ts）
+ * 只放行对本租户桶（每租户一桶，ADR-0008）执行 actions、列出桶内对象：对象权限与 s3:ListBucket 都只指到本桶，
+ * 不需要前缀 Condition。共享桶前缀已退场（#691）：s3 路径不是桶根（isTenantBucketRoot）时直接抛错，不能当成
+ * 整桶放行——那会把整个共享桶开放给一个租户。迁移存储期间新旧两个路径会混在一个策略里（lake-migration.ts），都得是桶根
  */
 function prefixPolicy(dataPaths: string[], actions: string[]) {
-  const paths = dataPaths.map(p => {
-    const [bucket, ...rest] = p.replace(/^s3:\/\//, '').split('/');
-    const prefix = rest.filter(Boolean).join('/');
-    return { bucket, prefix, bucketRoot: prefix === '' };
-  });
+  for (const p of dataPaths) {
+    if (!isTenantBucketRoot(p)) throw new Error(`共享桶前缀已退场（ADR-0008），先用 #689 所在版本把租户迁入独占桶：${p}`);
+  }
+  const buckets = dataPaths.map(p => p.replace(/^s3:\/\//, '').replace(/\/+$/, ''));
   return JSON.stringify({
     Version: '2012-10-17',
-    Statement: paths.flatMap(({ bucket, prefix, bucketRoot }) => bucketRoot
-      ? [
-        { Effect: 'Allow', Action: actions, Resource: [`arn:aws:s3:::${bucket}/*`] },
-        { Effect: 'Allow', Action: ['s3:ListBucket'], Resource: [`arn:aws:s3:::${bucket}`] },
-      ]
-      : [
-        { Effect: 'Allow', Action: actions, Resource: [`arn:aws:s3:::${bucket}/${prefix}/*`] },
-        { Effect: 'Allow', Action: ['s3:ListBucket'], Resource: [`arn:aws:s3:::${bucket}`], Condition: { StringLike: { 's3:prefix': [`${prefix}/*`] } } },
-      ]),
+    Statement: buckets.flatMap(bucket => [
+      { Effect: 'Allow', Action: actions, Resource: [`arn:aws:s3:::${bucket}/*`] },
+      { Effect: 'Allow', Action: ['s3:ListBucket'], Resource: [`arn:aws:s3:::${bucket}`] },
+    ]),
   });
 }
 
 /**
- * 为租户建好存储服务上的账号与前缀策略，签发一把新密钥。可重复执行：账号已存在时沿用，
+ * 为租户建好存储服务上的账号与本租户桶的策略，签发一把新密钥。可重复执行：账号已存在时沿用，
  * 此前签发、没来得及保存的密钥一并作废，策略按 dataPath 重新写入
  */
 export async function issueTenantS3Account(tenantId: string, dataPath: string) {
@@ -98,7 +93,7 @@ async function issueAccount(UserName: string, PolicyDocument: string) {
   return { accessKey, secretKey };
 }
 
-/** 重写租户两个账号的前缀策略：只能访问给出的存储前缀（对象存储上的）；只读账号还没建时跳过它 */
+/** 重写租户两个账号的策略：只能访问给出的本租户桶（对象存储上的）；只读账号还没建时跳过它 */
 export async function setTenantS3Prefixes(tenantId: string, dataPaths: string[]) {
   await putPolicy(s3UserOf(tenantId), prefixPolicy(dataPaths, READ_WRITE));
   await putPolicy(s3ReadOnlyUserOf(tenantId), prefixPolicy(dataPaths, READ_ONLY)).catch(ignoreIamError('NoSuchEntity'));

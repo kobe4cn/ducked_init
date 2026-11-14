@@ -26,11 +26,13 @@ export function normalizeLakeRoot(uri: string) {
 const lakeRoot = () => normalizeLakeRoot(process.env.PLATFORM_LAKE_URI ?? './data/platform-lake');
 
 /**
- * 租户在某个数据湖根下的存储前缀（共享桶里的写法）：<根>/tenants/<租户 ID>/。#688 之前开通的对象存储租户还在这种
- * 前缀上（经 lakeTargetOf 迁入独占的桶）；新开通的租户在 layout() 里直接得到独占的桶，本地目录租户仍按它算
+ * 租户在本地数据湖根下的存储前缀：<根>/tenants/<租户 ID>/。对象存储上没有这种写法（每租户一桶，ADR-0008）：
+ * 共享桶前缀已退场（#691），s3 根直接抛错，对象存储租户的路径只有 tenantBucketRoot
  */
-export const tenantDataPath = (root: string, tenantId: string) =>
-  isS3(root) ? `${root}/tenants/${tenantId}/` : `${join(root, 'tenants', tenantId)}/`;
+export const tenantDataPath = (root: string, tenantId: string) => {
+  if (isS3(root)) throw new Error('对象存储上的租户数据湖在独占的桶里（tenantBucketRoot），不再有共享桶前缀');
+  return `${join(root, 'tenants', tenantId)}/`;
+};
 
 /** 租户在对象存储上独占的桶根（ADR-0008）：s3://lake-<租户 ID>/，与账号名 lake-<租户 ID> 一致 */
 export const tenantBucketRoot = (tenantId: string) => `s3://lake-${tenantId}/`;
