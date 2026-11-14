@@ -35,11 +35,13 @@ const { values } = parseArgs({
     out: { type: 'string' },                // 结果 JSON 的路径（可选）
     keep: { type: 'boolean', default: false }, // 跳过清理，便于排查
     'max-minutes': { type: 'string', default: '30' }, // 建桶阶段的墙钟上限，超了就停在当前桶数
+    'write-each': { type: 'boolean', default: false }, // 建好每个桶后用平台账号首写 1 个对象（#687：验证全部桶写入不撞卷位）
   },
 });
 const USAGE = `用法：node --import tsx scripts/bench-bucket-per-tenant.ts --backend seaweedfs|rustfs --endpoint <host:port>
   --access-key <平台账号> --secret-key <平台密钥> [--buckets <正整数，默认 1000>] [--checkpoints 100,500,1000]
-  [--filer <http://host:port>（seaweedfs 必填）] [--master <host:port>] [--mc <mc 路径>] [--out <json>] [--keep] [--max-minutes 30]`;
+  [--filer <http://host:port>（seaweedfs 必填）] [--master <host:port>] [--mc <mc 路径>] [--out <json>] [--keep]
+  [--max-minutes 30] [--write-each]`;
 /** 外部输入先校验再用（.sandcastle/CODING_STANDARDS.md）：缺参数或取值不对就打印用法、退出码 2 */
 function usageExit(why: string): never {
   console.error(`参数错误：${why}\n${USAGE}`);
@@ -181,8 +183,9 @@ const s3Ok = async (what: string, creds: S3Creds, req: Parameters<typeof signedF
 
 // ---------------- 结果 ----------------
 const startedAt = new Date();
+const writeEach = values['write-each'] === true;
 const result: {
-  backend: string; endpoint: string; buckets: number; iamMode: string; iamProbe?: string;
+  backend: string; endpoint: string; buckets: number; iamMode: string; iamProbe?: string; writeEach: boolean;
   startedAt: string; finishedAt?: string; stoppedEarly?: string;
   buildMs: number[]; buildErrors: string[];
   checkpoints: Record<string, unknown>[];
@@ -190,7 +193,7 @@ const result: {
   isolationViolations: { checkpoint: number; a: string; b: string; op: 'read' | 'write' | 'list'; status: number }[];
   cleanup: { users: number; buckets: number; errors: string[] };
 } = {
-  backend, endpoint, buckets: bucketCount, iamMode: '', startedAt: startedAt.toISOString(),
+  backend, endpoint, buckets: bucketCount, iamMode: '', writeEach, startedAt: startedAt.toISOString(),
   buildMs: [], buildErrors: [], checkpoints: [], isolationViolations: [], cleanup: { users: 0, buckets: 0, errors: [] },
 };
 
@@ -219,6 +222,7 @@ const tenants: Tenant[] = [];
 const extras: Tenant[] = [];   // checkpoint 用的 reload 探测账号，结尾一并清理
 const stopped = (reason: string) => { result.stoppedEarly ??= reason; console.log(`提前停止：${reason}`); };
 const body1k = 'x'.repeat(1024);
+let firstWrites = 0;   // --write-each 下首写成功的桶数（失败抛错、计入 buildErrors）
 
 for (let i = 1; i <= bucketCount && !result.stoppedEarly; i++) {
   if (performance.now() > maxMs) { stopped(`建桶阶段超过 ${values['max-minutes']} 分钟，只建到 ${i - 1} 个桶`); break; }
@@ -231,6 +235,14 @@ for (let i = 1; i <= bucketCount && !result.stoppedEarly; i++) {
     const { key, secret } = await issueAccount(user, bucket);
     result.buildMs.push(performance.now() - t0);
     tenants.push({ user, bucket, key, secret });
+    if (writeEach) {
+      // 用平台凭据首写（不用刚开的租户凭据，避开 IAM 重载窗口）。不走 s3/s3Ok——它们丢响应体，
+      // 卷位耗尽时 `No writable volumes` 只在响应体里，直接 signedFetch 把它拼进错误抛出，落进下面的 catch
+      const res = await signedFetch(platform, 's3', { method: 'PUT', path: `/${bucket}/first-write`, body: body1k });
+      const text = await res.text();
+      if (!res.ok) throw new Error(`首写 ${bucket}/first-write 返回 HTTP ${res.status}：${text.slice(0, 300)}`);
+      firstWrites++;
+    }
   } catch (e) {
     const msg = `第 ${i} 个（${user}）：${e instanceof Error ? e.message : e}`;
     result.buildErrors.push(msg);
@@ -420,6 +432,7 @@ if (values.keep) {
 
 result.finishedAt = new Date().toISOString();
 console.log(`\n===== 结果（${backend}，${tenants.length} 个桶，墙钟 ${((Date.now() - startedAt.getTime()) / 60_000).toFixed(1)} 分钟）=====`);
+if (writeEach) console.log(`每桶首写 ${firstWrites}/${tenants.length} 次成功（失败计入下面的建租户失败）`);
 console.log(`建租户失败 ${result.buildErrors.length} 次；清理失败 ${result.cleanup.errors.length} 次；隔离放行 ${result.isolationViolations.length} 次`);
 if (values.out) {
   writeFileSync(values.out, JSON.stringify(result, null, 2));
