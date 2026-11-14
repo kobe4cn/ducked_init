@@ -273,6 +273,45 @@ describe.skipIf(!S3_TARGET)('对象存储上的数据湖迁移到另一个前缀
     // 删账号路径也要等网关拒绝旧凭据：InvalidAccessKeyId 漏判会白等到超时并记 warning
     expect((await lastMigrationOf(acme)).result?.warning).toBeUndefined();
   });
+
+  it('删账号后等旧凭据被拒期间失联，接手的执行幂等地完成，不把数据湖指回旧前缀', async () => {
+    const acme = await newTenant('acme');
+    const version = await seedLake(acme);
+    const before = { inventory: await inventoryOf(acme), timeTravel: await timeTravel(acme, version) };
+    const oldPath = (await getTenantLake(acme))!.dataPath;
+    await requestLakeMigration(null, acme, LOCAL_TARGET);
+
+    // 第一次执行：注入恒成功的探测（旧前缀一直列得动），迁移就停在等待网关拒绝里
+    const first = (await claimLakeMigration())!;
+    const controller = new AbortController();
+    const stuck = runLakeMigration(first, controller.signal, { probe: async () => [{ path: '.keep', size: 0 }] });
+    // 等它复制、切换、删完账号（数据湖已指向本地、凭据列已清空）再像失联的调度器一样中止
+    const toPath = tenantDataPath(LOCAL_TARGET, acme);
+    const accountDropped = async () => {
+      const lake = (await lakeRow(acme))!;
+      return lake.dataPath === toPath && !lake.s3AccessKey;
+    };
+    for (let i = 0; i < 150 && !(await accountDropped()); i++) await sleep(200);
+    expect(await accountDropped()).toBe(true);
+    controller.abort();
+    await stuck; // LostClaim：不写完成状态，迁移停在 running，数据湖已指向本地
+    expect((await lastMigrationOf(acme)).status).toBe('running');
+
+    // 另一个调度器失联判定后重新领取：接手方取不出旧凭据（账号已删），要能识别这个中间状态并幂等地完成
+    const takeover = (await claimLakeMigration(0))!;
+    expect(takeover.id).toBe(first.id);
+    await runLakeMigration(takeover);
+
+    const migration = await lastMigrationOf(acme);
+    expect(migration).toMatchObject({ status: 'succeeded', error: null });
+    expect(migration.result?.warning).toBeUndefined();
+    const lake = (await lakeRow(acme))!;
+    expect(lake.dataPath).toBe(toPath);
+    expect(lake.dataPath).not.toBe(oldPath); // 不得指回已没有账号的旧 s3 前缀
+    expect(lake.s3AccessKey).toBeNull();
+    expect(await inventoryOf(acme)).toEqual(before.inventory);
+    expect(await timeTravel(acme, version)).toEqual(before.timeTravel);
+  });
 });
 
 describe('迁移期间的调度', () => {
