@@ -16,7 +16,7 @@ import { mappingName, publishedPlans, requireMapping } from './mappings';
 import { consumerSensitive, identityRules, type IdentitySummary } from './pipeline/identity-engine';
 import { groupMemberOf, type MergeDrop, type MergeMappingParam, type MergeRecord, type RelationParam } from './pipeline/merge-engine';
 import { isSensitiveField, type PublishedPlan } from './pipeline/mapping-spec';
-import { readResult } from './pipeline/task-contracts';
+import { readResult, type MergeParams } from './pipeline/task-contracts';
 import { PublishError } from './publishing';
 import { insertTask, updateQueuedParams } from './tasks';
 import { lockTenant } from './tenant-lock';
@@ -102,6 +102,25 @@ export function relationParams(published: Map<string, RegisteredEntity>, plans: 
 }
 
 /**
+ * 把一次新的合并（incoming，enqueueMerge 组好的完整参数）并进已在排队的合并（queued，updateQueuedParams 读出的旧参数），返回合并后的参数（纯函数）：
+ * 1. drop 并在一起，同一映射去重时保留排队中的那条，不排序；
+ * 2. mappings 里排队中与 incoming 同一映射的换成 incoming 的版本（最新已发布版本），排队中被合并后 drop 撤下的映射剔除
+ *    （incoming 自己的映射不剔除——恢复映射时撤下它的合并还在排队，要同时带 drop 与它的重建，ADR-0031/#195）；
+ * 3. 排队中的同一映射已带 rebuild 时给 incoming 的这条补上 rebuild: true（强制重建的标记不丢）；
+ * 4. 结果按映射 ID 用 cmp 排序（码点比较，ADR-0045）；
+ * 5. identityForce 取或（已为真的保留），其余字段（identity、survivorship、consumerSensitive、relations、identityExclude）整体取 incoming 的；
+ *    ...queued 保留 looseObject 带来的未知键（与并进前的写法一致）
+ */
+export function mergeQueued(queued: MergeParams, incoming: MergeParams): MergeParams {
+  const drop = [...queued.drop, ...incoming.drop.filter(d => !queued.drop.some(q => q.mapping === d.mapping))];
+  const mappings = [
+    ...queued.mappings.filter(q => !incoming.mappings.some(pl => pl.mapping === q.mapping) && !drop.some(d => d.mapping === q.mapping)),
+    ...incoming.mappings.map(pl => (queued.mappings.some(q => q.mapping === pl.mapping && q.rebuild) ? { ...pl, rebuild: true } : pl)),
+  ].sort((a, b) => cmp(a.mapping, b.mapping));
+  return { ...queued, ...incoming, mappings, drop, identityForce: queued.identityForce || incoming.identityForce };
+}
+
+/**
  * 在调用方的事务里为给定映射（不给时为全部已发布映射）的最新已发布版本入队一次合并，返回带上它们的合并任务。
  * 锁住租户行后检查：同一租户同时只有一个合并在排队或运行（两个合并同时写同一张标准层表会冲突）。
  * 已有合并在排队时把映射补进去（同一映射换成最新版本）；已在运行（或补的时候刚被领取）时不入队，返回 null，由定时检查在它之后补上。
@@ -114,8 +133,8 @@ export function relationParams(published: Map<string, RegisteredEntity>, plans: 
 export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string[], opts?: { rebuild?: boolean; drop?: MergeDrop[] }) {
   await lockTenant(tx, tenantId);
   const plans = (await mergePlans(tx, tenantId, mappingIds)).map(p => (opts?.rebuild ? { ...p, rebuild: true } : p));
-  const incoming = opts?.drop ?? [];
-  if (!plans.length && !incoming.length) return null;
+  const drop = opts?.drop ?? [];
+  if (!plans.length && !drop.length) return null;
   const pending = await pendingMerge(tx, tenantId);
   const all: PublishedPlan[] = mappingIds ? await publishedPlans(tx, tenantId) : plans;
   const identity = identityRules(all, mappingName);
@@ -125,23 +144,15 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
   if (pending?.status === 'running') return null;
   const identityExclude = await excludedHashes(tx, tenantId);
   const force = await mustRecomputeIdentities(tx, tenantId, identity, survivorship, identityExclude);
+  // identity 由 schema 推出的入参类型是 string[]（identityRules 返回 readonly string[]），这里复制成可写的
+  const next: MergeParams = { mappings: plans, drop, identity: [...identity], survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: force };
   if (!pending) {
-    return insertTask(tx, tenantId, 'silver.merge', {
-      // identity 由 schema 推出的入参类型是 string[]（identityRules 返回 readonly string[]），这里复制成可写的
-      mappings: plans, ...(incoming.length > 0 && { drop: incoming }), identity: [...identity], survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: force,
-    });
+    // 新任务 drop 为空时不写 drop 键，与早先入队的任务形状一致；写回排队中的任务时总是带（mergeQueued 里显式给）
+    const { drop, ...rest } = next;
+    return insertTask(tx, tenantId, 'silver.merge', { ...rest, ...(drop.length > 0 && { drop }) });
   }
   // 已在排队：并进同一个任务。领取合并不锁租户行，updateQueuedParams 只在它仍在排队时改参数（刚被领取时返回 null，由定时检查补上）
-  return updateQueuedParams(tx, pending.id, 'silver.merge', p => {
-    const queuedDrop = p.drop;
-    const drop = [...queuedDrop, ...incoming.filter(d => !queuedDrop.some(q => q.mapping === d.mapping))];
-    const queued = p.mappings;
-    const merged = [
-      ...queued.filter(q => !plans.some(pl => pl.mapping === q.mapping) && !drop.some(d => d.mapping === q.mapping)),
-      ...plans.map(pl => (queued.some(q => q.mapping === pl.mapping && q.rebuild) ? { ...pl, rebuild: true } : pl)),
-    ].sort((a, b) => cmp(a.mapping, b.mapping));
-    return { ...p, mappings: merged, drop, identity: [...identity], survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: p.identityForce || force };
-  });
+  return updateQueuedParams(tx, pending.id, 'silver.merge', p => mergeQueued(p, next));
 }
 
 /**
