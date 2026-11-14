@@ -10,7 +10,7 @@ import { getDb } from './db/client';
 import { dslDefinitions, dslVersions, snapshots, tasks, templateDefinitions, templateVersions, tenants } from './db/schema';
 import { dslContext, downstreamTags, enqueueDsl, type DslVersionRef } from './dsl-definitions';
 import { publishedDependents } from './dsl-dependencies';
-import { pendingMerge } from './mappings';
+import { pendingMerge } from './merges';
 import { DSL_KINDS } from './pipeline/dsl';
 import { TEMPLATES } from './pipeline/templates';
 import { enqueueTemplate, TASK_KINDS, type TemplateId } from './templates';

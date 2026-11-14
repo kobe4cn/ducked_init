@@ -11,7 +11,8 @@ import type { CurrentMember } from './auth';
 import { catalogTx } from './catalog/tx';
 import { getDb, isUniqueViolation } from './db/client';
 import { mappings, mappingVersions, sources, sourceComments, sourceTables, sourceViews, sourceViewVersions, tasks, type TaskStatus } from './db/schema';
-import { crossSourceReferrers, pendingMerge } from './mappings';
+import { crossSourceReferrers } from './mappings';
+import { pendingMerge } from './merges';
 import { proposeFromComments } from './knowledge/source-comments';
 import {
   inspectSource, isKeyType, isSoftDeleteType, mongoReadGrant, SOFT_DELETE_NAME, type ListedTable, type SourceComment, type SourceSpec,
