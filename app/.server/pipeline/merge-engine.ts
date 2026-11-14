@@ -18,7 +18,6 @@ import { CONSUMER, CONSUMER_CONSENT, CONSUMER_IDS, consumerSensitive, DEFAULT_RU
 import { compileExpression, ident, lit, parseExpression, referencedColumns } from '../../lib/mapping-expr';
 import { columnExists, joinOn, keyList, rows, silverTable, tableExists } from './duck-sql';
 import { customerSourceColumn } from '../../lib/customer-source';
-import type { MergeRule } from '../../lib/merge-groups';
 import { ensureCustomerSourceColumns } from './customer-source-columns';
 import { referencedSourceColumns, sqlType, type MergePlan, type PlanColumn } from './mapping-spec';
 import { breakingColumns, type ColumnType } from './schema-diff';
@@ -26,39 +25,13 @@ import { bronzeTablesOf, checkViewSql, looksSensitive } from './source-view-engi
 import { bronzeSchema, PLATFORM_COLUMNS } from './sync-engine';
 import { recordRuns, type AssertionResult } from './assertions';
 import { customAssertionName, evalCustomAssertions } from './custom-assertions';
+import type { MergeDrop, MergeGroupParam, GroupMemberParam, MergeMappingParam, RelationParam } from './task-contracts';
 
 /**
- * 合并任务里的一个已发布映射：合并计划加上映射、版本与数据源；输入是源视图时另带视图最新的已发布版本
- * （版本号、SQL 与引用的原始层表，入队时取定）。rebuild 为真时强制由全部批次重建（数据地图上的重建合并，补上标准层缺的列）。
- * uniqueKey 是实体（customer 除外）的主键：合并后它在整个实体内跨映射唯一（ADR-0024「独占」），不是映射的去重键；
- * uniqueBySource 为真时（主键含指向 customer 的字段）只在同一个数据源内唯一。
- * group 是映射所在的已发布合并组（ADR-0032，可用组员至少 2 个时才带）：写标准层时按组的存活规则把组内同一主键并成一行
+ * 合并参数各部分的类型（已发布映射、合并组、组员、停用映射与关系）：由契约的 schema 推出（ADR-0052），这里转出——
+ * 全仓的 import 方大多指到本文件；说明见契约里各 schema 的注释
  */
-export interface MergeMappingParam extends MergePlan {
-  mapping: string; version: number; sourceId: string; sourceView?: SourceViewParam; rebuild?: boolean; uniqueKey?: string[]; uniqueBySource?: boolean;
-  group?: MergeGroupParam;
-}
-
-/**
- * 合并任务里的合并组（ADR-0032）：组 ID、存活规则、实体主键 key（组内按它比较，不是各映射的去重键）与可用的组员（按优先级排，入队时取定）
- */
-export interface MergeGroupParam { id: string; rule: MergeRule; key: string[]; members: GroupMemberParam[] }
-
-/**
- * 合并组的一个组员：重算时从它的当前记录按去重键 key 与取最新字段 latest 取每个键最新的一行，
- * 系统列按映射、数据源、版本与键空间写，customer 引用列旁的数据源列按 refs（列 → 数据源 ID）写；
- * sensitive 是它的敏感列（统计不一致时只计数，#200 之前入队的合并没有这一项）
- */
-export interface GroupMemberParam {
-  mapping: string; sourceId: string; version: number; key: string[]; latest: string | null; keySpace?: string; refs: { column: string; source: string }[];
-  sensitive?: string[];
-}
-
-/**
- * 合并任务里要撤下的停用映射（ADR-0031）：合并前删掉它写进标准层实体 entity 的行、它的当前记录与合并日志里的水位
- * （之后万一再合并它就走重建）
- */
-export interface MergeDrop { mapping: string; entity: string }
+export type { MergeMappingParam, MergeGroupParam, GroupMemberParam, MergeDrop, RelationParam } from './task-contracts';
 
 /** 撤下的停用映射与从标准层删掉的行数 */
 export type DroppedMapping = MergeDrop & { deleted: number };
@@ -121,9 +94,6 @@ export type MergeRecord = {
   /** 报错原文（已 redact）。第一个全角冒号「：」之前不放取值：快照登记时只留这部分作原因摘要（snapshots.ts summarizeMergeError） */
   | { error: string }
 );
-
-/** 合并任务里的一条已发布关系（内置 ref 与已发布登记上的关系）；sensitive：起点是敏感字段，标准层里是哈希，入队时算好 */
-export interface RelationParam extends EntityRelation { sensitive: boolean }
 
 /** 合并后的身份打通：摘要与耗时，失败时是错误信息；这次没改到 customer、event 与 consent 时跳过（skipped 是原因），沿用上次的结果 */
 export type IdentityRecord = { durationMs: number } & (IdentitySummary | { error: string } | { skipped: string });

@@ -3,7 +3,7 @@
 // 不合法时报一句话。本文件不连平台库、不建 DuckDB：只运行时依赖 zod 与纯模块（templates、sources），
 // engine 一律 import type（ADR-0008），所以入队侧也能安全地引它
 import { z } from 'zod';
-import { MERGE_RULE_KINDS } from '../../lib/merge-groups';
+import { MERGE_RULE_KINDS, type MergeRule } from '../../lib/merge-groups';
 import { LAKE_COVERAGE, type NotInLakeReason } from '../../lib/sources';
 import { TASK_KINDS, TEMPLATES, templateAt, type TemplateId } from './templates';
 import type { AssertionResult } from './assertions';
@@ -12,7 +12,8 @@ import type { syncSourceTables } from './sync-engine';
 import type { verifySourceLake } from './verify-engine';
 import type { InspectResult } from './inspect-engine';
 import type { KeyCheckResult } from './key-check-engine';
-import type { mergeToSilver, MergeDrop, MergeMappingParam, RelationParam } from './merge-engine';
+import type { mergeToSilver, SourceViewParam } from './merge-engine';
+import type { MergePlan, PlanColumn } from './mapping-spec';
 import type { buildServingStore } from './serving-engine';
 import type { KeyCheckTaskResult } from '../source-key-check';
 
@@ -86,9 +87,10 @@ const intInRange = (key: string, max: number) => {
   const message = `参数 ${key} 必须是 1 到 ${max} 之间的整数`;
   return z.number(error(message)).int(error(message)).min(1, error(message)).max(max, error(message));
 };
-/** 全是字符串字段的对象（如要撤下的停用映射），整个对象不合法时报同一句话 */
-const stringFields = (keys: string[], message: string) =>
-  z.object(Object.fromEntries(keys.map(k => [k, z.string(error(message))])), error(message)).loose();
+/** 全是字符串字段的对象（如要撤下的停用映射），整个对象不合法时报同一句话。keys 的字面量定出字段名：
+ * 推出的类型是具名字段而不是 Record<string, string>，对得上 EntityRelation 这类手写形状 */
+const stringFields = <K extends string>(keys: readonly K[], message: string) =>
+  z.object(Object.fromEntries(keys.map(k => [k, z.string(error(message))])) as Record<K, z.ZodString>, error(message)).loose();
 
 /** 没有参数的任务（入队时是空对象）：只要求是个对象，别的什么都不查 */
 const noParams = params<Record<string, unknown>>(z.record(z.string(), z.unknown()));
@@ -124,11 +126,18 @@ const nullableString = (message: string) => z.union([z.string(error(message)), z
 
 /** 合并参数里的映射（原 mergeMappings + isMergeGroup）：已发布的版本及其合并计划，发布时已校验过，这里只核对形状 */
 const MAPPINGS = '参数 mappings 必须是非空的已发布映射列表';
-/** 合并组的存活规则（ADR-0032）：latest 另带取最新的字段 */
+/**
+ * 合并组的存活规则（ADR-0032）：latest 另带取最新的字段。末尾把类型交叉成 MergeRule（联合类型），
+ * 校验与报错仍是上面的 object + refine（文案不变），不用 discriminatedUnion（会换报错路径和文案）
+ */
 const mergeRule = z.object({ kind: z.enum(MERGE_RULE_KINDS, error(MAPPINGS)), field: z.unknown().optional() }, error(MAPPINGS))
   .refine(r => r.kind !== 'latest' || typeof r.field === 'string', error(MAPPINGS))
-  .loose();
-/** 合并组的一个组员（ADR-0032）：从它的当前记录按去重键与取最新字段取每个键最新的一行，refs 是引用列旁的数据源列 */
+  .loose()
+  .transform(r => r as typeof r & MergeRule);
+/**
+ * 合并组的一个组员（ADR-0032）：从它的当前记录按去重键与取最新字段取每个键最新的一行，refs 是引用列旁的数据源列；
+ * sensitive 是它的敏感列（统计不一致时只计数，#200 之前入队的合并没有这一项）
+ */
 const groupMember = z.object({
   mapping: z.string(error(MAPPINGS)),
   sourceId: z.string(error(MAPPINGS)),
@@ -139,55 +148,82 @@ const groupMember = z.object({
   refs: z.array(stringFields(['column', 'source'], MAPPINGS), error(MAPPINGS)),
   sensitive: stringList(MAPPINGS).optional(),
 }, error(MAPPINGS)).loose();
+/** 合并组的一个组员的参数类型：由 groupMember schema 推出（Known 去掉 .loose() 的索引签名），merge-engine 转出 */
+export type GroupMemberParam = Known<z.infer<typeof groupMember>>;
+/** 合并组（ADR-0032）：组 ID、存活规则、实体主键 key（组内按它比较，不是各映射的去重键）与可用的组员（按优先级排，入队时取定） */
 const mergeGroup = z.object({
   id: z.string(error(MAPPINGS)),
   rule: mergeRule,
   key: strings(MAPPINGS),
   members: z.array(groupMember, error(MAPPINGS)).min(1, error(MAPPINGS)),
 }, error(MAPPINGS)).loose();
+/** 合并组的参数类型：由 mergeGroup schema 推出（Known 去掉顶层的索引签名），merge-engine 转出 */
+export type MergeGroupParam = Known<z.infer<typeof mergeGroup>>;
+/**
+ * 合并任务里的一个已发布映射：合并计划（transform 交叉成 MergePlan，深层形状发布时已校验过，这里与原手写校验一样只核对形状，
+ * 不把 MergePlan 的字段逐个抄进 schema——那是第二份定义）加上映射、版本与数据源；输入是源视图时另带视图最新的已发布版本
+ * （版本号、SQL 与引用的原始层表，入队时取定）。rebuild 为真时强制由全部批次重建（数据地图上的重建合并，补上标准层缺的列）。
+ * uniqueKey 是实体（customer 除外）的主键：合并后它在整个实体内跨映射唯一（ADR-0024「独占」），不是映射的去重键；
+ * uniqueBySource 为真时（主键含指向 customer 的字段）只在同一个数据源内唯一。
+ * group 是映射所在的已发布合并组（可用组员至少 2 个时才带）：写标准层时按组的存活规则把组内同一主键并成一行
+ */
 const mergeMapping = z.object({
   mapping: z.string(error(MAPPINGS)),
   version: z.number(error(MAPPINGS)).int(error(MAPPINGS)),
   sourceId: z.string(error(MAPPINGS)),
+  sourceView: z.custom<SourceViewParam>().optional(),
   entity: z.string(error(MAPPINGS)),
   table: z.string(error(MAPPINGS)),
-  columns: z.array(z.unknown(), error(MAPPINGS)).min(1, error(MAPPINGS)),
-  entityColumns: z.array(z.unknown(), error(MAPPINGS)),
+  // 深层形状发布时已校验过：元素用 z.custom 只定型（对值不设限，与原 z.unknown 等价），避免 transform 交叉后元素成了 unknown
+  columns: z.array(z.custom<PlanColumn>(), error(MAPPINGS)).min(1, error(MAPPINGS)),
+  entityColumns: z.array(z.custom<MergePlan['entityColumns'][number]>(), error(MAPPINGS)),
   key: strings(MAPPINGS),
   latest: nullableString(MAPPINGS),
   rebuild: z.boolean(error(MAPPINGS)).optional(),
   uniqueKey: strings(MAPPINGS).optional(),
   uniqueBySource: z.boolean(error(MAPPINGS)).optional(),
   group: mergeGroup.optional(),
-}, error(MAPPINGS)).loose();
+}, error(MAPPINGS)).loose()
+  .transform(m => m as typeof m & MergePlan);
+/** 合并任务里一个已发布映射的参数类型：由 mergeMapping schema 推出（Known 去掉 .loose() 的索引签名），merge-engine 转出 */
+export type MergeMappingParam = Known<z.infer<typeof mergeMapping>>;
 
-/** silver.merge 的参数：早先入队的合并没有 identity 之后的项，按缺省处理 */
-export interface MergeParams {
-  mappings: MergeMappingParam[];
-  drop: MergeDrop[];
+/** 合并任务里要撤下的停用映射（ADR-0031）：合并前删掉它写进标准层实体 entity 的行、它的当前记录与合并日志里的水位（之后万一再合并它就走重建） */
+const mergeDrop = stringFields(['mapping', 'entity'], '参数 drop 必须是 { mapping, entity } 列表');
+/** 要撤下的停用映射的参数类型：由 mergeDrop schema 推出（Known 去掉 .loose() 的索引签名），merge-engine 转出 */
+export type MergeDrop = Known<z.infer<typeof mergeDrop>>;
+
+/** 关系列表的报错文案（from、ref 与 sensitive 同一句话） */
+const RELATIONS = '参数 relations 必须是关系列表（from、ref 与 sensitive）';
+/** 合并任务里的一条已发布关系（内置 ref 与已发布登记上的关系）；sensitive：起点是敏感字段，标准层里是哈希，入队时算好 */
+const relation = z.looseObject({
+  from: stringFields(['entity', 'field'], RELATIONS),
+  ref: stringFields(['entity', 'field'], RELATIONS),
+  sensitive: z.boolean(error(RELATIONS)),
+}, error(RELATIONS));
+/** 要统计孤儿的关系的参数类型：由 relation schema 推出（Known 去掉顶层的索引签名），merge-engine 转出 */
+export type RelationParam = Known<z.infer<typeof relation>>;
+
+/**
+ * silver.merge 的参数 schema（参数与入参类型都从这里推出，带缺省值的项入参可省略）：早先入队的合并没有 identity 之后的项，按缺省处理。
+ * 带了要撤下的停用映射时 mappings 可以为空（停用的是实体最后一个映射）
+ */
+const mergeParams = z.looseObject({
+  drop: z.array(mergeDrop, error('参数 drop 必须是 { mapping, entity } 列表')).default([]),
+  mappings: z.array(mergeMapping, error(MAPPINGS)),
   /** 身份打通的匹配规则（入队时由全部 customer 映射汇总） */
-  identity?: string[];
-  identityForce: boolean;
-  /** 不参与身份匹配的值（规范化后的加盐哈希，只收 64 位十六进制，挡住误传的明文） */
-  identityExclude: string[];
-  /** 属性取舍的名次：映射 ID → 正整数名次 */
-  survivorship: Record<string, number>;
+  identity: strings('参数 identity 必须是非空的字段名列表').optional(),
+  relations: z.array(relation, error(RELATIONS)).default([]),
+  identityForce: z.boolean(error('参数 identityForce 必须是布尔值')).default(false),
   /** 不进 _consumer 的敏感字段 */
-  consumerSensitive: string[];
-  /** 要统计孤儿的已发布关系（from、ref 与起点是否敏感） */
-  relations: RelationParam[];
-}
-
-/** silver.merge 的入参（insertTask 用）：schema 里带缺省值的项可省略；identity 是入队时汇总出的只读列表 */
-export type MergeInput = Omit<MergeParams, 'identity' | 'drop' | 'identityForce' | 'consumerSensitive' | 'survivorship' | 'identityExclude' | 'relations'> & {
-  identity?: readonly string[];
-  drop?: MergeDrop[];
-  identityForce?: boolean;
-  consumerSensitive?: string[];
-  survivorship?: Record<string, number>;
-  identityExclude?: string[];
-  relations?: RelationParam[];
-};
+  consumerSensitive: stringList('参数 consumerSensitive 必须是字段名列表').default([]),
+  /** 属性取舍的名次：映射 ID → 正整数名次 */
+  survivorship: z.record(z.string(error(SURVIVORSHIP)), z.number(error(SURVIVORSHIP)).int(error(SURVIVORSHIP)).min(1, error(SURVIVORSHIP)), error(SURVIVORSHIP)).default({}),
+  /** 不参与身份匹配的值（规范化后的加盐哈希，只收 64 位十六进制，挡住误传的明文） */
+  identityExclude: z.array(z.string(error('参数 identityExclude 必须是哈希（64 位小写十六进制）列表')).regex(/^[0-9a-f]{64}$/, error('参数 identityExclude 必须是哈希（64 位小写十六进制）列表')), error('参数 identityExclude 必须是哈希（64 位小写十六进制）列表')).default([]),
+}).refine(p => p.mappings.length > 0 || p.drop.length > 0, { error: MAPPINGS, path: ['mappings'] });
+/** silver.merge 的参数类型：由 mergeParams schema 推出（Known 去掉 .loose() 的索引签名） */
+export type MergeParams = Known<z.infer<typeof mergeParams>>;
 
 /** 漂移检查参数里的应有结构：表名 → 列名 → 类型（入队时由已发布映射算出） */
 const EXPECTED = '参数 expected 必须是 表名 → 列名 → 类型 的对象';
@@ -420,21 +456,7 @@ export const CONTRACTS = {
   'silver.merge': {
     label: '合并到标准层',
     needs: { piiSalt: true },
-    params: params<MergeParams, MergeInput>(z.looseObject({
-      drop: z.array(stringFields(['mapping', 'entity'], '参数 drop 必须是 { mapping, entity } 列表'), error('参数 drop 必须是 { mapping, entity } 列表')).default([]),
-      mappings: z.array(mergeMapping, error(MAPPINGS)),
-      identity: strings('参数 identity 必须是非空的字段名列表').optional(),
-      relations: z.array(z.looseObject({
-        from: stringFields(['entity', 'field'], '参数 relations 必须是关系列表（from、ref 与 sensitive）'),
-        ref: stringFields(['entity', 'field'], '参数 relations 必须是关系列表（from、ref 与 sensitive）'),
-        sensitive: z.boolean(error('参数 relations 必须是关系列表（from、ref 与 sensitive）')),
-      }, error('参数 relations 必须是关系列表（from、ref 与 sensitive）')), error('参数 relations 必须是关系列表（from、ref 与 sensitive）')).default([]),
-      identityForce: z.boolean(error('参数 identityForce 必须是布尔值')).default(false),
-      consumerSensitive: stringList('参数 consumerSensitive 必须是字段名列表').default([]),
-      survivorship: z.record(z.string(error(SURVIVORSHIP)), z.number(error(SURVIVORSHIP)).int(error(SURVIVORSHIP)).min(1, error(SURVIVORSHIP)), error(SURVIVORSHIP)).default({}),
-      identityExclude: z.array(z.string(error('参数 identityExclude 必须是哈希（64 位小写十六进制）列表')).regex(/^[0-9a-f]{64}$/, error('参数 identityExclude 必须是哈希（64 位小写十六进制）列表')), error('参数 identityExclude 必须是哈希（64 位小写十六进制）列表')).default([]),
-      // 带了要撤下的停用映射时 mappings 可以为空（停用的是实体最后一个映射）
-    }).refine(p => p.mappings.length > 0 || p.drop.length > 0, { error: MAPPINGS, path: ['mappings'] })),
+    params: schemaParams(mergeParams),
     result: resultType<Awaited<ReturnType<typeof mergeToSilver>>>(),
   },
   // 指标或标签（ADR-0025）：发布定义时入队，参数里带上入队时按当天编译好的 SQL 与它用到的实体（不再访问平台库）。
@@ -529,6 +551,7 @@ type _attachDeclaresSource = AssertTrue<{ [K in TaskKind]: (typeof CONTRACTS)[K]
 // sync 的入参不带字符串索引签名——带了的话 source-sync 的 Omit<InputOf<K>, 'sourceId'> 会丢掉全部具名字段，入队参数不再做类型检查
 type _keycheckSensitive = AssertTrue<[ParamsOf<'source.keycheck'>['sensitive']] extends [boolean] ? true : false>;
 type _syncInputKnown = AssertTrue<string extends keyof InputOf<'source.sync'> ? false : true>;
+type _mergeInputKnown = AssertTrue<string extends keyof InputOf<'silver.merge'> ? false : true>;
 
 /** 一个任务的结果类型 */
 export type ResultOf<K extends TaskKind> = NonNullable<(typeof CONTRACTS)[K]['result']['__result']>;

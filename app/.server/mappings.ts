@@ -1195,7 +1195,8 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
   const force = await mustRecomputeIdentities(tx, tenantId, identity, survivorship, identityExclude);
   if (!pending) {
     return insertTask(tx, tenantId, 'silver.merge', {
-      mappings: plans, ...(incoming.length > 0 && { drop: incoming }), identity, survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: force,
+      // identity 由 schema 推出的入参类型是 string[]（identityRules 返回 readonly string[]），这里复制成可写的
+      mappings: plans, ...(incoming.length > 0 && { drop: incoming }), identity: [...identity], survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: force,
     });
   }
   // 已在排队：并进同一个任务。领取合并不锁租户行，updateQueuedParams 只在它仍在排队时改参数（刚被领取时返回 null，由定时检查补上）
@@ -1207,7 +1208,7 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
       ...queued.filter(q => !plans.some(pl => pl.mapping === q.mapping) && !drop.some(d => d.mapping === q.mapping)),
       ...plans.map(pl => (queued.some(q => q.mapping === pl.mapping && q.rebuild) ? { ...pl, rebuild: true } : pl)),
     ].sort((a, b) => cmp(a.mapping, b.mapping));
-    return { ...p, mappings: merged, drop, identity, survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: p.identityForce || force };
+    return { ...p, mappings: merged, drop, identity: [...identity], survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: p.identityForce || force };
   });
 }
 
