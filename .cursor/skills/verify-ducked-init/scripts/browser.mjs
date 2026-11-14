@@ -234,11 +234,17 @@ async function handle(page, state, req) {
     if (!req.selector) throw new Error('count requires --selector');
     return { stdout: String(await page.locator(req.selector).count()) };
   }
+  if (cmd === 'set-file') {
+    // 文件选择框不能用 fill 写入。CSV 上传数据源的登记表单要用它。
+    if (!req.selector || !req.path) throw new Error('set-file requires --selector and --path');
+    await scope.locator(req.selector).setInputFiles(req.path);
+    return {};
+  }
   throw new Error(`unknown command ${cmd}`);
 }
 
 function usage() {
-  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|magic-link> [args]`);
+  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|magic-link> [args]`);
   console.error('click accepts --confirm accept|dismiss for a window.confirm dialog');
 }
 

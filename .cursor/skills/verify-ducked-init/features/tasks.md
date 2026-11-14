@@ -28,7 +28,9 @@ Preconditions:
 
 ## Gotchas
 
-- An empty list is the correct result for this seed. Starting `pnpm dispatcher` or inserting into `platform.tasks` is not the user path.
+- An empty list is the correct result for this seed. Starting `pnpm dispatcher` or inserting into `platform.tasks` is not the user path for this map.
+- This map does not expand `查看结果`. A succeeded sync, verify, merge, key-check, template, or serving.build row is not produced here. Those jobs finish only after `pnpm dispatcher` is running against this run's `app.env`. Launch creates one admin, so a draft that needs a second publisher is also outside this map. `scripts/browser-lab.ts` can add `eng@` / `an@crmlab-smoke.test` when `PLATFORM_DATABASE_URL` is this run's database. Do not point it at `crm_platform`.
+- `browser.mjs` can set the CSV file input with `set-file --selector '#source-file' --path <file>` after the type select is `upload`. That command is not used by the empty-list steps above.
 - The page says `本租户最近 200 个任务` even when there are none. That number is the page size, not a count of rows.
 - When a task does exist, its row is `[data-task-kind="<kind>"][data-task-status="<status>"]` and the status text is `排队中`, `运行中`, `成功`, or `失败`. A succeeded row can be expanded with `查看结果`. This seed has no such row; do not report the expand control as verified from the empty state.
 - Viewers can open `/tasks` too. They cannot open `/members`. Do not follow a missing members link on a viewer session as a task-list failure.
