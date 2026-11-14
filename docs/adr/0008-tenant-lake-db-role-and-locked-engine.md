@@ -3,7 +3,7 @@
 ADR-0001 要求每个任务只挂载本租户的数据。实测发现只“挂载本租户的 catalog”并不够：DuckLake 把 catalog 所在的 PostgreSQL 以内部库（`__ducklake_metadata_<别名>`）挂进 DuckDB，若用平台 PG 的连接串挂载，任务里的 SQL 能经它读到整个平台库，包括其他租户的 catalog 与 `platform` schema 里的会话、成员等元数据；DuckDB 本身也能直接读写任意路径的文件。
 
 因此每个租户在开通时得到：
-- 对象存储上独占的桶 `s3://lake-<租户 ID>/`：`data_path` 就是这个桶的根，建租户时创建（幂等，桶已存在也算成功）。租户 ID 是 PG `uuid`，小写 36 位，桶名共 41 位，符合 S3 桶命名规则，也与账号名 `lake-<租户 ID>` 一致。本地目录存储时仍是 `<PLATFORM_LAKE_URI>/tenants/<租户 ID>/` 独立目录（开通时的根；平台切换存储后经「迁移存储」改到新位置）。
+- 对象存储上独占的桶 `s3://lake-<租户 ID>/`：`data_path` 就是这个桶的根，建租户时创建（幂等，桶已存在也算成功）。租户 ID 是 PG `uuid`，小写 36 位，桶名共 41 位，符合 S3 桶命名规则，也与账号名 `lake-<租户 ID>` 一致。桶里的临时前缀各有归属：`_exports/` 由 ADR-0040 的清理任务删，`_serving/` 由 `serving-store.ts` 自己清，`_uploads/` 是持久数据、不过期；不给桶配生命周期规则（ADR-0040）。本地目录存储时仍是 `<PLATFORM_LAKE_URI>/tenants/<租户 ID>/` 独立目录（开通时的根；平台切换存储后经「迁移存储」改到新位置）。
 - 平台 PG 中独占的 catalog schema 与数据库角色（同名 `lake_<租户 ID>`）。schema 归平台所有，只向该角色授予 USAGE 与 CREATE；其他租户的角色连表名都看不到，也无权访问 `platform` schema。
 - 存储根在对象存储上时，存储服务上独占的账号 `lake-<租户 ID>`：平台账号经存储服务的 IAM API（SeaweedFS 内置在 S3 端口上）创建，绑定只作用于本租户桶的策略——对象权限 `arn:aws:s3:::lake-<租户 ID>/*`，`s3:ListBucket` 限 `arn:aws:s3:::lake-<租户 ID>`，**不带任何 Conditions**。隔离由桶边界执行，不再依赖网关评估 `s3:prefix` 条件（换用其他对象存储时也只需桶级别的账号隔离能力）。与 catalog 用每租户 PG 角色一样，对象存储上的隔离由存储服务执行，不依赖工作进程内的检查。
 
