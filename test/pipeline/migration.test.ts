@@ -10,7 +10,7 @@ import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { lakeMigrations } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf, getTenantLake, tenantDataPath } from '../../app/.server/lake';
-import { claimLakeMigration, requestLakeMigration, requestLakeMigrations } from '../../app/.server/lake-migration';
+import { claimLakeMigration, requestLakeMigration, requestLakeMigrations, runLakeMigration } from '../../app/.server/lake-migration';
 import { listLakeFiles } from '../../app/.server/lake-storage';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -197,6 +197,21 @@ describe.skipIf(!S3_TARGET)('对象存储上的数据湖迁移到另一个前缀
     await expect(listObjects(creds, oldPath)).rejects.toThrow(/AccessDenied|HTTP 403/);
   });
 
+  it('旧前缀迟迟收不回时迁移仍然成功并记 warning', async () => {
+    const acme = await newTenant('acme');
+    await seedLake(acme);
+    const oldPath = (await getTenantLake(acme))!.dataPath;
+    await requestLakeMigration(null, acme, S3_TARGET!);
+    // 不经调度器直接执行：注入恒成功的探测（代表网关一直没加载收窄后的新策略），60 s 超时缩成 500 ms
+    await runLakeMigration((await claimLakeMigration())!, undefined, {
+      revokeTimeoutMs: 500,
+      probe: async () => [{ path: '.keep', size: 0 }],
+    });
+    const migration = await lastMigrationOf(acme);
+    expect(migration).toMatchObject({ status: 'succeeded' });
+    expect(migration.result?.warning).toContain(oldPath);
+  });
+
   it('并发迁移后租户账号被拒绝访问旧前缀', async () => {
     // 完整测试时多个 worker 同时改共享的 IAM 配置（#541）：6 个租户同时迁移，另外 2 个无关租户的策略在迁移期间被反复重写加压
     const ids: string[] = [];
@@ -255,6 +270,47 @@ describe.skipIf(!S3_TARGET)('对象存储上的数据湖迁移到另一个前缀
     // 迁离对象存储后收回租户在存储服务上的账号
     expect(await lakeRow(acme)).toMatchObject({ s3AccessKey: null, s3SecretKey: null });
     expect(await getTenantLake(acme)).toMatchObject({ ready: true, s3User: null });
+    // 删账号路径也要等网关拒绝旧凭据：InvalidAccessKeyId 漏判会白等到超时并记 warning
+    expect((await lastMigrationOf(acme)).result?.warning).toBeUndefined();
+  });
+
+  it('删账号后等旧凭据被拒期间失联，接手的执行幂等地完成，不把数据湖指回旧前缀', async () => {
+    const acme = await newTenant('acme');
+    const version = await seedLake(acme);
+    const before = { inventory: await inventoryOf(acme), timeTravel: await timeTravel(acme, version) };
+    const oldPath = (await getTenantLake(acme))!.dataPath;
+    await requestLakeMigration(null, acme, LOCAL_TARGET);
+
+    // 第一次执行：注入恒成功的探测（旧前缀一直列得动），迁移就停在等待网关拒绝里
+    const first = (await claimLakeMigration())!;
+    const controller = new AbortController();
+    const stuck = runLakeMigration(first, controller.signal, { probe: async () => [{ path: '.keep', size: 0 }] });
+    // 等它复制、切换、删完账号（数据湖已指向本地、凭据列已清空）再像失联的调度器一样中止
+    const toPath = tenantDataPath(LOCAL_TARGET, acme);
+    const accountDropped = async () => {
+      const lake = (await lakeRow(acme))!;
+      return lake.dataPath === toPath && !lake.s3AccessKey;
+    };
+    for (let i = 0; i < 150 && !(await accountDropped()); i++) await sleep(200);
+    expect(await accountDropped()).toBe(true);
+    controller.abort();
+    await stuck; // LostClaim：不写完成状态，迁移停在 running，数据湖已指向本地
+    expect((await lastMigrationOf(acme)).status).toBe('running');
+
+    // 另一个调度器失联判定后重新领取：接手方取不出旧凭据（账号已删），要能识别这个中间状态并幂等地完成
+    const takeover = (await claimLakeMigration(0))!;
+    expect(takeover.id).toBe(first.id);
+    await runLakeMigration(takeover);
+
+    const migration = await lastMigrationOf(acme);
+    expect(migration).toMatchObject({ status: 'succeeded', error: null });
+    expect(migration.result?.warning).toBeUndefined();
+    const lake = (await lakeRow(acme))!;
+    expect(lake.dataPath).toBe(toPath);
+    expect(lake.dataPath).not.toBe(oldPath); // 不得指回已没有账号的旧 s3 前缀
+    expect(lake.s3AccessKey).toBeNull();
+    expect(await inventoryOf(acme)).toEqual(before.inventory);
+    expect(await timeTravel(acme, version)).toEqual(before.timeTravel);
   });
 });
 

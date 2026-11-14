@@ -14,6 +14,7 @@ import { SERVING_DIR } from './pipeline/lake-engine';
 import { EXPORT_DIR, inventory } from './pipeline/handlers';
 import { openTenantLake, redactLakeSecrets, type EngineLimits } from './pipeline/lake-engine';
 import { putPrefixPlaceholder, setTenantS3Prefixes } from './s3-accounts';
+import { listObjects, type S3Creds } from './s3-client';
 import { lockClaims } from './tasks';
 import { TenantError } from './tenants';
 
@@ -112,17 +113,30 @@ class LostClaim extends Error {
   constructor() { super('迁移已由其他调度器接手'); }
 }
 
+/** 收回旧前缀后等网关拒绝旧凭据：超时（默认 60 s）与探测方式（默认 listObjects），测试注入用 */
+interface RevokeWaitOptions { revokeTimeoutMs?: number; probe?: (creds: S3Creds, prefixUri: string) => Promise<unknown> }
+
 /** 同时复制的文件数 */
 const COPY_CONCURRENCY = 4;
 
 /**
  * 执行一次迁移。复制与核对期间数据湖仍指向旧位置；切换之后盘点不一致时切回旧位置。
- * 出错时记为失败并写入审计：数据湖仍指向旧位置，可以重新申请，新位置上已复制的文件下次覆盖。
- * signal 中止表示迁移已被其他调度器接手（本调度器续期失败），就此放弃、不再写库
+ * 切换后收回旧前缀并等存储网关开始拒绝旧凭据（网关重载 IAM 配置有毫秒级窗口，#560），等不到只记 warning。
+ * 上一个执行者切换后失联时，接手的执行从新位置继续（盘点、收回旧前缀）；迁离对象存储时账号已被删的，收回视为完成。
+ * 出错时记为失败并写入审计：数据湖仍指向旧位置，可以重新申请，新位置上已复制的文件下次覆盖；
+ * 旧前缀上的账号已删的不能切回去（那里已没有租户能用的账号），数据留在新位置。
+ * signal 中止表示迁移已被其他调度器接手（本调度器续期失败），就此放弃、不再写库。
+ * opts 供测试注入收回后轮询的超时与探测方式，生产路径用默认值
  */
-export async function runLakeMigration(m: ClaimedMigration, signal?: AbortSignal) {
+export async function runLakeMigration(
+  m: ClaimedMigration,
+  signal?: AbortSignal,
+  opts?: RevokeWaitOptions,
+) {
   let switched = false;
   let result = m.result;
+  // 旧前缀（对象存储）上的租户账号已被删掉：本次执行删的，或接手时上一个执行者已删。删了账号就没有能指回去的旧前缀了
+  let fromAccountGone = false;
   try {
     let inventoryBefore = m.inventory;
     const lake = (await lakeRow(m.tenantId))!;
@@ -147,20 +161,38 @@ export async function runLakeMigration(m: ClaimedMigration, signal?: AbortSignal
       throw new Error(`迁移后的盘点与迁移前不一致：迁移前 ${summarize(inventoryBefore!)}，迁移后 ${summarize(after)}`);
     }
     // 收回租户账号对旧前缀的访问：迁往对象存储时策略只留新前缀，迁离对象存储时删掉账号。失败不影响迁移结果，写进审计提醒运营者
-    const revoke = isS3(m.toPath) ? () => setTenantS3Prefixes(m.tenantId, [m.toPath]) : isS3(m.fromPath) ? () => dropTenantS3Account(m.tenantId) : null;
-    const warning = await revoke?.().then(() => undefined, e => {
-      console.error(`[数据湖迁移] 租户 ${m.tenantId} 的对象存储账号收回旧前缀失败`, e);
-      return `租户的对象存储账号仍可访问旧前缀 ${m.fromPath}（${(e as Error).message}），重新初始化数据湖可以收回`;
-    });
+    // 迁离对象存储时删账号会连凭据列一起删掉，探测要用的旧凭据得在删之前取出来。
+    // 上一个执行者删完账号、还在等网关拒绝旧凭据时失联：接手的执行取不出凭据（列已清空），也不必再收回——账号删了比网关开始拒绝更彻底
+    const lakeNow = (await lakeRow(m.tenantId))!;
+    fromAccountGone = isS3(m.fromPath) && !lakeNow.s3AccessKey;
+    const fromCreds = isS3(m.fromPath) && !fromAccountGone ? lakeSpecOf({ ...lakeNow, dataPath: m.fromPath }).s3! : null;
+    const dropping = !isS3(m.toPath) && !!fromCreds; // 迁离对象存储：删账号收回
+    let revoke: (() => Promise<unknown>) | null;
+    if (isS3(m.toPath)) revoke = () => setTenantS3Prefixes(m.tenantId, [m.toPath]);
+    else if (dropping) revoke = () => dropTenantS3Account(m.tenantId);
+    else revoke = null;
+    let warning: string | undefined;
+    if (revoke) {
+      try {
+        await revoke();
+        if (dropping) fromAccountGone = true; // 账号收回已生效：此后的失败也不能再把数据湖指回旧前缀
+      } catch (e) {
+        console.error(`[数据湖迁移] 租户 ${m.tenantId} 的对象存储账号收回旧前缀失败`, e);
+        warning = `租户的对象存储账号仍可访问旧前缀 ${m.fromPath}（${(e as Error).message}），重新初始化数据湖可以收回`;
+      }
+    }
+    if (!warning && fromCreds) warning = await waitPrefixDenied(m, fromCreds, signal, opts);
     await finish(m, 'succeeded', null, { ...result!, ...(warning && { warning }) });
   } catch (e) {
     if (e instanceof LostClaim) return;
     console.error(`[数据湖迁移失败] 租户 ${m.tenantId}：${m.fromPath} → ${m.toPath}`, e);
     try {
-      if (switched) await switchDataPath(m, m.toPath, m.fromPath);
+      // 旧前缀上的账号已删（迁离对象存储的收回已生效）时不能切回旧前缀：那里已没有租户能用的账号，切回去数据湖就永远挂了。
+      // 数据留在新位置（旧位置的文件还在），只把迁移记为失败
+      if (switched && !fromAccountGone) await switchDataPath(m, m.toPath, m.fromPath);
       // 租户账号回到只能访问旧前缀；本地目录上的租户为这次迁移新建的账号删掉
-      if (isS3(m.fromPath)) await setTenantS3Prefixes(m.tenantId, [m.fromPath]);
-      else if (isS3(m.toPath)) await dropTenantS3Account(m.tenantId);
+      if (isS3(m.fromPath) && !fromAccountGone) await setTenantS3Prefixes(m.tenantId, [m.fromPath]);
+      else if (!isS3(m.fromPath) && isS3(m.toPath)) await dropTenantS3Account(m.tenantId);
       await finish(m, 'failed', redactLakeSecrets((e as Error).message, lakeSpecOf((await lakeRow(m.tenantId))!)), result);
     } catch (e2) {
       // 切不回去或记录不了结果：迁移停在执行中，调度器失联判定后由其他调度器重新领取
@@ -207,6 +239,38 @@ async function copyAndVerify(from: string, to: string, signal?: AbortSignal) {
     throw new Error(`核对失败：新位置有 ${bad.length} 个文件缺失或大小不一致，如 ${bad.slice(0, 3).map(f => f.path).join('、')}`);
   }
   return { files: files.length, bytes: files.reduce((n, f) => n + f.size, 0) };
+}
+
+/** 旧凭据已被存储服务拒绝的报错：迁往对象存储时收回后是 AccessDenied，迁离对象存储时账号已删是 InvalidAccessKeyId */
+const REVOKED = /AccessDenied|InvalidAccessKeyId|HTTP 403/;
+
+/**
+ * 等存储网关开始拒绝旧凭据列出旧前缀：收回只是改写 IAM 配置，网关异步重载，窗口内旧凭据仍能列出旧前缀（#560）。
+ * 网关的其他报错与仍可列出一样继续等；超时不让迁移失败，只返回写进 result.warning 的提示。写法照 test 侧的 untilPrefixDenied
+ */
+async function waitPrefixDenied(
+  m: ClaimedMigration,
+  creds: S3Creds,
+  signal: AbortSignal | undefined,
+  opts: RevokeWaitOptions | undefined,
+) {
+  const timeoutMs = opts?.revokeTimeoutMs ?? 60_000;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      await (opts?.probe ?? listObjects)(creds, m.fromPath);
+    } catch (e) {
+      if (REVOKED.test((e as Error).message)) return undefined;
+      // 网关瞬时报错等其他情况：和仍能列出一样继续等
+    }
+    if (Date.now() > deadline) {
+      const message = `租户账号在 ${timeoutMs / 1000} 秒后仍能列出旧前缀 ${m.fromPath}，存储服务可能还没加载新策略`;
+      console.warn(`[数据湖迁移] 租户 ${m.tenantId}：${message}`);
+      return message;
+    }
+    if (signal?.aborted) throw new LostClaim();
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
 }
 
 /** 迁移仍归本调度器时更新它，否则抛出 LostClaim */
