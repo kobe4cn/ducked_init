@@ -186,10 +186,12 @@ const result: {
   startedAt: string; finishedAt?: string; stoppedEarly?: string;
   buildMs: number[]; buildErrors: string[];
   checkpoints: Record<string, unknown>[];
+  /** 隔离抽查被放行（2xx）的红项：隔离方案的否决项，出现任何一条就置非零退出码 */
+  isolationViolations: { checkpoint: number; a: string; b: string; op: 'read' | 'write' | 'list'; status: number }[];
   cleanup: { users: number; buckets: number; errors: string[] };
 } = {
   backend, endpoint, buckets: bucketCount, iamMode: '', startedAt: startedAt.toISOString(),
-  buildMs: [], buildErrors: [], checkpoints: [], cleanup: { users: 0, buckets: 0, errors: [] },
+  buildMs: [], buildErrors: [], checkpoints: [], isolationViolations: [], cleanup: { users: 0, buckets: 0, errors: [] },
 };
 
 const policyDir = join(tmpdir(), 'bpt-policies');
@@ -350,12 +352,21 @@ async function checkpoint(at: number) {
   for (const a of sample(tenants, 5)) {
     const b = tenants.filter(t => t !== a)[Math.floor(Math.random() * (tenants.length - 1))]!;
     await s3Ok(`写隔离对象 ${b.bucket}/isolation`, platform, { method: 'PUT', path: `/${b.bucket}/isolation`, body: body1k });
-    isolation.push({
+    const row = {
       a: a.user, b: b.user,
       read: await s3(tenantCreds(a), { method: 'GET', path: `/${b.bucket}/isolation` }),
       write: await s3(tenantCreds(a), { method: 'PUT', path: `/${b.bucket}/evil`, body: 'x' }),
       list: await s3(tenantCreds(a), { method: 'GET', path: `/${b.bucket}`, query: { 'list-type': '2' } }),
-    });
+    };
+    isolation.push(row);
+    for (const op of ['read', 'write', 'list'] as const) {
+      const status = row[op];
+      if (status >= 200 && status < 300) {
+        result.isolationViolations.push({ checkpoint: at, a: a.user, b: b.user, op, status });
+        console.error(`\x1b[31m隔离放行（否决项）：${a.user} 的凭据 ${op} ${b.bucket} 返回 HTTP ${status}\x1b[0m`);
+        process.exitCode = 1;
+      }
+    }
   }
   cp.isolation = isolation;
 
@@ -409,9 +420,9 @@ if (values.keep) {
 
 result.finishedAt = new Date().toISOString();
 console.log(`\n===== 结果（${backend}，${tenants.length} 个桶，墙钟 ${((Date.now() - startedAt.getTime()) / 60_000).toFixed(1)} 分钟）=====`);
-console.log(`建租户失败 ${result.buildErrors.length} 次；清理失败 ${result.cleanup.errors.length} 次`);
+console.log(`建租户失败 ${result.buildErrors.length} 次；清理失败 ${result.cleanup.errors.length} 次；隔离放行 ${result.isolationViolations.length} 次`);
 if (values.out) {
   writeFileSync(values.out, JSON.stringify(result, null, 2));
   console.log(`JSON 已写 ${values.out}`);
 }
-if (result.buildErrors.length || result.cleanup.errors.length || result.stoppedEarly) process.exitCode = 1;
+if (result.buildErrors.length || result.cleanup.errors.length || result.isolationViolations.length || result.stoppedEarly) process.exitCode = 1;
