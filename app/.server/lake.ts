@@ -12,6 +12,7 @@ import { isS3 } from './lake-storage';
 import { openTenantLake, type LakeSpec } from './pipeline/lake-engine';
 import { ensureLakeSchemas } from './pipeline/lake-schemas';
 import { deleteTenantS3Account, issueTenantReadOnlyS3Account, issueTenantS3Account, platformS3, putPrefixPlaceholder, s3UserOf } from './s3-accounts';
+import { createBucket } from './s3-client';
 
 type TenantLakeRow = typeof tenantLakes.$inferSelect;
 
@@ -24,14 +25,21 @@ export function normalizeLakeRoot(uri: string) {
 /** 租户数据湖的根：PLATFORM_LAKE_URI，默认 ./data/platform-lake。只决定之后开通的租户放在哪里 */
 const lakeRoot = () => normalizeLakeRoot(process.env.PLATFORM_LAKE_URI ?? './data/platform-lake');
 
-/** 租户在某个数据湖根下的存储前缀：<根>/tenants/<租户 ID>/ */
+/**
+ * 租户在某个数据湖根下的存储前缀（共享桶里的写法）：<根>/tenants/<租户 ID>/。迁移存储的目标仍按它算（#689 改为
+ * 迁入独占的桶）；新开通的租户在 layout() 里直接得到独占的桶，不再用它
+ */
 export const tenantDataPath = (root: string, tenantId: string) =>
   isS3(root) ? `${root}/tenants/${tenantId}/` : `${join(root, 'tenants', tenantId)}/`;
 
-/** 每个租户的存储前缀与 catalog schema、数据库角色都由租户 ID 决定 */
+/** data_path 是对象存储上租户独占的桶根（s3://lake-<租户 ID>/，ADR-0008）；共享桶里的前缀租户不匹配 */
+export const isTenantBucketRoot = (dataPath: string) => /^s3:\/\/lake-[^/]+\/$/.test(dataPath);
+
+/** 每个租户的存储路径与 catalog schema、数据库角色都由租户 ID 决定：对象存储上是独占的桶 s3://lake-<租户 ID>/（ADR-0008），本地目录是 <根>/tenants/<租户 ID>/ */
 function layout(tenantId: string) {
   const name = `lake_${tenantId.replace(/-/g, '')}`;
-  return { dataPath: tenantDataPath(lakeRoot(), tenantId), catalogSchema: name, dbRole: name };
+  const root = lakeRoot();
+  return { dataPath: isS3(root) ? `s3://lake-${tenantId}/` : tenantDataPath(root, tenantId), catalogSchema: name, dbRole: name };
 }
 
 /** 租户的只读数据库角色：租户角色名加 _ro */
@@ -200,14 +208,19 @@ export async function dropTenantS3Account(tenantId: string) {
 }
 
 /**
- * 建好存储前缀（对象存储上先建好本租户的账号，再用它写入占位对象 .keep）并初始化 DuckLake catalog（首次挂载时建元数据表），
+ * 建好存储前缀（对象存储上先建桶、再建好本租户的账号，然后用它写入占位对象 .keep）并初始化 DuckLake catalog（首次挂载时建元数据表），
  * 再建好名字固定的 schema 与平台表（ensureLakeSchemas）。
+ * 桶租户（ADR-0008）先用平台凭据建桶再发账号：租户账号没有建桶权限，且 IAM 写入后要等存储网关重载才生效（#560），
+ * 顺序是建桶 → 发账号 → 只读凭据 → 写 .keep。
  * catalog 还没有元数据表时以加密方式新建，此后写入的数据文件都加密（ADR-0020）；加密上线前建好的 catalog 保持不加密。
- * 可重复执行：开通时初始化失败，或本功能上线前开通、还没有对象存储账号的租户，运营者可以重试补建。
+ * 可重复执行：开通时初始化失败，桶已存在也算成功，或本功能上线前开通、还没有对象存储账号的（共享桶前缀）租户，运营者可以重试补建。
  * 用本租户的数据库角色挂载，初始化出的元数据表归该角色所有。新建对象存储账号时记入审计，操作者为 operator。
  * 工作台用的只读凭据也在这里补齐（ensureReadOnlyLakeAccess）
  */
 export async function initTenantCatalog(tenantId: string, operator: OperatorActor) {
+  const lake = await lakeRow(tenantId);
+  if (!lake) throw new Error(`租户 ${tenantId} 还没有数据湖`);
+  if (isTenantBucketRoot(lake.dataPath)) await createBucket(platformS3(), lake.dataPath);
   await ensureTenantS3Account(tenantId, operator);
   await ensureReadOnlyLakeAccess(tenantId);
   const spec = lakeSpecOf((await lakeRow(tenantId))!);

@@ -9,7 +9,9 @@ import jsQR from 'jsqr';
 import { PNG } from 'pngjs';
 import type { Mail } from '../../app/.server/mailer';
 import * as opsAuth from '../../app/.server/ops-auth';
-import { deleteTenantS3Account } from '../../app/.server/s3-accounts';
+import { isTenantBucketRoot } from '../../app/.server/lake';
+import { deleteTenantS3Account, platformS3 } from '../../app/.server/s3-accounts';
+import { deleteBucket } from '../../app/.server/s3-client';
 import * as tenants from '../../app/.server/tenants';
 import { totpCode } from '../../app/.server/totp';
 import { record, timed, timingEnabled } from '../timing';
@@ -125,7 +127,7 @@ async function start(): Promise<TestApp> {
   };
 }
 
-/** 清空平台元数据与租户数据湖（catalog schema、数据库角色与只读角色、对象存储账号、本地存储前缀），保证每个用例从空库开始 */
+/** 清空平台元数据与租户数据湖（catalog schema、数据库角色与只读角色、对象存储账号与桶、本地存储前缀），保证每个用例从空库开始 */
 export function resetDb() {
   return timed('resetDb', reset);
 }
@@ -135,11 +137,28 @@ async function reset() {
   await client.connect();
   const { rows } = await client.query<{ tenant_id: string; data_path: string; catalog_schema: string; db_role: string; ro_db_role: string | null }>(
     'SELECT tenant_id, data_path, catalog_schema, db_role, ro_db_role FROM platform.tenant_lakes');
+  const droppedBuckets = new Set<string>();
+  const dropBucketIfOwned = async (dataPath: string) => {
+    if (!droppedBuckets.has(dataPath)) {
+      droppedBuckets.add(dataPath);
+      await deleteBucket(platformS3(), dataPath);
+    }
+  };
   for (const r of rows) {
     // 只读角色的权限与默认权限随 schema 一起删掉，之后才能删角色；用例清空了 ro 列时按命名规则找到它
     await client.query(`DROP SCHEMA IF EXISTS "${r.catalog_schema}" CASCADE; DROP ROLE IF EXISTS "${r.ro_db_role ?? `${r.db_role}_ro`}"; DROP ROLE IF EXISTS "${r.db_role}"`);
     // 上一轮在对象存储上跑、这一轮没有配置对象存储时，留下的账号不清（租户 ID 每次不同，不会冲突）
-    if (r.data_path.startsWith('s3://') && process.env.TEST_S3_LAKE_URI) await deleteTenantS3Account(r.tenant_id);
+    if (r.data_path.startsWith('s3://') && process.env.TEST_S3_LAKE_URI) {
+      await deleteTenantS3Account(r.tenant_id);
+      // 桶租户（每租户一桶）的桶也要删：TRUNCATE 之后没人知道这些桶，全量测试会漏下几百个桶（每个桶首写约占 7 个卷，#687）
+      if (isTenantBucketRoot(r.data_path)) await dropBucketIfOwned(r.data_path);
+    }
+  }
+  // 迁移离开旧桶的租户（lake_migrations.from_path 记着旧桶，迁移不删旧位置的文件）：桶同样没人认领，一并删掉
+  if (process.env.TEST_S3_LAKE_URI) {
+    const { rows: migrated } = await client.query<{ from_path: string }>(
+      `SELECT DISTINCT from_path FROM platform.lake_migrations WHERE from_path LIKE 's3://lake-%'`);
+    for (const r of migrated) if (isTenantBucketRoot(r.from_path)) await dropBucketIfOwned(r.from_path);
   }
   // 开启计时时，清表前把各任务的耗时记下（应用内部的开销用任务表近似；beforeAll 里清库的文件，最后一批任务记在下一个文件名下）
   if (timingEnabled()) {
@@ -149,7 +168,7 @@ async function reset() {
   }
   await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions, platform.tenant_lakes, platform.tasks, platform.lake_migrations CASCADE');
   await client.end();
-  // 对象存储上的数据不清：租户 ID 每次不同，前缀不会重叠
+  // 共享桶里的前缀数据不清：租户 ID 每次不同，前缀不会重叠；桶租户的桶在上面已按租户删掉
   if (!process.env.PLATFORM_LAKE_URI!.startsWith('s3://')) await rm(process.env.PLATFORM_LAKE_URI!, { recursive: true, force: true });
 }
 

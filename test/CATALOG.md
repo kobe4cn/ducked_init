@@ -79,7 +79,7 @@
 | `pipeline/migration.test.ts` | 数据湖迁移存储：本地目录与对象存储之间来回迁移表、行数、时间旅行一致，旧位置文件保留，之后的写入落新位置；迁往对象存储后工作进程与租户账号只能访问新前缀（对象存储的网关异步加载共享 IAM 配置，断言旧前缀被拒前先等策略生效，另断言迁移结果没有 warning；并发迁移 6 个租户、无关租户策略反复重写加压后旧前缀同样被拒，#541）；收回旧前缀后等存储网关开始拒绝旧凭据再报告成功，60 s 等不到只记 warning 不算失败（#560 的网关重载窗口，#569）；删账号后等旧凭据被拒期间失联被接手时，接手的执行幂等地完成迁移、不把数据湖指回已删账号的旧前缀，接手时凭据已清空记 warning；接手后盘点失败记 failed、数据湖留在新位置、不再卡在执行中（#569、#673）；迁移期间的调度（等运行中的任务、不派发该租户、其他租户不受影响、结束后照常）；中途失败保留旧位置与数据、可重试覆盖残留；重复申请与 `--all`、命令行用法 |
 | `pipeline/encryption.test.ts` | 数据湖加密存储：新租户原始层 / `_keys` / `_mirror` 的文件不带密钥读不出、不含明文；加密前的未加密湖重新初始化照常同步 |
 | `pipeline/reset.test.ts` | 开发用重置数据湖 |
-| `pipeline/s3-accounts.test.ts` | 租户对象存储账号的删除（#621，需 `TEST_S3_LAKE_URI`）：`deleteTenantS3Account` 删掉读写与只读账号后 `GetUserPolicy` 都回 `NoSuchEntity`、`ListUsers` 不含、filer 可达（本机 8888）时 `/etc/iam/policies.json` 的 `inlinePolicies` 里也没有；账号被别的路径删掉一半（密钥没了、策略没删）时再删一次不报错，账号不在也补删一次策略 |
+| `pipeline/s3-accounts.test.ts` | 租户对象存储账号的删除（#621，需 `TEST_S3_LAKE_URI`）：`deleteTenantS3Account` 删掉读写与只读账号后 `GetUserPolicy` 都回 `NoSuchEntity`、`ListUsers` 不含、filer 可达（本机 8888）时 `/etc/iam/policies.json` 的 `inlinePolicies` 里也没有；账号被别的路径删掉一半（密钥没了、策略没删）时再删一次不报错，账号不在也补删一次策略；每租户一桶（ADR-0008、#663）：新租户的策略只放行本桶（对象与 `s3:ListBucket`，不带 `Condition`），用本租户凭据读、列别的桶都 403，`initTenantCatalog` 再执行一次建桶幂等 |
 | `pipeline/lake-schemas.test.ts` | 固定的 schema 与平台表（ADR-0020）：新租户的湖里有 `gold`、`silver`、`silver_records` 与 `silver._merges`（带 `scheme` 列）、`_assertion_runs`、`_quarantine`，不预建身份打通的表；并发数为 4 的租户在空的结果层上同时跑 6 个 `gold.dsl` 全部成功（确有任务同时运行），`resetTenantLake` 之后同样成立；`pnpm lake:ensure` 给缺表、缺 `gold`、缺 `scheme` 列的租户补建（`--tenant` 只处理一个，不给时处理全部） |
 | `http/login.test.ts` | 租户与 Magic Link 登录 |
 | `http/members.test.ts` | 成员邀请与角色、权限矩阵、审计日志、跨租户拒绝 |
