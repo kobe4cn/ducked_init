@@ -199,7 +199,7 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
       </div>
 
       <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
-        <SectionHeader title="配额">每个任务在独立进程中运行，内存与线程按此限制；同时运行的任务超过并发数时排队。修改对之后派发的任务生效，并记入租户的审计日志。</SectionHeader>
+        <SectionHeader title="配额">每个任务在独立进程中运行，内存与线程按此限制；同时运行的任务超过并发数时排队。存储配额：租户桶的总用量上限，超出后拒绝写入类任务和上传（软配额）。修改对之后派发的任务生效，并记入租户的审计日志。</SectionHeader>
         <Form method="post" className="max-w-2xl">
           <input type="hidden" name="intent" value="set-quota" />
           <FieldGroup className="flex-row items-end">

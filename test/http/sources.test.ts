@@ -168,7 +168,7 @@ describe('登记数据源', () => {
   it('超过租户上传上限的文件 413：边读边计数与 Content-Length 预检都拒；上限改小后原来能传的文件被拒；被拒的不留数据源与文件', async () => {
     const { tenantId, browser } = await engineerOf('acme');
     const MiB = 1024 * 1024;
-    const limit = (maxUploadMb: number) => setTenantQuota(null, tenantId, { memoryLimitMb: 2048, threads: 2, maxConcurrentTasks: 1, maxUploadMb });
+    const limit = (maxUploadMb: number) => setTenantQuota(null, tenantId, { memoryLimitMb: 2048, threads: 2, maxConcurrentTasks: 1, maxUploadMb, storageQuotaMb: 10240 });
     const csvOf = (bytes: number) => new File(['id\n' + '1\n'.repeat(Math.ceil((bytes - 3) / 2))], 'big.csv');
     const sourceCount = async () => (await getDb().select().from(sources).where(eq(sources.tenantId, tenantId))).length;
     const expectRejected = async (res: Response, mb: number) => {

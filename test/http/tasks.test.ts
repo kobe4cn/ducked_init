@@ -159,21 +159,28 @@ describe('运营者设置租户配额', () => {
     expect(page).toMatch(/name="memoryLimitMb"[^>]*value="2048"|value="2048"[^>]*name="memoryLimitMb"/);
     expect(page).toContain('单个上传文件上限');
     expect(page).toMatch(/name="maxUploadMb"[^>]*value="100"|value="100"[^>]*name="maxUploadMb"/);
+    expect(page).toContain('租户存储配额');
+    expect(page).toMatch(/name="storageQuotaMb"[^>]*value="10240"|value="10240"[^>]*name="storageQuotaMb"/);
 
-    const bad = await ops.post(`/ops/tenants/${acme}`, { intent: 'set-quota', memoryLimitMb: '64', threads: '2', maxConcurrentTasks: '1', maxUploadMb: '100' });
+    const bad = await ops.post(`/ops/tenants/${acme}`, { intent: 'set-quota', memoryLimitMb: '64', threads: '2', maxConcurrentTasks: '1', maxUploadMb: '100', storageQuotaMb: '10240' });
     expect(bad.status).toBe(400);
     expect(await bad.text()).toContain('单任务内存上限必须是 128 到');
 
-    const ok = await ops.post(`/ops/tenants/${acme}`, { intent: 'set-quota', memoryLimitMb: '4096', threads: '4', maxConcurrentTasks: '3', maxUploadMb: '50' });
+    const badStorage = await ops.post(`/ops/tenants/${acme}`, { intent: 'set-quota', memoryLimitMb: '2048', threads: '2', maxConcurrentTasks: '1', maxUploadMb: '100', storageQuotaMb: '0' });
+    expect(badStorage.status).toBe(400);
+    expect(await badStorage.text()).toContain('租户存储配额必须是 1 到');
+
+    const ok = await ops.post(`/ops/tenants/${acme}`, { intent: 'set-quota', memoryLimitMb: '4096', threads: '4', maxConcurrentTasks: '3', maxUploadMb: '50', storageQuotaMb: '20480' });
     expect(ok.status).toBe(302);
     const after = await (await ops.get(`/ops/tenants/${acme}`)).text();
     expect(after).toMatch(/value="4096"/);
     expect(after).toMatch(/name="maxUploadMb"[^>]*value="50"|value="50"[^>]*name="maxUploadMb"/);
+    expect(after).toMatch(/name="storageQuotaMb"[^>]*value="20480"|value="20480"[^>]*name="storageQuotaMb"/);
 
     const admin = await loginAs(app, 'admin@acme.com');
     const audit = await (await admin.get('/audit')).text();
     expect(audit).toContain('调整配额');
-    expect(audit).toContain('内存 2048 MiB → 4096 MiB，线程 2 → 4，并发任务 1 → 3，上传 100 MiB → 50 MiB');
+    expect(audit).toContain('内存 2048 MiB → 4096 MiB，线程 2 → 4，并发任务 1 → 3，上传 100 MiB → 50 MiB，存储 10240 MiB → 20480 MiB');
   });
 });
 

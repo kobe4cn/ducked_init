@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."tenants" ADD COLUMN "storage_quota_mb" integer DEFAULT 10240 NOT NULL;

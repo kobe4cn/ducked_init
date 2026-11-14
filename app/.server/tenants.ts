@@ -113,6 +113,13 @@ export async function uploadLimitOf(tenantId: string): Promise<number> {
   return tenant.maxUploadMb;
 }
 
+/** 租户存储配额（MiB，ADR-0008）：租户桶的总用量上限，软配额；不存在时抛出 404 */
+export async function storageQuotaOf(tenantId: string): Promise<number> {
+  const [tenant] = await getDb().select({ storageQuotaMb: tenants.storageQuotaMb }).from(tenants).where(eq(tenants.id, tenantId));
+  if (!tenant) throw new TenantError(`租户不存在：${tenantId}`, 404);
+  return tenant.storageQuotaMb;
+}
+
 async function tryInitTenantCatalog(tenantId: string, operator: OperatorActor) {
   try {
     await initTenantCatalog(tenantId, operator);
@@ -137,6 +144,7 @@ const tenantSummaries = () =>
       threads: tenants.threads,
       maxConcurrentTasks: tenants.maxConcurrentTasks,
       maxUploadMb: tenants.maxUploadMb,
+      storageQuotaMb: tenants.storageQuotaMb,
       hybridSearch: tenants.hybridSearch,
       memberCount: sql<number>`count(${members.id})::int`,
       adminEmails: sql<string[]>`coalesce(array_agg(${members.email} order by ${members.email}) filter (where ${members.role} = 'admin'), '{}')`,
