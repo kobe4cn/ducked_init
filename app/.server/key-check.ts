@@ -8,7 +8,7 @@ import { publishedCustomEntities, type RegisteredEntity } from './custom-entitie
 import { getDb } from './db/client';
 import { tasks, tenants, type TaskStatus } from './db/schema';
 import { entityOf } from '../lib/canonical-model';
-import { mergePlans } from './mappings';
+import { mergePlans } from './merges';
 import type { KeyCheckParams } from './pipeline/key-check-engine';
 import type { MergeMappingParam } from './pipeline/merge-engine';
 import { readResult } from './pipeline/task-contracts';
