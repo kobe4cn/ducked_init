@@ -15,6 +15,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs, promisify } from 'node:util';
+import { IamError } from '../app/.server/s3-accounts';
 import { listObjects, signedFetch, xmlTag, xmlTags, type S3Creds } from '../app/.server/s3-client';
 
 const execFile = promisify(execFileCb);
@@ -57,10 +58,6 @@ const policyFor = (bucket: string) => JSON.stringify({
     { Effect: 'Allow', Action: ['s3:ListBucket'], Resource: [`arn:aws:s3:::${bucket}`] },
   ],
 });
-
-class IamError extends Error {
-  constructor(action: string, readonly code: string, message: string) { super(`IAM ${action} 失败（${code}）：${message}`); }
-}
 
 /** 用平台账号调 AWS IAM API（表单 POST，Version=2010-05-08，写法照 app/.server/s3-accounts.ts 的 iam()） */
 async function iam(action: string, params: Record<string, string>) {
@@ -233,6 +230,12 @@ for (let i = 1; i <= bucketCount && !result.stoppedEarly; i++) {
 }
 
 // ---------------- checkpoint ----------------
+/** master /dir/status 里用到的字段（缺字段时按 0 / undefined 记，不抛错） */
+interface MasterTopology {
+  Free?: number; Max?: number;
+  DataCenters?: { Racks?: { DataNodes?: { Volumes?: number }[] }[] }[];
+}
+
 function sample<T>(arr: T[], n: number) {
   const out: T[] = [];
   while (out.length < Math.min(n, arr.length)) {
@@ -346,10 +349,11 @@ async function checkpoint(at: number) {
   // ⑤ 卷数（SeaweedFS）
   if (backend === 'seaweedfs' && values.master) {
     try {
-      const topo = (await (await fetch(`http://${values.master}/dir/status`, { signal: AbortSignal.timeout(5000) })).json()) as any;
+      const topo: unknown = await (await fetch(`http://${values.master}/dir/status`, { signal: AbortSignal.timeout(5000) })).json();
+      const t = (topo as { Topology?: MasterTopology } | null)?.Topology;
       let volumes = 0;
-      for (const dc of topo.Topology?.DataCenters ?? []) for (const rack of dc.Racks ?? []) for (const node of rack.DataNodes ?? []) volumes += node.Volumes ?? 0;
-      cp.volumes = { free: topo.Topology?.Free, max: topo.Topology?.Max, volumes };
+      for (const dc of t?.DataCenters ?? []) for (const rack of dc.Racks ?? []) for (const node of rack.DataNodes ?? []) volumes += node.Volumes ?? 0;
+      cp.volumes = { free: t?.Free, max: t?.Max, volumes };
     } catch (e) { cp.volumes = { note: e instanceof Error ? e.message : e }; }
   }
   result.checkpoints.push(cp);
@@ -369,7 +373,6 @@ async function listObjectsOrGone(bucket: string) {
     throw e;
   }
 }
-
 
 if (values.keep) {
   console.log('\n--keep：跳过清理');
@@ -391,7 +394,8 @@ if (values.keep) {
   }
 }
 
-result.finishedAt = new Date().toISOString();console.log(`\n===== 结果（${backend}，${tenants.length} 个桶，墙钟 ${((Date.now() - startedAt.getTime()) / 60_000).toFixed(1)} 分钟）=====`);
+result.finishedAt = new Date().toISOString();
+console.log(`\n===== 结果（${backend}，${tenants.length} 个桶，墙钟 ${((Date.now() - startedAt.getTime()) / 60_000).toFixed(1)} 分钟）=====`);
 console.log(`建租户失败 ${result.buildErrors.length} 次；清理失败 ${result.cleanup.errors.length} 次`);
 if (values.out) {
   writeFileSync(values.out, JSON.stringify(result, null, 2));
