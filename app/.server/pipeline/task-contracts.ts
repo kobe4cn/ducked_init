@@ -102,8 +102,6 @@ export const SNAPSHOT_TABLE = /^gold\.([a-z][a-z0-9]*)__[0-9a-f-]{36}$/;
 export const EXPORT_DIR = '_exports/';
 export const EXPORT_FORMATS = ['parquet', 'csv'] as const;
 export type ExportFormat = (typeof EXPORT_FORMATS)[number];
-/** 人群导出的一个条件：标签、取值与入队时定下的快照表（结果层里不带 schema 的表名） */
-export interface ExportCondition { tag: string; value: string; table: string }
 
 /** 平台判断的未进湖原因：账号读不了、源端已删除由工作进程实时判断，不在参数里 */
 const NOT_IN_LAKE_REASONS = Object.keys(LAKE_COVERAGE).filter(c => !['in_lake', 'unreadable', 'gone'].includes(c)) as NotInLakeReason[];
@@ -269,6 +267,15 @@ const servingParams = z.looseObject({
 /** 人群导出的参数：格式与条件（入队时由平台库查出快照表） */
 const CONDITIONS = '参数 conditions 必须是非空的 { tag, value, table } 列表，table 是标签快照表名';
 const FORMAT = `参数 format 只能是 ${EXPORT_FORMATS.join(' / ')}`;
+
+/** 人群导出的一个条件：标签、取值与入队时定下的快照表（结果层里不带 schema 的表名） */
+const exportCondition = z.looseObject({
+  tag: z.string(error(CONDITIONS)),
+  value: z.string(error(CONDITIONS)),
+  table: z.string(error(CONDITIONS)).regex(/^tag__[0-9a-f-]{36}$/, error(CONDITIONS)),
+}, error(CONDITIONS));
+/** 人群导出条件的类型：由 exportCondition schema 推出（Known 去掉 .loose() 的索引签名，exports.ts 的 Omit 才不丢具名字段） */
+export type ExportCondition = Known<z.output<typeof exportCondition>>;
 
 /** 模板任务（ADR-0004）公共参数的报错文案：asOf 的这句与各模板 parseAsOf 的一字不差 */
 const ASOF = '参数 asOf 必须是 YYYY-MM-DD 格式的日期';
@@ -509,18 +516,15 @@ export const CONTRACTS = {
     result: resultType<{ version: number; path: string; rows: Awaited<ReturnType<typeof buildServingStore>> }>(),
   },
   // 人群导出（ADR-0040）：按入队时定下的标签快照表筛出所有条件同时满足的 consumer_id，按它排序写到本租户存储前缀下的 _exports/<任务 ID>.<格式>。
-  // 数据湖只读挂载；排队期间快照表被删掉（快照过期）时失败、不写文件。snapshots（清理与审计读）原样放行。
+  // 数据湖只读挂载；排队期间快照表被删掉（快照过期）时失败、不写文件。snapshots 只声明不校验（清理与审计读）。
   // 结果里的 path 在导出文件过了保留期被清理后会从结果里删掉（exports.ts），所以可选
   'export.tags': {
     label: '人群导出',
     readOnlyLake: true,
-    params: params<{ format: ExportFormat; conditions: ExportCondition[] } & Record<string, unknown>>(z.looseObject({
+    params: schemaParams(z.looseObject({
       format: z.enum(EXPORT_FORMATS, error(FORMAT)),
-      conditions: z.array(z.looseObject({
-        tag: z.string(error(CONDITIONS)),
-        value: z.string(error(CONDITIONS)),
-        table: z.string(error(CONDITIONS)).regex(/^tag__[0-9a-f-]{36}$/, error(CONDITIONS)),
-      }, error(CONDITIONS)), error(CONDITIONS)).min(1, error(CONDITIONS)),
+      conditions: z.array(exportCondition, error(CONDITIONS)).min(1, error(CONDITIONS)),
+      snapshots: z.unknown().optional(),
     })),
     result: resultType<{ rows: number; path?: string; format: ExportFormat }>(),
   },
@@ -549,10 +553,13 @@ type AssertTrue<T extends true> = T;
 type _needsSourceInParams = AssertTrue<{ [K in SourceNeedKinds]: [ParamsOf<K>] extends [{ sourceId: string }] ? true : false }[SourceNeedKinds] extends true ? true : false>;
 type _attachDeclaresSource = AssertTrue<{ [K in TaskKind]: (typeof CONTRACTS)[K] extends { attachSource: true } ? (K extends SourceNeedKinds ? true : false) : true }[TaskKind] extends true ? true : false>;
 // schemaParams 推出的类型（z.custom 定型、Known 去索引签名）：keycheck 的 sensitive 推出必填 boolean（不是 boolean | undefined）；
-// sync 的入参不带字符串索引签名——带了的话 source-sync 的 Omit<InputOf<K>, 'sourceId'> 会丢掉全部具名字段，入队参数不再做类型检查
+// sync 的入参不带字符串索引签名——带了的话 source-sync 的 Omit<InputOf<K>, 'sourceId'> 会丢掉全部具名字段，入队参数不再做类型检查；
+// export 的条件与入参同理（exports.ts 的 Omit<ExportCondition, 'table'>、入队时带的 snapshots）
 type _keycheckSensitive = AssertTrue<[ParamsOf<'source.keycheck'>['sensitive']] extends [boolean] ? true : false>;
 type _syncInputKnown = AssertTrue<string extends keyof InputOf<'source.sync'> ? false : true>;
 type _mergeInputKnown = AssertTrue<string extends keyof InputOf<'silver.merge'> ? false : true>;
+type _exportConditionKnown = AssertTrue<string extends keyof ExportCondition ? false : true>;
+type _exportInputKnown = AssertTrue<string extends keyof InputOf<'export.tags'> ? false : true>;
 
 /** 一个任务的结果类型 */
 export type ResultOf<K extends TaskKind> = NonNullable<(typeof CONTRACTS)[K]['result']['__result']>;
