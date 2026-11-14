@@ -3,7 +3,9 @@
 // 回收的范围：基准名加后缀、可能再加 worker 后缀 _w<i>：
 // - PG：crm_platform_test、crm_source_test、crm_platform_browser 的库，以及这些库里租户的 catalog 角色 lake_<id>（集群级，
 //   删库不会带走）。先记下依赖在库里的角色，删库后没有其他库再依赖的才删
-// - 对象存储：TEST_S3_LAKE_URI 加后缀的前缀下的全部对象，以及策略只授权这些前缀的账号（租户的 lake-<id>[-ro]、源文件的 src-*-<id>）
+// - 对象存储：TEST_S3_LAKE_URI 加后缀的前缀下的全部对象，以及策略只授权这些前缀的账号（租户的 lake-<id>[-ro]、源文件的 src-*-<id>）；
+//   每租户一桶（ADR-0008）的桶租户另有独占的桶 lake-<租户 ID>——桶名不含票后缀、开发租户的桶同名，不能按 lake-* 列桶全删，
+//   只能按测试库 platform.tenant_lakes 里记的 data_path 连桶带账号删（删库前先记下）
 // - MySQL / MongoDB：TEST_MYSQL_URL、TEST_MONGO_URL 的库名加后缀的库（MongoDB 删库不删库里的用户与角色，先删它们）
 // - PG / MySQL：源端测试账号 crm_src_reader|writer_i<n>_w<i>（集群级，test/pipeline/source-fixtures.ts 建的，
 //   名字见 scripts/test-resource-names.ts；只在删库之后回收，还有依赖（如开发库在用）就跳过。MongoDB 的同名账号
@@ -14,8 +16,8 @@
 import { DuckDBInstance } from '@duckdb/node-api';
 import { MongoClient } from 'mongodb';
 import pg from 'pg';
-import { platformS3 } from '../app/.server/s3-accounts';
-import { deleteObject, listObjects, signedFetch, xmlTag, xmlTags } from '../app/.server/s3-client';
+import { platformS3, deleteTenantS3Account } from '../app/.server/s3-accounts';
+import { deleteBucket, deleteObject, listObjects, signedFetch, xmlTag, xmlTags } from '../app/.server/s3-client';
 import { accountsToDrop, escapeRe, nameMatcher, suffixPattern } from './test-resource-names';
 
 const PG_URL = process.env.TEST_PLATFORM_DATABASE_URL ?? 'postgres://crm:crm@localhost:5432/crm_platform_test';
@@ -34,6 +36,9 @@ const suffixRe = suffixPattern(all ? 'all' : suffixes);
 const matcher = (bases: string[]) => nameMatcher(bases, suffixRe);
 const dbNameOf = (url: string) => new URL(url).pathname.slice(1);
 
+/** 测试库 tenant_lakes 里登记的桶租户（每租户一桶），以及 lake_migrations 里迁离的旧桶：删库后没人知道它们，先记下来交给 dropS3Buckets 回收 */
+const bucketTenants: { tenantId: string | null; dataPath: string }[] = [];
+
 async function dropPg() {
   const admin = new pg.Client({ connectionString: Object.assign(new URL(PG_URL), { pathname: '/postgres' }).toString() });
   await admin.connect();
@@ -42,6 +47,7 @@ async function dropPg() {
     const dbs = (await admin.query<{ datname: string }>('SELECT datname FROM pg_database')).rows.map(r => r.datname).filter(n => re.test(n));
     const roles = new Set<string>();
     for (const db of dbs) {
+      await collectBucketTenants(db);
       const { rows } = await admin.query<{ rolname: string }>(
         `SELECT DISTINCT r.rolname FROM pg_shdepend s JOIN pg_roles r ON r.oid = s.refobjid JOIN pg_database d ON d.oid = s.dbid
          WHERE d.datname = $1 AND r.rolname LIKE 'lake\\_%'`, [db]);
@@ -68,6 +74,50 @@ async function dropPg() {
   } finally {
     await admin.end();
   }
+}
+
+/** 连到库里记下桶租户（tenant_lakes.data_path 或 lake_migrations.from_path 是桶根的行）：表不存在（如 crm_source_test 没有 platform schema）或连不上就跳过 */
+async function collectBucketTenants(db: string) {
+  const client = new pg.Client({ connectionString: Object.assign(new URL(PG_URL), { pathname: `/${db}` }).toString() });
+  try {
+    await client.connect();
+    const { rows } = await client.query<{ tenant_id: string; data_path: string }>(
+      `SELECT tenant_id, data_path FROM platform.tenant_lakes WHERE data_path LIKE 's3://lake-%'`);
+    for (const r of rows) if (/^s3:\/\/lake-[^/]+\/$/.test(r.data_path)) bucketTenants.push({ tenantId: r.tenant_id, dataPath: r.data_path });
+    // 迁移离开旧桶的租户（迁移不删旧位置的文件）：桶同样要回收，账号已随 tenant_lakes 那边处理，这里只记桶
+    const { rows: migrated } = await client.query<{ from_path: string }>(
+      `SELECT DISTINCT from_path FROM platform.lake_migrations WHERE from_path LIKE 's3://lake-%'`);
+    for (const r of migrated) if (/^s3:\/\/lake-[^/]+\/$/.test(r.from_path)) bucketTenants.push({ tenantId: null, dataPath: r.from_path });
+  } catch (e) {
+    console.log(`PG：${db} 里没有可回收的桶租户（${e instanceof Error ? e.message : e}）`);
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+/**
+ * 删除桶租户的桶（先清空对象）与账号（dropS3Users 的正则只认共享前缀，认不出桶租户的账号，所以账号也在这里按租户 ID 删）。
+ * 单个租户失败不挡其余：桶只在 tenant_lakes / lake_migrations 里有记录、库马上要删，中途放弃会留下删不掉的孤儿桶
+ */
+async function dropS3Buckets() {
+  if (!process.env.S3_ACCESS_KEY) return;
+  let dropped = 0;
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  for (const { tenantId, dataPath } of bucketTenants) {
+    if (seen.has(dataPath)) continue;
+    seen.add(dataPath);
+    try {
+      await deleteBucket(platformS3(), dataPath);
+      if (tenantId) await deleteTenantS3Account(tenantId);
+      dropped++;
+    } catch (e) {
+      errors.push(`${dataPath}：${e instanceof Error ? e.message : e}`);
+    }
+  }
+  console.log(`对象存储：删除 ${dropped} 个桶租户的桶${errors.length ? `，${errors.length} 个失败` : ''}`);
+  for (const e of errors) console.error(e);
+  if (errors.length) throw new Error(`${errors.length} 个桶租户回收失败`);
 }
 
 async function iam(action: string, params: Record<string, string>) {
@@ -183,6 +233,7 @@ const step = async <T>(what: string, fn: () => Promise<T>) => {
 
 console.log(`回收测试资源：${all ? '全部 _i<n>' : suffixes.join(' ')}`);
 await step('PG ', dropPg);
+await step('对象存储桶租户', dropS3Buckets);
 await step('对象存储账号', dropS3Users);
 await step('对象存储对象', dropS3Objects);
 await step('MySQL ', dropMysql);

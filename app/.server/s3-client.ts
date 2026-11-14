@@ -117,3 +117,35 @@ export async function putObject(creds: S3Creds, uri: string, body: string | Read
     timeoutMs: TRANSFER_TIMEOUT_MS,
   }), `写入 ${uri} `);
 }
+
+/** 桶根 URI（s3://bucket/）转为 path-style 的 /bucket */
+const bucketPath = (bucketUri: string) => objectPath(bucketUri.replace(/\/+$/, ''));
+
+/**
+ * 建桶（每租户一桶，ADR-0008）：对 /<bucket> 发 PUT。幂等：桶已存在（409，BucketAlreadyOwnedByYou /
+ * BucketAlreadyExists）也算成功；要用平台凭据调，租户账号没有建桶权限
+ */
+export async function createBucket(creds: S3Creds, bucketUri: string) {
+  const res = await signedFetch(creds, 's3', { method: 'PUT', path: bucketPath(bucketUri) });
+  if (res.ok) return;
+  const body = await res.text();
+  if (res.status === 409 && /BucketAlreadyOwnedByYou|BucketAlreadyExists/.test(body)) return;
+  throw new Error(`建桶 ${bucketUri} 失败（HTTP ${res.status}）：${body}`);
+}
+
+/** 删桶（先清空桶里的对象）；桶已不存在（404 / NoSuchBucket）也算成功 */
+export async function deleteBucket(creds: S3Creds, bucketUri: string) {
+  let objects: { path: string; size: number }[];
+  try {
+    objects = await listObjects(creds, bucketUri);
+  } catch (e) {
+    if (e instanceof Error && /HTTP 404/.test(e.message)) return;
+    throw e;
+  }
+  for (const o of objects) await deleteObject(creds, `${bucketUri}${o.path}`);
+  const res = await signedFetch(creds, 's3', { method: 'DELETE', path: bucketPath(bucketUri) });
+  if (res.ok || res.status === 404) return;
+  const body = await res.text();
+  if (/NoSuchBucket/.test(body)) return;
+  throw new Error(`删桶 ${bucketUri} 失败（HTTP ${res.status}）：${body}`);
+}

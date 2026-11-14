@@ -352,7 +352,7 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储上的数据湖', ()
     const report = await verify(engineer, id);
     expect(report.differences).toBe(0);
     const customers = tableOf(report, 'customers');
-    expect(customers.location!.prefix).toMatch(new RegExp(`^${process.env.TEST_S3_LAKE_URI}/tenants/${acme}/${bronzeSchema(id)}/customers/$`));
+    expect(customers.location!.prefix).toMatch(new RegExp(`^s3://lake-${acme}/${bronzeSchema(id)}/customers/$`));
 
     const [file] = await onLake<{ path: string }>(acme, `SELECT data_file AS path FROM ducklake_list_files('lake', 'customers', schema => '${bronzeSchema(id)}')`);
     await deleteObject(platformS3(), file.path);

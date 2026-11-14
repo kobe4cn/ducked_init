@@ -47,18 +47,28 @@ const ignoreIamError = (code: string) => (e: unknown) => {
 const READ_WRITE = ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'];
 const READ_ONLY = ['s3:GetObject'];
 
-/** 只允许对本租户存储前缀下的对象执行 actions、列出这些对象。迁移存储期间同时给出新旧两个前缀（都是本租户的） */
+/**
+ * 只允许对本租户存储路径下的对象执行 actions、列出这些对象。路径是桶根（每租户一桶，ADR-0008）时放行整个桶：
+ * 对象权限与 s3:ListBucket 都只指到本桶，不需要前缀 Condition。共享桶里的前缀租户（迁移目标、本功能上线前的租户）
+ * 仍用前缀 + Condition 收窄。迁移存储期间两种写法会混在一个策略里（新旧两个路径，lake-migration.ts）
+ */
 function prefixPolicy(dataPaths: string[], actions: string[]) {
-  const prefixes = dataPaths.map(p => {
+  const paths = dataPaths.map(p => {
     const [bucket, ...rest] = p.replace(/^s3:\/\//, '').split('/');
-    return { bucket, prefix: `${rest.filter(Boolean).join('/')}/*` };
+    const prefix = rest.filter(Boolean).join('/');
+    return { bucket, prefix, bucketRoot: prefix === '' };
   });
   return JSON.stringify({
     Version: '2012-10-17',
-    Statement: prefixes.flatMap(({ bucket, prefix }) => [
-      { Effect: 'Allow', Action: actions, Resource: [`arn:aws:s3:::${bucket}/${prefix}`] },
-      { Effect: 'Allow', Action: ['s3:ListBucket'], Resource: [`arn:aws:s3:::${bucket}`], Condition: { StringLike: { 's3:prefix': [prefix] } } },
-    ]),
+    Statement: paths.flatMap(({ bucket, prefix, bucketRoot }) => bucketRoot
+      ? [
+        { Effect: 'Allow', Action: actions, Resource: [`arn:aws:s3:::${bucket}/*`] },
+        { Effect: 'Allow', Action: ['s3:ListBucket'], Resource: [`arn:aws:s3:::${bucket}`] },
+      ]
+      : [
+        { Effect: 'Allow', Action: actions, Resource: [`arn:aws:s3:::${bucket}/${prefix}/*`] },
+        { Effect: 'Allow', Action: ['s3:ListBucket'], Resource: [`arn:aws:s3:::${bucket}`], Condition: { StringLike: { 's3:prefix': [`${prefix}/*`] } } },
+      ]),
   });
 }
 
