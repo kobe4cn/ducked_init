@@ -8,8 +8,9 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { tasks } from '../../app/.server/db/schema';
 import {
-  confirmDisable, createMapping, enqueueDueMerges, enqueueMerge, getMapping, listMappings, mergeAfterSync, publishedPlans, disableImpact, requestDisable, restoreMapping,
+  confirmDisable, createMapping, getMapping, listMappings, publishedPlans, disableImpact, requestDisable, restoreMapping,
 } from '../../app/.server/mappings';
+import { enqueueDueMerges, enqueueMerge, mergeAfterSync } from '../../app/.server/merges';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';

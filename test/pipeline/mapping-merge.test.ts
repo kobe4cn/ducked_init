@@ -2,7 +2,8 @@
 // 表达式、值字典、时区转换与扩展字段，源端的新增、更新与删除随同步后的合并进入标准层，去重键与取最新规则、行过滤，跨映射的主键冲突（ADR-0015、0024）
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { createMapping, enqueueMerge, getMapping, mergeNow, publishMapping } from '../../app/.server/mappings';
+import { createMapping, getMapping, publishMapping } from '../../app/.server/mappings';
+import { enqueueMerge, mergeNow } from '../../app/.server/merges';
 import type { MergeMappingParam, MergeRecord } from '../../app/.server/pipeline/merge-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
