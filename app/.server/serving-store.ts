@@ -10,7 +10,7 @@ import { dslDefinitions, dslVersions, servingStores, snapshots, tasks, type Serv
 import { lakeReady, lakeRow } from './lake';
 import { isS3, listLakeFiles } from './lake-storage';
 import { SERVING_DIR } from './pipeline/lake-engine';
-import { servingPath } from './pipeline/serving-engine';
+import { servingPath, type ServingParams } from './pipeline/serving-engine';
 import { platformS3 } from './s3-accounts';
 import { deleteObject } from './s3-client';
 import { insertTask, updateQueuedParams } from './tasks';
@@ -52,8 +52,9 @@ export async function enqueueServingBuild(tenantId: string) {
   });
 }
 
-/** 要放进服务库的快照（serving.build 的参数 snapshots）：每个模板最新、未过期的一张，指标、标签只取定义仍有已发布版本的，按模板排序 */
-async function servingSnapshots(tx: Tx, tenantId: string): Promise<(ServingStoreSnapshot & { table: string })[]> {
+/** 要放进服务库的快照（serving.build 的参数 snapshots）：每个模板最新、未过期的一张，指标、标签只取定义仍有已发布版本的，按模板排序。
+ *  返回类型用契约推出的 ServingParams['snapshots']（loose schema 带索引签名，多余的指针字段原样放行），入队时直接可用 */
+async function servingSnapshots(tx: Tx, tenantId: string): Promise<ServingParams['snapshots']> {
   const published = new Set((await tx.selectDistinct({ kind: dslDefinitions.kind, key: dslDefinitions.key }).from(dslDefinitions)
     .innerJoin(dslVersions, and(eq(dslVersions.definitionId, dslDefinitions.id), eq(dslVersions.status, 'published')))
     .where(eq(dslDefinitions.tenantId, tenantId))).map(d => `${d.kind}:${d.key}`));

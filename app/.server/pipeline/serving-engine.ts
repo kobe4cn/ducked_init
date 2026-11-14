@@ -6,12 +6,13 @@ import { SERVING_DIR, type TenantLakeSession } from './lake-engine';
 import { CONSUMER_ID_CHANGES, CONSUMER_ID_MEMBERS, IDENTITIES } from './identity-engine';
 import { ident, lit } from '../../lib/mapping-expr';
 import { rows, tableExists } from './duck-sql';
-import { SNAPSHOT_TABLE } from './task-contracts';
+import { SNAPSHOT_TABLE, type ServingParams, type ServingSnapshot } from './task-contracts';
 
-/** 一个要放进服务库的快照：快照 ID、模板（rfm、metric:<键>、tag:<键>）与结果层表名；其余字段（定义版本等）由调用方记在指针上 */
-export interface ServingSnapshot { id: string; template: string; table: string }
-
-export interface ServingParams { version: number; target: string; snapshots: ServingSnapshot[] }
+/**
+ * 生成服务库的参数与一个快照的类型由契约推出（task-contracts 的 servingParams / servingSnapshot schema，ADR-0052，
+ * 快照字段含义见契约里的注释），只在这里转出，调用方 import 不变。对契约已有的值 import（SNAPSHOT_TABLE）之外不加新的（ADR-0008）
+ */
+export type { ServingParams, ServingSnapshot } from './task-contracts';
 
 /** 服务库里各表的行数 */
 export interface ServingRows { tags: number; metrics: number; rfm: number; consumer_aliases: number; consumer_sources: number }

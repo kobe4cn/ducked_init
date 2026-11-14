@@ -8,13 +8,13 @@ import { SILVER } from './lake-schemas';
 import { ident, lit } from '../../lib/mapping-expr';
 import { columnExists, joinOn, keyList, rows, silverTable, tableExists } from './duck-sql';
 import { SILVER_SYSTEM_COLUMNS } from './merge-engine';
+import type { KeyCheckEntity, KeyCheckParams } from './task-contracts';
 
 /**
- * 一个实体：主键、写入它的已发布映射（各带映射出来的列名与所在的已发布合并组 group）；bySource 为真时（主键含指向 customer 的字段）
- * 只在该字段指向的同一个数据源（数据源列 _customer_source / _<字段>_source）内比较主键。同一合并组的映射对不报（ADR-0032）
+ * 体检的参数（各实体）与一个实体的类型由契约推出（task-contracts 的 keyCheckEntity / silverKeyCheckParams schema，ADR-0052，
+ * 字段含义见契约里的注释），只在这里转出，调用方 import 不变。引擎对契约只能 import type / export type（ADR-0008）
  */
-export interface KeyCheckEntity { entity: string; key: string[]; bySource: boolean; mappings: { mapping: string; columns: string[]; group?: string }[] }
-export type KeyCheckParams = { entities: KeyCheckEntity[] };
+export type { KeyCheckEntity, KeyCheckParams } from './task-contracts';
 
 /**
  * 建议：duplicate 一边的键全在另一边里，多半是重复接入，可以建合并组（ADR-0032）；drop_one 同一批对象，去掉一边的映射；
