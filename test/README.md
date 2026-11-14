@@ -168,7 +168,7 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 | `loginAsOperator(app, email)` | 运营者登录（Magic Link + TOTP），返回 `{ browser, secret }` |
 | `createTenant(slug, name, adminEmail)` / `createOperator(email)` / `resetOperatorTotp(email)` | 进程内调用运营命令背后的领域函数（不起子进程）：开通租户（返回 `{ tenant, space, admin, lakeReady }`）/ 创建运营者 / 重置 TOTP；出错时抛错（如 `TenantError`），用 `rejects` 断言。用的是测试进程自己的连接池，文件的 `afterAll` 要 `closeDb()` |
 | `runCli(script, args, { input, env })` | 起子进程执行运营脚本，返回 `{ stdout, stderr, code }`（每次约 1.5 s）。只给测命令行本身（输出、退出码）的用例用，如 `login.test.ts` 的「运营命令创建租户…」「运营命令拒绝重复的租户标识」 |
-| `resetDb()` | 清空平台元数据与租户数据湖（只清本 worker 的库与湖目录，只删本库登记的租户角色）。**流水线测试也用它** |
+| `resetDb()` | 清空平台元数据与租户数据湖（只清本 worker 的库与湖目录，只删本库登记的租户角色；对象存储上删本库登记的租户账号与每租户一桶的桶，共享前缀下的对象不清）。**流水线测试也用它** |
 | `extractLink(mail)` / `extractOpsLink(mail)` | 从邮件里取出登录链接 |
 
 ## 新建一个流水线测试
