@@ -7,7 +7,8 @@ import { assertCan } from './access';
 import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { sources, tasks, tenants, type TaskStatus } from './db/schema';
-import type { VerifyRecord, VerifyTableParam } from './pipeline/verify-engine';
+import { readResult } from './pipeline/task-contracts';
+import type { VerifyTableParam } from './pipeline/verify-engine';
 import { requireSource, SourceError } from './source-config';
 import { enqueueSourceTask, ofSource, syncStatus } from './source-sync';
 import { confirmedTables, syncTables } from './sources';
@@ -111,13 +112,14 @@ export async function getVerifyStatus(actor: CurrentMember, sourceId: string) {
   const [latest] = await getDb().select().from(tasks).where(verifies).orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
   const [report] = await getDb().select().from(tasks).where(and(verifies, eq(tasks.status, 'succeeded')))
     .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
+  const result = readResult('source.verify', report);
   return {
     status: (latest?.status ?? 'none') as TaskStatus | 'none',
     error: latest?.error ?? null,
     attemptedAt: latest?.createdAt ?? null,
     verifiedAt: report?.finishedAt ?? null,
-    differences: Number(report?.result?.differences ?? 0),
-    tables: (report?.result?.tables ?? []) as VerifyRecord[],
+    differences: Number(result?.differences ?? 0),
+    tables: result?.tables ?? [],
   };
 }
 
