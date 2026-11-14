@@ -1,6 +1,6 @@
 ---
 name: verify-ducked-init
-description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, model provider, or the AI assistant, and capture evidence. When the diff changes no page, skip the browser launch. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class."
+description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, model provider, or the AI assistant, and capture evidence. When the diff changes no page, skip the browser launch. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class. When the diff touches SeaweedFS startup or volume config (db_script/docker-compose.yml, db_script/seaweedfs/master.toml, the SeaweedFS step in .github/workflows/ci.yml, or db_script/start.sh), start that compose stack, check master Max is 2000, confirm one new bucket's first write adds 1 volume, and run scripts/bench-bucket-per-tenant.ts --write-each on a small bucket count."
 ---
 
 # Verify CRM 数据分析平台
@@ -24,7 +24,68 @@ Record the command output for each check. Record a skipped file as skipped.
 - Run `sh -n` on each changed shell script.
 - Say whether the change is high-risk, and why. The classes are an auth or core authorization change, production secrets or high-privilege access, payments, a destructive database migration, mass data deletion, a core security control, and production infrastructure.
 
-When CI for this exact commit is already green, adopt that run. Leave the full suite unrun. Still run the targeted files when they can run.
+A diff that touches SeaweedFS startup or volume config still skips the browser. Run the subsection below. A green CI run does not cover it: CI only creates `crm-lake`, and a missed `master.toml` mount still lets weed start.
+
+### SeaweedFS startup and volume config
+
+Run this when the diff touches any of `db_script/docker-compose.yml`, `db_script/seaweedfs/master.toml`, the SeaweedFS step in `.github/workflows/ci.yml`, or `db_script/start.sh`. A missed mount fails open. Weed starts, and each new bucket's first write takes the default 7 volumes instead of the 1 in `master.toml`. Comparing the four files is not the check.
+
+Do not point this at a SeaweedFS that was already listening, including the developer's. If port 8333, 8888, or 9333 is held by a container this run did not start, stop and say so.
+
+`db_script/start.sh` is the Apple Container path. On Linux, `sh -n db_script/start.sh` is the check for that file. Do not execute it.
+
+Start the compose services from this checkout and wait until `create-bucket` has exited 0. It uses the `amazon/aws-cli` image to create `crm-lake` at `http://seaweedfs:8333`. That first `s3 mb` can grow one volume on the default collection. That volume is not the check below.
+
+```bash
+docker compose -f db_script/docker-compose.yml up -d seaweedfs create-bucket
+docker compose -f db_script/docker-compose.yml wait create-bucket
+```
+
+On a Linux host, container-to-container traffic needs the docker FORWARD chain to accept packets. If `create-bucket` never finishes its `s3 ls` loop, run `iptables-legacy -P FORWARD ACCEPT` and start the two services again (`up -d --force-recreate create-bucket` so the exited container runs again).
+
+Then, from the host, against the published ports:
+
+1. `curl -sS http://127.0.0.1:9333/dir/status`. `Max` is `Topology.Max` (the field `scripts/bench-bucket-per-tenant.ts` reads). It must be `2000`. A number derived from disk size means `-volume.max=2000` did not take effect.
+
+2. Record the volume count, create one new bucket, write one object, and read the count again. The count is the sum of `Volumes` on every data node: `Topology.DataCenters[].Racks[].DataNodes[].Volumes`. Use a new bucket name, not `crm-lake`. `s3 mb` of that bucket does not change the count. The PUT must raise it by 1. A rise of 7 means `db_script/seaweedfs/master.toml` was not mounted and `copy_1` stayed at the default. Read the count immediately before the PUT and immediately after it. On 4.50, `s3 rb --force` of that new bucket deletes the empty volume and the count falls back, so a count taken after the delete is not the check. The log line `reading /etc/seaweedfs/master.toml` is not proof: weed prints it only at glog verbosity 1, and the compose, CI, and `start.sh` commands do not pass `-v=1`.
+
+```bash
+curl -sS http://127.0.0.1:9333/dir/status | node --input-type=module -e '
+const chunks = [];
+for await (const c of process.stdin) chunks.push(c);
+const t = JSON.parse(Buffer.concat(chunks).toString()).Topology;
+let volumes = 0;
+for (const dc of t?.DataCenters ?? []) for (const rack of dc.Racks ?? []) for (const node of rack.DataNodes ?? []) volumes += node.Volumes ?? 0;
+console.log(JSON.stringify({ max: t?.Max, free: t?.Free, volumes }));
+'
+docker run --rm --network host \
+  -e AWS_ACCESS_KEY_ID=crm -e AWS_SECRET_ACCESS_KEY=crm-secret -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest --endpoint-url http://127.0.0.1:8333 s3 mb s3://verify-vol-delta
+printf x | docker run --rm -i --network host \
+  -e AWS_ACCESS_KEY_ID=crm -e AWS_SECRET_ACCESS_KEY=crm-secret -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest --endpoint-url http://127.0.0.1:8333 s3 cp - s3://verify-vol-delta/first-write
+```
+
+Run the volume-count command again. Then remove the bucket:
+
+```bash
+docker run --rm --network host \
+  -e AWS_ACCESS_KEY_ID=crm -e AWS_SECRET_ACCESS_KEY=crm-secret -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest --endpoint-url http://127.0.0.1:8333 s3 rb s3://verify-vol-delta --force
+```
+
+3. Run a small `--write-each` bench and keep the output. Exit code 0, a line `每桶首写 3/3 次成功`, and no `No writable volumes`. The script deletes the accounts and buckets it created. The checkpoint also first-writes a probe bucket, so `volumes` in the JSON is higher than `--buckets` (default-collection volume, plus one volume per bench bucket, plus the probe). The pass line is the `3/3` summary, not that volume total.
+
+```bash
+node --import tsx scripts/bench-bucket-per-tenant.ts \
+  --backend seaweedfs --endpoint localhost:8333 \
+  --access-key crm --secret-key crm-secret \
+  --filer http://localhost:8888 --master localhost:9333 \
+  --buckets 3 --checkpoints 3 --write-each \
+  --out /tmp/bpt-verify-write-each.json
+```
+
+When CI for this exact commit is already green, adopt that run. Leave the full suite unrun. Still run the targeted files when they can run. The SeaweedFS steps above still run when the diff touches those files.
 
 ## Launch
 
