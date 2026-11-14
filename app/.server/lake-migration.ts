@@ -11,7 +11,8 @@ import { lakeMigrations, tenantLakes, tenants, type LakeInventory } from './db/s
 import { asTenantRole, dropTenantS3Account, ensureTenantS3Account, lakeReady, lakeRow, lakeSpecOf, normalizeLakeRoot, tenantDataPath } from './lake';
 import { copyLakeFile, isS3, listLakeFiles, type LakeFile } from './lake-storage';
 import { SERVING_DIR } from './pipeline/lake-engine';
-import { EXPORT_DIR, inventory } from './pipeline/handlers';
+import { inventory } from './pipeline/handlers';
+import { EXPORT_DIR } from './pipeline/task-contracts';
 import { openTenantLake, redactLakeSecrets, type EngineLimits } from './pipeline/lake-engine';
 import { putPrefixPlaceholder, setTenantS3Prefixes } from './s3-accounts';
 import { listObjects, type S3Creds } from './s3-client';

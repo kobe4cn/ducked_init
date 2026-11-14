@@ -20,9 +20,9 @@ import { PartialFailure } from './partial-failure';
 import { buildServingStore, servingPath } from './serving-engine';
 import { CONTRACTS, EXPORT_DIR, type ResultOf, type TaskKind } from './task-contracts';
 
-// 契约里登记的常量、类型与 isTaskKind 从这里转出，调用方（任务表、导出、湖迁移）不用改 import
-export { EXPORT_DIR, EXPORT_FORMATS, isTaskKind } from './task-contracts';
-export type { ExportCondition, ExportFormat, TaskKind } from './task-contracts';
+// 契约里登记的 isTaskKind 与 TaskKind 从这里转出（数据源、同步入队与 worker 还从这里拿）
+export { isTaskKind } from './task-contracts';
+export type { TaskKind } from './task-contracts';
 
 /**
  * 任务的运行环境：任务 ID，配额，契约声明 needs.source 时派发时解密好的连接参数，合并到标准层时租户的敏感信息盐，
