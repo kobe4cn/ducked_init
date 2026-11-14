@@ -10,10 +10,10 @@ import type { AssertionResult } from './assertions';
 import type { profileSource } from './source-engine';
 import type { syncSourceTables } from './sync-engine';
 import type { verifySourceLake } from './verify-engine';
-import type { InspectParams, InspectResult } from './inspect-engine';
-import type { KeyCheckParams, KeyCheckResult } from './key-check-engine';
+import type { InspectResult } from './inspect-engine';
+import type { KeyCheckResult } from './key-check-engine';
 import type { mergeToSilver, MergeDrop, MergeMappingParam, RelationParam } from './merge-engine';
-import type { buildServingStore, ServingParams } from './serving-engine';
+import type { buildServingStore } from './serving-engine';
 import type { KeyCheckTaskResult } from '../source-key-check';
 
 z.config(z.locales.zhCN());
@@ -191,8 +191,16 @@ export type MergeInput = Omit<MergeParams, 'identity' | 'drop' | 'identityForce'
 
 /** 漂移检查参数里的应有结构：表名 → 列名 → 类型（入队时由已发布映射算出） */
 const EXPECTED = '参数 expected 必须是 表名 → 列名 → 类型 的对象';
+/** 漂移检查的参数 schema：应有结构在入队时由平台算好放进参数（工作进程不连平台库），参数类型（z.infer）从这里导出 */
+const inspectParams = z.object({
+  expected: z.record(z.string(error(EXPECTED)), z.record(z.string(error(EXPECTED)), z.string(error(EXPECTED)), error(EXPECTED)), error(EXPECTED)),
+});
 
-/** 主键冲突体检参数里的实体（入队时由已发布映射算出）：主键、是否按数据源比较、各映射与映射出来的列、所在的合并组 */
+/**
+ * 主键冲突体检参数里的实体（入队时由已发布映射算出）：主键、是否按数据源比较、各映射（各带映射出来的列名）与所在的合并组。
+ * bySource 为真时（主键含指向 customer 的字段）只在该字段指向的同一个数据源（数据源列 _customer_source / _<字段>_source）内比较主键；
+ * 同一合并组的映射对不报（ADR-0032）
+ */
 const KEYCHECK = '参数 entities 必须是 { entity, key, bySource, mappings: { mapping, columns, group? }[] } 列表';
 const keyCheckEntity = z.object({
   entity: z.string(error(KEYCHECK)),
@@ -204,9 +212,23 @@ const keyCheckEntity = z.object({
     group: z.string(error(KEYCHECK)).optional(),
   }, error(KEYCHECK)).loose(), error(KEYCHECK)),
 }, error(KEYCHECK)).loose();
+/** 主键冲突体检的参数 schema：KeyCheckEntity / KeyCheckParams 的类型（z.infer）从这里导出 */
+const silverKeyCheckParams = z.object({ entities: z.array(keyCheckEntity, error(KEYCHECK)) });
 
-/** 生成服务库的参数：版本、上传位置（与 session.lake.dataPath 的比对留在 run 里，schema 只查形状）与要放进去的快照 */
+/** 快照列表的报错文案：table 是结果层快照表名 */
 const SNAPSHOTS = '参数 snapshots 必须是 { id, template, table } 列表，table 是结果层快照表名';
+/** 一个要放进服务库的快照：快照 ID、模板（rfm、metric:<键>、tag:<键>）与结果层表名；其余字段（定义版本等）由调用方记在指针上 */
+const servingSnapshot = z.looseObject({
+  id: z.string(error(SNAPSHOTS)),
+  template: z.string(error(SNAPSHOTS)),
+  table: z.string(error(SNAPSHOTS)).regex(SNAPSHOT_TABLE, error(SNAPSHOTS)),
+}, error(SNAPSHOTS));
+/** 生成服务库的参数：版本、上传位置（与 session.lake.dataPath 的比对留在 run 里，schema 只查形状）与要放进去的快照 */
+const servingParams = z.looseObject({
+  version: z.number(error('参数 version 必须是正整数')).int(error('参数 version 必须是正整数')).min(1, error('参数 version 必须是正整数')),
+  target: z.string(error('参数 target 必须是本租户存储前缀下这一版服务库的位置')),
+  snapshots: z.array(servingSnapshot, error(SNAPSHOTS)),
+});
 
 /** 人群导出的参数：格式与条件（入队时由平台库查出快照表） */
 const CONDITIONS = '参数 conditions 必须是非空的 { tag, value, table } 列表，table 是标签快照表名';
@@ -255,7 +277,8 @@ const TEMPLATE_CONTRACTS = Object.fromEntries((Object.keys(TASK_KINDS) as Templa
   label: TEMPLATES[id].label, params: templateParams(id), result: resultType<Record<string, unknown>>(),
 }])) as { [K in TemplateId as (typeof TASK_KINDS)[K]]: TaskContract<TemplateParams<K>, Record<string, unknown>> & { params: { readonly __input?: TemplateInput } } };
 
-/** 同步 / 核对 / 业务主键校验的参数 schema：抽成具名常量，参数类型（z.infer）从这里导出，引擎不再手写（ADR-0052） */
+/** 同步 / 核对 / 业务主键校验的参数 schema：抽成具名常量，参数类型（z.infer）从这里导出，引擎不再手写（ADR-0052）；
+ * 漂移检查、主键冲突体检与服务库的具名常量见上方 EXPECTED / KEYCHECK / SNAPSHOTS 三段 */
 const SYNC_TABLES = '参数 tables 必须是非空的 { name, column?, kind?, key?, softDelete? } 列表';
 /** 同步任务里的一张表（原 syncTables，sync-engine 的 SyncTableParam 从它推出）：成员确认的水位线字段及其种类
  * （没有时全量比对）、软删除字段；源表没有主键时可带成员声明的业务主键——旧任务里是单个字段，schema 里转成列表
@@ -311,6 +334,16 @@ export type SyncTableParam = Known<z.infer<typeof syncTable>>;
 export type KeyCheckTaskParams = Known<z.infer<typeof keyCheckParams>>;
 /** 核对任务里一张表的参数类型：由 verifyTable schema 推出（保留 inScope 与 reason），verify-engine 转出 */
 export type VerifyTableParam = Known<z.infer<typeof verifyTable>>;
+/** 漂移检查的参数类型：由 inspectParams schema 推出（z.object 不带索引签名，不用包 Known），inspect-engine 转出 */
+export type InspectParams = z.infer<typeof inspectParams>;
+/** 主键冲突体检里一个实体的参数类型：由 keyCheckEntity schema 推出（Known 去掉 .loose() 的索引签名；mappings 元素那层留着），key-check-engine 转出 */
+export type KeyCheckEntity = Known<z.infer<typeof keyCheckEntity>>;
+/** 主键冲突体检的参数类型：由 silverKeyCheckParams schema 推出，key-check-engine 转出 */
+export type KeyCheckParams = z.infer<typeof silverKeyCheckParams>;
+/** 要放进服务库的一个快照的参数类型：由 servingSnapshot schema 推出（Known 去掉 .loose() 的索引签名），serving-engine 转出 */
+export type ServingSnapshot = Known<z.infer<typeof servingSnapshot>>;
+/** 生成服务库的参数类型：由 servingParams schema 推出（Known 去掉 .loose() 的索引签名），serving-engine 转出 */
+export type ServingParams = Known<z.infer<typeof servingParams>>;
 
 /**
  * 全部任务的契约表。新增任务先在这里登记契约，再去 handlers.ts 实现 run。
@@ -371,9 +404,7 @@ export const CONTRACTS = {
   'lake.inspect': {
     label: '漂移检查',
     readOnlyLake: true,
-    params: params<InspectParams>(z.object({
-      expected: z.record(z.string(error(EXPECTED)), z.record(z.string(error(EXPECTED)), z.string(error(EXPECTED)), error(EXPECTED)), error(EXPECTED)),
-    })),
+    params: schemaParams(inspectParams),
     result: resultType<InspectResult>(),
   },
   // 主键冲突体检：对每个实体里主键撞上的每对映射，统计重叠的键数、样本键与字段一致的比例，给出建议（ADR-0024）。
@@ -381,7 +412,7 @@ export const CONTRACTS = {
   'silver.keycheck': {
     label: '主键冲突体检',
     readOnlyLake: true,
-    params: params<KeyCheckParams>(z.object({ entities: z.array(keyCheckEntity, error(KEYCHECK)) })),
+    params: schemaParams(silverKeyCheckParams),
     result: resultType<KeyCheckResult>(),
   },
   // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务，之后按参数里的匹配规则重算身份打通。
@@ -452,15 +483,7 @@ export const CONTRACTS = {
     needs: { servingKey: true },
     readOnlyLake: true,
     servingFile: true,
-    params: params<ServingParams>(z.looseObject({
-      version: z.number(error('参数 version 必须是正整数')).int(error('参数 version 必须是正整数')).min(1, error('参数 version 必须是正整数')),
-      target: z.string(error('参数 target 必须是本租户存储前缀下这一版服务库的位置')),
-      snapshots: z.array(z.looseObject({
-        id: z.string(error(SNAPSHOTS)),
-        template: z.string(error(SNAPSHOTS)),
-        table: z.string(error(SNAPSHOTS)).regex(SNAPSHOT_TABLE, error(SNAPSHOTS)),
-      }, error(SNAPSHOTS)), error(SNAPSHOTS)),
-    })),
+    params: schemaParams(servingParams),
     result: resultType<{ version: number; path: string; rows: Awaited<ReturnType<typeof buildServingStore>> }>(),
   },
   // 人群导出（ADR-0040）：按入队时定下的标签快照表筛出所有条件同时满足的 consumer_id，按它排序写到本租户存储前缀下的 _exports/<任务 ID>.<格式>。

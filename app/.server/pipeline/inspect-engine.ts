@@ -3,9 +3,13 @@
 // 应有结构在入队时由平台算好放进参数（工作进程不连平台库）。_ 开头的内部表（_merges、_identities、_device_owner）不检查
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { cmp } from '../../lib/compare';
+import type { InspectParams } from './task-contracts';
 
-/** 应有结构：表名 → 列名 → DuckDB 类型 */
-export type InspectParams = { expected: Record<string, Record<string, string>> };
+/**
+ * 漂移检查的参数：应有结构（表名 → 列名 → DuckDB 类型）的类型由契约推出（task-contracts 的 inspectParams schema，ADR-0052），
+ * 只在这里转出，调用方 import 不变。工作进程不带平台模块，引擎对契约只能 import type / export type（ADR-0008）
+ */
+export type { InspectParams } from './task-contracts';
 
 /**
  * 一条差异：missing 应有、湖里没有的列；extra 湖里有、应有里没有的列；type 两边类型不一致；
