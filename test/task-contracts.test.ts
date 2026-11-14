@@ -1,9 +1,18 @@
-// 任务契约：参数 schema 接受的参数、拒绝的参数与报错文案（纯函数，不碰平台库与数据湖）
-import { describe, expect, it } from 'vitest';
+// 任务契约：参数 schema 接受的参数、拒绝的参数与报错文案（纯函数）；updateQueuedParams 按契约改写排队中的任务参数（连平台库）
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { eq } from 'drizzle-orm';
+import { closeDb, getDb } from '../app/.server/db/client';
+import { tasks } from '../app/.server/db/schema';
+import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
+import { getTask, insertTask, updateQueuedParams } from '../app/.server/tasks';
 import { CONTRACTS, TEMPLATE_COMMON, isTaskKind, type TaskContract, type TaskKind, type TaskNeeds } from '../app/.server/pipeline/task-contracts';
+import { newTenant } from './pipeline/fixtures';
+import { resetDb } from './http/harness';
 
-/** 一个已发布映射的最小参数（深层形状发布时已校验过，契约只核对形状） */
-const mapping = { mapping: 'm1', version: 1, sourceId: 's1', entity: 'customer', table: 'crm.customers', columns: [{ name: 'id' }], entityColumns: [{ name: 'id' }], key: ['id'], latest: null };
+afterAll(async () => { await closeDb(); });
+
+/** 一个已发布映射的最小参数（深层形状发布时已校验过，契约只核对形状；satisfies 让它也能直接传给 insertTask） */
+const mapping = { mapping: 'm1', version: 1, sourceId: 's1', entity: 'customer', table: 'crm.customers', columns: [{ name: 'id', type: 'string', expr: 'id' }], entityColumns: [{ name: 'id', type: 'string' }], key: ['id'], latest: null } satisfies MergeMappingParam;
 const uuid = '00000000-0000-0000-0000-000000000000';
 const hash = 'a'.repeat(64);
 
@@ -177,5 +186,48 @@ describe('任务契约', () => {
         expect((e as Error).message).not.toContain('13800000001');
       }
     }
+  });
+});
+
+describe('updateQueuedParams：按契约改写仍在排队的任务参数', () => {
+  beforeEach(async () => { await resetDb(); });
+
+  it('排队中的任务：f 拿到补上缺省项的旧参数，写回后 getTask 能看到改动', async () => {
+    const acme = await newTenant('acme');
+    const queued = await getDb().transaction(tx => insertTask(tx, acme, 'silver.merge', { mappings: [mapping] }));
+    const seen: unknown[] = [];
+    const updated = await getDb().transaction(tx => updateQueuedParams(tx, queued.id, 'silver.merge', p => {
+      seen.push(p);
+      return { ...p, mappings: [mapping, { ...mapping, mapping: 'm2' }], identityForce: true };
+    }));
+    // 写回的是 f 的返回值（与 insertTask 入库原始参数的做法一致），缺省项也一并写进库
+    expect(seen[0]).toMatchObject({ mappings: [mapping], drop: [], identityForce: false, survivorship: {}, consumerSensitive: [], relations: [], identityExclude: [] });
+    expect(updated).toMatchObject({ id: queued.id, status: 'queued' });
+    expect((await getTask(queued.id)).params).toMatchObject({ mappings: [mapping, { ...mapping, mapping: 'm2' }], identityForce: true, drop: [] });
+  });
+
+  it('任务已不在排队中（如刚被领取）时返回 null，参数不变', async () => {
+    const acme = await newTenant('acme');
+    const queued = await getDb().transaction(tx => insertTask(tx, acme, 'silver.merge', { mappings: [mapping] }));
+    await getDb().update(tasks).set({ status: 'running' }).where(eq(tasks.id, queued.id));
+    expect(await getDb().transaction(tx => updateQueuedParams(tx, queued.id, 'silver.merge', p => ({ ...p, identityForce: true })))).toBeNull();
+    expect((await getTask(queued.id)).params).toEqual({ mappings: [mapping] });
+  });
+
+  it('f 改出的参数不合法时抛 TaskError，库里参数不变', async () => {
+    const acme = await newTenant('acme');
+    const queued = await getDb().transaction(tx => insertTask(tx, acme, 'silver.merge', { mappings: [mapping] }));
+    await expect(getDb().transaction(tx => updateQueuedParams(tx, queued.id, 'silver.merge', p => ({ ...p, mappings: [], drop: [] }))))
+      .rejects.toThrow('参数 mappings 必须是非空的已发布映射列表');
+    expect((await getTask(queued.id)).params).toEqual({ mappings: [mapping] });
+  });
+
+  it('排队中的任务参数本身不合法（入队校验上线前留下的）时抛 TaskError，不写回', async () => {
+    const acme = await newTenant('acme');
+    // 裸插一条参数不合法的任务，绕过 insertTask 的入队校验
+    const [legacy] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'silver.merge', params: { mappings: 1 } }).returning();
+    await expect(getDb().transaction(tx => updateQueuedParams(tx, legacy.id, 'silver.merge', p => p)))
+      .rejects.toThrow('参数 mappings 必须是非空的已发布映射列表');
+    expect(await getDb().select({ params: tasks.params }).from(tasks).where(eq(tasks.id, legacy.id))).toEqual([{ params: { mappings: 1 } }]);
   });
 });

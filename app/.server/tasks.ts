@@ -7,7 +7,7 @@ import { TASK_STATUSES, tasks, tenantLakes, tenants, type TaskStatus } from './d
 import { lakeSpecOf } from './lake';
 import { tenantPiiSalt, tenantServingKey } from './secrets';
 import { loadSourceSpec, SourceError } from './source-config';
-import { CONTRACTS, isTaskKind, type InputOf, type TaskContract, type TaskKind } from './pipeline/task-contracts';
+import { CONTRACTS, isTaskKind, type InputOf, type ParamsOf, type TaskContract, type TaskKind } from './pipeline/task-contracts';
 import type { WorkerInput, WorkerOutcome } from './pipeline/worker';
 
 export type { InputOf, TaskKind } from './pipeline/task-contracts';
@@ -42,6 +42,33 @@ export async function insertTask<K extends TaskKind>(tx: Tx, tenantId: string, k
   }
   const [task] = await tx.insert(tasks).values({ tenantId, kind, params: params as Record<string, unknown> }).returning();
   return task;
+}
+
+/**
+ * 改写仍在排队的任务参数（ADR-0052）：旧参数先按 kind 的契约读成有类型的对象，f 改完后 parse 校验再写回（写回的是 f 的返回值，
+ * 与 insertTask 入库原始参数的做法一致；f 拿到的旧参数已 parse 过，缺省项会一并写进库）。
+ * 任务不存在、kind 不符或已不在排队中（刚被领取）时返回 null，参数不变；旧参数或改出的参数不合法时抛 TaskError。
+ * 不加 FOR UPDATE：UPDATE 条件里的 status = 'queued' 保证不与 claimNextTask 抢同一个任务（它不拿租户锁）
+ */
+export async function updateQueuedParams<K extends TaskKind>(tx: Tx, taskId: string, kind: K, f: (p: ParamsOf<K>) => InputOf<K>) {
+  // isTaskKind 是运行时检查，与 insertTask 一样兜底
+  if (!isTaskKind(kind)) throw new TaskError(`未知的任务类型：${kind}`);
+  const [row] = await tx.select({ params: tasks.params }).from(tasks)
+    .where(and(eq(tasks.id, taskId), eq(tasks.kind, kind), eq(tasks.status, 'queued')));
+  if (!row) return null;
+  // 两次 parse 的报错都包成 TaskError，文案与 insertTask 的一致；f 自己的异常原样抛出。断言只补上泛型关联（parse 运行时已校验）
+  const parse = (raw: unknown): ParamsOf<K> => {
+    try {
+      return CONTRACTS[kind].params.parse(raw) as ParamsOf<K>;
+    } catch (e) {
+      throw new TaskError((e as Error).message);
+    }
+  };
+  const next = f(parse(row.params));
+  parse(next);
+  const [task] = await tx.update(tasks).set({ params: next as Record<string, unknown> })
+    .where(and(eq(tasks.id, taskId), eq(tasks.status, 'queued'))).returning();
+  return task ?? null;
 }
 
 export async function getTask(taskId: string) {
