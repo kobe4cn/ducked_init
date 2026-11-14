@@ -10,8 +10,8 @@ import { referencedSourceColumns } from './pipeline/mapping-spec';
 import { isBreaking, type SchemaDiff } from './pipeline/schema-diff';
 import { appLink, mailSourceWriters } from './schema-alerts';
 import { describeRename, guessRenames, type Rename, rewriteMappingYaml } from './pipeline/schema-repair';
+import { readResult } from './pipeline/task-contracts';
 import type { ColumnProfile, TableProfile } from './pipeline/source-engine';
-import type { SyncRecord } from './pipeline/sync-engine';
 import { entityLabel } from '../lib/canonical-model';
 
 /** 一个受影响映射的起草结果，邮件按它逐个列出 */
@@ -41,10 +41,10 @@ export async function draftSchemaRepairs(tenantId: string, task: { id: string; p
     .where(and(eq(tasks.id, String(task.params.repairFor)), eq(tasks.tenantId, tenantId)));
   if (!synced) return;
   const changes = new Map<string, SchemaDiff>();
-  for (const r of ((synced.result as { tables?: SyncRecord[] } | null)?.tables) ?? []) {
+  for (const r of readResult('source.sync', synced)?.tables ?? []) {
     if ('schema' in r && r.schema?.changed) changes.set(r.table, r.schema);
   }
-  const current = new Map(((profiled?.result as { tables?: TableProfile[] } | null)?.tables ?? []).map(t => [t.name, t]));
+  const current = new Map((readResult('source.profile', profiled)?.tables ?? []).map(t => [t.name, t]));
   const previous = new Map<string, TableProfile | undefined>();
   const results: { mapping: string; entity: string; table: string; typeChanged: string[]; outcome: RepairOutcome }[] = [];
   for (const plan of await publishedPlans(getDb(), tenantId)) {

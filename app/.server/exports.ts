@@ -13,6 +13,7 @@ import { DSL_KEY_PATTERN } from './dsl-definitions';
 import { lakeRow, lakeSpecOf } from './lake';
 import { isS3 } from './lake-storage';
 import { EXPORT_FORMATS, type ExportCondition, type ExportFormat } from './pipeline/handlers';
+import { readResult } from './pipeline/task-contracts';
 import { platformS3 } from './s3-accounts';
 import { deleteObject, getObjectIfExists } from './s3-client';
 import { getSnapshot } from './snapshots';
@@ -26,9 +27,9 @@ export const EXPORT_RETENTION_MS = 24 * 60 * 60_000;
 /** 结束时间早于它的导出文件已过保留期（已被或即将被清理） */
 const retentionCutoff = () => new Date(Date.now() - EXPORT_RETENTION_MS);
 
-/** export.tags 成功后的结果：行数、相对存储前缀的文件路径（清理后去掉）与格式 */
-interface ExportResult { rows: number; path?: string; format: ExportFormat }
-const resultOf = (task: { result: unknown }) => task.result as ExportResult;
+/** export.tags 的结果（契约见 task-contracts）：行数、相对存储前缀的文件路径（清理后删掉）与格式。
+ * 调用处都只在已成功的导出任务上读结果（成功后工作进程一定写了），断言非空 */
+const resultOf = (task: { kind?: string; result: unknown }) => readResult('export.tags', task)!;
 
 const CONTENT_TYPES: Record<ExportFormat, string> = { parquet: 'application/vnd.apache.parquet', csv: 'text/csv; charset=utf-8' };
 
@@ -185,7 +186,8 @@ export async function cleanupExpiredExports() {
     try {
       const lake = await lakeRow(task.tenantId);
       if (lake) {
-        const file = lake.dataPath + resultOf(task).path;
+        // 上面的 SQL 只取 result->>'path' 非空的任务，这里断言 path 存在
+        const file = lake.dataPath + resultOf(task).path!;
         await (isS3(file) ? deleteObject(platformS3(), file) : rm(file, { force: true }));
       }
       await db.update(tasks).set({ result: sql`${tasks.result} - 'path'` }).where(eq(tasks.id, task.id));
