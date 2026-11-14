@@ -26,17 +26,28 @@ export function normalizeLakeRoot(uri: string) {
 const lakeRoot = () => normalizeLakeRoot(process.env.PLATFORM_LAKE_URI ?? './data/platform-lake');
 
 /**
- * 租户在某个数据湖根下的存储前缀（共享桶里的写法）：<根>/tenants/<租户 ID>/。迁移存储的目标仍按它算（#689 改为
- * 迁入独占的桶）；新开通的租户在 layout() 里直接得到独占的桶，不再用它
+ * 租户在某个数据湖根下的存储前缀（共享桶里的写法）：<根>/tenants/<租户 ID>/。#688 之前开通的对象存储租户还在这种
+ * 前缀上（经 lakeTargetOf 迁入独占的桶）；新开通的租户在 layout() 里直接得到独占的桶，本地目录租户仍按它算
  */
 export const tenantDataPath = (root: string, tenantId: string) =>
   isS3(root) ? `${root}/tenants/${tenantId}/` : `${join(root, 'tenants', tenantId)}/`;
+
+/** 租户在对象存储上独占的桶根（ADR-0008）：s3://lake-<租户 ID>/，与账号名 lake-<租户 ID> 一致 */
+export const tenantBucketRoot = (tenantId: string) => `s3://lake-${tenantId}/`;
+
+/**
+ * 迁移存储的目标（ADR-0008）：root 在对象存储上（任意 s3 根，桶名与前缀被忽略，只用来选「对象存储」）时是本租户
+ * 独占的桶；本地目录时仍是 <根>/tenants/<租户 ID>/。对未规范化的 root 判断 isS3：normalizeLakeRoot('s3://') 会把
+ * 结尾的 / 去掉变成 s3:，被当成本地目录
+ */
+export const lakeTargetOf = (root: string, tenantId: string) =>
+  isS3(root.trim()) ? tenantBucketRoot(tenantId) : tenantDataPath(normalizeLakeRoot(root), tenantId);
 
 /** 每个租户的存储路径与 catalog schema、数据库角色都由租户 ID 决定：对象存储上是独占的桶 s3://lake-<租户 ID>/（ADR-0008），本地目录是 <根>/tenants/<租户 ID>/ */
 function layout(tenantId: string) {
   const name = `lake_${tenantId.replace(/-/g, '')}`;
   const root = lakeRoot();
-  return { dataPath: isS3(root) ? `s3://lake-${tenantId}/` : tenantDataPath(root, tenantId), catalogSchema: name, dbRole: name };
+  return { dataPath: isS3(root) ? tenantBucketRoot(tenantId) : tenantDataPath(root, tenantId), catalogSchema: name, dbRole: name };
 }
 
 /** 租户的只读数据库角色：租户角色名加 _ro */
