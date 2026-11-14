@@ -10,10 +10,10 @@ import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { publishMapping, saveDraft } from '../../app/.server/mappings';
-import { latestIdentitySummary } from '../../app/.server/merges';
 import { syncSource } from '../../app/.server/source-sync';
 import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from '../pipeline/identity-fixtures';
+import { fakeHot } from '../pipeline/identity-helpers';
 import { grantOnSource } from '../pipeline/source-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -36,14 +36,6 @@ async function failedRfm() {
   const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
   expect(task).toMatchObject({ status: 'failed' });
   return { ...fixture, task: task! };
-}
-
-/** 直接改最近一次打通的结果造出 hot（真实打通的统计见 identity-stable-id.test.ts） */
-async function fakeHot(tenantId: string, hot: { rule: string; hash: string; records: number; sources: string[] }[]) {
-  const { taskId } = (await latestIdentitySummary(tenantId))!;
-  const [task] = await getDb().select({ result: tasks.result }).from(tasks).where(eq(tasks.id, taskId));
-  const result = task.result as { identities: object };
-  await getDb().update(tasks).set({ result: { ...result, identities: { ...result.identities, hot } } }).where(eq(tasks.id, taskId));
 }
 
 /** 本租户的合并任务，新的在前 */

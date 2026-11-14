@@ -6,10 +6,8 @@ import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { data, Form, useNavigation } from 'react-router';
 import type { Route } from './+types/quality';
 import { can, requirePermission } from '~/.server/access';
-import type { Tx } from '~/.server/audit';
-import { getDb } from '~/.server/db/client';
-import { excludeValue, includeValue, listExcludedValues } from '~/.server/identity-exclusions';
-import { enqueueMerge, latestIdentitySummary } from '~/.server/merges';
+import { excludeValue, ExclusionError, includeValue, listExcludedValues } from '~/.server/identity-exclusions';
+import { latestIdentitySummary } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
 import { HOT_VALUE_THRESHOLD } from '~/.server/pipeline/identity-engine';
 import { ASSERTION_LABELS, describeCustom, SAMPLE_LIMIT, type AssertionLevel } from '~/.server/pipeline/assertions';
@@ -57,35 +55,21 @@ export async function loader({ request }: Route.LoaderArgs) {
   };
 }
 
-/** 标记或撤销没有做成：回滚事务，把原因与状态码交给页面 */
-class ExclusionError extends Error {
-  constructor(message: string, readonly status: number) { super(message); }
-}
-
 /**
- * 标记（exclude）或撤销（include）一个不参与匹配的值。标记只收最近一次成功打通的 hot 里有的哈希（记录数也取自那里），不收任意输入；
- * 登记或撤销后在同一个事务里入队合并（带上新的排除列表，与上次打通的参数不同，强制重算打通）。合并正在运行时入不了队，
- * 定时检查也不会因排除列表变了补一次合并，所以整个回滚、请成员稍后再试（同恢复映射）
+ * 标记（exclude）或撤销（include）一个不参与匹配的值（identity-exclusions.ts 检查权限、校验 hot，并在同一个事务里入队合并）。
+ * 没做成时把原因与状态码交给页面，其余错误（如无权限的 403 响应）照常抛出
  */
 export async function action({ request }: Route.ActionArgs) {
   const member = await requirePermission(request, 'sources:write');
   const form = await request.formData();
   const hash = String(form.get('hash') ?? '');
-  const tenantId = member.tenant.id;
-  const change = async (apply: (tx: Tx) => Promise<boolean>, missing: ExclusionError) => getDb().transaction(async tx => {
-    if (!await apply(tx)) throw missing;
-    if (!await enqueueMerge(tx, tenantId)) throw new ExclusionError('已有一次合并在运行，等它结束后再试。', 409);
-  });
   try {
     switch (form.get('intent')) {
-      case 'exclude': {
-        const hot = (await latestIdentitySummary(tenantId))?.hot.find(h => h.hash === hash);
-        if (!hot) throw new ExclusionError('这个值不在最近一次打通的告警里，不能标记。', 400);
-        await change(tx => excludeValue(tx, tenantId, member, hash, hot.records), new ExclusionError('这个值已经标为不参与匹配。', 409));
+      case 'exclude':
+        await excludeValue(member, hash);
         return { error: null, notice: '已标为不参与匹配，已排队一次合并，打通完成后这些记录各自成组。' };
-      }
       case 'include':
-        await change(tx => includeValue(tx, tenantId, member, hash), new ExclusionError('这个值不在不参与匹配的列表里。', 404));
+        await includeValue(member, hash);
         return { error: null, notice: '已撤销，已排队一次合并重新打通。' };
       default:
         return data({ error: '未知操作', notice: null }, { status: 400 });

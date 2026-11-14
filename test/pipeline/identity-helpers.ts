@@ -1,6 +1,6 @@
 // test/pipeline/identity-helpers.ts —— 身份打通测试的读取与操作 helper（identity-merge / identity-recompute / identity-stable-id 共用）：种子明文 SEEDED，
 // 读 silver._identities 与 _device_owner 的 identities、匿名事件的 anonymousEvents、统一消费者同意的 consumerConsent、分组比较的 groupsOf，
-// 最近一次合并任务 lastMerge，以及存新草稿并由另一位成员发布的 republish
+// 最近一次合并任务 lastMerge、直接改打通结果造出 hot 的 fakeHot，以及存新草稿并由另一位成员发布的 republish
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { and, desc, eq } from 'drizzle-orm';
 import type { CurrentMember } from '../../app/.server/auth';
@@ -8,6 +8,7 @@ import { getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { publishMapping, saveDraft } from '../../app/.server/mappings';
+import { latestIdentitySummary } from '../../app/.server/merges';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { drain } from './fixtures';
 
@@ -61,6 +62,14 @@ export async function lastMerge(tenantId: string) {
   const [merge] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'silver.merge')))
     .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
   return merge as typeof merge & { result: { identities?: Record<string, unknown> } };
+}
+
+/** 直接改最近一次打通的结果造出 hot（真实打通的统计见 identity-stable-id.test.ts）；最近一次打通任务要先存在（没有时先合并一次） */
+export async function fakeHot(tenantId: string, hot: { rule: string; hash: string; records: number; sources: string[] }[]) {
+  const { taskId } = (await latestIdentitySummary(tenantId))!;
+  const [task] = await getDb().select({ result: tasks.result }).from(tasks).where(eq(tasks.id, taskId));
+  const result = task.result as { identities: object };
+  await getDb().update(tasks).set({ result: { ...result, identities: { ...result.identities, hot } } }).where(eq(tasks.id, taskId));
 }
 
 /** 给映射存一版新草稿并由另一位成员发布，跑空调度器（合并与打通完成） */
