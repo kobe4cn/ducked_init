@@ -11,7 +11,7 @@ import { sources, sourceTables, tasks, type TaskStatus } from './db/schema';
 import { requireSource, SourceError } from './source-config';
 import { ofSource } from './source-sync';
 import { insertTask } from './tasks';
-import type { KeyCheckTaskParams } from './pipeline/task-contracts';
+import { readResult, type KeyCheckTaskParams } from './pipeline/task-contracts';
 
 /** 入队参数：类型由契约推出（task-contracts 的 keyCheckParams schema，ADR-0052），只在这里转出，调用方 import 不变。
  * memberId 与 email 是声明的成员，写回时据此记审计 */
@@ -46,7 +46,7 @@ export async function applyKeyCheck(tenantId: string, taskId: string) {
   return getDb().transaction(async tx => {
     const [task] = await tx.select().from(tasks).where(and(eq(tasks.id, taskId), eq(tasks.tenantId, tenantId)));
     const params = task?.params as unknown as KeyCheckTaskParams | undefined;
-    if (!task || !params || (task.result as KeyCheckTaskResult | null)?.ok !== true) return false;
+    if (!task || !params || readResult('source.keycheck', task)?.ok !== true) return false;
     const [source] = await tx.select({ id: sources.id, name: sources.name }).from(sources)
       .where(and(eq(sources.id, params.sourceId), eq(sources.tenantId, tenantId))).for('update');
     if (!source) return false;
@@ -82,7 +82,7 @@ export async function getKeyChecks(actor: CurrentMember, sourceId: string) {
     if (typeof tableName === 'string' && !latest.has(tableName)) {
       latest.set(tableName, {
         keyColumns: Array.isArray(keyColumns) ? keyColumns : [],
-        status: t.status as TaskStatus, result: t.result as KeyCheckTaskResult | null, error: t.error,
+        status: t.status as TaskStatus, result: readResult('source.keycheck', t), error: t.error,
       });
     }
   }

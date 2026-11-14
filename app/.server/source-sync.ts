@@ -8,7 +8,7 @@ import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { sources, tasks, tenants, type TaskStatus } from './db/schema';
 import type { TaskKind } from './pipeline/handlers';
-import type { InputOf } from './pipeline/task-contracts';
+import { readResult, type InputOf } from './pipeline/task-contracts';
 import type { SyncRecord } from './pipeline/sync-engine';
 import { requireSource, SourceError } from './source-config';
 import { largeTableSyncHours, syncIntervalMinutes, syncTables } from './sources';
@@ -65,7 +65,7 @@ async function lastAttempts(tenantId: string, sourceId: string, since: Date) {
     .where(and(ofSource(tenantId, sourceId), gt(tasks.createdAt, since)));
   const last = new Map<string, Date>();
   for (const { result } of runs) {
-    for (const record of (result?.tables ?? []) as SyncRecord[]) {
+    for (const record of readResult('source.sync', { result })?.tables ?? []) {
       const at = new Date(record.startedAt);
       const seen = last.get(record.table);
       if (!seen || seen < at) last.set(record.table, at);
@@ -124,7 +124,7 @@ export async function syncStatus(tenantId: string, sourceId: string) {
   const history: Record<string, SyncHistoryEntry[]> = {};
   for (const run of runs) {
     // 一次同步里同一张表可能先后有增量与主键比对两个批次，同样新的在前
-    const records = [...((run.result?.tables ?? []) as SyncRecord[])].reverse();
+    const records = [...(readResult('source.sync', run)?.tables ?? [])].reverse();
     for (const record of records) (history[record.table] ??= []).push({ ...record, taskId: run.id });
   }
   const [latest] = runs;
