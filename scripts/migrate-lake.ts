@@ -1,8 +1,9 @@
-// scripts/migrate-lake.ts —— 用法：pnpm lake:migrate --tenant acme --to s3://crm-lake/platform
-//                                 pnpm lake:migrate --all --to s3://crm-lake/platform
-// 平台切换存储（本地目录 ⇄ 对象存储、换桶）时，把已开通租户的数据湖搬到新的数据湖根下（<根>/tenants/<租户 ID>/）。
+// scripts/migrate-lake.ts —— 用法：pnpm lake:migrate --tenant acme --to s3://
+//                                 pnpm lake:migrate --all --to s3://
+// 平台切换存储（本地目录 ⇄ 对象存储）时，把已开通租户的数据湖迁过去：--to 给任意 s3 根（如 s3://）都迁入各租户
+// 独占的桶 s3://lake-<租户 ID>/（桶名与前缀被忽略，目标桶在申请时建好）；本地目录仍是 <根>/tenants/<租户 ID>/。
 // 这条命令只申请迁移、标记「迁移中」，由调度器（pnpm dispatcher）执行；进度与结果在运营后台的租户页与租户审计日志查看。
-// --all 跳过已在目标根下的租户，可以重复执行
+// --all 跳过已在目标位置的租户，可以重复执行
 import { parseArgs } from 'node:util';
 import { closeDb } from '../app/.server/db/client';
 import { requestLakeMigration, requestLakeMigrations } from '../app/.server/lake-migration';
@@ -17,7 +18,7 @@ const { values } = parseArgs({
 });
 
 if (!values.to || !!values.tenant === values.all) {
-  console.error('用法：pnpm lake:migrate (--tenant <租户标识> | --all) --to <新的数据湖根，如 s3://bucket/prefix 或本地目录>');
+  console.error('用法：pnpm lake:migrate (--tenant <租户标识> | --all) --to <新的数据湖根：任意 s3 根（如 s3://）迁入各租户独占的桶 s3://lake-<ID>/，或本地目录>');
   process.exit(2);
 }
 

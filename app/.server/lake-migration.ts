@@ -1,6 +1,8 @@
-// app/.server/lake-migration.ts —— 租户数据湖迁移存储（本地目录 ⇄ 对象存储、换桶或换前缀）。
+// app/.server/lake-migration.ts —— 租户数据湖迁移存储（本地目录 ⇄ 对象存储、共享前缀 → 独占桶）。
 // 运营者用 pnpm lake:migrate 申请，调度器执行：等该租户运行中的任务结束 → 复制存储前缀下的全部文件 → 核对清单与大小 →
 // 一个事务里切换 catalog（ducklake_metadata）与 tenant_lakes 的 data_path → 盘点比对。迁移中不派发该租户的任务。
+// 迁移目标（lakeTargetOf）：对象存储上是本租户独占的桶 s3://lake-<租户 ID>/（--to 的 s3 根只用来选「对象存储」，
+// 桶名与前缀被忽略，目标桶在申请时建好），本地目录是 <根>/tenants/<租户 ID>/。
 // DuckLake catalog 里 schema、表与数据文件的路径都是相对 data_path 的，切换只需改这一处。旧位置的文件不自动删除
 import { mkdir } from 'node:fs/promises';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
@@ -8,14 +10,14 @@ import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import { recordAudit, type OperatorActor, type Tx } from './audit';
 import { getDb, type Db } from './db/client';
 import { lakeMigrations, tenantLakes, tenants, type LakeInventory } from './db/schema';
-import { asTenantRole, dropTenantS3Account, ensureTenantS3Account, lakeReady, lakeRow, lakeSpecOf, normalizeLakeRoot, tenantDataPath } from './lake';
-import { copyLakeFile, isS3, listLakeFiles, type LakeFile } from './lake-storage';
+import { asTenantRole, dropTenantS3Account, ensureTenantS3Account, lakeReady, lakeRow, lakeSpecOf, lakeTargetOf } from './lake';
+import { copyLakeFile, isS3, isTenantBucketRoot, listLakeFiles, type LakeFile } from './lake-storage';
 import { SERVING_DIR } from './pipeline/lake-engine';
 import { inventory } from './pipeline/handlers';
 import { EXPORT_DIR } from './pipeline/task-contracts';
 import { openTenantLake, redactLakeSecrets, type EngineLimits } from './pipeline/lake-engine';
-import { putPrefixPlaceholder, setTenantS3Prefixes } from './s3-accounts';
-import { listObjects, type S3Creds } from './s3-client';
+import { platformS3, putPrefixPlaceholder, setTenantS3Prefixes } from './s3-accounts';
+import { createBucket, listObjects, type S3Creds } from './s3-client';
 import { lockClaims } from './tasks';
 import { TenantError } from './tenants';
 
@@ -24,18 +26,24 @@ type LakeMigrationRow = typeof lakeMigrations.$inferSelect;
 export const ACTIVE_MIGRATION = ['pending', 'running'] as const;
 
 /**
- * 申请把租户的数据湖迁到 root 下（<root>/tenants/<租户 ID>/）。数据湖须已初始化；已在目标位置时拒绝，
- * 正在迁往同一位置时返回进行中的那次迁移（created 为 false），正在迁往别处时拒绝。
+ * 申请把租户的数据湖迁到 root 下：root 在对象存储上（任意 s3 根）时目标是本租户独占的桶 s3://lake-<租户 ID>/
+ * （桶名与前缀被忽略，只用来选「对象存储」），本地目录时仍是 <根>/tenants/<租户 ID>/。数据湖须已初始化；已在目标
+ * 位置时拒绝，正在迁往同一位置时返回进行中的那次迁移（created 为 false），正在迁往别处时拒绝。
+ * 目标是独占桶时在事务之前建好桶（runLakeMigration 切换前写占位对象依赖桶已存在，租户账号又没有建桶权限）：
+ * 不在持行锁的事务里发网络请求，建桶前的预检查（已初始化且不在目标位置）是为了不给会被拒的申请留空桶。
  * 申请即标记「迁移中」，记入租户的审计日志
  */
 export async function requestLakeMigration(operator: OperatorActor, tenantId: string, root: string) {
-  const toRoot = normalizeLakeRoot(root);
+  const toPath = lakeTargetOf(root, tenantId);
+  if (isTenantBucketRoot(toPath)) {
+    const lake = await lakeRow(tenantId);
+    if (lake && lakeReady(lake) && lake.dataPath !== toPath) await createBucket(platformS3(), toPath);
+  }
   return getDb().transaction(async tx => {
     // 锁住数据湖行：与同一租户的并发申请、切换互斥
     const [lake] = await tx.select().from(tenantLakes).where(eq(tenantLakes.tenantId, tenantId)).for('update');
     if (!lake) throw new TenantError('租户还没有数据湖');
     if (!lakeReady(lake)) throw new TenantError('数据湖未初始化，请先在运营后台初始化数据湖');
-    const toPath = tenantDataPath(toRoot, tenantId);
     const [active] = await tx.select().from(lakeMigrations)
       .where(and(eq(lakeMigrations.tenantId, tenantId), inArray(lakeMigrations.status, ACTIVE_MIGRATION)));
     if (active?.toPath === toPath) return { migration: active, created: false };
@@ -48,9 +56,8 @@ export async function requestLakeMigration(operator: OperatorActor, tenantId: st
   });
 }
 
-/** 把所有不在 root 下的租户迁过去；已在目标位置或正在迁往那里的跳过，可以重复执行。单个租户申请不了时记在 skipped 里 */
+/** 把所有不在目标位置（对象存储上是各租户独占的桶）的租户迁过去；已在目标位置或正在迁往那里的跳过，可以重复执行。单个租户申请不了时记在 skipped 里 */
 export async function requestLakeMigrations(operator: OperatorActor, root: string) {
-  const toRoot = normalizeLakeRoot(root);
   const lakes = await getDb()
     .select({ tenantId: tenants.id, slug: tenants.slug, dataPath: tenantLakes.dataPath })
     .from(tenantLakes)
@@ -59,9 +66,9 @@ export async function requestLakeMigrations(operator: OperatorActor, root: strin
   const requested: { tenantId: string; slug: string; fromPath: string; toPath: string }[] = [];
   const skipped: { tenantId: string; slug: string; reason: string }[] = [];
   for (const { tenantId, slug, dataPath } of lakes) {
-    if (dataPath === tenantDataPath(toRoot, tenantId)) continue;
+    if (dataPath === lakeTargetOf(root, tenantId)) continue;
     try {
-      const { migration: m, created } = await requestLakeMigration(operator, tenantId, toRoot);
+      const { migration: m, created } = await requestLakeMigration(operator, tenantId, root);
       if (created) requested.push({ tenantId, slug, fromPath: m.fromPath, toPath: m.toPath });
       else skipped.push({ tenantId, slug, reason: '已在迁移中' });
     } catch (e) {
