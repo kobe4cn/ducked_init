@@ -27,7 +27,7 @@ import { draftCustomMapping, draftMapping, DraftError, reuseMappingYaml } from '
 import {
   ASSERTION_DRAFT_SCHEMA, assertionDraftMessages, assertionsToYaml, type AssertionDraft, MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type DraftItem, type ModelDraft,
 } from './pipeline/model-draft';
-import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
+import { checkMapping, type CustomerSources, isSensitiveField, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import type { Rename } from './pipeline/schema-repair';
 import { diffColumns } from './pipeline/schema-diff';
 import { readResult } from './pipeline/task-contracts';
@@ -1157,19 +1157,8 @@ function relationParams(published: Map<string, RegisteredEntity>, plans: MergeMa
   return allRelations(published).map(r => ({ ...r, sensitive: isSensitiveField(r.from, e => published.get(e)?.fields, plans) }));
 }
 
-/**
- * 实体字段在标准层里是否敏感（ADR-0005，存的是哈希）：标准实体的 pii 字段、自定义实体登记（custom 给出字段）里标成敏感的字段，
- * 或已发布映射里标成敏感的列（x_ 字段，任一映射标了就算）
- */
-export function isSensitiveField(
-  { entity, field }: EntityRelation['from'],
-  custom: (entity: string) => readonly CustomEntityField[] | undefined,
-  plans: readonly MergeMappingParam[],
-): boolean {
-  return !!entityOf(entity)?.fields.find(f => f.name === field)?.pii
-    || !!custom(entity)?.find(f => f.name === field)?.sensitive
-    || plans.some(p => p.entity === entity && p.columns.some(c => c.name === field && c.sensitive));
-}
+// 临时 re-export：isSensitiveField 已挪进 pipeline/mapping-spec（#667），调用方（custom-entities、relation-suggest、catalog、knowledge）改由 #670 挪
+export { isSensitiveField } from './pipeline/mapping-spec';
 
 /**
  * 在调用方的事务里为给定映射（不给时为全部已发布映射）的最新已发布版本入队一次合并，返回带上它们的合并任务。
