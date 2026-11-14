@@ -8,8 +8,9 @@ import { createDefinition, deleteDefinition, publishDefinition } from '../../app
 import { mappingFallbackValues, mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
 import { setMailer, type Mail } from '../../app/.server/mailer';
 import {
-  createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeMapping, mergeNow, publishMapping, rebuildEntity, referenceTables, saveDraft,
+  createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeNow, publishMapping, referenceTables, saveDraft,
 } from '../../app/.server/mappings';
+import { MergeError, mergeMapping, rebuildEntity } from '../../app/.server/merges';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { PublishError } from '../../app/.server/publishing';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -498,11 +499,13 @@ describe('发布映射并合并到标准层', () => {
       // 合并在运行：不入队，提示稍后补上
       await getDb().update(tasks).set({ status: 'running', startedAt: sql`now()`, heartbeatAt: sql`now()` }).where(eq(tasks.id, queued.id));
       await expect(mergeMapping(author, orders)).rejects.toThrow('已有一次合并在运行');
+      await expect(mergeMapping(author, orders)).rejects.toBeInstanceOf(MergeError);
       expect((await listTasks(acme)).filter(t => t.kind === 'silver.merge' && t.status === 'queued')).toEqual([]);
 
       // 只有草稿的映射、别的租户的映射
       const draft = await createMapping(author, id, ORDER_LOG_MAPPING);
       await expect(mergeMapping(author, draft.id)).rejects.toThrow('这个映射还没有已发布的版本');
+      await expect(mergeMapping(author, draft.id)).rejects.toBeInstanceOf(MergeError);
       const other = await memberOf(await newTenant('globex'), 'de@globex.com');
       await expect(mergeMapping(other, customers)).rejects.toMatchObject({ status: 404 });
     });
@@ -536,8 +539,10 @@ describe('发布映射并合并到标准层', () => {
     // 合并在排队或运行、没有映射写入的实体、查看者
     const queued = await rebuildEntity(author, 'customer');
     await expect(rebuildEntity(author, 'customer')).rejects.toThrow('已有一次合并在排队或运行中');
+    await expect(rebuildEntity(author, 'customer')).rejects.toBeInstanceOf(MergeError);
     await getDb().update(tasks).set({ status: 'running', startedAt: sql`now()`, heartbeatAt: sql`now()` }).where(eq(tasks.id, queued.id));
     await expect(rebuildEntity(author, 'customer')).rejects.toThrow('已有一次合并在排队或运行中');
+    await expect(rebuildEntity(author, 'customer')).rejects.toBeInstanceOf(MergeError);
     await expect(rebuildEntity(author, 'coupon')).rejects.toThrow('没有已发布的映射写入');
     await expect(rebuildEntity(await memberOf(acme, 'v@acme.com', 'viewer'), 'customer')).rejects.toMatchObject({ init: { status: 403 } });
   });

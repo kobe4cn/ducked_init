@@ -28,7 +28,8 @@ import { publishedCustomEntities } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
 import { getInspectStatus, InspectError, inspectLakeNow } from '~/.server/lake-inspect';
-import { lastMergeByMapping, latestIdentitySummary, latestRelationStats, MappingError, type MergeHistoryEntry, publishedPlans, rebuildEntity } from '~/.server/mappings';
+import { MappingError, publishedPlans } from '~/.server/mappings';
+import { lastMergeByMapping, latestIdentitySummary, latestRelationStats, MergeError, type MergeHistoryEntry, rebuildEntity } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
 import { identityRules } from '~/.server/pipeline/identity-engine';
 import { listSources } from '~/.server/sources';
@@ -273,7 +274,7 @@ export async function action({ request }: Route.ActionArgs) {
         return data({ error: '未知操作', intent }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof InspectError || e instanceof MappingError) return data({ error: e.message, intent }, { status: 400 });
+    if (e instanceof InspectError || e instanceof MappingError || e instanceof MergeError) return data({ error: e.message, intent }, { status: 400 });
     if (e instanceof BusinessNoteError) {
       // 保存失败的说明按 noteKey 定位，编辑框里留着提交的内容
       const key = noteKey(String(form.get('entity') ?? ''), String(form.get('field') ?? ''), mappingId);

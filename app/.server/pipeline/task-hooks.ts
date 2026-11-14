@@ -6,7 +6,7 @@ import { rebuildProjection } from '../catalog/projection';
 import { recordCatalogVersionIfChanged } from '../catalog/versions';
 import { registerDslSnapshot } from '../dsl-definitions';
 import { alertNewFallback } from '../fallback-alerts';
-import { mergeAfterSync } from '../mappings';
+import { mergeAfterSync } from '../merges';
 import { alertAssertionFailure } from '../quality';
 import { markSandboxExpired } from '../sandbox';
 import { alertSchemaBreak } from '../schema-alerts';

@@ -6,7 +6,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { latestIdentitySummary, listMappings, mergeMapping, mergeNow, publishMapping, saveDraft } from '../../app/.server/mappings';
-import * as mappingsModule from '../../app/.server/mappings';
+import * as mergesModule from '../../app/.server/merges';
 import { syncSource } from '../../app/.server/source-sync';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { listTasks } from '../../app/.server/tasks';
@@ -182,8 +182,8 @@ describe('身份打通：可配置匹配字段与优先级', () => {
     // 放大调度器收尾的竞争窗口（#563）：同步任务先 finishTask（释放租户名额）后 mergeAfterSync（入队合并），
     // 在这里先等 1500 ms（比 pollMs 1 s 长），runUntilIdle 的轮询就会趁窗口领走排队中的下一个同步；
     // 后一个同步收尾时 enqueueMerge 撞上正在跑的合并返回 null，runUntilIdle 又不跑 enqueueDueMerges 补漏，变更就丢了
-    const originalMergeAfterSync = mappingsModule.mergeAfterSync;
-    vi.spyOn(mappingsModule, 'mergeAfterSync').mockImplementation(async (tenantId, syncTaskId) => {
+    const originalMergeAfterSync = mergesModule.mergeAfterSync;
+    vi.spyOn(mergesModule, 'mergeAfterSync').mockImplementation(async (tenantId, syncTaskId) => {
       await new Promise(resolve => setTimeout(resolve, 1500));
       return originalMergeAfterSync(tenantId, syncTaskId);
     });

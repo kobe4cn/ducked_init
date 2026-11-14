@@ -9,7 +9,8 @@ import type { Route } from './+types/mappings';
 import { assertCan, can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { checkKeysNow, getKeyCheckStatus, KeyCheckError } from '~/.server/key-check';
-import { createMapping, defaultDraft, draftFor, GenerationMismatchError, listMappings, MappingError, mergeNow, modelDraftFor, referenceTables, validateNewMapping } from '~/.server/mappings';
+import { createMapping, defaultDraft, draftFor, GenerationMismatchError, listMappings, MappingError, modelDraftFor, referenceTables, validateNewMapping } from '~/.server/mappings';
+import { MergeError, mergeNow } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
 import { SUGGESTION_LABELS } from '~/.server/pipeline/key-check-engine';
@@ -140,6 +141,10 @@ export async function action({ request }: Route.ActionArgs) {
     }
   } catch (e) {
     if (e instanceof KeyCheckError) return data({ error: e.message, issues: [], values: null, draftId: null }, { status: 400 });
+    // 手动合并被拒（已有合并等）：没有 issues，编辑框里留着提交的内容
+    if (e instanceof MergeError) {
+      return data({ error: e.message, issues: [], values: { sourceId: field('sourceId'), yaml: field('yaml') }, draftId: null, generationId: field('generationId') || null }, { status: e.status });
+    }
     if (e instanceof MappingError) {
       // 没保存时仍带着生成记录，改好再保存照样比对；生成记录本身不符时不再带
       const generationId = e instanceof GenerationMismatchError ? null : field('generationId') || null;
