@@ -9,11 +9,12 @@ import { Ajv, type ErrorObject } from 'ajv';
 import { Document, isMap, isScalar, isSeq, LineCounter, parseDocument, type Node, type YAMLMap } from 'yaml';
 import {
   CANONICAL_ENTITIES, CUSTOM_FIELD_PATTERN, entityOf, EXTENSION_PATTERN, FIELD_TYPE_NAMES, FIELD_TYPES, isCustomEntity, KEY_SPACE_PATTERN, MODEL_MAJOR,
-  type CanonicalEntity, type CanonicalField, type EntityRelation, type FieldType,
+  type CanonicalEntity, type CanonicalField, type CustomEntityField, type EntityRelation, type FieldType,
 } from '../../lib/canonical-model';
 import { fieldsForColumn, normalizeName, similarFields, similarNames, standardValue } from '../../lib/field-synonyms';
 import { ExprError, FUNCTIONS, KIND_FIELD_TYPES, kindOf, parseExpression, ref, referencedColumns, type Expr } from '../../lib/mapping-expr';
 import { CUSTOM_CHECKS, customAssertionName, type CustomAssertion } from './custom-assertions';
+import type { SourceViewParam } from './merge-engine';
 
 /** 字段的写法：表达式本身，或带值字典（与兜底值）、键空间的对象 */
 export type FieldSpec = string | { expr: string; dictionary?: Record<string, string>; otherwise?: string | null; sensitive?: boolean; key_space?: string; customer_source?: string };
@@ -177,7 +178,7 @@ export interface PlanColumn {
   customerSource?: string; customerRef?: true;
 }
 
-/** 合并计划：工作进程据此把源表的变更批次合并到标准层（MergeMappingParam 再加上映射与版本） */
+/** 合并计划：工作进程据此把源表的变更批次合并到标准层（PublishedPlan 在它之上再加上映射、版本与数据源） */
 export interface MergePlan {
   entity: string;
   /** 源表或源视图的名字 */
@@ -202,6 +203,18 @@ export interface MergePlan {
   where?: string;
   /** 映射级自定义断言（只有写了的映射才有）；已发布的老版本没有这一项 */
   assertions?: CustomAssertion[];
+}
+
+/** 已发布映射的合并计划：合并计划加上映射、版本与所属数据源（ADR-0053；任务契约里 silver.merge 的映射参数建在它上面，见 MergeMappingParam） */
+export interface PublishedPlan extends MergePlan {
+  /** 映射 ID */
+  mapping: string;
+  /** 已发布的版本号 */
+  version: number;
+  /** 所属数据源 */
+  sourceId: string;
+  /** 输入是源视图时才有：视图最新的已发布版本（版本号、SQL 与引用的原始层表） */
+  sourceView?: SourceViewParam;
 }
 
 /** 校验结果；notices 是不拦发布的提示（如 customer_source 写的就是本数据源） */
@@ -813,4 +826,18 @@ ${fields}
 dedupe:
   key: [${entity.key.join(', ')}]
 `;
+}
+
+/**
+ * 实体字段在标准层里是否敏感（ADR-0005，存的是哈希）：标准实体的 pii 字段、自定义实体登记（custom 给出字段）里标成敏感的字段，
+ * 或已发布映射里标成敏感的列（x_ 字段，任一映射标了就算）
+ */
+export function isSensitiveField(
+  { entity, field }: EntityRelation['from'],
+  custom: (entity: string) => readonly CustomEntityField[] | undefined,
+  plans: readonly PublishedPlan[],
+): boolean {
+  return !!entityOf(entity)?.fields.find(f => f.name === field)?.pii
+    || !!custom(entity)?.find(f => f.name === field)?.sensitive
+    || plans.some(p => p.entity === entity && p.columns.some(c => c.name === field && c.sensitive));
 }

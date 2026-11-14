@@ -13,7 +13,7 @@ import type { verifySourceLake } from './verify-engine';
 import type { InspectResult } from './inspect-engine';
 import type { KeyCheckResult } from './key-check-engine';
 import type { mergeToSilver, SourceViewParam } from './merge-engine';
-import type { MergePlan, PlanColumn } from './mapping-spec';
+import type { MergePlan, PlanColumn, PublishedPlan } from './mapping-spec';
 import type { buildServingStore } from './serving-engine';
 import type { KeyCheckTaskResult } from '../source-key-check';
 
@@ -160,8 +160,8 @@ const mergeGroup = z.object({
 /** 合并组的参数类型：由 mergeGroup schema 推出（Known 去掉顶层的索引签名），merge-engine 转出 */
 export type MergeGroupParam = Known<z.infer<typeof mergeGroup>>;
 /**
- * 合并任务里的一个已发布映射：合并计划（transform 交叉成 MergePlan，深层形状发布时已校验过，这里与原手写校验一样只核对形状，
- * 不把 MergePlan 的字段逐个抄进 schema——那是第二份定义）加上映射、版本与数据源；输入是源视图时另带视图最新的已发布版本
+ * 合并任务里的一个已发布映射：合并计划（transform 交叉成 PublishedPlan，深层形状发布时已校验过，这里与原手写校验一样只核对形状，
+ * 不把 PublishedPlan 的字段逐个抄进 schema——那是第二份定义）加上映射、版本与数据源；输入是源视图时另带视图最新的已发布版本
  * （版本号、SQL 与引用的原始层表，入队时取定）。rebuild 为真时强制由全部批次重建（数据地图上的重建合并，补上标准层缺的列）。
  * uniqueKey 是实体（customer 除外）的主键：合并后它在整个实体内跨映射唯一（ADR-0024「独占」），不是映射的去重键；
  * uniqueBySource 为真时（主键含指向 customer 的字段）只在同一个数据源内唯一。
@@ -184,7 +184,7 @@ const mergeMapping = z.object({
   uniqueBySource: z.boolean(error(MAPPINGS)).optional(),
   group: mergeGroup.optional(),
 }, error(MAPPINGS)).loose()
-  .transform(m => m as typeof m & MergePlan);
+  .transform(m => m as typeof m & PublishedPlan);
 /** 合并任务里一个已发布映射的参数类型：由 mergeMapping schema 推出（Known 去掉 .loose() 的索引签名），merge-engine 转出 */
 export type MergeMappingParam = Known<z.infer<typeof mergeMapping>>;
 

@@ -1,8 +1,9 @@
 // 映射文档的校验：不符合 Schema、表达式用了白名单之外的函数、引用了源表没有的字段、值字典对应到非标准枚举、行过滤 where 不返回布尔时被拒绝，并给出 YAML 里的行列位置；
 // 表达式里比较与逻辑运算的编译；
+// 敏感字段判定 isSensitiveField（标准实体 pii、自定义实体登记、映射里标成敏感的 x_ 列）；
 // 以及对照面板从编辑中的 YAML 读出的要点（已对应的字段、去重键）
 import { describe, expect, it } from 'vitest';
-import { checkMapping, type CustomerSources } from '../app/.server/pipeline/mapping-spec';
+import { checkMapping, type CustomerSources, isSensitiveField, type PublishedPlan } from '../app/.server/pipeline/mapping-spec';
 import { compileExpression, parseExpression } from '../app/lib/mapping-expr';
 import { mappingOutline } from '../app/lib/mapping-outline';
 
@@ -571,6 +572,35 @@ describe('映射报错给出改法', () => {
     // 源表里没有能对应主键的列时，给出映射主键或声明去重键的写法
     const unknown = checkMapping(ok.replace('  order_id: string(order_id)\n', ''));
     expect(!unknown.ok && unknown.issues[0].hint).toMatch(/^order_id: .*\n# 或者\ndedupe:\n  key: \[/);
+  });
+});
+
+describe('isSensitiveField', () => {
+  /** 只给 entity 与 columns，其余字段用 as 补齐（isSensitiveField 只看这两项） */
+  const planOf = (entity: string, name: string, sensitive = true) =>
+    ({ entity, columns: [{ name, type: 'string' as const, expr: name, ...(sensitive ? { sensitive: true as const } : {}) }] }) as PublishedPlan;
+
+  it('标准实体的 pii 字段是敏感字段', () => {
+    expect(isSensitiveField({ entity: 'customer', field: 'phone' }, () => undefined, [])).toBe(true);
+    expect(isSensitiveField({ entity: 'order', field: 'status' }, () => undefined, [])).toBe(false);
+  });
+
+  it('自定义实体登记里标成敏感的字段是敏感字段', () => {
+    const custom = (entity: string) => entity === 'crm_contact'
+      ? [{ name: 'wechat', type: 'string' as const, description: '微信号', sensitive: true }] : undefined;
+    expect(isSensitiveField({ entity: 'crm_contact', field: 'wechat' }, custom, [])).toBe(true);
+    expect(isSensitiveField({ entity: 'crm_contact', field: 'title' }, custom, [])).toBe(false);
+  });
+
+  it('映射里标成敏感的 x_ 列是敏感字段，任一映射标了就算，只看同一实体的映射', () => {
+    const plans = [planOf('customer', 'x_remark'), planOf('order', 'x_note')];
+    expect(isSensitiveField({ entity: 'customer', field: 'x_remark' }, () => undefined, plans)).toBe(true);
+    expect(isSensitiveField({ entity: 'customer', field: 'x_other' }, () => undefined, plans)).toBe(false);
+    expect(isSensitiveField({ entity: 'customer', field: 'x_note' }, () => undefined, plans)).toBe(false);
+  });
+
+  it('三者都不是时不是敏感字段', () => {
+    expect(isSensitiveField({ entity: 'order', field: 'amount' }, () => undefined, [planOf('order', 'x_note', false)])).toBe(false);
   });
 });
 
