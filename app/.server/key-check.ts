@@ -9,8 +9,9 @@ import { getDb } from './db/client';
 import { tasks, tenants, type TaskStatus } from './db/schema';
 import { entityOf } from '../lib/canonical-model';
 import { publishedPlans } from './mappings';
-import type { KeyCheckParams, KeyCheckResult } from './pipeline/key-check-engine';
+import type { KeyCheckParams } from './pipeline/key-check-engine';
 import type { MergeMappingParam } from './pipeline/merge-engine';
+import { readResult } from './pipeline/task-contracts';
 import { insertTask } from './tasks';
 
 export class KeyCheckError extends Error {}
@@ -67,6 +68,6 @@ export async function getKeyCheckStatus(actor: CurrentMember) {
     status: (latest?.status ?? 'none') as TaskStatus | 'none',
     error: latest?.error ?? null,
     checkedAt: report?.finishedAt ?? null,
-    entities: (report?.result?.entities ?? []) as KeyCheckResult['entities'],
+    entities: readResult('silver.keycheck', report)?.entities ?? [],
   };
 }

@@ -307,7 +307,7 @@ const templateParams = <T extends TemplateId>(id: T): { parse(raw: unknown): Tem
 
 /**
  * 模板任务（ADR-0004）的契约：由注册表（TEMPLATES 与 TASK_KINDS）生成，label 沿用模板的 label；
- * 结果类型仍是普通对象，收紧留给 #474、#477（钩子与 readResult）
+ * 结果类型仍是普通对象，不做运行时校验（ADR-0052）
  */
 const TEMPLATE_CONTRACTS = Object.fromEntries((Object.keys(TASK_KINDS) as TemplateId[]).map(id => [TASK_KINDS[id], {
   label: TEMPLATES[id].label, params: templateParams(id), result: resultType<Record<string, unknown>>(),
@@ -509,7 +509,8 @@ export const CONTRACTS = {
     result: resultType<{ version: number; path: string; rows: Awaited<ReturnType<typeof buildServingStore>> }>(),
   },
   // 人群导出（ADR-0040）：按入队时定下的标签快照表筛出所有条件同时满足的 consumer_id，按它排序写到本租户存储前缀下的 _exports/<任务 ID>.<格式>。
-  // 数据湖只读挂载；排队期间快照表被删掉（快照过期）时失败、不写文件。snapshots（清理与审计读）原样放行
+  // 数据湖只读挂载；排队期间快照表被删掉（快照过期）时失败、不写文件。snapshots（清理与审计读）原样放行。
+  // 结果里的 path 在导出文件过了保留期被清理后会从结果里删掉（exports.ts），所以可选
   'export.tags': {
     label: '人群导出',
     readOnlyLake: true,
@@ -521,7 +522,7 @@ export const CONTRACTS = {
         table: z.string(error(CONDITIONS)).regex(/^tag__[0-9a-f-]{36}$/, error(CONDITIONS)),
       }, error(CONDITIONS)), error(CONDITIONS)).min(1, error(CONDITIONS)),
     })),
-    result: resultType<{ rows: number; path: string; format: ExportFormat }>(),
+    result: resultType<{ rows: number; path?: string; format: ExportFormat }>(),
   },
   ...TEMPLATE_CONTRACTS,
 } satisfies Record<string, TaskContract<unknown, unknown>>;
@@ -555,3 +556,18 @@ type _mergeInputKnown = AssertTrue<string extends keyof InputOf<'silver.merge'> 
 
 /** 一个任务的结果类型 */
 export type ResultOf<K extends TaskKind> = NonNullable<(typeof CONTRACTS)[K]['result']['__result']>;
+
+/**
+ * 读一行任务的结果（ADR-0052）：结果只有类型、不做运行时校验（结果由本仓库的工作进程写出），
+ * 这里只核对是哪种任务的结果。row 是 tasks 表的行（或只 select 了 result 的部分行）：
+ * row 或 row.result 为空（还没有成功结果）返回 null；row 带 kind 且与参数不一致说明读错了行，抛错（程序错误）。
+ * engine 是工作进程往每个结果里加的运行配额（worker.ts），原样带出
+ */
+export function readResult<K extends TaskKind>(
+  kind: K,
+  row: { kind?: string; result: unknown } | null | undefined,
+): (ResultOf<K> & { engine?: { memoryLimit: string; threads: number } }) | null {
+  if (row?.result == null) return null;
+  if (row.kind !== undefined && row.kind !== kind) throw new Error(`readResult(${kind}) 读到的任务 kind 是 ${row.kind}`);
+  return row.result as ResultOf<K> & { engine?: { memoryLimit: string; threads: number } };
+}

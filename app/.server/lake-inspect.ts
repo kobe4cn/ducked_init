@@ -7,8 +7,9 @@ import type { CurrentMember } from './auth';
 import { getDb } from './db/client';
 import { tasks, tenants, type TaskStatus } from './db/schema';
 import { publishedPlans } from './mappings';
-import type { Drift, InspectParams } from './pipeline/inspect-engine';
+import type { InspectParams } from './pipeline/inspect-engine';
 import { sourceColumnsForPlan, sensitiveColumns, SILVER_SYSTEM_COLUMNS, type MergeMappingParam } from './pipeline/merge-engine';
+import { readResult } from './pipeline/task-contracts';
 import { sqlType } from './pipeline/mapping-spec';
 import { insertTask } from './tasks';
 
@@ -58,6 +59,6 @@ export async function getInspectStatus(actor: CurrentMember) {
     status: (latest?.status ?? 'none') as TaskStatus | 'none',
     error: latest?.error ?? null,
     inspectedAt: report?.finishedAt ?? null,
-    drifts: (report?.result?.drifts ?? []) as Drift[],
+    drifts: readResult('lake.inspect', report)?.drifts ?? [],
   };
 }

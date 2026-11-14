@@ -5,7 +5,7 @@ import { closeDb, getDb } from '../app/.server/db/client';
 import { tasks } from '../app/.server/db/schema';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
 import { getTask, insertTask, updateQueuedParams } from '../app/.server/tasks';
-import { CONTRACTS, TEMPLATE_COMMON, isTaskKind, type TaskContract, type TaskKind, type TaskNeeds } from '../app/.server/pipeline/task-contracts';
+import { CONTRACTS, readResult, TEMPLATE_COMMON, isTaskKind, type TaskContract, type TaskKind, type TaskNeeds } from '../app/.server/pipeline/task-contracts';
 import { newTenant } from './pipeline/fixtures';
 import { resetDb } from './http/harness';
 
@@ -131,6 +131,21 @@ describe('任务契约', () => {
     for (const kind of Object.keys(CONTRACTS)) expect(isTaskKind(kind)).toBe(true);
     expect(isTaskKind('demo.seeds')).toBe(false);
     expect(isTaskKind('constructor')).toBe(false);
+  });
+
+  it('readResult：row 或 result 为空返回 null，row 带 kind 且不一致抛错，正常时原样带出结果与 engine（不做运行时校验）', () => {
+    expect(readResult('lake.inspect', null)).toBeNull();
+    expect(readResult('lake.inspect', undefined)).toBeNull();
+    expect(readResult('lake.inspect', { result: null })).toBeNull();
+    expect(readResult('lake.inspect', { result: undefined })).toBeNull();
+    // 很多查询只 select 了 result、没选 kind：没有 kind 就不核对
+    expect(readResult('source.verify', { result: { tables: [], differences: 2 } })).toEqual({ tables: [], differences: 2 });
+    // 工作进程往结果里加的 engine 原样带出
+    const drifts = [{ table: 'customer', kind: 'type', column: 'tier', expected: 'VARCHAR', actual: 'INTEGER' }];
+    const engine = { memoryLimit: '512MB', threads: 2 };
+    expect(readResult('lake.inspect', { kind: 'lake.inspect', result: { drifts, engine } })).toEqual({ drifts, engine });
+    // kind 对不上是程序错误（读错了任务行），抛错而不是返回 null
+    expect(() => readResult('lake.inspect', { kind: 'silver.keycheck', result: { entities: [] } })).toThrow();
   });
 
   it('契约声明领取时要准备的凭据（needs）：源连接只有四个源任务，盐只有合并，密钥只有服务库', () => {
