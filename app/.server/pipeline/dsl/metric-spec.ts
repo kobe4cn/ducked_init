@@ -11,10 +11,9 @@ import { Ajv, type ValidateFunction } from 'ajv';
 import { LineCounter, parseDocument } from 'yaml';
 import { CANONICAL_ENTITIES, entityOf, isCustomEntity, type EntityRelation, type FieldType } from '../../../lib/canonical-model';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from '../identity-engine';
-import { describeSchemaError, locator, type Path, type RegisteredEntities } from '../mapping-spec';
+import { describeSchemaError, locator, type Path, type PublishedPlan, type RegisteredEntities } from '../mapping-spec';
 import { ident, lit } from '../../../lib/mapping-expr';
 import { silverTable } from '../duck-sql';
-import type { MergeMappingParam } from '../merge-engine';
 import { customerSourceColumn } from '../../../lib/customer-source';
 import { AGGS, FILTER_OPS, MAX_DIMENSIONS, MAX_HOPS, RATIO_AGGS } from '../../../lib/metric-vocab';
 
@@ -54,7 +53,7 @@ export interface MetricSpec {
  * 校验与编译要用的租户上下文：已发布的自定义实体登记，与已发布映射的合并计划（扩展字段的类型与敏感性只来自它们）；
  * metrics 是本租户各指标最新的已发布版本（键 → 对照登记与映射校验的结果），标签只引用它们
  */
-export interface DslContext { published: RegisteredEntities; plans: readonly MergeMappingParam[]; metrics: ReadonlyMap<string, DslCheck<MetricSpec>> }
+export interface DslContext { published: RegisteredEntities; plans: readonly PublishedPlan[]; metrics: ReadonlyMap<string, DslCheck<MetricSpec>> }
 
 /** 定义里的一个问题：行列从 1 起，path 是出问题的位置（如 dimensions.0.path） */
 export interface DslIssue { line: number; col: number; path: string; message: string }
