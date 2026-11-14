@@ -1,6 +1,6 @@
 ---
 name: verify-ducked-init
-description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, model provider, or the AI assistant, and capture evidence. When the diff changes no page, skip the browser launch. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class. When the diff touches SeaweedFS startup or volume config (db_script/docker-compose.yml, db_script/seaweedfs/master.toml, the SeaweedFS step in .github/workflows/ci.yml, or db_script/start.sh), start that compose stack, check master Max is 2000, confirm one new bucket's first write adds 1 volume, and run scripts/bench-bucket-per-tenant.ts --write-each on a small bucket count."
+description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, model provider, or the AI assistant, and capture evidence. When the diff changes no page, skip the browser launch. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class. When the diff touches SeaweedFS startup or volume config (db_script/docker-compose.yml, db_script/seaweedfs/master.toml, the SeaweedFS step in .github/workflows/ci.yml, or db_script/start.sh), start that compose stack, check master Max is 2000, confirm one new bucket's first write adds 1 volume, and run scripts/bench-bucket-per-tenant.ts --write-each on a small bucket count. When the diff changes per-tenant bucket isolation (initTenantCatalog creating a bucket, prefixPolicy, createBucket or deleteBucket, resetDb deleting buckets, or drop-test-resources collecting buckets), start a disposable SeaweedFS and check exclusive buckets, idempotent create, cross-tenant 403, legacy prefix conditions, and suffix cleanup. Do not delete every lake-* bucket."
 ---
 
 # Verify CRM 数据分析平台
@@ -86,6 +86,30 @@ node --import tsx scripts/bench-bucket-per-tenant.ts \
 ```
 
 When CI for this exact commit is already green, adopt that run. Leave the full suite unrun. Still run the targeted files when they can run. The SeaweedFS steps above still run when the diff touches those files.
+
+### Per-tenant buckets
+
+Run this when the diff changes who gets an object-storage bucket or who may delete one. The files are `app/.server/lake.ts` (`initTenantCatalog` and `layout`), `app/.server/s3-accounts.ts` (`prefixPolicy`), `app/.server/s3-client.ts` (`createBucket` and `deleteBucket`), `app/.server/lake-storage.ts` (`isTenantBucketRoot`), `test/http/harness.ts` (`resetDb`), and `scripts/drop-test-resources.ts`. A green CI run does not replace this section. CI does not show the bucket list, the policy document, or a cleanup of one named suffix. Skip `launch.sh`. There is no page to drive.
+
+Start a SeaweedFS this run owns. Do not use one that was already listening, including the developer's, and do not share its `policies.json`. The compose services in the volume-config subsection (`seaweedfs` and `create-bucket`) are the right server even when those four files are not in the diff. If `docker` is not on `PATH`, run the SeaweedFS 4.50 `weed` binary instead. Set `-ip` and `-ip.bind` to the same address the S3 client dials. For a process on this host, both are `127.0.0.1`. A volume server that binds `127.0.0.1` while the filer advertises another address answers `PutObject` with HTTP 500 (`dial tcp <advertised>:8080: connect: connection refused`). An empty `.keep` can still read back as 200, so that GET is not proof that writes work.
+
+```bash
+weed server -dir=/tmp/verify-weed/data -ip=127.0.0.1 -ip.bind=127.0.0.1 \
+  -s3 -s3.port=8333 -s3.iam.readOnly=false \
+  -master.volumeSizeLimitMB=1024 -volume.max=2000
+```
+
+Put `db_script/seaweedfs/master.toml` in the weed process's current directory so `copy_1 = 1` is read. Platform credentials on that server are `AWS_ACCESS_KEY_ID=crm` and `AWS_SECRET_ACCESS_KEY=crm-secret`.
+
+Use a new database named `crm_platform_test` plus a suffix `_i<token>`. The suffix must match `^_i\w+$`, which is what `scripts/drop-test-resources.ts` accepts. Point `PLATFORM_DATABASE_URL` at that database, `PLATFORM_LAKE_URI` at an `s3://` root on this server, and `TEST_S3_LAKE_URI` at the shared prefix without the suffix. Cleanup appends the suffix itself. Set `S3_ENDPOINT`, `S3_ACCESS_KEY`, and `S3_SECRET_KEY` to this server. Migrate the database. A temporary `node --import tsx` script may call `createTenant`, `initTenantCatalog`, `resetDb`, and the S3 helpers. Label that run as a temporary script. Put the script outside the commit. When CI for this commit is already green, do not rerun the suite.
+
+Record the command output for each of these:
+
+- A new tenant's `platform.tenant_lakes.data_path` is `s3://lake-<tenant id>/`. That bucket is in `ListBuckets`. `GetUserPolicy` for `lake-<tenant id>` allows object operations on `arn:aws:s3:::lake-<tenant id>/*` and `s3:ListBucket` on `arn:aws:s3:::lake-<tenant id>`, and the document has no `Condition`. The tenant's own `GetObject`, `ListBucket`, and `PutObject` on that bucket return 200.
+- With that tenant's keys, `GetObject`, `PutObject`, `DeleteObject`, and `ListBucket` on another tenant's bucket return HTTP 403 and `AccessDenied`. The same 403 is required for a bucket whose name is `lake-<id>` plus one extra character. `PutBucket` by the tenant returns 403.
+- A second `PUT` of the same bucket on SeaweedFS 4.50 returns 409 `BucketAlreadyOwnedByYou`. Calling `initTenantCatalog` again still succeeds, and the access key already stored is left in place.
+- A lake row whose `data_path` is a shared prefix (`s3://<bucket>/.../tenants/<id>/`) does not grow a `lake-<id>` bucket. Its policy still has a `Condition`. `setTenantS3Prefixes` with both that prefix and the tenant's own bucket keeps the `Condition` on the shared bucket. Listing the whole shared bucket with those keys returns 403.
+- `resetDb` against this database, with `TEST_S3_LAKE_URI` set, deletes the recorded `s3://lake-<id>/` buckets and the tenant accounts. `pnpm sandcastle:cleanup _i<token>` then deletes that test database, any recorded bucket still left, and accounts whose policy names the suffixed prefix. The suffix is an argument of the script. `pnpm sandcastle:cleanup -- _i<token>` forwards `--` and the script exits 2. A bucket you created and did not record in a matched test database, including another `lake-*` name, is still listed after both commands. Do not list every `lake-*` bucket and delete them. Dev tenants use those names on a shared server. After the evidence is recorded, delete only the canaries this run created.
 
 ## Launch
 
