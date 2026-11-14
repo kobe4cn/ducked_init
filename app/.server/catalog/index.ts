@@ -16,12 +16,12 @@ import { ruleText } from '../../lib/merge-groups';
 import { looksSensitive } from '../../lib/sensitive';
 import type { RegisteredEntity } from '../custom-entities';
 import type { PublishedMergeGroup } from '../merge-groups';
-import { isSensitiveField } from '../mappings';
 import { DSL_KINDS, type DslKind } from '../pipeline/dsl';
 import type { MetricSpec } from '../pipeline/dsl/metric-spec';
 import type { TagSpec } from '../pipeline/dsl/tag-spec';
 import { TEMPLATES, type TemplateId } from '../pipeline/templates';
-import { SILVER_SYSTEM_COLUMNS, type MergeMappingParam } from '../pipeline/merge-engine';
+import { isSensitiveField, type PublishedPlan } from '../pipeline/mapping-spec';
+import { SILVER_SYSTEM_COLUMNS } from '../pipeline/merge-engine';
 import type { ColumnProfile } from '../pipeline/source-engine';
 import { PLATFORM_COLUMNS } from '../pipeline/sync-engine';
 import { claimPhrase, knowledgeKey, knowledgeMarkdown, knowledgeText, presentKnowledge, type Knowledge, type KnowledgeInput } from '../knowledge/catalog';
@@ -34,7 +34,7 @@ export interface CatalogInput {
   /** 同步范围内（源端仍在且可读）的源表与已发布的源视图；columns 是最近一次采集到的列（源视图是输出列） */
   tables?: { sourceId: string; name: string; view: boolean; columns: { name: string; type: string; formats?: { format: string }[] }[] }[];
   /** 已发布映射（publishedPlans，已去掉停用的） */
-  plans?: MergeMappingParam[];
+  plans?: PublishedPlan[];
   /** 已发布的自定义实体 */
   customEntities?: RegisteredEntity[];
   /** 已发布的合并组：members 是映射 ID，按优先级排 */
@@ -245,7 +245,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
   const entries: CatalogEntry[] = [];
   // 目录里有的源表与源视图（同步范围内的、已发布的）
   const listed = new Set((input.tables ?? []).flatMap(t => (sourceName.has(t.sourceId) ? [tableId(sourceName.get(t.sourceId)!, t.name)] : [])));
-  const planTable = (p: MergeMappingParam) => tableId(sourceName.get(p.sourceId) ?? p.sourceId, p.table);
+  const planTable = (p: PublishedPlan) => tableId(sourceName.get(p.sourceId) ?? p.sourceId, p.table);
 
   // 源表与源视图能列出的列：被敏感字段引用的源列、像敏感信息的源列与系统列不列；统计只给这些列，只有源表有
   const visibleColumns = (t: NonNullable<CatalogInput['tables']>[number]) => {

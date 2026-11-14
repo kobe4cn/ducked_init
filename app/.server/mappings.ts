@@ -1163,9 +1163,6 @@ function relationParams(published: Map<string, RegisteredEntity>, plans: Publish
   return allRelations(published).map(r => ({ ...r, sensitive: isSensitiveField(r.from, e => published.get(e)?.fields, plans) }));
 }
 
-// 临时 re-export：isSensitiveField 已挪进 pipeline/mapping-spec（#667），调用方（custom-entities、relation-suggest、catalog、knowledge）改由 #670 挪
-export { isSensitiveField } from './pipeline/mapping-spec';
-
 /**
  * 在调用方的事务里为给定映射（不给时为全部已发布映射）的最新已发布版本入队一次合并，返回带上它们的合并任务。
  * 锁住租户行后检查：同一租户同时只有一个合并在排队或运行（两个合并同时写同一张标准层表会冲突）。
