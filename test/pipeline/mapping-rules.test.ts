@@ -8,9 +8,9 @@ import { createDefinition, deleteDefinition, publishDefinition } from '../../app
 import { mappingFallbackValues, mappings, mappingVersions, tasks, tenants } from '../../app/.server/db/schema';
 import { setMailer, type Mail } from '../../app/.server/mailer';
 import {
-  createMapping, enqueueDueMerges, getMapping, MappingError, mergeAfterSync, mergeNow, publishMapping, referenceTables, saveDraft,
+  createMapping, getMapping, MappingError, publishMapping, referenceTables, saveDraft,
 } from '../../app/.server/mappings';
-import { MergeError, mergeMapping, rebuildEntity } from '../../app/.server/merges';
+import { enqueueDueMerges, mergeAfterSync, MergeError, mergeMapping, mergeNow, rebuildEntity } from '../../app/.server/merges';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { PublishError } from '../../app/.server/publishing';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';

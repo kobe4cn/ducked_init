@@ -1155,10 +1155,3 @@ export async function getMapping(actor: CurrentMember, mappingId: string) {
     merge,
   };
 }
-
-// 临时，#699 删除：合并编排与合并结果的读取搬去了 merges.ts（ADR-0053），旧调用方暂时还从这里拿
-export {
-  dueMappings, enqueueDueMerges, enqueueMerge, entityRelationStats, lastMergeByMapping, latestIdentitySummary, latestRelationStats, mergeAfterSync, mergeMapping, mergeNow, mergePlans,
-  mustRecomputeIdentities, pendingMerge, rebuildEntity, relationParams, syncWroteMappingTable,
-  type MergeHistoryEntry,
-} from './merges';

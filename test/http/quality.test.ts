@@ -9,7 +9,8 @@ import { auditLogs, identityExcludedValues, tasks } from '../../app/.server/db/s
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
-import { latestIdentitySummary, publishMapping, saveDraft } from '../../app/.server/mappings';
+import { publishMapping, saveDraft } from '../../app/.server/mappings';
+import { latestIdentitySummary } from '../../app/.server/merges';
 import { syncSource } from '../../app/.server/source-sync';
 import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from '../pipeline/identity-fixtures';

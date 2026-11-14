@@ -4,7 +4,8 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { confirmDisable, getMapping, mergePlans, publishMapping, publishedPlans, requestDisable, restoreMapping, saveDraft } from '../../app/.server/mappings';
+import { confirmDisable, getMapping, publishMapping, publishedPlans, requestDisable, restoreMapping, saveDraft } from '../../app/.server/mappings';
+import { mergePlans } from '../../app/.server/merges';
 import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-groups';
 import { runAssertions } from '../../app/.server/pipeline/assertions';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';

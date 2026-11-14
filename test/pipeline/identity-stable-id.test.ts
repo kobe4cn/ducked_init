@@ -7,7 +7,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { excludeValue, includeValue } from '../../app/.server/identity-exclusions';
-import { enqueueMerge, mergeNow } from '../../app/.server/mappings';
+import { enqueueMerge, mergeNow } from '../../app/.server/merges';
 import { syncSource } from '../../app/.server/source-sync';
 import { resolveIdentities } from '../../app/.server/pipeline/identity-engine';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';

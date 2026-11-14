@@ -4,7 +4,8 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { listMappings, mergeNow } from '../../app/.server/mappings';
+import { listMappings } from '../../app/.server/mappings';
+import { mergeNow } from '../../app/.server/merges';
 import { syncSource } from '../../app/.server/source-sync';
 import { checkMetric, compileMetric, type DslContext } from '../../app/.server/pipeline/dsl/metric-spec';
 import { resolveIdentities } from '../../app/.server/pipeline/identity-engine';

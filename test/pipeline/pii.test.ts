@@ -6,7 +6,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { ensureTenantLakeSchemas, lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { mergeNow } from '../../app/.server/mappings';
+import { mergeNow } from '../../app/.server/merges';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { tenantPiiSalt } from '../../app/.server/secrets';
 import { syncSource } from '../../app/.server/source-sync';

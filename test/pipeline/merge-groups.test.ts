@@ -6,7 +6,8 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mergeGroups, mergeGroupVersions, tasks } from '../../app/.server/db/schema';
-import { confirmDisable, enqueueMerge, publishMapping, requestDisable, saveDraft } from '../../app/.server/mappings';
+import { confirmDisable, publishMapping, requestDisable, saveDraft } from '../../app/.server/mappings';
+import { enqueueMerge } from '../../app/.server/merges';
 import {
   checkMergeGroup, discardMergeGroupDraft, listMergeGroups, type MergeCandidate, publishedMergeGroups, publishMergeGroup, saveMergeGroupDraft,
 } from '../../app/.server/merge-groups';
