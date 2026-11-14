@@ -7,7 +7,7 @@ import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { cleanupExpiredExports } from '../exports';
 import { claimLakeMigration, heartbeatLakeMigrations, runLakeMigration } from '../lake-migration';
-import { enqueueDueMerges } from '../mappings';
+import { enqueueDueMerges } from '../merges';
 import { enqueueDueRefreshes } from '../refresh';
 import { enqueueDueSandboxExpiries } from '../sandbox';
 import { enqueueDueExpiries } from '../snapshots';

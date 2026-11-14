@@ -10,7 +10,7 @@ import type { CurrentMember } from './auth';
 import { publishedCustomEntities, uniqueKeys } from './custom-entities';
 import { getDb } from './db/client';
 import { mappings, mappingVersions, mergeGroups, mergeGroupVersions, sources } from './db/schema';
-import { enqueueMerge } from './mappings';
+import { enqueueMerge } from './merges';
 import { discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, publishReason, saveDraft, type PublishableAdapter } from './publishing';
 import { entityOf } from '../lib/canonical-model';
 import { cmpName } from '../lib/compare';
