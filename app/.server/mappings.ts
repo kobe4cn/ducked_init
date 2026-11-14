@@ -27,7 +27,7 @@ import { draftCustomMapping, draftMapping, DraftError, reuseMappingYaml } from '
 import {
   ASSERTION_DRAFT_SCHEMA, assertionDraftMessages, assertionsToYaml, type AssertionDraft, MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type DraftItem, type ModelDraft,
 } from './pipeline/model-draft';
-import { checkMapping, type CustomerSources, isSensitiveField, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
+import { checkMapping, type CustomerSources, isSensitiveField, mappingTemplate, type MappingIssue, type MergePlan, type PublishedPlan } from './pipeline/mapping-spec';
 import type { Rename } from './pipeline/schema-repair';
 import { diffColumns } from './pipeline/schema-diff';
 import { readResult } from './pipeline/task-contracts';
@@ -750,7 +750,7 @@ async function assertKeySpaces(tx: Tx, tenantId: string, mapping: typeof mapping
 }
 
 /** 各映射里 customer_source 指向 sourceId 的跨源引用列 */
-function crossSourceColumns(plans: MergeMappingParam[], sourceId: string) {
+function crossSourceColumns(plans: PublishedPlan[], sourceId: string) {
   return plans.flatMap(p => {
     const columns = p.columns.filter(c => c.customerSource === sourceId);
     return columns.length ? [{ plan: p, columns }] : [];
@@ -1071,43 +1071,49 @@ export async function dryRunMapping(actor: CurrentMember, mappingId: string, ver
 }
 
 /**
- * 租户各映射（给了 mappingIds 时只取这些；停用的映射除外，ADR-0031）最新的已发布版本及其合并计划（合并任务的参数）。
- * 输入是源视图的映射带上视图最新的已发布版本（SQL 与引用的表），工作进程不读平台库；
- * 写入全部实体（customer 除外，ADR-0024「独占」）的映射带上实体主键 uniqueKey，合并时跨映射查重；主键含指向 customer 的字段时
- * 另带 uniqueBySource，只在同一个数据源内查重。在已发布合并组里、组里可用（已发布、未停用、仍写入该实体）的组员至少 2 个的映射
- * 带上 group（ADR-0032），组员按优先级排
+ * 租户各映射（给了 mappingIds 时只取这些）最新的已发布版本及其合并计划，停用的映射除外（ADR-0031）。
+ * 输入是源视图的映射带上视图最新的已发布版本（SQL 与引用的表），工作进程不读平台库
  */
-export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId: string, mappingIds?: string[]): Promise<MergeMappingParam[]> {
+export async function publishedPlans(db: Tx | ReturnType<typeof getDb>, tenantId: string, mappingIds?: string[]): Promise<PublishedPlan[]> {
   if (mappingIds && !mappingIds.length) return [];
-  const groups = await publishedMergeGroups(db, tenantId);
-  // 合并组要看全部组员，给了 mappingIds 时把它们所在组的组员一并取出，最后再筛掉
-  const wanted = mappingIds && [...new Set([...mappingIds, ...[...groups.values()].flatMap(g => (g.members.some(m => mappingIds.includes(m)) ? g.members : []))])];
   const rows = await db
     .selectDistinctOn([mappingVersions.mappingId], {
       mapping: mappings.id, sourceId: mappings.sourceId, viewId: mappings.sourceViewId, version: mappingVersions.version, plan: mappingVersions.plan,
     })
     .from(mappingVersions)
     .innerJoin(mappings, eq(mappings.id, mappingVersions.mappingId))
-    .where(and(eq(mappings.tenantId, tenantId), isNull(mappings.disabledAt), eq(mappingVersions.status, 'published'), wanted && inArray(mappings.id, wanted)))
+    .where(and(eq(mappings.tenantId, tenantId), isNull(mappings.disabledAt), eq(mappingVersions.status, 'published'), mappingIds && inArray(mappings.id, mappingIds)))
     .orderBy(mappingVersions.mappingId, desc(mappingVersions.version));
   const views = await publishedViews(db, tenantId, { viewIds: [...new Set(rows.flatMap(r => (r.viewId ? [r.viewId] : [])))] });
-  const uniqueByEntity = uniqueKeys(await publishedCustomEntities(db, tenantId));
-  const plans: MergeMappingParam[] = rows
+  return rows
     .sort((a, b) => cmp(a.mapping, b.mapping))
     .map(({ viewId, ...r }) => {
       const view = views.find(v => v.id === viewId);
-      const unique = uniqueByEntity.get(r.plan.entity);
-      return {
-        ...r.plan, mapping: r.mapping, version: r.version, sourceId: r.sourceId,
-        ...(view && { sourceView: viewParam(view) }),
-        ...(unique && { uniqueKey: unique.key, ...(unique.bySource && { uniqueBySource: true }) }),
-      };
+      return { ...r.plan, mapping: r.mapping, version: r.version, sourceId: r.sourceId, ...(view && { sourceView: viewParam(view) }) };
     });
-  const withGroups = plans.map(plan => {
+}
+
+/**
+ * 已发布计划再补上合并任务的参数（合并入口与主键体检用，ADR-0053）：写入全部实体（customer 除外，ADR-0024「独占」）的映射带上
+ * 实体主键 uniqueKey，合并时跨映射查重；主键含指向 customer 的字段时另带 uniqueBySource，只在同一个数据源内查重。
+ * 在已发布合并组里、组里可用（已发布、未停用、仍写入该实体）的组员至少 2 个的映射带上 group（ADR-0032），组员按优先级排。
+ * 合并组要看全部组员：给了 mappingIds 时把它们所在组的组员一并取来算 group，最后只返回给定的映射
+ */
+export async function mergePlans(db: Tx | ReturnType<typeof getDb>, tenantId: string, mappingIds?: string[]): Promise<MergeMappingParam[]> {
+  if (mappingIds && !mappingIds.length) return [];
+  const groups = await publishedMergeGroups(db, tenantId);
+  const wanted = mappingIds && [...new Set([...mappingIds, ...[...groups.values()].flatMap(g => (g.members.some(m => mappingIds.includes(m)) ? g.members : []))])];
+  const plans = await publishedPlans(db, tenantId, wanted);
+  const uniqueByEntity = uniqueKeys(await publishedCustomEntities(db, tenantId));
+  const withKeys = plans.map(plan => {
+    const unique = uniqueByEntity.get(plan.entity);
+    return { ...plan, ...(unique && { uniqueKey: unique.key, ...(unique.bySource && { uniqueBySource: true }) }) };
+  });
+  const withGroups = withKeys.map(plan => {
     const group = groups.get(plan.entity);
     if (!group?.members.includes(plan.mapping) || !plan.uniqueKey) return plan;
     // 组失效（可用组员不到 2 个）时不带，组员之间照常查独占
-    const members = group.members.flatMap(id => plans.filter(p => p.mapping === id && p.entity === plan.entity));
+    const members = group.members.flatMap(id => withKeys.filter(p => p.mapping === id && p.entity === plan.entity));
     if (members.length < 2) return plan;
     return { ...plan, group: { id: group.id, rule: group.rule, key: plan.uniqueKey, members: members.map(groupMemberOf) } };
   });
@@ -1141,7 +1147,7 @@ async function mustRecomputeIdentities(db: Tx, tenantId: string, identity: unkno
 }
 
 /** 属性取舍的名次（ADR-0027）：各已发布 customer 映射里配置的名次，映射 ID → 名次（没配置的映射不在里面） */
-const survivorshipPriority = (plans: MergeMappingParam[]): Record<string, number> =>
+const survivorshipPriority = (plans: PublishedPlan[]): Record<string, number> =>
   Object.fromEntries(plans.filter(p => p.entity === 'customer' && p.survivorship).map(p => [p.mapping, p.survivorship!.priority]));
 
 /** 名次表按映射 ID 排好的键值对，用来比对是否变了（早先的合并参数里没有这一项，等同于空表） */
@@ -1153,7 +1159,7 @@ const sortedHashes = (hashes: unknown) => [...((hashes ?? []) as string[])].sort
 /**
  * 合并后要统计孤儿的关系：全部已发布关系（内置 ref 与已发布登记上的），带上起点是否敏感（isSensitiveField；标准层里是哈希，不给样例键）
  */
-function relationParams(published: Map<string, RegisteredEntity>, plans: MergeMappingParam[]): RelationParam[] {
+function relationParams(published: Map<string, RegisteredEntity>, plans: PublishedPlan[]): RelationParam[] {
   return allRelations(published).map(r => ({ ...r, sensitive: isSensitiveField(r.from, e => published.get(e)?.fields, plans) }));
 }
 
@@ -1172,11 +1178,11 @@ export { isSensitiveField } from './pipeline/mapping-spec';
  */
 export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string[], opts?: { rebuild?: boolean; drop?: MergeDrop[] }) {
   await lockTenant(tx, tenantId);
-  const plans = (await publishedPlans(tx, tenantId, mappingIds)).map(p => (opts?.rebuild ? { ...p, rebuild: true } : p));
+  const plans = (await mergePlans(tx, tenantId, mappingIds)).map(p => (opts?.rebuild ? { ...p, rebuild: true } : p));
   const incoming = opts?.drop ?? [];
   if (!plans.length && !incoming.length) return null;
   const pending = await pendingMerge(tx, tenantId);
-  const all = mappingIds ? await publishedPlans(tx, tenantId) : plans;
+  const all: PublishedPlan[] = mappingIds ? await publishedPlans(tx, tenantId) : plans;
   const identity = identityRules(all, mappingName);
   const survivorship = survivorshipPriority(all);
   const sensitive = consumerSensitive(all);
@@ -1252,7 +1258,7 @@ export async function mergeMapping(actor: CurrentMember, mappingId: string) {
     const task = await enqueueMerge(tx, actor.tenant.id, [mappingId]);
     if (task) return task;
     // 在同一个事务里判断原因：排队中的合并恰被领取时，这里读到的是运行中
-    if (!(await publishedPlans(tx, actor.tenant.id, [mappingId])).length) throw new MappingError('这个映射还没有已发布的版本');
+    if (!(await mergePlans(tx, actor.tenant.id, [mappingId])).length) throw new MappingError('这个映射还没有已发布的版本');
     throw new MappingError('已有一次合并在运行；它结束后，这个映射还有没合并的版本或变更时由定时检查补上');
   });
 }
@@ -1265,7 +1271,7 @@ export async function rebuildEntity(actor: CurrentMember, entity: string) {
   assertCan(actor, 'sources:write');
   return getDb().transaction(async tx => {
     await lockTenant(tx, actor.tenant.id);
-    const ids = (await publishedPlans(tx, actor.tenant.id)).filter(p => p.entity === entity).map(p => p.mapping);
+    const ids = (await mergePlans(tx, actor.tenant.id)).filter(p => p.entity === entity).map(p => p.mapping);
     if (!ids.length) throw new MappingError('这张表没有已发布的映射写入');
     if (await pendingMerge(tx, actor.tenant.id)) throw new MappingError('已有一次合并在排队或运行中，等它结束后再重建');
     // 锁已持有、没有排队或运行中的合并，入队必定成功

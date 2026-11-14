@@ -5,7 +5,7 @@ import type { CurrentMember } from '../../app/.server/auth';
 import { getDb } from '../../app/.server/db/client';
 import { members, spaces, tenants, type Role } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { createMapping, publishedPlans, publishMapping } from '../../app/.server/mappings';
+import { createMapping, mergePlans, publishMapping } from '../../app/.server/mappings';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import type { InputOf } from '../../app/.server/pipeline/task-contracts';
@@ -87,7 +87,7 @@ export function publish(author: CurrentMember, reviewer: CurrentMember, sourceId
  */
 export function mergeUnchecked(tenantId: string, mappingIds: string[]) {
   return timed('mergeUnchecked', async () => {
-    const mappings = (await publishedPlans(getDb(), tenantId, mappingIds)).map(({ uniqueKey: _k, uniqueBySource: _s, ...plan }) => plan);
+    const mappings = (await mergePlans(getDb(), tenantId, mappingIds)).map(({ uniqueKey: _k, uniqueBySource: _s, ...plan }) => plan);
     return runTask(tenantId, 'silver.merge', { mappings });
   });
 }

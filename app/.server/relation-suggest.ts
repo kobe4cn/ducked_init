@@ -9,7 +9,8 @@ import { allRelations, publishedCustomEntities, requireEntity } from './custom-e
 import { getDb } from './db/client';
 import { customEntityVersions } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
-import { isSensitiveField, publishedPlans } from './mappings';
+import { publishedPlans } from './mappings';
+import { isSensitiveField } from './pipeline/mapping-spec';
 import { openTenantLake } from './pipeline/lake-engine';
 import { SILVER } from './pipeline/lake-schemas';
 import { confirmedTables } from './sources';
