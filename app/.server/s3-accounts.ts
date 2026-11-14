@@ -68,7 +68,7 @@ function prefixPolicy(dataPaths: string[], actions: string[]) {
 }
 
 /**
- * 为租户建好存储服务上的账号与前缀策略，签发一把新密钥。可重复执行：账号已存在时沿用，
+ * 为租户建好存储服务上的账号与本租户桶的策略，签发一把新密钥。可重复执行：账号已存在时沿用，
  * 此前签发、没来得及保存的密钥一并作废，策略按 dataPath 重新写入
  */
 export async function issueTenantS3Account(tenantId: string, dataPath: string) {

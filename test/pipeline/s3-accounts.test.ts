@@ -35,7 +35,6 @@ async function inlinePolicyUsers(): Promise<string[] | null> {
   }
 }
 
-
 /** GetUserPolicy 拿回的策略文档：还原 XML 转义（含 &#34; 这类数字实体），URL 编码过时再解码 */
 async function policyDocOf(UserName: string) {
   const { xml } = await iam('GetUserPolicy', { UserName, PolicyName: 'tenant-lake' });
