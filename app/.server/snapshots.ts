@@ -12,6 +12,7 @@ import { publishedPlans } from './mappings';
 import { openTenantLake } from './pipeline/lake-engine';
 import type { MergeRecord } from './pipeline/merge-engine';
 import { insertTask } from './tasks';
+import { readResult } from './pipeline/task-contracts';
 import { TEMPLATES } from './pipeline/templates';
 import type { RfmParams } from './pipeline/templates/rfm';
 
@@ -53,7 +54,8 @@ export async function registerTaskSnapshot(
   const [task] = await db.select({ status: tasks.status, params: tasks.params, result: tasks.result, startedAt: tasks.startedAt }).from(tasks)
     .where(and(eq(tasks.id, taskId), eq(tasks.tenantId, tenantId)));
   if (task?.status !== 'succeeded' || !task.result) return;
-  const { table, rows, params } = task.result as { table: string; rows: number; params: Record<string, unknown> };
+  // 登记的既有 gold.dsl 也有模板任务（gold.rfm/…）：只借 gold.dsl 的结果类型读，不带 kind（#477）
+  const { table, rows, params } = readResult('gold.dsl', { result: task.result })!;
   const { definitionVersion, trigger } = task.params as { definitionVersion?: unknown; trigger?: unknown };
   const { template, entities } = describe(task.params as Record<string, unknown>);
   const incomplete = await incompleteMappings(tenantId, entities, task.startedAt ?? new Date());

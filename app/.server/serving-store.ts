@@ -11,6 +11,7 @@ import { lakeReady, lakeRow } from './lake';
 import { isS3, listLakeFiles } from './lake-storage';
 import { SERVING_DIR } from './pipeline/lake-engine';
 import { servingPath, type ServingParams } from './pipeline/serving-engine';
+import { readResult } from './pipeline/task-contracts';
 import { platformS3 } from './s3-accounts';
 import { deleteObject } from './s3-client';
 import { insertTask, updateQueuedParams } from './tasks';
@@ -82,7 +83,7 @@ export async function activateServingStore(tenantId: string, taskId: string) {
   const [task] = await db.select({ status: tasks.status, params: tasks.params, result: tasks.result, finishedAt: tasks.finishedAt }).from(tasks)
     .where(and(eq(tasks.id, taskId), eq(tasks.tenantId, tenantId), eq(tasks.kind, 'serving.build')));
   if (task?.status !== 'succeeded' || !task.result) return;
-  const { version, path } = task.result as { version: number; path: string };
+  const { version, path } = readResult('serving.build', task)!;
   const stored = (task.params.snapshots as (ServingStoreSnapshot & { table: string })[])
     .map(({ id, template, definitionVersion, createdAt, incomplete }) => ({ id, template, definitionVersion, createdAt, incomplete }));
   const previous = await db.transaction(async tx => {

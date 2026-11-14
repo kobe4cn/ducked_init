@@ -9,7 +9,7 @@ import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { getMailer } from './mailer';
 import { openTenantLake } from './pipeline/lake-engine';
 import { describeAssertion, failedErrors, type AssertionLevel, type AssertionResult } from './pipeline/assertions';
-import { CONTRACTS, type TaskKind } from './pipeline/task-contracts';
+import { CONTRACTS, readResult, type TaskKind } from './pipeline/task-contracts';
 
 /** 任务结果里有失败的 error 级断言时告警；没有时什么也不做。单个管理员发信失败只记日志，不影响其他人 */
 export async function alertAssertionFailure(tenantId: string, task: { id: string; kind: TaskKind }, result: Record<string, unknown> | undefined) {
@@ -41,7 +41,8 @@ export async function latestResultCheck(tenantId: string): Promise<{ taskId: str
   const [task] = await getDb().select({ id: tasks.id, result: tasks.result }).from(tasks)
     .where(and(eq(tasks.tenantId, tenantId), like(tasks.kind, 'gold.%'), isNotNull(tasks.finishedAt), sql`${tasks.result} -> 'assertions' IS NOT NULL`))
     .orderBy(desc(tasks.finishedAt)).limit(1);
-  return task && { taskId: task.id, assertions: task.result!.assertions as AssertionResult[] };
+  // 查询按 gold.% 匹配，模板任务（gold.rfm/…）与 gold.expire 也会进来：只借 gold.dsl 的结果类型读，不带 kind（#477）
+  return task && { taskId: task.id, assertions: readResult('gold.dsl', { result: task.result })!.assertions };
 }
 
 const READ_LIMITS = { memoryLimitMb: 256, threads: 1 };

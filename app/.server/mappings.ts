@@ -30,6 +30,7 @@ import {
 import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan } from './pipeline/mapping-spec';
 import type { Rename } from './pipeline/schema-repair';
 import { diffColumns } from './pipeline/schema-diff';
+import { readResult } from './pipeline/task-contracts';
 import { publishedMergeGroups } from './merge-groups';
 import {
   discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, saveDraft as savePublishable, type PublishableAdapter,
@@ -1132,7 +1133,8 @@ async function mustRecomputeIdentities(db: Tx, tenantId: string, identity: unkno
     .where(and(ofMerge(tenantId), inArray(tasks.status, ['succeeded', 'failed']),
       sql`(${tasks.result} IS NULL OR ${tasks.result} ? 'identities' AND NOT (${tasks.result}->'identities') ? 'skipped')`))
     .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
-  return !last?.result || 'error' in (last.result as { identities: object }).identities
+  const r = readResult('silver.merge', last);
+  return !r || !r.identities || 'error' in r.identities
     || JSON.stringify(last.params.identity ?? null) !== JSON.stringify(identity ?? null)
     || JSON.stringify(rankEntries(last.params.survivorship)) !== JSON.stringify(rankEntries(survivorship))
     || JSON.stringify(sortedHashes(last.params.identityExclude)) !== JSON.stringify(exclude);
@@ -1362,7 +1364,7 @@ export async function latestIdentitySummary(tenantId: string) {
     .where(and(ofMerge(tenantId), sql`${tasks.result} ? 'identities' AND NOT (${tasks.result}->'identities') ?| array['error', 'skipped']`))
     .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
   if (!latest) return null;
-  const { groups, records, devices, merged, split, hot } = (latest.result as { identities: Partial<IdentitySummary> & Pick<IdentitySummary, 'groups' | 'records' | 'devices'> }).identities;
+  const { groups, records, devices, merged, split, hot } = readResult('silver.merge', latest)!.identities as Partial<IdentitySummary> & Pick<IdentitySummary, 'groups' | 'records' | 'devices'>;
   return { groups, records, devices, merged: merged ?? null, split: split ?? null, hot: hot ?? [], taskId: latest.id, at: latest.createdAt };
 }
 
@@ -1372,7 +1374,7 @@ export async function latestRelationStats(tenantId: string) {
     .where(and(ofMerge(tenantId), sql`${tasks.result} ? 'relations'`))
     .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
   if (!latest) return null;
-  return { relations: (latest.result as { relations: RelationStat[] }).relations, at: latest.finishedAt };
+  return { relations: readResult('silver.merge', latest)!.relations ?? [], at: latest.finishedAt };
 }
 
 /**
@@ -1408,10 +1410,10 @@ export async function lastMergeByMapping(tenantId: string, mappingIds: string[])
 async function mergesOfMapping(tenantId: string, mappingId: string) {
   const runs = await getDb().select().from(tasks).where(and(ofMerge(tenantId), mergeHas(sql`${tasks.params}`, sql`${mappingId}::text`)))
     .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(HISTORY_TASKS);
-  const history = runs.flatMap(run => ((run.result?.mappings ?? []) as MergeRecord[])
+  const history = runs.flatMap(run => (readResult('silver.merge', run)?.mappings ?? [])
     .filter(r => r.mapping === mappingId).map(r => ({ ...r, taskId: run.id }) as MergeHistoryEntry));
   const [latest] = runs;
-  const own = latest && ((latest.result?.mappings ?? []) as MergeRecord[]).find(r => r.mapping === mappingId);
+  const own = latest && readResult('silver.merge', latest)?.mappings.find(r => r.mapping === mappingId);
   const status: TaskStatus | 'none' = !latest ? 'none' : own ? ('error' in own ? 'failed' : 'succeeded') : latest.status;
   return { status, history };
 }
