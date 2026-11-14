@@ -6,7 +6,8 @@ import { and, eq, isNull, ne } from 'drizzle-orm';
 import type { Tx } from '../audit';
 import { publishedCustomEntities } from '../custom-entities';
 import { sourceComments } from '../db/schema';
-import { isSensitiveField, publishedPlans } from '../mappings';
+import { publishedPlans } from '../mappings';
+import { isSensitiveField } from '../pipeline/mapping-spec';
 import { parseExpression } from '../../lib/mapping-expr';
 import { proposeMany, type ProposalInput, type ProposeManyResult } from './proposals';
 

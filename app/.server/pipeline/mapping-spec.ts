@@ -205,7 +205,7 @@ export interface MergePlan {
   assertions?: CustomAssertion[];
 }
 
-/** 已发布映射的合并计划：合并计划加上映射、版本与所属数据源（ADR-0053；任务契约里 silver.merge 的映射参数建在它上面，见 MergeMappingParam） */
+/** 已发布映射的合并计划：合并计划加上映射、版本与所属数据源（ADR-0053；任务契约里 silver.merge 的映射参数建在它上面） */
 export interface PublishedPlan extends MergePlan {
   /** 映射 ID */
   mapping: string;

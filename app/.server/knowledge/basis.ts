@@ -1,6 +1,6 @@
 // app/.server/knowledge/basis.ts —— 业务知识的目标与依据摘要（ADR-0046）。目标是目录条目标识：entity:x、field:e.f、metric:k、tag:k，
 // 映射字段是 field:e.f 再带映射 ID。依据摘要（basedOn）是知识写下时它依据的内容的摘要 [{id, hash}]：指标与标签是当前已发布版本 YAML 的 sha256（id 是条目标识），
-// 映射字段是该映射当前已发布计划稳定 JSON（不含版本号与合并组）的 sha256（id 是 mapping:<映射 ID>），实体与普通字段没有依据。
+// 映射字段是该映射当前已发布计划稳定 JSON（不含版本号）的 sha256（id 是 mapping:<映射 ID>），实体与普通字段没有依据。
 // 只存依据，不存「需复核」：读的时候与 currentBases 比较，不一样就是需复核。
 // 新知识不能挂在敏感字段上（ADR-0005），目标必须是本租户目录里有的：标准实体或已发布的自定义实体与它们的字段、已发布的指标与标签、已发布映射写入的字段
 import { and, eq } from 'drizzle-orm';
@@ -10,8 +10,8 @@ import { publishedCustomEntities } from '../custom-entities';
 import type { getDb } from '../db/client';
 import { mappings } from '../db/schema';
 import { publishedDependents } from '../dsl-dependencies';
-import { isSensitiveField, publishedPlans } from '../mappings';
-import type { MergeMappingParam } from '../pipeline/merge-engine';
+import { publishedPlans } from '../mappings';
+import { isSensitiveField, type PublishedPlan } from '../pipeline/mapping-spec';
 import { UUID } from '../tenants';
 import { entityOf } from '../../lib/canonical-model';
 import { cmp } from '../../lib/compare';
@@ -34,11 +34,11 @@ export const stableJson = (v: unknown): string => JSON.stringify(v, (_, x) =>
 export const definitionHash = (yaml: string) => sha256(yaml);
 
 /**
- * 映射的依据摘要：已发布计划的稳定 JSON 的 sha256。只看这个映射自己的内容：不含版本号（映射与源视图内容不变地重新发布不算变），
- * 也不含来自别处的合并组与实体主键（uniqueKey / uniqueBySource，随自定义实体发布而变）
+ * 映射的依据摘要：已发布计划的稳定 JSON 的 sha256。只看这个映射自己的内容：不含版本号（映射与源视图内容不变地重新发布不算变）；
+ * PublishedPlan 本来就不带来自别处的合并组与实体主键（uniqueKey / uniqueBySource，随自定义实体发布而变）
  */
-export function planHash(plan: MergeMappingParam): string {
-  const { version: _version, group: _group, uniqueKey: _key, uniqueBySource: _bySource, sourceView, ...rest } = plan;
+export function planHash(plan: PublishedPlan): string {
+  const { version: _version, sourceView, ...rest } = plan;
   return sha256(stableJson({ ...rest, ...(sourceView && { sourceView: { sql: sourceView.sql, tables: sourceView.tables } }) }));
 }
 
@@ -106,7 +106,7 @@ export async function assertTarget(tx: Tx, tenantId: string, targetId: string, m
     if (!own) throw notMapped();
   }
   const plans = await publishedPlans(tx, tenantId);
-  const writes = (p: MergeMappingParam) => p.entity === entity && p.columns.some(c => c.name === field);
+  const writes = (p: PublishedPlan) => p.entity === entity && p.columns.some(c => c.name === field);
   if (!fields.some(f => f.name === field) && !plans.some(writes)) throw new KnowledgeError(`实体 ${entity} 没有字段 ${field}`);
   if (isSensitiveField({ entity, field }, e => custom.get(e)?.fields, plans)) throw new KnowledgeError(`${entity}.${field} 是敏感字段，不能挂业务知识`);
   if (mappingId && !plans.some(p => p.mapping === mappingId && writes(p))) throw notMapped();
