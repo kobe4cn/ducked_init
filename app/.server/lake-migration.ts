@@ -113,6 +113,9 @@ class LostClaim extends Error {
   constructor() { super('迁移已由其他调度器接手'); }
 }
 
+/** 收回旧前缀后等网关拒绝旧凭据：超时（默认 60 s）与探测方式（默认 listObjects），测试注入用 */
+interface RevokeWaitOptions { revokeTimeoutMs?: number; probe?: (creds: S3Creds, prefixUri: string) => Promise<unknown> }
+
 /** 同时复制的文件数 */
 const COPY_CONCURRENCY = 4;
 
@@ -126,7 +129,7 @@ const COPY_CONCURRENCY = 4;
 export async function runLakeMigration(
   m: ClaimedMigration,
   signal?: AbortSignal,
-  opts?: { revokeTimeoutMs?: number; probe?: (creds: S3Creds, prefixUri: string) => Promise<unknown> },
+  opts?: RevokeWaitOptions,
 ) {
   let switched = false;
   let result = m.result;
@@ -230,7 +233,7 @@ async function waitPrefixDenied(
   m: ClaimedMigration,
   creds: S3Creds,
   signal: AbortSignal | undefined,
-  opts: { revokeTimeoutMs?: number; probe?: (creds: S3Creds, prefixUri: string) => Promise<unknown> } | undefined,
+  opts: RevokeWaitOptions | undefined,
 ) {
   const timeoutMs = opts?.revokeTimeoutMs ?? 60_000;
   const deadline = Date.now() + timeoutMs;
