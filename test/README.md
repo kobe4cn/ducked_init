@@ -15,7 +15,7 @@ npx vitest run test/pipeline/mapping-merge.test.ts # 单个文件
   - `TEST_S3_LAKE_URI`：对象存储上的隔离测试与文件数据源
   - `TEST_MYSQL_URL`：MySQL 数据源
   - `TEST_MONGO_URL`：MongoDB 数据源
-- `CRM_TEST_IAM_STRESS=1` 才跑 `test/pipeline/pipeline.test.ts` 的并发 IAM 改写用例（#560 的复现）：8 路并发建删一次性账号，压测期间已有租户的 ListBucket 前缀隔离应仍生效。默认关闭，因为压测打乱的是全局 IAM，会把同一存储服务上其他 worker 的 S3 用例一起搞成偶发失败；根因结论见 #569
+- `CRM_TEST_IAM_STRESS=1` 才跑 `test/pipeline/pipeline.test.ts` 的并发 IAM 改写用例（#560 的复现）：8 路并发建删一次性账号，压测期间已有租户的 ListBucket 前缀隔离应仍生效。默认关闭，因为压测打乱的是全局 IAM，会把同一存储服务上其他 worker 的 S3 用例一起搞成偶发失败；4.47 上 10/10 复现的网关重载窗口在 4.50 上已不复现（#569，本地与 CI 已统一固定 4.50）
 - `CRM_TEST_CONNECT_STRESS=1` 才跑 `test/pipeline/source-connect-stress.test.ts` 的源库建连压测（#627，`CRM_TEST_CONNECT_STRESS_N` 调并发路数，默认 32）：N 路 `openSource` 挂载测试源库加同一 host:port 的 N 路裸 TCP 建连作对照，输出两组建连耗时与失败数，定位沙箱经 podman 网关连 PG 的建连超时在哪一层；只统计不设断言
 - **按 worker 分库，文件并行**：worker 数由 `CRM_TEST_WORKERS` 控制（默认 8，CI 设成 4，要求 PG 的 `max_connections` ≥ 300，见 `db_script/docker-compose.yml`；PG 还是默认的 100 时用 `CRM_TEST_WORKERS=4`，约 19 分钟）。`vitest.config.ts` 把基准值另存到 `CRM_TEST_BASE_*`，`test/setup-env.ts`（setupFiles）按 `VITEST_POOL_ID`（1…N）给每个 worker 加后缀 `_w<i>`：
   - 平台库 `crm_platform_test_w<i>`、源库 `crm_source_test_w<i>`、MySQL / MongoDB 库（`TEST_MYSQL_URL` / `TEST_MONGO_URL` 的库名加后缀）

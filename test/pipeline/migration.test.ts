@@ -10,7 +10,7 @@ import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { lakeMigrations } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf, getTenantLake, tenantDataPath } from '../../app/.server/lake';
-import { claimLakeMigration, requestLakeMigration, requestLakeMigrations } from '../../app/.server/lake-migration';
+import { claimLakeMigration, requestLakeMigration, requestLakeMigrations, runLakeMigration } from '../../app/.server/lake-migration';
 import { listLakeFiles } from '../../app/.server/lake-storage';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -195,6 +195,21 @@ describe.skipIf(!S3_TARGET)('对象存储上的数据湖迁移到另一个前缀
     expect((await listObjects(creds, lake.dataPath)).some(f => f.path === '.keep')).toBe(true);
     await untilPrefixDenied(creds, oldPath);
     await expect(listObjects(creds, oldPath)).rejects.toThrow(/AccessDenied|HTTP 403/);
+  });
+
+  it('旧前缀迟迟收不回时迁移仍然成功并记 warning', async () => {
+    const acme = await newTenant('acme');
+    await seedLake(acme);
+    const oldPath = (await getTenantLake(acme))!.dataPath;
+    await requestLakeMigration(null, acme, S3_TARGET!);
+    // 不经调度器直接执行：注入恒成功的探测（代表网关一直没加载收窄后的新策略），60 s 超时缩成 500 ms
+    await runLakeMigration((await claimLakeMigration())!, undefined, {
+      revokeTimeoutMs: 500,
+      probe: async () => [{ path: '.keep', size: 0 }],
+    });
+    const migration = await lastMigrationOf(acme);
+    expect(migration).toMatchObject({ status: 'succeeded' });
+    expect(migration.result?.warning).toContain(oldPath);
   });
 
   it('并发迁移后租户账号被拒绝访问旧前缀', async () => {

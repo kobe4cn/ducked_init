@@ -15,8 +15,8 @@ ADR-0001 要求每个任务只挂载本租户的数据。实测发现只“挂�
 
 - 租户数据库角色的密码明文存在平台 PG（`tenant_lakes`），与 ADR-0007 中 TOTP 密钥同属“平台库访问权限即信任的根”。
 - 租户对象存储账号的密钥同样明文存在 `tenant_lakes`，与数据库角色的密码同等对待。账号是长期有效的，没有按任务签发的临时凭据（STS `GetFederationToken` 带会话策略同样实测可用，但要给 SeaweedFS 另配 STS 签名密钥）；凭据获取收在 `app/.server/s3-accounts.ts` 一处，以后可以替换。
-- 对象存储须支持 IAM API 与按前缀的用户策略。SeaweedFS 上账号必须由它自己保存在 filer 中（不能来自静态 `-s3.config` 文件），并开启 `-s3.iam.readOnly=false`；换用其他对象存储时要确认同等能力。
-  在 SeaweedFS 4.47 上实测（`test/pipeline/pipeline.test.ts`）：不锁 DuckDB 配置、只用租户账号时，其他租户前缀的读 / 写 / 列目录、列整个桶都被前缀策略拒绝（AccessDenied）。
+- 对象存储须支持 IAM API 与按前缀的用户策略。SeaweedFS 上账号必须由它自己保存在 filer 中（不能来自静态 `-s3.config` 文件），并开启 `-s3.iam.readOnly=false`；换用其他对象存储时要确认同等能力。本地（`db_script/docker-compose.yml`）与 CI（`.github/workflows/ci.yml`）固定同一 SeaweedFS 版本（4.50），升级时两处一起改。
+  在 SeaweedFS 4.47 上实测（`test/pipeline/pipeline.test.ts`）：不锁 DuckDB 配置、只用租户账号时，其他租户前缀的读 / 写 / 列目录、列整个桶都被前缀策略拒绝（AccessDenied）。同一版本上又有 #560 的反例：任何一次 IAM 写都让网关整份重载内存中的 IAM 配置，重载的毫秒级窗口内 ListBucket 的前缀条件失效，已有租户的凭据能列出其他租户前缀下的对象名（read / write 不受影响）；#569 在同款沙箱临时实例上对照压测（`CRM_TEST_IAM_STRESS=1`，8 路并发建删一次性账号）：4.47 上 3/3 次复现，4.50 上 10/10 次不再复现、把 IAM 配置臃肿到 #621 之前的规模后再压 3 次也不复现——窗口是 4.47 的缺陷，升级到 4.50 后消失，但机制上仍依赖网关正确评估前缀条件，每租户一桶的彻底隔离另票长期加固。
   删账号必须先删策略：`DeleteUser` 只删身份文件、不清 `policies.json` 里该账号的内联策略，`DeleteUserPolicy` 对已不存在的账号只回 `NoSuchEntity`，「账号没了、策略还在」就成了 IAM API 删不掉的孤儿；SeaweedFS 每次 IAM 改动又整份重写这个文件，孤儿条目把它和 filer 元数据日志一起撑大（2026-11-10 实测攒到 8022 条、文件 6 MB，#621）。`app/.server/s3-accounts.ts` 删号时对已消失的账号也补删一次策略，存量和增量残留由 `scripts/prune-seaweed-iam-policies.ts` 兜底（随 `pnpm sandcastle:prune-metalog` 每轮清理）。
   `<本租户前缀>../<其他租户 ID>/…` 路径穿越（DuckDB 不规范化 S3 路径里的 `..`，`allowed_directories` 挡不住它）同样被存储服务拒绝，但靠的不是前缀策略：SeaweedFS 对路径里带 `..` 的请求一律返回 400（签名正确、用平台账号也一样），DuckDB 发出的这类请求则因签名对不上返回 403。换用其他对象存储时，要确认它规范化路径后再按策略判断，或同样拒绝 `..`。
 - 平台 PG 需要 15 及以上版本（更早的版本默认允许所有角色在 `public` schema 建表，租户之间会多出一条互通的渠道），平台账号需要 CREATEROLE 权限。

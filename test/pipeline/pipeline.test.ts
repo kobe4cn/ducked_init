@@ -19,7 +19,6 @@ import { newTenant, runTask } from './fixtures';
 
 /** 本文件的已知差距（用 it.fails 标预期失败，改好后会变红，提醒从清单删掉；写法照 test/retrieval-golden.test.ts） */
 const KNOWN_GAPS = new Map<string, string>([
-  ['iam-concurrent', 'SeaweedFS 网关重载 IAM 期间 ListBucket 的前缀条件毫秒级失效（#569）'],
 ]);
 
 afterAll(async () => { await closeDb(); });
@@ -284,7 +283,7 @@ describe.skipIf(!process.env.TEST_S3_LAKE_URI)('对象存储上的越权访问',
   // IAM 配置，重载窗口内已有租户的 ListBucket 前缀隔离毫秒级失效（list 单个请求被放行，read / write / 列桶根仍被拒，
   // 同一连接立即重试即恢复拒绝——存储里的策略文档在泄露当下读回是完好的，排除丢更新；10/10 次运行复现，全在
   // SeaweedFS 4.47 上）。默认跳过：并发改写打乱的是全局 IAM，会把其他 worker 的 S3 用例一起搞成偶发失败（等于自己
-  // 制造 #560）。修复在 #569，根因结论也贴在那里
+  // 制造 #560）。#569 把本地与 CI 统一到 4.50 后不再复现（含把 IAM 配置臃肿成 #621 之前的状态再压），保留用例继续把关
   const gap = KNOWN_GAPS.get('iam-concurrent');
   const iamStress = it.skipIf(!process.env.CRM_TEST_IAM_STRESS);
   (gap ? iamStress.fails : iamStress)(
