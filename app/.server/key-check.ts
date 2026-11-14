@@ -8,7 +8,7 @@ import { publishedCustomEntities, type RegisteredEntity } from './custom-entitie
 import { getDb } from './db/client';
 import { tasks, tenants, type TaskStatus } from './db/schema';
 import { entityOf } from '../lib/canonical-model';
-import { publishedPlans } from './mappings';
+import { mergePlans } from './mappings';
 import type { KeyCheckParams } from './pipeline/key-check-engine';
 import type { MergeMappingParam } from './pipeline/merge-engine';
 import { readResult } from './pipeline/task-contracts';
@@ -19,7 +19,7 @@ export class KeyCheckError extends Error {}
 /**
  * 体检参数里的实体：按实体汇总已发布映射，带上实体主键与 bySource（主键里有字段指向 customer：标准实体看字段上内置的 ref，
  * 自定义实体与扩展字段看已发布登记上的关系）。customer 与主键未知的实体不放进去。
- * 映射在已发布合并组里时带上组 ID（publishedPlans 只给可用组员至少 2 个的组填 group），体检不报同组的映射对
+ * 映射在已发布合并组里时带上组 ID（mergePlans 只给可用组员至少 2 个的组填 group），体检不报同组的映射对
  */
 export function keyCheckEntities(plans: MergeMappingParam[], published: Map<string, RegisteredEntity>): KeyCheckParams['entities'] {
   const relations = [...published.values()].flatMap(e => e.relations ?? []);
@@ -49,7 +49,7 @@ export async function checkKeysNow(actor: CurrentMember) {
     const [pending] = await tx.select({ id: tasks.id }).from(tasks)
       .where(and(ofKeyCheck(tenantId), inArray(tasks.status, ['queued', 'running']))).limit(1);
     if (pending) throw new KeyCheckError('已有一次主键冲突体检在排队或运行中');
-    const entities = keyCheckEntities(await publishedPlans(tx, tenantId), await publishedCustomEntities(tx, tenantId));
+    const entities = keyCheckEntities(await mergePlans(tx, tenantId), await publishedCustomEntities(tx, tenantId));
     return insertTask(tx, tenantId, 'silver.keycheck', { entities } satisfies KeyCheckParams);
   });
 }

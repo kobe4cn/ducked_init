@@ -2,9 +2,9 @@
 // 标准层 silver.order 里组内同一主键只有一行，字段按存活规则取值，合并记录写下重叠与不一致；组外的映射撞键仍按独占失败；
 // 同步后的增量合并只重算受影响的主键；停用、恢复组员时整组重算，组失效后各自一行
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
-import { confirmDisable, getMapping, publishMapping, requestDisable, restoreMapping, saveDraft } from '../../app/.server/mappings';
+import { confirmDisable, getMapping, mergePlans, publishMapping, publishedPlans, requestDisable, restoreMapping, saveDraft } from '../../app/.server/mappings';
 import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-groups';
 import { runAssertions } from '../../app/.server/pipeline/assertions';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -194,6 +194,24 @@ describe('按合并组合并', () => {
     } finally {
       session.close();
     }
+  });
+
+  it('mergePlans 只返回给定的组员但算上整组，publishedPlans 只给已发布计划（不带主键与组）', async () => {
+    const fixture = await withOrders();
+    const { acme, crm, loyalty } = fixture;
+    await group(fixture, [loyalty, crm], { kind: 'priority' });
+
+    const merged = await mergePlans(getDb(), acme, [loyalty]);
+    expect(merged.map(p => p.mapping)).toEqual([loyalty]);
+    expect(merged[0]!.uniqueKey).toEqual(['order_id']);
+    // 组员列表按优先级排：先发布的会员在前
+    expect(merged[0]!.group).toMatchObject({ members: [{ mapping: loyalty }, { mapping: crm }] });
+
+    const plain = await publishedPlans(getDb(), acme, [loyalty]);
+    expect(plain.map(p => p.mapping)).toEqual([loyalty]);
+    expect(plain[0]).not.toHaveProperty('uniqueKey');
+    expect(plain[0]).not.toHaveProperty('uniqueBySource');
+    expect(plain[0]).not.toHaveProperty('group');
   });
 
   it('增量合并只重算受影响的订单号：其余订单号的合并时间不变，会员删掉的订单回落到 CRM 的那一行', async () => {
