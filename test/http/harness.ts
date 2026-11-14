@@ -9,7 +9,7 @@ import jsQR from 'jsqr';
 import { PNG } from 'pngjs';
 import type { Mail } from '../../app/.server/mailer';
 import * as opsAuth from '../../app/.server/ops-auth';
-import { isTenantBucketRoot } from '../../app/.server/lake';
+import { isTenantBucketRoot } from '../../app/.server/lake-storage';
 import { deleteTenantS3Account, platformS3 } from '../../app/.server/s3-accounts';
 import { deleteBucket } from '../../app/.server/s3-client';
 import * as tenants from '../../app/.server/tenants';

@@ -16,6 +16,7 @@
 import { DuckDBInstance } from '@duckdb/node-api';
 import { MongoClient } from 'mongodb';
 import pg from 'pg';
+import { isTenantBucketRoot } from '../app/.server/lake-storage';
 import { platformS3, deleteTenantS3Account } from '../app/.server/s3-accounts';
 import { deleteBucket, deleteObject, listObjects, signedFetch, xmlTag, xmlTags } from '../app/.server/s3-client';
 import { accountsToDrop, escapeRe, nameMatcher, suffixPattern } from './test-resource-names';
@@ -83,11 +84,11 @@ async function collectBucketTenants(db: string) {
     await client.connect();
     const { rows } = await client.query<{ tenant_id: string; data_path: string }>(
       `SELECT tenant_id, data_path FROM platform.tenant_lakes WHERE data_path LIKE 's3://lake-%'`);
-    for (const r of rows) if (/^s3:\/\/lake-[^/]+\/$/.test(r.data_path)) bucketTenants.push({ tenantId: r.tenant_id, dataPath: r.data_path });
+    for (const r of rows) if (isTenantBucketRoot(r.data_path)) bucketTenants.push({ tenantId: r.tenant_id, dataPath: r.data_path });
     // 迁移离开旧桶的租户（迁移不删旧位置的文件）：桶同样要回收，账号已随 tenant_lakes 那边处理，这里只记桶
     const { rows: migrated } = await client.query<{ from_path: string }>(
       `SELECT DISTINCT from_path FROM platform.lake_migrations WHERE from_path LIKE 's3://lake-%'`);
-    for (const r of migrated) if (/^s3:\/\/lake-[^/]+\/$/.test(r.from_path)) bucketTenants.push({ tenantId: null, dataPath: r.from_path });
+    for (const r of migrated) if (isTenantBucketRoot(r.from_path)) bucketTenants.push({ tenantId: null, dataPath: r.from_path });
   } catch (e) {
     console.log(`PG：${db} 里没有可回收的桶租户（${e instanceof Error ? e.message : e}）`);
   } finally {

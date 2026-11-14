@@ -8,7 +8,7 @@ import { desc, eq, sql } from 'drizzle-orm';
 import { recordAudit, type OperatorActor, type Tx } from './audit';
 import { getDb, type Db } from './db/client';
 import { lakeMigrations, tenantLakes } from './db/schema';
-import { isS3 } from './lake-storage';
+import { isS3, isTenantBucketRoot } from './lake-storage';
 import { openTenantLake, type LakeSpec } from './pipeline/lake-engine';
 import { ensureLakeSchemas } from './pipeline/lake-schemas';
 import { deleteTenantS3Account, issueTenantReadOnlyS3Account, issueTenantS3Account, platformS3, putPrefixPlaceholder, s3UserOf } from './s3-accounts';
@@ -31,9 +31,6 @@ const lakeRoot = () => normalizeLakeRoot(process.env.PLATFORM_LAKE_URI ?? './dat
  */
 export const tenantDataPath = (root: string, tenantId: string) =>
   isS3(root) ? `${root}/tenants/${tenantId}/` : `${join(root, 'tenants', tenantId)}/`;
-
-/** data_path 是对象存储上租户独占的桶根（s3://lake-<租户 ID>/，ADR-0008）；共享桶里的前缀租户不匹配 */
-export const isTenantBucketRoot = (dataPath: string) => /^s3:\/\/lake-[^/]+\/$/.test(dataPath);
 
 /** 每个租户的存储路径与 catalog schema、数据库角色都由租户 ID 决定：对象存储上是独占的桶 s3://lake-<租户 ID>/（ADR-0008），本地目录是 <根>/tenants/<租户 ID>/ */
 function layout(tenantId: string) {

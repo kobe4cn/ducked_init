@@ -11,6 +11,9 @@ import { deleteObject, getObject, listObjects, putObject } from './s3-client';
 
 export const isS3 = (path: string) => path.startsWith('s3://');
 
+/** data_path 是对象存储上租户独占的桶根（s3://lake-<租户 ID>/，ADR-0008）；共享桶里的前缀租户不匹配 */
+export const isTenantBucketRoot = (dataPath: string) => /^s3:\/\/lake-[^/]+\/$/.test(dataPath);
+
 /** 存储前缀下的一个文件：相对前缀的路径（以 / 分隔）与字节数 */
 export interface LakeFile { path: string; size: number }
 
