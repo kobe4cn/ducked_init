@@ -270,6 +270,8 @@ describe.skipIf(!S3_TARGET)('对象存储上的数据湖迁移到另一个前缀
     // 迁离对象存储后收回租户在存储服务上的账号
     expect(await lakeRow(acme)).toMatchObject({ s3AccessKey: null, s3SecretKey: null });
     expect(await getTenantLake(acme)).toMatchObject({ ready: true, s3User: null });
+    // 删账号路径也要等网关拒绝旧凭据：InvalidAccessKeyId 漏判会白等到超时并记 warning
+    expect((await lastMigrationOf(acme)).result?.warning).toBeUndefined();
   });
 });
 
