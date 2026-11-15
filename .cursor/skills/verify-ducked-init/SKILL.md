@@ -1,6 +1,6 @@
 ---
 name: verify-ducked-init
-description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, model provider, or the AI assistant, and capture evidence. When the diff changes no page, skip the browser launch. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class. When the diff touches SeaweedFS startup or volume config (db_script/docker-compose.yml, db_script/seaweedfs/master.toml, the SeaweedFS step in .github/workflows/ci.yml, or db_script/start.sh), start that compose stack, check master Max is 2000, confirm one new bucket's first write adds 1 volume, and run scripts/bench-bucket-per-tenant.ts --write-each on a small bucket count. When the diff changes per-tenant bucket isolation (initTenantCatalog creating a bucket, prefixPolicy, createBucket or deleteBucket, resetDb deleting buckets, or drop-test-resources collecting buckets), start a disposable SeaweedFS and check exclusive buckets, idempotent create, cross-tenant 403, legacy prefix conditions, and suffix cleanup. Do not delete every lake-* bucket."
+description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, model provider, the AI assistant, or the operator tenant storage quota, and capture evidence. When the diff changes no page, skip the browser launch. When the diff adds a drizzle migration, also migrate a database that already has rows at the parent commit and confirm only the new column changes. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class. When the diff touches SeaweedFS startup or volume config (db_script/docker-compose.yml, db_script/seaweedfs/master.toml, the SeaweedFS step in .github/workflows/ci.yml, or db_script/start.sh), start that compose stack, check master Max is 2000, confirm one new bucket's first write adds 1 volume, and run scripts/bench-bucket-per-tenant.ts --write-each on a small bucket count. When the diff changes per-tenant bucket isolation (initTenantCatalog creating a bucket, prefixPolicy, createBucket or deleteBucket, resetDb deleting buckets, or drop-test-resources collecting buckets), start a disposable SeaweedFS and check exclusive buckets, idempotent create, cross-tenant 403, legacy prefix conditions, and suffix cleanup. Do not delete every lake-* bucket."
 ---
 
 # Verify CRM 数据分析平台
@@ -11,7 +11,7 @@ Do not drive a server you did not start. Do not point this flow at the developer
 
 Two instances can run side by side. Each `launch.sh` picks its own port, PostgreSQL database (`crm_platform_verify_<run-id>`), and lake directory. Cluster-wide lake roles are named from the tenant id, so they do not collide. Both processes share the checkout's `node_modules/.vite` cache. Pass the run id to `doctor.sh`, `drive-members.sh`, `browser.mjs` is pinned to the `current` symlink unless `VERIFY_STATE_DIR` is set. The symlink always points at the latest launch.
 
-`/ops` (operator Magic Link plus TOTP) is not in this map. The dispatcher is not started. Registering a data source needs a separate read-only database, which this launch does not create.
+`/ops` is in this map only for the tenant storage-quota form. Drive that with [features/ops-quota.md](features/ops-quota.md) after `launch.sh`. Other operator pages are not in the map. The dispatcher is not started. Registering a data source needs a separate read-only database, which this launch does not create.
 
 ## Changes that do not touch a page
 
@@ -110,6 +110,47 @@ Record the command output for each of these:
 - A second `PUT` of the same bucket on SeaweedFS 4.50 returns 409 `BucketAlreadyOwnedByYou`. Calling `initTenantCatalog` again still succeeds, and the access key already stored is left in place.
 - A lake row whose `data_path` is a shared prefix (`s3://<bucket>/.../tenants/<id>/`) does not grow a `lake-<id>` bucket. Its policy still has a `Condition`. `setTenantS3Prefixes` with both that prefix and the tenant's own bucket keeps the `Condition` on the shared bucket. Listing the whole shared bucket with those keys returns 403.
 - `resetDb` against this database, with `TEST_S3_LAKE_URI` set, deletes the recorded `s3://lake-<id>/` buckets and the tenant accounts. `pnpm sandcastle:cleanup _i<token>` then deletes that test database, any recorded bucket still left, and accounts whose policy names the suffixed prefix. The suffix is an argument of the script. `pnpm sandcastle:cleanup -- _i<token>` forwards `--` and the script exits 2. A bucket you created and did not record in a matched test database, including another `lake-*` name, is still listed after both commands. Do not list every `lake-*` bucket and delete them. Dev tenants use those names on a shared server. After the evidence is recorded, delete only the canaries this run created.
+
+### Schema migration on existing rows
+
+Run this when the diff adds a directory under `drizzle/`. CI applies migrations to empty databases. It does not show rows that already existed at the parent commit's schema. A green CI run does not replace this section. If the diff also changes a page, still run `launch.sh`. `launch.sh` migrates an empty database; it is not this check.
+
+Do not point this at `crm_platform`, at a database `launch.sh` created, or at any `crm_platform_verify_*` database. Create two databases and drop them when the evidence is recorded. Names: `crm_migrate_<token>_up` and `crm_migrate_<token>_fresh`. `<token>` is `[a-z0-9]{1,12}`.
+
+The parent tree is `HEAD^` of the commit under test (the PR base). Its `drizzle/` does not contain the new migration directory.
+
+```bash
+git worktree add --detach /tmp/verify-migrate-parent HEAD^
+ln -sfn "$PWD/node_modules" /tmp/verify-migrate-parent/node_modules
+```
+
+`migratePlatformDb` in `app/.server/db/migrate.ts` reads `drizzle/` next to that file. Run it from the worktree for the upgrade database, then from the PR checkout for the same database and for the fresh database. Close the pool so the process exits:
+
+```bash
+PLATFORM_DATABASE_URL='postgres://crm:crm@127.0.0.1:5432/crm_migrate_<token>_up' \
+  node --import tsx -e '
+import { migratePlatformDb } from "./app/.server/db/migrate.ts";
+import { closeDb } from "./app/.server/db/client.ts";
+await migratePlatformDb();
+await closeDb();
+'
+```
+
+Before the second migrate, insert rows that omit the new column. For a column on `platform.tenants`, `slug` and `name` are required. Insert two rows and set the other integer quota columns to two different combinations. Record those values.
+
+Fingerprint the `platform` schema before the second migrate and after it. Include columns (type, `attnotnull`, default, column comment), constraints, indexes, enums, tables, and table comments. Sort the lines. `diff` the two files. The only added line is the new column. Existing rows show the column default, and every other column on those rows is unchanged. `INSERT` of `NULL` into a `NOT NULL` column fails with `violates not-null constraint`.
+
+Migrate `crm_migrate_<token>_fresh` from the PR checkout with no prior rows. Insert one row that omits the new column. It receives the default. The fresh fingerprint matches the upgraded fingerprint.
+
+`pnpm db:migrate` on the database `launch.sh` creates is a second fresh-database run. It does not replace the upgrade database.
+
+Copy the diff, the row listings, and the null-insert error into the evidence directory. Then:
+
+```bash
+git worktree remove --force /tmp/verify-migrate-parent
+```
+
+Drop both `crm_migrate_<token>_*` databases. Do not drop `crm_platform` or a `crm_platform_verify_*` database from this section. `cleanup.sh` drops only the launch database.
 
 ## Launch
 
