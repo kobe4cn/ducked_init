@@ -34,6 +34,8 @@ export interface TaskContract<P, R> {
   attachSource?: boolean;
   readOnlyLake?: boolean;
   servingFile?: boolean;
+  /** 存储超额时仍放行（清理、过期快照与不写租户桶的任务）；不声明就在领取时被拦（ADR-0008）。readOnlyLake 不等于不写桶：serving.build、export.tags 要拦 */
+  allowOverStorageQuota?: true;
   /** 领取任务时要由 tasks.ts 准备的凭据：源连接（照参数 sourceId 解密）、敏感信息盐、服务库密钥 */
   needs?: TaskNeeds;
 }
@@ -394,10 +396,10 @@ export type ServingParams = Known<z.infer<typeof servingParams>>;
  */
 export const CONTRACTS = {
   // 检索投影刷新（ADR-0047）：工作进程里没有平台库，什么也不做；成功后由调度器结束钩子从零重建投影
-  'catalog.projection': { label: '刷新检索投影', readOnlyLake: true, params: noParams, result: resultType<Record<string, unknown>>() },
+  'catalog.projection': { label: '刷新检索投影', readOnlyLake: true, allowOverStorageQuota: true, params: noParams, result: resultType<Record<string, unknown>>() },
   // 检索向量补算（ADR-0047、0049）：同上，工作进程里没有平台库；成功后由调度器结束钩子补齐当前模型缺的向量
-  'catalog.embed': { label: '补算检索向量', readOnlyLake: true, params: noParams, result: resultType<Record<string, unknown>>() },
-  'lake.inventory': { label: '盘点数据湖', params: noParams, result: resultType<{ tables: { name: string; rows: number }[] }>() },
+  'catalog.embed': { label: '补算检索向量', readOnlyLake: true, allowOverStorageQuota: true, params: noParams, result: resultType<Record<string, unknown>>() },
+  'lake.inventory': { label: '盘点数据湖', allowOverStorageQuota: true, params: noParams, result: resultType<{ tables: { name: string; rows: number }[] }>() },
   // 造数夹具：与 src/01_seed.ts 相同，用 hash() 确定性生成消费者与订单，同样的参数每次得到同样的数据
   'demo.seed': {
     label: '生成演示数据',
@@ -408,6 +410,7 @@ export const CONTRACTS = {
   // 数据源只读挂载在另一个 DuckDB 里，不碰本租户的数据湖。repairFor 是告警后重新采集的来源（调度器读）
   'source.profile': {
     label: '采集数据源',
+    allowOverStorageQuota: true,
     needs: { source: true },
     params: params<{ sourceId: string; tables: string[]; repairFor?: string }>(z.looseObject({ tables: strings('参数 tables 必须是非空的表名列表') })),
     result: resultType<Awaited<ReturnType<typeof profileSource>>>(),
@@ -429,6 +432,7 @@ export const CONTRACTS = {
     needs: { source: true },
     attachSource: true,
     readOnlyLake: true,
+    allowOverStorageQuota: true,
     params: schemaParams(keyCheckParams),
     result: resultType<KeyCheckTaskResult>(),
   },
@@ -439,6 +443,7 @@ export const CONTRACTS = {
     needs: { source: true },
     attachSource: true,
     readOnlyLake: true,
+    allowOverStorageQuota: true,
     params: schemaParams(verifyParams),
     result: resultType<{ tables: Awaited<ReturnType<typeof verifySourceLake>>; differences: number }>(),
   },
@@ -447,6 +452,7 @@ export const CONTRACTS = {
   'lake.inspect': {
     label: '漂移检查',
     readOnlyLake: true,
+    allowOverStorageQuota: true,
     params: schemaParams(inspectParams),
     result: resultType<InspectResult>(),
   },
@@ -455,6 +461,7 @@ export const CONTRACTS = {
   'silver.keycheck': {
     label: '主键冲突体检',
     readOnlyLake: true,
+    allowOverStorageQuota: true,
     params: schemaParams(silverKeyCheckParams),
     result: resultType<KeyCheckResult>(),
   },
@@ -481,6 +488,7 @@ export const CONTRACTS = {
   // 快照过期：删掉参数里到期快照的表（已删的跳过，重复执行不报错），再按 ADR-0020 擦除湖里的数据
   'gold.expire': {
     label: '快照过期',
+    allowOverStorageQuota: true,
     params: params<{ tables: string[] }>(z.object({
       tables: z.array(z.string(error('参数 tables 必须是非空的结果层快照表名列表')).regex(/^gold\.[a-z][a-z0-9]*__[0-9a-f-]{36}$/, error('参数 tables 必须是非空的结果层快照表名列表')), error('参数 tables 必须是非空的结果层快照表名列表')).min(1, error('参数 tables 必须是非空的结果层快照表名列表')),
     })),
@@ -490,6 +498,7 @@ export const CONTRACTS = {
   // 并与 gold.expire 一样擦除湖里的数据。没有声明 needs.source，领取时不读凭据（数据源已删）
   'source.drop': {
     label: '删除原始层',
+    allowOverStorageQuota: true,
     params: params<{ schema: string }>(z.object({
       schema: z.string(error('参数 schema 必须是原始层 schema 名')).regex(/^bronze_[0-9a-f]{32}$/, error('参数 schema 必须是原始层 schema 名')),
     })),
@@ -499,6 +508,7 @@ export const CONTRACTS = {
   // 表名正则是防注入的最后一道，只认沙箱 schema
   'sandbox.expire': {
     label: '沙箱表过期',
+    allowOverStorageQuota: true,
     params: params<{ tables: string[] }>(z.object({
       tables: z.array(z.string(error('参数 tables 必须是非空的沙箱表名列表')).regex(/^sandbox_[0-9a-f]{32}\.[a-z][a-z0-9_]{0,62}$/, error('参数 tables 必须是非空的沙箱表名列表')), error('参数 tables 必须是非空的沙箱表名列表')).min(1, error('参数 tables 必须是非空的沙箱表名列表')),
     })),

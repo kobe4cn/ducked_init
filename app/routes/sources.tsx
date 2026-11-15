@@ -11,6 +11,7 @@ import { listSources, registerSource, SourceError } from '~/.server/sources';
 import type { SourceInput } from '~/.server/source-config';
 import { decodeUtf8, removeUpload, storeUpload, UPLOAD_TABLE, UPLOAD_TABLE_RULE } from '~/.server/uploads';
 import { verifyDifferences } from '~/.server/source-verify';
+import { storageOverQuota } from '~/.server/storage-quota';
 import { uploadLimitOf } from '~/.server/tenants';
 import { formValues, SOURCE_KIND_LABELS, SOURCE_KINDS, targetOf, type SourceKind } from '~/lib/sources';
 import { cn } from '~/lib/utils';
@@ -56,6 +57,11 @@ export async function action({ request }: Route.ActionArgs) {
   // 先剔出文件：File 经 String() 会变成 "[object File]"
   const file = form.get('file');
   const input = Object.fromEntries([...form].filter(([k]) => k !== 'file').map(([k, v]) => [k, String(v)]));
+  // 文件要写进租户桶，存储超额时直接拒（ADR-0008）；非上传数据源不拦，它的同步会在领取任务时被拦
+  if (input.kind === 'upload') {
+    const over = await storageOverQuota(member.tenant.id);
+    if (over) return data({ error: over, values: formValues(form) }, { status: 413 });
+  }
   try {
     const { id } = input.kind === 'upload' ? await registerUpload(member, input, file) : await registerSource(member, input);
     throw redirect(`/sources/${id}`);

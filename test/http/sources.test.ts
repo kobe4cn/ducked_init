@@ -1,5 +1,5 @@
 // 数据源的 HTTP 接缝：数据工程师在界面上登记、修改与轮换凭据、测试连接、选定同步范围、查看列统计并确认水位线；凭据在任何页面与接口里都不回显
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, sources, tasks } from '../../app/.server/db/schema';
@@ -199,6 +199,25 @@ describe('登记数据源', () => {
     await expectRejected(await upload(browser, { name: '第二次', table: 'mid' }, file), 1);
     expect(await sourceCount()).toBe(1);
     expect(await listLakeFiles(await uploadsOf(tenantId))).toEqual(stored);
+  });
+
+  it('租户存储超额时上传 413，报错写明已用与配额，不留数据源与文件；未统计（用量为空）时照常上传', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+    await setTenantQuota(null, tenantId, { memoryLimitMb: 2048, threads: 2, maxConcurrentTasks: 1, maxUploadMb: 100, storageQuotaMb: 1 });
+    // 模拟调度器统计写回的超额用量（已用 2 MB > 配额 1 MB，ADR-0008）
+    const mark = (bytes: number | null) =>
+      getDb().execute(sql`UPDATE platform.tenant_lakes SET storage_used_bytes = ${bytes}, storage_measured_at = now() WHERE tenant_id = ${tenantId}`);
+
+    await mark(2 * 1048576);
+    const res = await upload(browser, { name: '活动报名', table: 'signups' }, new File(['id\n1\n'], 'a.csv'));
+    expect(res.status).toBe(413);
+    expect(await res.text()).toContain('租户存储已超出配额（已用 2 MB / 配额 1 MB）');
+    expect(await getDb().select().from(sources).where(eq(sources.tenantId, tenantId))).toEqual([]);
+    expect(await listLakeFiles(await uploadsOf(tenantId))).toEqual([]);
+
+    // 未统计时不拦：照常登记并跳转
+    await mark(null);
+    expect((await upload(browser, { name: '活动报名', table: 'signups' }, new File(['id\n1\n'], 'a.csv'))).status).toBe(302);
   });
 });
 

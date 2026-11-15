@@ -11,7 +11,7 @@
 | [0005](0005-pii-hashed-from-silver.md) | 敏感信息从标准层起只存加盐哈希，明文仅加密留在原始层 | 标准层字段、身份打通、敏感字段、解密审计 |
 | [0006](0006-bronze-as-change-batch-log.md) | 原始层统一存为变更批次（`_op`/`_commit_ts`/`_batch`），标准层只通过 MERGE 消费 | 原始层表格式、任何同步方式、标准层合并 |
 | [0007](0007-operator-console-separate-identity.md) | 运营后台用独立的运营者身份（`operators`、`/ops/login`、Magic Link + TOTP），只管租户元数据 | `/ops` 路由、运营者认证、租户开通 / 配额 |
-| [0008](0008-tenant-lake-db-role-and-locked-engine.md) | 租户数据湖隔离靠独占的 PG 角色、对象存储上每租户独占的桶（`s3://lake-<id>/`）与不带 Conditions 的桶级账号策略、锁定配置的 DuckDB；工作台另有只读角色 `lake_<id>_ro` 与只读账号 `lake-<id>-ro`（#237） | 工作进程里的 DuckDB 配置、租户开通、建桶、湖迁移、只读凭据 |
+| [0008](0008-tenant-lake-db-role-and-locked-engine.md) | 租户数据湖隔离靠独占的 PG 角色、对象存储上每租户独占的桶（`s3://lake-<id>/`）与不带 Conditions 的桶级账号策略、锁定配置的 DuckDB；工作台另有只读角色 `lake_<id>_ro` 与只读账号 `lake-<id>-ro`（#237）；存储配额由应用层软执行（配额存 `tenants.storage_quota_mb`、用量调度器每 10 分钟统计），超额时拦未声明放行的写入任务与上传（#715） | 工作进程里的 DuckDB 配置、租户开通、建桶、湖迁移、只读凭据、存储配额 |
 | [0009](0009-source-credentials-and-read-only-probe.md) | 数据源凭据按租户信封加密（AES-256-GCM + `PLATFORM_MASTER_KEY`），登记时探测只读权限 | 数据源登记、凭据、权限探测、模型服务密钥 |
 | [0010](0010-full-compare-against-lake-mirror.md) | 没有水位线的表一律全量比对，上一版作为当前镜像（整行哈希）存在租户数据湖 | 全量比对、`_mirror`、大表同步频率 |
 | [0011](0011-mongodb-via-community-extension.md) | MongoDB 经 DuckDB 社区扩展 `mongo` 只读挂载，权限另用官方驱动查询 | MongoDB 数据源 |

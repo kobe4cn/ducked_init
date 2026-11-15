@@ -1,6 +1,7 @@
 // 队列调度接缝：领取（claimNextTask）与结束（finishTask）。只看领取顺序与名额，不启动工作进程
+import { sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { closeDb, getDb } from '../../app/.server/db/client';
 import { claimNextTask, enqueueTask, failStaleTasks, finishTask, getTask, heartbeatTasks } from '../../app/.server/tasks';
 import { resumeTenant, setTenantQuota, suspendTenant } from '../../app/.server/tenants';
 import { resetDb } from '../http/harness';
@@ -136,5 +137,39 @@ describe('停用与中断', () => {
     expect(await getTask(lost.id)).toMatchObject({ status: 'failed', error: '调度器失联，任务中断' });
     expect((await getTask(alive.id)).status).toBe('running');
     expect((await claimNextTask())?.tenantId).toBe(lost.tenantId);
+  });
+});
+
+describe('存储配额（ADR-0008）', () => {
+  it('用量超额的租户：写入类任务领取时直接记为失败并报错写明已用与配额，清理与只读任务照常领取；未统计时不拦', async () => {
+    const acme = await newTenant('acme');
+    await setTenantQuota(null, acme, { memoryLimitMb: 512, threads: 1, maxConcurrentTasks: 1, maxUploadMb: 100, storageQuotaMb: 1 });
+    // 模拟调度器统计写回的超额用量（已用 2 MB > 配额 1 MB）；置空表示尚未统计
+    const mark = (bytes: number | null) =>
+      getDb().execute(sql`UPDATE platform.tenant_lakes SET storage_used_bytes = ${bytes}, storage_measured_at = now() WHERE tenant_id = ${acme}`);
+
+    await mark(2 * 1048576);
+    const { id: seedId } = await enqueueTask(acme, 'demo.seed', { customers: 5 });
+    await enqueueTask(acme, 'gold.expire', { tables: [`gold.rfm__${crypto.randomUUID()}`] });
+    await enqueueTask(acme, 'source.drop', { schema: `bronze_${'0'.repeat(32)}` });
+    await enqueueTask(acme, 'sandbox.expire', { tables: [`sandbox_${'0'.repeat(32)}.t1`] });
+    await enqueueTask(acme, 'lake.inventory');
+
+    // 排在最前的写入任务在领取时直接记为失败，不挡后面的清理任务：领到的是 gold.expire
+    const expired = (await claimNextTask())!;
+    expect(expired.kind).toBe('gold.expire');
+    await finishTask(expired.id, { result: {} });
+    expect(await getTask(seedId)).toMatchObject({ status: 'failed', error: '租户存储已超出配额（已用 2 MB / 配额 1 MB）' });
+    // 放行名单里的其余任务照常领取（并发上限 1，领一个结束一个）
+    for (const kind of ['source.drop', 'sandbox.expire', 'lake.inventory'] as const) {
+      const task = (await claimNextTask())!;
+      expect(task.kind).toBe(kind);
+      await finishTask(task.id, { result: {} });
+    }
+
+    // 未统计（用量为空）时写入任务照常领取
+    await mark(null);
+    await enqueueTask(acme, 'demo.seed', { customers: 5 });
+    expect((await claimNextTask())!.kind).toBe('demo.seed');
   });
 });

@@ -22,7 +22,7 @@ const createdAt = () => timestamp('created_at', { withTimezone: true }).notNull(
 
 // 停用（suspended_at 非空）：数据完整保留，可以恢复。拦截成员的会话与登录、外部系统的 API Key，排队的任务不再派发。
 // 配额由运营者设置：每个任务的 DuckDB 内存上限与线程数，同时运行的任务数（超出的排队），单个上传文件的大小上限（MiB，ADR-0037），
-// 以及租户存储配额（MiB）——租户桶的总用量上限，软配额，先只存值，用量统计与拦截在后续子票（ADR-0008）
+// 以及租户存储配额（MiB）——租户桶的总用量上限，软配额，超额时应用层拦写入类任务与上传（ADR-0008）
 // hybrid_search：catalog_search 是否走混合检索（ADR-0049），只有运营者能切换，默认关
 export const tenants = platform.table('tenants', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -47,7 +47,7 @@ export const tenants = platform.table('tenants', {
 // ro_* 是数据查询工作台用的只读凭据（ADR-0036）：对 catalog 的表只有 SELECT 的数据库角色，与只能读、列出本租户前缀的
 // 对象存储账号。为空表示还没建好（本功能上线前开通的租户），第一次执行工作台查询时补建
 // storage_used_bytes / storage_measured_at：调度器定期统计的桶总用量（字节）与统计时间（ADR-0008）。
-// measured_at 兼作统计的抢占锁，为空或过 10 分钟表示待统计（storage-quota.ts）；用量存 PG 不放内存，后续拦截上传也要读
+// measured_at 兼作统计的抢占锁，为空或过 10 分钟表示待统计（storage-quota.ts）；用量存 PG 不放内存，拦写入任务与上传都读它
 export const tenantLakes = platform.table('tenant_lakes', {
   tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
   dataPath: text('data_path').notNull(),
