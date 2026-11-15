@@ -2,7 +2,9 @@
 // 对话按成员存在 platform.assistant_conversations：标题与消息用租户数据密钥加密后存一个字段（ADR-0009），表里没有明文。
 // 消息只有成员与助手的文字和用过的工具名，不存工具输出、不存查询结果行；工作台的结果解读另存 SQL、行数与发送的列名（query）。
 // 分析计划（ADR-0050）随校验它的那轮 assistant 消息保存（plan）：只存计划本身（条目 id、版本与语义哈希），不存检索结果与工具原文（ADR-0043）；
-// 本轮 prefill_workbench 通过校验的 SQL 也随那条 assistant 消息保存（workbenchSql），只存进加密的消息体、不写进 content（content 会作为历史发给模型）。只有本人能读、续写与分享；
+// 本轮 prefill_workbench 通过校验的 SQL 也随那条 assistant 消息保存（workbenchSql），只存进加密的消息体、不写进 content（content 会作为历史发给模型）。
+// 歧义追问的结构化候选（⑥-3，ADR-0047）随判出歧义的那轮 assistant 消息保存（choices：词与候选条目 id，名称读时按读者目录组装，#539）；
+// 点选候选回答时服务端生成的 user 消息带 chosen（词与所选条目 id，ADR-0046），下一张票按它生成知识提案。只有本人能读、续写与分享；
 // 被分享人（同租户成员）只能读。按 id 访问别人没分享给自己的对话一律 404（管理员也一样）。
 // 成员被移出租户时，其对话与分享经外键级联删除
 import { and, desc, eq } from 'drizzle-orm';
@@ -28,7 +30,13 @@ export class ConversationError extends Error {
 
 /** 工作台结果解读的查询：SQL、发给模型服务的行数与列名，不含取值 */
 export interface InterpretedQuery { sql: string; rows: number; columns: string[] }
-export interface StoredMessage { role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: InterpretedQuery; plan?: AnalysisPlan; workbenchSql?: string }
+export interface StoredMessage {
+  role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: InterpretedQuery; plan?: AnalysisPlan; workbenchSql?: string;
+  /** 那一轮最后一次 catalog_search 判为歧义的追问候选（⑥-3）：只存词与候选条目 id，读回时按读者自己的目录组装成带名称的视图 */
+  choices?: { term: string; candidates: string[] }[];
+  /** 点选候选回答的那条 user 消息带的选择（⑥-3，ADR-0046：用户的回答只当数据，content 由服务端按它生成） */
+  chosen?: { term: string; entryId: string };
+}
 interface SealedBody { title: string; messages: StoredMessage[] }
 export interface ConversationSummary { id: string; title: string; updatedAt: Date }
 export interface Conversation extends SealedBody {
@@ -89,16 +97,32 @@ export async function readConversation(actor: CurrentMember, id: string): Promis
   return { id, owned, sharedWith: owned ? shares.map(s => s.email).sort() : [], ...await unseal(actor.tenant.id, row.sealed) };
 }
 
+/** appendTurn 的一轮问答：plan / workbenchSql / choices 随 assistant 消息、chosen 随 user 消息加密保存（⑥-3） */
+export interface TurnInput {
+  userText: string; reply: string; toolsUsed: string[];
+  plan?: AnalysisPlan; workbenchSql?: string; choices?: { term: string; candidates: string[] }[]; chosen?: { term: string; entryId: string };
+}
+
 /**
  * 把一轮问答（成员的问题、助手的答复与用过的工具名）记进自己的对话 id；id 为 null 时新建，标题取问题的前 TITLE_LENGTH 字。
  * plan 是本轮 validate_plan 收到的最后一份结构合法的计划（ADR-0050），workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（#437），
- * 都随 assistant 消息加密保存。返回对话 id。不是自己的对话时 404（被分享人也不能续写）
+ * choices 是本轮最后一次 catalog_search 判为歧义的追问候选（⑥-3），chosen 是点选候选回答时记在 user 消息上的选择（⑥-3），
+ * 都随消息加密保存。返回对话 id。不是自己的对话时 404（被分享人也不能续写）
  */
-export async function appendTurn(actor: CurrentMember, id: string | null, userText: string, reply: string, toolsUsed: string[], plan?: AnalysisPlan, workbenchSql?: string): Promise<string> {
+export async function appendTurn(actor: CurrentMember, id: string | null, turn: TurnInput): Promise<string> {
+  const { userText, reply, toolsUsed, plan, workbenchSql, choices, chosen } = turn;
   return appendMessages(actor, id, titleOf(userText, TITLE_LENGTH) || '新对话', [
-    { role: 'user', content: userText.slice(0, MAX_CONTENT) },
-    { role: 'assistant', content: reply.slice(0, MAX_CONTENT), toolsUsed, ...(plan ? { plan } : {}), ...(workbenchSql ? { workbenchSql } : {}) },
+    { role: 'user', content: userText.slice(0, MAX_CONTENT), ...(chosen ? { chosen } : {}) },
+    { role: 'assistant', content: reply.slice(0, MAX_CONTENT), toolsUsed, ...(plan ? { plan } : {}), ...(workbenchSql ? { workbenchSql } : {}), ...(choices ? { choices } : {}) },
   ]);
+}
+
+/** 最后一条 assistant 消息的歧义候选（⑥-3）：路由核对 /assistant 的 choice 入参用，词从这里反查（不收客户端传来的词或候选列表） */
+export function lastChoices(conversation: Conversation): { term: string; candidates: string[] }[] | undefined {
+  for (let i = conversation.messages.length - 1; i >= 0; i--) {
+    if (conversation.messages[i]!.role === 'assistant') return conversation.messages[i]!.choices;
+  }
+  return undefined;
 }
 
 /**

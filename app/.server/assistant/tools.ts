@@ -53,8 +53,9 @@ export const catalogFor = async (member: CurrentMember): Promise<Catalog> =>
 
 /** 一次助手对话轮的上下文：retrieved 是本轮 catalog_search / catalog_expand 返回过的条目 id，validate_plan 只认这些（防止模型引用没检索过的条目）；
  * plan 是本轮 validate_plan 收到的最后一份结构合法的计划，priorPlan 是对话里最近一份（助手循环带入）；存草稿与填工作台前都优先用 plan、其次 priorPlan 重新校验；
- * workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（多次通过以最后一次为准，之后的拒绝不清掉之前通过的值） */
-export interface ToolCtx { retrieved: Set<string>; plan?: AnalysisPlan; priorPlan?: AnalysisPlan; workbenchSql?: string }
+ * workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（多次通过以最后一次为准，之后的拒绝不清掉之前通过的值）；
+ * choices 是本轮最后一次 catalog_search 判为歧义的追问候选（⑥-3，只有词与候选条目 id）：随答复返回、由路由加密存进对话，不进发给模型的请求 */
+export interface ToolCtx { retrieved: Set<string>; plan?: AnalysisPlan; priorPlan?: AnalysisPlan; workbenchSql?: string; choices?: { term: string; candidates: string[] }[] }
 
 const TEXT = { type: 'string' };
 
@@ -205,6 +206,8 @@ export const TOOLS: AssistantTool[] = [
       for (const r of ranked) ctx?.retrieved.add(r.entry.id);
       // 回退时得分全为 0，照样判定（一律按差异追问）
       const { ambiguous, groups } = judgeAmbiguity(ranked, c, q);
+      // 歧义候选留在轮上下文里（⑥-3）：随本轮答复返回并加密存进对话，供前端点选、/assistant 的 choice 入参核对；同一轮再搜且不歧义时清空，只认最后一次
+      if (ctx) ctx.choices = ambiguous ? groups.map(g => ({ term: g.term, candidates: g.candidates })) : undefined;
       const entries = ranked.length
         ? ranked.map(r => r.reasons.length ? `${withHash(r.entry)}\n${hitLine(r.reasons)}` : withHash(r.entry)).join('\n\n')
         : toMarkdown([]);
