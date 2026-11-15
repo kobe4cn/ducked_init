@@ -240,11 +240,23 @@ async function handle(page, state, req) {
     await scope.locator(req.selector).setInputFiles(req.path);
     return {};
   }
+  if (cmd === 'scroll-y') {
+    return { stdout: String(Math.round(await page.evaluate(() => window.scrollY))) };
+  }
+  if (cmd === 'scroll-into') {
+    // 把控件滚进视口，并打印滚动后的 window.scrollY。数据源页的确认按钮在折线以下，提交后要用 scroll-y 证明没有跳回顶部。
+    const target = req.selector
+      ? scope.locator(req.selector).first()
+      : (req.role && req.name ? scope.getByRole(req.role, { name: req.name, exact: true }) : null);
+    if (!target) throw new Error('scroll-into requires --selector or --role and --name');
+    await target.scrollIntoViewIfNeeded();
+    return { stdout: String(Math.round(await page.evaluate(() => window.scrollY))) };
+  }
   throw new Error(`unknown command ${cmd}`);
 }
 
 function usage() {
-  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|magic-link> [args]`);
+  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|scroll-y|scroll-into|magic-link> [args]`);
   console.error('click accepts --confirm accept|dismiss for a window.confirm dialog');
 }
 
