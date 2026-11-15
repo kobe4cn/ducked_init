@@ -21,7 +21,8 @@ export const roleEnum = platform.enum('member_role', ROLES);
 const createdAt = () => timestamp('created_at', { withTimezone: true }).notNull().defaultNow();
 
 // 停用（suspended_at 非空）：数据完整保留，可以恢复。拦截成员的会话与登录、外部系统的 API Key，排队的任务不再派发。
-// 配额由运营者设置：每个任务的 DuckDB 内存上限与线程数，同时运行的任务数（超出的排队），以及单个上传文件的大小上限（MiB，ADR-0037）
+// 配额由运营者设置：每个任务的 DuckDB 内存上限与线程数，同时运行的任务数（超出的排队），单个上传文件的大小上限（MiB，ADR-0037），
+// 以及租户存储配额（MiB）——租户桶的总用量上限，软配额，先只存值，用量统计与拦截在后续子票（ADR-0008）
 // hybrid_search：catalog_search 是否走混合检索（ADR-0049），只有运营者能切换，默认关
 export const tenants = platform.table('tenants', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -33,6 +34,7 @@ export const tenants = platform.table('tenants', {
   threads: integer('threads').notNull().default(2),
   maxConcurrentTasks: integer('max_concurrent_tasks').notNull().default(1),
   maxUploadMb: integer('max_upload_mb').notNull().default(100),
+  storageQuotaMb: integer('storage_quota_mb').notNull().default(10240),
   hybridSearch: boolean('hybrid_search').notNull().default(false),
   createdAt: createdAt(),
 });
