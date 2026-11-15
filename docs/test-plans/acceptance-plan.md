@@ -347,7 +347,7 @@ sh scripts/fmcg-seed/uploads/make-uploads.sh
 | S2.3 | 确认水位线：有 `updated_at` / `update_time` / `modified` 的选它 →「确认为水位线」；`order_items`、`stations`、`regions` 以及只追加的 `scans`、`codes`、`points_ledger` 没有候选（平台只把按命名是更新时间的时间列和自增主键当候选，`created_at` 不算），按全量比对 | SRC-5：A 共 17 张表确认了水位线（含 oms `modified`、wecom `contacts` / `group_members` 的 `update_time`）；点按钮后页面停在原处 |
 | S2.4 | 文件类的表声明业务主键（下一段）→「在源端全表检查并确认」 | 每次声明排一个全表检查任务，通过才生效（SRC-6） |
 | S2.5 | 每个数据源点「立即同步」 | 原始层行数 = §3.3 的 L0；敏感列（手机、unionid、姓名）是密文（SRC-7） |
-| S2.6 | 每个数据源点「核对」 | 覆盖率 100%、缺失 0、多余 0（SRC-8 / VOL-1） |
+| S2.6 | 每个数据源点「核对」（**在 S2.3 确认水位线、S2.5 同步完成之后**；早点会给出「需确认水位线」「等待同步」） | 覆盖率 100%、缺失 0、多余 0（SRC-8 / VOL-1） |
 | S2.7 | 做 SRC-9（新增列）；SRC-3、SRC-10 在 C 的 `scratch_pg` 上做（§5.2） | |
 | S2.8 ✱ | **上传 GBK**：「数据源」→ 新建 → 类型「文件上传」→ 登记名 `dealer_upload`、表名 `dealer_stock`、选 `dealer_stock_gbk.csv` →「校验并登记」 | 登记成功；详情页列出 `dealer_stock` 7 列，列名是正确的中文（经销商编码…金额）（SRC-11） |
 | S2.9 ✱ | `dealer_upload` →「立即同步」；an 在「查询」跑：`select 大区, count(*), sum(进货箱数), sum(金额) from dealer_upload.dealer_stock group by 1 order by 1` | 华北 6 行、华东 12 行（金额 16,896.00）、华南 6 行；合计 24 行 / 360 箱 / 34,560.00；没有「�」或乱码（VOL-6） |
@@ -365,14 +365,14 @@ sh scripts/fmcg-seed/uploads/make-uploads.sh
 |---|---|---|
 | SRC-1 | 测试连接 | 13 个都通过只读探测；表清单正确 |
 | SRC-2 ✱ | 用**有写权限**的账号登记一个 PG 源（如 `crm/crm`） | 拒绝，说明是哪项写权限 |
-| SRC-3 ✱ | 编辑数据源：凭据框为空、页面与审计里没有明文；轮换只读账号的密码（在 C 上做，§5.2 ISO-C1–C2） | 同步失败有明确原因；更新后恢复，审计记「凭据已更新」 |
+| SRC-3 ✱ | 编辑数据源：凭据框为空、页面与审计里没有明文；轮换只读账号的密码（在 C 上做，§5.2 ISO-C1–C2） | 同步失败有明确原因；更新后恢复，审计记「修改数据源 「…」，轮换凭据」（detail 只有 `credentialsRotated: true`） |
 | SRC-4 | 选表、采集：列统计（类型、空值率、基数、范围、格式） | 手机、unionid 等像敏感的列**没有**常见取值；低基数状态列有常见取值 |
 | SRC-5 | 水位线：照 S2.3 | 页面标明每张表的同步方式 |
 | SRC-6 | 文件类表声明业务主键 | 排一个全表检查任务，重复时不生效并列出重复键 |
-| SRC-7 | 同步 | 原始层行数 = L0；敏感列在原始层是密文；每张表的同步历史有批次、行数、耗时、水位线 |
+| SRC-7 | 同步 | 原始层行数 = L0；原始层是**整湖文件加密**（catalog `encrypted=true`，每个数据文件有自己的 `encryption_key`；按 ADR-0005 / ADR-0020 列值本身是明文，哈希从标准层开始）；每张表的同步历史有批次、行数、耗时、水位线 |
 | SRC-8 | 核对（VOL-1） | 覆盖率 100% |
-| SRC-9 ✱ | 源端新增一列（`ALTER TABLE fmcg_member.members ADD COLUMN vip_level int`），同步 | 照常同步；提示「有新字段可映射」；目录变更记录多一条「数据源结构变化」 |
-| SRC-10 ✱ | 源端删一列映射用到的列（在 C 上做，§5.2 ISO-C3），同步 + 合并 | 只有依赖它的实体失败，其他实体照常；结果层继续用上一版快照；自动生成修复草稿 |
+| SRC-9 ✱ | 源端新增一列（`ALTER TABLE fmcg_member.members ADD COLUMN vip_level int`），同步 | 照常同步，同步结果 `schema.added` 有 `vip_level`；目录变更记录多一条「采集发现源表结构变化」（受限成员看到「数据源结构变化」），只写「变了：columns」、不列列名——**#767 修好前同步不触发采集，要再点「重新列出表并采集」才出现**；「N 个新列未映射」提示只对已发布映射的源表出现，在 S3.1 之后验 |
+| SRC-10 ✱ | 源端删一列映射用到的列（在 C 上做，§5.2 ISO-C3），同步 + 合并 | 只有依赖它的实体失败，其他实体照常；结果层继续用上一版快照；源端恢复后不改映射即自愈；源列**改名**时自动起草修复草稿（ADR-0034，单纯删列没有候选、不起草） |
 | SRC-11 ✱ | 上传 GBK CSV（S2.8） | 识别为 GBK、转 UTF-8 存进租户桶 `_uploads/<目录>/dealer_stock.csv`；上传类数据源没有水位线候选、不要求只读探测 |
 | SRC-12 ✱ | 上传审计：「审计日志」筛 `source.file_uploaded` | 一条：`dealer_stock：dealer_stock_gbk.csv（1,303 字节，GBK）`；不含文件内容。再登记一个 UTF-8 版（`dealer_upload_utf8`）对照：审计写 UTF-8，S2.9 的查询两边结果相同，然后删掉这个对照源（GOV-4 的流程） |
 | SRC-13 ✱ | 源端注释采集（S2.12） | PG 与 MySQL 的表 / 列注释都采到；敏感列的注释也会**显示在数据源页**（这是元数据原文），但不会成为提案（SK.9 验） |
@@ -395,7 +395,7 @@ node --env-file=.env --import tsx scripts/fmcg-seed/verify.ts fmcglab --only ide
 
 | # | 操作 | 期望 |
 |---|---|---|
-| S3.1 | 映射 `member_pg.members.customer.yaml`；eng 保存后试着自己发布 | 被拒：最后保存的人不能发布（MAP-5）；admin 发布后合并成功 |
+| S3.1 | 映射 `member_pg.members.customer.yaml`；eng 保存后试着自己发布 | 被拒：最后保存的人不能发布（MAP-5）；admin 发布后合并成功。随后补 SRC-9 后半：`ALTER TABLE fmcg_member.members ADD COLUMN vip_tier text`，同步（#767 修好前再点「重新列出表并采集」），数据源页 members 行出现「消费者：1 个新列未映射」（`vip_level` 在发布时已存在，视为有意不映射，不提示） |
 | S3.2 | 映射 `scan_mysql.scan_users`、`tmall_s3.buyers`、`wecom_duckdb.contacts` 的消费者映射 | `--only identity`：P01 已把会员、扫码、天猫、企微连成一个 |
 | S3.3 | jd_s3 建源视图 `jd_buyers`、douyin_s3 建源视图 `dy_buyers`，发布后映射 `jd_s3.jd_buyers.customer.yaml`、`douyin_s3.dy_buyers.customer.yaml` | 每个买家一条消费者记录（K9）；试着加上 `view_key: [openid]`，空跑与合并报 view_key 不唯一并列出重复标识（MAP-8），去掉再发 |
 | S3.4 | **P04 占位号**：先把 `station_mysql.members.customer.yaml` 里的 `phone: nullif(phone, '13800000000')` 改成 `phone: phone` 发布 | `--only identity`：误合并 1，最大的统一消费者有 267 个真实的人；**质量页出现「热值」告警**指向 13800000000（ID-3） |
@@ -815,8 +815,10 @@ node --env-file=.env --import tsx scripts/isolab/setup.ts --step compare --with 
 | # | 操作 | 期望 |
 |---|---|---|
 | ISO-C1（SRC-3） | `psql postgresql://crm:crm@localhost:5432/crm -c "ALTER ROLE isolab_reader PASSWORD 'rotated-1'"`；C 的 eng 对 `scratch_pg` 点「立即同步」 | 同步失败，原因是认证失败；编辑数据源时密码框为空 |
-| ISO-C2（SRC-3） | 页面上把密码改成 `rotated-1` →「校验并保存」，再同步 | 恢复；审计「凭据已更新」，没有明文 |
-| ISO-C3（SRC-10） | `psql … -c "ALTER TABLE iso_scratch.members DROP COLUMN city"`；同步 `scratch_pg`，等合并 | `scratch_pg → customer` 合并失败，`mall_pg → customer` 照常；提示结构变化；自动生成修复草稿；目录变更记录一条 |
+| ISO-C2（SRC-3） | 页面上把密码改成 `rotated-1` →「校验并保存」，再同步 | 恢复；审计「修改数据源 「scratch_pg」，轮换凭据」，审计与数据源配置里都没有明文 |
+| ISO-C3（SRC-10） | `psql … -c "ALTER TABLE iso_scratch.members DROP COLUMN city"`；同步 `scratch_pg`，等合并 | `scratch_pg → customer` 合并失败（「映射引用的源列 city 已被删除…」），`mall_pg → customer` 不受牵连；审计 `source.schema_broken`（只有列名）；平台自动重新采集这张表；目录变更记录一条「同步发现源表结构变化」；单纯删列**不**起草修复草稿（邮件写明没有候选） |
+| ISO-C3b（恢复） | `ALTER TABLE iso_scratch.members ADD COLUMN city text`，按 `crm_mall.users` 回填，并把 `updated_at` 刷成 `now()`（增量同步才会重读）；同步 | 同步识别新增 `city`、2000 行更新；合并不改映射即成功 |
+| ISO-C3c（改名） | `ALTER TABLE iso_scratch.members RENAME COLUMN city TO city_name`；同步，等两三分钟 | 合并失败后平台以平台身份起草第 2 版草稿（`city: city_name`）并记审计；eng 空跑、admin 发布后合并成功。**#767 修好前**：C3b 的恢复不触发采集，平台的改名基线停在删列时的采集，判为没有候选、不起草，需手工起草 v2 |
 | ISO-C4（GOV-4） | 直接删除 `scratch_pg` | 被拒，列出全部阻止原因 |
 | ISO-C5（GOV-4） | eng「提议停用」、admin「确认停用」它的映射，再删除数据源 | 删除成功；原始层随后删除；目录变更记录一条 |
 | 重置 | `setup.ts --step prepare` 重建上游，`setup.ts --step sources,mappings` 重新登记 | 回到 §5.1 的状态 |
@@ -1030,7 +1032,7 @@ pnpm eval:mapping:compare <旧结果> <新结果>
 |---|---|---|---|---|---|
 | S0 | ENV-1–6、造数、§3.6 素材、冒烟 A / B、VOL L0 | 2026-11-15 | ✅（ENV-6 未配，可选） | ENV-5：seaweedfs 按 `db_script/start.sh` 重建，Max 2000、新桶首写 +1 卷；造数 `--end 2026-11-15`；check-mappings A 64 ✔ / B 49 ✔；L0 36 张表对上（bills 以真值为准）；`verify.ts` A、B 均无 ✘（B 17 个定义 ✔） | B 冒烟租户映射过时（`douyin_buyers` 带 view_key、`events_s3` 停在 #191 之前），已按仓库发布新版本并停用 `users → customer`；`crm-seed/setup.ts` 的 recompute 复用旧任务 SQL（asOf 窗口写死），已改为 `recomputeDefinition`；重置后首批 `serving.build` 因旧快照已删失败、随后成功（暂态） |
 | S1 | S1.1–S1.8、OPS-1–9、AUTH-1–7 | 2026-11-15 | ✅（OPS-6–9 留到 S2 / ISO / AI-R6） | A 由 `/ops` 页面创建（审计 `tenant.created` 操作者为运营者）；B `verify.ts crmlab` 46 ✔ 无 ✘；**C 用 `isolab2`**（旧 `isolab` 早于每租户一桶，没有 `lake-<id>` 桶），后续 C 的用例一律换成 `isolab2`；三个租户各有 `lake-<id>` 桶，catalog、对象存储账号、只读账号互不相同；配额审计带前后值；用量统计 10 分钟内出现；混合检索三家都关；OPS-4 停用、恢复都进审计，停用期间不签发登录链接；AUTH-2 陌生邮箱连续 5 次后被限流、不签发；AUTH-3 / 4 按用户确认判过；OPS-1 / 5、AUTH-1 旧链接复用、AUTH-5–7 为页面观察 | AUTH-1 原期望写成「邀请邮件里的链接一次性」，与实现不符（邀请邮件只给 `/login` 地址），已改写；已登录的浏览器配置打开 `/login` 直接跳回首页，易误判为「没发链接」；crmlab 配额由冒烟脚本直接改库（无审计，脚本行为） |
-| S2 | S2.1–S2.12、SRC-1–15、VOL-1、VOL-6 | | | | |
+| S2 | S2.1–S2.12、SRC-1–15、VOL-1、VOL-6 | 2026-11-15 | ✅（SRC-9、ISO-C3c ⚠️ 见 #767；SRC-9 后半与 S3.1 一起验） | SRC-2 拒绝写权限账号并列出 34 项；13 源 36 表登记、注释与 §3.6 一致；17 张表水位线、16 个业务主键；同步后原始层逐表 = L0，核对 36/36 覆盖 100%、缺失 0、多余 0（VOL-1）；SRC-7 原始层整湖文件加密（80/80 文件带密钥）；ISO-C1–C3 在 `isolab2` 上做，加测源端恢复（C3b）与改名（C3c）；S2.8 GBK 上传：湖里存 UTF-8、审计记 gbk、7 列中文列名正确；S2.9 两份上传查询结果相同（华北 6 / 华东 12 · 16,896 / 华南 6，合计 24 行 360 箱 34,560，VOL-6）；S2.10 上限 1 时被拒、改回 100 后能登记，两次配额审计带前后值；S2.11 按用户确认判过；S2.12 注释版本 1、提案 0 | **#767**：同步发现结构变化不重新采集，目录版本、新列提示与改名修复草稿都停在旧结构；数据源页同页提交跳回顶部（#760、#768 修）；查询页原始层数据源默认全展开（#769 改为折叠）；上传预览超限无提示（#770 修）；验收中途 main 合入新迁移（`knowledge_term_defaults`、`model_prices`），本地平台库没迁移时保存数据源报错——**中途拉代码后先 `pnpm db:migrate` 并重启 dev 与调度器**；member_pg / station / wecom 的核对点在确认水位线之前，补点后通过；删除上传数据源 `dealer_upload_utf8`、`big_upload`：审计、目录版本、`source.drop` 清掉原始层都正常，但 `_uploads/<目录>/` 下的 CSV 没删（ADR-0044 写明「将来要一并删掉」，未实现，残留 1,561 + 4,068,902 字节、计入存储用量；**#771**） |
 | S3 | S3.1–S3.22、MAP-1–11、ID-1–6、VOL-2–3 | | | | |
 | S4 | S4.1–S4.14、TPL-1–3、DEF-1–11 | | | | |
 | SK | SK.1–SK.20、KN-1–12 | | | | |
