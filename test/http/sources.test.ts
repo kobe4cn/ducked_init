@@ -161,19 +161,47 @@ describe('登记数据源', () => {
     expect(audits[0].detail).toEqual({ table: 'signups', file: 'signups.csv', bytes: GBK_SIGNUPS_CSV.length, encoding: 'gbk' });
   });
 
-  it('上传登记失败（表名不合法、文件为空、不是 .csv、既不是 UTF-8 也不是 GBK、名称为空）时 400，不留下数据源与文件；没有 sources:write 的角色 403', async () => {
+  it('config.options 记下这张表实际的编码：选项指定 gbk 时按 gbk 解码并记 gbk，不带选项上传时记自动识别出的编码', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+
+    // 选项指定 gbk：只按 GBK 解码（不先试 UTF-8），config.options 原样记 gbk
+    const gbk = sourceIdOf(await upload(browser, { name: '活动报名', table: 'signups', options: '{"signups":{"encoding":"gbk"}}' },
+      new File([GBK_SIGNUPS_CSV], 'signups.csv')));
+    const [gbkSource] = await getDb().select().from(sources).where(eq(sources.id, gbk));
+    expect(gbkSource.config.options).toBe('{"signups":{"encoding":"gbk"}}');
+
+    // 不带选项上传 UTF-8 文件：config.options 也记下自动识别出的编码（含分隔符等选项时一并保留）
+    const plain = sourceIdOf(await upload(browser, { name: '报名二', table: 'signups' }, new File(['id;amount\n001;12.50\n'], 'a.csv')));
+    const [plainSource] = await getDb().select().from(sources).where(eq(sources.id, plain));
+    expect(plainSource.config.options).toBe('{"signups":{"encoding":"utf-8"}}');
+    const withDelim = sourceIdOf(await upload(browser, { name: '报名三', table: 'signups', options: '{"signups":{"delim":";"}}' },
+      new File(['id;amount\n001;12.50\n'], 'a.csv')));
+    const [delimSource] = await getDb().select().from(sources).where(eq(sources.id, withDelim));
+    expect(delimSource.config.options).toBe('{"signups":{"delim":";","encoding":"utf-8"}}');
+    expect(await listLakeFiles(await uploadsOf(tenantId))).toHaveLength(3);
+  });
+
+  it('上传登记失败（表名不合法、文件为空、不是 .csv、既不是 UTF-8 也不是 GBK、读取选项不合法、名称为空）时 400，不留下数据源与文件；没有 sources:write 的角色 403', async () => {
     const { tenantId, browser } = await engineerOf('acme');
     const csv = (name = 'a.csv', body = 'id\n1\n') => new File([body], name);
-    for (const [name, table, file, message] of [
+    for (const [name, table, file, message, options] of [
       ['活动报名', '../escape', csv(), '表名只能包含小写字母'],
       ['活动报名', 'signups', csv('a.csv', ''), '文件是空的'],
       ['活动报名', 'signups', csv('a.txt'), '.csv 文件'],
       // 0x81 是 GBK 双字节的首字节范围但单独出现不合法，UTF-8 与 GBK 都解不了
       ['活动报名', 'signups', new File([new Uint8Array([0x81])], 'a.csv'), '不是 UTF-8'],
+      // 读取选项不合法：JSON 不合法、键不是本表名、分隔符两个字符、列类型不在白名单、列数与文件对不上（探测不读行，在路由里拦）
+      ['活动报名', 'signups', csv(), '不是合法的 JSON', '{oops'],
+      ['活动报名', 'signups', csv(), '表名', '{"other":{"delim":";"}}'],
+      ['活动报名', 'signups', csv(), '分隔符必须是单个字符', '{"signups":{"delim":";;"}}'],
+      ['活动报名', 'signups', csv(), '列类型只能', '{"signups":{"columns":{"id":"BLOB"}}}'],
+      ['活动报名', 'signups', csv('a.csv', 'id,name\n1,zhang\n'), '读取选项给了 3 列', '{"signups":{"columns":{"id":"VARCHAR","name":"VARCHAR","age":"BIGINT"}}}'],
+      // 选项指定 utf-8 而文件是 GBK：按指定编码严格解码失败，不退回自动识别
+      ['活动报名', 'signups', new File([GBK_SIGNUPS_CSV], 'signups.csv'), '不是 UTF-8', '{"signups":{"encoding":"utf-8"}}'],
       // 通过前面的校验、文件已写进上传目录，registerSource 才失败：目录要删掉
       ['', 'signups', csv(), '请填写数据源名称'],
     ] as const) {
-      const res = await upload(browser, { name, table }, file);
+      const res = await upload(browser, { name, table, ...(options && { options }) }, file);
       expect(res.status).toBe(400);
       expect(await res.text()).toContain(message);
     }

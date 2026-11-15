@@ -6,7 +6,7 @@ import { and, eq, isNull } from 'drizzle-orm';
 import { getDb } from './db/client';
 import { SOURCE_KINDS, sources, type SourceKind } from './db/schema';
 import { lakeRow, lakeSpecOf } from './lake';
-import { FILE_FORMATS, type FileFormat, type S3Connection, type SourceSpec } from './pipeline/source-engine';
+import { FILE_FORMATS, type FileFormat, type S3Connection, type SourceSpec, type UploadReadOptions } from './pipeline/source-engine';
 import { decryptForTenant } from './secrets';
 import { UPLOAD_DIR, UPLOAD_TABLE, UPLOAD_TABLE_RULE, uploadDirOf } from './uploads';
 
@@ -72,6 +72,72 @@ async function localFile(tenantId: string, path: string) {
   return { full, relative: relative(base, full).split(sep).join('/') };
 }
 
+/** 列类型的白名单（ADR-0037）：成员能替上传表指定的 DuckDB 类型；DECIMAL 另查精度（1≤p≤38、0≤s≤p）。大小写不敏感，存成大写 */
+const COLUMN_TYPES = new Set(['VARCHAR', 'BIGINT', 'DOUBLE', 'BOOLEAN', 'DATE', 'TIMESTAMP']);
+const columnType = (raw: unknown): string | null => {
+  if (typeof raw !== 'string') return null;
+  const t = raw.trim().toUpperCase();
+  if (COLUMN_TYPES.has(t)) return t;
+  const m = /^DECIMAL\((\d+),(\d+)\)$/.exec(t);
+  if (!m) return null;
+  const [p, s] = [Number(m[1]), Number(m[2])];
+  return p >= 1 && p <= 38 && s <= p ? `DECIMAL(${p},${s})` : null;
+};
+
+/**
+ * 解析上传登记表单的 options 字段（每张表的读取选项，ADR-0037）：JSON 字符串 `{ "<表名>": { encoding, delim, header, skip, columns } }`，
+ * 只允许一个键且必须是本次登记的表名。不合法抛 SourceError（400）；空串 / 未给返回 undefined
+ */
+export function parseUploadOptions(json: string | undefined, table: string): Record<string, UploadReadOptions> | undefined {
+  const raw = (json ?? '').trim();
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new SourceError('读取选项不是合法的 JSON');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new SourceError('读取选项必须是 { "表名": { … } } 形式的对象');
+  const keys = Object.keys(parsed);
+  if (keys.length !== 1 || keys[0] !== table) throw new SourceError(`读取选项的键只能是本次登记的表名 ${table}`);
+  const value = (parsed as Record<string, unknown>)[table];
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new SourceError(`表 ${table} 的读取选项必须是对象`);
+  const opts: UploadReadOptions = {};
+  for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+    if (key === 'encoding') {
+      if (v !== 'utf-8' && v !== 'gbk') throw new SourceError('编码只能是 utf-8 或 gbk');
+      opts.encoding = v;
+    } else if (key === 'delim') {
+      if (typeof v !== 'string' || v.length !== 1 || /[\r\n"]/.test(v)) throw new SourceError('分隔符必须是单个字符，且不能是换行、回车或双引号');
+      opts.delim = v;
+    } else if (key === 'header') {
+      if (typeof v !== 'boolean') throw new SourceError('header 只能是 true 或 false');
+      opts.header = v;
+    } else if (key === 'skip') {
+      if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 1000) throw new SourceError('skip 必须是 0 到 1000 之间的整数');
+      opts.skip = v;
+    } else if (key === 'columns') {
+      if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new SourceError('columns 必须是 { 列名: 类型 } 形式的对象');
+      const columns: Record<string, string> = {};
+      const seen = new Set<string>();
+      for (const [name, type] of Object.entries(v as Record<string, unknown>)) {
+        const normalized = name.trim();
+        if (!normalized) throw new SourceError('columns 的列名不能为空');
+        if (seen.has(normalized)) throw new SourceError(`columns 的列名重复：${normalized}`);
+        seen.add(normalized);
+        const t = columnType(type);
+        if (!t) throw new SourceError(`列类型只能是 VARCHAR、BIGINT、DOUBLE、BOOLEAN、DATE、TIMESTAMP 或 DECIMAL(p,s)：${name}`);
+        columns[name] = t;
+      }
+      if (!Object.keys(columns).length) throw new SourceError('columns 不能为空');
+      opts.columns = columns;
+    } else {
+      throw new SourceError(`不支持的读取选项：${key}`);
+    }
+  }
+  return { [table]: opts };
+}
+
 /**
  * 校验表单并拆成 config（可展示）与凭据（加密保存）。修改时 previous 是原有的凭据：凭据字段留空表示不变，
  * 连接的目标（主机、库、用户名、路径、对象存储地址）变了时须重新填写
@@ -129,12 +195,15 @@ export async function parseSourceInput(tenantId: string, kind: SourceKind, input
       break;
     }
     case 'upload': {
-      // 修改时上传目录与表名不变：文件已经存在那里（ADR-0037）
+      // 修改时上传目录与表名不变：文件已经存在那里（ADR-0037）；读取选项同样沿用原 config.options，修改时不接受改
       const dir = previous?.config.dir ?? text(input, 'dir', '上传目录');
       const table = previous?.config.table ?? text(input, 'table', '表名');
       if (!UPLOAD_DIR.test(dir)) throw new SourceError('上传目录不合法');
       if (!UPLOAD_TABLE.test(table)) throw new SourceError(UPLOAD_TABLE_RULE);
-      config = { dir, table };
+      const parsed = previous ? undefined : parseUploadOptions(input.options, table);
+      // config 只能存字符串：登记时把解析后的选项存成 JSON 字符串，修改时沿用原字符串
+      const options = previous ? previous.config.options : parsed && JSON.stringify(parsed);
+      config = { dir, table, ...(options && { options }) };
       secretKeys = [];
       break;
     }
@@ -182,12 +251,12 @@ export async function resolveSourceSpec(tenantId: string, kind: SourceKind, conf
     case 'duckdb':
       return isS3Path(config.path) ? { kind, path: config.path, s3: s3() } : { kind, path: (await localFile(tenantId, config.path)).full };
     case 'upload':
-      return uploadSpec(tenantId, config.dir);
+      return uploadSpec(tenantId, config.dir, config.options);
   }
 }
 
-/** 上传目录按当前数据湖前缀拼出；数据湖在对象存储时带上租户数据湖的凭据（平台账号不能进 SourceSpec） */
-async function uploadSpec(tenantId: string, dir: string): Promise<SourceSpec> {
+/** 上传目录按当前数据湖前缀拼出；数据湖在对象存储时带上租户数据湖的凭据（平台账号不能进 SourceSpec）；options 是存成 JSON 字符串的读取选项 */
+async function uploadSpec(tenantId: string, dir: string, options?: string): Promise<SourceSpec> {
   const lake = await lakeRow(tenantId);
   if (!lake) throw new SourceError('本租户还没有开通数据湖，读不到上传的文件');
   const path = uploadDirOf(lake.dataPath, dir);
@@ -198,8 +267,11 @@ async function uploadSpec(tenantId: string, dir: string): Promise<SourceSpec> {
       throw new SourceError((e as Error).message);
     }
   })();
-  if (!s3) return { kind: 'upload', path };
-  return { kind: 'upload', path, s3: { endpoint: s3.endpoint, region: s3.region, urlStyle: s3.urlStyle, useSsl: s3.useSsl, keyId: s3.key, secret: s3.secret } };
+  // 登记时已校验过，这里只解析回对象放进 spec，采集、同步、校验经 SourceTable.from 都按它读（ADR-0037）
+  const opts = options ? (JSON.parse(options) as Record<string, UploadReadOptions>) : undefined;
+  const withOptions = { ...(opts && { options: opts }) };
+  if (!s3) return { kind: 'upload', path, ...withOptions };
+  return { kind: 'upload', path, ...withOptions, s3: { endpoint: s3.endpoint, region: s3.region, urlStyle: s3.urlStyle, useSsl: s3.useSsl, keyId: s3.key, secret: s3.secret } };
 }
 
 /** 凭据加密时绑定的用途：换到别的数据源上解不开 */

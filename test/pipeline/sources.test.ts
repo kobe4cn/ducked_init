@@ -2,13 +2,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { rm, symlink } from 'node:fs/promises';
 import pg from 'pg';
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { tasks } from '../../app/.server/db/schema';
+import { sources, tasks } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openSource } from '../../app/.server/pipeline/source-engine';
-import { loadSourceSpec } from '../../app/.server/source-config';
-import { confirmWatermark, getSource, registerSource, SourceError, testSource } from '../../app/.server/sources';
+import { loadSourceSpec, parseUploadOptions } from '../../app/.server/source-config';
+import { confirmWatermark, getSource, registerSource, SourceError, testSource, updateSource } from '../../app/.server/sources';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { tenantPiiSalt } from '../../app/.server/secrets';
@@ -344,6 +345,90 @@ fields:
       { id: '2', name: hash('李四'), phone: hash('13800000002') },
       { id: '3', name: hash('王五'), phone: hash('13800000003') },
     ]);
+  });
+
+  it('登记时带读取选项（分隔符、表头、跳过行、列类型）：采集与原始层的列类型与选项一致，改名称后选项保留', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const dir = randomUUID();
+    // 第一行是导出说明，第二行才是表头；分号分隔，编号带前导零（按 VARCHAR 读才保得住）
+    await storeUpload(acme, dir, 'signups', '线下活动报名（导出于 2026-10-31）\nid;amount;name\n001;12.50;张三\n002;7.00;李四\n003;99.99;王五\n');
+    const options = JSON.stringify({ signups: { delim: ';', header: true, skip: 1, columns: { id: 'VARCHAR', amount: 'DECIMAL(10,2)', name: 'VARCHAR' } } });
+    const { id, tables } = await registerSource(engineer, { kind: 'upload', name: '活动报名', dir, table: 'signups', options });
+    expect(tables).toEqual(['signups']);
+    await selectAllTables(engineer, id);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    // 采集出的列统计按选项读：跳过了说明行、分号分隔、列类型与选项一致
+    const [signups] = (await getSource(engineer, id)).tables;
+    expect(signups).toMatchObject({ name: 'signups', rows: 3, syncMode: 'full_compare' });
+    const typeOf = (name: string) => signups.columns.find(c => c.name === name)!.type;
+    expect(typeOf('id')).toBe('VARCHAR');
+    expect(typeOf('amount')).toBe('DECIMAL(10,2)');
+    expect(typeOf('name')).toBe('VARCHAR');
+
+    // 同步出的原始层表也是这些列类型（ADR-0037）
+    await syncSource(engineer, id);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const cols = await onLake<{ column_name: string; column_type: string }>(acme, `DESCRIBE "${bronzeSchema(id)}"."signups"`);
+    expect(Object.fromEntries(cols.map(c => [c.column_name, c.column_type]))).toMatchObject({ id: 'VARCHAR', amount: 'DECIMAL(10,2)', name: 'VARCHAR' });
+    const rows = await onLake<{ id: string; amount: string; name: string }>(acme,
+      `SELECT id, amount::VARCHAR AS amount, name FROM "${bronzeSchema(id)}"."signups" ORDER BY id`);
+    expect(rows).toEqual([
+      { id: '001', amount: '12.50', name: '张三' },
+      { id: '002', amount: '7.00', name: '李四' },
+      { id: '003', amount: '99.99', name: '王五' },
+    ]);
+
+    // 修改（改名称）后选项原样保留，登记的重新探测也照选项读（ADR-0037）
+    await updateSource(engineer, id, { name: '活动报名（2026 秋）' });
+    const [row] = await getDb().select().from(sources).where(eq(sources.id, id));
+    expect(row.config.options).toBe(options);
+    expect(row.name).toBe('活动报名（2026 秋）');
+  });
+
+  it('读取选项不合法（JSON 不合法、键不是本表、分隔符不是单个字符、skip 不是非负整数、列类型不在白名单）时不登记，抛 400', () => {
+    // 空串 / 未给没有选项；合法的存成规范化后的形状（列类型大写）
+    expect(parseUploadOptions(undefined, 'signups')).toBeUndefined();
+    expect(parseUploadOptions('  ', 'signups')).toBeUndefined();
+    expect(parseUploadOptions('{"signups":{"delim":";"}}', 'signups')).toEqual({ signups: { delim: ';' } });
+    expect(parseUploadOptions('{"signups":{"columns":{"amount":"decimal(10,2)","at":"TIMESTAMP"}}}', 'signups'))
+      .toEqual({ signups: { columns: { amount: 'DECIMAL(10,2)', at: 'TIMESTAMP' } } });
+
+    const rejects = (json: string) => {
+      try {
+        parseUploadOptions(json, 'signups');
+      } catch (e) {
+        return e;
+      }
+      return null;
+    };
+    for (const [json, message] of [
+      ['{', '不是合法的 JSON'],
+      ['[]', '形式的对象'],
+      ['{}', '表名'],
+      ['{"signups":1}', '必须是对象'],
+      ['{"signups":{"delim":";;"}}', '分隔符必须是单个字符'],
+      ['{"signups":{"delim":"\\n"}}', '分隔符必须是单个字符'],
+      ['{"signups":{"delim":"\\""}}', '分隔符必须是单个字符'],
+      ['{"signups":{"skip":-1}}', 'skip'],
+      ['{"signups":{"skip":1.5}}', 'skip'],
+      ['{"signups":{"skip":1001}}', 'skip'],
+      ['{"signups":{"skip":"2"}}', 'skip'],
+      ['{"signups":{"header":"yes"}}', 'header'],
+      ['{"signups":{"encoding":"utf-16"}}', '编码'],
+      ['{"signups":{"columns":{"id":"BLOB"}}}', '列类型'],
+      ['{"signups":{"columns":{"d":"DECIMAL(40,2)"}}}', '列类型'],
+      ['{"signups":{"columns":{"d":"DECIMAL(4,5)"}}}', '列类型'],
+      ['{"signups":{"columns":{"":"VARCHAR"}}}', '列名不能为空'],
+      ['{"signups":{"columns":{"a":"VARCHAR"," a":"BIGINT"}}}', '列名重复'],
+      ['{"signups":{"quotechar":"x"}}', '不支持的读取选项'],
+    ] as const) {
+      const err = rejects(json);
+      expect(err, json).toBeInstanceOf(SourceError);
+      expect((err as SourceError).status, json).toBe(400);
+      expect((err as Error).message, json).toContain(message);
+    }
   });
 });
 

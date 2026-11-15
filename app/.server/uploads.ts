@@ -63,3 +63,14 @@ export async function removeUpload(tenantId: string, dir: string) {
   if (!UPLOAD_DIR.test(dir)) return;
   await deleteLakeFiles(await uploadDirUri(tenantId, dir));
 }
+
+/** 一行 CSV 按分隔符数的字段个数（引号里的分隔符不算）：带 columns 读取选项登记时核对文件的列数用 */
+export function csvFieldCount(line: string, delim: string): number {
+  let count = 1;
+  let quoted = false;
+  for (const c of line) {
+    if (c === '"') quoted = !quoted;
+    else if (c === delim && !quoted) count++;
+  }
+  return count;
+}
