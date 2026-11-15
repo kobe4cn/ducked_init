@@ -32,6 +32,7 @@ export default [
   route('pii/reveal', 'routes/pii.reveal.tsx'),
   route('api-keys', 'routes/api-keys.tsx'),
   route('model-provider', 'routes/model-provider.tsx'),
+  route('llm-usage', 'routes/llm-usage.tsx'),
   route('assistant', 'routes/assistant.tsx'),
   route('settings', 'routes/settings.tsx'),
   route('mcp', 'routes/mcp.tsx'),
