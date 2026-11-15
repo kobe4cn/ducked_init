@@ -1,5 +1,6 @@
 // app/components/upload-preview.tsx —— 文件上传数据源的上传前预览（ADR-0037）：点「预览」用 fetcher 提交 intent=preview，不跳转、已选的文件不丢；
 // 显示识别出的编码、分隔符、表头行、每列类型与前 20 行，成员可改选项再预览。确认登记时把确认过的选项经 hidden options 随表单提交；
+// 改了编码 / 分隔符 / 表头 / 跳过行数而没重新预览时，hidden 不带 columns、服务端按新选项重新识别列（app/lib/upload-preview-options.ts）；
 // 换文件或改表名后预览结果作废（选项 JSON 的键必须是表名），hidden 回到空串、登记照自动识别
 import { useEffect, useRef, useState } from 'react';
 import { useFetcher } from 'react-router';
@@ -10,6 +11,7 @@ import { Button } from '~/components/ui/button';
 import { Field, FieldDescription, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
+import { structureChanged, uploadOptionsJson } from '~/lib/upload-preview-options';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
 /** 与服务端的 UPLOAD_TABLE 一致（app/.server/uploads.ts）：表名拼进文件路径，客户端先挡一道 */
@@ -60,7 +62,8 @@ export function UploadPreview() {
     };
   }, []);
 
-  const structuralChanged = result !== null && (encoding !== result.encoding || delim !== result.delim || header !== result.header || skip !== String(result.skip));
+  const choices = { encoding, delim, header, skip, types };
+  const structuralChanged = result !== null && structureChanged(result, choices);
   const typeChanged = result !== null && result.columns.some(c => types[c.name] !== c.type);
 
   // 改编码 / 分隔符 / 表头 / 跳过行数会改变识别出的列：清掉列类型的改动，下一次预览重新识别
@@ -72,30 +75,14 @@ export function UploadPreview() {
     if (result) setTypes(Object.fromEntries(result.columns.map(c => [c.name, c.type])));
   };
 
-  const skipNum = Number(skip);
-  const optionsJson = !result
-    ? ''
-    : JSON.stringify({
-      [table]: {
-        encoding,
-        delim,
-        header,
-        skip: Number.isInteger(skipNum) && skipNum >= 0 && skipNum <= 1000 ? skipNum : result.skip,
-        // read_csv 的 columns 要求列齐全、顺序与识别出的一致（ADR-0037）
-        columns: Object.fromEntries(result.columns.map(c => [c.name, types[c.name] ?? c.type])),
-      },
-    });
+  // 改了结构性选项但没点「重新预览」就登记时，hidden options 不带 columns（只带编码 / 分隔符 / 表头 / 跳过行数），
+  // 服务端照新选项自动识别，和 preview() 一样；否则上次识别的旧列名与旧类型会套到新读法上（#727 review）
+  const optionsJson = uploadOptionsJson(table, result, choices);
 
   const preview = (button: HTMLButtonElement) => {
     const fd = new FormData(button.form!);
     fd.set('intent', 'preview');
-    if (result) {
-      // 结构性选项变了就不带 columns：列会变，按新分隔符 / 表头重新识别；只改了列类型才带上
-      const columns = structuralChanged ? undefined : Object.fromEntries(result.columns.map(c => [c.name, types[c.name] ?? c.type]));
-      fd.set('options', JSON.stringify({ [String(fd.get('table') ?? '').trim()]: { encoding, delim, header, skip: skipNum, ...(columns && { columns }) } }));
-    } else {
-      fd.set('options', '');
-    }
+    fd.set('options', uploadOptionsJson(String(fd.get('table') ?? '').trim(), result, choices));
     void fetcher.submit(fd, { method: 'post', action: '/sources', encType: 'multipart/form-data' });
   };
 
