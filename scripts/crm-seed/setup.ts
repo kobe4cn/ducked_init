@@ -9,11 +9,11 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { DuckDBInstance } from '@duckdb/node-api';
-import { and, count, desc, eq, gt, inArray, sql } from 'drizzle-orm';
+import { and, count, eq, gt, inArray } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks, tenants } from '../../app/.server/db/schema';
 import { createCustomEntity, listCustomEntities, publishCustomEntity } from '../../app/.server/custom-entities';
-import { createDefinition, getDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
+import { createDefinition, getDefinition, publishDefinition, recomputeDefinition } from '../../app/.server/dsl-definitions';
 import { createMapping, publishMapping } from '../../app/.server/mappings';
 import { mergeNow } from '../../app/.server/merges';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
@@ -21,7 +21,6 @@ import { type KeyCheckTaskParams, type KeyCheckTaskResult } from '../../app/.ser
 import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, listSourceViews, publishSourceView } from '../../app/.server/source-views';
 import { confirmKey, confirmSoftDelete, confirmedTables, confirmWatermark, getSource, listSources, registerSource, setSyncScope, updateSource } from '../../app/.server/sources';
-import { enqueueTask, type InputOf } from '../../app/.server/tasks';
 import { createTenant, tenantIdBySlug } from '../../app/.server/tenants';
 import { duplicateKeyText } from '../../app/lib/sources';
 import { memberOf } from '../../test/pipeline/fixtures';
@@ -225,15 +224,20 @@ if (step('sync')) {
   await drain('立即合并');
 }
 
-// ---------- 重算指标与标签：标准层变了以后，结果层不会自己更新（#143），按各定义最近一次计算的参数、以今天为 asOf 再入队一次 ----------
+// ---------- 重算指标与标签：标准层变了以后，结果层不会自己更新（#143），以今天为 asOf 重新计算全部已发布的定义 ----------
+// 走 recomputeDefinition（按生效版本重新编译）：不能复用旧任务的参数，它的 sql 里已经写死了当时的 asOf 窗口
 if (step('recompute')) {
-  const last = await getDb().selectDistinctOn([sql`${tasks.params}->>'kind'`, sql`${tasks.params}->>'key'`], { params: tasks.params }).from(tasks)
-    .where(and(eq(tasks.tenantId, tenantId!), eq(tasks.kind, 'gold.dsl')))
-    .orderBy(sql`${tasks.params}->>'kind'`, sql`${tasks.params}->>'key'`, desc(tasks.createdAt));
-  const asOf = new Date().toISOString().slice(0, 10);
-  for (const { params } of last) await enqueueTask(tenantId!, 'gold.dsl', { ...(params as InputOf<'gold.dsl'>), asOf });
-  log(`重新入队 ${last.length} 个指标与标签（asOf ${asOf}）`);
-  await drain('指标与标签计算');
+  const keys = (kind: string) => readdirSync(join(HERE, 'definitions', kind)).filter(f => f.endsWith('.yaml')).map(f => f.replace(/\.yaml$/, '')).sort();
+  for (const kind of ['metric', 'tag']) {
+    for (const key of keys(kind)) {
+      // 指标会带着下游标签一起入队；后一个定义撞上还在排队的同一个标签时，等它算完再重试
+      await recomputeDefinition(eng, kind, key).catch(async () => {
+        await drain(`等 ${key} 的下游算完`);
+        await recomputeDefinition(eng, kind, key).catch((e: Error) => log(`  ✘ 重新计算 ${kind} ${key}：${e.message}`));
+      });
+    }
+    await drain(kind === 'metric' ? '指标计算' : '标签计算');
+  }
 }
 log(`完成。核对：node --env-file=.env --import tsx scripts/crm-seed/verify.ts ${slug}`);
 await closeDb();

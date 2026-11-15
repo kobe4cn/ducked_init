@@ -338,7 +338,7 @@ function SyncScope({ listing, newTables, canWrite, submitting }: { listing: List
     return next;
   });
   return (
-    <Form method="post" className="space-y-3">
+    <Form method="post" preventScrollReset className="space-y-3">
       <input type="hidden" name="intent" value="scope" />
       {newTables > 0 && (
         <StatusText tone="pending" data-new-tables={newTables}>{`有 ${newTables} 张新表未选`}</StatusText>
@@ -492,7 +492,7 @@ function Watermark({ table, canWrite, submitting }: { table: TableView; canWrite
           {table.watermark === c.column ? (
             <Badge variant="secondary">{`已确认${table.confirmedBy ? `（${table.confirmedBy}）` : ''}`}</Badge>
           ) : canWrite ? (
-            <Form method="post">
+            <Form method="post" preventScrollReset>
               <input type="hidden" name="intent" value="confirm-watermark" />
               <input type="hidden" name="table" value={table.name} />
               <input type="hidden" name="column" value={c.column} />
@@ -532,7 +532,7 @@ function Key({ table, canWrite, submitting }: { table: TableView; canWrite: bool
           <summary className="cursor-pointer text-muted-foreground select-none">
             {table.key ? '改为其他业务主键' : '声明业务主键（一列或多列的组合，能唯一标识一行；据此区分新增与更新）'}
           </summary>
-          <Form method="post" className="mt-1 space-y-1">
+          <Form method="post" preventScrollReset className="mt-1 space-y-1">
             <input type="hidden" name="intent" value="confirm-key" />
             <input type="hidden" name="table" value={table.name} />
             <div className="flex flex-wrap gap-x-3 gap-y-1">
@@ -584,7 +584,7 @@ function SoftDelete({ table, canWrite, submitting }: { table: TableView; canWrit
           {table.softDelete === column ? (
             <Badge variant="secondary">{`已确认${table.softDeleteConfirmedBy ? `（${table.softDeleteConfirmedBy}）` : ''}`}</Badge>
           ) : canWrite ? (
-            <Form method="post">
+            <Form method="post" preventScrollReset>
               <input type="hidden" name="intent" value="confirm-soft-delete" />
               <input type="hidden" name="table" value={table.name} />
               <input type="hidden" name="column" value={column} />
