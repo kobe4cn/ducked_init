@@ -187,6 +187,46 @@ describe('登记数据源', () => {
     expect(await listLakeFiles(await uploadsOf(tenantId))).toHaveLength(4);
   });
 
+  it('上传前预览返回识别结果与前 20 行，改分隔符后结果随之变化；不建数据源、不写湖、不记审计；分析师 403，超上限 413', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+    const sourceCount = async () => (await getDb().select().from(sources).where(eq(sources.tenantId, tenantId))).length;
+    const file = () => new File([GBK_SIGNUPS_CSV], 'signups.csv');
+
+    const res = await preview(browser, { name: '活动报名', table: 'signups' }, file());
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    // 响应文档里带着序列化的识别结果：编码 gbk、中文表头、前几行（原始值不脱敏，文件是成员本人的，ADR-0037）
+    expect(text).toContain('gbk');
+    expect(text).toContain('报名编号');
+    expect(text).toContain('张三');
+
+    // 改分隔符为分号再预览：整行是一个字段，只剩一列（列名是整行表头）
+    const semicolon = await preview(browser, { name: '活动报名', table: 'signups', options: '{"signups":{"delim":";"}}' }, file());
+    expect(semicolon.status).toBe(200);
+    expect(await semicolon.text()).toContain('报名编号,姓名,手机,活动,报名时间,是否到场');
+
+    // 选项里带 columns 时同样核对列数：文件 6 列、选项给 3 列，400
+    const mismatch = await preview(browser, { name: '活动报名', table: 'signups', options: '{"signups":{"columns":{"a":"VARCHAR","b":"VARCHAR","c":"VARCHAR"}}}' }, file());
+    expect(mismatch.status).toBe(400);
+    expect(await mismatch.text()).toContain('读取选项给了 3 列');
+
+    // 预览不建数据源、不写湖、不记审计
+    expect(await sourceCount()).toBe(0);
+    expect(await listLakeFiles(await uploadsOf(tenantId))).toEqual([]);
+    expect(await getDb().select().from(auditLogs).where(and(eq(auditLogs.tenantId, tenantId), eq(auditLogs.action, 'source.file_uploaded')))).toEqual([]);
+
+    // 没有 sources:write 的角色 403
+    await memberOf(tenantId, 'an@acme.com', 'analyst');
+    expect((await preview(await loginAs(app, 'an@acme.com'), { name: '活动报名', table: 'signups' }, file())).status).toBe(403);
+
+    // 预览受同样的上传大小上限约束
+    await setTenantQuota(null, tenantId, { memoryLimitMb: 2048, threads: 2, maxConcurrentTasks: 1, maxUploadMb: 1, storageQuotaMb: 10240 });
+    const MiB = 1024 * 1024;
+    const over = await preview(browser, { name: '大文件', table: 'big' }, new File(['id\n' + '1\n'.repeat(MiB)], 'big.csv'));
+    expect(over.status).toBe(413);
+    expect(await over.text()).toContain('文件超过本租户上传上限 1 MiB');
+  });
+
   it('上传登记失败（表名不合法、文件为空、不是 .csv、既不是 UTF-8 也不是 GBK、读取选项不合法、名称为空）时 400，不留下数据源与文件；没有 sources:write 的角色 403', async () => {
     const { tenantId, browser } = await engineerOf('acme');
     const csv = (name = 'a.csv', body = 'id\n1\n') => new File([body], name);
@@ -279,6 +319,14 @@ describe('登记数据源', () => {
 function upload(browser: Client, fields: Record<string, string>, file: File) {
   const body = new FormData();
   for (const [k, v] of Object.entries({ intent: 'register', kind: 'upload', ...fields })) body.set(k, v);
+  body.set('file', file);
+  return browser.request('/sources', { method: 'POST', body });
+}
+
+/** multipart 提交上传预览（intent=preview）：识别编码、分隔符、表头与列类型，不登记 */
+function preview(browser: Client, fields: Record<string, string>, file: File) {
+  const body = new FormData();
+  for (const [k, v] of Object.entries({ intent: 'preview', kind: 'upload', ...fields })) body.set(k, v);
   body.set('file', file);
   return browser.request('/sources', { method: 'POST', body });
 }

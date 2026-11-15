@@ -1,7 +1,7 @@
 // app/routes/sources.tsx —— 数据源（数据工程师、管理员可登记；分析师只读）：指标卡、本租户的数据源卡片（标出未核对与最近一次核对有差异的）与登记表单。
 // 表单按 multipart 提交：文件上传数据源带着 CSV 文件
 import { useState } from 'react';
-import { data, Form, Link, redirect, useNavigation } from 'react-router';
+import { data, Form, Link, redirect, useNavigation, type ShouldRevalidateFunctionArgs } from 'react-router';
 import { CircleAlert, Plus, X } from 'lucide-react';
 import type { Route } from './+types/sources';
 import { can, requirePermission } from '~/.server/access';
@@ -9,7 +9,8 @@ import { navFor } from '~/.server/nav';
 import type { CurrentMember } from '~/.server/auth';
 import { listSources, registerSource, SourceError } from '~/.server/sources';
 import { parseUploadOptions, type SourceInput } from '~/.server/source-config';
-import { csvFieldCount, decodeUpload, removeUpload, storeUpload, UPLOAD_TABLE, UPLOAD_TABLE_RULE } from '~/.server/uploads';
+import type { UploadReadOptions } from '~/.server/pipeline/source-engine';
+import { csvFieldCount, decodeUpload, previewUpload, removeUpload, storeUpload, UPLOAD_TABLE, UPLOAD_TABLE_RULE } from '~/.server/uploads';
 import { verifyDifferences } from '~/.server/source-verify';
 import { storageOverQuota } from '~/.server/storage-quota';
 import { uploadLimitOf } from '~/.server/tenants';
@@ -19,6 +20,7 @@ import { AppShell } from '~/components/app-shell';
 import { KindIcon } from '~/components/kind-icon';
 import { PageHeader } from '~/components/page-header';
 import { SourceFields } from '~/components/source-fields';
+import { UploadPreview } from '~/components/upload-preview';
 import { StatTile } from '~/components/stat-tile';
 import { VerifyBadge, verifyStateOf } from '~/components/verify-badge';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
@@ -53,6 +55,8 @@ export async function action({ request }: Route.ActionArgs) {
   const mb = await uploadLimitOf(member.tenant.id);
   const form = await readLimitedForm(request, mb * 1024 * 1024);
   if (!form) return data({ error: `文件超过本租户上传上限 ${mb} MiB`, values: {} }, { status: 413 });
+  // 上传前预览（ADR-0037）：受同样的上传大小上限约束，但不走存储配额检查（不写湖）
+  if (form.get('intent') === 'preview') return previewUploadAction(form);
   if (form.get('intent') !== 'register') return data({ error: '未知操作', values: {} }, { status: 400 });
   // 先剔出文件：File 经 String() 会变成 "[object File]"
   const file = form.get('file');
@@ -104,35 +108,67 @@ async function readLimitedForm(request: Request, maxBytes: number): Promise<Form
 /** 没给 delim 时 DuckDB read_csv 自动识别的分隔符 */
 const SNIFFED_DELIMS = [',', ';', '\t', '|'];
 
-/**
- * 文件上传数据源（ADR-0037）：先校验文件与表名，把文件写进服务端生成的上传目录（登记时要列出这张表），再登记。
- * 登记失败（含探测失败）时删掉目录，不留文件
- */
-async function registerUpload(member: CurrentMember, input: SourceInput, file: FormDataEntryValue | null) {
+/** 预览不保存数据，不重跑 loader（与 mapping 的 validate 一样） */
+export function shouldRevalidate({ formData, defaultShouldRevalidate }: ShouldRevalidateFunctionArgs) {
+  return formData?.get('intent') === 'preview' ? false : defaultShouldRevalidate;
+}
+
+/** 上传前预览（ADR-0037）：校验后交给 previewUpload，识别编码、分隔符、表头与列类型并读前 20 行。
+ * 不登记、不写湖、不记审计；确认登记时浏览器再提交一次同一个文件 */
+async function previewUploadAction(form: FormData) {
+  const file = form.get('file');
+  const input = Object.fromEntries([...form].filter(([k]) => k !== 'file').map(([k, v]) => [k, String(v)]));
+  try {
+    const table = (input.table ?? '').trim();
+    const upload = requireUpload(file, table);
+    const opts = parseUploadOptions(input.options, table)?.[table];
+    const bytes = new Uint8Array(await upload.arrayBuffer());
+    checkUploadColumns(opts, decodeUpload(bytes, opts?.encoding).text);
+    return data({ error: null, preview: await previewUpload(bytes, table, opts), values: {} });
+  } catch (e) {
+    if (e instanceof SourceError) return data({ error: null, previewError: e.message, values: {} }, { status: e.status });
+    throw e;
+  }
+}
+
+/** 校验上传的文件与表名（登记与预览共用），返回收窄后的文件；表名拼进文件路径，先校验再用，防路径穿越 */
+function requireUpload(file: FormDataEntryValue | null, table: string): File {
   if (!(file instanceof File) || !file.name.toLowerCase().endsWith('.csv')) throw new SourceError('请选择一份 .csv 文件');
   if (file.size === 0) throw new SourceError('文件是空的');
-  const table = (input.table ?? '').trim();
   if (!UPLOAD_TABLE.test(table)) throw new SourceError(UPLOAD_TABLE_RULE);
+  return file;
+}
+
+/** 带 columns 读取选项时按选项核对文件的列数（登记与预览共用）：登记的探测不读行，列数不符在这里拦下（否则要到首次同步才失败） */
+function checkUploadColumns(opts: UploadReadOptions | undefined, text: string) {
+  if (!opts?.columns) return;
+  const expected = Object.keys(opts.columns).length;
+  const firstRow = text.split(/\r?\n/).slice(opts.skip ?? 0).find(l => l.trim() !== '');
+  // 没给 delim 时 DuckDB 仍自动识别分隔符，按它会识别的几种分别数，任一种对上就放行
+  const counts = (opts.delim ? [opts.delim] : SNIFFED_DELIMS).map(d => (firstRow ? csvFieldCount(firstRow, d) : 0));
+  if (!counts.includes(expected)) {
+    const found = Math.max(...counts);
+    throw new SourceError(`读取选项给了 ${expected} 列，但文件开头的一行是 ${found} 列，请检查分隔符、跳过的行数与列类型`);
+  }
+}
+
+/**
+ * 文件上传数据源（ADR-0037）：先校验文件与表名（requireUpload）、读取选项与列数（checkUploadColumns），
+ * 把文件写进服务端生成的上传目录（登记时要列出这张表），再登记。登记失败（含探测失败）时删掉目录，不留文件
+ */
+async function registerUpload(member: CurrentMember, input: SourceInput, file: FormDataEntryValue | null) {
+  const table = (input.table ?? '').trim();
+  const upload = requireUpload(file, table);
   // 读取选项先校验（此时还没写文件）；指定了编码就只按那一种解码，失败 400，不退回自动识别（ADR-0037）
   const opts = parseUploadOptions(input.options, table)?.[table];
-  const { text, encoding } = decodeUpload(new Uint8Array(await file.arrayBuffer()), opts?.encoding);
-  // 带 columns 时按选项核对文件的列数：登记的探测不读行，列数不符在这里拦下（否则要到首次同步才失败）。
-  // 没给 delim 时 DuckDB 仍自动识别分隔符，按它会识别的几种分别数，任一种对上就放行
-  if (opts?.columns) {
-    const expected = Object.keys(opts.columns).length;
-    const firstRow = text.split(/\r?\n/).slice(opts.skip ?? 0).find(l => l.trim() !== '');
-    const counts = (opts.delim ? [opts.delim] : SNIFFED_DELIMS).map(d => (firstRow ? csvFieldCount(firstRow, d) : 0));
-    if (!counts.includes(expected)) {
-      const found = Math.max(...counts);
-      throw new SourceError(`读取选项给了 ${expected} 列，但文件开头的一行是 ${found} 列，请检查分隔符、跳过的行数与列类型`);
-    }
-  }
+  const { text, encoding } = decodeUpload(new Uint8Array(await upload.arrayBuffer()), opts?.encoding);
+  checkUploadColumns(opts, text);
   // 实际编码（选项指定的或自动识别出的）记进 config.options，不带选项上传也记（ADR-0037）；只有 encoding 的选项照自动识别读
   const options = JSON.stringify({ [table]: { ...opts, encoding } });
   const dir = crypto.randomUUID();
   try {
     await storeUpload(member.tenant.id, dir, table, text);
-    return await registerSource(member, { ...input, table, dir, options }, { table, file: file.name, bytes: file.size, encoding });
+    return await registerSource(member, { ...input, table, dir, options }, { table, file: upload.name, bytes: upload.size, encoding });
   } catch (e) {
     await removeUpload(member.tenant.id, dir);
     throw e;
@@ -219,6 +255,7 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
                   </Field>
                 </div>
                 <SourceFields key={kind} kind={kind} values={values} />
+                {kind === 'upload' && <UploadPreview key={kind} />}
                 <div>
                   <Button type="submit" disabled={submitting}>{submitting ? '正在校验…' : '校验并登记'}</Button>
                 </div>

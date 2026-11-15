@@ -94,7 +94,9 @@ const UPDATED_AT_NAME = /upd|modif|mtime|chang|last_?edit/i;
 /** SQL 字符串字面量（DuckDB 与 PostgreSQL、MySQL 的写法相同） */
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
-const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+
+/** 跑一条查询，按对象数组取回（值经 JSON 转换，避开 BigInt）；上传预览（uploads.ts）与这里共用 */
+export const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndReadAll(sql)).getRowObjectsJson() as T[];
 
 const FILE_EXTENSIONS: Record<FileFormat, RegExp> = {
   parquet: /\.parquet$/i,

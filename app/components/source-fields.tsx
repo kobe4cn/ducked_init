@@ -158,7 +158,7 @@ export function SourceFields({ kind, values, editing = false }: { kind: SourceKi
             <Field>
               <FieldLabel htmlFor="source-file">CSV 文件</FieldLabel>
               <Input id="source-file" name="file" type="file" accept=".csv" required />
-              <FieldDescription>UTF-8 或 GBK 编码，第一行是表头</FieldDescription>
+              <FieldDescription>UTF-8 或 GBK 编码；点「预览」可以确认或修改分隔符、表头与列类型</FieldDescription>
             </Field>
           )}
         </div>

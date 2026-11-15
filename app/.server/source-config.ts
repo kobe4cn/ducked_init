@@ -74,7 +74,9 @@ async function localFile(tenantId: string, path: string) {
 
 /** 列类型的白名单（ADR-0037）：成员能替上传表指定的 DuckDB 类型；DECIMAL 另查精度（1≤p≤38、0≤s≤p）。大小写不敏感，存成大写 */
 const COLUMN_TYPES = new Set(['VARCHAR', 'BIGINT', 'DOUBLE', 'BOOLEAN', 'DATE', 'TIMESTAMP']);
-const columnType = (raw: unknown): string | null => {
+
+/** 类型转成白名单里的写法；不在白名单（如 DuckDB 识别出的 TIME）返回 null（上传预览按 VARCHAR 显示） */
+export const columnType = (raw: unknown): string | null => {
   if (typeof raw !== 'string') return null;
   const t = raw.trim().toUpperCase();
   if (COLUMN_TYPES.has(t)) return t;

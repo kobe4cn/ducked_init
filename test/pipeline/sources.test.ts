@@ -1,6 +1,7 @@
 // 数据源登记的流水线接缝：成员登记数据源（领域函数）→ 平台探测只读、加密保存凭据、列出表 → 选入同步范围后调度器派发采集任务 → 查看列统计与水位线候选
 import { createHash, randomUUID } from 'node:crypto';
-import { rm, symlink } from 'node:fs/promises';
+import { readdir, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import pg from 'pg';
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -14,7 +15,7 @@ import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { tenantPiiSalt } from '../../app/.server/secrets';
 import { claimNextTask, enqueueTask, finishTask } from '../../app/.server/tasks';
-import { decodeUpload, storeUpload } from '../../app/.server/uploads';
+import { decodeUpload, previewUpload, storeUpload, UPLOAD_TABLE_RULE } from '../../app/.server/uploads';
 import { resetDb } from '../http/harness';
 import { dbNameOf } from '../setup-env';
 import { memberOf, newTenant, onLake, publish, selectAllTables, silver } from './fixtures';
@@ -304,6 +305,80 @@ describe('文件上传数据源', () => {
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
     const rows = await onLake<{ id: string; name: string }>(acme, `SELECT id::VARCHAR AS id, name FROM "${bronzeSchema(id)}"."signups" ORDER BY id`);
     expect(rows).toEqual([{ id: '1', name: '张三' }, { id: '2', name: '李四' }, { id: '3', name: '王五' }]);
+  });
+
+  it('上传前预览识别 GBK 编码、分隔符、表头行与每列类型，返回前 20 行；用完的临时目录即删（ADR-0037）', async () => {
+    const preview = await previewUpload(GBK_SIGNUPS_CSV, 'signups');
+    expect(preview.encoding).toBe('gbk');
+    expect(preview.delim).toBe(',');
+    expect(preview.header).toBe(true);
+    expect(preview.skip).toBe(0);
+    expect(preview.columns).toEqual([
+      { name: '报名编号', type: 'BIGINT' },
+      { name: '姓名', type: 'VARCHAR' },
+      { name: '手机', type: 'BIGINT' },
+      { name: '活动', type: 'VARCHAR' },
+      { name: '报名时间', type: 'TIMESTAMP' },
+      { name: '是否到场', type: 'VARCHAR' },
+    ]);
+    // 前端把每个值按字符串显示（null 保持 null），识别成的时间列也是格式化后的文本
+    expect(preview.rows).toEqual([
+      ['1', '张三', '13800000001', '秋季发布会', '2026-09-01 14:05:00', '是'],
+      ['2', '李四', '13800000002', '秋季发布会', '2026-09-01 14:06:00', '否'],
+      ['3', '王五', '13800000003', '客户答谢会', '2026-09-02 09:10:00', '是'],
+    ]);
+    // 预览不落盘到湖：临时目录在 tmpdir() 下，用完必须删干净
+    expect((await readdir(tmpdir())).filter(n => n.startsWith('crm-preview-'))).toEqual([]);
+
+    // 表名拼进临时文件路径，先校验再用（防路径穿越）
+    await expect(previewUpload(GBK_SIGNUPS_CSV, '../escape')).rejects.toThrow(UPLOAD_TABLE_RULE);
+  });
+
+  it('预览按改过的分隔符、表头行与列类型读；按预览确认的选项登记后，原始层的列类型与预览一致', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const bytes = new TextEncoder().encode('线下活动报名（导出于 2026-10-31）\nid;amount;name\n001;12.50;张三\n002;7.00;李四\n003;99.99;王五\n');
+
+    // 不带选项预览：识别出分号分隔、表头前跳过 1 行（说明行），编号带前导零按 VARCHAR 读
+    const auto = await previewUpload(bytes, 'signups');
+    expect(auto).toMatchObject({ encoding: 'utf-8', delim: ';', header: true, skip: 1 });
+    expect(auto.columns).toEqual([
+      { name: 'id', type: 'VARCHAR' },
+      { name: 'amount', type: 'DOUBLE' },
+      { name: 'name', type: 'VARCHAR' },
+    ]);
+    expect(auto.rows).toEqual([['001', '12.5', '张三'], ['002', '7', '李四'], ['003', '99.99', '王五']]);
+
+    // 改分隔符为逗号再预览：整行是一个字段，只剩一列（表头被识别成第一行的导出说明）
+    const comma = await previewUpload(bytes, 'signups', { delim: ',' });
+    expect(comma.columns).toEqual([{ name: '线下活动报名（导出于 2026-10-31）', type: 'VARCHAR' }]);
+    expect(comma.rows[0]).toEqual(['id;amount;name']);
+
+    // 改列类型再预览：金额按 DECIMAL(10,2)、编号仍 VARCHAR，返回的类型随之改变
+    const typed = await previewUpload(bytes, 'signups', {
+      delim: ';', header: true, skip: 1, columns: { id: 'VARCHAR', amount: 'DECIMAL(10,2)', name: 'VARCHAR' },
+    });
+    expect(typed.columns).toEqual([
+      { name: 'id', type: 'VARCHAR' },
+      { name: 'amount', type: 'DECIMAL(10,2)' },
+      { name: 'name', type: 'VARCHAR' },
+    ]);
+    expect(typed.rows[0]).toEqual(['001', '12.50', '张三']);
+
+    // 确认登记时把预览确认的选项随表单提交（服务端存进 config.options，ADR-0037）：同步出的原始层列类型与预览一致
+    const options = JSON.stringify({
+      signups: { encoding: 'utf-8', delim: ';', header: true, skip: 1, columns: Object.fromEntries(typed.columns.map(c => [c.name, c.type])) },
+    });
+    const dir = randomUUID();
+    await storeUpload(acme, dir, 'signups', new TextDecoder().decode(bytes));
+    const { id } = await registerSource(engineer, { kind: 'upload', name: '活动报名', dir, table: 'signups', options });
+    await selectAllTables(engineer, id);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    await syncSource(engineer, id);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const cols = await onLake<{ column_name: string; column_type: string }>(acme, `DESCRIBE "${bronzeSchema(id)}"."signups"`);
+    // 原始层在源列之后还有 _op / _commit_ts 等平台列，只比源列
+    expect(cols.slice(0, typed.columns.length).map(c => ({ name: c.column_name, type: c.column_type }))).toEqual(typed.columns);
   });
 
   it('GBK 编码的 CSV 登记时自动识别转成 UTF-8 存湖、审计记 gbk，发布映射后标准层有这些客户', async () => {
