@@ -279,7 +279,9 @@ describe('知识提案', () => {
   });
 
   it('term_default 提案：词是目标条目当前的名称或有效别名（不分大小写）才能提出，去空白、超长 400；指纹去重与拒绝过不再提照旧', async () => {
-    const { acme, analyst } = await setup();
+    const { acme, author, analyst, orderMappings } = await setup();
+    // 映射字段上的别名（mapping_id 非空）不算普通字段的有效别名
+    await addAlias(author, { targetId: 'field:order.status', mappingId: orderMappings!.loyalty, alias: '会员单状态' });
     await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: '营收' });
     const byAlias = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: '营收' } }))!;
     expect(byAlias).toMatchObject({ status: 'proposed', kind: 'term_default', content: { term: '营收' }, targetId: 'metric:paid_revenue' });
@@ -305,6 +307,9 @@ describe('知识提案', () => {
       { targetId: 'entity:order', kind: 'term_default', content: { term: '营收' } },
       { targetId: 'entity:order', kind: 'term_default', content: { term: '  ' } },
       { targetId: 'entity:order', kind: 'term_default', content: { term: '长'.repeat(ALIAS_MAX_LENGTH + 1) } },
+      // 默认指向只挂目录条目：带 mappingId 的（已发布映射的字段）400；只在映射字段上有的别名，提给普通字段也 400
+      { targetId: 'field:order.status', mappingId: orderMappings!.loyalty, kind: 'term_default', content: { term: '会员单状态' } },
+      { targetId: 'field:order.status', kind: 'term_default', content: { term: '会员单状态' } },
     ];
     for (const input of bad) await expect(propose(acme, input), JSON.stringify(input)).rejects.toMatchObject({ status: 400 });
     expect(await proposalRows(acme)).toHaveLength(5);

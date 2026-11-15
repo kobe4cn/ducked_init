@@ -110,10 +110,12 @@ const KINDS: { [K in ProposalKind]: KindSpec<K> } = {
       return { term };
     },
     // 词要是目标条目当前的名称或有效别名（都不分大小写），否则成员说的不是这个条目，默认指向无从谈起
-    async check(tx, tenantId, { targetId, content }) {
+    async check(tx, tenantId, { targetId, mappingId, content }) {
+      // 默认指向和主题归属一样只挂目录条目（knowledge_term_defaults 没有 mapping_id），映射字段上的别名也不算
+      if (mappingId) throw new KnowledgeError('映射字段不能设置默认指向');
       const name = await targetNameOf(tx, tenantId, targetId);
       const [alias] = await tx.select({ id: knowledgeAliases.id }).from(knowledgeAliases).where(and(
-        eq(knowledgeAliases.tenantId, tenantId), eq(knowledgeAliases.targetId, targetId),
+        eq(knowledgeAliases.tenantId, tenantId), eq(knowledgeAliases.targetId, targetId), isNull(knowledgeAliases.mappingId),
         sql`lower(${knowledgeAliases.alias}) = lower(${content.term})`, isNull(knowledgeAliases.retiredAt),
       ));
       if (!alias && name?.toLowerCase() !== content.term.toLowerCase()) throw new KnowledgeError(`词「${content.term}」不是 ${targetId} 的名称或别名`);
