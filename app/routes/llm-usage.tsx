@@ -56,6 +56,12 @@ function UsageRow({ row, isTotal = false }: { row: PurposeUsage; isTotal?: boole
   );
 }
 
+/** 明细里一次调用的 Schema 校验结果：没校验（null）显示「—」 */
+function SchemaResult({ valid }: { valid: boolean | null }) {
+  if (valid === null) return <>—</>;
+  return valid ? <span className="text-emerald-600">通过</span> : <span className="text-red-600">未通过</span>;
+}
+
 /** 上一页 / 下一页 */
 function Pager({ page, pages, pageSize, href }: { page: number; pages: number; pageSize: number; href: (p: number) => string }) {
   return (
@@ -146,11 +152,7 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
                     <TableCell>{r.promptTokens === null ? '—' : n(r.promptTokens)}</TableCell>
                     <TableCell>{r.completionTokens === null ? '—' : n(r.completionTokens)}</TableCell>
                     <TableCell>{`${n(r.durationMs)} ms`}</TableCell>
-                    <TableCell>
-                      {r.schemaValid === null ? '—' : r.schemaValid
-                        ? <span className="text-emerald-600">通过</span>
-                        : <span className="text-red-600">未通过</span>}
-                    </TableCell>
+                    <TableCell><SchemaResult valid={r.schemaValid} /></TableCell>
                     <TableCell className={cn('max-w-2xl truncate', r.error ? 'text-red-600' : 'text-slate-400')} title={r.error ?? undefined}>
                       {r.error ? brief(r.error) : '—'}
                     </TableCell>
