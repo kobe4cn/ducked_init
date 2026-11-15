@@ -31,3 +31,9 @@ export function rethrowDuplicateAlias(e: unknown): never {
   if (isUniqueViolation(e)) throw new KnowledgeError('已有同样的别名');
   throw e;
 }
+
+/** 并发给同一个词设置默认指向时唯一索引兜底（ADR-0056）：23505 改写成 400，其他错误原样抛出 */
+export function rethrowDuplicateTermDefault(e: unknown): never {
+  if (isUniqueViolation(e)) throw new KnowledgeError('这个词刚被设置过默认指向，请重试');
+  throw e;
+}

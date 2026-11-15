@@ -4,7 +4,7 @@
 // 数据地图字段抽屉（lineage）里有实体面板与 ?field= 展开的字段面板（不带说明区，敏感字段没有面板），自定义实体详情页（entity）有同一个实体面板
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { expand } from '../../app/.server/catalog';
+import { expand, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -270,6 +270,40 @@ describe('业务知识面板', () => {
     expect(edited.status).toBe(400);
     expect(decode(await edited.text())).toContain('主题归属提案不能修改后接受');
     expect(await panelOf(an, METRIC)).toContain(`data-proposal="${q.id}"`);
+  });
+
+  it('词的默认指向提案显示「默认指向：『营收』默认指这一条」，没有「修改后接受」；接受后提案消失、目录条目带上这个词；改值接受被服务端拦下', async () => {
+    const { acme, analyst } = await setup();
+    await addAlias(analyst, { targetId: TARGET, alias: '营收' });
+    const p = await propose(acme, { kind: 'term_default', content: { term: '营收' } });
+    const an = await loginAs(app, 'an@acme.com');
+    const post = (form: Record<string, string>) => an.post(METRIC, { targetId: TARGET, ...form });
+
+    let panel = await panelOf(an, METRIC);
+    expect(panel).toContain(`data-proposal="${p.id}"`);
+    expect(panel).toContain('默认指向：『营收』默认指这一条');
+    // 这条提案只有「接受」与「拒绝」，没有「修改后接受」的入口
+    const li = panel.match(new RegExp(`<li[^>]*data-proposal="${p.id}"[\\s\\S]*?</li>`))![0];
+    expect(li).toContain('name="intent" value="proposal.accept"');
+    expect(li).toContain('name="intent" value="proposal.reject"');
+    expect(li).not.toContain('修改后接受');
+    expect(panel).not.toContain('proposal.acceptEdited');
+
+    expect((await post({ intent: 'proposal.accept', proposalId: p.id })).status).toBe(302);
+    panel = await panelOf(an, METRIC);
+    expect(panel).not.toContain(`data-proposal="${p.id}"`);
+    expect(panel).not.toContain('待确认的知识提案');
+    // 接受后这个词出现在条目上（目录快照与 Markdown，给检索投影用）
+    expect(await knowledgeOf(acme)).toMatchObject({ aliases: ['营收'], termDefaults: ['营收'] });
+    const c = await tenantCatalog(acme);
+    expect(toMarkdown(expand(c, TARGET)!)).toContain('词的默认指向：营收（默认指这一条）');
+
+    // 直接 POST 改值接受 400，提案仍是待确认
+    const other = await propose(acme, { kind: 'term_default', content: { term: 'paid_revenue' } });
+    const edited = await post({ intent: 'proposal.acceptEdited', proposalId: other.id, kind: 'term_default', term: '营收' });
+    expect(edited.status).toBe(400);
+    expect(decode(await edited.text())).toContain('词的默认指向提案不能修改后接受');
+    expect(await panelOf(an, METRIC)).toContain(`data-proposal="${other.id}"`);
   });
 
   it('拒绝要填理由，拒绝后提案消失、目录不变；已处理或依据已变化时接受 409 并显示错误；查看者没有处理入口，提交 403', async () => {
