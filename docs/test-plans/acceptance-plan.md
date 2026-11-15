@@ -154,10 +154,10 @@ node --env-file=.env --import tsx scripts/fmcg-seed/seed.ts --persons 50000   # 
 node --env-file=.env --import tsx scripts/crm-seed/seed.ts  --persons 50000   # 约 10 秒
 # 回归：先确认流水线本身没问题
 node --env-file=.env --import tsx scripts/fmcg-seed/check-mappings.ts         # 42 个映射 + 22 个定义 全 ✔
-node --env-file=.env --import tsx scripts/crm-seed/check-mappings.ts          # 32 个映射 + 15 个定义 全 ✔
+node --env-file=.env --import tsx scripts/crm-seed/check-mappings.ts          # 32 个映射 + 17 个定义 全 ✔
 ```
 
-> 重新造数会改源端，已有的冒烟租户（`fmcglab-smoke`、`crmlab-smoke`）要 `pnpm lake:reset --tenant <slug> --yes` 再 `setup.ts --tenant <slug> --step sync`，然后 `verify.ts <slug>` 无 ✘。这一步同时是**回归基线**：冒烟不过就先不进 S1。
+> 重新造数会改源端，已有的冒烟租户（`fmcglab-smoke`、`crmlab-smoke`）要 `pnpm lake:reset --tenant <slug> --yes` 再 `setup.ts --tenant <slug> --step sync`（B 用 `--step definitions,sync,recompute`：B 的 sync 不重算，definitions 补发仓库里新增的定义），然后 `verify.ts <slug>` 无 ✘。冒烟租户里的映射是建租户当时的版本，`setup.ts` 遇到已有的会跳过，不会跟上仓库后来的修改；冒烟不过时先比对租户已发布的映射与仓库文件（2026-11-15 的 `crmlab-smoke` 就是 `events_s3` 两个映射停在 #191 之前）。这一步同时是**回归基线**：冒烟不过就先不进 S1。
 
 造数的终点日（`--end`，默认今天 UTC）决定探针的「距今天数」。**S4 最好在造数当天做**；隔天也行，`verify.ts` 按每张快照自己的 asOf 核对。
 
@@ -181,7 +181,7 @@ A 的 L0（第一轮）：
 | member_pg | members 34,345 · memberships 34,345 · points_ledger 467,848 · redemptions 6,079 · coupon_templates 20 · coupons 51,242 · consents 41,133 · preferences 12,271 |
 | mall_pg | orders 260,846 · order_items 518,768 · subscriptions 3,398 |
 | scan_mysql | scan_users 22,493 · scans 382,832 · codes 364,608 · sku_points 63 |
-| station_mysql | members 2,591 · bills 31,741 · stations 29 |
+| station_mysql | members 2,591 · bills 32,017 · stations 29 |
 | erp_mysql | products 60 · regions 7 |
 | oms_mongo | orders 99,234 |
 | tmall_s3 | buyers 9,907 · trades 82,265 · trade_items 164,891 |
@@ -193,7 +193,7 @@ A 的 L0（第一轮）：
 | wecom_duckdb | contacts 8,687 · groups 42 · group_members 12,944 · mass_sends 18,833 |
 | **dealer_upload** ✱ | dealer_stock 24（进货箱数合计 360、金额合计 34,560.00、华东 16,896.00） |
 
-> 造数参数相同时行数是确定的；如果某张表差了，先重跑 `seed.ts --only <源>`，不要带着差异进下一阶段。
+> 造数参数相同时行数是确定的，但奶站 `bills` 按自然月出账，随 `--end` 变化（上表是 `--end 2026-11-15`；10-20 时为 31,741），以真值库 `ord` 表 `src = 'station'` 的行数为准；如果某张表差了，先重跑 `seed.ts --only <源>`，不要带着差异进下一阶段。
 
 额外的数据量用例：
 
@@ -307,7 +307,7 @@ sh scripts/fmcg-seed/uploads/make-uploads.sh
 
 | # | 操作 | 期望 |
 |---|---|---|
-| AUTH-1 | admin 邀请 eng、an、view | 收到邮件（或 dev 终端打印）；链接一次性、过期失效 |
+| AUTH-1 | admin 邀请 eng、an、view；被邀请者在**各自的**浏览器配置里打开 `/login` 输入本人邮箱申请登录 | 邀请邮件只是通知，**不带登录链接**，只给出 `/login` 地址；申请登录后 dev 终端打印「登录 CRM 数据分析平台」邮件，里面的 `/auth/verify?token=…` 链接一次性、过期失效、重新申请后旧链接作废。已登录的浏览器配置打开 `/login` 会直接跳回首页，要换配置或先退出 |
 | AUTH-2 | 没被邀请的邮箱申请登录 | 不提示「账号不存在」以外的信息，进不去任何租户；频繁申请被限流 |
 | AUTH-3 | 把 an 改成查看者，再改回 | 改完立即生效（不用重新登录） |
 | AUTH-4 | 移除 view，再邀请回来 | 移除瞬间旧会话失效；其个人令牌、助手对话一起删除 |
@@ -344,7 +344,7 @@ sh scripts/fmcg-seed/uploads/make-uploads.sh
 |---|---|---|
 | S2.1 | 13 个数据源逐个登记、「测试连接」 | 都通过只读探测（SRC-1）；中途做 SRC-2 |
 | S2.2 | 每个数据源选上全部表 →「保存同步范围」，等采集完 | 共 36 张表；看列统计（SRC-4） |
-| S2.3 | 确认水位线：有 `updated_at` / `update_time` / `modified` 的选它 →「确认为水位线」；`scans`、`codes`、`points_ledger` 只追加，选 `created_at`；`order_items`、`stations`、`regions` 没有候选（全量比对） | SRC-5 |
+| S2.3 | 确认水位线：有 `updated_at` / `update_time` / `modified` 的选它 →「确认为水位线」；`order_items`、`stations`、`regions` 以及只追加的 `scans`、`codes`、`points_ledger` 没有候选（平台只把按命名是更新时间的时间列和自增主键当候选，`created_at` 不算），按全量比对 | SRC-5：A 共 17 张表确认了水位线（含 oms `modified`、wecom `contacts` / `group_members` 的 `update_time`）；点按钮后页面停在原处 |
 | S2.4 | 文件类的表声明业务主键（下一段）→「在源端全表检查并确认」 | 每次声明排一个全表检查任务，通过才生效（SRC-6） |
 | S2.5 | 每个数据源点「立即同步」 | 原始层行数 = §3.3 的 L0；敏感列（手机、unionid、姓名）是密文（SRC-7） |
 | S2.6 | 每个数据源点「核对」 | 覆盖率 100%、缺失 0、多余 0（SRC-8 / VOL-1） |
@@ -806,6 +806,8 @@ node --env-file=.env --import tsx scripts/isolab/setup.ts --step compare --with 
 | `scratch_pg` | C 自己的：schema `iso_scratch`、账号 `isolab_reader` / `isolab-reader-secret`，`members` 2000 行 | 会被改坏的用例：SRC-3、SRC-10、GOV-4、ISO-11 |
 
 成员：`admin@` / `eng@` / `an@` / `view@isolab.test`。配额保持默认。
+
+> 本机已有建于每租户一桶（#715）之前的 `isolab` 时，它没有自己的 `lake-<id>` 桶，测不了 OPS-2 / OPS-8 / ISO-11：改用 `--tenant isolab2`（`--step compare` 同样加上），成员邮箱随之变成 `@isolab2.test`。2026-11-15 这一轮的 C 就是 `isolab2`。
 跑完的期望：C 里 39,197 条消费者记录 → 37,197 个统一消费者；`compare` 三项 ✔（手机哈希相同 0、统一消费者 ID 相同 0）。
 
 ### 5.2 C 上的破坏性用例（按顺序做）
@@ -1026,8 +1028,8 @@ pnpm eval:mapping:compare <旧结果> <新结果>
 
 | 阶段 | 用例 | 日期 | 结果（✅ / ❌ / ⚠️） | 证据（命令输出、截图） | 问题 / issue |
 |---|---|---|---|---|---|
-| S0 | ENV-1–6、造数、§3.6 素材、冒烟 A / B、VOL L0 | | | | |
-| S1 | S1.1–S1.8、OPS-1–9、AUTH-1–7 | | | | |
+| S0 | ENV-1–6、造数、§3.6 素材、冒烟 A / B、VOL L0 | 2026-11-15 | ✅（ENV-6 未配，可选） | ENV-5：seaweedfs 按 `db_script/start.sh` 重建，Max 2000、新桶首写 +1 卷；造数 `--end 2026-11-15`；check-mappings A 64 ✔ / B 49 ✔；L0 36 张表对上（bills 以真值为准）；`verify.ts` A、B 均无 ✘（B 17 个定义 ✔） | B 冒烟租户映射过时（`douyin_buyers` 带 view_key、`events_s3` 停在 #191 之前），已按仓库发布新版本并停用 `users → customer`；`crm-seed/setup.ts` 的 recompute 复用旧任务 SQL（asOf 窗口写死），已改为 `recomputeDefinition`；重置后首批 `serving.build` 因旧快照已删失败、随后成功（暂态） |
+| S1 | S1.1–S1.8、OPS-1–9、AUTH-1–7 | 2026-11-15 | ✅（OPS-6–9 留到 S2 / ISO / AI-R6） | A 由 `/ops` 页面创建（审计 `tenant.created` 操作者为运营者）；B `verify.ts crmlab` 46 ✔ 无 ✘；**C 用 `isolab2`**（旧 `isolab` 早于每租户一桶，没有 `lake-<id>` 桶），后续 C 的用例一律换成 `isolab2`；三个租户各有 `lake-<id>` 桶，catalog、对象存储账号、只读账号互不相同；配额审计带前后值；用量统计 10 分钟内出现；混合检索三家都关；OPS-4 停用、恢复都进审计，停用期间不签发登录链接；AUTH-2 陌生邮箱连续 5 次后被限流、不签发；AUTH-3 / 4 按用户确认判过；OPS-1 / 5、AUTH-1 旧链接复用、AUTH-5–7 为页面观察 | AUTH-1 原期望写成「邀请邮件里的链接一次性」，与实现不符（邀请邮件只给 `/login` 地址），已改写；已登录的浏览器配置打开 `/login` 直接跳回首页，易误判为「没发链接」；crmlab 配额由冒烟脚本直接改库（无审计，脚本行为） |
 | S2 | S2.1–S2.12、SRC-1–15、VOL-1、VOL-6 | | | | |
 | S3 | S3.1–S3.22、MAP-1–11、ID-1–6、VOL-2–3 | | | | |
 | S4 | S4.1–S4.14、TPL-1–3、DEF-1–11 | | | | |
