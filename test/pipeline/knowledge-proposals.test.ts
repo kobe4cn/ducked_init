@@ -1,17 +1,19 @@
 // test/pipeline/knowledge-proposals.test.ts —— 知识提案（ADR-0046）的接缝：proposeKnowledge → knowledge_proposals（接受前不进 tenantCatalog、search
 // 与 modelDraftForDefinition 发给模型的消息）→ acceptProposal 生成别名 / 口径声明 / 业务说明（审计、目录版本），rejectProposal 按指纹记下、不再提出；
-// proposeMany 批量提出（单条不合法计 invalid 不作废整批、依据与快照不同计 stale），提出时就按别名 / 说明的长度上限校验
-import { desc, eq } from 'drizzle-orm';
+// proposeMany 批量提出（单条不合法计 invalid 不作废整批、依据与快照不同计 stale），提出时就按别名 / 说明的长度上限校验。
+// term_default（ADR-0056）：词是目标的名称或有效别名才能提出，接受写 knowledge_term_defaults（同一个词换目标停用旧的）、不能改值接受
+import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { NOTE_MAX_LENGTH } from '../../app/.server/business-notes';
 import { expand, search, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, businessNotes, catalogVersions, knowledgeAliases, knowledgeProposals, semanticClaims } from '../../app/.server/db/schema';
+import { auditLogs, businessNotes, catalogVersions, knowledgeAliases, knowledgeProposals, knowledgeTermDefaults, semanticClaims } from '../../app/.server/db/schema';
 import { createDefinition, modelDraftForDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
-import { addAlias, ALIAS_MAX_LENGTH } from '../../app/.server/knowledge/aliases';
+import { addAlias, ALIAS_MAX_LENGTH, retireAlias } from '../../app/.server/knowledge/aliases';
 import { currentBases } from '../../app/.server/knowledge/basis';
 import { acceptProposal, listProposals, proposeKnowledge, proposeMany, rejectProposal, type ProposalInput } from '../../app/.server/knowledge/proposals';
+import { listTermDefaults } from '../../app/.server/knowledge/term-defaults';
 import { setLlmFetch } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
@@ -274,5 +276,87 @@ describe('知识提案', () => {
     ]);
     expect(mixed.created).toHaveLength(1);
     expect(mixed.invalid).toEqual([{ index: 0, reason: expect.stringContaining(`${NOTE_MAX_LENGTH}`) }]);
+  });
+
+  it('term_default 提案：词是目标条目当前的名称或有效别名（不分大小写）才能提出，去空白、超长 400；指纹去重与拒绝过不再提照旧', async () => {
+    const { acme, author, analyst, orderMappings } = await setup();
+    // 映射字段上的别名（mapping_id 非空）不算普通字段的有效别名
+    await addAlias(author, { targetId: 'field:order.status', mappingId: orderMappings!.loyalty, alias: '会员单状态' });
+    await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: '营收' });
+    const byAlias = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: '营收' } }))!;
+    expect(byAlias).toMatchObject({ status: 'proposed', kind: 'term_default', content: { term: '营收' }, targetId: 'metric:paid_revenue' });
+    // 词是条目当前的名称也可以：指标的名称是 key，实体的名称是标签（订单）
+    await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'paid_revenue' } });
+    await propose(acme, { targetId: 'entity:order', kind: 'term_default', content: { term: '订单' } });
+    // 只差大小写也算是名称：Paid_Revenue 对上 paid_revenue
+    expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'Paid_Revenue' } }))
+      .toMatchObject({ status: 'proposed', content: { term: 'Paid_Revenue' } });
+    // 只差大小写也算是别名：别名 GMV，提 gmv
+    await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: 'GMV' });
+    expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'gmv' } }))
+      .toMatchObject({ status: 'proposed', content: { term: 'gmv' } });
+    expect(await proposalRows(acme)).toHaveLength(5);
+
+    // 停用的别名不算：停用「流水」后提它 400
+    const retired = await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: '流水' });
+    await retireAlias(analyst, retired);
+
+    // 不是这个目标的名称或有效别名（流水已停用）、是别的目标的别名、空白、超长都 400 不写入
+    const bad: Parameters<typeof propose>[1][] = [
+      { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: '流水' } },
+      { targetId: 'entity:order', kind: 'term_default', content: { term: '营收' } },
+      { targetId: 'entity:order', kind: 'term_default', content: { term: '  ' } },
+      { targetId: 'entity:order', kind: 'term_default', content: { term: '长'.repeat(ALIAS_MAX_LENGTH + 1) } },
+      // 默认指向只挂目录条目：带 mappingId 的（已发布映射的字段）400；只在映射字段上有的别名，提给普通字段也 400
+      { targetId: 'field:order.status', mappingId: orderMappings!.loyalty, kind: 'term_default', content: { term: '会员单状态' } },
+      { targetId: 'field:order.status', kind: 'term_default', content: { term: '会员单状态' } },
+    ];
+    for (const input of bad) await expect(propose(acme, input), JSON.stringify(input)).rejects.toMatchObject({ status: 400 });
+    expect(await proposalRows(acme)).toHaveLength(5);
+
+    // 去空白后同样的提案指纹相同（返回已有那条）；拒绝过不再提
+    expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: ' 营收 ' } })).toMatchObject({ id: byAlias.id });
+    await rejectProposal(analyst, byAlias.id, '营收默认指近一年那条');
+    expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: '营收' } })).toBeNull();
+    expect(await proposalRows(acme)).toHaveLength(5);
+  });
+
+  it('接受 term_default 写进 knowledge_term_defaults、记审计 term_default.set 与目录版本；同一个词换目标时停用旧的；不能改值接受；查看者 403', async () => {
+    const { acme, reviewer, analyst, viewer } = await setup();
+    await createDefinition(analyst, 'metric', 'revenue_365d', 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 近一年营收\n');
+    await publishDefinition(reviewer, 'metric', 'revenue_365d', 1);
+    // 两个目标上的同一个词只差大小写：先接受 Revenue → paid_revenue，再接受 revenue → revenue_365d
+    await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: 'Revenue' });
+    await addAlias(analyst, { targetId: 'metric:revenue_365d', alias: 'revenue' });
+    const first = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'Revenue' } }))!;
+    const second = (await propose(acme, { targetId: 'metric:revenue_365d', kind: 'term_default', content: { term: 'revenue' } }))!;
+
+    const a = await expectBump(acme, 'term_default.set', () => acceptProposal(analyst, first.id));
+    expect(a).toMatchObject({ status: 'accepted', reviewedByEmail: 'an@acme.com', acceptedRef: expect.any(String) });
+    const defaults = () => getDb().select().from(knowledgeTermDefaults).where(eq(knowledgeTermDefaults.tenantId, acme));
+    expect(await defaults()).toHaveLength(1);
+    expect((await defaults())[0]).toMatchObject({ term: 'Revenue', targetId: 'metric:paid_revenue', createdByEmail: 'an@acme.com', retiredAt: null });
+    const [audit] = await getDb().select().from(auditLogs)
+      .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'term_default.set')));
+    expect(audit).toMatchObject({ targetType: 'knowledge', targetId: (await defaults())[0]!.id, detail: { term: 'Revenue', targetId: 'metric:paid_revenue' } });
+
+    // 同一个词（不分大小写：revenue 与 Revenue）已有有效默认时停用旧的、换成新的，审计带上被替换的目标
+    const b = await expectBump(acme, 'term_default.set', () => acceptProposal(analyst, second.id));
+    const rows = await defaults();
+    expect(rows).toHaveLength(2);
+    expect(rows.find(r => r.targetId === 'metric:paid_revenue')).toMatchObject({ retiredAt: expect.any(Date) });
+    expect(rows.find(r => r.targetId === 'metric:revenue_365d')).toMatchObject({ retiredAt: null });
+    expect(b.acceptedRef).toBe(rows.find(r => r.targetId === 'metric:revenue_365d')!.id);
+    const replaced = await getDb().select().from(auditLogs)
+      .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'term_default.set'), eq(auditLogs.targetId, b.acceptedRef!)));
+    expect(replaced[0]).toMatchObject({ detail: { term: 'revenue', targetId: 'metric:revenue_365d', replaced: 'metric:paid_revenue' } });
+    // listTermDefaults 只给有效的默认（给歧义判定读用）
+    expect(await listTermDefaults(getDb(), acme)).toEqual([expect.objectContaining({ term: 'revenue', targetId: 'metric:revenue_365d', retiredAt: null })]);
+
+    // 不能改值接受（改 term 等于换了个词，面板不渲染入口，这里挡住直接提交）；查看者 403
+    const third = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'paid_revenue' } }))!;
+    await expect(acceptProposal(analyst, third.id, { term: '营收' })).rejects.toMatchObject({ status: 400, message: expect.stringContaining('不能修改后接受') });
+    await expect(acceptProposal(viewer, third.id)).rejects.toMatchObject({ init: { status: 403 } });
+    expect((await proposalRows(acme)).find(p => p.id === third.id)).toMatchObject({ status: 'proposed', acceptedRef: null });
   });
 });

@@ -78,6 +78,31 @@ export async function basisOf(tx: Db, tenantId: string, targetId: string, mappin
 }
 
 /**
+ * 目标条目在目录里的当前名称（buildCatalog 同口径：指标与标签是 key，实体是标签，字段是字段标签、映射写入的扩展字段是字段名）；
+ * 目标不存在时为 null。term_default 提案校验词是不是目标的名称或有效别名用（ADR-0056）
+ */
+export async function targetNameOf(db: Db, tenantId: string, targetId: string): Promise<string | null> {
+  const t = parseTarget(targetId);
+  if (!t) return null;
+  if (t.kind === 'metric' || t.kind === 'tag') {
+    const published = (await publishedDependents(db, tenantId)).some(d => d.kind === t.kind && d.key === t.key);
+    return published ? t.key : null;
+  }
+  const custom = await publishedCustomEntities(db, tenantId);
+  const entity = t.kind === 'field' ? t.entity : t.key;
+  const canonical = entityOf(entity);
+  const registered = canonical?.fields ?? custom.get(entity)?.fields;
+  if (!registered) return null;
+  if (t.kind !== 'field') return canonical?.label ?? custom.get(entity)?.label ?? null;
+  const declared = registered.find(f => f.name === t.field);
+  // 目录里字段的名称：标准字段是标签，自定义实体的字段就是字段名（与 buildCatalog 同口径）
+  if (declared) return 'label' in declared ? declared.label : declared.name;
+  // 映射写入的扩展字段：目录里的名称就是字段名
+  const plans = await publishedPlans(db, tenantId);
+  return plans.some(p => p.entity === entity && p.columns.some(c => c.name === t.field)) ? t.field : null;
+}
+
+/**
  * 校验知识的目标是本租户目录里有的、不是敏感字段，不合法时抛 KnowledgeError。
  * 字段是实体登记的字段或已发布映射写入的扩展字段；映射字段的映射必须已发布（未停用）且写入了这个字段，锁住映射行，与发布、停用互斥。
  * 指标、标签与自定义实体不加锁：与删除并发时可能留下挂不上的知识，目录会把它丢掉（同映射停用后的知识），不影响正确性

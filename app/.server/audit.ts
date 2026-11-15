@@ -258,6 +258,8 @@ const ACTIONS = {
   // 别名（ADR-0046）：不记别名原文
   'alias.added': { label: '添加别名', describe: knowledgeTarget },
   'alias.retired': { label: '停用别名', describe: knowledgeTarget },
+  // 词的默认指向（ADR-0056）：detail 只有 {term, targetId, replaced?}，词是目标的名称或别名，不是用户原话
+  'term_default.set': { label: '设置词的默认指向', describe: knowledgeTarget },
   // 口径声明（ADR-0046）：detail 只有目标与类型，不记取值
   'semantic_claim.saved': {
     label: '保存口径声明',

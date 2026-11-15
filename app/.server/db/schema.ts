@@ -802,6 +802,22 @@ export const knowledgeAliases = platform.table('knowledge_aliases', {
     .where(sql`retired_at is null`),
 ]);
 
+// 词的默认指向（ADR-0056）：某个词（term，目标条目的名称或有效别名，不分大小写）在本租户默认指哪个目录条目（target_id），
+// 用来在歧义时不再追问。只加和停用（接受新提案就停用旧的）、不改值，停用的行留着（retired_at）。based_on 与 knowledge_aliases 同口径；
+// 依据（默认条目的定义）变了时不生效，照常追问。只经知识提案接受写入（ADR-0046 入口⑥），本表没有 mapping_id：默认指向只挂目录条目
+export const knowledgeTermDefaults = platform.table('knowledge_term_defaults', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  term: text('term').notNull(),
+  targetId: text('target_id').notNull(),
+  basedOn: jsonb('based_on').$type<{ id: string; hash: string }[]>().notNull().default([]),
+  createdByEmail: text('created_by_email').notNull(),
+  createdAt: createdAt(),
+  retiredAt: timestamp('retired_at', { withTimezone: true }),
+}, t => [
+  uniqueIndex('knowledge_term_defaults_active_uq').on(t.tenantId, sql`lower(${t.term})`).where(sql`retired_at is null`),
+]);
+
 // 口径声明（ADR-0046）：目标与 knowledge_aliases 相同（target_id 是目录条目标识，mapping_id 非空是映射字段）。只追加不改，
 // 每个 (目标, 映射, 类型) 最新的一行生效，旧行是历史。claim_type 与 value 是 app/lib/semantic-claims.ts 登记的枚举；based_on 是依据摘要
 export const semanticClaims = platform.table('semantic_claims', {
@@ -837,10 +853,10 @@ export const subjectMemberships = platform.table('subject_memberships', {
   createdAt: createdAt(),
 }, t => [primaryKey({ columns: [t.subjectId, t.targetId] }), index('subject_memberships_tenant_idx').on(t.tenantId)]);
 
-/** 知识提案的种类：别名、口径声明、业务说明、主题归属 */
-export type ProposalKind = 'alias' | 'claim' | 'note' | 'subject';
-/** 知识提案的内容，按种类：别名 {alias}、口径声明 {type, value}、业务说明 {note}、主题归属 {subjectId}。jsonb 里只存这些键，种类在 kind 列 */
-export type ProposalContentOf = { alias: { alias: string }; claim: { type: string; value: string }; note: { note: string }; subject: { subjectId: string } };
+/** 知识提案的种类：别名、口径声明、业务说明、主题归属、词的默认指向 */
+export type ProposalKind = 'alias' | 'claim' | 'note' | 'subject' | 'term_default';
+/** 知识提案的内容，按种类：别名 {alias}、口径声明 {type, value}、业务说明 {note}、主题归属 {subjectId}、词的默认指向 {term}。jsonb 里只存这些键，种类在 kind 列 */
+export type ProposalContentOf = { alias: { alias: string }; claim: { type: string; value: string }; note: { note: string }; subject: { subjectId: string }; term_default: { term: string } };
 /** 任意种类知识提案的内容 */
 export type ProposalContent = ProposalContentOf[ProposalKind];
 /** 知识提案的状态：待处理、已接受、已拒绝 */
@@ -848,7 +864,7 @@ export type ProposalStatus = 'proposed' | 'accepted' | 'rejected';
 /** 知识提案的一条证据：元数据引用（可带版本），不放取值 */
 export type ProposalEvidence = { ref: string; version?: number };
 
-// 知识提案（ADR-0046）：系统或 AI 生成、等成员确认的别名、口径声明、业务说明、主题归属，接受前不进目录、检索与起草上下文（不要读进 loadKnowledge）。
+// 知识提案（ADR-0046）：系统或 AI 生成、等成员确认的别名、口径声明、业务说明、主题归属、词的默认指向（ADR-0056），接受前不进目录、检索与起草上下文（不要读进 loadKnowledge）。
 // 目标同 knowledge_aliases（target_id 是目录条目标识，mapping_id 非空是映射字段；主题归属只挂目录条目，mapping_id 一定是空）。evidence 只存元数据引用 [{ref, version?}]，不存取值；
 // based_on 是提出时的依据摘要。fingerprint = sha256(stableJson({targetId, mappingId, kind, claim: content, basedOn}))（proposalFingerprint），
 // 键名仍是改名前的 claim，指纹才不变；同租户唯一：同样的提案不重复存，拒绝过的不再提出。接受后 accepted_ref 是生成的知识行（别名、口径声明、业务说明）的 ID，主题归属是主题 ID

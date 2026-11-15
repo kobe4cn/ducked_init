@@ -1,5 +1,5 @@
 // app/.server/knowledge/catalog.ts —— 业务知识（ADR-0046）在语义目录里的挂载点：每个目录条目（映射字段挂在字段条目下该映射的血缘项上）可选地带一份 Knowledge，
-// 参与搜索、写进 Markdown。目前有别名、口径声明、所属分析主题与实体、指标、标签的业务说明（字段与映射字段的说明仍由 catalog/index.ts 挂在 note 上）。
+// 参与搜索、写进 Markdown。目前有别名、口径声明、所属分析主题、词的默认指向（ADR-0056）与实体、指标、标签的业务说明（字段与映射字段的说明仍由 catalog/index.ts 挂在 note 上）。
 // 需复核：知识行存下的依据摘要（based_on）里有一项与当前摘要（currentBases）不同时，这条知识需复核——别名照常生效、另列进 aliasesNeedReview，
 // 说明带 noteNeedsReview，口径声明按「未知」输出并带上原值；映射字段说明的需复核算成 staleNotes 交给 catalog/index.ts。依据已不在当前摘要里的
 // （定义删除、映射停用）目标本来就不在目录里，不算需复核；没有依据的（实体、普通字段、旧行）永远不需复核。重新保存（别名停用后重新加）后依据更新，标记消失。
@@ -8,7 +8,7 @@ import { and, asc, desc, eq, isNull } from 'drizzle-orm';
 import type { Tx } from '../audit';
 import { currentMappingNoteBases, currentTargetNotes } from '../business-notes';
 import type { getDb } from '../db/client';
-import { analysisSubjects, knowledgeAliases, semanticClaims, subjectMemberships } from '../db/schema';
+import { analysisSubjects, knowledgeAliases, knowledgeTermDefaults, semanticClaims, subjectMemberships } from '../db/schema';
 import { cmpName } from '../../lib/compare';
 import { currentBases, type Basis } from './basis';
 import { CLAIM_TYPE_ORDER, claimTypeLabel, claimValueLabel, isClaimType, isClaimValue, type ClaimType } from '../../lib/semantic-claims';
@@ -20,6 +20,8 @@ export interface Knowledge {
   aliasesNeedReview?: string[];
   claims?: Claim[];
   subjects?: string[];
+  /** 默认指这一条目的词（ADR-0056，当前有效的默认指向）。依据已变的不生效、不加载（照常追问） */
+  termDefaults?: string[];
   note?: string;
   noteNeedsReview?: true;
 }
@@ -40,6 +42,7 @@ export function presentKnowledge(k: Knowledge | undefined): Knowledge | undefine
   if (k?.aliases?.length && k.aliasesNeedReview?.length) out.aliasesNeedReview = k.aliasesNeedReview;
   if (k?.claims?.length) out.claims = k.claims;
   if (k?.subjects?.length) out.subjects = k.subjects;
+  if (k?.termDefaults?.length) out.termDefaults = k.termDefaults;
   if (k?.note) out.note = k.note;
   if (k?.note && k.noteNeedsReview) out.noteNeedsReview = true;
   return Object.keys(out).length ? out : undefined;
@@ -67,6 +70,12 @@ export async function loadKnowledge(db: Tx | ReturnType<typeof getDb>, tenantId:
   const subjects = await db.select({ targetId: subjectMemberships.targetId, name: analysisSubjects.name })
     .from(subjectMemberships).innerJoin(analysisSubjects, eq(analysisSubjects.id, subjectMemberships.subjectId))
     .where(eq(subjectMemberships.tenantId, tenantId));
+  // 词的默认指向（ADR-0056）：依据（默认条目的定义）已变的不生效、不加载——照常追问，不列为待复核
+  const termDefaults = await db.select({
+    targetId: knowledgeTermDefaults.targetId, term: knowledgeTermDefaults.term, basedOn: knowledgeTermDefaults.basedOn,
+  })
+    .from(knowledgeTermDefaults)
+    .where(and(eq(knowledgeTermDefaults.tenantId, tenantId), isNull(knowledgeTermDefaults.retiredAt)));
   const byTarget = new Map<string, Knowledge>();
   const knowledgeAt = (targetId: string, mappingId: string | null) => {
     const key = knowledgeKey(targetId, mappingId);
@@ -85,6 +94,10 @@ export async function loadKnowledge(db: Tx | ReturnType<typeof getDb>, tenantId:
       : { type: r.type, value: r.value });
   }
   for (const r of subjects) (knowledgeAt(r.targetId, null).subjects ??= []).push(r.name);
+  for (const r of termDefaults) {
+    if (stale(r.basedOn)) continue;
+    (knowledgeAt(r.targetId, null).termDefaults ??= []).push(r.term);
+  }
   for (const [targetId, { note, basedOn }] of await currentTargetNotes(db, tenantId)) {
     if (!note) continue;
     const k = knowledgeAt(targetId, null);
@@ -96,6 +109,7 @@ export async function loadKnowledge(db: Tx | ReturnType<typeof getDb>, tenantId:
     k.aliases?.sort(cmpName);
     k.aliasesNeedReview?.sort(cmpName);
     k.subjects?.sort(cmpName);
+    k.termDefaults?.sort(cmpName);
     k.claims?.sort((a, b) => CLAIM_TYPE_ORDER.indexOf(a.type) - CLAIM_TYPE_ORDER.indexOf(b.type));
   }
   return { byTarget, staleNotes };
@@ -117,5 +131,6 @@ export const knowledgeMarkdown = (k: Knowledge | undefined, indent = ''): string
   ...(k?.aliases?.length ? [`${indent}- 别名：${k.aliases.map(aliasPhrase(k)).join('、')}`] : []),
   ...(k?.claims?.length ? [`${indent}- 口径：`, ...k.claims.map(c => `${indent}  - ${claimPhrase(c)}`)] : []),
   ...(k?.subjects?.length ? [`${indent}- 分析主题：${k.subjects.join('、')}`] : []),
+  ...(k?.termDefaults?.length ? [`${indent}- 词的默认指向：${k.termDefaults.join('、')}（默认指这一条）`] : []),
   ...(k?.note ? [`${indent}- 业务说明${k.noteNeedsReview ? '（待复核）' : ''}：${k.note}`] : []),
 ];
