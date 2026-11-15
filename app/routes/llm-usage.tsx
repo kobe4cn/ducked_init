@@ -92,7 +92,7 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
         </div>
       ) : (
         <>
-          <div className="grid grid-cols-2 lg:grid-cols-4">
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
             <StatTile label="总调用" value={n(usage.total.calls)} hint={`近 ${days} 天，全部用途`} />
             <StatTile label="总 token" value={n(usage.total.promptTokens + usage.total.completionTokens)}
               hint={`输入 ${n(usage.total.promptTokens)} · 输出 ${n(usage.total.completionTokens)}`} />
