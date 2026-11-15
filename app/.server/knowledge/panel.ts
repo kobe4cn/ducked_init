@@ -55,6 +55,8 @@ async function evidenceOf(member: CurrentMember, proposals: { evidence: Proposal
         ? { text: `源端注释${v}` }
         : { text: `源端注释 ${name} ${key}${v}`, href: `/sources/${id}#comment-${encodeURIComponent(key)}` };
     }
+    // 助手对话里的选择（⑥-4，ADR-0056 第⑤条：证据只记引用）：审核人读不了别人的对话（会 404），只说明来源、不给链接
+    if (e.ref.startsWith('assistant_conversation:')) return { text: '助手对话中的选择' };
     const href = sourceDocHref(e.ref, e.version);
     return { text: `${e.ref}${v}`, ...(href ? { href } : {}) };
   }));
