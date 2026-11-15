@@ -10,7 +10,7 @@ import { lakeRow } from './lake';
 import { deleteLakeFiles, isS3 } from './lake-storage';
 import { platformS3 } from './s3-accounts';
 import { putObject } from './s3-client';
-import { lockConfiguration, rows, uploadReader, type UploadReadOptions } from './pipeline/source-engine';
+import { lit, lockConfiguration, rows, uploadReader, type UploadReadOptions } from './pipeline/source-engine';
 import { columnType, SourceError } from './source-config';
 
 /** 上传的表名：会拼进文件路径与原始层表名，先校验再用，防路径穿越 */
@@ -88,8 +88,6 @@ export interface UploadPreview {
   rows: (string | null)[][];
 }
 
-const sqlLit = (s: string) => `'${s.replace(/'/g, "''")}'`;
-
 /**
  * 上传前预览（ADR-0037）：把（可能已转码的）文件写进本机临时目录，用进程内 DuckDB 识别分隔符、表头行与列类型，
  * 返回前 20 行。不建数据源、不写湖、不保存状态；临时目录在 finally 里删掉。
@@ -112,11 +110,11 @@ export async function previewUpload(bytes: Uint8Array, table: string, opts?: Upl
     await lockConfiguration(con, [`${dir}/`]);
     // 成员给的 delim / header / skip 也传给 sniff_csv：没给的按识别结果
     const sniffParams: string[] = [];
-    if (opts?.delim !== undefined) sniffParams.push(`delim=${sqlLit(opts.delim)}`);
+    if (opts?.delim !== undefined) sniffParams.push(`delim=${lit(opts.delim)}`);
     if (opts?.header !== undefined) sniffParams.push(`header=${opts.header ? 'true' : 'false'}`);
     if (opts?.skip !== undefined) sniffParams.push(`skip=${opts.skip}`);
     const [sniffed] = await rows<{ Delimiter: string; HasHeader: boolean; SkipRows: number }>(con,
-      `SELECT Delimiter, HasHeader, SkipRows FROM sniff_csv(${sqlLit(file)}${sniffParams.length ? `, ${sniffParams.join(', ')}` : ''})`);
+      `SELECT Delimiter, HasHeader, SkipRows FROM sniff_csv(${lit(file)}${sniffParams.length ? `, ${sniffParams.join(', ')}` : ''})`);
     const from = uploadReader(file, read);
     const described = await rows<{ column_name: string; column_type: string }>(con, `DESCRIBE SELECT * FROM ${from}`);
     // 不在白名单里的类型（如 TIME）按 VARCHAR 返回：options 只收白名单类型
