@@ -153,7 +153,9 @@ async function handle(page, state, req) {
     return {};
   }
   if (cmd === 'click') {
-    if (!req.role || !req.name) throw new Error('click requires --role and --name');
+    // --selector 点一个 CSS 控件。<summary> 的角色是 group，按按钮名点「声明业务主键」会超时。
+    if (req.selector && (req.role || req.name)) throw new Error('click --selector cannot be combined with --role or --name');
+    if (!req.selector && (!req.role || !req.name)) throw new Error('click requires --role and --name, or --selector');
     if (req.confirm != null && req.confirm !== 'accept' && req.confirm !== 'dismiss') {
       throw new Error('--confirm must be accept or dismiss');
     }
@@ -166,8 +168,11 @@ async function handle(page, state, req) {
       };
       page.once('dialog', onDialog);
     }
+    const target = req.selector
+      ? scope.locator(req.selector).first()
+      : scope.getByRole(req.role, { name: req.name, exact: true });
     try {
-      await scope.getByRole(req.role, { name: req.name, exact: true }).click();
+      await target.click();
     } finally {
       if (onDialog) page.off('dialog', onDialog);
     }
@@ -188,7 +193,7 @@ async function handle(page, state, req) {
   if (cmd === 'wait-text') {
     const text = req.positionals?.[0];
     if (!text) throw new Error('wait-text requires the text');
-    await page.getByText(text, { exact: true }).first().waitFor({ state: 'visible', timeout });
+    await scope.getByText(text, { exact: true }).first().waitFor({ state: 'visible', timeout });
     return {};
   }
   if (cmd === 'wait-url') {
@@ -257,7 +262,7 @@ async function handle(page, state, req) {
 
 function usage() {
   console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|scroll-y|scroll-into|magic-link> [args]`);
-  console.error('click accepts --confirm accept|dismiss for a window.confirm dialog');
+  console.error('click accepts --role and --name, or --selector <css>. --confirm accept|dismiss handles one window.confirm');
 }
 
 async function runClient() {
