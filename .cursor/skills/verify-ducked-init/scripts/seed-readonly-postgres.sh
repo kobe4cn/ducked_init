@@ -25,7 +25,11 @@ psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -tA -c "SELECT 1 FROM pg_database WHERE 
 }
 
 psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$DB_NAME\" OWNER crm"
-psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$ROLE\" LOGIN PASSWORD '$PASS'"
+if psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -tA -c "SELECT 1 FROM pg_roles WHERE rolname = '$ROLE'" | grep -q 1; then
+  psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -c "ALTER ROLE \"$ROLE\" WITH LOGIN PASSWORD '$PASS'"
+else
+  psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$ROLE\" LOGIN PASSWORD '$PASS'"
+fi
 
 # A connection URI plus -d makes this psql treat the URI as a username. Swap the database in the URI.
 ADMIN_DB_URL=${PG_ADMIN_URL%/*}/$DB_NAME
