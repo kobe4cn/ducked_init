@@ -180,3 +180,4 @@
 | `client-build.test.ts` | 真实客户端构建，兜底页面误引 `.server` 模块 |
 | `dev-server-typegen.test.ts` | #615：测试起的 dev 服务器（4 个并发）不删、不重写 `.react-router/types`（`REACT_ROUTER_SKIP_TYPEGEN` 补丁生效） |
 | `mailer.test.ts` / `totp.test.ts` | 发信、TOTP（纯函数） |
+| `model-prices.test.ts` | 运营后台模型单价页（#744，ADR-0057）：新增 / 修改各写一条平台级审计、同值保存（"3" 与 "3.0000"）no-op 不写审计；空模型名、负数、超 4 位小数、币种不在白名单 400 并显示错误；并发新增同名模型只剩一行、冲突转 400；成员会话被拒；`costOf` 折算纯函数（null token 按 0） |

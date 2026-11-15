@@ -48,6 +48,7 @@ export default [
   route('ops', 'routes/ops.tsx', [
     index('routes/ops.tenants.tsx'),
     route('tenants/:tenantId', 'routes/ops.tenant.tsx'),
+    route('model-prices', 'routes/ops.model-prices.tsx'),
     route('audit', 'routes/ops.audit.tsx'),
     route('login', 'routes/ops.login.tsx'),
     route('auth/verify', 'routes/ops.auth.verify.tsx'),

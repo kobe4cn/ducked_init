@@ -166,7 +166,7 @@ async function reset() {
       'SELECT kind, status, EXTRACT(EPOCH FROM finished_at - started_at) * 1000 AS ms FROM platform.tasks WHERE finished_at IS NOT NULL AND started_at IS NOT NULL');
     for (const t of tasks.rows) record(`task:${t.kind}`, Number(t.ms), { status: t.status });
   }
-  await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions, platform.tenant_lakes, platform.tasks, platform.lake_migrations CASCADE');
+  await client.query('TRUNCATE platform.tenants, platform.spaces, platform.members, platform.magic_links, platform.sessions, platform.magic_link_requests, platform.audit_logs, platform.operators, platform.operator_magic_links, platform.operator_sessions, platform.tenant_lakes, platform.tasks, platform.lake_migrations, platform.model_prices CASCADE');
   await client.end();
   // 共享桶里的前缀数据不清：租户 ID 每次不同，前缀不会重叠；桶租户的桶在上面已按租户删掉
   if (!process.env.PLATFORM_LAKE_URI!.startsWith('s3://')) await rm(process.env.PLATFORM_LAKE_URI!, { recursive: true, force: true });

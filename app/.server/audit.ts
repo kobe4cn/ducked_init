@@ -370,6 +370,19 @@ const ACTIONS = {
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },
   'operator.totp_reset': { label: '重置 TOTP', describe: (d: Detail) => `${d.email}` },
   'operator.logged_in': { label: '运营者登录', describe: (d: Detail) => `${d.email}` },
+  // 模型单价（ADR-0057）：平台级元数据；改动的前后值都记在 detail 里，以后要按调用时单价折算可从审计重建价格历史
+  'model_price.created': {
+    label: '新增模型单价',
+    describe: (d: Detail) => `${d.model}：输入 ${d.inputPerMTok}、输出 ${d.outputPerMTok} ${d.currency} / 百万 token`,
+  },
+  'model_price.updated': {
+    label: '修改模型单价',
+    describe: (d: Detail) => {
+      const from = d.from as { inputPerMTok: number; outputPerMTok: number; currency: string };
+      const to = d.to as { inputPerMTok: number; outputPerMTok: number; currency: string };
+      return `${d.model}：输入 ${from.inputPerMTok} → ${to.inputPerMTok}、输出 ${from.outputPerMTok} → ${to.outputPerMTok}（${from.currency} → ${to.currency}）`;
+    },
+  },
 } satisfies Record<string, { label: string; describe: (d: Detail) => string }>;
 export type AuditAction = keyof typeof ACTIONS;
 

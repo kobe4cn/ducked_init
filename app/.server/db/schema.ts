@@ -1,6 +1,6 @@
 // app/.server/db/schema.ts —— 平台元数据（平台 PostgreSQL 的 platform schema）。业务数据不落这里（ADR-0002）
 import { sql } from 'drizzle-orm';
-import { bigint, boolean, check, index, integer, jsonb, pgSchema, primaryKey, real, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, check, index, integer, jsonb, numeric, pgSchema, primaryKey, real, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import type { CustomEntityField, CustomEntityKind, EntityRelation } from '../../lib/canonical-model';
 import type { KnowledgeSourceKind } from '../../lib/knowledge-source';
 import type { MergeRule } from '../../lib/merge-groups';
@@ -740,6 +740,18 @@ export const llmCalls = platform.table('llm_calls', {
   error: text('error'),
   createdAt: createdAt(),
 }, t => [index('llm_calls_tenant_created_idx').on(t.tenantId, t.createdAt)]);
+
+// 模型单价（ADR-0057）：llm_calls.model 原值 → 每百万 token 的输入 / 输出单价，运营者在运营后台维护（ADR-0007）。
+// 金额按查看时的当前单价折算，不保留历史版本，每次改动的前后值在审计里；只能增改、不能删除
+export const modelPrices = platform.table('model_prices', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  model: text('model').notNull().unique(),
+  inputPerMTok: numeric('input_per_m_tok', { precision: 12, scale: 4 }).notNull(),
+  outputPerMTok: numeric('output_per_m_tok', { precision: 12, scale: 4 }).notNull(),
+  currency: text('currency').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedBy: uuid('updated_by'),
+}, t => [check('model_prices_currency', sql`${t.currency} in ('CNY', 'USD')`)]);
 
 // 映射草稿的生成记录（ADR-0035）：新建页「用模型生成草稿」每次成功生成一行。origin 是草稿从哪来：复用已发布映射（reuse）、
 // 没配置模型服务时按规则（rules）、模型（model），详情页用模型建议断言（assertions，只换了 assertions 块）；
