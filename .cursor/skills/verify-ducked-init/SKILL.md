@@ -243,7 +243,7 @@ Stable handles used by the map:
 - Tasks rows: `[data-task-kind]` and `[data-task-status]`.
 - Model provider: nav `模型服务`, path `/model-provider`, heading `模型服务`, button `测试连通性`, button `恢复平台默认`, button `恢复默认`. `端点`, `模型名`, `API Key`, and `保存` repeat across cards. Scope them with `--within 'form:has(#...)'`. `恢复默认` and `恢复平台默认` need `--confirm accept`. After a save or a reset, read the inputs with `value --label`. A successful save leaves `API Key` empty. A 400 from `set-hidden` on `tier` leaves the typed draft in place.
 - LLM usage: nav `模型调用` (immediately after `模型服务`, admin only), path `/llm-usage`, heading `模型调用`, links `近 7 天` and `近 30 天`. Purpose rows are `[data-purpose="<purpose>"]`, the totals row is `[data-purpose="total"]`, and the pager text is `第 N / M 页，每页 50 条`. A denied role sees `无权访问` and `仅管理员可以配置模型服务`. `wait-text` is exact, so the empty state is the whole sentence ending in `测试一次连通性。`.
-- Assistant: button `AI 助手` (it toggles the panel), textarea label `向 AI 助手提问`, button `发送`.
+- Assistant: button `AI 助手` (it toggles the panel), textarea label `向 AI 助手提问`, button `发送`. Candidate buttons use `[data-choice]`, the group is `[data-choices]`, and the confirm card is `[data-ask-card]` with buttons `记为知识提案` and `不用`. `scripts/llm-stub.mjs` never calls `catalog_search`, and `browser.mjs` does not record requests, so that path is [记为知识提案](features/assistant-knowledge.md): a temporary stub, a temporary seed, and a temporary request log. The history row's accessible name includes the owner and the timestamp.
 
 The members journey, including login, invite, audit, SQL, the console mail, logout, and a second login as the invitee:
 
