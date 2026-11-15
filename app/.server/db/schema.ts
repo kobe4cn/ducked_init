@@ -46,6 +46,8 @@ export const tenants = platform.table('tenants', {
 // catalog_initialized_at 为空表示 DuckLake 元数据表尚未建好（开通时初始化失败），此时不派发任务。
 // ro_* 是数据查询工作台用的只读凭据（ADR-0036）：对 catalog 的表只有 SELECT 的数据库角色，与只能读、列出本租户前缀的
 // 对象存储账号。为空表示还没建好（本功能上线前开通的租户），第一次执行工作台查询时补建
+// storage_used_bytes / storage_measured_at：调度器定期统计的桶总用量（字节）与统计时间（ADR-0008）。
+// measured_at 兼作统计的抢占锁，为空或过 10 分钟表示待统计（storage-quota.ts）；用量存 PG 不放内存，后续拦截上传也要读
 export const tenantLakes = platform.table('tenant_lakes', {
   tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
   dataPath: text('data_path').notNull(),
@@ -59,6 +61,8 @@ export const tenantLakes = platform.table('tenant_lakes', {
   roS3AccessKey: text('ro_s3_access_key'),
   roS3SecretKey: text('ro_s3_secret_key'),
   catalogInitializedAt: timestamp('catalog_initialized_at', { withTimezone: true }),
+  storageUsedBytes: bigint('storage_used_bytes', { mode: 'number' }),
+  storageMeasuredAt: timestamp('storage_measured_at', { withTimezone: true }),
   createdAt: createdAt(),
 });
 
