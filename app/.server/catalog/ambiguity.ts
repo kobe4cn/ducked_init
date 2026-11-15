@@ -2,6 +2,7 @@
 // 同类候选（指标和指标、字段和字段）按这个词分组，逐维度对比口径（指标：度量、粒度、窗口、时间字段、过滤、口径声明；字段：粒度）。
 // 先做点名排除（「成员明确说的永远不被覆盖」）：查询里点到的粒度、时间字段、过滤取值只留取值被点名的候选；再判定：
 // 剩 1 个或各维度都相同（只是重名）不歧义，否则只有得分拉开且口径声明完全一致、不含未知时不追问；投影回退（得分全为 0）一律按差异追问。
+// 本来要追问的组先看「词的默认指向」（ADR-0056）：候选里恰好一个是这个词的有效默认（knowledge.termDefaults，不分大小写）就不追问、记进 defaults，点名 > 默认 > 追问。
 // 查询里的词按最长匹配认：被更长的词覆盖的出现不算（「订单明细」里的「订单」、「触达渠道」里的「渠道」）。纯函数，只用传进来的目录，不读库
 import { CLAIM_TYPE_ORDER, claimTypeLabel, claimValueLabel, type ClaimType } from '../../lib/semantic-claims';
 import type { Catalog, CatalogEntry, FieldEntry, MetricEntry } from './index';
@@ -20,8 +21,12 @@ export interface AmbiguityGroup {
   /** 每个不同的维度一句追问 */
   questions: string[];
 }
-/** groups 只列判为歧义的组 */
-export interface Ambiguity { ambiguous: boolean; groups: AmbiguityGroup[] }
+/** groups 只列判为歧义的组；defaults 是按「词的默认指向」处理掉、没有追问的组（词与默认条目） */
+export interface Ambiguity {
+  ambiguous: boolean;
+  groups: AmbiguityGroup[];
+  defaults: { term: string; entryId: string }[];
+}
 
 const DIMENSION_LABEL: Record<Dimension, string> = {
   measure: '度量', grain: '粒度', window: '窗口', timeField: '时间字段', filter: '过滤', claims: '口径声明',
@@ -132,6 +137,7 @@ export function judgeAmbiguity(ranked: Ranked[], c: Catalog, query: string): Amb
   }
 
   const out: AmbiguityGroup[] = [];
+  const defaults: Ambiguity['defaults'] = [];
   let ambiguous = false;
   for (const { term, members } of groups.values()) {
     if (members.length < 2) continue;
@@ -170,11 +176,19 @@ export function judgeAmbiguity(ranked: Ranked[], c: Catalog, query: string): Amb
       && !claimTypes.length && factsLeft.every(([, f]) => ![...f.claims.values()].includes('unknown'));
     if (settled) continue;
 
+    // 词的默认指向（ADR-0056）：这个组本来要追问时才看默认——left 里恰好一个候选带这个词的有效默认就不追问、按默认条目处理；
+    // 零个或多个（数据错误）照常追问。默认条目被点名排除后不在 left 里，自然走原逻辑。一定不分大小写比较（组的 term 取候选原文，默认存的是提案时的大小写）
+    const withDefault = left.filter(r => r.entry.knowledge?.termDefaults?.some(t => t.toLowerCase() === term.toLowerCase()));
+    if (withDefault.length === 1) {
+      defaults.push({ term, entryId: withDefault[0]!.entry.id });
+      continue;
+    }
+
     ambiguous = true;
     out.push({
       term, candidates: left.map(r => r.entry.id), diffs,
       questions: diffs.map(d => DIMENSION_QUESTION[d.dimension].replace('{term}', term).replace('{values}', [...new Set(Object.values(d.values))].join('还是'))),
     });
   }
-  return { ambiguous, groups: out };
+  return { ambiguous, groups: out, defaults };
 }

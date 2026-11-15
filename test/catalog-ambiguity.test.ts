@@ -1,6 +1,7 @@
 // test/catalog-ambiguity.test.ts —— 歧义判定 judgeAmbiguity()（ADR-0047，#384 方案 A）：纯函数，手工构造 CatalogInput（标准实体自带字段名称）。
 // 同一个别名「营收」挂在几个指标上：只是时间字段不同时只列时间字段、追问按哪个时间算；查询点名「支付时间」后只剩一个；「订单明细」按最长匹配、不算「订单」；
-// 过滤留取值包含全部被点名取值的；口径完全一致（只是重名）不歧义；得分拉开且口径声明一致、不含未知时不追问，含未知或没拉开时追问；得分全为 0（投影回退）按差异追问
+// 过滤留取值包含全部被点名取值的；口径完全一致（只是重名）不歧义；得分拉开且口径声明一致、不含未知时不追问，含未知或没拉开时追问；得分全为 0（投影回退）按差异追问。
+// 词的默认指向（ADR-0056）：本来要追问的组里恰好一个候选带这个词的有效默认时不追问、记进 defaults；点名排除了默认条目时不记；两个候选都带（数据错误）照常追问
 import { describe, expect, it } from 'vitest';
 import { buildCatalog, type CatalogInput } from '../app/.server/catalog';
 import { SCORE_GAP, judgeAmbiguity } from '../app/.server/catalog/ambiguity';
@@ -20,11 +21,13 @@ const yaml = {
 };
 type Key = keyof typeof yaml;
 
-/** keys 里的指标都挂别名「营收」；claims 给了的按类型覆盖系统口径声明 */
-function catalogOf(defs: [string, Key][], claims?: Claim[]) {
+/** keys 里的指标都挂别名「营收」（alias 可换）；claims 给了的按类型覆盖系统口径声明；termDefaults 给某个 key 加词的默认指向 */
+function catalogOf(defs: [string, Key][], claims?: Claim[], termDefaults?: Record<string, string[]>, alias = '营收') {
   const input: CatalogInput = {
     definitions: defs.map(([key, y]) => ({ kind: 'metric' as const, key, version: 1, yaml: yaml[y], spaceId: SPACE })),
-    knowledge: { byTarget: new Map(defs.map(([key]) => [`metric:${key}`, { aliases: ['营收'], ...(claims && { claims }) }])) },
+    knowledge: { byTarget: new Map(defs.map(([key]) => [`metric:${key}`, {
+      aliases: [alias], ...(claims && { claims }), ...(termDefaults?.[key] && { termDefaults: termDefaults[key] }),
+    }])) },
   };
   return buildCatalog(input);
 }
@@ -56,7 +59,7 @@ describe('歧义判定 judgeAmbiguity()', () => {
 
   it('点名「支付时间」：只留时间字段是支付时间的候选，剩一个不歧义', () => {
     const q = '近 30 天按支付时间算的营收';
-    expect(judgeAmbiguity(ranked(byTime, q), byTime, q)).toEqual({ ambiguous: false, groups: [] });
+    expect(judgeAmbiguity(ranked(byTime, q), byTime, q)).toEqual({ ambiguous: false, groups: [], defaults: [] });
   });
 
   it('粒度按最长匹配：「订单明细」只留订单明细上的，里面的「订单」不算；单说「订单」只留订单上的', () => {
@@ -80,7 +83,7 @@ describe('歧义判定 judgeAmbiguity()', () => {
 
   it('口径完全一致（只是重名）不歧义', () => {
     const c = catalogOf([['rev_a', 'order_paid'], ['rev_b', 'order_paid']]);
-    expect(judgeAmbiguity(ranked(c, '营收'), c, '营收')).toEqual({ ambiguous: false, groups: [] });
+    expect(judgeAmbiguity(ranked(c, '营收'), c, '营收')).toEqual({ ambiguous: false, groups: [], defaults: [] });
   });
 
   it(`得分拉开（≥ SCORE_GAP = ${SCORE_GAP}）且口径声明一致、不含未知时不追问；没拉开时追问`, () => {
@@ -95,11 +98,33 @@ describe('歧义判定 judgeAmbiguity()', () => {
     expect(judgeAmbiguity(scored(byTime, { 'metric:rev_a': 0.05, 'metric:rev_b': 0.01 }), byTime, '营收').ambiguous).toBe(true);
   });
 
+  it('词的默认指向（ADR-0056）：本来要追问的组里恰好一个候选带这个词的有效默认时不追问，记进 defaults', () => {
+    const c = catalogOf([['rev_a', 'item_by_order_time'], ['rev_b', 'item_by_paid_time']], undefined, { rev_a: ['营收'] });
+    expect(judgeAmbiguity(ranked(c, '营收'), c, '营收')).toEqual({
+      ambiguous: false, groups: [], defaults: [{ term: '营收', entryId: 'metric:rev_a' }],
+    });
+  });
+
+  it('点名排除了默认条目时按点名处理，不使用默认、不记 defaults', () => {
+    const c = catalogOf([['rev_a', 'item_by_order_time'], ['rev_b', 'item_by_paid_time']], undefined, { rev_a: ['营收'] });
+    const q = '近 30 天按支付时间算的营收';
+    expect(judgeAmbiguity(ranked(c, q), c, q)).toEqual({ ambiguous: false, groups: [], defaults: [] });
+  });
+
+  it('两个候选都带同一个词的默认（数据错误）照常追问；默认词不分大小写', () => {
+    const both = catalogOf([['rev_a', 'item_by_order_time'], ['rev_b', 'item_by_paid_time']], undefined, { rev_a: ['营收'], rev_b: ['营收'] });
+    expect(judgeAmbiguity(ranked(both, '营收'), both, '营收')).toEqual({ ambiguous: true, groups: [expect.any(Object)], defaults: [] });
+    const c = catalogOf([['rev_a', 'item_by_order_time'], ['rev_b', 'item_by_paid_time']], undefined, { rev_a: ['GMV'] }, 'gmv');
+    expect(judgeAmbiguity(ranked(c, 'GMV'), c, 'GMV')).toEqual({
+      ambiguous: false, groups: [], defaults: [{ term: 'gmv', entryId: 'metric:rev_a' }],
+    });
+  });
+
   it('得分全为 0（投影回退）时按差异追问；只有依赖展开理由的条目不参与分组', () => {
     const c = catalogOf([['rev_a', 'item_by_order_time'], ['rev_b', 'item_by_paid_time']], KNOWN);
     const zero = scored(c, { 'metric:rev_a': 0, 'metric:rev_b': 0 });
     expect(judgeAmbiguity(zero, c, '营收').ambiguous).toBe(true);
     const expandOnly = zero.map((r, i) => (i === 1 ? { ...r, reasons: [{ lane: 'expand' as const, matched: [] }] } : r));
-    expect(judgeAmbiguity(expandOnly, c, '营收')).toEqual({ ambiguous: false, groups: [] });
+    expect(judgeAmbiguity(expandOnly, c, '营收')).toEqual({ ambiguous: false, groups: [], defaults: [] });
   });
 });
