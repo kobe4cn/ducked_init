@@ -68,13 +68,13 @@ export async function loader({ request }: Route.LoaderArgs) {
     let conversation: ConversationView | undefined;
     if (id) {
       const read = await readConversation(member, id);
-      // 只有对话里有 plan、歧义候选或「记为知识提案」卡片时才查目录（每个请求一次），卡片与候选都按读者自己的目录组装：本人和被分享人看到的可以不同（ADR-0005）；
+      // 只有对话里有 plan 或歧义候选时才查目录（每个请求一次；「记为知识提案」卡片由 askCardFor 自己查），卡片与候选都按读者自己的目录组装：本人和被分享人看到的可以不同（ADR-0005）；
       // 读回只给 planCard、不给原始 plan（#539：plan.excluded 里有读者看不到的条目 id，比如自带数据源名的 table:…，不能经它泄露），
       // 候选同样只给过滤后的视图：存着的候选 id 列表不进响应
       // 「记为知识提案」卡片（⑥-4）：点选候选的那条 user 消息带 chosen，卡片加在它后面那条 assistant 消息上，读时计算、不存库
       // （审核状态变了，读回跟着变）；只给本人组装——被分享人只读，不能替主人提提案
       const chosenBefore = (i: number) => (read.owned ? read.messages[i - 1]?.chosen : undefined);
-      const catalog = read.messages.some((m, i) => m.plan || m.choices || chosenBefore(i) !== undefined) ? await catalogFor(member) : null;
+      const catalog = read.messages.some(m => m.plan || m.choices) ? await catalogFor(member) : null;
       conversation = {
         ...read,
         messages: await Promise.all(read.messages.map(async ({ plan, choices, ...m }, i) => {

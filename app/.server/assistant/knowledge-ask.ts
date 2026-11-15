@@ -27,7 +27,7 @@ export async function proposalBlock(tenantId: string, term: string, entryId: str
     if (p.kind !== 'term_default') continue;
     // kind 与 content 的对应在 proposeKnowledge 写入时已校验，表列类型表达不了，这里按它收窄
     const { term: existing } = p.content as ProposalContentOf['term_default'];
-    if (existing.toLowerCase() === term.toLowerCase()) return '这个词已有待复核的默认指向提案';
+    if (existing.toLowerCase() === term.trim().toLowerCase()) return '这个词已有待复核的默认指向提案';
   }
   // 指纹与 proposeKnowledge 内部同口径：内容先经种类的规范化（trim），依据现算
   const basedOn = await basisOf(db, tenantId, entryId, null);
