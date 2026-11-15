@@ -2,12 +2,11 @@
 // 不参与匹配的哈希（exclude），撞号加盐与老湖播种（ADR-0019）
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import type { Tx } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { excludeValue, includeValue } from '../../app/.server/identity-exclusions';
-import { enqueueMerge, mergeNow } from '../../app/.server/merges';
+import { latestIdentitySummary, mergeNow } from '../../app/.server/merges';
 import { syncSource } from '../../app/.server/source-sync';
 import { resolveIdentities } from '../../app/.server/pipeline/identity-engine';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -17,7 +16,7 @@ import { resetDb } from '../http/harness';
 import { drain, runTask } from './fixtures';
 import { CRM, publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
-import { type Identity, identities, lastMerge, republish } from './identity-helpers';
+import { fakeHot, type Identity, identities, lastMerge, republish } from './identity-helpers';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -286,14 +285,20 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     /** 共用这个哈希的源记录分在几个统一消费者里 */
     const sharingGroups = async () => new Set((await identities(acme)).rows.filter(r => sharing.includes(`${r._source}:${r.customer_id}`)).map(r => r.consumer_id)).size;
     expect(await sharingGroups()).toBe(1);
-    /** 在一个事务里改排除列表并入队合并，跑空调度器，返回这次合并 */
-    const mark = async (change: (tx: Tx) => Promise<boolean>) => {
-      await getDb().transaction(async tx => { expect(await change(tx)).toBe(true); expect(await enqueueMerge(tx, acme)).not.toBeNull(); });
+    // 只能标记最近一次打通任务的 hot 里有的哈希（记录数也取自那里）：夹具没留下成功的打通任务时先合并一次，再直接改它的结果造出 hot
+    if (!(await latestIdentitySummary(acme))) {
+      await mergeNow(author);
+      await drain();
+    }
+    await fakeHot(acme, [{ rule: 'phone', hash, records: sharing.length, sources: [...new Set(sharing.map(w => w.split(':')[0]))] }]);
+    /** 改排除列表（excludeValue / includeValue 自己入队合并），跑空调度器，返回这次合并 */
+    const mark = async (change: () => Promise<void>) => {
+      await change();
       await drain();
       return lastMerge(acme);
     };
 
-    const excluded = await mark(tx => excludeValue(tx, acme, author, hash, sharing.length));
+    const excluded = await mark(() => excludeValue(author, hash));
     expect(excluded).toMatchObject({ status: 'succeeded', params: { identityExclude: [hash], identityForce: true } });
     expect(excluded.result.identities).not.toHaveProperty('skipped');
     expect(await sharingGroups()).toBeGreaterThan(1);
@@ -304,7 +309,7 @@ describe('身份打通：统一消费者 ID 分配后固定', () => {
     expect(unchanged.params).toMatchObject({ identityExclude: [hash], identityForce: false });
     expect(unchanged.result.identities).toMatchObject({ skipped: expect.any(String) });
 
-    const included = await mark(tx => includeValue(tx, acme, author, hash));
+    const included = await mark(() => includeValue(author, hash));
     expect(included).toMatchObject({ status: 'succeeded', params: { identityExclude: [], identityForce: true } });
     expect(await sharingGroups()).toBe(1);
   });

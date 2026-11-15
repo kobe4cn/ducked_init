@@ -127,6 +127,7 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 | `consumerConsent(con, sourceId, customerId)` | 某条源记录所属统一消费者在 `silver._consumer_consent` 里的各渠道状态与来源 |
 | `groupsOf(rows, names)` | 按统一消费者分组成「数据源名:customer_id」列表，便于整体比较 |
 | `lastMerge(tenantId)` | 本租户最近一次 `silver.merge` 任务 |
+| `fakeHot(tenantId, hot)` | 直接改最近一次打通任务的结果造出 hot（最近一次打通任务要先存在，没有时先合并一次） |
 | `republish(author, reviewer, mappingId, yaml)` | 存一版新草稿、另一位成员发布并跑空调度器 |
 | `SEEDED` / `Identity` / `DeviceOwner` | 种子里的明文（断言表里没有明文）、行类型 |
 
