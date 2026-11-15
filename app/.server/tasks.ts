@@ -7,6 +7,7 @@ import { TASK_STATUSES, tasks, tenantLakes, tenants, type TaskStatus } from './d
 import { lakeSpecOf } from './lake';
 import { tenantPiiSalt, tenantServingKey } from './secrets';
 import { loadSourceSpec, SourceError } from './source-config';
+import { storageOverQuota } from './storage-quota';
 import { CONTRACTS, isTaskKind, type InputOf, type ParamsOf, type TaskContract, type TaskKind } from './pipeline/task-contracts';
 import type { WorkerInput, WorkerOutcome } from './pipeline/worker';
 
@@ -113,7 +114,7 @@ export async function lockClaims(tx: Tx) {
 /**
  * 领取下一个任务并标为运行中，按契约声明的 needs 准备凭据（都不写进任务记录）：声明源连接的任务解密该数据源的凭据
  * 交给工作进程，声明盐的任务派生租户的敏感信息盐，声明密钥的任务派生服务库密钥。数据源已不存在或凭据、盐、密钥无法取得时，
- * 该任务直接记为失败，接着领取下一个。
+ * 该任务直接记为失败，接着领取下一个。租户存储超额（软配额，ADR-0008）时未声明 allowOverStorageQuota 的任务同样直接记为失败。
  */
 export async function claimNextTask(): Promise<ClaimedTask | null> {
   for (;;) {
@@ -121,6 +122,15 @@ export async function claimNextTask(): Promise<ClaimedTask | null> {
     if (!task) return null;
     // 队列里可能有旧数据的未知 kind：没有契约就不准备任何凭据（经接口类型读 needs，字面量联合上直接取可选项编译不过）
     const contract: TaskContract<unknown, unknown> | undefined = isTaskKind(task.kind) ? CONTRACTS[task.kind] : undefined;
+    // 超额时不拦入队也不跳过（同一租户先进先出，跳过会让写入任务卡住后面的清理任务），领取时逐个记为失败
+    if (!contract?.allowOverStorageQuota) {
+      const over = await storageOverQuota(task.tenantId);
+      if (over) {
+        console.warn(`[调度器] 任务 ${task.id}（${task.kind}）失败：${over}`);
+        await finishTask(task.id, { error: over });
+        continue;
+      }
+    }
     const needs = contract?.needs;
     let reading = '数据源的凭据';
     try {

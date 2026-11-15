@@ -1,12 +1,13 @@
 // test/pipeline/storage-usage.test.ts —— 租户桶用量统计接缝：调度器 refreshStorageUsage（ADR-0008、ADR-0007）
 // → 对数据湖已初始化、用量为空或统计已过 10 分钟的租户，按 tenant_lakes 当前 data_path 用平台账号列出桶内
-// 全部文件求和写回 storage_used_bytes；storage_measured_at 同时是统计的抢占锁（多个调度器不重复统计）
+// 全部文件求和写回 storage_used_bytes；storage_measured_at 同时是统计的抢占锁（多个调度器不重复统计）。
+// storageOverQuota 是写入拦截（写入类任务的领取、上传登记）共用的超额判断
 import { sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { lakeRow } from '../../app/.server/lake';
 import { listLakeFiles } from '../../app/.server/lake-storage';
-import { refreshStorageUsage } from '../../app/.server/storage-quota';
+import { refreshStorageUsage, storageOverQuota } from '../../app/.server/storage-quota';
 import { resetDb } from '../http/harness';
 import { newTenant, runTask } from './fixtures';
 
@@ -62,6 +63,20 @@ describe('调度器统计租户桶用量', () => {
     const lake = (await lakeRow(acme))!;
     expect(lake.storageUsedBytes).toBeGreaterThan(0);
     expect(lake.storageMeasuredAt).not.toBeNull();
+  });
+});
+
+describe('storageOverQuota（超额判断，ADR-0008）', () => {
+  it('未统计或等于配额返回 null；超额返回写明已用与配额的报错（已用向上取整 MB）', async () => {
+    const acme = await newTenant('acme');
+    // 默认配额 10240 MB；没有湖行的租户（未统计）同样不拦
+    expect(await storageOverQuota(acme)).toBeNull();
+
+    await getDb().execute(sql`UPDATE platform.tenant_lakes SET storage_used_bytes = 10240::bigint * 1048576 WHERE tenant_id = ${acme}`);
+    expect(await storageOverQuota(acme)).toBeNull();
+
+    await getDb().execute(sql`UPDATE platform.tenant_lakes SET storage_used_bytes = 10240::bigint * 1048576 + 1 WHERE tenant_id = ${acme}`);
+    expect(await storageOverQuota(acme)).toBe('租户存储已超出配额（已用 10241 MB / 配额 10240 MB）');
   });
 });
 

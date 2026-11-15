@@ -16,7 +16,7 @@
 
 **Excel 用 DuckDB 的 `excel` 扩展。** `read_xlsx` 读第一个工作表，与 httpfs、postgres 等扩展一样运行时 `INSTALL excel; LOAD excel;`（在 `lockConfiguration` 之前），部署环境要能联网安装扩展。Parquet 用 `read_parquet`，列类型取文件自带的，不做编码与分隔符选项。同一个数据源里每个文件按扩展名选读取函数。
 
-**大小上限按租户配额。** 租户配额加「单个上传文件大小上限」（`maxUploadMb`，默认 100 MiB）。`request.formData()` 会把整个请求体读进内存，所以先看 `Content-Length`，超了直接拒绝、不读请求体；再在读的过程中计数，超过即中止。被拒的文件不写入湖、不登记。
+**大小上限按租户配额。** 租户配额加「单个上传文件大小上限」（`maxUploadMb`，默认 100 MiB）。`request.formData()` 会把整个请求体读进内存，所以先看 `Content-Length`，超了直接拒绝、不读请求体；再在读的过程中计数，超过即中止。被拒的文件不写入湖、不登记。除单文件上限外，租户桶总用量超额时上传同样被拒（413，ADR-0008）。
 
 **不算水位线候选。** 上传源每次都是整份文件，`profileSource` 对 upload 不算水位线候选，否则「修改时间」之类的列会让表卡在「待确认」。没有水位线的表本来就是全量比对（ADR-0010）。
 
