@@ -30,6 +30,22 @@ describe('Sandcastle 指引里要改的文件 changedFiles', () => {
     ]);
   });
 
+  it('只追加的索引文件不算冲突：与代码文件并列时被过滤，全是它们时为空且不走兜底，兜底分支同样过滤', () => {
+    const body = guide([
+      '- **Change**: `app/.server/a.ts:10-20`：改这里。',
+      '- **Change**（各追加一行，冲突交给 rebase）：',
+      '  - `test/CATALOG.md`：加一行。',
+      '  - `test/README.md`：补一节。',
+      '  - `CONTEXT.md`：补一条。',
+      '  - `docs/adr/README.md`：索引加一行。',
+    ].join('\n'));
+    expect(changedFiles(body)).toEqual({ files: ['app/.server/a.ts'], fallback: false });
+    // 有 Change 行就不走兜底（判断用过滤前的集合），哪怕全是索引文件
+    expect(changedFiles(guide('- **Change**: `test/CATALOG.md`：加一行。'))).toEqual({ files: [], fallback: false });
+    // 兜底分支同样过滤
+    expect(changedFiles(guide('- `test/README.md:12`：补一节。'))).toEqual({ files: [], fallback: false });
+  });
+
   it('一条 Change 都没有时兜底取 `path:行号` 引用（跳过 New / Reuse / ADRs / Tests），并标记 fallback', () => {
     const body = guide([
       '- `vitest.config.ts:55-57`：两项超时乘倍数。',
