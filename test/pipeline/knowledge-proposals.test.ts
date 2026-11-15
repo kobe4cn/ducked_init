@@ -320,21 +320,22 @@ describe('知识提案', () => {
     const { acme, reviewer, analyst, viewer } = await setup();
     await createDefinition(analyst, 'metric', 'revenue_365d', 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 近一年营收\n');
     await publishDefinition(reviewer, 'metric', 'revenue_365d', 1);
-    await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: '营收' });
-    await addAlias(analyst, { targetId: 'metric:revenue_365d', alias: '营收' });
-    const first = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: '营收' } }))!;
-    const second = (await propose(acme, { targetId: 'metric:revenue_365d', kind: 'term_default', content: { term: '营收' } }))!;
+    // 两个目标上的同一个词只差大小写：先接受 Revenue → paid_revenue，再接受 revenue → revenue_365d
+    await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: 'Revenue' });
+    await addAlias(analyst, { targetId: 'metric:revenue_365d', alias: 'revenue' });
+    const first = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'Revenue' } }))!;
+    const second = (await propose(acme, { targetId: 'metric:revenue_365d', kind: 'term_default', content: { term: 'revenue' } }))!;
 
     const a = await expectBump(acme, 'term_default.set', () => acceptProposal(analyst, first.id));
     expect(a).toMatchObject({ status: 'accepted', reviewedByEmail: 'an@acme.com', acceptedRef: expect.any(String) });
     const defaults = () => getDb().select().from(knowledgeTermDefaults).where(eq(knowledgeTermDefaults.tenantId, acme));
     expect(await defaults()).toHaveLength(1);
-    expect((await defaults())[0]).toMatchObject({ term: '营收', targetId: 'metric:paid_revenue', createdByEmail: 'an@acme.com', retiredAt: null });
+    expect((await defaults())[0]).toMatchObject({ term: 'Revenue', targetId: 'metric:paid_revenue', createdByEmail: 'an@acme.com', retiredAt: null });
     const [audit] = await getDb().select().from(auditLogs)
       .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'term_default.set')));
-    expect(audit).toMatchObject({ targetType: 'knowledge', targetId: (await defaults())[0]!.id, detail: { term: '营收', targetId: 'metric:paid_revenue' } });
+    expect(audit).toMatchObject({ targetType: 'knowledge', targetId: (await defaults())[0]!.id, detail: { term: 'Revenue', targetId: 'metric:paid_revenue' } });
 
-    // 同一个词（不分大小写）已有有效默认时停用旧的、换成新的，审计带上被替换的目标
+    // 同一个词（不分大小写：revenue 与 Revenue）已有有效默认时停用旧的、换成新的，审计带上被替换的目标
     const b = await expectBump(acme, 'term_default.set', () => acceptProposal(analyst, second.id));
     const rows = await defaults();
     expect(rows).toHaveLength(2);
@@ -343,9 +344,9 @@ describe('知识提案', () => {
     expect(b.acceptedRef).toBe(rows.find(r => r.targetId === 'metric:revenue_365d')!.id);
     const replaced = await getDb().select().from(auditLogs)
       .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'term_default.set'), eq(auditLogs.targetId, b.acceptedRef!)));
-    expect(replaced[0]).toMatchObject({ detail: { term: '营收', targetId: 'metric:revenue_365d', replaced: 'metric:paid_revenue' } });
+    expect(replaced[0]).toMatchObject({ detail: { term: 'revenue', targetId: 'metric:revenue_365d', replaced: 'metric:paid_revenue' } });
     // listTermDefaults 只给有效的默认（给歧义判定读用）
-    expect(await listTermDefaults(getDb(), acme)).toEqual([expect.objectContaining({ term: '营收', targetId: 'metric:revenue_365d', retiredAt: null })]);
+    expect(await listTermDefaults(getDb(), acme)).toEqual([expect.objectContaining({ term: 'revenue', targetId: 'metric:revenue_365d', retiredAt: null })]);
 
     // 不能改值接受（改 term 等于换了个词，面板不渲染入口，这里挡住直接提交）；查看者 403
     const third = (await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'paid_revenue' } }))!;
