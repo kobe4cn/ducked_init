@@ -22,10 +22,18 @@ const firstPath = (text: string) => {
 };
 
 /**
+ * 只追加的索引文件：几张票同时往末尾追加行也不会真冲突（rebase-prompt.md 已写明两边都保留），
+ * 不拿来判断「两张票改同一个文件」。曾经因为 `test/CATALOG.md` 几乎每张加测试的票都改，
+ * 这类票只能一张接一张做，两个空位经常只用上一个（2026-11 #732）。
+ */
+export const APPEND_ONLY = new Set(["test/CATALOG.md", "test/README.md", "CONTEXT.md", "docs/adr/README.md"]);
+
+/**
  * 指引里要改的已有文件（去掉 `:行号`），两种写法都认：
  * - `- **Change**: \`path:行\` …`，一行一个文件（括号说明、全角冒号也行）；
  * - `- **Change**（说明）：` 下面缩进的子条目，每条开头一个 \`path:行\`。
  * `fallback` 是指引里一条 Change 都没有时的兜底：取除 New / Reuse / ADRs / Tests 之外各条里的 \`path:行号\` 引用。
+ * 只追加的索引文件（APPEND_ONLY）不算：有 Change 行就不走兜底（哪怕全是索引文件），返回的数组里也过滤掉。
  * 宁可多认（多排队）也不漏认（两张并行的票改同一个文件，到合并才冲突）。
  */
 export const changedFiles = (body: string): { files: string[]; fallback: boolean } => {
@@ -46,7 +54,7 @@ export const changedFiles = (body: string): { files: string[]; fallback: boolean
       if (p) files.add(p);
     } else changeIndent = undefined;
   }
-  if (files.size > 0) return { files: [...files], fallback: false };
+  if (files.size > 0) return { files: [...files].filter((p) => !APPEND_ONLY.has(p)), fallback: false };
 
   let skip = false;
   for (const line of lines) {
@@ -58,7 +66,8 @@ export const changedFiles = (body: string): { files: string[]; fallback: boolean
       if (p) files.add(p);
     }
   }
-  return { files: [...files], fallback: files.size > 0 };
+  const claimed = [...files].filter((p) => !APPEND_ONLY.has(p));
+  return { files: claimed, fallback: claimed.length > 0 };
 };
 
 /** 去掉括号（全角、半角）里的说明，比如「（原为 #472，已拆票）」「(#267 已拆分)」。 */
