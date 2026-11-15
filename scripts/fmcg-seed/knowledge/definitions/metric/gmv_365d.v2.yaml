@@ -1,0 +1,6 @@
+# gmv_365d 第 2 版：窗口改按支付时间。发布后它的别名、业务说明与口径声明转为「待复核」（ADR-0046），见验收计划 SK.17。
+base: order
+measure: { agg: sum, field: amount }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed, refunded] }
+window: { field: paid_at, days: 365 }
