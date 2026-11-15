@@ -101,6 +101,9 @@ async function readLimitedForm(request: Request, maxBytes: number): Promise<Form
   }
 }
 
+/** 没给 delim 时 DuckDB read_csv 自动识别的分隔符 */
+const SNIFFED_DELIMS = [',', ';', '\t', '|'];
+
 /**
  * 文件上传数据源（ADR-0037）：先校验文件与表名，把文件写进服务端生成的上传目录（登记时要列出这张表），再登记。
  * 登记失败（含探测失败）时删掉目录，不留文件
@@ -113,12 +116,16 @@ async function registerUpload(member: CurrentMember, input: SourceInput, file: F
   // 读取选项先校验（此时还没写文件）；指定了编码就只按那一种解码，失败 400，不退回自动识别（ADR-0037）
   const opts = parseUploadOptions(input.options, table)?.[table];
   const { text, encoding } = decodeUpload(new Uint8Array(await file.arrayBuffer()), opts?.encoding);
-  // 带 columns 时按选项核对文件的列数：登记的探测不读行，列数不符在这里拦下（否则要到首次同步才失败）
+  // 带 columns 时按选项核对文件的列数：登记的探测不读行，列数不符在这里拦下（否则要到首次同步才失败）。
+  // 没给 delim 时 DuckDB 仍自动识别分隔符，按它会识别的几种分别数，任一种对上就放行
   if (opts?.columns) {
     const expected = Object.keys(opts.columns).length;
     const firstRow = text.split(/\r?\n/).slice(opts.skip ?? 0).find(l => l.trim() !== '');
-    const found = firstRow ? csvFieldCount(firstRow, opts.delim ?? ',') : 0;
-    if (found !== expected) throw new SourceError(`读取选项给了 ${expected} 列，但文件开头的一行是 ${found} 列，请检查分隔符、跳过的行数与列类型`);
+    const counts = (opts.delim ? [opts.delim] : SNIFFED_DELIMS).map(d => (firstRow ? csvFieldCount(firstRow, d) : 0));
+    if (!counts.includes(expected)) {
+      const found = Math.max(...counts);
+      throw new SourceError(`读取选项给了 ${expected} 列，但文件开头的一行是 ${found} 列，请检查分隔符、跳过的行数与列类型`);
+    }
   }
   // 实际编码（选项指定的或自动识别出的）记进 config.options，不带选项上传也记（ADR-0037）；只有 encoding 的选项照自动识别读
   const options = JSON.stringify({ [table]: { ...opts, encoding } });
