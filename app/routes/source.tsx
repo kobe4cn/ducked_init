@@ -731,12 +731,12 @@ function LakeData({ verify, canWrite, submitting, busy }: { verify: VerifyView; 
       )}
       {canWrite && (
         <div className="flex gap-2">
-          <Form method="post">
+          <Form method="post" preventScrollReset>
             <input type="hidden" name="intent" value="verify" />
             <Button type="submit" variant="outline" disabled={submitting || busy}>{busy ? '同步或核对进行中…' : '核对'}</Button>
           </Form>
           {reconcilable && (
-            <Form method="post">
+            <Form method="post" preventScrollReset>
               <input type="hidden" name="intent" value="reconcile" />
               <Button type="submit" disabled={submitting || busy}>立即主键比对</Button>
             </Form>
@@ -928,11 +928,11 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
           <>
             {canWrite && (
               <>
-                <Form method="post">
+                <Form method="post" preventScrollReset>
                   <input type="hidden" name="intent" value="test" />
                   <Button type="submit" variant="outline" disabled={submitting}><PlugZap />测试连接</Button>
                 </Form>
-                <Form method="post">
+                <Form method="post" preventScrollReset>
                   <input type="hidden" name="intent" value="refresh" />
                   <Button type="submit" variant="outline" disabled={submitting}><RefreshCw />重新列出表并采集</Button>
                 </Form>
@@ -1092,7 +1092,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
               </SectionHeader>
               {sync.status === 'failed' && sync.error && <StatusText tone="bad">{`同步失败：${sync.error}`}</StatusText>}
               {canWrite && (
-                <Form method="post">
+                <Form method="post" preventScrollReset>
                   <input type="hidden" name="intent" value="sync" />
                   <Button type="submit" variant="outline" disabled={submitting || syncing}>{syncing ? '同步中…' : '立即同步'}</Button>
                 </Form>
@@ -1106,7 +1106,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
                 <SectionHeader title="修改与轮换凭据">
                   保存前重新校验连接与只读。凭据留空表示沿用已保存的；主机、库名、用户名或路径变了时须重新填写。
                 </SectionHeader>
-                <Form method="post">
+                <Form method="post" preventScrollReset>
                   <input type="hidden" name="intent" value="update" />
                   <FieldGroup>
                     <Field>
