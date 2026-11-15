@@ -10,7 +10,7 @@ import { tenantCatalog } from '../../app/.server/catalog/load';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, businessNotes, catalogVersions, knowledgeAliases, knowledgeProposals, knowledgeTermDefaults, semanticClaims } from '../../app/.server/db/schema';
 import { createDefinition, modelDraftForDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
-import { addAlias, ALIAS_MAX_LENGTH } from '../../app/.server/knowledge/aliases';
+import { addAlias, ALIAS_MAX_LENGTH, retireAlias } from '../../app/.server/knowledge/aliases';
 import { currentBases } from '../../app/.server/knowledge/basis';
 import { acceptProposal, listProposals, proposeKnowledge, proposeMany, rejectProposal, type ProposalInput } from '../../app/.server/knowledge/proposals';
 import { listTermDefaults } from '../../app/.server/knowledge/term-defaults';
@@ -286,9 +286,20 @@ describe('知识提案', () => {
     // 词是条目当前的名称也可以：指标的名称是 key，实体的名称是标签（订单）
     await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'paid_revenue' } });
     await propose(acme, { targetId: 'entity:order', kind: 'term_default', content: { term: '订单' } });
-    expect(await proposalRows(acme)).toHaveLength(3);
+    // 只差大小写也算是名称：Paid_Revenue 对上 paid_revenue
+    expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'Paid_Revenue' } }))
+      .toMatchObject({ status: 'proposed', content: { term: 'Paid_Revenue' } });
+    // 只差大小写也算是别名：别名 GMV，提 gmv
+    await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: 'GMV' });
+    expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'gmv' } }))
+      .toMatchObject({ status: 'proposed', content: { term: 'gmv' } });
+    expect(await proposalRows(acme)).toHaveLength(5);
 
-    // 不是这个目标的名称或别名、是别的目标的别名、空白、超长都 400 不写入
+    // 停用的别名不算：停用「流水」后提它 400
+    const retired = await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: '流水' });
+    await retireAlias(analyst, retired);
+
+    // 不是这个目标的名称或有效别名（流水已停用）、是别的目标的别名、空白、超长都 400 不写入
     const bad: Parameters<typeof propose>[1][] = [
       { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: '流水' } },
       { targetId: 'entity:order', kind: 'term_default', content: { term: '营收' } },
@@ -296,13 +307,13 @@ describe('知识提案', () => {
       { targetId: 'entity:order', kind: 'term_default', content: { term: '长'.repeat(ALIAS_MAX_LENGTH + 1) } },
     ];
     for (const input of bad) await expect(propose(acme, input), JSON.stringify(input)).rejects.toMatchObject({ status: 400 });
-    expect(await proposalRows(acme)).toHaveLength(3);
+    expect(await proposalRows(acme)).toHaveLength(5);
 
     // 去空白后同样的提案指纹相同（返回已有那条）；拒绝过不再提
     expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: ' 营收 ' } })).toMatchObject({ id: byAlias.id });
     await rejectProposal(analyst, byAlias.id, '营收默认指近一年那条');
     expect(await propose(acme, { targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: '营收' } })).toBeNull();
-    expect(await proposalRows(acme)).toHaveLength(3);
+    expect(await proposalRows(acme)).toHaveLength(5);
   });
 
   it('接受 term_default 写进 knowledge_term_defaults、记审计 term_default.set 与目录版本；同一个词换目标时停用旧的；不能改值接受；查看者 403', async () => {
