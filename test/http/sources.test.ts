@@ -178,7 +178,13 @@ describe('登记数据源', () => {
       new File(['id;amount\n001;12.50\n'], 'a.csv')));
     const [delimSource] = await getDb().select().from(sources).where(eq(sources.id, withDelim));
     expect(delimSource.config.options).toBe('{"signups":{"delim":";","encoding":"utf-8"}}');
-    expect(await listLakeFiles(await uploadsOf(tenantId))).toHaveLength(3);
+    // 给了 columns 但没给 delim：DuckDB 仍自动识别分隔符，; 分隔的文件按识别出的分隔符核对列数，照常登记
+    const columnsOnly = sourceIdOf(await upload(browser,
+      { name: '报名四', table: 'signups', options: '{"signups":{"columns":{"id":"VARCHAR","amount":"DECIMAL(10,2)"}}}' },
+      new File(['id;amount\n001;12.50\n'], 'a.csv')));
+    const [columnsSource] = await getDb().select().from(sources).where(eq(sources.id, columnsOnly));
+    expect(JSON.parse(columnsSource.config.options!)).toEqual({ signups: { columns: { id: 'VARCHAR', amount: 'DECIMAL(10,2)' }, encoding: 'utf-8' } });
+    expect(await listLakeFiles(await uploadsOf(tenantId))).toHaveLength(4);
   });
 
   it('上传登记失败（表名不合法、文件为空、不是 .csv、既不是 UTF-8 也不是 GBK、读取选项不合法、名称为空）时 400，不留下数据源与文件；没有 sources:write 的角色 403', async () => {
