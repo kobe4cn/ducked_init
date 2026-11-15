@@ -1,8 +1,10 @@
 // test/http/llm-usage.test.ts —— 「模型调用」页的 HTTP 接缝：租户管理员按用途看近 7/30 天的调用统计（次数、token、平均/P95 耗时、Schema 通过率、错误数，与手算一致，只看本租户），
-// 明细分页按时间倒序、失败调用显示截断到 120 字的错误摘要（全文在 title）；数据工程师 / 分析师 / 查看者看不到入口、打开 403
+// 统计与明细按当前单价折算金额（ADR-0057）：未配单价、部分未配、多币种各有展示规则；明细分页按时间倒序、失败调用显示截断到 120 字的错误摘要（全文在 title）；
+// 数据工程师 / 分析师 / 查看者看不到入口、打开 403
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { llmCalls } from '../../app/.server/db/schema';
+import { llmCalls, modelPrices } from '../../app/.server/db/schema';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -20,6 +22,11 @@ const call = (tenantId: string, over: Partial<typeof llmCalls.$inferInsert> = {}
 const usageRow = (html: string, purpose: string) => html.match(new RegExp(`<tr[^>]*data-purpose="${purpose}"[\\s\\S]*?</tr>`))?.[0] ?? '';
 /** 统计表一行里某个数值单元格的文本 */
 const usageCell = (rowHtml: string, col: string) => rowHtml.match(new RegExp(`data-col="${col}"[^>]*>([^<]*)<`))?.[1] ?? '';
+/** 明细里某次调用的一行 HTML */
+const callRow = (html: string, id: string) => html.match(new RegExp(`<tr[^>]*data-call-id="${id}"[\\s\\S]*?</tr>`))?.[0] ?? '';
+/** 直接给模型配单价（numeric 列传字符串），不经过运营后台 */
+const price = (model: string, inputPerMTok: string, outputPerMTok: string, currency: 'CNY' | 'USD') =>
+  getDb().insert(modelPrices).values({ model, inputPerMTok, outputPerMTok, currency });
 
 describe('模型调用统计', () => {
   it('管理员按用途看到近 7 / 30 天的统计与总计，数值与手算一致，看不到其他租户', async () => {
@@ -92,6 +99,32 @@ describe('模型调用统计', () => {
     expect(list).not.toContain('99999');
   });
 
+  it('统计与总计的金额列按当前单价折算成各币种金额，未配单价、部分未配与别的租户按规则呈现', async () => {
+    const acme = await newTenant('acme');
+    const globex = await newTenant('globex');
+    await price('m-fast', '2', '8', 'CNY');
+    await price('m-usd', '1', '2', 'USD'); // m-x 不配单价
+    await call(acme, { promptTokens: 1000, completionTokens: 500 }); // m-fast：1000×2/1e6 + 500×8/1e6 = CNY 0.0060
+    await call(acme, { model: 'm-usd', promptTokens: 2000, completionTokens: 3000 }); // 2000×1/1e6 + 3000×2/1e6 = USD 0.0080
+    await call(acme, { purpose: 'mapping_draft', promptTokens: 1000, completionTokens: 500 });
+    await call(acme, { purpose: 'mapping_draft', model: 'm-usd', promptTokens: 2000, completionTokens: 3000 });
+    await call(acme, { purpose: 'mapping_draft', model: 'm-x', promptTokens: 100, completionTokens: 100 }); // 未配价的模型混在同一个用途里
+    await call(acme, { purpose: 'assistant', model: 'm-x', promptTokens: 100, completionTokens: 100 }); // 全是未配价的模型
+    await call(globex, { promptTokens: 900000, completionTokens: 900000 }); // 别的租户的已配价调用，不计入
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const html = await (await admin.get('/llm-usage?days=7')).text();
+
+    // 一个用途全配价：只显示金额，币种按代码排序用「 + 」连接
+    expect(usageCell(usageRow(html, 'connectivity'), 'cost')).toBe('CNY 0.0060 + USD 0.0080');
+    // 一部分配了：金额后面加注
+    expect(usageCell(usageRow(html, 'mapping_draft'), 'cost')).toBe('CNY 0.0060 + USD 0.0080（部分模型未配置单价）');
+    // 都没配：显示「未配置单价」，不是 0
+    expect(usageCell(usageRow(html, 'assistant'), 'cost')).toBe('未配置单价');
+    // 总计用全部分组重算（CNY 0.0060×2、USD 0.0080×2），别的租户的 9.00 不出现
+    expect(usageCell(usageRow(html, 'total'), 'cost')).toBe('CNY 0.0120 + USD 0.0160（部分模型未配置单价）');
+  });
+
   it('数据工程师 / 分析师 / 查看者看不到入口，打开 403；没有调用时是空状态', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'de@acme.com', 'data_engineer');
@@ -110,6 +143,31 @@ describe('模型调用统计', () => {
       expect(await (await member.get('/')).text()).not.toContain('href="/llm-usage"');
       expect((await member.get('/llm-usage')).status).toBe(403);
     }
+  });
+
+  it('明细每行显示按当前单价折算的金额：未配单价不是 0，token 为 null 按 0 算，改价后按新单价', async () => {
+    const acme = await newTenant('acme');
+    await price('m-fast', '2', '8', 'CNY'); // m-x 不配单价
+    const [x, nullTok, fast] = (await getDb().insert(llmCalls).values([
+      { tenantId: acme, purpose: 'connectivity', model: 'm-x', durationMs: 100, promptTokens: 100, completionTokens: 100, createdAt: ago(1) },
+      { tenantId: acme, purpose: 'connectivity', model: 'm-fast', durationMs: 100, createdAt: ago(1) }, // token 都为 null（失败的调用）
+      { tenantId: acme, purpose: 'connectivity', model: 'm-fast', durationMs: 100, promptTokens: 1000, completionTokens: 500, createdAt: ago(1) },
+    ]).returning({ id: llmCalls.id })).map(r => r.id);
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const html = await (await admin.get('/llm-usage')).text();
+    // 未配单价：显示「未配置单价」，不是 0、也不是 CNY 0.0000
+    expect(usageCell(callRow(html, x), 'cost')).toBe('未配置单价');
+    // 配了单价但 token 为 null：按 0 算，显示金额而不是「未配置单价」
+    expect(usageCell(callRow(html, nullTok), 'cost')).toBe('CNY 0.0000');
+    expect(usageCell(callRow(html, fast), 'cost')).toBe('CNY 0.0060');
+
+    // 改单价后重新打开：明细与统计都按新单价折算（1000×4/1e6 + 500×16/1e6 = 0.0120）
+    await getDb().update(modelPrices).set({ inputPerMTok: '4', outputPerMTok: '16' }).where(eq(modelPrices.model, 'm-fast'));
+    const after = await (await admin.get('/llm-usage')).text();
+    expect(usageCell(callRow(after, fast), 'cost')).toBe('CNY 0.0120');
+    expect(usageCell(callRow(after, nullTok), 'cost')).toBe('CNY 0.0000');
+    expect(usageCell(usageRow(after, 'connectivity'), 'cost')).toBe('CNY 0.0120（部分模型未配置单价）');
   });
 
   it('明细分页按时间倒序，失败调用的错误摘要截到 120 字、全文放 title', async () => {
