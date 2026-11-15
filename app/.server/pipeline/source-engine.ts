@@ -15,6 +15,12 @@ export interface S3Connection { endpoint: string; region: string; urlStyle: stri
 export const FILE_FORMATS = ['parquet', 'csv', 'json'] as const;
 export type FileFormat = (typeof FILE_FORMATS)[number];
 
+/**
+ * 一张上传表的读取选项（ADR-0037）：登记时随表单提交、存进数据源 config.options，按表名索引。
+ * encoding 只记录成员指定或识别出的原编码（湖里存的文件登记时已转成 UTF-8），不传给 read_csv
+ */
+export type UploadReadOptions = { encoding?: 'utf-8' | 'gbk'; delim?: string; header?: boolean; skip?: number; columns?: Record<string, string> };
+
 /** 连接一个数据源所需的全部信息（含解密后的凭据）。只在内存里传递：平台进程解密后直接使用，或经 IPC 交给工作进程 */
 export type SourceSpec =
   | { kind: 'postgres'; host: string; port: number; database: string; schema: string; user: string; password: string }
@@ -25,8 +31,8 @@ export type SourceSpec =
   | { kind: 's3'; path: string; format: FileFormat; s3: S3Connection }
   /** path 是对象存储上的文件（带 s3）或平台本机上租户源文件目录里的文件 */
   | { kind: 'duckdb'; path: string; s3?: S3Connection }
-  /** 文件上传（ADR-0037）：path 是租户数据湖里以 / 结尾的上传目录，其下每个 <表名>.csv 是一张表；数据湖在对象存储时带 s3 */
-  | { kind: 'upload'; path: string; s3?: S3Connection };
+  /** 文件上传（ADR-0037）：path 是租户数据湖里以 / 结尾的上传目录，其下每个 <表名>.csv 是一张表；数据湖在对象存储时带 s3；options 是每张表的读取选项 */
+  | { kind: 'upload'; path: string; s3?: S3Connection; options?: Record<string, UploadReadOptions> };
 
 /** 账号在源端可以写入的对象与权限 */
 export interface WriteGrant { object: string; privileges: string[] }
@@ -96,6 +102,20 @@ const FILE_EXTENSIONS: Record<FileFormat, RegExp> = {
   json: /\.(json|jsonl|ndjson)(\.gz)?$/i,
 };
 const READERS: Record<FileFormat, string> = { parquet: 'read_parquet', csv: 'read_csv', json: 'read_json_auto' };
+
+/**
+ * 上传表的 FROM 子句：没有选项（或只有 encoding）时按 read_csv 自动识别读，与没有读取选项的表一样（ADR-0037）；
+ * 有选项时只拼给出的参数，列名与类型都走 lit。encoding 不拼进去：湖里存的文件登记时已转成 UTF-8
+ */
+export function uploadReader(file: string, opts?: UploadReadOptions): string {
+  if (!opts) return `read_csv(${lit(file)})`;
+  const params: string[] = [];
+  if (opts.delim !== undefined) params.push(`delim=${lit(opts.delim)}`);
+  if (opts.header !== undefined) params.push(`header=${opts.header ? 'true' : 'false'}`);
+  if (opts.skip !== undefined) params.push(`skip=${opts.skip}`);
+  if (opts.columns) params.push(`columns={${Object.entries(opts.columns).map(([name, type]) => `${lit(name)}: ${lit(type)}`).join(', ')}}`);
+  return params.length ? `read_csv(${lit(file)}, ${params.join(', ')})` : `read_csv(${lit(file)})`;
+}
 
 /**
  * 源表：名称、所在 schema 与源端的表名（对象存储文件没有）、在会话里读取它的 FROM 子句，
@@ -215,7 +235,7 @@ export async function listTables(con: DuckDBConnection, spec: SourceSpec, mongo?
     const files = await rows<{ file: string }>(con, `SELECT file FROM glob(${lit(`${spec.path}*.csv`)}) ORDER BY file`);
     return files.map(({ file }) => {
       const name = file.slice(spec.path.length).replace(/\.csv$/, '');
-      return { name, schema: '', table: name, from: `read_csv(${lit(file)})`, readable: true };
+      return { name, schema: '', table: name, from: uploadReader(file, spec.options?.[name]), readable: true };
     });
   }
   if (spec.kind === 'mongodb' && !mongo!.can('listCollections', spec.database, '')) {

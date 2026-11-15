@@ -8,8 +8,8 @@ import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import type { CurrentMember } from '~/.server/auth';
 import { listSources, registerSource, SourceError } from '~/.server/sources';
-import type { SourceInput } from '~/.server/source-config';
-import { decodeUpload, removeUpload, storeUpload, UPLOAD_TABLE, UPLOAD_TABLE_RULE } from '~/.server/uploads';
+import { parseUploadOptions, type SourceInput } from '~/.server/source-config';
+import { csvFieldCount, decodeUpload, removeUpload, storeUpload, UPLOAD_TABLE, UPLOAD_TABLE_RULE } from '~/.server/uploads';
 import { verifyDifferences } from '~/.server/source-verify';
 import { storageOverQuota } from '~/.server/storage-quota';
 import { uploadLimitOf } from '~/.server/tenants';
@@ -110,11 +110,22 @@ async function registerUpload(member: CurrentMember, input: SourceInput, file: F
   if (file.size === 0) throw new SourceError('文件是空的');
   const table = (input.table ?? '').trim();
   if (!UPLOAD_TABLE.test(table)) throw new SourceError(UPLOAD_TABLE_RULE);
-  const { text, encoding } = decodeUpload(new Uint8Array(await file.arrayBuffer()));
+  // 读取选项先校验（此时还没写文件）；指定了编码就只按那一种解码，失败 400，不退回自动识别（ADR-0037）
+  const opts = parseUploadOptions(input.options, table)?.[table];
+  const { text, encoding } = decodeUpload(new Uint8Array(await file.arrayBuffer()), opts?.encoding);
+  // 带 columns 时按选项核对文件的列数：登记的探测不读行，列数不符在这里拦下（否则要到首次同步才失败）
+  if (opts?.columns) {
+    const expected = Object.keys(opts.columns).length;
+    const firstRow = text.split(/\r?\n/).slice(opts.skip ?? 0).find(l => l.trim() !== '');
+    const found = firstRow ? csvFieldCount(firstRow, opts.delim ?? ',') : 0;
+    if (found !== expected) throw new SourceError(`读取选项给了 ${expected} 列，但文件开头的一行是 ${found} 列，请检查分隔符、跳过的行数与列类型`);
+  }
+  // 实际编码（选项指定的或自动识别出的）记进 config.options，不带选项上传也记（ADR-0037）；只有 encoding 的选项照自动识别读
+  const options = JSON.stringify({ [table]: { ...opts, encoding } });
   const dir = crypto.randomUUID();
   try {
     await storeUpload(member.tenant.id, dir, table, text);
-    return await registerSource(member, { ...input, table, dir }, { table, file: file.name, bytes: file.size, encoding });
+    return await registerSource(member, { ...input, table, dir, options }, { table, file: file.name, bytes: file.size, encoding });
   } catch (e) {
     await removeUpload(member.tenant.id, dir);
     throw e;
