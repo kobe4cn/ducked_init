@@ -43,7 +43,7 @@ describe('模型调用统计', () => {
     expect(usageCell(conn, 'avg')).toBe('200 ms');
     expect(usageCell(conn, 'p95')).toBe('290 ms');
     expect(usageCell(conn, 'schema')).toBe('1/2（50%）');
-    expect(usageCell(conn, 'errors')).toBe('1');
+    expect(usageCell(conn, 'errors')).toBe('1（33.3%）');
 
     const draft = usageRow(html, 'mapping_draft');
     expect(usageCell(draft, 'calls')).toBe('1');
@@ -51,7 +51,7 @@ describe('模型调用统计', () => {
     expect(usageCell(draft, 'avg')).toBe('400 ms');
     expect(usageCell(draft, 'p95')).toBe('400 ms');
     expect(usageCell(draft, 'schema')).toBe('1/1（100%）');
-    expect(usageCell(draft, 'errors')).toBe('0');
+    expect(usageCell(draft, 'errors')).toBe('0（0%）');
 
     // 总计一行（不分组重算，不拿各用途的 P95 再平均）：4 次、240 token、P95 385 ms、错误率 25%
     const total = usageRow(html, 'total');
@@ -59,7 +59,7 @@ describe('模型调用统计', () => {
     expect(usageCell(total, 'tokens')).toBe('160 / 80');
     expect(usageCell(total, 'p95')).toBe('385 ms');
     expect(usageCell(total, 'schema')).toBe('2/3（66.7%）');
-    expect(usageCell(total, 'errors')).toBe('1');
+    expect(usageCell(total, 'errors')).toBe('1（25%）');
 
     // 指标卡：总调用 / 总 token / P95 耗时 / 错误率
     const tile = (label: string) => html.match(new RegExp(`${label}</div><div[^>]*>([^<]*)<`))?.[1];
@@ -73,7 +73,7 @@ describe('模型调用统计', () => {
     expect(usageCell(conn30, 'avg')).toBe('400 ms');
     expect(usageCell(conn30, 'p95')).toBe('895 ms');
     expect(usageCell(conn30, 'schema')).toBe('2/3（66.7%）');
-    expect(usageCell(conn30, 'errors')).toBe('1');
+    expect(usageCell(conn30, 'errors')).toBe('1（25%）');
     const total30 = usageRow(month, 'total');
     expect(usageCell(total30, 'calls')).toBe('5');
     expect(usageCell(total30, 'p95')).toBe('880 ms');

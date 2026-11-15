@@ -51,7 +51,7 @@ function UsageRow({ row, isTotal = false }: { row: PurposeUsage; isTotal?: boole
       <TableCell data-col="avg">{`${n(row.avgMs)} ms`}</TableCell>
       <TableCell data-col="p95">{`${n(row.p95Ms)} ms`}</TableCell>
       <TableCell data-col="schema">{checked ? `${row.schemaValid}/${checked}（${pct(row.schemaValid, checked)}）` : '—'}</TableCell>
-      <TableCell data-col="errors" className={row.errors ? 'text-red-600' : 'text-slate-500'}>{n(row.errors)}</TableCell>
+      <TableCell data-col="errors" className={row.errors ? 'text-red-600' : 'text-slate-500'}>{`${n(row.errors)}（${pct(row.errors, row.calls)}）`}</TableCell>
     </TableRow>
   );
 }
