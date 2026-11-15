@@ -1,6 +1,8 @@
 // test/http/model-prices.test.ts —— 运营后台模型单价页（#744）：新增 / 修改 / 校验拒绝 / 平台级审计与同值 no-op；costOf 折算纯函数
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb } from '../../app/.server/db/client';
+import { asc, inArray } from 'drizzle-orm';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { auditLogs } from '../../app/.server/db/schema';
 import { costOf, listModelPrices, ModelPriceError, upsertModelPrice } from '../../app/.server/model-prices';
 import { createOperator, createTenant, loginAs, loginAsOperator, resetDb, startApp, type TestApp } from './harness';
 
@@ -73,7 +75,28 @@ describe('运营后台模型单价页', () => {
     expect(events).toContain('输入 2.5 → 3');
     expect(events).toContain('输出 10 → 8');
     expect(events).toContain('CNY → USD');
-    expect(events).toContain('平台');
+    for (const label of ['新增模型单价', '修改模型单价']) {
+      const cells = rowCells(events, 'data-audit-action', label);
+      expect(cells[1], label).toBe(`运营者 ${OPS}`);
+      expect(cells[3], label).toBe('平台');
+    }
+
+    const rows = await getDb().select().from(auditLogs)
+      .where(inArray(auditLogs.action, ['model_price.created', 'model_price.updated']))
+      .orderBy(asc(auditLogs.createdAt), asc(auditLogs.action));
+    expect(rows.map(r => r.action)).toEqual(['model_price.created', 'model_price.updated']);
+    for (const r of rows) {
+      expect(r.tenantId, r.action).toBeNull();
+      expect(r.actorType, r.action).toBe('operator');
+      expect(r.actorEmail, r.action).toBe(OPS);
+      expect(r.actorOperatorId, r.action).not.toBeNull();
+      expect(r.targetId, r.action).toBe('m-fast');
+    }
+    expect(rows[1].detail).toEqual({
+      model: 'm-fast',
+      from: { inputPerMTok: 2.5, outputPerMTok: 10, currency: 'CNY' },
+      to: { inputPerMTok: 3, outputPerMTok: 8, currency: 'USD' },
+    });
   });
 
   it('同值保存是 no-op：不报错、不写审计（"3" 与 "3.0000" 是同一个值）', async () => {
