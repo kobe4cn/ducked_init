@@ -4,10 +4,12 @@
 // 工作台的结果解读存进本人的对话（带 query：SQL、行数与列名，不存取值），/workbench?sql= 把 SQL 填进编辑框、不执行；
 // 带 plan 的消息在读时按读者自己的目录组装计划卡（#452，ADR-0050：读时再校验；ADR-0005：被分享人按自己的目录，看不到的条目只留 id）；
 // 「排除了哪些口径」（#539）：被分享人看不到的条目只有原因、id 与名称都不进卡片，带 excluded 的计划存草稿不判过期
+// 歧义追问的结构化候选（⑥-3，ADR-0047 / 0046）：判为歧义的那轮 assistant 消息带 choices（词加候选条目 id，加密保存），
+// 读回按读者自己的目录组装成带名称的视图（#539）；POST 带 choice 时服务端核对后自己生成用户消息继续这一轮（不收自由文本）
 import { and, eq, like } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { assistantConversations, assistantConversationShares, auditLogs, dslVersions } from '../../app/.server/db/schema';
+import { assistantConversations, assistantConversationShares, auditLogs, dslVersions, knowledgeAliases } from '../../app/.server/db/schema';
 import { appendTurn, ASSISTANT_CONTEXT } from '../../app/.server/assistant/conversations';
 import { MAX_HISTORY } from '../../app/.server/assistant/loop';
 import { catalogFor } from '../../app/.server/assistant/tools';
@@ -47,6 +49,27 @@ async function analystAndPeer() {
   const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
   await memberOf(acme, 'viewer@acme.com', 'viewer');
   return { acme, analyst, client: await loginAs(app, 'analyst@acme.com'), peer: await loginAs(app, 'viewer@acme.com') };
+}
+
+/** 夹具（⑥-3）：发布两个只差时间字段的营收指标并都挂别名「营收」，问「近 30 天的营收」会让 catalog_search 判为歧义、候选就是这两个指标 */
+async function askAmbiguousRevenue() {
+  const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+  const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+  await memberOf(acme, 'viewer@acme.com', 'viewer');
+  const client = await loginAs(app, 'analyst@acme.com');
+  const peer = await loginAs(app, 'viewer@acme.com');
+  const BY_CREATED = 'base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: created_at, days: 30 }\n';
+  const BY_PAID = 'base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: paid_at, days: 30 }\n';
+  for (const [key, yaml] of [['revenue_created', BY_CREATED], ['revenue_paid', BY_PAID]] as const) {
+    await createDefinition(author, 'metric', key, yaml);
+    await publishDefinition(reviewer, 'metric', key, 1);
+  }
+  // 别名直接写 knowledge_aliases（种子里别名经知识导入进同一张表，这里只需要词本身）；basedOn 为空、不算待复核
+  await getDb().insert(knowledgeAliases).values([
+    { tenantId: acme, targetId: 'metric:revenue_created', alias: '营收', basedOn: [], createdByEmail: 'de@acme.com' },
+    { tenantId: acme, targetId: 'metric:revenue_paid', alias: '营收', basedOn: [], createdByEmail: 'de@acme.com' },
+  ]);
+  return { acme, analyst, client, peer };
 }
 
 /** 本人问两轮，返回对话 id */
@@ -91,7 +114,7 @@ describe('助手对话', () => {
     expect((await client.get('/assistant?id=not-a-uuid')).status).toBe(404);
 
     // 问满 MAX_HISTORY 条以后还能续写：只把最近的若干轮交给模型，保存的对话照样变长
-    for (let i = 0; i < MAX_HISTORY / 2; i++) await appendTurn(analyst, id, `问题 ${i}`, `答复 ${i}`, []);
+    for (let i = 0; i < MAX_HISTORY / 2; i++) await appendTurn(analyst, id, { userText: `问题 ${i}`, reply: `答复 ${i}`, toolsUsed: [] });
     const long = fakeModel(['还能接着答']);
     expect((await post(client, { conversationId: id, message: '最后一问', page: PAGE })).status).toBe(200);
     const sent = long[0].body.messages.filter(m => m.role !== 'system');
@@ -323,7 +346,7 @@ describe('助手对话', () => {
     expect(first).toMatchObject({ reply: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'] });
 
     // 带计划的那轮之后再问满 MAX_HISTORY 条：它落在交给模型的 history 截断范围之外，路由只能在完整消息列表里找到它
-    for (let i = 0; i < MAX_HISTORY / 2; i++) await appendTurn(analyst, first.conversationId, `问题 ${i}`, `答复 ${i}`, []);
+    for (let i = 0; i < MAX_HISTORY / 2; i++) await appendTurn(analyst, first.conversationId, { userText: `问题 ${i}`, reply: `答复 ${i}`, toolsUsed: [] });
 
     // 两次请求之间另一位成员存了第 2 版并发布：计划里的 v1 过期
     await saveDslDraft(author, 'metric', 'member_count', `# 换个说法\n${COUNT_MEMBERS}`);
@@ -410,6 +433,137 @@ describe('助手对话', () => {
     const tool = received[4].body.messages.filter((m: { role: string }) => m.role === 'tool').at(-1)!;
     expect(tool.content).toContain('已保存为草稿');
     expect(tool.content).not.toContain('计划已过期');
+  });
+
+  it('catalog_search 判为歧义的那一轮带结构化候选（⑥-3）：POST 返回与 ?id= 读回的 assistant 消息都带 choices（词加带名称的候选），sealed 里只有密文；本轮最后一次搜索不歧义时清空；发给模型的历史不含 choices', async () => {
+    const { acme, client } = await askAmbiguousRevenue();
+    const replies = [
+      toolCalls({ name: 'catalog_search', args: { query: '营收' } }),
+      text('营收按哪个时间字段算？'),
+      text('不客气'),
+    ];
+    const { received } = fakeLlm(f => app.setLlmFetch(f), n => replies[n - 1]);
+    const first = await (await post(client, { message: '近 30 天的营收', page: PAGE })).json();
+    expect(first).toMatchObject({ reply: '营收按哪个时间字段算？', toolsUsed: ['catalog_search'] });
+    // 候选取自本轮的 catalog_search：两个营收指标，按成员自己的目录带名称（排名先后不作断言，按 entryId 排序后比）
+    expect(first.choices).toHaveLength(1);
+    expect(first.choices[0].term).toBe('营收');
+    expect([...first.choices[0].candidates].sort((a: { entryId: string }, b: { entryId: string }) => (a.entryId < b.entryId ? -1 : 1))).toEqual([
+      { entryId: 'metric:revenue_created', name: 'revenue_created' },
+      { entryId: 'metric:revenue_paid', name: 'revenue_paid' },
+    ]);
+
+    // ?id= 读回：同一条 assistant 消息带一样的候选视图，user 消息没有这个键
+    const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(conversation.messages[0]).not.toHaveProperty('choices');
+    expect(conversation.messages[1].choices).toEqual(first.choices);
+
+    // 库里只有密文：存的是词加候选条目 id 列表，名称不存（读时按读者目录组装）
+    const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
+    expect(row.sealed).not.toContain('metric:revenue_created');
+    const stored = JSON.parse((await decryptForTenant(acme, ASSISTANT_CONTEXT, row.sealed)).body).messages[1].choices;
+    expect(stored).toHaveLength(1);
+    expect(stored[0].term).toBe('营收');
+    expect([...stored[0].candidates].sort()).toEqual(['metric:revenue_created', 'metric:revenue_paid']);
+
+    // 续写一轮：交给模型的历史只有 role 与 content，choices 不进历史
+    expect((await post(client, { conversationId: first.conversationId, message: '谢谢', page: PAGE })).status).toBe(200);
+    const sent = JSON.stringify(received[2].body.messages);
+    expect(sent).toContain('营收按哪个时间字段算？');
+    expect(sent).not.toContain('candidates');
+
+    // 本轮最后一次搜索不歧义时清空：先搜「营收」再搜「客户」（实体不成歧义组），返回不再带 choices
+    const cleared = [
+      toolCalls({ name: 'catalog_search', args: { query: '营收' } }),
+      toolCalls({ name: 'catalog_search', args: { query: '客户' } }),
+      text('客户是消费者实体'),
+    ];
+    fakeLlm(f => app.setLlmFetch(f), n => cleared[n - 1]);
+    const second = await (await post(client, { conversationId: first.conversationId, message: '客户是什么', page: PAGE })).json();
+    expect(second).toMatchObject({ reply: '客户是消费者实体' });
+    expect(second).not.toHaveProperty('choices');
+    const after = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(after.conversation.messages.at(-1)).toEqual({ role: 'assistant', content: '客户是消费者实体', toolsUsed: ['catalog_search', 'catalog_search'] });
+  });
+
+  it('choices 读回按读者自己的目录过滤（#539 的教训）：被分享的查看者看不到的源表候选不出现 id 与名称，看得到的条目照常带名称', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const client = await loginAs(app, 'analyst@acme.com');
+    const peer = await loginAs(app, 'viewer@acme.com');
+    const catalog = await catalogFor(analyst);
+    const entity = catalog.entries.find(e => e.id === 'entity:customer');
+    const table = catalog.entries.find(e => e.id === 'table:CRM/orders');
+    if (!entity || table?.kind !== 'table') throw new Error('entity:customer 或 table:CRM/orders 不在分析师目录里');
+    // 查看者没有 sources:read，目录里没有 table: 条目（ADR-0005）
+    expect((await catalogFor(await memberOf(acme, 'viewer@acme.com', 'viewer'))).entries.some(e => e.id === 'table:CRM/orders')).toBe(false);
+    // 直接种一条带 choices 的 assistant 消息，候选里混一个查看者看不到的源表条目：这里只验证读回这一层按读者目录组装
+    const id = await appendTurn(analyst, null, {
+      userText: '近 30 天的营收', reply: '营收按哪个口径算？', toolsUsed: ['catalog_search'],
+      choices: [{ term: '营收', candidates: ['entity:customer', 'table:CRM/orders'] }],
+    });
+    const own = await (await client.get(`/assistant?id=${id}`)).json();
+    expect(own.conversation.messages[1].choices).toEqual([{ term: '营收', candidates: [
+      { entryId: 'entity:customer', name: entity.name },
+      { entryId: 'table:CRM/orders', name: table.name },
+    ] }]);
+
+    // 只读分享给查看者：源表候选整个不出现（id 自带数据源名），实体照常带名称
+    expect((await post(client, { intent: 'share', conversationId: id, email: 'viewer@acme.com' })).status).toBe(200);
+    const shared = await (await peer.get(`/assistant?id=${id}`)).json();
+    expect(shared.conversation.messages[1].choices).toEqual([{ term: '营收', candidates: [{ entryId: 'entity:customer', name: entity.name }] }]);
+    expect(JSON.stringify(shared)).not.toContain('table:CRM/orders');
+    expect(JSON.stringify(shared)).not.toContain(table.name);
+  });
+
+  it('POST 带 choice 点选候选（⑥-3，ADR-0046）：服务端核对后生成「按 … 理解」的用户消息继续这一轮，模型收到它；这条 user 消息带 chosen、读回可见，历史不含 chosen', async () => {
+    const { client } = await askAmbiguousRevenue();
+    const replies = [
+      toolCalls({ name: 'catalog_search', args: { query: '营收' } }),
+      text('营收按哪个时间字段算？'),
+      text('好的，按支付时间算'),
+    ];
+    const { received } = fakeLlm(f => app.setLlmFetch(f), n => replies[n - 1]);
+    const first = await (await post(client, { message: '近 30 天的营收', page: PAGE })).json();
+    const picked = await (await post(client, { conversationId: first.conversationId, choice: { entryId: 'metric:revenue_paid' } })).json();
+    expect(picked).toMatchObject({ conversationId: first.conversationId, reply: '好的，按支付时间算' });
+
+    // 服务端生成的用户消息：词从存着的 choices 反查、名称从自己的目录取（不收客户端传来的词或候选列表）
+    const GENERATED = '『营收』按 〈revenue_paid〉（metric:revenue_paid）理解';
+    const sent = received[2].body.messages.filter((m: { role: string }) => m.role !== 'system' && m.role !== 'tool').map((m: { content: string }) => m.content);
+    expect(sent).toEqual(['近 30 天的营收', '营收按哪个时间字段算？', GENERATED]);
+    expect(JSON.stringify(received[2].body.messages)).not.toContain('chosen');
+
+    // 这条 user 消息带 chosen（下一张票按它生成知识提案），读回可见
+    const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(conversation.messages[2]).toEqual({ role: 'user', content: GENERATED, chosen: { term: '营收', entryId: 'metric:revenue_paid' } });
+  });
+
+  it('choice 入参核对：不在最后一条 assistant 消息的候选里、不在自己的目录里、与 message 同给、缺对话时 400 且不请求模型；别人的对话 404', async () => {
+    const { analyst, client, peer } = await askAmbiguousRevenue();
+    const replies = [
+      toolCalls({ name: 'catalog_search', args: { query: '营收' } }),
+      text('营收按哪个时间字段算？'),
+    ];
+    const { received } = fakeLlm(f => app.setLlmFetch(f), n => replies[n - 1]);
+    const first = await (await post(client, { message: '近 30 天的营收', page: PAGE })).json();
+    const id = first.conversationId as string;
+    expect(received).toHaveLength(2);
+
+    // 不在候选里（目录里有的实体也不行）；与 message 同给；没给对话
+    expect((await post(client, { conversationId: id, choice: { entryId: 'entity:customer' } })).status).toBe(400);
+    expect((await post(client, { conversationId: id, choice: { entryId: 'metric:revenue_paid' }, message: '就按这个' })).status).toBe(400);
+    expect((await post(client, { choice: { entryId: 'metric:revenue_paid' } })).status).toBe(400);
+    // 在候选里、但不在目录里：种一条带已不在目录里的条目的候选
+    const stale = await appendTurn(analyst, null, {
+      userText: '销售额', reply: '销售额指哪个？', toolsUsed: ['catalog_search'],
+      choices: [{ term: '销售额', candidates: ['metric:gone'] }],
+    });
+    expect((await post(client, { conversationId: stale, choice: { entryId: 'metric:gone' } })).status).toBe(400);
+    // 别人的对话 404（查看者没被分享）
+    expect((await post(peer, { conversationId: id, choice: { entryId: 'metric:revenue_paid' } })).status).toBe(404);
+    expect(received).toHaveLength(2);
   });
 
   it('计划卡的 resultHref 只在重新校验通过时给：两次读取之间另一位成员发布了新版本，?id= 读回的卡片不是 valid、没有 resultHref（#453，ADR-0050）', async () => {

@@ -5,7 +5,8 @@
 // 最多再修正 MAX_FIXES 次；仍不通过时不再请求模型，由服务端把问题清单与最后一版 YAML 交给成员。
 // 分析计划（ADR-0050）：每轮新建一个检索候选集合（ToolCtx.retrieved）传给每次工具调用，validate_plan 只认本轮 catalog_search / catalog_expand 返回过的条目；
 // 本轮校验过的最后一份结构合法的计划（ToolCtx.plan）随答复返回、由路由存进对话，对话里最近一份作为 priorPlan 带进下一轮，存草稿 / 填工作台前重新校验
-// 本轮 prefill_workbench 通过校验的 SQL（ToolCtx.workbenchSql）随答复返回；返回给前端的只有文字答复、用过的工具名、本轮的计划与这份 SQL，不回传工具原文；
+// 本轮 prefill_workbench 通过校验的 SQL（ToolCtx.workbenchSql）随答复返回；本轮最后一次 catalog_search 判为歧义的追问候选（ToolCtx.choices，⑥-3）也随答复返回；
+// 返回给前端的只有文字答复、用过的工具名、本轮的计划、这份 SQL 与歧义候选，不回传工具原文；
 // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮每次请求都用同一套端点与模型（chatToolsWith）、在 platform.llm_calls 记一条 assistant（route=reasoning），不存提示词与答复原文
 import type { CurrentMember } from '../auth';
 import type { AnalysisPlan } from '../catalog/plan';
@@ -36,6 +37,13 @@ function unfixedReply({ issues, yaml }: NonNullable<ToolResult['rejected']>) {
 }
 
 const TOOLS_UNSUPPORTED = '该模型服务不支持工具调用，AI 助手无法使用：请管理员到「模型服务」页换一个支持工具调用的模型';
+
+/** 五个 return 共用的展开：本轮校验过的计划、通过校验的 SQL 与最后一次搜索留下的歧义候选（⑥-3），没有的键不出现 */
+const extras = (ctx: ToolCtx) => ({
+  ...(ctx.plan ? { plan: ctx.plan } : {}),
+  ...(ctx.workbenchSql ? { workbenchSql: ctx.workbenchSql } : {}),
+  ...(ctx.choices?.length ? { choices: ctx.choices } : {}),
+});
 
 export class AssistantError extends Error {
   constructor(message: string, readonly status: 400 | 409 | 422) { super(message); }
@@ -95,7 +103,7 @@ async function callTool(actor: CurrentMember, name: string, args: string, ctx: T
  */
 export async function assistantTurn(
   actor: CurrentMember, history: ChatTurn[], page: AssistantPage, priorPlan?: AnalysisPlan,
-): Promise<{ reply: string; toolsUsed: string[]; plan?: AnalysisPlan; workbenchSql?: string }> {
+): Promise<{ reply: string; toolsUsed: string[]; plan?: AnalysisPlan; workbenchSql?: string; choices?: { term: string; candidates: string[] }[] }> {
   checkHistory(history);
   const tenantId = actor.tenant.id;
   // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮所有 chatToolsWith 都用它：中途改配置不影响本轮
@@ -123,18 +131,18 @@ export async function assistantTurn(
       if (e instanceof LlmError) throw new AssistantError(`该模型服务不支持工具调用或调用失败：${e.message}`, 422);
       throw e;
     }
-    if (!response.toolCalls.length) return { reply: response.content!, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}), ...(ctx.workbenchSql ? { workbenchSql: ctx.workbenchSql } : {}) };
-    if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}), ...(ctx.workbenchSql ? { workbenchSql: ctx.workbenchSql } : {}) };
+    if (!response.toolCalls.length) return { reply: response.content!, toolsUsed, ...extras(ctx) };
+    if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...extras(ctx) };
     // 一次给出的调用超出剩下的次数时只执行到上限就结束本轮
     messages.push({
       role: 'assistant', content: response.content ?? '',
       tool_calls: response.toolCalls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })),
     });
     for (const c of response.toolCalls) {
-      if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}), ...(ctx.workbenchSql ? { workbenchSql: ctx.workbenchSql } : {}) };
+      if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...extras(ctx) };
       toolsUsed.push(c.name);
       const result = await callTool(via, c.name, c.arguments, ctx);
-      if (result.rejected && ++failures > MAX_FIXES) return { reply: unfixedReply(result.rejected), toolsUsed, ...(ctx.plan ? { plan: ctx.plan } : {}), ...(ctx.workbenchSql ? { workbenchSql: ctx.workbenchSql } : {}) };
+      if (result.rejected && ++failures > MAX_FIXES) return { reply: unfixedReply(result.rejected), toolsUsed, ...extras(ctx) };
       // 保存成功后再起草下一份，重新计修正次数
       if (result.saved) failures = 0;
       messages.push({ role: 'tool', tool_call_id: c.id, content: result.text });
