@@ -11,8 +11,9 @@ import { currentCatalogVersion } from '../../app/.server/catalog/versions';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { catalogProjection, spaces, tasks } from '../../app/.server/db/schema';
-import { createDefinition, deleteDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
+import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { addAlias } from '../../app/.server/knowledge/aliases';
+import { acceptProposal, proposeKnowledge } from '../../app/.server/knowledge/proposals';
 import { addMembership, createSubject } from '../../app/.server/knowledge/subjects';
 import { confirmDisable, requestDisable } from '../../app/.server/mappings';
 import { resetDb } from '../http/harness';
@@ -25,6 +26,7 @@ afterEach(() => { vi.restoreAllMocks(); });
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 实付金额\n';
 const REFUND = 'base: order\nmeasure: { agg: count }\ndescription: 退货笔数统计\n';
+const GEN = 'test-gen-1';
 
 /** 身份打通数据源与订单映射，加一位分析师、一位查看者 */
 async function setup() {
@@ -41,7 +43,7 @@ const rows = (tenantId: string) => getDb().select().from(catalogProjection)
   .orderBy(asc(catalogProjection.visibilityClass), asc(catalogProjection.entryId));
 
 describe('检索投影', () => {
-  it('加别名、加主题归属、发布与删除定义、停用映射、改业务说明：每步之后逐版增量刷新与从零重建得到的投影完全相同', async () => {
+  it('加别名、加主题归属、发布与删除定义、停用映射、改业务说明、接受词的默认指向：每步之后逐版增量刷新与从零重建得到的投影完全相同', async () => {
     const { acme, author, reviewer, analyst, orderMappings } = await setup();
     expect(await refreshProjection(acme)).toBe('refreshed');
     expect(await refreshProjection(acme)).toBe('fresh');
@@ -61,6 +63,14 @@ describe('检索投影', () => {
         await confirmDisable(reviewer, orderMappings!.loyalty);
       }],
       ['业务说明', () => saveBusinessNote(analyst, { entity: 'order', field: 'status', note: '只算已支付' })],
+      ['词的默认指向', async () => {
+        // 词是目标的名称（指标的键）才能提出；接受写 knowledge_term_defaults、记一版 term_default.set
+        const proposal = (await getDb().transaction(tx => proposeKnowledge(tx, acme, {
+          targetId: 'metric:paid_revenue', kind: 'term_default', content: { term: 'paid_revenue' },
+          evidence: [{ ref: 'metric:paid_revenue', version: 1 }], generatorVersion: GEN,
+        })))!;
+        await acceptProposal(analyst, proposal.id);
+      }],
     ];
     for (const [label, act] of steps) {
       const before = await projectionVersion(getDb(), acme);
@@ -214,6 +224,43 @@ describe('检索投影', () => {
     expect(named).not.toContain('口径对比');
     // 工具描述要求模型拿到 ambiguous: true 后先追问
     expect(TOOLS.find(t => t.name === 'catalog_search')!.description).toContain('ambiguous 为 true 时，先用给出的追问问清楚口径，再继续');
+  });
+
+  it('词的默认指向（ADR-0056）：接受「营收 → revenue_365d」后 catalog_search 不再歧义、输出写明按默认口径理解；点名另一口径不使用默认；默认条目发布新版本后默认失效、照常追问', async () => {
+    const { acme, reviewer, analyst, viewer } = await setup();
+    const windowed = (field: string, days = 30) => `${REVENUE}window: { field: ${field}, days: ${days} }\n`;
+    for (const [key, field] of [['revenue_365d', 'created_at'], ['gmv_365d', 'paid_at']]) {
+      await createDefinition(analyst, 'metric', key, windowed(field));
+      await publishDefinition(reviewer, 'metric', key, 1);
+      await addAlias(analyst, { targetId: `metric:${key}`, alias: '营收' });
+    }
+    // 本来要追问
+    expect((await runTool(viewer, 'catalog_search', { query: '营收' })).split('\n')[0]).toBe('ambiguous: true');
+
+    // 接受「营收 → revenue_365d」的默认指向：不追问，输出写明按默认口径理解（指标的名称就是键）
+    const proposal = (await getDb().transaction(tx => proposeKnowledge(tx, acme, {
+      targetId: 'metric:revenue_365d', kind: 'term_default', content: { term: '营收' },
+      evidence: [{ ref: 'metric:revenue_365d', version: 1 }], generatorVersion: GEN,
+    })))!;
+    await acceptProposal(analyst, proposal.id);
+    const out = await runTool(viewer, 'catalog_search', { query: '营收' });
+    expect(out.split('\n')[0]).toBe('ambiguous: false');
+    expect(out).toContain('默认口径：按默认口径 revenue_365d（metric:revenue_365d）理解『营收』');
+    expect(out).not.toContain('## 口径对比');
+    expect(TOOLS.find(t => t.name === 'catalog_search')!.description).toContain('输出里有「默认口径：」行时，回答里要写明按哪个默认口径理解了哪个词');
+
+    // 点名了另一个口径（gmv_365d 的支付时间）：以点名为准，不使用默认、没有默认口径行
+    const paid = (await catalogFor(viewer)).entries.find(e => e.id === 'field:order.paid_at')!.name;
+    const named = await runTool(viewer, 'catalog_search', { query: `按${paid}算的营收` });
+    expect(named.split('\n')[0]).toBe('ambiguous: false');
+    expect(named).not.toContain('默认口径：');
+
+    // 默认条目的依据摘要变了（发布内容不同的 v2）：默认失效，照常追问
+    await saveDslDraft(analyst, 'metric', 'revenue_365d', windowed('created_at', 60));
+    await publishDefinition(reviewer, 'metric', 'revenue_365d', 2);
+    const again = await runTool(viewer, 'catalog_search', { query: '营收' });
+    expect(again.split('\n')[0]).toBe('ambiguous: true');
+    expect(again).not.toContain('默认口径：');
   });
 
   it('投影不可用时回退到实时目录搜索、不带理由：刷新抛错、投影版本不等于目录版本、排序抛错', async () => {

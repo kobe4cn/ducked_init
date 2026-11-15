@@ -183,7 +183,8 @@ export const TOOLS: AssistantTool[] = [
   },
   {
     name: 'catalog_search',
-    description: '按关键词、别名与名称搜索目录条目，返回展开后的条目、命中理由与歧义判定；ambiguous 为 true 时，先用给出的追问问清楚口径，再继续',
+    description: '按关键词、别名与名称搜索目录条目，返回展开后的条目、命中理由与歧义判定；ambiguous 为 true 时，先用给出的追问问清楚口径，再继续；'
+      + '输出里有「默认口径：」行时，回答里要写明按哪个默认口径理解了哪个词',
     inputSchema: {
       type: 'object', required: ['query'],
       properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 } },
@@ -205,13 +206,16 @@ export const TOOLS: AssistantTool[] = [
       // 排到的条目都算本轮检索到（含投影不可用回退的那部分），每个都带语义哈希
       for (const r of ranked) ctx?.retrieved.add(r.entry.id);
       // 回退时得分全为 0，照样判定（一律按差异追问）
-      const { ambiguous, groups } = judgeAmbiguity(ranked, c, q);
+      const { ambiguous, groups, defaults } = judgeAmbiguity(ranked, c, q);
       // 歧义候选留在轮上下文里（⑥-3）：随本轮答复返回并加密存进对话，供前端点选、/assistant 的 choice 入参核对；同一轮再搜且不歧义时清空，只认最后一次
       if (ctx) ctx.choices = ambiguous ? groups.map(g => ({ term: g.term, candidates: g.candidates })) : undefined;
       const entries = ranked.length
         ? ranked.map(r => r.reasons.length ? `${withHash(r.entry)}\n${hitLine(r.reasons)}` : withHash(r.entry)).join('\n\n')
         : toMarkdown([]);
-      return [`ambiguous: ${ambiguous}`, entries, ...(ambiguous ? groups.map(comparison) : [])].join('\n\n');
+      // 词的默认指向（ADR-0056）：没追问、按默认条目处理的组，每项一行（指标的名称就是键），让助手在回答里转述这一句
+      const defaultLines = defaults.map(({ term, entryId }) =>
+        `默认口径：按默认口径 ${c.entries.find(e => e.id === entryId)?.name}（${entryId}）理解『${term}』；用户要别的口径时请换一种说法再问`);
+      return [`ambiguous: ${ambiguous}`, entries, ...defaultLines, ...(ambiguous ? groups.map(comparison) : [])].join('\n\n');
     },
   },
   {
