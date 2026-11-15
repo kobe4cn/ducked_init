@@ -255,7 +255,8 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
                   </Field>
                 </div>
                 <SourceFields key={kind} kind={kind} values={values} />
-                {kind === 'upload' && <UploadPreview key={kind} />}
+                {/* 不能再给 key={kind}：与上面的 SourceFields 同 key，React 会报 duplicate key */}
+                {kind === 'upload' && <UploadPreview />}
                 <div>
                   <Button type="submit" disabled={submitting}>{submitting ? '正在校验…' : '校验并登记'}</Button>
                 </div>
