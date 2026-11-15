@@ -20,7 +20,8 @@ const DELIMS = [',', ';', '\t', '|'];
 /** 列类型的下拉选项：白名单（source-config.ts）；预览识别出 DECIMAL(p,s) 时另加进那一列 */
 const COLUMN_TYPES = ['VARCHAR', 'BIGINT', 'DOUBLE', 'BOOLEAN', 'DATE', 'TIMESTAMP'];
 
-interface PreviewActionData { preview?: UploadPreviewData; previewError?: string }
+/** previewError：预览本身的校验错误；error：读表单之前就拒绝的请求（文件超过本租户上传上限，此时还不知道是预览），两者都显示为「预览失败」 */
+interface PreviewActionData { preview?: UploadPreviewData; previewError?: string; error?: string | null }
 
 export function UploadPreview() {
   const fetcher = useFetcher<PreviewActionData>();
@@ -88,6 +89,7 @@ export function UploadPreview() {
 
   const tableOk = TABLE_NAME.test(table);
   const busy = fetcher.state !== 'idle';
+  const previewError = fetcher.data?.previewError || fetcher.data?.error;
   return (
     <div className="rounded-2xl border bg-white p-6 shadow-sm" data-upload-preview>
       <input type="hidden" name="options" value={optionsJson} />
@@ -100,11 +102,11 @@ export function UploadPreview() {
       </div>
       <FieldDescription>预览不保存文件；确认登记时按这里确认的选项读取。</FieldDescription>
 
-      {fetcher.data?.previewError && (
-        <Alert variant="destructive" role="alert" className="mt-4">
+      {previewError && (
+        <Alert variant="destructive" role="alert" className="mt-4" data-preview-error>
           <CircleAlert />
           <AlertTitle>预览失败</AlertTitle>
-          <AlertDescription>{fetcher.data.previewError}</AlertDescription>
+          <AlertDescription>{previewError}</AlertDescription>
         </Alert>
       )}
 
