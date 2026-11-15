@@ -1,4 +1,5 @@
 // app/.server/uploads.ts —— 文件上传数据源的文件（ADR-0037）：存在租户数据湖前缀的 _uploads/<上传目录 ID>/<表名>.csv。
+// 登记时解码识别原编码（UTF-8 严格解码失败再按 GBK），统一转成 UTF-8 文本存湖，原编码记进审计。
 // 只在平台进程里写与删：对象存储用平台账号，本地目录直接写文件（按 isS3 分派，同 lake-storage.ts）。
 // 路径每次由当前数据湖前缀拼出，不存绝对 URI，迁移数据湖前缀后照样能读
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -26,13 +27,23 @@ export async function uploadDirUri(tenantId: string, dir: string) {
   return uploadDirOf(lake.dataPath, dir);
 }
 
-/** 文件内容按 UTF-8 解码（去掉 BOM）；不是 UTF-8 时抛 400 */
-export function decodeUtf8(bytes: Uint8Array) {
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch {
-    throw new SourceError('文件不是 UTF-8 编码，请另存为 UTF-8 后再上传');
+/**
+ * 文件内容解码（去掉 BOM）：默认先按 UTF-8 严格解码，失败再按 GBK（都转成 UTF-8 字符串，ADR-0037）；
+ * 两种都失败抛 400。短的纯 ASCII 文件两种编码都合法，按 UTF-8 判定。给了 encoding 就只按那一种解码
+ */
+export function decodeUpload(bytes: Uint8Array, encoding?: 'utf-8' | 'gbk'): { text: string; encoding: 'utf-8' | 'gbk' } {
+  const tryDecode = (enc: 'utf-8' | 'gbk') => {
+    try {
+      return new TextDecoder(enc, { fatal: true }).decode(bytes);
+    } catch {
+      return null;
+    }
+  };
+  for (const enc of encoding ? [encoding] : (['utf-8', 'gbk'] as const)) {
+    const text = tryDecode(enc);
+    if (text !== null) return { text, encoding: enc };
   }
+  throw new SourceError('文件不是 UTF-8 或 GBK 编码，请另存为 UTF-8 后再上传');
 }
 
 /** 把一张表的 CSV 写进上传目录，已存在时覆盖 */
