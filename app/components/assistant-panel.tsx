@@ -8,19 +8,25 @@
 // 窗口 / 粒度 / 维度 / 人群与数据截至），新发的回答与打开历史对话都显示；卡片只进响应，不进发给模型的历史。
 // 计划卡的下一步入口（#453，P4⑯b）：通过的卡按 mode 给结果页链接或续写按钮，按钮替本人发一句固定续写（send(text)，不动
 // 输入框），由助手工具重新校验后再存草稿 / 填工作台；没有 planCard 只有 workbenchSql 的消息照旧给「填入工作台」链接
+// 歧义追问的候选按钮（⑥-4，ADR-0047 / 0046）：带 choices 的答复下列出候选，点选后 POST choice 继续这一轮——回答的文字由
+// 服务端生成、POST 不返回，所以本地不追加，成功后整个对话按服务端重新读回（消息、下标与卡片都以它为准）；
+// 被分享人只读（readOnlyOwner）：服务端照旧返回 choices，候选按钮与「记为知识提案」卡片只在前端隐藏
+// 「记为知识提案」卡片（KnowledgeAskCard）：点选候选的答复下由服务端确定性生成，确认后生成待复核的默认指向提案
 import { useEffect, useRef, useState } from 'react';
 import { Link, useFetcher, useLocation } from 'react-router';
 import { AlertTriangle, History, Send, Sparkles, X } from 'lucide-react';
+import { KnowledgeAskCard } from '~/components/knowledge-ask-card';
 import { PlanCard } from '~/components/plan-card';
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
+import type { AskCard } from '~/.server/assistant/knowledge-ask';
 import type { PlanCardView } from '~/.server/assistant/plan-card';
 
-interface Message { role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: { sql: string; rows: number; columns: string[] }; workbenchSql?: string; planCard?: PlanCardView }
+interface Message { role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: { sql: string; rows: number; columns: string[] }; workbenchSql?: string; planCard?: PlanCardView; choices?: { term: string; candidates: { entryId: string; name: string }[] }[]; askCard?: AskCard }
 interface Summary { id: string; title: string; updatedAt: string; owner?: string }
 interface Conversation { id: string; title: string; messages: Message[]; owned: boolean; sharedWith: string[] }
 type Overview = { configured: boolean; toolSupport: boolean | null; canManageProvider: boolean; tools: string[]; mine: Summary[]; shared: Summary[]; conversation?: Conversation } | { error: string };
-type TurnResult = { conversationId: string; reply: string; toolsUsed: string[]; workbenchSql?: string; planCard?: PlanCardView } | { error: string };
+type TurnResult = { conversationId: string; reply: string; toolsUsed: string[]; workbenchSql?: string; planCard?: PlanCardView; choices?: Message['choices']; askCard?: AskCard } | { error: string };
 type ShareResult = { ok: true; email: string } | { error: string };
 
 const JSON_POST = { method: 'post', action: '/assistant', encType: 'application/json' } as const;
@@ -46,6 +52,8 @@ export function AssistantPanel() {
   const handledShare = useRef<ShareResult | undefined>(undefined);
   /** 最近一次发送是不是计划卡按钮发的固定续写：出错的回填只在用输入框发送时做，续写文字不放回输入框 */
   const sentFollowUp = useRef(false);
+  /** 最近一次发送是不是点选歧义候选：回答由服务端生成、本地没追加过消息，成功后改为整个对话重新读回 */
+  const sentChoice = useRef(false);
   const scrollEnd = useRef<HTMLDivElement>(null);
 
   // 每次打开都重新取：管理员可能刚在「模型服务」页配置好
@@ -57,14 +65,29 @@ export function AssistantPanel() {
     const data = turn.data;
     if (turn.state !== 'idle' || !data || handledResult.current === data) return;
     handledResult.current = data;
+    const wasChoice = sentChoice.current;
+    sentChoice.current = false;
     if ('error' in data) {
-      // 没答上的问题放回输入框，免得下次发送时出现两条连续的提问；计划卡按钮发的固定续写不放回
+      // 没答上的问题放回输入框，免得下次发送时出现两条连续的提问；计划卡按钮发的固定续写不放回；
+      // 点选候选时本地没追加过消息，只报错、不移除也不回填
       setError(data.error);
+      if (wasChoice) return;
       setMessages(m => m.slice(0, -1));
       if (!sentFollowUp.current) setInput(current => current || messages.at(-1)?.content || '');
     } else {
       setConversationId(data.conversationId);
-      setMessages(m => [...m, { role: 'assistant', content: data.reply, toolsUsed: data.toolsUsed, ...(data.workbenchSql ? { workbenchSql: data.workbenchSql } : {}), ...(data.planCard ? { planCard: data.planCard } : {}) }]);
+      if (wasChoice) {
+        // 点选的回答与「记为知识提案」卡片都由服务端生成，重新读回整个对话，下标以服务端为准
+        conversationLoad.load(`/assistant?id=${data.conversationId}`);
+      } else {
+        setMessages(m => [...m, {
+          role: 'assistant', content: data.reply, toolsUsed: data.toolsUsed,
+          ...(data.workbenchSql ? { workbenchSql: data.workbenchSql } : {}),
+          ...(data.planCard ? { planCard: data.planCard } : {}),
+          ...(data.choices ? { choices: data.choices } : {}),
+          ...(data.askCard ? { askCard: data.askCard } : {}),
+        }]);
+      }
       overview.load('/assistant');
     }
   }, [turn.state, turn.data]);
@@ -125,6 +148,14 @@ export function AssistantPanel() {
   function submitShare(intent: 'share' | 'unshare', email: string) {
     if (!conversationId || !email.trim()) return;
     shareFetcher.submit({ intent, conversationId, email }, JSON_POST);
+  }
+
+  /** 点选歧义追问的候选（⑥-4）：POST choice 继续这一轮，回答与卡片由服务端生成、成功后整个对话重新读回 */
+  function pickChoice(entryId: string) {
+    if (!conversationId || busy || !usable || readOnlyOwner) return;
+    sentChoice.current = true;
+    setError(null);
+    turn.submit({ conversationId, choice: { entryId } }, JSON_POST);
   }
 
   const conversationList = (title: string, items: Summary[], testId: string) => (
@@ -211,6 +242,23 @@ export function AssistantPanel() {
                         <p className="whitespace-pre-wrap">{m.content}</p>
                         {m.planCard && <PlanCard card={m.planCard} workbenchSql={m.workbenchSql} onFollowUp={readOnlyOwner ? undefined : t => send(t)} />}
                         {!m.planCard && m.workbenchSql && <Link data-prefill to={`/workbench?sql=${encodeURIComponent(m.workbenchSql)}`} className="text-xs underline">填入工作台</Link>}
+                        {/* 歧义追问的候选按钮（⑥-4）：被分享人只读，服务端照旧返回 choices，这里不渲染按钮 */}
+                        {!readOnlyOwner && m.choices && m.choices.length > 0 && (
+                          <div data-choices className="mt-2 space-y-2 rounded-lg border bg-slate-50 p-3">
+                            {m.choices.map(g => (
+                              <div key={g.term} className="space-y-1">
+                                <p className="text-slate-500">{`『${g.term}』指哪一个？`}</p>
+                                <div className="flex flex-wrap gap-1.5">
+                                  {g.candidates.map(c => (
+                                    <Button key={c.entryId} type="button" size="xs" variant="outline" data-choice={c.entryId} disabled={busy} onClick={() => pickChoice(c.entryId)}>{c.name}</Button>
+                                  ))}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {/* 「记为知识提案」卡片（⑥-4）：同样只给本人渲染，被分享人不能替主人提提案 */}
+                        {!readOnlyOwner && m.askCard && conversationId && <KnowledgeAskCard card={m.askCard} conversationId={conversationId} />}
                       </>
                     )}
                     {m.toolsUsed && m.toolsUsed.length > 0 && (
