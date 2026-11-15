@@ -14,7 +14,6 @@
 // { intent: 'knowledge.propose', conversationId, index }（⑥-4，ADR-0046 / 0056）把对话里点选候选时存下的 chosen 确认成一条
 // 待复核的 term_default 提案：只收这两个字段，词与条目从服务端存下的 chosen 里取（不收客户端传来的值），
 // 卡片的显示条件（无权限 / 已有同词提案 / 指纹已拒绝）同样挡住提交（403 / 409）。出错返回 { error } 与对应状态码
-import type { ShouldRevalidateFunctionArgs } from 'react-router';
 import type { Route } from './+types/assistant';
 import { can } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
@@ -55,12 +54,12 @@ const errorResponse = (e: unknown) => {
   throw e;
 };
 
-// 侧栏对这个路由的所有读取都是显式的 fetcher load（打开面板 / 打开对话 / 点选候选与分享后重读），
-// 动作提交后的自动 revalidate 只会带来两个坏处：每发一条消息都多一次 GET 重读；「记为知识提案」确认后
-// 刚显示的「已提交，待复核」会被重读刷掉（⑥-4，卡片读时组装，有了待复核提案就不再带）。同一 URL 的
-// 自动重读关掉，换 URL 的 load（打开另一个对话）照常
-export const shouldRevalidate = ({ currentUrl, nextUrl }: ShouldRevalidateFunctionArgs) =>
-  currentUrl.pathname + currentUrl.search !== nextUrl.pathname + nextUrl.search;
+// 这个资源路由只服务挂在 app-shell 上的 AI 助手侧栏，侧栏的读取全部是显式的 fetcher load（打开面板 / 打开对话 /
+// 点选候选与分享后重读；fetcher.load 本身不经过 shouldRevalidate）。所以一律关掉自动重读：否则动作提交后会多一次
+// GET，「记为知识提案」确认后刚显示的「已提交，待复核」会被重读刷掉（⑥-4，卡片读时组装，有了待复核提案就不再带）；
+// 页面跳转时 overview / conversationLoad 两个 fetcher 也会被重读，conversationLoad 读回旧对话会盖掉面板里的当前对话。
+// 代价：在别的页面提交表单后，面板不会自动刷新，要等下一次显式 load
+export const shouldRevalidate = () => false;
 
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requireMember(request);

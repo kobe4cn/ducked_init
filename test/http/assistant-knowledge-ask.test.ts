@@ -4,10 +4,12 @@
 // 同词已有待复核提案（不论挂哪个条目）或指纹已被拒绝过时没有卡片、直接提交 409；查看者没有卡片、提交 403；
 // 被分享人读回没有卡片（候选照旧返回，按钮由前端对只读隐藏）；index 不指 chosen 消息 400，别人的对话 404
 import { eq } from 'drizzle-orm';
+import type { ShouldRevalidateFunctionArgs } from 'react-router';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { assistantConversations, knowledgeAliases } from '../../app/.server/db/schema';
 import { ASSISTANT_CONTEXT } from '../../app/.server/assistant/conversations';
+import { shouldRevalidate } from '../../app/routes/assistant';
 import { decryptForTenant } from '../../app/.server/secrets';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { listProposals, proposeKnowledge, rejectProposal } from '../../app/.server/knowledge/proposals';
@@ -169,5 +171,17 @@ describe('记为知识提案', () => {
     // 别人的对话：有权限但没被分享（管理员也一样）按 404，不泄露存在性
     const admin = await loginAs(app, 'admin@acme.com');
     expect((await post(admin, { intent: 'knowledge.propose', conversationId: id, index: 2 })).status).toBe(404);
+  });
+});
+
+describe('/assistant 资源路由的 shouldRevalidate', () => {
+  it('一律不自动重读：fetcher 提交（页面地址不变）和普通页面跳转（页面地址变了）都返回 false，侧栏只靠显式 load 读取', () => {
+    // React Router 会传入页面地址与默认值；这里照它的调用方式传参，确认不论参数如何都不重读
+    const revalidate = shouldRevalidate as (args: ShouldRevalidateFunctionArgs) => boolean;
+    const args = (from: string, to: string, defaultShouldRevalidate: boolean) =>
+      ({ currentUrl: new URL(from, 'http://x'), nextUrl: new URL(to, 'http://x'), defaultShouldRevalidate }) as ShouldRevalidateFunctionArgs;
+    expect(revalidate(args('/lineage', '/lineage', true))).toBe(false);
+    expect(revalidate(args('/lineage', '/knowledge', true))).toBe(false);
+    expect(revalidate(args('/lineage', '/lineage?tab=flow', true))).toBe(false);
   });
 });
