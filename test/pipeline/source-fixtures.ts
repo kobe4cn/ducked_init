@@ -445,3 +445,16 @@ export const MONGO_USERS = {
   partial: { user: `crm_src_partial${WORKER_SUFFIX}`, password: 'partial-p@ss' },
   stranger: { user: `crm_src_stranger${WORKER_SUFFIX}`, password: 'stranger-p@ss' },
 };
+
+/**
+ * GBK 编码的活动报名 CSV（186 字节，中文表头）：报名编号、姓名、手机、活动、报名时间、是否到场，3 行。
+ * 严格 UTF-8 解码失败、GBK 解码成功。Node 只能编码出 UTF-8，这里的字节由
+ * `python3 -c "print('…'.encode('gbk').hex())"` 生成后固化成十六进制常量，不加依赖
+ */
+export const GBK_SIGNUPS_CSV = Buffer.from(
+  'b1a8c3fbb1e0bac52cd0d5c3fb2ccad6bbfa2cbbeeb6af2cb1a8c3fbcab1bce42ccac7b7f1b5bdb3a10a' +
+    '312cd5c5c8fd2c31333830303030303030312cc7efbcbeb7a2b2bcbbe12c323032362f392f312031343a30352ccac70a' +
+    '322cc0eecbc42c31333830303030303030322cc7efbcbeb7a2b2bcbbe12c323032362f392f312031343a30362cb7f10a' +
+    '332ccdf5cee52c31333830303030303030332cbfcdbba7b4f0d0bbbbe12c323032362f392f322030393a31302ccac70a',
+  'hex',
+);

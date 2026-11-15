@@ -153,8 +153,8 @@ const parseName = (raw: string | undefined) => {
   return name;
 };
 
-/** 上传文件的元数据，随登记一起记审计 source.file_uploaded（不含文件内容） */
-type UploadMeta = { table: string; file: string; bytes: number; encoding: 'utf-8' };
+/** 上传文件的元数据，随登记一起记审计 source.file_uploaded（不含文件内容）；encoding 是识别出的原编码（ADR-0037） */
+type UploadMeta = { table: string; file: string; bytes: number; encoding: 'utf-8' | 'gbk' };
 
 /**
  * 登记数据源：校验连接与只读后加密保存凭据，记下列出的表。所有表都不在同步范围内，等成员选表后才采集与同步。

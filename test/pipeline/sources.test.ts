@@ -1,5 +1,5 @@
 // 数据源登记的流水线接缝：成员登记数据源（领域函数）→ 平台探测只读、加密保存凭据、列出表 → 选入同步范围后调度器派发采集任务 → 查看列统计与水位线候选
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { rm, symlink } from 'node:fs/promises';
 import pg from 'pg';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -11,12 +11,13 @@ import { loadSourceSpec } from '../../app/.server/source-config';
 import { confirmWatermark, getSource, registerSource, SourceError, testSource } from '../../app/.server/sources';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { syncSource } from '../../app/.server/source-sync';
+import { tenantPiiSalt } from '../../app/.server/secrets';
 import { claimNextTask, enqueueTask, finishTask } from '../../app/.server/tasks';
-import { storeUpload } from '../../app/.server/uploads';
+import { decodeUpload, storeUpload } from '../../app/.server/uploads';
 import { resetDb } from '../http/harness';
 import { dbNameOf } from '../setup-env';
-import { memberOf, newTenant, onLake, selectAllTables } from './fixtures';
-import { duckdbSourceFile, ensurePgAccounts, grantOnSource, MONGO_USERS, pgSourceInput, READER, s3SourceFiles, seedMongoSource, seedMysqlSource, SOURCE_DB_URL, WRITER } from './source-fixtures';
+import { memberOf, newTenant, onLake, publish, selectAllTables, silver } from './fixtures';
+import { duckdbSourceFile, ensurePgAccounts, GBK_SIGNUPS_CSV, grantOnSource, MONGO_USERS, pgSourceInput, READER, s3SourceFiles, seedMongoSource, seedMysqlSource, SOURCE_DB_URL, WRITER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -302,6 +303,47 @@ describe('文件上传数据源', () => {
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
     const rows = await onLake<{ id: string; name: string }>(acme, `SELECT id::VARCHAR AS id, name FROM "${bronzeSchema(id)}"."signups" ORDER BY id`);
     expect(rows).toEqual([{ id: '1', name: '张三' }, { id: '2', name: '李四' }, { id: '3', name: '王五' }]);
+  });
+
+  it('GBK 编码的 CSV 登记时自动识别转成 UTF-8 存湖、审计记 gbk，发布映射后标准层有这些客户', async () => {
+    const acme = await newTenant('acme');
+    const author = await memberOf(acme, 'de@acme.com');
+    const reviewer = await memberOf(acme, 'de2@acme.com');
+    const { text, encoding } = decodeUpload(GBK_SIGNUPS_CSV);
+    expect(encoding).toBe('gbk');
+    expect(text).toContain('报名编号,姓名,手机,活动,报名时间,是否到场');
+    // 短的纯 ASCII 文件两种编码都合法，按 UTF-8 判定
+    expect(decodeUpload(Buffer.from('id,name\n1,zhang\n'))).toEqual({ text: 'id,name\n1,zhang\n', encoding: 'utf-8' });
+    const dir = randomUUID();
+    await storeUpload(acme, dir, 'signups', text);
+    const { id, tables } = await registerSource(author, { kind: 'upload', name: '活动报名', dir, table: 'signups' },
+      { table: 'signups', file: '活动报名.csv', bytes: GBK_SIGNUPS_CSV.length, encoding });
+    expect(tables).toEqual(['signups']);
+    await selectAllTables(author, id);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    await syncSource(author, id);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const rows = await onLake<{ id: string; name: string }>(acme, `SELECT "报名编号"::VARCHAR AS id, "姓名" AS name FROM "${bronzeSchema(id)}"."signups" ORDER BY id`);
+    expect(rows).toEqual([{ id: '1', name: '张三' }, { id: '2', name: '李四' }, { id: '3', name: '王五' }]);
+
+    await publish(author, reviewer, id, `model: 1
+entity: customer
+table: signups
+fields:
+  customer_id: 报名编号
+  name: 姓名
+  phone: string(手机)
+  registered_at: from_timezone(报名时间, 'Asia/Shanghai')
+`);
+    // 姓名与手机是敏感列，标准层只存加盐哈希（ADR-0005）：哈希对得上，说明 GBK 解出的正是这些字
+    const salt = await tenantPiiSalt(acme);
+    const hash = (v: string) => createHash('sha256').update(salt + v).digest('hex');
+    const customers = await silver(acme, 'customer', 'customer_id::INT');
+    expect(customers.map(c => ({ id: c.customer_id, name: c.name, phone: c.phone }))).toEqual([
+      { id: '1', name: hash('张三'), phone: hash('13800000001') },
+      { id: '2', name: hash('李四'), phone: hash('13800000002') },
+      { id: '3', name: hash('王五'), phone: hash('13800000003') },
+    ]);
   });
 });
 

@@ -9,7 +9,7 @@ import { navFor } from '~/.server/nav';
 import type { CurrentMember } from '~/.server/auth';
 import { listSources, registerSource, SourceError } from '~/.server/sources';
 import type { SourceInput } from '~/.server/source-config';
-import { decodeUtf8, removeUpload, storeUpload, UPLOAD_TABLE, UPLOAD_TABLE_RULE } from '~/.server/uploads';
+import { decodeUpload, removeUpload, storeUpload, UPLOAD_TABLE, UPLOAD_TABLE_RULE } from '~/.server/uploads';
 import { verifyDifferences } from '~/.server/source-verify';
 import { storageOverQuota } from '~/.server/storage-quota';
 import { uploadLimitOf } from '~/.server/tenants';
@@ -110,11 +110,11 @@ async function registerUpload(member: CurrentMember, input: SourceInput, file: F
   if (file.size === 0) throw new SourceError('文件是空的');
   const table = (input.table ?? '').trim();
   if (!UPLOAD_TABLE.test(table)) throw new SourceError(UPLOAD_TABLE_RULE);
-  const text = decodeUtf8(new Uint8Array(await file.arrayBuffer()));
+  const { text, encoding } = decodeUpload(new Uint8Array(await file.arrayBuffer()));
   const dir = crypto.randomUUID();
   try {
     await storeUpload(member.tenant.id, dir, table, text);
-    return await registerSource(member, { ...input, table, dir }, { table, file: file.name, bytes: file.size, encoding: 'utf-8' });
+    return await registerSource(member, { ...input, table, dir }, { table, file: file.name, bytes: file.size, encoding });
   } catch (e) {
     await removeUpload(member.tenant.id, dir);
     throw e;

@@ -84,6 +84,7 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 | `drainUntilSucceeded(name, task, retry)` | 跑空调度器后查任务状态，failed 时调 `retry` 重新入队，最多 3 次，仍失败就抛出任务原始错误（错误里带 `name`、任务 kind、状态、重试次数）；`task` 为 null 时直接抛错。采集任务重试用 `relistSource`（表已在同步范围内时 `setSyncScope` 返回 `task: null`），同步任务重试再调 `syncSource` |
 | `seedMysqlSource()` | MySQL 源库，`orders` 带自增主键与 `updated_at`，表与 `order_id` 列带注释（`amount`、`updated_at` 没有，用于测空串视为没有注释）；`{ withView: true }` 另建视图 `orders_v`（`SELECT order_id FROM orders`，用于测视图不存表注释、列注释继承基表）（需 `TEST_MYSQL_URL`） |
 | `seedMongoSource()` / `MONGO_USERS` | MongoDB 源库与几种权限的账号（需 `TEST_MONGO_URL`） |
+| `GBK_SIGNUPS_CSV` | GBK 编码的活动报名 CSV（`Uint8Array`，186 字节，中文表头 3 行；严格 UTF-8 解码失败、GBK 成功）：文件上传数据源转码测试用，字节由 `python3 -c "print('…'.encode('gbk').hex())"` 生成后固化 |
 
 ### `test/pipeline/mapping-fixtures.ts`
 

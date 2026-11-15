@@ -1,4 +1,5 @@
 // 数据源的 HTTP 接缝：数据工程师在界面上登记、修改与轮换凭据、测试连接、选定同步范围、查看列统计并确认水位线；凭据在任何页面与接口里都不回显
+import { readFile } from 'node:fs/promises';
 import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -10,7 +11,7 @@ import { ignoreColumn } from '../../app/.server/mappings';
 import { registerSource, relistSource } from '../../app/.server/sources';
 import { setTenantQuota } from '../../app/.server/tenants';
 import { drain, memberOf, newTenant, publish, selectAllTables } from '../pipeline/fixtures';
-import { grantOnSource, pgSourceInput, READER, WRITER } from '../pipeline/source-fixtures';
+import { GBK_SIGNUPS_CSV, grantOnSource, pgSourceInput, READER, WRITER } from '../pipeline/source-fixtures';
 import { dbNameOf } from '../setup-env';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
 
@@ -142,14 +143,33 @@ describe('登记数据源', () => {
     expect(audit).not.toContain('张三');
   });
 
-  it('上传登记失败（表名不合法、文件为空、不是 .csv、不是 UTF-8、名称为空）时 400，不留下数据源与文件；没有 sources:write 的角色 403', async () => {
+  it('GBK 编码的 CSV 登记为文件上传数据源：湖里存的是转成 UTF-8 的内容，审计记原编码 gbk', async () => {
+    const { tenantId, browser } = await engineerOf('acme');
+    const res = await upload(browser, { name: '活动报名', table: 'signups' }, new File([GBK_SIGNUPS_CSV], 'signups.csv'));
+    expect(res.status).toBe(302);
+    const id = sourceIdOf(res);
+
+    // 湖里的文件是转成 UTF-8 的文本（中文表头与名字都能直接读出来）
+    const [source] = await getDb().select().from(sources).where(eq(sources.id, id));
+    const stored = await readFile(`${await uploadsOf(tenantId)}${source.config.dir}/signups.csv`, 'utf8');
+    expect(stored).toContain('报名编号,姓名,手机,活动,报名时间,是否到场');
+    expect(stored).toContain('1,张三,13800000001,秋季发布会,2026/9/1 14:05,是');
+
+    // 审计记识别出的原编码，不含文件内容
+    const audits = await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'source.file_uploaded'));
+    expect(audits).toHaveLength(1);
+    expect(audits[0].detail).toEqual({ table: 'signups', file: 'signups.csv', bytes: GBK_SIGNUPS_CSV.length, encoding: 'gbk' });
+  });
+
+  it('上传登记失败（表名不合法、文件为空、不是 .csv、既不是 UTF-8 也不是 GBK、名称为空）时 400，不留下数据源与文件；没有 sources:write 的角色 403', async () => {
     const { tenantId, browser } = await engineerOf('acme');
     const csv = (name = 'a.csv', body = 'id\n1\n') => new File([body], name);
     for (const [name, table, file, message] of [
       ['活动报名', '../escape', csv(), '表名只能包含小写字母'],
       ['活动报名', 'signups', csv('a.csv', ''), '文件是空的'],
       ['活动报名', 'signups', csv('a.txt'), '.csv 文件'],
-      ['活动报名', 'signups', new File([new Uint8Array([0xd5, 0xc5])], 'a.csv'), '不是 UTF-8'],
+      // 0x81 是 GBK 双字节的首字节范围但单独出现不合法，UTF-8 与 GBK 都解不了
+      ['活动报名', 'signups', new File([new Uint8Array([0x81])], 'a.csv'), '不是 UTF-8'],
       // 通过前面的校验、文件已写进上传目录，registerSource 才失败：目录要删掉
       ['', 'signups', csv(), '请填写数据源名称'],
     ] as const) {
