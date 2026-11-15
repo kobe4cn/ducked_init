@@ -3,7 +3,7 @@
 // 填上表名可以把 SELECT 的结果保存为个人沙箱表（SANDBOX_TTL_DAYS 天后过期），「我的沙箱表」列出表名、行数、过期时间与分享给了谁，
 // 可以按邮箱分享给本租户有沙箱权限的成员或撤销；「分享给我的」列出别人分享来的表（只读，在查询里按 sandbox_<主人>.<表名> 读）。
 // 左侧目录树按 标准层 / 结果层 / 我的沙箱 / 分享给我的 列出能读的表、字段类型、行数与湖中位置，点表名把带引号的引用插进 SQL 框；
-// 「原始层」按数据源名列出回放后当前状态的视图（敏感列是哈希），名字与保留名冲突的数据源给出没挂载的原因。
+// 「原始层」按数据源名列出回放后当前状态的视图（敏感列是哈希），每个数据源默认折叠，名字与保留名冲突的数据源给出没挂载的原因。
 // 「AI 起草」把需求与能读的表名、字段名发给模型服务，起草的 SQL 通过白名单校验后填进编辑框、不执行（ADR-0043），没通过时编辑框保留原来的 SQL。
 // 结果上方的「请 AI 解读」先由服务端重新执行、列出要发送与剔除的列，成员确认后再执行一次，把前 INTERPRET_ROWS 行（剔除敏感列与哈希列）发给模型服务，显示解读；
 // 租户没打开「发送脱敏样本」时只发 SQL、列名与类型、行数和列统计，确认框与解读结果都写明没有发送样本行，并请租户管理员到「模型服务」页打开。
@@ -162,14 +162,21 @@ function RawSection({ sources, onInsert }: { sources: RawCatalogSource[]; onInse
         <ul className="space-y-1 py-1 pl-3">
           {sources.map(source => (
             <li key={source.name} data-raw-source={source.name}>
-              <p className="flex items-center gap-1 text-slate-600"><Database className="size-3.5 shrink-0 text-slate-500" />{source.name}</p>
-              {source.error ? <p className="flex items-start gap-1 pl-5 text-xs text-red-600" data-raw-error><CircleAlert className="size-3.5 shrink-0" />{source.error}</p> : source.tables.length === 0
-                ? <p className="pl-5 text-xs text-slate-400">还没有同步的表</p>
-                : (
-                  <ul className="space-y-1 pl-3">
-                    {source.tables.map(t => <CatalogTableItem key={t.ref} table={t} onInsert={onInsert} />)}
-                  </ul>
-                )}
+              {/* 数据源多时默认折叠，点名字展开；没挂载的默认展开，原因不被藏起来 */}
+              <details className="group/source" open={source.error ? true : undefined}>
+                <summary className="flex cursor-pointer list-none items-center gap-1 text-slate-600">
+                  <ChevronRight className="size-3.5 shrink-0 text-slate-400 transition-transform group-open/source:rotate-90" />
+                  <Database className="size-3.5 shrink-0 text-slate-500" />{source.name}
+                  {!source.error && <span className="ml-auto shrink-0 text-xs text-slate-400">{`${source.tables.length} 张表`}</span>}
+                </summary>
+                {source.error ? <p className="flex items-start gap-1 pl-5 text-xs text-red-600" data-raw-error><CircleAlert className="size-3.5 shrink-0" />{source.error}</p> : source.tables.length === 0
+                  ? <p className="pl-5 text-xs text-slate-400">还没有同步的表</p>
+                  : (
+                    <ul className="space-y-1 py-1 pl-3">
+                      {source.tables.map(t => <CatalogTableItem key={t.ref} table={t} onInsert={onInsert} />)}
+                    </ul>
+                  )}
+              </details>
             </li>
           ))}
         </ul>
