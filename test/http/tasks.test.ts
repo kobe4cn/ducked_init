@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
 import { getTenantLake, tenantDataPath } from '../../app/.server/lake';
@@ -181,6 +181,22 @@ describe('运营者设置租户配额', () => {
     const audit = await (await admin.get('/audit')).text();
     expect(audit).toContain('调整配额');
     expect(audit).toContain('内存 2048 MiB → 4096 MiB，线程 2 → 4，并发任务 1 → 3，上传 100 MiB → 50 MiB，存储 10240 MiB → 20480 MiB');
+  });
+
+  it('配额区块显示桶用量与统计时间；未统计时显示「尚未统计」', async () => {
+    const acme = await newTenant('acme');
+    await createOperator('ops@platform.com');
+    const { browser: ops } = await loginAsOperator(app, 'ops@platform.com');
+
+    const before = await (await ops.get(`/ops/tenants/${acme}`)).text();
+    expect(before).toContain('尚未统计');
+
+    // 模拟调度器统计完一轮写回
+    await getDb().execute(sql`UPDATE platform.tenant_lakes SET storage_used_bytes = 5 * 1024 * 1024, storage_measured_at = now() WHERE tenant_id = ${acme}`);
+    const after = await (await ops.get(`/ops/tenants/${acme}`)).text();
+    expect(after).toContain('已用 5 MiB / 配额 10240 MiB');
+    expect(after).toContain('统计于');
+    expect(after).not.toContain('尚未统计');
   });
 });
 

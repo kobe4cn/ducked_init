@@ -13,6 +13,7 @@ import { enqueueDueSandboxExpiries } from '../sandbox';
 import { enqueueDueExpiries } from '../snapshots';
 import { enqueueDueSyncs } from '../source-sync';
 import { enqueueDueVerifies } from '../source-verify';
+import { refreshStorageUsage } from '../storage-quota';
 import { claimNextTask, failStaleTasks, finishTask, heartbeatTasks, setWorkerPid, type ClaimedTask } from '../tasks';
 import { runHooks, TASK_HOOKS, type TaskHookTable } from './task-hooks';
 import type { WorkerInput, WorkerOutcome } from './worker';
@@ -134,8 +135,8 @@ export function createDispatcher({
   let lastSyncCheck = 0;
   /**
    * 为到期的数据源入队同步，再入队核对（有同步在排队时等下一次检查），然后为有新变化的租户入队合并，为有到期快照的租户入队快照过期、有到期沙箱表的入队沙箱表过期，
-   * 再为依赖的实体有新合并的已发布指标、标签与模板入队当天的刷新，最后删掉过了保留期的人群导出文件与到期的下载链接：
-   * 每 syncCheckMs 一次，多个调度器同时检查也不会重复入队
+   * 再为依赖的实体有新合并的已发布指标、标签与模板入队当天的刷新，然后删掉过了保留期的人群导出文件与到期的下载链接，最后统计存储用量：
+   * 每 syncCheckMs 一次，多个调度器同时检查也不会重复入队、重复统计
    */
   async function scheduleSyncs() {
     if (Date.now() - lastSyncCheck < syncCheckMs) return;
@@ -147,6 +148,7 @@ export function createDispatcher({
     await enqueueDueSandboxExpiries();
     await enqueueDueRefreshes();
     await cleanupExpiredExports();
+    await refreshStorageUsage();
   }
 
   /** 每隔 pollMs 或有工作进程结束时醒来 */
@@ -167,7 +169,7 @@ export function createDispatcher({
     /** 持续运行，直到 stop()；之后等运行中的任务结束再返回 */
     async run() {
       while (!stopped) {
-        await scheduleSyncs().catch(e => console.error('[调度器] 入队到期的同步、核对、合并、快照过期、结果层刷新或清理人群导出出错', e));
+        await scheduleSyncs().catch(e => console.error('[调度器] 入队到期的同步、核对、合并、快照过期、结果层刷新、清理人群导出或统计存储用量出错', e));
         await tick().catch(e => console.error('[调度器] 轮询出错', e));
         await nap();
       }

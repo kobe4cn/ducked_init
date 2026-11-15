@@ -31,6 +31,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       email: operator.email,
       lake: lake && {
         ...lake,
+        storageMeasuredAt: lake.storageMeasuredAt?.toISOString() ?? null,
         migration: lake.migration && {
           ...lake.migration,
           createdAt: lake.migration.createdAt.toISOString(),
@@ -200,6 +201,11 @@ export default function OpsTenant({ loaderData, actionData }: Route.ComponentPro
 
       <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
         <SectionHeader title="配额">每个任务在独立进程中运行，内存与线程按此限制；同时运行的任务超过并发数时排队。存储配额：租户桶的总用量上限，超出后拒绝写入类任务和上传（软配额）。修改对之后派发的任务生效，并记入租户的审计日志。</SectionHeader>
+        <p className="text-sm" data-storage-usage={lake?.storageUsedBytes != null ? 'measured' : 'unmeasured'}>
+          {lake?.storageUsedBytes != null
+            ? `已用 ${Math.ceil(lake.storageUsedBytes / 1024 / 1024)} MiB / 配额 ${tenant.storageQuotaMb} MiB（统计于 ${at(lake.storageMeasuredAt)}）`
+            : '尚未统计'}
+        </p>
         <Form method="post" className="max-w-2xl">
           <input type="hidden" name="intent" value="set-quota" />
           <FieldGroup className="flex-row items-end">

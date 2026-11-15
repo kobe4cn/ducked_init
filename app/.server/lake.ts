@@ -287,6 +287,8 @@ export async function getTenantLake(tenantId: string) {
     dataPath: lake.dataPath,
     catalogSchema: lake.catalogSchema,
     catalogInitialized: !!lake.catalogInitializedAt,
+    storageUsedBytes: lake.storageUsedBytes,
+    storageMeasuredAt: lake.storageMeasuredAt,
     s3User: isS3(lake.dataPath) ? { name: s3UserOf(tenantId), ready: !!lake.s3AccessKey } : null,
     ready: lakeReady(lake),
   };
