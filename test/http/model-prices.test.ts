@@ -20,6 +20,13 @@ async function operator() {
 const auditActions = (html: string) => [...html.matchAll(/data-audit-action="([^"]+)"/g)].map(m => m[1]);
 const times = (actions: string[], label: string) => actions.filter(a => a === label).length;
 
+/** 截出 `<tr ... {attr}="{value}" ...>…</tr>` 那一行，返回各单元格去掉标签后的文字 */
+const rowCells = (html: string, attr: string, value: string) => {
+  const rows = [...html.matchAll(/<tr\b[^>]*>[\s\S]*?<\/tr>/g)].map(m => m[0]).filter(r => r.includes(`${attr}="${value}"`));
+  expect(rows, `${attr}="${value}" 的行`).toHaveLength(1);
+  return [...rows[0].matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/g)].map(m => m[1].replace(/<[^>]+>/g, '').trim());
+};
+
 /** 一次新增 / 修改提交 */
 const post = (browser: ReturnType<TestApp['client']>, overrides: Record<string, string> = {}) =>
   browser.post('/ops/model-prices', {
@@ -52,16 +59,12 @@ describe('运营后台模型单价页', () => {
 
     expect((await post(browser)).status).toBe(302);
     const created = await (await browser.get('/ops/model-prices')).text();
-    expect(created).toContain('data-model="m-fast"');
-    expect(created).toContain('2.5');
-    expect(created).toContain('10');
-    expect(created).toContain('CNY');
+    expect(rowCells(created, 'data-model', 'm-fast').slice(0, 4)).toEqual(['m-fast', '2.5', '10', 'CNY']);
 
     expect((await post(browser, { inputPerMTok: '3', outputPerMTok: '8', currency: 'USD' })).status).toBe(302);
     const updated = await (await browser.get('/ops/model-prices')).text();
-    expect(updated).toContain('data-model="m-fast"');
-    expect(updated).toContain('3');
-    expect(updated).toContain('USD');
+    expect(rowCells(updated, 'data-model', 'm-fast').slice(0, 4)).toEqual(['m-fast', '3', '8', 'USD']);
+    expect(await listModelPrices()).toMatchObject([{ model: 'm-fast', inputPerMTok: 3, outputPerMTok: 8, currency: 'USD' }]);
 
     const events = await (await browser.get('/ops/audit')).text();
     const actions = auditActions(events);
