@@ -6,7 +6,7 @@
 
 **金额按查看时的当前单价折算，不保留价格历史。** 金额 = 窗口内的 token 数 × 查看时 `model_prices` 里的单价。不在 `llm_calls` 上存调用时的单价，也不保留单价的历史版本：改了单价，历史调用的金额跟着变。这样一张表就够，代价是「当时的成本」不可复现——每次改动的前后值都记在平台级审计（`model_price.created` / `model_price.updated`，detail 带修改前后的单价与币种）里，以后真要按调用时单价折算，可以从审计重建价格历史，再另立口径。
 
-**公式与空值。** `costOf(promptTokens, completionTokens, price)`：金额 = `prompt_tokens × 输入单价 / 1,000,000 + completion_tokens × 输出单价 / 1,000,000`，纯函数；token 为 null（embedding 调用没记、或调用失败没拿到 usage）按 0 算。没配单价的模型金额为 0，按「未配置」展示而不是折算成 0 假装便宜。
+**公式与空值。** `costOf(promptTokens, completionTokens, price)`：金额 = `prompt_tokens × 输入单价 / 1,000,000 + completion_tokens × 输出单价 / 1,000,000`，纯函数；token 为 null（embedding 调用没记、或调用失败没拿到 usage）按 0 算。没配单价的模型不折算，按「未配置」展示，而不是当成 0 假装便宜。
 
 **不同币种的金额不换算、不相加。** 每个模型有自己的币种；跨模型、跨租户汇总时按币种分开列，不做汇率换算（汇率每天在变，存哪一天的都不对；真要折算另立配置）。显示规则（如保留几位小数、未配置怎么标）在 #745 定，不在本 ADR。
 
