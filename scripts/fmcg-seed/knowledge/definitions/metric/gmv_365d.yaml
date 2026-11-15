@@ -1,0 +1,8 @@
+# 近 365 天下单金额（GMV）：与 revenue_365d 的区别只在状态——这里含已退款，不扣退款。
+# 用途：与 revenue_365d 共用别名「营收」，制造一个要先追问口径的歧义（ADR-0047），见验收计划 SK.12–SK.16。
+# 不在 scripts/fmcg-seed/definitions/ 里，verify.ts 遇到它会打印「definitions/ 里没有，跳过」。
+base: order
+measure: { agg: sum, field: amount }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed, refunded] }
+window: { field: created_at, days: 365 }
