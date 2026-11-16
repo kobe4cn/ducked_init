@@ -1,13 +1,13 @@
 // 映射表单与 YAML 互转（纯函数）：从映射 YAML 读出每个标准字段的表单状态（源列、常用转换、参数、依据、是否只读），
 // 改单个字段时在原 Document 上改，保留注释与顺序；枚举字段的值对照与兜底读出、写回；表单不认识的写法只读、原样保留；
 // 扩展字段：没用到的源列、读出已有的扩展字段、加上 / 改名 / 删除；映射与引用字段的键空间读出、写回，引用字段按同源目标实体的键空间预填；
-// 指向 customer 的引用字段与扩展字段的 customer_source、扩展字段的键空间读出、写回；实时校验的问题按 path 对应到表单区块
+// 指向 customer 的引用字段与扩展字段的 customer_source、扩展字段的键空间读出、写回；属性取舍名次（survivorship.priority）读出、写回；实时校验的问题按 path 对应到表单区块
 import { parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
 import {
-  dictionaryRows, formUnavailable, groupIssues, identityCandidates, issueTarget, keySpaceOf, newExtension, readExtensions, readForm, readIdentity, readKeySpace, seedDictionary, TRANSFORMS,
-  unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace,
+  dictionaryRows, formUnavailable, groupIssues, identityCandidates, issueTarget, keySpaceOf, newExtension, readExtensions, readForm, readIdentity, readKeySpace, readSurvivorship, seedDictionary, TRANSFORMS,
+  unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace, writeSurvivorship,
   type FieldChoice, type FieldForm,
 } from '../app/lib/mapping-form';
 import { draftMapping } from '../app/.server/pipeline/mapping-draft';
@@ -419,6 +419,45 @@ describe('身份打通的匹配字段', () => {
   });
 });
 
+describe('属性取舍名次', () => {
+  const BASE = 'model: 1\nentity: customer\ntable: customers\nfields:\n  customer_id: string(id)\n';
+  const columns = ['id'].map(name => ({ name, type: 'VARCHAR' }));
+
+  it('写入数字后读回一致、写成数字而不是文本、通过校验；改成别的数字；清空后删掉 survivorship，其他行不动', () => {
+    const doc = parseDocument(BASE);
+    expect(readSurvivorship(doc)).toEqual({ priority: null });
+    writeSurvivorship(doc, 2);
+    expect(doc.toString()).toBe(`${BASE}survivorship:\n  priority: 2\n`);
+    expect(doc.toJS().survivorship).toEqual({ priority: 2 });
+    expect(readSurvivorship(parseDocument(doc.toString()))).toEqual({ priority: 2 });
+    expect(checkMapping(doc.toString(), () => columns)).toMatchObject({ ok: true });
+    writeSurvivorship(doc, 3);
+    expect(readSurvivorship(doc)).toEqual({ priority: 3 });
+    expect(checkMapping(doc.toString(), () => columns)).toMatchObject({ ok: true });
+    writeSurvivorship(doc, null);
+    expect(doc.toString()).toBe(BASE);
+    expect(readSurvivorship(doc)).toEqual({ priority: null });
+  });
+
+  it('改数字时其他行不动，priority 行外的写法（行内、注释）不被牵连', () => {
+    const yaml = `${BASE}survivorship:\n  priority: 2 # 名次\n`;
+    const doc = parseDocument(yaml);
+    writeSurvivorship(doc, 3);
+    expect(doc.toString()).toBe(`${BASE}survivorship:\n  priority: 3 # 名次\n`);
+  });
+
+  it('表单不认识的写法只读：读出原因、写回抛错，不会读成空后被写回清空', () => {
+    for (const odd of [
+      'survivorship: 2\n', 'survivorship: {}\n', 'survivorship:\n  priority: high\n', 'survivorship:\n  priority: 0\n',
+      'survivorship:\n  priority: 1.5\n', "survivorship:\n  priority: '2'\n", 'survivorship:\n  priority: 2\n  note: x\n',
+    ]) {
+      const doc = parseDocument(BASE + odd);
+      expect(readSurvivorship(doc)).toEqual({ priority: null, reason: expect.stringContaining('YAML') });
+      expect(() => writeSurvivorship(doc, 2)).toThrow(/YAML/);
+    }
+  });
+});
+
 describe('键空间', () => {
   const ITEM = entityOf('order_item')!;
   const ITEMS = 'model: 1\nentity: order_item\ntable: order_items\nfields:\n  order_item_id: item_no\n  order_id: string(order_id) # 同名\n  quantity: qty\n';
@@ -535,24 +574,27 @@ describe('跨源引用的数据源', () => {
 });
 
 describe('实时校验的问题对应到表单区块', () => {
-  it('issueTarget 按 path 的第一段对应：字段、扩展字段、键空间、身份打通，其余进总列表', () => {
+  it('issueTarget 按 path 的第一段对应：字段、扩展字段、键空间、身份打通、属性取舍名次，其余进总列表', () => {
     expect(issueTarget('fields.status.dictionary')).toEqual({ kind: 'field', name: 'status' });
     expect(issueTarget('fields.amount')).toEqual({ kind: 'field', name: 'amount' });
     expect(issueTarget('extensions.x_coupon.type')).toEqual({ kind: 'extension', name: 'x_coupon' });
     expect(issueTarget('key_space')).toEqual({ kind: 'key_space' });
     expect(issueTarget('identity.match.0')).toEqual({ kind: 'identity' });
+    expect(issueTarget('survivorship.priority')).toEqual({ kind: 'survivorship' });
+    expect(issueTarget('survivorship')).toEqual({ kind: 'survivorship' });
     for (const path of ['table', 'entity', 'assertions.0.sql', '', 'fields', 'extensions']) expect(issueTarget(path)).toEqual({ kind: 'general' });
   });
 
   it('groupIssues 按目标分组，字段与扩展字段同名时按 fields / extensions 区分', () => {
     const issue = (path: string) => ({ path, message: path });
     const groups = groupIssues([
-      issue('fields.x_a'), issue('extensions.x_a.type'), issue('fields.x_a.dictionary'), issue('key_space'), issue('identity.match'), issue('table'), issue(''),
+      issue('fields.x_a'), issue('extensions.x_a.type'), issue('fields.x_a.dictionary'), issue('key_space'), issue('identity.match'), issue('survivorship.priority'), issue('table'), issue(''),
     ]);
     expect(groups.fields).toEqual({ x_a: [issue('fields.x_a'), issue('fields.x_a.dictionary')] });
     expect(groups.extensions).toEqual({ x_a: [issue('extensions.x_a.type')] });
     expect(groups.keySpace).toEqual([issue('key_space')]);
     expect(groups.identity).toEqual([issue('identity.match')]);
+    expect(groups.survivorship).toEqual([issue('survivorship.priority')]);
     expect(groups.general).toEqual([issue('table'), issue('')]);
   });
 

@@ -5,6 +5,8 @@
 // 扩展字段：列出还没被任何字段用到的源列，勾选即按列推断名字与类型加上（列名或格式像敏感信息的默认标成敏感）；已有的扩展字段可改名、类型、中文名
 // 与是否敏感，取消勾选即删除，值字典与兜底原样保留。标准字段是否敏感由标准模型决定，YAML 里照写的 sensitive 原样保留。
 // 身份打通（只用于 customer）：从已映射的敏感字段里选匹配字段并排序，写成 identity.match，全部去掉时删掉 identity。
+// 属性取舍名次（ADR-0027，只用于 customer）：映射顶层的 survivorship.priority 读出、写回（写成数字），清空时删掉整个 survivorship；
+// 表单不认识的写法（多出别的键、priority 不是正整数）只读。
 // 键空间（ADR-0024）：映射顶层的 key_space 可填可清空；引用字段的 key_space 随字段写成对象写法 { expr, key_space }，
 // 没写时按同一数据源里目标实体已发布映射声明的键空间预填（只在写这个字段时一并写进 YAML）。
 // 跨源引用（ADR-0030）：指向 customer 的引用字段的 customer_source（目标消费者所在数据源的名字）随字段写成对象写法，选回本数据源时删掉
@@ -589,6 +591,38 @@ export function writeKeySpace(doc: Document, keySpace: string | null): void {
   else if (readKeySpace(doc) !== value) doc.set('key_space', value);
 }
 
+/** YAML 里的属性取舍名次（survivorship.priority，ADR-0027）；没写时为 null，写法表单不认识（多出别的键、priority 不是正整数）时带原因（只读） */
+export function readSurvivorship(doc: Document): { priority: number | null; reason?: string } {
+  const node = doc.get('survivorship', true);
+  if (node == null || (isScalar(node) && node.value == null)) return { priority: null };
+  const priority = isMap(node) ? node.get('priority', true) : undefined;
+  const keys = isMap(node) ? node.items.map(p => pairName(p.key)) : [];
+  if (!keys.every(k => k === 'priority') || !isScalar(priority) || typeof priority.value !== 'number' || !Number.isInteger(priority.value) || priority.value < 1) {
+    return { priority: null, reason: 'survivorship 的写法表单不认识，请在 YAML 里修改' };
+  }
+  return { priority: priority.value };
+}
+
+/** 写属性取舍名次，null 时删掉整个 survivorship（schema 要求 priority 必填）；已认识的对象写法原地改 priority 的值，行尾注释保留。写法表单不认识时抛错 */
+export function writeSurvivorship(doc: Document, priority: number | null): void {
+  const { reason } = readSurvivorship(doc);
+  if (reason) throw new Error(reason);
+  const node = doc.get('survivorship', true);
+  if (priority == null) {
+    doc.delete('survivorship');
+    return;
+  }
+  const value = isMap(node) ? node.items.find(p => isScalar(p.key) && p.key.value === 'priority')?.value : undefined;
+  if (isScalar(value)) {
+    // readSurvivorship 认识时 priority 一定是数字标量：原地改值，注释与写法保留
+    if (value.value !== priority) value.value = priority;
+    return;
+  }
+  const survivorship = new YAMLMap();
+  setKey(doc, survivorship, 'priority', priority);
+  doc.set('survivorship', survivorship);
+}
+
 /** 表单显示不了时的说明（目标实体不是标准实体、YAML 有语法错误、写的实体与目标实体不一致）；能显示时为 null */
 export function formUnavailable(doc: Document, entity: string): string | null {
   const target = entityOf(entity);
@@ -605,22 +639,22 @@ export function formUnavailable(doc: Document, entity: string): string | null {
   return null;
 }
 
-/** 校验问题在表单上对应的区块：标准字段、扩展字段、映射的键空间、身份打通，其余放进表单顶部的总列表 */
-export type IssueTarget = { kind: 'field' | 'extension'; name: string } | { kind: 'key_space' | 'identity' | 'general' };
+/** 校验问题在表单上对应的区块：标准字段、扩展字段、映射的键空间、身份打通、属性取舍名次，其余放进表单顶部的总列表 */
+export type IssueTarget = { kind: 'field' | 'extension'; name: string } | { kind: 'key_space' | 'identity' | 'survivorship' | 'general' };
 
 /** 按问题 path（点连接，如 fields.status.dictionary）的第一段对应到表单区块；字段与扩展字段可能同名，按第一段区分 */
 export function issueTarget(path: string): IssueTarget {
   const [head, name] = path.split('.');
   if ((head === 'fields' || head === 'extensions') && name) return { kind: head === 'fields' ? 'field' : 'extension', name };
-  if (head === 'key_space' || head === 'identity') return { kind: head };
+  if (head === 'key_space' || head === 'identity' || head === 'survivorship') return { kind: head };
   return { kind: 'general' };
 }
 
-export interface IssueGroups<I> { fields: Record<string, I[]>; extensions: Record<string, I[]>; keySpace: I[]; identity: I[]; general: I[] }
+export interface IssueGroups<I> { fields: Record<string, I[]>; extensions: Record<string, I[]>; keySpace: I[]; identity: I[]; survivorship: I[]; general: I[] }
 
 /** 按 issueTarget 分组，各组内保持原来的顺序 */
 export function groupIssues<I extends { path: string }>(issues: readonly I[]): IssueGroups<I> {
-  const groups: IssueGroups<I> = { fields: {}, extensions: {}, keySpace: [], identity: [], general: [] };
+  const groups: IssueGroups<I> = { fields: {}, extensions: {}, keySpace: [], identity: [], survivorship: [], general: [] };
   for (const issue of issues) {
     const target = issueTarget(issue.path);
     if (target.kind === 'field') (groups.fields[target.name] ??= []).push(issue);
