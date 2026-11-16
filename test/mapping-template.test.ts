@@ -3,7 +3,7 @@
 // 上一个表 / 实体的字段与「按规则生成的草稿：源表 …」注释不再出现；编辑框内容与上次生成的一致（没手改过）时不要求确认；
 // mappingTemplate（迁自服务端模块）与 withTarget（迁自路由）输出不变
 import { describe, expect, it } from 'vitest';
-import { mappingTemplate, reselect, VIEW_PREFIX, viewTemplate, withTarget } from '../app/lib/mapping-template';
+import { applyDraft, mappingTemplate, reselect, VIEW_PREFIX, viewTemplate, withTarget } from '../app/lib/mapping-template';
 
 /** 第一个数据源按规则生成的 consent 草稿：换选前编辑框里的内容（issue #776 的现场） */
 const CONSENT_DRAFT = `# 按规则生成的草稿：源表 consents → 营销同意（consent）
@@ -81,6 +81,13 @@ describe('reselect 换选后编辑框的去向', () => {
     const edited = { ...untouched, yaml: `${CONSENT_DRAFT}  revoked_at: revoked_at\n` };
     expect(reselect({ ...edited, input: 'buyers' }).needsConfirm).toBe(true);
     expect(reselect({ ...edited, input: `${VIEW_PREFIX}jd_buyers` }).needsConfirm).toBe(true);
+  });
+});
+
+describe('applyDraft 规则草稿回来时要不要先确认', () => {
+  it('请求发出后编辑框没再改过时直接替换，取草稿在途期间手改过则先确认', () => {
+    expect(applyDraft({ yaml: CONSENT_DRAFT, yamlAtRequest: CONSENT_DRAFT }).needsConfirm).toBe(false);
+    expect(applyDraft({ yaml: `${CONSENT_DRAFT}  pin: pin\n`, yamlAtRequest: CONSENT_DRAFT }).needsConfirm).toBe(true);
   });
 });
 

@@ -85,3 +85,11 @@ export function reselect({ sourceId, input, entity, yaml, lastGenerated }: {
       : { kind: 'fetch-draft', sourceId, table: input, entity },
   };
 }
+
+/**
+ * 换普通表后取的规则草稿回来时要不要先确认：发请求时编辑框的内容（yamlAtRequest）在请求在途期间又被手改过，
+ * 直接换进草稿会悄悄覆盖这段手写内容，所以 needsConfirm；没改过就直接替换（发请求前的手改已在 reselect 时确认过）
+ */
+export function applyDraft({ yaml, yamlAtRequest }: { yaml: string; yamlAtRequest: string }): { needsConfirm: boolean } {
+  return { needsConfirm: yaml !== yamlAtRequest };
+}
