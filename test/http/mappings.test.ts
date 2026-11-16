@@ -828,6 +828,33 @@ describe('按规则生成映射草稿', () => {
     expect((await analyst.post('/mappings', { intent: 'model-draft', sourceId, table: 'orders', entity: 'order' })).status).toBe(403);
   });
 
+  it('模型草稿个别项不过校验时去掉该项、采用其余内容：「生成依据」先单独列出「已去掉」的项（位置加原因），其余项照常按置信度显示', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    // order 映射不给 identity：去掉（规则草稿里也没有）后其余内容过校验
+    modelReplies({
+      fields: [
+        { field: 'order_id', expr: 'string(order_id)', confidence: 0.95, reason: '源表主键' },
+        { field: 'amount', expr: 'amount', confidence: 0.7, reason: '金额列' },
+      ],
+      identity: { match: ['order_id'], confidence: 0.3, reason: '试试主键' },
+    });
+    const engineer = await loginAs(app, 'de@acme.com');
+
+    const generated = await engineer.post('/mappings', { intent: 'model-draft', sourceId, table: 'orders', entity: 'order', yaml: '' });
+    expect(generated.status).toBe(200);
+    const html = await generated.text();
+    const yaml = editorYaml(html);
+    expect(yaml).toMatch(/^# 模型生成的草稿/);
+    expect(parseDocument(yaml).toJS()).not.toHaveProperty('identity');
+    expect(yaml).toContain('amount: amount # 金额列');
+    // 「已去掉」块：位置加原因，不进置信度表
+    expect(html).toContain('data-dropped="identity"');
+    expect(html).toContain('只有消费者（customer）映射能配置身份打通的匹配规则');
+    expect(html).not.toContain('data-confidence-path="identity"');
+    // 其余项照常显示置信度（按置信度升序：amount 0.7 在前）
+    expect(html).toMatch(/data-confidence-path="fields\.amount"[\s\S]*?data-confidence-path="fields\.order_id"/);
+  });
+
   it('模型草稿的「生成依据」按置信度升序列出每项，低置信度标红、中等琥珀色、其余绿色；理由照常转义；没配置模型服务时只写来源', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const engineer = await loginAs(app, 'de@acme.com');

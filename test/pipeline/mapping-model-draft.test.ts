@@ -71,6 +71,8 @@ const generations = (tenantId: string) => getDb().select().from(mappingGeneratio
 const calls = (tenantId: string) => getDb().select().from(llmCalls).where(eq(llmCalls.tenantId, tenantId));
 const failures = (tenantId: string) => getDb().select().from(auditLogs)
   .where(and(eq(auditLogs.tenantId, tenantId), eq(auditLogs.action, 'mapping.model_draft_failed')));
+const partials = (tenantId: string) => getDb().select().from(auditLogs)
+  .where(and(eq(auditLogs.tenantId, tenantId), eq(auditLogs.action, 'mapping.model_draft_partial')));
 
 /** 起草消息的 user：前面是目录各段（Markdown），最后一行是起草输入（JSON） */
 function draftUser(content: string) {
@@ -210,19 +212,101 @@ describe('用模型生成映射草稿', () => {
     expect(String(audit.detail.error)).toContain('不符合 Schema');
   });
 
-  it('转出的 YAML 引用不存在的列时拒绝：带问题列表，审计只记阶段、问题数与位置，不含模型原文', async () => {
+  it('转出的 YAML 有定位不到个别项的问题（主键没映射）时整份不采用：带问题列表，审计只记阶段、问题数与位置，不含模型原文', async () => {
     const { acme, author, sourceId } = await tenantWithSource();
     platformDefault();
-    fakeLlm(setLlmFetch, () => json({ fields: [...MODEL_ORDERS.fields, { field: 'channel', expr: 'no_such_col', confidence: 0.4, reason: '猜的渠道列' }] }, USAGE));
+    // channel 引用不存在的列（可定位），同时没映射主键 order_id（问题落在 fields 整体，定位不到个别项）
+    fakeLlm(setLlmFetch, () => json({ fields: [
+      ...MODEL_ORDERS.fields.filter(f => f.field !== 'order_id'),
+      { field: 'channel', expr: 'no_such_col', confidence: 0.4, reason: '猜的渠道列' },
+    ] }, USAGE));
 
     const e = await failure(modelDraftFor(author, sourceId, 'orders', 'order'));
     expect(e.status).toBe(422);
-    expect(e.issues.length).toBeGreaterThan(0);
+    expect(e.issues.map(i => i.path)).toEqual(expect.arrayContaining(['fields']));
     expect((await calls(acme))[0]).toMatchObject({ schemaValid: true });
     expect(await generations(acme)).toHaveLength(0);
     const [audit] = await failures(acme);
     expect(audit.detail).toMatchObject({ stage: 'mapping', issues: e.issues.length, paths: e.issues.map(i => i.path) });
     expect(JSON.stringify(audit.detail)).not.toMatch(/no_such_col|猜的渠道列|paid|refunded/);
+  });
+
+  it('个别字段引用不存在的列时去掉这个字段（规则草稿里也没有）、采用其余内容：items 里该项带 dropped，审计只记位置与问题数', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json({ fields: [...MODEL_ORDERS.fields, { field: 'channel', expr: 'no_such_col', confidence: 0.4, reason: '猜的渠道列' }] }, USAGE));
+
+    const result = await modelDraftFor(author, sourceId, 'orders', 'order');
+    expect(result.origin).toBe('model');
+    const spec = parse(result.yaml);
+    expect(spec.fields).toMatchObject({ order_id: 'string(order_id)', status: { expr: 'status' }, amount: 'amount' });
+    expect(spec.fields).not.toHaveProperty('channel');
+    const channel = result.items.find(i => i.path === 'fields.channel')!;
+    expect(channel).toMatchObject({ confidence: 0.4, reason: '猜的渠道列' });
+    expect(channel.dropped).toContain('no_such_col');
+
+    const [generation] = await generations(acme);
+    expect(generation).toMatchObject({ id: result.generationId, origin: 'model', yaml: result.yaml, items: result.items });
+    const [audit] = await partials(acme);
+    expect(audit.detail).toEqual({ sourceId, source: '门店1', table: 'orders', entity: 'order', dropped: ['fields.channel'], issues: 1 });
+    expect(JSON.stringify(audit.detail)).not.toMatch(/no_such_col|猜的渠道列/);
+    expect(await failures(acme)).toHaveLength(0);
+  });
+
+  it('个别项不过校验时去掉这些项、采用其余内容：items 里该项带 dropped，审计记 model_draft_partial（只记位置与问题数）', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    platformDefault();
+    // identity 用了非敏感的 customer_id：问题定位到 identity，去掉（规则草稿也没有）后其余内容过校验
+    fakeLlm(setLlmFetch, () => json({
+      fields: [
+        { field: 'customer_id', expr: 'string(customer_id)', confidence: 0.95, reason: '源表主键' },
+        { field: 'email', expr: 'email', confidence: 0.8, reason: '邮箱列' },
+      ],
+      identity: { match: ['customer_id'], confidence: 0.3, reason: '试试主键' },
+    }, USAGE));
+
+    const result = await modelDraftFor(author, sourceId, 'customers', 'customer');
+    expect(result.origin).toBe('model');
+    const spec = parse(result.yaml);
+    expect(spec).toMatchObject({ entity: 'customer', table: 'customers', fields: { customer_id: 'string(customer_id)', email: 'email' } });
+    expect(spec).not.toHaveProperty('identity');
+    const identity = result.items.find(i => i.path === 'identity')!;
+    expect(identity).toMatchObject({ confidence: 0.3, reason: '试试主键' });
+    expect(identity.dropped).toContain('不是敏感字段');
+
+    // 生成记录有一行，items 原样带 dropped
+    const [generation] = await generations(acme);
+    expect(generation).toMatchObject({ id: result.generationId, origin: 'model', yaml: result.yaml, items: result.items });
+    // 审计只记去掉了哪些位置与问题数，不记理由原文
+    const [audit] = await partials(acme);
+    expect(audit).toMatchObject({ actorEmail: author.email, targetType: 'source', targetId: sourceId });
+    expect(audit.detail).toEqual({ sourceId, source: '门店1', table: 'customers', entity: 'customer', dropped: ['identity'], issues: 1 });
+    expect(JSON.stringify(audit.detail)).not.toContain('不是敏感字段');
+    expect(JSON.stringify(audit.detail)).not.toContain('试试主键');
+    expect(await failures(acme)).toHaveLength(0);
+  });
+
+  it('去掉后仍不过校验（identity 引用了被删掉的字段）时整份不采用：422 带第二次的问题，记 model_draft_failed、不写生成记录', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    platformDefault();
+    // external_id 在规则草稿里没有对应列：字段被删掉后 identity.match 引用不到，第二次校验仍不过
+    fakeLlm(setLlmFetch, () => json({
+      fields: [
+        { field: 'customer_id', expr: 'string(customer_id)', confidence: 0.95, reason: '源表主键' },
+        { field: 'external_id', expr: 'no_such_col', confidence: 0.4, reason: '猜的外部 ID 列' },
+      ],
+      identity: { match: ['external_id'], confidence: 0.5, reason: '外部 ID 能精确匹配' },
+    }, USAGE));
+
+    const e = await failure(modelDraftFor(author, sourceId, 'customers', 'customer'));
+    expect(e.status).toBe(422);
+    expect(e.issues.map(i => i.path)).toEqual(['identity.match.0']);
+    expect(e.issues[0].message).toContain('external_id');
+    expect(await generations(acme)).toHaveLength(0);
+    expect(await partials(acme)).toHaveLength(0);
+    const [audit] = await failures(acme);
+    expect(audit.detail).toMatchObject({ stage: 'mapping', issues: 1, paths: ['identity.match.0'] });
+    expect(JSON.stringify(audit.detail)).not.toMatch(/no_such_col|猜的/);
   });
 
   it('模型服务 HTTP 500 时拒绝：审计的错误摘要里没有 Key，不写生成记录', async () => {
