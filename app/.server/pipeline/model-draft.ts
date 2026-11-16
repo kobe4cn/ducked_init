@@ -15,6 +15,7 @@ import type { LlmMessage } from '../llm';
 import type { AssertionLevel } from './assertions';
 import { CUSTOM_CHECKS, type CustomAssertion } from './custom-assertions';
 import type { TableContext } from './llm-context';
+import type { MappingIssue } from './mapping-spec';
 
 /** 每一项都带的置信度（0..1）与理由 */
 interface Reasoned { confidence: number; reason: string }
@@ -33,8 +34,8 @@ export interface ModelDraft {
   identity?: Reasoned & { match: string[] };
 }
 
-/** 生成记录里的一项：path 是 fields.<字段>、dedupe、identity，断言建议时是 assertions.<序号> */
-export interface DraftItem { path: string; confidence: number; reason: string }
+/** 生成记录里的一项：path 是 fields.<字段>、dedupe、identity，断言建议时是 assertions.<序号>；dropped 是这一项被去掉的原因（校验问题的消息） */
+export interface DraftItem { path: string; confidence: number; reason: string; dropped?: string }
 
 const reasoned = {
   confidence: { type: 'number', minimum: 0, maximum: 1 },
@@ -198,6 +199,43 @@ export function modelOutputToYaml(rulesYaml: string, out: ModelDraft): { yaml: s
   doc.commentBefore = ' 模型生成的草稿：行尾注释是模型给的依据，请逐项确认后保存';
   doc.comment = null;
   return { yaml: doc.toString({ nullStr: 'null', lineWidth: 0 }), items };
+}
+
+/**
+ * 校验问题只落在个别项（fields.<字段>、dedupe、identity）时去掉这些项：每个归好类的项用规则草稿里的同名节点替换（字段取 fields.<同名字段>，
+ * dedupe / identity 取同名顶层键），规则草稿没有就删掉；items 里对应的项保留模型给的置信度与理由，另带 dropped（同一项有多条问题时用「；」连接）。
+ * 有定位不到这三类项的问题（fields 整体、entity、where 等）时返回 null，由调用方整份不采用。只做一轮，去掉后要再校验一次
+ */
+export function dropItems(rulesYaml: string, yaml: string, items: DraftItem[], issues: MappingIssue[]): { yaml: string; items: DraftItem[] } | null {
+  const dropped = new Map<string, string[]>();
+  for (const { path, message } of issues) {
+    // 问题定位到哪一项：dedupe / identity 是整块，fields 的问题都带字段名
+    let target: string | undefined;
+    if (path === 'dedupe' || path.startsWith('dedupe.')) target = 'dedupe';
+    else if (path === 'identity' || path.startsWith('identity.')) target = 'identity';
+    else target = /^fields\.[^.]+/.exec(path)?.[0];
+    if (!target) return null;
+    dropped.set(target, [...(dropped.get(target) ?? []), message]);
+  }
+  const doc = parseDocument(yaml);
+  const rules = parseDocument(rulesYaml);
+  for (const target of dropped.keys()) {
+    if (target === 'dedupe' || target === 'identity') {
+      const from = rules.get(target, true);
+      if (from != null) doc.set(target, from);
+      else doc.delete(target);
+      continue;
+    }
+    const name = target.slice('fields.'.length);
+    const from = (rules.get('fields', true) as YAMLMap | undefined)?.get(name, true);
+    const fields = doc.get('fields', true) as YAMLMap | undefined;
+    if (from != null) fields?.set(name, from);
+    else fields?.delete(name);
+  }
+  return {
+    yaml: doc.toString({ nullStr: 'null', lineWidth: 0 }),
+    items: items.map(i => (dropped.has(i.path) ? { ...i, dropped: dropped.get(i.path)!.join('；') } : i)),
+  };
 }
 
 /** 模型建议的一条断言：写法同映射 YAML 的 assertions，另带置信度与理由 */

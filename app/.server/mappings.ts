@@ -23,7 +23,7 @@ import { identityRules } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { draftCustomMapping, draftMapping, DraftError, reuseMappingYaml } from './pipeline/mapping-draft';
 import {
-  ASSERTION_DRAFT_SCHEMA, assertionDraftMessages, assertionsToYaml, type AssertionDraft, MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type DraftItem, type ModelDraft,
+  ASSERTION_DRAFT_SCHEMA, assertionDraftMessages, assertionsToYaml, type AssertionDraft, dropItems, MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type DraftItem, type ModelDraft,
 } from './pipeline/model-draft';
 import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan, type PublishedPlan } from './pipeline/mapping-spec';
 import type { Rename } from './pipeline/schema-repair';
@@ -235,8 +235,9 @@ export interface ModelDraftResult {
 /**
  * 用模型生成映射草稿（ADR-0035）：按「复用已发布映射 > 模型 > 按规则」的顺序。复用命中时不调用模型；没配置模型服务时用规则草稿并提示；
  * 否则把表上下文、规则草稿与本租户的语义目录（ADR-0041）发给模型（purpose = mapping_draft），输出转成 YAML 后须过映射校验。成功时写一行生成记录，不保存映射。
- * 模型失败或转出的 YAML 不过校验时记审计 mapping.model_draft_failed（不含提示词、模型原文与取值），抛 422。
- * 为已有映射重新生成时传 mappingId，生成记录直接关联它
+ * 转出的 YAML 有问题时，只要每个问题都能定位到个别字段项、dedupe 或 identity，就去掉这些项（退回规则草稿里的同名项，没有就删掉）再校验一次：
+ * 第二次通过才采用，并记审计 mapping.model_draft_partial（只记去掉了哪些位置与问题数）。模型失败、有定位不到这三类项的问题，或第二次仍不过时
+ * 记审计 mapping.model_draft_failed（不含提示词、模型原文与取值），抛 422。为已有映射重新生成时传 mappingId，生成记录直接关联它
  */
 export async function modelDraftFor(
   actor: CurrentMember, sourceId: string, table: string, entity: string, mappingId: string | null = null,
@@ -270,12 +271,29 @@ export async function modelDraftFor(
     throw new MappingError(`模型生成草稿失败：${e.message}`, 422);
   }
   const { yaml, items } = modelOutputToYaml(base.yaml, out);
+  /** 整份不采用：审计只记问题数与前 10 个位置，错误带问题列表（行号指模型生成的那份） */
+  const reject = async (issues: MappingIssue[]): Promise<never> => {
+    await failed({ stage: 'mapping', issues: issues.length, paths: issues.slice(0, 10).map(i => i.path) });
+    throw new MappingError(`模型生成的映射有 ${issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, issues);
+  };
   try {
     await checkMappingDraft(tenantId, sourceId, yaml);
   } catch (e) {
     if (!(e instanceof MappingError)) throw e;
-    await failed({ stage: 'mapping', issues: e.issues.length, paths: e.issues.slice(0, 10).map(i => i.path) });
-    throw new MappingError(`模型生成的映射有 ${e.issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, e.issues);
+    // 只去掉有问题的个别项（退回规则草稿或删除）再校验一次；有定位不到的项时 dropItems 返回 null，整份不采用
+    const partial = dropItems(base.yaml, yaml, items, e.issues);
+    if (!partial) return reject(e.issues);
+    try {
+      await checkMappingDraft(tenantId, sourceId, partial.yaml);
+    } catch (e2) {
+      if (!(e2 instanceof MappingError)) throw e2;
+      return reject(e2.issues);
+    }
+    await recordAudit(getDb(), {
+      tenantId, actor, action: 'mapping.model_draft_partial', targetType: 'source', targetId: sourceId,
+      detail: { sourceId, source: source.name, table, entity, dropped: partial.items.filter(i => i.dropped).map(i => i.path), issues: e.issues.length },
+    });
+    return record('model', partial.yaml, partial.items);
   }
   return record('model', yaml, items);
 }

@@ -1,5 +1,6 @@
 // app/components/draft-confidence.tsx —— 用模型生成映射草稿或建议断言后的「生成依据」（ADR-0035）：模型给的每项按置信度从低到高列出（路径、置信度、理由），
-// 低于 0.5 标红、低于 0.8 琥珀色、其余绿色，颜色都配图标与文字；复用已发布映射或按规则生成时只写来源（复用时链接到来源映射）。
+// 低于 0.5 标红、低于 0.8 琥珀色、其余绿色，颜色都配图标与文字；个别项不过校验被去掉时先单独列出「已去掉」的项（路径加原因，红色配图标），
+// 这些项不进置信度表。复用已发布映射或按规则生成时只写来源（复用时链接到来源映射）。
 // 只是展示，保存不依赖它；置信度来自模型，展示前夹到 0..1，理由是纯文本
 import { AlertTriangle, Sparkles } from 'lucide-react';
 import { Link } from 'react-router';
@@ -22,8 +23,10 @@ export function DraftConfidence({ origin, items, reusedFrom, notice }: {
   notice?: string | null;
 }) {
   const rows = items
+    .filter(i => !i.dropped)
     .map(i => ({ ...i, confidence: clamp(i.confidence) }))
     .sort((a, b) => a.confidence - b.confidence || cmp(a.path, b.path));
+  const dropped = items.filter(i => i.dropped);
   return (
     <div data-draft-origin={origin} className="space-y-2 rounded-xl border bg-slate-50/60 p-4">
       <div className="flex items-center gap-1.5 text-sm font-medium"><Sparkles aria-hidden className="size-4 text-slate-400" />生成依据</div>
@@ -35,6 +38,18 @@ export function DraftConfidence({ origin, items, reusedFrom, notice }: {
       {origin === 'rules' && <p data-notice className="flex items-center gap-1.5 text-sm text-amber-600"><AlertTriangle aria-hidden className="size-4" />{notice ?? '按规则生成'}</p>}
       {(origin === 'model' || origin === 'assertions') && (
         <>
+          {dropped.length > 0 && (
+            <div className="space-y-1">
+              <p className="text-sm text-slate-500">这些项没有通过校验，已去掉（退回规则草稿或删除），不在下面的列表里：</p>
+              {/* 模型可能给出重复的路径，key 带上序号 */}
+              {dropped.map((d, i) => (
+                <p key={`${i}:${d.path}`} data-dropped={d.path} className="flex flex-wrap items-center gap-1.5 text-sm">
+                  <span className="font-mono text-xs">{d.path}</span>
+                  <StatusText tone="bad">{d.dropped}</StatusText>
+                </p>
+              ))}
+            </div>
+          )}
           <p className="text-sm text-slate-500">
             {origin === 'assertions' ? '只替换了 assertions 块（位置里的序号从 0 起），' : ''}模型给的每一项按置信度从低到高排列，低置信度的请先核对。
           </p>
