@@ -15,9 +15,16 @@ import { insertTask } from './tasks';
 import { readResult } from './pipeline/task-contracts';
 import { TEMPLATES } from './pipeline/templates';
 import type { RfmParams } from './pipeline/templates/rfm';
+import { isDslKind, type DslKind } from './pipeline/dsl';
 
 export type SnapshotTemplate = keyof typeof TEMPLATES;
 export type Snapshot = typeof snapshots.$inferSelect;
+
+/** 快照 template（`metric:<键>` / `tag:<键>`）里的 DSL 种类；不是指标或标签快照时为 null */
+export const dslKindOf = (template: string): DslKind | null => {
+  const kind = template.split(':', 1)[0];
+  return kind !== template && isDslKind(kind) ? kind : null;
+};
 
 /** 快照从创建起保留的天数 */
 export const SNAPSHOT_RETENTION_DAYS = 90;
@@ -159,12 +166,17 @@ export async function getSnapshot(tenantId: string, id: string): Promise<Snapsho
 }
 
 /**
- * 校验快照（未过期、表名是 gold."<模板 ID>__<任务 ID>"）后只读挂载本租户的数据湖，返回会话与带引号的表名；调用方负责关闭会话
+ * 校验快照（未过期、表名前缀与快照类型对得上）后只读挂载本租户的数据湖，返回会话与带引号的表名；调用方负责关闭会话。
+ * 模板快照的表名是 gold."<模板 ID>__<任务 ID>"，指标与标签（DSL）快照是 gold."<kind>__<任务 ID>"；
+ * 前缀都经过校验（登记过的模板只含小写字母与数字、kind 在 DSL 注册表里）才拼进正则
  */
 async function openSnapshotTable(snapshot: Snapshot) {
   if (snapshot.expiredAt) throw new SnapshotError('快照已过期', 404);
-  // 模板 ID 只含小写字母与数字（调用方已确认是登记过的模板），可以直接拼进正则
-  const match = new RegExp(`^gold\\.(${snapshot.template}__[0-9a-f-]{36})$`).exec(snapshot.table);
+  const dsl = dslKindOf(snapshot.template);
+  // template 带「:」却不是 DSL 种类的（历史脏数据）在这里挡下，不把没校验过的字符串拼进正则
+  const prefix = dsl ?? (snapshot.template.includes(':') ? null : snapshot.template);
+  if (!prefix) throw new SnapshotError('不是模板快照', 404);
+  const match = new RegExp(`^gold\\.(${prefix}__[0-9a-f-]{36})$`).exec(snapshot.table);
   if (!match) throw new SnapshotError('快照表名不合法', 404);
   const lake = await lakeRow(snapshot.tenantId);
   if (!lake || !lakeReady(lake)) throw new SnapshotError('本租户的数据湖还没有初始化');
@@ -200,16 +212,32 @@ export async function readRfmSnapshot(snapshot: Snapshot, { page, pageSize = CON
   }
 }
 
+/** 标签快照各取值的人数（tagSummary），NULL 取值的 value 为 null */
+export interface TagValueSummary { value: string | null; consumers: number }
+
 /**
- * 只读挂载本租户的数据湖，读出任一已登记模板的快照（列不做筛选：模板产出的快照表不带明文，ADR-0004、0005）：快照表的全部列名（按表里的顺序），以及按 consumer_id 排序的第 page 页明细（取值按 JSON 读出）
+ * 只读挂载本租户的数据湖，读出任一已登记模板或指标 / 标签（DSL）快照（列不做筛选：这些快照表不带明文，ADR-0004、0005）：
+ * 快照表的全部列名（按表里的顺序），以及第 page 页明细（取值按 JSON 读出）。模板快照按 consumer_id 排序；
+ * DSL 快照按全部列排序（带维度的指标每个消费者有多行，只按 consumer_id 排翻页会重复或漏行）。
+ * 标签快照在同一个会话里多查一次各取值人数的汇总 tagSummary（非标签快照没有这个字段）
  */
 export async function readTemplateSnapshot(snapshot: Snapshot, { page, pageSize = CONSUMER_PAGE_SIZE }: { page: number; pageSize?: number }) {
-  if (!Object.hasOwn(TEMPLATES, snapshot.template)) throw new SnapshotError('不是模板快照', 404);
+  const dsl = dslKindOf(snapshot.template);
+  if (!Object.hasOwn(TEMPLATES, snapshot.template) && !dsl) throw new SnapshotError('不是模板快照', 404);
   const { session, table } = await openSnapshotTable(snapshot);
   try {
     const result = await session.con.runAndReadAll(
-      `SELECT * FROM ${table} ORDER BY consumer_id LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`);
-    return { columns: result.columnNames(), rows: result.getRowObjectsJson() as Record<string, unknown>[] };
+      `SELECT * FROM ${table} ${dsl ? 'ORDER BY ALL' : 'ORDER BY consumer_id'} LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`);
+    const tagSummary = dsl === 'tag'
+      ? (await session.con.runAndReadAll(`SELECT tag_value::VARCHAR AS value, count(*) AS consumers FROM ${table} GROUP BY 1 ORDER BY 2 DESC, 1`))
+        .getRowObjectsJson()
+        .map((t): TagValueSummary => ({ value: t.value === null ? null : String(t.value), consumers: Number(t.consumers) }))
+      : null;
+    return {
+      columns: result.columnNames(),
+      rows: result.getRowObjectsJson() as Record<string, unknown>[],
+      ...(tagSummary ? { tagSummary } : {}),
+    };
   } finally {
     session.close();
   }

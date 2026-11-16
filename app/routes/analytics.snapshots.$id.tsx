@@ -1,5 +1,7 @@
 // app/routes/analytics.snapshots.$id.tsx —— 分析模板快照结果（有结果层查看权限的成员）。RFM：各人群的人数与金额（?tab=segments），
 // 按 consumer_id 分页的消费者明细（?tab=consumers&page=N）；其他模板：按 consumer_id 分页的通用明细（?page=N），列取快照表的全部列。
+// 指标与标签（DSL）快照同样走通用明细（#816）：页头写定义（类型与键）、定义版本、统计日与来源，标签在明细上方带各取值人数的汇总（回刷前后对照），
+// 带维度的指标每个消费者有多行，按行分页、统计卡片标「行数」。
 // 登记时有映射最近一次合并失败的快照标「数据不完整」，列出失败的映射。每次请求只读挂载本租户的数据湖读取；页面上只有 consumer_id 与汇总值（分值、订单汇总、各渠道同意等），没有明文。
 // 其他租户的快照、已过期的快照返回 404
 import { AlertTriangle } from 'lucide-react';
@@ -7,8 +9,9 @@ import { data, Link } from 'react-router';
 import type { Route } from './+types/analytics.snapshots.$id';
 import { requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
+import { DSL_KINDS } from '~/.server/pipeline/dsl';
 import { TEMPLATES } from '~/.server/pipeline/templates';
-import { CONSUMER_PAGE_SIZE, getSnapshot, readRfmSnapshot, readTemplateSnapshot, SnapshotError, type SnapshotTemplate } from '~/.server/snapshots';
+import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readRfmSnapshot, readTemplateSnapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { PageHeader } from '~/components/page-header';
@@ -17,7 +20,11 @@ import { StatTile } from '~/components/stat-tile';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
 export function meta({ loaderData }: Route.MetaArgs) {
-  return [{ title: `${loaderData ? `${loaderData.snapshot.templateLabel} · ${loaderData.snapshot.asOf}` : '分析'} · CRM 数据分析平台` }];
+  const s = loaderData?.snapshot;
+  const title = !s
+    ? '分析'
+    : `${'definition' in s ? `${s.definition.kindLabel} ${s.definition.key}` : s.templateLabel} · ${s.asOf}`;
+  return [{ title: `${title} · CRM 数据分析平台` }];
 }
 
 type Tab = 'segments' | 'consumers';
@@ -35,6 +42,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       ? { kind: 'rfm' as const, ...(await readRfmSnapshot(snapshot, { page })) }
       : { kind: 'generic' as const, ...(await readTemplateSnapshot(snapshot, { page })) };
     const lookbackDays = snapshot.params.lookbackDays;
+    // 页头：DSL（指标 / 标签）快照写定义（类型与键）、版本与来源；模板快照写注册表里的名字
+    const dsl = dslKindOf(snapshot.template);
     return {
       email: member.email,
       nav: navFor(member),
@@ -44,8 +53,13 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       pageSize: CONSUMER_PAGE_SIZE,
       snapshot: {
         id: snapshot.id,
-        // readTemplateSnapshot 已确认是登记过的模板
-        templateLabel: TEMPLATES[snapshot.template as SnapshotTemplate].label,
+        ...(dsl
+          ? {
+            definition: { kind: dsl, kindLabel: DSL_KINDS[dsl].label, key: snapshot.template.slice(dsl.length + 1) },
+            definitionVersion: snapshot.definitionVersion,
+            trigger: triggerLabel(snapshot.trigger),
+          }
+          : { templateLabel: TEMPLATES[snapshot.template as SnapshotTemplate].label }),
         asOf: String(snapshot.params.asOf),
         lookbackDays: typeof lookbackDays === 'number' ? lookbackDays : null,
         rowCount: snapshot.rowCount,
@@ -73,11 +87,11 @@ function cell(v: unknown): string {
   return String(v);
 }
 
-/** 上一页 / 下一页 */
-function Pager({ page, pages, pageSize, href }: { page: number; pages: number; pageSize: number; href: (p: number) => string }) {
+/** 上一页 / 下一页；unit 是每页计数的单位（模板快照按消费者「位」，DSL 快照按「行」） */
+function Pager({ page, pages, pageSize, unit = '位', href }: { page: number; pages: number; pageSize: number; unit?: string; href: (p: number) => string }) {
   return (
     <div className="flex items-center justify-between text-sm text-slate-500">
-      <span data-page={page}>{`第 ${page} / ${pages} 页，每页 ${pageSize} 位`}</span>
+      <span data-page={page}>{`第 ${page} / ${pages} 页，每页 ${pageSize} ${unit}`}</span>
       <div className="flex gap-3">
         {page > 1 && <Link to={href(page - 1)} className="hover:underline">← 上一页</Link>}
         {page < pages && <Link to={href(page + 1)} className="hover:underline">下一页 →</Link>}
@@ -89,11 +103,21 @@ function Pager({ page, pages, pageSize, href }: { page: number; pages: number; p
 export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
   const { email, nav, snapshot } = loaderData;
   const lookback = snapshot.lookbackDays === null ? '' : `回看 ${snapshot.lookbackDays} 天，`;
+  // DSL（指标 / 标签）快照：页头改写定义（类型与键）与版本、统计日、来源
+  const header = 'definition' in snapshot
+    ? {
+      title: `${snapshot.definition.kindLabel} · ${snapshot.definition.key}`,
+      note: `　${snapshot.definitionVersion ? `第 ${snapshot.definitionVersion} 版` : '—'}，统计日 ${snapshot.asOf}，来源 ${snapshot.trigger}，创建于 ${date(snapshot.createdAt)}，${date(snapshot.expiresAt)} 过期`,
+    }
+    : {
+      title: `${snapshot.templateLabel} · ${snapshot.asOf}`,
+      note: `　${lookback}创建于 ${date(snapshot.createdAt)}，${date(snapshot.expiresAt)} 过期`,
+    };
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
-        title={`${snapshot.templateLabel} · ${snapshot.asOf}`}
-        description={<><Link to="/analytics" className="hover:underline">← 全部快照</Link>{`　${lookback}创建于 ${date(snapshot.createdAt)}，${date(snapshot.expiresAt)} 过期`}</>}
+        title={header.title}
+        description={<><Link to="/analytics" className="hover:underline">← 全部快照</Link>{header.note}</>}
       />
 
       {snapshot.incomplete && (
@@ -118,13 +142,36 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
   );
 }
 
-function GenericResult({ page, pages, pageSize, snapshot, columns, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'generic' }>) {
+function GenericResult({ page, pages, pageSize, snapshot, columns, rows, tagSummary }: Extract<Route.ComponentProps['loaderData'], { kind: 'generic' }>) {
+  // DSL 快照的 rowCount 是快照表的行数（带维度的指标每个消费者有多行），不是消费者数
+  const dsl = 'definition' in snapshot ? snapshot : null;
   return (
     <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatTile label="消费者" value={snapshot.rowCount.toLocaleString('zh-CN')} hint="打通后的统一消费者" />
+        <StatTile label={dsl ? '行数' : '消费者'} value={snapshot.rowCount.toLocaleString('zh-CN')} hint={dsl ? '快照表的行数' : '打通后的统一消费者'} />
         <StatTile label="参考日期" value={snapshot.asOf} hint="计算的基准日" />
       </div>
+      {tagSummary && (
+        <div className="rounded-2xl border bg-white p-6 shadow-sm" data-tag-summary>
+          <h2 className="mb-4 font-medium">各取值人数</h2>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>取值</TableHead>
+                <TableHead>人数</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {tagSummary.map(t => (
+                <TableRow key={t.value ?? ''} data-tag-value={t.value ?? ''}>
+                  <TableCell className="font-medium">{t.value ?? '—'}</TableCell>
+                  <TableCell>{t.consumers.toLocaleString('zh-CN')}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
       <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
         <Table>
           <TableHeader>
@@ -133,14 +180,15 @@ function GenericResult({ page, pages, pageSize, snapshot, columns, rows }: Extra
             </TableRow>
           </TableHeader>
           <TableBody>
-            {rows.map(r => (
-              <TableRow key={String(r.consumer_id)} data-consumer={String(r.consumer_id)}>
+            {rows.map((r, i) => (
+              // 带维度的指标每个消费者有多行，行键不能只用 consumer_id
+              <TableRow key={i} data-consumer={String(r.consumer_id)}>
                 {columns.map(c => <TableCell key={c} className={c === 'consumer_id' ? 'font-mono text-xs' : undefined}>{cell(r[c])}</TableCell>)}
               </TableRow>
             ))}
           </TableBody>
         </Table>
-        <Pager page={page} pages={pages} pageSize={pageSize} href={p => `/analytics/snapshots/${snapshot.id}?page=${p}`} />
+        <Pager page={page} pages={pages} pageSize={pageSize} unit={dsl ? '行' : '位'} href={p => `/analytics/snapshots/${snapshot.id}?page=${p}`} />
       </div>
     </>
   );
