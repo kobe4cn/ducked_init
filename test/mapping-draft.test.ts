@@ -254,6 +254,73 @@ describe('开发库八张表生成的草稿', () => {
   });
 });
 
+describe('unionid 一类的列对应到 external_id', () => {
+  it('常见写法都对应到 external_id，unionid 优先级最高；openid 不是 external_id', () => {
+    for (const [rank, col] of ['unionid', 'union_id', 'wx_unionid', 'wechat_unionid'].entries())
+      expect(fieldsForColumn('customer', col)[0], col).toMatchObject({ field: 'external_id', by: 'synonym', rank: rank + 1 });
+    expect(fieldsForColumn('customer', 'external_id')[0]).toMatchObject({ field: 'external_id', by: 'same' });
+    expect(fieldsForColumn('customer', 'openid')).toEqual([]);
+  });
+
+  // 贴合种子事实 member_pg.members：member_id 主键，手机号必有，unionid 约 80%（scripts/fmcg-seed/seed.ts）
+  const MEMBERS = table('members', [
+    column('member_id', 'TEXT', { formats: [] }),
+    column('mobile', 'VARCHAR', { formats: [{ format: 'mobile', share: 1 }] }),
+    column('unionid', 'VARCHAR', { nullRate: 0.2, formats: [] }),
+    column('nickname', 'VARCHAR', { formats: [] }),
+    column('gender', 'CHAR(1)', { distinct: 3, top: top('F', 'M', 'U') }),
+    column('birthday', 'DATE'),
+    column('city', 'VARCHAR', { distinct: 6, top: top('北京', '上海', '广州', '深圳', '杭州', '成都') }),
+    column('registered_at', 'TIMESTAMPTZ'),
+    column('updated_at', 'TIMESTAMPTZ'),
+  ], ['member_id']);
+
+  // 贴合种子事实 scan_mysql.scan_users：openid 是扫码公众号的主键，与小程序不同，不作外部 ID
+  const SCAN_USERS = table('scan_users', [
+    column('openid', 'VARCHAR(32)', { formats: [] }),
+    column('unionid', 'VARCHAR(32)', { nullRate: 0.4, formats: [] }),
+    column('phone', 'VARCHAR(20)', { formats: [{ format: 'mobile', share: 1 }] }),
+    column('nickname', 'VARCHAR(64)', { formats: [] }),
+    column('city', 'VARCHAR(16)', { distinct: 6, top: top('北京', '上海', '广州', '深圳', '杭州', '成都') }),
+    column('first_scan_at', 'DATETIME'),
+    column('updated_at', 'DATETIME'),
+  ], ['openid']);
+
+  it('members 形状：unionid 对应到 external_id，其余字段照常对应', () => {
+    const yaml = draft(MEMBERS, 'customer');
+    expect(checkMapping(yaml).ok).toBe(true);
+    expect(fields(yaml)).toEqual({
+      customer_id: 'member_id',
+      name: 'nickname',
+      phone: 'mobile',
+      external_id: 'unionid',
+      gender: { expr: 'gender', dictionary: { F: 'female', M: 'male', U: 'unknown' } },
+      birthday: 'birthday',
+      city: 'city',
+      registered_at: 'registered_at',
+      updated_at: 'updated_at',
+    });
+    expect(lineOf(yaml, 'external_id')).toContain('同义词：unionid');
+    expect(yaml).not.toContain('dedupe');
+  });
+
+  it('scan_users 形状：openid 是主键只当 customer_id 用，不抢 external_id，也不生成去重键', () => {
+    const yaml = draft(SCAN_USERS, 'customer');
+    expect(checkMapping(yaml).ok).toBe(true);
+    expect(fields(yaml)).toMatchObject({
+      customer_id: 'openid',
+      name: 'nickname',
+      phone: 'phone',
+      external_id: 'unionid',
+      city: 'city',
+      updated_at: "from_timezone(updated_at, 'Asia/Shanghai')",
+    });
+    expect(lineOf(yaml, 'customer_id')).toContain('源表主键');
+    expect(lineOf(yaml, 'external_id')).toContain('同义词：unionid');
+    expect(yaml).not.toContain('dedupe');
+  });
+});
+
 describe('转换与值字典', () => {
   it('列名带 _cents / _fen 的金额除以 100', () => {
     const t = table('orders', [column('id', 'BIGINT'), column('total_fen', 'BIGINT'), column('PayAmountCents', 'INTEGER')], ['id']);
