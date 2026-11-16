@@ -155,7 +155,7 @@ describe('分析页 · 指标与标签列表', () => {
     expect(html).not.toContain('/analytics/definitions/new');
   });
 
-  it('快照表区分系统内置模板与自建指标：rfm 显示「分析模板」「系统内置」，metric:revenue 显示「指标」「自建」及创建人；可按定义筛选；定义页的「快照」区按时间列出', async () => {
+  it('快照表区分系统内置模板与自建指标、标签：rfm 显示「分析模板」「系统内置」，metric:revenue 显示「指标」「自建」及创建人，找不到定义的 tag:buyer 显示「标签」「自建」；可按定义筛选；定义页的「快照」区按时间列出', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     await createDefinition(analyst, 'metric', 'revenue', REVENUE);
@@ -164,12 +164,15 @@ describe('分析页 · 指标与标签列表', () => {
       { tenantId: acme, kind: 'gold.rfm', status: 'succeeded' },
       { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
       { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
+      { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
     ]).returning();
-    const [rfm, revenue] = await getDb().insert(snapshots).values([
+    const [rfm, revenue, , buyer] = await getDb().insert(snapshots).values([
       { tenantId: acme, template: 'rfm', taskId: taskRows[0]!.id, table: `gold.rfm__${taskRows[0]!.id}`, params: { asOf: '2024-07-01' }, rowCount: 5, expiresAt: new Date(Date.now() + 86_400_000) },
       { tenantId: acme, template: 'metric:revenue', taskId: taskRows[1]!.id, table: `gold.metric__${taskRows[1]!.id}`, params: { asOf: '2024-08-01' }, trigger: 'manual', rowCount: 3, expiresAt: new Date(Date.now() + 86_400_000) },
       // 同一定义更早的一张：定义页的「快照」区要排在 2024-08-01 后面，「最近计算」也不取它
       { tenantId: acme, template: 'metric:revenue', taskId: taskRows[2]!.id, table: `gold.metric__${taskRows[2]!.id}`, params: { asOf: '2024-07-15' }, rowCount: 2, createdAt: new Date(Date.now() - 86_400_000), expiresAt: new Date(Date.now() + 86_400_000) },
+      // 没有对应定义的自建标签快照：类型「标签」，归属只写「自建」（找不到创建人）
+      { tenantId: acme, template: 'tag:buyer', taskId: taskRows[3]!.id, table: `gold.tag__${taskRows[3]!.id}`, params: { asOf: '2024-08-01' }, rowCount: 4, expiresAt: new Date(Date.now() + 86_400_000) },
     ]).returning();
     const viewer = await loginAs(app, 'viewer@acme.com');
 
@@ -178,6 +181,8 @@ describe('分析页 · 指标与标签列表', () => {
     expect(html).toMatch(new RegExp(`data-snapshot="${rfm!.id}"(?:(?!</tr>).)*>系统内置<`, 's'));
     expect(html).toMatch(new RegExp(`data-snapshot="${revenue!.id}"(?:(?!</tr>).)*>指标<`, 's'));
     expect(html).toMatch(new RegExp(`data-snapshot="${revenue!.id}"(?:(?!</tr>).)*>自建 · analyst@acme\\.com<`, 's'));
+    expect(html).toMatch(new RegExp(`data-snapshot="${buyer!.id}"(?:(?!</tr>).)*>标签<`, 's'));
+    expect(html).toMatch(new RegExp(`data-snapshot="${buyer!.id}"(?:(?!</tr>).)*>自建<`, 's'));
 
     // 「指标与标签」列表的「最近计算」：最新一张快照的统计日、来源、行数
     const defRow = new RegExp('data-definition-row="metric:revenue"(?:(?!</tr>).)*', 's').exec(html)?.[0] ?? '';
