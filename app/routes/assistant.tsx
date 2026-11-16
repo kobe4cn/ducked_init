@@ -11,12 +11,12 @@
 // 说法未命中时同一字段存 kind: 'missing' 的候选组（⑥-5）：词不是任何名称或别名、按名称与描述检索最接近的 metric / tag / entity / field 条目；
 // POST 带 { conversationId, choice: { entryId } } 时服务端核对（对话属于本人、entryId 在最后一条 assistant 消息的候选里、在自己的目录里），
 // 通过后自己生成「『词』按 〈名称〉（entryId）理解」（未命中组是「『词』指的是 …」）的用户消息继续这一轮（不收自由文本），这条 user 消息带 chosen
-//（未命中的 chosen 带 kind: 'missing'，不出「记为知识提案」卡片，那是下一张票）；任一项不满足 400 且不请求模型；
+//（未命中的 chosen 带 kind: 'missing'，⑥-6 按它出「记为别名」卡片）；任一项不满足 400 且不请求模型；
 // choice.entryId 为 null 是「都不是」（⑥-5）：只在上一轮有未命中组时有效，生成「『词』不是这些候选里的任何一个」（不带 chosen），否则 400；
 // { intent: 'share' | 'unshare', conversationId, email } 分享或撤销分享自己的对话；
-// { intent: 'knowledge.propose', conversationId, index }（⑥-4，ADR-0046 / 0056）把对话里点选候选时存下的 chosen 确认成一条
-// 待复核的 term_default 提案：只收这两个字段，词与条目从服务端存下的 chosen 里取（不收客户端传来的值），
-// 卡片的显示条件（无权限 / 已有同词提案 / 指纹已拒绝）同样挡住提交（403 / 409）。出错返回 { error } 与对应状态码
+// { intent: 'knowledge.propose', conversationId, index }（⑥-4 / ⑥-6，ADR-0046 / 0056）把对话里点选候选时存下的 chosen 确认成一条
+// 待复核的提案：歧义点选出 term_default、未命中点选（kind: 'missing'）出 alias；只收这两个字段，词与条目从服务端存下的 chosen 里取（不收客户端传来的值），
+// 卡片的显示条件（无权限 / 已有同词提案 / 词已是名称或别名 / 指纹已拒绝）同样挡住提交（403 / 409）。出错返回 { error } 与对应状态码
 import type { Route } from './+types/assistant';
 import { can } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
@@ -28,7 +28,7 @@ import {
   appendTurn, ConversationError, lastChoices, listMyConversations, listSharedWithMe, readConversation, shareConversation, unshareConversation,
   type Conversation, type StoredMessage,
 } from '~/.server/assistant/conversations';
-import { askCardFor, proposeDefault, type AskCard } from '~/.server/assistant/knowledge-ask';
+import { askCardFor, proposeFromChoice, type AskCard } from '~/.server/assistant/knowledge-ask';
 import { AssistantError, assistantTurn, MAX_HISTORY, type ChatTurn } from '~/.server/assistant/loop';
 import { planCardView, type PlanCardView } from '~/.server/assistant/plan-card';
 import { catalogFor, toolsFor } from '~/.server/assistant/tools';
@@ -75,15 +75,15 @@ export async function loader({ request }: Route.LoaderArgs) {
       // 只有对话里有 plan 或歧义候选时才查目录（每个请求一次；「记为知识提案」卡片由 askCardFor 自己查），卡片与候选都按读者自己的目录组装：本人和被分享人看到的可以不同（ADR-0005）；
       // 读回只给 planCard、不给原始 plan（#539：plan.excluded 里有读者看不到的条目 id，比如自带数据源名的 table:…，不能经它泄露），
       // 候选同样只给过滤后的视图：存着的候选 id 列表不进响应
-      // 「记为知识提案」卡片（⑥-4）：点选候选的那条 user 消息带 chosen，卡片加在它后面那条 assistant 消息上，读时计算、不存库
-      // （审核状态变了，读回跟着变）；只给本人组装——被分享人只读，不能替主人提提案；未命中组的 chosen（⑥-5）不出卡片（下一张票）
+      // 「记为知识提案」卡片（⑥-4 / ⑥-6）：点选候选的那条 user 消息带 chosen，卡片加在它后面那条 assistant 消息上，读时计算、不存库
+      // （审核状态变了，读回跟着变）；歧义点选出 term_default、未命中点选出 alias；只给本人组装——被分享人只读，不能替主人提提案
       const chosenBefore = (i: number) => (read.owned ? read.messages[i - 1]?.chosen : undefined);
       const catalog = read.messages.some(m => m.plan || m.choices) ? await catalogFor(member) : null;
       conversation = {
         ...read,
         messages: await Promise.all(read.messages.map(async ({ plan, choices, ...m }, i) => {
           const chosen = chosenBefore(i);
-          const askCard = chosen && chosen.kind !== 'missing' ? await askCardFor(member, chosen, i - 1) : null;
+          const askCard = chosen ? await askCardFor(member, chosen, i - 1) : null;
           return {
             ...m,
             ...(plan && catalog ? { planCard: planCardView(catalog, plan) } : {}),
@@ -126,7 +126,7 @@ export async function action({ request }: Route.ActionArgs) {
       // 只收 conversationId 与 index：词与条目从服务端存下的 chosen 里取（ADR-0046），body 里别的字段一概不读
       if (!id) return Response.json({ error: '缺少对话' }, { status: 400 });
       if (typeof body.index !== 'number' || !Number.isInteger(body.index)) return Response.json({ error: 'index 要是整数' }, { status: 400 });
-      const out = await proposeDefault(member, id, body.index);
+      const out = await proposeFromChoice(member, id, body.index);
       return out instanceof Response ? out : Response.json(out);
     }
     const message = typeof body?.message === 'string' ? body.message.trim() : '';
@@ -167,7 +167,7 @@ export async function action({ request }: Route.ActionArgs) {
           if (!group) return Response.json({ error: '这个条目不在上一轮追问的候选里' }, { status: 400 });
           const entry = (await catalogFor(member)).entries.find(e => e.id === choice);
           if (!entry) return Response.json({ error: '这个条目不在你的目录里' }, { status: 400 });
-          // 歧义组（⑥-3）「按 … 理解」；未命中组（⑥-5）「指的是 …」，chosen 带 kind（下一张票按它出知识提案卡片，本票不出）
+          // 歧义组（⑥-3）「按 … 理解」；未命中组（⑥-5）「指的是 …」，chosen 带 kind（⑥-6 按它出「记为别名」卡片与 alias 提案）
           userText = group.kind === 'missing'
             ? `『${group.term}』指的是 〈${entry.name}〉（${choice}）`
             : `『${group.term}』按 〈${entry.name}〉（${choice}）理解`;
@@ -180,9 +180,9 @@ export async function action({ request }: Route.ActionArgs) {
     const conversationId = await appendTurn(member, id, { userText, reply, toolsUsed, ...(plan ? { plan } : {}), ...(workbenchSql ? { workbenchSql } : {}), ...(choices ? { choices } : {}), ...(chosen ? { chosen } : {}) });
     // 本轮校验过计划时带计划卡、判出过歧义时带候选：都按成员自己的目录读时组装；被拒的那轮（如 reuse_result 计划填工作台）校验过计划也带
     const catalog = plan || choices ? await catalogFor(member) : null;
-    // 「记为知识提案」卡片（⑥-4）：点选候选回答的那轮按存下的 chosen 确定性组装（不是模型生成的），无权限 / 已有同词提案 /
-    // 指纹已拒绝时不带（askCardFor 里检查，与提交同一套条件）；未命中组的 chosen（⑥-5）不出卡片，那是下一张票
-    const askCard = chosen && chosen.kind !== 'missing' ? await askCardFor(member, chosen, chosenIndex) : null;
+    // 「记为知识提案」卡片（⑥-4 / ⑥-6）：点选候选回答的那轮按存下的 chosen 确定性组装（不是模型生成的），无权限 / 已有同词提案 /
+    // 词已是名称或别名 / 指纹已拒绝时不带（askCardFor 里检查，与提交同一套条件）；歧义点选出 term_default、未命中点选出 alias
+    const askCard = chosen ? await askCardFor(member, chosen, chosenIndex) : null;
     return Response.json({
       conversationId, reply, toolsUsed,
       ...(workbenchSql ? { workbenchSql } : {}),

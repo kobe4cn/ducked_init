@@ -74,8 +74,8 @@ describe('记为知识提案', () => {
     const id = await askAmbiguous(client);
     const picked = await pick(client, id, 'metric:revenue_paid');
     expect(picked).toMatchObject({ conversationId: id });
-    // 卡片：index 是带 chosen 的 user 消息（下标 2）的下标，名称取自分析师自己的目录
-    expect(picked.askCard).toEqual({ index: 2, term: '营收', entryId: 'metric:revenue_paid', name: 'revenue_paid' });
+    // 卡片：index 是带 chosen 的 user 消息（下标 2）的下标，名称取自分析师自己的目录；歧义点选的 kind 是 term_default（⑥-6 起）
+    expect(picked.askCard).toEqual({ index: 2, term: '营收', entryId: 'metric:revenue_paid', name: 'revenue_paid', kind: 'term_default' });
     // ?id= 读回：同一条 assistant 消息（下标 3）带一样的卡片
     const { conversation } = await (await client.get(`/assistant?id=${id}`)).json();
     expect(conversation.messages[3].askCard).toEqual(picked.askCard);
