@@ -20,12 +20,13 @@ import { judgeAmbiguity, type AmbiguityGroup } from '../catalog/ambiguity';
 import { tenantCatalog } from '../catalog/load';
 import { planRetrievedIds, semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type PlanStatus } from '../catalog/plan';
 import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
-import type { HitReason } from '../catalog/rank';
+import type { HitReason, Ranked } from '../catalog/rank';
 import { getDb } from '../db/client';
 import { dslDefinitions, mappings, spaces, tenants } from '../db/schema';
 import { createDefinition, DslError, saveDslDraft, validateDefinition } from '../dsl-definitions';
 import type { DslIssue } from '../pipeline/dsl/metric-spec';
 import { createMapping, MappingError, saveMappingDraft, validateNewMapping } from '../mappings';
+import type { ChoiceGroup } from './conversations';
 import { sourceIdByName } from '../source-config';
 import { checkDraftedSql, runQuery, WORKBENCH_ROWS } from '../workbench';
 import { MAX_CELL, redactResult } from '../workbench-ai';
@@ -54,8 +55,8 @@ export const catalogFor = async (member: CurrentMember): Promise<Catalog> =>
 /** 一次助手对话轮的上下文：retrieved 是本轮 catalog_search / catalog_expand 返回过的条目 id，validate_plan 只认这些（防止模型引用没检索过的条目）；
  * plan 是本轮 validate_plan 收到的最后一份结构合法的计划，priorPlan 是对话里最近一份（助手循环带入）；存草稿与填工作台前都优先用 plan、其次 priorPlan 重新校验；
  * workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（多次通过以最后一次为准，之后的拒绝不清掉之前通过的值）；
- * choices 是本轮最后一次 catalog_search 判为歧义的追问候选（⑥-3，只有词与候选条目 id）：随答复返回、由路由加密存进对话，不进发给模型的请求 */
-export interface ToolCtx { retrieved: Set<string>; plan?: AnalysisPlan; priorPlan?: AnalysisPlan; workbenchSql?: string; choices?: { term: string; candidates: string[] }[] }
+ * choices 是本轮最后一次 catalog_search 判为歧义的追问候选（⑥-3，只有词与候选条目 id）或未命中说法的候选组（⑥-5，kind: 'missing'）：随答复返回、由路由加密存进对话，不进发给模型的请求 */
+export interface ToolCtx { retrieved: Set<string>; plan?: AnalysisPlan; priorPlan?: AnalysisPlan; workbenchSql?: string; choices?: ChoiceGroup[] }
 
 const TEXT = { type: 'string' };
 
@@ -76,6 +77,17 @@ const comparison = (g: AmbiguityGroup) => [
   ...g.diffs.map(d => `| ${d.label} | ${g.candidates.map(id => d.values[id] ?? '').join(' | ')} |`),
   ...g.questions.map(q => `追问：${q}`),
 ].join('\n');
+
+/** 未命中说法的候选组（⑥-5）：投影没回退（回退时理由全空，判不了）、没有任何标识 / 别名 / 名称命中（词命中名称或别名就不算未命中）、
+ * 词 1–20 字且不含空白（整句话不记，免得把问句变成以后的别名提案）时，取排名顺序里前 5 个 metric / tag / entity / field 条目当候选；
+ * 任一条件不满足时 undefined（歧义优先，见 catalog_search） */
+function missingGroup(ranked: Ranked[], fallback: boolean, q: string): ChoiceGroup[] | undefined {
+  const term = q.trim();
+  if (fallback || !term || [...term].length > 20 || /\s/.test(term)) return undefined;
+  if (ranked.some(r => r.reasons.some(({ lane }) => lane === 'id' || lane === 'alias' || lane === 'name'))) return undefined;
+  const candidates = ranked.filter(r => /^(metric|tag|entity|field):/.test(r.entry.id)).slice(0, 5).map(r => r.entry.id);
+  return candidates.length ? [{ term, kind: 'missing', candidates }] : undefined;
+}
 
 const issueLines = (issues: DslIssue[]) =>
   issues.map(i => `- ${i.path || '（文档）'}（第 ${i.line} 行第 ${i.col} 列）：${i.message}`).join('\n');
@@ -201,14 +213,15 @@ export const TOOLS: AssistantTool[] = [
         .filter(s => q.includes(s.name)).map(s => s.id);
       const c = await catalogFor(actor);
       const [tenant] = await getDb().select({ hybridSearch: tenants.hybridSearch }).from(tenants).where(eq(tenants.id, actor.tenant.id));
-      const { ranked } = await rankedSearch(actor.tenant.id, visibilityClass(actor.role), c, q,
+      const { ranked, fallback } = await rankedSearch(actor.tenant.id, visibilityClass(actor.role), c, q,
         { spaceIds, memberSpaceId: actor.space.id }, limit as number | undefined, { hybrid: tenant?.hybridSearch ?? false });
       // 排到的条目都算本轮检索到（含投影不可用回退的那部分），每个都带语义哈希
       for (const r of ranked) ctx?.retrieved.add(r.entry.id);
       // 回退时得分全为 0，照样判定（一律按差异追问）
       const { ambiguous, groups, defaults } = judgeAmbiguity(ranked, c, q);
-      // 歧义候选留在轮上下文里（⑥-3）：随本轮答复返回并加密存进对话，供前端点选、/assistant 的 choice 入参核对；同一轮再搜且不歧义时清空，只认最后一次
-      if (ctx) ctx.choices = ambiguous ? groups.map(g => ({ term: g.term, candidates: g.candidates })) : undefined;
+      // 歧义候选留在轮上下文里（⑥-3）：随本轮答复返回并加密存进对话，供前端点选、/assistant 的 choice 入参核对；同一轮再搜且不歧义时清空，只认最后一次。
+      // 不歧义但词未命中（没有任何标识 / 别名 / 名称命中）时改留未命中候选组（⑥-5），同样是最后一次搜索说了算
+      if (ctx) ctx.choices = ambiguous ? groups.map(g => ({ term: g.term, candidates: g.candidates })) : missingGroup(ranked, fallback, q);
       const entries = ranked.length
         ? ranked.map(r => r.reasons.length ? `${withHash(r.entry)}\n${hitLine(r.reasons)}` : withHash(r.entry)).join('\n\n')
         : toMarkdown([]);
