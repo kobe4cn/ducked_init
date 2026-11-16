@@ -1,4 +1,5 @@
-// app/routes/api-keys.tsx —— 外部系统的 API Key（仅管理员）：创建（明文只在创建后的这次响应里展示一次）、吊销
+// app/routes/api-keys.tsx —— 外部系统的 API Key（仅管理员）：创建（明文只在创建后的这次响应里展示一次）、吊销；
+// 「接口说明」标签页按 app/lib/api-docs.ts 的登记表渲染全部外部接口的调用方式（不查库，也没有任何真实 Key）
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { CircleAlert, KeyRound } from 'lucide-react';
 import type { Route } from './+types/api-keys';
@@ -7,6 +8,7 @@ import { ApiKeyError, createApiKey, listApiKeys, revokeApiKey } from '~/.server/
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
+import { PillTabs } from '~/components/pill-tabs';
 import { SectionHeader } from '~/components/section-header';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Badge } from '~/components/ui/badge';
@@ -14,26 +16,37 @@ import { Button } from '~/components/ui/button';
 import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { API_ENDPOINTS, type ApiEndpoint } from '~/lib/api-docs';
 
 export function meta({}: Route.MetaArgs) {
   return [{ title: 'API Key · CRM 数据分析平台' }];
 }
 
+/** 页面的标签页：Key 列表与接口说明（接口说明由登记表生成，不查库） */
+type Tab = 'keys' | 'docs';
+const tabOf = (request: Request): Tab => {
+  const tab = new URL(request.url).searchParams.get('tab');
+  return tab === 'docs' ? tab : 'keys';
+};
+
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'api_keys:manage');
-  const rows = await listApiKeys(member);
+  const tab = tabOf(request);
   return {
     email: member.email,
     nav: navFor(member),
-    keys: rows.map(r => ({
-      id: r.id,
-      name: r.name,
-      prefix: r.prefix,
-      createdByEmail: r.createdByEmail,
-      createdAt: r.createdAt.toISOString(),
-      lastUsedAt: r.lastUsedAt?.toISOString() ?? null,
-      revoked: r.revokedAt !== null,
-    })),
+    tab,
+    keys: tab === 'keys'
+      ? (await listApiKeys(member)).map(r => ({
+        id: r.id,
+        name: r.name,
+        prefix: r.prefix,
+        createdByEmail: r.createdByEmail,
+        createdAt: r.createdAt.toISOString(),
+        lastUsedAt: r.lastUsedAt?.toISOString() ?? null,
+        revoked: r.revokedAt !== null,
+      }))
+      : [],
   };
 }
 
@@ -63,32 +76,13 @@ export async function action({ request }: Route.ActionArgs) {
 
 const formatTime = (iso: string) => new Date(iso).toLocaleString('zh-CN', { hour12: false });
 
-export default function ApiKeys({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, keys } = loaderData;
-  const submitting = useNavigation().state === 'submitting';
+/** 参数位置与是否必填的页面文案 */
+const PARAM_IN_TEXT = { path: '路径', query: '查询', body: '请求体' } as const;
+
+/** 「Key」标签页：创建表单与 Key 列表 */
+function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefix: string; createdByEmail: string; createdAt: string; lastUsedAt: string | null; revoked: boolean }[]; submitting: boolean }) {
   return (
-    <AppShell email={email} nav={nav}>
-      <PageHeader title="API Key" description="外部系统用 Authorization: Bearer <Key> 调用 /api/v1/ 下的接口。吊销后用这把 Key 的请求立即被拒绝。" />
-
-      {actionData && 'error' in actionData && (
-        <Alert variant="destructive" role="alert">
-          <CircleAlert />
-          <AlertTitle>操作未完成</AlertTitle>
-          <AlertDescription>{actionData.error}</AlertDescription>
-        </Alert>
-      )}
-
-      {actionData && 'created' in actionData && (
-        <Alert role="status">
-          <KeyRound />
-          <AlertTitle>已创建「{actionData.created.name}」</AlertTitle>
-          <AlertDescription>
-            <p>请现在复制并妥善保存。这把 Key 只展示这一次，平台不保存明文，之后无法再查看。</p>
-            <code data-api-key className="mt-2 block break-all rounded-lg bg-slate-100 px-3 py-2 font-mono text-sm text-slate-900">{actionData.created.key}</code>
-          </AlertDescription>
-        </Alert>
-      )}
-
+    <>
       <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
         <SectionHeader title="创建 API Key">每个外部系统各用一把，便于单独吊销。</SectionHeader>
         <Form method="post">
@@ -145,6 +139,126 @@ export default function ApiKeys({ loaderData, actionData }: Route.ComponentProps
             </TableBody>
           </Table>
         </div>
+      )}
+    </>
+  );
+}
+
+/** 「接口说明」标签页的一张卡片：一个外部接口的调用方式，全部来自登记表 */
+function EndpointCard({ endpoint }: { endpoint: ApiEndpoint }) {
+  return (
+    <section data-endpoint={endpoint.route} className="rounded-2xl border bg-white p-6 shadow-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant="outline" className="font-mono">{endpoint.method}</Badge>
+        <code className="font-mono text-sm font-semibold text-slate-900">{endpoint.path}</code>
+      </div>
+      <p className="mt-3 max-w-3xl text-sm text-slate-600">{endpoint.purpose}</p>
+      <p className="mt-2 text-sm text-slate-600"><span className="text-slate-500">鉴权：</span>{endpoint.auth}</p>
+
+      {endpoint.params.length > 0 && (
+        <div className="mt-4 space-y-2">
+          <h3 className="text-sm font-semibold text-slate-900">参数</h3>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>参数</TableHead>
+                <TableHead>位置</TableHead>
+                <TableHead>必填</TableHead>
+                <TableHead>说明</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {endpoint.params.map(p => (
+                <TableRow key={p.name}>
+                  <TableCell className="font-mono">{p.name}</TableCell>
+                  <TableCell>{PARAM_IN_TEXT[p.in]}</TableCell>
+                  <TableCell>{p.required ? '必填' : '可选'}</TableCell>
+                  <TableCell className="text-slate-600">{p.desc}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      <div className="mt-4 space-y-2">
+        <h3 className="text-sm font-semibold text-slate-900">成功响应示例</h3>
+        <pre className="overflow-x-auto rounded-lg bg-slate-100 px-3 py-2 font-mono text-sm text-slate-900">{endpoint.responseExample}</pre>
+      </div>
+
+      <div className="mt-4 space-y-2">
+        <h3 className="text-sm font-semibold text-slate-900">错误</h3>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>状态码</TableHead>
+              <TableHead>返回文案（error 字段）</TableHead>
+              <TableHead>什么时候出现</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {endpoint.errors.map(err => (
+              <TableRow key={`${err.status}-${err.message}`}>
+                <TableCell className="font-mono">{err.status}</TableCell>
+                <TableCell className="font-mono text-xs">{err.message}</TableCell>
+                <TableCell className="text-slate-600">{err.meaning}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+
+      <div className="mt-4 space-y-2">
+        <h3 className="text-sm font-semibold text-slate-900">curl</h3>
+        <pre className="overflow-x-auto rounded-lg bg-slate-100 px-3 py-2 font-mono text-sm text-slate-900">{endpoint.curl}</pre>
+      </div>
+    </section>
+  );
+}
+
+export default function ApiKeys({ loaderData, actionData }: Route.ComponentProps) {
+  const { email, nav, tab, keys } = loaderData;
+  const submitting = useNavigation().state === 'submitting';
+  return (
+    <AppShell email={email} nav={nav}>
+      <PageHeader title="API Key" description="外部系统用 Authorization: Bearer <Key> 调用 /api/v1/ 下的接口。吊销后用这把 Key 的请求立即被拒绝。" />
+
+      <PillTabs
+        current={tab}
+        tabs={[
+          { key: 'keys', label: 'Key', href: '/api-keys' },
+          { key: 'docs', label: '接口说明', href: '/api-keys?tab=docs' },
+        ]}
+      />
+
+      {actionData && 'error' in actionData && (
+        <Alert variant="destructive" role="alert">
+          <CircleAlert />
+          <AlertTitle>操作未完成</AlertTitle>
+          <AlertDescription>{actionData.error}</AlertDescription>
+        </Alert>
+      )}
+
+      {actionData && 'created' in actionData && (
+        <Alert role="status">
+          <KeyRound />
+          <AlertTitle>已创建「{actionData.created.name}」</AlertTitle>
+          <AlertDescription>
+            <p>请现在复制并妥善保存。这把 Key 只展示这一次，平台不保存明文，之后无法再查看。</p>
+            <code data-api-key className="mt-2 block break-all rounded-lg bg-slate-100 px-3 py-2 font-mono text-sm text-slate-900">{actionData.created.key}</code>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {tab === 'docs' ? (
+        <div className="space-y-4">
+          <p className="max-w-3xl text-sm text-slate-500">
+            全部外部接口的调用方式如下，示例里的地址与 Key 都是占位符（&lt;平台地址&gt;、&lt;你的 API Key&gt;）。接口的增改以这份登记表为准。
+          </p>
+          {API_ENDPOINTS.map(endpoint => <EndpointCard key={endpoint.route} endpoint={endpoint} />)}
+        </div>
+      ) : (
+        <KeysTab keys={keys} submitting={submitting} />
       )}
     </AppShell>
   );
