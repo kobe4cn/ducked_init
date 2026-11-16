@@ -4,6 +4,7 @@
 import { and, eq } from 'drizzle-orm';
 import { parse } from 'yaml';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { CurrentMember } from '../../app/.server/auth';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -14,11 +15,11 @@ import { PublishError } from '../../app/.server/publishing';
 import { modelDraftMessages } from '../../app/.server/pipeline/model-draft';
 import { tableContextFor } from '../../app/.server/model-provider';
 import { syncSource } from '../../app/.server/source-sync';
-import { confirmWatermark, registerSource } from '../../app/.server/sources';
+import { confirmWatermark, getSource, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
-import { drain, memberOf, newTenant, publish, selectAllTables } from './fixtures';
+import { drain, memberOf, newTenant, publish } from './fixtures';
 import { fakeLlm, json, platformDefault } from './llm-fixtures';
-import { pgSourceInput, READER } from './source-fixtures';
+import { drainUntilSucceeded, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -55,9 +56,15 @@ async function tenantWithSource() {
   const author = await memberOf(acme, 'de@acme.com');
   const reviewer = await memberOf(acme, 'de2@acme.com');
   const { id } = await registerSource(author, await pgSourceInput(READER, '门店1'));
-  await selectAllTables(author, id);
-  await drain();
+  await profileAllTables(author, id, 'acme');
   return { acme, author, reviewer, sourceId: id };
+}
+
+/** 把数据源的可读表全部选入同步范围并采集完。采集任务偶尔因连不上源库失败（#780，同 #403、#360），检查状态、失败就重新采集 */
+async function profileAllTables(member: CurrentMember, sourceId: string, name: string) {
+  const { listing } = await getSource(member, sourceId);
+  const { task } = await setSyncScope(member, sourceId, { add: listing.filter(t => t.readable && !t.gone).map(t => t.name) });
+  await drainUntilSucceeded(name, task, () => relistSource(member, sourceId));
 }
 
 const generations = (tenantId: string) => getDb().select().from(mappingGenerations).where(eq(mappingGenerations.tenantId, tenantId));
@@ -79,8 +86,7 @@ describe('用模型生成映射草稿', () => {
     const { acme, author, reviewer, sourceId } = await tenantWithSource();
     const published = await publish(author, reviewer, sourceId, ORDERS);
     const { id: shop2 } = await registerSource(author, await pgSourceInput(READER, '门店2'));
-    await selectAllTables(author, shop2);
-    await drain();
+    await profileAllTables(author, shop2, '门店2');
     platformDefault();
     const { f } = fakeLlm(setLlmFetch, () => json(MODEL_ORDERS, USAGE));
 
@@ -299,8 +305,7 @@ describe('记录成员对生成草稿的修改', () => {
     const other = await newTenant('globex');
     const outsider = await memberOf(other, 'de@globex.com');
     const { id: theirSource } = await registerSource(outsider, await pgSourceInput(READER, '门店1'));
-    await selectAllTables(outsider, theirSource);
-    await drain();
+    await profileAllTables(outsider, theirSource, 'globex');
     const theirs = await modelDraftFor(outsider, theirSource, 'orders', 'order');
     const customers = await modelDraftFor(author, sourceId, 'customers', 'customer');
 
