@@ -746,6 +746,30 @@ describe('按规则生成映射草稿', () => {
     expect(await (await engineer.get(`/mappings/${id}?tab=versions`)).text()).toContain('data-version-status="draft"');
   });
 
+  it('换表 / 实体时新建页经 .data 接口取规则草稿（fetcher 式 intent=draft）：返回的草稿只含新表与新实体的字段，不保存；取不到时报错、不换内容', async () => {
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+
+    // 打开页面时编辑框默认是 customers → customer，换成 orders → order
+    const switched = await actionData(engineer, '/mappings', { intent: 'draft', sourceId, table: 'orders', entity: 'order' });
+    expect(switched.status).toBe(200);
+    expect(typeof (switched.value.data as { draftId: unknown }).draftId).toBe('string');
+    const yaml = (switched.value.data as { values: { yaml: string } }).values.yaml;
+    expect(yaml).toContain('table: orders');
+    expect(yaml).toContain('entity: order');
+    expect(yaml).toMatch(/order_id: string\(order_id\)/);
+    // 上一个实体（customer）特有的字段不再出现
+    expect(yaml).not.toContain('email:');
+    expect(yaml).not.toContain('registered_at:');
+    // 只生成，不保存
+    expect(await (await engineer.get('/mappings')).text()).toContain('还没有映射');
+
+    // 表取不到（没采集过）时给错误，values 里没有可换的草稿
+    const missing = await actionData(engineer, '/mappings', { intent: 'draft', sourceId, table: 'nope', entity: 'order' });
+    expect(missing.status).toBe(400);
+    expect((missing.value.data as { error: string }).error).toContain('数据源中没有表 nope');
+  });
+
   it('新建页用模型生成草稿填进编辑框，不保存；确认后保存为草稿。模型输出不合 Schema 时显示错误、编辑框保持原内容；分析师 403', async () => {
     const { tenantId, sourceId } = await tenantWithSource('acme');
     modelReplies({ fields: [
@@ -1333,5 +1357,8 @@ describe('实时校验接口', () => {
       expect(shouldRevalidate(args(form('save')))).toBe(true);
       expect(shouldRevalidate(args())).toBe(true);
     }
+    // 新建页的取规则草稿（fetcher 式或「按规则生成草稿」按钮）只生成不保存，也不重跑 loader
+    const args = { formData: (() => { const f = new FormData(); f.set('intent', 'draft'); return f; })(), defaultShouldRevalidate: true } as Parameters<typeof mappingsRevalidate>[0];
+    expect(mappingsRevalidate(args)).toBe(false);
   });
 });
