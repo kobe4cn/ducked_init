@@ -154,10 +154,17 @@ describe('主键冲突体检', () => {
   });
 
   it('撞号失败的映射一边的键全在另一边里时建议合并组', async () => {
-    const { author, reviewer, id } = await syncedSources();
+    const { acme, author, reviewer, id } = await syncedSources();
     // 都不带 where：customers 的键 1..40 全在 orders 的 1..100 里，后一个映射合并失败、一行也没进标准层
-    await publish(author, reviewer, id, TOUCH_FROM_CUSTOMERS);
-    await publish(author, reviewer, id, TOUCH_FROM_ORDERS);
+    const kept = await publish(author, reviewer, id, TOUCH_FROM_CUSTOMERS);
+    const clashing = await publish(author, reviewer, id, TOUCH_FROM_ORDERS);
+    await mergeNow(author);
+    await drain();
+    expect((await getMapping(author, clashing)).merge.history[0]).toMatchObject({ error: expect.stringContaining('主键 touch_id 跨映射重复') });
+    const touchRows = await silver(acme, 'touch', 'touch_id, _mapping');
+    expect(touchRows).toHaveLength(40);
+    expect(new Set(touchRows.map(r => r._mapping))).toEqual(new Set([kept]));
+
     await checkKeysNow(author);
     await drain();
 
