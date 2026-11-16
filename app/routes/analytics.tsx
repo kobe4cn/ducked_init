@@ -32,6 +32,18 @@ const STATUS_TABS = [
   { key: 'published', label: '已发布' },
 ] as const;
 
+/** 定义是否符合状态筛选：有生效版本又有草稿的同时符合「有草稿」与「已发布」 */
+function matchesStatus(d: DefinitionSummary, status: (typeof STATUS_TABS)[number]['key']) {
+  switch (status) {
+    case 'draft': return !!d.draft;
+    case 'unpublished': return d.published === null;
+    case 'published': return d.published !== null;
+  }
+}
+
+/** 自建定义的归属文案；创建人未知时只写「自建」 */
+const selfBuilt = (creator: string | null) => (creator ? `自建 · ${creator}` : '自建');
+
 export function meta({}: Route.MetaArgs) {
   return [{ title: '分析 · CRM 数据分析平台' }];
 }
@@ -79,8 +91,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     hasAnyDefinitions: all.length > 0,
     definitions: all
       .filter(d => (!typeFilter || d.kind === typeFilter)
-        && (!statusFilter
-          || (statusFilter === 'draft' ? !!d.draft : statusFilter === 'unpublished' ? d.published === null : d.published !== null)))
+        && (!statusFilter || matchesStatus(d, statusFilter)))
       .map(d => ({
         kind: d.kind,
         key: d.key,
@@ -95,7 +106,8 @@ export async function loader({ request }: Route.LoaderArgs) {
     templates: Object.entries(TEMPLATES).map(([id, t]) => ({ id, label: t.label })),
     snapshots: snapshots.map(s => {
       const dsl = DSL_TEMPLATE.exec(s.template);
-      const kind = dsl ? (dsl[1] === 'tag' ? 'tag' as const : 'metric' as const) : 'template' as const;
+      let kind: keyof typeof TYPE_LABELS = 'template';
+      if (dsl) kind = dsl[1] === 'tag' ? 'tag' : 'metric';
       return {
         id: s.id,
         /** 类型：系统内置的分析模板，或成员自建的指标 / 标签 */
@@ -188,7 +200,7 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
               {snapshots.map(s => (
                 <TableRow key={s.id} data-snapshot={s.id} className={cn(s.expired && 'text-slate-400')}>
                   <TableCell><Badge variant="secondary">{TYPE_LABELS[s.kind]}</Badge></TableCell>
-                  <TableCell className="text-slate-500">{s.origin.builtIn ? '系统内置' : s.origin.creator ? `自建 · ${s.origin.creator}` : '自建'}</TableCell>
+                  <TableCell className="text-slate-500">{s.origin.builtIn ? '系统内置' : selfBuilt(s.origin.creator)}</TableCell>
                   <TableCell>
                     {s.expired ? s.templateLabel : <Link to={s.href} className="font-medium hover:underline">{s.templateLabel}</Link>}
                   </TableCell>
@@ -256,7 +268,7 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
                       <TableRow key={`${d.kind}:${d.key}`} data-definition-row={`${d.kind}:${d.key}`}>
                         <TableCell><Link to={`/analytics/definitions/${d.kind}/${d.key}`} className="font-medium hover:underline">{d.key}</Link></TableCell>
                         <TableCell><Badge variant="secondary">{TYPE_LABELS[d.kind]}</Badge></TableCell>
-                        <TableCell className="text-slate-500">{d.creator ? `自建 · ${d.creator}` : '自建'}</TableCell>
+                        <TableCell className="text-slate-500">{selfBuilt(d.creator)}</TableCell>
                         <TableCell>{d.published ? `v${d.published}` : '未发布'}</TableCell>
                         <TableCell>{d.draft ? `有草稿 · ${d.draft.lastEditor}` : '—'}</TableCell>
                         <TableCell>
