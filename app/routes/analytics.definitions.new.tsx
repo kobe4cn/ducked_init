@@ -4,9 +4,13 @@
 // 标签选已发布的数值指标拼规则（单指标 / 多指标，all / any 一层），不加「检查」——保存时 checkTag 按行列报问题。保存仍走同一套校验与双人发布。
 // 构建器模式下表单只提交键、intent 与隐藏字段 form（MetricForm / TagForm 的 JSON），字段表与指标表不信客户端：指标按 form.base
 // 用 fieldsFor 重取（敏感字段已剔除，ADR-0005），标签按 tagFormOf 逐层规整（构建器没有的 readonly 清空），再 formToYaml 成 YAML——与手写 YAML 走完全一样的路（ADR-0017）。
+// 构建器与 YAML 的切换带上内容（intent=to-yaml / to-builder，#797）：切换提交本页表单，服务端转换后回显到目标模式（应答的 mode 覆盖 URL 里的 ?mode=）；
+// YAML 里有构建器表达不了的项（维度、只读项）时先逐项列出、确认（to-builder-confirmed）后才切，YAML 读不出来 400 不切换、编辑框保持原内容；空构建器切 YAML 给示例。
+// 种类切换仍是链接（内容带不过去），有还没保存的内容时客户端先确认（app/lib/unsaved-changes.ts：快照比基线，页面上有 action 回显一律算未保存）。
 // 可以写下需求后用模型生成草稿（intent=model-draft，ADR-0035，只在 YAML 模式）：生成的 YAML 填进编辑框、不保存，失败时编辑框保持原内容
 // 指标的构建器模式还能写一句话解析（intent=parse，#517）：parseMetricSentence 把句子解析成表单填进构建器并逐项说明，
 // 已有内容时先列出差异（intent=applyParse 确认后才覆盖），解析失败时表单保持原样
+import { useEffect, useRef } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.new';
 import { requirePermission } from '~/.server/access';
@@ -20,8 +24,9 @@ import { getDb } from '~/.server/db/client';
 import { todayUtc } from '~/.server/templates';
 import { CANONICAL_ENTITIES, entityOf, type FieldType } from '~/lib/canonical-model';
 import { cmp } from '~/lib/compare';
-import { formToYaml as tagFormToYaml, type TagForm } from '~/lib/tag-form';
+import { formToYaml as tagFormToYaml, yamlToForm as tagYamlToForm, type TagForm } from '~/lib/tag-form';
 import { diffForms, formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
+import { hasUnsavedChanges, snapshotOf } from '~/lib/unsaved-changes';
 import { TAG_CONDITIONS, type TagCondition } from '~/lib/tag-vocab';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
@@ -107,6 +112,17 @@ function ratioOf(v: unknown): RatioForm | undefined {
   const r = v as Record<string, unknown>;
   if (typeof r.agg !== 'string') return undefined;
   return { agg: r.agg as RatioForm['agg'], field: strOf(r.field), filter: condsOf(r.filter) };
+}
+
+/** 「切到构建器会丢掉这些项」里的一项：key 是名字（维度）或位置（readonly 项），reason 说明为什么丢 */
+interface DroppedItem { key: string; reason: string }
+
+/** 构建器隐藏字段里选没选基础实体（没选时 builderFormOf 会按「读不出来」抛）：切 YAML 的方向给示例而不是报错 */
+function builderHasBase(text: string): boolean {
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch { return false; }
+  const v = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  return strOf(v.base) !== undefined;
 }
 
 /**
@@ -240,10 +256,64 @@ export async function action({ request }: Route.ActionArgs) {
   const echo = kind !== 'metric' || builder === undefined ? undefined : (() => { try { return JSON.stringify(builderFormOf(builder)); } catch { return undefined; } })();
   /** 标签构建器的回显同样是服务端规整过的表单（tagFormOf 只在 JSON 读不出时不回显） */
   const tagEcho = kind !== 'tag' || builder === undefined ? undefined : (() => { try { return JSON.stringify(tagFormOf(builder)); } catch { return undefined; } })();
-  /** 各分支共有的回显；echoId 每次提交都变——回显字符串相同时（只多了一条空条件行被丢掉）也换 key 重挂载构建器，控件跟着回显走；parse / parsed / diff 只在 intent=parse 的应答里有，这里占位让组件能统一读 */
-  const keep = { key, request: requirement, generated: false, form: echo, tagForm: tagEcho, echoId: crypto.randomUUID(), sentence, parse: undefined, parsed: undefined, diff: undefined };
+  /** 各分支共有的回显；echoId 每次提交都变——回显字符串相同时（只多了一条空条件行被丢掉）也换 key 重挂载构建器，控件跟着回显走；parse / parsed / diff 只在 intent=parse 的应答里有，dropped 只在 to-builder 的应答里有，这里占位让组件能统一读 */
+  // 编辑模式默认跟页面当前显示的走：隐藏字段 mode（切换是本页表单的 POST、不改 URL，URL 会停在旧模式上），没带时按 URL（与 loader 同一套读法）；
+  // 不能按「有没有提交 form 字段」猜——空构建器解析一句话（intent=parse）也不提交它，却要留在构建器；只有模式切换的分支在应答里覆盖（to-yaml / to-builder-confirmed）
+  const urlMode = new URL(request.url).searchParams.get('mode') === 'yaml' ? 'yaml' as const : 'builder' as const;
+  const modeInput = form.get('mode');
+  const currentMode = modeInput === 'yaml' || modeInput === 'builder' ? modeInput : urlMode;
+  const keep = {
+    key, request: requirement, generated: false, form: echo, tagForm: tagEcho, echoId: crypto.randomUUID(), sentence,
+    parse: undefined, parsed: undefined, diff: undefined, dropped: undefined as DroppedItem[] | undefined,
+    /** 指标与标签的编辑模式；其他种类没有模式 */
+    mode: (kind === 'metric' || kind === 'tag') ? currentMode : undefined,
+  };
   let yaml = yamlInput;
   try {
+    // 模式切换（YAML ↔ 构建器）：提交本页表单，服务端把内容转换后带到目标模式（#797）。字段表只在服务端取（ADR-0005），不信客户端
+    if ((kind === 'metric' || kind === 'tag') && intent === 'to-yaml') {
+      let out = EXAMPLES[kind].example;
+      if (kind === 'metric' && builder !== undefined && builderHasBase(builder)) {
+        const formState = builderFormOf(builder); // 选了实体但 ratio 缺分子 / 分母：按读不出来 400，留在构建器
+        const ctx = await dslContext(getDb(), member.tenant.id);
+        const fields = fieldsFor(formState.base, ctx);
+        if (fields === undefined) throw new DslError(`${formState.base} 不能用作基础实体`);
+        out = formToYaml(formState, labelledFields(formState.base, fields));
+      }
+      if (kind === 'tag' && builder !== undefined) out = tagFormToYaml(tagFormOf(builder));
+      return { ...keep, mode: 'yaml', yaml: out, error: null, issues: [], summary: null, sql: null };
+    }
+    if (kind === 'metric' && (intent === 'to-builder' || intent === 'to-builder-confirmed')) {
+      // 先看整份 YAML 读不读得出来：读不出来 400 留在 YAML、编辑框保持原内容；读得出来再按 base 取字段表转表单
+      const first = yamlToForm(yaml, []);
+      const unreadable = first.readonly.find(r => r.key === '$yaml');
+      if (unreadable) throw new DslError(unreadable.reason);
+      const ctx = await dslContext(getDb(), member.tenant.id);
+      const fields = fieldsFor(first.base, ctx);
+      const parsed = yamlToForm(yaml, fields ? labelledFields(first.base, fields) : []);
+      // 构建器没有维度控件、也表达不了只读项：切过去会丢掉的逐项列出（多跳维度的名字在 readonly 项的 raw.name 里），没确认先不切
+      const dropped: DroppedItem[] = [
+        ...parsed.dimensions.map(d => ({ key: d.name, reason: '维度，构建器没有维度控件' })),
+        ...parsed.readonly.map(r => {
+          const raw = /^dimensions\.\d+$/.test(r.key) && r.raw && typeof r.raw === 'object' && !Array.isArray(r.raw) ? (r.raw as { name?: unknown }).name : undefined;
+          return { key: typeof raw === 'string' ? raw : r.key, reason: r.reason };
+        }),
+      ];
+      if (dropped.length > 0 && intent === 'to-builder') {
+        return { ...keep, mode: 'yaml', yaml, dropped, error: null, issues: [], summary: null, sql: null };
+      }
+      return { ...keep, mode: 'builder', form: JSON.stringify(builderFormOf(JSON.stringify(parsed))), yaml: undefined, error: null, issues: [], summary: null, sql: null };
+    }
+    if (kind === 'tag' && (intent === 'to-builder' || intent === 'to-builder-confirmed')) {
+      const parsed = tagYamlToForm(yaml);
+      const unreadable = parsed.readonly.find(r => r.key === '$yaml');
+      if (unreadable) throw new DslError(unreadable.reason);
+      const dropped: DroppedItem[] = parsed.readonly.map(r => ({ key: r.key, reason: r.reason }));
+      if (dropped.length > 0 && intent === 'to-builder') {
+        return { ...keep, mode: 'yaml', yaml, dropped, error: null, issues: [], summary: null, sql: null };
+      }
+      return { ...keep, mode: 'builder', tagForm: JSON.stringify(tagFormOf(JSON.stringify(parsed))), yaml: undefined, error: null, issues: [], summary: null, sql: null };
+    }
     if (intent === 'model-draft') {
       const generated = await modelDraftForDefinition(member, kind, requirement);
       return { error: null, issues: [], yaml: generated.yaml, summary: null, sql: null, ...keep, generated: true };
@@ -310,11 +380,18 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function NewDefinition({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, kind, label, kinds, mode, entities, tagMetrics } = loaderData;
+  const { email, nav, kind, label, kinds, entities, tagMetrics } = loaderData;
   const { placeholder, example, request, sends } = EXAMPLES[kind];
   const submitting = useNavigation().state === 'submitting';
-  // 指标与标签都在构建器与 YAML 间切换（切换不带内容过去：新建页不做 YAML → 构建器的转换）
+  // 指标与标签都在构建器与 YAML 间切换：切换提交本页表单（intent=to-*），服务端把内容带到目标模式，应答的 mode 覆盖 URL 里的 ?mode=
+  const mode = actionData?.mode ?? loaderData.mode;
   const builder = (kind === 'metric' || kind === 'tag') && mode !== 'yaml';
+  // 有没有还没保存的内容：挂载 / 每次回显后存一份快照作基线（构建器的增删行按钮不触发 change 事件，靠比较隐藏字段 form 的值记脏，不靠 onChange）
+  const formRef = useRef<HTMLFormElement>(null);
+  const baselineRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (formRef.current !== null) baselineRef.current = snapshotOf(new FormData(formRef.current));
+  }, [kind, mode, actionData]);
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -322,25 +399,41 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
         description={<><Link to="/analytics" className="hover:underline">← 分析</Link>　保存后成为第 1 版草稿，由另一位有发布权限的成员发布</>}
       />
 
-      <PillTabs
-        current={kind}
-        tabs={kinds.map(k => ({ ...k, href: `/analytics/definitions/new?kind=${k.key}` }))}
-      />
-      {(kind === 'metric' || kind === 'tag') && (
+      {/* 种类切换仍是链接（内容带不过去）：有还没保存的内容时先确认，取消就留在本页 */}
+      <div
+        onClickCapture={e => {
+          const tab = (e.target as HTMLElement).closest('a[data-tab]');
+          if (tab === null || tab.getAttribute('data-tab') === kind || formRef.current === null) return;
+          const unsaved = hasUnsavedChanges({ echoed: actionData !== undefined, baseline: baselineRef.current, current: snapshotOf(new FormData(formRef.current)) });
+          if (unsaved && !confirm('切换种类会丢掉还没保存的内容，确定离开？')) { e.preventDefault(); e.stopPropagation(); }
+        }}
+      >
         <PillTabs
-          current={builder ? 'builder' : 'yaml'}
-          tabs={[
-            { key: 'builder', label: '构建器', href: `/analytics/definitions/new?kind=${kind}&mode=builder` },
-            { key: 'yaml', label: 'YAML', href: `/analytics/definitions/new?kind=${kind}&mode=yaml` },
-          ]}
+          current={kind}
+          tabs={kinds.map(k => ({ ...k, href: `/analytics/definitions/new?kind=${k.key}` }))}
         />
-      )}
+      </div>
+      {(kind === 'metric' || kind === 'tag') && <ModeTabs mode={builder ? 'builder' : 'yaml'} submitting={submitting} />}
 
       {actionData?.error && <MappingErrors error={actionData.error} issues={actionData.issues} />}
+      {/* YAML → 构建器时有构建器表达不了的项：先列出（仍在 YAML 模式），点「仍然切换」才切过去 */}
+      {actionData?.dropped !== undefined && actionData.dropped.length > 0 && (
+        <div className="rounded-2xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900" data-switch-dropped>
+          <p className="font-medium">切到构建器会丢掉这些项（构建器没有它们的控件）：</p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-5">
+            {actionData.dropped.map((d, i) => <li key={`${d.key}-${i}`}>{`${d.key}：${d.reason}`}</li>)}
+          </ul>
+          <div className="mt-2">
+            <Button type="submit" form="definition-form" name="intent" value="to-builder-confirmed" variant="outline" formNoValidate disabled={submitting}>仍然切换</Button>
+          </div>
+        </div>
+      )}
 
       <div className="rounded-2xl border bg-white p-6 shadow-sm">
-        <Form method="post">
+        <Form method="post" id="definition-form" ref={formRef}>
           <input type="hidden" name="kind" value={kind} />
+          {/* 当前显示的编辑模式随表单提交：切换是 POST、不改 URL，应答的 mode 以它为默认、被切换分支覆盖 */}
+          {(kind === 'metric' || kind === 'tag') && <input type="hidden" name="mode" value={mode} />}
           <FieldGroup>
             <Field>
               <FieldLabel htmlFor="key">键</FieldLabel>
@@ -375,7 +468,7 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
                 {/* 构建器的 useState 只在挂载时初始化：key 用每次提交新生成的 echoId，回显字符串相同（只多了一条空条件行被丢掉）也重挂载，控件跟着回显走 */}
                 {kind === 'metric'
                   ? <MetricBuilder key={actionData?.echoId ?? 'blank'} entities={entities ?? []} defaultForm={formOfEcho(actionData?.form)} />
-                  : <TagBuilder key={actionData?.tagForm ?? 'empty'} metrics={tagMetrics ?? []} defaultForm={formOfTagEcho(actionData?.tagForm)} />}
+                  : <TagBuilder key={actionData?.echoId ?? 'empty'} metrics={tagMetrics ?? []} defaultForm={formOfTagEcho(actionData?.tagForm)} />}
               </>
             ) : (
               <>
@@ -394,7 +487,7 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
                 {actionData?.generated && <p className="text-sm text-muted-foreground" data-generated>已用模型生成草稿，请核对后填写键并保存。</p>}
                 <Field>
                   <FieldLabel>定义（YAML）</FieldLabel>
-                  <MappingEditor key={actionData?.yaml ?? `example-${kind}`} defaultValue={actionData?.yaml ?? example} />
+                  <MappingEditor key={actionData?.echoId ?? `example-${kind}`} defaultValue={actionData?.yaml ?? example} />
                 </Field>
               </>
             )}
@@ -427,5 +520,22 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
         </Form>
       </div>
     </AppShell>
+  );
+}
+
+/** 构建器 / YAML 的模式切换：提交本页表单（intent=to-builder / to-yaml），服务端把内容转换后回显到目标模式（应答的 mode 覆盖 URL）；当前模式那项不提交 */
+function ModeTabs({ mode, submitting }: { mode: 'builder' | 'yaml'; submitting: boolean }) {
+  const tabs = [{ key: 'builder', label: '构建器' }, { key: 'yaml', label: 'YAML' }] as const;
+  return (
+    <nav className="flex gap-1 self-start rounded-full bg-slate-200/60 p-1">
+      {tabs.map(t => t.key === mode ? (
+        <button key={t.key} type="button" data-tab={t.key} aria-current="page" className="cursor-default rounded-full bg-white px-4 py-1.5 text-sm font-medium text-slate-900 shadow-sm">{t.label}</button>
+      ) : (
+        <button
+          key={t.key} type="submit" form="definition-form" name="intent" value={`to-${t.key}`} formNoValidate disabled={submitting}
+          data-tab={t.key} className="cursor-pointer rounded-full px-4 py-1.5 text-sm text-slate-600 hover:text-slate-900"
+        >{t.label}</button>
+      ))}
+    </nav>
   );
 }

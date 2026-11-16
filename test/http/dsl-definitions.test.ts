@@ -11,6 +11,9 @@
 // 词表外的聚合也回显进构建器（下拉多一个当前值选项、标出「不支持」）；时间窗口天数 0 / 负数按 window.days 400（客户端不再静默丢掉窗口）；
 // 构建器模式还有一句话解析（intent=parse，#517）：解析结果填进构建器（隐藏字段 form 回显）并逐项说明、未知项与不支持的说法（固定原因说明）、
 // 构建器装不下的维度名显式提示；已有内容时先列差异（intent=applyParse 确认后才覆盖、parsed 不信客户端），失败（422 / 409）表单保持原内容
+// 构建器与 YAML 的切换带上内容（intent=to-yaml / to-builder(-confirmed)，#797，切换改成本页表单的 POST、应答的 mode 覆盖 URL）：
+// YAML → 构建器把表单回显进隐藏字段（有构建器表达不了的维度 / 只读项先列出、确认后才切，YAML 不合法 400 不切换），构建器 → YAML 给 formToYaml
+// 的结果（空构建器给示例），切换都不落库；种类切换仍是链接，有未保存内容时客户端先确认（app/lib/unsaved-changes.ts，纯函数另测）
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -239,6 +242,83 @@ describe('指标与标签定义页', () => {
     expect(await bad.text()).toMatch(/（default）：取值不能为空/);
     // 本租户 4 个指标定义 + 1 个标签 + globex 的 1 个指标
     expect(await getDb().select().from(dslVersions)).toHaveLength(6);
+  });
+
+  it('新建页的构建器与 YAML 切换带上内容：YAML → 构建器回显表单（有会丢的项先列出、确认后才切）、不合法不切换，构建器 → YAML 是 formToYaml 的结果；都不落库', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    // 表单提交到当前 URL（带 ?kind=），loader 的种类从 URL 读，与真实页面一致
+    // 切换的 POST 来自哪个模式的页面，就带哪个隐藏字段 mode（页面上的表单就有这个隐藏字段）
+    const post = (body: Record<string, string>) => analyst.post(`/analytics/definitions/new?kind=${body.kind}`, body);
+
+    // 指标：无维度的 YAML → to-builder：进构建器、隐藏字段 form 回显 base / agg，URL 里的 mode 还是 yaml 但应答的 mode 已覆盖
+    const plain = 'base: order\nmeasure: { agg: sum, field: amount }\n';
+    const toBuilder = await post({ kind: 'metric', intent: 'to-builder', yaml: plain, key: 'paid_amount', mode: 'yaml' });
+    expect(toBuilder.status).toBe(200);
+    const builderPage = await toBuilder.text();
+    expect(builderPage).toMatch(/data-tab="builder"[^>]*aria-current="page"/);
+    expect(builderPage).toMatch(/name="form" value="[^"]*&quot;base&quot;:&quot;order&quot;[^"]*&quot;agg&quot;:&quot;sum&quot;/);
+    // 模式切换不再是链接，是提交本页表单的按钮（当前模式那项不提交）
+    expect(builderPage).toMatch(/<button[^>]*type="submit"[^>]*form="definition-form"[^>]*>/);
+    expect(builderPage).toContain('value="to-yaml"');
+    expect(builderPage).not.toMatch(/href="\/analytics\/definitions\/new\?kind=metric&amp;mode=/);
+    expect(builderPage).not.toMatch(/<textarea[^>]*name="yaml"/);
+    expect(builderPage).toContain('value="paid_amount"');
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
+    // 带维度的 YAML → to-builder：不切换，仍在 YAML 模式列出会丢掉的维度（名字取自维度的 name），编辑框保持原内容
+    const dimYaml = 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n';
+    const warned = await post({ kind: 'metric', intent: 'to-builder', yaml: dimYaml, mode: 'yaml' });
+    expect(warned.status).toBe(200);
+    const warnedPage = await warned.text();
+    expect(warnedPage).toContain('data-switch-dropped');
+    expect(warnedPage).toContain('切到构建器会丢掉这些项');
+    expect(warnedPage).toContain('city');
+    expect(warnedPage).toContain('仍然切换');
+    expect(warnedPage).toMatch(/data-tab="yaml"[^>]*aria-current="page"/);
+    expect(editorYaml(warnedPage)).toBe(dimYaml);
+    // 确认后才进构建器（维度不再提示）
+    const confirmed = await post({ kind: 'metric', intent: 'to-builder-confirmed', yaml: dimYaml, mode: 'yaml' });
+    expect(confirmed.status).toBe(200);
+    const confirmedPage = await confirmed.text();
+    expect(confirmedPage).toMatch(/name="form" value="[^"]*&quot;base&quot;:&quot;order&quot;/);
+    expect(confirmedPage).not.toContain('data-switch-dropped');
+
+    // 不合法 YAML：不切换、400 报出原因、编辑框保持原内容
+    const bad = await post({ kind: 'metric', intent: 'to-builder', yaml: 'base: [', mode: 'yaml' });
+    expect(bad.status).toBe(400);
+    const badPage = await bad.text();
+    expect(badPage).toMatch(/YAML 语法错误/);
+    expect(editorYaml(badPage)).toBe('base: [');
+
+    // 构建器 → to-yaml：编辑框里是 formToYaml 的结果（不是示例）
+    const form: MetricForm = { base: 'order', agg: 'sum', field: 'amount', filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'paid_at', days: 30 }, dimensions: [], readonly: [] };
+    const toYaml = await post({ kind: 'metric', intent: 'to-yaml', form: JSON.stringify(form), key: 'paid_amount', mode: 'builder' });
+    expect(toYaml.status).toBe(200);
+    const yamlPage = await toYaml.text();
+    expect(yamlPage).toMatch(/data-tab="yaml"[^>]*aria-current="page"/);
+    const fields = entityOf('order')!.fields.map(f => ({ name: f.name, type: f.type }));
+    expect(editorYaml(yamlPage)).toBe(formToYaml(form, fields));
+    // 空构建器（没选基础实体）→ to-yaml：不报错，直接给示例 YAML
+    const empty = await post({ kind: 'metric', intent: 'to-yaml', form: JSON.stringify({ base: '', agg: 'count', filter: [], dimensions: [], readonly: [] }), mode: 'builder' });
+    expect(empty.status).toBe(200);
+    const emptyPage = await empty.text();
+    expect(editorYaml(emptyPage)).toContain('- { field: status, op: in, value: [paid, completed] }');
+    expect(emptyPage).not.toContain('读不出来');
+
+    // 标签同样：YAML → 构建器回显（隐藏字段 form 带上指标与规则），构建器 → YAML 是 tagFormToYaml 的结果
+    const tagYaml = 'metric: revenue_30d\nrules:\n  - value: high\n    when: { gte: 1000 }\ndefault: low\n';
+    const tagToBuilder = await post({ kind: 'tag', intent: 'to-builder', yaml: tagYaml, key: 'value_tier', mode: 'yaml' });
+    expect(tagToBuilder.status).toBe(200);
+    const tagBuilderPage = await tagToBuilder.text();
+    expect(tagBuilderPage).toContain('data-tag-builder');
+    expect(tagBuilderPage).toMatch(/name="form" value="[^"]*&quot;single&quot;:true[^"]*&quot;metric&quot;:&quot;revenue_30d&quot;/);
+    const tagForm: TagForm = { single: true, metric: 'revenue_30d', rules: [{ value: 'high', combinator: 'all', items: [{ metric: 'revenue_30d', cmp: [{ op: 'gte', value: 1000 }] }] }], missing: {}, default: 'low', readonly: [] };
+    const tagToYaml = await post({ kind: 'tag', intent: 'to-yaml', form: JSON.stringify(tagForm), key: 'value_tier', mode: 'builder' });
+    expect(tagToYaml.status).toBe(200);
+    expect(editorYaml(await tagToYaml.text())).toBe(tagFormToYaml(tagForm));
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
   });
 
   it('分析页「新建标签」进到标签种类的新建页；引用未发布的指标时按行列列出问题，种类不存在时 404', async () => {
