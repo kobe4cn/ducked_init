@@ -1,5 +1,6 @@
 // app/routes/llm-usage.tsx —— 「模型调用」页（仅管理员，#303）：按用途看近 7/30 天的调用次数、token、平均与 P95 耗时、
-// Schema 通过率、错误率与按当前单价折算的金额（ADR-0057，#745），并列出最近的调用明细（分页）；失败的调用标红、错误摘要截到 120 字（全文在 title）
+// Schema 通过率、错误率与按当前单价折算的金额（ADR-0057，#745），映射草稿一行另有「校验通过率」（#802，部分采用单独计数），
+// 并列出最近的调用明细（分页）；失败的调用标红、错误摘要截到 120 字（全文在 title）
 import type { Route } from './+types/llm-usage';
 import { Link } from 'react-router';
 import { requirePermission } from '~/.server/access';
@@ -43,6 +44,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 /** 统计表的一行（用途行与总计行共用） */
 function UsageRow({ row, isTotal = false }: { row: PurposeUsage; isTotal?: boolean }) {
   const checked = row.schemaChecked;
+  const dc = row.draftCheck; // 只有映射草稿一行有（#802），其他用途与总计显示「—」
   return (
     <TableRow data-purpose={row.purpose} className={isTotal ? 'font-medium' : undefined}>
       <TableCell>{isTotal ? '总计' : row.purpose}</TableCell>
@@ -51,6 +53,7 @@ function UsageRow({ row, isTotal = false }: { row: PurposeUsage; isTotal?: boole
       <TableCell data-col="avg">{`${n(row.avgMs)} ms`}</TableCell>
       <TableCell data-col="p95">{`${n(row.p95Ms)} ms`}</TableCell>
       <TableCell data-col="schema">{checked ? `${row.schemaValid}/${checked}（${pct(row.schemaValid, checked)}）` : '—'}</TableCell>
+      <TableCell data-col="draft-check">{dc && dc.checked ? `${dc.passed}/${dc.checked}（${pct(dc.passed, dc.checked)}），部分采用 ${dc.partial}` : '—'}</TableCell>
       <TableCell data-col="errors" className={row.errors ? 'text-red-600' : 'text-slate-500'}>{`${n(row.errors)}（${pct(row.errors, row.calls)}）`}</TableCell>
       <TableCell data-col="cost">{row.cost}</TableCell>
     </TableRow>
@@ -81,7 +84,7 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
   const href = (p: number) => `/llm-usage?days=${days}&page=${p}`;
   return (
     <AppShell email={email} nav={nav}>
-      <PageHeader title="模型调用" description={`近 ${days} 天本租户的模型调用：次数、token、耗时与质量（Schema 通过率、错误率），不含草稿采纳率。`} />
+      <PageHeader title="模型调用" description={`近 ${days} 天本租户的模型调用：次数、token、耗时与质量（Schema 通过率、错误率）。「校验通过率」只统计映射草稿：通过 / 做了映射校验的生成，部分采用另计。`} />
 
       <PillTabs
         tabs={[
@@ -109,7 +112,7 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
           </div>
 
           <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
-            <SectionHeader title="按用途统计">Schema 通过率的分母只算做了校验的调用（工具对话与向量检索没有 Schema）；P95 按每次调用的原始耗时算，不是各用途的平均。</SectionHeader>
+            <SectionHeader title="按用途统计">Schema 通过率的分母只算做了校验的调用（工具对话与向量检索没有 Schema）；P95 按每次调用的原始耗时算，不是各用途的平均。校验通过率只在映射草稿一行有值：分母是做了映射校验的映射草稿生成（采用的含部分采用，加上校验不过整份放弃的），部分采用单独计数。</SectionHeader>
             <Table>
               <TableHeader>
                 <TableRow>
@@ -119,6 +122,7 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
                   <TableHead>平均耗时</TableHead>
                   <TableHead>P95 耗时</TableHead>
                   <TableHead>Schema 通过率</TableHead>
+                  <TableHead>校验通过率</TableHead>
                   <TableHead>错误</TableHead>
                   <TableHead>金额</TableHead>
                 </TableRow>

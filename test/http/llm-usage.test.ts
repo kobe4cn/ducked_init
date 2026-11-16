@@ -1,11 +1,13 @@
 // test/http/llm-usage.test.ts —— 「模型调用」页的 HTTP 接缝：租户管理员按用途看近 7/30 天的调用统计（次数、token、平均/P95 耗时、Schema 通过率、错误数，与手算一致，只看本租户），
 // 统计与明细按当前单价折算金额（ADR-0057）：未配单价、部分未配、多币种各有展示规则；明细分页按时间倒序、失败调用显示截断到 120 字的错误摘要（全文在 title）；
+// 映射草稿一行另有「校验通过率」（#802）：从 mapping_generations（origin=model，items 带 dropped 键的是部分采用）加
+// mapping.model_draft_failed 审计（stage=mapping、无 kind）算，部分采用单独计数，其他用途与总计是「—」；
 // 数据工程师 / 分析师 / 查看者看不到入口、打开 403
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { llmCalls, modelPrices } from '../../app/.server/db/schema';
-import { memberOf, newTenant } from '../pipeline/fixtures';
+import { auditLogs, llmCalls, mappingGenerations, modelPrices, sources } from '../../app/.server/db/schema';
+import { defaultSpaceOf, memberOf, newTenant } from '../pipeline/fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
@@ -97,6 +99,61 @@ describe('模型调用统计', () => {
     const list = await (await admin.get('/llm-usage')).text();
     expect(list).toContain('HTTP 500 upstream broke');
     expect(list).not.toContain('99999');
+  });
+
+  it('映射草稿一行有「校验通过率」（部分采用单独计数），其他用途与总计是「—」，别的租户与窗口外不计入', async () => {
+    const acme = await newTenant('acme');
+    const globex = await newTenant('globex');
+    await call(acme, { purpose: 'mapping_draft', model: 'm-reason', promptTokens: 100, completionTokens: 50, durationMs: 400, schemaValid: true });
+    await call(acme, { promptTokens: 10, completionTokens: 5, durationMs: 100, schemaValid: true }); // 别的用途：这一列没有值
+    await call(globex, { purpose: 'mapping_draft', model: 'm-reason', promptTokens: 1, completionTokens: 1, durationMs: 100 });
+
+    // mapping_generations.source_id 有外键：直接插一行 sources（不走 registerSource），两个租户各一行
+    const src = async (tenantId: string) => (await getDb().insert(sources).values({
+      tenantId, spaceId: await defaultSpaceOf(tenantId), name: 'crm', kind: 'postgres' as const, config: {}, credentials: '',
+    }).returning({ id: sources.id }))[0]!.id;
+    /** 生成记录的 items；带 dropped 键的元素表示部分采用时被去掉的项（#801 写入，schema 的 TS 类型没写这个键） */
+    const items = (dropped?: string) =>
+      ([{ path: 'fields.name', confidence: 0.9, reason: '与实体主键同名', ...(dropped ? { dropped } : {}) }] as unknown as (typeof mappingGenerations.$inferInsert)['items']);
+    const gen = (tenantId: string, sourceId: string, over: Partial<typeof mappingGenerations.$inferInsert> = {}) =>
+      getDb().insert(mappingGenerations).values({
+        tenantId, sourceId, tableName: 'customers', entity: 'customer', origin: 'model',
+        yaml: 'table: customers\nentity: customer\n', items: items(), createdByEmail: 'de@acme.com', createdAt: ago(1), ...over,
+      });
+    const audit = (tenantId: string, action: string, detail: Record<string, unknown>) =>
+      getDb().insert(auditLogs).values({ tenantId, action, targetType: 'source', detail, createdAt: ago(1) });
+
+    // acme：采用 2（其中部分采用 1）+ 映射校验不过整份放弃 1 → 通过 1 / 分母 3
+    const acmeSrc = await src(acme);
+    await gen(acme, acmeSrc); // 全部通过
+    await gen(acme, acmeSrc, { items: items('refunded 不是标准取值') }); // 部分采用：算通过数时扣掉，单独计数
+    await gen(acme, acmeSrc, { origin: 'rules', items: [] }); // 规则草稿：不计入
+    await gen(acme, acmeSrc, { createdAt: ago(10) }); // 只落在 30 天窗口
+    await audit(acme, 'mapping.model_draft_failed', { stage: 'mapping', issues: 2, paths: ['fields.status'] }); // 计入分母
+    await audit(acme, 'mapping.model_draft_failed', { stage: 'model', error: 'upstream broke' }); // 模型阶段失败：不计入
+    await audit(acme, 'mapping.model_draft_failed', { stage: 'mapping', kind: 'assertions' }); // 断言建议失败：不计入
+    await audit(acme, 'mapping.model_draft_partial', { stage: 'mapping', dropped: ['fields.status'], issues: 1 }); // 部分采用审计不参与计数
+
+    // globex 插同样的数据：两边互不可见（getDb() 不受 RLS 限制，必须按 tenant_id 过滤）
+    const globexSrc = await src(globex);
+    await gen(globex, globexSrc);
+    await gen(globex, globexSrc, { items: items('列不存在'), createdByEmail: 'de@globex.com' });
+    await audit(globex, 'mapping.model_draft_failed', { stage: 'mapping', issues: 9 });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const html = await (await admin.get('/llm-usage?days=7')).text();
+    expect(usageCell(usageRow(html, 'mapping_draft'), 'draft-check')).toBe('1/3（33.3%），部分采用 1');
+    expect(usageCell(usageRow(html, 'connectivity'), 'draft-check')).toBe('—');
+    expect(usageCell(usageRow(html, 'total'), 'draft-check')).toBe('—');
+    // 页头不再写「不含草稿采纳率」，表头有这一列
+    expect(html).not.toContain('不含草稿采纳率');
+    expect(html).toContain('校验通过率');
+
+    // 30 天窗口：10 天前那次采用计入，成为 2/4；globex 只看到自己的 1/3
+    const month = await (await admin.get('/llm-usage?days=30')).text();
+    expect(usageCell(usageRow(month, 'mapping_draft'), 'draft-check')).toBe('2/4（50%），部分采用 1');
+    const other = await loginAs(app, 'admin@globex.com');
+    expect(usageCell(usageRow(await (await other.get('/llm-usage?days=7')).text(), 'mapping_draft'), 'draft-check')).toBe('1/3（33.3%），部分采用 1');
   });
 
   it('统计与总计的金额列按当前单价折算成各币种金额，未配单价、部分未配与别的租户按规则呈现', async () => {

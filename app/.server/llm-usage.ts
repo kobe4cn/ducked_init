@@ -1,11 +1,12 @@
 // app/.server/llm-usage.ts —— 模型调用统计（#303，Spec #1 故事 94）：给「模型调用」页按用途汇总 platform.llm_calls（近 N 天）并取最近调用明细；
 // 运营后台「模型调用汇总」（#746）跨租户按（租户、模型、用途）分组，只取聚合数（ADR-0007）。
 // 质量看 Schema 通过率、错误率与耗时；成本按 (purpose, model) 分组、用查看时的当前单价折算成各币种金额（ADR-0057，#745）。
+// 映射草稿另有「校验通过率」（#802）：不在 llm_calls 记，从 mapping_generations 加审计算（ADR-0035，见 draftCheckStats）。
 // 总计是单独一条不分组的聚合（不能拿各用途的 P95 再平均）；pg 把 bigint / numeric / double 当字符串返回，统一 Number() + Math.round 成整数
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { cmp, cmpName } from '../lib/compare';
 import { getDb } from './db/client';
-import { llmCalls, tenants } from './db/schema';
+import { auditLogs, llmCalls, mappingGenerations, tenants } from './db/schema';
 import { formatCost, priceMap, summarizeCost } from './model-prices';
 
 export const LLM_CALL_PAGE_SIZE = 50;
@@ -28,6 +29,8 @@ export interface PurposeUsage {
   errors: number;
   /** 按当前单价折算的金额（ADR-0057）：各币种「CNY 0.1234 + USD 0.0100」，未配单价时有对应提示 */
   cost: string;
+  /** 映射草稿的「校验通过率」（#802）：checked 分母（做了映射校验的生成）、passed 通过、partial 部分采用；只有 mapping_draft 行有 */
+  draftCheck?: { checked: number; passed: number; partial: number };
 }
 
 /** 时间窗口的起点在库里算（now() - make_interval），避免应用与库的时区差 */
@@ -57,6 +60,40 @@ const toUsage = (r: Record<string, unknown>, purpose: string): Omit<PurposeUsage
   errors: Number(r.errors ?? 0),
 });
 
+/**
+ * 映射草稿的「校验通过率」（#802，口径见 #791 评论）：不改 llm_calls、不加迁移，从已有两处记录算——
+ * 采用 = mapping_generations 里 origin = 'model' 的行（mappings.ts 只在映射校验通过后才写这个 origin），
+ * 其中 items 有元素带 dropped 键的是部分采用（#801 写入，值是校验消息；TS 类型没写这个键，判断放 SQL）；
+ * 失败 = audit_logs 里 mapping.model_draft_failed、detail.stage = 'mapping' 且无 kind 的行（两条整份拒绝路径都这样记）。
+ * 模型阶段失败（stage = 'model'）与断言建议失败（带 kind = 'assertions'）不算；mapping.model_draft_partial 审计不参与计数，
+ * 部分采用只从生成记录数，不重复计。通过数 = 采用 − 部分采用，分母 = 采用 + 失败。
+ * 口径与调用行不是一一对应：生成记录、审计与调用可能跨窗口边界，tableContextFor 出错或抛出非 MappingError 的异常时
+ * 不写审计、不计入分母——这两点可接受。getDb() 不受 RLS 限制，必须按 tenant_id 过滤。
+ */
+async function draftCheckStats(tenantId: string, days: 7 | 30) {
+  const [[gen], [fail]] = await Promise.all([
+    getDb().select({
+      adopted: sql<number>`count(*)`,
+      partial: sql<number>`count(*) filter (where jsonb_path_exists(${mappingGenerations.items}, '$[*].dropped'))`,
+    }).from(mappingGenerations).where(and(
+      eq(mappingGenerations.tenantId, tenantId),
+      eq(mappingGenerations.origin, 'model'),
+      sql`${mappingGenerations.createdAt} >= now() - make_interval(days => ${days})`,
+    )),
+    getDb().select({ failed: sql<number>`count(*)` }).from(auditLogs).where(and(
+      eq(auditLogs.tenantId, tenantId),
+      eq(auditLogs.action, 'mapping.model_draft_failed'),
+      sql`${auditLogs.detail} ->> 'stage' = 'mapping'`,
+      sql`${auditLogs.detail} ->> 'kind' is null`,
+      sql`${auditLogs.createdAt} >= now() - make_interval(days => ${days})`,
+    )),
+  ]);
+  // pg 的 count 是字符串，先 Number()（照 toUsage）
+  const adopted = Number(gen?.adopted ?? 0);
+  const partial = Number(gen?.partial ?? 0);
+  return { checked: adopted + Number(fail?.failed ?? 0), passed: adopted - partial, partial };
+}
+
 /** 按用途分组统计，另给一条不分组的总计；行按调用次数降序、同次数按用途名。金额按 (purpose, model) 分组用当前单价折算（ADR-0057），总计用全部分组重算 */
 export async function usageByPurpose(tenantId: string, days: 7 | 30) {
   const db = getDb();
@@ -67,12 +104,13 @@ export async function usageByPurpose(tenantId: string, days: 7 | 30) {
     promptTokens: sql<number>`coalesce(sum(${llmCalls.promptTokens}), 0)`,
     completionTokens: sql<number>`coalesce(sum(${llmCalls.completionTokens}), 0)`,
   });
-  const [grouped, [total], byPurposeModel, prices] = await Promise.all([
+  const [grouped, [total], byPurposeModel, prices, draftCheck] = await Promise.all([
     db.select({ purpose: llmCalls.purpose, ...agg() }).from(llmCalls)
       .where(inWindow(tenantId, days)).groupBy(llmCalls.purpose),
     db.select(agg()).from(llmCalls).where(inWindow(tenantId, days)),
     db.select(byModel()).from(llmCalls).where(inWindow(tenantId, days)).groupBy(llmCalls.purpose, llmCalls.model),
     priceMap(),
+    draftCheckStats(tenantId, days),
   ]);
   // pg 的 count / sum 是字符串，先 Number()（照 toUsage）；金额在各币种内先累加，最后由 formatCost 统一保留 4 位小数
   const costOfGroups = (groups: { model: string; calls: unknown; promptTokens: unknown; completionTokens: unknown }[]) =>
@@ -86,6 +124,8 @@ export async function usageByPurpose(tenantId: string, days: 7 | 30) {
     rows: grouped.map(r => ({
       ...toUsage(r, r.purpose),
       cost: costOfGroups(byPurposeModel.filter(g => g.purpose === r.purpose)),
+      // 「校验通过率」只挂在映射草稿一行（窗口内整份失败一定有调用行，不用补行）；总计与其他用途不汇总这一列
+      ...(r.purpose === 'mapping_draft' ? { draftCheck } : {}),
     })).sort((a, b) => b.calls - a.calls || cmp(a.purpose, b.purpose)),
     total: { ...toUsage(total ?? {}, 'total'), cost: costOfGroups(byPurposeModel) },
   };
