@@ -3,15 +3,18 @@
 // 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm；按生效版本重新计算（分析师 403、未来日期与重复入队被拒）；
 // 用户 360 走注册表里的通用参数表单（只读、起草、校验报错、多余字段不传、发布后入队 gold.user360、未登记模板 404）与通用快照明细（全部列、是 / 否、分页、没有明文）
 // 同期群与复购同样走通用表单（周期下拉框、起草、双人发布入队 gold.cohort / gold.repurchase 并登记快照，周期偏移列表用顿号连接）；
-// 模板升级（测试开关 TEMPLATE_TEST_VERSIONS=1）：提示条、预览差异（RFM 分群迁移表、流失预警变化人数，没有 consumer_id）、分析师起草升级但发布 403
+// 模板升级（测试开关 TEMPLATE_TEST_VERSIONS=1）：提示条、预览差异（RFM 分群迁移表、流失预警变化人数，没有 consumer_id）、分析师起草升级但发布 403；
+// 指标与标签（DSL）快照详情（#816）：定义页「快照」区未过期的行点统计日进快照详情页，DSL 快照走通用明细（页头写类型、键、版本、统计日与来源，按行分页），
+// 标签快照带各取值人数汇总，过期 / 其他租户 / 表名与类型对不上 404，未登录跳转登录页
+import { randomUUID } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { dslDefinitions, dslVersions, snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
-import { createDefinition } from '../../app/.server/dsl-definitions';
+import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { listSnapshots, readTemplateSnapshot } from '../../app/.server/snapshots';
-import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
+import { drain, memberOf, newTenant, onLake, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -573,5 +576,102 @@ describe('模板升级', () => {
     const [task] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'gold.rfm'), eq(tasks.status, 'queued')));
     expect(task!.params).toMatchObject({ definitionVersion: 2, templateVersion: 2 });
     expect(await (await de.get('/analytics/templates/rfm')).text()).not.toContain('有新的模板版本');
+  });
+});
+
+/** 不带维度的指标（标签只能引用没有维度的指标） */
+const REVENUE_TOTAL = 'base: order\nmeasure: { agg: sum, field: amount }\n';
+
+/**
+ * 只读用例共用的夹具：清库、打通订单后双人发布一个不带维度与一个带城市维度的指标、一个引用前者的标签（各 drain 一次跑完计算），
+ * 登录 acme 的查看者与另一租户 globex 的查看者；返回带维度那张指标快照与标签快照。
+ * 用它的用例除了插元数据行的那个都不能改共享的快照、不能依赖执行顺序
+ */
+async function publishedMetricAndTagSnapshots() {
+  await fresh();
+  const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+  await createDefinition(author, 'metric', 'revenue', REVENUE_TOTAL);
+  // REVENUE 自带城市维度：快照表每个消费者可能多行（consumer_id、city、value）
+  await createDefinition(author, 'metric', 'revenue_by_city', REVENUE);
+  await publishDefinition(reviewer, 'metric', 'revenue', 1);
+  await publishDefinition(reviewer, 'metric', 'revenue_by_city', 1);
+  await drain();
+  await createDefinition(author, 'tag', 'value_tier', 'metric: revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n');
+  await publishDefinition(reviewer, 'tag', 'value_tier', 1);
+  await drain();
+  const of = async (template: string) => (await listSnapshots(acme)).find(s => s.template === template)!;
+  await memberOf(acme, 'viewer@acme.com', 'viewer');
+  await memberOf(await newTenant('globex'), 'viewer@globex.com', 'viewer');
+  return { acme, metric: await of('metric:revenue_by_city'), tag: await of('tag:value_tier'), browser: await loginAs(app, 'viewer@acme.com'), globexBrowser: await loginAs(app, 'viewer@globex.com') };
+}
+
+describe('指标与标签快照详情', () => {
+  // 只读用例共用一次夹具：发布一个带维度的指标与一个标签并跑完，不逐用例重造（#816）
+  let shared: Awaited<ReturnType<typeof publishedMetricAndTagSnapshots>>;
+  beforeAll(async () => { shared = await publishedMetricAndTagSnapshots(); });
+
+  it('查看者从定义页「快照」区的统计日打开指标快照：页头有类型、键、版本、统计日与来源，明细按行分页列出全部列，页面没有明文也没有取值汇总', async () => {
+    const { metric, browser } = shared;
+    const asOf = String(metric.params.asOf);
+
+    // 定义页「快照」区：未过期的行统计日链接到快照详情页
+    const definitions = await (await browser.get('/analytics/definitions/metric/revenue_by_city')).text();
+    expect(definitions).toMatch(new RegExp(`data-definition-snapshot="${metric.id}"(?:(?!</tr>).)*href="/analytics/snapshots/${metric.id}"`, 's'));
+
+    const res = await browser.get(`/analytics/snapshots/${metric.id}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('指标 · revenue_by_city');
+    expect(html).toContain('第 1 版');
+    expect(html).toContain(`统计日 ${asOf}`);
+    expect(html).toContain('来源 发布');
+    // 带维度的指标每个消费者有多行：统计卡片按行数说
+    expect(html).toContain('行数');
+    for (const column of ['consumer_id', 'city', 'value']) expect(html).toMatch(new RegExp(`<th[^>]*>${column}</th>`));
+    expect(html.match(/data-consumer="/g)!.length).toBeGreaterThan(0);
+    expect(html).not.toContain('data-tag-summary');
+    for (const p of PLAINTEXT) expect(html).not.toContain(p);
+  });
+
+  it('标签快照在明细上方带各取值人数的汇总，人数与直接在湖上 GROUP BY tag_value 的一致；明细只有 consumer_id、tag_key、tag_value', async () => {
+    const { acme, tag, browser } = shared;
+    const res = await browser.get(`/analytics/snapshots/${tag.id}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('标签 · value_tier');
+    for (const column of ['consumer_id', 'tag_key', 'tag_value']) expect(html).toMatch(new RegExp(`<th[^>]*>${column}</th>`));
+
+    const expected = await onLake<{ value: string | null; consumers: number }>(acme,
+      `SELECT tag_value::VARCHAR AS value, count(*) AS consumers FROM gold."tag__${tag.taskId}" GROUP BY 1 ORDER BY 2 DESC, 1`);
+    expect(expected.length).toBeGreaterThan(0);
+    expect(html.match(/data-tag-value="/g)).toHaveLength(expected.length);
+    for (const { value, consumers } of expected) {
+      expect(html).toMatch(new RegExp(`data-tag-value="${value ?? ''}"(?:(?!</tr>).)*>${consumers.toLocaleString('zh-CN')}<`, 's'));
+    }
+  });
+
+  it('已过期的快照在定义页「快照」区没有链接、直接打开 404；其他租户的、表名与类型对不上的快照 404；未登录的请求跳转登录页', async () => {
+    const { acme, metric, browser, globexBrowser } = shared;
+    // 插一行已过期的 metric:revenue_by_city（不会影响前面用例的断言）与一行表名对不上的（metric 快照记了 tag 的表）
+    const taskRows = await getDb().insert(tasks).values([
+      { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
+      { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
+    ]).returning();
+    const [expired, mismatched] = await getDb().insert(snapshots).values([
+      { tenantId: acme, template: 'metric:revenue_by_city', taskId: taskRows[0]!.id, table: `gold.metric__${taskRows[0]!.id}`, params: { asOf: '2024-06-01' }, rowCount: 3, createdAt: new Date(Date.now() - 86_400_000), expiresAt: new Date(Date.now() - 3_600_000), expiredAt: new Date() },
+      { tenantId: acme, template: 'metric:x', taskId: taskRows[1]!.id, table: `gold.tag__${randomUUID()}`, params: { asOf: '2024-06-01' }, rowCount: 3, expiresAt: new Date(Date.now() + 86_400_000) },
+    ]).returning();
+
+    const definitions = await (await browser.get('/analytics/definitions/metric/revenue_by_city')).text();
+    expect(definitions).toMatch(new RegExp(`data-definition-snapshot="${expired!.id}"(?:(?!</tr>).)*>2024-06-01<`, 's'));
+    expect(definitions).not.toContain(`href="/analytics/snapshots/${expired!.id}"`);
+    expect((await browser.get(`/analytics/snapshots/${expired!.id}`)).status).toBe(404);
+
+    expect((await globexBrowser.get(`/analytics/snapshots/${metric.id}`)).status).toBe(404);
+    expect((await browser.get(`/analytics/snapshots/${mismatched!.id}`)).status).toBe(404);
+
+    const anon = await app.client().get(`/analytics/snapshots/${metric.id}`);
+    expect(anon.status).toBe(302);
+    expect(anon.headers.get('Location')).toBe('/login');
   });
 });
