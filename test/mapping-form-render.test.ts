@@ -95,6 +95,25 @@ describe('映射表单里的实时校验问题', () => {
     expect(identity).toContain('identity: { match: [phone] }');
     expect(html).not.toContain('data-form-issues');
   });
+
+  it('customer 映射有属性取舍名次的输入（照 YAML 填好），它的问题显示在旁边；order 映射没有这个控件，问题在顶部', () => {
+    const html = renderToStaticMarkup(createElement(MappingForm, {
+      yaml: 'model: 1\nentity: customer\ntable: members\nfields:\n  customer_id: id\nsurvivorship:\n  priority: 2\n', entity: 'customer', table: null, functions: [],
+      issues: [{ ...issue('survivorship.priority', 'priority 应不小于 1'), hint: 'survivorship: { priority: 1 }' }], onChange: () => {}, onEditYaml: () => {},
+    }));
+    const block = html.slice(html.indexOf('data-form-survivorship'));
+    expect(block).toContain('aria-label="属性取舍名次"');
+    expect(block).toMatch(/value="2"/);
+    expect(block).toContain('<p data-live-issue="true" data-issue-path="survivorship.priority">priority 应不小于 1</p>');
+    expect(block).toContain('survivorship: { priority: 1 }');
+    expect(html).not.toContain('data-form-issues');
+
+    const order = render(table, [issue('survivorship', '只有消费者（customer）映射能配置属性取舍的优先级')]);
+    expect(order).not.toContain('data-form-survivorship');
+    expect(order).not.toContain('aria-label="属性取舍名次"');
+    const top = order.slice(order.indexOf('data-form-issues'), order.indexOf('data-form-mapping-key-space'));
+    expect(top).toContain('只有消费者（customer）映射能配置属性取舍的优先级');
+  });
 });
 
 describe('编辑区下方的实时校验结果', () => {

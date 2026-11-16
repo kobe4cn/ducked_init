@@ -5,6 +5,8 @@
 // 内置敏感字段带「敏感」徽标，不能取消。标准字段之后是扩展字段：已有的可改名、类型、中文名与是否敏感（敏感的只能是文本），取消勾选即删除；
 // 下面列出还没用到的源列，勾选即加为扩展字段（名称或格式像敏感信息的默认标成敏感）。
 // 消费者（customer）映射最后是「身份打通」：从已映射的敏感字段里勾选匹配字段并排序（越靠前优先级越高），不选时用平台默认规则。
+// 身份打通之下是「属性取舍名次」（survivorship.priority，ADR-0027）：填正整数写回、留空不写（按 updated_at 取最新），只作用于统一消费者属性、不作用于同意；
+// 非正整数只在控件旁提示、不写进 YAML；YAML 里手写的非法值由实时校验报在 survivorship.priority，显示在控件旁。
 // 键空间（ADR-0024）：最上面是映射的键空间；指向别的实体的字段每行有键空间，没写时按同一数据源里目标实体已发布映射的键空间预填，
 // 预填值只在写这个字段时一并写进 YAML，打开表单不改 YAML；清空预填值不写进 YAML，重新打开表单时又会预填（发布时本来也要求写同源目标的键空间）。
 // 跨源引用（ADR-0030）：指向 customer 的字段在键空间旁选「所属数据源」，可选本租户有已发布 customer 映射的其他数据源，默认本数据源（不写 customer_source）
@@ -16,7 +18,7 @@ import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, KEY_SPACE_PATTERN, type Canoni
 import { parseExpression } from '~/lib/mapping-expr';
 import {
   dictionaryRows, expressionOf, extensionNameProblem, formUnavailable, groupIssues, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity,
-  readKeySpace, seedDictionary, TRANSFORMS, unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace, writtenDictionary,
+  readKeySpace, readSurvivorship, seedDictionary, TRANSFORMS, unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace, writeSurvivorship, writtenDictionary,
   type DictionaryEntry, type ExtensionChoice, type ExtensionForm, type FieldChoice, type FieldForm, type Part, type TransformId,
 } from '~/lib/mapping-form';
 import type { MappingIssueView } from '~/components/mapping-editor';
@@ -98,7 +100,12 @@ export function MappingForm({ yaml, entity, table, functions, focus, issues = []
     writeKeySpace(next, keySpace);
     onChange(next.toString());
   };
-  // 表单上没有那个区块（不是本实体的字段、扩展字段只读、不是 customer 的身份打通）的问题也放进顶部
+  const writeRank = (priority: number | null) => {
+    const next = parseDocument(yaml);
+    writeSurvivorship(next, priority);
+    onChange(next.toString());
+  };
+  // 表单上没有那个区块（不是本实体的字段、扩展字段只读、不是 customer 的身份打通与属性取舍名次）的问题也放进顶部
   const groups = groupIssues(issues);
   const extensionsRead = readExtensions(doc);
   const extensionNames = extensionsRead.reason ? [] : extensionsRead.extensions.map(e => e.name);
@@ -107,6 +114,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, issues = []
     ...Object.entries(groups.fields).flatMap(([name, list]) => (target.fields.some(f => f.name === name) ? [] : list)),
     ...Object.entries(groups.extensions).flatMap(([name, list]) => (extensionNames.includes(name) ? [] : list)),
     ...(target.name === 'customer' ? [] : groups.identity),
+    ...(target.name === 'customer' ? [] : groups.survivorship),
   ];
   return (
     <div className="max-h-[48rem] divide-y overflow-y-auto rounded-lg border text-sm">
@@ -135,6 +143,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, issues = []
       ))}
       <Extensions doc={doc} table={table} origins={table?.relationOrigins[target.name] ?? {}} issues={groups.extensions} onWrite={writeExt} onEditYaml={onEditYaml} />
       {target.name === 'customer' && <Identity doc={doc} entity={target} issues={groups.identity} onWrite={writeMatch} onEditYaml={onEditYaml} />}
+      {target.name === 'customer' && <Survivorship doc={doc} issues={groups.survivorship} onWrite={writeRank} onEditYaml={onEditYaml} />}
     </div>
   );
 }
@@ -158,6 +167,10 @@ const syncKey = (choice: FieldChoice | null, type: FieldType, keySpace?: string 
 const KEY_SPACE = new RegExp(KEY_SPACE_PATTERN);
 const keySpaceProblem = (keySpace?: string | null) =>
   keySpace?.trim() && !KEY_SPACE.test(keySpace.trim()) ? '键空间只用小写字母、数字与下划线' : null;
+
+/** 属性取舍名次的问题：填了但不是正整数（1、2、3…）时只留在本地，不写进 YAML */
+const rankProblem = (rank: string) =>
+  rank.trim() && !/^[1-9]\d*$/.test(rank.trim()) ? '名次是正整数，如 1、2、3' : null;
 
 /** 选择还缺什么（给出时不写进 YAML）；写得出表达式时为 null */
 function missing(choice: FieldChoice, type: FieldType): string | null {
@@ -630,6 +643,57 @@ function Identity({ doc, entity, issues, onWrite, onEditYaml }: {
           {!candidates.length && !match.length && <div className="text-xs text-muted-foreground">还没有映射敏感字段，映射手机号、邮箱等之后才能选</div>}
         </>
       )}
+      <BlockIssues issues={issues} />
+    </div>
+  );
+}
+
+/** 属性取舍名次（ADR-0027，只用于 customer）：正整数，数字越小越优先；清空时删掉 survivorship */
+function Survivorship({ doc, issues, onWrite, onEditYaml }: {
+  doc: ReturnType<typeof parseDocument>;
+  issues: MappingIssueView[];
+  onWrite: (priority: number | null) => void;
+  onEditYaml: () => void;
+}) {
+  const { priority, reason } = readSurvivorship(doc);
+  const written = priority == null ? '' : String(priority);
+  const [value, setValue] = useState(written);
+  // YAML 在别处改了时按 YAML 重新读出
+  const [synced, setSynced] = useState(written);
+  if (written !== synced) {
+    setSynced(written);
+    setValue(written);
+  }
+  const problem = rankProblem(value);
+  const change = (next: string) => {
+    setValue(next);
+    const trimmed = next.trim();
+    if (!trimmed) {
+      setSynced('');
+      onWrite(null);
+      return;
+    }
+    if (rankProblem(next)) return;
+    setSynced(trimmed);
+    onWrite(Number(trimmed));
+  };
+  return (
+    <div data-form-survivorship className="space-y-2 p-3">
+      <div className="flex flex-wrap items-baseline gap-x-2">
+        <span className="font-medium">属性取舍名次</span>
+        <span className="text-xs text-muted-foreground">
+          统一消费者的属性来自几个 customer 映射时，数字越小越优先；只作用于属性，不作用于同意；不写时按 updated_at 取最新
+        </span>
+      </div>
+      {reason ? (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span>{reason}</span>
+          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>到 YAML 修改</Button>
+        </div>
+      ) : (
+        <Input className="h-7 w-40" aria-label="属性取舍名次" placeholder="不写" value={value} onChange={e => change(e.target.value)} inputMode="numeric" />
+      )}
+      {problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
       <BlockIssues issues={issues} />
     </div>
   );
