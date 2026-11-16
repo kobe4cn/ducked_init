@@ -2,15 +2,19 @@
 // 样例文档有源表与源视图两种（源视图没有列统计，按规则生成草稿用不上，只给所选实体的样例字段）；
 // 换普通表要走 action 取规则草稿，这里只给指令；换源视图直接给空白模板。mappingTemplate 迁自 mapping-spec，withTarget 迁自路由
 import { isMap, isScalar, parseDocument } from 'yaml';
-import { CANONICAL_ENTITIES, entityOf, MODEL_MAJOR } from './canonical-model';
+import { CANONICAL_ENTITIES, type CanonicalEntity, entityOf, MODEL_MAJOR } from './canonical-model';
 
 /** 表下拉框的取值里源视图的前缀：与同名的源表区分，reselect 以它区分两种输入 */
 export const VIEW_PREFIX = 'view:';
 
+/** 样例文档的字段行：实体的前四个字段，各自映射到同名源列，枚举字段附标准枚举 */
+const sampleFields = (entity: CanonicalEntity) =>
+  entity.fields.slice(0, 4).map(f => `  ${f.name}: ${f.name}${f.enum ? `  # 标准枚举：${f.enum.join('、')}` : ''}`).join('\n');
+
 /** 新建映射时的样例文档 */
 export function mappingTemplate(entityName: string, table: string) {
   const entity = entityOf(entityName) ?? CANONICAL_ENTITIES[0];
-  const fields = entity.fields.slice(0, 4).map(f => `  ${f.name}: ${f.name}${f.enum ? `  # 标准枚举：${f.enum.join('、')}` : ''}`).join('\n');
+  const fields = sampleFields(entity);
   return `# 映射：源表 ${table} → ${entity.label}（${entity.name}）
 model: ${MODEL_MAJOR}
 entity: ${entity.name}
@@ -40,7 +44,7 @@ dedupe:
   key: []
 `;
   }
-  const fields = entity.fields.slice(0, 4).map(f => `  ${f.name}: ${f.name}${f.enum ? `  # 标准枚举：${f.enum.join('、')}` : ''}`).join('\n');
+  const fields = sampleFields(entity);
   return `${head}${fields}
 dedupe:
   key: [${entity.key.join(', ')}]
