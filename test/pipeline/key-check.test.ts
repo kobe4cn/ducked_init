@@ -153,6 +153,37 @@ describe('主键冲突体检', () => {
     expect(await mergeLogRows(acme)).toBe(before.merges);
   });
 
+  it('撞号失败的映射现算时带租户盐：两边都映射的敏感扩展列计入一致比例；体检前后标准层与合并日志不变', async () => {
+    const { acme, author, reviewer, id } = await syncedSources();
+    // 不用 TOUCH_FROM_*：campaign_id 两边永远不一致。两边都映射敏感扩展列 x_ref，取值与各自的键相同，重叠的键（21..30）上两边一致
+    const narrow = await publish(author, reviewer, id, 'model: 1\nentity: touch\ntable: customers\nfields:\n  touch_id: string(customer_id)\n'
+      + 'extensions:\n  x_ref: { type: string, expr: string(customer_id), sensitive: true }\nwhere: customer_id > 20\n');
+    const clashing = await publish(author, reviewer, id, 'model: 1\nentity: touch\ntable: orders\nfields:\n  touch_id: string(order_id)\n'
+      + 'extensions:\n  x_ref: { type: string, expr: string(order_id), sensitive: true }\nwhere: order_id <= 30\n');
+    await mergeNow(author);
+    await drain();
+    expect((await getMapping(author, clashing)).merge.history[0]).toMatchObject({ error: expect.stringContaining('主键 touch_id 跨映射重复') });
+    const before = { touch: await silver(acme, 'touch', 'touch_id, _mapping'), merges: await mergeLogRows(acme) };
+    // 标准层里只有前一个映射的行：失败的那个一行也没进去
+    expect(before.touch).toHaveLength(20);
+    expect(new Set(before.touch.map(r => r._mapping))).toEqual(new Set([narrow]));
+
+    await checkKeysNow(author);
+    await drain();
+    const status = await getKeyCheckStatus(author);
+    expect(status.status).toBe('succeeded');
+    const [a, b] = [narrow, clashing].sort();
+    // x_ref 两边按同一个租户盐哈希，现算一侧与标准层里的值可以直接比较：10 个重叠的键全部一致
+    expect(status.entities).toEqual([{
+      entity: 'touch',
+      bySource: false,
+      pairs: [{ a, b, overlap: 10, samples: [['21'], ['22'], ['23'], ['24'], ['25']], agreement: 1, suggestion: 'drop_one' }],
+    }]);
+
+    expect(await silver(acme, 'touch', 'touch_id, _mapping')).toEqual(before.touch);
+    expect(await mergeLogRows(acme)).toBe(before.merges);
+  });
+
   it('撞号失败的映射一边的键全在另一边里时建议合并组', async () => {
     const { acme, author, reviewer, id } = await syncedSources();
     // 都不带 where：customers 的键 1..40 全在 orders 的 1..100 里，后一个映射合并失败、一行也没进标准层
@@ -197,10 +228,11 @@ describe('主键冲突体检', () => {
     const session = await openTenantLake(lakeSpecOf((await lakeRow(acme))!), { memoryLimitMb: 256, threads: 1 });
     try {
       const columns = ['touch_id', 'campaign_id'];
+      // 这几条映射都没有 plan（不会现算），盐用空串
       const result = await runKeyCheck(session.con, { entities: [{
         entity: 'touch', key: ['touch_id'], bySource: false,
         mappings: [{ mapping: fromCustomers, columns, group: 'g1' }, { mapping: fromOrders, columns, group: 'g1' }, { mapping: outsider, columns }],
-      }] });
+      }] }, '');
       const pairs = result.entities[0].pairs.map(p => [[p.a, p.b].sort(), p.overlap, p.suggestion]);
       expect(pairs.sort()).toEqual([[[fromCustomers, outsider].sort(), 3, 'duplicate'], [[fromOrders, outsider].sort(), 3, 'duplicate']].sort());
     } finally {

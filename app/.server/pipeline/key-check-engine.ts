@@ -3,15 +3,15 @@
 // 实体的主键、是否按数据源比较与各映射的列在入队时由平台算好放进参数（工作进程不连平台库）。
 // 标准层里一行都没有的已发布映射是因主键跨映射重复合并失败（或从未合并成功）：撞号的合并整个事务回滚，不留记录。这些映射的键按它的合并计划
 // 从原始层（源表或源视图）现算，取的是合并时会用的同一批当前行，与标准层里其他映射的行（或同样现算的行）比对；只是新版本合并失败、
-// 标准层里还留着旧版本行的映射按旧行比对。现算只写本机库 stage（只读湖下 stage 仍可写）；现算一侧的敏感列不参与一致比例——现算不带租户的盐，
-// 与标准层里的哈希比不了（带盐比对见 #781），比对键里有敏感列的映射不现算、照旧不参与比对。源视图每次整张物化，大表会慢；不采样，采样会让重叠数不准
+// 标准层里还留着旧版本行的映射按旧行比对。现算只写本机库 stage（只读湖下 stage 仍可写）；现算用领取任务时拿到的租户盐，与合并同一套哈希，
+// 敏感列照常参与一致比例，比对键里有敏感列的映射也照常现算。源视图每次整张物化，大表会慢；不采样，采样会让重叠数不准
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { cmp } from '../../lib/compare';
 import { customerSourceColumn } from '../../lib/customer-source';
 import { SILVER } from './lake-schemas';
 import { ident, lit } from '../../lib/mapping-expr';
 import { columnExists, joinOn, keyList, rows, silverTable, tableExists } from './duck-sql';
-import { customerRefColumns, filterLive, liveRecords, mappingInput, sensitiveColumns, SILVER_SYSTEM_COLUMNS, transformRows } from './merge-engine';
+import { customerRefColumns, filterLive, liveRecords, mappingInput, SILVER_SYSTEM_COLUMNS, transformRows } from './merge-engine';
 import type { KeyCheckEntity, KeyCheckParams } from './task-contracts';
 
 /**
@@ -65,16 +65,16 @@ type MappingEntry = KeyCheckEntity['mappings'][number];
 /**
  * 按合并计划从原始层现算一个映射这次会写进标准层的行（与合并同一套步骤：物化输入、当前记录、行过滤、转换、按去重键取最新一行、补系统列），
  * 物化进 stage.keycheck_w<index> 并返回表名。源表（或源视图引用的表）还没有同步进原始层时返回 null，这个映射照旧不参与比对。
- * 敏感列用空盐哈希（值比不了，这些列随后不参与一致比例）；_src、_n、_batch 是合并的中间列，不带进比对表
+ * 敏感列用与合并同一个租户盐哈希，与标准层里的值可以直接比较；_src、_n、_batch 是合并的中间列，不带进比对表
  */
-async function liveWinners(con: DuckDBConnection, index: number, plan: NonNullable<MappingEntry['plan']>): Promise<string | null> {
+async function liveWinners(con: DuckDBConnection, index: number, plan: NonNullable<MappingEntry['plan']>, salt: string): Promise<string | null> {
   const input = await mappingInput(con, plan, plan.sourceId, plan.sourceView, KEYCHECK_VIEW, '体检');
   if ('skipped' in input) return null;
   const bronze = await input.load();
   const [{ top }] = await rows<{ top: string | null }>(con, `SELECT max(_batch) AS top FROM ${bronze}`);
   await liveRecords(con, bronze, input.keys, { from: 0, to: Number(top ?? 0), held: null }, { latest: KEYCHECK_LATEST, live: KEYCHECK_LIVE });
   if (plan.where) await filterLive(con, plan, KEYCHECK_LIVE);
-  await transformRows(con, plan, '', { live: KEYCHECK_LIVE, into: KEYCHECK_TRANSFORMED });
+  await transformRows(con, plan, salt, { live: KEYCHECK_LIVE, into: KEYCHECK_TRANSFORMED });
   // 每个去重键取最新的一行，排序与合并的 winners 相同（最新字段最大、再按最近的批次、最后按记录的哈希），结果确定
   const order = [...(plan.latest ? [`c.${ident(plan.latest)} DESC NULLS LAST`] : []), 'c._batch DESC', 'c._src'].join(', ');
   const winners = `stage.keycheck_w${index}`;
@@ -91,7 +91,7 @@ async function liveWinners(con: DuckDBConnection, index: number, plan: NonNullab
  * 体检本租户标准层里各实体的主键。只有一个映射写入的实体跳过；没有重叠的映射对、同一合并组的映射对与没有剩下映射对的实体不进结果。
  * 标准层里一行都没有的映射按合并计划从原始层现算（见文件头注释），它的行与标准层里其他映射的行并进本机库的一张表再比对
  */
-export async function runKeyCheck(con: DuckDBConnection, { entities }: KeyCheckParams): Promise<KeyCheckResult> {
+export async function runKeyCheck(con: DuckDBConnection, { entities }: KeyCheckParams, salt: string): Promise<KeyCheckResult> {
   const result: KeyCheckResult['entities'] = [];
   for (const { entity, key, bySource, mappings } of entities) {
     if (mappings.length < 2) continue;
@@ -104,8 +104,6 @@ export async function runKeyCheck(con: DuckDBConnection, { entities }: KeyCheckP
       counts.set(_mapping, Number(n));
     const absent = mappings.filter(m => !counts.get(m.mapping) && m.plan);
     if (!exists && !absent.length) continue;
-    // 现算成功的映射 → 它的敏感列（一致比例不比）
-    const liveSensitive = new Map<string, Set<string>>();
     const winnersTables: string[] = [];
     try {
       // 按主键里指向 customer 的字段旁的数据源列比较（ADR-0030，跨源引用时是目标数据源）；表还没有或老湖里没有这些列时退回 _source（现算的行带 _source）
@@ -115,12 +113,9 @@ export async function runKeyCheck(con: DuckDBConnection, { entities }: KeyCheckP
       let table = silver;
       if (absent.length) {
         for (const m of absent) {
-          // 比对键现算时会被哈希，与标准层里的值连不上：这样的映射不现算，照旧不参与比对
-          if (on.some(c => sensitiveColumns(m.plan!).has(c))) continue;
-          const winners = await liveWinners(con, winnersTables.length, m.plan!);
+          const winners = await liveWinners(con, winnersTables.length, m.plan!, salt);
           if (!winners) continue;
           winnersTables.push(winners);
-          liveSensitive.set(m.mapping, sensitiveColumns(m.plan!));
         }
         if (winnersTables.length) {
           // 标准层里其他映射的行与现算的行并成一张表：失败映射可能有标准层里没有的列，按列名并
@@ -149,8 +144,7 @@ export async function runKeyCheck(con: DuckDBConnection, { entities }: KeyCheckP
         const [a, b] = [o.a, o.b].map(id => mappings.find(m => m.mapping === id)!);
         if (a.group && a.group === b.group) continue;
         const overlap = Number(o.overlap);
-        const agreement = await agreementOf(con, table, on, key, a, b, overlap,
-          new Set([...liveSensitive.get(a.mapping) ?? [], ...liveSensitive.get(b.mapping) ?? []]));
+        const agreement = await agreementOf(con, table, on, key, a, b, overlap);
         pairs.push({
           a: o.a, b: o.b, overlap, samples: o.samples, agreement,
           suggestion: suggestionOf({ overlap, keysA: Number(o.keys_a), keysB: Number(o.keys_b), agreement }),
@@ -167,12 +161,12 @@ export async function runKeyCheck(con: DuckDBConnection, { entities }: KeyCheckP
 
 /**
  * 一致比例：重叠的键里，两边都映射了的列（去掉主键与系统列）全部 IS NOT DISTINCT FROM 的键所占的比例；没有这样的列时为 null。
- * 同一个映射的一个键有多行时（去重键比主键细），所有行两两一致才算一致。现算的映射（sensitive 非空）的敏感列不比：现算不带租户的盐，与标准层里的哈希比不了
+ * 同一个映射的一个键有多行时（去重键比主键细），所有行两两一致才算一致。敏感列照常比：现算与合并用同一个租户盐，两边的哈希可以直接比较
  */
 async function agreementOf(
-  con: DuckDBConnection, table: string, on: string[], key: string[], a: MappingEntry, b: MappingEntry, overlap: number, sensitive: Set<string>,
+  con: DuckDBConnection, table: string, on: string[], key: string[], a: MappingEntry, b: MappingEntry, overlap: number,
 ) {
-  const skip = new Set<string>([...key, ...Object.keys(SILVER_SYSTEM_COLUMNS), ...sensitive]);
+  const skip = new Set<string>([...key, ...Object.keys(SILVER_SYSTEM_COLUMNS)]);
   const columns = a.columns.filter(c => !skip.has(c) && b.columns.includes(c));
   if (!columns.length) return null;
   const [{ n }] = await rows<{ n: string }>(con, `

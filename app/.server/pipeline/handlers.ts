@@ -202,10 +202,13 @@ export const HANDLERS = {
     run: (con, raw) => inspectLake(con, CONTRACTS['lake.inspect'].params.parse(raw)),
   },
   // 主键冲突体检：对每个实体里主键撞上的每对映射，统计重叠的键数、样本键与字段一致的比例，给出建议（ADR-0024）。
-  // 数据湖只读挂载，只出报告不改标准层
+  // 数据湖只读挂载，只出报告不改标准层；领取时带租户盐，现算的敏感列与标准层同样哈希
   'silver.keycheck': {
     label: CONTRACTS['silver.keycheck'].label,
-    run: (con, raw) => runKeyCheck(con, CONTRACTS['silver.keycheck'].params.parse(raw)),
+    async run(con, raw, { piiSalt }) {
+      if (!piiSalt) throw new Error('缺少敏感信息盐');
+      return runKeyCheck(con, CONTRACTS['silver.keycheck'].params.parse(raw), piiSalt);
+    },
   },
   // 合并到标准层：按已发布的映射把原始层里新的变更批次合并进标准层，每个映射各自一个事务，之后按参数里的匹配规则重算身份打通
   // （没改到 customer / event、结果表都在且参数没要求强制时跳过打通，结果里写明原因）。

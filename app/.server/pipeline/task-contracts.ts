@@ -464,6 +464,7 @@ export const CONTRACTS = {
     label: '主键冲突体检',
     readOnlyLake: true,
     allowOverStorageQuota: true,
+    needs: { piiSalt: true },
     params: schemaParams(silverKeyCheckParams),
     result: resultType<KeyCheckResult>(),
   },
