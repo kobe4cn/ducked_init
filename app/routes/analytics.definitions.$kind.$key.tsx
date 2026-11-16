@@ -3,7 +3,7 @@
 // 以及各版本的作者与最后保存的人；草稿由最后保存它的人以外的另一位有发布权限的成员发布（发布后以当天入队一次计算，成功后快照出现在分析页），也可以丢弃。
 // 有草稿且有已发布版本时可以预览发布的影响：指标与受影响的下游标签按两版结果对比的消费者计数（只读挂载上按今天算，不出消费者 ID）。
 // 发布过的定义显示最近一次刷新的时间与来源；有发布权限的成员可以按今天以生效版本重新计算，有早于生效版本的未过期快照时可以按各自的统计日以生效版本回刷
-// （都连同下游标签），没有权限时说明原因。本定义的全部快照（含已过期）按时间倒序列在「快照」区——分析页每个定义只留最新一张（#798）。
+// （都连同下游标签），没有权限时说明原因。本定义的全部快照（含已过期）按时间倒序列在「快照」区——分析页「指标与标签」列表每个定义只显示最新一张，历史在这里（#798）。
 // 有修改与删除权限的成员可以删除定义（被已发布标签引用的指标删不了）。
 // 已发布过的定义带业务知识面板（ADR-0046）：alias.* / claim.* / note.* / subject.* / proposal.* 的提交交给 handleKnowledgeIntent，权限由领域函数检查，查看者看得到、提交 403
 import { AlertTriangle, CheckCircle2, Lock, RefreshCw, Trash2 } from 'lucide-react';
@@ -65,7 +65,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     backfill: d.backfill,
     /** 最近一次刷新的时间与来源；还没有快照时为 null */
     lastRefresh: d.lastRefresh && { at: d.lastRefresh.at.toISOString(), trigger: triggerLabel(d.lastRefresh.trigger) },
-    /** 本定义的全部快照（含已过期），按时间倒序；分析页的列表每个定义只留最新一张，历史在这里（#798） */
+    /** 本定义的全部快照（含已过期），按时间倒序；分析页「指标与标签」列表每个定义只显示最新一张，历史在这里（#798） */
     snapshots: (await listSnapshots(member.tenant.id, `${d.kind}:${d.key}`)).map(s => ({
       id: s.id,
       version: s.definitionVersion,
