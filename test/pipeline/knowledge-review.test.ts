@@ -89,7 +89,8 @@ describe('需复核', () => {
     await saveClaim(author, { targetId: target, mappingId: crm, type: 'time_meaning', value: 'pay_time' });
     await saveBusinessNote(author, { entity: 'order', field: 'status', mappingId: crm, note: 'CRM 手工改状态' });
 
-    await republish(author, reviewer, crm, CRM_ORDERS);
+    // 与已发布 v1 相同的草稿在发布时被拦下（#787），知识上不带需复核
+    await expect(republish(author, reviewer, crm, CRM_ORDERS)).rejects.toThrow('与 v1 相同，没有改动，请丢弃草稿');
     expect(JSON.stringify(crmLineage(expand(await tenantCatalog(acme), target)))).not.toContain('needsReview');
 
     await republish(author, reviewer, crm, CRM_ORDERS_V2);
