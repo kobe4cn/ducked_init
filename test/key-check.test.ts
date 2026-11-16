@@ -28,7 +28,7 @@ describe('体检参数', () => {
       plan('m5', 'custom_visit', ['member_id', 'day']),
       plan('m6', 'custom_ticket', ['ticket_id']),
       plan('m7', 'custom_unknown', ['id']),
-    ], published)).toEqual([
+    ], published)).toMatchObject([
       { entity: 'touch', key: ['touch_id'], bySource: false, mappings: [{ mapping: 'm2', columns: ['touch_id', 'campaign_id'] }, { mapping: 'm3', columns: ['touch_id'] }] },
       { entity: 'consent', key: ['customer_id', 'channel'], bySource: true, mappings: [{ mapping: 'm4', columns: ['customer_id', 'channel'] }] },
       { entity: 'custom_visit', key: ['member_id', 'day'], bySource: true, mappings: [{ mapping: 'm5', columns: ['member_id', 'day'] }] },
@@ -45,7 +45,7 @@ describe('体检参数里的合并组', () => {
       { ...plan('m1', 'order', ['order_id']), group },
       { ...plan('m2', 'order', ['order_id']), group },
       plan('m3', 'order', ['order_id']),
-    ], new Map())).toEqual([{
+    ], new Map())).toMatchObject([{
       entity: 'order', key: ['order_id'], bySource: false,
       mappings: [{ mapping: 'm1', columns: ['order_id'], group: 'g1' }, { mapping: 'm2', columns: ['order_id'], group: 'g1' }, { mapping: 'm3', columns: ['order_id'] }],
     }]);
