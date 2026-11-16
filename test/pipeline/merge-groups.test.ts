@@ -1,5 +1,6 @@
 // test/pipeline/merge-groups.test.ts —— 合并组的接缝（ADR-0032；保存 / 发布 / 丢弃经 publishing.ts 接入 ADR-0051，发布流程本身的用例见 publishing.test.ts）：
 // 发布后入队带 rebuild 的合并（组员改了时取新旧组员的并集，被移出组的映射也重建）、更新草稿不写审计、已有合并在运行时发布被拒并回滚；
+// 与当前生效已发布版相同的草稿（组员按顺序、规则相同）发布被拒、版本仍是草稿、没有新的合并任务，组员顺序不同不算相同；
 // publishedMergeGroups 给出每个实体最新的已发布组；checkMergeGroup 是保存与发布共用的纯函数校验
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -84,6 +85,37 @@ describe('合并组发布', () => {
       .toEqual([{ version: 1, status: 'draft' }]);
     expect(await publishedMergeGroups(getDb(), acme)).toEqual(new Map());
     expect((await listAuditLogs(acme)).filter(l => l.action === '发布合并组')).toEqual([]);
+  });
+
+  it('发布与当前生效已发布版相同的草稿被拒：页面标出与 v1 相同，版本仍是草稿、没有新的合并任务', async () => {
+    const { author, reviewer, orders } = await withOrders();
+    await saveMergeGroupDraft(author, 'order', { members: orders, rule: { kind: 'priority' } });
+    await publishMergeGroup(reviewer, 'order', 1);
+    await drain();
+    // 换一位成员（reviewer）存一份组员与规则完全相同的草稿，由 author 发布
+    expect(await saveMergeGroupDraft(reviewer, 'order', { members: orders, rule: { kind: 'priority' } })).toBe(2);
+    const [page] = await listMergeGroups(author);
+    expect(page.versions.find(v => v.status === 'draft')?.sameAs).toBe(1);
+
+    const tasksBefore = await getDb().select({ id: tasks.id }).from(tasks);
+    await expect(publishMergeGroup(author, 'order', 2)).rejects.toThrow('与 v1 相同，没有改动，请丢弃草稿');
+    // 拒绝发生在入队合并之前：v2 仍是草稿，tasks 没有新的合并任务
+    expect((await getDb().select({ version: mergeGroupVersions.version, status: mergeGroupVersions.status }).from(mergeGroupVersions))
+      .sort((a, b) => b.version - a.version))
+      .toEqual([{ version: 2, status: 'draft' }, { version: 1, status: 'published' }]);
+    expect(await getDb().select({ id: tasks.id }).from(tasks)).toEqual(tasksBefore);
+    expect(await discardMergeGroupDraft(author, 'order')).toEqual({ kept: true });
+  });
+
+  it('组员顺序不同的草稿不算相同，可以正常发布', async () => {
+    const { author, reviewer, orders } = await withOrders();
+    await saveMergeGroupDraft(author, 'order', { members: orders, rule: { kind: 'priority' } });
+    await publishMergeGroup(reviewer, 'order', 1);
+    await drain();
+    expect(await saveMergeGroupDraft(author, 'order', { members: [orders[1], orders[0]], rule: { kind: 'priority' } })).toBe(2);
+    const [page] = await listMergeGroups(author);
+    expect(page.versions.find(v => v.status === 'draft')?.sameAs).toBeNull();
+    expect(await publishMergeGroup(reviewer, 'order', 2)).not.toBeNull();
   });
 });
 

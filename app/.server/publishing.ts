@@ -15,6 +15,7 @@ import { catalogTx } from './catalog/tx';
 import { getDb } from './db/client';
 import { members, ROLES } from './db/schema';
 import { lockTenant } from './tenant-lock';
+import { cmp } from '../lib/compare';
 
 /** 发布流程本身的错误（ADR-0051 一律 400，双人规则在草稿状态下拦下时报 403）；可发布项自己的错误类继承它，保留各自的 status 与文案 */
 export class PublishError extends Error {
@@ -75,6 +76,11 @@ export interface VersionRow {
 /** 版本表的一整行（共有列之外带各可发布项自己的内容列）：事务外 / 内检查与发布后动作收到的是它 */
 export type DraftRow = VersionRow & Record<string, unknown>;
 
+/** 键按码点排好序的 JSON（键顺序不同视为相同）：各适配器的 sameContent 比较内容列用。
+ * 与 knowledge/basis.ts 的 stableJson 形状相同，但不能从那里引（basis.ts 经 mappings.ts 导入这里，会循环依赖），是合并成一处的候选 */
+export const stableJson = (v: unknown): string => JSON.stringify(v, (_, x) =>
+  x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => cmp(a, b))) : x);
+
 /**
  * 可发布项的适配器（ADR-0051）。给具体表与列，不做泛型 drizzle：Ctx 是定位这一项的上下文（发布前读草稿用 ctx.parentId），
  * Input 是保存的输入，Inside 是事务内检查传给发布后动作的值（合并组用它读出上一版的组员），After 是发布后动作（入队任务）的结果
@@ -101,6 +107,10 @@ export interface PublishableAdapter<Ctx, Input, Inside = undefined, After = null
   /** 保存的事务内检查（只查 PG）：合并组的校验与懒建父行在这里做 */
   saveInside?(tx: Tx, ctx: Ctx): Promise<void>;
 
+  /** 草稿与一份已发布版的内容列是否相同（版本号、作者这些不算）：publish 在草稿与当前生效已发布版相同时拒绝发布，
+   * loader 用 sameAsPublished 显示「与 vN 相同」。没有实现时不拦（各可发布项按子票逐个接入） */
+  sameContent?(draft: DraftRow, published: DraftRow): boolean;
+
   /** 发布的事务外检查（可以访问 DuckDB 或数据湖） */
   checkOutside?(draft: DraftRow, ctx: Ctx): Promise<void>;
 
@@ -125,6 +135,17 @@ export interface PublishableAdapter<Ctx, Input, Inside = undefined, After = null
   /** 文案：发布没有这一版时 404、丢弃没有草稿可丢 */
   missingVersion(version: number): string;
   noDraft(ctx: Ctx): string;
+}
+
+/** 草稿与当前生效已发布版（status='published' 里 version 最大的一行）相同时返回那一版的版本号，否则 null：给各页面的 loader 显示「与 vN 相同」用。
+ * rows 是该父项已读出的全部版本行（含 status / version 与内容列，常缺 id / createdAt 这些共有列）；adapter 没有实现 sameContent 时恒为 null */
+export function sameAsPublished<Ctx, Input, Inside, After>(
+  adapter: PublishableAdapter<Ctx, Input, Inside, After>, rows: DraftRow[],
+): number | null {
+  if (!adapter.sameContent) return null;
+  const draft = rows.find(r => r.status === 'draft');
+  const published = rows.filter(r => r.status === 'published').sort((a, b) => b.version - a.version)[0];
+  return draft && published && adapter.sameContent(draft, published) ? published.version : null;
 }
 
 /** 版本表 / 父表的共有列（各可发布项形状相同、名字相同，ADR-0051）：按名字从具体表上取 */
@@ -194,6 +215,14 @@ export async function publish<Ctx, Input, Inside, After>(
   if (!draft) throw new PublishError(adapter.missingVersion(version), 404);
   const blocker = publishBlocker(actor, draft);
   if (blocker) throw new PublishError(blocker, draft.status === 'draft' ? 403 : 400);
+  // 草稿与当前生效已发布版相同时拦下（发布它等于没改）：不入队合并、也不写审计。取法同 discard（降序里第一行 published）。
+  // 不用进事务：同一时刻只有一份草稿，已发布版只能由发布这份草稿改变，锁内的过期检查兜底
+  const published = ((await getDb().select().from(adapter.versions)
+    .where(eq(adapter.versionsFk, ctx.parentId)).orderBy(desc(versionCol))) as unknown as DraftRow[])
+    .find(v => v.status === 'published');
+  if (published && adapter.sameContent?.(draft, published)) {
+    throw new PublishError(`与 v${published.version} 相同，没有改动，请丢弃草稿`);
+  }
   await adapter.checkOutside?.(draft, ctx);
   return inTx(actor.tenant.id, tx, async tx => {
     if (adapter.lockTenant) await lockTenant(tx, actor.tenant.id);

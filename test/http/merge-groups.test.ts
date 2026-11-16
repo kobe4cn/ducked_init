@@ -1,6 +1,7 @@
 // test/http/merge-groups.test.ts —— 合并组的 HTTP 接缝（ADR-0032）：数据工程师从映射页进合并组页，给 order 的两个已发布映射排优先级、选存活规则保存草稿（不合格时页面给出原因，什么也不存），
 // 最后保存的人发布不了，另一位成员发布；再改是新的一版草稿，可丢弃回到已发布版本。分析师只读，查看者 403。
-// 组员映射的合并记录显示组内重叠的行数与各字段不一致的行数；版本列表列出每一版（当前生效有标记），查看旧版只读显示那一版的组员与规则
+// 组员映射的合并记录显示组内重叠的行数与各字段不一致的行数；版本列表列出每一版（当前生效有标记），查看旧版只读显示那一版的组员与规则；
+// 与当前生效已发布版相同的草稿在草稿行标「与 vN 相同」，发布被拒并提示丢弃
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mergeGroups } from '../../app/.server/db/schema';
@@ -79,6 +80,30 @@ describe('合并组页', () => {
     expect(page).toContain('data-merge-overlap="5"');
     expect(page).toContain('合并组：重叠 5 行，不一致');
     expect(page).toContain('订单状态 1 行（如 A4）');
+  });
+
+  it('与当前生效已发布版相同的草稿：页面显示「与 v1 相同」，发布被拒并提示丢弃，丢弃后回到 v1', async () => {
+    const { orderMappings } = await publishedIdentitySources({ orders: true });
+    const { crm, loyalty } = orderMappings!;
+    const author = await loginAs(app, 'de@acme.com');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+    const form = { intent: 'save', entity: 'order', candidate: [crm, loyalty], rank: ['2', '1'], rule: 'priority' };
+    expect((await author.post('/merge-groups', form)).status).toBe(302);
+    expect((await reviewer.post('/merge-groups?entity=order', { intent: 'publish', version: '1' })).status).toBe(302);
+    // 组员与规则完全相同的草稿（另一位成员保存），页面在草稿行标出与 v1 相同
+    expect((await reviewer.post('/merge-groups', form)).status).toBe(302);
+    const page = await (await author.get('/merge-groups?entity=order')).text();
+    expect(page).toContain('data-draft');
+    expect(page).toContain('data-same-as');
+    expect(page).toContain('与 v1 相同');
+    const rejected = await author.post('/merge-groups?entity=order', { intent: 'publish', version: '2' });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toContain('与 v1 相同，没有改动，请丢弃草稿');
+    // 拒绝后草稿还在，丢弃回到 v1
+    expect((await author.post('/merge-groups?entity=order', { intent: 'discard' })).status).toBe(302);
+    const back = await (await author.get('/merge-groups?entity=order')).text();
+    expect(back).not.toContain('data-draft');
+    expect(back).toContain('已发布 v1');
   });
 
   it('版本列表列出每一版（新的在前、当前生效有标记），查看 v1 只读显示那一版的组员与规则，编辑表单仍是当前版', async () => {

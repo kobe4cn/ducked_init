@@ -11,7 +11,7 @@ import { publishedCustomEntities, uniqueKeys } from './custom-entities';
 import { getDb } from './db/client';
 import { mappings, mappingVersions, mergeGroups, mergeGroupVersions, sources } from './db/schema';
 import { enqueueMerge } from './merges';
-import { discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, publishReason, saveDraft, type PublishableAdapter } from './publishing';
+import { discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, publishReason, sameAsPublished, saveDraft, stableJson, type PublishableAdapter } from './publishing';
 import { entityOf } from '../lib/canonical-model';
 import { cmpName } from '../lib/compare';
 import { MERGE_RULE_KINDS, type MergeRule, type MergeRuleKind, ruleText } from '../lib/merge-groups';
@@ -130,7 +130,8 @@ export interface MergeGroupEntity {
   entity: string;
   candidates: { id: string; name: string; keySpace: string | null }[];
   fields: string[];
-  versions: (Omit<typeof mergeGroupVersions.$inferSelect, 'id' | 'groupId' | 'createdAt'> & { publishBlocker: string | null })[];
+  /** 各版本（最新的在前，带当前成员发布不了的原因）；草稿行另有 sameAs：与当前生效已发布版相同时是那一版的版本号，否则 null */
+  versions: (Omit<typeof mergeGroupVersions.$inferSelect, 'id' | 'groupId' | 'createdAt'> & { publishBlocker: string | null; sameAs: number | null })[];
 }
 
 /**
@@ -156,12 +157,15 @@ export async function listMergeGroups(actor: CurrentMember): Promise<MergeGroupE
   ]);
   return [...entities].sort().map(entity => {
     const candidates = live.filter(m => m.entity === entity);
+    const rows = versions.filter(v => v.entity === entity);
+    const sameAs = sameAsPublished(mergeGroupAdapter, rows as unknown as DraftRow[]);
     return {
       entity,
       candidates: candidates.map(m => ({ id: m.id, name: m.name, keySpace: m.keySpace ?? null })),
       fields: [...fieldsOf(entity, ctx, candidates)].sort(),
-      versions: versions.filter(v => v.entity === entity).map(({ entity: _, ...v }) => ({
+      versions: rows.map(({ entity: _, ...v }) => ({
         ...v, publishBlocker: publishReason(actor, { ...v, publishBlocker: publishBlocker(actor, v) }, publishers),
+        sameAs: v.status === 'draft' ? sameAs : null,
       })),
     };
   });
@@ -211,6 +215,13 @@ export const mergeGroupAdapter: PublishableAdapter<MergeGroupCtx, MergeGroupInpu
     const { members, rule } = ctx as MergeGroupSaveCtx;
     await assertMergeGroup(tx, ctx.tenantId, ctx.entity, { members, rule });
     await tx.insert(mergeGroups).values({ tenantId: ctx.tenantId, entity: ctx.entity }).onConflictDoNothing();
+  },
+  // 草稿与已发布版内容相同：组员按顺序逐项比（顺序即优先级，换了顺序算改动），规则比规范化 JSON（保存入口已规范化键）
+  sameContent: (draft, published) => {
+    const { members, rule } = draft as GroupDraft;
+    const previous = published as GroupDraft;
+    return members.length === previous.members.length && members.every((m, i) => m === previous.members[i])
+      && stableJson(rule) === stableJson(previous.rule);
   },
   checkInside: async (tx, draft, ctx) => {
     const { members, rule } = draft as GroupDraft;
