@@ -1,6 +1,7 @@
 // app/routes/merge-groups.tsx —— 合并组（ADR-0032）：把同一实体下描述同一批对象的几个已发布映射绑在一起，同一主键在标准层只留一行。
 // 每个能建组、有至少 2 个已发布映射的实体一个标签（?entity=）；数据工程师、管理员给映射排优先级（留空即不在组里）、选存活规则并保存草稿，
-// 草稿需最后保存它的人以外的另一位有发布权限的成员在这个页面上发布，也可以丢弃；发布后版本锁定，再改是新的一版草稿
+// 草稿需最后保存它的人以外的另一位有发布权限的成员在这个页面上发布，也可以丢弃；发布后版本锁定，再改是新的一版草稿。
+// 每个实体卡片下方列出全部版本（新的在前，当前生效的已发布版有标记），?version=N 只读查看那一版的组员（顺序即优先级）与存活规则，不影响编辑表单
 import { CircleAlert, Layers } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/merge-groups';
@@ -15,6 +16,7 @@ import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
+import { Badge } from '~/components/ui/badge';
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 import { Label } from '~/components/ui/label';
@@ -26,6 +28,12 @@ import { MERGE_RULE_HINTS, MERGE_RULE_KINDS, MERGE_RULE_LABELS, ruleText } from 
 export const meta = () => [{ title: '合并组 · CRM 数据分析平台' }];
 
 const entityParam = (request: Request) => new URL(request.url).searchParams.get('entity');
+
+/** 要查看的版本（?version=，正整数），否则 null */
+const versionParam = (request: Request) => {
+  const n = Number(new URL(request.url).searchParams.get('version'));
+  return Number.isInteger(n) && n > 0 ? n : null;
+};
 
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
@@ -40,6 +48,8 @@ export async function loader({ request }: Route.LoaderArgs) {
     })),
     /** 选中的实体（?entity=，没有或不在列表里时为第一个） */
     selected: entities.find(e => e.entity === entityParam(request))?.entity ?? entities[0]?.entity ?? null,
+    /** 正在查看的版本（?version=，正整数）；不在选中实体的版本里时页面不渲染查看块 */
+    viewVersion: versionParam(request),
   };
 }
 
@@ -77,7 +87,7 @@ export async function action({ request }: Route.ActionArgs) {
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
 export default function MergeGroups({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, entities, selected } = loaderData;
+  const { email, nav, canWrite, entities, selected, viewVersion } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const current = entities.find(e => e.entity === selected);
   return (
@@ -112,7 +122,7 @@ export default function MergeGroups({ loaderData, actionData }: Route.ComponentP
             current={current.entity}
             tabs={entities.map(e => ({ key: e.entity, label: entityLabel(e.entity), href: `/merge-groups?entity=${encodeURIComponent(e.entity)}` }))}
           />
-          <EntityGroup key={current.entity} group={current} canWrite={canWrite} submitting={submitting} input={actionData?.input ?? null} />
+          <EntityGroup key={current.entity} group={current} canWrite={canWrite} submitting={submitting} input={actionData?.input ?? null} viewVersion={viewVersion} />
         </>
       )}
     </AppShell>
@@ -121,11 +131,12 @@ export default function MergeGroups({ loaderData, actionData }: Route.ComponentP
 
 type Group = Route.ComponentProps['loaderData']['entities'][number];
 
-function EntityGroup({ group, canWrite, submitting, input }: {
-  group: Group; canWrite: boolean; submitting: boolean; input: { members: string[]; rule: Group['versions'][number]['rule'] } | null;
+function EntityGroup({ group, canWrite, submitting, input, viewVersion }: {
+  group: Group; canWrite: boolean; submitting: boolean; input: { members: string[]; rule: Group['versions'][number]['rule'] } | null; viewVersion: number | null;
 }) {
   const draft = group.versions.find(v => v.status === 'draft');
   const live = group.versions.find(v => v.status === 'published');
+  const viewing = viewVersion === null ? undefined : group.versions.find(v => v.version === viewVersion);
   const values = input ?? draft ?? live ?? { members: [], rule: { kind: 'priority' as const } };
   const mappingName = (id: string) => group.candidates.find(c => c.id === id)?.name ?? '（已停用或不再发布的映射）';
   return (
@@ -195,6 +206,51 @@ function EntityGroup({ group, canWrite, submitting, input }: {
           <Button type="submit" disabled={submitting}>{draft ? '保存草稿' : '保存为新草稿'}</Button>
         </Form>
       ) : <p className="text-sm text-slate-500">只读。</p>}
+      <section className="mt-6" data-versions>
+        <h3 className="mb-2 text-sm font-semibold text-slate-500">版本</h3>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>版本</TableHead>
+              <TableHead>状态</TableHead>
+              <TableHead>作者</TableHead>
+              <TableHead>发布</TableHead>
+              <TableHead />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {group.versions.map(v => (
+              <TableRow key={v.version} data-version={v.version} data-version-status={v.status} data-live={v === live || undefined}>
+                <TableCell className="font-mono font-semibold">{`v${v.version}`}</TableCell>
+                <TableCell>
+                  <span className="flex flex-wrap items-center gap-2">
+                    <VersionStatus v={v} />
+                    {v === live && <Badge className="bg-emerald-50 text-emerald-600">当前生效</Badge>}
+                  </span>
+                </TableCell>
+                <TableCell className="text-sm">{v.authors.join('、') || '平台'}</TableCell>
+                <TableCell className="text-sm text-slate-500">{v.publishedByEmail ? `${v.publishedByEmail}，${time(v.publishedAt)}` : '—'}</TableCell>
+                <TableCell className="text-right">
+                  <Button asChild size="sm" variant="ghost"><Link to={`?entity=${group.entity}&version=${v.version}`}>查看</Link></Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </section>
+      {viewing && (
+        <section className="mt-6" data-version-view={viewing.version}>
+          <div className="mb-2 flex flex-wrap items-center gap-2 text-sm text-slate-500">
+            正在查看 <span className="font-mono font-semibold text-slate-900">{`v${viewing.version}`}</span><VersionStatus v={viewing} />
+            <Button asChild size="sm" variant="ghost"><Link to={`?entity=${group.entity}`}>关闭</Link></Button>
+          </div>
+          <p className="mb-1 max-w-2xl text-sm text-slate-500">组员按优先级从高到低：</p>
+          <ol className="max-w-2xl space-y-1 text-sm">
+            {viewing.members.map((id, i) => <li key={id} data-version-member>{`${i + 1}. ${mappingName(id)}`}</li>)}
+          </ol>
+          <p className="mt-2 max-w-2xl text-sm text-slate-500">{`存活规则：${ruleText(viewing.rule)}`}</p>
+        </section>
+      )}
     </div>
   );
 }

@@ -1,6 +1,6 @@
 // test/http/merge-groups.test.ts —— 合并组的 HTTP 接缝（ADR-0032）：数据工程师从映射页进合并组页，给 order 的两个已发布映射排优先级、选存活规则保存草稿（不合格时页面给出原因，什么也不存），
 // 最后保存的人发布不了，另一位成员发布；再改是新的一版草稿，可丢弃回到已发布版本。分析师只读，查看者 403。
-// 组员映射的合并记录显示组内重叠的行数与各字段不一致的行数
+// 组员映射的合并记录显示组内重叠的行数与各字段不一致的行数；版本列表列出每一版（当前生效有标记），查看旧版只读显示那一版的组员与规则
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mergeGroups } from '../../app/.server/db/schema';
@@ -79,5 +79,31 @@ describe('合并组页', () => {
     expect(page).toContain('data-merge-overlap="5"');
     expect(page).toContain('合并组：重叠 5 行，不一致');
     expect(page).toContain('订单状态 1 行（如 A4）');
+  });
+
+  it('版本列表列出每一版（新的在前、当前生效有标记），查看 v1 只读显示那一版的组员与规则，编辑表单仍是当前版', async () => {
+    const { author, reviewer, orderMappings } = await publishedIdentitySources({ orders: true });
+    const { crm, loyalty } = orderMappings!;
+    await publishMergeGroup(reviewer, 'order', await saveMergeGroupDraft(author, 'order', { members: [loyalty, crm], rule: { kind: 'priority' } }));
+    await publishMergeGroup(reviewer, 'order', await saveMergeGroupDraft(author, 'order', { members: [crm, loyalty], rule: { kind: 'coalesce' } }));
+    const de = await loginAs(app, 'de@acme.com');
+
+    const page = await (await de.get('/merge-groups?entity=order')).text();
+    expect(page).toMatch(/data-version="2"[^>]*data-version-status="published"/);
+    expect(page).toMatch(/data-version="1"[^>]*data-version-status="published"/);
+    expect(page.indexOf('data-version="2"')).toBeLessThan(page.indexOf('data-version="1"'));
+    expect(page).toMatch(/data-version="2"[^>]*data-live/);
+    expect(page).not.toMatch(/data-version="1"[^>]*data-live/);
+    expect(page).toContain('当前生效');
+
+    const viewing = await (await de.get('/merge-groups?entity=order&version=1')).text();
+    expect(viewing).toContain('data-version-view="1"');
+    const block = viewing.slice(viewing.indexOf('data-version-view="1"'));
+    expect(block.indexOf('1. 「会员」orders → order')).toBeGreaterThan(-1);
+    expect(block.indexOf('「会员」orders → order')).toBeLessThan(block.indexOf('「CRM」orders → order'));
+    expect(block).toContain('存活规则：按优先级');
+    expect(block).toContain('href="/merge-groups?entity=order"');
+    // 查看旧版不影响编辑表单：默认值仍是当前生效的 v2
+    expect(viewing).toMatch(/<option[^>]*value="coalesce"[^>]*selected/);
   });
 });
