@@ -2,6 +2,7 @@
 // 与关系边（标准实体的 ref、经 silver._identities 关联 customer、event.device_id → silver._device_owner、映射里声明的跨源引用），以及一个源列的影响范围（纯函数）
 import { describe, expect, it } from 'vitest';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
+import type { EntityRelation } from '../app/lib/canonical-model';
 import { deriveLineage, impactOf } from '../app/lib/lineage';
 
 const plan = (over: Partial<MergeMappingParam> = {}): MergeMappingParam => ({
@@ -89,6 +90,25 @@ describe('由已发布映射推导血缘', () => {
     expect(edges).toContainEqual({ from: { entity: 'event', field: 'device_id' }, to: { table: 'silver._device_owner', field: 'device_id' }, kind: 'device' });
     expect(edges.filter(e => e.kind === 'identity')).toHaveLength(8);
     expect(edges.filter(e => e.kind === 'ref')).toHaveLength(6);
+  });
+
+  it('登记关系：已发布登记上的关系各出一条边（起点可以是标准实体字段或 x_ 扩展字段），指向 customer 的经 _identities，标 custom', () => {
+    const relations: EntityRelation[] = [
+      { from: { entity: 'order', field: 'store_id' }, ref: { entity: 'custom_station', field: 'station_id' } },
+      { from: { entity: 'custom_station', field: 'region_id' }, ref: { entity: 'custom_region', field: 'region_id' } },
+      { from: { entity: 'event', field: 'x_code' }, ref: { entity: 'custom_code', field: 'code' } },
+      { from: { entity: 'custom_card', field: 'holder' }, ref: { entity: 'customer', field: 'customer_id' } },
+    ];
+    const { edges } = deriveLineage({ plans: [], sources: [], relations });
+    expect(edges).toContainEqual({ from: { entity: 'order', field: 'store_id' }, to: { table: 'silver.custom_station', field: 'station_id' }, kind: 'ref', custom: true });
+    expect(edges).toContainEqual({ from: { entity: 'custom_station', field: 'region_id' }, to: { table: 'silver.custom_region', field: 'region_id' }, kind: 'ref', custom: true });
+    expect(edges).toContainEqual({ from: { entity: 'event', field: 'x_code' }, to: { table: 'silver.custom_code', field: 'code' }, kind: 'ref', custom: true });
+    expect(edges).toContainEqual({
+      from: { entity: 'custom_card', field: 'holder' }, to: { table: 'silver.customer', field: 'customer_id' },
+      via: { table: 'silver._identities', on: ['_source', 'customer_id'] }, kind: 'identity', custom: true,
+    });
+    // 不给 relations 时与现在一致，只有内置与跨源的边
+    expect(deriveLineage({ plans, sources }).edges).toEqual(deriveLineage({ plans, sources, relations: [] }).edges);
   });
 
   it('跨源引用：声明了 customer_source 的计划列各出一条指向 customer 的边，带目标数据源 ID 与名字；不认识的数据源不带名字', () => {

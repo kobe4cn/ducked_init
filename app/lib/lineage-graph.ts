@@ -1,6 +1,6 @@
-// app/lib/lineage-graph.ts —— 数据地图的关系图：由血缘的关系边与已接入的标准层表画出节点与边（指向 customer 的经 _identities 关联，
+// app/lib/lineage-graph.ts —— 数据地图的关系图：由血缘的关系边（内置的、跨源引用的与登记关系）与已接入的标准层表画出节点与边（指向 customer 的经 _identities 关联，
 // event.device_id 经 _device_owner 归到消费者，口径见 ADR-0019；映射里声明的跨源引用标在指向 customer 的边上，ADR-0030），用 dagre 算好坐标；_identities 节点挂上匹配规则与最近一次打通的摘要；
-// 打开 showAll 时把未接入的标准实体与它们的内置关系也画出来，标为未接入；点表节点给出示例 SQL，
+// 打开 showAll 时把未接入的标准实体、已发布自定义实体（registered，含指向它们的登记关系边）也画出来，标为未接入；点表节点给出示例 SQL，
 // 一律按租户湖挂载为 lake 来写（ADR-0001/0008），不带连接方式与凭据。前后端共用的纯函数
 import { Graph, layout } from '@dagrejs/dagre';
 import { CANONICAL_ENTITIES, entityOf } from './canonical-model';
@@ -35,11 +35,13 @@ export interface GraphNode {
 
 /**
  * connected：两端都已接入；fromField：起点字段，只挂在指向标准实体的 ref / identity 边上，用来对上合并后的孤儿统计（ADR-0019）；
- * crossSource：映射里声明的跨源引用指向的数据源（ADR-0030），按出现顺序，不知道名字时 name 为 null
+ * crossSource：映射里声明的跨源引用指向的数据源（ADR-0030），按出现顺序，不知道名字时 name 为 null；
+ * custom：登记关系（ADR-0019），来自最新已发布自定义实体登记上的关系，不是标准模型内置的
  */
 export interface GraphEdge {
   id: string; source: string; target: string; kind: 'ref' | 'identity' | 'device'; label: string; connected: boolean; fromField?: string;
   crossSource?: { sourceId: string; name: string | null }[];
+  custom?: true;
 }
 
 export interface RelationGraph { nodes: GraphNode[]; edges: GraphEdge[] }
@@ -69,12 +71,16 @@ export function crossSourceLabel(edge: Pick<GraphEdge, 'crossSource'>): string |
 /** 跨源边的 data-cross-source：目标数据源 ID 以逗号连接；不是跨源边时为 undefined（不出属性） */
 export const crossSourceIds = (edge: Pick<GraphEdge, 'crossSource'>) => edge.crossSource?.map(s => s.sourceId).join(',');
 
-export function relationGraph(input: { edges: LineageEdge[]; connected: string[]; showAll: boolean; identity?: IdentityInfo | null }): RelationGraph {
+export function relationGraph(input: { edges: LineageEdge[]; connected: string[]; showAll: boolean; registered?: string[]; identity?: IdentityInfo | null }): RelationGraph {
   const connected = [...new Set(input.connected)];
   const entity = (id: string, live: boolean): Omit<GraphNode, 'x' | 'y'> =>
     ({ id, label: entityOf(id)?.label ?? id, kind: 'entity', connected: live, width: NODE_WIDTH, height: NODE_HEIGHT });
   const nodes = connected.map(id => entity(id, true));
-  if (input.showAll) nodes.push(...CANONICAL_ENTITIES.filter(e => !connected.includes(e.name)).map(e => entity(e.name, false)));
+  // showAll 时把未接入的已发布自定义实体也画出来（标为未接入），否则指向它们的登记关系边会因为终点没有节点被丢掉
+  if (input.showAll) nodes.push(
+    ...CANONICAL_ENTITIES.filter(e => !connected.includes(e.name)).map(e => entity(e.name, false)),
+    ...(input.registered ?? []).filter(id => !connected.includes(id)).map(id => entity(id, false)),
+  );
   if (connected.includes('customer')) {
     nodes.push({
       id: IDENTITIES, label: IDENTITIES, kind: 'identity', connected: true, width: NODE_WIDTH,
@@ -98,7 +104,7 @@ export function relationGraph(input: { edges: LineageEdge[]; connected: string[]
     // 跨源引用合并到同一字段已有的边上（标准字段已有内置边），没有时（如扩展字段）另起一条
     let edge = edges.find(x => x.id === id);
     if (!edge) {
-      edge = { id, source, target, kind: e.kind, label, connected: liveIds.has(source) && liveIds.has(target), ...(toEntity && { fromField: e.from.field }) };
+      edge = { id, source, target, kind: e.kind, label, connected: liveIds.has(source) && liveIds.has(target), ...(toEntity && { fromField: e.from.field }), ...(e.custom && { custom: true }) };
       edges.push(edge);
     }
     if (e.customerSource && !edge.crossSource?.some(s => s.sourceId === e.customerSource)) {

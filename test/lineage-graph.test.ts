@@ -83,6 +83,33 @@ describe('关系图', () => {
     expect(new Set(g.nodes.map(n => n.x)).size).toBeGreaterThan(1);
   });
 
+  it('登记关系也画成边：两端都已接入时照常连接并标 custom；showAll 时未接入的已发布自定义实体补出节点，指向它的边标为未接入', () => {
+    const relations = [
+      { from: { entity: 'order', field: 'store_id' }, ref: { entity: 'custom_station', field: 'station_id' } },
+      { from: { entity: 'custom_station', field: 'district' }, ref: { entity: 'custom_district', field: 'district_id' } },
+    ];
+    const custom = deriveLineage({ plans: [], sources: [], relations }).edges;
+    const registered = ['custom_station', 'custom_district'];
+
+    // 两端都已接入：边照常画出；终点未接入（custom_district 没有已发布映射）时不加 showAll 就没有节点，边也不出
+    const g = relationGraph({ edges: custom, connected: ['order', 'custom_station'], showAll: false, registered });
+    expect(g.edges.find(e => e.id === 'ref:order.store_id->custom_station')).toMatchObject({
+      source: 'order', target: 'custom_station', kind: 'ref', connected: true, fromField: 'store_id', custom: true,
+    });
+    expect(g.nodes.some(n => n.id === 'custom_district')).toBe(false);
+    expect(g.edges.some(e => e.id === 'ref:custom_station.district->custom_district')).toBe(false);
+
+    // showAll：未接入的已发布自定义实体补出节点（否则指向它的边会因为终点没有节点被丢掉），边标为未接入
+    const all = relationGraph({ edges: custom, connected: ['order', 'custom_station'], showAll: true, registered });
+    expect(all.nodes.find(n => n.id === 'custom_district')).toMatchObject({ label: 'custom_district', kind: 'entity', connected: false });
+    expect(all.edges.find(e => e.id === 'ref:custom_station.district->custom_district')).toMatchObject({ connected: false, custom: true });
+    // 内置的未接入标准实体照旧
+    expect(all.nodes.find(n => n.id === 'product')).toMatchObject({ connected: false });
+    expect(all.edges.find(e => e.id === 'ref:order_item.product_id->product')).toMatchObject({ connected: false });
+    // 同一条边只画一条：不传 registered 的边不带 custom
+    expect(graphOf(['order', 'custom_station']).edges.every(e => !('custom' in e))).toBe(true);
+  });
+
   it('显示未接入的标准实体时，未接入的实体出节点并标为未接入，两端有一端未接入的边也是未接入', () => {
     const g = graphOf(['customer', 'coupon'], { showAll: true });
     expect(g.nodes.find(n => n.id === 'coupon_template')).toMatchObject({ label: '券模板', kind: 'entity', connected: false });

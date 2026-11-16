@@ -1,7 +1,8 @@
 // app/routes/lineage.tsx —— 数据地图（需登录，任何角色）：关系图画出已接入的标准层表与 _identities、_device_owner 之间的关系，
 // 图下服务端渲染一份表与关系的列表；点表节点（?node=）给出按租户湖挂载为 lake 写的示例 SQL。
-// _identities 显示匹配规则与最近一次打通的摘要（只有计数）；列表里已接入、指向标准实体的内置关系带最近一次合并后的孤儿比例，展开看行数与样例键
-// （样例键只给有 sources:read 的成员，ADR-0019/0005）；映射里声明了跨源引用的边标「跨源 · <数据源名>」（data-cross-source，没有 sources:read 时不带名字，ADR-0030）；?all=1 时把未接入的标准实体与它们的内置关系也画出来，灰显。
+// _identities 显示匹配规则与最近一次打通的摘要（只有计数）；列表里已接入、指向标准实体的关系边（标准模型内置的与最新已发布自定义实体登记上的登记关系，
+// 起点可以是标准实体字段含 x_ 扩展字段，ADR-0019）带最近一次合并后的孤儿比例，展开看行数与样例键
+// （样例键只给有 sources:read 的成员，ADR-0019/0005）；映射里声明了跨源引用的边标「跨源 · <数据源名>」（data-cross-source，没有 sources:read 时不带名字，ADR-0030）；?all=1 时把未接入的标准实体与已发布自定义实体（及它们的关系）也画出来，灰显。
 // 流向图（?tab=flow）画源表 → 映射 → 标准层表 → 打通表，带各映射最近一次合并与标准层表行数（取自任务结果，不查湖），图下同样有一份列表；
 // 只对有 sources:read 的成员开放，没有权限时回到关系图，源表名与映射信息都不下发。
 // 点已接入的标准层表（关系图 ?node=<entity>，流向图 ?node=silver.<entity>）在右侧抽屉列出字段明细：有 sources:read 时带各映射的源表、源列、表达式、
@@ -24,7 +25,7 @@ import { catalogFor } from '~/.server/assistant/tools';
 import { BusinessNoteError, entityNoteHistory, saveBusinessNote } from '~/.server/business-notes';
 import { expand } from '~/.server/catalog';
 import { noteKey } from '~/lib/business-note-key';
-import { publishedCustomEntities } from '~/.server/custom-entities';
+import { allRelations, publishedCustomEntities, type RegisteredEntity } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
 import { getInspectStatus, InspectError, inspectLakeNow } from '~/.server/lake-inspect';
@@ -97,10 +98,18 @@ function IdentityChanges({ summary }: { summary: NonNullable<IdentityInfo['summa
 const NODE_KINDS = { entity: '标准层表', identity: '身份对应', device: '设备归属' } as const;
 const EDGE_KINDS = { ref: '内置关系', identity: '经 _identities', device: '经 _device_owner' } as const;
 
+/** 表与关系列表「关系」列：登记关系（ADR-0019）单独标出，不用「内置关系」；指向 customer 的带经 _identities */
+function edgeKindLabel(e: Pick<GraphEdge, 'kind' | 'custom' | 'target'>): string {
+  if (!e.custom) return EDGE_KINDS[e.kind];
+  return e.target === 'customer' ? '登记关系 · 经 _identities' : '登记关系';
+}
+
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requireMember(request);
   const plans = await publishedPlans(getDb(), member.tenant.id);
   const connected = [...new Set(plans.map(p => p.entity))].sort();
+  // 最新已发布自定义实体登记：登记关系（ADR-0019）的关系边从这里推导，抽屉里自定义实体的字段说明也取自它
+  const published = await publishedCustomEntities(getDb(), member.tenant.id);
   const searchParams = new URL(request.url).searchParams;
   const showAll = searchParams.get('all') === '1';
   let rules: readonly string[] | null;
@@ -114,14 +123,14 @@ export async function loader({ request }: Route.LoaderArgs) {
   const canFlow = can(member.role, 'sources:read');
   // 只取数据源的名字与种类，不带连接配置；不下发合并计划（里面有列与表达式）。没有 sources:read 时跨源边不带数据源名
   const sources = canFlow ? (await listSources(member)).map(({ id, name, kind }) => ({ id, name, kind })) : [];
-  const lineage = deriveLineage({ plans, sources });
+  const lineage = deriveLineage({ plans, sources, relations: [...published.values()].flatMap(e => e.relations ?? []) });
   const graph = relationGraph({
-    edges: lineage.edges, connected, showAll,
+    edges: lineage.edges, connected, showAll, registered: [...published.keys()],
     identity: { rules, summary: summary && { groups: summary.groups, records: summary.records, merged: summary.merged, split: summary.split } },
   });
   const node = searchParams.get('node');
   const sql = node ? sampleSql(node, graph) : null;
-  const edgeStats = await relationStatsByEdge(member.tenant.id, graph, canFlow);
+  const edgeStats = await relationStatsByEdge(member.tenant.id, graph, published, canFlow);
   const tab = tabOf(request, canFlow);
   const drawerEntity = drawerEntityOf(node, connected);
   const focusParam = searchParams.get('focus');
@@ -141,7 +150,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     const merges = Object.fromEntries(Object.entries(last).map(([id, r]) => [id, flowMerge(r)]));
     if (focusEntity) {
       const canonical = entityOf(focusEntity);
-      const custom = canonical ? undefined : (await publishedCustomEntities(getDb(), member.tenant.id)).get(focusEntity);
+      const custom = canonical ? undefined : published.get(focusEntity);
       // 字段顺序同抽屉；只下发写入这张表的血缘与它用到的数据源名字
       const own = lineage.tables.filter(t => t.entity === focusEntity);
       focus = {
@@ -158,7 +167,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     if (tableNode) tableDrawer = tableImpact(lineage, tableNode);
     if (drawerEntity) {
       const canonical = entityOf(drawerEntity);
-      const custom = canonical ? undefined : (await publishedCustomEntities(getDb(), member.tenant.id)).get(drawerEntity);
+      const custom = canonical ? undefined : published.get(drawerEntity);
       // 兜底统计里是源端的取值，只给有 sources:read 的人
       const fallbacks = canFlow ? Object.fromEntries(Object.entries(last).map(([id, r]) => [id, 'fallback' in r ? r.fallback : undefined])) : {};
       const declared = canonical?.fields ?? custom?.fields ?? [];
@@ -222,16 +231,18 @@ export async function loader({ request }: Route.LoaderArgs) {
 }
 
 /**
- * 已接入、指向标准实体的内置关系边在最近一次合并后的孤儿统计（ADR-0019），按边 id；最近一次合并没有统计到的
- * （还没合并过，或合并之后才发布的）为 unmerged。样例键是标准层里的取值，同兜底统计只给有 sources:read 的人
+ * 已接入、指向标准实体的关系边（内置与登记关系，ADR-0019）在最近一次合并后的孤儿统计，按边 id；最近一次合并没有统计到的
+ * （还没合并过，或合并之后才发布的）为 unmerged。一个字段最多一个 ref，按起点在全部关系（内置 ref 加已发布登记上的，含
+ * x_ 扩展字段与自定义实体的起点）里找到的那条就是对上的关系。样例键是标准层里的取值，同兜底统计只给有 sources:read 的人
  */
-async function relationStatsByEdge(tenantId: string, graph: { edges: GraphEdge[] }, withSamples: boolean) {
+async function relationStatsByEdge(tenantId: string, graph: { edges: GraphEdge[] }, published: Map<string, RegisteredEntity>, withSamples: boolean) {
   const latest = await latestRelationStats(tenantId);
+  const relations = allRelations(published);
   const stats: Record<string, RelationStat> = {};
   for (const edge of graph.edges) {
-    const ref = edge.connected && edge.fromField ? entityOf(edge.source)?.fields.find(f => f.name === edge.fromField)?.ref : undefined;
-    if (!ref) continue;
-    const relation = { from: { entity: edge.source, field: edge.fromField! }, ref };
+    if (!edge.connected || !edge.fromField) continue;
+    const relation = relations.find(r => r.from.entity === edge.source && r.from.field === edge.fromField);
+    if (!relation) continue;
     const stat = latest?.relations.find(r => relationText(r) === relationText(relation)) ?? { ...relation, status: 'unmerged' as const };
     stats[edge.id] = 'samples' in stat && !withSamples ? { ...stat, samples: [] } : stat;
   }
@@ -422,7 +433,7 @@ export default function Lineage({ loaderData, actionData }: Route.ComponentProps
                   >
                     <TableCell className="font-mono text-xs">{e.source}</TableCell>
                     <TableCell className="font-mono text-xs">{e.target}</TableCell>
-                    <TableCell className={e.connected ? 'text-slate-500' : ''}>{EDGE_KINDS[e.kind]}</TableCell>
+                    <TableCell className={e.connected ? 'text-slate-500' : ''}>{edgeKindLabel(e)}</TableCell>
                     <TableCell className="whitespace-normal font-mono text-xs">
                       {e.label}
                       {e.crossSource && <Badge variant="outline" className="ml-2 font-sans">{crossSourceLabel(e)}</Badge>}
