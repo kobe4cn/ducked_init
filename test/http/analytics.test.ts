@@ -7,7 +7,7 @@
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
+import { dslVersions, snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { createDefinition } from '../../app/.server/dsl-definitions';
 import { listSnapshots, readTemplateSnapshot } from '../../app/.server/snapshots';
@@ -163,10 +163,13 @@ describe('分析页 · 指标与标签列表', () => {
     const taskRows = await getDb().insert(tasks).values([
       { tenantId: acme, kind: 'gold.rfm', status: 'succeeded' },
       { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
+      { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
     ]).returning();
     const [rfm, revenue] = await getDb().insert(snapshots).values([
       { tenantId: acme, template: 'rfm', taskId: taskRows[0]!.id, table: `gold.rfm__${taskRows[0]!.id}`, params: { asOf: '2024-07-01' }, rowCount: 5, expiresAt: new Date(Date.now() + 86_400_000) },
       { tenantId: acme, template: 'metric:revenue', taskId: taskRows[1]!.id, table: `gold.metric__${taskRows[1]!.id}`, params: { asOf: '2024-08-01' }, trigger: 'manual', rowCount: 3, expiresAt: new Date(Date.now() + 86_400_000) },
+      // 同一定义更早的一张：定义页的「快照」区要排在 2024-08-01 后面，「最近计算」也不取它
+      { tenantId: acme, template: 'metric:revenue', taskId: taskRows[2]!.id, table: `gold.metric__${taskRows[2]!.id}`, params: { asOf: '2024-07-15' }, rowCount: 2, createdAt: new Date(Date.now() - 86_400_000), expiresAt: new Date(Date.now() + 86_400_000) },
     ]).returning();
     const viewer = await loginAs(app, 'viewer@acme.com');
 
@@ -185,9 +188,12 @@ describe('分析页 · 指标与标签列表', () => {
     expect(filtered).toContain(`data-snapshot="${revenue!.id}"`);
     expect(filtered).not.toContain(`data-snapshot="${rfm!.id}"`);
 
-    // 定义页的「快照」区按时间列出本定义的快照（版本、统计日、来源、行数）
+    // 定义页的「快照」区按时间倒序列出本定义的快照（版本、统计日、来源、行数）
     const page = await (await viewer.get('/analytics/definitions/metric/revenue')).text();
     expect(page).toMatch(new RegExp(`data-definition-snapshot="[^"]+"(?:(?!</tr>).)*>2024-08-01<`, 's'));
+    expect(page).toMatch(new RegExp(`data-definition-snapshot="[^"]+"(?:(?!</tr>).)*>2024-07-15<`, 's'));
+    expect(page.indexOf('2024-08-01')).toBeGreaterThan(-1);
+    expect(page.indexOf('2024-08-01')).toBeLessThan(page.indexOf('2024-07-15'));
   });
 
   it('列表不显示其他租户的定义；类型与状态筛选走 URL；没有定义的租户显示空状态，有起草权限的成员看到「新建定义」入口', async () => {
@@ -212,6 +218,9 @@ describe('分析页 · 指标与标签列表', () => {
       const filtered = await (await analyst.get(`/analytics?status=${status}`)).text();
       expect(filtered).toContain('data-definition-row="metric:revenue"');
     }
+    // 发布之后出现在「已发布」里
+    await getDb().update(dslVersions).set({ status: 'published' }).where(eq(dslVersions.status, 'draft'));
+    expect(await (await analyst.get('/analytics?status=published')).text()).toContain('data-definition-row="metric:revenue"');
 
     // 空租户：有起草权限的成员看到空状态与「新建定义」入口
     const other = await newTenant('other');
