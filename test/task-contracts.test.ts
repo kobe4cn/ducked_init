@@ -148,12 +148,12 @@ describe('任务契约', () => {
     expect(() => readResult('lake.inspect', { kind: 'silver.keycheck', result: { entities: [] } })).toThrow();
   });
 
-  it('契约声明领取时要准备的凭据（needs）：源连接只有四个源任务，盐只有合并，密钥只有服务库', () => {
+  it('契约声明领取时要准备的凭据（needs）：源连接只有四个源任务，盐只有合并与主键冲突体检，密钥只有服务库', () => {
     const needsOf = (contract: TaskContract<unknown, unknown>) => contract.needs;
     const kindsWith = (need: keyof TaskNeeds) =>
       Object.entries(CONTRACTS).filter(([, contract]) => needsOf(contract)?.[need] === true).map(([kind]) => kind);
     expect(kindsWith('source')).toEqual(['source.profile', 'source.sync', 'source.keycheck', 'source.verify']);
-    expect(kindsWith('piiSalt')).toEqual(['silver.merge']);
+    expect(kindsWith('piiSalt')).toEqual(['silver.keycheck', 'silver.merge']);
     expect(kindsWith('servingKey')).toEqual(['serving.build']);
   });
 
