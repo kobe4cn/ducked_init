@@ -9,6 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
+import { createDefinition } from '../../app/.server/dsl-definitions';
 import { listSnapshots, readTemplateSnapshot } from '../../app/.server/snapshots';
 import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
@@ -128,6 +129,93 @@ describe('分析页', () => {
     expect(await (await browser.get('/analytics')).text()).not.toContain(snapshot.id);
     expect((await browser.get(`/analytics/snapshots/${snapshot.id}`)).status).toBe(404);
     expect((await browser.get('/analytics/snapshots/not-a-uuid')).status).toBe(404);
+  });
+});
+
+/** 指标定义的 YAML：在空租户上就能通过校验（不依赖已发布的登记与映射） */
+const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n';
+
+describe('分析页 · 指标与标签列表', () => {
+  beforeEach(fresh);
+
+  it('只有草稿的定义也出现在列表里：viewer 看到键与类型、「未发布」「有草稿」及最后保存人、「未计算」，链接到定义页，页面没有新建入口', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    const html = await (await viewer.get('/analytics')).text();
+    const row = /data-definition-row="metric:revenue"(?:(?!<\/tr>).)*/s;
+    expect(html).toMatch(row);
+    expect(html).toMatch(/href="\/analytics\/definitions\/metric\/revenue"[^>]*>revenue</);
+    expect(html).toMatch(new RegExp('data-definition-row="metric:revenue"(?:(?!</tr>).)*>指标<', 's'));
+    expect(html).toMatch(new RegExp('data-definition-row="metric:revenue"(?:(?!</tr>).)*>未发布<', 's'));
+    expect(html).toMatch(new RegExp('data-definition-row="metric:revenue"(?:(?!</tr>).)*有草稿 · analyst@acme\\.com<', 's'));
+    expect(html).toMatch(new RegExp('data-definition-row="metric:revenue"(?:(?!</tr>).)*>未计算<', 's'));
+    expect(html).not.toContain('/analytics/definitions/new');
+  });
+
+  it('快照表区分系统内置模板与自建指标：rfm 显示「分析模板」「系统内置」，metric:revenue 显示「指标」「自建」及创建人；可按定义筛选；定义页的「快照」区按时间列出', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const taskRows = await getDb().insert(tasks).values([
+      { tenantId: acme, kind: 'gold.rfm', status: 'succeeded' },
+      { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
+    ]).returning();
+    const [rfm, revenue] = await getDb().insert(snapshots).values([
+      { tenantId: acme, template: 'rfm', taskId: taskRows[0]!.id, table: `gold.rfm__${taskRows[0]!.id}`, params: { asOf: '2024-07-01' }, rowCount: 5, expiresAt: new Date(Date.now() + 86_400_000) },
+      { tenantId: acme, template: 'metric:revenue', taskId: taskRows[1]!.id, table: `gold.metric__${taskRows[1]!.id}`, params: { asOf: '2024-08-01' }, rowCount: 3, expiresAt: new Date(Date.now() + 86_400_000) },
+    ]).returning();
+    const viewer = await loginAs(app, 'viewer@acme.com');
+
+    const html = await (await viewer.get('/analytics')).text();
+    expect(html).toMatch(new RegExp(`data-snapshot="${rfm!.id}"(?:(?!</tr>).)*>分析模板<`, 's'));
+    expect(html).toMatch(new RegExp(`data-snapshot="${rfm!.id}"(?:(?!</tr>).)*>系统内置<`, 's'));
+    expect(html).toMatch(new RegExp(`data-snapshot="${revenue!.id}"(?:(?!</tr>).)*>指标<`, 's'));
+    expect(html).toMatch(new RegExp(`data-snapshot="${revenue!.id}"(?:(?!</tr>).)*>自建 · analyst@acme\\.com<`, 's'));
+
+    // 快照表按定义筛选：只剩 revenue 这一张
+    const filtered = await (await viewer.get('/analytics?definition=metric:revenue')).text();
+    expect(filtered).toContain(`data-snapshot="${revenue!.id}"`);
+    expect(filtered).not.toContain(`data-snapshot="${rfm!.id}"`);
+
+    // 定义页的「快照」区按时间列出本定义的快照（版本、统计日、来源、行数）
+    const page = await (await viewer.get('/analytics/definitions/metric/revenue')).text();
+    expect(page).toMatch(new RegExp(`data-definition-snapshot="[^"]+"(?:(?!</tr>).)*>2024-08-01<`, 's'));
+  });
+
+  it('列表不显示其他租户的定义；类型与状态筛选走 URL；没有定义的租户显示空状态，有起草权限的成员看到「新建定义」入口', async () => {
+    const acme = await newTenant('acme');
+    await createDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'revenue', REVENUE);
+    await createDefinition(await memberOf(await newTenant('globex'), 'analyst@globex.com', 'analyst'), 'metric', 'churn_score', REVENUE);
+    const analyst = await loginAs(app, 'analyst@acme.com');
+
+    const html = await (await analyst.get('/analytics')).text();
+    expect(html).toContain('data-definition-row="metric:revenue"');
+    expect(html).not.toContain('data-definition-row="metric:churn_score"');
+
+    // 类型筛选走 URL：?type=tag 时没有标签定义，显示「没有符合条件的定义」而不是整个列表的空状态
+    const typed = await (await analyst.get('/analytics?type=tag')).text();
+    expect(typed).not.toContain('data-definition-row="metric:revenue"');
+    expect(typed).toContain('没有符合条件的定义');
+    expect(typed).toMatch(/data-tab="tag"[^>]*aria-current="page"/);
+
+    // 状态筛选：只有草稿的定义不在「已发布」里，在「有草稿」「未发布」里
+    expect(await (await analyst.get('/analytics?status=published')).text()).not.toContain('data-definition-row="metric:revenue"');
+    for (const status of ['draft', 'unpublished']) {
+      const filtered = await (await analyst.get(`/analytics?status=${status}`)).text();
+      expect(filtered).toContain('data-definition-row="metric:revenue"');
+    }
+
+    // 空租户：有起草权限的成员看到空状态与「新建定义」入口
+    const other = await newTenant('other');
+    await memberOf(other, 'analyst@other.com', 'analyst');
+    const empty = await (await (await loginAs(app, 'analyst@other.com')).get('/analytics')).text();
+    expect(empty).toContain('data-definitions-empty');
+    expect(empty).toContain('还没有任何指标或标签定义');
+    expect(empty).toContain('href="/analytics/definitions/new"');
   });
 });
 

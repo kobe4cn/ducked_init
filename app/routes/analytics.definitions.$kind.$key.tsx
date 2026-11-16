@@ -3,7 +3,7 @@
 // 以及各版本的作者与最后保存的人；草稿由最后保存它的人以外的另一位有发布权限的成员发布（发布后以当天入队一次计算，成功后快照出现在分析页），也可以丢弃。
 // 有草稿且有已发布版本时可以预览发布的影响：指标与受影响的下游标签按两版结果对比的消费者计数（只读挂载上按今天算，不出消费者 ID）。
 // 发布过的定义显示最近一次刷新的时间与来源；有发布权限的成员可以按今天以生效版本重新计算，有早于生效版本的未过期快照时可以按各自的统计日以生效版本回刷
-// （都连同下游标签），没有权限时说明原因。
+// （都连同下游标签），没有权限时说明原因。本定义的全部快照（含已过期）按时间倒序列在「快照」区——分析页每个定义只留最新一张（#798）。
 // 有修改与删除权限的成员可以删除定义（被已发布标签引用的指标删不了）。
 // 已发布过的定义带业务知识面板（ADR-0046）：alias.* / claim.* / note.* / subject.* / proposal.* 的提交交给 handleKnowledgeIntent，权限由领域函数检查，查看者看得到、提交 403
 import { AlertTriangle, CheckCircle2, Lock, RefreshCw, Trash2 } from 'lucide-react';
@@ -19,7 +19,7 @@ import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.ser
 import { navFor } from '~/.server/nav';
 import { UNLINKED } from '~/.server/pipeline/dsl/metric-spec';
 import { PublishError, publishReason } from '~/.server/publishing';
-import { triggerLabel } from '~/.server/snapshots';
+import { listSnapshots, triggerLabel } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { KnowledgePanel } from '~/components/knowledge-panel';
@@ -28,6 +28,7 @@ import { PageHeader } from '~/components/page-header';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { cn } from '~/lib/utils';
 
 export function meta({ loaderData }: Route.MetaArgs) {
   return [{ title: `${loaderData ? `${loaderData.label} ${loaderData.key}` : '定义'} · CRM 数据分析平台` }];
@@ -64,6 +65,17 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     backfill: d.backfill,
     /** 最近一次刷新的时间与来源；还没有快照时为 null */
     lastRefresh: d.lastRefresh && { at: d.lastRefresh.at.toISOString(), trigger: triggerLabel(d.lastRefresh.trigger) },
+    /** 本定义的全部快照（含已过期），按时间倒序；分析页的列表每个定义只留最新一张，历史在这里（#798） */
+    snapshots: (await listSnapshots(member.tenant.id, `${d.kind}:${d.key}`)).map(s => ({
+      id: s.id,
+      version: s.definitionVersion,
+      asOf: typeof s.params.asOf === 'string' ? s.params.asOf : null,
+      trigger: triggerLabel(s.trigger),
+      rowCount: s.rowCount,
+      expired: !!s.expiredAt,
+      createdAt: s.createdAt.toISOString(),
+      expiresAt: s.expiresAt.toISOString(),
+    })),
     /** 没有发布权限时重新计算、回刷不了的原因 */
     publishDenied: can(member.role, 'publish') ? null : deniedReason('publish'),
     kind: d.kind,
@@ -170,7 +182,7 @@ function PublishAction({ denied, intent, disabled, children }: { denied: string 
 export default function Definition({ loaderData, actionData }: Route.ComponentProps) {
   const {
     email, nav, canDraft, canDelete, dependents, justSaved, justPublished, justBackfilled, justRecomputed, backfill, lastRefresh, publishDenied,
-    kind, key, label, yaml, published, compiled, unlinked, versions, targetId, panel, system,
+    kind, key, label, yaml, published, compiled, unlinked, versions, targetId, panel, system, snapshots,
   } = loaderData;
   const navigation = useNavigation();
   const submitting = navigation.state === 'submitting';
@@ -390,6 +402,37 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
             </div>
             <PublishAction denied={publishDenied} intent="backfill" disabled={submitting || !backfill.snapshots}><RefreshCw />回刷</PublishAction>
           </div>
+        </div>
+      )}
+
+      {snapshots.length > 0 && (
+        <div className="rounded-2xl border bg-white p-6 shadow-sm">
+          <h2 className="mb-1 font-medium">快照</h2>
+          <p className="mb-4 max-w-2xl text-sm text-slate-500">本定义按时间倒序的全部快照；同一统计日多次计算各占一行，旧的保留到过期。</p>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>定义版本</TableHead>
+                <TableHead>统计日</TableHead>
+                <TableHead>来源</TableHead>
+                <TableHead>消费者</TableHead>
+                <TableHead>创建时间</TableHead>
+                <TableHead>过期时间</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {snapshots.map(s => (
+                <TableRow key={s.id} data-definition-snapshot={s.id} className={cn(s.expired && 'text-slate-400')}>
+                  <TableCell>{s.version ? `第 ${s.version} 版` : '任务参数'}</TableCell>
+                  <TableCell>{s.asOf ?? '—'}</TableCell>
+                  <TableCell>{s.trigger}</TableCell>
+                  <TableCell>{s.rowCount.toLocaleString('zh-CN')}</TableCell>
+                  <TableCell className="text-slate-500">{time(s.createdAt)}</TableCell>
+                  <TableCell className={cn(!s.expired && 'text-slate-500')}>{s.expired ? `已过期 · ${time(s.expiresAt)}` : time(s.expiresAt)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
         </div>
       )}
 
