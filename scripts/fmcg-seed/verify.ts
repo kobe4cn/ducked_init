@@ -32,6 +32,20 @@ const TRUTH = join(HERE, 'out', args.set!, 'truth.duckdb');
 const step = (name: string) => !args.only || args.only.split(',').includes(name);
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
+/**
+ * 统一消费者的城市期望（第 2 节与 revenue_by_city 同一口径，ADR-0027）：会员中心优先（survivorship 1），其余按 updated_at 取最新的非空值。
+ * 会员中心、扫码平台、奶站、抖音的城市与更新时间在真值 rec 里；活动报名的「城市」是本人城市（seed.ts 取 person.city），
+ * 映射没有 updated_at（平台按 NULLS LAST 排在最后），只在别的源都没有城市时补上
+ */
+const ECITY_SQL = `
+  SELECT g.consumer_id, arg_min(x.city, (x.pri, x.age)) AS city
+  FROM (
+    SELECT src, customer_id, city, CASE WHEN src = 'member' THEN 0 ELSE 1 END AS pri, -epoch(updated_utc) AS age
+    FROM t.rec WHERE city IS NOT NULL AND src IN ('member', 'scan', 'station', 'douyin')
+    UNION ALL
+    SELECT r.src, r.customer_id, p.city, 2, 0 FROM t.rec r JOIN t.person p USING (pid) WHERE r.src = 'activity' AND p.city IS NOT NULL
+  ) x JOIN rid USING (src, customer_id) JOIN gcons g USING (group_rid)
+  WHERE x.src IN (SELECT code FROM srcmap) GROUP BY 1`;
 
 const tenantId = await tenantIdBySlug(slug).catch(() => null);
 if (!tenantId) throw new Error(`没有租户 ${slug}`);
@@ -139,13 +153,12 @@ try {
 
   // ---------- 2. 统一消费者的属性与同意（ADR-0027） ----------
   if (step('consumer') && await has('_consumer')) {
-    // 城市：会员中心优先（survivorship 1），其余按 updated_at 取最新的非空值；只有会员中心、扫码平台、奶站、抖音映射了城市
-    await con.run(`CREATE TEMP TABLE ecity AS
-      SELECT g.consumer_id, arg_min(r.city, (CASE WHEN r.src = 'member' THEN 0 ELSE 1 END, -epoch(r.updated_utc))) AS city
-      FROM t.rec r JOIN rid USING (src, customer_id) JOIN gcons g USING (group_rid)
-      WHERE r.city IS NOT NULL AND r.src IN ('member', 'scan', 'station', 'douyin') AND r.src IN (SELECT code FROM srcmap) GROUP BY 1`);
-    show('统一消费者的城市（期望：不符为 0；K8 = 上海，第二轮 P01 = 北京）', await q(`
+    await con.run(`CREATE TEMP TABLE ecity AS ${ECITY_SQL}`);
+    // 平台多出：平台有城市、期望没有（只看真值里有的统一消费者）——只从期望一侧比对时看不到
+    show('统一消费者的城市（期望：不符与平台多出都为 0；K8 = 上海，第二轮 P01 = 北京）', await q(`
       SELECT count(*) AS 期望有城市, count(c.city) AS 平台有城市, count(*) FILTER (WHERE c.city IS DISTINCT FROM e.city) AS 不符,
+        (SELECT count(*) FROM lake.silver._consumer c2 WHERE c2.city IS NOT NULL AND c2.consumer_id IN (SELECT consumer_id FROM gcons)
+          AND c2.consumer_id NOT IN (SELECT consumer_id FROM ecity)) AS 平台多出,
         (SELECT c2.city FROM lake.silver._consumer c2 JOIN gcons g ON g.consumer_id = c2.consumer_id JOIN rid ON rid.group_rid = g.group_rid WHERE rid.pid = 99000014 LIMIT 1) AS K8,
         (SELECT c2.city FROM lake.silver._consumer c2 JOIN gcons g ON g.consumer_id = c2.consumer_id JOIN rid ON rid.group_rid = g.group_rid WHERE rid.pid = 99000001 LIMIT 1) AS P01
       FROM ecity e LEFT JOIN lake.silver._consumer c USING (consumer_id)`));
@@ -254,10 +267,7 @@ try {
     const ledger = facts('t.ledger', `'member'`);
     /** 统一消费者的城市（与第 2 节同一口径）：只在 revenue_by_city 用到，按需建 */
     const ecityReady = async () => {
-      await con.run(`CREATE TEMP TABLE IF NOT EXISTS ecity AS
-        SELECT g.consumer_id, arg_min(r.city, (CASE WHEN r.src = 'member' THEN 0 ELSE 1 END, -epoch(r.updated_utc))) AS city
-        FROM t.rec r JOIN rid USING (src, customer_id) JOIN gcons g USING (group_rid)
-        WHERE r.city IS NOT NULL AND r.src IN ('member', 'scan', 'station', 'douyin') AND r.src IN (SELECT code FROM srcmap) GROUP BY 1`);
+      await con.run(`CREATE TEMP TABLE IF NOT EXISTS ecity AS ${ECITY_SQL}`);
       return 'ecity';
     };
     /** 每个指标的期望：列为 consumer_id、维度…、value；dims 是维度列名 */

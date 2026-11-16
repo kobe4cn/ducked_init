@@ -135,7 +135,7 @@ S3 都是：端点、区域、Access Key 见 `credentials.txt`，路径风格 pa
 | T2.6 | **P05 代填号**：activity_s3 先**直接**映射 `signups` 表为消费者（字段照 `activity_s3.signups_clean.customer.yaml`，只把 `view: signups_clean`、`view_key` 换成 `table: signups`）发布 | 误合并 4 个统一消费者，每个是 1 位导购 + 10 个路人（11 个真实的人） |
 | T2.7 | 停用 T2.6 的映射：eng 在映射页「提议停用」，admin「确认停用」（ADR-0031） | 两人分别操作；确认后入队合并，撤下它在标准层的行 |
 | T2.8 | 建源视图 `signups_clean`（`views/activity_s3.signups_clean.sql`），发布后映射 `activity_s3.signups_clean.customer.yaml` | `verify.ts --only identity`：缺失、被拆开、误合并、多出都是 0；**统一消费者 69,335** |
-| T2.9 | **K8**：`verify.ts --only consumer`（发完 T4 的其余映射再看同意） | 城市不符 0，K8 = 上海（会员中心 `survivorship.priority: 1`）。可选：把会员映射的 `survivorship` 删掉发一版，K8 变杭州（扫码平台最新），再改回来 |
+| T2.9 | **K8**：`verify.ts --only consumer`（发完 T4 的其余映射再看同意） | 城市不符 0、平台多出 0，K8 = 上海（会员中心 `survivorship.priority: 1`）。可选：把会员映射的 `survivorship` 删掉发一版，K8 变杭州（扫码平台最新），再改回来 |
 
 ### T3 主键的四种意思（eng 起草、admin 发布）
 
