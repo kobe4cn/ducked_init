@@ -242,6 +242,7 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
                     { key: 'tag', label: '标签', href: href({ type: 'tag' }) },
                   ]}
                   current={typeFilter ?? 'all'}
+                  keepScroll
                 />
                 <PillTabs
                   tabs={[
@@ -249,6 +250,7 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
                     ...STATUS_TABS.map(t => ({ key: t.key, label: t.label, href: href({ status: t.key }) })),
                   ]}
                   current={statusFilter ?? 'all'}
+                  keepScroll
                 />
               </div>
               {definitions.length ? (
