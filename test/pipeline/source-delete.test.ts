@@ -1,12 +1,15 @@
 // test/pipeline/source-delete.test.ts —— 删除数据源的接缝（ADR-0044）：deleteBlockers 列出全部拒绝原因（已发布没停用的映射、跨源引用方、排队或运行中的源任务与合并），
 // deleteSource 满足条件时丢弃没发布过的映射与源视图、清空同步范围与凭据、打上删除标记、入队 source.drop 并记审计；已删除的数据源各处查不到，可以重新登记同名的；
 // source.drop 删掉原始层的三个 schema 与文件，标准层不动；已删除的数据源不被定时同步与核对、工作台原始层视图、映射列表、跨源引用与恢复映射用到
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, mappingVersions, sources, sourceTables, sourceViews, tasks } from '../../app/.server/db/schema';
+import { lakeRow } from '../../app/.server/lake';
+import { listLakeFiles } from '../../app/.server/lake-storage';
 import { confirmDisable, createMapping, listMappings, publishedPlans, publishMapping, requestDisable, restoreMapping, saveDraft } from '../../app/.server/mappings';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { requireSource, sourceIdByName } from '../../app/.server/source-config';
@@ -15,6 +18,7 @@ import { enqueueDueVerifies } from '../../app/.server/source-verify';
 import { createSourceView } from '../../app/.server/source-views';
 import { enqueueTask } from '../../app/.server/tasks';
 import { confirmWatermark, deleteBlockers, deleteSource, getSource, listSources, registerSource, relistSource, setSyncScope } from '../../app/.server/sources';
+import { removeUpload, storeUpload } from '../../app/.server/uploads';
 import { listCatalog, runQuery } from '../../app/.server/workbench';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, onLake, publish, runTask } from './fixtures';
@@ -246,5 +250,32 @@ describe('删除数据源', () => {
     await expect(saveDraft(author, crmOrders, CRM_ORDERS.replace('  customer_id: string(customer)\n', '  customer_id: { expr: string(customer), customer_source: 会员 }\n')))
       .rejects.toMatchObject({ issues: [expect.objectContaining({ message: expect.stringContaining('没有数据源 会员') })] });
     await expect(restoreMapping(author, customerMappings.loyalty)).rejects.toMatchObject({ status: 400, message: '数据源已删除' });
+  });
+
+  it('删除上传数据源后 _uploads/<dir>/ 下的文件被删除，别的上传数据源的文件还在；删除非上传数据源不动 _uploads/；目录已不在时再删不报错', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const uploads = async () => listLakeFiles(`${(await lakeRow(acme))!.dataPath}_uploads/`);
+    const csv = 'id,name,updated_at\n1,张三,2026-10-01 08:00:00\n2,李四,2026-10-02 09:30:00\n';
+    const dir = randomUUID();
+    const dir2 = randomUUID();
+    await storeUpload(acme, dir, 'signups', csv);
+    await storeUpload(acme, dir2, 'signups', csv);
+    const { id } = await registerSource(engineer, { kind: 'upload', name: '活动报名', dir, table: 'signups' });
+    await registerSource(engineer, { kind: 'upload', name: '秋季报名', dir: dir2, table: 'signups' });
+    await drain(); // 登记会入队采集，不 drain 的话 deleteBlockers 以「有排队中的源任务」拒删
+    expect(await uploads()).toHaveLength(2);
+
+    await deleteSource(engineer, id);
+    expect(await uploads()).toEqual([{ path: `${dir2}/signups.csv`, size: expect.any(Number) }]);
+
+    // 删除非上传数据源不动 _uploads/：本机 DuckDB 文件数据源指向的文件不归平台管（ADR-0044）
+    const { id: pgId } = await registerSource(engineer, await pgSourceInput(READER, '电商库'));
+    await drain();
+    await deleteSource(engineer, pgId);
+    expect(await uploads()).toEqual([{ path: `${dir2}/signups.csv`, size: expect.any(Number) }]);
+
+    // 目录已不在时再删一遍不报错（幂等）
+    await expect(removeUpload(acme, dir)).resolves.toBeUndefined();
   });
 });

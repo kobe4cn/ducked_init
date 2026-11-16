@@ -29,6 +29,7 @@ import { enqueueKeyCheck } from './source-key-check';
 import { ofSource } from './source-sync';
 import { insertTask } from './tasks';
 import { lockTenant } from './tenant-lock';
+import { removeUpload } from './uploads';
 import { looksSensitive } from '../lib/sensitive';
 
 export { SourceError, type SourceInput } from './source-config';
@@ -588,18 +589,21 @@ export async function sourceDeleteBlockers(actor: CurrentMember, sourceId: strin
 /**
  * 删除数据源（ADR-0044）：有发布权限的成员，deleteBlockers 没有原因时才能删（否则 400 并列出原因）。
  * 只软删：丢弃没发布过的映射与映射草稿、再丢弃没发布过的源视图与源视图草稿（映射引用源视图，顺序不能反），清空同步范围，
- * 凭据写成空串，打上删除标记，入队 source.drop 删掉湖里的原始层；已停用的映射与已发布版本保留，标准层里已合并的行也保留
+ * 凭据写成空串，打上删除标记，入队 source.drop 删掉湖里的原始层；上传数据源提交后还删掉 _uploads/<config.dir>/ 下的上传文件；
+ * 已停用的映射与已发布版本保留，标准层里已合并的行也保留
  */
 export async function deleteSource(actor: CurrentMember, sourceId: string) {
   assertCan(actor, 'publish');
   const tenantId = actor.tenant.id;
   await requireSource(tenantId, sourceId);
+  let uploadDir: string | undefined;
   await catalogTx(tenantId, async tx => {
     // 先锁源表行（与修改同步范围、恢复映射同序，不死锁），再锁数据源行（与入队同步、核对同一把锁），最后锁租户行（与发布、停用、入队合并互斥）
     await tx.select({ table: sourceTables.tableName }).from(sourceTables).where(eq(sourceTables.sourceId, sourceId)).for('update');
     const [row] = await tx.select().from(sources)
       .where(and(eq(sources.id, sourceId), eq(sources.tenantId, tenantId), isNull(sources.deletedAt))).for('update');
     if (!row) throw new SourceError('数据源不存在', 404);
+    if (row.kind === 'upload') uploadDir = row.config.dir;
     await lockTenant(tx, tenantId);
     const reasons = await deleteBlockers(tx, tenantId, sourceId);
     if (reasons.length) throw new SourceError(`不能删除数据源「${row.name}」：${reasons.join('；')}`);
@@ -620,4 +624,13 @@ export async function deleteSource(actor: CurrentMember, sourceId: string) {
       tenantId, actor, action: 'source.deleted', targetType: 'source', targetId: sourceId, detail: { name: row.name, kind: row.kind },
     });
   });
+  // 删除已提交，清上传目录失败只记日志不再抛错：不能因删不掉文件给用户 500；没有恢复已删数据源的功能，不会丢可恢复的数据。
+  // 用量不用同步更新，下一轮 refreshStorageUsage 扫桶重算会降下来
+  if (uploadDir) {
+    try {
+      await removeUpload(tenantId, uploadDir);
+    } catch (e) {
+      console.warn(`删除上传数据源后清理上传目录失败：tenant=${tenantId} dir=${uploadDir}`, e);
+    }
+  }
 }
