@@ -80,6 +80,36 @@ export function costOf(
   return ((promptTokens ?? 0) * price.inputPerMTok + (completionTokens ?? 0) * price.outputPerMTok) / 1_000_000;
 }
 
+/** 一组调用折算后的结果：各币种金额（先累加，显示时才保留 4 位小数）与已配价 / 未配价的调用次数 */
+export interface CostSummary {
+  byCurrency: Partial<Record<PriceCurrency, number>>;
+  pricedCalls: number;
+  unpricedCalls: number;
+}
+
+/** 把按 (purpose, model) 或单次调用的一组行折算成各币种金额（ADR-0057）：未配单价的模型只计 unpricedCalls，不当 0 算 */
+export function summarizeCost(
+  rows: { model: string; promptTokens: number | null; completionTokens: number | null; calls: number }[],
+  prices: Map<string, ModelPrice>,
+): CostSummary {
+  const summary: CostSummary = { byCurrency: {}, pricedCalls: 0, unpricedCalls: 0 };
+  for (const r of rows) {
+    const p = prices.get(r.model);
+    if (p === undefined) { summary.unpricedCalls += r.calls; continue; }
+    summary.byCurrency[p.currency] = (summary.byCurrency[p.currency] ?? 0) + costOf(r.promptTokens, r.completionTokens, p);
+    summary.pricedCalls += r.calls;
+  }
+  return summary;
+}
+
+/** 折算结果 → 展示文本：都没配价是「未配置单价」；否则「币种 金额（4 位小数）」按币种代码排序、用「 + 」连接，有未配价的在末尾加注 */
+export function formatCost(summary: CostSummary): string {
+  if (summary.pricedCalls === 0) return '未配置单价';
+  const parts = Object.entries(summary.byCurrency).sort(([a], [b]) => cmp(a, b))
+    .map(([currency, amount]) => `${currency} ${(amount ?? 0).toFixed(4)}`);
+  return parts.join(' + ') + (summary.unpricedCalls > 0 ? '（部分模型未配置单价）' : '');
+}
+
 /** 与已存的一行比是否同值：numeric 读出来是字符串，先转数字再比，否则 "2.0000" 和 "2" 会被当成变了 */
 const samePrice = (r: PriceRow, p: { inputPerMTok: number; outputPerMTok: number; currency: string }) =>
   Number(r.inputPerMTok) === p.inputPerMTok && Number(r.outputPerMTok) === p.outputPerMTok && r.currency === p.currency;

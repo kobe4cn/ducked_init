@@ -1,5 +1,5 @@
 // app/routes/llm-usage.tsx —— 「模型调用」页（仅管理员，#303）：按用途看近 7/30 天的调用次数、token、平均与 P95 耗时、
-// Schema 通过率与错误率，并列出最近的调用明细（分页）；失败的调用标红、错误摘要截到 120 字（全文在 title）
+// Schema 通过率、错误率与按当前单价折算的金额（ADR-0057，#745），并列出最近的调用明细（分页）；失败的调用标红、错误摘要截到 120 字（全文在 title）
 import type { Route } from './+types/llm-usage';
 import { Link } from 'react-router';
 import { requirePermission } from '~/.server/access';
@@ -52,6 +52,7 @@ function UsageRow({ row, isTotal = false }: { row: PurposeUsage; isTotal?: boole
       <TableCell data-col="p95">{`${n(row.p95Ms)} ms`}</TableCell>
       <TableCell data-col="schema">{checked ? `${row.schemaValid}/${checked}（${pct(row.schemaValid, checked)}）` : '—'}</TableCell>
       <TableCell data-col="errors" className={row.errors ? 'text-red-600' : 'text-slate-500'}>{`${n(row.errors)}（${pct(row.errors, row.calls)}）`}</TableCell>
+      <TableCell data-col="cost">{row.cost}</TableCell>
     </TableRow>
   );
 }
@@ -119,6 +120,7 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
                   <TableHead>P95 耗时</TableHead>
                   <TableHead>Schema 通过率</TableHead>
                   <TableHead>错误</TableHead>
+                  <TableHead>金额</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -141,6 +143,7 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
                   <TableHead>耗时</TableHead>
                   <TableHead>Schema</TableHead>
                   <TableHead>错误</TableHead>
+                  <TableHead>金额</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -156,6 +159,7 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
                     <TableCell className={cn('max-w-2xl truncate', r.error ? 'text-red-600' : 'text-slate-400')} title={r.error ?? undefined}>
                       {r.error ? brief(r.error) : '—'}
                     </TableCell>
+                    <TableCell data-col="cost">{r.cost}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
