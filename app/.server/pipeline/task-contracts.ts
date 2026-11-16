@@ -233,11 +233,12 @@ const inspectParams = z.object({
 });
 
 /**
- * 主键冲突体检参数里的实体（入队时由已发布映射算出）：主键、是否按数据源比较、各映射（各带映射出来的列名）与所在的合并组。
+ * 主键冲突体检参数里的实体（入队时由已发布映射算出）：主键、是否按数据源比较、各映射（各带映射出来的列名）与所在的合并组；
+ * plan 是映射的合并计划，体检用它把标准层里一行都没有的映射（因主键跨映射重复合并失败，或从未合并成功）从原始层现算。
  * bySource 为真时（主键含指向 customer 的字段）只在该字段指向的同一个数据源（数据源列 _customer_source / _<字段>_source）内比较主键；
  * 同一合并组的映射对不报（ADR-0032）
  */
-const KEYCHECK = '参数 entities 必须是 { entity, key, bySource, mappings: { mapping, columns, group? }[] } 列表';
+const KEYCHECK = '参数 entities 必须是 { entity, key, bySource, mappings: { mapping, columns, group?, plan? }[] } 列表';
 const keyCheckEntity = z.object({
   entity: z.string(error(KEYCHECK)),
   key: strings(KEYCHECK),
@@ -246,6 +247,7 @@ const keyCheckEntity = z.object({
     mapping: z.string(error(KEYCHECK)),
     columns: strings(KEYCHECK),
     group: z.string(error(KEYCHECK)).optional(),
+    plan: mergeMapping.optional(),
   }, error(KEYCHECK)).loose(), error(KEYCHECK)),
 }, error(KEYCHECK)).loose();
 /** 主键冲突体检的参数 schema：KeyCheckEntity / KeyCheckParams 的类型（z.infer）从这里导出 */

@@ -10,6 +10,8 @@ import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
+import { getMapping } from '../../app/.server/mappings';
+import { mergeNow } from '../../app/.server/merges';
 import { drain, memberOf, mergeUnchecked, newTenant, publish, selectAllTables, silver } from './fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
@@ -115,6 +117,59 @@ describe('主键冲突体检', () => {
     expect(await silver(acme, 'touch', 'touch_id, _mapping')).toEqual(before.touch);
     expect(await silver(acme, 'order', 'order_id')).toEqual(before.order);
     expect(await mergeLogRows(acme)).toBe(before.merges);
+  });
+
+  it('因撞号合并失败的映射从原始层现算比对：报告重叠数、样本键与建议键空间；体检前后标准层与合并日志不变', async () => {
+    const { acme, author, reviewer, id } = await syncedSources();
+    // 都不写键空间：customers 的键 21..40（20 个），orders 的键 1..30，重叠 21..30。后一个映射发布时合并已因独占失败
+    const narrow = await publish(author, reviewer, id, `${TOUCH_FROM_CUSTOMERS}where: customer_id > 20\n`);
+    const clashing = await publish(author, reviewer, id, `${TOUCH_FROM_ORDERS}where: order_id <= 30\n`);
+    await mergeNow(author);
+    await drain();
+    expect((await getMapping(author, clashing)).merge.history[0]).toMatchObject({ error: expect.stringContaining('主键 touch_id 跨映射重复') });
+    const before = { touch: await silver(acme, 'touch', 'touch_id, _mapping'), merges: await mergeLogRows(acme) };
+    // 标准层里只有前一个映射的行：失败的那个一行也没进去
+    expect(before.touch).toHaveLength(20);
+    expect(new Set(before.touch.map(r => r._mapping))).toEqual(new Set([narrow]));
+
+    await checkKeysNow(author);
+    await drain();
+    const status = await getKeyCheckStatus(author);
+    expect(status.status).toBe('succeeded');
+    const [a, b] = [narrow, clashing].sort();
+    expect(status.entities).toEqual([{
+      entity: 'touch',
+      bySource: false,
+      pairs: [{
+        a, b, overlap: 10,
+        samples: [['21'], ['22'], ['23'], ['24'], ['25']],
+        // campaign_id 一边是城市、一边是订单状态，从不一致
+        agreement: 0,
+        suggestion: 'key_space',
+      }],
+    }]);
+
+    expect(await silver(acme, 'touch', 'touch_id, _mapping')).toEqual(before.touch);
+    expect(await mergeLogRows(acme)).toBe(before.merges);
+  });
+
+  it('撞号失败的映射一边的键全在另一边里时建议合并组', async () => {
+    const { acme, author, reviewer, id } = await syncedSources();
+    // 都不带 where：customers 的键 1..40 全在 orders 的 1..100 里，后一个映射合并失败、一行也没进标准层
+    const kept = await publish(author, reviewer, id, TOUCH_FROM_CUSTOMERS);
+    const clashing = await publish(author, reviewer, id, TOUCH_FROM_ORDERS);
+    await mergeNow(author);
+    await drain();
+    expect((await getMapping(author, clashing)).merge.history[0]).toMatchObject({ error: expect.stringContaining('主键 touch_id 跨映射重复') });
+    const touchRows = await silver(acme, 'touch', 'touch_id, _mapping');
+    expect(touchRows).toHaveLength(40);
+    expect(new Set(touchRows.map(r => r._mapping))).toEqual(new Set([kept]));
+
+    await checkKeysNow(author);
+    await drain();
+
+    const touch = (await getKeyCheckStatus(author)).entities.find(e => e.entity === 'touch');
+    expect(touch).toMatchObject({ bySource: false, pairs: [{ overlap: 40, suggestion: 'duplicate' }] });
   });
 
   it('主键含 customer_id 的实体按 _customer_source 比较：两个数据源都指向电商库的同一批消费者时报冲突', async () => {

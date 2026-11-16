@@ -372,7 +372,7 @@ export const SILVER_SYSTEM_COLUMNS = { _mapping: 'VARCHAR', _source: 'VARCHAR', 
  * 本映射里指向 customer 的引用列（ADR-0030）：计划里带 customerRef 的，以及名为 customer_id 的列
  * （customer 自己的主键也记数据源；早于 customerRef 的老计划只能这样认）。每列旁边落一列 customerSourceColumn
  */
-const customerRefColumns = (plan: MergePlan) => plan.columns.filter(c => c.customerRef || c.name === 'customer_id');
+export const customerRefColumns = (plan: MergePlan) => plan.columns.filter(c => c.customerRef || c.name === 'customer_id');
 
 /** 标准层表上本映射要有的数据源列：实体有 customer_id 就有 _customer_source（不论本映射映不映射它），再加上本映射其他引用列的 */
 export const sourceColumnsForPlan = (plan: MergePlan) => [...new Set([
@@ -701,7 +701,7 @@ async function groupStats(con: DuckDBConnection, { key, candidates, data }: { ke
  * 从 live 里删掉不满足 where 的记录，返回删掉的源表行数（没有主键的表一条记录可代表多行）。
  * 报错里抹掉敏感字段与 where 引用的源端取值（where 可能引用没映射的敏感列）
  */
-async function filterLive(con: DuckDBConnection, plan: MergeMappingParam, live: string) {
+export async function filterLive(con: DuckDBConnection, plan: MergeMappingParam, live: string) {
   const failing = `(${compileExpression(parseExpression(plan.where!), live)}) IS NOT TRUE`;
   const pii = sensitiveColumns(plan);
   const scrubbed = [...plan.columns.filter(c => pii.has(c.name)), { expr: plan.where! }];

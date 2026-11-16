@@ -29,10 +29,10 @@ describe('体检参数', () => {
       plan('m6', 'custom_ticket', ['ticket_id']),
       plan('m7', 'custom_unknown', ['id']),
     ], published)).toEqual([
-      { entity: 'touch', key: ['touch_id'], bySource: false, mappings: [{ mapping: 'm2', columns: ['touch_id', 'campaign_id'] }, { mapping: 'm3', columns: ['touch_id'] }] },
-      { entity: 'consent', key: ['customer_id', 'channel'], bySource: true, mappings: [{ mapping: 'm4', columns: ['customer_id', 'channel'] }] },
-      { entity: 'custom_visit', key: ['member_id', 'day'], bySource: true, mappings: [{ mapping: 'm5', columns: ['member_id', 'day'] }] },
-      { entity: 'custom_ticket', key: ['ticket_id'], bySource: false, mappings: [{ mapping: 'm6', columns: ['ticket_id'] }] },
+      { entity: 'touch', key: ['touch_id'], bySource: false, mappings: [{ mapping: 'm2', columns: ['touch_id', 'campaign_id'], plan: expect.objectContaining({ mapping: 'm2' }) }, { mapping: 'm3', columns: ['touch_id'], plan: expect.objectContaining({ mapping: 'm3' }) }] },
+      { entity: 'consent', key: ['customer_id', 'channel'], bySource: true, mappings: [{ mapping: 'm4', columns: ['customer_id', 'channel'], plan: expect.objectContaining({ mapping: 'm4' }) }] },
+      { entity: 'custom_visit', key: ['member_id', 'day'], bySource: true, mappings: [{ mapping: 'm5', columns: ['member_id', 'day'], plan: expect.objectContaining({ mapping: 'm5' }) }] },
+      { entity: 'custom_ticket', key: ['ticket_id'], bySource: false, mappings: [{ mapping: 'm6', columns: ['ticket_id'], plan: expect.objectContaining({ mapping: 'm6' }) }] },
     ]);
   });
 });
@@ -47,7 +47,7 @@ describe('体检参数里的合并组', () => {
       plan('m3', 'order', ['order_id']),
     ], new Map())).toEqual([{
       entity: 'order', key: ['order_id'], bySource: false,
-      mappings: [{ mapping: 'm1', columns: ['order_id'], group: 'g1' }, { mapping: 'm2', columns: ['order_id'], group: 'g1' }, { mapping: 'm3', columns: ['order_id'] }],
+      mappings: [{ mapping: 'm1', columns: ['order_id'], plan: expect.objectContaining({ mapping: 'm1' }), group: 'g1' }, { mapping: 'm2', columns: ['order_id'], plan: expect.objectContaining({ mapping: 'm2' }), group: 'g1' }, { mapping: 'm3', columns: ['order_id'], plan: expect.objectContaining({ mapping: 'm3' }) }],
     }]);
   });
 });

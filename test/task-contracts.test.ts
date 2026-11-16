@@ -81,7 +81,7 @@ const rejected: [TaskKind, unknown, string][] = [
   ['lake.inspect', { expected: { customer: { id: 1 } } }, '参数 expected 必须是 表名 → 列名 → 类型 的对象'],
   ['lake.inspect', { expected: [] }, '参数 expected 必须是 表名 → 列名 → 类型 的对象'],
   ['lake.inspect', {}, '参数 expected 必须是 表名 → 列名 → 类型 的对象'],
-  ['silver.keycheck', { entities: [{ entity: 'customer', key: ['id'], bySource: false, mappings: [{ mapping: 'm1', columns: [] }] }] }, '参数 entities 必须是 { entity, key, bySource, mappings: { mapping, columns, group? }[] } 列表'],
+  ['silver.keycheck', { entities: [{ entity: 'customer', key: ['id'], bySource: false, mappings: [{ mapping: 'm1', columns: [] }] }] }, '参数 entities 必须是 { entity, key, bySource, mappings: { mapping, columns, group?, plan? }[] } 列表'],
   ['silver.merge', { mappings: [], drop: [{ mapping: 'm1' }] }, '参数 drop 必须是 { mapping, entity } 列表'],
   ['silver.merge', { drop: [{ mapping: 'm1', entity: 'customer' }] }, '参数 mappings 必须是非空的已发布映射列表'],
   ['silver.merge', { mappings: [{ ...mapping, mapping: 1 }] }, '参数 mappings 必须是非空的已发布映射列表'],
