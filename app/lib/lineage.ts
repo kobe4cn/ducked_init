@@ -1,7 +1,8 @@
 // app/lib/lineage.ts —— 数据地图的血缘：由已发布映射推出表级（数据源 → 源表或源视图 → 映射及版本 → 标准层表）、
-// 字段级（标准层字段在各映射里对应的源列与表达式）与标准实体之间的关系边（含映射里声明的跨源引用，ADR-0030）。只看表达式与列名，不读数据值，不落库（ADR-0019）
+// 字段级（标准层字段在各映射里对应的源列与表达式）与标准实体之间的关系边（含映射里声明的跨源引用，ADR-0030，
+// 与最新已发布自定义实体登记上登记的关系，ADR-0019）。只看表达式与列名，不读数据值，不落库（ADR-0019）
 import type { PublishedPlan } from '~/.server/pipeline/mapping-spec';
-import { CANONICAL_ENTITIES, entityOf, EXTENSION_PATTERN, isCustomEntity } from './canonical-model';
+import { CANONICAL_ENTITIES, entityOf, type EntityRelation, EXTENSION_PATTERN, isCustomEntity } from './canonical-model';
 import { cmp } from './compare';
 import { customerSourceColumn } from './customer-source';
 import { parseExpression, referencedColumns } from './mapping-expr';
@@ -45,6 +46,8 @@ export interface LineageEdge {
   kind: 'ref' | 'identity' | 'device';
   /** 跨源引用（ADR-0030）：映射里声明的目标数据源 ID 与名字（不知道名字时不带） */
   customerSource?: string; customerSourceName?: string;
+  /** 登记关系（ADR-0019）：来自最新已发布自定义实体登记上的关系，不是标准模型内置的 */
+  custom?: true;
 }
 
 export interface Lineage { tables: TableLineage[]; fields: FieldLineage[]; edges: LineageEdge[] }
@@ -94,8 +97,15 @@ function crossSourceEdges(plans: PublishedPlan[], sources: Map<string, { name: s
   return [...out.values()];
 }
 
-/** 由已发布映射（publishedPlans 的结果）与数据源推出血缘；结果按实体、字段、映射排序 */
-export function deriveLineage(input: { plans: PublishedPlan[]; sources: { id: string; name: string; kind: string }[] }): Lineage {
+/** 最新已发布自定义实体登记上的关系（ADR-0019）各出一条边：起点可以是标准实体的字段（含 x_ 扩展字段），指向 customer 的经 _identities */
+function customEdges(relations: EntityRelation[]): LineageEdge[] {
+  return relations.map(({ from, ref }) => ref.entity === 'customer'
+    ? { from, to: { table: 'silver.customer', field: ref.field }, via: VIA_IDENTITIES, kind: 'identity', custom: true }
+    : { from, to: { table: `silver.${ref.entity}`, field: ref.field }, kind: 'ref', custom: true });
+}
+
+/** 由已发布映射（publishedPlans 的结果）与数据源推出血缘，relations 是最新已发布登记上的关系（可选）；结果按实体、字段、映射排序 */
+export function deriveLineage(input: { plans: PublishedPlan[]; sources: { id: string; name: string; kind: string }[]; relations?: EntityRelation[] }): Lineage {
   const sources = new Map(input.sources.map(s => [s.id, s]));
   const tables: TableLineage[] = input.plans.map(p => {
     const s = sources.get(p.sourceId);
@@ -123,7 +133,7 @@ export function deriveLineage(input: { plans: PublishedPlan[]; sources: { id: st
   });
   fields.sort((a, b) => cmp(a.entity, b.entity) || cmp(a.field, b.field) || cmp(a.mapping, b.mapping));
 
-  return { tables, fields, edges: [...edges(), ...crossSourceEdges(input.plans, sources)] };
+  return { tables, fields, edges: [...edges(), ...crossSourceEdges(input.plans, sources), ...customEdges(input.relations ?? [])] };
 }
 
 /** 一个源列影响了哪些标准层字段 */

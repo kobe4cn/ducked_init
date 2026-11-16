@@ -14,10 +14,13 @@ import { mappings, tasks } from '../../app/.server/db/schema';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { publishMapping, saveDraft } from '../../app/.server/mappings';
 import { lastMergeByMapping, latestIdentitySummary } from '../../app/.server/merges';
-import type { RelationStat } from '../../app/lib/canonical-model';
+import { relationText, type RelationStat } from '../../app/lib/canonical-model';
 import { memberOf, newTenant, publish } from '../pipeline/fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
+
+/** 自定义实体登记里的一个文本字段 */
+const field = (name: string) => ({ name, type: 'string' as const, description: '', sensitive: false });
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
@@ -185,6 +188,95 @@ describe('数据地图', () => {
     expect(viewerRow).toContain(`data-cross-source="${sources.loyalty}"`);
     expect(viewerRow).toContain('跨源');
     expect(viewerRow).not.toContain('跨源 · ');
+  });
+
+  it('已发布自定义实体的登记关系画成边（含起点是标准实体字段的），列表标「登记关系」，孤儿比例与样例键同内置关系，没有统计时显示尚未合并', async () => {
+    const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
+    // 登记并发布大区（带指向 customer 的关系）、没有映射的片区，以及门店（order.store_id → 门店、门店 → 大区、门店 → 片区）
+    const region = await createCustomEntity(author, {
+      name: 'custom_region', label: '大区', kind: 'dimension', primaryKey: ['region_id'],
+      fields: [field('region_id'), field('name'), field('owner')],
+      relations: [{ from: { entity: 'custom_region', field: 'owner' }, ref: { entity: 'customer', field: 'customer_id' } }],
+    });
+    await publishCustomEntity(reviewer, region, 1);
+    const district = await createCustomEntity(author, { name: 'custom_district', label: '片区', kind: 'dimension', primaryKey: ['district_id'], fields: [field('district_id')] });
+    await publishCustomEntity(reviewer, district, 1);
+    const station = await createCustomEntity(author, {
+      name: 'custom_station', label: '门店', kind: 'dimension', primaryKey: ['station_id'],
+      fields: [field('station_id'), field('region_id'), field('district')],
+      relations: [
+        { from: { entity: 'order', field: 'store_id' }, ref: { entity: 'custom_station', field: 'station_id' } },
+        { from: { entity: 'custom_station', field: 'region_id' }, ref: { entity: 'custom_region', field: 'region_id' } },
+        { from: { entity: 'custom_station', field: 'district' }, ref: { entity: 'custom_district', field: 'district_id' } },
+      ],
+    });
+    await publishCustomEntity(reviewer, station, 1);
+    await publish(author, reviewer, sources.crm, `model: 1
+entity: custom_region
+table: customers
+extensions:
+  region_id: { type: string, expr: string(id) }
+  name: { type: string, expr: name }
+  owner: { type: string, expr: mobile }
+dedupe: { key: [region_id] }
+`);
+    await publish(author, reviewer, sources.loyalty, `model: 1
+entity: custom_station
+table: orders
+extensions:
+  station_id: { type: string, expr: string(id) }
+  region_id: { type: string, expr: string(member_id) }
+  district: { type: string, expr: state }
+dedupe: { key: [station_id] }
+`);
+    await memberOf(acme, 'eng@acme.com', 'data_engineer');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const eng = await loginAs(app, 'eng@acme.com');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    const STORE = 'ref:order.store_id->custom_station';
+    const REGION = 'ref:custom_station.region_id->custom_region';
+    const OWNER = 'identity:custom_region.owner->customer';
+    const DISTRICT = 'ref:custom_station.district->custom_district';
+    const edgeRow = (html: string, id: string) => html.match(new RegExp(`<tr[^>]*data-edge-id="${id}"[\\s\\S]*?</tr>`))![0];
+
+    const html = decode(await (await eng.get('/lineage')).text());
+    // 两条边都在，说明列标「登记关系」（起点是标准实体字段的也在）；指向 customer 的照现有写法经 _identities
+    expect(edgeRow(html, STORE)).toContain('登记关系');
+    expect(edgeRow(html, STORE)).not.toContain('内置关系');
+    expect(edgeRow(html, REGION)).toContain('登记关系');
+    expect(edgeRow(html, REGION)).toMatch(/data-edge-(orphans|stat)/);
+    expect(edgeRow(html, OWNER)).toContain('登记关系 · 经 _identities');
+    // order 映射没写 store_id：标准层这一列全为空，孤儿为 0（不是尚未合并）
+    expect(edgeRow(html, STORE)).toContain('data-edge-orphans="0"');
+    // 终点未接入（片区没有已发布映射）：不加 ?all=1 时没有节点，边也不出
+    expect(html).not.toContain('data-node="custom_district"');
+
+    // 往最近一次合并的结果里塞这条关系的统计：与内置关系一样显示孤儿比例与样例键
+    const [merge] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')))
+      .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
+    const result = merge.result as { relations: RelationStat[] };
+    const STORE_REL = { from: { entity: 'order', field: 'store_id' }, ref: { entity: 'custom_station', field: 'station_id' } };
+    await getDb().update(tasks).set({
+      result: { ...result, relations: [...result.relations.filter(r => relationText(r) !== relationText(STORE_REL)), { ...STORE_REL, withValue: 11, orphans: 3, samples: ['S-404'] }] },
+    }).where(eq(tasks.id, merge.id));
+    const withStat = decode(await (await eng.get('/lineage')).text());
+    expect(edgeRow(withStat, STORE)).toContain('data-edge-orphans="3"');
+    expect(edgeRow(withStat, STORE)).toMatch(/data-samples[\s\S]*S-404/);
+    // 样例键只给有 sources:read 的成员
+    const forViewer = decode(await (await viewer.get('/lineage')).text());
+    expect(edgeRow(forViewer, STORE)).toContain('data-edge-orphans="3"');
+    expect(forViewer).not.toContain('data-samples');
+
+    // ?all=1：未接入的已发布自定义实体灰显，指向它的登记关系边也是未接入样式
+    const all = decode(await (await eng.get('/lineage?all=1')).text());
+    expect(all).toMatch(/data-node="custom_district"[^>]*data-connected="false"/);
+    expect(edgeRow(all, DISTRICT)).toContain('data-connected="false"');
+
+    // 没有合并任务时与内置关系一样显示尚未合并
+    await getDb().delete(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')));
+    const none = decode(await (await eng.get('/lineage')).text());
+    expect(edgeRow(none, STORE)).toContain('data-edge-stat="unmerged"');
+    expect(edgeRow(none, REGION)).toContain('data-edge-stat="unmerged"');
   });
 
   it('数据工程师打开流向图，看到各映射的源表、版本、最近一次合并与标准层表行数；合并失败的映射标红并链到合并记录', async () => {
