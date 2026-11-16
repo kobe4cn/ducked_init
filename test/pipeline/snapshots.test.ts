@@ -258,6 +258,36 @@ describe('源端结构变化', () => {
     await drain();
     expect(((await lastMergeOf(acme, mappingId)).result as { mappings: MergeRecord[] }).mappings.find(r => r.mapping === mappingId)).not.toHaveProperty('error');
   });
+
+  it('删列、源端恢复列后再改名：随每次同步自动采集的列统计当基线，平台照样起草修复草稿（#767）', async () => {
+    const { acme, author, sources, orderMappings } = await publishedIdentitySources({ orders: true });
+    const mappingId = orderMappings!.crm;
+    // 删掉映射引用的 paid_at：同步发现（自动采集）后还猜不出改名——这次没有新增的列
+    await grantOnSource('ALTER TABLE crm.orders DROP COLUMN paid_at');
+    await syncSource(author, sources.crm);
+    await drain();
+    expect((await listAuditLogs(acme)).filter(a => a.action === '平台起草修复草稿')).toEqual([]);
+
+    // 源端加回 paid_at（取值照旧）：这次没有列被删除，不告警，但同步仍自动采集，最近一次采集里又有 paid_at 了
+    await grantOnSource(`ALTER TABLE crm.orders ADD COLUMN paid_at timestamp;
+      UPDATE crm.orders SET paid_at = (CASE order_no
+        WHEN 'A1' THEN '2024-06-30 09:00' WHEN 'A2' THEN '2024-05-01 10:00' WHEN 'A3' THEN '2024-06-20 10:00'
+        WHEN 'A4' THEN '2024-06-28 10:00' WHEN 'A5' THEN '2024-06-01 10:00' WHEN 'A6' THEN '2024-04-01 10:00' END)::timestamp;`);
+    await syncSource(author, sources.crm);
+    await drain();
+
+    // 再改名：修复草稿的统计基线是改名那次同步开始之前最近一次成功的采集（上一步随同步自动采集的，paid_at 在里面），猜得出改名
+    await grantOnSource('ALTER TABLE crm.orders RENAME paid_at TO paid_time');
+    await syncSource(author, sources.crm);
+    await drain();
+
+    expect((await listAuditLogs(acme)).filter(a => a.action === '平台起草修复草稿'))
+      .toEqual([expect.objectContaining({ actor: '平台', summary: expect.stringContaining('paid_at 改为 paid_time') })]);
+    const [draft] = await getDb().select().from(mappingVersions)
+      .where(and(eq(mappingVersions.mappingId, mappingId), eq(mappingVersions.version, 2)));
+    expect(draft).toMatchObject({ status: 'draft', lastEditor: 'platform', authors: [] });
+    expect(draft.yaml).toContain(`paid_at: from_timezone(paid_time, 'UTC')`);
+  });
 });
 
 describe('快照过期', () => {

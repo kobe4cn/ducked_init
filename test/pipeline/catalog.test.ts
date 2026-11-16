@@ -481,6 +481,22 @@ describe('语义目录的加载', () => {
     expect((await latestVersion(acme))?.version).toBe(v0 + 2);
   });
 
+  it('同步发现源表加了列时不点重新列出也记一版（source.profiled）：告警钩子给变了结构的表入队采集，差异里带列级明细', async () => {
+    const { acme, author, sources } = await publishedIdentitySources({ orders: true });
+    await drain();
+    const v0 = (await latestVersion(acme))!.version;
+
+    await grantOnSource('ALTER TABLE crm.orders ADD COLUMN coupon text');
+    await syncSource(author, sources.crm);
+    await drain();
+    // 没有映射引用 coupon，不告警；随同步入队的采集把新结构记进目录（版本原因是采集那一钩的 source.profiled）
+    const added = await catalogChangesSince(getDb(), acme, v0);
+    expect(added.versions.map(v => [v.version, v.reason])).toEqual([[v0 + 1, 'source.profiled']]);
+    expect(added.versions[0].diff.changed).toEqual([
+      expect.objectContaining({ id: 'table:CRM/orders', keys: ['columns'], columns: { added: ['coupon'], removed: [] } }),
+    ]);
+  });
+
   it('目录与最新一版不一致而没有事件记录时，读取时补记一版：只有能力条目变了是 platform.capabilities，否则 catalog.detected；没有版本时记第 1 版', async () => {
     const { acme } = await publishedIdentitySources();
     const tamper = async (drop: string) => {
