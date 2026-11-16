@@ -46,8 +46,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   /** 快照表按定义（快照的 template）筛选 */
   const definitionFilter = url.searchParams.get('definition') || null;
   const canReadDefinitions = can(member.role, 'definitions:read');
-  const snapshots = (await listSnapshots(member.tenant.id))
-    .filter(s => !definitionFilter || s.template === definitionFilter);
+  const snapshots = await listSnapshots(member.tenant.id, definitionFilter ?? undefined);
   const all = canReadDefinitions ? await listDefinitions(member) : [];
   /** 任务状态的文案在服务端翻好（~/.server/tasks 不能进客户端构建，色调由组件按 status 查 TASK_TONES） */
   const lastRunWithLabel = (run: DefinitionSummary['lastRun']) =>
