@@ -151,7 +151,7 @@ function EntityGroup({ group, canWrite, submitting, input, viewVersion }: {
           ) : <p className="text-sm text-slate-500">还没有发布的合并组。</p>}
           {draft && (
             <p className="flex items-center gap-2 text-sm text-slate-500" data-draft>
-              {`v${draft.version}`}<VersionStatus v={draft} />{`${draft.members.map(mappingName).join(' > ')}，${ruleText(draft.rule)}（最后保存 ${draft.lastEditor}）`}
+              {`v${draft.version}`}<VersionStatus v={draft} sameAs={draft.sameAs} />{`${draft.members.map(mappingName).join(' > ')}，${ruleText(draft.rule)}（最后保存 ${draft.lastEditor}）`}
             </p>
           )}
         </div>
