@@ -3,7 +3,7 @@
 // 运营后台不是租户成员，不显示 AI 助手（assistant={false}），头像也不是链接（settingsHref={null}）
 import { Form, Link, useLocation } from 'react-router';
 import { LogOut } from 'lucide-react';
-import { activeNavTo, flattenNav, type NavEntry } from '~/lib/nav';
+import { activeGroupLabel, activeNavTo, flattenNav, type NavEntry } from '~/lib/nav';
 import { cn } from '~/lib/utils';
 import { Button } from '~/components/ui/button';
 import { AssistantPanel } from '~/components/assistant-panel';
@@ -23,6 +23,7 @@ export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台
 }) {
   const pathname = useLocation().pathname;
   const active = activeNavTo(flattenNav(nav), pathname);
+  const activeGroup = activeGroupLabel(nav, pathname);
   return (
     <div className="min-h-svh bg-slate-50">
       <header className="border-b bg-white">
@@ -36,7 +37,7 @@ export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台
               {nav.map(entry => 'items' in entry ? (
                 // key 带上路径：跳转后重新挂载，下拉收起；再拼 label 避免与同路径的单链接 key 撞车
                 <details key={`${pathname}-${entry.label}`} className="relative">
-                  <summary className={cn('flex cursor-pointer list-none items-center rounded-full px-3 py-1.5 text-slate-600 hover:bg-slate-100 [&::-webkit-details-marker]:hidden', entry.items.some(item => item.to === active) && 'bg-slate-900 text-white hover:bg-slate-900')}>
+                  <summary className={cn('flex cursor-pointer list-none items-center rounded-full px-3 py-1.5 text-slate-600 hover:bg-slate-100 [&::-webkit-details-marker]:hidden', entry.label === activeGroup && 'bg-slate-900 text-white hover:bg-slate-900')}>
                     {entry.label}
                     <span aria-hidden className="ml-0.5 text-[0.65em]">▾</span>
                   </summary>
