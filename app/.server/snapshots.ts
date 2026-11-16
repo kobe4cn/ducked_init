@@ -144,9 +144,11 @@ export async function markExpired(tenantId: string, taskId: string) {
     .where(and(eq(snapshots.tenantId, tenantId), inArray(snapshots.table, tables), isNull(snapshots.expiredAt)));
 }
 
-/** 本租户的全部快照，最新的在前 */
-export async function listSnapshots(tenantId: string) {
-  return getDb().select().from(snapshots).where(eq(snapshots.tenantId, tenantId)).orderBy(desc(snapshots.createdAt));
+/** 本租户的全部快照（给 template 时只取这个模板的，如一个定义的全部历史快照），最新的在前 */
+export async function listSnapshots(tenantId: string, template?: string) {
+  return getDb().select().from(snapshots)
+    .where(template ? and(eq(snapshots.tenantId, tenantId), eq(snapshots.template, template)) : eq(snapshots.tenantId, tenantId))
+    .orderBy(desc(snapshots.createdAt));
 }
 
 /** 本租户的一张快照；不存在或属于其他租户时为 null */

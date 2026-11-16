@@ -19,7 +19,7 @@ import { catalogTx } from './catalog/tx';
 import { publishedCustomEntities } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
 import { publishedTagsOf, publishedTagsReferencing } from './dsl-dependencies';
-import { dslDefinitions, dslVersions, snapshots, tasks, type SnapshotTrigger } from './db/schema';
+import { dslDefinitions, dslVersions, snapshots, tasks, type SnapshotTrigger, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { chatJson, LlmError, resolveProvider } from './llm';
 import { publishedPlans } from './mappings';
@@ -317,6 +317,85 @@ export async function getDefinition(actor: CurrentMember, kind: string, key: str
       ? { version: versions[0]!.version, sql: DSL_KINDS[kind].compile(result.spec, ctx, todayUtc(), key), issues: [] as DslIssue[] }
       : { version: versions[0]!.version, sql: null, issues: result.issues },
   };
+}
+
+/** 分析页「指标与标签」列表里的一行（#798）：生效版本、草稿、创建人与最近一次计算的摘要 */
+export interface DefinitionSummary {
+  kind: DslKind;
+  key: string;
+  createdAt: Date;
+  /** 创建人（版本号最小那一版的 authors[0]；dsl_definitions 没有创建人列）；没有版本时为 null */
+  creator: string | null;
+  /** 生效版本（status='published' 里版本号最大的一条，同 getDefinition）；还没发布过时为 null */
+  published: number | null;
+  /** 草稿（每个定义最多一份）；没有时为 null */
+  draft: { version: number; lastEditor: string; updatedAt: Date } | null;
+  /**
+   * 最近一次计算：最新一张未过期快照的统计日、来源、行数与最新一条 gold.dsl 任务的状态；两者都没有时为 null（页面写「未计算」）。
+   * 还没有快照时 asOf / trigger / rowCount 都为 null
+   */
+  lastRun: { asOf: string | null; trigger: SnapshotTrigger | null; rowCount: number | null; status: TaskStatus | null } | null;
+}
+
+/**
+ * 本租户的全部定义（分析页「指标与标签」列表，#798）：包括只有草稿、还没算出快照的。只按租户过滤，不按 space（ADR-0048）。
+ * 最近一次计算用两条批量查询取全部定义的最新未过期快照与最新任务（写法同 lastRefresh 与 rejectPending），不逐个定义查
+ */
+export async function listDefinitions(actor: CurrentMember): Promise<DefinitionSummary[]> {
+  assertCan(actor, 'definitions:read');
+  const tenantId = actor.tenant.id;
+  // 版本号升序：创建人取第一行（版本号最小的一版），生效版本取最后一次赋值（版本号最大的已发布版）
+  const rows = await getDb().select({
+    id: dslDefinitions.id, kind: dslDefinitions.kind, key: dslDefinitions.key, createdAt: dslDefinitions.createdAt,
+    version: dslVersions.version, status: dslVersions.status, authors: dslVersions.authors,
+    lastEditor: dslVersions.lastEditor, updatedAt: dslVersions.updatedAt,
+  }).from(dslDefinitions)
+    .leftJoin(dslVersions, eq(dslVersions.definitionId, dslDefinitions.id))
+    .where(eq(dslDefinitions.tenantId, tenantId))
+    .orderBy(dslDefinitions.kind, dslDefinitions.key, dslVersions.version);
+  const summaries: DefinitionSummary[] = [];
+  const byId = new Map<string, DefinitionSummary>();
+  for (const row of rows) {
+    if (!byId.has(row.id)) {
+      const summary: DefinitionSummary = { kind: row.kind, key: row.key, createdAt: row.createdAt, creator: null, published: null, draft: null, lastRun: null };
+      byId.set(row.id, summary);
+      summaries.push(summary);
+    }
+    if (row.version === null || row.status === null) continue; // left join 没有版本（不该出现：新建时就写入第 1 版）
+    const summary = byId.get(row.id)!;
+    summary.creator ??= row.authors?.[0] ?? null;
+    if (row.status === 'published') summary.published = row.version;
+    if (row.status === 'draft' && row.lastEditor !== null && row.updatedAt !== null) {
+      summary.draft = { version: row.version, lastEditor: row.lastEditor, updatedAt: row.updatedAt };
+    }
+  }
+  if (summaries.length) {
+    // 最新一张未过期快照的统计日、来源、行数（按创建时间降序，每个模板只留第一个）
+    const templateOf = new Map(summaries.map(d => [`${d.kind}:${d.key}`, d]));
+    const latestByTemplate = new Map<string, { asOf: string | null; trigger: SnapshotTrigger | null; rowCount: number }>();
+    for (const s of await getDb().select({
+      template: snapshots.template, asOf: sql<string | null>`${snapshots.params}->>'asOf'`, trigger: snapshots.trigger, rowCount: snapshots.rowCount,
+    }).from(snapshots)
+      .where(and(eq(snapshots.tenantId, tenantId), isNull(snapshots.expiredAt), inArray(snapshots.template, [...templateOf.keys()])))
+      .orderBy(desc(snapshots.createdAt))) {
+      if (!latestByTemplate.has(s.template)) latestByTemplate.set(s.template, { asOf: s.asOf, trigger: s.trigger, rowCount: s.rowCount });
+    }
+    // 最新一条 gold.dsl 任务的状态（按创建时间降序，每个定义只留第一个）
+    const statusById = new Map<string, TaskStatus>();
+    for (const t of await getDb().select({ definitionId: sql<string>`${tasks.params}->>'definitionId'`, status: tasks.status }).from(tasks)
+      .where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'gold.dsl'), inArray(sql`${tasks.params}->>'definitionId'`, [...byId.keys()])))
+      .orderBy(desc(tasks.createdAt))) {
+      if (!statusById.has(t.definitionId)) statusById.set(t.definitionId, t.status);
+    }
+    for (const [id, summary] of byId) {
+      const latest = latestByTemplate.get(`${summary.kind}:${summary.key}`);
+      const status = statusById.get(id) ?? null;
+      if (latest || status !== null) {
+        summary.lastRun = { asOf: latest?.asOf ?? null, trigger: latest?.trigger ?? null, rowCount: latest?.rowCount ?? null, status };
+      }
+    }
+  }
+  return summaries;
 }
 
 /**
