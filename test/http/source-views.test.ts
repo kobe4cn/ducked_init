@@ -1,5 +1,6 @@
 // 源视图的 HTTP 接缝：数据工程师在数据源页的「源视图」标签页新建源视图，保存后看到视图的列与样本（敏感列是哈希），读标准层的 SQL 被拒绝并给出原因；
-// 最后保存草稿的人不能自己发布，由另一位数据工程师或管理员在页面上发布；没有登录会话的请求发布不了。分析师只读，查看者看不到，其他租户与别的数据源路径一律 404
+// 最后保存草稿的人不能自己发布，由另一位数据工程师或管理员在页面上发布；没有登录会话的请求发布不了。分析师只读，查看者看不到，其他租户与别的数据源路径一律 404；
+// 与当前生效已发布版相同的草稿（规范化后 SQL 相同）在草稿处标「与 v1 相同」，发布被拒并提示丢弃，草稿仍在
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { syncSource } from '../../app/.server/source-sync';
@@ -69,6 +70,26 @@ describe('源视图', () => {
     const anonymous = await app.client().post(viewPath, { intent: 'publish', version: '1' });
     expect(anonymous.status).toBe(302);
     expect(locationOf(anonymous)).toBe('/login');
+  });
+
+  it('与当前生效已发布版相同的草稿（规范化后 SQL 相同）：页面在草稿处显示「与 v1 相同」，发布被拒并提示丢弃，草稿仍在', async () => {
+    const { sourceId } = await syncedSource();
+    const author = await loginAs(app, 'de@acme.com');
+    const viewPath = locationOf(await author.post(`/sources/${sourceId}/views/new`, { intent: 'create', name: 'customer_city', sql: VIEW })).replace(/\?.*$/, '');
+    const admin = await loginAs(app, 'admin@acme.com');
+    expect((await admin.post(viewPath, { intent: 'publish', version: '1' })).status).toBe(302);
+    // 另一位成员不改 SQL 保存一份草稿（末尾多出的分号在保存时被规范化掉）
+    expect((await admin.post(viewPath, { intent: 'save', sql: `${VIEW};\n` })).status).toBe(302);
+    const page = await (await author.get(viewPath)).text();
+    expect(page).toContain('data-same-as');
+    expect(page).toContain('与 v1 相同');
+    // 作者（不是最后保存的人）发布被拒；版本表里 v2 仍是草稿
+    const rejected = await author.post(viewPath, { intent: 'publish', version: '2' });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toContain('与 v1 相同，没有改动，请丢弃草稿');
+    const versions = await (await author.get(`${viewPath}?tab=versions`)).text();
+    expect(versions).toMatch(/data-version="2"[^>]*data-version-status="draft"/);
+    expect(versions).toContain('与 v1 相同');
   });
 
   it('分析师只读，查看者 403，其他租户与别的数据源路径 404', async () => {

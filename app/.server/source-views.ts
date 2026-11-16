@@ -15,7 +15,7 @@ import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { ident } from '../lib/mapping-expr';
 import { normalizeViewSql, previewView, VIEW_PLATFORM_COLUMNS, ViewSqlError, type ViewPreview } from './pipeline/source-view-engine';
 import { PLATFORM_COLUMNS } from './pipeline/sync-engine';
-import { discard, publish, PublishError, publisherCount, publishBlocker, saveDraft, type PublishableAdapter } from './publishing';
+import { discard, publish, PublishError, publisherCount, publishBlocker, sameAsPublished, saveDraft, type ContentRow, type PublishableAdapter } from './publishing';
 import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
 import { confirmedTables } from './sources';
@@ -105,19 +105,21 @@ export async function listSourceViews(actor: CurrentMember, sourceId: string) {
   return { source: { id: source.id, name: source.name }, views: [...views.values()] };
 }
 
-/** 源视图详情：所属数据源、各版本（最新的在前，带当前成员发布不了的原因）、草稿与最近的已发布版本，以及本租户有发布权限的成员人数 */
+/** 源视图详情：所属数据源、各版本（最新的在前，带当前成员发布不了的原因，草稿与当前生效已发布版相同时带 sameAs）、草稿与最近的已发布版本，以及本租户有发布权限的成员人数 */
 export async function getSourceView(actor: CurrentMember, sourceId: string, viewId: string) {
   assertCan(actor, 'sources:read');
   const view = await requireView(actor.tenant.id, sourceId, viewId);
   const versions = await getDb().select({
     version: sourceViewVersions.version, status: sourceViewVersions.status, sql: sourceViewVersions.sql,
+    columns: sourceViewVersions.columns,
     authors: sourceViewVersions.authors, lastEditor: sourceViewVersions.lastEditor,
     publishedByEmail: sourceViewVersions.publishedByEmail, publishedAt: sourceViewVersions.publishedAt, updatedAt: sourceViewVersions.updatedAt,
   }).from(sourceViewVersions).where(eq(sourceViewVersions.viewId, viewId)).orderBy(desc(sourceViewVersions.version));
+  const sameAs = sameAsPublished(sourceViewAdapter, versions);
   return {
     view: { id: view.id, name: view.name },
     source: { id: view.sourceId, name: view.sourceName },
-    versions: versions.map(v => ({ ...v, publishBlocker: publishBlocker(actor, v) })),
+    versions: versions.map(v => ({ ...v, publishBlocker: publishBlocker(actor, v), sameAs: v.status === 'draft' ? sameAs : null })),
     draft: versions.find(v => v.status === 'draft') ?? null,
     published: versions.find(v => v.status === 'published') ?? null,
     publishers: await publisherCount(actor.tenant.id),
@@ -174,6 +176,9 @@ export async function sourceViewCtx(actor: CurrentMember, sourceId: string, view
 /** enqueueMerge 入队的合并任务（publishSourceView 返回它或 null） */
 type QueuedMerge = NonNullable<Awaited<ReturnType<typeof enqueueMerge>>>;
 
+/** 版本表的内容列（checkSave 写入）：规范化后的 SQL 与校验得到的输出列（早于 #96 保存的版本 columns / tables 为空），形状从表定义推 */
+type ViewVersionContent = Pick<typeof sourceViewVersions.$inferSelect, 'sql' | 'columns'>;
+
 /**
  * 源视图接入 publishing.ts 的适配器（ADR-0051）：保存的事务外检查在只读挂载的数据湖上校验 SQL（checkAndPreview），
  * 发布后为基于这个源视图的映射入队一次合并（按新版本重建，ADR-0023）。不锁租户行：发布源视图不查排队中的合并，总要按新版本重建
@@ -192,6 +197,12 @@ export const sourceViewAdapter: PublishableAdapter<SourceViewCtx, string, undefi
   checkSave: async (ctx, input) => {
     const viewSql = normalizeViewSql(input);
     return { sql: viewSql, ...shapeOf(await checkAndPreview(ctx.tenantId, ctx.sourceId, viewSql)) };
+  },
+  // 草稿与已发布版内容相同：只比保存时规范化过的 SQL。已发布版没有输出列（早于 #96 保存的旧版本）时视为不同：
+  // 这类旧版重存出的草稿 SQL 相同，但 checkOutside 要求重新保存，必须仍能发布
+  sameContent: (draft, published) => {
+    const previous = published as ContentRow & ViewVersionContent;
+    return !!previous.columns?.length && (draft as ContentRow & Pick<ViewVersionContent, 'sql'>).sql === previous.sql;
   },
   // 早于映射读源视图（#96）保存的草稿没有输出列与引用的表，映射对照不了、同步后也触发不了合并
   checkOutside: async draft => {

@@ -208,7 +208,7 @@ export default function SourceView({ loaderData, actionData }: Route.ComponentPr
         {tab === 'edit' && selected && (
           <>
             <div className="mb-4 space-y-1">
-              <div className="flex items-center gap-2 text-sm text-slate-500">正在查看 <span className="font-mono font-semibold text-slate-900">{`v${selected.version}`}</span><VersionStatus v={selected} /></div>
+              <div className="flex items-center gap-2 text-sm text-slate-500">正在查看 <span className="font-mono font-semibold text-slate-900">{`v${selected.version}`}</span><VersionStatus v={selected} sameAs={selected.sameAs} /></div>
               <p className="max-w-2xl text-sm text-slate-500">
                 {editHint(canWrite, selected, draft)}
               </p>
@@ -252,7 +252,7 @@ export default function SourceView({ loaderData, actionData }: Route.ComponentPr
                 {versions.map(v => (
                   <TableRow key={v.version} data-version={v.version} data-version-status={v.status}>
                     <TableCell className="font-mono font-semibold">{`v${v.version}`}</TableCell>
-                    <TableCell><VersionStatus v={v} /></TableCell>
+                    <TableCell><VersionStatus v={v} sameAs={v.sameAs} /></TableCell>
                     <TableCell className="text-sm">{v.authors.join('、')}</TableCell>
                     <TableCell className="text-sm text-slate-500">{v.publishedByEmail ? `${v.publishedByEmail}，${time(v.publishedAt)}` : '—'}</TableCell>
                     <TableCell className="text-right">
