@@ -1,5 +1,6 @@
 // 可发布项发布流程（ADR-0051）的流水线接缝：保存草稿、发布、丢弃在 publishing.ts 一处，用 sourceViewAdapter 做被测适配器 ——
-// 双人发布、丢弃回到已发布版本或连父行删、等锁期间的过期检查、审计在发布后动作之后才写。权限与各可发布项自己的校验在各自入口的测试里
+// 双人发布、丢弃回到已发布版本或连父行删、等锁期间的过期检查、审计在发布后动作之后才写；草稿与当前生效已发布版内容相同（只比规范化后的 SQL）时
+// 标 sameAs 并拒绝发布，已发布版没有输出列（早于 #96）的旧版本不算相同。权限与各可发布项自己的校验在各自入口的测试里
 import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Tx } from '../../app/.server/audit';
@@ -63,6 +64,22 @@ describe('可发布项的发布流程', () => {
     expect(view.draft).toBeNull();
     expect(view.versions.map(v => v.version)).toEqual([1]);
     expect((await listSourceViews(author, id)).views).toEqual([{ id: viewId, name: 'customer_orders', published: 1, draft: null }]);
+  });
+
+  it('草稿与当前生效已发布版内容相同：页面数据标出与 v1 相同、发布被拒并提示丢弃；已发布版没有输出列（早于 #96）时视为不同', async () => {
+    const { author, reviewer, id } = await syncedSource();
+    const viewId = await createSourceView(author, id, { name: 'customer_orders', sql: CUSTOMER_ORDERS });
+    const ctx = await sourceViewCtx(reviewer, id, viewId);
+    await publish(sourceViewAdapter, reviewer, ctx, 1);
+    // 同一段 SQL 再存一份草稿（保存入口同样 normalizeViewSql），getSourceView 给草稿行标 sameAs
+    expect(await saveDraft(sourceViewAdapter, author, ctx, CUSTOMER_ORDERS)).toBe(2);
+    expect((await getSourceView(author, id, viewId)).versions.find(v => v.status === 'draft')?.sameAs).toBe(1);
+    await expect(publish(sourceViewAdapter, reviewer, ctx, 2)).rejects.toMatchObject({ status: 400, message: expect.stringContaining('与 v1 相同') });
+    // 已发布版没有输出列（早于 #96 保存的旧版本）：重存出的草稿 SQL 相同，但必须还能发布
+    await getDb().update(sourceViewVersions).set({ columns: null })
+      .where(and(eq(sourceViewVersions.viewId, viewId), eq(sourceViewVersions.version, 1)));
+    expect((await getSourceView(author, id, viewId)).versions.find(v => v.status === 'draft')?.sameAs).toBeNull();
+    await expect(publish(sourceViewAdapter, reviewer, ctx, 2)).resolves.toBe(null);
   });
 
   it('丢弃从没发布过的可发布项会连父行一起删；权限在各入口上查，分析师不能起草与发布', async () => {
