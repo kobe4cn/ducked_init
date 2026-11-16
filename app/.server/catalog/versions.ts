@@ -19,8 +19,12 @@ export type CatalogVersionReason = AuditAction | 'source.profiled' | 'source.syn
 
 export interface DiffItem { id: string; kind: CatalogEntry['kind']; name: string }
 
-/** 两版目录按条目标识比出的差异；changed 的 keys 是变了的顶层键 */
-export interface CatalogDiff { added: DiffItem[]; removed: DiffItem[]; changed: (DiffItem & { keys: string[] })[] }
+/** 源表条目 columns 键的变化明细：新增与删除的列名（各自排序）。只改了列类型的列不在里面；两个数组都为空时不写这个字段。
+ *  旧版本存在 catalog_versions.diff 里的数据没有这个字段，读取时须容忍缺失 */
+export interface ColumnDiff { added: string[]; removed: string[] }
+
+/** 两版目录按条目标识比出的差异；changed 的 keys 是变了的顶层键，源表条目另给列级明细 */
+export interface CatalogDiff { added: DiffItem[]; removed: DiffItem[]; changed: (DiffItem & { keys: string[]; columns?: ColumnDiff })[] }
 
 /** 去掉统计后的单个条目：源表与实体的统计、字段来源的源端样本、模板的快照；指标、标签与模板的 version 是定义的版本，保留 */
 export function stripEntryStats(e: CatalogEntry): CatalogEntry {
@@ -46,7 +50,7 @@ const stable = (v: unknown): string => JSON.stringify(v, (_, x) =>
 
 const item = (e: CatalogEntry): DiffItem => ({ id: e.id, kind: e.kind, name: e.name });
 
-/** 按条目标识比较两版条目：新增、删除，以及顶层键有变化的改动 */
+/** 按条目标识比较两版条目：新增、删除，以及顶层键有变化的改动；源表条目的 columns 有增删时给列级明细 */
 export function diffCatalog(prev: CatalogEntry[], next: CatalogEntry[]): CatalogDiff {
   const before = new Map(prev.map(e => [e.id, e]));
   const after = new Map(next.map(e => [e.id, e]));
@@ -57,7 +61,16 @@ export function diffCatalog(prev: CatalogEntry[], next: CatalogEntry[]): Catalog
     const a = p as unknown as Record<string, unknown>;
     const b = e as unknown as Record<string, unknown>;
     const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])].filter(k => stable(a[k]) !== stable(b[k])).sort();
-    if (keys.length) changed.push({ ...item(e), keys });
+    if (!keys.length) continue;
+    const entry: CatalogDiff['changed'][number] = { ...item(e), keys };
+    // TableEntry.columns 已去掉敏感列与系统列，列名明细不会泄露它们；只改类型的列两边差集都进不去，两个数组都为空时不写
+    if (e.kind === 'table' && p.kind === 'table' && keys.includes('columns')) {
+      const had = new Set(p.columns.map(c => c.name));
+      const has = new Set(e.columns.map(c => c.name));
+      const columns = { added: e.columns.filter(c => !had.has(c.name)).map(c => c.name).sort(), removed: p.columns.filter(c => !has.has(c.name)).map(c => c.name).sort() };
+      if (columns.added.length || columns.removed.length) entry.columns = columns;
+    }
+    changed.push(entry);
   }
   return {
     added: next.filter(e => !before.has(e.id)).map(item),

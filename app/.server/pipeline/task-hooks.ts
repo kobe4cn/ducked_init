@@ -51,9 +51,10 @@ export const TASK_HOOKS = {
   'source.sync': [
     // 同步给已发布映射的源表写入了变更批次（部分失败时也可能有）：随即把它们合并进标准层
     { name: 'mergeAfterSync', when: 'result', run: ({ task }) => mergeAfterSync(task.tenantId, task.id) },
-    // 同步发现源表删了列或破坏性改了类型、且已发布映射引用了它们：通知能改映射的成员并记审计（ADR-0034）
+    // 同步发现源表结构变了：给变了结构的表入队采集（有被引用的列被删除时带 repairFor），通知与起草修复草稿都在 alertSchemaBreak 里（ADR-0034、#767）
     { name: 'alertSchemaBreak', when: 'result', run: ({ task, result }) => alertSchemaBreak(task.tenantId, task, result) },
-    // 同步成功：源表的列可能变了，和最新一版目录比较，有差异记一版（ADR-0041）；只改了统计不记
+    // 同步成功：源表的列可能变了，和最新一版目录比较，有差异记一版（ADR-0041）；只改了统计不记。
+    // 这一钩通常比不出差异：平台记的源表结构（最近一次采集）还没跟上，结构变化由上面入队的采集那一钩记（source.profiled）
     { name: 'recordCatalogVersionIfChanged', when: 'succeeded', run: ({ task }) => recordCatalogVersionIfChanged(task.tenantId, 'source.synced') },
   ],
   'source.profile': [

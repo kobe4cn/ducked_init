@@ -88,6 +88,28 @@ describe('目录版本的比较', () => {
     expect(diffCatalog([], all).added.map(x => x.id)).toEqual(all.map(e => e.id));
   });
 
+  it('源表加列、删列：改动条目带列级明细（新增与删除的列名，排序）；只改类型或非源表条目不带明细', () => {
+    const orders = input().tables![0]!;
+    const withColumns = (columns: { name: string; type: string }[]) => input({ tables: [{ ...orders, columns }] });
+    // 加两列（倒序给，明细里排好序）
+    const [add] = diffCatalog(snap(input()), snap(withColumns([...orders.columns, { name: 'vip', type: 'INTEGER' }, { name: 'coupon', type: 'VARCHAR' }]))).changed;
+    expect(add).toMatchObject({ keys: ['columns'], columns: { added: ['coupon', 'vip'], removed: [] } });
+    // 删一列
+    const [drop] = diffCatalog(snap(input()), snap(withColumns(orders.columns.slice(0, 1)))).changed;
+    expect(drop).toMatchObject({ keys: ['columns'], columns: { added: [], removed: ['state'] } });
+    // 只改类型：keys 仍是 columns，但没有列级明细
+    const [retype] = diffCatalog(snap(input()), snap(withColumns([{ ...orders.columns[0]!, type: 'TEXT' }, orders.columns[1]!]))).changed;
+    expect(retype).toMatchObject({ keys: ['columns'] });
+    expect(retype.columns).toBeUndefined();
+    // 非源表条目（自定义实体加字段）不带明细
+    const more = input({ customEntities: [{ ...input().customEntities![0]!, fields: [
+      ...input().customEntities![0]!.fields, { name: 'region', type: 'string', description: '所在大区', sensitive: false },
+    ] }] });
+    const [entity] = diffCatalog(snap(input()), snap(more)).changed;
+    expect(entity).toMatchObject({ id: 'entity:custom_store', keys: ['fields'] });
+    expect(entity.columns).toBeUndefined();
+  });
+
   it('总览带目录版本号，还没有版本时不显示', () => {
     const c = buildCatalog(input());
     expect(overview(c).version).toBeNull();

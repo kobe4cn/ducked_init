@@ -1,4 +1,5 @@
-// app/routes/catalog.changes.tsx —— 目录变更记录（ADR-0041）：所有成员可看，按版本倒序列出各版的原因与新增 / 删除 / 改动的条目（只有标识、类型、名称与变了的顶层键，不显示快照内容）；
+// app/routes/catalog.changes.tsx —— 目录变更记录（ADR-0041）：所有成员可看，按版本倒序列出各版的原因与新增 / 删除 / 改动的条目（只有标识、类型、名称与变了的顶层键，不显示快照内容），
+// 源表条目 columns 键的变化另给列级明细（新增列 / 删除列，#767；旧版本的数据没有这个字段，容忍缺失）；
 // ?since=N 只看 N 之后的版本，最多 50 个版本；裁剪由 catalogChangesFor 按成员的可见性类别负责（与 visibleCatalog 共用规则）：没有 sources:read 的成员（查看者）看不到数据源与源表条目，
 // 数据源相关原因（含源视图发布与删除数据源）的版本只显示「数据源结构变化」、不列明细（ADR-0005）
 import type { Route } from './+types/catalog.changes';
@@ -108,6 +109,18 @@ export default function CatalogChanges({ loaderData }: Route.ComponentProps) {
                       <span>{x.name}</span>
                       <code className="text-xs text-slate-400">{x.id}</code>
                       {'keys' in x && <span className="text-xs text-slate-500">{`变了：${x.keys.join('、')}`}</span>}
+                      {'keys' in x && x.columns && (
+                        <span
+                          className="text-xs text-slate-500"
+                          data-diff-columns-added={x.columns.added.join(',')}
+                          data-diff-columns-removed={x.columns.removed.join(',')}
+                        >
+                          {[
+                            x.columns.added.length ? `新增列：${x.columns.added.join('、')}` : '',
+                            x.columns.removed.length ? `删除列：${x.columns.removed.join('、')}` : '',
+                          ].filter(Boolean).join(' ')}
+                        </span>
+                      )}
                     </li>
                     );
                   }))}

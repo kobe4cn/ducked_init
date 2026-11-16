@@ -119,6 +119,38 @@ describe('目录变更记录', () => {
     expect(viewer).not.toContain('data-diff-id=');
   });
 
+  it('源表加列、删列的改动条目显示列级明细；查看者那一版不列条目（ADR-0005）', async () => {
+    const beta = await newTenant('beta');
+    await getDb().insert(catalogVersions).values({
+      tenantId: beta, version: 1, snapshot: [], reason: 'source.profiled',
+      diff: {
+        added: [], removed: [],
+        changed: [
+          { id: 'table:CRM/orders', kind: 'table' as const, name: 'CRM/orders', keys: ['columns'], columns: { added: ['coupon', 'channel'], removed: ['paid_at'] } },
+          { id: 'table:CRM/customers', kind: 'table' as const, name: 'CRM/customers', keys: ['columns'] },
+        ],
+      },
+    });
+
+    const admin = await (await (await loginAs(app, 'admin@beta.com')).get('/catalog/changes')).text();
+    const row = admin.slice(admin.indexOf('data-diff-id="table:CRM/orders"'));
+    expect(row).toContain('data-diff-columns-added="coupon,channel"');
+    expect(row).toContain('data-diff-columns-removed="paid_at"');
+    expect(row).toContain('新增列：coupon、channel');
+    expect(row).toContain('删除列：paid_at');
+    // 只有类型变化的表条目没有明细（旧数据也没有，读取时容忍缺失）
+    const customers = admin.slice(admin.indexOf('data-diff-id="table:CRM/customers"'));
+    expect(customers).toContain('变了：columns');
+    expect(customers).not.toContain('data-diff-columns-added');
+
+    await memberOf(beta, 'viewer@beta.com', 'viewer');
+    const viewer = await (await (await loginAs(app, 'viewer@beta.com')).get('/catalog/changes')).text();
+    expect(viewer).toContain('data-reason="sources"');
+    expect(viewer).toContain('数据源结构变化');
+    expect(viewer).not.toContain('data-diff-id=');
+    expect(viewer).not.toContain('新增列');
+  });
+
   it('还没有任何版本时显示空状态', async () => {
     await newTenant('beta');
     const html = await (await (await loginAs(app, 'admin@beta.com')).get('/catalog/changes')).text();

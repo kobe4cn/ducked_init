@@ -65,6 +65,17 @@ describe('映射源表列差异', () => {
     expect(drift!.newColumns[0]).toMatchObject({ name: 'level', type: 'VARCHAR', top: [{ value: 'gold', rows: 40 }] });
   });
 
+  it('发布后源表新增一列只同步、不重新采集：随同步入队的自动采集也让这一列照常标出', async () => {
+    const { acme, author, id, mappingId } = await publishedCustomers();
+    await grantOnSource(`ALTER TABLE shop.customers ADD COLUMN level text; UPDATE shop.customers SET level = 'gold'`);
+    await syncSource(author, id);
+    await drain();
+    const drift = (await mappingDrift(acme)).get(mappingId);
+    expect(drift).toMatchObject({ sourceId: id, tableName: 'customers', missing: [] });
+    expect(drift!.newColumns).toHaveLength(1);
+    expect(drift!.newColumns[0]).toMatchObject({ name: 'level', type: 'VARCHAR', top: [{ value: 'gold', rows: 40 }] });
+  });
+
   it('映射引用的列在源端被删除并重新采集：报源端已删除', async () => {
     const { acme, author, id, mappingId } = await publishedCustomers();
     await alterAndRelist(author, id, 'ALTER TABLE shop.customers DROP COLUMN email');
