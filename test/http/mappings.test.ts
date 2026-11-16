@@ -464,6 +464,31 @@ describe('编写与发布映射', () => {
     expect(await (await reviewer.get(`/mappings/${id}?version=1`)).text()).not.toContain('data-draft-diff');
   });
 
+  it('与当前生效已发布版相同的草稿：编辑页与版本列表标「与 v1 相同」，发布被拒并提示丢弃；改了内容后不再标出', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    await memberOf(tenantId, 'de2@acme.com', 'data_engineer');
+    const reviewer = await loginAs(app, 'de2@acme.com');
+
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '1' })).status).toBe(302);
+    // 只加一行注释的草稿（另一位成员保存），编辑页与版本列表在草稿处标出与 v1 相同
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: `# 只加注释\n${ORDERS}` })).status).toBe(302);
+    const page = await (await reviewer.get(`/mappings/${id}`)).text();
+    expect(page).toContain('data-same-as');
+    expect(page).toContain('与 v1 相同');
+    expect(await (await reviewer.get(`/mappings/${id}?tab=versions`)).text()).toContain('与 v1 相同');
+    const rejected = await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '2' });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toContain('与 v1 相同，没有改动，请丢弃草稿');
+    // 真正改了规则后不再标出，可以发布
+    expect((await engineer.post(`/mappings/${id}`, { intent: 'save', yaml: `# 只加注释\n${ORDERS.replace('amount: amount', 'amount: amount / 100')}` })).status).toBe(302);
+    const changed = await (await reviewer.get(`/mappings/${id}`)).text();
+    expect(changed).not.toContain('data-same-as');
+    expect(changed).not.toContain('与 v1 相同');
+    expect((await reviewer.post(`/mappings/${id}`, { intent: 'publish', version: '2' })).status).toBe(302);
+  });
+
   it('发布后源表新增一列、删除映射引用的列并重新采集：映射列表与详情页标出新列（带类型与常见取值）与源端已删除的列', async () => {
     const { tenantId, sourceId } = await tenantWithSource('acme');
     const author = await memberOf(tenantId, 'de@acme.com');

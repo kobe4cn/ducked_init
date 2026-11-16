@@ -104,6 +104,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         /** 当前成员发布不了这一版草稿的原因（没有发布权限、最后保存的是自己、租户里没有别人能发布）；可以发布或不是草稿时为 null */
         publishBlocker: publishReason(member, v, m.publishers),
       })),
+      /** 草稿与当前生效已发布版内容相同时那一版的版本号（发布会被拒）；没有草稿或不相同时为 null */
+      sameAs: m.sameAs,
       /** 草稿相对最新已发布版本 against 的差异；没有草稿时为 null */
       draftDiff: m.draftDiff,
       /** 源表列差异：最近一次采集里映射没用到的新列（带类型与常见取值）与源端已删除的列；没有时为 null */
@@ -564,7 +566,7 @@ function DisableStatus({ disable }: { disable: DisableData }) {
 }
 
 export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, draftDiff, drift, keySpaceChange, disable, merge } = loaderData;
+  const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, sameAs, draftDiff, drift, keySpaceChange, disable, merge } = loaderData;
   // 用模型重新生成或建议断言时的来源、每项置信度与理由
   const generated = actionData && 'generated' in actionData ? actionData.generated : null;
   // 编辑框里是生成的草稿时它的生成记录，保存时一起提交，比对生成稿记下改动；换版本或重新加载后 actionData 没了就不再带
@@ -674,7 +676,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
         {tab === 'edit' && selected && (
           <>
             <div className="mb-4 space-y-1">
-              <div className="flex items-center gap-2 text-sm text-slate-500">正在查看 <span className="font-mono font-semibold text-slate-900">{`v${selected.version}`}</span><VersionStatus v={selected} /></div>
+              <div className="flex items-center gap-2 text-sm text-slate-500">正在查看 <span className="font-mono font-semibold text-slate-900">{`v${selected.version}`}</span><VersionStatus v={selected} sameAs={selected.status === 'draft' ? sameAs : null} /></div>
               <p className="max-w-2xl text-sm text-slate-500">
                 {canWrite
                   ? selected.status === 'draft' ? '保存后你是最后改这一版草稿的人，需由另一位数据工程师或管理员发布。' : draft ? `已发布的版本锁定。已有草稿 v${draft.version}，请在草稿上修改。` : '已发布的版本锁定，在这一版的基础上修改，保存为新的一版草稿。'
@@ -742,7 +744,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
                 {versions.map(v => (
                   <TableRow key={v.version} data-version={v.version} data-version-status={v.status}>
                     <TableCell className="font-mono font-semibold">{`v${v.version}`}</TableCell>
-                    <TableCell><VersionStatus v={v} /></TableCell>
+                    <TableCell><VersionStatus v={v} sameAs={v.status === 'draft' ? sameAs : null} /></TableCell>
                     <TableCell className="text-sm">{v.authors.join('、') || '平台'}</TableCell>
                     <TableCell className="text-sm text-slate-500">{v.publishedBy ? `${v.publishedBy}，${time(v.publishedAt)}` : '—'}</TableCell>
                     <TableCell className="text-right">
