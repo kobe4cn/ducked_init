@@ -54,6 +54,8 @@ const COLUMN_SYNONYMS: Record<string, Record<string, readonly string[]>> = {
     name: ['customer_name', 'user_name', 'real_name', 'full_name', 'nickname', 'nick_name'],
     phone: ['mobile', 'tel', 'phone_no', 'phone_number', 'mobile_no', 'mobile_phone', 'cellphone', 'telephone'],
     email: ['mail', 'email_address', 'e_mail'],
+    // openid 不算：只在单个微信应用内唯一，不是跨渠道的外部 ID，何况 scan_users 一类表里它就是主键
+    external_id: ['unionid', 'union_id', 'wx_unionid', 'wechat_unionid'],
     gender: ['sex'],
     birthday: ['birth_date', 'birthdate', 'date_of_birth', 'dob', 'birth'],
     city: ['city_name'],
