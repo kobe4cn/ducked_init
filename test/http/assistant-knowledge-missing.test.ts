@@ -6,11 +6,12 @@
 // 生成「『词』指的是 〈名称〉（entryId）」的 user 消息并带 chosen.kind: 'missing'，这一轮答复带 kind: 'alias' 的「记为别名」卡片
 //（读时计算不存库），确认后生成待复核的 alias 提案（assistant-missing/1），接受后再搜同一说法按别名命中、不再出未命中组；
 // choice.entryId 为 null 是「都不是」：生成「『词』不是这些候选里的任何一个」（不带 chosen、不出卡片），上一轮没有未命中组时 400 且不请求模型
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { assistantConversations, knowledgeAliases } from '../../app/.server/db/schema';
 import { appendTurn, ASSISTANT_CONTEXT } from '../../app/.server/assistant/conversations';
+import { retireAlias } from '../../app/.server/knowledge/aliases';
 import { listProposals, proposeKnowledge, rejectProposal } from '../../app/.server/knowledge/proposals';
 import { decryptForTenant } from '../../app/.server/secrets';
 import { memberOf } from '../pipeline/fixtures';
@@ -130,7 +131,7 @@ describe('说法未命中的结构化候选（⑥-5）', () => {
   });
 
   it('确认「记为别名」卡片后有一条待复核的 alias 提案（content 只有词、证据只有对话引用、不含原话），接受后再搜同一说法按别名命中、不再出未命中组', async () => {
-    const { acme, client } = await ordersTenant();
+    const { acme, analyst, client } = await ordersTenant();
     const { first } = await askWithSearch(client, '实际支付');
     await post(client, { conversationId: first.conversationId, choice: { entryId: 'field:order.amount' } });
 
@@ -152,6 +153,20 @@ describe('说法未命中的结构化候选（⑥-5）', () => {
     // 审核状态变了，读回跟着变：词已是这个条目的别名，卡片不再出现
     const after = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
     expect(after.conversation.messages[3]).not.toHaveProperty('askCard');
+
+    // 接受后直接提交：词已是这个条目的别名，409、不新增提案
+    const repeat = await post(client, { intent: 'knowledge.propose', conversationId: first.conversationId, index: 2 });
+    expect(repeat.status).toBe(409);
+    expect(await repeat.json()).toEqual({ error: '这个说法已经是这个条目的名称或别名' });
+
+    // 停用这条别名后再提交：实时目录里已没有它，但指纹已接受过，仍 409、不新增提案
+    const [alias] = await getDb().select({ id: knowledgeAliases.id }).from(knowledgeAliases).where(and(
+      eq(knowledgeAliases.tenantId, acme), eq(knowledgeAliases.targetId, 'field:order.amount'), eq(knowledgeAliases.alias, '实际支付')));
+    await retireAlias(analyst, alias.id);
+    const retired = await post(client, { intent: 'knowledge.propose', conversationId: first.conversationId, index: 2 });
+    expect(retired.status).toBe(409);
+    expect(await retired.json()).toEqual({ error: '已接受过这条别名' });
+    expect(await listProposals(getDb(), acme)).toHaveLength(1);
   });
 
   it('同一个说法已有待复核的 alias 提案（不论挂在哪个条目上）时没有卡片、直接提交 409；那条提案被拒绝后再点选它挂的条目，指纹已被拒绝过，同样没有卡片、409', async () => {
