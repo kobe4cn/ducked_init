@@ -7,7 +7,7 @@
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { dslVersions, snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
+import { dslDefinitions, dslVersions, snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { createDefinition } from '../../app/.server/dsl-definitions';
 import { listSnapshots, readTemplateSnapshot } from '../../app/.server/snapshots';
@@ -155,16 +155,21 @@ describe('分析页 · 指标与标签列表', () => {
     expect(html).not.toContain('/analytics/definitions/new');
   });
 
-  it('快照表区分系统内置模板与自建指标、标签：rfm 显示「分析模板」「系统内置」，metric:revenue 显示「指标」「自建」及创建人，找不到定义的 tag:buyer 显示「标签」「自建」；可按定义筛选；定义页的「快照」区按时间列出', async () => {
+  it('快照表区分系统内置模板与自建指标、标签：rfm 显示「分析模板」「系统内置」，metric:revenue 显示「指标」「自建」及创建人，找不到定义的 tag:buyer 显示「标签」「自建」；「最近计算」显示最新快照与最新任务的状态；可按定义筛选；定义页的「快照」区按时间列出', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     await createDefinition(analyst, 'metric', 'revenue', REVENUE);
     await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const [definition] = await getDb().select({ id: dslDefinitions.id }).from(dslDefinitions)
+      .where(and(eq(dslDefinitions.tenantId, acme), eq(dslDefinitions.key, 'revenue')));
     const taskRows = await getDb().insert(tasks).values([
       { tenantId: acme, kind: 'gold.rfm', status: 'succeeded' },
+      // 算出 2024-08-01 那张快照的任务：成功，但比下面失败的那次重算早
+      { tenantId: acme, kind: 'gold.dsl', status: 'succeeded', params: { definitionId: definition!.id }, createdAt: new Date(Date.now() - 3_600_000) },
       { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
       { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
-      { tenantId: acme, kind: 'gold.dsl', status: 'succeeded' },
+      // revenue 最新一次计算失败：「最近计算」的状态取这一条
+      { tenantId: acme, kind: 'gold.dsl', status: 'failed', params: { definitionId: definition!.id } },
     ]).returning();
     const [rfm, revenue, , buyer] = await getDb().insert(snapshots).values([
       { tenantId: acme, template: 'rfm', taskId: taskRows[0]!.id, table: `gold.rfm__${taskRows[0]!.id}`, params: { asOf: '2024-07-01' }, rowCount: 5, expiresAt: new Date(Date.now() + 86_400_000) },
@@ -187,6 +192,9 @@ describe('分析页 · 指标与标签列表', () => {
     // 「指标与标签」列表的「最近计算」：最新一张快照的统计日、来源、行数
     const defRow = new RegExp('data-definition-row="metric:revenue"(?:(?!</tr>).)*', 's').exec(html)?.[0] ?? '';
     expect(defRow).toContain('2024-08-01 · 手动 · 3 行');
+    // 「最近计算」的状态取本定义最新一条 gold.dsl 任务（失败），不是更早成功的那条
+    expect(defRow).toContain('失败');
+    expect(defRow).not.toContain('成功');
 
     // 快照表按定义筛选：只剩 revenue 这一张
     const filtered = await (await viewer.get('/analytics?definition=metric:revenue')).text();
