@@ -10,8 +10,10 @@
 // 输入框），由助手工具重新校验后再存草稿 / 填工作台；没有 planCard 只有 workbenchSql 的消息照旧给「填入工作台」链接
 // 歧义追问的候选按钮（⑥-4，ADR-0047 / 0046）：带 choices 的答复下列出候选，点选后 POST choice 继续这一轮——回答的文字由
 // 服务端生成、POST 不返回，所以本地不追加，成功后整个对话按服务端重新读回（消息、下标与卡片都以它为准）；
-// 被分享人只读（readOnlyOwner）：服务端照旧返回 choices，候选按钮与「记为知识提案」卡片只在前端隐藏
-// 「记为知识提案」卡片（KnowledgeAskCard）：点选候选的答复下由服务端确定性生成，确认后生成待复核的默认指向提案
+// 未命中组的标题是「指的是哪一个？」并多一个「都不是」按钮（⑥-5），点了提交 entryId: null；被分享人只读（readOnlyOwner）：
+// 服务端照旧返回 choices，候选按钮、「都不是」与「记为知识提案」卡片只在前端隐藏
+// 「记为知识提案」卡片（KnowledgeAskCard）：点选候选的答复下由服务端确定性生成，确认后生成待复核的提案
+//（歧义点选默认指向、未命中点选别名，文案按 kind 区分）
 import { useEffect, useRef, useState } from 'react';
 import { Link, useFetcher, useLocation } from 'react-router';
 import { AlertTriangle, History, Send, Sparkles, X } from 'lucide-react';
@@ -22,7 +24,7 @@ import { Input } from '~/components/ui/input';
 import type { AskCard } from '~/.server/assistant/knowledge-ask';
 import type { PlanCardView } from '~/.server/assistant/plan-card';
 
-interface Message { role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: { sql: string; rows: number; columns: string[] }; workbenchSql?: string; planCard?: PlanCardView; choices?: { term: string; candidates: { entryId: string; name: string }[] }[]; askCard?: AskCard }
+interface Message { role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: { sql: string; rows: number; columns: string[] }; workbenchSql?: string; planCard?: PlanCardView; choices?: { term: string; kind?: 'missing'; candidates: { entryId: string; name: string }[] }[]; askCard?: AskCard }
 interface Summary { id: string; title: string; updatedAt: string; owner?: string }
 interface Conversation { id: string; title: string; messages: Message[]; owned: boolean; sharedWith: string[] }
 type Overview = { configured: boolean; toolSupport: boolean | null; canManageProvider: boolean; tools: string[]; mine: Summary[]; shared: Summary[]; conversation?: Conversation } | { error: string };
@@ -150,8 +152,8 @@ export function AssistantPanel() {
     shareFetcher.submit({ intent, conversationId, email }, JSON_POST);
   }
 
-  /** 点选歧义追问的候选（⑥-4）：POST choice 继续这一轮，回答与卡片由服务端生成、成功后整个对话重新读回 */
-  function pickChoice(entryId: string) {
+  /** 点选追问的候选（⑥-3 歧义 / ⑥-5 未命中；entryId 为 null 是「都不是」）：POST choice 继续这一轮，回答与卡片由服务端生成、成功后整个对话重新读回 */
+  function pickChoice(entryId: string | null) {
     if (!conversationId || busy || !usable || readOnlyOwner) return;
     sentChoice.current = true;
     setError(null);
@@ -242,16 +244,20 @@ export function AssistantPanel() {
                         <p className="whitespace-pre-wrap">{m.content}</p>
                         {m.planCard && <PlanCard card={m.planCard} workbenchSql={m.workbenchSql} onFollowUp={readOnlyOwner ? undefined : t => send(t)} />}
                         {!m.planCard && m.workbenchSql && <Link data-prefill to={`/workbench?sql=${encodeURIComponent(m.workbenchSql)}`} className="text-xs underline">填入工作台</Link>}
-                        {/* 歧义追问的候选按钮（⑥-4）：被分享人只读，服务端照旧返回 choices，这里不渲染按钮 */}
+                        {/* 追问的候选按钮（⑥-3 歧义 / ⑥-5 未命中）：被分享人只读，服务端照旧返回 choices，这里不渲染按钮 */}
                         {!readOnlyOwner && m.choices && m.choices.length > 0 && (
                           <div data-choices className="mt-2 space-y-2 rounded-lg border bg-slate-50 p-3">
                             {m.choices.map(g => (
                               <div key={g.term} className="space-y-1">
-                                <p className="text-slate-500">{`『${g.term}』指哪一个？`}</p>
+                                <p className="text-slate-500">{g.kind === 'missing' ? `『${g.term}』指的是哪一个？` : `『${g.term}』指哪一个？`}</p>
                                 <div className="flex flex-wrap gap-1.5">
                                   {g.candidates.map(c => (
                                     <Button key={c.entryId} type="button" size="xs" variant="outline" data-choice={c.entryId} disabled={busy} onClick={() => pickChoice(c.entryId)}>{c.name}</Button>
                                   ))}
+                                  {/* 「都不是」（⑥-5）只属于未命中组：歧义组由点选回答，没有这个按钮 */}
+                                  {g.kind === 'missing' && (
+                                    <Button type="button" size="xs" variant="ghost" data-choice-none disabled={busy} onClick={() => pickChoice(null)}>都不是</Button>
+                                  )}
                                 </div>
                               </div>
                             ))}

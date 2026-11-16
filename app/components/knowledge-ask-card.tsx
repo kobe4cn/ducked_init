@@ -1,7 +1,8 @@
-// app/components/knowledge-ask-card.tsx —— 助手答复下的「记为知识提案」卡片（⑥-4，ADR-0046 / 0056）：点选歧义候选后
-// 由服务端确定性组装（askCardFor，不是模型生成的），这里只渲染与提交：确认后生成一条待复核的词的默认指向提案，
-// 接受前不进目录（ADR-0046）。只给本人渲染（被分享人只读，见 assistant-panel）；「不用」只在本地隐藏、不写库；
-// 成功后显示「已提交，待复核」（amber，待确认），出错在卡片里用 role="alert" 说明原因（如同词已有待复核提案）
+// app/components/knowledge-ask-card.tsx —— 助手答复下的「记为知识提案」卡片（⑥-4 / ⑥-6，ADR-0046 / 0056）：点选歧义或未命中候选后
+// 由服务端确定性组装（askCardFor，不是模型生成的），这里只渲染与提交：确认后生成一条待复核的提案——歧义点选是词的默认指向
+//（term_default），未命中点选是别名（alias），文案按 kind 区分；接受前不进目录（ADR-0046）。只给本人渲染（被分享人只读，
+// 见 assistant-panel）；「不用」只在本地隐藏、不写库；成功后显示「已提交，待复核」（amber，待确认），
+// 出错在卡片里用 role="alert" 说明原因（如同词已有待复核提案）
 import { useState } from 'react';
 import { useFetcher } from 'react-router';
 import { Button } from '~/components/ui/button';
@@ -18,7 +19,10 @@ export function KnowledgeAskCard({ card, conversationId }: { card: AskCard; conv
   if (dismissed) return null;
   return (
     <div data-ask-card className="mt-2 space-y-2 rounded-lg border border-amber-200 bg-amber-50/50 p-3 text-xs">
-      <p className="font-medium text-slate-700">{`把『${card.term}』默认指向 〈${card.name}〉？`}</p>
+      {/* 文案按 kind 区分：未命中点选是「记为别名」，歧义点选是「默认指向」 */}
+      <p className="font-medium text-slate-700">
+        {card.kind === 'alias' ? `把『${card.term}』记为 〈${card.name}〉 的别名？` : `把『${card.term}』默认指向 〈${card.name}〉？`}
+      </p>
       {propose.data?.ok ? (
         // 已提交：等成员在 /knowledge 复核（接受前不进目录），不再给提交入口
         <p className="text-amber-600">已提交，待复核</p>
