@@ -17,7 +17,7 @@
 
 另记两笔：
 
-- 将来文件上传数据源（ADR-0037）删除时，数据湖前缀下的 `_uploads/<上传目录 ID>/` 也要一并删掉。
+- 文件上传数据源（ADR-0037）删除时，数据湖前缀下的 `_uploads/<上传目录 ID>/` 也一并删掉：`deleteSource` 事务提交后在平台进程里用 `removeUpload` 删 `_uploads/<config.dir>/`（平台账号，目录不在时不报错，失败只记日志；用量由下一轮 `refreshStorageUsage` 降下来）。
 - 本机 DuckDB 文件数据源指向的文件不归平台管，删除数据源时不删它。
 
 ## Considered Options
