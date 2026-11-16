@@ -21,10 +21,9 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~
 
 export function meta({ loaderData }: Route.MetaArgs) {
   const s = loaderData?.snapshot;
-  const title = !s
-    ? '分析'
-    : `${'definition' in s ? `${s.definition.kindLabel} ${s.definition.key}` : s.templateLabel} · ${s.asOf}`;
-  return [{ title: `${title} · CRM 数据分析平台` }];
+  if (!s) return [{ title: '分析 · CRM 数据分析平台' }];
+  const name = 'definition' in s ? `${s.definition.kindLabel} ${s.definition.key}` : s.templateLabel;
+  return [{ title: `${name} · ${s.asOf} · CRM 数据分析平台` }];
 }
 
 type Tab = 'segments' | 'consumers';
