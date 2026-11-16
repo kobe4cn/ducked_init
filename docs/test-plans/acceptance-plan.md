@@ -400,7 +400,7 @@ node --env-file=.env --import tsx scripts/fmcg-seed/verify.ts fmcglab --only ide
 | S3.3 | jd_s3 建源视图 `jd_buyers`、douyin_s3 建源视图 `dy_buyers`，发布后映射 `jd_s3.jd_buyers.customer.yaml`、`douyin_s3.dy_buyers.customer.yaml` | 每个买家一条消费者记录（K9）；试着加上 `view_key: [openid]`，空跑与合并报 view_key 不唯一并列出重复标识（MAP-8），去掉再发 |
 | S3.4 | **P04 占位号**：先把 `station_mysql.members.customer.yaml` 里的 `phone: nullif(phone, '13800000000')` 改成 `phone: phone` 发布 | `--only identity`：误合并 1，最大的统一消费者有 267 个真实的人；**质量页出现「热值」告警**指向 13800000000（ID-3） |
 | S3.5 | 改回 `nullif(…)` 发布第 2 版（或在质量页把这个值标为不参与匹配，看完再撤销排除、改回映射） | 误合并 0；266 人拆出来。`--only identity` 打印「先合后拆后的退役 ID」，S5 的 API-4b 用 |
-| S3.6 | **P05 代填号**：activity_s3 先**直接**把 `signups` 表映射为消费者（字段照 `activity_s3.signups_clean.customer.yaml`，只把 `view: signups_clean`、`view_key` 换成 `table: signups`）发布 | 误合并 4 个统一消费者，每个是 1 位导购 + 10 个路人；质量页热值告警 |
+| S3.6 | **P05 代填号**：activity_s3 先**直接**把 `signups` 表映射为消费者（字段照 `activity_s3.signups_clean.customer.yaml`，把 `view: signups_clean` 换成 `table: signups`，并删掉 `view_key` 一行：直接映射源表不能写 `view_key`）发布 | 误合并 4 个统一消费者，每个是 1 位导购 + 10 个路人；质量页热值告警 |
 | S3.7 | 停用 S3.6 的映射：eng「提议停用」、admin「确认停用」 | 两人分别操作，审计两条；确认后入队合并，撤下它在标准层的行（MAP-10） |
 | S3.8 | 建源视图 `signups_clean`，发布后映射 `activity_s3.signups_clean.customer.yaml` | `--only identity`：缺失、被拆开、误合并、多出都是 0；**统一消费者 69,335**（ID-1） |
 | S3.9 | **K8**：做完 S3.18 再跑 `--only consumer` | 城市不符 0，K8 = 上海（会员中心 `survivorship.priority: 1`） |
@@ -409,14 +409,14 @@ node --env-file=.env --import tsx scripts/fmcg-seed/verify.ts fmcglab --only ide
 
 | # | 操作 | 期望 |
 |---|---|---|
-| S3.10 | **K1 键空间**：映射 `mall_pg.orders` 与 `station_mysql.bills`，**都先删掉 `key_space` 一行**再发布 | 后合并的那个失败，列出冲突的订单号，**报错建议键空间或合并组**（MAP-6）；「主键冲突体检」→ 运行：建议键空间 |
-| S3.11 | 加回 `key_space: mall` / `station` 各发一版 | 合并成功；`silver."order"` = 260,846 + 31,729（奶站 12 张测试账单被 `where` 去掉，K7） |
+| S3.10 | **K1 键空间**：映射 `mall_pg.orders` 与 `station_mysql.bills`，**都先删掉 `key_space` 一行**再发布 | 后合并的那个失败，列出冲突的订单号，**报错建议键空间或合并组**（MAP-6）；「主键冲突体检」→ 运行：建议键空间（#778 修好前体检只看标准层里的行，合并失败的映射不在其中，会显示「没有主键冲突」） |
+| S3.11 | 加回 `key_space: mall` / `station` 各发一版 | 合并成功；`silver."order"` = 260,846 + 32,005（奶站 12 张测试账单被 `where` 去掉，K7；合并记录显示过滤 12 行） |
 | S3.12 | **K1b**：映射 `mall_pg.order_items`，先把 `order_id` 写成 `string(order_id)`（不带 `key_space`） | 发布被拒：引用字段要写同一数据源里目标实体声明的键空间；改回文件里的写法后通过 |
-| S3.13 | **K2 去重**：映射 `tmall_s3.trades`、`jd_s3.jd_orders`、`douyin_s3.dy_orders` 的订单；oms_mongo 建源视图 `oms_tmall`、`oms_jd`、`oms_douyin`，发布后映射对应的 3 个订单映射 | 三个中台映射合并失败：主键跨映射重复；体检建议「多半是重复接入，可以建合并组」 |
+| S3.13 | **K2 去重**：映射 `tmall_s3.trades`、`jd_s3.jd_orders`、`douyin_s3.dy_orders` 的订单；oms_mongo 建源视图 `oms_tmall`、`oms_jd`、`oms_douyin`，发布后映射对应的 3 个订单映射 | 三个中台映射合并失败：主键跨映射重复；体检建议「多半是重复接入，可以建合并组」（#778 修好前同 S3.10，体检显示无冲突） |
 | S3.14 | **建合并组**：映射页 → 合并组 → 实体 order，组员优先级 1 tmall trades、2 jd_orders、3 dy_orders、4 oms_tmall、5 oms_jd、6 oms_douyin；规则「取最新」，字段 `updated_at`；eng 保存、admin 发布 | 合并记录：重叠 97,328 行，status 不一致 13,487 行、updated_at 97,328 行；`--only silver` 订单合并组状态 / 胜出方 / 物流不符都是 0；中台胜出 87,700 行 |
 | S3.15 | **K2a / K2b 覆盖**：看 verify 的「订单合并组探针」 | k2a-tm → 已退款，胜出方 oms；k2b-jd → 已完成，胜出方 jd |
 | S3.16 | **K3 补齐**：映射 `erp_mysql.products` 与 `scan_mysql.sku_points` 的商品 | 第二个合并失败（独占）；建合并组：product，1 ERP、2 扫码平台，「逐字段补齐」，发布 → 商品 63 行，品牌不符 0 |
-| S3.17 | **K3b**：商品合并组改成「按优先级」发第 2 版，比较后改回「逐字段补齐」发第 3 版 | 第 2 版：品牌不符 8；第 3 版恢复 0 |
+| S3.17 | **K3b**：商品合并组改成「按优先级」发一版，比较后改回「逐字段补齐」再发一版 | 按优先级：品牌不符 8；改回后恢复 0 |
 | S3.18 | **K4 明细**：映射 `tmall_s3.trade_items`、`douyin_s3.dy_orders.order_item`；jd_s3 建源视图 `jd_lines` 后映射 `jd_s3.jd_lines.order_item.yaml`；再跑一次体检 | 订单明细四个源都 ✔；天猫约 5% 明细商品为空 |
 
 **其余事实与自定义实体**
@@ -426,7 +426,7 @@ node --env-file=.env --import tsx scripts/fmcg-seed/verify.ts fmcglab --only ide
 | S3.19 | member_pg 其余 7 个映射、`station_mysql.members.consent.yaml` | 同一张奶站会员表映射成消费者又映射成同意 |
 | S3.20 | 行为事件：`events_s3.events`、`scan_mysql.scans`、`wecom_duckdb.group_members`；建源视图 `group_quits` 后映射；`activity_s3.signups.event.yaml`；触达 `wecom_duckdb.mass_sends.touch.yaml` | `--only identity`：设备归属不符 0（ID-6）；`--only silver` event 五个源都 ✔（扫码 382,792） |
 | S3.21 | 「自定义实体」按顺序登记并发布（字段与关系见下） | 关系要在订单、扫码事件的映射发布之后才能登记 |
-| S3.22 | 映射 6 个自定义实体（`*.custom_*.yaml`） | `--only silver` 全 ✔；积分断言 points_balance 1 个会员差额 799，points_chain 0；数据地图看到 order → custom_station → custom_region（MAP-9） |
+| S3.22 | 映射 6 个自定义实体（`*.custom_*.yaml`） | `--only silver` 全 ✔；数据地图看到 order → custom_station → custom_region（MAP-9）。积分断言 points_balance 1 个会员差额 799、points_chain 0 在 S4 结果层计算后核对（断言在 `gold.dsl` 里跑） |
 
 自定义实体：
 - **维度** `custom_region`（region_id、region_name）
@@ -1033,7 +1033,7 @@ pnpm eval:mapping:compare <旧结果> <新结果>
 | S0 | ENV-1–6、造数、§3.6 素材、冒烟 A / B、VOL L0 | 2026-11-15 | ✅（ENV-6 未配，可选） | ENV-5：seaweedfs 按 `db_script/start.sh` 重建，Max 2000、新桶首写 +1 卷；造数 `--end 2026-11-15`；check-mappings A 64 ✔ / B 49 ✔；L0 36 张表对上（bills 以真值为准）；`verify.ts` A、B 均无 ✘（B 17 个定义 ✔） | B 冒烟租户映射过时（`douyin_buyers` 带 view_key、`events_s3` 停在 #191 之前），已按仓库发布新版本并停用 `users → customer`；`crm-seed/setup.ts` 的 recompute 复用旧任务 SQL（asOf 窗口写死），已改为 `recomputeDefinition`；重置后首批 `serving.build` 因旧快照已删失败、随后成功（暂态） |
 | S1 | S1.1–S1.8、OPS-1–9、AUTH-1–7 | 2026-11-15 | ✅（OPS-6–9 留到 S2 / ISO / AI-R6） | A 由 `/ops` 页面创建（审计 `tenant.created` 操作者为运营者）；B `verify.ts crmlab` 46 ✔ 无 ✘；**C 用 `isolab2`**（旧 `isolab` 早于每租户一桶，没有 `lake-<id>` 桶），后续 C 的用例一律换成 `isolab2`；三个租户各有 `lake-<id>` 桶，catalog、对象存储账号、只读账号互不相同；配额审计带前后值；用量统计 10 分钟内出现；混合检索三家都关；OPS-4 停用、恢复都进审计，停用期间不签发登录链接；AUTH-2 陌生邮箱连续 5 次后被限流、不签发；AUTH-3 / 4 按用户确认判过；OPS-1 / 5、AUTH-1 旧链接复用、AUTH-5–7 为页面观察 | AUTH-1 原期望写成「邀请邮件里的链接一次性」，与实现不符（邀请邮件只给 `/login` 地址），已改写；已登录的浏览器配置打开 `/login` 直接跳回首页，易误判为「没发链接」；crmlab 配额由冒烟脚本直接改库（无审计，脚本行为） |
 | S2 | S2.1–S2.12、SRC-1–15、VOL-1、VOL-6 | 2026-11-15 | ✅（SRC-9、ISO-C3c ⚠️ 见 #767；SRC-9 后半与 S3.1 一起验） | SRC-2 拒绝写权限账号并列出 34 项；13 源 36 表登记、注释与 §3.6 一致；17 张表水位线、16 个业务主键；同步后原始层逐表 = L0，核对 36/36 覆盖 100%、缺失 0、多余 0（VOL-1）；SRC-7 原始层整湖文件加密（80/80 文件带密钥）；ISO-C1–C3 在 `isolab2` 上做，加测源端恢复（C3b）与改名（C3c）；S2.8 GBK 上传：湖里存 UTF-8、审计记 gbk、7 列中文列名正确；S2.9 两份上传查询结果相同（华北 6 / 华东 12 · 16,896 / 华南 6，合计 24 行 360 箱 34,560，VOL-6）；S2.10 上限 1 时被拒、改回 100 后能登记，两次配额审计带前后值；S2.11 按用户确认判过；S2.12 注释版本 1、提案 0 | **#767**：同步发现结构变化不重新采集，目录版本、新列提示与改名修复草稿都停在旧结构；数据源页同页提交跳回顶部（#760、#768 修）；查询页原始层数据源默认全展开（#769 改为折叠）；上传预览超限无提示（#770 修）；验收中途 main 合入新迁移（`knowledge_term_defaults`、`model_prices`），本地平台库没迁移时保存数据源报错——**中途拉代码后先 `pnpm db:migrate` 并重启 dev 与调度器**；member_pg / station / wecom 的核对点在确认水位线之前，补点后通过；删除上传数据源 `dealer_upload_utf8`、`big_upload`：审计、目录版本、`source.drop` 清掉原始层都正常，但 `_uploads/<目录>/` 下的 CSV 没删（ADR-0044 写明「将来要一并删掉」，未实现，残留 1,561 + 4,068,902 字节、计入存储用量；**#771**） |
-| S3 | S3.1–S3.22、MAP-1–11、ID-1–6、VOL-2–3 | | | | |
+| S3 | S3.1–S3.22、MAP-1–11、ID-1–6、VOL-2–3 | 2026-11-16 | ⚠️ S3.1–S3.22 数据全部对上；MAP-2、MAP-9、两处体检 ❌；MAP-3、MAP-4、MAP-7、MAP-11、VOL-3 未跑，MAP-8、S3.12 的发布被拒未确认 | SRC-9 后半：加 `vip_tier` 后同步记 `schema.added`，members 行只提示 1 个新列；S3.2 第一次被拆开 7,262（scan_users 映射漏了 `external_id: unionid`），补上发 v2 后被拆开 0、误合并 0，P01 连成 1 人；S3.3 京东 7,245、抖音 4,633 个买家各一条，K9 ✔；S3.4 误合并 1（267 个真实的人），质量页热值告警只显示哈希（ID-3）；S3.5 标为不参与匹配 → 误合并 0、拆出 266 人，撤销排除后改映射发 v2 → 误合并 0，266 个退役 ID 由 merge 记录别名（S5.3 API-4b 用）；S3.6 误合并 4，每个 11 人；S3.7 停用：提议（eng）与确认（admin）两条审计，确认后撤下（MAP-10）；S3.8 缺失 / 拆开 / 误合并 / 多出都是 0，统一消费者 69,335（ID-1）；S3.9 城市不符 0，K8 = 上海；S3.10 后合并的 bills 失败，报错指向键空间与合并组（MAP-6）；S3.11 商城 260,846 + 奶站 32,005（过滤 12 行）；S3.12 明细 518,768 行、金额对上；S3.13 中台三个视图因撞号失败，冲突 20,292 / 32,117 / 44,919，合计 97,328；S3.14 合并组：重叠 97,328、status 不一致 13,487，状态 / 胜出方 / 物流不符 0，中台胜出 87,700，各来源订单数与金额 ✔；S3.15 K2a、K2b ✔；S3.16 商品 63 行、品牌不符 0（撞号 60 个）；S3.17 按优先级 v3 品牌不符 8，改回 v4 恢复 0（多出的 v2 与 v1 相同，所以版本号比原计划大 1）；S3.18 明细四个源 ✔，天猫商品为空 8,199 行（4.97%），京东经 `jd_lines` 全部关联上商品；S3.19 同意不符 0，K5 短信 = revoked，会员中心 6 个实体都 ✔；S3.20 设备归属 28,929 台、不符 0（ID-6），event 五个源与 touch ✔；S3.21 6 个自定义实体及其关系按计划登记发布（含 order.store_id、event.x_code 起点）；S3.22 6 个映射全 ✔；ID-5 01:35 之后身份打通又重算了 8 次，merged / split 都是 0，`_consumer_id_changes` 没有新增记录；VOL-2 order 与 `--only silver` 期望一致、重叠 = 中台与平台导出的交集；MAP-1 规则草稿的同义词、值字典与去重键都对，但 unionid 没有对应到 external_id；MAP-2 模型（qwen-plus）给出 `identity.match: [customer_id]`，整份草稿未采用 | **#778** 主键冲突体检只看标准层，合并失败的映射看不到（S3.10、S3.13）；**#783** 合并组页没有版本列表；**#784** 内容和已发布版完全相同的草稿也能发布，并触发重建（合并组 v2、dy_buyers v2）；**#790** 数据地图不画自定义实体关系（MAP-9）；**#791** 模型草稿错 1 处就整份丢弃、规则草稿不认 unionid、用量页 Schema 通过率不反映映射校验（MAP-1、MAP-2、S3.2）；**#775** 首页没有「待你发布」（admin 找不到源视图草稿）；**#776** 新建映射页切换表与实体后，编辑框里仍是旧的默认草稿；撞号报错里的映射写成 UUID、没写名字；同一版草稿的后续修改不进审计（只有第一次 `mapping.drafted`）；数据地图空白是 Vite「Outdated Optimize Dep」504（标签页过期，强制刷新即可）；计划已修：S3.6 删掉 `view_key`、S3.11 改为 32,005、S3.10 / S3.13 体检注 #778、S3.17 版本号、积分断言挪到 S4；README T3.1 / T3.2 同步修改 |
 | S4 | S4.1–S4.14、TPL-1–3、DEF-1–11 | | | | |
 | SK | SK.1–SK.20、KN-1–12 | | | | |
 | S5 | S5.1–S5.7、API-1–9、WB-1–7、PII-1–3、VOL-5 | | | | |
