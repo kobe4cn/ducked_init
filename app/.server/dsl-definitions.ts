@@ -330,8 +330,11 @@ export interface DefinitionSummary {
   published: number | null;
   /** 草稿（每个定义最多一份）；没有时为 null */
   draft: { version: number; lastEditor: string; updatedAt: Date } | null;
-  /** 最近一次计算：最新一张未过期快照的统计日与最新一条 gold.dsl 任务的状态；两者都没有时为 null（页面写「未计算」） */
-  lastRun: { asOf: string | null; status: TaskStatus | null } | null;
+  /**
+   * 最近一次计算：最新一张未过期快照的统计日、来源、行数与最新一条 gold.dsl 任务的状态；两者都没有时为 null（页面写「未计算」）。
+   * 还没有快照时 asOf / trigger / rowCount 都为 null
+   */
+  lastRun: { asOf: string | null; trigger: SnapshotTrigger | null; rowCount: number | null; status: TaskStatus | null } | null;
 }
 
 /**
@@ -367,13 +370,15 @@ export async function listDefinitions(actor: CurrentMember): Promise<DefinitionS
     }
   }
   if (summaries.length) {
-    // 最新一张未过期快照的统计日（按创建时间降序，每个模板只留第一个）
+    // 最新一张未过期快照的统计日、来源、行数（按创建时间降序，每个模板只留第一个）
     const templateOf = new Map(summaries.map(d => [`${d.kind}:${d.key}`, d]));
-    const asOfByTemplate = new Map<string, string | null>();
-    for (const s of await getDb().select({ template: snapshots.template, asOf: sql<string | null>`${snapshots.params}->>'asOf'` }).from(snapshots)
+    const latestByTemplate = new Map<string, { asOf: string | null; trigger: SnapshotTrigger | null; rowCount: number }>();
+    for (const s of await getDb().select({
+      template: snapshots.template, asOf: sql<string | null>`${snapshots.params}->>'asOf'`, trigger: snapshots.trigger, rowCount: snapshots.rowCount,
+    }).from(snapshots)
       .where(and(eq(snapshots.tenantId, tenantId), isNull(snapshots.expiredAt), inArray(snapshots.template, [...templateOf.keys()])))
       .orderBy(desc(snapshots.createdAt))) {
-      if (!asOfByTemplate.has(s.template)) asOfByTemplate.set(s.template, s.asOf);
+      if (!latestByTemplate.has(s.template)) latestByTemplate.set(s.template, { asOf: s.asOf, trigger: s.trigger, rowCount: s.rowCount });
     }
     // 最新一条 gold.dsl 任务的状态（按创建时间降序，每个定义只留第一个）
     const statusById = new Map<string, TaskStatus>();
@@ -383,9 +388,11 @@ export async function listDefinitions(actor: CurrentMember): Promise<DefinitionS
       if (!statusById.has(t.definitionId)) statusById.set(t.definitionId, t.status);
     }
     for (const [id, summary] of byId) {
-      const asOf = asOfByTemplate.get(`${summary.kind}:${summary.key}`) ?? null;
+      const latest = latestByTemplate.get(`${summary.kind}:${summary.key}`);
       const status = statusById.get(id) ?? null;
-      if (asOf !== null || status !== null) summary.lastRun = { asOf, status };
+      if (latest || status !== null) {
+        summary.lastRun = { asOf: latest?.asOf ?? null, trigger: latest?.trigger ?? null, rowCount: latest?.rowCount ?? null, status };
+      }
     }
   }
   return summaries;

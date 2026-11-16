@@ -166,7 +166,7 @@ describe('分析页 · 指标与标签列表', () => {
     ]).returning();
     const [rfm, revenue] = await getDb().insert(snapshots).values([
       { tenantId: acme, template: 'rfm', taskId: taskRows[0]!.id, table: `gold.rfm__${taskRows[0]!.id}`, params: { asOf: '2024-07-01' }, rowCount: 5, expiresAt: new Date(Date.now() + 86_400_000) },
-      { tenantId: acme, template: 'metric:revenue', taskId: taskRows[1]!.id, table: `gold.metric__${taskRows[1]!.id}`, params: { asOf: '2024-08-01' }, rowCount: 3, expiresAt: new Date(Date.now() + 86_400_000) },
+      { tenantId: acme, template: 'metric:revenue', taskId: taskRows[1]!.id, table: `gold.metric__${taskRows[1]!.id}`, params: { asOf: '2024-08-01' }, trigger: 'manual', rowCount: 3, expiresAt: new Date(Date.now() + 86_400_000) },
     ]).returning();
     const viewer = await loginAs(app, 'viewer@acme.com');
 
@@ -175,6 +175,10 @@ describe('分析页 · 指标与标签列表', () => {
     expect(html).toMatch(new RegExp(`data-snapshot="${rfm!.id}"(?:(?!</tr>).)*>系统内置<`, 's'));
     expect(html).toMatch(new RegExp(`data-snapshot="${revenue!.id}"(?:(?!</tr>).)*>指标<`, 's'));
     expect(html).toMatch(new RegExp(`data-snapshot="${revenue!.id}"(?:(?!</tr>).)*>自建 · analyst@acme\\.com<`, 's'));
+
+    // 「指标与标签」列表的「最近计算」：最新一张快照的统计日、来源、行数
+    const defRow = new RegExp('data-definition-row="metric:revenue"(?:(?!</tr>).)*', 's').exec(html)?.[0] ?? '';
+    expect(defRow).toContain('2024-08-01 · 手动 · 3 行');
 
     // 快照表按定义筛选：只剩 revenue 这一张
     const filtered = await (await viewer.get('/analytics?definition=metric:revenue')).text();

@@ -48,9 +48,18 @@ export async function loader({ request }: Route.LoaderArgs) {
   const canReadDefinitions = can(member.role, 'definitions:read');
   const snapshots = await listSnapshots(member.tenant.id, definitionFilter ?? undefined);
   const all = canReadDefinitions ? await listDefinitions(member) : [];
-  /** 任务状态的文案在服务端翻好（~/.server/tasks 不能进客户端构建，色调由组件按 status 查 TASK_TONES） */
+  /**
+   * 「最近计算」在服务端拼好：最新一张快照写成「统计日 · 来源 · N 行」（来源用 triggerLabel 翻成中文），还没有快照时为 null；
+   * 任务状态的文案也在服务端翻好（~/.server/tasks 不能进客户端构建，色调由组件按 status 查 TASK_TONES）
+   */
   const lastRunWithLabel = (run: DefinitionSummary['lastRun']) =>
-    run ? { asOf: run.asOf, status: run.status, statusLabel: run.status ? TASK_STATUS_LABELS[run.status] : null } : null;
+    run
+      ? {
+          snapshot: run.rowCount === null ? null : `${run.asOf ?? '—'} · ${triggerLabel(run.trigger)} · ${run.rowCount} 行`,
+          status: run.status,
+          statusLabel: run.status ? TASK_STATUS_LABELS[run.status] : null,
+        }
+      : null;
   const byTemplate = new Map(all.map(d => [`${d.kind}:${d.key}`, d]));
   return {
     email: member.email,
@@ -254,7 +263,7 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
                           {d.lastRun
                             ? (
                                 <span className="inline-flex items-center gap-2">
-                                  {d.lastRun.asOf ?? '—'}
+                                  {d.lastRun.snapshot ?? '—'}
                                   {d.lastRun.status && <StatusText tone={TASK_TONES[d.lastRun.status]}>{d.lastRun.statusLabel}</StatusText>}
                                 </span>
                               )
