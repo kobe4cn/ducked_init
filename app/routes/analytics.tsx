@@ -170,8 +170,8 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <h2 className="font-medium">结果快照</h2>
           <form method="get" action="/analytics" className="flex items-center gap-2 text-sm">
-            <input type="hidden" name="type" value={typeFilter ?? ''} />
-            <input type="hidden" name="status" value={statusFilter ?? ''} />
+            {typeFilter && <input type="hidden" name="type" value={typeFilter} />}
+            {statusFilter && <input type="hidden" name="status" value={statusFilter} />}
             <label htmlFor="snapshot-definition" className="text-slate-500">按定义筛选</label>
             <select id="snapshot-definition" name="definition" defaultValue={definitionFilter ?? ''} className="rounded-lg border bg-white px-2 py-1.5">
               <option value="">全部</option>
