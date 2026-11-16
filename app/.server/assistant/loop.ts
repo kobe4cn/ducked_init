@@ -13,6 +13,7 @@ import type { AnalysisPlan } from '../catalog/plan';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
 import { chatToolsWith, LlmError, resolveRoute, type LlmMessage } from '../llm';
 import { toolSupport } from '../model-provider';
+import type { ChoiceGroup } from './conversations';
 import { invokeTool, toolsFor, type ToolCtx, type ToolResult } from './tools';
 
 /** 每轮最多调用工具的次数，超出时结束本轮并告知成员；要给检索、展开、校验计划与保存草稿都留出次数 */
@@ -103,7 +104,7 @@ async function callTool(actor: CurrentMember, name: string, args: string, ctx: T
  */
 export async function assistantTurn(
   actor: CurrentMember, history: ChatTurn[], page: AssistantPage, priorPlan?: AnalysisPlan,
-): Promise<{ reply: string; toolsUsed: string[]; plan?: AnalysisPlan; workbenchSql?: string; choices?: { term: string; candidates: string[] }[] }> {
+): Promise<{ reply: string; toolsUsed: string[]; plan?: AnalysisPlan; workbenchSql?: string; choices?: ChoiceGroup[] }> {
   checkHistory(history);
   const tenantId = actor.tenant.id;
   // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮所有 chatToolsWith 都用它：中途改配置不影响本轮

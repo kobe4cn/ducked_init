@@ -4,6 +4,7 @@
 // 分析计划（ADR-0050）随校验它的那轮 assistant 消息保存（plan）：只存计划本身（条目 id、版本与语义哈希），不存检索结果与工具原文（ADR-0043）；
 // 本轮 prefill_workbench 通过校验的 SQL 也随那条 assistant 消息保存（workbenchSql），只存进加密的消息体、不写进 content（content 会作为历史发给模型）。
 // 歧义追问的结构化候选（⑥-3，ADR-0047）随判出歧义的那轮 assistant 消息保存（choices：词与候选条目 id，名称读时按读者目录组装，#539）；
+// 说法未命中时同一字段存 kind: 'missing' 的候选组（⑥-5，候选是按名称、描述检索最接近的 metric / tag / entity / field 条目）；
 // 点选候选回答时服务端生成的 user 消息带 chosen（词与所选条目 id，ADR-0046），下一张票按它生成知识提案。只有本人能读、续写与分享；
 // 被分享人（同租户成员）只能读。按 id 访问别人没分享给自己的对话一律 404（管理员也一样）。
 // 成员被移出租户时，其对话与分享经外键级联删除
@@ -30,12 +31,14 @@ export class ConversationError extends Error {
 
 /** 工作台结果解读的查询：SQL、发给模型服务的行数与列名，不含取值 */
 export interface InterpretedQuery { sql: string; rows: number; columns: string[] }
+/** 追问候选组：歧义追问（⑥-3，不带 kind）或说法未命中的候选（⑥-5，kind: 'missing'），只存词与候选条目 id */
+export interface ChoiceGroup { term: string; candidates: string[]; kind?: 'missing' }
 export interface StoredMessage {
   role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; query?: InterpretedQuery; plan?: AnalysisPlan; workbenchSql?: string;
-  /** 那一轮最后一次 catalog_search 判为歧义的追问候选（⑥-3）：只存词与候选条目 id，读回时按读者自己的目录组装成带名称的视图 */
-  choices?: { term: string; candidates: string[] }[];
-  /** 点选候选回答的那条 user 消息带的选择（⑥-3，ADR-0046：用户的回答只当数据，content 由服务端按它生成） */
-  chosen?: { term: string; entryId: string };
+  /** 那一轮最后一次 catalog_search 判为歧义（⑥-3）或说法未命中（⑥-5）的追问候选：只存词与候选条目 id，读回时按读者自己的目录组装成带名称的视图 */
+  choices?: ChoiceGroup[];
+  /** 点选候选回答的那条 user 消息带的选择（⑥-3 / ⑥-5，ADR-0046：用户的回答只当数据，content 由服务端按它生成） */
+  chosen?: { term: string; entryId: string; kind?: 'missing' };
 }
 interface SealedBody { title: string; messages: StoredMessage[] }
 export interface ConversationSummary { id: string; title: string; updatedAt: Date }
@@ -97,10 +100,10 @@ export async function readConversation(actor: CurrentMember, id: string): Promis
   return { id, owned, sharedWith: owned ? shares.map(s => s.email).sort() : [], ...await unseal(actor.tenant.id, row.sealed) };
 }
 
-/** appendTurn 的一轮问答：plan / workbenchSql / choices 随 assistant 消息、chosen 随 user 消息加密保存（⑥-3） */
+/** appendTurn 的一轮问答：plan / workbenchSql / choices 随 assistant 消息、chosen 随 user 消息加密保存（⑥-3 / ⑥-5） */
 export interface TurnInput {
   userText: string; reply: string; toolsUsed: string[];
-  plan?: AnalysisPlan; workbenchSql?: string; choices?: { term: string; candidates: string[] }[]; chosen?: { term: string; entryId: string };
+  plan?: AnalysisPlan; workbenchSql?: string; choices?: ChoiceGroup[]; chosen?: { term: string; entryId: string; kind?: 'missing' };
 }
 
 /**
@@ -117,8 +120,8 @@ export async function appendTurn(actor: CurrentMember, id: string | null, turn: 
   ]);
 }
 
-/** 最后一条 assistant 消息的歧义候选（⑥-3）：路由核对 /assistant 的 choice 入参用，词从这里反查（不收客户端传来的词或候选列表） */
-export function lastChoices(conversation: Conversation): { term: string; candidates: string[] }[] | undefined {
+/** 最后一条 assistant 消息的追问候选（⑥-3 歧义 / ⑥-5 未命中）：路由核对 /assistant 的 choice 入参用，词从这里反查（不收客户端传来的词或候选列表） */
+export function lastChoices(conversation: Conversation): ChoiceGroup[] | undefined {
   for (let i = conversation.messages.length - 1; i >= 0; i--) {
     if (conversation.messages[i]!.role === 'assistant') return conversation.messages[i]!.choices;
   }

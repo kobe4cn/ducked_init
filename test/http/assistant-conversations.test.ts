@@ -472,10 +472,11 @@ describe('助手对话', () => {
     expect(sent).toContain('营收按哪个时间字段算？');
     expect(sent).not.toContain('candidates');
 
-    // 本轮最后一次搜索不歧义时清空：先搜「营收」再搜「客户」（实体不成歧义组），返回不再带 choices
+    // 本轮最后一次搜索不歧义时清空：先搜「营收」再搜「消费者」（按名称命中实体，不产生任何候选组），返回不再带 choices。
+    // 搜「客户」这类只命中关键词的说法现在会留一个 kind: 'missing' 组（⑥-5，见 assistant-knowledge-missing.test.ts），不能再用来验证清空
     const cleared = [
       toolCalls({ name: 'catalog_search', args: { query: '营收' } }),
-      toolCalls({ name: 'catalog_search', args: { query: '客户' } }),
+      toolCalls({ name: 'catalog_search', args: { query: '消费者' } }),
       text('客户是消费者实体'),
     ];
     fakeLlm(f => app.setLlmFetch(f), n => cleared[n - 1]);
