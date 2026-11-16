@@ -7,7 +7,7 @@ import { Link } from 'react-router';
 import type { Route } from './+types/analytics';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
-import { listDefinitions } from '~/.server/dsl-definitions';
+import { listDefinitions, type DefinitionSummary } from '~/.server/dsl-definitions';
 import { TEMPLATES } from '~/.server/pipeline/templates';
 import { listSnapshots, SNAPSHOT_RETENTION_DAYS, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
@@ -49,6 +49,9 @@ export async function loader({ request }: Route.LoaderArgs) {
   const snapshots = (await listSnapshots(member.tenant.id))
     .filter(s => !definitionFilter || s.template === definitionFilter);
   const all = canReadDefinitions ? await listDefinitions(member) : [];
+  /** 任务状态的文案在服务端翻好（~/.server/tasks 不能进客户端构建，色调由组件按 status 查 TASK_TONES） */
+  const lastRunWithLabel = (run: DefinitionSummary['lastRun']) =>
+    run ? { asOf: run.asOf, status: run.status, statusLabel: run.status ? TASK_STATUS_LABELS[run.status] : null } : null;
   const byTemplate = new Map(all.map(d => [`${d.kind}:${d.key}`, d]));
   return {
     email: member.email,
@@ -77,7 +80,8 @@ export async function loader({ request }: Route.LoaderArgs) {
         creator: d.creator,
         published: d.published,
         draft: d.draft && { version: d.draft.version, lastEditor: d.draft.lastEditor, updatedAt: d.draft.updatedAt.toISOString() },
-        lastRun: d.lastRun,
+        /** 最近一次计算：统计日、任务状态与其文案 */
+        lastRun: lastRunWithLabel(d.lastRun),
       })),
     /** 每个已登记模板的参数入口 */
     templates: Object.entries(TEMPLATES).map(([id, t]) => ({ id, label: t.label })),
@@ -252,7 +256,7 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
                             ? (
                                 <span className="inline-flex items-center gap-2">
                                   {d.lastRun.asOf ?? '—'}
-                                  {d.lastRun.status && <StatusText tone={TASK_TONES[d.lastRun.status]}>{TASK_STATUS_LABELS[d.lastRun.status]}</StatusText>}
+                                  {d.lastRun.status && <StatusText tone={TASK_TONES[d.lastRun.status]}>{d.lastRun.statusLabel}</StatusText>}
                                 </span>
                               )
                             : '未计算'}
