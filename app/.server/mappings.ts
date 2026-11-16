@@ -31,7 +31,7 @@ import { diffColumns } from './pipeline/schema-diff';
 import { publishedMergeGroups } from './merge-groups';
 import { enqueueMerge, lastMergeByMapping, mergesOfMapping, tenantLatestMerge } from './merges';
 import {
-  discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, saveDraft as savePublishable, type PublishableAdapter,
+  discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, sameAsPublished, saveDraft as savePublishable, stableJson, type PublishableAdapter,
 } from './publishing';
 import { tenantPiiSalt } from './secrets';
 import { requireSource } from './source-config';
@@ -832,6 +832,16 @@ type QueuedMerge = Awaited<ReturnType<typeof enqueueMerge>>;
 /** mappingVersions 的内容列：发布流程里 checkOutside 收到的草稿带上它 */
 type MappingDraft = DraftRow & { yaml: string };
 
+/** 两份 YAML 解析后的值是否相同（stableJson 比较，键顺序不同视为相同，注释与空白不算改动）：解析出错按不相同处理，不抛 */
+const parsedSame = (a: string, b: string) => {
+  try {
+    const [da, db] = [parseDocument(a), parseDocument(b)];
+    return da.errors.length === 0 && db.errors.length === 0 && stableJson(da.toJSON()) === stableJson(db.toJSON());
+  } catch {
+    return false;
+  }
+};
+
 /**
  * 映射接入 publishing.ts 的适配器（ADR-0051）：保存的事务外检查（checkMappingEdit）由入口完成，校验出的 plan 经 ctx 带进 checkSave 写进版本表；
  * 发布的事务外检查（checkOutside）重新校验文档并把重校验出的 plan 写回 ctx，事务内检查（锁内）跑 assertPublishable 并把 plan 写回版本行
@@ -849,6 +859,8 @@ export const mappingAdapter: PublishableAdapter<MappingCtx, string, void, Queued
     return locked.id;
   },
   checkSave: async (ctx, yaml) => ({ yaml, plan: ctx.plan }),
+  // 草稿与已发布版内容相同：比较解析后的 YAML，不比 plan（发布时 checkOutside / checkInside 会重算 plan 写回，可能因源表或登记的变化而变）
+  sameContent: (draft, published) => parsedSame(String(draft.yaml), String(published.yaml)),
   checkOutside: async (draft, ctx) => {
     const { plan } = await checkMappingDraft(ctx.tenantId, ctx.mapping.sourceId, (draft as MappingDraft).yaml, ctx.registrations);
     ctx.plan = plan;
@@ -1133,10 +1145,13 @@ export async function getMapping(actor: CurrentMember, mappingId: string) {
   const merge = await mergesOfMapping(actor.tenant.id, mappingId);
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
+  const sameAs = sameAsPublished(mappingAdapter, versions);
   return {
     ...mapping,
     source,
     publishers: await publisherCount(actor.tenant.id),
+    /** 草稿与当前生效已发布版（live，取法相同）内容相同时那一版的版本号，否则 null */
+    sameAs,
     versions: versions.map(v => ({
       version: v.version,
       status: v.status,

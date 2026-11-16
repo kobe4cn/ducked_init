@@ -297,6 +297,29 @@ describe('发布映射并合并到标准层', () => {
     expect((await getMapping(author, mapping.id)).merge.history[0]).toMatchObject({ mode: 'rebuild', version: 2, rows: 40 });
   });
 
+  it('发布与当前生效已发布版相同的映射草稿被拒：详情标出与 v1 相同，版本仍是草稿、没有新的合并任务', async () => {
+    const { author, reviewer, id } = await syncedSource();
+    const mapping = await publish(author, reviewer, id, CUSTOMERS);
+    // 换一位成员（reviewer）存一份只改了注释、空白与字段键顺序的草稿，由 author 发布
+    const restated = `# 只加注释\n${CUSTOMERS.replace('  email: lower(email)\n  city: city\n', '  city:    city\n\n  email: lower(email)\n')}`;
+    expect(await saveDraft(reviewer, mapping, restated)).toBe(2);
+    expect((await getMapping(author, mapping)).sameAs).toBe(1);
+
+    const tasksBefore = await getDb().select({ id: tasks.id }).from(tasks);
+    await expect(publishMapping(author, mapping, 2)).rejects.toThrow('与 v1 相同，没有改动，请丢弃草稿');
+    // 拒绝发生在入队合并之前：v2 仍是草稿，tasks 没有新的合并任务
+    expect((await getDb().select({ version: mappingVersions.version, status: mappingVersions.status }).from(mappingVersions))
+      .sort((a, b) => b.version - a.version))
+      .toEqual([{ version: 2, status: 'draft' }, { version: 1, status: 'published' }]);
+    expect(await getDb().select({ id: tasks.id }).from(tasks)).toEqual(tasksBefore);
+    // 真正改了规则的草稿不算相同，可以正常发布
+    await saveDraft(reviewer, mapping, restated.replace('city:    city', 'city: upper(city)'));
+    expect((await getMapping(author, mapping)).sameAs).toBeNull();
+    await publishMapping(author, mapping, 2);
+    await drain();
+    expect((await getMapping(author, mapping)).versions[0]).toMatchObject({ version: 2, status: 'published' });
+  });
+
   it('发布者不能是最后保存草稿的人：A 起草、B 修改后 A 能发布，作者仍记下两人', async () => {
     const { author, reviewer, id } = await syncedSource();
     const mapping = await createMapping(author, id, CUSTOMERS);
