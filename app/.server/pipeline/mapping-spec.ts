@@ -813,20 +813,8 @@ export function referencedSourceColumns(plan: MergePlan) {
 /** 标准层列的 DuckDB 类型 */
 export const sqlType = (type: FieldType) => FIELD_TYPES[type].sql;
 
-/** 新建映射时的样例文档 */
-export function mappingTemplate(entityName: string, table: string) {
-  const entity = entityOf(entityName) ?? CANONICAL_ENTITIES[0];
-  const fields = entity.fields.slice(0, 4).map(f => `  ${f.name}: ${f.name}${f.enum ? `  # 标准枚举：${f.enum.join('、')}` : ''}`).join('\n');
-  return `# 映射：源表 ${table} → ${entity.label}（${entity.name}）
-model: ${MODEL_MAJOR}
-entity: ${entity.name}
-table: ${table}
-fields:
-${fields}
-dedupe:
-  key: [${entity.key.join(', ')}]
-`;
-}
+// 新建映射时的样例文档迁到了客户端共用的 lib（换选源视图时要在客户端生成它的变体），这里转出口，调用方不动
+export { mappingTemplate } from '../../lib/mapping-template';
 
 /**
  * 实体字段在标准层里是否敏感（ADR-0005，存的是哈希）：标准实体的 pii 字段、自定义实体登记（custom 给出字段）里标成敏感的字段，

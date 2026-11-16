@@ -1,10 +1,9 @@
 // app/routes/mappings.tsx —— 映射（数据工程师、管理员可起草；分析师只读）：本租户的映射列表（源表 → 实体、已发布版本、草稿、已停用或待确认停用、目标自定义实体待补登、最近一次合并），
-// 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿，检查有提示（notices）时留在本页列出提示与新映射的入口；可按所选的表与实体按规则生成草稿填进编辑框，或用模型生成（复用已发布映射 > 模型 > 规则，ADR-0035，编辑框上方按置信度从低到高列出模型给的每项与理由），都不保存；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
+// 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿，检查有提示（notices）时留在本页列出提示与新映射的入口；可按所选的表与实体按规则生成草稿填进编辑框，或用模型生成（复用已发布映射 > 模型 > 规则，ADR-0035，编辑框上方按置信度从低到高列出模型给的每项与理由），都不保存；换数据源 / 表 / 实体时编辑框换成新选择的初始内容（普通表按规则生成草稿、源视图用空白模板），手改过的先确认；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
 // 手动触发一次合并到标准层，以及主键冲突体检（silver.keycheck）：任何能看映射的成员都可以运行，报告按实体列出主键重叠的映射对
 import { AlertTriangle, CheckCircle2, CircleDashed, Layers, Loader2, PencilLine, Play, Plus, ScanSearch, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { isMap, isScalar, parseDocument } from 'yaml';
-import { data, Form, Link, redirect, type ShouldRevalidateFunctionArgs, useNavigation, useRevalidator } from 'react-router';
+import { data, Form, Link, redirect, type ShouldRevalidateFunctionArgs, useFetcher, useNavigation, useRevalidator } from 'react-router';
 import type { Route } from './+types/mappings';
 import { assertCan, can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
@@ -14,7 +13,6 @@ import { MergeError, mergeNow } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
 import { SUGGESTION_LABELS } from '~/.server/pipeline/key-check-engine';
-import { mappingTemplate } from '~/.server/pipeline/mapping-spec';
 import { listSources } from '~/.server/sources';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { CANONICAL_ENTITIES, entityLabel, entityOf, isCustomEntity } from '~/lib/canonical-model';
@@ -23,6 +21,7 @@ import { DraftConfidence } from '~/components/draft-confidence';
 import { MappingErrors, MappingNotices } from '~/components/mapping-editor';
 import { MappingEditorWithReference } from '~/components/mapping-reference';
 import { mappingOutline } from '~/lib/mapping-outline';
+import { mappingTemplate, reselect, VIEW_PREFIX, withTarget } from '~/lib/mapping-template';
 import { cn } from '~/lib/utils';
 import { PageHeader } from '~/components/page-header';
 import { SectionHeader } from '~/components/section-header';
@@ -94,9 +93,9 @@ export async function loader({ request }: Route.LoaderArgs) {
 /** 最近一次体检任务的状态 → 页面上的状态：从没体检过、体检中（排队或运行）、失败、成功 */
 const KEYCHECK_STATUS = { none: 'never', queued: 'running', running: 'running', failed: 'failed', succeeded: 'ok' } as const;
 
-/** 只校验的提交不改数据，不重跑 loader */
+/** 只读的提交（只校验、按规则生成草稿）不改数据，不重跑 loader：草稿靠 action 返回的 draftId 换编辑框内容 */
 export function shouldRevalidate({ formData, defaultShouldRevalidate }: ShouldRevalidateFunctionArgs) {
-  return formData?.get('intent') === 'validate' ? false : defaultShouldRevalidate;
+  return formData?.get('intent') === 'validate' || formData?.get('intent') === 'draft' ? false : defaultShouldRevalidate;
 }
 
 /** 运行体检（intent=keycheck）只要 sources:read，其余操作都要 sources:write */
@@ -354,29 +353,16 @@ export default function Mappings({ loaderData, actionData }: Route.ComponentProp
   );
 }
 
-/**
- * YAML 里的 table、view 或 entity 换成 value（保留注释与顺序）；table 与 view 只能写一个，换成另一种时原地改键名，换成 table 时去掉 view_key。
- * YAML 解析不了时不动
- */
-function withTarget(yaml: string, key: 'table' | 'view' | 'entity', value: string) {
-  const doc = parseDocument(yaml);
-  if (doc.errors.length || !isMap(doc.contents)) return yaml;
-  const other = key === 'table' ? 'view' : key === 'view' ? 'table' : null;
-  const swapped = other && doc.contents.items.find(i => isScalar(i.key) && i.key.value === other);
-  if (!swapped && doc.get(key) === value) return yaml;
-  if (swapped && isScalar(swapped.key)) swapped.key.value = key;
-  doc.set(key, value);
-  if (key === 'table') doc.delete('view_key');
-  return doc.toString();
-}
-
 /** 表下拉框的取值：源视图前加 view: 与同名的源表区分 */
-const VIEW_PREFIX = 'view:';
 const inputValue = (t: { name: string; view?: true }) => (t.view ? `${VIEW_PREFIX}${t.name}` : t.name);
+
+/** 换选数据源 / 表 / 实体取规则草稿（intent=draft 走 fetcher）时 action 的返回值，这里只用到 error 与生成的 YAML */
+interface DraftResult { error: string | null; values: { yaml: string } | null }
 
 /**
  * 新建映射的表单：选数据源、用表单或 YAML 编写映射。表与目标实体两个下拉框决定表单列哪些字段、对照面板显示什么（默认取 YAML 里写的），
- * 也是「按规则生成草稿」的输入；换选时一并写进 YAML 的 table / entity，保存时以 YAML 里写的为准
+ * 也是「按规则生成草稿」的输入；换选数据源 / 表 / 实体时编辑框换成新选择的初始内容（普通表按规则生成草稿、源视图用空白模板，手改过先确认），
+ * 保存时以 YAML 里写的为准
  */
 function NewMapping({ sources, tables, registered, functions, values, generated, generationId, submitting }: {
   sources: LoaderData['sources'];
@@ -393,6 +379,13 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
   const [sourceId, setSourceId] = useState(values.sourceId);
   const [currentGenerationId, setCurrentGenerationId] = useState(generationId);
   const [yaml, setYaml] = useState(values.yaml);
+  /** 编辑框里最近一次放进来的生成稿（loader 的初始草稿、action 生成的或换选换进来的），与它不同就是手改过 */
+  const [lastGenerated, setLastGenerated] = useState(values.yaml);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  // 换普通表时经 action 取规则草稿（「按规则生成草稿」按钮同一个 intent，走 fetcher 不整页提交）
+  const draft = useFetcher<DraftResult>();
+  /** 正在等的取草稿请求；响应回来时与当前选择比对，已经又切走的丢弃 */
+  const [draftRequest, setDraftRequest] = useState<{ sourceId: string; table: string; entity: string } | null>(null);
   const [outline] = useState(() => mappingOutline(values.yaml));
   const [inputName, setInputName] = useState(outline.view ? inputValue({ name: outline.view, view: true }) : outline.table);
   const [entity, setEntity] = useState(outline.entity && (entityOf(outline.entity) || isCustomEntity(outline.entity)) ? outline.entity : CANONICAL_ENTITIES[0].name);
@@ -404,11 +397,44 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
   ];
   const sourceTables = tables[sourceId] ?? [];
   const table = sourceTables.find(t => inputValue(t) === inputName) ?? sourceTables[0] ?? null;
-  const selectInput = (value: string) => {
-    setInputName(value);
+  const currentInput = table ? inputValue(table) : '';
+
+  /**
+   * 换选数据源 / 表 / 实体后换掉编辑框的内容：源视图换成该实体的空白模板、普通表按新表与实体取规则草稿（见 reselect）；
+   * 手改过先确认，取消时一个 state 都不动、受控下拉框自然回到原选择。新的源还没有已采集的表时没有草稿可取，照旧只把实体行换掉
+   */
+  const reselectContent = (nextSourceId: string, nextInput: string, nextEntity: string) => {
+    if (nextInput) {
+      const { needsConfirm, next } = reselect({ sourceId: nextSourceId, input: nextInput, entity: nextEntity, yaml, lastGenerated });
+      if (needsConfirm && !window.confirm('编辑框里的内容被手改过，换选后会替换成新表 / 实体的初始内容。确定替换吗？')) return false;
+      if (next.kind === 'template') { setYaml(next.yaml); setLastGenerated(next.yaml); }
+      else {
+        setDraftRequest({ sourceId: next.sourceId, table: next.table, entity: next.entity });
+        void draft.submit({ intent: 'draft', ...next }, { method: 'post', action: '/mappings' });
+      }
+    } else {
+      const rewritten = withTarget(yaml, 'entity', nextEntity);
+      setYaml(rewritten);
+      setLastGenerated(rewritten);
+    }
+    setDraftError(null);
     setCurrentGenerationId(null);
-    setYaml(y => (value.startsWith(VIEW_PREFIX) ? withTarget(y, 'view', value.slice(VIEW_PREFIX.length)) : withTarget(y, 'table', value)));
+    return true;
   };
+
+  // 规则草稿回来了：与当前选择一致才填进编辑框（快速连续切换时丢弃过期的响应）；取不到（如表没采集过）只报错、编辑框不动
+  useEffect(() => {
+    if (draft.state !== 'idle' || !draft.data || !draftRequest) return;
+    setDraftRequest(null);
+    if (draftRequest.sourceId !== sourceId || draftRequest.table !== currentInput || draftRequest.entity !== entity) return;
+    if (draft.data.error || !draft.data.values) {
+      setDraftError(draft.data.error ?? '生成草稿失败');
+      return;
+    }
+    setYaml(draft.data.values.yaml);
+    setLastGenerated(draft.data.values.yaml);
+  }, [draft.state, draft.data, draftRequest, sourceId, currentInput, entity]);
+
   return (
     <Form method="post">
       {currentGenerationId && <input type="hidden" name="generationId" value={currentGenerationId} />}
@@ -416,19 +442,28 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
         <div className="grid gap-4 sm:grid-cols-3">
           <Field>
             <FieldLabel htmlFor="mapping-source">数据源</FieldLabel>
-            <NativeSelect id="mapping-source" name="sourceId" value={sourceId} onChange={e => { setSourceId(e.target.value); setCurrentGenerationId(null); }}>
+            <NativeSelect id="mapping-source" name="sourceId" value={sourceId} onChange={e => {
+              const id = e.target.value;
+              const list = tables[id] ?? [];
+              // 换数据源后表回退到新源里同名或第一张表，按回退后的输入重新生成并同步下拉框
+              const fallback = list.find(t => inputValue(t) === inputName) ?? list[0];
+              const nextInput = fallback ? inputValue(fallback) : '';
+              if (!reselectContent(id, nextInput, entity)) return;
+              setSourceId(id);
+              setInputName(nextInput);
+            }}>
               {sources.map(s => <NativeSelectOption key={s.id} value={s.id}>{s.name}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
           <Field>
             <FieldLabel htmlFor="mapping-table">表或源视图</FieldLabel>
-            <NativeSelect id="mapping-table" name="table" value={table ? inputValue(table) : ''} onChange={e => selectInput(e.target.value)} disabled={!sourceTables.length}>
+            <NativeSelect id="mapping-table" name="table" value={currentInput} onChange={e => { if (reselectContent(sourceId, e.target.value, entity)) setInputName(e.target.value); }} disabled={!sourceTables.length}>
               {sourceTables.map(t => <NativeSelectOption key={inputValue(t)} value={inputValue(t)}>{t.view ? `源视图 ${t.name}` : t.name}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
           <Field>
             <FieldLabel htmlFor="mapping-entity">目标实体</FieldLabel>
-            <NativeSelect id="mapping-entity" name="entity" value={entity} onChange={e => { setEntity(e.target.value); setCurrentGenerationId(null); setYaml(y => withTarget(y, 'entity', e.target.value)); }}>
+            <NativeSelect id="mapping-entity" name="entity" value={entity} onChange={e => { if (reselectContent(sourceId, currentInput, e.target.value)) setEntity(e.target.value); }}>
               {entities.map(e => <NativeSelectOption key={e.name} value={e.name}>{`${e.label}（${e.name}）`}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
@@ -436,6 +471,7 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
         <Field>
           <FieldLabel>映射</FieldLabel>
           {generated && <DraftConfidence {...generated} />}
+          {draftError && <MappingErrors error={draftError} issues={[]} />}
           <MappingEditorWithReference defaultValue={values.yaml} value={yaml} onValueChange={setYaml} table={table} entity={entity} registered={registered} functions={functions}
             validateAction={sources.length ? '/mappings' : undefined} validateExtra={{ sourceId }}
           />
