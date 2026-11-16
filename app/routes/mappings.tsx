@@ -2,7 +2,7 @@
 // 新建映射（选数据源、编写 YAML，默认是第一个数据源按规则生成的草稿，校验通过才保存为草稿，检查有提示（notices）时留在本页列出提示与新映射的入口；可按所选的表与实体按规则生成草稿填进编辑框，或用模型生成（复用已发布映射 > 模型 > 规则，ADR-0035，编辑框上方按置信度从低到高列出模型给的每项与理由），都不保存；换数据源 / 表 / 实体时编辑框换成新选择的初始内容（普通表按规则生成草稿、源视图用空白模板），手改过的先确认；目标实体可选标准实体或已发布登记的自定义实体；编辑框旁对照所选源表的列统计与目标实体的标准字段或登记的字段），
 // 手动触发一次合并到标准层，以及主键冲突体检（silver.keycheck）：任何能看映射的成员都可以运行，报告按实体列出主键重叠的映射对
 import { AlertTriangle, CheckCircle2, CircleDashed, Layers, Loader2, PencilLine, Play, Plus, ScanSearch, X } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { data, Form, Link, redirect, type ShouldRevalidateFunctionArgs, useFetcher, useNavigation, useRevalidator } from 'react-router';
 import type { Route } from './+types/mappings';
 import { assertCan, can, requirePermission } from '~/.server/access';
@@ -386,6 +386,8 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
   const draft = useFetcher<DraftResult>();
   /** 正在等的取草稿请求；响应回来时与当前选择比对，已经又切走的丢弃 */
   const [draftRequest, setDraftRequest] = useState<{ sourceId: string; table: string; entity: string } | null>(null);
+  // 这条 fetcher 自上次取草稿后有没有真正提交过（离开过 idle）：刚记下新请求、还没提交的那一帧 data 仍是上一轮的，不能当新响应用
+  const draftSubmitted = useRef(false);
   const [outline] = useState(() => mappingOutline(values.yaml));
   const [inputName, setInputName] = useState(outline.view ? inputValue({ name: outline.view, view: true }) : outline.table);
   const [entity, setEntity] = useState(outline.entity && (entityOf(outline.entity) || isCustomEntity(outline.entity)) ? outline.entity : CANONICAL_ENTITIES[0].name);
@@ -409,6 +411,7 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
       if (needsConfirm && !window.confirm('编辑框里的内容被手改过，换选后会替换成新表 / 实体的初始内容。确定替换吗？')) return false;
       if (next.kind === 'template') { setYaml(next.yaml); setLastGenerated(next.yaml); }
       else {
+        draftSubmitted.current = false;
         setDraftRequest({ sourceId: next.sourceId, table: next.table, entity: next.entity });
         void draft.submit({ intent: 'draft', ...next }, { method: 'post', action: '/mappings' });
       }
@@ -422,15 +425,18 @@ function NewMapping({ sources, tables, registered, functions, values, generated,
     return true;
   };
 
-  // 规则草稿回来了：与当前选择一致才填进编辑框（快速连续切换时丢弃过期的响应）；取不到（如表没采集过）只报错、编辑框不动
+  // 规则草稿回来了才填进编辑框：只认这条请求真正提交过（fetcher 离开过 idle）之后的 idle 帧——那之前的 idle 帧 data 仍是上一轮的，
+  // 不能当新响应用；再与当前选择比对，快速连续切换时丢弃过期的响应。取不到（如表没采集过）只报错、编辑框不动
   useEffect(() => {
-    if (draft.state !== 'idle' || !draft.data || !draftRequest) return;
+    if (draft.state !== 'idle') { draftSubmitted.current = true; return; }
+    if (!draftSubmitted.current || !draft.data || !draftRequest) return;
     setDraftRequest(null);
     if (draftRequest.sourceId !== sourceId || draftRequest.table !== currentInput || draftRequest.entity !== entity) return;
     if (draft.data.error || !draft.data.values) {
       setDraftError(draft.data.error ?? '生成草稿失败');
       return;
     }
+    setDraftError(null);
     setYaml(draft.data.values.yaml);
     setLastGenerated(draft.data.values.yaml);
   }, [draft.state, draft.data, draftRequest, sourceId, currentInput, entity]);
