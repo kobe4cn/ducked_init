@@ -182,3 +182,4 @@
 | `dev-server-typegen.test.ts` | #615：测试起的 dev 服务器（4 个并发）不删、不重写 `.react-router/types`（`REACT_ROUTER_SKIP_TYPEGEN` 补丁生效） |
 | `mailer.test.ts` / `totp.test.ts` | 发信、TOTP（纯函数） |
 | `model-prices.test.ts` | 运营后台模型单价页（#744，ADR-0057）：新增 / 修改各写一条平台级审计、同值保存（"3" 与 "3.0000"）no-op 不写审计；空模型名、负数、超 4 位小数、币种不在白名单 400 并显示错误；并发新增同名模型只剩一行、冲突转 400；成员会话被拒；`costOf` 折算纯函数（null token 按 0） |
+| `ops-llm-usage.test.ts` | 运营后台「模型调用汇总」页（#746）：跨租户按（租户、模型、用途）汇总近 7/30 天的调用，次数、token、按当前单价折算的金额与错误率和手算一致，未配单价显示「未配置单价」，窗口外不出现，租户名按 zh-CN 排序；未登录与成员会话（包括租户管理员）302 到 /ops/login；页面不含错误原文（ADR-0007） |

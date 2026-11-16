@@ -50,6 +50,7 @@ export default [
     route('tenants/:tenantId', 'routes/ops.tenant.tsx'),
     route('model-prices', 'routes/ops.model-prices.tsx'),
     route('audit', 'routes/ops.audit.tsx'),
+    route('llm-usage', 'routes/ops.llm-usage.tsx'),
     route('login', 'routes/ops.login.tsx'),
     route('auth/verify', 'routes/ops.auth.verify.tsx'),
     route('totp', 'routes/ops.totp.tsx'),

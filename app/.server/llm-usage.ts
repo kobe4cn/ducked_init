@@ -1,10 +1,11 @@
-// app/.server/llm-usage.ts —— 模型调用统计（#303，Spec #1 故事 94）：给「模型调用」页按用途汇总 platform.llm_calls（近 N 天）并取最近调用明细。
+// app/.server/llm-usage.ts —— 模型调用统计（#303，Spec #1 故事 94）：给「模型调用」页按用途汇总 platform.llm_calls（近 N 天）并取最近调用明细；
+// 运营后台「模型调用汇总」（#746）跨租户按（租户、模型、用途）分组，只取聚合数（ADR-0007）。
 // 质量看 Schema 通过率、错误率与耗时；成本按 (purpose, model) 分组、用查看时的当前单价折算成各币种金额（ADR-0057，#745）。
 // 总计是单独一条不分组的聚合（不能拿各用途的 P95 再平均）；pg 把 bigint / numeric / double 当字符串返回，统一 Number() + Math.round 成整数
 import { and, desc, eq, sql } from 'drizzle-orm';
-import { cmp } from '../lib/compare';
+import { cmp, cmpName } from '../lib/compare';
 import { getDb } from './db/client';
-import { llmCalls } from './db/schema';
+import { llmCalls, tenants } from './db/schema';
 import { formatCost, priceMap, summarizeCost } from './model-prices';
 
 export const LLM_CALL_PAGE_SIZE = 50;
@@ -30,8 +31,8 @@ export interface PurposeUsage {
 }
 
 /** 时间窗口的起点在库里算（now() - make_interval），避免应用与库的时区差 */
-const inWindow = (tenantId: string, days: 7 | 30) =>
-  and(eq(llmCalls.tenantId, tenantId), sql`${llmCalls.createdAt} >= now() - make_interval(days => ${days})`);
+const since = (days: 7 | 30) => sql`${llmCalls.createdAt} >= now() - make_interval(days => ${days})`;
+const inWindow = (tenantId: string, days: 7 | 30) => and(eq(llmCalls.tenantId, tenantId), since(days));
 
 const agg = () => ({
   calls: sql<number>`count(*)`,
@@ -88,6 +89,56 @@ export async function usageByPurpose(tenantId: string, days: 7 | 30) {
     })).sort((a, b) => b.calls - a.calls || cmp(a.purpose, b.purpose)),
     total: { ...toUsage(total ?? {}, 'total'), cost: costOfGroups(byPurposeModel) },
   };
+}
+
+/** 运营后台「模型调用汇总」的一行（#746）：（租户、模型、用途）分组的聚合数，金额按当前单价折算（ADR-0057） */
+export interface TenantModelUsage {
+  tenantName: string;
+  model: string;
+  purpose: string;
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+  errors: number;
+  cost: string;
+}
+
+/**
+ * 跨租户按（租户、模型、用途）分组汇总（#746，运营后台）。运营者没有租户 RLS，直接用 getDb()（先例 listOperatorAuditLogs）；
+ * 只取聚合数与租户名，不 select error 原文、不带出其他租户字段（ADR-0007）。排序：租户名 zh-CN（ADR-0045），模型与用途按码点
+ */
+export async function usageAcrossTenants(days: 7 | 30): Promise<TenantModelUsage[]> {
+  const [rows, prices] = await Promise.all([
+    getDb().select({
+      tenantName: tenants.name,
+      model: llmCalls.model,
+      purpose: llmCalls.purpose,
+      calls: sql<number>`count(*)`,
+      promptTokens: sql<number>`coalesce(sum(${llmCalls.promptTokens}), 0)`,
+      completionTokens: sql<number>`coalesce(sum(${llmCalls.completionTokens}), 0)`,
+      errors: sql<number>`count(*) filter (where ${llmCalls.error} is not null)`,
+    }).from(llmCalls)
+      .innerJoin(tenants, eq(tenants.id, llmCalls.tenantId))
+      .where(since(days))
+      .groupBy(llmCalls.tenantId, tenants.name, llmCalls.model, llmCalls.purpose),
+    priceMap(),
+  ]);
+  // pg 的 count / sum 是字符串，先 Number()（照 toUsage）；每行单独走 summarizeCost / formatCost，与统计口径一致
+  return rows.map(r => {
+    const calls = Number(r.calls ?? 0);
+    const promptTokens = Number(r.promptTokens ?? 0);
+    const completionTokens = Number(r.completionTokens ?? 0);
+    return {
+      tenantName: r.tenantName,
+      model: r.model,
+      purpose: r.purpose,
+      calls,
+      promptTokens,
+      completionTokens,
+      errors: Number(r.errors ?? 0),
+      cost: formatCost(summarizeCost([{ model: r.model, calls, promptTokens, completionTokens }], prices)),
+    };
+  }).sort((a, b) => cmpName(a.tenantName, b.tenantName) || cmp(a.model, b.model) || cmp(a.purpose, b.purpose));
 }
 
 /** 明细行取 `llm_calls` 的一部分列（见 listCalls 的 select）加折算好的金额 */
