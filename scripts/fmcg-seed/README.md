@@ -141,8 +141,8 @@ S3 都是：端点、区域、Access Key 见 `credentials.txt`，路径风格 pa
 
 | # | 操作 | 期望 |
 |---|---|---|
-| T3.1 | **K1**：映射 `mall_pg.orders` 与 `station_mysql.bills`，**都先删掉 `key_space` 一行**再发布 | 后合并的那个失败，列出冲突的订单号（两边都从 1 开始）。留意报错文案只建议「加前缀或去掉一边」（#257）。映射页「主键冲突体检」→ 运行：order 下这对映射一致比例很低，建议键空间 |
-| T3.2 | 加回 `key_space: mall` / `station` 各发一版 | 合并成功；`SELECT count(*) FROM silver."order"` = 260,846 + 31,729（奶站的 12 张测试账单被 `where` 去掉，K7；合并记录里显示过滤 12 行） |
+| T3.1 | **K1**：映射 `mall_pg.orders` 与 `station_mysql.bills`，**都先删掉 `key_space` 一行**再发布 | 后合并的那个失败，列出冲突的订单号（两边都从 1 开始），报错建议在映射里声明键空间、或到合并组页建组。映射页「主键冲突体检」→ 运行：order 下这对映射一致比例很低，建议键空间（#778 修好前体检看不到合并失败的映射，显示无冲突） |
+| T3.2 | 加回 `key_space: mall` / `station` 各发一版 | 合并成功；`SELECT count(*) FROM silver."order"` = 260,846 + 32,005（奶站的 12 张测试账单被 `where` 去掉，K7；合并记录里显示过滤 12 行） |
 | T3.3 | **K1b**：映射 `mall_pg.order_items`，先把 `order_id` 写成 `string(order_id)`（不带 `key_space`） | 发布被拒：引用字段要写同一数据源里目标实体声明的键空间。改回文件里的写法后通过 |
 | T3.4 | **K2 去重**：映射 `tmall_s3.trades`、`jd_s3.jd_orders`、`douyin_s3.dy_orders` 的订单；oms_mongo 建 3 个源视图 `oms_tmall`、`oms_jd`、`oms_douyin`，发布后映射对应的 3 个订单映射 | 三个中台映射合并失败：主键跨映射重复（如京东「共 32117 个」）。再跑体检：建议「多半是重复接入，可以建合并组」 |
 | T3.5 | **建合并组**：映射页 → 合并组 → 实体 order：组员按优先级填 1 tmall trades、2 jd_orders、3 dy_orders、4 oms_tmall、5 oms_jd、6 oms_douyin；存活规则「取最新」，字段 `updated_at`；eng 保存、admin 发布 | 发布后组员重建；订单映射的合并记录显示「合并组：重叠 97,328 行，不一致 status 13,487 行、updated_at 97,328 行」。`verify.ts --only silver`：订单合并组状态不符 0、胜出方不符 0、物流不符 0；中台胜出 87,700 行 |
