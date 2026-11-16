@@ -11,7 +11,7 @@ import { publishedCustomEntities, uniqueKeys } from './custom-entities';
 import { getDb } from './db/client';
 import { mappings, mappingVersions, mergeGroups, mergeGroupVersions, sources } from './db/schema';
 import { enqueueMerge } from './merges';
-import { discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, publishReason, sameAsPublished, saveDraft, stableJson, type PublishableAdapter } from './publishing';
+import { type ContentRow, discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, publishReason, sameAsPublished, saveDraft, stableJson, type PublishableAdapter } from './publishing';
 import { entityOf } from '../lib/canonical-model';
 import { cmpName } from '../lib/compare';
 import { MERGE_RULE_KINDS, type MergeRule, type MergeRuleKind, ruleText } from '../lib/merge-groups';
@@ -158,7 +158,7 @@ export async function listMergeGroups(actor: CurrentMember): Promise<MergeGroupE
   return [...entities].sort().map(entity => {
     const candidates = live.filter(m => m.entity === entity);
     const rows = versions.filter(v => v.entity === entity);
-    const sameAs = sameAsPublished(mergeGroupAdapter, rows as unknown as DraftRow[]);
+    const sameAs = sameAsPublished(mergeGroupAdapter, rows);
     return {
       entity,
       candidates: candidates.map(m => ({ id: m.id, name: m.name, keySpace: m.keySpace ?? null })),
@@ -218,8 +218,8 @@ export const mergeGroupAdapter: PublishableAdapter<MergeGroupCtx, MergeGroupInpu
   },
   // 草稿与已发布版内容相同：组员按顺序逐项比（顺序即优先级，换了顺序算改动），规则比规范化 JSON（保存入口已规范化键）
   sameContent: (draft, published) => {
-    const { members, rule } = draft as GroupDraft;
-    const previous = published as GroupDraft;
+    const { members, rule } = draft as ContentRow & Pick<GroupDraft, 'members' | 'rule'>;
+    const previous = published as ContentRow & Pick<GroupDraft, 'members' | 'rule'>;
     return members.length === previous.members.length && members.every((m, i) => m === previous.members[i])
       && stableJson(rule) === stableJson(previous.rule);
   },

@@ -76,6 +76,9 @@ export interface VersionRow {
 /** 版本表的一整行（共有列之外带各可发布项自己的内容列）：事务外 / 内检查与发布后动作收到的是它 */
 export type DraftRow = VersionRow & Record<string, unknown>;
 
+/** 比较内容用的版本行：只要求版本号与状态，其余是内容列（loader 读出的行常缺 id / createdAt 这些共有列） */
+export type ContentRow = Pick<VersionRow, 'version' | 'status'> & Record<string, unknown>;
+
 /** 键按码点排好序的 JSON（键顺序不同视为相同）：各适配器的 sameContent 比较内容列用。
  * 与 knowledge/basis.ts 的 stableJson 形状相同，但不能从那里引（basis.ts 经 mappings.ts 导入这里，会循环依赖），是合并成一处的候选 */
 export const stableJson = (v: unknown): string => JSON.stringify(v, (_, x) =>
@@ -109,7 +112,7 @@ export interface PublishableAdapter<Ctx, Input, Inside = undefined, After = null
 
   /** 草稿与一份已发布版的内容列是否相同（版本号、作者这些不算）：publish 在草稿与当前生效已发布版相同时拒绝发布，
    * loader 用 sameAsPublished 显示「与 vN 相同」。没有实现时不拦（各可发布项按子票逐个接入） */
-  sameContent?(draft: DraftRow, published: DraftRow): boolean;
+  sameContent?(draft: ContentRow, published: ContentRow): boolean;
 
   /** 发布的事务外检查（可以访问 DuckDB 或数据湖） */
   checkOutside?(draft: DraftRow, ctx: Ctx): Promise<void>;
@@ -140,7 +143,7 @@ export interface PublishableAdapter<Ctx, Input, Inside = undefined, After = null
 /** 草稿与当前生效已发布版（status='published' 里 version 最大的一行）相同时返回那一版的版本号，否则 null：给各页面的 loader 显示「与 vN 相同」用。
  * rows 是该父项已读出的全部版本行（含 status / version 与内容列，常缺 id / createdAt 这些共有列）；adapter 没有实现 sameContent 时恒为 null */
 export function sameAsPublished<Ctx, Input, Inside, After>(
-  adapter: PublishableAdapter<Ctx, Input, Inside, After>, rows: DraftRow[],
+  adapter: PublishableAdapter<Ctx, Input, Inside, After>, rows: ContentRow[],
 ): number | null {
   if (!adapter.sameContent) return null;
   const draft = rows.find(r => r.status === 'draft');
