@@ -160,40 +160,53 @@ const SERVING_PART_LABELS: Record<keyof ServingRows, string> = {
   consumer_sources: '源端 ID 对照',
 };
 
-function ResultDetails({ result: { tables, serving, emptyHint, unlinkedOrders, keyCheck, engine } }: { result: TaskResult }) {
+/** 结果的主体：主键检查、服务库、表清单、空表提示四选一（按 taskResult 整理出的字段） */
+function ResultBody({ result: { tables, serving, emptyHint, keyCheck } }: { result: TaskResult }) {
+  if (keyCheck) {
+    return (
+      <div className="space-y-0.5">
+        <div data-keycheck-result={keyCheck.tableName}>
+          {`${keyCheck.tableName} 的业务主键 ${keyCheck.keyColumns.join('、')}：`}
+          <StatusText tone={keyCheck.ok ? 'ok' : 'bad'} className="text-xs">{keyCheck.ok ? '通过' : '不通过'}</StatusText>
+        </div>
+        {!keyCheck.ok && <KeyCheckFindings result={keyCheck} className="pl-3" />}
+      </div>
+    );
+  }
+  if (serving) {
+    return (
+      <div className="space-y-0.5">
+        <div data-serving-version={serving.version}>{`服务库第 ${serving.version} 版`}</div>
+        {(Object.keys(SERVING_PART_LABELS) as (keyof ServingRows)[]).map(part => (
+          <div key={part} data-serving-part={part} className="pl-3">
+            {`${SERVING_PART_LABELS[part]}：`}<span className="text-foreground">{`${serving.rows[part].toLocaleString('zh-CN')} 行`}</span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (tables.length) {
+    return (
+      <ul>
+        {/* 同步结果按批次记录，同一张表可能出现多次（如增量后接全量比对），key 要带上序号 */}
+        {tables.map((t, i) => (
+          <li key={`${i}-${t.name}`} data-result-table={t.name}>
+            {`${t.name}：`}<span className="text-foreground">{t.dropped ? '已删除' : t.rows === null ? '—' : `${t.rows.toLocaleString('zh-CN')} 行`}</span>
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  return emptyHint ? <div>数据湖里还没有表</div> : null;
+}
+
+function ResultDetails({ result }: { result: TaskResult }) {
+  const { unlinkedOrders, engine } = result;
   return (
     <details className="text-xs text-muted-foreground">
       <summary className="cursor-pointer select-none">查看结果</summary>
       <div className="mt-1 space-y-1 pl-3">
-        {keyCheck ? (
-          <div className="space-y-0.5">
-            <div data-keycheck-result={keyCheck.tableName}>
-              {`${keyCheck.tableName} 的业务主键 ${keyCheck.keyColumns.join('、')}：`}
-              <StatusText tone={keyCheck.ok ? 'ok' : 'bad'} className="text-xs">{keyCheck.ok ? '通过' : '不通过'}</StatusText>
-            </div>
-            {!keyCheck.ok && <KeyCheckFindings result={keyCheck} className="pl-3" />}
-          </div>
-        ) : serving ? (
-          <div className="space-y-0.5">
-            <div data-serving-version={serving.version}>{`服务库第 ${serving.version} 版`}</div>
-            {(Object.keys(SERVING_PART_LABELS) as (keyof ServingRows)[]).map(part => (
-              <div key={part} data-serving-part={part} className="pl-3">
-                {`${SERVING_PART_LABELS[part]}：`}<span className="text-foreground">{`${serving.rows[part].toLocaleString('zh-CN')} 行`}</span>
-              </div>
-            ))}
-          </div>
-        ) : tables.length ? (
-          <ul>
-            {/* 同步结果按批次记录，同一张表可能出现多次（如增量后接全量比对），key 要带上序号 */}
-            {tables.map((t, i) => (
-              <li key={`${i}-${t.name}`} data-result-table={t.name}>
-                {`${t.name}：`}<span className="text-foreground">{t.dropped ? '已删除' : t.rows === null ? '—' : `${t.rows.toLocaleString('zh-CN')} 行`}</span>
-              </li>
-            ))}
-          </ul>
-        ) : emptyHint ? (
-          <div>数据湖里还没有表</div>
-        ) : null}
+        <ResultBody result={result} />
         {unlinkedOrders !== undefined && (
           <div>打通不到消费者的订单：<span className="text-foreground">{unlinkedOrders.toLocaleString('zh-CN')}</span></div>
         )}
