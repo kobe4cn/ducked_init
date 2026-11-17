@@ -116,6 +116,22 @@ describe('权限矩阵', () => {
       expect(app.outbox).toHaveLength(0);
     });
   }
+
+  it('顶栏导航按模块分组：分组渲染成 <summary> 下拉，子项带 aria-current；查看者没有数据接入与管理分组', async () => {
+    const admin = await loginWithRole('admin');
+    const html = await (await admin.get('/sources')).text();
+    // 概览、任务是单链接，其余 4 组是下拉；当前页（/sources）的分组是数据接入，子项「数据源」标 aria-current
+    for (const group of ['数据接入', '数据模型', '分析', '管理']) expect(html).toMatch(new RegExp(`<summary[^>]*>${group}`));
+    expect(html).toMatch(/<a(?=[^>]*aria-current="page")(?=[^>]*href="\/sources")[^>]*>数据源/);
+    expect(html).toContain('href="/quality"');
+
+    const viewer = (await tenantWith('viewer', 'viewer-co')).member;
+    const home = await (await viewer.get('/')).text();
+    expect(home).not.toMatch(/<summary[^>]*>(数据接入|管理)/);
+    expect(home).not.toContain('href="/sources"');
+    expect(home).toMatch(/<summary[^>]*>数据模型/);
+    expect(home).toMatch(/<a(?=[^>]*href="\/analytics")[^>]*>指标与标签/);
+  });
 });
 
 describe('审计日志', () => {
