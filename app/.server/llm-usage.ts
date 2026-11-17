@@ -152,7 +152,8 @@ export interface TenantModelUsage {
 }
 
 /** 同组内来源的排序：tenant → platform → 旧行（null 记 2） */
-const sourceRank = (s: 'tenant' | 'platform' | null) => (s === 'tenant' ? 0 : s === 'platform' ? 1 : 2);
+const SOURCE_RANK = { tenant: 0, platform: 1 } as const;
+const sourceRank = (s: 'tenant' | 'platform' | null) => (s === null ? 2 : SOURCE_RANK[s]);
 
 /**
  * 跨租户按（租户、模型、用途、来源）分组汇总（#746，运营后台；#844 加来源分组键）。运营者没有租户 RLS，直接用 getDb()（先例
