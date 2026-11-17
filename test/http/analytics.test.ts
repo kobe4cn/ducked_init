@@ -15,7 +15,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { dslDefinitions, dslVersions, snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
-import { listSnapshots, readChurnSnapshot, readTemplateSnapshot } from '../../app/.server/snapshots';
+import { listSnapshots, readChurnSnapshot, readClvSnapshot, readRepurchaseSnapshot, readTemplateSnapshot } from '../../app/.server/snapshots';
 import { drain, memberOf, newTenant, onLake, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -632,6 +632,36 @@ describe('复购与 CLV 快照页（#835）', () => {
     expect(consumerIds(html)).toHaveLength(snapshot.rowCount);
     expect(consumerIds(html)).toEqual(await lakeIds(acme, snapshot));
     for (const p of PLAINTEXT) expect(html).not.toContain(p);
+  });
+
+  it('readRepurchaseSnapshot / readClvSnapshot 翻页：每页 2 位时 3 页拼起来与湖上按 consumer_id 排序的全部 id 一致、不重不漏，汇总不随页码变化', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await runTask(acme, 'gold.repurchase', { asOf: '2024-07-01' });
+    await runTask(acme, 'gold.clv', { asOf: '2024-07-01' });
+    const repurchase = (await listSnapshots(acme, 'repurchase'))[0]!;
+    const clv = (await listSnapshots(acme, 'clv'))[0]!;
+
+    const repurchaseIds = await lakeIds(acme, repurchase);
+    expect(repurchaseIds).toHaveLength(5);
+    const repurchasePages = await Promise.all([1, 2, 3].map(page => readRepurchaseSnapshot(repurchase, { page, pageSize: 2 })));
+    expect(repurchasePages.map(p => p.rows.length)).toEqual([2, 2, 1]);
+    expect(repurchasePages.flatMap(p => p.rows.map(r => r.consumer_id))).toEqual(repurchaseIds);
+    const repurchaseSummary = await repurchaseExpected(acme, repurchase);
+    for (const p of repurchasePages) {
+      expect({ total: p.total, repurchased: p.repurchased, medianDaysToSecond: p.medianDaysToSecond }).toEqual(repurchaseSummary);
+    }
+
+    const clvIds = await lakeIds(acme, clv);
+    expect(clvIds).toHaveLength(5);
+    const clvPages = await Promise.all([1, 2, 3].map(page => readClvSnapshot(clv, { page, pageSize: 2 })));
+    expect(clvPages.map(p => p.rows.length)).toEqual([2, 2, 1]);
+    expect(clvPages.flatMap(p => p.rows.map(r => r.consumer_id))).toEqual(clvIds);
+    const clvSummary = await clvExpected(acme, clv);
+    for (const p of clvPages) {
+      expect(p.deciles.map(d => ({ ...d, clv: Number(d.clv) }))).toEqual(clvSummary.deciles);
+      expect(p.topShare).toBe(clvSummary.topShare);
+      expect(Number(p.totalClv)).toBe(clvSummary.totalClv);
+    }
   });
 
   it('没人复购时天数中位数显示「—」（复购率为 0.0%）、总 clv 为 0 时头部占比显示「—」，不除零；明细照常', async () => {
