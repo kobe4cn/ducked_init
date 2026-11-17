@@ -964,7 +964,7 @@ export const catalogProjection = platform.table('catalog_projection', {
 }, t => [uniqueIndex('catalog_projection_tenant_class_entry_uq').on(t.tenantId, t.visibilityClass, t.entryId)]);
 
 // 检索投影文字的向量缓存（ADR-0047、0049）：按（租户, 模型, 文本哈希）一行。embedding 是昂贵的派生计算，丢了可以重算、不参与权限判断；
-// 键里含模型标识：换模型后旧模型的行命中不了，补算时删掉（catalog/embeddings.ts）。仓库没有 pgvector，向量存 real[]。
+// 键里含模型标识：换模型后旧模型的行命中不了，补算时删掉（catalog/embeddings.ts）。平台库不依赖 pgvector（自建 PG 不一定装），向量存 real[]；pgvector 只用在租户自带的外部向量库（ADR-0058，catalog/vector-store-pgvector.ts）。
 // 缓存读写一律带 tenant_id，哈希相同也不跨租户共用
 export const catalogEmbeddings = platform.table('catalog_embeddings', {
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),

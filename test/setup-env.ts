@@ -22,6 +22,7 @@ const PER_WORKER: Record<string, (base: string) => string> = {
   TEST_SOURCE_DATABASE_URL: withDbSuffix,
   TEST_MYSQL_URL: withDbSuffix,
   TEST_MONGO_URL: withDbSuffix,
+  TEST_PGVECTOR_URL: withDbSuffix,
   PLATFORM_LAKE_URI: base => base + WORKER_SUFFIX,
   PLATFORM_SOURCE_FILES_DIR: base => base + WORKER_SUFFIX,
   TEST_S3_LAKE_URI: base => base + WORKER_SUFFIX,

@@ -1,7 +1,7 @@
 // scripts/drop-test-resources.ts —— 回收 Sandcastle 按票分配的测试资源（库名 / 前缀带 _i<n>，见 .sandcastle/main.ts 的 testEnv）。
 // 每张票的沙箱关掉后由 main.ts 调用；下次再跑这张票时 test/global-setup.ts 与夹具会重新建库。
 // 回收的范围：基准名加后缀、可能再加 worker 后缀 _w<i>：
-// - PG：crm_platform_test、crm_source_test、crm_platform_browser 的库，以及这些库里租户的 catalog 角色 lake_<id>（集群级，
+// - PG：crm_platform_test、crm_source_test、crm_platform_browser、crm_vector_test 的库，以及这些库里租户的 catalog 角色 lake_<id>（集群级，
 //   删库不会带走）。先记下依赖在库里的角色，删库后没有其他库再依赖的才删
 // - 对象存储：TEST_S3_LAKE_URI 加后缀的前缀下的全部对象，以及策略只授权这些前缀的账号（租户的 lake-<id>[-ro]、源文件的 src-*-<id>）；
 //   每租户一桶（ADR-0008）的桶租户另有独占的桶 lake-<租户 ID>——桶名不含票后缀、开发租户的桶同名，不能按 lake-* 列桶全删，
@@ -22,7 +22,8 @@ import { deleteBucket, deleteObject, listObjects, signedFetch, xmlTag, xmlTags }
 import { accountsToDrop, escapeRe, nameMatcher, suffixPattern } from './test-resource-names';
 
 const PG_URL = process.env.TEST_PLATFORM_DATABASE_URL ?? 'postgres://crm:crm@localhost:5432/crm_platform_test';
-const PG_BASES = ['crm_platform_test', 'crm_source_test', 'crm_platform_browser'];
+// crm_vector_test：pgvector 契约用例的库（TEST_PGVECTOR_URL，沙箱里与平台库在同一台 PG，见 .sandcastle/main.ts 的 testEnv）
+const PG_BASES = ['crm_platform_test', 'crm_source_test', 'crm_platform_browser', 'crm_vector_test'];
 
 const args = process.argv.slice(2);
 const all = args.includes('--all');

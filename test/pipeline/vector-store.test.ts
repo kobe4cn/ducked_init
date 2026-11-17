@@ -1,5 +1,5 @@
 // test/pipeline/vector-store.test.ts —— 向量存储接口（ADR-0058）的契约用例：同一组用例（contractCases）对系统自带实现 platformStore 一直跑，
-// 对 pgvector 外部实现只在设置 TEST_PGVECTOR_URL 时跑（skipIf；测试 PG 没装 pgvector 扩展时自动跳过，换镜像见 #850）；
+// 对 pgvector 外部实现只在设置 TEST_PGVECTOR_URL 时跑（skipIf；本地 .env.test、CI 与 Sandcastle 沙箱都设置，测试 PG 镜像带 pgvector，#850）；
 // topN 展开成行后与 vectorLane 同序的用例依赖精确相等，只属于 platformStore。preparePgvector 的失败路径（连不上、抹凭据）一直跑。
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { ProjectionRow } from '../../app/.server/catalog/projection';
