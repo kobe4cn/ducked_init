@@ -1,6 +1,7 @@
-// app/routes/ops.llm-usage.tsx —— 运营后台「模型调用汇总」页（#746，仅运营者）：跨租户按（租户、模型、用途）看近 7/30 天的
+// app/routes/ops.llm-usage.tsx —— 运营后台「模型调用汇总」页（#746，仅运营者）：跨租户按（租户、模型、用途、来源）看近 7/30 天的
 // 调用次数、输入 / 输出 token、按当前单价折算的金额（ADR-0057）与错误「次数（错误率）」。只放聚合数，不放调用明细与
-// 错误原文（ADR-0007）；排序：租户名 zh-CN、模型与用途按码点（ADR-0045，见 usageAcrossTenants）
+// 错误原文（ADR-0007）；排序：租户名 zh-CN、模型与用途按码点（ADR-0045，见 usageAcrossTenants）。
+// 来源（#844）是分组键之一：tenant「租户」/ platform「平台」，迁移前的旧行（为空）显示「—」
 import type { Route } from './+types/ops.llm-usage';
 import { parseDays, usageAcrossTenants, type TenantModelUsage } from '~/.server/llm-usage';
 import { requireOperator } from '~/.server/ops-auth';
@@ -22,14 +23,17 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 const n = (v: number) => v.toLocaleString('zh-CN');
 const pct = (part: number, whole: number) => (whole ? `${Math.round((part / whole) * 1000) / 10}%` : '—');
+/** 来源列（#844）：与租户页各定义一份，不从路由模块导出复用 */
+const SOURCE_LABEL = { tenant: '租户', platform: '平台' } as const;
 
 /** 汇总表的一行 */
 function UsageRow({ row }: { row: TenantModelUsage }) {
   return (
-    <TableRow data-tenant={row.tenantName} data-model={row.model} data-purpose={row.purpose}>
+    <TableRow data-tenant={row.tenantName} data-model={row.model} data-purpose={row.purpose} data-source={row.source ?? 'none'}>
       <TableCell>{row.tenantName}</TableCell>
       <TableCell className="text-slate-500">{row.model}</TableCell>
       <TableCell>{row.purpose}</TableCell>
+      <TableCell data-col="source" className="text-slate-500">{(row.source && SOURCE_LABEL[row.source]) ?? '—'}</TableCell>
       <TableCell data-col="calls">{n(row.calls)}</TableCell>
       <TableCell data-col="tokens" className="text-slate-500">{`${n(row.promptTokens)} / ${n(row.completionTokens)}`}</TableCell>
       <TableCell data-col="cost">{row.cost}</TableCell>
@@ -42,7 +46,7 @@ export default function OpsLlmUsage({ loaderData }: Route.ComponentProps) {
   const { email, days, rows } = loaderData;
   return (
     <OpsShell email={email}>
-      <PageHeader title="模型调用" description={`近 ${days} 天各租户的模型调用按（租户、模型、用途）汇总：次数、token、按当前单价折算的金额与错误率。只有聚合数，没有调用明细。`} />
+      <PageHeader title="模型调用" description={`近 ${days} 天各租户的模型调用按（租户、模型、用途、来源）汇总：次数、token、按当前单价折算的金额与错误率。只有聚合数，没有调用明细。`} />
 
       <PillTabs
         tabs={[
@@ -64,6 +68,7 @@ export default function OpsLlmUsage({ loaderData }: Route.ComponentProps) {
                 <TableHead>租户</TableHead>
                 <TableHead>模型</TableHead>
                 <TableHead>用途</TableHead>
+                <TableHead>来源</TableHead>
                 <TableHead>调用</TableHead>
                 <TableHead>token（输入 / 输出）</TableHead>
                 <TableHead>金额</TableHead>
