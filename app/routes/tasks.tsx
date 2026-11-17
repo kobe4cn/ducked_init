@@ -7,6 +7,7 @@ import { isTaskKind, readResult } from '~/.server/pipeline/task-contracts';
 import { templateOfKind } from '~/.server/pipeline/templates';
 import { entityLabel } from '~/lib/canonical-model';
 import type { KeyCheckTaskResult } from '~/.server/source-key-check';
+import type { ServingRows } from '~/.server/pipeline/serving-engine';
 import { AppShell } from '~/components/app-shell';
 import { KeyCheckFindings } from '~/components/key-check-findings';
 import { PageHeader } from '~/components/page-header';
@@ -21,6 +22,10 @@ export function meta({}: Route.MetaArgs) {
 interface TaskResult {
   /** rows 为 null：这张表没有行数（同步失败、源端已删除、核对时读不了）；dropped：快照过期删掉的表 */
   tables: { name: string; rows: number | null; dropped?: true }[];
+  /** 生成服务库：服务库版本与各部分的行数 */
+  serving?: { version: number; rows: ServingRows };
+  /** 盘点数据湖时表还没有建：提示「数据湖里还没有表」；其他没有表清单的 kind 不提示 */
+  emptyHint?: true;
   /** RFM 分层：打通不到消费者、没计入的订单数 */
   unlinkedOrders?: number;
   /** 校验业务主键：是否通过、空值行数与前几个重复键（敏感列的 key 为 null） */
@@ -47,8 +52,12 @@ function taskResult(task: { kind: string; result: unknown }): TaskResult | null 
     return { tables: [], engine: engineOf((task.result as { engine?: unknown }).engine) };
   }
   switch (task.kind) {
-    // 盘点、造数与采集：tables 是 { name, rows }[]
-    case 'lake.inventory':
+    // 盘点数据湖：tables 是 { name, rows }[]；没有表时提示数据湖还没有表（emptyHint 只在这里设置）
+    case 'lake.inventory': {
+      const result = readResult(task.kind, task);
+      return result && { tables: result.tables.map(t => ({ name: t.name, rows: t.rows })), engine: result.engine, emptyHint: true };
+    }
+    // 造数与采集：tables 是 { name, rows }[]
     case 'demo.seed':
     case 'source.profile': {
       const result = readResult(task.kind, task);
@@ -88,6 +97,11 @@ function taskResult(task: { kind: string; result: unknown }): TaskResult | null 
       const result = readResult(task.kind, task);
       return result && { tables: [{ name: result.table, rows: result.rows }], engine: result.engine };
     }
+    // 生成服务库：结果没有表清单，是版本号与各部分的行数（ADR-0033）
+    case 'serving.build': {
+      const result = readResult(task.kind, task);
+      return result && { tables: [], serving: { version: result.version, rows: result.rows }, engine: result.engine };
+    }
     // 快照过期、沙箱表过期与删除原始层：tables 是删掉的表名
     case 'gold.expire':
     case 'sandbox.expire':
@@ -107,7 +121,7 @@ function taskResult(task: { kind: string; result: unknown }): TaskResult | null 
           engine: result.engine,
         };
       }
-      // 刷新检索投影、补算检索向量、漂移检查、主键冲突体检、生成服务库、人群导出等：只展示运行配额
+      // 刷新检索投影、补算检索向量、漂移检查、主键冲突体检、人群导出等：只展示运行配额
       return { tables: [], engine: result.engine };
     }
   }
@@ -137,7 +151,16 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
 
-function ResultDetails({ result: { tables, unlinkedOrders, keyCheck, engine } }: { result: TaskResult }) {
+/** 服务库各部分在任务页上的中文名（对象顺序即展示顺序，各部分见 serving-engine 的 ServingRows） */
+const SERVING_PART_LABELS: Record<keyof ServingRows, string> = {
+  rfm: 'RFM',
+  tags: '标签',
+  metrics: '指标',
+  consumer_aliases: '退役 ID 对照',
+  consumer_sources: '源端 ID 对照',
+};
+
+function ResultDetails({ result: { tables, serving, emptyHint, unlinkedOrders, keyCheck, engine } }: { result: TaskResult }) {
   return (
     <details className="text-xs text-muted-foreground">
       <summary className="cursor-pointer select-none">查看结果</summary>
@@ -150,6 +173,15 @@ function ResultDetails({ result: { tables, unlinkedOrders, keyCheck, engine } }:
             </div>
             {!keyCheck.ok && <KeyCheckFindings result={keyCheck} className="pl-3" />}
           </div>
+        ) : serving ? (
+          <div className="space-y-0.5">
+            <div data-serving-version={serving.version}>{`服务库第 ${serving.version} 版`}</div>
+            {(Object.keys(SERVING_PART_LABELS) as (keyof ServingRows)[]).map(part => (
+              <div key={part} data-serving-part={part} className="pl-3">
+                {`${SERVING_PART_LABELS[part]}：`}<span className="text-foreground">{`${serving.rows[part].toLocaleString('zh-CN')} 行`}</span>
+              </div>
+            ))}
+          </div>
         ) : tables.length ? (
           <ul>
             {/* 同步结果按批次记录，同一张表可能出现多次（如增量后接全量比对），key 要带上序号 */}
@@ -159,9 +191,9 @@ function ResultDetails({ result: { tables, unlinkedOrders, keyCheck, engine } }:
               </li>
             ))}
           </ul>
-        ) : (
+        ) : emptyHint ? (
           <div>数据湖里还没有表</div>
-        )}
+        ) : null}
         {unlinkedOrders !== undefined && (
           <div>打通不到消费者的订单：<span className="text-foreground">{unlinkedOrders.toLocaleString('zh-CN')}</span></div>
         )}

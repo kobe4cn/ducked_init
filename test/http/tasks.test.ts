@@ -102,8 +102,8 @@ describe('成员查看本租户的任务', () => {
     };
     const engine = { memoryLimit: '2 GiB', threads: 2 };
     const keyCheckShape = { tableName: 'shop.customers', keyColumns: ['customer_id'], ok: true, nullRows: 0, duplicates: [] };
-    // serving.build 的结果顶层带 table / rows，形状像快照表结果，任务页只显示运行配额
-    await finish('serving.build', {}, { table: 'gold.metric__791a674d-0000-4000-8000-000000000000', rows: 5, engine });
+    // lake.inspect 的结果顶层带 table / rows，形状像快照表结果，任务页只显示运行配额，不提示数据湖里还没有表
+    await finish('lake.inspect', {}, { table: 'gold.metric__791a674d-0000-4000-8000-000000000000', rows: 5, engine });
     // silver.keycheck 的结果带 tableName / ok 等，形状像业务主键检查，任务页不渲染检查结果
     await finish('silver.keycheck', {}, { ...keyCheckShape, engine });
     // source.keycheck 的结果同形，这个 kind 显示主键检查结果
@@ -113,12 +113,49 @@ describe('成员查看本租户的任务', () => {
     const res = await admin.get('/tasks');
     expect(res.status).toBe(200);
     const byKind = Object.fromEntries(taskRows(await res.text()).map(r => [r.kind, r]));
-    expect(byKind['serving.build'].html).toContain('运行配额');
-    expect(byKind['serving.build'].html).not.toContain('data-result-table');
+    expect(byKind['lake.inspect'].html).toContain('运行配额');
+    expect(byKind['lake.inspect'].html).not.toContain('data-result-table');
+    expect(byKind['lake.inspect'].html).not.toContain('数据湖里还没有表');
     expect(byKind['silver.keycheck'].html).toContain('运行配额');
     expect(byKind['silver.keycheck'].html).not.toContain('data-keycheck-result');
     expect(byKind['source.keycheck'].html).toMatch(/data-keycheck-result="shop\.customers"/);
     expect(byKind['source.keycheck'].html).toContain('通过');
+  });
+
+  it('生成服务库的任务结果显示服务库版本与各部分行数，空表提示只在盘点数据湖时出现', async () => {
+    const acme = await newTenant('acme');
+    // 参数过不了入队校验：裸插再直接改状态（不触发服务库激活钩子，不用造服务库文件）
+    const finish = async (kind: TaskKind, params: Record<string, unknown>, result: Record<string, unknown>) => {
+      const [task] = await getDb().insert(tasks).values({ tenantId: acme, kind, params }).returning();
+      await getDb().update(tasks).set({ status: 'succeeded', result, finishedAt: new Date() }).where(eq(tasks.id, task.id));
+    };
+    const engine = { memoryLimit: '2 GiB', threads: 2 };
+    await finish('serving.build', {}, {
+      version: 57,
+      path: 'x/_serving/v57.duckdb',
+      rows: { rfm: 42965, tags: 416010, metrics: 621216, consumer_aliases: 7528, consumer_sources: 92080 },
+      engine,
+    });
+    await finish('lake.inventory', {}, { tables: [], engine });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const res = await admin.get('/tasks');
+    expect(res.status).toBe(200);
+    const byKind = Object.fromEntries(taskRows(await res.text()).map(r => [r.kind, r]));
+    const serving = byKind['serving.build'].html;
+    expect(serving).toContain('服务库第 57 版');
+    expect(serving).toContain('RFM：');
+    expect(serving).toContain('42,965');
+    expect(serving).toContain('标签：');
+    expect(serving).toContain('416,010');
+    expect(serving).toContain('指标：');
+    expect(serving).toContain('621,216');
+    expect(serving).toContain('退役 ID 对照：');
+    expect(serving).toContain('7,528');
+    expect(serving).toContain('源端 ID 对照：');
+    expect(serving).toContain('92,080');
+    expect(serving).not.toContain('数据湖里还没有表');
+    expect(byKind['lake.inventory'].html).toContain('数据湖里还没有表');
   });
 
   it('RFM 分层任务展示快照表与打通不到消费者的订单，快照过期任务列出删除的表', async () => {
