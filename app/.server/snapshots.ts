@@ -15,6 +15,7 @@ import { insertTask } from './tasks';
 import { readResult } from './pipeline/task-contracts';
 import { TEMPLATES } from './pipeline/templates';
 import type { RfmParams } from './pipeline/templates/rfm';
+import type { CohortParams } from './pipeline/templates/cohort';
 import { isDslKind, type DslKind } from './pipeline/dsl';
 
 export type SnapshotTemplate = keyof typeof TEMPLATES;
@@ -306,6 +307,40 @@ export async function readClvSnapshot(snapshot: Snapshot, { page, pageSize = CON
       columns: result.columnNames(),
       rows: result.getRowObjectsJson() as Record<string, unknown>[],
     };
+  } finally {
+    session.close();
+  }
+}
+
+/** 同期群留存矩阵里的一行：cohort_start（YYYY-MM-DD）与第 0…periods-1 期各期有下单的人数（没人下单的期为 0） */
+export interface CohortRow { cohortStart: string; counts: number[] }
+
+/**
+ * 只读挂载本租户的数据湖，读出同期群快照：留存矩阵（每行一个 cohort_start、按日期升序，counts[k] 是 active_periods
+ * 含偏移 k 的人数，按快照 params.periods 补齐、湖上没有的期补 0，超出 periods 的偏移丢弃）与粒度 granularity，
+ * 以及按 consumer_id 排序的第 page 页明细（列取快照表的全部列，同通用明细）。
+ * active_periods 的首单周期是 0，所以 counts[0] 就是这个群的人数（留存率的分母）
+ */
+export async function readCohortSnapshot(snapshot: Snapshot, { page, pageSize = CONSUMER_PAGE_SIZE }: { page: number; pageSize?: number }) {
+  if (snapshot.template !== 'cohort') throw new SnapshotError('不是同期群快照', 404);
+  const { session, table } = await openSnapshotTable(snapshot);
+  const read = async <T>(sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+  try {
+    const { periods, granularity } = snapshot.params as unknown as CohortParams;
+    const grouped = await read<{ cohort_start: string; p: number; consumers: string }>(
+      `SELECT cohort_start::VARCHAR AS cohort_start, p, count(*) AS consumers FROM (SELECT cohort_start, unnest(active_periods) AS p FROM ${table}) GROUP BY ALL ORDER BY ALL`);
+    // GROUP BY ALL + ORDER BY ALL 已按 cohort_start、p 升序；这里按 periods 补齐成每行等长的 counts
+    const countsOf = new Map<string, number[]>();
+    for (const g of grouped) {
+      const counts = countsOf.get(g.cohort_start) ?? Array.from({ length: periods }, () => 0);
+      const p = Number(g.p);
+      if (p < periods) counts[p] = Number(g.consumers);
+      countsOf.set(g.cohort_start, counts);
+    }
+    const matrix = [...countsOf].map(([cohortStart, counts]): CohortRow => ({ cohortStart, counts }));
+    const result = await session.con.runAndReadAll(
+      `SELECT * FROM ${table} ORDER BY consumer_id LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`);
+    return { matrix, granularity, columns: result.columnNames(), rows: result.getRowObjectsJson() as Record<string, unknown>[] };
   } finally {
     session.close();
   }
