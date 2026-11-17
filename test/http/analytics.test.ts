@@ -571,6 +571,11 @@ describe('复购与 CLV 快照页（#835）', () => {
     };
   };
 
+  /** 湖上这张快照全部 consumer_id，按 consumer_id 升序（与明细的分页顺序一致） */
+  const lakeIds = async (tenantId: string, snapshot: { table: string }) => {
+    const [schema, name] = snapshot.table.split('.');
+    return (await onLake<{ consumer_id: string }>(tenantId, `SELECT consumer_id FROM ${schema}."${name}" ORDER BY consumer_id`)).map(r => r.consumer_id);
+  };
   const consumerIds = (html: string) => [...html.matchAll(/data-consumer="([^"]+)"/g)].map(m => m[1]!);
   /** 页面上金额的写法（与路由里的 money 一致） */
   const money = (n: number) => `¥${n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -593,8 +598,9 @@ describe('复购与 CLV 快照页（#835）', () => {
     expect(html).toContain(`data-total-count="${expected.total}"`);
     expect(html).toContain(`data-median-days="${expected.medianDaysToSecond} 天"`);
     expect(html).toContain(`${expected.repurchased} / ${expected.total} 人`);
-    // 明细按 consumer_id 升序分页（通用明细，不筛选）
-    expect(consumerIds(html)).toEqual([...consumerIds(html)].sort());
+    // 明细按 consumer_id 升序分页（通用明细，不筛选）：5 人一页全列出，与湖上按 consumer_id 排序的全部 id 一致
+    expect(consumerIds(html)).toHaveLength(expected.total);
+    expect(consumerIds(html)).toEqual(await lakeIds(acme, snapshot));
     expect(html).toContain('第 1 / 1 页');
     for (const p of PLAINTEXT) expect(html).not.toContain(p);
   });
@@ -622,7 +628,9 @@ describe('复购与 CLV 快照页（#835）', () => {
       expect(row[2]).toContain(money(expected.deciles[i]!.clv));
     }
     expect(html).toContain('第 1 / 1 页');
-    expect(consumerIds(html)).toEqual([...consumerIds(html)].sort());
+    expect(snapshot.rowCount).toBe(5);
+    expect(consumerIds(html)).toHaveLength(snapshot.rowCount);
+    expect(consumerIds(html)).toEqual(await lakeIds(acme, snapshot));
     for (const p of PLAINTEXT) expect(html).not.toContain(p);
   });
 
