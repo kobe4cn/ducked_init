@@ -842,19 +842,27 @@ describe('模板升级', () => {
     expect(page).toContain('有新的模板版本 v2（当前 v1）');
     expect(page).toContain('预览升级差异');
     expect(page).toContain('升级到新版本');
+    // 提示条列出锁定版本之后每一版的改动说明
+    expect(page).toContain('data-upgrade-changes');
+    expect(page).toContain('v2：分群名加 v2: 前缀，用于验证升级流程；所有人的分群名都会变');
 
     const preview = await analyst.post('/analytics/templates/rfm', { intent: 'preview-upgrade', asOf: '2024-12-31' });
     expect(preview.status).toBe(200);
     const diff = await preview.text();
     expect(diff).toContain('data-upgrade-diff');
     expect(diff).toContain('v1 → v2，统计日 2024-12-31');
+    // 预览结果的头部再列一次同样的说明（提示条里一次、预览头部一次）
+    expect(diff.match(/data-upgrade-changes/g)!.length).toBe(2);
+    expect(diff).toContain('v2：分群名加 v2: 前缀，用于验证升级流程；所有人的分群名都会变');
     expect(diff.match(/data-upgrade-segment/g)!.length).toBeGreaterThan(0);
     expect(diff).toMatch(/<td[^>]*>v2:[^<]+<\/td>/);
     expect(diff).not.toMatch(/[0-9a-f]{64}/);
 
-    // 流失预警：变化、新增、移出人数
+    // 流失预警：变化、新增、移出人数；提示条与预览头部列出它自己的改动说明
     const churn = await (await analyst.post('/analytics/templates/churn', { intent: 'preview-upgrade', asOf: '2024-10-15' })).text();
     expect(churn).toMatch(/data-upgrade-metric[^>]*>取值变化 [1-9]\d* 人，新增 0 人，移出 0 人/);
+    expect(churn.match(/data-upgrade-changes/g)!.length).toBe(2);
+    expect(churn).toContain('v2：at_risk 取反；minOrders 不超过 10，用于验证升级流程；所有人的 at_risk 都会翻转');
     expect(churn).not.toMatch(/[0-9a-f]{64}/);
 
     const upgraded = await analyst.post('/analytics/templates/rfm', { intent: 'upgrade' });
