@@ -15,7 +15,7 @@ import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
 import type { CurrentMember } from './auth';
-import { tenantCatalog } from './catalog/load';
+import { draftSearch, type DraftAmbiguity } from './catalog/draft-search';
 import { catalogTx } from './catalog/tx';
 import { publishedCustomEntities } from './custom-entities';
 import { getDb, isUniqueViolation } from './db/client';
@@ -27,7 +27,7 @@ import { publishedPlans } from './mappings';
 import { failedErrors, type AssertionResult } from './pipeline/assertions';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
-import { definitionDraftMessages, definitionDraftPurpose, definitionDraftSchema, definitionOutputToYaml } from './pipeline/dsl/model-draft';
+import { definitionDraftMessages, definitionDraftPurpose, definitionDraftSchema, definitionOutputToYaml, SEARCH_LIMIT } from './pipeline/dsl/model-draft';
 import { checkMetric, type DslCheck, type DslContext, type DslIssue, type MetricSpec } from './pipeline/dsl/metric-spec';
 import { withMetric } from './pipeline/dsl/tag-spec';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './pipeline/identity-engine';
@@ -182,12 +182,13 @@ export async function createDefinition(actor: CurrentMember, kind: string, key: 
 }
 
 /**
- * 用模型按自然语言需求生成定义草稿（ADR-0003、ADR-0035）：上下文取自本租户的语义目录（ADR-0041：总览、按需求搜出的条目与该种类的能力说明）；
- * 模型输出按该种类的 Schema 校验、转成 YAML 后须过该种类的校验，只返回 YAML，不保存（之后照常保存草稿、双人发布）。
+ * 用模型按自然语言需求生成定义草稿（ADR-0003、ADR-0035）：上下文取自本租户的语义目录（ADR-0041：分层目录、按需求检索出的条目与该种类的能力说明）；
+ * 检索与助手 catalog_search 同一条路（draftSearch，#827：按成员权限的目录、租户开 hybrid_search 时带向量一路），需求有歧义时照常起草，
+ * 另把歧义词与候选带回页面提示成员；模型输出按该种类的 Schema 校验、转成 YAML 后须过该种类的校验，只返回 YAML，不保存（之后照常保存草稿、双人发布）。
  * 没配置模型服务、或上下文里没东西可用（标签没有可引用的指标）时 400、不发请求；
  * 模型失败或转出的 YAML 不过校验时记审计 definition.model_draft_failed（不含需求原文、模型原文与取值），抛 422
  */
-export async function modelDraftForDefinition(actor: CurrentMember, kind: string, request: string): Promise<{ yaml: string }> {
+export async function modelDraftForDefinition(actor: CurrentMember, kind: string, request: string): Promise<{ yaml: string; ambiguity: DraftAmbiguity | null }> {
   assertCan(actor, 'definitions:draft');
   requireKind(kind);
   if (!request.trim()) throw new DslError('请先写下需求');
@@ -197,7 +198,8 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
   const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
     tenantId, actor, action: 'definition.model_draft_failed', targetType: 'definition', detail: { kind, ...detail },
   });
-  const messages = definitionDraftMessages(kind, request, await tenantCatalog(tenantId));
+  const { catalog, entries, ambiguity } = await draftSearch(actor, request, SEARCH_LIMIT);
+  const messages = definitionDraftMessages(kind, request, catalog, entries);
   if (!Array.isArray(messages)) throw new DslError(messages.unavailable);
   let output: object;
   try {
@@ -213,7 +215,7 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
     await failed({ stage: 'definition', issues: checked.issues.length, paths: checked.issues.slice(0, 10).map(i => i.path) });
     throw new DslError(`模型生成的${DSL_KINDS[kind].label}定义有 ${checked.issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, checked.issues);
   }
-  return { yaml };
+  return { yaml, ambiguity };
 }
 
 /** dslDefinitionAdapter 的上下文：租户、种类与键；parentId 是定义行 ID */

@@ -9,7 +9,7 @@ import { CLAIM_TYPES } from '../../app/lib/semantic-claims';
 import { callModel, LlmError, type LlmMessage, type LlmProvider } from '../../app/.server/llm';
 import { DSL_KINDS, type DslKind } from '../../app/.server/pipeline/dsl';
 import type { MetricSpec, RatioPart } from '../../app/.server/pipeline/dsl/metric-spec';
-import { completeDraftPaths, definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml } from '../../app/.server/pipeline/dsl/model-draft';
+import { completeDraftPaths, definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml, rankedEntries } from '../../app/.server/pipeline/dsl/model-draft';
 import { tagMetrics, type TagSpec } from '../../app/.server/pipeline/dsl/tag-spec';
 import { CATALOG, CONTEXT, type GoldenCase, type GoldenEntry } from './golden';
 import { expectedMode } from './plan-modes';
@@ -124,7 +124,7 @@ function scoreStructure(kind: DslKind, expected: object, got: object | null): Pi
 export async function runCase(provider: LlmProvider, c: GoldenCase): Promise<CaseResult> {
   const want = DSL_KINDS[c.kind].check(stringify(c.expected), CONTEXT);
   if (!want.ok) throw new Error(`黄金样例 ${c.id} 的期望不过校验：${want.issues.map(i => i.message).join('；')}`);
-  const messages = definitionDraftMessages(c.kind, c.request, CATALOG);
+  const messages = definitionDraftMessages(c.kind, c.request, CATALOG, rankedEntries(CATALOG, c.request));
   if (!Array.isArray(messages)) throw new Error(`黄金样例 ${c.id} 无法起草：${messages.unavailable}`);
 
   let out: object;

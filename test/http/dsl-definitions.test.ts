@@ -20,6 +20,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { dslVersions, snapshots, tasks } from '../../app/.server/db/schema';
 import { createDefinition, getDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
+import { addAlias } from '../../app/.server/knowledge/aliases';
 import { syncSource } from '../../app/.server/source-sync';
 import { todayUtc } from '../../app/.server/templates';
 import { entityOf } from '../../app/lib/canonical-model';
@@ -694,6 +695,31 @@ describe('用模型生成指标草稿', () => {
     const badHtml = await bad.text();
     expect(badHtml).toContain('未采用，编辑框保持原内容');
     expect(editorYaml(badHtml)).toBe(REVENUE);
+  });
+
+  it('需求里的词挂两个同别名指标时：草稿照常生成，页面上出现「这些词有多种理解」与指向业务知识页的候选链接', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const reviewer = await memberOf(acme, 'de@acme.com', 'data_engineer');
+    // 两个窗口时间字段不同的指标挂同一个别名「营收」：检索判出歧义
+    const windowed = (field: string) => `base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: ${field}, days: 30 }\n`;
+    for (const [key, field] of [['revenue_365d', 'created_at'], ['gmv_365d', 'paid_at']] as const) {
+      await createDefinition(analyst, 'metric', key, windowed(field));
+      await publishDefinition(reviewer, 'metric', key, 1);
+      await addAlias(analyst, { targetId: `metric:${key}`, alias: '营收' });
+    }
+
+    modelReplies({ base: 'order', measure: { agg: 'sum', field: 'amount' } });
+    const res = await (await loginAs(app, 'analyst@acme.com'))
+      .post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request: '营收', yaml: REVENUE });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // 草稿照常生成，编辑框上方出现歧义提示：词、两个候选链接与说明
+    expect(editorYaml(html)).toContain('# 模型根据需求生成，请核对');
+    expect(html).toMatch(/data-ambiguity[^>]*>.*?这些词有多种理解/s);
+    expect(html).toMatch(/<a[^>]*href="\/knowledge\?item=metric%3Arevenue_365d"[^>]*>revenue_365d<\/a>/);
+    expect(html).toMatch(/<a[^>]*href="\/knowledge\?item=metric%3Agmv_365d"[^>]*>gmv_365d<\/a>/);
+    expect(html).toContain('请确认模型选的是否是你要的口径，或在需求里写明');
   });
 
   it('未配置模型服务时 400 提示；查看者提交 403', async () => {

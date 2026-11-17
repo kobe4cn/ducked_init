@@ -1,7 +1,7 @@
 // app/.server/pipeline/dsl/model-draft.ts —— 用模型按自然语言需求生成定义草稿（ADR-0035，纯函数，不读库、不发请求）：
 // 每种可生成的定义给出模型必须遵守的输出 Schema（直接用该种类的定义 Schema）、调用用途、提示词与给模型的上下文；
 // 上下文取自语义目录（ADR-0041）：system 是简短的角色说明加该种类的能力说明，user 是目录分层上下文（第一层分组、相关分组的组内列表，#855）、
-// 用需求原文搜出的条目与需求原文。
+// 按需求检索出的条目与需求原文。检索在 catalog/draft-search.ts（与助手同一条路，#827），排好的条目由调用方传入，这里只管截断与拼消息。
 // 目录里本就没有敏感字段、哈希列与明细行（ADR-0005），统计只有 ADR-0016 的常见取值。
 // 模型输出转成 YAML（首行注释提示核对）后仍要过该种类的校验（DSL_KINDS[kind].check），保存与双人发布照旧
 import { Document } from 'yaml';
@@ -14,8 +14,8 @@ import { CONSUMER_ENTITY, METRIC_SCHEMA, type MetricSpec, type RatioPart } from 
 import type { DslKind } from './index';
 import { SINGLE_TAG_SCHEMA } from './tag-spec';
 
-/** 按需求搜出的条目最多几条 */
-const SEARCH_LIMIT = 15;
+/** 按需求搜出的条目最多几条（起草的检索由 catalog/draft-search.ts 取，这里是截断上限） */
+export const SEARCH_LIMIT = 15;
 /** 搜出的条目估算最多多少 token，超过时减少条数 */
 const SEARCH_TOKENS = 6000;
 
@@ -83,9 +83,9 @@ const DRAFTS = {
 export const definitionDraftSchema = (kind: DslKind) => DRAFTS[kind].schema;
 export const definitionDraftPurpose = (kind: DslKind) => DRAFTS[kind].purpose;
 
-/** 按需求排序（rank，内存里派生的 full 投影）出的条目：分层上下文取相关分组、检索段取条目，一次算两处共用；
- * 能力说明已在 system 里，排序前就去掉它的投影行，不占依赖展开的名额 */
-function rankedEntries(catalog: Catalog, request: string): CatalogEntry[] {
+/** 一句话解析的条目排序（rank，内存里派生的 full 投影），需求评测脚本（不读库）也拿它拼同一份消息：起草已改用 catalog/draft-search.ts（#827），
+ * 一句话解析换检索后这里删掉；能力说明已在 system 里，排序前就去掉它的投影行，不占依赖展开的名额 */
+export function rankedEntries(catalog: Catalog, request: string): CatalogEntry[] {
   return rank(deriveProjection(catalog, 'full').filter(r => !r.entryId.startsWith('capability:')), catalog, request, {}, SEARCH_LIMIT).map(r => r.entry);
 }
 
@@ -100,13 +100,13 @@ function relevantMarkdown(hits: CatalogEntry[]): string {
 
 /**
  * 发给模型的消息：system 是角色说明与该种类的能力说明，user 依次是目录分层上下文（第一层分组、相关分组的组内列表）、按需求搜出的条目与需求原文；
+ * 条目由调用方经 catalog/draft-search.ts 排好传入（这里保持纯函数，不读库），只按 SEARCH_TOKENS 截断；
  * 目录里没有可用的东西时（如标签没有可引用的指标）返回提示，调用方不发请求
  */
-export function definitionDraftMessages(kind: DslKind, request: string, catalog: Catalog): LlmMessage[] | { unavailable: string } {
+export function definitionDraftMessages(kind: DslKind, request: string, catalog: Catalog, ranked: CatalogEntry[]): LlmMessage[] | { unavailable: string } {
   const { system, unavailable } = DRAFTS[kind];
   const hint = unavailable(catalog);
   if (hint) return { unavailable: hint };
-  const ranked = rankedEntries(catalog, request);
   const user = [layeredContext(catalog, ranked, OVERVIEW_TOKENS), `# 与需求相关的条目\n\n${relevantMarkdown(ranked)}`, `# 需求\n\n${request}`].join('\n\n');
   return [
     { role: 'system', content: system },
