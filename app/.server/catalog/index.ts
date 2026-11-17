@@ -544,7 +544,11 @@ function groupsOf(c: Catalog): Groups {
         break;
     }
     if (e.kind === 'field' || e.kind === 'metric' || e.kind === 'tag') {
-      for (const s of e.knowledge?.subjects ?? []) g.subject.set(s, [...(g.subject.get(s) ?? []), e]);
+      for (const s of e.knowledge?.subjects ?? []) {
+        const list = g.subject.get(s);
+        if (list) list.push(e);
+        else g.subject.set(s, [e]);
+      }
       (group ?? g.other).push(e);
     }
   }
