@@ -317,6 +317,9 @@ async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider:
       tenantId, purpose, model, schemaValid: stats.schemaValid, error, inputCount,
       // 档位与回落原因（ADR-0055）：route 是这次调用所属的档位，fallbackReason 为 'unbound' 表示该档位没绑定模型
       route, fallbackReason,
+      // 来源（#843）就是这次实际解析到的端点的 source（chat 由 resolveRoute、embedding 由 resolveEmbeddingProvider 填好），
+      // 不在日志层另行推算：embedding 与 chat 可能来自不同套配置
+      source: provider.source,
       promptTokens: stats.usage?.prompt_tokens ?? null, completionTokens: stats.usage?.completion_tokens ?? null,
       durationMs: Date.now() - started,
     }).catch(e => console.error('记录模型调用日志失败', e));

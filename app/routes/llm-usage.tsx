@@ -21,6 +21,8 @@ export function meta({}: Route.MetaArgs) {
 const n = (v: number) => v.toLocaleString('zh-CN');
 const pct = (part: number, whole: number) => (whole ? `${Math.round((part / whole) * 1000) / 10}%` : '—');
 const brief = (s: string) => (s.length > 120 ? `${s.slice(0, 120)}…` : s);
+/** 来源列（#843）：这次调用用的端点是租户的还是平台的；迁移前的旧行 source 为空，显示 — */
+const SOURCE_LABEL = { tenant: '租户', platform: '平台' } as const;
 
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'model_provider:manage');
@@ -142,6 +144,7 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
                   <TableHead>时间</TableHead>
                   <TableHead>用途</TableHead>
                   <TableHead>模型</TableHead>
+                  <TableHead>来源</TableHead>
                   <TableHead>输入 token</TableHead>
                   <TableHead>输出 token</TableHead>
                   <TableHead>耗时</TableHead>
@@ -156,6 +159,8 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
                     <TableCell className="text-slate-500">{new Date(r.createdAt).toLocaleString('zh-CN')}</TableCell>
                     <TableCell>{r.purpose}</TableCell>
                     <TableCell className="text-slate-500">{r.model}</TableCell>
+                    {/* 来源（#843）：这次调用用的端点是租户的还是平台的；迁移前的旧行为空，显示 — */}
+                    <TableCell data-col="source" className="text-slate-500">{(r.source && SOURCE_LABEL[r.source]) ?? '—'}</TableCell>
                     <TableCell>{r.promptTokens === null ? '—' : n(r.promptTokens)}</TableCell>
                     <TableCell>{r.completionTokens === null ? '—' : n(r.completionTokens)}</TableCell>
                     <TableCell>{`${n(r.durationMs)} ms`}</TableCell>
