@@ -104,7 +104,7 @@ describe('error 断言阻断快照并告警', () => {
     expect(task).toMatchObject({ status: 'failed' });
     // 重复的订单 1 一行来自 CRM、一行来自会员源，两个映射都写上（DISTINCT 的顺序不保证）
     expect((task!.result as { assertions: unknown[] }).assertions).toContainEqual(expect.objectContaining(
-      { name: 'primary_key_unique', level: 'error', entity: 'order', failed: 2, mappings: expect.arrayContaining([orderMappings!.crm, orderMappings!.loyalty]) }));
+      { name: 'primary_key_unique', level: 'error', entity: 'order', failed: 2, detail: 'order_id, _key_space', mappings: expect.arrayContaining([orderMappings!.crm, orderMappings!.loyalty]) }));
     await expectBlocked(acme, snapshot, /主键唯一（silver\.order，2 行不合格）/);
     const rows = await onLake<{ assertion: string; key: string }>(acme, `SELECT assertion, "key" FROM silver._quarantine WHERE task_id = ${lit(task!.id)}`);
     expect(rows).toEqual([{ assertion: 'primary_key_unique', key: '1' }, { assertion: 'primary_key_unique', key: '1' }]);
