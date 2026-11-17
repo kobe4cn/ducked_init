@@ -299,14 +299,15 @@ function ChurnResult({ tab, page, pages, pageSize, snapshot, total, atRisk, rows
 /** 复购快照（#835）：顶部卡片写复购率（X / Y 人）与到第二单天数中位数，下方按 consumer_id 的通用分页明细 */
 function RepurchaseResult({ page, pages, pageSize, snapshot, total, repurchased, medianDaysToSecond, columns, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'repurchase' }>) {
   const rate = total ? `${((repurchased / total) * 100).toFixed(1)}%` : '—';
+  const median = medianDaysToSecond === null ? '—' : `${medianDaysToSecond} 天`;
   return (
     <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <div data-repurchase-rate={rate}>
           <StatTile label="复购率" value={rate} hint={`${repurchased} / ${total} 人`} />
         </div>
-        <div data-median-days={medianDaysToSecond === null ? '—' : `${medianDaysToSecond} 天`}>
-          <StatTile label="到第二单天数中位数" value={medianDaysToSecond === null ? '—' : `${medianDaysToSecond} 天`} hint="只算有第二单的人" />
+        <div data-median-days={median}>
+          <StatTile label="到第二单天数中位数" value={median} hint="只算有第二单的人" />
         </div>
         <div data-repurchase-count={repurchased}>
           <StatTile label="复购人数" value={repurchased.toLocaleString('zh-CN')} hint="第二单落在复购窗口内" />
