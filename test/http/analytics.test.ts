@@ -1,7 +1,8 @@
 // 分析页的 HTTP 接缝：有结果层查看权限的成员在「分析」页看到本租户的 RFM 快照，打开看各人群与分页的消费者明细（只有 consumer_id 与分值，没有明文）；
 // 其他租户的快照 404，已过期的快照标灰、打不开；RFM 模板参数页的权限矩阵：查看者只读，分析师能起草不能发布，
 // 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm；按生效版本重新计算（分析师 403、未来日期与重复入队被拒）；
-// 用户 360 走注册表里的通用参数表单（只读、起草、校验报错、多余字段不传、发布后入队 gold.user360、未登记模板 404）与通用快照明细（全部列、是 / 否、分页、没有明文）
+// 用户 360 走注册表里的通用参数表单（只读、起草、校验报错、多余字段不传、发布后入队 gold.user360、未登记模板 404）与汇总快照页（#837）：
+// 默认「汇总」标签——总人数、有订单人数与各渠道同意人数（与湖上一致），按 consumer_id 查单人一行（查不到或格式不对提示且 200）；逐人明细在 ?tab=consumers（全部列、是 / 否、分页、没有明文）
 // 流失预警快照页（#834）：顶部汇总卡片写有风险人数、占比与总人数（与湖上一致），明细默认只列有风险的人（沉默比从高到低），?tab=all 看全部，分页总数按筛选后的行数算
 // 复购与 CLV 快照页（#835）：复购率（X / Y 人）与到第二单天数中位数、CLV 头部 10% 贡献占比与十档分布（与湖上一致，空值显示「—」），下方仍是按 consumer_id 的通用分页明细，没有明文
 // 同期群与复购同样走通用表单（周期下拉框、起草、双人发布入队 gold.cohort / gold.repurchase 并登记快照，周期偏移列表用顿号连接）；
@@ -17,6 +18,7 @@ import { dslDefinitions, dslVersions, snapshots, tasks, templateVersions } from 
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { listSnapshots, readChurnSnapshot, readClvSnapshot, readRepurchaseSnapshot, readTemplateSnapshot } from '../../app/.server/snapshots';
+import { CHANNELS } from '../../app/lib/canonical-model';
 import { drain, memberOf, newTenant, onLake, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -370,7 +372,7 @@ describe('RFM 模板参数页', () => {
   });
 });
 
-describe('用户 360 模板参数页与快照（通用表单与通用明细）', () => {
+describe('用户 360 模板参数页与快照（通用表单与汇总视图）', () => {
   beforeEach(fresh);
 
   it('分析页列出每个已登记模板的参数入口；通用表单按 form 渲染，查看者只读、提交 403，未登记的模板 404', async () => {
@@ -431,7 +433,7 @@ describe('用户 360 模板参数页与快照（通用表单与通用明细）',
     expect(await (await de.get('/analytics/templates/rfm')).text()).toContain('当前生效：默认参数');
   });
 
-  it('user360 快照在快照页打开，分页显示全部列的明细（同意列为是 / 否），模板名取自注册表，页面上没有明文', async () => {
+  it('user360 快照的逐人明细标签页（?tab=consumers）分页显示全部列（同意列为是 / 否），模板名取自注册表，页面上没有明文', async () => {
     const { acme } = await publishedIdentitySources({ orders: true, consents: true });
     await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
     const [snapshot] = await listSnapshots(acme);
@@ -443,7 +445,7 @@ describe('用户 360 模板参数页与快照（通用表单与通用明细）',
     expect(listHtml).toContain(`href="/analytics/snapshots/${snapshot!.id}"`);
     expect(listHtml).toContain('用户 360');
 
-    const res = await browser.get(`/analytics/snapshots/${snapshot!.id}`);
+    const res = await browser.get(`/analytics/snapshots/${snapshot!.id}?tab=consumers`);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('用户 360 · 2024-07-01');
@@ -453,8 +455,8 @@ describe('用户 360 模板参数页与快照（通用表单与通用明细）',
     expect(html).toMatch(/>是</);
     expect(html).toMatch(/>否</);
     expect(html).toContain('第 1 / 1 页');
-    // 页码超出时停在最后一页
-    expect(await (await browser.get(`/analytics/snapshots/${snapshot!.id}?page=9`)).text()).toContain('第 1 / 1 页');
+    // 页码超出时停在最后一页，仍停留在逐人明细标签
+    expect(await (await browser.get(`/analytics/snapshots/${snapshot!.id}?tab=consumers&page=9`)).text()).toContain('第 1 / 1 页');
     for (const p of PLAINTEXT) expect(html).not.toContain(p);
 
     // 按 consumer_id 分页：每页 3 位时第 3 页只剩 2 位，三页合起来不重不漏
@@ -463,6 +465,61 @@ describe('用户 360 模板参数页与快照（通用表单与通用明细）',
     const ids = pages.flatMap(p => p.rows.map(r => String(r.consumer_id)));
     expect(ids).toEqual([...new Set(ids)].sort());
     expect(pages[0]!.columns[0]).toBe('consumer_id');
+  });
+
+  it('user360 快照默认打开汇总：总人数、有订单人数与各渠道同意人数和湖上 count 一致，没有逐人明细，页面没有明文', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true, consents: true });
+    await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
+    const snapshot = (await listSnapshots(acme, 'user360'))[0]!;
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    // 湖上按同一口径算出期望汇总：总人数、有订单人数（orders > 0）与各渠道同意人数
+    const [schema, name] = snapshot.table.split('.');
+    const [expected] = await onLake<Record<string, string>>(acme, `SELECT count(*) AS total, count(*) FILTER (WHERE orders > 0) AS with_orders, ${
+      CHANNELS.map(c => `count(*) FILTER (WHERE consent_${c}) AS consent_${c}`).join(', ')} FROM ${schema}."${name}"`);
+
+    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
+    expect(html).toContain('用户 360 · 2024-07-01');
+    expect(html).toContain(`data-user360-total="${Number(expected!.total)}"`);
+    expect(html).toContain(`data-user360-with-orders="${Number(expected!.with_orders)}"`);
+    for (const c of CHANNELS) {
+      expect(html).toContain(`data-consent-channel="${c}"`);
+      expect(html).toContain(`data-consent-consumers="${Number(expected![`consent_${c}`])}"`);
+    }
+    // 逐人明细在另一个标签页，默认页没有明文也没有 data-consumer
+    expect(html).toContain('data-tab="consumers"');
+    expect(html).not.toMatch(/data-consumer="/);
+    for (const p of PLAINTEXT) expect(html).not.toContain(p);
+  });
+
+  it('user360 汇总页按 consumer_id 查单人：湖上真实 id 显示一行全部列并回显，不存在的 id 与注入串显示提示且 200', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true, consents: true });
+    await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
+    const snapshot = (await listSnapshots(acme, 'user360'))[0]!;
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    const [schema, name] = snapshot.table.split('.');
+    const realId = String((await onLake<{ consumer_id: string }>(acme,
+      `SELECT consumer_id FROM ${schema}."${name}" ORDER BY consumer_id LIMIT 1`))[0]!.consumer_id);
+
+    const found = await (await browser.get(`/analytics/snapshots/${snapshot.id}?consumer=${encodeURIComponent(realId)}`)).text();
+    expect(found).toContain(`data-user360-lookup="${realId}"`);
+    // 查到的一行带全部列，输入框回显这个 id
+    for (const column of ['consumer_id', 'orders', 'monetary', 'recency_days', 'consent_email']) expect(found).toMatch(new RegExp(`<th[^>]*>${column}</th>`));
+    expect(found).toContain(`value="${realId}"`);
+
+    const missing = await browser.get(`/analytics/snapshots/${snapshot.id}?consumer=no-such-id`);
+    expect(missing.status).toBe(200);
+    const missingHtml = await missing.text();
+    expect(missingHtml).toContain('这张快照里没有这个 consumer_id');
+    expect(missingHtml).not.toContain('data-user360-lookup=');
+
+    const injection = await browser.get(`/analytics/snapshots/${snapshot.id}?consumer=${encodeURIComponent("' OR 1=1 --")}`);
+    expect(injection.status).toBe(200);
+    expect(await injection.text()).toContain('consumer_id 格式不对');
+    for (const p of PLAINTEXT) expect(found).not.toContain(p);
   });
 });
 
