@@ -2,13 +2,13 @@
 // 模型必须遵守的输出 Schema（字段对应、值字典、去重键、身份打通规则，每项带置信度与理由），以及把模型输出转成映射 YAML：
 // 以规则草稿为底，保留 table / entity / extensions 等其他顶层键，fields / dedupe / identity 整体换成模型给的，理由写成行尾注释。
 // 转出的 YAML 仍要过映射校验（checkMappingDraft），保存、空跑与双人发布照旧。
-// 传了语义目录（ADR-0041）时，user 前面加上目录总览、目标实体与它的各字段条目、按表名与列名搜出的条目，字段口径以目录为准；
-// 不传时消息与原来一致（scripts/eval-mapping 照旧）。
+// 传了语义目录（ADR-0041）时，user 前面加上目录分层上下文（#855：第一层分组、相关分组的组内列表，目标实体组最前）、目标实体与它的各字段条目、
+// 按表名与列名搜出的条目，字段口径以目录为准；不传时消息与原来一致（scripts/eval-mapping 照旧）。
 // 另有断言建议：把表上下文与当前映射 YAML 发给模型，模型返回自定义断言列表（每条带置信度与理由），只换掉 YAML 的 assertions 块
 import { Document, isCollection, isScalar, parseDocument, Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { FUNCTIONS } from '../../lib/mapping-expr';
 import { CAPABILITIES } from '../catalog/capabilities';
-import { estimateTokens, expand, overview, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
+import { estimateTokens, expand, layeredContext, OVERVIEW_TOKENS, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
 import { deriveProjection } from '../catalog/projection';
 import { rank } from '../catalog/rank';
 import type { LlmMessage } from '../llm';
@@ -102,7 +102,7 @@ const SYSTEM = [
 ].join('\n');
 
 const CATALOG_SYSTEM = [
-  '- 成员的消息里先是语义目录：总览、目标实体与它的各字段条目、按表名与列名搜出的条目，最后一行是上面说的输入（JSON）。',
+  '- 成员的消息里先是语义目录：第一层分组、相关分组的组内列表（目标实体组最前）、目标实体与它的各字段条目、按表名与列名搜出的条目，最后一行是上面说的输入（JSON）。',
   '- 字段口径以目录为准：字段的含义、标准取值与业务说明看目录里的字段条目；目录里没有的字段（包括敏感字段）照 rulesDraft 写。',
 ].join('\n');
 
@@ -111,7 +111,8 @@ const SEARCH_LIMIT = 10;
 /** 搜出的条目估算最多多少 token，超过时减少条数 */
 const SEARCH_TOKENS = 4000;
 
-/** 目录各段：总览、目标实体与它的各字段条目、按「实体名 + 表名 + 列名」排序（rank，内存里派生的 full 投影）出的其余条目（不含能力说明，估算超过 SEARCH_TOKENS 时减少条数） */
+/** 目录各段：分层上下文（第一层分组 + 相关分组的组内列表，目标实体组最前，#855）、目标实体与它的各字段条目、
+ * 按「实体名 + 表名 + 列名」排序（rank，内存里派生的 full 投影）出的其余条目（不含能力说明，估算超过 SEARCH_TOKENS 时减少条数） */
 function catalogMarkdown(catalog: Catalog, context: TableContext, entity: string): string {
   const target = [expand(catalog, `entity:${entity}`), ...catalog.entries.filter(e => e.kind === 'field' && e.entity === `entity:${entity}`)]
     .filter((e): e is CatalogEntry => e !== null);
@@ -121,7 +122,11 @@ function catalogMarkdown(catalog: Catalog, context: TableContext, entity: string
     .filter(e => e.kind !== 'capability' && !shown.has(e.id)).slice(0, SEARCH_LIMIT);
   let n = related.length;
   while (n > 0 && estimateTokens(toMarkdown(related.slice(0, n))) > SEARCH_TOKENS) n--;
-  return [toMarkdown(overview(catalog)), `# 目标实体\n\n${toMarkdown(target)}`, `# 与源表相关的条目\n\n${toMarkdown(related.slice(0, n))}`].join('\n\n');
+  return [
+    layeredContext(catalog, related.slice(0, n), OVERVIEW_TOKENS, [`group:entity:${entity}`]),
+    `# 目标实体\n\n${toMarkdown(target)}`,
+    `# 与源表相关的条目\n\n${toMarkdown(related.slice(0, n))}`,
+  ].join('\n\n');
 }
 
 /**

@@ -9,7 +9,7 @@
 // 没有 sources:read 时随血缘一起去掉。
 // 另有一份分层总览（#854）：groupOverview 只给第一层分组（主题组、实体组各一行，数据源、关系、模板各一行汇总；放不下时去掉说明、把实体组
 // 连续分桶为合并组），groupItems 按分组标识（group:…，分页在标识后加 @页）给出组内条目（第二层，超出分页不截断）；助手与 MCP 的目录工具用它，
-// 起草仍用上面的 overview()
+// 起草用下面的 layeredContext()（#855：第一层分组 + 相关分组的组内列表）
 import { parse } from 'yaml';
 import { CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, type CustomEntityField, type EntityRelation, type FieldType } from '../../lib/canonical-model';
 import { noteKey } from '../../lib/business-note-key';
@@ -182,16 +182,7 @@ export type CatalogEntry =
 /** 按标识排好序的全部条目；version 是当前目录版本号（tenantCatalog 读出，不进快照、不参与比较），还没有版本时为 null */
 export interface Catalog { entries: CatalogEntry[]; version?: number | null }
 
-/** 总览的一项；实体带字段名，放不下时只带字段数 */
-export interface OverviewItem { id: string; name: string; description: string; fields?: string[]; fieldCount?: number }
-
-export interface Overview {
-  kind: 'overview'; items: OverviewItem[]; /** 放不下、没列出的项数（用搜索找） */ omitted: number;
-  /** 目录版本号，还没有版本时为 null */
-  version: number | null;
-}
-
-/** 总览的 token 上限（按 estimateTokens 估算 Markdown） */
+/** 第一层分组与起草分层上下文的 token 上限（按 estimateTokens 估算 Markdown） */
 export const OVERVIEW_TOKENS = 4000;
 /** 分组展开（第二层）的 token 上限：超出按条目分页，不截断 */
 export const GROUP_TOKENS = 4000;
@@ -464,31 +455,6 @@ const truncate = (text: string, chars = SUMMARY_CHARS) => {
   return all.length > chars ? `${all.slice(0, chars).join('')}…` : text;
 };
 
-/**
- * 总览：数据源、源表、实体与关系各一行（字段在实体那一行），说明截到 40 字；估算超过 4000 token 时实体只给字段数，
- * 还放不下时截掉后面的项，记下没列出的项数
- */
-export function overview(c: Catalog): Overview {
-  const top = c.entries.filter(e => e.kind !== 'field');
-  const item = (e: CatalogEntry, names: boolean): OverviewItem => ({
-    id: e.id, name: e.name, description: truncate(e.description),
-    ...(e.kind === 'entity' && (names ? { fields: e.fields.map(f => f.name) } : { fieldCount: e.fields.length })),
-  });
-  const fits = (o: Overview) => estimateTokens(toMarkdown(o)) <= OVERVIEW_TOKENS;
-  const version = c.version ?? null;
-  const full: Overview = { kind: 'overview', items: top.map(e => item(e, true)), omitted: 0, version };
-  if (fits(full)) return full;
-  const counts = top.map(e => item(e, false));
-  const first = (n: number): Overview => ({ kind: 'overview', items: counts.slice(0, n), omitted: counts.length - n, version });
-  // 放得下的最多项数（项数越多越长，二分）
-  let [lo, hi] = [0, counts.length];
-  while (lo < hi) {
-    const mid = Math.ceil((lo + hi) / 2);
-    if (fits(first(mid))) lo = mid; else hi = mid - 1;
-  }
-  return first(lo);
-}
-
 /** 按标识展开一个条目；标识不存在时为 null */
 export const expand = (c: Catalog, id: string): CatalogEntry | null => c.entries.find(e => e.id === id) ?? null;
 
@@ -651,10 +617,10 @@ export function groupOverview(c: Catalog): GroupOverview {
 
 /**
  * 按分组标识展开第二层：group:entity:<实体名> / group:subject:<主题名> / group:sources / group:relationships / group:templates / group:other
- * 给组内条目（每行一个，带调用方传入的 semanticHash；指标、标签、模板带 version），合并组 group:entities@<k> 给其中实体组的第一层行；
+ * 给组内条目（每行一个，带调用方传入的 semanticHash（可不给，如起草的上下文）；指标、标签、模板带 version），合并组 group:entities@<k> 给其中实体组的第一层行；
  * 标识后加 @<页> 翻页（超出 GROUP_TOKENS 分页，不截断）。没有这个分组或页码时为 null
  */
-export function groupItems(c: Catalog, groupId: string, hash: (e: CatalogEntry) => string): GroupItems | null {
+export function groupItems(c: Catalog, groupId: string, hash?: (e: CatalogEntry) => string): GroupItems | null {
   const { g, buckets } = firstLevel(c);
   type Resolved = { entries: CatalogEntry[] } | { bucket: GroupLine[] };
   const resolve = (id: string): Resolved | null => {
@@ -687,7 +653,7 @@ export function groupItems(c: Catalog, groupId: string, hash: (e: CatalogEntry) 
   if (!resolved) return null;
 
   const versionOf = (e: CatalogEntry) => (e.kind === 'metric' || e.kind === 'tag' || e.kind === 'template') ? ` · version: ${e.version}` : '';
-  const itemLine = (e: CatalogEntry) => `- ${e.id} ${e.name}${e.description ? ` — ${truncate(e.description)}` : ''} · semanticHash: ${hash(e)}${versionOf(e)}`;
+  const itemLine = (e: CatalogEntry) => `- ${e.id} ${e.name}${e.description ? ` — ${truncate(e.description)}` : ''}${hash ? ` · semanticHash: ${hash(e)}` : ''}${versionOf(e)}`;
   const all = 'entries' in resolved ? resolved.entries.map(itemLine) : resolved.bucket.map(groupLineMarkdown);
   const entryIds = 'entries' in resolved ? resolved.entries.map(e => e.id) : [];
   // 分页：每页至少一行，放得下 GROUP_TOKENS 就继续放
@@ -714,6 +680,75 @@ export function groupItems(c: Catalog, groupId: string, hash: (e: CatalogEntry) 
   const current = pages[page - 1];
   if (!current) return null;
   return { kind: 'group', id, page, lines: current.lines, entries: current.entries, ...(pages[page] && { nextPage: `${id}@${page + 1}` }) };
+}
+
+/** 反查条目属于哪些分组（groupItems 认的分组标识）：字段、指标、标签同时属于实体组（或 other）与各主题组，
+ * 数据源与源表进 group:sources，关系进 group:relationships，模板进 group:templates；能力条目不属于任何组 */
+function entryGroups(g: Groups): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  const add = (groupId: string, entries: CatalogEntry[]) => {
+    for (const e of entries) out.set(e.id, [...(out.get(e.id) ?? []), groupId]);
+  };
+  for (const [id, entries] of g.entity) add(`group:${id}`, entries);
+  for (const [name, entries] of g.subject) add(`group:subject:${name}`, entries);
+  add('group:other', g.other);
+  add('group:sources', g.sources);
+  add('group:relationships', g.relations);
+  add('group:templates', g.templates);
+  return out;
+}
+
+/**
+ * 起草用的分层上下文（#855）：第一层分组（groupOverview，总是完整给出）+「相关分组」的组内列表（每个组只取第 1 页，不出哈希列）。
+ * 相关分组 = pin 在前（映射起草的目标实体组），然后按 ranked 的排名先后收条目所在的分组（一个条目属于多个组时都算）；
+ * 第一层 + 全部组内列表放得下 budget 时全部给出（不再分相关 / 不相关）。剩余预算（budget − 第一层）≤ 0 时不给组内列表；
+ * 否则按顺序逐组加入，下一组放不下就停（不跳过去试更小的组）。纯函数
+ */
+export function layeredContext(c: Catalog, ranked: CatalogEntry[], budget: number, pin: string[] = []): string {
+  const first = groupsMarkdown(groupOverview(c));
+  if (budget - estimateTokens(first) <= 0) return first;
+  const g = groupsOf(c);
+  const belongs = entryGroups(g);
+  // 全部分组，按第一层顺序（主题组、实体组，然后各汇总组）；大目录里实体组被合并成合并组行，相关分组仍用 group:entity:x（groupItems 能解析）
+  const all = [
+    ...[...g.subject.keys()].sort((a, b) => cmp(`group:subject:${a}`, `group:subject:${b}`)).map(name => `group:subject:${name}`),
+    ...[...g.entity.keys()].sort(cmp).map(id => `group:${id}`),
+    ...(g.other.length ? ['group:other'] : []),
+    ...(c.entries.some(e => e.kind === 'source') ? ['group:sources'] : []),
+    ...(g.relations.length ? ['group:relationships'] : []),
+    ...(g.templates.length ? ['group:templates'] : []),
+  ];
+  const relevant: string[] = [];
+  const push = (id: string) => { if (!relevant.includes(id)) relevant.push(id); };
+  for (const id of pin) push(id);
+  for (const e of ranked) for (const id of belongs.get(e.id) ?? []) push(id);
+
+  const memo = new Map<string, string>();
+  const items = (id: string): string | null => {
+    if (!memo.has(id)) {
+      const gi = groupItems(c, id);
+      memo.set(id, gi ? groupItemsMarkdown(gi) : '');
+    }
+    return memo.get(id) || null;
+  };
+  // 全部放得下时全部给出（pin 与相关组在前，其余按第一层顺序）；逐项累计超过预算就提前认定放不下。+3 是「# 相关分组」标题与分隔的余量
+  let allFits = true;
+  let used = estimateTokens(first);
+  for (const id of all) {
+    const md = items(id);
+    if (!md) continue;
+    used += estimateTokens(md);
+    if (used + 3 > budget) { allFits = false; break; }
+  }
+  const withSections = (list: string[]) => (list.length ? [first, '# 相关分组', ...list].join('\n\n') : first);
+  const sections: string[] = [];
+  for (const id of (allFits ? [...relevant, ...all.filter(id => !relevant.includes(id))] : relevant)) {
+    const md = items(id);
+    if (!md) continue;
+    if (estimateTokens(withSections([...sections, md])) > budget) break;
+    sections.push(md);
+  }
+  return withSections(sections);
 }
 
 /** 查询分词：ASCII 单词转小写、至少 2 个字符；连续的中日韩字符切成二元组（只有一个字时取这个字） */
@@ -770,15 +805,6 @@ function tableStatsMarkdown(s: TableStats | null): string[] {
   if (!s) return [`- 统计：${NO_STATS}`];
   return [`- 统计：${s.rows} 行，列统计基于 ${s.sampleRows} 行样本，统计截至 ${s.at}（采集时间）`,
     ...s.columns.map(c => `  - ${code(c.name)}：${columnStatsText(c)}`)];
-}
-
-function overviewMarkdown(o: Overview): string {
-  const lines = o.items.map(i => {
-    const fields = i.fields ? `；字段：${i.fields.join(', ')}` : i.fieldCount !== undefined ? `；${i.fieldCount} 个字段` : '';
-    return `- ${i.id} ${i.name}${i.description ? ` — ${i.description}` : ''}${fields}`;
-  });
-  if (o.omitted) lines.push(`- 另有 ${o.omitted} 项没有列出，请用搜索查找`);
-  return ['# 语义目录', '', ...(o.version != null ? [`目录版本 ${o.version}`, ''] : []), ...lines].join('\n');
 }
 
 function groupsMarkdown(o: GroupOverview): string {
@@ -840,13 +866,12 @@ const dependenciesMarkdown = (d: DefinitionDependencies) => [
   ...(d.fields.length ? [`- 用到字段：${d.fields.join(', ')}`] : []),
 ];
 
-/** 可渲染的结果：总览、分层总览、分组展开、单个条目或搜索结果 */
-export type Renderable = Overview | GroupOverview | GroupItems | CatalogEntry | CatalogEntry[];
+/** 可渲染的结果：分层总览、分组展开、单个条目或搜索结果 */
+export type Renderable = GroupOverview | GroupItems | CatalogEntry | CatalogEntry[];
 
 /** 渲染成 Markdown */
 export function toMarkdown(x: Renderable): string {
   if (Array.isArray(x)) return x.length ? x.map(entryMarkdown).join('\n\n') : '没有找到相关条目';
-  if (x.kind === 'overview') return overviewMarkdown(x);
   if (x.kind === 'groups') return groupsMarkdown(x);
   if (x.kind === 'group') return groupItemsMarkdown(x);
   return entryMarkdown(x);

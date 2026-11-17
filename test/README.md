@@ -52,6 +52,12 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 
 ## 夹具
 
+### `test/catalog-groups.ts`
+
+| helper | 作用 |
+|---|---|
+| `groupedText(catalog)` | 分层目录的全量输出（#855）：第一层分组（`groupOverview`）与各分组组内列表（`groupItems`）的 Markdown 与 JSON 各一份，从第一层跟着分组行与「下一页」走全（合并组、分页都展开），给「不进任何输出」「统计变了分层输出不变」这类断言用 |
+
 ### `test/pipeline/fixtures.ts`
 
 | helper | 作用 |

@@ -1,10 +1,12 @@
-// test/catalog.test.ts —— 语义目录（ADR-0041）：按元数据生成条目，总览、按稳定标识展开与关键词搜索，可渲染成 Markdown 与 JSON；
+// test/catalog.test.ts —— 语义目录（ADR-0041）：按元数据生成条目，第一层分组、按分组标识展开第二层、按稳定标识展开与关键词搜索，可渲染成 Markdown 与 JSON；
 // 敏感字段、哈希列与系统列不进目录（纯函数，手工构造 CatalogInput）
-// 分层总览（#854）：groupOverview 只给第一层分组（大目录实体组合并成桶），groupItems 按分组标识展开第二层（每行带 semanticHash，超 GROUP_TOKENS 分页）
+// 分层总览（#854）：groupOverview 只给第一层分组（大目录实体组合并成桶），groupItems 按分组标识展开第二层（每行带 semanticHash，超 GROUP_TOKENS 分页）；
+// 起草的分层上下文（#855）用这两个函数拼，不再有旧的单层总览
 import { describe, expect, it } from 'vitest';
 import {
-  buildCatalog, estimateTokens, expand, groupItems, groupOverview, overview, OVERVIEW_TOKENS, search, toJson, toMarkdown, type CatalogInput,
+  buildCatalog, estimateTokens, expand, groupItems, groupOverview, GROUP_TOKENS, OVERVIEW_TOKENS, search, toJson, toMarkdown, type CatalogInput,
 } from '../app/.server/catalog';
+import { groupedText } from './catalog-groups';
 import { knowledgeKey } from '../app/.server/knowledge/catalog';
 import { semanticHash } from '../app/.server/catalog/plan';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
@@ -107,19 +109,18 @@ const withStats = (rows = 120): CatalogInput => ({
   entityStats: [{ entity: 'order', rows: 118, at: '2024-07-03T08:00:00.000Z' }],
 });
 
-/** 全部输出：总览、每个条目的展开与几次搜索，Markdown 与 JSON 各一份 */
+/** 全部输出：第一层分组与全部分组的组内列表（groupedText）、每个条目的展开与几次搜索，Markdown 与 JSON 各一份 */
 function everything(input: CatalogInput) {
   const c = buildCatalog(input);
-  const ov = overview(c);
   const ids = c.entries.map(e => e.id);
-  const out = [toMarkdown(ov), toJson(ov)];
+  const out = [groupedText(c)];
   for (const id of ids) out.push(toMarkdown(expand(c, id)!), toJson(expand(c, id)!));
   for (const q of ['phone', 'unionid', '手机', 'hash', 'synced', 'secret', 'contact', 'memo']) out.push(toMarkdown(search(c, q)), toJson(search(c, q)));
   return { c, ids, text: out.join('\n') };
 }
 
 describe('语义目录', () => {
-  it('同一份输入生成的总览与展开逐字节相同，标识只用名字、不带版本，按标识排序', () => {
+  it('同一份输入生成的第一层分组、组内列表与展开逐字节相同，标识只用名字、不带版本，按标识排序', () => {
     const a = everything(input());
     const shuffled = input();
     shuffled.sources!.reverse(); shuffled.tables!.reverse(); shuffled.plans!.reverse();
@@ -133,31 +134,51 @@ describe('语义目录', () => {
     expect(a.ids.every(id => /^(source|table|entity|field|relation|metric|tag|template|capability):/.test(id) && !/m-order|\bv\d/.test(id))).toBe(true);
   });
 
-  it('总览每项一行（标识、名称、说明截到 40 字），实体附字段名，估算不超过 4000 token', () => {
+  it('第一层每组一行（只给数量），组内列表每项一行（标识、名称、说明截到 40 字），各估算不超过上限', () => {
     const c = buildCatalog(input());
-    const md = toMarkdown(overview(c));
-    expect(estimateTokens(md)).toBeLessThanOrEqual(4000);
-    const line = md.split('\n').find(l => l.includes('entity:order '))!;
+    const md = toMarkdown(groupOverview(c));
+    expect(estimateTokens(md)).toBeLessThanOrEqual(OVERVIEW_TOKENS);
+    const line = md.split('\n').find(l => l.includes('group:entity:order '))!;
     expect(line).toContain('订单');
-    expect(line).toMatch(/order_id, customer_id, status.*x_coupon_code/);
-    expect(md).toMatch(/table:商城\/members .*未映射/);
+    expect(line).toMatch(/· 字段 \d+$/);
+    // 第一层不列条目，条目在组内列表里每项一行
     expect(md).not.toContain('field:');
-    const long = md.split('\n').find(l => l.includes('entity:points_transaction '))!;
+    const items = toMarkdown(groupItems(c, 'group:entity:order')!);
+    const entityLine = items.split('\n').find(l => l.startsWith('- entity:order '))!;
+    expect(entityLine).toContain('订单');
+    expect(items).toMatch(/^- field:order\.order_id /m);
+    expect(items).not.toContain('下一页');
+    const sources = toMarkdown(groupItems(c, 'group:sources')!);
+    expect(sources).toMatch(/table:商城\/members .*未映射/);
+    const points = toMarkdown(groupItems(c, 'group:entity:points_transaction')!);
+    const long = points.split('\n').find(l => l.startsWith('- entity:points_transaction '))!;
     expect(long).toContain('一笔积分变动（获得、消费抵扣、兑换、过期、调整）。当前余额看会员的积分，'.slice(0, 40));
     expect(long).not.toContain('获取与消耗看积分流水');
   });
 
-  it('字段太多时总览里的实体只给字段数，仍不超过 4000 token', () => {
+  it('字段太多时第一层只给字段数、不超上限；组内列表分页，每页不超 GROUP_TOKENS，翻页仍能找到每个字段', () => {
     const big = input();
     const many = Array.from({ length: 1000 }, (_, i) => ({ name: `stat_field_${i}`, type: 'string' as const, description: `第 ${i} 个统计字段的说明`, sensitive: false }));
     big.customEntities![0].fields.push(...many);
     const c = buildCatalog(big);
-    const md = toMarkdown(overview(c));
-    expect(estimateTokens(md)).toBeLessThanOrEqual(4000);
+    const md = toMarkdown(groupOverview(c));
+    expect(estimateTokens(md)).toBeLessThanOrEqual(OVERVIEW_TOKENS);
     expect(md).not.toContain('stat_field_999');
-    expect(md).toMatch(/entity:custom_store .*1002 个字段/);
-    expect(md).toMatch(/entity:order .*\d+ 个字段/);
+    expect(md).toMatch(/group:entity:custom_store 门店 .*· 字段 1002/);
     expect(expand(c, 'field:custom_store.stat_field_999')).toMatchObject({ kind: 'field', type: 'string' });
+    // 组内列表跟着「下一页」走，每一页都不超过 GROUP_TOKENS，字段都在其中
+    const collected: string[] = [];
+    for (let page = 1; ; page++) {
+      const gi = groupItems(c, `group:entity:custom_store${page > 1 ? `@${page}` : ''}`);
+      if (!gi) break;
+      const pageMd = toMarkdown(gi);
+      expect(estimateTokens(gi.lines.join('\n'))).toBeLessThanOrEqual(GROUP_TOKENS);
+      expect(pageMd).toContain(page > 1 ? `# 分组 group:entity:custom_store@${page}` : '# 分组 group:entity:custom_store\n');
+      collected.push(...gi.entries);
+      if (!gi.nextPage) break;
+    }
+    expect(collected).toContain('field:custom_store.stat_field_999');
+    expect(collected).toHaveLength(1003);
   });
 
   it('千指标目录：第一层分组不超过上限，每个条目都能经分组（含合并组、分页）展开找到', () => {
@@ -342,16 +363,15 @@ describe('语义目录', () => {
     expect(expand(c, 'field:custom_store.region')).toMatchObject({ lineage: [{ sample: [] }] });
   });
 
-  it('被敏感字段引用的源列、像敏感信息的源列与哈希列没有统计与取值；统计变了，总览不变', () => {
+  it('被敏感字段引用的源列、像敏感信息的源列与哈希列没有统计与取值；统计变了，分层输出不变', () => {
     const { text } = everything(withStats());
     for (const word of ['S-MIN-0', 'S-MAX-9', 'S-TOP-1', '13800000001', 'H-TOP-1', 'wx_union_8', 'secret_code', 'unionid']) expect(text, word).not.toContain(word);
-    const ov = (i: CatalogInput) => toMarkdown(overview(buildCatalog(i)));
-    expect(ov(withStats())).toBe(ov(input()));
-    expect(ov(withStats(999))).toBe(ov(withStats()));
-    expect(toJson(overview(buildCatalog(withStats(999))))).toBe(toJson(overview(buildCatalog(input()))));
+    const layout = (i: CatalogInput) => groupedText(buildCatalog(i));
+    expect(layout(withStats())).toBe(layout(input()));
+    expect(layout(withStats(999))).toBe(layout(withStats()));
   });
 
-  it('已发布的指标、标签与模板产出：总览列出，按标识展开给键、说明、度量 / 取值、依赖与产出列，搜索命中指标说明；快照变了总览不变', () => {
+  it('已发布的指标、标签与模板产出：进各分组（模板组），按标识展开给键、说明、度量 / 取值、依赖与产出列，搜索命中指标说明；快照变了分层输出不变', () => {
     const withDefinitions = (rows = 1200): CatalogInput => ({
       ...input(),
       definitions: [
@@ -385,10 +405,11 @@ describe('语义目录', () => {
     expect(toMarkdown(expand(c, 'metric:revenue')!)).toContain('度量 `sum(amount)`');
     expect(toMarkdown(expand(c, 'template:rfm')!)).toContain('`gold.rfm__t1`，1200 行');
 
-    const ov = toMarkdown(overview(c));
-    for (const id of ['metric:revenue', 'metric:store_orders', 'tag:spender', 'template:rfm', 'capability:metric-dsl']) expect(ov).toContain(`- ${id} `);
+    const orderItems = toMarkdown(groupItems(c, 'group:entity:order')!);
+    for (const id of ['metric:revenue', 'metric:store_orders', 'tag:spender']) expect(orderItems).toContain(`- ${id} `);
+    expect(toMarkdown(groupItems(c, 'group:templates')!)).toContain('- template:rfm ');
     expect(search(c, '消费金额')[0]?.id).toBe('metric:revenue');
-    expect(toJson(overview(buildCatalog(withDefinitions(5))))).toBe(toJson(overview(c)));
+    expect(groupedText(buildCatalog(withDefinitions(5)))).toBe(groupedText(c));
   });
 
   it('条目带 knowledge.aliases 时搜索与 Markdown 含别名（映射字段的在血缘项下）；挂不上的丢掉，没有知识时条目没有 knowledge 键', () => {
