@@ -9,6 +9,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { sha256 } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { apiKeys, auditLogs, snapshots as snapshotsTable, sources as sourcesTable, spaces as spacesTable, tasks } from '../../app/.server/db/schema';
+import { API_ENDPOINTS } from '../../app/lib/api-docs';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow } from '../../app/.server/lake';
 import { servingPath } from '../../app/.server/pipeline/serving-engine';
@@ -88,6 +89,46 @@ describe('API Key 页', () => {
     expect(JSON.stringify(details)).not.toContain(key);
 
     expect((await admin.post('/api-keys', { intent: 'create', name: '  ' })).status).toBe(400);
+  });
+
+  it('「接口说明」标签页按登记表列出全部外部接口；页面只有占位符，没有 Key 前缀、哈希或创建者；无权限成员 403；Key 列表照旧', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'de@acme.com', 'data_engineer');
+    const admin = await loginAs(app, 'admin@acme.com');
+    const { key } = await createKey(admin, '营销自动化');
+    const [row] = await getDb().select().from(apiKeys);
+    expect(row.prefix).toBe(key.slice(0, 8));
+
+    const res = await admin.get('/api-keys?tab=docs');
+    expect(res.status).toBe(200);
+    const docs = await res.text();
+    // JSX 会把 < > 转义成 &lt; &gt;，断言页面上可见的文字时先按同样规则转义
+    const asHtml = (text: string) => text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // 登记表里每个接口的方法和路径都在页面上，一张卡片一个接口
+    expect([...docs.matchAll(/data-endpoint="([^"]+)"/g)].map(m => m[1])).toEqual(API_ENDPOINTS.map(e => e.route));
+    for (const e of API_ENDPOINTS) {
+      expect(docs, e.route).toContain(asHtml(e.path));
+      expect(docs, e.route).toContain(e.method);
+    }
+    // 示例一律是占位符（JSX 会把 < > 转义，HTML 里是 &lt;你的 API Key&gt;）
+    expect(docs).toContain('&lt;你的 API Key&gt;');
+    expect(docs).toContain('&lt;平台地址&gt;');
+    // 页面上没有这把 Key 的任何真实信息，也不渲染 Key 列表的内容（顶栏里登录者自己的邮箱不算）
+    expect(docs).not.toContain(key);
+    expect(docs).not.toContain(row.prefix);
+    expect(docs).not.toContain(row.tokenHash);
+    expect(docs).not.toContain('营销自动化');
+    expect(docs).not.toContain('创建 API Key');
+    expect(docs).not.toContain('data-api-key-id');
+
+    const engineer = await loginAs(app, 'de@acme.com');
+    expect((await engineer.get('/api-keys?tab=docs')).status).toBe(403);
+
+    // 不带 tab 仍是原来的 Key 列表标签页
+    const keys = await (await admin.get('/api-keys')).text();
+    expect(keys).toContain('营销自动化');
+    expect(keys).toContain(`${key.slice(0, 8)}…`);
+    expect(keys).toContain('href="/api-keys?tab=docs"');
   });
 
   it('非管理员看不到入口、打不开页面，提交 403', async () => {
