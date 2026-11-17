@@ -1,6 +1,6 @@
 ---
 name: verify-ducked-init
-description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, the user 360 snapshot page, the definition-page assertion-failure alert, model provider, the LLM usage page, the AI assistant, the file-upload source preview on /sources, the data-source page scroll position, the knowledge page, the template upgrade banner and preview, the cohort snapshot page, the repurchase, CLV, and generic template snapshot pages, the operator tenant storage quota, the operator model price page, or the operator model-call summary, and capture evidence. When the diff changes scripts/crm-seed/setup.ts recompute, run that step against an isolated database and record task asOf. When the diff changes no page, skip the browser launch. When the diff touches app/.server/catalog/embeddings.ts or app/.server/catalog/vector-store.ts, skip the browser and run the Catalog embeddings section. When the diff adds a drizzle migration, also migrate a database that already has rows at the parent commit and confirm only the new column changes. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class. When the diff touches SeaweedFS startup or volume config (db_script/docker-compose.yml, db_script/seaweedfs/master.toml, the SeaweedFS step in .github/workflows/ci.yml, or db_script/start.sh), start that compose stack, check master Max is 2000, confirm one new bucket's first write adds 1 volume, and run scripts/bench-bucket-per-tenant.ts --write-each on a small bucket count. When the diff changes per-tenant bucket isolation (initTenantCatalog creating a bucket, prefixPolicy, createBucket or deleteBucket, resetDb deleting buckets, or drop-test-resources collecting buckets), start a disposable SeaweedFS and check exclusive buckets, idempotent create, cross-tenant 403, legacy prefix conditions, and suffix cleanup. Do not delete every lake-* bucket."
+description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, the user 360 snapshot page, the definition-page assertion-failure alert, model provider, the LLM usage page, the AI assistant, the file-upload source preview on /sources, the data-source page scroll position, the knowledge page, the template upgrade banner and preview, the cohort snapshot page, the repurchase, CLV, and generic template snapshot pages, the operator tenant storage quota, the operator model price page, or the operator model-call summary, and capture evidence. When the diff changes scripts/crm-seed/setup.ts recompute, run that step against an isolated database and record task asOf. When the diff changes no page, skip the browser launch. When the diff touches app/.server/catalog/embeddings.ts or app/.server/catalog/vector-store.ts, skip the browser and run the Catalog embeddings section. When the diff adds a drizzle migration, also migrate a database that already has rows at the parent commit and confirm only the new column changes. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class. When the diff touches SeaweedFS startup or volume config (db_script/docker-compose.yml, db_script/seaweedfs/master.toml, the SeaweedFS step in .github/workflows/ci.yml, or db_script/start.sh), start that compose stack, check master Max is 2000, confirm one new bucket's first write adds 1 volume, and run scripts/bench-bucket-per-tenant.ts --write-each on a small bucket count. When the diff changes per-tenant bucket isolation (initTenantCatalog creating a bucket, prefixPolicy, createBucket or deleteBucket, resetDb deleting buckets, or drop-test-resources collecting buckets), start a disposable SeaweedFS and check exclusive buckets, idempotent create, cross-tenant 403, legacy prefix conditions, and suffix cleanup. Do not delete every lake-* bucket. When the diff changes the test Postgres image, TEST_PGVECTOR_URL, Sandcastle testEnv, createPgvectorDbs, or drop-test-resources PG_BASES, skip the browser and run the pgvector test Postgres section."
 ---
 
 # Verify CRM 数据分析平台
@@ -21,16 +21,16 @@ The user 360 snapshot page is [features/user360-snapshot.md](features/user360-sn
 
 ## Changes that do not touch a page
 
-If the diff changes no route, page, or client state, skip `launch.sh`. The browser map does not exercise that diff. A diff that touches `app/.server/catalog/embeddings.ts` or `app/.server/catalog/vector-store.ts` still skips the browser. Run [Catalog embeddings](#catalog-embeddings).
+If the diff changes no route, page, or client state, skip `launch.sh`. The browser map does not exercise that diff. A diff that touches `app/.server/catalog/embeddings.ts` or `app/.server/catalog/vector-store.ts` still skips the browser. Run [Catalog embeddings](#catalog-embeddings). A diff that changes the test Postgres image, `TEST_PGVECTOR_URL`, Sandcastle `testEnv`, `createPgvectorDbs`, or `PG_BASES` still skips the browser. Run [pgvector test Postgres](#pgvector-test-postgres).
 
 Record the command output for each check. Record a skipped file as skipped.
 
 - Run the test files named in the ticket. `vitest.config.ts` always runs `test/global-setup.ts`, which needs PostgreSQL even when the test is a pure function. If PostgreSQL refuses the connection, report that the vitest file was not run. A temporary `node --import tsx` script may call the pure function. Label that run as a temporary script.
 - Point a script that rewrites an external file at a temporary server you started. Do not point it at a filer that was already listening, including the developer's SeaweedFS and a shared `policies.json`. Show one orphan removed, one live entry left as it was, malformed input and an empty body left unwritten, a second run that does not write, and a read-back that disagrees with the write followed by a restore of the backup.
-- Run `sh -n` on each changed shell script.
+- Run `sh -n` on each changed shell script whose shebang is `sh` or `bash`. `db_script/pg_setup.sh` is `#!/usr/bin/env fish`. `sh -n` on it exits 2 (`Syntax error: "(" unexpected`) and is not a failure of that file. When `fish` is on `PATH`, run `fish -n db_script/pg_setup.sh`. When it is not, record that `fish` is missing.
 - Say whether the change is high-risk, and why. The classes are an auth or core authorization change, production secrets or high-privilege access, payments, a destructive database migration, mass data deletion, a core security control, and production infrastructure.
 
-A diff that touches SeaweedFS startup or volume config still skips the browser. Run the subsection below. A green CI run does not cover it: CI only creates `crm-lake`, and a missed `master.toml` mount still lets weed start.
+A diff that touches SeaweedFS startup or volume config still skips the browser. Run the subsection below. A green CI run does not cover it: CI only creates `crm-lake`, and a missed `master.toml` mount still lets weed start. A diff that changes only the `postgres` service `image` in `db_script/docker-compose.yml` is [pgvector test Postgres](#pgvector-test-postgres), not this subsection.
 
 ### SeaweedFS startup and volume config
 
@@ -203,6 +203,44 @@ Record both directions. Do not score them as identical to the parent unless the 
 - One projection hash has no row. Insert that row while the projection select waits. A hash read inside the transaction returns `fresh`. A hash read taken before the transaction returns `queued` and inserts one task.
 
 Copy the log into the evidence directory. Drop `crm_verify_embed_<token>`. Do not drop `crm_platform` or a `crm_platform_verify_*` database.
+
+## pgvector test Postgres
+
+Run this when the diff changes any of these: `POSTGRES_IMAGE` in `db_script/pg_setup.sh`, the `postgres` service `image` in `db_script/docker-compose.yml`, the `postgres` service `image` in `.github/workflows/ci.yml`, `TEST_PGVECTOR_URL` in that workflow or in `.env.test.example`, `testEnv` in `.sandcastle/main.ts`, `createPgvectorDbs` in `test/global-setup.ts`, `TEST_PGVECTOR_URL` in `test/setup-env.ts`, or `PG_BASES` in `scripts/drop-test-resources.ts`. Skip `launch.sh`. Nothing in the browser reads this wiring. Do not start Sandcastle. Do not connect to the host apple-container Postgres. A cloud VM is not that Mac.
+
+`db_script/pg_setup.sh` is fish, as the shell-script bullet says. The image is the `POSTGRES_IMAGE` variable. `container run` passes `$POSTGRES_IMAGE`.
+
+When CI for this exact commit is already green, adopt that run. Do not rerun the suite, and do not run `npx vitest run test/pipeline/vector-store.test.ts`, unless no shard log contains the file line below.
+
+Pass for the wiring, read from the diff:
+
+- `db_script/pg_setup.sh`, `db_script/docker-compose.yml`, and the CI `postgres` service all name `pgvector/pgvector:pg17-trixie`. `pgvector/pgvector:pg17` is the bookworm tag (same digest as `pg17-bookworm` on Docker Hub). Official `postgres:17` is directory `17/trixie` in `docker-library/official-images`. The trixie tag is the one that shares that glibc, so an old data volume does not hit a collation version mismatch. Do not "correct" the tag back to `pg17`.
+- `.env.test.example` sets `TEST_PGVECTOR_URL=postgres://crm:crm@localhost:5432/crm_vector_test` and that line is not commented out. The CI job `env` sets the same URL. The postgres service publishes `5432:5432`.
+- `.sandcastle/main.ts` `testEnv` always sets `TEST_PGVECTOR_URL` to `withDbSuffix(toContainer("postgres://crm:crm@localhost:5432/crm_vector_test"), suffix)`, with `suffix` equal to `_i` plus the issue id. The assignment is not behind `if (hostEnv.TEST_PGVECTOR_URL)`. `sandboxFor` passes that object to `podman({ env })`. `build` and `rebaseAndMerge` both call `testEnv`. The prep sandbox (`podman()` with no env) does not run the suite.
+- `scripts/drop-test-resources.ts` `PG_BASES` includes `crm_vector_test`. `nameMatcher` drops that base plus the issue suffix and an optional `_w<digits>` (`crm_vector_test_i850_w1`). It does not drop unsuffixed `crm_vector_test` or `crm_vector_test_w1`. The script connects with `TEST_PLATFORM_DATABASE_URL`, so the vector databases have to be on that same server. The template, CI, and `testEnv` all use port 5432 on that server.
+- `test/setup-env.ts` maps `TEST_PGVECTOR_URL` through `withDbSuffix`. `vitest.config.ts` copies every `PER_WORKER_KEYS` entry into `CRM_TEST_BASE_*` before workers start. `createPgvectorDbs` connects to database `postgres` on that URL, creates one empty database per `maxWorkers` (`crm_vector_test_w<i>`, quoted), and does not call `migratePlatformDb`. A `"` in a database name is percent-encoded by `new URL` before the quote-escape runs; the names this repo uses (`crm_vector_test_w1`, `crm_vector_test_i850_w2`) round-trip.
+- `test/pipeline/vector-store.test.ts` still skips the external group only with `describe.skipIf(!process.env.TEST_PGVECTOR_URL)`. A comment-only edit does not change that. With the URL set, the file is 18 tests and the pgvector group is 8 (one `preparePgvector` idempotence test plus the 7 shared contract cases). With the URL unset, that group is skipped.
+
+From the CI logs of the green run for this exact SHA, quote the shard whose log contains `test/pipeline/vector-store.test.ts`. Pass is a check mark and `(18 tests)` with no skipped count on that file, plus a passing `pgvector 外部向量存储（TEST_PGVECTOR_URL） (8)` and a passing `pgvectorStore 的向量存储契约 (7)`. The other shards still pull `pgvector/pgvector:pg17-trixie` and set `TEST_PGVECTOR_URL`. They do not run this file. A shard can still skip another file. `test/pipeline/source-connect-stress.test.ts` stays skipped unless `CRM_TEST_CONNECT_STRESS=1`. That skip is not this file. The idempotence title may be absent as its own line; the group count `(8)` with a check mark and no `| skipped` is the pass for that one case.
+
+If no shard log contains that file line, the logs are insufficient. Start a disposable container this run owns. Do not use port 5432 when something is already listening there. Do not point this at a Postgres you did not start.
+
+```bash
+docker run -d --name verify-pgvector -e POSTGRES_USER=crm -e POSTGRES_PASSWORD=crm -e POSTGRES_DB=postgres -p 54329:5432 pgvector/pgvector:pg17-trixie
+```
+
+Wait until `docker exec verify-pgvector pg_isready -U crm` exits 0. Then, from the repo root:
+
+```bash
+TEST_PLATFORM_DATABASE_URL=postgres://crm:crm@127.0.0.1:54329/crm_platform_test \
+TEST_PGVECTOR_URL=postgres://crm:crm@127.0.0.1:54329/crm_vector_test \
+CRM_TEST_WORKERS=1 \
+npx vitest run test/pipeline/vector-store.test.ts
+```
+
+Pass is exit 0 and `(18 tests)` with no skipped count. Then `docker rm -f verify-pgvector`.
+
+The running `postgres-server` container on the Mac is not visible from a cloud VM. Leave that image unverified. What verifies it: on that Mac, `container list` shows `postgres-server` using `pgvector/pgvector:pg17-trixie` (`docs/test-plans/acceptance-plan.md` ENV-1). Merging the script does not recreate a container that is already running. `db_script/pg_setup.sh` stops, deletes, and recreates `postgres-server`.
 
 ## Launch
 
