@@ -7,12 +7,10 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, dslVersions, llmCalls } from '../../app/.server/db/schema';
 import { buildCatalog, estimateTokens, OVERVIEW_TOKENS, type CatalogInput } from '../../app/.server/catalog';
-import { deriveProjection } from '../../app/.server/catalog/projection';
-import { rank } from '../../app/.server/catalog/rank';
 import { knowledgeKey } from '../../app/.server/knowledge/catalog';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { createDefinition, DslError, modelDraftForDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
-import { definitionDraftMessages, SEARCH_LIMIT } from '../../app/.server/pipeline/dsl/model-draft';
+import { definitionDraftMessages, rankedEntries } from '../../app/.server/pipeline/dsl/model-draft';
 import { setLlmFetch, type LlmMessage } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
@@ -275,8 +273,8 @@ describe('大目录下的起草上下文（#855：第一层分组 + 相关分组
     });
 
     const REQUEST = '按灯塔统计';
-    // 排好的条目由调用方传入（#827 起检索在 catalog/draft-search.ts）：这里照一句话解析的本地 helper 算同一份
-    const ranked = rank(deriveProjection(c, 'full').filter(r => !r.entryId.startsWith('capability:')), c, REQUEST, {}, SEARCH_LIMIT).map(r => r.entry);
+    // 排好的条目由调用方传入（#827 起检索在 catalog/draft-search.ts）：这里用一句话解析的 rankedEntries 算同一份
+    const ranked = rankedEntries(c, REQUEST);
     const content = (definitionDraftMessages('metric', REQUEST, c, ranked) as LlmMessage[])[1]!.content;
     const [layered] = content.split('# 与需求相关的条目');
     // 第一层分组完整给出（合并组行），相关分组段里有命中实体组的组内列表

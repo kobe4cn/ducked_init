@@ -3,12 +3,12 @@
 // 两个指标挂同一个别名时结果带歧义提示；设默认指向后不再提示、默认条目排第一
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { draftSearch, type DraftAmbiguity } from '../../app/.server/catalog/draft-search';
+import { draftSearch } from '../../app/.server/catalog/draft-search';
 import { ensureEmbeddings } from '../../app/.server/catalog/embeddings';
 import { currentCatalogVersion } from '../../app/.server/catalog/versions';
-import { projectionVersion, rankedSearch, refreshProjection } from '../../app/.server/catalog/projection';
+import { projectionVersion, refreshProjection } from '../../app/.server/catalog/projection';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { catalogEmbeddings, catalogProjection, llmCalls, tasks, tenants } from '../../app/.server/db/schema';
+import { catalogEmbeddings, catalogProjection, tasks, tenants } from '../../app/.server/db/schema';
 import { createDefinition, modelDraftForDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { publishedIdentitySources } from './identity-fixtures';
 import { addAlias } from '../../app/.server/knowledge/aliases';
