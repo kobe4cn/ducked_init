@@ -5,6 +5,7 @@ import { data, Form, redirect, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleAlert } from 'lucide-react';
 import type { Route } from './+types/model-provider';
 import { requirePermission } from '~/.server/access';
+import { prefetchEmbeddings } from '~/.server/catalog/versions';
 import {
   getModelProvider, ModelProviderError, resetEmbeddingProvider, resetModelProvider, resetTierProvider, SAMPLE_ROWS, saveEmbeddingProvider,
   saveModelProvider, saveTierProvider, setAllowSamples, testEmbeddingProvider, testModelProvider,
@@ -55,6 +56,9 @@ export async function action({ request }: Route.ActionArgs) {
       }
       case 'embedding_save':
         await saveEmbeddingProvider(member, { baseUrl: field('embeddingBaseUrl'), model: field('embeddingModel'), apiKey: field('embeddingApiKey') });
+        // 保存了 embedding 配置时提前补一次检索向量（#824）：没开混合检索的租户 prefetchEmbeddings 自己返回 off，这里不用再判断
+        await prefetchEmbeddings(member.tenant.id)
+          .catch(e => console.warn('保存 embedding 配置后提前补算向量失败', member.tenant.id, e instanceof Error ? e.message : e));
         break;
       case 'embedding_reset':
         await resetEmbeddingProvider(member);
