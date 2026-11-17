@@ -3,7 +3,8 @@
 // 有起草权限的成员保存草稿（参数不合法时报错）、丢弃草稿；草稿由最后保存它的人以外的另一位有发布权限的成员发布（ADR-0015），
 // 发布后以新参数入队一次模板计算，产出的快照记下定义版本；有发布权限的成员也可以按生效的版本重新计算，选填不晚于今天的参考日期。
 // 没有已发布版本时生效的是模板的默认参数（不能重新计算）。注册表有了比生效版本锁定的更新的模板版本时显示提示条：可以预览升级差异
-// （只有分群迁移或变化人数，没有 consumer_id），有起草权限的成员确认升级后得到一版锁定新模板版本的草稿，照常双人发布（ADR-0021）
+// （只有分群迁移或变化人数，没有 consumer_id），提示条与预览结果的头部列出锁定版本之后每一版的改动说明（模板注册表里的 changes），
+// 有起草权限的成员确认升级后得到一版锁定新模板版本的草稿，照常双人发布（ADR-0021）
 import { ArrowUpCircle, CheckCircle2, Eye, Lock, Plus, RefreshCw, X } from 'lucide-react';
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
@@ -56,6 +57,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     /** 有比生效版本锁定的更新的模板版本 */
     upgradeAvailable: t.upgradeAvailable,
     latestTemplateVersion: t.latestTemplateVersion,
+    /** 锁定版本之后每一版的改动说明（提示条与预览结果的头部列出） */
+    upgradeChanges: t.upgradeChanges,
     /** 生效的已发布版本锁定的模板版本；没有已发布版本时为 null */
     lockedTemplateVersion: t.published?.templateVersion ?? null,
     /** 草稿锁定的模板版本；没有草稿时为 null */
@@ -180,13 +183,22 @@ function RecomputeAction({ denied, today, submitting }: { denied: string | null;
 
 type UpgradeDiff = Awaited<ReturnType<typeof previewTemplateUpgrade>>;
 
+/** 锁定版本之后每一版的改动说明（提示条的说明段下面与预览结果的头部各列一次） */
+function ChangeList({ changes }: { changes: { version: number; changes: string }[] }) {
+  return (
+    <ul data-upgrade-changes className="list-disc space-y-0.5 pl-5 text-sm text-slate-500">
+      {changes.map(c => <li key={c.version}>{`v${c.version}：${c.changes}`}</li>)}
+    </ul>
+  );
+}
+
 /**
  * 有新模板版本时的提示条：预览升级差异（intent=preview-upgrade，选填参考日期），有起草权限时确认升级（intent=upgrade）；
  * 草稿已锁定新版本时说明发布后生效。预览结果：RFM 是分群迁移人数表，其他模板是变化、新增、移出人数
  */
-function UpgradeBanner({ latest, locked, draft, canDraft, today, diff, submitting }: {
-  latest: number; locked: number; draft: { version: number; templateVersion: number | null } | null; canDraft: boolean; today: string;
-  diff: UpgradeDiff | null; submitting: boolean;
+function UpgradeBanner({ latest, locked, changes, draft, canDraft, today, diff, submitting }: {
+  latest: number; locked: number; changes: { version: number; changes: string }[]; draft: { version: number; templateVersion: number | null } | null;
+  canDraft: boolean; today: string; diff: UpgradeDiff | null; submitting: boolean;
 }) {
   const upgraded = draft !== null && draft.templateVersion === latest;
   return (
@@ -199,6 +211,7 @@ function UpgradeBanner({ latest, locked, draft, canDraft, today, diff, submittin
               ? `第 ${draft.version} 版草稿已锁定模板 v${latest}，由另一位数据工程师或管理员发布后按新版本计算；发布之前仍按 v${locked} 计算。`
               : `升级前先预览：以生效的参数分别按 v${locked} 与 v${latest} 计算，按消费者对比，只给人数。确认升级后生成一版草稿，发布之前仍按 v${locked} 计算。`}
           </p>
+          <div className="mt-1"><ChangeList changes={changes} /></div>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           <Form method="post" className="flex items-center gap-2">
@@ -217,6 +230,7 @@ function UpgradeBanner({ latest, locked, draft, canDraft, today, diff, submittin
       {diff && (
         <div data-upgrade-diff className="space-y-2">
           <p className="text-sm text-slate-500">{`v${diff.from} → v${diff.to}，统计日 ${diff.asOf}`}</p>
+          <ChangeList changes={changes} />
           {diff.segments && (diff.segments.length
             ? (
               <Table>
@@ -395,7 +409,7 @@ function ParamsForm({ params, canDraft, submitting }: { params: RfmDefinition; c
 export default function TemplateParams({ loaderData, actionData }: Route.ComponentProps) {
   const {
     email, nav, canDraft, recomputeDenied, today, justPublished, justRecomputed, justUpgraded, upgradeAvailable, latestTemplateVersion, lockedTemplateVersion,
-    draftTemplateVersion, label, fields, form, published, versions,
+    upgradeChanges, draftTemplateVersion, label, fields, form, published, versions,
   } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
@@ -434,7 +448,8 @@ export default function TemplateParams({ loaderData, actionData }: Route.Compone
       )}
       {upgradeAvailable && lockedTemplateVersion !== null && (
         <UpgradeBanner
-          latest={latestTemplateVersion} locked={lockedTemplateVersion} draft={draft ? { version: draft.version, templateVersion: draftTemplateVersion } : null}
+          latest={latestTemplateVersion} locked={lockedTemplateVersion} changes={upgradeChanges}
+          draft={draft ? { version: draft.version, templateVersion: draftTemplateVersion } : null}
           canDraft={canDraft} today={today} diff={actionData?.upgradeDiff ?? null} submitting={submitting}
         />
       )}
