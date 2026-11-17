@@ -624,7 +624,7 @@ describe('复购与 CLV 快照页（#835）', () => {
     const decileRows = [...html.matchAll(/data-clv-decile="(\d+)"([\s\S]*?)(?=data-clv-decile=|<\/tbody>)/g)];
     expect(decileRows.map(m => Number(m[1]))).toEqual(expected.deciles.map(d => d.decile));
     for (const [i, row] of decileRows.entries()) {
-      expect(row[2]).toContain(String(expected.deciles[i]!.consumers));
+      expect(row[2]).toContain(`data-clv-decile-consumers="${expected.deciles[i]!.consumers}"`);
       expect(row[2]).toContain(money(expected.deciles[i]!.clv));
     }
     expect(html).toContain('第 1 / 1 页');

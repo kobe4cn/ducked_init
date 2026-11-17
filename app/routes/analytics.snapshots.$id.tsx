@@ -353,7 +353,7 @@ function ClvResult({ page, pages, pageSize, snapshot, totalClv, topShare, decile
             {deciles.map(d => (
               <TableRow key={d.decile} data-clv-decile={d.decile}>
                 <TableCell className="font-medium">{`第 ${d.decile} 档${d.decile === 1 ? '（最高）' : ''}`}</TableCell>
-                <TableCell>{d.consumers.toLocaleString('zh-CN')}</TableCell>
+                <TableCell data-clv-decile-consumers={d.consumers}>{d.consumers.toLocaleString('zh-CN')}</TableCell>
                 <TableCell>{money(d.clv)}</TableCell>
               </TableRow>
             ))}
