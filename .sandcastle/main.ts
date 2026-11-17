@@ -133,6 +133,8 @@ function testEnv(issueId: string): Record<string, string> {
     ...serviceEnv,
     TEST_PLATFORM_DATABASE_URL: withDbSuffix(toContainer("postgres://crm:crm@localhost:5432/crm_platform_test"), suffix),
     TEST_SOURCE_DATABASE_URL: withDbSuffix(toContainer("postgres://crm:crm@localhost:5432/crm_source_test"), suffix),
+    // 宿主机 PG 是 pgvector/pgvector:pg17-trixie（db_script/pg_setup.sh），pgvector 契约用例在沙箱里也跑（#850）
+    TEST_PGVECTOR_URL: withDbSuffix(toContainer("postgres://crm:crm@localhost:5432/crm_vector_test"), suffix),
     // 源端测试账号名按票区分（scripts/test-resource-names.ts 的 CRM_TEST_RUN_SUFFIX），并行的沙箱不共用账号
     CRM_TEST_RUN_SUFFIX: suffix,
     CRM_TEST_WORKERS: "4",

@@ -3,7 +3,8 @@
 
 set CONTAINER_NAME postgres-server
 set VOLUME_NAME pg-data
-set POSTGRES_IMAGE postgres:17
+# 带 pgvector 扩展（外部向量存储的契约用例要用，#850）；用 trixie 版：postgres:17 现在基于 Debian trixie，pgvector/pgvector:pg17 默认基于 bookworm，glibc 版本不同、排序规则版本对不上，沿用老卷会报 collation version mismatch
+set POSTGRES_IMAGE pgvector/pgvector:pg17-trixie
 
 set POSTGRES_USER crm
 set POSTGRES_PASSWORD crm

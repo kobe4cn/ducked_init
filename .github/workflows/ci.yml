@@ -31,7 +31,8 @@ jobs:
         shard: [1, 2, 3, 4, 5]
     services:
       postgres:
-        image: postgres:17
+        # 带 pgvector：test/pipeline/vector-store.test.ts 的外部向量存储契约用例要用（TEST_PGVECTOR_URL，#850）；与本地 db_script 同一镜像
+        image: pgvector/pgvector:pg17-trixie
         env:
           POSTGRES_USER: crm
           POSTGRES_PASSWORD: crm
@@ -80,6 +81,7 @@ jobs:
       # 用 127.0.0.1 而不是 localhost：MySQL 客户端把 localhost 当作本机 socket
       TEST_MYSQL_URL: mysql://root:crm@127.0.0.1:3306/crm_source_test
       TEST_MONGO_URL: mongodb://crm:crm@localhost:27017/crm_source_test?authSource=admin
+      TEST_PGVECTOR_URL: postgres://crm:crm@localhost:5432/crm_vector_test
     steps:
       - uses: actions/checkout@v4
       - name: Start SeaweedFS

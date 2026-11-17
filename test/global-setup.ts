@@ -1,5 +1,5 @@
 // test/global-setup.ts —— 测试用平台 PG：每个 worker 一个库（基准库名加 _w<i>，见 test/setup-env.ts），不存在就建库，
-// 然后迁移到最新结构；同时只允许一个 vitest 使用这组测试库。旧库不删：库里租户的 catalog 角色 lake_<id> 是集群级的，删库会留下孤儿角色（Sandcastle 按票加 _i<n> 的库由 scripts/drop-test-resources.ts 连同角色一起回收）
+// 然后迁移到最新结构（设置了 TEST_PGVECTOR_URL 时它的库也按 worker 建，不迁移）；同时只允许一个 vitest 使用这组测试库。旧库不删：库里租户的 catalog 角色 lake_<id> 是集群级的，删库会留下孤儿角色（Sandcastle 按票加 _i<n> 的库由 scripts/drop-test-resources.ts 连同角色一起回收）
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,6 +26,23 @@ function lockTestDb(dbName: string) {
   return () => rmSync(file, { force: true });
 }
 
+/** 设置了 TEST_PGVECTOR_URL 时同样按 worker 建空库（不迁移：表与扩展由用例里的 preparePgvector 建）；它可能指向另一台 PG，单独连 */
+async function createPgvectorDbs(maxWorkers: number) {
+  const baseUrl = process.env.TEST_PGVECTOR_URL;
+  if (!baseUrl) return;
+  const admin = new pg.Client({ connectionString: Object.assign(new URL(baseUrl), { pathname: '/postgres' }).toString() });
+  await admin.connect();
+  try {
+    for (let i = 1; i <= maxWorkers; i++) {
+      const dbName = dbNameOf(withDbSuffix(baseUrl, `_w${i}`));
+      const { rowCount } = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
+      if (!rowCount) await admin.query(`CREATE DATABASE "${dbName.replace(/"/g, '""')}"`);
+    }
+  } finally {
+    await admin.end();
+  }
+}
+
 export default async function setup(project: TestProject) {
   const baseUrl = process.env.PLATFORM_DATABASE_URL!;
   const unlock = lockTestDb(dbNameOf(baseUrl));
@@ -46,5 +63,6 @@ export default async function setup(project: TestProject) {
     process.env.PLATFORM_DATABASE_URL = baseUrl;
     await admin.end();
   }
+  await createPgvectorDbs(project.config.maxWorkers);
   return unlock;
 }
