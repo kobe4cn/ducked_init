@@ -3,7 +3,7 @@
 // 成功后每次查询签发一个 15 分钟的下载链接（只存令牌哈希），凭令牌下载；文件在任务结束 24 小时后由调度器删掉
 import { open, rm } from 'node:fs/promises';
 import { Readable } from 'node:stream';
-import { and, desc, eq, gt, inArray, isNull, lt, lte, sql } from 'drizzle-orm';
+import { and, eq, gt, inArray, isNull, lt, lte, sql } from 'drizzle-orm';
 import type { ApiCaller } from './api-auth';
 import { recordAudit } from './audit';
 import { newToken, sha256 } from './auth';
@@ -15,7 +15,7 @@ import { isS3 } from './lake-storage';
 import { EXPORT_FORMATS, readResult, type ExportCondition, type ExportFormat } from './pipeline/task-contracts';
 import { platformS3 } from './s3-accounts';
 import { deleteObject, getObjectIfExists } from './s3-client';
-import { getSnapshot } from './snapshots';
+import { getSnapshot, newestFirst } from './snapshots';
 import { insertTask, TaskError } from './tasks';
 
 export const MAX_EXPORT_CONDITIONS = 5;
@@ -70,7 +70,7 @@ function parseRequest(body: unknown): ExportRequest {
 
 /**
  * 这个标签要用的快照：指定了就用它（须是本租户、这个标签的、未过期的，别的租户的与不存在的同样报错），
- * 否则取最新一张未过期的（按登记时间、ID 倒序）。返回快照 ID 与不带 schema 的表名
+ * 否则取最新一张未过期的（按统计日 newestFirst 倒序）。返回快照 ID 与不带 schema 的表名
  */
 async function pickSnapshot(tenantId: string, tag: string, id: string | undefined) {
   const template = `tag:${tag}`;
@@ -78,7 +78,7 @@ async function pickSnapshot(tenantId: string, tag: string, id: string | undefine
   const snapshot = id === undefined
     ? (await getDb().select().from(snapshots)
       .where(and(eq(snapshots.tenantId, tenantId), eq(snapshots.template, template), isNull(snapshots.expiredAt), gt(snapshots.expiresAt, new Date())))
-      .orderBy(desc(snapshots.createdAt), desc(snapshots.id)).limit(1))[0]
+      .orderBy(...newestFirst).limit(1))[0]
     : await getSnapshot(tenantId, id);
   const table = snapshot && /^gold\.(tag__[0-9a-f-]{36})$/.exec(snapshot.table)?.[1];
   if (!snapshot || !table || snapshot.template !== template || !live(snapshot)) {

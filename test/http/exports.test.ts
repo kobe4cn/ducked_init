@@ -37,15 +37,16 @@ async function tenantWithKey(slug: string) {
 
 /**
  * 在湖里建一张标签快照表 gold."tag__<uuid>"（consumer_id, tag_key, tag_value）并登记成快照（template tag:<键>），返回快照 ID。
- * 登记时间按 createdAt（默认现在）
+ * 登记时间按 createdAt（默认现在），统计日按 asOf（不传时 params 里没有 asOf，与老快照一致）
  */
-async function tagSnapshot(tenantId: string, key: string, people: Record<string, string>, opts: { createdAt?: Date; expiredAt?: Date } = {}) {
+async function tagSnapshot(tenantId: string, key: string, people: Record<string, string>, opts: { createdAt?: Date; expiredAt?: Date; asOf?: string } = {}) {
   const id = randomUUID();
   const values = Object.entries(people).map(([c, v]) => `('${c}', '${key}', '${v}')`).join(', ');
   await onLake(tenantId, `CREATE TABLE gold."tag__${id}" AS SELECT * FROM (VALUES ${values}) t(consumer_id, tag_key, tag_value)`);
   const [task] = await getDb().insert(tasks).values({ tenantId, kind: 'lake.inventory', status: 'succeeded' }).returning();
   await getDb().insert(snapshots).values({
-    id, tenantId, template: `tag:${key}`, taskId: task.id, table: `gold.tag__${id}`, params: {}, rowCount: Object.keys(people).length,
+    id, tenantId, template: `tag:${key}`, taskId: task.id, table: `gold.tag__${id}`,
+    params: opts.asOf === undefined ? {} : { asOf: opts.asOf }, rowCount: Object.keys(people).length,
     expiresAt: new Date(Date.now() + 86_400_000), createdAt: opts.createdAt ?? new Date(), expiredAt: opts.expiredAt,
   });
   return id;
@@ -209,6 +210,21 @@ describe('导出结果与状态', () => {
     expect(await readExport(tenantId, again.id, 'parquet')).toEqual(await readExport(tenantId, first.id, 'parquet'));
     expect((await readExport(tenantId, first.id, 'parquet')).ids).toEqual(['c1', 'c2', 'c3']);
     expect((await readExport(tenantId, latest.id, 'parquet')).ids).toEqual(['c2', 'c5']);
+  });
+
+  it('不指定快照时按统计日选：统计日早一天、后登记的回刷快照不被选中；同一统计日取登记较晚的那张', async () => {
+    const { tenantId, key } = await tenantWithKey('acme');
+    const day = new Date().toISOString().slice(0, 10);
+    const prevDay = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    // 统计日 D 的两张（早登记、晚登记），再登记一张统计日 D-1 的回刷快照（登记最晚）
+    await tagSnapshot(tenantId, 'vip', { c1: 'yes', c2: 'yes' }, { asOf: day, createdAt: new Date(Date.now() - 120_000) });
+    const sameDay = await tagSnapshot(tenantId, 'vip', { c2: 'yes', c5: 'yes' }, { asOf: day, createdAt: new Date(Date.now() - 60_000) });
+    await tagSnapshot(tenantId, 'vip', VIP, { asOf: prevDay });
+
+    const res = (await post({ conditions: [{ tag: 'vip', value: 'yes' }] }, key)).body;
+    expect(res.snapshots).toEqual({ vip: sameDay });
+    await drain();
+    expect((await readExport(tenantId, res.id, 'parquet')).ids).toEqual(['c2', 'c5']);
   });
 
   it('排队期间快照表被删掉时任务失败、提示重新发起，不留下文件', async () => {

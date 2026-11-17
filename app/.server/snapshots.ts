@@ -153,11 +153,19 @@ export async function markExpired(tenantId: string, taskId: string) {
     .where(and(eq(snapshots.tenantId, tenantId), inArray(snapshots.table, tables), isNull(snapshots.expiredAt)));
 }
 
-/** 本租户的全部快照（给 template 时只取这个模板的，如一个定义的全部历史快照），最新的在前 */
+/** 「最新快照」的共用排序：统计日（params->>'asOf'，YYYY-MM-DD 按字符串排即按日期排）从新到旧，同一统计日按登记时间、ID 从新到旧。
+ *  DESC 要写 NULLS LAST：PG 的 DESC 默认 NULLS FIRST，没有统计日的老快照（与测试里 params 为空的快照）不能排在最前 */
+export const newestFirst: SQL[] = [
+  sql`${snapshots.params}->>'asOf' DESC NULLS LAST`,
+  desc(snapshots.createdAt),
+  desc(snapshots.id),
+];
+
+/** 本租户的全部快照（给 template 时只取这个模板的，如一个定义的全部历史快照），按 newestFirst 从新到旧 */
 export async function listSnapshots(tenantId: string, template?: string) {
   return getDb().select().from(snapshots)
     .where(template ? and(eq(snapshots.tenantId, tenantId), eq(snapshots.template, template)) : eq(snapshots.tenantId, tenantId))
-    .orderBy(desc(snapshots.createdAt));
+    .orderBy(...newestFirst);
 }
 
 /** 本租户的一张快照；不存在或属于其他租户时为 null */

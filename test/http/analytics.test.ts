@@ -29,11 +29,11 @@ afterAll(async () => { await app?.close(); await closeDb(); });
 const fresh = async () => { await resetDb(); app.outbox.length = 0; };
 afterEach(() => { vi.unstubAllEnvs(); });
 
-/** 打通好的 acme 跑一次 RFM，返回租户与快照 */
+/** 打通好的 acme 跑一次 RFM，返回租户与快照。快照按统计日找：映射合并已自动启用了一张当天 asOf 的 rfm 快照，排在前面 */
 async function rfmSnapshot() {
   const { acme } = await publishedIdentitySources({ orders: true });
   await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
-  const [snapshot] = await listSnapshots(acme);
+  const snapshot = (await listSnapshots(acme, 'rfm')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
   return { acme, snapshot };
 }
 
@@ -215,6 +215,42 @@ describe('分析页 · 指标与标签列表', () => {
     expect(page).toMatch(new RegExp(`data-definition-snapshot="[^"]+"(?:(?!</tr>).)*>2024-07-15<`, 's'));
     expect(page.indexOf('2024-08-01')).toBeGreaterThan(-1);
     expect(page.indexOf('2024-08-01')).toBeLessThan(page.indexOf('2024-07-15'));
+  });
+
+  it('快照列表与定义页「快照」区都按统计日从新到旧排：统计日早一天、后登记的回刷快照排在后面；同一统计日按登记时间从新到旧', async () => {
+    const acme = await newTenant('acme');
+    await createDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'revenue', REVENUE);
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const [definition] = await getDb().select({ id: dslDefinitions.id }).from(dslDefinitions)
+      .where(and(eq(dslDefinitions.tenantId, acme), eq(dslDefinitions.key, 'revenue')));
+    const taskRows = await getDb().insert(tasks).values([
+      { tenantId: acme, kind: 'gold.dsl', status: 'succeeded', params: { definitionId: definition!.id }, createdAt: new Date(Date.now() - 7_200_000) },
+      { tenantId: acme, kind: 'gold.dsl', status: 'succeeded', params: { definitionId: definition!.id }, createdAt: new Date(Date.now() - 3_600_000) },
+      { tenantId: acme, kind: 'gold.dsl', status: 'succeeded', params: { definitionId: definition!.id } },
+    ]).returning();
+    const [first, backfill, latest] = await getDb().insert(snapshots).values([
+      // 统计日 D、最早登记
+      { tenantId: acme, template: 'metric:revenue', taskId: taskRows[0]!.id, table: `gold.metric__${taskRows[0]!.id}`, params: { asOf: '2024-08-01' }, trigger: 'manual', rowCount: 3, createdAt: new Date(Date.now() - 7_200_000), expiresAt: new Date(Date.now() + 86_400_000) },
+      // 统计日 D-1、登记更晚的回刷快照：按统计日排在最后，不因为登记晚排到前面
+      { tenantId: acme, template: 'metric:revenue', taskId: taskRows[1]!.id, table: `gold.metric__${taskRows[1]!.id}`, params: { asOf: '2024-07-31' }, trigger: 'backfill', rowCount: 2, createdAt: new Date(Date.now() - 3_600_000), expiresAt: new Date(Date.now() + 86_400_000) },
+      // 同一统计日 D、登记最晚：排在最前
+      { tenantId: acme, template: 'metric:revenue', taskId: taskRows[2]!.id, table: `gold.metric__${taskRows[2]!.id}`, params: { asOf: '2024-08-01' }, trigger: 'manual', rowCount: 1, expiresAt: new Date(Date.now() + 86_400_000) },
+    ]).returning();
+    const viewer = await loginAs(app, 'viewer@acme.com');
+
+    // 定义页「快照」区：D 最晚登记 → D 早登记 → D-1 回刷
+    const page = await (await viewer.get('/analytics/definitions/metric/revenue')).text();
+    const rowAt = (id: string) => page.indexOf(`data-definition-snapshot="${id}"`);
+    expect(rowAt(latest!.id)).toBeGreaterThan(-1);
+    expect(rowAt(latest!.id)).toBeLessThan(rowAt(first!.id));
+    expect(rowAt(first!.id)).toBeLessThan(rowAt(backfill!.id));
+
+    // 快照列表同样按统计日从新到旧
+    const list = await (await viewer.get('/analytics')).text();
+    const listAt = (id: string) => list.indexOf(`data-snapshot="${id}"`);
+    expect(listAt(latest!.id)).toBeGreaterThan(-1);
+    expect(listAt(latest!.id)).toBeLessThan(listAt(first!.id));
+    expect(listAt(first!.id)).toBeLessThan(listAt(backfill!.id));
   });
 
   it('列表不显示其他租户的定义；类型与状态筛选走 URL；没有定义的租户显示空状态，有起草权限的成员看到「新建定义」入口', async () => {
@@ -436,7 +472,7 @@ describe('用户 360 模板参数页与快照（通用表单与汇总视图）',
   it('user360 快照的逐人明细标签页（?tab=consumers）分页显示全部列（同意列为是 / 否），模板名取自注册表，页面上没有明文', async () => {
     const { acme } = await publishedIdentitySources({ orders: true, consents: true });
     await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
-    const [snapshot] = await listSnapshots(acme);
+    const snapshot = (await listSnapshots(acme, 'user360')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
     expect(snapshot!.template).toBe('user360');
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     const browser = await loginAs(app, 'viewer@acme.com');
@@ -586,7 +622,7 @@ describe('流失预警快照页（#834）', () => {
   it('readChurnSnapshot 分页总数按筛选后的行数算：每页 2 位时「全部」2 页、「有风险」1 页，页码超出停在最后一页，两页合起来不重不漏', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     await runTask(acme, 'gold.churn', { asOf: '2024-09-15', minOrders: 2 });
-    const snapshot = (await listSnapshots(acme, 'churn'))[0]!;
+    const snapshot = (await listSnapshots(acme, 'churn')).find(s => (s.params as { asOf: string }).asOf === '2024-09-15')!;
     const expected = await lakeExpected(acme, snapshot);
 
     const atRisk = await readChurnSnapshot(snapshot, { page: 9, filter: 'at-risk', pageSize: 2 });
@@ -647,7 +683,7 @@ describe('复购与 CLV 快照页（#835）', () => {
   it('复购页顶部卡片写复购率（X / Y 人）与到第二单天数中位数（与湖上一致），下方有按 consumer_id 升序的分页明细；页面上没有明文', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     await runTask(acme, 'gold.repurchase', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'repurchase'))[0]!;
+    const snapshot = (await listSnapshots(acme, 'repurchase')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     const browser = await loginAs(app, 'viewer@acme.com');
 
@@ -672,7 +708,7 @@ describe('复购与 CLV 快照页（#835）', () => {
   it('CLV 页顶部卡片写前 10% 的人贡献的 clv 占比、CLV 合计，十档表的人数与合计和湖上 ntile(10) 分组一致；下方有分页明细；页面上没有明文', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     await runTask(acme, 'gold.clv', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'clv'))[0]!;
+    const snapshot = (await listSnapshots(acme, 'clv')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     const browser = await loginAs(app, 'viewer@acme.com');
 
@@ -702,8 +738,8 @@ describe('复购与 CLV 快照页（#835）', () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     await runTask(acme, 'gold.repurchase', { asOf: '2024-07-01' });
     await runTask(acme, 'gold.clv', { asOf: '2024-07-01' });
-    const repurchase = (await listSnapshots(acme, 'repurchase'))[0]!;
-    const clv = (await listSnapshots(acme, 'clv'))[0]!;
+    const repurchase = (await listSnapshots(acme, 'repurchase')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
+    const clv = (await listSnapshots(acme, 'clv')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
 
     const repurchaseIds = await lakeIds(acme, repurchase);
     expect(repurchaseIds).toHaveLength(5);
@@ -732,8 +768,8 @@ describe('复购与 CLV 快照页（#835）', () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     await runTask(acme, 'gold.repurchase', { asOf: '2024-07-01' });
     await runTask(acme, 'gold.clv', { asOf: '2024-07-01' });
-    const repurchase = (await listSnapshots(acme, 'repurchase'))[0]!;
-    const clv = (await listSnapshots(acme, 'clv'))[0]!;
+    const repurchase = (await listSnapshots(acme, 'repurchase')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
+    const clv = (await listSnapshots(acme, 'clv')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
     // 在湖上直接改快照表：没有人有第二单、clv 全为 0
     const tableOf = (s: { table: string }) => { const [schema, name] = s.table.split('.'); return `${schema}."${name}"`; };
     await onLake(acme, `UPDATE ${tableOf(repurchase)} SET days_to_second = NULL, repurchased = false`);
@@ -759,7 +795,7 @@ describe('同期群快照页（#836）', () => {
   it('默认打开留存矩阵：行按 cohort_start 升序，每格的人数与湖上按 unnest(active_periods) 分组的计数一致、第 0 期都是 100.0%、没人下单的期补 0；卡片写同期群数、总人数与粒度；页面没有明文', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     await runTask(acme, 'gold.cohort', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'cohort'))[0]!;
+    const snapshot = (await listSnapshots(acme, 'cohort')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     const browser = await loginAs(app, 'viewer@acme.com');
 

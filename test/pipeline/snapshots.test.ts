@@ -70,7 +70,8 @@ describe('结果快照登记', () => {
   it('读出 RFM 结果：按定义顺序的人群人数与金额，分页的消费者明细只带 consumer_id 与分值', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
-    const [snapshot] = await listSnapshots(acme);
+    // 映射合并已自动启用了一张当天 asOf 的 rfm 快照，按统计日取刚跑的这张
+    const snapshot = (await listSnapshots(acme, 'rfm')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
 
     const first = await readRfmSnapshot(snapshot, { page: 1, pageSize: 2 });
     // 见 rfm.test.ts 的手算：重要价值 550；一般价值 500；一般挽留 300 + 80 + 1000
@@ -303,8 +304,10 @@ describe('快照过期', () => {
     await onLake(acme, `CALL lake.set_option('data_inlining_row_limit', 0)`);
     const filedTask = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
     await onLake(acme, `CALL lake.set_option('data_inlining_row_limit', 10)`);
-    await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
-    const [filed, inlined] = (await listSnapshots(acme)).sort((a, b) => Number(b.taskId === filedTask!.id) - Number(a.taskId === filedTask!.id));
+    const inlinedTask = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
+    // 按任务 ID 取（映射合并已自动启用了一批当天 asOf 的模板快照，不能按列表顺序取）
+    const filed = (await listSnapshots(acme, 'rfm')).find(s => s.taskId === filedTask!.id)!;
+    const inlined = (await listSnapshots(acme, 'rfm')).find(s => s.taskId === inlinedTask!.id)!;
     const files = await onLake<{ path: string }>(acme, `SELECT data_file AS path FROM ducklake_list_files('lake', '${nameOf(filed)}', schema => 'gold')`);
     expect(files.length).toBeGreaterThan(0);
     const inlinedData = () => onLake(acme, `
@@ -312,8 +315,8 @@ describe('快照过期', () => {
     expect(await inlinedData()).toHaveLength(1);
 
     vi.setSystemTime(Date.now() + 30 * DAY);
-    await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
-    const [fresh] = await listSnapshots(acme);
+    const freshTask = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
+    const fresh = (await listSnapshots(acme, 'rfm')).find(s => s.taskId === freshTask!.id)!;
 
     vi.setSystemTime(filed.expiresAt.getTime() + 60_000);
     expect(await enqueueDueExpiries()).toEqual([acme]);
