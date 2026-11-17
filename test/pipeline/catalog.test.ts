@@ -9,7 +9,7 @@
 // 指标、标签、模板条目带定义所属空间 spaceId（只作记录，不按它过滤，ADR-0048）；加这个键前后的差异只有它，已发布过定义或模板的租户读取时补记一版 catalog.detected
 import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { type CatalogEntry, expand, overview, search, toJson, toMarkdown } from '../../app/.server/catalog';
+import { type CatalogEntry, expand, groupItems, groupOverview, search, toJson, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { catalogChangesSince, diffCatalog, recordCatalogVersion, stripStats } from '../../app/.server/catalog/versions';
 import { saveBusinessNote, targetNoteHistory } from '../../app/.server/business-notes';
@@ -25,6 +25,7 @@ import { confirmWatermark, deleteSource, registerSource, relistSource, setSyncSc
 import { publishTemplate, saveDraft } from '../../app/.server/templates';
 import { lockTenant } from '../../app/.server/tenant-lock';
 import { resetDb } from '../http/harness';
+import { groupedText } from '../catalog-groups';
 import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish, selectAllTables } from './fixtures';
 import { CRM, CRM_ORDERS, LOYALTY, publishedIdentitySources, TRACKING_USERS } from './identity-fixtures';
 import { grantOnSource, pgSourceInput, READER, seedIdentitySources } from './source-fixtures';
@@ -68,11 +69,11 @@ describe('语义目录的加载', () => {
     expect(expand(c, 'field:order.status')).toMatchObject({ lineage: expect.arrayContaining([expect.objectContaining({ source: 'CRM', table: 'orders' })]) });
     expect(expand(c, 'entity:customer')).toMatchObject({ tables: ['table:CRM/customers', 'table:会员/members', 'table:埋点/users'] });
 
-    const md = toMarkdown(overview(c));
-    expect(md).toMatch(/table:CRM\/stores .*未映射/);
-    expect(md).not.toContain('audit_log');
+    const sourcesGroup = toMarkdown(groupItems(c, 'group:sources')!);
+    expect(sourcesGroup).toMatch(/table:CRM\/stores .*未映射/);
+    expect(sourcesGroup).not.toContain('audit_log');
 
-    const all = [md, toJson(overview(c)), ...c.entries.flatMap(e => [toMarkdown(e), toJson(e)]),
+    const all = [groupedText(c), ...c.entries.flatMap(e => [toMarkdown(e), toJson(e)]),
       ...['手机 phone', '邮箱 email', '姓名 name', 'unionid external'].flatMap(q => [toMarkdown(search(c, q)), toJson(search(c, q))])].join('\n');
     for (const field of ['name', 'phone', 'email', 'external_id']) expect(all, field).not.toContain(`field:customer.${field}`);
     const customer = expand(c, 'entity:customer');
@@ -106,9 +107,9 @@ describe('语义目录的加载', () => {
     // 映射成 external_id 的 unionid（列名不像敏感信息，采集时照样存了取值）与像敏感信息的列不出现
     const customers = expand(c, 'table:CRM/customers');
     expect(customers?.kind === 'table' && customers.stats!.columns.map(col => col.name)).toEqual(['id', 'updated_at']);
-    const all = [toMarkdown(overview(c)), toJson(overview(c)), ...c.entries.flatMap(e => [toMarkdown(e), toJson(e)])].join('\n');
+    const all = [groupedText(c), ...c.entries.flatMap(e => [toMarkdown(e), toJson(e)])].join('\n');
     for (const word of ['wx_union_8', '张三', '13800000002', 'zhang@crm.test']) expect(all, word).not.toContain(word);
-    expect(toJson(overview(c))).not.toMatch(/采集时间|最近一次合并|nullRate|sampleRows|"top"/);
+    expect(groupedText(c)).not.toMatch(/采集时间|最近一次合并|nullRate|sampleRows|"top"/);
   });
 
   it('发布的指标取最新发布版：能展开、能按说明搜到，草稿不算；自动启用的模板带产出列与快照', async () => {
@@ -126,14 +127,14 @@ describe('语义目录的加载', () => {
       dependencies: { entities: ['entity:order'], fields: ['field:order.amount', 'field:order.status'] },
     });
     expect(search(c, '已支付 实付金额')[0]?.id).toBe('metric:paid_revenue');
-    expect(toMarkdown(overview(c))).toContain('- metric:paid_revenue paid_revenue — 已支付订单的实付金额');
+    expect(toMarkdown(groupItems(c, 'group:entity:order')!)).toContain('- metric:paid_revenue paid_revenue — 已支付订单的实付金额');
     expect(toJson(c.entries)).not.toMatch(/旧口径|草稿口径/);
     // 映射合并后平台自动启用的模板：产出列与最近一次快照
     expect(expand(c, 'template:rfm')).toMatchObject({
       version: 1, entities: ['entity:order', 'entity:customer'], columns: expect.arrayContaining([expect.objectContaining({ name: 'segment' })]),
       snapshot: { table: expect.stringMatching(/^gold\.rfm__/), rows: expect.any(Number), at: expect.any(String) },
     });
-    expect(toMarkdown(overview(c))).toContain('- template:rfm RFM 分层');
+    expect(toMarkdown(groupItems(c, 'group:templates')!)).toContain('- template:rfm RFM 分层');
   });
 
   it('指标、标签、模板条目带定义所属空间 spaceId，只作记录：另一个空间的成员发布的标签也在目录里', async () => {
@@ -212,7 +213,7 @@ describe('语义目录的加载', () => {
     expect(md).toContain('会员系统的取消单不进同步');
     expect(search(c, '退款单')[0]?.id).toBe('field:order.status');
     expect(search(c, '取消单')[0]?.id).toBe('field:order.status');
-    const all = [toMarkdown(overview(c)), toJson(overview(c)), ...c.entries.flatMap(e => [toMarkdown(e), toJson(e)])].join('\n');
+    const all = [groupedText(c), ...c.entries.flatMap(e => [toMarkdown(e), toJson(e)])].join('\n');
     expect(all).not.toContain('机密口径');
     expect(search(c, '机密口径')).toEqual([]);
 
@@ -336,8 +337,8 @@ describe('语义目录的加载', () => {
 
     const c = await tenantCatalog(acme);
     expect(c.version).toBe(v0 + 3);
-    expect(overview(c).version).toBe(v0 + 3);
-    expect(toMarkdown(overview(c))).toContain(`目录版本 ${v0 + 3}`);
+    expect(groupOverview(c).version).toBe(v0 + 3);
+    expect(toMarkdown(groupOverview(c))).toContain(`目录版本 ${v0 + 3}`);
   });
 
   it('自定义实体发布与删除各记一版', async () => {

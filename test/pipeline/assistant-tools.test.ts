@@ -1,11 +1,13 @@
 // test/pipeline/assistant-tools.test.ts —— AI 助手的工具注册表（ADR-0042）：toolsFor 按角色列出可用工具，runTool 按登记的权限检查（403）、
 // 没有的工具与不合 Schema 的输入 400；目录工具按角色过滤（catalogFor：查看者看不到 source: / table: 条目与字段来源，ADR-0005）；
 // 校验工具（定义、映射）把问题转成给模型的文本；validate_plan 校验分析计划（ADR-0050）：只认本轮 catalog_search / catalog_expand 检索到的条目，
-// search / expand 的输出给每个条目带按角色裁剪的目录上算出的语义哈希
+// search / expand 的输出给每个条目带按角色裁剪的目录上算出的语义哈希；
+// 分层总览（#854）：catalog_overview 只给第一层分组（查看者没有 group:sources 汇总行），catalog_expand 认 group: 分组标识，组内条目记进本轮检索
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { catalogFor, invokeTool, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { semanticHash } from '../../app/.server/catalog/plan';
+import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
@@ -40,14 +42,25 @@ describe('AI 助手的工具注册表', () => {
 
     const searched = await runTool(viewer, 'catalog_search', { query: 'CRM' });
     expect(searched).not.toMatch(/(source|table):/);
+    // 第一层只有分组：查看者没有数据源汇总行（也不泄露源表数），没有 source / table 条目行
     const overview = await runTool(viewer, 'catalog_overview', {});
-    expect(overview).toContain('- entity:customer ');
+    expect(overview).toContain('- group:entity:customer ');
+    expect(overview).not.toContain('group:sources');
     expect(overview).not.toMatch(/(source|table):/);
     const field = await runTool(viewer, 'catalog_expand', { id: mapped.id });
     expect(field).toContain(`## ${mapped.id}`);
     expect(field).toContain('- 来源：未映射');
     expect(await runTool(viewer, 'catalog_expand', { id: 'entity:customer' })).not.toMatch(/(source|table):/);
-    const [source] = (await runTool(analyst, 'catalog_overview', {})).match(/source:\S+/)!;
+    // 组内列表也没有数据源、源表与字段来源
+    const grouped = await runTool(viewer, 'catalog_expand', { id: 'group:entity:customer' });
+    expect(grouped).toContain('- entity:customer ');
+    expect(grouped).not.toMatch(/(source|table):/);
+    expect(grouped).not.toContain('来源：');
+    // 数据源与源表在 group:sources 组里（每行带语义哈希）；查看者的目录里没有这个组
+    const sources = await runTool(analyst, 'catalog_expand', { id: 'group:sources' });
+    const source = sources.match(/^- (source:\S+)/m)![1]!;
+    expect(sources).toMatch(/· semanticHash: [0-9a-f]{64}/m);
+    expect(await runTool(viewer, 'catalog_expand', { id: 'group:sources' })).toBe('没有这个条目');
     expect(await runTool(viewer, 'catalog_expand', { id: source })).toBe('没有这个条目');
   });
 
@@ -103,5 +116,46 @@ describe('AI 助手的工具注册表', () => {
     expect(invalid.text).toContain('status: invalid');
     expect(invalid.text).toContain('- selected.0.id（entity:order）：选中的条目不在本次检索结果里');
     expect(invalid.rejected).toBeUndefined(); // 不用 rejected：计划的校验结果不算修正次数
+  });
+
+  it('catalog_expand 展开分组：组内条目每行带语义哈希并记进本轮检索，计划只经分组引用它们也通过', async () => {
+    const { author, reviewer } = await publishedIdentitySources();
+    await createDefinition(author, 'metric', 'customer_count', 'base: customer\nmeasure: { agg: count }\ndescription: 客户数\n');
+    await publishDefinition(reviewer, 'metric', 'customer_count', 1);
+
+    // 只经分组拿到条目：展开实体组，从行里取条目标识与语义哈希
+    const retrieved = new Set<string>();
+    const group = await invokeTool(author, 'catalog_expand', { id: 'group:entity:customer' }, {}, { retrieved });
+    const line = group.text.split('\n').find(l => l.startsWith('- entity:customer '))!;
+    const hash = line.match(/semanticHash: ([0-9a-f]{64})/)![1];
+    expect(hash).toBe(semanticHash((await catalogFor(author)).entries.find(e => e.id === 'entity:customer')!));
+    expect(group.text).toMatch(/^# 分组 group:entity:customer$/m);
+    expect(retrieved.has('entity:customer')).toBe(true);
+    expect(retrieved.has('group:entity:customer')).toBe(false); // 组标识不是条目，不进候选集合
+    expect(group.text.split('\n').filter(l => l.startsWith('- field:')).length).toBeGreaterThan(0);
+
+    const plan = {
+      schemaVersion: 1,
+      mode: 'reuse_result',
+      selected: [{ id: 'entity:customer', semanticHash: hash }],
+      request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: ['entity:customer'] }],
+      assumptions: [],
+      questions: [],
+    };
+    const checked = await invokeTool(author, 'validate_plan', { plan }, {}, { retrieved });
+    expect(checked.text).toBe('status: valid');
+
+    // 只经分组拿到的指标：组内行带 semanticHash 与 version，计划带上两者通过
+    const metricLine = group.text.split('\n').find(l => l.startsWith('- metric:customer_count '))!;
+    const [, metricHash, version] = metricLine.match(/semanticHash: ([0-9a-f]{64}) · version: (\d+)/)!;
+    expect(retrieved.has('metric:customer_count')).toBe(true);
+    const metricPlan = {
+      ...plan,
+      selected: [{ id: 'metric:customer_count', semanticHash: metricHash, version: Number(version) }],
+      steps: [{ id: 's1', action: 'answer', inputs: ['metric:customer_count'] }],
+    };
+    const metricChecked = await invokeTool(author, 'validate_plan', { plan: metricPlan }, {}, { retrieved });
+    expect(metricChecked.text).toBe('status: valid');
   });
 });

@@ -1,6 +1,6 @@
 // test/catalog-versions.test.ts —— 目录版本（ADR-0041）的比较：去掉统计后按条目标识比出新增、删除与改动，只改统计没有差异（纯函数，手工构造 CatalogInput）
 import { describe, expect, it } from 'vitest';
-import { buildCatalog, overview, toMarkdown, type CatalogInput } from '../app/.server/catalog';
+import { buildCatalog, groupOverview, toMarkdown, type CatalogInput } from '../app/.server/catalog';
 import { diffCatalog, stripStats } from '../app/.server/catalog/versions';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
 
@@ -110,11 +110,11 @@ describe('目录版本的比较', () => {
     expect(entity.columns).toBeUndefined();
   });
 
-  it('总览带目录版本号，还没有版本时不显示', () => {
+  it('第一层分组带目录版本号，还没有版本时不显示', () => {
     const c = buildCatalog(input());
-    expect(overview(c).version).toBeNull();
-    expect(toMarkdown(overview(c))).not.toContain('目录版本');
-    const v = overview({ ...c, version: 7 });
+    expect(groupOverview(c).version).toBeNull();
+    expect(toMarkdown(groupOverview(c))).not.toContain('目录版本');
+    const v = groupOverview({ ...c, version: 7 });
     expect(v.version).toBe(7);
     expect(toMarkdown(v).split('\n').slice(0, 3)).toEqual(['# 语义目录', '', '目录版本 7']);
     expect(stripStats({ ...c, version: 7 })).toEqual(stripStats(c));

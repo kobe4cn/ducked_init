@@ -4,6 +4,8 @@
 // 保存类工具只存草稿，发布照旧双人；注册表里没有发布工具。执行查询的 run_query 另要令牌的授权（requires: 'allowQuery'）：只有签发时允许执行查询的令牌经 MCP 拿得到，
 // 平台内的助手拿不到（toolsFor 不含、invokeTool 不带授权时 403）；结果按工作台解读的规则剔除列，但对全部返回行判断哈希（ADR-0043）。目录按角色过滤（catalogFor）：没有 sources:read 的成员看不到数据源与源表条目、字段来源与实体映射到的源表（ADR-0005）。
 // 分析计划（ADR-0050）：目录检索工具的输出给每个条目带语义哈希（同一份按角色裁剪的目录上算），并把条目 id 记进 ToolCtx.retrieved（助手循环每轮新建）；
+// 目录总览分层（#854）：catalog_overview 只给第一层分组（groupOverview），catalog_expand 认 group: 分组标识（groupItems，组内条目同样带哈希并记进 retrieved），
+// 大目录不再截掉条目；查看者的目录里没有数据源条目，第一层不出 group:sources 汇总行、展开也回「没有这个条目」；
 // validate_plan 只认本轮检索到的条目，校验结果渲染成文本、不带 rejected（不计修正次数）；它不对外开放（external: false），外部没有这个上下文。
 // 本轮校验过的计划经 ToolCtx 带走随对话保存；save_definition_draft 存草稿前对最新目录重新校验（本轮的优先，其次对话里最近一份），
 // 不是 valid 就不保存、说明原因（依赖变了 / 看不到所选条目时说计划已过期，否则写明计划状态，如 clarify 计划的 needs_clarification），不带 rejected；外部经 MCP 调用不带 ctx，没有计划，行为与不带计划时一致。
@@ -15,7 +17,7 @@ import { data } from 'react-router';
 import { parse } from 'yaml';
 import { assertCan, can, type Permission } from '../access';
 import type { CurrentMember } from '../auth';
-import { expand, overview, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
+import { expand, groupItems, groupOverview, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
 import { judgeAmbiguity, type AmbiguityGroup } from '../catalog/ambiguity';
 import { tenantCatalog } from '../catalog/load';
 import { planRetrievedIds, semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type PlanStatus } from '../catalog/plan';
@@ -172,22 +174,34 @@ const MAX_PREFILL_SQL = 20_000;
 export const TOOLS: AssistantTool[] = [
   {
     name: 'catalog_overview',
-    description: '语义目录总览：实体、关系、指标、标签与模板各一行。先看总览，再按标识展开或按关键词搜索',
+    description: '语义目录总览（第一层分组）：分析主题、实体各一组一行（带指标 / 标签 / 字段数量），数据源、关系、模板各一行汇总。'
+      + '先看分组，再用 catalog_expand 按分组展开（group:… 标识）或用 catalog_search 搜索',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     outputSchema: TEXT,
     permission: 'definitions:read',
     external: true,
-    run: async actor => toMarkdown(overview(await catalogFor(actor))),
+    run: async actor => toMarkdown(groupOverview(await catalogFor(actor))),
   },
   {
     name: 'catalog_expand',
-    description: '按标识展开一个目录条目，如 entity:customer、field:customer.city、metric:paid_revenue_30d',
+    description: '按标识展开一个目录条目（如 entity:customer、field:customer.city、metric:paid_revenue_30d），或展开一个分组：'
+      + 'group:subject:<主题名>、group:entity:<实体名>、group:sources、group:relationships、group:templates、group:other、合并组 group:entities@<k>'
+      + '（组内放不下时分页，在标识后加 @<页>，如 group:entity:order@2）。先看 catalog_overview 的分组，再按分组展开或搜索',
     inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } }, additionalProperties: false },
     outputSchema: TEXT,
     permission: 'definitions:read',
     external: true,
     run: async (actor, { id }, ctx) => {
-      const entry = expand(await catalogFor(actor), id as string);
+      const c = await catalogFor(actor);
+      const key = id as string;
+      // 分组（第一层 group: 标识）走第二层：组内条目每行带语义哈希，同样记进本轮检索到的候选集合
+      if (key.startsWith('group:')) {
+        const group = groupItems(c, key, semanticHash);
+        if (!group) return '没有这个条目';
+        for (const entryId of group.entries) ctx?.retrieved.add(entryId);
+        return toMarkdown(group);
+      }
+      const entry = expand(c, key);
       if (!entry) return '没有这个条目';
       ctx?.retrieved.add(entry.id);
       return withHash(entry);

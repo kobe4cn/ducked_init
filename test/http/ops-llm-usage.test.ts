@@ -1,5 +1,6 @@
-// test/http/ops-llm-usage.test.ts —— 运营后台「模型调用汇总」页（#746）：跨租户按（租户、模型、用途）分组汇总近 7/30 天的调用，
-// 次数、token、按当前单价折算的金额（ADR-0057）与错误率和手算一致；窗口外的调用不出现；未登录与成员会话（包括租户管理员）
+// test/http/ops-llm-usage.test.ts —— 运营后台「模型调用汇总」页（#746）：跨租户按（租户、模型、用途、来源）分组汇总近 7/30 天的调用，
+// 次数、token、按当前单价折算的金额（ADR-0057）与错误率和手算一致；来源（#844）是分组键之一：同一组的租户 / 平台 / 旧行分成三行，
+// 列显示「租户」/「平台」/「—」；窗口外的调用不出现；未登录与成员会话（包括租户管理员）
 // 被拒（302 到 /ops/login）；页面只放聚合数，不含错误原文（ADR-0007）
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -20,9 +21,12 @@ const call = (tenantId: string, over: Partial<typeof llmCalls.$inferInsert> = {}
 const price = (model: string, inputPerMTok: string, outputPerMTok: string, currency: 'CNY' | 'USD') =>
   getDb().insert(modelPrices).values({ model, inputPerMTok, outputPerMTok, currency });
 
-/** 汇总表里（租户、模型、用途）一行 的 HTML */
+/** 汇总表里（租户、模型、用途）一行 的 HTML（旧行 source 为 null，渲染成 data-source="none"） */
 const usageRow = (html: string, tenant: string, model: string, purpose: string) =>
   html.match(new RegExp(`<tr[^>]*data-tenant="${tenant}"[^>]*data-model="${model}"[^>]*data-purpose="${purpose}"[\\s\\S]*?</tr>`))?.[0] ?? '';
+/** 汇总表里（租户、模型、用途、来源）一行的 HTML：source 传 'tenant' / 'platform' / 'none'（旧行） */
+const sourceRow = (html: string, tenant: string, model: string, purpose: string, source: string) =>
+  html.match(new RegExp(`<tr[^>]*data-tenant="${tenant}"[^>]*data-model="${model}"[^>]*data-purpose="${purpose}"[^>]*data-source="${source}"[\\s\\S]*?</tr>`))?.[0] ?? '';
 /** 汇总一行里某个数值单元格的文本 */
 const usageCell = (rowHtml: string, col: string) => rowHtml.match(new RegExp(`data-col="${col}"[^>]*>([^<]*)<`))?.[1] ?? '';
 
@@ -85,6 +89,36 @@ describe('运营后台模型调用汇总', () => {
     // days 不在白名单：回退 7 天
     const fallback = usageRow(await (await browser.get('/ops/llm-usage?days=99')).text(), '示例商贸', 'm-fast', 'connectivity');
     expect(usageCell(fallback, 'calls')).toBe('2');
+  });
+
+  it('按（租户、模型、用途、来源）分组：同一组的租户 / 平台 / 旧行分成三行，窗口外不计入', async () => {
+    const acme = (await createTenant('acme', '示例商贸', 'admin@acme.com')).tenant.id;
+    await call(acme, { source: 'tenant' });
+    await call(acme, { source: 'tenant' });
+    await call(acme, { source: 'tenant' });
+    await call(acme, { source: 'platform' });
+    await call(acme, { source: 'platform' });
+    await call(acme); // 迁移前的旧行：source 为空，单独一行显示「—」
+    await call(acme, { createdAt: ago(40), source: 'tenant' }); // 两个窗口都不在
+
+    const browser = await operator();
+    const html = await (await browser.get('/ops/llm-usage?days=7')).text();
+
+    // 同一（租户、模型、用途）组按来源拆成三行，各自计数；来源列 tenant「租户」、platform「平台」、旧行「—」
+    expect(html.match(/<tr[^>]*data-tenant=/g)).toHaveLength(3);
+    const tenant = sourceRow(html, '示例商贸', 'm-fast', 'connectivity', 'tenant');
+    const platform = sourceRow(html, '示例商贸', 'm-fast', 'connectivity', 'platform');
+    const legacy = sourceRow(html, '示例商贸', 'm-fast', 'connectivity', 'none');
+    expect(usageCell(tenant, 'calls')).toBe('3');
+    expect(usageCell(platform, 'calls')).toBe('2');
+    expect(usageCell(legacy, 'calls')).toBe('1');
+    expect(usageCell(tenant, 'source')).toBe('租户');
+    expect(usageCell(platform, 'source')).toBe('平台');
+    expect(usageCell(legacy, 'source')).toBe('—');
+
+    // 同组内排序固定 tenant → platform → 旧行；窗口外那条不计入任何一行
+    expect(html.indexOf('data-source="tenant"')).toBeLessThan(html.indexOf('data-source="platform"'));
+    expect(html.indexOf('data-source="platform"')).toBeLessThan(html.indexOf('data-source="none"'));
   });
 
   it('只有运营者能打开：未登录与成员会话（包括租户管理员）都 302 到 /ops/login，页面不含错误原文', async () => {
