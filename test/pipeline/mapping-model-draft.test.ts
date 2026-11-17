@@ -136,8 +136,9 @@ describe('用模型生成映射草稿', () => {
     expect(user).toMatchObject({ entity: 'order', table: { table: 'orders', rows: 100 } });
     expect(user.table).not.toHaveProperty('samples');
     expect(user.rulesDraft).toMatch(/^# 按规则生成的草稿/);
-    // 目录总览、目标实体与它的各字段条目（带枚举与业务说明）、按表名与列名搜出的条目
+    // 目录分层上下文（第一层分组 + 相关分组的组内列表，目标实体组最前）、目标实体与它的各字段条目、按表名与列名搜出的条目
     expect(catalog).toContain('# 语义目录');
+    expect(catalog).toMatch(/# 相关分组\n\n# 分组 group:entity:order\n/);
     expect(catalog).toContain('## entity:order ');
     expect(catalog).toMatch(/## field:order\.status [\s\S]*- 取值：[^\n]*`paid`[\s\S]*- 业务说明：退款单也算一笔订单，状态记为 refunded/);
     for (const f of ['order_id', 'customer_id', 'amount', 'created_at']) expect(catalog).toContain(`## field:order.${f} `);

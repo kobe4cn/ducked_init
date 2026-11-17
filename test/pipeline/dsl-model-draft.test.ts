@@ -6,9 +6,12 @@ import { parse } from 'yaml';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, dslVersions, llmCalls } from '../../app/.server/db/schema';
+import { buildCatalog, estimateTokens, OVERVIEW_TOKENS, type CatalogInput } from '../../app/.server/catalog';
+import { knowledgeKey } from '../../app/.server/knowledge/catalog';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { createDefinition, DslError, modelDraftForDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
-import { setLlmFetch } from '../../app/.server/llm';
+import { definitionDraftMessages } from '../../app/.server/pipeline/dsl/model-draft';
+import { setLlmFetch, type LlmMessage } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
 import { fakeLlm, json, platformDefault } from './llm-fixtures';
@@ -57,17 +60,17 @@ describe('用模型生成指标定义草稿', () => {
     const [system, user] = received[0]!.body.messages;
     expect(system).toMatchObject({ role: 'system', content: expect.stringContaining('## capability:metric-dsl 指标 DSL') });
     expect(user!.role).toBe('user');
-    // 依次是目录总览、按需求搜出的条目与需求原文
+    // 依次是目录分层上下文（第一层分组 + 相关分组的组内列表）、按需求搜出的条目与需求原文
     const [overviewPart, searchPart] = user!.content.split('# 与需求相关的条目');
     expect(overviewPart).toContain('# 语义目录');
+    expect(overviewPart).toContain('# 相关分组');
     for (const id of ['entity:customer', 'entity:order', 'relation:order.customer_id']) expect(overviewPart).toContain(`- ${id} `);
     expect(searchPart).toContain('## field:order.amount');
     expect(user!.content.endsWith(`# 需求\n\n${REQUEST}`)).toBe(true);
-    // 敏感字段、哈希列不进上下文
+    // 敏感字段、哈希列不进上下文：customer 组的组内列表有 city 的条目行，没有敏感字段的行
     const sent = received[0]!.body.messages.map(m => m.content).join('\n');
-    const customerLine = overviewPart!.split('\n').find(l => l.startsWith('- entity:customer '))!;
-    expect(customerLine).toMatch(/字段：.*\bcity\b/);
-    for (const pii of ['name', 'phone', 'email', 'external_id']) expect(customerLine).not.toMatch(new RegExp(`\\b${pii}\\b`));
+    expect(overviewPart).toMatch(/^- field:customer\.city /m);
+    for (const pii of ['name', 'phone', 'email', 'external_id']) expect(overviewPart).not.toMatch(new RegExp(`^- field:customer\\.${pii} `, 'm'));
     for (const pii of ['`phone`', '`email`', '`external_id`', 'customer.phone', 'customer.email', 'customer.name', '_hash']) expect(sent).not.toContain(pii);
 
     await createDefinition(author, 'metric', 'paid_revenue_30d', yaml);
@@ -148,6 +151,9 @@ describe('用模型生成指标定义草稿', () => {
     await expect(modelDraftForDefinition(viewer, 'metric', REQUEST)).rejects.toMatchObject({ init: { status: 403 } });
   });
 });
+
+/** 手写目录输入里定义所属的空间：目录只记录它，不按它过滤（ADR-0048） */
+const SPACE = '00000000-0000-0000-0000-000000000000';
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: created_at, days: 30 }\ndescription: 近 30 天订单金额\n';
 const REVENUE_BY_CITY = 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n';
@@ -237,5 +243,50 @@ describe('用模型生成标签定义草稿', () => {
     expect(e).toMatchObject({ status: 400, message: expect.stringContaining('先发布一个数值型指标') });
     expect(f).not.toHaveBeenCalled();
     expect(await calls(acme)).toHaveLength(0);
+  });
+});
+
+describe('大目录下的起草上下文（#855：第一层分组 + 相关分组组内列表）', () => {
+  it('按只命中一个实体的需求起草时，相关分组段只有命中实体组的组内列表，不相关实体只在第一层', () => {
+    // 五百个自定义实体（第一层放不下，实体组按标识分桶成合并组）与 1200 个指标、带主题，照 test/catalog.test.ts 千指标目录的造法；
+    // 只有 e_7 的字段说明带「灯塔」，需求只命中它
+    const c = buildCatalog({
+      customEntities: Array.from({ length: 500 }, (_, i) => ({
+        name: `e_${i}`, label: `实体${i}`, kind: 'dimension' as const, primaryKey: ['id'],
+        fields: [
+          { name: 'id', type: 'string' as const, description: i === 7 ? '灯塔实体标识' : `第 ${i} 个实体的标识`, sensitive: false },
+          { name: `f_${i}`, type: 'string' as const, description: '', sensitive: false },
+        ],
+        relations: [],
+      })),
+      definitions: [
+        ...Array.from({ length: 1200 }, (_, i): { kind: 'metric'; key: string; version: number; yaml: string; spaceId: string } => ({
+          kind: 'metric', key: `m_${i}`, version: 1, spaceId: SPACE,
+          yaml: `base: order\nmeasure: { agg: count }\ndescription: 第 ${i} 个测试指标\n`,
+        })),
+      ],
+      knowledge: {
+        byTarget: new Map([
+          ...Array.from({ length: 50 }, (_, i): [string, { subjects: string[] }] => [knowledgeKey(`metric:m_${i}`), { subjects: ['复购'] }]),
+        ]),
+      },
+    });
+
+    const REQUEST = '按灯塔统计';
+    const content = (definitionDraftMessages('metric', REQUEST, c) as LlmMessage[])[1]!.content;
+    const [layered] = content.split('# 与需求相关的条目');
+    // 第一层分组完整给出（合并组行），相关分组段里有命中实体组的组内列表
+    expect(layered).toContain('# 相关分组');
+    expect(layered).toMatch(/^- group:entities@1 /m);
+    expect(layered).toContain('# 分组 group:entity:e_7');
+    expect(layered).toMatch(/^- entity:e_7 /m);
+    expect(layered).toMatch(/^- field:e_7\.id /m);
+    // 不相关实体不出组内列表，条目行只在第一层的合并组行里（或没有）
+    expect(layered).not.toMatch(/^- (entity|field):e_8\S* /m);
+    expect(layered).not.toMatch(/^- metric:m_\d+ /m);
+    // 检索段只搜出命中的字段
+    expect(content).toContain('## field:e_7.id ');
+    // 总量不超过分层上下文与检索段各自的预算加需求本身
+    expect(estimateTokens(content)).toBeLessThanOrEqual(OVERVIEW_TOKENS + 6000 + estimateTokens(REQUEST) + 40);
   });
 });
