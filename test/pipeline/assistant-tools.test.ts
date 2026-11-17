@@ -7,6 +7,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { catalogFor, invokeTool, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { semanticHash } from '../../app/.server/catalog/plan';
+import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
@@ -118,7 +119,9 @@ describe('AI 助手的工具注册表', () => {
   });
 
   it('catalog_expand 展开分组：组内条目每行带语义哈希并记进本轮检索，计划只经分组引用它们也通过', async () => {
-    const { author } = await publishedIdentitySources();
+    const { author, reviewer } = await publishedIdentitySources();
+    await createDefinition(author, 'metric', 'customer_count', 'base: customer\nmeasure: { agg: count }\ndescription: 客户数\n');
+    await publishDefinition(reviewer, 'metric', 'customer_count', 1);
 
     // 只经分组拿到条目：展开实体组，从行里取条目标识与语义哈希
     const retrieved = new Set<string>();
@@ -142,5 +145,17 @@ describe('AI 助手的工具注册表', () => {
     };
     const checked = await invokeTool(author, 'validate_plan', { plan }, {}, { retrieved });
     expect(checked.text).toBe('status: valid');
+
+    // 只经分组拿到的指标：组内行带 semanticHash 与 version，计划带上两者通过
+    const metricLine = group.text.split('\n').find(l => l.startsWith('- metric:customer_count '))!;
+    const [, metricHash, version] = metricLine.match(/semanticHash: ([0-9a-f]{64}) · version: (\d+)/)!;
+    expect(retrieved.has('metric:customer_count')).toBe(true);
+    const metricPlan = {
+      ...plan,
+      selected: [{ id: 'metric:customer_count', semanticHash: metricHash, version: Number(version) }],
+      steps: [{ id: 's1', action: 'answer', inputs: ['metric:customer_count'] }],
+    };
+    const metricChecked = await invokeTool(author, 'validate_plan', { plan: metricPlan }, {}, { retrieved });
+    expect(metricChecked.text).toBe('status: valid');
   });
 });
