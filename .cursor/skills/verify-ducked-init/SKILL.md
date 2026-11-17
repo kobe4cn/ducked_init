@@ -1,6 +1,6 @@
 ---
 name: verify-ducked-init
-description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, model provider, the LLM usage page, the AI assistant, the file-upload source preview on /sources, the data-source page scroll position, the knowledge page, the operator tenant storage quota, or the operator model price page, and capture evidence. When the diff changes scripts/crm-seed/setup.ts recompute, run that step against an isolated database and record task asOf. When the diff changes no page, skip the browser launch. When the diff adds a drizzle migration, also migrate a database that already has rows at the parent commit and confirm only the new column changes. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class. When the diff touches SeaweedFS startup or volume config (db_script/docker-compose.yml, db_script/seaweedfs/master.toml, the SeaweedFS step in .github/workflows/ci.yml, or db_script/start.sh), start that compose stack, check master Max is 2000, confirm one new bucket's first write adds 1 volume, and run scripts/bench-bucket-per-tenant.ts --write-each on a small bucket count. When the diff changes per-tenant bucket isolation (initTenantCatalog creating a bucket, prefixPolicy, createBucket or deleteBucket, resetDb deleting buckets, or drop-test-resources collecting buckets), start a disposable SeaweedFS and check exclusive buckets, idempotent create, cross-tenant 403, legacy prefix conditions, and suffix cleanup. Do not delete every lake-* bucket."
+description: "Drive the CRM 数据分析平台 web app (repo ducked_init, package duckdb_crm) in a real browser against an isolated dev server. Use when a PR-acceptance agent must launch the React Router app from an empty database, log in with a Magic Link, exercise overview, members, tasks, audit, the metric builder, model provider, the LLM usage page, the AI assistant, the file-upload source preview on /sources, the data-source page scroll position, the knowledge page, the operator tenant storage quota, or the operator model price page, and capture evidence. When the diff changes scripts/crm-seed/setup.ts recompute, run that step against an isolated database and record task asOf. When the diff changes no page, skip the browser launch. When the diff touches app/.server/catalog/embeddings.ts or app/.server/catalog/vector-store.ts, skip the browser and run the Catalog embeddings section. When the diff adds a drizzle migration, also migrate a database that already has rows at the parent commit and confirm only the new column changes. Run the named test files, point a script that rewrites an external file at a temporary server, run sh -n on changed shell scripts, and record the risk class. When the diff touches SeaweedFS startup or volume config (db_script/docker-compose.yml, db_script/seaweedfs/master.toml, the SeaweedFS step in .github/workflows/ci.yml, or db_script/start.sh), start that compose stack, check master Max is 2000, confirm one new bucket's first write adds 1 volume, and run scripts/bench-bucket-per-tenant.ts --write-each on a small bucket count. When the diff changes per-tenant bucket isolation (initTenantCatalog creating a bucket, prefixPolicy, createBucket or deleteBucket, resetDb deleting buckets, or drop-test-resources collecting buckets), start a disposable SeaweedFS and check exclusive buckets, idempotent create, cross-tenant 403, legacy prefix conditions, and suffix cleanup. Do not delete every lake-* bucket."
 ---
 
 # Verify CRM 数据分析平台
@@ -15,7 +15,7 @@ Two instances can run side by side. Each `launch.sh` picks its own port, Postgre
 
 ## Changes that do not touch a page
 
-If the diff changes no route, page, or client state, skip `launch.sh`. The browser map does not exercise that diff.
+If the diff changes no route, page, or client state, skip `launch.sh`. The browser map does not exercise that diff. A diff that touches `app/.server/catalog/embeddings.ts` or `app/.server/catalog/vector-store.ts` still skips the browser. Run [Catalog embeddings](#catalog-embeddings).
 
 Record the command output for each check. Record a skipped file as skipped.
 
@@ -177,6 +177,26 @@ Pass is all of these:
 `definitions` throws, before `recompute`, when a yaml names a field that no published mapping has produced (for example `event.x_guide_id` on `wecom_chats_30d`). That throw is not the `✘` line. Fix the missing mapping or report the check blocked.
 
 Drop `crm_recomp_<token>` after the log and the task query are copied into the evidence directory. Do not drop `crm_platform` or a `crm_platform_verify_*` database.
+
+## Catalog embeddings
+
+Run this when the diff touches `app/.server/catalog/embeddings.ts` or `app/.server/catalog/vector-store.ts`. Skip `launch.sh`. There is no feature file and no page: nothing in the browser reads or writes `platform.catalog_embeddings`. A green CI run does not replace this section. CI runs the catalog embedding tests. It does not show the hash read `ensureEmbeddings` takes outside its platform transaction.
+
+Create a database named `crm_verify_embed_<token>`. `<token>` is `[a-z0-9]{1,12}`. Do not use `crm_platform` or a `crm_platform_verify_*` database. Migrate it from this checkout with `PLATFORM_DATABASE_URL` pointing at it. Set `LLM_EMBEDDING_BASE_URL` to `http://127.0.0.1:9/v1`, and set `LLM_EMBEDDING_MODEL` and `LLM_EMBEDDING_API_KEY` to fake values. A temporary `node --import tsx` script may call `ensureEmbeddings`, `fillEmbeddings`, `readEmbeddings`, and `vectorHits`. Pass `setLlmFetch` a function that returns one numeric vector per input string and does not call the network. Label that run as a temporary script. Put the script outside the commit. When CI for this commit is already green, do not rerun the suite.
+
+Pass for the sequential path is all of these, on one tenant, with a second tenant that has the same text hash:
+
+- With the three `LLM_EMBEDDING_*` variables unset, `ensureEmbeddings` returns `off` and inserts no `catalog.embed` task. With them set, two calls while vectors are missing return `queued` and leave one `catalog.embed` row.
+- `fillEmbeddings` writes one current-model row per distinct projection hash. The vector matches the stub. Rows for another model, and rows whose hash is not in the projection, are gone. The other tenant's row is unchanged. The next `ensureEmbeddings` returns `fresh` and does not insert a task. `vectorHits` on those projection rows returns one hit per row and does not insert a task.
+
+Then open the window around the hash read. From a second connection, `BEGIN` and `LOCK TABLE platform.catalog_projection IN ACCESS EXCLUSIVE MODE`. Call `ensureEmbeddings`. Wait until `pg_stat_activity` shows that call waiting on a `Lock` for the projection select. While it waits, change `platform.catalog_embeddings`, then `COMMIT` the lock and record the return value and the task count.
+
+Record both directions. Do not score them as identical to the parent unless the ticket says so:
+
+- Projection hashes are already stored. Delete one current-model row while the projection select waits. A hash read inside the transaction returns `queued` and inserts one task. A hash read taken before the transaction returns `fresh` and inserts nothing: the in-memory set still contains the deleted hash.
+- One projection hash has no row. Insert that row while the projection select waits. A hash read inside the transaction returns `fresh`. A hash read taken before the transaction returns `queued` and inserts one task.
+
+Copy the log into the evidence directory. Drop `crm_verify_embed_<token>`. Do not drop `crm_platform` or a `crm_platform_verify_*` database.
 
 ## Launch
 
