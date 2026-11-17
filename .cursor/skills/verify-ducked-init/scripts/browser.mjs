@@ -18,6 +18,18 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
+// 这个 Chrome 打开过的每个页面共用一份控制台消息。`console` 打印，`console --clear` 丢掉。
+const browserConsole = [];
+
+function watchPage(page) {
+  page.on('console', msg => {
+    browserConsole.push({ type: msg.type(), text: msg.text() });
+  });
+  page.on('pageerror', err => {
+    browserConsole.push({ type: 'pageerror', text: String(err) });
+  });
+}
+
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const skillDir = resolve(scriptDir, '..');
 const selfPath = fileURLToPath(import.meta.url);
@@ -99,6 +111,8 @@ async function runDaemon(dir) {
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
   const page = context.pages()[0] || await context.newPage();
+  for (const open of context.pages()) watchPage(open);
+  context.on('page', watchPage);
   const sock = join(state.STATE_DIR, 'browser.sock');
   if (existsSync(sock)) unlinkSync(sock);
   const server = net.createServer(socket => {
@@ -248,6 +262,16 @@ async function handle(page, state, req) {
   if (cmd === 'scroll-y') {
     return { stdout: String(Math.round(await page.evaluate(() => window.scrollY))) };
   }
+  if (cmd === 'console') {
+    const lines = [];
+    if (req.clear) {
+      lines.push(`console-cleared=${browserConsole.length}`);
+      browserConsole.length = 0;
+    }
+    lines.push(`console-events=${browserConsole.length}`);
+    for (const event of browserConsole) lines.push(`${event.type}\t${event.text.replaceAll('\n', ' ')}`);
+    return { stdout: lines.join('\n') };
+  }
   if (cmd === 'html') {
     // 整页 HTML，含服务端渲染和注水数据。截图和可访问性树只看得到画出来的字。
     if (!req.path) throw new Error('html requires --path');
@@ -268,8 +292,9 @@ async function handle(page, state, req) {
 }
 
 function usage() {
-  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|html|title|url|text|value|count|scroll-y|scroll-into|magic-link> [args]`);
+  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|html|title|url|text|value|count|scroll-y|scroll-into|console|magic-link> [args]`);
   console.error('click accepts --role and --name, or --selector <css>. --confirm accept|dismiss handles one window.confirm');
+  console.error('console accepts --clear, which drops the buffer and prints console-cleared=<N>');
 }
 
 async function runClient() {
@@ -288,6 +313,7 @@ async function runClient() {
       selector: { type: 'string' },
       within: { type: 'string' },
       confirm: { type: 'string' },
+      clear: { type: 'boolean' },
     },
   });
   const cmd = positionals[0];
@@ -333,6 +359,7 @@ async function runClient() {
     selector: values.selector,
     within: values.within,
     confirm: values.confirm,
+    clear: values.clear === true,
     timeout: values.timeout,
   });
   if (!response.ok) {
