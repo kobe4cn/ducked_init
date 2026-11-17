@@ -144,9 +144,13 @@ fi
 write_env_files
 
 echo "starting dev server on $BASE_URL"
-# Record this pid and kill only its descendant tree in cleanup.sh. nohup keeps it alive if the caller exits.
-nohup bash -c "set -a; source $(verify_sq "$STATE_DIR/app.env"); set +a; unset MAIL_HOST MAIL_USER MAIL_PASS; cd $(verify_sq "$ROOT"); exec pnpm dev --host 127.0.0.1 --port $(verify_sq "$PORT") --strictPort" \
-  >"$LOG_FILE" 2>&1 &
+# Record this pid and kill only its descendant tree in cleanup.sh. setsid puts the
+# server in its own session. nohup ignores SIGHUP, but a launching shell whose
+# session is then torn down (a tmux session that exits) still takes the process
+# group with it, and react-router's restarted dev process exits ELIFECYCLE.
+# The listener stays a descendant of this pid, which is what doctor.sh checks.
+setsid bash -c "set -a; source $(verify_sq "$STATE_DIR/app.env"); set +a; unset MAIL_HOST MAIL_USER MAIL_PASS; cd $(verify_sq "$ROOT"); exec pnpm dev --host 127.0.0.1 --port $(verify_sq "$PORT") --strictPort" \
+  >"$LOG_FILE" 2>&1 < /dev/null &
 SERVER_PID=$!
 echo "$SERVER_PID" >"$PID_FILE"
 write_env_files
