@@ -140,7 +140,7 @@ S1–S8 约 9 次会话；S6 可以和 S5 并行（SK 做完之后）。**SK 必
 
 | # | 操作 | 期望 |
 |---|---|---|
-| ENV-1 | `container list` | postgres-server、mysql、mongodb、seaweedfs 都在运行 |
+| ENV-1 | `container list` | postgres-server、mysql、mongodb、seaweedfs 都在运行；postgres-server 的镜像是 `pgvector/pgvector:pg17-trixie`（`db_script/pg_setup.sh`，带 pgvector） |
 | ENV-2 | `.env` 里 `PLATFORM_DATABASE_URL`、`PLATFORM_LAKE_URI`、`PLATFORM_MASTER_KEY`、`LLM_*`、`MAIL_*` 已配置；`pnpm db:migrate` | 迁移到最新，无报错 |
 | ENV-3 | 三个终端：`pnpm dev`、`pnpm dispatcher`（全程不关）、一个跑检查命令 | 调度器日志在动 |
 | ENV-4 | 运营者：`pnpm operator:create`（没有的话） | 能用 `/ops/login` 登录并绑 TOTP |

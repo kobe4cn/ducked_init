@@ -5,21 +5,24 @@
 // CLV（#835）：顶部卡片写前 10% 的人贡献的 clv 占比（总 clv 为 0 时为「—」）与合计，下方十档分布表（每档人数与 clv 合计，只列有人的档），再下方通用分页明细；
 // 同期群（#836）：主视图是留存矩阵（行是 cohort_start 升序、列是第 0…periods-1 期，格子是人数与留存率，卡片写同期群数、总人数、粒度，?tab=matrix），
 // 逐人明细挪到 ?tab=consumers&page=N（仍按 consumer_id 分页、active_periods 顿号连接）；
+// 用户 360（#837）：默认「汇总」标签（?tab=summary）——卡片写总人数、有订单人数与各渠道同意人数，可按 consumer_id 查单人一行（?consumer=），
+// 逐人明细挪到 ?tab=consumers&page=N（仍按 consumer_id 分页）；
 // 其他模板（含指标 / 标签 DSL 快照，#816）：按 consumer_id（DSL 按全部列）分页的通用明细（?page=N），列取快照表的全部列，
 // DSL 快照页头写定义（类型与键）、定义版本、统计日与来源，标签在明细上方带各取值人数的汇总（回刷前后对照），
 // 带维度的指标每个消费者有多行，按行分页、统计卡片标「行数」。
 // 登记时有映射最近一次合并失败的快照标「数据不完整」，列出失败的映射。每次请求只读挂载本租户的数据湖读取；页面上只有 consumer_id 与汇总值（分值、订单汇总、各渠道同意等），没有明文。
 // 其他租户的快照、已过期的快照返回 404
 import { AlertTriangle } from 'lucide-react';
-import { data, Link } from 'react-router';
+import { data, Form, Link } from 'react-router';
 import type { Route } from './+types/analytics.snapshots.$id';
 import { requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { DSL_KINDS } from '~/.server/pipeline/dsl';
 import { TEMPLATES } from '~/.server/pipeline/templates';
-import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readChurnSnapshot, readClvSnapshot, readCohortSnapshot, readRepurchaseSnapshot, readRfmSnapshot, readTemplateSnapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
+import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readChurnSnapshot, readClvSnapshot, readCohortSnapshot, readRepurchaseSnapshot, readRfmSnapshot, readTemplateSnapshot, readUser360Snapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
+import { Input } from '~/components/ui/input';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { StatTile } from '~/components/stat-tile';
@@ -98,6 +101,14 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
         const page = Math.min(pages, requestedPage);
         return { ...head, tab, page, pages, kind: 'cohort' as const, ...(await readCohortSnapshot(snapshot, { page })) };
+      }
+      // 用户 360（#837）：默认汇总（?tab=summary，可带 ?consumer= 查单人），逐人明细在 ?tab=consumers；两个标签都读汇总（卡片要用）
+      case 'user360': {
+        const tab = tabOf(['summary', 'consumers'] as const, 'summary');
+        const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
+        const page = Math.min(pages, requestedPage);
+        const consumer = url.searchParams.get('consumer');
+        return { ...head, tab, page, pages, kind: 'user360' as const, consumer, ...(await readUser360Snapshot(snapshot, { page, consumerId: consumer })) };
       }
       default: {
         const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
@@ -215,6 +226,7 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
       {loaderData.kind === 'repurchase' && <RepurchaseResult {...loaderData} />}
       {loaderData.kind === 'clv' && <ClvResult {...loaderData} />}
       {loaderData.kind === 'cohort' && <CohortResult {...loaderData} />}
+      {loaderData.kind === 'user360' && <User360Result {...loaderData} />}
       {loaderData.kind === 'generic' && <GenericResult {...loaderData} />}
     </AppShell>
   );
@@ -438,6 +450,82 @@ function CohortResult({ tab, page, pages, pageSize, snapshot, matrix, granularit
             </Table>
           </div>
         </div>
+      ) : (
+        <DetailTable columns={columns} rows={rows} page={page} pages={pages} pageSize={pageSize} snapshot={snapshot} href={pageHref} />
+      )}
+    </>
+  );
+}
+
+/**
+ * 用户 360 快照（#837）：默认「汇总」标签——顶部卡片写总人数、有订单人数与各渠道同意人数（按 CHANNELS 顺序），
+ * 下方按 consumer_id 查单人一行（GET 表单 ?consumer=，查不到或格式不对时给提示、页面仍 200）；
+ * 「逐人明细」标签是原来的通用分页明细（按 consumer_id 分页、全部列）
+ */
+function User360Result({ tab, page, pages, pageSize, snapshot, total, withOrders, consents, lookup, lookupError, columns, rows, consumer }: Extract<Route.ComponentProps['loaderData'], { kind: 'user360' }>) {
+  const base = `/analytics/snapshots/${snapshot.id}`;
+  const pageHref = (p: number) => `${base}?tab=consumers&page=${p}`;
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <div data-user360-total={total}>
+          <StatTile label="总人数" value={total.toLocaleString('zh-CN')} hint="打通后的统一消费者" />
+        </div>
+        <div data-user360-with-orders={withOrders}>
+          <StatTile label="有订单人数" value={withOrders.toLocaleString('zh-CN')} hint="回看窗口内 orders > 0" />
+        </div>
+        <StatTile label="参考日期" value={snapshot.asOf} hint="统计订单与同意的基准" />
+      </div>
+
+      <PillTabs
+        current={tab}
+        tabs={[
+          { key: 'summary', label: '汇总', href: base },
+          { key: 'consumers', label: '逐人明细', href: `${base}?tab=consumers` },
+        ]}
+      />
+
+      {tab === 'summary' ? (
+        <>
+          <div className="rounded-2xl border bg-white p-6 shadow-sm">
+            <h2 className="mb-4 font-medium">各渠道同意人数</h2>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+              {consents.map(c => (
+                <div key={c.channel} data-consent-channel={c.channel} className="rounded-xl border bg-slate-50 px-4 py-3">
+                  <div className="text-sm text-slate-500">{c.channel}</div>
+                  <div className="mt-1 text-xl font-semibold" data-consent-consumers={c.consumers}>{c.consumers.toLocaleString('zh-CN')}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <Form method="get" action={base} preventScrollReset className="flex max-w-2xl items-center gap-2">
+            <input type="hidden" name="tab" value="summary" />
+            <div className="flex-1">
+              <Input key={consumer ?? ''} type="search" name="consumer" defaultValue={consumer ?? ''} placeholder="按 consumer_id 查单人" aria-label="按 consumer_id 查单人" data-consumer-input />
+            </div>
+            <button type="submit" className="h-8 shrink-0 rounded-lg border px-3 text-sm hover:bg-slate-50">查询</button>
+          </Form>
+
+          {lookupError === 'invalid' && <p data-lookup-error="invalid" className="text-sm text-amber-700">consumer_id 格式不对：只允许字母、数字、下划线与连字符，最长 80 字符</p>}
+          {lookupError === 'missing' && <p data-lookup-error="missing" className="text-sm text-slate-500">这张快照里没有这个 consumer_id</p>}
+          {lookup && (
+            <div className="rounded-2xl border bg-white p-6 shadow-sm">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    {columns.map(c => <TableHead key={c}>{c}</TableHead>)}
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  <TableRow data-user360-lookup={String(lookup.consumer_id)}>
+                    {columns.map(c => <TableCell key={c} className={c === 'consumer_id' ? 'font-mono text-xs' : undefined}>{cell(lookup[c])}</TableCell>)}
+                  </TableRow>
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </>
       ) : (
         <DetailTable columns={columns} rows={rows} page={page} pages={pages} pageSize={pageSize} snapshot={snapshot} href={pageHref} />
       )}

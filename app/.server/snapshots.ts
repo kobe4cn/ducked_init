@@ -14,6 +14,7 @@ import type { MergeRecord } from './pipeline/merge-engine';
 import { insertTask } from './tasks';
 import { readResult } from './pipeline/task-contracts';
 import { TEMPLATES } from './pipeline/templates';
+import { CHANNELS } from '../lib/canonical-model';
 import type { RfmParams } from './pipeline/templates/rfm';
 import type { CohortParams } from './pipeline/templates/cohort';
 import { isDslKind, type DslKind } from './pipeline/dsl';
@@ -341,6 +342,48 @@ export async function readCohortSnapshot(snapshot: Snapshot, { page, pageSize = 
     const result = await session.con.runAndReadAll(
       `SELECT * FROM ${table} ORDER BY consumer_id LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`);
     return { matrix, granularity, columns: result.columnNames(), rows: result.getRowObjectsJson() as Record<string, unknown>[] };
+  } finally {
+    session.close();
+  }
+}
+
+/** 用户 360 汇总里各渠道的同意人数（按 CHANNELS 顺序） */
+export interface User360ConsentSummary { channel: string; consumers: number }
+
+/**
+ * 只读挂载本租户的数据湖，读出用户 360 快照：一句 count 的汇总（总人数、有订单人数 orders > 0、各渠道同意人数），
+ * 按 consumer_id 查单人一行，以及按 consumer_id 排序的第 page 页明细（列取快照表的全部列，同通用明细）。
+ * consumerId 为空时不查；先过白名单（长度与字符集）再参数绑定取行，两道都过才落到 lookup——
+ * 没过白名单记 invalid，过了但没有这一行记 missing。汇总与明细两个标签都读（卡片要用），不按标签省查询
+ */
+export async function readUser360Snapshot(snapshot: Snapshot, { page, consumerId, pageSize = CONSUMER_PAGE_SIZE }: { page: number; consumerId: string | null; pageSize?: number }) {
+  if (snapshot.template !== 'user360') throw new SnapshotError('不是用户 360 快照', 404);
+  const { session, table } = await openSnapshotTable(snapshot);
+  const read = async <T>(sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+  try {
+    // 列名只来自 CHANNELS 常量；count(*) 是 BIGINT，读出来是字符串，一律 Number()
+    const [summary] = await read<Record<string, string>>(
+      `SELECT count(*) AS total, count(*) FILTER (WHERE orders > 0) AS with_orders, ${
+        CHANNELS.map(c => `count(*) FILTER (WHERE consent_${c}) AS consent_${c}`).join(', ')} FROM ${table}`);
+    // 单人：id 先过白名单（长度与字符集），再参数绑定查一行，不把 id 拼进 SQL
+    const idOk = !!consumerId && /^[0-9A-Za-z_-]{1,80}$/.test(consumerId);
+    const lookup = consumerId && idOk
+      ? (await session.con.runAndReadAll(`SELECT * FROM ${table} WHERE consumer_id = $1`, [consumerId])).getRowObjectsJson()[0] ?? null
+      : null;
+    let lookupError: 'invalid' | 'missing' | null = null;
+    if (consumerId && !idOk) lookupError = 'invalid';
+    else if (consumerId && !lookup) lookupError = 'missing';
+    const result = await session.con.runAndReadAll(
+      `SELECT * FROM ${table} ORDER BY consumer_id LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`);
+    return {
+      total: Number(summary?.total ?? 0),
+      withOrders: Number(summary?.with_orders ?? 0),
+      consents: CHANNELS.map((c): User360ConsentSummary => ({ channel: c, consumers: Number(summary?.[`consent_${c}`] ?? 0) })),
+      lookup,
+      lookupError,
+      columns: result.columnNames(),
+      rows: result.getRowObjectsJson() as Record<string, unknown>[],
+    };
   } finally {
     session.close();
   }
