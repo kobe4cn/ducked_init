@@ -509,6 +509,10 @@ describe('用户 360 模板参数页与快照（通用表单与汇总视图）',
     // 查到的一行带全部列，输入框回显这个 id
     for (const column of ['consumer_id', 'orders', 'monetary', 'recency_days', 'consent_email']) expect(found).toMatch(new RegExp(`<th[^>]*>${column}</th>`));
     expect(found).toContain(`value="${realId}"`);
+    // 这一行的同意列显示是 / 否，不是 true / false
+    const lookupRow = found.match(/<tr[^>]*data-user360-lookup[^>]*>([\s\S]*?)<\/tr>/)![1]!;
+    expect(lookupRow).toMatch(/>(是|否)</);
+    expect(lookupRow).not.toMatch(/>(true|false)</);
 
     const missing = await browser.get(`/analytics/snapshots/${snapshot.id}?consumer=no-such-id`);
     expect(missing.status).toBe(200);
@@ -518,7 +522,9 @@ describe('用户 360 模板参数页与快照（通用表单与汇总视图）',
 
     const injection = await browser.get(`/analytics/snapshots/${snapshot.id}?consumer=${encodeURIComponent("' OR 1=1 --")}`);
     expect(injection.status).toBe(200);
-    expect(await injection.text()).toContain('consumer_id 格式不对');
+    const injectionHtml = await injection.text();
+    expect(injectionHtml).toContain('consumer_id 格式不对');
+    expect(injectionHtml).not.toContain('data-user360-lookup=');
     for (const p of PLAINTEXT) expect(found).not.toContain(p);
   });
 });
