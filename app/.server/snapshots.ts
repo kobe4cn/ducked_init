@@ -252,6 +252,65 @@ export async function readChurnSnapshot(
   }
 }
 
+/**
+ * 只读挂载本租户的数据湖，读出复购快照：总人数与复购人数、到第二单天数的中位数（median 自动跳过 NULL，没人有第二单时为 null），
+ * 以及按 consumer_id 排序的第 page 页明细（列取快照表的全部列，同通用明细）
+ */
+export async function readRepurchaseSnapshot(snapshot: Snapshot, { page, pageSize = CONSUMER_PAGE_SIZE }: { page: number; pageSize?: number }) {
+  if (snapshot.template !== 'repurchase') throw new SnapshotError('不是复购快照', 404);
+  const { session, table } = await openSnapshotTable(snapshot);
+  try {
+    const [summary] = (await session.con.runAndReadAll(
+      `SELECT count(*) AS total, count(*) FILTER (WHERE repurchased) AS repurchased, median(days_to_second) AS median_days_to_second FROM ${table}`,
+    )).getRowObjectsJson() as { total: string; repurchased: string; median_days_to_second: number | null }[];
+    const result = await session.con.runAndReadAll(
+      `SELECT * FROM ${table} ORDER BY consumer_id LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`);
+    return {
+      total: Number(summary?.total ?? 0),
+      repurchased: Number(summary?.repurchased ?? 0),
+      medianDaysToSecond: summary?.median_days_to_second ?? null,
+      columns: result.columnNames(),
+      rows: result.getRowObjectsJson() as Record<string, unknown>[],
+    };
+  } finally {
+    session.close();
+  }
+}
+
+/** CLV 快照十档分布里的一档：decile 从 1（clv 最高的 10%）起 */
+export interface ClvDecile { decile: number; consumers: number; clv: string }
+
+/**
+ * 只读挂载本租户的数据湖，读出 CLV 快照：clv 总额、前 10%（第 1 档）贡献的占比（总 clv 为 0 时不除零，为 null）、
+ * 按 clv 从高到低（同值按 consumer_id）ntile(10) 分档的每档人数与合计（只列有人的档），以及按 consumer_id 排序的第 page 页明细
+ */
+export async function readClvSnapshot(snapshot: Snapshot, { page, pageSize = CONSUMER_PAGE_SIZE }: { page: number; pageSize?: number }) {
+  if (snapshot.template !== 'clv') throw new SnapshotError('不是 CLV 快照', 404);
+  const { session, table } = await openSnapshotTable(snapshot);
+  const read = async <T>(sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+  try {
+    const decileRows = await read<{ decile: number; consumers: string; clv: string | null }>(`
+      SELECT decile, count(*) AS consumers, sum(clv)::VARCHAR AS clv FROM (
+        SELECT ntile(10) OVER (ORDER BY clv DESC, consumer_id) AS decile, clv FROM ${table}
+      ) GROUP BY decile ORDER BY decile`);
+    const [totals] = await read<{ total_clv: string }>(`SELECT coalesce(sum(clv), 0)::VARCHAR AS total_clv FROM ${table}`);
+    const totalClv = totals?.total_clv ?? '0';
+    const top = decileRows.find(d => Number(d.decile) === 1);
+    const topShare = Number(totalClv) > 0 && top ? Number(top.clv ?? 0) / Number(totalClv) : null;
+    const result = await session.con.runAndReadAll(
+      `SELECT * FROM ${table} ORDER BY consumer_id LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`);
+    return {
+      totalClv,
+      topShare,
+      deciles: decileRows.map((d): ClvDecile => ({ decile: Number(d.decile), consumers: Number(d.consumers), clv: d.clv ?? '0.00' })),
+      columns: result.columnNames(),
+      rows: result.getRowObjectsJson() as Record<string, unknown>[],
+    };
+  } finally {
+    session.close();
+  }
+}
+
 /** 标签快照各取值的人数（tagSummary），NULL 取值的 value 为 null */
 export interface TagValueSummary { value: string | null; consumers: number }
 

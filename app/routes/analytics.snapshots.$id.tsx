@@ -1,6 +1,8 @@
 // app/routes/analytics.snapshots.$id.tsx —— 分析模板快照结果（有结果层查看权限的成员）。loader 按模板分派：
 // RFM：各人群的人数与金额（?tab=segments），按 consumer_id 分页的消费者明细（?tab=consumers&page=N）；
 // 流失预警（#834）：顶部汇总卡片（有风险人数、占比、总人数），明细默认只列有风险（at_risk）的人、按沉默比从高到低（?tab=all 看全部）；
+// 复购（#835）：顶部卡片写复购率（X / Y 人）与到第二单天数中位数（没人有第二单时为「—」），下方通用分页明细；
+// CLV（#835）：顶部卡片写前 10% 的人贡献的 clv 占比（总 clv 为 0 时为「—」）与合计，下方十档分布表（每档人数与 clv 合计，只列有人的档），再下方通用分页明细；
 // 其他模板（含指标 / 标签 DSL 快照，#816）：按 consumer_id（DSL 按全部列）分页的通用明细（?page=N），列取快照表的全部列，
 // DSL 快照页头写定义（类型与键）、定义版本、统计日与来源，标签在明细上方带各取值人数的汇总（回刷前后对照），
 // 带维度的指标每个消费者有多行，按行分页、统计卡片标「行数」。
@@ -13,7 +15,7 @@ import { requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { DSL_KINDS } from '~/.server/pipeline/dsl';
 import { TEMPLATES } from '~/.server/pipeline/templates';
-import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readChurnSnapshot, readRfmSnapshot, readTemplateSnapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
+import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readChurnSnapshot, readClvSnapshot, readRepurchaseSnapshot, readRfmSnapshot, readTemplateSnapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { PageHeader } from '~/components/page-header';
@@ -77,6 +79,17 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         const tab = tabOf(['at-risk', 'all'] as const, 'at-risk');
         return { ...head, tab, kind: 'churn' as const, ...(await readChurnSnapshot(snapshot, { page: requestedPage, filter: tab })) };
       }
+      // 复购与 CLV（#835）：明细不筛选，页数按快照行数算（同 default 分支），只是多读一份顶部汇总
+      case 'repurchase': {
+        const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
+        const page = Math.min(pages, requestedPage);
+        return { ...head, page, pages, kind: 'repurchase' as const, ...(await readRepurchaseSnapshot(snapshot, { page })) };
+      }
+      case 'clv': {
+        const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
+        const page = Math.min(pages, requestedPage);
+        return { ...head, page, pages, kind: 'clv' as const, ...(await readClvSnapshot(snapshot, { page })) };
+      }
       default: {
         const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
         const page = Math.min(pages, requestedPage);
@@ -110,6 +123,41 @@ function Pager({ page, pages, pageSize, unit = '位', href }: { page: number; pa
         {page > 1 && <Link to={href(page - 1)} className="hover:underline">← 上一页</Link>}
         {page < pages && <Link to={href(page + 1)} className="hover:underline">下一页 →</Link>}
       </div>
+    </div>
+  );
+}
+
+/**
+ * 通用分页明细：列取快照表的全部列（空值 —、BOOLEAN 是 / 否、列表顿号连接），第 page 页按 consumer_id（DSL 按全部列）排好序。
+ * 通用视图与复购 / CLV（#835）的明细都用它
+ */
+function DetailTable({ columns, rows, page, pages, pageSize, unit, snapshot }: {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  page: number;
+  pages: number;
+  pageSize: number;
+  unit?: string;
+  snapshot: { id: string };
+}) {
+  return (
+    <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            {columns.map(c => <TableHead key={c}>{c}</TableHead>)}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.map((r, i) => (
+            // 带维度的指标每个消费者有多行，行键不能只用 consumer_id
+            <TableRow key={i} data-consumer={String(r.consumer_id)}>
+              {columns.map(c => <TableCell key={c} className={c === 'consumer_id' ? 'font-mono text-xs' : undefined}>{cell(r[c])}</TableCell>)}
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+      <Pager page={page} pages={pages} pageSize={pageSize} unit={unit} href={p => `/analytics/snapshots/${snapshot.id}?page=${p}`} />
     </div>
   );
 }
@@ -153,6 +201,8 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
 
       {loaderData.kind === 'rfm' && <RfmResult {...loaderData} />}
       {loaderData.kind === 'churn' && <ChurnResult {...loaderData} />}
+      {loaderData.kind === 'repurchase' && <RepurchaseResult {...loaderData} />}
+      {loaderData.kind === 'clv' && <ClvResult {...loaderData} />}
       {loaderData.kind === 'generic' && <GenericResult {...loaderData} />}
     </AppShell>
   );
@@ -188,24 +238,7 @@ function GenericResult({ page, pages, pageSize, snapshot, columns, rows, tagSumm
           </Table>
         </div>
       )}
-      <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              {columns.map(c => <TableHead key={c}>{c}</TableHead>)}
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((r, i) => (
-              // 带维度的指标每个消费者有多行，行键不能只用 consumer_id
-              <TableRow key={i} data-consumer={String(r.consumer_id)}>
-                {columns.map(c => <TableCell key={c} className={c === 'consumer_id' ? 'font-mono text-xs' : undefined}>{cell(r[c])}</TableCell>)}
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-        <Pager page={page} pages={pages} pageSize={pageSize} unit={dsl ? '行' : '位'} href={p => `/analytics/snapshots/${snapshot.id}?page=${p}`} />
-      </div>
+      <DetailTable columns={columns} rows={rows} page={page} pages={pages} pageSize={pageSize} unit={dsl ? '行' : '位'} snapshot={snapshot} />
     </>
   );
 }
@@ -259,6 +292,75 @@ function ChurnResult({ tab, page, pages, pageSize, snapshot, total, atRisk, rows
         </Table>
         <Pager page={page} pages={pages} pageSize={pageSize} href={pageHref} />
       </div>
+    </>
+  );
+}
+
+/** 复购快照（#835）：顶部卡片写复购率（X / Y 人）与到第二单天数中位数，下方按 consumer_id 的通用分页明细 */
+function RepurchaseResult({ page, pages, pageSize, snapshot, total, repurchased, medianDaysToSecond, columns, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'repurchase' }>) {
+  const rate = total ? `${((repurchased / total) * 100).toFixed(1)}%` : '—';
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <div data-repurchase-rate={rate}>
+          <StatTile label="复购率" value={rate} hint={`${repurchased} / ${total} 人`} />
+        </div>
+        <div data-median-days={medianDaysToSecond === null ? '—' : `${medianDaysToSecond} 天`}>
+          <StatTile label="到第二单天数中位数" value={medianDaysToSecond === null ? '—' : `${medianDaysToSecond} 天`} hint="只算有第二单的人" />
+        </div>
+        <div data-repurchase-count={repurchased}>
+          <StatTile label="复购人数" value={repurchased.toLocaleString('zh-CN')} hint="第二单落在复购窗口内" />
+        </div>
+        <div data-total-count={total}>
+          <StatTile label="总人数" value={total.toLocaleString('zh-CN')} hint="回看窗口内下过单的消费者" />
+        </div>
+      </div>
+
+      <DetailTable columns={columns} rows={rows} page={page} pages={pages} pageSize={pageSize} snapshot={snapshot} />
+    </>
+  );
+}
+
+/**
+ * CLV 快照（#835）：顶部卡片写前 10% 的人（clv 最高的第 1 档）贡献的占比与合计，下方按 clv 从高到低分十档
+ * （每档人数与 clv 合计，只列有人的档），再下方按 consumer_id 的通用分页明细
+ */
+function ClvResult({ page, pages, pageSize, snapshot, totalClv, topShare, deciles, columns, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'clv' }>) {
+  const share = topShare === null ? '—' : `${(topShare * 100).toFixed(1)}%`;
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <div data-clv-top-share={share}>
+          <StatTile label="前 10% 的人贡献的 clv 占比" value={share} hint="clv 最高的第 1 档合计 ÷ 总额" />
+        </div>
+        <StatTile label="CLV 合计" value={money(totalClv)} hint="回看窗口内全部消费者的 clv" />
+        <StatTile label="消费者" value={snapshot.rowCount.toLocaleString('zh-CN')} hint="打通后的统一消费者" />
+        <StatTile label="参考日期" value={snapshot.asOf} hint="计算 clv 的基准日" />
+      </div>
+
+      <div className="rounded-2xl border bg-white p-6 shadow-sm">
+        <h2 className="mb-4 font-medium">CLV 十档分布</h2>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>档位</TableHead>
+              <TableHead>人数</TableHead>
+              <TableHead>clv 合计</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {deciles.map(d => (
+              <TableRow key={d.decile} data-clv-decile={d.decile}>
+                <TableCell className="font-medium">{`第 ${d.decile} 档${d.decile === 1 ? '（最高）' : ''}`}</TableCell>
+                <TableCell>{d.consumers.toLocaleString('zh-CN')}</TableCell>
+                <TableCell>{money(d.clv)}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+
+      <DetailTable columns={columns} rows={rows} page={page} pages={pages} pageSize={pageSize} snapshot={snapshot} />
     </>
   );
 }

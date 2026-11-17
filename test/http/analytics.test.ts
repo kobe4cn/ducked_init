@@ -3,6 +3,7 @@
 // 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm；按生效版本重新计算（分析师 403、未来日期与重复入队被拒）；
 // 用户 360 走注册表里的通用参数表单（只读、起草、校验报错、多余字段不传、发布后入队 gold.user360、未登记模板 404）与通用快照明细（全部列、是 / 否、分页、没有明文）
 // 流失预警快照页（#834）：顶部汇总卡片写有风险人数、占比与总人数（与湖上一致），明细默认只列有风险的人（沉默比从高到低），?tab=all 看全部，分页总数按筛选后的行数算
+// 复购与 CLV 快照页（#835）：复购率（X / Y 人）与到第二单天数中位数、CLV 头部 10% 贡献占比与十档分布（与湖上一致，空值显示「—」），下方仍是按 consumer_id 的通用分页明细，没有明文
 // 同期群与复购同样走通用表单（周期下拉框、起草、双人发布入队 gold.cohort / gold.repurchase 并登记快照，周期偏移列表用顿号连接）；
 // 模板升级（测试开关 TEMPLATE_TEST_VERSIONS=1）：提示条、预览差异（RFM 分群迁移表、流失预警变化人数，没有 consumer_id）、分析师起草升级但发布 403；
 // 指标与标签（DSL）快照详情（#816）：定义页「快照」区未过期的行点统计日进快照详情页，DSL 快照走通用明细（页头写类型、键、版本、统计日与来源，按行分页），
@@ -538,6 +539,115 @@ describe('流失预警快照页（#834）', () => {
     expect(last.page).toBe(2);
     expect([...first.rows, ...last.rows].map(r => r.consumer_id)).toEqual(expected.allIds);
     expect([...first.rows, ...last.rows].filter(r => r.at_risk)).toHaveLength(2);
+  });
+});
+
+describe('复购与 CLV 快照页（#835）', () => {
+  beforeEach(fresh);
+
+  /** 在湖上按同一口径算出这张复购快照的汇总：总人数、复购人数与到第二单天数的中位数（median 自动跳过 NULL） */
+  const repurchaseExpected = async (tenantId: string, snapshot: { table: string }) => {
+    const [schema, name] = snapshot.table.split('.');
+    const table = `${schema}."${name}"`;
+    const [totals] = await onLake<{ total: string; repurchased: string; median_days_to_second: number | null }>(tenantId,
+      `SELECT count(*) AS total, count(*) FILTER (WHERE repurchased) AS repurchased, median(days_to_second) AS median_days_to_second FROM ${table}`);
+    return { total: Number(totals!.total), repurchased: Number(totals!.repurchased), medianDaysToSecond: totals!.median_days_to_second };
+  };
+
+  /** 在湖上按同一口径算出这张 CLV 快照的十档分布（ntile 同值按 consumer_id 排序，分档才稳定）与头部 10% 的贡献占比 */
+  const clvExpected = async (tenantId: string, snapshot: { table: string }) => {
+    const [schema, name] = snapshot.table.split('.');
+    const table = `${schema}."${name}"`;
+    const deciles = await onLake<{ decile: number; consumers: string; clv: string | null }>(tenantId, `
+      SELECT decile, count(*) AS consumers, sum(clv)::VARCHAR AS clv FROM (
+        SELECT ntile(10) OVER (ORDER BY clv DESC, consumer_id) AS decile, clv FROM ${table}
+      ) GROUP BY decile ORDER BY decile`);
+    const [total] = await onLake<{ total_clv: string | null }>(tenantId, `SELECT coalesce(sum(clv), 0)::VARCHAR AS total_clv FROM ${table}`);
+    const top = deciles.find(d => Number(d.decile) === 1);
+    return {
+      deciles: deciles.map(d => ({ decile: Number(d.decile), consumers: Number(d.consumers), clv: Number(d.clv ?? 0) })),
+      totalClv: Number(total!.total_clv ?? 0),
+      topShare: Number(total!.total_clv ?? 0) > 0 && top ? Number(top.clv ?? 0) / Number(total!.total_clv) : null,
+    };
+  };
+
+  const consumerIds = (html: string) => [...html.matchAll(/data-consumer="([^"]+)"/g)].map(m => m[1]!);
+  /** 页面上金额的写法（与路由里的 money 一致） */
+  const money = (n: number) => `¥${n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  it('复购页顶部卡片写复购率（X / Y 人）与到第二单天数中位数（与湖上一致），下方有按 consumer_id 升序的分页明细；页面上没有明文', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await runTask(acme, 'gold.repurchase', { asOf: '2024-07-01' });
+    const snapshot = (await listSnapshots(acme, 'repurchase'))[0]!;
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    const expected = await repurchaseExpected(acme, snapshot);
+    // 默认 windowDays 90：crm 4 与 crm 5 在窗口内复购（相隔 29 与 80 天），中位数 (29+80)/2
+    expect(expected).toMatchObject({ total: 5, repurchased: 2, medianDaysToSecond: 54.5 });
+
+    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
+    expect(html).toContain('复购 · 2024-07-01');
+    expect(html).toContain(`data-repurchase-rate="${((expected.repurchased / expected.total) * 100).toFixed(1)}%"`);
+    expect(html).toContain(`data-repurchase-count="${expected.repurchased}"`);
+    expect(html).toContain(`data-total-count="${expected.total}"`);
+    expect(html).toContain(`data-median-days="${expected.medianDaysToSecond} 天"`);
+    expect(html).toContain(`${expected.repurchased} / ${expected.total} 人`);
+    // 明细按 consumer_id 升序分页（通用明细，不筛选）
+    expect(consumerIds(html)).toEqual([...consumerIds(html)].sort());
+    expect(html).toContain('第 1 / 1 页');
+    for (const p of PLAINTEXT) expect(html).not.toContain(p);
+  });
+
+  it('CLV 页顶部卡片写前 10% 的人贡献的 clv 占比、CLV 合计，十档表的人数与合计和湖上 ntile(10) 分组一致；下方有分页明细；页面上没有明文', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await runTask(acme, 'gold.clv', { asOf: '2024-07-01' });
+    const snapshot = (await listSnapshots(acme, 'clv'))[0]!;
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    const expected = await clvExpected(acme, snapshot);
+    // 这份数据只有 5 位消费者：只列出有人的 5 档，每档 1 人，第 1 档就是 clv 最高的那位
+    expect(expected.deciles.map(d => d.consumers)).toEqual([1, 1, 1, 1, 1]);
+
+    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
+    expect(html).toContain('CLV · 2024-07-01');
+    expect(html).toContain(`data-clv-top-share="${(expected.topShare! * 100).toFixed(1)}%"`);
+    expect(html).toContain(money(expected.totalClv));
+    // 十档表只列有人的档，每行的人数与 clv 合计与湖上分组一致
+    const decileRows = [...html.matchAll(/data-clv-decile="(\d+)"([\s\S]*?)(?=data-clv-decile=|<\/tbody>)/g)];
+    expect(decileRows.map(m => Number(m[1]))).toEqual(expected.deciles.map(d => d.decile));
+    for (const [i, row] of decileRows.entries()) {
+      expect(row[2]).toContain(String(expected.deciles[i]!.consumers));
+      expect(row[2]).toContain(money(expected.deciles[i]!.clv));
+    }
+    expect(html).toContain('第 1 / 1 页');
+    expect(consumerIds(html)).toEqual([...consumerIds(html)].sort());
+    for (const p of PLAINTEXT) expect(html).not.toContain(p);
+  });
+
+  it('没人复购时天数中位数显示「—」（复购率为 0.0%）、总 clv 为 0 时头部占比显示「—」，不除零；明细照常', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await runTask(acme, 'gold.repurchase', { asOf: '2024-07-01' });
+    await runTask(acme, 'gold.clv', { asOf: '2024-07-01' });
+    const repurchase = (await listSnapshots(acme, 'repurchase'))[0]!;
+    const clv = (await listSnapshots(acme, 'clv'))[0]!;
+    // 在湖上直接改快照表：没有人有第二单、clv 全为 0
+    const tableOf = (s: { table: string }) => { const [schema, name] = s.table.split('.'); return `${schema}."${name}"`; };
+    await onLake(acme, `UPDATE ${tableOf(repurchase)} SET days_to_second = NULL, repurchased = false`);
+    await onLake(acme, `UPDATE ${tableOf(clv)} SET clv = 0`);
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    const repurchaseHtml = await (await browser.get(`/analytics/snapshots/${repurchase.id}`)).text();
+    expect(repurchaseHtml).toContain('data-repurchase-rate="0.0%"');
+    expect(repurchaseHtml).toContain('data-median-days="—"');
+    expect(repurchaseHtml).toContain('data-repurchase-count="0"');
+    expect(repurchaseHtml).toContain('第 1 / 1 页');
+
+    const clvHtml = await (await browser.get(`/analytics/snapshots/${clv.id}`)).text();
+    expect(clvHtml).toContain('data-clv-top-share="—"');
+    expect(clvHtml).toContain('第 1 / 1 页');
   });
 });
 
