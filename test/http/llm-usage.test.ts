@@ -258,4 +258,19 @@ describe('模型调用统计', () => {
     expect(clamped).toContain('第 2 / 2 页');
     expect(clamped).toContain(`data-call-id="${ids[54]}"`);
   });
+
+  it('明细每行显示来源：tenant 是「租户」、platform 是「平台」、旧行（迁移前，为空）是「—」', async () => {
+    const acme = await newTenant('acme');
+    const [tenant, platform, legacy] = (await getDb().insert(llmCalls).values([
+      { tenantId: acme, purpose: 'connectivity', model: 'deepseek-chat', durationMs: 100, createdAt: ago(1), source: 'tenant' },
+      { tenantId: acme, purpose: 'embedding', model: 'text-embedding-v3', durationMs: 100, createdAt: ago(1), source: 'platform' },
+      { tenantId: acme, purpose: 'assistant', model: 'qwen-plus', durationMs: 100, createdAt: ago(1) }, // 迁移前的旧行：source 为空
+    ]).returning({ id: llmCalls.id })).map(r => r.id);
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const html = await (await admin.get('/llm-usage')).text();
+    expect(usageCell(callRow(html, tenant), 'source')).toBe('租户');
+    expect(usageCell(callRow(html, platform), 'source')).toBe('平台');
+    expect(usageCell(callRow(html, legacy), 'source')).toBe('—');
+  });
 });

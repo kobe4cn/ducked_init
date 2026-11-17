@@ -80,6 +80,8 @@ describe('AI 助手的一轮问答', () => {
     const logged = await calls(acme);
     expect(logged).toHaveLength(2);
     expect(logged.every(c => c.purpose === 'assistant' && c.route === 'reasoning' && c.error === null)).toBe(true);
+    // 助手一轮的每条调用都记 source（#843；这里全程平台端点）
+    expect(logged.every(c => c.source === 'platform')).toBe(true);
   });
 
   it('工具出错（没有权限、参数不是 JSON）时把错误文本回填给模型，本轮继续', async () => {

@@ -183,7 +183,7 @@ export async function usageAcrossTenants(days: 7 | 30): Promise<TenantModelUsage
 
 /** 明细行取 `llm_calls` 的一部分列（见 listCalls 的 select）加折算好的金额 */
 export type LlmCallRow = Pick<typeof llmCalls.$inferSelect,
-  'id' | 'createdAt' | 'purpose' | 'model' | 'promptTokens' | 'completionTokens' | 'durationMs' | 'schemaValid' | 'error'> & { cost: string };
+  'id' | 'createdAt' | 'purpose' | 'model' | 'source' | 'promptTokens' | 'completionTokens' | 'durationMs' | 'schemaValid' | 'error'> & { cost: string };
 
 /** 最近调用明细（时间倒序）分页：页码夹到 1..pages，total 是窗口内的总条数；每行按当前单价折算金额（ADR-0057） */
 export async function listCalls(tenantId: string, days: 7 | 30, page: number) {
@@ -200,6 +200,7 @@ export async function listCalls(tenantId: string, days: 7 | 30, page: number) {
     createdAt: llmCalls.createdAt,
     purpose: llmCalls.purpose,
     model: llmCalls.model,
+    source: llmCalls.source,
     promptTokens: llmCalls.promptTokens,
     completionTokens: llmCalls.completionTokens,
     durationMs: llmCalls.durationMs,

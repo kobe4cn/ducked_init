@@ -62,6 +62,9 @@ describe('模型服务客户端', () => {
     expect(received[0].url).toBe('https://platform.example.com/v1/chat/completions');
     expect(received[0].headers.get('authorization')).toBe('Bearer sk-platform-secret');
     expect(received[0].body).toEqual({ model: 'qwen-plus', messages: MESSAGES, response_format: { type: 'json_object' }, temperature: 0 });
+    // 平台默认端点解析出的调用记 source='platform'（#843）
+    const [row] = await calls(acme);
+    expect(row.source).toBe('platform');
   });
 
   it('租户有自己的配置时整套用租户的，库里不存 Key 明文', async () => {
@@ -77,6 +80,9 @@ describe('模型服务客户端', () => {
     const [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
     expect(row.apiKey).not.toContain('sk-tenant-secret');
     expect(await resolveProvider(acme)).toMatchObject({ source: 'tenant', model: 'deepseek-chat' });
+    // 租户端点的调用记 source='tenant'（#843）
+    const [logged] = await calls(acme);
+    expect(logged.source).toBe('tenant');
   });
 
   it('租户与平台都没有配置时报错且不发请求', async () => {
@@ -391,6 +397,9 @@ describe('embedding 端点', () => {
     expect(await resolveEmbeddingProvider(acme)).toMatchObject({ source: 'platform', model: 'text-embedding-v3' });
     await embed(acme, ['成交额']);
     expect(received[0].url).toBe('https://embed.example.com/v1/embeddings');
+    // chat 用租户端点不影响 embedding：日志的 source 跟着这次用的端点走，记 'platform'（#843）
+    const [row] = await calls(acme);
+    expect(row.source).toBe('platform');
   });
 
   it('租户配了 embedding 三项时整套用租户的，库里不存 Key 明文', async () => {
@@ -406,6 +415,9 @@ describe('embedding 端点', () => {
     expect(received[0].body.model).toBe('bge-m3');
     const [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
     expect(row.embeddingApiKey).not.toContain('sk-tenant-embed-secret');
+    // 租户 embedding 端点的调用记 source='tenant'（#843）
+    const [logged] = await calls(acme);
+    expect(logged.source).toBe('tenant');
   });
 
   it('两边都没配置时返回 null，不发请求、不写 llm_calls（chat 的配置不算数）', async () => {
