@@ -1,16 +1,18 @@
 // app/.server/catalog/embeddings.ts —— 检索投影文字的向量缓存（ADR-0047、0049）：按（租户, 模型, 文本哈希）缓存 embedding，由调度器在后台补算。
 // 向量是昂贵的派生计算：丢了可以重算、不参与权限判断；换 embedding 模型后旧模型的行命中不了，补算时删掉。
+// 向量读写一律经 VectorStore 接口（ADR-0058）的系统自带实现 platformStore，不直接查 catalog_embeddings；外部实现由后续子票接入。
 // vectorHits 是查询时的向量一路：对查询算一次 embedding（短超时）后读缓存排行次，失败只去掉这一路、不拖垮关键词检索；
 // 缓存补齐由 ensureEmbeddings 入队去重，fillEmbeddings 在任务的调度器结束钩子里补算
-import { and, eq, inArray, ne, notInArray } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { cmp } from '../../lib/compare';
 import type { Tx } from '../audit';
 import { getDb } from '../db/client';
-import { catalogEmbeddings, catalogProjection, tasks } from '../db/schema';
+import { catalogProjection, tasks } from '../db/schema';
 import { embedWith, resolveEmbeddingProvider } from '../llm';
 import { insertTask } from '../tasks';
 import type { ProjectionRow } from './projection';
 import { vectorLane, type VectorHit } from './vector';
+import { platformStore } from './vector-store';
 
 /** 每批补算的条数：一次 /embeddings 请求的输入条数 */
 export const EMBED_BATCH = 64;
@@ -20,11 +22,7 @@ export const QUERY_EMBED_TIMEOUT_MS = 3000;
 
 /** 读当前模型下这些文本哈希的向量：只按（租户, 模型, 文本哈希）命中，旧模型与别的租户的行不算 */
 export async function readEmbeddings(tenantId: string, model: string, hashes: string[]): Promise<Map<string, number[]>> {
-  if (!hashes.length) return new Map();
-  const rows = await getDb().select({ textHash: catalogEmbeddings.textHash, vector: catalogEmbeddings.vector })
-    .from(catalogEmbeddings)
-    .where(and(eq(catalogEmbeddings.tenantId, tenantId), eq(catalogEmbeddings.modelId, model), inArray(catalogEmbeddings.textHash, hashes)));
-  return new Map(rows.map(r => [r.textHash, r.vector]));
+  return platformStore(tenantId).read(model, hashes);
 }
 
 /** 该租户两类投影里不同的（文本哈希, 文本），按哈希排序，补算的分批顺序确定 */
@@ -32,13 +30,6 @@ async function projectionTexts(db: Tx | ReturnType<typeof getDb>, tenantId: stri
   const rows = await db.selectDistinct({ textHash: catalogProjection.textHash, text: catalogProjection.text })
     .from(catalogProjection).where(eq(catalogProjection.tenantId, tenantId));
   return rows.sort((a, b) => cmp(a.textHash, b.textHash));
-}
-
-/** 当前模型下该租户已有向量的文本哈希 */
-async function embeddedHashes(db: Tx | ReturnType<typeof getDb>, tenantId: string, model: string) {
-  const rows = await db.select({ textHash: catalogEmbeddings.textHash }).from(catalogEmbeddings)
-    .where(and(eq(catalogEmbeddings.tenantId, tenantId), eq(catalogEmbeddings.modelId, model)));
-  return new Set(rows.map(r => r.textHash));
 }
 
 /**
@@ -49,9 +40,11 @@ async function embeddedHashes(db: Tx | ReturnType<typeof getDb>, tenantId: strin
 export async function ensureEmbeddings(tenantId: string): Promise<'queued' | 'fresh' | 'off'> {
   const provider = await resolveEmbeddingProvider(tenantId);
   if (!provider) return 'off';
+  // 读哈希经 store，不在下面的事务里：store 可能是没法和平台事务放在一起的外部实现（ADR-0058），
+  // 判断 fresh 只是提示，入队去重仍在事务里，读到的哈希偏旧至多多排一个任务
+  const existing = await platformStore(tenantId).hashes(provider.model);
   return getDb().transaction(async tx => {
     const wanted = await projectionTexts(tx, tenantId);
-    const existing = await embeddedHashes(tx, tenantId, provider.model);
     if (wanted.every(r => existing.has(r.textHash))) return 'fresh';
     const [pending] = await tx.select({ id: tasks.id }).from(tasks)
       .where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'catalog.embed'), inArray(tasks.status, ['queued', 'running']))).limit(1);
@@ -68,23 +61,18 @@ export async function ensureEmbeddings(tenantId: string): Promise<'queued' | 'fr
 export async function fillEmbeddings(tenantId: string): Promise<void> {
   const provider = await resolveEmbeddingProvider(tenantId);
   if (!provider) return;
-  const db = getDb();
-  const wanted = await projectionTexts(db, tenantId);
-  const existing = await embeddedHashes(db, tenantId, provider.model);
+  const store = platformStore(tenantId);
+  const wanted = await projectionTexts(getDb(), tenantId);
+  const existing = await store.hashes(provider.model);
   const missing = wanted.filter(r => !existing.has(r.textHash));
   for (let i = 0; i < missing.length; i += EMBED_BATCH) {
     const batch = missing.slice(i, i + EMBED_BATCH);
     const vectors = await embedWith(tenantId, provider, batch.map(r => r.text));
-    await db.insert(catalogEmbeddings).values(batch.map((r, j) => ({
-      tenantId, modelId: provider.model, textHash: r.textHash,
-      dimension: vectors[j].length, vector: vectors[j],
-    }))).onConflictDoNothing(); // 两个调度器的钩子可能同时补：谁先写上都行
+    await store.upsert(provider.model, batch.map((r, j) => ({ textHash: r.textHash, vector: vectors[j] })));
   }
-  await db.delete(catalogEmbeddings)
-    .where(and(eq(catalogEmbeddings.tenantId, tenantId), ne(catalogEmbeddings.modelId, provider.model)));
-  const hashes = wanted.map(r => r.textHash);
-  if (hashes.length) await db.delete(catalogEmbeddings).where(and(
-    eq(catalogEmbeddings.tenantId, tenantId), eq(catalogEmbeddings.modelId, provider.model), notInArray(catalogEmbeddings.textHash, hashes)));
+  await store.deleteOtherModels(provider.model);
+  const keep = wanted.map(r => r.textHash);
+  if (keep.length) await store.deleteMissing(provider.model, keep);
 }
 
 /**
