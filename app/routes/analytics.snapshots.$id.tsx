@@ -1,6 +1,8 @@
-// app/routes/analytics.snapshots.$id.tsx —— 分析模板快照结果（有结果层查看权限的成员）。RFM：各人群的人数与金额（?tab=segments），
-// 按 consumer_id 分页的消费者明细（?tab=consumers&page=N）；其他模板：按 consumer_id 分页的通用明细（?page=N），列取快照表的全部列。
-// 指标与标签（DSL）快照同样走通用明细（#816）：页头写定义（类型与键）、定义版本、统计日与来源，标签在明细上方带各取值人数的汇总（回刷前后对照），
+// app/routes/analytics.snapshots.$id.tsx —— 分析模板快照结果（有结果层查看权限的成员）。loader 按模板分派：
+// RFM：各人群的人数与金额（?tab=segments），按 consumer_id 分页的消费者明细（?tab=consumers&page=N）；
+// 流失预警（#834）：顶部汇总卡片（有风险人数、占比、总人数），明细默认只列有风险（at_risk）的人、按沉默比从高到低（?tab=all 看全部）；
+// 其他模板（含指标 / 标签 DSL 快照，#816）：按 consumer_id（DSL 按全部列）分页的通用明细（?page=N），列取快照表的全部列，
+// DSL 快照页头写定义（类型与键）、定义版本、统计日与来源，标签在明细上方带各取值人数的汇总（回刷前后对照），
 // 带维度的指标每个消费者有多行，按行分页、统计卡片标「行数」。
 // 登记时有映射最近一次合并失败的快照标「数据不完整」，列出失败的映射。每次请求只读挂载本租户的数据湖读取；页面上只有 consumer_id 与汇总值（分值、订单汇总、各渠道同意等），没有明文。
 // 其他租户的快照、已过期的快照返回 404
@@ -11,7 +13,7 @@ import { requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { DSL_KINDS } from '~/.server/pipeline/dsl';
 import { TEMPLATES } from '~/.server/pipeline/templates';
-import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readRfmSnapshot, readTemplateSnapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
+import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readChurnSnapshot, readRfmSnapshot, readTemplateSnapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { PageHeader } from '~/components/page-header';
@@ -26,29 +28,24 @@ export function meta({ loaderData }: Route.MetaArgs) {
   return [{ title: `${name} · ${s.asOf} · CRM 数据分析平台` }];
 }
 
-type Tab = 'segments' | 'consumers';
-
 export async function loader({ request, params }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'results:read');
   const snapshot = await getSnapshot(member.tenant.id, params.snapshotId);
   if (!snapshot) throw data({ message: '快照不存在' }, { status: 404 });
   const url = new URL(request.url);
-  const tab: Tab = url.searchParams.get('tab') === 'consumers' ? 'consumers' : 'segments';
-  const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
-  const page = Math.min(pages, Math.max(1, Math.floor(Number(url.searchParams.get('page'))) || 1));
+  // 页码先清洗成 ≥ 1 的整数，夹到最后一页由各模板分支自己算（流失预警要先知道筛选后的行数）
+  const requestedPage = Math.max(1, Math.floor(Number(url.searchParams.get('page'))) || 1);
+  const tabOf = <T extends string>(allowed: readonly T[], fallback: T): T => {
+    const t = url.searchParams.get('tab');
+    return (allowed as readonly string[]).includes(t!) ? t as T : fallback;
+  };
   try {
-    const result = snapshot.template === 'rfm'
-      ? { kind: 'rfm' as const, ...(await readRfmSnapshot(snapshot, { page })) }
-      : { kind: 'generic' as const, ...(await readTemplateSnapshot(snapshot, { page })) };
     const lookbackDays = snapshot.params.lookbackDays;
     // 页头：DSL（指标 / 标签）快照写定义（类型与键）、版本与来源；模板快照写注册表里的名字
     const dsl = dslKindOf(snapshot.template);
-    return {
+    const head = {
       email: member.email,
       nav: navFor(member),
-      tab,
-      page,
-      pages,
       pageSize: CONSUMER_PAGE_SIZE,
       snapshot: {
         id: snapshot.id,
@@ -66,8 +63,26 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         expiresAt: snapshot.expiresAt.toISOString(),
         incomplete: snapshot.incomplete,
       },
-      ...result,
     };
+    // 每个模板自己的快照视图：解析 ?tab=、算分页并读数（后面的票在这里加分支）
+    switch (snapshot.template) {
+      case 'rfm': {
+        const tab = tabOf(['segments', 'consumers'] as const, 'segments');
+        const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
+        const page = Math.min(pages, requestedPage);
+        return { ...head, tab, page, pages, kind: 'rfm' as const, ...(await readRfmSnapshot(snapshot, { page })) };
+      }
+      case 'churn': {
+        // 分页总数按筛选后的行数算，页码由 readChurnSnapshot 夹（它开了湖才知道行数，避免开两次）
+        const tab = tabOf(['at-risk', 'all'] as const, 'at-risk');
+        return { ...head, tab, kind: 'churn' as const, ...(await readChurnSnapshot(snapshot, { page: requestedPage, filter: tab })) };
+      }
+      default: {
+        const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
+        const page = Math.min(pages, requestedPage);
+        return { ...head, page, pages, kind: 'generic' as const, ...(await readTemplateSnapshot(snapshot, { page })) };
+      }
+    }
   } catch (e) {
     if (e instanceof SnapshotError) throw data({ message: e.message }, { status: e.status });
     throw e;
@@ -136,7 +151,9 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
         </Alert>
       )}
 
-      {loaderData.kind === 'rfm' ? <RfmResult {...loaderData} /> : <GenericResult {...loaderData} />}
+      {loaderData.kind === 'rfm' && <RfmResult {...loaderData} />}
+      {loaderData.kind === 'churn' && <ChurnResult {...loaderData} />}
+      {loaderData.kind === 'generic' && <GenericResult {...loaderData} />}
     </AppShell>
   );
 }
@@ -188,6 +205,59 @@ function GenericResult({ page, pages, pageSize, snapshot, columns, rows, tagSumm
           </TableBody>
         </Table>
         <Pager page={page} pages={pages} pageSize={pageSize} unit={dsl ? '行' : '位'} href={p => `/analytics/snapshots/${snapshot.id}?page=${p}`} />
+      </div>
+    </>
+  );
+}
+
+/** 流失预警快照：顶部汇总卡片（有风险人数、占比、总人数），明细默认只列有风险的人、沉默比从高到低，可切到全部 */
+function ChurnResult({ tab, page, pages, pageSize, snapshot, total, atRisk, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'churn' }>) {
+  const base = `/analytics/snapshots/${snapshot.id}`;
+  const pageHref = (p: number) => `${base}?tab=${tab}&page=${p}`;
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <StatTile label="有风险人数" value={atRisk.toLocaleString('zh-CN')} tone={atRisk ? 'text-amber-600' : undefined} hint="沉默比超过风险阈值的消费者" />
+        <StatTile label="风险占比" value={total ? `${((atRisk / total) * 100).toFixed(1)}%` : '—'} hint="有风险人数 ÷ 总人数" />
+        <StatTile label="总人数" value={total.toLocaleString('zh-CN')} hint="回看窗口内有购买节奏的消费者" />
+        <StatTile label="参考日期" value={snapshot.asOf} hint="计算沉默天数的基准" />
+      </div>
+
+      <PillTabs
+        current={tab}
+        tabs={[
+          { key: 'at-risk', label: '有风险', href: base },
+          { key: 'all', label: '全部', href: `${base}?tab=all` },
+        ]}
+      />
+
+      <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        {rows.length === 0 && <p className="text-sm text-slate-500">{tab === 'at-risk' ? '没有有风险的消费者' : '这份快照没有数据'}</p>}
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>consumer_id</TableHead>
+              <TableHead>订单数</TableHead>
+              <TableHead>平均间隔（天）</TableHead>
+              <TableHead>沉默天数</TableHead>
+              <TableHead>沉默比</TableHead>
+              <TableHead>有风险</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map(c => (
+              <TableRow key={c.consumer_id} data-consumer={c.consumer_id}>
+                <TableCell className="font-mono text-xs">{c.consumer_id}</TableCell>
+                <TableCell>{c.orders}</TableCell>
+                <TableCell>{c.avg_gap_days}</TableCell>
+                <TableCell>{c.recency_days}</TableCell>
+                <TableCell>{c.silence_ratio}</TableCell>
+                <TableCell>{c.at_risk ? '是' : '否'}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+        <Pager page={page} pages={pages} pageSize={pageSize} href={pageHref} />
       </div>
     </>
   );

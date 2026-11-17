@@ -212,6 +212,46 @@ export async function readRfmSnapshot(snapshot: Snapshot, { page, pageSize = CON
   }
 }
 
+/** 流失预警快照明细里的一位消费者：silence_ratio 是沉默天数超过平均间隔的倍数 */
+export interface ChurnConsumer { consumer_id: string; orders: number; avg_gap_days: number; recency_days: number; silence_ratio: number; at_risk: boolean }
+
+/**
+ * 只读挂载本租户的数据湖，读出流失预警快照：总人数与有风险（at_risk）人数，以及按 silence_ratio 从高到低
+ * （同值按 consumer_id）的第 page 页明细；filter 为 'at-risk' 时只看有风险的。分页总数按筛选后的行数算，
+ * 传入的 page 超出时停在最后一页（返回夹过的 page 与 pages），调用方不用为算页数先开一次湖
+ */
+export async function readChurnSnapshot(
+  snapshot: Snapshot,
+  { page, filter, pageSize = CONSUMER_PAGE_SIZE }: { page: number; filter: 'at-risk' | 'all'; pageSize?: number },
+) {
+  if (snapshot.template !== 'churn') throw new SnapshotError('不是流失预警快照', 404);
+  const { session, table } = await openSnapshotTable(snapshot);
+  const read = async <T>(sql: string) => (await session.con.runAndReadAll(sql)).getRowObjectsJson() as T[];
+  try {
+    const [totals] = await read<{ total: string; at_risk: string }>(
+      `SELECT count(*) AS total, count(*) FILTER (WHERE at_risk) AS at_risk FROM ${table}`);
+    const total = Number(totals?.total ?? 0);
+    const atRisk = Number(totals?.at_risk ?? 0);
+    const filteredCount = filter === 'at-risk' ? atRisk : total;
+    const pages = Math.max(1, Math.ceil(filteredCount / pageSize));
+    const clamped = Math.min(pages, Math.max(1, page));
+    const rows = await read<Record<string, unknown>>(`
+      SELECT consumer_id, orders, avg_gap_days, recency_days, silence_ratio, at_risk FROM ${table}
+      ${filter === 'at-risk' ? 'WHERE at_risk' : ''}
+      ORDER BY silence_ratio DESC NULLS LAST, consumer_id
+      LIMIT ${pageSize} OFFSET ${(clamped - 1) * pageSize}`);
+    return {
+      page: clamped, pages, total, atRisk, filteredCount,
+      rows: rows.map((r): ChurnConsumer => ({
+        consumer_id: String(r.consumer_id), orders: Number(r.orders), avg_gap_days: Number(r.avg_gap_days),
+        recency_days: Number(r.recency_days), silence_ratio: Number(r.silence_ratio), at_risk: r.at_risk === true,
+      })),
+    };
+  } finally {
+    session.close();
+  }
+}
+
 /** 标签快照各取值的人数（tagSummary），NULL 取值的 value 为 null */
 export interface TagValueSummary { value: string | null; consumers: number }
 
