@@ -5,7 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import type { ProjectionRow } from '../../app/.server/catalog/projection';
 import { vectorLane } from '../../app/.server/catalog/vector';
 import { platformStore, type VectorStore } from '../../app/.server/catalog/vector-store';
-import { closePgvectorPools, pgvectorStore, preparePgvector } from '../../app/.server/catalog/vector-store-pgvector';
+import { closePgvectorPools, pgvectorStore, preparePgvector, setPgvectorConnect } from '../../app/.server/catalog/vector-store-pgvector';
 import { cmp } from '../../app/lib/compare';
 import { closeDb } from '../../app/.server/db/client';
 import { resetDb } from '../http/harness';
@@ -139,6 +139,24 @@ describe('preparePgvector 连不上', () => {
     if (!prepared.ok) {
       expect(prepared.error).not.toContain('s3cret');
       expect(prepared.error).not.toContain('postgres://u');
+      expect(prepared.error).toContain('准备 pgvector 向量库失败');
+    }
+  });
+
+  it('用户名和密码带百分号编码的特殊字符：错误里原文、编码形式和整串连接串都抹掉', async () => {
+    const url = 'postgres://us%40r:p%40ss%2Fw@h:1/x';
+    setPgvectorConnect(() => ({
+      query: () => Promise.reject(new Error(`password authentication failed for user "us@r" (p@ss/w) ${url}`)),
+    }));
+    try {
+      const prepared = await preparePgvector(url);
+      expect(prepared.ok).toBe(false);
+      if (!prepared.ok) {
+        for (const secret of ['p@ss/w', 'p%40ss%2Fw', 'us@r', url]) expect(prepared.error).not.toContain(secret);
+        expect(prepared.error).toContain('准备 pgvector 向量库失败');
+      }
+    } finally {
+      setPgvectorConnect(undefined);
     }
   });
 });
