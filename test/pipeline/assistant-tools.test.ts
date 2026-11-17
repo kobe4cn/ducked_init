@@ -50,6 +50,11 @@ describe('AI 助手的工具注册表', () => {
     expect(field).toContain(`## ${mapped.id}`);
     expect(field).toContain('- 来源：未映射');
     expect(await runTool(viewer, 'catalog_expand', { id: 'entity:customer' })).not.toMatch(/(source|table):/);
+    // 组内列表也没有数据源、源表与字段来源
+    const grouped = await runTool(viewer, 'catalog_expand', { id: 'group:entity:customer' });
+    expect(grouped).toContain('- entity:customer ');
+    expect(grouped).not.toMatch(/(source|table):/);
+    expect(grouped).not.toContain('来源：');
     // 数据源与源表在 group:sources 组里（每行带语义哈希）；查看者的目录里没有这个组
     const sources = await runTool(analyst, 'catalog_expand', { id: 'group:sources' });
     const source = sources.match(/^- (source:\S+)/m)![1]!;
