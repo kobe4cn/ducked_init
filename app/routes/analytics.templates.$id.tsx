@@ -286,7 +286,7 @@ function SegmentUpgradeDistribution({ from, to, distribution }: { from: number; 
             const delta = v2 - v1;
             return (
               <TableRow key={s ?? '（无）'}>
-                <TableCell>{s}</TableCell>
+                <TableCell>{s ?? '（无）'}</TableCell>
                 <TableCell>{count(v1)}</TableCell>
                 <TableCell>{count(v2)}</TableCell>
                 <TableCell>{delta >= 0 ? `+${count(delta)}` : count(delta)}</TableCell>
