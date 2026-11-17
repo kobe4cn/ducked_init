@@ -7,6 +7,7 @@
 // 发布指标时同一事务里另为引用它的每个已发布标签入队一次（标签 SQL 内联刚发布的指标）。已有快照不动；有发布权限的成员可手动回刷：
 // 早于生效版本的未过期快照按各自的 asOf 以生效版本重算（指标连同下游标签），也可以按当天以生效版本重新计算，本定义已有任务在排队或运行时拒绝。
 // 依赖的实体有新合并后调度器按当天以生效版本重算（refresh.ts，ADR-0028）；任务参数与快照记下来源（发布、回刷、定时刷新、手动）。
+// getDefinition 另给出最近一次计算的断言失败（#839：最新一条 gold.dsl 因 error 级断言失败、比最新快照还新时），定义页据此显示失败提示。
 // 有修改与删除权限的成员可以删除定义；被已发布标签引用的指标不能删（依赖由已发布版本按需解析，dsl-dependencies.ts）。
 // 一律限定在操作者所属租户内
 import type { DuckDBConnection } from '@duckdb/node-api';
@@ -23,6 +24,7 @@ import { dslDefinitions, dslVersions, snapshots, tasks, type SnapshotTrigger, ty
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { chatJson, LlmError, resolveProvider } from './llm';
 import { publishedPlans } from './mappings';
+import { failedErrors, type AssertionResult } from './pipeline/assertions';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
 import { definitionDraftMessages, definitionDraftPurpose, definitionDraftSchema, definitionOutputToYaml } from './pipeline/dsl/model-draft';
@@ -32,6 +34,7 @@ import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
 import { lit } from '../lib/mapping-expr';
 import { rows } from './pipeline/duck-sql';
+import { readResult } from './pipeline/task-contracts';
 import { discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, saveDraft, type PublishableAdapter } from './publishing';
 import { registerTaskSnapshot } from './snapshots';
 import { insertTask } from './tasks';
@@ -135,6 +138,26 @@ async function lastRefresh(db: Tx | ReturnType<typeof getDb>, tenantId: string, 
     .where(and(eq(snapshots.tenantId, tenantId), eq(snapshots.template, `${kind}:${key}`), isNull(snapshots.expiredAt)))
     .orderBy(desc(snapshots.createdAt)).limit(1);
   return latest ?? null;
+}
+
+/**
+ * 本定义最近一次计算因断言失败时的失败信息（定义页的失败提示，#839）：取最新一条 gold.dsl 任务（按 params 里的 definitionId 过滤、创建时间降序），
+ * 只有它是 failed、结果里有失败的 error 级断言、并且比最新一张未过期快照还新（或还没有快照）时才返回；否则为 null——之后再算一次成功，提示自然消失
+ */
+async function lastFailure(db: Tx | ReturnType<typeof getDb>, tenantId: string, kind: DslKind, key: string, refreshedAt: Date | null) {
+  const [definition] = await db.select({ id: dslDefinitions.id }).from(dslDefinitions).where(ofDefinition(tenantId, kind, key));
+  if (!definition) return null; // 不该出现：调用方在有版本的定义里才调到这里
+  const [task] = await db.select({ id: tasks.id, finishedAt: tasks.finishedAt, createdAt: tasks.createdAt, status: tasks.status, result: tasks.result })
+    .from(tasks)
+    .where(and(
+      eq(tasks.tenantId, tenantId), eq(tasks.kind, 'gold.dsl'),
+      eq(sql`${tasks.params}->>'definitionId'`, definition.id),
+    )).orderBy(desc(tasks.createdAt)).limit(1);
+  if (!task || task.status !== 'failed') return null;
+  const assertions = failedErrors(readResult('gold.dsl', { result: task.result })?.assertions ?? []);
+  if (!assertions.length) return null;
+  const at = task.finishedAt ?? task.createdAt;
+  return refreshedAt && at <= refreshedAt ? null : { taskId: task.id, at, assertions };
 }
 
 /** 新建定义：键要合规且在本租户这一种类里没用过，YAML 校验通过后保存为第 1 版草稿 */
@@ -280,8 +303,8 @@ export async function saveDslDraft(actor: CurrentMember, kind: string, key: stri
 }
 
 /**
- * 本租户的一个定义：各版本（最新的在前，带当前成员发布不了的原因）、草稿与最近的已发布版本、本租户有发布权限的成员人数、引用它的已发布标签、可回刷的快照、最近一次刷新，
- * 以及最新一版（有草稿时是草稿）按今天（UTC）编译出的 SQL；它对照当前的登记与映射不再通过校验时给出问题
+ * 本租户的一个定义：各版本（最新的在前，带当前成员发布不了的原因）、草稿与最近的已发布版本、本租户有发布权限的成员人数、引用它的已发布标签、可回刷的快照、最近一次刷新、
+ * 最近一次计算的断言失败（#839，没有时为 null），以及最新一版（有草稿时是草稿）按今天（UTC）编译出的 SQL；它对照当前的登记与映射不再通过校验时给出问题
  */
 export async function getDefinition(actor: CurrentMember, kind: string, key: string) {
   assertCan(actor, 'definitions:read');
@@ -299,6 +322,7 @@ export async function getDefinition(actor: CurrentMember, kind: string, key: str
   const published = versions.find(v => v.status === 'published') ?? null;
   const ctx = await dslContext(getDb(), actor.tenant.id);
   const result = DSL_KINDS[kind].check(versions[0]!.yaml, ctx);
+  const refresh = await lastRefresh(getDb(), actor.tenant.id, kind, key);
   return {
     kind,
     key,
@@ -312,7 +336,9 @@ export async function getDefinition(actor: CurrentMember, kind: string, key: str
     /** 可回刷的快照数与它们的统计日（去重、升序） */
     backfill: published ? await staleSnapshots(getDb(), actor.tenant.id, kind, key, published.version) : { snapshots: 0, days: [] as string[] },
     /** 最近一次刷新：本定义最新一张未过期快照的登记时间与来源（老快照没记来源时为 null）；没有时为 null */
-    lastRefresh: await lastRefresh(getDb(), actor.tenant.id, kind, key),
+    lastRefresh: refresh,
+    /** 最近一次计算因断言失败（有失败的 error 级断言、比最新快照还新或还没有快照）时的任务与失败的断言；没有时为 null */
+    lastFailure: await lastFailure(getDb(), actor.tenant.id, kind, key, refresh?.at ?? null),
     compiled: result.ok
       ? { version: versions[0]!.version, sql: DSL_KINDS[kind].compile(result.spec, ctx, todayUtc(), key), issues: [] as DslIssue[] }
       : { version: versions[0]!.version, sql: null, issues: result.issues },
