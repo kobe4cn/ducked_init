@@ -1,8 +1,12 @@
 // test/catalog.test.ts —— 语义目录（ADR-0041）：按元数据生成条目，总览、按稳定标识展开与关键词搜索，可渲染成 Markdown 与 JSON；
 // 敏感字段、哈希列与系统列不进目录（纯函数，手工构造 CatalogInput）
+// 分层总览（#854）：groupOverview 只给第一层分组（大目录实体组合并成桶），groupItems 按分组标识展开第二层（每行带 semanticHash，超 GROUP_TOKENS 分页）
 import { describe, expect, it } from 'vitest';
-import { buildCatalog, estimateTokens, expand, overview, search, toJson, toMarkdown, type CatalogInput } from '../app/.server/catalog';
+import {
+  buildCatalog, estimateTokens, expand, groupItems, groupOverview, overview, OVERVIEW_TOKENS, search, toJson, toMarkdown, type CatalogInput,
+} from '../app/.server/catalog';
 import { knowledgeKey } from '../app/.server/knowledge/catalog';
+import { semanticHash } from '../app/.server/catalog/plan';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
 
 /** 手写目录输入里定义与模板所属的空间：目录只记录它，不按它过滤（ADR-0048） */
@@ -154,6 +158,98 @@ describe('语义目录', () => {
     expect(md).toMatch(/entity:custom_store .*1002 个字段/);
     expect(md).toMatch(/entity:order .*\d+ 个字段/);
     expect(expand(c, 'field:custom_store.stat_field_999')).toMatchObject({ kind: 'field', type: 'string' });
+  });
+
+  it('千指标目录：第一层分组不超过上限，每个条目都能经分组（含合并组、分页）展开找到', () => {
+    // 五百个自定义实体：第一层放不下，实体组按标识排序连续分桶（合并组）
+    const many = input();
+    many.customEntities!.push(...Array.from({ length: 500 }, (_, i) => ({
+      name: `e_${i}`, label: `实体${i}`, kind: 'dimension' as const, primaryKey: ['id'],
+      fields: [
+        { name: 'id', type: 'string' as const, description: `第 ${i} 个实体的标识`, sensitive: false },
+        { name: `f_${i}`, type: 'string' as const, description: '', sensitive: false },
+      ],
+      relations: [],
+    })));
+    const c = buildCatalog({
+      ...many,
+      definitions: [
+        ...Array.from({ length: 1200 }, (_, i): { kind: 'metric'; key: string; version: number; yaml: string; spaceId: string } => ({
+          kind: 'metric', key: `m_${i}`, version: 1, spaceId: SPACE,
+          yaml: `base: order\nmeasure: { agg: count }\ndescription: 第 ${i} 个测试指标\n`,
+        })),
+        // 标签没有 base：按所依赖第一个指标（m_0）的 base 归进 entity:order 组
+        { kind: 'tag', key: 't_lost', version: 1, spaceId: SPACE, yaml: 'metric: m_0\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n' },
+      ],
+      knowledge: {
+        byTarget: new Map([
+          ...Array.from({ length: 50 }, (_, i): [string, { subjects: string[] }] => [knowledgeKey(`metric:m_${i}`), { subjects: ['复购'] }]),
+          [knowledgeKey('field:order.status'), { subjects: ['订单'] }],
+          [knowledgeKey('tag:t_lost'), { subjects: ['复购'] }],
+        ]),
+      },
+    });
+    const md = toMarkdown(groupOverview(c));
+    expect(estimateTokens(md)).toBeLessThanOrEqual(OVERVIEW_TOKENS);
+    // 第一层只有分组行，不列条目；主题组带数量，实体组放进合并组
+    expect(md).not.toMatch(/^- metric:m_0 /m);
+    expect(md).toMatch(/^- group:subject:复购 复购 · 指标 50 · 标签 1$/m);
+    expect(md).toMatch(/^- group:entities@1 /m);
+    expect(md).toMatch(/^- group:entities@2 /m);
+    expect(md).toMatch(/^- group:sources 数据源 2 个、源表 \d+ 张$/m);
+    expect(md).toMatch(/^- group:relationships 关系 \d+ 条$/m);
+
+    // 从第一层出发走全部分组：合并组先展开一层实体组，实体组 / 主题组 / 汇总组展开条目，跟着「下一页」走，覆盖全部非 capability 条目
+    const collected = new Set<string>();
+    const expandGroup = (id: string): void => {
+      const gi = groupItems(c, id, semanticHash);
+      expect(gi, id).not.toBeNull();
+      for (const line of toMarkdown(gi!).split('\n')) {
+        const item = line.match(/^- (?!下一页：)(\S+)/);
+        if (item) {
+          if (item[1]!.startsWith('group:')) expandGroup(item[1]!);
+          else collected.add(item[1]!);
+        }
+        const next = line.match(/^- 下一页：(\S+)/);
+        if (next) expandGroup(next[1]!);
+      }
+    };
+    for (const line of md.split('\n')) {
+      const group = line.match(/^- (group:\S+)/);
+      if (group) expandGroup(group[1]!);
+    }
+    expect([...collected].sort()).toEqual(c.entries.filter(e => e.kind !== 'capability').map(e => e.id).sort());
+  });
+
+  it('分层总览：小目录每组一行带数量；分组展开每项一行，带 semanticHash 与 version', () => {
+    const c = buildCatalog(input());
+    const md = toMarkdown(groupOverview(c));
+    expect(md).toMatch(/^- group:entity:order 订单( — .*)? · 字段 \d+$/m);
+    expect(md).toMatch(/^- group:entity:custom_store 门店 /m);
+    // 组内条目：实体、字段都带 semanticHash，字段没有 version；展开过的条目由调用方记进检索上下文（entries 给出 id）
+    const order = groupItems(c, 'group:entity:order', semanticHash)!;
+    expect(order.entries).toContain('entity:order');
+    expect(order.entries).toContain('field:order.status');
+    expect(toMarkdown(order)).toMatch(/^- entity:order 订单( — .*)? · semanticHash: [0-9a-f]{64}/m);
+    expect(toMarkdown(order)).toMatch(/^- field:order\.status 订单状态 — .* · semanticHash: [0-9a-f]{64}$/m);
+    expect(toMarkdown(order)).not.toContain('version:');
+    // 指标与标签带 version；目录版本号沿用总览的头两行
+    const withDefinitions = buildCatalog({
+      ...input(),
+      definitions: [
+        { kind: 'metric', key: 'revenue', version: 2, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 已支付订单的消费金额\n', spaceId: SPACE },
+        { kind: 'tag', key: 'spender', version: 1, yaml: 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1000 } }\ndefault: low\n', spaceId: SPACE },
+      ],
+    });
+    const tagged = groupItems(withDefinitions, 'group:entity:order', semanticHash)!;
+    expect(toMarkdown(tagged)).toMatch(/^- metric:revenue revenue — 已支付订单的消费金额 · semanticHash: [0-9a-f]{64} · version: 2$/m);
+    expect(toMarkdown(tagged)).toMatch(/^- tag:spender spender · semanticHash: [0-9a-f]{64} · version: 1$/m);
+    expect(groupOverview({ ...withDefinitions, version: 7 }).version).toBe(7);
+    expect(toMarkdown(groupOverview({ ...withDefinitions, version: 7 })).split('\n').slice(0, 3)).toEqual(['# 语义目录', '', '目录版本 7']);
+    // 不存在的分组、超出页码返回 null；分页标识在组标识后加 @页
+    expect(groupItems(c, 'group:entity:nope', semanticHash)).toBeNull();
+    expect(groupItems(c, 'group:entities@99', semanticHash)).toBeNull();
+    expect(groupItems(c, 'group:entity:order@99', semanticHash)).toBeNull();
   });
 
   it('按标识展开数据源、源表、实体、字段与关系，标识不存在时返回 null', () => {

@@ -6,7 +6,10 @@
 // 定义条目只给键、说明、度量 / 取值、依赖与系统生成的口径文字（knowledge/derive.ts，读目录时现算），不给结果数据；模板条目给产出列与最近一次快照的表名、行数与时间。
 // 字段带实体字段的业务说明，各映射血缘带映射字段的业务说明（当前内容，清空的不给），都参与搜索、不进总览。
 // 实体、字段、指标、标签与各映射血缘可带业务知识（knowledge，见 knowledge/catalog.ts），同样参与搜索、不进总览；映射字段的知识挂在血缘项上，
-// 没有 sources:read 时随血缘一起去掉
+// 没有 sources:read 时随血缘一起去掉。
+// 另有一份分层总览（#854）：groupOverview 只给第一层分组（主题组、实体组各一行，数据源、关系、模板各一行汇总；放不下时去掉说明、把实体组
+// 连续分桶为合并组），groupItems 按分组标识（group:…，分页在标识后加 @页）给出组内条目（第二层，超出分页不截断）；助手与 MCP 的目录工具用它，
+// 起草仍用上面的 overview()
 import { parse } from 'yaml';
 import { CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, type CustomEntityField, type EntityRelation, type FieldType } from '../../lib/canonical-model';
 import { noteKey } from '../../lib/business-note-key';
@@ -190,8 +193,43 @@ export interface Overview {
 
 /** 总览的 token 上限（按 estimateTokens 估算 Markdown） */
 export const OVERVIEW_TOKENS = 4000;
+/** 分组展开（第二层）的 token 上限：超出按条目分页，不截断 */
+export const GROUP_TOKENS = 4000;
 /** 总览里的说明截到多少字 */
 const SUMMARY_CHARS = 40;
+
+/** 分层总览（第一层）的一项：实体组 / 主题组一行（名称、说明与数量），合并组一行（首尾实体名与总数），数据源、关系、模板各一行汇总 */
+export interface GroupLine {
+  id: string;
+  name: string;
+  /** 说明（截 40 字）；主题组、合并组与汇总行没有 */
+  description: string;
+  /** 组内指标 / 标签 / 字段数量，为 0 的不显示；实体组自身不算 */
+  metrics: number;
+  tags: number;
+  fields: number;
+  /** 合并组：桶里实体组数与首尾实体名 */
+  merged?: { entities: number; first: string; last: string };
+  /** 汇总行的正文（数据源 / 关系 / 模板），给了就不渲染名称、说明与数量 */
+  summary?: string;
+}
+
+/** 分层总览（第一层）：只给分组，每组一行；大目录去掉说明、把实体组连续分桶，不截掉条目（条目经分组展开找） */
+export interface GroupOverview { kind: 'groups'; groups: GroupLine[]; /** 目录版本号，还没有版本时为 null */ version: number | null }
+
+/** 分组展开（第二层）：条目组每行一个条目，合并组给其中实体组的第一层行；超出 GROUP_TOKENS 分页 */
+export interface GroupItems {
+  kind: 'group';
+  /** 组标识，不带页码 */
+  id: string;
+  page: number;
+  /** 每项一行（以「- 」开头） */
+  lines: string[];
+  /** 本页里的条目 id（合并组没有），供调用方记进本轮检索上下文 */
+  entries: string[];
+  /** 还有下一页时给下一页的标识（组标识后加 @页码） */
+  nextPage?: string;
+}
 
 const CJK = /[\u3000-\u303f\uff00-\uffef぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]/u;
 const CJK_RUN = /[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]+/gu;
@@ -454,6 +492,226 @@ export function overview(c: Catalog): Overview {
 /** 按标识展开一个条目；标识不存在时为 null */
 export const expand = (c: Catalog, id: string): CatalogEntry | null => c.entries.find(e => e.id === id) ?? null;
 
+/** 归组：字段归它的实体组，指标按 base，标签按依赖里按标识排序的第一个实体（没有时第一个指标的 base）；指标、标签、字段另按
+ * knowledge.subjects 进主题组；能力条目不进任何组；归不进实体组的兜底进 group:other，保证每个条目都能经分组找到 */
+interface Groups {
+  /** 实体组：键是实体条目标识（entity:order），组里含实体条目自身 */
+  entity: Map<string, CatalogEntry[]>;
+  /** 主题组：键是主题名；只有挂了条目的主题才出现 */
+  subject: Map<string, CatalogEntry[]>;
+  /** 推不出实体组的条目 */
+  other: CatalogEntry[];
+  /** 数据源与源表（含源视图） */
+  sources: CatalogEntry[];
+  relations: CatalogEntry[];
+  templates: CatalogEntry[];
+}
+
+function groupsOf(c: Catalog): Groups {
+  const g: Groups = { entity: new Map(), subject: new Map(), other: [], sources: [], relations: [], templates: [] };
+  const entryById = new Map(c.entries.map(e => [e.id, e]));
+  for (const e of c.entries) {
+    let group: CatalogEntry[] | undefined;
+    switch (e.kind) {
+      case 'entity':
+        g.entity.set(e.id, [e]);
+        break;
+      case 'field':
+      case 'metric':
+        group = g.entity.get(e.kind === 'field' ? e.entity : e.base);
+        break;
+      case 'tag': {
+        const firstEntity = [...e.dependencies.entities].sort(cmp)[0];
+        group = firstEntity !== undefined ? g.entity.get(firstEntity) : undefined;
+        if (!group) {
+          const firstMetric = [...e.dependencies.metrics].sort(cmp)[0];
+          const base = firstMetric !== undefined ? entryById.get(firstMetric) : undefined;
+          if (base?.kind === 'metric') group = g.entity.get(base.base);
+        }
+        break;
+      }
+      case 'source':
+      case 'table':
+        g.sources.push(e);
+        break;
+      case 'relation':
+        g.relations.push(e);
+        break;
+      case 'template':
+        g.templates.push(e);
+        break;
+      case 'capability':
+        break;
+    }
+    if (e.kind === 'field' || e.kind === 'metric' || e.kind === 'tag') {
+      for (const s of e.knowledge?.subjects ?? []) g.subject.set(s, [...(g.subject.get(s) ?? []), e]);
+      (group ?? g.other).push(e);
+    }
+  }
+  for (const list of [...g.entity.values(), ...g.subject.values()]) list.sort(byId);
+  return g;
+}
+
+/** 第一层一行：`- group:entity:order 订单 — 说明 · 指标 12 · 标签 3 · 字段 40`；合并组带实体数，汇总行给 summary 正文 */
+function groupLineMarkdown(l: GroupLine): string {
+  if (l.summary !== undefined) return `- ${l.id} ${l.summary}`;
+  const counts = ([['指标', l.metrics], ['标签', l.tags], ['字段', l.fields]] as const)
+    .filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`).join(' · ');
+  const rest = [l.merged ? `共 ${l.merged.entities} 个实体` : '', counts].filter(Boolean).join(' · ');
+  return `- ${l.id} ${l.name}${l.description ? ` — ${l.description}` : ''}${rest ? ` · ${rest}` : ''}`;
+}
+
+/** 实体组的第一层行（按实体标识排序；withDescription 为 false 时去掉说明） */
+function entityGroupLines(g: Groups, withDescription: boolean): GroupLine[] {
+  return [...g.entity.entries()].sort(([a], [b]) => cmp(a, b)).map(([, entries]) => {
+    const entity = entries.find(e => e.kind === 'entity')!;
+    const count = (kind: 'metric' | 'tag' | 'field') => entries.filter(e => e.kind === kind).length;
+    return {
+      id: `group:entity:${entity.entity}`, name: entity.name, description: withDescription ? truncate(entity.description) : '',
+      metrics: count('metric'), tags: count('tag'), fields: count('field'),
+    };
+  });
+}
+
+/** 一个合并组的行：写首尾实体名与总计数（成员是桶里的实体组行） */
+function bucketLine(bucket: GroupLine[], index: number): GroupLine {
+  const first = bucket[0]!;
+  const last = bucket.at(-1)!;
+  const count = (k: 'metrics' | 'tags' | 'fields') => bucket.reduce((n, l) => n + l[k], 0);
+  return {
+    id: `group:entities@${index}`, name: `${first.name} ~ ${last.name}`, description: '',
+    metrics: count('metrics'), tags: count('tags'), fields: count('fields'),
+    merged: { entities: bucket.length, first: first.name, last: last.name },
+  };
+}
+
+/** 第一层的全部内容：主题组行、要显示的实体组行（分桶后是合并组行）、分桶（成员是实体组行，展开合并组用）与汇总行。
+ * 估算超过 OVERVIEW_TOKENS 时先去掉说明，还放不下时把实体组行按标识排序连续分桶：每桶的第一层行放得下 GROUP_TOKENS、桶数取最少；
+ * 第一层还放不下时桶数减半到放得下为止（桶内超出由第二层分页兜住）。groupOverview 与 groupItems（解析 group:entities@k）共用，保证两边一致 */
+function firstLevel(c: Catalog): { g: Groups; subjects: GroupLine[]; entityLines: GroupLine[]; buckets: GroupLine[][]; summaries: GroupLine[] } {
+  const g = groupsOf(c);
+  const subjects = [...g.subject.entries()].sort(([a], [b]) => cmp(`group:subject:${a}`, `group:subject:${b}`)).map(([name, list]) => {
+    const count = (kind: 'metric' | 'tag' | 'field') => list.filter(e => e.kind === kind).length;
+    return { id: `group:subject:${name}`, name, description: '', metrics: count('metric'), tags: count('tag'), fields: count('field') };
+  });
+  const summary = (id: string, name: string, text: string): GroupLine => ({ id, name, description: '', metrics: 0, tags: 0, fields: 0, summary: text });
+  // restricted 目录里没有 source 条目时这行不出，也不泄露源表数
+  const sourceCount = c.entries.filter(e => e.kind === 'source').length;
+  const summaries = [
+    ...(g.other.length ? [summary('group:other', '其他', `条目 ${g.other.length} 个`)] : []),
+    ...(sourceCount ? [summary('group:sources', '数据源', `数据源 ${sourceCount} 个、源表 ${c.entries.filter(e => e.kind === 'table').length} 张`)] : []),
+    ...(g.relations.length ? [summary('group:relationships', '关系', `关系 ${g.relations.length} 条`)] : []),
+    ...(g.templates.length ? [summary('group:templates', '模板', `模板 ${g.templates.length} 个`)] : []),
+  ];
+  const of = (entityLines: GroupLine[]): GroupOverview => ({ kind: 'groups', groups: [...subjects, ...entityLines, ...summaries], version: c.version ?? null });
+  const fits = (o: GroupOverview) => estimateTokens(toMarkdown(o)) <= OVERVIEW_TOKENS;
+
+  const described = entityGroupLines(g, true);
+  if (fits(of(described))) return { g, subjects, entityLines: described, buckets: [], summaries };
+  const bare = entityGroupLines(g, false);
+  if (fits(of(bare))) return { g, subjects, entityLines: bare, buckets: [], summaries };
+  // 连续分桶：每桶的第一层行放得下 GROUP_TOKENS（至少一组一桶），桶数最少
+  const buckets: GroupLine[][] = [];
+  let current: GroupLine[] = [];
+  let used = 0;
+  for (const line of bare) {
+    const t = estimateTokens(groupLineMarkdown(line));
+    if (current.length && used + t > GROUP_TOKENS) {
+      buckets.push(current);
+      current = [];
+      used = 0;
+    }
+    current.push(line);
+    used += t;
+  }
+  if (current.length) buckets.push(current);
+  let merged = buckets;
+  while (merged.length > 1 && !fits(of(merged.map((b, i) => bucketLine(b, i + 1))))) {
+    merged = merged.reduce<GroupLine[][]>((out, b, i) => {
+      if (i % 2) out[out.length - 1] = [...out[out.length - 1]!, ...b];
+      else out.push(b);
+      return out;
+    }, []);
+  }
+  return { g, subjects, entityLines: merged.map((b, i) => bucketLine(b, i + 1)), buckets: merged, summaries };
+}
+
+/**
+ * 分层总览（第一层）：主题组、实体组各一行（名称、说明与指标 / 标签 / 字段数量），数据源、关系、模板各一行汇总；
+ * 超过 OVERVIEW_TOKENS 时去掉说明、把实体组连续分桶（每桶一行，首尾实体名与总计数），不截掉条目（条目经分组展开找）
+ */
+export function groupOverview(c: Catalog): GroupOverview {
+  const { subjects, entityLines, summaries } = firstLevel(c);
+  return { kind: 'groups', groups: [...subjects, ...entityLines, ...summaries], version: c.version ?? null };
+}
+
+/**
+ * 按分组标识展开第二层：group:entity:<实体名> / group:subject:<主题名> / group:sources / group:relationships / group:templates / group:other
+ * 给组内条目（每行一个，带调用方传入的 semanticHash；指标、标签、模板带 version），合并组 group:entities@<k> 给其中实体组的第一层行；
+ * 标识后加 @<页> 翻页（超出 GROUP_TOKENS 分页，不截断）。没有这个分组或页码时为 null
+ */
+export function groupItems(c: Catalog, groupId: string, hash: (e: CatalogEntry) => string): GroupItems | null {
+  const { g, buckets } = firstLevel(c);
+  type Resolved = { entries: CatalogEntry[] } | { bucket: GroupLine[] };
+  const resolve = (id: string): Resolved | null => {
+    if (id === 'group:sources') return g.sources.length ? { entries: g.sources } : null;
+    if (id === 'group:relationships') return g.relations.length ? { entries: g.relations } : null;
+    if (id === 'group:templates') return g.templates.length ? { entries: g.templates } : null;
+    if (id === 'group:other') return g.other.length ? { entries: g.other } : null;
+    if (id.startsWith('group:entity:')) {
+      const entries = g.entity.get(`entity:${id.slice('group:entity:'.length)}`);
+      return entries ? { entries } : null;
+    }
+    if (id.startsWith('group:subject:')) {
+      const entries = g.subject.get(id.slice('group:subject:'.length));
+      return entries ? { entries } : null;
+    }
+    const bucketNo = id.match(/^group:entities@(\d+)$/);
+    if (bucketNo) return buckets[Number(bucketNo[1]) - 1] ? { bucket: buckets[Number(bucketNo[1]) - 1]! } : null;
+    return null;
+  };
+  // 页码：标识后缀 @<页>（如 group:entity:order@2）；整个标识先按原样解析（group:entities@1 是桶 1，不是 group:entities 的第 1 页）
+  const paged = groupId.match(/^(.*)@(\d+)$/);
+  let resolved: Resolved | null = resolve(groupId);
+  let id = groupId;
+  let page = 1;
+  if (!resolved && paged) {
+    resolved = resolve(paged[1]!);
+    id = paged[1]!;
+    page = Number(paged[2]);
+  }
+  if (!resolved) return null;
+
+  const versionOf = (e: CatalogEntry) => (e.kind === 'metric' || e.kind === 'tag' || e.kind === 'template') ? ` · version: ${e.version}` : '';
+  const itemLine = (e: CatalogEntry) => `- ${e.id} ${e.name}${e.description ? ` — ${truncate(e.description)}` : ''} · semanticHash: ${hash(e)}${versionOf(e)}`;
+  const all = 'entries' in resolved ? resolved.entries.map(itemLine) : resolved.bucket.map(groupLineMarkdown);
+  const entryIds = 'entries' in resolved ? resolved.entries.map(e => e.id) : [];
+  // 分页：每页至少一行，放得下 GROUP_TOKENS 就继续放
+  const pages: { lines: string[]; entries: string[] }[] = [];
+  let lines: string[] = [];
+  let ids: string[] = [];
+  let used = 0;
+  const flush = () => {
+    if (lines.length) {
+      pages.push({ lines, entries: ids });
+      lines = [];
+      ids = [];
+      used = 0;
+    }
+  };
+  for (const [i, line] of all.entries()) {
+    const t = estimateTokens(line);
+    if (lines.length && used + t > GROUP_TOKENS) flush();
+    lines.push(line);
+    if (entryIds.length) ids.push(entryIds[i]!);
+    used += t;
+  }
+  flush();
+  const current = pages[page - 1];
+  if (!current) return null;
+  return { kind: 'group', id, page, lines: current.lines, entries: current.entries, ...(pages[page] && { nextPage: `${id}@${page + 1}` }) };
+}
+
 /** 查询分词：ASCII 单词转小写、至少 2 个字符；连续的中日韩字符切成二元组（只有一个字时取这个字） */
 export function terms(query: string): string[] {
   const out = new Set<string>();
@@ -519,6 +777,14 @@ function overviewMarkdown(o: Overview): string {
   return ['# 语义目录', '', ...(o.version != null ? [`目录版本 ${o.version}`, ''] : []), ...lines].join('\n');
 }
 
+function groupsMarkdown(o: GroupOverview): string {
+  return ['# 语义目录', '', ...(o.version != null ? [`目录版本 ${o.version}`, ''] : []), ...o.groups.map(groupLineMarkdown)].join('\n');
+}
+
+function groupItemsMarkdown(gi: GroupItems): string {
+  return ['# 分组 ' + (gi.page > 1 ? `${gi.id}@${gi.page}` : gi.id), '', ...gi.lines, ...(gi.nextPage ? ['', `- 下一页：${gi.nextPage}`] : [])].join('\n');
+}
+
 function entryMarkdown(e: CatalogEntry): string {
   const head = [`## ${e.id} ${e.name}`, ...(e.description ? ['', e.description] : []), '', ...('knowledge' in e ? knowledgeMarkdown(e.knowledge) : [])];
   switch (e.kind) {
@@ -570,13 +836,16 @@ const dependenciesMarkdown = (d: DefinitionDependencies) => [
   ...(d.fields.length ? [`- 用到字段：${d.fields.join(', ')}`] : []),
 ];
 
-/** 可渲染的结果：总览、单个条目或搜索结果 */
-export type Renderable = Overview | CatalogEntry | CatalogEntry[];
+/** 可渲染的结果：总览、分层总览、分组展开、单个条目或搜索结果 */
+export type Renderable = Overview | GroupOverview | GroupItems | CatalogEntry | CatalogEntry[];
 
 /** 渲染成 Markdown */
 export function toMarkdown(x: Renderable): string {
   if (Array.isArray(x)) return x.length ? x.map(entryMarkdown).join('\n\n') : '没有找到相关条目';
-  return x.kind === 'overview' ? overviewMarkdown(x) : entryMarkdown(x);
+  if (x.kind === 'overview') return overviewMarkdown(x);
+  if (x.kind === 'groups') return groupsMarkdown(x);
+  if (x.kind === 'group') return groupItemsMarkdown(x);
+  return entryMarkdown(x);
 }
 
 /** 渲染成 JSON */
