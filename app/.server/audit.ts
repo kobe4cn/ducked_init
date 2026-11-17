@@ -327,10 +327,10 @@ const ACTIONS = {
       `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，主键 ${Object.entries(d.key as Record<string, string>).map(([k, v]) => `${k} = ${v}`).join('，')}，`
       + `字段 ${(d.fields as string[]).join('、')}；原因：${d.reason}`,
   },
-  // 平台在结果层任务计算前发现的数据质量问题（ADR-0026）：只记断言名、实体与行数，不记行内容
+  // 平台在结果层任务计算前发现的数据质量问题（ADR-0026）：只记断言名、实体、行数、来源映射名与数据质量页链接，不记键与行内容（要不要记键见 #842）
   'assertion.failed': {
     label: '断言失败',
-    describe: (d: Detail) => `${d.task}：${(d.summaries as string[]).join('；')}，未产出新快照，继续使用上一版`,
+    describe: (d: Detail) => `${d.task}：${(d.summaries as string[]).join('；')}，未产出新快照，继续使用上一版${d.link ? `，样本：${d.link}` : ''}`,
   },
   // 平台在同步时发现源表删了列或破坏性改了类型，且已发布映射引用了这些列（ADR-0034）：只记映射、表与列名
   'source.schema_broken': {

@@ -29,6 +29,8 @@ export interface AssertionResult {
   rows?: number;
   /** row_drop：该实体上一次运行时的行数 */
   previous?: number;
+  /** 样本里出现的映射 ID（最多 3 个，工作进程连不上平台库，只有 ID；写隔离区后回填，取不到时没有）。告警时由平台侧换成「源 · 表 → 实体」 */
+  mappings?: string[];
 }
 
 export const ASSERTION_LABELS: Record<string, string> = {
@@ -155,7 +157,9 @@ export async function runAssertions(con: DuckDBConnection, entities: readonly st
 
 /**
  * 把每条失败断言的不合格行（最多 SAMPLE_LIMIT 行）追加进隔离区（表在初始化数据湖时建好）。
- * 每行记断言、级别、实体、标准模型主键（多列用逗号连接）、整行 JSON、任务与时间
+ * 每行记断言、级别、实体、标准模型主键（多列用逗号连接）、整行 JSON、任务与时间。
+ * 写完一条断言的样本后，把样本里出现的映射 ID（行 JSON 的 _mapping，最多 3 个）回填进结果：告警时要写来源映射名，
+ * 而这里在 assertOrThrow 之前执行，任务失败的结果里才带得上
  */
 async function writeQuarantine(con: DuckDBConnection, taskId: string, samples: ReadonlyMap<AssertionResult, string>) {
   for (const [r, sample] of samples) {
@@ -165,6 +169,11 @@ async function writeQuarantine(con: DuckDBConnection, taskId: string, samples: R
       INSERT INTO ${QUARANTINE}
       SELECT ${lit(r.name)}, ${lit(r.level)}, ${lit(r.entity)}, concat(${key}), to_json(s), ${lit(taskId)}, now()
       FROM (${sample} ORDER BY ALL LIMIT ${SAMPLE_LIMIT}) s`);
+    const ids = await rows<{ m: string | null }>(con, `
+      SELECT DISTINCT json_extract_string("row", '_mapping') AS m FROM ${QUARANTINE}
+      WHERE task_id = ${lit(taskId)} AND assertion = ${lit(r.name)} AND entity = ${lit(r.entity)} LIMIT 3`);
+    const mappings = ids.map(({ m }) => m).filter((m): m is string => m !== null);
+    if (mappings.length) r.mappings = mappings;
   }
 }
 
