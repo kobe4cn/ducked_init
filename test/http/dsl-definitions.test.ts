@@ -5,7 +5,7 @@
 // 数据工程师看到「删除」按钮（分析师看不到、提交 403），被已发布标签引用的指标删不了，删除后回到分析页；
 // 有早于生效版本的快照时数据工程师点「回刷」入队按旧统计日的计算，分析师在按钮处看到原因、提交 403；
 // 数据工程师点「重新计算」按生效版本以今天入队（连同下游标签，来源 manual），定义页显示最近一次刷新的时间与来源，分析页快照列表显示来源；
-// 最近一次计算因断言失败且比最新快照新时，定义页显示红色失败提示（#839）：断言名与不合格行数人人可看，不合格的键、来源映射与「查看样本」链接只给有 sources:read 的角色，再算成功提示消失；
+// 最近一次计算因断言失败且比最新快照新时，定义页显示红色失败提示（#839）：断言名与不合格行数人人可看，不合格的键、来源映射与「查看样本」链接只给有 sources:read 的角色，再算成功提示消失；还没有快照时（发布后第一次计算就失败）不说「继续使用上一版」；
 // 新建页写需求「用模型生成草稿」填进编辑框、不保存，不过校验时 422 保持原内容，未配置模型服务时 400，查看者 403；标签同样能生成，没有可引用的已发布指标时 400；
 // 指标新建页默认是条件构建器（?mode=builder|yaml）：「检查」只编译给出摘要与编译出的 SQL、不保存（YAML 模式也能检查），
 // 不合法按行列 400（行列号指向生成的 YAML，一并显示；fieldsFor 里没有的字段服务端兜底拦下），保存得到与手写 YAML 一样的草稿；
@@ -609,6 +609,7 @@ describe('指标与标签定义页', () => {
     expect(html).toMatch(/最近一次计算未通过（[^）]+）/);
     expect(html).toContain('金额非负（silver.order，1 行不合格）');
     expect(html).toContain('不合格的键：A7；来源映射：CRM · orders → order');
+    expect(html).toContain('本次没有产出新快照，分析页继续使用上一版');
     expect(html).toContain(`href="/quality?task=${failed!.id}"`);
     expect(html).toMatch(/data-failure-samples/);
 
@@ -628,6 +629,25 @@ describe('指标与标签定义页', () => {
     expect((await engineer.post(path, { intent: 'recompute' })).status).toBe(302);
     await drain();
     expect(await (await engineer.get(path)).text()).not.toContain('data-last-failure');
+  });
+
+  it('发布后的第一次计算就因断言失败（还没有任何快照）时，失败提示照常显示，但不说「继续使用上一版」', async () => {
+    const { acme, sources } = await publishedIdentitySources({ orders: true });
+    const author = await memberOf(acme, 'de@acme.com');
+    // 先注入负金额订单 A7 并合并，再发布：发布入队的第一次计算就失败
+    await grantOnSource(`INSERT INTO crm.orders VALUES ('A7', 1, 'paid', -10, '2024-06-29 10:00', '2024-06-29 10:00', now())`);
+    await syncSource(author, sources.crm);
+    await drain();
+    await createDefinition(author, 'metric', 'revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    await publishDefinition(await memberOf(acme, 'de2@acme.com'), 'metric', 'revenue', 1);
+    await drain();
+    expect(await getDb().select({ id: snapshots.id }).from(snapshots).where(eq(snapshots.template, 'metric:revenue'))).toEqual([]);
+
+    const html = await (await (await loginAs(app, 'de@acme.com')).get('/analytics/definitions/metric/revenue')).text();
+    expect(html).toMatch(/data-last-failure/);
+    expect(html).toContain('金额非负（silver.order，1 行不合格）');
+    expect(html).toContain('还没有可用的快照');
+    expect(html).not.toContain('继续使用上一版');
   });
 });
 

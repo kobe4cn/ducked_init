@@ -405,7 +405,7 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
                   <AlertTriangle />
                   <AlertTitle>{`最近一次计算未通过（${time(lastFailure.at)}）`}</AlertTitle>
                   <AlertDescription>
-                    <p>{`${lastFailure.assertions.join('；')}。本次没有产出新快照，分析页继续使用上一版。`}</p>
+                    <p>{`${lastFailure.assertions.join('；')}。${lastRefresh ? '本次没有产出新快照，分析页继续使用上一版。' : '本次没有产出快照，分析页还没有可用的快照。'}`}</p>
                     {lastFailure.samples && (
                       <p>
                         {`不合格的键：${lastFailure.samples.keys.join('、') || '—'}；来源映射：${lastFailure.samples.mappings.join('、') || '—'}。`}
