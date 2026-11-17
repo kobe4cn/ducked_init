@@ -260,8 +260,9 @@ const count = (n: number) => n.toLocaleString('en-US');
 /** RFM 升级预览的分群对比（每个分群的 v1 / v2 人数、变化与 v2 占比）与「原分群 × 新分群」迁移矩阵（含没变的人，对角线淡显；只有计数，ADR-0025） */
 function SegmentUpgradeDistribution({ from, to, distribution }: { from: number; to: number; distribution: NonNullable<UpgradeDiff['distribution']> }) {
   const names = (side: 'before' | 'after') => [...new Set(distribution[side].map(s => s.segment))];
-  // 对比表的行是 v1 / v2 分群名的并集（只有一边有的分群另一边人数为 0）；矩阵的行列再并上迁移里出现的「（无）」
-  const rows = [...new Set([...names('before'), ...names('after'), ...distribution.matrix.map(m => m.before)])].sort(cmpSegment);
+  // 对比表的行是 v1 / v2 分群名的并集（只有一边有的分群另一边人数为 0）；矩阵行是原分群、列是新分群，迁移里出现的「（无）」（新增或移出）也各占一行/列
+  const compareRows = [...new Set([...names('before'), ...names('after')])].sort(cmpSegment);
+  const matrixRows = [...new Set([...names('before'), ...distribution.matrix.map(m => m.before)])].sort(cmpSegment);
   const columns = [...new Set([...names('after'), ...distribution.matrix.map(m => m.after)])].sort(cmpSegment);
   const sideCount = (side: 'before' | 'after', segment: string | null) => distribution[side].find(s => s.segment === segment)?.consumers ?? 0;
   const totalAfter = distribution.after.reduce((n, s) => n + s.consumers, 0);
@@ -280,7 +281,7 @@ function SegmentUpgradeDistribution({ from, to, distribution }: { from: number; 
           </TableRow>
         </TableHeader>
         <TableBody>
-          {rows.map(s => {
+          {compareRows.map(s => {
             const v1 = sideCount('before', s), v2 = sideCount('after', s);
             const delta = v2 - v1;
             return (
@@ -304,7 +305,7 @@ function SegmentUpgradeDistribution({ from, to, distribution }: { from: number; 
           </TableRow>
         </TableHeader>
         <TableBody>
-          {rows.map(b => (
+          {matrixRows.map(b => (
             <TableRow key={b ?? '（无）'}>
               <TableCell>{b ?? '（无）'}</TableCell>
               {columns.map(a => (

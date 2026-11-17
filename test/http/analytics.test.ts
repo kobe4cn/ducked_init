@@ -861,6 +861,8 @@ describe('模板升级', () => {
     expect(diff).toContain('data-upgrade-distribution');
     expect(diff).toContain('data-upgrade-matrix');
     expect(diff).toMatch(/<td[^>]*>v2:[^<]+<\/td>/);
+    // 矩阵行是原分群：v2: 前缀只出现在对比表和矩阵列头，不作为矩阵的出发行
+    expect(diff.slice(diff.indexOf('data-upgrade-matrix'))).not.toMatch(/<td[^>]*>v2:/);
     expect(diff).not.toMatch(/[0-9a-f]{64}/);
 
     // 流失预警：变化、新增、移出人数；提示条与预览头部列出它自己的改动说明
