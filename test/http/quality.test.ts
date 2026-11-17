@@ -5,7 +5,7 @@
 import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, identityExcludedValues, tasks } from '../../app/.server/db/schema';
+import { auditLogs, identityExcludedValues, mappings, tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -25,17 +25,17 @@ beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 // 源表里的姓名、手机、邮箱、外部 ID，页面上一个都不能出现
 const PLAINTEXT = ['张三', '钱七', '13800000002', '138 0000 0001', 'zhang@crm.test', 'qian7@example.com', 'wx_union_8'];
 
-/** 打通好的 acme 先成功算一次 RFM，再注入一单负金额订单 A7 并重算：断言失败 */
+/** 打通好的 acme 先成功算一次 RFM（ok），再注入一单负金额订单 A7 并重算：断言失败（task） */
 async function failedRfm() {
   const fixture = await publishedIdentitySources({ orders: true });
   const { acme, sources } = fixture;
-  await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
+  const ok = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
   await grantOnSource(`INSERT INTO crm.orders VALUES ('A7', 1, 'paid', -10, '2024-06-29 10:00', '2024-06-29 10:00', now())`);
   await syncSource(await memberOf(acme, 'de@acme.com'), sources.crm);
   await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
   const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
   expect(task).toMatchObject({ status: 'failed' });
-  return { ...fixture, task: task! };
+  return { ...fixture, ok: ok!, task: task! };
 }
 
 /** 本租户的合并任务，新的在前 */
@@ -179,6 +179,52 @@ describe('数据质量页', () => {
     expect(html).toMatch(/>1(<!-- -->)? 行不合格</);
     expect(html).toMatch(/最近一次阻断失败<\/div><div class="[^"]*">1<\/div>/);
     expect(html).toContain(`结果层任务 ${task.id}`);
+  });
+
+  it('按任务筛选：?task= 只看该任务的断言与隔离区，隔离区行显示来源映射并链到映射详情页；映射删了只显 ID；参数不是 UUID 忽略；别的租户用同一 ID 是空', async () => {
+    const { acme, orderMappings, ok, task } = await failedRfm();
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const browser = await loginAs(app, 'analyst@acme.com');
+
+    // 失败任务：只显示这次的断言与隔离区，顶部提示筛选、给出「看全部」；隔离区行带映射名与链接
+    const html = await (await browser.get(`/quality?task=${task.id}`)).text();
+    expect(html).toContain('只看任务');
+    expect(html).toContain(task.id);
+    expect(html).not.toContain(ok.id);
+    expect(html).toContain('href="/quality"');
+    expect(html).toMatch(/data-quarantine-key="A7"/);
+    expect(html).toContain(`data-quarantine-mapping="${orderMappings!.crm}"`);
+    expect(html).toMatch(new RegExp(`href="/mappings/${orderMappings!.crm}"`));
+    expect(html).toContain('CRM · orders → order');
+
+    // 之前成功的那次：断言记录都在（这一列只显 ok），隔离区是空的（「最近一次」统计仍是全局的，不受筛选影响）
+    const okHtml = await (await browser.get(`/quality?task=${ok.id}`)).text();
+    expect(okHtml).toContain(ok.id);
+    expect(okHtml).not.toContain('data-quarantine-key');
+    expect(okHtml).not.toContain('A7');
+    expect(okHtml).toContain('隔离区是空的');
+
+    // 参数不是 UUID：忽略筛选，和不带参数一样
+    const bad = await (await browser.get('/quality?task=not-a-uuid')).text();
+    expect(bad).toMatch(/data-quarantine-key="A7"/);
+    expect(bad).toContain(ok.id);
+    expect(bad).not.toContain('只看任务');
+
+    // 映射删除后查不到名字：只显示映射 ID，不出链接
+    await getDb().delete(mappings).where(eq(mappings.id, orderMappings!.crm));
+    const gone = await (await browser.get(`/quality?task=${task.id}`)).text();
+    expect(gone).toContain(`data-quarantine-mapping="${orderMappings!.crm}"`);
+    expect(gone).not.toMatch(new RegExp(`href="/mappings/${orderMappings!.crm}"`));
+    expect(gone).not.toContain('CRM · orders → order');
+
+    // 别的租户的成员用同一个任务 ID 打开：列表是空的，看不到本租户的数据
+    const globex = await newTenant('globex');
+    await memberOf(globex, 'analyst@globex.com', 'analyst');
+    const other = await loginAs(app, 'analyst@globex.com');
+    const cross = await (await other.get(`/quality?task=${task.id}`)).text();
+    expect(cross).not.toContain('A7');
+    expect(cross).not.toContain('data-quarantine');
+    expect(cross).not.toContain('data-assertion=');
   });
 
   it('其他租户的成员只看到自己湖里的断言结果，看不到本租户的断言结果与隔离区', async () => {

@@ -1,9 +1,10 @@
 // app/routes/quality.tsx —— 数据质量（有 sources:read 的成员）：本租户最近的内置断言结果（来自 silver._assertion_runs）与隔离区里不合格行的样本（silver._quarantine），
 // 以及最近一次成功打通里连了太多源记录的匹配值（只有加盐哈希、记录数与数据源名，见 ADR-0039）。有 sources:write 的成员可以把其中的值标为不参与匹配、
 // 或撤销：写平台表、记审计，并在同一个事务里入队一次强制重算打通的合并；页面列出已标记的值（哈希、标记人、时间）。
-// 合并时映射的自定义断言也记在 silver._assertion_runs，显示为「自定义：<字段> <检查>」。每次请求只读挂载本租户的数据湖读取；样本只来自标准层，敏感字段只有哈希。失败的 error 断言标红，warn 标琥珀色
+// 合并时映射的自定义断言也记在 silver._assertion_runs，显示为「自定义：<字段> <检查>」。每次请求只读挂载本租户的数据湖读取；样本只来自标准层，敏感字段只有哈希。失败的 error 断言标红，warn 标琥珀色。
+// ?task=<任务 ID> 只看这一次任务的记录（#838，不是 UUID 时忽略），隔离区每行还显示来源映射「源 · 表 → 实体」并链到映射详情页
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
-import { data, Form, useNavigation } from 'react-router';
+import { data, Form, Link, useNavigation } from 'react-router';
 import type { Route } from './+types/quality';
 import { can, requirePermission } from '~/.server/access';
 import { excludeValue, ExclusionError, includeValue, listExcludedValues } from '~/.server/identity-exclusions';
@@ -11,8 +12,9 @@ import { latestIdentitySummary } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
 import { HOT_VALUE_THRESHOLD } from '~/.server/pipeline/identity-engine';
 import { ASSERTION_LABELS, describeCustom, SAMPLE_LIMIT, type AssertionLevel } from '~/.server/pipeline/assertions';
-import { latestResultCheck, QUALITY_QUARANTINE, QUALITY_RUNS, readQuality } from '~/.server/quality';
+import { latestResultCheck, mappingLabels, QUALITY_QUARANTINE, QUALITY_RUNS, readQuality } from '~/.server/quality';
 import { listSources } from '~/.server/sources';
+import { UUID } from '~/.server/tenants';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
 import { StatTile } from '~/components/stat-tile';
@@ -26,12 +28,18 @@ export function meta({}: Route.MetaArgs) {
 
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'sources:read');
-  const { runs, quarantine } = await readQuality(member.tenant.id);
+  // ?task=<任务 ID> 只看这一次任务（#838）；不是 UUID 时忽略，当作没有筛选
+  const task = new URL(request.url).searchParams.get('task');
+  const taskFilter = task && UUID.test(task) ? task : null;
+  const { runs, quarantine } = await readQuality(member.tenant.id, { taskId: taskFilter ?? undefined });
   // 「最近一次」只看结果层任务：合并任务的自定义断言也写运行记录，error 失败时还会回滚、不留记录
   const check = await latestResultCheck(member.tenant.id);
   const latest = check?.assertions ?? [];
   // 结果里的 sources 是数据源 ID（工作进程不读平台库），在这里换成名字；删掉的数据源照旧显示 ID
-  const [identity, sources, excluded] = await Promise.all([latestIdentitySummary(member.tenant.id), listSources(member), listExcludedValues(member.tenant.id)]);
+  const [identity, sources, excluded, mappingNames] = await Promise.all([
+    latestIdentitySummary(member.tenant.id), listSources(member), listExcludedValues(member.tenant.id),
+    mappingLabels(member.tenant.id, quarantine.flatMap(q => (q.mappingId ? [q.mappingId] : []))),
+  ]);
   const names = new Map(sources.map(s => [s.id, s.name]));
   const hot = (identity?.hot ?? []).map(h => ({ rule: h.rule, hash: h.hash, records: h.records, sources: h.sources.map(id => names.get(id) ?? id) }));
   return {
@@ -39,7 +47,10 @@ export async function loader({ request }: Route.LoaderArgs) {
     nav: navFor(member),
     canWrite: can(member.role, 'sources:write'),
     runs,
-    quarantine,
+    /** 隔离区行的来源映射：ID 与显示名（映射已删除时 mappingLabel 为 null，页面只显 ID） */
+    quarantine: quarantine.map(q => ({ ...q, mappingLabel: q.mappingId ? mappingNames.get(q.mappingId) ?? null : null })),
+    /** 按任务筛选时的任务 ID；null 表示未筛选 */
+    taskFilter,
     labels: labelsFor(runs.flatMap(r => r.assertions).map(a => a.name)),
     /** 最近一次成功打通的热值；还没成功打通过时为 null */
     hot: identity ? hot : null,
@@ -116,12 +127,18 @@ function HashAction({ intent, hash, children }: { intent: 'exclude' | 'include';
 }
 
 export default function Quality({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, canWrite, runs, quarantine, hot, hotThreshold, excluded, labels, limits, latest } = loaderData;
+  const { email, nav, canWrite, runs, quarantine, taskFilter, hot, hotThreshold, excluded, labels, limits, latest } = loaderData;
   const label = (name: string) => labels[name] ?? name;
   const isExcluded = (hash: string) => excluded.some(e => e.hash === hash);
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader title="数据质量" description="结果层任务计算前对标准层做的内置检查，以及合并时映射里写的自定义断言。阻断级失败时任务不产出新快照（自定义断言则是这个映射合并失败），告警级只记录；不合格行的样本放在隔离区，敏感字段只有哈希。" />
+
+      {taskFilter && (
+        <p className="text-sm text-slate-500" data-task-filter>
+          只看任务 <span className="font-mono text-xs">{taskFilter}</span>。<Link to="/quality" className="text-slate-900 underline">看全部</Link>
+        </p>
+      )}
 
       <div className="grid gap-4 sm:grid-cols-3">
         <StatTile label="最近一次阻断失败" value={latest.errors} tone={latest.errors ? 'text-red-600' : undefined} hint={latest.taskId ? `结果层任务 ${latest.taskId}` : '还没有运行记录'} />
@@ -248,6 +265,7 @@ export default function Quality({ loaderData, actionData }: Route.ComponentProps
                 <TableHead>断言</TableHead>
                 <TableHead>实体</TableHead>
                 <TableHead>键</TableHead>
+                <TableHead>来源映射</TableHead>
                 <TableHead>行</TableHead>
               </TableRow>
             </TableHeader>
@@ -258,6 +276,9 @@ export default function Quality({ loaderData, actionData }: Route.ComponentProps
                   <TableCell><Failed level={q.level}>{label(q.assertion)}</Failed></TableCell>
                   <TableCell>silver.{q.entity}</TableCell>
                   <TableCell className="font-mono text-xs">{q.key}</TableCell>
+                  <TableCell data-quarantine-mapping={q.mappingId ?? undefined}>{q.mappingLabel
+                    ? <Link to={`/mappings/${q.mappingId}`} className="hover:underline">{q.mappingLabel}</Link>
+                    : <span className="font-mono text-xs text-slate-400">{q.mappingId}</span>}</TableCell>
                   <TableCell className="max-w-xl whitespace-normal break-all font-mono text-xs text-slate-500">{q.row}</TableCell>
                 </TableRow>
               ))}
