@@ -21,6 +21,7 @@ import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
 import { lit } from '../lib/mapping-expr';
 import { rows } from './pipeline/duck-sql';
 import { latestTemplate, missingTableHint, TASK_KINDS, templateAt, TEMPLATES, type Template, type TemplateId } from './pipeline/templates';
+import { summarizeSegmentUpgrade } from './pipeline/templates/upgrade-summary';
 import { insertTask } from './tasks';
 
 export { TASK_KINDS, templateOfKind, type TemplateId } from './pipeline/templates';
@@ -271,7 +272,8 @@ async function requireUpgradable(db: Tx | Db, tenantId: string, template: Templa
 
 /**
  * 预览升级差异：需要定义查看权限。以生效版本的参数加上参考日期 asOf（不给时为当天，UTC；不能晚于今天），分别按它锁定的模板版本与当前版本编译，
- * 在只读挂载的数据湖上按 consumer_id 对比，只给计数（ADR-0025）：RFM 是分群迁移（原分群 → 新分群的人数），其他模板是换了取值、新增、移出的人数。
+ * 在只读挂载的数据湖上按 consumer_id 对比，只给计数（ADR-0025）：RFM 是分群迁移（原分群 → 新分群的人数）加 v1 / v2 各分群人数、完整迁移矩阵（含没变的人）
+ * 与一句话结论（upgrade-summary.ts，不调模型），其他模板是换了取值、新增、移出的人数（distribution 与 summary 由 #829 的后续子票补上）。
  * 不出 consumer_id，不建表、不入队任务、不登记快照。已是当前版本时报「已是最新模板版本」，当前版本不接受生效的参数时说明原因
  */
 export async function previewTemplateUpgrade(actor: CurrentMember, id: string, asOf?: string) {
@@ -296,14 +298,42 @@ export async function previewTemplateUpgrade(actor: CurrentMember, id: string, a
       const has = (t: string) => present.has(t);
       const oldSql = locked.compile(before, has), newSql = latest.compile(after, has);
       const segment = (sql: string) => `SELECT consumer_id, segment AS tag_value FROM (${sql})`;
+      if (template !== 'rfm') {
+        return {
+          template,
+          from: published.templateVersion,
+          to: latest.version,
+          asOf: day,
+          segments: null,
+          metric: (await rows<DiffCounts>(con, compileMetricDiff(oldSql, newSql)))[0]!,
+          /** 各分群分布对比与一句话结论：其他模板由 #829 的后续子票补上 */
+          distribution: null,
+          summary: null,
+        };
+      }
+      // RFM 在同一个只读连接上多跑各分群人数与完整迁移（compileTagDiff 去掉 WHERE：含没变的人）。
+      // 迁移 SQL 内联在这里：dsl-definitions 的标签影响预览还在用 impact.ts 的版本，不改它
+      const segmentCounts = (sql: string) => rows<{ segment: string; consumers: number }>(con, `
+        SELECT tag_value AS segment, count(*)::INTEGER AS consumers FROM (${segment(sql)}) GROUP BY tag_value ORDER BY tag_value`);
+      const matrix = await rows<TagTransition>(con, `
+        WITH o AS (${segment(oldSql)}),
+        n AS (${segment(newSql)})
+        SELECT o.tag_value AS before, n.tag_value AS after, count(*)::INTEGER AS consumers
+        FROM o FULL JOIN n ON n.consumer_id = o.consumer_id
+        GROUP BY ALL
+        ORDER BY ALL NULLS FIRST`);
       return {
         template,
         from: published.templateVersion,
         to: latest.version,
         asOf: day,
-        /** RFM：分群迁移，取值没变的人不出现 */
-        segments: template === 'rfm' ? await rows<TagTransition>(con, compileTagDiff(segment(oldSql), segment(newSql))) : null,
-        metric: template === 'rfm' ? null : (await rows<DiffCounts>(con, compileMetricDiff(oldSql, newSql)))[0]!,
+        /** 分群迁移，取值没变的人不出现 */
+        segments: await rows<TagTransition>(con, compileTagDiff(segment(oldSql), segment(newSql))),
+        metric: null,
+        /** v1 / v2 各分群人数与「原分群 × 新分群」迁移矩阵（含没变的人；新增、移出的一边为 null） */
+        distribution: { kind: 'segments', before: await segmentCounts(oldSql), after: await segmentCounts(newSql), matrix },
+        /** 一句话结论：由代码从矩阵计数生成，不调用模型 */
+        summary: summarizeSegmentUpgrade(matrix),
       };
     });
   } catch (e) {
