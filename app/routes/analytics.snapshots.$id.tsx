@@ -217,7 +217,7 @@ function ChurnResult({ tab, page, pages, pageSize, snapshot, total, atRisk, rows
   return (
     <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatTile label="有风险人数" value={atRisk.toLocaleString('zh-CN')} tone="text-amber-600" hint="沉默比超过风险阈值的消费者" />
+        <StatTile label="有风险人数" value={atRisk.toLocaleString('zh-CN')} tone={atRisk ? 'text-amber-600' : undefined} hint="沉默比超过风险阈值的消费者" />
         <StatTile label="风险占比" value={total ? `${((atRisk / total) * 100).toFixed(1)}%` : '—'} hint="有风险人数 ÷ 总人数" />
         <StatTile label="总人数" value={total.toLocaleString('zh-CN')} hint="回看窗口内有购买节奏的消费者" />
         <StatTile label="参考日期" value={snapshot.asOf} hint="计算沉默天数的基准" />
