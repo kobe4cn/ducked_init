@@ -35,12 +35,16 @@ export async function closePgvectorPools() {
   pools.clear();
 }
 
-/** 抹掉错误信息里的连接串与凭据：整串 url、密码原文、百分号编码的密码、用户名都换成 ***
- *  （照 source-engine.ts 的 redactSourceSecrets 的思路；那边吃 SourceSpec，这里吃连接串） */
+/** 百分号解码；解码失败（不成对的 %）就退回原值 */
+const decodeOr = (s: string): string => { try { return decodeURIComponent(s); } catch { return s; } };
+
+/** 抹掉错误信息里的连接串与凭据：整串 url、密码原文、URL 里编码过的密码、用户名原文、URL 里编码过的用户名都换成 ***
+ *  （照 source-engine.ts 的 redactSourceSecrets 的思路；那边吃 SourceSpec，这里吃连接串）。
+ *  new URL 给的 username / password 是百分号编码后的值，pg 报错里出现的是解码后的原文，两种都要抹 */
 function redactUrl(message: string, url: string): string {
   let username = '', password = '';
   try { ({ username, password } = new URL(url)); } catch { /* 连接串不合法：没有可提取的凭据，下面仍把整串抹掉 */ }
-  return [url, password, encodeURIComponent(password), username]
+  return [url, decodeOr(password), password, decodeOr(username), username]
     .filter(s => s !== '')
     .reduce((m, secret) => m.replaceAll(secret, '***'), message);
 }
