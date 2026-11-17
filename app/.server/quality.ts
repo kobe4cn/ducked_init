@@ -1,5 +1,5 @@
 // app/.server/quality.ts —— 数据质量告警（ADR-0026）：结果层任务因 error 级断言失败时，给租户管理员发邮件并记审计。
-// 邮件与审计只写断言名、实体与不合格行数，不写行内容。数据质量页只读挂载本租户数据湖，读最近的断言运行记录与隔离区样本（只来自标准层，敏感字段只有哈希）；
+// 报错文本、邮件与审计写断言名、实体、不合格行数与来源映射名，并附数据质量页链接；不写键与行内容。数据质量页只读挂载本租户数据湖，读最近的断言运行记录与隔离区样本（只来自标准层，敏感字段只有哈希）；
 // 顶部「最近一次」统计取平台库里最近一次结果层任务的断言结果（合并任务也写运行记录，且 error 失败时回滚不留记录，不能拿湖里最近一条当准）。
 // readQuality 可按任务 ID 过滤（#838，定义页的失败提示与告警链到 /quality?task=）；隔离区行 JSON 里的 _mapping 是映射 ID，mappingLabels 给出「源 · 表 → 实体」
 import { and, desc, eq, inArray, isNotNull, like, sql } from 'drizzle-orm';
@@ -11,6 +11,7 @@ import { getMailer } from './mailer';
 import { openTenantLake } from './pipeline/lake-engine';
 import { describeAssertion, failedErrors, type AssertionLevel, type AssertionResult } from './pipeline/assertions';
 import { CONTRACTS, readResult, type TaskKind } from './pipeline/task-contracts';
+import { appLink } from './schema-alerts';
 import { lit } from '../lib/mapping-expr';
 
 /** 任务结果里有失败的 error 级断言时告警；没有时什么也不做。单个管理员发信失败只记日志，不影响其他人 */
@@ -18,10 +19,19 @@ export async function alertAssertionFailure(tenantId: string, task: { id: string
   const failed = failedErrors((result?.assertions as AssertionResult[] | undefined) ?? []);
   if (!failed.length) return;
   const { label } = CONTRACTS[task.kind];
-  const summaries = failed.map(describeAssertion);
+  // 断言在工作进程里跑，结果里的 mappings 只有映射 ID（ADR-0008）：这里换成「源 · 表 → 实体」，已删除的映射查不到，原样写 ID
+  const labels = await mappingLabels(tenantId, [...new Set(failed.flatMap(r => r.mappings ?? []))]);
+  const sourcesOf = (r: AssertionResult) => (r.mappings ?? []).map(id => labels.get(id) ?? id);
+  const summaries = failed.map(r => {
+    const sources = sourcesOf(r);
+    return `${describeAssertion(r)}${sources.length ? `，来源：${sources.join('、')}` : ''}`;
+  });
+  const link = appLink(`/quality?task=${task.id}`);
+  // 任务页的报错文本换上带来源的摘要并附链接（本钩子在 finishTask 之后执行，不会随后者写库而被覆盖）
+  await getDb().update(tasks).set({ error: `断言失败：${summaries.join('；')}。查看样本：${link}` }).where(eq(tasks.id, task.id));
   await recordAudit(getDb(), {
     tenantId, system: true, action: 'assertion.failed', targetType: 'task', targetId: task.id,
-    detail: { task: label, summaries, assertions: failed },
+    detail: { task: label, summaries, mappings: [...new Set(failed.flatMap(sourcesOf))], link, assertions: failed },
   });
   const admins = await getDb().select({ email: members.email }).from(members)
     .where(and(eq(members.tenantId, tenantId), eq(members.role, 'admin')));
@@ -31,6 +41,8 @@ export async function alertAssertionFailure(tenantId: string, task: { id: string
     ...summaries.map(s => `- ${s}`),
     '',
     '请检查对应映射的源数据，修正后重新合并并重算。',
+    '',
+    `查看样本：${link}`,
   ].join('\n');
   for (const { email } of admins) {
     await getMailer().send({ to: email, subject: `数据检查未通过：${label}`, text })

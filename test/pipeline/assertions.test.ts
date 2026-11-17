@@ -5,7 +5,7 @@ import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { mappings } from '../../app/.server/db/schema';
+import { auditLogs, mappings } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { setMailer, type Mail } from '../../app/.server/mailer';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
@@ -64,7 +64,7 @@ async function withRfmSnapshot() {
   return { ...fixture, snapshot };
 }
 
-/** 断言失败后：没有新快照、没有新的快照表，旧快照仍可读；管理员收到一封只带断言名、实体与行数的邮件，审计里一条断言失败 */
+/** 断言失败后：没有新快照、没有新的快照表，旧快照仍可读；管理员收到一封带断言名、实体、行数与来源映射名的邮件，审计里一条断言失败 */
 async function expectBlocked(acme: string, snapshot: Awaited<ReturnType<typeof withRfmSnapshot>>['snapshot'], summary: RegExp) {
   expect(await ranSnapshots(acme)).toEqual([snapshot]);
   expect(await goldTables(acme)).toEqual((await listSnapshots(acme)).map(s => s.table.slice('gold.'.length)).sort());
@@ -80,19 +80,19 @@ async function expectBlocked(acme: string, snapshot: Awaited<ReturnType<typeof w
 
 describe('error 断言阻断快照并告警', () => {
   it('标准层出现负金额：gold.rfm 失败，结果带断言名、实体与不合格行数；不登记新快照，旧快照仍可读', async () => {
-    const { acme, sources, snapshot } = await withRfmSnapshot();
+    const { acme, sources, snapshot, orderMappings } = await withRfmSnapshot();
     await insertCrmOrder(acme, sources.crm, `'A7', 1, 'paid', -10, '2024-06-29 10:00', '2024-06-29 10:00', now()`);
 
     const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
     expect(task).toMatchObject({ status: 'failed', error: expect.stringContaining('金额非负（silver.order，1 行不合格）') });
     expect((task!.result as { assertions: unknown[] }).assertions).toContainEqual(
-      { name: 'amount_non_negative', level: 'error', entity: 'order', failed: 1, detail: 'amount' });
+      { name: 'amount_non_negative', level: 'error', entity: 'order', failed: 1, detail: 'amount', mappings: [orderMappings!.crm] });
     await expectBlocked(acme, snapshot, /金额非负（silver\.order，1 行不合格）/);
     expect(outbox[0].text).not.toContain('A7');
   });
 
   it('标准层出现重复主键：gold.rfm 失败并告警，不登记新快照', async () => {
-    const { acme, sources, snapshot } = await withRfmSnapshot();
+    const { acme, sources, snapshot, orderMappings } = await withRfmSnapshot();
     // 与会员订单 1 撞主键：正常合并会被独占检查挡住，用 mergeUnchecked 造出重复
     await insertCrmOrder(acme, sources.crm, `'1', 1, 'paid', 10, '2024-06-29 10:00', '2024-06-29 10:00', now()`);
     const [crmOrders] = await getDb().select({ id: mappings.id }).from(mappings)
@@ -102,8 +102,9 @@ describe('error 断言阻断快照并告警', () => {
 
     const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
     expect(task).toMatchObject({ status: 'failed' });
-    expect((task!.result as { assertions: unknown[] }).assertions).toContainEqual(
-      { name: 'primary_key_unique', level: 'error', entity: 'order', failed: 2, detail: 'order_id, _key_space' });
+    // 重复的订单 1 一行来自 CRM、一行来自会员源，两个映射都写上（DISTINCT 的顺序不保证）
+    expect((task!.result as { assertions: unknown[] }).assertions).toContainEqual(expect.objectContaining(
+      { name: 'primary_key_unique', level: 'error', entity: 'order', failed: 2, mappings: expect.arrayContaining([orderMappings!.crm, orderMappings!.loyalty]) }));
     await expectBlocked(acme, snapshot, /主键唯一（silver\.order，2 行不合格）/);
     const rows = await onLake<{ assertion: string; key: string }>(acme, `SELECT assertion, "key" FROM silver._quarantine WHERE task_id = ${lit(task!.id)}`);
     expect(rows).toEqual([{ assertion: 'primary_key_unique', key: '1' }, { assertion: 'primary_key_unique', key: '1' }]);
@@ -122,6 +123,31 @@ describe('error 断言阻断快照并告警', () => {
     expect(ok).toMatchObject({ status: 'succeeded' });
     expect(new Set((ok!.result as { assertions: { entity: string }[] }).assertions.map(a => a.entity))).toEqual(new Set(['customer']));
   });
+
+  it('断言失败的报错文本、邮件与审计写出来源映射名并链到数据质量页，仍不写不合格的键（A7）', async () => {
+    const { acme, sources, snapshot, orderMappings } = await withRfmSnapshot();
+    await insertCrmOrder(acme, sources.crm, `'A7', 1, 'paid', -10, '2024-06-29 10:00', '2024-06-29 10:00', now()`);
+
+    const task = await runTask(acme, 'gold.dsl',
+      { kind: 'metric', key: 'm', asOf: '2024-07-01', sql: 'SELECT consumer_id, 1 AS value FROM silver._identities', entities: ['order', 'customer'] });
+    expect(task).toMatchObject({ status: 'failed' });
+    const link = `/quality?task=${task!.id}`;
+    // 结果里带样本中出现的映射 ID（工作进程连不上平台库，只有 ID；名字在告警时才查，ADR-0008）
+    expect((task!.result as { assertions: unknown[] }).assertions).toContainEqual(
+      { name: 'amount_non_negative', level: 'error', entity: 'order', failed: 1, detail: 'amount', mappings: [orderMappings!.crm] });
+    // 任务页的报错文本：每条失败断言后面写来源映射名「源 · 表 → 实体」，末尾附数据质量页链接（筛选出本任务的样本）
+    expect(task!.error).toContain(`断言失败：金额非负（silver.order，1 行不合格），来源：CRM · orders → order。查看样本：${link}`);
+    await expectBlocked(acme, snapshot, /金额非负（silver\.order，1 行不合格），来源：CRM · orders → order/);
+
+    // 邮件正文与审计描述同样带来源映射名和链接；不合格的键不写（是否写键见 #842）
+    expect(outbox[0].text).toContain('来源：CRM · orders → order');
+    expect(outbox[0].text).toContain(link);
+    expect(outbox[0].text).not.toContain('A7');
+    const [audit] = await getDb().select().from(auditLogs)
+      .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'assertion.failed')));
+    expect(audit!.detail).toMatchObject({ mappings: ['CRM · orders → order'], link });
+    expect((await listAuditLogs(acme)).find(a => a.action === '断言失败')!.summary).toContain(link);
+  });
 });
 
 /** 湖里某个任务的断言运行记录 */
@@ -130,7 +156,7 @@ const assertionRuns = (acme: string, taskId: string) => onLake<{ entity: string;
 
 describe('warn 断言只记录不阻断', () => {
   it('订单关联消费者的比例低于 80%：记一条 warn（带比例与孤儿数），任务成功、登记快照，运行记录里也有', async () => {
-    const { acme, sources, snapshot } = await withRfmSnapshot();
+    const { acme, sources, snapshot, orderMappings } = await withRfmSnapshot();
     // 种子数据 11 单里 10 单关联得上，不触发
     expect((await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' }))!.result).toMatchObject({
       assertions: expect.arrayContaining([{ name: 'order_customer_link', level: 'warn', entity: 'order', failed: 0, ratio: 0.9091, orphans: 1 }]),
@@ -144,7 +170,8 @@ describe('warn 断言只记录不阻断', () => {
     const task = await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' });
     expect(task).toMatchObject({ status: 'succeeded' });
     const warn = { name: 'order_customer_link', level: 'warn', entity: 'order', failed: 3, ratio: 0.7692, orphans: 3 };
-    expect((task!.result as { assertions: unknown[] }).assertions).toContainEqual(warn);
+    // 孤儿订单都在 CRM 订单映射名下，结果里带映射 ID；运行记录在写隔离区之前记下，没有映射 ID
+    expect((task!.result as { assertions: unknown[] }).assertions).toContainEqual({ ...warn, mappings: [orderMappings!.crm] });
     const snapshots = await ranSnapshots(acme);
     expect(snapshots).toHaveLength(3);
     expect(snapshots).toContainEqual(snapshot);
@@ -157,7 +184,7 @@ describe('warn 断言只记录不阻断', () => {
     // gold.dsl 只读订单时同样检查（silver.customer 不在参数里也查）
     const dsl = await runTask(acme, 'gold.dsl', { kind: 'metric', key: 'm', asOf: '2024-07-01', sql: 'SELECT consumer_id, 1 AS value FROM silver._identities', entities: ['order'] });
     expect(dsl).toMatchObject({ status: 'succeeded' });
-    expect((dsl!.result as { assertions: unknown[] }).assertions).toContainEqual(warn);
+    expect((dsl!.result as { assertions: unknown[] }).assertions).toContainEqual({ ...warn, mappings: [orderMappings!.crm] });
   });
 
   it('实体行数比上一次运行少一半以上：记一条 warn（带前后行数），首次运行没有基准不报', async () => {
@@ -265,7 +292,7 @@ fields:
   points: points
 `;
 
-/** 身份打通的租户上再登记积分源（shop schema），同步并发布会员与积分流水的映射 */
+/** 身份打通的租户上再登记积分源（shop schema），同步并发布会员与积分流水的映射（pointMappings 给出两个映射 ID） */
 async function withPointsSource() {
   const fixture = await publishedIdentitySources();
   const { author, reviewer } = fixture;
@@ -279,9 +306,9 @@ async function withPointsSource() {
   await confirmWatermark(author, id, 'memberships', 'updated_at');
   await syncSource(author, id);
   await drain();
-  await publish(author, reviewer, id, POINT_LOGS_MAPPING);
-  await publish(author, reviewer, id, MEMBERSHIPS_MAPPING);
-  return { ...fixture, points: id };
+  const logs = await publish(author, reviewer, id, POINT_LOGS_MAPPING);
+  const memberships = await publish(author, reviewer, id, MEMBERSHIPS_MAPPING);
+  return { ...fixture, points: id, pointMappings: { logs, memberships } };
 }
 
 const pointsDsl = { kind: 'metric', key: 'm', asOf: '2024-07-01', sql: 'SELECT consumer_id, 1 AS value FROM silver._identities', entities: ['membership', 'points_transaction'] };
@@ -306,7 +333,7 @@ describe('积分余额与积分流水的一致性', () => {
   });
 
   it('流水 balance_after 不等于上一笔余额加本笔变动时报断档，样本写这笔流水；任务照常产出', async () => {
-    const { acme, points } = await withPointsSource();
+    const { acme, points, pointMappings } = await withPointsSource();
     await grantOnSource(`INSERT INTO shop.point_logs (customer_id, member_no, change_type, points, balance, order_no, created_at, expire_time)
       VALUES (2, 'M002', '获得', 5, 99, NULL, '2024-06-08 10:00', NULL)`);
     await syncSource(await memberOf(acme, 'de@acme.com'), points);
@@ -315,7 +342,8 @@ describe('积分余额与积分流水的一致性', () => {
     const task = await runTask(acme, 'gold.dsl', pointsDsl);
     expect(task).toMatchObject({ status: 'succeeded' });
     const assertions = (task!.result as { assertions: unknown[] }).assertions;
-    expect(assertions).toContainEqual({ name: 'points_chain', level: 'warn', entity: 'points_transaction', failed: 1, detail: 'balance_after' });
+    expect(assertions).toContainEqual(
+      { name: 'points_chain', level: 'warn', entity: 'points_transaction', failed: 1, detail: 'balance_after', mappings: [pointMappings.logs] });
     expect(assertions).toContainEqual(expect.objectContaining({ name: 'points_balance', failed: 2, detail: '2 个会员不一致，差额合计 35' }));
     const chain = (await quarantine(acme, task!.id)).filter(r => r.assertion === 'points_chain');
     expect(chain.map(r => [r.entity, r.key])).toEqual([['points_transaction', '12']]);
