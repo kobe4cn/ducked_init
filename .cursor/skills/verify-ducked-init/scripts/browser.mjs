@@ -18,6 +18,9 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
+// 从这个 Chrome 启动起收集的控制台消息。`console` 命令打印它们，别的命令不打印。
+const browserConsole = [];
+
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const skillDir = resolve(scriptDir, '..');
 const selfPath = fileURLToPath(import.meta.url);
@@ -99,6 +102,12 @@ async function runDaemon(dir) {
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
   const page = context.pages()[0] || await context.newPage();
+  page.on('console', msg => {
+    browserConsole.push({ type: msg.type(), text: msg.text() });
+  });
+  page.on('pageerror', err => {
+    browserConsole.push({ type: 'pageerror', text: String(err) });
+  });
   const sock = join(state.STATE_DIR, 'browser.sock');
   if (existsSync(sock)) unlinkSync(sock);
   const server = net.createServer(socket => {
@@ -248,6 +257,11 @@ async function handle(page, state, req) {
   if (cmd === 'scroll-y') {
     return { stdout: String(Math.round(await page.evaluate(() => window.scrollY))) };
   }
+  if (cmd === 'console') {
+    const lines = [`console-events=${browserConsole.length}`];
+    for (const event of browserConsole) lines.push(`${event.type}\t${event.text.replaceAll('\n', ' ')}`);
+    return { stdout: lines.join('\n') };
+  }
   if (cmd === 'scroll-into') {
     // 把控件滚进视口，并打印滚动后的 window.scrollY。数据源页的确认按钮在折线以下，提交后要用 scroll-y 证明没有跳回顶部。
     const target = req.selector
@@ -261,7 +275,7 @@ async function handle(page, state, req) {
 }
 
 function usage() {
-  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|scroll-y|scroll-into|magic-link> [args]`);
+  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|scroll-y|scroll-into|console|magic-link> [args]`);
   console.error('click accepts --role and --name, or --selector <css>. --confirm accept|dismiss handles one window.confirm');
 }
 
