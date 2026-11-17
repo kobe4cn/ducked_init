@@ -1,9 +1,10 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { tenants } from '../../app/.server/db/schema';
+import { tasks, tenants } from '../../app/.server/db/schema';
 import { totpCode } from '../../app/.server/totp';
 import { newTenant } from '../pipeline/fixtures';
+import { platformEmbedding } from '../pipeline/llm-fixtures';
 import {
   createOperator, createTenant, extractOpsLink, loginAs, loginAsOperator, opsMagicLogin, resetDb, resetOperatorTotp, runCli, scanTotpQrOn, startApp,
   totpSecretOn,
@@ -477,6 +478,24 @@ describe('运营者切换租户混合检索', () => {
     expect(res.headers.get('Location')).toBe('/ops/login');
     const [row] = await getDb().select({ hybridSearch: tenants.hybridSearch }).from(tenants).where(eq(tenants.id, acme));
     expect(row.hybridSearch).toBe(false);
+  });
+
+  it('打开混合检索时配了 embedding 的租户提前排补算任务，关掉再开不重复入队（#824）', async () => {
+    platformEmbedding(); // HTTP 测试的 env 与服务端共享，服务端同样解析得到平台端点
+    const acme = await newTenant('acme');
+    await createOperator(OPS);
+    const { browser: ops } = await loginAsOperator(app, OPS);
+    const catalogTasks = () => getDb().select().from(tasks)
+      .where(and(eq(tasks.tenantId, acme), inArray(tasks.kind, ['catalog.embed', 'catalog.projection'])));
+
+    const on = await ops.post(`/ops/tenants/${acme}`, { intent: 'set-hybrid-search', enabled: 'true' });
+    expect(on.status).toBe(302);
+    expect((await catalogTasks()).map(t => `${t.kind}/${t.status}`)).toEqual(['catalog.embed/queued']); // 排上了一个补算
+
+    // 关掉再开：投影已刷到最新、补算任务还排着队，不重复入队
+    expect((await ops.post(`/ops/tenants/${acme}`, { intent: 'set-hybrid-search', enabled: 'false' })).status).toBe(302);
+    expect((await ops.post(`/ops/tenants/${acme}`, { intent: 'set-hybrid-search', enabled: 'true' })).status).toBe(302);
+    expect(await catalogTasks()).toHaveLength(1);
   });
 });
 

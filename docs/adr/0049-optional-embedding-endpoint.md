@@ -14,3 +14,4 @@
 
 - embedding 是否默认启用，由黄金集上 Recall@20 的开关对比决定。
 - 端点超时或失败时，向量这一路降级关闭，不影响检索的其余部分。
+- 目录版本变化后（catalogTx 提交后）、运营打开混合检索、租户保存 embedding 配置时，提前补算（`prefetchEmbeddings`，#824）：先把检索投影刷到最新（改动多时它排 `catalog.projection`、其钩子照常补算），再去重排一个 `catalog.embed`；两者缺一项（没开混合检索或没配端点）时不排任务也不刷投影。

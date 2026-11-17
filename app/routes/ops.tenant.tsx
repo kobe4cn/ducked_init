@@ -2,6 +2,7 @@
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import { CircleAlert } from 'lucide-react';
 import type { Route } from './+types/ops.tenant';
+import { prefetchEmbeddings } from '~/.server/catalog/versions';
 import { requireOperator } from '~/.server/ops-auth';
 import { getTenantLake } from '~/.server/lake';
 import { QUOTA_FIELDS, QUOTA_KEYS, type QuotaKey } from '~/.server/quota';
@@ -70,6 +71,11 @@ export async function action({ request, params }: Route.ActionArgs) {
         break;
       case 'set-hybrid-search':
         await setTenantHybridSearch(operator, params.tenantId, field('enabled') === 'true');
+        // 打开混合检索时提前补一次检索向量（#824）：幂等——投影与向量都齐了或已有任务排队就不排；失败只打 warn，不挡开关
+        if (field('enabled') === 'true') {
+          await prefetchEmbeddings(params.tenantId)
+            .catch(e => console.warn('打开混合检索后提前补算向量失败', params.tenantId, e instanceof Error ? e.message : e));
+        }
         break;
       case 'init-lake':
         await initTenantLake(operator, params.tenantId);

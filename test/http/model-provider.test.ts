@@ -5,7 +5,7 @@
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, llmCalls, modelProviders } from '../../app/.server/db/schema';
+import { auditLogs, llmCalls, modelProviders, tasks, tenants } from '../../app/.server/db/schema';
 import { resolveEmbeddingProvider, resolveProvider } from '../../app/.server/llm';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { embeddings, fakeLlm, json, platformDefault, platformEmbedding, text, toolCalls } from '../pipeline/llm-fixtures';
@@ -130,6 +130,21 @@ describe('模型服务页', () => {
     expect(JSON.stringify(logs)).not.toContain(NEW_EKEY);
     const audit = await (await admin.get('/audit')).text();
     expect(audit).toContain('向量检索 https://embed-tenant.example.com/v1');
+  });
+
+  it('保存 embedding 配置时开了混合检索的租户提前排补算任务，没开的不排（#824）', async () => {
+    // 没开混合检索：保存配置不排任务
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    expect((await saveEmbedding(admin)).status).toBe(302);
+    const catalogTasks = () => getDb().select().from(tasks).where(eq(tasks.tenantId, acme));
+    expect((await catalogTasks()).filter(t => t.kind.startsWith('catalog.'))).toHaveLength(0);
+
+    // 打开混合检索（直接改库即可，开关入口的 HTTP 行为由 ops 测试覆盖）再保存：提前排上补算
+    await getDb().update(tenants).set({ hybridSearch: true }).where(eq(tenants.id, acme));
+    expect((await saveEmbedding(admin, NEW_EKEY)).status).toBe(302);
+    expect((await catalogTasks()).filter(t => t.kind.startsWith('catalog.')).map(t => `${t.kind}/${t.status}`))
+      .toEqual(['catalog.embed/queued']);
   });
 
   it('管理员保存档位：没有自己的模型服务 400；只填模型名时端点与 Key 存 null；填端点按现有规则要 Key、Key 加密不回显；审计写明是哪一档', async () => {

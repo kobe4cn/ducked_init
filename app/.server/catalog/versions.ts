@@ -1,15 +1,18 @@
 // app/.server/catalog/versions.ts —— 语义目录的版本（ADR-0041）：目录的结构或含义变了才记一版，比较前去掉统计，只改统计不产生版本。
 // 版本由 catalogTx 在成员事务的收尾记一次（ADR-0054；recordAudit 只登记白名单动作，见 catalog/tx.ts），
-// 调度器在采集与同步成功后、tenantCatalog 在读取时也各比较一次：重新生成目录、去掉统计，和上一版的快照按条目标识比较，有差异才记新版本
+// 调度器在采集与同步成功后、tenantCatalog 在读取时也各比较一次：重新生成目录、去掉统计，和上一版的快照按条目标识比较，有差异才记新版本。
+// prefetchEmbeddings 供 catalogTx 提交后与开关入口（打开混合检索、保存 embedding 配置的路由）提前补算检索向量（#824）
 import { and, desc, eq, gt, sql } from 'drizzle-orm';
 import type { CurrentMember } from '../auth';
 import type { AuditAction, Tx } from '../audit';
 import { getDb } from '../db/client';
 import { catalogVersions, tenants } from '../db/schema';
+import { resolveEmbeddingProvider } from '../llm';
+import { ensureEmbeddings } from './embeddings';
 import { buildCatalog, type Catalog, type CatalogEntry } from './index';
 import { loadCatalogInput } from './load';
 // projection.ts 也从本文件导入：这个环只能在函数体里用它的绑定，不能在模块顶层求值
-import { RESTRICTED_CLEARED_KEYS, RESTRICTED_HIDDEN_KINDS, SOURCE_REASONS, visibilityClass } from './projection';
+import { refreshProjection, RESTRICTED_CLEARED_KEYS, RESTRICTED_HIDDEN_KINDS, SOURCE_REASONS, visibilityClass } from './projection';
 
 /**
  * 一版目录的原因：白名单审计动作，采集 / 同步后发现源表结构变了（source.profiled / source.synced），
@@ -136,6 +139,20 @@ export const ensureCatalogVersion = (tenantId: string) => recordCatalogVersionIf
   first ? 'catalog.initial'
   : [...diff.added, ...diff.removed, ...diff.changed].every(x => x.kind === 'capability') ? 'platform.capabilities'
   : 'catalog.detected');
+
+/**
+ * 提前补算检索向量（#824）：catalogTx 提交后、运营打开混合检索、租户保存 embedding 配置时调用，让第一次混合检索不必等后台补算。
+ * 租户没开混合检索或没配 embedding 端点时返回 off，不刷投影也不排任务（先查开关，没开的租户不再多查端点）；
+ * 否则先把检索投影刷到最新（refreshProjection）：改动多时它自己去重排 catalog.projection、其结束钩子照常 ensureEmbeddings，这里返回 queued；
+ * 改动少时同步刷新完再 ensureEmbeddings，去重排一个 catalog.embed；向量已齐时返回 fresh。幂等：投影与向量都齐了什么都不排
+ */
+export async function prefetchEmbeddings(tenantId: string): Promise<'off' | 'fresh' | 'queued'> {
+  const [tenant] = await getDb().select({ hybridSearch: tenants.hybridSearch }).from(tenants).where(eq(tenants.id, tenantId));
+  if (!tenant?.hybridSearch) return 'off';
+  if (!(await resolveEmbeddingProvider(tenantId))) return 'off';
+  if (await refreshProjection(tenantId) === 'queued') return 'queued';
+  return ensureEmbeddings(tenantId);
+}
 
 const versionsAfter = (db: Tx | ReturnType<typeof getDb>, tenantId: string, since: number) => db
   .select({ version: catalogVersions.version, reason: catalogVersions.reason, createdAt: catalogVersions.createdAt, diff: catalogVersions.diff })
