@@ -88,13 +88,21 @@ export async function getTemplate(actor: CurrentMember, id: string) {
   const published = versions.find(v => v.status === 'published') ?? null;
   const draft = versions.find(v => v.status === 'draft') ?? null;
   const latestTemplateVersion = latestTemplate(template).version;
+  const upgradeAvailable = published !== null && published.templateVersion < latestTemplateVersion;
   return {
     template,
     label: TEMPLATES[template].label,
     /** 注册表里模板的当前版本 */
     latestTemplateVersion,
     /** 生效的已发布版本锁定的模板版本比当前版本旧：可以预览升级差异、起草升级 */
-    upgradeAvailable: published !== null && published.templateVersion < latestTemplateVersion,
+    upgradeAvailable,
+    /** 有可升级版本时：锁定版本 +1 到当前版本之间每一版的改动说明（提示条与预览结果头部列出）；没有时为空 */
+    upgradeChanges: upgradeAvailable
+      ? Array.from({ length: latestTemplateVersion - published.templateVersion }, (_, i) => {
+          const version = published.templateVersion + i + 1;
+          return { version, changes: templateAt(template, version).changes };
+        })
+      : [],
     versions: versions.map(v => ({ ...v, publishBlocker: publishBlocker(actor, v) })),
     draft,
     published,

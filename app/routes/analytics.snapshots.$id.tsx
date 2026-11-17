@@ -3,6 +3,8 @@
 // 流失预警（#834）：顶部汇总卡片（有风险人数、占比、总人数），明细默认只列有风险（at_risk）的人、按沉默比从高到低（?tab=all 看全部）；
 // 复购（#835）：顶部卡片写复购率（X / Y 人）与到第二单天数中位数（没人有第二单时为「—」），下方通用分页明细；
 // CLV（#835）：顶部卡片写前 10% 的人贡献的 clv 占比（总 clv 为 0 时为「—」）与合计，下方十档分布表（每档人数与 clv 合计，只列有人的档），再下方通用分页明细；
+// 同期群（#836）：主视图是留存矩阵（行是 cohort_start 升序、列是第 0…periods-1 期，格子是人数与留存率，卡片写同期群数、总人数、粒度，?tab=matrix），
+// 逐人明细挪到 ?tab=consumers&page=N（仍按 consumer_id 分页、active_periods 顿号连接）；
 // 其他模板（含指标 / 标签 DSL 快照，#816）：按 consumer_id（DSL 按全部列）分页的通用明细（?page=N），列取快照表的全部列，
 // DSL 快照页头写定义（类型与键）、定义版本、统计日与来源，标签在明细上方带各取值人数的汇总（回刷前后对照），
 // 带维度的指标每个消费者有多行，按行分页、统计卡片标「行数」。
@@ -15,7 +17,7 @@ import { requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { DSL_KINDS } from '~/.server/pipeline/dsl';
 import { TEMPLATES } from '~/.server/pipeline/templates';
-import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readChurnSnapshot, readClvSnapshot, readRepurchaseSnapshot, readRfmSnapshot, readTemplateSnapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
+import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readChurnSnapshot, readClvSnapshot, readCohortSnapshot, readRepurchaseSnapshot, readRfmSnapshot, readTemplateSnapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { PageHeader } from '~/components/page-header';
@@ -90,6 +92,13 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         const page = Math.min(pages, requestedPage);
         return { ...head, page, pages, kind: 'clv' as const, ...(await readClvSnapshot(snapshot, { page })) };
       }
+      // 同期群（#836）：主视图是留存矩阵（?tab=matrix），逐人明细在 ?tab=consumers；两个标签都读矩阵（卡片要用）
+      case 'cohort': {
+        const tab = tabOf(['matrix', 'consumers'] as const, 'matrix');
+        const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
+        const page = Math.min(pages, requestedPage);
+        return { ...head, tab, page, pages, kind: 'cohort' as const, ...(await readCohortSnapshot(snapshot, { page })) };
+      }
       default: {
         const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
         const page = Math.min(pages, requestedPage);
@@ -129,9 +138,10 @@ function Pager({ page, pages, pageSize, unit = '位', href }: { page: number; pa
 
 /**
  * 通用分页明细：列取快照表的全部列（空值 —、BOOLEAN 是 / 否、列表顿号连接），第 page 页按 consumer_id（DSL 按全部列）排好序。
- * 通用视图与复购 / CLV（#835）的明细都用它
+ * 通用视图、复购 / CLV（#835）与同期群逐人明细（#836）都用它；翻页链接默认是 ?page=N，带标签的页面
+ * （同期群的 ?tab=consumers）传 href 保住自己的查询参数
  */
-function DetailTable({ columns, rows, page, pages, pageSize, unit, snapshot }: {
+function DetailTable({ columns, rows, page, pages, pageSize, unit, snapshot, href }: {
   columns: string[];
   rows: Record<string, unknown>[];
   page: number;
@@ -139,6 +149,7 @@ function DetailTable({ columns, rows, page, pages, pageSize, unit, snapshot }: {
   pageSize: number;
   unit?: string;
   snapshot: { id: string };
+  href?: (p: number) => string;
 }) {
   return (
     <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
@@ -157,7 +168,7 @@ function DetailTable({ columns, rows, page, pages, pageSize, unit, snapshot }: {
           ))}
         </TableBody>
       </Table>
-      <Pager page={page} pages={pages} pageSize={pageSize} unit={unit} href={p => `/analytics/snapshots/${snapshot.id}?page=${p}`} />
+      <Pager page={page} pages={pages} pageSize={pageSize} unit={unit} href={href ?? (p => `/analytics/snapshots/${snapshot.id}?page=${p}`)} />
     </div>
   );
 }
@@ -203,6 +214,7 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
       {loaderData.kind === 'churn' && <ChurnResult {...loaderData} />}
       {loaderData.kind === 'repurchase' && <RepurchaseResult {...loaderData} />}
       {loaderData.kind === 'clv' && <ClvResult {...loaderData} />}
+      {loaderData.kind === 'cohort' && <CohortResult {...loaderData} />}
       {loaderData.kind === 'generic' && <GenericResult {...loaderData} />}
     </AppShell>
   );
@@ -362,6 +374,73 @@ function ClvResult({ page, pages, pageSize, snapshot, totalClv, topShare, decile
       </div>
 
       <DetailTable columns={columns} rows={rows} page={page} pages={pages} pageSize={pageSize} snapshot={snapshot} />
+    </>
+  );
+}
+
+/**
+ * 同期群快照（#836）：顶部卡片写同期群数、总人数与粒度，主视图是留存矩阵——行是 cohort_start（升序）、列是第 0…periods-1 期，
+ * 格子是这一期有下单的人数与留存率（÷ 该群第 0 期人数；首单周期是 0，第 0 期都是 100.0%，没人下单的期补 0）；
+ * 逐人明细在 ?tab=consumers（按 consumer_id 分页，active_periods 用顿号连接）
+ */
+function CohortResult({ tab, page, pages, pageSize, snapshot, matrix, granularity, columns, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'cohort' }>) {
+  const base = `/analytics/snapshots/${snapshot.id}`;
+  const pageHref = (p: number) => `${base}?tab=consumers&page=${p}`;
+  const cohorts = matrix.length;
+  const total = matrix.reduce((sum, r) => sum + r.counts[0]!, 0);
+  const periods = matrix[0]?.counts.length ?? 0;
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <div data-cohort-count={cohorts}>
+          <StatTile label="同期群数" value={cohorts.toLocaleString('zh-CN')} hint="按首单所在周期分群" />
+        </div>
+        <div data-cohort-total={total}>
+          <StatTile label="总人数" value={total.toLocaleString('zh-CN')} hint="首单落在最近周期窗口内的消费者" />
+        </div>
+        <div data-cohort-granularity={granularity}>
+          <StatTile label="粒度" value={granularity === 'week' ? '按周' : '按月'} hint="同期与周期的划分粒度" />
+        </div>
+      </div>
+
+      <PillTabs
+        current={tab}
+        tabs={[
+          { key: 'matrix', label: '留存矩阵', href: base },
+          { key: 'consumers', label: '逐人明细', href: `${base}?tab=consumers` },
+        ]}
+      />
+
+      {tab === 'matrix' ? (
+        <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+          {matrix.length === 0 && <p className="text-sm text-slate-500">这份快照没有数据</p>}
+          {/* periods 最多 60 列，矩阵面板里横向滚动 */}
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>cohort_start</TableHead>
+                  {Array.from({ length: periods }, (_, k) => <TableHead key={k}>{`第 ${k} 期`}</TableHead>)}
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {matrix.map(r => (
+                  <TableRow key={r.cohortStart}>
+                    <TableCell className="font-mono text-xs">{r.cohortStart}</TableCell>
+                    {r.counts.map((n, k) => (
+                      <TableCell key={k} data-cohort={r.cohortStart} data-period={k} data-consumers={n}>
+                        {`${n} / ${((n / r.counts[0]!) * 100).toFixed(1)}%`}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </div>
+      ) : (
+        <DetailTable columns={columns} rows={rows} page={page} pages={pages} pageSize={pageSize} snapshot={snapshot} href={pageHref} />
+      )}
     </>
   );
 }

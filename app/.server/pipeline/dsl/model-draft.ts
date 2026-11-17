@@ -1,11 +1,12 @@
 // app/.server/pipeline/dsl/model-draft.ts —— 用模型按自然语言需求生成定义草稿（ADR-0035，纯函数，不读库、不发请求）：
 // 每种可生成的定义给出模型必须遵守的输出 Schema（直接用该种类的定义 Schema）、调用用途、提示词与给模型的上下文；
-// 上下文取自语义目录（ADR-0041）：system 是简短的角色说明加该种类的能力说明，user 是目录总览、用需求原文搜出的条目与需求原文。
+// 上下文取自语义目录（ADR-0041）：system 是简短的角色说明加该种类的能力说明，user 是目录分层上下文（第一层分组、相关分组的组内列表，#855）、
+// 用需求原文搜出的条目与需求原文。
 // 目录里本就没有敏感字段、哈希列与明细行（ADR-0005），统计只有 ADR-0016 的常见取值。
 // 模型输出转成 YAML（首行注释提示核对）后仍要过该种类的校验（DSL_KINDS[kind].check），保存与双人发布照旧
 import { Document } from 'yaml';
 import { CAPABILITIES } from '../../catalog/capabilities';
-import { estimateTokens, overview, toMarkdown, type Catalog } from '../../catalog';
+import { estimateTokens, layeredContext, OVERVIEW_TOKENS, toMarkdown, type Catalog, type CatalogEntry } from '../../catalog';
 import { deriveProjection } from '../../catalog/projection';
 import { rank } from '../../catalog/rank';
 import type { LlmMessage, LlmPurpose } from '../../llm';
@@ -35,7 +36,7 @@ const METRIC_RULES = [
 
 const METRIC_SYSTEM = [
   '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（与下面 YAML 示例同样的结构），不要输出别的文字。',
-  '成员的消息里依次是语义目录总览、按需求搜出的目录条目与需求原文。',
+  '成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按需求搜出的目录条目与需求原文。',
   ...METRIC_RULES,
   '',
   METRIC_CAPABILITY,
@@ -44,7 +45,7 @@ const METRIC_SYSTEM = [
 /** 一句话解析（#516）：spec 是指标定义，另有逐项说明、认不出的词与不支持的说法 */
 const METRIC_PARSE_SYSTEM = [
   '你是 CRM 数据平台的指标助手：把成员的一句话解析成一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（spec 是指标定义，与下面 YAML 示例同样的结构），不要输出别的文字。',
-  '成员的消息里依次是语义目录总览、按句子搜出的目录条目与句子原文。',
+  '成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按句子搜出的目录条目与句子原文。',
   ...METRIC_RULES,
   '解析说明：',
   '- items 逐项说明 spec 的每个部分是怎么从句子来的：path 用它在 spec 里的位置（如 measure.field、filter.0、window），reason 一句话。',
@@ -59,7 +60,7 @@ const METRIC_PARSE_SYSTEM = [
 
 const TAG_SYSTEM = [
   '你是 CRM 数据平台的标签助手：按成员的需求写一个标签定义，只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
-  '成员的消息里依次是语义目录总览、按需求搜出的目录条目与需求原文。',
+  '成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按需求搜出的目录条目与需求原文。',
   '规则：',
   '- 只用单指标写法：metric 是目录里一个没有维度的已发布指标（metric:<键> 条目里的键），不要编造；不写 missing，when 里直接写比较。',
   '- rules 按顺序取第一条命中的，when 里的条件全部满足才算命中，至少写一个条件；都没命中的取 default。',
@@ -82,9 +83,14 @@ const DRAFTS = {
 export const definitionDraftSchema = (kind: DslKind) => DRAFTS[kind].schema;
 export const definitionDraftPurpose = (kind: DslKind) => DRAFTS[kind].purpose;
 
-/** 用需求原文排序（rank，内存里派生的 full 投影）出的条目的 Markdown，估算超过 SEARCH_TOKENS 时减少条数；能力说明已在 system 里，排序前就去掉它的投影行，不占依赖展开的名额 */
-function relevantMarkdown(catalog: Catalog, request: string): string {
-  const hits = rank(deriveProjection(catalog, 'full').filter(r => !r.entryId.startsWith('capability:')), catalog, request, {}, SEARCH_LIMIT).map(r => r.entry);
+/** 按需求排序（rank，内存里派生的 full 投影）出的条目：分层上下文取相关分组、检索段取条目，一次算两处共用；
+ * 能力说明已在 system 里，排序前就去掉它的投影行，不占依赖展开的名额 */
+function rankedEntries(catalog: Catalog, request: string): CatalogEntry[] {
+  return rank(deriveProjection(catalog, 'full').filter(r => !r.entryId.startsWith('capability:')), catalog, request, {}, SEARCH_LIMIT).map(r => r.entry);
+}
+
+/** 排序出的条目的 Markdown，估算超过 SEARCH_TOKENS 时减少条数 */
+function relevantMarkdown(hits: CatalogEntry[]): string {
   for (let n = hits.length; n > 0; n--) {
     const md = toMarkdown(hits.slice(0, n));
     if (estimateTokens(md) <= SEARCH_TOKENS) return md;
@@ -93,14 +99,15 @@ function relevantMarkdown(catalog: Catalog, request: string): string {
 }
 
 /**
- * 发给模型的消息：system 是角色说明与该种类的能力说明，user 依次是目录总览、按需求搜出的条目与需求原文；
+ * 发给模型的消息：system 是角色说明与该种类的能力说明，user 依次是目录分层上下文（第一层分组、相关分组的组内列表）、按需求搜出的条目与需求原文；
  * 目录里没有可用的东西时（如标签没有可引用的指标）返回提示，调用方不发请求
  */
 export function definitionDraftMessages(kind: DslKind, request: string, catalog: Catalog): LlmMessage[] | { unavailable: string } {
   const { system, unavailable } = DRAFTS[kind];
   const hint = unavailable(catalog);
   if (hint) return { unavailable: hint };
-  const user = [toMarkdown(overview(catalog)), `# 与需求相关的条目\n\n${relevantMarkdown(catalog, request)}`, `# 需求\n\n${request}`].join('\n\n');
+  const ranked = rankedEntries(catalog, request);
+  const user = [layeredContext(catalog, ranked, OVERVIEW_TOKENS), `# 与需求相关的条目\n\n${relevantMarkdown(ranked)}`, `# 需求\n\n${request}`].join('\n\n');
   return [
     { role: 'system', content: system },
     { role: 'user', content: user },
@@ -130,10 +137,11 @@ export const METRIC_PARSE_SCHEMA = {
 
 /**
  * 一句话解析成指标表单（#516）发给模型的消息，结构与 definitionDraftMessages 相同：
- * system 是指标规则（共用）加解析说明，user 依次是目录总览、按句子搜出的条目与句子原文
+ * system 是指标规则（共用）加解析说明，user 依次是目录分层上下文（第一层分组、相关分组的组内列表）、按句子搜出的条目与句子原文
  */
 export function metricParseMessages(sentence: string, catalog: Catalog): LlmMessage[] {
-  const user = [toMarkdown(overview(catalog)), `# 与需求相关的条目\n\n${relevantMarkdown(catalog, sentence)}`, `# 句子\n\n${sentence}`].join('\n\n');
+  const ranked = rankedEntries(catalog, sentence);
+  const user = [layeredContext(catalog, ranked, OVERVIEW_TOKENS), `# 与需求相关的条目\n\n${relevantMarkdown(ranked)}`, `# 句子\n\n${sentence}`].join('\n\n');
   return [
     { role: 'system', content: METRIC_PARSE_SYSTEM },
     { role: 'user', content: user },

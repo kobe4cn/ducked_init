@@ -70,10 +70,11 @@ describe('一句话解析成指标表单', () => {
     expect(system).toMatchObject({ role: 'system' });
     expect(system!.content).toContain('capability:metric-dsl');
     for (const rule of ['同一字段的不同取值时改写成一个 in', '近 N 天', '上个月', '分母为 0 时算 0', 'unknowns', 'unsupported']) expect(system!.content).toContain(rule);
-    // user 依次是目录总览、按句子搜出的条目与句子原文
+    // user 依次是目录分层上下文（第一层分组 + 相关分组的组内列表）、按句子搜出的条目与句子原文
     expect(user!.role).toBe('user');
     const [overviewPart, searchPart] = user!.content.split('# 与需求相关的条目');
     expect(overviewPart).toContain('# 语义目录');
+    expect(overviewPart).toContain('# 相关分组');
     expect(searchPart).toContain('## field:order.amount');
     expect(user!.content.endsWith(`# 句子\n\n${SENTENCE}`)).toBe(true);
 
