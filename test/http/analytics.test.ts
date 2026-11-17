@@ -2,6 +2,7 @@
 // 其他租户的快照 404，已过期的快照标灰、打不开；RFM 模板参数页的权限矩阵：查看者只读，分析师能起草不能发布，
 // 最后保存草稿的人不能发布，另一位数据工程师或管理员发布后入队 gold.rfm；按生效版本重新计算（分析师 403、未来日期与重复入队被拒）；
 // 用户 360 走注册表里的通用参数表单（只读、起草、校验报错、多余字段不传、发布后入队 gold.user360、未登记模板 404）与通用快照明细（全部列、是 / 否、分页、没有明文）
+// 流失预警快照页（#834）：顶部汇总卡片写有风险人数、占比与总人数（与湖上一致），明细默认只列有风险的人（沉默比从高到低），?tab=all 看全部，分页总数按筛选后的行数算
 // 同期群与复购同样走通用表单（周期下拉框、起草、双人发布入队 gold.cohort / gold.repurchase 并登记快照，周期偏移列表用顿号连接）；
 // 模板升级（测试开关 TEMPLATE_TEST_VERSIONS=1）：提示条、预览差异（RFM 分群迁移表、流失预警变化人数，没有 consumer_id）、分析师起草升级但发布 403；
 // 指标与标签（DSL）快照详情（#816）：定义页「快照」区未过期的行点统计日进快照详情页，DSL 快照走通用明细（页头写类型、键、版本、统计日与来源，按行分页），
@@ -13,7 +14,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { dslDefinitions, dslVersions, snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
-import { listSnapshots, readTemplateSnapshot } from '../../app/.server/snapshots';
+import { listSnapshots, readChurnSnapshot, readTemplateSnapshot } from '../../app/.server/snapshots';
 import { drain, memberOf, newTenant, onLake, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -460,6 +461,83 @@ describe('用户 360 模板参数页与快照（通用表单与通用明细）',
     const ids = pages.flatMap(p => p.rows.map(r => String(r.consumer_id)));
     expect(ids).toEqual([...new Set(ids)].sort());
     expect(pages[0]!.columns[0]).toBe('consumer_id');
+  });
+});
+
+describe('流失预警快照页（#834）', () => {
+  beforeEach(fresh);
+
+  /** 在湖上按同一口径算出这张快照的汇总（总数、有风险数）与两个口径下按沉默比排序的 consumer_id（表名来自快照登记） */
+  const lakeExpected = async (tenantId: string, snapshot: { table: string }) => {
+    const [schema, name] = snapshot.table.split('.');
+    const table = `${schema}."${name}"`;
+    const [totals] = await onLake<{ total: string; at_risk: string }>(tenantId,
+      `SELECT count(*) AS total, count(*) FILTER (WHERE at_risk) AS at_risk FROM ${table}`);
+    const ids = (where: string) => onLake<{ consumer_id: string }>(tenantId,
+      `SELECT consumer_id FROM ${table} ${where} ORDER BY silence_ratio DESC NULLS LAST, consumer_id`).then(rs => rs.map(r => r.consumer_id));
+    return { total: Number(totals!.total), atRisk: Number(totals!.at_risk), atRiskIds: await ids('WHERE at_risk'), allIds: await ids('') };
+  };
+  const consumerIds = (html: string) => [...html.matchAll(/data-consumer="([^"]+)"/g)].map(m => m[1]!);
+
+  it('顶部汇总卡片写有风险人数、占比与总人数（与湖上一致），明细默认只列有风险的人、沉默比从高到低，?tab=all 看全部；页面上没有明文', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    // 默认参数 2024-10-15：共 1 位且在风险里；minOrders 2 的 2024-09-15：共 3 位、其中 2 位有风险（沉默比各不相同）
+    await runTask(acme, 'gold.churn', { asOf: '2024-10-15' });
+    await runTask(acme, 'gold.churn', { asOf: '2024-09-15', minOrders: 2 });
+    const mixed = (await listSnapshots(acme, 'churn')).find(s => (s.params as { asOf: string }).asOf === '2024-09-15')!;
+    const single = (await listSnapshots(acme, 'churn')).find(s => (s.params as { asOf: string }).asOf === '2024-10-15')!;
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    const expected = await lakeExpected(acme, mixed);
+    expect(expected).toMatchObject({ total: 3, atRisk: 2 });
+
+    const html = await (await browser.get(`/analytics/snapshots/${mixed.id}`)).text();
+    expect(html).toContain('流失预警 · 2024-09-15');
+    expect(html).toMatch(/有风险人数.*?>2</s);
+    expect(html).toMatch(/风险占比.*?>66\.7%</s);
+    expect(html).toMatch(/总人数.*?>3</s);
+    // 默认只列有风险的人，行序与湖上按沉默比降序的一致；标签页可以切到全部
+    expect(consumerIds(html)).toEqual(expected.atRiskIds);
+    expect(html).toContain('第 1 / 1 页');
+    expect(html).toMatch(/data-tab="all"[^>]*href="[^"]*\?tab=all"/);
+
+    const all = await (await browser.get(`/analytics/snapshots/${mixed.id}?tab=all`)).text();
+    expect(consumerIds(all)).toEqual(expected.allIds);
+    expect(all).toContain('data-tab="at-risk"');
+    // 页码超出时停在最后一页
+    expect(await (await browser.get(`/analytics/snapshots/${mixed.id}?tab=all&page=9`)).text()).toContain('第 1 / 1 页');
+    for (const text of [html, all]) for (const p of PLAINTEXT) expect(text).not.toContain(p);
+
+    // 只有一位且在风险里：卡片与明细同样成立
+    const one = await lakeExpected(acme, single);
+    expect(one).toMatchObject({ total: 1, atRisk: 1 });
+    const singleHtml = await (await browser.get(`/analytics/snapshots/${single.id}`)).text();
+    expect(singleHtml).toMatch(/有风险人数.*?>1</s);
+    expect(singleHtml).toMatch(/风险占比.*?>100\.0%</s);
+    expect(consumerIds(singleHtml)).toEqual(one.atRiskIds);
+  });
+
+  it('readChurnSnapshot 分页总数按筛选后的行数算：每页 2 位时「全部」2 页、「有风险」1 页，页码超出停在最后一页，两页合起来不重不漏', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await runTask(acme, 'gold.churn', { asOf: '2024-09-15', minOrders: 2 });
+    const snapshot = (await listSnapshots(acme, 'churn'))[0]!;
+    const expected = await lakeExpected(acme, snapshot);
+
+    const atRisk = await readChurnSnapshot(snapshot, { page: 9, filter: 'at-risk', pageSize: 2 });
+    expect(atRisk).toMatchObject({ page: 1, pages: 1, total: 3, atRisk: 2, filteredCount: 2 });
+    expect(atRisk.rows.map(r => r.consumer_id)).toEqual(expected.atRiskIds);
+    expect(atRisk.rows.every(r => r.at_risk)).toBe(true);
+    // 沉默比从高到低（同值按 consumer_id）
+    const ratios = atRisk.rows.map(r => r.silence_ratio);
+    expect([...ratios].sort((a, b) => b - a)).toEqual(ratios);
+
+    const first = await readChurnSnapshot(snapshot, { page: 1, filter: 'all', pageSize: 2 });
+    const last = await readChurnSnapshot(snapshot, { page: 9, filter: 'all', pageSize: 2 });
+    expect(first).toMatchObject({ page: 1, pages: 2, filteredCount: 3 });
+    expect(last.page).toBe(2);
+    expect([...first.rows, ...last.rows].map(r => r.consumer_id)).toEqual(expected.allIds);
+    expect([...first.rows, ...last.rows].filter(r => r.at_risk)).toHaveLength(2);
   });
 });
 
