@@ -29,6 +29,17 @@ const contractCases = (make: (tenantId: string) => VectorStore) => () => {
     expect(await store.read('m', [])).toEqual(new Map());
   });
 
+  it('别的模型的行不命中：hashes、read、topN 都只看当前模型', async () => {
+    const acme = await newTenant('acme');
+    const store = make(acme);
+    await store.upsert('m1', [{ textHash: 'h:a', vector: [1, 0] }]);
+    await store.upsert('m2', [{ textHash: 'h:b', vector: [1, 0] }]); // 与查询同向，但属于别的模型
+    expect(await store.hashes('m1')).toEqual(new Set(['h:a']));
+    expect(await store.read('m1', ['h:b', 'h:a'])).toEqual(new Map([['h:a', [1, 0]]]));
+    expect(await store.topN('m1', [1, 0], ['h:b'], 5)).toEqual([]);
+    expect((await store.topN('m1', [1, 0], ['h:a', 'h:b'], 5)).map(h => h.textHash)).toEqual(['h:a']);
+  });
+
   it('同哈希 upsert 两次只留一行，保留第一次的向量（先写上的算数）', async () => {
     const acme = await newTenant('acme');
     const store = make(acme);
