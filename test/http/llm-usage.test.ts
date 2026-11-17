@@ -2,6 +2,7 @@
 // 统计与明细按当前单价折算金额（ADR-0057）：未配单价、部分未配、多币种各有展示规则；明细分页按时间倒序、失败调用显示截断到 120 字的错误摘要（全文在 title）；
 // 映射草稿一行另有「校验通过率」（#802）：从 mapping_generations（origin=model，items 带 dropped 键的是部分采用）加
 // mapping.model_draft_failed 审计（stage=mapping、无 kind）算，部分采用单独计数，其他用途与总计是「—」；
+// 指标卡另有「调用来源」卡（#844）：窗口内按租户 / 平台端点分开计数，旧行计入「未记录」，别的租户与窗口外不计入；
 // 数据工程师 / 分析师 / 查看者看不到入口、打开 403
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -257,6 +258,30 @@ describe('模型调用统计', () => {
     const clamped = await (await admin.get('/llm-usage?page=9')).text();
     expect(clamped).toContain('第 2 / 2 页');
     expect(clamped).toContain(`data-call-id="${ids[54]}"`);
+  });
+
+  it('指标卡的「调用来源」卡按租户 / 平台分开计数，旧行计入「未记录」，别的租户与窗口外不计入', async () => {
+    const acme = await newTenant('acme');
+    const globex = await newTenant('globex');
+    await call(acme, { source: 'tenant' });
+    await call(acme, { source: 'tenant' });
+    await call(acme, { source: 'platform' });
+    await call(acme); // 迁移前的旧行：source 为空，计入「未记录」
+    await call(globex, { source: 'tenant' }); // 别的租户：不计入
+    await call(acme, { createdAt: ago(40), source: 'platform' }); // 两个窗口都不在
+
+    const tile = (html: string, col: string) => html.match(new RegExp(`data-col="${col}"[^>]*>([^<]*)<`))?.[1] ?? '';
+    const admin = await loginAs(app, 'admin@acme.com');
+    const html = await (await admin.get('/llm-usage?days=7')).text();
+    expect(tile(html, 'source-split')).toBe('租户 2 / 平台 1');
+    expect(tile(html, 'source-unknown')).toBe('未记录 1');
+
+    // 只有 tenant / platform 行的租户：不渲染「未记录」，hint 回到窗口说明
+    const other = await loginAs(app, 'admin@globex.com');
+    const otherHtml = await (await other.get('/llm-usage?days=7')).text();
+    expect(tile(otherHtml, 'source-split')).toBe('租户 1 / 平台 0');
+    expect(otherHtml).not.toContain('source-unknown');
+    expect(otherHtml).toContain(`近 7 天`);
   });
 
   it('明细每行显示来源：tenant 是「租户」、platform 是「平台」、旧行（迁移前，为空）是「—」', async () => {

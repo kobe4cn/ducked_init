@@ -94,7 +94,7 @@ async function draftCheckStats(tenantId: string, days: 7 | 30) {
   return { checked: adopted + Number(fail?.failed ?? 0), passed: adopted - partial, partial };
 }
 
-/** 按用途分组统计，另给一条不分组的总计；行按调用次数降序、同次数按用途名。金额按 (purpose, model) 分组用当前单价折算（ADR-0057），总计用全部分组重算 */
+/** 按用途分组统计，另给一条不分组的总计与按来源的计数（#844「调用来源」卡）；行按调用次数降序、同次数按用途名。金额按 (purpose, model) 分组用当前单价折算（ADR-0057），总计用全部分组重算 */
 export async function usageByPurpose(tenantId: string, days: 7 | 30) {
   const db = getDb();
   const byModel = () => ({
@@ -104,11 +104,14 @@ export async function usageByPurpose(tenantId: string, days: 7 | 30) {
     promptTokens: sql<number>`coalesce(sum(${llmCalls.promptTokens}), 0)`,
     completionTokens: sql<number>`coalesce(sum(${llmCalls.completionTokens}), 0)`,
   });
-  const [grouped, [total], byPurposeModel, prices, draftCheck] = await Promise.all([
+  const [grouped, [total], byPurposeModel, bySource, prices, draftCheck] = await Promise.all([
     db.select({ purpose: llmCalls.purpose, ...agg() }).from(llmCalls)
       .where(inWindow(tenantId, days)).groupBy(llmCalls.purpose),
     db.select(agg()).from(llmCalls).where(inWindow(tenantId, days)),
     db.select(byModel()).from(llmCalls).where(inWindow(tenantId, days)).groupBy(llmCalls.purpose, llmCalls.model),
+    // 「调用来源」卡（#844）：窗口内按 source 分组的调用次数，旧行（null）计入 unknown
+    db.select({ source: llmCalls.source, calls: sql<number>`count(*)` }).from(llmCalls)
+      .where(inWindow(tenantId, days)).groupBy(llmCalls.source),
     priceMap(),
     draftCheckStats(tenantId, days),
   ]);
@@ -120,6 +123,9 @@ export async function usageByPurpose(tenantId: string, days: 7 | 30) {
       promptTokens: Number(g.promptTokens ?? 0),
       completionTokens: Number(g.completionTokens ?? 0),
     })), prices));
+  // 「调用来源」卡（#844）：没有的那项为 0；pg 的 count 是字符串，先 Number()（照 toUsage）
+  const bySourceCount = { tenant: 0, platform: 0, unknown: 0 };
+  for (const r of bySource) bySourceCount[r.source ?? 'unknown'] = Number(r.calls ?? 0);
   return {
     rows: grouped.map(r => ({
       ...toUsage(r, r.purpose),
@@ -128,14 +134,16 @@ export async function usageByPurpose(tenantId: string, days: 7 | 30) {
       ...(r.purpose === 'mapping_draft' ? { draftCheck } : {}),
     })).sort((a, b) => b.calls - a.calls || cmp(a.purpose, b.purpose)),
     total: { ...toUsage(total ?? {}, 'total'), cost: costOfGroups(byPurposeModel) },
+    bySource: bySourceCount,
   };
 }
 
-/** 运营后台「模型调用汇总」的一行（#746）：（租户、模型、用途）分组的聚合数，金额按当前单价折算（ADR-0057） */
+/** 运营后台「模型调用汇总」的一行（#746）：（租户、模型、用途、来源）分组的聚合数，金额按当前单价折算（ADR-0057）；source 为 null 是迁移前的旧行 */
 export interface TenantModelUsage {
   tenantName: string;
   model: string;
   purpose: string;
+  source: 'tenant' | 'platform' | null;
   calls: number;
   promptTokens: number;
   completionTokens: number;
@@ -143,9 +151,13 @@ export interface TenantModelUsage {
   cost: string;
 }
 
+/** 同组内来源的排序：tenant → platform → 旧行（null 记 2） */
+const sourceRank = (s: 'tenant' | 'platform' | null) => (s === 'tenant' ? 0 : s === 'platform' ? 1 : 2);
+
 /**
- * 跨租户按（租户、模型、用途）分组汇总（#746，运营后台）。运营者没有租户 RLS，直接用 getDb()（先例 listOperatorAuditLogs）；
- * 只取聚合数与租户名，不 select error 原文、不带出其他租户字段（ADR-0007）。排序：租户名 zh-CN（ADR-0045），模型与用途按码点
+ * 跨租户按（租户、模型、用途、来源）分组汇总（#746，运营后台；#844 加来源分组键）。运营者没有租户 RLS，直接用 getDb()（先例
+ * listOperatorAuditLogs）；只取聚合数与租户名，不 select error 原文、不带出其他租户字段（ADR-0007）。排序：租户名 zh-CN（ADR-0045），
+ * 模型与用途按码点，同组内按上面的来源序
  */
 export async function usageAcrossTenants(days: 7 | 30): Promise<TenantModelUsage[]> {
   const [rows, prices] = await Promise.all([
@@ -153,6 +165,7 @@ export async function usageAcrossTenants(days: 7 | 30): Promise<TenantModelUsage
       tenantName: tenants.name,
       model: llmCalls.model,
       purpose: llmCalls.purpose,
+      source: llmCalls.source,
       calls: sql<number>`count(*)`,
       promptTokens: sql<number>`coalesce(sum(${llmCalls.promptTokens}), 0)`,
       completionTokens: sql<number>`coalesce(sum(${llmCalls.completionTokens}), 0)`,
@@ -160,7 +173,7 @@ export async function usageAcrossTenants(days: 7 | 30): Promise<TenantModelUsage
     }).from(llmCalls)
       .innerJoin(tenants, eq(tenants.id, llmCalls.tenantId))
       .where(since(days))
-      .groupBy(llmCalls.tenantId, tenants.name, llmCalls.model, llmCalls.purpose),
+      .groupBy(llmCalls.tenantId, tenants.name, llmCalls.model, llmCalls.purpose, llmCalls.source),
     priceMap(),
   ]);
   // pg 的 count / sum 是字符串，先 Number()（照 toUsage）；每行单独走 summarizeCost / formatCost，与统计口径一致
@@ -172,13 +185,15 @@ export async function usageAcrossTenants(days: 7 | 30): Promise<TenantModelUsage
       tenantName: r.tenantName,
       model: r.model,
       purpose: r.purpose,
+      source: r.source ?? null,
       calls,
       promptTokens,
       completionTokens,
       errors: Number(r.errors ?? 0),
       cost: formatCost(summarizeCost([{ model: r.model, calls, promptTokens, completionTokens }], prices)),
     };
-  }).sort((a, b) => cmpName(a.tenantName, b.tenantName) || cmp(a.model, b.model) || cmp(a.purpose, b.purpose));
+  }).sort((a, b) => cmpName(a.tenantName, b.tenantName) || cmp(a.model, b.model) || cmp(a.purpose, b.purpose)
+    || sourceRank(a.source) - sourceRank(b.source));
 }
 
 /** 明细行取 `llm_calls` 的一部分列（见 listCalls 的 select）加折算好的金额 */
