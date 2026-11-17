@@ -10,10 +10,11 @@
 // 可以写下需求后用模型生成草稿（intent=model-draft，ADR-0035，只在 YAML 模式）：生成的 YAML 填进编辑框、不保存，失败时编辑框保持原内容
 // 指标的构建器模式还能写一句话解析（intent=parse，#517）：parseMetricSentence 把句子解析成表单填进构建器并逐项说明，
 // 已有内容时先列出差异（intent=applyParse 确认后才覆盖），解析失败时表单保持原样
-import { useEffect, useRef } from 'react';
+import { Fragment, useEffect, useRef } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.new';
 import { requirePermission } from '~/.server/access';
+import type { DraftAmbiguity } from '~/.server/catalog/draft-search';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { createDefinition, DslError, dslContext, modelDraftForDefinition } from '~/.server/dsl-definitions';
 import { MetricParseError, parseMetricSentence } from '~/.server/metric-parse';
@@ -265,6 +266,8 @@ export async function action({ request }: Route.ActionArgs) {
   const keep = {
     key, request: requirement, generated: false, form: echo, tagForm: tagEcho, echoId: crypto.randomUUID(), sentence,
     parse: undefined, parsed: undefined, diff: undefined, dropped: undefined as DroppedItem[] | undefined,
+    /** model-draft 检索判出的歧义（#827）：词与候选，草稿照常生成、在编辑框上方提示成员确认；其余分支占位让组件统一读 */
+    ambiguity: undefined as DraftAmbiguity | undefined,
     /** 指标与标签的编辑模式；其他种类没有模式 */
     mode: (kind === 'metric' || kind === 'tag') ? currentMode : undefined,
   };
@@ -316,7 +319,7 @@ export async function action({ request }: Route.ActionArgs) {
     }
     if (intent === 'model-draft') {
       const generated = await modelDraftForDefinition(member, kind, requirement);
-      return { error: null, issues: [], yaml: generated.yaml, summary: null, sql: null, ...keep, generated: true };
+      return { error: null, issues: [], yaml: generated.yaml, summary: null, sql: null, ...keep, generated: true, ambiguity: generated.ambiguity };
     }
     if (kind === 'metric' && intent === 'parse') {
       const parsed = await parseMetricSentence(member, sentence);
@@ -485,6 +488,23 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
                   </div>
                 </Field>
                 {actionData?.generated && <p className="text-sm text-muted-foreground" data-generated>已用模型生成草稿，请核对后填写键并保存。</p>}
+                {actionData?.ambiguity && (
+                  <div className="rounded-2xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900" data-ambiguity>
+                    <p className="font-medium">这些词有多种理解</p>
+                    {actionData.ambiguity.groups.map(g => (
+                      <p key={g.term}>
+                        「{g.term}」可能指
+                        {g.candidates.map((c, i) => (
+                          <Fragment key={c.id}>
+                            {i > 0 && '、'}
+                            <a className="underline underline-offset-2" href={`/knowledge?item=${encodeURIComponent(c.id)}`}>{c.name}</a>
+                          </Fragment>
+                        ))}
+                      </p>
+                    ))}
+                    <p>请确认模型选的是否是你要的口径，或在需求里写明；常用的理解可以在助手里选定后设为默认口径。</p>
+                  </div>
+                )}
                 <Field>
                   <FieldLabel>定义（YAML）</FieldLabel>
                   <MappingEditor key={actionData?.echoId ?? `example-${kind}`} defaultValue={actionData?.yaml ?? example} />
