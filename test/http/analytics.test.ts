@@ -5,6 +5,7 @@
 // 流失预警快照页（#834）：顶部汇总卡片写有风险人数、占比与总人数（与湖上一致），明细默认只列有风险的人（沉默比从高到低），?tab=all 看全部，分页总数按筛选后的行数算
 // 复购与 CLV 快照页（#835）：复购率（X / Y 人）与到第二单天数中位数、CLV 头部 10% 贡献占比与十档分布（与湖上一致，空值显示「—」），下方仍是按 consumer_id 的通用分页明细，没有明文
 // 同期群与复购同样走通用表单（周期下拉框、起草、双人发布入队 gold.cohort / gold.repurchase 并登记快照，周期偏移列表用顿号连接）；
+// 同期群快照页（#836）：默认留存矩阵（行是 cohort_start 升序、列是第 0…periods-1 期，格子是人数与留存率，卡片写同期群数、总人数、粒度），逐人明细在 ?tab=consumers；
 // 模板升级（测试开关 TEMPLATE_TEST_VERSIONS=1）：提示条、预览差异（RFM 分群迁移表、流失预警变化人数，没有 consumer_id）、分析师起草升级但发布 403；
 // 指标与标签（DSL）快照详情（#816）：定义页「快照」区未过期的行点统计日进快照详情页，DSL 快照走通用明细（页头写类型、键、版本、统计日与来源，按行分页），
 // 标签快照带各取值人数汇总，过期 / 其他租户 / 表名与类型对不上 404，未登录跳转登录页
@@ -689,6 +690,66 @@ describe('复购与 CLV 快照页（#835）', () => {
   });
 });
 
+describe('同期群快照页（#836）', () => {
+  beforeEach(fresh);
+
+  it('默认打开留存矩阵：行按 cohort_start 升序，每格的人数与湖上按 unnest(active_periods) 分组的计数一致、第 0 期都是 100.0%、没人下单的期补 0；卡片写同期群数、总人数与粒度；页面没有明文', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await runTask(acme, 'gold.cohort', { asOf: '2024-07-01' });
+    const snapshot = (await listSnapshots(acme, 'cohort'))[0]!;
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    // 湖上按同一口径算出期望矩阵：各 cohort_start 在每个偏移期有下单的人数
+    const [schema, name] = snapshot.table.split('.');
+    const expected = (await onLake<{ cohort_start: string; p: number; consumers: string }>(acme,
+      `SELECT cohort_start::VARCHAR AS cohort_start, p, count(*) AS consumers FROM (SELECT cohort_start, unnest(active_periods) AS p FROM ${schema}."${name}") GROUP BY ALL ORDER BY ALL`))
+      .map(e => ({ cohort: e.cohort_start, period: Number(e.p), consumers: Number(e.consumers) }));
+    // 直接入队的任务参数也补齐了定义默认值：按月 12 期
+    const { granularity, periods } = snapshot.params as { granularity: string; periods: number };
+    expect({ granularity, periods }).toEqual({ granularity: 'month', periods: 12 });
+    const cohorts = [...new Set(expected.map(e => e.cohort))].sort();
+
+    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
+    expect(html).toContain('同期群 · 2024-07-01');
+    // 格子带 data-cohort / data-period / data-consumers，内容是「人数 / 留存率」
+    const cells = [...html.matchAll(/data-cohort="([^"]+)" data-period="(\d+)" data-consumers="(\d+)"[^>]*>([^<]*)/g)]
+      .map(m => ({ cohort: m[1]!, period: Number(m[2]!), consumers: Number(m[3]!), text: m[4]! }));
+    // 行按 cohort_start 升序，每行第 0…periods-1 期都有格子
+    expect([...new Set(cells.map(c => c.cohort))]).toEqual(cohorts);
+    expect(cells.filter(c => c.cohort === cohorts[0]).map(c => c.period)).toEqual([...Array(periods).keys()]);
+    // 每个非零格子的人数与湖上分组一致
+    for (const e of expected) {
+      expect(cells.find(c => c.cohort === e.cohort && c.period === e.period)?.consumers).toBe(e.consumers);
+    }
+    // 第 0 期是整群人数，留存率 100.0%
+    for (const cohort of cohorts) {
+      expect(cells.find(c => c.cohort === cohort && c.period === 0)?.text).toContain('100.0%');
+    }
+    // 湖上没有的 (cohort, period) 组合补 0
+    const missing = (() => {
+      for (const cohort of cohorts) {
+        for (let period = 0; period < periods; period++) {
+          if (!expected.some(e => e.cohort === cohort && e.period === period)) return { cohort, period };
+        }
+      }
+      throw new Error('湖上每个格子都有人下单，找不到该补 0 的格子');
+    })();
+    const zeroCell = cells.find(c => c.cohort === missing.cohort && c.period === missing.period);
+    expect(zeroCell?.consumers).toBe(0);
+    expect(zeroCell?.text).toContain('0.0%');
+    // 卡片：同期群数、总人数（= 快照行数 = 各行第 0 期合计）、粒度
+    expect(html).toContain(`data-cohort-count="${cohorts.length}"`);
+    expect(html).toContain(`data-cohort-total="${snapshot.rowCount}"`);
+    expect(html).toContain('data-cohort-granularity="month"');
+    expect(html).toContain('按月');
+    // 逐人明细在另一个标签页，默认页不带 data-consumer
+    expect(html).toContain('data-tab="consumers"');
+    expect(html).not.toMatch(/data-consumer="/);
+    for (const p of PLAINTEXT) expect(html).not.toContain(p);
+  });
+});
+
 describe('同期群与复购模板参数页（通用表单）', () => {
   beforeEach(fresh);
 
@@ -714,7 +775,7 @@ describe('同期群与复购模板参数页（通用表单）', () => {
     return { acme, de, published: published!, registered, recomputed: registered.find(s => s.taskId !== published!.id)! };
   }
 
-  it('同期群：通用表单有周期下拉框，参数不合法时报错；按周起草、双人发布后以新参数入队 gold.cohort 并登记快照，快照页偏移列表用顿号连接', async () => {
+  it('同期群：通用表单有周期下拉框，参数不合法时报错；按周起草、双人发布后以新参数入队 gold.cohort 并登记快照，默认页是留存矩阵（列到第 29 期），逐人明细标签页的偏移列表用顿号连接', async () => {
     const other = await newTenant('other');
     await memberOf(other, 'analyst@other.com', 'analyst');
     const browser = await loginAs(app, 'analyst@other.com');
@@ -731,12 +792,20 @@ describe('同期群与复购模板参数页（通用表单）', () => {
     expect(registered.map(s => s.template)).toEqual(['cohort', 'cohort']);
     expect(await (await de.get('/analytics/templates/cohort')).text()).toMatch(/value="week" selected="">按周</);
 
-    const page = await (await de.get(`/analytics/snapshots/${recomputed.id}`)).text();
+    // 逐人明细挪到 ?tab=consumers（#836）：表头、5 位消费者与顿号连接的周期偏移照旧
+    const page = await (await de.get(`/analytics/snapshots/${recomputed.id}?tab=consumers`)).text();
     expect(page).toContain('同期群 · 2024-07-01');
     for (const column of ['consumer_id', 'cohort_start', 'orders', 'active_periods']) expect(page).toMatch(new RegExp(`<th[^>]*>${column}</th>`));
     expect(page.match(/data-consumer="/g)).toHaveLength(5);
     // crm 5、crm 6 + 会员 5：4-01（4-01 那周）、6-20 与 6-25（6-17 与 6-24 那周）
     expect(page).toContain('0、11、12');
+
+    // 默认页是留存矩阵：有「留存矩阵」/「逐人明细」两个标签，按周 30 期 → 列到第 29 期为止
+    const matrix = await (await de.get(`/analytics/snapshots/${recomputed.id}`)).text();
+    expect(matrix).toContain('留存矩阵');
+    expect(matrix).toContain('逐人明细');
+    expect(matrix).toContain('data-period="29"');
+    expect(matrix).not.toContain('data-period="30"');
   });
 
   it('复购：windowDays 改成 60 起草、双人发布后入队 gold.repurchase 并登记快照，crm 5 那组 80 天才复购，不再算复购', async () => {
@@ -773,19 +842,27 @@ describe('模板升级', () => {
     expect(page).toContain('有新的模板版本 v2（当前 v1）');
     expect(page).toContain('预览升级差异');
     expect(page).toContain('升级到新版本');
+    // 提示条列出锁定版本之后每一版的改动说明
+    expect(page).toContain('data-upgrade-changes');
+    expect(page).toContain('v2：分群名加 v2: 前缀，用于验证升级流程；所有人的分群名都会变');
 
     const preview = await analyst.post('/analytics/templates/rfm', { intent: 'preview-upgrade', asOf: '2024-12-31' });
     expect(preview.status).toBe(200);
     const diff = await preview.text();
     expect(diff).toContain('data-upgrade-diff');
     expect(diff).toContain('v1 → v2，统计日 2024-12-31');
+    // 预览结果的头部再列一次同样的说明（提示条里一次、预览头部一次）
+    expect(diff.match(/data-upgrade-changes/g)!.length).toBe(2);
+    expect(diff).toContain('v2：分群名加 v2: 前缀，用于验证升级流程；所有人的分群名都会变');
     expect(diff.match(/data-upgrade-segment/g)!.length).toBeGreaterThan(0);
     expect(diff).toMatch(/<td[^>]*>v2:[^<]+<\/td>/);
     expect(diff).not.toMatch(/[0-9a-f]{64}/);
 
-    // 流失预警：变化、新增、移出人数
+    // 流失预警：变化、新增、移出人数；提示条与预览头部列出它自己的改动说明
     const churn = await (await analyst.post('/analytics/templates/churn', { intent: 'preview-upgrade', asOf: '2024-10-15' })).text();
     expect(churn).toMatch(/data-upgrade-metric[^>]*>取值变化 [1-9]\d* 人，新增 0 人，移出 0 人/);
+    expect(churn.match(/data-upgrade-changes/g)!.length).toBe(2);
+    expect(churn).toContain('v2：at_risk 取反；minOrders 不超过 10，用于验证升级流程；所有人的 at_risk 都会翻转');
     expect(churn).not.toMatch(/[0-9a-f]{64}/);
 
     const upgraded = await analyst.post('/analytics/templates/rfm', { intent: 'upgrade' });

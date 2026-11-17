@@ -1,5 +1,6 @@
 // app/routes/llm-usage.tsx —— 「模型调用」页（仅管理员，#303）：按用途看近 7/30 天的调用次数、token、平均与 P95 耗时、
 // Schema 通过率、错误率与按当前单价折算的金额（ADR-0057，#745），映射草稿一行另有「校验通过率」（#802，部分采用单独计数），
+// 指标卡另有「调用来源」（#844）：租户 / 平台端点分开计数，旧行计入「未记录」，
 // 并列出最近的调用明细（分页）；失败的调用标红、错误摘要截到 120 字（全文在 title）
 import type { Route } from './+types/llm-usage';
 import { Link } from 'react-router';
@@ -104,13 +105,16 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
         </div>
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
             <StatTile label="总调用" value={n(usage.total.calls)} hint={`近 ${days} 天，全部用途`} />
             <StatTile label="总 token" value={n(usage.total.promptTokens + usage.total.completionTokens)}
               hint={`输入 ${n(usage.total.promptTokens)} · 输出 ${n(usage.total.completionTokens)}`} />
             <StatTile label="P95 耗时" value={`${n(usage.total.p95Ms)} ms`} hint="全部用途合计" />
             <StatTile label="错误率" value={pct(usage.total.errors, usage.total.calls)} tone={usage.total.errors ? 'text-red-600' : undefined}
               hint={`${n(usage.total.errors)} 次失败`} />
+            {/* 调用来源（#844）：本租户、本窗口按租户 / 平台端点分开计数；旧行（source 为空）单独提示，没有时不渲染 */}
+            <StatTile label="调用来源" value={<span data-col="source-split">{`租户 ${n(usage.bySource.tenant)} / 平台 ${n(usage.bySource.platform)}`}</span>}
+              hint={usage.bySource.unknown ? <span data-col="source-unknown">{`未记录 ${n(usage.bySource.unknown)}`}</span> : `近 ${days} 天`} />
           </div>
 
           <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">

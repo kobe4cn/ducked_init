@@ -272,6 +272,13 @@ async function handle(page, state, req) {
     for (const event of browserConsole) lines.push(`${event.type}\t${event.text.replaceAll('\n', ' ')}`);
     return { stdout: lines.join('\n') };
   }
+  if (cmd === 'html') {
+    // 整页 HTML，含服务端渲染和注水数据。截图和可访问性树只看得到画出来的字。
+    if (!req.path) throw new Error('html requires --path');
+    mkdirSync(dirname(req.path), { recursive: true });
+    writeFileSync(req.path, await page.content());
+    return { stderr: req.path };
+  }
   if (cmd === 'scroll-into') {
     // 把控件滚进视口，并打印滚动后的 window.scrollY。数据源页的确认按钮在折线以下，提交后要用 scroll-y 证明没有跳回顶部。
     const target = req.selector
@@ -285,7 +292,7 @@ async function handle(page, state, req) {
 }
 
 function usage() {
-  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|title|url|text|value|count|scroll-y|scroll-into|console|magic-link> [args]`);
+  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|html|title|url|text|value|count|scroll-y|scroll-into|console|magic-link> [args]`);
   console.error('click accepts --role and --name, or --selector <css>. --confirm accept|dismiss handles one window.confirm');
   console.error('console accepts --clear, which drops the buffer and prints console-cleared=<N>');
 }

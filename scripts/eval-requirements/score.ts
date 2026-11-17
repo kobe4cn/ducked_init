@@ -3,7 +3,7 @@
 // 另有计划模式的评测（#423，ADR-0050）：runPlanCase 让模型对一条需求在五种模式里选一个并给出计划 JSON，validatePlan 解析出 mode，
 // 与 plan-modes.ts 的期望比对。产品的 validate_plan 工具还没接入助手（P4⑮），这里的消息是评测自己拼的，接入后对齐
 import { stringify } from 'yaml';
-import { expand, overview, toMarkdown, type Catalog, type CatalogEntry } from '../../app/.server/catalog';
+import { expand, layeredContext, OVERVIEW_TOKENS, toMarkdown, type Catalog, type CatalogEntry } from '../../app/.server/catalog';
 import { AGGREGATE_FNS, PLAN_MODES, PLAN_SCHEMA, semanticHash, validatePlan, type PlanMode } from '../../app/.server/catalog/plan';
 import { CLAIM_TYPES } from '../../app/lib/semantic-claims';
 import { callModel, LlmError, type LlmMessage, type LlmProvider } from '../../app/.server/llm';
@@ -164,7 +164,7 @@ const claimValues = (t: 'unit' | 'time_meaning') => CLAIM_TYPES[t].values.map(v 
 /** system 提示词：五种模式与计划 JSON 的字段（对齐 PLAN_SCHEMA 的约束） */
 const PLAN_SYSTEM = [
   '你是 CRM 数据平台的分析助手：成员提一条数据分析需求，你先判断怎么回答，输出一份分析计划。只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
-  '成员的消息里依次是语义目录总览、按需求搜出的目录条目、可选中条目的版本与语义哈希、需求原文。',
+  '成员的消息里依次是语义目录的第一层分组与相关分组的组内列表、按需求搜出的目录条目、可选中条目的版本与语义哈希、需求原文。',
   '五种模式（mode 只能取这五个值之一）：',
   ...PLAN_MODES.map(m => `- ${m}：${MODE_HELP[m]}。`),
   '计划 JSON 的字段（schemaVersion 恒为 1）：',
@@ -203,7 +203,7 @@ export async function runPlanCase(provider: LlmProvider, g: GoldenEntry): Promis
   const catalog: Catalog = g.role === 'viewer' ? viewerView(RETRIEVAL_CATALOG) : RETRIEVAL_CATALOG;
   const entries = r.top.flatMap(id => { const e = expand(catalog, id); return e ? [e] : []; });
   const user = [
-    toMarkdown(overview(catalog)),
+    layeredContext(catalog, [], OVERVIEW_TOKENS),
     `# 与需求相关的条目\n\n${toMarkdown(entries)}`,
     `# 可选中条目的版本与语义哈希\n\n${entries.map(selectableLine).join('\n') || '无'}`,
     `# 需求\n\n${g.request}`,

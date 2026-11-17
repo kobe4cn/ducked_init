@@ -6,7 +6,8 @@ import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, snapshots, tasks, templateDefinitions, templateVersions } from '../../app/.server/db/schema';
-import { latestTemplate, templateAt } from '../../app/.server/pipeline/templates';
+import { latestTemplate, templateAt, TEMPLATE_HISTORY, TEMPLATES, type Template, type TemplateId } from '../../app/.server/pipeline/templates';
+import { TEST_VERSIONS } from '../../app/.server/pipeline/templates/test-versions';
 import { enqueueDueRefreshes } from '../../app/.server/refresh';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
@@ -49,6 +50,21 @@ describe('模板升级', () => {
     expect(templateAt('rfm', 1).compile(params, () => true)).not.toContain('v2:');
     expect(templateAt('rfm', 2).compile(params, () => true)).toContain(`SELECT * REPLACE ('v2:' || segment AS segment) FROM (${templateAt('rfm', 1).compile(params, () => true)})`);
     expect(latestTemplate('user360').version).toBe(1);
+  });
+
+  it('每个模板的第 1 版都写「初版」；version > 1 的每一版（TEMPLATE_HISTORY、TEMPLATES 当前版本、TEST_VERSIONS 生成的版本）都带非空的改动说明，且和上一版的不同', () => {
+    for (const id of Object.keys(TEMPLATES) as TemplateId[]) {
+      const current = TEMPLATES[id] as unknown as Template<unknown, unknown>;
+      const chain = [...TEMPLATE_HISTORY[id] ?? [], current, ...[TEST_VERSIONS[id]?.(current)].flatMap(t => (t ? [t] : []))]
+        .sort((a, b) => a.version - b.version);
+      expect(chain[0]!.version, id).toBe(1);
+      expect(chain[0]!.changes, id).toBe('初版');
+      for (const [i, t] of chain.entries()) {
+        if (t.version === 1) continue;
+        expect(t.changes.trim(), `${id} v${t.version}`).not.toBe('');
+        expect(t.changes, `${id} v${t.version}`).not.toBe(chain[i - 1]!.changes);
+      }
+    }
   });
 
   it('模板新版本发布后，锁定第 1 版的定义起草发布、重新计算、定时刷新的结果都不变；开关打开后才自动启用 RFM 的租户锁定第 2 版，分群带 v2:', async () => {
