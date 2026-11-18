@@ -226,7 +226,7 @@ const sampleValue = (v: unknown) => (v == null ? '—' : typeof v === 'boolean' 
 function SampleTable({ from, to, sample }: { from: number; to: number; sample: UpgradeSample }) {
   return (
     <div className="space-y-1">
-      <p className="text-xs font-medium text-slate-400">{`样例消费者（最多 10 个，按 consumer_id 排序，${'cell' in sample.pick ? '原分群 → 新分群' : '换了取值'}）`}</p>
+      <p className="text-xs font-medium text-slate-400">{`样例消费者（最多 10 个，按 consumer_id 排序，${sample.pick.kind === 'cell' ? '原分群 → 新分群' : '换了取值'}）`}</p>
       <Table data-upgrade-sample>
         <TableHeader>
           <TableRow>

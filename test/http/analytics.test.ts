@@ -991,7 +991,7 @@ describe('模板升级', () => {
     expect(sampled).toContain('data-upgrade-diff');
     expect(sampled).toContain('data-upgrade-matrix');
     expect(sampled.indexOf('data-upgrade-matrix')).toBeLessThan(sampled.indexOf('data-upgrade-sample'));
-    expect(sampled).toContain('样例消费者');
+    expect(sampled).toContain('样例消费者（最多 10 个，按 consumer_id 排序，原分群 → 新分群）');
     expect(sampled.match(/data-sample-row="/g)!.length).toBeLessThanOrEqual(10);
     expect(sampled).toMatch(/data-sample-row="[0-9a-f]{64}"/);
     expect(sampled).toMatch(/<th[^>]*>consumer_id<\/th>/);
@@ -1006,7 +1006,7 @@ describe('模板升级', () => {
     const churnSampled = await (await viewer.post('/analytics/templates/churn', { intent: 'preview-sample', asOf: '2024-10-15', column: 'at_risk' })).text();
     expect(churnSampled).toContain('data-upgrade-diff');
     expect(churnSampled.indexOf('data-upgrade-columns')).toBeLessThan(churnSampled.indexOf('data-upgrade-sample'));
-    expect(churnSampled).toContain('样例消费者');
+    expect(churnSampled).toContain('样例消费者（最多 10 个，按 consumer_id 排序，换了取值）');
     expect(churnSampled).toMatch(/data-sample-row="[0-9a-f]{64}"/);
     expect(churnSampled).toContain('v1 at_risk');
     expect(churnSampled).toContain('v2 at_risk');
