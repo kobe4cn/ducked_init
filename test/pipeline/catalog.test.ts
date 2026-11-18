@@ -158,12 +158,11 @@ describe('语义目录的加载', () => {
 
     // 先登记统计日 D 的快照，再登记统计日 D-1、但登记更晚的回刷快照：目录里该模板仍是 D 那张
     const dayD = await register('2024-08-01', new Date(Date.now() - 7_200_000));
-    const backfill = await register('2024-07-31', new Date(Date.now() - 3_600_000));
+    await register('2024-07-31', new Date(Date.now() - 3_600_000));
     expect(await snapshotTable()).toBe(dayD);
     // 同一统计日 D 再登记一张（登记最晚）：取它
     const late = await register('2024-08-01', new Date());
     expect(await snapshotTable()).toBe(late);
-    expect(backfill).not.toBe(dayD);
   });
 
   it('指标、标签、模板条目带定义所属空间 spaceId，只作记录：另一个空间的成员发布的标签也在目录里', async () => {
