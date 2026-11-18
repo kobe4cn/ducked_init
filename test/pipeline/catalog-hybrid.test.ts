@@ -1,5 +1,5 @@
 // test/pipeline/catalog-hybrid.test.ts —— 混合检索（ADR-0047、0049）的接缝：rankedSearch({ hybrid: true }) → vectorHits（查询 embedding + catalog_embeddings 缓存）→ rank 的向量一路；
-// embedding 超时（短超时）、5xx 或没配置时只去掉向量这一路（fallback 仍为 false、结果与关键词检索逐项相同）；换模型后缺向量的条目只走关键词并入队补算，drain 后向量一路恢复；
+// embedding 超时（短超时）、5xx 或没配置时只去掉向量这一路（fallback 仍为 false、结果与关键词检索逐项相同，vectorFallback 给出原因）；换模型后缺向量的条目只走关键词并入队补算，drain 后向量一路恢复；
 // catalog_search（内部与 MCP 同一入口）按租户 hybrid_search 开关决定是否走混合（#432）；
 // hybridReady 断言向量缓存齐全，缺了就在报错里列出诊断（#610）
 import { and, eq } from 'drizzle-orm';
@@ -109,29 +109,39 @@ describe('混合检索', () => {
     expect((await embedTasks(acme)).map(t => t.status)).toEqual(['succeeded']);
   });
 
-  it('embedding 超时（按 QUERY_EMBED_TIMEOUT_MS 短超时）、5xx 或没配置时，hybrid: true 的结果与不传的逐项相同、fallback: false，查询文本不进日志', async () => {
+  it('embedding 超时（按 QUERY_EMBED_TIMEOUT_MS 短超时）、5xx 或没配置时，hybrid: true 的 ranked 与不传的逐项相同、fallback: false、vectorFallback 给出原因，查询文本不进日志', async () => {
     const { acme, c } = await hybridReady();
     const plain = await rankedSearch(acme, 'full', c, QUERY, {});
+    expect('vectorFallback' in plain).toBe(false); // 不传 hybrid 时连这个键都没有
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     // 超时：永不 resolve、但遵守 abort 的 fetch，按短超时中断而不是 60 秒
     setLlmFetch((_url, init) => new Promise((_resolve, reject) =>
       init?.signal?.addEventListener('abort', function aborted(this: AbortSignal) { reject(this.reason); })));
     const started = Date.now();
-    expect(await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true })).toEqual(plain);
+    const timedOut = await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true });
+    expect(timedOut.ranked).toEqual(plain.ranked);
+    expect(timedOut.fallback).toBe(false);
+    expect(timedOut.vectorFallback).toBe('embed_failed');
     expect(Date.now() - started).toBeLessThan(10_000);
     expect(warn).toHaveBeenCalledTimes(1);
 
     // 5xx
     setLlmFetch(async () => new Response('server exploded', { status: 500 }));
-    expect(await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true })).toEqual(plain);
+    const exploded = await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true });
+    expect(exploded.ranked).toEqual(plain.ranked);
+    expect(exploded.fallback).toBe(false);
+    expect(exploded.vectorFallback).toBe('embed_failed');
     expect(warn).toHaveBeenCalledTimes(2);
 
-    // 没配置（租户与平台都没有）：不发请求、不算错误
+    // 没配置（租户与平台都没有）：不发请求、不算错误，原因是 off
     let called = false;
     setLlmFetch(async () => { called = true; throw new TypeError('fetch failed'); });
     vi.unstubAllEnvs();
-    expect(await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true })).toEqual(plain);
+    const off = await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true });
+    expect(off.ranked).toEqual(plain.ranked);
+    expect(off.fallback).toBe(false);
+    expect(off.vectorFallback).toBe('off');
     expect(called).toBe(false);
     expect(warn).toHaveBeenCalledTimes(2);
 
@@ -176,6 +186,7 @@ describe('混合检索', () => {
     const off = await runTool(analyst, 'catalog_search', { query: QUERY });
     expect(off).not.toContain('churn_forecast');
     expect(off).not.toContain(MARK);
+    expect(off).not.toContain('vector_fallback'); // 开关关着（没走向量一路）就没有这一行
     expect(off.startsWith('ambiguous: ')).toBe(true);
     expect([...off.matchAll(/^## (\S+)/gm)].map(m => m[1])).toEqual(plain.ranked.map(r => r.entry.id));
     expect(received.length).toBe(callsBefore);
@@ -185,6 +196,16 @@ describe('混合检索', () => {
     const on = await runTool(analyst, 'catalog_search', { query: QUERY });
     expect(on).toContain('churn_forecast');
     expect(on).toContain('语义');
+    expect(on).not.toContain('vector_fallback'); // 向量一路正常时也没有这一行
     expect(received.slice(callsBefore).map(r => r.body.input)).toEqual([[QUERY]]);
+  });
+
+  it('catalog_search 打开混合检索但向量一路没用上时，输出在 ambiguous 后紧跟一行 vector_fallback 原因（结果只来自关键词）', async () => {
+    const { acme, analyst } = await hybridReady();
+    await getDb().update(tenants).set({ hybridSearch: true }).where(eq(tenants.id, acme));
+    setLlmFetch(async () => new Response('server exploded', { status: 500 })); // 照上面 5xx 的写法：查询 embedding 失败
+    const out = await runTool(analyst, 'catalog_search', { query: QUERY });
+    expect(out.split('\n\n')[1]).toBe('vector_fallback: embed_failed');
+    expect(out).not.toContain(MARK); // 向量一路没生效：只靠向量命中的条目不在结果里
   });
 });

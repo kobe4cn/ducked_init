@@ -167,14 +167,15 @@ describe('补算与混合检索连不上外部库（pgvector 替身）', () => {
     for (const secret of ['p@ss/w', 'p%40ss%2Fw', 'us@r', 'us%40r', url]) expect(error).not.toContain(secret);
   });
 
-  it('混合检索连不上外部库：结果与不传 hybrid 逐项相同、fallback: false，不抛错，warn 里也不带连接串', async () => {
+  it('混合检索连不上外部库：ranked 与不传 hybrid 逐项相同、fallback: false、vectorFallback: store_unreachable，不抛错，warn 里也不带连接串', async () => {
     const { acme, c } = await tenantOnBrokenStore();
     const plain = await rankedSearch(acme, 'full', c, QUERY, {}, 20);
     setPgvectorConnect(() => ({ query: () => Promise.reject(new Error(`connect failed ${url}`)) }));
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const hybrid = await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true });
-    expect(hybrid).toEqual(plain);
+    expect(hybrid.ranked).toEqual(plain.ranked);
     expect(hybrid.fallback).toBe(false);
+    expect(hybrid.vectorFallback).toBe('store_unreachable');
     expect(JSON.stringify(warn.mock.calls)).not.toContain(url);
   });
 });
