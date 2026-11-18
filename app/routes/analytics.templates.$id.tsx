@@ -350,7 +350,7 @@ function ColumnUpgradeDistribution({ from, to, distribution }: {
     if (c.type === 'text') {
       const stat = c[side];
       return stat === null || stat.values.length === 0 ? '—' : (
-        <div>{stat.values.map(v => <div key={v.value}>{`${v.value}：${count(v.consumers)} 人`}</div>)}</div>
+        <div>{stat.values.map((v, i) => <div key={i}>{`${v.value ?? '（无）'}：${count(v.consumers)} 人`}</div>)}</div>
       );
     }
     const stat = c[side];

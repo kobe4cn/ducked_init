@@ -19,7 +19,8 @@ export interface BoolStat { yes: number }
 export interface NumberStat { mean: number | null; median: number | null; p90: number | null }
 
 /** 文本列一边的统计量：人数最多的前 10 个取值（已按人数降序、同数按取值升序，超过 10 个不另标注） */
-export interface TextStat { values: { value: string; consumers: number }[] }
+/** value 为 null 是这一列为空的人（GROUP BY 把 NULL 也算一个取值），显示成「（无）」 */
+export interface TextStat { values: { value: string | null; consumers: number }[] }
 
 /** 其他类型（日期、列表等）列一边的统计量：非空人数 */
 export interface OtherStat { nonNull: number }
@@ -75,7 +76,7 @@ function columnPhrase(c: ColumnStat): string {
     // 取值写 v2 里人数最多的（values 已按人数降序）；v2 一个取值都没有时用 v1 的；那一边没有这一取值记 0
     const v = (c.after?.values.length ? c.after : c.before)?.values[0]?.value;
     const at = (s: TextStat | null) => (s === null ? '—' : count(s.values.find(x => x.value === v)?.consumers ?? 0));
-    return v === undefined ? `${c.name}：${at(c.before)} → ${at(c.after)}` : `${c.name} 为 ${v}：${at(c.before)} → ${at(c.after)}`;
+    return v === undefined ? `${c.name}：${at(c.before)} → ${at(c.after)}` : `${c.name} 为 ${label(v)}：${at(c.before)} → ${at(c.after)}`;
   }
   const nonNull = (s: OtherStat | null) => (s === null ? '—' : count(s.nonNull));
   return `${c.name} 非空：${nonNull(c.before)} → ${nonNull(c.after)}`;

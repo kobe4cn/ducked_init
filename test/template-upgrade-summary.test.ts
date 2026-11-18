@@ -116,6 +116,17 @@ describe('summarizeColumnUpgrade', () => {
       .toBe('没变的人占 95.0%；变化最大的字段：city 为 北京：60 → 0。');
   });
 
+  it('text 列 v2 人数最多的取值是 null 时写「（无）」', () => {
+    const column: ColumnStat = {
+      name: 'city', type: 'text',
+      before: { values: [{ value: '北京', consumers: 60 }, { value: null, consumers: 40 }] },
+      after: { values: [{ value: null, consumers: 70 }, { value: '北京', consumers: 30 }] },
+      changed: 30,
+    };
+    expect(summarizeColumnUpgrade({ changed: 30, added: 0, removed: 0 }, [column], { before: 100, after: 100 }).text)
+      .toBe('没变的人占 70.0%；变化最大的字段：city 为 （无）：40 → 70。');
+  });
+
   it('other 写非空人数；某一边缺这一列时那一边写「—」', () => {
     const column: ColumnStat = { name: 'last_order', type: 'other', before: { nonNull: 80 }, after: { nonNull: 95 }, changed: 15 };
     expect(summarizeColumnUpgrade({ changed: 15, added: 0, removed: 0 }, [column], { before: 100, after: 100 }).text)

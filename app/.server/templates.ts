@@ -332,7 +332,7 @@ export async function previewTemplateUpgrade(actor: CurrentMember, id: string, a
         const numberStat = async (sql: string, c: string): Promise<NumberStat> => (await rows<NumberStat>(con, `
           SELECT avg(CAST(${c} AS DOUBLE))::DOUBLE AS mean, median(CAST(${c} AS DOUBLE))::DOUBLE AS median,
             quantile_cont(CAST(${c} AS DOUBLE), 0.9)::DOUBLE AS p90 FROM (${sql})`))[0]!;
-        const textStat = async (sql: string, c: string) => ({ values: await rows<{ value: string; consumers: number }>(con, `
+        const textStat = async (sql: string, c: string) => ({ values: await rows<{ value: string | null; consumers: number }>(con, `
           SELECT ${c} AS value, count(*)::INTEGER AS consumers FROM (${sql}) GROUP BY ${c} ORDER BY count(*) DESC, ${c} LIMIT 10`) });
         const otherStat = async (sql: string, c: string) => (await rows<{ nonNull: number }>(con, `SELECT count(${c})::INTEGER AS nonNull FROM (${sql})`))[0]!;
         // 同一列两边的统计形状一样（type 以 v2 为准），pair 在这一列两边都在时各算一份，只有一边有时缺的一边为 null
