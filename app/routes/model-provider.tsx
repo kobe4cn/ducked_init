@@ -110,6 +110,29 @@ const EMBEDDING_SOURCE_LABEL = {
 /** 向量存储（ADR-0058，#848）两种选型的名字 */
 const VECTOR_STORE_LABEL = { platform: '系统自带', pgvector: '外部 pgvector' } as const;
 
+/** 向量存储卡上的「上次检查」状态行：失败 / 通过 / 还没测过 */
+function VectorStoreStatus({ checkedAt, error }: { checkedAt: string | null; error: string | null }) {
+  if (error) {
+    return (
+      <span data-vector-store-status="failed" className="flex items-center gap-1 text-red-600">
+        <CircleAlert className="size-4" />上次检查未通过：{error}
+      </span>
+    );
+  }
+  if (checkedAt) {
+    return (
+      <span data-vector-store-status="ok" className="flex items-center gap-1 text-emerald-600">
+        <CheckCircle2 className="size-4" />上次检查 {new Date(checkedAt).toLocaleString('zh-CN')}，连接正常
+      </span>
+    );
+  }
+  return (
+    <span data-vector-store-status="never" className="flex items-center gap-1 text-slate-400">
+      <AlertTriangle className="size-4" />还没有测试过连接
+    </span>
+  );
+}
+
 /** 每档的名字与它管哪些用途（ADR-0055 的 PURPOSE_TIER 决定，页面只做说明） */
 const TIER_LABEL: Record<'fast' | 'reasoning', { title: string; hint: string }> = {
   fast: { title: '快速档（fast）', hint: '断言草稿、工作台结果解读、一句话解析这类要快的用途' },
@@ -384,19 +407,7 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
         <p className="text-sm text-slate-500">检索向量存在平台库，或租户自己的外部 PostgreSQL（pgvector 扩展）。连接串加密保存、保存后不再显示；选外部 pgvector 时保存前先测试连通，失败不保存。</p>
         {provider.vectorStore.kind === 'pgvector' && (
           <div data-vector-store-checked={provider.vectorStore.checkedAt ?? ''} className="text-sm">
-            {provider.vectorStore.error ? (
-              <span data-vector-store-status="failed" className="flex items-center gap-1 text-red-600">
-                <CircleAlert className="size-4" />上次检查未通过：{provider.vectorStore.error}
-              </span>
-            ) : provider.vectorStore.checkedAt ? (
-              <span data-vector-store-status="ok" className="flex items-center gap-1 text-emerald-600">
-                <CheckCircle2 className="size-4" />上次检查 {new Date(provider.vectorStore.checkedAt).toLocaleString('zh-CN')}，连接正常
-              </span>
-            ) : (
-              <span data-vector-store-status="never" className="flex items-center gap-1 text-slate-400">
-                <AlertTriangle className="size-4" />还没有测试过连接
-              </span>
-            )}
+            <VectorStoreStatus checkedAt={provider.vectorStore.checkedAt} error={provider.vectorStore.error} />
           </div>
         )}
         <div className="flex flex-wrap gap-2">
