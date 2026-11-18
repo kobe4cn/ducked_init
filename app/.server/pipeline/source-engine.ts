@@ -155,15 +155,34 @@ export function sourceConnectTimeout(env: Record<string, string | undefined> = p
   return /^\d+$/.test(raw ?? '') && Number(raw) > 0 ? Number(raw) : 10;
 }
 
+/** PostgreSQL 源库建连超时（timeout expired）的重试次数（SOURCE_CONNECT_RETRIES，默认 0）：高负载环境下建连偶发整段超时（#892），
+ *  生产默认不重试、行为不变；非负整数字符串才用，否则按默认 0 */
+export function sourceConnectRetries(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.SOURCE_CONNECT_RETRIES;
+  return /^\d+$/.test(raw ?? '') ? Number(raw) : 0;
+}
+
 /** 在已有的 DuckDB 里以 src 只读挂载数据源，返回锁定配置时要放行的路径。调用方负责随后锁住配置 */
 export async function attachSource(con: DuckDBConnection, spec: SourceSpec): Promise<{ allowed: string[]; mongo?: MongoAccess }> {
   switch (spec.kind) {
-    case 'postgres':
+    case 'postgres': {
+      // ATTACH 单独跑、只在建连超时（timeout expired）时按 SOURCE_CONNECT_RETRIES 重试（#892）：整段重跑会报 secret src_pg 已存在。
+      // ATTACH 失败时 src 没有注册，重试前不需要 DETACH；此时还在 lockConfiguration 之前，可以再次 ATTACH。
+      // 用完重试次数或密码错、库不存在等其他错误时抛最后一次的原错误，不包装（openSource 会脱敏，probe 会加前缀）。mysql 和 mongo 不重试（不在 #892 范围内）
       await con.run(`INSTALL postgres; LOAD postgres;
         CREATE TEMPORARY SECRET src_pg (TYPE postgres, HOST ${lit(spec.host)}, PORT ${spec.port}, DATABASE ${lit(spec.database)},
-          USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)});
-        ATTACH 'connect_timeout=${sourceConnectTimeout()}' AS src (TYPE postgres, SECRET src_pg, SCHEMA ${lit(spec.schema)}, READ_ONLY)`);
-      return { allowed: [] };
+          USER ${lit(spec.user)}, PASSWORD ${lit(spec.password)})`);
+      const attach = `ATTACH 'connect_timeout=${sourceConnectTimeout()}' AS src (TYPE postgres, SECRET src_pg, SCHEMA ${lit(spec.schema)}, READ_ONLY)`;
+      const retries = sourceConnectRetries();
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await con.run(attach);
+          return { allowed: [] };
+        } catch (e) {
+          if (attempt >= retries || !(e as Error).message.includes('timeout expired')) throw e;
+        }
+      }
+    }
     case 'mysql':
       await con.run(`INSTALL mysql; LOAD mysql;
         CREATE TEMPORARY SECRET src_mysql (TYPE mysql, HOST ${lit(spec.host)}, PORT ${spec.port}, DATABASE ${lit(spec.database)},
