@@ -11,6 +11,7 @@
 // 有修改与删除权限的成员可以删除定义；被已发布标签引用的指标不能删（依赖由已发布版本按需解析，dsl-dependencies.ts）。
 // 一律限定在操作者所属租户内
 import type { DuckDBConnection } from '@duckdb/node-api';
+import { randomUUID } from 'node:crypto';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
@@ -94,12 +95,13 @@ export interface DslVersionRef { kind: DslKind; key: string; definitionId: strin
 
 /**
  * 在调用方的事务里按 asOf 编译定义的一版（spec 已对照 ctx 校验通过）并入队一次 gold.dsl，参数带上编译出的 SQL、用到的实体（任务不再访问平台库）
- * 与来源 trigger（登记快照时记下）
+ * 与来源 trigger（登记快照时记下）。batchId 把同一次入队的一组任务（指标连同下游标签、回刷的各个统计日）归成一批：
+ * 这批任务因断言失败时只告警一次（quality.ts），由调用处生成、同一次调用共用
  */
-export const enqueueDsl = (tx: Tx, tenantId: string, d: DslVersionRef, spec: unknown, ctx: DslContext, asOf: string, trigger: SnapshotTrigger) =>
+export const enqueueDsl = (tx: Tx, tenantId: string, d: DslVersionRef, spec: unknown, ctx: DslContext, asOf: string, trigger: SnapshotTrigger, batchId: string) =>
   insertTask(tx, tenantId, 'gold.dsl', {
     kind: d.kind, key: d.key, definitionId: d.definitionId, definitionVersion: d.version, asOf,
-    sql: DSL_KINDS[d.kind].compile(spec, ctx, asOf, d.key), entities: DSL_KINDS[d.kind].entities(spec, ctx), trigger,
+    sql: DSL_KINDS[d.kind].compile(spec, ctx, asOf, d.key), entities: DSL_KINDS[d.kind].entities(spec, ctx), trigger, batchId,
   });
 
 /**
@@ -274,8 +276,9 @@ export const dslDefinitionAdapter: PublishableAdapter<DslDefinitionCtx, string, 
     return { checked, dslCtx, tagCtx, downstream, asOf: todayUtc() };
   },
   afterPublish: async (tx, draft, ctx, inside) => {
-    const task = await enqueueDsl(tx, ctx.tenantId, { kind: ctx.kind, key: ctx.key, definitionId: ctx.parentId, version: draft.version }, inside.checked.spec, inside.dslCtx, inside.asOf, 'publish');
-    for (const { tag, spec } of inside.downstream.ready) await enqueueDsl(tx, ctx.tenantId, tag, spec, inside.tagCtx, inside.asOf, 'publish');
+    const batchId = randomUUID();
+    const task = await enqueueDsl(tx, ctx.tenantId, { kind: ctx.kind, key: ctx.key, definitionId: ctx.parentId, version: draft.version }, inside.checked.spec, inside.dslCtx, inside.asOf, 'publish', batchId);
+    for (const { tag, spec } of inside.downstream.ready) await enqueueDsl(tx, ctx.tenantId, tag, spec, inside.tagCtx, inside.asOf, 'publish', batchId);
     return task;
   },
   audit: {
@@ -487,9 +490,11 @@ export async function backfillDefinition(actor: CurrentMember, kind: string, key
     });
     const self = { kind, key, definitionId: published.definitionId, version: published.version };
     const enqueued = [];
+    // 一次回刷（所有统计日）算一批
+    const batchId = randomUUID();
     for (const day of days) {
-      enqueued.push(await enqueueDsl(tx, actor.tenant.id, self, checked.spec, ctx, day, 'backfill'));
-      for (const { tag, spec } of downstream.ready) enqueued.push(await enqueueDsl(tx, actor.tenant.id, tag, spec, ctx, day, 'backfill'));
+      enqueued.push(await enqueueDsl(tx, actor.tenant.id, self, checked.spec, ctx, day, 'backfill', batchId));
+      for (const { tag, spec } of downstream.ready) enqueued.push(await enqueueDsl(tx, actor.tenant.id, tag, spec, ctx, day, 'backfill', batchId));
     }
     return { version: published.version, days, tasks: enqueued };
   });
@@ -518,8 +523,9 @@ export async function recomputeDefinition(actor: CurrentMember, kind: string, ke
       detail: { kind, key, version: published.version, asOf, tags: downstream.ready.map(t => t.tag.key), skippedTags: downstream.skipped },
     });
     const self = { kind, key, definitionId: published.definitionId, version: published.version };
-    const enqueued = [await enqueueDsl(tx, actor.tenant.id, self, checked.spec, ctx, asOf, 'manual')];
-    for (const { tag, spec } of downstream.ready) enqueued.push(await enqueueDsl(tx, actor.tenant.id, tag, spec, ctx, asOf, 'manual'));
+    const batchId = randomUUID();
+    const enqueued = [await enqueueDsl(tx, actor.tenant.id, self, checked.spec, ctx, asOf, 'manual', batchId)];
+    for (const { tag, spec } of downstream.ready) enqueued.push(await enqueueDsl(tx, actor.tenant.id, tag, spec, ctx, asOf, 'manual', batchId));
     return { version: published.version, asOf, tasks: enqueued };
   });
 }

@@ -6,9 +6,10 @@ import { and, eq, inArray, like, sql } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { snapshots, tasks } from '../../app/.server/db/schema';
-import { backfillDefinition, createDefinition, DslError, getDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
+import { auditLogs, snapshots, tasks } from '../../app/.server/db/schema';
+import { backfillDefinition, createDefinition, DslError, getDefinition, publishDefinition, recomputeDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
+import { setMailer, type Mail } from '../../app/.server/mailer';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { enqueueDueRefreshes } from '../../app/.server/refresh';
 import { listSnapshots } from '../../app/.server/snapshots';
@@ -208,9 +209,11 @@ describe('定时刷新', () => {
       `INSERT INTO tracking.events VALUES ('e10', 'u1', 'd1', 'view', '2024-07-01 10:00', '2024-07-01')`);
     expect(await refreshed(noonOf(day))).toEqual([]);
 
-    // 新订单合并后：指标与下游标签按当天入队
+    // 新订单合并后：指标与下游标签按当天入队，同一次入队用同一个 batchId（断言失败时只告警一次，#841）
     await syncAndMerge(author, sources.crm, newOrder('A7'));
-    expect(await refreshed(noonOf(day))).toEqual([
+    const due = (await enqueueDueRefreshes(noonOf(day))).filter(t => t.kind === 'gold.dsl');
+    expect(new Set(due.map(t => t.params.batchId)).size).toBe(1);
+    expect(due.map(t => [t.params.kind, t.params.key, t.params.definitionVersion, t.params.asOf, t.params.trigger]).sort()).toEqual([
       ['metric', 'revenue', 1, day, 'scheduled'],
       ['tag', 'value_tier', 1, day, 'scheduled'],
     ]);
@@ -250,5 +253,44 @@ describe('定时刷新', () => {
     await getDb().delete(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'gold.dsl'), sql`${tasks.params}->>'kind' = 'tag'`, eq(tasks.status, 'queued')));
     await drain();
     expect(await refreshed(noonOf(day))).toEqual([['tag', 'value_tier', 1, day, 'scheduled']]);
+  });
+});
+
+describe('断言失败只告警一次', () => {
+  const outbox: Mail[] = [];
+  beforeEach(() => {
+    outbox.length = 0;
+    setMailer({ async send(m) { outbox.push(m); } });
+  });
+  afterEach(() => { setMailer(undefined); });
+
+  it('一次重新计算入队的指标与下游标签都因负金额失败：共用同一个 batchId、各写报错文本，管理员只收到 1 封告警、审计只记 1 条', async () => {
+    const { acme, author, reviewer, sources } = await publishedMetricAndTag();
+    // 往 CRM 订单里注入一单负金额：读订单的指标与随它入队的标签都会因「金额非负」失败
+    await syncAndMerge(author, sources.crm, `INSERT INTO crm.orders VALUES ('A9', 1, 'paid', -10, '2024-07-01 10:00', '2024-07-01 10:00', '2024-07-01 09:00')`);
+    const { tasks: enqueued } = await recomputeDefinition(reviewer, 'metric', 'revenue');
+    expect(enqueued.map(t => t.params.kind).sort()).toEqual(['metric', 'tag']);
+    const [batchId] = enqueued.map(t => t.params.batchId);
+    expect(typeof batchId).toBe('string');
+    expect(new Set(enqueued.map(t => t.params.batchId))).toEqual(new Set([batchId]));
+    await drain();
+
+    const failed = await getDb().select().from(tasks).where(and(
+      eq(tasks.tenantId, acme), eq(tasks.kind, 'gold.dsl'), inArray(tasks.status, ['failed'])));
+    expect(failed.map(t => t.params.key).sort()).toEqual(['revenue', 'value_tier']);
+    // 每个任务自己的报错文本照常写（#840）：带来源映射名，链到各自的样本页
+    for (const t of failed) {
+      expect(t.params.batchId).toBe(batchId);
+      expect(t.error).toContain('来源：CRM · orders → order');
+      expect(t.error).toContain(`/quality?task=${t.id}`);
+    }
+    // 一批只发一封：租户只有开通时的 admin@acme.com 一位管理员
+    expect(outbox.map(m => [m.to, m.subject])).toEqual([['admin@acme.com', '数据检查未通过：指标与标签']]);
+    expect(outbox[0]!.text).toContain('同一批重算的其他任务若也未通过，不再另发邮件');
+    // 一批只记一条审计，detail.batch 等于这个 batchId
+    const audits = await getDb().select().from(auditLogs).where(and(
+      eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'assertion.failed')));
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.detail).toMatchObject({ batch: batchId, mappings: ['CRM · orders → order'] });
   });
 });
