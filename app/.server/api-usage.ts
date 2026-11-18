@@ -3,7 +3,8 @@
 // catalog、exports 接口也走它，那些不在口径里；last_used_at 照旧由 requireApiKey 每分钟最多更新一次，与计数无关。
 // 记录写不进去时接口照常返回（catch 后打日志），也不和读放在同一个事务里
 // 读：预览页按 30 个 UTC 日求和（#921）
-import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
+import { cmpName } from '../lib/compare';
 import { getDb } from './db/client';
 import { apiKeyUsage, apiKeys } from './db/schema';
 
@@ -28,7 +29,8 @@ export async function recordApiKeyUsage(caller: { tenantId: string; keyId: strin
   }
 }
 
-/** 预览页的「下游影响」（#921）：本租户最近 30 个 UTC 日（day >= UTC 今天 - 29）按这些 endpoint 有调用的 Key —— 名字、合计次数、是否吊销 */
+/** 预览页的「下游影响」（#921）：本租户最近 30 个 UTC 日（day >= UTC 今天 - 29）按这些 endpoint 有调用的 Key —— 名字、合计次数、是否吊销。
+ * 次数降序，同次数按 cmpName（zh-CN，汉字按拼音，ADR-0045）排；在 JS 里排而不是 SQL order by，免得结果随库的 collation 变 */
 export async function apiKeyUsageLast30Days(tenantId: string, endpoints: ApiUsageEndpoint[]): Promise<{ name: string; calls: number; revoked: boolean }[]> {
   if (endpoints.length === 0) return []; // inArray 空数组会报错
   const rows = await getDb()
@@ -45,7 +47,8 @@ export async function apiKeyUsageLast30Days(tenantId: string, endpoints: ApiUsag
       inArray(apiKeyUsage.endpoint, endpoints),
       sql`${apiKeyUsage.day} >= (now() at time zone 'UTC')::date - 29`,
     ))
-    .groupBy(apiKeys.id, apiKeys.name, apiKeys.revokedAt)
-    .orderBy(desc(sql`sum(${apiKeyUsage.calls})`), asc(apiKeys.name));
-  return rows.map(r => ({ name: r.name, calls: Number(r.calls), revoked: r.revoked }));
+    .groupBy(apiKeys.id, apiKeys.name, apiKeys.revokedAt);
+  return rows
+    .map(r => ({ name: r.name, calls: Number(r.calls), revoked: r.revoked }))
+    .sort((a, b) => b.calls - a.calls || cmpName(a.name, b.name));
 }
