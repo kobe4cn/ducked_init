@@ -584,6 +584,32 @@ describe('指标与标签定义页', () => {
     expect(await (await engineer.post(path, { intent: 'recompute' })).text()).toContain('已有计算在排队或运行中');
   });
 
+  it('定义页「最近一次刷新」按统计日选最新快照：登记更晚的回刷快照不算最新，同一统计日取登记较晚的那张', async () => {
+    const acme = await newTenant('acme');
+    const author = await memberOf(acme, 'de@acme.com', 'data_engineer');
+    const reviewer = await memberOf(acme, 'de2@acme.com', 'data_engineer');
+    await createDefinition(author, 'metric', 'revenue', 'base: order\nmeasure: { agg: sum, field: amount }\n');
+    await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    await getDb().update(tasks).set({ status: 'succeeded' });
+    const path = '/analytics/definitions/metric/revenue';
+    const engineer = await loginAs(app, 'de@acme.com');
+    /** 直接登记一张快照（不真算），统计日、来源与登记时间可控 */
+    const register = async (asOf: string, trigger: 'manual' | 'backfill' | 'scheduled', createdAt: Date) => {
+      const [task] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'gold.dsl', status: 'succeeded', createdAt }).returning();
+      await getDb().insert(snapshots).values({
+        tenantId: acme, template: 'metric:revenue', definitionVersion: 1, trigger, taskId: task!.id, table: `gold.dsl__${task!.id}`,
+        params: { kind: 'metric', key: 'revenue', asOf, definitionVersion: 1 }, rowCount: 1, createdAt, expiresAt: new Date(Date.now() + 86_400_000),
+      });
+    };
+    // 先登记统计日 D 的快照，再登记统计日 D-1、但登记更晚的回刷快照：「最近一次刷新」仍取 D 那张（来源 manual）
+    await register('2024-08-01', 'manual', new Date(Date.now() - 7_200_000));
+    await register('2024-07-31', 'backfill', new Date(Date.now() - 3_600_000));
+    expect(await (await engineer.get(path)).text()).toMatch(/data-last-refresh[^>]*>[^<]*，来源 手动/);
+    // 同一统计日 D 再登记一张（登记最晚）：取它
+    await register('2024-08-01', 'scheduled', new Date());
+    expect(await (await engineer.get(path)).text()).toMatch(/data-last-refresh[^>]*>[^<]*，来源 定时刷新/);
+  });
+
   it('最近一次计算因断言失败时定义页显示失败提示：断言名、不合格行数与任务时间；有 sources:read 的成员还看到不合格的键、来源映射与「查看样本」链接，查看者只看到断言与行数；再算一次成功提示消失', async () => {
     const { acme, sources } = await publishedIdentitySources({ orders: true });
     const author = await memberOf(acme, 'de@acme.com');

@@ -37,7 +37,7 @@ import { lit } from '../lib/mapping-expr';
 import { rows } from './pipeline/duck-sql';
 import { readResult } from './pipeline/task-contracts';
 import { discard, type DraftRow, publish, PublishError, publishBlocker, publisherCount, saveDraft, type PublishableAdapter } from './publishing';
-import { registerTaskSnapshot } from './snapshots';
+import { newestFirst, registerTaskSnapshot } from './snapshots';
 import { insertTask } from './tasks';
 import { todayUtc } from './templates';
 import { lockTenant } from './tenant-lock';
@@ -134,11 +134,11 @@ async function staleSnapshots(db: Tx | ReturnType<typeof getDb>, tenantId: strin
   return { snapshots: stale.length, days: [...new Set(stale)].sort() };
 }
 
-/** 本定义最新一张未过期快照的登记时间与来源；没有时为 null */
+/** 本定义最新一张未过期快照（按统计日 newestFirst）的登记时间与来源；没有时为 null */
 async function lastRefresh(db: Tx | ReturnType<typeof getDb>, tenantId: string, kind: DslKind, key: string) {
   const [latest] = await db.select({ at: snapshots.createdAt, trigger: snapshots.trigger }).from(snapshots)
     .where(and(eq(snapshots.tenantId, tenantId), eq(snapshots.template, `${kind}:${key}`), isNull(snapshots.expiredAt)))
-    .orderBy(desc(snapshots.createdAt)).limit(1);
+    .orderBy(...newestFirst).limit(1);
   return latest ?? null;
 }
 
@@ -401,14 +401,14 @@ export async function listDefinitions(actor: CurrentMember): Promise<DefinitionS
     }
   }
   if (summaries.length) {
-    // 最新一张未过期快照的统计日、来源、行数（按创建时间降序，每个模板只留第一个）
+    // 最新一张未过期快照的统计日、来源、行数（按统计日 newestFirst，每个模板只留第一个）
     const templateOf = new Map(summaries.map(d => [`${d.kind}:${d.key}`, d]));
     const latestByTemplate = new Map<string, { asOf: string | null; trigger: SnapshotTrigger | null; rowCount: number }>();
     for (const s of await getDb().select({
       template: snapshots.template, asOf: sql<string | null>`${snapshots.params}->>'asOf'`, trigger: snapshots.trigger, rowCount: snapshots.rowCount,
     }).from(snapshots)
       .where(and(eq(snapshots.tenantId, tenantId), isNull(snapshots.expiredAt), inArray(snapshots.template, [...templateOf.keys()])))
-      .orderBy(desc(snapshots.createdAt))) {
+      .orderBy(...newestFirst)) {
       if (!latestByTemplate.has(s.template)) latestByTemplate.set(s.template, { asOf: s.asOf, trigger: s.trigger, rowCount: s.rowCount });
     }
     // 最新一条 gold.dsl 任务的状态（按创建时间降序，每个定义只留第一个）

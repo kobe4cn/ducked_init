@@ -15,7 +15,7 @@ import { catalogChangesSince, diffCatalog, recordCatalogVersion, stripStats } fr
 import { saveBusinessNote, targetNoteHistory } from '../../app/.server/business-notes';
 import { createCustomEntity, deleteCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, businessNotes, catalogVersions } from '../../app/.server/db/schema';
+import { auditLogs, businessNotes, catalogVersions, snapshots, tasks } from '../../app/.server/db/schema';
 import { createDefinition, discardDslDraft, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { confirmDisable, requestDisable } from '../../app/.server/mappings';
 import { publishMergeGroup, saveMergeGroupDraft } from '../../app/.server/merge-groups';
@@ -135,6 +135,35 @@ describe('语义目录的加载', () => {
       snapshot: { table: expect.stringMatching(/^gold\.rfm__/), rows: expect.any(Number), at: expect.any(String) },
     });
     expect(toMarkdown(groupItems(c, 'group:templates')!)).toContain('- template:rfm RFM 分层');
+  });
+
+  it('各模板的最新快照按统计日选：登记更晚的回刷快照不算最新，同一统计日取登记较晚的那张', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    // 自动启用时登记的 rfm 快照（当天 asOf）过期掉，换成统计日与登记时间可控的
+    await getDb().update(snapshots).set({ expiredAt: new Date() })
+      .where(and(eq(snapshots.tenantId, acme), eq(snapshots.template, 'rfm')));
+    /** 直接给 rfm 登记一张快照（不真算），统计日与登记时间可控，返回目录里认得的表名 */
+    const register = async (asOf: string, createdAt: Date) => {
+      const [task] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'gold.rfm', status: 'succeeded', createdAt }).returning();
+      await getDb().insert(snapshots).values({
+        tenantId: acme, template: 'rfm', trigger: 'backfill', taskId: task!.id, table: `gold.rfm__${task!.id}`,
+        params: { asOf }, rowCount: 5, createdAt, expiresAt: new Date(Date.now() + 86_400_000),
+      });
+      return `gold.rfm__${task!.id}`;
+    };
+    const snapshotTable = async () => {
+      const entry = expand(await tenantCatalog(acme), 'template:rfm');
+      return entry?.kind === 'template' ? entry.snapshot?.table ?? null : null;
+    };
+
+    // 先登记统计日 D 的快照，再登记统计日 D-1、但登记更晚的回刷快照：目录里该模板仍是 D 那张
+    const dayD = await register('2024-08-01', new Date(Date.now() - 7_200_000));
+    const backfill = await register('2024-07-31', new Date(Date.now() - 3_600_000));
+    expect(await snapshotTable()).toBe(dayD);
+    // 同一统计日 D 再登记一张（登记最晚）：取它
+    const late = await register('2024-08-01', new Date());
+    expect(await snapshotTable()).toBe(late);
+    expect(backfill).not.toBe(dayD);
   });
 
   it('指标、标签、模板条目带定义所属空间 spaceId，只作记录：另一个空间的成员发布的标签也在目录里', async () => {
