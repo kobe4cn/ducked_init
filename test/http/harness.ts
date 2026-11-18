@@ -8,6 +8,7 @@ import pg from 'pg';
 import jsQR from 'jsqr';
 import { PNG } from 'pngjs';
 import type { Mail } from '../../app/.server/mailer';
+import type { PgvectorClient } from '../../app/.server/catalog/vector-store-pgvector';
 import * as opsAuth from '../../app/.server/ops-auth';
 import { isTenantBucketRoot } from '../../app/.server/lake-storage';
 import { deleteTenantS3Account, platformS3 } from '../../app/.server/s3-accounts';
@@ -28,6 +29,8 @@ export interface TestApp {
   useTestMailer(): void;
   /** 替换模型服务的 fetch；传 undefined 恢复默认替身（直接报错，不会真的请求填写的端点） */
   setLlmFetch(f: typeof fetch | undefined): void;
+  /** 替换外部 pgvector 的建连（替身只要实现 query，同 vector-store-pgvector 的 setPgvectorConnect）；传 undefined 恢复默认替身（直接 reject，不连真实地址） */
+  setPgvectorConnect(f: ((url: string) => PgvectorClient) | undefined): void;
   /** 等待后台任务（签发链接、发信）全部完成 */
   drain(): Promise<void>;
   client(): Client;
@@ -111,12 +114,16 @@ async function start(): Promise<TestApp> {
   const llm = await vite.ssrLoadModule('/app/.server/llm.ts');
   const noLlm = (async () => { throw new Error('测试没有设置模型服务替身（app.setLlmFetch）'); }) as typeof fetch;
   llm.setLlmFetch(noLlm);
+  const pgvector = await vite.ssrLoadModule('/app/.server/catalog/vector-store-pgvector.ts');
+  const noPgvector = { query: () => Promise.reject(new Error('测试没有设置外部向量库替身（app.setPgvectorConnect）')) };
+  pgvector.setPgvectorConnect(() => noPgvector);
 
   return {
     outbox,
     setMailer: m => mailer.setMailer(m),
     useTestMailer: () => mailer.setMailer(testMailer),
     setLlmFetch: f => llm.setLlmFetch(f ?? noLlm),
+    setPgvectorConnect: f => pgvector.setPgvectorConnect(f ?? (() => noPgvector)),
     drain: () => background.drain(),
     client: () => new Client(req => handler(req)),
     async close() {

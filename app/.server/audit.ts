@@ -92,6 +92,11 @@ const ACTIONS = {
       return d.embedding ? '清空本租户的 embedding 端点、模型名与 API Key' : '清空本租户的端点、模型名与 API Key';
     },
   },
+  // 向量存储的选型（ADR-0058，#848）：只记从哪种换成哪种、连接串有没有换，不记连接串
+  'model_provider.vector_store_updated': {
+    label: '切换向量存储',
+    describe: (d: Detail) => `向量存储 ${d.from} → ${d.to}${d.urlRotated ? '（换了连接串）' : ''}`,
+  },
   'source.registered': { label: '登记数据源', describe: (d: Detail) => `「${d.name}」（${sourceKindLabel(d.kind)}），${d.tables} 张表` },
   // 只记元数据，不记文件内容（ADR-0037）
   'source.file_uploaded': {

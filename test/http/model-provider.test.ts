@@ -1,7 +1,9 @@
 // test/http/model-provider.test.ts —— 「模型服务」页的 HTTP 接缝：管理员在 /model-provider 保存端点、模型名与 API Key（Key 不回显、加密入库、留空沿用），
 // 测试连通性与工具调用探测（假 fetch 经 app.setLlmFetch 注入，结果看页面与 platform.llm_calls），恢复平台默认后 resolveProvider 回到环境变量；
 // 开关发送脱敏样本（默认关、记审计）；embedding 三项（ADR-0049）自成一张卡，与 chat 互不影响（不动 chat 配置与探测结果）；
-// fast / reasoning 档位（ADR-0055 路由③a）一张卡：只填模型名时沿用租户端点与 Key，没有自己的模型服务 400，恢复只清该档三列；非管理员 403
+// fast / reasoning 档位（ADR-0055 路由③a）一张卡：只填模型名时沿用租户端点与 Key，没有自己的模型服务 400，恢复只清该档三列；非管理员 403；
+// 向量存储（ADR-0058，#848）一张卡：选系统自带还是外部 pgvector，连接串加密不回显（假替身经 app.setPgvectorConnect 注入，不连真实地址），
+// 保存时先测连通失败不保存，审计只记 from / to / urlRotated，切回系统自带时已存的连接串保留
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -15,7 +17,7 @@ let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-afterEach(() => { app.setLlmFetch(undefined); vi.unstubAllEnvs(); });
+afterEach(() => { app.setLlmFetch(undefined); app.setPgvectorConnect(undefined); vi.unstubAllEnvs(); });
 
 const KEY = 'sk-tenant-secret-1234';
 const NEW_KEY = 'sk-tenant-rotated-5678';
@@ -34,6 +36,24 @@ const tierSave = (admin: Client, tier: 'fast' | 'reasoning', model: string, base
   admin.post('/model-provider', { intent: 'tier_save', tier, model, baseUrl, apiKey });
 
 const tierReset = (admin: Client, tier: 'fast' | 'reasoning') => admin.post('/model-provider', { intent: 'tier_reset', tier });
+
+const PURL = 'postgres://vector:sec%40ret@pg.example.com:5432/vectors';
+const PURL2 = 'postgres://vector:rotated@pg2.example.com:5432/vectors';
+
+const saveVectorStore = (admin: Client, kind: string, url = '') =>
+  admin.post('/model-provider', { intent: 'vector_store_save', vectorStore: kind, vectorStoreUrl: url });
+
+/** 注入外部 pgvector 建连替身（不连真实地址）：不传 fail 时全部成功；返回收到的连接串（断言「没有配置就不发起连接」） */
+const pgvectorStub = (fail?: (url: string) => Error) => {
+  const urls: string[] = [];
+  app.setPgvectorConnect(url => {
+    urls.push(url);
+    return fail
+      ? { query: () => Promise.reject(fail(url)) }
+      : { query: async () => ({ rows: [], rowCount: 0, command: '', oid: 0, fields: [] }) };
+  });
+  return urls;
+};
 
 const setLlm = (f: typeof fetch | undefined) => app.setLlmFetch(f);
 const ok = () => json({ ok: true }, { prompt_tokens: 10, completion_tokens: 3 });
@@ -429,10 +449,10 @@ describe('模型服务页', () => {
     const page = await engineer.get('/model-provider');
     expect(page.status).toBe(403);
     expect(await page.text()).toContain('配置模型服务');
-    for (const intent of ['save', 'reset', 'test', 'samples', 'embedding_save', 'embedding_reset', 'embedding_test', 'tier_save', 'tier_reset']) {
+    for (const intent of ['save', 'reset', 'test', 'samples', 'embedding_save', 'embedding_reset', 'embedding_test', 'tier_save', 'tier_reset', 'vector_store_save', 'vector_store_test']) {
       expect((await engineer.post('/model-provider', {
         intent, baseUrl: 'https://x.example.com', model: 'm', apiKey: KEY, allowSamples: 'on', tier: 'fast',
-        embeddingBaseUrl: 'https://x.example.com', embeddingModel: 'm', embeddingApiKey: KEY,
+        embeddingBaseUrl: 'https://x.example.com', embeddingModel: 'm', embeddingApiKey: KEY, vectorStore: 'pgvector', vectorStoreUrl: PURL,
       })).status).toBe(403);
     }
     expect(await getDb().select().from(modelProviders)).toHaveLength(0);
@@ -459,5 +479,147 @@ describe('模型服务页', () => {
     const after = await probed();
     expect(after).toMatchObject({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat' });
     expect(after.apiKey).toBe(before.apiKey);
+  });
+
+  it('管理员保存外部 pgvector：页面选中且不回显连接串，库里是密文、checked_at 非空，审计只记 from / to / urlRotated；协议不对 / 不是 URL / 第一次不填 400，留空沿用', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    expect(await (await admin.get('/model-provider')).text()).toContain('data-vector-store-kind="platform"');
+
+    expect((await saveVectorStore(admin, 'pgvector', 'mysql://u:p@h/db')).status).toBe(400);
+    expect((await saveVectorStore(admin, 'pgvector', '不是地址')).status).toBe(400);
+    expect((await saveVectorStore(admin, 'pgvector')).status).toBe(400); // 第一次选外部 pgvector 须填连接串
+    expect((await saveVectorStore(admin, 'sqlite', PURL)).status).toBe(400); // kind 不合法
+    expect(await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme))).toHaveLength(0);
+
+    pgvectorStub();
+    const saved = await saveVectorStore(admin, 'pgvector', PURL);
+    expect(saved.status).toBe(200); // 不重定向：结果在这次响应里展示
+    expect(await saved.text()).toContain('data-vector-store-test="ok"');
+    const page = await (await admin.get('/model-provider')).text();
+    expect(page).toContain('data-vector-store-kind="pgvector"');
+    expect(page).toContain('data-vector-store-status="ok"');
+    expect(page).toContain('已设置，留空不修改');
+    expect(page).not.toContain(PURL);
+    expect(page).not.toContain('sec%40ret');
+
+    const row = async () => (await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme)))[0];
+    const saved1 = await row();
+    expect(saved1.vectorStore).toBe('pgvector');
+    expect(saved1.vectorStoreUrl).toBeTruthy();
+    expect(saved1.vectorStoreUrl).not.toContain(PURL); // 密文，不是明文
+    expect(saved1.vectorStoreCheckedAt).toBeTruthy();
+    expect(saved1.vectorStoreError).toBeNull();
+
+    const storeLogs = () => getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.vector_store_updated'));
+    let logs = await storeLogs();
+    expect(logs.map(l => l.detail)).toEqual([{ from: 'platform', to: 'pgvector', urlRotated: true }]);
+    expect(JSON.stringify(logs)).not.toContain(PURL);
+    expect(await (await admin.get('/audit')).text()).toContain('向量存储 platform → pgvector（换了连接串）');
+
+    // 留空沿用：密文不变、存储没换连接串没换，不记审计
+    expect((await saveVectorStore(admin, 'pgvector')).status).toBe(200);
+    expect((await row()).vectorStoreUrl).toBe(saved1.vectorStoreUrl);
+    expect(await storeLogs()).toHaveLength(1);
+
+    // 填新连接串：换主机只能通过填新串，from === to 但 urlRotated 仍记审计
+    expect((await saveVectorStore(admin, 'pgvector', PURL2)).status).toBe(200);
+    const saved2 = await row();
+    expect(saved2.vectorStoreUrl).not.toBe(saved1.vectorStoreUrl);
+    logs = await storeLogs();
+    expect(logs.map(l => l.detail)).toEqual([
+      { from: 'platform', to: 'pgvector', urlRotated: true },
+      { from: 'pgvector', to: 'pgvector', urlRotated: true },
+    ]);
+    expect((await (await admin.get('/model-provider')).text())).not.toContain(PURL2);
+  });
+
+  it('保存外部 pgvector 时连不上：不写库、页面显示抹掉凭据的错误；「测试连接」写 checked_at 与 error、不记审计，还没配置时不发起连接', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    // 还没配置连接串就「测试连接」：直接失败，不调 preparePgvector
+    const urls = pgvectorStub();
+    const noUrl = await admin.post('/model-provider', { intent: 'vector_store_test' });
+    expect(await noUrl.text()).toContain('还没有配置外部 pgvector 连接串');
+    expect(urls).toEqual([]);
+
+    // 替身抛带密码与整串连接串的错误：页面与库里都没有明文
+    pgvectorStub(url => new Error(`password authentication failed for user "vector" (sec@ret) at ${url}`));
+    const failed = await saveVectorStore(admin, 'pgvector', PURL);
+    const failedPage = await failed.text();
+    expect(failedPage).toContain('data-vector-store-test="failed"');
+    expect(failedPage).toContain('准备 pgvector 向量库失败');
+    expect(failedPage).not.toContain('sec%40ret');
+    expect(failedPage).not.toContain('sec@ret');
+    expect(failedPage).not.toContain(PURL);
+    // 失败不保存：本来就没有配置行，失败的保存连行都不写，仍是默认的 platform
+    expect(await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme))).toHaveLength(0);
+    expect(await (await admin.get('/model-provider')).text()).toContain('data-vector-store-kind="platform"');
+    expect(await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.vector_store_updated'))).toHaveLength(0);
+
+    // 配好之后「测试连接」失败：写 checked_at 与 error，不记审计
+    pgvectorStub();
+    await saveVectorStore(admin, 'pgvector', PURL);
+    pgvectorStub(url => new Error(`password authentication failed for user "vector" (sec@ret) at ${url}`));
+    const tested = await admin.post('/model-provider', { intent: 'vector_store_test' });
+    expect(await tested.text()).toContain('data-vector-store-test="failed"');
+    const afterFail = async () => (await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme)))[0];
+    let state = await afterFail();
+    expect(state.vectorStoreCheckedAt).toBeTruthy();
+    expect(state.vectorStoreError).toContain('准备 pgvector 向量库失败');
+    expect(state.vectorStoreError).not.toContain('sec@ret');
+    expect(state.vectorStoreError).not.toContain(PURL);
+    expect(await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.vector_store_updated'))).toHaveLength(1); // 只有保存那条
+
+    // 再测一次成功：清掉 error，页面显示上次检查时间与状态
+    pgvectorStub();
+    const okTest = await admin.post('/model-provider', { intent: 'vector_store_test' });
+    expect(await okTest.text()).toContain('data-vector-store-test="ok"');
+    state = await afterFail();
+    expect(state.vectorStoreError).toBeNull();
+    expect(state.vectorStoreCheckedAt).toBeTruthy();
+    const page = await (await admin.get('/model-provider')).text();
+    expect(page).toMatch(/data-vector-store-checked="2\d{3}-/);
+    expect(page).toContain('连接正常');
+    expect(await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.vector_store_updated'))).toHaveLength(1);
+  });
+
+  it('切回系统自带：不测连通、忽略表单里的连接串，已存的密文与检查结果保留，记一条审计；本来就没换过时保存不写库也不记审计', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    expect((await saveVectorStore(admin, 'platform')).status).toBe(302); // 什么都没变：不写库不记审计
+    expect(await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme))).toHaveLength(0);
+
+    const urls = pgvectorStub(); // 留着数调用：切回 platform 不该发起连接
+    expect((await saveVectorStore(admin, 'pgvector', PURL)).status).toBe(200);
+    const before = (await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme)))[0];
+
+    const back = await saveVectorStore(admin, 'platform', 'mysql://连不上的串也会被忽略');
+    expect(back.status).toBe(302); // 切回系统自带不测连通，照别的保存一样重定向
+    const after = (await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme)))[0];
+    expect(after.vectorStore).toBe('platform');
+    expect(after.vectorStoreUrl).toBe(before.vectorStoreUrl); // 密文保留，方便撤回
+    expect(after.vectorStoreCheckedAt).toEqual(before.vectorStoreCheckedAt);
+    expect(urls).toHaveLength(1); // 只有保存 pgvector 那次测过
+    const page = await (await admin.get('/model-provider')).text();
+    expect(page).toContain('data-vector-store-kind="platform"');
+    expect(page).not.toContain(PURL);
+
+    const logs = await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.vector_store_updated')).orderBy(auditLogs.createdAt);
+    expect(logs.map(l => l.detail)).toEqual([
+      { from: 'platform', to: 'pgvector', urlRotated: true },
+      { from: 'pgvector', to: 'platform', urlRotated: false },
+    ]);
+
+    // 再切回 pgvector：连接串留空沿用，第三条审计 urlRotated: false
+    expect((await saveVectorStore(admin, 'pgvector')).status).toBe(200);
+    const again = (await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme)))[0];
+    expect(again.vectorStoreUrl).toBe(before.vectorStoreUrl);
+    const allLogs = await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.vector_store_updated')).orderBy(auditLogs.createdAt);
+    expect(allLogs.map(l => l.detail)).toEqual([
+      { from: 'platform', to: 'pgvector', urlRotated: true },
+      { from: 'pgvector', to: 'platform', urlRotated: false },
+      { from: 'platform', to: 'pgvector', urlRotated: false },
+    ]);
   });
 });

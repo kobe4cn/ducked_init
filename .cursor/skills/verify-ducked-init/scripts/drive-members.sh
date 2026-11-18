@@ -48,6 +48,7 @@ run B wait-text "当前租户 · 默认空间 · admin@verify.test（管理员�
 run B screenshot --path "$EV/home-admin.png"
 run B snapshot --path "$EV/home-admin.aria.txt"
 
+run B click --selector 'details:has(a[href="/members"]) > summary'
 run B click --role link --name "成员"
 run B wait-url /members
 expect_title "成员 · CRM 数据分析平台"
@@ -62,6 +63,7 @@ log "selected-role=$role"
 run B screenshot --path "$EV/members-saved.png"
 run B snapshot --path "$EV/members.aria.txt"
 
+run B click --selector 'details:has(a[href="/audit"]) > summary'
 run B click --role link --name "审计日志"
 run B wait-url /audit
 expect_title "审计日志 · CRM 数据分析平台"

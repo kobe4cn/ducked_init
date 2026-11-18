@@ -1,11 +1,12 @@
-// app/.server/quality.ts —— 数据质量告警（ADR-0026）：结果层任务因 error 级断言失败时，给租户管理员发邮件并记审计。
+// app/.server/quality.ts —— 数据质量告警（ADR-0026）：结果层任务因 error 级断言失败时，给租户管理员发邮件并记审计；
+// 同一次入队的一组任务（参数里同一个 batchId）只告警一次、只记一条审计（#841），每个任务自己的报错文本照常写。
 // 报错文本、邮件与审计写断言名、实体、不合格行数与来源映射名，并附数据质量页链接；不写键与行内容。数据质量页只读挂载本租户数据湖，读最近的断言运行记录与隔离区样本（只来自标准层，敏感字段只有哈希）；
 // 顶部「最近一次」统计取平台库里最近一次结果层任务的断言结果（合并任务也写运行记录，且 error 失败时回滚不留记录，不能拿湖里最近一条当准）。
 // readQuality 可按任务 ID 过滤（#838，定义页的失败提示与告警链到 /quality?task=）；隔离区行 JSON 里的 _mapping 是映射 ID，mappingLabels 给出「源 · 表 → 实体」
 import { and, desc, eq, inArray, isNotNull, like, sql } from 'drizzle-orm';
 import { recordAudit } from './audit';
 import { getDb } from './db/client';
-import { mappings, members, sources, tasks } from './db/schema';
+import { auditLogs, mappings, members, sources, tasks } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { getMailer } from './mailer';
 import { openTenantLake } from './pipeline/lake-engine';
@@ -14,11 +15,20 @@ import { CONTRACTS, readResult, type TaskKind } from './pipeline/task-contracts'
 import { appLink } from './schema-alerts';
 import { lit } from '../lib/mapping-expr';
 
-/** 任务结果里有失败的 error 级断言时告警；没有时什么也不做。单个管理员发信失败只记日志，不影响其他人 */
-export async function alertAssertionFailure(tenantId: string, task: { id: string; kind: TaskKind }, result: Record<string, unknown> | undefined) {
+/**
+ * 任务结果里有失败的 error 级断言时告警；没有时什么也不做。params 里的 batchId 把同一次入队的一组任务归成一批（一次发布、
+ * 回刷、重新计算或一个定义的定时刷新；没有 batchId 的任务各自算一批）：一批只记一条审计、只发一封邮件，内容来自批里第一个
+ * 失败的任务；每个任务自己的报错文本照常写（#840）。同租户的任务可能并发（max_concurrent_tasks 调大后两个钩子同时跑），
+ * 先查后写挡不住，靠事务级 advisory lock 按批串行化后再查。发信在事务提交之后、不持锁：单个管理员发信失败只记日志，
+ * 不影响其他人；发信失败（或进程在发信前退出）时同批后续任务不会补发——已接受的取舍
+ */
+export async function alertAssertionFailure(
+  tenantId: string, task: { id: string; kind: TaskKind }, result: Record<string, unknown> | undefined, params: Record<string, unknown> | undefined,
+) {
   const failed = failedErrors((result?.assertions as AssertionResult[] | undefined) ?? []);
   if (!failed.length) return;
   const { label } = CONTRACTS[task.kind];
+  const batch = typeof params?.batchId === 'string' ? params.batchId : task.id;
   // 断言在工作进程里跑，结果里的 mappings 只有映射 ID（ADR-0008）：这里换成「源 · 表 → 实体」，已删除的映射查不到，原样写 ID
   const labels = await mappingLabels(tenantId, [...new Set(failed.flatMap(r => r.mappings ?? []))]);
   const sourcesOf = (r: AssertionResult) => (r.mappings ?? []).map(id => labels.get(id) ?? id);
@@ -27,12 +37,22 @@ export async function alertAssertionFailure(tenantId: string, task: { id: string
     return `${describeAssertion(r)}${sources.length ? `，来源：${sources.join('、')}` : ''}`;
   });
   const link = appLink(`/quality?task=${task.id}`);
-  // 任务页的报错文本换上带来源的摘要并附链接（本钩子在 finishTask 之后执行，不会随后者写库而被覆盖）
+  // 任务页的报错文本换上带来源的摘要并附链接（本钩子在 finishTask 之后执行，不会随后者写库而被覆盖）：留在事务外，每个任务都写
   await getDb().update(tasks).set({ error: `断言失败：${summaries.join('；')}。查看样本：${link}` }).where(eq(tasks.id, task.id));
-  await recordAudit(getDb(), {
-    tenantId, system: true, action: 'assertion.failed', targetType: 'task', targetId: task.id,
-    detail: { task: label, summaries, mappings: [...new Set(failed.flatMap(sourcesOf))], link, assertions: failed },
+  // 拿锁后查这一批有没有告警过：有就不重复（审计与邮件都以这条审计为准，邮件在事务提交后才发）
+  const first = await getDb().transaction(async tx => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`assertion_alert:${tenantId}:${batch}`}, 0))`);
+    const [alerted] = await tx.select({ id: auditLogs.id }).from(auditLogs).where(and(
+      eq(auditLogs.tenantId, tenantId), eq(auditLogs.action, 'assertion.failed'), sql`${auditLogs.detail} ->> 'batch' = ${batch}`,
+    ));
+    if (alerted) return false;
+    await recordAudit(tx, {
+      tenantId, system: true, action: 'assertion.failed', targetType: 'task', targetId: task.id,
+      detail: { batch, task: label, summaries, mappings: [...new Set(failed.flatMap(sourcesOf))], link, assertions: failed },
+    });
+    return true;
   });
+  if (!first) return;
   const admins = await getDb().select({ email: members.email }).from(members)
     .where(and(eq(members.tenantId, tenantId), eq(members.role, 'admin')));
   const text = [
@@ -40,6 +60,7 @@ export async function alertAssertionFailure(tenantId: string, task: { id: string
     '',
     ...summaries.map(s => `- ${s}`),
     '',
+    '同一批重算的其他任务若也未通过，不再另发邮件，报错见各自的任务页。',
     '请检查对应映射的源数据，修正后重新合并并重算。',
     '',
     `查看样本：${link}`,

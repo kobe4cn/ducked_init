@@ -964,9 +964,22 @@ describe('模板升级', () => {
     expect(diff.slice(diff.indexOf('data-upgrade-matrix'))).not.toMatch(/<td[^>]*>v2:/);
     expect(diff).not.toMatch(/[0-9a-f]{64}/);
 
-    // 流失预警：变化、新增、移出人数；提示条与预览头部列出它自己的改动说明
+    // 流失预警（#858）：一句话结论（警示）与按列统计对比，列对比表在变化人数上方；提示条与预览头部列出它自己的改动说明
     const churn = await (await analyst.post('/analytics/templates/churn', { intent: 'preview-upgrade', asOf: '2024-10-15' })).text();
     expect(churn).toMatch(/data-upgrade-metric[^>]*>取值变化 [1-9]\d* 人，新增 0 人，移出 0 人/);
+    expect(churn).toContain('data-upgrade-summary');
+    expect(churn).toContain('变化最大的字段：at_risk 为是');
+    expect(churn).toContain('data-upgrade-columns');
+    // 列对比表在变化、新增、移出人数那行上方
+    expect(churn.indexOf('data-upgrade-columns')).toBeLessThan(churn.indexOf('data-upgrade-metric'));
+    // 列对比表的单元格并排给出统计量：布尔列给是的人数和占比，数值列给均值、中位数、P90；不出 consumer_id
+    const columns = churn.slice(churn.indexOf('data-upgrade-columns'), churn.indexOf('data-upgrade-metric'));
+    expect(columns).toContain('布尔');
+    expect(columns).toMatch(/\d[\d,]* 人（\d+\.\d%）/);
+    expect(columns).toContain('均值 ');
+    expect(columns).toContain('中位数 ');
+    expect(columns).toContain('P90 ');
+    expect(columns).not.toContain('consumer_id');
     expect(churn.match(/data-upgrade-changes/g)!.length).toBe(2);
     expect(churn).toContain('v2：at_risk 取反；minOrders 不超过 10，用于验证升级流程；所有人的 at_risk 都会翻转');
     expect(churn).not.toMatch(/[0-9a-f]{64}/);

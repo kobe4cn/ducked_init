@@ -5,6 +5,7 @@
 // 定义已有任务在排队或运行、或当天已有当前版本的快照时跳过这个定义。已发布的模板（如 RFM，依赖 TEMPLATES[模板].entities）同样检查，
 // 按模板去重（每个租户一个），以生效版本的参数入队模板任务。一律限定在给定租户内
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { randomUUID } from 'node:crypto';
 import { recordAudit, type Tx } from './audit';
 import { getDb } from './db/client';
 import { dslDefinitions, dslVersions, snapshots, tasks, templateDefinitions, templateVersions, tenants } from './db/schema';
@@ -51,9 +52,9 @@ async function refreshTenant(tx: Tx, tenantId: string, asOf: string) {
   // ctx 里的指标就是各自生效的版本，下游标签按它内联
   const ctx = await dslContext(tx, tenantId);
   const enqueued: Task[] = [];
-  const enqueueOne = async (d: DslVersionRef, spec: unknown) => {
+  const enqueueOne = async (d: DslVersionRef, spec: unknown, batchId: string) => {
     busy.add(d.definitionId);
-    enqueued.push(await enqueueDsl(tx, tenantId, d, spec, ctx, asOf, 'scheduled'));
+    enqueued.push(await enqueueDsl(tx, tenantId, d, spec, ctx, asOf, 'scheduled', batchId));
   };
   // publishedDependents 按种类、键排序，指标排在标签前面：随指标入队过的标签不再单独检查
   for (const { definitionId, kind, key, version, yaml } of definitions) {
@@ -64,8 +65,10 @@ async function refreshTenant(tx: Tx, tenantId: string, asOf: string) {
     const downstream = kind === 'metric' ? await downstreamTags(tx, tenantId, key, ctx) : { ready: [], skipped: [] };
     // 随指标入队的标签只在已有任务排队或运行时跳过：当天已有快照也重算，与指标读同一份标准层
     const tags = downstream.ready.filter(t => !busy.has(t.tag.definitionId));
-    await enqueueOne(self, checked.spec);
-    for (const { tag, spec } of tags) await enqueueOne(tag, spec);
+    // 一个定义和随它入队的标签算一批（这批任务因断言失败时只告警一次）；一个租户的所有定义在同一事务里入队，只能按循环轮次分批
+    const batchId = randomUUID();
+    await enqueueOne(self, checked.spec, batchId);
+    for (const { tag, spec } of tags) await enqueueOne(tag, spec, batchId);
     await recordAudit(tx, {
       tenantId, system: true, action: 'definition.refreshed', targetType: 'definition', targetId: definitionId,
       detail: { kind, key, version, asOf, tags: tags.map(t => t.tag.key), skippedTags: downstream.skipped },

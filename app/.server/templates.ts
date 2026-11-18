@@ -18,10 +18,11 @@ import { mappings, mappingVersions, spaces, tasks, templateDefinitions, template
 import { pendingMerge } from './merges';
 import { discard, type DraftRow, publish, publishBlocker, PublishError, publisherCount, saveDraft as savePublishable, type PublishableAdapter, withAuthor } from './publishing';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
-import { lit } from '../lib/mapping-expr';
+import { cmp } from '../lib/compare';
+import { ident, lit } from '../lib/mapping-expr';
 import { rows } from './pipeline/duck-sql';
 import { latestTemplate, missingTableHint, TASK_KINDS, templateAt, TEMPLATES, type Template, type TemplateId } from './pipeline/templates';
-import { summarizeSegmentUpgrade } from './pipeline/templates/upgrade-summary';
+import { summarizeColumnUpgrade, summarizeSegmentUpgrade, type ColumnStat, type ColumnType, type NumberStat } from './pipeline/templates/upgrade-summary';
 import { insertTask } from './tasks';
 
 export { TASK_KINDS, templateOfKind, type TemplateId } from './pipeline/templates';
@@ -270,10 +271,22 @@ async function requireUpgradable(db: Tx | Db, tenantId: string, template: Templa
   return { published, latest };
 }
 
+/** DESCRIBE 报的列类型可能带参数（DECIMAL(18,2)、INTEGER[] 等），按前缀归类 */
+const NUMBER_TYPE_PREFIXES = ['TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT', 'UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT', 'FLOAT', 'DOUBLE', 'DECIMAL'];
+
+const columnKind = (t: string): ColumnType => {
+  const upper = t.toUpperCase();
+  if (upper === 'BOOLEAN') return 'bool';
+  if (upper === 'VARCHAR') return 'text';
+  // 带 [] 的列表（如 INTEGER[]）不算数值列，归 other
+  return NUMBER_TYPE_PREFIXES.some(p => upper.startsWith(p)) && !upper.endsWith('[]') ? 'number' : 'other';
+};
+
 /**
  * 预览升级差异：需要定义查看权限。以生效版本的参数加上参考日期 asOf（不给时为当天，UTC；不能晚于今天），分别按它锁定的模板版本与当前版本编译，
- * 在只读挂载的数据湖上按 consumer_id 对比，只给计数（ADR-0025）：RFM 是分群迁移（原分群 → 新分群的人数）加 v1 / v2 各分群人数、完整迁移矩阵（含没变的人）
- * 与一句话结论（upgrade-summary.ts，不调模型），其他模板是换了取值、新增、移出的人数（distribution 与 summary 由 #829 的后续子票补上）。
+ * 在只读挂载的数据湖上按 consumer_id 对比，只给计数与统计量（ADR-0025）：RFM 是分群迁移（原分群 → 新分群的人数）加 v1 / v2 各分群人数、完整迁移矩阵
+ * （含没变的人）与一句话结论（upgrade-summary.ts，不调模型），其他模板是换了取值、新增、移出的人数加每个输出列（不含 consumer_id）的 v1 / v2 统计量
+ * （布尔列是的人数、数值列是均值 / 中位数 / P90、文本列是人数最多的前 10 个取值、其余只给非空人数）与一句话结论，不输出单个消费者的取值。
  * 不出 consumer_id，不建表、不入队任务、不登记快照。已是当前版本时报「已是最新模板版本」，当前版本不接受生效的参数时说明原因
  */
 export async function previewTemplateUpgrade(actor: CurrentMember, id: string, asOf?: string) {
@@ -299,16 +312,55 @@ export async function previewTemplateUpgrade(actor: CurrentMember, id: string, a
       const oldSql = locked.compile(before, has), newSql = latest.compile(after, has);
       const segment = (sql: string) => `SELECT consumer_id, segment AS tag_value FROM (${sql})`;
       if (template !== 'rfm') {
+        const metric = (await rows<DiffCounts>(con, compileMetricDiff(oldSql, newSql)))[0]!;
+        // 按列对比（#858）：列名从两边的 DESCRIBE 取并集（不含 consumer_id），按码点排序（ADR-0045：列名是内部键）；两边类型不一致以 v2 为准
+        const described = async (sql: string) => new Map((await rows<{ column_name: string; column_type: string }>(con, `DESCRIBE (${sql})`)).map(c => [c.column_name, c.column_type]));
+        const oldTypes = await described(oldSql), newTypes = await described(newSql);
+        const names = [...new Set([...oldTypes.keys(), ...newTypes.keys()])].filter(n => n !== 'consumer_id').sort(cmp);
+        // 换了取值的人数：两边都有的列才比（IS DISTINCT FROM 连 null 与 null 也算没变）；只有一边有的列 changed 为 null
+        const shared = names.filter(n => oldTypes.has(n) && newTypes.has(n));
+        const changedCounts = shared.length > 0
+          ? (await rows<Record<string, number>>(con, `
+            WITH o AS (${oldSql}),
+            n AS (${newSql})
+            SELECT ${shared.map(n => `count(*) FILTER (WHERE o.${ident(n)} IS DISTINCT FROM n.${ident(n)})::INTEGER AS ${ident(n)}`).join(', ')}
+            FROM o JOIN n ON n.${ident('consumer_id')} = o.${ident('consumer_id')}`))[0]!
+          : {};
+        // 每列在 v1、v2 各算一份统计（计数转 ::INTEGER、统计量转 ::DOUBLE：getRowObjectsJson 里 BIGINT / DECIMAL 是字符串）；
+        // DECIMAL 先 CAST 成 DOUBLE 再聚合；文本列只给人数最多的前 10 个取值，超过不另标注
+        const boolStat = async (sql: string, c: string) => (await rows<{ yes: number }>(con, `SELECT count(*) FILTER (WHERE ${c})::INTEGER AS yes FROM (${sql})`))[0]!;
+        const numberStat = async (sql: string, c: string): Promise<NumberStat> => (await rows<NumberStat>(con, `
+          SELECT avg(CAST(${c} AS DOUBLE))::DOUBLE AS mean, median(CAST(${c} AS DOUBLE))::DOUBLE AS median,
+            quantile_cont(CAST(${c} AS DOUBLE), 0.9)::DOUBLE AS p90 FROM (${sql})`))[0]!;
+        const textStat = async (sql: string, c: string) => ({ values: await rows<{ value: string | null; consumers: number }>(con, `
+          SELECT ${c} AS value, count(*)::INTEGER AS consumers FROM (${sql}) GROUP BY ${c} ORDER BY count(*) DESC, ${c} LIMIT 10`) });
+        const otherStat = async (sql: string, c: string) => (await rows<{ nonNull: number }>(con, `SELECT count(${c})::INTEGER AS nonNull FROM (${sql})`))[0]!;
+        // 同一列两边的统计形状一样（type 以 v2 为准），pair 在这一列两边都在时各算一份，只有一边有时缺的一边为 null
+        const pair = async <S>(stat: (sql: string) => Promise<S>, name: string) => ({
+          before: oldTypes.has(name) ? await stat(oldSql) : null,
+          after: newTypes.has(name) ? await stat(newSql) : null,
+        });
+        const columns: ColumnStat[] = [];
+        for (const name of names) {
+          const c = ident(name), type = columnKind(newTypes.get(name) ?? oldTypes.get(name)!), changed = shared.includes(name) ? changedCounts[name]! : null;
+          if (type === 'bool') columns.push({ name, type, ...await pair(sql => boolStat(sql, c), name), changed });
+          else if (type === 'number') columns.push({ name, type, ...await pair(sql => numberStat(sql, c), name), changed });
+          else if (type === 'text') columns.push({ name, type, ...await pair(sql => textStat(sql, c), name), changed });
+          else columns.push({ name, type, ...await pair(sql => otherStat(sql, c), name), changed });
+        }
+        const totalOf = async (sql: string) => (await rows<{ n: number }>(con, `SELECT count(*)::INTEGER AS n FROM (${sql})`))[0]!.n;
+        const total = { before: await totalOf(oldSql), after: await totalOf(newSql) };
         return {
           template,
           from: published.templateVersion,
           to: latest.version,
           asOf: day,
           segments: null,
-          metric: (await rows<DiffCounts>(con, compileMetricDiff(oldSql, newSql)))[0]!,
-          /** 各分群分布对比与一句话结论：其他模板由 #829 的后续子票补上 */
-          distribution: null,
-          summary: null,
+          metric,
+          /** 每个输出列（不含 consumer_id）的 v1 / v2 统计量与换了取值的人数（只有计数与统计量，ADR-0025） */
+          distribution: { kind: 'columns' as const, total, columns },
+          /** 一句话结论：由代码从计数与统计量生成，不调用模型 */
+          summary: summarizeColumnUpgrade(metric, columns, total),
         };
       }
       // RFM 在同一个只读连接上多跑各分群人数与完整迁移（compileTagDiff 去掉 WHERE：含没变的人）。
@@ -331,7 +383,7 @@ export async function previewTemplateUpgrade(actor: CurrentMember, id: string, a
         segments: await rows<TagTransition>(con, compileTagDiff(segment(oldSql), segment(newSql))),
         metric: null,
         /** v1 / v2 各分群人数与「原分群 × 新分群」迁移矩阵（含没变的人；新增、移出的一边为 null） */
-        distribution: { kind: 'segments', before: await segmentCounts(oldSql), after: await segmentCounts(newSql), matrix },
+        distribution: { kind: 'segments' as const, before: await segmentCounts(oldSql), after: await segmentCounts(newSql), matrix },
         /** 一句话结论：由代码从矩阵计数生成，不调用模型 */
         summary: summarizeSegmentUpgrade(matrix),
       };
