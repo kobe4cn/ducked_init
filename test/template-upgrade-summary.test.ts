@@ -134,7 +134,7 @@ describe('summarizeColumnUpgrade', () => {
 
   it('新增与移出不算没变也不算换了取值：占比按 v1 ∪ v2 的人数算', () => {
     // 100 人里 10 人移出、另来 10 人新增、90 人两边都在且取值没变
-    const s = summarizeColumnUpgrade({ changed: 0, added: 10, removed: 10 }, [number(5)], { before: 100, after: 90 });
+    const s = summarizeColumnUpgrade({ changed: 0, added: 10, removed: 10 }, [number(5)], { before: 100, after: 100 });
     expect(s.unchangedShare).toBeCloseTo(90 / 110);
     expect(s.changedShare).toBe(0);
     expect(s.warn).toBe(false);
