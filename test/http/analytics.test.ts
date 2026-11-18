@@ -963,6 +963,56 @@ describe('模板升级', () => {
     expect(task!.params).toMatchObject({ definitionVersion: 2, templateVersion: 2 });
     expect(await (await de.get('/analytics/templates/rfm')).text()).not.toContain('有新的模板版本');
   });
+
+  it('预览页有「下游影响」：RFM 列出服务库表与两个对外接口；查看者点迁移矩阵的一格或输出列的「换了取值」展开样例消费者（两版输出列并排）；churn 没有下游使用', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    // 先跑完任务让服务库建好（RFM 进服务库，ADR-0004）
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    vi.stubEnv('TEMPLATE_TEST_VERSIONS', '1');
+
+    const rfm = await (await viewer.post('/analytics/templates/rfm', { intent: 'preview-upgrade', asOf: '2024-12-31' })).text();
+    // 下游影响（#830）：服务库表、发布后下一次计算时切换、读取它的两个对外接口；计数预览仍不出 consumer_id
+    expect(rfm).toContain('下游影响');
+    expect(rfm).toContain('serving.rfm');
+    expect(rfm).toContain('发布后下一次计算时切换');
+    expect(rfm).toContain('GET /api/v1/consumers/:consumerId');
+    expect(rfm).toContain('GET /api/v1/consumers/by-source/:source/:customerId');
+    expect(rfm).not.toMatch(/[0-9a-f]{64}/);
+
+    // 矩阵格子是查看样例的按钮（查看者有 results:read）：取第一个 v2: 分群列，它对应的格子（X → v2:X）非零
+    const matrix = rfm.slice(rfm.indexOf('data-upgrade-matrix'));
+    const segment = matrix.match(/<th[^>]*>v2:([^<]+)<\/th>/)![1];
+    const sampled = await (await viewer.post('/analytics/templates/rfm', {
+      intent: 'preview-sample', asOf: '2024-12-31', before: segment, after: `v2:${segment}`,
+    })).text();
+    // 预览保持展开，样例表在迁移矩阵下方：每行 consumer_id 与 v1 / v2 的全部输出列（样例接口按预期出 consumer_id）
+    expect(sampled).toContain('data-upgrade-diff');
+    expect(sampled).toContain('data-upgrade-matrix');
+    expect(sampled.indexOf('data-upgrade-matrix')).toBeLessThan(sampled.indexOf('data-upgrade-sample'));
+    expect(sampled).toContain('样例消费者');
+    expect(sampled.match(/data-sample-row="/g)!.length).toBeLessThanOrEqual(10);
+    expect(sampled).toMatch(/data-sample-row="[0-9a-f]{64}"/);
+    expect(sampled).toMatch(/<th[^>]*>consumer_id<\/th>/);
+    expect(sampled).toContain('v1 segment');
+    expect(sampled).toContain('v2 segment');
+    expect(sampled).toContain(`v2:${segment}`);
+
+    // 流失预警：不进服务库，「下游影响」写「没有下游使用」；点 at_risk 的「换了取值」看到样例
+    const churn = await (await viewer.post('/analytics/templates/churn', { intent: 'preview-upgrade', asOf: '2024-10-15' })).text();
+    expect(churn).toContain('没有下游使用');
+    expect(churn).toContain('data-sample-column="at_risk"');
+    const churnSampled = await (await viewer.post('/analytics/templates/churn', { intent: 'preview-sample', asOf: '2024-10-15', column: 'at_risk' })).text();
+    expect(churnSampled).toContain('data-upgrade-diff');
+    expect(churnSampled.indexOf('data-upgrade-columns')).toBeLessThan(churnSampled.indexOf('data-upgrade-sample'));
+    expect(churnSampled).toContain('样例消费者');
+    expect(churnSampled).toMatch(/data-sample-row="[0-9a-f]{64}"/);
+    expect(churnSampled).toContain('v1 at_risk');
+    expect(churnSampled).toContain('v2 at_risk');
+    // 每个人都换了取值：同一行里 v1 与 v2 的 at_risk 相反（是 / 否）
+    expect(churnSampled).toMatch(/<td[^>]*>(是|否)<\/td><td[^>]*>(否|是)<\/td>/);
+  });
 });
 
 /** 不带维度的指标（标签只能引用没有维度的指标） */

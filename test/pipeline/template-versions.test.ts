@@ -11,7 +11,7 @@ import { TEST_VERSIONS } from '../../app/.server/pipeline/templates/test-version
 import { enqueueDueRefreshes } from '../../app/.server/refresh';
 import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
-import { discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, saveDraft, upgradeTemplateDraft } from '../../app/.server/templates';
+import { discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, sampleTemplateUpgrade, saveDraft, upgradeTemplateDraft } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
 import { drain, onLake } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
@@ -194,6 +194,52 @@ describe('升级预览与确认', () => {
     await expect(previewTemplateUpgrade(author, 'rfm')).rejects.toThrow('已是最新模板版本');
   });
 
+  it('点迁移矩阵的一格查看样例消费者：最多 10 条、按 consumer_id 升序、两次结果相同；给出两版的全部输出列，湖与任务不变；审计记格子与条数，不出 consumer_id', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    await drain();
+    await saveDraft(author, 'rfm', PARAMS);
+    await publishTemplate(reviewer, 'rfm', 2);
+    await drain();
+    vi.stubEnv('TEMPLATE_TEST_VERSIONS', '1');
+    const preview = await previewTemplateUpgrade(author, 'rfm', '2024-12-31');
+    const d = preview.distribution!;
+    if (d.kind !== 'segments') throw new Error(`预览的分群对比 kind 应是 segments：${d.kind}`);
+    // 对角线全是 0：挑一个非零的非对角格子（这里每个人的分群都变成 v2: 前缀）
+    const cell = d.matrix.find(c => c.before !== c.after && c.consumers > 0)!;
+    expect(cell).toBeDefined();
+
+    const [lakeBefore] = await onLake<{ n: string }>(acme, LAKE_SNAPSHOT);
+    const queued = (await getDb().select().from(tasks)).length;
+    const first = await sampleTemplateUpgrade(author, 'rfm', { before: cell.before, after: cell.after }, '2024-12-31');
+    expect(await sampleTemplateUpgrade(author, 'rfm', { before: cell.before, after: cell.after }, '2024-12-31')).toEqual(first);
+    expect(first).toMatchObject({ template: 'rfm', from: 1, to: 2, asOf: '2024-12-31', pick: { kind: 'cell', before: cell.before, after: cell.after } });
+    // 这一格的人数不超过 10：样例就是这一格的全部人
+    expect(first.rows).toHaveLength(Math.min(10, cell.consumers));
+    const ids = first.rows.map(r => r.consumerId);
+    expect(ids).toEqual([...ids].sort());
+    // 样例给两版的全部输出列（不含 consumer_id）：v2 的分群带前缀，其余列两边相同
+    expect(first.columns).not.toContain('consumer_id');
+    expect(first.columns).toContain('segment');
+    for (const r of first.rows) {
+      expect(r.after.segment).toBe(`v2:${r.before.segment}`);
+      expect(r.after.monetary).toEqual(r.before.monetary);
+    }
+    // 只读：湖上没多表、没有新任务
+    expect(await onLake<{ n: string }>(acme, LAKE_SNAPSHOT)).toEqual([lakeBefore]);
+    expect(await getDb().select().from(tasks)).toHaveLength(queued);
+    // 审计：模板、版本、格子与条数；detail 不出 consumer_id（查了两次，记两条）
+    const expected = { template: 'rfm', from: 1, to: 2, cell: { before: cell.before, after: cell.after }, count: first.rows.length };
+    const audits = await getDb().select({ actorEmail: auditLogs.actorEmail, detail: auditLogs.detail }).from(auditLogs)
+      .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'template.preview_sampled')));
+    expect(audits).toEqual([
+      { actorEmail: author.email, detail: expected },
+      { actorEmail: author.email, detail: expected },
+    ]);
+    expect(JSON.stringify(audits)).not.toMatch(/[0-9a-f]{64}/);
+    // RFM 的样例要给格子：给成列名时说明原因
+    await expect(sampleTemplateUpgrade(author, 'rfm', { column: 'segment' }, '2024-12-31')).rejects.toThrow(/格子/);
+  }, 120_000);
+
   it('其他模板给出变化、新增、移出人数；新版本拒绝生效的参数时预览与升级都说明原因；没有测试版本的模板已是最新', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     await drain();
@@ -236,5 +282,30 @@ describe('升级预览与确认', () => {
 
     await expect(previewTemplateUpgrade(author, 'cohort')).rejects.toThrow('已是最新模板版本');
     await expect(upgradeTemplateDraft(author, 'cohort')).rejects.toThrow('已是最新模板版本');
+  });
+
+  it('其他模板点输出列的「换了取值」查看样例：只取两边都在且换了取值的人，at_risk 两边相反；列名不在输出列里时给成格子时报 400，不拼进 SQL', async () => {
+    const { author } = await publishedIdentitySources({ orders: true });
+    await drain();
+    vi.stubEnv('TEMPLATE_TEST_VERSIONS', '1');
+    const churn = await previewTemplateUpgrade(author, 'churn', '2024-10-15');
+    const sample = await sampleTemplateUpgrade(author, 'churn', { column: 'at_risk' }, '2024-10-15');
+    expect(sample).toMatchObject({ template: 'churn', from: 1, to: 2, asOf: '2024-10-15', pick: { kind: 'column', column: 'at_risk' } });
+    // 第 2 版把 at_risk 取反：每个人都换了取值，样例就是变化人数（不超过 10）
+    expect(sample.rows).toHaveLength(Math.min(10, churn.metric!.changed));
+    const ids = sample.rows.map(r => r.consumerId);
+    expect(ids).toEqual([...ids].sort());
+    expect(sample.columns).not.toContain('consumer_id');
+    for (const r of sample.rows) {
+      expect(typeof r.before.at_risk).toBe('boolean');
+      expect(r.after.at_risk).toBe(!r.before.at_risk);
+    }
+    // 审计：列与条数
+    const audits = await getDb().select({ detail: auditLogs.detail }).from(auditLogs)
+      .where(and(eq(auditLogs.tenantId, author.tenant.id), eq(auditLogs.action, 'template.preview_sampled')));
+    expect(audits).toEqual([{ detail: { template: 'churn', from: 1, to: 2, column: 'at_risk', count: sample.rows.length } }]);
+    // 列名不在输出列里、或给成了格子（RFM 的参数）时报 400，不执行 SQL
+    await expect(sampleTemplateUpgrade(author, 'churn', { column: 'no_such_column' }, '2024-10-15')).rejects.toMatchObject({ status: 400, message: /没有输出列/ });
+    await expect(sampleTemplateUpgrade(author, 'churn', { before: null, after: null }, '2024-10-15')).rejects.toMatchObject({ status: 400, message: /输出列/ });
   });
 });

@@ -4,7 +4,8 @@
 // 发布后以新参数入队一次模板计算，产出的快照记下定义版本；有发布权限的成员也可以按生效的版本重新计算，选填不晚于今天的参考日期。
 // 没有已发布版本时生效的是模板的默认参数（不能重新计算）。注册表有了比生效版本锁定的更新的模板版本时显示提示条：可以预览升级差异
 // （RFM 是一句话结论、分群对比与迁移矩阵，其他模板是一句话结论、按列统计对比与变化人数；没有 consumer_id），提示条与预览结果的头部列出锁定版本之后每一版的改动说明（模板注册表里的 changes），
-// 有起草权限的成员确认升级后得到一版锁定新模板版本的草稿，照常双人发布（ADR-0021）
+// 有结果层查看权限的成员可以点迁移矩阵的一格（RFM）或输出列的「换了取值」（其他模板）查看最多 10 个样例消费者在两版下的全部输出列（#830，ADR-0025 补充），
+// 预览另有「下游影响」一节（这个模板进服务库的表与读取它的对外接口）；有起草权限的成员确认升级后得到一版锁定新模板版本的草稿，照常双人发布（ADR-0021）
 import { AlertTriangle, ArrowUpCircle, CheckCircle2, Eye, Lock, Plus, RefreshCw, X } from 'lucide-react';
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
@@ -17,7 +18,8 @@ import type { ColumnStat, ColumnType } from '~/.server/pipeline/templates/upgrad
 import type { RfmDefinition, ScoreRange, SegmentRule } from '~/.server/pipeline/templates/rfm';
 import { TaskError } from '~/.server/tasks';
 import {
-  discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, saveDraft, todayUtc, upgradeTemplateDraft,
+  discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, sampleTemplateUpgrade, saveDraft, templateDownstream,
+  todayUtc, upgradeTemplateDraft,
 } from '~/.server/templates';
 import { cmpName } from '~/lib/compare';
 import { entityOf } from '~/lib/canonical-model';
@@ -46,6 +48,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     email: member.email,
     nav: navFor(member),
     canDraft: can(member.role, 'definitions:draft'),
+    /** 可以查看升级样例（有结果层查看权限，#830）；矩阵格子与「换了取值」只在可以时渲染成按钮 */
+    canSample: can(member.role, 'results:read'),
     /** 不能重新计算的原因（没有发布权限）；可以时为 null */
     recomputeDenied: can(member.role, 'publish') ? null : deniedReason('publish'),
     /** 今天（UTC），参考日期的上限 */
@@ -125,6 +129,9 @@ const fieldsOf = (id: string): readonly ParamField[] =>
 
 const paramsOf = (id: string, form: FormData) => (id === 'rfm' ? rfmParamsOf(form) : formParamsOf(fieldsOf(id), form));
 
+/** 表单里的分群名（迁移矩阵的格子）：空串表示「（无）」（新增 / 移出） */
+const segmentOf = (v: FormDataEntryValue | null) => (v == null || String(v) === '' ? null : String(v));
+
 export async function action({ request, params }: Route.ActionArgs) {
   const form = await request.formData();
   const page = `/analytics/templates/${params.templateId}`;
@@ -147,19 +154,39 @@ export async function action({ request, params }: Route.ActionArgs) {
         break;
       case 'preview-upgrade': {
         const member = await requirePermission(request, 'definitions:read');
-        return { error: null, upgradeDiff: await previewTemplateUpgrade(member, params.templateId, String(form.get('asOf') ?? '') || undefined) };
+        return {
+          error: null,
+          upgradeDiff: await previewTemplateUpgrade(member, params.templateId, String(form.get('asOf') ?? '') || undefined),
+          downstream: await templateDownstream(member, params.templateId),
+          sample: null,
+        };
+      }
+      case 'preview-sample': {
+        const member = await requirePermission(request, 'results:read');
+        const asOf = String(form.get('asOf') ?? '') || undefined;
+        const column = form.get('column');
+        const pick = column != null && String(column) !== ''
+          ? { column: String(column) }
+          : { before: segmentOf(form.get('before')), after: segmentOf(form.get('after')) };
+        // 带上升级差异让预览保持展开，样例表出现在点开的格子 / 列下面
+        return {
+          error: null,
+          upgradeDiff: await previewTemplateUpgrade(member, params.templateId, asOf),
+          downstream: await templateDownstream(member, params.templateId),
+          sample: await sampleTemplateUpgrade(member, params.templateId, pick, asOf),
+        };
       }
       case 'upgrade': {
         const { version } = await upgradeTemplateDraft(await requirePermission(request, 'definitions:draft'), params.templateId);
         throw redirect(`${page}?upgraded=${version}`);
       }
       default:
-        return data({ error: '未知操作', upgradeDiff: null }, { status: 400 });
+        return data({ error: '未知操作', upgradeDiff: null, downstream: null, sample: null }, { status: 400 });
     }
   } catch (e) {
     // 模板与发布流程的业务错误（TemplateError 是 PublishError 的子类，ADR-0051）
-    if (e instanceof PublishError) return data({ error: e.message, upgradeDiff: null }, { status: e.status });
-    if (e instanceof TaskError) return data({ error: e.message, upgradeDiff: null }, { status: 400 });
+    if (e instanceof PublishError) return data({ error: e.message, upgradeDiff: null, downstream: null, sample: null }, { status: e.status });
+    if (e instanceof TaskError) return data({ error: e.message, upgradeDiff: null, downstream: null, sample: null }, { status: 400 });
     throw e;
   }
   throw redirect(page);
@@ -184,6 +211,60 @@ function RecomputeAction({ denied, today, submitting }: { denied: string | null;
 }
 
 type UpgradeDiff = Awaited<ReturnType<typeof previewTemplateUpgrade>>;
+/** 升级样例（intent=preview-sample）：点的格子或列、两版输出列与样例行（#830） */
+type UpgradeSample = Awaited<ReturnType<typeof sampleTemplateUpgrade>>;
+/** 下游影响（#830）：这个模板进服务库的表与读取它的对外接口 */
+type Downstream = Awaited<ReturnType<typeof templateDownstream>>;
+
+/** 样例的取值：null 显示「—」，布尔显示「是 / 否」，其余按字符串 */
+const sampleValue = (v: unknown) => (v == null ? '—' : typeof v === 'boolean' ? (v ? '是' : '否') : String(v));
+
+/**
+ * 样例消费者表（#830）：一行一个消费者（最多 10 个，按 consumer_id 排序），并排 v1 / v2 的全部输出列；
+ * 取值只来自模板的输出列，不出敏感字段明文
+ */
+function SampleTable({ from, to, sample }: { from: number; to: number; sample: UpgradeSample }) {
+  return (
+    <div className="space-y-1">
+      <p className="text-xs font-medium text-slate-400">{`样例消费者（最多 10 个，按 consumer_id 排序，${'cell' in sample.pick ? '原分群 → 新分群' : '换了取值'}）`}</p>
+      <Table data-upgrade-sample>
+        <TableHeader>
+          <TableRow>
+            <TableHead>consumer_id</TableHead>
+            {/* 每列并排 v1 / v2，方便逐列对比 */}
+            {sample.columns.flatMap(c => [<TableHead key={c}>{`v${from} ${c}`}</TableHead>, <TableHead key={`v2-${c}`}>{`v${to} ${c}`}</TableHead>])}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {sample.rows.map(r => (
+            <TableRow key={r.consumerId} data-sample-row={r.consumerId}>
+              <TableCell className="font-mono text-xs">{r.consumerId}</TableCell>
+              {sample.columns.flatMap(c => [<TableCell key={c}>{sampleValue(r.before[c])}</TableCell>, <TableCell key={`v2-${c}`}>{sampleValue(r.after[c])}</TableCell>])}
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+      {sample.rows.length === 0 && <p className="text-sm text-slate-500">这里没有消费者。</p>}
+    </div>
+  );
+}
+
+/** 「下游影响」（#830）：服务库表、发布后下一次计算时切换与读取它的对外接口；没有下游时写「没有下游使用」 */
+function DownstreamImpact({ downstream }: { downstream: Downstream }) {
+  return (
+    <div data-downstream className="space-y-1">
+      <p className="text-xs font-medium text-slate-400">下游影响</p>
+      {downstream.table === null ? (
+        <p className="text-sm text-slate-500">没有下游使用</p>
+      ) : (
+        <ul className="list-disc space-y-0.5 pl-5 text-sm text-slate-500">
+          <li>{`服务库表 ${downstream.table}，升级发布后下一次计算时切换到新结果`}</li>
+          {downstream.paths.map(p => <li key={p}>{`对外接口 ${p} 读取这张表`}</li>)}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 /** 锁定版本之后每一版的改动说明（提示条的说明段下面与预览结果的头部各列一次） */
 function ChangeList({ changes }: { changes: { version: number; changes: string }[] }) {
@@ -196,11 +277,12 @@ function ChangeList({ changes }: { changes: { version: number; changes: string }
 
 /**
  * 有新模板版本时的提示条：预览升级差异（intent=preview-upgrade，选填参考日期），有起草权限时确认升级（intent=upgrade）；
- * 草稿已锁定新版本时说明发布后生效。预览结果：RFM 是一句话结论、分群对比与迁移矩阵，其他模板是一句话结论、按列统计对比与变化、新增、移出人数
+ * 草稿已锁定新版本时说明发布后生效。预览结果：RFM 是一句话结论、分群对比与迁移矩阵，其他模板是一句话结论、按列统计对比与变化、新增、移出人数；
+ * 有结果层查看权限的成员可以点格子 / 「换了取值」查看样例消费者（intent=preview-sample），预览还带「下游影响」一节
  */
-function UpgradeBanner({ latest, locked, changes, draft, canDraft, today, diff, submitting }: {
+function UpgradeBanner({ latest, locked, changes, draft, canDraft, canSample, today, diff, downstream, sample, submitting }: {
   latest: number; locked: number; changes: { version: number; changes: string }[]; draft: { version: number; templateVersion: number | null } | null;
-  canDraft: boolean; today: string; diff: UpgradeDiff | null; submitting: boolean;
+  canDraft: boolean; canSample: boolean; today: string; diff: UpgradeDiff | null; downstream: Downstream | null; sample: UpgradeSample | null; submitting: boolean;
 }) {
   const upgraded = draft !== null && draft.templateVersion === latest;
   return (
@@ -211,7 +293,7 @@ function UpgradeBanner({ latest, locked, changes, draft, canDraft, today, diff, 
           <p className="text-sm text-slate-500">
             {upgraded
               ? `第 ${draft.version} 版草稿已锁定模板 v${latest}，由另一位数据工程师或管理员发布后按新版本计算；发布之前仍按 v${locked} 计算。`
-              : `升级前先预览：以生效的参数分别按 v${locked} 与 v${latest} 计算，按消费者对比，只给人数。确认升级后生成一版草稿，发布之前仍按 v${locked} 计算。`}
+              : `升级前先预览：以生效的参数分别按 v${locked} 与 v${latest} 计算，按消费者对比给计数与统计量${canSample ? '，点迁移矩阵的格子或输出列的「换了取值」可看样例消费者' : ''}。确认升级后生成一版草稿，发布之前仍按 v${locked} 计算。`}
           </p>
           <div className="mt-1"><ChangeList changes={changes} /></div>
         </div>
@@ -239,11 +321,14 @@ function UpgradeBanner({ latest, locked, changes, draft, canDraft, today, diff, 
               <span>{diff.summary.text}</span>
             </p>
           )}
-          {diff.distribution?.kind === 'segments' && <SegmentUpgradeDistribution from={diff.from} to={diff.to} distribution={diff.distribution} />}
-          {diff.distribution?.kind === 'columns' && <ColumnUpgradeDistribution from={diff.from} to={diff.to} distribution={diff.distribution} />}
+          {diff.distribution?.kind === 'segments'
+            && <SegmentUpgradeDistribution from={diff.from} to={diff.to} asOf={diff.asOf} distribution={diff.distribution} canSample={canSample} sample={sample} />}
+          {diff.distribution?.kind === 'columns'
+            && <ColumnUpgradeDistribution from={diff.from} to={diff.to} asOf={diff.asOf} distribution={diff.distribution} canSample={canSample} sample={sample} />}
           {diff.metric && (
             <p data-upgrade-metric className="text-sm text-slate-500">{`取值变化 ${diff.metric.changed} 人，新增 ${diff.metric.added} 人，移出 ${diff.metric.removed} 人`}</p>
           )}
+          {downstream && <DownstreamImpact downstream={downstream} />}
         </div>
       )}
     </div>
@@ -259,9 +344,11 @@ function cmpSegment(a: string | null, b: string | null) {
 
 const count = (n: number) => n.toLocaleString('en-US');
 
-/** RFM 升级预览的分群对比（每个分群的 v1 / v2 人数、变化与 v2 占比）与「原分群 × 新分群」迁移矩阵（含没变的人，对角线淡显；只有计数，ADR-0025） */
-function SegmentUpgradeDistribution({ from, to, distribution }: {
-  from: number; to: number; distribution: Extract<NonNullable<UpgradeDiff['distribution']>, { kind: 'segments' }>;
+/** RFM 升级预览的分群对比（每个分群的 v1 / v2 人数、变化与 v2 占比）与「原分群 × 新分群」迁移矩阵（含没变的人，对角线淡显；计数本身不出消费者 ID，ADR-0025）。
+ *  有结果层查看权限的成员点非零的格子查看样例消费者（#830） */
+function SegmentUpgradeDistribution({ from, to, asOf, distribution, canSample, sample }: {
+  from: number; to: number; asOf: string; distribution: Extract<NonNullable<UpgradeDiff['distribution']>, { kind: 'segments' }>;
+  canSample: boolean; sample: UpgradeSample | null;
 }) {
   const names = (side: 'before' | 'after') => [...new Set(distribution[side].map(s => s.segment))];
   // 对比表的行是 v1 / v2 分群名的并集（只有一边有的分群另一边人数为 0）；矩阵行是原分群、列是新分群，迁移里出现的「（无）」（新增或移出）也各占一行/列
@@ -271,6 +358,8 @@ function SegmentUpgradeDistribution({ from, to, distribution }: {
   const sideCount = (side: 'before' | 'after', segment: string | null) => distribution[side].find(s => s.segment === segment)?.consumers ?? 0;
   const totalAfter = distribution.after.reduce((n, s) => n + s.consumers, 0);
   const moved = (b: string | null, a: string | null) => distribution.matrix.find(m => m.before === b && m.after === a)?.consumers ?? 0;
+  // 当前展开的样例是哪一格（null 是「（无）」）
+  const picked = sample !== null && sample.pick.kind === 'cell' ? sample.pick : null;
   return (
     <div className="space-y-2">
       <p className="text-xs font-medium text-slate-400">分群对比</p>
@@ -300,7 +389,7 @@ function SegmentUpgradeDistribution({ from, to, distribution }: {
           })}
         </TableBody>
       </Table>
-      <p className="text-xs font-medium text-slate-400">迁移矩阵（原分群 × 新分群，含没变的人，「（无）」是新增或移出）</p>
+      <p className="text-xs font-medium text-slate-400">{`迁移矩阵（原分群 × 新分群，含没变的人，「（无）」是新增或移出${canSample ? '，点人数查看样例' : ''}）`}</p>
       <Table data-upgrade-matrix>
         <TableHeader>
           <TableRow>
@@ -312,20 +401,42 @@ function SegmentUpgradeDistribution({ from, to, distribution }: {
           {matrixRows.map(b => (
             <TableRow key={b ?? '（无）'}>
               <TableCell>{b ?? '（无）'}</TableCell>
-              {columns.map(a => (
-                <TableCell key={a ?? '（无）'} className={a === b ? 'text-slate-400' : undefined}>{count(moved(b, a))}</TableCell>
-              ))}
+              {columns.map(a => {
+                const n = moved(b, a);
+                const isPicked = picked !== null && picked.before === b && picked.after === a;
+                return (
+                  <TableCell key={a ?? '（无）'} className={a === b && !isPicked ? 'text-slate-400' : undefined}>
+                    {canSample && n > 0 ? (
+                      <Form method="post" className="inline">
+                        <input type="hidden" name="intent" value="preview-sample" />
+                        <input type="hidden" name="asOf" value={asOf} />
+                        <input type="hidden" name="before" value={b ?? ''} />
+                        <input type="hidden" name="after" value={a ?? ''} />
+                        <button
+                          type="submit"
+                          data-sample-cell={`${b ?? ''}→${a ?? ''}`}
+                          aria-label={`查看 ${b ?? '（无）'} → ${a ?? '（无）'} 的样例消费者`}
+                          className={`underline decoration-dotted underline-offset-2 hover:text-slate-900 ${isPicked ? 'font-medium text-slate-900' : ''}`}
+                        >{count(n)}</button>
+                      </Form>
+                    ) : count(n)}
+                  </TableCell>
+                );
+              })}
             </TableRow>
           ))}
         </TableBody>
       </Table>
+      {sample?.pick.kind === 'cell' && <SampleTable from={from} to={to} sample={sample} />}
     </div>
   );
 }
 
-/** 非 RFM 升级预览的按列对比：每个输出列（不含 consumer_id）一行，并排 v1 / v2 统计量与换了取值的人数（只有计数与统计量，不出单个消费者的取值，ADR-0025） */
-function ColumnUpgradeDistribution({ from, to, distribution }: {
-  from: number; to: number; distribution: Extract<NonNullable<UpgradeDiff['distribution']>, { kind: 'columns' }>;
+/** 非 RFM 升级预览的按列对比：每个输出列（不含 consumer_id）一行，并排 v1 / v2 统计量与换了取值的人数（计数与统计量本身不出单个消费者的取值，ADR-0025）。
+ *  有结果层查看权限的成员点「换了取值」的人数查看样例消费者（#830） */
+function ColumnUpgradeDistribution({ from, to, asOf, distribution, canSample, sample }: {
+  from: number; to: number; asOf: string; distribution: Extract<NonNullable<UpgradeDiff['distribution']>, { kind: 'columns' }>;
+  canSample: boolean; sample: UpgradeSample | null;
 }) {
   const typeLabel: Record<ColumnType, string> = { bool: '布尔', number: '数值', text: '文本', other: '其他' };
   // 布尔列的占比用该边自己的总人数算；数值列的 null（这一列全为 null）与缺列的一边都显示「—」
@@ -377,11 +488,26 @@ function ColumnUpgradeDistribution({ from, to, distribution }: {
               <TableCell>{typeLabel[c.type]}</TableCell>
               <TableCell>{cell(c, 'before')}</TableCell>
               <TableCell>{cell(c, 'after')}</TableCell>
-              <TableCell>{c.changed === null ? '—' : count(c.changed)}</TableCell>
+              <TableCell>
+                {canSample && c.changed !== null && c.changed > 0 ? (
+                  <Form method="post" className="inline">
+                    <input type="hidden" name="intent" value="preview-sample" />
+                    <input type="hidden" name="asOf" value={asOf} />
+                    <input type="hidden" name="column" value={c.name} />
+                    <button
+                      type="submit"
+                      data-sample-column={c.name}
+                      aria-label={`查看 ${c.name} 换了取值的样例消费者`}
+                      className={`underline decoration-dotted underline-offset-2 hover:text-slate-900 ${sample?.pick.kind === 'column' && sample.pick.column === c.name ? 'font-medium text-slate-900' : ''}`}
+                    >{count(c.changed)}</button>
+                  </Form>
+                ) : c.changed === null ? '—' : count(c.changed)}
+              </TableCell>
             </TableRow>
           ))}
         </TableBody>
       </Table>
+      {sample?.pick.kind === 'column' && <SampleTable from={from} to={to} sample={sample} />}
     </div>
   );
 }
@@ -533,7 +659,7 @@ function ParamsForm({ params, canDraft, submitting }: { params: RfmDefinition; c
 export default function TemplateParams({ loaderData, actionData }: Route.ComponentProps) {
   const {
     email, nav, canDraft, recomputeDenied, today, justPublished, justRecomputed, justUpgraded, upgradeAvailable, latestTemplateVersion, lockedTemplateVersion,
-    upgradeChanges, draftTemplateVersion, label, fields, form, published, versions,
+    upgradeChanges, draftTemplateVersion, label, fields, form, published, versions, canSample,
   } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
@@ -574,7 +700,8 @@ export default function TemplateParams({ loaderData, actionData }: Route.Compone
         <UpgradeBanner
           latest={latestTemplateVersion} locked={lockedTemplateVersion} changes={upgradeChanges}
           draft={draft ? { version: draft.version, templateVersion: draftTemplateVersion } : null}
-          canDraft={canDraft} today={today} diff={actionData?.upgradeDiff ?? null} submitting={submitting}
+          canDraft={canDraft} canSample={canSample} today={today} diff={actionData?.upgradeDiff ?? null}
+          downstream={actionData?.downstream ?? null} sample={actionData?.sample ?? null} submitting={submitting}
         />
       )}
 
