@@ -142,6 +142,7 @@ require_call() {
 
 log "drive model provider and assistant against $BASE_URL"
 login_as "$ADMIN_EMAIL"
+run B click --selector 'details:has(a[href="/model-provider"]) > summary'
 run B click --role link --name "模型服务"
 run B wait-url /model-provider
 expect_title "模型服务 · CRM 数据分析平台"

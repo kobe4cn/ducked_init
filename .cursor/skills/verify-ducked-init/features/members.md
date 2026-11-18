@@ -12,7 +12,7 @@ An admin invites an email, picks a role, and sees that person in the members tab
 
 ## How to get to it (user POV)
 
-- Choose `成员` in the top nav. The path is `/members`.
+- Open `管理` in the top nav, then choose `成员`. The path is `/members`. The link is inside a closed `<details>` until that summary is open.
 - Admins also see `邀请成员、修改角色与移除成员` on the overview, but that line is not a link. The nav entry is the way in.
 
 ## Driving it with Playwright
@@ -25,10 +25,10 @@ Preconditions:
 
 The whole recipe is `.cursor/skills/verify-ducked-init/scripts/drive-members.sh`. The commands below are what it runs.
 
-- **Open members.** Choose `成员`. Run `node .cursor/skills/verify-ducked-init/scripts/browser.mjs click --role link --name "成员"` and `browser.mjs wait-url /members`. The title is `成员 · CRM 数据分析平台`. The heading is `成员`. `[data-email="admin@verify.test"]` is visible and the text `你` is in that row.
+- **Open members.** Choose `管理`, then `成员`. Run `node .cursor/skills/verify-ducked-init/scripts/browser.mjs click --selector 'details:has(a[href="/members"]) > summary'`, `browser.mjs click --role link --name "成员"`, and `browser.mjs wait-url /members`. The title is `成员 · CRM 数据分析平台`. The heading is `成员`. `[data-email="admin@verify.test"]` is visible and the text `你` is in that row.
 - **Fill the invite.** Run `browser.mjs fill --label "邮箱" --value "eng@verify.test"` and `browser.mjs select --label "角色" --value "data_engineer"`. The role control shows the value `data_engineer` (label `数据工程师`). Run `browser.mjs screenshot --path <evidence>/members-filled.png`.
 - **Invite.** Choose `邀请`. Run `browser.mjs click --role button --name "邀请"` and `browser.mjs wait-selector '[data-email="eng@verify.test"]'`. Run `browser.mjs value --label "eng@verify.test 的角色"` and expect `data_engineer`. Run `browser.mjs screenshot --path <evidence>/members-saved.png` and `browser.mjs snapshot --path <evidence>/members.aria.txt`.
-- **Audit view.** Choose `审计日志`. Run `browser.mjs click --role link --name "审计日志"`, `browser.mjs wait-url /audit`, `browser.mjs wait-text "邀请成员"`, and `browser.mjs wait-text "eng@verify.test，角色：数据工程师"`. `[data-audit-action="邀请成员"]` is visible. Run `browser.mjs screenshot --path <evidence>/audit.png`.
+- **Audit view.** Choose `管理`, then `审计日志`. Run `browser.mjs click --selector 'details:has(a[href="/audit"]) > summary'`, `browser.mjs click --role link --name "审计日志"`, `browser.mjs wait-url /audit`, `browser.mjs wait-text "邀请成员"`, and `browser.mjs wait-text "eng@verify.test，角色：数据工程师"`. `[data-audit-action="邀请成员"]` is visible. Run `browser.mjs screenshot --path <evidence>/audit.png`.
 - **Stored member.** Run `scripts/sql.sh "SELECT email, role::text FROM platform.members m JOIN platform.tenants t ON t.id = m.tenant_id WHERE t.slug = 'verify' ORDER BY 1"`. Stdout contains `admin@verify.test|admin` and `eng@verify.test|data_engineer`.
 - **Stored audit.** Run `scripts/sql.sh "SELECT action, coalesce(actor_email, ''), detail->>'email', detail->>'role' FROM platform.audit_logs WHERE action = 'member.invited'"`. Stdout is `member.invited|admin@verify.test|eng@verify.test|data_engineer`.
 - **Mail.** The server log gains a console-mail block whose recipient is `eng@verify.test`, whose body contains `admin@verify.test 邀请你以「数据工程师」角色加入 验收租户。`, and whose login URL is `<BASE_URL>/login`. Copy that block to `<evidence>/invite-mail.txt`. The invite mail has no `/auth/verify` token.
