@@ -19,17 +19,26 @@ const server = net.createServer(socket => {
   socket.on('close', () => sockets.delete(socket));
 });
 
+/** 假源库：接受连接后立刻断开，libpq 报 server closed the connection unexpectedly 一类的错（不含 timeout expired） */
+let closedConnections = 0;
+const closingServer = net.createServer(socket => {
+  closedConnections += 1;
+  socket.destroy();
+});
+
 beforeAll(async () => {
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>(resolve => closingServer.listen(0, '127.0.0.1', resolve));
 });
 afterAll(async () => {
   for (const socket of sockets) socket.destroy();
   await new Promise<void>(resolve => server.close(() => resolve()));
+  await new Promise<void>(resolve => closingServer.close(() => resolve()));
 });
-afterEach(() => { vi.unstubAllEnvs(); connections = 0; });
+afterEach(() => { vi.unstubAllEnvs(); connections = 0; closedConnections = 0; });
 
-const spec = (): Extract<SourceSpec, { kind: 'postgres' }> => {
-  const address = server.address() as net.AddressInfo;
+const spec = (target: net.Server = server): Extract<SourceSpec, { kind: 'postgres' }> => {
+  const address = target.address() as net.AddressInfo;
   return {
     kind: 'postgres', host: address.address, port: address.port,
     database: 'crm', schema: 'public', user: 'reader', password: 'reader',
@@ -50,5 +59,23 @@ describe('PostgreSQL 源库建连超时的重试', () => {
     vi.stubEnv('SOURCE_CONNECT_RETRIES', '0');
     await expect(openSource(spec(), limits)).rejects.toThrow(/timeout expired/);
     expect(connections).toBe(1);
+  });
+
+  it('其他错误（连上即被断开）立刻抛出、不重试：重试 2 次时的连接次数与重试 0 次相同', async () => {
+    vi.stubEnv('SOURCE_CONNECT_TIMEOUT_SECONDS', '2');
+    // 基准：不重试时的连接次数（sslmode=prefer 可能让 libpq 对一次 ATTACH 连两次，不硬写 1）
+    vi.stubEnv('SOURCE_CONNECT_RETRIES', '0');
+    const baseline = await openSource(spec(closingServer), limits).then(
+      () => { throw new Error('openSource 应当失败'); },
+      (e: Error) => { expect(e.message).not.toMatch(/timeout expired/); return closedConnections; },
+    );
+    expect(baseline).toBeGreaterThan(0);
+
+    closedConnections = 0;
+    vi.stubEnv('SOURCE_CONNECT_RETRIES', '2');
+    const error = await openSource(spec(closingServer), limits).then(() => null, (e: Error) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error!.message).not.toMatch(/timeout expired/);
+    expect(closedConnections).toBe(baseline);
   });
 });
