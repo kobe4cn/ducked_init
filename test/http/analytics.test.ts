@@ -928,9 +928,14 @@ describe('模板升级', () => {
     expect(diff.slice(diff.indexOf('data-upgrade-matrix'))).not.toMatch(/<td[^>]*>v2:/);
     expect(diff).not.toMatch(/[0-9a-f]{64}/);
 
-    // 流失预警：变化、新增、移出人数；提示条与预览头部列出它自己的改动说明
+    // 流失预警（#858）：一句话结论（警示）与按列统计对比，列对比表在变化人数上方；提示条与预览头部列出它自己的改动说明
     const churn = await (await analyst.post('/analytics/templates/churn', { intent: 'preview-upgrade', asOf: '2024-10-15' })).text();
     expect(churn).toMatch(/data-upgrade-metric[^>]*>取值变化 [1-9]\d* 人，新增 0 人，移出 0 人/);
+    expect(churn).toContain('data-upgrade-summary');
+    expect(churn).toContain('变化最大的字段：at_risk 为是');
+    expect(churn).toContain('data-upgrade-columns');
+    // 列对比表在变化、新增、移出人数那行上方
+    expect(churn.indexOf('data-upgrade-columns')).toBeLessThan(churn.indexOf('data-upgrade-metric'));
     expect(churn.match(/data-upgrade-changes/g)!.length).toBe(2);
     expect(churn).toContain('v2：at_risk 取反；minOrders 不超过 10，用于验证升级流程；所有人的 at_risk 都会翻转');
     expect(churn).not.toMatch(/[0-9a-f]{64}/);
