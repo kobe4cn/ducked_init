@@ -136,10 +136,19 @@ describe('升级预览与确认', () => {
     const [lakeBefore] = await onLake<{ n: string }>(acme, LAKE_SNAPSHOT);
     const queued = (await getDb().select().from(tasks)).length;
     const preview = await previewTemplateUpgrade(author, 'rfm', '2024-12-31');
-    expect(preview).toMatchObject({ from: 1, to: 2, asOf: '2024-12-31', metric: null });
+    expect(preview).toMatchObject({ from: 1, to: 2, asOf: '2024-12-31', metric: null, distribution: { kind: 'segments' } });
     expect(preview.segments!.length).toBeGreaterThan(0);
     for (const t of preview.segments!) expect(t.after).toBe(`v2:${t.before}`);
     expect(preview.segments!.reduce((n, t) => n + t.consumers, 0)).toBe(Number(total));
+    // 分群对比：v1 各分群人数之和等于快照行数；每个 v2:X 的人数等于 v1 的 X
+    const d = preview.distribution!;
+    expect(d.before.reduce((n, s) => n + s.consumers, 0)).toBe(Number(total));
+    expect(d.after).toEqual(d.before.map(s => ({ segment: `v2:${s.segment}`, consumers: s.consumers })));
+    // 迁移矩阵（含没变的人）：对角线（原分群 = 新分群）为 0，全部格子的人数之和是 v1 与 v2 的并集（这里同一批人，即快照行数）
+    expect(d.matrix.every(c => c.before !== c.after && c.after === `v2:${c.before}`)).toBe(true);
+    expect(d.matrix.reduce((n, c) => n + c.consumers, 0)).toBe(Number(total));
+    expect(preview.summary!.warn).toBe(true);
+    expect(preview.summary!.text).toContain('没变的人占 0.0%');
     expect(JSON.stringify(preview)).not.toMatch(/[0-9a-f]{64}/);
     await expect(previewTemplateUpgrade(author, 'rfm', '2999-01-01')).rejects.toThrow(/晚于今天/);
     expect(await onLake<{ n: string }>(acme, LAKE_SNAPSHOT)).toEqual([lakeBefore]);
@@ -194,7 +203,7 @@ describe('升级预览与确认', () => {
     const [{ n }] = await onLake<{ n: string }>(acme, `SELECT count(*)::VARCHAR AS n FROM gold."churn__${task.id}"`);
     expect(Number(n)).toBeGreaterThan(0);
     expect(await previewTemplateUpgrade(author, 'churn', '2024-10-15'))
-      .toEqual({ template: 'churn', from: 1, to: 2, asOf: '2024-10-15', segments: null, metric: { changed: Number(n), added: 0, removed: 0 } });
+      .toEqual({ template: 'churn', from: 1, to: 2, asOf: '2024-10-15', segments: null, metric: { changed: Number(n), added: 0, removed: 0 }, distribution: null, summary: null });
 
     // 第 2 版的 minOrders 不超过 10
     await saveDraft(author, 'churn', { minOrders: 20 });

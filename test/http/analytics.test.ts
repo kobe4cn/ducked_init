@@ -7,7 +7,7 @@
 // 复购与 CLV 快照页（#835）：复购率（X / Y 人）与到第二单天数中位数、CLV 头部 10% 贡献占比与十档分布（与湖上一致，空值显示「—」），下方仍是按 consumer_id 的通用分页明细，没有明文
 // 同期群与复购同样走通用表单（周期下拉框、起草、双人发布入队 gold.cohort / gold.repurchase 并登记快照，周期偏移列表用顿号连接）；
 // 同期群快照页（#836）：默认留存矩阵（行是 cohort_start 升序、列是第 0…periods-1 期，格子是人数与留存率，卡片写同期群数、总人数、粒度），逐人明细在 ?tab=consumers；
-// 模板升级（测试开关 TEMPLATE_TEST_VERSIONS=1）：提示条、预览差异（RFM 分群迁移表、流失预警变化人数，没有 consumer_id）、分析师起草升级但发布 403；
+// 模板升级（测试开关 TEMPLATE_TEST_VERSIONS=1）：提示条、预览差异（RFM 一句话结论、分群对比与迁移矩阵、流失预警变化人数，没有 consumer_id）、分析师起草升级但发布 403；
 // 指标与标签（DSL）快照详情（#816）：定义页「快照」区未过期的行点统计日进快照详情页，DSL 快照走通用明细（页头写类型、键、版本、统计日与来源，按行分页），
 // 标签快照带各取值人数汇总，过期 / 其他租户 / 表名与类型对不上 404，未登录跳转登录页
 import { randomUUID } from 'node:crypto';
@@ -917,8 +917,15 @@ describe('模板升级', () => {
     // 预览结果的头部再列一次同样的说明（提示条里一次、预览头部一次）
     expect(diff.match(/data-upgrade-changes/g)!.length).toBe(2);
     expect(diff).toContain('v2：分群名加 v2: 前缀，用于验证升级流程；所有人的分群名都会变');
-    expect(diff.match(/data-upgrade-segment/g)!.length).toBeGreaterThan(0);
+    // 一句话结论（换分群的人超过 20%，警示）：分群对比表与迁移矩阵（只有计数，没有 consumer_id）
+    expect(diff).toContain('data-upgrade-summary');
+    expect(diff).toContain('没变的人占 0.0%');
+    expect(diff).toContain('→ v2:');
+    expect(diff).toContain('data-upgrade-distribution');
+    expect(diff).toContain('data-upgrade-matrix');
     expect(diff).toMatch(/<td[^>]*>v2:[^<]+<\/td>/);
+    // 矩阵行是原分群：v2: 前缀只出现在对比表和矩阵列头，不作为矩阵的出发行
+    expect(diff.slice(diff.indexOf('data-upgrade-matrix'))).not.toMatch(/<td[^>]*>v2:/);
     expect(diff).not.toMatch(/[0-9a-f]{64}/);
 
     // 流失预警：变化、新增、移出人数；提示条与预览头部列出它自己的改动说明

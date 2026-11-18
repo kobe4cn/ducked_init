@@ -3,9 +3,9 @@
 // 有起草权限的成员保存草稿（参数不合法时报错）、丢弃草稿；草稿由最后保存它的人以外的另一位有发布权限的成员发布（ADR-0015），
 // 发布后以新参数入队一次模板计算，产出的快照记下定义版本；有发布权限的成员也可以按生效的版本重新计算，选填不晚于今天的参考日期。
 // 没有已发布版本时生效的是模板的默认参数（不能重新计算）。注册表有了比生效版本锁定的更新的模板版本时显示提示条：可以预览升级差异
-// （只有分群迁移或变化人数，没有 consumer_id），提示条与预览结果的头部列出锁定版本之后每一版的改动说明（模板注册表里的 changes），
+// （RFM 是一句话结论、分群对比与迁移矩阵，其他模板是变化人数；没有 consumer_id），提示条与预览结果的头部列出锁定版本之后每一版的改动说明（模板注册表里的 changes），
 // 有起草权限的成员确认升级后得到一版锁定新模板版本的草稿，照常双人发布（ADR-0021）
-import { ArrowUpCircle, CheckCircle2, Eye, Lock, Plus, RefreshCw, X } from 'lucide-react';
+import { AlertTriangle, ArrowUpCircle, CheckCircle2, Eye, Lock, Plus, RefreshCw, X } from 'lucide-react';
 import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.templates.$id';
@@ -18,6 +18,7 @@ import { TaskError } from '~/.server/tasks';
 import {
   discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, saveDraft, todayUtc, upgradeTemplateDraft,
 } from '~/.server/templates';
+import { cmpName } from '~/lib/compare';
 import { entityOf } from '~/lib/canonical-model';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
@@ -194,7 +195,7 @@ function ChangeList({ changes }: { changes: { version: number; changes: string }
 
 /**
  * 有新模板版本时的提示条：预览升级差异（intent=preview-upgrade，选填参考日期），有起草权限时确认升级（intent=upgrade）；
- * 草稿已锁定新版本时说明发布后生效。预览结果：RFM 是分群迁移人数表，其他模板是变化、新增、移出人数
+ * 草稿已锁定新版本时说明发布后生效。预览结果：RFM 是一句话结论、分群对比与迁移矩阵，其他模板是变化、新增、移出人数
  */
 function UpgradeBanner({ latest, locked, changes, draft, canDraft, today, diff, submitting }: {
   latest: number; locked: number; changes: { version: number; changes: string }[]; draft: { version: number; templateVersion: number | null } | null;
@@ -231,33 +232,89 @@ function UpgradeBanner({ latest, locked, changes, draft, canDraft, today, diff, 
         <div data-upgrade-diff className="space-y-2">
           <p className="text-sm text-slate-500">{`v${diff.from} → v${diff.to}，统计日 ${diff.asOf}`}</p>
           <ChangeList changes={changes} />
-          {diff.segments && (diff.segments.length
-            ? (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>原分群</TableHead>
-                    <TableHead>新分群</TableHead>
-                    <TableHead>人数</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {diff.segments.map(t => (
-                    <TableRow key={`${t.before} → ${t.after}`} data-upgrade-segment>
-                      <TableCell>{t.before ?? '（无）'}</TableCell>
-                      <TableCell>{t.after ?? '（无）'}</TableCell>
-                      <TableCell>{t.consumers}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            )
-            : <p className="text-sm">没有消费者换分群。</p>)}
+          {diff.summary && (
+            <p data-upgrade-summary className={`flex items-center gap-1.5 text-sm ${diff.summary.warn ? 'text-amber-600' : 'text-slate-500'}`}>
+              {diff.summary.warn && <AlertTriangle className="size-4 shrink-0" aria-label="警示" />}
+              <span>{diff.summary.text}</span>
+            </p>
+          )}
+          {diff.distribution && <SegmentUpgradeDistribution from={diff.from} to={diff.to} distribution={diff.distribution} />}
           {diff.metric && (
             <p data-upgrade-metric className="text-sm">{`取值变化 ${diff.metric.changed} 人，新增 ${diff.metric.added} 人，移出 ${diff.metric.removed} 人`}</p>
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+/** 分群按名字排（ADR-0045 的 cmpName），null（新增或移出，显示成「（无）」）排最后 */
+function cmpSegment(a: string | null, b: string | null) {
+  if (a === null) return 1;
+  if (b === null) return -1;
+  return cmpName(a, b);
+}
+
+const count = (n: number) => n.toLocaleString('en-US');
+
+/** RFM 升级预览的分群对比（每个分群的 v1 / v2 人数、变化与 v2 占比）与「原分群 × 新分群」迁移矩阵（含没变的人，对角线淡显；只有计数，ADR-0025） */
+function SegmentUpgradeDistribution({ from, to, distribution }: { from: number; to: number; distribution: NonNullable<UpgradeDiff['distribution']> }) {
+  const names = (side: 'before' | 'after') => [...new Set(distribution[side].map(s => s.segment))];
+  // 对比表的行是 v1 / v2 分群名的并集（只有一边有的分群另一边人数为 0）；矩阵行是原分群、列是新分群，迁移里出现的「（无）」（新增或移出）也各占一行/列
+  const compareRows = [...new Set([...names('before'), ...names('after')])].sort(cmpSegment);
+  const matrixRows = [...new Set([...names('before'), ...distribution.matrix.map(m => m.before)])].sort(cmpSegment);
+  const columns = [...new Set([...names('after'), ...distribution.matrix.map(m => m.after)])].sort(cmpSegment);
+  const sideCount = (side: 'before' | 'after', segment: string | null) => distribution[side].find(s => s.segment === segment)?.consumers ?? 0;
+  const totalAfter = distribution.after.reduce((n, s) => n + s.consumers, 0);
+  const moved = (b: string | null, a: string | null) => distribution.matrix.find(m => m.before === b && m.after === a)?.consumers ?? 0;
+  return (
+    <div className="space-y-2">
+      <p className="text-xs font-medium text-slate-400">分群对比</p>
+      <Table data-upgrade-distribution>
+        <TableHeader>
+          <TableRow>
+            <TableHead>分群</TableHead>
+            <TableHead>{`v${from} 人数`}</TableHead>
+            <TableHead>{`v${to} 人数`}</TableHead>
+            <TableHead>变化</TableHead>
+            <TableHead>{`v${to} 占比`}</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {compareRows.map(s => {
+            const v1 = sideCount('before', s), v2 = sideCount('after', s);
+            const delta = v2 - v1;
+            return (
+              <TableRow key={s ?? '（无）'}>
+                <TableCell>{s ?? '（无）'}</TableCell>
+                <TableCell>{count(v1)}</TableCell>
+                <TableCell>{count(v2)}</TableCell>
+                <TableCell>{delta >= 0 ? `+${count(delta)}` : count(delta)}</TableCell>
+                <TableCell>{totalAfter > 0 ? `${((v2 / totalAfter) * 100).toFixed(1)}%` : '0.0%'}</TableCell>
+              </TableRow>
+            );
+          })}
+        </TableBody>
+      </Table>
+      <p className="text-xs font-medium text-slate-400">迁移矩阵（原分群 × 新分群，含没变的人，「（无）」是新增或移出）</p>
+      <Table data-upgrade-matrix>
+        <TableHeader>
+          <TableRow>
+            <TableHead>原分群 ＼ 新分群</TableHead>
+            {columns.map(a => <TableHead key={a ?? '（无）'}>{a ?? '（无）'}</TableHead>)}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {matrixRows.map(b => (
+            <TableRow key={b ?? '（无）'}>
+              <TableCell>{b ?? '（无）'}</TableCell>
+              {columns.map(a => (
+                <TableCell key={a ?? '（无）'} className={a === b ? 'text-slate-400' : undefined}>{count(moved(b, a))}</TableCell>
+              ))}
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
     </div>
   );
 }
