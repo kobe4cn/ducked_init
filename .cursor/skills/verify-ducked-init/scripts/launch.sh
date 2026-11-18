@@ -80,6 +80,12 @@ write_env_files() {
       [[ $llm_name == LLM_* ]] || continue
       echo "$llm_name=$(verify_sq "${!llm_name}")"
     done < <(compgen -v LLM_ || true)
+    # Copy TEMPLATE_TEST_VERSIONS only when the launch shell already set it.
+    # An unset variable stays unset: a default launch does not turn the test versions on,
+    # and a template auto-enabled while the flag is on locks at that newer version.
+    if [[ -n ${TEMPLATE_TEST_VERSIONS+x} ]]; then
+      echo "TEMPLATE_TEST_VERSIONS=$(verify_sq "$TEMPLATE_TEST_VERSIONS")"
+    fi
   } >"$STATE_DIR/app.env"
   {
     echo "RUN_ID=$(verify_sq "$RUN_ID")"
