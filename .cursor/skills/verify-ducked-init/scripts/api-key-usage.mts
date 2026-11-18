@@ -142,7 +142,8 @@ async function main() {
   const revokeId = q(`SELECT k.id FROM platform.api_keys k JOIN platform.tenants t ON t.id=k.tenant_id WHERE t.slug='verify' AND k.name='待吊销' AND k.revoked_at IS NULL`);
   const revokedRes = await http('POST', '/api-keys', { jar, form: { intent: 'revoke', keyId: revokeId } });
   assert(revokedRes.status === 302, `revoke status=${revokedRes.status}`);
-  assert(q(`SELECT (revoked_at IS NOT NULL)::text FROM platform.api_keys WHERE id='${revokeId}'`) === 't', 'key not revoked');
+  const revokedFlag = q(`SELECT (revoked_at IS NOT NULL)::text FROM platform.api_keys WHERE id='${revokeId}'`);
+  assert(revokedFlag === 'true', `key not revoked (got=${revokedFlag})`);
 
   const unauth = { error: '未授权：请在 Authorization 头里带上有效的 API Key（Bearer）' };
   for (const [label, token] of [['missing', undefined], ['wrong', 'not-a-real-key'], ['revoked', revoked]] as const) {
