@@ -229,6 +229,14 @@ const ACTIONS = {
   },
   'template.auto_enabled': { label: '自动启用模板', describe: (d: Detail) => `${templateLabel(d.template)}，按默认参数发布第 ${d.version} 版` },
   'template.upgrade_drafted': { label: '起草模板升级', describe: (d: Detail) => `${templateLabel(d.template)} 第 ${d.version} 版草稿，模板第 ${d.from} 版 → 第 ${d.to} 版` },
+  // 查看升级样例（#830）：只记点的格子 / 列与返回条数，不记 consumer_id
+  'template.preview_sampled': {
+    label: '查看模板升级样例',
+    describe: (d: Detail) => {
+      const cell = d.cell as { before: string | null; after: string | null } | undefined;
+      return `${templateLabel(d.template)} 第 ${d.from} 版 → 第 ${d.to} 版，${cell ? `分群 ${cell.before ?? '（无）'} → ${cell.after ?? '（无）'}` : `列 ${d.column}`}，返回 ${d.count} 条`;
+    },
+  },
   'template.recomputed': {
     label: '重新计算模板',
     describe: (d: Detail) => `${templateLabel(d.template)}，按第 ${d.version} 版参数，参考日期 ${d.asOf}`,

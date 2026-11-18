@@ -5,8 +5,10 @@
 // 也可以按当前生效的版本重新计算（可指定参考日期），不产生新版本；依赖的实体有新合并后调度器按当天以生效版本重算（refresh.ts，ADR-0028）。
 // 任务参数与快照记下来源（发布、手动重新计算、定时刷新、平台自动启用时的发布）。映射合并成功后，平台以注册表里的默认参数自动启用
 // 本租户还没有定义、依赖的实体都已有已发布映射的模板（enableDefaultTemplates，不经双人发布，ADR-0021）。
-// 注册表有了比生效版本锁定的更新的模板版本时，成员可以预览升级后的差异（只读、只出计数），确认后起草一版锁定新模板版本的草稿，照常双人发布。
+// 注册表有了比生效版本锁定的更新的模板版本时，成员可以预览升级后的差异（只读、计数与统计量，ADR-0025），有结果层查看权限的成员可以再点格子或输出列
+// 查看最多 10 个样例消费者在两版下的全部输出列（#830，每次写审计），预览还列出下游影响：这个模板进服务库的表与读取它的对外接口。确认后起草一版锁定新模板版本的草稿，照常双人发布。
 // 一律限定在操作者所属租户内
+import type { DuckDBConnection } from '@duckdb/node-api';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit, type Tx } from './audit';
@@ -21,6 +23,7 @@ import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
 import { cmp } from '../lib/compare';
 import { ident, lit } from '../lib/mapping-expr';
 import { rows } from './pipeline/duck-sql';
+import { currentServingStore } from './serving-store';
 import { latestTemplate, missingTableHint, TASK_KINDS, templateAt, TEMPLATES, type Template, type TemplateId } from './pipeline/templates';
 import { summarizeColumnUpgrade, summarizeSegmentUpgrade, type ColumnStat, type ColumnType, type NumberStat } from './pipeline/templates/upgrade-summary';
 import { insertTask } from './tasks';
@@ -261,7 +264,9 @@ export async function recomputeTemplate(actor: CurrentMember, id: string, asOf?:
 
 /** 升级的起点：生效的已发布版本锁定的模板版本比当前版本旧；没有已发布版本或已是当前版本时报错 */
 async function requireUpgradable(db: Tx | Db, tenantId: string, template: TemplateId) {
-  const [published] = await db.select({ version: templateVersions.version, params: templateVersions.params, templateVersion: templateVersions.templateVersion })
+  const [published] = await db.select({
+    definitionId: templateVersions.definitionId, version: templateVersions.version, params: templateVersions.params, templateVersion: templateVersions.templateVersion,
+  })
     .from(templateVersions)
     .innerJoin(templateDefinitions, eq(templateDefinitions.id, templateVersions.definitionId))
     .where(and(ofDefinition(tenantId, template), eq(templateVersions.status, 'published')))
@@ -282,17 +287,21 @@ const columnKind = (t: string): ColumnType => {
   return NUMBER_TYPE_PREFIXES.some(p => upper.startsWith(p)) && !upper.endsWith('[]') ? 'number' : 'other';
 };
 
+/** 升级预览 / 样例共用的准备结果（withUpgradedSqls 交给 run 的上下文）：生效与最新版本、两版编译出的 SQL 与统计日 */
+type UpgradeCtx = Awaited<ReturnType<typeof requireUpgradable>> & {
+  con: DuckDBConnection;
+  /** 统计日（asOf，不给时为当天，UTC） */
+  day: string;
+  oldSql: string;
+  newSql: string;
+};
+
 /**
- * 预览升级差异：需要定义查看权限。以生效版本的参数加上参考日期 asOf（不给时为当天，UTC；不能晚于今天），分别按它锁定的模板版本与当前版本编译，
- * 在只读挂载的数据湖上按 consumer_id 对比，只给计数与统计量（ADR-0025）：RFM 是分群迁移（原分群 → 新分群的人数）加 v1 / v2 各分群人数、完整迁移矩阵
- * （含没变的人）与一句话结论（upgrade-summary.ts，不调模型），其他模板是换了取值、新增、移出的人数加每个输出列（不含 consumer_id）的 v1 / v2 统计量
- * （布尔列是的人数、数值列是均值 / 中位数 / P90、文本列是人数最多的前 10 个取值、其余只给非空人数）与一句话结论，不输出单个消费者的取值。
- * 不出 consumer_id，不建表、不入队任务、不登记快照。已是当前版本时报「已是最新模板版本」，当前版本不接受生效的参数时说明原因
+ * 升级预览与样例（#830）共用的准备：以生效版本的参数加上参考日期 asOf（不给时为当天，UTC；不能晚于今天），分别按它锁定的模板版本与当前版本编译，
+ * 在只读挂载的数据湖上运行 run（what 是操作名，报错时用）。不建表、不入队任务、不登记快照。已是当前版本时报「已是最新模板版本」，当前版本不接受生效的参数时说明原因
  */
-export async function previewTemplateUpgrade(actor: CurrentMember, id: string, asOf?: string) {
-  assertCan(actor, 'definitions:read');
-  const template = requireTemplate(id);
-  const { published, latest } = await requireUpgradable(getDb(), actor.tenant.id, template);
+async function withUpgradedSqls<T>(tenantId: string, template: TemplateId, asOf: string | undefined, what: string, run: (ctx: UpgradeCtx) => Promise<T>) {
+  const { published, latest } = await requireUpgradable(getDb(), tenantId, template);
   const locked = lockedTemplate(template, published.templateVersion);
   const day = asOf || todayUtc();
   const before = validated(() => locked.parse({ ...published.params, asOf: day }));
@@ -302,96 +311,220 @@ export async function previewTemplateUpgrade(actor: CurrentMember, id: string, a
   const tables = [...new Set([...locked.requires, ...locked.optional ?? [], ...latest.requires, ...latest.optional ?? []])];
   const entities = [...new Set([...locked.entities, ...latest.entities])];
   try {
-    return await onReadOnlyLake(actor.tenant.id, entities, [], '预览升级差异', async con => {
+    return await onReadOnlyLake(tenantId, entities, [], what, async con => {
       const present = new Set((await rows<{ name: string }>(con, `
         SELECT table_name AS name FROM information_schema.tables
         WHERE table_catalog = 'lake' AND table_schema = 'silver' AND table_name IN (${tables.map(lit).join(', ')})`)).map(t => t.name));
       const missing = [...locked.requires, ...latest.requires].find(t => !present.has(t));
-      if (missing) throw new DslError(`${missingTableHint(missing)}，再预览升级差异`);
+      if (missing) throw new DslError(`${missingTableHint(missing)}，再${what}`);
       const has = (t: string) => present.has(t);
-      const oldSql = locked.compile(before, has), newSql = latest.compile(after, has);
-      const segment = (sql: string) => `SELECT consumer_id, segment AS tag_value FROM (${sql})`;
-      if (template !== 'rfm') {
-        const metric = (await rows<DiffCounts>(con, compileMetricDiff(oldSql, newSql)))[0]!;
-        // 按列对比（#858）：列名从两边的 DESCRIBE 取并集（不含 consumer_id），按码点排序（ADR-0045：列名是内部键）；两边类型不一致以 v2 为准
-        const described = async (sql: string) => new Map((await rows<{ column_name: string; column_type: string }>(con, `DESCRIBE (${sql})`)).map(c => [c.column_name, c.column_type]));
-        const oldTypes = await described(oldSql), newTypes = await described(newSql);
-        const names = [...new Set([...oldTypes.keys(), ...newTypes.keys()])].filter(n => n !== 'consumer_id').sort(cmp);
-        // 换了取值的人数：两边都有的列才比（IS DISTINCT FROM 连 null 与 null 也算没变）；只有一边有的列 changed 为 null
-        const shared = names.filter(n => oldTypes.has(n) && newTypes.has(n));
-        const changedCounts = shared.length > 0
-          ? (await rows<Record<string, number>>(con, `
-            WITH o AS (${oldSql}),
-            n AS (${newSql})
-            SELECT ${shared.map(n => `count(*) FILTER (WHERE o.${ident(n)} IS DISTINCT FROM n.${ident(n)})::INTEGER AS ${ident(n)}`).join(', ')}
-            FROM o JOIN n ON n.${ident('consumer_id')} = o.${ident('consumer_id')}`))[0]!
-          : {};
-        // 每列在 v1、v2 各算一份统计（计数转 ::INTEGER、统计量转 ::DOUBLE：getRowObjectsJson 里 BIGINT / DECIMAL 是字符串）；
-        // DECIMAL 先 CAST 成 DOUBLE 再聚合；文本列只给人数最多的前 10 个取值，超过不另标注
-        const boolStat = async (sql: string, c: string) => (await rows<{ yes: number }>(con, `SELECT count(*) FILTER (WHERE ${c})::INTEGER AS yes FROM (${sql})`))[0]!;
-        const numberStat = async (sql: string, c: string): Promise<NumberStat> => (await rows<NumberStat>(con, `
-          SELECT avg(CAST(${c} AS DOUBLE))::DOUBLE AS mean, median(CAST(${c} AS DOUBLE))::DOUBLE AS median,
-            quantile_cont(CAST(${c} AS DOUBLE), 0.9)::DOUBLE AS p90 FROM (${sql})`))[0]!;
-        const textStat = async (sql: string, c: string) => ({ values: await rows<{ value: string | null; consumers: number }>(con, `
-          SELECT ${c} AS value, count(*)::INTEGER AS consumers FROM (${sql}) GROUP BY ${c} ORDER BY count(*) DESC, ${c} LIMIT 10`) });
-        const otherStat = async (sql: string, c: string) => (await rows<{ nonNull: number }>(con, `SELECT count(${c})::INTEGER AS nonNull FROM (${sql})`))[0]!;
-        // 同一列两边的统计形状一样（type 以 v2 为准），pair 在这一列两边都在时各算一份，只有一边有时缺的一边为 null
-        const pair = async <S>(stat: (sql: string) => Promise<S>, name: string) => ({
-          before: oldTypes.has(name) ? await stat(oldSql) : null,
-          after: newTypes.has(name) ? await stat(newSql) : null,
-        });
-        const columns: ColumnStat[] = [];
-        for (const name of names) {
-          const c = ident(name), type = columnKind(newTypes.get(name) ?? oldTypes.get(name)!), changed = shared.includes(name) ? changedCounts[name]! : null;
-          if (type === 'bool') columns.push({ name, type, ...await pair(sql => boolStat(sql, c), name), changed });
-          else if (type === 'number') columns.push({ name, type, ...await pair(sql => numberStat(sql, c), name), changed });
-          else if (type === 'text') columns.push({ name, type, ...await pair(sql => textStat(sql, c), name), changed });
-          else columns.push({ name, type, ...await pair(sql => otherStat(sql, c), name), changed });
-        }
-        const totalOf = async (sql: string) => (await rows<{ n: number }>(con, `SELECT count(*)::INTEGER AS n FROM (${sql})`))[0]!.n;
-        const total = { before: await totalOf(oldSql), after: await totalOf(newSql) };
-        return {
-          template,
-          from: published.templateVersion,
-          to: latest.version,
-          asOf: day,
-          segments: null,
-          metric,
-          /** 每个输出列（不含 consumer_id）的 v1 / v2 统计量与换了取值的人数（只有计数与统计量，ADR-0025） */
-          distribution: { kind: 'columns' as const, total, columns },
-          /** 一句话结论：由代码从计数与统计量生成，不调用模型 */
-          summary: summarizeColumnUpgrade(metric, columns, total),
-        };
-      }
-      // RFM 在同一个只读连接上多跑各分群人数与完整迁移（compileTagDiff 去掉 WHERE：含没变的人）。
-      // 迁移 SQL 内联在这里：dsl-definitions 的标签影响预览还在用 impact.ts 的版本，不改它
-      const segmentCounts = (sql: string) => rows<{ segment: string; consumers: number }>(con, `
-        SELECT tag_value AS segment, count(*)::INTEGER AS consumers FROM (${segment(sql)}) GROUP BY tag_value ORDER BY tag_value`);
-      const matrix = await rows<TagTransition>(con, `
-        WITH o AS (${segment(oldSql)}),
-        n AS (${segment(newSql)})
-        SELECT o.tag_value AS before, n.tag_value AS after, count(*)::INTEGER AS consumers
-        FROM o FULL JOIN n ON n.consumer_id = o.consumer_id
-        GROUP BY ALL
-        ORDER BY ALL NULLS FIRST`);
-      return {
-        template,
-        from: published.templateVersion,
-        to: latest.version,
-        asOf: day,
-        /** 分群迁移，取值没变的人不出现 */
-        segments: await rows<TagTransition>(con, compileTagDiff(segment(oldSql), segment(newSql))),
-        metric: null,
-        /** v1 / v2 各分群人数与「原分群 × 新分群」迁移矩阵（含没变的人；新增、移出的一边为 null） */
-        distribution: { kind: 'segments' as const, before: await segmentCounts(oldSql), after: await segmentCounts(newSql), matrix },
-        /** 一句话结论：由代码从矩阵计数生成，不调用模型 */
-        summary: summarizeSegmentUpgrade(matrix),
-      };
+      return run({ published, latest, con, day, oldSql: locked.compile(before, has), newSql: latest.compile(after, has) });
     });
   } catch (e) {
     if (e instanceof DslError) throw new TemplateError(e.message);
     throw e;
   }
+}
+
+/**
+ * 预览升级差异：需要定义查看权限。计数与统计量（ADR-0025）：RFM 是分群迁移（原分群 → 新分群的人数）加 v1 / v2 各分群人数、完整迁移矩阵
+ * （含没变的人）与一句话结论（upgrade-summary.ts，不调模型），其他模板是换了取值、新增、移出的人数加每个输出列（不含 consumer_id）的 v1 / v2 统计量
+ * （布尔列是的人数、数值列是均值 / 中位数 / P90、文本列是人数最多的前 10 个取值、其余只给非空人数）与一句话结论，不输出单个消费者的取值。
+ * 不出 consumer_id，不建表、不入队任务、不登记快照；单个消费者的样例由 sampleTemplateUpgrade 另行按需给出（要结果层查看权限）。
+ * 已是当前版本时报「已是最新模板版本」，当前版本不接受生效的参数时说明原因
+ */
+export async function previewTemplateUpgrade(actor: CurrentMember, id: string, asOf?: string) {
+  assertCan(actor, 'definitions:read');
+  const template = requireTemplate(id);
+  return withUpgradedSqls(actor.tenant.id, template, asOf, '预览升级差异', async ({ con, published, latest, day, oldSql, newSql }) => {
+    const segment = (sql: string) => `SELECT consumer_id, segment AS tag_value FROM (${sql})`;
+    if (template !== 'rfm') {
+      const metric = (await rows<DiffCounts>(con, compileMetricDiff(oldSql, newSql)))[0]!;
+      // 按列对比（#858）：列名从两边的 DESCRIBE 取并集（不含 consumer_id），按码点排序（ADR-0045：列名是内部键）；两边类型不一致以 v2 为准
+      const described = async (sql: string) => new Map((await rows<{ column_name: string; column_type: string }>(con, `DESCRIBE (${sql})`)).map(c => [c.column_name, c.column_type]));
+      const oldTypes = await described(oldSql), newTypes = await described(newSql);
+      const names = [...new Set([...oldTypes.keys(), ...newTypes.keys()])].filter(n => n !== 'consumer_id').sort(cmp);
+      // 换了取值的人数：两边都有的列才比（IS DISTINCT FROM 连 null 与 null 也算没变）；只有一边有的列 changed 为 null
+      const shared = names.filter(n => oldTypes.has(n) && newTypes.has(n));
+      const changedCounts = shared.length > 0
+        ? (await rows<Record<string, number>>(con, `
+          WITH o AS (${oldSql}),
+          n AS (${newSql})
+          SELECT ${shared.map(n => `count(*) FILTER (WHERE o.${ident(n)} IS DISTINCT FROM n.${ident(n)})::INTEGER AS ${ident(n)}`).join(', ')}
+          FROM o JOIN n ON n.${ident('consumer_id')} = o.${ident('consumer_id')}`))[0]!
+        : {};
+      // 每列在 v1、v2 各算一份统计（计数转 ::INTEGER、统计量转 ::DOUBLE：getRowObjectsJson 里 BIGINT / DECIMAL 是字符串）；
+      // DECIMAL 先 CAST 成 DOUBLE 再聚合；文本列只给人数最多的前 10 个取值，超过不另标注
+      const boolStat = async (sql: string, c: string) => (await rows<{ yes: number }>(con, `SELECT count(*) FILTER (WHERE ${c})::INTEGER AS yes FROM (${sql})`))[0]!;
+      const numberStat = async (sql: string, c: string): Promise<NumberStat> => (await rows<NumberStat>(con, `
+        SELECT avg(CAST(${c} AS DOUBLE))::DOUBLE AS mean, median(CAST(${c} AS DOUBLE))::DOUBLE AS median,
+          quantile_cont(CAST(${c} AS DOUBLE), 0.9)::DOUBLE AS p90 FROM (${sql})`))[0]!;
+      const textStat = async (sql: string, c: string) => ({ values: await rows<{ value: string | null; consumers: number }>(con, `
+        SELECT ${c} AS value, count(*)::INTEGER AS consumers FROM (${sql}) GROUP BY ${c} ORDER BY count(*) DESC, ${c} LIMIT 10`) });
+      const otherStat = async (sql: string, c: string) => (await rows<{ nonNull: number }>(con, `SELECT count(${c})::INTEGER AS nonNull FROM (${sql})`))[0]!;
+      // 同一列两边的统计形状一样（type 以 v2 为准），pair 在这一列两边都在时各算一份，只有一边有时缺的一边为 null
+      const pair = async <S>(stat: (sql: string) => Promise<S>, name: string) => ({
+        before: oldTypes.has(name) ? await stat(oldSql) : null,
+        after: newTypes.has(name) ? await stat(newSql) : null,
+      });
+      const columns: ColumnStat[] = [];
+      for (const name of names) {
+        const c = ident(name), type = columnKind(newTypes.get(name) ?? oldTypes.get(name)!), changed = shared.includes(name) ? changedCounts[name]! : null;
+        if (type === 'bool') columns.push({ name, type, ...await pair(sql => boolStat(sql, c), name), changed });
+        else if (type === 'number') columns.push({ name, type, ...await pair(sql => numberStat(sql, c), name), changed });
+        else if (type === 'text') columns.push({ name, type, ...await pair(sql => textStat(sql, c), name), changed });
+        else columns.push({ name, type, ...await pair(sql => otherStat(sql, c), name), changed });
+      }
+      const totalOf = async (sql: string) => (await rows<{ n: number }>(con, `SELECT count(*)::INTEGER AS n FROM (${sql})`))[0]!.n;
+      const total = { before: await totalOf(oldSql), after: await totalOf(newSql) };
+      return {
+        template,
+        from: published.templateVersion,
+        to: latest.version,
+        asOf: day,
+        segments: null,
+        metric,
+        /** 每个输出列（不含 consumer_id）的 v1 / v2 统计量与换了取值的人数（只有计数与统计量，ADR-0025） */
+        distribution: { kind: 'columns' as const, total, columns },
+        /** 一句话结论：由代码从计数与统计量生成，不调用模型 */
+        summary: summarizeColumnUpgrade(metric, columns, total),
+      };
+    }
+    // RFM 在同一个只读连接上多跑各分群人数与完整迁移（compileTagDiff 去掉 WHERE：含没变的人）。
+    // 迁移 SQL 内联在这里：dsl-definitions 的标签影响预览还在用 impact.ts 的版本，不改它
+    const segmentCounts = (sql: string) => rows<{ segment: string; consumers: number }>(con, `
+      SELECT tag_value AS segment, count(*)::INTEGER AS consumers FROM (${segment(sql)}) GROUP BY tag_value ORDER BY tag_value`);
+    const matrix = await rows<TagTransition>(con, `
+      WITH o AS (${segment(oldSql)}),
+      n AS (${segment(newSql)})
+      SELECT o.tag_value AS before, n.tag_value AS after, count(*)::INTEGER AS consumers
+      FROM o FULL JOIN n ON n.consumer_id = o.consumer_id
+      GROUP BY ALL
+      ORDER BY ALL NULLS FIRST`);
+    return {
+      template,
+      from: published.templateVersion,
+      to: latest.version,
+      asOf: day,
+      /** 分群迁移，取值没变的人不出现 */
+      segments: await rows<TagTransition>(con, compileTagDiff(segment(oldSql), segment(newSql))),
+      metric: null,
+      /** v1 / v2 各分群人数与「原分群 × 新分群」迁移矩阵（含没变的人；新增、移出的一边为 null） */
+      distribution: { kind: 'segments' as const, before: await segmentCounts(oldSql), after: await segmentCounts(newSql), matrix },
+      /** 一句话结论：由代码从矩阵计数生成，不调用模型 */
+      summary: summarizeSegmentUpgrade(matrix),
+    };
+  });
+}
+
+/** 样例消费者的一行：这个人在 v1、v2 下的全部输出列（不含 consumer_id；只有一边有的列那一边为 null） */
+export interface UpgradeSampleRow { consumerId: string; before: Record<string, unknown>; after: Record<string, unknown> }
+
+/** 查看升级样例的结果：点的格子（RFM）或输出列（其他模板）、两版输出列的并集（按码点排序）与样例行（最多 10 个，按 consumer_id 排序） */
+export interface UpgradeSample {
+  template: TemplateId;
+  from: number;
+  to: number;
+  asOf: string;
+  pick: { kind: 'cell'; before: string | null; after: string | null } | { kind: 'column'; column: string };
+  /** 两版输出列的并集（不含 consumer_id，按码点排序），样例行两边都按它给值 */
+  columns: string[];
+  rows: UpgradeSampleRow[];
+}
+
+/** 一次查看的样例上限（ADR-0025 补充：按需取样例，只读湖上现算、不缓存） */
+const SAMPLE_LIMIT = 10;
+
+/**
+ * 查看升级样例（#830）：需要结果层查看权限（没有这个权限的成员仍然只能看计数）。pick 指定看哪些人：RFM 是迁移矩阵的一格
+ * （before / after 是原、新分群，null 是「（无）」，与矩阵的口径一致）；其他模板是某个输出列的「换了取值」（只取两边都在且这一列换了取值的人）。
+ * 在只读湖上对两版做 FULL JOIN 按 consumer_id 现算（每点一次都重算，不缓存），最多 10 条、按 consumer_id 排序，给出两版的全部输出列。
+ * 不建表、不入队任务；每次查看写审计 template.preview_sampled（detail 只有模板、版本、格子 / 列与条数，不出 consumer_id）
+ */
+export async function sampleTemplateUpgrade(
+  actor: CurrentMember, id: string, pick: { before: string | null; after: string | null } | { column: string }, asOf?: string,
+): Promise<UpgradeSample> {
+  assertCan(actor, 'results:read');
+  const template = requireTemplate(id);
+  return withUpgradedSqls(actor.tenant.id, template, asOf, '查看升级样例', async ({ con, published, latest, day, oldSql, newSql }) => {
+    // 两版输出列的并集（不含 consumer_id，按码点排序，与按列对比同一口径）；只有一边有的列那一栏给 null
+    const namesOf = async (sql: string) => new Set((await rows<{ column_name: string }>(con, `DESCRIBE (${sql})`)).map(c => c.column_name));
+    const oldNames = await namesOf(oldSql), newNames = await namesOf(newSql);
+    const columns = [...new Set([...oldNames, ...newNames])].filter(n => n !== 'consumer_id').sort(cmp);
+    // 取样例的 WHERE：列名先验证再拼进 SQL（不拼接用户输入以外的内容，且只在两版都有这一列时才比）
+    let where: string;
+    if (template === 'rfm') {
+      if (!('before' in pick) || !('after' in pick)) throw new TemplateError(`${TEMPLATES[template].label}的样例按迁移矩阵的格子取：要给原分群 before 与新分群 after`);
+      // NULL 表示新增 / 移出，与迁移矩阵的口径一致
+      where = `o.${ident('segment')} IS NOT DISTINCT FROM ${pick.before === null ? 'NULL' : lit(pick.before)}`
+        + ` AND n.${ident('segment')} IS NOT DISTINCT FROM ${pick.after === null ? 'NULL' : lit(pick.after)}`;
+    } else {
+      if (!('column' in pick)) throw new TemplateError(`${TEMPLATES[template].label}的样例按输出列取：要给列名 column`);
+      if (!columns.includes(pick.column)) throw new TemplateError(`模板没有输出列 ${pick.column}`);
+      if (!oldNames.has(pick.column) || !newNames.has(pick.column)) throw new TemplateError(`输出列 ${pick.column} 只在其中一版里有，不能取样例`);
+      // 只取两边都在的人（与按列对比的换了取值人数同一口径）
+      where = `o.${ident('consumer_id')} IS NOT NULL AND n.${ident('consumer_id')} IS NOT NULL AND o.${ident(pick.column)} IS DISTINCT FROM n.${ident(pick.column)}`;
+    }
+    const selected = await rows<Record<string, unknown>>(con, `
+      WITH o AS (${oldSql}),
+      n AS (${newSql})
+      SELECT coalesce(o.${ident('consumer_id')}, n.${ident('consumer_id')}) AS consumer_id,
+        ${columns.flatMap(c => [
+          `${oldNames.has(c) ? `o.${ident(c)}` : 'NULL'} AS ${ident(`v1_${c}`)}`,
+          `${newNames.has(c) ? `n.${ident(c)}` : 'NULL'} AS ${ident(`v2_${c}`)}`,
+        ]).join(', ')}
+      FROM o FULL JOIN n ON n.${ident('consumer_id')} = o.${ident('consumer_id')}
+      WHERE ${where}
+      ORDER BY consumer_id
+      LIMIT ${SAMPLE_LIMIT}`);
+    const samples: UpgradeSampleRow[] = selected.map(r => ({
+      consumerId: String(r.consumer_id),
+      before: Object.fromEntries(columns.map(c => [c, r[`v1_${c}`]])),
+      after: Object.fromEntries(columns.map(c => [c, r[`v2_${c}`]])),
+    }));
+    const picked = 'column' in pick ? { kind: 'column' as const, column: pick.column } : { kind: 'cell' as const, before: pick.before, after: pick.after };
+    await recordAudit(getDb(), {
+      tenantId: actor.tenant.id,
+      actor,
+      action: 'template.preview_sampled',
+      targetType: 'template',
+      targetId: published.definitionId,
+      detail: { template, from: published.templateVersion, to: latest.version, ...('column' in picked ? { column: picked.column } : { cell: { before: picked.before, after: picked.after } }), count: samples.length },
+    });
+    return { template, from: published.templateVersion, to: latest.version, asOf: day, pick: picked, columns, rows: samples };
+  });
+}
+
+/** 模板 → 它进服务库的表与读取这张表的对外接口（ADR-0004、0033：分析模板里目前只有 RFM 进服务库）；有新模板进服务库时在这里登记 */
+const SERVING_DOWNSTREAM: Partial<Record<TemplateId, { table: string; paths: string[] }>> = {
+  rfm: {
+    table: 'serving.rfm',
+    paths: ['GET /api/v1/consumers/:consumerId', 'GET /api/v1/consumers/by-source/:source/:customerId'],
+  },
+};
+
+/** 模板升级预览的「下游影响」（#830）：这个模板进服务库的表与读取它的对外接口路径 */
+export interface TemplateDownstream {
+  template: TemplateId;
+  /** 服务库里由这个模板生成的表；模板不进服务库、租户还没有服务库或没有这个模板的快照时为 null（「没有下游使用」） */
+  table: string | null;
+  /** 读取这张表的对外接口路径；没有下游时为空 */
+  paths: string[];
+}
+
+/**
+ * 模板的下游影响（#830）：需要定义查看权限。只读服务库指针，不改服务库代码：列出服务库里由这个模板生成的表与读取它的对外接口路径。
+ * 升级确认发布后以下一次计算产出的新快照为准，serving.build 成功后服务库切到新版——没有可查的切换时间，界面用固定文案说明。
+ * 模板不进服务库、租户还没有服务库或没有这个模板的快照时 table 为 null（「没有下游使用」）。按 API Key 统计读取次数要等有了调用记录（#912）
+ */
+export async function templateDownstream(actor: CurrentMember, id: string): Promise<TemplateDownstream> {
+  assertCan(actor, 'definitions:read');
+  const template = requireTemplate(id);
+  const downstream = SERVING_DOWNSTREAM[template];
+  if (!downstream) return { template, table: null, paths: [] };
+  const store = await currentServingStore(actor.tenant.id);
+  const inStore = (store?.snapshots ?? []).some(s => s.template === template);
+  return inStore ? { template, ...downstream } : { template, table: null, paths: [] };
 }
 
 /**
