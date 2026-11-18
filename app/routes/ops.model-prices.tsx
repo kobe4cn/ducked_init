@@ -90,29 +90,33 @@ export default function OpsModelPrices({ loaderData, actionData }: Route.Compone
       )}
 
       <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
-        <SectionHeader title="新增或修改单价">填已有模型名就是修改；保存相同的单价不会有任何变化，也不写审计。不同币种的金额不相加。</SectionHeader>
+        <SectionHeader title="新增或修改单价">单价按每百万 token 计。填已有模型名就是修改；保存相同的单价不会有任何变化，也不写审计。不同币种的金额不相加。</SectionHeader>
         <Form method="post">
           <input type="hidden" name="intent" value="save-price" />
-          <FieldGroup className="flex-row items-end">
-            <Field className="flex-1">
+          <FieldGroup className="gap-4">
+            <Field>
               <FieldLabel htmlFor="price-model">模型名</FieldLabel>
               <Input id="price-model" name="model" required placeholder="qwen-plus" />
             </Field>
-            <Field>
-              <FieldLabel htmlFor="price-input">输入单价</FieldLabel>
-              <Input id="price-input" name="inputPerMTok" required inputMode="decimal" placeholder="2.5" />
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="price-output">输出单价</FieldLabel>
-              <Input id="price-output" name="outputPerMTok" required inputMode="decimal" placeholder="10" />
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="price-currency">币种</FieldLabel>
-              <NativeSelect id="price-currency" name="currency" defaultValue="CNY">
-                {CURRENCIES.map(c => <NativeSelectOption key={c} value={c}>{c}</NativeSelectOption>)}
-              </NativeSelect>
-            </Field>
-            <Button type="submit" disabled={submitting}>保存</Button>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field>
+                <FieldLabel htmlFor="price-input">输入单价（每百万 token）</FieldLabel>
+                <Input id="price-input" name="inputPerMTok" required inputMode="decimal" placeholder="2.5" />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="price-output">输出单价（每百万 token）</FieldLabel>
+                <Input id="price-output" name="outputPerMTok" required inputMode="decimal" placeholder="10" />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="price-currency">币种</FieldLabel>
+                <NativeSelect id="price-currency" name="currency" defaultValue="CNY">
+                  {CURRENCIES.map(c => <NativeSelectOption key={c} value={c}>{c}</NativeSelectOption>)}
+                </NativeSelect>
+              </Field>
+            </div>
+            <div>
+              <Button type="submit" disabled={submitting}>保存</Button>
+            </div>
           </FieldGroup>
         </Form>
       </div>
