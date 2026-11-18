@@ -4,7 +4,7 @@
 // Bearer Key 打不开成员页面，也没有通往标准层、沙箱的接口；成员存下（并分享出去）的沙箱表不进服务库，也不出现在目录接口里
 import { randomUUID } from 'node:crypto';
 import { DuckDBInstance } from '@duckdb/node-api';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { sha256 } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -243,6 +243,9 @@ describe('目录接口', () => {
 async function servedTenant() {
   const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
   expect(await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' })).toMatchObject({ status: 'succeeded' });
+  // 映射合并已自动启用一张当天 asOf 的 rfm 快照（窗口里没有订单，是空表），服务库按统计日会选它；标记过期，让服务库与 of('rfm') 用上面这张有数据的
+  await getDb().update(snapshotsTable).set({ expiredAt: new Date() }).where(and(eq(snapshotsTable.tenantId, acme), eq(snapshotsTable.template, 'rfm'),
+    sql`${snapshotsTable.params}->>'asOf' <> '2024-07-01'`));
   await createDefinition(author, 'metric', 'revenue', REVENUE);
   await createDefinition(author, 'metric', 'revenue_by_city', `${REVENUE}dimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n`);
   await publishDefinition(reviewer, 'metric', 'revenue', 1);
@@ -252,7 +255,7 @@ async function servedTenant() {
   await publishDefinition(reviewer, 'tag', 'value_tier', 1);
   await drain();
   const snapshots = await listSnapshots(acme);
-  const of = (template: string) => snapshots.find(s => s.template === template)!;
+  const of = (template: string) => snapshots.find(s => s.template === template && !s.expiredAt)!;
   const table = (template: string) => `gold."${of(template).table.slice('gold.'.length)}"`;
   const [{ consumer_id: consumer }] = await onLake<{ consumer_id: string }>(acme,
     `SELECT t.consumer_id FROM ${table('tag:value_tier')} t JOIN ${table('rfm')} r USING (consumer_id) ORDER BY 1 LIMIT 1`);
