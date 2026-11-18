@@ -1,0 +1,3 @@
+{
+  "申请过于频繁，请 {minutes} 分钟后再试。": "Too many requests. Please try again in {minutes, plural, one {# minute.} other {# minutes.}}"
+}
