@@ -1,6 +1,6 @@
 // app/.server/model-prices.ts —— 运营后台维护的模型单价（ADR-0057）：llm_calls.model 原值 → 每百万 token 的输入 / 输出单价。
 // 金额按查看时的当前单价折算，不在 llm_calls 上存调用时单价，也不保留历史版本；每次改动的前后值在审计里，可重建价格历史。
-// 单价只能增改、不能删除；本模块只管平台元数据，不碰任何租户的调用数据（ADR-0007）
+// 单价可增改可删除（删除后该模型的调用显示「未配置单价」，删除前的值在审计里）；本模块只管平台元数据，不碰任何租户的调用数据（ADR-0007）
 import { eq } from 'drizzle-orm';
 import { cmp } from '../lib/compare';
 import { recordAudit, type OperatorActor } from './audit';
@@ -162,4 +162,25 @@ export async function upsertModelPrice(operator: OperatorActor, raw: Record<stri
     if (isUniqueViolation(e)) throw new ModelPriceError(`已有模型 ${price.model} 的单价，请刷新后重试`);
     throw e;
   }
+}
+
+/**
+ * 删除一个模型的单价（ADR-0057）：删除后该模型的调用按「未配置单价」处理，删除前的值写进审计，可照着重新填回。
+ * 模型不存在（已被别人删掉或从未配置）是业务错误
+ */
+export async function deleteModelPrice(operator: OperatorActor, rawModel: unknown) {
+  const model = String(rawModel ?? '').trim();
+  if (!model) throw new ModelPriceError('缺少模型名');
+  await getDb().transaction(async tx => {
+    const [existing] = await tx.delete(modelPrices).where(eq(modelPrices.model, model)).returning();
+    if (!existing) throw new ModelPriceError(`没有模型 ${model} 的单价，可能已被删除，请刷新`);
+    await recordAudit(tx, {
+      tenantId: null,
+      operator,
+      action: 'model_price.deleted',
+      targetType: 'model_price',
+      targetId: model,
+      detail: { model, ...detailOf(toPrice(existing)) },
+    });
+  });
 }

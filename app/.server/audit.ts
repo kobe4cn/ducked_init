@@ -393,6 +393,10 @@ const ACTIONS = {
       return `${d.model}：输入 ${from.inputPerMTok} → ${to.inputPerMTok}、输出 ${from.outputPerMTok} → ${to.outputPerMTok}（${from.currency} → ${to.currency}）`;
     },
   },
+  'model_price.deleted': {
+    label: '删除模型单价',
+    describe: (d: Detail) => `${d.model}：删除前 输入 ${d.inputPerMTok}、输出 ${d.outputPerMTok} ${d.currency} / 百万 token`,
+  },
 } satisfies Record<string, { label: string; describe: (d: Detail) => string }>;
 export type AuditAction = keyof typeof ACTIONS;
 

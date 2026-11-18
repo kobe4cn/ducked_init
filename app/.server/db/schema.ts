@@ -752,7 +752,7 @@ export const llmCalls = platform.table('llm_calls', {
 }, t => [index('llm_calls_tenant_created_idx').on(t.tenantId, t.createdAt)]);
 
 // 模型单价（ADR-0057）：llm_calls.model 原值 → 每百万 token 的输入 / 输出单价，运营者在运营后台维护（ADR-0007）。
-// 金额按查看时的当前单价折算，不保留历史版本，每次改动的前后值在审计里；只能增改、不能删除
+// 金额按查看时的当前单价折算，不保留历史版本，每次改动的前后值与删除前的值在审计里；可增改可删除
 export const modelPrices = platform.table('model_prices', {
   id: uuid('id').primaryKey().defaultRandom(),
   model: text('model').notNull().unique(),
