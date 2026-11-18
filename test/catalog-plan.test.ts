@@ -127,7 +127,16 @@ describe('分析计划校验 validatePlan()：硬性检查', () => {
     const absent = validatePlan({ ...planOf(), selected: [{ id: 'metric:nope', semanticHash: 'x' }], steps: [] },
       { catalog: RETRIEVAL_CATALOG, retrieved: new Set(['metric:nope']) });
     expect(absent.status).toBe('invalid');
-    expect(absent.issues).toEqual([{ path: 'selected.0.id', entryId: 'metric:nope', message: '选中的条目不在可见目录里（无权限、未发布或已停用）' }]);
+    expect(absent.issues).toEqual([{ path: 'selected.0.id', entryId: 'metric:nope', message: '选中的条目不在可见目录里（无权限、未发布或已停用）', kind: 'hidden' }]);
+  });
+
+  it('只有「不在可见目录里」的问题带 kind: hidden，别的问题（不在本次检索结果里）不带（#930）', () => {
+    const absent = validatePlan({ ...planOf(), selected: [{ id: 'metric:nope', semanticHash: 'x' }], steps: [] },
+      { catalog: RETRIEVAL_CATALOG, retrieved: new Set(['metric:nope']) });
+    expect(absent.issues.every(i => i.kind === 'hidden')).toBe(true);
+
+    const notRetrieved = validatePlan(planOf(), { catalog: RETRIEVAL_CATALOG, retrieved: new Set() });
+    expect(notRetrieved.issues.every(i => i.kind === undefined)).toBe(true);
   });
 
   it('excluded 的 id 不在本次检索结果里返回 invalid（path excluded.N.id、带 entryId）；在检索结果里就合法、不查可见目录；与 selected 重复、缺 reason、步骤 inputs 引用 excluded 的条目都 invalid（#539）', () => {

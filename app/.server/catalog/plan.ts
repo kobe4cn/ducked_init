@@ -76,8 +76,9 @@ export interface AnalysisPlan {
 
 export type PlanStatus = 'valid' | 'needs_clarification' | 'unsupported' | 'invalid';
 
-/** 一条问题：path 是 JSON 路径（点分隔，如 selected.0.version），entryId 是涉及的目录条目，next 是建议的下一步 */
-export interface PlanIssue { path: string; entryId?: string; message: string; next?: string }
+/** 一条问题：path 是 JSON 路径（点分隔，如 selected.0.version），entryId 是涉及的目录条目，next 是建议的下一步；
+ *  kind 是问题类型，给助手按结构判断用（isHiddenIssue），不随 message 文字翻译（ADR-0060） */
+export interface PlanIssue { path: string; entryId?: string; message: string; next?: string; kind?: 'hidden' }
 
 /** 校验结果：结构合法时 plan 是原样解析回的计划，否则为 null */
 export interface PlanCheck { status: PlanStatus; plan: AnalysisPlan | null; issues: PlanIssue[] }
@@ -231,7 +232,7 @@ export function validatePlan(input: unknown, ctx: { catalog: Catalog; retrieved:
       raise('invalid');
     }
     if (!e) {
-      issues.push({ path: `selected.${i}.id`, entryId: s.id, message: '选中的条目不在可见目录里（无权限、未发布或已停用）' });
+      issues.push({ path: `selected.${i}.id`, entryId: s.id, message: '选中的条目不在可见目录里（无权限、未发布或已停用）', kind: 'hidden' });
       raise('invalid');
       continue;
     }
