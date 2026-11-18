@@ -1,17 +1,19 @@
 // app/.server/metric-parse.ts —— 一句话解析成指标表单（#516，ADR-0035）：模型把一句话解析成 MetricSpec（#514 的指标表单那一侧），
 // 补全 `->` 路径、转 YAML 后须过 checkMetric，再转成表单（formToYaml 兜底再校验）返回；只返回、不保存（之后照常保存草稿、双人发布）。
 // 同时带回逐项解析说明（items，path 用 spec 里的位置）、认不出的词（unknowns）与不支持的说法（unsupported），由提示词保证（model-draft.ts 的解析说明）。
-// 上下文取自本租户的语义目录（ADR-0041），敏感字段不进上下文（ADR-0005）；表单取自 YAML（ADR-0017：YAML 仍是唯一格式，ADR-0025）。
+// 上下文取自本租户的语义目录（ADR-0041），敏感字段不进上下文（ADR-0005）；检索与起草同一条路（draftSearch，#853：按成员权限的目录，
+// 租户开 hybrid_search 时带向量一路，ADR-0047、0049），句子有歧义时照常解析、带回歧义词与候选（ADR-0056）由页面提示成员；
+// 表单取自 YAML（ADR-0017：YAML 仍是唯一格式，ADR-0025）。
 // 失败记审计 definition.metric_parse_failed（stage / error / 问题数与位置，不含原句、解析说明与取值），成功不记审计
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
-import { tenantCatalog } from './catalog/load';
+import { draftSearch, type DraftAmbiguity } from './catalog/draft-search';
 import { getDb } from './db/client';
 import { dslContext } from './dsl-definitions';
 import { chatJson, LlmError, resolveProvider } from './llm';
 import { yamlToForm, formToYaml, type MetricForm } from '../lib/metric-form';
-import { completeDraftPaths, definitionOutputToYaml, METRIC_PARSE_SCHEMA, metricParseMessages } from './pipeline/dsl/model-draft';
+import { completeDraftPaths, definitionOutputToYaml, METRIC_PARSE_SCHEMA, metricParseMessages, SEARCH_LIMIT } from './pipeline/dsl/model-draft';
 import { checkMetric, fieldsFor, type DslIssue, type MetricSpec } from './pipeline/dsl/metric-spec';
 
 /** 句子最多的字数 */
@@ -35,7 +37,7 @@ interface ParseOutput {
  * 没配置模型服务 409、不发请求；模型失败或转出的定义不过校验时记审计 definition.metric_parse_failed（不含原句）并抛 422
  */
 export async function parseMetricSentence(actor: CurrentMember, sentence: string): Promise<
-  { form: MetricForm; items: { path: string; reason: string }[]; unknowns: string[]; unsupported: string[] }
+  { form: MetricForm; items: { path: string; reason: string }[]; unknowns: string[]; unsupported: string[]; ambiguity: DraftAmbiguity | null }
 > {
   assertCan(actor, 'definitions:draft');
   if (!sentence.trim()) throw new MetricParseError('请先写一句话', 400);
@@ -46,9 +48,11 @@ export async function parseMetricSentence(actor: CurrentMember, sentence: string
   const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
     tenantId, actor, action: 'definition.metric_parse_failed', targetType: 'definition', detail,
   });
+  // 检索与起草同一条路（draftSearch，#853）：按成员权限的目录与条目，句子有歧义时照常解析、带回提示
+  const { catalog, entries, ambiguity } = await draftSearch(actor, sentence, SEARCH_LIMIT);
   let out: ParseOutput;
   try {
-    out = await chatJson<ParseOutput>(tenantId, 'metric_parse', metricParseMessages(sentence, await tenantCatalog(tenantId)), METRIC_PARSE_SCHEMA);
+    out = await chatJson<ParseOutput>(tenantId, 'metric_parse', metricParseMessages(sentence, catalog, entries), METRIC_PARSE_SCHEMA);
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
     await failed({ stage: 'model', error: e.message.slice(0, 200) });
@@ -66,5 +70,5 @@ export async function parseMetricSentence(actor: CurrentMember, sentence: string
   const form = yamlToForm(yaml, fields);
   const formChecked = checkMetric(formToYaml(form, fields), ctx);
   if (!formChecked.ok) await reject('form', formChecked.issues);
-  return { form, items: out.items, unknowns: out.unknowns, unsupported: out.unsupported };
+  return { form, items: out.items, unknowns: out.unknowns, unsupported: out.unsupported, ambiguity };
 }

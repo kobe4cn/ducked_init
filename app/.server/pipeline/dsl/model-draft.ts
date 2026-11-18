@@ -7,14 +7,12 @@
 import { Document } from 'yaml';
 import { CAPABILITIES } from '../../catalog/capabilities';
 import { estimateTokens, layeredContext, OVERVIEW_TOKENS, toMarkdown, type Catalog, type CatalogEntry } from '../../catalog';
-import { deriveProjection } from '../../catalog/projection';
-import { rank } from '../../catalog/rank';
 import type { LlmMessage, LlmPurpose } from '../../llm';
 import { CONSUMER_ENTITY, METRIC_SCHEMA, type MetricSpec, type RatioPart } from './metric-spec';
 import type { DslKind } from './index';
 import { SINGLE_TAG_SCHEMA } from './tag-spec';
 
-/** 按需求搜出的条目最多几条（起草的检索由 catalog/draft-search.ts 取，这里是截断上限） */
+/** 按需求搜出的条目最多几条（起草与一句话解析的检索都由 catalog/draft-search.ts 取，这里是截断上限） */
 export const SEARCH_LIMIT = 15;
 /** 搜出的条目估算最多多少 token，超过时减少条数 */
 const SEARCH_TOKENS = 6000;
@@ -83,12 +81,6 @@ const DRAFTS = {
 export const definitionDraftSchema = (kind: DslKind) => DRAFTS[kind].schema;
 export const definitionDraftPurpose = (kind: DslKind) => DRAFTS[kind].purpose;
 
-/** 一句话解析的条目排序（rank，内存里派生的 full 投影），需求评测脚本（不读库）也拿它拼同一份消息：起草已改用 catalog/draft-search.ts（#827），
- * 一句话解析换检索后这里删掉；能力说明已在 system 里，排序前就去掉它的投影行，不占依赖展开的名额 */
-export function rankedEntries(catalog: Catalog, request: string): CatalogEntry[] {
-  return rank(deriveProjection(catalog, 'full').filter(r => !r.entryId.startsWith('capability:')), catalog, request, {}, SEARCH_LIMIT).map(r => r.entry);
-}
-
 /** 排序出的条目的 Markdown，估算超过 SEARCH_TOKENS 时减少条数 */
 function relevantMarkdown(hits: CatalogEntry[]): string {
   for (let n = hits.length; n > 0; n--) {
@@ -137,10 +129,10 @@ export const METRIC_PARSE_SCHEMA = {
 
 /**
  * 一句话解析成指标表单（#516）发给模型的消息，结构与 definitionDraftMessages 相同：
- * system 是指标规则（共用）加解析说明，user 依次是目录分层上下文（第一层分组、相关分组的组内列表）、按句子搜出的条目与句子原文
+ * system 是指标规则（共用）加解析说明，user 依次是目录分层上下文（第一层分组、相关分组的组内列表）、按句子搜出的条目与句子原文；
+ * 条目由调用方经 catalog/draft-search.ts 排好传入（#853，与起草同一条检索），这里只按 SEARCH_TOKENS 截断
  */
-export function metricParseMessages(sentence: string, catalog: Catalog): LlmMessage[] {
-  const ranked = rankedEntries(catalog, sentence);
+export function metricParseMessages(sentence: string, catalog: Catalog, ranked: CatalogEntry[]): LlmMessage[] {
   const user = [layeredContext(catalog, ranked, OVERVIEW_TOKENS), `# 与需求相关的条目\n\n${relevantMarkdown(ranked)}`, `# 句子\n\n${sentence}`].join('\n\n');
   return [
     { role: 'system', content: METRIC_PARSE_SYSTEM },

@@ -4,12 +4,14 @@
 // 与 plan-modes.ts 的期望比对。产品的 validate_plan 工具还没接入助手（P4⑮），这里的消息是评测自己拼的，接入后对齐
 import { stringify } from 'yaml';
 import { expand, layeredContext, OVERVIEW_TOKENS, toMarkdown, type Catalog, type CatalogEntry } from '../../app/.server/catalog';
+import { deriveProjection } from '../../app/.server/catalog/projection';
+import { rank } from '../../app/.server/catalog/rank';
 import { AGGREGATE_FNS, PLAN_MODES, PLAN_SCHEMA, semanticHash, validatePlan, type PlanMode } from '../../app/.server/catalog/plan';
 import { CLAIM_TYPES } from '../../app/lib/semantic-claims';
 import { callModel, LlmError, type LlmMessage, type LlmProvider } from '../../app/.server/llm';
 import { DSL_KINDS, type DslKind } from '../../app/.server/pipeline/dsl';
 import type { MetricSpec, RatioPart } from '../../app/.server/pipeline/dsl/metric-spec';
-import { completeDraftPaths, definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml, rankedEntries } from '../../app/.server/pipeline/dsl/model-draft';
+import { completeDraftPaths, definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml, SEARCH_LIMIT } from '../../app/.server/pipeline/dsl/model-draft';
 import { tagMetrics, type TagSpec } from '../../app/.server/pipeline/dsl/tag-spec';
 import { CATALOG, CONTEXT, type GoldenCase, type GoldenEntry } from './golden';
 import { expectedMode } from './plan-modes';
@@ -119,6 +121,11 @@ function scoreStructure(kind: DslKind, expected: object, got: object | null): Pi
   const items = STRUCTURE[kind].length;
   return { structure, hits, items, hitRate: hits / items };
 }
+
+/** 按需求排序目录条目（内存里派生的 full 投影再 rank，能力条目不占名额）：评测脚本不读库，用不了产品侧的 draftSearch（#827/#853 起检索在读库那一侧），
+ *  用与它同一式子拼同一份消息 */
+const rankedEntries = (catalog: Catalog, request: string): CatalogEntry[] =>
+  rank(deriveProjection(catalog, 'full').filter(r => !r.entryId.startsWith('capability:')), catalog, request, {}, SEARCH_LIMIT).map(r => r.entry);
 
 /** 跑一个样例；期望本身不过校验、目录里没东西可用时直接抛错（黄金集写错了） */
 export async function runCase(provider: LlmProvider, c: GoldenCase): Promise<CaseResult> {

@@ -808,6 +808,32 @@ describe('一句话解析', () => {
     expect(await getDb().select().from(dslVersions)).toHaveLength(0);
   });
 
+  it('一句话里的词挂两个同别名指标时：解析照常填入构建器，解析面板上方出现「这些词有多种理解」与指向业务知识页的候选链接', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const reviewer = await memberOf(acme, 'de@acme.com', 'data_engineer');
+    // 两个窗口时间字段不同的指标挂同一个别名「营收」：检索判出歧义（与 YAML 模式的起草同一个判定，#827 / #853）
+    const windowed = (field: string) => `base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: ${field}, days: 30 }\n`;
+    for (const [key, field] of [['revenue_365d', 'created_at'], ['gmv_365d', 'paid_at']] as const) {
+      await createDefinition(analyst, 'metric', key, windowed(field));
+      await publishDefinition(reviewer, 'metric', key, 1);
+      await addAlias(analyst, { targetId: `metric:${key}`, alias: '营收' });
+    }
+
+    modelReplies(PARSE_REPLY);
+    const res = await (await loginAs(app, 'analyst@acme.com'))
+      .post('/analytics/definitions/new?kind=metric', { intent: 'parse', kind: 'metric', key: '', sentence: '营收' });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // 解析照常填入构建器（逐项说明照常），面板上方出现歧义提示：词、两个候选链接与说明
+    expect(builderFormOfHtml(html)).toMatchObject({ base: 'order', agg: 'sum', field: 'amount' });
+    expect(html).toContain('data-parse-items');
+    expect(html).toMatch(/data-ambiguity[^>]*>.*?这些词有多种理解/s);
+    expect(html).toMatch(/<a[^>]*href="\/knowledge\?item=metric%3Arevenue_365d"[^>]*>revenue_365d<\/a>/);
+    expect(html).toMatch(/<a[^>]*href="\/knowledge\?item=metric%3Agmv_365d"[^>]*>gmv_365d<\/a>/);
+    expect(html).toContain('请确认解析结果是否是你要的口径，或改写这句话');
+  });
+
   it('构建器已有不同内容时先列差异、表单不变，确认覆盖（applyParse）后才换成解析结果；parsed 读不出来 400', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'analyst@acme.com', 'analyst');
