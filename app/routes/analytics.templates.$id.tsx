@@ -331,9 +331,10 @@ function ColumnUpgradeDistribution({ from, to, distribution }: {
   // 布尔列的占比用该边自己的总人数算；数值列的 null（这一列全为 null）与缺列的一边都显示「—」
   const cell = (c: ColumnStat, side: 'before' | 'after') => {
     const total = distribution.total[side];
+    const percent = (n: number) => (total > 0 ? ((n / total) * 100).toFixed(1) : '0.0');
     if (c.type === 'bool') {
       const stat = c[side];
-      return stat === null ? '—' : `${count(stat.yes)} 人（${total > 0 ? ((stat.yes / total) * 100).toFixed(1) : '0.0'}%）`;
+      return stat === null ? '—' : `${count(stat.yes)} 人（${percent(stat.yes)}%）`;
     }
     if (c.type === 'number') {
       const stat = c[side];

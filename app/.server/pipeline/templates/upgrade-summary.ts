@@ -18,8 +18,7 @@ export interface BoolStat { yes: number }
 /** 数值列一边的统计量：均值、中位数、P90；这一列全为 null 时值是 null */
 export interface NumberStat { mean: number | null; median: number | null; p90: number | null }
 
-/** 文本列一边的统计量：人数最多的前 10 个取值（已按人数降序、同数按取值升序，超过 10 个不另标注） */
-/** value 为 null 是这一列为空的人（GROUP BY 把 NULL 也算一个取值），显示成「（无）」 */
+/** 文本列一边的统计量：人数最多的前 10 个取值（已按人数降序、同数按取值升序，超过 10 个不另标注）；value 为 null 是这一列为空的人（GROUP BY 把 NULL 也算一个取值），显示成「（无）」 */
 export interface TextStat { values: { value: string | null; consumers: number }[] }
 
 /** 其他类型（日期、列表等）列一边的统计量：非空人数 */
