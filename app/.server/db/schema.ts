@@ -1,6 +1,6 @@
 // app/.server/db/schema.ts —— 平台元数据（平台 PostgreSQL 的 platform schema）。业务数据不落这里（ADR-0002）
 import { sql } from 'drizzle-orm';
-import { bigint, boolean, check, index, integer, jsonb, numeric, pgSchema, primaryKey, real, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, check, date, index, integer, jsonb, numeric, pgSchema, primaryKey, real, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import type { CustomEntityField, CustomEntityKind, EntityRelation } from '../../lib/canonical-model';
 import type { KnowledgeSourceKind } from '../../lib/knowledge-source';
 import type { MergeRule } from '../../lib/merge-groups';
@@ -129,6 +129,16 @@ export const apiKeys = platform.table('api_keys', {
   lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
   revokedAt: timestamp('revoked_at', { withTimezone: true }),
 }, t => [index('api_keys_tenant_idx').on(t.tenantId, t.createdAt)]);
+
+// API Key 调用计数（ADR-0059）：外部点查接口成功返回时按 (租户, Key, endpoint, UTC 日) upsert 加 1，只记次数不记每次调用。
+// 只存 keyId 与 endpoint，不存 consumerId、IP、token；Key 只吊销不删行，行随删租户级联删掉
+export const apiKeyUsage = platform.table('api_key_usage', {
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  apiKeyId: uuid('api_key_id').notNull().references(() => apiKeys.id, { onDelete: 'cascade' }),
+  endpoint: text('endpoint').notNull(),
+  day: date('day').notNull(),
+  calls: integer('calls').notNull().default(0),
+}, t => [uniqueIndex('api_key_usage_key_day_idx').on(t.tenantId, t.apiKeyId, t.endpoint, t.day)]);
 
 // 成员个人令牌：平台外的 Agent 代表这位成员经 /mcp 接入（ADR-0042）。成员自己签发，明文只在签发时显示一次，库里只存 SHA-256；
 // prefix 是明文前 16 位（含 crm_pat_），用于辨认。权限不存在令牌上，每次按成员当前角色；成员被移除时级联删除。

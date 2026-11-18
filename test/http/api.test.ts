@@ -1,6 +1,7 @@
 // test/http/api.test.ts —— 外部系统接口的 HTTP 接缝：管理员在「API Key」页创建（明文只展示一次）、吊销；外部系统带 Bearer Key 调 /api/v1/catalog。
 // 非管理员看不到页面；没有 Key、Key 错误、已吊销、租户已暂停一律同样的 401，成员的 cookie 不算数；A 租户管理员吊销不了 B 的 Key，各自的 Key 只看到本租户的目录。
 // 点查 /api/v1/consumers/:id：数据由身份打通夹具、RFM 与已发布的指标、标签跑出快照，调度器自动生成服务库；?snapshot= 只读查湖里那张快照表。
+// 成功的点查按天记入 api_key_usage（ADR-0059，401/404/503/?snapshot= 不记），计数按租户隔离。
 // Bearer Key 打不开成员页面，也没有通往标准层、沙箱的接口；成员存下（并分享出去）的沙箱表不进服务库，也不出现在目录接口里
 import { randomUUID } from 'node:crypto';
 import { DuckDBInstance } from '@duckdb/node-api';
@@ -8,7 +9,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { sha256 } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { apiKeys, auditLogs, snapshots as snapshotsTable, sources as sourcesTable, spaces as spacesTable, tasks } from '../../app/.server/db/schema';
+import { apiKeyUsage, apiKeys, auditLogs, snapshots as snapshotsTable, sources as sourcesTable, spaces as spacesTable, tasks } from '../../app/.server/db/schema';
 import { API_ENDPOINTS } from '../../app/lib/api-docs';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow } from '../../app/.server/lake';
@@ -265,10 +266,10 @@ async function servedTenant() {
 }
 
 /**
- * 开通租户 globex：结果层一张 RFM 表，里面只有一个与 acme 的消费者同 ID 的人（人群 globex_only），登记成快照并生成服务库；返回租户、快照 ID 与它的 Key
+ * 开通另一个租户（默认 globex）：结果层一张 RFM 表，里面只有一个与 acme 的消费者同 ID 的人（人群 globex_only），登记成快照并生成服务库；返回租户、快照 ID 与它的 Key
  */
-async function otherTenant(consumer: string) {
-  const globex = await newTenant('globex');
+async function otherTenant(consumer: string, slug = 'globex') {
+  const globex = await newTenant(slug);
   const id = randomUUID();
   const table = `gold.rfm__${id}`;
   await onLake(globex, `CREATE TABLE gold."rfm__${id}" AS SELECT '${consumer}' AS consumer_id, 'globex_only' AS segment,
@@ -280,7 +281,7 @@ async function otherTenant(consumer: string) {
   await getDb().insert(snapshotsTable).values({
     id, tenantId: globex, template: 'rfm', taskId: task!.id, table, params: {}, rowCount: 1, expiresAt: new Date(Date.now() + 86_400_000),
   });
-  const { key } = await createKey(await loginAs(app, 'admin@globex.com'), '环球');
+  const { key } = await createKey(await loginAs(app, `admin@${slug}.com`), '环球');
   return { tenantId: globex, snapshot: id, key };
 }
 
@@ -490,6 +491,39 @@ describe('点查接口', () => {
     expect(await lookup('/api/v1/consumers/nobody', key)).toEqual({ status: 404, body: { error: expect.any(String) } });
     expect((await call(`/api/v1/consumers/${consumer}`)).status).toBe(401);
   });
+
+  it('成功的点查按天记入 api_key_usage：byId 与 bySource 各自加 1、重复调用同一行累加；404、?snapshot=、by-source 带 snapshot 400、没有 Key 401 都不记', async () => {
+    const { acme, of, sources, consumer, key } = shared;
+    const keyId = await keyIdOf(await loginAs(app, 'admin@acme.com'), '营销自动化');
+    const own = await loyaltyIdOf(acme, sources.loyalty, consumer);
+    // 共用夹具会被同组的其他用例调用，计数有累计：一律断言前后差值
+    const sumsOf = async () => {
+      const rows = await getDb().select({ endpoint: apiKeyUsage.endpoint, calls: apiKeyUsage.calls }).from(apiKeyUsage).where(eq(apiKeyUsage.apiKeyId, keyId));
+      const sums: Record<string, number> = {};
+      for (const r of rows) sums[r.endpoint] = (sums[r.endpoint] ?? 0) + r.calls;
+      return sums;
+    };
+    const rowsOf = (endpoint: string) => getDb().select({ day: apiKeyUsage.day, calls: apiKeyUsage.calls }).from(apiKeyUsage)
+      .where(and(eq(apiKeyUsage.apiKeyId, keyId), eq(apiKeyUsage.endpoint, endpoint)));
+    const before = await sumsOf();
+    const beforeById = await rowsOf('consumers.byId');
+    const today = new Date().toISOString().slice(0, 10); // day 用 UTC 日期
+
+    expect((await lookup(`/api/v1/consumers/${consumer}`, key)).status).toBe(200);
+    expect((await lookup(bySource('会员', own), key)).status).toBe(200);
+    expect((await lookup('/api/v1/consumers/nobody', key)).status).toBe(404);
+    expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${of('rfm').id}`, key)).status).toBe(200);
+    expect((await lookup(`${bySource('会员', own)}?snapshot=${of('rfm').id}`, key)).status).toBe(400);
+    expect((await call(`/api/v1/consumers/${consumer}`)).status).toBe(401);
+    expect((await lookup(`/api/v1/consumers/${consumer}`, key)).status).toBe(200); // 同一个 Key 再调一次
+
+    const after = await sumsOf();
+    expect((after['consumers.byId'] ?? 0) - (before['consumers.byId'] ?? 0)).toBe(2);
+    expect((after['consumers.bySource'] ?? 0) - (before['consumers.bySource'] ?? 0)).toBe(1);
+    const afterById = await rowsOf('consumers.byId');
+    expect(afterById.find(r => r.day === today)).toEqual({ day: today, calls: (beforeById.find(r => r.day === today)?.calls ?? 0) + 2 });
+    expect(afterById).toHaveLength(beforeById.length + (beforeById.some(r => r.day === today) ? 0 : 1)); // 同一行累加，不另开行
+  });
 });
 
 describe('按数据源点查', () => {
@@ -540,5 +574,22 @@ describe('点查的隔离', () => {
     expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${of('rfm').id}`, globex.key)).status).toBe(404);
     expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${globex.snapshot}`, key)).status).toBe(404);
     expect((await lookup(`/api/v1/consumers/${consumer}?snapshot=${globex.snapshot}`, globex.key)).body.rfm.segment).toBe('globex_only');
+  });
+
+  it('计数按租户隔离：A、B 两个租户的 Key 各自调用后，api_key_usage 里每个 keyId 的行都属于它自己的租户', async () => {
+    const { acme, consumer, key } = shared;
+    const other = await otherTenant(consumer, 'initech'); // 另开一个租户，不碰 acme；globex 已被上面的用例占用
+    const acmeKeyId = await keyIdOf(await loginAs(app, 'admin@acme.com'), '营销自动化');
+    const otherKeyId = await keyIdOf(await loginAs(app, 'admin@initech.com'), '环球');
+    expect((await lookup(`/api/v1/consumers/${consumer}`, key)).status).toBe(200);
+    expect((await lookup(`/api/v1/consumers/${consumer}`, other.key)).status).toBe(200);
+
+    const rows = await getDb().select({ tenantId: apiKeyUsage.tenantId, apiKeyId: apiKeyUsage.apiKeyId }).from(apiKeyUsage);
+    const ours = rows.filter(r => r.apiKeyId === acmeKeyId);
+    const theirs = rows.filter(r => r.apiKeyId === otherKeyId);
+    expect(ours.length).toBeGreaterThan(0);
+    expect(theirs.length).toBeGreaterThan(0);
+    expect(new Set(ours.map(r => r.tenantId))).toEqual(new Set([acme]));
+    expect(new Set(theirs.map(r => r.tenantId))).toEqual(new Set([other.tenantId]));
   });
 });
