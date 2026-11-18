@@ -210,7 +210,8 @@ export const TOOLS: AssistantTool[] = [
   {
     name: 'catalog_search',
     description: '按关键词、别名与名称搜索目录条目，返回展开后的条目、命中理由与歧义判定；ambiguous 为 true 时，先用给出的追问问清楚口径，再继续；'
-      + '输出里有「默认口径：」行时，回答里要写明按哪个默认口径理解了哪个词',
+      + '输出里有「默认口径：」行时，回答里要写明按哪个默认口径理解了哪个词；'
+      + '输出里有「vector_fallback:」行时，表示向量一路没用上（结果只来自关键词）',
     inputSchema: {
       type: 'object', required: ['query'],
       properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 } },
@@ -227,7 +228,7 @@ export const TOOLS: AssistantTool[] = [
         .filter(s => q.includes(s.name)).map(s => s.id);
       const c = await catalogFor(actor);
       const [tenant] = await getDb().select({ hybridSearch: tenants.hybridSearch }).from(tenants).where(eq(tenants.id, actor.tenant.id));
-      const { ranked, fallback } = await rankedSearch(actor.tenant.id, visibilityClass(actor.role), c, q,
+      const { ranked, fallback, vectorFallback } = await rankedSearch(actor.tenant.id, visibilityClass(actor.role), c, q,
         { spaceIds, memberSpaceId: actor.space.id }, limit as number | undefined, { hybrid: tenant?.hybridSearch ?? false });
       // 排到的条目都算本轮检索到（含投影不可用回退的那部分），每个都带语义哈希
       for (const r of ranked) ctx?.retrieved.add(r.entry.id);
@@ -242,7 +243,8 @@ export const TOOLS: AssistantTool[] = [
       // 词的默认指向（ADR-0056）：没追问、按默认条目处理的组，每项一行（指标的名称就是键），让助手在回答里转述这一句
       const defaultLines = defaults.map(({ term, entryId }) =>
         `默认口径：按默认口径 ${c.entries.find(e => e.id === entryId)?.name}（${entryId}）理解『${term}』；用户要别的口径时请换一种说法再问`);
-      return [`ambiguous: ${ambiguous}`, entries, ...defaultLines, ...(ambiguous ? groups.map(comparison) : [])].join('\n\n');
+      // 向量一路没用上时（开了混合检索但 embedding 失败或外部库连不上）紧跟 ambiguous 报原因，结果只来自关键词
+      return [`ambiguous: ${ambiguous}`, ...(vectorFallback ? [`vector_fallback: ${vectorFallback}`] : []), entries, ...defaultLines, ...(ambiguous ? groups.map(comparison) : [])].join('\n\n');
     },
   },
   {

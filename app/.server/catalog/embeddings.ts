@@ -1,14 +1,14 @@
 // app/.server/catalog/embeddings.ts —— 检索投影文字的向量缓存（ADR-0047、0049）：按（租户, 模型, 文本哈希）缓存 embedding，由调度器在后台补算。
 // 向量是昂贵的派生计算：丢了可以重算、不参与权限判断；换 embedding 模型后旧模型的行命中不了，补算时删掉。
 // 向量读写一律经 VectorStore 接口（ADR-0058），由 resolveVectorStore 按租户在模型服务页的选型解析：系统自带 platformStore 或外部 pgvector，不直接查 catalog_embeddings。
-// vectorHits 是查询时的向量一路：对查询算一次 embedding（短超时）后经存储的 topN 取相似哈希排行次，失败只去掉这一路、不拖垮关键词检索；
+// vectorHits 是查询时的向量一路：对查询算一次 embedding（短超时）后经存储的 topN 取相似哈希排行次，失败只去掉这一路、不拖垮关键词检索，并向调用方报告降级原因（off / embed_failed / store_unreachable）；
 // 缓存补齐由 ensureEmbeddings 入队去重，fillEmbeddings 在任务的调度器结束钩子里补算
 import { and, eq, inArray } from 'drizzle-orm';
 import { cmp } from '../../lib/compare';
 import type { Tx } from '../audit';
 import { getDb } from '../db/client';
 import { catalogProjection, modelProviders, tasks } from '../db/schema';
-import { embedWith, resolveEmbeddingProvider } from '../llm';
+import { embedWith, type LlmProvider, resolveEmbeddingProvider } from '../llm';
 import { decryptForTenant } from '../secrets';
 import { insertTask } from '../tasks';
 import type { ProjectionRow } from './projection';
@@ -107,25 +107,39 @@ export async function fillEmbeddings(tenantId: string): Promise<void> {
     .where(eq(modelProviders.tenantId, tenantId));
 }
 
+/** 向量一路没用上时的降级原因（ADR-0049、0058）：只放枚举值，绝不能带错误消息（消息里可能有连接串） */
+export type VectorFallback = 'off' | 'embed_failed' | 'store_unreachable';
+
 /**
  * 检索查询的向量一路（ADR-0047、0049）：对查询文本算一次 embedding（QUERY_EMBED_TIMEOUT_MS 短超时），从租户选定的向量存储（ADR-0058）
  * 按余弦相似度取本批行的前 LANE_LIMIT 个哈希，展开回行排出名次（顺序与 vectorLane 一致：相似度降序、同分按 entryId 升序）。
  * 查询向量不缓存、不落库；调用日志（embedWith 经 logged）只记条数与 token，不含查询文本。
  * 行只用调用方按可见类读出的那批（restricted 不另按 full 类读），topN 也只喂这批行的哈希，restricted 条目带不出来；
  * limit 按哈希计数，展开成条目后要再排一次、截一次。
- * embedding 没配置、超时或失败、外部库连不上时返回 undefined——调用方只去掉向量这一路，不落进整体回退；任何错误都吞在这里（不打查询文本，也不打连接串）。
- * 缓存里缺向量的哈希（刚换模型、后台还在补算）入队补算，去重由 ensureEmbeddings 的事务保证
+ * 向量一路没用上时返回 fallback 原因而不是 hits：off（没配置 embedding，不算错误、不打 warn）、embed_failed（查询 embedding 失败或超时）、
+ * store_unreachable（从解析存储到读写抛错，含连接串解密失败）——调用方只去掉向量这一路，不落进整体回退；任何错误都吞在这里（不打查询文本，也不打连接串）。
+ * 存储正常、只是缓存里缺向量的哈希（刚换模型、后台还在补算）不算降级：照常返回 hits 并入队补算，去重由 ensureEmbeddings 的事务保证
  */
-export async function vectorHits(tenantId: string, rows: ProjectionRow[], query: string): Promise<VectorHit[] | undefined> {
+export async function vectorHits(tenantId: string, rows: ProjectionRow[], query: string): Promise<{ hits: VectorHit[] } | { fallback: VectorFallback }> {
   let url: string | null = null; // 外部库的连接串：只用来把日志里的凭据抹掉，本身不进日志
   const logged = (e: unknown): string => {
     const message = e instanceof Error ? e.message : String(e);
     return url ? redactUrl(message, url) : message;
   };
+  // 第一段：查询 embedding。没配置不算错误（不打 warn）；配了但失败或超时是 embed_failed
+  let provider: LlmProvider;
+  let queryVec: number[];
   try {
-    const provider = await resolveEmbeddingProvider(tenantId);
-    if (!provider) return undefined;
-    const [queryVec] = await embedWith(tenantId, provider, [query], { timeoutMs: QUERY_EMBED_TIMEOUT_MS });
+    const resolvedProvider = await resolveEmbeddingProvider(tenantId);
+    if (!resolvedProvider) return { fallback: 'off' };
+    provider = resolvedProvider;
+    [queryVec] = await embedWith(tenantId, provider, [query], { timeoutMs: QUERY_EMBED_TIMEOUT_MS });
+  } catch (e) {
+    console.warn('混合检索的向量一路不可用，只走关键词', tenantId, logged(e));
+    return { fallback: 'embed_failed' };
+  }
+  // 第二段：向量存储。从解析（含连接串解密失败）到读哈希、取 topN，抛错都是 store_unreachable
+  try {
     const resolved = await resolveVectorStore(tenantId);
     url = resolved.url;
     const store = resolved.store;
@@ -135,12 +149,14 @@ export async function vectorHits(tenantId: string, rows: ProjectionRow[], query:
       await ensureEmbeddings(tenantId).catch(e => console.warn('混合检索入队补算向量失败', tenantId, logged(e)));
     }
     const top = await store.topN(provider.model, queryVec, hashes, LANE_LIMIT);
-    return top
-      .flatMap(h => rows.filter(r => r.textHash === h.textHash).map(r => ({ entryId: r.entryId, similarity: h.similarity })))
-      .sort((a, b) => b.similarity - a.similarity || cmp(a.entryId, b.entryId))
-      .slice(0, LANE_LIMIT);
+    return {
+      hits: top
+        .flatMap(h => rows.filter(r => r.textHash === h.textHash).map(r => ({ entryId: r.entryId, similarity: h.similarity })))
+        .sort((a, b) => b.similarity - a.similarity || cmp(a.entryId, b.entryId))
+        .slice(0, LANE_LIMIT),
+    };
   } catch (e) {
     console.warn('混合检索的向量一路不可用，只走关键词', tenantId, logged(e));
-    return undefined;
+    return { fallback: 'store_unreachable' };
   }
 }
