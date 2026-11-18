@@ -10,11 +10,12 @@
 // 可以写下需求后用模型生成草稿（intent=model-draft，ADR-0035，只在 YAML 模式）：生成的 YAML 填进编辑框、不保存，失败时编辑框保持原内容
 // 指标的构建器模式还能写一句话解析（intent=parse，#517）：parseMetricSentence 把句子解析成表单填进构建器并逐项说明，
 // 已有内容时先列出差异（intent=applyParse 确认后才覆盖），解析失败时表单保持原样
-import { Fragment, useEffect, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.new';
+import { DraftAmbiguity } from '~/components/draft-ambiguity';
 import { requirePermission } from '~/.server/access';
-import type { DraftAmbiguity } from '~/.server/catalog/draft-search';
+import type { DraftAmbiguity as DraftAmbiguityInfo } from '~/.server/catalog/draft-search';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { createDefinition, DslError, dslContext, modelDraftForDefinition } from '~/.server/dsl-definitions';
 import { MetricParseError, parseMetricSentence } from '~/.server/metric-parse';
@@ -266,8 +267,8 @@ export async function action({ request }: Route.ActionArgs) {
   const keep = {
     key, request: requirement, generated: false, form: echo, tagForm: tagEcho, echoId: crypto.randomUUID(), sentence,
     parse: undefined, parsed: undefined, diff: undefined, dropped: undefined as DroppedItem[] | undefined,
-    /** model-draft 检索判出的歧义（#827）：词与候选，草稿照常生成、在编辑框上方提示成员确认；其余分支占位让组件统一读 */
-    ambiguity: undefined as DraftAmbiguity | undefined,
+    /** model-draft / parse 检索判出的歧义（#827、#853）：词与候选，草稿 / 解析照常生成、在上方提示成员确认；其余分支占位让组件统一读 */
+    ambiguity: undefined as DraftAmbiguityInfo | undefined,
     /** 指标与标签的编辑模式；其他种类没有模式 */
     mode: (kind === 'metric' || kind === 'tag') ? currentMode : undefined,
   };
@@ -345,10 +346,11 @@ export async function action({ request }: Route.ActionArgs) {
         current, normalized,
         labelledFields(normalized.base, fieldsFor(normalized.base, await dslContext(getDb(), member.tenant.id)) ?? []),
       );
-      // 构建器是空的或解析结果与当前内容一样：直接填入；否则先列出差异等成员确认（form 仍是当前内容）
+      // 构建器是空的或解析结果与当前内容一样：直接填入；否则先列出差异等成员确认（form 仍是当前内容）；
+      // 句子有歧义时照常解析，歧义提示带回页面（要写在 ...keep 的 ambiguity 占位之后）
       return diff.length === 0
-        ? { error: null, issues: [], yaml, summary: null, sql: null, ...keep, form: shown, parse }
-        : { error: null, issues: [], yaml, summary: null, sql: null, ...keep, parsed: shown, diff, parse };
+        ? { error: null, issues: [], yaml, summary: null, sql: null, ...keep, form: shown, parse, ambiguity: parsed.ambiguity }
+        : { error: null, issues: [], yaml, summary: null, sql: null, ...keep, parsed: shown, diff, parse, ambiguity: parsed.ambiguity };
     }
     if (kind === 'metric' && intent === 'applyParse') {
       // 确认覆盖：读隐藏字段 parsed（parse 应答里那份 JSON），同样不信客户端，过一遍规整再回显
@@ -459,6 +461,10 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
                     </div>
                   </Field>
                 )}
+                {/* 句子有歧义时照常解析：解析面板上方提示成员确认或改写（与 YAML 模式起草同一个组件） */}
+                {kind === 'metric' && actionData?.parse && actionData.ambiguity && (
+                  <DraftAmbiguity ambiguity={actionData.ambiguity} hint="请确认解析结果是否是你要的口径，或改写这句话；常用的理解可以在助手里选定后设为默认口径。" />
+                )}
                 {kind === 'metric' && actionData?.parse && <MetricParsePanel parse={actionData.parse} diff={actionData.diff} />}
                 {kind === 'metric' && actionData?.parsed && (
                   <div className="flex items-center gap-2">
@@ -489,21 +495,7 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
                 </Field>
                 {actionData?.generated && <p className="text-sm text-muted-foreground" data-generated>已用模型生成草稿，请核对后填写键并保存。</p>}
                 {actionData?.ambiguity && (
-                  <div className="rounded-2xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900" data-ambiguity>
-                    <p className="font-medium">这些词有多种理解</p>
-                    {actionData.ambiguity.groups.map(g => (
-                      <p key={g.term}>
-                        「{g.term}」可能指
-                        {g.candidates.map((c, i) => (
-                          <Fragment key={c.id}>
-                            {i > 0 && '、'}
-                            <a className="underline underline-offset-2" href={`/knowledge?item=${encodeURIComponent(c.id)}`}>{c.name}</a>
-                          </Fragment>
-                        ))}
-                      </p>
-                    ))}
-                    <p>请确认模型选的是否是你要的口径，或在需求里写明；常用的理解可以在助手里选定后设为默认口径。</p>
-                  </div>
+                  <DraftAmbiguity ambiguity={actionData.ambiguity} hint="请确认模型选的是否是你要的口径，或在需求里写明；常用的理解可以在助手里选定后设为默认口径。" />
                 )}
                 <Field>
                   <FieldLabel>定义（YAML）</FieldLabel>
