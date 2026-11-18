@@ -103,7 +103,7 @@ const planIssueLine = (i: PlanIssue) => `- ${planIssueRef(i)}：${i.message}${i.
 const planIssueLines = (issues: PlanIssue[]) => issues.map(planIssueLine).join('\n');
 
 const isDependencyIssue = (i: PlanIssue) => i.path.endsWith('.version') || i.path.endsWith('.semanticHash');
-const isHiddenIssue = (i: PlanIssue) => i.path.endsWith('.id') && i.message.includes('可见目录');
+const isHiddenIssue = (i: PlanIssue) => i.kind === 'hidden';
 
 /** 重新校验没通过时的两种动作：存草稿与把 SQL 填进工作台，文案只差「保存 / 填入」那几个词（save 的逐字文案有历史用例断言） */
 type StaleAction = 'save' | 'prefill';
