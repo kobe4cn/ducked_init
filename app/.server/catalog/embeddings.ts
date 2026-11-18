@@ -118,6 +118,10 @@ export async function fillEmbeddings(tenantId: string): Promise<void> {
  */
 export async function vectorHits(tenantId: string, rows: ProjectionRow[], query: string): Promise<VectorHit[] | undefined> {
   let url: string | null = null; // 外部库的连接串：只用来把日志里的凭据抹掉，本身不进日志
+  const logged = (e: unknown): string => {
+    const message = e instanceof Error ? e.message : String(e);
+    return url ? redactUrl(message, url) : message;
+  };
   try {
     const provider = await resolveEmbeddingProvider(tenantId);
     if (!provider) return undefined;
@@ -128,8 +132,7 @@ export async function vectorHits(tenantId: string, rows: ProjectionRow[], query:
     const hashes = [...new Set(rows.map(r => r.textHash))];
     const existing = await store.hashes(provider.model);
     if (hashes.some(h => !existing.has(h))) {
-      await ensureEmbeddings(tenantId).catch(e => console.warn('混合检索入队补算向量失败', tenantId,
-        url ? redactUrl(e instanceof Error ? e.message : String(e), url) : e instanceof Error ? e.message : e));
+      await ensureEmbeddings(tenantId).catch(e => console.warn('混合检索入队补算向量失败', tenantId, logged(e)));
     }
     const top = await store.topN(provider.model, queryVec, hashes, LANE_LIMIT);
     return top
@@ -137,8 +140,7 @@ export async function vectorHits(tenantId: string, rows: ProjectionRow[], query:
       .sort((a, b) => b.similarity - a.similarity || cmp(a.entryId, b.entryId))
       .slice(0, LANE_LIMIT);
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    console.warn('混合检索的向量一路不可用，只走关键词', tenantId, url ? redactUrl(message, url) : message);
+    console.warn('混合检索的向量一路不可用，只走关键词', tenantId, logged(e));
     return undefined;
   }
 }
