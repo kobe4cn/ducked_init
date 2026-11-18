@@ -268,7 +268,8 @@ function DownstreamImpact({ downstream }: { downstream: Downstream }) {
             <li data-downstream-keys>
               {'最近 30 天读取的 API Key：'}
               <ul className="list-[circle] pl-5">
-                {downstream.keys.map(k => <li key={k.name}>{`${k.name}${k.revoked ? '（已吊销）' : ''} · ${k.calls} 次`}</li>)}
+                {/* 名字不唯一（吊销后可以用同名再建），不能当 key */}
+                {downstream.keys.map((k, i) => <li key={i}>{`${k.name}${k.revoked ? '（已吊销）' : ''} · ${k.calls} 次`}</li>)}
               </ul>
             </li>
           )}
