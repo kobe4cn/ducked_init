@@ -14,7 +14,7 @@ import { randomUUID } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { dslDefinitions, dslVersions, snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
+import { apiKeyUsage, apiKeys, dslDefinitions, dslVersions, snapshots, tasks, templateVersions } from '../../app/.server/db/schema';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { listSnapshots, readChurnSnapshot, readClvSnapshot, readRepurchaseSnapshot, readTemplateSnapshot } from '../../app/.server/snapshots';
@@ -1076,6 +1076,67 @@ describe('模板升级', () => {
     expect(churnSampled).toContain('v2 at_risk');
     // 每个人都换了取值：同一行里 v1 与 v2 的 at_risk 相反（是 / 否）
     expect(churnSampled).toMatch(/<td[^>]*>(是|否)<\/td><td[^>]*>(否|是)<\/td>/);
+  });
+
+  it('下游影响按 API Key 列出最近 30 个 UTC 日的调用次数（#921）：名字与两个点查合计次数、次数从多到少、次数相同按名字排（拼音）、吊销的标「已吊销」；只列本租户，没有前缀与哈希；30 天内没人调用不出这一小节，churn 仍没有下游使用', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle(); // 跑完任务让 RFM 进服务库
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    vi.stubEnv('TEMPLATE_TEST_VERSIONS', '1');
+
+    const preview = () => viewer.post('/analytics/templates/rfm', { intent: 'preview-upgrade', asOf: '2024-12-31' });
+    // 还没有任何调用记录时不出现这一小节
+    expect(await (await preview()).text()).not.toContain('data-downstream-keys');
+
+    // 造 Key：直接插行不走 /api-keys 页面，prefix 可控；客服系统已吊销，环球属于别的租户
+    const [marketing] = await getDb().insert(apiKeys).values({
+      tenantId: acme, name: '营销自动化', prefix: 'crm_aaaa', tokenHash: randomUUID(), createdByEmail: 'admin@acme.com',
+    }).returning();
+    const [support] = await getDb().insert(apiKeys).values({
+      tenantId: acme, name: '客服系统', prefix: 'crm_bbbb', tokenHash: randomUUID(), createdByEmail: 'admin@acme.com', revokedAt: new Date(),
+    }).returning();
+    // 报表导出与客服系统同为 1 次：按拼音 bao < ke 排在前面；按码点「报」U+62A5 >「客」U+5BA2 会排在后面
+    const [reports] = await getDb().insert(apiKeys).values({
+      tenantId: acme, name: '报表导出', prefix: 'crm_dddd', tokenHash: randomUUID(), createdByEmail: 'admin@acme.com',
+    }).returning();
+    const globex = await newTenant('globex');
+    const [globalKey] = await getDb().insert(apiKeys).values({
+      tenantId: globex, name: '环球', prefix: 'crm_cccc', tokenHash: randomUUID(), createdByEmail: 'admin@globex.com',
+    }).returning();
+
+    // 造调用：day 用 UTC 日期串；29 天前在窗口内（day >= 今天 - 29），30 天前不计入
+    const utcDay = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+    await getDb().insert(apiKeyUsage).values([
+      { tenantId: acme, apiKeyId: marketing.id, endpoint: 'consumers.byId', day: utcDay(0), calls: 3 },
+      { tenantId: acme, apiKeyId: marketing.id, endpoint: 'consumers.bySource', day: utcDay(0), calls: 2 },
+      { tenantId: acme, apiKeyId: marketing.id, endpoint: 'consumers.byId', day: utcDay(29), calls: 1 },
+      { tenantId: acme, apiKeyId: marketing.id, endpoint: 'consumers.byId', day: utcDay(30), calls: 1 },
+      { tenantId: acme, apiKeyId: support.id, endpoint: 'consumers.byId', day: utcDay(0), calls: 1 },
+      { tenantId: acme, apiKeyId: reports.id, endpoint: 'consumers.bySource', day: utcDay(0), calls: 1 },
+      { tenantId: globex, apiKeyId: globalKey.id, endpoint: 'consumers.byId', day: utcDay(0), calls: 9 },
+    ]);
+
+    const rfm = await (await preview()).text();
+    expect(rfm).toContain('data-downstream-keys');
+    // 营销自动化 3+2+1=6 次（窗口外的 1 次不计），排在只有 1 次的客服系统前面；已吊销的照样列出并标注
+    expect(rfm.indexOf('营销自动化 · 6 次')).toBeGreaterThanOrEqual(0);
+    expect(rfm.indexOf('营销自动化 · 6 次')).toBeLessThan(rfm.indexOf('报表导出 · 1 次'));
+    // 次数相同按名字排（cmpName，zh-CN 拼音），与库的 collation 无关
+    expect(rfm.indexOf('报表导出 · 1 次')).toBeLessThan(rfm.indexOf('客服系统（已吊销） · 1 次'));
+    // 只列本租户的 Key，不出现前缀，也没有哈希
+    expect(rfm).not.toContain('环球');
+    expect(rfm).not.toContain('9 次');
+    expect(rfm).not.toContain('crm_aaaa');
+    expect(rfm).not.toContain('crm_bbbb');
+    expect(rfm).not.toContain('crm_cccc');
+    expect(rfm).not.toContain('crm_dddd');
+    expect(rfm).not.toMatch(/[0-9a-f]{64}/);
+
+    // churn 不进服务库：仍写「没有下游使用」，不列 Key
+    const churn = await (await viewer.post('/analytics/templates/churn', { intent: 'preview-upgrade', asOf: '2024-10-15' })).text();
+    expect(churn).toContain('没有下游使用');
+    expect(churn).not.toContain('data-downstream-keys');
   });
 });
 

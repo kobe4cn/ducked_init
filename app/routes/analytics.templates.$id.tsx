@@ -253,7 +253,7 @@ function SampleTable({ from, to, sample }: { from: number; to: number; sample: U
   );
 }
 
-/** 「下游影响」（#830）：服务库表、发布后下一次计算时切换与读取它的对外接口；没有下游时写「没有下游使用」 */
+/** 「下游影响」（#830）：服务库表、发布后下一次计算时切换、读取它的对外接口与最近 30 天读取的 API Key（#921，吊销的标「已吊销」）；没有下游时写「没有下游使用」 */
 function DownstreamImpact({ downstream }: { downstream: Downstream }) {
   return (
     <div data-downstream className="space-y-1">
@@ -264,6 +264,15 @@ function DownstreamImpact({ downstream }: { downstream: Downstream }) {
         <ul className="list-disc space-y-0.5 pl-5 text-sm text-slate-500">
           <li>{`服务库表 ${downstream.table}，升级发布后下一次计算时切换到新结果`}</li>
           {downstream.paths.map(p => <li key={p}>{`对外接口 ${p} 读取这张表`}</li>)}
+          {downstream.keys.length > 0 && (
+            <li data-downstream-keys>
+              {'最近 30 天读取的 API Key：'}
+              <ul className="list-[circle] pl-5">
+                {/* 名字不唯一（吊销后可以用同名再建），不能当 key */}
+                {downstream.keys.map((k, i) => <li key={i}>{`${k.name}${k.revoked ? '（已吊销）' : ''} · ${k.calls} 次`}</li>)}
+              </ul>
+            </li>
+          )}
         </ul>
       )}
     </div>

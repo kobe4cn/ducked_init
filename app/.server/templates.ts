@@ -18,6 +18,7 @@ import { getDb, type Db } from './db/client';
 import { DslError, onReadOnlyLake, type DiffCounts, type TagTransition } from './dsl-definitions';
 import { mappings, mappingVersions, spaces, tasks, templateDefinitions, templateVersions, tenants, type SnapshotTrigger } from './db/schema';
 import { pendingMerge } from './merges';
+import { apiKeyUsageLast30Days, type ApiUsageEndpoint } from './api-usage';
 import { discard, type DraftRow, publish, publishBlocker, PublishError, publisherCount, saveDraft as savePublishable, type PublishableAdapter, withAuthor } from './publishing';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
 import { cmp } from '../lib/compare';
@@ -496,10 +497,11 @@ export async function sampleTemplateUpgrade(
 }
 
 /** 模板 → 它进服务库的表与读取这张表的对外接口（ADR-0004、0033：分析模板里目前只有 RFM 进服务库）；有新模板进服务库时在这里登记 */
-const SERVING_DOWNSTREAM: Partial<Record<TemplateId, { table: string; paths: string[] }>> = {
+const SERVING_DOWNSTREAM: Partial<Record<TemplateId, { table: string; paths: string[]; endpoints: ApiUsageEndpoint[] }>> = {
   rfm: {
     table: 'serving.rfm',
     paths: ['GET /api/v1/consumers/:consumerId', 'GET /api/v1/consumers/by-source/:source/:customerId'],
+    endpoints: ['consumers.byId', 'consumers.bySource'],
   },
 };
 
@@ -510,21 +512,27 @@ export interface TemplateDownstream {
   table: string | null;
   /** 读取这张表的对外接口路径；没有下游时为空 */
   paths: string[];
+  /** 最近 30 个 UTC 日读过的 API Key（名字、两个点查合计次数、是否吊销）；没有下游时为空 */
+  keys: { name: string; calls: number; revoked: boolean }[];
 }
 
 /**
  * 模板的下游影响（#830）：需要定义查看权限。只读服务库指针，不改服务库代码：列出服务库里由这个模板生成的表与读取它的对外接口路径。
  * 升级确认发布后以下一次计算产出的新快照为准，serving.build 成功后服务库切到新版——没有可查的切换时间，界面用固定文案说明。
- * 模板不进服务库、租户还没有服务库或没有这个模板的快照时 table 为 null（「没有下游使用」）。按 API Key 统计读取次数要等有了调用记录（#912）
+ * 模板不进服务库、租户还没有服务库或没有这个模板的快照时 table 为 null（「没有下游使用」）；进服务库的模板另列最近 30 个
+ * UTC 日有调用的 API Key 与合计次数（ADR-0059：只显示名字与次数，已吊销的照样列出）
  */
 export async function templateDownstream(actor: CurrentMember, id: string): Promise<TemplateDownstream> {
   assertCan(actor, 'definitions:read');
   const template = requireTemplate(id);
   const downstream = SERVING_DOWNSTREAM[template];
-  if (!downstream) return { template, table: null, paths: [] };
+  if (!downstream) return { template, table: null, paths: [], keys: [] };
   const store = await currentServingStore(actor.tenant.id);
   const inStore = (store?.snapshots ?? []).some(s => s.template === template);
-  return inStore ? { template, ...downstream } : { template, table: null, paths: [] };
+  // 不展开 downstream：endpoints 是登记数据，不进返回值
+  return inStore
+    ? { template, table: downstream.table, paths: downstream.paths, keys: await apiKeyUsageLast30Days(actor.tenant.id, downstream.endpoints) }
+    : { template, table: null, paths: [], keys: [] };
 }
 
 /**
