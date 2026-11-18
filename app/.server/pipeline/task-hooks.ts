@@ -36,8 +36,8 @@ export type TaskHookTable = { [K in TaskKind]: readonly TaskHook<K>[] };
 const templateHooks = (id: TemplateId): readonly TaskHook<(typeof TASK_KINDS)[TemplateId]>[] => [
   // 分析模板任务写好了结果层的快照表：登记到平台元数据，分析页据此列出（断言失败的任务也带 result，靠库里的 status 挡住）
   { name: 'registerSnapshot', when: 'result', run: ({ task }) => registerSnapshot(task.tenantId, task.id, id) },
-  // 结果层任务因 error 级断言失败（没有登记快照）：告警租户管理员并记审计
-  { name: 'alertAssertionFailure', when: 'failed', run: ({ task, result }) => alertAssertionFailure(task.tenantId, task, result) },
+  // 结果层任务因 error 级断言失败（没有登记快照）：告警租户管理员并记审计（模板参数里没有 batchId，各自算一批）
+  { name: 'alertAssertionFailure', when: 'failed', run: ({ task, result, params }) => alertAssertionFailure(task.tenantId, task, result, params) },
   // 有了新快照：重建服务库（ADR-0033），只收 RFM 与指标、标签，其他模板的快照不触发；生成成功后才切换指针
   ...(id === 'rfm' ? [{ name: 'enqueueServingBuild', when: 'succeeded' as const, run: ({ task }: { task: ClaimedTask }) => enqueueServingBuild(task.tenantId) }] : []),
 ];
@@ -74,8 +74,8 @@ export const TASK_HOOKS = {
   'gold.dsl': [
     // 自定义定义写好了结果层的快照表：登记到平台元数据（断言失败的任务也带 result，靠库里的 status 挡住）
     { name: 'registerDslSnapshot', when: 'result', run: ({ task }) => registerDslSnapshot(task.tenantId, task.id) },
-    // 结果层任务因 error 级断言失败（没有登记快照）：告警租户管理员并记审计
-    { name: 'alertAssertionFailure', when: 'failed', run: ({ task, result }) => alertAssertionFailure(task.tenantId, task, result) },
+    // 结果层任务因 error 级断言失败（没有登记快照）：告警租户管理员并记审计（同批 batchId 只告警一次，quality.ts）
+    { name: 'alertAssertionFailure', when: 'failed', run: ({ task, result, params }) => alertAssertionFailure(task.tenantId, task, result, params) },
     // 有了新快照：重建服务库（ADR-0033），生成成功后才切换指针
     { name: 'enqueueServingBuild', when: 'succeeded', run: ({ task }) => enqueueServingBuild(task.tenantId) },
   ],
