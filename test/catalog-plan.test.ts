@@ -133,10 +133,11 @@ describe('分析计划校验 validatePlan()：硬性检查', () => {
   it('只有「不在可见目录里」的问题带 kind: hidden，别的问题（不在本次检索结果里）不带（#930）', () => {
     const absent = validatePlan({ ...planOf(), selected: [{ id: 'metric:nope', semanticHash: 'x' }], steps: [] },
       { catalog: RETRIEVAL_CATALOG, retrieved: new Set(['metric:nope']) });
-    expect(absent.issues.every(i => i.kind === 'hidden')).toBe(true);
+    expect(absent.issues.map(i => i.kind)).toEqual(['hidden']);
 
     const notRetrieved = validatePlan(planOf(), { catalog: RETRIEVAL_CATALOG, retrieved: new Set() });
-    expect(notRetrieved.issues.every(i => i.kind === undefined)).toBe(true);
+    expect(notRetrieved.issues).toHaveLength(1);
+    expect(notRetrieved.issues[0]).not.toHaveProperty('kind');
   });
 
   it('excluded 的 id 不在本次检索结果里返回 invalid（path excluded.N.id、带 entryId）；在检索结果里就合法、不查可见目录；与 selected 重复、缺 reason、步骤 inputs 引用 excluded 的条目都 invalid（#539）', () => {
