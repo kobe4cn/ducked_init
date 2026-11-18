@@ -14,6 +14,7 @@ import { lastMergeByMapping } from '../merges';
 import { publishedMergeGroups } from '../merge-groups';
 import type { TableProfile } from '../pipeline/source-engine';
 import { TEMPLATES, type TemplateId } from '../pipeline/templates';
+import { newestFirst } from '../snapshots';
 import { buildCatalog, type Catalog, type CatalogInput } from './index';
 import { currentCatalogVersion, ensureCatalogVersion } from './versions';
 
@@ -69,7 +70,8 @@ export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenant
     .selectDistinctOn([snapshots.template], { template: snapshots.template, table: snapshots.table, rows: snapshots.rowCount, at: snapshots.createdAt })
     .from(snapshots)
     .where(and(eq(snapshots.tenantId, tenantId), isNull(snapshots.expiredAt)))
-    .orderBy(snapshots.template, desc(snapshots.createdAt), desc(snapshots.id));
+    // selectDistinctOn 要求第一个排序键是 template，其后按统计日 newestFirst 挑最新一张
+    .orderBy(snapshots.template, ...newestFirst);
   const templates = publishedTemplates.filter(t => Object.hasOwn(TEMPLATES, t.template)).map(t => {
     const s = latestSnapshots.find(x => x.template === t.template);
     return { template: t.template as TemplateId, version: t.version, params: t.params, spaceId: t.spaceId, snapshot: s ? { table: s.table, rows: s.rows, at: s.at.toISOString() } : null };

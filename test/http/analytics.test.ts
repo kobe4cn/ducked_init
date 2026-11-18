@@ -253,6 +253,34 @@ describe('分析页 · 指标与标签列表', () => {
     expect(listAt(first!.id)).toBeLessThan(listAt(backfill!.id));
   });
 
+  it('「最近计算」按统计日选最新快照：登记更晚的回刷快照不算最新，同一统计日取登记较晚的那张', async () => {
+    const acme = await newTenant('acme');
+    await createDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'revenue', REVENUE);
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const [definition] = await getDb().select({ id: dslDefinitions.id }).from(dslDefinitions)
+      .where(and(eq(dslDefinitions.tenantId, acme), eq(dslDefinitions.key, 'revenue')));
+    /** 直接登记一张快照（不真算），统计日、来源与登记时间可控 */
+    const register = async (asOf: string, trigger: 'manual' | 'backfill' | 'scheduled', rowCount: number, createdAt: Date) => {
+      const [task] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'gold.dsl', status: 'succeeded', params: { definitionId: definition!.id }, createdAt }).returning();
+      await getDb().insert(snapshots).values({
+        tenantId: acme, template: 'metric:revenue', trigger, taskId: task!.id, table: `gold.metric__${task!.id}`,
+        params: { asOf }, rowCount, createdAt, expiresAt: new Date(Date.now() + 86_400_000),
+      });
+    };
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    const defRow = async () => new RegExp('data-definition-row="metric:revenue"(?:(?!</tr>).)*', 's').exec(await (await viewer.get('/analytics')).text())?.[0] ?? '';
+
+    // 先登记统计日 D 的快照，再登记统计日 D-1、但登记更晚的回刷快照：「最近计算」仍取 D 那张
+    await register('2024-08-01', 'manual', 3, new Date(Date.now() - 7_200_000));
+    await register('2024-07-31', 'backfill', 2, new Date(Date.now() - 3_600_000));
+    expect(await defRow()).toContain('2024-08-01 · 手动 · 3 行');
+    expect(await defRow()).not.toContain('2024-07-31');
+    // 同一统计日 D 再登记一张（登记最晚）：取它
+    await register('2024-08-01', 'scheduled', 1, new Date());
+    expect(await defRow()).toContain('2024-08-01 · 定时刷新 · 1 行');
+    expect(await defRow()).not.toContain('手动');
+  });
+
   it('列表不显示其他租户的定义；类型与状态筛选走 URL；没有定义的租户显示空状态，有起草权限的成员看到「新建定义」入口', async () => {
     const acme = await newTenant('acme');
     await createDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'revenue', REVENUE);
