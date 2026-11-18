@@ -5,12 +5,14 @@
 // embedding 端点（ADR-0049）自成一套同样的保存 / 恢复 / 测试，与 chat 互不影响；
 // fast / reasoning 档位（ADR-0055 路由③a）是租户按用途绑的模型，只在 chat 三项整套生效时才有意义，保存 / 恢复同样在这里
 // 向量存储（ADR-0058，#848）也在这里：选平台库还是外部 pgvector、连接串加密保存（context vector_store，不回显），
-// 保存时先测连通失败不保存；这里只存设置，补算与检索真正切换在 #849
+// 保存时先测连通失败不保存；切换存储后的清理与补算也在保存后触发（#849-1：embeddings.ts 按这里的选型解析存储）
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
-import { preparePgvector } from './catalog/vector-store-pgvector';
+import { ensureEmbeddings } from './catalog/embeddings';
+import { preparePgvector, redactUrl } from './catalog/vector-store-pgvector';
+import { platformStore } from './catalog/vector-store';
 import { getDb } from './db/client';
 import { modelProviders } from './db/schema';
 import { chatJson, chatTools, chatToolsWith, embed, embeddingSource, LlmError, MODEL_PROVIDER_CONTEXT, providerSource, resolveEmbeddingProvider, resolveProvider, resolveRoute, type LlmRoute } from './llm';
@@ -245,7 +247,9 @@ const VECTOR_STORE_CONTEXT = 'vector_store';
  * 保存向量存储的选型（ADR-0058，#848）：选外部 pgvector 时连接串整串加密保存（不回显，留空沿用已存的密文；主机只能通过填新连接串来改，
  * 规则同 sealApiKey）。保存前先在事务外调 preparePgvector 测连通并建表，失败不写库、把抹过凭据的错误返回给页面显示。
  * 选 platform 时忽略表单里的连接串、不测连通，url / checked_at / error 三列原样保留（切回时不丢配置，方便撤回）。
- * 审计只记 from / to / urlRotated；存储没换且连接串也没换时不记。「测试连接」不在这里，见 testVectorStore
+ * 审计只记 from / to / urlRotated；存储没换且连接串也没换时不记。「测试连接」不在这里，见 testVectorStore。
+ * 事务提交后处理存储切换（ADR-0058，#849-1）：切到 pgvector 时清掉本租户在平台表的行并入队从零补算（换连接串同样入队）；
+ * 切回 platform 时外部库的行不删、平台表入队补算。清理与补算失败只打日志，不让保存失败
  */
 export async function saveVectorStore(actor: CurrentMember, input: { kind: string; url: string }): Promise<VectorStoreResult> {
   assertCan(actor, 'model_provider:manage');
@@ -262,6 +266,10 @@ export async function saveVectorStore(actor: CurrentMember, input: { kind: strin
         .onConflictDoUpdate({ target: modelProviders.tenantId, set: { vectorStore: 'platform', updatedAt: new Date() } });
       await recordAudit(tx, { tenantId, actor, action: 'model_provider.vector_store_updated', targetType: 'model_provider', detail: { from, to: 'platform', urlRotated: false } });
     });
+    // 切回「系统自带」（ADR-0058）：外部库的行保留不删（租户自己的库），平台表入队从零补算。
+    // 补算在事务提交之后、失败只打日志——配置已经保存，不该让保存失败；没配 embedding 时 ensureEmbeddings 返回 off、不入队，是对的
+    await ensureEmbeddings(tenantId)
+      .catch(e => console.warn('切回系统向量库后入队补算失败', tenantId, e instanceof Error ? e.message : e));
     return { ok: true };
   }
   // 外部 pgvector：先校验连接串（文案不带原串），拿到要用的 url 再去测连通
@@ -294,6 +302,18 @@ export async function saveVectorStore(actor: CurrentMember, input: { kind: strin
       await recordAudit(tx, { tenantId, actor, action: 'model_provider.vector_store_updated', targetType: 'model_provider', detail: { from, to: 'pgvector', urlRotated } });
     }
   });
+  // 存储切换的清理与补算都在事务提交之后（ADR-0058：外部库和平台表清理都进不了平台事务），失败只打日志（不带连接串）——配置已经保存
+  if (from === 'platform') {
+    // 切到外部库：删掉本租户在平台表里的全部行，再入队 catalog.embed 从零补算
+    await platformStore(tenantId).clear()
+      .catch(e => console.warn('切到外部向量库后清理平台表失败', tenantId, e instanceof Error ? e.message : e));
+    await ensureEmbeddings(tenantId)
+      .catch(e => console.warn('切到外部向量库后入队补算失败', tenantId, redactUrl(e instanceof Error ? e.message : String(e), url)));
+  } else if (urlRotated) {
+    // 换了连接串：新库是空的，入队从零补算（ensureEmbeddings 会先看缺多少，不缺就不入队）
+    await ensureEmbeddings(tenantId)
+      .catch(e => console.warn('更换外部向量库连接串后入队补算失败', tenantId, redactUrl(e instanceof Error ? e.message : String(e), url)));
+  }
   return { ok: true };
 }
 
