@@ -217,7 +217,11 @@ type UpgradeSample = Awaited<ReturnType<typeof sampleTemplateUpgrade>>;
 type Downstream = Awaited<ReturnType<typeof templateDownstream>>;
 
 /** 样例的取值：null 显示「—」，布尔显示「是 / 否」，其余按字符串 */
-const sampleValue = (v: unknown) => (v == null ? '—' : typeof v === 'boolean' ? (v ? '是' : '否') : String(v));
+const sampleValue = (v: unknown) => {
+  if (v == null) return '—';
+  if (typeof v === 'boolean') return v ? '是' : '否';
+  return String(v);
+};
 
 /**
  * 样例消费者表（#830）：一行一个消费者（最多 10 个，按 consumer_id 排序），并排 v1 / v2 的全部输出列；
@@ -343,6 +347,8 @@ function cmpSegment(a: string | null, b: string | null) {
 }
 
 const count = (n: number) => n.toLocaleString('en-US');
+/** 没有计数（只有一边有的列）时显示「—」 */
+const countOrDash = (n: number | null) => (n === null ? '—' : count(n));
 
 /** RFM 升级预览的分群对比（每个分群的 v1 / v2 人数、变化与 v2 占比）与「原分群 × 新分群」迁移矩阵（含没变的人，对角线淡显；计数本身不出消费者 ID，ADR-0025）。
  *  有结果层查看权限的成员点非零的格子查看样例消费者（#830） */
@@ -501,7 +507,7 @@ function ColumnUpgradeDistribution({ from, to, asOf, distribution, canSample, sa
                       className={`underline decoration-dotted underline-offset-2 hover:text-slate-900 ${sample?.pick.kind === 'column' && sample.pick.column === c.name ? 'font-medium text-slate-900' : ''}`}
                     >{count(c.changed)}</button>
                   </Form>
-                ) : c.changed === null ? '—' : count(c.changed)}
+                ) : countOrDash(c.changed)}
               </TableCell>
             </TableRow>
           ))}
