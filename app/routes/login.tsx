@@ -5,7 +5,7 @@ import type { Route } from './+types/login';
 import { formatServer } from '~/.server/i18n';
 import { getCurrentMember, requestMagicLink } from '~/.server/auth';
 import { getLocale } from '~/.server/locale';
-import { makeT, msg, useT, type Locale } from '~/lib/i18n';
+import { makeT, msg, useT } from '~/lib/i18n';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
@@ -13,9 +13,8 @@ import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '~/c
 import { Input } from '~/components/ui/input';
 
 export function meta({ matches }: Route.MetaArgs) {
-  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段（没有 data）
-  const rootMatch = (matches as Array<{ id: string; loaderData?: unknown }>).find(m => m.id === 'root');
-  const root = rootMatch?.loaderData as { locale?: Locale; messages?: Record<string, string> | null } | undefined;
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段（没有 data）；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
   const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
   return [{ title: t('登录 · CRM 数据分析平台') }];
 }

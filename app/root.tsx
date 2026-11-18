@@ -27,7 +27,7 @@ export const shouldRevalidate = () => false;
 
 export function Layout({ children }: { children: React.ReactNode }) {
   // ErrorBoundary 场景下 loader 数据为空，回退中文
-  const data = useRouteLoaderData('root');
+  const data = useRouteLoaderData<typeof loader>('root');
   const locale = data?.locale ?? 'zh-CN';
   const messages = data?.messages ?? null;
   return (
