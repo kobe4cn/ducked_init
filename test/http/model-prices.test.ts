@@ -1,4 +1,4 @@
-// test/http/model-prices.test.ts —— 运营后台模型单价页（#744）：新增 / 修改 / 校验拒绝 / 平台级审计与同值 no-op；costOf 折算纯函数
+// test/http/model-prices.test.ts —— 运营后台模型单价页（#744）：新增 / 修改 / 删除 / 校验拒绝 / 平台级审计与同值 no-op；costOf 折算纯函数
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { asc, inArray } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -150,6 +150,30 @@ describe('运营后台模型单价页', () => {
     expect(race[0]).toMatchObject({ inputPerMTok: 1.5, outputPerMTok: 2, currency: 'CNY' });
   });
 
+  it('删除：行消失、写一条带删除前单价的平台级审计；再删同一模型是 400', async () => {
+    const { browser } = await operator();
+    await post(browser, { model: 'm-keep' });
+    await post(browser, { model: 'm-drop', inputPerMTok: '1.5', outputPerMTok: '6', currency: 'USD' });
+
+    const del = (model: string) => browser.post('/ops/model-prices', { intent: 'delete-price', model });
+    expect((await del('m-drop')).status).toBe(302);
+    expect((await listModelPrices()).map(p => p.model)).toEqual(['m-keep']);
+    const page = await (await browser.get('/ops/model-prices')).text();
+    expect(page).not.toContain('data-model="m-drop"');
+    expect(page).toContain('data-model="m-keep"');
+
+    const again = await del('m-drop');
+    expect(again.status).toBe(400);
+    expect(await again.text()).toContain('没有模型 m-drop 的单价');
+
+    const events = await (await browser.get('/ops/audit')).text();
+    expect(times(auditActions(events), '删除模型单价')).toBe(1);
+    expect(events).toContain('m-drop：删除前 输入 1.5、输出 6 USD / 百万 token');
+    const [row] = await getDb().select().from(auditLogs).where(inArray(auditLogs.action, ['model_price.deleted']));
+    expect(row).toMatchObject({ tenantId: null, actorType: 'operator', actorEmail: OPS, targetId: 'm-drop' });
+    expect(row.detail).toEqual({ model: 'm-drop', inputPerMTok: 1.5, outputPerMTok: 6, currency: 'USD' });
+  });
+
   it('成员会话（包括租户管理员）访问模型单价页一律被拒绝', async () => {
     await createTenant('acme', '示例商贸', 'admin@acme.com');
     const admin = await loginAs(app, 'admin@acme.com');
@@ -159,5 +183,8 @@ describe('运营后台模型单价页', () => {
     const create = await post(admin);
     expect(create.status).toBe(302);
     expect(create.headers.get('Location')).toBe('/ops/login');
+    const remove = await admin.post('/ops/model-prices', { intent: 'delete-price', model: 'm-fast' });
+    expect(remove.status).toBe(302);
+    expect(remove.headers.get('Location')).toBe('/ops/login');
   });
 });
