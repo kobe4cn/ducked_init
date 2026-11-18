@@ -1078,7 +1078,7 @@ describe('模板升级', () => {
     expect(churnSampled).toMatch(/<td[^>]*>(是|否)<\/td><td[^>]*>(否|是)<\/td>/);
   });
 
-  it('下游影响按 API Key 列出最近 30 个 UTC 日的调用次数（#921）：名字与两个点查合计次数、次数从多到少、吊销的标「已吊销」；只列本租户，没有前缀与哈希；30 天内没人调用不出这一小节，churn 仍没有下游使用', async () => {
+  it('下游影响按 API Key 列出最近 30 个 UTC 日的调用次数（#921）：名字与两个点查合计次数、次数从多到少、次数相同按名字排（拼音）、吊销的标「已吊销」；只列本租户，没有前缀与哈希；30 天内没人调用不出这一小节，churn 仍没有下游使用', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     await createDispatcher({ maxWorkers: 2 }).runUntilIdle(); // 跑完任务让 RFM 进服务库
@@ -1096,6 +1096,10 @@ describe('模板升级', () => {
     const [support] = await getDb().insert(apiKeys).values({
       tenantId: acme, name: '客服系统', prefix: 'crm_bbbb', tokenHash: randomUUID(), createdByEmail: 'admin@acme.com', revokedAt: new Date(),
     }).returning();
+    // 报表导出与客服系统同为 1 次：按拼音 bao < ke 排在前面；按码点「报」U+62A5 >「客」U+5BA2 会排在后面
+    const [reports] = await getDb().insert(apiKeys).values({
+      tenantId: acme, name: '报表导出', prefix: 'crm_dddd', tokenHash: randomUUID(), createdByEmail: 'admin@acme.com',
+    }).returning();
     const globex = await newTenant('globex');
     const [globalKey] = await getDb().insert(apiKeys).values({
       tenantId: globex, name: '环球', prefix: 'crm_cccc', tokenHash: randomUUID(), createdByEmail: 'admin@globex.com',
@@ -1109,19 +1113,24 @@ describe('模板升级', () => {
       { tenantId: acme, apiKeyId: marketing.id, endpoint: 'consumers.byId', day: utcDay(29), calls: 1 },
       { tenantId: acme, apiKeyId: marketing.id, endpoint: 'consumers.byId', day: utcDay(30), calls: 1 },
       { tenantId: acme, apiKeyId: support.id, endpoint: 'consumers.byId', day: utcDay(0), calls: 1 },
+      { tenantId: acme, apiKeyId: reports.id, endpoint: 'consumers.bySource', day: utcDay(0), calls: 1 },
       { tenantId: globex, apiKeyId: globalKey.id, endpoint: 'consumers.byId', day: utcDay(0), calls: 9 },
     ]);
 
     const rfm = await (await preview()).text();
     expect(rfm).toContain('data-downstream-keys');
     // 营销自动化 3+2+1=6 次（窗口外的 1 次不计），排在只有 1 次的客服系统前面；已吊销的照样列出并标注
-    expect(rfm.indexOf('营销自动化 · 6 次')).toBeLessThan(rfm.indexOf('客服系统（已吊销） · 1 次'));
+    expect(rfm.indexOf('营销自动化 · 6 次')).toBeGreaterThanOrEqual(0);
+    expect(rfm.indexOf('营销自动化 · 6 次')).toBeLessThan(rfm.indexOf('报表导出 · 1 次'));
+    // 次数相同按名字排（cmpName，zh-CN 拼音），与库的 collation 无关
+    expect(rfm.indexOf('报表导出 · 1 次')).toBeLessThan(rfm.indexOf('客服系统（已吊销） · 1 次'));
     // 只列本租户的 Key，不出现前缀，也没有哈希
     expect(rfm).not.toContain('环球');
     expect(rfm).not.toContain('9 次');
     expect(rfm).not.toContain('crm_aaaa');
     expect(rfm).not.toContain('crm_bbbb');
     expect(rfm).not.toContain('crm_cccc');
+    expect(rfm).not.toContain('crm_dddd');
     expect(rfm).not.toMatch(/[0-9a-f]{64}/);
 
     // churn 不进服务库：仍写「没有下游使用」，不列 Key
