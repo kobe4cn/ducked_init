@@ -3,7 +3,7 @@
 // 再删掉 _serving/ 下除新版与上一版以外的旧文件。版本号只增不减，同一租户两个 serving.build 不会写同一个文件，
 // 先完成的新版本之后完成的旧版本不再生效。一律限定在给定租户内
 import { rm } from 'node:fs/promises';
-import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
+import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 import type { Tx } from './audit';
 import { getDb } from './db/client';
 import { dslDefinitions, dslVersions, servingStores, snapshots, tasks, type ServingStoreSnapshot } from './db/schema';
@@ -14,6 +14,7 @@ import { servingPath, type ServingParams } from './pipeline/serving-engine';
 import { readResult } from './pipeline/task-contracts';
 import { platformS3 } from './s3-accounts';
 import { deleteObject } from './s3-client';
+import { newestFirst } from './snapshots';
 import { insertTask, updateQueuedParams } from './tasks';
 import { lockTenant } from './tenant-lock';
 import { cmp } from '../lib/compare';
@@ -53,16 +54,16 @@ export async function enqueueServingBuild(tenantId: string) {
   });
 }
 
-/** 要放进服务库的快照（serving.build 的参数 snapshots）：每个模板最新、未过期的一张，指标、标签只取定义仍有已发布版本的，按模板排序。
+/** 要放进服务库的快照（serving.build 的参数 snapshots）：每个模板按统计日最新（newestFirst）、未过期的一张，指标、标签只取定义仍有已发布版本的，按模板排序。
  *  返回类型用契约推出的 ServingParams['snapshots']（loose schema 带索引签名，多余的指针字段原样放行），入队时直接可用 */
 async function servingSnapshots(tx: Tx, tenantId: string): Promise<ServingParams['snapshots']> {
   const published = new Set((await tx.selectDistinct({ kind: dslDefinitions.kind, key: dslDefinitions.key }).from(dslDefinitions)
     .innerJoin(dslVersions, and(eq(dslVersions.definitionId, dslDefinitions.id), eq(dslVersions.status, 'published')))
     .where(eq(dslDefinitions.tenantId, tenantId))).map(d => `${d.kind}:${d.key}`));
-  // 每个模板最新的一张：按登记时间倒序，取每个模板第一次出现的
+  // 每个模板最新的一张：按统计日（newestFirst）倒序，取每个模板第一次出现的
   const live = await tx.select().from(snapshots)
     .where(and(eq(snapshots.tenantId, tenantId), isNull(snapshots.expiredAt), gt(snapshots.expiresAt, new Date())))
-    .orderBy(desc(snapshots.createdAt), desc(snapshots.id));
+    .orderBy(...newestFirst);
   const latest = new Map<string, typeof live[number]>();
   for (const s of live) if (!latest.has(s.template)) latest.set(s.template, s);
   return [...latest.values()]

@@ -5,7 +5,7 @@
 // 发布过的定义显示最近一次刷新的时间与来源；有发布权限的成员可以按今天以生效版本重新计算，有早于生效版本的未过期快照时可以按各自的统计日以生效版本回刷
 // （都连同下游标签），没有权限时说明原因。最近一次计算因断言失败（比最新快照新）时，「最近一次刷新」上方显示红色失败提示（#839）：
 // 断言名与不合格行数人人可看；前几个不合格的键、来源映射与「查看样本」链接（/quality?task=…）只给有 sources:read 权限的角色，与 /quality 的边界一致，数据不进应答。
-// 本定义的全部快照（含已过期）按时间倒序列在「快照」区——分析页「指标与标签」列表每个定义只显示最新一张，历史在这里（#798）；
+// 本定义的全部快照（含已过期）按统计日从新到旧列在「快照」区——分析页「指标与标签」列表每个定义只显示最新一张，历史在这里（#798）；
 // 未过期的行点统计日进快照详情页（#816）。
 // 有修改与删除权限的成员可以删除定义（被已发布标签引用的指标删不了）。
 // 已发布过的定义带业务知识面板（ADR-0046）：alias.* / claim.* / note.* / subject.* / proposal.* 的提交交给 handleKnowledgeIntent，权限由领域函数检查，查看者看得到、提交 403
@@ -88,7 +88,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       assertions: d.lastFailure.assertions.map(describeAssertion),
       samples: can(member.role, 'sources:read') ? await failureSamples(member.tenant.id, d.lastFailure) : null,
     },
-    /** 本定义的全部快照（含已过期），按时间倒序；分析页「指标与标签」列表每个定义只显示最新一张，历史在这里（#798） */
+    /** 本定义的全部快照（含已过期），按统计日从新到旧（newestFirst）；分析页「指标与标签」列表每个定义只显示最新一张，历史在这里（#798） */
     snapshots: (await listSnapshots(member.tenant.id, `${d.kind}:${d.key}`)).map(s => ({
       id: s.id,
       version: s.definitionVersion,
@@ -446,7 +446,7 @@ export default function Definition({ loaderData, actionData }: Route.ComponentPr
       {snapshots.length > 0 && (
         <div className="rounded-2xl border bg-white p-6 shadow-sm">
           <h2 className="mb-1 font-medium">快照</h2>
-          <p className="mb-4 max-w-2xl text-sm text-slate-500">本定义按时间倒序的全部快照；同一统计日多次计算各占一行，旧的保留到过期。未过期的快照点统计日可看明细。</p>
+          <p className="mb-4 max-w-2xl text-sm text-slate-500">本定义按统计日从新到旧的全部快照；同一统计日多次计算各占一行（登记晚的在前），旧的保留到过期。未过期的快照点统计日可看明细。</p>
           <Table>
             <TableHeader>
               <TableRow>

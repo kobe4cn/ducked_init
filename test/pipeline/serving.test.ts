@@ -20,6 +20,7 @@ import { currentServingStore, enqueueServingBuild } from '../../app/.server/serv
 import { TEMPLATES } from '../../app/.server/pipeline/templates';
 import type { InputOf } from '../../app/.server/pipeline/task-contracts';
 import { enqueueDueExpiries, listSnapshots } from '../../app/.server/snapshots';
+import { todayUtc } from '../../app/.server/templates';
 import { syncSource } from '../../app/.server/source-sync';
 import { enqueueTask, getTask } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
@@ -65,7 +66,8 @@ async function onLake<T = Record<string, unknown>>(tenantId: string, sql: string
 /** 身份打通与订单映射已发布，跑出 RFM 快照，双人发布指标 revenue、带城市维度的 revenue_by_city 与引用 revenue 的标签 value_tier */
 async function publishedDefinitions() {
   const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
-  expect(await runTask(acme, 'gold.rfm', { asOf: '2024-07-01' })).toMatchObject({ status: 'succeeded' });
+  // asOf 取当天：映射合并已自动启用了一张当天 asOf 的 rfm 快照（trigger publish），这里跑的这张登记更晚、同一统计日胜出，服务库选它
+  expect(await runTask(acme, 'gold.rfm', { asOf: todayUtc() })).toMatchObject({ status: 'succeeded' });
   await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
   await createDefinition(author, 'metric', 'revenue_by_city', REVENUE_BY_CITY);
   await publishDefinition(reviewer, 'metric', 'revenue', 1);
@@ -263,6 +265,34 @@ describe('自动重建服务库', () => {
     expect(next.snapshots.map(s => s.template)).toEqual(['metric:revenue', 'metric:revenue_by_city', 'rfm']);
     expect(await readServing(acme, next.path, 'SELECT count(*)::INT AS n FROM tags')).toEqual([{ n: 0 }]);
     expect(await servingVersions(dataPath)).toEqual([store.version, next.version]);
+  });
+
+  it('服务库选统计日最新的快照：统计日早一天、后登记的回刷快照不会顶进服务库；同一统计日取登记较晚的那张', async () => {
+    const { acme, snapshots } = await publishedDefinitions();
+    const rfm = snapshots.find(s => s.template === 'rfm')!;
+    // 直接登记一张同模板的快照（表名照抄已有那张，湖里的表还在），返回登记的快照
+    const register = async (asOf: string, trigger: 'backfill' | 'manual') => {
+      const [task] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'lake.inventory', status: 'succeeded' }).returning();
+      const [row] = await getDb().insert(snapshotsTable).values({
+        tenantId: acme, template: 'rfm', taskId: task.id, table: rfm.table, params: { asOf }, trigger,
+        rowCount: rfm.rowCount, expiresAt: new Date(Date.now() + 86_400_000),
+      }).returning();
+      return row!;
+    };
+    // 重建一次服务库，返回它放进来的 rfm 快照
+    const rebuild = async () => {
+      expect(await enqueueServingBuild(acme)).not.toBeNull();
+      await drain();
+      return (await currentServingStore(acme))!.snapshots.find(s => s.template === 'rfm')!;
+    };
+
+    // 统计日早一天、刚登记的回刷快照：服务库仍用统计日为当天的那张（publishedDefinitions 里 runTask 跑出的）
+    await register(new Date(Date.now() - 86_400_000).toISOString().slice(0, 10), 'backfill');
+    expect((await rebuild()).id).toBe(rfm.id);
+
+    // 同一统计日、登记更晚的另一张：服务库换成它
+    const later = await register(todayUtc(), 'manual');
+    expect((await rebuild()).id).toBe(later.id);
   });
 
   it('快照过期后自动重建，不再放过期的快照', async () => {
