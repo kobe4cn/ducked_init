@@ -3,7 +3,7 @@
 // 有起草权限的成员保存草稿（参数不合法时报错）、丢弃草稿；草稿由最后保存它的人以外的另一位有发布权限的成员发布（ADR-0015），
 // 发布后以新参数入队一次模板计算，产出的快照记下定义版本；有发布权限的成员也可以按生效的版本重新计算，选填不晚于今天的参考日期。
 // 没有已发布版本时生效的是模板的默认参数（不能重新计算）。注册表有了比生效版本锁定的更新的模板版本时显示提示条：可以预览升级差异
-// （RFM 是一句话结论、分群对比与迁移矩阵，其他模板是变化人数；没有 consumer_id），提示条与预览结果的头部列出锁定版本之后每一版的改动说明（模板注册表里的 changes），
+// （RFM 是一句话结论、分群对比与迁移矩阵，其他模板是一句话结论、按列统计对比与变化人数；没有 consumer_id），提示条与预览结果的头部列出锁定版本之后每一版的改动说明（模板注册表里的 changes），
 // 有起草权限的成员确认升级后得到一版锁定新模板版本的草稿，照常双人发布（ADR-0021）
 import { AlertTriangle, ArrowUpCircle, CheckCircle2, Eye, Lock, Plus, RefreshCw, X } from 'lucide-react';
 import { useState } from 'react';
@@ -13,6 +13,7 @@ import { can, deniedReason, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import { PublishError, publishReason } from '~/.server/publishing';
 import { TEMPLATES, type ParamField } from '~/.server/pipeline/templates';
+import type { ColumnStat, ColumnType } from '~/.server/pipeline/templates/upgrade-summary';
 import type { RfmDefinition, ScoreRange, SegmentRule } from '~/.server/pipeline/templates/rfm';
 import { TaskError } from '~/.server/tasks';
 import {
@@ -195,7 +196,7 @@ function ChangeList({ changes }: { changes: { version: number; changes: string }
 
 /**
  * 有新模板版本时的提示条：预览升级差异（intent=preview-upgrade，选填参考日期），有起草权限时确认升级（intent=upgrade）；
- * 草稿已锁定新版本时说明发布后生效。预览结果：RFM 是一句话结论、分群对比与迁移矩阵，其他模板是变化、新增、移出人数
+ * 草稿已锁定新版本时说明发布后生效。预览结果：RFM 是一句话结论、分群对比与迁移矩阵，其他模板是一句话结论、按列统计对比与变化、新增、移出人数
  */
 function UpgradeBanner({ latest, locked, changes, draft, canDraft, today, diff, submitting }: {
   latest: number; locked: number; changes: { version: number; changes: string }[]; draft: { version: number; templateVersion: number | null } | null;
@@ -238,9 +239,10 @@ function UpgradeBanner({ latest, locked, changes, draft, canDraft, today, diff, 
               <span>{diff.summary.text}</span>
             </p>
           )}
-          {diff.distribution && <SegmentUpgradeDistribution from={diff.from} to={diff.to} distribution={diff.distribution} />}
+          {diff.distribution?.kind === 'segments' && <SegmentUpgradeDistribution from={diff.from} to={diff.to} distribution={diff.distribution} />}
+          {diff.distribution?.kind === 'columns' && <ColumnUpgradeDistribution from={diff.from} to={diff.to} distribution={diff.distribution} />}
           {diff.metric && (
-            <p data-upgrade-metric className="text-sm">{`取值变化 ${diff.metric.changed} 人，新增 ${diff.metric.added} 人，移出 ${diff.metric.removed} 人`}</p>
+            <p data-upgrade-metric className="text-sm text-slate-500">{`取值变化 ${diff.metric.changed} 人，新增 ${diff.metric.added} 人，移出 ${diff.metric.removed} 人`}</p>
           )}
         </div>
       )}
@@ -258,7 +260,9 @@ function cmpSegment(a: string | null, b: string | null) {
 const count = (n: number) => n.toLocaleString('en-US');
 
 /** RFM 升级预览的分群对比（每个分群的 v1 / v2 人数、变化与 v2 占比）与「原分群 × 新分群」迁移矩阵（含没变的人，对角线淡显；只有计数，ADR-0025） */
-function SegmentUpgradeDistribution({ from, to, distribution }: { from: number; to: number; distribution: NonNullable<UpgradeDiff['distribution']> }) {
+function SegmentUpgradeDistribution({ from, to, distribution }: {
+  from: number; to: number; distribution: Extract<NonNullable<UpgradeDiff['distribution']>, { kind: 'segments' }>;
+}) {
   const names = (side: 'before' | 'after') => [...new Set(distribution[side].map(s => s.segment))];
   // 对比表的行是 v1 / v2 分群名的并集（只有一边有的分群另一边人数为 0）；矩阵行是原分群、列是新分群，迁移里出现的「（无）」（新增或移出）也各占一行/列
   const compareRows = [...new Set([...names('before'), ...names('after')])].sort(cmpSegment);
@@ -311,6 +315,69 @@ function SegmentUpgradeDistribution({ from, to, distribution }: { from: number; 
               {columns.map(a => (
                 <TableCell key={a ?? '（无）'} className={a === b ? 'text-slate-400' : undefined}>{count(moved(b, a))}</TableCell>
               ))}
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
+/** 非 RFM 升级预览的按列对比：每个输出列（不含 consumer_id）一行，并排 v1 / v2 统计量与换了取值的人数（只有计数与统计量，不出单个消费者的取值，ADR-0025） */
+function ColumnUpgradeDistribution({ from, to, distribution }: {
+  from: number; to: number; distribution: Extract<NonNullable<UpgradeDiff['distribution']>, { kind: 'columns' }>;
+}) {
+  const typeLabel: Record<ColumnType, string> = { bool: '布尔', number: '数值', text: '文本', other: '其他' };
+  // 布尔列的占比用该边自己的总人数算；数值列的 null（这一列全为 null）与缺列的一边都显示「—」
+  const cell = (c: ColumnStat, side: 'before' | 'after') => {
+    const total = distribution.total[side];
+    const percent = (n: number) => (total > 0 ? ((n / total) * 100).toFixed(1) : '0.0');
+    if (c.type === 'bool') {
+      const stat = c[side];
+      return stat === null ? '—' : `${count(stat.yes)} 人（${percent(stat.yes)}%）`;
+    }
+    if (c.type === 'number') {
+      const stat = c[side];
+      if (stat === null) return '—';
+      const decimal = (n: number | null) => (n === null ? '—' : n.toFixed(2));
+      return (
+        <div>
+          <div>{`均值 ${decimal(stat.mean)}`}</div>
+          <div>{`中位数 ${decimal(stat.median)}`}</div>
+          <div>{`P90 ${decimal(stat.p90)}`}</div>
+        </div>
+      );
+    }
+    if (c.type === 'text') {
+      const stat = c[side];
+      return stat === null || stat.values.length === 0 ? '—' : (
+        <div>{stat.values.map((v, i) => <div key={i}>{`${v.value ?? '（无）'}：${count(v.consumers)} 人`}</div>)}</div>
+      );
+    }
+    const stat = c[side];
+    return stat === null ? '—' : `非空 ${count(stat.nonNull)} 人`;
+  };
+  return (
+    <div className="space-y-2">
+      <p className="text-xs font-medium text-slate-400">按列对比</p>
+      <Table data-upgrade-columns>
+        <TableHeader>
+          <TableRow>
+            <TableHead>字段</TableHead>
+            <TableHead>类型</TableHead>
+            <TableHead>{`v${from}`}</TableHead>
+            <TableHead>{`v${to}`}</TableHead>
+            <TableHead>换了取值的人数</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {distribution.columns.map(c => (
+            <TableRow key={c.name}>
+              <TableCell>{c.name}</TableCell>
+              <TableCell>{typeLabel[c.type]}</TableCell>
+              <TableCell>{cell(c, 'before')}</TableCell>
+              <TableCell>{cell(c, 'after')}</TableCell>
+              <TableCell>{c.changed === null ? '—' : count(c.changed)}</TableCell>
             </TableRow>
           ))}
         </TableBody>

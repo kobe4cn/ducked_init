@@ -142,6 +142,7 @@ describe('升级预览与确认', () => {
     expect(preview.segments!.reduce((n, t) => n + t.consumers, 0)).toBe(Number(total));
     // 分群对比：v1 各分群人数之和等于快照行数；每个 v2:X 的人数等于 v1 的 X
     const d = preview.distribution!;
+    if (d.kind !== 'segments') throw new Error(`预览的分群对比 kind 应是 segments：${d.kind}`);
     expect(d.before.reduce((n, s) => n + s.consumers, 0)).toBe(Number(total));
     expect(d.after).toEqual(d.before.map(s => ({ segment: `v2:${s.segment}`, consumers: s.consumers })));
     // 迁移矩阵（含没变的人）：对角线（原分群 = 新分群）为 0，全部格子的人数之和是 v1 与 v2 的并集（这里同一批人，即快照行数）
@@ -202,8 +203,30 @@ describe('升级预览与确认', () => {
     await drain();
     const [{ n }] = await onLake<{ n: string }>(acme, `SELECT count(*)::VARCHAR AS n FROM gold."churn__${task.id}"`);
     expect(Number(n)).toBeGreaterThan(0);
-    expect(await previewTemplateUpgrade(author, 'churn', '2024-10-15'))
-      .toEqual({ template: 'churn', from: 1, to: 2, asOf: '2024-10-15', segments: null, metric: { changed: Number(n), added: 0, removed: 0 }, distribution: null, summary: null });
+    const churn = await previewTemplateUpgrade(author, 'churn', '2024-10-15');
+    expect(churn).toMatchObject({
+      template: 'churn', from: 1, to: 2, asOf: '2024-10-15', segments: null,
+      metric: { changed: Number(n), added: 0, removed: 0 },
+    });
+    // 按列对比（#858）：不含 consumer_id，只有计数与统计量（ADR-0025）
+    const distribution = churn.distribution!;
+    if (distribution.kind !== 'columns') throw new Error(`预览的按列对比 kind 应是 columns：${distribution.kind}`);
+    expect(distribution.total).toEqual({ before: Number(n), after: Number(n) });
+    expect(distribution.columns.map(c => c.name)).not.toContain('consumer_id');
+    const column = (name: string) => distribution.columns.find(c => c.name === name);
+    // v2 是 NOT at_risk：两边「是」的人数相加等于总人数，每个人都换了取值
+    const atRisk = column('at_risk');
+    if (atRisk?.type !== 'bool') throw new Error('at_risk 应是 bool 列');
+    expect(atRisk.before!.yes + atRisk.after!.yes).toBe(Number(n));
+    expect(atRisk.changed).toBe(Number(n));
+    // v2 没改订单数：orders 的统计量两边相同，没有人换取值
+    const orders = column('orders');
+    if (orders?.type !== 'number') throw new Error('orders 应是 number 列');
+    expect(orders.after).toEqual(orders.before);
+    expect(orders.changed).toBe(0);
+    expect(churn.summary!.warn).toBe(true);
+    expect(churn.summary!.text).toContain('变化最大的字段：at_risk 为是');
+    expect(JSON.stringify(churn)).not.toMatch(/[0-9a-f]{64}/);
 
     // 第 2 版的 minOrders 不超过 10
     await saveDraft(author, 'churn', { minOrders: 20 });
