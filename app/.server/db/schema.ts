@@ -699,6 +699,9 @@ export const dslVersions = platform.table('dsl_versions', {
 // allow_samples 打开后才把敏感列已哈希的样本行发给模型，默认只发表结构与列统计
 // fast / reasoning 档位三列（ADR-0055）：租户按档位绑的模型，只在 chat 三列整套生效时才起作用。模型名必填；
 // 端点留空表示沿用本租户默认的端点与 Key（这时档位的端点与 Key 都存 null），要换端点时端点与 Key 一起填，Key 用同一个 context 加密
+// 向量存储四列（ADR-0058，#848）：vector_store 选平台库还是租户自己的外部 pgvector（默认 platform；#849 起检索真正切换）。
+// 连接串整串用 context vector_store 加密（url 只在这一个输入框里换主机）、保存时先测连通失败不保存，checked_at / error 记最近一次结果；
+// 切回 platform 时这三列保留，方便撤回
 export const modelProviders = platform.table('model_providers', {
   tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
   baseUrl: text('base_url'),
@@ -718,8 +721,12 @@ export const modelProviders = platform.table('model_providers', {
   toolsSupported: boolean('tools_supported'),
   toolsProbedBaseUrl: text('tools_probed_base_url'),
   toolsProbedModel: text('tools_probed_model'),
+  vectorStore: text('vector_store').$type<'platform' | 'pgvector'>().notNull().default('platform'),
+  vectorStoreUrl: text('vector_store_url'),
+  vectorStoreCheckedAt: timestamp('vector_store_checked_at', { withTimezone: true }),
+  vectorStoreError: text('vector_store_error'),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-});
+}, t => [check('model_providers_vector_store', sql`${t.vectorStore} in ('platform', 'pgvector')`)]);
 
 // 模型调用日志（ADR-0035）：每次调用一行，成功、HTTP 失败与 Schema 校验失败都记。不存提示词与返回原文（里面可能有样本行），
 // embedding 调用（ADR-0049）也不存请求文本与向量，只记条数 input_count。

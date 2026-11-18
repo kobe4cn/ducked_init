@@ -1,6 +1,7 @@
 // app/routes/model-provider.tsx —— 模型服务（仅管理员）：看当前用平台默认还是本租户配置；保存端点、模型名与 API Key（Key 不回显，留空沿用）、
 // 恢复平台默认、测试连通性（同时显示是否支持工具调用）、开关发送脱敏样本；embedding 端点（ADR-0049）单独一张卡，与 chat 互不影响；
-// fast / reasoning 档位（ADR-0055 路由③a）再一张卡，按用途换模型，端点留空沿用本租户的端点与 Key
+// fast / reasoning 档位（ADR-0055 路由③a）再一张卡，按用途换模型，端点留空沿用本租户的端点与 Key；
+// 向量存储（ADR-0058，#848）一张卡：选系统自带还是外部 pgvector，连接串加密不回显，保存时先测连通失败不保存
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleAlert } from 'lucide-react';
 import type { Route } from './+types/model-provider';
@@ -8,7 +9,7 @@ import { requirePermission } from '~/.server/access';
 import { prefetchEmbeddings } from '~/.server/catalog/versions';
 import {
   getModelProvider, ModelProviderError, resetEmbeddingProvider, resetModelProvider, resetTierProvider, SAMPLE_ROWS, saveEmbeddingProvider,
-  saveModelProvider, saveTierProvider, setAllowSamples, testEmbeddingProvider, testModelProvider,
+  saveModelProvider, saveTierProvider, saveVectorStore, setAllowSamples, testEmbeddingProvider, testModelProvider, testVectorStore,
 } from '~/.server/model-provider';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
@@ -66,6 +67,15 @@ export async function action({ request }: Route.ActionArgs) {
       case 'embedding_test':
         // 不重定向：测试结果只在这次响应里展示
         return { embeddingTested: await testEmbeddingProvider(member) };
+      // 向量存储（#848）：保存时先测连通、失败不保存，结果（连同「测试连接」的）只在这次响应里展示；
+      // 切回「系统自带」不测连通，照别的保存一样重定向
+      case 'vector_store_save': {
+        const checked = await saveVectorStore(member, { kind: field('vectorStore'), url: field('vectorStoreUrl') });
+        if (checked.ok && field('vectorStore') === 'platform') break;
+        return { vectorStoreChecked: checked };
+      }
+      case 'vector_store_test':
+        return { vectorStoreChecked: await testVectorStore(member) };
       case 'reset':
         await resetModelProvider(member);
         break;
@@ -96,6 +106,9 @@ const EMBEDDING_SOURCE_LABEL = {
   platform: '当前使用平台默认的 embedding 端点',
   none: '还没有配置 embedding：不配置时目录检索只用关键词',
 } as const;
+
+/** 向量存储（ADR-0058，#848）两种选型的名字 */
+const VECTOR_STORE_LABEL = { platform: '系统自带', pgvector: '外部 pgvector' } as const;
 
 /** 每档的名字与它管哪些用途（ADR-0055 的 PURPOSE_TIER 决定，页面只做说明） */
 const TIER_LABEL: Record<'fast' | 'reasoning', { title: string; hint: string }> = {
@@ -174,6 +187,7 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
   // 三个成员的联合会被 TS 规范化成带交叉可选属性的形状（tested?: undefined），in 之后属性仍可能 undefined，先收进局部再判空
   const tested = actionData && 'tested' in actionData ? actionData.tested : null;
   const embeddingTested = actionData && 'embeddingTested' in actionData ? actionData.embeddingTested : null;
+  const vectorStoreChecked = actionData && 'vectorStoreChecked' in actionData ? actionData.vectorStoreChecked : null;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -340,6 +354,87 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
                 placeholder={provider.embedding.apiKeySet ? '已设置，留空不修改' : '未设置'}
               />
               {provider.embedding.apiKeySet && <FieldDescription>改了端点须重新填写，原来的 Key 不会发给新的端点。</FieldDescription>}
+            </Field>
+            <div>
+              <Button type="submit" disabled={submitting}>保存</Button>
+            </div>
+          </FieldGroup>
+        </Form>
+      </div>
+
+      {vectorStoreChecked && (vectorStoreChecked.ok ? (
+        <Alert role="status" data-vector-store-test="ok">
+          <CheckCircle2 className="text-emerald-600" />
+          <AlertTitle>连接成功</AlertTitle>
+          <AlertDescription>外部 pgvector 连通正常。</AlertDescription>
+        </Alert>
+      ) : (
+        <Alert variant="destructive" role="alert" data-vector-store-test="failed">
+          <CircleAlert />
+          <AlertTitle>连接失败</AlertTitle>
+          <AlertDescription>{vectorStoreChecked.error}</AlertDescription>
+        </Alert>
+      ))}
+
+      {/* 向量存储（ADR-0058，#848）：这里只存选型与连接串，补算与检索真正切到外部库在 #849 */}
+      <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
+        <SectionHeader title="向量存储">
+          当前：<span data-vector-store-kind={provider.vectorStore.kind}>{VECTOR_STORE_LABEL[provider.vectorStore.kind]}</span>
+        </SectionHeader>
+        <p className="text-sm text-slate-500">检索向量存在平台库，或租户自己的外部 PostgreSQL（pgvector 扩展）。连接串加密保存、保存后不再显示；选外部 pgvector 时保存前先测试连通，失败不保存。</p>
+        {provider.vectorStore.kind === 'pgvector' && (
+          <div data-vector-store-checked={provider.vectorStore.checkedAt ?? ''} className="text-sm">
+            {provider.vectorStore.error ? (
+              <span data-vector-store-status="failed" className="flex items-center gap-1 text-red-600">
+                <CircleAlert className="size-4" />上次检查未通过：{provider.vectorStore.error}
+              </span>
+            ) : provider.vectorStore.checkedAt ? (
+              <span data-vector-store-status="ok" className="flex items-center gap-1 text-emerald-600">
+                <CheckCircle2 className="size-4" />上次检查 {new Date(provider.vectorStore.checkedAt).toLocaleString('zh-CN')}，连接正常
+              </span>
+            ) : (
+              <span data-vector-store-status="never" className="flex items-center gap-1 text-slate-400">
+                <AlertTriangle className="size-4" />还没有测试过连接
+              </span>
+            )}
+          </div>
+        )}
+        <div className="flex flex-wrap gap-2">
+          <Form method="post">
+            <input type="hidden" name="intent" value="vector_store_test" />
+            <Button type="submit" variant="outline" disabled={submitting || !provider.vectorStore.urlSet}>测试连接</Button>
+          </Form>
+        </div>
+        {/* 同上：非受控输入框不跟着新 defaultValue 刷新，保存后靠 key 重挂载回服务端新值 */}
+        <Form method="post" key={`${provider.vectorStore.kind}|${provider.vectorStore.urlSet}`}>
+          <input type="hidden" name="intent" value="vector_store_save" />
+          <FieldGroup>
+            <Field>
+              <FieldLabel>存储</FieldLabel>
+              <div className="space-y-2 text-sm">
+                <label className="flex items-center gap-2">
+                  <input type="radio" name="vectorStore" value="platform" defaultChecked={provider.vectorStore.kind === 'platform'} className="size-4" />
+                  系统自带（存平台库）
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="radio" name="vectorStore" value="pgvector" defaultChecked={provider.vectorStore.kind === 'pgvector'} className="size-4" />
+                  外部 pgvector（租户自己的 PostgreSQL）
+                </label>
+              </div>
+              {provider.vectorStore.urlSet && provider.vectorStore.kind === 'platform' && (
+                <FieldDescription>已保存过外部库的连接串，切回外部 pgvector 时留空沿用。</FieldDescription>
+              )}
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="vector-store-url">连接串</FieldLabel>
+              <Input
+                id="vector-store-url"
+                name="vectorStoreUrl"
+                type="password"
+                autoComplete="off"
+                placeholder={provider.vectorStore.urlSet ? '已设置，留空不修改' : 'postgres://user:password@host:5432/dbname'}
+              />
+              <FieldDescription>postgres:// 或 postgresql:// 开头；换主机时填新的连接串。</FieldDescription>
             </Field>
             <div>
               <Button type="submit" disabled={submitting}>保存</Button>
