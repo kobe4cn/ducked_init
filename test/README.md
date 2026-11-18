@@ -173,6 +173,7 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 |---|---|
 | `startApp()` | 启动服务端（vite 缓存目录按 worker 分开：`node_modules/.vite-test_w<i>`；测试进程设了 `REACT_ROUTER_SKIP_TYPEGEN=1`，开发服务器不生成路由类型，#615，补丁见 `patches/`），返回 `TestApp`：`client()` 新浏览器、`outbox` 已发邮件、`drain()` 等后台发信完成、`close()` |
 | `Client` | `get(path)`、`post(path, form)`（数组值提交多次）、`request(path, init)`、`cookie(name)`；不自动跟随重定向 |
+| `setLlmFetch(f)` / `setPgvectorConnect(f)` | 替换模型服务的 fetch / 外部 pgvector 的建连（pgvector 替身只要实现 `query`，见 `vector-store-pgvector.ts` 的 `setPgvectorConnect`）；传 `undefined` 恢复默认替身（都不连真实地址），`afterEach` 里恢复 |
 | `loginAs(app, email)` | 走完 Magic Link 登录，返回已登录的 `Client`（成员须已存在，可先 `memberOf` 加入） |
 | `loginAsOperator(app, email)` | 运营者登录（Magic Link + TOTP），返回 `{ browser, secret }` |
 | `createTenant(slug, name, adminEmail)` / `createOperator(email)` / `resetOperatorTotp(email)` | 进程内调用运营命令背后的领域函数（不起子进程）：开通租户（返回 `{ tenant, space, admin, lakeReady }`）/ 创建运营者 / 重置 TOTP；出错时抛错（如 `TenantError`），用 `rejects` 断言。用的是测试进程自己的连接池，文件的 `afterAll` 要 `closeDb()` |

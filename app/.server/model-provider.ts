@@ -4,10 +4,13 @@
 // 测试连通性时的工具调用探测结果连同当时的端点、模型存下来（#531：存助手实际要用的 reasoning 档位那一套），toolSupport 给 AI 助手判断能不能用。
 // embedding 端点（ADR-0049）自成一套同样的保存 / 恢复 / 测试，与 chat 互不影响；
 // fast / reasoning 档位（ADR-0055 路由③a）是租户按用途绑的模型，只在 chat 三项整套生效时才有意义，保存 / 恢复同样在这里
+// 向量存储（ADR-0058，#848）也在这里：选平台库还是外部 pgvector、连接串加密保存（context vector_store，不回显），
+// 保存时先测连通失败不保存；这里只存设置，补算与检索真正切换在 #849
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
+import { preparePgvector } from './catalog/vector-store-pgvector';
 import { getDb } from './db/client';
 import { modelProviders } from './db/schema';
 import { chatJson, chatTools, chatToolsWith, embed, embeddingSource, LlmError, MODEL_PROVIDER_CONTEXT, providerSource, resolveEmbeddingProvider, resolveProvider, resolveRoute, type LlmRoute } from './llm';
@@ -32,6 +35,8 @@ export interface ModelProviderView {
   embedding: { source: 'tenant' | 'platform' | 'none'; baseUrl: string | null; model: string | null; apiKeySet: boolean };
   /** 档位（ADR-0055 路由③a）：租户按用途绑的模型。model 为空表示该档没绑定、用默认那一套；端点为空表示沿用本租户默认的端点与 Key */
   tiers: Record<'fast' | 'reasoning', { model: string | null; baseUrl: string | null; apiKeySet: boolean }>;
+  /** 向量存储（ADR-0058，#848）：当前选的库与最近一次连通检查；连接串只告诉页面有没有，明文与密文都不出这个模块 */
+  vectorStore: { kind: 'platform' | 'pgvector'; urlSet: boolean; checkedAt: string | null; error: string | null };
 }
 
 const rowOf = async (tenantId: string) =>
@@ -59,6 +64,12 @@ export async function getModelProvider(actor: CurrentMember): Promise<ModelProvi
     tiers: {
       fast: tierView(row, 'fast'),
       reasoning: tierView(row, 'reasoning'),
+    },
+    vectorStore: {
+      kind: row?.vectorStore ?? 'platform',
+      urlSet: Boolean(row?.vectorStoreUrl),
+      checkedAt: row?.vectorStoreCheckedAt?.toISOString() ?? null,
+      error: row?.vectorStoreError ?? null,
     },
   };
 }
@@ -222,6 +233,85 @@ export async function resetTierProvider(actor: CurrentMember, tier: 'fast' | 're
       .returning({ tenantId: modelProviders.tenantId });
     if (cleared.length) await recordAudit(tx, { tenantId, actor, action: 'model_provider.reset', targetType: 'model_provider', detail: { tier } });
   });
+}
+
+/** 向量存储保存 / 测试的结果：失败时 error 已由 preparePgvector 抹掉连接串与密码，可以直接给页面显示 */
+export type VectorStoreResult = { ok: true } | { ok: false; error: string };
+
+/** 向量存储连接串的加密 context（ADR-0058；与 API Key 的 model_provider 分开，用途不同不共用） */
+const VECTOR_STORE_CONTEXT = 'vector_store';
+
+/**
+ * 保存向量存储的选型（ADR-0058，#848）：选外部 pgvector 时连接串整串加密保存（不回显，留空沿用已存的密文；主机只能通过填新连接串来改，
+ * 规则同 sealApiKey）。保存前先在事务外调 preparePgvector 测连通并建表，失败不写库、把抹过凭据的错误返回给页面显示。
+ * 选 platform 时忽略表单里的连接串、不测连通，url / checked_at / error 三列原样保留（切回时不丢配置，方便撤回）。
+ * 审计只记 from / to / urlRotated；存储没换且连接串也没换时不记。「测试连接」不在这里，见 testVectorStore
+ */
+export async function saveVectorStore(actor: CurrentMember, input: { kind: string; url: string }): Promise<VectorStoreResult> {
+  assertCan(actor, 'model_provider:manage');
+  const tenantId = actor.tenant.id;
+  if (input.kind !== 'platform' && input.kind !== 'pgvector') throw new ModelProviderError('向量存储须是「系统自带」或「外部 pgvector」');
+  const row = await rowOf(tenantId);
+  const from = row?.vectorStore ?? 'platform';
+  const existingUrl = row?.vectorStoreUrl ? (await decryptForTenant(tenantId, VECTOR_STORE_CONTEXT, row.vectorStoreUrl)).url : null;
+  const filled = input.url.trim();
+  if (input.kind === 'platform') {
+    if (from === 'platform') return { ok: true }; // 什么都没变，不写库也不记审计（同 setAllowSamples）
+    await getDb().transaction(async tx => {
+      await tx.insert(modelProviders).values({ tenantId, vectorStore: 'platform' })
+        .onConflictDoUpdate({ target: modelProviders.tenantId, set: { vectorStore: 'platform', updatedAt: new Date() } });
+      await recordAudit(tx, { tenantId, actor, action: 'model_provider.vector_store_updated', targetType: 'model_provider', detail: { from, to: 'platform', urlRotated: false } });
+    });
+    return { ok: true };
+  }
+  // 外部 pgvector：先校验连接串（文案不带原串），拿到要用的 url 再去测连通
+  let url: string;
+  if (filled) {
+    let parsed: URL;
+    try {
+      parsed = new URL(filled);
+    } catch {
+      throw new ModelProviderError('连接串须是 postgres:// 或 postgresql:// 开头的完整地址');
+    }
+    if (parsed.protocol !== 'postgres:' && parsed.protocol !== 'postgresql:') throw new ModelProviderError('连接串须是 postgres:// 或 postgresql:// 开头的完整地址');
+    url = filled;
+  } else if (existingUrl) {
+    url = existingUrl; // 留空沿用已存的密文（改主机只能通过填新连接串）
+  } else {
+    throw new ModelProviderError('第一次选择外部 pgvector 须填写连接串');
+  }
+  const prepared = await preparePgvector(url);
+  if (!prepared.ok) return prepared; // 不写库：设置与实际可用保持一致（ADR-0058）
+  const urlRotated = Boolean(filled) && filled !== existingUrl;
+  const sealed = urlRotated ? await encryptForTenant(tenantId, VECTOR_STORE_CONTEXT, { url }) : row?.vectorStoreUrl ?? null;
+  await getDb().transaction(async tx => {
+    await tx.insert(modelProviders).values({ tenantId, vectorStore: 'pgvector', vectorStoreUrl: sealed, vectorStoreCheckedAt: new Date(), vectorStoreError: null })
+      .onConflictDoUpdate({
+        target: modelProviders.tenantId,
+        set: { vectorStore: 'pgvector', vectorStoreUrl: sealed, vectorStoreCheckedAt: new Date(), vectorStoreError: null, updatedAt: new Date() },
+      });
+    if (from !== 'pgvector' || urlRotated) {
+      await recordAudit(tx, { tenantId, actor, action: 'model_provider.vector_store_updated', targetType: 'model_provider', detail: { from, to: 'pgvector', urlRotated } });
+    }
+  });
+  return { ok: true };
+}
+
+/**
+ * 用已存的连接串测外部 pgvector 连通（不换配置）：结果写进 vector_store_checked_at / vector_store_error，页面显示上次检查时间与状态。
+ * 还没配置连接串时直接失败、不发起连接。照 embedding 的测试，不记审计
+ */
+export async function testVectorStore(actor: CurrentMember): Promise<VectorStoreResult> {
+  assertCan(actor, 'model_provider:manage');
+  const tenantId = actor.tenant.id;
+  const row = await rowOf(tenantId);
+  if (!row?.vectorStoreUrl) return { ok: false, error: '还没有配置外部 pgvector 连接串' };
+  const result = await preparePgvector((await decryptForTenant(tenantId, VECTOR_STORE_CONTEXT, row.vectorStoreUrl)).url);
+  // 只写检查结果两列：配置没改，不动 updated_at（同工具调用探测的写法）
+  await getDb().update(modelProviders)
+    .set({ vectorStoreCheckedAt: new Date(), vectorStoreError: result.ok ? null : result.error })
+    .where(eq(modelProviders.tenantId, tenantId));
+  return result;
 }
 
 /** tools：模型是否支持工具调用（AI 助手要用，ADR-0042）；null 是这次没能确认（模型没调用探测工具，或临时故障） */
