@@ -506,7 +506,7 @@ describe('用户 360 模板参数页与快照（通用表单与汇总视图）',
   it('user360 快照默认打开汇总：总人数、有订单人数与各渠道同意人数和湖上 count 一致，没有逐人明细，页面没有明文', async () => {
     const { acme } = await publishedIdentitySources({ orders: true, consents: true });
     await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'user360'))[0]!;
+    const snapshot = (await listSnapshots(acme, 'user360')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     const browser = await loginAs(app, 'viewer@acme.com');
 
@@ -532,7 +532,7 @@ describe('用户 360 模板参数页与快照（通用表单与汇总视图）',
   it('user360 汇总页按 consumer_id 查单人：湖上真实 id 显示一行全部列并回显，不存在的 id 与注入串显示提示且 200', async () => {
     const { acme } = await publishedIdentitySources({ orders: true, consents: true });
     await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'user360'))[0]!;
+    const snapshot = (await listSnapshots(acme, 'user360')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
     await memberOf(acme, 'viewer@acme.com', 'viewer');
     const browser = await loginAs(app, 'viewer@acme.com');
 
