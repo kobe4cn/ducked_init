@@ -218,6 +218,25 @@ describe('按主题生成知识提案', () => {
     expect((await generations(acme))[0]!.proposalCount).toBe(4);
   });
 
+  it('丢弃超过 20 条时审计的 dropped 只记前 20 条，invalid 照常计全部', async () => {
+    const { acme, analyst, subjectId } = await setup();
+    platformDefault();
+    const bad = Array.from({ length: 25 }, (_, i) => (
+      { kind: 'alias', targetId: `entity:nope${i}`, alias: `野名${i}`, evidence: [], reason: '目标不在主题条目里' }
+    ));
+    fakeLlm(setLlmFetch, () => json(modelOutput(bad), USAGE));
+
+    const out = await suggestForSubject(analyst, subjectId);
+    expect(out).toMatchObject({ fresh: true, created: 4, invalid: 25 });
+    const [audit] = await auditsOf(acme, 'knowledge_proposal.generated');
+    const detail = audit!.detail as { invalid: number; dropped: unknown[] };
+    expect(detail.invalid).toBe(25);
+    expect(detail.dropped).toHaveLength(20);
+    expect(detail.dropped).toEqual(Array.from({ length: 20 }, (_, i) => (
+      { targetId: `entity:nope${i}`, reason: 'target_not_in_entries' }
+    )));
+  });
+
   it('生成期间依据变了的目标计 stale 不写入：快照在调模型前取，模型应答前另一位成员发布指标 v2', async () => {
     const { acme, analyst, reviewer, subjectId } = await setup();
     await addMembership(analyst, subjectId, 'field:order.status'); // 普通字段没有依据、永不过期，用来对照
