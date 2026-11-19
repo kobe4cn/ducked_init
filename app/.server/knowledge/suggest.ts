@@ -19,6 +19,7 @@ import { stripStats } from '../catalog/versions';
 import type { LlmMessage } from '../llm';
 import { ALIAS_MAX_LENGTH } from './aliases';
 import { stableJson } from './basis';
+import { asRecord } from './known';
 import type { ProposalInput } from './proposals';
 
 /** 生成器的版本号：提案行的 generator_version；提示词或转换规则变了要换 */
@@ -247,9 +248,6 @@ export function outputToProposals(output: SuggestOutput, input: SubjectInput): P
   }
   return out;
 }
-
-/** 提案内容按 Record 取键（形状由 outputToProposals 保证，这里只取要比较的键，取不到按没有处理） */
-const asRecord = (content: unknown): Record<string, unknown> => (content && typeof content === 'object' ? content as Record<string, unknown> : {});
 
 /** 别名去首尾空白、不分大小写（与 addAlias 入库的规范化一致，apply-pack 的比较同款） */
 const normAlias = (content: unknown): string => {
