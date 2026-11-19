@@ -116,6 +116,23 @@ describe('把知识来源解析成知识提案', () => {
     expect(JSON.stringify(audit!.detail)).not.toContain('幽灵');
   });
 
+  it('丢弃超过 20 条时审计的 dropped 只记前 20 条，invalid 照常计全部', async () => {
+    const { acme, analyst, source } = await setup();
+    platformDefault();
+    const bad = Array.from({ length: 25 }, (_, i) => (
+      { kind: 'note', targetId: 'entity:nope', note: `不在目录里 ${i + 1}`, evidence: [{ paragraph: 1 }], reason: '目标不在输入里' }
+    ));
+    fakeLlm(setLlmFetch, () => json(modelOutput(bad), USAGE));
+
+    const out = await importFromSource(analyst, source.id);
+    expect(out).toMatchObject({ created: 3, invalid: 25 });
+    const [audit] = await auditsOf(acme, 'knowledge_source.parsed');
+    const detail = audit!.detail as { invalid: number; dropped: unknown[] };
+    expect(detail.invalid).toBe(25);
+    expect(detail.dropped).toHaveLength(20);
+    expect(detail.dropped[0]).toEqual({ targetId: 'entity:nope', reason: 'target_not_in_input' });
+  });
+
   it('模型输出 kind:note 但没有 note（正文写进 reason）时不合 Schema：422、没有新提案、没有 knowledge_source.parsed 审计', async () => {
     const { acme, analyst, source } = await setup();
     platformDefault();
