@@ -6,7 +6,7 @@ let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
-afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 /** 申请 Magic Link 并等待后台签发与发信完成 */
 async function requestLink(browser: Client, email: string) {
@@ -176,6 +176,39 @@ describe('租户与 Magic Link 登录', () => {
     vi.setSystemTime(Date.now() + 15 * 60 * 1000 + 1000);
     expect((await requestLink(app.client(), 'admin@acme.com')).status).toBe(200);
     expect(app.outbox).toHaveLength(6);
+  });
+
+  it('未打开英文开关时，带 crm_locale=en 的 cookie 登录页也仍是中文', async () => {
+    const res = await app.client().get('/login', { Cookie: 'crm_locale=en' });
+    const html = await res.text();
+    expect(html).toContain('lang="zh-CN"');
+    expect(html).toContain('<title>登录 · CRM 数据分析平台</title>');
+    expect(html).toContain('登录 CRM 数据分析平台');
+    expect(html).not.toContain('Sign in');
+  });
+
+  it('打开英文开关并带 crm_locale=en 时，登录页整页英文，html lang 为 en', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const res = await app.client().get('/login', { Cookie: 'crm_locale=en' });
+    const html = await res.text();
+    expect(html).toContain('lang="en"');
+    expect(html).toContain('<title>Sign in · CRM Data Analytics Platform</title>');
+    // 页面文案全英文；水合数据里的脚本会带中文词典键（键就是中文原文），断言前先去掉脚本
+    const strip = html.replace(/<script[\s\S]*?<\/script>/g, '');
+    expect(strip).toContain('Sign in to CRM Data Analytics Platform');
+    for (const zh of ['登录 CRM 数据分析平台', '输入受邀邮箱', '请查收邮件', '工作邮箱', '发送登录链接', '仅限受邀成员']) {
+      expect(strip).not.toContain(zh);
+    }
+  });
+
+  it('英文界面下限流提示是英文复数句式', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const browser = app.client();
+    for (let i = 0; i < 5; i++) expect((await requestLink(browser, 'admin@acme.com')).status).toBe(200);
+    const limited = await browser.post('/login', { email: 'admin@acme.com' }, { Cookie: 'crm_locale=en' });
+    expect(limited.status).toBe(429);
+    expect(await limited.text()).toMatch(/Too many requests\. Please try again in \d+ minutes\./);
   });
 
   it('申请登录的响应不等待签发与发信，已登记邮箱无法通过响应时间被探测', async () => {
