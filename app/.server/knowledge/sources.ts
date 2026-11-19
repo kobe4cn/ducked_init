@@ -2,13 +2,15 @@
 // 带版本地保存。只存原文，不调模型（解析成提案是 #526）；SQL 与文本只是待解析的数据，绝不执行。服务端不做内容识别，
 // 只限长度与段数（页面上提示「只粘贴元数据说明，不要粘贴业务数据」是 #527）。同租户同标题的再粘贴不新建来源：
 // 种类与正文都没变时返回现有版本（不加版本、不记审计），变了版本 +1、正文更新。一律限定在操作者所属租户内。
+// 每次保存的正文一版一行留存在 knowledge_source_versions（#966，修订 #525 的「只存当前正文」）：知识来源行上仍是当前正文，
+// 历史版本可按 (来源, 版本) 读回（getKnowledgeSource 带 version），提案证据指向的段落随时能回溯。
 // 审计 knowledge_source.created 的 detail 只有标题、种类、版本与段数，不记原文
 import { and, eq } from 'drizzle-orm';
 import { assertCan } from '../access';
 import { recordAudit } from '../audit';
 import { sha256, type CurrentMember } from '../auth';
 import { getDb, isUniqueViolation } from '../db/client';
-import { knowledgeSources } from '../db/schema';
+import { knowledgeSources, knowledgeSourceVersions } from '../db/schema';
 import { UUID } from '../tenants';
 import {
   KNOWLEDGE_SOURCE_BODY_MAX, KNOWLEDGE_SOURCE_KINDS, KNOWLEDGE_SOURCE_PARAGRAPHS_MAX, KNOWLEDGE_SOURCE_TITLE_MAX,
@@ -22,10 +24,11 @@ export interface SourceParagraph { no: number; text: string }
 /** 保存结果：来源 id、当前版本与段落列表（段号从 1 开始） */
 export interface SavedKnowledgeSource { id: string; version: number; paragraphs: SourceParagraph[] }
 
-/** 读出的来源：标题、种类、版本、段落与两个时间 */
+/** 读出的来源：标题、种类、版本、段落与两个时间；version 是实际显示的版本（带 ?v= 读历史版时是那一版），currentVersion 是来源行上的当前版本 */
 export interface KnowledgeSource extends SavedKnowledgeSource {
   title: string;
   kind: KnowledgeSourceKind;
+  currentVersion: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -71,7 +74,8 @@ function bodyOf(body: unknown, kind: KnowledgeSourceKind) {
 /**
  * 保存成员粘贴的来源原文（#525），需要 definitions:draft。同租户同标题的再粘贴不新建来源：种类与正文（哈希）都没变时
  * 返回现有版本、不加版本也不记审计；变了版本 +1、种类与正文更新，审计 knowledge_source.created（detail 不含原文）。
- * 并发下两人同时首存同标题会撞 (tenant, title) 唯一键：重试一次就走更新分支
+ * 每次保存都在同一事务里往 knowledge_source_versions 写一行这一版的正文（#966，created_by_email 是这一版的保存人）。
+ * 并发下两人同时首存同标题会撞 (tenant, title) 唯一键：重试一次就走更新分支（版本行随事务回滚，不会重复）
  */
 export async function saveKnowledgeSource(
   actor: CurrentMember, input: { title: unknown; kind: unknown; body: unknown },
@@ -95,6 +99,8 @@ export async function saveKnowledgeSource(
             .set({ kind, body, bodyHash, version: existing.version + 1, updatedAt: new Date() })
             .where(eq(knowledgeSources.id, existing.id)).returning()
           : await tx.insert(knowledgeSources).values({ tenantId, title, kind, body, bodyHash, createdByEmail: actor.email }).returning();
+        await tx.insert(knowledgeSourceVersions)
+          .values({ tenantId, sourceId: row.id, version: row.version, kind, body, bodyHash, createdByEmail: actor.email });
         await recordAudit(tx, {
           tenantId, actor, action: 'knowledge_source.created', targetType: 'knowledge_source', targetId: row.id,
           detail: { title, kind, version: row.version, paragraphs: paragraphs.length },
@@ -108,16 +114,32 @@ export async function saveKnowledgeSource(
   }
 }
 
-/** 读一个来源，有 definitions:read 就能看（原文是成员写的元数据说明，不是业务数据）；不是 UUID、不存在或属于别的租户时 400 */
-export async function getKnowledgeSource(member: CurrentMember, id: unknown): Promise<KnowledgeSource> {
+/**
+ * 读一个来源，有 definitions:read 就能看（原文是成员写的元数据说明，不是业务数据）；不是 UUID、不存在或属于别的租户时 400。
+ * 带 version 且不是当前版时读那一版的历史正文（#966）：version 是实际显示的版本、updatedAt 是那一版的保存时刻；
+ * 版本不存在不是错误——回退当前版（version = currentVersion = 行上的 version），页面上再提示段号可能对不上
+ */
+export async function getKnowledgeSource(member: CurrentMember, id: unknown, version?: number): Promise<KnowledgeSource> {
   assertCan(member, 'definitions:read');
   const [row] = typeof id === 'string' && UUID.test(id)
     ? await getDb().select().from(knowledgeSources)
       .where(and(eq(knowledgeSources.id, id), eq(knowledgeSources.tenantId, member.tenant.id)))
     : [];
   if (!row) throw new KnowledgeError('没有这个来源');
+  if (version !== undefined && version !== row.version) {
+    const [past] = await getDb().select().from(knowledgeSourceVersions)
+      .where(and(
+        eq(knowledgeSourceVersions.tenantId, member.tenant.id),
+        eq(knowledgeSourceVersions.sourceId, row.id),
+        eq(knowledgeSourceVersions.version, version),
+      ));
+    if (past) return {
+      id: row.id, title: row.title, kind: past.kind, version: past.version, currentVersion: row.version,
+      paragraphs: paragraphsOf(past.body, past.kind), createdAt: row.createdAt, updatedAt: past.createdAt,
+    };
+  }
   return {
-    id: row.id, title: row.title, kind: row.kind, version: row.version,
+    id: row.id, title: row.title, kind: row.kind, version: row.version, currentVersion: row.version,
     paragraphs: paragraphsOf(row.body, row.kind), createdAt: row.createdAt, updatedAt: row.updatedAt,
   };
 }
