@@ -41,6 +41,10 @@ process.env.SOURCE_LARGE_TABLE_ROWS = '1000';
 // 命令行已设时以它为准
 process.env.SOURCE_CONNECT_TIMEOUT_SECONDS ??= '20';
 process.env.SOURCE_CONNECT_RETRIES ??= '2';
+// 湖 catalog 的 ATTACH 建连同样经 podman 网关偶发卡住（#938）：工作台 60 秒计时器内唯一走网络的一步，超时报「查询超过 60 秒」。
+// 15 秒 × 重试 2 次 = 45 秒 < 工作台的 60 秒，重试用完前不会被工作台计时器抢先；命令行已设时以它为准；见 #938
+process.env.LAKE_CONNECT_TIMEOUT_SECONDS ??= '15';
+process.env.LAKE_CONNECT_RETRIES ??= '2';
 // 设置 TEST_S3_LAKE_URI（如 s3://crm-lake/platform-test）后，隔离测试在对象存储上再跑一遍。
 // 平台账号取 S3_*，未设置时用本地 SeaweedFS 的开发账号（db_script/docker-compose.yml）；租户账号由测试开通租户时经 IAM API 创建
 if (process.env.TEST_S3_LAKE_URI) {
