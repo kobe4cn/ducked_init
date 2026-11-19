@@ -58,6 +58,21 @@ describe('buildKnowledgeHub', () => {
     expect(buildKnowledgeHub(entries, []).groups.map(g => g.subject)).toEqual(['订单', '营收', 'Alpha', 'Zeta', null]);
   });
 
+  it('subjectNames 里没有待处理条目的主题也有一组（items 为空、不进「有条目的主题」），条目已有的主题不重开一组', () => {
+    const entries: CatalogEntry[] = [metric('revenue', UNKNOWN_UNIT, { subjects: ['营收'] })];
+    const hub = buildKnowledgeHub(entries, [], ['会员价值', '营收']);
+
+    // 会员价值没有条目也在（cmpName：h 在 y 前）；「未归入主题」组不因 subjectNames 出现
+    expect(hub.groups.map(g => g.subject)).toEqual(['会员价值', '营收']);
+    expect(hub.groups[0]).toMatchObject({ subject: '会员价值', proposals: 0, missing: 0, items: [] });
+    expect(hub.groups[1].items.map(i => i.targetId)).toEqual(['metric:revenue']);
+    // 有条目的主题只数有待处理条目的主题（口径不变）
+    expect(hub.totals).toEqual({ proposals: 0, missing: 1, subjects: 1 });
+    // 没有任何主题、也没有待处理条目时才没有组（集中页的空态）
+    expect(buildKnowledgeHub([], [], ['会员价值']).groups).toHaveLength(1);
+    expect(buildKnowledgeHub([], []).groups).toHaveLength(0);
+  });
+
   it('需复核的 unknown 记为 needsReview，普通 unknown 记为 unknown，没有声明记为 undeclared', () => {
     const entries: CatalogEntry[] = [
       metric('stale', [], { claims: [{ type: 'unit', value: 'unknown', previous: 'currency_major', needsReview: true }] }),

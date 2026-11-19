@@ -5,7 +5,8 @@
 // - 金额字段：type 为 decimal、所属实体已接入（tables 非空）的字段，检查单位与币种。没有 sources:read 的成员目录里实体的 tables 已清空，所以他们看不到金额字段的缺失项
 // - 指标：只检查单位（sum / avg / min / max / latest / earliest 的系统单位是 unknown，没有成员声明时列为缺失）
 // 分组按 knowledge.subjects（主题名，cmpName 排序）：属于多个主题的每组各出现一次，不属于任何主题的进最后的「未归入主题」组（subject 为 null）；
-// 总数按条目去重
+// subjectNames（租户的全部主题）里没有待处理条目的主题也有一组（items 为空），这样按主题「生成建议」的入口不随知识补齐消失（#951）；
+// 总数按条目去重，「有条目的主题」只数有待处理条目的主题
 import type { CurrentMember } from '../auth';
 import { catalogFor } from '../assistant/tools';
 import type { Catalog, CatalogEntry, EntityEntry, FieldEntry, MetricEntry, TagEntry } from '../catalog';
@@ -13,6 +14,7 @@ import { getDb } from '../db/client';
 import { cmpName } from '../../lib/compare';
 import type { Claim } from './catalog';
 import { listProposals, type Proposal } from './proposals';
+import { listSubjects } from './subjects';
 
 /** 集中页与业务知识面板处理的目录条目 */
 export type HubEntry = EntityEntry | FieldEntry | MetricEntry | TagEntry;
@@ -51,13 +53,14 @@ function missingOf(e: HubEntry, connected: ReadonlySet<string>): HubItem['missin
   });
 }
 
-/** 由目录条目与待确认提案算出集中页；proposals 应只含 status 为 proposed 的 */
-export function buildKnowledgeHub(entries: CatalogEntry[], proposals: Proposal[]): KnowledgeHub {
+/** 由目录条目、待确认提案与租户的全部主题名算出集中页；proposals 应只含 status 为 proposed 的，subjectNames 里的主题没有待处理条目也有一组 */
+export function buildKnowledgeHub(entries: CatalogEntry[], proposals: Proposal[], subjectNames: string[] = []): KnowledgeHub {
   const counts = new Map<string, number>();
   for (const p of proposals) if (p.mappingId === null) counts.set(p.targetId, (counts.get(p.targetId) ?? 0) + 1);
   const connected = new Set(entries.flatMap(e => (e.kind === 'entity' && e.tables.length > 0 ? [e.id] : [])));
 
   const bySubject = new Map<string | null, HubItem[]>();
+  for (const s of subjectNames) bySubject.set(s, []);
   let totalProposals = 0;
   let totalMissing = 0;
   for (const e of entries) {
@@ -80,11 +83,15 @@ export function buildKnowledgeHub(entries: CatalogEntry[], proposals: Proposal[]
       items,
     };
   });
-  return { totals: { proposals: totalProposals, missing: totalMissing, subjects: named.length }, groups };
+  // 「有条目的主题」只数有待处理条目的主题：空组不计（口径不变，#951）
+  const subjectsWithItems = groups.filter(g => g.subject !== null && g.items.length > 0).length;
+  return { totals: { proposals: totalProposals, missing: totalMissing, subjects: subjectsWithItems }, groups };
 }
 
-/** 成员看到的集中页；catalog 已取好时传进来，免得再读一次目录 */
+/** 成员看到的集中页；catalog 已取好时传进来，免得再读一次目录（主题名再查一次，与 loader 的 subjectIds 重复可接受） */
 export async function knowledgeHub(member: CurrentMember, catalog?: Catalog): Promise<KnowledgeHub> {
   const c = catalog ?? await catalogFor(member);
-  return buildKnowledgeHub(c.entries, await listProposals(getDb(), member.tenant.id, { status: 'proposed' }));
+  const proposals = await listProposals(getDb(), member.tenant.id, { status: 'proposed' });
+  const subjectNames = (await listSubjects(getDb(), member.tenant.id)).map(s => s.name);
+  return buildKnowledgeHub(c.entries, proposals, subjectNames);
 }
