@@ -1,5 +1,6 @@
 // test/http/api.test.ts —— 外部系统接口的 HTTP 接缝：管理员在「API Key」页创建（明文只展示一次）、吊销；外部系统带 Bearer Key 调 /api/v1/catalog。
 // 非管理员看不到页面；没有 Key、Key 错误、已吊销、租户已暂停一律同样的 401，成员的 cookie 不算数；A 租户管理员吊销不了 B 的 Key，各自的 Key 只看到本租户的目录。
+// 目录条目在 YAML 的 description 之外带业务知识里当前的业务说明（note，#968）：最新一版、保存即生效，没写或清空为 null。
 // 点查 /api/v1/consumers/:id：数据由身份打通夹具、RFM 与已发布的指标、标签跑出快照，调度器自动生成服务库；?snapshot= 只读查湖里那张快照表。
 // 成功的点查按天记入 api_key_usage（ADR-0059，401/404/503/?snapshot= 不记），计数按租户隔离。
 // Bearer Key 打不开成员页面，也没有通往标准层、沙箱的接口；成员存下（并分享出去）的沙箱表不进服务库，也不出现在目录接口里
@@ -8,6 +9,7 @@ import { DuckDBInstance } from '@duckdb/node-api';
 import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { sha256 } from '../../app/.server/auth';
+import { saveBusinessNote } from '../../app/.server/business-notes';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { apiKeyUsage, apiKeys, auditLogs, snapshots as snapshotsTable, sources as sourcesTable, spaces as spacesTable, tasks } from '../../app/.server/db/schema';
 import { API_ENDPOINTS } from '../../app/lib/api-docs';
@@ -221,6 +223,46 @@ describe('目录接口', () => {
 
     const theirs = await (await call('/api/v1/catalog', globexKey)).json();
     expect(theirs.definitions.map((d: { key: string }) => d.key)).toEqual(['secret']);
+  });
+
+  it('条目带业务知识里当前的业务说明（note）：取最新一版、没写或清空为 null、description 仍取 YAML；同名指标各自的说明只在本租户的目录里', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const engineer = await memberOf(acme, 'de@acme.com', 'data_engineer');
+    await createDefinition(analyst, 'metric', 'revenue', `description: 累计消费金额\n${REVENUE}`);
+    await publishDefinition(engineer, 'metric', 'revenue', 1);
+    await createDefinition(analyst, 'tag', 'buyer', BUYER);
+    await publishDefinition(engineer, 'tag', 'buyer', 1);
+    await createDefinition(analyst, 'metric', 'points', REVENUE);
+    await publishDefinition(engineer, 'metric', 'points', 1);
+    await saveBusinessNote(analyst, { targetId: 'metric:revenue', note: '旧版说明' });
+    await saveBusinessNote(analyst, { targetId: 'metric:revenue', note: '财务口径：只算已支付' });
+    await saveBusinessNote(analyst, { targetId: 'tag:buyer', note: '下过单的都算买家' });
+
+    const globex = await newTenant('globex');
+    const globexAnalyst = await memberOf(globex, 'analyst@globex.com', 'analyst');
+    await createDefinition(globexAnalyst, 'metric', 'revenue', REVENUE);
+    await publishDefinition(await memberOf(globex, 'de@globex.com', 'data_engineer'), 'metric', 'revenue', 1);
+    await saveBusinessNote(globexAnalyst, { targetId: 'metric:revenue', note: '环球自己的口径' });
+
+    const { key } = await createKey(await loginAs(app, 'admin@acme.com'), '营销自动化');
+    const { key: globexKey } = await createKey(await loginAs(app, 'admin@globex.com'), '环球');
+    const byTarget = async (k: string) => new Map<string, { description: string | null; note: string | null }>(
+      (await (await call('/api/v1/catalog', k)).json()).definitions.map((d: { kind: string; key: string; description: string | null; note: string | null }) => [`${d.kind}:${d.key}`, d]));
+
+    const acme1 = await byTarget(key);
+    expect(acme1.get('metric:revenue')).toMatchObject({ description: '累计消费金额', note: '财务口径：只算已支付' });
+    expect(acme1.get('tag:buyer')).toMatchObject({ description: null, note: '下过单的都算买家' });
+    expect(acme1.get('metric:points')).toMatchObject({ note: null }); // 没写过说明的条目
+
+    // 清空（空串）后 note 为 null，description 不受影响
+    await saveBusinessNote(analyst, { targetId: 'metric:revenue', note: '' });
+    const acme2 = await byTarget(key);
+    expect(acme2.get('metric:revenue')).toMatchObject({ description: '累计消费金额', note: null });
+
+    const theirs = await byTarget(globexKey);
+    expect([...theirs.keys()]).toEqual(['metric:revenue']);
+    expect(theirs.get('metric:revenue')).toMatchObject({ note: '环球自己的口径' });
   });
 
   it('A 租户管理员吊销不了 B 租户的 Key，B 的 Key 照常可用', async () => {
