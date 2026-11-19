@@ -5,5 +5,6 @@
   "快照不存在或已过期": "Snapshot not found or expired",
   "目录": "Catalog",
   "点查": "Lookup",
-  "导出": "Export"
+  "导出": "Export",
+  "已删除沙箱表 {name}，分享一并撤销，湖里的数据随后清理": "Deleted sandbox table {name}. Its shares were revoked; its data in the lake will be cleaned up shortly."
 }
