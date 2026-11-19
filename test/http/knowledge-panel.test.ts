@@ -2,13 +2,13 @@
 // 分析师、数据工程师、管理员提交 alias.* / claim.* / note.* / subject.* 后面板与目录（expand 的 knowledge）立即反映；查看者看得到、没有编辑入口、提交 403；
 // 依据变了的知识显示「待复核」；待复核的别名可以确认（alias.confirm）：确认后 302、别名仍在且不再待复核，不待复核的确认 400；从未发布过的定义只提示发布后才能添加；待确认的知识提案可以接受、修改后接受、拒绝（理由必填），已处理或依据已变化时 409、显示错误；
 // 数据地图字段抽屉（lineage）里有实体面板与 ?field= 展开的字段面板（不带说明区，敏感字段没有面板），自定义实体详情页（entity）有同一个实体面板
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { analysisSubjects, knowledgeAliases } from '../../app/.server/db/schema';
+import { analysisSubjects, auditLogs, knowledgeAliases } from '../../app/.server/db/schema';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { addAlias } from '../../app/.server/knowledge/aliases';
@@ -190,6 +190,8 @@ describe('业务知识面板', () => {
     expect(panel).not.toContain('value="alias.confirm"');
     expect(panel).toContain('value="alias.retire"');
     expect(await knowledgeOf(acme)).toEqual({ aliases: ['营收'] });
+    const audits = await getDb().select().from(auditLogs).where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'alias.confirmed')));
+    expect(audits.map(a => a.detail)).toContainEqual(expect.objectContaining({ previousAliasId: alias!.id }));
 
     // 确认后换成新行，已不再待复核：再确认 400，面板 role="alert" 显示中文消息
     const [renewed] = (await getDb().select().from(knowledgeAliases).where(eq(knowledgeAliases.tenantId, acme))).filter(r => !r.retiredAt);
