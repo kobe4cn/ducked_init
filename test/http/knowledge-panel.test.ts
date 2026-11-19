@@ -1,6 +1,6 @@
 // test/http/knowledge-panel.test.ts —— 业务知识面板（ADR-0046）的 HTTP 接缝：指标 / 标签详情页（analytics.definitions.$kind.$key）的面板显示系统事实与成员写的知识，
 // 分析师、数据工程师、管理员提交 alias.* / claim.* / note.* / subject.* 后面板与目录（expand 的 knowledge）立即反映；查看者看得到、没有编辑入口、提交 403；
-// 依据变了的知识显示「待复核」；从未发布过的定义只提示发布后才能添加；待确认的知识提案可以接受、修改后接受、拒绝（理由必填），已处理或依据已变化时 409、显示错误；
+// 依据变了的知识显示「待复核」；待复核的别名可以确认（alias.confirm）：确认后 302、别名仍在且不再待复核，不待复核的确认 400；从未发布过的定义只提示发布后才能添加；待确认的知识提案可以接受、修改后接受、拒绝（理由必填），已处理或依据已变化时 409、显示错误；
 // 数据地图字段抽屉（lineage）里有实体面板与 ?field= 展开的字段面板（不带说明区，敏感字段没有面板），自定义实体详情页（entity）有同一个实体面板
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -130,7 +130,7 @@ describe('业务知识面板', () => {
 
   it('查看者看得到同样的知识，没有编辑入口，提交 403', async () => {
     const { acme, analyst } = await setup();
-    await addAlias(analyst, { targetId: TARGET, alias: '营收' });
+    const aliasId = await addAlias(analyst, { targetId: TARGET, alias: '营收' });
     await saveBusinessNote(analyst, { targetId: TARGET, note: '只算已支付' });
     const viewer = await loginAs(app, 'view@acme.com');
 
@@ -143,6 +143,7 @@ describe('业务知识面板', () => {
     expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'note.save', note: '改掉' })).status).toBe(403);
     expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'claim.save', type: 'currency', value: 'CNY' })).status).toBe(403);
     expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'subject.create', name: '营收' })).status).toBe(403);
+    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'alias.confirm', aliasId })).status).toBe(403);
     expect(await knowledgeOf(acme)).toEqual({ aliases: ['营收'], note: '只算已支付' });
   });
 
@@ -165,6 +166,36 @@ describe('业务知识面板', () => {
     const draft = await panelOf(an, '/analytics/definitions/metric/draft_only');
     expect(draft).toContain('发布后才能添加业务知识');
     expect(draft).not.toContain('name="intent"');
+  });
+
+  it('待复核的别名在「停用」前有「确认」按钮，确认后 302、别名仍在且不再待复核、按钮消失；对不待复核的别名确认 400 并在面板显示中文消息', async () => {
+    const { acme, reviewer, analyst } = await setup();
+    await addAlias(analyst, { targetId: TARGET, alias: '营收' });
+    await saveDslDraft(analyst, 'metric', 'paid_revenue', REVENUE_V2);
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 2);
+    const an = await loginAs(app, 'an@acme.com');
+    const post = (form: Record<string, string>) => an.post(METRIC, { targetId: TARGET, ...form });
+
+    // 按钮：待复核的别名 chip 里，「确认」在「停用」前面，带 aliasId
+    const [alias] = await getDb().select().from(knowledgeAliases).where(eq(knowledgeAliases.tenantId, acme));
+    let panel = await panelOf(an, METRIC);
+    const chip = panel.match(/<li data-alias="营收"[^>]*data-needs-review[\s\S]*?<\/li>/)![0];
+    expect(chip).toContain(`name="aliasId" value="${alias!.id}"`);
+    expect(chip.indexOf('value="alias.confirm"')).toBeLessThan(chip.indexOf('value="alias.retire"'));
+
+    expect((await post({ intent: 'alias.confirm', aliasId: alias!.id })).status).toBe(302);
+    panel = await panelOf(an, METRIC);
+    expect(panel).toContain('data-alias="营收"');
+    expect(panel).not.toContain('data-needs-review');
+    expect(panel).not.toContain('value="alias.confirm"');
+    expect(panel).toContain('value="alias.retire"');
+    expect(await knowledgeOf(acme)).toEqual({ aliases: ['营收'] });
+
+    // 确认换出头新行后已不再待复核：再确认 400，面板 role="alert" 显示中文消息
+    const [renewed] = (await getDb().select().from(knowledgeAliases).where(eq(knowledgeAliases.tenantId, acme))).filter(r => !r.retiredAt);
+    const bad = await post({ intent: 'alias.confirm', aliasId: renewed!.id });
+    expect(bad.status).toBe(400);
+    expect(decode(await bad.text())).toContain('这个别名不需要复核');
   });
 
   it('待确认的提案显示种类、内容、证据，接受前不进知识区与目录；直接接受别名、改值后接受口径声明与业务说明，提案消失、知识区与目录是改后的值', async () => {

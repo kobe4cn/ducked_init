@@ -1,6 +1,6 @@
 // app/components/knowledge-panel.tsx —— 业务知识面板（ADR-0046）：左边是系统事实（目录条目的只读内容、系统口径文字与派生的口径声明），右边是成员写的知识
 // （待确认的知识提案、别名、口径声明、业务说明、分析主题）。提案可以接受、修改后接受、填理由拒绝（主题归属与词的默认指向只有接受与拒绝，分别显示主题名、「『词』默认指这一条」）。每个表单都带 intent 与 targetId，交给路由 action 里的 handleKnowledgeIntent；不能编辑时不渲染任何表单和按钮。
-// 需复核的知识配 amber 图标与「待复核」，生效的配 emerald。panel 为 null（定义从未发布过）时只提示发布后才能添加
+// 需复核的知识配 amber 图标与「待复核」，生效的配 emerald；待复核的别名多一个「确认」按钮（alias.confirm），确认后换一依据行、不再待复核。panel 为 null（定义从未发布过）时只提示发布后才能添加
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { Fragment } from 'react';
 import { Form, Link } from 'react-router';
@@ -210,6 +210,12 @@ function Aliases({ panel, targetId }: { panel: Panel; targetId: string }) {
             <li key={a.id} data-alias={a.alias} data-needs-review={a.needsReview || undefined} className="flex items-center gap-2 rounded-full border px-3 py-1 text-sm">
               {a.alias}
               {a.needsReview && <Status needsReview />}
+              {panel.canEdit && a.needsReview && (
+                <KnowledgeForm intent="alias.confirm" targetId={targetId}>
+                  <input type="hidden" name="aliasId" value={a.id} />
+                  <Button type="submit" size="xs" variant="ghost">确认</Button>
+                </KnowledgeForm>
+              )}
               {panel.canEdit && (
                 <KnowledgeForm intent="alias.retire" targetId={targetId}>
                   <input type="hidden" name="aliasId" value={a.id} />
