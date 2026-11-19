@@ -42,12 +42,20 @@ export const makeT = (locale: Locale, messages: Record<string, string> | null): 
   (key, params) => translate(locale, messages, key, params);
 
 const I18nContext = createContext<T>(makeT('zh-CN', null));
+// 语言单独一个 context：数字 / 日期格式化（format.ts）只要语言、不要词典
+const LocaleContext = createContext<Locale>('zh-CN');
 
-/** 把当前语言的翻译函数发给组件树（无 Provider 时回退中文，见 ErrorBoundary 场景） */
-export function I18nProvider({ t, children }: { t: T; children: ReactNode }) {
-  return createElement(I18nContext.Provider, { value: t }, children);
+/** 把当前语言的翻译函数和语言本身发给组件树（无 Provider 时回退中文，见 ErrorBoundary 场景） */
+export function I18nProvider({ t, locale, children }: { t: T; locale: Locale; children: ReactNode }) {
+  return createElement(LocaleContext.Provider, { value: locale },
+    createElement(I18nContext.Provider, { value: t }, children));
 }
 
 export function useT(): T {
   return useContext(I18nContext);
+}
+
+/** 当前界面语言，给数字 / 日期 / 金额格式化（format.ts）用；不从 react-router 读 root loaderData，这里不依赖路由 */
+export function useLocale(): Locale {
+  return useContext(LocaleContext);
 }

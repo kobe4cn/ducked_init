@@ -1,7 +1,8 @@
 // app/routes/llm-usage.tsx —— 「模型调用」页（仅管理员，#303）：按用途看近 7/30 天的调用次数、token、平均与 P95 耗时、
 // Schema 通过率、错误率与按当前单价折算的金额（ADR-0057，#745），映射草稿一行另有「校验通过率」（#802，部分采用单独计数），
 // 指标卡另有「调用来源」（#844）：租户 / 平台端点分开计数，旧行计入「未记录」，
-// 并列出最近的调用明细（分页）；失败的调用标红、错误摘要截到 120 字（全文在 title）
+// 并列出最近的调用明细（分页）；失败的调用标红、错误摘要截到 120 字（全文在 title）；
+// 数字与日期跟随界面语言（#928，ADR-0060），金额列仍来自服务端 formatCost 不在本票范围
 import type { Route } from './+types/llm-usage';
 import { Link } from 'react-router';
 import { requirePermission } from '~/.server/access';
@@ -13,13 +14,14 @@ import { PillTabs } from '~/components/pill-tabs';
 import { SectionHeader } from '~/components/section-header';
 import { StatTile } from '~/components/stat-tile';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { formatDateTime, formatNumber } from '~/lib/format';
+import { useLocale } from '~/lib/i18n';
 import { cn } from '~/lib/utils';
 
 export function meta({}: Route.MetaArgs) {
   return [{ title: '模型调用 · CRM 数据分析平台' }];
 }
 
-const n = (v: number) => v.toLocaleString('zh-CN');
 const pct = (part: number, whole: number) => (whole ? `${Math.round((part / whole) * 1000) / 10}%` : '—');
 const brief = (s: string) => (s.length > 120 ? `${s.slice(0, 120)}…` : s);
 /** 来源列（#843）：这次调用用的端点是租户的还是平台的；迁移前的旧行 source 为空，显示 — */
@@ -46,18 +48,19 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 /** 统计表的一行（用途行与总计行共用） */
 function UsageRow({ row, isTotal = false }: { row: PurposeUsage; isTotal?: boolean }) {
+  const locale = useLocale();
   const checked = row.schemaChecked;
   const dc = row.draftCheck; // 只有映射草稿一行有（#802），其他用途与总计显示「—」
   return (
     <TableRow data-purpose={row.purpose} className={isTotal ? 'font-medium' : undefined}>
       <TableCell>{isTotal ? '总计' : row.purpose}</TableCell>
-      <TableCell data-col="calls">{n(row.calls)}</TableCell>
-      <TableCell data-col="tokens" className="text-slate-500">{`${n(row.promptTokens)} / ${n(row.completionTokens)}`}</TableCell>
-      <TableCell data-col="avg">{`${n(row.avgMs)} ms`}</TableCell>
-      <TableCell data-col="p95">{`${n(row.p95Ms)} ms`}</TableCell>
+      <TableCell data-col="calls">{formatNumber(locale, row.calls)}</TableCell>
+      <TableCell data-col="tokens" className="text-slate-500">{`${formatNumber(locale, row.promptTokens)} / ${formatNumber(locale, row.completionTokens)}`}</TableCell>
+      <TableCell data-col="avg">{`${formatNumber(locale, row.avgMs)} ms`}</TableCell>
+      <TableCell data-col="p95">{`${formatNumber(locale, row.p95Ms)} ms`}</TableCell>
       <TableCell data-col="schema">{checked ? `${row.schemaValid}/${checked}（${pct(row.schemaValid, checked)}）` : '—'}</TableCell>
       <TableCell data-col="draft-check">{dc && dc.checked ? `${dc.passed}/${dc.checked}（${pct(dc.passed, dc.checked)}），部分采用 ${dc.partial}` : '—'}</TableCell>
-      <TableCell data-col="errors" className={row.errors ? 'text-red-600' : 'text-slate-500'}>{`${n(row.errors)}（${pct(row.errors, row.calls)}）`}</TableCell>
+      <TableCell data-col="errors" className={row.errors ? 'text-red-600' : 'text-slate-500'}>{`${formatNumber(locale, row.errors)}（${pct(row.errors, row.calls)}）`}</TableCell>
       <TableCell data-col="cost">{row.cost}</TableCell>
     </TableRow>
   );
@@ -84,6 +87,7 @@ function Pager({ page, pages, pageSize, href }: { page: number; pages: number; p
 
 export default function LlmUsage({ loaderData }: Route.ComponentProps) {
   const { email, nav, days, pageSize, usage, calls } = loaderData;
+  const locale = useLocale();
   const href = (p: number) => `/llm-usage?days=${days}&page=${p}`;
   return (
     <AppShell email={email} nav={nav}>
@@ -106,15 +110,15 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
       ) : (
         <>
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
-            <StatTile label="总调用" value={n(usage.total.calls)} hint={`近 ${days} 天，全部用途`} />
-            <StatTile label="总 token" value={n(usage.total.promptTokens + usage.total.completionTokens)}
-              hint={`输入 ${n(usage.total.promptTokens)} · 输出 ${n(usage.total.completionTokens)}`} />
-            <StatTile label="P95 耗时" value={`${n(usage.total.p95Ms)} ms`} hint="全部用途合计" />
+            <StatTile label="总调用" value={formatNumber(locale, usage.total.calls)} hint={`近 ${days} 天，全部用途`} />
+            <StatTile label="总 token" value={formatNumber(locale, usage.total.promptTokens + usage.total.completionTokens)}
+              hint={`输入 ${formatNumber(locale, usage.total.promptTokens)} · 输出 ${formatNumber(locale, usage.total.completionTokens)}`} />
+            <StatTile label="P95 耗时" value={`${formatNumber(locale, usage.total.p95Ms)} ms`} hint="全部用途合计" />
             <StatTile label="错误率" value={pct(usage.total.errors, usage.total.calls)} tone={usage.total.errors ? 'text-red-600' : undefined}
-              hint={`${n(usage.total.errors)} 次失败`} />
+              hint={`${formatNumber(locale, usage.total.errors)} 次失败`} />
             {/* 调用来源（#844）：本租户、本窗口按租户 / 平台端点分开计数；旧行（source 为空）单独提示，没有时不渲染 */}
-            <StatTile label="调用来源" value={<span data-col="source-split">{`租户 ${n(usage.bySource.tenant)} / 平台 ${n(usage.bySource.platform)}`}</span>}
-              hint={usage.bySource.unknown ? <span data-col="source-unknown">{`未记录 ${n(usage.bySource.unknown)}`}</span> : `近 ${days} 天`} />
+            <StatTile label="调用来源" value={<span data-col="source-split">{`租户 ${formatNumber(locale, usage.bySource.tenant)} / 平台 ${formatNumber(locale, usage.bySource.platform)}`}</span>}
+              hint={usage.bySource.unknown ? <span data-col="source-unknown">{`未记录 ${formatNumber(locale, usage.bySource.unknown)}`}</span> : `近 ${days} 天`} />
           </div>
 
           <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
@@ -160,14 +164,14 @@ export default function LlmUsage({ loaderData }: Route.ComponentProps) {
               <TableBody>
                 {calls.rows.map(r => (
                   <TableRow key={r.id} data-call-id={r.id}>
-                    <TableCell className="text-slate-500">{new Date(r.createdAt).toLocaleString('zh-CN')}</TableCell>
+                    <TableCell className="text-slate-500">{formatDateTime(locale, r.createdAt)}</TableCell>
                     <TableCell>{r.purpose}</TableCell>
                     <TableCell className="text-slate-500">{r.model}</TableCell>
                     {/* 来源（#843）：这次调用用的端点是租户的还是平台的；迁移前的旧行为空，显示 — */}
                     <TableCell data-col="source" className="text-slate-500">{(r.source && SOURCE_LABEL[r.source]) ?? '—'}</TableCell>
-                    <TableCell>{r.promptTokens === null ? '—' : n(r.promptTokens)}</TableCell>
-                    <TableCell>{r.completionTokens === null ? '—' : n(r.completionTokens)}</TableCell>
-                    <TableCell>{`${n(r.durationMs)} ms`}</TableCell>
+                    <TableCell>{r.promptTokens === null ? '—' : formatNumber(locale, r.promptTokens)}</TableCell>
+                    <TableCell>{r.completionTokens === null ? '—' : formatNumber(locale, r.completionTokens)}</TableCell>
+                    <TableCell>{`${formatNumber(locale, r.durationMs)} ms`}</TableCell>
                     <TableCell><SchemaResult valid={r.schemaValid} /></TableCell>
                     <TableCell className={cn('max-w-2xl truncate', r.error ? 'text-red-600' : 'text-slate-400')} title={r.error ?? undefined}>
                       {r.error ? brief(r.error) : '—'}
