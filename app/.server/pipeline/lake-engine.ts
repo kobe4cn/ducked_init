@@ -66,7 +66,9 @@ export function lakeConnectTimeout(env: Record<string, string | undefined> = pro
  *  libpq 只做百分号解码、不把 + 当空格，`?options=-c%20search_path%3Dx` 这类参数会被改坏（#938） */
 export function lakeCatalogAttachUrl(catalogUrl: string, timeout: number | undefined): string {
   if (timeout === undefined) return catalogUrl;
-  const sep = !catalogUrl.includes('?') ? '?' : catalogUrl.endsWith('?') || catalogUrl.endsWith('&') ? '' : '&';
+  let sep = '&';
+  if (!catalogUrl.includes('?')) sep = '?';
+  else if (catalogUrl.endsWith('?') || catalogUrl.endsWith('&')) sep = '';
   return `${catalogUrl}${sep}connect_timeout=${timeout}`;
 }
 
