@@ -1,5 +1,6 @@
 // app/.server/sandbox.ts —— 沙箱表过期（ADR-0036）：沙箱表保存后 SANDBOX_TTL_DAYS 天到期，调度器为有到期沙箱表的租户入队 sandbox.expire，
-// 工作进程删表并清理湖里的旧文件（与快照过期同一套做法，ADR-0020），成功后在平台库标记 expiredAt 并删掉它的分享，工作台不再列出。一律限定在给定租户内
+// 工作进程删表并清理湖里的旧文件（与快照过期同一套做法，ADR-0020），成功后在平台库标记 expiredAt 并删掉它的分享，工作台不再列出。一律限定在给定租户内。
+// 表的主人提前删除走同一条清理路：enqueueSandboxDrop 单独入队一个只删这张表的任务，过期时间先被设成现在（见 workbench.ts 的 dropSandboxTable）
 import { and, eq, inArray, isNull, lte, sql } from 'drizzle-orm';
 import type { Tx } from './audit';
 import { getDb } from './db/client';
@@ -74,4 +75,12 @@ export async function lockForSave(tx: Tx, tenantId: string, memberId: string, na
     .where(and(eq(tasks.tenantId, tenantId), eq(tasks.kind, 'sandbox.expire'), inArray(tasks.status, ['queued', 'running']),
       sql`${tasks.params}->'tables' ? ${sandboxLakeName({ memberId, name })}`)).limit(1);
   return !pending;
+}
+
+/**
+ * 表的主人提前删除沙箱表时入队（与删除登记同一事务）：单独入队一个只删这张表的 sandbox.expire，不查平台库、不受本租户已有任务影响。
+ * 不走 enqueueDueSandboxExpiries：它扫全平台，且本租户已有排队中的 expire 时会跳过入队，那段时间 lockForSave 拦不住同名保存，新表会被删
+ */
+export async function enqueueSandboxDrop(tx: Tx, tenantId: string, memberId: string, name: string) {
+  return insertTask(tx, tenantId, 'sandbox.expire', { tables: [sandboxLakeName({ memberId, name })] });
 }

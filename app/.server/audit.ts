@@ -381,6 +381,8 @@ const ACTIONS = {
   'sandbox.save': { label: '保存沙箱表', describe: (d: Detail) => `${d.name}` },
   'sandbox.share': { label: '分享沙箱表', describe: (d: Detail) => `${d.name}` },
   'sandbox.unshare': { label: '撤销沙箱表分享', describe: (d: Detail) => `${d.name}` },
+  // 主人提前删除沙箱表（#970）：只记表名，湖里的清理走 sandbox.expire 任务，不在审计里重复记
+  'sandbox.dropped': { label: '删除沙箱表', describe: (d: Detail) => `${d.name}` },
   // AI 助手对话的只读分享（ADR-0043）：只记被分享人的邮箱，不记标题与内容
   'assistant.conversation_shared': { label: '分享助手对话', describe: (d: Detail) => `分享给 ${d.member}` },
   'assistant.conversation_unshared': { label: '撤销分享助手对话', describe: (d: Detail) => `不再分享给 ${d.member}` },

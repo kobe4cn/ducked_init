@@ -4,11 +4,11 @@ import { existsSync } from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { sandboxTables, tasks } from '../../app/.server/db/schema';
+import { auditLogs, sandboxTables, tasks } from '../../app/.server/db/schema';
 import { lakeRow } from '../../app/.server/lake';
 import { enqueueDueSandboxExpiries, lockForSave } from '../../app/.server/sandbox';
 import { enqueueTask } from '../../app/.server/tasks';
-import { listSandboxTables, listSharedWithMe, runQuery, sandboxSchema, saveAsSandbox, shareSandboxTable } from '../../app/.server/workbench';
+import { dropSandboxTable, listSandboxTables, listSharedWithMe, runQuery, sandboxSchema, saveAsSandbox, shareSandboxTable } from '../../app/.server/workbench';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, onLake, runTask } from './fixtures';
 
@@ -93,7 +93,7 @@ describe('沙箱表过期', () => {
     await expire(analyst.memberId, 'old');
     expect(await enqueueDueSandboxExpiries()).toEqual([acme]);
 
-    await expect(saveAsSandbox(analyst, 'old', ROWS)).rejects.toThrow('这张沙箱表已到期、正在清理');
+    await expect(saveAsSandbox(analyst, 'old', ROWS)).rejects.toThrow('这张沙箱表正在删除或清理');
     await saveAsSandbox(analyst, 'other', ROWS);
     await saveAsSandbox(engineer, 'old', ROWS);
     await drain();
@@ -118,6 +118,65 @@ describe('沙箱表过期', () => {
     release();
     await saving;
     expect(await enqueueDueSandboxExpiries()).toEqual([acme]);
+  });
+
+  it('主人提前删除（dropSandboxTable）：列表与被分享人的「分享给我的」立刻看不到，入队 sandbox.expire 删表清文件、标记 expiredAt；任务前同名保存被拒，清理后同名再存是新表不带旧分享；别人的表 404，已删的再删 404、不重复入队，别的成员同名表不受影响', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const mine = sandboxSchema(analyst.memberId);
+    await onLake(acme, `CALL lake.set_option('data_inlining_row_limit', 0)`);
+    await saveAsSandbox(analyst, 'filed', ROWS);
+    await saveAsSandbox(analyst, 'keep', ROWS);
+    await saveAsSandbox(engineer, 'filed', ROWS);
+    const files = await onLake<{ path: string }>(acme, `SELECT data_file AS path FROM ducklake_list_files('lake', 'filed', schema => '${mine}')`);
+    expect(files.length).toBeGreaterThan(0);
+    await shareSandboxTable(analyst, 'filed', 'de@acme.com');
+
+    await dropSandboxTable(analyst, 'filed');
+
+    // 不等任务跑完：我的沙箱表与被分享人的「分享给我的」都不再列出（验收标准 1）
+    expect((await listSandboxTables(analyst)).map(t => t.name)).toEqual(['keep']);
+    expect(await listSharedWithMe(engineer)).toEqual([]);
+    // 删除任务排队或运行时同名保存被拒（验收标准 2）
+    await expect(saveAsSandbox(analyst, 'filed', ROWS)).rejects.toThrow('这张沙箱表正在删除或清理');
+    await saveAsSandbox(analyst, 'other', ROWS);
+
+    await drain();
+
+    // 湖里的表与 parquet 文件清掉，平台库标记 expiredAt（验收标准 2）
+    const lakeTables = await onLake<{ schema: string; name: string }>(acme, `
+      SELECT table_schema AS schema, table_name AS name FROM information_schema.tables
+      WHERE table_catalog = 'lake' AND table_schema LIKE 'sandbox_%' ORDER BY ALL`);
+    expect(lakeTables).toHaveLength(3);
+    expect(lakeTables).toEqual(expect.arrayContaining([
+      { schema: sandboxSchema(engineer.memberId), name: 'filed' }, { schema: mine, name: 'keep' }, { schema: mine, name: 'other' },
+    ]));
+    expect(files.filter(f => existsSync(f.path))).toEqual([]);
+    const [dropped] = await getDb().select().from(sandboxTables)
+      .where(and(eq(sandboxTables.tenantId, acme), eq(sandboxTables.memberId, analyst.memberId), eq(sandboxTables.name, 'filed')));
+    expect(dropped.expiredAt).toEqual(expect.any(Date));
+
+    // 已删（已清理）的表再删也是 404，不重复入队（验收标准 3）
+    await expect(dropSandboxTable(analyst, 'filed')).rejects.toMatchObject({ status: 404, message: '没有沙箱表 filed' });
+
+    // 清理后同名再保存：一张新表，不沿用旧分享（验收标准 2）
+    await saveAsSandbox(analyst, 'filed', ROWS);
+    expect((await listSandboxTables(analyst)).map(t => t.name)).toEqual(['filed', 'keep', 'other']);
+    expect(await listSharedWithMe(engineer)).toEqual([]);
+
+    // 只有主人能删：别人的表（哪怕是同名的）404（验收标准 3）
+    await expect(dropSandboxTable(engineer, 'keep')).rejects.toMatchObject({ status: 404, message: '没有沙箱表 keep' });
+    // 表还在时正常删除，已删的再删 404
+    await dropSandboxTable(analyst, 'keep');
+    await expect(dropSandboxTable(analyst, 'keep')).rejects.toMatchObject({ status: 404 });
+    const expireTasks = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'sandbox.expire')));
+    expect(expireTasks).toHaveLength(2);
+    const drops = await getDb().select().from(auditLogs).where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, 'sandbox.dropped')));
+    expect(drops.map(d => (d.detail as { name: string }).name).sort()).toEqual(['filed', 'keep']);
+    // 别的成员同名的表不受影响
+    expect((await listSandboxTables(engineer)).map(t => t.name)).toEqual(['filed']);
+    expect((await runQuery(engineer, `SELECT count(*) AS n FROM ${sandboxSchema(engineer.memberId)}.filed`)).rows).toEqual([['3']]);
   });
 
   it('sandbox.expire 只认沙箱 schema 里的表名', async () => {

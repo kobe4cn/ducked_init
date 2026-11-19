@@ -1,7 +1,8 @@
 // app/routes/workbench.tsx —— 数据查询工作台（有沙箱权限的分析师、数据工程师，ADR-0036）：写一条只读 SQL，在本租户只读挂载的数据湖上执行，
 // 只能读标准层 silver、结果层 gold、自己的沙箱、分享给自己的沙箱表与按数据源名的原始层视图（敏感列是哈希），结果最多 1 万行、不导出；执行中可以取消（中止请求即中断查询），每次查询都记进审计日志。
 // 填上表名可以把 SELECT 的结果保存为个人沙箱表（SANDBOX_TTL_DAYS 天后过期），「我的沙箱表」列出表名、行数、过期时间与分享给了谁，
-// 可以按邮箱分享给本租户有沙箱权限的成员或撤销；「分享给我的」列出别人分享来的表（只读，在查询里按 sandbox_<主人>.<表名> 读）。
+// 可以按邮箱分享给本租户有沙箱权限的成员或撤销；主人也可以提前删除（确认后撤销分享、入队 sandbox.expire 清理湖里的数据，只有主人能删）；
+// 「分享给我的」列出别人分享来的表（只读，在查询里按 sandbox_<主人>.<表名> 读）。
 // 左侧目录树按 标准层 / 结果层 / 我的沙箱 / 分享给我的 列出能读的表、字段类型、行数与湖中位置，点表名把带引号的引用插进 SQL 框；
 // 「原始层」按数据源名列出回放后当前状态的视图（敏感列是哈希），每个数据源默认折叠，名字与保留名冲突的数据源给出没挂载的原因。
 // 「AI 起草」把需求与能读的表名、字段名发给模型服务，起草的 SQL 通过白名单校验后填进编辑框、不执行（ADR-0043），没通过时编辑框保留原来的 SQL。
@@ -19,8 +20,8 @@ import { ConversationError } from '~/.server/assistant/conversations';
 import type { CurrentMember } from '~/.server/auth';
 import { navFor } from '~/.server/nav';
 import {
-  listCatalog, listSandboxTables, listSharedWithMe, runQuery, SANDBOX_TTL_DAYS, sandboxSchema, saveAsSandbox, shareSandboxTable, unshareSandboxTable,
-  WORKBENCH_ROWS, WORKBENCH_TIMEOUT_MS, WorkbenchError, type CatalogEntry, type RawCatalogSource, type WorkbenchCatalog,
+  dropSandboxTable, listCatalog, listSandboxTables, listSharedWithMe, runQuery, SANDBOX_TTL_DAYS, sandboxSchema, saveAsSandbox, shareSandboxTable,
+  unshareSandboxTable, WORKBENCH_ROWS, WORKBENCH_TIMEOUT_MS, WorkbenchError, type CatalogEntry, type RawCatalogSource, type WorkbenchCatalog,
 } from '~/.server/workbench';
 import { draftWorkbenchSql, interpretResult, MAX_REQUEST, previewInterpretation, WorkbenchAiError } from '~/.server/workbench-ai';
 import { AppShell } from '~/components/app-shell';
@@ -94,6 +95,11 @@ export async function action({ request }: Route.ActionArgs) {
     if (intent === 'unshare') {
       return { sql: '', name: '', notice: `已撤销 ${name} 对 ${await unshareSandboxTable(member, name, email)} 的分享` };
     }
+    // 主人提前删除：只有自己的表能删，别人的表与已删的表 404（WorkbenchError 带状态），湖里的数据由入队的 sandbox.expire 随后清理
+    if (intent === 'drop') {
+      await dropSandboxTable(member, name);
+      return { sql: '', name: '', notice: `已删除沙箱表 ${name}，分享一并撤销，湖里的数据随后清理` };
+    }
     return { sql, name, result: await runQuery(member, sql, request.signal), conversationId };
   } catch (e) {
     if (e instanceof WorkbenchError || e instanceof WorkbenchAiError || e instanceof ConversationError) {
@@ -108,7 +114,7 @@ const dateTime = (d: Date | string) => new Date(d).toLocaleString('zh-CN', { hou
 
 const ERROR_TITLES: Record<string, string> = {
   draft: 'AI 没有起草 SQL', interpret_preview: 'AI 没有解读结果', interpret: 'AI 没有解读结果',
-  save: '沙箱表没有保存', share: '没有分享', unshare: '没有撤销分享',
+  save: '沙箱表没有保存', share: '没有分享', unshare: '没有撤销分享', drop: '沙箱表没有删除',
 };
 
 /** 目录树的四节：标题与说明 */
@@ -398,6 +404,7 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                     <TableHead>保存时间</TableHead>
                     <TableHead>过期时间</TableHead>
                     <TableHead>分享给</TableHead>
+                    <TableHead className="text-right">操作</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -428,6 +435,16 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                             defaultValue={actionData && 'error' in actionData && actionData.intent === 'share' && actionData.name === t.name ? actionData.email : ''}
                           />
                           <Button type="submit" name="intent" value="share" variant="outline" size="sm">分享</Button>
+                        </Form>
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {/* 危险操作：destructive 加确认（项目里没有对话框组件，照 members / api-keys 的 confirm() 写法） */}
+                        <Form
+                          method="post"
+                          onSubmit={e => { if (!confirm(`确定删除沙箱表「${t.name}」？分享会一并撤销，湖里的数据随后清理。`)) e.preventDefault(); }}
+                        >
+                          <input type="hidden" name="name" value={t.name} />
+                          <Button type="submit" name="intent" value="drop" variant="destructive" size="sm">删除</Button>
                         </Form>
                       </TableCell>
                     </TableRow>
