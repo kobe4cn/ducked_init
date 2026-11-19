@@ -166,6 +166,7 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 - `retrieval.ts`：`viewerView`（照抄 `catalogFor`）、`retrieve(g)`（前 20，先去掉能力说明）、`recallAt`、`retrievalRows` 与 `groupByType`，`retrieval-golden.test.ts` 与 `pnpm eval:requirements` 共用，两边的 Recall@20 是同一算法。追问按服务端的歧义判定算，「该追问」= `clarify` 不为 null。
 - 调参集 / 验收集：`golden.ts` 的 `HOLDOUT`（每类 2 条，不写进 YAML）标出验收集，条目上是 `holdout: true`。调参只看调参集，验收集只在验收时看；`pnpm eval:requirements` 两张表分开列，基线在 `docs/test-plans/requirements-eval-baseline.md`。`BASELINE` / `KNOWN_GAPS` 是回归下限，仍覆盖全部条目。
 - 约定：现有 `search()` 做不到的条目记在测试的 `KNOWN_GAPS`（`it.fails`），汇总用例断言总 Recall@20 ≥ `BASELINE`（实测值向下取两位小数）。改好一条后它会变红：从 `KNOWN_GAPS` 删掉，并按汇总用例打出的新值抬高 `BASELINE`（`--silent=false` 才看得到 `console.table`）。新增条目时守住分布：a、b、c、d 每类 ≥ 4 条，`covers` 每种 ≥ 5 条。
+- 约定（i18n 棘轮，#929）：`test/i18n-ratchet.test.ts` 保证未接入翻译的中文只减不增（ADR-0060），计数与 `/ops` 分组见 `test/CATALOG.md`。接入翻译后它会因「少于基线」变红：跑 `pnpm i18n:ratchet --update` 把 `test/i18n-ratchet-baseline.json` 改小并和代码一起提交；新增未接入翻译的中文时它会列出 `file:line`，要么接入翻译，要么（确有理由时）`pnpm i18n:ratchet --update --allow-increase` 并在 PR 里说明。
 
 ### `test/http/harness.ts`
 
