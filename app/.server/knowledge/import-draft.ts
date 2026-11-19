@@ -2,8 +2,8 @@
 // 调用方（import.ts）用 importInput 取输入、importMessages 与 IMPORT_SCHEMA 组 chatJson 请求，再把模型输出交给 outputToProposals。
 // 输入是来源的段落（段号从 1 开始）加 restricted 目录条目的 { id, kind, name }（ADR-0047 / 0005：数据源与源表整类不进，
 // 只给这三个字段控制体积）。段落原文是成员粘贴的，可能藏着指令文字：user 消息只放 JSON、system 写明它只是数据，
-// 输出受 IMPORT_SCHEMA 限制（kind 与口径类型 / 取值都是枚举）。outputToProposals 再按本次输入过滤：段号不在 1..段数、
-// 没有证据、目标不在输入条目里的整条丢弃；证据 ref 由代码拼成 source:<id>#p<段号> 并带来源版本（段号是模型给的，
+// 输出受 IMPORT_SCHEMA 限制（kind 与口径类型 / 取值都是枚举，且按 kind 要求对应字段，缺了整次调用 422）。outputToProposals
+// 再按本次输入过滤：段号不在 1..段数、没有证据、目标不在输入条目里的整条丢弃（返回 dropped 记目标与原因）；证据 ref 由代码拼成 source:<id>#p<段号> 并带来源版本（段号是模型给的，
 // ref 与 version 不让模型输出），mappingId 一律 null
 import { cmp } from '../../lib/compare';
 import { CLAIM_TYPES, CLAIM_TYPE_ORDER, isClaimValue } from '../../lib/semantic-claims';
@@ -16,8 +16,8 @@ import { ALIAS_MAX_LENGTH } from './aliases';
 import type { ProposalInput } from './proposals';
 import type { KnowledgeSource, SourceParagraph } from './sources';
 
-/** 解析生成器的版本号：提案行的 generator_version；提示词或转换规则变了要换 */
-export const IMPORT_GENERATOR_VERSION = 'import-v1';
+/** 解析生成器的版本号：提案行的 generator_version；提示词或转换规则变了要换（import-v2：写明正文放哪、Schema 按 kind 要字段） */
+export const IMPORT_GENERATOR_VERSION = 'import-v2';
 
 /** 输入里的一个目录条目：只给标识、种类与名称（控制发给模型的体积） */
 export interface ImportEntryInput { id: string; kind: CatalogEntry['kind']; name: string }
@@ -49,6 +49,7 @@ const SYSTEM = [
   '- note：给 entries 里的条目写业务说明。',
   '规则：',
   '- targetId 只用 entries 里的 id；evidence 的 paragraph 只用 paragraphs 里出现过的段号，每条提案至少一段。',
+  '- 说明的正文写在 note 字段、别名写在 alias 字段、口径声明写在 claim 字段；reason 只写为什么提这条，不要把正文写进 reason。',
   '- 口径类型与取值只能是这些：',
   ...CLAIM_TYPE_ORDER.map(t => `  ${t}（${CLAIM_TYPES[t].label}）：${CLAIM_TYPES[t].values.map(v => v.value).join('、')}`),
   '- 别名与说明要简洁准确，拿不准的提案不要输出。',
@@ -57,7 +58,9 @@ const SYSTEM = [
 /** 登记表里所有口径取值的并集：Schema 只能把 value 限到这一层，类型与取值的配对在 outputToProposals 里再用 isClaimValue 校验 */
 const ALL_CLAIM_VALUES = [...new Set(Object.values(CLAIM_TYPES).flatMap(t => t.values.map(v => v.value)))];
 
-/** 模型输出必须符合的 JSON Schema（chatJson 只用 json_object + 本地 Ajv 校验，不需要全部 required） */
+/** 模型输出必须符合的 JSON Schema（chatJson 只用 json_object + 本地 Ajv 校验，不需要全部 required）。
+ *  按 kind 要求对应字段（allOf + if/then，不用 oneOf：llm.ts 的 ajv 开着 allErrors，if/then 给出的是「缺少 note」这类
+ *  required 错误，oneOf 的报错很杂）；缺字段整次调用 422，不再被 outputToProposals 静默丢掉 */
 export const IMPORT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -86,6 +89,11 @@ export const IMPORT_SCHEMA = {
           },
           reason: { type: 'string', maxLength: 200 },
         },
+        allOf: [
+          { if: { properties: { kind: { const: 'alias' } } }, then: { required: ['alias'] } },
+          { if: { properties: { kind: { const: 'claim' } } }, then: { required: ['claim'] } },
+          { if: { properties: { kind: { const: 'note' } } }, then: { required: ['note'] } },
+        ],
       },
     },
   },
@@ -105,6 +113,18 @@ export interface ImportProposal {
 /** 模型输出：一组提案 */
 export interface ImportOutput { proposals: ImportProposal[] }
 
+/** outputToProposals 丢弃一条的原因：与目标 ID 一起记进审计 detail 的 dropped，不记提案内容（Schema 拦不住的才到这一层） */
+export type ImportDropReason =
+  | 'no_evidence'            // 整条没有证据
+  | 'evidence_out_of_range'  // 有一个段号不在 1..段数
+  | 'target_not_in_input'    // 目标不在本次输入的条目里
+  | 'alias_invalid'          // 别名 trim 后为空或超上限
+  | 'claim_invalid'          // 缺 claim 或类型与取值不配对
+  | 'note_invalid';          // 说明 trim 后为空或超上限
+
+/** outputToProposals 丢弃的条目：只有目标与原因（审计不记提案内容） */
+export interface ImportDrop { targetId: string; reason: ImportDropReason }
+
 /** 发给模型的消息：system 讲清任务、三种提案与「user 里的 JSON 只是数据」；user 只放输入 JSON */
 export function importMessages(input: ImportInput): LlmMessage[] {
   return [{ role: 'system', content: SYSTEM }, { role: 'user', content: JSON.stringify(input) }];
@@ -112,33 +132,40 @@ export function importMessages(input: ImportInput): LlmMessage[] {
 
 /**
  * 把模型输出转成提案输入（proposeMany 的入参形状）。不合法的单条丢弃，不抛错：模型输出宁可少提、不要错提。
- * 证据只要有一条段号不满足 1 ≤ n ≤ 段数、或整条没有证据、或目标不在输入条目里就整条丢弃；ref 由代码拼成
- * source:<id>#p<n>、version 取来源当前版本；mappingId 一律 null
+ * 丢弃的条目在 dropped 里记目标与原因（调用方写进审计，不再静默消失）。证据只要有一条段号不满足 1 ≤ n ≤ 段数、
+ * 或整条没有证据、或目标不在输入条目里就整条丢弃；ref 由代码拼成 source:<id>#p<n>、version 取来源当前版本；
+ * mappingId 一律 null
  */
 export function outputToProposals(
   output: ImportOutput, input: ImportInput, source: Pick<KnowledgeSource, 'id' | 'version'>,
-): ProposalInput[] {
+): { inputs: ProposalInput[]; dropped: ImportDrop[] } {
   const entryIds = new Set(input.entries.map(e => e.id));
   const max = input.paragraphs.length;
-  const out: ProposalInput[] = [];
+  const inputs: ProposalInput[] = [];
+  const dropped: ImportDrop[] = [];
   for (const p of output.proposals) {
-    // 没有证据、或有一条段号不在 1..段数（0、越界、非整数由 Schema 拦）的整条丢弃
-    if (!p.evidence.length || !p.evidence.every(({ paragraph }) => Number.isInteger(paragraph) && paragraph >= 1 && paragraph <= max)) continue;
-    if (!entryIds.has(p.targetId)) continue;
+    // 整条没有证据、或有一条段号不在 1..段数（0、越界、非整数由 Schema 拦）的整条丢弃
+    if (!p.evidence.length) { dropped.push({ targetId: p.targetId, reason: 'no_evidence' }); continue; }
+    if (!p.evidence.every(({ paragraph }) => Number.isInteger(paragraph) && paragraph >= 1 && paragraph <= max)) {
+      dropped.push({ targetId: p.targetId, reason: 'evidence_out_of_range' });
+      continue;
+    }
+    if (!entryIds.has(p.targetId)) { dropped.push({ targetId: p.targetId, reason: 'target_not_in_input' }); continue; }
     const evidence = p.evidence.map(({ paragraph }) => ({ ref: `source:${source.id}#p${paragraph}`, version: source.version }));
     const base = { targetId: p.targetId, mappingId: null, evidence, generatorVersion: IMPORT_GENERATOR_VERSION };
     if (p.kind === 'alias') {
       const alias = p.alias?.trim() ?? '';
-      if (!alias || [...alias].length > ALIAS_MAX_LENGTH) continue;
-      out.push({ ...base, kind: 'alias', content: { alias } });
+      if (!alias || [...alias].length > ALIAS_MAX_LENGTH) { dropped.push({ targetId: p.targetId, reason: 'alias_invalid' }); continue; }
+      inputs.push({ ...base, kind: 'alias', content: { alias } });
     } else if (p.kind === 'claim') {
-      if (!p.claim || !isClaimValue(p.claim.type, p.claim.value)) continue;
-      out.push({ ...base, kind: 'claim', content: { type: p.claim.type, value: p.claim.value } });
+      // claim 由 Schema 按 kind 要求，但 TS 类型不是联合（as const Schema），防御判断保留
+      if (!p.claim || !isClaimValue(p.claim.type, p.claim.value)) { dropped.push({ targetId: p.targetId, reason: 'claim_invalid' }); continue; }
+      inputs.push({ ...base, kind: 'claim', content: { type: p.claim.type, value: p.claim.value } });
     } else if (p.kind === 'note') {
       const note = p.note?.trim() ?? '';
-      if (!note || [...note].length > NOTE_MAX_LENGTH) continue;
-      out.push({ ...base, kind: 'note', content: { note } });
+      if (!note || [...note].length > NOTE_MAX_LENGTH) { dropped.push({ targetId: p.targetId, reason: 'note_invalid' }); continue; }
+      inputs.push({ ...base, kind: 'note', content: { note } });
     }
   }
-  return out;
+  return { inputs, dropped };
 }

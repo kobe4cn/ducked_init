@@ -35,7 +35,7 @@
     "app/.server/knowledge/claims.ts": 3,
     "app/.server/knowledge/derive.ts": 33,
     "app/.server/knowledge/guards.ts": 2,
-    "app/.server/knowledge/import-draft.ts": 14,
+    "app/.server/knowledge/import-draft.ts": 15,
     "app/.server/knowledge/import.ts": 2,
     "app/.server/knowledge/panel.ts": 5,
     "app/.server/knowledge/proposals.ts": 24,
