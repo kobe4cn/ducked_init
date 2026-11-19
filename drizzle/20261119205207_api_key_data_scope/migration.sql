@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."api_keys" ADD COLUMN "data_scope" jsonb DEFAULT '{"all":true}' NOT NULL;

@@ -1,6 +1,7 @@
 // app/.server/db/schema.ts —— 平台元数据（平台 PostgreSQL 的 platform schema）。业务数据不落这里（ADR-0002）
 import { sql } from 'drizzle-orm';
 import { bigint, boolean, check, date, index, integer, jsonb, numeric, pgSchema, primaryKey, real, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import type { ApiDataScope } from '../../lib/api-data-scope';
 import type { ApiScope } from '../../lib/api-scopes';
 import type { CustomEntityField, CustomEntityKind, EntityRelation } from '../../lib/canonical-model';
 import type { KnowledgeSourceKind } from '../../lib/knowledge-source';
@@ -120,7 +121,8 @@ export const sessions = platform.table('sessions', {
 
 // 外部系统的 API Key：明文只在创建时给管理员看一次，库里只存 SHA-256；prefix 是明文前 8 位，用于辨认。
 // 吊销（revoked_at 非空）后立即失效；last_used_at 同一把 Key 每分钟最多更新一次。
-// scopes 是接口范围（ADR-0061）：三类全开是迁移与创建表单的默认值，认证时按路径判定，范围外 403
+// scopes 是接口范围（ADR-0061）：三类全开是迁移与创建表单的默认值，认证时按路径判定，范围外 403。
+// dataScope 是数据范围（ADR-0061）：默认 {"all":true} 全放开，点查只返回范围内的标签、指标与 RFM（#975）
 export const apiKeys = platform.table('api_keys', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
@@ -128,6 +130,7 @@ export const apiKeys = platform.table('api_keys', {
   prefix: text('prefix').notNull(),
   tokenHash: text('token_hash').notNull().unique(),
   scopes: text('scopes').array().$type<ApiScope>().notNull().default(sql`'{catalog,consumers,exports}'`),
+  dataScope: jsonb('data_scope').$type<ApiDataScope>().notNull().default({ all: true }),
   createdByEmail: text('created_by_email').notNull(),
   createdAt: createdAt(),
   lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
