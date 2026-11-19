@@ -1,4 +1,4 @@
-// test/pipeline/knowledge-aliases.test.ts —— 别名（ADR-0046）的接缝：addAlias / retireAlias → knowledge_aliases 与审计、目录版本 →
+// test/pipeline/knowledge-aliases.test.ts —— 别名（ADR-0046）的接缝：addAlias / retireAlias / confirmAlias → knowledge_aliases 与审计、目录版本 →
 // tenantCatalog 的条目（映射字段在血缘项下）、search 与 Markdown
 import { desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -6,8 +6,8 @@ import { expand, search, toMarkdown } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, catalogVersions, knowledgeAliases } from '../../app/.server/db/schema';
-import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
-import { addAlias, retireAlias } from '../../app/.server/knowledge/aliases';
+import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
+import { addAlias, confirmAlias, retireAlias } from '../../app/.server/knowledge/aliases';
 import { definitionHash, planHash } from '../../app/.server/knowledge/basis';
 import { publishedPlans } from '../../app/.server/mappings';
 import { resetDb } from '../http/harness';
@@ -18,6 +18,7 @@ afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 实付金额\n';
+const REVENUE_V2 = 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 新口径\n';
 const SPENDER = 'metric: paid_revenue\nrules:\n  - { value: high, when: { gte: 1000 } }\ndefault: low\n';
 
 const latestVersion = async (tenantId: string) => (await getDb().select().from(catalogVersions)
@@ -169,5 +170,50 @@ describe('别名', () => {
     expect(rows.find(r => r.id === mapped)?.retiredAt).toBeNull();
     expect((await audits(acme)).map(l => l.action).sort()).toEqual(['alias.added', 'alias.added', 'alias.added', 'alias.added', 'alias.retired']);
     expect((await latestVersion(acme))!.version).toBe(before + 2);
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
+
+  it('确认待复核的别名：停用旧行、插入取当前依据的同名新行，记审计 alias.confirmed 并记一版目录，detail 不含别名原文', async () => {
+    const { acme, reviewer, analyst } = await setup();
+    const aliasId = await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: '营收' });
+    await saveDslDraft(analyst, 'metric', 'paid_revenue', REVENUE_V2);
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 2); // 改了 yaml，别名转为待复核
+
+    const newId = await expectBump(acme, 'alias.confirmed', () => confirmAlias(analyst, aliasId));
+    expect(newId).not.toBe(aliasId);
+    const logs = await audits(acme);
+    expect(logs.filter(l => l.action === 'alias.confirmed').map(l => [l.action, l.targetType, l.targetId, l.detail])).toEqual([[
+      'alias.confirmed', 'knowledge', newId,
+      { targetId: 'metric:paid_revenue', mappingId: null, previousAliasId: aliasId, aliasId: newId },
+    ]]);
+    expect(JSON.stringify(logs)).not.toMatch(/营收/);
+    const rows = await aliasRows(acme);
+    expect(rows).toHaveLength(2);
+    expect(rows.find(r => r.id === aliasId)).toMatchObject({ alias: '营收', retiredAt: expect.any(Date), retiredByEmail: 'an@acme.com' });
+    expect(rows.find(r => r.id === newId)).toMatchObject({
+      alias: '营收', retiredAt: null, basedOn: [{ id: 'metric:paid_revenue', hash: definitionHash(REVENUE_V2) }], createdByEmail: 'an@acme.com',
+    });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
+
+  it('确认别名：没有待复核、已停用、不存在时 400，查看者与没有 sources:write 的（映射字段）403，都不留记录', async () => {
+    const { acme, reviewer, author, analyst, viewer, orderMappings } = await setup();
+    const aliasId = await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: '营收' });
+    const mapped = await addAlias(author, { targetId: 'field:order.status', mappingId: orderMappings!.loyalty, alias: '会员单状态' });
+    const before = (await latestVersion(acme))!.version;
+    await expect(confirmAlias(analyst, aliasId), '还没有待复核').rejects.toMatchObject({ status: 400 });
+    await expect(confirmAlias(analyst, '00000000-0000-0000-0000-000000000000'), '不存在').rejects.toMatchObject({ status: 400 });
+    await expect(confirmAlias(viewer, aliasId), '查看者').rejects.toMatchObject({ init: { status: 403 } });
+    await expect(confirmAlias(analyst, mapped), '映射字段的要 sources:write').rejects.toMatchObject({ init: { status: 403 } });
+    expect((await latestVersion(acme))!.version).toBe(before);
+
+    await saveDslDraft(analyst, 'metric', 'paid_revenue', REVENUE_V2);
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 2);
+    const newId = await confirmAlias(analyst, aliasId);
+    await expect(confirmAlias(analyst, newId), '确认过的不再待复核').rejects.toMatchObject({ status: 400 });
+    await expect(confirmAlias(analyst, aliasId), '旧行已停用').rejects.toMatchObject({ status: 400 });
+    // 两次失败不留版本：发布 +1、确认 +1，最后一版的原因是 alias.confirmed
+    expect(await latestVersion(acme)).toMatchObject({ version: before + 2, reason: 'alias.confirmed' });
+    const rows = await aliasRows(acme);
+    expect(rows).toHaveLength(3);
+    expect((await audits(acme)).map(l => l.action).sort()).toEqual(['alias.added', 'alias.added', 'alias.confirmed']);
   }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 });

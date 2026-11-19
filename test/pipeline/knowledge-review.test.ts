@@ -1,14 +1,14 @@
 // test/pipeline/knowledge-review.test.ts —— 需复核（ADR-0046）：指标发布新版本、映射发布改了计划的新版本后，挂在上面的别名、口径声明、业务说明
-// 在目录里带需复核标记（同一次发布的那一版目录里），口径声明按「未知」输出、能搜到「待复核」；重新保存 / 停用后重新加同名别名后标记消失
+// 在目录里带需复核标记（同一次发布的那一版目录里），口径声明按「未知」输出、能搜到「待复核」；重新保存 / 停用后重新加同名别名 / confirmAlias 确认后标记消失
 import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { expand, search, toMarkdown, type CatalogEntry } from '../../app/.server/catalog';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { catalogVersions } from '../../app/.server/db/schema';
+import { catalogVersions, knowledgeAliases } from '../../app/.server/db/schema';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
-import { addAlias, retireAlias } from '../../app/.server/knowledge/aliases';
+import { addAlias, confirmAlias, retireAlias } from '../../app/.server/knowledge/aliases';
 import { saveClaim } from '../../app/.server/knowledge/claims';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
@@ -79,6 +79,27 @@ describe('需复核', () => {
     expect(JSON.stringify(after)).not.toContain('needsReview');
     expect(JSON.stringify(after)).not.toContain('previous');
     expect(after).toMatchObject({ knowledge: { aliases: ['营收'], note: '只算已支付', claims: [{ type: 'currency', value: 'CNY' }] } });
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
+
+  it('改 yaml 发布新版本后别名需复核，confirmAlias 后不再需复核，生效别名数不变', async () => {
+    const { acme, reviewer, analyst } = await setup();
+    const target = 'metric:paid_revenue';
+    const aliasId = await addAlias(analyst, { targetId: target, alias: '营收' });
+    await saveDslDraft(analyst, 'metric', 'paid_revenue', REVENUE_V2);
+    await publishDefinition(reviewer, 'metric', 'paid_revenue', 2);
+    const stale = expand(await tenantCatalog(acme), target)!;
+    expect(stale).toMatchObject({ knowledge: { aliases: ['营收'], aliasesNeedReview: ['营收'] } });
+
+    const newId = await confirmAlias(analyst, aliasId);
+    expect(newId).not.toBe(aliasId);
+    const after = expand(await tenantCatalog(acme), target)!;
+    expect(JSON.stringify(after)).not.toContain('needsReview');
+    expect(after).toMatchObject({ knowledge: { aliases: ['营收'] } });
+    // 生效别名数不变：旧行停用、同名新行生效，表里始终只有一个未停用的「营收」
+    const rows = await getDb().select().from(knowledgeAliases).where(eq(knowledgeAliases.tenantId, acme));
+    expect(rows).toHaveLength(2);
+    expect(rows.find(r => r.id === aliasId)?.retiredAt).toBeInstanceOf(Date);
+    expect(rows.find(r => r.id === newId)).toMatchObject({ alias: '营收', retiredAt: null });
   }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 
   it('映射发布改了计划的新版本后，映射字段上的别名、口径声明、映射说明带需复核，说明的标记在血缘项上；内容不变的重新发布不触发', async () => {
