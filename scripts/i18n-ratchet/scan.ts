@@ -61,11 +61,11 @@ export function untranslatedLines(source: string): UntranslatedLine[] {
     } else if (state === 'block-comment') {
       if (ch === '*' && next === '/') { state = 'code'; i++; }
     } else if (state === 'single' || state === 'double') {
-      if (ch === '\\') i++;
+      if (ch === '\\') { if (next === '\n') line++; i++; } // 续行的 \ 吃掉换行，行号照样往下走
       else if (ch === (state === 'single' ? "'" : '"')) state = 'code';
       else if (HAN.test(ch) && !stringKey) mark(line);
     } else { // template
-      if (ch === '\\') i++;
+      if (ch === '\\') { if (next === '\n') line++; i++; } // 续行的 \ 吃掉换行，行号照样往下走
       else if (ch === '`') state = 'code';
       else if (ch === '$' && next === '{') { frames.push(0); frameKeys.push(stringKey); state = 'code'; i++; }
       else if (HAN.test(ch) && !stringKey) mark(line);

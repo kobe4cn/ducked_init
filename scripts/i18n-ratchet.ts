@@ -27,11 +27,11 @@ function scanApp(): Map<string, { line: number; text: string }[]> {
 }
 
 const actual = scanApp();
+const baseline: Record<string, number> = existsSync(baselinePath)
+  ? (JSON.parse(readFileSync(baselinePath, 'utf8')) as { files?: Record<string, number> }).files ?? {}
+  : {};
 
 if (process.argv.includes('--update')) {
-  const baseline = existsSync(baselinePath)
-    ? (JSON.parse(readFileSync(baselinePath, 'utf8')) as { files?: Record<string, number> }).files ?? {}
-    : {};
   const result = updatedBaseline(baseline, actual, process.argv.includes('--allow-increase'));
   if (!result.ok) {
     console.error(`计数比基线多，拒绝写入（确有理由时加 --allow-increase 并在 PR 里说明）：\n${result.increased.join('\n')}`);
@@ -42,12 +42,7 @@ if (process.argv.includes('--update')) {
   console.log(`基线已写入 test/i18n-ratchet-baseline.json：${Object.keys(result.files).length} 个文件，${total} 行`);
 } else {
   console.table(summarize(actual));
-  const { increased, decreased } = compare(
-    existsSync(baselinePath)
-      ? (JSON.parse(readFileSync(baselinePath, 'utf8')) as { files?: Record<string, number> }).files ?? {}
-      : {},
-    actual,
-  );
+  const { increased, decreased } = compare(baseline, actual);
   if (increased.length) {
     console.error(`\n计数比基线多（test/i18n-ratchet.test.ts 会拦下）：\n${increased.join('\n')}`);
     process.exit(1);
