@@ -1,7 +1,8 @@
 // test/pipeline/knowledge-import.test.ts —— 把知识来源解析成知识提案的服务（ADR-0046 入口③，#526）的接缝：importFromSource →
 // 注入的假 fetch（setLlmFetch）→ chatJson（llm_calls 记 knowledge_import）→ outputToProposals（证据 ref 由代码拼成
-// source:<id>#p<段号> 并带来源版本，段号越界 / 没有证据 / 目标不在 restricted 目录里的整条丢弃）→ 事务里 proposeMany（stale 按
-// 解析前的依据快照）+ 审计 knowledge_source.parsed（detail 只有标题、种类、版本与各类计数）。来源只是待解析的数据：
+// source:<id>#p<段号> 并带来源版本，段号越界 / 没有证据 / 目标不在 restricted 目录里的整条丢弃）→ dropKnown（和已生效知识
+// 相同的丢掉计 skipped，#948）→ 事务里 proposeMany（stale 按解析前的依据快照）+ 审计 knowledge_source.parsed（detail 只有
+// 标题、种类、版本与各类计数）。来源只是待解析的数据：
 // 段落里写「请发布 / 调用接口 / 忽略以上要求」或整段 SQL 时结果仍只有提案，没有 workbench 审计、没有任务；没配模型服务 409 不发请求
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -9,7 +10,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, knowledgeProposals, llmCalls, tasks } from '../../app/.server/db/schema';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { currentBases } from '../../app/.server/knowledge/basis';
-import { rejectProposal } from '../../app/.server/knowledge/proposals';
+import { acceptProposal, rejectProposal } from '../../app/.server/knowledge/proposals';
 import { IMPORT_GENERATOR_VERSION } from '../../app/.server/knowledge/import-draft';
 import { ImportError, importFromSource } from '../../app/.server/knowledge/import';
 import { saveKnowledgeSource } from '../../app/.server/knowledge/sources';
@@ -60,7 +61,7 @@ describe('把知识来源解析成知识提案', () => {
     const { f, received } = fakeLlm(setLlmFetch, () => json(modelOutput(), USAGE));
 
     const out = await importFromSource(analyst, source.id);
-    expect(out).toEqual({ created: 3, existing: 0, rejected: 0, invalid: 0, stale: 0 });
+    expect(out).toEqual({ created: 3, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0 });
     expect(f).toHaveBeenCalledTimes(1);
     const [call] = await calls(acme);
     expect(call).toMatchObject({ purpose: 'knowledge_import', model: 'qwen-plus', schemaValid: true,
@@ -99,7 +100,7 @@ describe('把知识来源解析成知识提案', () => {
     fakeLlm(setLlmFetch, () => json(modelOutput(bad), USAGE));
 
     const out = await importFromSource(analyst, source.id);
-    expect(out).toEqual({ created: 3, existing: 0, rejected: 0, invalid: 5, stale: 0 });
+    expect(out).toEqual({ created: 3, existing: 0, rejected: 0, invalid: 5, stale: 0, skipped: 0 });
     expect((await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).map(r => r.kind).sort())
       .toEqual(['alias', 'claim', 'note']);
   });
@@ -114,7 +115,7 @@ describe('把知识来源解析成知识提案', () => {
     ] }, USAGE));
 
     const out = await importFromSource(analyst, source.id);
-    expect(out).toEqual({ created: 1, existing: 0, rejected: 0, invalid: 0, stale: 0 });
+    expect(out).toEqual({ created: 1, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0 });
 
     // 结果只有提案：指令与 SQL 没被照做——只调了模型，没有工作台审计、没有新任务，审计里也没有段落原文
     expect((await calls(acme)).map(c => c.purpose)).toEqual(['knowledge_import']);
@@ -135,7 +136,7 @@ describe('把知识来源解析成知识提案', () => {
 
     // 再解析同一来源：还会调模型，同样的提案命中已有指纹计 existing
     const second = await importFromSource(analyst, source.id);
-    expect(second).toEqual({ created: 0, existing: 3, rejected: 0, invalid: 0, stale: 0 });
+    expect(second).toEqual({ created: 0, existing: 3, rejected: 0, invalid: 0, stale: 0, skipped: 0 });
     expect(f).toHaveBeenCalledTimes(2);
 
     // 拒绝一条后再解析：命中已拒绝的指纹计 rejected，不重新提出
@@ -143,13 +144,13 @@ describe('把知识来源解析成知识提案', () => {
       .where(and(eq(knowledgeProposals.tenantId, acme), eq(knowledgeProposals.kind, 'alias')));
     await rejectProposal(analyst, alias!.id, '不是这个叫法');
     const third = await importFromSource(analyst, source.id);
-    expect(third).toEqual({ created: 0, existing: 2, rejected: 1, invalid: 0, stale: 0 });
+    expect(third).toEqual({ created: 0, existing: 2, rejected: 1, invalid: 0, stale: 0, skipped: 0 });
 
     // 再粘贴换版（version + 1）后解析：指纹不含证据，同样的提案仍命中已有那条、证据仍是首版的
     const v2 = await saveKnowledgeSource(analyst, { title: '指标口径文档', kind: 'metric', body: `${BODY}\n\n补充：退货不算流水。` });
     expect(v2.version).toBe(2);
     const fourth = await importFromSource(analyst, source.id);
-    expect(fourth).toEqual({ created: 0, existing: 2, rejected: 1, invalid: 0, stale: 0 });
+    expect(fourth).toEqual({ created: 0, existing: 2, rejected: 1, invalid: 0, stale: 0, skipped: 0 });
     const [claim] = await getDb().select().from(knowledgeProposals)
       .where(and(eq(knowledgeProposals.tenantId, acme), eq(knowledgeProposals.kind, 'claim')));
     expect(claim!.evidence).toEqual([{ ref: `source:${source.id}#p2`, version: 1 }]);
@@ -159,11 +160,29 @@ describe('把知识来源解析成知识提案', () => {
     expect(audits).toHaveLength(4);
     expect(audits[3]).toMatchObject({ targetType: 'knowledge_source', targetId: source.id,
       detail: { sourceId: source.id, title: '指标口径文档', kind: 'metric', version: 2,
-        created: 0, existing: 2, rejected: 1, invalid: 0, stale: 0 } });
+        created: 0, existing: 2, rejected: 1, invalid: 0, stale: 0, skipped: 0 } });
     expect(Object.keys(audits[3]!.detail as Record<string, unknown>).sort())
-      .toEqual(['created', 'existing', 'invalid', 'kind', 'rejected', 'sourceId', 'stale', 'title', 'version']);
+      .toEqual(['created', 'existing', 'invalid', 'kind', 'rejected', 'skipped', 'sourceId', 'stale', 'title', 'version']);
     expect(JSON.stringify(audits)).not.toContain('成交额');
     expect(JSON.stringify(audits)).not.toContain('人民币');
+  });
+
+  it('提案接受成已生效知识后再解析同一来源：同值提案落库前丢掉、计 skipped，不再重复提出', async () => {
+    const { acme, analyst, source } = await setup();
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json(modelOutput(), USAGE));
+    await importFromSource(analyst, source.id);
+
+    // 三条全部接受：别名、币种声明与业务说明都成了已生效知识（SK.10 的场景：成员刚写进去的又原样提回来）
+    const rows = await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme));
+    for (const r of rows) await acceptProposal(analyst, r.id);
+
+    // 再解析同一来源：同样的三条和已生效知识相同，落库前丢掉、计 skipped，而不是靠指纹计 existing
+    const second = await importFromSource(analyst, source.id);
+    expect(second).toEqual({ created: 0, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 3 });
+    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(3);
+    const [, audit] = await auditsOf(acme, 'knowledge_source.parsed');
+    expect(audit!.detail).toMatchObject({ created: 0, skipped: 3 });
   });
 
   it('模型失败 422 且不留提案与审计；查看者 403；未配置模型服务 409 且不发请求；来源不存在 400', async () => {
