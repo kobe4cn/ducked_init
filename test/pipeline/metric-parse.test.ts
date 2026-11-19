@@ -1,5 +1,6 @@
 // test/pipeline/metric-parse.test.ts —— 一句话解析成指标表单（#516）：parseMetricSentence → 注入的假 fetch（setLlmFetch）
 // → 模型输出 MetricSpec（包在 spec 里，另带逐项说明、未知项与不支持的说法）补全路径、转 YAML 过 checkMetric、再转表单（formToYaml 兜底再校验）；
+// 模型看不到 Schema，会把定义平铺在顶层（qwen-plus 必现，#959）：宽松 Schema 放行后收进 spec 再严格校验，返回与失败审计带 normalized；
 // platform.llm_calls 记 purpose = metric_parse；失败审计 definition.metric_parse_failed（不含原句）；不保存、不写 dsl_versions
 // 检索与起草同一条路（draftSearch，#853：租户 hybrid_search 开关带向量一路，ADR-0047、0049），歧义时照常解析并带回提示（ADR-0056）
 import { and, eq } from 'drizzle-orm';
@@ -105,6 +106,8 @@ describe('一句话解析成指标表单', () => {
     expect(out.items).toEqual(MODEL_PARSE.items);
     expect(out.unknowns).toEqual(MODEL_PARSE.unknowns);
     expect(out.unsupported).toEqual(MODEL_PARSE.unsupported);
+    // 输出本来就包在 spec 里：没有收拢（#959）
+    expect(out.normalized).toBe(false);
 
     const [call] = await calls(acme);
     expect(call).toMatchObject({ purpose: 'metric_parse', schemaValid: true });
@@ -113,6 +116,8 @@ describe('一句话解析成指标表单', () => {
     expect(system).toMatchObject({ role: 'system' });
     expect(system!.content).toContain('capability:metric-dsl');
     for (const rule of ['同一字段的不同取值时改写成一个 in', '近 N 天', '上个月', '分母为 0 时算 0', 'unknowns', 'unsupported']) expect(system!.content).toContain(rule);
+    // 输出骨架（#959）：模型看不到 Schema，提示词要写明顶层四个键、定义只放在 spec 里
+    for (const part of ['输出格式：', '"spec"', '"items"', '"unknowns"', '"unsupported"', '四个键都必须有', '平铺到顶层']) expect(system!.content).toContain(part);
     // user 依次是目录分层上下文（第一层分组 + 相关分组的组内列表）、按句子搜出的条目与句子原文
     expect(user!.role).toBe('user');
     const [overviewPart, searchPart] = user!.content.split('# 与需求相关的条目');
@@ -144,6 +149,68 @@ describe('一句话解析成指标表单', () => {
     expect(JSON.stringify(audit!.detail)).not.toContain(SENTENCE);
     expect(JSON.stringify(audit!.detail)).not.toContain('vip-secret-42');
     expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+  });
+
+  it('模型把定义平铺在顶层（缺 spec / unknowns / unsupported）时收进 spec：解析成功、列表补空、normalized 为 true，llm_calls 照常记 schema_valid', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    // qwen-plus 的实际输出形状（#959）：定义平铺在顶层，不带 unknowns / unsupported
+    fakeLlm(setLlmFetch, () => json({ ...MODEL_PARSE.spec, items: MODEL_PARSE.items }, USAGE));
+
+    const out = await parseMetricSentence(analyst, SENTENCE);
+    expect(out.form).toMatchObject({
+      base: 'order', agg: 'sum', field: 'amount',
+      filter: [{ field: 'status', op: 'in', value: ['paid', 'shipped'] }],
+      window: { field: 'created_at', days: 30 },
+    });
+    expect(out.items).toEqual(MODEL_PARSE.items);
+    expect(out.unknowns).toEqual([]);
+    expect(out.unsupported).toEqual([]);
+    expect(out.normalized).toBe(true);
+
+    // 宽松 Schema 放行平铺输出，schema_valid 记的是它的结果；收拢后照常成功、不记审计
+    const [call] = await calls(acme);
+    expect(call).toMatchObject({ purpose: 'metric_parse', schemaValid: true });
+    expect(await failures(acme)).toHaveLength(0);
+  });
+
+  it('完全不像定义的输出（没有 spec，顶层也没有 base / measure）仍 422：审计记 model 阶段，不带 normalized', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json({ foo: 1 }, USAGE));
+
+    const e = await failure(parseMetricSentence(analyst, SENTENCE));
+    expect(e).toBeInstanceOf(MetricParseError);
+    expect(e.status).toBe(422);
+    expect(e.message).toContain('不符合 Schema');
+    const [audit] = await failures(acme);
+    expect(audit!.detail).toMatchObject({ stage: 'model', error: expect.stringContaining('不符合 Schema') });
+    // 连宽松 Schema 都没过：在 chatJson 里就抛了 LlmError，审计不带 normalized，llm_calls 记 schema_valid = false
+    expect(JSON.stringify(audit!.detail)).not.toContain('normalized');
+    const [call] = await calls(acme);
+    expect(call).toMatchObject({ schemaValid: false });
+  });
+
+  it('收拢过的定义转出来不过校验时 422：失败审计带 normalized，问题列表照旧', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    // 平铺在顶层、spec 用了不存在的字段：宽松 Schema 放行、收拢成功，卡在定义校验
+    fakeLlm(setLlmFetch, () => json({
+      base: 'order', measure: { agg: 'count' },
+      filter: [{ field: 'channel_code', op: 'eq', value: 'vip-secret-42' }],
+      items: MODEL_PARSE.items,
+    }, USAGE));
+
+    const e = await failure(parseMetricSentence(analyst, SENTENCE));
+    expect(e).toBeInstanceOf(MetricParseError);
+    expect(e.status).toBe(422);
+    expect(e.issues!.map(i => i.path)).toEqual(['filter.0.field']);
+    const [audit] = await failures(acme);
+    expect(audit!.detail).toMatchObject({ stage: 'definition', issues: 1, paths: ['filter.0.field'], normalized: true });
+    expect(JSON.stringify(audit!.detail)).not.toContain(SENTENCE);
   });
 
   it('模型服务 HTTP 500 时 422，审计记阶段与错误摘要', async () => {

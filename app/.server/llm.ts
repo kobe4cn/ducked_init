@@ -191,7 +191,8 @@ export async function resolveEmbeddingProvider(tenantId: string): Promise<LlmPro
 const ajv = new Ajv({ allErrors: true, strict: false });
 const compiledSchemas = new WeakMap<object, ValidateFunction>();
 
-function validatorFor(schema: object) {
+/** 编译并缓存 JSON Schema 的校验器（WeakMap 按对象缓存，Schema 得用模块级常量）；导出给调用方做收拢后的严格校验（#959） */
+export function validatorFor(schema: object) {
   let v = compiledSchemas.get(schema);
   if (!v) compiledSchemas.set(schema, v = ajv.compile(schema));
   return v;
@@ -210,8 +211,8 @@ function describeError(e: ErrorObject) {
   }
 }
 
-/** 校验错误的中文摘要，最多列三条 */
-const schemaErrors = (v: ValidateFunction) => (v.errors ?? []).slice(0, 3).map(describeError).join('；');
+/** 校验错误的中文摘要，最多列三条；导出给调用方严格校验时报错文案与 callModel 一致（#959） */
+export const schemaErrors = (v: ValidateFunction) => (v.errors ?? []).slice(0, 3).map(describeError).join('；');
 
 /** 一次调用的统计，调用日志用：令牌数与 Schema 校验结果（没走到校验时为 null） */
 export interface CallStats { usage?: { prompt_tokens?: number; completion_tokens?: number }; schemaValid: boolean | null }
