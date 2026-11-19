@@ -53,6 +53,21 @@ export function redactLakeSecrets(message: string, lake: LakeSpec) {
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`;
 
+/** 湖 catalog（DuckLake 的 PostgreSQL）的建连超时秒数（LAKE_CONNECT_TIMEOUT_SECONDS）：设了才给 catalogUrl 拼 connect_timeout，
+ *  不设（生产默认）不加参数、由网络栈决定，行为不变。正整数字符串才用，否则 undefined。
+ *  沙箱经 podman 网关 ATTACH 建连偶发卡住 60 秒以上（工作台报「查询超过 60 秒」），libpq 一直等且 interrupt() 打断不了（#938，#545 / #627 同类） */
+export function lakeConnectTimeout(env: Record<string, string | undefined> = process.env): number | undefined {
+  const raw = env.LAKE_CONNECT_TIMEOUT_SECONDS;
+  return /^\d+$/.test(raw ?? '') && Number(raw) > 0 ? Number(raw) : undefined;
+}
+
+/** 湖 catalog 建连超时（timeout expired）的重试次数（LAKE_CONNECT_RETRIES，默认 0）：照 #892 给源库 ATTACH 拍板的方案，
+ *  只对建连超时重试，密码错、库不存在等其他错误不重试；生产默认不重试、行为不变 */
+export function lakeConnectRetries(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.LAKE_CONNECT_RETRIES;
+  return /^\d+$/.test(raw ?? '') ? Number(raw) : 0;
+}
+
 /**
  * 挂载租户数据湖（给了 source 时再只读挂载该数据源，ADR-0012）后锁住配置：只能读写本租户的存储前缀，不能再挂载其他库、读其他路径，也不能改回这些设置。
  * catalog 的数据库角色只能访问本租户的 schema，因此经 DuckLake 内部的 PG 连接也读不到其他租户与平台元数据。
@@ -86,8 +101,28 @@ export async function openTenantLake(
       await con.run(`CREATE SECRET lake_s3 (TYPE s3, KEY_ID ${lit(s.key)}, SECRET ${lit(s.secret)}, REGION ${lit(s.region)},
           ENDPOINT ${lit(s.endpoint)}, URL_STYLE ${lit(s.urlStyle)}, USE_SSL ${s.useSsl}, SCOPE ${lit(spec.dataPath)})`);
     }
-    await con.run(`ATTACH ${lit(`ducklake:postgres:${spec.catalogUrl}`)} AS lake
-      (DATA_PATH ${lit(spec.dataPath)}, METADATA_SCHEMA ${lit(spec.catalogSchema)}${readOnly ? ', READ_ONLY' : ''}${encrypted ? ', ENCRYPTED' : ''})`);
+    // catalog 的 ATTACH 单独跑、只在建连超时（timeout expired）时按 LAKE_CONNECT_RETRIES 重试（#938，照 #892 源库 ATTACH 的写法）：
+    // 设了超时才把 connect_timeout 拼进 URL 的查询串（不改 spec.catalogUrl 本身：它进 IPC 传给工作进程、也用于脱敏），不设时 URL 原样、生产行为不变。
+    // ATTACH 失败时 lake 没有注册，重试前不需要 DETACH；此时还在 lockConfiguration 之前（ADR-0008），可以再次 ATTACH。
+    // 用完重试次数或密码错、库不存在等其他错误时抛最后一次的原错误，不包装（调用方会脱敏）
+    const timeout = lakeConnectTimeout();
+    let catalogUrl = spec.catalogUrl;
+    if (timeout !== undefined) {
+      const url = new URL(spec.catalogUrl);
+      url.searchParams.set('connect_timeout', String(timeout));
+      catalogUrl = url.href;
+    }
+    const attach = `ATTACH ${lit(`ducklake:postgres:${catalogUrl}`)} AS lake
+      (DATA_PATH ${lit(spec.dataPath)}, METADATA_SCHEMA ${lit(spec.catalogSchema)}${readOnly ? ', READ_ONLY' : ''}${encrypted ? ', ENCRYPTED' : ''})`;
+    const retries = lakeConnectRetries();
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await con.run(attach);
+        break;
+      } catch (e) {
+        if (attempt >= retries || !(e as Error).message.includes('timeout expired')) throw e;
+      }
+    }
     // 源端不带时区的时间一律按 UTC 解读，不随工作进程所在机器的时区变化；GLOBAL 让之后 connect() 开的连接同样按 UTC
     await con.run(`USE lake; SET GLOBAL TimeZone = 'UTC'`);
     const attached = source ? await attachSource(con, source) : { allowed: [], mongo: undefined };
