@@ -18,6 +18,8 @@ import type { Route } from './+types/workbench';
 import { requirePermission } from '~/.server/access';
 import { ConversationError } from '~/.server/assistant/conversations';
 import type { CurrentMember } from '~/.server/auth';
+import { formatServer } from '~/.server/i18n';
+import { getLocale } from '~/.server/locale';
 import { navFor } from '~/.server/nav';
 import {
   dropSandboxTable, listCatalog, listSandboxTables, listSharedWithMe, runQuery, SANDBOX_TTL_DAYS, sandboxSchema, saveAsSandbox, shareSandboxTable,
@@ -32,6 +34,7 @@ import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 import { Label } from '~/components/ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { msg, useT } from '~/lib/i18n';
 import { completionSchema } from '~/lib/sql-completion';
 
 export function meta({}: Route.MetaArgs) {
@@ -98,7 +101,7 @@ export async function action({ request }: Route.ActionArgs) {
     // 主人提前删除：只有自己的表能删，别人的表与已删的表 404（WorkbenchError 带状态），湖里的数据由入队的 sandbox.expire 随后清理
     if (intent === 'drop') {
       await dropSandboxTable(member, name);
-      return { sql: '', name: '', notice: `已删除沙箱表 ${name}，分享一并撤销，湖里的数据随后清理` };
+      return { sql: '', name: '', notice: formatServer(await getLocale(request), msg('已删除沙箱表 {name}，分享一并撤销，湖里的数据随后清理', { name })) };
     }
     return { sql, name, result: await runQuery(member, sql, request.signal), conversationId };
   } catch (e) {
@@ -234,6 +237,7 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
   const insertRef = (ref: string) => sqlBox.current?.insert(ref);
   const schema = useMemo(() => (catalog ? completionSchema(catalog) : {}), [catalog]);
   const navigation = useNavigation();
+  const t = useT();
   const running = navigation.state === 'submitting';
   const drafting = running && navigation.formData?.get('intent') === 'draft';
   const result = actionData && 'result' in actionData ? actionData.result : null;
@@ -404,24 +408,24 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                     <TableHead>保存时间</TableHead>
                     <TableHead>过期时间</TableHead>
                     <TableHead>分享给</TableHead>
-                    <TableHead className="text-right">操作</TableHead>
+                    <TableHead className="text-right">{t('操作')}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {sandboxTables.map(t => (
-                    <TableRow key={t.name}>
+                  {sandboxTables.map(table => (
+                    <TableRow key={table.name}>
                       {/* 单元格默认不换行，整串全名太长会把表名左侧截掉：一行认表用的表名、一行查询里要用的全名，都允许换行 */}
                       <TableCell className="whitespace-normal">
-                        <div className="break-all font-mono">{t.name}</div>
-                        <div className="break-all font-mono text-xs text-slate-400">{`${sandbox}.${t.name}`}</div>
+                        <div className="break-all font-mono">{table.name}</div>
+                        <div className="break-all font-mono text-xs text-slate-400">{`${sandbox}.${table.name}`}</div>
                       </TableCell>
-                      <TableCell>{t.rowCount.toLocaleString('zh-CN')}</TableCell>
-                      <TableCell>{dateTime(t.createdAt)}</TableCell>
-                      <TableCell>{dateTime(t.expiresAt)}</TableCell>
+                      <TableCell>{table.rowCount.toLocaleString('zh-CN')}</TableCell>
+                      <TableCell>{dateTime(table.createdAt)}</TableCell>
+                      <TableCell>{dateTime(table.expiresAt)}</TableCell>
                       <TableCell className="space-y-2">
-                        {t.sharedWith.map(member => (
+                        {table.sharedWith.map(member => (
                           <Form method="post" action="/workbench" key={member} className="flex items-center gap-2">
-                            <input type="hidden" name="name" value={t.name} />
+                            <input type="hidden" name="name" value={table.name} />
                             <input type="hidden" name="email" value={member} />
                             <span>{member}</span>
                             <Button type="submit" name="intent" value="unshare" variant="outline" size="sm">撤销</Button>
@@ -429,10 +433,10 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                         ))}
                         {/* 分享成功（shareId 每次都不同）时换 key 重新挂载、清空邮箱；失败时 key 回到 'share'，defaultValue 把刚填的邮箱填回去（不开 JS 整页刷新时同样成立） */}
                         <Form method="post" action="/workbench" key={shareId ?? 'share'} className="flex items-center gap-2">
-                          <input type="hidden" name="name" value={t.name} />
+                          <input type="hidden" name="name" value={table.name} />
                           <Input
-                            name="email" type="email" required placeholder="成员邮箱" aria-label={`把 ${t.name} 分享给`} className="h-8 w-48"
-                            defaultValue={actionData && 'error' in actionData && actionData.intent === 'share' && actionData.name === t.name ? actionData.email : ''}
+                            name="email" type="email" required placeholder="成员邮箱" aria-label={`把 ${table.name} 分享给`} className="h-8 w-48"
+                            defaultValue={actionData && 'error' in actionData && actionData.intent === 'share' && actionData.name === table.name ? actionData.email : ''}
                           />
                           <Button type="submit" name="intent" value="share" variant="outline" size="sm">分享</Button>
                         </Form>
@@ -441,10 +445,10 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                         {/* 危险操作：destructive 加确认（项目里没有对话框组件，照 members / api-keys 的 confirm() 写法） */}
                         <Form
                           method="post"
-                          onSubmit={e => { if (!confirm(`确定删除沙箱表「${t.name}」？分享会一并撤销，湖里的数据随后清理。`)) e.preventDefault(); }}
+                          onSubmit={e => { if (!confirm(t('确定删除沙箱表「{name}」？分享会一并撤销，湖里的数据随后清理。', { name: table.name }))) e.preventDefault(); }}
                         >
-                          <input type="hidden" name="name" value={t.name} />
-                          <Button type="submit" name="intent" value="drop" variant="destructive" size="sm">删除</Button>
+                          <input type="hidden" name="name" value={table.name} />
+                          <Button type="submit" name="intent" value="drop" variant="destructive" size="sm">{t('删除')}</Button>
                         </Form>
                       </TableCell>
                     </TableRow>

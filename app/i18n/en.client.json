@@ -16,5 +16,8 @@
   "目录": "Catalog",
   "点查": "Lookup",
   "导出": "Export",
-  "、": ", "
+  "、": ", ",
+  "操作": "Actions",
+  "删除": "Delete",
+  "确定删除沙箱表「{name}」？分享会一并撤销，湖里的数据随后清理。": "Delete sandbox table \"{name}\"? Its shares will be revoked and its data in the lake cleaned up afterwards."
 }
