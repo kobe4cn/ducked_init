@@ -61,6 +61,15 @@ export function lakeConnectTimeout(env: Record<string, string | undefined> = pro
   return /^\d+$/.test(raw ?? '') && Number(raw) > 0 ? Number(raw) : undefined;
 }
 
+/** 湖 catalog ATTACH 用的 URL：给了超时就在查询串末尾追加 connect_timeout，已有参数逐字保留；不给时原样返回。
+ *  按字符串拼接而不用 URL.searchParams：后者会把整个查询串按表单格式重新编码（%20 变成 +），
+ *  libpq 只做百分号解码、不把 + 当空格，`?options=-c%20search_path%3Dx` 这类参数会被改坏（#938） */
+export function lakeCatalogAttachUrl(catalogUrl: string, timeout: number | undefined): string {
+  if (timeout === undefined) return catalogUrl;
+  const sep = !catalogUrl.includes('?') ? '?' : catalogUrl.endsWith('?') || catalogUrl.endsWith('&') ? '' : '&';
+  return `${catalogUrl}${sep}connect_timeout=${timeout}`;
+}
+
 /** 湖 catalog 建连超时（timeout expired）的重试次数（LAKE_CONNECT_RETRIES，默认 0）：照 #892 给源库 ATTACH 拍板的方案，
  *  只对建连超时重试，密码错、库不存在等其他错误不重试；生产默认不重试、行为不变 */
 export function lakeConnectRetries(env: Record<string, string | undefined> = process.env): number {
@@ -105,13 +114,7 @@ export async function openTenantLake(
     // 设了超时才把 connect_timeout 拼进 URL 的查询串（不改 spec.catalogUrl 本身：它进 IPC 传给工作进程、也用于脱敏），不设时 URL 原样、生产行为不变。
     // ATTACH 失败时 lake 没有注册，重试前不需要 DETACH；此时还在 lockConfiguration 之前（ADR-0008），可以再次 ATTACH。
     // 用完重试次数或密码错、库不存在等其他错误时抛最后一次的原错误，不包装（调用方会脱敏）
-    const timeout = lakeConnectTimeout();
-    let catalogUrl = spec.catalogUrl;
-    if (timeout !== undefined) {
-      const url = new URL(spec.catalogUrl);
-      url.searchParams.set('connect_timeout', String(timeout));
-      catalogUrl = url.href;
-    }
+    const catalogUrl = lakeCatalogAttachUrl(spec.catalogUrl, lakeConnectTimeout());
     const attach = `ATTACH ${lit(`ducklake:postgres:${catalogUrl}`)} AS lake
       (DATA_PATH ${lit(spec.dataPath)}, METADATA_SCHEMA ${lit(spec.catalogSchema)}${readOnly ? ', READ_ONLY' : ''}${encrypted ? ', ENCRYPTED' : ''})`;
     const retries = lakeConnectRetries();
