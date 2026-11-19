@@ -8,7 +8,7 @@ import { BusinessNoteError, saveBusinessNote, targetNoteHistory, type NoteVersio
 import { getDb } from '../db/client';
 import { knowledgeAliases, sources, subjectMemberships, type ProposalContentOf, type ProposalEvidence } from '../db/schema';
 import { cmpName } from '../../lib/compare';
-import { addAlias, retireAlias } from './aliases';
+import { addAlias, confirmAlias, retireAlias } from './aliases';
 import { KnowledgeError } from './basis';
 import { knowledgeKey, loadKnowledge, type Claim } from './catalog';
 import { saveClaim } from './claims';
@@ -125,6 +125,9 @@ export async function handleKnowledgeIntent(member: CurrentMember, form: FormDat
         break;
       case 'alias.retire':
         await retireAlias(member, String(field('aliasId') ?? ''));
+        break;
+      case 'alias.confirm':
+        await confirmAlias(member, String(field('aliasId') ?? ''));
         break;
       case 'claim.save':
         await saveClaim(member, { targetId, type: field('type'), value: field('value') });

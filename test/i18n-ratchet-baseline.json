@@ -136,7 +136,7 @@
     "app/components/draft-version.tsx": 6,
     "app/components/key-check-findings.tsx": 1,
     "app/components/knowledge-ask-card.tsx": 4,
-    "app/components/knowledge-panel.tsx": 58,
+    "app/components/knowledge-panel.tsx": 59,
     "app/components/lineage-drawer.tsx": 25,
     "app/components/lineage-flow.tsx": 5,
     "app/components/lineage-focus.tsx": 2,
