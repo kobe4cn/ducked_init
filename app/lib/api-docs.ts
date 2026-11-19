@@ -70,13 +70,13 @@ export const API_ENDPOINTS: readonly ApiEndpoint[] = [
     path: '/api/v1/catalog',
     route: 'api/v1/catalog',
     file: 'routes/api.v1.catalog.tsx',
-    purpose: '本租户已发布的指标与标签目录：各自的键、当前版本（最新已发布版）、说明与发布时间。只列已发布的，草稿不出现。',
+    purpose: '本租户已发布的指标与标签目录：各自的键、当前版本（最新已发布版）、说明、业务知识里的说明（note）与发布时间。只列已发布的，草稿不出现。',
     auth: 'Authorization: Bearer <你的 API Key>',
     params: [],
     responseExample: `{
   "definitions": [
-    { "kind": "metric", "key": "revenue", "version": 2, "description": "累计消费金额", "publishedAt": "2026-11-01T08:30:00.000Z" },
-    { "kind": "tag", "key": "value_tier", "version": 1, "description": null, "publishedAt": "2026-11-01T09:00:00.000Z" }
+    { "kind": "metric", "key": "revenue", "version": 2, "description": "累计消费金额", "note": "财务口径：只算已支付、已发货或已完成，已退款整单不计", "publishedAt": "2026-11-01T08:30:00.000Z" },
+    { "kind": "tag", "key": "value_tier", "version": 1, "description": null, "note": null, "publishedAt": "2026-11-01T09:00:00.000Z" }
   ]
 }`,
     errors: [UNAUTHORIZED],
