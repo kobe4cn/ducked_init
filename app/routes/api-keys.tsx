@@ -17,6 +17,7 @@ import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 import { API_ENDPOINTS, type ApiEndpoint } from '~/lib/api-docs';
+import { API_SCOPES, API_SCOPE_LABELS, type ApiScope } from '~/lib/api-scopes';
 
 export function meta({}: Route.MetaArgs) {
   return [{ title: 'API Key · CRM 数据分析平台' }];
@@ -41,6 +42,7 @@ export async function loader({ request }: Route.LoaderArgs) {
         id: r.id,
         name: r.name,
         prefix: r.prefix,
+        scopes: r.scopes,
         createdByEmail: r.createdByEmail,
         createdAt: r.createdAt.toISOString(),
         lastUsedAt: r.lastUsedAt?.toISOString() ?? null,
@@ -58,7 +60,7 @@ export async function action({ request }: Route.ActionArgs) {
     switch (field('intent')) {
       case 'create': {
         // 不重定向：明文只在这次响应里出现，刷新或离开后再也看不到
-        const { key, row } = await createApiKey(member, field('name'));
+        const { key, row } = await createApiKey(member, field('name'), form.getAll('scope').map(String));
         return { created: { name: row.name, key } };
       }
       case 'revoke':
@@ -80,20 +82,32 @@ const formatTime = (iso: string) => new Date(iso).toLocaleString('zh-CN', { hour
 const PARAM_IN_TEXT = { path: '路径', query: '查询', body: '请求体' } as const;
 
 /** 「Key」标签页：创建表单与 Key 列表 */
-function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefix: string; createdByEmail: string; createdAt: string; lastUsedAt: string | null; revoked: boolean }[]; submitting: boolean }) {
+function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefix: string; scopes: ApiScope[]; createdByEmail: string; createdAt: string; lastUsedAt: string | null; revoked: boolean }[]; submitting: boolean }) {
   return (
     <>
       <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
         <SectionHeader title="创建 API Key">每个外部系统各用一把，便于单独吊销。</SectionHeader>
         <Form method="post">
           <input type="hidden" name="intent" value="create" />
-          <FieldGroup className="flex-row items-end">
+          <FieldGroup className="flex-row flex-wrap items-end">
             <Field>
               <FieldLabel htmlFor="api-key-name">名称</FieldLabel>
               <Input id="api-key-name" name="name" required maxLength={100} placeholder="如：营销自动化系统" />
             </Field>
+            <Field>
+              <FieldLabel>可用接口</FieldLabel>
+              <div className="flex items-center gap-4 pb-2">
+                {API_SCOPES.map(scope => (
+                  <label key={scope} className="flex items-center gap-1.5 text-sm text-slate-700">
+                    <input type="checkbox" name="scope" value={scope} defaultChecked className="size-4" />
+                    {API_SCOPE_LABELS[scope]}
+                  </label>
+                ))}
+              </div>
+            </Field>
             <Button type="submit" disabled={submitting}>创建</Button>
           </FieldGroup>
+          <p className="mt-1 text-xs text-slate-400">不勾的那类接口，这把 Key 调用时返回 403。</p>
         </Form>
       </div>
 
@@ -106,6 +120,7 @@ function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefi
               <TableRow>
                 <TableHead>名称</TableHead>
                 <TableHead>前缀</TableHead>
+                <TableHead>接口</TableHead>
                 <TableHead>创建人</TableHead>
                 <TableHead>创建时间</TableHead>
                 <TableHead>最近使用</TableHead>
@@ -117,6 +132,7 @@ function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefi
                 <TableRow key={k.id} data-api-key-id={k.id}>
                   <TableCell>{k.name}</TableCell>
                   <TableCell className="font-mono">{`${k.prefix}…`}</TableCell>
+                  <TableCell className="text-slate-500">{k.scopes.map(s => API_SCOPE_LABELS[s]).join('、')}</TableCell>
                   <TableCell>{k.createdByEmail}</TableCell>
                   <TableCell className="text-slate-500">{formatTime(k.createdAt)}</TableCell>
                   <TableCell className="text-slate-500">{k.lastUsedAt ? formatTime(k.lastUsedAt) : '从未使用'}</TableCell>

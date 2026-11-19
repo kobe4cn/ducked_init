@@ -1,5 +1,7 @@
 // app/.server/api-keys.ts —— 租户管理员管理外部系统的 API Key：创建（明文只返回这一次，库里只存哈希）、吊销、列出。一律限定在操作者所属租户内
+// 创建时选接口范围（ADR-0061）：三类接口的非空子集，去重后按固定顺序存
 import { and, desc, eq, isNull } from 'drizzle-orm';
+import { API_SCOPES, type ApiScope } from '../lib/api-scopes';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import { newToken, sha256, type CurrentMember } from './auth';
@@ -17,6 +19,13 @@ const PREFIX_LENGTH = 8;
 const NAME_MAX = 100;
 const notFound = () => new ApiKeyError('API Key 不存在或已吊销', 404);
 
+/** 表单勾选的接口范围收敛成要存的值：只认三类（白名单），去重、按固定顺序；一类都没有是业务错误 */
+function normalizeScopes(raw: string[]): ApiScope[] {
+  const scopes = API_SCOPES.filter(s => raw.includes(s));
+  if (scopes.length === 0) throw new ApiKeyError('请至少勾选一类接口');
+  return scopes;
+}
+
 export async function listApiKeys(actor: CurrentMember) {
   assertCan(actor, 'api_keys:manage');
   return getDb()
@@ -24,6 +33,7 @@ export async function listApiKeys(actor: CurrentMember) {
       id: apiKeys.id,
       name: apiKeys.name,
       prefix: apiKeys.prefix,
+      scopes: apiKeys.scopes,
       createdByEmail: apiKeys.createdByEmail,
       createdAt: apiKeys.createdAt,
       lastUsedAt: apiKeys.lastUsedAt,
@@ -34,18 +44,19 @@ export async function listApiKeys(actor: CurrentMember) {
     .orderBy(desc(apiKeys.createdAt), desc(apiKeys.id));
 }
 
-/** 创建一把 Key：返回的 key 是明文，调用方只能把它展示给管理员这一次 */
-export async function createApiKey(actor: CurrentMember, rawName: string) {
+/** 创建一把 Key：返回的 key 是明文，调用方只能把它展示给管理员这一次；scopes 是勾选的接口范围（三类之外的被忽略） */
+export async function createApiKey(actor: CurrentMember, rawName: string, rawScopes: string[]) {
   assertCan(actor, 'api_keys:manage');
   const name = rawName.trim();
   if (!name) throw new ApiKeyError('请填写名称，用来辨认是哪个外部系统');
   if (name.length > NAME_MAX) throw new ApiKeyError(`名称不能超过 ${NAME_MAX} 个字`);
+  const scopes = normalizeScopes(rawScopes);
   const key = newToken();
   const prefix = key.slice(0, PREFIX_LENGTH);
   const row = await getDb().transaction(async tx => {
     const [created] = await tx
       .insert(apiKeys)
-      .values({ tenantId: actor.tenant.id, name, prefix, tokenHash: sha256(key), createdByEmail: actor.email })
+      .values({ tenantId: actor.tenant.id, name, prefix, tokenHash: sha256(key), scopes, createdByEmail: actor.email })
       .returning({ id: apiKeys.id, name: apiKeys.name, prefix: apiKeys.prefix, createdAt: apiKeys.createdAt });
     await recordAudit(tx, {
       tenantId: actor.tenant.id,
@@ -53,7 +64,7 @@ export async function createApiKey(actor: CurrentMember, rawName: string) {
       action: 'api_key.created',
       targetType: 'api_key',
       targetId: created.id,
-      detail: { name, prefix },
+      detail: { name, prefix, scopes },
     });
     return created;
   });

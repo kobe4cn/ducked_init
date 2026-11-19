@@ -33,9 +33,9 @@ const fresh = async () => { await resetDb(); app.outbox.length = 0; };
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\n';
 const BUYER = 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n';
 
-/** 管理员在页面上创建一把 Key，返回明文与创建那次响应的 HTML */
-async function createKey(admin: Client, name: string) {
-  const res = await admin.post('/api-keys', { intent: 'create', name });
+/** 管理员在页面上创建一把 Key，返回明文与创建那次响应的 HTML；scope 是勾选的接口范围，默认三类全勾（与页面表单一致） */
+async function createKey(admin: Client, name: string, scopes: string[] = ['catalog', 'consumers', 'exports']) {
+  const res = await admin.post('/api-keys', { intent: 'create', name, scope: scopes });
   expect(res.status).toBe(200);
   const html = await res.text();
   const key = html.match(/data-api-key="[^"]*"[^>]*>([^<]+)</)?.[1];
@@ -58,7 +58,7 @@ const call = (path: string, key?: string, browser: Client = app.client()) =>
 describe('API Key 页', () => {
   beforeEach(fresh);
 
-  it('管理员创建后只展示一次明文，列表只有名称、前缀、创建人与时间，库里只存哈希；吊销后审计有记录', async () => {
+  it('管理员创建后只展示一次明文，列表只有名称、前缀、接口、创建人与时间，库里只存哈希；吊销后审计有记录', async () => {
     await newTenant('acme');
     const admin = await loginAs(app, 'admin@acme.com');
     expect(await (await admin.get('/')).text()).toContain('href="/api-keys"');
@@ -92,6 +92,51 @@ describe('API Key 页', () => {
     expect(JSON.stringify(details)).not.toContain(key);
 
     expect((await admin.post('/api-keys', { intent: 'create', name: '  ' })).status).toBe(400);
+  });
+
+  it('创建时勾选接口范围：三个复选框默认全勾；只勾点查的列表「接口」列只显示点查；一类都不勾报错不创建；审计 detail 带 scopes', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+
+    // 表单是三个默认勾选的复选框（目录 / 点查 / 导出），值是三类接口
+    const page = await (await admin.get('/api-keys')).text();
+    const scopeInputs = [...page.matchAll(/<input[^>]*name="scope"[^>]*>/g)].map(m => m[0]);
+    expect(scopeInputs.map(t => t.match(/value="(\w+)"/)?.[1]).sort()).toEqual(['catalog', 'consumers', 'exports']);
+    expect(scopeInputs.every(t => t.includes('checked'))).toBe(true);
+    for (const label of ['目录', '点查', '导出']) expect(page).toContain(label);
+
+    // 默认提交三类；乱序、重复的勾选去重后按固定顺序存
+    const { key } = await createKey(admin, '三类全开');
+    const [full] = await getDb().select().from(apiKeys).where(eq(apiKeys.tokenHash, sha256(key)));
+    expect(full.scopes).toEqual(['catalog', 'consumers', 'exports']);
+    const { key: messy } = await createKey(admin, '乱序', ['exports', 'consumers', 'exports']);
+    expect((await getDb().select({ scopes: apiKeys.scopes }).from(apiKeys).where(eq(apiKeys.tokenHash, sha256(messy))))[0].scopes)
+      .toEqual(['consumers', 'exports']);
+
+    // 列表多一列「接口」：只点查的那行只显示点查，三类全开的那行三类都在
+    const { key: onlyKey } = await createKey(admin, '只点查', ['consumers']);
+    const list = await (await admin.get('/api-keys')).text();
+    expect(list).toMatch(/<th[^>]*>接口<\/th>/);
+    const rowOf = (name: string) => list.split('<tr').find(r => r.includes(`>${name}<`)) ?? '';
+    expect(rowOf('只点查')).toContain('>点查<');
+    expect(rowOf('只点查')).not.toContain('目录');
+    expect(rowOf('只点查')).not.toContain('导出');
+    expect(rowOf('三类全开')).toContain('目录、点查、导出');
+
+    // 一类都不勾：报错不创建，列表与库里都没有这把 Key
+    const none = await admin.post('/api-keys', { intent: 'create', name: '都不勾' });
+    expect(none.status).toBe(400);
+    expect(await none.text()).toContain('请至少勾选一类接口');
+    expect(await (await admin.get('/api-keys')).text()).not.toContain('都不勾');
+    expect(await getDb().select().from(apiKeys)).toHaveLength(3);
+
+    // 审计 detail 带 scopes（只存勾选的类，不含 Key 明文）
+    const created = await getDb().select({ detail: auditLogs.detail }).from(auditLogs).where(eq(auditLogs.action, 'api_key.created')).orderBy(auditLogs.createdAt);
+    expect(created.map(d => d.detail)).toEqual([
+      { name: '三类全开', prefix: key.slice(0, 8), scopes: ['catalog', 'consumers', 'exports'] },
+      { name: '乱序', prefix: messy.slice(0, 8), scopes: ['consumers', 'exports'] },
+      { name: '只点查', prefix: onlyKey.slice(0, 8), scopes: ['consumers'] },
+    ]);
   });
 
   it('「接口说明」标签页按登记表列出全部外部接口；页面只有占位符，没有 Key 前缀、哈希或创建者；无权限成员 403；Key 列表照旧', async () => {
@@ -186,6 +231,61 @@ describe('Bearer 认证', () => {
     }
     expect(new Set(bodies).size).toBe(1);
     expect(JSON.parse(bodies[0])).toHaveProperty('error');
+  });
+
+  it('只开点查的 Key：点查接口照常，目录与导出 403；先认证后判范围，401 的情形仍是 401', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    const { key } = await createKey(admin, '只点查', ['consumers']);
+
+    // 点查照常：还没有服务库与数据，落在平时的 503 / 404 上，而不是 403；这些是真实的使用，记下最近使用时间
+    expect((await call('/api/v1/consumers/c1', key)).status).toBe(503);
+    expect((await call('/api/v1/consumers/by-source/shop/c1', key)).status).toBe(404);
+    const [used] = await getDb().select({ lastUsedAt: apiKeys.lastUsedAt }).from(apiKeys).where(eq(apiKeys.tokenHash, sha256(key)));
+    expect(used.lastUsedAt).not.toBeNull();
+
+    // 目录与导出（发起与查状态）都 403；文案只说是哪一类，不含 Key 前缀或租户信息
+    const catalog = await call('/api/v1/catalog', key);
+    expect(catalog.status).toBe(403);
+    expect(await catalog.json()).toEqual({ error: '这把 Key 没有目录接口的权限' });
+    for (const res of [
+      await app.client().request('/api/v1/exports', { method: 'POST', headers: { Authorization: `Bearer ${key}` } }),
+      await call(`/api/v1/exports/${randomUUID()}`, key),
+    ]) {
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: '这把 Key 没有导出接口的权限' });
+    }
+    const body = JSON.stringify(await (await call('/api/v1/catalog', key)).json());
+    expect(body).not.toContain(key.slice(0, 8));
+    expect(body).not.toContain('acme');
+
+    // 403 不算一次使用，不更新最近使用时间
+    const [after] = await getDb().select({ lastUsedAt: apiKeys.lastUsedAt }).from(apiKeys).where(eq(apiKeys.tokenHash, sha256(key)));
+    expect(after.lastUsedAt).toEqual(used.lastUsedAt);
+
+    // 先认证后判范围：没有 Key、Key 错误、已吊销在范围外的接口上仍是原来的 401
+    expect((await call('/api/v1/catalog')).status).toBe(401);
+    expect((await call('/api/v1/catalog', 'not-a-key')).status).toBe(401);
+    await admin.post('/api-keys', { intent: 'revoke', keyId: await keyIdOf(admin, '只点查') });
+    expect((await call('/api/v1/catalog', key)).status).toBe(401);
+  });
+
+  it('迁移默认：迁移前就有的 Key（插入时不带 scopes）三类全开，行为不变', async () => {
+    const acme = await newTenant('acme');
+    await loginAs(app, 'admin@acme.com');
+    // 直接插一行不带 scopes：靠列默认补齐，等同迁移加列时已有 Key 拿到的取值
+    await getDb().insert(apiKeys).values({
+      tenantId: acme, name: '老 Key', prefix: 'legacyab', tokenHash: sha256('legacy-key-token'), createdByEmail: 'admin@acme.com',
+    });
+    const [legacy] = await getDb().select().from(apiKeys);
+    expect(legacy.scopes).toEqual(['catalog', 'consumers', 'exports']);
+
+    // 三类接口都过范围判定，行为与迁移前一致：目录 200、点查 503（还没有服务库）、导出发起走到请求体校验的 400
+    expect((await call('/api/v1/catalog', 'legacy-key-token')).status).toBe(200);
+    expect((await call('/api/v1/consumers/c1', 'legacy-key-token')).status).toBe(503);
+    const exportCall = await app.client().request('/api/v1/exports', { method: 'POST', headers: { Authorization: 'Bearer legacy-key-token' } });
+    expect(exportCall.status).toBe(400);
+    expect(await exportCall.json()).toEqual({ error: '请求体必须是 JSON' });
   });
 });
 

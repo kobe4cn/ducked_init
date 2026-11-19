@@ -155,7 +155,7 @@ describe('/mcp', () => {
     expect(await (await analyst.get('/settings')).text()).toContain('已过期');
 
     const admin = await loginAs(app, 'admin@acme.com');
-    const keyHtml = await (await admin.post('/api-keys', { intent: 'create', name: '营销自动化' })).text();
+    const keyHtml = await (await admin.post('/api-keys', { intent: 'create', name: '营销自动化', scope: ['catalog', 'consumers', 'exports'] })).text();
     const apiKey = keyHtml.match(/data-api-key="[^"]*"[^>]*>([^<]+)</)![1];
 
     const failures = [
