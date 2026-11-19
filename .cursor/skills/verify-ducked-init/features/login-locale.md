@@ -29,7 +29,7 @@ Preconditions:
 - **One minute.** On that same server, reload `/login` and submit `rate1m@verify.test` six times. The first five show `Check your email`. The sixth is HTTP 429 and the page shows `Too many requests. Please try again in 1 minute.` Run `browser.mjs screenshot --path <evidence>/login-en-rate-1m.png`.
 - **Five minutes.** Clean up and launch again with `CRM_ENABLE_EN_LOCALE=1`, `MAGIC_LINK_RATE_LIMIT=5`, and `MAGIC_LINK_RATE_WINDOW_MINUTES=5`. Set the same cookie and submit `rate5m@verify.test` six times. The sixth shows `Too many requests. Please try again in 5 minutes.`
 - **Cookie cleared.** With the flag still on, run `browser.mjs cookie --clear` and `browser.mjs goto /login`. `lang` prints `zh-CN` and the title is `登录 · CRM 数据分析平台`.
-- **Flag off, cookie on.** Clean up and launch with the flag unset and `MAGIC_LINK_RATE_LIMIT=5`. Set `crm_locale=en` and open `/login`. `lang` is `zh-CN`. Submit a new email six times. The sixth shows `申请过于频繁，请 5 分钟后再试。` when the window is 5, or `请 1 分钟后再试。` when the window is 1.
+- **Flag off, cookie on.** Clean up and launch with the flag unset and `MAGIC_LINK_RATE_LIMIT=5`. Set `crm_locale=en` and open `/login`. `lang` is `zh-CN`. Submit a new email six times. The sixth shows `申请过于频繁，请 5 分钟后再试。` when the window is 5, or `申请过于频繁，请 1 分钟后再试。` when the window is 1. `wait-text` is exact, so the whole sentence is the target.
 
 ## Gotchas
 
