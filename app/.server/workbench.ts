@@ -284,14 +284,11 @@ export async function dropSandboxTable(actor: CurrentMember, name: string) {
 
 /** ownTable 的 404 版本，只在删除时用：没有这张表（或已删、已到期）时抛 404，与不存在报同一句话 */
 async function ownTableOr404(tx: Tx, actor: CurrentMember, name: string) {
-  try {
-    const table = await ownTable(tx, actor, name);
-    if (table.expiresAt <= new Date()) throw new WorkbenchError(`没有沙箱表 ${name}`, 404);
-    return table;
-  } catch (e) {
-    // ownTable 没找到时抛的 400 在这里改成 404（上面已到期抛的本来就是 404，原样透传；其余错误照常抛）
-    throw e instanceof WorkbenchError && e.status === 400 ? new WorkbenchError(`没有沙箱表 ${name}`, 404) : e;
-  }
+  const table = await ownTable(tx, actor, name).catch((e: unknown) => {
+    throw e instanceof WorkbenchError ? new WorkbenchError(`没有沙箱表 ${name}`, 404) : e;
+  });
+  if (table.expiresAt <= new Date()) throw new WorkbenchError(`没有沙箱表 ${name}`, 404);
+  return table;
 }
 
 /** 成员自己还没过期的沙箱表 name 的登记（锁住这一行，与过期标记互斥）；没有时抛出 WorkbenchError */
