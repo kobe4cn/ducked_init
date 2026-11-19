@@ -5,6 +5,8 @@ import { CircleAlert, KeyRound } from 'lucide-react';
 import type { Route } from './+types/api-keys';
 import { requirePermission } from '~/.server/access';
 import { ApiKeyError, createApiKey, listApiKeys, revokeApiKey } from '~/.server/api-keys';
+import { formatServer } from '~/.server/i18n';
+import { getLocale } from '~/.server/locale';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
@@ -17,7 +19,8 @@ import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 import { API_ENDPOINTS, type ApiEndpoint } from '~/lib/api-docs';
-import { API_SCOPES, API_SCOPE_LABELS, type ApiScope } from '~/lib/api-scopes';
+import { API_SCOPES, type ApiScope } from '~/lib/api-scopes';
+import { useT, type T } from '~/lib/i18n';
 
 export function meta({}: Route.MetaArgs) {
   return [{ title: 'API Key · CRM 数据分析平台' }];
@@ -70,7 +73,10 @@ export async function action({ request }: Route.ActionArgs) {
         return data({ error: '未知操作' }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof ApiKeyError) return data({ error: e.message }, { status: e.status });
+    if (e instanceof ApiKeyError) {
+      const error = typeof e.detail === 'string' ? e.detail : formatServer(await getLocale(request), e.detail);
+      return data({ error }, { status: e.status });
+    }
     throw e;
   }
   throw redirect('/api-keys');
@@ -81,8 +87,12 @@ const formatTime = (iso: string) => new Date(iso).toLocaleString('zh-CN', { hour
 /** 参数位置与是否必填的页面文案 */
 const PARAM_IN_TEXT = { path: '路径', query: '查询', body: '请求体' } as const;
 
+/** 接口范围的名称：中文与 lib/api-scopes 的 API_SCOPE_LABELS 一致，这里写成字面量 t('…') 才能与词典对账 */
+const scopeLabel = (t: T, scope: ApiScope) => ({ catalog: t('目录'), consumers: t('点查'), exports: t('导出') })[scope];
+
 /** 「Key」标签页：创建表单与 Key 列表 */
 function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefix: string; scopes: ApiScope[]; createdByEmail: string; createdAt: string; lastUsedAt: string | null; revoked: boolean }[]; submitting: boolean }) {
+  const t = useT();
   return (
     <>
       <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
@@ -95,19 +105,19 @@ function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefi
               <Input id="api-key-name" name="name" required maxLength={100} placeholder="如：营销自动化系统" />
             </Field>
             <Field>
-              <FieldLabel>可用接口</FieldLabel>
+              <FieldLabel>{t('可用接口')}</FieldLabel>
               <div className="flex items-center gap-4 pb-2">
                 {API_SCOPES.map(scope => (
                   <label key={scope} className="flex items-center gap-1.5 text-sm text-slate-700">
                     <input type="checkbox" name="scope" value={scope} defaultChecked className="size-4" />
-                    {API_SCOPE_LABELS[scope]}
+                    {scopeLabel(t, scope)}
                   </label>
                 ))}
               </div>
             </Field>
             <Button type="submit" disabled={submitting}>创建</Button>
           </FieldGroup>
-          <p className="mt-1 text-xs text-slate-400">不勾的那类接口，这把 Key 调用时返回 403。</p>
+          <p className="mt-1 text-xs text-slate-400">{t('不勾的那类接口，这把 Key 调用时返回 403。')}</p>
         </Form>
       </div>
 
@@ -120,7 +130,7 @@ function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefi
               <TableRow>
                 <TableHead>名称</TableHead>
                 <TableHead>前缀</TableHead>
-                <TableHead>接口</TableHead>
+                <TableHead>{t('接口')}</TableHead>
                 <TableHead>创建人</TableHead>
                 <TableHead>创建时间</TableHead>
                 <TableHead>最近使用</TableHead>
@@ -132,7 +142,7 @@ function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefi
                 <TableRow key={k.id} data-api-key-id={k.id}>
                   <TableCell>{k.name}</TableCell>
                   <TableCell className="font-mono">{`${k.prefix}…`}</TableCell>
-                  <TableCell className="text-slate-500">{k.scopes.map(s => API_SCOPE_LABELS[s]).join('、')}</TableCell>
+                  <TableCell className="text-slate-500">{k.scopes.map(s => scopeLabel(t, s)).join(t('、'))}</TableCell>
                   <TableCell>{k.createdByEmail}</TableCell>
                   <TableCell className="text-slate-500">{formatTime(k.createdAt)}</TableCell>
                   <TableCell className="text-slate-500">{k.lastUsedAt ? formatTime(k.lastUsedAt) : '从未使用'}</TableCell>

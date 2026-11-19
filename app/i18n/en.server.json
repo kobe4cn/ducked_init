@@ -1,3 +1,8 @@
 {
-  "申请过于频繁，请 {minutes} 分钟后再试。": "Too many requests. Please try again in {minutes, plural, one {# minute.} other {# minutes.}}"
+  "申请过于频繁，请 {minutes} 分钟后再试。": "Too many requests. Please try again in {minutes, plural, one {# minute.} other {# minutes.}}",
+  "这把 Key 没有{scope}接口的权限": "This key does not have access to the {scope} API",
+  "请至少勾选一类接口": "Select at least one API type",
+  "目录": "Catalog",
+  "点查": "Lookup",
+  "导出": "Export"
 }

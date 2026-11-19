@@ -4,9 +4,11 @@
 // 认证通过后按接口范围（ADR-0061）判路径：Key 没开的类 403。先认证后判范围，401 的情形不变
 import { and, eq, isNull, lt, or, sql } from 'drizzle-orm';
 import { API_SCOPE_LABELS, type ApiScope } from '../lib/api-scopes';
+import { msg } from '../lib/i18n';
 import { sha256 } from './auth';
 import { getDb } from './db/client';
 import { apiKeys, tenants } from './db/schema';
+import { formatServer } from './i18n';
 
 /** 调用方：所属租户与 Key（prefix 是明文的前 8 位，可以写进审计） */
 export interface ApiCaller { tenantId: string; keyId: string; prefix: string; scopes: ApiScope[] }
@@ -38,8 +40,12 @@ const LAST_USED_GRANULARITY = sql`interval '1 minute'`;
 const unauthorized = () =>
   Response.json({ error: '未授权：请在 Authorization 头里带上有效的 API Key（Bearer）' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } });
 
+/** 403 文案：/api/v1 不看界面语言，固定中文（ADR-0060 的 msg() 句式，词典里有英文以备将来按语言出） */
 const forbidden = (scope: ApiScope) =>
-  Response.json({ error: `这把 Key 没有${API_SCOPE_LABELS[scope]}接口的权限` }, { status: 403 });
+  Response.json(
+    { error: formatServer('zh-CN', msg('这把 Key 没有{scope}接口的权限', { scope: formatServer('zh-CN', API_SCOPE_LABELS[scope]) })) },
+    { status: 403 },
+  );
 
 export function bearerToken(request: Request) {
   const m = /^Bearer\s+(\S+)\s*$/i.exec(request.headers.get('Authorization') ?? '');
