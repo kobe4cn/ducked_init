@@ -191,11 +191,11 @@ describe('业务知识面板', () => {
     expect(panel).toContain('value="alias.retire"');
     expect(await knowledgeOf(acme)).toEqual({ aliases: ['营收'] });
 
-    // 确认换出头新行后已不再待复核：再确认 400，面板 role="alert" 显示中文消息
+    // 确认后换成新行，已不再待复核：再确认 400，面板 role="alert" 显示中文消息
     const [renewed] = (await getDb().select().from(knowledgeAliases).where(eq(knowledgeAliases.tenantId, acme))).filter(r => !r.retiredAt);
     const bad = await post({ intent: 'alias.confirm', aliasId: renewed!.id });
     expect(bad.status).toBe(400);
-    expect(decode(await bad.text())).toContain('这个别名不需要复核');
+    expect(decode(await bad.text())).toMatch(/role="alert"[^>]*>这个别名不需要复核</);
   });
 
   it('待确认的提案显示种类、内容、证据，接受前不进知识区与目录；直接接受别名、改值后接受口径声明与业务说明，提案消失、知识区与目录是改后的值', async () => {
