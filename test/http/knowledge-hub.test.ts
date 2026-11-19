@@ -198,7 +198,15 @@ describe('业务知识集中页', () => {
     expect(itemOf(groupOf(html, 'none'), 'entity:order')).toContain('1 条待确认');
     expect(groupOf(html, '营收')).toContain('name="intent" value="suggest"');
 
-    // 同样的输入与生成器版本已经生成过：不调模型，提示没有新提案
+    // 条目带上了待处理的提案（#953），是另一个输入：再点会真的调模型，同一批由兜底与指纹全数跳过、不新建
+    res = await an.post('/knowledge', { intent: 'suggest', subjectId });
+    expect(res.status).toBe(302);
+    expect(decodeURIComponent(res.headers.get('location')!)).toBe('/knowledge?suggested=营收&created=0&skipped=4');
+    html = await pageOf(an, res.headers.get('location')!);
+    expect(html).toContain('主题「营收」新建 0 条提案，跳过 4 条');
+    expect(statOf(html, '待确认提案')).toBe('4');
+
+    // 没有新提案也没改知识：同样的输入与生成器版本已经生成过，不调模型，提示没有新内容
     res = await an.post('/knowledge', { intent: 'suggest', subjectId });
     expect(res.status).toBe(302);
     expect(decodeURIComponent(res.headers.get('location')!)).toBe('/knowledge?suggested=营收&fresh=0');

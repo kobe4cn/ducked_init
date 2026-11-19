@@ -1,8 +1,10 @@
 // test/pipeline/knowledge-suggest-run.test.ts —— 按主题生成知识提案的服务（ADR-0046 入口③，#512）的接缝：suggestForSubject →
 // 注入的假 fetch（setLlmFetch）→ chatJson（llm_calls 记 knowledge_proposal）→ outputToProposals → dropKnown（和已生效知识相同的
-// 丢掉计 skipped，#948）→ 事务里 proposeMany（stale 按生成前的依据快照）+ 写 knowledge_generations + 审计 knowledge_proposal.generated。
-// 同样的输入与生成器版本再点不调模型（fresh: false）；
-// 拒绝过的提案不再出现（计 rejected）；模型失败 422 并记 generate_failed 审计（不含提示词与输出原文）；restricted 投影以外的内容不进提示词
+// 丢掉计 skipped，#948）→ dropPending（与待处理 / 已拒绝提案重复的跳过计 existing，#953）→ 事务里 proposeMany（stale 按生成前的依据快照）
+// + 写 knowledge_generations + 审计 knowledge_proposal.generated。
+// 同样的输入与生成器版本再点不调模型（fresh: false）；条目带上了待处理与已拒绝的提案时是另一个输入：再点真的调模型，
+// 同一批不再写入（#953）、提示词带 pending / rejected 与拒绝理由；拒绝过的提案不再出现（计 rejected）；
+// 模型失败 422 并记 generate_failed 审计（不含提示词与输出原文）；restricted 投影以外的内容不进提示词
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tenantCatalog } from '../../app/.server/catalog/load';
@@ -15,7 +17,7 @@ import { saveClaim } from '../../app/.server/knowledge/claims';
 import { rejectProposal } from '../../app/.server/knowledge/proposals';
 import { SuggestError, suggestForSubject } from '../../app/.server/knowledge/suggest-run';
 import { subjectInput, SUGGEST_GENERATOR_VERSION } from '../../app/.server/knowledge/suggest';
-import { addMembership, createSubject, renameSubject } from '../../app/.server/knowledge/subjects';
+import { addMembership, createSubject } from '../../app/.server/knowledge/subjects';
 import { setLlmFetch } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
@@ -128,31 +130,67 @@ describe('按主题生成知识提案', () => {
     expect(prompt).not.toContain(input.inputHash);
   });
 
-  it('同样的输入与生成器版本再点：不发请求、不写入，返回 fresh: false；拒绝过的提案换名重新生成时计 rejected 不新建', async () => {
+  it('同样的输入与生成器版本再点：不发请求、不写入，返回 fresh: false（只有邻接条目的主题归属时不进条目的提案输入）', async () => {
     const { acme, analyst, subjectId } = await setup();
     platformDefault();
-    const { f } = fakeLlm(setLlmFetch, () => json(modelOutput(), USAGE));
-    const first = await suggestForSubject(analyst, subjectId);
-    expect(first).toMatchObject({ fresh: true, created: 4 });
+    const { f } = fakeLlm(setLlmFetch, () => json({ proposals: [
+      { kind: 'subject', targetId: 'entity:order', evidence: [{ ref: 'metric:paid_revenue' }], reason: '订单在主题里' },
+    ] }, USAGE));
 
+    const first = await suggestForSubject(analyst, subjectId);
+    expect(first).toMatchObject({ fresh: true, created: 1 });
     const second = await suggestForSubject(analyst, subjectId);
     expect(second).toEqual({ fresh: false });
     expect(f).toHaveBeenCalledTimes(1);
-    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(4);
+    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(1);
     expect(await generations(acme)).toHaveLength(1);
     expect(await auditsOf(acme, 'knowledge_proposal.generated')).toHaveLength(1);
+  });
 
-    // 拒绝别名提案后改名（inputHash 含主题名，改名会重新生成）：模型再返回同一条时计 rejected、不新建；仍待处理的三条指纹命中计 existing
+  it('待处理与已拒绝的提案进了输入：再点真的调模型，同一批不再写入——待处理 claim / note 与被拒过的别名由兜底跳过、subject 走指纹，全计 existing', async () => {
+    const { acme, analyst, subjectId } = await setup();
+    platformDefault();
+    const { f, received } = fakeLlm(setLlmFetch, () => json(modelOutput(), USAGE));
+    const first = await suggestForSubject(analyst, subjectId);
+    expect(first).toMatchObject({ fresh: true, created: 4 });
+
+    // 拒绝别名提案（拒绝理由进输入）：条目带上了待处理与已拒绝，inputHash 已变，再点会真的调模型
     const rejected = (await getDb().select().from(knowledgeProposals)
       .where(and(eq(knowledgeProposals.tenantId, acme), eq(knowledgeProposals.kind, 'alias'))))[0]!;
     await rejectProposal(analyst, rejected.id, '不是这个叫法');
-    await renameSubject(analyst, subjectId, '营收口径');
+
     const again = await suggestForSubject(analyst, subjectId);
-    expect(again).toEqual({ fresh: true, created: 0, existing: 3, rejected: 1, invalid: 0, stale: 0, skipped: 0 });
+    expect(again).toEqual({ fresh: true, created: 0, existing: 4, rejected: 0, invalid: 0, stale: 0, skipped: 0 });
     expect(f).toHaveBeenCalledTimes(2);
-    expect(await generations(acme)).toHaveLength(2); // 改名后的输入是另一行
+    // 一条都没多：三条仍待处理、被拒的还是被拒
     expect((await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).map(r => r.status).sort())
       .toEqual(['proposed', 'proposed', 'proposed', 'rejected']);
+    expect(await generations(acme)).toHaveLength(2); // 带提案的输入是另一代
+    // 第二次的提示词带上了待处理与已拒绝（含拒绝理由），模型看得见才不会再提同类
+    const user = JSON.parse(received[1]!.body.messages[1]!.content);
+    const entry = user.entries.find((e: { id: string }) => e.id === 'metric:paid_revenue');
+    expect(entry.pending).toEqual([
+      { kind: 'claim', content: { type: 'currency', value: 'unknown' } },
+      { kind: 'note', content: { note: '只算实付金额' } },
+    ]);
+    expect(entry.rejected).toEqual([{ kind: 'alias', content: { alias: '流水暗号' }, reason: '不是这个叫法' }]);
+  });
+
+  it('已有待处理说明时，第二段措辞不同的说明不落库，计入 existing（#953 的落库前兜底）', async () => {
+    const { acme, analyst, subjectId } = await setup();
+    platformDefault();
+    fakeLlm(setLlmFetch, n => json(n === 1 ? modelOutput() : { proposals: [
+      { kind: 'note', targetId: 'metric:paid_revenue', note: '实付金额，已扣除整单退款', evidence: [{ ref: 'entity:order' }], reason: '换个说法再提一次' },
+    ] }, USAGE));
+
+    const first = await suggestForSubject(analyst, subjectId);
+    expect(first).toMatchObject({ fresh: true, created: 4 });
+    const second = await suggestForSubject(analyst, subjectId);
+    expect(second).toEqual({ fresh: true, created: 0, existing: 1, rejected: 0, invalid: 0, stale: 0, skipped: 0 });
+    const notes = await getDb().select().from(knowledgeProposals)
+      .where(and(eq(knowledgeProposals.tenantId, acme), eq(knowledgeProposals.kind, 'note')));
+    expect(notes).toHaveLength(1); // 第二段说明没有落库
+    expect(notes[0]!.content).toEqual({ note: '只算实付金额' });
   });
 
   it('模型引用输入以外的条目时整条丢弃、计 invalid', async () => {

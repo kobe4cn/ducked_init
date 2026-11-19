@@ -1,23 +1,26 @@
 // app/.server/knowledge/suggest-run.ts —— 按主题生成知识提案的服务（ADR-0046 入口③，#512）：suggestForSubject 把 #511 的纯函数
 // 接上模型与库。顺序定死：查权限 → 找主题 → 查模型服务（没配 409、不发请求）→ 取依据快照（必须在调模型前，生成期间依据变了的目标
-// 落成 stale 而不是脏提案）→ 取 restricted 投影的输入 → 查代次（同样的输入与生成器版本已经生成过就不再调模型，返回没有新内容）→
+// 落成 stale 而不是脏提案）→ 查条目上待处理与已拒绝的提案 → 取 restricted 投影的输入（带上它们，模型才看得见 #953；提案进了输入，
+// 处理一条后再点就是另一个输入、会真的调模型，重复由兜底挡住）→ 查代次（同样的输入与生成器版本已经生成过就不再调模型，返回没有新内容）→
 // 事务外调 chatJson（llm_calls 由它自己记，调用方回滚时调用记录也留下）→ dropKnown 丢掉和调模型前已生效知识相同的提案（#948）→
+// dropPending 丢掉和生成前待处理 / 已拒绝的提案重复的（#953：待处理 note / 同类型 claim / 同别名，跳过的计进 existing）→
 // 事务里 proposeMany、写 knowledge_generations 与审计。
 // 模型失败记 generate_failed 审计（只记阶段与错误摘要，不放提示词与输出原文）后 422；失败不记代次行，再点还会调模型。
 // 本票只提供服务，路由与页面在之后的票接
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { assertCan } from '../access';
 import { recordAudit } from '../audit';
 import type { CurrentMember } from '../auth';
 import { tenantCatalog } from '../catalog/load';
 import { getDb } from '../db/client';
-import { knowledgeGenerations } from '../db/schema';
+import { knowledgeGenerations, knowledgeProposals } from '../db/schema';
 import { chatJson, LlmError, resolveProvider } from '../llm';
 import { currentBases, KnowledgeError } from './basis';
 import { dropKnown } from './known';
 import { proposeMany } from './proposals';
 import {
-  outputToProposals, subjectInput, suggestMessages, SUGGEST_GENERATOR_VERSION, SUGGEST_SCHEMA, type SuggestOutput,
+  dropPending, outputToProposals, subjectInput, suggestMessages, SUGGEST_GENERATOR_VERSION, SUGGEST_SCHEMA,
+  type ProposalBrief, type SuggestOutput,
 } from './suggest';
 import { listSubjects } from './subjects';
 
@@ -26,15 +29,16 @@ export class SuggestError extends Error {
   constructor(message: string, readonly status: 409 | 422) { super(message); }
 }
 
-/** 一次生成的结果：fresh: false 是同样的输入已经生成过、没有新内容；其余是各类计数（新建 / 已有 / 已拒绝 / 不合法 / 依据已变 / 与已生效知识相同） */
+/** 一次生成的结果：fresh: false 是同样的输入已经生成过、没有新内容；其余是各类计数（新建 / 已有（指纹命中与落库前兜底跳过） /
+ *  已拒绝 / 不合法 / 依据已变 / 与已生效知识相同） */
 export type SuggestResult =
   | { fresh: false }
   | { fresh: true; created: number; existing: number; rejected: number; invalid: number; stale: number; skipped: number };
 
 /**
  * 按主题生成一批知识提案（要 definitions:draft）。同样的 (租户, 主题, 输入, 生成器版本) 已经生成过时不调模型，
- * 返回 { fresh: false }；否则调模型、与调模型前已生效知识相同的输出丢掉计 skipped（#948）、剩下的经 proposeMany 写进提案
- * （按生成前的依据快照跳过已变的目标），并记一代
+ * 返回 { fresh: false }；否则调模型、与调模型前已生效知识相同的输出丢掉计 skipped（#948）、与生成前待处理 / 已拒绝的提案
+ * 重复的跳过计进 existing（#953），剩下的经 proposeMany 写进提案（按生成前的依据快照跳过已变的目标），并记一代
  */
 export async function suggestForSubject(actor: CurrentMember, subjectId: string): Promise<SuggestResult> {
   assertCan(actor, 'definitions:draft');
@@ -46,7 +50,31 @@ export async function suggestForSubject(actor: CurrentMember, subjectId: string)
 
   const bases = await currentBases(getDb(), tenantId);
   const catalog = await tenantCatalog(tenantId);
-  const input = subjectInput(catalog, { id: subject.id, name: subject.name });
+  // 条目 id 再算一次纯函数拿（无妨）：按它查出待处理与已拒绝的提案，既进输入（模型看得到）也做落库前兜底；
+  // 不用 listProposals，它一次只能按单个 status / targetId 过滤
+  const entryIds = subjectInput(catalog, { id: subject.id, name: subject.name }).entries.map(e => e.id);
+  const byTarget = new Map<string, ProposalBrief[]>();
+  if (entryIds.length) {
+    const rows = await getDb().select({
+      targetId: knowledgeProposals.targetId, kind: knowledgeProposals.kind, content: knowledgeProposals.content,
+      status: knowledgeProposals.status, rejectedReason: knowledgeProposals.rejectedReason, reviewedAt: knowledgeProposals.reviewedAt,
+    }).from(knowledgeProposals).where(and(
+      eq(knowledgeProposals.tenantId, tenantId),
+      inArray(knowledgeProposals.targetId, entryIds),
+      isNull(knowledgeProposals.mappingId),
+      inArray(knowledgeProposals.status, ['proposed', 'rejected']),
+    ));
+    for (const row of rows) {
+      if (row.status !== 'proposed' && row.status !== 'rejected') continue; // 查询已限，这里只为收窄类型
+      const list = byTarget.get(row.targetId) ?? [];
+      list.push({
+        targetId: row.targetId, kind: row.kind, content: row.content,
+        status: row.status, rejectedReason: row.rejectedReason, reviewedAt: row.reviewedAt,
+      });
+      byTarget.set(row.targetId, list);
+    }
+  }
+  const input = subjectInput(catalog, { id: subject.id, name: subject.name }, byTarget);
   const [generated] = await getDb().select({ id: knowledgeGenerations.id }).from(knowledgeGenerations)
     .where(and(
       eq(knowledgeGenerations.tenantId, tenantId),
@@ -72,7 +100,9 @@ export async function suggestForSubject(actor: CurrentMember, subjectId: string)
   // 不合法的条目（引用输入外、目标不在集合、类型取值不配对、空白超上限）在这里就被丢掉，proposeMany 的 invalid 只是库里再拦下的
   const inputs = outputToProposals(output, input);
   // invalid 按丢已知之前的条数算（被丢掉的不再同时计进 invalid），已知部分不再交给 proposeMany
-  const { inputs: toPropose, skipped } = dropKnown(inputs, catalog.entries);
+  const { inputs: notKnown, skipped } = dropKnown(inputs, catalog.entries);
+  // 落库前兜底：与生成前待处理 / 已拒绝的提案重复的不再写，跳过的条数计进 existing（集中页「跳过」的一部分）
+  const { kept: toPropose, skipped: pendingSkipped } = dropPending(notKnown, byTarget);
   const result = await getDb().transaction(async tx => {
     const r = await proposeMany(tx, tenantId, toPropose, { expectedBases: bases });
     // 并发重复点击时唯一索引兜底：插不上就当这一代已经记过
@@ -83,9 +113,9 @@ export async function suggestForSubject(actor: CurrentMember, subjectId: string)
     const invalid = output.proposals.length - inputs.length + r.invalid.length;
     await recordAudit(tx, {
       tenantId, actor, action: 'knowledge_proposal.generated', targetType: 'analysis_subject', targetId: subject.id,
-      detail: { subjectId: subject.id, created: r.created.length, existing: r.existing, rejected: r.rejected, invalid, stale: r.stale, skipped },
+      detail: { subjectId: subject.id, created: r.created.length, existing: r.existing + pendingSkipped, rejected: r.rejected, invalid, stale: r.stale, skipped },
     });
-    return { ...r, invalid };
+    return { ...r, existing: r.existing + pendingSkipped, invalid };
   });
   return {
     fresh: true, created: result.created.length, existing: result.existing,
