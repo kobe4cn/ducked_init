@@ -1,5 +1,6 @@
 // app/routes/knowledge.tsx —— 业务知识集中页（ADR-0046）：所有成员可看（definitions:read，不新增权限），按分析主题分组列出有待确认提案或缺失项的目录条目
-// （规则见 knowledge/hub.ts），没有主题的条目在最后的「未归入主题」组。点条目（?item=<targetId>）在本页展开与详情页相同的业务知识面板（字段不带说明区），
+// （规则见 knowledge/hub.ts），租户的每个主题都有一组：条目全部补齐的组显示「没有待处理的条目」并保留「生成建议」入口（#951），没有主题的条目在最后的
+// 「未归入主题」组，空态（没有待确认的提案或缺失项）只在没有任何主题、也没有待处理条目时出现。点条目（?item=<targetId>）在本页展开与详情页相同的业务知识面板（字段不带说明区），
 // 能不能编辑沿用面板的 canEdit（definitions:draft）；提交成功后回到原 URL，列表与计数随之更新。
 // 主题组的「生成建议」（ADR-0046 入口③，#513）同步按主题生成一批提案：成功 302 回集中页带计数，查看者由 suggestForSubject 内部抛 403。
 // 页头的「应用标准模板包」（ADR-0046 入口②，#521）把标准包按租户用到的实体展开成提案：成功同样 302 回集中页带计数，查看者由 applyStandardPackFor 抛 403。
@@ -171,9 +172,13 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
               </Form>
             )}
           </div>
-          <ul className="space-y-1">
-            {g.items.map(i => <Item key={i.targetId} item={i} active={i.targetId === selected?.targetId} />)}
-          </ul>
+          {g.items.length === 0 ? (
+            <p data-hub-empty className="text-sm text-slate-500">没有待处理的条目</p>
+          ) : (
+            <ul className="space-y-1">
+              {g.items.map(i => <Item key={i.targetId} item={i} active={i.targetId === selected?.targetId} />)}
+            </ul>
+          )}
         </section>
       ))}
     </div>

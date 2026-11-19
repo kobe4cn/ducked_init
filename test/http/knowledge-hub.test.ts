@@ -110,6 +110,24 @@ describe('业务知识集中页', () => {
     expect(html).toContain(`data-hub-item="${TARGET}"`);
   }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
 
+  it('条目补齐的主题组还在：显示「没有待处理的条目」、保留「生成建议」表单，排在「未归入主题」前；「有条目的主题」不数它', async () => {
+    const { analyst } = await setup();
+    const subjectId = await createSubject(analyst, '营收');
+    await addMembership(analyst, subjectId, TARGET);
+    // 成员声明单位后主题里的条目全部补齐，组不能消失（#951）；order.amount 仍在「未归入主题」
+    await saveClaim(analyst, { targetId: TARGET, type: 'unit', value: 'currency_major' });
+    const an = await loginAs(app, 'an@acme.com');
+
+    const html = await pageOf(an);
+    const revenue = groupOf(html, '营收');
+    expect(revenue).toContain('没有待处理的条目');
+    expect(revenue).toContain('name="intent" value="suggest"');
+    expect(revenue).not.toContain('data-hub-item');
+    expect(html.indexOf('data-hub-group="营收"')).toBeLessThan(html.indexOf('data-hub-group="none"'));
+    expect(statOf(html, '有条目的主题')).toBe('0');
+    expect(statOf(html, '缺失项')).toBe('2');
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
+
   it('点开条目在本页展开同一个面板；接受提案、声明单位后 302 回原 URL，列表随之更新；重复别名 400 错误在面板里；查看者只读、提交 403', async () => {
     const { acme, analyst } = await setup();
     await addAlias(analyst, { targetId: TARGET, alias: '营收' });
