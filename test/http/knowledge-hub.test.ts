@@ -206,6 +206,25 @@ describe('业务知识集中页', () => {
     expect((await viewer.post('/knowledge', { intent: 'suggest', subjectId })).status).toBe(403);
   }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s、中位 30.1 s，docs/test-plans/test-duration-report.md），还有 2 次登录、1 次模型替身与约 10 次请求，4 个 worker 并行时超过默认的 90 s
 
+  it('按主题生成：和已生效知识同值的提案（成员声明的币种、已有别名）落库前丢掉，302 带 created=2&skipped=2', async () => {
+    const { analyst } = await setup();
+    const subjectId = await createSubject(analyst, '营收');
+    await addMembership(analyst, subjectId, TARGET);
+    // 模型那条无证据的币种提案会被改成 unknown（outputToProposals），成员声明 unknown 就是同值；别名「流水暗号」和模型给的同值
+    await saveClaim(analyst, { targetId: TARGET, type: 'currency', value: 'unknown' });
+    await addAlias(analyst, { targetId: TARGET, alias: '流水暗号' });
+    const an = await loginAs(app, 'an@acme.com');
+
+    platformDefault();
+    fakeLlm(f => app.setLlmFetch(f), () => json(modelOutput()));
+    const res = await an.post('/knowledge', { intent: 'suggest', subjectId });
+    expect(res.status).toBe(302);
+    expect(decodeURIComponent(res.headers.get('location')!)).toBe('/knowledge?suggested=营收&created=2&skipped=2');
+    const html = await pageOf(an, res.headers.get('location')!);
+    expect(html).toContain('主题「营收」新建 2 条提案，跳过 2 条');
+    expect(statOf(html, '待确认提案')).toBe('2');
+  }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
+
   it('页头有「应用标准模板包」按钮：提交 302 回集中页带计数、提案都落在「未归入主题」组；再点全部计入跳过；审计记 pack_applied；查看者没有按钮、提交 403', async () => {
     const { acme } = await setup();
     const an = await loginAs(app, 'an@acme.com');
