@@ -197,7 +197,7 @@
     "app/routes/home.tsx": 13,
     "app/routes/knowledge.import.tsx": 16,
     "app/routes/knowledge.sources.$id.tsx": 4,
-    "app/routes/knowledge.tsx": 21,
+    "app/routes/knowledge.tsx": 22,
     "app/routes/lineage.tsx": 63,
     "app/routes/llm-usage.tsx": 42,
     "app/routes/mapping.tsx": 108,
