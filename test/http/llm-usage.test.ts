@@ -3,9 +3,10 @@
 // 映射草稿一行另有「校验通过率」（#802）：从 mapping_generations（origin=model，items 带 dropped 键的是部分采用）加
 // mapping.model_draft_failed 审计（stage=mapping、无 kind）算，部分采用单独计数，其他用途与总计是「—」；
 // 指标卡另有「调用来源」卡（#844）：窗口内按租户 / 平台端点分开计数，旧行计入「未记录」，别的租户与窗口外不计入；
-// 数据工程师 / 分析师 / 查看者看不到入口、打开 403
+// 数据工程师 / 分析师 / 查看者看不到入口、打开 403；
+// 数字与日期跟随界面语言（#928）：英文界面（开关 + crm_locale=en）明细时间是 M/D/YYYY, h:mm:ss AM、token 仍带千分位，中文界面保持 2026/… 格式
 import { eq } from 'drizzle-orm';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, mappingGenerations, modelPrices, sources } from '../../app/.server/db/schema';
 import { defaultSpaceOf, memberOf, newTenant } from '../pipeline/fixtures';
@@ -15,6 +16,7 @@ let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
+afterEach(() => { vi.unstubAllEnvs(); });
 
 const ago = (days: number) => new Date(Date.now() - days * 86400_000);
 /** 造一条调用记录（默认 connectivity，近 1 天） */
@@ -27,6 +29,8 @@ const usageRow = (html: string, purpose: string) => html.match(new RegExp(`<tr[^
 const usageCell = (rowHtml: string, col: string) => rowHtml.match(new RegExp(`data-col="${col}"[^>]*>([^<]*)<`))?.[1] ?? '';
 /** 明细里某次调用的一行 HTML */
 const callRow = (html: string, id: string) => html.match(new RegExp(`<tr[^>]*data-call-id="${id}"[\\s\\S]*?</tr>`))?.[0] ?? '';
+/** 明细行第一个单元格（时间列）的文本 */
+const timeCell = (rowHtml: string) => rowHtml.match(/<td[^>]*>([^<]*)<\/td>/)?.[1] ?? '';
 /** 直接给模型配单价（numeric 列传字符串），不经过运营后台 */
 const price = (model: string, inputPerMTok: string, outputPerMTok: string, currency: 'CNY' | 'USD') =>
   getDb().insert(modelPrices).values({ model, inputPerMTok, outputPerMTok, currency });
@@ -297,5 +301,30 @@ describe('模型调用统计', () => {
     expect(usageCell(callRow(html, tenant), 'source')).toBe('租户');
     expect(usageCell(callRow(html, platform), 'source')).toBe('平台');
     expect(usageCell(callRow(html, legacy), 'source')).toBe('—');
+  });
+
+  it('英文界面（开关 + crm_locale=en）下明细时间是英文格式（AM/PM）、token 仍带千分位；不开开关时同一行还是中文格式', async () => {
+    const acme = await newTenant('acme');
+    const at = new Date(Date.now() - 60_000); // 已知时间：落在 7 天窗口内
+    const [id] = (await getDb().insert(llmCalls).values({
+      tenantId: acme, purpose: 'connectivity', model: 'm-fast', durationMs: 100,
+      promptTokens: 1234567, completionTokens: 8901, createdAt: at,
+    }).returning({ id: llmCalls.id })).map(r => r.id);
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    // crm_locale 写进 cookie jar：显式传 Cookie 头时 Client 不带 jar，会丢登录会话
+    admin.store('crm_locale=en; Path=/');
+
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const en = callRow(await (await admin.get('/llm-usage')).text(), id);
+    expect(timeCell(en)).toMatch(/^\d{1,2}\/\d{1,2}\/\d{4}, \d{1,2}:\d{2}:\d{2} [AP]M$/);
+    expect(en).toContain('1,234,567');
+    expect(en).toContain('8,901');
+
+    // 关掉开关（cookie 还在）：同一行回到 2026/… 的中文格式，token 不变
+    vi.unstubAllEnvs();
+    const zh = callRow(await (await admin.get('/llm-usage')).text(), id);
+    expect(timeCell(zh)).toMatch(/^\d{4}\/\d{1,2}\/\d{1,2} \d{2}:\d{2}:\d{2}$/);
+    expect(zh).toContain('1,234,567');
   });
 });

@@ -39,7 +39,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <Links />
       </head>
       <body>
-        <I18nProvider t={makeT(locale, messages)}>{children}</I18nProvider>
+        <I18nProvider t={makeT(locale, messages)} locale={locale}>{children}</I18nProvider>
         <ScrollRestoration />
         <Scripts />
       </body>
