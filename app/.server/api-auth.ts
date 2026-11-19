@@ -11,11 +11,25 @@ import { apiKeys, tenants } from './db/schema';
 /** 调用方：所属租户与 Key（prefix 是明文的前 8 位，可以写进审计） */
 export interface ApiCaller { tenantId: string; keyId: string; prefix: string; scopes: ApiScope[] }
 
-/** 路径属于哪一类接口：三类外部接口按路径判定（ADR-0061）。导出下载凭令牌、不走 requireApiKey，不会到这里 */
+const underPath = (path: string, base: string) => path === base || path.startsWith(`${base}/`);
+
+/** 与 React Router 匹配路由前一样逐段解码（同 react-router 的 decodePath）：解码出的 / 保持编码，坏编码原样返回 */
+function decodeSegments(pathname: string) {
+  try {
+    return pathname.split('/').map(v => decodeURIComponent(v).replace(/\//g, '%2F')).join('/');
+  } catch {
+    return pathname;
+  }
+}
+
+/** 路径属于哪一类接口：三类外部接口按路径判定（ADR-0061）。导出下载凭令牌、不走 requireApiKey，不会到这里。
+ *  路由匹配会逐段解码、不区分大小写、接受结尾的 /，所以这里同样解码、转小写、去掉结尾的 / 再判，
+ *  否则 /api/v1/Catalog、/api/v1/catalog/、/api/v1/%63atalog 能绕过范围 */
 export function scopeOfPath(pathname: string): ApiScope | null {
-  if (pathname === '/api/v1/catalog') return 'catalog';
-  if (pathname.startsWith('/api/v1/consumers')) return 'consumers';
-  if (pathname.startsWith('/api/v1/exports')) return 'exports';
+  const path = decodeSegments(pathname).toLowerCase().replace(/\/+$/, '');
+  if (path === '/api/v1/catalog') return 'catalog';
+  if (underPath(path, '/api/v1/consumers')) return 'consumers';
+  if (underPath(path, '/api/v1/exports')) return 'exports';
   return null;
 }
 
