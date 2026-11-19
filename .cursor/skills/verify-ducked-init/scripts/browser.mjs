@@ -246,11 +246,19 @@ async function handle(page, state, req) {
     // Plaintext cookie. react-router createCookie would base64-encode the value,
     // and getLocale only treats the raw value "en" as English.
     const context = page.context();
-    if (req.clear) {
+    if (req.clear && !req.name) {
       await context.clearCookies();
       return { stdout: 'cleared' };
     }
-    if (!req.name || req.value === undefined) throw new Error('cookie requires --name and --value, or --clear');
+    // --clear --name deletes one cookie and leaves the session. cookie --clear
+    // with no name still drops every cookie, which logs a signed-in admin out.
+    if (req.clear && req.name) {
+      const kept = (await context.cookies()).filter(c => c.name !== req.name);
+      await context.clearCookies();
+      if (kept.length) await context.addCookies(kept);
+      return { stdout: `cleared ${req.name}` };
+    }
+    if (!req.name || req.value === undefined) throw new Error('cookie requires --name and --value, or --clear, or --clear --name');
     await context.addCookies([{ name: req.name, value: req.value, url: state.BASE_URL }]);
     return { stdout: `${req.name}=${req.value}` };
   }
@@ -308,7 +316,7 @@ async function handle(page, state, req) {
 
 function usage() {
   console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|html|title|lang|url|text|value|count|scroll-y|scroll-into|console|cookie|magic-link> [args]`);
-  console.error('cookie --name <name> --value <value> sets a plaintext cookie for BASE_URL; cookie --clear removes them');
+  console.error('cookie --name <name> --value <value> sets a plaintext cookie for BASE_URL; cookie --clear removes every cookie; cookie --clear --name <name> removes one');
   console.error('click accepts --role and --name, or --selector <css>. --confirm accept|dismiss handles one window.confirm');
   console.error('console accepts --clear, which drops the buffer and prints console-cleared=<N>');
 }

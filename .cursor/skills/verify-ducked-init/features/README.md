@@ -44,6 +44,7 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 
 - [Log in with a Magic Link](./login.md) covers requesting a link, confirming it, and landing on the tenant overview.
 - [Login page locale](./login-locale.md) covers Chinese copy with `lang=zh-CN` when `CRM_ENABLE_EN_LOCALE` is off, English copy with `lang=en` when that variable is `1` and the plaintext cookie `crm_locale=en` is set, the 1-minute and 5-minute rate-limit sentences, and the return to Chinese when the cookie or the flag is cleared. `launch.sh` writes the flag and the rate-limit numbers from the launch shell.
+- [模型调用的数字和日期](./llm-usage-locale.md) covers `/llm-usage` thousands separators and 24-hour times with no cookie, `M/D/YYYY, h:mm:ss AM/PM` after `crm_locale=en`, and the return to 24-hour times after `cookie --clear --name crm_locale`, which deletes only that cookie and leaves the login session. A cookie value other than `en` stays Chinese. The amount column is unchanged.
 - [Tenant overview](./overview.md) covers the signed-in home page: tenant, space, role, task counts, and the permission list.
 - [Invite a member](./members.md) covers inviting a data engineer, the members table, the audit row, the console mail, and signing in as that person.
 - [Task list](./tasks.md) covers the empty task list on a freshly seeded tenant. It does not expand `查看结果` and does not start the dispatcher.
