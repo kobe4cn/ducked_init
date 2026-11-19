@@ -289,7 +289,7 @@ const ACTIONS = {
   'knowledge_proposal.accepted': { label: '接受知识提案', describe: knowledgeTarget },
   'knowledge_proposal.rejected': { label: '拒绝知识提案', describe: knowledgeTarget },
   // 按主题生成提案（ADR-0046 入口③）：targetType 是主题，detail 只有 subjectId 与各类计数 / 错误摘要，
-  // 不记提示词、模型原文与提案内容。也不进 CATALOG_ACTIONS（提案接受前不进目录）
+  // 被丢条目再有 dropped（目标 ID 与原因枚举，最多 20 条，#956），不记提示词、模型原文与提案内容。也不进 CATALOG_ACTIONS（提案接受前不进目录）
   'knowledge_proposal.generated': {
     label: '按主题生成知识提案',
     describe: (d: Detail) => `${subjectTarget(d)}：新建 ${d.created} 条，已有 ${d.existing}、拒绝过 ${d.rejected}、不合法 ${d.invalid}、依据已变 ${d.stale}`,

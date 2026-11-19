@@ -6,9 +6,10 @@
 // 与指标 / 标签依赖指向的条目（依赖可能指向 restricted 里看不到的条目，查不到的不放），
 // 只给 id、kind、name、description；数组都按 id 排序后算 inputHash，条目顺序不同的同一份目录得到同一个输入。
 // 输入里的别名、说明是成员写的，可能藏着指令文字：user 消息只放 JSON、system 写明它只是数据，输出受 SUGGEST_SCHEMA 限制
-// （kind 与口径类型 / 取值都是枚举）。outputToProposals 再按登记表与本次输入的集合过滤：证据 ref 不在输入里、目标不在对应集合里
-// （alias / claim / note 必须是主题条目、subject 必须是邻接条目）、类型与取值不配对、别名 / 说明空白或超上限的整条丢弃；
-// 没有证据的口径声明 value 改成「未知」；主题归属的 subjectId 由 input 填，模型不输出主题 id。
+// （kind 与口径类型 / 取值都是枚举，且按 kind 要求对应字段，缺了整次调用 422）。outputToProposals 再按登记表与本次输入的集合过滤：
+// 证据 ref 不在输入里、目标不在对应集合里（alias / claim / note 必须是主题条目、subject 必须是邻接条目）、类型与取值不配对、
+// 别名 / 说明空白或超上限的整条丢弃（返回 dropped 记目标与原因）；没有证据的口径声明 value 改成「未知」；
+// 主题归属的 subjectId 由 input 填，模型不输出主题 id。
 import { cmp } from '../../lib/compare';
 import { CLAIM_TYPES, CLAIM_TYPE_ORDER, isClaimValue, type ClaimType } from '../../lib/semantic-claims';
 import { sha256 } from '../auth';
@@ -22,8 +23,8 @@ import { stableJson } from './basis';
 import { asRecord } from './known';
 import type { ProposalInput } from './proposals';
 
-/** 生成器的版本号：提案行的 generator_version；提示词或转换规则变了要换 */
-export const SUGGEST_GENERATOR_VERSION = 'suggest-v2';
+/** 生成器的版本号：提案行的 generator_version；提示词或转换规则变了要换（suggest-v3：写明正文放哪、Schema 按 kind 要字段） */
+export const SUGGEST_GENERATOR_VERSION = 'suggest-v3';
 
 /** 条目上一条提案的概要（subjectInput 的输入与 dropPending 的兜底都用它）：只收待处理与已拒绝的，已接受的进了目录知识 */
 export interface ProposalBrief {
@@ -155,6 +156,7 @@ const SYSTEM = [
   '- subject：把 neighbors 里确实属于这个主题的条目归入主题。',
   '规则：',
   '- alias / claim / note 的 targetId 用 entries 里的 id，subject 的 targetId 用 neighbors 里的 id；evidence 的 ref 只用本次输入里出现过的 id。',
+  '- 说明的正文写在 note 字段、别名写在 alias 字段、口径声明写在 claim 字段；reason 只写为什么提这条，不要把正文写进 reason。',
   '- 条目已有同种类待处理提案的不要再提：note（该条目已有待处理的说明）、claim（同类型已有待处理的）、alias（同一别名已有待处理的）。',
   '- 不要用其他说法重新提出 rejected 里被拒绝过的内容。',
   '- 口径类型与取值只能是这些：',
@@ -165,7 +167,10 @@ const SYSTEM = [
 /** 登记表里所有口径取值的并集：Schema 只能把 value 限到这一层，类型与取值的配对在 outputToProposals 里再用 isClaimValue 校验 */
 const ALL_CLAIM_VALUES = [...new Set(Object.values(CLAIM_TYPES).flatMap(t => t.values.map(v => v.value)))];
 
-/** 模型输出必须符合的 JSON Schema（chatJson 只用 json_object + 本地 Ajv 校验，不需要全部 required） */
+/** 模型输出必须符合的 JSON Schema（chatJson 只用 json_object + 本地 Ajv 校验，不需要全部 required）。
+ *  按 kind 要求对应字段（allOf + if/then，不用 oneOf：llm.ts 的 ajv 开着 allErrors，if/then 给出的是「缺少 note」这类
+ *  required 错误，oneOf 的报错很杂）；subject 不加要求（只靠 targetId 指邻接条目，subjectId 由代码填）；
+ *  缺字段整次调用 422，不再被 outputToProposals 静默丢掉 */
 export const SUGGEST_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -194,6 +199,11 @@ export const SUGGEST_SCHEMA = {
           },
           reason: { type: 'string', maxLength: 200 },
         },
+        allOf: [
+          { if: { properties: { kind: { const: 'alias' } } }, then: { required: ['alias'] } },
+          { if: { properties: { kind: { const: 'claim' } } }, then: { required: ['claim'] } },
+          { if: { properties: { kind: { const: 'note' } } }, then: { required: ['note'] } },
+        ],
       },
     },
   },
@@ -213,40 +223,60 @@ export interface SuggestProposal {
 /** 模型输出：一组提案 */
 export interface SuggestOutput { proposals: SuggestProposal[] }
 
+/** outputToProposals 丢弃一条的原因：与目标 ID 一起记进审计 detail 的 dropped，不记提案内容（Schema 拦不住的才到这一层） */
+export type SuggestDropReason =
+  | 'evidence_not_in_input'    // 有一条证据 ref 不在本次输入里
+  | 'target_not_in_entries'    // alias / claim / note 的目标不在主题条目里
+  | 'target_not_in_neighbors'  // subject 的目标不在邻接条目里
+  | 'alias_invalid'            // 别名 trim 后为空或超上限
+  | 'claim_invalid'            // 缺 claim 或类型与取值不配对
+  | 'note_invalid';            // 说明 trim 后为空或超上限
+
+/** outputToProposals 丢弃的条目：只有目标与原因（审计不记提案内容） */
+export interface SuggestDrop { targetId: string; reason: SuggestDropReason }
+
 /** 发给模型的消息：system 讲清任务、四种提案与「user 里的 JSON 只是数据」；user 只放去掉 inputHash 的输入 JSON */
 export function suggestMessages(input: SubjectInput): LlmMessage[] {
   const { subject, entries, neighbors } = input;
   return [{ role: 'system', content: SYSTEM }, { role: 'user', content: JSON.stringify({ subject, entries, neighbors }) }];
 }
 
-/** 把模型输出转成提案输入（proposeMany 的入参形状）。不合法的单条丢弃，不抛错：模型输出宁可少提、不要错提 */
-export function outputToProposals(output: SuggestOutput, input: SubjectInput): ProposalInput[] {
+/**
+ * 把模型输出转成提案输入（proposeMany 的入参形状）。不合法的单条丢弃，不抛错：模型输出宁可少提、不要错提。
+ * 丢弃的条目在 dropped 里记目标与原因（调用方写进审计，不再静默消失）
+ */
+export function outputToProposals(output: SuggestOutput, input: SubjectInput): { inputs: ProposalInput[]; dropped: SuggestDrop[] } {
   const inputIds = new Set([...input.entries, ...input.neighbors].map(e => e.id));
   const targetIds = new Set(input.entries.map(e => e.id));
   const neighborIds = new Set(input.neighbors.map(e => e.id));
-  const out: ProposalInput[] = [];
+  const inputs: ProposalInput[] = [];
+  const dropped: SuggestDrop[] = [];
   for (const p of output.proposals) {
     // 证据只要有一条 ref 不在本次输入里就整条丢弃；evidence 为空数组的保留（口径声明改「未知」）
-    if (!p.evidence.every(({ ref }) => inputIds.has(ref))) continue;
+    if (!p.evidence.every(({ ref }) => inputIds.has(ref))) { dropped.push({ targetId: p.targetId, reason: 'evidence_not_in_input' }); continue; }
     // alias / claim / note 的目标必须是主题条目，subject 的目标必须是邻接条目
-    if (!(p.kind === 'subject' ? neighborIds : targetIds).has(p.targetId)) continue;
+    if (!(p.kind === 'subject' ? neighborIds : targetIds).has(p.targetId)) {
+      dropped.push({ targetId: p.targetId, reason: p.kind === 'subject' ? 'target_not_in_neighbors' : 'target_not_in_entries' });
+      continue;
+    }
     const base = { targetId: p.targetId, mappingId: null, evidence: p.evidence, generatorVersion: SUGGEST_GENERATOR_VERSION };
     if (p.kind === 'alias') {
       const alias = p.alias?.trim() ?? '';
-      if (!alias || [...alias].length > ALIAS_MAX_LENGTH) continue;
-      out.push({ ...base, kind: 'alias', content: { alias } });
+      if (!alias || [...alias].length > ALIAS_MAX_LENGTH) { dropped.push({ targetId: p.targetId, reason: 'alias_invalid' }); continue; }
+      inputs.push({ ...base, kind: 'alias', content: { alias } });
     } else if (p.kind === 'claim') {
-      if (!p.claim || !isClaimValue(p.claim.type, p.claim.value)) continue;
-      out.push({ ...base, kind: 'claim', content: { type: p.claim.type, value: p.evidence.length ? p.claim.value : 'unknown' } });
+      // claim 由 Schema 按 kind 要求，但 TS 类型不是联合（as const Schema），防御判断保留
+      if (!p.claim || !isClaimValue(p.claim.type, p.claim.value)) { dropped.push({ targetId: p.targetId, reason: 'claim_invalid' }); continue; }
+      inputs.push({ ...base, kind: 'claim', content: { type: p.claim.type, value: p.evidence.length ? p.claim.value : 'unknown' } });
     } else if (p.kind === 'note') {
       const note = p.note?.trim() ?? '';
-      if (!note || [...note].length > NOTE_MAX_LENGTH) continue;
-      out.push({ ...base, kind: 'note', content: { note } });
+      if (!note || [...note].length > NOTE_MAX_LENGTH) { dropped.push({ targetId: p.targetId, reason: 'note_invalid' }); continue; }
+      inputs.push({ ...base, kind: 'note', content: { note } });
     } else if (p.kind === 'subject') {
-      out.push({ ...base, kind: 'subject', content: { subjectId: input.subject.id } });
+      inputs.push({ ...base, kind: 'subject', content: { subjectId: input.subject.id } });
     }
   }
-  return out;
+  return { inputs, dropped };
 }
 
 /** 别名去首尾空白、不分大小写（与 addAlias 入库的规范化一致，apply-pack 的比较同款） */

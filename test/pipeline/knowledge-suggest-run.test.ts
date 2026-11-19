@@ -1,10 +1,12 @@
 // test/pipeline/knowledge-suggest-run.test.ts —— 按主题生成知识提案的服务（ADR-0046 入口③，#512）的接缝：suggestForSubject →
-// 注入的假 fetch（setLlmFetch）→ chatJson（llm_calls 记 knowledge_proposal）→ outputToProposals → dropKnown（和已生效知识相同的
+// 注入的假 fetch（setLlmFetch）→ chatJson（llm_calls 记 knowledge_proposal）→ outputToProposals（#956：丢弃条目的目标与原因记进
+// 审计 detail 的 dropped，最多 20 条、没有丢弃时不写这个键）→ dropKnown（和已生效知识相同的
 // 丢掉计 skipped，#948）→ dropPending（与待处理 / 已拒绝提案重复的跳过计 existing，#953）→ 事务里 proposeMany（stale 按生成前的依据快照）
 // + 写 knowledge_generations + 审计 knowledge_proposal.generated。
 // 同样的输入与生成器版本再点不调模型（fresh: false）；条目带上了待处理与已拒绝的提案时是另一个输入：再点真的调模型，
 // 同一批不再写入（#953）、提示词带 pending / rejected 与拒绝理由；拒绝过的提案不再出现（计 rejected）；
-// 模型失败 422 并记 generate_failed 审计（不含提示词与输出原文）；restricted 投影以外的内容不进提示词
+// 模型失败（HTTP 错误，或缺 kind 对应字段不合 Schema，#956）422 并记 generate_failed 审计（不含提示词与输出原文）；
+// restricted 投影以外的内容不进提示词
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tenantCatalog } from '../../app/.server/catalog/load';
@@ -84,10 +86,11 @@ describe('按主题生成知识提案', () => {
     expect(alias.basedOn).toEqual([{ id: 'metric:paid_revenue', hash: bases.get('metric:paid_revenue') }]);
     expect(rows.find(r => r.kind === 'claim')!.content).toEqual({ type: 'currency', value: 'unknown' }); // 无证据的口径声明记「未知」
 
-    // 审计 detail 只有计数与 subjectId；代次行记新建数
+    // 审计 detail 只有计数与 subjectId；没有丢弃时不写 dropped 这个键；代次行记新建数
     const [audit] = await auditsOf(acme, 'knowledge_proposal.generated');
     expect(audit).toMatchObject({ targetType: 'analysis_subject', targetId: subjectId,
       detail: { subjectId, created: 4, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0 } });
+    expect(audit!.detail).not.toHaveProperty('dropped');
     expect(await generations(acme)).toEqual([expect.objectContaining({
       subjectId, inputHash: expect.any(String), generatorVersion: SUGGEST_GENERATOR_VERSION,
       proposalCount: 4, createdByEmail: 'an@acme.com',
@@ -204,7 +207,14 @@ describe('按主题生成知识提案', () => {
     const invalid = await suggestForSubject(analyst, subjectId);
     expect(invalid).toEqual({ fresh: true, created: 4, existing: 0, rejected: 0, invalid: 2, stale: 0, skipped: 0 });
     const [audit] = await auditsOf(acme, 'knowledge_proposal.generated');
-    expect(audit!.detail).toMatchObject({ created: 4, invalid: 2 });
+    // 被丢条目记目标与原因进审计 detail 的 dropped；没有丢弃的生成不写这个键
+    const detail = audit!.detail as { created: number; invalid: number; dropped: unknown[] };
+    expect(detail.created).toBe(4);
+    expect(detail.invalid).toBe(2);
+    expect(detail.dropped).toEqual([
+      { targetId: 'metric:paid_revenue', reason: 'evidence_not_in_input' },
+      { targetId: 'entity:nope', reason: 'target_not_in_entries' },
+    ]);
     expect((await generations(acme))[0]!.proposalCount).toBe(4);
   });
 
@@ -226,6 +236,24 @@ describe('按主题生成知识提案', () => {
     const rows = await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme));
     expect(rows.filter(r => r.kind === 'alias')).toHaveLength(0);
     expect(rows.map(r => [r.kind, r.targetId])).toEqual([['note', 'field:order.status']]);
+  });
+
+  it('模型输出 kind:note 但没有 note（正文写进 reason）时不合 Schema：422、记 generate_failed 审计、不留提案与代次行', async () => {
+    const { acme, analyst, subjectId } = await setup();
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json(modelOutput([
+      { kind: 'note', targetId: 'entity:order', evidence: [{ ref: 'entity:order' }], reason: '订单表存下单与支付信息' },
+    ]), USAGE));
+
+    const failure = (p: Promise<unknown>) => p.then(() => { throw new Error('应当失败'); }, (e: unknown) => e as SuggestError);
+    const e = await failure(suggestForSubject(analyst, subjectId));
+    expect(e).toBeInstanceOf(SuggestError);
+    expect(e).toMatchObject({ status: 422, message: expect.stringContaining('不符合 Schema') });
+    const [audit] = await auditsOf(acme, 'knowledge_proposal.generate_failed');
+    expect(audit).toMatchObject({ targetType: 'analysis_subject', targetId: subjectId,
+      detail: { subjectId, stage: 'model', error: expect.stringContaining('Schema') } });
+    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
+    expect(await generations(acme)).toHaveLength(0);
   });
 
   it('模型失败 422 并记 generate_failed 审计（不含提示词与输出原文），不留提案与代次行；查看者 403；未配置模型服务 409 且不发请求；主题不存在 400', async () => {

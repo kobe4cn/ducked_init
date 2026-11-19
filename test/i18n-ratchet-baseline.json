@@ -42,7 +42,7 @@
     "app/.server/knowledge/sources.ts": 8,
     "app/.server/knowledge/subjects.ts": 11,
     "app/.server/knowledge/suggest-run.ts": 3,
-    "app/.server/knowledge/suggest.ts": 17,
+    "app/.server/knowledge/suggest.ts": 18,
     "app/.server/knowledge/term-defaults.ts": 2,
     "app/.server/lake-inspect.ts": 1,
     "app/.server/lake-migration.ts": 21,
