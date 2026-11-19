@@ -40,11 +40,16 @@ const METRIC_SYSTEM = [
   METRIC_CAPABILITY,
 ].join('\n');
 
-/** 一句话解析（#516）：spec 是指标定义，另有逐项说明、认不出的词与不支持的说法 */
+/** 一句话解析（#516）：spec 是指标定义，另有逐项说明、认不出的词与不支持的说法；提示词要写出输出骨架——
+ *  模型看不到 METRIC_PARSE_SCHEMA（callModel 只发 response_format: json_object），不写骨架时模型会照 YAML 示例把定义平铺到顶层（#959） */
 const METRIC_PARSE_SYSTEM = [
-  '你是 CRM 数据平台的指标助手：把成员的一句话解析成一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（spec 是指标定义，与下面 YAML 示例同样的结构），不要输出别的文字。',
+  '你是 CRM 数据平台的指标助手：把成员的一句话解析成一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（顶层是 spec、items、unknowns、unsupported 四个键，指标定义只放在 spec 里），不要输出别的文字。',
   '成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按句子搜出的目录条目与句子原文。',
   ...METRIC_RULES,
+  '输出格式：',
+  '{ "spec": { "base": 基础实体, "measure": 度量, "filter"?: 过滤条件数组, "window"?: 时间窗口, … },',
+  '  "items": [{ "path": 在 spec 里的位置, "reason": 一句话说明 }], "unknowns": [], "unsupported": [] }',
+  '四个键都必须有，没有内容给空列表；下面 YAML 示例是 spec 里面的写法，不要把定义平铺到顶层。',
   '解析说明：',
   '- items 逐项说明 spec 的每个部分是怎么从句子来的：path 用它在 spec 里的位置（如 measure.field、filter.0、window），reason 一句话。',
   '- 句子里认不出的词照原话进 unknowns（如目录里没有的字段、对应不上的说法），不要猜。',
@@ -126,6 +131,24 @@ export const METRIC_PARSE_SCHEMA = {
     unsupported: { type: 'array', items: { type: 'string' } },
   },
 } as const;
+
+/** 宽松 Schema（#959 兜底）：callModel 只发 response_format: json_object、模型看不到上面的 Schema，常把定义平铺在顶层
+ *  （qwen-plus 必现），严格 Schema 会让一句话解析必然失败——也接受顶层有 base 或 measure 的平铺输出，收拢
+ *  （normalizeParseOutput）后再按 METRIC_PARSE_SCHEMA 严格校验。必须是模块级常量：validatorFor 用 WeakMap 按对象缓存
+ *  编译结果，每次调用新建对象会反复编译 */
+export const METRIC_PARSE_LENIENT_SCHEMA = {
+  anyOf: [METRIC_PARSE_SCHEMA, { type: 'object', anyOf: [{ required: ['base'] }, { required: ['measure'] }] }],
+} as const;
+
+/**
+ * 收拢平铺的解析输出（#959 兜底，纯函数、不校验）：有 spec 键原样返回；否则模型是把定义平铺在顶层，
+ * 把 items / unknowns / unsupported 以外的键收进 spec、缺的列表补 []，由调用方再按 METRIC_PARSE_SCHEMA 严格校验
+ */
+export function normalizeParseOutput(raw: Record<string, unknown>): { output: unknown; normalized: boolean } {
+  if ('spec' in raw) return { output: raw, normalized: false };
+  const { items, unknowns, unsupported, ...spec } = raw;
+  return { output: { spec, items: items ?? [], unknowns: unknowns ?? [], unsupported: unsupported ?? [] }, normalized: true };
+}
 
 /**
  * 一句话解析成指标表单（#516）发给模型的消息，结构与 definitionDraftMessages 相同：
