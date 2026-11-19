@@ -5,6 +5,8 @@
 // 租户整套自配时读租户自己的档位列（只填模型沿用租户默认端点与 Key，带端点用档位自己的 Key），平台档位不生效；
 // 档位没绑定模型就回落默认并记 fallbackReason='unbound'。
 // chatTools 带工具调用模型（AI 助手，ADR-0042），不要求 JSON。
+// 平台 chat 的请求体可经 LLM_CHAT_EXTRA 合并服务商参数（按档位 LLM_<TIER>_CHAT_EXTRA 覆盖，如 qwen3 思考模型关思考模式），
+// 平台字段（model、messages、response_format、tools 等）不会被它覆盖；chat 与 embedding 补算的超时由 LLM_TIMEOUT_SECONDS 控制（默认 60 秒）。
 // embed（ADR-0049）走可选的 embedding 端点：租户的 embedding 三项 > 平台环境变量 LLM_EMBEDDING_*，与 chat 互不影响；
 // 都没配置时返回 null（不发请求、不记日志），调用方只走关键词检索。
 // chatJson 与 chatTools 的每次调用（成功、HTTP 失败、校验失败）都在 platform.llm_calls 记一行：用途、模型、令牌数、耗时、校验结果与错误摘要，不存提示词与返回原文；评测命令用不查库、不记日志的 callModel
@@ -33,7 +35,11 @@ export interface LlmMessage {
   tool_call_id?: string;
 }
 
-export interface LlmProvider { baseUrl: string; model: string; apiKey: string; source: 'tenant' | 'platform' }
+export interface LlmProvider {
+  baseUrl: string; model: string; apiKey: string; source: 'tenant' | 'platform';
+  /** 平台的 LLM(_<TIER>)_CHAT_EXTRA：env 是变量名（报配置错误用），raw 是原文，调用时才解析合并进 chat 请求体；租户 provider 不带 */
+  chatExtra?: { env: string; raw: string };
+}
 
 /** transient：超时、连不上、HTTP 5xx 或 429，过一会儿再试可能就好了 */
 export class LlmError extends Error {
@@ -43,7 +49,12 @@ export class LlmError extends Error {
 /** 租户 API Key 的加密 context（ADR-0009），解密时须给出同一个 */
 export const MODEL_PROVIDER_CONTEXT = 'model_provider';
 
-const TIMEOUT_MS = 60_000;
+/** chat 与 embedding 补算共用的超时毫秒数（ADR-0049）：LLM_TIMEOUT_SECONDS 每次调用都读（默认参数在调用时求值，stubEnv 生效），
+ *  正整数字符串才用（照 lakeConnectTimeout 的取法），否则回落默认 60 秒——配错不让所有模型调用一起失败。检索查询向量的短超时由调用方另传 */
+function timeoutMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.LLM_TIMEOUT_SECONDS;
+  return /^\d+$/.test(raw ?? '') && Number(raw) > 0 ? Number(raw) * 1000 : 60_000;
+}
 
 let fetchOverride: typeof fetch | undefined;
 
@@ -59,9 +70,14 @@ export function providerSource(row: { baseUrl: string | null } | undefined): Llm
   return LLM_BASE_URL && LLM_MODEL && LLM_API_KEY ? 'platform' : null;
 }
 
-/** 平台默认的端点、模型与 Key（环境变量 LLM_*）；只在三个变量都有时调用 */
-export const platformProvider = (): LlmProvider =>
-  ({ baseUrl: process.env.LLM_BASE_URL!, model: process.env.LLM_MODEL!, apiKey: process.env.LLM_API_KEY!, source: 'platform' });
+/** 平台默认的端点、模型与 Key（环境变量 LLM_*）；只在三个变量都有时调用。LLM_CHAT_EXTRA 有值（空串算没填）时带上服务商参数原文 */
+export const platformProvider = (): LlmProvider => {
+  const extra = process.env.LLM_CHAT_EXTRA;
+  return {
+    baseUrl: process.env.LLM_BASE_URL!, model: process.env.LLM_MODEL!, apiKey: process.env.LLM_API_KEY!, source: 'platform',
+    ...(extra ? { chatExtra: { env: 'LLM_CHAT_EXTRA', raw: extra } } : {}),
+  };
+};
 
 /** 行上某一档的三列（与 model-provider.ts 的 tierOf 同样的取法，不 import 它：那边已 import 本文件，反向会循环）：
  *  没绑定时 model 为 null，端点与 Key 为 null 表示沿用本租户默认的那一套 */
@@ -96,7 +112,8 @@ export async function resolveProvider(tenantId: string): Promise<LlmProvider | n
 export interface LlmRoute { provider: LlmProvider; route: 'fast' | 'reasoning' | null; fallbackReason: 'unbound' | null }
 
 /** 平台档位的某一项环境变量（LLM_<TIER>_*），空串算没填 */
-const tierEnv = (tier: 'fast' | 'reasoning', suffix: 'MODEL' | 'BASE_URL' | 'API_KEY') => process.env[`LLM_${tier.toUpperCase()}_${suffix}`] || undefined;
+const tierEnv = (tier: 'fast' | 'reasoning', suffix: 'MODEL' | 'BASE_URL' | 'API_KEY' | 'CHAT_EXTRA') =>
+  process.env[`LLM_${tier.toUpperCase()}_${suffix}`] || undefined;
 
 /**
  * 解析一次调用走哪一档（ADR-0055）：先按 ADR-0035 选出整套 provider（都没有返回 null）。
@@ -104,6 +121,7 @@ const tierEnv = (tier: 'fast' | 'reasoning', suffix: 'MODEL' | 'BASE_URL' | 'API
  * 档位有自己的端点时用档位的端点与 Key（端点与 Key 须一起填，只填端点按没绑定处理并 console.warn，不把租户默认
  * Key 发到档位的端点）。平台默认时 LLM_<TIER>_MODEL 有值就把模型换成它；BASE_URL 与 API_KEY 必须一起填才用
  * 档位自己的端点与 Key（只填一个同样按没绑定处理并 console.warn），只填 MODEL 时端点与 Key 复用默认的。
+ * 服务商参数（#952）：档位自己的 LLM_<TIER>_CHAT_EXTRA 覆盖默认的 LLM_CHAT_EXTRA，只填 MODEL 的档位继承默认的。
  */
 export async function resolveRoute(tenantId: string, purpose: LlmPurpose): Promise<LlmRoute | null> {
   const { row, provider } = await providerRow(tenantId);
@@ -127,13 +145,18 @@ export async function resolveRoute(tenantId: string, purpose: LlmPurpose): Promi
   const model = tierEnv(tier, 'MODEL');
   const baseUrl = tierEnv(tier, 'BASE_URL');
   const apiKey = tierEnv(tier, 'API_KEY');
+  const chatExtra = tierEnv(tier, 'CHAT_EXTRA');
   if ((baseUrl || apiKey) && !(baseUrl && apiKey)) {
     console.warn(`LLM_${tier.toUpperCase()}_BASE_URL 与 LLM_${tier.toUpperCase()}_API_KEY 要一起填才生效，现在按未配置档位处理`);
     return { provider, route: tier, fallbackReason: 'unbound' };
   }
   if (!model) return { provider, route: tier, fallbackReason: 'unbound' };
   return {
-    provider: { baseUrl: baseUrl ?? provider.baseUrl, model, apiKey: apiKey ?? provider.apiKey, source: 'platform' },
+    provider: {
+      baseUrl: baseUrl ?? provider.baseUrl, model, apiKey: apiKey ?? provider.apiKey, source: 'platform',
+      // 档位自己的服务商参数优先；只填 MODEL 的档位继承默认的 LLM_CHAT_EXTRA（上面两个 return 直接用默认 provider，自动带上）
+      chatExtra: chatExtra ? { env: `LLM_${tier.toUpperCase()}_CHAT_EXTRA`, raw: chatExtra } : provider.chatExtra,
+    },
     route: tier, fallbackReason: null,
   };
 }
@@ -195,14 +218,14 @@ export interface CallStats { usage?: { prompt_tokens?: number; completion_tokens
 
 const maskKey = (apiKey: string, s: string) => (apiKey ? s.replaceAll(apiKey, '***') : s);
 
-/** 跑 run，失败都转成 LlmError，消息里的 API Key 换成 ***；timeoutMs 只是超时消息里的秒数，中断本身由 postJson 的 AbortSignal 负责 */
-async function masked<T>(apiKey: string, run: () => Promise<T>, timeoutMs = TIMEOUT_MS): Promise<T> {
+/** 跑 run，失败都转成 LlmError，消息里的 API Key 换成 ***；timeout 只是超时消息里的秒数，中断本身由 postJson 的 AbortSignal 负责 */
+async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeoutMs()): Promise<T> {
   try {
     return await run();
   } catch (e) {
     const timedOut = e instanceof Error && e.name === 'TimeoutError';
     throw new LlmError(maskKey(apiKey, e instanceof LlmError ? e.message
-      : timedOut ? `模型服务 ${timeoutMs / 1000} 秒内没有返回`
+      : timedOut ? `模型服务 ${timeout / 1000} 秒内没有返回`
       : `调用模型服务失败：${e instanceof Error ? e.message : String(e)}`), e instanceof LlmError ? e.transient : true);
   }
 }
@@ -211,23 +234,46 @@ async function masked<T>(apiKey: string, run: () => Promise<T>, timeoutMs = TIME
 interface RawMessage { content?: unknown; tool_calls?: unknown }
 
 /** POST 一个 JSON 请求到 {baseUrl}{path}（带 Bearer Key 与超时），非 2xx 抛 LlmError（5xx 与 429 算 transient），返回解析后的 JSON，不是 JSON 时返回 null */
-async function postJson(provider: LlmProvider, path: string, payload: Record<string, unknown>, timeoutMs = TIMEOUT_MS): Promise<unknown> {
+async function postJson(provider: LlmProvider, path: string, payload: Record<string, unknown>, timeout = timeoutMs()): Promise<unknown> {
   const { baseUrl, apiKey } = provider;
   const res = await llmFetch()(`${baseUrl.replace(/\/+$/, '')}${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(timeout),
   });
   // 先遮蔽再截断：Key 跨过截断处时半截 Key 就遮不住了
   if (!res.ok) throw new LlmError(`模型服务返回 HTTP ${res.status}：${maskKey(apiKey, await res.text()).slice(0, 200)}`, res.status >= 500 || res.status === 429);
   return res.json().catch(() => null);
 }
 
-/** 发一次 /chat/completions（payload 之外补上模型名与 temperature 0），返回 choices[0].message；令牌数填进 stats */
+/** chatExtra 里不允许出现的平台字段：服务商参数垫在请求体最底层，这几个键先删掉再合并，覆盖不了平台自己的；
+ *  tools 与 response_format 同时出现很多服务不接受（callTools 的注释），更不能从 extra 混进来 */
+const CHAT_EXTRA_PROTECTED = ['model', 'messages', 'response_format', 'tools', 'tool_choice', 'temperature'];
+
+/** 把 provider 的 chatExtra 原文解析成要合并进 /chat/completions 请求体的对象（#952）。
+ *  在这里（调用时）而不是解析 provider 时做：logged 的 resolve 在 try 之外，提前抛错会漏记 llm_calls，
+ *  评测脚本又在模块顶层调 platformProvider()，会在启动时直接崩。JSON 不合法或不是对象（数组、null、标量）都算
+ *  配置错误（非 transient），消息只带变量名，不带原文与 Key */
+function chatExtraBody(provider: LlmProvider): Record<string, unknown> {
+  const { chatExtra } = provider;
+  if (!chatExtra) return {};
+  let parsed: unknown;
+  try { parsed = JSON.parse(chatExtra.raw); } catch { parsed = null; }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new LlmError(`模型服务配置错误：${chatExtra.env} 不是合法的 JSON 对象`);
+  }
+  const extra: Record<string, unknown> = { ...parsed };
+  for (const key of CHAT_EXTRA_PROTECTED) delete extra[key];
+  return extra;
+}
+
+/** 发一次 /chat/completions（chatExtra 的服务商参数垫在最底层，payload 之外补上模型名与 temperature 0，平台字段不会被覆盖），
+ *  返回 choices[0].message；令牌数填进 stats */
 async function postChat(provider: LlmProvider, payload: Record<string, unknown>, stats: CallStats): Promise<RawMessage> {
   if (!provider.model) throw new LlmError('模型服务配置不完整：没有填写模型名');
-  const body = await postJson(provider, '/chat/completions', { model: provider.model, ...payload, temperature: 0 }) as
+  const body = await postJson(provider, '/chat/completions',
+    { ...chatExtraBody(provider), model: provider.model, ...payload, temperature: 0 }) as
     { choices?: { message?: RawMessage }[]; usage?: CallStats['usage'] } | null;
   stats.usage = body?.usage;
   return body?.choices?.[0]?.message ?? {};

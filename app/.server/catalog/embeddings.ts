@@ -20,7 +20,7 @@ import { platformStore, type VectorStore } from './vector-store';
 /** 每批补算的条数：一次 /embeddings 请求的输入条数 */
 export const EMBED_BATCH = 64;
 
-/** 查询向量一次 embedding 的短超时：检索在请求路径上，宁可只走关键词也不让成员等一个完整超时（默认 60 秒） */
+/** 查询向量一次 embedding 的短超时：检索在请求路径上，宁可只走关键词也不让成员等一个完整超时（补算默认 LLM_TIMEOUT_SECONDS，60 秒） */
 export const QUERY_EMBED_TIMEOUT_MS = 3000;
 
 /** 解析租户当前选定的向量存储（ADR-0058，做法照 llm.ts 的 resolveEmbeddingProvider）：选了外部 pgvector 且连接串密文在时返回外部实现与解出的 url，
