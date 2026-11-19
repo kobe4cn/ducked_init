@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."api_keys" ADD COLUMN "scopes" text[] DEFAULT '{catalog,consumers,exports}'::text[] NOT NULL;

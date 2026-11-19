@@ -21,9 +21,9 @@ beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
 
-/** 管理员在页面上创建一把 Key，返回明文 */
+/** 管理员在页面上创建一把 Key，返回明文；接口范围照页面表单默认三类全勾 */
 async function createKey(admin: Client, name: string) {
-  const res = await admin.post('/api-keys', { intent: 'create', name });
+  const res = await admin.post('/api-keys', { intent: 'create', name, scope: ['catalog', 'consumers', 'exports'] });
   expect(res.status).toBe(200);
   const key = (await res.text()).match(/data-api-key="[^"]*"[^>]*>([^<]+)</)?.[1];
   if (!key) throw new Error('创建后的页面没有展示 Key');
