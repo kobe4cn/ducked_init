@@ -167,7 +167,7 @@ export interface RawCatalogSource { name: string; tables: { name: string; ref: s
 /** 工作台目录树：标准层、结果层、我的沙箱、分享给我的，与按数据源名的原始层视图 */
 export interface WorkbenchCatalog { silver: CatalogEntry[]; gold: CatalogEntry[]; mine: CatalogEntry[]; shared: CatalogEntry[]; raw: RawCatalogSource[] }
 
-const quoted = (s: string) => `"${s.replace(/"/g, '""')}"`;
+const quoted = (s: string) => `"${s.replaceAll('"', '""')}"`;
 
 /**
  * 成员此刻能读的表与字段、行数、位置（工作台目录树）：用查询同一套只读凭据挂载，按查询同一个允许集合列出，不经白名单。
