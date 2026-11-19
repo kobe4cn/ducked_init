@@ -3,12 +3,13 @@
 // 查询的挂载用本租户的只读数据库角色与只读对象存储账号，凭据本身写不进 catalog 与存储；
 // 把查询结果保存为个人沙箱表时用可写挂载，CREATE 语句由平台拼出、只写进成员自己的 sandbox_<成员>，并在平台库登记（保存后 SANDBOX_TTL_DAYS 天过期）。
 // 表的主人可以把沙箱表只读分享给本租户有沙箱权限的成员；每次查询都按被分享人当前的角色与分享登记重新算能读的表，不缓存。
+// 表的主人也可以提前删除自己的沙箱表（dropSandboxTable）：撤销分享、过期时间设为现在并入队 sandbox.expire 清理湖里的表与旧文件（#970）。
 // 目录树（listCatalog）用同一套只读凭据挂载、按同一个允许集合列出表与字段，由平台查询，不拿并发锁、不记审计。
 // 原始层只给回放后的当前状态：每次挂载都按此刻的数据源名现建内存 catalog 与视图（数据源改名后别名随之变化），敏感列是加盐哈希，
 // 采集时像敏感信息的列取自数据源的列统计（与源视图预览同一套规则，ADR-0005）；报错里抹掉盐。
 // 每个租户同时只有一个交互查询（PG 事务级 advisory lock，持有到查询结束），不经任务队列、不占正式任务名额；
 // 超时或客户端中止请求时 interrupt 本进程里的这个查询。每次查询都记审计（SQL、耗时、行数，失败时加原因），不记查询结果
-import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan, can } from './access';
 import { recordAudit, type AuditAction, type Tx } from './audit';
 import type { CurrentMember } from './auth';
@@ -20,7 +21,7 @@ import {
   checkWorkbenchSql, listRawTables, listReadableTables, mountRawSources, normalizeWorkbenchSql, runWorkbenchQuery, sandboxSchema, saveSandboxTable,
   WorkbenchSqlError, type CatalogTable, type RawMount, type RawSource, type SandboxAccess, type WorkbenchResult,
 } from './pipeline/workbench-engine';
-import { lockForSave } from './sandbox';
+import { enqueueSandboxDrop, lockForSave } from './sandbox';
 import { tenantPiiSalt } from './secrets';
 import { confirmedTables } from './sources';
 import { normalizeEmail } from './tenants';
@@ -30,9 +31,9 @@ import { looksSensitive } from '../lib/sensitive';
 export { SANDBOX_TTL_DAYS } from './db/schema';
 export { sandboxSchema } from './pipeline/workbench-engine';
 
-/** 可以展示给成员的错误 */
+/** 可以展示给成员的错误；删除别人的或已删的沙箱表是 404（不泄露表在与不在），本租户已有查询在运行是 429，其余是 400 */
 export class WorkbenchError extends Error {
-  constructor(message: string, readonly status: 400 | 429 = 400) { super(message); }
+  constructor(message: string, readonly status: 400 | 404 | 429 = 400) { super(message); }
 }
 
 /** 最多给出的行数、默认超时与所用的计算资源 */
@@ -101,7 +102,7 @@ export interface SharedWithMe { owner: string; schema: string; name: string; exp
  * 把一条 SELECT 的结果存为成员沙箱里的表 name（湖里的 sandbox_<成员>.name；同名表覆盖，过期时间重新从现在算起），返回登记的表。
  * 在本租户可写挂载的数据湖上、与工作台查询同一把并发锁下执行：先按工作台白名单校验（可以读分享来的表），再由平台拼出 CREATE 语句，
  * 目标永远是成员自己的沙箱。
- * 同名表已到期、正在过期清理时拒绝（lockForSave）。成功、失败都记审计 sandbox.save；出错时与 runQuery 一样抛出 WorkbenchError
+ * 同名表已到期、正在过期清理或正在删除时拒绝（lockForSave）。成功、失败都记审计 sandbox.save；出错时与 runQuery 一样抛出 WorkbenchError
  */
 export async function saveAsSandbox(
   actor: CurrentMember, name: string, rawSql: string, signal?: AbortSignal, { timeoutMs = WORKBENCH_TIMEOUT_MS }: { timeoutMs?: number } = {},
@@ -109,7 +110,7 @@ export async function saveAsSandbox(
   const query = normalizeWorkbenchSql(rawSql);
   const schema = sandboxSchema(actor.memberId);
   return inWorkbench(actor, { signal, timeoutMs, readOnly: false }, async ({ session, throwIfStopped, tx, mountAccess }) => {
-    if (!await lockForSave(tx, actor.tenant.id, actor.memberId, name)) throw new WorkbenchSqlError('这张沙箱表已到期、正在清理，请稍后再保存或换个表名');
+    if (!await lockForSave(tx, actor.tenant.id, actor.memberId, name)) throw new WorkbenchSqlError('这张沙箱表正在删除或清理，请稍后再保存或换个表名');
     const checked = await checkWorkbenchSql(session.con, query, await mountAccess());
     throwIfStopped();
     const rowCount = await saveSandboxTable(session.con, schema, name, checked);
@@ -124,14 +125,14 @@ export async function saveAsSandbox(
   }));
 }
 
-/** 成员自己还没过期的沙箱表与各自分享给了谁，按表名排序 */
+/** 成员自己的沙箱表与各自分享给了谁，按表名排序；已过期（到期或主人删除、还没清理完）的不列 */
 export async function listSandboxTables(actor: CurrentMember): Promise<ListedSandboxTable[]> {
   assertCan(actor, 'sandbox');
   const db = getDb();
   const tables = await db.select({
     id: sandboxTables.id, name: sandboxTables.name, rowCount: sandboxTables.rowCount, createdAt: sandboxTables.createdAt, expiresAt: sandboxTables.expiresAt,
   }).from(sandboxTables)
-    .where(and(eq(sandboxTables.tenantId, actor.tenant.id), eq(sandboxTables.memberId, actor.memberId), isNull(sandboxTables.expiredAt)))
+    .where(and(eq(sandboxTables.tenantId, actor.tenant.id), eq(sandboxTables.memberId, actor.memberId), isNull(sandboxTables.expiredAt), gt(sandboxTables.expiresAt, new Date())))
     .orderBy(asc(sandboxTables.name));
   const shares = tables.length ? await db.select({ tableId: sandboxShares.tableId, email: members.email }).from(sandboxShares)
     .innerJoin(members, eq(members.id, sandboxShares.memberId))
@@ -262,6 +263,35 @@ export async function unshareSandboxTable(actor: CurrentMember, name: string, em
     await recordAudit(tx, { tenantId: actor.tenant.id, actor, action: 'sandbox.unshare', targetType: 'sandbox_table', targetId: table.id, detail: { name, member: target } });
   });
   return target;
+}
+
+/**
+ * 表的主人提前删除自己的沙箱表 name：撤销它的全部分享（被分享人马上读不到）、过期时间设为现在（工作台列表不再列出），
+ * 并入队一个 sandbox.expire 删表、清理湖里的旧文件（ADR-0020），任务成功后标记 expiredAt；记审计 sandbox.dropped。
+ * 只有主人能删（ownTable 只认自己的表）：别人的表（管理员、被分享人也一样）与已删或已到期的表都抛 404，不泄露表在与不在
+ */
+export async function dropSandboxTable(actor: CurrentMember, name: string) {
+  assertCan(actor, 'sandbox');
+  await getDb().transaction(async tx => {
+    const table = await ownTableOr404(tx, actor, name);
+    // 过期时间设到比现在早一点：markSandboxExpired 拿它和数据库生成的任务 createdAt 比，往前多留 1 秒避开应用与数据库的时钟偏差
+    await tx.update(sandboxTables).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(sandboxTables.id, table.id));
+    await tx.delete(sandboxShares).where(eq(sandboxShares.tableId, table.id));
+    await enqueueSandboxDrop(tx, actor.tenant.id, actor.memberId, name);
+    await recordAudit(tx, { tenantId: actor.tenant.id, actor, action: 'sandbox.dropped', targetType: 'sandbox_table', targetId: table.id, detail: { name } });
+  });
+}
+
+/** ownTable 的 404 版本，只在删除时用：没有这张表（或已删、已到期）时抛 404，与不存在报同一句话 */
+async function ownTableOr404(tx: Tx, actor: CurrentMember, name: string) {
+  try {
+    const table = await ownTable(tx, actor, name);
+    if (table.expiresAt <= new Date()) throw new WorkbenchError(`没有沙箱表 ${name}`, 404);
+    return table;
+  } catch (e) {
+    // ownTable 没找到时抛的 400 在这里改成 404（上面已到期抛的本来就是 404，原样透传；其余错误照常抛）
+    throw e instanceof WorkbenchError && e.status === 400 ? new WorkbenchError(`没有沙箱表 ${name}`, 404) : e;
+  }
 }
 
 /** 成员自己还没过期的沙箱表 name 的登记（锁住这一行，与过期标记互斥）；没有时抛出 WorkbenchError */

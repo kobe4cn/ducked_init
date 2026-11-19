@@ -222,10 +222,12 @@ describe('沙箱表', () => {
 
 /** 页面上我的沙箱 schema（先保存一张表才会出现在列表里） */
 const sandboxOfPage = (html: string, table: string) => new RegExp(`(sandbox_[0-9a-f]{32})\\.${table}`).exec(html)?.[1];
-const shareAudits = async (action: 'sandbox.share' | 'sandbox.unshare') => getDb().select().from(auditLogs)
+const shareAudits = async (action: 'sandbox.share' | 'sandbox.unshare' | 'sandbox.dropped') => getDb().select().from(auditLogs)
   .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, action)));
 /** 页面「分享给我的」面板的 HTML */
 const sharedPanel = (html: string) => html.split('data-shared-with-me')[1]?.split('</table>')[0] ?? '';
+/** 页面「我的沙箱表」面板的 HTML（删除后表格空了没有 </table>，按下一个面板截断） */
+const minePanel = (html: string) => html.split('data-sandbox-tables')[1]?.split('data-shared-with-me')[0] ?? '';
 /** 「我的沙箱表」里某一行分享表单的邮箱输入框（aria-label 带表名，每行唯一） */
 const shareInput = (html: string, table: string) => new RegExp(`<input[^>]*aria-label="把 ${table} 分享给"[^>]*>`).exec(html)?.[0] ?? '';
 
@@ -279,6 +281,47 @@ describe('分享', () => {
     expect(again.status).toBe(400);
     expect(await again.text()).toContain('不存在或没有权限');
     expect(sharedPanel(await (await engineer.get('/workbench')).text())).not.toContain('an@acme.com');
+  });
+
+  it('主人提前删除沙箱表：「我的沙箱表」每行有「删除」按钮，删除后这张表与被分享人「分享给我的」里的条目立刻消失、再查报不存在；审计 sandbox.dropped 只记 name；被分享人与管理员删别人的表 404、查看者 403、主人再删一次 404', async () => {
+    // an@acme.com / de@acme.com 的登录邮件已到申请频率上限，这里用新成员
+    await memberOf(acme, 'an5@acme.com', 'analyst');
+    await memberOf(acme, 'de4@acme.com');
+    const owner = await loginAs(app, 'an5@acme.com');
+    await owner.post('/workbench', { intent: 'save', name: 'gone_top', sql: 'SELECT customer_id FROM silver.customer LIMIT 2' });
+    const page = await (await owner.get('/workbench')).text();
+    const schema = sandboxOfPage(page, 'gone_top')!;
+    // 每行有删除按钮（intent=drop），与表名在同一行（验收标准 1）
+    expect(page).toMatch(new RegExp(`gone_top(?:(?!<tr)[\\s\\S])*?value="drop" name="intent">删除`));
+    await owner.post('/workbench', { intent: 'share', name: 'gone_top', email: 'de4@acme.com' });
+    const engineer = await loginAs(app, 'de4@acme.com');
+    expect(sharedPanel(await (await engineer.get('/workbench')).text())).toContain('gone_top');
+
+    const dropped = await owner.post('/workbench', { intent: 'drop', name: 'gone_top' });
+    expect(dropped.status).toBe(200);
+    const html = await dropped.text();
+    expect(html).toContain('已删除沙箱表 gone_top');
+    expect(minePanel(html)).not.toContain('gone_top');
+    // 被分享人再查报「不存在或没有权限」，「分享给我的」里也没有（验收标准 1）
+    const denied = await engineer.post('/workbench', { sql: `SELECT count(*) AS n FROM ${schema}.gone_top` });
+    expect(denied.status).toBe(400);
+    expect(await denied.text()).toContain(`表 ${schema}.gone_top 不存在或没有权限`);
+    expect(sharedPanel(await (await engineer.get('/workbench')).text())).not.toContain('gone_top');
+
+    // 审计 sandbox.dropped 的 detail 只有 name（验收标准 1）
+    expect((await shareAudits('sandbox.dropped')).at(-1)).toMatchObject({ actorEmail: 'an5@acme.com', detail: { name: 'gone_top' } });
+    expect((await shareAudits('sandbox.dropped')).at(-1)?.detail).toEqual({ name: 'gone_top' });
+
+    // 只有主人能删（验收标准 3）：被分享人、管理员（有全部权限）都走 ownTable 找不到别人的表
+    for (const actor of [engineer, await loginAs(app, 'admin@acme.com')]) {
+      const refused = await actor.post('/workbench', { intent: 'drop', name: 'gone_top' });
+      expect(refused.status).toBe(404);
+      expect(await refused.text()).toContain('没有沙箱表 gone_top');
+    }
+    expect((await (await loginAs(app, 'vi@acme.com')).post('/workbench', { intent: 'drop', name: 'gone_top' })).status).toBe(403);
+    // 已删的表再删也是 404，不重复记审计
+    expect((await owner.post('/workbench', { intent: 'drop', name: 'gone_top' })).status).toBe(404);
+    expect(await shareAudits('sandbox.dropped')).toHaveLength(1);
   });
 
   it('只能分享给本租户有沙箱权限的成员；别人的表、过期的表分享不了；失败时这一行的邮箱输入框保留刚填的邮箱；表过期或被分享人降为查看者后分享失效', async () => {

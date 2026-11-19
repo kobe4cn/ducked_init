@@ -17,9 +17,9 @@ import { checkDraftedSql, listCatalog, runQuery, WorkbenchError, type QueryOutco
 import { samplesAllowed } from './model-provider';
 import { looksSensitive } from '../lib/sensitive';
 
-/** 可以展示给成员的错误 */
+/** 可以展示给成员的错误；状态码与 WorkbenchError 对齐（透传它的 status） */
 export class WorkbenchAiError extends Error {
-  constructor(message: string, readonly status: 400 | 409 | 422 | 429) { super(message); }
+  constructor(message: string, readonly status: 400 | 404 | 409 | 422 | 429) { super(message); }
 }
 
 /** 需求最多的字数 */
