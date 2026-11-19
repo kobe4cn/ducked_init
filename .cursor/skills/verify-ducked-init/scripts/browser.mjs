@@ -239,6 +239,21 @@ async function handle(page, state, req) {
     writeFileSync(req.path, typeof snap === 'string' ? snap : JSON.stringify(snap, null, 2));
     return { stderr: req.path };
   }
+  if (cmd === 'lang') {
+    return { stdout: await page.evaluate(() => document.documentElement.lang) };
+  }
+  if (cmd === 'cookie') {
+    // Plaintext cookie. react-router createCookie would base64-encode the value,
+    // and getLocale only treats the raw value "en" as English.
+    const context = page.context();
+    if (req.clear) {
+      await context.clearCookies();
+      return { stdout: 'cleared' };
+    }
+    if (!req.name || req.value === undefined) throw new Error('cookie requires --name and --value, or --clear');
+    await context.addCookies([{ name: req.name, value: req.value, url: state.BASE_URL }]);
+    return { stdout: `${req.name}=${req.value}` };
+  }
   if (cmd === 'title') return { stdout: await page.title() };
   if (cmd === 'url') return { stdout: page.url() };
   if (cmd === 'text') {
@@ -292,7 +307,8 @@ async function handle(page, state, req) {
 }
 
 function usage() {
-  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|html|title|url|text|value|count|scroll-y|scroll-into|console|magic-link> [args]`);
+  console.error(`usage: browser.mjs <goto|fill|click|select|set-hidden|set-file|wait-text|wait-url|wait-selector|screenshot|snapshot|html|title|lang|url|text|value|count|scroll-y|scroll-into|console|cookie|magic-link> [args]`);
+  console.error('cookie --name <name> --value <value> sets a plaintext cookie for BASE_URL; cookie --clear removes them');
   console.error('click accepts --role and --name, or --selector <css>. --confirm accept|dismiss handles one window.confirm');
   console.error('console accepts --clear, which drops the buffer and prints console-cleared=<N>');
 }
