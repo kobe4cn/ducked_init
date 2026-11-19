@@ -1,15 +1,15 @@
 // test/http/knowledge-import.test.ts —— 知识粘贴导入页 /knowledge/import 与来源原文页 /knowledge/sources/:id（ADR-0046 入口③，#527）的 HTTP 接缝：
-// 分析师粘贴标题、种类与正文提交后保存来源并调模型解析，302 回集中页带计数（跳过 = 已有 + 拒绝过 + 不合法 + 依据已变）、页顶提示《标题》与新提案；
+// 分析师粘贴标题、种类与正文提交后保存来源并调模型解析，302 回集中页带计数（跳过 = 已有 + 拒绝过 + 不合法 + 依据已变 + 和已生效知识相同，#948）、页顶提示《标题》与新提案；
 // 查看者打不开导入页（GET / POST 都 403）、集中页没有入口；未配置模型服务 409 时页面原地显示错误、带回已填的值与来源页链接；
 // 来源页按段渲染（段落带 p<段号> 锚点、段前显示段号），有 definitions:read 就能看，非 UUID / 不存在 400，?v= 与当前版本不同时提示段号可能对不上；
 // 知识面板里 source:<id>#p<段号> 证据渲染成指向来源页对应段落的链接（?v=<证据版本>#p<段号>），非 source 证据仍是纯文本
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { knowledgeSources } from '../../app/.server/db/schema';
+import { knowledgeProposals, knowledgeSources } from '../../app/.server/db/schema';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { saveKnowledgeSource } from '../../app/.server/knowledge/sources';
-import { proposeKnowledge } from '../../app/.server/knowledge/proposals';
+import { acceptProposal, proposeKnowledge } from '../../app/.server/knowledge/proposals';
 import { memberOf } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { fakeLlm, json, platformDefault } from '../pipeline/llm-fixtures';
@@ -92,6 +92,25 @@ describe('知识粘贴导入页与来源原文页', () => {
     const source = await theSource(acme);
     expect(source.title).toBe(TITLE);
   }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
+
+  it('提案全部接受后同标题同正文再提交：和已生效知识相同的提案落库前丢掉，302 带 created=0&skipped=3，提案表不增加', async () => {
+    const { acme, analyst } = await setup();
+    const an = await loginAs(app, 'an@acme.com');
+    platformDefault();
+    fakeLlm(f => app.setLlmFetch(f), () => json(modelOutput()));
+    const first = await an.post('/knowledge/import', { title: TITLE, kind: 'metric', body: BODY });
+    expect(decodeURIComponent(first.headers.get('location')!)).toBe(`/knowledge?imported=${TITLE}&created=3&skipped=0`);
+
+    const proposals = () => getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme));
+    const before = await proposals();
+    expect(before).toHaveLength(3);
+    for (const p of before) await acceptProposal(analyst, p.id);
+
+    const again = await an.post('/knowledge/import', { title: TITLE, kind: 'metric', body: BODY });
+    expect(again.status).toBe(302);
+    expect(decodeURIComponent(again.headers.get('location')!)).toBe(`/knowledge?imported=${TITLE}&created=0&skipped=3`);
+    expect(await proposals()).toHaveLength(3);
+  }, 180_000); // 每个用例都跑 publishedIdentitySources，4 个 worker 并行时超过默认的 90 s
 
   it('查看者打不开导入页：GET 与 POST 都 403，集中页没有「粘贴导入」入口', async () => {
     await setup();

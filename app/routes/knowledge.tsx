@@ -105,7 +105,7 @@ export async function action({ request }: Route.ActionArgs) {
     const params = new URLSearchParams({ suggested: (await listSubjects(getDb(), member.tenant.id)).find(s => s.id === subjectId)?.name ?? '' });
     if (outcome.fresh) {
       params.set('created', String(outcome.created));
-      params.set('skipped', String(outcome.existing + outcome.rejected + outcome.invalid + outcome.stale));
+      params.set('skipped', String(outcome.existing + outcome.rejected + outcome.invalid + outcome.stale + outcome.skipped));
     } else {
       params.set('fresh', '0');
     }

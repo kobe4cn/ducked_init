@@ -1,6 +1,6 @@
 // app/routes/knowledge.import.tsx —— 知识粘贴导入页（ADR-0046 入口③，#527）：有起草权限的成员粘贴标题、种类与来源原文，
 // 提交后先 saveKnowledgeSource（保存不调模型，同租户同标题再粘贴不新建来源）再 importFromSource（同步调模型解析成提案），
-// 成功 302 回集中页带计数（跳过 = 已有 + 拒绝过 + 不合法 + 依据已变）。查看者 loader 就 403，GET 与 POST 都打不开。
+// 成功 302 回集中页带计数（跳过 = 已有 + 拒绝过 + 不合法 + 依据已变 + 与已生效知识相同，#948）。查看者 loader 就 403，GET 与 POST 都打不开。
 // 失败原地显示错误并带回已填的值：校验不过（KnowledgeError 400）时来源没保存；模型没配置（409）或失败（422）时来源已保存，
 // 给出来源页链接——再提交同标题同正文是安全的重试（保存走幂等、解析按指纹去重）。页面提示只粘贴元数据说明，不要粘贴业务数据
 import { useState } from 'react';
@@ -56,7 +56,7 @@ export async function action({ request }: Route.ActionArgs) {
     const outcome = await importFromSource(member, saved.id);
     const params = new URLSearchParams({
       imported: values.title.trim(), created: String(outcome.created),
-      skipped: String(outcome.existing + outcome.rejected + outcome.invalid + outcome.stale),
+      skipped: String(outcome.existing + outcome.rejected + outcome.invalid + outcome.stale + outcome.skipped),
     });
     throw redirect(`/knowledge?${params.toString()}`);
   } catch (e) {

@@ -1,6 +1,7 @@
 // test/pipeline/knowledge-suggest-run.test.ts —— 按主题生成知识提案的服务（ADR-0046 入口③，#512）的接缝：suggestForSubject →
-// 注入的假 fetch（setLlmFetch）→ chatJson（llm_calls 记 knowledge_proposal）→ outputToProposals → 事务里 proposeMany（stale 按生成前的
-// 依据快照）+ 写 knowledge_generations + 审计 knowledge_proposal.generated。同样的输入与生成器版本再点不调模型（fresh: false）；
+// 注入的假 fetch（setLlmFetch）→ chatJson（llm_calls 记 knowledge_proposal）→ outputToProposals → dropKnown（和已生效知识相同的
+// 丢掉计 skipped，#948）→ 事务里 proposeMany（stale 按生成前的依据快照）+ 写 knowledge_generations + 审计 knowledge_proposal.generated。
+// 同样的输入与生成器版本再点不调模型（fresh: false）；
 // 拒绝过的提案不再出现（计 rejected）；模型失败 422 并记 generate_failed 审计（不含提示词与输出原文）；restricted 投影以外的内容不进提示词
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -9,6 +10,8 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, knowledgeGenerations, knowledgeProposals, llmCalls } from '../../app/.server/db/schema';
 import { createDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { currentBases } from '../../app/.server/knowledge/basis';
+import { addAlias } from '../../app/.server/knowledge/aliases';
+import { saveClaim } from '../../app/.server/knowledge/claims';
 import { rejectProposal } from '../../app/.server/knowledge/proposals';
 import { SuggestError, suggestForSubject } from '../../app/.server/knowledge/suggest-run';
 import { subjectInput, SUGGEST_GENERATOR_VERSION } from '../../app/.server/knowledge/suggest';
@@ -63,7 +66,7 @@ describe('按主题生成知识提案', () => {
     const { f } = fakeLlm(setLlmFetch, () => json(modelOutput(), USAGE));
 
     const out = await suggestForSubject(analyst, subjectId);
-    expect(out).toEqual({ fresh: true, created: 4, existing: 0, rejected: 0, invalid: 0, stale: 0 });
+    expect(out).toEqual({ fresh: true, created: 4, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0 });
     expect(f).toHaveBeenCalledTimes(1);
     const [call] = await calls(acme);
     expect(call).toMatchObject({ purpose: 'knowledge_proposal', model: 'qwen-plus', schemaValid: true,
@@ -82,11 +85,31 @@ describe('按主题生成知识提案', () => {
     // 审计 detail 只有计数与 subjectId；代次行记新建数
     const [audit] = await auditsOf(acme, 'knowledge_proposal.generated');
     expect(audit).toMatchObject({ targetType: 'analysis_subject', targetId: subjectId,
-      detail: { subjectId, created: 4, existing: 0, rejected: 0, invalid: 0, stale: 0 } });
+      detail: { subjectId, created: 4, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0 } });
     expect(await generations(acme)).toEqual([expect.objectContaining({
       subjectId, inputHash: expect.any(String), generatorVersion: SUGGEST_GENERATOR_VERSION,
       proposalCount: 4, createdByEmail: 'an@acme.com',
     })]);
+  });
+
+  it('成员已生效的口径与别名不再重复提出：同值计 skipped，取值不同的声明照常提出（要人判断的冲突）', async () => {
+    const { acme, analyst, subjectId } = await setup();
+    await saveClaim(analyst, { targetId: 'metric:paid_revenue', type: 'currency', value: 'CNY' });
+    await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: '流水暗号' });
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json({ proposals: [
+      { kind: 'alias', targetId: 'metric:paid_revenue', alias: ' 流水暗号 ', evidence: [{ ref: 'entity:order' }], reason: '空白不同' },
+      { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'CNY' }, evidence: [{ ref: 'entity:order' }], reason: '同值声明' },
+      { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'USD' }, evidence: [{ ref: 'entity:order' }], reason: '取值不同' },
+    ] }, USAGE));
+
+    const out = await suggestForSubject(analyst, subjectId);
+    expect(out).toEqual({ fresh: true, created: 1, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 2 });
+    const rows = await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme));
+    expect(rows.map(r => [r.kind, r.content])).toEqual([['claim', { type: 'currency', value: 'USD' }]]);
+    const [audit] = await auditsOf(acme, 'knowledge_proposal.generated');
+    expect(audit!.detail).toMatchObject({ created: 1, skipped: 2 });
+    expect((await generations(acme))[0]!.proposalCount).toBe(1);
   });
 
   it('提示词只放 restricted 投影：没有数据源名与源表名，条目只带知识依赖与关系', async () => {
@@ -125,7 +148,7 @@ describe('按主题生成知识提案', () => {
     await rejectProposal(analyst, rejected.id, '不是这个叫法');
     await renameSubject(analyst, subjectId, '营收口径');
     const again = await suggestForSubject(analyst, subjectId);
-    expect(again).toEqual({ fresh: true, created: 0, existing: 3, rejected: 1, invalid: 0, stale: 0 });
+    expect(again).toEqual({ fresh: true, created: 0, existing: 3, rejected: 1, invalid: 0, stale: 0, skipped: 0 });
     expect(f).toHaveBeenCalledTimes(2);
     expect(await generations(acme)).toHaveLength(2); // 改名后的输入是另一行
     expect((await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).map(r => r.status).sort())
@@ -141,7 +164,7 @@ describe('按主题生成知识提案', () => {
     ];
     fakeLlm(setLlmFetch, () => json(modelOutput(bad), USAGE));
     const invalid = await suggestForSubject(analyst, subjectId);
-    expect(invalid).toEqual({ fresh: true, created: 4, existing: 0, rejected: 0, invalid: 2, stale: 0 });
+    expect(invalid).toEqual({ fresh: true, created: 4, existing: 0, rejected: 0, invalid: 2, stale: 0, skipped: 0 });
     const [audit] = await auditsOf(acme, 'knowledge_proposal.generated');
     expect(audit!.detail).toMatchObject({ created: 4, invalid: 2 });
     expect((await generations(acme))[0]!.proposalCount).toBe(4);
@@ -160,7 +183,7 @@ describe('按主题生成知识提案', () => {
       ] }, USAGE);
     });
     const stale = await suggestForSubject(analyst, subjectId);
-    expect(stale).toEqual({ fresh: true, created: 1, existing: 0, rejected: 0, invalid: 0, stale: 1 });
+    expect(stale).toEqual({ fresh: true, created: 1, existing: 0, rejected: 0, invalid: 0, stale: 1, skipped: 0 });
     expect((await generations(acme))[0]!.proposalCount).toBe(1);
     const rows = await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme));
     expect(rows.filter(r => r.kind === 'alias')).toHaveLength(0);
