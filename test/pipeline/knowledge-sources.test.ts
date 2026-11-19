@@ -4,7 +4,7 @@ import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, knowledgeSources } from '../../app/.server/db/schema';
+import { auditLogs, knowledgeSources, knowledgeSourceVersions } from '../../app/.server/db/schema';
 import { getKnowledgeSource, saveKnowledgeSource } from '../../app/.server/knowledge/sources';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
@@ -96,6 +96,33 @@ describe('版本与读取', () => {
     const mine = (await rows()).filter(r => r.title === '会员口径');
     expect(mine).toHaveLength(1);   // 没有新建行
     expect(mine[0]).toMatchObject({ id, kind: 'metric', body: 'members 表\n\nlevel 会员等级', version: 3, createdByEmail: 'an@acme.com' });
+  });
+
+  it('每次保存的正文都留存成一行（#966）：连存两版两版都在、正文没变不加行；getKnowledgeSource 带 version 读历史版，不存在时回退当前版', async () => {
+    const first = await saveKnowledgeSource(await analyst(), { title: '留存口径', kind: 'metric', body: 'v1 第一段\n\nv1 第二段' });
+    const second = await saveKnowledgeSource(await memberOf(acme, 'de@acme.com', 'data_engineer'), { title: '留存口径', kind: 'metric', body: 'v2 只有一段' });
+    expect(second.version).toBe(2);
+    const unchanged = await saveKnowledgeSource(await analyst(), { title: '留存口径', kind: 'metric', body: ' v2 只有一段 ' });   // 只差首尾空白
+    expect(unchanged.version).toBe(2);
+
+    const kept = (await getDb().select().from(knowledgeSourceVersions)
+      .where(eq(knowledgeSourceVersions.sourceId, first.id))).sort((a, b) => a.version - b.version);
+    expect(kept).toHaveLength(2);   // 正文没变的那次没加行
+    expect(kept.map(r => [r.version, r.kind, r.body])).toEqual([
+      [1, 'metric', 'v1 第一段\n\nv1 第二段'],
+      [2, 'metric', 'v2 只有一段'],
+    ]);
+    expect(kept.map(r => r.createdByEmail)).toEqual(['an@acme.com', 'de@acme.com']);   // 每一版的保存人，不是首存者
+
+    const viewer = await memberOf(acme, 'view@acme.com', 'viewer');
+    const v1 = await getKnowledgeSource(viewer, first.id, 1);
+    expect(v1).toMatchObject({ id: first.id, version: 1, currentVersion: 2 });
+    expect(v1.paragraphs).toEqual([{ no: 1, text: 'v1 第一段' }, { no: 2, text: 'v1 第二段' }]);
+    const missing = await getKnowledgeSource(viewer, first.id, 99);   // 版本不存在不是错误：回退当前版
+    expect(missing).toMatchObject({ id: first.id, version: 2, currentVersion: 2 });
+    expect(missing.paragraphs).toEqual([{ no: 1, text: 'v2 只有一段' }]);
+    const current = await getKnowledgeSource(viewer, first.id);
+    expect(current).toMatchObject({ version: 2, currentVersion: 2 });
   });
 
   it('getKnowledgeSource 按当前正文切段读回；查看者（definitions:read）能看，别的租户或不是 UUID 时 400', async () => {

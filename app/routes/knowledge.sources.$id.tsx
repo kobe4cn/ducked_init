@@ -1,6 +1,7 @@
 // app/routes/knowledge.sources.$id.tsx —— 知识来源原文页（ADR-0046 入口③，#527）：有 definitions:read 就能看（原文是成员写的元数据说明，不是业务数据）。
 // 正文按保存时的段落逐段显示，每段带 p<段号> 锚点与段号，知识面板里 source:<id>#p<段号> 的证据链接就跳到这里（?v= 是证据记下的版本）。
-// 表里只存当前正文，不存历史版本：URL 带 ?v= 且与当前 version 不同时，页顶提示段号可能对不上。非 UUID、不存在、属于别的租户都是 400
+// 每次保存的正文都留存（#966）：URL 带 ?v=N 时显示第 N 版的正文与段落，页头标「第 N 版（当前第 M 版）」；
+// 版本不存在时显示当前版并提示段号可能对不上，不带 ?v= 时就是当前版。非 UUID、不存在、属于别的租户都是 400
 import { AlertTriangle } from 'lucide-react';
 import { data, Link } from 'react-router';
 import type { Route } from './+types/knowledge.sources.$id';
@@ -24,7 +25,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   const parsed = raw === null ? null : Number(raw);
   const evidenceVersion = parsed !== null && Number.isInteger(parsed) && parsed > 0 ? parsed : null;
   try {
-    const source = await getKnowledgeSource(member, params.sourceId);
+    // 证据链接里带的版本：读得到就显示那一版的正文（#966），读不到（版本不存在）在 getKnowledgeSource 里回退当前版
+    const source = await getKnowledgeSource(member, params.sourceId, evidenceVersion ?? undefined);
     return {
       email: member.email,
       nav: navFor(member),
@@ -32,6 +34,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         title: source.title,
         kindLabel: KNOWLEDGE_SOURCE_KIND_LABELS[source.kind],
         version: source.version,
+        currentVersion: source.currentVersion,
         // 读取时由 paragraphsOf 现切，不存段落表
         paragraphs: source.paragraphs.map(p => ({ no: p.no, text: p.text })),
         updatedAt: source.updatedAt.toISOString(),
@@ -48,8 +51,12 @@ const when = (iso: string) => new Date(iso).toLocaleString('zh-CN');
 
 export default function KnowledgeSourcePage({ loaderData }: Route.ComponentProps) {
   const { email, nav, source, evidenceVersion } = loaderData;
-  // 证据记的是旧版本、表里只存当前正文：段号可能对不上，页顶提示
+  // 请求的版本（?v=）不存在、回退到了当前版：段号可能对不上，页顶提示；读得到的历史版本身就是证据依据的那版，不提示
   const staleEvidence = evidenceVersion !== null && evidenceVersion !== source.version;
+  // 显示的是历史版时页头标出来（「第 N 版（当前第 M 版）」），当前版保持「第 M 版」
+  const versionLabel = source.version !== source.currentVersion
+    ? `第 ${source.version} 版（当前第 ${source.currentVersion} 版）`
+    : `第 ${source.version} 版`;
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -57,7 +64,7 @@ export default function KnowledgeSourcePage({ loaderData }: Route.ComponentProps
         description={
           <>
             <Link to="/knowledge" className="hover:underline">← 业务知识</Link>
-            {`　${source.kindLabel} · 第 ${source.version} 版 · 更新于 ${when(source.updatedAt)}`}
+            {`　${source.kindLabel} · ${versionLabel} · 更新于 ${when(source.updatedAt)}`}
           </>
         }
       />

@@ -194,17 +194,34 @@ describe('知识粘贴导入页与来源原文页', () => {
     expect((await an.get(`/knowledge/sources/${source.id}?v=1`)).status).toBe(200);
   }, 180_000); // 每个用例都跑 publishedIdentitySources，4 个 worker 并行时超过默认的 90 s
 
-  it('来源页 ?v= 与当前版本不同时提示「证据来自旧版，段号可能对不上」，相同时不提示', async () => {
+  it('来源页 ?v=N 读得到的历史版本直接显示那一版（页头「第 N 版（当前第 M 版）」），版本不存在时回退当前版并提示段号可能对不上', async () => {
     const { analyst } = await setup();
     const v1 = await saveKnowledgeSource(analyst, { title: TITLE, kind: 'metric', body: BODY });
     const v2 = await saveKnowledgeSource(analyst, { title: TITLE, kind: 'metric', body: `${BODY}\n\n补充：退货不算流水。` });
     expect(v2.version).toBe(2);
     const an = await loginAs(app, 'an@acme.com');
 
-    const stale = decode(await (await an.get(`/knowledge/sources/${v1.id}?v=1`)).text());
-    expect(stale).toContain('证据来自 v1，原文已更新到 v2，段号可能对不上');
-    const fresh = decode(await (await an.get(`/knowledge/sources/${v1.id}?v=2`)).text());
-    expect(fresh).toContain('补充：退货不算流水。');
-    expect(fresh).not.toContain('段号可能对不上');
+    // v1（三段）完整可回溯：页头标历史版，没有「段号可能对不上」的提示
+    const old = decode(await (await an.get(`/knowledge/sources/${v1.id}?v=1`)).text());
+    expect(old).toContain('第 1 版（当前第 2 版）');
+    expect(old).toContain('订单实付金额的口径说明。');
+    expect(old).not.toContain('补充：退货不算流水。');
+    expect(old).not.toContain('data-stale-evidence');
+
+    // 版本不存在：显示当前版（v2 的四段），提示证据版本对不上
+    const missing = decode(await (await an.get(`/knowledge/sources/${v1.id}?v=99`)).text());
+    expect(missing).toContain('证据来自 v99，原文已更新到 v2，段号可能对不上');
+    expect(missing).toContain('data-stale-evidence');
+    expect(missing).toContain('补充：退货不算流水。');
+    expect(missing).not.toContain('第 99 版');
+
+    // ?v=2 与不带 ?v=：都是当前版，页头「第 2 版」，不提示
+    for (const path of [`/knowledge/sources/${v1.id}?v=2`, `/knowledge/sources/${v1.id}`]) {
+      const fresh = decode(await (await an.get(path)).text());
+      expect(fresh).toContain('补充：退货不算流水。');
+      expect(fresh).toContain('第 2 版');
+      expect(fresh).not.toContain('（当前第');
+      expect(fresh).not.toContain('段号可能对不上');
+    }
   }, 180_000); // 每个用例都跑 publishedIdentitySources，4 个 worker 并行时超过默认的 90 s
 });

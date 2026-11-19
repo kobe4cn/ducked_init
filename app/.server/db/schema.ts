@@ -939,6 +939,21 @@ export const knowledgeSources = platform.table('knowledge_sources', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, t => [uniqueIndex('knowledge_sources_tenant_title_uq').on(t.tenantId, t.title)]);
 
+// 知识来源的版本正文（ADR-0046 入口③，#966，修订 #525 的「只存当前正文」）：每次保存的正文一版一行，只加不改——提案证据指向的
+// 段落随时可以按 (来源, 版本) 回溯。knowledge_sources 行上仍是当前正文，version 与这里的最大版本一致。created_by_email 是这一版
+// 的保存人（来源行上的仍是首存者）。版本表不进任何审计
+export const knowledgeSourceVersions = platform.table('knowledge_source_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  sourceId: uuid('source_id').notNull().references(() => knowledgeSources.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  kind: text('kind').$type<KnowledgeSourceKind>().notNull(),
+  body: text('body').notNull(),
+  bodyHash: text('body_hash').notNull(),
+  createdByEmail: text('created_by_email').notNull(),
+  createdAt: createdAt(),
+}, t => [uniqueIndex('knowledge_source_versions_source_version_uq').on(t.sourceId, t.version)]);
+
 // 按主题生成提案的代次记录（ADR-0046 入口③）：每次成功生成一行。input_hash 是 subjectInput 的 inputHash（含主题名），同一个
 // (租户, 主题, 输入, 生成器版本) 再点不再调模型（直接返回没有新内容）；主题名、条目或知识变了（hash 不同）会再生成。
 // proposal_count 是这次新建的提案数；模型失败不记行，再点还会调模型
