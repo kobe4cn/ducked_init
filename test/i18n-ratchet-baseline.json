@@ -48,7 +48,7 @@
     "app/.server/lake-migration.ts": 21,
     "app/.server/lake-reset.ts": 3,
     "app/.server/lake.ts": 7,
-    "app/.server/llm.ts": 18,
+    "app/.server/llm.ts": 19,
     "app/.server/mailer.ts": 7,
     "app/.server/mappings.ts": 59,
     "app/.server/mcp.ts": 5,
