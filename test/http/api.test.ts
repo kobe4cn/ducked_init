@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { scopeOfPath } from '../../app/.server/api-auth';
 import { sha256 } from '../../app/.server/auth';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -255,6 +256,14 @@ describe('Bearer 认证', () => {
       expect(res.status).toBe(403);
       expect(await res.json()).toEqual({ error: '这把 Key 没有导出接口的权限' });
     }
+    // 路径大小写、结尾的 /、百分号编码绕不过范围：路由匹配逐段解码、不区分大小写、接受结尾 /，范围判定也一样
+    for (const res of [
+      await call('/api/v1/catalog/', key),
+      await call('/api/v1/Catalog', key),
+      await call('/api/v1/%63atalog', key),
+      await call(`/api/v1/EXPORTS/${randomUUID()}`, key),
+      await app.client().request('/api/v1/Exports', { method: 'POST', headers: { Authorization: `Bearer ${key}` } }),
+    ]) expect(res.status).toBe(403);
     const body = JSON.stringify(await (await call('/api/v1/catalog', key)).json());
     expect(body).not.toContain(key.slice(0, 8));
     expect(body).not.toContain('acme');
@@ -268,6 +277,22 @@ describe('Bearer 认证', () => {
     expect((await call('/api/v1/catalog', 'not-a-key')).status).toBe(401);
     await admin.post('/api-keys', { intent: 'revoke', keyId: await keyIdOf(admin, '只点查') });
     expect((await call('/api/v1/catalog', key)).status).toBe(401);
+  });
+
+  it('每个走 Bearer Key 的端点都登记了接口范围（新增接口忘了登记会失败）；判定逐段解码、不区分大小写、忽略结尾 /，不会把相似前缀算进来', () => {
+    const bearer = API_ENDPOINTS.filter(e => e.auth.startsWith('Authorization: Bearer'));
+    expect(bearer.length).toBeGreaterThan(0);
+    for (const e of bearer) {
+      const path = e.path.split('?')[0].replace(/<[^>]+>/g, 'x');
+      expect(scopeOfPath(path), e.path).not.toBeNull();
+    }
+    expect(scopeOfPath('/api/v1/catalog/')).toBe('catalog');
+    expect(scopeOfPath('/API/V1/Consumers/x')).toBe('consumers');
+    expect(scopeOfPath('/api/v1/exports')).toBe('exports');
+    expect(scopeOfPath('/api/v1/%63atalog')).toBe('catalog');
+    expect(scopeOfPath('/api/v1/%E5')).toBeNull();
+    expect(scopeOfPath('/api/v1/consumersx')).toBeNull();
+    expect(scopeOfPath('/api/v1/exports-other')).toBeNull();
   });
 
   it('迁移默认：迁移前就有的 Key（插入时不带 scopes）三类全开，行为不变', async () => {
