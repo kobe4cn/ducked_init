@@ -69,8 +69,13 @@ write_env_files() {
     echo "PLATFORM_LAKE_URI=$(verify_sq "$LAKE_DIR")"
     echo "PLATFORM_MASTER_KEY=$(verify_sq "$MASTER_KEY")"
     echo "MAILER=$(verify_sq console)"
-    echo "MAGIC_LINK_RATE_LIMIT=$(verify_sq 50)"
-    echo "MAGIC_LINK_RATE_WINDOW_MINUTES=$(verify_sq 15)"
+    # Defaults keep the members drive under the limit. A launch shell that already
+    # exported either name wins, so the login-locale recipe can ask for 5 per 1 minute.
+    echo "MAGIC_LINK_RATE_LIMIT=$(verify_sq "${MAGIC_LINK_RATE_LIMIT:-50}")"
+    echo "MAGIC_LINK_RATE_WINDOW_MINUTES=$(verify_sq "${MAGIC_LINK_RATE_WINDOW_MINUTES:-15}")"
+    # Empty unless the launch shell set it. Writing the name either way stops Vite
+    # loadEnv from refilling CRM_ENABLE_EN_LOCALE out of a repo .env.
+    echo "CRM_ENABLE_EN_LOCALE=$(verify_sq "${CRM_ENABLE_EN_LOCALE:-}")"
     echo "NODE_ENV=$(verify_sq development)"
     echo "APP_ORIGIN=$(verify_sq "$BASE_URL")"
     # Copy every LLM_* variable that is set in this shell, including an empty value.
