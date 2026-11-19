@@ -3,6 +3,7 @@
 // 没有 Key、Key 错误、已吊销、租户已暂停一律 401，响应相同，不泄露是哪种原因。bearerToken 也给 /mcp 的个人令牌认证用（member-tokens.ts）
 // 认证通过后按接口范围（ADR-0061）判路径：Key 没开的类 403。先认证后判范围，401 的情形不变
 import { and, eq, isNull, lt, or, sql } from 'drizzle-orm';
+import type { ApiDataScope } from '../lib/api-data-scope';
 import { API_SCOPE_LABELS, type ApiScope } from '../lib/api-scopes';
 import { msg } from '../lib/i18n';
 import { sha256 } from './auth';
@@ -10,8 +11,8 @@ import { getDb } from './db/client';
 import { apiKeys, tenants } from './db/schema';
 import { formatServer } from './i18n';
 
-/** 调用方：所属租户与 Key（prefix 是明文的前 8 位，可以写进审计） */
-export interface ApiCaller { tenantId: string; keyId: string; prefix: string; scopes: ApiScope[] }
+/** 调用方：所属租户与 Key（prefix 是明文的前 8 位，可以写进审计）；dataScope 是数据范围（点查按它过滤，#975） */
+export interface ApiCaller { tenantId: string; keyId: string; prefix: string; scopes: ApiScope[]; dataScope: ApiDataScope }
 
 const underPath = (path: string, base: string) => path === base || path.startsWith(`${base}/`);
 
@@ -59,7 +60,7 @@ export async function requireApiKey(request: Request): Promise<ApiCaller> {
   if (!token) throw unauthorized();
   const db = getDb();
   const [row] = await db
-    .select({ keyId: apiKeys.id, tenantId: apiKeys.tenantId, prefix: apiKeys.prefix, scopes: apiKeys.scopes })
+    .select({ keyId: apiKeys.id, tenantId: apiKeys.tenantId, prefix: apiKeys.prefix, scopes: apiKeys.scopes, dataScope: apiKeys.dataScope })
     .from(apiKeys)
     .innerJoin(tenants, eq(tenants.id, apiKeys.tenantId))
     .where(and(eq(apiKeys.tokenHash, sha256(token)), isNull(apiKeys.revokedAt), isNull(tenants.suspendedAt)));

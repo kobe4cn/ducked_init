@@ -3,6 +3,7 @@
 // 目录条目在 YAML 的 description 之外带业务知识里当前的业务说明（note，#968）：最新一版、保存即生效，没写或清空为 null。
 // 点查 /api/v1/consumers/:id：数据由身份打通夹具、RFM 与已发布的指标、标签跑出快照，调度器自动生成服务库；?snapshot= 只读查湖里那张快照表。
 // 成功的点查按天记入 api_key_usage（ADR-0059，401/404/503/?snapshot= 不记），计数按租户隔离。
+// 点查还按 Key 的数据范围（data_scope，ADR-0061「数据范围」，#975）裁剪：范围外的标签、指标与 RFM 不出现，范围外的快照 404。
 // Bearer Key 打不开成员页面，也没有通往标准层、沙箱的接口；成员存下（并分享出去）的沙箱表不进服务库，也不出现在目录接口里
 import { randomUUID } from 'node:crypto';
 import { DuckDBInstance } from '@duckdb/node-api';
@@ -13,6 +14,7 @@ import { sha256 } from '../../app/.server/auth';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { apiKeyUsage, apiKeys, auditLogs, snapshots as snapshotsTable, sources as sourcesTable, spaces as spacesTable, tasks } from '../../app/.server/db/schema';
+import type { ApiDataScope } from '../../app/lib/api-data-scope';
 import { API_ENDPOINTS } from '../../app/lib/api-docs';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { lakeRow } from '../../app/.server/lake';
@@ -758,5 +760,83 @@ describe('点查的隔离', () => {
     expect(theirs.length).toBeGreaterThan(0);
     expect(new Set(ours.map(r => r.tenantId))).toEqual(new Set([acme]));
     expect(new Set(theirs.map(r => r.tenantId))).toEqual(new Set([other.tenantId]));
+  });
+});
+
+// 数据范围（ADR-0061「数据范围」，#975）：Key 带 data_scope，点查响应裁到范围内；组里另建自己的 Key 再改它的 data_scope，
+// 不动共用夹具的 key（计数、隔离用例按名字找它），改完不用恢复
+describe('点查的数据范围', () => {
+  let shared: ServedFixture;
+  beforeAll(async () => { shared = await sharedServed(); }, 180_000); // 共用的点查夹具（打通、RFM、发布指标与标签、生成服务库），并行跑满时超过默认 hookTimeout 60 s
+
+  it('默认 {"all":true}（迁移默认值）行为不变；收窄后按 ID / 按源只返回范围内的标签、指标与 RFM、快照只列范围内的；范围内什么都没有时 200 空对象；计数照旧', async () => {
+    const { acme, sources, consumer, key } = shared;
+    const admin = await loginAs(app, 'admin@acme.com');
+    // 共用夹具的 key 是页面创建的（不带 data_scope）：迁移默认值应是 {"all":true}
+    expect(await getDb().select({ dataScope: apiKeys.dataScope }).from(apiKeys).where(eq(apiKeys.tokenHash, sha256(key))))
+      .toEqual([{ dataScope: { all: true } }]);
+    const { key: scoped } = await createKey(admin, '数据范围');
+    const scopeOf = (dataScope: ApiDataScope) => getDb().update(apiKeys).set({ dataScope }).where(eq(apiKeys.tokenHash, sha256(scoped)));
+    await scopeOf({ all: false, tags: ['value_tier'], metrics: ['revenue'], rfm: false });
+
+    const full = (await lookup(`/api/v1/consumers/${consumer}`, key)).body; // 默认 Key 的全量返回，与上面用例逐字段断言的相同（验收 1）
+    const r = await lookup(`/api/v1/consumers/${consumer}`, scoped);
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({
+      ...full,
+      metrics: { revenue: full.metrics.revenue }, // revenue_by_city 不在范围里，消失
+      rfm: null, // rfm: false
+      snapshots: full.snapshots.filter((s: { template: string }) => ['tag:value_tier', 'metric:revenue'].includes(s.template)),
+    });
+
+    // 按数据源查同一个结果：与按 ID 查的逐字段相同（requested_id 是源端 ID）
+    const own = await loyaltyIdOf(acme, sources.loyalty, consumer);
+    expect(await lookup(bySource('会员', own), scoped)).toEqual({ status: 200, body: { ...r.body, requested_id: own } });
+
+    // 范围内什么都没有（人在服务库里）：200 与空的 tags / metrics，不是 404，不暴露范围外有数据
+    await scopeOf({ all: false, tags: ['nope'], metrics: [], rfm: false });
+    expect(await lookup(`/api/v1/consumers/${consumer}`, scoped)).toEqual({
+      status: 200,
+      body: { consumer_id: consumer, requested_id: consumer, serving_version: full.serving_version, tags: {}, metrics: {}, rfm: null, snapshots: [] },
+    });
+
+    // 调用计数照旧：这把 Key 只有本用例用过，byId 两次、bySource 一次
+    const keyId = await keyIdOf(admin, '数据范围');
+    const rows = await getDb().select({ endpoint: apiKeyUsage.endpoint, calls: apiKeyUsage.calls }).from(apiKeyUsage).where(eq(apiKeyUsage.apiKeyId, keyId));
+    const sums: Record<string, number> = {};
+    for (const row of rows) sums[row.endpoint] = (sums[row.endpoint] ?? 0) + row.calls;
+    expect(sums).toEqual({ 'consumers.byId': 2, 'consumers.bySource': 1 });
+  });
+
+  it('?snapshot= 指向范围外的快照 404 且文案与真不存在相同（不会先报「没有这个消费者」）；范围内的照常只读那张表', async () => {
+    const { of, consumer } = shared;
+    const admin = await loginAs(app, 'admin@acme.com');
+    const { key: scoped } = await createKey(admin, '数据范围快照');
+    const scopeOf = (dataScope: ApiDataScope) => getDb().update(apiKeys).set({ dataScope }).where(eq(apiKeys.tokenHash, sha256(scoped)));
+    await scopeOf({ all: false, tags: ['value_tier'], metrics: [], rfm: false });
+
+    // 范围内的照常：只读那张快照表（snapshots 也只剩这一张）
+    const served = (await lookup(`/api/v1/consumers/${consumer}`, scoped)).body;
+    const tag = await lookup(`/api/v1/consumers/${consumer}?snapshot=${of('tag:value_tier').id}`, scoped);
+    expect(tag.status).toBe(200);
+    expect(tag.body).toMatchObject({ consumer_id: consumer, serving_version: null, tags: served.tags, metrics: {}, rfm: null });
+    expect(tag.body.snapshots.map((s: { id: string }) => s.id)).toEqual([of('tag:value_tier').id]);
+
+    // 范围外的定义（metric 不在范围）与 rfm:false 时的 RFM 快照：404，文案与真不存在的快照相同
+    const missing = await lookup(`/api/v1/consumers/${consumer}?snapshot=00000000-0000-0000-0000-000000000000`, scoped);
+    expect(missing).toEqual({ status: 404, body: { error: '快照不存在或已过期' } });
+    expect(await lookup(`/api/v1/consumers/${consumer}?snapshot=${of('metric:revenue').id}`, scoped)).toEqual(missing);
+    expect(await lookup(`/api/v1/consumers/${consumer}?snapshot=${of('rfm').id}`, scoped)).toEqual(missing);
+    // 范围外的快照即使查一个不在表里的人也报同样的 404（判定在 lookupSnapshot 之前），不会先报「没有这个消费者」
+    expect(await lookup(`/api/v1/consumers/nobody?snapshot=${of('rfm').id}`, scoped)).toEqual(missing);
+    // 对照：范围内的快照查一个不在表里的人，报的是「没有这个消费者」，与范围外的不同
+    expect((await lookup(`/api/v1/consumers/nobody?snapshot=${of('tag:value_tier').id}`, scoped)).body.error).not.toBe(missing.body.error);
+
+    // rfm 开着时 RFM 快照照常可查
+    await scopeOf({ all: false, tags: [], metrics: [], rfm: true });
+    const rfm = await lookup(`/api/v1/consumers/${consumer}?snapshot=${of('rfm').id}`, scoped);
+    expect(rfm.status).toBe(200);
+    expect(rfm.body.rfm).not.toBeNull();
+    expect(rfm.body.rfm).toEqual((await lookup(`/api/v1/consumers/${consumer}`, scoped)).body.rfm); // 服务库里的 rfm 与 RFM 快照里的一致（上面用例也断言过）
   });
 });
