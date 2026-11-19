@@ -7,5 +7,7 @@
   "工作邮箱": "Work email",
   "发送中…": "Sending…",
   "发送登录链接": "Send Magic Link",
-  "平台仅限受邀成员使用，不开放注册。": "The platform is invite-only and does not offer sign-up."
+  "平台仅限受邀成员使用，不开放注册。": "The platform is invite-only and does not offer sign-up.",
+  "第 {version} 版（当前第 {current} 版）": "Version {version} (current: version {current})",
+  "第 {version} 版": "Version {version}"
 }

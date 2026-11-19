@@ -12,6 +12,7 @@ import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertTitle } from '~/components/ui/alert';
 import { PageHeader } from '~/components/page-header';
+import { useT } from '~/lib/i18n';
 import { KNOWLEDGE_SOURCE_KIND_LABELS } from '~/lib/knowledge-source';
 
 export function meta({ loaderData }: Route.MetaArgs) {
@@ -51,12 +52,13 @@ const when = (iso: string) => new Date(iso).toLocaleString('zh-CN');
 
 export default function KnowledgeSourcePage({ loaderData }: Route.ComponentProps) {
   const { email, nav, source, evidenceVersion } = loaderData;
+  const t = useT();
   // 请求的版本（?v=）不存在、回退到了当前版：段号可能对不上，页顶提示；读得到的历史版本身就是证据依据的那版，不提示
   const staleEvidence = evidenceVersion !== null && evidenceVersion !== source.version;
   // 显示的是历史版时页头标出来（「第 N 版（当前第 M 版）」），当前版保持「第 M 版」
   const versionLabel = source.version !== source.currentVersion
-    ? `第 ${source.version} 版（当前第 ${source.currentVersion} 版）`
-    : `第 ${source.version} 版`;
+    ? t('第 {version} 版（当前第 {current} 版）', { version: source.version, current: source.currentVersion })
+    : t('第 {version} 版', { version: source.version });
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
