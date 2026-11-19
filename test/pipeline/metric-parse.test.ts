@@ -193,6 +193,24 @@ describe('一句话解析成指标表单', () => {
     expect(call).toMatchObject({ schemaValid: false });
   });
 
+  it('平铺输出过了宽松 Schema、收拢后不合严格 Schema 时 422：审计记 model 阶段并带 normalized，不含原句', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    // 顶层有 base / measure，宽松 Schema 放行；items 不是列表，收进 spec 后严格校验不过
+    fakeLlm(setLlmFetch, () => json({ ...MODEL_PARSE.spec, items: 'not-a-list' }, USAGE));
+
+    const e = await failure(parseMetricSentence(analyst, SENTENCE));
+    expect(e).toBeInstanceOf(MetricParseError);
+    expect(e.status).toBe(422);
+    expect(e.message).toContain('不符合 Schema');
+    const [audit] = await failures(acme);
+    expect(audit!.detail).toMatchObject({ stage: 'model', error: expect.stringContaining('不符合 Schema'), normalized: true });
+    expect(JSON.stringify(audit!.detail)).not.toContain(SENTENCE);
+    const [call] = await calls(acme);
+    expect(call).toMatchObject({ schemaValid: true });
+  });
+
   it('收拢过的定义转出来不过校验时 422：失败审计带 normalized，问题列表照旧', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
