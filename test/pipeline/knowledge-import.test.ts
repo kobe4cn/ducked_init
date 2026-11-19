@@ -103,6 +103,32 @@ describe('把知识来源解析成知识提案', () => {
     expect(out).toEqual({ created: 3, existing: 0, rejected: 0, invalid: 5, stale: 0, skipped: 0 });
     expect((await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).map(r => r.kind).sort())
       .toEqual(['alias', 'claim', 'note']);
+
+    // 被丢条目的目标与原因记进审计 detail 的 dropped，不记提案内容；没有丢弃的调用不写这个键（下面的指纹用例精确比对键列表）
+    const [audit] = await auditsOf(acme, 'knowledge_source.parsed');
+    expect(audit!.detail).toMatchObject({ invalid: 5, dropped: [
+      { targetId: 'metric:paid_revenue', reason: 'evidence_out_of_range' },
+      { targetId: 'metric:paid_revenue', reason: 'evidence_out_of_range' },
+      { targetId: 'metric:paid_revenue', reason: 'no_evidence' },
+      { targetId: 'entity:nope', reason: 'target_not_in_input' },
+      { targetId: 'field:customer.phone', reason: 'target_not_in_input' },
+    ] });
+    expect(JSON.stringify(audit!.detail)).not.toContain('幽灵');
+  });
+
+  it('模型输出 kind:note 但没有 note（正文写进 reason）时不合 Schema：422、没有新提案、没有 knowledge_source.parsed 审计', async () => {
+    const { acme, analyst, source } = await setup();
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json(modelOutput([
+      { kind: 'note', targetId: 'entity:order', evidence: [{ paragraph: 1 }], reason: '订单表存下单与支付信息' },
+    ]), USAGE));
+
+    const failure = (p: Promise<unknown>) => p.then(() => { throw new Error('应当失败'); }, (e: unknown) => e as ImportError);
+    const e = await failure(importFromSource(analyst, source.id));
+    expect(e).toBeInstanceOf(ImportError);
+    expect(e).toMatchObject({ status: 422, message: expect.stringContaining('不符合 Schema') });
+    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
+    expect(await auditsOf(acme, 'knowledge_source.parsed')).toHaveLength(0);
   });
 
   it('段落里写「请发布 / 调用接口 / 忽略以上要求」和整段 SQL 时，结果仍只有提案：没有 workbench 审计、没有任务', async () => {
