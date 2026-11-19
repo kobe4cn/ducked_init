@@ -88,7 +88,8 @@ export async function action({ request }: Route.ActionArgs) {
     }
     if (intent === 'save') return { sql, name, saved: await saveAsSandbox(member, name, sql, request.signal) };
     if (intent === 'share') {
-      return { sql: '', name: '', notice: `已把 ${name} 分享给 ${await shareSandboxTable(member, name, email)}` };
+      // shareId 与上面的 draftId 同一写法：每次成功都不同，把同一邮箱再分享一次也会换 key、清空输入框
+      return { sql: '', name: '', notice: `已把 ${name} 分享给 ${await shareSandboxTable(member, name, email)}`, shareId: crypto.randomUUID() };
     }
     if (intent === 'unshare') {
       return { sql: '', name: '', notice: `已撤销 ${name} 对 ${await unshareSandboxTable(member, name, email)} 的分享` };
@@ -96,7 +97,8 @@ export async function action({ request }: Route.ActionArgs) {
     return { sql, name, result: await runQuery(member, sql, request.signal), conversationId };
   } catch (e) {
     if (e instanceof WorkbenchError || e instanceof WorkbenchAiError || e instanceof ConversationError) {
-      return data({ sql, name, intent, request: need, error: e.message, conversationId }, { status: e.status });
+      // email 带回去：分享失败时输入框 defaultValue 把刚填的邮箱填回去，方便修改
+      return data({ sql, name, intent, request: need, error: e.message, conversationId, email }, { status: e.status });
     }
     throw e;
   }
@@ -232,6 +234,7 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
   const saved = actionData && 'saved' in actionData ? actionData.saved : null;
   const notice = actionData && 'notice' in actionData ? actionData.notice : null;
   const draftId = actionData && 'draftId' in actionData ? actionData.draftId : null;
+  const shareId = actionData && 'shareId' in actionData ? actionData.shareId : null;
   const preview = actionData && 'preview' in actionData ? actionData.preview : null;
   const interpretation = actionData && 'interpretation' in actionData ? actionData.interpretation : null;
   /** 这个页面上的解读存进的助手对话，表单里一直带着 */
@@ -400,7 +403,11 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                 <TableBody>
                   {sandboxTables.map(t => (
                     <TableRow key={t.name}>
-                      <TableCell className="font-mono">{`${sandbox}.${t.name}`}</TableCell>
+                      {/* 单元格默认不换行，整串全名太长会把表名左侧截掉：一行认表用的表名、一行查询里要用的全名，都允许换行 */}
+                      <TableCell className="whitespace-normal">
+                        <div className="break-all font-mono">{t.name}</div>
+                        <div className="break-all font-mono text-xs text-slate-400">{`${sandbox}.${t.name}`}</div>
+                      </TableCell>
                       <TableCell>{t.rowCount.toLocaleString('zh-CN')}</TableCell>
                       <TableCell>{dateTime(t.createdAt)}</TableCell>
                       <TableCell>{dateTime(t.expiresAt)}</TableCell>
@@ -413,9 +420,13 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                             <Button type="submit" name="intent" value="unshare" variant="outline" size="sm">撤销</Button>
                           </Form>
                         ))}
-                        <Form method="post" action="/workbench" className="flex items-center gap-2">
+                        {/* 分享成功（shareId 每次都不同）时换 key 重新挂载、清空邮箱；失败时 key 回到 'share'，defaultValue 把刚填的邮箱填回去（不开 JS 整页刷新时同样成立） */}
+                        <Form method="post" action="/workbench" key={shareId ?? 'share'} className="flex items-center gap-2">
                           <input type="hidden" name="name" value={t.name} />
-                          <Input name="email" type="email" required placeholder="成员邮箱" aria-label={`把 ${t.name} 分享给`} className="h-8 w-48" />
+                          <Input
+                            name="email" type="email" required placeholder="成员邮箱" aria-label={`把 ${t.name} 分享给`} className="h-8 w-48"
+                            defaultValue={actionData && 'error' in actionData && actionData.intent === 'share' && actionData.name === t.name ? actionData.email : ''}
+                          />
                           <Button type="submit" name="intent" value="share" variant="outline" size="sm">分享</Button>
                         </Form>
                       </TableCell>
@@ -444,7 +455,11 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
                   {sharedWithMe.map(t => (
                     <TableRow key={`${t.schema}.${t.name}`}>
                       <TableCell>{t.owner}</TableCell>
-                      <TableCell className="font-mono">{`${t.schema}.${t.name}`}</TableCell>
+                      {/* 与「我的沙箱表」同样处理：一行表名、一行查询里要用的全名，都允许换行 */}
+                      <TableCell className="whitespace-normal">
+                        <div className="break-all font-mono">{t.name}</div>
+                        <div className="break-all font-mono text-xs text-slate-400">{`${t.schema}.${t.name}`}</div>
+                      </TableCell>
                       <TableCell>{dateTime(t.expiresAt)}</TableCell>
                     </TableRow>
                   ))}

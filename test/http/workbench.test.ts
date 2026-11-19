@@ -195,7 +195,8 @@ describe('沙箱表', () => {
     const page = await (await analyst.get('/workbench')).text();
     const schema = /(sandbox_[0-9a-f]{32})\.my_customers/.exec(page)?.[1];
     expect(schema).toBeDefined();
-    expect(page).toMatch(/my_customers<\/td><td[^>]*>3<\/td>/);
+    // 表名单元格一行是不带沙箱前缀的表名、一行是查询里要用的全名，行数 3 仍在同一行（验收标准 1）
+    expect(page).toMatch(new RegExp(`my_customers</div><div[^>]*>${schema}\\.my_customers</div></td><td[^>]*>3</td>`));
 
     const read = await analyst.post('/workbench', { sql: `SELECT count(*) AS n FROM ${schema}.my_customers` });
     expect(await read.text()).toContain('1 行');
@@ -225,9 +226,11 @@ const shareAudits = async (action: 'sandbox.share' | 'sandbox.unshare') => getDb
   .where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, action)));
 /** 页面「分享给我的」面板的 HTML */
 const sharedPanel = (html: string) => html.split('data-shared-with-me')[1]?.split('</table>')[0] ?? '';
+/** 「我的沙箱表」里某一行分享表单的邮箱输入框（aria-label 带表名，每行唯一） */
+const shareInput = (html: string, table: string) => new RegExp(`<input[^>]*aria-label="把 ${table} 分享给"[^>]*>`).exec(html)?.[0] ?? '';
 
 describe('分享', () => {
-  it('主人分享后被分享人在「分享给我的」里看到并能读，写不了也覆盖不了；撤销后又读不到；分享与撤销记审计', async () => {
+  it('主人分享后被分享人在「分享给我的」里看到并能读，写不了也覆盖不了；撤销后又读不到；分享成功后这一行的邮箱输入框清空；分享与撤销记审计', async () => {
     const owner = await loginAs(app, 'an@acme.com');
     await owner.post('/workbench', { intent: 'save', name: 'shared_top', sql: 'SELECT customer_id FROM silver.customer ORDER BY 1 LIMIT 2' });
     const schema = sandboxOfPage(await (await owner.get('/workbench')).text(), 'shared_top')!;
@@ -243,12 +246,17 @@ describe('分享', () => {
 
     const shared = await owner.post('/workbench', { intent: 'share', name: 'shared_top', email: 'DE@acme.com ' });
     expect(shared.status).toBe(200);
-    expect(await shared.text()).toContain('已把 shared_top 分享给 de@acme.com');
-    expect(await (await owner.get('/workbench')).text()).toMatch(/shared_top<\/td>(?:(?!<\/tr>).)*de@acme\.com/s);
+    const sharedHtml = await shared.text();
+    expect(sharedHtml).toContain('已把 shared_top 分享给 de@acme.com');
+    // 分享成功：这一行的邮箱输入框清空（验收标准 2）
+    expect(shareInput(sharedHtml, 'shared_top')).not.toMatch(/value="[^"]/);
+    expect(await (await owner.get('/workbench')).text()).toMatch(/shared_top<\/div>(?:(?!<\/tr>).)*de@acme\.com/s);
     expect((await shareAudits('sandbox.share')).at(-1)).toMatchObject({ actorEmail: 'an@acme.com', detail: { name: 'shared_top', member: 'de@acme.com' } });
 
     const panel = sharedPanel(await (await engineer.get('/workbench')).text());
     expect(panel).toContain('an@acme.com');
+    // 「分享给我的」同样一行不带前缀的表名、一行全名（验收标准 1）
+    expect(panel).toContain('>shared_top</div>');
     expect(panel).toContain(`${schema}.shared_top`);
     const read = await engineer.post('/workbench', { sql: `SELECT count(*) AS n FROM ${schema}.shared_top` });
     expect(read.status).toBe(200);
@@ -273,7 +281,7 @@ describe('分享', () => {
     expect(sharedPanel(await (await engineer.get('/workbench')).text())).not.toContain('an@acme.com');
   });
 
-  it('只能分享给本租户有沙箱权限的成员；别人的表、过期的表分享不了；表过期或被分享人降为查看者后分享失效', async () => {
+  it('只能分享给本租户有沙箱权限的成员；别人的表、过期的表分享不了；失败时这一行的邮箱输入框保留刚填的邮箱；表过期或被分享人降为查看者后分享失效', async () => {
     const owner = await loginAs(app, 'an@acme.com');
     await owner.post('/workbench', { intent: 'save', name: 'rules_top', sql: 'SELECT 1 AS x' });
     const schema = sandboxOfPage(await (await owner.get('/workbench')).text(), 'rules_top')!;
@@ -291,7 +299,10 @@ describe('分享', () => {
     for (const [form, message] of refused) {
       const res = await owner.post('/workbench', { intent: 'share', ...form });
       expect(res.status, form.email).toBe(400);
-      expect(await res.text(), form.email).toContain(message);
+      const html = await res.text();
+      expect(html, form.email).toContain(message);
+      // 分享失败：这一行的邮箱输入框保留刚填的邮箱，方便修改（验收标准 2）
+      if (form.name === 'rules_top') expect(shareInput(html, 'rules_top'), form.email).toContain(`value="${form.email}"`);
     }
     // 别人的表：数据工程师有同名表也只能分享自己的
     const engineer = await loginAs(app, 'de@acme.com');
