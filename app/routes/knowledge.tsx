@@ -143,12 +143,14 @@ function Item({ item, active }: { item: HubItem; active: boolean }) {
 export default function Knowledge({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, hub, selected, subjectIds, canSuggest, suggested, packApplied, imported } = loaderData;
   // 生成建议同步调模型：生成期间禁用所有「生成建议」防止再起一次调用，只有被点的那组显示「生成中…」；
-  // 应用标准模板包同理禁用；面板里的提交（alias.add、proposal.accept 等）不影响这些按钮
+  // 应用标准模板包同理禁用。两个都是写提案的操作，互相也禁用（busy，#951）：不能同时生成；
+  // 面板里的提交（alias.add、proposal.accept 等）不影响这些按钮
   const navigation = useNavigation();
   const pendingSubject = navigation.state === 'submitting' && navigation.formData?.get('intent') === 'suggest'
     ? String(navigation.formData.get('subjectId'))
     : null;
   const pendingPack = navigation.state === 'submitting' && navigation.formData?.get('intent') === 'apply-pack';
+  const busy = pendingSubject !== null || pendingPack;
   const list = hub.groups.length === 0 ? (
     <section className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">
       <p className="inline-flex items-center gap-2"><CheckCircle2 className="size-4 text-emerald-600" />没有待确认的提案或缺失项。</p>
@@ -166,7 +168,7 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
               <Form method="post" className="ml-auto">
                 <input type="hidden" name="intent" value="suggest" />
                 <input type="hidden" name="subjectId" value={subjectIds[g.subject] ?? ''} />
-                <Button type="submit" variant="outline" size="sm" disabled={pendingSubject !== null}>
+                <Button type="submit" variant="outline" size="sm" disabled={busy}>
                   <Sparkles />{pendingSubject !== null && pendingSubject === subjectIds[g.subject] ? '生成中…' : '生成建议'}
                 </Button>
               </Form>
@@ -192,7 +194,7 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
             <Button asChild variant="outline"><Link to="/knowledge/import">粘贴导入</Link></Button>
             <Form method="post">
               <input type="hidden" name="intent" value="apply-pack" />
-              <Button type="submit" disabled={pendingPack}>
+              <Button type="submit" disabled={busy}>
                 <PackageCheck />{pendingPack ? '应用中…' : '应用标准模板包'}
               </Button>
             </Form>
