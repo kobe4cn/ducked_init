@@ -94,6 +94,7 @@ describe('需复核', () => {
     expect(newId).not.toBe(aliasId);
     const after = expand(await tenantCatalog(acme), target)!;
     expect(JSON.stringify(after)).not.toContain('needsReview');
+    expect(after.kind === 'metric' && after.knowledge).not.toHaveProperty('aliasesNeedReview');
     expect(after).toMatchObject({ knowledge: { aliases: ['营收'] } });
     // 生效别名数不变：旧行停用、同名新行生效，表里始终只有一个未停用的「营收」
     const rows = await getDb().select().from(knowledgeAliases).where(eq(knowledgeAliases.tenantId, acme));
