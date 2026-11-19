@@ -1,6 +1,6 @@
 # 模型调用
 
-An admin opens 模型调用 and sees this tenant's model calls for the last 7 or 30 days. The page groups them by purpose and shows calls, input and output tokens, average and P95 duration, schema pass rate, and error rate. A totals row is its own aggregate. Five metric cards sit on one row at 1440×900; the fifth is 调用来源 and splits this tenant's in-window calls into 租户 and 平台, with 未记录 only when a call has no source. The detail list is 50 rows per page, newest first. A data engineer, an analyst, and a viewer get HTTP 403 and have no nav entry. Another tenant's rows never appear. 测试连通性 on 模型服务 writes a row that then shows up here, including a failed call to an unreachable endpoint.
+An admin opens 模型调用 and sees this tenant's model calls for the last 7 or 30 days. The page groups them by purpose and shows calls, input and output tokens, average and P95 duration, schema pass rate, and error rate. A totals row is its own aggregate. Five metric cards sit on one row at 1440×900; the fifth is 调用来源 and splits this tenant's in-window calls into 租户 and 平台, with 未记录 only when a call has no source. The detail list is 50 rows per page, newest first. A data engineer, an analyst, and a viewer get HTTP 403 and have no nav entry. Another tenant's rows never appear. 测试连通性 on 模型服务 writes a row that then shows up here, including a failed call to an unreachable endpoint. Numbers and dates that follow the UI language are [llm-usage-locale.md](./llm-usage-locale.md), not this file.
 
 ## Sub-features
 
