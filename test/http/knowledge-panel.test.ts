@@ -183,6 +183,12 @@ describe('业务知识面板', () => {
     expect(chip).toContain(`name="aliasId" value="${alias!.id}"`);
     expect(chip.indexOf('value="alias.confirm"')).toBeLessThan(chip.indexOf('value="alias.retire"'));
 
+    // 查看者：同一个待复核的别名，看不到「确认」按钮，也没有任何按钮
+    const viewerPanel = await panelOf(await loginAs(app, 'view@acme.com'), METRIC);
+    expect(viewerPanel).toMatch(/data-alias="营收"[^>]*data-needs-review/);
+    expect(viewerPanel).not.toContain('value="alias.confirm"');
+    expect(viewerPanel).not.toContain('<button');
+
     expect((await post({ intent: 'alias.confirm', aliasId: alias!.id })).status).toBe(302);
     panel = await panelOf(an, METRIC);
     expect(panel).toContain('data-alias="营收"');
