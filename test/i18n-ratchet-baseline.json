@@ -8,7 +8,7 @@
     "app/.server/assistant/loop.ts": 24,
     "app/.server/assistant/plan-card.ts": 3,
     "app/.server/assistant/tools.ts": 60,
-    "app/.server/audit.ts": 186,
+    "app/.server/audit.ts": 187,
     "app/.server/auth.ts": 5,
     "app/.server/background.ts": 1,
     "app/.server/business-notes.ts": 7,
@@ -127,7 +127,7 @@
     "app/.server/totp.ts": 2,
     "app/.server/uploads.ts": 5,
     "app/.server/workbench-ai.ts": 19,
-    "app/.server/workbench.ts": 32,
+    "app/.server/workbench.ts": 16,
     "app/components/app-shell.tsx": 3,
     "app/components/assistant-panel.tsx": 33,
     "app/components/custom-entity-form.tsx": 35,
@@ -222,6 +222,6 @@
     "app/routes/source.tsx": 180,
     "app/routes/sources.tsx": 21,
     "app/routes/tasks.tsx": 21,
-    "app/routes/workbench.tsx": 64
+    "app/routes/workbench.tsx": 68
   }
 }
