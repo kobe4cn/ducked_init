@@ -1,18 +1,20 @@
 // test/pipeline/llm.test.ts —— 模型服务客户端（ADR-0035）：按租户配置 > 平台默认（环境变量）解析端点，chatJson → 注入的假 fetch → platform.llm_calls 的调用日志；
+// LLM_CHAT_EXTRA（#952）：服务商参数合并进 chat 请求体（平台字段不被覆盖、档位 LLM_<TIER>_CHAT_EXTRA 覆盖默认），不是合法 JSON 对象时调用失败并记 error；
+// LLM_TIMEOUT_SECONDS（#952）：控制 chat 超时与超时消息里的秒数，不是正整数时回落 60；
 // embedding 端点（ADR-0049）：租户 embedding 三项 > 平台 LLM_EMBEDDING_*（与 chat 互不影响），都没配置时 embed 返回 null；
 // tableContextFor：采集统计 + 允许时原始层的脱敏样本行
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { llmCalls, modelProviders } from '../../app/.server/db/schema';
-import { chatJson, embed, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch } from '../../app/.server/llm';
+import { chatJson, chatTools, embed, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch } from '../../app/.server/llm';
 import { tableContextFor } from '../../app/.server/model-provider';
 import { encryptForTenant } from '../../app/.server/secrets';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
-import { embeddings, fakeLlm, json, platformDefault, platformEmbedding, platformTier } from './llm-fixtures';
+import { embeddings, fakeLlm, json, platformDefault, platformEmbedding, platformTier, text } from './llm-fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -141,6 +143,79 @@ describe('模型服务客户端', () => {
     const logged = JSON.stringify(rows);
     expect(logged).not.toContain('13800138000');
     expect(logged).not.toContain('13900139000');
+  });
+
+  it('LLM_CHAT_EXTRA 合并进 /chat/completions 请求体，档位 LLM_<TIER>_CHAT_EXTRA 覆盖默认，平台字段不被覆盖', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    // extra 里写了平台字段也会被删掉：model / messages / response_format / tools / tool_choice / temperature 不能被服务商参数覆盖
+    vi.stubEnv('LLM_CHAT_EXTRA', JSON.stringify({
+      enable_thinking: false, top_p: 0.9,
+      model: 'evil-model', messages: [], response_format: { type: 'text' },
+      tools: [{ type: 'function', function: { name: 'evil' } }], tool_choice: 'none', temperature: 1,
+    }));
+    const TOOL = { name: 'lookup_metric', description: '查指标', parameters: { type: 'object' } };
+    // chatJson 的请求体带 response_format，chatTools 的带 tools：按哪个分流答复
+    const { received } = fakeLlm(setLlmFetch, (n, body) => 'response_format' in body ? json({ table: 'orders' }, USAGE) : text('好的'));
+
+    await chatJson(acme, 'connectivity', MESSAGES, SCHEMA);
+    await chatTools(acme, 'assistant', MESSAGES, [TOOL]);
+    expect(received[0].body).toEqual({
+      enable_thinking: false, top_p: 0.9,
+      model: 'qwen-plus', messages: MESSAGES, response_format: { type: 'json_object' }, temperature: 0,
+    });
+    // chatTools 不带 response_format，tools 是平台给的、不是 extra 里的 evil
+    expect(received[1].body).toEqual({
+      enable_thinking: false, top_p: 0.9, model: 'qwen-plus', messages: MESSAGES,
+      tools: [{ type: 'function', function: TOOL }], tool_choice: 'auto', temperature: 0,
+    });
+
+    // fast 档绑了模型后 LLM_FAST_CHAT_EXTRA 覆盖默认 extra：默认的 top_p 不再出现
+    platformTier('fast', 'qwen3.8-flash');
+    vi.stubEnv('LLM_FAST_CHAT_EXTRA', JSON.stringify({ enable_thinking: false, top_k: 5 }));
+    await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
+    expect(received[2].body).toEqual({
+      enable_thinking: false, top_k: 5,
+      model: 'qwen3.8-flash', messages: MESSAGES, response_format: { type: 'json_object' }, temperature: 0,
+    });
+  });
+
+  it('LLM_CHAT_EXTRA 不是合法的 JSON 对象时调用失败：报配置错误、不发请求，消息与日志里没有 Key 与原文', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    // {bad 不是 JSON，[1] 是 JSON 但不是对象（数组、null、标量都算）
+    for (const raw of ['{bad', '[1]']) {
+      vi.stubEnv('LLM_CHAT_EXTRA', raw);
+      const { f } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+      const err = await failure(chatJson(acme, 'connectivity', MESSAGES, SCHEMA)) as LlmError;
+      expect(err).toBeInstanceOf(LlmError);
+      expect(err.transient).toBe(false);
+      expect(err.message).toBe('模型服务配置错误：LLM_CHAT_EXTRA 不是合法的 JSON 对象');
+      expect(err.message).not.toContain('sk-platform-secret');
+      expect(err.message).not.toContain(raw);
+      expect(f).not.toHaveBeenCalled();
+      const rows = await calls(acme);
+      expect(rows.at(-1)).toMatchObject({ purpose: 'connectivity', model: 'qwen-plus', error: '模型服务配置错误：LLM_CHAT_EXTRA 不是合法的 JSON 对象' });
+      expect(rows.at(-1)!.error).not.toContain(raw);
+    }
+    expect(await calls(acme)).toHaveLength(2);
+  });
+
+  it('LLM_TIMEOUT_SECONDS 控制 chat 超时，超时消息里的秒数跟着变；不是正整数时回落 60', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    // 假 fetch 同步 throw TimeoutError，不会真的等：断言的是超时消息里的秒数跟着环境变量走
+    for (const [seconds, message] of [['5', /5 秒内没有返回/], ['abc', /60 秒内没有返回/]] as const) {
+      vi.stubEnv('LLM_TIMEOUT_SECONDS', seconds);
+      fakeLlm(setLlmFetch, () => { throw new DOMException('signal timed out', 'TimeoutError'); });
+
+      const err = await failure(chatJson(acme, 'connectivity', MESSAGES, SCHEMA)) as LlmError;
+      expect(err).toBeInstanceOf(LlmError);
+      expect(err.transient).toBe(true);
+      expect(err.message).toMatch(message);
+      expect((await calls(acme)).at(-1)).toMatchObject({ purpose: 'connectivity', error: expect.stringMatching(message) });
+    }
   });
 });
 
