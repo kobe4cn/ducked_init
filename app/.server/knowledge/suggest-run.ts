@@ -97,8 +97,9 @@ export async function suggestForSubject(actor: CurrentMember, subjectId: string)
     throw new SuggestError(`按主题生成提案失败：${e.message}`, 422);
   }
 
-  // 不合法的条目（引用输入外、目标不在集合、类型取值不配对、空白超上限）在这里就被丢掉，proposeMany 的 invalid 只是库里再拦下的
-  const inputs = outputToProposals(output, input);
+  // 不合法的条目（引用输入外、目标不在集合、类型取值不配对、空白超上限）在这里就被丢掉并记下目标与原因（写进审计 detail 的 dropped），
+  // proposeMany 的 invalid 只是库里再拦下的
+  const { inputs, dropped } = outputToProposals(output, input);
   // invalid 按丢已知之前的条数算（被丢掉的不再同时计进 invalid），已知部分不再交给 proposeMany
   const { inputs: notKnown, skipped } = dropKnown(inputs, catalog.entries);
   // 落库前兜底：与生成前待处理 / 已拒绝的提案重复的不再写，跳过的条数计进 existing（集中页「跳过」的一部分）
@@ -111,9 +112,14 @@ export async function suggestForSubject(actor: CurrentMember, subjectId: string)
       proposalCount: r.created.length, createdByEmail: actor.email,
     }).onConflictDoNothing();
     const invalid = output.proposals.length - inputs.length + r.invalid.length;
+    // 被丢条目只记目标与原因（最多前 20 条），不记提案内容；没有丢弃时不写 dropped 这个键
+    const detail: Record<string, unknown> = {
+      subjectId: subject.id, created: r.created.length, existing: r.existing + pendingSkipped,
+      rejected: r.rejected, invalid, stale: r.stale, skipped,
+    };
+    if (dropped.length > 0) detail.dropped = dropped.slice(0, 20);
     await recordAudit(tx, {
-      tenantId, actor, action: 'knowledge_proposal.generated', targetType: 'analysis_subject', targetId: subject.id,
-      detail: { subjectId: subject.id, created: r.created.length, existing: r.existing + pendingSkipped, rejected: r.rejected, invalid, stale: r.stale, skipped },
+      tenantId, actor, action: 'knowledge_proposal.generated', targetType: 'analysis_subject', targetId: subject.id, detail,
     });
     return { ...r, existing: r.existing + pendingSkipped, invalid };
   });
