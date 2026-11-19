@@ -23,8 +23,8 @@ export interface DropKnownResult { inputs: ProposalInput[]; skipped: number }
 /** 参与比较的成员声明：需复核的取值已被改成 unknown（原值在 previous），不知道成员写的是什么，不比 */
 const comparableClaims = (claims: Claim[] | undefined): Claim[] => (claims ?? []).filter(c => !c.needsReview);
 
-/** 提案内容按 Record 取键（形状由 outputToProposals 保证，这里只取要比较的键，取不到按不同处理） */
-const asRecord = (content: unknown): Record<string, unknown> => (content && typeof content === 'object' ? content as Record<string, unknown> : {});
+/** 提案内容按 Record 取键（形状由 outputToProposals 保证，这里只取要比较的键，取不到按不同处理；suggest 的 dropPending 也用） */
+export const asRecord = (content: unknown): Record<string, unknown> => (content && typeof content === 'object' ? content as Record<string, unknown> : {});
 
 /** 这条提案和目标上已生效的知识相同：接受了也不会带来任何变化，不该再提 */
 function isKnown(input: ProposalInput, byId: Map<string, CatalogEntry>): boolean {
