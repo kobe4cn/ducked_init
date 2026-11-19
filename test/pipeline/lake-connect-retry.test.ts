@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { lakeConnectRetries, lakeConnectTimeout, openTenantLake, type EngineLimits, type LakeSpec } from '../../app/.server/pipeline/lake-engine';
+import { lakeCatalogAttachUrl, lakeConnectRetries, lakeConnectTimeout, openTenantLake, type EngineLimits, type LakeSpec } from '../../app/.server/pipeline/lake-engine';
 
 // 压测 DuckDB 实例给小资源（照 source-connect-retry.test.ts）：建连路径用不了多少内存与线程
 const limits: EngineLimits = { memoryLimitMb: 256, threads: 1 };
@@ -121,5 +121,23 @@ describe('湖 catalog 建连超时秒数与重试次数的解析', () => {
     expect(lakeConnectRetries({ LAKE_CONNECT_RETRIES: 'abc' })).toBe(0);
     expect(lakeConnectRetries({ LAKE_CONNECT_RETRIES: '-1' })).toBe(0);
     expect(lakeConnectRetries({ LAKE_CONNECT_RETRIES: '1.5' })).toBe(0);
+  });
+});
+
+describe('湖 catalog ATTACH 用的 URL（拼 connect_timeout）', () => {
+  it('已有查询参数原样保留（%20 不变成 +），末尾追加 &connect_timeout', () => {
+    const url = 'postgres://u:p@127.0.0.1:5432/db?options=-c%20search_path%3Dx';
+    const out = lakeCatalogAttachUrl(url, 15);
+    expect(out).toContain('options=-c%20search_path%3Dx');
+    expect(out).toBe(`${url}&connect_timeout=15`);
+  });
+
+  it('没有查询串时追加 ?connect_timeout', () => {
+    expect(lakeCatalogAttachUrl('postgres://u:p@127.0.0.1:5432/db', 15)).toBe('postgres://u:p@127.0.0.1:5432/db?connect_timeout=15');
+  });
+
+  it('超时为 undefined 时 URL 原样返回', () => {
+    const url = 'postgres://u:p@127.0.0.1:5432/db?options=-c%20search_path%3Dx';
+    expect(lakeCatalogAttachUrl(url, undefined)).toBe(url);
   });
 });
