@@ -1,12 +1,13 @@
 // app/components/app-shell.tsx —— 登录后页面的外壳：白色顶栏（品牌、按模块分组的胶囊导航（分组是 <details> 下拉，不用 JS 也能开合，路径变化后重新挂载为收起）、
-// AI 助手、头像首字母（链到「我的设置」）、退出登录），内容铺满宽度；
-// 运营后台不是租户成员，不显示 AI 助手（assistant={false}），头像也不是链接（settingsHref={null}）
+// AI 助手、界面语言菜单、头像首字母（链到「我的设置」）、退出登录），内容铺满宽度；
+// 运营后台不是租户成员，不显示 AI 助手（assistant={false}）、语言菜单与头像链接（settingsHref={null}）
 import { Form, Link, useLocation } from 'react-router';
 import { LogOut } from 'lucide-react';
 import { activeGroupLabel, activeNavTo, flattenNav, type NavEntry } from '~/lib/nav';
 import { cn } from '~/lib/utils';
 import { Button } from '~/components/ui/button';
 import { AssistantPanel } from '~/components/assistant-panel';
+import { LocaleSwitch } from '~/components/locale-switch';
 
 export type { NavItem } from '~/lib/nav';
 
@@ -68,6 +69,7 @@ export function AppShell({ email, nav, children, brand = 'CRM 数据分析平台
           </div>
           <div className="flex items-center gap-3 text-sm text-slate-500">
             {assistant && <AssistantPanel />}
+            {settingsHref && <LocaleSwitch />}
             {settingsHref ? (
               <Link to={settingsHref} title={`我的设置（${email}）`} aria-label={`我的设置（${email}）`} className={avatarClass}>
                 {email[0]?.toUpperCase()}

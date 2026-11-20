@@ -8,6 +8,7 @@ import { getLocale } from '~/.server/locale';
 import { makeT, msg, useT } from '~/lib/i18n';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
+import { LocaleSwitch } from '~/components/locale-switch';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '~/components/ui/card';
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
@@ -42,7 +43,8 @@ export default function Login({ actionData }: Route.ComponentProps) {
   const t = useT();
   const submitting = useNavigation().state === 'submitting';
   return (
-    <main className="flex min-h-svh items-center justify-center bg-muted p-6">
+    <main className="relative flex min-h-svh items-center justify-center bg-muted p-6">
+      <div className="absolute right-6 top-6"><LocaleSwitch /></div>
       <Card className="w-full max-w-sm">
         <CardHeader>
           <CardTitle className="text-xl">{t('登录 CRM 数据分析平台')}</CardTitle>
