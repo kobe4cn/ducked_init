@@ -1,5 +1,6 @@
 // test/pipeline/sandbox-expire.test.ts —— 沙箱表过期的流水线接缝：saveAsSandbox 存下的沙箱表到期（直接把 expiresAt 改到过去）→ enqueueDueSandboxExpiries →
-// 调度器派发 sandbox.expire → 湖里的表、parquet 文件与内联在 catalog 的行、平台元数据里的 expiredAt 与分享、工作台的列表与查询
+// 调度器派发 sandbox.expire → 湖里的表、parquet 文件与内联在 catalog 的行、平台元数据里的 expiredAt 与分享、工作台的列表与查询。
+// 主人提前删除（dropSandboxTable）把湖表改名成保留名 _d<8hex> 再按改名后的名字入队：任务排队时同名保存马上成功，新表不会被删
 import { existsSync } from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -8,13 +9,17 @@ import { auditLogs, sandboxTables, tasks } from '../../app/.server/db/schema';
 import { lakeRow } from '../../app/.server/lake';
 import { enqueueDueSandboxExpiries, lockForSave } from '../../app/.server/sandbox';
 import { enqueueTask } from '../../app/.server/tasks';
-import { dropSandboxTable, listSandboxTables, listSharedWithMe, runQuery, sandboxSchema, saveAsSandbox, shareSandboxTable } from '../../app/.server/workbench';
+import { dropSandboxTable, listCatalog, listSandboxTables, listSharedWithMe, runQuery, sandboxSchema, saveAsSandbox, shareSandboxTable } from '../../app/.server/workbench';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, onLake, runTask } from './fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 const ROWS = 'SELECT * FROM (VALUES (1, \'a\'), (2, \'b\'), (3, \'c\')) t(id, label)';
+/** 比 ROWS 多一行：删除后同名再保存的新表用它，行数能和旧表区分 */
+const ROWS4 = 'SELECT * FROM (VALUES (1, \'a\'), (2, \'b\'), (3, \'c\'), (4, \'d\')) t(id, label)';
+/** 删除中的沙箱表在湖里改成的保留名：原名加 _d 与 8 位十六进制 */
+const DROPPED = /_d[0-9a-f]{8}$/;
 
 /** 把成员的这张沙箱表登记为已到期 */
 const expire = (memberId: string, name: string) => getDb().update(sandboxTables).set({ expiresAt: new Date(Date.now() - 60_000) })
@@ -120,7 +125,7 @@ describe('沙箱表过期', () => {
     expect(await enqueueDueSandboxExpiries()).toEqual([acme]);
   });
 
-  it('主人提前删除（dropSandboxTable）：列表与被分享人的「分享给我的」立刻看不到，入队 sandbox.expire 删表清文件、标记 expiredAt；任务前同名保存被拒，清理后同名再存是新表不带旧分享；别人的表 404，已删的再删 404、不重复入队，别的成员同名表不受影响', async () => {
+  it('主人提前删除（dropSandboxTable）：列表与被分享人的「分享给我的」立刻看不到，湖表改名成保留名后 SHOW TABLES、目录树不列出、查它报不存在、保留名不能保存；删除任务排队时同名保存马上成功，任务跑完新表还在（新行数、新过期时间、无旧分享）、旧表与 parquet 文件被清掉；别人的表 404，已删的再删 404、不重复入队，别的成员同名表不受影响', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     const engineer = await memberOf(acme, 'de@acme.com');
@@ -135,34 +140,53 @@ describe('沙箱表过期', () => {
 
     await dropSandboxTable(analyst, 'filed');
 
-    // 不等任务跑完：我的沙箱表与被分享人的「分享给我的」都不再列出（验收标准 1）
+    // 不等任务跑完：我的沙箱表与被分享人的「分享给我的」都不再列出，登记行标记 expiredAt（验收标准 1、3）
     expect((await listSandboxTables(analyst)).map(t => t.name)).toEqual(['keep']);
     expect(await listSharedWithMe(engineer)).toEqual([]);
-    // 删除任务排队或运行时同名保存被拒（验收标准 2）
-    await expect(saveAsSandbox(analyst, 'filed', ROWS)).rejects.toThrow('这张沙箱表正在删除或清理');
-    await saveAsSandbox(analyst, 'other', ROWS);
-
-    await drain();
-
-    // 湖里的表与 parquet 文件清掉，平台库标记 expiredAt（验收标准 2）
-    const lakeTables = await onLake<{ schema: string; name: string }>(acme, `
-      SELECT table_schema AS schema, table_name AS name FROM information_schema.tables
-      WHERE table_catalog = 'lake' AND table_schema LIKE 'sandbox_%' ORDER BY ALL`);
-    expect(lakeTables).toHaveLength(3);
-    expect(lakeTables).toEqual(expect.arrayContaining([
-      { schema: sandboxSchema(engineer.memberId), name: 'filed' }, { schema: mine, name: 'keep' }, { schema: mine, name: 'other' },
-    ]));
-    expect(files.filter(f => existsSync(f.path))).toEqual([]);
     const [dropped] = await getDb().select().from(sandboxTables)
       .where(and(eq(sandboxTables.tenantId, acme), eq(sandboxTables.memberId, analyst.memberId), eq(sandboxTables.name, 'filed')));
     expect(dropped.expiredAt).toEqual(expect.any(Date));
-
-    // 已删（已清理）的表再删也是 404，不重复入队（验收标准 3）
+    // 已删的再删 404，不重复入队（验收标准 3）
     await expect(dropSandboxTable(analyst, 'filed')).rejects.toMatchObject({ status: 404, message: '没有沙箱表 filed' });
+    expect(await getDb().select({ id: tasks.id }).from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'sandbox.expire')))).toHaveLength(1);
 
-    // 清理后同名再保存：一张新表，不沿用旧分享（验收标准 2）
-    await saveAsSandbox(analyst, 'filed', ROWS);
+    // 湖里的表已改名成保留名：主人的 SHOW TABLES、目录树都不列出，直接查它报「不存在或没有权限」（验收标准 3）
+    const renamedTables = await onLake<{ name: string }>(acme, `
+      SELECT table_name AS name FROM information_schema.tables
+      WHERE table_catalog = 'lake' AND table_schema = '${mine}' AND table_name ~ '^filed_d[0-9a-f]{8}$'`);
+    expect(renamedTables).toHaveLength(1);
+    const shown = (await runQuery(analyst, 'SHOW TABLES')).rows.map(r => String(r[1]));
+    expect(shown.filter(n => DROPPED.test(n))).toEqual([]);
+    expect(shown).toContain('keep');
+    expect((await listCatalog(analyst)).mine.map(t => t.name)).toEqual(['keep']);
+    await expect(runQuery(analyst, `SELECT * FROM ${mine}."${renamedTables[0]!.name}"`)).rejects.toThrow('不存在或没有权限');
+    // 以 _d 加 8 位十六进制结尾的名字是保留名，不能保存
+    await expect(saveAsSandbox(analyst, 'keep_d1234abcd', ROWS)).rejects.toThrow('保留名');
+
+    // 删除任务还排着队（不调 drain）：同名保存马上成功，得到一张新表（验收标准 1）
+    await saveAsSandbox(analyst, 'filed', ROWS4);
+    await saveAsSandbox(analyst, 'other', ROWS);
     expect((await listSandboxTables(analyst)).map(t => t.name)).toEqual(['filed', 'keep', 'other']);
+
+    await drain();
+
+    // 任务跑完：新表还在、能读，行数是新的（4 行）；改名后的旧表与 parquet 文件被清掉（验收标准 2）
+    expect((await runQuery(analyst, `SELECT count(*) AS n FROM ${mine}.filed`)).rows).toEqual([['4']]);
+    const lakeTables = await onLake<{ schema: string; name: string }>(acme, `
+      SELECT table_schema AS schema, table_name AS name FROM information_schema.tables
+      WHERE table_catalog = 'lake' AND table_schema LIKE 'sandbox_%' ORDER BY ALL`);
+    expect(lakeTables).toHaveLength(4);
+    expect(lakeTables).toEqual(expect.arrayContaining([
+      { schema: sandboxSchema(engineer.memberId), name: 'filed' }, { schema: mine, name: 'keep' },
+      { schema: mine, name: 'other' }, { schema: mine, name: 'filed' },
+    ]));
+    expect(lakeTables.filter(t => DROPPED.test(t.name))).toEqual([]);
+    expect(files.filter(f => existsSync(f.path))).toEqual([]);
+    // 新登记：expiredAt 为空、过期时间重新约 7 天后，没有旧分享（验收标准 1）
+    const [resaved] = await getDb().select().from(sandboxTables)
+      .where(and(eq(sandboxTables.tenantId, acme), eq(sandboxTables.memberId, analyst.memberId), eq(sandboxTables.name, 'filed')));
+    expect(resaved!.expiredAt).toBeNull();
+    expect(resaved!.expiresAt.getTime()).toBeGreaterThan(Date.now() + 6 * 86_400_000);
     expect(await listSharedWithMe(engineer)).toEqual([]);
 
     // 只有主人能删：别人的表（哪怕是同名的）404（验收标准 3）

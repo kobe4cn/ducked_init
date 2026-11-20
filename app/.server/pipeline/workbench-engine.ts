@@ -4,7 +4,8 @@
 // 读别人没分享的沙箱表时，表在与不在报同样的话。
 // 会话里还挂着可写的本机库 stage 与 DuckLake 的元数据库 __ducklake_metadata_lake（里面有加密密钥，ADR-0020），
 // 表函数、SHOW DATABASES 之类与读配置的函数一律拒绝。
-// 保存沙箱表在可写挂载上执行：成员只给表名与一条校验过的 SELECT，CREATE 语句由这里拼出，只写进成员自己的沙箱。
+// 保存沙箱表在可写挂载上执行：成员只给表名与一条校验过的 SELECT，CREATE 语句由这里拼出，只写进成员自己的沙箱；
+// 以 _d 加 8 位十六进制结尾的是删除中的保留名（DROPPED_TABLE_NAME，见 workbench.ts 的 dropSandboxTable）：不能保存，也不列出、读不到。
 // 目录树（listReadableTables）按同一个允许集合列出能读的表与字段。
 // 原始层只给回放后的当前状态（mountRawSources）：每个数据源一个以数据源名命名的内存 catalog，每张表一个视图，敏感列是加盐哈希（ADR-0005），
 // 盐放在默认库 memory 的一张表里由视图读取，不写进视图定义（EXPLAIN 会展开视图）；lake.bronze_* 照旧拒绝
@@ -25,6 +26,10 @@ const SANDBOX_SCHEMA = /^sandbox_[0-9a-f]{32}$/;
 
 /** 沙箱表名：小写字母开头，小写字母、数字、下划线，最长 63 个字符 */
 export const SANDBOX_TABLE_NAME = /^[a-z][a-z0-9_]{0,62}$/;
+
+/** 删除中的沙箱表在湖里改成的名字（workbench.ts 的 dropSandboxTable 生成：原名截到 53 字符再加 _d 与 8 位十六进制，最长 63）。
+ *  以它结尾的表名是保留名：不能保存，自己的 SHOW TABLES、目录树与查询都看不到（改名后的表等 sandbox.expire 删掉） */
+export const DROPPED_TABLE_NAME = /_d[0-9a-f]{8}$/;
 
 /** 别人分享给成员的一张沙箱表：主人的沙箱 schema 与表名 */
 export interface SandboxTableRef { schema: string; table: string }
@@ -61,13 +66,13 @@ const ALLOWED_SHOWS = new Set(['DESCRIBE', 'SUMMARY']);
 /** SHOW TABLES、SHOW ALL TABLES 与不带对象的 DESCRIBE 在解析树里的表名 */
 const SHOW_TABLES = new Set(['"tables"', '__show_tables_expanded']);
 
-/** 能读的表的过滤条件：schema 在 schemas 里，或是 shared 里的表（列名由调用方给出） */
-const readableWhere = (schemaCol: string, tableCol: string, schemas: readonly string[], shared: readonly SandboxTableRef[]) =>
-  `(${schemaCol} IN (${schemas.map(lit).join(', ')})${shared.map(t => ` OR (${schemaCol} = ${lit(t.schema)} AND ${tableCol} = ${lit(t.table)})`).join('')})`;
+/** 能读的表的过滤条件：schema 在 schemas 里，或是 shared 里的表（列名由调用方给出）；sandbox 给出时排除自己沙箱里删除中改名的保留表 */
+const readableWhere = (schemaCol: string, tableCol: string, schemas: readonly string[], shared: readonly SandboxTableRef[], sandbox?: string) =>
+  `(${schemaCol} IN (${schemas.map(lit).join(', ')})${shared.map(t => ` OR (${schemaCol} = ${lit(t.schema)} AND ${tableCol} = ${lit(t.table)})`).join('')}${sandbox ? ` AND NOT (${schemaCol} = ${lit(sandbox)} AND regexp_matches(${tableCol}, ${lit(DROPPED_TABLE_NAME.source)}))` : ''})`;
 
-/** 列出能读的表（shared 是分享来的表，SHOW TABLES 时一并列出）：代替 SHOW TABLES（原样执行会列出 stage 与元数据库里的表） */
-const listTablesSql = (schemas: readonly string[], shared: readonly SandboxTableRef[] = []) => `SELECT table_schema AS schema, table_name AS name, table_type AS type
-  FROM information_schema.tables WHERE table_catalog = 'lake' AND ${readableWhere('table_schema', 'table_name', schemas, shared)} ORDER BY 1, 2`;
+/** 列出能读的表（shared 是分享来的表，SHOW TABLES 时一并列出；sandbox 是自己的沙箱 schema，保留表不列）：代替 SHOW TABLES（原样执行会列出 stage 与元数据库里的表） */
+const listTablesSql = (schemas: readonly string[], shared: readonly SandboxTableRef[] = [], sandbox?: string) => `SELECT table_schema AS schema, table_name AS name, table_type AS type
+  FROM information_schema.tables WHERE table_catalog = 'lake' AND ${readableWhere('table_schema', 'table_name', schemas, shared, sandbox)} ORDER BY 1, 2`;
 
 /** 可读 schema：silver、gold 与成员自己的沙箱（给了时） */
 const readableSchemas = (sandbox?: string): readonly string[] => sandbox ? [...WORKBENCH_SCHEMAS, sandbox] : WORKBENCH_SCHEMAS;
@@ -109,7 +114,7 @@ export async function checkWorkbenchSql(con: DuckDBConnection, sql: string, { sa
   if (tree.statements?.length !== 1) throw new WorkbenchSqlError(ALLOWED_STATEMENTS);
   if (!explain) {
     const listed = showTablesOf(tree.statements[0], schemas, hint);
-    if (listed) return { sql: listTablesSql(listed.schemas, listed.all ? shared : []), savable: false };
+    if (listed) return { sql: listTablesSql(listed.schemas, listed.all ? shared : [], sandbox), savable: false };
   }
   const found = collectRefs(tree.statements, { allowedShows: ALLOWED_SHOWS });
   if (found.forbidden.length) throw new WorkbenchSqlError(`不能用 ${[...new Set(found.forbidden)].join('、')}，${hint}的表`);
@@ -124,7 +129,8 @@ export async function checkWorkbenchSql(con: DuckDBConnection, sql: string, { sa
     if (rawRef) continue;
     if (t.catalog && t.catalog.toLowerCase() !== 'lake') throw new WorkbenchSqlError(`${hint}，不能读 ${name}`);
     if (shared.some(s => s.schema === schema && s.table === t.table.toLowerCase())) continue;
-    if (schema.startsWith('sandbox_') && schema !== sandbox) throw new WorkbenchSqlError(`表 ${name} 不存在或没有权限`);
+    // 别人没分享的沙箱表与自己沙箱里删除中改名的保留表同样对待：表在与不在报同一句话
+    if (schema.startsWith('sandbox_') && (schema !== sandbox || DROPPED_TABLE_NAME.test(t.table.toLowerCase()))) throw new WorkbenchSqlError(`表 ${name} 不存在或没有权限`);
     if (!schemas.includes(schema)) {
       throw new WorkbenchSqlError(t.schema
         ? `${hint}，不能读 ${name}`
@@ -145,7 +151,7 @@ export async function listReadableTables(con: DuckDBConnection, { sandbox, share
   const rows = (await con.runAndReadAll(`SELECT t.schema_name AS schema, t.table_name AS name, t.estimated_size AS rows,
       list({'name': c.column_name, 'type': c.data_type} ORDER BY c.column_index) AS columns
     FROM duckdb_tables() t JOIN duckdb_columns() c USING (database_name, schema_name, table_name)
-    WHERE t.database_name = 'lake' AND ${readableWhere('t.schema_name', 't.table_name', readableSchemas(sandbox), shared)}
+    WHERE t.database_name = 'lake' AND ${readableWhere('t.schema_name', 't.table_name', readableSchemas(sandbox), shared, sandbox)}
     GROUP BY ALL ORDER BY 1, 2`)).getRowObjectsJson() as unknown as (Omit<CatalogTable, 'rows'> & { rows: string | number })[];
   return rows.map(r => ({ ...r, rows: Number(r.rows) }));
 }
@@ -238,12 +244,13 @@ export async function runWorkbenchQuery(con: DuckDBConnection, query: CheckedQue
 
 /**
  * 把校验过的 SELECT 存为成员沙箱里的表 lake.<schema>."<name>"（同名表覆盖），返回行数。
- * query 必须是同一会话里 checkWorkbenchSql 的结果；schema 由 sandboxSchema 给出，表名不合规时抛出 WorkbenchSqlError。
+ * query 必须是同一会话里 checkWorkbenchSql 的结果；schema 由 sandboxSchema 给出，表名不合规或是删除中的保留名（DROPPED_TABLE_NAME）时抛出 WorkbenchSqlError。
  * 拼出的语句再交给 DuckDB 拆分，确认仍是一条，才执行
  */
 export async function saveSandboxTable(con: DuckDBConnection, schema: string, name: string, query: CheckedQuery): Promise<number> {
   if (!SANDBOX_SCHEMA.test(schema)) throw new Error(`不是沙箱 schema：${schema}`);
   if (!SANDBOX_TABLE_NAME.test(name)) throw new WorkbenchSqlError('表名只能用小写字母、数字和下划线，以小写字母开头，最长 63 个字符');
+  if (DROPPED_TABLE_NAME.test(name)) throw new WorkbenchSqlError('以 _d 加 8 位十六进制结尾的表名是保留名，请换个表名');
   if (!query.savable) throw new WorkbenchSqlError('只能把 SELECT / WITH 查询的结果保存为沙箱表');
   const table = `lake."${schema}"."${name}"`;
   const create = `CREATE OR REPLACE TABLE ${table} AS ${query.sql}`;

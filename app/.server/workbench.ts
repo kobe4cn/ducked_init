@@ -3,12 +3,14 @@
 // 查询的挂载用本租户的只读数据库角色与只读对象存储账号，凭据本身写不进 catalog 与存储；
 // 把查询结果保存为个人沙箱表时用可写挂载，CREATE 语句由平台拼出、只写进成员自己的 sandbox_<成员>，并在平台库登记（保存后 SANDBOX_TTL_DAYS 天过期）。
 // 表的主人可以把沙箱表只读分享给本租户有沙箱权限的成员；每次查询都按被分享人当前的角色与分享登记重新算能读的表，不缓存。
-// 表的主人也可以提前删除自己的沙箱表（dropSandboxTable）：撤销分享、过期时间设为现在并入队 sandbox.expire 清理湖里的表与旧文件（#970）。
+// 表的主人也可以提前删除自己的沙箱表（dropSandboxTable）：在与查询同一把并发锁、可写挂载下把湖里的表改名成保留名（_d 加 8 位十六进制，
+// 不再列出、读不到），撤销分享、登记行标记 expiredAt，并按改名后的名字入队 sandbox.expire 清理湖里的表与旧文件，删除后马上可以同名再存（#970、#981）。
 // 目录树（listCatalog）用同一套只读凭据挂载、按同一个允许集合列出表与字段，由平台查询，不拿并发锁、不记审计。
 // 原始层只给回放后的当前状态：每次挂载都按此刻的数据源名现建内存 catalog 与视图（数据源改名后别名随之变化），敏感列是加盐哈希，
 // 采集时像敏感信息的列取自数据源的列统计（与源视图预览同一套规则，ADR-0005）；报错里抹掉盐。
 // 每个租户同时只有一个交互查询（PG 事务级 advisory lock，持有到查询结束），不经任务队列、不占正式任务名额；
 // 超时或客户端中止请求时 interrupt 本进程里的这个查询。每次查询都记审计（SQL、耗时、行数，失败时加原因），不记查询结果
+import { randomBytes } from 'node:crypto';
 import { and, asc, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
 import { assertCan, can } from './access';
 import { recordAudit, type AuditAction, type Tx } from './audit';
@@ -21,7 +23,7 @@ import {
   checkWorkbenchSql, listRawTables, listReadableTables, mountRawSources, normalizeWorkbenchSql, runWorkbenchQuery, sandboxSchema, saveSandboxTable,
   WorkbenchSqlError, type CatalogTable, type RawMount, type RawSource, type SandboxAccess, type WorkbenchResult,
 } from './pipeline/workbench-engine';
-import { enqueueSandboxDrop, lockForSave } from './sandbox';
+import { enqueueSandboxDrop, lockForSave, sandboxLakeName } from './sandbox';
 import { tenantPiiSalt } from './secrets';
 import { confirmedTables } from './sources';
 import { normalizeEmail } from './tenants';
@@ -47,6 +49,9 @@ export interface QueryOutcome extends WorkbenchResult { durationMs: number }
 
 /** 查询被打断的原因与报给成员的说法 */
 type Stop = 'timeout' | 'cancel';
+/** 拿不到工作台并发锁时报给成员的话（429）：查询、保存与删除共用 */
+const WORKBENCH_BUSY = '本租户已有查询在运行，请等它结束后再试';
+
 const STOP_MESSAGES: Record<Stop, (timeoutMs: number) => string> = {
   timeout: timeoutMs => `查询超过 ${timeoutMs / 1000} 秒，已中断`,
   cancel: () => '查询已取消',
@@ -102,7 +107,8 @@ export interface SharedWithMe { owner: string; schema: string; name: string; exp
  * 把一条 SELECT 的结果存为成员沙箱里的表 name（湖里的 sandbox_<成员>.name；同名表覆盖，过期时间重新从现在算起），返回登记的表。
  * 在本租户可写挂载的数据湖上、与工作台查询同一把并发锁下执行：先按工作台白名单校验（可以读分享来的表），再由平台拼出 CREATE 语句，
  * 目标永远是成员自己的沙箱。
- * 同名表已到期、正在过期清理或正在删除时拒绝（lockForSave）。成功、失败都记审计 sandbox.save；出错时与 runQuery 一样抛出 WorkbenchError
+ * 同名表已到期或正在过期清理时拒绝（lockForSave）；主人删除的表入队用的是改名后的名字，删除后马上可以同名再存。
+ * 成功、失败都记审计 sandbox.save；出错时与 runQuery 一样抛出 WorkbenchError
  */
 export async function saveAsSandbox(
   actor: CurrentMember, name: string, rawSql: string, signal?: AbortSignal, { timeoutMs = WORKBENCH_TIMEOUT_MS }: { timeoutMs?: number } = {},
@@ -266,20 +272,26 @@ export async function unshareSandboxTable(actor: CurrentMember, name: string, em
 }
 
 /**
- * 表的主人提前删除自己的沙箱表 name：撤销它的全部分享（被分享人马上读不到）、过期时间设为现在（工作台列表不再列出），
- * 并入队一个 sandbox.expire 删表、清理湖里的旧文件（ADR-0020），任务成功后标记 expiredAt；记审计 sandbox.dropped。
- * 只有主人能删（ownTable 只认自己的表）：别人的表（管理员、被分享人也一样）与已删或已到期的表都抛 404，不泄露表在与不在
+ * 表的主人提前删除自己的沙箱表 name：在与工作台查询同一把并发锁、可写挂载下，把湖里的表改名成保留名（DROPPED_TABLE_NAME：_d 加 8 位十六进制，
+ * SHOW TABLES、目录树与查询都不再列出），撤销它的全部分享、登记行直接标记 expiredAt（工作台列表不再列出），
+ * 并入队一个 sandbox.expire 按改名后的名字删表、清理湖里的旧文件（ADR-0020）——同名重新保存的新表不受影响；记审计 sandbox.dropped。
+ * 只有主人能删（ownTable 只认自己的表）：别人的表（管理员、被分享人也一样）与已删或已到期的表都抛 404，不泄露表在与不在。
+ * 工作台忙时与查询一样抛 429
  */
 export async function dropSandboxTable(actor: CurrentMember, name: string) {
-  assertCan(actor, 'sandbox');
-  await getDb().transaction(async tx => {
+  const outcome = await inLockedLake(actor, { readOnly: false }, async ({ open, tx }) => {
     const table = await ownTableOr404(tx, actor, name);
-    // 过期时间设到比现在早一点：markSandboxExpired 拿它和数据库生成的任务 createdAt 比，往前多留 1 秒避开应用与数据库的时钟偏差
-    await tx.update(sandboxTables).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(sandboxTables.id, table.id));
+    const { session } = await open();
+    // 湖里的改名不在 PG 事务里回滚：放在所有可能失败的检查之后、入队与审计之前，改名失败就抛错回滚 PG；
+    // PG 提交时失败会留下一张读不到、也没人删的保留名表，可以接受。湖里没有这张表时 IF EXISTS 跳过改名，入队照样用改名后的名字（handler 是 DROP TABLE IF EXISTS）
+    const renamed = `${name.slice(0, 53)}_d${randomBytes(4).toString('hex')}`;
+    await session.con.run(`ALTER TABLE IF EXISTS lake."${sandboxSchema(actor.memberId)}"."${name}" RENAME TO "${renamed}"`);
+    await tx.update(sandboxTables).set({ expiredAt: new Date() }).where(eq(sandboxTables.id, table.id));
     await tx.delete(sandboxShares).where(eq(sandboxShares.tableId, table.id));
-    await enqueueSandboxDrop(tx, actor.tenant.id, actor.memberId, name);
+    await enqueueSandboxDrop(tx, actor.tenant.id, sandboxLakeName({ memberId: actor.memberId, name: renamed }));
     await recordAudit(tx, { tenantId: actor.tenant.id, actor, action: 'sandbox.dropped', targetType: 'sandbox_table', targetId: table.id, detail: { name } });
   });
+  if (outcome.kind === 'busy') throw new WorkbenchError(WORKBENCH_BUSY, 429);
 }
 
 /** ownTable 的 404 版本，只在删除时用：没有这张表（或已删、已到期）时抛 404，与不存在报同一句话 */
@@ -309,7 +321,39 @@ async function memberByEmail(tx: Tx, actor: CurrentMember, email: string) {
 }
 
 /**
- * 工作台的一次操作：在 PG 事务里拿本租户的并发锁（拿不到抛 429），挂载数据湖（readOnly 时用只读凭据），执行 work，
+ * 工作台并发锁下的一次操作外壳：本租户的数据湖没初始化时抛 WorkbenchError；在一个 PG 事务里拿 pg_try_advisory_xact_lock
+ * （拿不到返回 busy，由调用方报 429），work 在锁内执行，open() 按 readOnly 打开本租户的数据湖会话（只读时用只读凭据；
+ * 打开与否、何时打开都由 work 决定，打开失败照常抛出），打开过的会话由这里负责关闭。
+ * inWorkbench 在这之上加超时、中止与审计；dropSandboxTable 直接用它，不套 workbench 的那层审计
+ */
+async function inLockedLake<T>(
+  actor: CurrentMember,
+  { readOnly }: { readOnly: boolean },
+  work: (ctx: { open: () => Promise<{ session: TenantLakeSession; spec: LakeSpec }>; tx: Tx }) => Promise<T>,
+): Promise<{ kind: 'busy' } | { kind: 'ok'; value: T }> {
+  assertCan(actor, 'sandbox');
+  const tenantId = actor.tenant.id;
+  const lake = await lakeRow(tenantId);
+  if (!lake || !lakeReady(lake)) throw new WorkbenchError('本租户的数据湖还没有初始化');
+  return getDb().transaction(async tx => {
+    const { rows: [{ locked }] } = await tx.execute<{ locked: boolean }>(sql`SELECT pg_try_advisory_xact_lock(hashtext(${`workbench:${tenantId}`})) AS locked`);
+    if (!locked) return { kind: 'busy' as const };
+    let session: TenantLakeSession | undefined;
+    try {
+      const open = async () => {
+        const spec = readOnly ? await readOnlySpec(lake) : lakeSpecOf(lake);
+        session = await openTenantLake(spec, WORKBENCH_LIMITS, undefined, { readOnly });
+        return { session, spec };
+      };
+      return { kind: 'ok' as const, value: await work({ open, tx }) };
+    } finally {
+      session?.close();
+    }
+  });
+}
+
+/**
+ * 工作台的一次操作：拿本租户的并发锁（拿不到抛 429，见 inLockedLake），挂载数据湖（readOnly 时用只读凭据），执行 work，
  * 超时或 signal 中止时 interrupt；work 在两步之间调 throwIfStopped()，挂载或上一步期间已被打断时就此停下。
  * mountAccess() 在会话里挂上原始层视图并给出这次能读的范围（每次操作只调一次）。
  * 不论成败都在同一事务里按 audit 给出的动作与详情记审计（error 是展示给成员的原因），失败时抛出 WorkbenchError
@@ -320,21 +364,15 @@ async function inWorkbench<T>(
   work: (ctx: { session: TenantLakeSession; throwIfStopped: () => void; started: number; tx: Tx; mountAccess: () => Promise<SandboxAccess> }) => Promise<T>,
   audit: (result: T | undefined, durationMs: number, error: string | undefined) => { action: AuditAction; detail: Record<string, unknown> },
 ): Promise<T> {
-  assertCan(actor, 'sandbox');
   const tenantId = actor.tenant.id;
-  const lake = await lakeRow(tenantId);
-  if (!lake || !lakeReady(lake)) throw new WorkbenchError('本租户的数据湖还没有初始化');
   const salt = await tenantPiiSalt(tenantId);
-  const outcome = await getDb().transaction(async tx => {
-    const { rows: [{ locked }] } = await tx.execute<{ locked: boolean }>(sql`SELECT pg_try_advisory_xact_lock(hashtext(${`workbench:${tenantId}`})) AS locked`);
-    if (!locked) return { kind: 'busy' as const };
+  const outcome = await inLockedLake(actor, { readOnly }, async ({ open, tx }) => {
     const started = Date.now();
     let result: { value: T } | undefined;
     let error: string | undefined;
     let stopped: Stop | undefined;
-    let session: TenantLakeSession | undefined;
-    let spec: LakeSpec | undefined;
-    const interrupt = (why: Stop) => { stopped ??= why; session?.con.interrupt(); };
+    let mounted: { session: TenantLakeSession; spec: LakeSpec } | undefined;
+    const interrupt = (why: Stop) => { stopped ??= why; mounted?.session.con.interrupt(); };
     const onAbort = () => interrupt('cancel');
     const timer = setTimeout(() => interrupt('timeout'), timeoutMs);
     signal?.addEventListener('abort', onAbort);
@@ -342,28 +380,27 @@ async function inWorkbench<T>(
     // 挂载或校验期间到了超时、被中止：interrupt 打断不到还没开始的查询，在这里停下
     const throwIfStopped = () => { if (stopped) throw new Error(stopped); };
     try {
-      spec = readOnly ? await readOnlySpec(lake) : lakeSpecOf(lake);
-      session = await openTenantLake(spec, WORKBENCH_LIMITS, undefined, { readOnly });
+      mounted = await open();
       throwIfStopped();
-      const con = session.con;
+      const con = mounted.session.con;
       const mountAccess = async () => ({ ...await sandboxAccess(tx, actor), raw: (await mountRaw(con, tenantId, salt)).mounted });
-      result = { value: await work({ session, throwIfStopped, started, tx, mountAccess }) };
+      result = { value: await work({ session: mounted.session, throwIfStopped, started, tx, mountAccess }) };
     } catch (e) {
       error = stopped ? STOP_MESSAGES[stopped](timeoutMs)
         : e instanceof WorkbenchSqlError ? e.message
-          : `查询出错：${redact((e as Error).message, spec, salt)}`;
+          : `查询出错：${redact((e as Error).message, mounted?.spec, salt)}`;
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
-      session?.close();
     }
     const { action, detail } = audit(result?.value, Date.now() - started, error);
     await recordAudit(tx, { tenantId, actor, action, targetType: 'workbench', detail });
     return result ? { kind: 'ok' as const, value: result.value } : { kind: 'failed' as const, error: error! };
   });
-  if (outcome.kind === 'busy') throw new WorkbenchError('本租户已有查询在运行，请等它结束后再试', 429);
-  if (outcome.kind === 'failed') throw new WorkbenchError(outcome.error);
-  return outcome.value;
+  if (outcome.kind === 'busy') throw new WorkbenchError(WORKBENCH_BUSY, 429);
+  const run = outcome.value;
+  if (run.kind === 'failed') throw new WorkbenchError(run.error);
+  return run.value;
 }
 
 /**
