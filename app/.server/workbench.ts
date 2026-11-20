@@ -323,7 +323,7 @@ async function memberByEmail(tx: Tx, actor: CurrentMember, email: string) {
 /**
  * 工作台并发锁下的一次操作外壳：本租户的数据湖没初始化时抛 WorkbenchError；在一个 PG 事务里拿 pg_try_advisory_xact_lock
  * （拿不到返回 busy，由调用方报 429），work 在锁内执行，open() 按 readOnly 打开本租户的数据湖会话（只读时用只读凭据；
- * 打开与否、何时打开都由 work 决定，打开失败照常抛出），打开过的会话由这里负责关闭。
+ * 打开与否、何时打开都由 work 决定，打开失败照常抛出，报错里的湖凭据已抹掉），打开过的会话由这里负责关闭。
  * inWorkbench 在这之上加超时、中止与审计；dropSandboxTable 直接用它，不套 workbench 的那层审计
  */
 async function inLockedLake<T>(
@@ -342,7 +342,9 @@ async function inLockedLake<T>(
     try {
       const open = async () => {
         const spec = readOnly ? await readOnlySpec(lake) : lakeSpecOf(lake);
-        session = await openTenantLake(spec, WORKBENCH_LIMITS, undefined, { readOnly });
+        // 挂载失败的报错可能带着湖的凭据（catalog 连接串、对象存储密钥）：在这里抹掉，调用方拿不到 spec 也不会泄露
+        session = await openTenantLake(spec, WORKBENCH_LIMITS, undefined, { readOnly })
+          .catch((e: unknown) => { throw new Error(redactLakeSecrets((e as Error).message, spec)); });
         return { session, spec };
       };
       return { kind: 'ok' as const, value: await work({ open, tx }) };
