@@ -62,6 +62,8 @@ const ACTIONS = {
   // 只记名称与前缀，明文只在创建那次响应里出现
   'api_key.created': { label: '创建 API Key', describe: credentialLabel },
   'api_key.revoked': { label: '吊销 API Key', describe: credentialLabel },
+  // 修改接口与数据范围（#977）：describe 只认 Key，前后范围在 detail 里（不记明文与哈希）
+  'api_key.scope_changed': { label: '修改 API Key 范围', describe: credentialLabel },
   // 成员个人令牌（ADR-0042）：只记名称、前缀、是否允许执行查询与有效期至，不记明文与哈希
   'member_token.created': { label: '签发个人令牌', describe: credentialLabel },
   'member_token.revoked': { label: '吊销个人令牌', describe: credentialLabel },

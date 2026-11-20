@@ -1,4 +1,4 @@
-// app/.server/api-keys.ts —— 租户管理员管理外部系统的 API Key：创建（明文只返回这一次，库里只存哈希）、吊销、列出。一律限定在操作者所属租户内
+// app/.server/api-keys.ts —— 租户管理员管理外部系统的 API Key：创建（明文只返回这一次，库里只存哈希）、修改范围（#977）、吊销、列出。一律限定在操作者所属租户内
 // 创建时选接口范围（ADR-0061）：三类接口的非空子集，去重后按固定顺序存；创建时还选数据范围（#976）：「全部」或本租户已发布定义的白名单
 import { and, desc, eq, isNull } from 'drizzle-orm';
 import type { ApiDataScope } from '../lib/api-data-scope';
@@ -99,6 +99,45 @@ export async function createApiKey(actor: CurrentMember, rawName: string, rawSco
     return created;
   });
   return { key, row };
+}
+
+/** 两个数据范围是否一样：jsonb 读回来键序会变，不能 JSON.stringify，逐字段比（存进去时标签、指标已排好序，这里仍排一遍稳妥） */
+function sameDataScope(a: ApiDataScope, b: ApiDataScope): boolean {
+  if (a.all === true || b.all === true) return a.all === b.all; // 「全部」只与「全部」相同
+  const sameKeys = (x: string[], y: string[]) => {
+    const [sx, sy] = [[...x].sort(cmp), [...y].sort(cmp)];
+    return sx.length === sy.length && sx.every((v, i) => v === sy[i]);
+  };
+  return sameKeys(a.tags ?? [], b.tags ?? []) && sameKeys(a.metrics ?? [], b.metrics ?? []) && a.rfm === b.rfm;
+}
+
+/** 修改已有 Key 的接口与数据范围（#977）：校验与创建相同；提交后这把 Key 的下一个请求即按新范围（requireApiKey 每次请求读库，无缓存）。
+ *  范围没变时不写审计、不报错；不在本租户、已吊销的 Key 与不存在一样处理 */
+export async function updateApiKeyScope(actor: CurrentMember, id: string, rawScopes: string[], rawDataScope: RawDataScope) {
+  assertCan(actor, 'api_keys:manage');
+  if (!UUID.test(id)) throw notFound();
+  const scopes = normalizeScopes(rawScopes);
+  const dataScope = await normalizeDataScope(actor.tenant.id, rawDataScope);
+  await getDb().transaction(async tx => {
+    const [row] = await tx
+      .select({ id: apiKeys.id, name: apiKeys.name, prefix: apiKeys.prefix, scopes: apiKeys.scopes, dataScope: apiKeys.dataScope })
+      .from(apiKeys)
+      .where(and(eq(apiKeys.id, id), eq(apiKeys.tenantId, actor.tenant.id), isNull(apiKeys.revokedAt)))
+      .for('update');
+    if (!row) throw notFound();
+    const before = { scopes: row.scopes, dataScope: row.dataScope };
+    const changed = before.scopes.length !== scopes.length || before.scopes.some((s, i) => s !== scopes[i]) || !sameDataScope(before.dataScope, dataScope);
+    if (!changed) return; // 范围没变：不写审计、不报错
+    await tx.update(apiKeys).set({ scopes, dataScope }).where(eq(apiKeys.id, row.id));
+    await recordAudit(tx, {
+      tenantId: actor.tenant.id,
+      actor,
+      action: 'api_key.scope_changed',
+      targetType: 'api_key',
+      targetId: row.id,
+      detail: { name: row.name, prefix: row.prefix, before, after: { scopes, dataScope } },
+    });
+  });
 }
 
 /** 吊销：用这把 Key 的下一个请求即被拒绝。不在本租户、或已吊销的 Key 与不存在一样处理 */
