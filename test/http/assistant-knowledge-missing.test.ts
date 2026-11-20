@@ -22,10 +22,9 @@ import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
-beforeEach(async () => {
-  await resetDb();
-  platformDefault();
-});
+// platformDefault 是 vi.stubEnv，每个用例后被 afterEach 撤销，必须每个用例前重设；不碰数据库，留在顶层
+beforeEach(() => { platformDefault(); });
+const fresh = () => resetDb();
 afterEach(() => { app.setLlmFetch(undefined); vi.unstubAllEnvs(); });
 
 const PAGE = { path: '/analytics', title: '分析' };
@@ -56,79 +55,7 @@ const toolOutputs = (received: { body: { messages: { role: string }[] } }[]) =>
   JSON.stringify(received[1].body.messages.filter(m => m.role === 'tool'));
 
 describe('说法未命中的结构化候选（⑥-5）', () => {
-  it('判为未命中的那轮 assistant 消息带 kind: missing 的候选组：POST 返回与 ?id= 读回一致，候选只有 metric/tag/entity/field 并带名称；sealed 里没有 id 明文，发给模型的历史不含 choices', async () => {
-    const { acme, client } = await ordersTenant();
-    const { received, first } = await askWithSearch(client, '实际支付');
-    expect(first).toMatchObject({ toolsUsed: ['catalog_search'] });
-    expect(first.choices).toHaveLength(1);
-    const [group] = first.choices;
-    expect(group.term).toBe('实际支付');
-    expect(group.kind).toBe('missing');
-    for (const c of group.candidates) expect(c.entryId).toMatch(/^(metric|tag|entity|field):/);
-    expect(group.candidates.map((c: { entryId: string }) => c.entryId).sort()).toEqual(
-      ['field:coupon.discount_amount', 'field:order.amount', 'field:order.paid_at']);
-    expect(group.candidates.find((c: { entryId: string }) => c.entryId === 'field:order.amount').name).toBe('实付金额');
-
-    // ?id= 读回：同一条 assistant 消息带一样的视图，user 消息没有这个键
-    const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
-    expect(conversation.messages[0]).not.toHaveProperty('choices');
-    expect(conversation.messages[1].choices).toEqual(first.choices);
-
-    // 库里只有密文；解密后存的是词加候选条目 id（带 kind），名称读时按读者目录组装、不存
-    const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
-    expect(row.sealed).not.toContain('field:order.amount');
-    const stored = JSON.parse((await decryptForTenant(acme, ASSISTANT_CONTEXT, row.sealed)).body).messages[1].choices;
-    expect(stored).toEqual([{
-      term: '实际支付', kind: 'missing',
-      candidates: expect.arrayContaining(['field:order.amount', 'field:coupon.discount_amount', 'field:order.paid_at']),
-    }]);
-    expect(stored[0].candidates).toHaveLength(3);
-
-    // 续写一轮：交给模型的历史不含 choices
-    expect((await post(client, { conversationId: first.conversationId, message: '谢谢', page: PAGE })).status).toBe(200);
-    expect(JSON.stringify(received[2].body.messages)).not.toContain('candidates');
-    expect(JSON.stringify(received[2].body.messages)).not.toContain('missing');
-  });
-
-  it('这几种情况都不带未命中组：词超过 20 字或含空白（关键词照常命中）、词命中了条目名称', async () => {
-    const { client } = await ordersTenant();
-    // 含空白：关键词「实际」「支付」仍命中 order.amount 的描述（工具输出里有它），但词里有空格
-    const spaced = await askWithSearch(client, '实际支付 汇总');
-    expect(spaced.first).not.toHaveProperty('choices');
-    expect(toolOutputs(spaced.received)).toContain('实付金额');
-    // 超过 20 字：关键词仍命中
-    const long = await askWithSearch(client, '实际支付' + '呢'.repeat(18));
-    expect(long.first).not.toHaveProperty('choices');
-    expect(toolOutputs(long.received)).toContain('实付金额');
-    // 命中名称：实付金额是 field:order.amount 的名称（name 一路有命中，不算未命中）
-    const named = await askWithSearch(client, '实付金额');
-    expect(named.first).not.toHaveProperty('choices');
-  });
-
-  it('点选未命中组的候选：生成「『实际支付』指的是 …」的用户消息继续这一轮（模型收到它），user 消息带 chosen.kind: missing，这一轮答复带 kind: alias 的「记为别名」卡片（POST 返回与读回一致、库里不存）', async () => {
-    const { acme, client } = await ordersTenant();
-    const { received, first } = await askWithSearch(client, '实际支付');
-    const picked = await (await post(client, { conversationId: first.conversationId, choice: { entryId: 'field:order.amount' } })).json();
-    expect(picked).toMatchObject({ conversationId: first.conversationId });
-    // 卡片：index 是带 chosen 的 user 消息（下标 2）的下标，未命中点选的 kind 是 alias（记为别名），名称取自分析师自己的目录
-    expect(picked.askCard).toEqual({ index: 2, term: '实际支付', entryId: 'field:order.amount', name: '实付金额', kind: 'alias' });
-
-    // 服务端生成的用户消息：词从存着的未命中组反查、名称从自己的目录取（不收客户端传来的词或候选列表）
-    const GENERATED = '『实际支付』指的是 〈实付金额〉（field:order.amount）';
-    const sent = received[2].body.messages
-      .filter((m: { role: string }) => m.role !== 'system' && m.role !== 'tool')
-      .map((m: { content: string }) => m.content);
-    expect(sent).toEqual(['按实际支付看看', '先给你最接近的几个条目', GENERATED]);
-    expect(JSON.stringify(received[2].body.messages)).not.toContain('chosen');
-
-    // 读回：user 消息带 chosen（kind: missing），它后面的 assistant 消息（下标 3）带一样的卡片；卡片读时组装、不存库
-    const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
-    expect(conversation.messages[2]).toEqual({ role: 'user', content: GENERATED, chosen: { term: '实际支付', entryId: 'field:order.amount', kind: 'missing' } });
-    expect(conversation.messages[3].askCard).toEqual(picked.askCard);
-    const [row] = await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme));
-    const stored = JSON.parse((await decryptForTenant(acme, ASSISTANT_CONTEXT, row.sealed)).body).messages;
-    expect(stored[3]).not.toHaveProperty('askCard');
-  });
+  beforeEach(fresh); // 会建 / 拒提案、加别名并断言提案状态的用例，每个用例从空库开始
 
   it('确认「记为别名」卡片后有一条待复核的 alias 提案（content 只有词、证据只有对话引用、不含原话），接受后再搜同一说法按别名命中、不再出未命中组', async () => {
     const { acme, analyst, client } = await ordersTenant();
@@ -242,8 +169,97 @@ describe('说法未命中的结构化候选（⑥-5）', () => {
     expect(await listProposals(getDb(), acme)).toHaveLength(1);
   });
 
+});
+
+// 只读用例共用一次 ordersTenant()：这一组写在文件末尾、后面没有每用例清库的组。组里的用例 POST /assistant 只给自己的会话追加消息，
+// 不改目录（见本票 sandcastle:decided 评论）；查会话行按本用例的会话 id 查，不取「租户的第一条」
+let servedOnce: ReturnType<typeof ordersTenant> | undefined;
+const sharedTenant = () => (servedOnce ??= fresh().then(ordersTenant));
+
+describe('说法未命中的结构化候选（⑥-5）', () => {
+  let shared: Awaited<ReturnType<typeof ordersTenant>>;
+  beforeAll(async () => { shared = await sharedTenant(); }, 180_000); // 共用的夹具要跑一次 publishedIdentitySources，超过默认 hookTimeout
+
+  it('判为未命中的那轮 assistant 消息带 kind: missing 的候选组：POST 返回与 ?id= 读回一致，候选只有 metric/tag/entity/field 并带名称；sealed 里没有 id 明文，发给模型的历史不含 choices', async () => {
+    const { acme, client } = shared;
+    const { received, first } = await askWithSearch(client, '实际支付');
+    expect(first).toMatchObject({ toolsUsed: ['catalog_search'] });
+    expect(first.choices).toHaveLength(1);
+    const [group] = first.choices;
+    expect(group.term).toBe('实际支付');
+    expect(group.kind).toBe('missing');
+    for (const c of group.candidates) expect(c.entryId).toMatch(/^(metric|tag|entity|field):/);
+    expect(group.candidates.map((c: { entryId: string }) => c.entryId).sort()).toEqual(
+      ['field:coupon.discount_amount', 'field:order.amount', 'field:order.paid_at']);
+    expect(group.candidates.find((c: { entryId: string }) => c.entryId === 'field:order.amount').name).toBe('实付金额');
+
+    // ?id= 读回：同一条 assistant 消息带一样的视图，user 消息没有这个键
+    const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(conversation.messages[0]).not.toHaveProperty('choices');
+    expect(conversation.messages[1].choices).toEqual(first.choices);
+
+    // 库里只有密文；解密后存的是词加候选条目 id（带 kind），名称读时按读者目录组装、不存
+    // 共享组里租户下还有别的用例的会话：按本用例的会话 id 查
+    const [row] = await getDb().select().from(assistantConversations).where(and(
+      eq(assistantConversations.tenantId, acme), eq(assistantConversations.id, first.conversationId)));
+    expect(row.sealed).not.toContain('field:order.amount');
+    const stored = JSON.parse((await decryptForTenant(acme, ASSISTANT_CONTEXT, row.sealed)).body).messages[1].choices;
+    expect(stored).toEqual([{
+      term: '实际支付', kind: 'missing',
+      candidates: expect.arrayContaining(['field:order.amount', 'field:coupon.discount_amount', 'field:order.paid_at']),
+    }]);
+    expect(stored[0].candidates).toHaveLength(3);
+
+    // 续写一轮：交给模型的历史不含 choices
+    expect((await post(client, { conversationId: first.conversationId, message: '谢谢', page: PAGE })).status).toBe(200);
+    expect(JSON.stringify(received[2].body.messages)).not.toContain('candidates');
+    expect(JSON.stringify(received[2].body.messages)).not.toContain('missing');
+  });
+
+  it('这几种情况都不带未命中组：词超过 20 字或含空白（关键词照常命中）、词命中了条目名称', async () => {
+    const { client } = shared;
+    // 含空白：关键词「实际」「支付」仍命中 order.amount 的描述（工具输出里有它），但词里有空格
+    const spaced = await askWithSearch(client, '实际支付 汇总');
+    expect(spaced.first).not.toHaveProperty('choices');
+    expect(toolOutputs(spaced.received)).toContain('实付金额');
+    // 超过 20 字：关键词仍命中
+    const long = await askWithSearch(client, '实际支付' + '呢'.repeat(18));
+    expect(long.first).not.toHaveProperty('choices');
+    expect(toolOutputs(long.received)).toContain('实付金额');
+    // 命中名称：实付金额是 field:order.amount 的名称（name 一路有命中，不算未命中）
+    const named = await askWithSearch(client, '实付金额');
+    expect(named.first).not.toHaveProperty('choices');
+  });
+
+  it('点选未命中组的候选：生成「『实际支付』指的是 …」的用户消息继续这一轮（模型收到它），user 消息带 chosen.kind: missing，这一轮答复带 kind: alias 的「记为别名」卡片（POST 返回与读回一致、库里不存）', async () => {
+    const { acme, client } = shared;
+    const { received, first } = await askWithSearch(client, '实际支付');
+    const picked = await (await post(client, { conversationId: first.conversationId, choice: { entryId: 'field:order.amount' } })).json();
+    expect(picked).toMatchObject({ conversationId: first.conversationId });
+    // 卡片：index 是带 chosen 的 user 消息（下标 2）的下标，未命中点选的 kind 是 alias（记为别名），名称取自分析师自己的目录
+    expect(picked.askCard).toEqual({ index: 2, term: '实际支付', entryId: 'field:order.amount', name: '实付金额', kind: 'alias' });
+
+    // 服务端生成的用户消息：词从存着的未命中组反查、名称从自己的目录取（不收客户端传来的词或候选列表）
+    const GENERATED = '『实际支付』指的是 〈实付金额〉（field:order.amount）';
+    const sent = received[2].body.messages
+      .filter((m: { role: string }) => m.role !== 'system' && m.role !== 'tool')
+      .map((m: { content: string }) => m.content);
+    expect(sent).toEqual(['按实际支付看看', '先给你最接近的几个条目', GENERATED]);
+    expect(JSON.stringify(received[2].body.messages)).not.toContain('chosen');
+
+    // 读回：user 消息带 chosen（kind: missing），它后面的 assistant 消息（下标 3）带一样的卡片；卡片读时组装、不存库
+    const { conversation } = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(conversation.messages[2]).toEqual({ role: 'user', content: GENERATED, chosen: { term: '实际支付', entryId: 'field:order.amount', kind: 'missing' } });
+    expect(conversation.messages[3].askCard).toEqual(picked.askCard);
+    // 共享组里租户下还有别的用例的会话：按本用例的会话 id 查
+    const [row] = await getDb().select().from(assistantConversations).where(and(
+      eq(assistantConversations.tenantId, acme), eq(assistantConversations.id, first.conversationId)));
+    const stored = JSON.parse((await decryptForTenant(acme, ASSISTANT_CONTEXT, row.sealed)).body).messages;
+    expect(stored[3]).not.toHaveProperty('askCard');
+  });
+
   it('查看者点选后没有卡片、直接提交 403；被分享人读回没有卡片（候选照旧返回）', async () => {
-    const { client, peer } = await ordersTenant();
+    const { client, peer } = shared;
     // 查看者自己问一轮并点选：卡片与提交都要 definitions:draft，查看者没有
     const { first: viewerFirst } = await askWithSearch(peer, '实际支付');
     const picked = await (await post(peer, { conversationId: viewerFirst.conversationId, choice: { entryId: 'field:order.amount' } })).json();
@@ -256,14 +272,14 @@ describe('说法未命中的结构化候选（⑥-5）', () => {
     const { first } = await askWithSearch(client, '实际支付');
     await post(client, { conversationId: first.conversationId, choice: { entryId: 'field:order.amount' } });
     expect((await post(client, { intent: 'share', conversationId: first.conversationId, email: 'viewer@acme.com' })).status).toBe(200);
-    const shared = await (await peer.get(`/assistant?id=${first.conversationId}`)).json();
-    expect(shared.conversation.messages[3]).not.toHaveProperty('askCard');
-    expect(JSON.stringify(shared)).not.toContain('askCard');
-    expect(shared.conversation.messages[1].choices).toHaveLength(1);
+    const readback = await (await peer.get(`/assistant?id=${first.conversationId}`)).json();
+    expect(readback.conversation.messages[3]).not.toHaveProperty('askCard');
+    expect(JSON.stringify(readback)).not.toContain('askCard');
+    expect(readback.conversation.messages[1].choices).toHaveLength(1);
   });
 
   it('「都不是」：未命中组生成『词』不是这些候选里的任何一个继续这一轮，user 消息不带 chosen；上一轮没有未命中组（只有歧义组或没有候选）时 400 且不请求模型', async () => {
-    const { analyst, client } = await ordersTenant();
+    const { analyst, client } = shared;
     const { received, first } = await askWithSearch(client, '实际支付');
     const none = await (await post(client, { conversationId: first.conversationId, choice: { entryId: null } })).json();
     expect(none).toMatchObject({ conversationId: first.conversationId });
@@ -293,7 +309,7 @@ describe('说法未命中的结构化候选（⑥-5）', () => {
   });
 
   it('choice 核对：点选不在候选里 / 不在自己目录里的条目、与 message 同给、entryId 不是字符串也不是 null 时 400 且不请求模型；别人的对话 404', async () => {
-    const { analyst, client, peer } = await ordersTenant();
+    const { analyst, client, peer } = shared;
     const { received, first } = await askWithSearch(client, '实际支付');
     const id = first.conversationId as string;
     // 目录里有的实体但不在候选里

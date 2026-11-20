@@ -18,8 +18,8 @@ import { loginAs, resetDb, startApp, type TestApp } from './harness';
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
-beforeEach(async () => { await resetDb(); });
 afterEach(() => { app.setLlmFetch(undefined); vi.unstubAllEnvs(); });
+const fresh = () => resetDb();
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 实付金额\n';
 const TARGET = 'metric:paid_revenue';
@@ -54,6 +54,8 @@ async function setup() {
 }
 
 describe('知识粘贴导入页与来源原文页', () => {
+  beforeEach(fresh);
+
   it('分析师在新页粘贴并提交：302 回集中页带计数，页顶提示与新提案都在；重复提交计入跳过；字数计数与「只粘贴元数据说明」的提示在页', async () => {
     const { acme, analyst } = await setup();
     const an = await loginAs(app, 'an@acme.com');
@@ -112,16 +114,6 @@ describe('知识粘贴导入页与来源原文页', () => {
     expect(await proposals()).toHaveLength(3);
   }, 180_000); // 每个用例都跑 publishedIdentitySources，4 个 worker 并行时超过默认的 90 s
 
-  it('查看者打不开导入页：GET 与 POST 都 403，集中页没有「粘贴导入」入口', async () => {
-    await setup();
-    const viewer = await loginAs(app, 'view@acme.com');
-    expect((await viewer.get('/knowledge/import')).status).toBe(403);
-    expect((await viewer.post('/knowledge/import', { title: TITLE, kind: 'metric', body: BODY })).status).toBe(403);
-    const html = await pageOf(viewer);
-    expect(html).not.toContain('href="/knowledge/import"');
-    expect(html).not.toContain('粘贴导入');
-  }, 180_000); // 每个用例都跑 publishedIdentitySources，4 个 worker 并行时超过默认的 90 s
-
   it('未配置模型服务 409：页面原地显示错误、带回已填的值与种类，来源已保存、给出来源页链接', async () => {
     const { acme } = await setup();
     const an = await loginAs(app, 'an@acme.com');
@@ -141,29 +133,6 @@ describe('知识粘贴导入页与来源原文页', () => {
     const source = await theSource(acme);
     expect(source.title).toBe(TITLE);
     expect(html).toContain(`href="/knowledge/sources/${source.id}"`);
-  }, 180_000); // 每个用例都跑 publishedIdentitySources，4 个 worker 并行时超过默认的 90 s
-
-  it('来源页按段显示、段落有锚点与段号：有 definitions:read 就能看（查看者可以），非 UUID 与不存在的来源 400', async () => {
-    const { analyst } = await setup();
-    const saved = await saveKnowledgeSource(analyst, { title: TITLE, kind: 'metric', body: BODY });
-    const viewer = await loginAs(app, 'view@acme.com');
-
-    const res = await viewer.get(`/knowledge/sources/${saved.id}`);
-    expect(res.status).toBe(200);
-    const html = decode(await res.text());
-    expect(html).toContain(TITLE);
-    expect(html).toContain('指标说明'); // 种类中文名
-    expect(html).toContain('第 1 版');
-    expect(html).toContain('id="p1"');
-    expect(html).toContain('id="p2"');
-    expect(html).toContain('id="p3"');
-    expect(html).toContain('¶1');
-    expect(html).toContain('¶2');
-    expect(html).toContain('金额字段 amount 存的是人民币（元）。');
-    expect(html).not.toContain('段号可能对不上'); // 没带 ?v= 时不提示
-
-    expect((await viewer.get('/knowledge/sources/not-a-uuid')).status).toBe(400);
-    expect((await viewer.get('/knowledge/sources/00000000-0000-0000-0000-000000000000')).status).toBe(400);
   }, 180_000); // 每个用例都跑 publishedIdentitySources，4 个 worker 并行时超过默认的 90 s
 
   it('知识面板里的 source: 证据渲染成指向来源页对应段落的链接（带证据版本），非 source 证据仍是纯文本', async () => {
@@ -193,11 +162,59 @@ describe('知识粘贴导入页与来源原文页', () => {
     // 来源页链接打得开且落得到对应段落
     expect((await an.get(`/knowledge/sources/${source.id}?v=1`)).status).toBe(200);
   }, 180_000); // 每个用例都跑 publishedIdentitySources，4 个 worker 并行时超过默认的 90 s
+});
+
+// 只读用例共用一次 setup()：这一组写在文件末尾、后面没有每用例清库的组。组里的用例只 GET 页面与提交被 403 拒绝的表单，不写库；
+// 要的来源在夹具里一次造好。来源按 (tenant, title) 唯一：197 要的两版历史另用一个标题，否则版本号会接着 146 那份排
+async function importFixture() {
+  const s = await setup();
+  const saved = await saveKnowledgeSource(s.analyst, { title: TITLE, kind: 'metric', body: BODY });
+  const history = `${TITLE}（历史版本）`;
+  const v1 = await saveKnowledgeSource(s.analyst, { title: history, kind: 'metric', body: BODY });
+  const v2 = await saveKnowledgeSource(s.analyst, { title: history, kind: 'metric', body: `${BODY}\n\n补充：退货不算流水。` });
+  return { ...s, saved, v1, v2 };
+}
+
+let importOnce: ReturnType<typeof importFixture> | undefined;
+const sharedImport = () => (importOnce ??= fresh().then(importFixture));
+
+describe('知识粘贴导入页与来源原文页', () => {
+  let shared: Awaited<ReturnType<typeof sharedImport>>;
+  beforeAll(async () => { shared = await sharedImport(); }, 180_000); // 共用的夹具要跑一次 publishedIdentitySources，超过默认 hookTimeout
+
+  it('查看者打不开导入页：GET 与 POST 都 403，集中页没有「粘贴导入」入口', async () => {
+    const viewer = await loginAs(app, 'view@acme.com');
+    expect((await viewer.get('/knowledge/import')).status).toBe(403);
+    expect((await viewer.post('/knowledge/import', { title: TITLE, kind: 'metric', body: BODY })).status).toBe(403);
+    const html = await pageOf(viewer);
+    expect(html).not.toContain('href="/knowledge/import"');
+    expect(html).not.toContain('粘贴导入');
+  });
+
+  it('来源页按段显示、段落有锚点与段号：有 definitions:read 就能看（查看者可以），非 UUID 与不存在的来源 400', async () => {
+    const { saved } = shared;
+    const viewer = await loginAs(app, 'view@acme.com');
+
+    const res = await viewer.get(`/knowledge/sources/${saved.id}`);
+    expect(res.status).toBe(200);
+    const html = decode(await res.text());
+    expect(html).toContain(TITLE);
+    expect(html).toContain('指标说明'); // 种类中文名
+    expect(html).toContain('第 1 版');
+    expect(html).toContain('id="p1"');
+    expect(html).toContain('id="p2"');
+    expect(html).toContain('id="p3"');
+    expect(html).toContain('¶1');
+    expect(html).toContain('¶2');
+    expect(html).toContain('金额字段 amount 存的是人民币（元）。');
+    expect(html).not.toContain('段号可能对不上'); // 没带 ?v= 时不提示
+
+    expect((await viewer.get('/knowledge/sources/not-a-uuid')).status).toBe(400);
+    expect((await viewer.get('/knowledge/sources/00000000-0000-0000-0000-000000000000')).status).toBe(400);
+  });
 
   it('来源页 ?v=N 读得到的历史版本直接显示那一版（页头「第 N 版（当前第 M 版）」），版本不存在时回退当前版并提示段号可能对不上', async () => {
-    const { analyst } = await setup();
-    const v1 = await saveKnowledgeSource(analyst, { title: TITLE, kind: 'metric', body: BODY });
-    const v2 = await saveKnowledgeSource(analyst, { title: TITLE, kind: 'metric', body: `${BODY}\n\n补充：退货不算流水。` });
+    const { v1, v2 } = shared;
     expect(v2.version).toBe(2);
     const an = await loginAs(app, 'an@acme.com');
 
@@ -223,5 +240,5 @@ describe('知识粘贴导入页与来源原文页', () => {
       expect(fresh).not.toContain('（当前第');
       expect(fresh).not.toContain('段号可能对不上');
     }
-  }, 180_000); // 每个用例都跑 publishedIdentitySources，4 个 worker 并行时超过默认的 90 s
+  });
 });

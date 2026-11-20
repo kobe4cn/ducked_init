@@ -54,6 +54,18 @@ async function sharedSnapshot() {
 // 源表里的姓名、手机、邮箱、外部 ID，页面上一个都不能出现
 const PLAINTEXT = ['张三', '钱七', '13800000002', '138 0000 0001', 'zhang@crm.test', 'qian7@example.com', 'wx_union_8'];
 
+/**
+ * 只读用例共用的夹具：清库、打通带订单与同意的 acme、跑一次 user360（2024-07-01），登录查看者。
+ * 用它的用例不能写库、不能依赖执行顺序，也不能断言「恰好 N 条」（打开页面可能入队任务或写审计）
+ */
+async function sharedUser360() {
+  await fresh();
+  const { acme } = await publishedIdentitySources({ orders: true, consents: true });
+  await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
+  const snapshot = (await listSnapshots(acme, 'user360')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
+  await memberOf(acme, 'viewer@acme.com', 'viewer');
+  return { acme, snapshot, browser: await loginAs(app, 'viewer@acme.com') };
+}
 describe('分析页', () => {
   beforeEach(fresh);
 
@@ -498,14 +510,16 @@ describe('用户 360 模板参数页与快照（通用表单与汇总视图）',
     // RFM 的定义不受影响
     expect(await (await de.get('/analytics/templates/rfm')).text()).toContain('当前生效：默认参数');
   });
+});
+
+describe('用户 360 模板参数页与快照（通用表单与汇总视图）', () => {
+  // 只读用例共用一次 { orders: true, consents: true } 加 user360 快照
+  let shared: Awaited<ReturnType<typeof sharedUser360>>;
+  beforeAll(async () => { shared = await sharedUser360(); }, 180_000); // 共用的夹具要跑一次 publishedIdentitySources，超过默认 hookTimeout
 
   it('user360 快照的逐人明细标签页（?tab=consumers）分页显示全部列（同意列为是 / 否），模板名取自注册表，页面上没有明文', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true, consents: true });
-    await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'user360')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
+    const { snapshot, browser } = shared;
     expect(snapshot!.template).toBe('user360');
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const browser = await loginAs(app, 'viewer@acme.com');
 
     const listHtml = await (await browser.get('/analytics')).text();
     expect(listHtml).toContain(`href="/analytics/snapshots/${snapshot!.id}"`);
@@ -534,11 +548,7 @@ describe('用户 360 模板参数页与快照（通用表单与汇总视图）',
   });
 
   it('user360 快照默认打开汇总：总人数、有订单人数与各渠道同意人数和湖上 count 一致，没有逐人明细，页面没有明文', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true, consents: true });
-    await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'user360')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const browser = await loginAs(app, 'viewer@acme.com');
+    const { acme, snapshot, browser } = shared;
 
     // 湖上按同一口径算出期望汇总：总人数、有订单人数（orders > 0）与各渠道同意人数
     const [schema, name] = snapshot.table.split('.');
@@ -560,11 +570,7 @@ describe('用户 360 模板参数页与快照（通用表单与汇总视图）',
   });
 
   it('user360 汇总页按 consumer_id 查单人：湖上真实 id 显示一行全部列并回显，不存在的 id 与注入串显示提示且 200', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true, consents: true });
-    await runTask(acme, 'gold.user360', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'user360')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const browser = await loginAs(app, 'viewer@acme.com');
+    const { acme, snapshot, browser } = shared;
 
     const [schema, name] = snapshot.table.split('.');
     const realId = String((await onLake<{ consumer_id: string }>(acme,
@@ -595,204 +601,8 @@ describe('用户 360 模板参数页与快照（通用表单与汇总视图）',
   });
 });
 
-describe('流失预警快照页（#834）', () => {
-  beforeEach(fresh);
-
-  /** 在湖上按同一口径算出这张快照的汇总（总数、有风险数）与两个口径下按沉默比排序的 consumer_id（表名来自快照登记） */
-  const lakeExpected = async (tenantId: string, snapshot: { table: string }) => {
-    const [schema, name] = snapshot.table.split('.');
-    const table = `${schema}."${name}"`;
-    const [totals] = await onLake<{ total: string; at_risk: string }>(tenantId,
-      `SELECT count(*) AS total, count(*) FILTER (WHERE at_risk) AS at_risk FROM ${table}`);
-    const ids = (where: string) => onLake<{ consumer_id: string }>(tenantId,
-      `SELECT consumer_id FROM ${table} ${where} ORDER BY silence_ratio DESC NULLS LAST, consumer_id`).then(rs => rs.map(r => r.consumer_id));
-    return { total: Number(totals!.total), atRisk: Number(totals!.at_risk), atRiskIds: await ids('WHERE at_risk'), allIds: await ids('') };
-  };
-  const consumerIds = (html: string) => [...html.matchAll(/data-consumer="([^"]+)"/g)].map(m => m[1]!);
-
-  it('顶部汇总卡片写有风险人数、占比与总人数（与湖上一致），明细默认只列有风险的人、沉默比从高到低，?tab=all 看全部；页面上没有明文', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    // 默认参数 2024-10-15：共 1 位且在风险里；minOrders 2 的 2024-09-15：共 3 位、其中 2 位有风险（沉默比各不相同）
-    await runTask(acme, 'gold.churn', { asOf: '2024-10-15' });
-    await runTask(acme, 'gold.churn', { asOf: '2024-09-15', minOrders: 2 });
-    const mixed = (await listSnapshots(acme, 'churn')).find(s => (s.params as { asOf: string }).asOf === '2024-09-15')!;
-    const single = (await listSnapshots(acme, 'churn')).find(s => (s.params as { asOf: string }).asOf === '2024-10-15')!;
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const browser = await loginAs(app, 'viewer@acme.com');
-
-    const expected = await lakeExpected(acme, mixed);
-    expect(expected).toMatchObject({ total: 3, atRisk: 2 });
-
-    const html = await (await browser.get(`/analytics/snapshots/${mixed.id}`)).text();
-    expect(html).toContain('流失预警 · 2024-09-15');
-    expect(html).toMatch(/有风险人数.*?>2</s);
-    expect(html).toMatch(/风险占比.*?>66\.7%</s);
-    expect(html).toMatch(/总人数.*?>3</s);
-    // 默认只列有风险的人，行序与湖上按沉默比降序的一致；标签页可以切到全部
-    expect(consumerIds(html)).toEqual(expected.atRiskIds);
-    expect(html).toContain('第 1 / 1 页');
-    expect(html).toMatch(/data-tab="all"[^>]*href="[^"]*\?tab=all"/);
-
-    const all = await (await browser.get(`/analytics/snapshots/${mixed.id}?tab=all`)).text();
-    expect(consumerIds(all)).toEqual(expected.allIds);
-    expect(all).toContain('data-tab="at-risk"');
-    // 页码超出时停在最后一页
-    expect(await (await browser.get(`/analytics/snapshots/${mixed.id}?tab=all&page=9`)).text()).toContain('第 1 / 1 页');
-    for (const text of [html, all]) for (const p of PLAINTEXT) expect(text).not.toContain(p);
-
-    // 只有一位且在风险里：卡片与明细同样成立
-    const one = await lakeExpected(acme, single);
-    expect(one).toMatchObject({ total: 1, atRisk: 1 });
-    const singleHtml = await (await browser.get(`/analytics/snapshots/${single.id}`)).text();
-    expect(singleHtml).toMatch(/有风险人数.*?>1</s);
-    expect(singleHtml).toMatch(/风险占比.*?>100\.0%</s);
-    expect(consumerIds(singleHtml)).toEqual(one.atRiskIds);
-  });
-
-  it('readChurnSnapshot 分页总数按筛选后的行数算：每页 2 位时「全部」2 页、「有风险」1 页，页码超出停在最后一页，两页合起来不重不漏', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    await runTask(acme, 'gold.churn', { asOf: '2024-09-15', minOrders: 2 });
-    const snapshot = (await listSnapshots(acme, 'churn')).find(s => (s.params as { asOf: string }).asOf === '2024-09-15')!;
-    const expected = await lakeExpected(acme, snapshot);
-
-    const atRisk = await readChurnSnapshot(snapshot, { page: 9, filter: 'at-risk', pageSize: 2 });
-    expect(atRisk).toMatchObject({ page: 1, pages: 1, total: 3, atRisk: 2, filteredCount: 2 });
-    expect(atRisk.rows.map(r => r.consumer_id)).toEqual(expected.atRiskIds);
-    expect(atRisk.rows.every(r => r.at_risk)).toBe(true);
-    // 沉默比从高到低（同值按 consumer_id）
-    const ratios = atRisk.rows.map(r => r.silence_ratio);
-    expect([...ratios].sort((a, b) => b - a)).toEqual(ratios);
-
-    const first = await readChurnSnapshot(snapshot, { page: 1, filter: 'all', pageSize: 2 });
-    const last = await readChurnSnapshot(snapshot, { page: 9, filter: 'all', pageSize: 2 });
-    expect(first).toMatchObject({ page: 1, pages: 2, filteredCount: 3 });
-    expect(last.page).toBe(2);
-    expect([...first.rows, ...last.rows].map(r => r.consumer_id)).toEqual(expected.allIds);
-    expect([...first.rows, ...last.rows].filter(r => r.at_risk)).toHaveLength(2);
-  });
-});
-
 describe('复购与 CLV 快照页（#835）', () => {
   beforeEach(fresh);
-
-  /** 在湖上按同一口径算出这张复购快照的汇总：总人数、复购人数与到第二单天数的中位数（median 自动跳过 NULL） */
-  const repurchaseExpected = async (tenantId: string, snapshot: { table: string }) => {
-    const [schema, name] = snapshot.table.split('.');
-    const table = `${schema}."${name}"`;
-    const [totals] = await onLake<{ total: string; repurchased: string; median_days_to_second: number | null }>(tenantId,
-      `SELECT count(*) AS total, count(*) FILTER (WHERE repurchased) AS repurchased, median(days_to_second) AS median_days_to_second FROM ${table}`);
-    return { total: Number(totals!.total), repurchased: Number(totals!.repurchased), medianDaysToSecond: totals!.median_days_to_second };
-  };
-
-  /** 在湖上按同一口径算出这张 CLV 快照的十档分布（ntile 同值按 consumer_id 排序，分档才稳定）与头部 10% 的贡献占比 */
-  const clvExpected = async (tenantId: string, snapshot: { table: string }) => {
-    const [schema, name] = snapshot.table.split('.');
-    const table = `${schema}."${name}"`;
-    const deciles = await onLake<{ decile: number; consumers: string; clv: string | null }>(tenantId, `
-      SELECT decile, count(*) AS consumers, sum(clv)::VARCHAR AS clv FROM (
-        SELECT ntile(10) OVER (ORDER BY clv DESC, consumer_id) AS decile, clv FROM ${table}
-      ) GROUP BY decile ORDER BY decile`);
-    const [total] = await onLake<{ total_clv: string | null }>(tenantId, `SELECT coalesce(sum(clv), 0)::VARCHAR AS total_clv FROM ${table}`);
-    const top = deciles.find(d => Number(d.decile) === 1);
-    return {
-      deciles: deciles.map(d => ({ decile: Number(d.decile), consumers: Number(d.consumers), clv: Number(d.clv ?? 0) })),
-      totalClv: Number(total!.total_clv ?? 0),
-      topShare: Number(total!.total_clv ?? 0) > 0 && top ? Number(top.clv ?? 0) / Number(total!.total_clv) : null,
-    };
-  };
-
-  /** 湖上这张快照全部 consumer_id，按 consumer_id 升序（与明细的分页顺序一致） */
-  const lakeIds = async (tenantId: string, snapshot: { table: string }) => {
-    const [schema, name] = snapshot.table.split('.');
-    return (await onLake<{ consumer_id: string }>(tenantId, `SELECT consumer_id FROM ${schema}."${name}" ORDER BY consumer_id`)).map(r => r.consumer_id);
-  };
-  const consumerIds = (html: string) => [...html.matchAll(/data-consumer="([^"]+)"/g)].map(m => m[1]!);
-  /** 页面上金额的写法（与路由里的 money 一致） */
-  const money = (n: number) => `¥${n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-
-  it('复购页顶部卡片写复购率（X / Y 人）与到第二单天数中位数（与湖上一致），下方有按 consumer_id 升序的分页明细；页面上没有明文', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    await runTask(acme, 'gold.repurchase', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'repurchase')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const browser = await loginAs(app, 'viewer@acme.com');
-
-    const expected = await repurchaseExpected(acme, snapshot);
-    // 默认 windowDays 90：crm 4 与 crm 5 在窗口内复购（相隔 29 与 80 天），中位数 (29+80)/2
-    expect(expected).toMatchObject({ total: 5, repurchased: 2, medianDaysToSecond: 54.5 });
-
-    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
-    expect(html).toContain('复购 · 2024-07-01');
-    expect(html).toContain(`data-repurchase-rate="${((expected.repurchased / expected.total) * 100).toFixed(1)}%"`);
-    expect(html).toContain(`data-repurchase-count="${expected.repurchased}"`);
-    expect(html).toContain(`data-total-count="${expected.total}"`);
-    expect(html).toContain(`data-median-days="${expected.medianDaysToSecond} 天"`);
-    expect(html).toContain(`${expected.repurchased} / ${expected.total} 人`);
-    // 明细按 consumer_id 升序分页（通用明细，不筛选）：5 人一页全列出，与湖上按 consumer_id 排序的全部 id 一致
-    expect(consumerIds(html)).toHaveLength(expected.total);
-    expect(consumerIds(html)).toEqual(await lakeIds(acme, snapshot));
-    expect(html).toContain('第 1 / 1 页');
-    for (const p of PLAINTEXT) expect(html).not.toContain(p);
-  });
-
-  it('CLV 页顶部卡片写前 10% 的人贡献的 clv 占比、CLV 合计，十档表的人数与合计和湖上 ntile(10) 分组一致；下方有分页明细；页面上没有明文', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    await runTask(acme, 'gold.clv', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'clv')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const browser = await loginAs(app, 'viewer@acme.com');
-
-    const expected = await clvExpected(acme, snapshot);
-    // 这份数据只有 5 位消费者：只列出有人的 5 档，每档 1 人，第 1 档就是 clv 最高的那位
-    expect(expected.deciles.map(d => d.consumers)).toEqual([1, 1, 1, 1, 1]);
-
-    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
-    expect(html).toContain('CLV · 2024-07-01');
-    expect(html).toContain(`data-clv-top-share="${(expected.topShare! * 100).toFixed(1)}%"`);
-    expect(html).toContain(money(expected.totalClv));
-    // 十档表只列有人的档，每行的人数与 clv 合计与湖上分组一致
-    const decileRows = [...html.matchAll(/data-clv-decile="(\d+)"([\s\S]*?)(?=data-clv-decile=|<\/tbody>)/g)];
-    expect(decileRows.map(m => Number(m[1]))).toEqual(expected.deciles.map(d => d.decile));
-    for (const [i, row] of decileRows.entries()) {
-      expect(row[2]).toContain(`data-clv-decile-consumers="${expected.deciles[i]!.consumers}"`);
-      expect(row[2]).toContain(money(expected.deciles[i]!.clv));
-    }
-    expect(html).toContain('第 1 / 1 页');
-    expect(snapshot.rowCount).toBe(5);
-    expect(consumerIds(html)).toHaveLength(snapshot.rowCount);
-    expect(consumerIds(html)).toEqual(await lakeIds(acme, snapshot));
-    for (const p of PLAINTEXT) expect(html).not.toContain(p);
-  });
-
-  it('readRepurchaseSnapshot / readClvSnapshot 翻页：每页 2 位时 3 页拼起来与湖上按 consumer_id 排序的全部 id 一致、不重不漏，汇总不随页码变化', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    await runTask(acme, 'gold.repurchase', { asOf: '2024-07-01' });
-    await runTask(acme, 'gold.clv', { asOf: '2024-07-01' });
-    const repurchase = (await listSnapshots(acme, 'repurchase')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
-    const clv = (await listSnapshots(acme, 'clv')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
-
-    const repurchaseIds = await lakeIds(acme, repurchase);
-    expect(repurchaseIds).toHaveLength(5);
-    const repurchasePages = await Promise.all([1, 2, 3].map(page => readRepurchaseSnapshot(repurchase, { page, pageSize: 2 })));
-    expect(repurchasePages.map(p => p.rows.length)).toEqual([2, 2, 1]);
-    expect(repurchasePages.flatMap(p => p.rows.map(r => r.consumer_id))).toEqual(repurchaseIds);
-    const repurchaseSummary = await repurchaseExpected(acme, repurchase);
-    for (const p of repurchasePages) {
-      expect({ total: p.total, repurchased: p.repurchased, medianDaysToSecond: p.medianDaysToSecond }).toEqual(repurchaseSummary);
-    }
-
-    const clvIds = await lakeIds(acme, clv);
-    expect(clvIds).toHaveLength(5);
-    const clvPages = await Promise.all([1, 2, 3].map(page => readClvSnapshot(clv, { page, pageSize: 2 })));
-    expect(clvPages.map(p => p.rows.length)).toEqual([2, 2, 1]);
-    expect(clvPages.flatMap(p => p.rows.map(r => r.consumer_id))).toEqual(clvIds);
-    const clvSummary = await clvExpected(acme, clv);
-    for (const p of clvPages) {
-      expect(p.deciles.map(d => ({ ...d, clv: Number(d.clv) }))).toEqual(clvSummary.deciles);
-      expect(p.topShare).toBe(clvSummary.topShare);
-      expect(Number(p.totalClv)).toBe(clvSummary.totalClv);
-    }
-  });
 
   it('没人复购时天数中位数显示「—」（复购率为 0.0%）、总 clv 为 0 时头部占比显示「—」，不除零；明细照常', async () => {
     const { acme } = await publishedIdentitySources({ orders: true });
@@ -816,66 +626,6 @@ describe('复购与 CLV 快照页（#835）', () => {
     const clvHtml = await (await browser.get(`/analytics/snapshots/${clv.id}`)).text();
     expect(clvHtml).toContain('data-clv-top-share="—"');
     expect(clvHtml).toContain('第 1 / 1 页');
-  });
-});
-
-describe('同期群快照页（#836）', () => {
-  beforeEach(fresh);
-
-  it('默认打开留存矩阵：行按 cohort_start 升序，每格的人数与湖上按 unnest(active_periods) 分组的计数一致、第 0 期都是 100.0%、没人下单的期补 0；卡片写同期群数、总人数与粒度；页面没有明文', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    await runTask(acme, 'gold.cohort', { asOf: '2024-07-01' });
-    const snapshot = (await listSnapshots(acme, 'cohort')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const browser = await loginAs(app, 'viewer@acme.com');
-
-    // 湖上按同一口径算出期望矩阵：各 cohort_start 在每个偏移期有下单的人数
-    const [schema, name] = snapshot.table.split('.');
-    const expected = (await onLake<{ cohort_start: string; p: number; consumers: string }>(acme,
-      `SELECT cohort_start::VARCHAR AS cohort_start, p, count(*) AS consumers FROM (SELECT cohort_start, unnest(active_periods) AS p FROM ${schema}."${name}") GROUP BY ALL ORDER BY ALL`))
-      .map(e => ({ cohort: e.cohort_start, period: Number(e.p), consumers: Number(e.consumers) }));
-    // 直接入队的任务参数也补齐了定义默认值：按月 12 期
-    const { granularity, periods } = snapshot.params as { granularity: string; periods: number };
-    expect({ granularity, periods }).toEqual({ granularity: 'month', periods: 12 });
-    const cohorts = [...new Set(expected.map(e => e.cohort))].sort();
-
-    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
-    expect(html).toContain('同期群 · 2024-07-01');
-    // 格子带 data-cohort / data-period / data-consumers，内容是「人数 / 留存率」
-    const cells = [...html.matchAll(/data-cohort="([^"]+)" data-period="(\d+)" data-consumers="(\d+)"[^>]*>([^<]*)/g)]
-      .map(m => ({ cohort: m[1]!, period: Number(m[2]!), consumers: Number(m[3]!), text: m[4]! }));
-    // 行按 cohort_start 升序，每行第 0…periods-1 期都有格子
-    expect([...new Set(cells.map(c => c.cohort))]).toEqual(cohorts);
-    expect(cells.filter(c => c.cohort === cohorts[0]).map(c => c.period)).toEqual([...Array(periods).keys()]);
-    // 每个非零格子的人数与湖上分组一致
-    for (const e of expected) {
-      expect(cells.find(c => c.cohort === e.cohort && c.period === e.period)?.consumers).toBe(e.consumers);
-    }
-    // 第 0 期是整群人数，留存率 100.0%
-    for (const cohort of cohorts) {
-      expect(cells.find(c => c.cohort === cohort && c.period === 0)?.text).toContain('100.0%');
-    }
-    // 湖上没有的 (cohort, period) 组合补 0
-    const missing = (() => {
-      for (const cohort of cohorts) {
-        for (let period = 0; period < periods; period++) {
-          if (!expected.some(e => e.cohort === cohort && e.period === period)) return { cohort, period };
-        }
-      }
-      throw new Error('湖上每个格子都有人下单，找不到该补 0 的格子');
-    })();
-    const zeroCell = cells.find(c => c.cohort === missing.cohort && c.period === missing.period);
-    expect(zeroCell?.consumers).toBe(0);
-    expect(zeroCell?.text).toContain('0.0%');
-    // 卡片：同期群数、总人数（= 快照行数 = 各行第 0 期合计）、粒度
-    expect(html).toContain(`data-cohort-count="${cohorts.length}"`);
-    expect(html).toContain(`data-cohort-total="${snapshot.rowCount}"`);
-    expect(html).toContain('data-cohort-granularity="month"');
-    expect(html).toContain('按月');
-    // 逐人明细在另一个标签页，默认页不带 data-consumer
-    expect(html).toContain('data-tab="consumers"');
-    expect(html).not.toMatch(/data-consumer="/);
-    for (const p of PLAINTEXT) expect(html).not.toContain(p);
   });
 });
 
@@ -1142,6 +892,273 @@ describe('模板升级', () => {
   });
 });
 
+/** 在湖上按同一口径算出这张快照的汇总（总数、有风险数）与两个口径下按沉默比排序的 consumer_id（表名来自快照登记） */
+const lakeExpected = async (tenantId: string, snapshot: { table: string }) => {
+  const [schema, name] = snapshot.table.split('.');
+  const table = `${schema}."${name}"`;
+  const [totals] = await onLake<{ total: string; at_risk: string }>(tenantId,
+    `SELECT count(*) AS total, count(*) FILTER (WHERE at_risk) AS at_risk FROM ${table}`);
+  const ids = (where: string) => onLake<{ consumer_id: string }>(tenantId,
+    `SELECT consumer_id FROM ${table} ${where} ORDER BY silence_ratio DESC NULLS LAST, consumer_id`).then(rs => rs.map(r => r.consumer_id));
+  return { total: Number(totals!.total), atRisk: Number(totals!.at_risk), atRiskIds: await ids('WHERE at_risk'), allIds: await ids('') };
+};
+
+/** 在湖上按同一口径算出这张复购快照的汇总：总人数、复购人数与到第二单天数的中位数（median 自动跳过 NULL） */
+const repurchaseExpected = async (tenantId: string, snapshot: { table: string }) => {
+  const [schema, name] = snapshot.table.split('.');
+  const table = `${schema}."${name}"`;
+  const [totals] = await onLake<{ total: string; repurchased: string; median_days_to_second: number | null }>(tenantId,
+    `SELECT count(*) AS total, count(*) FILTER (WHERE repurchased) AS repurchased, median(days_to_second) AS median_days_to_second FROM ${table}`);
+  return { total: Number(totals!.total), repurchased: Number(totals!.repurchased), medianDaysToSecond: totals!.median_days_to_second };
+};
+
+/** 在湖上按同一口径算出这张 CLV 快照的十档分布（ntile 同值按 consumer_id 排序，分档才稳定）与头部 10% 的贡献占比 */
+const clvExpected = async (tenantId: string, snapshot: { table: string }) => {
+  const [schema, name] = snapshot.table.split('.');
+  const table = `${schema}."${name}"`;
+  const deciles = await onLake<{ decile: number; consumers: string; clv: string | null }>(tenantId, `
+    SELECT decile, count(*) AS consumers, sum(clv)::VARCHAR AS clv FROM (
+      SELECT ntile(10) OVER (ORDER BY clv DESC, consumer_id) AS decile, clv FROM ${table}
+    ) GROUP BY decile ORDER BY decile`);
+  const [total] = await onLake<{ total_clv: string | null }>(tenantId, `SELECT coalesce(sum(clv), 0)::VARCHAR AS total_clv FROM ${table}`);
+  const top = deciles.find(d => Number(d.decile) === 1);
+  return {
+    deciles: deciles.map(d => ({ decile: Number(d.decile), consumers: Number(d.consumers), clv: Number(d.clv ?? 0) })),
+    totalClv: Number(total!.total_clv ?? 0),
+    topShare: Number(total!.total_clv ?? 0) > 0 && top ? Number(top.clv ?? 0) / Number(total!.total_clv) : null,
+  };
+};
+
+/** 湖上这张快照全部 consumer_id，按 consumer_id 升序（与明细的分页顺序一致） */
+const lakeIds = async (tenantId: string, snapshot: { table: string }) => {
+  const [schema, name] = snapshot.table.split('.');
+  return (await onLake<{ consumer_id: string }>(tenantId, `SELECT consumer_id FROM ${schema}."${name}" ORDER BY consumer_id`)).map(r => r.consumer_id);
+};
+const consumerIds = (html: string) => [...html.matchAll(/data-consumer="([^"]+)"/g)].map(m => m[1]!);
+/** 页面上金额的写法（与路由里的 money 一致） */
+const money = (n: number) => `¥${n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+// 三组只读快照页用例共用一次 { orders: true } 加五张快照：这三组连续写在「指标与标签快照详情」（它的夹具自己先 fresh()）之前、
+// 所有 beforeEach(fresh) 组之后，中间不能夹每用例清库的组，否则后面的组拿到的是被清掉的库
+async function ordersFixture() {
+  const { acme } = await publishedIdentitySources({ orders: true });
+  await runTask(acme, 'gold.churn', { asOf: '2024-10-15' });
+  await runTask(acme, 'gold.churn', { asOf: '2024-09-15', minOrders: 2 });
+  await runTask(acme, 'gold.repurchase', { asOf: '2024-07-01' });
+  await runTask(acme, 'gold.clv', { asOf: '2024-07-01' });
+  await runTask(acme, 'gold.cohort', { asOf: '2024-07-01' });
+  await memberOf(acme, 'viewer@acme.com', 'viewer');
+  return { acme };
+}
+
+let ordersOnce: ReturnType<typeof ordersFixture> | undefined;
+const ordersSnapshots = () => (ordersOnce ??= fresh().then(ordersFixture));
+
+describe('流失预警快照页（#834）', () => {
+  let shared: Awaited<ReturnType<typeof ordersSnapshots>>;
+  beforeAll(async () => { shared = await ordersSnapshots(); }, 180_000); // 共用的夹具要跑一次 publishedIdentitySources，超过默认 hookTimeout
+
+  it('顶部汇总卡片写有风险人数、占比与总人数（与湖上一致），明细默认只列有风险的人、沉默比从高到低，?tab=all 看全部；页面上没有明文', async () => {
+    const { acme } = shared;
+    // 默认参数 2024-10-15：共 1 位且在风险里；minOrders 2 的 2024-09-15：共 3 位、其中 2 位有风险（沉默比各不相同）
+    const mixed = (await listSnapshots(acme, 'churn')).find(s => (s.params as { asOf: string }).asOf === '2024-09-15')!;
+    const single = (await listSnapshots(acme, 'churn')).find(s => (s.params as { asOf: string }).asOf === '2024-10-15')!;
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    const expected = await lakeExpected(acme, mixed);
+    expect(expected).toMatchObject({ total: 3, atRisk: 2 });
+
+    const html = await (await browser.get(`/analytics/snapshots/${mixed.id}`)).text();
+    expect(html).toContain('流失预警 · 2024-09-15');
+    expect(html).toMatch(/有风险人数.*?>2</s);
+    expect(html).toMatch(/风险占比.*?>66\.7%</s);
+    expect(html).toMatch(/总人数.*?>3</s);
+    // 默认只列有风险的人，行序与湖上按沉默比降序的一致；标签页可以切到全部
+    expect(consumerIds(html)).toEqual(expected.atRiskIds);
+    expect(html).toContain('第 1 / 1 页');
+    expect(html).toMatch(/data-tab="all"[^>]*href="[^"]*\?tab=all"/);
+
+    const all = await (await browser.get(`/analytics/snapshots/${mixed.id}?tab=all`)).text();
+    expect(consumerIds(all)).toEqual(expected.allIds);
+    expect(all).toContain('data-tab="at-risk"');
+    // 页码超出时停在最后一页
+    expect(await (await browser.get(`/analytics/snapshots/${mixed.id}?tab=all&page=9`)).text()).toContain('第 1 / 1 页');
+    for (const text of [html, all]) for (const p of PLAINTEXT) expect(text).not.toContain(p);
+
+    // 只有一位且在风险里：卡片与明细同样成立
+    const one = await lakeExpected(acme, single);
+    expect(one).toMatchObject({ total: 1, atRisk: 1 });
+    const singleHtml = await (await browser.get(`/analytics/snapshots/${single.id}`)).text();
+    expect(singleHtml).toMatch(/有风险人数.*?>1</s);
+    expect(singleHtml).toMatch(/风险占比.*?>100\.0%</s);
+    expect(consumerIds(singleHtml)).toEqual(one.atRiskIds);
+  });
+
+  it('readChurnSnapshot 分页总数按筛选后的行数算：每页 2 位时「全部」2 页、「有风险」1 页，页码超出停在最后一页，两页合起来不重不漏', async () => {
+    const { acme } = shared;
+    const snapshot = (await listSnapshots(acme, 'churn')).find(s => (s.params as { asOf: string }).asOf === '2024-09-15')!;
+    const expected = await lakeExpected(acme, snapshot);
+
+    const atRisk = await readChurnSnapshot(snapshot, { page: 9, filter: 'at-risk', pageSize: 2 });
+    expect(atRisk).toMatchObject({ page: 1, pages: 1, total: 3, atRisk: 2, filteredCount: 2 });
+    expect(atRisk.rows.map(r => r.consumer_id)).toEqual(expected.atRiskIds);
+    expect(atRisk.rows.every(r => r.at_risk)).toBe(true);
+    // 沉默比从高到低（同值按 consumer_id）
+    const ratios = atRisk.rows.map(r => r.silence_ratio);
+    expect([...ratios].sort((a, b) => b - a)).toEqual(ratios);
+
+    const first = await readChurnSnapshot(snapshot, { page: 1, filter: 'all', pageSize: 2 });
+    const last = await readChurnSnapshot(snapshot, { page: 9, filter: 'all', pageSize: 2 });
+    expect(first).toMatchObject({ page: 1, pages: 2, filteredCount: 3 });
+    expect(last.page).toBe(2);
+    expect([...first.rows, ...last.rows].map(r => r.consumer_id)).toEqual(expected.allIds);
+    expect([...first.rows, ...last.rows].filter(r => r.at_risk)).toHaveLength(2);
+  });
+});
+
+describe('复购与 CLV 快照页（#835）', () => {
+  let shared: Awaited<ReturnType<typeof ordersSnapshots>>;
+  beforeAll(async () => { shared = await ordersSnapshots(); }, 180_000); // 共用的夹具要跑一次 publishedIdentitySources，超过默认 hookTimeout
+
+  it('复购页顶部卡片写复购率（X / Y 人）与到第二单天数中位数（与湖上一致），下方有按 consumer_id 升序的分页明细；页面上没有明文', async () => {
+    const { acme } = shared;
+    const snapshot = (await listSnapshots(acme, 'repurchase')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    const expected = await repurchaseExpected(acme, snapshot);
+    // 默认 windowDays 90：crm 4 与 crm 5 在窗口内复购（相隔 29 与 80 天），中位数 (29+80)/2
+    expect(expected).toMatchObject({ total: 5, repurchased: 2, medianDaysToSecond: 54.5 });
+
+    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
+    expect(html).toContain('复购 · 2024-07-01');
+    expect(html).toContain(`data-repurchase-rate="${((expected.repurchased / expected.total) * 100).toFixed(1)}%"`);
+    expect(html).toContain(`data-repurchase-count="${expected.repurchased}"`);
+    expect(html).toContain(`data-total-count="${expected.total}"`);
+    expect(html).toContain(`data-median-days="${expected.medianDaysToSecond} 天"`);
+    expect(html).toContain(`${expected.repurchased} / ${expected.total} 人`);
+    // 明细按 consumer_id 升序分页（通用明细，不筛选）：5 人一页全列出，与湖上按 consumer_id 排序的全部 id 一致
+    expect(consumerIds(html)).toHaveLength(expected.total);
+    expect(consumerIds(html)).toEqual(await lakeIds(acme, snapshot));
+    expect(html).toContain('第 1 / 1 页');
+    for (const p of PLAINTEXT) expect(html).not.toContain(p);
+  });
+
+  it('CLV 页顶部卡片写前 10% 的人贡献的 clv 占比、CLV 合计，十档表的人数与合计和湖上 ntile(10) 分组一致；下方有分页明细；页面上没有明文', async () => {
+    const { acme } = shared;
+    const snapshot = (await listSnapshots(acme, 'clv')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    const expected = await clvExpected(acme, snapshot);
+    // 这份数据只有 5 位消费者：只列出有人的 5 档，每档 1 人，第 1 档就是 clv 最高的那位
+    expect(expected.deciles.map(d => d.consumers)).toEqual([1, 1, 1, 1, 1]);
+
+    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
+    expect(html).toContain('CLV · 2024-07-01');
+    expect(html).toContain(`data-clv-top-share="${(expected.topShare! * 100).toFixed(1)}%"`);
+    expect(html).toContain(money(expected.totalClv));
+    // 十档表只列有人的档，每行的人数与 clv 合计与湖上分组一致
+    const decileRows = [...html.matchAll(/data-clv-decile="(\d+)"([\s\S]*?)(?=data-clv-decile=|<\/tbody>)/g)];
+    expect(decileRows.map(m => Number(m[1]))).toEqual(expected.deciles.map(d => d.decile));
+    for (const [i, row] of decileRows.entries()) {
+      expect(row[2]).toContain(`data-clv-decile-consumers="${expected.deciles[i]!.consumers}"`);
+      expect(row[2]).toContain(money(expected.deciles[i]!.clv));
+    }
+    expect(html).toContain('第 1 / 1 页');
+    expect(snapshot.rowCount).toBe(5);
+    expect(consumerIds(html)).toHaveLength(snapshot.rowCount);
+    expect(consumerIds(html)).toEqual(await lakeIds(acme, snapshot));
+    for (const p of PLAINTEXT) expect(html).not.toContain(p);
+  });
+
+  it('readRepurchaseSnapshot / readClvSnapshot 翻页：每页 2 位时 3 页拼起来与湖上按 consumer_id 排序的全部 id 一致、不重不漏，汇总不随页码变化', async () => {
+    const { acme } = shared;
+    const repurchase = (await listSnapshots(acme, 'repurchase')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
+    const clv = (await listSnapshots(acme, 'clv')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
+
+    const repurchaseIds = await lakeIds(acme, repurchase);
+    expect(repurchaseIds).toHaveLength(5);
+    const repurchasePages = await Promise.all([1, 2, 3].map(page => readRepurchaseSnapshot(repurchase, { page, pageSize: 2 })));
+    expect(repurchasePages.map(p => p.rows.length)).toEqual([2, 2, 1]);
+    expect(repurchasePages.flatMap(p => p.rows.map(r => r.consumer_id))).toEqual(repurchaseIds);
+    const repurchaseSummary = await repurchaseExpected(acme, repurchase);
+    for (const p of repurchasePages) {
+      expect({ total: p.total, repurchased: p.repurchased, medianDaysToSecond: p.medianDaysToSecond }).toEqual(repurchaseSummary);
+    }
+
+    const clvIds = await lakeIds(acme, clv);
+    expect(clvIds).toHaveLength(5);
+    const clvPages = await Promise.all([1, 2, 3].map(page => readClvSnapshot(clv, { page, pageSize: 2 })));
+    expect(clvPages.map(p => p.rows.length)).toEqual([2, 2, 1]);
+    expect(clvPages.flatMap(p => p.rows.map(r => r.consumer_id))).toEqual(clvIds);
+    const clvSummary = await clvExpected(acme, clv);
+    for (const p of clvPages) {
+      expect(p.deciles.map(d => ({ ...d, clv: Number(d.clv) }))).toEqual(clvSummary.deciles);
+      expect(p.topShare).toBe(clvSummary.topShare);
+      expect(Number(p.totalClv)).toBe(clvSummary.totalClv);
+    }
+  });
+
+});
+
+describe('同期群快照页（#836）', () => {
+  let shared: Awaited<ReturnType<typeof ordersSnapshots>>;
+  beforeAll(async () => { shared = await ordersSnapshots(); }, 180_000); // 共用的夹具要跑一次 publishedIdentitySources，超过默认 hookTimeout
+
+  it('默认打开留存矩阵：行按 cohort_start 升序，每格的人数与湖上按 unnest(active_periods) 分组的计数一致、第 0 期都是 100.0%、没人下单的期补 0；卡片写同期群数、总人数与粒度；页面没有明文', async () => {
+    const { acme } = shared;
+    const snapshot = (await listSnapshots(acme, 'cohort')).find(s => (s.params as { asOf: string }).asOf === '2024-07-01')!;
+    const browser = await loginAs(app, 'viewer@acme.com');
+
+    // 湖上按同一口径算出期望矩阵：各 cohort_start 在每个偏移期有下单的人数
+    const [schema, name] = snapshot.table.split('.');
+    const expected = (await onLake<{ cohort_start: string; p: number; consumers: string }>(acme,
+      `SELECT cohort_start::VARCHAR AS cohort_start, p, count(*) AS consumers FROM (SELECT cohort_start, unnest(active_periods) AS p FROM ${schema}."${name}") GROUP BY ALL ORDER BY ALL`))
+      .map(e => ({ cohort: e.cohort_start, period: Number(e.p), consumers: Number(e.consumers) }));
+    // 直接入队的任务参数也补齐了定义默认值：按月 12 期
+    const { granularity, periods } = snapshot.params as { granularity: string; periods: number };
+    expect({ granularity, periods }).toEqual({ granularity: 'month', periods: 12 });
+    const cohorts = [...new Set(expected.map(e => e.cohort))].sort();
+
+    const html = await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text();
+    expect(html).toContain('同期群 · 2024-07-01');
+    // 格子带 data-cohort / data-period / data-consumers，内容是「人数 / 留存率」
+    const cells = [...html.matchAll(/data-cohort="([^"]+)" data-period="(\d+)" data-consumers="(\d+)"[^>]*>([^<]*)/g)]
+      .map(m => ({ cohort: m[1]!, period: Number(m[2]!), consumers: Number(m[3]!), text: m[4]! }));
+    // 行按 cohort_start 升序，每行第 0…periods-1 期都有格子
+    expect([...new Set(cells.map(c => c.cohort))]).toEqual(cohorts);
+    expect(cells.filter(c => c.cohort === cohorts[0]).map(c => c.period)).toEqual([...Array(periods).keys()]);
+    // 每个非零格子的人数与湖上分组一致
+    for (const e of expected) {
+      expect(cells.find(c => c.cohort === e.cohort && c.period === e.period)?.consumers).toBe(e.consumers);
+    }
+    // 第 0 期是整群人数，留存率 100.0%
+    for (const cohort of cohorts) {
+      expect(cells.find(c => c.cohort === cohort && c.period === 0)?.text).toContain('100.0%');
+    }
+    // 湖上没有的 (cohort, period) 组合补 0
+    const missing = (() => {
+      for (const cohort of cohorts) {
+        for (let period = 0; period < periods; period++) {
+          if (!expected.some(e => e.cohort === cohort && e.period === period)) return { cohort, period };
+        }
+      }
+      throw new Error('湖上每个格子都有人下单，找不到该补 0 的格子');
+    })();
+    const zeroCell = cells.find(c => c.cohort === missing.cohort && c.period === missing.period);
+    expect(zeroCell?.consumers).toBe(0);
+    expect(zeroCell?.text).toContain('0.0%');
+    // 卡片：同期群数、总人数（= 快照行数 = 各行第 0 期合计）、粒度
+    expect(html).toContain(`data-cohort-count="${cohorts.length}"`);
+    expect(html).toContain(`data-cohort-total="${snapshot.rowCount}"`);
+    expect(html).toContain('data-cohort-granularity="month"');
+    expect(html).toContain('按月');
+    // 逐人明细在另一个标签页，默认页不带 data-consumer
+    expect(html).toContain('data-tab="consumers"');
+    expect(html).not.toMatch(/data-consumer="/);
+    for (const p of PLAINTEXT) expect(html).not.toContain(p);
+  });
+});
+
 /** 不带维度的指标（标签只能引用没有维度的指标） */
 const REVENUE_TOTAL = 'base: order\nmeasure: { agg: sum, field: amount }\n';
 
@@ -1238,3 +1255,4 @@ describe('指标与标签快照详情', () => {
     expect(anon.headers.get('Location')).toBe('/login');
   });
 });
+
