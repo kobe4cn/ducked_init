@@ -11,7 +11,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { and, eq, sql } from 'drizzle-orm';
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -33,12 +33,27 @@ import { CRM_ORDERS, publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
-beforeEach(async () => { await resetDb(); });
+const fresh = () => resetDb();
+
+type Fixture = Awaited<ReturnType<typeof publishedIdentitySources>>;
+
+// 订单共享组：「标签定义」「发布前的影响预览」「多指标标签」与「所属空间（ADR-0048）」的不隔离用例连续排在
+// 「删除定义」之前，中间不夹 beforeEach(fresh) 的组。哪一组先跑（-t 单独跑时就是那一组），它的 beforeAll 清库
+// 并造一次带订单的 acme，其余组 await 同一个 Promise。组里的用例只建 / 发布自己独占键名的定义、跑以自己任务 id
+// 命名的 gold 表（不撞），不 newTenant('acme')、不断言租户内全部定义 / 快照 / 任务的条数
+let ordersOnce: Promise<Fixture> | undefined;
+const sharedOrders = () => (ordersOnce ??= fresh().then(() => publishedIdentitySources({ orders: true })));
+
+// 无订单共享组：「样本预览」「发布与丢弃」各挪一个用例到文件末尾的同名 describe，共用同一份不带订单的夹具
+let peopleOnce: Promise<Fixture> | undefined;
+const sharedPeople = () => (peopleOnce ??= fresh().then(() => publishedIdentitySources()));
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: created_at, days: 30 }\n';
 const REVENUE_BY_CITY = `${REVENUE}dimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n`;
 
 describe('指标定义', () => {
+  beforeEach(fresh);
+
   it('新建后再次保存改的是同一份草稿，记下作者与最后保存的人；定义页给出编译出的 SQL', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
@@ -147,6 +162,8 @@ async function ordersWithStores() {
 const BY_STORE = 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: store, path: order.store_id -> custom_store.name }\n';
 
 describe('样本预览', () => {
+  beforeEach(fresh);
+
   it('在只读挂载上按今天运行编译出的 SQL，给出前 50 行与总行数；关联不到门店的记「未关联」，打通不到消费者的订单不计入；湖与任务不变', async () => {
     const { acme } = await ordersWithStores();
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
@@ -188,12 +205,6 @@ describe('样本预览', () => {
     await expect(previewDefinition(viewer, 'metric', 'revenue')).rejects.toThrow(/标准层还没有/);
   });
 
-  it('只发布了 customer 映射、还没有订单时说明缺 silver.order', async () => {
-    const { acme } = await publishedIdentitySources();
-    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
-    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
-    await expect(previewDefinition(analyst, 'metric', 'revenue')).rejects.toThrow(/标准层还没有.*silver\.order.*发布.*映射并合并/);
-  });
 });
 
 // 不限时间窗口：覆盖夹具里 2024 年的订单
@@ -203,6 +214,8 @@ const ORDERS = 'base: order\nmeasure: { agg: count }\n';
 const MIXED = 'rules:\n  - { value: big, when: { all: [{ metric: revenue, gte: 100 }, { metric: orders, gte: 2 }] } }\ndefault: other\n';
 
 describe('字段路径（ADR-0038）', () => {
+  beforeEach(fresh);
+
   it('filter 写路径的指标能发布，结果与手写 SQL 一致；只合并门店后定时刷新入队它、不入队只依赖订单的指标；停用门店映射时影响里列出它', async () => {
     const { acme, author, reviewer, sources: { crm } } = await ordersWithStores();
     await createDefinition(author, 'metric', 'store_one', 'base: order\nmeasure: { agg: count }\nfilter:\n  - { field: order.store_id -> custom_store.name, op: eq, value: 一店 }\n');
@@ -264,6 +277,8 @@ async function ordersWithItems() {
 }
 
 describe('基础实体经一跳关联消费者（ADR-0038）', () => {
+  beforeEach(fresh);
+
   it('订单明细的奶粉消费金额能发布，结果与手写 SQL 一致（已退款、打通不到、订单不存在的明细不计入）；引用它的奶粉人群标签能发布并算出', async () => {
     const { acme, author, reviewer } = await ordersWithItems();
     await createDefinition(author, 'metric', 'milk_revenue', 'base: order_item\nmeasure: { agg: sum, field: amount }\nfilter:\n'
@@ -291,6 +306,8 @@ describe('基础实体经一跳关联消费者（ADR-0038）', () => {
 });
 
 describe('发布与丢弃', () => {
+  beforeEach(fresh);
+
   it('分析师不能发布；另一位数据工程师发布后以当天入队 gold.dsl，成功后登记快照；再改是新一版草稿，再发布只新增快照（双人规则见 publishing.test.ts）', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
@@ -332,15 +349,6 @@ describe('发布与丢弃', () => {
     expect(snapshots).toHaveLength(2);
     expect(snapshots.find(s => s.taskId === second.id)).toMatchObject({ template: 'metric:revenue', definitionVersion: 2 });
     expect(snapshots.find(s => s.taskId === task.id)).toEqual(first);
-  });
-
-  it('任务失败（标准层还没有订单）时不登记快照', async () => {
-    const { acme, author, reviewer } = await publishedIdentitySources();
-    await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
-    const task = await publishDefinition(reviewer, 'metric', 'revenue', 1);
-    await drain();
-    expect(await getTask(task.id)).toMatchObject({ status: 'failed', error: expect.stringMatching(/silver\.order/) });
-    expect(await listSnapshots(acme)).toEqual([]);
   });
 
   it('丢弃草稿：查看者 403；从没发布过返回 { kept: false } 并删除定义；没有草稿 400；有已发布版本返回 { kept: true }，回到它', async () => {
@@ -407,8 +415,11 @@ describe('发布与丢弃', () => {
 });
 
 describe('标签定义', () => {
+  let shared: Fixture;
+  beforeAll(async () => { shared = await sharedOrders(); }, 180_000); // 共用的带订单夹具：打通三个源、发布订单映射并合并，并行跑满时超过默认 hookTimeout 60 s
+
   it('只认指标的已发布版本；双人发布后快照为 consumer_id、tag_key、tag_value，覆盖全部统一消费者（不在指标结果里的按 0 比较）；发布第二版键不变、定义版本递增', async () => {
-    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const { acme, author, reviewer } = shared;
     await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
     const tiers = (threshold: number, high = 'high') => `metric: revenue\nrules:\n  - { value: ${high}, when: { gte: ${threshold} } }\ndefault: low\n`;
     // 指标还只是草稿：标签引用不到
@@ -452,7 +463,7 @@ describe('标签定义', () => {
   });
 
   it('引用带维度的指标、rules 为空被拒，不写入', async () => {
-    const { author, reviewer } = await publishedIdentitySources({ orders: true });
+    const { author, reviewer } = shared;
     await createDefinition(author, 'metric', 'revenue_by_city', REVENUE_BY_CITY);
     await publishDefinition(reviewer, 'metric', 'revenue_by_city', 1);
     await expect(createDefinition(author, 'tag', 'city_tier', 'metric: revenue_by_city\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n'))
@@ -464,74 +475,109 @@ describe('标签定义', () => {
 });
 
 describe('发布前的影响预览', () => {
+  let shared: Fixture;
+  beforeAll(async () => { shared = await sharedOrders(); }, 180_000); // 同一份订单共享夹具：-t 单独跑本组时由这里先造
+
   it('指标草稿：给出指标与引用它的已发布标签的变化计数；标签草稿只算它自己；不出 consumer_id，湖与任务不变', async () => {
-    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
-    await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
-    const metricTask = await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    const { acme, author, reviewer } = shared;
+    await createDefinition(author, 'metric', 'revenue_impact', ALL_REVENUE);
+    const metricTask = await publishDefinition(reviewer, 'metric', 'revenue_impact', 1);
     await drain();
     const values = (await onLake<{ value: string }>(acme, `SELECT value::VARCHAR AS value FROM gold."metric__${metricTask.id}"`)).map(m => Number(m.value));
     const threshold = [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]!;
     const high = values.filter(v => v >= threshold).length;
-    const tiers = (t: number) => `metric: revenue\nrules:\n  - { value: high, when: { gte: ${t} } }\ndefault: low\n`;
-    await createDefinition(author, 'tag', 'value_tier', tiers(threshold));
-    await publishDefinition(reviewer, 'tag', 'value_tier', 1);
+    const tiers = (t: number) => `metric: revenue_impact\nrules:\n  - { value: high, when: { gte: ${t} } }\ndefault: low\n`;
+    await createDefinition(author, 'tag', 'impact_tier', tiers(threshold));
+    await publishDefinition(reviewer, 'tag', 'impact_tier', 1);
     await drain();
     // 没有草稿时不显示
-    expect(await impactOf(author, 'metric', 'revenue')).toBeNull();
+    expect(await impactOf(author, 'metric', 'revenue_impact')).toBeNull();
 
     const [before] = await onLake<{ n: string }>(acme, SNAPSHOT);
     const queued = (await getDb().select().from(tasks)).length;
 
     // 过滤掉所有订单：每个消费者都从指标里移出；标签的人群是全部统一消费者，按 0 比较，原来 high 的都换成 low
-    await saveDslDraft(author, 'metric', 'revenue', `${ALL_REVENUE}filter:\n  - { field: amount, op: gt, value: 1000000000 }\n`);
-    const gone = await impactOf(author, 'metric', 'revenue');
+    await saveDslDraft(author, 'metric', 'revenue_impact', `${ALL_REVENUE}filter:\n  - { field: amount, op: gt, value: 1000000000 }\n`);
+    const gone = await impactOf(author, 'metric', 'revenue_impact');
     expect(gone).toMatchObject({ version: 2, published: 1, asOf: new Date().toISOString().slice(0, 10), metric: { changed: 0, added: 0, removed: values.length } });
     expect(gone!.tags).toEqual([{
-      key: 'value_tier', issue: null, changed: high, added: 0, removed: 0,
+      key: 'impact_tier', issue: null, changed: high, added: 0, removed: 0,
       transitions: [{ before: 'high', after: 'low', consumers: high }],
     }]);
     expect(JSON.stringify(gone)).not.toMatch(/[0-9a-f]{64}/);
 
     // 指标加了维度：每个消费者的行都变了；标签按草稿不再通过校验，只给原因
-    await saveDslDraft(author, 'metric', 'revenue', `${ALL_REVENUE}dimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n`);
-    const dimensioned = await impactOf(author, 'metric', 'revenue');
+    await saveDslDraft(author, 'metric', 'revenue_impact', `${ALL_REVENUE}dimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n`);
+    const dimensioned = await impactOf(author, 'metric', 'revenue_impact');
     expect(dimensioned!.metric).toEqual({ changed: values.length, added: 0, removed: 0 });
-    expect(dimensioned!.tags).toEqual([expect.objectContaining({ key: 'value_tier', issue: expect.stringMatching(/带维度/), transitions: [] })]);
+    expect(dimensioned!.tags).toEqual([expect.objectContaining({ key: 'impact_tier', issue: expect.stringMatching(/带维度/), transitions: [] })]);
 
     // 标签草稿把门槛提到最高值之上：原来 high 的都换成 low
-    await saveDslDraft(author, 'tag', 'value_tier', tiers(Math.max(...values) + 1));
-    expect(await impactOf(author, 'tag', 'value_tier')).toMatchObject({
+    await saveDslDraft(author, 'tag', 'impact_tier', tiers(Math.max(...values) + 1));
+    expect(await impactOf(author, 'tag', 'impact_tier')).toMatchObject({
       metric: null,
-      tags: [{ key: 'value_tier', issue: null, changed: high, added: 0, removed: 0, transitions: [{ before: 'high', after: 'low', consumers: high }] }],
+      tags: [{ key: 'impact_tier', issue: null, changed: high, added: 0, removed: 0, transitions: [{ before: 'high', after: 'low', consumers: high }] }],
     });
 
     const [after] = await onLake<{ n: string }>(acme, SNAPSHOT);
     expect(after).toEqual(before);
     expect(await getDb().select().from(tasks)).toHaveLength(queued);
     const outsider = await memberOf(await newTenant('globex'), 'analyst@globex.com', 'analyst');
-    await expect(impactOf(outsider, 'metric', 'revenue')).rejects.toMatchObject({ status: 404 });
+    await expect(impactOf(outsider, 'metric', 'revenue_impact')).rejects.toMatchObject({ status: 404 });
   });
 });
 
 describe('多指标标签', () => {
+  let shared: Fixture;
+  beforeAll(async () => { shared = await sharedOrders(); }, 180_000); // 同一份订单共享夹具：-t 单独跑本组时由这里先造
+
   it('影响预览：草稿改了其中任一指标，引用它的多指标标签都列出', async () => {
-    const { author, reviewer } = await publishedIdentitySources({ orders: true });
-    await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
-    await publishDefinition(reviewer, 'metric', 'revenue', 1);
+    const { author, reviewer } = shared;
+    await createDefinition(author, 'metric', 'revenue_multi', ALL_REVENUE);
+    await publishDefinition(reviewer, 'metric', 'revenue_multi', 1);
     await createDefinition(author, 'metric', 'orders', ORDERS);
     await publishDefinition(reviewer, 'metric', 'orders', 1);
-    await createDefinition(author, 'tag', 'mixed', MIXED);
+    // MIXED 还被「删除定义」的用例引用着：只把本用例 YAML 里的指标键换成组内独占的 revenue_multi
+    await createDefinition(author, 'tag', 'mixed', MIXED.replace('metric: revenue,', 'metric: revenue_multi,'));
     await publishDefinition(reviewer, 'tag', 'mixed', 1);
     await drain();
 
-    for (const key of ['revenue', 'orders']) {
+    for (const key of ['revenue_multi', 'orders']) {
       await saveDslDraft(author, 'metric', key, `base: order\nmeasure: { agg: count }\nfilter:\n  - { field: amount, op: gt, value: 1000000000 }\n`);
       expect((await impactOf(author, 'metric', key))!.tags).toEqual([expect.objectContaining({ key: 'mixed', issue: null })]);
     }
   });
 });
 
+const spaceOf = async (tenantId: string, key: string) => (await getDb().select({ spaceId: dslDefinitions.spaceId }).from(dslDefinitions)
+  .where(and(eq(dslDefinitions.tenantId, tenantId), eq(dslDefinitions.key, key))))[0]?.spaceId;
+
+// 「不按空间隔离」要用带订单的夹具，从「所属空间（ADR-0048）」组搬到订单共享组的末尾；指标与标签的键换成组内
+// 独占的 revenue_space / space_tier，避开「标签定义」建的 revenue / value_tier
+describe('所属空间（ADR-0048）', () => {
+  let shared: Fixture;
+  beforeAll(async () => { shared = await sharedOrders(); }, 180_000); // 同一份订单共享夹具：-t 单独跑本组时由这里先造
+
+  it('不按空间隔离：别的空间的成员能读到、在目录里展开、引用另一个空间建的指标', async () => {
+    const { acme, author, reviewer } = shared;
+    await createDefinition(author, 'metric', 'revenue_space', ALL_REVENUE);
+    await publishDefinition(reviewer, 'metric', 'revenue_space', 1);
+    const other = await memberInNewSpace(acme, 'b@acme.com');
+    expect(other.space.id).not.toBe(author.space.id);
+
+    expect(await getDefinition(other, 'metric', 'revenue_space')).toMatchObject({ key: 'revenue_space', published: { version: 1, yaml: ALL_REVENUE } });
+    const expanded = await runTool(other, 'catalog_expand', { id: 'metric:revenue_space' });
+    expect(expanded).not.toBe('没有这个条目');
+    expect(expanded).toContain('revenue_space');
+    expect(await createDefinition(other, 'tag', 'space_tier', 'metric: revenue_space\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n'))
+      .toEqual({ kind: 'tag', key: 'space_tier', version: 1 });
+    expect(await spaceOf(acme, 'space_tier')).toBe(other.space.id);
+  });
+});
+
 describe('删除定义', () => {
+  beforeEach(fresh);
+
   it('被已发布标签引用的指标不能删并列出标签的键，草稿与标签的旧版本里的引用不算；分析师不能删；删除级联版本并记审计', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
@@ -592,8 +638,7 @@ const RFM_PARAMS = {
 };
 
 describe('所属空间（ADR-0048）', () => {
-  const spaceOf = async (tenantId: string, key: string) => (await getDb().select({ spaceId: dslDefinitions.spaceId }).from(dslDefinitions)
-    .where(and(eq(dslDefinitions.tenantId, tenantId), eq(dslDefinitions.key, key))))[0]?.spaceId;
+  beforeEach(fresh);
 
   it('新建的定义记为创建者的当前空间，别的空间的成员再存一版草稿不改', async () => {
     const acme = await newTenant('acme');
@@ -645,20 +690,33 @@ describe('所属空间（ADR-0048）', () => {
     expect(await spaceOf(globex, 'revenue')).toBe(await defaultSpaceOf(globex));
     expect(await templateSpaceOf(acme)).toBe(await defaultSpaceOf(acme));
   });
+});
 
-  it('不按空间隔离：别的空间的成员能读到、在目录里展开、引用另一个空间建的指标', async () => {
-    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
-    await createDefinition(author, 'metric', 'revenue', ALL_REVENUE);
-    await publishDefinition(reviewer, 'metric', 'revenue', 1);
-    const other = await memberInNewSpace(acme, 'b@acme.com');
-    expect(other.space.id).not.toBe(author.space.id);
+// 无订单共享组的两个用例：从「样本预览」「发布与丢弃」各搬一个到文件末尾的同名 describe。夹具自己先 fresh()，
+// 排在订单共享组之后即可；「发布与丢弃」的指标键换成组内独占的 revenue_failed，避开「样本预览」建的草稿 revenue
+describe('样本预览', () => {
+  let shared: Fixture;
+  beforeAll(async () => { shared = await sharedPeople(); }, 180_000); // 共用的无订单夹具：打通三个源并发布 customer 映射，并行跑满时超过默认 hookTimeout 60 s
 
-    expect(await getDefinition(other, 'metric', 'revenue')).toMatchObject({ key: 'revenue', published: { version: 1, yaml: ALL_REVENUE } });
-    const expanded = await runTool(other, 'catalog_expand', { id: 'metric:revenue' });
-    expect(expanded).not.toBe('没有这个条目');
-    expect(expanded).toContain('revenue');
-    expect(await createDefinition(other, 'tag', 'value_tier', 'metric: revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n'))
-      .toEqual({ kind: 'tag', key: 'value_tier', version: 1 });
-    expect(await spaceOf(acme, 'value_tier')).toBe(other.space.id);
+  it('只发布了 customer 映射、还没有订单时说明缺 silver.order', async () => {
+    const { acme } = shared;
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await expect(previewDefinition(analyst, 'metric', 'revenue')).rejects.toThrow(/标准层还没有.*silver\.order.*发布.*映射并合并/);
+  });
+});
+
+describe('发布与丢弃', () => {
+  let shared: Fixture;
+  beforeAll(async () => { shared = await sharedPeople(); }, 180_000); // 同一份无订单共享夹具：-t 单独跑本组时由这里先造
+
+  it('任务失败（标准层还没有订单）时不登记快照', async () => {
+    const { acme, author, reviewer } = shared;
+    await createDefinition(author, 'metric', 'revenue_failed', ALL_REVENUE);
+    const task = await publishDefinition(reviewer, 'metric', 'revenue_failed', 1);
+    await drain();
+    expect(await getTask(task.id)).toMatchObject({ status: 'failed', error: expect.stringMatching(/silver\.order/) });
+    // 组里「样本预览」的用例只建草稿不发布，租户内仍不会有任何快照
+    expect(await listSnapshots(acme)).toEqual([]);
   });
 });
