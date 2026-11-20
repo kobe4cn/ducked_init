@@ -82,11 +82,13 @@ export const spaces = platform.table('spaces', {
 ]);
 
 // 成员按 (租户, 邮箱) 唯一：同一个邮箱可以分别隶属于多个租户
+// locale 是界面语言（ADR-0060）：只存 'en' / 'zh-CN'，null 表示没设置；同一邮箱各租户的记录保持一致
 export const members = platform.table('members', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
   email: text('email').notNull(),
   role: roleEnum('role').notNull(),
+  locale: text('locale'),
   createdAt: createdAt(),
 }, t => [
   uniqueIndex('members_tenant_email_uq').on(t.tenantId, t.email),

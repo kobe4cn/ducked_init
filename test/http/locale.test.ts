@@ -1,0 +1,135 @@
+// test/http/locale.test.ts —— 界面语言的判断与切换（#945，ADR-0060）：账号 > cookie > 浏览器语言 > 中文
+// 开关 CRM_ENABLE_EN_LOCALE 关闭时整站中文、切换接口 404；打开时按优先级判断，POST /locale 写 cookie 并同步到账号
+import { eq } from 'drizzle-orm';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { closeDb, getDb } from '../../app/.server/db/client';
+import { members } from '../../app/.server/db/schema';
+import { Client, createTenant, extractLink, resetDb, startApp, type Mail, type TestApp } from './harness';
+
+let app: TestApp;
+beforeAll(async () => { app = await startApp(); });
+afterAll(async () => { await app?.close(); await closeDb(); });
+beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
+afterEach(() => { vi.unstubAllEnvs(); });
+
+/** 申请 Magic Link 并等后台签发与发信完成 */
+async function requestLink(browser: Client, email: string) {
+  const res = await browser.post('/login', { email });
+  await app.drain();
+  return res;
+}
+
+/** 申请 Magic Link → 从邮件里挑指定租户那一行 → 打开链接 → 确认登录 */
+async function loginToTenant(browser: Client, email: string, tenantName: string) {
+  await requestLink(browser, email);
+  const mail = app.outbox.at(-1)!;
+  const line = mail.text.split('\n').find(l => l.startsWith(tenantName));
+  const link = extractLink(line ? ({ ...mail, text: line } as Mail) : mail);
+  expect((await browser.get(link)).status).toBe(200);
+  return browser.post(link, {});
+}
+
+/** 某邮箱所有成员记录的 locale */
+async function memberLocales(email: string) {
+  const rows = await getDb().select({ locale: members.locale }).from(members).where(eq(members.email, email));
+  return rows.map(r => r.locale);
+}
+
+describe('界面语言：开关关闭时整站中文', () => {
+  it('无论 cookie、Accept-Language 还是账号语言如何，页面都是中文，POST /locale 返回 404', async () => {
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const anon = await app.client().get('/login', { Cookie: 'crm_locale=en', 'Accept-Language': 'en-US,en;q=0.9' });
+    expect(await anon.text()).toContain('lang="zh-CN"');
+
+    const browser = app.client();
+    expect((await loginToTenant(browser, 'admin@acme.com', '示例商贸')).status).toBe(302);
+    await getDb().update(members).set({ locale: 'en' }).where(eq(members.email, 'admin@acme.com'));
+    const home = await browser.get('/');
+    expect(home.status).toBe(200);
+    expect(await home.text()).toContain('lang="zh-CN"');
+
+    expect((await browser.post('/locale', { locale: 'en', redirectTo: '/' })).status).toBe(404);
+  });
+});
+
+describe('界面语言：开关打开时按账号 > cookie > 浏览器语言 > 中文判断', () => {
+  beforeEach(() => { vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1'); });
+
+  it('未登录时按浏览器语言：Accept-Language 是英文则英文，都不认识、q=0 或没有头则中文', async () => {
+    const en = await app.client().get('/login', { 'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8' });
+    expect(await en.text()).toContain('lang="en"');
+    const zh = await app.client().get('/login', { 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' });
+    expect(await zh.text()).toContain('lang="zh-CN"');
+
+    const none = await app.client().get('/login');
+    expect(await none.text()).toContain('lang="zh-CN"');
+    // 只认识 en / zh：法语跳过；en 的 q=0 是明确拒绝，也跳过
+    const fr = await app.client().get('/login', { 'Accept-Language': 'fr-FR,fr;q=0.9' });
+    expect(await fr.text()).toContain('lang="zh-CN"');
+    const rejected = await app.client().get('/login', { 'Accept-Language': 'fr;q=0.9,en;q=0' });
+    expect(await rejected.text()).toContain('lang="zh-CN"');
+  });
+
+  it('cookie 胜过浏览器语言：crm_locale=zh-CN 时即便 Accept-Language 是英文也仍是中文', async () => {
+    const res = await app.client().get('/login', { Cookie: 'crm_locale=zh-CN', 'Accept-Language': 'en-US,en;q=0.9' });
+    expect(await res.text()).toContain('lang="zh-CN"');
+  });
+
+  it('账号胜过 cookie：成员 locale=en、cookie 是 zh-CN 时页面是英文', async () => {
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const browser = app.client();
+    expect((await loginToTenant(browser, 'admin@acme.com', '示例商贸')).status).toBe(302);
+    await getDb().update(members).set({ locale: 'en' }).where(eq(members.email, 'admin@acme.com'));
+    browser.store('crm_locale=zh-CN; Path=/');
+    const home = await browser.get('/');
+    expect(await home.text()).toContain('lang="en"');
+  });
+});
+
+describe('界面语言：POST /locale 切换', () => {
+  it('写 crm_locale cookie 后跳回 redirectTo，当前页生效', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const browser = app.client();
+    const res = await browser.post('/locale', { locale: 'en', redirectTo: '/login' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe('/login');
+    expect(res.headers.getSetCookie()).toContain('crm_locale=en; Path=/; Max-Age=31536000; SameSite=Lax');
+    expect(browser.cookie('crm_locale')).toBe('en');
+    expect(await (await browser.get('/login')).text()).toContain('lang="en"');
+  });
+
+  it('redirectTo 不是站内路径时回退到 /，locale 不是 en/zh-CN 时 400', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const browser = app.client();
+    const evil = await browser.post('/locale', { locale: 'en', redirectTo: '//evil.com' });
+    expect(evil.headers.get('Location')).toBe('/');
+    const backslash = await browser.post('/locale', { locale: 'en', redirectTo: '/\\evil.com' });
+    expect(backslash.headers.get('Location')).toBe('/');
+    const bad = await browser.post('/locale', { locale: 'fr', redirectTo: '/' });
+    expect(bad.status).toBe(400);
+  });
+});
+
+describe('界面语言：同一邮箱隶属多个租户时语言跟随账号', () => {
+  it('在 A 租户切换语言后，所有成员记录同步更新，换租户登录仍是同一语言', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    await createTenant('acme', '示例商贸', 'ops@shared.com');
+    await createTenant('globex', '环球零售', 'ops@shared.com');
+    expect(await memberLocales('ops@shared.com')).toEqual([null, null]);
+
+    const browser = app.client();
+    expect((await loginToTenant(browser, 'ops@shared.com', '示例商贸')).status).toBe(302);
+    const res = await browser.post('/locale', { locale: 'en', redirectTo: '/' });
+    expect(res.status).toBe(302);
+    expect(await memberLocales('ops@shared.com')).toEqual(['en', 'en']);
+    expect(await (await browser.get('/')).text()).toContain('lang="en"');
+
+    // 换一台没有 cookie 的浏览器登录另一个租户：语言仍是账号上的英文
+    const fresh = app.client();
+    expect((await loginToTenant(fresh, 'ops@shared.com', '环球零售')).status).toBe(302);
+    const home = await fresh.get('/');
+    const html = await home.text();
+    expect(html).toContain('lang="en"');
+    expect(html).toContain('环球零售');
+  });
+});

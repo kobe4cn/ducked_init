@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."members" ADD COLUMN "locale" text;
