@@ -100,7 +100,7 @@
     "app/.server/pipeline/templates/upgrade-summary.ts": 10,
     "app/.server/pipeline/templates/user360.ts": 2,
     "app/.server/pipeline/verify-engine.ts": 6,
-    "app/.server/pipeline/workbench-engine.ts": 22,
+    "app/.server/pipeline/workbench-engine.ts": 23,
     "app/.server/pipeline/worker.ts": 2,
     "app/.server/publishing.ts": 5,
     "app/.server/quality.ts": 8,

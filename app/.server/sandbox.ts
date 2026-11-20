@@ -1,6 +1,6 @@
 // app/.server/sandbox.ts —— 沙箱表过期（ADR-0036）：沙箱表保存后 SANDBOX_TTL_DAYS 天到期，调度器为有到期沙箱表的租户入队 sandbox.expire，
 // 工作进程删表并清理湖里的旧文件（与快照过期同一套做法，ADR-0020），成功后在平台库标记 expiredAt 并删掉它的分享，工作台不再列出。一律限定在给定租户内。
-// 表的主人提前删除走同一条清理路：enqueueSandboxDrop 单独入队一个只删这张表的任务，过期时间先被设成现在（见 workbench.ts 的 dropSandboxTable）
+// 表的主人提前删除走同一条清理路：删除时先把湖表改名成保留名，enqueueSandboxDrop 按改名后的名字单独入队一个只删这张表的任务，登记行直接写 expiredAt（见 workbench.ts 的 dropSandboxTable）
 import { and, eq, inArray, isNull, lte, sql } from 'drizzle-orm';
 import type { Tx } from './audit';
 import { getDb } from './db/client';
@@ -8,8 +8,8 @@ import { sandboxShares, sandboxTables, tasks, tenants } from './db/schema';
 import { sandboxSchema } from './pipeline/workbench-engine';
 import { insertTask } from './tasks';
 
-/** 沙箱表在湖里的全名 sandbox_<成员>.<表名>，即 sandbox.expire 的参数 */
-const sandboxLakeName = (t: { memberId: string; name: string }) => `${sandboxSchema(t.memberId)}.${t.name}`;
+/** 沙箱表在湖里的全名 sandbox_<成员>.<表名>（表名可以是删除时改成的保留名），即 sandbox.expire 的参数 */
+export const sandboxLakeName = (t: { memberId: string; name: string }) => `${sandboxSchema(t.memberId)}.${t.name}`;
 
 /**
  * 为有到期沙箱表（expiresAt 已到、还没标记过期）的租户各入队一个 sandbox.expire，参数是到期沙箱表在湖里的全名；
@@ -78,9 +78,10 @@ export async function lockForSave(tx: Tx, tenantId: string, memberId: string, na
 }
 
 /**
- * 表的主人提前删除沙箱表时入队（与删除登记同一事务）：单独入队一个只删这张表的 sandbox.expire，不查平台库、不受本租户已有任务影响。
- * 不走 enqueueDueSandboxExpiries：它扫全平台，且本租户已有排队中的 expire 时会跳过入队，那段时间 lockForSave 拦不住同名保存，新表会被删
+ * 表的主人提前删除沙箱表时入队（与删除登记同一事务）：lakeName 是删除时改成的改名后的湖表全名，按改名后的名字删，同名重新保存的新表不受影响。
+ * 单独入队一个只删这张表的 sandbox.expire，不查平台库、不受本租户已有任务影响。
+ * 不走 enqueueDueSandboxExpiries：它只挑 expiredAt 还为空的到期登记行（删除的这行已直接标记 expiredAt），且本租户已有排队中的 expire 时会跳过入队
  */
-export async function enqueueSandboxDrop(tx: Tx, tenantId: string, memberId: string, name: string) {
-  return insertTask(tx, tenantId, 'sandbox.expire', { tables: [sandboxLakeName({ memberId, name })] });
+export async function enqueueSandboxDrop(tx: Tx, tenantId: string, lakeName: string) {
+  return insertTask(tx, tenantId, 'sandbox.expire', { tables: [lakeName] });
 }
