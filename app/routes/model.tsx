@@ -5,6 +5,8 @@ import { requireMember } from '~/.server/auth';
 import { navFor } from '~/.server/nav';
 import { functionList } from '~/lib/mapping-expr';
 import { CANONICAL_ENTITIES, FIELD_TYPES, MODEL_VERSION } from '~/lib/canonical-model';
+import { builtinName, CANONICAL_NAMES, ENUM_LABELS } from '~/lib/builtin-names';
+import { useT } from '~/lib/i18n';
 import { AppShell } from '~/components/app-shell';
 import { Badge } from '~/components/ui/badge';
 import { PageHeader } from '~/components/page-header';
@@ -26,6 +28,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 export default function Model({ loaderData }: Route.ComponentProps) {
   const { email, nav, functions } = loaderData;
+  const t = useT();
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
@@ -35,13 +38,13 @@ export default function Model({ loaderData }: Route.ComponentProps) {
 
       <nav className="flex flex-wrap gap-2">
         {CANONICAL_ENTITIES.map(e => (
-          <a key={e.name} href={`#entity-${e.name}`} className="rounded-full border bg-white px-3 py-1 text-sm hover:bg-slate-100">{`${e.label}（${e.name}）`}</a>
+          <a key={e.name} href={`#entity-${e.name}`} className="rounded-full border bg-white px-3 py-1 text-sm hover:bg-slate-100">{`${builtinName(t, e.label, CANONICAL_NAMES)}（${e.name}）`}</a>
         ))}
       </nav>
 
       {CANONICAL_ENTITIES.map(e => (
         <section key={e.name} id={`entity-${e.name}`} data-entity={e.name} className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
-          <SectionHeader title={`${e.label}（${e.name}）`}>{`${e.description}主键：${e.key.join('、')}。`}</SectionHeader>
+          <SectionHeader title={`${builtinName(t, e.label, CANONICAL_NAMES)}（${e.name}）`}>{`${e.description}主键：${e.key.join('、')}。`}</SectionHeader>
           <Table>
             <TableHeader>
               <TableRow>
@@ -59,8 +62,8 @@ export default function Model({ loaderData }: Route.ComponentProps) {
                     {e.key.includes(f.name) && <Badge variant="secondary">主键</Badge>}
                     {f.pii && <Badge variant="outline">敏感信息</Badge>}
                   </TableCell>
-                  <TableCell>{f.label}</TableCell>
-                  <TableCell>{FIELD_TYPES[f.type].label}</TableCell>
+                  <TableCell>{builtinName(t, f.label, CANONICAL_NAMES)}</TableCell>
+                  <TableCell>{builtinName(t, FIELD_TYPES[f.type].label, ENUM_LABELS)}</TableCell>
                   <TableCell className="whitespace-normal text-slate-500">
                     {f.description}
                     {f.enum && <div className="font-mono text-xs">{`标准枚举：${f.enum.join('、')}`}</div>}
@@ -82,7 +85,7 @@ export default function Model({ loaderData }: Route.ComponentProps) {
             {functions.map(f => (
               <TableRow key={f.name} data-function={f.name}>
                 <TableCell className="font-mono text-xs">{f.signature}</TableCell>
-                <TableCell className="whitespace-normal text-slate-500">{f.label}</TableCell>
+                <TableCell className="whitespace-normal text-slate-500">{builtinName(t, f.label, CANONICAL_NAMES)}</TableCell>
               </TableRow>
             ))}
           </TableBody>

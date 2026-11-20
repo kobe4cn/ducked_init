@@ -6,6 +6,11 @@ import { parse, TYPE } from '@formatjs/icu-messageformat-parser';
 import { describe, expect, it } from 'vitest';
 import enClient from '../app/i18n/en.client.json';
 import enServer from '../app/i18n/en.server.json';
+import { CANONICAL_NAMES, ENUM_LABELS } from '../app/lib/builtin-names';
+import { TEMPLATES } from '../app/.server/pipeline/templates/index';
+import { RFM_DEFAULTS } from '../app/.server/pipeline/templates/rfm';
+import { TASK_STATUS_LABELS } from '../app/.server/tasks';
+import { DSL_KINDS } from '../app/.server/pipeline/dsl/index';
 
 type Catalog = Record<string, string>;
 const root = join(import.meta.dirname, '..');
@@ -19,7 +24,10 @@ const listSourceFiles = (dir: string): string[] => readdirSync(dir, { withFileTy
  * 检查源码里 t('…') / msg('…') 的调用（跳过注释行）：
  * 字面量键必须在对应词典里；参数不是字符串字面量也算问题（没法静态对账）。
  * 非字面量的检查只对 import 了 i18n 模块的文件生效，避免 SQL 里的表别名 t(i) 这类同名写法误报。
+ * 唯一的豁免是 builtin-names.ts：它把名单里的名称变量递给 t()，这些键由「所有平台内置名称都在 en.client.json」的用例对账。
  */
+const DYNAMIC_KEYS_ALLOWED = new Set(['app/lib/builtin-names.ts']);
+
 function checkUsages(source: string, file: string, client: Catalog, server: Catalog): string[] {
   const problems: string[] = [];
   const usesI18n = /from\s+['"][^'"]*i18n['"]/.test(source);
@@ -34,7 +42,7 @@ function checkUsages(source: string, file: string, client: Catalog, server: Cata
         if (!(literal[1]! in catalog)) {
           problems.push(`${file}:${i + 1} ${fn}('${literal[1]}') 不在 en.${fn === 't' ? 'client' : 'server'}.json`);
         }
-      } else if (usesI18n) {
+      } else if (usesI18n && !DYNAMIC_KEYS_ALLOWED.has(file)) {
         problems.push(`${file}:${i + 1} ${fn}(…) 的参数不是字符串字面量`);
       }
     }
@@ -91,6 +99,18 @@ describe('守卫：翻译键与英文词典对账（ADR-0060）', () => {
     const violations = listSourceFiles(join(root, 'app'))
       .flatMap((path) => checkUsages(readFileSync(path, 'utf8'), relative(root, path), enClient, enServer));
     expect(violations.join('\n')).toBe('');
+  });
+
+  it('所有平台内置名称都在 en.client.json', () => {
+    const builtin = [
+      ...CANONICAL_NAMES,
+      ...ENUM_LABELS,
+      ...Object.values(TEMPLATES).map(template => template.label),
+      ...RFM_DEFAULTS.segments.map(segment => segment.name),
+      ...Object.values(TASK_STATUS_LABELS),
+      ...Object.values(DSL_KINDS).map(kind => kind.label),
+    ];
+    expect(builtin.filter(name => !(name in enClient)).join('\n')).toBe('');
   });
 
   it('两份词典中英文句式的变量名一致', () => {
