@@ -32,7 +32,8 @@ type Shared = Awaited<ReturnType<typeof sharedFixture>>;
 
 /**
  * 只读用例共用的夹具：清库、打通一次带订单的 acme（可再加一步 prepare），登录查看者与数据工程师。
- * 用它的用例不能写库、不能依赖执行顺序，也不能断言「恰好 N 条」（打开页面可能入队任务或写审计）
+ * 用它的用例不能写库、不能依赖执行顺序，也不能断言「恰好 N 条」（打开页面可能入队任务或写审计）；
+ * 只改少量可还原行的组例外，由组内 beforeEach 还原那些行
  */
 async function sharedFixture(prepare?: (fixture: Fixture) => Promise<unknown>) {
   await fresh();
