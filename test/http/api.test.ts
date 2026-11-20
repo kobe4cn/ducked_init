@@ -1004,14 +1004,14 @@ describe('修改 Key 的范围', () => {
   });
 
   it('别租户、已吊销、不是 UUID 的 Key 改范围一律 404；已吊销的行不出现「修改范围」', async () => {
-    const umbrella = await newTenant('umbrella');
+    await newTenant('umbrella');
     const adminB = await loginAs(app, `admin@umbrella.com`);
     const { key: theirs } = await createKey(adminB, '别家的');
     const foreignId = await keyIdOf(adminB, '别家的');
     expect(await updateScope(foreignId, { scope: ['consumers'], dataScope: 'all' })).toBe(404);
     expect((await call('/api/v1/catalog', theirs)).status).toBe(200); // B 的 Key 照常可用，范围没被改
 
-    const { key } = await createKey(admin, '要吊销的');
+    await createKey(admin, '要吊销的');
     const id = await keyIdOf(admin, '要吊销的');
     expect((await admin.post('/api-keys', { intent: 'revoke', keyId: id })).status).toBe(302);
     expect(await updateScope(id, { scope: ['consumers'], dataScope: 'all' })).toBe(404);
@@ -1021,12 +1021,11 @@ describe('修改 Key 的范围', () => {
     expect(revokedRow).not.toContain('修改范围');
 
     expect(await updateScope('not-a-uuid', { scope: ['consumers'], dataScope: 'all' })).toBe(404);
-    expect(umbrella).toBeDefined();
   });
 
   it('?edit=<id> 只在该行下渲染修改表单，预填当前范围（SSR 勾选项带 checked）；不带 edit 时页面只有一组数据范围单选', async () => {
     const scoped: ApiDataScope = { all: false, tags: ['value_tier'], metrics: [], rfm: true };
-    const { key } = await createKey(admin, '预填', ['consumers'], scoped);
+    await createKey(admin, '预填', ['consumers'], scoped);
     const id = await keyIdOf(admin, '预填');
 
     // 不带 edit：没有修改表单，数据范围单选仍只有创建表单那一组（已有用例断言过两个单选）
@@ -1055,10 +1054,9 @@ describe('修改 Key 的范围', () => {
 // 修改范围记审计（#977）：动作 api_key.scope_changed（「修改 API Key 范围」），detail 只有名称、前缀与前后两个范围，
 // 不记 Key 明文与哈希；范围没变再提交不写审计、也不报错。写在另一组里，用 detail 里的名称过滤，不受上一组的影响
 describe('修改 Key 范围的审计', () => {
-  let shared: ServedFixture;
   let admin: Client;
   beforeAll(async () => {
-    shared = await sharedServed(); // 共用的点查夹具（打通、RFM、发布指标与标签、生成服务库），并行跑满时超过默认 hookTimeout 60 s
+    await sharedServed(); // 共用的点查夹具（打通、RFM、发布指标与标签、生成服务库），并行跑满时超过默认 hookTimeout 60 s
     await getDb().delete(magicLinkRequests);
     admin = await loginAs(app, 'admin@acme.com');
   }, 180_000);
@@ -1101,7 +1099,6 @@ describe('修改 Key 范围的审计', () => {
     expect(audit).toContain(`「审计改范围」（${key.slice(0, 8)}…）`);
     const details = await getDb().select({ detail: auditLogs.detail }).from(auditLogs).where(eq(auditLogs.action, 'api_key.scope_changed'));
     expect(JSON.stringify(details)).not.toContain(key);
-    expect(shared.acme).toBeDefined();
   });
 });
 
