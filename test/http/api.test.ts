@@ -4,6 +4,7 @@
 // 点查 /api/v1/consumers/:id：数据由身份打通夹具、RFM 与已发布的指标、标签跑出快照，调度器自动生成服务库；?snapshot= 只读查湖里那张快照表。
 // 成功的点查按天记入 api_key_usage（ADR-0059，401/404/503/?snapshot= 不记），计数按租户隔离。
 // 点查还按 Key 的数据范围（data_scope，ADR-0061「数据范围」，#975）裁剪：范围外的标签、指标与 RFM 不出现，范围外的快照 404。
+// 创建时也能设置数据范围（#976）：表单选「全部」或「指定」（白名单校验），目录接口只返回范围内的定义。
 // Bearer Key 打不开成员页面，也没有通往标准层、沙箱的接口；成员存下（并分享出去）的沙箱表不进服务库，也不出现在目录接口里
 import { randomUUID } from 'node:crypto';
 import { DuckDBInstance } from '@duckdb/node-api';
@@ -13,7 +14,7 @@ import { scopeOfPath } from '../../app/.server/api-auth';
 import { sha256 } from '../../app/.server/auth';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { apiKeyUsage, apiKeys, auditLogs, snapshots as snapshotsTable, sources as sourcesTable, spaces as spacesTable, tasks } from '../../app/.server/db/schema';
+import { apiKeyUsage, apiKeys, auditLogs, magicLinkRequests, snapshots as snapshotsTable, sources as sourcesTable, spaces as spacesTable, tasks } from '../../app/.server/db/schema';
 import type { ApiDataScope } from '../../app/lib/api-data-scope';
 import { API_ENDPOINTS } from '../../app/lib/api-docs';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
@@ -36,9 +37,16 @@ const fresh = async () => { await resetDb(); app.outbox.length = 0; };
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\n';
 const BUYER = 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1 } }\ndefault: low\n';
 
-/** 管理员在页面上创建一把 Key，返回明文与创建那次响应的 HTML；scope 是勾选的接口范围，默认三类全勾（与页面表单一致） */
-async function createKey(admin: Client, name: string, scopes: string[] = ['catalog', 'consumers', 'exports']) {
-  const res = await admin.post('/api-keys', { intent: 'create', name, scope: scopes });
+/** 管理员在页面上创建一把 Key，返回明文与创建那次响应的 HTML；scope 是勾选的接口范围，默认三类全勾（与页面表单一致）；
+ * dataScope 是数据范围，默认「全部」，收窄时提交单选 some 与复选框 tag / metric / rfm（与页面表单的字段一致） */
+async function createKey(admin: Client, name: string, scopes: string[] = ['catalog', 'consumers', 'exports'], dataScope: ApiDataScope = { all: true }) {
+  const form: Record<string, string | string[]> = { intent: 'create', name, scope: scopes, dataScope: dataScope.all ? 'all' : 'some' };
+  if (!dataScope.all) {
+    form.tag = dataScope.tags;
+    form.metric = dataScope.metrics;
+    if (dataScope.rfm) form.rfm = 'on';
+  }
+  const res = await admin.post('/api-keys', form);
   expect(res.status).toBe(200);
   const html = await res.text();
   const key = html.match(/data-api-key="[^"]*"[^>]*>([^<]+)</)?.[1];
@@ -46,10 +54,10 @@ async function createKey(admin: Client, name: string, scopes: string[] = ['catal
   return { key, html };
 }
 
-/** 页面上某个名称对应的 Key ID */
+/** 页面上某个名称对应的 Key ID：只在 Key 列表的行里找（创建表单的标签也可能出现同名文字） */
 async function keyIdOf(admin: Client, name: string) {
   const html = await (await admin.get('/api-keys')).text();
-  const row = html.split('<tr').find(r => r.includes(`>${name}<`));
+  const row = html.split('<tr').find(r => r.includes('data-api-key-id=') && r.includes(`>${name}<`));
   const id = row?.match(/data-api-key-id="([\w-]+)"/)?.[1];
   if (!id) throw new Error(`API Key 页没有「${name}」`);
   return id;
@@ -133,12 +141,12 @@ describe('API Key 页', () => {
     expect(await (await admin.get('/api-keys')).text()).not.toContain('都不勾');
     expect(await getDb().select().from(apiKeys)).toHaveLength(3);
 
-    // 审计 detail 带 scopes（只存勾选的类，不含 Key 明文）
+    // 审计 detail 带 scopes 与 dataScope（默认「全部」，不含 Key 明文）
     const created = await getDb().select({ detail: auditLogs.detail }).from(auditLogs).where(eq(auditLogs.action, 'api_key.created')).orderBy(auditLogs.createdAt);
     expect(created.map(d => d.detail)).toEqual([
-      { name: '三类全开', prefix: key.slice(0, 8), scopes: ['catalog', 'consumers', 'exports'] },
-      { name: '乱序', prefix: messy.slice(0, 8), scopes: ['consumers', 'exports'] },
-      { name: '只点查', prefix: onlyKey.slice(0, 8), scopes: ['consumers'] },
+      { name: '三类全开', prefix: key.slice(0, 8), scopes: ['catalog', 'consumers', 'exports'], dataScope: { all: true } },
+      { name: '乱序', prefix: messy.slice(0, 8), scopes: ['consumers', 'exports'], dataScope: { all: true } },
+      { name: '只点查', prefix: onlyKey.slice(0, 8), scopes: ['consumers'], dataScope: { all: true } },
     ]);
   });
 
@@ -390,6 +398,28 @@ describe('目录接口', () => {
     const theirs = await byTarget(globexKey);
     expect([...theirs.keys()]).toEqual(['metric:revenue']);
     expect(theirs.get('metric:revenue')).toMatchObject({ note: '环球自己的口径' });
+  });
+
+  it('Key 的数据范围收窄后目录只返回范围内的定义，「全部」时与原来相同（#976）', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const engineer = await memberOf(acme, 'de@acme.com', 'data_engineer');
+    await createDefinition(analyst, 'metric', 'revenue', REVENUE);
+    await publishDefinition(engineer, 'metric', 'revenue', 1);
+    await createDefinition(analyst, 'tag', 'buyer', BUYER);
+    await publishDefinition(engineer, 'tag', 'buyer', 1);
+
+    const { key } = await createKey(await loginAs(app, 'admin@acme.com'), '营销自动化');
+    const keysOf = async (k: string) => (await (await call('/api/v1/catalog', k)).json())
+      .definitions.map((d: { kind: string; key: string }) => `${d.kind}:${d.key}`);
+    // 「全部」（迁移默认）：与收窄前相同，两条都在
+    expect(await keysOf(key)).toEqual(['metric:revenue', 'tag:buyer']);
+
+    const setScope = (dataScope: ApiDataScope) => getDb().update(apiKeys).set({ dataScope }).where(eq(apiKeys.tokenHash, sha256(key)));
+    await setScope({ all: false, tags: ['buyer'], metrics: [], rfm: false });
+    expect(await keysOf(key)).toEqual(['tag:buyer']); // 范围外的指标消失，不报错
+    await setScope({ all: false, tags: [], metrics: ['revenue'], rfm: true });
+    expect(await keysOf(key)).toEqual(['metric:revenue']); // RFM 开关不影响目录（目录里没有 RFM 条目）
   });
 
   it('A 租户管理员吊销不了 B 租户的 Key，B 的 Key 照常可用', async () => {
@@ -838,5 +868,87 @@ describe('点查的数据范围', () => {
     expect(rfm.status).toBe(200);
     expect(rfm.body.rfm).not.toBeNull();
     expect(rfm.body.rfm).toEqual((await lookup(`/api/v1/consumers/${consumer}`, scoped)).body.rfm); // 服务库里的 rfm 与 RFM 快照里的一致（上面用例也断言过）
+  });
+});
+
+// 创建 Key 的数据范围（ADR-0061「数据范围」，#976）：创建时选「全部」或「指定」，指定的标签、指标必须是本租户已发布的（白名单，
+// 别租户、未发布、不存在报同一句）。目录、导出按范围限制的用例各自在「目录接口」与 test/http/exports.test.ts。
+// 组里另建自己的 Key，不动共用夹具的 key；草稿定义与新租户 hooli 只在本组里加，不影响前面已经跑完的组
+describe('创建 Key 的数据范围', () => {
+  let shared: ServedFixture;
+  let admin: Client;
+  beforeAll(async () => {
+    shared = await sharedServed(); // 共用的点查夹具（打通、RFM、发布指标与标签、生成服务库），并行跑满时超过默认 hookTimeout 60 s
+    // admin@acme.com 的 Magic Link 登录申请已被共享夹具与前面的组用到限流（15 分钟窗口内 5 次）：清掉计数，本组登录一次共用
+    await getDb().delete(magicLinkRequests);
+    admin = await loginAs(app, 'admin@acme.com');
+  }, 180_000);
+
+  it('表单有「数据范围」两个单选、默认「全部」；「指定」勾 1 个标签 + RFM 创建后 data_scope 存对、列表「数据」列、审计 detail 带 dataScope', async () => {
+    // 表单是两个单选：「全部（含以后新发布的）」默认选中，另一个「指定」；勾选区要选了「指定」才出现（浏览器验收里看）
+    const page = await (await admin.get('/api-keys')).text();
+    const radios = [...page.matchAll(/<input[^>]*name="dataScope"[^>]*>/g)].map(m => m[0]);
+    expect(radios.map(t => t.match(/value="(\w+)"/)?.[1])).toEqual(['all', 'some']);
+    expect(radios[0]).toContain('checked');
+    expect(radios[1]).not.toContain('checked');
+    expect(page).toContain('数据范围');
+    expect(page).toContain('全部（含以后新发布的）');
+    expect(page).toContain('指定');
+
+    // 默认提交：data_scope 存 {"all":true}（与迁移默认一致）
+    const { key } = await createKey(admin, '全量数据');
+    expect(await getDb().select({ dataScope: apiKeys.dataScope }).from(apiKeys).where(eq(apiKeys.tokenHash, sha256(key))))
+      .toEqual([{ dataScope: { all: true } }]);
+
+    // 选「指定」勾 value_tier + RFM：存成收窄的范围，列表「数据」列「1 个标签、RFM」
+    const scoped: ApiDataScope = { all: false, tags: ['value_tier'], metrics: [], rfm: true };
+    const { key: scopedKey } = await createKey(admin, '只有分层', undefined, scoped);
+    expect(await getDb().select({ dataScope: apiKeys.dataScope }).from(apiKeys).where(eq(apiKeys.tokenHash, sha256(scopedKey))))
+      .toEqual([{ dataScope: scoped }]);
+
+    const list = await (await admin.get('/api-keys')).text();
+    expect(list).toMatch(/<th[^>]*>数据<\/th>/);
+    const rowOf = (name: string) => list.split('<tr').find(r => r.includes(`>${name}<`)) ?? '';
+    expect(rowOf('全量数据')).toContain('>全部<');
+    expect(rowOf('只有分层')).toContain('1 个标签、RFM');
+
+    // 审计 detail 带 dataScope（不含 Key 明文）
+    const [audit] = await getDb().select({ detail: auditLogs.detail }).from(auditLogs)
+      .where(and(eq(auditLogs.action, 'api_key.created'), sql`${auditLogs.detail}->>'name' = '只有分层'`));
+    expect(audit.detail).toEqual({ name: '只有分层', prefix: scopedKey.slice(0, 8), scopes: ['catalog', 'consumers', 'exports'], dataScope: scoped });
+  });
+
+  it('选「指定」时至少选一项；未发布、不存在、别租户的 key 一律 400 且同一句提示，不创建', async () => {
+    const { author } = shared;
+    const before = await getDb().select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.tenantId, shared.acme));
+
+    // 「指定」但标签、指标、RFM 一个都没选
+    const none = await admin.post('/api-keys', { intent: 'create', name: '空范围', scope: ['catalog'], dataScope: 'some' });
+    expect(none.status).toBe(400);
+    expect(await none.text()).toContain('请至少选择一个标签、指标或 RFM');
+
+    // 三种不可用的 key：本租户的草稿（未发布）、根本不存在的、别的租户已发布的
+    await createDefinition(author, 'tag', 'draft_tier', 'metric: revenue\nrules:\n  - { value: high, when: { gte: 100 } }\ndefault: low\n');
+    const hooli = await newTenant('hooli');
+    await createDefinition(await memberOf(hooli, 'analyst@hooli.com', 'analyst'), 'metric', 'hooli_revenue', REVENUE);
+    await publishDefinition(await memberOf(hooli, 'de@hooli.com', 'data_engineer'), 'metric', 'hooli_revenue', 1);
+
+    const bad = async (name: string, fields: Record<string, string | string[]>) => {
+      const res = await admin.post('/api-keys', { intent: 'create', name, scope: ['catalog'], dataScope: 'some', ...fields });
+      return { status: res.status, message: (await res.text()).match(/[^<>]*不在已发布的标签与指标里[^<>]*/)?.[0] ?? '' };
+    };
+    const draft = await bad('本租户草稿', { tag: ['draft_tier'] });
+    const missing = await bad('不存在', { tag: ['nope_tier'] });
+    const foreign = await bad('别租户', { metric: ['hooli_revenue'] });
+    expect(draft.status).toBe(400);
+    expect(missing.status).toBe(400);
+    expect(foreign.status).toBe(400);
+    // 同一句提示：只带 key 名，不说它是草稿、不存在还是别的租户的
+    expect(draft.message).toBe('draft_tier 不在已发布的标签与指标里');
+    expect(missing.message).toBe('nope_tier 不在已发布的标签与指标里');
+    expect(foreign.message).toBe('hooli_revenue 不在已发布的标签与指标里');
+
+    // 一把都没有创建出来
+    expect(await getDb().select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.tenantId, shared.acme))).toEqual(before);
   });
 });

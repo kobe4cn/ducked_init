@@ -1,10 +1,12 @@
 // app/routes/api-keys.tsx —— 外部系统的 API Key（仅管理员）：创建（明文只在创建后的这次响应里展示一次）、吊销；
-// 「接口说明」标签页按 app/lib/api-docs.ts 的登记表渲染全部外部接口的调用方式（不查库，也没有任何真实 Key）
+// 创建时选接口范围与数据范围（ADR-0061）；「接口说明」标签页按 app/lib/api-docs.ts 的登记表渲染全部外部接口的调用方式（不查库，也没有任何真实 Key）
 import { data, Form, redirect, useNavigation } from 'react-router';
+import { useState } from 'react';
 import { CircleAlert, KeyRound } from 'lucide-react';
 import type { Route } from './+types/api-keys';
 import { requirePermission } from '~/.server/access';
-import { ApiKeyError, createApiKey, listApiKeys, revokeApiKey } from '~/.server/api-keys';
+import { ApiKeyError, createApiKey, listApiKeys, revokeApiKey, type RawDataScope } from '~/.server/api-keys';
+import { apiCatalog } from '~/.server/api-catalog';
 import { formatServer } from '~/.server/i18n';
 import { getLocale } from '~/.server/locale';
 import { navFor } from '~/.server/nav';
@@ -18,6 +20,7 @@ import { Button } from '~/components/ui/button';
 import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import type { ApiDataScope } from '~/lib/api-data-scope';
 import { API_ENDPOINTS, type ApiEndpoint } from '~/lib/api-docs';
 import { API_SCOPES, type ApiScope } from '~/lib/api-scopes';
 import { useT, type T } from '~/lib/i18n';
@@ -36,22 +39,24 @@ const tabOf = (request: Request): Tab => {
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'api_keys:manage');
   const tab = tabOf(request);
+  const base = { email: member.email, nav: navFor(member), tab };
+  if (tab === 'docs') return { ...base, keys: [], definitions: [] };
+  // 「指定」的勾选清单只列本租户已发布的定义（kind、key、当前版本说明），与目录接口同一来源
+  const [rows, catalog] = await Promise.all([listApiKeys(member), apiCatalog(member.tenant.id)]);
   return {
-    email: member.email,
-    nav: navFor(member),
-    tab,
-    keys: tab === 'keys'
-      ? (await listApiKeys(member)).map(r => ({
-        id: r.id,
-        name: r.name,
-        prefix: r.prefix,
-        scopes: r.scopes,
-        createdByEmail: r.createdByEmail,
-        createdAt: r.createdAt.toISOString(),
-        lastUsedAt: r.lastUsedAt?.toISOString() ?? null,
-        revoked: r.revokedAt !== null,
-      }))
-      : [],
+    ...base,
+    keys: rows.map(r => ({
+      id: r.id,
+      name: r.name,
+      prefix: r.prefix,
+      scopes: r.scopes,
+      dataScope: r.dataScope,
+      createdByEmail: r.createdByEmail,
+      createdAt: r.createdAt.toISOString(),
+      lastUsedAt: r.lastUsedAt?.toISOString() ?? null,
+      revoked: r.revokedAt !== null,
+    })),
+    definitions: catalog.definitions.map(d => ({ kind: d.kind, key: d.key, version: d.version, description: d.description })),
   };
 }
 
@@ -63,7 +68,13 @@ export async function action({ request }: Route.ActionArgs) {
     switch (field('intent')) {
       case 'create': {
         // 不重定向：明文只在这次响应里出现，刷新或离开后再也看不到
-        const { key, row } = await createApiKey(member, field('name'), form.getAll('scope').map(String));
+        const dataScope: RawDataScope = {
+          all: field('dataScope') !== 'some',
+          tags: form.getAll('tag').map(String),
+          metrics: form.getAll('metric').map(String),
+          rfm: form.get('rfm') !== null,
+        };
+        const { key, row } = await createApiKey(member, field('name'), form.getAll('scope').map(String), dataScope);
         return { created: { name: row.name, key } };
       }
       case 'revoke':
@@ -90,9 +101,30 @@ const PARAM_IN_TEXT = { path: '路径', query: '查询', body: '请求体' } as 
 /** 接口范围的名称：中文与 lib/api-scopes 的 API_SCOPE_LABELS 一致，这里写成字面量 t('…') 才能与词典对账 */
 const scopeLabel = (t: T, scope: ApiScope) => ({ catalog: t('目录'), consumers: t('点查'), exports: t('导出') })[scope];
 
+/** 数据范围在列表里的一行文字：「全部」，或「N 个标签」「M 个指标」「RFM」中非零的部分 */
+const dataScopeLabel = (t: T, scope: ApiDataScope) => {
+  if (scope.all) return t('全部');
+  return [
+    (scope.tags ?? []).length > 0 && t('{n} 个标签', { n: scope.tags.length }),
+    (scope.metrics ?? []).length > 0 && t('{n} 个指标', { n: scope.metrics.length }),
+    scope.rfm === true && t('RFM'),
+  ].filter(Boolean).join(t('、'));
+};
+
+/** 「指定」勾选清单里一个定义的标签文字：key 加当前版本的说明（没写说明就只有 key） */
+const definitionLabel = (d: { key: string; version: number; description: string | null }) =>
+  d.description ? `${d.key}（${d.description}）` : d.key;
+
 /** 「Key」标签页：创建表单与 Key 列表 */
-function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefix: string; scopes: ApiScope[]; createdByEmail: string; createdAt: string; lastUsedAt: string | null; revoked: boolean }[]; submitting: boolean }) {
+function KeysTab({ keys, definitions, submitting }: {
+  keys: { id: string; name: string; prefix: string; scopes: ApiScope[]; dataScope: ApiDataScope; createdByEmail: string; createdAt: string; lastUsedAt: string | null; revoked: boolean }[];
+  definitions: { kind: 'metric' | 'tag'; key: string; version: number; description: string | null }[];
+  submitting: boolean;
+}) {
   const t = useT();
+  // 「指定」的勾选区跟着单选走：服务端渲染只带「全部」，选「指定」后展开（浏览器验收里看）
+  const [specific, setSpecific] = useState(false);
+  const ofKind = (kind: 'tag' | 'metric') => definitions.filter(d => d.kind === kind);
   return (
     <>
       <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
@@ -115,6 +147,39 @@ function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefi
                 ))}
               </div>
             </Field>
+            <Field className="basis-full">
+              <FieldLabel>{t('数据范围')}</FieldLabel>
+              <div className="flex items-center gap-4 pb-2">
+                <label className="flex items-center gap-1.5 text-sm text-slate-700">
+                  <input type="radio" name="dataScope" value="all" checked={!specific} onChange={() => setSpecific(false)} className="size-4" />
+                  {t('全部（含以后新发布的）')}
+                </label>
+                <label className="flex items-center gap-1.5 text-sm text-slate-700">
+                  <input type="radio" name="dataScope" value="some" checked={specific} onChange={() => setSpecific(true)} className="size-4" />
+                  {t('指定')}
+                </label>
+              </div>
+              {specific && (
+                <div className="space-y-2 rounded-lg bg-slate-50 p-3 text-sm text-slate-700">
+                  {(['tag', 'metric'] as const).map(kind => (
+                    <div key={kind} className="space-y-1">
+                      <p className="text-xs text-slate-500">{kind === 'tag' ? t('标签') : t('指标')}</p>
+                      {ofKind(kind).map(d => (
+                        <label key={d.key} className="flex items-center gap-1.5">
+                          <input type="checkbox" name={kind} value={d.key} className="size-4" />
+                          {definitionLabel(d)}
+                        </label>
+                      ))}
+                    </div>
+                  ))}
+                  <label className="flex items-center gap-1.5">
+                    <input type="checkbox" name="rfm" className="size-4" />
+                    {t('RFM')}
+                  </label>
+                </div>
+              )}
+              <p className="text-xs text-slate-400">{t('范围外的定义，点查、目录与导出都不会出现。')}</p>
+            </Field>
             <Button type="submit" disabled={submitting}>创建</Button>
           </FieldGroup>
           <p className="mt-1 text-xs text-slate-400">{t('不勾的那类接口，这把 Key 调用时返回 403。')}</p>
@@ -131,6 +196,7 @@ function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefi
                 <TableHead>名称</TableHead>
                 <TableHead>前缀</TableHead>
                 <TableHead>{t('接口')}</TableHead>
+                <TableHead>{t('数据')}</TableHead>
                 <TableHead>创建人</TableHead>
                 <TableHead>创建时间</TableHead>
                 <TableHead>最近使用</TableHead>
@@ -143,6 +209,7 @@ function KeysTab({ keys, submitting }: { keys: { id: string; name: string; prefi
                   <TableCell>{k.name}</TableCell>
                   <TableCell className="font-mono">{`${k.prefix}…`}</TableCell>
                   <TableCell className="text-slate-500">{k.scopes.map(s => scopeLabel(t, s)).join(t('、'))}</TableCell>
+                  <TableCell className="text-slate-500">{dataScopeLabel(t, k.dataScope)}</TableCell>
                   <TableCell>{k.createdByEmail}</TableCell>
                   <TableCell className="text-slate-500">{formatTime(k.createdAt)}</TableCell>
                   <TableCell className="text-slate-500">{k.lastUsedAt ? formatTime(k.lastUsedAt) : '从未使用'}</TableCell>
@@ -243,7 +310,7 @@ function EndpointCard({ endpoint }: { endpoint: ApiEndpoint }) {
 }
 
 export default function ApiKeys({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tab, keys } = loaderData;
+  const { email, nav, tab, keys, definitions } = loaderData;
   const submitting = useNavigation().state === 'submitting';
   return (
     <AppShell email={email} nav={nav}>
@@ -284,7 +351,7 @@ export default function ApiKeys({ loaderData, actionData }: Route.ComponentProps
           {API_ENDPOINTS.map(endpoint => <EndpointCard key={endpoint.route} endpoint={endpoint} />)}
         </div>
       ) : (
-        <KeysTab keys={keys} submitting={submitting} />
+        <KeysTab keys={keys} definitions={definitions} submitting={submitting} />
       )}
     </AppShell>
   );
