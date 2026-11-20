@@ -45,6 +45,7 @@ export default [
   route('login', 'routes/login.tsx'),
   route('auth/verify', 'routes/auth.verify.tsx'),
   route('logout', 'routes/logout.tsx'),
+  route('locale', 'routes/locale.tsx'),
   route('ops', 'routes/ops.tsx', [
     index('routes/ops.tenants.tsx'),
     route('tenants/:tenantId', 'routes/ops.tenant.tsx'),

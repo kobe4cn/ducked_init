@@ -22,7 +22,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   return { locale, messages: locale === 'en' ? enClient : null };
 }
 
-// 词典只在语言变化时才变（语言来源是 cookie，请求间不会变），导航不必重新下发
+// 词典只在语言变化时才变（语言来源是账号与 cookie，切换走 /locale 的整页加载，导航之间不会变），导航不必重新下发
 export const shouldRevalidate = () => false;
 
 export function Layout({ children }: { children: React.ReactNode }) {
