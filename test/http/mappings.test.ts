@@ -115,6 +115,25 @@ describe('标准模型', () => {
     // 查看者看不到映射
     expect((await viewer.get('/mappings')).status).toBe(403);
   });
+
+  it('英文界面下标准模型页的实体名、字段名和字段类型是英文', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const tenantId = await newTenant('acme');
+    await memberOf(tenantId, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    viewer.store('crm_locale=en; Path=/');
+    const html = await (await viewer.get('/model')).text();
+    expect(html).toContain('lang="en"');
+    // 水合数据里的脚本会带中文词典键（键就是中文原文），断言前先去掉脚本
+    const strip = html.replace(/<script[\s\S]*?<\/script>/g, '');
+    expect(strip).toContain('Customer（customer）');
+    expect(strip).toContain('Coupon Template（coupon_template）');
+    expect(strip).toContain('Amount Paid');
+    expect(strip).toContain('Decimal (2 places)');
+    expect(strip).toContain('Timestamp (UTC)');
+    // 字段说明与页面其余文字仍是中文（#932），这里只查名称与类型本身（说明里有「这一行的实付金额（元）」）
+    for (const zh of ['消费者（customer）', '>实付金额<', '小数（两位）', '时间（UTC）']) expect(strip).not.toContain(zh);
+  });
 });
 
 describe('编写与发布映射', () => {
