@@ -16,10 +16,12 @@ import { syncSource } from '../../app/.server/source-sync';
 import { getTask, insertTask } from '../../app/.server/tasks';
 import { discardDraft, enableDefaultTemplates, getTemplate, publishTemplate, recomputeTemplate, saveDraft, TemplateError } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
-import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish } from './fixtures';
+import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish, useDefaultTemplates } from './fixtures';
 import { CRM, CRM_ORDERS, LOYALTY, publishedIdentitySources, TRACKING_USERS } from './identity-fixtures';
 import { grantOnSource, seedIdentitySources } from './source-fixtures';
 
+// 本文件多处依赖「映射首次合并后自动启用默认模板」：关掉 setup-env 默认打开的 CRM_TEST_SKIP_DEFAULT_TEMPLATES（#997）
+useDefaultTemplates();
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 // 与「当天」比对的断言不重新取当前日期：定时刷新的用例显式传 now，其余在调用前后各取一次日期夹住实际值，跨 UTC 午夜也不会偶发失败
@@ -246,6 +248,19 @@ describe('映射首次合并后自动启用默认模板', () => {
     expect(await definitions(acme)).toHaveLength(6);
     expect((await listSnapshots(acme)).filter(s => s.trigger === 'publish')).toHaveLength(6);
     expect(await autoEnabled(acme)).toHaveLength(6);
+  });
+
+  it('测试开关 CRM_TEST_SKIP_DEFAULT_TEMPLATES=1 时合并成功后不入队模板任务、不建模板定义、没有快照与自动启用的审计', async () => {
+    vi.stubEnv('CRM_TEST_SKIP_DEFAULT_TEMPLATES', '1'); // 配置里没开 unstubEnvs，用完在 finally 里还原
+    try {
+      const { acme } = await publishedIdentitySources({ orders: true });
+      expect(await definitions(acme)).toEqual([]);
+      expect((await getDb().select({ kind: tasks.kind }).from(tasks).where(eq(tasks.tenantId, acme))).map(t => t.kind).filter(kind => kind.startsWith('gold.'))).toEqual([]);
+      expect(await listSnapshots(acme)).toEqual([]);
+      expect(await autoEnabled(acme)).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('只有 customer 映射时不启用依赖 order 的模板；之后发布订单映射并合并再启用，成员已起草未发布的模板不被覆盖', async () => {

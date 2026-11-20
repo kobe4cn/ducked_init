@@ -74,6 +74,7 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 | `mergeUnchecked(tenantId, mappingIds)` | 不查跨映射主键，把这些已发布映射合并一次（去掉 `uniqueKey` / `uniqueBySource`），模拟独占检查上线前已存在的重叠；返回合并任务最终状态 |
 | `silver(tenantId, entity, orderBy)` | 读出标准层某个实体的表（时间按 UTC 文本、金额按文本，去掉 `_merged_at`） |
 | `onLake(tenantId, sql)` | 在本租户数据湖里执行 SQL（可写），返回结果行；结果层表名要加引号：`gold."rfm__<任务 ID>"` |
+| `useDefaultTemplates()` | 本测试文件要看「映射首次合并后自动启用默认模板」的快照（ADR-0021）：在文件顶层（describe 外）调用一次，关掉 `test/setup-env.ts` 默认打开的 `CRM_TEST_SKIP_DEFAULT_TEMPLATES`（#997）。不调它的文件合并后没有自动启用的模板定义与 `gold.*` 模板任务 |
 
 跑空调度器：用 `fixtures.ts` 的 `drain()`。
 
@@ -110,7 +111,7 @@ pnpm test:report                                 # 汇总成 Markdown，写到 /
 
 | helper | 作用 |
 |---|---|
-| `publishedIdentitySources({ orders?, consents?, slug? })` | 开通租户 `acme`（`slug` 给定时开通那个租户，成员邮箱随之改为 `@<slug>.com`；源库的三个 schema 会重建），`de@acme.com` 登记同步三个身份打通数据源、`de2@acme.com` 审核发布三个 customer 映射与埋点事件映射（`orders` 为真时再发布两个订单映射，`consents` 为真时再发布 CRM 与会员的同意映射：crm 1 短信早同意、loyalty 1 晚撤回，crm 2 与 loyalty 2 同一时刻一个同意一个撤回），合并与打通跑完；返回 `{ acme, author, reviewer, sources, mappings, orderMappings, consentMappings, names }` |
+| `publishedIdentitySources({ orders?, consents?, slug? })` | 开通租户 `acme`（`slug` 给定时开通那个租户，成员邮箱随之改为 `@<slug>.com`；源库的三个 schema 会重建），`de@acme.com` 登记同步三个身份打通数据源、`de2@acme.com` 审核发布三个 customer 映射与埋点事件映射（`orders` 为真时再发布两个订单映射，`consents` 为真时再发布 CRM 与会员的同意映射：crm 1 短信早同意、loyalty 1 晚撤回，crm 2 与 loyalty 2 同一时刻一个同意一个撤回），合并与打通跑完（默认不自动启用默认模板，#997：`test/setup-env.ts` 打开了 `CRM_TEST_SKIP_DEFAULT_TEMPLATES`，要模板快照的文件调 `fixtures.ts` 的 `useDefaultTemplates()`）；返回 `{ acme, author, reviewer, sources, mappings, orderMappings, consentMappings, names }` |
 | `CRM` / `LOYALTY` / `TRACKING_USERS` / `TRACKING_EVENTS` / `CRM_ORDERS` / `LOYALTY_ORDERS` / `CRM_CONSENTS` / `LOYALTY_CONSENTS` | 上面发布的映射 YAML，改规则后重新发布时在其后追加内容 |
 
 PostgreSQL 源库 `shop` schema 的内容（确定性造数）：

@@ -37,4 +37,8 @@ if (WORKER_SUFFIX) {
     const base = process.env[`CRM_TEST_BASE_${key}`];
     if (base) process.env[key] = derive(base);
   }
+  // 测试默认不自动启用默认模板（#997）：合并钩子（task-hooks.ts 的 enableDefaultTemplates）看到它就跳过，省掉大部分用例
+  // 不看的 6 个 gold.* 模板任务；要看模板快照的测试文件在文件顶层调 test/pipeline/fixtures.ts 的 useDefaultTemplates() 关掉。
+  // setupFiles 每个测试文件重跑一次，上一个文件的 opt-in 不会带进来；vitest 主进程与 scripts 不设，行为与生产一致
+  process.env.CRM_TEST_SKIP_DEFAULT_TEMPLATES = '1';
 }

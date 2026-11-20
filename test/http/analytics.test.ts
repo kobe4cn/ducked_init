@@ -19,11 +19,13 @@ import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { listSnapshots, readChurnSnapshot, readClvSnapshot, readRepurchaseSnapshot, readTemplateSnapshot } from '../../app/.server/snapshots';
 import { CHANNELS } from '../../app/lib/canonical-model';
-import { drain, memberOf, newTenant, onLake, runTask } from '../pipeline/fixtures';
+import { drain, memberOf, newTenant, onLake, runTask, useDefaultTemplates } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
+// 模板参数页与升级用例依赖自动启用的默认模板（还有它们触发的下游影响）：关掉 setup-env 默认打开的 CRM_TEST_SKIP_DEFAULT_TEMPLATES（#997）
+useDefaultTemplates();
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 const fresh = async () => { await resetDb(); app.outbox.length = 0; };

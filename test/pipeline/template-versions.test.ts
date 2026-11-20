@@ -13,10 +13,12 @@ import { listSnapshots } from '../../app/.server/snapshots';
 import { syncSource } from '../../app/.server/source-sync';
 import { discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, sampleTemplateUpgrade, saveDraft, upgradeTemplateDraft } from '../../app/.server/templates';
 import { resetDb } from '../http/harness';
-import { drain, onLake } from './fixtures';
+import { drain, onLake, useDefaultTemplates } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 
+// 本文件多处依赖「映射首次合并后自动启用默认模板」的 RFM：关掉 setup-env 默认打开的 CRM_TEST_SKIP_DEFAULT_TEMPLATES（#997）
+useDefaultTemplates();
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 afterEach(() => { vi.unstubAllEnvs(); });
