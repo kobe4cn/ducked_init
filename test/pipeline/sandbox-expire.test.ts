@@ -137,6 +137,8 @@ describe('沙箱表过期', () => {
     const files = await onLake<{ path: string }>(acme, `SELECT data_file AS path FROM ducklake_list_files('lake', 'filed', schema => '${mine}')`);
     expect(files.length).toBeGreaterThan(0);
     await shareSandboxTable(analyst, 'filed', 'de@acme.com');
+    // analyst 也有别人分享来的表：可读条件里多了分享项时，保留名照样要排除
+    await shareSandboxTable(engineer, 'filed', 'analyst@acme.com');
 
     await dropSandboxTable(analyst, 'filed');
 
@@ -159,6 +161,10 @@ describe('沙箱表过期', () => {
     expect(shown.filter(n => DROPPED.test(n))).toEqual([]);
     expect(shown).toContain('keep');
     expect((await listCatalog(analyst)).mine.map(t => t.name)).toEqual(['keep']);
+    expect((await listCatalog(analyst)).mine.filter(t => DROPPED.test(t.name))).toEqual([]);
+    const shownAll = (await runQuery(analyst, 'SHOW ALL TABLES')).rows.flat().map(String);
+    expect(shownAll.filter(n => DROPPED.test(n))).toEqual([]);
+    expect(shownAll).toContain('keep');
     await expect(runQuery(analyst, `SELECT * FROM ${mine}."${renamedTables[0]!.name}"`)).rejects.toThrow('不存在或没有权限');
     // 以 _d 加 8 位十六进制结尾的名字是保留名，不能保存
     await expect(saveAsSandbox(analyst, 'keep_d1234abcd', ROWS)).rejects.toThrow('保留名');
