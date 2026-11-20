@@ -952,3 +952,189 @@ describe('创建 Key 的数据范围', () => {
     expect(await getDb().select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.tenantId, shared.acme))).toEqual(before);
   });
 });
+
+// 修改已有 Key 的范围（ADR-0061，#977）：列表每把未吊销的 Key 有「修改范围」，表单预填当前范围、校验与创建相同，
+// 提交后这把 Key 的下一个请求即按新范围（requireApiKey 每次请求读库，无缓存）；已吊销或别租户的 Key 404。
+// 组里另建自己的 Key，不动共用夹具的 key（计数、隔离用例按名字找它）；别租户另开 umbrella，不占 globex / initech
+describe('修改 Key 的范围', () => {
+  let shared: ServedFixture;
+  let admin: Client;
+  beforeAll(async () => {
+    shared = await sharedServed(); // 共用的点查夹具（打通、RFM、发布指标与标签、生成服务库），并行跑满时超过默认 hookTimeout 60 s
+    // admin@acme.com 的 Magic Link 登录申请已被共享夹具与前面的组用到限流（15 分钟窗口内 5 次）：清掉计数，本组登录一次共用
+    await getDb().delete(magicLinkRequests);
+    admin = await loginAs(app, 'admin@acme.com');
+  }, 180_000);
+
+  /** 提交修改范围（字段与页面表单一致），返回状态码 */
+  const updateScope = (id: string, fields: Record<string, string | string[]>) =>
+    admin.post('/api-keys', { intent: 'update-scope', id, ...fields }).then(r => r.status);
+
+  it('三类全开的 Key 改成只开点查：下一个请求目录 403、点查 200；再改成「指定」一个标签：点查只剩该标签', async () => {
+    const { consumer } = shared;
+    const { key } = await createKey(admin, '改范围');
+    const id = await keyIdOf(admin, '改范围');
+    expect((await call('/api/v1/catalog', key)).status).toBe(200); // 改之前三类全开
+
+    expect(await updateScope(id, { scope: ['consumers'], dataScope: 'all' })).toBe(302);
+    const forbidden = await call('/api/v1/catalog', key); // 下一个请求即按新范围，不用等
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toEqual({ error: '这把 Key 没有目录接口的权限' });
+    expect((await lookup(`/api/v1/consumers/${consumer}`, key)).status).toBe(200);
+
+    // 数据范围同时收窄到只有一个标签：点查只剩该标签，指标空、RFM null（与创建时就选「指定」相同）
+    expect(await updateScope(id, { scope: ['consumers'], dataScope: 'some', tag: ['value_tier'] })).toBe(302);
+    const body = (await lookup(`/api/v1/consumers/${consumer}`, key)).body;
+    expect(body.tags).toEqual({ value_tier: expect.stringMatching(/^(high|low)$/) });
+    expect(body.metrics).toEqual({});
+    expect(body.rfm).toBeNull();
+
+    // 列表「接口」「数据」列跟着更新，未吊销的行有「修改范围」链接
+    const list = await (await admin.get('/api-keys')).text();
+    const row = list.split('<tr').find(r => r.includes('data-api-key-id=') && r.includes('>改范围<')) ?? '';
+    expect(row).toContain('>点查<');
+    expect(row).not.toContain('目录');
+    expect(row).toContain('1 个标签');
+    expect(row).toContain(`href="/api-keys?edit=${id}"`);
+
+    // 校验规则与创建相同：一类都不勾、指定范围一项不选、白名单外的 key 都是 400，范围不变
+    expect(await updateScope(id, { scope: [], dataScope: 'some', tag: ['value_tier'] })).toBe(400);
+    expect(await updateScope(id, { scope: ['consumers'], dataScope: 'some' })).toBe(400);
+    expect(await updateScope(id, { scope: ['consumers'], dataScope: 'some', tag: ['nope_tier'] })).toBe(400);
+  });
+
+  it('别租户、已吊销、不是 UUID 的 Key 改范围一律 404；已吊销的行不出现「修改范围」', async () => {
+    const umbrella = await newTenant('umbrella');
+    const adminB = await loginAs(app, `admin@umbrella.com`);
+    const { key: theirs } = await createKey(adminB, '别家的');
+    const foreignId = await keyIdOf(adminB, '别家的');
+    expect(await updateScope(foreignId, { scope: ['consumers'], dataScope: 'all' })).toBe(404);
+    expect((await call('/api/v1/catalog', theirs)).status).toBe(200); // B 的 Key 照常可用，范围没被改
+
+    const { key } = await createKey(admin, '要吊销的');
+    const id = await keyIdOf(admin, '要吊销的');
+    expect((await admin.post('/api-keys', { intent: 'revoke', keyId: id })).status).toBe(302);
+    expect(await updateScope(id, { scope: ['consumers'], dataScope: 'all' })).toBe(404);
+    const list = await (await admin.get('/api-keys')).text();
+    const revokedRow = list.split('<tr').find(r => r.includes('data-api-key-id=') && r.includes('>要吊销的<')) ?? '';
+    expect(revokedRow).toContain('已吊销');
+    expect(revokedRow).not.toContain('修改范围');
+
+    expect(await updateScope('not-a-uuid', { scope: ['consumers'], dataScope: 'all' })).toBe(404);
+    expect(umbrella).toBeDefined();
+  });
+
+  it('?edit=<id> 只在该行下渲染修改表单，预填当前范围（SSR 勾选项带 checked）；不带 edit 时页面只有一组数据范围单选', async () => {
+    const scoped: ApiDataScope = { all: false, tags: ['value_tier'], metrics: [], rfm: true };
+    const { key } = await createKey(admin, '预填', ['consumers'], scoped);
+    const id = await keyIdOf(admin, '预填');
+
+    // 不带 edit：没有修改表单，数据范围单选仍只有创建表单那一组（已有用例断言过两个单选）
+    const plain = await (await admin.get('/api-keys')).text();
+    expect(plain.match(/name="dataScope"/g)).toHaveLength(2);
+    expect(plain).not.toContain('update-scope');
+
+    const page = await (await admin.get(`/api-keys?edit=${id}`)).text();
+    expect(page.match(/name="dataScope"/g)).toHaveLength(4); // 创建 + 修改各一组
+    const editForm = page.split('<form').find(f => f.includes('value="update-scope"')) ?? '';
+    expect(editForm).not.toBe('');
+    expect(editForm).toContain(`value="${id}"`);
+    // 预填当前范围：接口只勾点查，数据范围选「指定」，value_tier 与 RFM 勾着，别的没勾
+    const inputOf = (name: string, value?: string) => editForm.match(new RegExp(`<input[^>]*name="${name}"[^>]*${value ? `value="${value}"` : ''}[^>]*>`))![0];
+    expect(inputOf('scope', 'catalog')).not.toContain('checked');
+    expect(inputOf('scope', 'consumers')).toContain('checked');
+    expect(inputOf('dataScope', 'all')).not.toContain('checked');
+    expect(inputOf('dataScope', 'some')).toContain('checked');
+    expect(inputOf('tag', 'value_tier')).toContain('checked');
+    expect(inputOf('rfm')).toContain('checked');
+    // 只在这一行下渲染：整页恰好一张修改表单
+    expect(page.split('<form').filter(f => f.includes('value="update-scope"'))).toHaveLength(1);
+  });
+});
+
+// 修改范围记审计（#977）：动作 api_key.scope_changed（「修改 API Key 范围」），detail 只有名称、前缀与前后两个范围，
+// 不记 Key 明文与哈希；范围没变再提交不写审计、也不报错。写在另一组里，用 detail 里的名称过滤，不受上一组的影响
+describe('修改 Key 范围的审计', () => {
+  let shared: ServedFixture;
+  let admin: Client;
+  beforeAll(async () => {
+    shared = await sharedServed(); // 共用的点查夹具（打通、RFM、发布指标与标签、生成服务库），并行跑满时超过默认 hookTimeout 60 s
+    await getDb().delete(magicLinkRequests);
+    admin = await loginAs(app, 'admin@acme.com');
+  }, 180_000);
+
+  it('detail 只有 { name, prefix, before, after }；先后改接口与数据范围各记一条；范围没变再提交：审计不增加、不报错', async () => {
+    const { key } = await createKey(admin, '审计改范围');
+    const id = await keyIdOf(admin, '审计改范围');
+    const rows = () => getDb().select({ detail: auditLogs.detail }).from(auditLogs)
+      .where(and(eq(auditLogs.action, 'api_key.scope_changed'), sql`${auditLogs.detail}->>'name' = '审计改范围'`)).orderBy(auditLogs.createdAt);
+    expect(await rows()).toHaveLength(0);
+
+    // 先只改接口范围
+    expect((await admin.post('/api-keys', { intent: 'update-scope', id, scope: ['catalog', 'consumers'], dataScope: 'all' })).status).toBe(302);
+    expect(await rows()).toEqual([{
+      detail: {
+        name: '审计改范围', prefix: key.slice(0, 8),
+        before: { scopes: ['catalog', 'consumers', 'exports'], dataScope: { all: true } },
+        after: { scopes: ['catalog', 'consumers'], dataScope: { all: true } },
+      },
+    }]);
+
+    // 再只改数据范围
+    const scoped: ApiDataScope = { all: false, tags: ['value_tier'], metrics: [], rfm: false };
+    expect((await admin.post('/api-keys', { intent: 'update-scope', id, scope: ['catalog', 'consumers'], dataScope: 'some', tag: ['value_tier'] })).status).toBe(302);
+    expect(await rows()).toHaveLength(2);
+    const second = (await rows())[1]; // 第二条：只改了数据范围
+    expect(second.detail).toEqual({
+      name: '审计改范围', prefix: key.slice(0, 8),
+      before: { scopes: ['catalog', 'consumers'], dataScope: { all: true } },
+      after: { scopes: ['catalog', 'consumers'], dataScope: scoped },
+    });
+
+    // 同样的范围再提交：不报错，审计不增加
+    expect((await admin.post('/api-keys', { intent: 'update-scope', id, scope: ['catalog', 'consumers'], dataScope: 'some', tag: ['value_tier'] })).status).toBe(302);
+    expect(await rows()).toHaveLength(2);
+
+    // 审计页出现「修改 API Key 范围」，描述是 Key 的名称与前缀；detail 里没有 Key 明文
+    const audit = await (await admin.get('/audit')).text();
+    expect(audit).toContain('修改 API Key 范围');
+    expect(audit).toContain(`「审计改范围」（${key.slice(0, 8)}…）`);
+    const details = await getDb().select({ detail: auditLogs.detail }).from(auditLogs).where(eq(auditLogs.action, 'api_key.scope_changed'));
+    expect(JSON.stringify(details)).not.toContain(key);
+    expect(shared.acme).toBeDefined();
+  });
+});
+
+// 「接口说明」补 403 与数据范围（#977）：每个走 Bearer 的接口错误表都有 403 行，文案与实际响应逐字相同（按接口所属类），
+// 凭令牌的下载接口没有；引言写明数据范围外的标签 / 指标、快照与导出的行为
+describe('接口说明的 403 与数据范围', () => {
+  it('每个 Bearer 接口的错误表有 403 行（文案与实际响应逐字相同、按接口所属类），下载接口没有；引言写明数据范围', async () => {
+    // 与前面几组共用 sharedServed 造好的 acme（这几组之间不清库）：清掉 Magic Link 限流再登录
+    await getDb().delete(magicLinkRequests);
+    const admin = await loginAs(app, 'admin@acme.com');
+    const docs = await (await admin.get('/api-keys?tab=docs')).text();
+    const labelOf = (route: string) => (route === 'api/v1/catalog' ? '目录' : route.startsWith('api/v1/consumers') ? '点查' : '导出');
+    // 一张卡片一段：按 data-endpoint 切开，逐个接口断言
+    const chunks = docs.split('data-endpoint="').slice(1);
+    for (const e of API_ENDPOINTS) {
+      const chunk = chunks.find(c => c.startsWith(`${e.route}"`)) ?? '';
+      expect(chunk, e.route).not.toBe('');
+      if (e.route.endsWith('/download')) {
+        expect(chunk, e.route).not.toContain('>403<'); // 下载凭令牌，不走 Bearer，没有 403
+      } else {
+        expect(chunk, e.route).toContain(`这把 Key 没有${labelOf(e.route)}接口的权限`);
+      }
+    }
+
+    // 文案与实际响应逐字相同：只开点查的 Key 调目录，error 与目录卡片里的 403 文案一致
+    const { key } = await createKey(admin, '只点查的', ['consumers']);
+    const error = await (await call('/api/v1/catalog', key)).json();
+    expect(error).toEqual({ error: '这把 Key 没有目录接口的权限' });
+    expect(docs).toContain(error.error);
+
+    // 引言写明数据范围：范围外的标签 / 指标不出现、快照 404、导出 400
+    expect(docs).toContain('范围外的标签、指标不会出现在目录与点查里');
+    expect(docs).toContain('范围外的快照返回 404');
+    expect(docs).toContain('导出条件用到范围外的标签时返回 400');
+  });
+});

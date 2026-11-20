@@ -43,6 +43,13 @@ const UNAUTHORIZED: ApiEndpointError = {
   meaning: '没带 Key、Key 错误、Key 已吊销或租户已暂停，响应一律相同，并带 WWW-Authenticate: Bearer',
 };
 
+/** Key 没开这一类接口：403（api-auth.ts 的 forbidden）。message 与实际响应逐字相同，label 是接口所属类在页面上的名字 */
+const forbidden = (label: '目录' | '点查' | '导出'): ApiEndpointError => ({
+  status: 403,
+  message: `这把 Key 没有${label}接口的权限`,
+  meaning: '这把 Key 的接口范围里没有这一类（创建 Key 或「修改范围」时勾选）',
+});
+
 /** 点查接口共同的 503：还没有服务库、正在生成或数据湖未初始化 */
 const SERVING_UNAVAILABLE: ApiEndpointError = {
   status: 503,
@@ -79,7 +86,7 @@ export const API_ENDPOINTS: readonly ApiEndpoint[] = [
     { "kind": "tag", "key": "value_tier", "version": 1, "description": null, "note": null, "publishedAt": "2026-11-01T09:00:00.000Z" }
   ]
 }`,
-    errors: [UNAUTHORIZED],
+    errors: [UNAUTHORIZED, forbidden('目录')],
     curl: `curl -H 'Authorization: Bearer <你的 API Key>' '<平台地址>/api/v1/catalog'`,
   },
   {
@@ -96,6 +103,7 @@ export const API_ENDPOINTS: readonly ApiEndpoint[] = [
     responseExample: PROFILE_EXAMPLE,
     errors: [
       UNAUTHORIZED,
+      forbidden('点查'),
       { status: 404, message: '没有这个消费者', meaning: '统一消费者 ID 不存在' },
       { status: 404, message: '快照不存在或已过期', meaning: '?snapshot= 给的快照不存在、已过期，或不是 RFM / 指标 / 标签的快照' },
       SERVING_UNAVAILABLE,
@@ -116,6 +124,7 @@ export const API_ENDPOINTS: readonly ApiEndpoint[] = [
     responseExample: PROFILE_EXAMPLE,
     errors: [
       UNAUTHORIZED,
+      forbidden('点查'),
       { status: 400, message: '按数据源查询不支持 snapshot：请先查出 consumer_id，再带 snapshot 调 /api/v1/consumers/:consumerId', meaning: '这个接口不接受 ?snapshot=（旧快照记的是当时的 ID）' },
       { status: 404, message: '没有这个数据源', meaning: '数据源登记名不存在（区分大小写）' },
       { status: 404, message: '这个数据源下没有这个消费者', meaning: '源端 ID 不存在，或查到人但他没有任何标签、指标与 RFM 结果' },
@@ -143,6 +152,7 @@ export const API_ENDPOINTS: readonly ApiEndpoint[] = [
 }`,
     errors: [
       UNAUTHORIZED,
+      forbidden('导出'),
       { status: 400, message: '请求体必须是 JSON / 请求体必须是 JSON 对象', meaning: '请求体不是合法 JSON，或不是 JSON 对象' },
       { status: 400, message: 'conditions 必须是 1 到 5 个 { tag, value }、标签 × 重复、标签键不合法、取值为空或超长、snapshots 不合法、format 不合法、标签 × 还没有可用的快照、标签 × 指定的快照不存在、已过期或不是这个标签的', meaning: '条件或快照不合法，不入队、不记审计；错误文案里 × 是具体的标签键' },
       { status: 405, message: '只支持 POST', meaning: '用别的方法调这个路径' },
@@ -171,6 +181,7 @@ export const API_ENDPOINTS: readonly ApiEndpoint[] = [
 }`,
     errors: [
       UNAUTHORIZED,
+      forbidden('导出'),
       { status: 404, message: '导出不存在', meaning: '导出 ID 不是 UUID、不存在、属于别的租户，或这个任务不是人群导出' },
     ],
     curl: `curl -H 'Authorization: Bearer <你的 API Key>' '<平台地址>/api/v1/exports/0d1e2f3a-4b5c-6d7e-8f9a-0b1c2d3e4f5a'`,
