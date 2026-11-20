@@ -66,9 +66,9 @@ const ALLOWED_SHOWS = new Set(['DESCRIBE', 'SUMMARY']);
 /** SHOW TABLES、SHOW ALL TABLES 与不带对象的 DESCRIBE 在解析树里的表名 */
 const SHOW_TABLES = new Set(['"tables"', '__show_tables_expanded']);
 
-/** 能读的表的过滤条件：schema 在 schemas 里，或是 shared 里的表（列名由调用方给出）；sandbox 给出时排除自己沙箱里删除中改名的保留表 */
+/** 能读的表的过滤条件：schema 在 schemas 里，或是 shared 里的表（列名由调用方给出）；sandbox 给出时排除自己沙箱里删除中改名的保留表（IN/OR 整体加括号再接 AND NOT，否则 AND 只套在最后一个分享项上） */
 const readableWhere = (schemaCol: string, tableCol: string, schemas: readonly string[], shared: readonly SandboxTableRef[], sandbox?: string) =>
-  `(${schemaCol} IN (${schemas.map(lit).join(', ')})${shared.map(t => ` OR (${schemaCol} = ${lit(t.schema)} AND ${tableCol} = ${lit(t.table)})`).join('')}${sandbox ? ` AND NOT (${schemaCol} = ${lit(sandbox)} AND regexp_matches(${tableCol}, ${lit(DROPPED_TABLE_NAME.source)}))` : ''})`;
+  `((${schemaCol} IN (${schemas.map(lit).join(', ')})${shared.map(t => ` OR (${schemaCol} = ${lit(t.schema)} AND ${tableCol} = ${lit(t.table)})`).join('')})${sandbox ? ` AND NOT (${schemaCol} = ${lit(sandbox)} AND regexp_matches(${tableCol}, ${lit(DROPPED_TABLE_NAME.source)}))` : ''})`;
 
 /** 列出能读的表（shared 是分享来的表，SHOW TABLES 时一并列出；sandbox 是自己的沙箱 schema，保留表不列）：代替 SHOW TABLES（原样执行会列出 stage 与元数据库里的表） */
 const listTablesSql = (schemas: readonly string[], shared: readonly SandboxTableRef[] = [], sandbox?: string) => `SELECT table_schema AS schema, table_name AS name, table_type AS type
