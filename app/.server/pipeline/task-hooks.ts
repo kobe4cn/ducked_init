@@ -66,8 +66,11 @@ export const TASK_HOOKS = {
   'silver.merge': [
     // 合并里值字典没写到的新取值落入了兜底值（以前没通知过）：通知能改映射的成员并记审计（ADR-0015）。部分映射失败时也看成功的那些
     { name: 'alertNewFallback', when: 'result', run: ({ task, result }) => alertNewFallback(task.tenantId, task, result) },
-    // 合并成功：以默认参数自动启用依赖已齐、本租户还没有定义的模板，产出第一版快照（ADR-0021）
-    { name: 'enableDefaultTemplates', when: 'succeeded', run: ({ task }) => enableDefaultTemplates(task.tenantId) },
+    // 合并成功：以默认参数自动启用依赖已齐、本租户还没有定义的模板，产出第一版快照（ADR-0021）。
+    // CRM_TEST_SKIP_DEFAULT_TEMPLATES=1 是只给测试用的开关：大部分用例不看这些快照，test/setup-env.ts 给每个测试文件默认打开，
+    // 要模板的文件用 test/pipeline/fixtures.ts 的 useDefaultTemplates() 关掉；生产不设这个变量，行为不变。每次调用时读
+    // （同 TEMPLATE_TEST_VERSIONS），判断不放进 enableDefaultTemplates 本身：它还被别处直接调用（templates.test.ts）
+    { name: 'enableDefaultTemplates', when: 'succeeded', run: async ({ task }) => { if (process.env.CRM_TEST_SKIP_DEFAULT_TEMPLATES !== '1') await enableDefaultTemplates(task.tenantId); } },
   ],
   // 业务主键的全表检查通过：写回声明并记审计（工作进程里没有平台库）
   'source.keycheck': [{ name: 'applyKeyCheck', when: 'result', run: ({ task }) => applyKeyCheck(task.tenantId, task.id) }],

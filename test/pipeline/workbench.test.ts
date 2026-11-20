@@ -20,12 +20,14 @@ import { listCatalog, listSandboxTables, runQuery, saveAsSandbox, WORKBENCH_ROWS
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { bronzeSchema } from '../../app/.server/pipeline/sync-engine';
 import { resetDb } from '../http/harness';
-import { drain, memberOf, newTenant, onLake, runTask } from './fixtures';
+import { drain, memberOf, newTenant, onLake, runTask, useDefaultTemplates } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource, READER } from './source-fixtures';
 
 let acme: string;
 let crm: string;
+// 只读查询的用例要读自动启用的默认模板的结果层表：关掉 setup-env 默认打开的 CRM_TEST_SKIP_DEFAULT_TEMPLATES（#997）
+useDefaultTemplates();
 afterAll(async () => { await closeDb(); });
 beforeAll(async () => {
   await resetDb();

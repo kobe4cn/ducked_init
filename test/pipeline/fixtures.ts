@@ -1,6 +1,7 @@
 // test/pipeline/fixtures.ts —— 流水线接缝的夹具：直接调用领域函数开通租户、入队任务并让调度器把队列跑空、把数据源的表全部选入同步范围、
 // 发布映射并合并、读取标准层
 import { and, eq } from 'drizzle-orm';
+import { beforeAll } from 'vitest';
 import type { CurrentMember } from '../../app/.server/auth';
 import { getDb } from '../../app/.server/db/client';
 import { members, spaces, tenants, type Role } from '../../app/.server/db/schema';
@@ -116,4 +117,11 @@ export async function onLake<T = Record<string, unknown>>(tenantId: string, sql:
   } finally {
     session.close();
   }
+}
+
+/** 本测试文件要看「映射首次合并后自动启用默认模板」产出的快照（ADR-0021）：在文件顶层（describe 外）调用一次，
+ *  删掉 setup-env 默认打开的 CRM_TEST_SKIP_DEFAULT_TEMPLATES（#997）。删除放在 beforeAll 里就够：HTTP 接缝（vite SSR
+ *  同进程）共用 process.env，第一个用例之前删掉即可对调度器一侧生效；下一个测试文件的 setup-env 会重新打开，opt-in 不跨文件 */
+export function useDefaultTemplates() {
+  beforeAll(() => { delete process.env.CRM_TEST_SKIP_DEFAULT_TEMPLATES; });
 }

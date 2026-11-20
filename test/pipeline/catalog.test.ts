@@ -26,10 +26,12 @@ import { publishTemplate, saveDraft } from '../../app/.server/templates';
 import { lockTenant } from '../../app/.server/tenant-lock';
 import { resetDb } from '../http/harness';
 import { groupedText } from '../catalog-groups';
-import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish, selectAllTables } from './fixtures';
+import { defaultSpaceOf, drain, memberInNewSpace, memberOf, newTenant, publish, selectAllTables, useDefaultTemplates } from './fixtures';
 import { CRM, CRM_ORDERS, LOYALTY, publishedIdentitySources, TRACKING_USERS } from './identity-fixtures';
 import { grantOnSource, pgSourceInput, READER, seedIdentitySources } from './source-fixtures';
 
+// 目录的模板条目、模板的产出列与快照、自动启用记的目录版本都要默认模板自动启用：关掉 setup-env 默认打开的 CRM_TEST_SKIP_DEFAULT_TEMPLATES（#997）
+useDefaultTemplates();
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 
