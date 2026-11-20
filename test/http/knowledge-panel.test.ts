@@ -523,8 +523,7 @@ describe('业务知识面板', () => {
 });
 
 describe('字段抽屉与自定义实体详情页里的业务知识面板', () => {
-  let shared: Awaited<ReturnType<typeof sharedPanel>>;
-  beforeAll(async () => { shared = await sharedPanel(); }, 180_000); // 与上一组共用同一个 Promise，不重造
+  beforeAll(async () => { await sharedPanel(); }, 180_000); // 与上一组共用同一个 Promise，不重造；这组的用例只用夹具造好的库，不取返回值
 
   it('查看者在字段抽屉里看得到实体与字段面板，没有表单，字段面板没有来源，提交 403', async () => {
     const viewer = await loginAs(app, 'view@acme.com');
