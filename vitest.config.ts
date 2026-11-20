@@ -22,14 +22,26 @@ process.env.MAILER = 'console';
 // 插件没有官方开关，靠补丁加的这个变量关闭（patches/@react-router__dev.patch）；本地 pnpm dev 不设，行为不变。
 // 必须在顶层设：开关在插件的 config 钩子里读，worker 进程继承这个变量
 process.env.REACT_ROUTER_SKIP_TYPEGEN = '1';
-// 测试不调用真实的模型服务：本地 .env.test 或 shell 里的平台默认配置不带进测试，要测时用 vi.stubEnv
-delete process.env.LLM_BASE_URL;
-delete process.env.LLM_MODEL;
-delete process.env.LLM_API_KEY;
-// 平台档位（ADR-0055）同理，两档各三个变量一起清
+// 测试不调用真实的模型服务：本地 .env / .env.test 或 shell 里的平台配置不带进测试，要测时用 vi.stubEnv。
+// 必须设成空串而不能 delete：HTTP 测试的开发服务器会把 .env 重新灌回 process.env——React Router 插件启动
+// vite 时执行 Object.assign(process.env, vite.loadEnv(mode, root, ''))（@react-router/dev/dist/vite.js 的
+// loadDotenv），而 vite 的 loadEnv 最后会让 process.env 里已存在的 key 覆盖文件里的值（按 key 是否存在判断，
+// 不看值真假），所以空串挡得住 .env，删除挡不住（#996）。app/.server/llm.ts 把空串当作没配置（真值判断，
+// 超时走正则）。清空 app/.server/llm.ts 读取的全部 16 个变量：默认五项、两档各四项（ADR-0055）、embedding 三项
+// （ADR-0049），见 ADR-0035。必须顶层直接赋值、不能用 ??=：shell 里设过的值也要清掉，worker 进程靠继承拿到这些值
+process.env.LLM_BASE_URL = '';
+process.env.LLM_MODEL = '';
+process.env.LLM_API_KEY = '';
+process.env.LLM_CHAT_EXTRA = '';
+process.env.LLM_TIMEOUT_SECONDS = '';
+// 平台档位（ADR-0055）同理，两档各四个变量一起清
 for (const tier of ['FAST', 'REASONING']) {
-  for (const suffix of ['MODEL', 'BASE_URL', 'API_KEY']) delete process.env[`LLM_${tier}_${suffix}`];
+  for (const suffix of ['MODEL', 'BASE_URL', 'API_KEY', 'CHAT_EXTRA']) process.env[`LLM_${tier}_${suffix}`] = '';
 }
+// 平台 embedding（ADR-0049）同理：.env 带上 LLM_EMBEDDING_* 时，检查 data-embedding-source="none" 的用例同样会挂
+process.env.LLM_EMBEDDING_BASE_URL = '';
+process.env.LLM_EMBEDDING_MODEL = '';
+process.env.LLM_EMBEDDING_API_KEY = '';
 // 凭据信封加密的主密钥：测试用固定值
 process.env.PLATFORM_MASTER_KEY = Buffer.alloc(32, 7).toString('base64');
 // DuckDB 文件类数据源所在的本地目录（每个租户一个子目录）
