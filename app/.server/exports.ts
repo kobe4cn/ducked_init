@@ -1,9 +1,11 @@
 // app/.server/exports.ts —— 人群导出（ADR-0040）：外部系统按标签条件发起导出，入队时定下每个标签用哪张快照，
 // 由工作进程的 export.tags 写文件。导出 ID 就是任务 ID；一律限定在调用方的租户内。
+// 条件里的标签还按 Key 的数据范围（ADR-0061「数据范围」，#976）拦一道：范围外的与没有可用快照同样提示。
 // 成功后每次查询签发一个 15 分钟的下载链接（只存令牌哈希），凭令牌下载；文件在任务结束 24 小时后由调度器删掉
 import { open, rm } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { and, eq, gt, inArray, isNull, lt, lte, sql } from 'drizzle-orm';
+import { templateInScope } from '../lib/api-data-scope';
 import type { ApiCaller } from './api-auth';
 import { recordAudit } from './audit';
 import { newToken, sha256 } from './auth';
@@ -68,6 +70,9 @@ function parseRequest(body: unknown): ExportRequest {
   };
 }
 
+/** 「还没有可用的快照」的提示：标签没有可用快照，以及（#976 起）标签不在 Key 数据范围内，都用这一句，不区分 */
+const noSnapshotMessage = (tag: string) => `标签 ${tag} 还没有可用的快照`;
+
 /**
  * 这个标签要用的快照：指定了就用它（须是本租户、这个标签的、未过期的，别的租户的与不存在的同样报错），
  * 否则取最新一张未过期的（按统计日 newestFirst 倒序）。返回快照 ID 与不带 schema 的表名
@@ -82,17 +87,19 @@ async function pickSnapshot(tenantId: string, tag: string, id: string | undefine
     : await getSnapshot(tenantId, id);
   const table = snapshot && /^gold\.(tag__[0-9a-f-]{36})$/.exec(snapshot.table)?.[1];
   if (!snapshot || !table || snapshot.template !== template || !live(snapshot)) {
-    throw new ExportError(id === undefined ? `标签 ${tag} 还没有可用的快照` : `标签 ${tag} 指定的快照不存在、已过期或不是这个标签的`);
+    throw new ExportError(id === undefined ? noSnapshotMessage(tag) : `标签 ${tag} 指定的快照不存在、已过期或不是这个标签的`);
   }
   return { id: snapshot.id, table };
 }
 
 /** 发起一次人群导出：校验、定下每个标签的快照后入队 export.tags，同一事务里记审计。校验不通过时抛 ExportError（400），不入队 */
-export async function createExport({ tenantId, prefix }: ApiCaller, body: unknown) {
+export async function createExport({ tenantId, prefix, dataScope }: ApiCaller, body: unknown) {
   const request = parseRequest(body);
   const picked: Record<string, string> = {};
   const conditions: ExportCondition[] = [];
   for (const { tag, value } of request.conditions) {
+    // 条件里的标签先过数据范围：范围外的与没有可用快照同样提示（即使指定了 snapshots），不泄露范围外有定义
+    if (!templateInScope(`tag:${tag}`, dataScope)) throw new ExportError(noSnapshotMessage(tag));
     const { id, table } = await pickSnapshot(tenantId, tag, request.snapshots[tag]);
     picked[tag] = id;
     conditions.push({ tag, value, table });

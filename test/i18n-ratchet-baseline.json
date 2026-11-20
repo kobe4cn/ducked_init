@@ -24,7 +24,7 @@
     "app/.server/custom-entities.ts": 45,
     "app/.server/db/client.ts": 1,
     "app/.server/dsl-definitions.ts": 40,
-    "app/.server/exports.ts": 11,
+    "app/.server/exports.ts": 12,
     "app/.server/fallback-alerts.ts": 4,
     "app/.server/identity-exclusions.ts": 4,
     "app/.server/key-check.ts": 1,

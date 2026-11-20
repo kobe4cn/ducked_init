@@ -1,6 +1,7 @@
 // test/http/exports.test.ts —— 人群导出接口：外部系统带 Bearer Key 调 POST /api/v1/exports 按标签条件发起导出（入队时定下每个标签的快照），
 // 工作进程写成 Parquet / CSV 文件，GET /api/v1/exports/:id 查状态与实际用到的快照，成功后带限时下载链接，凭 token 下载；
 // 任务结束 24 小时后调度器删掉文件（ADR-0040）。
+// 条件里的标签还按 Key 的数据范围（ADR-0061「数据范围」，#976）拦一道：范围外的标签 400，提示与「还没有可用的快照」相同。
 // 快照直接在湖里建表、在平台库登记，不跑分析模板
 import { existsSync } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
@@ -8,8 +9,9 @@ import { randomUUID } from 'node:crypto';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { sha256 } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, exportLinks, snapshots, tasks } from '../../app/.server/db/schema';
+import { apiKeys, auditLogs, exportLinks, snapshots, tasks } from '../../app/.server/db/schema';
 import { cleanupExpiredExports, EXPORT_LINK_TTL_MS } from '../../app/.server/exports';
 import { lakeRow } from '../../app/.server/lake';
 import { listTasks } from '../../app/.server/tasks';
@@ -156,6 +158,29 @@ describe('发起导出', () => {
       .toEqual((await post({ conditions: [vipYes], snapshots: { vip: randomUUID() } }, key)).body);
     expect(await exportTasks(tenantId)).toEqual([]);
     expect(await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'export.requested'))).toEqual([]);
+  });
+
+  it('Key 的数据范围外的标签 400 且提示与「还没有可用的快照」逐字相同（指定 snapshots 时也是这句，不是「指定的快照不存在」），不入队；范围内的照常 202（#976）', async () => {
+    const { tenantId, key } = await tenantWithKey('acme');
+    const vip = await tagSnapshot(tenantId, 'vip', VIP);
+    const city = await tagSnapshot(tenantId, 'city', CITY);
+    // 这把 Key 只放开 vip：直接改库，创建表单的数据范围在 test/http/api.test.ts 里测
+    await getDb().update(apiKeys).set({ dataScope: { all: false, tags: ['vip'], metrics: [], rfm: false } }).where(eq(apiKeys.tokenHash, sha256(key)));
+
+    // 范围外的标签：400，error 与「标签还没有可用的快照」逐字相同
+    expect(await post({ conditions: [{ tag: 'city', value: 'sh' }] }, key))
+      .toEqual({ status: 400, body: { error: '标签 city 还没有可用的快照' } });
+    // 指定了范围外标签的快照也是这句，不能报「指定的快照不存在、已过期或不是这个标签的」（那张快照其实可用）
+    expect(await post({ conditions: [{ tag: 'city', value: 'sh' }], snapshots: { city } }, key))
+      .toEqual({ status: 400, body: { error: '标签 city 还没有可用的快照' } });
+    // 一次请求里范围内、范围外各一个条件：整体 400
+    expect((await post({ conditions: [{ tag: 'vip', value: 'yes' }, { tag: 'city', value: 'sh' }] }, key)).status).toBe(400);
+
+    // 范围内的照常 202 入队；上面被拒的都没有入队、没有记审计
+    const ok = await post({ conditions: [{ tag: 'vip', value: 'yes' }] }, key);
+    expect(ok).toEqual({ status: 202, body: { id: expect.any(String), status: 'queued', snapshots: { vip } } });
+    expect(await exportTasks(tenantId)).toHaveLength(1);
+    expect(await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'export.requested'))).toHaveLength(1);
   });
 });
 
