@@ -22,7 +22,7 @@ import { loginAs, resetDb, startApp, type TestApp } from './harness';
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
-beforeEach(async () => { await resetDb(); });
+const fresh = () => resetDb();
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 实付金额\n';
 const REVENUE_V2 = 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 新口径\n';
@@ -60,6 +60,8 @@ async function setup() {
 }
 
 describe('业务知识面板', () => {
+  beforeEach(fresh);
+
   it('分析师在指标详情页加 / 停用别名、存 / 清空业务说明、设置口径声明、新建主题并加入 / 移出，面板与目录立即反映；数据工程师与管理员同样能改，标签页也有面板', async () => {
     const { acme, analyst } = await setup();
     const an = await loginAs(app, 'an@acme.com');
@@ -126,25 +128,6 @@ describe('业务知识面板', () => {
     expect(panel).toContain('name="intent" value="alias.add"');
     expect((await post({ intent: 'alias.add', alias: '高消费', targetId: 'tag:spender' }, TAG)).status).toBe(302);
     expect(await knowledgeOf(acme, 'tag:spender')).toEqual({ aliases: ['高消费'] });
-  });
-
-  it('查看者看得到同样的知识，没有编辑入口，提交 403', async () => {
-    const { acme, analyst } = await setup();
-    const aliasId = await addAlias(analyst, { targetId: TARGET, alias: '营收' });
-    await saveBusinessNote(analyst, { targetId: TARGET, note: '只算已支付' });
-    const viewer = await loginAs(app, 'view@acme.com');
-
-    const panel = await panelOf(viewer, METRIC);
-    expect(panel).toContain('data-alias="营收"');
-    expect(panel).toContain('data-note="只算已支付"');
-    expect(panel).not.toContain('name="intent"');
-    expect(panel).not.toContain('<button');
-    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'alias.add', alias: '年营收' })).status).toBe(403);
-    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'note.save', note: '改掉' })).status).toBe(403);
-    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'claim.save', type: 'currency', value: 'CNY' })).status).toBe(403);
-    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'subject.create', name: '营收' })).status).toBe(403);
-    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'alias.confirm', aliasId })).status).toBe(403);
-    expect(await knowledgeOf(acme)).toEqual({ aliases: ['营收'], note: '只算已支付' });
   });
 
   it('依据变了的别名、业务说明、口径声明显示「待复核」，口径声明显示原值；从未发布过的定义只提示发布后才能添加', async () => {
@@ -246,35 +229,6 @@ describe('业务知识面板', () => {
     const other = await propose(acme, { kind: 'alias', content: { alias: '营业额' } });
     expect((await post({ intent: 'proposal.acceptEdited', proposalId: other.id, kind: 'alias', alias: '年营业额' })).status).toBe(302);
     expect((await knowledgeOf(acme))?.aliases).toEqual(expect.arrayContaining(['年营业额', '流水']));
-  });
-
-  it('source_comment 证据（#524）：有 sources:read 的成员看到链到数据源页锚点的链接与源名，不存在的源只有文字；查看者只看到「源端注释 vN」，HTML 里没有源、表与列名', async () => {
-    const { acme, sources } = await setup();
-    const gone = '00000000-0000-0000-0000-000000000000';
-    const linked = await propose(acme, {
-      kind: 'note', content: { note: '含退款' },
-      evidence: [{ ref: 'metric:paid_revenue', version: 1 }, { ref: `source_comment:${sources.crm}/public.x.y`, version: 2 }],
-    });
-    await propose(acme, { kind: 'alias', content: { alias: '流水' }, evidence: [{ ref: `source_comment:${gone}/public.z.w`, version: 1 }] });
-
-    const an = await loginAs(app, 'an@acme.com');
-    const panel = await panelOf(an, METRIC);
-    expect(panel).toContain('metric:paid_revenue v1');
-    expect(panel).toContain('源端注释 CRM public.x.y v2');
-    expect(panel).toContain(`href="/sources/${sources.crm}#comment-public.x.y"`);
-    // 不存在的源（或没有 sources:read 的成员）：只有文字，没有链接
-    expect(panel).toContain('源端注释 v1');
-    expect(panel).not.toContain(`href="/sources/${gone}`);
-
-    // 查看者：文字里不带源与表列名，链接与源 ID 都不在 HTML 里
-    const view = await loginAs(app, 'view@acme.com');
-    const viewerPanel = await panelOf(view, METRIC);
-    expect(viewerPanel).toContain(`data-proposal="${linked.id}"`);
-    expect(viewerPanel).toContain('源端注释 v2');
-    expect(viewerPanel).not.toContain('源端注释 CRM');
-    expect(viewerPanel).not.toContain('public.x');
-    expect(viewerPanel).not.toContain(sources.crm);
-    expect(viewerPanel).not.toContain('href="/sources/');
   });
 
   it('主题归属提案显示主题名，没有「修改后接受」；接受后提案消失、条目进入主题；主题删除后显示「已删除的主题」，改值接受被服务端拦下', async () => {
@@ -388,6 +342,8 @@ const panelFor = (html: string, targetId: string) =>
 const pageOf = async (browser: Awaited<ReturnType<typeof loginAs>>, path: string) => decode(await (await browser.get(path)).text());
 
 describe('字段抽屉与自定义实体详情页里的业务知识面板', () => {
+  beforeEach(fresh);
+
   it('分析师在字段抽屉里编辑实体与普通字段的知识：实体面板列字段与关系，字段面板没有说明区、有类型、枚举与来源，敏感字段没有面板', async () => {
     const { acme } = await setup();
     const an = await loginAs(app, 'an@acme.com');
@@ -476,23 +432,6 @@ describe('字段抽屉与自定义实体详情页里的业务知识面板', () =
     expect(detailHtml).not.toContain('未保存');
   });
 
-  it('查看者在字段抽屉里看得到实体与字段面板，没有表单，字段面板没有来源，提交 403', async () => {
-    await setup();
-    const viewer = await loginAs(app, 'view@acme.com');
-    const html = await pageOf(viewer, '/lineage?node=customer&field=customer_id');
-    const entity = panelFor(html, 'entity:customer');
-    const field = panelFor(html, 'field:customer.customer_id');
-    expect(entity).toContain('系统事实');
-    expect(field).toContain('系统事实');
-    for (const panel of [entity, field]) {
-      expect(panel).not.toContain('value="alias.add"');
-      expect(panel).not.toContain('<form');
-    }
-    expect(field).not.toContain('data-field-lineage');
-    expect((await viewer.post('/lineage?node=customer', { intent: 'alias.add', targetId: 'entity:customer', alias: '会员' })).status).toBe(403);
-    expect((await viewer.post('/lineage?node=customer&field=customer_id', { intent: 'claim.save', targetId: 'field:customer.customer_id', type: 'unit', value: 'count' })).status).toBe(403);
-  });
-
   it('数据工程师在自定义实体详情页的面板里加别名，数据地图抽屉里的实体面板显示同一个别名；在版本页提交后回到版本页', async () => {
     const { acme, author, reviewer, sources } = await setup();
     const id = await createCustomEntity(author, {
@@ -517,5 +456,89 @@ describe('字段抽屉与自定义实体详情页里的业务知识面板', () =
     const again = await de.post(versions, { intent: 'alias.add', targetId: 'entity:custom_member_card', alias: '会员储值卡' });
     expect(again.status).toBe(302);
     expect(again.headers.get('location')).toBe(versions);
+  });
+});
+
+// 只读用例共用一次 setup()：这两组并列写在文件末尾、中间没有每用例清库的组。组里的用例只 GET 页面与提交被 403 拒绝的表单，不写库；
+// 别名、业务说明与两条提案在夹具里一次造好（提案不进知识区，也不给查看者处理入口，不影响这两个用例的断言）
+async function panelFixture() {
+  const s = await setup();
+  const aliasId = await addAlias(s.analyst, { targetId: TARGET, alias: '营收' });
+  await saveBusinessNote(s.analyst, { targetId: TARGET, note: '只算已支付' });
+  const gone = '00000000-0000-0000-0000-000000000000';
+  const linked = await propose(s.acme, {
+    kind: 'note', content: { note: '含退款' },
+    evidence: [{ ref: 'metric:paid_revenue', version: 1 }, { ref: `source_comment:${s.sources.crm}/public.x.y`, version: 2 }],
+  });
+  await propose(s.acme, { kind: 'alias', content: { alias: '流水' }, evidence: [{ ref: `source_comment:${gone}/public.z.w`, version: 1 }] });
+  return { acme: s.acme, sources: s.sources, aliasId, linkedId: linked.id };
+}
+
+let panelOnce: ReturnType<typeof panelFixture> | undefined;
+const sharedPanel = () => (panelOnce ??= fresh().then(panelFixture));
+
+describe('业务知识面板', () => {
+  let shared: Awaited<ReturnType<typeof sharedPanel>>;
+  beforeAll(async () => { shared = await sharedPanel(); }, 180_000); // 共用的夹具要跑一次 publishedIdentitySources，超过默认 hookTimeout
+
+  it('查看者看得到同样的知识，没有编辑入口，提交 403', async () => {
+    const { acme, aliasId } = shared;
+    const viewer = await loginAs(app, 'view@acme.com');
+
+    const panel = await panelOf(viewer, METRIC);
+    expect(panel).toContain('data-alias="营收"');
+    expect(panel).toContain('data-note="只算已支付"');
+    expect(panel).not.toContain('name="intent"');
+    expect(panel).not.toContain('<button');
+    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'alias.add', alias: '年营收' })).status).toBe(403);
+    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'note.save', note: '改掉' })).status).toBe(403);
+    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'claim.save', type: 'currency', value: 'CNY' })).status).toBe(403);
+    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'subject.create', name: '营收' })).status).toBe(403);
+    expect((await viewer.post(METRIC, { targetId: TARGET, intent: 'alias.confirm', aliasId })).status).toBe(403);
+    expect(await knowledgeOf(acme)).toEqual({ aliases: ['营收'], note: '只算已支付' });
+  });
+
+  it('source_comment 证据（#524）：有 sources:read 的成员看到链到数据源页锚点的链接与源名，不存在的源只有文字；查看者只看到「源端注释 vN」，HTML 里没有源、表与列名', async () => {
+    const { sources, linkedId } = shared;
+    const gone = '00000000-0000-0000-0000-000000000000';
+    const an = await loginAs(app, 'an@acme.com');
+    const panel = await panelOf(an, METRIC);
+    expect(panel).toContain('metric:paid_revenue v1');
+    expect(panel).toContain('源端注释 CRM public.x.y v2');
+    expect(panel).toContain(`href="/sources/${sources.crm}#comment-public.x.y"`);
+    // 不存在的源（或没有 sources:read 的成员）：只有文字，没有链接
+    expect(panel).toContain('源端注释 v1');
+    expect(panel).not.toContain(`href="/sources/${gone}`);
+
+    // 查看者：文字里不带源与表列名，链接与源 ID 都不在 HTML 里
+    const view = await loginAs(app, 'view@acme.com');
+    const viewerPanel = await panelOf(view, METRIC);
+    expect(viewerPanel).toContain(`data-proposal="${linkedId}"`);
+    expect(viewerPanel).toContain('源端注释 v2');
+    expect(viewerPanel).not.toContain('源端注释 CRM');
+    expect(viewerPanel).not.toContain('public.x');
+    expect(viewerPanel).not.toContain(sources.crm);
+    expect(viewerPanel).not.toContain('href="/sources/');
+  });
+});
+
+describe('字段抽屉与自定义实体详情页里的业务知识面板', () => {
+  let shared: Awaited<ReturnType<typeof sharedPanel>>;
+  beforeAll(async () => { shared = await sharedPanel(); }, 180_000); // 与上一组共用同一个 Promise，不重造
+
+  it('查看者在字段抽屉里看得到实体与字段面板，没有表单，字段面板没有来源，提交 403', async () => {
+    const viewer = await loginAs(app, 'view@acme.com');
+    const html = await pageOf(viewer, '/lineage?node=customer&field=customer_id');
+    const entity = panelFor(html, 'entity:customer');
+    const field = panelFor(html, 'field:customer.customer_id');
+    expect(entity).toContain('系统事实');
+    expect(field).toContain('系统事实');
+    for (const panel of [entity, field]) {
+      expect(panel).not.toContain('value="alias.add"');
+      expect(panel).not.toContain('<form');
+    }
+    expect(field).not.toContain('data-field-lineage');
+    expect((await viewer.post('/lineage?node=customer', { intent: 'alias.add', targetId: 'entity:customer', alias: '会员' })).status).toBe(403);
+    expect((await viewer.post('/lineage?node=customer&field=customer_id', { intent: 'claim.save', targetId: 'field:customer.customer_id', type: 'unit', value: 'count' })).status).toBe(403);
   });
 });
