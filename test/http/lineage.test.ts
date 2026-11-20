@@ -8,7 +8,7 @@
 // 最近一次成功检查里有差异的表在两张图的列表行上带漂移标记，孤表在区块里单独列出；缺列的表旁边有「重建合并」按钮（查看者没有、提交被拒），
 // 类型不一致、多列与孤表只给提示
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, inArray, notInArray } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { mappings, tasks } from '../../app/.server/db/schema';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
@@ -69,101 +69,6 @@ const decode = (html: string) => html.replaceAll('&quot;', '"').replaceAll('&#x2
 
 describe('数据地图', () => {
   beforeEach(fresh);
-
-  it('_identities 显示匹配规则与最近一次打通的摘要（跳过打通的合并不算）；打开「显示未接入的标准实体」后灰显它们；没有合并任务时显示尚未合并', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const viewer = await loginAs(app, 'viewer@acme.com');
-
-    // 最后一次合并只带订单映射、跳过了打通：摘要取的是之前真正打通的那次
-    const { groups, records } = (await latestIdentitySummary(acme))!;
-    expect(groups).toBeGreaterThan(0);
-
-    const html = decode(await (await viewer.get('/lineage')).text());
-    // 这些映射都没配 identity.match，用默认规则
-    expect(html).toContain('手机号 > 邮箱 > 外部 ID');
-    expect(html).toContain(`data-groups="${groups}"`);
-    expect(html).toContain(`data-records="${records}"`);
-    expect(html).not.toContain('尚未合并');
-    expect(html).toMatch(/data-show-all[^>]*aria-checked="false"|aria-checked="false"[^>]*data-show-all/);
-    expect(html).not.toContain('data-node="product"');
-    expect(html).not.toContain('data-connected="false"');
-
-    const all = decode(await (await viewer.get('/lineage?all=1&node=order')).text());
-    expect(all).toContain('data-node="product"');
-    expect(all).toContain('data-connected="false"');
-    // 开关保留 node，指向关掉 all 的 URL
-    expect(all).toMatch(/href="\/lineage\?node=order"[^>]*data-show-all|data-show-all[^>]*href="\/lineage\?node=order"/);
-
-    // 新打通结果里合并、拆开都为 0 时不显示这一行
-    expect(html).not.toContain('data-merged');
-    // 最近一次打通有合并或拆开时显示组数
-    const { taskId } = (await latestIdentitySummary(acme))!;
-    const [task] = await getDb().select({ result: tasks.result }).from(tasks).where(eq(tasks.id, taskId));
-    const result = task.result as { identities: { merged?: number; split?: number } };
-    const withIdentities = (identities: object) =>
-      getDb().update(tasks).set({ result: { ...result, identities } }).where(eq(tasks.id, taskId));
-    await withIdentities({ ...result.identities, merged: 2, split: 1 });
-    const changed = decode(await (await viewer.get('/lineage')).text());
-    expect(changed).toContain('data-merged="2"');
-    expect(changed).toContain('data-split="1"');
-    expect(changed).toContain('合并 2 组、拆开 1 组');
-    expect(await latestIdentitySummary(acme)).toMatchObject({ merged: 2, split: 1 });
-    // 上一版的打通结果没有这两个字段：为 null，不显示
-    const { merged: _merged, split: _split, ...old } = result.identities;
-    await withIdentities(old);
-    expect(await latestIdentitySummary(acme)).toMatchObject({ merged: null, split: null });
-    expect(await (await viewer.get('/lineage')).text()).not.toContain('data-merged');
-
-    await getDb().delete(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')));
-    const none = await (await viewer.get('/lineage')).text();
-    expect(none).toContain('尚未合并');
-    expect(none).not.toContain('data-groups');
-  });
-
-  it('表与关系列表上已接入的内置关系显示最近一次合并后的孤儿比例与样例键（只给数据工程师）；统计失败标红，没有合并任务时显示尚未合并', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    await memberOf(acme, 'eng@acme.com', 'data_engineer');
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const eng = await loginAs(app, 'eng@acme.com');
-    const viewer = await loginAs(app, 'viewer@acme.com');
-    const ORDER = 'identity:order.customer_id->customer';
-    const EVENT = 'identity:event.customer_id->customer';
-    const edgeRow = (html: string, id: string) => html.match(new RegExp(`<tr[^>]*data-edge-id="${id}"[\\s\\S]*?</tr>`))![0];
-
-    const html = decode(await (await eng.get('/lineage')).text());
-    expect(edgeRow(html, ORDER)).toContain('data-edge-orphans="1"');
-    expect(edgeRow(html, ORDER)).toContain('1 / 11 行');
-    expect(edgeRow(html, ORDER)).toMatch(/data-samples[\s\S]*99/);
-    expect(edgeRow(html, EVENT)).toContain('data-edge-orphans="0"');
-    // 指向 _identities、_device_owner 的边不统计
-    expect(edgeRow(html, 'identity:customer.customer_id->_identities')).not.toMatch(/data-edge-(orphans|stat)/);
-    expect(html).not.toContain('尚未合并');
-
-    const forViewer = decode(await (await viewer.get('/lineage')).text());
-    expect(edgeRow(forViewer, ORDER)).toContain('data-edge-orphans="1"');
-    expect(forViewer).not.toContain('data-samples');
-
-    // 未接入的边（?all=1 才出现）不统计，也不写尚未合并
-    const all = decode(await (await eng.get('/lineage?all=1')).text());
-    expect(edgeRow(all, 'ref:order_item.order_id->order')).not.toMatch(/data-edge-(orphans|stat)/);
-    expect(all).not.toContain('尚未合并');
-
-    const [merge] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')))
-      .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
-    const result = merge.result as { relations: RelationStat[] };
-    await getDb().update(tasks).set({
-      result: { ...result, relations: result.relations.map(r => (r.from.entity === 'order' && r.from.field === 'customer_id' ? { from: r.from, ref: r.ref, error: 'boom' } : r)) },
-    }).where(eq(tasks.id, merge.id));
-    const failed = decode(await (await eng.get('/lineage')).text());
-    expect(edgeRow(failed, ORDER)).toContain('data-edge-stat="error"');
-    expect(edgeRow(failed, ORDER)).toContain('统计失败：boom');
-
-    await getDb().delete(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')));
-    const none = decode(await (await eng.get('/lineage')).text());
-    expect(edgeRow(none, ORDER)).toContain('data-edge-stat="unmerged"');
-    expect(edgeRow(none, EVENT)).toContain('data-edge-stat="unmerged"');
-  });
 
   it('映射里声明了跨源引用时，表与关系列表上那条指向 customer 的边带 data-cross-source 与「跨源 · <数据源名>」；查看者只看到「跨源」', async () => {
     const { acme, author, reviewer, sources } = await publishedIdentitySources({ orders: true });
@@ -279,39 +184,6 @@ dedupe: { key: [station_id] }
     expect(edgeRow(none, REGION)).toContain('data-edge-stat="unmerged"');
   });
 
-  it('数据工程师打开流向图，看到各映射的源表、版本、最近一次合并与标准层表行数；合并失败的映射标红并链到合并记录', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    await memberOf(acme, 'eng@acme.com', 'data_engineer');
-    const eng = await loginAs(app, 'eng@acme.com');
-
-    expect(await (await eng.get('/lineage')).text()).toContain('href="/lineage?tab=flow"');
-    const res = await eng.get('/lineage?tab=flow');
-    expect(res.status).toBe(200);
-    const html = decode(await res.text());
-    expect(html).toContain('data-tab="flow"');
-    expect(html).toContain('data-flow-mapping');
-    for (const table of ['customers', 'members', 'users', 'events', 'orders']) expect(html).toContain(table);
-    expect(html).toMatch(/data-version="1"/);
-    expect(html).toMatch(/data-rows="[1-9]\d*"/);
-    expect(html).toContain('data-merge-status="ok"');
-    expect(html).not.toContain('data-merge-status="failed"');
-    // 流向图不带关系图的表与关系列表
-    expect(html).not.toContain('data-edge=');
-
-    const [merge] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')))
-      .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
-    const result = merge.result as { mappings: { mapping: string; entity: string; table: string; version: number; startedAt: string; durationMs: number }[] };
-    const [first, ...rest] = result.mappings;
-    const { mapping, entity, table, version, startedAt, durationMs } = first;
-    await getDb().update(tasks).set({ result: { ...result, mappings: [{ mapping, entity, table, version, startedAt, durationMs, error: '源表读取失败' }, ...rest] } })
-      .where(eq(tasks.id, merge.id));
-
-    const failed = decode(await (await eng.get('/lineage?tab=flow')).text());
-    const row = failed.match(new RegExp(`<tr[^>]*data-flow-mapping="${mapping}"[\\s\\S]*?</tr>`))![0];
-    expect(row).toContain('data-merge-status="failed"');
-    expect(row).toContain(`href="/mappings/${mapping}?tab=merges"`);
-  });
-
   it('自定义实体的表节点也能打开字段抽屉，字段说明取自实体登记', async () => {
     const { acme, author, reviewer, sources } = await publishedIdentitySources();
     const entity = await createCustomEntity(author, {
@@ -342,12 +214,158 @@ dedupe: { key: [card_id] }
     expect(fieldRow(full, 'holder')).not.toContain('扩展字段');
   });
 
-  it('数据工程师点「漂移检查」入队，重复点提示已在排队；查看者看不到按钮、提交被拒，但看得到最近一次结果的每条差异', async () => {
-    const { acme } = await publishedIdentitySources();
-    await memberOf(acme, 'eng@acme.com', 'data_engineer');
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const eng = await loginAs(app, 'eng@acme.com');
+  it('没有已发布映射时显示空状态', async () => {
+    const tenantId = await newTenant('acme');
+    await memberOf(tenantId, 'viewer@acme.com', 'viewer');
     const viewer = await loginAs(app, 'viewer@acme.com');
+    const html = await (await viewer.get('/lineage')).text();
+    expect(html).toContain('还没有已发布的映射');
+    expect(html).not.toContain('data-node=');
+  });
+});
+
+describe('数据地图', () => {
+  // 共用一次 { orders: true } 的夹具；这组会改本租户的 silver.merge / lake.inspect 任务行，组内 beforeEach 还原（插回删掉的、改回改过的、删掉用例里新增的）；不发布、不改湖与源库
+  let shared: Shared;
+  let saved: (typeof tasks.$inferSelect)[];
+  beforeAll(async () => {
+    shared = await sharedFixture();
+    saved = await getDb().select().from(tasks)
+      .where(and(eq(tasks.tenantId, shared.acme), inArray(tasks.kind, ['silver.merge', 'lake.inspect'])));
+  });
+  beforeEach(async () => {
+    app.outbox.length = 0;
+    await getDb().delete(tasks).where(and(
+      eq(tasks.tenantId, shared.acme),
+      inArray(tasks.kind, ['silver.merge', 'lake.inspect']),
+      saved.length ? notInArray(tasks.id, saved.map(t => t.id)) : undefined,
+    ));
+    // 用例会删光 silver.merge 再看「尚未合并」：整行插回；被 update 改过的行也整行改回
+    for (const row of saved) await getDb().insert(tasks).values(row).onConflictDoUpdate({ target: tasks.id, set: row });
+  });
+
+  it('_identities 显示匹配规则与最近一次打通的摘要（跳过打通的合并不算）；打开「显示未接入的标准实体」后灰显它们；没有合并任务时显示尚未合并', async () => {
+    const { acme, viewer } = shared;
+
+    // 最后一次合并只带订单映射、跳过了打通：摘要取的是之前真正打通的那次
+    const { groups, records } = (await latestIdentitySummary(acme))!;
+    expect(groups).toBeGreaterThan(0);
+
+    const html = decode(await (await viewer.get('/lineage')).text());
+    // 这些映射都没配 identity.match，用默认规则
+    expect(html).toContain('手机号 > 邮箱 > 外部 ID');
+    expect(html).toContain(`data-groups="${groups}"`);
+    expect(html).toContain(`data-records="${records}"`);
+    expect(html).not.toContain('尚未合并');
+    expect(html).toMatch(/data-show-all[^>]*aria-checked="false"|aria-checked="false"[^>]*data-show-all/);
+    expect(html).not.toContain('data-node="product"');
+    expect(html).not.toContain('data-connected="false"');
+
+    const all = decode(await (await viewer.get('/lineage?all=1&node=order')).text());
+    expect(all).toContain('data-node="product"');
+    expect(all).toContain('data-connected="false"');
+    // 开关保留 node，指向关掉 all 的 URL
+    expect(all).toMatch(/href="\/lineage\?node=order"[^>]*data-show-all|data-show-all[^>]*href="\/lineage\?node=order"/);
+
+    // 新打通结果里合并、拆开都为 0 时不显示这一行
+    expect(html).not.toContain('data-merged');
+    // 最近一次打通有合并或拆开时显示组数
+    const { taskId } = (await latestIdentitySummary(acme))!;
+    const [task] = await getDb().select({ result: tasks.result }).from(tasks).where(eq(tasks.id, taskId));
+    const result = task.result as { identities: { merged?: number; split?: number } };
+    const withIdentities = (identities: object) =>
+      getDb().update(tasks).set({ result: { ...result, identities } }).where(eq(tasks.id, taskId));
+    await withIdentities({ ...result.identities, merged: 2, split: 1 });
+    const changed = decode(await (await viewer.get('/lineage')).text());
+    expect(changed).toContain('data-merged="2"');
+    expect(changed).toContain('data-split="1"');
+    expect(changed).toContain('合并 2 组、拆开 1 组');
+    expect(await latestIdentitySummary(acme)).toMatchObject({ merged: 2, split: 1 });
+    // 上一版的打通结果没有这两个字段：为 null，不显示
+    const { merged: _merged, split: _split, ...old } = result.identities;
+    await withIdentities(old);
+    expect(await latestIdentitySummary(acme)).toMatchObject({ merged: null, split: null });
+    expect(await (await viewer.get('/lineage')).text()).not.toContain('data-merged');
+
+    await getDb().delete(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')));
+    const none = await (await viewer.get('/lineage')).text();
+    expect(none).toContain('尚未合并');
+    expect(none).not.toContain('data-groups');
+  });
+
+  it('表与关系列表上已接入的内置关系显示最近一次合并后的孤儿比例与样例键（只给数据工程师）；统计失败标红，没有合并任务时显示尚未合并', async () => {
+    const { acme, eng, viewer } = shared;
+    const ORDER = 'identity:order.customer_id->customer';
+    const EVENT = 'identity:event.customer_id->customer';
+    const edgeRow = (html: string, id: string) => html.match(new RegExp(`<tr[^>]*data-edge-id="${id}"[\\s\\S]*?</tr>`))![0];
+
+    const html = decode(await (await eng.get('/lineage')).text());
+    expect(edgeRow(html, ORDER)).toContain('data-edge-orphans="1"');
+    expect(edgeRow(html, ORDER)).toContain('1 / 11 行');
+    expect(edgeRow(html, ORDER)).toMatch(/data-samples[\s\S]*99/);
+    expect(edgeRow(html, EVENT)).toContain('data-edge-orphans="0"');
+    // 指向 _identities、_device_owner 的边不统计
+    expect(edgeRow(html, 'identity:customer.customer_id->_identities')).not.toMatch(/data-edge-(orphans|stat)/);
+    expect(html).not.toContain('尚未合并');
+
+    const forViewer = decode(await (await viewer.get('/lineage')).text());
+    expect(edgeRow(forViewer, ORDER)).toContain('data-edge-orphans="1"');
+    expect(forViewer).not.toContain('data-samples');
+
+    // 未接入的边（?all=1 才出现）不统计，也不写尚未合并
+    const all = decode(await (await eng.get('/lineage?all=1')).text());
+    expect(edgeRow(all, 'ref:order_item.order_id->order')).not.toMatch(/data-edge-(orphans|stat)/);
+    expect(all).not.toContain('尚未合并');
+
+    const [merge] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')))
+      .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
+    const result = merge.result as { relations: RelationStat[] };
+    await getDb().update(tasks).set({
+      result: { ...result, relations: result.relations.map(r => (r.from.entity === 'order' && r.from.field === 'customer_id' ? { from: r.from, ref: r.ref, error: 'boom' } : r)) },
+    }).where(eq(tasks.id, merge.id));
+    const failed = decode(await (await eng.get('/lineage')).text());
+    expect(edgeRow(failed, ORDER)).toContain('data-edge-stat="error"');
+    expect(edgeRow(failed, ORDER)).toContain('统计失败：boom');
+
+    await getDb().delete(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')));
+    const none = decode(await (await eng.get('/lineage')).text());
+    expect(edgeRow(none, ORDER)).toContain('data-edge-stat="unmerged"');
+    expect(edgeRow(none, EVENT)).toContain('data-edge-stat="unmerged"');
+  });
+
+  it('数据工程师打开流向图，看到各映射的源表、版本、最近一次合并与标准层表行数；合并失败的映射标红并链到合并记录', async () => {
+    const { acme, eng } = shared;
+
+    expect(await (await eng.get('/lineage')).text()).toContain('href="/lineage?tab=flow"');
+    const res = await eng.get('/lineage?tab=flow');
+    expect(res.status).toBe(200);
+    const html = decode(await res.text());
+    expect(html).toContain('data-tab="flow"');
+    expect(html).toContain('data-flow-mapping');
+    for (const table of ['customers', 'members', 'users', 'events', 'orders']) expect(html).toContain(table);
+    expect(html).toMatch(/data-version="1"/);
+    expect(html).toMatch(/data-rows="[1-9]\d*"/);
+    expect(html).toContain('data-merge-status="ok"');
+    expect(html).not.toContain('data-merge-status="failed"');
+    // 流向图不带关系图的表与关系列表
+    expect(html).not.toContain('data-edge=');
+
+    const [merge] = await getDb().select().from(tasks).where(and(eq(tasks.tenantId, acme), eq(tasks.kind, 'silver.merge')))
+      .orderBy(desc(tasks.createdAt), desc(tasks.id)).limit(1);
+    const result = merge.result as { mappings: { mapping: string; entity: string; table: string; version: number; startedAt: string; durationMs: number }[] };
+    const [first, ...rest] = result.mappings;
+    const { mapping, entity, table, version, startedAt, durationMs } = first;
+    await getDb().update(tasks).set({ result: { ...result, mappings: [{ mapping, entity, table, version, startedAt, durationMs, error: '源表读取失败' }, ...rest] } })
+      .where(eq(tasks.id, merge.id));
+
+    const failed = decode(await (await eng.get('/lineage?tab=flow')).text());
+    const row = failed.match(new RegExp(`<tr[^>]*data-flow-mapping="${mapping}"[\\s\\S]*?</tr>`))![0];
+    expect(row).toContain('data-merge-status="failed"');
+    expect(row).toContain(`href="/mappings/${mapping}?tab=merges"`);
+  });
+
+  it('数据工程师点「漂移检查」入队，重复点提示已在排队；查看者看不到按钮、提交被拒，但看得到最近一次结果的每条差异', async () => {
+    const { acme, eng, viewer } = shared;
 
     const before = await (await eng.get('/lineage')).text();
     expect(before).toContain('data-inspect-status="never"');
@@ -393,11 +411,7 @@ dedupe: { key: [card_id] }
   });
 
   it('最近一次成功的漂移检查有差异的标准层表，在关系图与流向图上标出差异种类与数量；孤表在漂移检查区块单独列出', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    await memberOf(acme, 'eng@acme.com', 'data_engineer');
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const eng = await loginAs(app, 'eng@acme.com');
-    const viewer = await loginAs(app, 'viewer@acme.com');
+    const { acme, eng, viewer } = shared;
 
     // 从没检查过：没有标记
     expect(await (await viewer.get('/lineage')).text()).not.toContain('data-node-drift');
@@ -432,11 +446,7 @@ dedupe: { key: [card_id] }
   });
 
   it('缺列的表旁边有「重建合并」按钮，提交后入队一次带强制重建标记的合并；类型不一致、多列、孤表只给提示；查看者看不到按钮、提交被拒', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    await memberOf(acme, 'eng@acme.com', 'data_engineer');
-    await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const eng = await loginAs(app, 'eng@acme.com');
-    const viewer = await loginAs(app, 'viewer@acme.com');
+    const { acme, eng, viewer } = shared;
     await getDb().insert(tasks).values({
       tenantId: acme, kind: 'lake.inspect', status: 'succeeded', finishedAt: new Date(),
       result: { drifts: [
@@ -486,15 +496,6 @@ dedupe: { key: [card_id] }
     expect(html).toContain('没有开始重建');
     expect(html).toContain('已有一次合并在排队或运行中');
     expect((await eng.post('/lineage', { intent: 'rebuild', entity: 'stray' })).status).toBe(400);
-  });
-
-  it('没有已发布映射时显示空状态', async () => {
-    const tenantId = await newTenant('acme');
-    await memberOf(tenantId, 'viewer@acme.com', 'viewer');
-    const viewer = await loginAs(app, 'viewer@acme.com');
-    const html = await (await viewer.get('/lineage')).text();
-    expect(html).toContain('还没有已发布的映射');
-    expect(html).not.toContain('data-node=');
   });
 });
 
