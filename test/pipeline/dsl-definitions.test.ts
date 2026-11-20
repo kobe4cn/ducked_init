@@ -204,7 +204,6 @@ describe('样本预览', () => {
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
     await expect(previewDefinition(viewer, 'metric', 'revenue')).rejects.toThrow(/标准层还没有/);
   });
-
 });
 
 // 不限时间窗口：覆盖夹具里 2024 年的订单
