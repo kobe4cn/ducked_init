@@ -10,16 +10,16 @@ import {
 } from 'react-router';
 
 import type { Route } from './+types/root';
-import { getLocale } from '~/.server/locale';
+import { getLocale, localeSwitchEnabled } from '~/.server/locale';
 import { I18nProvider, makeT } from '~/lib/i18n';
 import enClient from './i18n/en.client.json';
 import './app.css';
 
 // 界面语言与前端词典都由这里下发（ADR-0060）：中文界面不下发词典，英文界面下发 en.client.json，
-// SSR 与 hydration 用同一份数据，英文界面不会先闪一下中文
+// SSR 与 hydration 用同一份数据，英文界面不会先闪一下中文；localeSwitch 控制 /locale 切换入口是否渲染
 export async function loader({ request }: Route.LoaderArgs) {
   const locale = await getLocale(request);
-  return { locale, messages: locale === 'en' ? enClient : null };
+  return { locale, messages: locale === 'en' ? enClient : null, localeSwitch: localeSwitchEnabled() };
 }
 
 // 词典只在语言变化时才变（语言来源是账号与 cookie，切换走 /locale 的整页加载，导航之间不会变），导航不必重新下发

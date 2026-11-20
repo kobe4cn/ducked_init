@@ -4,9 +4,10 @@ import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { members } from '../../app/.server/db/schema';
-import { Client, createTenant, extractLink, resetDb, startApp, type Mail, type TestApp } from './harness';
+import { Client, createOperator, createTenant, extractLink, loginAs, loginAsOperator, resetDb, startApp, type Mail, type TestApp } from './harness';
 
 let app: TestApp;
+const OPS_EMAIL = 'ops@platform.com';
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
@@ -34,6 +35,15 @@ async function memberLocales(email: string) {
   const rows = await getDb().select({ locale: members.locale }).from(members).where(eq(members.email, email));
   return rows.map(r => r.locale);
 }
+
+/** 页面 HTML 里提交语言切换的那个表单（不含其他 action="/locale" 的表单干扰时唯一对应一个选项） */
+const localeForm = (html: string, locale: string) => {
+  const form = [...html.matchAll(/<form[^>]*action="\/locale"[\s\S]*?<\/form>/g)]
+    .map(m => m[0])
+    .find(f => f.includes(`name="locale" value="${locale}"`));
+  expect(form, `切换到 ${locale} 的表单`).toBeDefined();
+  return form!;
+};
 
 describe('界面语言：开关关闭时整站中文', () => {
   it('无论 cookie、Accept-Language 还是账号语言如何，页面都是中文，POST /locale 返回 404', async () => {
@@ -107,6 +117,58 @@ describe('界面语言：POST /locale 切换', () => {
     expect(backslash.headers.get('Location')).toBe('/');
     const bad = await browser.post('/locale', { locale: 'fr', redirectTo: '/' });
     expect(bad.status).toBe(400);
+  });
+});
+
+describe('界面语言：切换入口（顶栏与登录页，#946）', () => {
+  it('开关关闭时，登录后的首页和登录页都没有切换入口', async () => {
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const browser = await loginAs(app, 'admin@acme.com');
+    expect(await (await browser.get('/')).text()).not.toContain('action="/locale"');
+    expect(await (await app.client().get('/login')).text()).not.toContain('action="/locale"');
+  });
+
+  it('开关打开时，登录页右上角与顶栏（头像旁）都有入口，redirectTo 带查询参数、当前语言有标记；/ops 不显示', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    // 未登录：登录页右上角，中文为当前语言
+    const loginHtml = await (await app.client().get('/login')).text();
+    expect(loginHtml).toContain('action="/locale"');
+    expect(localeForm(loginHtml, 'zh-CN')).toContain('aria-current="true"');
+    expect(localeForm(loginHtml, 'zh-CN')).toContain('name="redirectTo" value="/login"');
+    expect(localeForm(loginHtml, 'en')).not.toContain('aria-current="true"');
+
+    // 登录后的顶栏：停留页带查询参数时 redirectTo 原样带上
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const browser = await loginAs(app, 'admin@acme.com');
+    const tasksHtml = await (await browser.get('/tasks?x=1&y=2')).text();
+    expect(tasksHtml).toContain('action="/locale"');
+    expect(localeForm(tasksHtml, 'zh-CN')).toContain('aria-current="true"');
+    // HTML 里 & 转义成 &amp;
+    expect(localeForm(tasksHtml, 'zh-CN')).toContain('name="redirectTo" value="/tasks?x=1&amp;y=2"');
+
+    // 运营后台的外壳不显示切换入口
+    await createOperator(OPS_EMAIL);
+    const ops = await loginAsOperator(app, OPS_EMAIL);
+    expect(await (await ops.browser.get('/ops')).text()).not.toContain('action="/locale"');
+  });
+
+  it('从入口提交后 302 跳回停留页（含查询参数），整页换成所选语言', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const browser = await loginAs(app, 'admin@acme.com');
+    const html = await (await browser.get('/tasks?x=1&y=2')).text();
+    // 用表单里实际渲染的字段提交，而不是手写一份
+    const redirectTo = localeForm(html, 'en').match(/name="redirectTo" value="([^"]*)"/)![1].replace('&amp;', '&');
+    expect(redirectTo).toBe('/tasks?x=1&y=2');
+
+    const res = await browser.post('/locale', { locale: 'en', redirectTo });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe('/tasks?x=1&y=2');
+
+    const after = await (await browser.get('/tasks?x=1&y=2')).text();
+    expect(after).toContain('lang="en"');
+    expect(localeForm(after, 'en')).toContain('aria-current="true"');
+    expect(localeForm(after, 'zh-CN')).not.toContain('aria-current="true"');
   });
 });
 
