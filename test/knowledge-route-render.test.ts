@@ -19,6 +19,8 @@ vi.mock('react-router', async importOriginal => {
     useNavigation: () => router.navigation,
     useLocation: () => ({ pathname: '/knowledge', search: '', hash: '', state: null, key: 'render' }),
     useFetcher: () => ({ state: 'idle', data: undefined, load: () => {}, submit: () => {} }),
+    // 顶栏的界面语言入口（#946）读 root loader 数据；这里没有 root，返回 undefined 即不渲染入口
+    useRouteLoaderData: () => undefined,
     Form: (props: { children?: ReactNode }) => createElement('form', { method: 'post' }, props.children),
     Link: (props: { to: string; children?: ReactNode }) => createElement('a', { href: props.to }, props.children),
   };
