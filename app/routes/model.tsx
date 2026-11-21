@@ -85,7 +85,7 @@ export default function Model({ loaderData }: Route.ComponentProps) {
             {functions.map(f => (
               <TableRow key={f.name} data-function={f.name}>
                 <TableCell className="font-mono text-xs">{f.signature}</TableCell>
-                <TableCell className="whitespace-normal text-slate-500">{builtinName(t, f.label, CANONICAL_NAMES)}</TableCell>
+                <TableCell className="whitespace-normal text-slate-500">{f.label}</TableCell>
               </TableRow>
             ))}
           </TableBody>
