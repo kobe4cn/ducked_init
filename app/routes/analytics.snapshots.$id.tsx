@@ -17,8 +17,8 @@ import { data, Form, Link } from 'react-router';
 import type { Route } from './+types/analytics.snapshots.$id';
 import { requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
-import { DSL_KINDS } from '~/.server/pipeline/dsl';
 import { TEMPLATES } from '~/.server/pipeline/templates';
+import { RFM_DEFAULTS } from '~/.server/pipeline/templates/rfm';
 import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readChurnSnapshot, readClvSnapshot, readCohortSnapshot, readRepurchaseSnapshot, readRfmSnapshot, readTemplateSnapshot, readUser360Snapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
@@ -27,12 +27,23 @@ import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
 import { StatTile } from '~/components/stat-tile';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { builtinName } from '~/lib/builtin-names';
+import { makeT, useT, type T } from '~/lib/i18n';
 
-export function meta({ loaderData }: Route.MetaArgs) {
+/** DSL 类型名（指标 / 标签）按界面语言翻译：写成字面量 t('…') 的对照表（照 api-keys 的 scopeLabel）才能与词典对账 */
+const dslKindLabel = (t: T, kind: 'metric' | 'tag') => ({ metric: t('指标'), tag: t('标签') })[kind];
+
+export function meta({ loaderData, matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
   const s = loaderData?.snapshot;
-  if (!s) return [{ title: '分析 · CRM 数据分析平台' }];
-  const name = 'definition' in s ? `${s.definition.kindLabel} ${s.definition.key}` : s.templateLabel;
-  return [{ title: `${name} · ${s.asOf} · CRM 数据分析平台` }];
+  if (!s) return [{ title: `分析 · ${t('CRM 数据分析平台')}` }];
+  // 模板名与类型名是平台内置名称，按界面语言翻译；定义键不翻
+  const name = 'definition' in s
+    ? `${dslKindLabel(t, s.definition.kind)} ${s.definition.key}`
+    : builtinName(t, s.templateLabel);
+  return [{ title: `${name} · ${s.asOf} · ${t('CRM 数据分析平台')}` }];
 }
 
 export async function loader({ request, params }: Route.LoaderArgs) {
@@ -48,7 +59,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   };
   try {
     const lookbackDays = snapshot.params.lookbackDays;
-    // 页头：DSL（指标 / 标签）快照写定义（类型与键）、版本与来源；模板快照写注册表里的名字
+    // 页头：DSL（指标 / 标签）快照写定义（类型与键）、版本与来源；模板快照写注册表里的名字。
+    // 名称是原名（中文），渲染处按界面语言翻译（ADR-0060）
     const dsl = dslKindOf(snapshot.template);
     const head = {
       email: member.email,
@@ -58,7 +70,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         id: snapshot.id,
         ...(dsl
           ? {
-            definition: { kind: dsl, kindLabel: DSL_KINDS[dsl].label, key: snapshot.template.slice(dsl.length + 1) },
+            definition: { kind: dsl, key: snapshot.template.slice(dsl.length + 1) },
             definitionVersion: snapshot.definitionVersion,
             trigger: triggerLabel(snapshot.trigger),
           }
@@ -77,7 +89,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         const tab = tabOf(['segments', 'consumers'] as const, 'segments');
         const pages = Math.max(1, Math.ceil(snapshot.rowCount / CONSUMER_PAGE_SIZE));
         const page = Math.min(pages, requestedPage);
-        return { ...head, tab, page, pages, kind: 'rfm' as const, ...(await readRfmSnapshot(snapshot, { page })) };
+        // RFM 默认人群名：展示时判断「是不是默认名」的名单（默认名翻译、租户改名原样），值本身不进这里
+        return { ...head, tab, page, pages, kind: 'rfm' as const, defaultSegmentNames: RFM_DEFAULTS.segments.map(s => s.name), ...(await readRfmSnapshot(snapshot, { page })) };
       }
       case 'churn': {
         // 分页总数按筛选后的行数算，页码由 readChurnSnapshot 夹（它开了湖才知道行数，避免开两次）
@@ -186,15 +199,16 @@ function DetailTable({ columns, rows, page, pages, pageSize, unit, snapshot, hre
 
 export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
   const { email, nav, snapshot } = loaderData;
+  const t = useT();
   const lookback = snapshot.lookbackDays === null ? '' : `回看 ${snapshot.lookbackDays} 天，`;
-  // DSL（指标 / 标签）快照：页头改写定义（类型与键）与版本、统计日、来源
+  // DSL（指标 / 标签）快照：页头改写定义（类型与键）与版本、统计日、来源；类型名与模板名按界面语言翻译，定义键不翻
   const header = 'definition' in snapshot
     ? {
-      title: `${snapshot.definition.kindLabel} · ${snapshot.definition.key}`,
+      title: `${dslKindLabel(t, snapshot.definition.kind)} · ${snapshot.definition.key}`,
       note: `　${snapshot.definitionVersion ? `第 ${snapshot.definitionVersion} 版` : '—'}，统计日 ${snapshot.asOf}，来源 ${snapshot.trigger}，创建于 ${date(snapshot.createdAt)}，${date(snapshot.expiresAt)} 过期`,
     }
     : {
-      title: `${snapshot.templateLabel} · ${snapshot.asOf}`,
+      title: `${builtinName(t, snapshot.templateLabel)} · ${snapshot.asOf}`,
       note: `　${lookback}创建于 ${date(snapshot.createdAt)}，${date(snapshot.expiresAt)} 过期`,
     };
   return (
@@ -533,7 +547,11 @@ function User360Result({ tab, page, pages, pageSize, snapshot, total, withOrders
   );
 }
 
-function RfmResult({ tab, page, pages, pageSize, snapshot, segments, consumers }: Extract<Route.ComponentProps['loaderData'], { kind: 'rfm' }>) {
+function RfmResult({ tab, page, pages, pageSize, snapshot, segments, consumers, defaultSegmentNames }: Extract<Route.ComponentProps['loaderData'], { kind: 'rfm' }>) {
+  const t = useT();
+  /** 默认人群名按界面语言翻译，租户改过的人群名原样；行键、data-segment 与写回的值仍是存储的原值 */
+  const defaults = new Set(defaultSegmentNames);
+  const segmentName = (name: string) => builtinName(t, name, defaults);
   const base = `/analytics/snapshots/${snapshot.id}`;
   const total = segments.reduce((sum, s) => sum + Number(s.monetary), 0);
   const pageHref = (p: number) => `${base}?tab=consumers&page=${p}`;
@@ -568,7 +586,7 @@ function RfmResult({ tab, page, pages, pageSize, snapshot, segments, consumers }
             <TableBody>
               {segments.map(s => (
                 <TableRow key={s.name} data-segment={s.name} className={s.consumers ? undefined : 'text-slate-400'}>
-                  <TableCell className="font-medium">{s.name}</TableCell>
+                  <TableCell className="font-medium">{segmentName(s.name)}</TableCell>
                   <TableCell data-segment-consumers>{s.consumers.toLocaleString('zh-CN')}</TableCell>
                   <TableCell>{snapshot.rowCount ? `${((s.consumers / snapshot.rowCount) * 100).toFixed(1)}%` : '—'}</TableCell>
                   <TableCell data-segment-monetary>{money(s.monetary)}</TableCell>
@@ -596,7 +614,7 @@ function RfmResult({ tab, page, pages, pageSize, snapshot, segments, consumers }
               {consumers.map(c => (
                 <TableRow key={c.consumer_id} data-consumer={c.consumer_id}>
                   <TableCell className="font-mono text-xs">{c.consumer_id}</TableCell>
-                  <TableCell>{c.segment}</TableCell>
+                  <TableCell>{segmentName(c.segment)}</TableCell>
                   <TableCell>{c.r}</TableCell>
                   <TableCell>{c.f}</TableCell>
                   <TableCell>{c.m}</TableCell>
