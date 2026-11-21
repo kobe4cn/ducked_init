@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { and, eq, sql } from 'drizzle-orm';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { scopeOfPath } from '../../app/.server/api-auth';
 import { sha256 } from '../../app/.server/auth';
 import { saveBusinessNote } from '../../app/.server/business-notes';
@@ -148,6 +148,39 @@ describe('API Key 页', () => {
       { name: '乱序', prefix: messy.slice(0, 8), scopes: ['consumers', 'exports'], dataScope: { all: true } },
       { name: '只点查', prefix: onlyKey.slice(0, 8), scopes: ['consumers'], dataScope: { all: true } },
     ]);
+  });
+
+  it('英文界面下创建报错是英文（一类都不勾、名称超长、吊销不存在的 Key）；同一操作中文界面仍是原中文', async () => {
+    await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    // crm_locale 写进 cookie jar：显式传 Cookie 头时 Client 不带 jar，会丢登录会话
+    admin.store('crm_locale=en; Path=/');
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+
+    // 一类都不勾：400，报错是英文且不含汉字
+    const none = await admin.post('/api-keys', { intent: 'create', name: 'no scopes' });
+    expect(none.status).toBe(400);
+    const enNone = await none.text();
+    expect(enNone).toContain('Select at least one API type');
+
+    // 名称超过 100 字：参数代入英文句式
+    const tooLong = await admin.post('/api-keys', { intent: 'create', name: 'x'.repeat(101), scope: ['catalog'] });
+    expect(tooLong.status).toBe(400);
+    expect(await tooLong.text()).toContain('Names cannot exceed 100 characters.');
+
+    // 吊销不存在的 Key：404 的报错也是英文
+    const revoked = await admin.post('/api-keys', { intent: 'revoke', keyId: '0ed45a67-89ab-4cde-b012-3456789abcde' });
+    expect(revoked.status).toBe(404);
+    expect(await revoked.text()).toContain('API Key not found or revoked');
+
+    // 同一操作（一类都不勾、名称超长）在中文界面仍是原中文
+    vi.unstubAllEnvs();
+    const zhNone = await admin.post('/api-keys', { intent: 'create', name: '都不勾' });
+    expect(zhNone.status).toBe(400);
+    expect(await zhNone.text()).toContain('请至少勾选一类接口');
+    const zhLong = await admin.post('/api-keys', { intent: 'create', name: '名'.repeat(101), scope: ['catalog'] });
+    expect(zhLong.status).toBe(400);
+    expect(await zhLong.text()).toContain('名称不能超过 100 个字');
   });
 
   it('「接口说明」标签页按登记表列出全部外部接口；页面只有占位符，没有 Key 前缀、哈希或创建者；无权限成员 403；Key 列表照旧', async () => {

@@ -4,27 +4,26 @@ import { and, desc, eq, isNull } from 'drizzle-orm';
 import type { ApiDataScope } from '../lib/api-data-scope';
 import { API_SCOPES, type ApiScope } from '../lib/api-scopes';
 import { cmp } from '../lib/compare';
-import { msg, type Msg } from '../lib/i18n';
+import { msg, MsgError, type Msg } from '../lib/i18n';
 import { assertCan } from './access';
 import { apiCatalog } from './api-catalog';
 import { recordAudit } from './audit';
 import { newToken, sha256, type CurrentMember } from './auth';
 import { getDb } from './db/client';
-import { formatServer } from './i18n';
 import { apiKeys } from './db/schema';
 import { UUID } from './tenants';
 
-/** 可以展示给管理员的业务错误，带对应的 HTTP 状态码。detail 是 msg() 时由页面按界面语言格式化（ADR-0060），message 固定中文 */
-export class ApiKeyError extends Error {
-  constructor(readonly detail: string | Msg, readonly status: 400 | 404 = 400) {
-    super(typeof detail === 'string' ? detail : formatServer('zh-CN', detail));
+/** 可以展示给管理员的业务错误，带对应的 HTTP 状态码。detail 是句式，路由 catch 点用 errorTextFor 按界面语言出报错文字（ADR-0060），message 固定中文 */
+export class ApiKeyError extends MsgError {
+  constructor(detail: Msg, readonly status: 400 | 404 = 400) {
+    super(detail);
   }
 }
 
 /** 前缀：明文前 8 位，列表与审计里用来辨认是哪一把 */
 const PREFIX_LENGTH = 8;
 const NAME_MAX = 100;
-const notFound = () => new ApiKeyError('API Key 不存在或已吊销', 404);
+const notFound = () => new ApiKeyError(msg('API Key 不存在或已吊销'), 404);
 
 /** 表单勾选的接口范围收敛成要存的值：只认三类（白名单），去重、按固定顺序；一类都没有是业务错误 */
 function normalizeScopes(raw: string[]): ApiScope[] {
@@ -77,8 +76,8 @@ export async function listApiKeys(actor: CurrentMember) {
 export async function createApiKey(actor: CurrentMember, rawName: string, rawScopes: string[], rawDataScope: RawDataScope) {
   assertCan(actor, 'api_keys:manage');
   const name = rawName.trim();
-  if (!name) throw new ApiKeyError('请填写名称，用来辨认是哪个外部系统');
-  if (name.length > NAME_MAX) throw new ApiKeyError(`名称不能超过 ${NAME_MAX} 个字`);
+  if (!name) throw new ApiKeyError(msg('请填写名称，用来辨认是哪个外部系统'));
+  if (name.length > NAME_MAX) throw new ApiKeyError(msg('名称不能超过 {max} 个字', { max: NAME_MAX }));
   const scopes = normalizeScopes(rawScopes);
   const dataScope = await normalizeDataScope(actor.tenant.id, rawDataScope);
   const key = newToken();

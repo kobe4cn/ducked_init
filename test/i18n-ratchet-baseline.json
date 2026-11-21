@@ -2,7 +2,6 @@
   "files": {
     "app/.server/access.ts": 14,
     "app/.server/api-auth.ts": 1,
-    "app/.server/api-keys.ts": 3,
     "app/.server/assistant/conversations.ts": 7,
     "app/.server/assistant/knowledge-ask.ts": 9,
     "app/.server/assistant/loop.ts": 24,
