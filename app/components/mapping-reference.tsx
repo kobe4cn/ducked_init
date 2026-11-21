@@ -177,7 +177,7 @@ function MappingReference({ table, entity, registered, functions, yaml, onInsert
         <div data-reference-table={table.name} className="space-y-1">
           <div className="font-medium">{table.view
             ? t('源视图 {name}（只有列与类型，没有列统计）', { name: table.name })
-            : t('源表 {name}（基于前 {rows} 行样本）', { name: table.name, rows: formatNumber(locale, table.sampleRows) })}</div>
+            : t('源表 {name}（基于前 {rows, number} 行样本）', { name: table.name, rows: table.sampleRows })}</div>
           <Table>
             <TableHeader>
               <TableRow>
