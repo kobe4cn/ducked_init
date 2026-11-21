@@ -41,7 +41,7 @@ const render = (locale: 'en' | 'zh-CN', node: ReactNode) =>
   renderToStaticMarkup(createElement(I18nProvider, { t: makeT(locale, locale === 'en' ? enClient : null), locale, children: node }));
 
 describe('英文界面：数据源连接参数表单', () => {
-  it('四种数据源的标签、提示与选项文字都是英文，没有汉字（postgres 空表单、mongodb、s3 编辑态、upload）', () => {
+  it('四种数据源的标签、提示与选项文字都是英文，没有汉字（postgres 空表单、mongodb、s3 编辑态、duckdb、upload）', () => {
     const pg = render('en', createElement(SourceFields, { kind: 'postgres', values: {} }));
     expect(pg).not.toMatch(/[一-鿿]/);
     expect(pg).toContain('Host');
@@ -57,6 +57,10 @@ describe('英文界面：数据源连接参数表单', () => {
     expect(s3).toContain('Object storage endpoint');
     expect(s3).toContain('path (/bucket/key)');
     expect(s3).toContain('Stored encrypted; leave blank to keep it unchanged');
+
+    const duckdb = render('en', createElement(SourceFields, { kind: 'duckdb', values: {} }));
+    expect(duckdb).not.toMatch(/[一-鿿]/);
+    expect(duckdb).toContain('The settings above and the keys below are needed only for files on object storage');
 
     const upload = render('en', createElement(SourceFields, { kind: 'upload', values: { table: 'signups' }, editing: true }));
     expect(upload).not.toMatch(/[一-鿿]/);
