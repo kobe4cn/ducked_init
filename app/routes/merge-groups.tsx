@@ -6,6 +6,7 @@ import { CircleAlert, Layers } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/merge-groups';
 import { can, requirePermission } from '~/.server/access';
+import { errorTextFor } from '~/.server/i18n';
 import {
   discardMergeGroupDraft, listMergeGroups, type MergeGroupInput, mergeGroupInputOf, publishMergeGroup, saveMergeGroupDraft,
 } from '~/.server/merge-groups';
@@ -77,7 +78,7 @@ export async function action({ request }: Route.ActionArgs) {
   } catch (e) {
     if (e instanceof PublishError) {
       const intent = String(form.get('intent'));
-      return data({ error: e.message, intent, input }, { status: e.status });
+      return data({ error: await errorTextFor(request, e), intent, input }, { status: e.status });
     }
     throw e;
   }
