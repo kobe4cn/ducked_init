@@ -7,6 +7,8 @@ import type { Route } from './+types/sources';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import type { CurrentMember } from '~/.server/auth';
+import { errorText, errorTextFor } from '~/.server/i18n';
+import { getLocale } from '~/.server/locale';
 import { listSources, registerSource, SourceError } from '~/.server/sources';
 import { parseUploadOptions, type SourceInput } from '~/.server/source-config';
 import type { UploadReadOptions } from '~/.server/pipeline/source-engine';
@@ -14,6 +16,7 @@ import { csvFieldCount, decodeUpload, previewUpload, removeUpload, storeUpload, 
 import { verifyDifferences } from '~/.server/source-verify';
 import { storageOverQuota } from '~/.server/storage-quota';
 import { uploadLimitOf } from '~/.server/tenants';
+import type { Locale } from '~/lib/i18n';
 import { formValues, SOURCE_KIND_LABELS, SOURCE_KINDS, targetOf, type SourceKind } from '~/lib/sources';
 import { cn } from '~/lib/utils';
 import { AppShell } from '~/components/app-shell';
@@ -56,7 +59,7 @@ export async function action({ request }: Route.ActionArgs) {
   const form = await readLimitedForm(request, mb * 1024 * 1024);
   if (!form) return data({ error: `文件超过本租户上传上限 ${mb} MiB`, values: {} }, { status: 413 });
   // 上传前预览（ADR-0037）：受同样的上传大小上限约束，但不走存储配额检查（不写湖）
-  if (form.get('intent') === 'preview') return previewUploadAction(form);
+  if (form.get('intent') === 'preview') return previewUploadAction(form, await getLocale(request));
   if (form.get('intent') !== 'register') return data({ error: '未知操作', values: {} }, { status: 400 });
   // 先剔出文件：File 经 String() 会变成 "[object File]"
   const file = form.get('file');
@@ -70,7 +73,7 @@ export async function action({ request }: Route.ActionArgs) {
     const { id } = input.kind === 'upload' ? await registerUpload(member, input, file) : await registerSource(member, input);
     throw redirect(`/sources/${id}`);
   } catch (e) {
-    if (e instanceof SourceError) return data({ error: e.message, values: formValues(form) }, { status: e.status });
+    if (e instanceof SourceError) return data({ error: await errorTextFor(request, e), values: formValues(form) }, { status: e.status });
     throw e;
   }
 }
@@ -115,7 +118,7 @@ export function shouldRevalidate({ formData, defaultShouldRevalidate }: ShouldRe
 
 /** 上传前预览（ADR-0037）：校验后交给 previewUpload，识别编码、分隔符、表头与列类型并读前 20 行。
  * 不登记、不写湖、不记审计；确认登记时浏览器再提交一次同一个文件 */
-async function previewUploadAction(form: FormData) {
+async function previewUploadAction(form: FormData, locale: Locale) {
   const file = form.get('file');
   const input = Object.fromEntries([...form].filter(([k]) => k !== 'file').map(([k, v]) => [k, String(v)]));
   try {
@@ -126,7 +129,7 @@ async function previewUploadAction(form: FormData) {
     checkUploadColumns(opts, decodeUpload(bytes, opts?.encoding).text);
     return data({ error: null, preview: await previewUpload(bytes, table, opts), values: {} });
   } catch (e) {
-    if (e instanceof SourceError) return data({ error: null, previewError: e.message, values: {} }, { status: e.status });
+    if (e instanceof SourceError) return data({ error: null, previewError: errorText(locale, e), values: {} }, { status: e.status });
     throw e;
   }
 }

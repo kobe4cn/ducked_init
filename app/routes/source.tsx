@@ -12,6 +12,7 @@ import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react
 import { CheckCircle2, CircleAlert, CircleCheck, Lock, PencilLine, PlugZap, Plus, RefreshCw, ScrollText, Trash2 } from 'lucide-react';
 import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
+import { errorTextFor } from '~/.server/i18n';
 import { navFor } from '~/.server/nav';
 import { sourceDrift } from '~/.server/source-drift';
 import { getKeyChecks } from '~/.server/source-key-check';
@@ -201,7 +202,7 @@ export async function action({ request, params }: Route.ActionArgs) {
     }
   } catch (e) {
     if (e instanceof SourceError) {
-      return data({ ok: null, error: e.message, values: field('intent') === 'update' ? formValues(form) : null }, { status: e.status });
+      return data({ ok: null, error: await errorTextFor(request, e), values: field('intent') === 'update' ? formValues(form) : null }, { status: e.status });
     }
     throw e;
   }
