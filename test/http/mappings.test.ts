@@ -6,9 +6,9 @@
 // 新建页与详情页的只校验接口（intent=validate，经 .data 接口取返回值）与保存同一套检查，不保存
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseDocument } from 'yaml';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { mappingGenerations } from '../../app/.server/db/schema';
+import { mappingGenerations, tasks } from '../../app/.server/db/schema';
 import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import type { CurrentMember } from '../../app/.server/auth';
@@ -728,6 +728,23 @@ describe('编写映射时的对照面板', () => {
     for (const zh of ['空值率', '常见取值（样本行数）', '写法速查：点击插入到光标处', '的标准字段：已对应的打勾，去重键必填', '表达式可用的函数（白名单）']) expect(strip).not.toContain(zh);
     // 提交的值不因界面语言改变：编辑框里的 YAML 与保存的一致
     expect(editorYaml(html)).toBe(ORDERS);
+  });
+
+  it('对照面板的样本行数上千时按界面语言分组：英文是 first 12,345 rows（不是 NaN），中文仍是基于前 12,345 行样本', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    // 测试源库造不出上万行，直接改采集结果里 orders 的样本行数
+    await getDb().execute(sql`UPDATE ${tasks} SET result = jsonb_set(result, '{tables}', (
+      SELECT jsonb_agg(CASE WHEN p->>'name' = 'orders' THEN jsonb_set(p, '{sampleRows}', '12345') ELSE p END) FROM jsonb_array_elements(result->'tables') p))
+      WHERE tenant_id = ${tenantId} AND kind = 'source.profile' AND status = 'succeeded'`);
+    const engineer = await loginAs(app, 'de@acme.com');
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    const zh = (await (await engineer.get(`/mappings/${id}`)).text()).replace(/<script[\s\S]*?<\/script>/g, '');
+    expect(zh).toContain('源表 orders（基于前 12,345 行样本）');
+    engineer.store('crm_locale=en; Path=/');
+    const en = (await (await engineer.get(`/mappings/${id}`)).text()).replace(/<script[\s\S]*?<\/script>/g, '');
+    expect(en).toContain('Source table orders (based on a sample of the first 12,345 rows)');
+    expect(en).not.toContain('NaN');
   });
 
   it('自定义实体的映射对照它已发布登记的字段（类型、敏感、说明、主键）；没登记的提示去登记', async () => {

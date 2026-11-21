@@ -475,7 +475,7 @@
   "没用到的源列，勾选即加为扩展字段：": "Unused source columns; check one to add it as an extension field:",
   "源值": "Source value",
   "源列名": "Source column name",
-  "源表 {name}（基于前 {rows} 行样本）": "Source table {name} (based on a sample of the first {rows, plural, one {# row} other {# rows}})",
+  "源表 {name}（基于前 {rows, number} 行样本）": "Source table {name} (based on a sample of the first {rows, plural, one {# row} other {# rows}})",
   "源视图 {name}（只有列与类型，没有列统计）": "Source view {name} (columns and types only, no column statistics)",
   "空值率": "Null rate",
   "第 {n} 个源值": "Source value {n}",
