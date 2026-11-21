@@ -1,11 +1,13 @@
 // test/http/i18n-sources-pages.test.ts —— 数据源列表与源视图页接入双语后的整页断言（#1038，ADR-0060）：
 // 英文界面（CRM_ENABLE_EN_LOCALE + crm_locale cookie）下两页写死的文字没有汉字，数据源类型经 builtinName 显示英文、
-// 登记/类型下拉的 option value 不变，日期按英文格式；中文界面下日期与时间仍和改造前的 zh-CN 格式一致。
+// 登记/类型下拉的 option value 不变，日期按英文格式，列表页 action 的报错（上传上限 413、未知操作 400）走 formatServer 也是英文；
+// 中文界面下日期与时间仍和改造前的 zh-CN 格式一致。
 // 上传预览组件的静态渲染见 test/i18n-sources-list-render.test.ts。源名用 ASCII（数据不翻，整页断言不剔数据值）
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
+import { setTenantQuota } from '../../app/.server/tenants';
 import { drain, memberOf, newTenant, selectAllTables } from '../pipeline/fixtures';
 import { pgSourceInput, READER } from '../pipeline/source-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
@@ -89,6 +91,30 @@ describe('英文界面：数据源列表与源视图页', () => {
     expect(versions).not.toMatch(/[一-鿿]/);
     expect(versions).toMatch(/admin@acme\.com, \d{1,2}\/\d{1,2}\/\d{4}, [\d:]+ [AP]M/);
     for (const head of ['Version</th>', 'Status</th>', 'Authors</th>', 'Published</th>', 'View</a>']) expect(versions).toContain(head);
+  });
+
+  it('列表页 action 的两条报错是英文：超过租户上传上限 413、未知操作 400，整页回显都没有汉字', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const tenantId = await newTenant('acme');
+    await memberOf(tenantId, 'de@acme.com', 'data_engineer');
+    await setTenantQuota(null, tenantId, { memoryLimitMb: 2048, threads: 2, maxConcurrentTasks: 1, maxUploadMb: 1, storageQuotaMb: 10240 });
+    const engineer = await loginAs(app, 'de@acme.com');
+    engineer.store('crm_locale=en; Path=/');
+    // 超过 1 MiB 上限的上传：413（harness 用 FormData 作请求体时没有 Content-Length，走边读边计数的路径）
+    const body = new FormData();
+    for (const [k, v] of Object.entries({ intent: 'register', kind: 'upload', name: 'big', table: 'big' })) body.set(k, v);
+    body.set('file', new File(['id\n' + '1\n'.repeat(1024 * 1024)], 'big.csv'));
+    const over = await engineer.request('/sources', { method: 'POST', body });
+    expect(over.status).toBe(413);
+    const overHtml = stripScripts(await over.text());
+    expect(overHtml).toContain("File exceeds this tenant&#x27;s upload limit of 1 MiB"); // 文本里的单引号被 React 转义成 &#x27;
+    expect(overHtml).not.toMatch(/[一-鿿]/);
+    // 未知 intent：400
+    const bad = await engineer.request('/sources', { method: 'POST', body: new URLSearchParams({ intent: 'bogus' }) });
+    expect(bad.status).toBe(400);
+    const badHtml = stripScripts(await bad.text());
+    expect(badHtml).toContain('Unknown operation');
+    expect(badHtml).not.toMatch(/[一-鿿]/);
   });
 });
 
