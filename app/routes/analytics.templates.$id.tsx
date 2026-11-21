@@ -376,8 +376,9 @@ function SegmentUpgradeDistribution({ from, to, asOf, distribution, canSample, s
   canSample: boolean; sample: UpgradeSample | null; defaultSegmentNames: string[] | null;
 }) {
   const t = useT();
+  const defaults = new Set(defaultSegmentNames ?? []);
   /** null（新增或移出）显示「（无）」 */
-  const disp = (s: string | null) => (s === null ? t('（无）') : builtinName(t, s, new Set(defaultSegmentNames ?? [])));
+  const disp = (s: string | null) => (s === null ? t('（无）') : builtinName(t, s, defaults));
   const names = (side: 'before' | 'after') => [...new Set(distribution[side].map(s => s.segment))];
   // 对比表的行是 v1 / v2 分群名的并集（只有一边有的分群另一边人数为 0）；矩阵行是原分群、列是新分群，迁移里出现的「（无）」（新增或移出）也各占一行/列
   const compareRows = [...new Set([...names('before'), ...names('after')])].sort(cmpSegment);
