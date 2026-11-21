@@ -150,6 +150,13 @@ describe('API Key 页', () => {
     ]);
   });
 
+  // 页面其余部分仍有中文，只取报错 Alert 里 <AlertDescription> 的文字来断言「不含汉字」
+  const alertError = (html: string) => {
+    const m = html.match(/<div data-slot="alert-description"[^>]*>([\s\S]*?)<\/div>/);
+    expect(m, '响应里没有报错 AlertDescription').not.toBeNull();
+    return m![1].replace(/<[^>]+>/g, '').trim();
+  };
+
   it('英文界面下创建报错是英文（一类都不勾、名称超长、吊销不存在的 Key）；同一操作中文界面仍是原中文', async () => {
     await newTenant('acme');
     const admin = await loginAs(app, 'admin@acme.com');
@@ -160,18 +167,23 @@ describe('API Key 页', () => {
     // 一类都不勾：400，报错是英文且不含汉字
     const none = await admin.post('/api-keys', { intent: 'create', name: 'no scopes' });
     expect(none.status).toBe(400);
-    const enNone = await none.text();
+    const enNone = alertError(await none.text());
     expect(enNone).toContain('Select at least one API type');
+    expect(enNone).not.toMatch(/\p{Script=Han}/u);
 
     // 名称超过 100 字：参数代入英文句式
     const tooLong = await admin.post('/api-keys', { intent: 'create', name: 'x'.repeat(101), scope: ['catalog'] });
     expect(tooLong.status).toBe(400);
-    expect(await tooLong.text()).toContain('Names cannot exceed 100 characters.');
+    const enLong = alertError(await tooLong.text());
+    expect(enLong).toContain('Names cannot exceed 100 characters.');
+    expect(enLong).not.toMatch(/\p{Script=Han}/u);
 
     // 吊销不存在的 Key：404 的报错也是英文
     const revoked = await admin.post('/api-keys', { intent: 'revoke', keyId: '0ed45a67-89ab-4cde-b012-3456789abcde' });
     expect(revoked.status).toBe(404);
-    expect(await revoked.text()).toContain('API Key not found or revoked');
+    const enRevoked = alertError(await revoked.text());
+    expect(enRevoked).toContain('API Key not found or revoked');
+    expect(enRevoked).not.toMatch(/\p{Script=Han}/u);
 
     // 同一操作（一类都不勾、名称超长）在中文界面仍是原中文
     vi.unstubAllEnvs();
