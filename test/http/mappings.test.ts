@@ -706,6 +706,30 @@ describe('编写映射时的对照面板', () => {
     expect(html).toMatch(/data-reference-field="customer_id"(?![^>]*data-mapped)/);
   });
 
+  it('英文界面下编辑页的对照面板是英文：标签、标准字段名与类型，YAML 编辑框内容不变', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const { sourceId } = await tenantWithSource('acme');
+    const engineer = await loginAs(app, 'de@acme.com');
+    const id = mappingIdOf(await engineer.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    engineer.store('crm_locale=en; Path=/');
+    const html = await (await engineer.get(`/mappings/${id}`)).text();
+    // 水合数据里的脚本会带中文词典键（键就是中文原文），断言前先去掉脚本
+    const strip = html.replace(/<script[\s\S]*?<\/script>/g, '');
+    // 源表块：标题（样本行数按英文习惯分组）与表头
+    expect(strip).toMatch(/Source table orders \(based on a sample of the first [\d,]+ rows?\)/);
+    expect(strip).toContain('Null rate');
+    expect(strip).toContain('Distinct values');
+    // 标准字段块：字段名与类型按界面语言（#1011 的词典），标题整句是英文
+    expect(strip).toContain('Amount Paid');
+    expect(strip).toContain('Decimal (2 places)');
+    expect(strip).toContain('Syntax cheatsheet: click to insert at the cursor');
+    expect(strip).toContain('Functions available in expressions (whitelist)');
+    // 面板特有的中文界面文字不再出现（字段说明、函数说明是数据，随 #932）
+    for (const zh of ['空值率', '常见取值（样本行数）', '写法速查：点击插入到光标处', '的标准字段：已对应的打勾，去重键必填', '表达式可用的函数（白名单）']) expect(strip).not.toContain(zh);
+    // 提交的值不因界面语言改变：编辑框里的 YAML 与保存的一致
+    expect(editorYaml(html)).toBe(ORDERS);
+  });
+
   it('自定义实体的映射对照它已发布登记的字段（类型、敏感、说明、主键）；没登记的提示去登记', async () => {
     const { tenantId, sourceId } = await tenantWithSource('acme');
     const author = await memberOf(tenantId, 'de@acme.com');

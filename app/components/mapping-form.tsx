@@ -16,6 +16,8 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
 import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, KEY_SPACE_PATTERN, type CanonicalEntity, type CanonicalField, type FieldType } from '~/lib/canonical-model';
 import { parseExpression } from '~/lib/mapping-expr';
+import { builtinName, CANONICAL_NAMES, ENUM_LABELS } from '~/lib/builtin-names';
+import { useT, type T } from '~/lib/i18n';
 import {
   dictionaryRows, expressionOf, extensionNameProblem, formUnavailable, groupIssues, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity,
   readKeySpace, readSurvivorship, seedDictionary, TRANSFORMS, unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace, writeSurvivorship, writtenDictionary,
@@ -30,10 +32,11 @@ import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select'
 
 /** 表单显示不了时的说明（YAML 写错了、实体对不上），附到 YAML 标签页的入口 */
 function Notice({ children, onEditYaml }: { children: string; onEditYaml: () => void }) {
+  const t = useT();
   return (
     <div data-mapping-form-notice className="space-y-2 rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
       <div>{children}</div>
-      <Button type="button" size="sm" variant="outline" onClick={onEditYaml}>到 YAML 标签页修改</Button>
+      <Button type="button" size="sm" variant="outline" onClick={onEditYaml}>{t('到 YAML 标签页修改')}</Button>
     </div>
   );
 }
@@ -71,6 +74,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, issues = []
   onEditYaml: () => void;
 }) {
   const doc = useMemo(() => parseDocument(yaml), [yaml]);
+  const t = useT();
   // 只在打开时定位一次：保存后 loader 重新给出的 focus 不再滚动
   const focused = focus?.field;
   useEffect(() => {
@@ -120,7 +124,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, issues = []
     <div className="max-h-[48rem] divide-y overflow-y-auto rounded-lg border text-sm">
       {general.length > 0 && (
         <div data-form-issues className="space-y-1 p-3">
-          <div className="text-xs font-medium text-destructive">实时校验发现的问题</div>
+          <div className="text-xs font-medium text-destructive">{t('实时校验发现的问题')}</div>
           <BlockIssues issues={general} />
         </div>
       )}
@@ -148,7 +152,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, issues = []
   );
 }
 
-const transformOf = (id: TransformId) => TRANSFORMS.find(t => t.id === id)!;
+const transformOf = (id: TransformId) => TRANSFORMS.find(tr => tr.id === id)!;
 
 const fieldId = (field: string) => `form-field-${field}`;
 
@@ -165,34 +169,34 @@ const syncKey = (choice: FieldChoice | null, type: FieldType, keySpace?: string 
   : '';
 
 const KEY_SPACE = new RegExp(KEY_SPACE_PATTERN);
-const keySpaceProblem = (keySpace?: string | null) =>
-  keySpace?.trim() && !KEY_SPACE.test(keySpace.trim()) ? '键空间只用小写字母、数字与下划线' : null;
+const keySpaceProblem = (t: T, keySpace?: string | null) =>
+  keySpace?.trim() && !KEY_SPACE.test(keySpace.trim()) ? t('键空间只用小写字母、数字与下划线') : null;
 
 /** 属性取舍名次的问题：填了但不是正整数（1、2、3…）时只留在本地，不写进 YAML */
-const rankProblem = (rank: string) =>
-  rank.trim() && !/^[1-9]\d*$/.test(rank.trim()) ? '名次是正整数，如 1、2、3' : null;
+const rankProblem = (t: T, rank: string) =>
+  rank.trim() && !/^[1-9]\d*$/.test(rank.trim()) ? t('名次是正整数，如 1、2、3') : null;
 
-/** 选择还缺什么（给出时不写进 YAML）；写得出表达式时为 null */
-function missing(choice: FieldChoice, type: FieldType): string | null {
+/** 选择还缺什么（给出时不写进 YAML）；写得出表达式时为 null。TRANSFORMS 的参数名、parseExpression 的报错是 lib 给的数据，随 #932 */
+function missing(t: T, choice: FieldChoice, type: FieldType): string | null {
   const def = transformOf(choice.transform);
-  if (def.column && !choice.column) return '选一个源列';
+  if (def.column && !choice.column) return t('选一个源列');
   const arg = def.args.find((a, i) => !a.optional && !choice.args?.[i]?.trim());
-  if (arg) return `填写${arg.label}`;
+  if (arg) return t('填写{label}', { label: arg.label });
   if (choice.transform === 'concat') {
-    if (!choice.parts?.length) return '至少加一段源列或文本';
-    if (choice.parts.some(p => 'column' in p && !p.column)) return '每段源列都要选一列';
+    if (!choice.parts?.length) return t('至少加一段源列或文本');
+    if (choice.parts.some(p => 'column' in p && !p.column)) return t('每段源列都要选一列');
   }
-  const space = keySpaceProblem(choice.keySpace);
+  const space = keySpaceProblem(t, choice.keySpace);
   if (space) return space;
   const entries = choice.dictionary ?? [];
-  if (entries.some(e => e.to !== null && !e.from)) return '值对照里对应了标准值的行要填源值';
+  if (entries.some(e => e.to !== null && !e.from)) return t('值对照里对应了标准值的行要填源值');
   const twice = (writtenDictionary(entries) ?? []).find((e, i, all) => all.findIndex(x => x.from === e.from) !== i);
-  if (twice) return `值对照里源值 ${twice.from} 写了两次，只留一行`;
+  if (twice) return t('值对照里源值 {from} 写了两次，只留一行', { from: twice.from });
   try {
     parseExpression(expressionOf(choice, type));
     return null;
   } catch (e) {
-    return choice.transform === 'custom' ? `表达式有误：${(e as Error).message}` : (e as Error).message;
+    return choice.transform === 'custom' ? t('表达式有误：{message}', { message: (e as Error).message }) : (e as Error).message;
   }
 }
 
@@ -214,6 +218,7 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
   onWrite: (choice: FieldChoice | null) => void;
   onEditYaml: () => void;
 }) {
+  const t = useT();
   const [choice, setChoice] = useState(() => choiceOf(form));
   // 键空间只存在这里（choice 里不带）：引用字段按 keySpaceOf 预填，不论这一行是否已对应都留着，写这个字段时一并写进 YAML；
   // 不是引用字段时照 YAML 里写的（没有输入框）
@@ -237,7 +242,7 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
     setSeen(declared);
     if (form.keySpace === undefined) setKeySpace(initialKeySpace);
   }
-  const problem = choice && missing({ ...choice, keySpace }, field.type);
+  const problem = choice && missing(t, { ...choice, keySpace }, field.type);
   const unmapped = form.required && !form.raw;
 
   const update = (next: FieldChoice | null, space = keySpace, source = customerSource) => {
@@ -248,7 +253,7 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
       return;
     }
     const written = { ...next, keySpace: space, customerSource: source };
-    if (!missing(written, field.type)) {
+    if (!missing(t, written, field.type)) {
       setSynced(syncKey(next, field.type, space, source || undefined));
       onWrite(written);
     }
@@ -262,7 +267,7 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
     if (choice) update(choice, keySpace, source);
   };
   const keySpacePending = keySpace?.trim() && keySpace.trim() !== form.keySpace && choice && !problem;
-  const topValues = (column?: string | null) => table?.columns.find(c => c.name === column)?.top?.map(t => t.value) ?? [];
+  const topValues = (column?: string | null) => table?.columns.find(c => c.name === column)?.top?.map(v => v.value) ?? [];
   // 新对应的枚举字段选了源列：按常见取值新建值对照，其他取值默认记为空
   const newEnum = form.dictionary && !form.raw && !form.dictionary.length && form.otherwise === undefined;
   const setColumn = (next: FieldChoice, column: string) => update(
@@ -274,7 +279,7 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
     if (!id) return update(null);
     const def = transformOf(id);
     let raw = form.raw;
-    if (choice && !missing(choice, field.type)) raw = expressionOf(choice, field.type);
+    if (choice && !missing(t, choice, field.type)) raw = expressionOf(choice, field.type);
     update({
       transform: id,
       column: def.column ? (choice?.column ?? null) : null,
@@ -292,14 +297,14 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
     <div id={fieldId(field.name)} data-form-field={field.name} data-readonly={form.readonly || undefined} className={`space-y-2 p-3 ${unmapped ? 'bg-destructive/10' : ''}`}>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
         <span className="font-mono font-medium">{field.name}</span>
-        <span>{field.label}</span>
-        <span className="text-xs text-muted-foreground">{FIELD_TYPES[field.type].label}</span>
-        {field.pii && <Badge variant="outline" title="标准层只存加盐哈希，不能取消">敏感信息</Badge>}
-        {form.required && <Badge variant={unmapped ? 'destructive' : 'secondary'}>{unmapped ? '必填（去重键），未对应' : '必填（去重键）'}</Badge>}
+        <span>{builtinName(t, field.label, CANONICAL_NAMES)}</span>
+        <span className="text-xs text-muted-foreground">{builtinName(t, FIELD_TYPES[field.type].label, ENUM_LABELS)}</span>
+        {field.pii && <Badge variant="outline" title={t('标准层只存加盐哈希，不能取消')}>{t('敏感信息')}</Badge>}
+        {form.required && <Badge variant={unmapped ? 'destructive' : 'secondary'}>{unmapped ? t('必填（去重键），未对应') : t('必填（去重键）')}</Badge>}
       </div>
       <div className="text-xs text-muted-foreground">
         {field.description}
-        {field.enum && `。标准枚举：${field.enum.join('、')}`}
+        {field.enum && t('。标准枚举：{values}', { values: field.enum.join(t('、')) })}
       </div>
 
       {form.readonly ? (
@@ -307,17 +312,17 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
           {form.raw && <code className="block rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap">{form.raw}</code>}
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <span>{form.reason}</span>
-            <Button type="button" size="xs" variant="link" onClick={onEditYaml}>到 YAML 修改</Button>
+            <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
           </div>
         </div>
       ) : (
         <div className="flex flex-wrap items-center gap-2">
-          <NativeSelect size="sm" aria-label={`${field.name} 的转换`} value={choice?.transform ?? ''} onChange={e => switchTo(e.target.value as TransformId | '')}>
-            <NativeSelectOption value="">不对应</NativeSelectOption>
-            {TRANSFORMS.map(t => <NativeSelectOption key={t.id} value={t.id}>{t.label}</NativeSelectOption>)}
+          <NativeSelect size="sm" aria-label={t('{name} 的转换', { name: field.name })} value={choice?.transform ?? ''} onChange={e => switchTo(e.target.value as TransformId | '')}>
+            <NativeSelectOption value="">{t('不对应')}</NativeSelectOption>
+            {TRANSFORMS.map(tr => <NativeSelectOption key={tr.id} value={tr.id}>{tr.label}</NativeSelectOption>)}
           </NativeSelect>
           {choice && def?.column && (
-            <ColumnPicker label={`${field.name} 的源列`} table={table} value={choice.column ?? ''} onChange={column => setColumn(choice, column)} />
+            <ColumnPicker label={t('{name} 的源列', { name: field.name })} table={table} value={choice.column ?? ''} onChange={column => setColumn(choice, column)} />
           )}
           {choice && def?.args.map((a, i) => {
             const value = choice.args?.[i] ?? '';
@@ -346,8 +351,8 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
         >
           {keySpacePending && (
             <>
-              <span className="text-muted-foreground">还没写进 YAML</span>
-              <Button type="button" size="xs" variant="link" onClick={() => update(choice)}>写进 YAML</Button>
+              <span className="text-muted-foreground">{t('还没写进 YAML')}</span>
+              <Button type="button" size="xs" variant="link" onClick={() => update(choice)}>{t('写进 YAML')}</Button>
             </>
           )}
         </ReferenceKeyControls>
@@ -363,8 +368,8 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
         />
       )}
 
-      {!form.readonly && problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
-      {form.basis && <div className="text-xs text-muted-foreground">{`依据：${form.basis}`}</div>}
+      {!form.readonly && problem && <div className="text-xs text-destructive">{t('{problem}，之后才写进 YAML', { problem })}</div>}
+      {form.basis && <div className="text-xs text-muted-foreground">{t('依据：{basis}', { basis: form.basis })}</div>}
       <BlockIssues issues={issues} />
     </div>
   );
@@ -385,15 +390,16 @@ function ReferenceKeyControls({ name, target, keySpace, customerSource, options,
 }) {
   // YAML 里写的数据源不在可选里（没有已发布的 customer 映射、写的是本源）时也列出来，保存时由校验指出
   const sourceNames = [...new Set([...options.map(s => s.name), ...(customerSource ? [customerSource] : [])])];
+  const t = useT();
   return (
     <div data-form-key-space={name} className="flex flex-wrap items-center gap-2 text-xs">
-      <span className="text-muted-foreground">{`键空间（${target} 的主键所在）`}</span>
-      <Input className="h-7 w-40" aria-label={`${name} 的键空间`} placeholder="不写" value={keySpace} onChange={e => onKeySpace(e.target.value)} />
+      <span className="text-muted-foreground">{t('键空间（{target} 的主键所在）', { target })}</span>
+      <Input className="h-7 w-40" aria-label={t('{name} 的键空间', { name })} placeholder={t('不写')} value={keySpace} onChange={e => onKeySpace(e.target.value)} />
       {target === 'customer' && (
         <>
-          <span className="text-muted-foreground">所属数据源</span>
-          <NativeSelect size="sm" aria-label={`${name} 的所属数据源`} value={customerSource} onChange={e => onCustomerSource(e.target.value)}>
-            <NativeSelectOption value="">本数据源</NativeSelectOption>
+          <span className="text-muted-foreground">{t('所属数据源')}</span>
+          <NativeSelect size="sm" aria-label={t('{name} 的所属数据源', { name })} value={customerSource} onChange={e => onCustomerSource(e.target.value)}>
+            <NativeSelectOption value="">{t('本数据源')}</NativeSelectOption>
             {sourceNames.map(n => <NativeSelectOption key={n} value={n}>{n}</NativeSelectOption>)}
           </NativeSelect>
         </>
@@ -417,16 +423,17 @@ function Extensions({ doc, table, origins, issues, onWrite, onEditYaml }: {
   const { extensions, reason } = readExtensions(doc);
   const names = extensions.map(e => e.name);
   const unused = table ? unusedColumns(doc, table) : [];
+  const t = useT();
   return (
     <div data-form-extensions className="space-y-2 p-3">
       <div className="flex flex-wrap items-baseline gap-x-2">
-        <span className="font-medium">扩展字段</span>
-        <span className="text-xs text-muted-foreground">标准模型里没有的租户特有字段，名字以 x_ 开头</span>
+        <span className="font-medium">{t('扩展字段')}</span>
+        <span className="text-xs text-muted-foreground">{t('标准模型里没有的租户特有字段，名字以 x_ 开头')}</span>
       </div>
       {reason ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span>{reason}</span>
-          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>到 YAML 修改</Button>
+          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       ) : (
         <>
@@ -443,17 +450,17 @@ function Extensions({ doc, table, origins, issues, onWrite, onEditYaml }: {
               onEditYaml={onEditYaml}
             />
           ))}
-          {unused.length > 0 && <div className="pt-1 text-xs text-muted-foreground">没用到的源列，勾选即加为扩展字段：</div>}
+          {unused.length > 0 && <div className="pt-1 text-xs text-muted-foreground">{t('没用到的源列，勾选即加为扩展字段：')}</div>}
           {unused.map(c => (
             <label key={c.name} data-unused-column={c.name} className="flex items-center gap-2 text-xs">
               <input type="checkbox" checked={false} onChange={() => {
                 const ext = newExtension(table!, c.name, names);
                 onWrite(ext.name, ext);
               }} />
-              <span className="font-mono">{columnLabel(c)}</span>
+              <span className="font-mono">{columnLabel(t, c)}</span>
             </label>
           ))}
-          {!table && !extensions.length && <div className="text-xs text-muted-foreground">没有可对照的源表，扩展字段请在 YAML 里编写</div>}
+          {!table && !extensions.length && <div className="text-xs text-muted-foreground">{t('没有可对照的源表，扩展字段请在 YAML 里编写')}</div>}
         </>
       )}
     </div>
@@ -477,6 +484,7 @@ function ExtensionRow({ form, others, origins, customerSourceOptions, issues, on
   onWrite: (choice: ExtensionChoice | null) => void;
   onEditYaml: () => void;
 }) {
+  const t = useT();
   const read = {
     name: form.name, type: form.type ?? 'string', label: form.label, sensitive: form.sensitive, keySpace: form.keySpace ?? '', customerSource: form.customerSource ?? '',
   };
@@ -490,7 +498,7 @@ function ExtensionRow({ form, others, origins, customerSourceOptions, issues, on
   }
   const targetOf = (d: typeof draft) => (d.type === 'string' && !d.sensitive ? origins[d.name] : undefined);
   const target = targetOf(draft);
-  const problemOf = (d: typeof draft) => extensionNameProblem(d.name, others) ?? (targetOf(d) ? keySpaceProblem(d.keySpace) : null);
+  const problemOf = (d: typeof draft) => extensionNameProblem(d.name, others) ?? (targetOf(d) ? keySpaceProblem(t, d.keySpace) : null);
   const problem = problemOf(draft);
   const update = (next: typeof draft) => {
     setDraft(next);
@@ -504,27 +512,27 @@ function ExtensionRow({ form, others, origins, customerSourceOptions, issues, on
   return (
     <div data-form-extension={form.name} data-readonly={form.readonly || undefined} className="space-y-1 rounded-md border p-2">
       <div className="flex flex-wrap items-center gap-2">
-        <input type="checkbox" checked aria-label={`保留扩展字段 ${form.name}`} disabled={form.readonly} onChange={() => onWrite(null)} />
+        <input type="checkbox" checked aria-label={t('保留扩展字段 {name}', { name: form.name })} disabled={form.readonly} onChange={() => onWrite(null)} />
         {form.readonly ? (
           <>
             <span className="font-mono">{form.name}</span>
-            {form.sensitive && <Badge variant="outline">敏感信息</Badge>}
+            {form.sensitive && <Badge variant="outline">{t('敏感信息')}</Badge>}
           </>
         ) : (
           <>
-            <Input className="h-7 w-48 font-mono" aria-label={`${form.name} 的名字`} value={draft.name} onChange={e => update({ ...draft, name: e.target.value })} />
+            <Input className="h-7 w-48 font-mono" aria-label={t('{name} 的名字', { name: form.name })} value={draft.name} onChange={e => update({ ...draft, name: e.target.value })} />
             <NativeSelect
               size="sm"
-              aria-label={`${form.name} 的类型`}
+              aria-label={t('{name} 的类型', { name: form.name })}
               value={draft.type}
               disabled={form.dictionary || draft.sensitive}
-              title={form.dictionary ? '带值字典或兜底的扩展字段只能是文本' : draft.sensitive ? '敏感字段只存哈希，只能是文本' : undefined}
+              title={form.dictionary ? t('带值字典或兜底的扩展字段只能是文本') : draft.sensitive ? t('敏感字段只存哈希，只能是文本') : undefined}
               onChange={e => update({ ...draft, type: e.target.value as FieldType })}
             >
-              {FIELD_TYPE_NAMES.map(t => <NativeSelectOption key={t} value={t}>{`${t}（${FIELD_TYPES[t].label}）`}</NativeSelectOption>)}
+              {FIELD_TYPE_NAMES.map(ft => <NativeSelectOption key={ft} value={ft}>{t('{type}（{label}）', { type: ft, label: builtinName(t, FIELD_TYPES[ft].label, ENUM_LABELS) })}</NativeSelectOption>)}
             </NativeSelect>
-            <Input className="h-7 w-40" aria-label={`${form.name} 的中文名`} placeholder="中文名（可不填）" value={draft.label} onChange={e => update({ ...draft, label: e.target.value })} />
-            <label className="flex items-center gap-1 text-xs" title={form.dictionary ? '带值字典或兜底的扩展字段不能标成敏感' : '标准层只存加盐哈希'}>
+            <Input className="h-7 w-40" aria-label={t('{name} 的中文名', { name: form.name })} placeholder={t('中文名（可不填）')} value={draft.label} onChange={e => update({ ...draft, label: e.target.value })} />
+            <label className="flex items-center gap-1 text-xs" title={form.dictionary ? t('带值字典或兜底的扩展字段不能标成敏感') : t('标准层只存加盐哈希')}>
               {/* 标成敏感时类型改为文本 */}
               <input
                 type="checkbox"
@@ -532,7 +540,7 @@ function ExtensionRow({ form, others, origins, customerSourceOptions, issues, on
                 disabled={form.dictionary}
                 onChange={e => update({ ...draft, sensitive: e.target.checked, ...(e.target.checked && { type: 'string' as const }) })}
               />
-              敏感
+              {t('敏感')}
             </label>
           </>
         )}
@@ -549,14 +557,14 @@ function ExtensionRow({ form, others, origins, customerSourceOptions, issues, on
           onCustomerSource={customerSource => update({ ...draft, customerSource })}
         />
       )}
-      {form.dictionary && !form.readonly && <div className="text-xs text-muted-foreground">带值字典或兜底，请在 YAML 里修改对照</div>}
+      {form.dictionary && !form.readonly && <div className="text-xs text-muted-foreground">{t('带值字典或兜底，请在 YAML 里修改对照')}</div>}
       {form.readonly && (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span>{form.reason}</span>
-          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>到 YAML 修改</Button>
+          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       )}
-      {!form.readonly && problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
+      {!form.readonly && problem && <div className="text-xs text-destructive">{t('{problem}，之后才写进 YAML', { problem })}</div>}
       <BlockIssues issues={issues} />
     </div>
   );
@@ -564,6 +572,7 @@ function ExtensionRow({ form, others, origins, customerSourceOptions, issues, on
 
 /** 映射的键空间：主键在标准层带上这个前缀，同一数据源里指向本实体的引用字段要写同一个；清空时删掉 key_space */
 function KeySpace({ doc, issues, onWrite }: { doc: ReturnType<typeof parseDocument>; issues: MappingIssueView[]; onWrite: (keySpace: string | null) => void }) {
+  const t = useT();
   const written = readKeySpace(doc) ?? '';
   const [value, setValue] = useState(written);
   // YAML 在别处改了时按 YAML 重新读出
@@ -572,23 +581,23 @@ function KeySpace({ doc, issues, onWrite }: { doc: ReturnType<typeof parseDocume
     setSynced(written);
     setValue(written);
   }
-  const problem = keySpaceProblem(value);
+  const problem = keySpaceProblem(t, value);
   const change = (next: string) => {
     setValue(next);
-    if (keySpaceProblem(next)) return;
+    if (keySpaceProblem(t, next)) return;
     setSynced(next.trim());
     onWrite(next.trim() || null);
   };
   return (
     <div data-form-mapping-key-space className="space-y-2 p-3">
       <div className="flex flex-wrap items-baseline gap-x-2">
-        <span className="font-medium">键空间</span>
+        <span className="font-medium">{t('键空间')}</span>
         <span className="text-xs text-muted-foreground">
-          多个映射写同一实体、主键取值可能撞上时，给本映射起一个键空间（如 pos），标准层的主键写成「键空间:原值」；同一数据源里指向本实体的字段要写同一个键空间。不写时主键照原值
+          {t('多个映射写同一实体、主键取值可能撞上时，给本映射起一个键空间（如 pos），标准层的主键写成「键空间:原值」；同一数据源里指向本实体的字段要写同一个键空间。不写时主键照原值')}
         </span>
       </div>
-      <Input className="h-7 w-40" aria-label="映射的键空间" placeholder="不写" value={value} onChange={e => change(e.target.value)} />
-      {problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
+      <Input className="h-7 w-40" aria-label={t('映射的键空间')} placeholder={t('不写')} value={value} onChange={e => change(e.target.value)} />
+      {problem && <div className="text-xs text-destructive">{t('{problem}，之后才写进 YAML', { problem })}</div>}
       <BlockIssues issues={issues} />
     </div>
   );
@@ -604,6 +613,7 @@ function Identity({ doc, entity, issues, onWrite, onEditYaml }: {
 }) {
   const { match, reason } = readIdentity(doc);
   const candidates = identityCandidates(doc, entity);
+  const t = useT();
   const move = (i: number, by: number) => {
     const next = [...match];
     [next[i], next[i + by]] = [next[i + by], next[i]];
@@ -612,26 +622,26 @@ function Identity({ doc, entity, issues, onWrite, onEditYaml }: {
   return (
     <div data-form-identity className="space-y-2 p-3">
       <div className="flex flex-wrap items-baseline gap-x-2">
-        <span className="font-medium">身份打通</span>
+        <span className="font-medium">{t('身份打通')}</span>
         <span className="text-xs text-muted-foreground">
-          按哪些敏感字段的哈希判断是同一个人，越靠前优先级越高：更高优先级的字段双方都有值且不同时，不按后面的字段合并。不选时用默认规则（手机号、邮箱、外部 ID）
+          {t('按哪些敏感字段的哈希判断是同一个人，越靠前优先级越高：更高优先级的字段双方都有值且不同时，不按后面的字段合并。不选时用默认规则（手机号、邮箱、外部 ID）')}
         </span>
       </div>
       {reason ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span>{reason}</span>
-          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>到 YAML 修改</Button>
+          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       ) : (
         <>
           {match.map((name, i) => (
             <div key={name} data-identity-match={name} className="flex items-center gap-2 text-xs">
-              <input type="checkbox" checked aria-label={`不按 ${name} 匹配`} onChange={() => onWrite(match.filter(m => m !== name))} />
+              <input type="checkbox" checked aria-label={t('不按 {name} 匹配', { name })} onChange={() => onWrite(match.filter(m => m !== name))} />
               <span className="w-6 text-muted-foreground">{i + 1}</span>
               <span className="font-mono">{name}</span>
-              {!candidates.includes(name) && <span className="text-destructive">没有映射或不是敏感字段，请去掉</span>}
-              <Button type="button" size="xs" variant="ghost" aria-label={`${name} 提前`} disabled={i === 0} onClick={() => move(i, -1)}>↑</Button>
-              <Button type="button" size="xs" variant="ghost" aria-label={`${name} 推后`} disabled={i === match.length - 1} onClick={() => move(i, 1)}>↓</Button>
+              {!candidates.includes(name) && <span className="text-destructive">{t('没有映射或不是敏感字段，请去掉')}</span>}
+              <Button type="button" size="xs" variant="ghost" aria-label={t('{name} 提前', { name })} disabled={i === 0} onClick={() => move(i, -1)}>↑</Button>
+              <Button type="button" size="xs" variant="ghost" aria-label={t('{name} 推后', { name })} disabled={i === match.length - 1} onClick={() => move(i, 1)}>↓</Button>
             </div>
           ))}
           {candidates.filter(c => !match.includes(c)).map(name => (
@@ -640,7 +650,7 @@ function Identity({ doc, entity, issues, onWrite, onEditYaml }: {
               <span className="font-mono">{name}</span>
             </label>
           ))}
-          {!candidates.length && !match.length && <div className="text-xs text-muted-foreground">还没有映射敏感字段，映射手机号、邮箱等之后才能选</div>}
+          {!candidates.length && !match.length && <div className="text-xs text-muted-foreground">{t('还没有映射敏感字段，映射手机号、邮箱等之后才能选')}</div>}
         </>
       )}
       <BlockIssues issues={issues} />
@@ -657,6 +667,7 @@ function Survivorship({ doc, issues, onWrite, onEditYaml }: {
 }) {
   const { priority, reason } = readSurvivorship(doc);
   const written = priority == null ? '' : String(priority);
+  const t = useT();
   const [value, setValue] = useState(written);
   // YAML 在别处改了时按 YAML 重新读出
   const [synced, setSynced] = useState(written);
@@ -664,7 +675,7 @@ function Survivorship({ doc, issues, onWrite, onEditYaml }: {
     setSynced(written);
     setValue(written);
   }
-  const problem = rankProblem(value);
+  const problem = rankProblem(t, value);
   const change = (next: string) => {
     setValue(next);
     const trimmed = next.trim();
@@ -673,27 +684,27 @@ function Survivorship({ doc, issues, onWrite, onEditYaml }: {
       onWrite(null);
       return;
     }
-    if (rankProblem(next)) return;
+    if (rankProblem(t, next)) return;
     setSynced(trimmed);
     onWrite(Number(trimmed));
   };
   return (
     <div data-form-survivorship className="space-y-2 p-3">
       <div className="flex flex-wrap items-baseline gap-x-2">
-        <span className="font-medium">属性取舍名次</span>
+        <span className="font-medium">{t('属性取舍名次')}</span>
         <span className="text-xs text-muted-foreground">
-          统一消费者的属性来自几个 customer 映射时，数字越小越优先；只作用于属性，不作用于同意；不写时按 updated_at 取最新
+          {t('统一消费者的属性来自几个 customer 映射时，数字越小越优先；只作用于属性，不作用于同意；不写时按 updated_at 取最新')}
         </span>
       </div>
       {reason ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span>{reason}</span>
-          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>到 YAML 修改</Button>
+          <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       ) : (
-        <Input className="h-7 w-40" aria-label="属性取舍名次" placeholder="不写" value={value} onChange={e => change(e.target.value)} inputMode="numeric" />
+        <Input className="h-7 w-40" aria-label={t('属性取舍名次')} placeholder={t('不写')} value={value} onChange={e => change(e.target.value)} inputMode="numeric" />
       )}
-      {problem && <div className="text-xs text-destructive">{`${problem}，之后才写进 YAML`}</div>}
+      {problem && <div className="text-xs text-destructive">{t('{problem}，之后才写进 YAML', { problem })}</div>}
       <BlockIssues issues={issues} />
     </div>
   );
@@ -715,6 +726,7 @@ function DictionaryEditor({ entity, field, entries, otherwise, values, onChange 
   onChange: (entries: DictionaryEntry[], otherwise: string | null | undefined) => void;
 }) {
   const standard = field.enum!;
+  const t = useT();
   const rows = dictionaryRows(entity, field.name, entries, values);
   const set = (entries: DictionaryEntry[]) => onChange(entries, otherwise);
   // 表单上的行与 entries 对齐：extra 的行在对应时追加进 entries
@@ -726,39 +738,39 @@ function DictionaryEditor({ entity, field, entries, otherwise, values, onChange 
   const fillSuggested = () => set(rows.flatMap(({ from, to, extra, suggestion }) => (extra && !suggestion ? [] : [{ from, to: to ?? suggestion ?? null }])));
   return (
     <div data-form-dictionary={field.name} className="space-y-2 rounded-md border bg-muted/30 p-2 text-xs">
-      <div className="text-muted-foreground">值对照（源值 → 标准值）：合并时只认这里写了的源值，源值与标准值相同也要写上</div>
+      <div className="text-muted-foreground">{t('值对照（源值 → 标准值）：合并时只认这里写了的源值，源值与标准值相同也要写上')}</div>
       {rows.map((r, i) => (
         <div key={r.extra ? `extra-${r.from}` : i} data-dictionary-row={r.from} data-unmapped={r.to === null || undefined} className={`flex flex-wrap items-center gap-2 rounded px-1 py-0.5 ${r.to === null ? 'bg-amber-100' : ''}`}>
           {r.extra
             ? <span className="w-40 truncate font-mono" title={r.from}>{r.from}</span>
-            : <Input className="h-7 w-40 font-mono" aria-label={`第 ${i + 1} 个源值`} placeholder="源值" value={r.from} onChange={e => set(entries.map((x, j) => (j === i ? { ...x, from: e.target.value } : x)))} />}
+            : <Input className="h-7 w-40 font-mono" aria-label={t('第 {n} 个源值', { n: i + 1 })} placeholder={t('源值')} value={r.from} onChange={e => set(entries.map((x, j) => (j === i ? { ...x, from: e.target.value } : x)))} />}
           <span className="text-muted-foreground">→</span>
-          <NativeSelect size="sm" aria-label={`${r.from || `第 ${i + 1} 个源值`} 对应的标准值`} value={r.to ?? ''} onChange={e => setTo(i, e.target.value || null)}>
-            <NativeSelectOption value="">未对应</NativeSelectOption>
-            {r.to && !standard.includes(r.to) && <NativeSelectOption value={r.to}>{`${r.to}（不是标准值）`}</NativeSelectOption>}
+          <NativeSelect size="sm" aria-label={r.from ? t('{from} 对应的标准值', { from: r.from }) : t('第 {n} 个源值对应的标准值', { n: i + 1 })} value={r.to ?? ''} onChange={e => setTo(i, e.target.value || null)}>
+            <NativeSelectOption value="">{t('未对应')}</NativeSelectOption>
+            {r.to && !standard.includes(r.to) && <NativeSelectOption value={r.to}>{t('{value}（不是标准值）', { value: r.to })}</NativeSelectOption>}
             {standard.map(v => <NativeSelectOption key={v} value={v}>{v}</NativeSelectOption>)}
           </NativeSelect>
-          {r.to === null && <span className="text-amber-700">{r.extra ? '样本里出现过，建议对应' : '未对应，不写进值字典'}</span>}
-          {r.to === null && r.suggestion && <Button type="button" size="xs" variant="link" onClick={() => setTo(i, r.suggestion!)}>{`对应为 ${r.suggestion}`}</Button>}
-          {!r.extra && <Button type="button" size="xs" variant="ghost" aria-label={`去掉源值 ${r.from}`} onClick={() => set(entries.filter((_, j) => j !== i))}>×</Button>}
+          {r.to === null && <span className="text-amber-700">{r.extra ? t('样本里出现过，建议对应') : t('未对应，不写进值字典')}</span>}
+          {r.to === null && r.suggestion && <Button type="button" size="xs" variant="link" onClick={() => setTo(i, r.suggestion!)}>{t('对应为 {value}', { value: r.suggestion })}</Button>}
+          {!r.extra && <Button type="button" size="xs" variant="ghost" aria-label={t('去掉源值 {from}', { from: r.from })} onClick={() => set(entries.filter((_, j) => j !== i))}>×</Button>}
         </div>
       ))}
       <div className="flex flex-wrap items-center gap-2">
-        <Button type="button" size="xs" variant="outline" onClick={() => set([...entries, { from: '', to: null }])}>加一个源值</Button>
-        {suggested.length > 1 && <Button type="button" size="xs" variant="outline" onClick={fillSuggested}>{`按建议对应 ${suggested.length} 个源值`}</Button>}
+        <Button type="button" size="xs" variant="outline" onClick={() => set([...entries, { from: '', to: null }])}>{t('加一个源值')}</Button>
+        {suggested.length > 1 && <Button type="button" size="xs" variant="outline" onClick={fillSuggested}>{t('按建议对应 {n} 个源值', { n: suggested.length })}</Button>}
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        <span>没对上的取值</span>
+        <span>{t('没对上的取值')}</span>
         <NativeSelect
           size="sm"
-          aria-label={`${field.name} 的兜底`}
+          aria-label={t('{name} 的兜底', { name: field.name })}
           value={otherwise === undefined ? '' : (otherwise ?? NULL_OTHERWISE)}
           onChange={e => onChange(entries, e.target.value === '' ? undefined : e.target.value === NULL_OTHERWISE ? null : e.target.value)}
         >
-          <NativeSelectOption value="">不写兜底（合并失败并列出这些取值）</NativeSelectOption>
-          <NativeSelectOption value={NULL_OTHERWISE}>其他取值记为空</NativeSelectOption>
-          {otherwise && !standard.includes(otherwise) && <NativeSelectOption value={otherwise}>{`记为 ${otherwise}（不是标准值）`}</NativeSelectOption>}
-          {standard.map(v => <NativeSelectOption key={v} value={v}>{`其他取值记为 ${v}`}</NativeSelectOption>)}
+          <NativeSelectOption value="">{t('不写兜底（合并失败并列出这些取值）')}</NativeSelectOption>
+          <NativeSelectOption value={NULL_OTHERWISE}>{t('其他取值记为空')}</NativeSelectOption>
+          {otherwise && !standard.includes(otherwise) && <NativeSelectOption value={otherwise}>{t('记为 {value}（不是标准值）', { value: otherwise })}</NativeSelectOption>}
+          {standard.map(v => <NativeSelectOption key={v} value={v}>{t('其他取值记为 {value}', { value: v })}</NativeSelectOption>)}
         </NativeSelect>
       </div>
     </div>
@@ -766,45 +778,48 @@ function DictionaryEditor({ entity, field, entries, otherwise, values, onChange 
 }
 
 /** 源列的说明：类型与常见取值 */
-const columnLabel = (c: ReferenceColumn) => {
-  const top = c.top?.slice(0, 3).map(t => t.value).join('、');
-  return `${c.name}（${c.type}${top ? `，常见：${top}` : ''}）`;
+const columnLabel = (t: T, c: ReferenceColumn) => {
+  const top = c.top?.slice(0, 3).map(v => v.value).join(t('、'));
+  return `${c.name}（${c.type}${top ? t('，常见：{values}', { values: top }) : ''}）`;
 };
 
 /** 选源列；没有可对照的源表时手填列名 */
 function ColumnPicker({ label, table, value, onChange }: { label: string; table: ReferenceTable | null; value: string; onChange: (column: string) => void }) {
-  if (!table) return <Input className="h-7 w-48 font-mono" aria-label={label} placeholder="源列名" value={value} onChange={e => onChange(e.target.value)} />;
+  const t = useT();
+  if (!table) return <Input className="h-7 w-48 font-mono" aria-label={label} placeholder={t('源列名')} value={value} onChange={e => onChange(e.target.value)} />;
   const known = table.columns.some(c => c.name === value);
   return (
     <NativeSelect size="sm" aria-label={label} value={value} onChange={e => onChange(e.target.value)}>
-      <NativeSelectOption value="">选源列…</NativeSelectOption>
-      {value && !known && <NativeSelectOption value={value}>{`${value}（源表里没有这一列）`}</NativeSelectOption>}
-      {table.columns.map(c => <NativeSelectOption key={c.name} value={c.name}>{columnLabel(c)}</NativeSelectOption>)}
+      <NativeSelectOption value="">{t('选源列…')}</NativeSelectOption>
+      {value && !known && <NativeSelectOption value={value}>{t('{column}（源表里没有这一列）', { column: value })}</NativeSelectOption>}
+      {table.columns.map(c => <NativeSelectOption key={c.name} value={c.name}>{columnLabel(t, c)}</NativeSelectOption>)}
     </NativeSelect>
   );
 }
 
 /** 拼接的各段：源列或一段文本，按顺序拼起来 */
 function PartsEditor({ table, parts, onChange }: { table: ReferenceTable | null; parts: Part[]; onChange: (parts: Part[]) => void }) {
+  const t = useT();
   const set = (i: number, p: Part) => onChange(parts.map((q, j) => (j === i ? p : q)));
   return (
     <div className="flex flex-wrap items-center gap-2">
       {parts.map((p, i) => (
         <span key={i} className="flex items-center gap-1">
           {'column' in p
-            ? <ColumnPicker label={`第 ${i + 1} 段的源列`} table={table} value={p.column} onChange={column => set(i, { column })} />
-            : <Input className="h-7 w-28" aria-label={`第 ${i + 1} 段的文本`} placeholder="文本" value={p.text} onChange={e => set(i, { text: e.target.value })} />}
-          <Button type="button" size="xs" variant="ghost" aria-label={`去掉第 ${i + 1} 段`} onClick={() => onChange(parts.filter((_, j) => j !== i))}>×</Button>
+            ? <ColumnPicker label={t('第 {n} 段的源列', { n: i + 1 })} table={table} value={p.column} onChange={column => set(i, { column })} />
+            : <Input className="h-7 w-28" aria-label={t('第 {n} 段的文本', { n: i + 1 })} placeholder={t('文本')} value={p.text} onChange={e => set(i, { text: e.target.value })} />}
+          <Button type="button" size="xs" variant="ghost" aria-label={t('去掉第 {n} 段', { n: i + 1 })} onClick={() => onChange(parts.filter((_, j) => j !== i))}>×</Button>
         </span>
       ))}
-      <Button type="button" size="xs" variant="outline" onClick={() => onChange([...parts, { column: '' }])}>加一列</Button>
-      <Button type="button" size="xs" variant="outline" onClick={() => onChange([...parts, { text: '' }])}>加一段文本</Button>
+      <Button type="button" size="xs" variant="outline" onClick={() => onChange([...parts, { column: '' }])}>{t('加一列')}</Button>
+      <Button type="button" size="xs" variant="outline" onClick={() => onChange([...parts, { text: '' }])}>{t('加一段文本')}</Button>
     </div>
   );
 }
 
 /** 自定义表达式，旁边可把白名单函数插入到光标处 */
 function CustomExpression({ raw, functions, onChange }: { raw: string; functions: ReferenceFunction[]; onChange: (raw: string) => void }) {
+  const t = useT();
   const input = useRef<HTMLInputElement>(null);
   const insert = (name: string) => {
     const el = input.current;
@@ -819,10 +834,10 @@ function CustomExpression({ raw, functions, onChange }: { raw: string; functions
   };
   return (
     <>
-      <Input ref={input} className="h-7 w-80 font-mono" aria-label="自定义表达式" placeholder="如 coalesce(pay_amount, pay_fen / 100)" value={raw} onChange={e => onChange(e.target.value)} />
-      <NativeSelect size="sm" aria-label="插入函数" value="" onChange={e => e.target.value && insert(e.target.value)}>
-        <NativeSelectOption value="">插入函数…</NativeSelectOption>
-        {functions.map(f => <NativeSelectOption key={f.name} value={f.name}>{`${f.signature}：${f.label}`}</NativeSelectOption>)}
+      <Input ref={input} className="h-7 w-80 font-mono" aria-label={t('自定义表达式')} placeholder={t('如 coalesce(pay_amount, pay_fen / 100)')} value={raw} onChange={e => onChange(e.target.value)} />
+      <NativeSelect size="sm" aria-label={t('插入函数')} value="" onChange={e => e.target.value && insert(e.target.value)}>
+        <NativeSelectOption value="">{t('插入函数…')}</NativeSelectOption>
+        {functions.map(f => <NativeSelectOption key={f.name} value={f.name}>{t('{signature}：{label}', { signature: f.signature, label: f.label })}</NativeSelectOption>)}
       </NativeSelect>
     </>
   );
