@@ -18,12 +18,19 @@ import { StatusText, TASK_TONES } from '~/components/status-text';
 import { Badge } from '~/components/ui/badge';
 import { Button } from '~/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { builtinName } from '~/lib/builtin-names';
+import { useT, type T } from '~/lib/i18n';
 import { cn } from '~/lib/utils';
 
 /** 指标与标签快照的 template：<种类>:<键> */
 const DSL_TEMPLATE = /^(metric|tag):(.+)$/;
 
 const TYPE_LABELS = { template: '分析模板', metric: '指标', tag: '标签' } as const;
+
+/** 类型名与模板名都是平台内置名称：展示处按界面语言翻译（ADR-0060），存储与链接仍用原值。
+ *  写成字面量 t('…') 的对照表（照 api-keys 的 scopeLabel）才能与词典对账 */
+const typeLabel = (t: T, kind: keyof typeof TYPE_LABELS) =>
+  ({ template: t('分析模板'), metric: t('指标'), tag: t('标签') })[kind];
 
 /** 定义列表的状态筛选值与说明 */
 const STATUS_TABS = [
@@ -82,10 +89,13 @@ export async function loader({ request }: Route.LoaderArgs) {
     typeFilter,
     statusFilter,
     definitionFilter,
-    /** 快照表「按定义筛选」的选项：系统内置模板 + 本租户的定义（有定义查看权限才列定义） */
+    /**
+     * 快照表「按定义筛选」的选项：系统内置模板 + 本租户的定义（有定义查看权限才列定义）。
+     * 只返回原名（模板名 / 类型 + 定义键），选项文字在渲染处按界面语言翻译
+     */
     definitionOptions: [
-      ...Object.entries(TEMPLATES).map(([id, t]) => ({ value: id, label: `${t.label}（分析模板）` })),
-      ...all.map(d => ({ value: `${d.kind}:${d.key}`, label: `${TYPE_LABELS[d.kind]} ${d.key}` })),
+      ...Object.entries(TEMPLATES).map(([id, t]) => ({ value: id, kind: 'template' as const, name: t.label })),
+      ...all.map(d => ({ value: `${d.kind}:${d.key}`, kind: d.kind, key: d.key })),
     ],
     /** 本租户是否一个定义都没有（筛选后为空与没有任何定义的空状态不同） */
     hasAnyDefinitions: all.length > 0,
@@ -102,7 +112,7 @@ export async function loader({ request }: Route.LoaderArgs) {
         /** 最近一次计算：统计日、任务状态与其文案 */
         lastRun: lastRunWithLabel(d.lastRun),
       })),
-    /** 每个已登记模板的参数入口 */
+    /** 每个已登记模板的参数入口（名称是注册表常量，按钮文字在渲染处按界面语言翻译） */
     templates: Object.entries(TEMPLATES).map(([id, t]) => ({ id, label: t.label })),
     snapshots: snapshots.map(s => {
       const dsl = DSL_TEMPLATE.exec(s.template);
@@ -119,6 +129,7 @@ export async function loader({ request }: Route.LoaderArgs) {
         origin: dsl
           ? { builtIn: false as const, creator: byTemplate.get(s.template)?.creator ?? null }
           : { builtIn: true as const },
+        /** 模板名（或指标 / 标签的定义键，键不翻译）；模板名在渲染处按界面语言翻译 */
         templateLabel: dsl ? dsl[2]! : TEMPLATES[s.template as SnapshotTemplate]?.label ?? s.template,
         /** 指标与标签的快照链接到定义页，其余链接到快照页 */
         href: dsl ? `/analytics/definitions/${dsl[1]}/${dsl[2]}` : `/analytics/snapshots/${s.id}`,
@@ -143,6 +154,7 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
     email, nav, canReadDefinitions, canDraftDefinitions, retentionDays, templates, snapshots,
     typeFilter, statusFilter, definitionFilter, definitionOptions, hasAnyDefinitions, definitions,
   } = loaderData;
+  const t = useT();
   /** 筛选链接：改一组参数时保留另外两组 */
   const href = (over: { type?: string | null; status?: string | null; definition?: string | null }) => {
     const params = new URLSearchParams();
@@ -157,8 +169,8 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
       <PageHeader title="分析" description={`分析模板每次运行在结果层写下一份快照，只含 consumer_id 与分值，保留 ${retentionDays} 天。点开快照查看各人群与消费者明细。`}
         actions={(canReadDefinitions || canDraftDefinitions) && (
           <>
-            {canReadDefinitions && templates.map(t => (
-              <Button key={t.id} asChild variant="outline"><Link to={`/analytics/templates/${t.id}`}><SlidersHorizontal />{`${t.label} 模板参数`}</Link></Button>
+            {canReadDefinitions && templates.map(tpl => (
+              <Button key={tpl.id} asChild variant="outline"><Link to={`/analytics/templates/${tpl.id}`}><SlidersHorizontal />{t('{name} 模板参数', { name: builtinName(t, tpl.label) })}</Link></Button>
             ))}
             {canDraftDefinitions && <Button asChild variant="outline"><Link to="/analytics/definitions/new?kind=tag"><Plus />新建标签</Link></Button>}
             {canDraftDefinitions && <Button asChild><Link to="/analytics/definitions/new?kind=metric"><Plus />新建指标</Link></Button>}
@@ -175,7 +187,13 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
             <label htmlFor="snapshot-definition" className="text-slate-500">按定义筛选</label>
             <select id="snapshot-definition" name="definition" defaultValue={definitionFilter ?? ''} className="rounded-lg border bg-white px-2 py-1.5">
               <option value="">全部</option>
-              {definitionOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              {definitionOptions.map(o => (
+                <option key={o.value} value={o.value}>
+                  {o.kind === 'template'
+                    ? t('{name}（分析模板）', { name: builtinName(t, o.name) })
+                    : `${typeLabel(t, o.kind)} ${o.key}`}
+                </option>
+              ))}
             </select>
             <Button type="submit" variant="outline" size="sm">筛选</Button>
           </form>
@@ -197,12 +215,15 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {snapshots.map(s => (
+              {snapshots.map(s => {
+                // 模板快照的模板名按界面语言翻译；指标 / 标签的 templateLabel 是定义键，不翻
+                const templateName = s.kind === 'template' ? builtinName(t, s.templateLabel) : s.templateLabel;
+                return (
                 <TableRow key={s.id} data-snapshot={s.id} className={cn(s.expired && 'text-slate-400')}>
-                  <TableCell><Badge variant="secondary">{TYPE_LABELS[s.kind]}</Badge></TableCell>
+                  <TableCell><Badge variant="secondary">{typeLabel(t, s.kind)}</Badge></TableCell>
                   <TableCell className="text-slate-500">{s.origin.builtIn ? '系统内置' : selfBuilt(s.origin.creator)}</TableCell>
                   <TableCell>
-                    {s.expired ? s.templateLabel : <Link to={s.href} className="font-medium hover:underline">{s.templateLabel}</Link>}
+                    {s.expired ? templateName : <Link to={s.href} className="font-medium hover:underline">{templateName}</Link>}
                   </TableCell>
                   <TableCell>{s.asOf ?? '—'}</TableCell>
                   <TableCell data-definition-version>{s.definitionVersion ? `定义第 ${s.definitionVersion} 版` : '任务参数'}</TableCell>
@@ -218,7 +239,8 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
                         : <StatusText tone="ok" data-snapshot-status="available">可查看</StatusText>}
                   </TableCell>
                 </TableRow>
-              ))}
+                );
+              })}
             </TableBody>
           </Table>
         ) : (
@@ -269,7 +291,7 @@ export default function Analytics({ loaderData }: Route.ComponentProps) {
                     {definitions.map(d => (
                       <TableRow key={`${d.kind}:${d.key}`} data-definition-row={`${d.kind}:${d.key}`}>
                         <TableCell><Link to={`/analytics/definitions/${d.kind}/${d.key}`} className="font-medium hover:underline">{d.key}</Link></TableCell>
-                        <TableCell><Badge variant="secondary">{TYPE_LABELS[d.kind]}</Badge></TableCell>
+                        <TableCell><Badge variant="secondary">{typeLabel(t, d.kind)}</Badge></TableCell>
                         <TableCell className="text-slate-500">{selfBuilt(d.creator)}</TableCell>
                         <TableCell>{d.published ? `v${d.published}` : '未发布'}</TableCell>
                         <TableCell>{d.draft ? `有草稿 · ${d.draft.lastEditor}` : '—'}</TableCell>

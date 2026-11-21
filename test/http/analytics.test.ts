@@ -154,6 +154,46 @@ describe('分析页', () => {
   });
 });
 
+describe('分析页 · 双语（#1017）', () => {
+  beforeEach(fresh);
+
+  it('英文界面下快照页的模板名与 RFM 默认人群名是英文，data-segment 仍是中文原值；列表页的类型名、模板名与模板按钮是英文，人群编辑框仍是中文原名', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const { acme, snapshot } = await rfmSnapshot();
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const browser = await loginAs(app, 'analyst@acme.com');
+    browser.store('crm_locale=en; Path=/');
+    // 水合数据里的脚本会带中文原文（键就是中文），断言前先去掉脚本
+    const strip = (html: string) => html.replace(/<script[\s\S]*?<\/script>/g, '');
+
+    // 列表页：筛选下拉的模板选项、类型徽标、快照的模板列与「模板参数」按钮都是英文
+    const list = strip(await (await browser.get('/analytics')).text());
+    expect(list).toContain('RFM Segmentation (template)');
+    expect(list).toMatch(/data-snapshot="[^"]+"(?:(?!<\/tr>).)*>Template</s);
+    expect(list).toMatch(new RegExp(`href="/analytics/snapshots/${snapshot.id}"[^>]*>RFM Segmentation<`));
+    expect(list).toContain('RFM Segmentation template parameters');
+    expect(list).not.toContain('RFM 分层');
+
+    // 快照页：页头模板名与人群表的默认人群名是英文，data-segment 仍是中文原值
+    const page = strip(await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text());
+    expect(page).toContain('RFM Segmentation · 2024-07-01');
+    expect(page).toMatch(/data-segment="重要价值"(?:(?!<\/tr>).)*>Champions</s);
+    expect(page).toMatch(/data-segment="一般挽留"(?:(?!<\/tr>).)*>Hibernating</s);
+    expect(page).not.toMatch(/>重要价值</);
+
+    // 消费者明细：人群列是英文
+    const consumers = strip(await (await browser.get(`/analytics/snapshots/${snapshot.id}?tab=consumers`)).text());
+    expect(consumers).toMatch(/data-consumer="[^"]+"(?:(?!<\/tr>).)*>Champions</s);
+    expect(consumers).not.toContain('重要价值');
+
+    // 模板参数页：标题与页头的模板名是英文，人群编辑框的输入值仍是存储的中文原名（保存不会把英文写回库里）
+    const params = strip(await (await browser.get('/analytics/templates/rfm')).text());
+    expect(params).toContain('<title>RFM Segmentation template parameters · CRM Data Analytics Platform</title>');
+    expect(params).toContain('RFM Segmentation · Template parameters');
+    expect(params).toContain('value="重要价值"');
+  });
+});
+
 /** 指标定义的 YAML：在空租户上就能通过校验（不依赖已发布的登记与映射） */
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n';
 

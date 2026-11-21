@@ -15,7 +15,7 @@ import { navFor } from '~/.server/nav';
 import { PublishError, publishReason } from '~/.server/publishing';
 import { TEMPLATES, type ParamField } from '~/.server/pipeline/templates';
 import type { ColumnStat, ColumnType } from '~/.server/pipeline/templates/upgrade-summary';
-import type { RfmDefinition, ScoreRange, SegmentRule } from '~/.server/pipeline/templates/rfm';
+import { RFM_DEFAULTS, type RfmDefinition, type ScoreRange, type SegmentRule } from '~/.server/pipeline/templates/rfm';
 import { TaskError } from '~/.server/tasks';
 import {
   discardDraft, getTemplate, previewTemplateUpgrade, publishTemplate, recomputeTemplate, sampleTemplateUpgrade, saveDraft, templateDownstream,
@@ -23,6 +23,8 @@ import {
 } from '~/.server/templates';
 import { cmpName } from '~/lib/compare';
 import { entityOf } from '~/lib/canonical-model';
+import { builtinName } from '~/lib/builtin-names';
+import { makeT, useT } from '~/lib/i18n';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { PageHeader } from '~/components/page-header';
@@ -33,8 +35,12 @@ import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
-export function meta({ loaderData }: Route.MetaArgs) {
-  return [{ title: `${loaderData ? `${loaderData.label} 模板参数` : '模板参数'} · CRM 数据分析平台` }];
+export function meta({ loaderData, matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
+  const name = loaderData ? t('{name} 模板参数', { name: builtinName(t, loaderData.label) }) : t('模板参数');
+  return [{ title: `${name} · ${t('CRM 数据分析平台')}` }];
 }
 
 const ORDER_STATUSES = entityOf('order')!.fields.find(f => f.name === 'status')!.enum!;
@@ -70,6 +76,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     /** 草稿锁定的模板版本；没有草稿时为 null */
     draftTemplateVersion: t.draft?.templateVersion ?? null,
     label: t.label,
+    /** RFM 默认人群名：升级迁移矩阵判断「是不是默认名」的名单（默认名翻译、租户改名原样）；非 RFM 模板为 null */
+    defaultSegmentNames: t.template === 'rfm' ? RFM_DEFAULTS.segments.map(s => s.name) : null,
     /** 通用表单的各项；RFM 用专用表单，为 null */
     fields: t.template === 'rfm' ? null : [...fieldsOf(t.template)],
     /** 表单里的参数：有草稿时是草稿，否则是生效的参数 */
@@ -293,9 +301,10 @@ function ChangeList({ changes }: { changes: { version: number; changes: string }
  * 草稿已锁定新版本时说明发布后生效。预览结果：RFM 是一句话结论、分群对比与迁移矩阵，其他模板是一句话结论、按列统计对比与变化、新增、移出人数；
  * 有结果层查看权限的成员可以点格子 / 「换了取值」查看样例消费者（intent=preview-sample），预览还带「下游影响」一节
  */
-function UpgradeBanner({ latest, locked, changes, draft, canDraft, canSample, today, diff, downstream, sample, submitting }: {
+function UpgradeBanner({ latest, locked, changes, draft, canDraft, canSample, today, diff, downstream, sample, defaultSegmentNames, submitting }: {
   latest: number; locked: number; changes: { version: number; changes: string }[]; draft: { version: number; templateVersion: number | null } | null;
-  canDraft: boolean; canSample: boolean; today: string; diff: UpgradeDiff | null; downstream: Downstream | null; sample: UpgradeSample | null; submitting: boolean;
+  canDraft: boolean; canSample: boolean; today: string; diff: UpgradeDiff | null; downstream: Downstream | null; sample: UpgradeSample | null;
+  defaultSegmentNames: string[] | null; submitting: boolean;
 }) {
   const upgraded = draft !== null && draft.templateVersion === latest;
   return (
@@ -335,7 +344,7 @@ function UpgradeBanner({ latest, locked, changes, draft, canDraft, canSample, to
             </p>
           )}
           {diff.distribution?.kind === 'segments'
-            && <SegmentUpgradeDistribution from={diff.from} to={diff.to} asOf={diff.asOf} distribution={diff.distribution} canSample={canSample} sample={sample} />}
+            && <SegmentUpgradeDistribution from={diff.from} to={diff.to} asOf={diff.asOf} distribution={diff.distribution} canSample={canSample} sample={sample} defaultSegmentNames={defaultSegmentNames} />}
           {diff.distribution?.kind === 'columns'
             && <ColumnUpgradeDistribution from={diff.from} to={diff.to} asOf={diff.asOf} distribution={diff.distribution} canSample={canSample} sample={sample} />}
           {diff.metric && (
@@ -360,11 +369,15 @@ const count = (n: number) => n.toLocaleString('en-US');
 const countOrDash = (n: number | null) => (n === null ? '—' : count(n));
 
 /** RFM 升级预览的分群对比（每个分群的 v1 / v2 人数、变化与 v2 占比）与「原分群 × 新分群」迁移矩阵（含没变的人，对角线淡显；计数本身不出消费者 ID，ADR-0025）。
- *  有结果层查看权限的成员点非零的格子查看样例消费者（#830） */
-function SegmentUpgradeDistribution({ from, to, asOf, distribution, canSample, sample }: {
+ *  有结果层查看权限的成员点非零的格子查看样例消费者（#830）。人群名只翻显示文字：默认人群名按界面语言翻译，
+ *  排序（cmpSegment）、行 / 列键与表单提交的 before / after 仍是存储的原值 */
+function SegmentUpgradeDistribution({ from, to, asOf, distribution, canSample, sample, defaultSegmentNames }: {
   from: number; to: number; asOf: string; distribution: Extract<NonNullable<UpgradeDiff['distribution']>, { kind: 'segments' }>;
-  canSample: boolean; sample: UpgradeSample | null;
+  canSample: boolean; sample: UpgradeSample | null; defaultSegmentNames: string[] | null;
 }) {
+  const t = useT();
+  /** null（新增或移出）显示「（无）」 */
+  const disp = (s: string | null) => (s === null ? t('（无）') : builtinName(t, s, new Set(defaultSegmentNames ?? [])));
   const names = (side: 'before' | 'after') => [...new Set(distribution[side].map(s => s.segment))];
   // 对比表的行是 v1 / v2 分群名的并集（只有一边有的分群另一边人数为 0）；矩阵行是原分群、列是新分群，迁移里出现的「（无）」（新增或移出）也各占一行/列
   const compareRows = [...new Set([...names('before'), ...names('after')])].sort(cmpSegment);
@@ -394,7 +407,7 @@ function SegmentUpgradeDistribution({ from, to, asOf, distribution, canSample, s
             const delta = v2 - v1;
             return (
               <TableRow key={s ?? '（无）'}>
-                <TableCell>{s ?? '（无）'}</TableCell>
+                <TableCell>{disp(s)}</TableCell>
                 <TableCell>{count(v1)}</TableCell>
                 <TableCell>{count(v2)}</TableCell>
                 <TableCell>{delta >= 0 ? `+${count(delta)}` : count(delta)}</TableCell>
@@ -409,13 +422,13 @@ function SegmentUpgradeDistribution({ from, to, asOf, distribution, canSample, s
         <TableHeader>
           <TableRow>
             <TableHead>原分群 ＼ 新分群</TableHead>
-            {columns.map(a => <TableHead key={a ?? '（无）'}>{a ?? '（无）'}</TableHead>)}
+            {columns.map(a => <TableHead key={a ?? '（无）'}>{disp(a)}</TableHead>)}
           </TableRow>
         </TableHeader>
         <TableBody>
           {matrixRows.map(b => (
             <TableRow key={b ?? '（无）'}>
-              <TableCell>{b ?? '（无）'}</TableCell>
+              <TableCell>{disp(b)}</TableCell>
               {columns.map(a => {
                 const n = moved(b, a);
                 const isPicked = picked !== null && picked.before === b && picked.after === a;
@@ -430,7 +443,7 @@ function SegmentUpgradeDistribution({ from, to, asOf, distribution, canSample, s
                         <button
                           type="submit"
                           data-sample-cell={`${b ?? ''}→${a ?? ''}`}
-                          aria-label={`查看 ${b ?? '（无）'} → ${a ?? '（无）'} 的样例消费者`}
+                          aria-label={t('查看 {before} → {after} 的样例消费者', { before: disp(b), after: disp(a) })}
                           className={`underline decoration-dotted underline-offset-2 hover:text-slate-900 ${isPicked ? 'font-medium text-slate-900' : ''}`}
                         >{count(n)}</button>
                       </Form>
@@ -674,14 +687,15 @@ function ParamsForm({ params, canDraft, submitting }: { params: RfmDefinition; c
 export default function TemplateParams({ loaderData, actionData }: Route.ComponentProps) {
   const {
     email, nav, canDraft, recomputeDenied, today, justPublished, justRecomputed, justUpgraded, upgradeAvailable, latestTemplateVersion, lockedTemplateVersion,
-    upgradeChanges, draftTemplateVersion, label, fields, form, published, versions, canSample,
+    upgradeChanges, draftTemplateVersion, label, defaultSegmentNames, fields, form, published, versions, canSample,
   } = loaderData;
+  const t = useT();
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
-        title={`${label} · 模板参数`}
+        title={`${builtinName(t, label)} · ${t('模板参数')}`}
         description={<><Link to="/analytics" className="hover:underline">← 分析</Link>{`　当前生效：${published ? `第 ${published} 版` : '默认参数'}`}</>}
       />
 
@@ -716,7 +730,7 @@ export default function TemplateParams({ loaderData, actionData }: Route.Compone
           latest={latestTemplateVersion} locked={lockedTemplateVersion} changes={upgradeChanges}
           draft={draft ? { version: draft.version, templateVersion: draftTemplateVersion } : null}
           canDraft={canDraft} canSample={canSample} today={today} diff={actionData?.upgradeDiff ?? null}
-          downstream={actionData?.downstream ?? null} sample={actionData?.sample ?? null} submitting={submitting}
+          downstream={actionData?.downstream ?? null} sample={actionData?.sample ?? null} defaultSegmentNames={defaultSegmentNames} submitting={submitting}
         />
       )}
 
