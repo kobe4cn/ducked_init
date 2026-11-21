@@ -12,6 +12,7 @@ import { Field, FieldDescription, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
 import { structureChanged, uploadOptionsJson } from '~/lib/upload-preview-options';
+import { useT } from '~/lib/i18n';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
 /** 与服务端的 UPLOAD_TABLE 一致（app/.server/uploads.ts）：表名拼进文件路径，客户端先挡一道 */
@@ -24,6 +25,7 @@ const COLUMN_TYPES = ['VARCHAR', 'BIGINT', 'DOUBLE', 'BOOLEAN', 'DATE', 'TIMESTA
 interface PreviewActionData { preview?: UploadPreviewData; previewError?: string; error?: string | null }
 
 export function UploadPreview() {
+  const t = useT();
   const fetcher = useFetcher<PreviewActionData>();
   const [result, setResult] = useState<UploadPreviewData | null>(null);
   const [encoding, setEncoding] = useState<'utf-8' | 'gbk'>('utf-8');
@@ -95,17 +97,17 @@ export function UploadPreview() {
       <input type="hidden" name="options" value={optionsJson} />
       <div className="flex items-center gap-3">
         <Button ref={buttonRef} type="button" variant="outline" onClick={e => preview(e.currentTarget)} disabled={busy || !tableOk}>
-          <Eye data-preview-button />{result && (structuralChanged || typeChanged) ? '重新预览' : '预览'}
+          <Eye data-preview-button />{result && (structuralChanged || typeChanged) ? t('重新预览') : t('预览')}
         </Button>
-        {!tableOk && <span className="text-sm text-slate-400">先填表名</span>}
-        {busy && <span className="text-sm text-slate-500">正在读取…</span>}
+        {!tableOk && <span className="text-sm text-slate-400">{t('先填表名')}</span>}
+        {busy && <span className="text-sm text-slate-500">{t('正在读取…')}</span>}
       </div>
-      <FieldDescription>预览不保存文件；确认登记时按这里确认的选项读取。</FieldDescription>
+      <FieldDescription>{t('预览不保存文件；确认登记时按这里确认的选项读取。')}</FieldDescription>
 
       {previewError && (
         <Alert variant="destructive" role="alert" className="mt-4" data-preview-error>
           <CircleAlert />
-          <AlertTitle>预览失败</AlertTitle>
+          <AlertTitle>{t('预览失败')}</AlertTitle>
           <AlertDescription>{previewError}</AlertDescription>
         </Alert>
       )}
@@ -114,41 +116,41 @@ export function UploadPreview() {
         <>
           <div className="mt-4 grid grid-cols-2 gap-4 lg:grid-cols-5">
             <Field>
-              <FieldLabel htmlFor="preview-encoding">编码</FieldLabel>
+              <FieldLabel htmlFor="preview-encoding">{t('编码')}</FieldLabel>
               <NativeSelect id="preview-encoding" value={encoding} onChange={e => changeStructure({ encoding: e.target.value as 'utf-8' | 'gbk' })}>
                 <NativeSelectOption value="utf-8">UTF-8</NativeSelectOption>
                 <NativeSelectOption value="gbk">GBK</NativeSelectOption>
               </NativeSelect>
             </Field>
             <Field>
-              <FieldLabel htmlFor="preview-delim">分隔符</FieldLabel>
+              <FieldLabel htmlFor="preview-delim">{t('分隔符')}</FieldLabel>
               <NativeSelect id="preview-delim" value={delim} onChange={e => changeStructure({ delim: e.target.value })}>
                 {DELIMS.map(d => <NativeSelectOption key={d} value={d}>{d === '\t' ? 'Tab' : d}</NativeSelectOption>)}
               </NativeSelect>
             </Field>
             <Field orientation="horizontal" className="mt-7">
               <input type="checkbox" id="preview-header" className="size-4" checked={header} onChange={e => changeStructure({ header: e.target.checked })} />
-              <FieldLabel htmlFor="preview-header">第一行是表头</FieldLabel>
+              <FieldLabel htmlFor="preview-header">{t('第一行是表头')}</FieldLabel>
             </Field>
             <Field>
-              <FieldLabel htmlFor="preview-skip">表头前跳过的行数</FieldLabel>
+              <FieldLabel htmlFor="preview-skip">{t('表头前跳过的行数')}</FieldLabel>
               <Input id="preview-skip" type="number" min={0} max={1000} value={skip} onChange={e => changeStructure({ skip: e.target.value })} />
             </Field>
           </div>
 
           <div className="mt-4">
-            <div className="mb-2 text-sm font-medium">列类型</div>
+            <div className="mb-2 text-sm font-medium">{t('列类型')}</div>
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
               {result.columns.map(c => (
                 <div key={c.name} className="grid grid-cols-[1fr_10rem] items-center gap-2">
                   <span className="truncate font-mono text-xs" title={c.name}>{c.name}</span>
                   <NativeSelect
-                    aria-label={`${c.name} 的类型`}
+                    aria-label={t('{name} 的类型', { name: c.name })}
                     value={types[c.name] ?? c.type}
                     onChange={e => setTypes({ ...types, [c.name]: e.target.value })}
                   >
-                    {(COLUMN_TYPES.includes(c.type) ? COLUMN_TYPES : [...COLUMN_TYPES, c.type]).map(t => (
-                      <NativeSelectOption key={t} value={t}>{t}</NativeSelectOption>
+                    {(COLUMN_TYPES.includes(c.type) ? COLUMN_TYPES : [...COLUMN_TYPES, c.type]).map(ty => (
+                      <NativeSelectOption key={ty} value={ty}>{ty}</NativeSelectOption>
                     ))}
                   </NativeSelect>
                 </div>
@@ -157,7 +159,7 @@ export function UploadPreview() {
           </div>
 
           <div className="mt-4">
-            <div className="mb-2 text-sm font-medium">前 {result.rows.length} 行（最多 20 行）</div>
+            <div className="mb-2 text-sm font-medium">{t('前 {rows, plural, other {# 行}}（最多 20 行）', { rows: result.rows.length })}</div>
             <div className="overflow-x-auto rounded-2xl border">
               <Table>
                 <TableHeader>
@@ -168,7 +170,7 @@ export function UploadPreview() {
                 <TableBody>
                   {result.rows.map((row, i) => (
                     <TableRow key={i}>
-                      {row.map((v, j) => <TableCell key={j} className="whitespace-nowrap font-mono text-xs">{v ?? <span className="text-slate-300">空</span>}</TableCell>)}
+                      {row.map((v, j) => <TableCell key={j} className="whitespace-nowrap font-mono text-xs">{v ?? <span className="text-slate-300">{t('空')}</span>}</TableCell>)}
                     </TableRow>
                   ))}
                 </TableBody>

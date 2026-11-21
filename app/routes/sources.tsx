@@ -7,7 +7,7 @@ import type { Route } from './+types/sources';
 import { can, requirePermission } from '~/.server/access';
 import { navFor } from '~/.server/nav';
 import type { CurrentMember } from '~/.server/auth';
-import { errorText, errorTextFor } from '~/.server/i18n';
+import { errorText, errorTextFor, formatServer } from '~/.server/i18n';
 import { getLocale } from '~/.server/locale';
 import { listSources, registerSource, SourceError } from '~/.server/sources';
 import { parseUploadOptions, type SourceInput } from '~/.server/source-config';
@@ -16,7 +16,9 @@ import { csvFieldCount, decodeUpload, previewUpload, removeUpload, storeUpload, 
 import { verifyDifferences } from '~/.server/source-verify';
 import { storageOverQuota } from '~/.server/storage-quota';
 import { uploadLimitOf } from '~/.server/tenants';
-import type { Locale } from '~/lib/i18n';
+import { makeT, msg, useLocale, useT, type Locale } from '~/lib/i18n';
+import { builtinName, ENUM_LABELS } from '~/lib/builtin-names';
+import { formatDate } from '~/lib/format';
 import { formValues, SOURCE_KIND_LABELS, SOURCE_KINDS, targetOf, type SourceKind } from '~/lib/sources';
 import { cn } from '~/lib/utils';
 import { AppShell } from '~/components/app-shell';
@@ -33,8 +35,11 @@ import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
 
-export function meta({}: Route.MetaArgs) {
-  return [{ title: '数据源 · CRM 数据分析平台' }];
+export function meta({ matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
+  return [{ title: `${t('数据源')} · ${t('CRM 数据分析平台')}` }];
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -57,10 +62,10 @@ export async function action({ request }: Route.ActionArgs) {
   const member = await requirePermission(request, 'sources:write');
   const mb = await uploadLimitOf(member.tenant.id);
   const form = await readLimitedForm(request, mb * 1024 * 1024);
-  if (!form) return data({ error: `文件超过本租户上传上限 ${mb} MiB`, values: {} }, { status: 413 });
+  if (!form) return data({ error: formatServer(await getLocale(request), msg('文件超过本租户上传上限 {mb} MiB', { mb })), values: {} }, { status: 413 });
   // 上传前预览（ADR-0037）：受同样的上传大小上限约束，但不走存储配额检查（不写湖）
   if (form.get('intent') === 'preview') return previewUploadAction(form, await getLocale(request));
-  if (form.get('intent') !== 'register') return data({ error: '未知操作', values: {} }, { status: 400 });
+  if (form.get('intent') !== 'register') return data({ error: formatServer(await getLocale(request), msg('未知操作')), values: {} }, { status: 400 });
   // 先剔出文件：File 经 String() 会变成 "[object File]"
   const file = form.get('file');
   const input = Object.fromEntries([...form].filter(([k]) => k !== 'file').map(([k, v]) => [k, String(v)]));
@@ -180,6 +185,8 @@ async function registerUpload(member: CurrentMember, input: SourceInput, file: F
 
 export default function Sources({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, canWrite, sources } = loaderData;
+  const t = useT();
+  const locale = useLocale();
   const values: Record<string, string> = actionData?.values ?? {};
   const [kind, setKind] = useState<SourceKind>((SOURCE_KINDS as readonly string[]).includes(values.kind) ? (values.kind as SourceKind) : 'postgres');
   const submitting = useNavigation().state === 'submitting';
@@ -189,16 +196,16 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
   const consistent = cards.filter(s => s.state === 'ok').length;
   return (
     <AppShell email={email} nav={nav}>
-      <PageHeader title="数据源" description="本租户登记的外部只读连接。平台永不写入数据源；凭据加密保存，任何页面都不显示。" />
+      <PageHeader title={t('数据源')} description={t('本租户登记的外部只读连接。平台永不写入数据源；凭据加密保存，任何页面都不显示。')} />
 
       <div className="grid grid-cols-3 gap-4">
-        <StatTile label="数据源数" value={sources.length} hint={`${kinds} 种类型`} />
-        <StatTile label="核对一致" value={consistent} hint="最近一次核对" tone={consistent ? 'text-emerald-600' : undefined} />
-        <StatTile label="需要处理" value={needsAttention} hint="核对有差异的数据源" tone={needsAttention ? 'text-red-600' : undefined} />
+        <StatTile label={t('数据源数')} value={sources.length} hint={t('{kinds, plural, other {# 种类型}}', { kinds })} />
+        <StatTile label={t('核对一致')} value={consistent} hint={t('最近一次核对')} tone={consistent ? 'text-emerald-600' : undefined} />
+        <StatTile label={t('需要处理')} value={needsAttention} hint={t('核对有差异的数据源')} tone={needsAttention ? 'text-red-600' : undefined} />
       </div>
 
       {!sources.length && !canWrite && (
-        <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">还没有数据源。数据工程师或管理员登记后会出现在这里。</div>
+        <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">{t('还没有数据源。数据工程师或管理员登记后会出现在这里。')}</div>
       )}
 
       <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
@@ -211,13 +218,13 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
           >
             <div className="flex items-start justify-between">
               <KindIcon kind={s.kind} />
-              <Badge variant="outline" className="rounded-full">{SOURCE_KIND_LABELS[s.kind]}</Badge>
+              <Badge variant="outline" className="rounded-full">{builtinName(t, SOURCE_KIND_LABELS[s.kind], ENUM_LABELS)}</Badge>
             </div>
             <div className="mt-4 text-lg font-medium">{s.name}</div>
             <div className="mt-1 truncate font-mono text-xs text-slate-400">{s.target}</div>
             <div className="mt-4 flex items-center justify-between border-t pt-3">
               <VerifyBadge differences={s.differences} />
-              <span className="text-xs text-slate-400">{`登记于 ${new Date(s.createdAt).toLocaleDateString('zh-CN')}`}</span>
+              <span className="text-xs text-slate-400">{t('登记于 {date}', { date: formatDate(locale, s.createdAt) })}</span>
             </div>
           </Link>
         ))}
@@ -227,18 +234,18 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
           <details open={!sources.length || Boolean(actionData?.error)} className="group rounded-2xl border-2 border-dashed open:col-span-full open:border open:border-solid open:bg-white open:p-6 open:shadow-sm">
             <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden">
               <span className="grid min-h-48 place-items-center text-slate-400 hover:text-slate-600 group-open:hidden">
-                <span className="flex flex-col items-center gap-2"><Plus className="size-6" />登记新的数据源</span>
+                <span className="flex flex-col items-center gap-2"><Plus className="size-6" />{t('登记新的数据源')}</span>
               </span>
               <span className="hidden items-center justify-between gap-6 group-open:flex">
-                <h2 className="text-lg font-semibold">登记数据源</h2>
+                <h2 className="text-lg font-semibold">{t('登记数据源')}</h2>
                 <X aria-hidden className="size-4 text-slate-400" />
               </span>
             </summary>
-            <p className="mt-1 mb-5 max-w-2xl text-sm text-slate-500">登记前平台会连接数据源并探测账号的写权限，可写的账号会被拒绝。登记后列出表（不读取数据），在数据源页选定要同步的表，平台只采集与同步选中的表。</p>
+            <p className="mt-1 mb-5 max-w-2xl text-sm text-slate-500">{t('登记前平台会连接数据源并探测账号的写权限，可写的账号会被拒绝。登记后列出表（不读取数据），在数据源页选定要同步的表，平台只采集与同步选中的表。')}</p>
             {actionData?.error && (
               <Alert variant="destructive" role="alert" className="mb-5 max-w-2xl">
                 <CircleAlert />
-                <AlertTitle>未能登记</AlertTitle>
+                <AlertTitle>{t('未能登记')}</AlertTitle>
                 <AlertDescription>{actionData.error}</AlertDescription>
               </Alert>
             )}
@@ -247,13 +254,13 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
               <FieldGroup>
                 <div className="grid grid-cols-2 gap-4">
                   <Field>
-                    <FieldLabel htmlFor="source-name">名称</FieldLabel>
-                    <Input id="source-name" name="name" required defaultValue={values.name ?? ''} placeholder="如：电商主库" />
+                    <FieldLabel htmlFor="source-name">{t('名称')}</FieldLabel>
+                    <Input id="source-name" name="name" required defaultValue={values.name ?? ''} placeholder={t('如：电商主库')} />
                   </Field>
                   <Field>
-                    <FieldLabel htmlFor="source-kind">类型</FieldLabel>
+                    <FieldLabel htmlFor="source-kind">{t('类型')}</FieldLabel>
                     <NativeSelect id="source-kind" name="kind" value={kind} onChange={e => setKind(e.target.value as SourceKind)}>
-                      {SOURCE_KINDS.map(k => <NativeSelectOption key={k} value={k}>{SOURCE_KIND_LABELS[k]}</NativeSelectOption>)}
+                      {SOURCE_KINDS.map(k => <NativeSelectOption key={k} value={k}>{builtinName(t, SOURCE_KIND_LABELS[k], ENUM_LABELS)}</NativeSelectOption>)}
                     </NativeSelect>
                   </Field>
                 </div>
@@ -261,7 +268,7 @@ export default function Sources({ loaderData, actionData }: Route.ComponentProps
                 {/* 不能再给 key={kind}：与上面的 SourceFields 同 key，React 会报 duplicate key */}
                 {kind === 'upload' && <UploadPreview />}
                 <div>
-                  <Button type="submit" disabled={submitting}>{submitting ? '正在校验…' : '校验并登记'}</Button>
+                  <Button type="submit" disabled={submitting}>{submitting ? t('正在校验…') : t('校验并登记')}</Button>
                 </div>
               </FieldGroup>
             </Form>

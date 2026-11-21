@@ -137,7 +137,6 @@
     "app/components/relation-suggestions-card.tsx": 5,
     "app/components/tag-builder.tsx": 35,
     "app/components/tenant-status.tsx": 1,
-    "app/components/upload-preview.tsx": 13,
     "app/lib/api-docs.ts": 58,
     "app/lib/canonical-model.ts": 116,
     "app/lib/fallback.ts": 2,
@@ -200,9 +199,8 @@
     "app/routes/pii.reveal.tsx": 17,
     "app/routes/quality.tsx": 49,
     "app/routes/settings.tsx": 29,
-    "app/routes/source-view.tsx": 27,
     "app/routes/source.tsx": 180,
-    "app/routes/sources.tsx": 21,
+    "app/routes/sources.tsx": 4,
     "app/routes/tasks.tsx": 21,
     "app/routes/workbench.tsx": 64
   }
