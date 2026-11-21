@@ -198,7 +198,7 @@ describe('界面语言：顶栏与导航整块翻译（#1012）', () => {
     }
   });
 
-  it('中文界面下顶栏与导航仍是中文（词典已下发也回退原文，输出与改造前一致）', async () => {
+  it('中文界面下顶栏与导航仍是中文（不下发词典、按原文回退，输出与改造前一致）', async () => {
     await createTenant('acme', '示例商贸', 'admin@acme.com');
     const browser = await loginAs(app, 'admin@acme.com');
     browser.store('crm_locale=zh-CN; Path=/');
