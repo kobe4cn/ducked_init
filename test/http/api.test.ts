@@ -178,7 +178,7 @@ describe('API Key 页', () => {
     const tooLong = await admin.post('/api-keys', { intent: 'create', name: 'x'.repeat(101), scope: ['catalog'] });
     expect(tooLong.status).toBe(400);
     const enLong = alertError(await tooLong.text());
-    expect(enLong).toContain('Names cannot exceed 100 characters.');
+    expect(enLong).toContain('Names cannot exceed 100 characters');
     expect(enLong).not.toMatch(/\p{Script=Han}/u);
 
     // 吊销不存在的 Key：404 的报错也是英文
