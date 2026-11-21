@@ -27,6 +27,7 @@ import { expand } from '~/.server/catalog';
 import { noteKey } from '~/lib/business-note-key';
 import { allRelations, publishedCustomEntities, type RegisteredEntity } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
+import { errorTextFor } from '~/.server/i18n';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
 import { getInspectStatus, InspectError, inspectLakeNow } from '~/.server/lake-inspect';
 import { MappingError, publishedPlans } from '~/.server/mappings';
@@ -285,13 +286,13 @@ export async function action({ request }: Route.ActionArgs) {
         return data({ error: '未知操作', intent }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof InspectError || e instanceof MappingError || e instanceof MergeError) return data({ error: e.message, intent }, { status: 400 });
+    if (e instanceof InspectError || e instanceof MappingError || e instanceof MergeError) return data({ error: await errorTextFor(request, e), intent }, { status: 400 });
     if (e instanceof BusinessNoteError) {
       // 保存失败的说明按 noteKey 定位，编辑框里留着提交的内容
       const key = noteKey(String(form.get('entity') ?? ''), String(form.get('field') ?? ''), mappingId);
-      return data({ error: e.message, intent, key, note: String(form.get('note') ?? '') }, { status: 400 });
+      return data({ error: await errorTextFor(request, e), intent, key, note: String(form.get('note') ?? '') }, { status: 400 });
     }
-    if (e instanceof TaskError) return data({ error: e.message, intent }, { status: e.status });
+    if (e instanceof TaskError) return data({ error: await errorTextFor(request, e), intent }, { status: e.status });
     throw e;
   }
   throw redirect('/lineage');

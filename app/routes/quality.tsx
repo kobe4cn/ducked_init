@@ -7,6 +7,7 @@ import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { data, Form, Link, useNavigation } from 'react-router';
 import type { Route } from './+types/quality';
 import { can, requirePermission } from '~/.server/access';
+import { errorTextFor } from '~/.server/i18n';
 import { excludeValue, ExclusionError, includeValue, listExcludedValues } from '~/.server/identity-exclusions';
 import { latestIdentitySummary } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
@@ -86,7 +87,7 @@ export async function action({ request }: Route.ActionArgs) {
         return data({ error: '未知操作', notice: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof ExclusionError) return data({ error: e.message, notice: null }, { status: e.status });
+    if (e instanceof ExclusionError) return data({ error: await errorTextFor(request, e), notice: null }, { status: e.status });
     throw e;
   }
 }
