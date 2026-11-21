@@ -165,6 +165,11 @@ fields:
     expect(dict).toContain('Apply suggested mappings for 2 source values');
     expect(dict).toContain('Map other values to null');
 
+    // 源列标签是整句译文（英文括号），不是中文括号拼英文；去掉数据后没有全角括号
+    const unused = stripData(renderEn(YAML, dictTable));
+    expect(unused).toMatch(/data-unused-column="status"[^>]*><input[^>]*\/><span class="font-mono">status \(text, common: paid, pending, refund\)<\/span>/);
+    expect(unused).not.toContain('（');
+
     const error = stripData(renderEn(YAML, table, [{ line: 6, col: 9, path: 'table', message: '源表 orders 中没有字段 nope' }]));
     expect(error).not.toMatch(/[一-鿿]/);
     expect(error).toContain('Issues found by live validation');

@@ -780,7 +780,7 @@ function DictionaryEditor({ entity, field, entries, otherwise, values, onChange 
 /** 源列的说明：类型与常见取值 */
 const columnLabel = (t: T, c: ReferenceColumn) => {
   const top = c.top?.slice(0, 3).map(v => v.value).join(t('、'));
-  return `${c.name}（${c.type}${top ? t('，常见：{values}', { values: top }) : ''}）`;
+  return top ? t('{name}（{type}，常见：{values}）', { name: c.name, type: c.type, values: top }) : t('{name}（{type}）', { name: c.name, type: c.type });
 };
 
 /** 选源列；没有可对照的源表时手填列名 */
