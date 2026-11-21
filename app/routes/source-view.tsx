@@ -7,6 +7,7 @@ import { AlertTriangle, CircleAlert, Eye } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/source-view';
 import { can, requirePermission } from '~/.server/access';
+import { errorTextFor } from '~/.server/i18n';
 import { navFor } from '~/.server/nav';
 import { PublishError, publishReason } from '~/.server/publishing';
 import type { ViewPreview } from '~/.server/pipeline/source-view-engine';
@@ -50,7 +51,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         preview = { version: previewVersion, result: await previewSourceView(member, params.sourceId, params.viewId, previewVersion), error: null };
       } catch (e) {
         if (!(e instanceof PublishError)) throw e;
-        preview = { version: previewVersion, result: null, error: e.message };
+        preview = { version: previewVersion, result: null, error: await errorTextFor(request, e) };
       }
     }
     return {
@@ -101,7 +102,7 @@ export async function action({ request, params }: Route.ActionArgs) {
         return data({ error: '未知操作', sql: null, name: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof PublishError) return data({ error: e.message, sql: field('sql') || null, name: field('name') || null }, { status: e.status });
+    if (e instanceof PublishError) return data({ error: await errorTextFor(request, e), sql: field('sql') || null, name: field('name') || null }, { status: e.status });
     throw e;
   }
   const tab = tabOf(request);
