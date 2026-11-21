@@ -360,5 +360,18 @@
   "新主题名": "New subject name",
   "新建并加入": "Create and add",
   "成员写的知识": "Knowledge from members",
-  "发布后才能添加业务知识": "Business knowledge can be added once the definition is published"
+  "发布后才能添加业务知识": "Business knowledge can be added once the definition is published",
+  "已发布关系": "Published relations",
+  "孤儿：起点有值、在终点主键里找不到的行。": "Orphan rows: rows that have a value at the source but are missing from the target primary key.",
+  "统计于最近一次合并（{at}）。": " Stats are from the latest merge ({at}).",
+  "敏感字段在标准层里是哈希，不给样例键。": " Sensitive fields are hashed in the Silver layer, so no sample keys are shown.",
+  "统计失败：{error}": "Stats failed: {error}",
+  "孤儿 {percent}（{orphans} / {withValue} 行）": "Orphan rows {percent} ({orphans, plural, other {#}} / {withValue, plural, one {# row} other {# rows}})",
+  "样例键：": "Sample keys: ",
+  "尚未合并": "Not merged yet",
+  "统一消费者 {groups} · 记录 {records}": "Unified consumers {groups} · records {records}",
+  "重置布局": "Reset layout",
+  "{n} 张源表，点击展开": "{n, plural, one {# source table, click to expand} other {# source tables, click to expand}}",
+  "源视图": "Source View",
+  "{rows, plural, other {# 行}} · {mappings, plural, other {# 个映射}}": "{rows, plural, one {# row} other {# rows}} · {mappings, plural, one {# mapping} other {# mappings}}"
 }

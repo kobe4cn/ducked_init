@@ -11,6 +11,8 @@ import '@xyflow/react/dist/style.css';
 import { DRIFT_NODE_STYLE, DriftBadge } from '~/components/drift-badge';
 import { KindIcon } from '~/components/kind-icon';
 import { EDGE_COLOR } from '~/components/lineage-graph';
+import { formatDateTime, formatNumber } from '~/lib/format';
+import { type Locale, useLocale, type T, useT } from '~/lib/i18n';
 import { driftAttrs, type DriftByTable } from '~/lib/lineage-drift';
 import { defaultCollapsed, type FlowData, type FlowInput, flowGraph, type FlowStatus, groupId, MERGE_STATUS } from '~/lib/lineage-flow';
 import { identityChangesLabel, ruleLabels } from '~/lib/lineage-graph';
@@ -29,13 +31,14 @@ const FAILED: React.CSSProperties = { background: '#fef2f2', borderColor: '#fca5
 /** 变淡：悬停时与它无关的连线、反向查时没命中的节点与连线 */
 export const FADED = 0.15;
 
-const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
+const time = (locale: Locale, iso: string | null) => (iso ? formatDateTime(locale, iso) : '—');
 
 const STATUS_ICON: Record<FlowStatus, typeof CheckCircle2> = { ok: CheckCircle2, skipped: Clock, failed: AlertTriangle, never: CircleDashed };
 const STATUS_TONE: Record<FlowStatus, string> = { ok: 'text-emerald-600', skipped: 'text-amber-600', failed: 'text-red-600', never: 'text-slate-500' };
 
 /** 映射最近一次合并的结果：图标、文字与时间；失败的链到该映射的合并记录。small 用在图节点里 */
 export function MergeStatus({ status, at, mappingId, small }: { status: FlowStatus; at: string | null; mappingId: string; small?: boolean }) {
+  const locale = useLocale();
   const Icon = STATUS_ICON[status];
   const label = status === 'failed'
     ? <Link to={`/mappings/${mappingId}?tab=merges`} className="nodrag underline-offset-2 hover:underline">{MERGE_STATUS.failed}</Link>
@@ -44,7 +47,7 @@ export function MergeStatus({ status, at, mappingId, small }: { status: FlowStat
     <span className={`inline-flex items-center gap-1 ${small ? 'text-[10px]' : 'text-sm'} ${STATUS_TONE[status]}`}>
       <Icon className={`${small ? 'size-3' : 'size-4'} shrink-0`} />
       {label}
-      {at && <span className="text-slate-500">{` · ${time(at)}`}</span>}
+      {at && <span className="text-slate-500">{` · ${time(locale, at)}`}</span>}
     </span>
   );
 }
@@ -57,19 +60,21 @@ const NODE_TYPES = { flowGroup: GroupNode };
 
 const small = (text: React.ReactNode, className = 'text-slate-500') => <div className={`text-[10px] ${className}`}>{text}</div>;
 
-function nodeLabel(d: FlowData, tableCount: Record<string, number>, drift: DriftByTable): React.ReactNode {
+/** 节点的显示；t 与 locale 由 FlowGraphView 传入（导出供测试单独渲染）。行数与映射数在中文侧也走 plural 的 #，
+ *  让 ICU 按语言出千分位，与原来的 toLocaleString('zh-CN') 逐字一致（英文侧随之得到 one / other 与英文分组） */
+export function nodeLabel(d: FlowData, tableCount: Record<string, number>, drift: DriftByTable, t: T, locale: Locale): React.ReactNode {
   switch (d.kind) {
     case 'source':
       return d.collapsed
         ? (
           <div className="flex items-center gap-2 leading-tight">
             <KindIcon kind={d.sourceKind as SourceKind} small />
-            <div className="text-left"><div>{d.label} ▸</div>{small(`${tableCount[d.sourceId]} 张源表，点击展开`)}</div>
+            <div className="text-left"><div>{d.label} ▸</div>{small(t('{n} 张源表，点击展开', { n: tableCount[d.sourceId] }))}</div>
           </div>
         )
         : <span className="flex items-center gap-2"><KindIcon kind={d.sourceKind as SourceKind} small />{`${d.label} ▾`}</span>;
     case 'table':
-      return d.viaView ? <div className="leading-tight"><div>{d.label}</div>{small('源视图')}</div> : d.label;
+      return d.viaView ? <div className="leading-tight"><div>{d.label}</div>{small(t('源视图'))}</div> : d.label;
     case 'mapping':
       return (
         <div className="leading-tight">
@@ -81,7 +86,7 @@ function nodeLabel(d: FlowData, tableCount: Record<string, number>, drift: Drift
       return (
         <div className="leading-tight">
           <div>{d.label}</div>
-          {small(`${d.rows.toLocaleString('zh-CN')} 行 · ${d.mappings} 个映射`)}
+          {small(t('{rows, plural, other {# 行}} · {mappings, plural, other {# 个映射}}', { rows: d.rows, mappings: d.mappings }))}
           {drift[d.entity] && <DriftBadge counts={drift[d.entity]} small />}
         </div>
       );
@@ -92,7 +97,7 @@ function nodeLabel(d: FlowData, tableCount: Record<string, number>, drift: Drift
         <div className="leading-tight">
           <div>{d.label}</div>
           {d.identity?.rules && small(ruleLabels(d.identity.rules))}
-          {small(summary ? `统一消费者 ${summary.groups.toLocaleString('zh-CN')} · 记录 ${summary.records.toLocaleString('zh-CN')}` : '尚未合并')}
+          {small(summary ? t('统一消费者 {groups} · 记录 {records}', { groups: formatNumber(locale, summary.groups), records: formatNumber(locale, summary.records) }) : t('尚未合并'))}
           {changes && small(changes)}
         </div>
       );
@@ -104,6 +109,8 @@ function nodeLabel(d: FlowData, tableCount: Record<string, number>, drift: Drift
 
 /** drift：最近一次成功的漂移检查里有差异的表 */
 export function FlowGraphView({ flow, hits, drift }: { flow: FlowInput; hits?: SearchHits | null; drift: DriftByTable }) {
+  const t = useT();
+  const locale = useLocale();
   const [mounted, setMounted] = useState(false);
   const [, setSearchParams] = useSearchParams();
   useEffect(() => setMounted(true), []);
@@ -133,7 +140,7 @@ export function FlowGraphView({ flow, hits, drift }: { flow: FlowInput; hits?: S
       ...n,
       type: group ? 'flowGroup' : undefined,
       position: moved[n.id] ?? n.position,
-      data: { label: nodeLabel(n.data, tableCount, drift) },
+      data: { label: nodeLabel(n.data, tableCount, drift, t, locale) },
       domAttributes: driftAttrs(nodeDrift) as React.HTMLAttributes<HTMLDivElement>,
       sourcePosition: Position.Right, targetPosition: Position.Left,
       connectable: false,
@@ -145,7 +152,7 @@ export function FlowGraphView({ flow, hits, drift }: { flow: FlowInput; hits?: S
         ...(hits && !group && !hits.nodes.has(n.id) ? { opacity: FADED } : {}),
       },
     };
-  }), [graph, moved, tableCount, hits, drift]);
+  }), [graph, moved, tableCount, hits, drift, t, locale]);
 
   const edges = useMemo<Edge[]>(() => graph.edges.map(e => {
     const near = hovered !== null && (e.source === hovered || e.target === hovered);
@@ -202,7 +209,7 @@ export function FlowGraphView({ flow, hits, drift }: { flow: FlowInput; hits?: S
           {Object.keys(moved).length > 0 && (
             <Panel position="top-right">
               <button type="button" onClick={() => setMoved(() => ({}))} className="rounded-lg border bg-white px-3 py-1 text-xs text-slate-600 shadow-sm hover:bg-slate-50">
-                重置布局
+                {t('重置布局')}
               </button>
             </Panel>
           )}
