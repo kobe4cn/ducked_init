@@ -52,7 +52,7 @@ export function AppShell({ email, nav, children, brand, logoutAction = '/logout'
                         key={item.to}
                         to={item.to}
                         aria-current={item.to === active ? 'page' : undefined}
-                        className={cn('block rounded-md px-3 py-1.5 text-slate-600 hover:bg-slate-100', item.to === active && 'bg-slate-100 font-medium text-slate-900')}
+                        className={cn('block whitespace-nowrap rounded-md px-3 py-1.5 text-slate-600 hover:bg-slate-100', item.to === active && 'bg-slate-100 font-medium text-slate-900')}
                       >
                         {navLabel(t, item.label)}
                       </Link>
