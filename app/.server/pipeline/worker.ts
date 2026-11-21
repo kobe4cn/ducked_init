@@ -5,14 +5,16 @@ import { CONTRACTS, type TaskContract } from './task-contracts';
 import { PartialFailure } from './partial-failure';
 import { openTenantLake, redactLakeSecrets, type EngineLimits, type LakeSpec } from './lake-engine';
 import { redactSourceSecrets, type SourceSpec } from './source-engine';
+import { MsgError, msg, type Msg } from '../../lib/i18n';
+import { errorOutcome } from './worker-outcome';
 
 /**
  * source 是任务涉及的数据源（参数带 sourceId 时），凭据已由调度器解密；piiSalt 是合并到标准层时给敏感字段加盐的租户盐；
  * servingKey 是生成服务库时加密文件的租户密钥（ADR-0033）。都只在内存里使用；taskId 用来给结果层的快照表命名
  */
 export interface WorkerInput { taskId: string; kind: TaskKind; params: Record<string, unknown>; lake: LakeSpec; limits: EngineLimits; source?: SourceSpec; piiSalt?: string; servingKey?: string }
-/** 任务部分完成时既有错误也有结果 */
-export type WorkerOutcome = { result: Record<string, unknown> } | { error: string; result?: Record<string, unknown> };
+/** 任务部分完成时既有错误也有结果。失败另带句式（errorMsg，ADR-0060）：MsgError 折算而来，纯 JSON 可过 IPC；其余失败路径只有中文 error */
+export type WorkerOutcome = { result: Record<string, unknown> } | { error: string; result?: Record<string, unknown>; errorMsg?: Msg };
 
 const redactor = (input: WorkerInput) => (message: string) => {
   let redacted = redactLakeSecrets(message, input.lake);
@@ -29,10 +31,13 @@ async function run(input: WorkerInput): Promise<WorkerOutcome> {
   const readOnly = contract.readOnlyLake === true;
   const servingFile = contract.servingFile === true;
   // 没拿到密钥就不挂 serving：不写未加密的服务库文件
-  if (servingFile && !input.servingKey) throw new Error('缺少服务库密钥');
+  if (servingFile && !input.servingKey) throw new MsgError(msg('缺少服务库密钥'));
   const servingKey = servingFile ? input.servingKey : undefined;
   const session = await openTenantLake(input.lake, input.limits, attach, { readOnly, servingKey }).catch(e => {
-    throw new Error(`挂载${attach ? '数据湖与数据源' : '数据湖'}失败：${(e as Error).message}`);
+    // 完整句式而不是碎片拼接（ADR-0060）：外部报错原文作为参数，展示时按界面语言出
+    throw new MsgError(attach
+      ? msg('挂载数据湖与数据源失败：{error}', { error: (e as Error).message })
+      : msg('挂载数据湖失败：{error}', { error: (e as Error).message }));
   });
   try {
     const [engine] = (await session.con.runAndReadAll(
@@ -55,6 +60,6 @@ process.once('disconnect', () => process.exit(1));
 
 process.once('message', (input: WorkerInput) => {
   run(input)
-    .catch((e): WorkerOutcome => ({ error: redactor(input)((e as Error).message) }))
+    .catch((e): WorkerOutcome => errorOutcome(e, redactor(input)))
     .then(outcome => process.send!(outcome, () => process.exit('error' in outcome ? 1 : 0)));
 });

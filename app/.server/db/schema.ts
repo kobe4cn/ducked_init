@@ -6,6 +6,7 @@ import type { ApiScope } from '../../lib/api-scopes';
 import type { CustomEntityField, CustomEntityKind, EntityRelation } from '../../lib/canonical-model';
 import type { KnowledgeSourceKind } from '../../lib/knowledge-source';
 import type { MergeRule } from '../../lib/merge-groups';
+import type { Msg } from '../../lib/i18n';
 import { ROLES } from '../../lib/roles';
 import { SOURCE_KINDS } from '../../lib/sources';
 import type { CatalogEntry } from '../catalog';
@@ -265,6 +266,8 @@ export const tasks = platform.table('tasks', {
   status: taskStatusEnum('status').notNull().default('queued'),
   result: jsonb('result').$type<Record<string, unknown>>(),
   error: text('error'),
+  // 失败原因另存句式和参数（ADR-0060）：展示时按读者界面语言格式化，没有时显示 error 的中文；旧数据不回填
+  errorMsg: jsonb('error_msg').$type<Msg>(),
   workerPid: integer('worker_pid'),
   heartbeatAt: timestamp('heartbeat_at', { withTimezone: true }),
   startedAt: timestamp('started_at', { withTimezone: true }),

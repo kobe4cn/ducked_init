@@ -4,10 +4,12 @@ import { and, desc, eq, inArray, isNotNull, ne, sql } from 'drizzle-orm';
 import type { Tx } from './audit';
 import { getDb } from './db/client';
 import { TASK_STATUSES, tasks, tenantLakes, tenants, type TaskStatus } from './db/schema';
+import { formatServer } from './i18n';
 import { lakeSpecOf } from './lake';
 import { tenantPiiSalt, tenantServingKey } from './secrets';
 import { loadSourceSpec, SourceError } from './source-config';
 import { storageOverQuota } from './storage-quota';
+import { msg, type Locale, type Msg } from '~/lib/i18n';
 import { CONTRACTS, isTaskKind, type InputOf, type ParamsOf, type TaskContract, type TaskKind } from './pipeline/task-contracts';
 import type { WorkerInput, WorkerOutcome } from './pipeline/worker';
 
@@ -220,10 +222,23 @@ export async function finishTask(taskId: string, outcome: WorkerOutcome) {
       status: 'error' in outcome ? 'failed' : 'succeeded',
       result: outcome.result ?? null,
       error: 'error' in outcome ? outcome.error : null,
+      errorMsg: 'error' in outcome ? outcome.errorMsg ?? null : null,
       finishedAt: sql`now()`,
     })
     .where(and(eq(tasks.id, taskId), eq(tasks.status, 'running')));
 }
+
+/**
+ * 任务失败原因按读者的界面语言出文字（ADR-0060）：带句式（error_msg）时查词典格式化，
+ * 没有时（旧数据、调度器之外的中断路径）原样返回中文 error。任务页与导出详情（#1033 等）共用
+ */
+export function taskErrorText(locale: Locale, row: { error: string | null; errorMsg: Msg | null }): string | null {
+  return row.errorMsg ? formatServer(locale, row.errorMsg) : row.error;
+}
+
+// 调度器写入的两种失败的句式（ADR-0060）：error 列仍写中文（formatServer zh-CN 与原句逐字相同），error_msg 另存句式供展示
+const TENANT_SUSPENDED = msg('租户已停用，任务终止');
+const DISPATCHER_LOST = msg('调度器失联，任务中断');
 
 /**
  * 调度器定期为自己派发的任务续期，返回应当终止的任务：租户已停用的（随即记为失败），
@@ -234,7 +249,7 @@ export async function heartbeatTasks(taskIds: string[]): Promise<string[]> {
   const mine = and(inArray(tasks.id, taskIds), eq(tasks.status, 'running'));
   const suspended = await getDb()
     .update(tasks)
-    .set({ status: 'failed', error: '租户已停用，任务终止', finishedAt: sql`now()` })
+    .set({ status: 'failed', error: formatServer('zh-CN', TENANT_SUSPENDED), errorMsg: TENANT_SUSPENDED, finishedAt: sql`now()` })
     .where(and(mine, inArray(tasks.tenantId, getDb().select({ id: tenants.id }).from(tenants).where(isNotNull(tenants.suspendedAt)))))
     .returning({ id: tasks.id });
   await getDb().update(tasks).set({ heartbeatAt: sql`now()` }).where(mine);
@@ -246,6 +261,6 @@ export async function heartbeatTasks(taskIds: string[]): Promise<string[]> {
 export async function failStaleTasks(staleAfterMs: number) {
   await getDb()
     .update(tasks)
-    .set({ status: 'failed', error: '调度器失联，任务中断', finishedAt: sql`now()` })
+    .set({ status: 'failed', error: formatServer('zh-CN', DISPATCHER_LOST), errorMsg: DISPATCHER_LOST, finishedAt: sql`now()` })
     .where(and(eq(tasks.status, 'running'), sql`${tasks.heartbeatAt} < now() - make_interval(secs => ${staleAfterMs / 1000})`));
 }

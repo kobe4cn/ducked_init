@@ -116,6 +116,8 @@ describe('停用与中断', () => {
 
     expect(await heartbeatTasks([a.id, g.id])).toEqual([a.id]);
     expect(await getTask(a.id)).toMatchObject({ status: 'failed', error: '租户已停用，任务终止' });
+    // 另存句式（error_msg）：展示时按读者界面语言格式化，error 仍是中文（ADR-0060）
+    expect((await getTask(a.id)).errorMsg).toEqual({ key: '租户已停用，任务终止' });
     expect((await getTask(g.id)).status).toBe('running');
     // 工作进程被终止后回报的结果不会覆盖失败状态
     await finishTask(a.id, { result: {} });
@@ -135,6 +137,7 @@ describe('停用与中断', () => {
     await heartbeatTasks([alive.id]);
     await failStaleTasks(30);
     expect(await getTask(lost.id)).toMatchObject({ status: 'failed', error: '调度器失联，任务中断' });
+    expect((await getTask(lost.id)).errorMsg).toEqual({ key: '调度器失联，任务中断' });
     expect((await getTask(alive.id)).status).toBe('running');
     expect((await claimNextTask())?.tenantId).toBe(lost.tenantId);
   });
