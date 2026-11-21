@@ -1,5 +1,6 @@
 // test/http/locale.test.ts —— 界面语言的判断与切换（#945，ADR-0060）：账号 > cookie > 浏览器语言 > 中文
-// 开关 CRM_ENABLE_EN_LOCALE 关闭时整站中文、切换接口 404；打开时按优先级判断，POST /locale 写 cookie 并同步到账号
+// 开关 CRM_ENABLE_EN_LOCALE 关闭时整站中文、切换接口 404；打开时按优先级判断，POST /locale 写 cookie 并同步到账号；
+// 顶栏与导航整块翻译（#1012）：英文界面顶栏全英文、中文界面输出不变、子路由 404 时根 ErrorBoundary 英文
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -169,6 +170,57 @@ describe('界面语言：切换入口（顶栏与登录页，#946）', () => {
     expect(after).toContain('lang="en"');
     expect(localeForm(after, 'en')).toContain('aria-current="true"');
     expect(localeForm(after, 'zh-CN')).not.toContain('aria-current="true"');
+  });
+});
+
+describe('界面语言：顶栏与导航整块翻译（#1012）', () => {
+  beforeEach(() => { vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1'); });
+
+  /** 去掉 <script>（loader 数据与水合脚本里的导航仍是中文）后的顶栏这一块 */
+  const headerOf = (html: string) => {
+    const header = html.replace(/<script[\s\S]*?<\/script>/g, '').match(/<header[\s\S]*?<\/header>/)?.[0];
+    expect(header, '顶栏 <header>').toBeDefined();
+    return header!;
+  };
+
+  it('英文界面下顶栏与导航整块英文，中文 label 不出现', async () => {
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const browser = await loginAs(app, 'admin@acme.com');
+    browser.store('crm_locale=en; Path=/');
+    const header = headerOf(await (await browser.get('/')).text());
+    // 品牌名、全部分组与链接、我的设置提示、退出登录（「API Key」本就是英文；& 在 HTML 里转义成 &amp;）
+    for (const en of ['CRM Data Analytics Platform', 'Overview', 'Data Ingestion', 'Sources', 'Mappings', 'Custom Entities', 'Data Quality', 'Data Model', 'Canonical Model', 'Lineage', 'Business Knowledge', 'Analytics', 'Metrics &amp; Tags', 'Workbench', 'Tasks', 'Admin', 'Members', 'API Key', 'Model Providers', 'Model Calls', 'Audit Log', 'PII Reveal', 'Sign out', 'title="My settings (admin@acme.com)"']) {
+      expect(header).toContain(en);
+    }
+    // 导航定义（app/.server/nav.ts）保持中文，只在渲染时翻译：顶栏里中文 label 一个都不出现
+    for (const zh of ['概览', '数据接入', '数据源', '映射', '自定义实体', '数据质量', '数据模型', '标准模型', '数据地图', '业务知识', '分析', '指标与标签', '查询', '任务', '管理', '成员', '模型服务', '模型调用', '审计日志', '解密', '退出登录', '我的设置']) {
+      expect(header).not.toContain(zh);
+    }
+  });
+
+  it('中文界面下顶栏与导航仍是中文（词典已下发也回退原文，输出与改造前一致）', async () => {
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const browser = await loginAs(app, 'admin@acme.com');
+    browser.store('crm_locale=zh-CN; Path=/');
+    const header = headerOf(await (await browser.get('/')).text());
+    for (const zh of ['CRM 数据分析平台', '概览', '数据接入', '数据源', '映射', '自定义实体', '数据质量', '数据模型', '标准模型', '数据地图', '业务知识', '分析', '指标与标签', '查询', '任务', '管理', '成员', 'API Key', '模型服务', '模型调用', '审计日志', '解密', '退出登录', '我的设置（admin@acme.com）']) {
+      expect(header).toContain(zh);
+    }
+  });
+
+  it('英文界面下根路由 ErrorBoundary 的出错页（404）是英文', async () => {
+    await createTenant('acme', '示例商贸', 'admin@acme.com');
+    const browser = await loginAs(app, 'admin@acme.com');
+    browser.store('crm_locale=en; Path=/');
+    // 子路由 loader 抛 404（数据源不存在）：root loader 正常跑完、词典已下发，错误页整块英文
+    const res = await browser.get('/sources/00000000-0000-0000-0000-000000000000');
+    expect(res.status).toBe(404);
+    const strip = (await res.text()).replace(/<script[\s\S]*?<\/script>/g, '');
+    expect(strip).toContain('lang="en"');
+    expect(strip).toContain('Page not found.');
+    for (const zh of ['出错了', '页面不存在', '发生了意外错误', '无权访问', '返回首页']) {
+      expect(strip).not.toContain(zh);
+    }
   });
 });
 

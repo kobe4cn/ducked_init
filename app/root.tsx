@@ -11,7 +11,7 @@ import {
 
 import type { Route } from './+types/root';
 import { getLocale, localeSwitchEnabled } from '~/.server/locale';
-import { I18nProvider, makeT } from '~/lib/i18n';
+import { I18nProvider, makeT, useT } from '~/lib/i18n';
 import enClient from './i18n/en.client.json';
 import './app.css';
 
@@ -52,18 +52,21 @@ export default function App() {
 }
 
 export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
-  let message = '出错了';
-  let details = '发生了意外错误。';
+  // 子路由出错时 root loader 已正常跑完、Layout 里的 Provider 拿得到词典，按界面语言翻译；
+  // root loader 本身出错（或整站没匹配到路由）时没有词典，回退中文
+  const t = useT();
+  let message = t('出错了');
+  let details = t('发生了意外错误。');
   let stack: string | undefined;
 
   if (isRouteErrorResponse(error)) {
     if (error.status === 404) {
       message = '404';
-      details = '页面不存在。';
+      details = t('页面不存在。');
     } else if (error.status === 403) {
-      message = '无权访问';
+      message = t('无权访问');
       // 服务端入口给出的说明（如“仅管理员可以……”）
-      details = typeof error.data?.message === 'string' ? error.data.message : '当前角色无权进行此操作。';
+      details = typeof error.data?.message === 'string' ? error.data.message : t('当前角色无权进行此操作。');
     } else {
       details = error.statusText || details;
     }
@@ -77,7 +80,7 @@ export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
       <h1 className="text-xl font-semibold">{message}</h1>
       <p className="text-muted-foreground">{details}</p>
       {isRouteErrorResponse(error) && error.status === 403 && (
-        <a href="/" className="text-sm underline underline-offset-4">返回首页</a>
+        <a href="/" className="text-sm underline underline-offset-4">{t('返回首页')}</a>
       )}
       {stack && (
         <pre className="w-full p-4 overflow-x-auto">
