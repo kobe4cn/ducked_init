@@ -90,6 +90,7 @@ describe('英文界面：数据源列表与源视图页', () => {
     const versions = stripScripts(await (await author.get(`${viewPath}?tab=versions`)).text());
     expect(versions).not.toMatch(/[一-鿿]/);
     expect(versions).toMatch(/admin@acme\.com, \d{1,2}\/\d{1,2}\/\d{4}, [\d:]+ [AP]M/);
+    expect(versions).toContain('Versions (1)');
     for (const head of ['Version</th>', 'Status</th>', 'Authors</th>', 'Published</th>', 'View</a>']) expect(versions).toContain(head);
   });
 
