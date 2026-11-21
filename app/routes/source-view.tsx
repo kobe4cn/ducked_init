@@ -7,13 +7,16 @@ import { AlertTriangle, CircleAlert, Eye } from 'lucide-react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/source-view';
 import { can, requirePermission } from '~/.server/access';
-import { errorTextFor } from '~/.server/i18n';
+import { errorTextFor, formatServer } from '~/.server/i18n';
+import { getLocale } from '~/.server/locale';
 import { navFor } from '~/.server/nav';
 import { PublishError, publishReason } from '~/.server/publishing';
 import type { ViewPreview } from '~/.server/pipeline/source-view-engine';
 import {
   createSourceView, discardSourceViewDraft, getSourceView, listSourceViews, previewSourceView, publishSourceView, saveSourceViewDraft,
 } from '~/.server/source-views';
+import { makeT, msg, useLocale, useT, type Locale, type T } from '~/lib/i18n';
+import { formatDateTime } from '~/lib/format';
 import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { PageHeader } from '~/components/page-header';
@@ -23,8 +26,11 @@ import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
-export function meta({ loaderData }: Route.MetaArgs) {
-  return [{ title: `${loaderData?.view?.name ?? '源视图'} · CRM 数据分析平台` }];
+export function meta({ loaderData, matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
+  return [{ title: `${loaderData?.view?.name ?? t('源视图')} · ${t('CRM 数据分析平台')}` }];
 }
 
 type Tab = 'edit' | 'versions';
@@ -99,7 +105,7 @@ export async function action({ request, params }: Route.ActionArgs) {
         break;
       }
       default:
-        return data({ error: '未知操作', sql: null, name: null }, { status: 400 });
+        return data({ error: formatServer(await getLocale(request), msg('未知操作')), sql: null, name: null }, { status: 400 });
     }
   } catch (e) {
     if (e instanceof PublishError) return data({ error: await errorTextFor(request, e), sql: field('sql') || null, name: field('name') || null }, { status: e.status });
@@ -109,16 +115,19 @@ export async function action({ request, params }: Route.ActionArgs) {
   throw redirect(`${base}/${params.viewId}${tab === 'edit' ? '' : `?tab=${tab}`}`);
 }
 
-const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
+const time = (locale: Locale, iso: string | null) => (iso ? formatDateTime(locale, iso) : '—');
 
 /** 预览：视图的列（像敏感信息的标「哈希」）与前几行样本，空值显示为 — */
 function PreviewPanel({ version, result }: { version: number; result: ViewPreview }) {
+  const t = useT();
   const { columns, rows } = result;
   return (
     <section className="mt-6 space-y-4 border-t pt-6" data-preview={version}>
       <div>
-        <h2 className="font-semibold">{`预览 v${version}`}</h2>
-        <p className="max-w-2xl text-sm text-slate-500">{`视图有 ${columns.length} 列；样本取前 ${rows.length} 行（最多 ${result.limit} 行），像敏感信息的列显示为按租户加盐的哈希。`}</p>
+        <h2 className="font-semibold">{t('预览 v{version}', { version })}</h2>
+        <p className="max-w-2xl text-sm text-slate-500">{t('视图有 {columns, plural, other {# 列}}；样本取前 {rows, plural, other {# 行}}（最多 {limit, plural, other {# 行}}），像敏感信息的列显示为按租户加盐的哈希。', {
+          columns: columns.length, rows: rows.length, limit: result.limit,
+        })}</p>
       </div>
       <div className="overflow-x-auto rounded-2xl border bg-white">
         <Table>
@@ -127,7 +136,7 @@ function PreviewPanel({ version, result }: { version: number; result: ViewPrevie
               {columns.map(c => (
                 <TableHead key={c.name} data-preview-column={c.name} data-sensitive={c.sensitive || undefined}>
                   <span className="block font-mono">{c.name}</span>
-                  <span className="block text-xs font-normal text-slate-400">{`${c.sensitive ? '哈希 · ' : ''}${c.type}`}</span>
+                  <span className="block text-xs font-normal text-slate-400">{`${c.sensitive ? t('哈希 · ') : ''}${c.type}`}</span>
                 </TableHead>
               ))}
             </TableRow>
@@ -144,7 +153,7 @@ function PreviewPanel({ version, result }: { version: number; result: ViewPrevie
             ))}
             {!rows.length && (
               <TableRow>
-                <TableCell colSpan={columns.length} className="text-center text-slate-500">视图没有返回行</TableCell>
+                <TableCell colSpan={columns.length} className="text-center text-slate-500">{t('视图没有返回行')}</TableCell>
               </TableRow>
             )}
           </TableBody>
@@ -155,21 +164,23 @@ function PreviewPanel({ version, result }: { version: number; result: ViewPrevie
 }
 
 /** 编辑页对正在查看的版本的说明：只读、改草稿，或在已发布的版本上改成新草稿 */
-function editHint(canWrite: boolean, selected: { status: string }, draft: { version: number } | undefined) {
-  if (!canWrite) return '只读。';
-  if (selected.status === 'draft') return '保存后你是最后改这一版草稿的人，需由另一位数据工程师或管理员发布。';
-  if (draft) return `已发布的版本锁定。已有草稿 v${draft.version}，请在草稿上修改。`;
-  return '已发布的版本锁定，在这一版的基础上修改，保存为新的一版草稿。';
+function editHint(t: T, canWrite: boolean, selected: { status: string }, draft: { version: number } | undefined) {
+  if (!canWrite) return t('只读。');
+  if (selected.status === 'draft') return t('保存后你是最后改这一版草稿的人，需由另一位数据工程师或管理员发布。');
+  if (draft) return t('已发布的版本锁定。已有草稿 v{version}，请在草稿上修改。', { version: draft.version });
+  return t('已发布的版本锁定，在这一版的基础上修改，保存为新的一版草稿。');
 }
 
 export default function SourceView({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, tab, canWrite, source, view, version, versions, preview } = loaderData;
+  const t = useT();
+  const locale = useLocale();
   const submitting = useNavigation().state === 'submitting';
-  const back = <Link to={`/sources/${source.id}?tab=views`} className="hover:underline">{`← ${source.name} 的源视图`}</Link>;
+  const back = <Link to={`/sources/${source.id}?tab=views`} className="hover:underline">{t('← {name} 的源视图', { name: source.name })}</Link>;
   const error = actionData?.error && (
     <Alert variant="destructive" role="alert">
       <CircleAlert />
-      <AlertTitle>未保存</AlertTitle>
+      <AlertTitle>{t('未保存')}</AlertTitle>
       <AlertDescription>{actionData.error}</AlertDescription>
     </Alert>
   );
@@ -177,7 +188,7 @@ export default function SourceView({ loaderData, actionData }: Route.ComponentPr
   if (!view) {
     return (
       <AppShell email={email} nav={nav}>
-        <PageHeader title="新建源视图" description={back} />
+        <PageHeader title={t('新建源视图')} description={back} />
         {error}
         <div className="rounded-2xl border bg-white p-6 shadow-sm">
           <NewSourceViewForm name={actionData?.name} sql={actionData?.sql} submitting={submitting} />
@@ -195,23 +206,23 @@ export default function SourceView({ loaderData, actionData }: Route.ComponentPr
       <PageHeader
         title={<span className="font-mono">{view.name}</span>}
         description={back}
-        actions={draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : '这个源视图从没发布过，将被删除'} submitting={submitting} />}
+        actions={draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? t('回到最近的已发布版本') : t('这个源视图从没发布过，将被删除')} submitting={submitting} />}
       />
       {error}
       <PillTabs
         current={tab}
         tabs={[
-          { key: 'edit', label: '编辑', href: base },
-          { key: 'versions', label: `版本（${versions.length}）`, href: `${base}?tab=versions` },
+          { key: 'edit', label: t('编辑'), href: base },
+          { key: 'versions', label: t('版本（{n}）', { n: versions.length }), href: `${base}?tab=versions` },
         ]}
       />
       <div className="rounded-2xl border bg-white p-6 shadow-sm">
         {tab === 'edit' && selected && (
           <>
             <div className="mb-4 space-y-1">
-              <div className="flex items-center gap-2 text-sm text-slate-500">正在查看 <span className="font-mono font-semibold text-slate-900">{`v${selected.version}`}</span><VersionStatus v={selected} sameAs={selected.sameAs} /></div>
+              <div className="flex items-center gap-2 text-sm text-slate-500">{t('正在查看')} <span className="font-mono font-semibold text-slate-900">{`v${selected.version}`}</span><VersionStatus v={selected} sameAs={selected.sameAs} /></div>
               <p className="max-w-2xl text-sm text-slate-500">
-                {editHint(canWrite, selected, draft)}
+                {editHint(t, canWrite, selected, draft)}
               </p>
               {canWrite && <SourceViewHint className="max-w-2xl text-sm text-slate-500" />}
             </div>
@@ -219,7 +230,7 @@ export default function SourceView({ loaderData, actionData }: Route.ComponentPr
               <Form method="post" className="space-y-3" key={selected.version}>
                 <SqlEditor defaultValue={actionData?.sql ?? selected.sql} />
                 <Button type="submit" name="intent" value="save" disabled={submitting}>
-                  {submitting ? '正在校验…' : selected.status === 'draft' ? '校验并保存草稿' : '校验并保存为新草稿'}
+                  {submitting ? t('正在校验…') : selected.status === 'draft' ? t('校验并保存草稿') : t('校验并保存为新草稿')}
                 </Button>
               </Form>
             ) : (
@@ -227,25 +238,25 @@ export default function SourceView({ loaderData, actionData }: Route.ComponentPr
             )}
             {canWrite && (
               <div className="mt-4 flex flex-wrap items-center gap-3">
-                <Button asChild variant="outline"><Link to={`${base}?version=${selected.version}&preview=${selected.version}`}><Eye />{`预览 v${selected.version}`}</Link></Button>
-                <span className="text-sm text-slate-500">在原始层上执行已保存的这一版，看视图的列与前几行样本；编辑框里没保存的修改不参与。</span>
+                <Button asChild variant="outline"><Link to={`${base}?version=${selected.version}&preview=${selected.version}`}><Eye />{t('预览 v{version}', { version: selected.version })}</Link></Button>
+                <span className="text-sm text-slate-500">{t('在原始层上执行已保存的这一版，看视图的列与前几行样本；编辑框里没保存的修改不参与。')}</span>
               </div>
             )}
             {preview?.version === selected.version && (preview.result ? <PreviewPanel version={preview.version} result={preview.result} /> : (
-              <p className="mt-6 flex items-center gap-2 border-t pt-6 text-sm text-red-600" data-preview-error><AlertTriangle className="size-4" />{`预览失败：${preview.error}`}</p>
+              <p className="mt-6 flex items-center gap-2 border-t pt-6 text-sm text-red-600" data-preview-error><AlertTriangle className="size-4" />{t('预览失败：{error}', { error: preview.error })}</p>
             ))}
           </>
         )}
         {tab === 'versions' && (
           <>
-            <p className="mb-4 max-w-2xl text-sm text-slate-500">已发布的版本锁定，修改会形成新的一版草稿；草稿需由最后保存它的人以外的另一位数据工程师或管理员发布，也可以丢弃。</p>
+            <p className="mb-4 max-w-2xl text-sm text-slate-500">{t('已发布的版本锁定，修改会形成新的一版草稿；草稿需由最后保存它的人以外的另一位数据工程师或管理员发布，也可以丢弃。')}</p>
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>版本</TableHead>
-                  <TableHead>状态</TableHead>
-                  <TableHead>作者</TableHead>
-                  <TableHead>发布</TableHead>
+                  <TableHead>{t('版本')}</TableHead>
+                  <TableHead>{t('状态')}</TableHead>
+                  <TableHead>{t('作者')}</TableHead>
+                  <TableHead>{t('发布')}</TableHead>
                   <TableHead />
                 </TableRow>
               </TableHeader>
@@ -254,10 +265,10 @@ export default function SourceView({ loaderData, actionData }: Route.ComponentPr
                   <TableRow key={v.version} data-version={v.version} data-version-status={v.status}>
                     <TableCell className="font-mono font-semibold">{`v${v.version}`}</TableCell>
                     <TableCell><VersionStatus v={v} sameAs={v.sameAs} /></TableCell>
-                    <TableCell className="text-sm">{v.authors.join('、')}</TableCell>
-                    <TableCell className="text-sm text-slate-500">{v.publishedByEmail ? `${v.publishedByEmail}，${time(v.publishedAt)}` : '—'}</TableCell>
+                    <TableCell className="text-sm">{v.authors.join(t('、'))}</TableCell>
+                    <TableCell className="text-sm text-slate-500">{v.publishedByEmail ? `${v.publishedByEmail}${t('，')}${time(locale, v.publishedAt)}` : '—'}</TableCell>
                     <TableCell className="text-right">
-                      <Button asChild size="sm" variant="ghost"><Link to={`${base}?version=${v.version}`}>查看</Link></Button>
+                      <Button asChild size="sm" variant="ghost"><Link to={`${base}?version=${v.version}`}>{t('查看')}</Link></Button>
                     </TableCell>
                   </TableRow>
                 ))}

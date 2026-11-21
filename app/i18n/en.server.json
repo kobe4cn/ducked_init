@@ -16,5 +16,7 @@
   "调度器失联，任务中断": "Dispatcher lost; task interrupted",
   "缺少服务库密钥": "Missing serving store key",
   "挂载数据湖与数据源失败：{error}": "Failed to mount the data lake and data source: {error}",
-  "挂载数据湖失败：{error}": "Failed to mount the data lake: {error}"
+  "挂载数据湖失败：{error}": "Failed to mount the data lake: {error}",
+  "未知操作": "Unknown operation",
+  "文件超过本租户上传上限 {mb} MiB": "File exceeds this tenant's upload limit of {mb} MiB"
 }
