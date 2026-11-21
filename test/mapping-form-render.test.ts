@@ -7,6 +7,9 @@ import { describe, expect, it } from 'vitest';
 import { MappingForm } from '../app/components/mapping-form';
 import { LiveMappingIssues, type MappingIssueView } from '../app/components/mapping-editor';
 import type { ReferenceTable } from '../app/components/mapping-reference';
+import { entityOf } from '../app/lib/canonical-model';
+import { I18nProvider, makeT } from '../app/lib/i18n';
+import enClient from '../app/i18n/en.client.json';
 
 const YAML = `model: 1
 entity: order
@@ -113,6 +116,63 @@ describe('映射表单里的实时校验问题', () => {
     expect(order).not.toContain('aria-label="属性取舍名次"');
     const top = order.slice(order.indexOf('data-form-issues'), order.indexOf('data-form-mapping-key-space'));
     expect(top).toContain('只有消费者（customer）映射能配置属性取舍的优先级');
+  });
+});
+
+describe('英文界面', () => {
+  /** 带值对照的枚举字段（status），源列的常见取值给出建议（field-synonyms 的 ASCII 同义词） */
+  const DICT_YAML = `model: 1
+entity: order
+table: orders
+fields:
+  order_id: order_no
+  status: { expr: status, dictionary: { paid: paid }, otherwise: null }
+`;
+  const dictTable: ReferenceTable = {
+    ...table, columns: [{ name: 'status', type: 'text', nullRate: 0, distinct: 3, top: [{ value: 'paid', rows: 50 }, { value: 'pending', rows: 3 }, { value: 'refund', rows: 1 }] }],
+  };
+  const renderEn = (yaml: string, t: ReferenceTable | null, issues: MappingIssueView[] = []) => renderToStaticMarkup(createElement(
+    I18nProvider,
+    { t: makeT('en', enClient), locale: 'en' as const, children: createElement(MappingForm, { yaml, entity: 'order', table: t, functions: [], issues, onChange: () => {}, onEditYaml: () => {} }) },
+  ));
+  /** 输出里仍是中文的数据（order 各字段的说明、lib 给的只读 reason、issue message、lib 的 TRANSFORMS 选项文字）随 #932 翻译，先去掉再断言界面文字 */
+  const stripData = (html: string) => [...entityOf('order')!.fields.map(f => f.description), '这种写法表单不认识，请在 YAML 里修改']
+    .reduce((out, zh) => out.split(zh).join(''), html)
+    .replace(/<p data-live-issue[\s\S]*?<\/p>/g, '')
+    .replace(/<option[^>]*>[^<]*[一-鿿][^<]*<\/option>/g, '');
+
+  it('表单的标签、按钮与提示是英文，标准字段名与类型按界面语言显示；提交的值仍是代码名', () => {
+    const html = stripData(renderEn(YAML, table));
+    expect(html).not.toMatch(/[一-鿿]/);
+    // 标准字段名与字段类型走 builtinName（#1011 的词典）
+    expect(html).toContain('Order ID');
+    expect(html).toContain('Amount Paid');
+    expect(html).toContain('Decimal (2 places)');
+    expect(html).toContain('Timestamp (UTC)');
+    // 区块标签与提示
+    expect(html).toContain('Key space');
+    expect(html).toContain('Extension fields');
+    expect(html).toContain('Required (dedupe key)');
+    // 表单提交的值不因界面语言改变：字段类型的 option value 仍是代码名（转换的 option 文字是 lib 数据，随 #932 翻译，已被上面按汉字去掉）
+    expect(html).toContain('value="string"');
+    expect(html).toContain('value="integer"');
+  });
+
+  it('值对照与兜底（枚举字段）、实时校验的错误态、没有源表的空态同样没有汉字（数据除外）', () => {
+    const dict = stripData(renderEn(DICT_YAML, dictTable));
+    expect(dict).not.toMatch(/[一-鿿]/);
+    expect(dict).toContain('Standard value for paid');
+    expect(dict).toContain('Apply suggested mappings for 2 source values');
+    expect(dict).toContain('Map other values to null');
+
+    const error = stripData(renderEn(YAML, table, [{ line: 6, col: 9, path: 'table', message: '源表 orders 中没有字段 nope' }]));
+    expect(error).not.toMatch(/[一-鿿]/);
+    expect(error).toContain('Issues found by live validation');
+
+    // 空态提示只在 YAML 里还没有扩展字段时出现
+    const empty = stripData(renderEn('model: 1\nentity: order\ntable: orders\nfields:\n  order_id: order_no\n', null));
+    expect(empty).not.toMatch(/[一-鿿]/);
+    expect(empty).toContain('No source table to compare against; write extension fields in the YAML');
   });
 });
 

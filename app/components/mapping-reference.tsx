@@ -10,6 +10,9 @@ import { Link } from 'react-router';
 import { type CustomEntityField, entityOf, FIELD_TYPES, isCustomEntity } from '~/lib/canonical-model';
 import { formUnavailable } from '~/lib/mapping-form';
 import { mappingOutline } from '~/lib/mapping-outline';
+import { builtinName, CANONICAL_NAMES, ENUM_LABELS } from '~/lib/builtin-names';
+import { useLocale, useT, type T } from '~/lib/i18n';
+import { formatNumber } from '~/lib/format';
 import { LiveMappingIssues, MappingEditor, type MappingEditorHandle } from '~/components/mapping-editor';
 import { MappingForm, type FormFocus } from '~/components/mapping-form';
 import { useMappingValidation } from '~/components/use-mapping-validation';
@@ -34,24 +37,36 @@ export interface RegisteredEntityView { label: string; fields: CustomEntityField
 /** 白名单函数（由 loader 从 mapping-expr 的 FUNCTIONS 传来） */
 export interface ReferenceFunction { name: string; signature: string; label: string }
 
-/** 写法速查：每种写法一行能直接复制的例子 */
+/** 写法速查：每种写法一行能直接复制的例子。text 里的「已支付」是插入 YAML 的内容，不翻译 */
 const SNIPPETS = [
-  { kind: 'field', label: '普通字段', text: 'customer_id: buyer_id' },
-  { kind: 'expr', label: '表达式', text: 'amount: coalesce(pay_amount, pay_fen / 100)' },
-  { kind: 'dictionary', label: '值字典', text: "status: { expr: order_status, dictionary: { 已支付: paid, '2': refunded } }" },
-  { kind: 'otherwise', label: '兜底值（值字典没对应上的取值写成它，可写 null）', text: 'status: { expr: order_status, dictionary: { 已支付: paid }, otherwise: cancelled }' },
-  { kind: 'extension', label: '扩展字段（写在 extensions 下）', text: 'x_coupon_code: { type: string, expr: coupon_code }' },
-  { kind: 'dedupe', label: '去重键', text: 'dedupe: { key: [order_id], latest: updated_at }' },
-];
+  { kind: 'field', text: 'customer_id: buyer_id' },
+  { kind: 'expr', text: 'amount: coalesce(pay_amount, pay_fen / 100)' },
+  { kind: 'dictionary', text: "status: { expr: order_status, dictionary: { 已支付: paid, '2': refunded } }" },
+  { kind: 'otherwise', text: 'status: { expr: order_status, dictionary: { 已支付: paid }, otherwise: cancelled }' },
+  { kind: 'extension', text: 'x_coupon_code: { type: string, expr: coupon_code }' },
+  { kind: 'dedupe', text: 'dedupe: { key: [order_id], latest: updated_at }' },
+] as const;
+
+/** 写法速查每行的名称：中文与 SNIPPETS 的 kind 对应，这里写成字面量 t('…') 才能与词典对账（照 api-keys.tsx 的 scopeLabel） */
+const snippetLabel = (t: T, kind: (typeof SNIPPETS)[number]['kind']) => ({
+  field: t('普通字段'),
+  expr: t('表达式'),
+  dictionary: t('值字典'),
+  otherwise: t('兜底值（值字典没对应上的取值写成它，可写 null）'),
+  extension: t('扩展字段（写在 extensions 下）'),
+  dedupe: t('去重键'),
+})[kind];
 
 const pct = (n: number) => `${Math.round(n * 1000) / 10}%`;
 
 /** 点击插入到编辑框光标处的名字或写法；text 是插入的文本（默认同显示的） */
-const nameButton = (name: string, onInsert: (text: string) => void, text = name) => (
-  <button type="button" className="text-left font-mono hover:underline" title="插入到编辑框光标处" onClick={() => onInsert(text)}>{name}</button>
+const nameButton = (t: T, name: string, onInsert: (text: string) => void, text = name) => (
+  <button type="button" className="text-left font-mono hover:underline" title={t('插入到编辑框光标处')} onClick={() => onInsert(text)}>{name}</button>
 );
 
-const TABS = [{ id: 'form', label: '表单' }, { id: 'yaml', label: 'YAML' }] as const;
+/** 编辑区标签页的名称（TABS 只留 id，label 按界面语言取译文） */
+const TABS = ['form', 'yaml'] as const;
+const tabLabel = (t: T, id: (typeof TABS)[number]) => ({ form: t('表单'), yaml: t('YAML') })[id];
 
 /**
  * 映射编辑区（表单 / YAML 标签页），旁边是对照面板；点击面板里的列名、字段名、写法或函数插入到 YAML 框光标处（在表单标签页时先切到 YAML）。
@@ -81,28 +96,29 @@ export function MappingEditorWithReference({ defaultValue, value, onValueChange,
   const validation = useMappingValidation(validateAction, yaml, validateExtra);
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => setHydrated(true), []);
-  const [chosen, setTab] = useState<(typeof TABS)[number]['id']>('form');
+  const [chosen, setTab] = useState<(typeof TABS)[number]>('form');
   const tab = hydrated ? chosen : 'yaml';
+  const t = useT();
   // 表单显示出来时问题已在各区块里，编辑区下方不再逐项列出
   const formShown = useMemo(() => tab === 'form' && !formUnavailable(parseDocument(yaml), entity), [tab, yaml, entity]);
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       <div className="space-y-2">
         <div role="tablist" className="flex gap-1">
-          {TABS.map(t => (
+          {TABS.map(id => (
             <Button
-              key={t.id}
+              key={id}
               type="button"
               role="tab"
               size="sm"
-              variant={tab === t.id ? 'secondary' : 'ghost'}
-              aria-selected={tab === t.id}
-              data-editor-tab={t.id}
-              disabled={!hydrated && t.id === 'form'}
-              title={!hydrated && t.id === 'form' ? '表单需要浏览器脚本，加载完成前请用 YAML 编写' : undefined}
-              onClick={() => setTab(t.id)}
+              variant={tab === id ? 'secondary' : 'ghost'}
+              aria-selected={tab === id}
+              data-editor-tab={id}
+              disabled={!hydrated && id === 'form'}
+              title={!hydrated && id === 'form' ? t('表单需要浏览器脚本，加载完成前请用 YAML 编写') : undefined}
+              onClick={() => setTab(id)}
             >
-              {t.label}
+              {tabLabel(t, id)}
             </Button>
           ))}
         </div>
@@ -153,19 +169,23 @@ function MappingReference({ table, entity, registered, functions, yaml, onInsert
   const outline = mappingOutline(yaml);
   const mapped = outline.fields;
   const requiredFields = outline.dedupeKey ?? target?.key ?? [];
+  const t = useT();
+  const locale = useLocale();
   return (
     <div className="max-h-[48rem] space-y-4 overflow-y-auto text-xs">
       {table ? (
         <div data-reference-table={table.name} className="space-y-1">
-          <div className="font-medium">{table.view ? `源视图 ${table.name}（只有列与类型，没有列统计）` : `源表 ${table.name}（基于前 ${table.sampleRows.toLocaleString('zh-CN')} 行样本）`}</div>
+          <div className="font-medium">{table.view
+            ? t('源视图 {name}（只有列与类型，没有列统计）', { name: table.name })
+            : t('源表 {name}（基于前 {rows} 行样本）', { name: table.name, rows: formatNumber(locale, table.sampleRows) })}</div>
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>列</TableHead>
-                <TableHead>类型</TableHead>
-                <TableHead>空值率</TableHead>
-                <TableHead>不同取值</TableHead>
-                <TableHead>常见取值（样本行数）</TableHead>
+                <TableHead>{t('列')}</TableHead>
+                <TableHead>{t('类型')}</TableHead>
+                <TableHead>{t('空值率')}</TableHead>
+                <TableHead>{t('不同取值')}</TableHead>
+                <TableHead>{t('常见取值（样本行数）')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -177,33 +197,33 @@ function MappingReference({ table, entity, registered, functions, yaml, onInsert
                   data-watermark={table.watermark === c.name || undefined}
                 >
                   <TableCell className="space-x-1">
-                    {nameButton(c.name, onInsert)}
-                    {table.primaryKey.includes(c.name) && <Badge variant="secondary">主键</Badge>}
-                    {table.watermark === c.name && <Badge variant="outline">水位线</Badge>}
+                    {nameButton(t, c.name, onInsert)}
+                    {table.primaryKey.includes(c.name) && <Badge variant="secondary">{t('主键')}</Badge>}
+                    {table.watermark === c.name && <Badge variant="outline">{t('水位线')}</Badge>}
                   </TableCell>
                   <TableCell className="font-mono text-muted-foreground">{c.type}</TableCell>
                   <TableCell>{table.view ? '—' : pct(c.nullRate)}</TableCell>
-                  <TableCell>{table.view ? '—' : c.distinct.toLocaleString('zh-CN')}</TableCell>
-                  <TableCell className="whitespace-normal">{c.top?.map(t => `${t.value}（${t.rows.toLocaleString('zh-CN')}）`).join('，') || '—'}</TableCell>
+                  <TableCell>{table.view ? '—' : formatNumber(locale, c.distinct)}</TableCell>
+                  <TableCell className="whitespace-normal">{c.top?.map(v => t('{value}（{rows}）', { value: v.value, rows: formatNumber(locale, v.rows) })).join(t('，')) || '—'}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
           </Table>
         </div>
       ) : (
-        <div className="text-muted-foreground">没有可对照的源表：表须在同步范围内、已采集。</div>
+        <div className="text-muted-foreground">{t('没有可对照的源表：表须在同步范围内、已采集。')}</div>
       )}
 
       {target ? (
         <div data-reference-entity={target.name} className="space-y-1">
-          <div className="font-medium">{`${target.label}（${target.name}）的标准字段：已对应的打勾，去重键必填`}</div>
+          <div className="font-medium">{t('{entity}（{name}）的标准字段：已对应的打勾，去重键必填', { entity: builtinName(t, target.label, CANONICAL_NAMES), name: target.name })}</div>
           <Table>
             <TableHeader>
               <TableRow>
                 <TableHead />
-                <TableHead>字段</TableHead>
-                <TableHead>类型</TableHead>
-                <TableHead>说明</TableHead>
+                <TableHead>{t('字段')}</TableHead>
+                <TableHead>{t('类型')}</TableHead>
+                <TableHead>{t('说明')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -218,15 +238,15 @@ function MappingReference({ table, entity, registered, functions, yaml, onInsert
                     data-missing-required={missing || undefined}
                     className={missing ? 'bg-destructive/10' : undefined}
                   >
-                    <TableCell>{mapped.has(f.name) && <Check className="size-3.5" aria-label="已对应" />}</TableCell>
+                    <TableCell>{mapped.has(f.name) && <Check className="size-3.5" aria-label={t('已对应')} />}</TableCell>
                     <TableCell className="space-x-1">
-                      {nameButton(f.name, onInsert)}
-                      {required && <Badge variant={missing ? 'destructive' : 'secondary'}>{missing ? '必填，未对应' : '必填'}</Badge>}
+                      {nameButton(t, f.name, onInsert)}
+                      {required && <Badge variant={missing ? 'destructive' : 'secondary'}>{missing ? t('必填，未对应') : t('必填')}</Badge>}
                     </TableCell>
-                    <TableCell className="text-muted-foreground">{FIELD_TYPES[f.type].label}</TableCell>
+                    <TableCell className="text-muted-foreground">{builtinName(t, FIELD_TYPES[f.type].label, ENUM_LABELS)}</TableCell>
                     <TableCell className="whitespace-normal">
-                      {f.label}
-                      {f.enum && <div className="text-muted-foreground">{`标准枚举：${f.enum.join('、')}`}</div>}
+                      {builtinName(t, f.label, CANONICAL_NAMES)}
+                      {f.enum && <div className="text-muted-foreground">{t('标准枚举：{values}', { values: f.enum.join(t('、')) })}</div>}
                     </TableCell>
                   </TableRow>
                 );
@@ -236,24 +256,24 @@ function MappingReference({ table, entity, registered, functions, yaml, onInsert
         </div>
       ) : registered ? (
         <div data-reference-registered={entity} className="space-y-1">
-          <div className="font-medium">{`${registered.label}（${entity}）已发布登记的字段：写在 extensions 下`}</div>
+          <div className="font-medium">{t('{label}（{entity}）已发布登记的字段：写在 extensions 下', { label: registered.label, entity })}</div>
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>字段</TableHead>
-                <TableHead>类型</TableHead>
-                <TableHead>说明</TableHead>
+                <TableHead>{t('字段')}</TableHead>
+                <TableHead>{t('类型')}</TableHead>
+                <TableHead>{t('说明')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {registered.fields.map(f => (
                 <TableRow key={f.name} data-reference-field={f.name} data-primary-key={registered.primaryKey.includes(f.name) || undefined}>
                   <TableCell className="space-x-1">
-                    {nameButton(f.name, onInsert)}
-                    {registered.primaryKey.includes(f.name) && <Badge variant="secondary">主键</Badge>}
-                    {f.sensitive && <Badge variant="outline">敏感</Badge>}
+                    {nameButton(t, f.name, onInsert)}
+                    {registered.primaryKey.includes(f.name) && <Badge variant="secondary">{t('主键')}</Badge>}
+                    {f.sensitive && <Badge variant="outline">{t('敏感')}</Badge>}
                   </TableCell>
-                  <TableCell className="text-muted-foreground">{FIELD_TYPES[f.type].label}</TableCell>
+                  <TableCell className="text-muted-foreground">{builtinName(t, FIELD_TYPES[f.type].label, ENUM_LABELS)}</TableCell>
                   <TableCell className="whitespace-normal">{f.description || '—'}</TableCell>
                 </TableRow>
               ))}
@@ -262,20 +282,20 @@ function MappingReference({ table, entity, registered, functions, yaml, onInsert
         </div>
       ) : isCustomEntity(entity) ? (
         <div data-reference-unregistered={entity} className="text-muted-foreground">
-          {`${entity} 未登记：先到`}<Link to="/entities" className="underline">自定义实体</Link>登记并发布，才有字段可对照。
+          {t('{entity} 未登记：先到', { entity })}<Link to="/entities" className="underline">{t('自定义实体')}</Link>{t('登记并发布，才有字段可对照。')}
         </div>
       ) : (
-        <div className="text-muted-foreground">{`${entity} 不是标准实体，没有标准字段可对照。`}</div>
+        <div className="text-muted-foreground">{t('{entity} 不是标准实体，没有标准字段可对照。', { entity })}</div>
       )}
 
       <div className="space-y-1">
-        <div className="font-medium">写法速查：点击插入到光标处</div>
+        <div className="font-medium">{t('写法速查：点击插入到光标处')}</div>
         <Table>
           <TableBody>
             {SNIPPETS.map(s => (
               <TableRow key={s.kind} data-reference-snippet={s.kind}>
-                <TableCell className="text-muted-foreground">{s.label}</TableCell>
-                <TableCell className="whitespace-normal">{nameButton(s.text, onInsert)}</TableCell>
+                <TableCell className="text-muted-foreground">{snippetLabel(t, s.kind)}</TableCell>
+                <TableCell className="whitespace-normal">{nameButton(t, s.text, onInsert)}</TableCell>
               </TableRow>
             ))}
           </TableBody>
@@ -283,12 +303,12 @@ function MappingReference({ table, entity, registered, functions, yaml, onInsert
       </div>
 
       <div className="space-y-1">
-        <div className="font-medium">表达式可用的函数（白名单）</div>
+        <div className="font-medium">{t('表达式可用的函数（白名单）')}</div>
         <Table>
           <TableBody>
             {functions.map(f => (
               <TableRow key={f.name} data-reference-function={f.name}>
-                <TableCell>{nameButton(f.signature, onInsert, `${f.name}(`)}</TableCell>
+                <TableCell>{nameButton(t, f.signature, onInsert, `${f.name}(`)}</TableCell>
                 <TableCell className="whitespace-normal">{f.label}</TableCell>
               </TableRow>
             ))}
