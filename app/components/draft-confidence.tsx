@@ -38,7 +38,10 @@ export function DraftConfidence({ origin, items, reusedFrom, notice }: {
       <div className="flex items-center gap-1.5 text-sm font-medium"><Sparkles aria-hidden className="size-4 text-slate-400" />{t('生成依据')}</div>
       {origin === 'reuse' && (
         <p className="text-sm text-slate-500">
-          {t('源表结构与已发布映射一致，直接复用')}{reusedFrom ? <>{t('了')}<Link to={`/mappings/${reusedFrom}`} className="underline">{t('那个映射')}</Link></> : null}{t('，没有调用模型。')}
+          {/* 有来源时链接前后各一段（英文前段末尾带空格），无来源时整句一条，不拼碎片 */}
+          {reusedFrom
+            ? <>{t('源表结构与已发布映射一致，直接复用了')}<Link to={`/mappings/${reusedFrom}`} className="underline">{t('那个映射')}</Link>{t('，没有调用模型。')}</>
+            : t('源表结构与已发布映射一致，直接复用，没有调用模型。')}
         </p>
       )}
       {origin === 'rules' && <p data-notice className="flex items-center gap-1.5 text-sm text-amber-600"><AlertTriangle aria-hidden className="size-4" />{notice ?? t('按规则生成')}</p>}
