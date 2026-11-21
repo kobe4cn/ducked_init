@@ -15,7 +15,7 @@ describe('MsgError', () => {
 
 describe('errorText', () => {
   it('错误带句式时按界面语言格式化：英文是英文', () => {
-    expect(errorText('en', tooLong())).toBe('Names cannot exceed 100 characters.');
+    expect(errorText('en', tooLong())).toBe('Names cannot exceed 100 characters');
   });
 
   it('中文界面等于 message', () => {
