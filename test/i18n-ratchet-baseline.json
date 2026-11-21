@@ -130,7 +130,6 @@
     "app/.server/workbench.ts": 16,
     "app/components/custom-entity-form.tsx": 35,
     "app/components/draft-ambiguity.tsx": 2,
-    "app/components/knowledge-panel.tsx": 59,
     "app/components/lineage-drawer.tsx": 25,
     "app/components/lineage-flow.tsx": 5,
     "app/components/lineage-focus.tsx": 2,

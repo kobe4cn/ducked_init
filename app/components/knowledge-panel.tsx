@@ -1,6 +1,8 @@
 // app/components/knowledge-panel.tsx —— 业务知识面板（ADR-0046）：左边是系统事实（目录条目的只读内容、系统口径文字与派生的口径声明），右边是成员写的知识
 // （待确认的知识提案、别名、口径声明、业务说明、分析主题）。提案可以接受、修改后接受、填理由拒绝（主题归属与词的默认指向只有接受与拒绝，分别显示主题名、「『词』默认指这一条」）。每个表单都带 intent 与 targetId，交给路由 action 里的 handleKnowledgeIntent；不能编辑时不渲染任何表单和按钮。
 // 需复核的知识配 amber 图标与「待复核」，生效的配 emerald；待复核的别名多一个「确认」按钮（alias.confirm），确认后换一依据行、不再待复核。panel 为 null（定义从未发布过）时只提示发布后才能添加
+// 界面文字按界面语言翻译（ADR-0060，#1016）：写死的文字走 t()；semantic-claims 的类型 / 取值标签（随 #932）、error 与
+// 成员 / 模型写的条目内容（别名、说明正文、主题名、证据文字）不翻，条目内容保持原文
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { Fragment } from 'react';
 import { Form, Link } from 'react-router';
@@ -10,6 +12,8 @@ import type { Subject } from '~/.server/knowledge/subjects';
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
+import { formatDateTime } from '~/lib/format';
+import { useLocale, useT, type T } from '~/lib/i18n';
 import { CLAIM_TYPE_ORDER, CLAIM_TYPES, claimTypeLabel, claimValueLabel, isClaimType, type ClaimType } from '~/lib/semantic-claims';
 
 /** 一个面板表单：带上 intent 与 targetId */
@@ -25,13 +29,15 @@ function KnowledgeForm({ intent, targetId, className, children }: { intent: stri
 
 /** 生效或待复核：颜色配图标与文字 */
 function Status({ needsReview }: { needsReview: boolean }) {
+  const t = useT();
   return needsReview
-    ? <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="size-3" />待复核</span>
-    : <span className="inline-flex items-center gap-1 text-xs text-emerald-600"><CheckCircle2 className="size-3" />已生效</span>;
+    ? <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="size-3" />{t('待复核')}</span>
+    : <span className="inline-flex items-center gap-1 text-xs text-emerald-600"><CheckCircle2 className="size-3" />{t('已生效')}</span>;
 }
 
-/** 一条口径声明的说法：「币种：人民币」。claimPhrase 在 .server 下进不了客户端，这里用同一套标签 */
-const phrase = (type: ClaimType, value: string) => `${claimTypeLabel(type)}：${claimValueLabel(type, value)}`;
+/** 一条口径声明的说法：「币种：人民币」。claimPhrase 在 .server 下进不了客户端，这里用同一套标签；
+ *  标签本身是 semantic-claims 的中文（随 #932 翻译），组件只出类型与取值之间的连接句式 */
+const phrase = (t: T, type: ClaimType, value: string) => t('{type}：{value}', { type: claimTypeLabel(type), value: claimValueLabel(type, value) });
 
 function Fact({ label, value }: { label: string; value: string }) {
   return (
@@ -46,34 +52,35 @@ function Fact({ label, value }: { label: string; value: string }) {
 export type PanelSystem = MetricEntry | TagEntry | EntityEntry | FieldEntry | null;
 
 function SystemFacts({ system }: { system: PanelSystem }) {
+  const t = useT();
   const definition = system?.kind === 'metric' || system?.kind === 'tag';
   const deps = definition ? [...system.dependencies.metrics, ...system.dependencies.entities, ...system.dependencies.fields] : [];
   return (
     <div className="space-y-4">
-      <h3 className="text-sm font-medium">系统事实</h3>
+      <h3 className="text-sm font-medium">{t('系统事实')}</h3>
       <dl className="space-y-2">
         {system?.kind === 'metric' && (
           <>
-            <Fact label="基础实体" value={system.base} />
-            <Fact label="度量" value={system.measure} />
-            <Fact label="维度" value={system.dimensions.join('、')} />
+            <Fact label={t('基础实体')} value={system.base} />
+            <Fact label={t('度量')} value={system.measure} />
+            <Fact label={t('维度')} value={system.dimensions.join(t('、'))} />
           </>
         )}
-        {system?.kind === 'tag' && <Fact label="取值" value={system.values.join('、')} />}
-        {definition && <Fact label="依赖" value={deps.join('、')} />}
+        {system?.kind === 'tag' && <Fact label={t('取值')} value={system.values.join(t('、'))} />}
+        {definition && <Fact label={t('依赖')} value={deps.join(t('、'))} />}
         {system?.kind === 'entity' && (
           <>
-            <Fact label="字段" value={system.fields.map((f) => f.label && f.label !== f.name ? `${f.label}（${f.name}）` : f.name).join('、')} />
-            <Fact label="关系" value={system.relations.join('、')} />
+            <Fact label={t('字段')} value={system.fields.map((f) => f.label && f.label !== f.name ? t('{label}（{name}）', { label: f.label, name: f.name }) : f.name).join(t('、'))} />
+            <Fact label={t('关系')} value={system.relations.join(t('、'))} />
           </>
         )}
         {system?.kind === 'field' && (
           <>
-            <Fact label="类型" value={system.type} />
-            {system.enum && <Fact label="枚举" value={system.enum.join('、')} />}
+            <Fact label={t('类型')} value={system.type} />
+            {system.enum && <Fact label={t('枚举')} value={system.enum.join(t('、'))} />}
             {system.lineage.length > 0 && (
               <div data-field-lineage className="grid grid-cols-[6rem_1fr] gap-2 text-sm">
-                <dt className="text-slate-500">来源</dt>
+                <dt className="text-slate-500">{t('来源')}</dt>
                 <dd className="space-y-1 break-all">
                   {system.lineage.map((l, i) => <p key={i}>{l.source} · {l.table} · <code>{l.expr}</code></p>)}
                 </dd>
@@ -85,12 +92,12 @@ function SystemFacts({ system }: { system: PanelSystem }) {
       {/* 依赖与系统口径只属于指标、标签；没有目录条目时照旧显示占位 */}
       {(definition || !system) && (
         <div>
-          <h4 className="text-sm text-slate-500">系统口径</h4>
+          <h4 className="text-sm text-slate-500">{t('系统口径')}</h4>
           {definition ? (
             <>
               <p className="text-sm">{system.system.text}</p>
               <ul className="mt-2 space-y-1">
-                {system.system.claims.map(c => <li key={c.type} data-system-claim={c.type} className="text-sm">{phrase(c.type, c.value)}</li>)}
+                {system.system.claims.map(c => <li key={c.type} data-system-claim={c.type} className="text-sm">{phrase(t, c.type, c.value)}</li>)}
               </ul>
             </>
           ) : <p className="text-sm text-slate-400">—</p>}
@@ -100,33 +107,36 @@ function SystemFacts({ system }: { system: PanelSystem }) {
   );
 }
 
-const PROPOSAL_KIND_LABEL = { alias: '别名', claim: '口径声明', note: '业务说明', subject: '归入主题', term_default: '默认指向' } as const;
+/** 提案种类的名称：中文与原字面量对照表一致，这里写成字面量 t('…') 才能与词典对账（同 api-keys 的 scopeLabel） */
+const proposalKindLabel = (t: T, kind: PanelProposal['kind']) =>
+  ({ alias: t('别名'), claim: t('口径声明'), note: t('业务说明'), subject: t('归入主题'), term_default: t('默认指向') })[kind];
 
-/** 一条提案内容的说法；主题归属显示主题名，主题已删除时显示占位 */
-function proposalText(p: PanelProposal, subjects: Subject[]): string {
+/** 一条提案内容的说法；主题归属显示主题名，主题已删除时显示占位。claim 一条是 semantic-claims 的中文标签（随 #932 翻译） */
+function proposalText(t: T, p: PanelProposal, subjects: Subject[]): string {
   switch (p.kind) {
     case 'alias': return p.content.alias;
-    case 'claim': return `${claimTypeLabel(p.content.type)}：${claimValueLabel(p.content.type, p.content.value)}`;
+    case 'claim': return t('{type}：{value}', { type: claimTypeLabel(p.content.type), value: claimValueLabel(p.content.type, p.content.value) });
     case 'note': return p.content.note;
-    case 'subject': return subjects.find(s => s.id === p.content.subjectId)?.name ?? '已删除的主题';
-    case 'term_default': return `『${p.content.term}』默认指这一条`;
+    case 'subject': return subjects.find(s => s.id === p.content.subjectId)?.name ?? t('已删除的主题');
+    case 'term_default': return t('『{term}』默认指这一条', { term: p.content.term });
   }
 }
 
 /** 修改后接受：按种类给一个预填原值的输入；主题归属与词的默认指向没有这个入口（服务端也拦），返回 null 让 switch 保持穷尽 */
 function EditedValue({ proposal: p }: { proposal: PanelProposal }) {
+  const t = useT();
   switch (p.kind) {
     case 'subject':
     case 'term_default':
       return null;
     case 'alias':
-      return <Input name="alias" required maxLength={50} defaultValue={p.content.alias} aria-label="改后的别名" className="w-48" />;
+      return <Input name="alias" required maxLength={50} defaultValue={p.content.alias} aria-label={t('改后的别名')} className="w-48" />;
     case 'claim': {
       const { type } = p.content;
       return (
         <>
           <input type="hidden" name="type" value={type} />
-          <NativeSelect name="value" size="sm" className="w-48" required defaultValue={p.content.value} aria-label={`改后的${claimTypeLabel(type)}`}>
+          <NativeSelect name="value" size="sm" className="w-48" required defaultValue={p.content.value} aria-label={t('改后的{type}', { type: claimTypeLabel(type) })}>
             {(isClaimType(type) ? CLAIM_TYPES[type].values : []).map(v => <NativeSelectOption key={v.value} value={v.value}>{v.label}</NativeSelectOption>)}
           </NativeSelect>
         </>
@@ -135,7 +145,7 @@ function EditedValue({ proposal: p }: { proposal: PanelProposal }) {
     case 'note':
       return (
         <textarea
-          name="note" rows={3} maxLength={2000} required defaultValue={p.content.note} aria-label="改后的业务说明"
+          name="note" rows={3} maxLength={2000} required defaultValue={p.content.note} aria-label={t('改后的业务说明')}
           className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
         />
       );
@@ -144,23 +154,24 @@ function EditedValue({ proposal: p }: { proposal: PanelProposal }) {
 
 /** 待确认的知识提案：没有时整块不渲染 */
 function Proposals({ panel, targetId }: { panel: Panel; targetId: string }) {
+  const t = useT();
   if (!panel.proposals.length) return null;
   return (
     <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50/50 p-3">
       <h4 className="flex items-center gap-2 text-sm text-slate-500">
-        待确认的知识提案
-        <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="size-3" />待确认</span>
+        {t('待确认的知识提案')}
+        <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="size-3" />{t('待确认')}</span>
       </h4>
       <ul className="space-y-3">
         {panel.proposals.map(p => (
           <li key={p.id} data-proposal={p.id} className="space-y-1 text-sm">
-            <div className="whitespace-pre-wrap">{`${PROPOSAL_KIND_LABEL[p.kind]}：${proposalText(p, panel.subjects.all)}`}</div>
+            <div className="whitespace-pre-wrap">{t('{kind}：{text}', { kind: proposalKindLabel(t, p.kind), text: proposalText(t, p, panel.subjects.all) })}</div>
             {p.evidence.length > 0 && (
               <div className="text-xs text-slate-500">
-                {'证据：'}{p.evidence.map((e, i) => (
+                {t('证据：')}{p.evidence.map((e, i) => (
                   // 证据的 ref 不进客户端（#524）：panel.ts 在服务端换成展示文字，source_comment / source 证据带链接
                   <Fragment key={`${e.text}:${i}`}>
-                    {i > 0 && '、'}
+                    {i > 0 && t('、')}
                     {e.href ? <Link to={e.href} className="hover:underline">{e.text}</Link> : e.text}
                   </Fragment>
                 ))}
@@ -170,25 +181,25 @@ function Proposals({ panel, targetId }: { panel: Panel; targetId: string }) {
               <div className="flex flex-wrap items-start gap-3">
                 <KnowledgeForm intent="proposal.accept" targetId={targetId}>
                   <input type="hidden" name="proposalId" value={p.id} />
-                  <Button type="submit" size="xs" variant="outline">接受</Button>
+                  <Button type="submit" size="xs" variant="outline">{t('接受')}</Button>
                 </KnowledgeForm>
                 {p.kind !== 'subject' && p.kind !== 'term_default' && (
                   <details className="text-xs">
-                    <summary className="cursor-pointer py-1 text-slate-500 hover:text-slate-900">修改后接受</summary>
+                    <summary className="cursor-pointer py-1 text-slate-500 hover:text-slate-900">{t('修改后接受')}</summary>
                     <KnowledgeForm intent="proposal.acceptEdited" targetId={targetId} className="mt-2 flex max-w-2xl flex-wrap items-start gap-2">
                       <input type="hidden" name="proposalId" value={p.id} />
                       <input type="hidden" name="kind" value={p.kind} />
                       <EditedValue proposal={p} />
-                      <Button type="submit" size="sm" variant="outline">接受修改</Button>
+                      <Button type="submit" size="sm" variant="outline">{t('接受修改')}</Button>
                     </KnowledgeForm>
                   </details>
                 )}
                 <details className="text-xs">
-                  <summary className="cursor-pointer py-1 text-slate-500 hover:text-slate-900">拒绝</summary>
+                  <summary className="cursor-pointer py-1 text-slate-500 hover:text-slate-900">{t('拒绝')}</summary>
                   <KnowledgeForm intent="proposal.reject" targetId={targetId} className="mt-2 flex gap-2">
                     <input type="hidden" name="proposalId" value={p.id} />
-                    <Input name="reason" required maxLength={500} placeholder="拒绝理由，最多 500 字" aria-label="拒绝理由" className="w-64" />
-                    <Button type="submit" size="sm" variant="outline">拒绝</Button>
+                    <Input name="reason" required maxLength={500} placeholder={t('拒绝理由，最多 500 字')} aria-label={t('拒绝理由')} className="w-64" />
+                    <Button type="submit" size="sm" variant="outline">{t('拒绝')}</Button>
                   </KnowledgeForm>
                 </details>
               </div>
@@ -201,9 +212,10 @@ function Proposals({ panel, targetId }: { panel: Panel; targetId: string }) {
 }
 
 function Aliases({ panel, targetId }: { panel: Panel; targetId: string }) {
+  const t = useT();
   return (
     <div className="space-y-2">
-      <h4 className="text-sm text-slate-500">别名</h4>
+      <h4 className="text-sm text-slate-500">{t('别名')}</h4>
       {panel.aliases.length ? (
         <ul className="flex flex-wrap gap-2">
           {panel.aliases.map(a => (
@@ -213,23 +225,23 @@ function Aliases({ panel, targetId }: { panel: Panel; targetId: string }) {
               {panel.canEdit && a.needsReview && (
                 <KnowledgeForm intent="alias.confirm" targetId={targetId}>
                   <input type="hidden" name="aliasId" value={a.id} />
-                  <Button type="submit" size="xs" variant="ghost">确认</Button>
+                  <Button type="submit" size="xs" variant="ghost">{t('确认')}</Button>
                 </KnowledgeForm>
               )}
               {panel.canEdit && (
                 <KnowledgeForm intent="alias.retire" targetId={targetId}>
                   <input type="hidden" name="aliasId" value={a.id} />
-                  <Button type="submit" size="xs" variant="ghost">停用</Button>
+                  <Button type="submit" size="xs" variant="ghost">{t('停用')}</Button>
                 </KnowledgeForm>
               )}
             </li>
           ))}
         </ul>
-      ) : <p className="text-sm text-slate-400">还没有别名</p>}
+      ) : <p className="text-sm text-slate-400">{t('还没有别名')}</p>}
       {panel.canEdit && (
         <KnowledgeForm intent="alias.add" targetId={targetId} className="flex max-w-md gap-2">
-          <Input name="alias" required maxLength={50} placeholder="成员习惯的说法，最多 50 字" aria-label="新别名" />
-          <Button type="submit" size="sm" variant="outline">新增别名</Button>
+          <Input name="alias" required maxLength={50} placeholder={t('成员习惯的说法，最多 50 字')} aria-label={t('新别名')} />
+          <Button type="submit" size="sm" variant="outline">{t('新增别名')}</Button>
         </KnowledgeForm>
       )}
     </div>
@@ -237,15 +249,17 @@ function Aliases({ panel, targetId }: { panel: Panel; targetId: string }) {
 }
 
 function Claims({ panel, targetId }: { panel: Panel; targetId: string }) {
+  const t = useT();
   return (
     <div className="space-y-2">
-      <h4 className="text-sm text-slate-500">口径声明</h4>
+      <h4 className="text-sm text-slate-500">{t('口径声明')}</h4>
       <ul className="space-y-2">
         {CLAIM_TYPE_ORDER.map(type => {
           const claim = panel.claims.find(c => c.type === type);
+          // claimTypeLabel / claimValueLabel 是 semantic-claims 的中文标签，随 #932 翻译
           const text = claim?.needsReview
-            ? `${phrase(type, claim.value)}（待复核，原为 ${claimValueLabel(type, claim.previous ?? '')}）`
-            : (claim ? phrase(type, claim.value) : `${claimTypeLabel(type)}：未声明`);
+            ? t('{phrase}（待复核，原为 {previous}）', { phrase: phrase(t, type, claim.value), previous: claimValueLabel(type, claim.previous ?? '') })
+            : (claim ? phrase(t, type, claim.value) : t('{type}：未声明', { type: claimTypeLabel(type) }));
           return (
             <li key={type} data-claim={claim ? type : undefined} className="flex flex-wrap items-center gap-3 text-sm">
               <span className={claim ? '' : 'text-slate-400'}>{text}</span>
@@ -254,10 +268,10 @@ function Claims({ panel, targetId }: { panel: Panel; targetId: string }) {
                 <KnowledgeForm intent="claim.save" targetId={targetId} className="ml-auto flex gap-2">
                   <input type="hidden" name="type" value={type} />
                   <NativeSelect name="value" size="sm" className="w-48" required defaultValue={claim?.needsReview ? '' : (claim?.value ?? '')} aria-label={claimTypeLabel(type)}>
-                    <NativeSelectOption value="" disabled>选择取值</NativeSelectOption>
+                    <NativeSelectOption value="" disabled>{t('选择取值')}</NativeSelectOption>
                     {CLAIM_TYPES[type].values.map(v => <NativeSelectOption key={v.value} value={v.value}>{v.label}</NativeSelectOption>)}
                   </NativeSelect>
-                  <Button type="submit" size="sm" variant="outline">保存</Button>
+                  <Button type="submit" size="sm" variant="outline">{t('保存')}</Button>
                 </KnowledgeForm>
               )}
             </li>
@@ -269,42 +283,44 @@ function Claims({ panel, targetId }: { panel: Panel; targetId: string }) {
 }
 
 function Note({ panel, targetId }: { panel: Panel; targetId: string }) {
+  const t = useT();
+  const locale = useLocale();
   const { current, history, needsReview } = panel.note;
   return (
     <div className="space-y-2">
-      <h4 className="text-sm text-slate-500">业务说明</h4>
+      <h4 className="text-sm text-slate-500">{t('业务说明')}</h4>
       {current ? (
         <div className="space-y-1">
           <p data-note={current} data-needs-review={needsReview || undefined} className="whitespace-pre-wrap text-sm text-slate-700">{current}</p>
           <Status needsReview={needsReview} />
         </div>
-      ) : <p className="text-sm text-slate-400">还没有业务说明</p>}
+      ) : <p className="text-sm text-slate-400">{t('还没有业务说明')}</p>}
       {panel.canEdit && (
         <div className="max-w-2xl space-y-2">
           <KnowledgeForm intent="note.save" targetId={targetId} className="space-y-2">
             <textarea
-              name="note" rows={3} maxLength={2000} defaultValue={current} aria-label="业务说明"
-              placeholder="这个定义在本租户的业务口径，最多 2000 字"
+              name="note" rows={3} maxLength={2000} defaultValue={current} aria-label={t('业务说明')}
+              placeholder={t('这个定义在本租户的业务口径，最多 2000 字')}
               className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
             />
-            <Button type="submit" size="sm" variant="outline">保存说明</Button>
+            <Button type="submit" size="sm" variant="outline">{t('保存说明')}</Button>
           </KnowledgeForm>
           {current && (
             <KnowledgeForm intent="note.save" targetId={targetId}>
               <input type="hidden" name="note" value="" />
-              <Button type="submit" size="sm" variant="ghost">清空说明</Button>
+              <Button type="submit" size="sm" variant="ghost">{t('清空说明')}</Button>
             </KnowledgeForm>
           )}
         </div>
       )}
       {history.length > 0 && (
         <details className="text-xs text-slate-500">
-          <summary className="cursor-pointer hover:text-slate-900">{`历史（${history.length} 版）`}</summary>
+          <summary className="cursor-pointer hover:text-slate-900">{t('历史（{n} 版）', { n: history.length })}</summary>
           <div className="mt-2 space-y-2">
             {[...history].reverse().map((v, i) => (
               <div key={`${v.at}:${i}`} className="border-l-2 pl-2">
-                <div>{`${v.by} · ${new Date(v.at).toLocaleString('zh-CN')}`}</div>
-                <div className="whitespace-pre-wrap text-slate-700">{v.note || <span className="text-slate-400">（已清空）</span>}</div>
+                <div>{`${v.by} · ${formatDateTime(locale, v.at)}`}</div>
+                <div className="whitespace-pre-wrap text-slate-700">{v.note || <span className="text-slate-400">{t('（已清空）')}</span>}</div>
               </div>
             ))}
           </div>
@@ -315,12 +331,13 @@ function Note({ panel, targetId }: { panel: Panel; targetId: string }) {
 }
 
 function Subjects({ panel, targetId }: { panel: Panel; targetId: string }) {
+  const t = useT();
   const { all, memberOf } = panel.subjects;
   const joined = all.filter(s => memberOf.includes(s.id));
   const others = all.filter(s => !memberOf.includes(s.id));
   return (
     <div className="space-y-2">
-      <h4 className="text-sm text-slate-500">分析主题</h4>
+      <h4 className="text-sm text-slate-500">{t('分析主题')}</h4>
       {joined.length ? (
         <ul className="flex flex-wrap gap-2">
           {joined.map(s => (
@@ -329,27 +346,27 @@ function Subjects({ panel, targetId }: { panel: Panel; targetId: string }) {
               {panel.canEdit && (
                 <KnowledgeForm intent="subject.remove" targetId={targetId}>
                   <input type="hidden" name="subjectId" value={s.id} />
-                  <Button type="submit" size="xs" variant="ghost">移出</Button>
+                  <Button type="submit" size="xs" variant="ghost">{t('移出')}</Button>
                 </KnowledgeForm>
               )}
             </li>
           ))}
         </ul>
-      ) : <p className="text-sm text-slate-400">还没有加入分析主题</p>}
+      ) : <p className="text-sm text-slate-400">{t('还没有加入分析主题')}</p>}
       {panel.canEdit && (
         <div className="flex flex-wrap gap-4">
           {others.length > 0 && (
             <KnowledgeForm intent="subject.add" targetId={targetId} className="flex gap-2">
-              <NativeSelect name="subjectId" size="sm" required defaultValue="" aria-label="已有主题">
-                <NativeSelectOption value="" disabled>选择主题</NativeSelectOption>
+              <NativeSelect name="subjectId" size="sm" required defaultValue="" aria-label={t('已有主题')}>
+                <NativeSelectOption value="" disabled>{t('选择主题')}</NativeSelectOption>
                 {others.map(s => <NativeSelectOption key={s.id} value={s.id}>{s.name}</NativeSelectOption>)}
               </NativeSelect>
-              <Button type="submit" size="sm" variant="outline">加入</Button>
+              <Button type="submit" size="sm" variant="outline">{t('加入')}</Button>
             </KnowledgeForm>
           )}
           <KnowledgeForm intent="subject.create" targetId={targetId} className="flex gap-2">
-            <Input name="name" required maxLength={30} placeholder="新主题名，最多 30 字" aria-label="新主题名" className="w-48" />
-            <Button type="submit" size="sm" variant="outline">新建并加入</Button>
+            <Input name="name" required maxLength={30} placeholder={t('新主题名，最多 30 字')} aria-label={t('新主题名')} className="w-48" />
+            <Button type="submit" size="sm" variant="outline">{t('新建并加入')}</Button>
           </KnowledgeForm>
         </div>
       )}
@@ -362,14 +379,15 @@ function Subjects({ panel, targetId }: { panel: Panel; targetId: string }) {
 export function KnowledgePanel({ panel, system, targetId, error, hideNote = false, compact = false }: {
   panel: Panel | null; system: PanelSystem; targetId: string; error: string | null; hideNote?: boolean; compact?: boolean;
 }) {
+  const t = useT();
   return (
     <section data-knowledge-panel={targetId} className={`rounded-2xl border bg-white shadow-sm ${compact ? 'p-4' : 'p-6'}`}>
-      <h2 className="mb-4 font-medium">业务知识</h2>
+      <h2 className="mb-4 font-medium">{t('业务知识')}</h2>
       {panel ? (
         <div className={compact ? 'grid gap-6' : 'grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]'}>
           <SystemFacts system={system} />
           <div className="min-w-0 space-y-6">
-            <h3 className="text-sm font-medium">成员写的知识</h3>
+            <h3 className="text-sm font-medium">{t('成员写的知识')}</h3>
             {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
             <Proposals panel={panel} targetId={targetId} />
             <Aliases panel={panel} targetId={targetId} />
@@ -378,7 +396,7 @@ export function KnowledgePanel({ panel, system, targetId, error, hideNote = fals
             <Subjects panel={panel} targetId={targetId} />
           </div>
         </div>
-      ) : <p className="text-sm text-slate-500">发布后才能添加业务知识</p>}
+      ) : <p className="text-sm text-slate-500">{t('发布后才能添加业务知识')}</p>}
     </section>
   );
 }
