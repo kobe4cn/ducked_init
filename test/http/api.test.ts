@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { and, eq, sql } from 'drizzle-orm';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { scopeOfPath } from '../../app/.server/api-auth';
 import { sha256 } from '../../app/.server/auth';
 import { saveBusinessNote } from '../../app/.server/business-notes';
@@ -28,6 +28,9 @@ import { saveAsSandbox, shareSandboxTable } from '../../app/.server/workbench';
 import { drain, memberOf, newTenant, onLake, runTask } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
+
+// 英文开关的 stubEnv 中途断言失败也要还原，免得后续用例在英文界面下误红
+afterEach(() => { vi.unstubAllEnvs(); });
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
