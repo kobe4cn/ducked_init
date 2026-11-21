@@ -7,24 +7,30 @@
 // draft_definition 给「存草稿」、draft_query 有 workbenchSql 给「填入工作台」链接、没有给按钮；按钮只替本人发一句固定
 // 续写 onFollowUp，存草稿与填入工作台都会在助手工具里重新校验；不传 onFollowUp（被分享人只读）时不渲染按钮，链接照样
 // 渲染）> 过期（只提示重新提问，不给任何执行入口）。「排除了哪些口径」（excluded，#539）对所有 status 都显示，
-// 读者看不到的条目服务端只给原因，这里显示「你看不到的条目」
+// 读者看不到的条目服务端只给原因，这里显示「你看不到的条目」。
+// 界面文字按界面语言翻译（ADR-0060，#1013）：显示文字走 t()；卡片数据（reason / issues / questions / assumptions /
+// 所选条目的名称与说明）原样显示，不翻。两条固定续写（DRAFT_FOLLOW_UP / WORKBENCH_FOLLOW_UP）是发给服务端的请求
+// 内容，不翻——棘轮基线里本文件剩的两行就是它们
 import type { PlanCardView } from '~/.server/assistant/plan-card';
 import { Link } from 'react-router';
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { useT, type T } from '~/lib/i18n';
 
-const MODE_LABEL: Record<PlanCardView['mode'], string> = {
-  reuse_result: '复用现有结果',
-  draft_definition: '起草新定义',
-  draft_query: '起草工作台查询',
-  clarify: '追问澄清',
-  unsupported: '做不到',
-};
+/** 模式的展示名：字面量 t('…') 才能与英文词典对账（写法同 api-keys.tsx 的 scopeLabel） */
+const modeLabel = (t: T, mode: PlanCardView['mode']): string => ({
+  reuse_result: t('复用现有结果'),
+  draft_definition: t('起草新定义'),
+  draft_query: t('起草工作台查询'),
+  clarify: t('追问澄清'),
+  unsupported: t('做不到'),
+})[mode];
 
 /** 续写的固定文字：让助手走带重新校验的工具（save_definition_draft / prefill_workbench，见 tools.ts），不新增路由 */
 const DRAFT_FOLLOW_UP = '请把这个计划存成定义草稿';
 const WORKBENCH_FOLLOW_UP = '请按这个计划生成 SQL 填入工作台';
 
 export function PlanCard({ card, workbenchSql, onFollowUp }: { card: PlanCardView; workbenchSql?: string; onFollowUp?: (text: string) => void }) {
+  const t = useT();
   const ok = card.status === 'valid';
   // 分支顺序（#453）：做不到（red）> 追问澄清（amber）> 通过（按 mode 给下一步入口）> 过期（只提示重新提问）；
   // mode 是 clarify 时状态一定是 needs_clarification、mode 是 unsupported 时一定是 unsupported（catalog/plan.ts）
@@ -32,11 +38,11 @@ export function PlanCard({ card, workbenchSql, onFollowUp }: { card: PlanCardVie
   const clarify = !unsupported && (card.mode === 'clarify' || card.status === 'needs_clarification');
   // 整卡的颜色与标题跟着分支走（颜色不是唯一信号，标题与图标同时区分）
   let tone = '';
-  let title = '计划需要重新确认';
+  let title = t('计划需要重新确认');
   let titleColor = 'text-amber-700';
-  if (unsupported) { tone = 'border-red-200 bg-red-50 text-red-600'; title = '这个要求做不到'; titleColor = 'text-red-600'; }
-  else if (clarify) { tone = 'border-amber-200 bg-amber-50 text-amber-700'; title = '计划需要补充信息'; }
-  else if (ok) { title = '计划已通过校验'; titleColor = 'text-emerald-600'; }
+  if (unsupported) { tone = 'border-red-200 bg-red-50 text-red-600'; title = t('这个要求做不到'); titleColor = 'text-red-600'; }
+  else if (clarify) { tone = 'border-amber-200 bg-amber-50 text-amber-700'; title = t('计划需要补充信息'); }
+  else if (ok) { title = t('计划已通过校验'); titleColor = 'text-emerald-600'; }
   return (
     <div data-plan-card data-status={card.status} className={`mt-2 space-y-2 rounded-lg border p-3 text-xs ${tone}`}>
       <p className={`flex items-center gap-1.5 font-medium ${titleColor}`}>
@@ -45,13 +51,13 @@ export function PlanCard({ card, workbenchSql, onFollowUp }: { card: PlanCardVie
       </p>
       {card.selected.length > 0 && (
         <div>
-          <h4 className="text-slate-400">所选条目</h4>
+          <h4 className="text-slate-400">{t('所选条目')}</h4>
           <ul className="mt-0.5 space-y-1">
             {card.selected.map(s => (
               <li key={s.id}>
                 <span className="font-medium text-slate-700">{s.name ?? s.id}</span>
-                {s.description && <span className="text-slate-500">：{s.description}</span>}
-                {s.asOf && <span className="text-slate-400">（数据截至 {s.asOf}）</span>}
+                {s.description && <span className="text-slate-500">{t('：{description}', { description: s.description })}</span>}
+                {s.asOf && <span className="text-slate-400">{t('（数据截至 {asOf}）', { asOf: s.asOf })}</span>}
               </li>
             ))}
           </ul>
@@ -61,16 +67,16 @@ export function PlanCard({ card, workbenchSql, onFollowUp }: { card: PlanCardVie
           没有时（旧计划）assumptions 退回列在「为何选」下，不重复出「依据」；两者都没有不渲染（对所有 status 都显示） */}
       {card.rationale && (
         <div>
-          <h4 className="text-slate-400">为何选</h4>
+          <h4 className="text-slate-400">{t('为何选')}</h4>
           <p className="mt-0.5">{card.rationale}</p>
         </div>
       )}
       {card.assumptions.length > 0 && (
         <div>
-          <h4 className="text-slate-400">{card.rationale ? '依据' : '为何选'}</h4>
+          <h4 className="text-slate-400">{card.rationale ? t('依据') : t('为何选')}</h4>
           <ul className="mt-0.5 space-y-0.5">
             {card.assumptions.map((a, j) => (
-              <li key={j}>{a.text}<span className="text-slate-400">（{a.confirmed ? '已确认' : '未确认'}）</span></li>
+              <li key={j}>{a.text}<span className="text-slate-400">{a.confirmed ? t('（已确认）') : t('（未确认）')}</span></li>
             ))}
           </ul>
         </div>
@@ -79,18 +85,18 @@ export function PlanCard({ card, workbenchSql, onFollowUp }: { card: PlanCardVie
           对所有 status 都显示，和「为何选 / 依据」一样；旧计划没有 excluded，不渲染 */}
       {card.excluded?.length ? (
         <div>
-          <h4 className="text-slate-400">排除了哪些口径</h4>
+          <h4 className="text-slate-400">{t('排除了哪些口径')}</h4>
           <ul className="mt-0.5 space-y-0.5">
-            {card.excluded.map((x, j) => <li key={j}>{`${x.name ?? '你看不到的条目'}：${x.reason}`}</li>)}
+            {card.excluded.map((x, j) => <li key={j}>{t('{name}：{reason}', { name: x.name ?? t('你看不到的条目'), reason: x.reason })}</li>)}
           </ul>
         </div>
       ) : null}
       <p className="text-slate-500">
-        {`模式：${MODE_LABEL[card.mode]}`}
-        {card.request.windowDays !== undefined && `；窗口：近 ${card.request.windowDays} 天`}
-        {card.request.grain && `；粒度：${card.request.grain}`}
-        {`；维度：${card.request.dimensions.length ? card.request.dimensions.join('、') : '全体'}`}
-        {card.request.population && `；人群：${card.request.population}`}
+        {t('模式：{mode}', { mode: modeLabel(t, card.mode) })}
+        {card.request.windowDays !== undefined && t('；窗口：近 {days} 天', { days: card.request.windowDays })}
+        {card.request.grain && t('；粒度：{grain}', { grain: card.request.grain })}
+        {t('；维度：{dimensions}', { dimensions: card.request.dimensions.length ? card.request.dimensions.join(t('、')) : t('全体') })}
+        {card.request.population && t('；人群：{population}', { population: card.request.population })}
       </p>
       <NextSteps card={card} unsupported={unsupported} clarify={clarify} workbenchSql={workbenchSql} onFollowUp={onFollowUp} />
     </div>
@@ -101,17 +107,18 @@ export function PlanCard({ card, workbenchSql, onFollowUp }: { card: PlanCardVie
 function NextSteps({ card, unsupported, clarify, workbenchSql, onFollowUp }: {
   card: PlanCardView; unsupported: boolean; clarify: boolean; workbenchSql?: string; onFollowUp?: (text: string) => void;
 }) {
+  const t = useT();
   if (unsupported) {
     return (
       <>
         {/* 做不到：说明原因与每条问题的可行下一步，链到新建定义（表达不了时先定义） */}
-        {card.reason && <p>原因：{card.reason}</p>}
+        {card.reason && <p>{t('原因：{reason}', { reason: card.reason })}</p>}
         {card.issues.some(i => i.next) && (
           <ul className="list-disc space-y-0.5 pl-5">
             {card.issues.filter(i => i.next).map((i, j) => <li key={j}>{i.next}</li>)}
           </ul>
         )}
-        <Link to="/analytics/definitions/new" data-next="new-definition" className="underline">新建定义</Link>
+        <Link to="/analytics/definitions/new" data-next="new-definition" className="underline">{t('新建定义')}</Link>
       </>
     );
   }
@@ -120,19 +127,19 @@ function NextSteps({ card, unsupported, clarify, workbenchSql, onFollowUp }: {
       <>
         {card.issues.length > 0 && (
           <ul className="list-disc space-y-0.5 pl-5 text-amber-700">
-            {card.issues.map((i, j) => <li key={j}>{i.next ? `${i.message}（${i.next}）` : i.message}</li>)}
+            {card.issues.map((i, j) => <li key={j}>{i.next ? t('{message}（{next}）', { message: i.message, next: i.next }) : i.message}</li>)}
           </ul>
         )}
         {/* 要回答的问题（mode 是 clarify 时计划一定带）；提示在下方输入框回答 */}
         {card.questions.length > 0 && (
           <div>
-            <h4 className="text-slate-400">待澄清</h4>
+            <h4 className="text-slate-400">{t('待澄清')}</h4>
             <ul className="mt-0.5 list-disc space-y-0.5 pl-5">
               {card.questions.map((q, j) => <li key={j}>{q}</li>)}
             </ul>
           </div>
         )}
-        <p>请在下方输入框回答</p>
+        <p>{t('请在下方输入框回答')}</p>
       </>
     );
   }
@@ -141,14 +148,14 @@ function NextSteps({ card, unsupported, clarify, workbenchSql, onFollowUp }: {
       <>
         {/* 下一步入口（#453）：通过时按 mode 给（按钮只替本人发续写）；存草稿与填入工作台都会在助手工具里重新校验 */}
         {card.mode === 'reuse_result' && card.resultHref && (
-          <Link to={card.resultHref} data-next="result" className="underline">查看已有结果</Link>
+          <Link to={card.resultHref} data-next="result" className="underline">{t('查看已有结果')}</Link>
         )}
         {card.mode === 'draft_definition' && onFollowUp && (
-          <button type="button" data-next="draft" onClick={() => onFollowUp(DRAFT_FOLLOW_UP)} className="underline">存草稿</button>
+          <button type="button" data-next="draft" onClick={() => onFollowUp(DRAFT_FOLLOW_UP)} className="underline">{t('存草稿')}</button>
         )}
         {card.mode === 'draft_query' && (workbenchSql
-          ? <Link to={`/workbench?sql=${encodeURIComponent(workbenchSql)}`} data-prefill data-next="workbench" className="underline">填入工作台</Link>
-          : onFollowUp && <button type="button" data-next="workbench" onClick={() => onFollowUp(WORKBENCH_FOLLOW_UP)} className="underline">填入工作台</button>)}
+          ? <Link to={`/workbench?sql=${encodeURIComponent(workbenchSql)}`} data-prefill data-next="workbench" className="underline">{t('填入工作台')}</Link>
+          : onFollowUp && <button type="button" data-next="workbench" onClick={() => onFollowUp(WORKBENCH_FOLLOW_UP)} className="underline">{t('填入工作台')}</button>)}
       </>
     );
   }
@@ -156,10 +163,10 @@ function NextSteps({ card, unsupported, clarify, workbenchSql, onFollowUp }: {
     <>
       {card.issues.length > 0 && (
         <ul className="list-disc space-y-0.5 pl-5 text-amber-700">
-          {card.issues.map((i, j) => <li key={j}>{i.next ? `${i.message}（${i.next}）` : i.message}</li>)}
+          {card.issues.map((i, j) => <li key={j}>{i.next ? t('{message}（{next}）', { message: i.message, next: i.next }) : i.message}</li>)}
         </ul>
       )}
-      <p>计划已过期或不再适用，请重新提问</p>
+      <p>{t('计划已过期或不再适用，请重新提问')}</p>
     </>
   );
 }
