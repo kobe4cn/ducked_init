@@ -87,7 +87,7 @@ describe('草稿与校验类公共组件的界面文字按界面语言翻译（A
     expect(en.生成依据模型).toContain('Confidence</th>');
     expect(en.生成依据模型).toContain('Reason</th>');
     expect(en.生成依据模型).toContain('failed the not-null assertion');
-    expect(en.生成依据断言).toContain('Only the assertions block was replaced (indices in paths start at 0); Entries from the model are sorted by confidence');
+    expect(en.生成依据断言).toContain('Only the assertions block was replaced (indices in paths start at 0). Entries from the model are sorted by confidence');
     expect(en.生成依据复用).toContain('The source table structure matches a published mapping, so this draft directly reuses <a href="/mappings/m-123">that mapping</a>; no model was called.');
     expect(en.生成依据复用无来源).toContain('The source table structure matches a published mapping, so it was reused directly; no model was called.');
     expect(en.生成依据复用无来源).not.toContain('reuses;');
