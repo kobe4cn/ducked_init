@@ -4,6 +4,7 @@ import { useImperativeHandle, useRef, type ReactNode, type Ref } from 'react';
 import { AlertTriangle, CheckCircle2, CircleAlert, Loader2 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import type { MappingValidationView } from '~/components/use-mapping-validation';
+import { useT, type T } from '~/lib/i18n';
 import { lineRangeOf, offsetOf } from '~/lib/text-offset';
 
 export interface MappingIssueView { line: number; col: number; path: string; message: string; hint?: string }
@@ -68,6 +69,7 @@ export function MappingEditor({ name = 'yaml', defaultValue, value, readOnly = f
 
 /** 不拦保存与发布的提示（行列 + 文字）；children 是标题下的附加内容 */
 export function MappingNotices({ title, notices, children }: { title: string; notices: MappingIssueView[]; children?: ReactNode }) {
+  const t = useT();
   return (
     <Alert role="status" data-mapping-notices>
       <AlertTriangle className="text-amber-600" />
@@ -76,7 +78,7 @@ export function MappingNotices({ title, notices, children }: { title: string; no
         {children}
         <ul className="list-disc space-y-0.5 pl-4">
           {notices.map((i, n) => (
-            <li key={n} data-notice-line={i.line} data-notice-path={i.path}>{`第 ${i.line} 行第 ${i.col} 列${i.path ? `（${i.path}）` : ''}：${i.message}`}</li>
+            <li key={n} data-notice-line={i.line} data-notice-path={i.path}>{issueText(t, i)}</li>
           ))}
         </ul>
       </AlertDescription>
@@ -84,10 +86,14 @@ export function MappingNotices({ title, notices, children }: { title: string; no
   );
 }
 
-const issueText = (i: MappingIssueView) => `第 ${i.line} 行第 ${i.col} 列${i.path ? `（${i.path}）` : ''}：${i.message}`;
+/** 问题的位置句：按有没有 path 二选一（message 是 app/lib 给的数据，原样拼在后面） */
+const issueText = (t: T, i: MappingIssueView) =>
+  i.path ? t('第 {line} 行第 {col} 列（{path}）：{message}', { line: i.line, col: i.col, path: i.path, message: i.message })
+    : t('第 {line} 行第 {col} 列：{message}', { line: i.line, col: i.col, message: i.message });
 
 /** 保存或发布被拒绝的原因；映射文档的问题逐项给出位置，能给出改法时附上改好的写法。给出 onJump 时每条位置是按钮，点击定位到 YAML 里那一处 */
 export function MappingErrors({ error, issues, onJump }: { error: string; issues: MappingIssueView[]; onJump?: (line: number, col: number) => void }) {
+  const t = useT();
   return (
     <Alert variant="destructive" role={onJump ? undefined : 'alert'}>
       <CircleAlert />
@@ -98,8 +104,8 @@ export function MappingErrors({ error, issues, onJump }: { error: string; issues
             {issues.map((i, n) => (
               <li key={n} data-issue-line={i.line} data-issue-path={i.path}>
                 {onJump
-                  ? <button type="button" className="text-left hover:underline" title="定位到 YAML 里这一处" onClick={() => onJump(i.line, i.col)}>{issueText(i)}</button>
-                  : issueText(i)}
+                  ? <button type="button" className="text-left hover:underline" title={t('定位到 YAML 里这一处')} onClick={() => onJump(i.line, i.col)}>{issueText(t, i)}</button>
+                  : issueText(t, i)}
                 {i.hint && <pre data-issue-hint className="mt-1 whitespace-pre-wrap rounded bg-muted px-2 py-1 font-mono text-foreground">{i.hint}</pre>}
               </li>
             ))}
@@ -120,18 +126,19 @@ export function LiveMappingIssues({ validation, inForm = false, onJump }: {
   onJump: (line: number, col: number) => void;
 }) {
   const { state, error, issues, notices } = validation;
+  const t = useT();
   if (state === 'idle') return null;
   return (
     <div data-live-issues={state} aria-live="polite" className="space-y-2">
       {state === 'checking' && (
-        <p className="flex items-center gap-1 text-sm text-slate-500"><Loader2 className="size-3.5 animate-spin" />正在校验…</p>
+        <p className="flex items-center gap-1 text-sm text-slate-500"><Loader2 className="size-3.5 animate-spin" />{t('正在校验…')}</p>
       )}
       {error && <MappingErrors error={error} issues={inForm ? [] : issues} onJump={onJump} />}
-      {inForm && issues.length > 0 && <p className="text-sm text-slate-500">问题显示在表单里对应的位置，到 YAML 标签页可看到行列并定位</p>}
+      {inForm && issues.length > 0 && <p className="text-sm text-slate-500">{t('问题显示在表单里对应的位置，到 YAML 标签页可看到行列并定位')}</p>}
       {state === 'ok' && (
-        <p className="flex items-center gap-1 text-sm text-emerald-600"><CheckCircle2 className="size-4" />校验通过</p>
+        <p className="flex items-center gap-1 text-sm text-emerald-600"><CheckCircle2 className="size-4" />{t('校验通过')}</p>
       )}
-      {state === 'ok' && notices.length > 0 && <MappingNotices title="保存时会有这些提示（不影响保存）" notices={notices} />}
+      {state === 'ok' && notices.length > 0 && <MappingNotices title={t('保存时会有这些提示（不影响保存）')} notices={notices} />}
     </div>
   );
 }

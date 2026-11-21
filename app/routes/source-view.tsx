@@ -17,7 +17,7 @@ import { AppShell } from '~/components/app-shell';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
 import { PageHeader } from '~/components/page-header';
 import { PillTabs } from '~/components/pill-tabs';
-import { NewSourceViewForm, SOURCE_VIEW_HINT, SqlEditor } from '~/components/source-view-form';
+import { NewSourceViewForm, SourceViewHint, SqlEditor } from '~/components/source-view-form';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
@@ -212,7 +212,7 @@ export default function SourceView({ loaderData, actionData }: Route.ComponentPr
               <p className="max-w-2xl text-sm text-slate-500">
                 {editHint(canWrite, selected, draft)}
               </p>
-              {canWrite && <p className="max-w-2xl text-sm text-slate-500">{SOURCE_VIEW_HINT}</p>}
+              {canWrite && <SourceViewHint className="max-w-2xl text-sm text-slate-500" />}
             </div>
             {canWrite && (selected.status === 'draft' || !draft) ? (
               <Form method="post" className="space-y-3" key={selected.version}>

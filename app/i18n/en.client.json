@@ -283,5 +283,15 @@
   "未核对": "Not verified",
   "一致": "Consistent",
   "{n} 张表有差异": "{n, plural, one {# table differs} other {# tables differ}}",
-  "空值 {n, plural, other {# 行}}": "{n, plural, one {# row with null values} other {# rows with null values}}"
+  "空值 {n, plural, other {# 行}}": "{n, plural, one {# row with null values} other {# rows with null values}}",
+  "第 {line} 行第 {col} 列（{path}）：{message}": "Line {line}, column {col} ({path}): {message}",
+  "第 {line} 行第 {col} 列：{message}": "Line {line}, column {col}: {message}",
+  "定位到 YAML 里这一处": "Jump to this spot in the YAML",
+  "正在校验…": "Validating…",
+  "校验通过": "Validation passed",
+  "保存时会有这些提示（不影响保存）": "You will see these notices when saving (they do not block it)",
+  "问题显示在表单里对应的位置，到 YAML 标签页可看到行列并定位": "Issues are shown where they belong in the form; switch to the YAML tab to see line and column numbers and jump to them",
+  "视图名": "View name",
+  "校验并保存草稿": "Validate and save draft",
+  "只能读本数据源原始层的表，表名直接写源表名（如 customers），不能读标准层、结果层或其他数据源，也不能写入。视图要输出平台列 _op、_batch、_commit_ts（从原始层的表里带出来），映射才能按变更批次增量合并。": "The view can read only tables in this source's Bronze layer; write the table name directly as the source table (e.g. customers). It cannot read the Silver layer, the Gold layer, or other sources, and it cannot write. The view must output the platform columns _op, _batch and _commit_ts (carried over from a table in the Bronze layer) so the mapping can merge incrementally by change batch."
 }
