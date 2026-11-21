@@ -102,7 +102,14 @@ function states(locale: 'en' | 'zh-CN'): Record<string, string> {
 
 describe('助手面板的界面文字按界面语言翻译（ADR-0060）', () => {
   it('英文界面：面板、对话列表、消息区、计划卡与提案卡的典型状态都没有汉字（数据除外——夹具里都是 ASCII）', () => {
-    for (const [name, html] of Object.entries(states('en'))) expect(html, name).not.toMatch(/[一-鿿]/);
+    const en = states('en');
+    for (const [name, html] of Object.entries(en)) expect(html, name).not.toMatch(/[一-鿿]/);
+    // 带数量的句子走 ICU 复数（单数不出 "1 rows" / "last 1 days"）
+    expect(en.消息区只读).toContain('3 rows, columns: ');
+    expect(en.计划卡通过复用).toContain('; window: last 30 days');
+    const t = makeT('en', enClient);
+    expect(t('{rows} 行，列：{columns}', { rows: 1, columns: 'n' })).toBe('1 row, columns: n');
+    expect(t('；窗口：近 {days} 天', { days: 1 })).toBe('; window: last day');
   });
 
   it('中文界面：词典不下发、按中文原文回退，输出与接入前一致', () => {
