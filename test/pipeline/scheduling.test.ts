@@ -141,6 +141,22 @@ describe('停用与中断', () => {
     expect((await getTask(alive.id)).status).toBe('running');
     expect((await claimNextTask())?.tenantId).toBe(lost.tenantId);
   });
+
+  it('工作进程回报失败时，中文原因写入 error，带句式的另存 error_msg；不带句式的 error_msg 为空', async () => {
+    const acme = await newTenant('acme');
+    await setTenantQuota(null, acme, quota(2));
+    await enqueue(acme, 2);
+    const withMsg = (await claimNextTask())!;
+    const plain = (await claimNextTask())!;
+
+    const errorMsg = { key: '挂载数据湖失败：{error}', params: { error: 'x' } };
+    await finishTask(withMsg.id, { error: '挂载数据湖失败：x', errorMsg });
+    expect(await getTask(withMsg.id)).toMatchObject({ status: 'failed', error: '挂载数据湖失败：x' });
+    expect((await getTask(withMsg.id)).errorMsg).toEqual(errorMsg);
+
+    await finishTask(plain.id, { error: '引擎报错' });
+    expect(await getTask(plain.id)).toMatchObject({ status: 'failed', error: '引擎报错', errorMsg: null });
+  });
 });
 
 describe('存储配额（ADR-0008）', () => {
