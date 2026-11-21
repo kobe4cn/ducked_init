@@ -7,8 +7,7 @@ import type { Route } from './+types/api-keys';
 import { requirePermission } from '~/.server/access';
 import { ApiKeyError, createApiKey, listApiKeys, revokeApiKey, updateApiKeyScope, type RawDataScope } from '~/.server/api-keys';
 import { apiCatalog } from '~/.server/api-catalog';
-import { formatServer } from '~/.server/i18n';
-import { getLocale } from '~/.server/locale';
+import { errorTextFor } from '~/.server/i18n';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
@@ -89,8 +88,7 @@ export async function action({ request }: Route.ActionArgs) {
     }
   } catch (e) {
     if (e instanceof ApiKeyError) {
-      const error = typeof e.detail === 'string' ? e.detail : formatServer(await getLocale(request), e.detail);
-      return data({ error }, { status: e.status });
+      return data({ error: await errorTextFor(request, e) }, { status: e.status });
     }
     throw e;
   }

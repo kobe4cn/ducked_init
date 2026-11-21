@@ -12,6 +12,13 @@ export function msg(key: string, params?: Record<string, unknown>): Msg {
   return params === undefined ? { key } : { key, params };
 }
 
+/** 服务端业务错误的基类（ADR-0060）：detail 带句式和参数，message 固定中文（/mcp 与日志读它），展示文字按界面语言出（errorText） */
+export class MsgError extends Error {
+  constructor(readonly detail: Msg) {
+    super(translate('zh-CN', null, detail.key, detail.params));
+  }
+}
+
 /** 翻译函数：键是中文 ICU 句式，变量作为参数传入 */
 export type T = (key: string, params?: Record<string, unknown>) => string;
 
