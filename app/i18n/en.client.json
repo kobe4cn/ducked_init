@@ -585,7 +585,7 @@
   "这个源视图从没发布过，将被删除": "This source view has never been published and will be deleted",
   "编辑": "Edit",
   "版本": "Version",
-  "版本（{n}）": "Versions ({n, plural, one {# version} other {# versions}})",
+  "版本（{n}）": "Versions ({n})",
   "状态": "Status",
   "作者": "Authors",
   "发布": "Published",
