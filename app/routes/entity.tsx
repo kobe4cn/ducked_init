@@ -15,6 +15,7 @@ import {
   adoptRelation, CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, relationTargets, saveCustomEntityDraft,
   unpublishedMappingsOf,
 } from '~/.server/custom-entities';
+import { errorTextFor } from '~/.server/i18n';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
 import { entityRelationStats } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
@@ -144,7 +145,7 @@ export async function action({ request, params }: Route.ActionArgs) {
     // 保存、发布、丢弃经 publishing.ts（ADR-0051）：流程错误是 PublishError，CustomEntityError 是它的子类
     if (e instanceof PublishError) {
       const intent = String(form.get('intent'));
-      return data({ error: e.message, intent, input: intent === 'save' ? input : null }, { status: e.status });
+      return data({ error: await errorTextFor(request, e), intent, input: intent === 'save' ? input : null }, { status: e.status });
     }
     throw e;
   }

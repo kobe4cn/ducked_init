@@ -7,6 +7,7 @@ import { data, Form, Link, redirect, type ShouldRevalidateFunctionArgs, useFetch
 import type { Route } from './+types/mappings';
 import { assertCan, can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
+import { errorTextFor } from '~/.server/i18n';
 import { checkKeysNow, getKeyCheckStatus, KeyCheckError } from '~/.server/key-check';
 import { createMapping, defaultDraft, draftFor, GenerationMismatchError, listMappings, MappingError, modelDraftFor, referenceTables, validateNewMapping } from '~/.server/mappings';
 import { MergeError, mergeNow } from '~/.server/merges';
@@ -139,15 +140,15 @@ export async function action({ request }: Route.ActionArgs) {
         return data({ error: '未知操作', issues: [], values: null, draftId: null }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof KeyCheckError) return data({ error: e.message, issues: [], values: null, draftId: null }, { status: 400 });
+    if (e instanceof KeyCheckError) return data({ error: await errorTextFor(request, e), issues: [], values: null, draftId: null }, { status: 400 });
     // 手动合并被拒（已有合并等）：没有 issues，编辑框里留着提交的内容
     if (e instanceof MergeError) {
-      return data({ error: e.message, issues: [], values: { sourceId: field('sourceId'), yaml: field('yaml') }, draftId: null, generationId: field('generationId') || null }, { status: e.status });
+      return data({ error: await errorTextFor(request, e), issues: [], values: { sourceId: field('sourceId'), yaml: field('yaml') }, draftId: null, generationId: field('generationId') || null }, { status: e.status });
     }
     if (e instanceof MappingError) {
       // 没保存时仍带着生成记录，改好再保存照样比对；生成记录本身不符时不再带
       const generationId = e instanceof GenerationMismatchError ? null : field('generationId') || null;
-      return data({ error: e.message, issues: e.issues, values: { sourceId: field('sourceId'), yaml: field('yaml') }, draftId: null, generationId }, { status: e.status });
+      return data({ error: await errorTextFor(request, e), issues: e.issues, values: { sourceId: field('sourceId'), yaml: field('yaml') }, draftId: null, generationId }, { status: e.status });
     }
     throw e;
   }
