@@ -9,7 +9,9 @@ import { Field, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { builtinName, ENUM_LABELS } from '~/lib/builtin-names';
 import { CUSTOM_ENTITY_KINDS, entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, type CustomEntityField, type EntityRelation } from '~/lib/canonical-model';
+import { useT } from '~/lib/i18n';
 
 /** 表单里的一版登记（与服务端的 CustomEntityInput 同形；类型按字符串传，未通过校验时原样回显） */
 export interface EntityFormValues {
@@ -45,8 +47,9 @@ export function CustomEntityForm({ intent, entity, values, targets, submitting, 
   submitLabel: string;
 }) {
   const v = values ?? EMPTY;
-  const canonical = targets.filter(t => entityOf(t.name));
-  const others = targets.filter(t => t.name !== entity);
+  const t = useT();
+  const canonical = targets.filter(tg => entityOf(tg.name));
+  const others = targets.filter(tg => tg.name !== entity);
   const refOf = (r: EntityRelation) => (r.ref.entity === entity ? '' : r.ref.entity);
   const [extra, setExtra] = useState(EXTRA_ROWS);
   const [extraRelations, setExtraRelations] = useState(EXTRA_RELATION_ROWS);
@@ -61,110 +64,113 @@ export function CustomEntityForm({ intent, entity, values, targets, submitting, 
       <div className="grid max-w-2xl gap-4 sm:grid-cols-3">
         {intent === 'create' && (
           <Field>
-            <FieldLabel htmlFor="entity-name">名称</FieldLabel>
+            <FieldLabel htmlFor="entity-name">{t('名称')}</FieldLabel>
             <Input id="entity-name" name="name" defaultValue={v.name ?? ''} placeholder="custom_store" className="font-mono" required />
           </Field>
         )}
         <Field>
-          <FieldLabel htmlFor="entity-label">中文名</FieldLabel>
-          <Input id="entity-label" name="label" defaultValue={v.label} placeholder="门店" required />
+          <FieldLabel htmlFor="entity-label">{t('中文名')}</FieldLabel>
+          <Input id="entity-label" name="label" defaultValue={v.label} placeholder={t('门店')} required />
         </Field>
         <Field>
-          <FieldLabel htmlFor="entity-kind">类型</FieldLabel>
+          <FieldLabel htmlFor="entity-kind">{t('类型')}</FieldLabel>
           <NativeSelect id="entity-kind" name="kind" defaultValue={v.kind}>
-            {Object.entries(CUSTOM_ENTITY_KINDS).map(([k, label]) => <NativeSelectOption key={k} value={k}>{label}</NativeSelectOption>)}
+            {Object.entries(CUSTOM_ENTITY_KINDS).map(([k, label]) => <NativeSelectOption key={k} value={k}>{builtinName(t, label, ENUM_LABELS)}</NativeSelectOption>)}
           </NativeSelect>
         </Field>
       </div>
-      {intent === 'create' && <p className="max-w-2xl text-sm text-slate-500">名称以 custom_ 开头，只含小写字母、数字和下划线，建好后不能改。类型只用于引导：维度是被描述的对象（如门店），事实是发生的事件（如巡店记录）。</p>}
+      {intent === 'create' && <p className="max-w-2xl text-sm text-slate-500">{t('名称以 custom_ 开头，只含小写字母、数字和下划线，建好后不能改。类型只用于引导：维度是被描述的对象（如门店），事实是发生的事件（如巡店记录）。')}</p>}
       <div className="overflow-x-auto rounded-2xl border">
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>字段名</TableHead>
-              <TableHead>类型</TableHead>
-              <TableHead>说明</TableHead>
-              <TableHead>敏感</TableHead>
+              <TableHead>{t('字段名')}</TableHead>
+              <TableHead>{t('类型')}</TableHead>
+              <TableHead>{t('说明')}</TableHead>
+              <TableHead>{t('敏感')}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {rows.map((f, i) => (
               <TableRow key={i} data-field-row={i}>
-                <TableCell><Input name="fieldName" defaultValue={f.name} aria-label={`第 ${i + 1} 行字段名`} className="font-mono" /></TableCell>
+                <TableCell><Input name="fieldName" defaultValue={f.name} aria-label={t('第 {n} 行字段名', { n: i + 1 })} className="font-mono" /></TableCell>
                 <TableCell>
-                  <NativeSelect name="fieldType" defaultValue={f.type} aria-label={`第 ${i + 1} 行类型`}>
-                    {FIELD_TYPE_NAMES.map(t => <NativeSelectOption key={t} value={t}>{`${t}（${FIELD_TYPES[t].label}）`}</NativeSelectOption>)}
+                  <NativeSelect name="fieldType" defaultValue={f.type} aria-label={t('第 {n} 行类型', { n: i + 1 })}>
+                    {FIELD_TYPE_NAMES.map(ft => <NativeSelectOption key={ft} value={ft}>{t('{type}（{label}）', { type: ft, label: builtinName(t, FIELD_TYPES[ft].label, ENUM_LABELS) })}</NativeSelectOption>)}
                   </NativeSelect>
                 </TableCell>
-                <TableCell><Input name="fieldDescription" defaultValue={f.description} aria-label={`第 ${i + 1} 行说明`} /></TableCell>
-                <TableCell><input type="checkbox" name="fieldSensitive" value={i} defaultChecked={f.sensitive} aria-label={`第 ${i + 1} 行敏感`} className="size-4" /></TableCell>
+                <TableCell><Input name="fieldDescription" defaultValue={f.description} aria-label={t('第 {n} 行说明', { n: i + 1 })} /></TableCell>
+                <TableCell><input type="checkbox" name="fieldSensitive" value={i} defaultChecked={f.sensitive} aria-label={t('第 {n} 行敏感', { n: i + 1 })} className="size-4" /></TableCell>
               </TableRow>
             ))}
           </TableBody>
         </Table>
       </div>
       <Button type="button" variant="outline" size="sm" onClick={() => setExtra(n => n + 1)}>
-        <Plus />添加字段
+        <Plus />{t('添加字段')}
       </Button>
-      <p className="max-w-2xl text-sm text-slate-500">{`字段名只用小写字母、数字与下划线，以字母开头；字段名留空的行忽略。敏感字段在标准层只存哈希，类型只能是 string。`}</p>
+      <p className="max-w-2xl text-sm text-slate-500">{t('字段名只用小写字母、数字与下划线，以字母开头；字段名留空的行忽略。敏感字段在标准层只存哈希，类型只能是 string。')}</p>
       <Field className="max-w-2xl">
-        <FieldLabel htmlFor="entity-primary-key">主键</FieldLabel>
+        <FieldLabel htmlFor="entity-primary-key">{t('主键')}</FieldLabel>
         <Input id="entity-primary-key" name="primaryKey" defaultValue={v.primaryKey.join(', ')} placeholder="store_id" className="font-mono" required />
       </Field>
       <div className="overflow-x-auto rounded-2xl border">
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>关系：起点实体</TableHead>
-              <TableHead>起点字段</TableHead>
-              <TableHead>终点实体</TableHead>
-              <TableHead>终点字段（主键）</TableHead>
+              <TableHead>{t('关系：起点实体')}</TableHead>
+              <TableHead>{t('起点字段')}</TableHead>
+              <TableHead>{t('终点实体')}</TableHead>
+              <TableHead>{t('终点字段（主键）')}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {relationRows.map((r, i) => (
               <TableRow key={i} data-relation-row={i}>
                 <TableCell>
-                  <NativeSelect name="relFrom" defaultValue={entityOf(r.from.entity) ? r.from.entity : ''} aria-label={`第 ${i + 1} 条关系的起点实体`}>
-                    <NativeSelectOption value="">本实体</NativeSelectOption>
-                    {canonical.map(t => <NativeSelectOption key={t.name} value={t.name}>{`${t.name}（${t.label}）`}</NativeSelectOption>)}
+                  <NativeSelect name="relFrom" defaultValue={entityOf(r.from.entity) ? r.from.entity : ''} aria-label={t('第 {n} 条关系的起点实体', { n: i + 1 })}>
+                    <NativeSelectOption value="">{t('本实体')}</NativeSelectOption>
+                    {canonical.map(tg => <NativeSelectOption key={tg.name} value={tg.name}>{t('{name}（{label}）', { name: tg.name, label: tg.label })}</NativeSelectOption>)}
                   </NativeSelect>
                 </TableCell>
-                <TableCell><Input name="relField" defaultValue={r.from.field} placeholder="region_id" aria-label={`第 ${i + 1} 条关系的字段`} className="font-mono" /></TableCell>
+                <TableCell><Input name="relField" defaultValue={r.from.field} placeholder="region_id" aria-label={t('第 {n} 条关系的字段', { n: i + 1 })} className="font-mono" /></TableCell>
                 <TableCell>
-                  <NativeSelect name="relEntity" defaultValue={refOf(r)} aria-label={`第 ${i + 1} 条关系的终点实体`}>
-                    <NativeSelectOption value="">本实体</NativeSelectOption>
+                  <NativeSelect name="relEntity" defaultValue={refOf(r)} aria-label={t('第 {n} 条关系的终点实体', { n: i + 1 })}>
+                    <NativeSelectOption value="">{t('本实体')}</NativeSelectOption>
                     {/* 已填的终点不在可选列表里（如没发布）时也列出，报错后原样回显 */}
-                    {refOf(r) && !others.some(t => t.name === r.ref.entity) && <NativeSelectOption value={r.ref.entity}>{r.ref.entity}</NativeSelectOption>}
-                    {others.map(t => <NativeSelectOption key={t.name} value={t.name}>{`${t.name}（${t.label}）`}</NativeSelectOption>)}
+                    {refOf(r) && !others.some(tg => tg.name === r.ref.entity) && <NativeSelectOption value={r.ref.entity}>{r.ref.entity}</NativeSelectOption>}
+                    {others.map(tg => <NativeSelectOption key={tg.name} value={tg.name}>{t('{name}（{label}）', { name: tg.name, label: tg.label })}</NativeSelectOption>)}
                   </NativeSelect>
                 </TableCell>
-                <TableCell><Input name="relTarget" defaultValue={r.ref.field} placeholder="终点的主键" aria-label={`第 ${i + 1} 条关系的终点字段`} className="font-mono" /></TableCell>
+                <TableCell><Input name="relTarget" defaultValue={r.ref.field} placeholder={t('终点的主键')} aria-label={t('第 {n} 条关系的终点字段', { n: i + 1 })} className="font-mono" /></TableCell>
               </TableRow>
             ))}
           </TableBody>
         </Table>
       </div>
       <Button type="button" variant="outline" size="sm" onClick={() => setExtraRelations(n => n + 1)}>
-        <Plus />添加关系
+        <Plus />{t('添加关系')}
       </Button>
       <p className="max-w-2xl text-sm text-slate-500">
-        {`关系把一个字段指向另一个实体的主键，两端类型要相同。起点是本实体的字段时，终点可以是标准实体或已发布的自定义实体，只能是单列主键：${others.filter(t => t.primaryKey.length === 1).map(t => `${t.name}.${t.primaryKey[0]}`).join('、') || '暂无'}。起点也可以是标准实体的字段（含已发布映射用过的 x_ 扩展字段，如 order.x_store_id），这时终点选「本实体」、填本实体的主键。不能成环。字段留空的行忽略；发布后只能新增关系。`}
+        {t('关系把一个字段指向另一个实体的主键，两端类型要相同。起点是本实体的字段时，终点可以是标准实体或已发布的自定义实体，只能是单列主键：{list}。起点也可以是标准实体的字段（含已发布映射用过的 x_ 扩展字段，如 order.x_store_id），这时终点选「本实体」、填本实体的主键。不能成环。字段留空的行忽略；发布后只能新增关系。', {
+          list: others.filter(tg => tg.primaryKey.length === 1).map(tg => `${tg.name}.${tg.primaryKey[0]}`).join(t('、')) || t('暂无'),
+        })}
       </p>
-      <Button type="submit" disabled={submitting}>{submitting ? '正在保存…' : submitLabel}</Button>
+      <Button type="submit" disabled={submitting}>{submitting ? t('正在保存…') : submitLabel}</Button>
     </Form>
   );
 }
 
 /** 一版登记的只读字段表：主键字段标「主键」，敏感字段标「敏感」 */
 export function EntityFieldsTable({ fields, primaryKey }: Pick<EntityFormValues, 'fields' | 'primaryKey'>) {
+  const t = useT();
   return (
     <Table>
       <TableHeader>
         <TableRow>
-          <TableHead>字段名</TableHead>
-          <TableHead>类型</TableHead>
-          <TableHead>说明</TableHead>
+          <TableHead>{t('字段名')}</TableHead>
+          <TableHead>{t('类型')}</TableHead>
+          <TableHead>{t('说明')}</TableHead>
           <TableHead />
         </TableRow>
       </TableHeader>
@@ -174,7 +180,7 @@ export function EntityFieldsTable({ fields, primaryKey }: Pick<EntityFormValues,
             <TableCell className="font-mono">{f.name}</TableCell>
             <TableCell className="text-sm">{f.type}</TableCell>
             <TableCell className="text-sm text-slate-500">{f.description || '—'}</TableCell>
-            <TableCell className="text-sm text-slate-500">{[primaryKey.includes(f.name) && '主键', f.sensitive && '敏感'].filter(Boolean).join('、')}</TableCell>
+            <TableCell className="text-sm text-slate-500">{[primaryKey.includes(f.name) && t('主键'), f.sensitive && t('敏感')].filter(Boolean).join(t('、'))}</TableCell>
           </TableRow>
         ))}
       </TableBody>
@@ -184,13 +190,14 @@ export function EntityFieldsTable({ fields, primaryKey }: Pick<EntityFormValues,
 
 /** 一版登记的只读关系表：起点实体.起点字段 → 终点实体.终点字段；没有关系时不显示 */
 export function EntityRelationsTable({ relations }: { relations: EntityRelation[] }) {
+  const t = useT();
   if (!relations.length) return null;
   return (
     <Table>
       <TableHeader>
         <TableRow>
-          <TableHead>关系：起点</TableHead>
-          <TableHead>终点</TableHead>
+          <TableHead>{t('关系：起点')}</TableHead>
+          <TableHead>{t('终点')}</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
