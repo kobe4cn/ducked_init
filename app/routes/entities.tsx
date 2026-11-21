@@ -8,6 +8,7 @@ import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entities';
 import { can, requirePermission } from '~/.server/access';
 import { createCustomEntity, CustomEntityError, customEntityInputOf, listCustomEntities, relationTargets } from '~/.server/custom-entities';
+import { errorTextFor } from '~/.server/i18n';
 import { referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { createPassthrough } from '~/.server/passthrough';
@@ -57,7 +58,7 @@ export async function action({ request }: Route.ActionArgs) {
       const { entityId } = await createPassthrough(await requirePermission(request, 'sources:write'), picked.sourceId, picked.table, picked.name);
       throw redirect(`/entities/${entityId}`);
     } catch (e) {
-      if (e instanceof CustomEntityError) return data({ error: e.message, input: null, passthrough: picked }, { status: e.status });
+      if (e instanceof CustomEntityError) return data({ error: await errorTextFor(request, e), input: null, passthrough: picked }, { status: e.status });
       throw e;
     }
   }
@@ -67,7 +68,7 @@ export async function action({ request }: Route.ActionArgs) {
     const id = await createCustomEntity(await requirePermission(request, 'sources:write'), input);
     throw redirect(`/entities/${id}`);
   } catch (e) {
-    if (e instanceof CustomEntityError) return data({ error: e.message, input, passthrough: null }, { status: e.status });
+    if (e instanceof CustomEntityError) return data({ error: await errorTextFor(request, e), input, passthrough: null }, { status: e.status });
     throw e;
   }
 }

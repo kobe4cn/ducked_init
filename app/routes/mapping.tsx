@@ -13,6 +13,7 @@ import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
+import { errorTextFor } from '~/.server/i18n';
 import { latestIdentitySummary, mergeMapping } from '~/.server/merges';
 import {
   confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, GenerationMismatchError, getMapping, ignoreColumn, MappingError, modelAssertionsForMapping, modelDraftForMapping, publishMapping, referenceTables,
@@ -217,7 +218,7 @@ export async function action({ request, params }: Route.ActionArgs) {
     if (e instanceof PublishError) {
       // 没保存时仍带着生成记录，改好再保存照样比对；生成记录本身不符时不再带
       const generationId = e instanceof GenerationMismatchError ? null : field('generationId') || null;
-      return data({ error: e.message, issues: e instanceof MappingError ? e.issues : [], yaml: field('yaml') || null, draftId: null, dryRun: null, generationId }, { status: e.status });
+      return data({ error: await errorTextFor(request, e), issues: e instanceof MappingError ? e.issues : [], yaml: field('yaml') || null, draftId: null, dryRun: null, generationId }, { status: e.status });
     }
     throw e;
   }
