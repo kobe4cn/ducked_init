@@ -2,7 +2,7 @@ import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { eq, sql } from 'drizzle-orm';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { tasks } from '../../app/.server/db/schema';
@@ -18,6 +18,7 @@ let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); app.outbox.length = 0; });
+afterEach(() => { vi.unstubAllEnvs(); });
 
 /** 任务页上的任务：[类型, 状态] */
 const taskRows = (html: string) =>
@@ -57,6 +58,30 @@ describe('成员查看本租户的任务', () => {
     expect(rows.map(r => r.html.match(/>(排队中|运行中|成功|失败)</)?.[1])).toEqual(['排队中', '失败', '成功']);
     expect(rows[0].html).toContain('生成演示数据');
     expect(rows[1].html).toContain('参数 customers');
+  });
+
+  it('失败原因按界面语言显示（ADR-0060）：带句式的失败任务出读者的语言，旧任务（无句式）仍是原中文', async () => {
+    const acme = await newTenant('acme');
+    // 裸插两条失败任务：一条带句式（调度器写入的失联失败同款），一条是只有中文 error 的旧数据（不回填）
+    await getDb().insert(tasks).values({ tenantId: acme, kind: 'demo.seed', params: {}, status: 'failed', error: '调度器失联，任务中断', errorMsg: { key: '调度器失联，任务中断' } });
+    await getDb().insert(tasks).values({ tenantId: acme, kind: 'lake.inventory', params: {}, status: 'failed', error: '调度器失联，任务中断' });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    // crm_locale 写进 cookie jar：显式传 Cookie 头时 Client 不带 jar，会丢登录会话
+    admin.store('crm_locale=en; Path=/');
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    // 英文界面：带句式的那条出英文，旧任务仍显示原中文
+    const en = taskRows(await (await admin.get('/tasks')).text());
+    const errOf = (rows: ReturnType<typeof taskRows>, kind: string) =>
+      rows.find(r => r.kind === kind)!.html.match(/text-red-600">([^<]*)</)![1];
+    expect(errOf(en, 'demo.seed')).toBe('Dispatcher lost; task interrupted');
+    expect(errOf(en, 'lake.inventory')).toBe('调度器失联，任务中断');
+
+    // 中文界面：两条都是原中文
+    admin.store('crm_locale=zh-CN; Path=/');
+    const zh = taskRows(await (await admin.get('/tasks')).text());
+    expect(errOf(zh, 'demo.seed')).toBe('调度器失联，任务中断');
+    expect(errOf(zh, 'lake.inventory')).toBe('调度器失联，任务中断');
   });
 
   it('成功的任务可以查看结果：各表的行数与运行时的配额', async () => {

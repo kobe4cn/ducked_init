@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."tasks" ADD COLUMN "error_msg" jsonb;

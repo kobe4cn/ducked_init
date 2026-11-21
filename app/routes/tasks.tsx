@@ -1,8 +1,9 @@
 // app/routes/tasks.tsx —— 任务（需登录，任何角色）：本租户最近的任务及其状态、成功任务的结果
 import type { Route } from './+types/tasks';
 import { requireMember } from '~/.server/auth';
+import { getLocale } from '~/.server/locale';
 import { navFor } from '~/.server/nav';
-import { listTasks, TASK_PAGE_SIZE, TASK_STATUS_LABELS } from '~/.server/tasks';
+import { listTasks, TASK_PAGE_SIZE, TASK_STATUS_LABELS, taskErrorText } from '~/.server/tasks';
 import { isTaskKind, readResult } from '~/.server/pipeline/task-contracts';
 import { templateOfKind } from '~/.server/pipeline/templates';
 import { entityLabel } from '~/lib/canonical-model';
@@ -129,6 +130,8 @@ function taskResult(task: { kind: string; result: unknown }): TaskResult | null 
 
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requireMember(request);
+  // 失败原因按读者的界面语言出文字（ADR-0060）：带句式（error_msg）时查词典，旧任务显示原中文
+  const locale = await getLocale(request);
   const tasks = await listTasks(member.tenant.id);
   return {
     email: member.email,
@@ -140,7 +143,7 @@ export async function loader({ request }: Route.LoaderArgs) {
       kindLabel: t.kindLabel,
       status: t.status,
       statusLabel: TASK_STATUS_LABELS[t.status],
-      error: t.error,
+      error: taskErrorText(locale, t),
       result: t.status === 'succeeded' ? taskResult(t) : null,
       createdAt: t.createdAt.toISOString(),
       startedAt: t.startedAt?.toISOString() ?? null,
