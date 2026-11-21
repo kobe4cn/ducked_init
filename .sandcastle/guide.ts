@@ -26,7 +26,15 @@ const firstPath = (text: string) => {
  * 不拿来判断「两张票改同一个文件」。曾经因为 `test/CATALOG.md` 几乎每张加测试的票都改，
  * 这类票只能一张接一张做，两个空位经常只用上一个（2026-11 #732）。
  */
-export const APPEND_ONLY = new Set(["test/CATALOG.md", "test/README.md", "CONTEXT.md", "docs/adr/README.md"]);
+// 翻译表 app/i18n/en.*.json 按键增加，几乎每张双语票都改，算追加型文件，双语票才能两张并行（2026-11-22）。
+export const APPEND_ONLY = new Set([
+  "test/CATALOG.md",
+  "test/README.md",
+  "CONTEXT.md",
+  "docs/adr/README.md",
+  "app/i18n/en.client.json",
+  "app/i18n/en.server.json",
+]);
 
 /**
  * 指引里要改的已有文件（去掉 `:行号`），两种写法都认：
