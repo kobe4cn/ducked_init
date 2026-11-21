@@ -7,6 +7,9 @@ import { useSearchParams } from 'react-router';
 import { Background, Controls, type Edge, MarkerType, type Node, type NodeChange, Panel, Position, ReactFlow, type XYPosition } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { DRIFT_NODE_STYLE, DriftBadge } from '~/components/drift-badge';
+import { builtinName, CANONICAL_NAMES } from '~/lib/builtin-names';
+import { formatNumber } from '~/lib/format';
+import { type Locale, useLocale, type T, useT } from '~/lib/i18n';
 import { driftAttrs, type DriftByTable, type DriftCounts } from '~/lib/lineage-drift';
 import { crossSourceIds, crossSourceLabel, type GraphEdge, type GraphNode, type RelationGraph, identityChangesLabel, ruleLabels } from '~/lib/lineage-graph';
 
@@ -28,8 +31,9 @@ const edgeLabel = (e: GraphEdge, near: boolean) => {
   return e.kind === 'ref' && !near ? undefined : e.label;
 };
 
-const nodeLabel = (n: GraphNode, drift: DriftCounts | undefined): React.ReactNode => {
-  const name = n.kind === 'entity' && n.label !== n.id ? `${n.label}（${n.id}）` : n.label;
+/** 节点的显示：标准实体名按界面语言（英文界面显示英文，自定义实体的 label 就是 id、原样）；t 与 locale 由 RelationGraphView 传入 */
+export const nodeLabel = (n: GraphNode, drift: DriftCounts | undefined, t: T, locale: Locale): React.ReactNode => {
+  const name = n.kind === 'entity' && n.label !== n.id ? `${builtinName(t, n.label, CANONICAL_NAMES)}（${n.id}）` : n.label;
   if (!n.identity && !drift) return name;
   const { rules, summary } = n.identity ?? {};
   const changes = identityChangesLabel(summary ?? null);
@@ -39,7 +43,7 @@ const nodeLabel = (n: GraphNode, drift: DriftCounts | undefined): React.ReactNod
       {rules && <div className="text-[10px] text-slate-500">{ruleLabels(rules)}</div>}
       {n.identity && (
         <div className="text-[10px] text-slate-500">
-          {summary ? `统一消费者 ${summary.groups.toLocaleString()} · 记录 ${summary.records.toLocaleString()}` : '尚未合并'}
+          {summary ? t('统一消费者 {groups} · 记录 {records}', { groups: formatNumber(locale, summary.groups), records: formatNumber(locale, summary.records) }) : t('尚未合并')}
         </div>
       )}
       {changes && <div className="text-[10px] text-slate-500">{changes}</div>}
@@ -50,6 +54,8 @@ const nodeLabel = (n: GraphNode, drift: DriftCounts | undefined): React.ReactNod
 
 /** drift：最近一次成功的漂移检查里有差异的表 */
 export function RelationGraphView({ graph, selected, drift }: { graph: RelationGraph; selected: string | null; drift: DriftByTable }) {
+  const t = useT();
+  const locale = useLocale();
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   const [, setSearchParams] = useSearchParams();
@@ -66,7 +72,7 @@ export function RelationGraphView({ graph, selected, drift }: { graph: RelationG
     id: n.id,
     // React Flow 的坐标是左上角，dagre 给的是中心
     position: moved[n.id] ?? { x: n.x - n.width / 2, y: n.y - n.height / 2 },
-    data: { label: nodeLabel(n, drift[n.id]) },
+    data: { label: nodeLabel(n, drift[n.id], t, locale) },
     domAttributes: driftAttrs(drift[n.id]) as React.HTMLAttributes<HTMLDivElement>,
     width: n.width, height: n.height,
     sourcePosition: Position.Right, targetPosition: Position.Left,
@@ -77,7 +83,7 @@ export function RelationGraphView({ graph, selected, drift }: { graph: RelationG
       fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'grab',
       ...(n.id === selected ? { borderColor: '#0f172a' } : {}),
     },
-  })), [graph, selected, moved, drift]);
+  })), [graph, selected, moved, drift, t, locale]);
 
   const edges = useMemo<Edge[]>(() => graph.edges.map(e => {
     const color = e.connected ? EDGE_COLOR[e.kind] : DISCONNECTED_EDGE;
@@ -125,7 +131,7 @@ export function RelationGraphView({ graph, selected, drift }: { graph: RelationG
           {Object.keys(moved).length > 0 && (
             <Panel position="top-right">
               <button type="button" onClick={() => setMoved({})} className="rounded-lg border bg-white px-3 py-1 text-xs text-slate-600 shadow-sm hover:bg-slate-50">
-                重置布局
+                {t('重置布局')}
               </button>
             </Panel>
           )}
