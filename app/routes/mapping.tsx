@@ -536,10 +536,9 @@ function DisableActions({ disable, submitting }: { disable: DisableData; submitt
       method="post"
       onSubmit={e => {
         const question = disable.requestedBy ? t('确认停用这个映射（{name} 提议）？', { name: disable.requestedBy }) : t('提议停用这个映射？需由另一位数据工程师或管理员确认后生效。');
-        const warning = affected
-          ? `${t('停用后合并撤下它写进标准层的行。')}\n${t('这些已发布的定义会受影响，下次刷新可能失败：{affected}', { affected })}`
-          : t('停用后合并撤下它写进标准层的行。');
-        if (!confirm(`${question}${warning}`)) e.preventDefault();
+        const text = t('{question}停用后合并撤下它写进标准层的行。', { question });
+        const message = affected ? [text, t('这些已发布的定义会受影响，下次刷新可能失败：{affected}', { affected })].join('\n') : text;
+        if (!confirm(message)) e.preventDefault();
       }}
     >
       <input type="hidden" name="intent" value={step} />

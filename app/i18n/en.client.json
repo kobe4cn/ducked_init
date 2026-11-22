@@ -1103,7 +1103,7 @@
   "等待另一位确认：你提议了停用，需由另一位数据工程师或管理员确认": "Waiting for another member to confirm: you proposed disabling this mapping, and another data engineer or administrator must confirm it",
   "确认停用这个映射（{name} 提议）？": "Confirm disabling this mapping (proposed by {name})?",
   "提议停用这个映射？需由另一位数据工程师或管理员确认后生效。": "Propose disabling this mapping? It takes effect only after another data engineer or administrator confirms it.",
-  "停用后合并撤下它写进标准层的行。": "Once disabled, merges remove the rows it wrote to the Silver layer.",
+  "{question}停用后合并撤下它写进标准层的行。": "{question} Once disabled, merges remove the rows it wrote to the Silver layer.",
   "这些已发布的定义会受影响，下次刷新可能失败：{affected}": "These published definitions are affected and may fail on the next refresh: {affected}",
   "指标 {keys}": "Metrics {keys}",
   "标签 {keys}": "Tags {keys}",
