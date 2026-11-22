@@ -16,6 +16,7 @@ import { AlertTriangle } from 'lucide-react';
 import { data, Form, Link } from 'react-router';
 import type { Route } from './+types/analytics.snapshots.$id';
 import { requirePermission } from '~/.server/access';
+import { errorTextFor } from '~/.server/i18n';
 import { navFor } from '~/.server/nav';
 import { TEMPLATES } from '~/.server/pipeline/templates';
 import { RFM_DEFAULTS } from '~/.server/pipeline/templates/rfm';
@@ -130,7 +131,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       }
     }
   } catch (e) {
-    if (e instanceof SnapshotError) throw data({ message: e.message }, { status: e.status });
+    if (e instanceof SnapshotError) throw data({ message: await errorTextFor(request, e) }, { status: e.status });
     throw e;
   }
 }

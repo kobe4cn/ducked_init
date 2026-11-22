@@ -18,6 +18,7 @@ import { requirePermission } from '~/.server/access';
 import type { DraftAmbiguity as DraftAmbiguityInfo } from '~/.server/catalog/draft-search';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { createDefinition, DslError, dslContext, modelDraftForDefinition } from '~/.server/dsl-definitions';
+import { errorTextFor } from '~/.server/i18n';
 import { MetricParseError, parseMetricSentence } from '~/.server/metric-parse';
 import { DSL_KINDS, isDslKind, type DslKind } from '~/.server/pipeline/dsl';
 import { checkMetric, compileMetric, fieldsFor } from '~/.server/pipeline/dsl/metric-spec';
@@ -378,7 +379,7 @@ export async function action({ request }: Route.ActionArgs) {
     await createDefinition(member, kind, key, yaml);
   } catch (e) {
     // MetricParseError（空句 / 超长 400、未配置模型服务 409、模型失败或不过校验 422）不是 DslError，不补会变成 500；表单保持原样
-    if (e instanceof DslError || e instanceof MetricParseError) return data({ error: e.message, issues: e.issues ?? [], yaml, summary: null, sql: null, ...keep }, { status: e.status });
+    if (e instanceof DslError || e instanceof MetricParseError) return data({ error: await errorTextFor(request, e), issues: e.issues ?? [], yaml, summary: null, sql: null, ...keep }, { status: e.status });
     throw e;
   }
   throw redirect(`/analytics/definitions/${kind}/${key}`);

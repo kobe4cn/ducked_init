@@ -18,6 +18,7 @@ import { expand } from '~/.server/catalog';
 import {
   backfillDefinition, deleteDefinition, discardDslDraft, DslError, getDefinition, impactOf, previewDefinition, publishDefinition, recomputeDefinition, saveDslDraft,
 } from '~/.server/dsl-definitions';
+import { errorTextFor } from '~/.server/i18n';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
 import { navFor } from '~/.server/nav';
 import { describeAssertion, type AssertionResult } from '~/.server/pipeline/assertions';
@@ -182,7 +183,7 @@ export async function action({ request, params }: Route.ActionArgs) {
     }
   } catch (e) {
     // 发布流程抛的 PublishError（如双人规则的 403）也要按状态码展示给成员，只有 DslError 带按行列的问题
-    if (e instanceof PublishError) return data({ error: e.message, issues: e instanceof DslError ? e.issues : [], yaml: intent === 'save' ? yaml : null, preview: null, impact: null }, { status: e.status });
+    if (e instanceof PublishError) return data({ error: await errorTextFor(request, e), issues: e instanceof DslError ? e.issues : [], yaml: intent === 'save' ? yaml : null, preview: null, impact: null }, { status: e.status });
     throw e;
   }
 }
