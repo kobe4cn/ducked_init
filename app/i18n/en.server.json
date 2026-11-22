@@ -45,6 +45,7 @@
   "源表里没有列 {column}": "The source table has no column {column}",
   "点查": "Lookup",
   "申请过于频繁，请 {minutes} 分钟后再试。": "Too many requests. Please try again in {minutes, plural, one {# minute.} other {# minutes.}}",
+  "登录链接无效、已过期或已被使用，请重新申请。": "The Magic Link is invalid, expired, or already used; request a new one.",
   "目录": "Catalog",
   "租户已停用，任务终止": "Tenant suspended; task terminated",
   "类型 {type} 不是标准层的类型，请在 YAML 里修改": "Type {type} is not a Silver-layer type; edit it in the YAML",
