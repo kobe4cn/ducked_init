@@ -9,6 +9,8 @@
 // 只能 import app/lib 里的东西（.server 的只能 import type）
 import { parseDocument, stringify } from 'yaml';
 import type { FieldType } from './canonical-model';
+import { builtinName, CANONICAL_NAMES } from './builtin-names';
+import { msg, type Msg, type T } from './i18n';
 import { AGGS, FILTER_OPS, FILTER_OP_TEXT, MAX_DIMENSIONS, NUMERIC_TYPES, RATIO_AGGS } from './metric-vocab';
 
 /** 表单认识的字段：调用方传进来（服务端用 fieldsFor(entity, ctx)，metric-spec.ts）；不接收 DslContext——它带服务端的已发布实体与计划，前端拿不到 */
@@ -20,8 +22,9 @@ export interface Cond { field: string; op: (typeof FILTER_OPS)[number]; value?: 
 /** ratio 的分子或分母在表单里的样子 */
 export interface RatioForm { agg: (typeof RATIO_AGGS)[number]; field?: string; filter: Cond[] }
 
-/** 表单表达不了的写法：key 是它在定义里的位置（顶层键名、measure.field、measure.numerator、filter.1、dimensions.0，整个定义读不了是 $yaml），raw 是原始值 */
-export interface ReadonlyItem { key: string; reason: string; raw: unknown }
+/** 表单表达不了的写法：key 是它在定义里的位置（顶层键名、measure.field、measure.numerator、filter.1、dimensions.0，整个定义读不了是 $yaml），raw 是原始值；
+ *  reason 带句式（Msg，ADR-0060），展示时 msgText / formatServer 按界面语言出文字 */
+export interface ReadonlyItem { key: string; reason: Msg; raw: unknown }
 
 /** 指标表单的状态 */
 export interface MetricForm {
@@ -48,14 +51,14 @@ export function opsFor(type: FieldType): { op: (typeof FILTER_OPS)[number]; labe
   return (ops[type] ?? FILTER_OPS).map(op => ({ op, label: FILTER_OP_TEXT[op] }));
 }
 
-const UNKNOWN = '这种写法表单不认识，请在 YAML 里修改';
-const PATH_REASON = '字段是路径（沿关系走到别的实体，ADR-0038），请在 YAML 里修改';
-const DIM_PATH_REASON = '维度路径沿关系走（-> 或 consumer.），请在 YAML 里修改';
+const UNKNOWN = msg('这种写法表单不认识，请在 YAML 里修改');
+const PATH_REASON = msg('字段是路径（沿关系走到别的实体，ADR-0038），请在 YAML 里修改');
+const DIM_PATH_REASON = msg('维度路径沿关系走（-> 或 consumer.），请在 YAML 里修改');
 
 /** 表单表达不了、但认识的顶层键 */
-const TOP_REASON: Record<string, string> = {
-  consumer_via: '基础实体经哪个字段一跳关联消费者（consumer_via），请在 YAML 里修改',
-  device_attribution: '匿名事件的设备归属（device_attribution），请在 YAML 里修改',
+const TOP_REASON: Record<string, Msg> = {
+  consumer_via: msg('基础实体经哪个字段一跳关联消费者（consumer_via），请在 YAML 里修改'),
+  device_attribution: msg('匿名事件的设备归属（device_attribution），请在 YAML 里修改'),
 };
 
 /** measure / filter / window 的字段里含 . 或 -> 就是路径，不是基础实体上的裸字段名 */
@@ -66,7 +69,7 @@ const isOps = (v: unknown): v is (typeof FILTER_OPS)[number] => typeof v === 'st
 const noValue = (op: (typeof FILTER_OPS)[number]) => op === 'is_null' || op === 'not_null';
 
 /** 一条过滤条件的表单状态；表单表达不了时返回原因 */
-function readCond(v: unknown): Cond | string {
+function readCond(v: unknown): Cond | Msg {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return UNKNOWN;
   const { field, op, value, ...rest } = v as Record<string, unknown>;
   if (Object.keys(rest).length || typeof field !== 'string') return UNKNOWN;
@@ -75,9 +78,9 @@ function readCond(v: unknown): Cond | string {
   if (value === undefined) return { field, op };
   const scalar = (x: unknown): string | undefined => (typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean') ? String(x) : undefined;
   const one = scalar(value);
-  if (one !== undefined) return noValue(op) ? `${op} 不用写 value，请在 YAML 里修改` : { field, op, value: one };
+  if (one !== undefined) return noValue(op) ? msg('{op} 不用写 value，请在 YAML 里修改', { op }) : { field, op, value: one };
   if (Array.isArray(value) && value.every(x => scalar(x) !== undefined)) return { field, op, value: value.map(x => scalar(x)!) };
-  return '取值不是标量或标量列表，请在 YAML 里修改';
+  return msg('取值不是标量或标量列表，请在 YAML 里修改');
 }
 
 /** 过滤列表（顶层 filter 与 ratio 分子、分母的 filter）的表单状态；认不出的条目按原下标记只读，写回时原样放回那个位置 */
@@ -90,7 +93,7 @@ function readFilter(list: unknown, at: string, readonly: ReadonlyItem[]): Cond[]
   const conds: Cond[] = [];
   list.forEach((v, i) => {
     const read = readCond(v);
-    if (typeof read === 'string') readonly.push({ key: `${at}.${i}`, reason: read, raw: v });
+    if ('key' in read) readonly.push({ key: `${at}.${i}`, reason: read, raw: v });
     else conds.push(read);
   });
   return conds;
@@ -98,12 +101,11 @@ function readFilter(list: unknown, at: string, readonly: ReadonlyItem[]): Cond[]
 
 /** ratio 分子 / 分母的表单状态；没写或写法不认识时整个记只读（分子字段的路径单独记） */
 function readPart(part: unknown, at: 'numerator' | 'denominator', readonly: ReadonlyItem[]): RatioForm {
-  const whole = `${at === 'numerator' ? '分子' : '分母'}（measure.${at}）`;
-  const fail = (reason: string): RatioForm => {
+  const fail = (reason: Msg): RatioForm => {
     readonly.push({ key: `measure.${at}`, reason, raw: part });
     return { agg: 'count', filter: [] };
   };
-  if (typeof part !== 'object' || part === null || Array.isArray(part)) return fail(part === undefined ? `ratio 要写${whole}，请在 YAML 里修改` : UNKNOWN);
+  if (typeof part !== 'object' || part === null || Array.isArray(part)) return fail(part === undefined ? msg('ratio 要写{at, select, numerator {分子} denominator {分母} other {}}（measure.{at}），请在 YAML 里修改', { at }) : UNKNOWN);
   const { agg, field, filter, ...rest } = part as Record<string, unknown>;
   if (Object.keys(rest).length || typeof agg !== 'string' || !(RATIO_AGGS as readonly string[]).includes(agg)) return fail(UNKNOWN);
   const form: RatioForm = { agg: agg as RatioForm['agg'], filter: readFilter(filter, `measure.${at}.filter`, readonly) };
@@ -115,36 +117,36 @@ function readPart(part: unknown, at: 'numerator' | 'denominator', readonly: Read
 }
 
 /** 一条维度的表单状态；表单表达不了（as_of、多跳或 consumer. 路径、超上限、别的写法）时返回原因 */
-function readDimension(d: unknown, i: number): { name: string; path: string } | string {
+function readDimension(d: unknown, i: number): { name: string; path: string } | Msg {
   if (typeof d !== 'object' || d === null || Array.isArray(d)) return UNKNOWN;
   const item = d as Record<string, unknown>;
-  if ('as_of' in item) return '维度按时间点关联（as_of），请在 YAML 里修改';
+  if ('as_of' in item) return msg('维度按时间点关联（as_of），请在 YAML 里修改');
   if (!('name' in item) || !('path' in item) || Object.keys(item).some(k => k !== 'name' && k !== 'path')) return UNKNOWN;
   const { name, path } = item;
   if (typeof name !== 'string' || typeof path !== 'string') return UNKNOWN;
-  if (i >= MAX_DIMENSIONS) return `维度最多 ${MAX_DIMENSIONS} 个，请在 YAML 里修改`;
+  if (i >= MAX_DIMENSIONS) return msg('维度最多 {max} 个，请在 YAML 里修改', { max: MAX_DIMENSIONS });
   return dimIsPath(path) ? DIM_PATH_REASON : { name, path };
 }
 
 /** 指标定义 YAML → 表单状态：认不出的写法只读并说明原因，原始值原样保留（fields 与 formToYaml 对称；读出取值都按字符串收，不需要字段表） */
 export function yamlToForm(text: string, fields: FormField[]): MetricForm {
   void fields;
-  const whole = (reason: string): MetricForm => ({ base: '', agg: 'count', filter: [], dimensions: [], readonly: [{ key: '$yaml', reason, raw: text }] });
+  const whole = (reason: Msg): MetricForm => ({ base: '', agg: 'count', filter: [], dimensions: [], readonly: [{ key: '$yaml', reason, raw: text }] });
   const doc = parseDocument(text);
-  if (doc.errors.length) return whole(`YAML 语法错误：${doc.errors[0]!.message.split('\n')[0]}，请在 YAML 里修改`);
+  if (doc.errors.length) return whole(msg('YAML 语法错误：{message}，请在 YAML 里修改', { message: doc.errors[0]!.message.split('\n')[0] }));
   const v = doc.toJS();
   const baseName = (typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>).base : undefined);
-  if (typeof baseName !== 'string') return whole('定义要写成带 base（基础实体）的对象，请在 YAML 里修改');
+  if (typeof baseName !== 'string') return whole(msg('定义要写成带 base（基础实体）的对象，请在 YAML 里修改'));
   const top = v as Record<string, unknown>;
   const readonly: ReadonlyItem[] = [];
   const form: MetricForm = { base: baseName, agg: 'count', filter: [], dimensions: [], readonly };
   for (const [k, val] of Object.entries(top)) {
     if (['base', 'measure', 'filter', 'window', 'dimensions', 'description'].includes(k)) continue;
-    readonly.push({ key: k, reason: TOP_REASON[k] ?? `不认识的键 ${k}，请在 YAML 里修改`, raw: val });
+    readonly.push({ key: k, reason: TOP_REASON[k] ?? msg('不认识的键 {key}，请在 YAML 里修改', { key: k }), raw: val });
   }
   const m = top.measure;
   if (typeof m !== 'object' || m === null || Array.isArray(m)) {
-    readonly.push({ key: 'measure', reason: m === undefined ? '没有度量（measure），请在 YAML 里修改' : UNKNOWN, raw: m });
+    readonly.push({ key: 'measure', reason: m === undefined ? msg('没有度量（measure），请在 YAML 里修改') : UNKNOWN, raw: m });
   } else {
     const { agg, field, by, numerator, denominator, ...rest } = m as Record<string, unknown>;
     if (Object.keys(rest).length || typeof agg !== 'string' || !(AGGS as readonly string[]).includes(agg)) {
@@ -179,7 +181,7 @@ export function yamlToForm(text: string, fields: FormField[]): MetricForm {
     if (!Array.isArray(ds)) readonly.push({ key: 'dimensions', reason: UNKNOWN, raw: ds });
     else for (const [i, d] of ds.entries()) {
       const read = readDimension(d, i);
-      if (typeof read === 'string') readonly.push({ key: `dimensions.${i}`, reason: read, raw: d });
+      if ('key' in read) readonly.push({ key: `dimensions.${i}`, reason: read, raw: d });
       else form.dimensions.push(read);
     }
   }
@@ -279,71 +281,78 @@ export function formToYaml(form: MetricForm, fields: FormField[]): string {
   return stringify(spec);
 }
 
-/** 字段的中文名（没有就用字段名） */
-const labelOf = (name: string, fields: readonly FormField[]) => fields.find(f => f.name === name)?.label ?? name;
+/** 字段的显示名：标准字段按界面语言（builtinName 查内置名词典，ADR-0060），租户自定义的与词表外的字段名原样 */
+const labelOf = (t: T, name: string, fields: readonly FormField[]) => {
+  const f = fields.find(f => f.name === name);
+  return f ? builtinName(t, f.label ?? f.name, CANONICAL_NAMES) : name;
+};
 
-/** 取值在摘要里的显示：列表用「、」连接 */
-const show = (v: string | string[] | undefined) => (Array.isArray(v) ? v.join('、') : (v ?? ''));
+/** 取值在摘要里的显示：列表用界面语言的顿号 / 逗号连接 */
+const show = (t: T, v: string | string[] | undefined) => (Array.isArray(v) ? v.join(t('、')) : (v ?? ''));
 
 const FILTER_TEXT = {
-  eq: (v: string) => `等于 ${v}`,
-  ne: (v: string) => `不等于 ${v}`,
-  in: (v: string) => `在 ${v} 中`,
-  not_in: (v: string) => `不在 ${v} 中`,
-  gt: (v: string) => `大于 ${v}`,
-  gte: (v: string) => `大于等于 ${v}`,
-  lt: (v: string) => `小于 ${v}`,
-  lte: (v: string) => `小于等于 ${v}`,
-  is_null: () => '为空',
-  not_null: () => '不为空',
-} satisfies Record<(typeof FILTER_OPS)[number], (v: string) => string>;
+  eq: (t: T, v: string) => t('等于 {v}', { v }),
+  ne: (t: T, v: string) => t('不等于 {v}', { v }),
+  in: (t: T, v: string) => t('在 {v} 中', { v }),
+  not_in: (t: T, v: string) => t('不在 {v} 中', { v }),
+  gt: (t: T, v: string) => t('大于 {v}', { v }),
+  gte: (t: T, v: string) => t('大于等于 {v}', { v }),
+  lt: (t: T, v: string) => t('小于 {v}', { v }),
+  lte: (t: T, v: string) => t('小于等于 {v}', { v }),
+  is_null: (t: T) => t('为空'),
+  not_null: (t: T) => t('不为空'),
+} satisfies Record<(typeof FILTER_OPS)[number], (t: T, v: string) => string>;
 
-/** 过滤条件逐条中文化 */
-const filterTexts = (conds: readonly Cond[], fields: readonly FormField[]) =>
-  conds.map(c => `${labelOf(c.field, fields)} ${FILTER_TEXT[c.op](show(c.value))}`.trim());
+/** 过滤条件逐条按界面语言成句 */
+const filterTexts = (t: T, conds: readonly Cond[], fields: readonly FormField[]) =>
+  conds.map(c => `${labelOf(t, c.field, fields)} ${FILTER_TEXT[c.op](t, show(t, c.value))}`.trim());
 
-/** 第一句的主体：聚合与字段（用中文名）；ratio 写成「分子…÷ 分母…」 */
-function measurePhrase(form: MetricForm, fields: readonly FormField[]): string {
-  const label = (name: string | undefined) => name === undefined ? '' : labelOf(name, fields);
-  const count = (field: string | undefined) => field === undefined ? '行数' : `${label(field)}不为空的行数`;
+/** 第一句（计算什么）：按聚合各给一句式；ratio 用一个 select 句式把分子、分母的形状（行数 / 某字段不为空的行数 / 不同取值个数 / 求和）挑出来，字段名单独传给各分支 */
+function measurePhrase(t: T, form: MetricForm, fields: readonly FormField[]): string {
+  const label = (name: string | undefined) => name === undefined ? '' : labelOf(t, name, fields);
+  const count = (field: string | undefined) => field === undefined ? t('计算行数。') : t('计算{field}不为空的行数。', { field: label(field) });
   if (form.agg === 'ratio') {
-    const part = (p: RatioForm | undefined) => {
-      if (p === undefined) return '';
-      if (p.agg === 'count') return count(p.field);
-      return p.agg === 'count_distinct' ? `${label(p.field)}的不同取值个数` : `${label(p.field)}求和`;
+    const part = (p: RatioForm | undefined): [string, string] => {
+      if (p === undefined) return ['other', ''];
+      if (p.agg === 'count') return p.field === undefined ? ['rows', ''] : ['nonempty', label(p.field)];
+      return p.agg === 'count_distinct' ? ['distinct', label(p.field)] : ['sum', label(p.field)];
     };
-    return `分子${part(form.numerator)} ÷ 分母${part(form.denominator)}`;
+    const [num, numField] = part(form.numerator);
+    const [den, denField] = part(form.denominator);
+    return t('计算分子{num, select, rows {行数} nonempty {{numField}不为空的行数} distinct {{numField}的不同取值个数} sum {{numField}求和} other {}} ÷ 分母{den, select, rows {行数} nonempty {{denField}不为空的行数} distinct {{denField}的不同取值个数} sum {{denField}求和} other {}}。', { num, numField, den, denField });
   }
   const phrase: Record<Exclude<(typeof AGGS)[number], 'ratio'>, () => string> = {
     count: () => count(form.field),
-    count_distinct: () => `${label(form.field)}的不同取值个数`,
-    sum: () => `${label(form.field)}求和`,
-    avg: () => `${label(form.field)}平均值`,
-    min: () => `${label(form.field)}最小值`,
-    max: () => `${label(form.field)}最大值`,
-    latest: () => `按${label(form.by)}取最新一行的${label(form.field)}`,
-    earliest: () => `按${label(form.by)}取最早一行的${label(form.field)}`,
-    days_since: () => `距${label(form.field)}最近一天的天数`,
+    count_distinct: () => t('计算{field}的不同取值个数。', { field: label(form.field) }),
+    sum: () => t('计算{field}求和。', { field: label(form.field) }),
+    avg: () => t('计算{field}平均值。', { field: label(form.field) }),
+    min: () => t('计算{field}最小值。', { field: label(form.field) }),
+    max: () => t('计算{field}最大值。', { field: label(form.field) }),
+    latest: () => t('计算按{by}取最新一行的{field}。', { by: label(form.by), field: label(form.field) }),
+    earliest: () => t('计算按{by}取最早一行的{field}。', { by: label(form.by), field: label(form.field) }),
+    days_since: () => t('计算距{field}最近一天的天数。', { field: label(form.field) }),
   };
   return phrase[form.agg]();
 }
 
 /**
  * 指标表单的四句摘要：① 计算什么（聚合与字段）② 只算哪些记录（filter 只保留满足条件的行：顶层写「只算 … 的记录」，ratio 分子、分母自己的过滤写「分子只算 … 的记录」，多条用「并且」，没有任何过滤时「不排除任何记录」）
- * ③ 按什么时间（「近 N 天，按 xx 时间」，没有时「不限时间」）④ ratio 时「分母为 0 或为空时结果记为空」（与 compileMetric 的 NULLIF 一致）；非 ratio 时省略，返回三句
+ * ③ 按什么时间（「近 N 天，按 xx 时间」，没有时「不限时间」）④ ratio 时「分母为 0 或为空时结果记为空」（与 compileMetric 的 NULLIF 一致）；非 ratio 时省略，返回三句。
+ * 句子按界面语言出（t 由调用方构造），中文界面回退中文原文、逐字与改造前一致
  */
-export function summarize(form: MetricForm, fields: readonly FormField[]): string[] {
+export function summarize(t: T, form: MetricForm, fields: readonly FormField[]): string[] {
   // filter 只保留满足条件的行（全部满足）；分子、分母自己的 filter 只限制分子或分母，各自写明范围
-  const scope = (who: string, conds: readonly Cond[]) => conds.length ? [`${who}只算 ${filterTexts(conds, fields).join(' 并且 ')} 的记录`] : [];
+  const scope = (who: '' | 'numerator' | 'denominator', conds: readonly Cond[]) =>
+    conds.length ? [t('{who, select, numerator {分子} denominator {分母} other {}}只算 {conds} 的记录', { who, conds: filterTexts(t, conds, fields).join(t(' 并且 ')) })] : [];
   const scopes = [
     ...scope('', form.filter),
-    ...(form.agg === 'ratio' ? [...scope('分子', form.numerator?.filter ?? []), ...scope('分母', form.denominator?.filter ?? [])] : []),
+    ...(form.agg === 'ratio' ? [...scope('numerator', form.numerator?.filter ?? []), ...scope('denominator', form.denominator?.filter ?? [])] : []),
   ];
   return [
-    `计算${measurePhrase(form, fields)}。`,
-    scopes.length ? `${scopes.join('；')}。` : '不排除任何记录。',
-    form.window ? `近 ${form.window.days} 天，按${labelOf(form.window.field, fields)}。` : '不限时间。',
-    ...(form.agg === 'ratio' ? ['分母为 0 或为空时结果记为空。'] : []),
+    measurePhrase(t, form, fields),
+    scopes.length ? t('{scopes}。', { scopes: scopes.join(t('；')) }) : t('不排除任何记录。'),
+    form.window ? t('近 {days} 天，按{field}。', { days: form.window.days, field: labelOf(t, form.window.field, fields) }) : t('不限时间。'),
+    ...(form.agg === 'ratio' ? [t('分母为 0 或为空时结果记为空。')] : []),
   ];
 }
 
@@ -352,9 +361,9 @@ export function summarize(form: MetricForm, fields: readonly FormField[]): strin
  * 只留不相等的项，缺的一边记 ''（如 ratio 比非 ratio 多一句分母说明）。字段表用解析结果那张的基础实体
  * （换基础实体时两张的字段名对不上，中文名显示不出来就退回字段名）
  */
-export function diffForms(current: MetricForm, next: MetricForm, fields: readonly FormField[]): { before: string; after: string }[] {
-  const before = summarize(current, fields);
-  const after = summarize(next, fields);
+export function diffForms(t: T, current: MetricForm, next: MetricForm, fields: readonly FormField[]): { before: string; after: string }[] {
+  const before = summarize(t, current, fields);
+  const after = summarize(t, next, fields);
   const out: { before: string; after: string }[] = [];
   for (let i = 0; i < Math.max(before.length, after.length); i++) {
     const b = before[i] ?? '', a = after[i] ?? '';

@@ -2,13 +2,18 @@
 // count / sum / ratio / latest 的表单写成 YAML 过 checkMetric，读回与原表单相等（往返不丢信息，取值按字段类型转换）；
 // consumer_via、device_attribution、路径（-> / consumer.）、维度的 as_of 与不认识的键标成只读并说明原因，raw 原样写回后仍过 checkMetric、与原定义深相等；
 // summarize 四句（ratio + 过滤 + 窗口）与非 ratio 三句的全文；过滤句写「只算…的记录」，分子、分母的过滤各自写明范围；
-// diffForms 把两张表单的摘要按位置配对，只留不相等的项（缺的一边记空串）
+// diffForms 把两张表单的摘要按位置配对，只留不相等的项（缺的一边记空串）；
+// 双语（#1053，ADR-0060）：只读原因带句式（Msg），中文界面 formatServer 逐字等于改造前的原文；summarize / diffForms 第一个参数是翻译函数，
+// 英文界面（makeT('en', enClient)，标准字段名经 builtinName 显示 Amount Paid 等）四句是英文、没有汉字
 import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf, type CustomEntityField, type EntityRelation } from '../app/lib/canonical-model';
 import type { RegisteredEntity } from '../app/.server/custom-entities';
 import { checkMetric, type DslContext } from '../app/.server/pipeline/dsl/metric-spec';
 import { FILTER_OPS, FILTER_OP_TEXT } from '../app/lib/metric-vocab';
+import { makeT, msgText } from '../app/lib/i18n';
+import { formatServer } from '../app/.server/i18n';
+import enClient from '../app/i18n/en.client.json';
 import { diffForms, formToYaml, opsFor, summarize, yamlToForm, type FormField, type MetricForm } from '../app/lib/metric-form';
 
 const field = (name: string, type: CustomEntityField['type'] = 'string'): CustomEntityField => ({ name, type, description: '', sensitive: false });
@@ -39,6 +44,11 @@ const LINE: FormField[] = [field('line_id'), field('order_id'), field('visit_id'
   .map(f => ({ name: f.name, type: f.type }));
 
 const empty: Pick<MetricForm, 'filter' | 'dimensions' | 'readonly'> = { filter: [], dimensions: [], readonly: [] };
+
+/** 中文界面（词典不下发、按中文原文回退）与英文界面（查 en.client.json）的翻译函数 */
+const zh = makeT('zh-CN', null);
+const en = makeT('en', enClient);
+const HAN = /[一-鿿]/;
 
 /** 表单 → YAML 过 checkMetric，再读回与原表单相等 */
 function roundTrip(form: MetricForm, fields: FormField[]) {
@@ -112,7 +122,7 @@ dimensions:
     expect(form.dimensions).toEqual([]);
     expect(form.window).toBeUndefined();
     expect(form.readonly.map(r => r.key)).toEqual(['consumer_via', 'filter.0', 'window', 'dimensions.0']);
-    for (const r of form.readonly) expect(r.reason, r.key).toContain('请在 YAML 里修改');
+    for (const r of form.readonly) expect(formatServer('zh-CN', r.reason), r.key).toContain('请在 YAML 里修改');
     const out = formToYaml(form, LINE);
     expect(checkMetric(out, ctx).ok, out).toBe(true);
     expect(parse(out), out).toEqual(parse(yaml));
@@ -126,7 +136,7 @@ measure: { agg: count, field: order.store_id -> custom_store.name }
 `;
     const form = yamlToForm(yaml, ORDER);
     expect(form.readonly.map(r => r.key)).toEqual(['device_attribution', 'renamed', 'measure.field']);
-    for (const r of form.readonly) expect(r.reason, r.key).toContain('请在 YAML 里修改');
+    for (const r of form.readonly) expect(formatServer('zh-CN', r.reason), r.key).toContain('请在 YAML 里修改');
     expect(parse(formToYaml(form, ORDER))).toEqual(parse(yaml));
   });
 
@@ -151,7 +161,7 @@ measure:
 
 describe('四句摘要', () => {
   it('ratio + 过滤 + 窗口给四句全文', () => {
-    expect(summarize({
+    expect(summarize(zh, {
       base: 'order', agg: 'ratio', ...empty,
       numerator: { agg: 'count', filter: [{ field: 'status', op: 'eq', value: 'paid' }] },
       denominator: { agg: 'sum', field: 'amount', filter: [] },
@@ -166,17 +176,17 @@ describe('四句摘要', () => {
   });
 
   it('非 ratio、无窗口时三句：聚合、过滤、不限时间', () => {
-    expect(summarize({ base: 'order', agg: 'count', ...empty, filter: [{ field: 'status', op: 'eq', value: 'paid' }] }, ORDER))
+    expect(summarize(zh, { base: 'order', agg: 'count', ...empty, filter: [{ field: 'status', op: 'eq', value: 'paid' }] }, ORDER))
       .toEqual(['计算行数。', '只算 订单状态 等于 paid 的记录。', '不限时间。']);
   });
 
   it('ratio 只有分母过滤时第二句只说分母的范围，不说成排除整个指标的记录', () => {
-    expect(summarize({
+    expect(summarize(zh, {
       base: 'order', agg: 'ratio', ...empty,
       numerator: { agg: 'count', filter: [] },
       denominator: { agg: 'count', filter: [{ field: 'status', op: 'in', value: ['paid', 'completed'] }, { field: 'channel', op: 'not_null' }] },
     }, ORDER)[1]).toBe('分母只算 订单状态 在 paid、completed 中 并且 渠道 不为空 的记录。');
-    expect(summarize({ base: 'order', agg: 'count', ...empty }, ORDER)[1]).toBe('不排除任何记录。');
+    expect(summarize(zh, { base: 'order', agg: 'count', ...empty }, ORDER)[1]).toBe('不排除任何记录。');
   });
 });
 
@@ -184,9 +194,9 @@ describe('表单差异', () => {
   it('只差窗口的两张表单只出一项（原来 → 解析后），完全相同时为空', () => {
     const withWindow: MetricForm = { base: 'order', agg: 'sum', field: 'amount', ...empty, window: { field: 'created_at', days: 30 } };
     const withoutWindow: MetricForm = { base: 'order', agg: 'sum', field: 'amount', ...empty };
-    expect(diffForms(withWindow, withoutWindow, ORDER)).toEqual([{ before: '近 30 天，按下单时间。', after: '不限时间。' }]);
-    expect(diffForms(withoutWindow, withWindow, ORDER)).toEqual([{ before: '不限时间。', after: '近 30 天，按下单时间。' }]);
-    expect(diffForms(withWindow, { ...withWindow }, ORDER)).toEqual([]);
+    expect(diffForms(zh, withWindow, withoutWindow, ORDER)).toEqual([{ before: '近 30 天，按下单时间。', after: '不限时间。' }]);
+    expect(diffForms(zh, withoutWindow, withWindow, ORDER)).toEqual([{ before: '不限时间。', after: '近 30 天，按下单时间。' }]);
+    expect(diffForms(zh, withWindow, { ...withWindow }, ORDER)).toEqual([]);
   });
 
   it('句子数不同（ratio 比非 ratio 多一句分母说明）时，缺的一边记空串', () => {
@@ -196,9 +206,91 @@ describe('表单差异', () => {
       numerator: { agg: 'count', filter: [] },
       denominator: { agg: 'count', filter: [] },
     };
-    expect(diffForms(plain, ratio, ORDER)).toEqual([
+    expect(diffForms(zh, plain, ratio, ORDER)).toEqual([
       { before: '计算行数。', after: '计算分子行数 ÷ 分母行数。' },
       { before: '', after: '分母为 0 或为空时结果记为空。' },
     ]);
+  });
+});
+
+describe('双语（#1053）：只读原因与摘要按界面语言出文字', () => {
+  it('只读原因中文逐字不变（formatServer），英文是英文：没有汉字', () => {
+    const withPaths = `base: custom_line
+consumer_via: order_id
+measure: { agg: sum, field: qty }
+filter:
+  - { field: custom_line.order_id -> order.status, op: in, value: [paid, completed] }
+dimensions:
+  - name: store
+    path: custom_line.store_id
+    as_of: current
+`;
+    const form = yamlToForm(withPaths, LINE);
+    for (const r of form.readonly) {
+      expect(formatServer('zh-CN', r.reason), r.key).toContain('请在 YAML 里修改');
+      expect(msgText(en, r.reason), r.key).not.toMatch(HAN);
+    }
+    // 每种原因都给出一条：词表外键、路径、as_of 维度、值形状不对
+    const unreadable = yamlToForm('base: order\nmeasure: { agg: sum, field: amount }\nrenamed: { a: 1 }\n', ORDER);
+    expect(formatServer('zh-CN', unreadable.readonly.find(r => r.key === 'renamed')!.reason)).toBe('不认识的键 renamed，请在 YAML 里修改');
+    expect(msgText(en, unreadable.readonly.find(r => r.key === 'renamed')!.reason)).toBe('Unknown key renamed; edit it in the YAML');
+    const badCond = yamlToForm('base: order\nmeasure: { agg: count }\nfilter:\n  - { field: status, op: eq, value: { x: 1 } }\n', ORDER);
+    expect(formatServer('zh-CN', badCond.readonly[0]!.reason)).toBe('取值不是标量或标量列表，请在 YAML 里修改');
+    expect(msgText(en, badCond.readonly[0]!.reason)).toBe('The value is not a scalar or a list of scalars; edit it in the YAML');
+    const noValue = yamlToForm('base: order\nmeasure: { agg: count }\nfilter:\n  - { field: status, op: is_null, value: paid }\n', ORDER);
+    expect(formatServer('zh-CN', noValue.readonly[0]!.reason)).toBe('is_null 不用写 value，请在 YAML 里修改');
+    expect(msgText(en, noValue.readonly[0]!.reason)).toBe('is_null takes no value; edit it in the YAML');
+    const ratioMiss = yamlToForm('base: order\nmeasure: { agg: ratio, numerator: { agg: count } }\n', ORDER);
+    expect(formatServer('zh-CN', ratioMiss.readonly.find(r => r.key === 'measure.denominator')!.reason)).toBe('ratio 要写分母（measure.denominator），请在 YAML 里修改');
+    expect(msgText(en, ratioMiss.readonly.find(r => r.key === 'measure.denominator')!.reason)).toBe('ratio needs a denominator (measure.denominator); edit it in the YAML');
+    const tooMany = yamlToForm('base: order\nmeasure: { agg: count }\ndimensions:\n' + Array.from({ length: 4 }, (_, i) => `  - { name: d${i}, path: order.d${i} }\n`).join(''), ORDER);
+    expect(formatServer('zh-CN', tooMany.readonly.find(r => r.key === 'dimensions.3')!.reason)).toBe('维度最多 3 个，请在 YAML 里修改');
+    expect(msgText(en, tooMany.readonly.find(r => r.key === 'dimensions.3')!.reason)).toBe('At most 3 dimensions are allowed; edit it in the YAML');
+    const bad = yamlToForm('base: order\nmeasure: [1]\n', ORDER);
+    expect(msgText(en, bad.readonly[0]!.reason)).not.toMatch(HAN);
+  });
+
+  it('英文界面四句摘要是英文：标准字段名显示英文名，取值原样；中文界面逐字不变（上面两组用例）', () => {
+    const form: MetricForm = {
+      base: 'order', agg: 'ratio', ...empty,
+      numerator: { agg: 'count', filter: [{ field: 'status', op: 'eq', value: 'paid' }] },
+      denominator: { agg: 'sum', field: 'amount', filter: [] },
+      filter: [{ field: 'channel', op: 'not_null' }],
+      window: { field: 'created_at', days: 30 },
+    };
+    expect(summarize(en, form, ORDER)).toEqual([
+      'Calculates the numerator (the number of rows) ÷ the denominator (the sum of Amount Paid).',
+      'Counts only records where Channel is not empty; Numerator counts only records where Order Status equals paid.',
+      'In the last 30 days, by Placed At.',
+      'When the denominator is 0 or empty, the result is null.',
+    ]);
+    // 非 ratio 三句、列表取值用逗号连接、多条条件用 and 连接
+    expect(summarize(en, {
+      base: 'order', agg: 'count_distinct', field: 'customer_id', ...empty,
+      filter: [{ field: 'status', op: 'in', value: ['paid', 'completed'] }, { field: 'amount', op: 'gte', value: '100' }],
+    }, ORDER)).toEqual([
+      'Calculates the number of distinct values of Customer ID.',
+      'Counts only records where Order Status is one of paid, completed and Amount Paid is greater than or equal to 100.',
+      'No time window.',
+    ]);
+  });
+
+  it('其余聚合的第一句也是英文且没有汉字；diffForms 两边都按界面语言出句子', () => {
+    const byAgg: Record<string, string> = {};
+    for (const [agg, field, by] of [
+      ['count', undefined, undefined], ['count', 'amount', undefined], ['sum', 'amount', undefined], ['avg', 'amount', undefined],
+      ['min', 'amount', undefined], ['max', 'amount', undefined], ['days_since', 'created_at', undefined],
+      ['latest', 'amount', 'created_at'], ['earliest', 'amount', 'created_at'],
+    ] as const) {
+      const s = summarize(en, { base: 'order', agg, ...(field && { field }), ...(by && { by }), ...empty }, ORDER)[0];
+      expect(s, agg).not.toMatch(HAN);
+      byAgg[agg + (field ?? '') + (by ?? '')] = s;
+    }
+    expect(summarize(en, { base: 'order', agg: 'count', ...empty }, ORDER)).toEqual(['Counts the number of rows.', 'No records are excluded.', 'No time window.']);
+    expect(summarize(en, { base: 'order', agg: 'sum', field: 'amount', ...empty }, ORDER)[0]).toBe('Calculates the sum of Amount Paid.');
+    expect(summarize(en, { base: 'order', agg: 'latest', field: 'amount', by: 'created_at', ...empty }, ORDER)[0]).toBe('Calculates the Amount Paid of the latest row by Placed At.');
+    const withWindow: MetricForm = { base: 'order', agg: 'sum', field: 'amount', ...empty, window: { field: 'created_at', days: 30 } };
+    expect(diffForms(en, withWindow, { ...withWindow, window: undefined }, ORDER))
+      .toEqual([{ before: 'In the last 30 days, by Placed At.', after: 'No time window.' }]);
   });
 });
