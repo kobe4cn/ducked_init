@@ -157,7 +157,6 @@
     "app/lib/tag-vocab.ts": 5,
     "app/routes/analytics.definitions.$kind.$key.tsx": 68,
     "app/routes/analytics.definitions.new.tsx": 42,
-    "app/routes/analytics.snapshots.$id.tsx": 79,
     "app/routes/analytics.templates.$id.tsx": 5,
     "app/routes/analytics.tsx": 48,
     "app/routes/api.v1.consumers.by-source.tsx": 1,

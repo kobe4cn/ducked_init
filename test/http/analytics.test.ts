@@ -978,8 +978,8 @@ const consumerIds = (html: string) => [...html.matchAll(/data-consumer="([^"]+)"
 /** 页面上金额的写法（与路由里的 money 一致） */
 const money = (n: number) => `¥${n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-// 三组只读快照页用例共用一次 { orders: true } 加五张快照：这三组连续写在「指标与标签快照详情」（它的夹具自己先 fresh()）之前、
-// 所有 beforeEach(fresh) 组之后，中间不能夹每用例清库的组，否则后面的组拿到的是被清掉的库
+// 三组只读快照页用例（与后面共用 ordersSnapshots 的英文界面组）共用一次 { orders: true } 加五张快照：这几组连续写在
+// 「指标与标签快照详情」（它的夹具自己先 fresh()）之前、所有 beforeEach(fresh) 组之后，中间不能夹每用例清库的组，否则后面的组拿到的是被清掉的库
 async function ordersFixture() {
   const { acme } = await publishedIdentitySources({ orders: true });
   await runTask(acme, 'gold.churn', { asOf: '2024-10-15' });
@@ -1196,6 +1196,59 @@ describe('同期群快照页（#836）', () => {
     expect(html).toContain('data-tab="consumers"');
     expect(html).not.toMatch(/data-consumer="/);
     for (const p of PLAINTEXT) expect(html).not.toContain(p);
+  });
+});
+
+describe('英文界面下的快照页（#1050）', () => {
+  // 只读用例，共用 ordersSnapshots 的一次夹具（与前面三组连续，中间不能夹每用例清库的组）
+  let shared: Awaited<ReturnType<typeof ordersSnapshots>>;
+  beforeAll(async () => { shared = await ordersSnapshots(); }, 180_000);
+
+  it('churn、repurchase、clv、cohort 快照的英文页面去掉水合脚本后没有汉字（cohort 用默认矩阵标签页），clv 的金额以 ¥ 开头、两位小数', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const { acme } = shared;
+    const browser = await loginAs(app, 'viewer@acme.com');
+    browser.store('crm_locale=en; Path=/');
+    // 去掉水合脚本（键是中文）与语言切换菜单里的「中文」选项（它是界面语言名，不算页面文案）
+    const strip = (html: string) => html.replace(/<script[\s\S]*?<\/script>/g, '').replaceAll('中文', '');
+    const of = async (kind: string, asOf: string) => (await listSnapshots(acme, kind)).find(s => (s.params as { asOf: string }).asOf === asOf)!;
+    const pages = [
+      ['churn', await of('churn', '2024-09-15')],
+      ['repurchase', await of('repurchase', '2024-07-01')],
+      ['clv', await of('clv', '2024-07-01')],
+      ['cohort', await of('cohort', '2024-07-01')],
+    ] as const;
+    for (const [kind, snapshot] of pages) {
+      const html = strip(await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text());
+      expect(html, kind).not.toMatch(/[一-鿿]/);
+    }
+    // 金额仍以 ¥ 开头、两位小数（#925：货币符号不变，数字按界面语言分组）
+    const clv = strip(await (await browser.get(`/analytics/snapshots/${pages[2][1].id}`)).text());
+    expect(clv).toMatch(/¥[\d,]+\.\d{2}/);
+    // 表头与标签页名是英文词条，不是空缺
+    const cohort = strip(await (await browser.get(`/analytics/snapshots/${pages[3][1].id}`)).text());
+    expect(cohort).toContain('Retention matrix');
+    expect(cohort).toContain('Monthly');
+  });
+});
+
+describe('英文界面下的用户 360 快照页（#1050）', () => {
+  // 只读用例共用 sharedUser360（自己先 fresh()，放在共用 ordersSnapshots 的组之后）
+  let shared: Awaited<ReturnType<typeof sharedUser360>>;
+  beforeAll(async () => { shared = await sharedUser360(); }, 180_000);
+
+  it('user360 的汇总标签与 ?tab=consumers 英文页面去掉水合脚本后没有汉字：卡片、同意渠道、查询表单与表头都是英文', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const { snapshot, browser } = shared;
+    browser.store('crm_locale=en; Path=/');
+    // 同上：去掉水合脚本与语言切换菜单的「中文」选项
+    const strip = (html: string) => html.replace(/<script[\s\S]*?<\/script>/g, '').replaceAll('中文', '');
+    const summary = strip(await (await browser.get(`/analytics/snapshots/${snapshot.id}`)).text());
+    expect(summary).not.toMatch(/[一-鿿]/);
+    // 查询按钮用 select 句式区分导航的「查询」（Workbench）
+    expect(summary).toContain('Look up');
+    const consumers = strip(await (await browser.get(`/analytics/snapshots/${snapshot.id}?tab=consumers`)).text());
+    expect(consumers).not.toMatch(/[一-鿿]/);
   });
 });
 

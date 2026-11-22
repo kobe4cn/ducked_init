@@ -20,7 +20,7 @@ import { errorTextFor } from '~/.server/i18n';
 import { navFor } from '~/.server/nav';
 import { TEMPLATES } from '~/.server/pipeline/templates';
 import { RFM_DEFAULTS } from '~/.server/pipeline/templates/rfm';
-import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readChurnSnapshot, readClvSnapshot, readCohortSnapshot, readRepurchaseSnapshot, readRfmSnapshot, readTemplateSnapshot, readUser360Snapshot, SnapshotError, triggerLabel, type SnapshotTemplate } from '~/.server/snapshots';
+import { CONSUMER_PAGE_SIZE, dslKindOf, getSnapshot, readChurnSnapshot, readClvSnapshot, readCohortSnapshot, readRepurchaseSnapshot, readRfmSnapshot, readTemplateSnapshot, readUser360Snapshot, SnapshotError, type SnapshotTemplate, type SnapshotTrigger } from '~/.server/snapshots';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Input } from '~/components/ui/input';
@@ -29,28 +29,34 @@ import { PillTabs } from '~/components/pill-tabs';
 import { StatTile } from '~/components/stat-tile';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 import { builtinName } from '~/lib/builtin-names';
-import { makeT, useT, type T } from '~/lib/i18n';
+import { formatDate, formatDateTime, formatMoney, formatNumber } from '~/lib/format';
+import { makeT, useLocale, useT, type Locale, type T } from '~/lib/i18n';
 
 /** DSL 类型名（指标 / 标签）按界面语言翻译：写成字面量 t('…') 的对照表（照 api-keys 的 scopeLabel）才能与词典对账 */
 const dslKindLabel = (t: T, kind: 'metric' | 'tag') => ({ metric: t('指标'), tag: t('标签') })[kind];
+
+/** 快照来源按界面语言翻译：同样写成字面量 t('…') 的对照表；中文值与 triggerLabel 一致（列表页与定义页还在用它） */
+const triggerText = (t: T, trigger: SnapshotTrigger | null) =>
+  trigger ? ({ publish: t('发布'), backfill: t('回刷'), scheduled: t('定时刷新'), manual: t('手动') } satisfies Record<SnapshotTrigger, string>)[trigger] : '—';
 
 export function meta({ loaderData, matches }: Route.MetaArgs) {
   // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文
   const root = matches[0]?.loaderData;
   const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
   const s = loaderData?.snapshot;
-  if (!s) return [{ title: `分析 · ${t('CRM 数据分析平台')}` }];
+  if (!s) return [{ title: `${t('分析')} · ${t('CRM 数据分析平台')}` }];
   // 模板名与类型名是平台内置名称，按界面语言翻译；定义键不翻
   const name = 'definition' in s
     ? `${dslKindLabel(t, s.definition.kind)} ${s.definition.key}`
     : builtinName(t, s.templateLabel);
-  return [{ title: `${name} · ${s.asOf} · ${t('CRM 数据分析平台')}` }];
+  const brand = t('CRM 数据分析平台');
+  return [{ title: `${name} · ${s.asOf} · ${brand}` }];
 }
 
 export async function loader({ request, params }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'results:read');
   const snapshot = await getSnapshot(member.tenant.id, params.snapshotId);
-  if (!snapshot) throw data({ message: '快照不存在' }, { status: 404 });
+  if (!snapshot) throw data(null, { status: 404 });
   const url = new URL(request.url);
   // 页码先清洗成 ≥ 1 的整数，夹到最后一页由各模板分支自己算（流失预警要先知道筛选后的行数）
   const requestedPage = Math.max(1, Math.floor(Number(url.searchParams.get('page'))) || 1);
@@ -73,7 +79,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
           ? {
             definition: { kind: dsl, key: snapshot.template.slice(dsl.length + 1) },
             definitionVersion: snapshot.definitionVersion,
-            trigger: triggerLabel(snapshot.trigger),
+            // 下发原始来源，页面上按界面语言翻译（triggerText）
+            trigger: snapshot.trigger,
           }
           : { templateLabel: TEMPLATES[snapshot.template as SnapshotTemplate].label }),
         asOf: String(snapshot.params.asOf),
@@ -136,26 +143,31 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   }
 }
 
-const money = (s: string) => `¥${Number(s).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-const date = (iso: string) => new Date(iso).toLocaleDateString('zh-CN');
+// 金额 / 日期按界面语言格式化（ADR-0060）：¥ 前缀、默认两位小数，不做 compact（页面一直显示完整金额）
+const money = (locale: Locale, s: string) => formatMoney(locale, '¥', Number(s));
+const date = (locale: Locale, iso: string) => formatDate(locale, iso);
 
-/** 通用明细里的一格：BOOLEAN 显示为是 / 否，列表用顿号连接，空值显示为 —，其余原样 */
-function cell(v: unknown): string {
+/** 通用明细里的一格：BOOLEAN 显示为是 / 否，列表用顿号连接，空值显示为 —，其余原样；显示文字按界面语言翻译 */
+function cell(v: unknown, t: T): string {
   if (v === null || v === undefined) return '—';
-  if (typeof v === 'boolean') return v ? '是' : '否';
-  if (Array.isArray(v)) return v.map(cell).join('、');
+  if (typeof v === 'boolean') return v ? t('是') : t('否');
+  if (Array.isArray(v)) return v.map(x => cell(x, t)).join(t('、'));
   if (typeof v === 'object') return JSON.stringify(v);
   return String(v);
 }
 
-/** 上一页 / 下一页；unit 是每页计数的单位（模板快照按消费者「位」，DSL 快照按「行」） */
-function Pager({ page, pages, pageSize, unit = '位', href }: { page: number; pages: number; pageSize: number; unit?: string; href: (p: number) => string }) {
+/** 上一页 / 下一页；unit 是每页计数的单位（模板快照按消费者「位」，DSL 快照按「行」），两种单位各写一条完整句子 */
+function Pager({ page, pages, pageSize, unit = 'consumer', href }: { page: number; pages: number; pageSize: number; unit?: 'consumer' | 'row'; href: (p: number) => string }) {
+  const t = useT();
+  const info = { page: String(page), pages: String(pages), size: String(pageSize) };
   return (
     <div className="flex items-center justify-between text-sm text-slate-500">
-      <span data-page={page}>{`第 ${page} / ${pages} 页，每页 ${pageSize} ${unit}`}</span>
+      <span data-page={page}>{unit === 'consumer'
+        ? t('第 {page} / {pages} 页，每页 {size} 位', info)
+        : t('第 {page} / {pages} 页，每页 {size} 行', info)}</span>
       <div className="flex gap-3">
-        {page > 1 && <Link to={href(page - 1)} className="hover:underline">← 上一页</Link>}
-        {page < pages && <Link to={href(page + 1)} className="hover:underline">下一页 →</Link>}
+        {page > 1 && <Link to={href(page - 1)} className="hover:underline">{t('← 上一页')}</Link>}
+        {page < pages && <Link to={href(page + 1)} className="hover:underline">{t('下一页 →')}</Link>}
       </div>
     </div>
   );
@@ -172,10 +184,11 @@ function DetailTable({ columns, rows, page, pages, pageSize, unit, snapshot, hre
   page: number;
   pages: number;
   pageSize: number;
-  unit?: string;
+  unit?: 'consumer' | 'row';
   snapshot: { id: string };
   href?: (p: number) => string;
 }) {
+  const t = useT();
   return (
     <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
       <Table>
@@ -188,7 +201,7 @@ function DetailTable({ columns, rows, page, pages, pageSize, unit, snapshot, hre
           {rows.map((r, i) => (
             // 带维度的指标每个消费者有多行，行键不能只用 consumer_id
             <TableRow key={i} data-consumer={String(r.consumer_id)}>
-              {columns.map(c => <TableCell key={c} className={c === 'consumer_id' ? 'font-mono text-xs' : undefined}>{cell(r[c])}</TableCell>)}
+              {columns.map(c => <TableCell key={c} className={c === 'consumer_id' ? 'font-mono text-xs' : undefined}>{cell(r[c], t)}</TableCell>)}
             </TableRow>
           ))}
         </TableBody>
@@ -201,34 +214,52 @@ function DetailTable({ columns, rows, page, pages, pageSize, unit, snapshot, hre
 export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
   const { email, nav, snapshot } = loaderData;
   const t = useT();
-  const lookback = snapshot.lookbackDays === null ? '' : `回看 ${snapshot.lookbackDays} 天，`;
-  // DSL（指标 / 标签）快照：页头改写定义（类型与键）与版本、统计日、来源；类型名与模板名按界面语言翻译，定义键不翻
+  const locale = useLocale();
+  // DSL（指标 / 标签）快照：页头改写定义（类型与键）与版本、统计日、来源；类型名与模板名按界面语言翻译，定义键不翻。
+  // 模板快照有 / 无回看窗口拆成两条完整句子，不拼碎片；数字与日期先按界面语言格式化好再代入（ICU 不再加工）
   const header = 'definition' in snapshot
     ? {
       title: `${dslKindLabel(t, snapshot.definition.kind)} · ${snapshot.definition.key}`,
-      note: `　${snapshot.definitionVersion ? `第 ${snapshot.definitionVersion} 版` : '—'}，统计日 ${snapshot.asOf}，来源 ${snapshot.trigger}，创建于 ${date(snapshot.createdAt)}，${date(snapshot.expiresAt)} 过期`,
+      note: t('第 {version} 版，统计日 {asOf}，来源 {trigger}，创建于 {created}，{expires} 过期', {
+        version: snapshot.definitionVersion ? t('第 {version} 版', { version: String(snapshot.definitionVersion) }) : '—',
+        asOf: snapshot.asOf,
+        trigger: triggerText(t, snapshot.trigger),
+        created: date(locale, snapshot.createdAt),
+        expires: date(locale, snapshot.expiresAt),
+      }),
     }
     : {
       title: `${builtinName(t, snapshot.templateLabel)} · ${snapshot.asOf}`,
-      note: `　${lookback}创建于 ${date(snapshot.createdAt)}，${date(snapshot.expiresAt)} 过期`,
+      note: snapshot.lookbackDays === null
+        ? t('创建于 {created}，{expires} 过期', { created: date(locale, snapshot.createdAt), expires: date(locale, snapshot.expiresAt) })
+        : t('回看 {days} 天，创建于 {created}，{expires} 过期', {
+          days: String(snapshot.lookbackDays),
+          created: date(locale, snapshot.createdAt),
+          expires: date(locale, snapshot.expiresAt),
+        }),
     };
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
         title={header.title}
-        description={<><Link to="/analytics" className="hover:underline">← 全部快照</Link>{header.note}</>}
+        description={<><Link to="/analytics" className="hover:underline">{t('← 全部快照')}</Link>{t('　')}{header.note}</>}
       />
 
       {snapshot.incomplete && (
         <Alert role="status" data-snapshot-incomplete className="border-amber-200 bg-amber-50 text-amber-900">
           <AlertTriangle className="text-amber-600" />
-          <AlertTitle>数据不完整</AlertTitle>
+          <AlertTitle>{t('数据不完整')}</AlertTitle>
           <AlertDescription>
-            <p>计算时以下映射最近一次合并失败，结果没有包含它们最新的数据：</p>
+            <p>{t('计算时以下映射最近一次合并失败，结果没有包含它们最新的数据：')}</p>
             <ul className="list-disc pl-5">
               {snapshot.incomplete.map(m => (
                 <li key={m.mapping} data-incomplete-mapping={m.mapping}>
-                  {`源表 ${m.table} → ${m.entity}：${m.error}，${m.lastSuccessAt ? `数据停在 ${new Date(m.lastSuccessAt).toLocaleString('zh-CN')}` : '从未成功合并'}`}
+                  {t('源表 {table} → {entity}：{error}，{rest}', {
+                    table: m.table,
+                    entity: m.entity,
+                    error: m.error,
+                    rest: m.lastSuccessAt ? t('数据停在 {when}', { when: formatDateTime(locale, m.lastSuccessAt) }) : t('从未成功合并'),
+                  })}
                 </li>
               ))}
             </ul>
@@ -248,72 +279,77 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
 }
 
 function GenericResult({ page, pages, pageSize, snapshot, columns, rows, tagSummary }: Extract<Route.ComponentProps['loaderData'], { kind: 'generic' }>) {
+  const t = useT();
+  const locale = useLocale();
   // DSL 快照的 rowCount 是快照表的行数（带维度的指标每个消费者有多行），不是消费者数
   const dsl = 'definition' in snapshot ? snapshot : null;
   return (
     <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatTile label={dsl ? '行数' : '消费者'} value={snapshot.rowCount.toLocaleString('zh-CN')} hint={dsl ? '快照表的行数' : '打通后的统一消费者'} />
-        <StatTile label="参考日期" value={snapshot.asOf} hint="计算的基准日" />
+        <StatTile label={dsl ? t('行数') : t('消费者')} value={formatNumber(locale, snapshot.rowCount)} hint={dsl ? t('快照表的行数') : t('打通后的统一消费者')} />
+        <StatTile label={t('参考日期')} value={snapshot.asOf} hint={t('计算的基准日')} />
       </div>
       {tagSummary && (
         <div className="rounded-2xl border bg-white p-6 shadow-sm" data-tag-summary>
-          <h2 className="mb-4 font-medium">各取值人数</h2>
+          <h2 className="mb-4 font-medium">{t('各取值人数')}</h2>
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>取值</TableHead>
-                <TableHead>人数</TableHead>
+                <TableHead>{t('取值')}</TableHead>
+                <TableHead>{t('人数')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {tagSummary.map(t => (
-                <TableRow key={t.value ?? ''} data-tag-value={t.value ?? ''}>
-                  <TableCell className="font-medium">{t.value ?? '—'}</TableCell>
-                  <TableCell>{t.consumers.toLocaleString('zh-CN')}</TableCell>
+              {/* 取值是存下来的数据（如 low / high），不翻译；这里改叫 s，别遮蔽翻译函数 t */}
+              {tagSummary.map(s => (
+                <TableRow key={s.value ?? ''} data-tag-value={s.value ?? ''}>
+                  <TableCell className="font-medium">{s.value ?? '—'}</TableCell>
+                  <TableCell>{formatNumber(locale, s.consumers)}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
           </Table>
         </div>
       )}
-      <DetailTable columns={columns} rows={rows} page={page} pages={pages} pageSize={pageSize} unit={dsl ? '行' : '位'} snapshot={snapshot} />
+      <DetailTable columns={columns} rows={rows} page={page} pages={pages} pageSize={pageSize} unit={dsl ? 'row' : 'consumer'} snapshot={snapshot} />
     </>
   );
 }
 
 /** 流失预警快照：顶部汇总卡片（有风险人数、占比、总人数），明细默认只列有风险的人、沉默比从高到低，可切到全部 */
 function ChurnResult({ tab, page, pages, pageSize, snapshot, total, atRisk, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'churn' }>) {
+  const t = useT();
+  const locale = useLocale();
   const base = `/analytics/snapshots/${snapshot.id}`;
   const pageHref = (p: number) => `${base}?tab=${tab}&page=${p}`;
   return (
     <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatTile label="有风险人数" value={atRisk.toLocaleString('zh-CN')} tone={atRisk ? 'text-amber-600' : undefined} hint="沉默比超过风险阈值的消费者" />
-        <StatTile label="风险占比" value={total ? `${((atRisk / total) * 100).toFixed(1)}%` : '—'} hint="有风险人数 ÷ 总人数" />
-        <StatTile label="总人数" value={total.toLocaleString('zh-CN')} hint="回看窗口内有购买节奏的消费者" />
-        <StatTile label="参考日期" value={snapshot.asOf} hint="计算沉默天数的基准" />
+        <StatTile label={t('有风险人数')} value={formatNumber(locale, atRisk)} tone={atRisk ? 'text-amber-600' : undefined} hint={t('沉默比超过风险阈值的消费者')} />
+        <StatTile label={t('风险占比')} value={total ? `${((atRisk / total) * 100).toFixed(1)}%` : '—'} hint={t('有风险人数 ÷ 总人数')} />
+        <StatTile label={t('总人数')} value={formatNumber(locale, total)} hint={t('回看窗口内有购买节奏的消费者')} />
+        <StatTile label={t('参考日期')} value={snapshot.asOf} hint={t('计算沉默天数的基准')} />
       </div>
 
       <PillTabs
         current={tab}
         tabs={[
-          { key: 'at-risk', label: '有风险', href: base },
-          { key: 'all', label: '全部', href: `${base}?tab=all` },
+          { key: 'at-risk', label: t('有风险'), href: base },
+          { key: 'all', label: t('全部'), href: `${base}?tab=all` },
         ]}
       />
 
       <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
-        {rows.length === 0 && <p className="text-sm text-slate-500">{tab === 'at-risk' ? '没有有风险的消费者' : '这份快照没有数据'}</p>}
+        {rows.length === 0 && <p className="text-sm text-slate-500">{tab === 'at-risk' ? t('没有有风险的消费者') : t('这份快照没有数据')}</p>}
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>consumer_id</TableHead>
-              <TableHead>订单数</TableHead>
-              <TableHead>平均间隔（天）</TableHead>
-              <TableHead>沉默天数</TableHead>
-              <TableHead>沉默比</TableHead>
-              <TableHead>有风险</TableHead>
+              <TableHead>{t('订单数')}</TableHead>
+              <TableHead>{t('平均间隔（天）')}</TableHead>
+              <TableHead>{t('沉默天数')}</TableHead>
+              <TableHead>{t('沉默比')}</TableHead>
+              <TableHead>{t('有风险')}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -324,7 +360,7 @@ function ChurnResult({ tab, page, pages, pageSize, snapshot, total, atRisk, rows
                 <TableCell>{c.avg_gap_days}</TableCell>
                 <TableCell>{c.recency_days}</TableCell>
                 <TableCell>{c.silence_ratio}</TableCell>
-                <TableCell>{c.at_risk ? '是' : '否'}</TableCell>
+                <TableCell>{c.at_risk ? t('是') : t('否')}</TableCell>
               </TableRow>
             ))}
           </TableBody>
@@ -337,22 +373,24 @@ function ChurnResult({ tab, page, pages, pageSize, snapshot, total, atRisk, rows
 
 /** 复购快照（#835）：顶部卡片写复购率（X / Y 人）与到第二单天数中位数，下方按 consumer_id 的通用分页明细 */
 function RepurchaseResult({ page, pages, pageSize, snapshot, total, repurchased, medianDaysToSecond, columns, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'repurchase' }>) {
+  const t = useT();
+  const locale = useLocale();
   const rate = total ? `${((repurchased / total) * 100).toFixed(1)}%` : '—';
-  const median = medianDaysToSecond === null ? '—' : `${medianDaysToSecond} 天`;
+  const median = medianDaysToSecond === null ? '—' : t('{days} 天', { days: String(medianDaysToSecond) });
   return (
     <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <div data-repurchase-rate={rate}>
-          <StatTile label="复购率" value={rate} hint={`${repurchased} / ${total} 人`} />
+          <StatTile label={t('复购率')} value={rate} hint={t('{repurchased} / {total} 人', { repurchased: String(repurchased), total: String(total) })} />
         </div>
         <div data-median-days={median}>
-          <StatTile label="到第二单天数中位数" value={median} hint="只算有第二单的人" />
+          <StatTile label={t('到第二单天数中位数')} value={median} hint={t('只算有第二单的人')} />
         </div>
         <div data-repurchase-count={repurchased}>
-          <StatTile label="复购人数" value={repurchased.toLocaleString('zh-CN')} hint="第二单落在复购窗口内" />
+          <StatTile label={t('复购人数')} value={formatNumber(locale, repurchased)} hint={t('第二单落在复购窗口内')} />
         </div>
         <div data-total-count={total}>
-          <StatTile label="总人数" value={total.toLocaleString('zh-CN')} hint="回看窗口内下过单的消费者" />
+          <StatTile label={t('总人数')} value={formatNumber(locale, total)} hint={t('回看窗口内下过单的消费者')} />
         </div>
       </div>
 
@@ -366,34 +404,38 @@ function RepurchaseResult({ page, pages, pageSize, snapshot, total, repurchased,
  * （每档人数与 clv 合计，只列有人的档），再下方按 consumer_id 的通用分页明细
  */
 function ClvResult({ page, pages, pageSize, snapshot, totalClv, topShare, deciles, columns, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'clv' }>) {
+  const t = useT();
+  const locale = useLocale();
   const share = topShare === null ? '—' : `${(topShare * 100).toFixed(1)}%`;
   return (
     <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <div data-clv-top-share={share}>
-          <StatTile label="前 10% 的人贡献的 clv 占比" value={share} hint="clv 最高的第 1 档合计 ÷ 总额" />
+          <StatTile label={t('前 10% 的人贡献的 clv 占比')} value={share} hint={t('clv 最高的第 1 档合计 ÷ 总额')} />
         </div>
-        <StatTile label="CLV 合计" value={money(totalClv)} hint="回看窗口内全部消费者的 clv" />
-        <StatTile label="消费者" value={snapshot.rowCount.toLocaleString('zh-CN')} hint="打通后的统一消费者" />
-        <StatTile label="参考日期" value={snapshot.asOf} hint="计算 clv 的基准日" />
+        <StatTile label={t('CLV 合计')} value={money(locale, totalClv)} hint={t('回看窗口内全部消费者的 clv')} />
+        <StatTile label={t('消费者')} value={formatNumber(locale, snapshot.rowCount)} hint={t('打通后的统一消费者')} />
+        <StatTile label={t('参考日期')} value={snapshot.asOf} hint={t('计算 clv 的基准日')} />
       </div>
 
       <div className="rounded-2xl border bg-white p-6 shadow-sm">
-        <h2 className="mb-4 font-medium">CLV 十档分布</h2>
+        <h2 className="mb-4 font-medium">{t('CLV 十档分布')}</h2>
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>档位</TableHead>
-              <TableHead>人数</TableHead>
-              <TableHead>clv 合计</TableHead>
+              <TableHead>{t('档位')}</TableHead>
+              <TableHead>{t('人数')}</TableHead>
+              <TableHead>{t('clv 合计')}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {deciles.map(d => (
               <TableRow key={d.decile} data-clv-decile={d.decile}>
-                <TableCell className="font-medium">{`第 ${d.decile} 档${d.decile === 1 ? '（最高）' : ''}`}</TableCell>
-                <TableCell data-clv-decile-consumers={d.consumers}>{d.consumers.toLocaleString('zh-CN')}</TableCell>
-                <TableCell>{money(d.clv)}</TableCell>
+                <TableCell className="font-medium">{d.decile === 1
+                  ? t('第 {n} 档（最高）', { n: String(d.decile) })
+                  : t('第 {n} 档', { n: String(d.decile) })}</TableCell>
+                <TableCell data-clv-decile-consumers={d.consumers}>{formatNumber(locale, d.consumers)}</TableCell>
+                <TableCell>{money(locale, d.clv)}</TableCell>
               </TableRow>
             ))}
           </TableBody>
@@ -411,6 +453,8 @@ function ClvResult({ page, pages, pageSize, snapshot, totalClv, topShare, decile
  * 逐人明细在 ?tab=consumers（按 consumer_id 分页，active_periods 用顿号连接）
  */
 function CohortResult({ tab, page, pages, pageSize, snapshot, matrix, granularity, columns, rows }: Extract<Route.ComponentProps['loaderData'], { kind: 'cohort' }>) {
+  const t = useT();
+  const locale = useLocale();
   const base = `/analytics/snapshots/${snapshot.id}`;
   const pageHref = (p: number) => `${base}?tab=consumers&page=${p}`;
   const cohorts = matrix.length;
@@ -420,34 +464,34 @@ function CohortResult({ tab, page, pages, pageSize, snapshot, matrix, granularit
     <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <div data-cohort-count={cohorts}>
-          <StatTile label="同期群数" value={cohorts.toLocaleString('zh-CN')} hint="按首单所在周期分群" />
+          <StatTile label={t('同期群数')} value={formatNumber(locale, cohorts)} hint={t('按首单所在周期分群')} />
         </div>
         <div data-cohort-total={total}>
-          <StatTile label="总人数" value={total.toLocaleString('zh-CN')} hint="首单落在最近周期窗口内的消费者" />
+          <StatTile label={t('总人数')} value={formatNumber(locale, total)} hint={t('首单落在最近周期窗口内的消费者')} />
         </div>
         <div data-cohort-granularity={granularity}>
-          <StatTile label="粒度" value={granularity === 'week' ? '按周' : '按月'} hint="同期与周期的划分粒度" />
+          <StatTile label={t('粒度')} value={granularity === 'week' ? t('按周') : t('按月')} hint={t('同期与周期的划分粒度')} />
         </div>
       </div>
 
       <PillTabs
         current={tab}
         tabs={[
-          { key: 'matrix', label: '留存矩阵', href: base },
-          { key: 'consumers', label: '逐人明细', href: `${base}?tab=consumers` },
+          { key: 'matrix', label: t('留存矩阵'), href: base },
+          { key: 'consumers', label: t('逐人明细'), href: `${base}?tab=consumers` },
         ]}
       />
 
       {tab === 'matrix' ? (
         <div className="space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
-          {matrix.length === 0 && <p className="text-sm text-slate-500">这份快照没有数据</p>}
+          {matrix.length === 0 && <p className="text-sm text-slate-500">{t('这份快照没有数据')}</p>}
           {/* periods 最多 60 列，矩阵面板里横向滚动 */}
           <div className="overflow-x-auto">
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>cohort_start</TableHead>
-                  {Array.from({ length: periods }, (_, k) => <TableHead key={k}>{`第 ${k} 期`}</TableHead>)}
+                  {Array.from({ length: periods }, (_, k) => <TableHead key={k}>{t('第 {k} 期', { k: String(k) })}</TableHead>)}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -478,37 +522,39 @@ function CohortResult({ tab, page, pages, pageSize, snapshot, matrix, granularit
  * 「逐人明细」标签是原来的通用分页明细（按 consumer_id 分页、全部列）
  */
 function User360Result({ tab, page, pages, pageSize, snapshot, total, withOrders, consents, lookup, lookupError, columns, rows, consumer }: Extract<Route.ComponentProps['loaderData'], { kind: 'user360' }>) {
+  const t = useT();
+  const locale = useLocale();
   const base = `/analytics/snapshots/${snapshot.id}`;
   const pageHref = (p: number) => `${base}?tab=consumers&page=${p}`;
   return (
     <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <div data-user360-total={total}>
-          <StatTile label="总人数" value={total.toLocaleString('zh-CN')} hint="打通后的统一消费者" />
+          <StatTile label={t('总人数')} value={formatNumber(locale, total)} hint={t('打通后的统一消费者')} />
         </div>
         <div data-user360-with-orders={withOrders}>
-          <StatTile label="有订单人数" value={withOrders.toLocaleString('zh-CN')} hint="回看窗口内 orders > 0" />
+          <StatTile label={t('有订单人数')} value={formatNumber(locale, withOrders)} hint={t('回看窗口内 orders > 0')} />
         </div>
-        <StatTile label="参考日期" value={snapshot.asOf} hint="统计订单与同意的基准" />
+        <StatTile label={t('参考日期')} value={snapshot.asOf} hint={t('统计订单与同意的基准')} />
       </div>
 
       <PillTabs
         current={tab}
         tabs={[
-          { key: 'summary', label: '汇总', href: base },
-          { key: 'consumers', label: '逐人明细', href: `${base}?tab=consumers` },
+          { key: 'summary', label: t('汇总'), href: base },
+          { key: 'consumers', label: t('逐人明细'), href: `${base}?tab=consumers` },
         ]}
       />
 
       {tab === 'summary' ? (
         <>
           <div className="rounded-2xl border bg-white p-6 shadow-sm">
-            <h2 className="mb-4 font-medium">各渠道同意人数</h2>
+            <h2 className="mb-4 font-medium">{t('各渠道同意人数')}</h2>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
               {consents.map(c => (
                 <div key={c.channel} data-consent-channel={c.channel} className="rounded-xl border bg-slate-50 px-4 py-3">
                   <div className="text-sm text-slate-500">{c.channel}</div>
-                  <div className="mt-1 text-xl font-semibold" data-consent-consumers={c.consumers}>{c.consumers.toLocaleString('zh-CN')}</div>
+                  <div className="mt-1 text-xl font-semibold" data-consent-consumers={c.consumers}>{formatNumber(locale, c.consumers)}</div>
                 </div>
               ))}
             </div>
@@ -517,13 +563,14 @@ function User360Result({ tab, page, pages, pageSize, snapshot, total, withOrders
           <Form method="get" action={base} preventScrollReset className="flex max-w-2xl items-center gap-2">
             <input type="hidden" name="tab" value="summary" />
             <div className="flex-1">
-              <Input key={consumer ?? ''} type="search" name="consumer" defaultValue={consumer ?? ''} placeholder="按 consumer_id 查单人" aria-label="按 consumer_id 查单人" data-consumer-input />
+              <Input key={consumer ?? ''} type="search" name="consumer" defaultValue={consumer ?? ''} placeholder={t('按 consumer_id 查单人')} aria-label={t('按 consumer_id 查单人')} data-consumer-input />
             </div>
-            <button type="submit" className="h-8 shrink-0 rounded-lg border px-3 text-sm hover:bg-slate-50">查询</button>
+            {/* 「查询」与导航的「查询」（Workbench）撞键：用 select 句式区分（变量名与英文词典一致） */}
+            <button type="submit" className="h-8 shrink-0 rounded-lg border px-3 text-sm hover:bg-slate-50">{t('{ctx, select, lookup {查询} other {查询}}', { ctx: 'lookup' })}</button>
           </Form>
 
-          {lookupError === 'invalid' && <p data-lookup-error="invalid" className="text-sm text-amber-700">consumer_id 格式不对：只允许字母、数字、下划线与连字符，最长 80 字符</p>}
-          {lookupError === 'missing' && <p data-lookup-error="missing" className="text-sm text-slate-500">这张快照里没有这个 consumer_id</p>}
+          {lookupError === 'invalid' && <p data-lookup-error="invalid" className="text-sm text-amber-700">{t('consumer_id 格式不对：只允许字母、数字、下划线与连字符，最长 80 字符')}</p>}
+          {lookupError === 'missing' && <p data-lookup-error="missing" className="text-sm text-slate-500">{t('这张快照里没有这个 consumer_id')}</p>}
           {lookup && (
             <div className="rounded-2xl border bg-white p-6 shadow-sm">
               <Table>
@@ -534,7 +581,7 @@ function User360Result({ tab, page, pages, pageSize, snapshot, total, withOrders
                 </TableHeader>
                 <TableBody>
                   <TableRow data-user360-lookup={String(lookup.consumer_id)}>
-                    {columns.map(c => <TableCell key={c} className={c === 'consumer_id' ? 'font-mono text-xs' : undefined}>{cell(lookup[c])}</TableCell>)}
+                    {columns.map(c => <TableCell key={c} className={c === 'consumer_id' ? 'font-mono text-xs' : undefined}>{cell(lookup[c], t)}</TableCell>)}
                   </TableRow>
                 </TableBody>
               </Table>
@@ -550,6 +597,7 @@ function User360Result({ tab, page, pages, pageSize, snapshot, total, withOrders
 
 function RfmResult({ tab, page, pages, pageSize, snapshot, segments, consumers, defaultSegmentNames }: Extract<Route.ComponentProps['loaderData'], { kind: 'rfm' }>) {
   const t = useT();
+  const locale = useLocale();
   /** 默认人群名按界面语言翻译，租户改过的人群名原样；行键、data-segment 与写回的值仍是存储的原值 */
   const defaults = new Set(defaultSegmentNames);
   const segmentName = (name: string) => builtinName(t, name, defaults);
@@ -559,17 +607,17 @@ function RfmResult({ tab, page, pages, pageSize, snapshot, segments, consumers, 
   return (
     <>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatTile label="消费者" value={snapshot.rowCount.toLocaleString('zh-CN')} hint="打通后的统一消费者" />
-        <StatTile label="消费金额" value={money(String(total))} hint="回看窗口内计入的订单" />
-        <StatTile label="人群" value={segments.filter(s => s.consumers > 0).length} hint={`共 ${segments.length} 个分群规则`} />
-        <StatTile label="参考日期" value={snapshot.asOf} hint="计算最近一次消费的基准" />
+        <StatTile label={t('消费者')} value={formatNumber(locale, snapshot.rowCount)} hint={t('打通后的统一消费者')} />
+        <StatTile label={t('消费金额')} value={money(locale, String(total))} hint={t('回看窗口内计入的订单')} />
+        <StatTile label={t('人群')} value={segments.filter(s => s.consumers > 0).length} hint={t('共 {n} 个分群规则', { n: String(segments.length) })} />
+        <StatTile label={t('参考日期')} value={snapshot.asOf} hint={t('计算最近一次消费的基准')} />
       </div>
 
       <PillTabs
         current={tab}
         tabs={[
-          { key: 'segments', label: '人群', href: base },
-          { key: 'consumers', label: '消费者明细', href: `${base}?tab=consumers` },
+          { key: 'segments', label: t('人群'), href: base },
+          { key: 'consumers', label: t('消费者明细'), href: `${base}?tab=consumers` },
         ]}
       />
 
@@ -578,19 +626,19 @@ function RfmResult({ tab, page, pages, pageSize, snapshot, segments, consumers, 
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>人群</TableHead>
-                <TableHead>人数</TableHead>
-                <TableHead>占比</TableHead>
-                <TableHead>消费金额</TableHead>
+                <TableHead>{t('人群')}</TableHead>
+                <TableHead>{t('人数')}</TableHead>
+                <TableHead>{t('占比')}</TableHead>
+                <TableHead>{t('消费金额')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {segments.map(s => (
                 <TableRow key={s.name} data-segment={s.name} className={s.consumers ? undefined : 'text-slate-400'}>
                   <TableCell className="font-medium">{segmentName(s.name)}</TableCell>
-                  <TableCell data-segment-consumers>{s.consumers.toLocaleString('zh-CN')}</TableCell>
+                  <TableCell data-segment-consumers>{formatNumber(locale, s.consumers)}</TableCell>
                   <TableCell>{snapshot.rowCount ? `${((s.consumers / snapshot.rowCount) * 100).toFixed(1)}%` : '—'}</TableCell>
-                  <TableCell data-segment-monetary>{money(s.monetary)}</TableCell>
+                  <TableCell data-segment-monetary>{money(locale, s.monetary)}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -602,13 +650,13 @@ function RfmResult({ tab, page, pages, pageSize, snapshot, segments, consumers, 
             <TableHeader>
               <TableRow>
                 <TableHead>consumer_id</TableHead>
-                <TableHead>人群</TableHead>
+                <TableHead>{t('人群')}</TableHead>
                 <TableHead>R</TableHead>
                 <TableHead>F</TableHead>
                 <TableHead>M</TableHead>
-                <TableHead>距最近消费（天）</TableHead>
-                <TableHead>消费次数</TableHead>
-                <TableHead>消费金额</TableHead>
+                <TableHead>{t('距最近消费（天）')}</TableHead>
+                <TableHead>{t('消费次数')}</TableHead>
+                <TableHead>{t('消费金额')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -621,7 +669,7 @@ function RfmResult({ tab, page, pages, pageSize, snapshot, segments, consumers, 
                   <TableCell>{c.m}</TableCell>
                   <TableCell>{c.recency_days}</TableCell>
                   <TableCell>{c.frequency}</TableCell>
-                  <TableCell>{money(c.monetary)}</TableCell>
+                  <TableCell>{money(locale, c.monetary)}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
