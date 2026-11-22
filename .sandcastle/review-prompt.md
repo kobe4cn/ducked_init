@@ -43,6 +43,7 @@
 - implementer 或 prep 已经代拍板的（issue 评论里第一行是 `<!-- sandcastle:decided -->`）：确认它属于「可以代拍板」，并且代码和改过的验收标准一致。不属于的，写进「需要人判断」。
 - 除了本票（issue #{{TASK_ID}}）和本次会话里自己新开的 issue，不要改其他 issue 的标签或正文（评论除外）；本次会话之前开出的票（包括本票早先会话开的）也不能改。
 - 不要跑完整测试（之后编排脚本会跑一遍作为合并门槛）；只跑你改到的测试文件。
+- 不要把 `origin/main` 合并（`git merge`）或 rebase 进分支，即使和 main 有冲突：合并用的是 rebase，分支里有 merge 提交就合不进去。冲突由编排脚本落地前的 rebase 处理。
 
 # OUTPUT
 
