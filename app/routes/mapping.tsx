@@ -327,7 +327,10 @@ function Assertion({ name, ok, severe, children }: { name: string; ok: boolean; 
 }
 
 /** 自定义断言检查的名称：中文与 pipeline/custom-assertions 的标签一致，这里写成字面量 t('…') 才能与词典对账 */
-const customCheckLabel = (t: T, check: string) => ({ not_null: t('非空'), unique: t('唯一'), range: t('取值范围'), in: t('取值在列表内') } as Record<CustomCheck, string>)[check as CustomCheck] ?? check;
+const customCheckLabel = (t: T, check: string) => {
+  const labels: Record<CustomCheck, string> = { not_null: t('非空'), unique: t('唯一'), range: t('取值范围'), in: t('取值在列表内') };
+  return Object.hasOwn(labels, check) ? labels[check as CustomCheck] : check;
+};
 
 /** 自定义断言的结果：名称是 custom:<字段>:<检查>，只显示级别与不合格行数，不显示取值 */
 function CustomAssertionItem({ result, label }: { result: AssertionResult; label: (name: string) => string }) {
@@ -475,7 +478,7 @@ function SourceDrift({ drift, canAdd, submitting }: { drift: NonNullable<LoaderD
 
 /** 差异里列配置各项的名称：写成字面量 t('…') 才能与词典对账 */
 const columnFieldLabel = (t: T, f: ColumnField) =>
-  ({ type: t('类型'), expr: t('表达式'), dictionary: t('值字典'), otherwise: t('兜底'), sensitive: t('敏感标记'), keySpace: t('键空间'), customerSource: t('跨源引用的数据源') } as Record<ColumnField, string>)[f];
+  ({ type: t('类型'), expr: t('表达式'), dictionary: t('值字典'), otherwise: t('兜底'), sensitive: t('敏感标记'), keySpace: t('键空间'), customerSource: t('跨源引用的数据源') } satisfies Record<ColumnField, string>)[f];
 
 /** 草稿与最新已发布版本的差异：首个版本、没有差异，或逐项列出列与去重 / 身份打通 / 键空间配置的变化 */
 function DraftDiff({ entity, version, diff }: { entity: string; version: number; diff: PlanDiff & { against: number | null } }) {
