@@ -41,6 +41,7 @@
   "无法识别的字符 {c}": "Unrecognized character {c}",
   "无法识别的数字": "Unrecognized number",
   "未知操作": "Unknown operation",
+  "档位须是 fast 或 reasoning": "Tier must be fast or reasoning",
   "没有要采纳的关系": "No relation to adopt",
   "源表里没有列 {column}": "The source table has no column {column}",
   "点查": "Lookup",

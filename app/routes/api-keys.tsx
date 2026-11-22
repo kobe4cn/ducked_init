@@ -7,7 +7,8 @@ import type { Route } from './+types/api-keys';
 import { requirePermission } from '~/.server/access';
 import { ApiKeyError, createApiKey, listApiKeys, revokeApiKey, updateApiKeyScope, type RawDataScope } from '~/.server/api-keys';
 import { apiCatalog } from '~/.server/api-catalog';
-import { errorTextFor } from '~/.server/i18n';
+import { errorTextFor, formatServer } from '~/.server/i18n';
+import { getLocale } from '~/.server/locale';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
@@ -22,10 +23,14 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~
 import type { ApiDataScope } from '~/lib/api-data-scope';
 import { API_ENDPOINTS, type ApiEndpoint } from '~/lib/api-docs';
 import { API_SCOPES, type ApiScope } from '~/lib/api-scopes';
-import { useT, type T } from '~/lib/i18n';
+import { formatDateTime } from '~/lib/format';
+import { makeT, msg, useLocale, useT, type Locale, type T } from '~/lib/i18n';
 
-export function meta({}: Route.MetaArgs) {
-  return [{ title: 'API Key · CRM 数据分析平台' }];
+export function meta({ matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
+  return [{ title: `API Key · ${t('CRM 数据分析平台')}` }];
 }
 
 /** 页面的标签页：Key 列表与接口说明（接口说明由登记表生成，不查库） */
@@ -84,7 +89,7 @@ export async function action({ request }: Route.ActionArgs) {
         await revokeApiKey(member, field('keyId'));
         break;
       default:
-        return data({ error: '未知操作' }, { status: 400 });
+        return data({ error: formatServer(await getLocale(request), msg('未知操作')) }, { status: 400 });
     }
   } catch (e) {
     if (e instanceof ApiKeyError) {
@@ -95,10 +100,10 @@ export async function action({ request }: Route.ActionArgs) {
   throw redirect('/api-keys');
 }
 
-const formatTime = (iso: string) => new Date(iso).toLocaleString('zh-CN', { hour12: false });
+const formatTime = (locale: Locale, iso: string) => formatDateTime(locale, iso, { hour12: false });
 
-/** 参数位置与是否必填的页面文案 */
-const PARAM_IN_TEXT = { path: '路径', query: '查询', body: '请求体' } as const;
+/** 参数位置的页面文案（照 scopeLabel 写成字面量 t('…') 的对照表，才能与词典对账） */
+const paramInText = (t: T, p: 'path' | 'query' | 'body') => ({ path: t('路径'), query: t('查询'), body: t('请求体') })[p];
 
 /** 接口范围的名称：中文与 lib/api-scopes 的 API_SCOPE_LABELS 一致，这里写成字面量 t('…') 才能与词典对账 */
 const scopeLabel = (t: T, scope: ApiScope) => ({ catalog: t('目录'), consumers: t('点查'), exports: t('导出') })[scope];
@@ -192,41 +197,42 @@ function KeysTab({ keys, definitions, submitting }: {
   submitting: boolean;
 }) {
   const t = useT();
+  const locale = useLocale();
   // ?edit=<id> 时只在这一行下渲染「修改范围」表单（SSR 预填当前范围），平时页面不多出第二组单选
   const edit = useSearchParams()[0].get('edit');
   return (
     <>
       <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
-        <SectionHeader title="创建 API Key">每个外部系统各用一把，便于单独吊销。</SectionHeader>
+        <SectionHeader title={t('创建 API Key')}>{t('每个外部系统各用一把，便于单独吊销。')}</SectionHeader>
         <Form method="post">
           <input type="hidden" name="intent" value="create" />
           <FieldGroup className="flex-row flex-wrap items-end">
             <Field>
-              <FieldLabel htmlFor="api-key-name">名称</FieldLabel>
-              <Input id="api-key-name" name="name" required maxLength={100} placeholder="如：营销自动化系统" />
+              <FieldLabel htmlFor="api-key-name">{t('名称')}</FieldLabel>
+              <Input id="api-key-name" name="name" required maxLength={100} placeholder={t('如：营销自动化系统')} />
             </Field>
             <ScopeFields initial={{ scopes: [...API_SCOPES], dataScope: { all: true } }} definitions={definitions} />
-            <Button type="submit" disabled={submitting}>创建</Button>
+            <Button type="submit" disabled={submitting}>{t('创建')}</Button>
           </FieldGroup>
           <p className="mt-1 text-xs text-slate-400">{t('不勾的那类接口，这把 Key 调用时返回 403。')}</p>
         </Form>
       </div>
 
       {keys.length === 0 ? (
-        <div className="rounded-2xl border bg-white p-6 text-sm text-slate-500 shadow-sm">还没有 API Key。在上面填写名称创建第一把，交给要调用接口的外部系统。</div>
+        <div className="rounded-2xl border bg-white p-6 text-sm text-slate-500 shadow-sm">{t('还没有 API Key。在上面填写名称创建第一把，交给要调用接口的外部系统。')}</div>
       ) : (
         <div className="rounded-2xl border bg-white p-6 shadow-sm">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>名称</TableHead>
-                <TableHead>前缀</TableHead>
+                <TableHead>{t('名称')}</TableHead>
+                <TableHead>{t('前缀')}</TableHead>
                 <TableHead>{t('接口')}</TableHead>
                 <TableHead>{t('数据')}</TableHead>
-                <TableHead>创建人</TableHead>
-                <TableHead>创建时间</TableHead>
-                <TableHead>最近使用</TableHead>
-                <TableHead className="text-right">操作</TableHead>
+                <TableHead>{t('创建人')}</TableHead>
+                <TableHead>{t('创建时间')}</TableHead>
+                <TableHead>{t('最近使用')}</TableHead>
+                <TableHead className="text-right">{t('操作')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -238,21 +244,21 @@ function KeysTab({ keys, definitions, submitting }: {
                     <TableCell className="text-slate-500">{k.scopes.map(s => scopeLabel(t, s)).join(t('、'))}</TableCell>
                     <TableCell className="text-slate-500">{dataScopeLabel(t, k.dataScope)}</TableCell>
                     <TableCell>{k.createdByEmail}</TableCell>
-                    <TableCell className="text-slate-500">{formatTime(k.createdAt)}</TableCell>
-                    <TableCell className="text-slate-500">{k.lastUsedAt ? formatTime(k.lastUsedAt) : '从未使用'}</TableCell>
+                    <TableCell className="text-slate-500">{formatTime(locale, k.createdAt)}</TableCell>
+                    <TableCell className="text-slate-500">{k.lastUsedAt ? formatTime(locale, k.lastUsedAt) : t('从未使用')}</TableCell>
                     <TableCell className="text-right">
                       {k.revoked ? (
-                        <Badge variant="secondary">已吊销</Badge>
+                        <Badge variant="secondary">{t('已吊销')}</Badge>
                       ) : (
                         <div className="flex items-center justify-end gap-3">
                           <Link to={`/api-keys?edit=${k.id}`} className="text-sm text-slate-600 hover:underline">{t('修改范围')}</Link>
                           <Form
                             method="post"
-                            onSubmit={e => { if (!confirm(`确定吊销「${k.name}」？用这把 Key 的外部系统将立即无法调用接口。`)) e.preventDefault(); }}
+                            onSubmit={e => { if (!confirm(t('确定吊销「{name}」？用这把 Key 的外部系统将立即无法调用接口。', { name: k.name }))) e.preventDefault(); }}
                           >
                             <input type="hidden" name="intent" value="revoke" />
                             <input type="hidden" name="keyId" value={k.id} />
-                            <Button type="submit" variant="destructive" size="sm" disabled={submitting}>吊销</Button>
+                            <Button type="submit" variant="destructive" size="sm" disabled={submitting}>{t('吊销')}</Button>
                           </Form>
                         </div>
                       )}
@@ -287,8 +293,9 @@ function KeysTab({ keys, definitions, submitting }: {
   );
 }
 
-/** 「接口说明」标签页的一张卡片：一个外部接口的调用方式，全部来自登记表 */
+/** 「接口说明」标签页的一张卡片：一个外部接口的调用方式，全部来自登记表（卡片外壳的文字走词条，登记表内容是 #1125） */
 function EndpointCard({ endpoint }: { endpoint: ApiEndpoint }) {
+  const t = useT();
   return (
     <section data-endpoint={endpoint.route} className="rounded-2xl border bg-white p-6 shadow-sm">
       <div className="flex flex-wrap items-center gap-2">
@@ -296,26 +303,26 @@ function EndpointCard({ endpoint }: { endpoint: ApiEndpoint }) {
         <code className="font-mono text-sm font-semibold text-slate-900">{endpoint.path}</code>
       </div>
       <p className="mt-3 max-w-3xl text-sm text-slate-600">{endpoint.purpose}</p>
-      <p className="mt-2 text-sm text-slate-600"><span className="text-slate-500">鉴权：</span>{endpoint.auth}</p>
+      <p className="mt-2 text-sm text-slate-600"><span className="text-slate-500">{t('鉴权：')}</span>{endpoint.auth}</p>
 
       {endpoint.params.length > 0 && (
         <div className="mt-4 space-y-2">
-          <h3 className="text-sm font-semibold text-slate-900">参数</h3>
+          <h3 className="text-sm font-semibold text-slate-900">{t('参数')}</h3>
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>参数</TableHead>
-                <TableHead>位置</TableHead>
-                <TableHead>必填</TableHead>
-                <TableHead>说明</TableHead>
+                <TableHead>{t('参数')}</TableHead>
+                <TableHead>{t('位置')}</TableHead>
+                <TableHead>{t('必填')}</TableHead>
+                <TableHead>{t('说明')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {endpoint.params.map(p => (
                 <TableRow key={p.name}>
                   <TableCell className="font-mono">{p.name}</TableCell>
-                  <TableCell>{PARAM_IN_TEXT[p.in]}</TableCell>
-                  <TableCell>{p.required ? '必填' : '可选'}</TableCell>
+                  <TableCell>{paramInText(t, p.in)}</TableCell>
+                  <TableCell>{p.required ? t('必填') : t('可选')}</TableCell>
                   <TableCell className="text-slate-600">{p.desc}</TableCell>
                 </TableRow>
               ))}
@@ -325,18 +332,18 @@ function EndpointCard({ endpoint }: { endpoint: ApiEndpoint }) {
       )}
 
       <div className="mt-4 space-y-2">
-        <h3 className="text-sm font-semibold text-slate-900">成功响应示例</h3>
+        <h3 className="text-sm font-semibold text-slate-900">{t('成功响应示例')}</h3>
         <pre className="overflow-x-auto rounded-lg bg-slate-100 px-3 py-2 font-mono text-sm text-slate-900">{endpoint.responseExample}</pre>
       </div>
 
       <div className="mt-4 space-y-2">
-        <h3 className="text-sm font-semibold text-slate-900">错误</h3>
+        <h3 className="text-sm font-semibold text-slate-900">{t('错误')}</h3>
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>状态码</TableHead>
-              <TableHead>返回文案（error 字段）</TableHead>
-              <TableHead>什么时候出现</TableHead>
+              <TableHead>{t('状态码')}</TableHead>
+              <TableHead>{t('返回文案（error 字段）')}</TableHead>
+              <TableHead>{t('什么时候出现')}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -365,20 +372,20 @@ export default function ApiKeys({ loaderData, actionData }: Route.ComponentProps
   const submitting = useNavigation().state === 'submitting';
   return (
     <AppShell email={email} nav={nav}>
-      <PageHeader title="API Key" description="外部系统用 Authorization: Bearer <Key> 调用 /api/v1/ 下的接口。吊销后用这把 Key 的请求立即被拒绝。" />
+      <PageHeader title="API Key" description={t("外部系统用 Authorization: Bearer '<Key 调用 /api/v1/ 下的接口。吊销后用这把 Key 的请求立即被拒绝。")} />
 
       <PillTabs
         current={tab}
         tabs={[
           { key: 'keys', label: 'Key', href: '/api-keys' },
-          { key: 'docs', label: '接口说明', href: '/api-keys?tab=docs' },
+          { key: 'docs', label: t('接口说明'), href: '/api-keys?tab=docs' },
         ]}
       />
 
       {actionData && 'error' in actionData && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />
-          <AlertTitle>操作未完成</AlertTitle>
+          <AlertTitle>{t('操作未完成')}</AlertTitle>
           <AlertDescription>{actionData.error}</AlertDescription>
         </Alert>
       )}
@@ -386,9 +393,9 @@ export default function ApiKeys({ loaderData, actionData }: Route.ComponentProps
       {actionData && 'created' in actionData && (
         <Alert role="status">
           <KeyRound />
-          <AlertTitle>已创建「{actionData.created.name}」</AlertTitle>
+          <AlertTitle>{t('已创建「{name}」', { name: actionData.created.name })}</AlertTitle>
           <AlertDescription>
-            <p>请现在复制并妥善保存。这把 Key 只展示这一次，平台不保存明文，之后无法再查看。</p>
+            <p>{t('请现在复制并妥善保存。这把 Key 只展示这一次，平台不保存明文，之后无法再查看。')}</p>
             <code data-api-key className="mt-2 block break-all rounded-lg bg-slate-100 px-3 py-2 font-mono text-sm text-slate-900">{actionData.created.key}</code>
           </AlertDescription>
         </Alert>
@@ -397,7 +404,7 @@ export default function ApiKeys({ loaderData, actionData }: Route.ComponentProps
       {tab === 'docs' ? (
         <div className="space-y-4">
           <p className="max-w-3xl text-sm text-slate-500">
-            全部外部接口的调用方式如下，示例里的地址与 Key 都是占位符（&lt;平台地址&gt;、&lt;你的 API Key&gt;）。接口的增改以这份登记表为准。
+            {t("全部外部接口的调用方式如下，示例里的地址与 Key 都是占位符（'<平台地址>、'<你的 API Key>）。接口的增改以这份登记表为准。")}
           </p>
           <p className="max-w-3xl text-sm text-slate-500">
             {t('每把 Key 还有数据范围：范围外的标签、指标不会出现在目录与点查里；范围外的快照返回 404（与不存在相同）；导出条件用到范围外的标签时返回 400。范围在创建 Key 时设置，之后可随时在 Key 列表里「修改范围」，下一个请求即按新范围。')}
