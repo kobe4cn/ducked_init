@@ -186,11 +186,11 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
         description={<Link to="/entities" className="hover:underline">{t('← 全部自定义实体')}</Link>}
         actions={(
           <div className="flex items-center gap-2">
-            {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? t('回到最近的已发布版本') : t('这个自定义实体从没发布过，将被删除{mappings}', {
-              mappings: unpublishedMappings.length ? t('，目标是它的映射草稿一并丢弃：{list}', {
+            {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? t('回到最近的已发布版本') : unpublishedMappings.length
+              ? t('这个自定义实体从没发布过，将被删除，目标是它的映射草稿一并丢弃：{list}', {
                 list: unpublishedMappings.map(m => t('「{source}」{table}', { source: m.source, table: m.table })).join(t('、')),
-              }) : '',
-            })} submitting={submitting} />}
+              })
+              : t('这个自定义实体从没发布过，将被删除')} submitting={submitting} />}
             {canDelete && (referrers.length ? (
               <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-delete-blocker>
                 <Lock className="size-3.5 shrink-0" />{t('被已发布的映射、关系或指标引用，不能删除：{list}', { list: referrers.join(t('、')) })}
