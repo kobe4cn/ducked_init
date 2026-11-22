@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import enClient from '../app/i18n/en.client.json';
 import enServer from '../app/i18n/en.server.json';
 import { CANONICAL_NAMES, ENUM_LABELS } from '../app/lib/builtin-names';
-import { TEMPLATES } from '../app/.server/pipeline/templates/index';
+import { TEMPLATES, type ParamField } from '../app/.server/pipeline/templates/index';
 import { RFM_DEFAULTS } from '../app/.server/pipeline/templates/rfm';
 import { TASK_STATUS_LABELS } from '../app/.server/tasks';
 import { DSL_KINDS } from '../app/.server/pipeline/dsl/index';
@@ -115,6 +115,8 @@ describe('守卫：翻译键与英文词典对账（ADR-0060）', () => {
       ...CANONICAL_NAMES,
       ...ENUM_LABELS,
       ...Object.values(TEMPLATES).map(template => template.label),
+      // 通用参数表单（注册表里的 form）的字段标签与下拉选项（#1049）
+      ...Object.values(TEMPLATES).flatMap(template => ('form' in template ? template.form as readonly ParamField[] : []).flatMap(field => [field.label, ...(field.options ?? []).map(option => option.label)])),
       ...RFM_DEFAULTS.segments.map(segment => segment.name),
       ...Object.values(TASK_STATUS_LABELS),
       ...Object.values(DSL_KINDS).map(kind => kind.label),
