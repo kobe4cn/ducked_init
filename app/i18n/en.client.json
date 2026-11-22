@@ -1138,7 +1138,7 @@
   "会把表结构与列统计（打开「发送脱敏样本」时附 5 行脱敏样本）和已保存的这一版映射（有草稿时是草稿）发给模型服务，以它为底只替换 assertions 块填进编辑框，编辑框里没保存的修改会被换掉；不会保存": "Sends the table structure and column statistics (with \"send anonymized samples\" enabled, 5 anonymized rows are attached) and this mapping's saved version (the draft, if any) to the model service, and replaces only the assertions block in the editor based on it; unsaved edits in the editor are replaced. Nothing is saved",
   "空跑 v{version}": "Dry-run v{version}",
   "在原始层最新的样本上转换已保存的这一版，看样例行与基础断言；编辑框里没保存的修改不参与，也不写标准层。": "Transform this saved version on the latest Bronze-layer sample to see sample rows and basic assertions; unsaved edits in the editor take no part, and nothing is written to the Silver layer.",
-  "{count} 个匹配值各连了 {threshold} 条以上记录，可能是占位号或代填号。": "{count, plural, other {# matching values each link {threshold} or more records; they may be placeholder or filler numbers.}}",
+  "{count} 个匹配值各连了 {threshold} 条以上记录，可能是占位号或代填号。": "{count, plural, one {# matching value links {threshold} or more records; it may be a placeholder or filler number.} other {# matching values each link {threshold} or more records; they may be placeholder or filler numbers.}}",
   "去数据质量页查看": "See the data quality page",
   "这个映射最近一次合并：{status}。发布后、以及同步给这个映射的源表写入了变更后，已发布的最新版本把原始层的新批次合并进标准层；换了版本时由全部批次重建。写了兜底值的字段，每次合并列出本次落入兜底的取值。": "This mapping's latest merge: {status}. After publishing, and after the source table synced to this mapping receives changes, the latest published version merges new Bronze-layer batches into the Silver layer; changing versions rebuilds from all batches. For fields with a fallback value, each merge lists the values that fell back this time."
 }

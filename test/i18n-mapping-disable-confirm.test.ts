@@ -21,3 +21,12 @@ describe('停用确认弹窗：问句和后果说明是一个整句词条', () =
       .toBe('确认停用这个映射（de@acme.com 提议）？停用后合并撤下它写进标准层的行。');
   });
 });
+
+describe('合并记录：高频匹配值提示的英文单复数', () => {
+  const HOT = '{count} 个匹配值各连了 {threshold} 条以上记录，可能是占位号或代填号。';
+  it('count=1 用单数句，count>1 用复数句', () => {
+    const t = makeT('en', enClient as Record<string, string>);
+    expect(t(HOT, { count: 1, threshold: 10 })).toBe('1 matching value links 10 or more records; it may be a placeholder or filler number.');
+    expect(t(HOT, { count: 2, threshold: 10 })).toBe('2 matching values each link 10 or more records; they may be placeholder or filler numbers.');
+  });
+});
