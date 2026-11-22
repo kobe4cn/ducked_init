@@ -6,6 +6,7 @@ import { AlertTriangle } from 'lucide-react';
 import { data, Link } from 'react-router';
 import type { Route } from './+types/knowledge.sources.$id';
 import { requirePermission } from '~/.server/access';
+import { errorTextFor } from '~/.server/i18n';
 import { KnowledgeError } from '~/.server/knowledge/basis';
 import { getKnowledgeSource } from '~/.server/knowledge/sources';
 import { navFor } from '~/.server/nav';
@@ -43,7 +44,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       evidenceVersion,
     };
   } catch (e) {
-    if (e instanceof KnowledgeError) throw data({ message: e.message }, { status: e.status });
+    if (e instanceof KnowledgeError) throw data({ message: await errorTextFor(request, e) }, { status: e.status });
     throw e;
   }
 }
