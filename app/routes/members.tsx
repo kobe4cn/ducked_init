@@ -76,8 +76,8 @@ export default function Members({ loaderData, actionData }: Route.ComponentProps
   const t = useT();
   const locale = useLocale();
   const submitting = useNavigation().state === 'submitting';
-  const roleOptions = ROLES.map(r => <NativeSelectOption key={r} value={r}>{builtinName(t, ROLE_LABELS[r], ENUM_LABELS)}</NativeSelectOption>);
   const roleName = (role: Role) => builtinName(t, ROLE_LABELS[role], ENUM_LABELS);
+  const roleOptions = ROLES.map(r => <NativeSelectOption key={r} value={r}>{roleName(r)}</NativeSelectOption>);
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader title={t('成员')} description={t('修改角色立即生效；移除成员后其已登录的会话立即失效。租户至少保留一名管理员。')} />
