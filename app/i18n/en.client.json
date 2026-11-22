@@ -1370,7 +1370,7 @@
   "需要处理": "Needs attention",
   "非枚举字段带值字典或兜底值（dictionary / otherwise），请在 YAML 里修改": "A non-enum field carries a value dictionary or fallback (dictionary / otherwise); edit it in the YAML",
   "非空": "not null",
-  "非空 {n, plural, other {# 人}}": "{n} non-null",
+  "非空 {n, plural, other {# 人}}": "{n, plural, other {# non-null}}",
   "面额": "Face Value",
   "页换一个支持工具调用的模型。": " page to switch to a model that supports tool calling.",
   "页配置。": " page to configure one.",
