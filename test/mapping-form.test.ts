@@ -5,6 +5,7 @@
 import { parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { entityOf } from '../app/lib/canonical-model';
+import { makeT, msgText } from '../app/lib/i18n';
 import {
   dictionaryRows, formUnavailable, groupIssues, identityCandidates, issueTarget, keySpaceOf, newExtension, readExtensions, readForm, readIdentity, readKeySpace, readSurvivorship, seedDictionary, TRANSFORMS,
   unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace, writeSurvivorship,
@@ -16,6 +17,8 @@ import type { ColumnProfile, TableProfile } from '../app/.server/pipeline/source
 
 const ORDER = entityOf('order')!;
 const CUSTOMER = entityOf('customer')!;
+/** reason / formUnavailable 现在是句式（Msg）：断言 msgText 按中文界面出的文字（原中文不变） */
+const zhT = makeT('zh-CN', null);
 
 const column = (name: string, type: string, extra: Partial<ColumnProfile> = {}): ColumnProfile =>
   ({ name, type, nullRate: 0, distinct: 100, min: null, max: null, ...extra });
@@ -117,9 +120,12 @@ describe('读出表单', () => {
 
   it('非枚举字段的值字典或兜底值、解析失败的表达式与认不出的结构只读，并说明原因', () => {
     const odd = readForm(parseDocument(ODD), CUSTOMER);
-    expect(field(odd, 'city')).toMatchObject({ transform: 'direct', readonly: true, reason: expect.stringContaining('值字典') });
-    expect(field(odd, 'name')).toMatchObject({ transform: 'custom', raw: 'foo(', readonly: true, reason: expect.stringContaining('表达式') });
-    expect(field(odd, 'updated_at')).toMatchObject({ transform: null, readonly: true, reason: expect.any(String) });
+    expect(field(odd, 'city')).toMatchObject({ transform: 'direct', readonly: true });
+    expect(msgText(zhT, field(odd, 'city').reason!)).toContain('值字典');
+    expect(field(odd, 'name')).toMatchObject({ transform: 'custom', raw: 'foo(', readonly: true });
+    expect(msgText(zhT, field(odd, 'name').reason!)).toContain('表达式');
+    expect(field(odd, 'updated_at')).toMatchObject({ transform: null, readonly: true });
+    expect(msgText(zhT, field(odd, 'updated_at').reason!)).toBe('这种写法表单不认识，请在 YAML 里修改');
   });
 
   it('必填字段是 dedupe.key 声明的字段，没有声明时是实体主键', () => {
@@ -343,7 +349,7 @@ describe('扩展字段', () => {
     const doc = parseDocument(yaml);
     const { extensions } = readExtensions(doc);
     expect(extensions.map(e => [e.name, e.readonly, e.dictionary])).toEqual([['x_amount_fen', false, false], ['x_level', false, true], ['x_bad', true, false], ['x_odd', true, false]]);
-    expect(extensions[2].reason).toEqual(expect.any(String));
+    expect(msgText(zhT, extensions[2].reason!)).toBe('这种写法表单不认识，请在 YAML 里修改');
     expect(() => writeExtension(doc, 'x_bad', null)).toThrow();
 
     // 只改中文名：值字典、兜底与注释都在
@@ -352,7 +358,9 @@ describe('扩展字段', () => {
     const out = doc.toString();
     expect(out).toBe(yaml.replace('    otherwise: null\n', '    otherwise: null\n    label: 会员等级\n'));
     expect(parseDocument(out).toJS().extensions.x_level).toEqual({ type: 'string', expr: 'lvl', dictionary: { 1: '金卡' }, otherwise: null, label: '会员等级' });
-    expect(readExtensions(parseDocument('extensions: [a]\n'))).toMatchObject({ extensions: [], reason: expect.any(String) });
+    const notMap = readExtensions(parseDocument('extensions: [a]\n'));
+    expect(notMap).toMatchObject({ extensions: [] });
+    expect(msgText(zhT, notMap.reason!)).toBe('extensions 下不是字段表，请在 YAML 里修改');
   });
   it('敏感：列名或格式像敏感信息的源列加为扩展字段时默认标成敏感（文本）；勾选、取消敏感写回 YAML', () => {
     const contacts = table('contacts', [
@@ -413,8 +421,10 @@ describe('身份打通的匹配字段', () => {
   });
 
   it('表单不认识的写法只读', () => {
-    expect(readIdentity(parseDocument('identity: [phone]\n'))).toMatchObject({ match: [], reason: expect.stringContaining('YAML') });
-    expect(readIdentity(parseDocument('identity:\n  match: phone\n'))).toMatchObject({ reason: expect.stringContaining('YAML') });
+    const seq = readIdentity(parseDocument('identity: [phone]\n'));
+    expect(seq).toMatchObject({ match: [] });
+    expect(msgText(zhT, seq.reason!)).toBe('identity 的写法表单不认识，请在 YAML 里修改');
+    expect(msgText(zhT, readIdentity(parseDocument('identity:\n  match: phone\n')).reason!)).toContain('YAML');
     expect(() => writeIdentity(parseDocument('identity: [phone]\n'), ['phone'])).toThrow(/YAML/);
   });
 });
@@ -452,7 +462,8 @@ describe('属性取舍名次', () => {
       'survivorship:\n  priority: 1.5\n', "survivorship:\n  priority: '2'\n", 'survivorship:\n  priority: 2\n  note: x\n',
     ]) {
       const doc = parseDocument(BASE + odd);
-      expect(readSurvivorship(doc)).toEqual({ priority: null, reason: expect.stringContaining('YAML') });
+      expect(readSurvivorship(doc)).toMatchObject({ priority: null });
+      expect(msgText(zhT, readSurvivorship(doc).reason!)).toContain('YAML');
       expect(() => writeSurvivorship(doc, 2)).toThrow(/YAML/);
     }
   });
@@ -601,9 +612,9 @@ describe('实时校验的问题对应到表单区块', () => {
   it('formUnavailable：标准实体、YAML 没有语法错误、写的实体一致时表单能显示（null），否则给出说明', () => {
     expect(formUnavailable(parseDocument(HAND), 'order')).toBeNull();
     expect(formUnavailable(parseDocument('model: 1\n'), 'order')).toBeNull();
-    expect(formUnavailable(parseDocument(HAND), 'custom_store')).toContain('不是标准实体');
-    expect(formUnavailable(parseDocument('fields: [\n'), 'order')).toContain('YAML 有语法错误');
-    expect(formUnavailable(parseDocument(HAND), 'customer')).toContain('YAML 里写的实体是 order');
+    expect(msgText(zhT, formUnavailable(parseDocument(HAND), 'custom_store')!)).toContain('不是标准实体');
+    expect(msgText(zhT, formUnavailable(parseDocument('fields: [\n'), 'order')!)).toContain('YAML 有语法错误');
+    expect(msgText(zhT, formUnavailable(parseDocument(HAND), 'customer')!)).toContain('YAML 里写的实体是 order');
   });
 
   it('真实的校验结果：amount 写错的问题对应到字段 amount', () => {

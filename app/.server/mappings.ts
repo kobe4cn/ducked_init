@@ -43,6 +43,7 @@ import { cmp, cmpName } from '../lib/compare';
 import { entityForTable } from '../lib/field-synonyms';
 import { diffPlans } from '../lib/mapping-diff';
 import { newExtension, readExtensions, writeExtension } from '../lib/mapping-form';
+import { translate } from '../lib/i18n';
 
 /** 可以展示给成员的业务错误；issues 是映射文档里带行列位置的问题。发布流程本身的错误（PublishError）由它继承（ADR-0051） */
 export class MappingError extends PublishError {
@@ -398,7 +399,8 @@ export async function yamlWithColumns(actor: CurrentMember, mappingId: string, c
   if (typeof profiled === 'string') throw new MappingError(profiled);
   const doc = parseDocument(await latestYaml(mappingId));
   const { extensions, reason } = readExtensions(doc);
-  if (reason) throw new MappingError(reason);
+  // reason 现在是句式（Msg）：按中文出原文，服务端报错逐字不变（报错英文化不在 #1043）
+  if (reason) throw new MappingError(translate('zh-CN', null, reason.key, reason.params));
   const taken = extensions.map(e => e.name);
   try {
     for (const column of new Set(columns)) {
