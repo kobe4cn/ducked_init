@@ -642,7 +642,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
               {keySpaceChange.followers.map(f => (
                 <li key={f.mapping}>
                   <Link to={`/mappings/${f.mapping}`} className="font-mono underline">{f.table}</Link>
-                  <span className="text-slate-500">{`（${f.entity}）`}</span>
+                  <span className="text-slate-500">{t('（{entity}）', { entity: f.entity })}</span>
                   {f.fields.map(field => <code key={field} className="ml-2" data-key-space-follower-field={field}>{field}</code>)}
                 </li>
               ))}
@@ -667,7 +667,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
           <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-violet-100 text-violet-700"><Boxes className="size-5" /></span>
           <span className="min-w-0">
             <span className="block text-xs text-slate-500">{t('{kind, select, custom {自定义实体} other {标准实体}}', { kind: isCustomEntity(mapping.entity) ? 'custom' : 'canonical' })}</span>
-            <span className="block truncate font-medium">{`${entityName}（${mapping.entity}）`}</span>
+            <span className="block truncate font-medium">{t('{label}（{name}）', { label: entityName, name: mapping.entity })}</span>
           </span>
         </Link>
         <div className="grid grid-cols-2 gap-4">

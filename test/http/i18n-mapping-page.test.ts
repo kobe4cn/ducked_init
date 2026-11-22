@@ -58,7 +58,8 @@ describe('英文界面：映射详情页（一）', () => {
     // 标题与页头：标准实体名（行为事件）经 builtinName 显示英文，自定义实体名才是数据不翻
     expect(edit).toContain('<title>Event ← events · CRM Data Analytics Platform</title>');
     expect(edit).toContain('← All mappings');
-    expect(edit).toContain('Event（event）');
+    expect(edit).toContain('Event (event)');
+    expect(edit).not.toContain('（');
     // 源表卡与实体卡的种类（单数）：ICU 复数 / select
     expect(edit).toContain('text-slate-500">Source table<');
     expect(edit).toContain('text-slate-500">Canonical entity<');
