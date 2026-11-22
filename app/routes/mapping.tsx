@@ -637,7 +637,7 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
           <AlertTriangle className="text-amber-600" />
           <AlertTitle>{t('主键的键空间由 {from} 改为 {to}', { from: keySpaceChange.from ?? t('未声明'), to: keySpaceChange.to ?? t('未声明') })}</AlertTitle>
           <AlertDescription>
-            <p>{t('同一数据源里这些已发布映射的引用字段还按旧的键空间写，关系会对不上。请把它们改成 {keySpace}，与本映射一起改、一起发布（本映射先发布）：', { keySpace: keySpaceChange.to ? `key_space: ${keySpaceChange.to}` : t('不写键空间') })}</p>
+            <p>{t('同一数据源里这些已发布映射的引用字段还按旧的键空间写，关系会对不上。请把它们改成{declared, select, yes { key_space: {keySpace}} other {不写键空间}}，与本映射一起改、一起发布（本映射先发布）：', { declared: keySpaceChange.to ? 'yes' : 'no', keySpace: keySpaceChange.to ?? '' })}</p>
             <ul className="mt-1 space-y-0.5">
               {keySpaceChange.followers.map(f => (
                 <li key={f.mapping}>

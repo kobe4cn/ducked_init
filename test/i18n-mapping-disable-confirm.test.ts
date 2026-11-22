@@ -30,3 +30,17 @@ describe('合并记录：高频匹配值提示的英文单复数', () => {
     expect(t(HOT, { count: 2, threshold: 10 })).toBe('2 matching values each link 10 or more records; they may be placeholder or filler numbers.');
   });
 });
+
+describe('键空间跟随提示：改成哪种写法是 ICU select，中文与改造前逐字一致', () => {
+  const KEY_SPACE = '同一数据源里这些已发布映射的引用字段还按旧的键空间写，关系会对不上。请把它们改成{declared, select, yes { key_space: {keySpace}} other {不写键空间}}，与本映射一起改、一起发布（本映射先发布）：';
+  it('中文：声明了键空间时前面带空格，不写键空间时不带', () => {
+    const t = makeT('zh-CN', null);
+    expect(t(KEY_SPACE, { declared: 'yes', keySpace: 'store' })).toContain('请把它们改成 key_space: store，与本映射');
+    expect(t(KEY_SPACE, { declared: 'no', keySpace: '' })).toContain('请把它们改成不写键空间，与本映射');
+  });
+  it('英文两支', () => {
+    const t = makeT('en', enClient as Record<string, string>);
+    expect(t(KEY_SPACE, { declared: 'yes', keySpace: 'store' })).toContain('Change them to key_space: store and');
+    expect(t(KEY_SPACE, { declared: 'no', keySpace: '' })).toContain('Change them to no key space and');
+  });
+});
