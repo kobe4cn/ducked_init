@@ -4,6 +4,7 @@ import { data, Form, useNavigation } from 'react-router';
 import { CircleAlert, ShieldAlert } from 'lucide-react';
 import type { Route } from './+types/pii.reveal';
 import { requirePermission } from '~/.server/access';
+import { errorTextFor } from '~/.server/i18n';
 import { navFor } from '~/.server/nav';
 import { PiiError, revealableMappings, revealPii } from '~/.server/pii';
 import { AppShell } from '~/components/app-shell';
@@ -35,7 +36,7 @@ export async function action({ request }: Route.ActionArgs) {
   try {
     return { revealed: await revealPii(member, { mappingId: field('mappingId'), key: field('key'), reason: field('reason') }) };
   } catch (e) {
-    if (e instanceof PiiError) return data({ error: e.message }, { status: e.status });
+    if (e instanceof PiiError) return data({ error: await errorTextFor(request, e) }, { status: e.status });
     throw e;
   }
 }

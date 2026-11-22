@@ -4,6 +4,7 @@ import { data, Form, redirect, useNavigation } from 'react-router';
 import { CircleAlert, KeyRound } from 'lucide-react';
 import type { Route } from './+types/settings';
 import { requireMember } from '~/.server/auth';
+import { errorTextFor } from '~/.server/i18n';
 import { createMemberToken, listMemberTokens, MemberTokenError, revokeMemberToken } from '~/.server/member-tokens';
 import { DEFAULT_TOKEN_DAYS, TOKEN_DAYS, TOKEN_NAME_MAX } from '~/lib/member-tokens';
 import { navFor } from '~/.server/nav';
@@ -64,7 +65,7 @@ export async function action({ request }: Route.ActionArgs) {
         return data({ error: '未知操作' }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof MemberTokenError) return data({ error: e.message }, { status: e.status });
+    if (e instanceof MemberTokenError) return data({ error: await errorTextFor(request, e) }, { status: e.status });
     throw e;
   }
   throw redirect('/settings');
