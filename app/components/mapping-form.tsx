@@ -15,9 +15,10 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
 import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, KEY_SPACE_PATTERN, type CanonicalEntity, type CanonicalField, type FieldType } from '~/lib/canonical-model';
-import { parseExpression } from '~/lib/mapping-expr';
+import { ExprError, parseExpression } from '~/lib/mapping-expr';
 import { builtinName, CANONICAL_NAMES, ENUM_LABELS } from '~/lib/builtin-names';
-import { useT, type T } from '~/lib/i18n';
+import { msgText, useT, type T } from '~/lib/i18n';
+import { functionText } from '~/lib/mapping-functions-text';
 import {
   dictionaryRows, expressionOf, extensionNameProblem, formUnavailable, groupIssues, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity,
   readKeySpace, readSurvivorship, seedDictionary, TRANSFORMS, unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace, writeSurvivorship, writtenDictionary,
@@ -196,7 +197,9 @@ function missing(t: T, choice: FieldChoice, type: FieldType): string | null {
     parseExpression(expressionOf(choice, type));
     return null;
   } catch (e) {
-    return choice.transform === 'custom' ? t('表达式有误：{message}', { message: (e as Error).message }) : (e as Error).message;
+    // ExprError 带句式：英文界面出英文（msgText）；其他错误照旧出 message
+    const text = e instanceof ExprError ? msgText(t, e.detail) : (e as Error).message;
+    return choice.transform === 'custom' ? t('表达式有误：{message}', { message: text }) : text;
   }
 }
 
@@ -837,7 +840,10 @@ function CustomExpression({ raw, functions, onChange }: { raw: string; functions
       <Input ref={input} className="h-7 w-80 font-mono" aria-label={t('自定义表达式')} placeholder={t('如 coalesce(pay_amount, pay_fen / 100)')} value={raw} onChange={e => onChange(e.target.value)} />
       <NativeSelect size="sm" aria-label={t('插入函数')} value="" onChange={e => e.target.value && insert(e.target.value)}>
         <NativeSelectOption value="">{t('插入函数…')}</NativeSelectOption>
-        {functions.map(f => <NativeSelectOption key={f.name} value={f.name}>{t('{signature}：{label}', { signature: f.signature, label: f.label })}</NativeSelectOption>)}
+        {functions.map(f => {
+          const text = functionText(t, f);
+          return <NativeSelectOption key={f.name} value={f.name}>{t('{signature}：{label}', { signature: text.signature, label: text.label })}</NativeSelectOption>;
+        })}
       </NativeSelect>
     </>
   );

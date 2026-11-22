@@ -48,6 +48,11 @@ export function translate(locale: Locale, messages: Record<string, string> | nul
 export const makeT = (locale: Locale, messages: Record<string, string> | null): T =>
   (key, params) => translate(locale, messages, key, params);
 
+/** 前端显示 Msg（如 ExprError 的 detail）：交给 t 按界面语言出文字。前后端共用的 lib 里 msg() 的键要同时在 en.client.json 和 en.server.json */
+export function msgText(t: T, m: Msg): string {
+  return t(m.key, m.params);
+}
+
 const I18nContext = createContext<T>(makeT('zh-CN', null));
 // 语言单独一个 context：数字 / 日期格式化（format.ts）只要语言、不要词典
 const LocaleContext = createContext<Locale>('zh-CN');

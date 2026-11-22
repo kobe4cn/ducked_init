@@ -5,6 +5,7 @@
 // 平台进程（保存与发布时校验）、工作进程（合并时编译）与映射表单（客户端读写表达式）共用
 import type { FieldType } from './canonical-model';
 import { looksSensitive } from './sensitive';
+import { msg, MsgError, type Msg } from './i18n';
 
 export type Expr =
   | { kind: 'column'; name: string; offset: number }
@@ -23,9 +24,9 @@ export type CompareOp = '=' | '<>' | '<' | '<=' | '>' | '>=';
 /** 关键字：作字段名时要加双引号 */
 const KEYWORDS = ['and', 'or', 'not', 'is', 'in'];
 
-/** 表达式里的错误：offset 是在表达式文本里的位置（从 0 起） */
-export class ExprError extends Error {
-  constructor(message: string, readonly offset: number) { super(message); }
+/** 表达式里的错误：offset 是在表达式文本里的位置（从 0 起）；detail 带句式（英文界面出英文，message 固定中文） */
+export class ExprError extends MsgError {
+  constructor(detail: Msg, readonly offset: number) { super(detail); }
 }
 
 /** 源列类型的大类 */
@@ -88,10 +89,14 @@ const isTimeZone = (tz: string) => {
   }
 };
 
-/** 参数里要求是字符串字面量的位置（时区、时间格式），返回其文本 */
-function textArg(call: Extract<Expr, { kind: 'call' }>, i: number, what: string) {
+/** 参数里要求是字符串字面量的位置（时区、时间格式），返回其文本；what 是代码，按它分句式 */
+function textArg(call: Extract<Expr, { kind: 'call' }>, i: number, what: 'format' | 'timezone') {
   const arg = call.args[i];
-  if (arg.kind !== 'literal' || arg.text === undefined) throw new ExprError(`${call.fn} 的第 ${i + 1} 个参数（${what}）必须是单引号括起的字符串`, arg.offset);
+  if (arg.kind !== 'literal' || arg.text === undefined) {
+    throw new ExprError(what === 'format'
+      ? msg('{fn} 的第 {n} 个参数（格式）必须是单引号括起的字符串', { fn: call.fn, n: i + 1 })
+      : msg('{fn} 的第 {n} 个参数（时区）必须是单引号括起的字符串', { fn: call.fn, n: i + 1 }), arg.offset);
+  }
   return arg.text;
 }
 
@@ -118,25 +123,25 @@ export const FUNCTIONS: Record<string, FunctionDef> = {
     signature: "date(x[, '格式'])", returns: 'date',
     label: '转为日期；第二个参数为格式时按格式解析（如 \'%Y/%m/%d\'）',
     arity: [1, 2],
-    check: call => { if (call.args.length === 2) textArg(call, 1, '格式'); },
-    sql: (args, call) => (args.length === 2 ? `CAST(strptime(CAST(${args[0]} AS VARCHAR), ${lit(textArg(call, 1, '格式'))}) AS DATE)` : `CAST(${args[0]} AS DATE)`),
+    check: call => { if (call.args.length === 2) textArg(call, 1, 'format'); },
+    sql: (args, call) => (args.length === 2 ? `CAST(strptime(CAST(${args[0]} AS VARCHAR), ${lit(textArg(call, 1, 'format'))}) AS DATE)` : `CAST(${args[0]} AS DATE)`),
   },
   timestamp: {
     signature: "timestamp(x[, '格式'])", returns: 'timestamp',
     label: '转为时间（不带时区的按 UTC）；第二个参数为格式时按格式解析（如 \'%Y-%m-%d %H:%M\'）',
     arity: [1, 2],
-    check: call => { if (call.args.length === 2) textArg(call, 1, '格式'); },
-    sql: (args, call) => (args.length === 2 ? `strptime(CAST(${args[0]} AS VARCHAR), ${lit(textArg(call, 1, '格式'))})` : `CAST(${args[0]} AS TIMESTAMP)`),
+    check: call => { if (call.args.length === 2) textArg(call, 1, 'format'); },
+    sql: (args, call) => (args.length === 2 ? `strptime(CAST(${args[0]} AS VARCHAR), ${lit(textArg(call, 1, 'format'))})` : `CAST(${args[0]} AS TIMESTAMP)`),
   },
   from_timezone: {
     signature: "from_timezone(x, '时区')", returns: 'timestamp',
     label: '把源端的本地时间（不带时区）按给定时区解读，如 from_timezone(created_at, \'Asia/Shanghai\')',
     arity: [2, 2],
     check: call => {
-      const tz = textArg(call, 1, '时区');
-      if (!isTimeZone(tz)) throw new ExprError(`不认识的时区：${tz}（请用 IANA 时区名，如 Asia/Shanghai）`, call.args[1].offset);
+      const tz = textArg(call, 1, 'timezone');
+      if (!isTimeZone(tz)) throw new ExprError(msg('不认识的时区：{tz}（请用 IANA 时区名，如 Asia/Shanghai）', { tz }), call.args[1].offset);
     },
-    sql: (args, call) => `timezone(${lit(textArg(call, 1, '时区'))}, CAST(${args[0]} AS TIMESTAMP))`,
+    sql: (args, call) => `timezone(${lit(textArg(call, 1, 'timezone'))}, CAST(${args[0]} AS TIMESTAMP))`,
   },
   from_epoch_seconds: { signature: 'from_epoch_seconds(x)', returns: 'timestamp', label: 'Unix 秒转为时间', arity: [1, 1], sql: ([a]) => `to_timestamp(CAST(${a} AS DOUBLE))` },
   from_epoch_millis: { signature: 'from_epoch_millis(x)', returns: 'timestamp', label: 'Unix 毫秒转为时间', arity: [1, 1], sql: ([a]) => `to_timestamp(CAST(${a} AS DOUBLE) / 1000)` },
@@ -177,12 +182,14 @@ export function parseExpression(src: string): Expr {
     return true;
   };
 
-  function quoted(close: string, what: string) {
+  function quoted(close: string, what: 'string' | 'field') {
     const start = i;
     i++;
     let text = '';
     for (;;) {
-      if (i >= src.length) throw new ExprError(`${what}没有结束的 ${close}`, start);
+      if (i >= src.length) throw new ExprError(what === 'string'
+        ? msg('字符串没有结束的 {close}', { close })
+        : msg('字段名没有结束的 {close}', { close }), start);
       if (src[i] === close) {
         if (src[i + 1] === close) { text += close; i += 2; continue; }
         i++;
@@ -196,22 +203,22 @@ export function parseExpression(src: string): Expr {
     skip();
     const start = i;
     const c = src[i];
-    if (c === undefined) throw new ExprError('表达式不完整', i);
+    if (c === undefined) throw new ExprError(msg('表达式不完整'), i);
     if (c === '(') {
       i++;
       const e = or();
-      if (peek() !== ')') throw new ExprError('缺少右括号', i);
+      if (peek() !== ')') throw new ExprError(msg('缺少右括号'), i);
       i++;
       return e;
     }
     if (c === "'") {
-      const text = quoted("'", '字符串');
+      const text = quoted("'", 'string');
       return { kind: 'literal', sql: lit(text), text, offset: start };
     }
-    if (c === '"') return { kind: 'column', name: quoted('"', '字段名'), offset: start };
+    if (c === '"') return { kind: 'column', name: quoted('"', 'field'), offset: start };
     if (/[0-9.]/.test(c)) {
       const m = /^(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)/.exec(src.slice(i));
-      if (!m) throw new ExprError(`无法识别的数字`, i);
+      if (!m) throw new ExprError(msg('无法识别的数字'), i);
       i += m[0].length;
       return { kind: 'literal', sql: m[0], offset: start };
     }
@@ -221,7 +228,7 @@ export function parseExpression(src: string): Expr {
       if (peek() === '(') {
         const fn = name.toLowerCase();
         const def = FUNCTIONS[fn];
-        if (!def) throw new ExprError(`函数 ${name} 不在白名单内（可用：${Object.keys(FUNCTIONS).join('、')}）`, start);
+        if (!def) throw new ExprError(msg('函数 {name} 不在白名单内（可用：{names}）', { name, names: Object.keys(FUNCTIONS).join('、') }), start);
         i++;
         const args: Expr[] = [];
         if (peek() !== ')') {
@@ -231,12 +238,15 @@ export function parseExpression(src: string): Expr {
             break;
           }
         }
-        if (peek() !== ')') throw new ExprError(`函数 ${fn} 的参数缺少右括号`, i);
+        if (peek() !== ')') throw new ExprError(msg('函数 {fn} 的参数缺少右括号', { fn }), i);
         i++;
         const [min, max] = def.arity;
         if (args.length < min || args.length > max) {
-          const expected = min === max ? `${min} 个` : max === Infinity ? `至少 ${min} 个` : `${min} 到 ${max} 个`;
-          throw new ExprError(`函数 ${fn} 需要${expected}参数，实际 ${args.length} 个`, start);
+          let detail: Msg;
+          if (min === max) detail = msg('函数 {fn} 需要{min} 个参数，实际 {actual} 个', { fn, min, actual: args.length });
+          else if (max === Infinity) detail = msg('函数 {fn} 需要至少 {min} 个参数，实际 {actual} 个', { fn, min, actual: args.length });
+          else detail = msg('函数 {fn} 需要{min} 到 {max} 个参数，实际 {actual} 个', { fn, min, max, actual: args.length });
+          throw new ExprError(detail, start);
         }
         const call = { kind: 'call' as const, fn, args, offset: start };
         def.check?.(call);
@@ -245,10 +255,10 @@ export function parseExpression(src: string): Expr {
       const lower = name.toLowerCase();
       if (lower === 'null') return { kind: 'literal', sql: 'NULL', offset: start };
       if (lower === 'true' || lower === 'false') return { kind: 'literal', sql: lower.toUpperCase(), offset: start };
-      if (KEYWORDS.includes(lower)) throw new ExprError(`${name} 是关键字，作字段名时请加双引号："${name}"`, start);
+      if (KEYWORDS.includes(lower)) throw new ExprError(msg('{name} 是关键字，作字段名时请加双引号："{name}"', { name }), start);
       return { kind: 'column', name, offset: start };
     }
-    throw new ExprError(`无法识别的字符 ${c}`, i);
+    throw new ExprError(msg('无法识别的字符 {c}', { c }), i);
   }
 
   function unary(): Expr {
@@ -285,12 +295,12 @@ export function parseExpression(src: string): Expr {
     }
     if (keyword('is')) {
       const negated = keyword('not');
-      if (!keyword('null')) throw new ExprError('is 后面只能是 null 或 not null', i);
+      if (!keyword('null')) throw new ExprError(msg('is 后面只能是 null 或 not null'), i);
       return { kind: 'isnull', arg: left, negated, offset };
     }
     const negated = keyword('not');
     if (keyword('in')) {
-      if (peek() !== '(') throw new ExprError("in 后面要用括号列出取值，如 in ('a', 'b')", i);
+      if (peek() !== '(') throw new ExprError(msg("in 后面要用括号列出取值，如 in ('a', 'b')"), i);
       i++;
       const list: Expr[] = [];
       for (;;) {
@@ -298,11 +308,11 @@ export function parseExpression(src: string): Expr {
         if (peek() === ',') { i++; continue; }
         break;
       }
-      if (peek() !== ')') throw new ExprError('in 的取值缺少右括号', i);
+      if (peek() !== ')') throw new ExprError(msg('in 的取值缺少右括号'), i);
       i++;
       return { kind: 'in', arg: left, list, negated, offset };
     }
-    if (negated) throw new ExprError('not 放在这里只能接 in', i);
+    if (negated) throw new ExprError(msg('not 放在这里只能接 in'), i);
     return left;
   }
 
@@ -326,10 +336,10 @@ export function parseExpression(src: string): Expr {
   const and = logic(not, 'and');
   const or = logic(and, 'or');
 
-  if (!src.trim()) throw new ExprError('表达式为空', 0);
+  if (!src.trim()) throw new ExprError(msg('表达式为空'), 0);
   const expr = or();
   skip();
-  if (i < src.length) throw new ExprError(`多余的内容：${src.slice(i, i + 20)}`, i);
+  if (i < src.length) throw new ExprError(msg('多余的内容：{rest}', { rest: src.slice(i, i + 20) }), i);
   return expr;
 }
 

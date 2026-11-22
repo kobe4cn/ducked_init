@@ -724,8 +724,13 @@ describe('编写映射时的对照面板', () => {
     expect(strip).toContain('Decimal (2 places)');
     expect(strip).toContain('Syntax cheatsheet: click to insert at the cursor');
     expect(strip).toContain('Functions available in expressions (whitelist)');
-    // 面板特有的中文界面文字不再出现（字段说明、函数说明是数据，随 #932）
-    for (const zh of ['空值率', '常见取值（样本行数）', '写法速查：点击插入到光标处', '的标准字段：已对应的打勾，去重键必填', '表达式可用的函数（白名单）']) expect(strip).not.toContain(zh);
+    // 函数表：写法与说明也按界面语言（#1042，FUNCTIONS 的中文是数据，经 functionText 出英文）
+    expect(strip).toContain('substr(x, start[, length])');
+    expect(strip).toContain('round(x[, decimal places])');
+    expect(strip).toContain('Convert Unix seconds to a timestamp');
+    expect(strip).toContain('Take the first non-null value');
+    // 面板特有的中文界面文字不再出现（字段说明是数据，随 #932）
+    for (const zh of ['空值率', '常见取值（样本行数）', '写法速查：点击插入到光标处', '的标准字段：已对应的打勾，去重键必填', '表达式可用的函数（白名单）', '转为日期', '取第一个非空值', '起始[, 长度]', '已支付']) expect(strip).not.toContain(zh);
     // 提交的值不因界面语言改变：编辑框里的 YAML 与保存的一致
     expect(editorYaml(html)).toBe(ORDERS);
   });
