@@ -11,6 +11,7 @@ import { useState } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.templates.$id';
 import { can, deniedReason, requirePermission } from '~/.server/access';
+import { errorTextFor } from '~/.server/i18n';
 import { navFor } from '~/.server/nav';
 import { PublishError, publishReason } from '~/.server/publishing';
 import { TEMPLATES, type ParamField } from '~/.server/pipeline/templates';
@@ -193,8 +194,8 @@ export async function action({ request, params }: Route.ActionArgs) {
     }
   } catch (e) {
     // 模板与发布流程的业务错误（TemplateError 是 PublishError 的子类，ADR-0051）
-    if (e instanceof PublishError) return data({ error: e.message, upgradeDiff: null, downstream: null, sample: null }, { status: e.status });
-    if (e instanceof TaskError) return data({ error: e.message, upgradeDiff: null, downstream: null, sample: null }, { status: 400 });
+    if (e instanceof PublishError) return data({ error: await errorTextFor(request, e), upgradeDiff: null, downstream: null, sample: null }, { status: e.status });
+    if (e instanceof TaskError) return data({ error: await errorTextFor(request, e), upgradeDiff: null, downstream: null, sample: null }, { status: 400 });
     throw e;
   }
   throw redirect(page);
