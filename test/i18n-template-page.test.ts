@@ -103,6 +103,28 @@ describe('英文界面：模板参数页', () => {
     expect(html).toContain('value="My VIP"');
   });
 
+  it('通用参数表单（注册表里的 form）：流失预警与同期群的字段标签、下拉选项是英文，没有汉字', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const { acme } = await publishedIdentitySources({ orders: true });
+    await memberOf(acme, 'de@acme.com', 'data_engineer');
+    const de = await loginAs(app, 'de@acme.com');
+    de.store('crm_locale=en; Path=/');
+    const churn = stripScripts(await (await de.get('/analytics/templates/churn')).text());
+    expect(churn).toContain('lang="en"');
+    expect(churn).not.toMatch(/[一-鿿]/);
+    expect(churn).toContain('Lookback days');
+    expect(churn).toContain('Minimum orders');
+    expect(churn).toContain('Silence multiplier');
+    expect(churn).toContain('Minimum gap (days)');
+    expect(churn).toContain('Order statuses included');
+    const cohort = stripScripts(await (await de.get('/analytics/templates/cohort')).text());
+    expect(cohort).not.toMatch(/[一-鿿]/);
+    expect(cohort).toContain('Period');
+    expect(cohort).toContain('Number of periods');
+    expect(cohort).toContain('>Monthly<');
+    expect(cohort).toContain('>Weekly<');
+  });
+
   it('升级预览与「样例消费者」：界面文字是英文，默认人群名按词典显示英文、租户改过名的人群原样（v2 是湖里 v2: 前缀原值）；提交的格子仍是存储原值', async () => {
     vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
     const { acme } = await publishedIdentitySources({ orders: true });

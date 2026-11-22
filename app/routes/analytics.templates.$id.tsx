@@ -669,7 +669,7 @@ function GenericParamsForm({ fields, params, canDraft, submitting }: { fields: P
             const checked = Array.isArray(value) ? value : [];
             return (
               <fieldset key={f.key} className="max-w-2xl space-y-2">
-                <legend className="text-sm font-medium">{f.label}</legend>
+                <legend className="text-sm font-medium">{builtinName(t, f.label)}</legend>
                 <div className="flex flex-wrap gap-4">
                   {ORDER_STATUSES.map(s => (
                     <label key={s} className="flex items-center gap-1.5 text-sm">
@@ -683,12 +683,12 @@ function GenericParamsForm({ fields, params, canDraft, submitting }: { fields: P
           const id = `param-${f.key}`;
           return (
             <Field key={f.key} className="max-w-xs">
-              <FieldLabel htmlFor={id}>{f.label}</FieldLabel>
+              <FieldLabel htmlFor={id}>{builtinName(t, f.label)}</FieldLabel>
               {f.kind === 'int' ? (
                 <Input id={id} name={f.key} type="number" min={f.min} max={f.max} step={1} required defaultValue={value == null ? '' : String(value)} disabled={disabled} />
               ) : (
                 <NativeSelect id={id} name={f.key} defaultValue={value == null ? '' : String(value)} disabled={disabled}>
-                  {(f.options ?? []).map(o => <NativeSelectOption key={o.value} value={o.value}>{o.label}</NativeSelectOption>)}
+                  {(f.options ?? []).map(o => <NativeSelectOption key={o.value} value={o.value}>{builtinName(t, o.label)}</NativeSelectOption>)}
                 </NativeSelect>
               )}
             </Field>
