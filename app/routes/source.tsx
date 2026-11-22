@@ -12,7 +12,8 @@ import { data, Form, Link, redirect, useNavigation, useRevalidator } from 'react
 import { CheckCircle2, CircleAlert, CircleCheck, Lock, PencilLine, PlugZap, Plus, RefreshCw, ScrollText, Trash2 } from 'lucide-react';
 import type { Route } from './+types/source';
 import { can, requirePermission } from '~/.server/access';
-import { errorTextFor } from '~/.server/i18n';
+import { errorTextFor, formatServer } from '~/.server/i18n';
+import { getLocale } from '~/.server/locale';
 import { navFor } from '~/.server/nav';
 import { sourceDrift } from '~/.server/source-drift';
 import { getKeyChecks } from '~/.server/source-key-check';
@@ -27,6 +28,9 @@ import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import type { DataCheck, FailedCheck, FileCheck, StructureCheck, VerifyRecord } from '~/.server/pipeline/verify-engine';
 import type { SchemaDiff } from '~/.server/pipeline/schema-diff';
 import { formValues, LAKE_COVERAGE, SOURCE_KIND_LABELS, SYNC_MODES, targetOf, type LakeCoverage } from '~/lib/sources';
+import { builtinName, ENUM_LABELS } from '~/lib/builtin-names';
+import { formatDateTime, formatNumber } from '~/lib/format';
+import { msg, useLocale, useT, type Locale, type T } from '~/lib/i18n';
 import { AppShell } from '~/components/app-shell';
 import { KeyCheckFindings } from '~/components/key-check-findings';
 import { KindIcon } from '~/components/kind-icon';
@@ -49,10 +53,11 @@ export function meta({ loaderData }: Route.MetaArgs) {
   return [{ title: `${loaderData?.source.name ?? '数据源'} · CRM 数据分析平台` }];
 }
 
-const CONFIG_LABELS: Record<string, string> = {
-  host: '主机', port: '端口', database: '数据库名', schema: 'schema', user: '用户名', srv: 'SRV 记录', tls: 'TLS', authSource: '认证库',
-  path: '路径', format: '文件格式', endpoint: '对象存储地址', region: '区域', urlStyle: '寻址方式', useSsl: 'HTTPS',
-};
+/** 连接配置项的中文名（键与界面表单同名）：schema、TLS、HTTPS 本来就是拉丁字，不进词典 */
+const configLabel = (t: T, k: string) => (({
+  host: t('主机'), port: t('端口'), database: t('数据库名'), schema: 'schema', user: t('用户名'), srv: t('SRV 记录'), tls: 'TLS', authSource: t('认证库'),
+  path: t('路径'), format: t('文件格式'), endpoint: t('对象存储地址'), region: t('区域'), urlStyle: t('寻址方式'), useSsl: 'HTTPS',
+}) as Record<string, string>)[k] ?? k;
 
 const FORMAT_LABELS: Record<string, string> = {
   email: '邮箱', mobile: '手机号', integer: '整数', decimal: '小数', date: '日期', datetime: '日期时间', uuid: 'UUID', json: 'JSON', objectid: 'ObjectId',
@@ -158,9 +163,15 @@ export async function action({ request, params }: Route.ActionArgs) {
   try {
     switch (field('intent')) {
       case 'test': {
+        // 两条完整句式（有、没有不可读的表各一条），表数用 ICU 复数；表名连接符「、」也是服务端词条
+        const locale = await getLocale(request);
         const { tables, unreadable } = await testSource(member, params.sourceId);
-        const skipped = unreadable.length ? `；${unreadable.length} 张表没有读权限，不能选入同步范围：${unreadable.join('、')}` : '';
-        return { ok: `连接正常：${tables.length} 张表，账号只读${skipped}`, error: null, values: null };
+        const ok = unreadable.length
+          ? formatServer(locale, msg('连接正常：{count, plural, other {# 张表}}，账号只读；{unreadable, plural, other {# 张表}}没有读权限，不能选入同步范围：{names}', {
+              count: tables.length, unreadable: unreadable.length, names: unreadable.join(formatServer(locale, msg('、'))),
+            }))
+          : formatServer(locale, msg('连接正常：{count, plural, other {# 张表}}，账号只读', { count: tables.length }));
+        return { ok, error: null, values: null };
       }
       case 'update':
         await updateSource(member, params.sourceId, Object.fromEntries([...form].map(([k, v]) => [k, String(v)])));
@@ -198,7 +209,7 @@ export async function action({ request, params }: Route.ActionArgs) {
         await deleteSource(member, params.sourceId);
         throw redirect('/sources');
       default:
-        return data({ ok: null, error: '未知操作', values: null }, { status: 400 });
+        return data({ ok: null, error: formatServer(await getLocale(request), msg('未知操作')), values: null }, { status: 400 });
     }
   } catch (e) {
     if (e instanceof SourceError) {
@@ -213,6 +224,8 @@ export async function action({ request, params }: Route.ActionArgs) {
 const SYNC_VARIANTS = { watermark: 'default', needs_confirmation: 'secondary', full_compare: 'outline' } as const;
 const pct = (n: number) => `${Math.round(n * 1000) / 10}%`;
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
+/** 按界面语言格式化的日期时间（time 写死 zh-CN，#1037 的子组件还在用，这里不改它的签名）：空值同样返回 — */
+const when = (locale: Locale, iso: string | null) => (iso ? formatDateTime(locale, iso) : '—');
 
 type TableView = Route.ComponentProps['loaderData']['tables'][number];
 type ListedView = Route.ComponentProps['loaderData']['listing'][number];
@@ -327,12 +340,14 @@ function LakeCoverage({ listing }: { listing: ListedView[] }) {
  * 账号读不了、源端已不存在的表不能选入（已在范围内的可以移出）。服务端的范围变了（保存、重新列出表）时由调用方换 key 重置勾选
  */
 function SyncScope({ listing, newTables, canWrite, submitting }: { listing: ListedView[]; newTables: number; canWrite: boolean; submitting: boolean }) {
+  const t = useT();
+  const locale = useLocale();
   const [filter, setFilter] = useState('');
-  const [selected, setSelected] = useState(() => new Set(listing.filter(t => t.inScope).map(t => t.name)));
-  const visible = (t: ListedView) => t.name.toLowerCase().includes(filter.trim().toLowerCase());
-  const addable = (t: ListedView) => canWrite && t.readable && !t.gone;
-  const selectable = (t: ListedView) => addable(t) || (canWrite && t.inScope);
-  const schemas = [...new Set(listing.map(t => t.schema))];
+  const [selected, setSelected] = useState(() => new Set(listing.filter(row => row.inScope).map(row => row.name)));
+  const visible = (row: ListedView) => row.name.toLowerCase().includes(filter.trim().toLowerCase());
+  const addable = (row: ListedView) => canWrite && row.readable && !row.gone;
+  const selectable = (row: ListedView) => addable(row) || (canWrite && row.inScope);
+  const schemas = [...new Set(listing.map(row => row.schema))];
   const toggle = (names: string[], on: boolean) => setSelected(prev => {
     const next = new Set(prev);
     for (const n of names) on ? next.add(n) : next.delete(n);
@@ -342,16 +357,16 @@ function SyncScope({ listing, newTables, canWrite, submitting }: { listing: List
     <Form method="post" preventScrollReset className="space-y-3">
       <input type="hidden" name="intent" value="scope" />
       {newTables > 0 && (
-        <StatusText tone="pending" data-new-tables={newTables}>{`有 ${newTables} 张新表未选`}</StatusText>
+        <StatusText tone="pending" data-new-tables={newTables}>{t('有 {n, plural, other {# 张新表}}未选', { n: newTables })}</StatusText>
       )}
       {canWrite && (
         <div className="flex flex-wrap items-center gap-2">
-          <Input className="max-w-64" placeholder="按名称过滤" value={filter} onChange={e => setFilter(e.target.value)} aria-label="按名称过滤" />
-          <Button type="button" variant="outline" size="sm" onClick={() => toggle(listing.filter(t => visible(t) && addable(t)).map(t => t.name), true)}>
-            全选过滤结果
+          <Input className="max-w-64" placeholder={t('按名称过滤')} value={filter} onChange={e => setFilter(e.target.value)} aria-label={t('按名称过滤')} />
+          <Button type="button" variant="outline" size="sm" onClick={() => toggle(listing.filter(row => visible(row) && addable(row)).map(row => row.name), true)}>
+            {t('全选过滤结果')}
           </Button>
-          <Button type="button" variant="outline" size="sm" onClick={() => toggle(listing.filter(visible).map(t => t.name), false)}>
-            取消过滤结果
+          <Button type="button" variant="outline" size="sm" onClick={() => toggle(listing.filter(visible).map(row => row.name), false)}>
+            {t('取消过滤结果')}
           </Button>
         </div>
       )}
@@ -359,13 +374,13 @@ function SyncScope({ listing, newTables, canWrite, submitting }: { listing: List
         <TableHeader>
           <TableRow>
             <TableHead className="w-8" />
-            <TableHead>表</TableHead>
-            <TableHead>估算行数</TableHead>
-            <TableHead>状态</TableHead>
+            <TableHead>{t('表')}</TableHead>
+            <TableHead>{t('估算行数')}</TableHead>
+            <TableHead>{t('状态')}</TableHead>
           </TableRow>
         </TableHeader>
         {schemas.map(schema => {
-          const group = listing.filter(t => t.schema === schema);
+          const group = listing.filter(row => row.schema === schema);
           const shown = group.filter(visible);
           const choices = shown.filter(addable);
           return (
@@ -376,38 +391,40 @@ function SyncScope({ listing, newTables, canWrite, submitting }: { listing: List
                     {canWrite && (
                       <input
                         type="checkbox"
-                        aria-label={`全选 ${schema || '全部'}`}
+                        aria-label={t('全选 {schema}', { schema: schema || t('全部') })}
                         disabled={!choices.length}
-                        checked={choices.length > 0 && choices.every(t => selected.has(t.name))}
-                        onChange={e => toggle(choices.map(t => t.name), e.target.checked)}
+                        checked={choices.length > 0 && choices.every(row => selected.has(row.name))}
+                        onChange={e => toggle(choices.map(row => row.name), e.target.checked)}
                       />
                     )}
                   </TableCell>
-                  <TableCell colSpan={3} className="font-medium">{schema || '（无 schema）'}</TableCell>
+                  <TableCell colSpan={3} className="font-medium">{schema || t('（无 schema）')}</TableCell>
                 </TableRow>
               ) : null}
-              {group.map(t => (
-                <TableRow key={t.name} hidden={!visible(t)} data-listed={t.name} data-in-scope={String(t.inScope)}>
+              {group.map(row => (
+                <TableRow key={row.name} hidden={!visible(row)} data-listed={row.name} data-in-scope={String(row.inScope)}>
                   <TableCell>
-                    <input type="hidden" name="listed" value={t.name} />
+                    <input type="hidden" name="listed" value={row.name} />
                     <input
                       type="checkbox"
                       name="table"
-                      value={t.name}
-                      aria-label={t.name}
-                      disabled={!selectable(t)}
-                      checked={selected.has(t.name)}
-                      onChange={e => toggle([t.name], e.target.checked)}
+                      value={row.name}
+                      aria-label={row.name}
+                      disabled={!selectable(row)}
+                      checked={selected.has(row.name)}
+                      onChange={e => toggle([row.name], e.target.checked)}
                     />
                   </TableCell>
-                  <TableCell className="font-mono">{t.name}</TableCell>
-                  <TableCell>{t.estimatedRows === null ? '—' : `约 ${t.estimatedRows.toLocaleString('zh-CN')}`}</TableCell>
+                  <TableCell className="font-mono">{row.name}</TableCell>
+                  <TableCell>{row.estimatedRows === null ? '—' : t('约 {n}', { n: formatNumber(locale, row.estimatedRows) })}</TableCell>
                   <TableCell className="space-x-1 whitespace-normal">
-                    {t.gone && <StatusText tone="bad" data-gone>源端已不存在</StatusText>}
-                    {!t.readable && !t.gone && <Badge variant="outline">账号没有读权限</Badge>}
-                    {t.isNew && <Badge variant="secondary" data-new>新表</Badge>}
-                    {t.inScope && (
-                      <span className="text-xs text-muted-foreground">{`已选入${t.scopedBy ? `（${t.scopedBy}，${time(t.scopedAt)}）` : ''}`}</span>
+                    {row.gone && <StatusText tone="bad" data-gone>{t('源端已不存在')}</StatusText>}
+                    {!row.readable && !row.gone && <Badge variant="outline">{t('账号没有读权限')}</Badge>}
+                    {row.isNew && <Badge variant="secondary" data-new>{t('新表')}</Badge>}
+                    {row.inScope && (
+                      <span className="text-xs text-muted-foreground">
+                        {t('已选入{by}', { by: row.scopedBy ? t('（{who}，{at}）', { who: row.scopedBy, at: when(locale, row.scopedAt) }) : '' })}
+                      </span>
                     )}
                   </TableCell>
                 </TableRow>
@@ -416,7 +433,7 @@ function SyncScope({ listing, newTables, canWrite, submitting }: { listing: List
           );
         })}
       </Table>
-      {canWrite && <Button type="submit" disabled={submitting}>保存同步范围</Button>}
+      {canWrite && <Button type="submit" disabled={submitting}>{t('保存同步范围')}</Button>}
     </Form>
   );
 }
@@ -905,11 +922,13 @@ function SourceComments({ comments }: { comments: CommentView[] }) {
 
 export default function Source({ loaderData, actionData }: Route.ComponentProps) {
   const { tab, email, nav, canWrite, canDelete, deleteBlockers, source, profile, listing, newTables, tables, sync, verify, views, comments } = loaderData;
+  const t = useT();
+  const locale = useLocale();
   const submitting = useNavigation().state === 'submitting';
   const profiling = profile.status === 'queued' || profile.status === 'running';
   const syncing = sync.status === 'queued' || sync.status === 'running';
   const verifying = verify.status === 'queued' || verify.status === 'running';
-  const keyChecking = tables.some(t => t.keyCheck?.status === 'running');
+  const keyChecking = tables.some(table => table.keyCheck?.status === 'running');
   // 采集、同步、核对与业务主键检查在调度器里异步进行：进行中时定时刷新，结束后停下
   const revalidator = useRevalidator();
   useEffect(() => {
@@ -924,18 +943,18 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
     <AppShell email={email} nav={nav}>
       <PageHeader
         title={source.name}
-        description={<><Link to="/sources" className="hover:underline">← 数据源</Link>{` · 登记于 ${time(source.createdAt)}`}</>}
+        description={<><Link to="/sources" className="hover:underline">{t('← 数据源')}</Link>{` · ${t('登记于 {date}', { date: when(locale, source.createdAt) })}`}</>}
         actions={(canWrite || canDelete) && (
           <>
             {canWrite && (
               <>
                 <Form method="post" preventScrollReset>
                   <input type="hidden" name="intent" value="test" />
-                  <Button type="submit" variant="outline" disabled={submitting}><PlugZap />测试连接</Button>
+                  <Button type="submit" variant="outline" disabled={submitting}><PlugZap />{t('测试连接')}</Button>
                 </Form>
                 <Form method="post" preventScrollReset>
                   <input type="hidden" name="intent" value="refresh" />
-                  <Button type="submit" variant="outline" disabled={submitting}><RefreshCw />重新列出表并采集</Button>
+                  <Button type="submit" variant="outline" disabled={submitting}><RefreshCw />{t('重新列出表并采集')}</Button>
                 </Form>
               </>
             )}
@@ -947,41 +966,41 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
       {actionData?.error && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />
-          <AlertTitle>操作未完成</AlertTitle>
+          <AlertTitle>{t('操作未完成')}</AlertTitle>
           <AlertDescription>{actionData.error}</AlertDescription>
         </Alert>
       )}
       {actionData?.ok && (
         <Alert role="status">
           <CircleCheck />
-          <AlertTitle>测试连接</AlertTitle>
+          <AlertTitle>{t('测试连接')}</AlertTitle>
           <AlertDescription>{actionData.ok}</AlertDescription>
         </Alert>
       )}
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatTile
-          label="类型"
-          value={<span className="flex items-center gap-3 text-xl"><KindIcon kind={source.kind} />{SOURCE_KIND_LABELS[source.kind]}</span>}
+          label={t('类型')}
+          value={<span className="flex items-center gap-3 text-xl"><KindIcon kind={source.kind} />{builtinName(t, SOURCE_KIND_LABELS[source.kind], ENUM_LABELS)}</span>}
         />
         <StatTile
-          label="目标"
+          label={t('目标')}
           value={<span className="block truncate font-mono text-base">{targetOf(source.kind, source.config)}</span>}
         />
-        <StatTile label="同步表数" value={listing.filter(t => t.inScope).length} hint={`共列出 ${listing.length} 张表`} />
+        <StatTile label={t('同步表数')} value={listing.filter(row => row.inScope).length} hint={t('共列出 {n, plural, other {# 张表}}', { n: listing.length })} />
         <StatTile
-          label="核对状态"
+          label={t('核对状态')}
           value={<VerifyBadge differences={verify.verifiedAt ? verify.differences : null} className="gap-2 text-3xl font-semibold [&>svg]:size-6" />}
-          hint={verifying ? '核对进行中…' : `最近一次核对：${time(verify.verifiedAt)}`}
+          hint={verifying ? t('核对进行中…') : t('最近一次核对：{at}', { at: when(locale, verify.verifiedAt) })}
         />
       </div>
 
       <PillTabs
         current={tab}
         tabs={[
-          { key: 'overview', label: '概览', href: base },
-          { key: 'lake', label: '湖中数据', href: `${base}?tab=lake` },
-          { key: 'views', label: `源视图（${views.length}）`, href: `${base}?tab=views` },
+          { key: 'overview', label: t('概览'), href: base },
+          { key: 'lake', label: t('湖中数据'), href: `${base}?tab=lake` },
+          { key: 'views', label: t('源视图（{n}）', { n: views.length }), href: `${base}?tab=views` },
         ]}
       />
 
@@ -993,25 +1012,25 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
         ) : (
           <div className="space-y-10">
             <section className="space-y-3">
-              <SectionHeader title="连接" />
+              <SectionHeader title={t('连接')} />
               <dl className="grid grid-cols-[8rem_1fr] gap-x-4 gap-y-1 text-sm">
                 {Object.entries(source.config).map(([k, v]) => (
                   <div key={k} className="contents">
-                    <dt className="text-muted-foreground">{CONFIG_LABELS[k] ?? k}</dt>
+                    <dt className="text-muted-foreground">{configLabel(t, k)}</dt>
                     <dd className="font-mono">{v}</dd>
                   </div>
                 ))}
-                <dt className="text-muted-foreground">凭据</dt>
-                <dd>{`已加密保存，不可查看${source.credentialsRotatedAt ? `（${time(source.credentialsRotatedAt)} 轮换）` : ''}`}</dd>
+                <dt className="text-muted-foreground">{t('凭据')}</dt>
+                <dd>{t('已加密保存，不可查看{rotated}', { rotated: source.credentialsRotatedAt ? t('（{at} 轮换）', { at: when(locale, source.credentialsRotatedAt) }) : '' })}</dd>
               </dl>
             </section>
 
             <section className="space-y-3">
-              <SectionHeader title="同步范围">
-                只有选入同步范围的表才会采集列统计、同步进原始层。新出现的表默认不选；移出范围只停止同步，已进湖的数据保留，重新选回后接着同步。
+              <SectionHeader title={t('同步范围')}>
+                {t('只有选入同步范围的表才会采集列统计、同步进原始层。新出现的表默认不选；移出范围只停止同步，已进湖的数据保留，重新选回后接着同步。')}
               </SectionHeader>
               <SyncScope
-                key={listing.map(t => `${t.name}:${t.inScope}`).join('\n')}
+                key={listing.map(row => `${row.name}:${row.inScope}`).join('\n')}
                 listing={listing}
                 newTables={newTables}
                 canWrite={canWrite}
@@ -1021,52 +1040,52 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
 
             <section className="space-y-3">
               <SectionHeader
-                title="源表"
-                status={<StatusText tone={TASK_TONES[profile.status]} data-profile-status={profile.status}>{`采集${profile.statusLabel}`}</StatusText>}
+                title={t('源表')}
+                status={<StatusText tone={TASK_TONES[profile.status]} data-profile-status={profile.status}>{t('采集{status}', { status: builtinName(t, profile.statusLabel) })}</StatusText>}
               >
-                {`同步范围内的表：有更新时间或自增主键的按水位线增量同步（需确认字段），没有的全量比对：每小时一次，大表每天一次。最近采集：${time(profile.profiledAt)}`}
+                {t('同步范围内的表：有更新时间或自增主键的按水位线增量同步（需确认字段），没有的全量比对：每小时一次，大表每天一次。最近采集：{at}', { at: when(locale, profile.profiledAt) })}
               </SectionHeader>
               {listing.length > 0 && <LakeCoverage listing={listing} />}
               {profile.status === 'failed' && profile.error && (
-                <StatusText tone="bad">{`${time(profile.attemptedAt)} 提交的采集失败：${profile.error}`}</StatusText>
+                <StatusText tone="bad">{t('{at} 提交的采集失败：{error}', { at: when(locale, profile.attemptedAt), error: profile.error })}</StatusText>
               )}
               {profile.unreadable.length > 0 && (
                 <div className="text-sm text-muted-foreground" data-unreadable>
-                  {`账号没有读权限的 ${profile.unreadable.length} 张表不能选入同步范围：${profile.unreadable.join('、')}。需要时在源库授予 SELECT 后重新列出表`}
+                  {t('账号没有读权限的 {n, plural, other {# 张表}}不能选入同步范围：{names}。需要时在源库授予 SELECT 后重新列出表', { n: profile.unreadable.length, names: profile.unreadable.join(t('、')) })}
                 </div>
               )}
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>表</TableHead>
-                    <TableHead>行数</TableHead>
-                    <TableHead>同步方式</TableHead>
+                    <TableHead>{t('表')}</TableHead>
+                    <TableHead>{t('行数')}</TableHead>
+                    <TableHead>{t('同步方式')}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {tables.map(t => (
-                    <Fragment key={t.name}>
-                      <TableRow data-table={t.name} data-sync-mode={t.syncMode} className="border-b-0">
-                        <TableCell className="align-top font-mono font-medium">{t.name}</TableCell>
-                        <TableCell className="align-top">{t.rows.toLocaleString('zh-CN')}</TableCell>
+                  {tables.map(table => (
+                    <Fragment key={table.name}>
+                      <TableRow data-table={table.name} data-sync-mode={table.syncMode} className="border-b-0">
+                        <TableCell className="align-top font-mono font-medium">{table.name}</TableCell>
+                        <TableCell className="align-top">{formatNumber(locale, table.rows)}</TableCell>
                         <TableCell className="space-y-1 align-top whitespace-normal">
                           <div className="flex flex-wrap items-center gap-2">
-                            <Badge variant={SYNC_VARIANTS[t.syncMode]}>{SYNC_MODES[t.syncMode]}</Badge>
-                            <StatusText tone={t.notInLake ? 'bad' : 'ok'} data-in-lake={String(!t.notInLake)}>
-                              {t.notInLake ? `未进湖：${t.notInLake}` : '已进湖'}
+                            <Badge variant={SYNC_VARIANTS[table.syncMode]}>{builtinName(t, SYNC_MODES[table.syncMode], ENUM_LABELS)}</Badge>
+                            <StatusText tone={table.notInLake ? 'bad' : 'ok'} data-in-lake={String(!table.notInLake)}>
+                              {table.notInLake ? t('未进湖：{reason}', { reason: builtinName(t, table.notInLake, ENUM_LABELS) }) : t('已进湖')}
                             </StatusText>
                           </div>
-                          <div className="text-xs text-muted-foreground">{t.syncModeNote}</div>
-                          <TableMappingDrift drift={t.drift} />
-                          <Watermark table={t} canWrite={canWrite} submitting={submitting} />
-                          <Key table={t} canWrite={canWrite} submitting={submitting} />
-                          <SoftDelete table={t} canWrite={canWrite} submitting={submitting} />
+                          <div className="text-xs text-muted-foreground">{table.syncModeNote}</div>
+                          <TableMappingDrift drift={table.drift} />
+                          <Watermark table={table} canWrite={canWrite} submitting={submitting} />
+                          <Key table={table} canWrite={canWrite} submitting={submitting} />
+                          <SoftDelete table={table} canWrite={canWrite} submitting={submitting} />
                         </TableCell>
                       </TableRow>
                       {/* 列统计单独一行占满表格宽度 */}
                       <TableRow className="hover:bg-transparent">
                         <TableCell colSpan={3} className="pt-0">
-                          <ColumnStats table={t} />
+                          <ColumnStats table={table} />
                         </TableCell>
                       </TableRow>
                     </Fragment>
@@ -1074,7 +1093,7 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
                   {!tables.length && (
                     <TableRow>
                       <TableCell colSpan={3} className="text-center text-muted-foreground">
-                        {profiling ? '正在采集列统计…' : '同步范围内还没有采集过的表'}
+                        {profiling ? t('正在采集列统计…') : t('同步范围内还没有采集过的表')}
                       </TableCell>
                     </TableRow>
                   )}
@@ -1083,40 +1102,40 @@ export default function Source({ loaderData, actionData }: Route.ComponentProps)
             </section>
 
             <section className="space-y-3">
-              <SectionHeader title="源端注释" />
+              <SectionHeader title={t('源端注释')} />
               <SourceComments comments={comments} />
             </section>
 
             <section className="space-y-4">
-              <SectionHeader title="同步" status={<StatusText tone={TASK_TONES[sync.status]} data-sync-status={sync.status}>{sync.statusLabel}</StatusText>}>
-                {`已确认水位线的表每小时增量同步一次，首次同步为全表读取，每天再比对一次（有主键的比对主键全集，没有的整行比对），补上源端的删除与漏掉的行。没有水位线的表全量比对，大表每天一次（立即同步时大表一并同步）。变化都以变更批次追加到原始层。最近一次：${time(sync.attemptedAt)} 提交`}
+              <SectionHeader title={t('同步')} status={<StatusText tone={TASK_TONES[sync.status]} data-sync-status={sync.status}>{builtinName(t, sync.statusLabel)}</StatusText>}>
+                {t('已确认水位线的表每小时增量同步一次，首次同步为全表读取，每天再比对一次（有主键的比对主键全集，没有的整行比对），补上源端的删除与漏掉的行。没有水位线的表全量比对，大表每天一次（立即同步时大表一并同步）。变化都以变更批次追加到原始层。最近一次：{at} 提交', { at: when(locale, sync.attemptedAt) })}
               </SectionHeader>
-              {sync.status === 'failed' && sync.error && <StatusText tone="bad">{`同步失败：${sync.error}`}</StatusText>}
+              {sync.status === 'failed' && sync.error && <StatusText tone="bad">{t('同步失败：{error}', { error: sync.error })}</StatusText>}
               {canWrite && (
                 <Form method="post" preventScrollReset>
                   <input type="hidden" name="intent" value="sync" />
-                  <Button type="submit" variant="outline" disabled={submitting || syncing}>{syncing ? '同步中…' : '立即同步'}</Button>
+                  <Button type="submit" variant="outline" disabled={submitting || syncing}>{syncing ? t('同步中…') : t('立即同步')}</Button>
                 </Form>
               )}
               {synced.map(([table, entries]) => <SyncHistory key={table} table={table} entries={entries} />)}
-              {!synced.length && <div className="text-sm text-muted-foreground">还没有同步记录</div>}
+              {!synced.length && <div className="text-sm text-muted-foreground">{t('还没有同步记录')}</div>}
             </section>
 
             {canWrite && (
               <section className="max-w-2xl space-y-4">
-                <SectionHeader title="修改与轮换凭据">
-                  保存前重新校验连接与只读。凭据留空表示沿用已保存的；主机、库名、用户名或路径变了时须重新填写。
+                <SectionHeader title={t('修改与轮换凭据')}>
+                  {t('保存前重新校验连接与只读。凭据留空表示沿用已保存的；主机、库名、用户名或路径变了时须重新填写。')}
                 </SectionHeader>
                 <Form method="post" preventScrollReset>
                   <input type="hidden" name="intent" value="update" />
                   <FieldGroup>
                     <Field>
-                      <FieldLabel htmlFor="source-name">名称</FieldLabel>
+                      <FieldLabel htmlFor="source-name">{t('名称')}</FieldLabel>
                       <Input id="source-name" name="name" required defaultValue={values.name ?? ''} />
                     </Field>
                     <SourceFields kind={source.kind} values={values} editing />
                     <div>
-                      <Button type="submit" disabled={submitting}>{submitting ? '正在校验…' : '校验并保存'}</Button>
+                      <Button type="submit" disabled={submitting}>{submitting ? t('正在校验…') : t('校验并保存')}</Button>
                     </div>
                   </FieldGroup>
                 </Form>
