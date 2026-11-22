@@ -9,6 +9,7 @@ import { Check } from 'lucide-react';
 import { Link } from 'react-router';
 import { type CustomEntityField, entityOf, FIELD_TYPES, isCustomEntity } from '~/lib/canonical-model';
 import { formUnavailable } from '~/lib/mapping-form';
+import { functionText } from '~/lib/mapping-functions-text';
 import { mappingOutline } from '~/lib/mapping-outline';
 import { builtinName, CANONICAL_NAMES, ENUM_LABELS } from '~/lib/builtin-names';
 import { useLocale, useT, type T } from '~/lib/i18n';
@@ -37,12 +38,12 @@ export interface RegisteredEntityView { label: string; fields: CustomEntityField
 /** 白名单函数（由 loader 从 mapping-expr 的 FUNCTIONS 传来） */
 export interface ReferenceFunction { name: string; signature: string; label: string }
 
-/** 写法速查：每种写法一行能直接复制的例子。text 里的「已支付」是插入 YAML 的内容，不翻译 */
+/** 写法速查：每种写法一行能直接复制的例子 */
 const SNIPPETS = [
   { kind: 'field', text: 'customer_id: buyer_id' },
   { kind: 'expr', text: 'amount: coalesce(pay_amount, pay_fen / 100)' },
-  { kind: 'dictionary', text: "status: { expr: order_status, dictionary: { 已支付: paid, '2': refunded } }" },
-  { kind: 'otherwise', text: 'status: { expr: order_status, dictionary: { 已支付: paid }, otherwise: cancelled }' },
+  { kind: 'dictionary', text: "status: { expr: order_status, dictionary: { PAID: paid, '2': refunded } }" },
+  { kind: 'otherwise', text: 'status: { expr: order_status, dictionary: { PAID: paid }, otherwise: cancelled }' },
   { kind: 'extension', text: 'x_coupon_code: { type: string, expr: coupon_code }' },
   { kind: 'dedupe', text: 'dedupe: { key: [order_id], latest: updated_at }' },
 ] as const;
@@ -306,12 +307,15 @@ function MappingReference({ table, entity, registered, functions, yaml, onInsert
         <div className="font-medium">{t('表达式可用的函数（白名单）')}</div>
         <Table>
           <TableBody>
-            {functions.map(f => (
-              <TableRow key={f.name} data-reference-function={f.name}>
-                <TableCell>{nameButton(t, f.signature, onInsert, `${f.name}(`)}</TableCell>
-                <TableCell className="whitespace-normal">{f.label}</TableCell>
-              </TableRow>
-            ))}
+            {functions.map(f => {
+              const text = functionText(t, f);
+              return (
+                <TableRow key={f.name} data-reference-function={f.name}>
+                  <TableCell>{nameButton(t, text.signature, onInsert, `${f.name}(`)}</TableCell>
+                  <TableCell className="whitespace-normal">{text.label}</TableCell>
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       </div>

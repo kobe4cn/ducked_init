@@ -36,11 +36,13 @@ function checkUsages(source: string, file: string, client: Catalog, server: Cata
     if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) continue;
     for (const m of line.matchAll(/\b(?:t|msg)\(/g)) {
       const fn = m[0].slice(0, -1) as 't' | 'msg';
-      const literal = line.slice(m.index! + m[0].length).match(/^\s*'([^']*)'/);
+      // 字面量可以是单引号或双引号：含单引号的键（date(x[, '格式'])、in ('a', 'b')）只能用双引号写
+      const literal = line.slice(m.index! + m[0].length).match(/^\s*(?:'([^']*)'|"([^"]*)")/);
       if (literal) {
+        const key = literal[1] ?? literal[2]!;
         const catalog = fn === 't' ? client : server;
-        if (!(literal[1]! in catalog)) {
-          problems.push(`${file}:${i + 1} ${fn}('${literal[1]}') 不在 en.${fn === 't' ? 'client' : 'server'}.json`);
+        if (!(key in catalog)) {
+          problems.push(`${file}:${i + 1} ${fn}('${key}') 不在 en.${fn === 't' ? 'client' : 'server'}.json`);
         }
       } else if (usesI18n && !DYNAMIC_KEYS_ALLOWED.has(file)) {
         problems.push(`${file}:${i + 1} ${fn}(…) 的参数不是字符串字面量`);
@@ -101,6 +103,12 @@ describe('守卫：翻译键与英文词典对账（ADR-0060）', () => {
     expect(violations.join('\n')).toBe('');
   });
 
+  it("app/lib、app/components 里 msg('…') 的键也在 en.client.json：前后端共用的 lib（如 ExprError，#1042）两边词典都要有", () => {
+    const violations = [...listSourceFiles(join(root, 'app/lib')), ...listSourceFiles(join(root, 'app/components'))]
+      .flatMap((path) => checkUsages(readFileSync(path, 'utf8'), relative(root, path), enClient, enClient));
+    expect(violations.join('\n')).toBe('');
+  });
+
   it('所有平台内置名称都在 en.client.json', () => {
     const builtin = [
       ...CANONICAL_NAMES,
@@ -125,10 +133,12 @@ describe('守卫：翻译键与英文词典对账（ADR-0060）', () => {
       'msg(dynamicKey)',
       "// t('注释里的不算')",
       "translate('也不是它')",
+      't("双引号也不在词典里")',
     ].join('\n');
     expect(checkUsages(source, 'demo.tsx', { 在词典里的句子: 'ok' }, {})).toEqual([
       "demo.tsx:2 t('不在词典里的句子') 不在 en.client.json",
       'demo.tsx:3 msg(…) 的参数不是字符串字面量',
+      "demo.tsx:6 t('双引号也不在词典里') 不在 en.client.json",
     ]);
   });
 
