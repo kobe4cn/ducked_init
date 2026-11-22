@@ -372,7 +372,7 @@ export default function ApiKeys({ loaderData, actionData }: Route.ComponentProps
   const submitting = useNavigation().state === 'submitting';
   return (
     <AppShell email={email} nav={nav}>
-      <PageHeader title="API Key" description={t("外部系统用 Authorization: Bearer '<Key 调用 /api/v1/ 下的接口。吊销后用这把 Key 的请求立即被拒绝。")} />
+      <PageHeader title="API Key" description={t("外部系统用 Authorization: Bearer '<Key> 调用 /api/v1/ 下的接口。吊销后用这把 Key 的请求立即被拒绝。")} />
 
       <PillTabs
         current={tab}

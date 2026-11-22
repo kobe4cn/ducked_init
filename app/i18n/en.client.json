@@ -563,7 +563,7 @@
   "外部 pgvector": "External pgvector",
   "外部 pgvector 连通正常。": "The external pgvector is reachable.",
   "外部 pgvector（租户自己的 PostgreSQL）": "External pgvector (the tenant's own PostgreSQL)",
-  "外部系统用 Authorization: Bearer '<Key 调用 /api/v1/ 下的接口。吊销后用这把 Key 的请求立即被拒绝。": "External systems call the APIs under /api/v1/ with Authorization: Bearer '<Key>. Once revoked, requests with this key are rejected immediately.",
+  "外部系统用 Authorization: Bearer '<Key> 调用 /api/v1/ 下的接口。吊销后用这把 Key 的请求立即被拒绝。": "External systems call the APIs under /api/v1/ with Authorization: Bearer '<Key>. Once revoked, requests with this key are rejected immediately.",
   "多个映射写同一实体、主键取值可能撞上时，给本映射起一个键空间（如 pos），标准层的主键写成「键空间:原值」；同一数据源里指向本实体的字段要写同一个键空间。不写时主键照原值": "When several mappings write the same entity and primary key values could collide, give this mapping a key space (for example pos); the Silver-layer primary key is written as key space:original value, and fields in the same data source that point to this entity must use the same key space. Without one the primary key keeps the original value",
   "多余的内容：{rest}": "Unexpected trailing content: {rest}",
   "多半是重复接入，可以建合并组": "Mostly duplicate ingestion; consider creating a merge group",
