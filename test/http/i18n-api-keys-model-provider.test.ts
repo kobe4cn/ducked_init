@@ -133,6 +133,9 @@ describe('中文界面输出与改造前一致', () => {
     expect(list).toContain('每个外部系统各用一把，便于单独吊销。');
     expect(list).toContain('从未使用');
     expect(list).toMatch(/20\d{2}\/\d{1,2}\/\d{1,2} \d{1,2}:\d{2}:\d{2}/);
+    expect(list).toContain('外部系统用 Authorization: Bearer &lt;Key&gt; 调用 /api/v1/ 下的接口。');
+    const docs = await (await admin.get('/api-keys?tab=docs')).text();
+    expect(docs).toContain('（&lt;平台地址&gt;、&lt;你的 API Key&gt;）');
   });
 
   it('模型服务页：当前配置、档位卡与上次检查的 24 小时制时间、非法档位报错仍是中文', async () => {
