@@ -35,7 +35,7 @@ import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel, entityOf, isCustomEntity } from '~/lib/canonical-model';
 import { builtinName, CANONICAL_NAMES } from '~/lib/builtin-names';
 import { formatDateTime, formatNumber } from '~/lib/format';
-import { makeT, msg, useLocale, useT, type T } from '~/lib/i18n';
+import { makeT, msg, useLocale, useT, type Locale, type T } from '~/lib/i18n';
 import { AppShell } from '~/components/app-shell';
 import { DraftConfidence } from '~/components/draft-confidence';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
@@ -238,23 +238,26 @@ export async function action({ request, params }: Route.ActionArgs) {
   throw redirect(`/mappings/${params.mappingId}${tab === 'edit' ? '' : `?tab=${tab}`}`);
 }
 
-const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
+const time = (locale: Locale, iso: string | null) => (iso ? formatDateTime(locale, iso) : '—');
 const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
 
 type LoaderData = Route.ComponentProps['loaderData'];
 type MergeEntry = LoaderData['merge']['history'][number];
 
-/** 字段在实体上的名称，扩展字段没有名称时用字段名 */
-const fieldLabel = (entity: string, field: string) => entityOf(entity)?.fields.find(x => x.name === field)?.label ?? field;
+/** 字段在实体上的名称（标准字段名经 builtinName 显示英文），扩展字段没有名称时用字段名 */
+const fieldLabel = (t: T, entity: string, field: string) => builtinName(t, entityOf(entity)?.fields.find(x => x.name === field)?.label ?? field, CANONICAL_NAMES);
 
-/** 一列落入兜底的情况，字段用实体上的名称（见 fallbackText） */
-const columnFallbackText = (entity: string, f: FallbackStat, what?: string) => fallbackText(fieldLabel(entity, f.column), f, what);
+/** 一列落入兜底的情况，字段用实体上的名称（见 fallbackText；句子本身归 #1057） */
+const columnFallbackText = (t: T, entity: string, f: FallbackStat, what?: string) => fallbackText(fieldLabel(t, entity, f.column), f, what);
 
 /** 合并组的重叠与不一致（ADR-0032）：「合并组：重叠 N 行，不一致 字段 n 行（如 样本主键）…」 */
-const groupStatText = (entity: string, { overlap, conflicts }: GroupStat) => {
-  const conflict = (c: GroupStat['conflicts'][number]) =>
-    `${fieldLabel(entity, c.field)} ${c.count.toLocaleString('zh-CN')} 行${c.samples.length ? `（如 ${c.samples.join('、')}）` : ''}`;
-  return `合并组：重叠 ${overlap.toLocaleString('zh-CN')} 行${conflicts.length ? `，不一致 ${conflicts.map(conflict).join('，')}` : ''}`;
+const groupStatText = (t: T, locale: Locale, entity: string, { overlap, conflicts }: GroupStat) => {
+  const conflict = (c: GroupStat['conflicts'][number]) => (c.samples.length
+    ? t('{field} {count} 行（如 {samples}）', { field: fieldLabel(t, entity, c.field), count: formatNumber(locale, c.count), samples: c.samples.join(t('、')) })
+    : t('{field} {count} 行', { field: fieldLabel(t, entity, c.field), count: formatNumber(locale, c.count) }));
+  return conflicts.length
+    ? t('合并组：重叠 {overlap} 行，不一致 {conflicts}', { overlap: formatNumber(locale, overlap), conflicts: conflicts.map(conflict).join(t('，')) })
+    : t('合并组：重叠 {overlap} 行', { overlap: formatNumber(locale, overlap) });
 };
 
 /** 把落入兜底的取值加进值对照：打开编辑标签页的表单，定位到该字段（只用于标准枚举字段） */
@@ -262,35 +265,37 @@ const addToDictionaryHref = (base: string, f: FallbackStat) =>
   `${base}?${new URLSearchParams([['tab', 'edit'], ['field', f.column], ...f.values.map(v => ['add', v.value])])}`;
 
 function MergeRow({ e, base, canWrite }: { e: MergeEntry; base: string; canWrite: boolean }) {
+  const t = useT();
+  const locale = useLocale();
   if ('error' in e || 'skipped' in e) {
     return (
       <TableRow data-merge-error={'error' in e ? true : undefined}>
         <TableCell>{`v${e.version}`}</TableCell>
         <TableCell colSpan={3} className={`whitespace-normal ${'error' in e ? 'text-destructive' : 'text-muted-foreground'}`}>
-          {'error' in e ? `失败：${e.error}` : `跳过：${e.skipped}`}
+          {'error' in e ? t('失败：{error}', { error: e.error }) : t('跳过：{reason}', { reason: e.skipped })}
         </TableCell>
-        <TableCell>{time(e.startedAt)}</TableCell>
+        <TableCell>{time(locale, e.startedAt)}</TableCell>
       </TableRow>
     );
   }
   return (
     <TableRow data-merge-mode={e.mode}>
       <TableCell>{`v${e.version}`}</TableCell>
-      <TableCell>{e.mode === 'rebuild' ? `重建（批次 1–${e.batchTo}）` : e.batchTo === e.batchFrom ? '增量（无新批次）' : `增量（批次 ${e.batchFrom + 1}–${e.batchTo}）`}</TableCell>
+      <TableCell>{e.mode === 'rebuild' ? t('重建（批次 1–{to}）', { to: e.batchTo }) : e.batchTo === e.batchFrom ? t('增量（无新批次）') : t('增量（批次 {from}–{to}）', { from: e.batchFrom + 1, to: e.batchTo })}</TableCell>
       <TableCell className="whitespace-normal">
-        {`${e.rows.toLocaleString('zh-CN')} 行（新增 ${e.inserted}，更新 ${e.updated}，删除 ${e.deleted}）`}
-        {e.filtered !== undefined && <span data-merge-filtered={e.filtered}>{`，过滤 ${e.filtered.toLocaleString('zh-CN')} 行`}</span>}
+        {t('{rows} 行（新增 {inserted}，更新 {updated}，删除 {deleted}）', { rows: formatNumber(locale, e.rows), inserted: e.inserted, updated: e.updated, deleted: e.deleted })}
+        {e.filtered !== undefined && <span data-merge-filtered={e.filtered}>{t('，过滤 {n} 行', { n: formatNumber(locale, e.filtered) })}</span>}
         {e.fallback?.map(f => (
           <div key={f.column} className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground" data-merge-fallback={f.column}>
-            {columnFallbackText(e.entity, f)}
+            {columnFallbackText(t, e.entity, f)}
             {canWrite && isEnumField(entityOf(e.entity)?.fields.find(x => x.name === f.column)) && (
-              <Button asChild size="xs" variant="outline"><Link to={addToDictionaryHref(base, f)} data-add-to-dictionary={f.column}>加进值对照</Link></Button>
+              <Button asChild size="xs" variant="outline"><Link to={addToDictionaryHref(base, f)} data-add-to-dictionary={f.column}>{t('加进值对照')}</Link></Button>
             )}
           </div>
         ))}
         {e.group && (
           <div className="text-sm text-muted-foreground" data-merge-overlap={e.group.overlap}>
-            {groupStatText(e.entity, e.group)}
+            {groupStatText(t, locale, e.entity, e.group)}
           </div>
         )}
         {/* 合并成功时不通过的只会是 warn：error 级不通过时这个映射合并失败（merge-engine failOnCustomErrors） */}
@@ -299,13 +304,13 @@ function MergeRow({ e, base, canWrite }: { e: MergeEntry; base: string; canWrite
           return (
             <div key={r.name} className="flex items-center gap-1 text-sm text-amber-600" data-merge-assertion={r.name}>
               <AlertTriangle className="size-4 shrink-0" />
-              {`自定义：${fieldLabel(e.entity, field)} ${CUSTOM_CHECK_LABELS[check as CustomCheck] ?? check}（警告级）：${r.failed.toLocaleString('zh-CN')} 行不合格`}
+              {t('自定义：{field} {check}（警告级）：{n} 行不合格', { field: fieldLabel(t, e.entity, field), check: customCheckLabel(t, check), n: formatNumber(locale, r.failed) })}
             </div>
           );
         })}
       </TableCell>
       <TableCell>{duration(e.durationMs)}</TableCell>
-      <TableCell>{time(e.startedAt)}</TableCell>
+      <TableCell>{time(locale, e.startedAt)}</TableCell>
     </TableRow>
   );
 }
@@ -321,39 +326,42 @@ function Assertion({ name, ok, severe, children }: { name: string; ok: boolean; 
   );
 }
 
-const CUSTOM_CHECK_LABELS: Record<CustomCheck, string> = { not_null: '非空', unique: '唯一', range: '取值范围', in: '取值在列表内' };
+/** 自定义断言检查的名称：中文与 pipeline/custom-assertions 的标签一致，这里写成字面量 t('…') 才能与词典对账 */
+const customCheckLabel = (t: T, check: string) => ({ not_null: t('非空'), unique: t('唯一'), range: t('取值范围'), in: t('取值在列表内') } as Record<CustomCheck, string>)[check as CustomCheck] ?? check;
 
 /** 自定义断言的结果：名称是 custom:<字段>:<检查>，只显示级别与不合格行数，不显示取值 */
 function CustomAssertionItem({ result, label }: { result: AssertionResult; label: (name: string) => string }) {
+  const t = useT();
   const [, field, check] = result.name.split(':');
-  const title = `自定义：${label(field)} ${CUSTOM_CHECK_LABELS[check as CustomCheck] ?? check}（${result.level === 'error' ? '错误级' : '警告级'}）`;
+  const title = t('自定义：{field} {check}（{level}）', { field: label(field), check: customCheckLabel(t, check), level: result.level === 'error' ? t('错误级') : t('警告级') });
   return (
     <Assertion name={result.name} ok={!result.failed} severe={result.level === 'error'}>
-      {result.failed ? `${title}：样本里有 ${result.failed} 行不合格` : `${title}：样本里都合格`}
+      {result.failed ? t('{title}：样本里有 {n} 行不合格', { title, n: result.failed }) : t('{title}：样本里都合格', { title })}
     </Assertion>
   );
 }
 
 /** 空跑结果：基础断言、自定义断言与转换后的样例行（敏感字段是加盐哈希，空值显示为 —） */
 function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult & { version: number } }) {
+  const t = useT();
   const { assertions: a, columns, rows, sampled } = result;
-  const label = (name: string) => entityOf(entity)?.fields.find(f => f.name === name)?.label ?? name;
-  const keys = a.key.map(label).join('、');
+  const label = (name: string) => builtinName(t, entityOf(entity)?.fields.find(f => f.name === name)?.label ?? name, CANONICAL_NAMES);
+  const keys = a.key.map(label).join(t('、'));
   return (
     <section className="mt-6 space-y-4 border-t pt-6" data-dryrun={result.version}>
       <div>
-        <h2 className="font-semibold">{`空跑 v${result.version}`}</h2>
-        <p className="max-w-2xl text-sm text-slate-500">{`取原始层里最新的 ${sampled} 条记录（最多 ${result.limit} 条）转换，没有写进标准层。`}</p>
+        <h2 className="font-semibold">{t('空跑 v{version}', { version: result.version })}</h2>
+        <p className="max-w-2xl text-sm text-slate-500">{t('取原始层里最新的 {sampled} 条记录（最多 {limit} 条）转换，没有写进标准层。', { sampled, limit: result.limit })}</p>
       </div>
       <ul className="space-y-1.5">
-        <Assertion name="key-nulls" ok={!a.keyNulls} severe>{a.keyNulls ? `去重键（${keys}）有 ${a.keyNulls} 行为空，合并会失败` : `去重键（${keys}）都不为空`}</Assertion>
-        <Assertion name="key-unique" ok={!a.keyDuplicates}>{a.keyDuplicates ? `${a.keyDuplicates} 个去重键出现在不止一行，合并时只取最新的一行` : '去重键在样本里都唯一'}</Assertion>
+        <Assertion name="key-nulls" ok={!a.keyNulls} severe>{a.keyNulls ? t('去重键（{keys}）有 {n} 行为空，合并会失败', { keys, n: a.keyNulls }) : t('去重键（{keys}）都不为空', { keys })}</Assertion>
+        <Assertion name="key-unique" ok={!a.keyDuplicates}>{a.keyDuplicates ? t('{n} 个去重键出现在不止一行，合并时只取最新的一行', { n: a.keyDuplicates }) : t('去重键在样本里都唯一')}</Assertion>
         {Object.entries(a.requiredNulls).filter(([name]) => !a.key.includes(name)).map(([name, nulls]) => (
-          <Assertion key={name} name={`required-${name}`} ok={!nulls}>{nulls ? `必填字段${label(name)}有 ${nulls} 行为空` : `必填字段${label(name)}都不为空`}</Assertion>
+          <Assertion key={name} name={`required-${name}`} ok={!nulls}>{nulls ? t('必填字段{field}有 {n} 行为空', { field: label(name), n: nulls }) : t('必填字段{field}都不为空', { field: label(name) })}</Assertion>
         ))}
         {a.unknownValues.map(u => (
           <Assertion key={u.column} name={`unknown-${u.column}`} ok={false} severe={!u.fallback}>
-            {u.fallback ? columnFallbackText(entity, u) : `${columnFallbackText(entity, u, '不在值字典里')}，没写兜底值，合并会失败`}
+            {u.fallback ? columnFallbackText(t, entity, u) : t('{text}，没写兜底值，合并会失败', { text: columnFallbackText(t, entity, u, '不在值字典里') })}
           </Assertion>
         ))}
         {a.custom.map(r => <CustomAssertionItem key={r.name} result={r} label={label} />)}
@@ -365,7 +373,7 @@ function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult 
               {columns.map(c => (
                 <TableHead key={c.name} data-dryrun-column={c.name}>
                   <span className="block font-mono">{c.name}</span>
-                  <span className="block text-xs font-normal text-slate-400">{`${c.sensitive ? '哈希 · ' : ''}空 ${c.nulls}/${sampled}`}</span>
+                  <span className="block text-xs font-normal text-slate-400">{c.sensitive ? t('哈希 · 空 {nulls}/{sampled}', { nulls: c.nulls, sampled }) : t('空 {nulls}/{sampled}', { nulls: c.nulls, sampled })}</span>
                 </TableHead>
               ))}
             </TableRow>
@@ -382,7 +390,7 @@ function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult 
             ))}
             {!rows.length && (
               <TableRow>
-                <TableCell colSpan={columns.length} className="text-center text-slate-500">源表在原始层里没有记录</TableCell>
+                <TableCell colSpan={columns.length} className="text-center text-slate-500">{t('源表在原始层里没有记录')}</TableCell>
               </TableRow>
             )}
           </TableBody>
@@ -394,21 +402,23 @@ function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult 
 
 /** 把新列加为扩展字段：填进编辑框，不保存 */
 function AddColumns({ columns, submitting, children, ...attrs }: { columns: string[]; submitting: boolean; children: React.ReactNode; [data: `data-${string}`]: string }) {
+  const t = useT();
   return (
     <Form method="post" className="inline">
       <input type="hidden" name="intent" value="add-columns" />
       {columns.map(c => <input key={c} type="hidden" name="column" value={c} />)}
-      <Button type="submit" size="xs" variant="outline" disabled={submitting} title="名字 x_<列名>，类型按列推断，像敏感信息的标成敏感；填进编辑框，不会保存" {...attrs}>{children}</Button>
+      <Button type="submit" size="xs" variant="outline" disabled={submitting} title={t("名字 x_'<列名>'，类型按列推断，像敏感信息的标成敏感；填进编辑框，不会保存")} {...attrs}>{children}</Button>
     </Form>
   );
 }
 
 function IgnoreColumn({ column, submitting }: { column: string; submitting: boolean }) {
+  const t = useT();
   return (
-    <Form method="post" className="inline" onSubmit={e => { if (!confirm(`忽略新列 ${column}？之后不再提醒，不能取消。`)) e.preventDefault(); }}>
+    <Form method="post" className="inline" onSubmit={e => { if (!confirm(t('忽略新列 {column}？之后不再提醒，不能取消。', { column }))) e.preventDefault(); }}>
       <input type="hidden" name="intent" value="ignore-column" />
       <input type="hidden" name="column" value={column} />
-      <Button type="submit" size="xs" variant="destructive" disabled={submitting} title="有意不映射这一列，不再提醒；不能取消" data-ignore-column={column}>忽略</Button>
+      <Button type="submit" size="xs" variant="destructive" disabled={submitting} title={t('有意不映射这一列，不再提醒；不能取消')} data-ignore-column={column}>{t('忽略')}</Button>
     </Form>
   );
 }
@@ -418,19 +428,20 @@ function IgnoreColumn({ column, submitting }: { column: string; submitting: bool
  * canAdd 时新列可加为扩展字段（全部或逐列），或逐列标记为忽略
  */
 function SourceDrift({ drift, canAdd, submitting }: { drift: NonNullable<LoaderData['drift']>; canAdd: boolean; submitting: boolean }) {
+  const t = useT();
   const names = drift.newColumns.map(c => c.name);
   return (
     <section className="mb-4 space-y-3 rounded-xl border bg-slate-50 p-4" data-source-drift>
       {drift.newColumns.length > 0 && (
         <div>
           <StatusText tone="pending" className="font-semibold" data-drift-new={names.join(',')}>
-            {`源表新增 ${drift.newColumns.length} 列，映射还没用到`}
+            {t('源表新增 {n, plural, other {# 列}}，映射还没用到', { n: drift.newColumns.length })}
           </StatusText>
-          <p className="mt-1 text-sm text-slate-500">发布后源表新采集到的列。在草稿里用上这一列并保存，或标记为忽略后，提醒消失。</p>
+          <p className="mt-1 text-sm text-slate-500">{t('发布后源表新采集到的列。在草稿里用上这一列并保存，或标记为忽略后，提醒消失。')}</p>
           {canAdd && (
             <div className="mt-2">
               <AddColumns columns={names} submitting={submitting} data-add-columns={names.join(',')}>
-                全部加为扩展字段
+                {t('全部加为扩展字段')}
               </AddColumns>
             </div>
           )}
@@ -438,10 +449,10 @@ function SourceDrift({ drift, canAdd, submitting }: { drift: NonNullable<LoaderD
             {drift.newColumns.map(c => (
               <li key={c.name} data-drift-column={c.name}>
                 <span className="font-mono">{c.name}</span> <span className="font-mono text-slate-400">{c.type}</span>
-                {c.top?.length ? <span className="text-slate-500">{` · 常见取值：${c.top.map(t => t.value).join('、')}`}</span> : null}
+                {c.top?.length ? <span className="text-slate-500">{t(' · 常见取值：{values}', { values: c.top.map(v => v.value).join(t('、')) })}</span> : null}
                 {canAdd && (
                   <span className="ml-2">
-                    <AddColumns columns={[c.name]} submitting={submitting} data-add-column={c.name}>加为扩展字段</AddColumns>
+                    <AddColumns columns={[c.name]} submitting={submitting} data-add-column={c.name}>{t('加为扩展字段')}</AddColumns>
                     <IgnoreColumn column={c.name} submitting={submitting} />
                   </span>
                 )}
@@ -453,50 +464,53 @@ function SourceDrift({ drift, canAdd, submitting }: { drift: NonNullable<LoaderD
       {drift.missing.length > 0 && (
         <div>
           <StatusText tone="bad" className="font-semibold" data-drift-missing={drift.missing.join(',')}>
-            {`源端已删除 ${drift.missing.length} 列：${drift.missing.join('、')}`}
+            {t('源端已删除 {n, plural, other {# 列}}：{columns}', { n: drift.missing.length, columns: drift.missing.join(t('、')) })}
           </StatusText>
-          <p className="mt-1 text-sm text-slate-500">已发布版本引用了这些列，合并时这一列为空值；若是去重键，合并会失败。</p>
+          <p className="mt-1 text-sm text-slate-500">{t('已发布版本引用了这些列，合并时这一列为空值；若是去重键，合并会失败。')}</p>
         </div>
       )}
     </section>
   );
 }
 
-const COLUMN_FIELD_LABELS: Record<ColumnField, string> = { type: '类型', expr: '表达式', dictionary: '值字典', otherwise: '兜底', sensitive: '敏感标记', keySpace: '键空间', customerSource: '跨源引用的数据源' };
+/** 差异里列配置各项的名称：写成字面量 t('…') 才能与词典对账 */
+const columnFieldLabel = (t: T, f: ColumnField) =>
+  ({ type: t('类型'), expr: t('表达式'), dictionary: t('值字典'), otherwise: t('兜底'), sensitive: t('敏感标记'), keySpace: t('键空间'), customerSource: t('跨源引用的数据源') } as Record<ColumnField, string>)[f];
 
 /** 草稿与最新已发布版本的差异：首个版本、没有差异，或逐项列出列与去重 / 身份打通 / 键空间配置的变化 */
 function DraftDiff({ entity, version, diff }: { entity: string; version: number; diff: PlanDiff & { against: number | null } }) {
+  const t = useT();
   const label = (name: string) => {
     const l = entityOf(entity)?.fields.find(f => f.name === name)?.label;
-    return <>{l && `${l} `}<span className="font-mono">{name}</span></>;
+    return <>{l && `${builtinName(t, l, CANONICAL_NAMES)} `}<span className="font-mono">{name}</span></>;
   };
-  const fieldList = (list: string[] | null, none = '—') => (list?.length ? list.map((n, i) => <span key={n}>{i > 0 && '、'}{label(n)}</span>) : none);
-  const latestText = (name: string | null) => (name ? label(name) : '最近同步到的一行');
+  const fieldList = (list: string[] | null, none = '—') => (list?.length ? list.map((n, i) => <span key={n}>{i > 0 && t('、')}{label(n)}</span>) : none);
+  const latestText = (name: string | null) => (name ? label(name) : t('最近同步到的一行'));
   const codeText = (text: string | null) => <span className="font-mono">{text ?? '—'}</span>;
   return (
     <section className="mb-4 rounded-xl border bg-slate-50 p-4" data-draft-diff={version}>
       <h2 className="flex items-center gap-2 text-sm font-semibold">
         <FileDiff className="size-4 text-amber-600" />
-        {diff.first ? `v${version} 是首个版本` : `v${version} 与已发布 v${diff.against} 的差异`}
+        {diff.first ? t('v{version} 是首个版本', { version }) : t('v{version} 与已发布 v{against} 的差异', { version, against: diff.against })}
       </h2>
       {diff.first ? (
-        <p className="mt-1 text-sm text-slate-500">还没有已发布的版本，发布后这一版的全部列与去重规则生效。</p>
+        <p className="mt-1 text-sm text-slate-500">{t('还没有已发布的版本，发布后这一版的全部列与去重规则生效。')}</p>
       ) : diff.empty ? (
-        <p className="mt-1 text-sm text-slate-500" data-diff-item="none">合并计划与已发布版本相同（只改了注释或写法）。</p>
+        <p className="mt-1 text-sm text-slate-500" data-diff-item="none">{t('合并计划与已发布版本相同（只改了注释或写法）。')}</p>
       ) : (
         <ul className="mt-2 space-y-1 text-sm">
-          {diff.added.map(n => <li key={`added-${n}`} data-diff-item={`added-${n}`}>新增列 {label(n)}</li>)}
-          {diff.removed.map(n => <li key={`removed-${n}`} data-diff-item={`removed-${n}`}>删除列 {label(n)}</li>)}
-          {diff.changed.map(c => <li key={`changed-${c.name}`} data-diff-item={`changed-${c.name}`}>{label(c.name)} 改了{c.fields.map(f => COLUMN_FIELD_LABELS[f]).join('、')}</li>)}
-          {diff.key && <li data-diff-item="key">去重键：{fieldList(diff.key.from)} → {fieldList(diff.key.to)}</li>}
-          {diff.latest && <li data-diff-item="latest">取最新字段：{latestText(diff.latest.from)} → {latestText(diff.latest.to)}</li>}
-          {diff.identity && <li data-diff-item="identity">身份打通匹配字段：{fieldList(diff.identity.from, '平台默认')} → {fieldList(diff.identity.to, '平台默认')}</li>}
-          {diff.keySpace && <li data-diff-item="key-space">键空间：{codeText(diff.keySpace.from)} → {codeText(diff.keySpace.to)}</li>}
-          {diff.survivorship && <li data-diff-item="survivorship">属性取舍名次：{diff.survivorship.from ?? '—'} → {diff.survivorship.to ?? '—'}</li>}
-          {diff.where && <li data-diff-item="where">行过滤：{codeText(diff.where.from)} → {codeText(diff.where.to)}</li>}
-          {diff.assertions.added.map(n => <li key={`added-${n}`} data-diff-item={`added-${n}`}>新增断言 {codeText(n)}</li>)}
-          {diff.assertions.removed.map(n => <li key={`removed-${n}`} data-diff-item={`removed-${n}`}>删除断言 {codeText(n)}</li>)}
-          {diff.assertions.changed.map(n => <li key={`changed-${n}`} data-diff-item={`changed-${n}`}>断言 {codeText(n)} 改了级别或取值条件</li>)}
+          {diff.added.map(n => <li key={`added-${n}`} data-diff-item={`added-${n}`}>{t('新增列')} {label(n)}</li>)}
+          {diff.removed.map(n => <li key={`removed-${n}`} data-diff-item={`removed-${n}`}>{t('删除列')} {label(n)}</li>)}
+          {diff.changed.map(c => <li key={`changed-${c.name}`} data-diff-item={`changed-${c.name}`}>{label(c.name)}{t(' 改了{fields}', { fields: c.fields.map(f => columnFieldLabel(t, f)).join(t('、')) })}</li>)}
+          {diff.key && <li data-diff-item="key">{t('去重键：')}{fieldList(diff.key.from)} → {fieldList(diff.key.to)}</li>}
+          {diff.latest && <li data-diff-item="latest">{t('取最新字段：')}{latestText(diff.latest.from)} → {latestText(diff.latest.to)}</li>}
+          {diff.identity && <li data-diff-item="identity">{t('身份打通匹配字段：')}{fieldList(diff.identity.from, t('平台默认'))} → {fieldList(diff.identity.to, t('平台默认'))}</li>}
+          {diff.keySpace && <li data-diff-item="key-space">{t('键空间：')}{codeText(diff.keySpace.from)} → {codeText(diff.keySpace.to)}</li>}
+          {diff.survivorship && <li data-diff-item="survivorship">{t('属性取舍名次：')}{diff.survivorship.from ?? '—'} → {diff.survivorship.to ?? '—'}</li>}
+          {diff.where && <li data-diff-item="where">{t('行过滤：')}{codeText(diff.where.from)} → {codeText(diff.where.to)}</li>}
+          {diff.assertions.added.map(n => <li key={`added-${n}`} data-diff-item={`added-${n}`}>{t('新增断言')} {codeText(n)}</li>)}
+          {diff.assertions.removed.map(n => <li key={`removed-${n}`} data-diff-item={`removed-${n}`}>{t('删除断言')} {codeText(n)}</li>)}
+          {diff.assertions.changed.map(n => <li key={`changed-${n}`} data-diff-item={`changed-${n}`}>{t('断言')} {codeText(n)}{t(' 改了级别或取值条件')}</li>)}
         </ul>
       )}
     </section>
