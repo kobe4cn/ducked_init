@@ -7,8 +7,10 @@
 // value / default 是纯数字字符串时写成 number，否则 string；missing 只写规则里引用到的指标（写了未引用的会被 checkTag 拦）。
 // 只能 import app/lib 里的东西（.server 的只能 import type）
 import { parseDocument, stringify } from 'yaml';
-import type { ReadonlyItem } from './metric-form';
 import { TAG_CONDITIONS, type TagCondition } from './tag-vocab';
+
+/** 标签表单里表单表达不了的项：与指标表单的 ReadonlyItem 同形，reason 仍是中文字符串（标签表单没接双语，#1053 只做指标） */
+interface TagReadonlyItem { key: string; reason: string; raw: unknown }
 
 /** 一条规则的条件行：指标与它上面的比较（至少一个；同一行多个比较是 AND） */
 export interface TagItem { metric: string; cmp: { op: TagCondition; value: number }[] }
@@ -26,7 +28,7 @@ export interface TagForm {
   missing: Record<string, number | null>;
   default: string | number | '';
   description?: string;
-  readonly: ReadonlyItem[];
+  readonly: TagReadonlyItem[];
 }
 
 const UNKNOWN = '这种写法表单不认识，请在 YAML 里修改';
@@ -67,7 +69,7 @@ export function yamlToForm(text: string): TagForm {
   if (doc.errors.length) return whole(`YAML 语法错误：${doc.errors[0]!.message.split('\n')[0]}，请在 YAML 里修改`);
   const top: unknown = doc.toJS();
   if (!isObj(top)) return whole('定义要写成带 rules（规则）的对象，请在 YAML 里修改');
-  const readonly: ReadonlyItem[] = [];
+  const readonly: TagReadonlyItem[] = [];
   const form: TagForm = { single: typeof top.metric === 'string', rules: [], missing: {}, default: '', readonly };
   for (const [k, val] of Object.entries(top)) {
     if (!['metric', 'rules', 'missing', 'default', 'description'].includes(k)) readonly.push({ key: k, reason: `不认识的键 ${k}，请在 YAML 里修改`, raw: val });

@@ -19,6 +19,7 @@ import type { DraftAmbiguity as DraftAmbiguityInfo } from '~/.server/catalog/dra
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { createDefinition, DslError, dslContext, modelDraftForDefinition } from '~/.server/dsl-definitions';
 import { errorTextFor } from '~/.server/i18n';
+import { getLocale } from '~/.server/locale';
 import { MetricParseError, parseMetricSentence } from '~/.server/metric-parse';
 import { DSL_KINDS, isDslKind, type DslKind } from '~/.server/pipeline/dsl';
 import { checkMetric, compileMetric, fieldsFor } from '~/.server/pipeline/dsl/metric-spec';
@@ -30,6 +31,8 @@ import { cmp } from '~/lib/compare';
 import { formToYaml as tagFormToYaml, yamlToForm as tagYamlToForm, type TagForm } from '~/lib/tag-form';
 import { diffForms, formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
 import { hasUnsavedChanges, snapshotOf } from '~/lib/unsaved-changes';
+import { makeT, msgText } from '~/lib/i18n';
+import enClient from '~/i18n/en.client.json';
 import { TAG_CONDITIONS, type TagCondition } from '~/lib/tag-vocab';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
@@ -274,6 +277,9 @@ export async function action({ request }: Route.ActionArgs) {
     mode: (kind === 'metric' || kind === 'tag') ? currentMode : undefined,
   };
   let yaml = yamlInput;
+  // 界面语言：指标摘要 / 差异 / 切构建器时丢弃项的原因与读不出来的报错按它出文字（英文界面查客户端词典，与页面展示同一份，ADR-0060）
+  const locale = await getLocale(request);
+  const t = makeT(locale, locale === 'en' ? enClient : null);
   try {
     // 模式切换（YAML ↔ 构建器）：提交本页表单，服务端把内容转换后带到目标模式（#797）。字段表只在服务端取（ADR-0005），不信客户端
     if ((kind === 'metric' || kind === 'tag') && intent === 'to-yaml') {
@@ -292,16 +298,16 @@ export async function action({ request }: Route.ActionArgs) {
       // 先看整份 YAML 读不读得出来：读不出来 400 留在 YAML、编辑框保持原内容；读得出来再按 base 取字段表转表单
       const first = yamlToForm(yaml, []);
       const unreadable = first.readonly.find(r => r.key === '$yaml');
-      if (unreadable) throw new DslError(unreadable.reason);
+      if (unreadable) throw new DslError(msgText(t, unreadable.reason));
       const ctx = await dslContext(getDb(), member.tenant.id);
       const fields = fieldsFor(first.base, ctx);
       const parsed = yamlToForm(yaml, fields ? labelledFields(first.base, fields) : []);
       // 构建器没有维度控件、也表达不了只读项：切过去会丢掉的逐项列出（多跳维度的名字在 readonly 项的 raw.name 里），没确认先不切
       const dropped: DroppedItem[] = [
-        ...parsed.dimensions.map(d => ({ key: d.name, reason: '维度，构建器没有维度控件' })),
+        ...parsed.dimensions.map(d => ({ key: d.name, reason: t('维度，构建器没有维度控件') })),
         ...parsed.readonly.map(r => {
           const raw = /^dimensions\.\d+$/.test(r.key) && r.raw && typeof r.raw === 'object' && !Array.isArray(r.raw) ? (r.raw as { name?: unknown }).name : undefined;
-          return { key: typeof raw === 'string' ? raw : r.key, reason: r.reason };
+          return { key: typeof raw === 'string' ? raw : r.key, reason: msgText(t, r.reason) };
         }),
       ];
       if (dropped.length > 0 && intent === 'to-builder') {
@@ -344,7 +350,7 @@ export async function action({ request }: Route.ActionArgs) {
       let current: MetricForm | undefined;
       if (builder !== undefined) { try { current = builderFormOf(builder); } catch { current = undefined; } }
       const diff = current === undefined ? [] : diffForms(
-        current, normalized,
+        t, current, normalized,
         labelledFields(normalized.base, fieldsFor(normalized.base, await dslContext(getDb(), member.tenant.id)) ?? []),
       );
       // 构建器是空的或解析结果与当前内容一样：直接填入；否则先列出差异等成员确认（form 仍是当前内容）；
@@ -371,7 +377,7 @@ export async function action({ request }: Route.ActionArgs) {
         const result = checkMetric(yaml, ctx);
         if (!result.ok) return data({ error: `指标定义有 ${result.issues.length} 个问题`, issues: result.issues, yaml, summary: null, sql: null, ...keep }, { status: 400 });
         // 只编译、不碰数据湖；摘要给四句（ratio）或三句
-        return { error: null, issues: [], yaml, summary: summarize(formState, labelled), sql: compileMetric(result.spec, ctx, todayUtc()), ...keep };
+        return { error: null, issues: [], yaml, summary: summarize(t, formState, labelled), sql: compileMetric(result.spec, ctx, todayUtc()), ...keep };
       }
     }
     // 标签的构建器提交：规整成表单后生成 YAML，落到下面同一套校验与保存（标签没有「检查」：不合法由 createDefinition 按行列 400）

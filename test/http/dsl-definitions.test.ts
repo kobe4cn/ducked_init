@@ -188,6 +188,23 @@ describe('指标与标签定义页', () => {
     expect((await getDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'paid_amount_30d')).draft).toMatchObject({ version: 1, yaml: formToYaml(form, fields) });
   });
 
+  it('英文界面下构建器「检查」的摘要句子是英文（字段名走 CANONICAL_NAMES 词典），摘要里没有汉字', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    analyst.store('crm_locale=en; Path=/');
+    const form: MetricForm = { base: 'order', agg: 'sum', field: 'amount', filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'paid_at', days: 30 }, dimensions: [], readonly: [] };
+    const check = await analyst.post('/analytics/definitions/new', { kind: 'metric', key: 'paid_amount_30d', form: JSON.stringify(form), intent: 'check' });
+    expect(check.status).toBe(200);
+    // 只断言摘要块：句子按界面语言（summarize 收 t），实体 / 字段名走 builtinName 的英文词典
+    const summary = (await check.text()).match(/<ul data-summary[^>]*>([\s\S]*?)<\/ul>/)![1];
+    expect(summary).toContain('<li>Calculates the sum of Amount Paid.</li>');
+    expect(summary).toContain('<li>Counts only records where Order Status equals paid.</li>');
+    expect(summary).toContain('<li>In the last 30 days, by Paid At.</li>');
+    expect(summary).not.toMatch(/[一-鿿]/);
+  });
+
   it('新建标签页的条件构建器：可选指标只有本租户已发布的数值指标；保存得到与手写 YAML 一样的草稿；default 为空 400', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     await memberOf(acme, 'analyst@acme.com', 'analyst');
