@@ -102,8 +102,8 @@ export async function action({ request }: Route.ActionArgs) {
 
 const formatTime = (locale: Locale, iso: string) => formatDateTime(locale, iso, { hour12: false });
 
-/** 参数位置的页面文案（照 scopeLabel 写成字面量 t('…') 的对照表，才能与词典对账） */
-const paramInText = (t: T, p: 'path' | 'query' | 'body') => ({ path: t('路径'), query: t('查询'), body: t('请求体') })[p];
+/** 参数位置的页面文案：写成 select 句式而不是 t('查询')，因为「查询」这个词条是侧导航的 Workbench，这里要译成 Query */
+const paramInText = (t: T, p: 'path' | 'query' | 'body') => t('{where, select, path {路径} query {查询} other {请求体}}', { where: p });
 
 /** 接口范围的名称：中文与 lib/api-scopes 的 API_SCOPE_LABELS 一致，这里写成字面量 t('…') 才能与词典对账 */
 const scopeLabel = (t: T, scope: ApiScope) => ({ catalog: t('目录'), consumers: t('点查'), exports: t('导出') })[scope];

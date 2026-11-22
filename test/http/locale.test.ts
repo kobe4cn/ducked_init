@@ -189,7 +189,7 @@ describe('界面语言：顶栏与导航整块翻译（#1012）', () => {
     browser.store('crm_locale=en; Path=/');
     const header = headerOf(await (await browser.get('/')).text());
     // 品牌名、全部分组与链接、我的设置提示、退出登录（「API Key」本就是英文；& 在 HTML 里转义成 &amp;）
-    for (const en of ['CRM Data Analytics Platform', 'Overview', 'Data Ingestion', 'Sources', 'Mappings', 'Custom Entities', 'Data Quality', 'Data Model', 'Canonical Model', 'Lineage', 'Business Knowledge', 'Analytics', 'Metrics &amp; Tags', 'Query', 'Tasks', 'Admin', 'Members', 'API Key', 'Model Providers', 'Model Calls', 'Audit Log', 'PII Reveal', 'Sign out', 'title="My settings (admin@acme.com)"']) {
+    for (const en of ['CRM Data Analytics Platform', 'Overview', 'Data Ingestion', 'Sources', 'Mappings', 'Custom Entities', 'Data Quality', 'Data Model', 'Canonical Model', 'Lineage', 'Business Knowledge', 'Analytics', 'Metrics &amp; Tags', 'Workbench', 'Tasks', 'Admin', 'Members', 'API Key', 'Model Providers', 'Model Calls', 'Audit Log', 'PII Reveal', 'Sign out', 'title="My settings (admin@acme.com)"']) {
       expect(header).toContain(en);
     }
     // 导航定义（app/.server/nav.ts）保持中文，只在渲染时翻译：顶栏里中文 label 一个都不出现
