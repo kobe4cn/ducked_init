@@ -1298,6 +1298,9 @@ describe('指标与标签快照详情', () => {
     expect(html).toContain('第 1 版');
     expect(html).toContain(`统计日 ${asOf}`);
     expect(html).toContain('来源 发布');
+    // 页头的版本号只包一层「第…版」（#1050 review）
+    expect(html).toContain(`第 1 版，统计日 ${asOf}，来源 发布`);
+    expect(html).not.toContain('第 第');
     // 带维度的指标每个消费者有多行：统计卡片按行数说
     expect(html).toContain('行数');
     for (const column of ['consumer_id', 'city', 'value']) expect(html).toMatch(new RegExp(`<th[^>]*>${column}</th>`));
@@ -1321,6 +1324,16 @@ describe('指标与标签快照详情', () => {
     for (const { value, consumers } of expected) {
       expect(html).toMatch(new RegExp(`data-tag-value="${value ?? ''}"(?:(?!</tr>).)*>${consumers.toLocaleString('zh-CN')}<`, 's'));
     }
+  });
+
+  it('英文界面下指标快照的页头是 Version 1, as of …（#1050）', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const { metric } = shared;
+    const asOf = String(metric.params.asOf);
+    const browser = await loginAs(app, 'viewer@acme.com');
+    browser.store('crm_locale=en; Path=/');
+    const html = (await (await browser.get(`/analytics/snapshots/${metric.id}`)).text()).replace(/<script[\s\S]*?<\/script>/g, '');
+    expect(html).toContain(`Version 1, as of ${asOf}, source `);
   });
 
   it('已过期的快照在定义页「快照」区没有链接、直接打开 404；其他租户的、表名与类型对不上的快照 404；未登录的请求跳转登录页', async () => {
