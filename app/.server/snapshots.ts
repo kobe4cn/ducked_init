@@ -21,6 +21,8 @@ import { isDslKind, type DslKind } from './pipeline/dsl';
 
 export type SnapshotTemplate = keyof typeof TEMPLATES;
 export type Snapshot = typeof snapshots.$inferSelect;
+// 快照来源的联合类型：详情页要在组件里按界面语言翻译来源名（#1050），路由层也用得到
+export type { SnapshotTrigger } from './db/schema';
 
 /** 快照 template（`metric:<键>` / `tag:<键>`）里的 DSL 种类；不是指标或标签快照时为 null */
 export const dslKindOf = (template: string): DslKind | null => {
