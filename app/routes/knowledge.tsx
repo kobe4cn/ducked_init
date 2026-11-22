@@ -12,13 +12,14 @@ import { can, requirePermission } from '~/.server/access';
 import { catalogFor } from '~/.server/assistant/tools';
 import { expand } from '~/.server/catalog';
 import { getDb } from '~/.server/db/client';
-import { errorTextFor } from '~/.server/i18n';
+import { errorTextFor, formatServer } from '~/.server/i18n';
 import { applyStandardPackFor } from '~/.server/knowledge/apply-pack';
 import { KnowledgeError } from '~/.server/knowledge/basis';
 import { isHubEntry, knowledgeHub, type HubEntry, type HubItem } from '~/.server/knowledge/hub';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel, type KnowledgePanel as Panel } from '~/.server/knowledge/panel';
 import { suggestForSubject, SuggestError, type SuggestResult } from '~/.server/knowledge/suggest-run';
 import { listSubjects } from '~/.server/knowledge/subjects';
+import { getLocale } from '~/.server/locale';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { KnowledgePanel } from '~/components/knowledge-panel';
@@ -26,15 +27,21 @@ import { PageHeader } from '~/components/page-header';
 import { StatTile } from '~/components/stat-tile';
 import { Alert, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
-import { claimTypeLabel } from '~/lib/semantic-claims';
+import { claimTypeText } from '~/lib/claim-labels';
+import { makeT, msg, useT, type T } from '~/lib/i18n';
 
-const KIND_LABELS: Record<HubItem['kind'], string> = { entity: '实体', field: '字段', metric: '指标', tag: '标签' };
-const STATE_LABELS: Record<HubItem['missing'][number]['state'], string> = { undeclared: '未声明', unknown: '未知', needsReview: '未知（待复核）' };
+/** 条目种类与缺失状态的名称：中文与原字面量对照表一致，这里写成字面量 t('…') 才能与词典对账（同 api-keys 的 scopeLabel） */
+const kindLabel = (t: T, kind: HubItem['kind']) => ({ entity: t('实体'), field: t('字段'), metric: t('指标'), tag: t('标签') })[kind];
+const stateLabel = (t: T, state: HubItem['missing'][number]['state']) =>
+  ({ undeclared: t('未声明'), unknown: t('未知'), needsReview: t('未知（待复核）') })[state];
 
 const itemHref = (targetId: string) => `/knowledge?item=${encodeURIComponent(targetId)}`;
 
-export function meta({}: Route.MetaArgs) {
-  return [{ title: '业务知识 · CRM 数据分析平台' }];
+export function meta({ matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
+  return [{ title: `${t('业务知识')} · ${t('CRM 数据分析平台')}` }];
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -115,25 +122,26 @@ export async function action({ request }: Route.ActionArgs) {
     if (item) params.set('item', item);
     throw redirect(`/knowledge?${params.toString()}`);
   }
-  if (!isKnowledgeIntent(intent)) return data({ error: '未知操作', targetId: '' }, { status: 400 });
+  if (!isKnowledgeIntent(intent)) return data({ error: formatServer(await getLocale(request), msg('未知操作')), targetId: '' }, { status: 400 });
   const result = await handleKnowledgeIntent(await requirePermission(request, 'definitions:read'), form);
   if ('error' in result) return data({ error: result.error, targetId: String(form.get('targetId') ?? '') }, { status: result.status });
   throw redirect(`/knowledge${new URL(request.url).search}`);
 }
 
 function Item({ item, active }: { item: HubItem; active: boolean }) {
+  const t = useT();
   return (
     <li data-hub-item={item.targetId} className={`rounded-lg px-3 py-2 ${active ? 'bg-slate-100' : ''}`}>
       <div className="flex flex-wrap items-baseline gap-2">
-        <span className="text-xs text-slate-500">{KIND_LABELS[item.kind]}</span>
+        <span className="text-xs text-slate-500">{kindLabel(t, item.kind)}</span>
         <Link to={itemHref(item.targetId)} className="font-medium hover:underline">{item.name}</Link>
         <span className="font-mono text-xs text-slate-400">{item.targetId}</span>
       </div>
       <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-sm">
-        {item.proposals > 0 && <span className="inline-flex items-center gap-1 text-amber-600"><Inbox className="size-3.5" />{`${item.proposals} 条待确认`}</span>}
+        {item.proposals > 0 && <span className="inline-flex items-center gap-1 text-amber-600"><Inbox className="size-3.5" />{t('{n, plural, other {# 条待确认}}', { n: item.proposals })}</span>}
         {item.missing.map(m => (
           <span key={m.type} data-missing={m.type} className="inline-flex items-center gap-1 text-red-600">
-            <CircleHelp className="size-3.5" />{`${claimTypeLabel(m.type)}：${STATE_LABELS[m.state]}`}
+            <CircleHelp className="size-3.5" />{t('{type}：{value}', { type: claimTypeText(t, m.type), value: stateLabel(t, m.state) })}
           </span>
         ))}
       </div>
@@ -143,6 +151,7 @@ function Item({ item, active }: { item: HubItem; active: boolean }) {
 
 export default function Knowledge({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, hub, selected, subjectIds, canSuggest, suggested, packApplied, imported } = loaderData;
+  const t = useT();
   // 生成建议同步调模型：生成期间禁用所有「生成建议」防止再起一次调用，只有被点的那组显示「生成中…」；
   // 应用标准模板包同理禁用。两个都是写提案的操作，互相也禁用（busy，#951）：不能同时生成；
   // 面板里的提交（alias.add、proposal.accept 等）不影响这些按钮
@@ -154,29 +163,29 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
   const busy = pendingSubject !== null || pendingPack;
   const list = hub.groups.length === 0 ? (
     <section className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">
-      <p className="inline-flex items-center gap-2"><CheckCircle2 className="size-4 text-emerald-600" />没有待确认的提案或缺失项。</p>
-      <p className="mt-2 text-sm">这里按分析主题列出等待确认的知识提案，以及没有声明单位、币种（或声明为未知）的指标和金额字段。<Link to="/lineage" className="ml-2 text-slate-900 underline">去数据地图</Link></p>
+      <p className="inline-flex items-center gap-2"><CheckCircle2 className="size-4 text-emerald-600" />{t('没有待确认的提案或缺失项。')}</p>
+      <p className="mt-2 text-sm">{t('这里按分析主题列出等待确认的知识提案，以及没有声明单位、币种（或声明为未知）的指标和金额字段。')}<Link to="/lineage" className="ml-2 text-slate-900 underline">{t('去数据地图')}</Link></p>
     </section>
   ) : (
     <div className="space-y-4">
       {hub.groups.map(g => (
         <section key={g.subject ?? ''} data-hub-group={g.subject ?? 'none'} className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm">
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-            <h2 className="text-lg font-semibold">{g.subject ?? '未归入主题'}</h2>
-            {g.proposals > 0 && <span className="inline-flex items-center gap-1 text-sm text-amber-600"><Inbox className="size-4" />{`${g.proposals} 条待确认提案`}</span>}
-            {g.missing > 0 && <span className="inline-flex items-center gap-1 text-sm text-red-600"><AlertTriangle className="size-4" />{`${g.missing} 个缺失项`}</span>}
+            <h2 className="text-lg font-semibold">{g.subject ?? t('未归入主题')}</h2>
+            {g.proposals > 0 && <span className="inline-flex items-center gap-1 text-sm text-amber-600"><Inbox className="size-4" />{t('{n, plural, other {# 条待确认提案}}', { n: g.proposals })}</span>}
+            {g.missing > 0 && <span className="inline-flex items-center gap-1 text-sm text-red-600"><AlertTriangle className="size-4" />{t('{n, plural, other {# 个缺失项}}', { n: g.missing })}</span>}
             {g.subject !== null && canSuggest && (
               <Form method="post" className="ml-auto">
                 <input type="hidden" name="intent" value="suggest" />
                 <input type="hidden" name="subjectId" value={subjectIds[g.subject] ?? ''} />
                 <Button type="submit" variant="outline" size="sm" disabled={busy}>
-                  <Sparkles />{pendingSubject !== null && pendingSubject === subjectIds[g.subject] ? '生成中…' : '生成建议'}
+                  <Sparkles />{pendingSubject !== null && pendingSubject === subjectIds[g.subject] ? t('生成中…') : t('生成建议')}
                 </Button>
               </Form>
             )}
           </div>
           {g.items.length === 0 ? (
-            <p data-hub-empty className="text-sm text-slate-500">没有待处理的条目</p>
+            <p data-hub-empty className="text-sm text-slate-500">{t('没有待处理的条目')}</p>
           ) : (
             <ul className="space-y-1">
               {g.items.map(i => <Item key={i.targetId} item={i} active={i.targetId === selected?.targetId} />)}
@@ -189,14 +198,14 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
-        title="业务知识" description="按分析主题列出待确认的知识提案与缺失的口径声明，点开条目在本页处理"
+        title={t('业务知识')} description={t('按分析主题列出待确认的知识提案与缺失的口径声明，点开条目在本页处理')}
         actions={canSuggest && (
           <div className="flex gap-2">
-            <Button asChild variant="outline"><Link to="/knowledge/import">粘贴导入</Link></Button>
+            <Button asChild variant="outline"><Link to="/knowledge/import">{t('粘贴导入')}</Link></Button>
             <Form method="post">
               <input type="hidden" name="intent" value="apply-pack" />
               <Button type="submit" disabled={busy}>
-                <PackageCheck />{pendingPack ? '应用中…' : '应用标准模板包'}
+                <PackageCheck />{pendingPack ? t('应用中…') : t('应用标准模板包')}
               </Button>
             </Form>
           </div>
@@ -205,7 +214,7 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
       {packApplied && !actionData?.error && (
         <Alert role="status" className="mb-4">
           <CheckCircle2 className="text-emerald-600" />
-          <AlertTitle>{`已应用标准模板包：新建 ${packApplied.created} 条提案，跳过 ${packApplied.skipped} 条`}</AlertTitle>
+          <AlertTitle>{t('已应用标准模板包：新建 {created, plural, other {# 条提案}}，跳过 {skipped} 条', { created: packApplied.created, skipped: packApplied.skipped })}</AlertTitle>
         </Alert>
       )}
       {suggested && !actionData?.error && (
@@ -213,15 +222,15 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
           <CheckCircle2 className="text-emerald-600" />
           <AlertTitle>
             {suggested.fresh
-              ? `主题「${suggested.subject}」新建 ${suggested.created} 条提案，跳过 ${suggested.skipped} 条`
-              : `主题「${suggested.subject}」已按当前内容生成过，没有新提案`}
+              ? t('主题「{subject}」新建 {created, plural, other {# 条提案}}，跳过 {skipped} 条', { subject: suggested.subject, created: suggested.created, skipped: suggested.skipped })
+              : t('主题「{subject}」已按当前内容生成过，没有新提案', { subject: suggested.subject })}
           </AlertTitle>
         </Alert>
       )}
       {imported && !actionData?.error && (
         <Alert role="status" className="mb-4">
           <CheckCircle2 className="text-emerald-600" />
-          <AlertTitle>{`已从《${imported.title}》新建 ${imported.created} 条提案，跳过 ${imported.skipped} 条`}</AlertTitle>
+          <AlertTitle>{t('已从《{title}》新建 {created, plural, other {# 条提案}}，跳过 {skipped} 条', { title: imported.title, created: imported.created, skipped: imported.skipped })}</AlertTitle>
         </Alert>
       )}
       {actionData?.error && !actionData.targetId && (
@@ -231,9 +240,9 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
         </Alert>
       )}
       <div className="mb-6 grid gap-4 sm:grid-cols-3">
-        <StatTile label="待确认提案" value={hub.totals.proposals} tone={hub.totals.proposals ? 'text-amber-600' : undefined} hint="等待成员确认的知识提案" />
-        <StatTile label="缺失项" value={hub.totals.missing} tone={hub.totals.missing ? 'text-red-600' : undefined} hint="未声明或声明为未知的单位、币种" />
-        <StatTile label="有条目的主题" value={hub.totals.subjects} hint="不含「未归入主题」" />
+        <StatTile label={t('待确认提案')} value={hub.totals.proposals} tone={hub.totals.proposals ? 'text-amber-600' : undefined} hint={t('等待成员确认的知识提案')} />
+        <StatTile label={t('缺失项')} value={hub.totals.missing} tone={hub.totals.missing ? 'text-red-600' : undefined} hint={t('未声明或声明为未知的单位、币种')} />
+        <StatTile label={t('有条目的主题')} value={hub.totals.subjects} hint={t('不含「未归入主题」')} />
       </div>
       {selected ? (
         <div className="grid gap-6 xl:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">

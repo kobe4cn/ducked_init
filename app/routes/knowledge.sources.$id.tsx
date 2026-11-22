@@ -13,11 +13,16 @@ import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertTitle } from '~/components/ui/alert';
 import { PageHeader } from '~/components/page-header';
-import { useT } from '~/lib/i18n';
+import { builtinName, ENUM_LABELS } from '~/lib/builtin-names';
+import { formatDateTime } from '~/lib/format';
+import { makeT, useLocale, useT } from '~/lib/i18n';
 import { KNOWLEDGE_SOURCE_KIND_LABELS } from '~/lib/knowledge-source';
 
-export function meta({ loaderData }: Route.MetaArgs) {
-  return [{ title: `${loaderData ? `${loaderData.source.title} · 来源原文` : '来源原文'} · CRM 数据分析平台` }];
+export function meta({ loaderData, matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文。标题是成员写的，不翻
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
+  return [{ title: `${loaderData ? `${loaderData.source.title} · ${t('来源原文')}` : t('来源原文')} · ${t('CRM 数据分析平台')}` }];
 }
 
 export async function loader({ request, params }: Route.LoaderArgs) {
@@ -34,7 +39,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       nav: navFor(member),
       source: {
         title: source.title,
-        kindLabel: KNOWLEDGE_SOURCE_KIND_LABELS[source.kind],
+        kind: source.kind,
         version: source.version,
         currentVersion: source.currentVersion,
         // 读取时由 paragraphsOf 现切，不存段落表
@@ -49,25 +54,25 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   }
 }
 
-const when = (iso: string) => new Date(iso).toLocaleString('zh-CN');
-
 export default function KnowledgeSourcePage({ loaderData }: Route.ComponentProps) {
   const { email, nav, source, evidenceVersion } = loaderData;
   const t = useT();
+  const locale = useLocale();
   // 请求的版本（?v=）不存在、回退到了当前版：段号可能对不上，页顶提示；读得到的历史版本身就是证据依据的那版，不提示
   const staleEvidence = evidenceVersion !== null && evidenceVersion !== source.version;
-  // 显示的是历史版时页头标出来（「第 N 版（当前第 M 版）」），当前版保持「第 M 版」
+  // 显示的是历史版时页头标出来（「第 N 版（当前第 M 版）」），当前版保持「第 M 版」；种类是平台内置名称，经 builtinName 按界面语言显示
   const versionLabel = source.version !== source.currentVersion
     ? t('第 {version} 版（当前第 {current} 版）', { version: source.version, current: source.currentVersion })
     : t('第 {version} 版', { version: source.version });
+  const kindLabel = builtinName(t, KNOWLEDGE_SOURCE_KIND_LABELS[source.kind], ENUM_LABELS);
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
         title={source.title}
         description={
           <>
-            <Link to="/knowledge" className="hover:underline">← 业务知识</Link>
-            {`　${source.kindLabel} · ${versionLabel} · 更新于 ${when(source.updatedAt)}`}
+            <Link to="/knowledge" className="hover:underline">{t('← 业务知识')}</Link>
+            {`　${kindLabel} · ${versionLabel} · ${t('更新于 {when}', { when: formatDateTime(locale, source.updatedAt) })}`}
           </>
         }
       />
@@ -75,7 +80,7 @@ export default function KnowledgeSourcePage({ loaderData }: Route.ComponentProps
       {staleEvidence && (
         <Alert role="status" className="mb-4" data-stale-evidence>
           <AlertTriangle className="text-amber-600" />
-          <AlertTitle>{`证据来自 v${evidenceVersion}，原文已更新到 v${source.version}，段号可能对不上`}</AlertTitle>
+          <AlertTitle>{t('证据来自 v{evidence}，原文已更新到 v{current}，段号可能对不上', { evidence: evidenceVersion, current: source.version })}</AlertTitle>
         </Alert>
       )}
 

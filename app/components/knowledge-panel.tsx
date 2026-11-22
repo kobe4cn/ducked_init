@@ -1,8 +1,8 @@
 // app/components/knowledge-panel.tsx —— 业务知识面板（ADR-0046）：左边是系统事实（目录条目的只读内容、系统口径文字与派生的口径声明），右边是成员写的知识
 // （待确认的知识提案、别名、口径声明、业务说明、分析主题）。提案可以接受、修改后接受、填理由拒绝（主题归属与词的默认指向只有接受与拒绝，分别显示主题名、「『词』默认指这一条」）。每个表单都带 intent 与 targetId，交给路由 action 里的 handleKnowledgeIntent；不能编辑时不渲染任何表单和按钮。
 // 需复核的知识配 amber 图标与「待复核」，生效的配 emerald；待复核的别名多一个「确认」按钮（alias.confirm），确认后换一依据行、不再待复核。panel 为 null（定义从未发布过）时只提示发布后才能添加
-// 界面文字按界面语言翻译（ADR-0060，#1016）：写死的文字走 t()；semantic-claims 的类型 / 取值标签（随 #932）、error 与
-// 成员 / 模型写的条目内容（别名、说明正文、主题名、证据文字）不翻，条目内容保持原文
+// 界面文字按界面语言翻译（ADR-0060，#1016）：写死的文字走 t()；口径类型 / 取值标签经 claim-labels 按界面语言显示（#1048）、
+// error 与成员 / 模型写的条目内容（别名、说明正文、主题名、证据文字）不翻，条目内容保持原文
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { Fragment } from 'react';
 import { Form, Link } from 'react-router';
@@ -12,9 +12,10 @@ import type { Subject } from '~/.server/knowledge/subjects';
 import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
+import { claimTypeText, claimValueText } from '~/lib/claim-labels';
 import { formatDateTime } from '~/lib/format';
 import { useLocale, useT, type T } from '~/lib/i18n';
-import { CLAIM_TYPE_ORDER, CLAIM_TYPES, claimTypeLabel, claimValueLabel, isClaimType, type ClaimType } from '~/lib/semantic-claims';
+import { CLAIM_TYPE_ORDER, CLAIM_TYPES, isClaimType, type ClaimType } from '~/lib/semantic-claims';
 
 /** 一个面板表单：带上 intent 与 targetId */
 function KnowledgeForm({ intent, targetId, className, children }: { intent: string; targetId: string; className?: string; children: React.ReactNode }) {
@@ -36,8 +37,8 @@ function Status({ needsReview }: { needsReview: boolean }) {
 }
 
 /** 一条口径声明的说法：「币种：人民币」。claimPhrase 在 .server 下进不了客户端，这里用同一套标签；
- *  标签本身是 semantic-claims 的中文（随 #932 翻译），组件只出类型与取值之间的连接句式 */
-const phrase = (t: T, type: ClaimType, value: string) => t('{type}：{value}', { type: claimTypeLabel(type), value: claimValueLabel(type, value) });
+ *  类型与取值的说法经 claim-labels 按界面语言显示（#1048），组件只出它们之间的连接句式 */
+const phrase = (t: T, type: ClaimType, value: string) => t('{type}：{value}', { type: claimTypeText(t, type), value: claimValueText(t, type, value) });
 
 function Fact({ label, value }: { label: string; value: string }) {
   return (
@@ -111,11 +112,11 @@ function SystemFacts({ system }: { system: PanelSystem }) {
 const proposalKindLabel = (t: T, kind: PanelProposal['kind']) =>
   ({ alias: t('别名'), claim: t('口径声明'), note: t('业务说明'), subject: t('归入主题'), term_default: t('默认指向') })[kind];
 
-/** 一条提案内容的说法；主题归属显示主题名，主题已删除时显示占位。claim 一条是 semantic-claims 的中文标签（随 #932 翻译） */
+/** 一条提案内容的说法；主题归属显示主题名，主题已删除时显示占位。claim 一条的类型与取值按界面语言显示（#1048） */
 function proposalText(t: T, p: PanelProposal, subjects: Subject[]): string {
   switch (p.kind) {
     case 'alias': return p.content.alias;
-    case 'claim': return t('{type}：{value}', { type: claimTypeLabel(p.content.type), value: claimValueLabel(p.content.type, p.content.value) });
+    case 'claim': return t('{type}：{value}', { type: claimTypeText(t, p.content.type), value: claimValueText(t, p.content.type, p.content.value) });
     case 'note': return p.content.note;
     case 'subject': return subjects.find(s => s.id === p.content.subjectId)?.name ?? t('已删除的主题');
     case 'term_default': return t('『{term}』默认指这一条', { term: p.content.term });
@@ -136,8 +137,8 @@ function EditedValue({ proposal: p }: { proposal: PanelProposal }) {
       return (
         <>
           <input type="hidden" name="type" value={type} />
-          <NativeSelect name="value" size="sm" className="w-48" required defaultValue={p.content.value} aria-label={t('改后的{type}', { type: claimTypeLabel(type) })}>
-            {(isClaimType(type) ? CLAIM_TYPES[type].values : []).map(v => <NativeSelectOption key={v.value} value={v.value}>{v.label}</NativeSelectOption>)}
+          <NativeSelect name="value" size="sm" className="w-48" required defaultValue={p.content.value} aria-label={t('改后的{type}', { type: claimTypeText(t, type) })}>
+            {(isClaimType(type) ? CLAIM_TYPES[type].values : []).map(v => <NativeSelectOption key={v.value} value={v.value}>{claimValueText(t, type, v.value)}</NativeSelectOption>)}
           </NativeSelect>
         </>
       );
@@ -256,10 +257,10 @@ function Claims({ panel, targetId }: { panel: Panel; targetId: string }) {
       <ul className="space-y-2">
         {CLAIM_TYPE_ORDER.map(type => {
           const claim = panel.claims.find(c => c.type === type);
-          // claimTypeLabel / claimValueLabel 是 semantic-claims 的中文标签，随 #932 翻译
+          // 类型与取值的说法经 claim-labels 按界面语言显示（#1048）
           const text = claim?.needsReview
-            ? t('{phrase}（待复核，原为 {previous}）', { phrase: phrase(t, type, claim.value), previous: claimValueLabel(type, claim.previous ?? '') })
-            : (claim ? phrase(t, type, claim.value) : t('{type}：未声明', { type: claimTypeLabel(type) }));
+            ? t('{phrase}（待复核，原为 {previous}）', { phrase: phrase(t, type, claim.value), previous: claimValueText(t, type, claim.previous ?? '') })
+            : (claim ? phrase(t, type, claim.value) : t('{type}：未声明', { type: claimTypeText(t, type) }));
           return (
             <li key={type} data-claim={claim ? type : undefined} className="flex flex-wrap items-center gap-3 text-sm">
               <span className={claim ? '' : 'text-slate-400'}>{text}</span>
@@ -267,9 +268,9 @@ function Claims({ panel, targetId }: { panel: Panel; targetId: string }) {
               {panel.canEdit && (
                 <KnowledgeForm intent="claim.save" targetId={targetId} className="ml-auto flex gap-2">
                   <input type="hidden" name="type" value={type} />
-                  <NativeSelect name="value" size="sm" className="w-48" required defaultValue={claim?.needsReview ? '' : (claim?.value ?? '')} aria-label={claimTypeLabel(type)}>
+                  <NativeSelect name="value" size="sm" className="w-48" required defaultValue={claim?.needsReview ? '' : (claim?.value ?? '')} aria-label={claimTypeText(t, type)}>
                     <NativeSelectOption value="" disabled>{t('选择取值')}</NativeSelectOption>
-                    {CLAIM_TYPES[type].values.map(v => <NativeSelectOption key={v.value} value={v.value}>{v.label}</NativeSelectOption>)}
+                    {CLAIM_TYPES[type].values.map(v => <NativeSelectOption key={v.value} value={v.value}>{claimValueText(t, type, v.value)}</NativeSelectOption>)}
                   </NativeSelect>
                   <Button type="submit" size="sm" variant="outline">{t('保存')}</Button>
                 </KnowledgeForm>

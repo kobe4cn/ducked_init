@@ -20,12 +20,17 @@ import { Field, FieldDescription, FieldGroup, FieldLabel } from '~/components/ui
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
 import { PageHeader } from '~/components/page-header';
+import { builtinName, ENUM_LABELS } from '~/lib/builtin-names';
+import { makeT, useT } from '~/lib/i18n';
 import {
   KNOWLEDGE_SOURCE_BODY_MAX, KNOWLEDGE_SOURCE_KINDS, KNOWLEDGE_SOURCE_KIND_LABELS, KNOWLEDGE_SOURCE_TITLE_MAX,
 } from '~/lib/knowledge-source';
 
-export function meta({}: Route.MetaArgs) {
-  return [{ title: '粘贴导入 · 业务知识 · CRM 数据分析平台' }];
+export function meta({ matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
+  return [{ title: `${t('粘贴导入')} · ${t('业务知识')} · ${t('CRM 数据分析平台')}` }];
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -69,6 +74,7 @@ export async function action({ request }: Route.ActionArgs) {
 
 export default function KnowledgeImport({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav } = loaderData;
+  const t = useT();
   const navigation = useNavigation();
   const submitting = navigation.state === 'submitting';
   const values = actionData?.values;
@@ -77,8 +83,8 @@ export default function KnowledgeImport({ loaderData, actionData }: Route.Compon
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
-        title="粘贴导入"
-        description={<><Link to="/knowledge" className="hover:underline">← 业务知识</Link>　粘贴一份文档原文，保存后交给模型解析成知识提案</>}
+        title={t('粘贴导入')}
+        description={<><Link to="/knowledge" className="hover:underline">{t('← 业务知识')}</Link>　{t('粘贴一份文档原文，保存后交给模型解析成知识提案')}</>}
       />
 
       {actionData?.error && (
@@ -87,8 +93,8 @@ export default function KnowledgeImport({ loaderData, actionData }: Route.Compon
           <AlertTitle>{actionData.error}</AlertTitle>
           {actionData.sourceId && (
             <AlertDescription>
-              来源已保存：<Link to={`/knowledge/sources/${actionData.sourceId}`}>查看原文</Link>
-              ，再提交同标题同正文是安全的重试。
+              {t('来源已保存：')}<Link to={`/knowledge/sources/${actionData.sourceId}`}>{t('查看原文')}</Link>
+              {t('，再提交同标题同正文是安全的重试。')}
             </AlertDescription>
           )}
         </Alert>
@@ -98,35 +104,35 @@ export default function KnowledgeImport({ loaderData, actionData }: Route.Compon
         <Form method="post">
           <FieldGroup>
             <Field>
-              <FieldLabel htmlFor="title">标题</FieldLabel>
-              <Input id="title" name="title" required maxLength={KNOWLEDGE_SOURCE_TITLE_MAX} defaultValue={values?.title ?? ''} placeholder="如：营收指标口径文档" />
-              <FieldDescription>同租户同标题的再粘贴不新建来源：内容变了版本 +1，没变返回现有版本。</FieldDescription>
+              <FieldLabel htmlFor="title">{t('标题')}</FieldLabel>
+              <Input id="title" name="title" required maxLength={KNOWLEDGE_SOURCE_TITLE_MAX} defaultValue={values?.title ?? ''} placeholder={t('如：营收指标口径文档')} />
+              <FieldDescription>{t('同租户同标题的再粘贴不新建来源：内容变了版本 +1，没变返回现有版本。')}</FieldDescription>
             </Field>
             <Field>
-              <FieldLabel htmlFor="kind">种类</FieldLabel>
+              <FieldLabel htmlFor="kind">{t('种类')}</FieldLabel>
               <NativeSelect id="kind" name="kind" required defaultValue={values?.kind ?? 'dictionary'} className="w-48">
-                {KNOWLEDGE_SOURCE_KINDS.map(k => <NativeSelectOption key={k} value={k}>{KNOWLEDGE_SOURCE_KIND_LABELS[k]}</NativeSelectOption>)}
+                {KNOWLEDGE_SOURCE_KINDS.map(k => <NativeSelectOption key={k} value={k}>{builtinName(t, KNOWLEDGE_SOURCE_KIND_LABELS[k], ENUM_LABELS)}</NativeSelectOption>)}
               </NativeSelect>
-              <FieldDescription>数据字典与指标说明按空行分段，SQL 按语句（分号）分段。</FieldDescription>
+              <FieldDescription>{t('数据字典与指标说明按空行分段，SQL 按语句（分号）分段。')}</FieldDescription>
             </Field>
             <Field>
-              <FieldLabel htmlFor="body">来源原文</FieldLabel>
+              <FieldLabel htmlFor="body">{t('来源原文')}</FieldLabel>
               <textarea
                 id="body" name="body" rows={12} required maxLength={KNOWLEDGE_SOURCE_BODY_MAX} value={body}
                 onChange={e => setBody(e.target.value)}
-                placeholder="粘贴字段含义、口径说明或 SQL 原文（只粘贴元数据说明，不要粘贴业务数据）"
+                placeholder={t('粘贴字段含义、口径说明或 SQL 原文（只粘贴元数据说明，不要粘贴业务数据）')}
                 className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
               />
               <FieldDescription>
-                <span data-char-count>{`已输入 ${body.length} / ${KNOWLEDGE_SOURCE_BODY_MAX} 字`}</span>
-                ；只粘贴元数据说明（字段含义、口径、SQL），不要粘贴业务数据。
+                <span data-char-count>{t('已输入 {n} / {max} 字', { n: body.length, max: KNOWLEDGE_SOURCE_BODY_MAX })}</span>
+                {t('；只粘贴元数据说明（字段含义、口径、SQL），不要粘贴业务数据。')}
               </FieldDescription>
             </Field>
             <div className="flex items-center gap-3">
               <Button type="submit" disabled={submitting}>
-                <ClipboardPaste />{submitting ? '解析中…' : '保存并解析'}
+                <ClipboardPaste />{submitting ? t('解析中…') : t('保存并解析')}
               </Button>
-              <span className="text-sm text-slate-400">解析会同步调用模型服务，稍等片刻。</span>
+              <span className="text-sm text-slate-400">{t('解析会同步调用模型服务，稍等片刻。')}</span>
             </div>
           </FieldGroup>
         </Form>
