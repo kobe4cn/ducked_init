@@ -311,6 +311,57 @@ describe('编写与发布映射', () => {
     }
   });
 
+  it('英文界面：写死的文字没有汉字，合并状态与实体名是英文，体检报告与数字按英文格式（#1041）', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    // 源名用 ASCII：源表名、映射名与下拉里的数据源名是租户数据，不翻
+    const tenantId = await newTenant('acme');
+    const engineer = await memberOf(tenantId, 'de@acme.com');
+    const { id: sourceId } = await registerSource(engineer, await pgSourceInput(READER, 'ecom'));
+    await profileAllTables(engineer, sourceId, 'ecom');
+    await confirmWatermark(engineer, sourceId, 'customers', 'updated_at');
+    await confirmWatermark(engineer, sourceId, 'orders', 'order_id');
+    await syncSource(engineer, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const reviewer = await memberOf(tenantId, 'de2@acme.com');
+    // campaign_id 两边都映射（值全不同）：一致比例才有可比字段，是 0%
+    const yaml = (table: string, idColumn: string, from: string) => `model: 1\nentity: touch\ntable: ${table}\nfields:\n  touch_id: string(${idColumn})\n  campaign_id: ${from}\n`;
+    await publish(engineer, reviewer, sourceId, yaml('customers', 'customer_id', 'city'));
+    // orders 的主键与 customers 重叠：发布后的合并被独占检查拦下，不查主键再合并一次，让最近一次合并是成功
+    const b = await publish(engineer, reviewer, sourceId, yaml('orders', 'order_id', 'status'));
+    expect((await mergeUnchecked(tenantId, [b])).status).toBe('succeeded');
+    const eng = await loginAs(app, 'de@acme.com');
+    // crm_locale 写进 cookie jar：显式传 Cookie 头时 Client 不带 jar，会丢登录会话
+    eng.store('crm_locale=en; Path=/');
+    expect((await eng.post('/mappings', { intent: 'keycheck' })).status).toBe(302);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    // 水合 script 里带中文词典键（键就是中文原文）、meta 标题按惯例不翻、语言切换表单的「中文」按母语名显示，断言前都去掉；
+    // 编辑框里的规则草稿是服务端生成的数据（注释仍是中文，随 #932），也去掉；
+    // 对照面板表格单元里的常见取值（源库的城市名）与标准模型的字段说明是数据，表头是 th 不受影响，一并去掉
+    const html = (await (await eng.get('/mappings')).text())
+      .replace(/<script[\s\S]*?<\/script>/g, '')
+      .replace(/<title>[^<]*<\/title>/g, '')
+      .replace(/<form[^>]*action="\/locale"[\s\S]*?<\/form>/g, '')
+      .replace(/<textarea[^>]*>[\s\S]*?<\/textarea>/g, '')
+      .replace(/<t[dr][^>]*>[^<]*[一-鿿][^<]*<\/t[dr]>/g, '');
+    expect(html).toContain('lang="en"');
+    expect(html).not.toMatch(/[一-鿿]/);
+    // 页头的最近一次合并状态（builtinName）与卡片实体名都是英文，合并摘要有英文千分位与复数
+    expect(html).toContain('Latest merge: Succeeded');
+    expect(html).toContain('Marketing Touch（touch）');
+    expect(html).toMatch(/Latest merge: Version 1, \d+ rows \(\d+ inserted, \d+ updated, \d+ deleted\)/);
+    // 体检报告：重叠键数与样本键（连接符「、」出英文逗号加空格）、一致比例、建议都是英文，体检时间按英文格式
+    expect(html).toContain('data-keycheck-status="ok"');
+    expect(html).toContain('40 overlapping keys');
+    expect(html).toContain('Sample keys: 1, 10, 11, 12, 13');
+    expect(html).toContain('Consistent 0%');
+    expect(html).toContain('Recommendation: Mostly duplicate ingestion; consider creating a merge group');
+    expect(html).toContain('href="/merge-groups?entity=touch"');
+    expect(html).toMatch(/Checked at: \d{1,2}\/\d{1,2}\/\d{4}, \d{1,2}:\d{2}:\d{2} [AP]M/);
+    // 新建表单的标签与按钮；未知操作的报错也按界面语言（en.server.json）
+    for (const label of ['New mapping', 'Sources', 'Table or source view', 'Target entity']) expect(html).toContain(label);
+    expect(await (await eng.post('/mappings', { intent: 'nope' })).text()).toContain('Unknown operation');
+  });
+
   it('新建映射的表下拉框列出已发布的源视图；YAML 写 view 的映射保存后，详情页对照视图的列，空跑转换视图的样本', async () => {
     const { tenantId, sourceId } = await tenantWithSource('acme');
     const engineer = await memberOf(tenantId, 'de@acme.com');

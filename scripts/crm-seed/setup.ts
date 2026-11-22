@@ -22,6 +22,7 @@ import { syncSource } from '../../app/.server/source-sync';
 import { createSourceView, listSourceViews, publishSourceView } from '../../app/.server/source-views';
 import { confirmKey, confirmSoftDelete, confirmedTables, confirmWatermark, getSource, listSources, registerSource, setSyncScope, updateSource } from '../../app/.server/sources';
 import { createTenant, tenantIdBySlug } from '../../app/.server/tenants';
+import { makeT } from '../../app/lib/i18n';
 import { duplicateKeyText } from '../../app/lib/sources';
 import { memberOf } from '../../test/pipeline/fixtures';
 import { ENTITIES } from './check-mappings';
@@ -64,7 +65,7 @@ async function logKeyChecks(since: Date) {
     const result = t.result as KeyCheckTaskResult | null;
     if (result?.ok) { log(`${tableName} 业务主键 ${keyColumns.join('、')} 检查通过，用时 ${secs}`); continue; }
     const why = result
-      ? `空值 ${result.nullRows} 行；${result.duplicates.map(d => duplicateKeyText(keyColumns, d)).join('；') || '没有重复'}`
+      ? `空值 ${result.nullRows} 行；${result.duplicates.map(d => duplicateKeyText(makeT('zh-CN', null), keyColumns, d)).join('；') || '没有重复'}`
       : `检查出错：${String(t.error).slice(0, 500)}`;
     log(`  ✘ ${tableName} 业务主键 ${keyColumns.join('、')} 检查不通过（用时 ${secs}），按整行全量比对：${why}`);
   }

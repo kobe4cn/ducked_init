@@ -1,5 +1,6 @@
 // app/lib/sources.ts —— 数据源类型六种：PostgreSQL、MySQL、MongoDB、对象存储文件、DuckDB 文件、文件上传。前后端共用（页面组件也要显示类型名称）
 import type { KeyCheckTaskResult } from '~/.server/source-key-check';
+import type { T } from './i18n';
 
 export const SOURCE_KINDS = ['postgres', 'mysql', 'mongodb', 's3', 'duckdb', 'upload'] as const;
 export type SourceKind = (typeof SOURCE_KINDS)[number];
@@ -51,6 +52,12 @@ const SECRET_FIELDS = ['password', 'keyId', 'secret'];
 export const formValues = (form: FormData): Record<string, string> =>
   Object.fromEntries([...form].filter(([k, v]) => typeof v === 'string' && !SECRET_FIELDS.includes(k)).map(([k, v]) => [k, String(v)]));
 
-/** 业务主键检查结果里的一个重复键（数据源页与任务页共用）：主键列像敏感信息时 key 为 null，只给次数 */
-export const duplicateKeyText = (keyColumns: string[], d: KeyCheckTaskResult['duplicates'][number]) =>
-  `${d.key ? keyColumns.map((c, i) => `${c}=${d.key![i]}`).join(', ') : '（敏感字段，不显示取值）'} 出现 ${d.count.toLocaleString('zh-CN')} 次`;
+/**
+ * 业务主键检查结果里的一个重复键（数据源页与任务页共用）：主键列像敏感信息时 key 为 null，只给次数。
+ * 整句走 t()（#1041）：次数用 ICU 复数的 # 按界面语言分组（原来的 toLocaleString('zh-CN')），敏感字段那半句单独一条词条
+ */
+export const duplicateKeyText = (t: T, keyColumns: string[], d: KeyCheckTaskResult['duplicates'][number]) =>
+  t('{keys} 出现 {n, plural, other {# 次}}', {
+    keys: d.key ? keyColumns.map((c, i) => `${c}=${d.key![i]}`).join(', ') : t('（敏感字段，不显示取值）'),
+    n: d.count,
+  });
