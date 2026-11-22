@@ -2,8 +2,8 @@
 // 英文词典（en.client.json）经 I18nProvider 注入后渲染 KnowledgePanel 的典型状态（指标 / 实体 / 字段的系统事实、
 // 五种知识提案、待复核的别名与口径声明、带历史的业务说明、已加入与未加入的分析主题、只读与空态、未发布），
 // 界面文字不能有汉字；作为 props 传进来的数据（error、别名与说明正文、主题名、证据文字）是服务端返回的内容、
-// 不算界面文字（随 #932 翻译），英文态全用 ASCII。semantic-claims 的类型 / 取值标签（单位、人民币等）是 app/lib
-// 返回的中文、不在本票：mock 成 ASCII 透传（取值标签换成取值本身），当作数据去掉再做无汉字断言。
+// 不算界面文字（随 #932 翻译），英文态全用 ASCII。口径类型与取值标签经 claim-labels（#1048）按界面语言显示，
+// 英文态断言具体词条（Unit、Chinese yuan）。
 // 中文界面（词典 null）回退中文原文，输出与接入前一致（验收标准 2）。Form / Link 是 data router 组件，静态渲染里
 // 没有上下文，vi.mock 掉 react-router（同 test/i18n-draft-components-render.test.ts），被测组件在 mock 之后导入
 import { createElement, type ReactNode } from 'react';
@@ -18,20 +18,6 @@ vi.mock('react-router', async importOriginal => {
     ...actual,
     Form: (props: { children?: ReactNode }) => createElement('form', { method: 'post' }, props.children),
     Link: (props: { to: string; children?: ReactNode }) => createElement('a', { href: props.to }, props.children),
-  };
-});
-
-vi.mock('~/lib/semantic-claims', async importOriginal => {
-  const actual = await importOriginal<typeof import('~/lib/semantic-claims')>();
-  // 类型与取值的标签换成各自的代码（ASCII）：口径声明行只剩组件自己的文字
-  const CLAIM_TYPES = Object.fromEntries(Object.entries(actual.CLAIM_TYPES).map(([type, def]) => [
-    type, { label: type, values: def.values.map(v => ({ value: v.value, label: v.value })) },
-  ])) as unknown as typeof actual.CLAIM_TYPES;
-  return {
-    ...actual,
-    CLAIM_TYPES,
-    claimTypeLabel: (type: string) => type,
-    claimValueLabel: (_type: string, value: string) => value,
   };
 });
 
@@ -139,8 +125,12 @@ describe('知识面板的双语渲染', () => {
     expect(full).toContain('Accept with edits');
     expect(full).toContain('Pending review');
     expect(full).toContain('In effect');
-    expect(full).toContain('unit: unknown (pending review; was count)');
-    expect(full).toContain('time_meaning: not declared');
+    expect(full).toContain('Unit: Unknown (pending review; was Count)');
+    expect(full).toContain('Time meaning: not declared');
+    // 口径类型与取值按界面语言显示（#1048）：系统口径、提案与取值下拉里的标签都是英文
+    expect(full).toContain('Currency: Chinese yuan');
+    expect(full).toContain('Semantic claim: Currency: US dollar');
+    expect(full).toContain('value="currency_major">Major currency unit (e.g. yuan)</option>');
     expect(full).toContain('“revenue” defaults to this entry');
     expect(full).toContain('Deleted subject');
     expect(full).toContain('History (2 versions)');
@@ -172,8 +162,10 @@ describe('知识面板的双语渲染', () => {
     expect(full).toContain('拒绝理由，最多 500 字');
     expect(full).toContain('待复核');
     expect(full).toContain('已生效');
-    expect(full).toContain('unit：unknown（待复核，原为 count）');
-    expect(full).toContain('time_meaning：未声明');
+    expect(full).toContain('单位：未知（待复核，原为 个数）');
+    expect(full).toContain('时间含义：未声明');
+    expect(full).toContain('币种：人民币');
+    expect(full).toContain('口径声明：币种：美元');
     expect(full).toContain('『revenue』默认指这一条');
     expect(full).toContain('已删除的主题');
     expect(full).toContain('业务说明');
