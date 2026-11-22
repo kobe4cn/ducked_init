@@ -86,7 +86,7 @@ describe('草稿与校验类公共组件的界面文字按界面语言翻译（A
     expect(en.生成依据模型).toContain('Low 30%');
     expect(en.生成依据模型).toContain('Medium 60%');
     expect(en.生成依据模型).toContain('High 95%');
-    expect(en.生成依据模型).toContain('Path</th>');
+    expect(en.生成依据模型).toContain('Location</th>');
     expect(en.生成依据模型).toContain('Confidence</th>');
     expect(en.生成依据模型).toContain('Reason</th>');
     expect(en.生成依据模型).toContain('failed the not-null assertion');
