@@ -7,6 +7,9 @@ import { listTasks, TASK_PAGE_SIZE, TASK_STATUS_LABELS, taskErrorText } from '~/
 import { isTaskKind, readResult } from '~/.server/pipeline/task-contracts';
 import { templateOfKind } from '~/.server/pipeline/templates';
 import { entityLabel } from '~/lib/canonical-model';
+import { builtinName, CANONICAL_NAMES } from '~/lib/builtin-names';
+import { formatDateTime, formatNumber } from '~/lib/format';
+import { useLocale, useT, type Locale, type T } from '~/lib/i18n';
 import type { KeyCheckTaskResult } from '~/.server/source-key-check';
 import type { ServingRows } from '~/.server/pipeline/serving-engine';
 import { AppShell } from '~/components/app-shell';
@@ -21,8 +24,9 @@ export function meta({}: Route.MetaArgs) {
 
 /** 成功任务的结果在任务页上的展示：按表的行数、主键检查结果与运行配额（taskResult 按任务的 kind 整理） */
 interface TaskResult {
-  /** rows 为 null：这张表没有行数（同步失败、源端已删除、核对时读不了）；dropped：快照过期删掉的表 */
-  tables: { name: string; rows: number | null; dropped?: true }[];
+  /** rows 为 null：这张表没有行数（同步失败、源端已删除、核对时读不了）；dropped：快照过期删掉的表；
+   *  entity / table 只在合并到标准层的行上带（实体的标准中文名与源表名，页面按界面语言显示「实体 ← 表」） */
+  tables: { name: string; rows: number | null; dropped?: true; entity?: string; table?: string }[];
   /** 生成服务库：服务库版本与各部分的行数 */
   serving?: { version: number; rows: ServingRows };
   /** 盘点数据湖时表还没有建：提示「数据湖里还没有表」；其他没有表清单的 kind 不提示 */
@@ -85,11 +89,16 @@ function taskResult(task: { kind: string; result: unknown }): TaskResult | null 
         engine: result.engine,
       };
     }
-    // 合并到标准层：按映射展示「实体 ← 表」，失败和跳过的映射没有 rows
+    // 合并到标准层：按映射展示「实体 ← 表」，失败和跳过的映射没有 rows（name 与 data-result-table 仍用中文拼好的串）
     case 'silver.merge': {
       const result = readResult(task.kind, task);
       return result && {
-        tables: result.mappings.map(m => ({ name: `${entityLabel(m.entity)} ← ${m.table}`, rows: 'rows' in m ? m.rows : null })),
+        tables: result.mappings.map(m => ({
+          name: `${entityLabel(m.entity)} ← ${m.table}`,
+          entity: entityLabel(m.entity),
+          table: m.table,
+          rows: 'rows' in m ? m.rows : null,
+        })),
         engine: result.engine,
       };
     }
@@ -152,25 +161,52 @@ export async function loader({ request }: Route.LoaderArgs) {
   };
 }
 
-const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
+const time = (locale: Locale, iso: string | null) => (iso ? formatDateTime(locale, iso) : '—');
 
-/** 服务库各部分在任务页上的中文名（对象顺序即展示顺序，各部分见 serving-engine 的 ServingRows） */
-const SERVING_PART_LABELS: Record<keyof ServingRows, string> = {
-  rfm: 'RFM',
-  tags: '标签',
-  metrics: '指标',
-  consumer_aliases: '退役 ID 对照',
-  consumer_sources: '源端 ID 对照',
+/** 服务库各部分在任务页上的名称（对象顺序即展示顺序，各部分见 serving-engine 的 ServingRows）；
+ *  写成字面量 t('…') 才能与词典对账（RFM 两种语言一样，不翻） */
+const SERVING_PART_LABELS: Record<keyof ServingRows, (t: T) => string> = {
+  rfm: () => 'RFM',
+  tags: t => t('标签'),
+  metrics: t => t('指标'),
+  consumer_aliases: t => t('退役 ID 对照'),
+  consumer_sources: t => t('源端 ID 对照'),
 };
+
+/** 契约任务类型在任务页上的名称：中文与 task-contracts 的 CONTRACTS label 逐字一致（label 本身不改，翻译只在页面做）；
+ *  写成字面量 t('…') 才能与词典对账 */
+const KIND_LABELS: Record<string, (t: T) => string> = {
+  'catalog.projection': t => t('刷新检索投影'),
+  'catalog.embed': t => t('补算检索向量'),
+  'lake.inventory': t => t('盘点数据湖'),
+  'demo.seed': t => t('生成演示数据'),
+  'source.profile': t => t('采集数据源'),
+  'source.sync': t => t('同步数据源'),
+  'source.keycheck': t => t('校验业务主键'),
+  'source.verify': t => t('核对湖中数据'),
+  'lake.inspect': t => t('漂移检查'),
+  'silver.keycheck': t => t('主键冲突体检'),
+  'silver.merge': t => t('合并到标准层'),
+  'gold.dsl': t => t('指标与标签'),
+  'gold.expire': t => t('快照过期'),
+  'source.drop': t => t('删除原始层'),
+  'sandbox.expire': t => t('沙箱表过期'),
+  'serving.build': t => t('生成服务库'),
+  'export.tags': t => t('人群导出'),
+};
+
+/** 任务类型名：契约 kind 用上表，模板任务（gold.rfm 等，模板名已在词典）与不认识的 kind 走 builtinName（缺键回退原文） */
+const kindName = (t: T, kind: string, kindLabel: string) => KIND_LABELS[kind]?.(t) ?? builtinName(t, kindLabel);
 
 /** 结果的主体：主键检查、服务库、表清单、空表提示四选一（按 taskResult 整理出的字段） */
 function ResultBody({ result: { tables, serving, emptyHint, keyCheck } }: { result: TaskResult }) {
+  const t = useT();
   if (keyCheck) {
     return (
       <div className="space-y-0.5">
         <div data-keycheck-result={keyCheck.tableName}>
-          {`${keyCheck.tableName} 的业务主键 ${keyCheck.keyColumns.join('、')}：`}
-          <StatusText tone={keyCheck.ok ? 'ok' : 'bad'} className="text-xs">{keyCheck.ok ? '通过' : '不通过'}</StatusText>
+          {t('{table} 的业务主键 {columns}：', { table: keyCheck.tableName, columns: keyCheck.keyColumns.join(t('、')) })}
+          <StatusText tone={keyCheck.ok ? 'ok' : 'bad'} className="text-xs">{keyCheck.ok ? t('通过') : t('不通过')}</StatusText>
         </div>
         {!keyCheck.ok && <KeyCheckFindings result={keyCheck} className="pl-3" />}
       </div>
@@ -179,10 +215,11 @@ function ResultBody({ result: { tables, serving, emptyHint, keyCheck } }: { resu
   if (serving) {
     return (
       <div className="space-y-0.5">
-        <div data-serving-version={serving.version}>{`服务库第 ${serving.version} 版`}</div>
+        <div data-serving-version={serving.version}>{t('服务库第 {version} 版', { version: serving.version })}</div>
         {(Object.keys(SERVING_PART_LABELS) as (keyof ServingRows)[]).map(part => (
           <div key={part} data-serving-part={part} className="pl-3">
-            {`${SERVING_PART_LABELS[part]}：`}<span className="text-foreground">{`${serving.rows[part].toLocaleString('zh-CN')} 行`}</span>
+            {t('{part}：', { part: SERVING_PART_LABELS[part](t) })}
+            <span className="text-foreground">{t('{rows, plural, other {# 行}}', { rows: serving.rows[part] })}</span>
           </div>
         ))}
       </div>
@@ -192,28 +229,33 @@ function ResultBody({ result: { tables, serving, emptyHint, keyCheck } }: { resu
     return (
       <ul>
         {/* 同步结果按批次记录，同一张表可能出现多次（如增量后接全量比对），key 要带上序号 */}
-        {tables.map((t, i) => (
-          <li key={`${i}-${t.name}`} data-result-table={t.name}>
-            {`${t.name}：`}<span className="text-foreground">{t.dropped ? '已删除' : t.rows === null ? '—' : `${t.rows.toLocaleString('zh-CN')} 行`}</span>
+        {tables.map((table, i) => (
+          <li key={`${i}-${table.name}`} data-result-table={table.name}>
+            {table.entity === undefined
+              ? t('{table}：', { table: table.name })
+              : t('{entity} ← {table}：', { entity: builtinName(t, table.entity, CANONICAL_NAMES), table: table.table })}
+            <span className="text-foreground">{table.dropped ? t('已删除') : table.rows === null ? '—' : t('{rows, plural, other {# 行}}', { rows: table.rows })}</span>
           </li>
         ))}
       </ul>
     );
   }
-  return emptyHint ? <div>数据湖里还没有表</div> : null;
+  return emptyHint ? <div>{t('数据湖里还没有表')}</div> : null;
 }
 
 function ResultDetails({ result }: { result: TaskResult }) {
+  const t = useT();
+  const locale = useLocale();
   const { unlinkedOrders, engine } = result;
   return (
     <details className="text-xs text-muted-foreground">
-      <summary className="cursor-pointer select-none">查看结果</summary>
+      <summary className="cursor-pointer select-none">{t('查看结果')}</summary>
       <div className="mt-1 space-y-1 pl-3">
         <ResultBody result={result} />
         {unlinkedOrders !== undefined && (
-          <div>打通不到消费者的订单：<span className="text-foreground">{unlinkedOrders.toLocaleString('zh-CN')}</span></div>
+          <div>{t('打通不到消费者的订单：')}<span className="text-foreground">{formatNumber(locale, unlinkedOrders)}</span></div>
         )}
-        {engine && <div>{`运行配额：内存 ${engine.memoryLimit} · ${engine.threads} 线程`}</div>}
+        {engine && <div>{t('运行配额：内存 {memory} · {threads, plural, other {# 线程}}', { memory: engine.memoryLimit, threads: engine.threads })}</div>}
       </div>
     </details>
   );
@@ -221,41 +263,43 @@ function ResultDetails({ result }: { result: TaskResult }) {
 
 export default function Tasks({ loaderData }: Route.ComponentProps) {
   const { email, nav, pageSize, tasks } = loaderData;
+  const t = useT();
+  const locale = useLocale();
   return (
     <AppShell email={email} nav={nav}>
-      <PageHeader title="任务" description={`本租户最近 ${pageSize} 个任务，按提交时间倒序。超出并发上限的任务排队等待；成功的任务可展开查看结果。`} />
+      <PageHeader title={t('任务')} description={t('本租户最近 {count} 个任务，按提交时间倒序。超出并发上限的任务排队等待；成功的任务可展开查看结果。', { count: pageSize })} />
 
       {tasks.length ? (
         <div className="rounded-2xl border bg-white p-6 shadow-sm">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>任务</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>提交时间</TableHead>
-                <TableHead>开始时间</TableHead>
-                <TableHead>结束时间</TableHead>
+                <TableHead>{t('任务')}</TableHead>
+                <TableHead>{t('状态')}</TableHead>
+                <TableHead>{t('提交时间')}</TableHead>
+                <TableHead>{t('开始时间')}</TableHead>
+                <TableHead>{t('结束时间')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {tasks.map(t => (
-                <TableRow key={t.id} data-task-kind={t.kind} data-task-status={t.status}>
+              {tasks.map(task => (
+                <TableRow key={task.id} data-task-kind={task.kind} data-task-status={task.status}>
                   <TableCell>
-                    {t.kindLabel}
-                    {t.error && <div className="text-xs whitespace-normal text-red-600">{t.error}</div>}
-                    {t.result && <ResultDetails result={t.result} />}
+                    {kindName(t, task.kind, task.kindLabel)}
+                    {task.error && <div className="text-xs whitespace-normal text-red-600">{task.error}</div>}
+                    {task.result && <ResultDetails result={task.result} />}
                   </TableCell>
-                  <TableCell><StatusText tone={TASK_TONES[t.status]}>{t.statusLabel}</StatusText></TableCell>
-                  <TableCell className="text-slate-500">{time(t.createdAt)}</TableCell>
-                  <TableCell className="text-slate-500">{time(t.startedAt)}</TableCell>
-                  <TableCell className="text-slate-500">{time(t.finishedAt)}</TableCell>
+                  <TableCell><StatusText tone={TASK_TONES[task.status]}>{builtinName(t, task.statusLabel)}</StatusText></TableCell>
+                  <TableCell className="text-slate-500">{time(locale, task.createdAt)}</TableCell>
+                  <TableCell className="text-slate-500">{time(locale, task.startedAt)}</TableCell>
+                  <TableCell className="text-slate-500">{time(locale, task.finishedAt)}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
           </Table>
         </div>
       ) : (
-        <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">暂无任务。采集、同步、核对、合并等后台任务提交后会出现在这里。</div>
+        <div className="rounded-2xl border bg-white p-6 text-slate-500 shadow-sm">{t('暂无任务。采集、同步、核对、合并等后台任务提交后会出现在这里。')}</div>
       )}
     </AppShell>
   );
