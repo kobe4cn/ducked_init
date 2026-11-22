@@ -34,6 +34,8 @@ export const APPEND_ONLY = new Set([
   "docs/adr/README.md",
   "app/i18n/en.client.json",
   "app/i18n/en.server.json",
+  // 中文棘轮基线：每张双语票按文件下调计数，冲突时 rebase 用 `npm run i18n:ratchet -- --update` 重算（2026-11-22）。
+  "test/i18n-ratchet-baseline.json",
 ]);
 
 /**
