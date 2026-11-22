@@ -22,7 +22,9 @@ import { can } from '~/.server/access';
 import { requireMember } from '~/.server/auth';
 import type { Catalog } from '~/.server/catalog';
 import type { AnalysisPlan } from '~/.server/catalog/plan';
+import { errorText } from '~/.server/i18n';
 import { resolveProvider } from '~/.server/llm';
+import { getLocale } from '~/.server/locale';
 import { toolSupport } from '~/.server/model-provider';
 import {
   appendTurn, ConversationError, lastChoices, listMyConversations, listSharedWithMe, readConversation, shareConversation, unshareConversation,
@@ -34,6 +36,7 @@ import { planCardView, type PlanCardView } from '~/.server/assistant/plan-card';
 import { catalogFor, toolsFor } from '~/.server/assistant/tools';
 import { KnowledgeError } from '~/.server/knowledge/basis';
 import { ProposalError } from '~/.server/knowledge/proposals';
+import type { Locale } from '~/lib/i18n';
 
 /** 追问候选组的视图（⑥-3 歧义 / ⑥-5 未命中）：按读者自己的目录只留看得到的条目并带名称（#539：看不到的条目 id 与名称都不出现） */
 interface ChoiceGroupView { term: string; kind?: 'missing'; candidates: { entryId: string; name: string }[] }
@@ -51,9 +54,9 @@ const choicesView = (catalog: Catalog, choices: NonNullable<StoredMessage['choic
     }),
   }));
 
-const errorResponse = (e: unknown) => {
+const errorResponse = (e: unknown, locale: Locale) => {
   if (e instanceof AssistantError || e instanceof ConversationError || e instanceof KnowledgeError || e instanceof ProposalError) {
-    return Response.json({ error: e.message }, { status: e.status });
+    return Response.json({ error: errorText(locale, e) }, { status: e.status });
   }
   throw e;
 };
@@ -103,7 +106,7 @@ export async function loader({ request }: Route.LoaderArgs) {
       ...(conversation ? { conversation } : {}),
     });
   } catch (e) {
-    return errorResponse(e);
+    return errorResponse(e, await getLocale(request));
   }
 }
 
@@ -191,6 +194,6 @@ export async function action({ request }: Route.ActionArgs) {
       ...(askCard ? { askCard } : {}),
     });
   } catch (e) {
-    return errorResponse(e);
+    return errorResponse(e, await getLocale(request));
   }
 }

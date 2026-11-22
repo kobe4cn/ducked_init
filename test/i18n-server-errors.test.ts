@@ -1,6 +1,9 @@
 // test/i18n-server-errors.test.ts —— MsgError 基类与 errorText / errorTextFor（#1079，ADR-0060，纯函数，不连库）：
 // 服务端业务错误带句式和参数（Msg），message 固定中文（/mcp 与日志读它），errorText 按界面语言出报错文字——
 // 英文界面查 en.server.json，中文界面回退 message；不带句式的错误（普通 Error、字符串）原样返回
+// 另有守卫（#1119）：租户路由的 catch 点不得把 e.message 直接放进返回字段，要经 errorText / errorTextFor 按界面语言取文字
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { errorText } from '../app/.server/i18n';
 import { msg, MsgError } from '../app/lib/i18n';
@@ -27,5 +30,22 @@ describe('errorText', () => {
     expect(errorText('en', new Error('x'))).toBe('x');
     expect(errorText('zh-CN', new Error('x'))).toBe('x');
     expect(errorText('en', '兜底文案')).toBe('兜底文案');
+  });
+});
+
+describe('守卫：租户路由不把 e.message 直接放进返回字段', () => {
+  const routes = join(import.meta.dirname, '..', 'app', 'routes');
+
+  it('app/routes 的 .tsx（除 ops*、api.v1.*）没有 error / message / catalogError / previewError 取 e.message', () => {
+    const violations = readdirSync(routes)
+      .filter((name) => name.endsWith('.tsx') && !name.startsWith('ops') && !name.startsWith('api.v1.'))
+      .flatMap((name) =>
+        readFileSync(join(routes, name), 'utf8').split('\n').flatMap((line, i) =>
+          /(error|message|catalogError|previewError):\s*e\.message/.test(line) ? [`app/routes/${name}:${i + 1}`] : [],
+        ));
+    expect(
+      violations,
+      `catch 点改用 errorText(locale, e) / errorTextFor(request, e) 按界面语言取报错文字（ADR-0060，#1119）：\n${violations.join('\n')}`,
+    ).toEqual([]);
   });
 });
