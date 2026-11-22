@@ -159,17 +159,17 @@ function TierSection({ tier, state, chatReady, submitting }: {
   const t = useT();
   const label = tierLabel(t, tier);
   const bound = Boolean(state.model);
+  let bindingText: string;
+  if (!bound) bindingText = t('使用默认');
+  else if (state.baseUrl) bindingText = t('模型 {model}，端点 {baseUrl}', { model: state.model, baseUrl: state.baseUrl });
+  else bindingText = t('模型 {model}，端点沿用本租户默认', { model: state.model });
   return (
     <div className="space-y-3 border-t pt-4 first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <h3 className="font-medium">{label.title}</h3>
           <p className="text-sm text-slate-500" {...{ [`data-tier-${tier}`]: bound ? 'tenant' : 'default' }}>
-            {bound
-              ? state.baseUrl
-                ? t('模型 {model}，端点 {baseUrl}', { model: state.model, baseUrl: state.baseUrl })
-                : t('模型 {model}，端点沿用本租户默认', { model: state.model })
-              : t('使用默认')}
+            {bindingText}
           </p>
           <p className="text-sm text-slate-400">{label.hint}</p>
         </div>
