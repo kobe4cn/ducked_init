@@ -220,7 +220,7 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
   const header = 'definition' in snapshot
     ? {
       title: `${dslKindLabel(t, snapshot.definition.kind)} · ${snapshot.definition.key}`,
-      note: t('第 {version} 版，统计日 {asOf}，来源 {trigger}，创建于 {created}，{expires} 过期', {
+      note: t('{version}，统计日 {asOf}，来源 {trigger}，创建于 {created}，{expires} 过期', {
         version: snapshot.definitionVersion ? t('第 {version} 版', { version: String(snapshot.definitionVersion) }) : '—',
         asOf: snapshot.asOf,
         trigger: triggerText(t, snapshot.trigger),
