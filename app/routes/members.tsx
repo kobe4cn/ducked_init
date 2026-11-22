@@ -4,6 +4,7 @@ import { CircleAlert } from 'lucide-react';
 import type { Route } from './+types/members';
 import { can, requirePermission } from '~/.server/access';
 import { logout } from '~/.server/auth';
+import { errorTextFor } from '~/.server/i18n';
 import { ROLE_LABELS, ROLES, type Role } from '~/lib/roles';
 import { changeMemberRole, inviteMember, listMembers, MemberError, removeMember } from '~/.server/members';
 import { navFor } from '~/.server/nav';
@@ -57,7 +58,7 @@ export async function action({ request }: Route.ActionArgs) {
         return data({ error: '未知操作' }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof MemberError) return data({ error: e.message }, { status: e.status });
+    if (e instanceof MemberError) return data({ error: await errorTextFor(request, e) }, { status: e.status });
     throw e;
   }
   throw redirect('/members');

@@ -7,6 +7,7 @@ import { AlertTriangle, CheckCircle2, CircleAlert } from 'lucide-react';
 import type { Route } from './+types/model-provider';
 import { requirePermission } from '~/.server/access';
 import { prefetchEmbeddings } from '~/.server/catalog/versions';
+import { errorTextFor } from '~/.server/i18n';
 import {
   getModelProvider, ModelProviderError, resetEmbeddingProvider, resetModelProvider, resetTierProvider, SAMPLE_ROWS, saveEmbeddingProvider,
   saveModelProvider, saveTierProvider, saveVectorStore, setAllowSamples, testEmbeddingProvider, testModelProvider, testVectorStore,
@@ -89,7 +90,7 @@ export async function action({ request }: Route.ActionArgs) {
         return data({ error: '未知操作' }, { status: 400 });
     }
   } catch (e) {
-    if (e instanceof ModelProviderError) return data({ error: e.message }, { status: e.status });
+    if (e instanceof ModelProviderError) return data({ error: await errorTextFor(request, e) }, { status: e.status });
     throw e;
   }
   throw redirect('/model-provider');
