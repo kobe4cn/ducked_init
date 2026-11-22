@@ -395,6 +395,10 @@ describe('中文界面：整页静态渲染与改造前一致', () => {
     expect(html).toContain('对外接口 GET /api/v1/consumers/:consumerId 读取这张表');
     expect(html).toContain('最近 30 天读取的 API Key：');
     expect(html).toContain('partner · 3 次');
+    // 次数与改造前一样不加千分位（`${calls} 次`）
+    const many = render('zh-CN', LOADER_A, { ...ACTION_A, downstream: { ...ACTION_A!.downstream, keys: [{ name: 'busy', calls: 1234, revoked: false }, { name: 'old', calls: 1234, revoked: true }] } } as Route.ComponentProps['actionData']);
+    expect(many).toContain('busy · 1234 次');
+    expect(many).toContain('old（已吊销） · 1234 次');
     expect(html).toContain('legacy（已吊销） · 1 次');
 
     const upgraded = render('zh-CN', LOADER_B, undefined);

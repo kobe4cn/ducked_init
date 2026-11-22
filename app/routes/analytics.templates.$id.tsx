@@ -286,8 +286,8 @@ function DownstreamImpact({ downstream }: { downstream: Downstream }) {
                 {/* 名字不唯一（吊销后可以用同名再建），不能当 key */}
                 {downstream.keys.map((k, i) => (
                   <li key={i}>{k.revoked
-                    ? t('{name}（已吊销） · {calls, plural, other {# 次}}', { name: k.name, calls: k.calls })
-                    : t('{name} · {calls, plural, other {# 次}}', { name: k.name, calls: k.calls })}
+                    ? t('{name}（已吊销） · {calls} 次', { name: k.name, calls: k.calls })
+                    : t('{name} · {calls} 次', { name: k.name, calls: k.calls })}
                   </li>
                 ))}
               </ul>
