@@ -1,9 +1,10 @@
 // test/i18n-metric-builder-render.test.ts —— 指标构建器与一句话解析面板的静态渲染（#1053，纯函数，不连库）：
 // 英文界面下两个组件写死的界面文字没有汉字：聚合 / 分子分母 / 过滤运算下拉的说明查组件内的字面量 t() 对照表
 // （metric-vocab 的 AGG_TEXT 等词表是数据不接翻译，照 mapping-functions-text 的做法），解析面板的位置（条件第 N 行等）
-// 与固定说明按界面语言；模型写的说明（items[].reason）与路由传的实体 / 字段名是数据，不在本票翻译。
+// 与固定说明按界面语言；模型写的说明（items[].reason）是数据不翻；路由传的实体 / 字段名里，
+// 标准实体名与标准字段名按界面语言（builtinName + CANONICAL_NAMES，与「检查」摘要一致），租户自定义名原样。
 // 提交进隐藏字段 form 的表单值不随界面语言变化。两个组件不引 react-router，静态渲染不需要 mock；
-// 中文界面（词典不下发）的输出与改造前的中文一致（夹具全 ASCII，输出里的汉字就只剩组件写死的界面文字）
+// 中文界面（词典不下发）的输出与改造前的中文一致（除内置名用例外夹具全 ASCII，输出里的汉字就只剩组件写死的界面文字）
 import { createElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
@@ -52,6 +53,16 @@ const PARSE: MetricParseResult = {
   unsupported: ['either A or B'],
   dropped: ['region', 'channel'],
 };
+/** 路由真实给的标签：标准实体与标准字段带中文内置名，英文界面要按 CANONICAL_NAMES 显示英文名；自定义字段没有 label */
+const BUILTIN_ENTITIES: BuilderEntity[] = [{
+  name: 'order', label: '订单',
+  fields: [
+    { name: 'amount', label: '实付金额', type: 'decimal' },
+    { name: 'my_amount', type: 'decimal' },
+  ],
+}];
+const BUILTIN_FORM: MetricForm = { base: 'order', agg: 'sum', field: 'amount', filter: [], dimensions: [], readonly: [] };
+
 const DIFF: readonly FormDiff[] = [{ before: '', after: 'Counts the number of rows.' }];
 
 describe('英文界面：指标构建器', () => {
@@ -87,6 +98,22 @@ describe('英文界面：指标构建器', () => {
     expect(html).toContain('The numerator or denominator is the number of rows');
     expect(html).toContain('The numerator or denominator is the sum of a field');
     expect(html).toContain('None (count rows)');
+  });
+});
+
+describe('英文界面：实体与字段下拉的内置名', () => {
+  it('标准实体名与标准字段名按界面语言显示（与「检查」摘要一致），没有汉字', () => {
+    const html = render('en', createElement(MetricBuilder, { entities: BUILTIN_ENTITIES, defaultForm: BUILTIN_FORM }));
+    expect(html).not.toMatch(HAN);
+    expect(html).toContain('Order (order)');
+    expect(html).toContain('Amount Paid (amount)');
+    expect(html).toContain('>my_amount<');
+  });
+
+  it('中文界面仍显示中文内置名', () => {
+    const html = render('zh-CN', createElement(MetricBuilder, { entities: BUILTIN_ENTITIES, defaultForm: BUILTIN_FORM }));
+    expect(html).toContain('订单（order）');
+    expect(html).toContain('实付金额（amount）');
   });
 });
 

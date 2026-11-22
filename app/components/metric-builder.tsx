@@ -8,6 +8,7 @@ import { Button } from '~/components/ui/button';
 import { Field, FieldDescription, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
+import { builtinName, CANONICAL_NAMES } from '~/lib/builtin-names';
 import type { FieldType } from '~/lib/canonical-model';
 import { useT, type T } from '~/lib/i18n';
 import { AGGS, FILTER_OPS, NUMERIC_TYPES, RATIO_AGGS, TEMPORAL_TYPES } from '~/lib/metric-vocab';
@@ -73,8 +74,11 @@ const noValue = (op: Cond['op']) => op === 'is_null' || op === 'not_null';
 const multiOf = (op: Cond['op']) => op === 'in' || op === 'not_in';
 /** 文本里输的列表（、，逗号或空白分隔） */
 const listOf = (text: string) => text.split(/[,，、\s]+/).filter(Boolean);
-/** 字段在页面上的显示：有中文名写「中文名（字段名）」，括号随界面语言（字段名本身是路由传的数据，不在这里翻） */
-const show = (t: T, f: FormField) => (f.label && f.label !== f.name ? t('{label}（{name}）', { label: f.label, name: f.name }) : f.name);
+/** 实体 / 字段在下拉里的显示：有中文名写「中文名（名称）」，括号随界面语言；标准实体名与标准字段名按界面语言
+ * （builtinName 查内置名词典，与 metric-form 的 labelOf 一致，构建器与「检查」摘要同名），租户自定义名原样 */
+const labelled = (t: T, label: string | undefined, name: string) =>
+  label && label !== name ? t('{label}（{name}）', { label: builtinName(t, label, CANONICAL_NAMES), name }) : name;
+const show = (t: T, f: FormField) => labelled(t, f.label, f.name);
 
 /** 空表单；换基础实体时字段引用全部失效，重置成它（保留聚合） */
 const emptyForm = (): MetricForm => ({
@@ -228,7 +232,7 @@ export function MetricBuilder({ entities, defaultForm }: { entities: BuilderEnti
         <FieldLabel htmlFor="builder-base">{t('基础实体')}</FieldLabel>
         <NativeSelect id="builder-base" value={form.base} onChange={e => changeBase(e.target.value)}>
           <NativeSelectOption value="">{t('（请选择）')}</NativeSelectOption>
-          {entities.map(e => <NativeSelectOption key={e.name} value={e.name}>{e.label !== e.name ? t('{label}（{name}）', { label: e.label, name: e.name }) : e.name}</NativeSelectOption>)}
+          {entities.map(e => <NativeSelectOption key={e.name} value={e.name}>{labelled(t, e.label, e.name)}</NativeSelectOption>)}
         </NativeSelect>
         <FieldDescription>{t('列表与字段来自本租户能用于指标的定义字段（不含敏感字段）；不能做基础实体的实体会被「检查」拦下。')}</FieldDescription>
       </Field>
