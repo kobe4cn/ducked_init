@@ -254,12 +254,9 @@ export default function SnapshotResult({ loaderData }: Route.ComponentProps) {
             <ul className="list-disc pl-5">
               {snapshot.incomplete.map(m => (
                 <li key={m.mapping} data-incomplete-mapping={m.mapping}>
-                  {t('源表 {table} → {entity}：{error}，{rest}', {
-                    table: m.table,
-                    entity: m.entity,
-                    error: m.error,
-                    rest: m.lastSuccessAt ? t('数据停在 {when}', { when: formatDateTime(locale, m.lastSuccessAt) }) : t('从未成功合并'),
-                  })}
+                  {m.lastSuccessAt
+                    ? t('源表 {table} → {entity}：{error}，数据停在 {when}', { table: m.table, entity: m.entity, error: m.error, when: formatDateTime(locale, m.lastSuccessAt) })
+                    : t('源表 {table} → {entity}：{error}，从未成功合并', { table: m.table, entity: m.entity, error: m.error })}
                 </li>
               ))}
             </ul>
