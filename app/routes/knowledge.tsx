@@ -12,6 +12,7 @@ import { can, requirePermission } from '~/.server/access';
 import { catalogFor } from '~/.server/assistant/tools';
 import { expand } from '~/.server/catalog';
 import { getDb } from '~/.server/db/client';
+import { errorTextFor } from '~/.server/i18n';
 import { applyStandardPackFor } from '~/.server/knowledge/apply-pack';
 import { KnowledgeError } from '~/.server/knowledge/basis';
 import { isHubEntry, knowledgeHub, type HubEntry, type HubItem } from '~/.server/knowledge/hub';
@@ -100,7 +101,7 @@ export async function action({ request }: Route.ActionArgs) {
     try {
       outcome = await suggestForSubject(member, subjectId);
     } catch (e) {
-      if (e instanceof SuggestError || e instanceof KnowledgeError) return data({ error: e.message, targetId: '' }, { status: e.status });
+      if (e instanceof SuggestError || e instanceof KnowledgeError) return data({ error: await errorTextFor(request, e), targetId: '' }, { status: e.status });
       throw e;
     }
     const params = new URLSearchParams({ suggested: (await listSubjects(getDb(), member.tenant.id)).find(s => s.id === subjectId)?.name ?? '' });

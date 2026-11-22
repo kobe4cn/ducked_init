@@ -8,6 +8,7 @@ import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import { AlertTriangle, ClipboardPaste } from 'lucide-react';
 import type { Route } from './+types/knowledge.import';
 import { requirePermission } from '~/.server/access';
+import { errorTextFor } from '~/.server/i18n';
 import { KnowledgeError } from '~/.server/knowledge/basis';
 import { ImportError, importFromSource } from '~/.server/knowledge/import';
 import { saveKnowledgeSource } from '~/.server/knowledge/sources';
@@ -49,7 +50,7 @@ export async function action({ request }: Route.ActionArgs) {
     saved = await saveKnowledgeSource(member, values);
   } catch (e) {
     // 校验不过：来源没保存，不带来源页链接（sourceId 补 undefined 让 actionData 的类型统一）
-    if (e instanceof KnowledgeError) return data({ error: e.message, values, sourceId: undefined }, { status: e.status });
+    if (e instanceof KnowledgeError) return data({ error: await errorTextFor(request, e), values, sourceId: undefined }, { status: e.status });
     throw e;
   }
   try {
@@ -61,7 +62,7 @@ export async function action({ request }: Route.ActionArgs) {
     throw redirect(`/knowledge?${params.toString()}`);
   } catch (e) {
     // 未配置模型服务 409 / 模型失败 422：来源已保存，给出来源页链接，再提交同标题同正文是安全的重试
-    if (e instanceof ImportError) return data({ error: e.message, values, sourceId: saved.id }, { status: e.status });
+    if (e instanceof ImportError) return data({ error: await errorTextFor(request, e), values, sourceId: saved.id }, { status: e.status });
     throw e;
   }
 }
