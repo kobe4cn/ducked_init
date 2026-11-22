@@ -59,9 +59,10 @@ const configLabel = (t: T, k: string) => (({
   path: t('路径'), format: t('文件格式'), endpoint: t('对象存储地址'), region: t('区域'), urlStyle: t('寻址方式'), useSsl: 'HTTPS',
 }) as Record<string, string>)[k] ?? k;
 
-const FORMAT_LABELS: Record<string, string> = {
-  email: '邮箱', mobile: '手机号', integer: '整数', decimal: '小数', date: '日期', datetime: '日期时间', uuid: 'UUID', json: 'JSON', objectid: 'ObjectId',
-};
+/** 列统计里格式特征的中文名（键与 TEXT_FORMATS 同名）：UUID、JSON、ObjectId 本来就是拉丁字，不进词典 */
+const formatLabel = (t: T, k: string) => (({
+  email: t('邮箱'), mobile: t('手机号'), integer: t('整数'), decimal: t('小数'), date: t('日期'), datetime: t('日期时间'),
+}) as Record<string, string>)[k] ?? k;
 
 /** 页面的标签页：概览（连接、同步范围、源表、同步）、湖中数据（核对结果）与源视图 */
 type Tab = 'overview' | 'lake' | 'views';
@@ -89,7 +90,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       if (!c) return null;
       const { keyColumns } = c;
       if (c.status === 'queued' || c.status === 'running') return { status: 'running' as const, keyColumns };
-      if (c.status === 'failed' || !c.result) return { status: 'error' as const, keyColumns, error: c.error ?? '未知错误' };
+      if (c.status === 'failed' || !c.result) return { status: 'error' as const, keyColumns, error: c.error ?? null };
       return c.result.ok ? null : { status: 'failed' as const, keyColumns, result: c.result };
     };
     /** 同步范围内的表没有进湖的原因（同步成功过的为 null） */
@@ -223,8 +224,7 @@ export async function action({ request, params }: Route.ActionArgs) {
 
 const SYNC_VARIANTS = { watermark: 'default', needs_confirmation: 'secondary', full_compare: 'outline' } as const;
 const pct = (n: number) => `${Math.round(n * 1000) / 10}%`;
-const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
-/** 按界面语言格式化的日期时间（time 写死 zh-CN，#1037 的子组件还在用，这里不改它的签名）：空值同样返回 — */
+/** 按界面语言格式化的日期时间：空值返回 — */
 const when = (locale: Locale, iso: string | null) => (iso ? formatDateTime(locale, iso) : '—');
 
 type TableView = Route.ComponentProps['loaderData']['tables'][number];
@@ -233,40 +233,43 @@ type CommentView = Route.ComponentProps['loaderData']['comments'][number];
 type SyncEntry = Route.ComponentProps['loaderData']['sync']['history'][string][number];
 
 const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
-const BATCH_MODES = { full: '全表读取', incremental: '增量', reconcile: '主键比对', compare: '全量比对' } as const;
-const count = (n: number) => n.toLocaleString('zh-CN');
+/** 批次方式的中文名（键与同步历史的 batch mode 同名）：主键比对与全量比对是动作名，全量比对与同步方式共用词条 */
+const batchLabel = (t: T, k: string) => (({
+  full: t('全表读取'), incremental: t('增量'), reconcile: t('主键比对'), compare: t('全量比对'),
+}) as Record<string, string>)[k] ?? k;
 
 /** 批次的读取范围：增量批次从水位线往回退了回看窗口时一并说明 */
-function watermarkRange(e: Extract<SyncEntry, { batch: number }>) {
-  if (e.watermarkColumn === null) return '—（没有水位线）';
-  if (e.mode === 'reconcile') return `${e.watermarkColumn}：${e.watermarkTo ?? '—'}（不变）`;
-  const lookback = e.readFrom !== null && e.readFrom !== e.watermarkFrom ? `（回看自 ${e.readFrom}）` : '';
-  return `${e.watermarkColumn}：${e.watermarkFrom ?? '起始'} → ${e.watermarkTo ?? '—'}${lookback}`;
+function watermarkRange(t: T, e: Extract<SyncEntry, { batch: number }>) {
+  if (e.watermarkColumn === null) return t('—（没有水位线）');
+  if (e.mode === 'reconcile') return t('{column}：{to}（不变）', { column: e.watermarkColumn, to: e.watermarkTo ?? '—' });
+  const lookback = e.readFrom !== null && e.readFrom !== e.watermarkFrom ? t('（回看自 {at}）', { at: e.readFrom }) : '';
+  return t('{column}：{from} → {to}{lookback}', { column: e.watermarkColumn, from: e.watermarkFrom ?? t('起始'), to: e.watermarkTo ?? '—', lookback });
 }
 
 /** 批次读到的源表结构与上一次相比的变化（ADR-0034）：删除与改类型的列标红 */
 function SchemaChange({ schema }: { schema: SchemaDiff }) {
+  const t = useT();
   return (
     <TableRow data-schema-change>
       <TableCell />
       <TableCell colSpan={5} className="text-xs whitespace-normal">
-        <span className="mr-2 text-slate-500">源表结构变化</span>
+        <span className="mr-2 text-slate-500">{t('源表结构变化')}</span>
         {schema.removed.length > 0 && (
           <span data-schema-removed className="mr-3 inline-flex items-center gap-1 font-medium text-red-600">
             <CircleAlert className="size-3.5" />
-            删除 <span className="font-mono">{schema.removed.join('、')}</span>
+            {t('删除')} <span className="font-mono">{schema.removed.join(t('、'))}</span>
           </span>
         )}
         {schema.typeChanged.length > 0 && (
           <span data-schema-type-changed className="mr-3 inline-flex items-center gap-1 font-medium text-red-600">
             <CircleAlert className="size-3.5" />
-            改类型 <span className="font-mono">
-              {schema.typeChanged.map(c => `${c.name}（${c.from} → ${c.to}${c.widened ? '，放宽' : ''}）`).join('、')}
+            {t('改类型')} <span className="font-mono">
+              {schema.typeChanged.map(c => t('{name}（{from} → {to}{widened}）', { name: c.name, from: c.from, to: c.to, widened: c.widened ? t('，放宽') : '' })).join(t('、'))}
             </span>
           </span>
         )}
         {schema.added.length > 0 && (
-          <span data-schema-added className="text-slate-600">新增 <span className="font-mono">{schema.added.join('、')}</span></span>
+          <span data-schema-added className="text-slate-600">{t('新增')} <span className="font-mono">{schema.added.join(t('、'))}</span></span>
         )}
       </TableCell>
     </TableRow>
@@ -275,18 +278,20 @@ function SchemaChange({ schema }: { schema: SchemaDiff }) {
 
 /** 一张表的同步历史：每次同步一个变更批次（新的在前），源表结构有变化时在批次下面列出 */
 function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }) {
+  const t = useT();
+  const locale = useLocale();
   return (
     <div data-sync-table={table} className="space-y-1">
       <div className="font-mono text-sm font-medium">{table}</div>
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead>批次</TableHead>
-            <TableHead>方式</TableHead>
-            <TableHead>行数</TableHead>
-            <TableHead>耗时</TableHead>
-            <TableHead>水位线</TableHead>
-            <TableHead>开始时间</TableHead>
+            <TableHead>{t('批次')}</TableHead>
+            <TableHead>{t('方式')}</TableHead>
+            <TableHead>{t('行数')}</TableHead>
+            <TableHead>{t('耗时')}</TableHead>
+            <TableHead>{t('水位线')}</TableHead>
+            <TableHead>{t('开始时间')}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -294,20 +299,22 @@ function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }
             <TableRow key={`${e.taskId}-${i}`} data-sync-error={e.gone ? undefined : true} data-sync-gone={e.gone ? true : undefined}>
               <TableCell>—</TableCell>
               <TableCell colSpan={3} className={`whitespace-normal ${e.gone ? 'text-muted-foreground' : 'text-destructive'}`}>
-                {e.gone ? `跳过：${e.error}` : `失败：${e.error}`}
+                {e.gone ? t('跳过：{error}', { error: e.error }) : t('失败：{error}', { error: e.error })}
               </TableCell>
               <TableCell>—</TableCell>
-              <TableCell>{time(e.startedAt)}</TableCell>
+              <TableCell>{when(locale, e.startedAt)}</TableCell>
             </TableRow>
           ) : (
             <Fragment key={`${e.taskId}-${i}`}>
               <TableRow data-batch={e.batch} data-batch-mode={e.mode}>
                 <TableCell>{e.batch}</TableCell>
-                <TableCell>{BATCH_MODES[e.mode]}</TableCell>
-                <TableCell>{`${count(e.rows)}（新增 ${count(e.inserted)}，更新 ${count(e.updated)}，删除 ${count(e.deleted)}）`}</TableCell>
+                <TableCell>{batchLabel(t, e.mode)}</TableCell>
+                <TableCell>{t('{rows}（新增 {inserted}，更新 {updated}，删除 {deleted}）', {
+                  rows: formatNumber(locale, e.rows), inserted: formatNumber(locale, e.inserted), updated: formatNumber(locale, e.updated), deleted: formatNumber(locale, e.deleted),
+                })}</TableCell>
                 <TableCell>{duration(e.durationMs)}</TableCell>
-                <TableCell className="font-mono text-xs whitespace-normal">{watermarkRange(e)}</TableCell>
-                <TableCell>{time(e.startedAt)}</TableCell>
+                <TableCell className="font-mono text-xs whitespace-normal">{watermarkRange(t, e)}</TableCell>
+                <TableCell>{when(locale, e.startedAt)}</TableCell>
               </TableRow>
               {e.schema?.changed && <SchemaChange schema={e.schema} />}
             </Fragment>
@@ -320,17 +327,23 @@ function SyncHistory({ table, entries }: { table: string; entries: SyncEntry[] }
 
 /** 进湖情况：同步范围内的表有几张已经进湖，没进湖的逐张说明原因；范围外的表只计数 */
 function LakeCoverage({ listing }: { listing: ListedView[] }) {
-  const scoped = listing.filter(t => t.inScope);
-  const missing = scoped.filter(t => t.notInLake).map(t => `${t.name}（${t.notInLake}）`);
-  const outside = listing.filter(t => !t.inScope);
-  const unreadable = outside.filter(t => !t.readable).length;
+  const t = useT();
+  const scoped = listing.filter(row => row.inScope);
+  const missing = scoped.filter(row => row.notInLake).map(row => t('{table}（{reason}）', { table: row.name, reason: builtinName(t, row.notInLake!, ENUM_LABELS) }));
+  const outside = listing.filter(row => !row.inScope);
+  const unreadable = outside.filter(row => !row.readable).length;
   const others = [
-    outside.length - unreadable ? `不在同步范围 ${outside.length - unreadable} 张` : '',
-    unreadable ? `账号没有读权限 ${unreadable} 张` : '',
-  ].filter(Boolean).join('，');
+    outside.length - unreadable ? t('不在同步范围 {n, plural, other {# 张}}', { n: outside.length - unreadable }) : '',
+    unreadable ? t('账号没有读权限 {n, plural, other {# 张}}', { n: unreadable }) : '',
+  ].filter(Boolean).join(t('，'));
   return (
     <StatusText tone={missing.length ? 'bad' : scoped.length ? 'ok' : 'none'} data-lake-coverage>
-      {`已进湖 ${scoped.length - missing.length} 张，未进湖 ${missing.length} 张${missing.length ? `：${missing.join('、')}` : ''}${others ? `；${others}` : ''}`}
+      {t('已进湖 {inLake, plural, other {# 张}}，未进湖 {missing, plural, other {# 张}}{list}{others}', {
+        inLake: scoped.length - missing.length,
+        missing: missing.length,
+        list: missing.length ? t('：{list}', { list: missing.join(t('、')) }) : '',
+        others: others ? t('；{others}', { others }) : '',
+      })}
     </StatusText>
   );
 }
@@ -439,21 +452,23 @@ function SyncScope({ listing, newTables, canWrite, submitting }: { listing: List
 }
 
 function ColumnStats({ table }: { table: TableView }) {
+  const t = useT();
+  const locale = useLocale();
   return (
     <details className="text-xs">
       <summary className="cursor-pointer text-muted-foreground select-none">
-        {`列统计（${table.columns.length} 列，基于前 ${table.sampleRows.toLocaleString('zh-CN')} 行样本）`}
+        {t('列统计（{cols, plural, other {# 列}}，基于前 {rows} 行样本）', { cols: table.columns.length, rows: formatNumber(locale, table.sampleRows) })}
       </summary>
       <Table className="mt-2">
         <TableHeader>
           <TableRow>
-            <TableHead>列</TableHead>
-            <TableHead>类型</TableHead>
-            <TableHead>空值率</TableHead>
-            <TableHead>基数</TableHead>
-            <TableHead>取值范围</TableHead>
-            <TableHead>格式特征</TableHead>
-            <TableHead>常见取值（样本行数）</TableHead>
+            <TableHead>{t('列')}</TableHead>
+            <TableHead>{t('类型')}</TableHead>
+            <TableHead>{t('空值率')}</TableHead>
+            <TableHead>{t('基数')}</TableHead>
+            <TableHead>{t('取值范围')}</TableHead>
+            <TableHead>{t('格式特征')}</TableHead>
+            <TableHead>{t('常见取值（样本行数）')}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -462,13 +477,13 @@ function ColumnStats({ table }: { table: TableView }) {
               <TableCell className="font-mono">{c.name}</TableCell>
               <TableCell className="font-mono text-muted-foreground">{c.type}</TableCell>
               <TableCell>{pct(c.nullRate)}</TableCell>
-              <TableCell>{c.distinct.toLocaleString('zh-CN')}</TableCell>
+              <TableCell>{formatNumber(locale, c.distinct)}</TableCell>
               <TableCell className="whitespace-normal">
-                {c.min !== null ? `${c.min} ～ ${c.max}` : c.length ? `长度 ${c.length.min}～${c.length.max}` : '—'}
+                {c.min !== null ? t('{min} ～ {max}', { min: c.min, max: c.max }) : c.length ? t('长度 {min}～{max}', { min: c.length.min, max: c.length.max }) : '—'}
               </TableCell>
-              <TableCell>{c.formats?.map(f => `${FORMAT_LABELS[f.format] ?? f.format} ${pct(f.share)}`).join('，') || '—'}</TableCell>
+              <TableCell>{c.formats?.map(f => `${formatLabel(t, f.format)} ${pct(f.share)}`).join(t('，')) || '—'}</TableCell>
               <TableCell className="whitespace-normal" data-top>
-                {c.top?.map(t => `${t.value}（${t.rows.toLocaleString('zh-CN')}）`).join('，') || '—'}
+                {c.top?.map(v => t('{value}（{rows}）', { value: v.value, rows: formatNumber(locale, v.rows) })).join(t('，')) || '—'}
               </TableCell>
             </TableRow>
           ))}
@@ -480,6 +495,7 @@ function ColumnStats({ table }: { table: TableView }) {
 
 /** 这张表的已发布映射的列差异：每个映射一行，标出没映射的新列与源端已删除的引用列，链接到映射详情页 */
 function TableMappingDrift({ drift }: { drift: TableView['drift'] }) {
+  const t = useT();
   if (!drift.length) return null;
   return (
     <ul className="space-y-1">
@@ -487,10 +503,10 @@ function TableMappingDrift({ drift }: { drift: TableView['drift'] }) {
         <li key={d.mappingId}>
           <Link to={`/mappings/${d.mappingId}`} className="inline-flex flex-wrap items-center gap-2 hover:underline">
             {d.newColumns.length > 0 && (
-              <StatusText tone="pending" data-drift-new={d.newColumns.join(',')}>{`${d.entity}：${d.newColumns.length} 个新列未映射`}</StatusText>
+              <StatusText tone="pending" data-drift-new={d.newColumns.join(',')}>{t('{entity}：{n, plural, other {# 个新列未映射}}', { entity: d.entity, n: d.newColumns.length })}</StatusText>
             )}
             {d.missing.length > 0 && (
-              <StatusText tone="bad" data-drift-missing={d.missing.join(',')}>{`${d.entity}：源端已删除 ${d.missing.length} 列`}</StatusText>
+              <StatusText tone="bad" data-drift-missing={d.missing.join(',')}>{t('{entity}：源端已删除 {n, plural, other {# 列}}', { entity: d.entity, n: d.missing.length })}</StatusText>
             )}
           </Link>
         </li>
@@ -500,21 +516,22 @@ function TableMappingDrift({ drift }: { drift: TableView['drift'] }) {
 }
 
 function Watermark({ table, canWrite, submitting }: { table: TableView; canWrite: boolean; submitting: boolean }) {
+  const t = useT();
   if (!table.watermarkCandidates.length) return null;
   return (
     <ul className="space-y-1 text-xs">
       {table.watermarkCandidates.map(c => (
         <li key={c.column} className="flex items-center gap-2" data-candidate={c.column}>
           <span className="font-mono">{c.column}</span>
-          <span className="text-muted-foreground">{`${c.kind === 'updated_at' ? '更新时间' : '自增主键'}：${c.reason}`}</span>
+          <span className="text-muted-foreground">{t('{kind}：{reason}', { kind: c.kind === 'updated_at' ? t('更新时间') : t('自增主键'), reason: c.reason })}</span>
           {table.watermark === c.column ? (
-            <Badge variant="secondary">{`已确认${table.confirmedBy ? `（${table.confirmedBy}）` : ''}`}</Badge>
+            <Badge variant="secondary">{t('已确认{by}', { by: table.confirmedBy ? t('（{who}）', { who: table.confirmedBy }) : '' })}</Badge>
           ) : canWrite ? (
             <Form method="post" preventScrollReset>
               <input type="hidden" name="intent" value="confirm-watermark" />
               <input type="hidden" name="table" value={table.name} />
               <input type="hidden" name="column" value={c.column} />
-              <Button type="submit" variant="outline" size="sm" disabled={submitting}>确认为水位线</Button>
+              <Button type="submit" variant="outline" size="sm" disabled={submitting}>{t('确认为水位线')}</Button>
             </Form>
           ) : null}
         </li>
@@ -529,26 +546,27 @@ function Watermark({ table, canWrite, submitting }: { table: TableView; canWrite
  * 都没有时，全量比对按整行比对（修改记为一删一增），水位线同步的增量行一律记为新增、每天整行比对一次补上删除
  */
 function Key({ table, canWrite, submitting }: { table: TableView; canWrite: boolean; submitting: boolean }) {
-  if (table.primaryKey.length) return <div className="text-xs text-muted-foreground">{`主键：${table.primaryKey.join('、')}`}</div>;
+  const t = useT();
+  if (table.primaryKey.length) return <div className="text-xs text-muted-foreground">{t('主键：{cols}', { cols: table.primaryKey.join(t('、')) })}</div>;
   return (
     <div className="space-y-1 text-xs">
       {table.key ? (
         <div className="flex items-center gap-2" data-declared-key={table.key.join(',')}>
-          <span>{`业务主键：${table.key.join('、')}`}</span>
-          <Badge variant="secondary">{`已确认${table.keyConfirmedBy ? `（${table.keyConfirmedBy}）` : ''}`}</Badge>
+          <span>{t('业务主键：{cols}', { cols: table.key.join(t('、')) })}</span>
+          <Badge variant="secondary">{t('已确认{by}', { by: table.keyConfirmedBy ? t('（{who}）', { who: table.keyConfirmedBy }) : '' })}</Badge>
         </div>
       ) : (
         <div className="text-muted-foreground" data-no-key>
           {table.syncMode === 'full_compare'
-            ? '没有主键：按整行比对，完全相同的重复行按出现次数计，修改记为一删一增'
-            : '没有主键：增量行一律记为新增；每天整行全量比对一次，补上源端的删除'}
+            ? t('没有主键：按整行比对，完全相同的重复行按出现次数计，修改记为一删一增')
+            : t('没有主键：增量行一律记为新增；每天整行全量比对一次，补上源端的删除')}
         </div>
       )}
       {table.keyCheck && <KeyCheck check={table.keyCheck} />}
       {canWrite && table.keyEligibleColumns.length > 0 && (
         <details>
           <summary className="cursor-pointer text-muted-foreground select-none">
-            {table.key ? '改为其他业务主键' : '声明业务主键（一列或多列的组合，能唯一标识一行；据此区分新增与更新）'}
+            {table.key ? t('改为其他业务主键') : t('声明业务主键（一列或多列的组合，能唯一标识一行；据此区分新增与更新）')}
           </summary>
           <Form method="post" preventScrollReset className="mt-1 space-y-1">
             <input type="hidden" name="intent" value="confirm-key" />
@@ -558,11 +576,11 @@ function Key({ table, canWrite, submitting }: { table: TableView; canWrite: bool
                 <label key={column} className="flex items-center gap-1" data-key-column={column}>
                   <input type="checkbox" name="column" value={column} defaultChecked={table.key?.includes(column)} />
                   <span className="font-mono">{column}</span>
-                  {table.keyCandidates.includes(column) && <span className="text-muted-foreground" data-key-candidate={column}>（样本中唯一）</span>}
+                  {table.keyCandidates.includes(column) && <span className="text-muted-foreground" data-key-candidate={column}>{t('（样本中唯一）')}</span>}
                 </label>
               ))}
             </div>
-            <Button type="submit" variant="outline" size="sm" disabled={submitting || table.keyCheck?.status === 'running'}>在源端全表检查并确认</Button>
+            <Button type="submit" variant="outline" size="sm" disabled={submitting || table.keyCheck?.status === 'running'}>{t('在源端全表检查并确认')}</Button>
           </Form>
         </details>
       )}
@@ -572,16 +590,18 @@ function Key({ table, canWrite, submitting }: { table: TableView; canWrite: bool
 
 /** 新声明的业务主键检查：进行中、没通过（空值行数与重复键）或检查出错 */
 function KeyCheck({ check }: { check: NonNullable<TableView['keyCheck']> }) {
-  const columns = check.keyColumns.join('、');
+  const t = useT();
+  const columns = check.keyColumns.join(t('、'));
   switch (check.status) {
     case 'running':
-      return <StatusText tone="pending" data-keycheck-status="running">{`正在全表检查新声明：${columns}`}</StatusText>;
+      return <StatusText tone="pending" data-keycheck-status="running">{t('正在全表检查新声明：{columns}', { columns })}</StatusText>;
     case 'error':
-      return <StatusText tone="bad" data-keycheck-status="error">{`新声明 ${columns} 检查出错：${check.error}`}</StatusText>;
+      // loader 在任务没留下错误原文时下发 null，这里按界面语言兜底；其余是服务端原文
+      return <StatusText tone="bad" data-keycheck-status="error">{t('新声明 {columns} 检查出错：{error}', { columns, error: check.error ?? t('未知错误') })}</StatusText>;
     case 'failed':
       return (
         <div className="space-y-0.5">
-          <StatusText tone="bad" data-keycheck-status="failed">{`新声明 ${columns} 未通过全表检查，没有生效`}</StatusText>
+          <StatusText tone="bad" data-keycheck-status="failed">{t('新声明 {columns} 未通过全表检查，没有生效', { columns })}</StatusText>
           <KeyCheckFindings result={check.result} className="pl-5" />
         </div>
       );
@@ -590,6 +610,7 @@ function KeyCheck({ check }: { check: NonNullable<TableView['keyCheck']> }) {
 
 /** 软删除字段：有主键（源端主键或业务主键）的表可以从候选中确认，标记为删除的行同步时记为删除 */
 function SoftDelete({ table, canWrite, submitting }: { table: TableView; canWrite: boolean; submitting: boolean }) {
+  const t = useT();
   if (!table.primaryKey.length && !table.key) return null;
   const candidates = [...new Set([...(table.softDelete ? [table.softDelete] : []), ...table.softDeleteCandidates])];
   if (!candidates.length) return null;
@@ -598,15 +619,15 @@ function SoftDelete({ table, canWrite, submitting }: { table: TableView; canWrit
       {candidates.map(column => (
         <li key={column} className="flex items-center gap-2" data-soft-delete-candidate={column}>
           <span className="font-mono">{column}</span>
-          <span className="text-muted-foreground">软删除字段：为真、非零或非空的行记为删除</span>
+          <span className="text-muted-foreground">{t('软删除字段：为真、非零或非空的行记为删除')}</span>
           {table.softDelete === column ? (
-            <Badge variant="secondary">{`已确认${table.softDeleteConfirmedBy ? `（${table.softDeleteConfirmedBy}）` : ''}`}</Badge>
+            <Badge variant="secondary">{t('已确认{by}', { by: table.softDeleteConfirmedBy ? t('（{who}）', { who: table.softDeleteConfirmedBy }) : '' })}</Badge>
           ) : canWrite ? (
             <Form method="post" preventScrollReset>
               <input type="hidden" name="intent" value="confirm-soft-delete" />
               <input type="hidden" name="table" value={table.name} />
               <input type="hidden" name="column" value={column} />
-              <Button type="submit" variant="outline" size="sm" disabled={submitting}>确认为软删除字段</Button>
+              <Button type="submit" variant="outline" size="sm" disabled={submitting}>{t('确认为软删除字段')}</Button>
             </Form>
           ) : null}
         </li>
@@ -632,83 +653,110 @@ const passed = <T extends { ok: boolean }>(c: T | FailedCheck | undefined) => (c
 
 /** 一项核对的简要状态：一致、有差异的要点或出错；没有核对这一项时为 — */
 function CheckCell<T extends { ok: boolean }>({ name, check, summary }: { name: string; check: T | FailedCheck | undefined; summary: (c: T) => string }) {
+  const t = useT();
   if (!check) return <TableCell className="text-muted-foreground">—</TableCell>;
   return (
     <TableCell className="whitespace-normal">
       <StatusText tone={check.ok ? 'ok' : 'bad'} className="items-start [&>svg]:mt-0.5" data-check={name} data-ok={String(check.ok)}>
-        {failed(check) ? '出错' : summary(check as T)}
+        {failed(check) ? t('出错') : summary(check as T)}
       </StatusText>
     </TableCell>
   );
 }
 
-const fileSummary = (f: FileCheck) => {
+const fileSummary = (t: T, locale: Locale, f: FileCheck) => {
   const issues = [
-    f.missing.length && `缺失 ${f.missing.length} 个`,
-    f.sizeMismatch.length && `大小不符 ${f.sizeMismatch.length} 个`,
-    f.footer.length && `尾部元数据不符 ${f.footer.length} 个`,
-    f.orphans.length && `孤儿文件 ${f.orphans.length} 个`,
+    f.missing.length && t('{n, plural, other {缺失 # 个}}', { n: f.missing.length }),
+    f.sizeMismatch.length && t('{n, plural, other {大小不符 # 个}}', { n: f.sizeMismatch.length }),
+    f.footer.length && t('{n, plural, other {尾部元数据不符 # 个}}', { n: f.footer.length }),
+    f.orphans.length && t('{n, plural, other {孤儿文件 # 个}}', { n: f.orphans.length }),
   ].filter(Boolean);
-  return issues.length ? issues.join('，') : `一致（${f.registered} 个文件${f.inlinedRows ? `，内联 ${count(f.inlinedRows)} 行` : ''}）`;
+  return issues.length ? issues.join(t('，')) : t('一致（{n, plural, other {# 个文件}}{inlined}）', {
+    n: f.registered,
+    inlined: f.inlinedRows ? t('，内联 {rows} 行', { rows: formatNumber(locale, f.inlinedRows) }) : '',
+  });
 };
-const structureSummary = (s: StructureCheck) => {
+const structureSummary = (t: T, s: StructureCheck) => {
   const issues = [
-    s.missingInLake.length && `湖中缺列 ${s.missingInLake.length}`,
-    s.typeChanged.length && `类型不同 ${s.typeChanged.length}`,
+    s.missingInLake.length && t('湖中缺列 {n}', { n: s.missingInLake.length }),
+    s.typeChanged.length && t('类型不同 {n}', { n: s.typeChanged.length }),
   ].filter(Boolean);
-  if (issues.length) return issues.join('，');
-  return s.extraInLake.length ? `一致（湖中多出 ${s.extraInLake.length} 列）` : '一致';
+  if (issues.length) return issues.join(t('，'));
+  return s.extraInLake.length ? t('一致（湖中多出 {n, plural, other {# 列}}）', { n: s.extraInLake.length }) : t('一致');
 };
-const dataSummary = (d: DataCheck) => {
-  if (!d.keyed) return d.ok ? `一致（${count(d.lakeRows)} 行）` : `源端 ${count(d.sourceRows)} 行，湖中 ${count(d.lakeRows)} 行`;
-  const pending = d.pendingSync ? `；待下次同步 ${count(d.pendingSync)} 个` : '';
-  if (d.ok) return `一致（${count(d.lakeRows)} 个主键${pending}）`;
-  return `${[d.missing && `湖中缺失 ${count(d.missing)}`, d.extra && `湖中多出 ${count(d.extra)}`].filter(Boolean).join('，')}${pending}`;
+const dataSummary = (t: T, locale: Locale, d: DataCheck) => {
+  if (!d.keyed) return d.ok
+    ? t('一致（{rows} 行）', { rows: formatNumber(locale, d.lakeRows) })
+    : t('源端 {source} 行，湖中 {lake} 行', { source: formatNumber(locale, d.sourceRows), lake: formatNumber(locale, d.lakeRows) });
+  const pending = d.pendingSync ? t('；待下次同步 {n} 个', { n: formatNumber(locale, d.pendingSync) }) : '';
+  if (d.ok) return t('一致（{rows} 个主键{pending}）', { rows: formatNumber(locale, d.lakeRows), pending });
+  return t('{issues}{pending}', {
+    issues: [d.missing && t('湖中缺失 {n}', { n: formatNumber(locale, d.missing) }), d.extra && t('湖中多出 {n}', { n: formatNumber(locale, d.extra) })]
+      .filter(Boolean).join(t('，')),
+    pending,
+  });
 };
 
-const samples = (list: string[], total: number) => (list.length ? `：${list.join('、')}${total > list.length ? ' 等' : ''}` : '');
+/** 主键比对的样本值：只列前几个，还有更多时以「等」收尾 */
+const samples = (t: T, list: string[], total: number) => (list.length ? t('：{list}{etc}', { list: list.join(t('、')), etc: total > list.length ? t(' 等') : '' }) : '');
 
 /** 一张表的核对明细：位置与四项各自的细节 */
-function VerifyDetail({ t }: { t: VerifyRecord }) {
-  const files = passed<FileCheck>(t.files);
-  const structure = passed<StructureCheck>(t.structure);
-  const data = passed<DataCheck>(t.data);
+function VerifyDetail({ record }: { record: VerifyRecord }) {
+  const t = useT();
+  const locale = useLocale();
+  const files = passed<FileCheck>(record.files);
+  const structure = passed<StructureCheck>(record.structure);
+  const data = passed<DataCheck>(record.data);
   const errors = [
-    t.error,
-    failed(t.files) && `文件核对出错：${t.files.error}`,
-    failed(t.structure) && `结构核对出错：${t.structure.error}`,
-    failed(t.data) && `数据量核对出错：${t.data.error}`,
+    record.error,
+    failed(record.files) && t('文件核对出错：{error}', { error: record.files.error }),
+    failed(record.structure) && t('结构核对出错：{error}', { error: record.structure.error }),
+    failed(record.data) && t('数据量核对出错：{error}', { error: record.data.error }),
   ].filter((e): e is string => !!e);
   const lines: string[] = [];
-  if (t.location) {
-    lines.push(`原始层：${t.location.schema}.${t.location.table}`, `存储前缀：${t.location.prefix}`);
-    lines.push(t.location.state ? `${t.location.state.includes('_keys.') ? '当前主键状态' : '当前镜像'}：${t.location.state}` : '当前主键状态 / 镜像：还没有');
+  if (record.location) {
+    lines.push(t('原始层：{schema}.{table}', { schema: record.location.schema, table: record.location.table }), t('存储前缀：{prefix}', { prefix: record.location.prefix }));
+    lines.push(record.location.state
+      ? t('{kind}：{state}', { kind: record.location.state.includes('_keys.') ? t('当前主键状态') : t('当前镜像'), state: record.location.state })
+      : t('当前主键状态 / 镜像：还没有'));
   }
-  if (t.outOfScope) lines.push('已移出同步范围：湖中数据不再更新，只核对位置与文件');
+  if (record.outOfScope) lines.push(t('已移出同步范围：湖中数据不再更新，只核对位置与文件'));
   if (files) {
-    lines.push(`目录登记 ${files.registered} 个文件，当前 ${files.current} 个数据文件共 ${count(files.fileRows)} 行；内联在目录库中 ${count(files.inlinedRows)} 行（没有对应文件）`);
-    for (const path of files.missing) lines.push(`缺失：${path}`);
-    for (const f of files.sizeMismatch) lines.push(`大小不符：${f.path}（目录 ${count(f.expected)} 字节，存储上 ${count(f.actual)} 字节）`);
-    for (const f of files.footer) lines.push(`尾部元数据：${f.path}（${f.problem}）`);
-    for (const path of files.orphans) lines.push(`孤儿文件（目录未登记，只报告不删除）：${path}`);
+    lines.push(t('目录登记 {registered, plural, other {# 个文件}}，当前 {current, plural, other {# 个数据文件}}共 {rows} 行；内联在目录库中 {inlined} 行（没有对应文件）', {
+      registered: files.registered,
+      current: files.current,
+      rows: formatNumber(locale, files.fileRows),
+      inlined: formatNumber(locale, files.inlinedRows),
+    }));
+    for (const path of files.missing) lines.push(t('缺失：{path}', { path }));
+    for (const f of files.sizeMismatch) lines.push(t('大小不符：{path}（目录 {expected} 字节，存储上 {actual} 字节）', {
+      path: f.path, expected: formatNumber(locale, f.expected), actual: formatNumber(locale, f.actual),
+    }));
+    for (const f of files.footer) lines.push(t('尾部元数据：{path}（{problem}）', { path: f.path, problem: f.problem }));
+    for (const path of files.orphans) lines.push(t('孤儿文件（目录未登记，只报告不删除）：{path}', { path }));
   }
   if (structure) {
-    for (const c of structure.missingInLake) lines.push(`湖中缺列（源端新增字段）：${c.name} ${c.type}`);
-    for (const c of structure.extraInLake) lines.push(`湖中多出（源端删除字段，保留旧列属预期）：${c.name} ${c.type}`);
-    for (const c of structure.typeChanged) lines.push(`类型不同（${c.widened ? '源端放宽' : '不兼容'}）：${c.name} 湖中 ${c.lake}，源端 ${c.source}`);
+    for (const c of structure.missingInLake) lines.push(t('湖中缺列（源端新增字段）：{name} {type}', { name: c.name, type: c.type }));
+    for (const c of structure.extraInLake) lines.push(t('湖中多出（源端删除字段，保留旧列属预期）：{name} {type}', { name: c.name, type: c.type }));
+    for (const c of structure.typeChanged) lines.push(t('类型不同（{kind}）：{name} 湖中 {lake}，源端 {source}', {
+      kind: c.widened ? t('源端放宽') : t('不兼容'), name: c.name, lake: c.lake, source: c.source,
+    }));
   }
   if (data?.keyed) {
-    lines.push(`按主键 ${data.keys.join('、')} 比对：源端 ${count(data.sourceRows)} 个，湖中回放后 ${count(data.lakeRows)} 个${data.syncedThrough ? `；最近一次同步到 ${data.syncedThrough}` : ''}`);
-    if (data.missing) lines.push(`湖中缺失 ${count(data.missing)} 个${samples(data.samples.missing, data.missing)}`);
-    if (data.pendingSync) lines.push(`同步后新增，待下次同步 ${count(data.pendingSync)} 个${samples(data.samples.pendingSync, data.pendingSync)}`);
-    if (data.extra) lines.push(`湖中多出（源端已删）${count(data.extra)} 个${samples(data.samples.extra, data.extra)}`);
+    lines.push(t('按主键 {keys} 比对：源端 {source} 个，湖中回放后 {lake} 个{synced}', {
+      keys: data.keys.join(t('、')), source: formatNumber(locale, data.sourceRows), lake: formatNumber(locale, data.lakeRows),
+      synced: data.syncedThrough ? t('；最近一次同步到 {at}', { at: data.syncedThrough }) : '',
+    }));
+    if (data.missing) lines.push(t('湖中缺失 {n} 个{samples}', { n: formatNumber(locale, data.missing), samples: samples(t, data.samples.missing, data.missing) }));
+    if (data.pendingSync) lines.push(t('同步后新增，待下次同步 {n} 个{samples}', { n: formatNumber(locale, data.pendingSync), samples: samples(t, data.samples.pendingSync, data.pendingSync) }));
+    if (data.extra) lines.push(t('湖中多出（源端已删）{n} 个{samples}', { n: formatNumber(locale, data.extra), samples: samples(t, data.samples.extra, data.extra) }));
   } else if (data) {
-    lines.push(`没有主键，按行数比较：源端 ${count(data.sourceRows)} 行，湖中回放后 ${count(data.lakeRows)} 行`);
+    lines.push(t('没有主键，按行数比较：源端 {source} 行，湖中回放后 {lake} 行', { source: formatNumber(locale, data.sourceRows), lake: formatNumber(locale, data.lakeRows) }));
   }
   if (!lines.length && !errors.length) return null;
   return (
     <details className="text-xs">
-      <summary className="cursor-pointer text-muted-foreground select-none">明细</summary>
+      <summary className="cursor-pointer text-muted-foreground select-none">{t('明细')}</summary>
       <ul className="mt-1 space-y-0.5 font-mono break-all whitespace-normal">
         {lines.map(l => <li key={l}>{l}</li>)}
         {errors.map(e => <li key={e} className="text-destructive">{e}</li>)}
@@ -718,17 +766,23 @@ function VerifyDetail({ t }: { t: VerifyRecord }) {
 }
 
 /** 核对结果的汇总：源端的表有几张进湖、没进湖的按原因计数，源端已删除的另计，以及有差异的表数 */
-function verifySummary(tables: VerifyRecord[], differences: number) {
-  const atSource = tables.filter(t => t.coverage !== 'gone');
-  const inLake = atSource.filter(t => t.coverage === 'in_lake').length;
+function verifySummary(t: T, tables: VerifyRecord[], differences: number) {
+  const atSource = tables.filter(row => row.coverage !== 'gone');
+  const inLake = atSource.filter(row => row.coverage === 'in_lake').length;
   const reasons = (Object.keys(LAKE_COVERAGE) as LakeCoverage[])
     .filter(c => c !== 'in_lake' && c !== 'gone')
-    .map(c => [c, atSource.filter(t => t.coverage === c).length] as const)
+    .map(c => [c, atSource.filter(row => row.coverage === c).length] as const)
     .filter(([, n]) => n)
-    .map(([c, n]) => `${LAKE_COVERAGE[c]} ${n} 张`);
+    .map(([c, n]) => t('{label} {n, plural, other {# 张}}', { label: builtinName(t, LAKE_COVERAGE[c], ENUM_LABELS), n }));
   const gone = tables.length - atSource.length;
-  return `源端 ${atSource.length} 张表：已进湖 ${inLake} 张，未进湖 ${atSource.length - inLake} 张${reasons.length ? `（${reasons.join('、')}）` : ''}`
-    + `${gone ? `；源端已删除 ${gone} 张` : ''}；有差异 ${differences} 张`;
+  return t('源端 {total, plural, other {# 张表}}：已进湖 {inLake, plural, other {# 张}}，未进湖 {missing, plural, other {# 张}}{reasons}{gone}；有差异 {diff, plural, other {# 张}}', {
+    total: atSource.length,
+    inLake,
+    missing: atSource.length - inLake,
+    reasons: reasons.length ? t('（{list}）', { list: reasons.join(t('、')) }) : '',
+    gone: gone ? t('；源端已删除 {n, plural, other {# 张}}', { n: gone }) : '',
+    diff: differences,
+  });
 }
 
 type VerifyView = Route.ComponentProps['loaderData']['verify'];
@@ -738,74 +792,76 @@ type VerifyView = Route.ComponentProps['loaderData']['verify'];
  * 结构或数据量有差异时可以立即触发一次主键比对同步（修复只走同步这一条写入路径）；只有文件的问题时主键比对修不了，只作说明
  */
 function LakeData({ verify, canWrite, submitting, busy }: { verify: VerifyView; canWrite: boolean; submitting: boolean; busy: boolean }) {
-  const reconcilable = verify.tables.some(t => passed(t.structure)?.ok === false || passed(t.data)?.ok === false);
+  const t = useT();
+  const locale = useLocale();
+  const reconcilable = verify.tables.some(row => passed(row.structure)?.ok === false || passed(row.data)?.ok === false);
   return (
     <section className="space-y-3">
-      <SectionHeader title="湖中数据" status={<StatusText tone={TASK_TONES[verify.status]} data-verify-status={verify.status}>{`核对${verify.statusLabel}`}</StatusText>}>
-        {`从源端的全部表出发，核对每张表的数据进了湖里的什么位置、文件是否真实存在、结构与数据量是否与源端一致。核对只读、只出报告，不修改湖中数据；每天自动核对一次。最近一次核对：${time(verify.verifiedAt)}`}
+      <SectionHeader title={t('湖中数据')} status={<StatusText tone={TASK_TONES[verify.status]} data-verify-status={verify.status}>{t('核对{status}', { status: builtinName(t, verify.statusLabel) })}</StatusText>}>
+        {t('从源端的全部表出发，核对每张表的数据进了湖里的什么位置、文件是否真实存在、结构与数据量是否与源端一致。核对只读、只出报告，不修改湖中数据；每天自动核对一次。最近一次核对：{at}', { at: when(locale, verify.verifiedAt) })}
       </SectionHeader>
       {verify.status === 'failed' && verify.error && (
-        <StatusText tone="bad">{`${time(verify.attemptedAt)} 提交的核对失败：${verify.error}`}</StatusText>
+        <StatusText tone="bad">{t('{at} 提交的核对失败：{error}', { at: when(locale, verify.attemptedAt), error: verify.error })}</StatusText>
       )}
       {canWrite && (
         <div className="flex gap-2">
           <Form method="post" preventScrollReset>
             <input type="hidden" name="intent" value="verify" />
-            <Button type="submit" variant="outline" disabled={submitting || busy}>{busy ? '同步或核对进行中…' : '核对'}</Button>
+            <Button type="submit" variant="outline" disabled={submitting || busy}>{busy ? t('同步或核对进行中…') : t('核对')}</Button>
           </Form>
           {reconcilable && (
             <Form method="post" preventScrollReset>
               <input type="hidden" name="intent" value="reconcile" />
-              <Button type="submit" disabled={submitting || busy}>立即主键比对</Button>
+              <Button type="submit" disabled={submitting || busy}>{t('立即主键比对')}</Button>
             </Form>
           )}
         </div>
       )}
       {verify.verifiedAt && (
         <StatusText tone={verify.differences ? 'bad' : 'ok'} data-verify-summary>
-          {verifySummary(verify.tables, verify.differences)}
+          {verifySummary(t, verify.tables, verify.differences)}
         </StatusText>
       )}
       {verify.differences > 0 && !reconcilable && (
         <div className="text-sm text-muted-foreground" data-files-only>
-          差异只在文件上（文件缺失、大小或尾部元数据不符、孤儿文件）：主键比对修不了，请联系运营者检查存储
+          {t('差异只在文件上（文件缺失、大小或尾部元数据不符、孤儿文件）：主键比对修不了，请联系运营者检查存储')}
         </div>
       )}
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead>表</TableHead>
-            <TableHead>覆盖</TableHead>
-            <TableHead>源端行数</TableHead>
-            <TableHead>位置</TableHead>
-            <TableHead>文件</TableHead>
-            <TableHead>结构</TableHead>
-            <TableHead>数据量</TableHead>
+            <TableHead>{t('表')}</TableHead>
+            <TableHead>{t('覆盖')}</TableHead>
+            <TableHead>{t('源端行数')}</TableHead>
+            <TableHead>{t('位置')}</TableHead>
+            <TableHead>{t('文件')}</TableHead>
+            <TableHead>{t('结构')}</TableHead>
+            <TableHead>{t('数据量')}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {verify.tables.map(t => (
-            <TableRow key={t.table} data-verify-table={t.table} data-coverage={t.coverage} data-verify-ok={t.ok === null ? undefined : String(t.ok)}>
+          {verify.tables.map(row => (
+            <TableRow key={row.table} data-verify-table={row.table} data-coverage={row.coverage} data-verify-ok={row.ok === null ? undefined : String(row.ok)}>
               <TableCell className="align-top">
-                <div className="font-mono font-medium">{t.table}</div>
-                <VerifyDetail t={t} />
+                <div className="font-mono font-medium">{row.table}</div>
+                <VerifyDetail record={row} />
               </TableCell>
               <TableCell className="align-top">
-                <StatusText tone={COVERAGE_TONES[t.coverage]}>{LAKE_COVERAGE[t.coverage]}</StatusText>
+                <StatusText tone={COVERAGE_TONES[row.coverage]}>{builtinName(t, LAKE_COVERAGE[row.coverage], ENUM_LABELS)}</StatusText>
               </TableCell>
               <TableCell className="align-top">
-                {t.sourceRows === null ? '—' : `${t.rowsEstimated ? '约 ' : ''}${count(t.sourceRows)}`}
+                {row.sourceRows === null ? '—' : row.rowsEstimated ? t('约 {n}', { n: formatNumber(locale, row.sourceRows) }) : formatNumber(locale, row.sourceRows)}
               </TableCell>
-              <TableCell className="align-top font-mono text-xs">{t.location ? `${t.location.schema}.${t.location.table}` : '—'}</TableCell>
-              <CheckCell name="files" check={t.files} summary={fileSummary} />
-              <CheckCell name="structure" check={t.structure} summary={structureSummary} />
-              <CheckCell name="data" check={t.data} summary={dataSummary} />
+              <TableCell className="align-top font-mono text-xs">{row.location ? `${row.location.schema}.${row.location.table}` : '—'}</TableCell>
+              <CheckCell name="files" check={row.files} summary={c => fileSummary(t, locale, c)} />
+              <CheckCell name="structure" check={row.structure} summary={c => structureSummary(t, c)} />
+              <CheckCell name="data" check={row.data} summary={c => dataSummary(t, locale, c)} />
             </TableRow>
           ))}
           {!verify.tables.length && (
             <TableRow>
               <TableCell colSpan={7} className="text-center text-muted-foreground">
-                {verify.status === 'queued' || verify.status === 'running' ? '正在核对…' : '还没有核对结果'}
+                {verify.status === 'queued' || verify.status === 'running' ? t('正在核对…') : t('还没有核对结果')}
               </TableCell>
             </TableRow>
           )}
@@ -815,12 +871,13 @@ function LakeData({ verify, canWrite, submitting, busy }: { verify: VerifyView; 
   );
 }
 
-/** 删除数据源：确认后提交；被挡时按钮禁用，旁边列出原因（ADR-0044） */
+/** 删除数据源：确认后提交；被挡时按钮禁用，旁边列出原因（ADR-0044，原因是服务端原文） */
 function DeleteSource({ name, blockers, submitting }: { name: string; blockers: string[]; submitting: boolean }) {
+  const t = useT();
   if (blockers.length) {
     return (
       <span className="flex items-center gap-2">
-        <Button type="button" variant="destructive" disabled><Trash2 />删除数据源</Button>
+        <Button type="button" variant="destructive" disabled><Trash2 />{t('删除数据源')}</Button>
         <span className="flex max-w-xs items-start gap-1 text-sm text-slate-500" data-delete-blockers>
           <Lock className="mt-0.5 size-3.5 shrink-0" />
           <span>{blockers.map(r => <span key={r} className="block">{r}</span>)}</span>
@@ -832,23 +889,24 @@ function DeleteSource({ name, blockers, submitting }: { name: string; blockers: 
     <Form
       method="post"
       onSubmit={e => {
-        if (!confirm(`确认删除数据源「${name}」？删除后不能恢复：同步范围、凭据与湖里的原始层都会删掉，标准层里已合并的行保留。`)) e.preventDefault();
+        if (!confirm(t('确认删除数据源「{name}」？删除后不能恢复：同步范围、凭据与湖里的原始层都会删掉，标准层里已合并的行保留。', { name }))) e.preventDefault();
       }}
     >
       <input type="hidden" name="intent" value="delete" />
-      <Button type="submit" variant="destructive" disabled={submitting}><Trash2 />删除数据源</Button>
+      <Button type="submit" variant="destructive" disabled={submitting}><Trash2 />{t('删除数据源')}</Button>
     </Form>
   );
 }
 
 /** 源视图：每个一张卡片（名称、已发布版本、草稿），可新建时末尾是虚线的新建卡片；没有源视图时说明它是什么，可新建时直接给出新建表单 */
 function SourceViews({ base, views, canWrite, submitting }: { base: string; views: SourceViewSummary[]; canWrite: boolean; submitting: boolean }) {
-  const intro = '源视图是一段只读本数据源原始层的 SELECT，用来把复杂的源表整理成可映射的形状。保存时在原始层上校验并预览，按双人发布规则由另一位成员发布。';
+  const t = useT();
+  const intro = t('源视图是一段只读本数据源原始层的 SELECT，用来把复杂的源表整理成可映射的形状。保存时在原始层上校验并预览，按双人发布规则由另一位成员发布。');
   if (!views.length) {
     return (
       <div className="space-y-3 py-6 text-center">
         <ScrollText className="mx-auto size-8 text-slate-300" />
-        <p className="mx-auto max-w-2xl text-sm text-slate-500">{`还没有源视图。${intro}`}</p>
+        <p className="mx-auto max-w-2xl text-sm text-slate-500">{t('还没有源视图。{intro}', { intro })}</p>
         {canWrite && <NewSourceViewForm action={`${base}/views/new`} submitting={submitting} />}
       </div>
     );
@@ -862,15 +920,15 @@ function SourceViews({ base, views, canWrite, submitting }: { base: string; view
             <span className="block truncate font-mono font-medium">{v.name}</span>
             <span className="mt-2 flex flex-wrap gap-3 text-sm">
               {v.published
-                ? <span className="inline-flex items-center gap-1 text-emerald-600"><CheckCircle2 className="size-3.5" />{`已发布 v${v.published}`}</span>
-                : <span className="text-slate-500">还没有发布</span>}
-              {v.draft && <span className="inline-flex items-center gap-1 text-amber-600"><PencilLine className="size-3.5" />{`草稿 v${v.draft}`}</span>}
+                ? <span className="inline-flex items-center gap-1 text-emerald-600"><CheckCircle2 className="size-3.5" />{t('已发布 v{version}', { version: v.published })}</span>
+                : <span className="text-slate-500">{t('还没有发布')}</span>}
+              {v.draft && <span className="inline-flex items-center gap-1 text-amber-600"><PencilLine className="size-3.5" />{t('草稿 v{version}', { version: v.draft })}</span>}
             </span>
           </Link>
         ))}
         {canWrite && (
           <Link to={`${base}/views/new`} className="flex items-center justify-center gap-2 rounded-2xl border border-dashed p-5 text-sm text-slate-500 hover:border-slate-400 hover:text-slate-900">
-            <Plus className="size-4" />新建源视图
+            <Plus className="size-4" />{t('新建源视图')}
           </Link>
         )}
       </div>
@@ -880,7 +938,9 @@ function SourceViews({ base, views, canWrite, submitting }: { base: string; view
 
 /** 概览页的「源端注释」区块（#524）：按 schema.表 分组，每组一张表列出列注释（表注释标「（表注释）」）；组与每行列注释带锚点，知识面板的证据链回这里 */
 function SourceComments({ comments }: { comments: CommentView[] }) {
-  if (!comments.length) return <div className="text-sm text-muted-foreground">还没有采集到源端注释</div>;
+  const t = useT();
+  const locale = useLocale();
+  if (!comments.length) return <div className="text-sm text-muted-foreground">{t('还没有采集到源端注释')}</div>;
   // comments 已按 schema、表、列排好序，这里顺序分组
   const groups: [string, CommentView[]][] = [];
   for (const c of comments) {
@@ -897,19 +957,19 @@ function SourceComments({ comments }: { comments: CommentView[] }) {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>列</TableHead>
-                <TableHead>原文</TableHead>
-                <TableHead>版本</TableHead>
-                <TableHead>采集时间</TableHead>
+                <TableHead>{t('列')}</TableHead>
+                <TableHead>{t('原文')}</TableHead>
+                <TableHead>{t('版本')}</TableHead>
+                <TableHead>{t('采集时间')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {rows.map(c => (
                 <TableRow key={`${c.tableName}:${c.columnName}`} id={c.columnName ? `comment-${group}.${c.columnName}` : undefined}>
-                  <TableCell className="font-mono">{c.columnName || '（表注释）'}</TableCell>
+                  <TableCell className="font-mono">{c.columnName || t('（表注释）')}</TableCell>
                   <TableCell className="max-w-xl whitespace-pre-wrap">{c.commentText}</TableCell>
                   <TableCell>{`v${c.version}`}</TableCell>
-                  <TableCell>{time(c.collectedAt)}</TableCell>
+                  <TableCell>{when(locale, c.collectedAt)}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
