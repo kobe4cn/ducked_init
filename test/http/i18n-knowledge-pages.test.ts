@@ -1,8 +1,8 @@
 // test/http/i18n-knowledge-pages.test.ts —— 知识库三个页面接入双语后的整页断言（#1048，ADR-0060）：
 // 英文界面（CRM_ENABLE_EN_LOCALE + crm_locale cookie）下 /knowledge、/knowledge/import 与 /knowledge/sources/:id
-// 写死的文字没有汉字：口径类型与状态（Unit: Not declared、Currency: Unknown）、知识源种类（Metric notes）与
+// 写死的文字没有汉字：口径类型与状态（Unit: Not declared、Currency: Not declared）、知识源种类（Metric notes）与
 // 更新时间的英文格式；中文界面下三页的原中文（单位：未声明、指标说明、更新于 …）都还在（验收标准 2）。
-// 指标描述、来源标题与正文等数据值不翻，夹具全 ASCII，整页断言不用剔数据值；只 GET 页面不写库，夹具共用一次 setup
+// 指标描述、来源标题与正文等数据值不翻，夹具全 ASCII；标准模型的字段名「实付金额」是数据，断言前换成 ASCII；只 GET 页面不写库，夹具共用一次 setup
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
