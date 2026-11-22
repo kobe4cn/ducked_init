@@ -15,9 +15,10 @@ import {
   adoptRelation, CustomEntityError, customEntityInputOf, deleteCustomEntity, discardCustomEntityDraft, getCustomEntity, isInferredDraft, publishCustomEntity, relationTargets, saveCustomEntityDraft,
   unpublishedMappingsOf,
 } from '~/.server/custom-entities';
-import { errorTextFor } from '~/.server/i18n';
+import { errorTextFor, formatServer } from '~/.server/i18n';
 import { handleKnowledgeIntent, isKnowledgeIntent, knowledgePanel } from '~/.server/knowledge/panel';
 import { entityRelationStats } from '~/.server/merges';
+import { getLocale } from '~/.server/locale';
 import { navFor } from '~/.server/nav';
 import { passthroughPair, publishPassthrough } from '~/.server/passthrough';
 import { PublishError, publishBlocker, publishReason } from '~/.server/publishing';
@@ -33,10 +34,16 @@ import { RelationSuggestionsCard } from '~/components/relation-suggestions-card'
 import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { builtinName, ENUM_LABELS } from '~/lib/builtin-names';
 import { CUSTOM_ENTITY_KINDS } from '~/lib/canonical-model';
+import { formatDateTime } from '~/lib/format';
+import { makeT, msg, useLocale, useT, type Locale, type T } from '~/lib/i18n';
 
-export function meta({ loaderData }: Route.MetaArgs) {
-  return [{ title: `${loaderData?.entity?.name ?? '自定义实体'} · CRM 数据分析平台` }];
+export function meta({ loaderData, matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
+  return [{ title: `${loaderData?.entity?.name ?? t('自定义实体')} · ${t('CRM 数据分析平台')}` }];
 }
 
 type Tab = 'edit' | 'versions';
@@ -81,8 +88,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         /** 当前成员发布不了这一版草稿的原因；可以发布或不是草稿时为 null */
         publishBlocker: publishReason(member, v, found.publishers),
       })),
-      /** 丢弃从没发布过的登记时一并丢弃的映射（目标是它、从没发布过） */
-      unpublishedMappings: unpublishedMappings.map(m => `「${m.source}」${m.table}`),
+      /** 丢弃从没发布过的登记时一并丢弃的映射（目标是它、从没发布过）；「源」表名在组件里按界面语言拼 */
+      unpublishedMappings: unpublishedMappings.map(m => ({ source: m.source, table: m.table })),
       /** 业务知识面板；从没发布过（不在目录里）时为 null */
       knowledge: system?.kind === 'entity' ? { targetId, system, panel: await knowledgePanel(member, targetId) } : null,
       /** 配套的映射草稿；登记发布过或没有时为 null。publishBlocker 是当前成员不能把两份一起发布的原因 */
@@ -117,7 +124,7 @@ export async function action({ request, params }: Route.ActionArgs) {
         throw redirect(base);
       case 'adoptRelation': {
         const [relation] = input.relations ?? [];
-        if (!relation) return data({ error: '没有要采纳的关系', intent: 'adoptRelation', input: null }, { status: 400 });
+        if (!relation) return data({ error: formatServer(await getLocale(request), msg('没有要采纳的关系')), intent: 'adoptRelation', input: null }, { status: 400 });
         await adoptRelation(await requirePermission(request, 'sources:write'), params.entityId, relation);
         throw redirect(base);
       }
@@ -139,7 +146,7 @@ export async function action({ request, params }: Route.ActionArgs) {
         await deleteCustomEntity(await requirePermission(request, 'publish'), params.entityId);
         throw redirect('/entities');
       default:
-        return data({ error: '未知操作', intent: null, input: null }, { status: 400 });
+        return data({ error: formatServer(await getLocale(request), msg('未知操作')), intent: null, input: null }, { status: 400 });
     }
   } catch (e) {
     // 保存、发布、丢弃经 publishing.ts（ADR-0051）：流程错误是 PublishError，CustomEntityError 是它的子类
@@ -153,18 +160,20 @@ export async function action({ request, params }: Route.ActionArgs) {
   throw redirect(`${base}${tab === 'edit' ? '' : `?tab=${tab}`}`);
 }
 
-const time = (iso: string | null) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
+const time = (locale: Locale, iso: string | null) => (iso ? formatDateTime(locale, iso) : '—');
 
 /** 编辑页对正在查看的版本的说明：只读、改草稿，或在已发布的版本上改成新草稿 */
-function editHint(canWrite: boolean, selected: { status: string }, draft: { version: number } | undefined) {
-  if (!canWrite) return '只读。';
-  if (selected.status === 'draft') return '保存后你是最后改这一版草稿的人，需由另一位数据工程师或管理员发布。';
-  if (draft) return `已发布的版本锁定。已有草稿 v${draft.version}，请在草稿上修改。`;
-  return '已发布的版本锁定，在这一版的基础上修改，保存为新的一版草稿。';
+function editHint(t: T, canWrite: boolean, selected: { status: string }, draft: { version: number } | undefined) {
+  if (!canWrite) return t('只读。');
+  if (selected.status === 'draft') return t('保存后你是最后改这一版草稿的人，需由另一位数据工程师或管理员发布。');
+  if (draft) return t('已发布的版本锁定。已有草稿 v{version}，请在草稿上修改。', { version: draft.version });
+  return t('已发布的版本锁定，在这一版的基础上修改，保存为新的一版草稿。');
 }
 
 export default function Entity({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, tab, canWrite, canDelete, entity, targets, suggestions, relationStats, inferred, referrers, version, versions, pair, unpublishedMappings, knowledge } = loaderData;
+  const t = useT();
+  const locale = useLocale();
   const submitting = useNavigation().state === 'submitting';
   const draft = versions.find(v => v.status === 'draft');
   const live = versions.find(v => v.status === 'published');
@@ -174,23 +183,27 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
     <AppShell email={email} nav={nav}>
       <PageHeader
         title={<span className="font-mono">{entity.name}</span>}
-        description={<Link to="/entities" className="hover:underline">← 全部自定义实体</Link>}
+        description={<Link to="/entities" className="hover:underline">{t('← 全部自定义实体')}</Link>}
         actions={(
           <div className="flex items-center gap-2">
-            {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : `这个自定义实体从没发布过，将被删除${unpublishedMappings.length ? `，目标是它的映射草稿一并丢弃：${unpublishedMappings.join('、')}` : ''}`} submitting={submitting} />}
+            {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? t('回到最近的已发布版本') : t('这个自定义实体从没发布过，将被删除{mappings}', {
+              mappings: unpublishedMappings.length ? t('，目标是它的映射草稿一并丢弃：{list}', {
+                list: unpublishedMappings.map(m => t('「{source}」{table}', { source: m.source, table: m.table })).join(t('、')),
+              }) : '',
+            })} submitting={submitting} />}
             {canDelete && (referrers.length ? (
               <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-delete-blocker>
-                <Lock className="size-3.5 shrink-0" />{`被已发布的映射、关系或指标引用，不能删除：${referrers.join('、')}`}
+                <Lock className="size-3.5 shrink-0" />{t('被已发布的映射、关系或指标引用，不能删除：{list}', { list: referrers.join(t('、')) })}
               </span>
             ) : (
               <Form
                 method="post"
                 onSubmit={e => {
-                  if (!confirm(`删除自定义实体 ${entity.name}？所有版本一并删除，不能恢复。`)) e.preventDefault();
+                  if (!confirm(t('删除自定义实体 {name}？所有版本一并删除，不能恢复。', { name: entity.name }))) e.preventDefault();
                 }}
               >
                 <input type="hidden" name="intent" value="delete" />
-                <Button type="submit" variant="destructive" disabled={submitting}><Trash2 />删除实体</Button>
+                <Button type="submit" variant="destructive" disabled={submitting}><Trash2 />{t('删除实体')}</Button>
               </Form>
             ))}
           </div>
@@ -199,25 +212,25 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
       {actionData?.error && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />
-          <AlertTitle>{actionData.intent === 'delete' ? '未删除' : '未保存'}</AlertTitle>
+          <AlertTitle>{actionData.intent === 'delete' ? t('未删除') : t('未保存')}</AlertTitle>
           <AlertDescription>{actionData.error}</AlertDescription>
         </Alert>
       )}
       {inferred && (
         <Alert data-inferred>
           <Info />
-          <AlertTitle>推断登记 · 待确认</AlertTitle>
-          <AlertDescription>这份登记由已发布映射推断，请核对字段、类型和主键后保存确认；主键和已发布字段在发布后不能改。</AlertDescription>
+          <AlertTitle>{t('推断登记 · 待确认')}</AlertTitle>
+          <AlertDescription>{t('这份登记由已发布映射推断，请核对字段、类型和主键后保存确认；主键和已发布字段在发布后不能改。')}</AlertDescription>
         </Alert>
       )}
       {pair && (
         <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border bg-white p-6 shadow-sm" data-passthrough-pair>
           <div className="space-y-1">
-            <p className="text-sm text-slate-500">配套的映射草稿</p>
+            <p className="text-sm text-slate-500">{t('配套的映射草稿')}</p>
             <Link to={`/mappings/${pair.mappingId}`} className="flex items-center gap-2 font-semibold hover:underline">
               {pair.sourceName}<span className="font-mono">{pair.table}</span><ArrowRight className="size-4 text-slate-400" /><span className="font-mono">{entity.name}</span>
             </Link>
-            <p className="max-w-2xl text-sm text-slate-500">登记与映射一起发布后合并入标准层。发布后只能新增字段，主键和字段类型以后都不能改。</p>
+            <p className="max-w-2xl text-sm text-slate-500">{t('登记与映射一起发布后合并入标准层。发布后只能新增字段，主键和字段类型以后都不能改。')}</p>
           </div>
           {pair.publishBlocker ? (
             <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-publish-blocker><Lock className="size-3.5 shrink-0" />{pair.publishBlocker}</span>
@@ -227,7 +240,7 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
               <input type="hidden" name="version" value={1} />
               <input type="hidden" name="mappingId" value={pair.mappingId} />
               <input type="hidden" name="mappingVersion" value={pair.version} />
-              <Button type="submit" disabled={submitting}><Upload />登记与映射一起发布</Button>
+              <Button type="submit" disabled={submitting}><Upload />{t('登记与映射一起发布')}</Button>
             </Form>
           )}
         </div>
@@ -235,16 +248,16 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
       <PillTabs
         current={tab}
         tabs={[
-          { key: 'edit', label: '编辑', href: base },
-          { key: 'versions', label: `版本（${versions.length}）`, href: `${base}?tab=versions` },
+          { key: 'edit', label: t('编辑'), href: base },
+          { key: 'versions', label: t('版本（{n}）', { n: versions.length }), href: `${base}?tab=versions` },
         ]}
       />
       <div className="rounded-2xl border bg-white p-6 shadow-sm">
         {tab === 'edit' && selected && (
           <>
             <div className="mb-4 space-y-1">
-              <div className="flex items-center gap-2 text-sm text-slate-500">正在查看 <span className="font-mono font-semibold text-slate-900">{`v${selected.version}`}</span><VersionStatus v={selected} /></div>
-              <p className="max-w-2xl text-sm text-slate-500">{editHint(canWrite, selected, draft)}</p>
+              <div className="flex items-center gap-2 text-sm text-slate-500">{t('正在查看')} <span className="font-mono font-semibold text-slate-900">{`v${selected.version}`}</span><VersionStatus v={selected} /></div>
+              <p className="max-w-2xl text-sm text-slate-500">{editHint(t, canWrite, selected, draft)}</p>
             </div>
             {canWrite && (selected.status === 'draft' || !draft) ? (
               <CustomEntityForm
@@ -254,11 +267,11 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
                 values={actionData?.input ?? selected}
                 targets={targets}
                 submitting={submitting}
-                submitLabel={selected.status === 'draft' ? '保存草稿' : '保存为新草稿'}
+                submitLabel={selected.status === 'draft' ? t('保存草稿') : t('保存为新草稿')}
               />
             ) : (
               <>
-                <p className="mb-4 text-sm">{`${selected.label} · ${CUSTOM_ENTITY_KINDS[selected.kind]} · 主键 `}<span className="font-mono">{selected.primaryKey.join(', ')}</span></p>
+                <p className="mb-4 text-sm">{`${selected.label} · ${builtinName(t, CUSTOM_ENTITY_KINDS[selected.kind], ENUM_LABELS)} · ${t('主键')} `}<span className="font-mono">{selected.primaryKey.join(', ')}</span></p>
                 <EntityFieldsTable fields={selected.fields} primaryKey={selected.primaryKey} />
                 <EntityRelationsTable relations={selected.relations} />
               </>
@@ -267,14 +280,14 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
         )}
         {tab === 'versions' && (
           <>
-            <p className="mb-4 max-w-2xl text-sm text-slate-500">已发布的版本锁定，修改会形成新的一版草稿；草稿需由最后保存它的人以外的另一位数据工程师或管理员发布，也可以丢弃。</p>
+            <p className="mb-4 max-w-2xl text-sm text-slate-500">{t('已发布的版本锁定，修改会形成新的一版草稿；草稿需由最后保存它的人以外的另一位数据工程师或管理员发布，也可以丢弃。')}</p>
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>版本</TableHead>
-                  <TableHead>状态</TableHead>
-                  <TableHead>作者</TableHead>
-                  <TableHead>发布</TableHead>
+                  <TableHead>{t('版本')}</TableHead>
+                  <TableHead>{t('状态')}</TableHead>
+                  <TableHead>{t('作者')}</TableHead>
+                  <TableHead>{t('发布')}</TableHead>
                   <TableHead />
                 </TableRow>
               </TableHeader>
@@ -283,10 +296,10 @@ export default function Entity({ loaderData, actionData }: Route.ComponentProps)
                   <TableRow key={v.version} data-version={v.version} data-version-status={v.status}>
                     <TableCell className="font-mono font-semibold">{`v${v.version}`}</TableCell>
                     <TableCell><VersionStatus v={v} /></TableCell>
-                    <TableCell className="text-sm">{v.authors.join('、')}</TableCell>
-                    <TableCell className="text-sm text-slate-500">{v.publishedByEmail ? `${v.publishedByEmail}，${time(v.publishedAt)}` : '—'}</TableCell>
+                    <TableCell className="text-sm">{v.authors.join(t('、'))}</TableCell>
+                    <TableCell className="text-sm text-slate-500">{v.publishedByEmail ? `${v.publishedByEmail}${t('，')}${time(locale, v.publishedAt)}` : '—'}</TableCell>
                     <TableCell className="text-right">
-                      <Button asChild size="sm" variant="ghost"><Link to={`${base}?version=${v.version}`}>查看</Link></Button>
+                      <Button asChild size="sm" variant="ghost"><Link to={`${base}?version=${v.version}`}>{t('查看')}</Link></Button>
                     </TableCell>
                   </TableRow>
                 ))}
