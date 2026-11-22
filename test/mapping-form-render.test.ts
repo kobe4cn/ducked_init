@@ -8,7 +8,6 @@ import { MappingForm } from '../app/components/mapping-form';
 import { LiveMappingIssues, type MappingIssueView } from '../app/components/mapping-editor';
 import type { ReferenceTable } from '../app/components/mapping-reference';
 import { entityOf } from '../app/lib/canonical-model';
-import { TRANSFORMS } from '../app/lib/mapping-form';
 import { I18nProvider, makeT } from '../app/lib/i18n';
 import enClient from '../app/i18n/en.client.json';
 
@@ -136,12 +135,10 @@ fields:
     I18nProvider,
     { t: makeT('en', enClient), locale: 'en' as const, children: createElement(MappingForm, { yaml, entity: 'order', table: t, functions: [], issues, onChange: () => {}, onEditYaml: () => {} }) },
   ));
-  /** 输出里仍是中文的数据（order 各字段的说明、lib 给的只读 reason、issue message、lib 的 TRANSFORMS 选项文字）随 #932 翻译，按原文逐个去掉再断言界面文字；组件写死的选项文字不去掉 */
-  const stripData = (html: string) => [
-    ...entityOf('order')!.fields.map(f => f.description),
-    ...TRANSFORMS.map(tr => tr.label),
-    '这种写法表单不认识，请在 YAML 里修改',
-  ].reduce((out, zh) => out.split(zh).join(''), html)
+  /** 输出里仍是中文的数据只有 order 各字段的说明（随 #932 翻译），按原文逐个去掉再断言界面文字；
+   *  常用转换的名称 / 参数说明与只读 reason 已随 #1043 按界面语言出文字，不用再去掉 */
+  const stripData = (html: string) => entityOf('order')!.fields.map(f => f.description)
+    .reduce((out, zh) => out.split(zh).join(''), html)
     .replace(/<p data-live-issue[\s\S]*?<\/p>/g, '');
 
   it('表单的标签、按钮与提示是英文，标准字段名与类型按界面语言显示；提交的值仍是代码名', () => {
@@ -156,10 +153,15 @@ fields:
     expect(html).toContain('Key space');
     expect(html).toContain('Extension fields');
     expect(html).toContain('Required (dedupe key)');
-    // 组件写死的选项文字是英文（stripData 只去掉 lib 的 TRANSFORMS 文字，不去掉这些）
+    // 组件写死的选项文字是英文
     expect(html).toContain('>Unmap</option>');
     expect(html).toContain('>Pick a source column…</option>');
-    // 表单提交的值不因界面语言改变：字段类型的 option value 仍是代码名（转换的 option 文字是 lib 数据，随 #932 翻译，已被 stripData 按 TRANSFORMS 原文去掉）
+    // 常用转换的名称经 transformText 出英文，option 的 value 仍是代码名；只读说明（lib 的 reason）经 msgText 出英文
+    expect(html).toContain('>Direct value</option>');
+    expect(html).toContain('>Cents to yuan (divide by 100)</option>');
+    expect(html).toContain('The form does not recognize this notation; edit it in the YAML');
+    // 表单提交的值不因界面语言改变：字段类型与常用转换的 option value 仍是代码名
+    expect(html).toContain('value="direct"');
     expect(html).toContain('value="string"');
     expect(html).toContain('value="integer"');
   });
@@ -184,6 +186,14 @@ fields:
     const empty = stripData(renderEn('model: 1\nentity: order\ntable: orders\nfields:\n  order_id: order_no\n', null));
     expect(empty).not.toMatch(/[一-鿿]/);
     expect(empty).toContain('No source table to compare against; write extension fields in the YAML');
+  });
+
+  it('带参数的常用转换：参数名与单位选项出英文，提交值仍是代码值 seconds / millis', () => {
+    const epoch = stripData(renderEn('model: 1\nentity: order\ntable: orders\nfields:\n  order_id: order_no\n  created_at: from_epoch_seconds(created_at)\n', null));
+    expect(epoch).not.toMatch(/[一-鿿]/);
+    expect(epoch).toContain('aria-label="Unit"');
+    expect(epoch).toMatch(/<option[^>]*value="seconds"[^>]*>Seconds<\/option>/);
+    expect(epoch).toMatch(/<option[^>]*value="millis"[^>]*>Milliseconds<\/option>/);
   });
 });
 

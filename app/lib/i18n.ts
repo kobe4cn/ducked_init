@@ -38,10 +38,16 @@ function format(pattern: string, locale: Locale, params?: Record<string, unknown
   return typeof out === 'string' ? out : out.join('');
 }
 
-/** 按界面语言出字符串：英文界面查词典，中文界面、词典缺键或词典未下发（null）时回退中文原文，变量照常代入 */
+/** 参数值是不是 Msg（有 key 的对象）：嵌套句式（如报错里的 reason）按同一语言先翻出来再代入 */
+const isMsg = (v: unknown): v is Msg => typeof v === 'object' && v !== null && 'key' in v && typeof (v as Msg).key === 'string';
+
+/** 按界面语言出字符串：英文界面查词典，中文界面、词典缺键或词典未下发（null）时回退中文原文，变量照常代入；
+ *  参数值本身是 Msg 时按同一语言递归翻译再代入（嵌套报错整句可译，中文逐字不变） */
 export function translate(locale: Locale, messages: Record<string, string> | null, key: string, params?: Record<string, unknown>): string {
   const en = locale === 'en' ? messages?.[key] : undefined;
-  return typeof en === 'string' && en !== key ? format(en, 'en', params) : format(key, 'zh-CN', params);
+  const pattern = typeof en === 'string' && en !== key ? en : key;
+  const vars = params && Object.fromEntries(Object.entries(params).map(([k, v]) => [k, isMsg(v) ? translate(locale, messages, v.key, v.params) : v]));
+  return format(pattern, locale, vars);
 }
 
 /** 在服务端或 meta 里构造翻译函数；组件里用 useT() */

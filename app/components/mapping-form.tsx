@@ -15,10 +15,11 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
 import { entityOf, FIELD_TYPE_NAMES, FIELD_TYPES, KEY_SPACE_PATTERN, type CanonicalEntity, type CanonicalField, type FieldType } from '~/lib/canonical-model';
-import { ExprError, parseExpression } from '~/lib/mapping-expr';
+import { parseExpression } from '~/lib/mapping-expr';
 import { builtinName, CANONICAL_NAMES, ENUM_LABELS } from '~/lib/builtin-names';
-import { msgText, useT, type T } from '~/lib/i18n';
+import { msgText, MsgError, useT, type T } from '~/lib/i18n';
 import { functionText } from '~/lib/mapping-functions-text';
+import { transformText } from '~/lib/mapping-transforms-text';
 import {
   dictionaryRows, expressionOf, extensionNameProblem, formUnavailable, groupIssues, identityCandidates, keySpaceOf, newExtension, readExtensions, readForm, readIdentity,
   readKeySpace, readSurvivorship, seedDictionary, TRANSFORMS, unusedColumns, writeExtension, writeField, writeIdentity, writeKeySpace, writeSurvivorship, writtenDictionary,
@@ -82,7 +83,7 @@ export function MappingForm({ yaml, entity, table, functions, focus, issues = []
     if (focused) document.getElementById(fieldId(focused))?.scrollIntoView({ block: 'center' });
   }, [focused]);
   const unavailable = formUnavailable(doc, entity);
-  if (unavailable) return <Notice onEditYaml={onEditYaml}>{unavailable}</Notice>;
+  if (unavailable) return <Notice onEditYaml={onEditYaml}>{msgText(t, unavailable)}</Notice>;
   const target = entityOf(entity)!;
   const write = (field: string, choice: FieldChoice | null) => {
     // writeField 会改 Document，另解析一份，不动渲染用的 doc
@@ -177,12 +178,13 @@ const keySpaceProblem = (t: T, keySpace?: string | null) =>
 const rankProblem = (t: T, rank: string) =>
   rank.trim() && !/^[1-9]\d*$/.test(rank.trim()) ? t('名次是正整数，如 1、2、3') : null;
 
-/** 选择还缺什么（给出时不写进 YAML）；写得出表达式时为 null。TRANSFORMS 的参数名、parseExpression 的报错是 lib 给的数据，随 #932 */
+/** 选择还缺什么（给出时不写进 YAML）；写得出表达式时为 null。转换的参数名经 transformText、parseExpression 与 lib 抛的错经 msgText 按界面语言出文字 */
 function missing(t: T, choice: FieldChoice, type: FieldType): string | null {
   const def = transformOf(choice.transform);
+  const text = transformText(t, def);
   if (def.column && !choice.column) return t('选一个源列');
-  const arg = def.args.find((a, i) => !a.optional && !choice.args?.[i]?.trim());
-  if (arg) return t('填写{label}', { label: arg.label });
+  const at = def.args.findIndex((a, i) => !a.optional && !choice.args?.[i]?.trim());
+  if (at >= 0) return t('填写{label}', { label: text.args[at].label });
   if (choice.transform === 'concat') {
     if (!choice.parts?.length) return t('至少加一段源列或文本');
     if (choice.parts.some(p => 'column' in p && !p.column)) return t('每段源列都要选一列');
@@ -197,9 +199,9 @@ function missing(t: T, choice: FieldChoice, type: FieldType): string | null {
     parseExpression(expressionOf(choice, type));
     return null;
   } catch (e) {
-    // ExprError 带句式：英文界面出英文（msgText）；其他错误照旧出 message
-    const text = e instanceof ExprError ? msgText(t, e.detail) : (e as Error).message;
-    return choice.transform === 'custom' ? t('表达式有误：{message}', { message: text }) : text;
+    // MsgError 带句式（ExprError 与 lib 抛的错）：英文界面出英文（msgText）；其他错误照旧出 message
+    const problem = e instanceof MsgError ? msgText(t, e.detail) : (e as Error).message;
+    return choice.transform === 'custom' ? t('表达式有误：{message}', { message: problem }) : problem;
   }
 }
 
@@ -295,6 +297,8 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
     });
   };
   const def = choice && transformOf(choice.transform);
+  // def 的名称与参数说明按界面语言出（msg / 报错也用同一批词条）
+  const defText = def ? transformText(t, def) : null;
 
   return (
     <div id={fieldId(field.name)} data-form-field={field.name} data-readonly={form.readonly || undefined} className={`space-y-2 p-3 ${unmapped ? 'bg-destructive/10' : ''}`}>
@@ -314,7 +318,7 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
         <div className="space-y-1">
           {form.raw && <code className="block rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap">{form.raw}</code>}
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <span>{form.reason}</span>
+            <span>{form.reason ? msgText(t, form.reason) : null}</span>
             <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
           </div>
         </div>
@@ -322,7 +326,7 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
         <div className="flex flex-wrap items-center gap-2">
           <NativeSelect size="sm" aria-label={t('{name} 的转换', { name: field.name })} value={choice?.transform ?? ''} onChange={e => switchTo(e.target.value as TransformId | '')}>
             <NativeSelectOption value="">{t('不对应')}</NativeSelectOption>
-            {TRANSFORMS.map(tr => <NativeSelectOption key={tr.id} value={tr.id}>{tr.label}</NativeSelectOption>)}
+            {TRANSFORMS.map(tr => <NativeSelectOption key={tr.id} value={tr.id}>{transformText(t, tr).label}</NativeSelectOption>)}
           </NativeSelect>
           {choice && def?.column && (
             <ColumnPicker label={t('{name} 的源列', { name: field.name })} table={table} value={choice.column ?? ''} onChange={column => setColumn(choice, column)} />
@@ -330,12 +334,14 @@ function FieldRow({ entity, form, field, table, functions, keySpaces, customerSo
           {choice && def?.args.map((a, i) => {
             const value = choice.args?.[i] ?? '';
             const set = (v: string) => update({ ...choice, args: def.args.map((_, j) => (j === i ? v : (choice.args?.[j] ?? ''))) });
+            // 参数名、提示与单位选项文字经 transformText 按界面语言出；key 与提交的 value 仍用 lib 数据
+            const arg = defText!.args[i];
             return a.options ? (
-              <NativeSelect key={a.label} size="sm" aria-label={a.label} value={value} onChange={e => set(e.target.value)}>
-                {a.options.map(o => <NativeSelectOption key={o.value} value={o.value}>{o.label}</NativeSelectOption>)}
+              <NativeSelect key={a.label} size="sm" aria-label={arg.label} value={value} onChange={e => set(e.target.value)}>
+                {a.options.map((o, j) => <NativeSelectOption key={o.value} value={o.value}>{arg.options?.[j]?.label ?? o.label}</NativeSelectOption>)}
               </NativeSelect>
             ) : (
-              <Input key={a.label} className="h-7 w-56" aria-label={a.label} placeholder={a.hint ?? a.label} title={a.hint} value={value} onChange={e => set(e.target.value)} />
+              <Input key={a.label} className="h-7 w-56" aria-label={arg.label} placeholder={arg.hint ?? arg.label} title={arg.hint} value={value} onChange={e => set(e.target.value)} />
             );
           })}
           {choice?.transform === 'concat' && <PartsEditor table={table} parts={choice.parts ?? []} onChange={parts => update({ ...choice, parts })} />}
@@ -435,7 +441,7 @@ function Extensions({ doc, table, origins, issues, onWrite, onEditYaml }: {
       </div>
       {reason ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span>{reason}</span>
+          <span>{reason ? msgText(t, reason) : null}</span>
           <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       ) : (
@@ -501,7 +507,11 @@ function ExtensionRow({ form, others, origins, customerSourceOptions, issues, on
   }
   const targetOf = (d: typeof draft) => (d.type === 'string' && !d.sensitive ? origins[d.name] : undefined);
   const target = targetOf(draft);
-  const problemOf = (d: typeof draft) => extensionNameProblem(d.name, others) ?? (targetOf(d) ? keySpaceProblem(t, d.keySpace) : null);
+  // 名字的问题是 lib 给的句式（msgText 按界面语言出文字），键空间的问题已是文字
+  const problemOf = (d: typeof draft) => {
+    const name = extensionNameProblem(d.name, others);
+    return (name && msgText(t, name)) ?? (targetOf(d) ? keySpaceProblem(t, d.keySpace) : null);
+  };
   const problem = problemOf(draft);
   const update = (next: typeof draft) => {
     setDraft(next);
@@ -563,7 +573,7 @@ function ExtensionRow({ form, others, origins, customerSourceOptions, issues, on
       {form.dictionary && !form.readonly && <div className="text-xs text-muted-foreground">{t('带值字典或兜底，请在 YAML 里修改对照')}</div>}
       {form.readonly && (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span>{form.reason}</span>
+          <span>{form.reason ? msgText(t, form.reason) : null}</span>
           <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       )}
@@ -632,7 +642,7 @@ function Identity({ doc, entity, issues, onWrite, onEditYaml }: {
       </div>
       {reason ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span>{reason}</span>
+          <span>{reason ? msgText(t, reason) : null}</span>
           <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       ) : (
@@ -701,7 +711,7 @@ function Survivorship({ doc, issues, onWrite, onEditYaml }: {
       </div>
       {reason ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span>{reason}</span>
+          <span>{reason ? msgText(t, reason) : null}</span>
           <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       ) : (

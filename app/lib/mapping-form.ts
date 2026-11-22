@@ -13,6 +13,7 @@
 import { isMap, isScalar, isSeq, YAMLMap, YAMLSeq, type Document, type Scalar } from 'yaml';
 import { entityOf, EXTENSION_PATTERN, FIELD_TYPE_NAMES, type CanonicalEntity, type CanonicalField, type FieldType } from './canonical-model';
 import { extensionName, standardValue } from './field-synonyms';
+import { type Msg, msg, MsgError } from './i18n';
 import { ExprError, extensionSpec, lit, parseExpression, ref, referencedColumns, type Expr } from './mapping-expr';
 
 export type TransformId = 'direct' | 'cents' | 'text' | 'timezone' | 'parse' | 'epoch' | 'concat' | 'fixed' | 'custom';
@@ -95,13 +96,13 @@ export interface FieldForm {
   /** 跨源引用的数据源名字，只在 YAML 里写了时有这一项 */
   customerSource?: string;
   readonly: boolean;
-  /** 只读的原因 */
-  reason?: string;
+  /** 只读的原因（句式，展示时 msgText 按界面语言出文字） */
+  reason?: Msg;
   /** 草稿写在行尾注释里的依据（同名、同义词、格式等） */
   basis?: string;
 }
 
-const UNKNOWN = '这种写法表单不认识，请在 YAML 里修改';
+const UNKNOWN = msg('这种写法表单不认识，请在 YAML 里修改');
 
 /** 解析后的表达式对应到常用转换；对不上的是自定义表达式 */
 function recognize(e: Expr): Pick<FieldForm, 'transform' | 'column' | 'args' | 'parts'> {
@@ -132,8 +133,9 @@ function recognize(e: Expr): Pick<FieldForm, 'transform' | 'column' | 'args' | '
 export function expressionOf(choice: FieldChoice, type?: FieldType): string {
   const { transform, args = [] } = choice;
   const def = TRANSFORMS.find(t => t.id === transform);
-  if (!def) throw new Error(`不认识的转换：${transform}`);
-  if (def.column && !choice.column) throw new Error(`${def.label}要选一个源列`);
+  if (!def) throw new MsgError(msg('不认识的转换：{transform}', { transform }));
+  // 转换名（TRANSFORMS 的中文 label）作为嵌套 Msg 参数（{ key } 即 Msg），英文由 transformText 的同一批词条翻译
+  if (def.column && !choice.column) throw new MsgError(msg('{transform}要选一个源列', { transform: { key: def.label } }));
   const col = choice.column ? ref(choice.column) : '';
   switch (transform) {
     case 'direct': return col;
@@ -146,7 +148,7 @@ export function expressionOf(choice: FieldChoice, type?: FieldType): string {
     case 'fixed': return lit(args[0] ?? '');
     case 'custom': {
       const raw = (choice.raw ?? '').trim();
-      if (!raw) throw new Error('自定义表达式不能为空');
+      if (!raw) throw new MsgError(msg('自定义表达式不能为空'));
       return raw;
     }
   }
@@ -155,8 +157,8 @@ export function expressionOf(choice: FieldChoice, type?: FieldType): string {
 /** 有标准枚举的文本字段：表单给它值对照与兜底 */
 export const isEnumField = (field?: CanonicalField) => field?.type === 'string' && !!field.enum;
 
-/** 对象写法里的值字典与兜底值；写法表单不认识时是原因 */
-function readDictionary(value: YAMLMap): Pick<FieldForm, 'dictionary' | 'otherwise'> | string {
+/** 对象写法里的值字典与兜底值；写法表单不认识时是原因（Msg，用 'key' in read 判断） */
+function readDictionary(value: YAMLMap): Pick<FieldForm, 'dictionary' | 'otherwise'> | Msg {
   const node = value.get('dictionary', true);
   const dictionary: DictionaryEntry[] = [];
   if (isMap(node)) {
@@ -181,13 +183,13 @@ function locate(doc: Document, standard: CanonicalField | undefined, field: stri
   const form: FieldForm = { field, required, transform: null, column: null, args: [], raw: '', readonly: false, ...(isEnumField(standard) && { dictionary: [] }) };
   const fields = doc.get('fields', true);
   if (fields != null && !isMap(fields) && !(isScalar(fields) && fields.value == null)) {
-    return { form: { ...form, readonly: true, reason: 'fields 下不是字段表，请在 YAML 里修改' } };
+    return { form: { ...form, readonly: true, reason: msg('fields 下不是字段表，请在 YAML 里修改') } };
   }
   const value = isMap(fields) ? fields.items.find(p => isScalar(p.key) && p.key.value === field)?.value : undefined;
   if (value == null || (isScalar(value) && value.value == null)) return { form };
 
   let node: unknown = value;
-  let reason: string | undefined;
+  let reason: Msg | undefined;
   // 对象写法里表达式之外表单认识的项：值对照、兜底、键空间与跨源引用的数据源
   let extras: Pick<FieldForm, 'dictionary' | 'otherwise' | 'keySpace' | 'customerSource'> = {};
   if (isMap(value)) {
@@ -199,8 +201,8 @@ function locate(doc: Document, standard: CanonicalField | undefined, field: stri
     else if (keys.includes('key_space') && typeof keySpace !== 'string') reason = UNKNOWN;
     else if (keys.includes('customer_source') && typeof customerSource !== 'string') reason = UNKNOWN;
     else if (keys.includes('dictionary') || keys.includes('otherwise')) {
-      const read = isEnumField(standard) ? readDictionary(value) : '非枚举字段带值字典或兜底值（dictionary / otherwise），请在 YAML 里修改';
-      if (typeof read === 'string') reason = read;
+      const read = isEnumField(standard) ? readDictionary(value) : msg('非枚举字段带值字典或兜底值（dictionary / otherwise），请在 YAML 里修改');
+      if ('key' in read) reason = read;
       else extras = read;
     }
     if (typeof keySpace === 'string') extras = { ...extras, keySpace };
@@ -215,7 +217,8 @@ function locate(doc: Document, standard: CanonicalField | undefined, field: stri
     return { form: { ...form, ...recognize(parseExpression(raw)), raw, ...extras, readonly: !!reason, reason, basis }, ...(!reason && { node, spec }) };
   } catch (e) {
     if (!(e instanceof ExprError)) throw e;
-    return { form: { ...form, transform: 'custom', raw, readonly: true, reason: reason ?? `表达式有误（${e.message}），请在 YAML 里修改`, basis } };
+    // ExprError 的 detail 作为嵌套参数：英文界面整句英文，中文逐字不变
+    return { form: { ...form, transform: 'custom', raw, readonly: true, reason: reason ?? msg('表达式有误（{error}），请在 YAML 里修改', { error: e.detail }), basis } };
   }
 }
 
@@ -275,7 +278,7 @@ export function dictionaryRows(entityName: string, fieldName: string, entries: D
 export function writeField(doc: Document, entity: CanonicalEntity, field: string, choice: FieldChoice | null): void {
   const standard = entity.fields.find(f => f.name === field);
   const { form, node, spec } = locate(doc, standard, field, false);
-  if (form.readonly) throw new Error(`${field}：${form.reason}`);
+  if (form.readonly) throw new MsgError(msg('{name}：{reason}', { name: field, reason: form.reason ?? UNKNOWN }));
   const fields = doc.get('fields', true);
   if (!choice) {
     if (isMap(fields)) fields.delete(field);
@@ -384,7 +387,8 @@ export interface ExtensionForm {
   keySpace?: string;
   customerSource?: string;
   readonly: boolean;
-  reason?: string;
+  /** 只读的原因（句式，展示时 msgText 按界面语言出文字） */
+  reason?: Msg;
 }
 
 /** 表单上对一个扩展字段的选择（name 是改名后的名字）；交给 writeExtension 写回 YAML */
@@ -396,11 +400,11 @@ export interface ExtensionChoice {
 
 const EXTENSION_KEYS = ['type', 'expr', 'label', 'dictionary', 'otherwise', 'sensitive', 'key_space', 'customer_source'];
 
-/** extensions 下的字段表；没写时都没有，写的不是字段表时是原因 */
-function extensionsMap(doc: Document): { map?: YAMLMap; reason?: string } {
+/** extensions 下的字段表；没写时都没有，写的不是字段表时是原因（Msg） */
+function extensionsMap(doc: Document): { map?: YAMLMap; reason?: Msg } {
   const node = doc.get('extensions', true);
   if (node == null || (isScalar(node) && node.value == null)) return {};
-  return isMap(node) ? { map: node } : { reason: 'extensions 下不是字段表，请在 YAML 里修改' };
+  return isMap(node) ? { map: node } : { reason: msg('extensions 下不是字段表，请在 YAML 里修改') };
 }
 
 function readExtension(name: string, value: unknown): ExtensionForm {
@@ -427,23 +431,23 @@ function readExtension(name: string, value: unknown): ExtensionForm {
     || (value.has('key_space') && typeof keySpace !== 'string') || (value.has('customer_source') && typeof customerSource !== 'string')) {
     return { ...read, readonly: true, reason: UNKNOWN };
   }
-  if (!read.type) return { ...read, readonly: true, reason: `类型 ${String(type)} 不是标准层的类型，请在 YAML 里修改` };
+  if (!read.type) return { ...read, readonly: true, reason: msg('类型 {type} 不是标准层的类型，请在 YAML 里修改', { type: String(type) }) };
   return read;
 }
 
 const pairName = (key: unknown) => (isScalar(key) ? String(key.value) : '');
 
-/** YAML 里的扩展字段（按 YAML 里的顺序）；extensions 写的不是字段表时只有原因 */
-export function readExtensions(doc: Document): { extensions: ExtensionForm[]; reason?: string } {
+/** YAML 里的扩展字段（按 YAML 里的顺序）；extensions 写的不是字段表时只有原因（Msg） */
+export function readExtensions(doc: Document): { extensions: ExtensionForm[]; reason?: Msg } {
   const { map, reason } = extensionsMap(doc);
   return { extensions: map?.items.map(p => readExtension(pairName(p.key), p.value)) ?? [], ...(reason && { reason }) };
 }
 
-const nameTaken = (name: string) => `扩展字段 ${name} 已有，换一个名字`;
+const nameTaken = (name: string): Msg => msg('扩展字段 {name} 已有，换一个名字', { name });
 
-/** 扩展字段名的问题；合格时为 null。others 是其他扩展字段的名字 */
-export function extensionNameProblem(name: string, others: readonly string[]): string | null {
-  if (!new RegExp(EXTENSION_PATTERN).test(name)) return '名字要以 x_ 开头，只用小写字母、数字与下划线';
+/** 扩展字段名的问题（句式）；合格时为 null。others 是其他扩展字段的名字 */
+export function extensionNameProblem(name: string, others: readonly string[]): Msg | null {
+  if (!new RegExp(EXTENSION_PATTERN).test(name)) return msg('名字要以 x_ 开头，只用小写字母、数字与下划线');
   return others.includes(name) ? nameTaken(name) : null;
 }
 
@@ -455,7 +459,7 @@ export function newExtension(
   table: { columns: readonly { name: string; type: string; formats?: readonly { format: string }[] }[] }, column: string, taken: readonly string[],
 ): ExtensionChoice {
   const at = table.columns.findIndex(c => c.name === column);
-  if (at < 0) throw new Error(`源表里没有列 ${column}`);
+  if (at < 0) throw new MsgError(msg('源表里没有列 {column}', { column }));
   return { name: extensionName(column, at + 1, taken), ...extensionSpec(table.columns[at]) };
 }
 
@@ -484,11 +488,11 @@ export function unusedColumns<C extends { name: string }>(doc: Document, table: 
  */
 export function writeExtension(doc: Document, name: string, choice: ExtensionChoice | null): void {
   const { map, reason } = extensionsMap(doc);
-  if (reason) throw new Error(reason);
+  if (reason) throw new MsgError(reason);
   const pair = map?.items.find(p => pairName(p.key) === name);
   if (pair) {
     const form = readExtension(name, pair.value);
-    if (form.readonly) throw new Error(`${name}：${form.reason}`);
+    if (form.readonly) throw new MsgError(msg('{name}：{reason}', { name, reason: form.reason ?? UNKNOWN }));
   }
   if (!choice) {
     if (!map || !pair) return;
@@ -496,7 +500,7 @@ export function writeExtension(doc: Document, name: string, choice: ExtensionCho
     if (!map.items.length) doc.delete('extensions');
     return;
   }
-  if (choice.name !== name && map?.items.some(p => pairName(p.key) === choice.name)) throw new Error(nameTaken(choice.name));
+  if (choice.name !== name && map?.items.some(p => pairName(p.key) === choice.name)) throw new MsgError(nameTaken(choice.name));
   const label = choice.label?.trim();
   const keySpace = choice.keySpace?.trim();
   const customerSource = choice.customerSource?.trim();
@@ -550,14 +554,14 @@ export function identityCandidates(doc: Document, entity: CanonicalEntity): stri
   ];
 }
 
-/** YAML 里身份打通的匹配字段（按优先级）；没写时为空，写法表单不认识时带原因（只读） */
-export function readIdentity(doc: Document): { match: string[]; reason?: string } {
+/** YAML 里身份打通的匹配字段（按优先级）；没写时为空，写法表单不认识时带原因（Msg，只读） */
+export function readIdentity(doc: Document): { match: string[]; reason?: Msg } {
   const node = doc.get('identity', true);
   if (node == null || (isScalar(node) && node.value == null)) return { match: [] };
   const match = isMap(node) ? node.get('match', true) : undefined;
   const keys = isMap(node) ? node.items.map(p => pairName(p.key)) : [];
   if (!isSeq(match) || keys.some(k => k !== 'match') || !match.items.every(i => isScalar(i) && typeof i.value === 'string')) {
-    return { match: [], reason: 'identity 的写法表单不认识，请在 YAML 里修改' };
+    return { match: [], reason: msg('identity 的写法表单不认识，请在 YAML 里修改') };
   }
   return { match: match.items.map(i => String((i as Scalar).value)) };
 }
@@ -565,7 +569,7 @@ export function readIdentity(doc: Document): { match: string[]; reason?: string 
 /** 把匹配字段（按优先级）写成 identity.match（行内列表），没有字段时删掉 identity。写法表单不认识时抛错 */
 export function writeIdentity(doc: Document, match: string[]): void {
   const { reason } = readIdentity(doc);
-  if (reason) throw new Error(reason);
+  if (reason) throw new MsgError(reason);
   if (!match.length) {
     doc.delete('identity');
     return;
@@ -591,14 +595,14 @@ export function writeKeySpace(doc: Document, keySpace: string | null): void {
   else if (readKeySpace(doc) !== value) doc.set('key_space', value);
 }
 
-/** YAML 里的属性取舍名次（survivorship.priority，ADR-0027）；没写时为 null，写法表单不认识（多出别的键、priority 不是正整数）时带原因（只读） */
-export function readSurvivorship(doc: Document): { priority: number | null; reason?: string } {
+/** YAML 里的属性取舍名次（survivorship.priority，ADR-0027）；没写时为 null，写法表单不认识（多出别的键、priority 不是正整数）时带原因（Msg，只读） */
+export function readSurvivorship(doc: Document): { priority: number | null; reason?: Msg } {
   const node = doc.get('survivorship', true);
   if (node == null || (isScalar(node) && node.value == null)) return { priority: null };
   const priority = isMap(node) ? node.get('priority', true) : undefined;
   const keys = isMap(node) ? node.items.map(p => pairName(p.key)) : [];
   if (!keys.every(k => k === 'priority') || !isScalar(priority) || typeof priority.value !== 'number' || !Number.isInteger(priority.value) || priority.value < 1) {
-    return { priority: null, reason: 'survivorship 的写法表单不认识，请在 YAML 里修改' };
+    return { priority: null, reason: msg('survivorship 的写法表单不认识，请在 YAML 里修改') };
   }
   return { priority: priority.value };
 }
@@ -606,7 +610,7 @@ export function readSurvivorship(doc: Document): { priority: number | null; reas
 /** 写属性取舍名次，null 时删掉整个 survivorship（schema 要求 priority 必填）；已认识的对象写法原地改 priority 的值，行尾注释保留。写法表单不认识时抛错 */
 export function writeSurvivorship(doc: Document, priority: number | null): void {
   const { reason } = readSurvivorship(doc);
-  if (reason) throw new Error(reason);
+  if (reason) throw new MsgError(reason);
   const node = doc.get('survivorship', true);
   if (priority == null) {
     doc.delete('survivorship');
@@ -623,18 +627,20 @@ export function writeSurvivorship(doc: Document, priority: number | null): void 
   doc.set('survivorship', survivorship);
 }
 
-/** 表单显示不了时的说明（目标实体不是标准实体、YAML 有语法错误、写的实体与目标实体不一致）；能显示时为 null */
-export function formUnavailable(doc: Document, entity: string): string | null {
+/** 表单显示不了时的说明（句式；目标实体不是标准实体、YAML 有语法错误、写的实体与目标实体不一致）；能显示时为 null */
+export function formUnavailable(doc: Document, entity: string): Msg | null {
   const target = entityOf(entity);
-  if (!target) return `${entity} 不是标准实体，表单只列标准实体的字段，请在 YAML 里编写。`;
+  if (!target) return msg('{entity} 不是标准实体，表单只列标准实体的字段，请在 YAML 里编写。', { entity });
   if (doc.errors.length) {
     const e = doc.errors[0];
-    const at = e.linePos ? `第 ${e.linePos[0].line} 行：` : '';
-    return `YAML 有语法错误（${at}${e.message.split('\n')[0]}），改好之前表单无法显示。`;
+    // 有行号 / 无行号是两条完整句式，不拼「第 N 行：」碎片
+    return e.linePos
+      ? msg('YAML 有语法错误（第 {line} 行：{message}），改好之前表单无法显示。', { line: e.linePos[0].line, message: e.message.split('\n')[0] })
+      : msg('YAML 有语法错误（{message}），改好之前表单无法显示。', { message: e.message.split('\n')[0] });
   }
   const written = doc.get('entity');
   if (typeof written === 'string' && written !== target.name) {
-    return `YAML 里写的实体是 ${written}，与目标实体 ${target.name} 不一致；请改成一致或按规则重新生成草稿。`;
+    return msg('YAML 里写的实体是 {written}，与目标实体 {target} 不一致；请改成一致或按规则重新生成草稿。', { written, target: target.name });
   }
   return null;
 }

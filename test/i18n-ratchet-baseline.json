@@ -145,7 +145,7 @@
     "app/lib/lineage-flow.ts": 1,
     "app/lib/lineage-graph.ts": 8,
     "app/lib/mapping-expr.ts": 56,
-    "app/lib/mapping-form.ts": 28,
+    "app/lib/mapping-form.ts": 10,
     "app/lib/mapping-template.ts": 4,
     "app/lib/merge-groups.ts": 6,
     "app/lib/metric-form.ts": 42,
