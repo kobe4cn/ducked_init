@@ -214,13 +214,34 @@ const envPrefix = (env: Record<string, string>) =>
 // 完整测试在沙箱里要跑 ~40 分钟，负载下个别用例会偶发失败（hook 超时、随机数据撞上断言）：
 // 失败的文件不超过 GATE_RERUN_MAX 个时单独重跑一次，重跑通过算通过，但输出 GATE_FLAKY 让 PR 上标出来。
 // 失败摘要只取 vitest 的 Failed Tests / Failed Suites 一节（去掉颜色、每行截断），不 grep 日志里的 Error。
+//
+// 分级门槛（2026-11-22）：分支相对 origin/main 只改了页面、组件、翻译表、测试文件和文档时（LIGHT_PATHS），
+// 只跑 test/http 和 test/ 根目录的单元测试（加上改到的测试文件），不跑占全量约 3/4 时间的 test/pipeline：
+// 这些文件只被页面渲染用到，pipeline 测试和服务端都不引用它们。改到其他任何文件仍跑完整测试。
+// 环境变量 GATE_FULL=1 强制完整测试：每 GATE_FULL_EVERY 张走精简门槛的票后跑一次，兜住漏网的问题。
+// 输出第一行是 GATE_TIER: full|light，脚本据此计数、写进 PR。
 const GATE_RERUN_MAX = 3;
+const GATE_FULL_EVERY = 4;
+const LIGHT_PATHS = String.raw`^(app/routes/|app/components/|app/i18n/en\.(client|server)\.json$|test/.*\.test\.tsx?$|test/i18n-ratchet-baseline\.json$|test/CATALOG\.md$|docs/|[^/]*\.md$)`;
+let lightGatesSinceFull = 0;
+const gateTier = (stdout: string): "light" | "full" => (stdout.includes("GATE_TIER: light") ? "light" : "full");
 const GATE_SCRIPT = String.raw`
 plain() { sed 's/\[[0-9;]*m//g' "$1"; }
 failures() { plain "$1" | sed -n '/Failed \(Tests\|Suites\)/,/Test Files/p' | grep -v 'Test Files' | cut -c1-300 | head -80; }
 totals() { plain "$1" | grep -E "Test Files|Tests " | tail -2; }
+changed=$(git diff --name-only "$(git merge-base HEAD ${BASE_REF})" HEAD)
+others=$(printf '%s\n' "$changed" | grep . | grep -vE '${LIGHT_PATHS}')
+if [ "$GATE_FULL" != "1" ] && [ -n "$changed" ] && [ -z "$others" ]; then
+  extra=$(printf '%s\n' "$changed" | grep -E '^test/.+\.test\.tsx?$' | grep -v '^test/http/' | while read -r f; do [ -f "$f" ] && printf '%s ' "$f"; done)
+  echo "GATE_TIER: light（只改了页面 / 组件 / 翻译表 / 测试 / 文档：跑 test/http 与 test/ 根目录单元测试，不跑 test/pipeline）"
+  testcmd="npx vitest run test/http $(ls test/*.test.ts test/*.test.tsx 2>/dev/null | tr '\n' ' ') $extra"
+else
+  echo "GATE_TIER: full"
+  [ -n "$others" ] && { echo "改到这些文件，跑完整测试："; printf '%s\n' "$others" | head -10; }
+  testcmd="npm run test"
+fi
 npm run typecheck > /tmp/gate-typecheck.log 2>&1 || { plain /tmp/gate-typecheck.log | tail -40; exit 1; }
-npm run test > /tmp/gate-test.log 2>&1 && { totals /tmp/gate-test.log; exit 0; }
+$testcmd > /tmp/gate-test.log 2>&1 && { totals /tmp/gate-test.log; exit 0; }
 files=$(plain /tmp/gate-test.log | grep -oE "FAIL +test/[^ ]+\.test\.tsx?" | awk '{print $2}' | sort -u)
 count=$(printf '%s
 ' "$files" | grep -c .)
@@ -822,8 +843,13 @@ async function build(issue: Issue) {
     }
     const review = reviews.at(-1)!;
 
-    const gate = () => sandbox.exec(`${envPrefix(env)} sh -c ${shellQuote(GATE_SCRIPT)}`);
+    // 每 GATE_FULL_EVERY 张走精简门槛的票后，这张强制跑完整测试（计数在进程内，重启后从 0 算）。
+    const forceFull = lightGatesSinceFull >= GATE_FULL_EVERY;
+    const gateEnv = forceFull ? { ...env, GATE_FULL: "1" } : env;
+    const gate = () => sandbox.exec(`${envPrefix(gateEnv)} sh -c ${shellQuote(GATE_SCRIPT)}`);
     let gateResult = await gate();
+    if (gateTier(gateResult.stdout) === "light") lightGatesSinceFull++;
+    else lightGatesSinceFull = 0;
     let fix: sandcastle.SandboxRunResult | undefined;
     if (gateResult.exitCode !== 0) {
       // 给 implementer 一次修的机会（新会话），再跑一次门槛。
@@ -850,7 +876,7 @@ async function build(issue: Issue) {
       revisions: revisions.map((r) => r.items),
       verdict: tagged(review.stdout, "verdict"),
       summary: tagged(review.stdout, "review-summary") ?? "（reviewer 没有给出摘要）",
-      gate: { ok: gateResult.exitCode === 0, output: gateResult.stdout.slice(-3000) },
+      gate: { ok: gateResult.exitCode === 0, output: gateResult.stdout.slice(-3000), tier: gateTier(gateResult.stdout) },
       browser: collectBrowserCheck(sandbox.worktreePath, issue.id),
       notes: readAcceptanceNotes(sandbox.worktreePath),
       usage,
@@ -1082,12 +1108,13 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
 
   const overBudget = peak > CONTEXT_BUDGET ? "\n\n⚠️ 超过上下文预算，考虑把同类票切得更小。" : "";
   const flaky = result.gate.output.includes("GATE_FLAKY");
+  const tierName = result.gate.tier === "light" ? "精简门槛（test/http 与单元测试，没跑 test/pipeline）" : "完整测试";
   // 先 push 开 PR 才有 PR 号；开票放在后面，票号用评论补到 PR 上。
   const gateNote = !result.gate.ok
     ? `❌ 门槛失败：\n\n\`\`\`\n${result.gate.output}\n\`\`\``
     : flaky
-      ? `typecheck 通过；⚠️ 完整测试有偶发失败，失败的文件单独重跑通过（沙箱内）。已自动开票修（见 PR 评论）。\n\n\`\`\`\n${result.gate.output}\n\`\`\``
-      : `typecheck 与完整测试通过（沙箱内）。\n\n\`\`\`\n${result.gate.output.slice(-500)}\n\`\`\``;
+      ? `typecheck 通过；⚠️ ${tierName}有偶发失败，失败的文件单独重跑通过（沙箱内）。已自动开票修（见 PR 评论）。\n\n\`\`\`\n${result.gate.output}\n\`\`\``
+      : `typecheck 与${tierName}通过（沙箱内）。\n\n\`\`\`\n${result.gate.output.slice(-500)}\n\`\`\``;
   const browserSection = result.browser
     ? `${result.browser.result ?? "（implementer 没有写 RESULT.md）"}\n\n截图 ${result.browser.shots.length} 张，附在下面。`
     : undefined;

@@ -44,12 +44,14 @@ reviewer 的结论有三种：`merge`、`revise`、`pr`（规则在 `.sandcastle
 
 1. reviewer 给出 `<verdict>merge</verdict>`：验收标准都实现且有测试、没有要人判断的问题、没改页面（改了页面留 PR 附截图，见「浏览器验收」）、没动 ADR / 权限 / 敏感字段处理、没改弱已有测试（规则在 `.sandcastle/review-prompt.md`）。
 2. 门槛通过：脚本在沙箱里自己跑 `npm run typecheck` 与完整测试（沙箱里 4 个 worker，约 40 分钟）。
+   - 分级门槛：分支相对 `origin/main` 只改了页面（`app/routes/`）、组件（`app/components/`）、翻译表（`app/i18n/en.*.json`）、测试文件、`test/i18n-ratchet-baseline.json` 和文档时，只跑 `test/http`、`test/` 根目录的单元测试和改到的测试文件，不跑占全量约 3/4 时间的 `test/pipeline`（这些文件只被页面渲染用到，服务端和 pipeline 测试不引用）。改到其他任何文件（`app/.server/`、`app/lib/`、迁移、依赖、配置、测试夹具等）仍跑完整测试。判断规则在 `.sandcastle/main.ts` 的 `LIGHT_PATHS`。
+   - 兜底：每 4 张（`GATE_FULL_EVERY`）走精简门槛的票之后，下一张强制跑完整测试（`GATE_FULL=1`），漏网的问题在这里暴露。计数在进程内，重启后从 0 算。门槛输出第一行 `GATE_TIER: light|full`，PR 的 **Gate** 一节写明跑的是精简门槛还是完整测试。rebase 补救后重跑的门槛按同样规则分级，不计数。
    - 完整测试失败、且失败的文件不超过 3 个时，先把这几个文件单独重跑一次：重跑通过算通过，PR 的 **Gate** 一节标出「偶发失败」和第一次的失败摘要。脚本还会给每个偶发失败的文件开一张票，标题是 `偶发失败：<文件>`，带 `flaky`、`Sandcastle`、`ready-for-agent` 标签，正文附失败摘要、复现方法和验收标准；下次调度会自动 prep 并修：prep 先查同样的报错是否已被别的提交修掉，修掉了就只核实、不改代码；没修掉要给出修复前变红、修复后变绿的复现（跨沙箱竞争写并发用例），重复单跑总共不超过 20 分钟。已经有同名的 open 票时，就在那张票上追加一次出现记录。票号会评论到 PR 上。重跑仍失败、或失败文件更多，才算门槛失败。
    - 门槛失败时让 implementer 用新会话修一次，再跑一次门槛。
    - 失败摘要只取 vitest 的 Failed Tests / Failed Suites 一节。
 3. GitHub 能 rebase 合并，且本票的 drizzle 迁移接在 `origin/main` 最新的迁移后面（两张票各加一个迁移时没有文本冲突，但迁移链会分叉，所以合并前脚本先查）。
 
-   不满足时脚本自动补救一次：在原分支上开沙箱 `git rebase origin/main`；有冲突或迁移链分叉就开一次 agent 会话按 `.sandcastle/rebase-prompt.md` 处理（追加型文件两边都留，迁移删掉重新 `db:generate`，要做判断的放弃并在 issue 上评论）；然后**重跑完整门槛**，通过才 force-push 再合并。补救不成就留 PR 并写原因。代价是这张票多跑一遍完整测试。
+   不满足时脚本自动补救一次：在原分支上开沙箱 `git rebase origin/main`；有冲突或迁移链分叉就开一次 agent 会话按 `.sandcastle/rebase-prompt.md` 处理（追加型文件两边都留，迁移删掉重新 `db:generate`，要做判断的放弃并在 issue 上评论）；然后**重跑门槛**（按上面的分级规则），通过才 force-push 再合并。补救不成就留 PR 并写原因。代价是这张票多跑一遍完整测试。
 
    reviewer 不给 `merge`、但门槛通过、要留 PR 给人审的票，也先查一次：和最新的 `origin/main` 有文本冲突或迁移链分叉（开工后 main 上合进了改同一处的票）时，同样 rebase、处理冲突、重跑门槛、force-push，只是不合并，PR 上评论一句。这样人审到的 PR 能直接合并。补救不成就在「没有自动合并」的评论里写上原因。
 
