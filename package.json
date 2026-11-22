@@ -12,6 +12,7 @@
     "test:timing": "rm -f /tmp/crm-test-timing.jsonl && TEST_TIMING=/tmp/crm-test-timing.jsonl vitest run --reporter=default --reporter=json --outputFile.json=/tmp/crm-test-results.json",
     "test:report": "node --import tsx scripts/test-duration-report.ts /tmp/crm-test-results.json /tmp/crm-test-timing.jsonl > /tmp/crm-test-report.md",
     "i18n:ratchet": "node --import tsx scripts/i18n-ratchet.ts",
+    "i18n:sort": "node --import tsx scripts/i18n-sort.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "tenant:create": "node --env-file-if-exists=.env --import tsx scripts/create-tenant.ts",

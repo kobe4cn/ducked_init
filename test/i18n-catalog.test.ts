@@ -11,6 +11,7 @@ import { TEMPLATES } from '../app/.server/pipeline/templates/index';
 import { RFM_DEFAULTS } from '../app/.server/pipeline/templates/rfm';
 import { TASK_STATUS_LABELS } from '../app/.server/tasks';
 import { DSL_KINDS } from '../app/.server/pipeline/dsl/index';
+import { CATALOG_FILES, sortCatalog } from '../scripts/i18n-sort';
 
 type Catalog = Record<string, string>;
 const root = join(import.meta.dirname, '..');
@@ -150,5 +151,24 @@ describe('守卫：翻译键与英文词典对账（ADR-0060）', () => {
     expect(checkCatalog({ '{c} 条：{n, plural, other {{x} 行}}': '{c} rows: {n, plural, other {{y} lines}}' }, 'demo.json')).toEqual([
       'demo.json「{c} 条：{n, plural, other {{x} 行}}」的变量中英不一致：中文 [c, n, x]，英文 [c, n, y]',
     ]);
+  });
+
+  // 排序让并行的双语票各自插在不同位置，落地时 git 能自动合并；重复键时 JSON 后者覆盖前者，没人发现（2026-11-23）
+  it('两份词典按键排序、没有重复键（不满足时跑 pnpm i18n:sort）', () => {
+    for (const file of CATALOG_FILES) {
+      const raw = readFileSync(join(root, file), 'utf8');
+      const { text, conflicts, duplicates } = sortCatalog(raw);
+      expect(conflicts, `${file} 同一个键有不同译文`).toEqual([]);
+      expect(duplicates, `${file} 有重复键`).toEqual([]);
+      expect(raw === text, `${file} 没有按键排序：跑 pnpm i18n:sort`).toBe(true);
+    }
+  });
+
+  it('sortCatalog 按码点排序，合并相同的重复键，报出译文不同的重复键', () => {
+    const raw = '{\n  "乙": "B",\n  "甲": "A",\n  "乙": "B",\n  "丙": "C1",\n  "丙": "C2"\n}\n';
+    const { text, conflicts, duplicates } = sortCatalog(raw);
+    expect(duplicates).toEqual(['乙']);
+    expect(conflicts).toEqual(['「丙」："C1" 与 "C2"']);
+    expect(Object.keys(JSON.parse(text))).toEqual(['丙', '乙', '甲']);
   });
 });
