@@ -4,7 +4,7 @@
 import type { T } from './i18n';
 import { CANONICAL_ENTITIES, CUSTOM_ENTITY_KINDS, FIELD_TYPES } from './canonical-model';
 import { ROLE_LABELS } from './roles';
-import { SOURCE_KIND_LABELS } from './sources';
+import { LAKE_COVERAGE, SOURCE_KIND_LABELS, SYNC_MODES } from './sources';
 import { KNOWLEDGE_SOURCE_KIND_LABELS } from './knowledge-source';
 import { MERGE_RULE_LABELS } from './merge-groups';
 
@@ -23,7 +23,7 @@ export const CANONICAL_NAMES: ReadonlySet<string> = new Set(
   CANONICAL_ENTITIES.flatMap(e => [e.label, ...e.fields.map(f => f.label)]),
 );
 
-/** 实体 / 字段名之外的内置枚举名称：字段类型、自定义实体类型、角色、数据源类型、知识源类型、合并规则 */
+/** 实体 / 字段名之外的内置枚举名称：字段类型、自定义实体类型、角色、数据源类型、知识源类型、合并规则、同步方式、进湖覆盖原因 */
 export const ENUM_LABELS: ReadonlySet<string> = new Set([
   ...Object.values(FIELD_TYPES).map(x => x.label),
   ...Object.values(CUSTOM_ENTITY_KINDS),
@@ -31,4 +31,6 @@ export const ENUM_LABELS: ReadonlySet<string> = new Set([
   ...Object.values(SOURCE_KIND_LABELS),
   ...Object.values(KNOWLEDGE_SOURCE_KIND_LABELS),
   ...Object.values(MERGE_RULE_LABELS),
+  ...Object.values(SYNC_MODES),
+  ...Object.values(LAKE_COVERAGE),
 ]);

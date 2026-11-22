@@ -198,7 +198,7 @@
     "app/routes/pii.reveal.tsx": 17,
     "app/routes/quality.tsx": 49,
     "app/routes/settings.tsx": 29,
-    "app/routes/source.tsx": 180,
+    "app/routes/source.tsx": 122,
     "app/routes/sources.tsx": 4,
     "app/routes/tasks.tsx": 1,
     "app/routes/workbench.tsx": 64
