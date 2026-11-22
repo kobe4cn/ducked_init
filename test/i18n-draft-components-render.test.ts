@@ -2,8 +2,8 @@
 // 英文词典（en.client.json）经 I18nProvider 注入后渲染 VersionStatus / DraftActions / DraftConfidence / VerifyBadge /
 // KeyCheckFindings 的典型状态（已发布 / 草稿 / 与已发布版相同、可发布 / 发布被锁、复用 / 规则 / 模型 / 断言的生成依据、
 // 未核对 / 一致 / 有差异、空值与重复键），界面文字不能有汉字；作为 props 传进来的数据（发布被拒的原因、丢弃提示、
-// 模型给的理由、notice、重复键明细）是服务端与 app/lib 返回的内容、不算界面文字（随 #932 翻译），英文夹具里全用 ASCII
-// 或不触发：key-check-findings 用的 duplicateKeyText（app/lib/sources.ts）仍出中文，英文态不给重复键。
+// 模型给的理由、notice）是服务端与 app/lib 返回的内容、不算界面文字，英文夹具里全用 ASCII。重复键明细经
+// duplicateKeyText（app/lib/sources.ts，#1041）也按界面语言输出：英文态给普通与敏感字段两种重复键。
 // 中文界面（词典 null）回退中文原文，输出与接入前一致（验收标准 2）。Form / Link 是 data router 组件，静态渲染里
 // 没有上下文，vi.mock 掉 react-router（同 test/assistant-panel-render.test.ts），被测组件在 mock 之后导入
 import { createElement, type ReactNode } from 'react';
@@ -60,8 +60,11 @@ function states(locale: 'en' | 'zh-CN'): Record<string, string> {
     徽标差异单数: render(createElement(VerifyBadge, { differences: 1 })),
     主键检查: render(createElement(KeyCheckFindings, { result: {
       keyColumns: ['customer_id'], nullRows: 1234,
-      // duplicateKeyText（app/lib/sources.ts）随 #932 翻译：英文态不给重复键，中文态断言它照旧透传
-      duplicates: locale === 'en' ? [] : [{ key: ['1'], count: 2 }],
+      // duplicateKeyText（app/lib/sources.ts，#1041）也按界面语言输出：英文态给普通与敏感字段（key 为 null）两种重复键，
+      // 次数取大数好断言千分位；中文态的夹具与断言保持改造前的样子
+      duplicates: locale === 'en'
+        ? [{ key: ['1'], count: 2000 }, { key: null, count: 3 }]
+        : [{ key: ['1'], count: 2 }],
     } })),
     主键检查单数: render(createElement(KeyCheckFindings, { result: { keyColumns: [], nullRows: 1, duplicates: [] } })),
   };
@@ -99,6 +102,9 @@ describe('草稿与校验类公共组件的界面文字按界面语言翻译（A
     expect(en.徽标差异单数).toContain('1 table differs');
     expect(en.主键检查).toContain('1,234 rows with null values');
     expect(en.主键检查单数).toContain('1 row with null values');
+    // 重复键（duplicateKeyText，#1041）：整句英文、次数带英文千分位；敏感字段那半句也是英文
+    expect(en.主键检查).toContain('customer_id=1 appears 2,000 times');
+    expect(en.主键检查).toContain('(sensitive field, values not shown) appears 3 times');
   });
 
   it('中文界面：词典不下发、按中文原文回退，输出与接入前一致', () => {
@@ -125,7 +131,7 @@ describe('草稿与校验类公共组件的界面文字按界面语言翻译（A
     expect(zh.生成依据复用).toContain('源表结构与已发布映射一致，直接复用了<a href="/mappings/m-123">那个映射</a>，没有调用模型。');
     expect(zh.生成依据复用无来源).toContain('源表结构与已发布映射一致，直接复用，没有调用模型。');
     expect(zh.生成依据规则).toContain('按规则生成');
-    // 核对徽标与主键检查：duplicateKeyText 照旧透传，数字仍按 zh-CN 分组
+    // 核对徽标与主键检查：duplicateKeyText 按中文原文输出，数字仍按 zh-CN 分组
     expect(zh.徽标未核对).toContain('未核对');
     expect(zh.徽标一致).toContain('一致');
     expect(zh.徽标差异).toContain('3 张表有差异');
