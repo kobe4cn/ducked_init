@@ -18,7 +18,7 @@ import type { Route } from './+types/workbench';
 import { requirePermission } from '~/.server/access';
 import { ConversationError } from '~/.server/assistant/conversations';
 import type { CurrentMember } from '~/.server/auth';
-import { formatServer } from '~/.server/i18n';
+import { errorText, errorTextFor, formatServer } from '~/.server/i18n';
 import { getLocale } from '~/.server/locale';
 import { navFor } from '~/.server/nav';
 import {
@@ -34,7 +34,7 @@ import { Button } from '~/components/ui/button';
 import { Input } from '~/components/ui/input';
 import { Label } from '~/components/ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
-import { msg, useT } from '~/lib/i18n';
+import { msg, useT, type Locale } from '~/lib/i18n';
 import { completionSchema } from '~/lib/sql-completion';
 
 export function meta({}: Route.MetaArgs) {
@@ -45,11 +45,11 @@ export function meta({}: Route.MetaArgs) {
 export const headers = () => ({ 'Cache-Control': 'no-store' });
 
 /** 目录树；读不出来时给出原因，页面其余部分照常 */
-async function loadCatalog(member: CurrentMember): Promise<{ catalog: WorkbenchCatalog | null; catalogError?: string }> {
+async function loadCatalog(member: CurrentMember, locale: Locale): Promise<{ catalog: WorkbenchCatalog | null; catalogError?: string }> {
   try {
     return { catalog: await listCatalog(member) };
   } catch (e) {
-    if (e instanceof WorkbenchError) return { catalog: null, catalogError: e.message };
+    if (e instanceof WorkbenchError) return { catalog: null, catalogError: errorText(locale, e) };
     throw e;
   }
 }
@@ -62,7 +62,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   const sqlParam = new URL(request.url).searchParams.get('sql') ?? '';
   return {
     initialSql: sqlParam.length > MAX_SQL_PARAM ? '' : sqlParam,
-    ...await loadCatalog(member),
+    ...await loadCatalog(member, await getLocale(request)),
     email: member.email, nav: navFor(member), maxRows: WORKBENCH_ROWS, timeoutSeconds: WORKBENCH_TIMEOUT_MS / 1000,
     sandbox: sandboxSchema(member.memberId), sandboxTables: await listSandboxTables(member), sharedWithMe: await listSharedWithMe(member),
     ttlDays: SANDBOX_TTL_DAYS, maxRequest: MAX_REQUEST,
@@ -107,7 +107,7 @@ export async function action({ request }: Route.ActionArgs) {
   } catch (e) {
     if (e instanceof WorkbenchError || e instanceof WorkbenchAiError || e instanceof ConversationError) {
       // email 带回去：分享失败时输入框 defaultValue 把刚填的邮箱填回去，方便修改
-      return data({ sql, name, intent, request: need, error: e.message, conversationId, email }, { status: e.status });
+      return data({ sql, name, intent, request: need, error: await errorTextFor(request, e), conversationId, email }, { status: e.status });
     }
     throw e;
   }
