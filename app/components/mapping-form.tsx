@@ -441,7 +441,7 @@ function Extensions({ doc, table, origins, issues, onWrite, onEditYaml }: {
       </div>
       {reason ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span>{reason ? msgText(t, reason) : null}</span>
+          <span>{msgText(t, reason)}</span>
           <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       ) : (
@@ -642,7 +642,7 @@ function Identity({ doc, entity, issues, onWrite, onEditYaml }: {
       </div>
       {reason ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span>{reason ? msgText(t, reason) : null}</span>
+          <span>{msgText(t, reason)}</span>
           <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       ) : (
@@ -711,7 +711,7 @@ function Survivorship({ doc, issues, onWrite, onEditYaml }: {
       </div>
       {reason ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span>{reason ? msgText(t, reason) : null}</span>
+          <span>{msgText(t, reason)}</span>
           <Button type="button" size="xs" variant="link" onClick={onEditYaml}>{t('到 YAML 修改')}</Button>
         </div>
       ) : (
