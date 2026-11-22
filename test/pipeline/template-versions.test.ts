@@ -151,7 +151,9 @@ describe('升级预览与确认', () => {
     expect(d.matrix.every(c => c.before !== c.after && c.after === `v2:${c.before}`)).toBe(true);
     expect(d.matrix.reduce((n, c) => n + c.consumers, 0)).toBe(Number(total));
     expect(preview.summary!.warn).toBe(true);
-    expect(preview.summary!.text).toContain('没变的人占 0.0%');
+    // 一句话结论只下发结构（整句由页面按界面语言拼）：全都换了分群，最大迁移的人数等于矩阵最大格子
+    expect(preview.summary!.unchangedShare).toBe(0);
+    expect(preview.summary!.detail).toMatchObject({ kind: 'segment', topMove: { consumers: Math.max(...d.matrix.map(c => c.consumers)) } });
     expect(JSON.stringify(preview)).not.toMatch(/[0-9a-f]{64}/);
     await expect(previewTemplateUpgrade(author, 'rfm', '2999-01-01')).rejects.toThrow(/晚于今天/);
     expect(await onLake<{ n: string }>(acme, LAKE_SNAPSHOT)).toEqual([lakeBefore]);
@@ -273,7 +275,8 @@ describe('升级预览与确认', () => {
     expect(orders.after).toEqual(orders.before);
     expect(orders.changed).toBe(0);
     expect(churn.summary!.warn).toBe(true);
-    expect(churn.summary!.text).toContain('变化最大的字段：at_risk 为是');
+    // 一句话结论只下发结构（整句由页面按界面语言拼）：变化最大的字段是换了取值人数最多的 at_risk
+    expect(churn.summary!.detail).toEqual({ kind: 'column', topColumn: atRisk });
     expect(JSON.stringify(churn)).not.toMatch(/[0-9a-f]{64}/);
 
     // 第 2 版的 minOrders 不超过 10
