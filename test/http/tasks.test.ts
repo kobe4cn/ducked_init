@@ -84,6 +84,36 @@ describe('成员查看本租户的任务', () => {
     expect(errOf(zh, 'lake.inventory')).toBe('调度器失联，任务中断');
   });
 
+  it('英文界面：写死的文字没有汉字，任务类型与状态是英文，数字与日期按英文格式（#1035）', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const acme = await newTenant('acme');
+    await runTask(acme, 'lake.inventory');
+    await runTask(acme, 'demo.seed', { customers: 1000 });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    // crm_locale 写进 cookie jar：显式传 Cookie 头时 Client 不带 jar，会丢登录会话
+    admin.store('crm_locale=en; Path=/');
+    // 水合 script 里带中文词典键（键就是中文原文）、meta 标题按其他页的惯例不翻、语言切换的「中文」按母语名显示，断言前都去掉
+    const html = (await (await admin.get('/tasks')).text())
+      .replace(/<script[\s\S]*?<\/script>/g, '')
+      .replace(/<title>[^<]*<\/title>/g, '')
+      .replace(/<form[^>]*action="\/locale"[\s\S]*?<\/form>/g, '');
+    expect(html).toContain('lang="en"');
+    expect(html).not.toMatch(/[一-鿿]/);
+    const [seed, inventory] = taskRows(html);
+    // 任务类型（契约 kind 的 label）与状态（builtinName）都是英文
+    expect(seed.html).toContain('Generate demo data');
+    expect(inventory.html).toContain('Inventory the data lake');
+    expect(seed.html).toContain('>Succeeded<');
+    // 结果里的行数带英文千分位与复数（ICU），运行配额的线程数同样
+    expect(seed.html).toMatch(/data-result-table="customers"[\s\S]*?>1,000 rows</);
+    expect(seed.html).toMatch(/Quota: memory [\d.]+ ?\w+ · 2 threads/);
+    // 表头与「查看结果」，时间按英文格式（zh-CN 是 2026/11/22 10:30:00 这样的 24 小时制）
+    for (const head of ['Tasks</th>', 'Status</th>', 'Submitted at</th>', 'Started at</th>', 'Finished at</th>']) expect(html).toContain(head);
+    expect(html).toContain('View result');
+    expect(html).toMatch(/\d{1,2}\/\d{1,2}\/\d{4}, \d{1,2}:\d{2}:\d{2} [AP]M/);
+  });
+
   it('成功的任务可以查看结果：各表的行数与运行时的配额', async () => {
     const acme = await newTenant('acme');
     await runTask(acme, 'lake.inventory');

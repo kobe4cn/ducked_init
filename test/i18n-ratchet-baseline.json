@@ -201,7 +201,7 @@
     "app/routes/settings.tsx": 29,
     "app/routes/source.tsx": 180,
     "app/routes/sources.tsx": 4,
-    "app/routes/tasks.tsx": 21,
+    "app/routes/tasks.tsx": 1,
     "app/routes/workbench.tsx": 64
   }
 }
