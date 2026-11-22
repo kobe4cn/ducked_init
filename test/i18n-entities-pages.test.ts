@@ -25,6 +25,7 @@ vi.mock('react-router', async importOriginal => {
 
 // 被测组件要在 vi.mock 之后导入（vitest 会把 vi.mock 提升到文件顶部，写在后面即可）
 import { RelationSuggestionsCard } from '../app/components/relation-suggestions-card';
+import { discardHint } from '../app/lib/custom-entity-text';
 import { I18nProvider, makeT } from '../app/lib/i18n';
 import enClient from '../app/i18n/en.client.json';
 import { memberOf, newTenant, selectAllTables } from './pipeline/fixtures';
@@ -210,5 +211,31 @@ describe('中文界面：输出与改造前一致', () => {
     expect(detail).toContain('版本（1）');
     const versions = await (await author.get(`${page}?tab=versions`)).text();
     expect(versions).toMatch(/admin@acme\.com，\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}/);
+  });
+});
+
+describe('丢弃草稿的说明（只在 confirm() 里，SSR 不输出，测纯函数 discardHint）', () => {
+  const MAPPINGS = [{ source: 'A', table: 't1' }, { source: 'B', table: 't2' }];
+  const en = makeT('en', enClient);
+  const zh = makeT('zh-CN', null);
+
+  it('发布过：回到最近的已发布版本', () => {
+    expect(discardHint(en, true, MAPPINGS)).not.toMatch(/[一-鿿]/);
+    expect(discardHint(en, true, MAPPINGS)).not.toContain('t1');
+    expect(discardHint(zh, true, MAPPINGS)).toBe('回到最近的已发布版本');
+  });
+
+  it('从没发布过且没有配套映射草稿：只说将被删除', () => {
+    const text = discardHint(en, false, []);
+    expect(text).not.toMatch(/[一-鿿]/);
+    expect(text).toBe('This custom entity has never been published and will be deleted');
+    expect(discardHint(zh, false, [])).toBe('这个自定义实体从没发布过，将被删除');
+  });
+
+  it('从没发布过且有两条映射草稿：英文用 "源" 表 与 ", " 分隔，中文与改造前逐字一致', () => {
+    const text = discardHint(en, false, MAPPINGS);
+    expect(text).not.toMatch(/[一-鿿]/);
+    expect(text).toContain('"A" t1, "B" t2');
+    expect(discardHint(zh, false, MAPPINGS)).toBe('这个自定义实体从没发布过，将被删除，目标是它的映射草稿一并丢弃：「A」t1、「B」t2');
   });
 });
