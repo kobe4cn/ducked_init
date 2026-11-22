@@ -176,7 +176,7 @@
     "app/routes/knowledge.tsx": 22,
     "app/routes/lineage.tsx": 63,
     "app/routes/llm-usage.tsx": 42,
-    "app/routes/mapping.tsx": 108,
+    "app/routes/mapping.tsx": 47,
     "app/routes/mappings.tsx": 2,
     "app/routes/mcp.tsx": 2,
     "app/routes/merge-groups.tsx": 35,

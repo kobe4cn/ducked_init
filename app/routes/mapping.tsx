@@ -13,7 +13,8 @@ import type { Route } from './+types/mapping';
 import { can, requirePermission } from '~/.server/access';
 import { customEntityPages, customEntityRegistrations } from '~/.server/custom-entities';
 import { getDb } from '~/.server/db/client';
-import { errorTextFor } from '~/.server/i18n';
+import { errorTextFor, formatServer } from '~/.server/i18n';
+import { getLocale } from '~/.server/locale';
 import { latestIdentitySummary, mergeMapping } from '~/.server/merges';
 import {
   confirmDisable, disableImpact, discardDraft, draftForMapping, dryRunMapping, GenerationMismatchError, getMapping, ignoreColumn, MappingError, modelAssertionsForMapping, modelDraftForMapping, publishMapping, referenceTables,
@@ -32,6 +33,9 @@ import type { DryRunResult } from '~/.server/pipeline/dry-run-engine';
 import type { FallbackStat, GroupStat } from '~/.server/pipeline/merge-engine';
 import { TASK_STATUS_LABELS } from '~/.server/tasks';
 import { entityLabel, entityOf, isCustomEntity } from '~/lib/canonical-model';
+import { builtinName, CANONICAL_NAMES } from '~/lib/builtin-names';
+import { formatDateTime, formatNumber } from '~/lib/format';
+import { makeT, msg, useLocale, useT, type T } from '~/lib/i18n';
 import { AppShell } from '~/components/app-shell';
 import { DraftConfidence } from '~/components/draft-confidence';
 import { DraftActions, VersionStatus } from '~/components/draft-version';
@@ -46,8 +50,13 @@ import { Alert, AlertDescription, AlertTitle } from '~/components/ui/alert';
 import { Button } from '~/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
 
-export function meta({ loaderData }: Route.MetaArgs) {
-  return [{ title: `${loaderData ? `${loaderData.mapping.entityLabel} ← ${loaderData.mapping.table}` : '映射'} · CRM 数据分析平台` }];
+export function meta({ loaderData, matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段（没有 data）；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
+  const m = loaderData?.mapping;
+  // 标准实体名经 builtinName 翻；租户登记的自定义实体名是租户数据，不翻
+  return [{ title: `${m ? `${m.customEntity ? m.entityLabel : builtinName(t, m.entityLabel, CANONICAL_NAMES)} ← ${m.table}` : t('映射')} · ${t('CRM 数据分析平台')}` }];
 }
 
 type Tab = 'edit' | 'versions' | 'merges';
@@ -89,6 +98,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         table: m.tableName,
         entity: m.entity,
         entityLabel: customPage?.label ?? entityLabel(m.entity),
+        /** 实体是已发布登记的自定义实体：entityLabel 是租户起的名字（用户数据），展示时不翻 */
+        customEntity: !!customPage,
         /** 实体卡片的去处：自定义实体是它的实体页（推断不出登记时是实体列表），标准实体是标准模型页 */
         entityPage: customPage?.href ?? '/model',
         /** 编辑草稿时对照的源表（还没采集、不在同步范围时为 null；不能编辑时不给） */
@@ -120,8 +131,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         disabledAt: m.disabledAt?.toISOString() ?? null,
         disabledBy: m.disabledByEmail,
         requestedBy: m.disableRequestedByEmail,
-        /** 当前成员确认不了停用的原因（提议的是自己）；可以确认或没人提议时为 null */
-        confirmBlocker: m.disableRequestedByEmail === member.email ? '等待另一位确认：你提议了停用，需由另一位数据工程师或管理员确认' : null,
+        /** 当前成员提议了停用、需由另一位确认（提示等待原因）；可以确认或没人提议时为 false */
+        awaitingConfirm: m.disableRequestedByEmail === member.email,
         /** 停用后会受影响的已发布指标与引用它们的已发布标签（只是提示，不拦停用）；已停用或没有发布权限时为空 */
         impact: m.disabledAt || !can(member.role, 'publish') ? { metrics: [], tags: [] } : await disableImpact(getDb(), member.tenant.id, m.id),
       } : null,
@@ -211,7 +222,7 @@ export async function action({ request, params }: Route.ActionArgs) {
         break;
       }
       default:
-        return data({ error: '未知操作', issues: [], yaml: null, draftId: null, dryRun: null }, { status: 400 });
+        return data({ error: formatServer(await getLocale(request), msg('未知操作')), issues: [], yaml: null, draftId: null, dryRun: null }, { status: 400 });
     }
   } catch (e) {
     // 保存、发布、丢弃经 publishing.ts（ADR-0051）：流程错误（双人 403、草稿过期、没有草稿）也是 PublishError；issues 只有映射校验错误（MappingError）带
@@ -494,27 +505,29 @@ function DraftDiff({ entity, version, diff }: { entity: string; version: number;
 
 type DisableData = NonNullable<LoaderData['disable']>;
 
-const impactText = ({ impact }: DisableData) =>
-  [impact.metrics.length && `指标 ${impact.metrics.map(m => m.key).join('、')}`, impact.tags.length && `标签 ${impact.tags.map(t => t.key).join('、')}`].filter(Boolean).join('；');
+/** 受影响的已发布指标与标签（确认停用的弹窗里带出）：「指标 k1、k2；标签 a、b」 */
+const impactText = (t: T, { impact }: DisableData) =>
+  [impact.metrics.length && t('指标 {keys}', { keys: impact.metrics.map(m => m.key).join(t('、')) }), impact.tags.length && t('标签 {keys}', { keys: impact.tags.map(x => x.key).join(t('、')) })].filter(Boolean).join(t('；'));
 
 /** 停用的操作（ADR-0031）：没人提议时提议停用，有人提议时另一位确认（提议人看到等待原因），已停用时恢复；停用前请成员确认，并带上受影响的定义 */
 function DisableActions({ disable, submitting }: { disable: DisableData; submitting: boolean }) {
+  const t = useT();
   if (disable.disabledAt) {
     return (
-      <Form method="post" onSubmit={e => { if (!confirm('恢复这个映射？恢复后重新合并它最新的已发布版本。')) e.preventDefault(); }}>
+      <Form method="post" onSubmit={e => { if (!confirm(t('恢复这个映射？恢复后重新合并它最新的已发布版本。'))) e.preventDefault(); }}>
         <input type="hidden" name="intent" value="restore" />
-        <Button type="submit" variant="outline" disabled={submitting}><RotateCcw />恢复</Button>
+        <Button type="submit" variant="outline" disabled={submitting}><RotateCcw />{t('恢复')}</Button>
       </Form>
     );
   }
-  const affected = impactText(disable);
+  const affected = impactText(t, disable);
   const step = disable.requestedBy ? 'confirm-disable' : 'request-disable';
-  const label = disable.requestedBy ? '确认停用' : '停用';
-  if (disable.confirmBlocker) {
+  const label = disable.requestedBy ? t('确认停用') : t('停用');
+  if (disable.awaitingConfirm) {
     return (
       <span className="flex items-center gap-2">
         <Button type="button" variant="destructive" disabled><Ban />{label}</Button>
-        <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-disable-blocker><Lock className="size-3.5 shrink-0" />{disable.confirmBlocker}</span>
+        <span className="flex max-w-xs items-center gap-1 text-sm text-slate-500" data-disable-blocker><Lock className="size-3.5 shrink-0" />{t('等待另一位确认：你提议了停用，需由另一位数据工程师或管理员确认')}</span>
       </span>
     );
   }
@@ -522,8 +535,11 @@ function DisableActions({ disable, submitting }: { disable: DisableData; submitt
     <Form
       method="post"
       onSubmit={e => {
-        const question = disable.requestedBy ? `确认停用这个映射（${disable.requestedBy} 提议）？` : '提议停用这个映射？需由另一位数据工程师或管理员确认后生效。';
-        if (!confirm(`${question}停用后合并撤下它写进标准层的行。${affected ? `\n这些已发布的定义会受影响，下次刷新可能失败：${affected}` : ''}`)) e.preventDefault();
+        const question = disable.requestedBy ? t('确认停用这个映射（{name} 提议）？', { name: disable.requestedBy }) : t('提议停用这个映射？需由另一位数据工程师或管理员确认后生效。');
+        const warning = affected
+          ? `${t('停用后合并撤下它写进标准层的行。')}\n${t('这些已发布的定义会受影响，下次刷新可能失败：{affected}', { affected })}`
+          : t('停用后合并撤下它写进标准层的行。');
+        if (!confirm(`${question}${warning}`)) e.preventDefault();
       }}
     >
       <input type="hidden" name="intent" value={step} />
@@ -534,6 +550,8 @@ function DisableActions({ disable, submitting }: { disable: DisableData; submitt
 
 /** 停用状态：已停用、待确认停用，以及停用后会受影响的已发布指标与标签（只是提示） */
 function DisableStatus({ disable }: { disable: DisableData }) {
+  const t = useT();
+  const locale = useLocale();
   const { impact } = disable;
   const link = (kind: 'metric' | 'tag', key: string) => (
     <Link key={key} to={`/analytics/definitions/${kind}/${key}`} className="ml-2 font-mono underline" data-disable-impact={`${kind}-${key}`}>{key}</Link>
@@ -542,9 +560,9 @@ function DisableStatus({ disable }: { disable: DisableData }) {
     return (
       <Alert role="status" data-disable-state="disabled">
         <Ban className="text-slate-500" />
-        <AlertTitle>已停用</AlertTitle>
+        <AlertTitle>{t('已停用')}</AlertTitle>
         <AlertDescription>
-          <p>{`于 ${time(disable.disabledAt)} 停用（停用人 ${disable.disabledBy ?? '—'}，即提议人）。停用后它不参与合并，写进标准层的行已撤下；恢复后重新合并它最新的已发布版本。`}</p>
+          <p>{t('于 {time} 停用（停用人 {by}，即提议人）。停用后它不参与合并，写进标准层的行已撤下；恢复后重新合并它最新的已发布版本。', { time: formatDateTime(locale, disable.disabledAt), by: disable.disabledBy ?? '—' })}</p>
         </AlertDescription>
       </Alert>
     );
@@ -554,12 +572,12 @@ function DisableStatus({ disable }: { disable: DisableData }) {
   return (
     <Alert role="status" data-disable-state={disable.requestedBy ? 'requested' : 'impact'}>
       <AlertTriangle className="text-amber-600" />
-      <AlertTitle>{disable.requestedBy ? `待确认停用：${disable.requestedBy} 提议停用这个映射，等待另一位确认` : '停用这个映射会影响已发布的指标'}</AlertTitle>
+      <AlertTitle>{disable.requestedBy ? t('待确认停用：{name} 提议停用这个映射，等待另一位确认', { name: disable.requestedBy }) : t('停用这个映射会影响已发布的指标')}</AlertTitle>
       {affected && (
         <AlertDescription>
-          <p>停用后这些指标引用的实体再没有映射，下次刷新可能失败（只是提示，不拦停用）：</p>
-          <p>指标{impact.metrics.map(m => link('metric', m.key))}</p>
-          {impact.tags.length > 0 && <p>引用它们的标签{impact.tags.map(t => link('tag', t.key))}</p>}
+          <p>{t('停用后这些指标引用的实体再没有映射，下次刷新可能失败（只是提示，不拦停用）：')}</p>
+          <p>{t('指标')}{impact.metrics.map(m => link('metric', m.key))}</p>
+          {impact.tags.length > 0 && <p>{t('引用它们的标签')}{impact.tags.map(x => link('tag', x.key))}</p>}
         </AlertDescription>
       )}
     </Alert>
@@ -568,6 +586,8 @@ function DisableStatus({ disable }: { disable: DisableData }) {
 
 export default function Mapping({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, tab, version, focus, canWrite, functions, mapping, versions, sameAs, draftDiff, drift, keySpaceChange, disable, merge } = loaderData;
+  const t = useT();
+  const locale = useLocale();
   // 用模型重新生成或建议断言时的来源、每项置信度与理由
   const generated = actionData && 'generated' in actionData ? actionData.generated : null;
   // 编辑框里是生成的草稿时它的生成记录，保存时一起提交，比对生成稿记下改动；换版本或重新加载后 actionData 没了就不再带
@@ -580,18 +600,20 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
   const editable = canWrite && !!selected && (selected.status === 'draft' || !draft);
   const lastMerge = merge.history[0];
   const base = `/mappings/${mapping.id}`;
+  // 标准实体名经 builtinName 翻；租户登记的自定义实体名是租户数据，不翻
+  const entityName = mapping.customEntity ? mapping.entityLabel : builtinName(t, mapping.entityLabel, CANONICAL_NAMES);
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
-        title={<span className="flex items-center gap-3">{mapping.entityLabel}<span className="text-slate-300">←</span><span className="font-mono text-2xl text-slate-500">{mapping.table}</span></span>}
-        description={<Link to="/mappings" className="hover:underline">← 全部映射</Link>}
+        title={<span className="flex items-center gap-3">{entityName}<span className="text-slate-300">←</span><span className="font-mono text-2xl text-slate-500">{mapping.table}</span></span>}
+        description={<Link to="/mappings" className="hover:underline">{t('← 全部映射')}</Link>}
         actions={
           <>
-            {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? '回到最近的已发布版本' : '这个映射从没发布过，将被删除'} submitting={submitting} />}
+            {draft && <DraftActions v={draft} canDiscard={canWrite} discardHint={live ? t('回到最近的已发布版本') : t('这个映射从没发布过，将被删除')} submitting={submitting} />}
             {canWrite && live && !disable?.disabledAt && (
               <Form method="post">
                 <input type="hidden" name="intent" value="merge" />
-                <Button type="submit" variant="outline" disabled={submitting} title="只合并这个映射已发布的最新版本"><Play />立即合并</Button>
+                <Button type="submit" variant="outline" disabled={submitting} title={t('只合并这个映射已发布的最新版本')}><Play />{t('立即合并')}</Button>
               </Form>
             )}
             {disable?.canPublish && <DisableActions disable={disable} submitting={submitting} />}
@@ -602,11 +624,11 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
       {mapping.pendingEntity && (
         <Alert role="status">
           <AlertTriangle />
-          <AlertTitle>{`实体待补登：${mapping.entity} 还没有已发布的登记`}</AlertTitle>
+          <AlertTitle>{t('实体待补登：{entity} 还没有已发布的登记', { entity: mapping.entity })}</AlertTitle>
           <AlertDescription>
             <p>
-              登记发布前，这个映射保存不了新草稿；已发布的版本照常合并。
-              <Link to={mapping.pendingEntity} className="underline">去实体页确认登记</Link>，再由另一位成员发布。
+              {t('登记发布前，这个映射保存不了新草稿；已发布的版本照常合并。')}
+              <Link to={mapping.pendingEntity} className="underline">{t('去实体页确认登记')}</Link>{t('，再由另一位成员发布。')}
             </p>
           </AlertDescription>
         </Alert>
@@ -614,9 +636,9 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
       {keySpaceChange && (
         <Alert role="status" data-key-space-followers>
           <AlertTriangle className="text-amber-600" />
-          <AlertTitle>{`主键的键空间由 ${keySpaceChange.from ?? '未声明'} 改为 ${keySpaceChange.to ?? '未声明'}`}</AlertTitle>
+          <AlertTitle>{t('主键的键空间由 {from} 改为 {to}', { from: keySpaceChange.from ?? t('未声明'), to: keySpaceChange.to ?? t('未声明') })}</AlertTitle>
           <AlertDescription>
-            <p>同一数据源里这些已发布映射的引用字段还按旧的键空间写，关系会对不上。请把它们改成{keySpaceChange.to ? ` key_space: ${keySpaceChange.to}` : '不写键空间'}，与本映射一起改、一起发布（本映射先发布）：</p>
+            <p>{t('同一数据源里这些已发布映射的引用字段还按旧的键空间写，关系会对不上。请把它们改成 {keySpace}，与本映射一起改、一起发布（本映射先发布）：', { keySpace: keySpaceChange.to ? `key_space: ${keySpaceChange.to}` : t('不写键空间') })}</p>
             <ul className="mt-1 space-y-0.5">
               {keySpaceChange.followers.map(f => (
                 <li key={f.mapping}>
@@ -631,13 +653,13 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
       )}
       {disable && <DisableStatus disable={disable} />}
       {actionData?.error && <MappingErrors error={actionData.error} issues={actionData.issues} />}
-      {actionData && 'notices' in actionData && actionData.notices && <MappingNotices title="草稿已保存，检查有以下提示（不影响发布）" notices={actionData.notices} />}
+      {actionData && 'notices' in actionData && actionData.notices && <MappingNotices title={t('草稿已保存，检查有以下提示（不影响发布）')} notices={actionData.notices} />}
 
       <div className="grid gap-4 lg:grid-cols-[1fr_auto_1fr_1.2fr]">
         <Link to={`/sources/${mapping.source.id}`} className="flex items-center gap-3 rounded-2xl border bg-white p-5 shadow-sm transition hover:shadow-md">
           <KindIcon kind={mapping.source.kind} />
           <span className="min-w-0">
-            <span className="block text-xs text-slate-500">源表</span>
+            <span className="block text-xs text-slate-500">{t('{n, plural, other {源表}}', { n: 1 })}</span>
             <span className="block truncate font-medium">{mapping.source.name} / <span className="font-mono">{mapping.table}</span></span>
           </span>
         </Link>
@@ -645,20 +667,20 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
         <Link to={mapping.entityPage} className="flex items-center gap-3 rounded-2xl border bg-white p-5 shadow-sm transition hover:shadow-md">
           <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-violet-100 text-violet-700"><Boxes className="size-5" /></span>
           <span className="min-w-0">
-            <span className="block text-xs text-slate-500">{isCustomEntity(mapping.entity) ? '自定义实体' : '标准实体'}</span>
-            <span className="block truncate font-medium">{`${mapping.entityLabel}（${mapping.entity}）`}</span>
+            <span className="block text-xs text-slate-500">{t('{kind, select, custom {自定义实体} other {标准实体}}', { kind: isCustomEntity(mapping.entity) ? 'custom' : 'canonical' })}</span>
+            <span className="block truncate font-medium">{`${entityName}（${mapping.entity}）`}</span>
           </span>
         </Link>
         <div className="grid grid-cols-2 gap-4">
           <StatTile
-            label="线上版本"
+            label={t('线上版本')}
             value={live ? `v${live.version}` : '—'}
-            hint={draft ? <span className="inline-flex items-center gap-1 text-amber-600"><PencilLine className="size-3" />{`有草稿 v${draft.version}`}</span> : live ? '已发布的最新版本' : '还没有发布'}
+            hint={draft ? <span className="inline-flex items-center gap-1 text-amber-600"><PencilLine className="size-3" />{t('有草稿 v{version}', { version: draft.version })}</span> : live ? t('已发布的最新版本') : t('还没有发布')}
           />
           <StatTile
-            label={<span className="inline-flex items-center gap-1">{merge.status === 'failed' && <AlertTriangle className="size-3.5 text-red-600" />}{`最近合并 · ${merge.statusLabel}`}</span>}
-            value={lastMerge && 'rows' in lastMerge ? lastMerge.rows.toLocaleString('zh-CN') : '—'}
-            hint="标准层行数"
+            label={<span className="inline-flex items-center gap-1">{merge.status === 'failed' && <AlertTriangle className="size-3.5 text-red-600" />}{t('最近合并 · {status}', { status: builtinName(t, merge.statusLabel) })}</span>}
+            value={lastMerge && 'rows' in lastMerge ? formatNumber(locale, lastMerge.rows) : '—'}
+            hint={t('标准层行数')}
             tone={merge.status === 'failed' ? 'text-red-600' : undefined}
           />
         </div>
@@ -667,9 +689,9 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
       <PillTabs
         current={tab}
         tabs={[
-          { key: 'edit', label: '编辑', href: base },
-          { key: 'versions', label: `版本（${versions.length}）`, href: `${base}?tab=versions` },
-          { key: 'merges', label: `合并记录（${merge.history.length}）`, href: `${base}?tab=merges` },
+          { key: 'edit', label: t('编辑'), href: base },
+          { key: 'versions', label: t('版本（{n}）', { n: versions.length }), href: `${base}?tab=versions` },
+          { key: 'merges', label: t('合并记录（{n}）', { n: merge.history.length }), href: `${base}?tab=merges` },
         ]}
       />
 
@@ -677,11 +699,11 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
         {tab === 'edit' && selected && (
           <>
             <div className="mb-4 space-y-1">
-              <div className="flex items-center gap-2 text-sm text-slate-500">正在查看 <span className="font-mono font-semibold text-slate-900">{`v${selected.version}`}</span><VersionStatus v={selected} sameAs={selected.status === 'draft' ? sameAs : null} /></div>
+              <div className="flex items-center gap-2 text-sm text-slate-500">{t('正在查看')} <span className="font-mono font-semibold text-slate-900">{`v${selected.version}`}</span><VersionStatus v={selected} sameAs={selected.status === 'draft' ? sameAs : null} /></div>
               <p className="max-w-2xl text-sm text-slate-500">
                 {canWrite
-                  ? selected.status === 'draft' ? '保存后你是最后改这一版草稿的人，需由另一位数据工程师或管理员发布。' : draft ? `已发布的版本锁定。已有草稿 v${draft.version}，请在草稿上修改。` : '已发布的版本锁定，在这一版的基础上修改，保存为新的一版草稿。'
-                  : '只读。'}
+                  ? selected.status === 'draft' ? t('保存后你是最后改这一版草稿的人，需由另一位数据工程师或管理员发布。') : draft ? t('已发布的版本锁定。已有草稿 v{version}，请在草稿上修改。', { version: draft.version }) : t('已发布的版本锁定，在这一版的基础上修改，保存为新的一版草稿。')
+                  : t('只读。')}
               </p>
             </div>
             {/* 加列的底稿是草稿或最新已发布版本，只在查看的就是它时提供 */}
@@ -694,22 +716,22 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
                 <MappingEditorWithReference defaultValue={actionData?.yaml ?? selected.yaml} table={mapping.reference} entity={mapping.entity} registered={mapping.registered} functions={functions} focus={focus} validateAction={base} />
                 <div className="flex gap-2">
                   <Button type="submit" name="intent" value="save" disabled={submitting}>
-                    {submitting ? '正在处理…' : selected.status === 'draft' ? '校验并保存草稿' : '校验并保存为新草稿'}
+                    {submitting ? t('正在处理…') : selected.status === 'draft' ? t('校验并保存草稿') : t('校验并保存为新草稿')}
                   </Button>
-                  <Button type="submit" name="intent" value="draft" variant="outline" disabled={submitting || !mapping.reference} title="按列名、类型与常见取值生成，替换编辑框里的内容；不会保存">
-                    按规则生成草稿
+                  <Button type="submit" name="intent" value="draft" variant="outline" disabled={submitting || !mapping.reference} title={t('按列名、类型与常见取值生成，替换编辑框里的内容；不会保存')}>
+                    {t('按规则生成草稿')}
                   </Button>
                   <Button
                     type="submit" name="intent" value="model-draft" variant="outline" disabled={submitting || !mapping.reference}
-                    title="会把表结构与列统计发给模型服务（打开「发送脱敏样本」时附 5 行脱敏样本）；结构与已发布映射一致时直接复用、不调用模型，没配置模型服务时按规则生成。替换编辑框里的内容，不会保存"
+                    title={t('会把表结构与列统计发给模型服务（打开「发送脱敏样本」时附 5 行脱敏样本）；结构与已发布映射一致时直接复用、不调用模型，没配置模型服务时按规则生成。替换编辑框里的内容，不会保存')}
                   >
-                    用模型重新生成
+                    {t('用模型重新生成')}
                   </Button>
                   <Button
                     type="submit" name="intent" value="model-assertions" variant="outline" disabled={submitting || !mapping.reference}
-                    title="会把表结构与列统计（打开「发送脱敏样本」时附 5 行脱敏样本）和已保存的这一版映射（有草稿时是草稿）发给模型服务，以它为底只替换 assertions 块填进编辑框，编辑框里没保存的修改会被换掉；不会保存"
+                    title={t('会把表结构与列统计（打开「发送脱敏样本」时附 5 行脱敏样本）和已保存的这一版映射（有草稿时是草稿）发给模型服务，以它为底只替换 assertions 块填进编辑框，编辑框里没保存的修改会被换掉；不会保存')}
                   >
-                    用模型建议断言
+                    {t('用模型建议断言')}
                   </Button>
                 </div>
               </Form>
@@ -720,8 +742,8 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
               <Form method="post" className="mt-4 flex flex-wrap items-center gap-3">
                 <input type="hidden" name="intent" value="dryrun" />
                 <input type="hidden" name="version" value={selected.version} />
-                <Button type="submit" variant="outline" disabled={submitting}><FlaskConical />{`空跑 v${selected.version}`}</Button>
-                <span className="text-sm text-slate-500">在原始层最新的样本上转换已保存的这一版，看样例行与基础断言；编辑框里没保存的修改不参与，也不写标准层。</span>
+                <Button type="submit" variant="outline" disabled={submitting}><FlaskConical />{t('空跑 v{version}', { version: selected.version })}</Button>
+                <span className="text-sm text-slate-500">{t('在原始层最新的样本上转换已保存的这一版，看样例行与基础断言；编辑框里没保存的修改不参与，也不写标准层。')}</span>
               </Form>
             )}
             {actionData?.dryRun && actionData.dryRun.version === selected.version && <DryRunPanel entity={mapping.entity} result={actionData.dryRun} />}
@@ -730,14 +752,14 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
 
         {tab === 'versions' && (
           <>
-            <p className="mb-4 max-w-2xl text-sm text-slate-500">已发布的版本锁定，修改会形成新的一版草稿；草稿需由最后保存它的人以外的另一位数据工程师或管理员发布，也可以丢弃。</p>
+            <p className="mb-4 max-w-2xl text-sm text-slate-500">{t('已发布的版本锁定，修改会形成新的一版草稿；草稿需由最后保存它的人以外的另一位数据工程师或管理员发布，也可以丢弃。')}</p>
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>版本</TableHead>
-                  <TableHead>状态</TableHead>
-                  <TableHead>作者</TableHead>
-                  <TableHead>发布</TableHead>
+                  <TableHead>{t('版本')}</TableHead>
+                  <TableHead>{t('状态')}</TableHead>
+                  <TableHead>{t('作者')}</TableHead>
+                  <TableHead>{t('发布')}</TableHead>
                   <TableHead />
                 </TableRow>
               </TableHeader>
@@ -746,10 +768,10 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
                   <TableRow key={v.version} data-version={v.version} data-version-status={v.status}>
                     <TableCell className="font-mono font-semibold">{`v${v.version}`}</TableCell>
                     <TableCell><VersionStatus v={v} sameAs={v.status === 'draft' ? sameAs : null} /></TableCell>
-                    <TableCell className="text-sm">{v.authors.join('、') || '平台'}</TableCell>
-                    <TableCell className="text-sm text-slate-500">{v.publishedBy ? `${v.publishedBy}，${time(v.publishedAt)}` : '—'}</TableCell>
+                    <TableCell className="text-sm">{v.authors.join(t('、')) || t('平台')}</TableCell>
+                    <TableCell className="text-sm text-slate-500">{v.publishedBy ? `${v.publishedBy}${t('，')}${v.publishedAt ? formatDateTime(locale, v.publishedAt) : '—'}` : '—'}</TableCell>
                     <TableCell className="text-right">
-                      <Button asChild size="sm" variant="ghost"><Link to={`${base}?version=${v.version}`}>查看</Link></Button>
+                      <Button asChild size="sm" variant="ghost"><Link to={`${base}?version=${v.version}`}>{t('查看')}</Link></Button>
                     </TableCell>
                   </TableRow>
                 ))}
@@ -763,29 +785,29 @@ export default function Mapping({ loaderData, actionData }: Route.ComponentProps
             {merge.hotCount > 0 && (
               <p className="mb-4 flex w-fit items-center gap-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700" data-hot-alert>
                 <AlertTriangle className="size-4" />
-                {`${merge.hotCount} 个匹配值各连了 ${merge.hotThreshold} 条以上记录，可能是占位号或代填号。`}
-                <Link to="/quality" className="font-medium underline">去数据质量页查看</Link>
+                {t('{count} 个匹配值各连了 {threshold} 条以上记录，可能是占位号或代填号。', { count: merge.hotCount, threshold: merge.hotThreshold })}
+                <Link to="/quality" className="font-medium underline">{t('去数据质量页查看')}</Link>
               </p>
             )}
             <p className="mb-4 max-w-2xl text-sm text-slate-500">
               {merge.status === 'failed' && <AlertTriangle className="mr-1 inline size-3.5 text-red-600" />}
-              {`这个映射最近一次合并：${merge.statusLabel}。发布后、以及同步给这个映射的源表写入了变更后，已发布的最新版本把原始层的新批次合并进标准层；换了版本时由全部批次重建。写了兜底值的字段，每次合并列出本次落入兜底的取值。`}
+              {t('这个映射最近一次合并：{status}。发布后、以及同步给这个映射的源表写入了变更后，已发布的最新版本把原始层的新批次合并进标准层；换了版本时由全部批次重建。写了兜底值的字段，每次合并列出本次落入兜底的取值。', { status: builtinName(t, merge.statusLabel) })}
             </p>
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>版本</TableHead>
-                  <TableHead>方式</TableHead>
-                  <TableHead>标准层行数</TableHead>
-                  <TableHead>耗时</TableHead>
-                  <TableHead>开始时间</TableHead>
+                  <TableHead>{t('版本')}</TableHead>
+                  <TableHead>{t('方式')}</TableHead>
+                  <TableHead>{t('标准层行数')}</TableHead>
+                  <TableHead>{t('耗时')}</TableHead>
+                  <TableHead>{t('开始时间')}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {merge.history.map((e, i) => <MergeRow key={`${e.taskId}-${i}`} e={e} base={base} canWrite={canWrite} />)}
                 {!merge.history.length && (
                   <TableRow>
-                    <TableCell colSpan={5} className="text-center text-slate-500">还没有合并过</TableCell>
+                    <TableCell colSpan={5} className="text-center text-slate-500">{t('还没有合并过')}</TableCell>
                   </TableRow>
                 )}
               </TableBody>
