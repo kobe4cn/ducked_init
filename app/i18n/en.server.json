@@ -21,6 +21,7 @@
   "、": ", ",
   "连接正常：{count, plural, other {# 张表}}，账号只读": "Connected: {count, plural, one {# table} other {# tables}}, account is read-only",
   "连接正常：{count, plural, other {# 张表}}，账号只读；{unreadable, plural, other {# 张表}}没有读权限，不能选入同步范围：{names}": "Connected: {count, plural, one {# table} other {# tables}}, account is read-only; {unreadable, plural, one {# table} other {# tables}} cannot be read and cannot be added to the sync scope: {names}",
+  "没有要采纳的关系": "No relation to adopt",
   "文件超过本租户上传上限 {mb} MiB": "File exceeds this tenant's upload limit of {mb} MiB",
   "{fn} 的第 {n} 个参数（格式）必须是单引号括起的字符串": "Argument {n} of {fn} (the format) must be a single-quoted string",
   "{fn} 的第 {n} 个参数（时区）必须是单引号括起的字符串": "Argument {n} of {fn} (the time zone) must be a single-quoted string",

@@ -8,7 +8,8 @@ import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/entities';
 import { can, requirePermission } from '~/.server/access';
 import { createCustomEntity, CustomEntityError, customEntityInputOf, listCustomEntities, relationTargets } from '~/.server/custom-entities';
-import { errorTextFor } from '~/.server/i18n';
+import { errorTextFor, formatServer } from '~/.server/i18n';
+import { getLocale } from '~/.server/locale';
 import { referenceTables } from '~/.server/mappings';
 import { navFor } from '~/.server/nav';
 import { createPassthrough } from '~/.server/passthrough';
@@ -22,10 +23,15 @@ import { Field, FieldGroup, FieldLabel } from '~/components/ui/field';
 import { Input } from '~/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '~/components/ui/native-select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui/table';
+import { builtinName, ENUM_LABELS } from '~/lib/builtin-names';
 import { CUSTOM_ENTITY_KINDS } from '~/lib/canonical-model';
+import { makeT, msg, useT } from '~/lib/i18n';
 
-export function meta() {
-  return [{ title: '自定义实体 · CRM 数据分析平台' }];
+export function meta({ matches }: Route.MetaArgs) {
+  // RR8 的 MetaMatch 把 loader 数据放在 loaderData 字段；root 出错时为空，回退中文
+  const root = matches[0]?.loaderData;
+  const t = makeT(root?.locale ?? 'zh-CN', root?.messages ?? null);
+  return [{ title: `${t('自定义实体')} · ${t('CRM 数据分析平台')}` }];
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -63,7 +69,7 @@ export async function action({ request }: Route.ActionArgs) {
     }
   }
   const input = customEntityInputOf(form);
-  if (field('intent') !== 'create') return data({ error: '未知操作', input: null, passthrough: null }, { status: 400 });
+  if (field('intent') !== 'create') return data({ error: formatServer(await getLocale(request), msg('未知操作')), input: null, passthrough: null }, { status: 400 });
   try {
     const id = await createCustomEntity(await requirePermission(request, 'sources:write'), input);
     throw redirect(`/entities/${id}`);
@@ -75,57 +81,58 @@ export async function action({ request }: Route.ActionArgs) {
 
 export default function Entities({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, canWrite, creating, passthrough, entities, targets, sources, tables } = loaderData;
+  const t = useT();
   const submitting = useNavigation().state === 'submitting';
   const showPassthrough = canWrite && (passthrough || !!actionData?.passthrough);
   const showForm = canWrite && !showPassthrough && (creating || !entities.length || !!actionData);
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader
-        title="自定义实体"
-        description="标准模型之外、本租户自己登记的实体：名称以 custom_ 开头，映射可以写到它。登记的草稿需由另一位数据工程师或管理员发布。"
+        title={t('自定义实体')}
+        description={t('标准模型之外、本租户自己登记的实体：名称以 custom_ 开头，映射可以写到它。登记的草稿需由另一位数据工程师或管理员发布。')}
         actions={canWrite && (
           <>
-            {!showPassthrough && <Button asChild variant="outline"><Link to="/entities?passthrough=1"><Zap />从源表一键生成</Link></Button>}
-            {!showForm && <Button asChild><Link to="/entities?new=1"><Plus />新建自定义实体</Link></Button>}
+            {!showPassthrough && <Button asChild variant="outline"><Link to="/entities?passthrough=1"><Zap />{t('从源表一键生成')}</Link></Button>}
+            {!showForm && <Button asChild><Link to="/entities?new=1"><Plus />{t('新建自定义实体')}</Link></Button>}
           </>
         )}
       />
       {actionData?.error && (
         <Alert variant="destructive" role="alert">
           <CircleAlert />
-          <AlertTitle>{actionData.passthrough ? '没有生成' : '未保存'}</AlertTitle>
+          <AlertTitle>{actionData.passthrough ? t('没有生成') : t('未保存')}</AlertTitle>
           <AlertDescription>{actionData.error}</AlertDescription>
         </Alert>
       )}
       {showPassthrough && (
         <section className="rounded-2xl border bg-white p-6 shadow-sm">
-          <h2 className="mb-1 font-semibold">从源表一键生成</h2>
+          <h2 className="mb-1 font-semibold">{t('从源表一键生成')}</h2>
           <p className="mb-4 max-w-2xl text-sm text-slate-500">
-            选一张已采集的源表，生成实体的登记草稿（实体名留空时为 custom_&lt;表名&gt;，别的数据源已有同名表时另填一个）（每列一个字段，类型与敏感标记取自源列，主键取源表主键或声明的业务主键）和覆盖全部列的映射草稿。两份草稿都需由另一位数据工程师或管理员发布。
+            {t("选一张已采集的源表，生成实体的登记草稿（实体名留空时为 custom_'<'表名>，别的数据源已有同名表时另填一个）（每列一个字段，类型与敏感标记取自源列，主键取源表主键或声明的业务主键）和覆盖全部列的映射草稿。两份草稿都需由另一位数据工程师或管理员发布。")}
           </p>
           <PassthroughForm sources={sources} tables={tables} values={actionData?.passthrough ?? null} submitting={submitting} />
         </section>
       )}
       {showForm && (
         <section className="rounded-2xl border bg-white p-6 shadow-sm">
-          <h2 className="mb-1 font-semibold">新建自定义实体</h2>
-          {!entities.length && <p className="mb-4 max-w-2xl text-sm text-slate-500">还没有自定义实体。登记名称、字段与主键，保存为第一版草稿。</p>}
-          <CustomEntityForm intent="create" values={actionData?.input} targets={targets} submitting={submitting} submitLabel="保存草稿" />
+          <h2 className="mb-1 font-semibold">{t('新建自定义实体')}</h2>
+          {!entities.length && <p className="mb-4 max-w-2xl text-sm text-slate-500">{t('还没有自定义实体。登记名称、字段与主键，保存为第一版草稿。')}</p>}
+          <CustomEntityForm intent="create" values={actionData?.input} targets={targets} submitting={submitting} submitLabel={t('保存草稿')} />
         </section>
       )}
       {!entities.length && !canWrite && (
-        <div className="rounded-2xl border bg-white p-6 text-sm text-slate-500 shadow-sm">还没有自定义实体。数据工程师或管理员可以在这里登记。</div>
+        <div className="rounded-2xl border bg-white p-6 text-sm text-slate-500 shadow-sm">{t('还没有自定义实体。数据工程师或管理员可以在这里登记。')}</div>
       )}
       {!!entities.length && (
         <div className="overflow-x-auto rounded-2xl border bg-white">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>名称</TableHead>
-                <TableHead>中文名</TableHead>
-                <TableHead>类型</TableHead>
-                <TableHead>已发布</TableHead>
-                <TableHead>草稿</TableHead>
+                <TableHead>{t('名称')}</TableHead>
+                <TableHead>{t('中文名')}</TableHead>
+                <TableHead>{t('类型')}</TableHead>
+                <TableHead>{t('已发布')}</TableHead>
+                <TableHead>{t('草稿')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -133,9 +140,9 @@ export default function Entities({ loaderData, actionData }: Route.ComponentProp
                 <TableRow key={e.id} data-custom-entity={e.name}>
                   <TableCell><Link to={`/entities/${e.id}`} className="font-mono font-semibold hover:underline">{e.name}</Link></TableCell>
                   <TableCell>{e.label}</TableCell>
-                  <TableCell className="text-sm">{CUSTOM_ENTITY_KINDS[e.kind]}</TableCell>
-                  <TableCell className="text-sm">{e.published ? <span className="inline-flex items-center gap-1 text-emerald-600"><CheckCircle2 className="size-3.5" />{`已发布 v${e.published}`}</span> : <span className="text-slate-400">—</span>}</TableCell>
-                  <TableCell className="text-sm">{e.draft ? <span className="inline-flex items-center gap-1 text-amber-600" data-inferred={e.inferred || undefined}><PencilLine className="size-3.5" />{e.inferred ? `推断登记 · 待确认 v${e.draft}` : `草稿 v${e.draft}`}</span> : <span className="text-slate-400">—</span>}</TableCell>
+                  <TableCell className="text-sm">{builtinName(t, CUSTOM_ENTITY_KINDS[e.kind], ENUM_LABELS)}</TableCell>
+                  <TableCell className="text-sm">{e.published ? <span className="inline-flex items-center gap-1 text-emerald-600"><CheckCircle2 className="size-3.5" />{t('已发布 v{version}', { version: e.published })}</span> : <span className="text-slate-400">—</span>}</TableCell>
+                  <TableCell className="text-sm">{e.draft ? <span className="inline-flex items-center gap-1 text-amber-600" data-inferred={e.inferred || undefined}><PencilLine className="size-3.5" />{e.inferred ? t('推断登记 · 待确认 v{version}', { version: e.draft }) : t('草稿 v{version}', { version: e.draft })}</span> : <span className="text-slate-400">—</span>}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -153,34 +160,35 @@ function PassthroughForm({ sources, tables, values, submitting }: {
   values: { sourceId: string; table: string; name: string } | null;
   submitting: boolean;
 }) {
+  const t = useT();
   const [sourceId, setSourceId] = useState(values?.sourceId ?? sources[0]?.id ?? '');
   const sourceTables = tables[sourceId] ?? [];
-  if (!sources.length) return <p className="text-sm text-slate-500">还没有数据源。先到「数据源」登记并采集，再回来生成。</p>;
+  if (!sources.length) return <p className="text-sm text-slate-500">{t('还没有数据源。先到「数据源」登记并采集，再回来生成。')}</p>;
   return (
     <Form method="post" action="/entities?passthrough=1">
       <FieldGroup>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field>
-            <FieldLabel htmlFor="passthrough-source">数据源</FieldLabel>
+            <FieldLabel htmlFor="passthrough-source">{t('数据源')}</FieldLabel>
             <NativeSelect id="passthrough-source" name="sourceId" value={sourceId} onChange={e => setSourceId(e.target.value)}>
               {sources.map(s => <NativeSelectOption key={s.id} value={s.id}>{s.name}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
           <Field>
-            <FieldLabel htmlFor="passthrough-table">源表</FieldLabel>
+            <FieldLabel htmlFor="passthrough-table">{t('源表')}</FieldLabel>
             <NativeSelect id="passthrough-table" name="table" key={sourceId} defaultValue={values?.sourceId === sourceId ? values.table : undefined} disabled={!sourceTables.length}>
-              {sourceTables.map(t => <NativeSelectOption key={t} value={t}>{t}</NativeSelectOption>)}
+              {sourceTables.map(tb => <NativeSelectOption key={tb} value={tb}>{tb}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
         </div>
         <Field className="sm:max-w-sm">
-          <FieldLabel htmlFor="passthrough-name">实体名（可选）</FieldLabel>
-          <Input id="passthrough-name" name="name" className="font-mono" placeholder="custom_<表名>" defaultValue={values?.name ?? ''} />
+          <FieldLabel htmlFor="passthrough-name">{t('实体名（可选）')}</FieldLabel>
+          <Input id="passthrough-name" name="name" className="font-mono" placeholder={t("custom_'<'表名>")} defaultValue={values?.name ?? ''} />
         </Field>
-        {!sourceTables.length && <p className="text-sm text-slate-500">这个数据源还没有已采集的源表。</p>}
+        {!sourceTables.length && <p className="text-sm text-slate-500">{t('这个数据源还没有已采集的源表。')}</p>}
         <div className="flex gap-2">
-          <Button type="submit" name="intent" value="passthrough" disabled={submitting || !sourceTables.length}>{submitting ? '正在生成…' : '生成登记与映射草稿'}</Button>
-          <Button asChild variant="outline"><Link to="/entities">取消</Link></Button>
+          <Button type="submit" name="intent" value="passthrough" disabled={submitting || !sourceTables.length}>{submitting ? t('正在生成…') : t('生成登记与映射草稿')}</Button>
+          <Button asChild variant="outline"><Link to="/entities">{t('取消')}</Link></Button>
         </div>
       </FieldGroup>
     </Form>
