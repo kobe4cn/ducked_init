@@ -27,12 +27,19 @@ export const MAX_REQUEST = 2000;
 /** 目录在提示里最多占的字数，超出的表略去 */
 const MAX_CATALOG = 30_000;
 
-/** 起草的 SQL，或做不到的原因（二选一；都给时按做不到处理）。不用 oneOf：ajv allErrors 下报错很杂 */
+/**
+ * 起草的 SQL，或做不到的原因（二选一；都给且原因不是空白时按做不到处理）。不用 oneOf：ajv allErrors 下报错很杂。
+ * 长度限制写在 anyOf 的分支里而不是顶层 properties：另一项是空字符串时（{"sql": "", "unsupported": "原因"}、
+ * {"sql": "SELECT 1", "unsupported": ""}）只要有一个分支成立就通过，不报 Schema 错误
+ */
 const SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  properties: { sql: { type: 'string', minLength: 1 }, unsupported: { type: 'string', minLength: 1, pattern: '\\S' } },
-  anyOf: [{ required: ['sql'] }, { required: ['unsupported'] }],
+  properties: { sql: { type: 'string' }, unsupported: { type: 'string' } },
+  anyOf: [
+    { required: ['unsupported'], properties: { unsupported: { minLength: 1, pattern: '\\S' } } },
+    { required: ['sql'], properties: { sql: { minLength: 1 } } },
+  ],
 };
 /** 做不到的原因最多的字数 */
 const MAX_UNSUPPORTED = 500;
@@ -85,11 +92,12 @@ export async function draftWorkbenchSql(actor: CurrentMember, request: string): 
       if (e instanceof LlmError) throw new WorkbenchAiError(`模型起草 SQL 失败：${e.message}`, 422);
       throw e;
     }
-    if (output.unsupported !== undefined) {
+    const reason = output.unsupported?.trim();
+    if (reason) {
       await recordAudit(getDb(), { tenantId, actor, action: 'workbench.ai_drafted', targetType: 'workbench', detail: { unsupported: true } });
-      throw new WorkbenchAiError(output.unsupported.trim().slice(0, MAX_UNSUPPORTED), 422);
+      throw new WorkbenchAiError(reason.slice(0, MAX_UNSUPPORTED), 422);
     }
-    // SCHEMA 的 anyOf 保证没给 unsupported 时一定有非空的 sql
+    // unsupported 没给或只有空白时 SCHEMA anyOf 的第一个分支不成立（它要求有非空白字符），通过校验靠的是第二个分支，所以一定有非空的 sql
     const { sql, problem } = await checkDraftedSql(actor, output.sql!);
     if (problem) throw new WorkbenchAiError(`AI 起草的 SQL 没有通过校验：${problem}`, 422);
     return { sql };
