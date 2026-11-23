@@ -6,6 +6,7 @@ import { runHooks, type HookWhen } from '../../app/.server/pipeline/task-hooks';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import type { ClaimedTask } from '../../app/.server/tasks';
 import { enqueueTask, getTask, listTasks } from '../../app/.server/tasks';
+import * as tasksModule from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { newTenant } from './fixtures';
 
@@ -114,5 +115,38 @@ describe('调度器的 hooks 选项', () => {
     const [task] = await listTasks(acme);
     expect(task.status).toBe('succeeded');
     expect(seen).toEqual([{ id: task.id, kind: 'lake.inventory', status: 'succeeded' }]); // 钩子拿到该任务，且跑在 finishTask 之后
+  });
+
+  it('领取时名额被占、领完前任务结束：runUntilIdle 不提前返回，排队的下一个任务照样跑完', async () => {
+    const acme = await newTenant('acme');
+    await enqueueTask(acme, 'lake.inventory', {});
+    await enqueueTask(acme, 'lake.inventory', {});
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    // 放大领任务与收尾之间的竞争窗口（#1141，写法照 identity-recompute 的 #563）：租户并发上限是 1，
+    // 第一次领取拿到 null（名额被第一个任务占着）时不马上返回，等第一个任务结束的钩子放行、
+    // 再等 50 ms 让它的 .finally 执行完，才把 null 交回 fill——这期间 runUntilIdle 正在 tick 里、不在 nap 里，
+    // 收尾调的 wake 丢掉；idle 判断只看 busy() 的话第二个任务一次都没被领过，留在 queued
+    const originalClaim = tasksModule.claimNextTask;
+    let firstNull = true;
+    vi.spyOn(tasksModule, 'claimNextTask').mockImplementation(async () => {
+      const task = await originalClaim();
+      if (!task && firstNull) {
+        firstNull = false;
+        await firstGate;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      return task;
+    });
+    try {
+      await createDispatcher({
+        maxWorkers: 2,
+        hooks: { 'lake.inventory': [{ name: 'gate', when: 'succeeded', run: async () => { releaseFirst(); } }] },
+      }).runUntilIdle();
+      const statuses = (await listTasks(acme)).map(t => t.status).sort();
+      expect(statuses).toEqual(['succeeded', 'succeeded']);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
