@@ -131,6 +131,7 @@ describe('AI 助手的一轮问答', () => {
     expect(system).toContain('validate_plan');
     expect(system).toContain('needs_clarification');
     expect(system).toContain('unsupported');
+    expect(system).toContain('silver._identities');
     // 没有 priorPlan 时不带「对话里最近一份计划」摘要（#1179）
     expect(system).toContain('本轮或对话里最近一份计划已检索到的条目');
     expect(system).not.toContain('prior_plan:');
