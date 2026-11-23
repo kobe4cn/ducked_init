@@ -144,9 +144,10 @@ export const ensureCatalogVersion = (tenantId: string) => recordCatalogVersionIf
  * 提前补算检索向量（#824）：catalogTx 提交后、运营打开混合检索、租户保存 embedding 配置时调用，让第一次混合检索不必等后台补算。
  * 租户没开混合检索或没配 embedding 端点时返回 off，不刷投影也不排任务（先查开关，没开的租户不再多查端点）；
  * 否则先把检索投影刷到最新（refreshProjection）：改动多时它自己去重排 catalog.projection、其结束钩子照常 ensureEmbeddings，这里返回 queued；
- * 改动少时同步刷新完再 ensureEmbeddings，去重排一个 catalog.embed；向量已齐时返回 fresh。幂等：投影与向量都齐了什么都不排
+ * 改动少时同步刷新完再 ensureEmbeddings，去重排一个 catalog.embed；向量已齐时返回 fresh。幂等：投影与向量都齐了什么都不排。
+ * 最近一次补算失败、还在退避期内时照 ensureEmbeddings 返回 backoff，不排任务
  */
-export async function prefetchEmbeddings(tenantId: string): Promise<'off' | 'fresh' | 'queued'> {
+export async function prefetchEmbeddings(tenantId: string): Promise<'off' | 'fresh' | 'queued' | 'backoff'> {
   const [tenant] = await getDb().select({ hybridSearch: tenants.hybridSearch }).from(tenants).where(eq(tenants.id, tenantId));
   if (!tenant?.hybridSearch) return 'off';
   if (!(await resolveEmbeddingProvider(tenantId))) return 'off';

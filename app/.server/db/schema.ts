@@ -726,6 +726,8 @@ export const dslVersions = platform.table('dsl_versions', {
 // 向量存储四列（ADR-0058，#848）：vector_store 选平台库还是租户自己的外部 pgvector（默认 platform；#849 起检索真正切换）。
 // 连接串整串用 context vector_store 加密（url 只在这一个输入框里换主机）、保存时先测连通失败不保存，checked_at / error 记最近一次结果；
 // 切回 platform 时这三列保留，方便撤回
+// 向量补算两列（#1172）：embedding_fill_error 是最近一次 fillEmbeddings 失败的原因（抹过 Key 与连接串，成功时清空），embedding_fill_at 是那次补算结束的时间；
+// 最近一次失败且不到 10 分钟时 ensureEmbeddings 不再入队（退避）。没有本行（走平台 embedding）时补算 upsert 只写这两列建行
 export const modelProviders = platform.table('model_providers', {
   tenantId: uuid('tenant_id').primaryKey().references(() => tenants.id, { onDelete: 'cascade' }),
   baseUrl: text('base_url'),
@@ -752,6 +754,8 @@ export const modelProviders = platform.table('model_providers', {
   vectorStoreUrl: text('vector_store_url'),
   vectorStoreCheckedAt: timestamp('vector_store_checked_at', { withTimezone: true }),
   vectorStoreError: text('vector_store_error'),
+  embeddingFillError: text('embedding_fill_error'),
+  embeddingFillAt: timestamp('embedding_fill_at', { withTimezone: true }),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, t => [check('model_providers_vector_store', sql`${t.vectorStore} in ('platform', 'pgvector')`)]);
 

@@ -1,11 +1,12 @@
 // test/pipeline/catalog-hybrid.test.ts —— 混合检索（ADR-0047、0049）的接缝：rankedSearch({ hybrid: true }) → vectorHits（查询 embedding + catalog_embeddings 缓存）→ rank 的向量一路；
-// embedding 超时（短超时）、5xx 或没配置时只去掉向量这一路（fallback 仍为 false、结果与关键词检索逐项相同，vectorFallback 给出原因）；换模型后缺向量的条目只走关键词并入队补算，drain 后向量一路恢复；
+// embedding 超时（短超时）、5xx 或没配置时只去掉向量这一路（fallback 仍为 false、结果与关键词检索逐项相同，vectorFallback 给出原因）；换模型后这批行一个向量都没有时 vectorFallback 是 not_ready、只走关键词并入队补算，drain 后向量一路恢复；
+// 补算批量请求失败时记下 embedding_fill_error、10 分钟内检索不再入队（backoff）、catalog_search 输出 not_ready，成功后清空错误（#1172）；
 // catalog_search（内部与 MCP 同一入口）按租户 hybrid_search 开关决定是否走混合（#432）；
 // hybridReady 断言向量缓存齐全，缺了就在报错里列出诊断（#610）
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runTool } from '../../app/.server/assistant/tools';
-import { ensureEmbeddings, QUERY_EMBED_TIMEOUT_MS } from '../../app/.server/catalog/embeddings';
+import { EMBED_FILL_BACKOFF_MS, ensureEmbeddings, QUERY_EMBED_TIMEOUT_MS } from '../../app/.server/catalog/embeddings';
 import { haystack, terms } from '../../app/.server/catalog/index';
 import { tenantCatalog } from '../../app/.server/catalog/load';
 import { projectionVersion, rankedSearch, refreshProjection } from '../../app/.server/catalog/projection';
@@ -21,7 +22,7 @@ import { embeddings, fakeLlm, platformEmbedding, type LlmBody } from './llm-fixt
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+afterEach(() => { vi.useRealTimers(); setLlmFetch(undefined); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 /** 只靠向量命中的查询；MARK 只出现在目标指标的说明里——关键词分不出它们，假向量让两者同向、其余正交 */
 const QUERY = '顾客流失风险';
@@ -74,10 +75,13 @@ async function hybridReady() {
 
 /** 给租户配自己的 embedding 三项（chat 三列为空），换模型用 */
 async function tenantEmbedding(tenantId: string, model: string) {
-  await getDb().insert(modelProviders).values({
-    tenantId, embeddingBaseUrl: 'https://tenant-embed.example.com/v1', embeddingModel: model,
+  const columns = {
+    embeddingBaseUrl: 'https://tenant-embed.example.com/v1', embeddingModel: model,
     embeddingApiKey: await encryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, { apiKey: 'sk-tenant-embed-secret' }),
-  });
+  };
+  // upsert：hybridReady 的补算成功时已经建了本行（只写了 embedding_fill_* 两列，#1172）
+  await getDb().insert(modelProviders).values({ tenantId, ...columns })
+    .onConflictDoUpdate({ target: modelProviders.tenantId, set: columns });
 }
 
 describe('混合检索', () => {
@@ -155,13 +159,14 @@ describe('混合检索', () => {
     expect(JSON.stringify(failed)).not.toContain(QUERY);
   });
 
-  it('换模型后、补算完成前 hybrid: true 仍正常返回：缺向量的条目只走关键词并入队一个 catalog.embed（重复检索不重复入队）；drain 后再检索向量一路恢复', async () => {
+  it('换模型后、补算完成前 hybrid: true 仍正常返回：这批行一个向量都没有时 vectorFallback 是 not_ready，只走关键词并入队一个 catalog.embed（重复检索不重复入队）；drain 后再检索向量一路恢复', async () => {
     const { acme, c } = await hybridReady();
     await tenantEmbedding(acme, 'bge-m3'); // 缓存里的行都是旧模型的，当前模型一个都命中不了
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const degraded = await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true });
     expect(degraded.fallback).toBe(false);
+    expect(degraded.vectorFallback).toBe('not_ready');
     expect(degraded.ranked.map(r => r.entry.id)).not.toContain('metric:churn_forecast');
     expect(degraded.ranked.flatMap(r => r.reasons.map(x => x.lane))).not.toContain('vector');
     expect((await embedTasks(acme)).map(t => t.status)).toEqual(['succeeded', 'queued']); // 入队补算
@@ -208,5 +213,52 @@ describe('混合检索', () => {
     const out = await runTool(analyst, 'catalog_search', { query: QUERY });
     expect(out.split('\n\n')[1]).toBe('vector_fallback: embed_failed');
     expect(out).not.toContain(MARK); // 向量一路没生效：只靠向量命中的条目不在结果里
+  });
+
+  it('补算的批量 embedding 请求返回 400：记下 embedding_fill_error（不含 Key）、10 分钟内检索不再发补算请求（ensureEmbeddings 返回 backoff）、catalog_search 输出 not_ready；过了退避期换好端点后补算成功、错误清空、向量一路恢复（#1172）', async () => {
+    const { acme, analyst } = await hybridReady();
+    await getDb().update(tenants).set({ hybridSearch: true }).where(eq(tenants.id, acme));
+    await tenantEmbedding(acme, 'bge-m3'); // 当前模型下一个向量都没有
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    // 查询 embedding（1 条输入）正常，补算的批量请求（多于 1 条）一律 400
+    const { received } = fakeLlm(setLlmFetch, (_n, body: LlmBody) => body.input.length > 1
+      ? new Response('{"error":{"message":"batch size is invalid, it should not be larger than 10"}}', { status: 400 })
+      : embeddings(body.input.map((t: string) => vec(t))));
+    const batches = () => received.filter(r => r.body.input.length > 1).length;
+    const fill = async () => (await getDb().select({ error: modelProviders.embeddingFillError, at: modelProviders.embeddingFillAt })
+      .from(modelProviders).where(eq(modelProviders.tenantId, acme)))[0]!;
+
+    expect((await runTool(analyst, 'catalog_search', { query: QUERY })).split('\n\n')[1]).toBe('vector_fallback: not_ready');
+    expect((await embedTasks(acme)).map(t => t.status)).toEqual(['succeeded', 'queued']); // 照样入队
+    await drain();
+    expect(batches()).toBe(1); // 第一批就失败，后面的批次不再发
+    const failed = await fill();
+    expect(failed.error).toContain('HTTP 400');
+    expect(failed.error).not.toContain('sk-tenant-embed-secret');
+    expect(failed.at).toBeInstanceOf(Date);
+
+    // 退避期内：检索两次都不入队、不发补算请求，输出仍是 not_ready
+    for (let i = 0; i < 2; i++) {
+      expect((await runTool(analyst, 'catalog_search', { query: QUERY })).split('\n\n')[1]).toBe('vector_fallback: not_ready');
+    }
+    expect(await ensureEmbeddings(acme)).toBe('backoff');
+    await drain();
+    expect(batches()).toBe(1);
+    expect(await embedTasks(acme)).toHaveLength(2);
+
+    // 过了退避期、端点修好：检索照常入队，drain 后补算成功，错误清空、时间更新，向量一路恢复
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + EMBED_FILL_BACKOFF_MS + 60_000);
+    fakeLlm(setLlmFetch, (_n, body: LlmBody) => embeddings(body.input.map((t: string) => vec(t))));
+    expect((await runTool(analyst, 'catalog_search', { query: QUERY })).split('\n\n')[1]).toBe('vector_fallback: not_ready');
+    expect(await embedTasks(acme)).toHaveLength(3);
+    await drain();
+    const ok = await fill();
+    expect(ok.error).toBeNull();
+    expect(ok.at!.getTime()).toBeGreaterThan(failed.at!.getTime());
+    const restored = await runTool(analyst, 'catalog_search', { query: QUERY });
+    expect(restored).not.toContain('vector_fallback');
+    expect(restored).toContain('churn_forecast');
   });
 });

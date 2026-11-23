@@ -1,0 +1,2 @@
+ALTER TABLE "platform"."model_providers" ADD COLUMN "embedding_fill_error" text;--> statement-breakpoint
+ALTER TABLE "platform"."model_providers" ADD COLUMN "embedding_fill_at" timestamp with time zone;
