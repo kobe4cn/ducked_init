@@ -165,6 +165,11 @@ describe('补算与混合检索连不上外部库（pgvector 替身）', () => {
     const error = (await providerRow(acme)).vectorStoreError;
     expect(error).toContain('补算写入外部向量库失败');
     for (const secret of ['p@ss/w', 'p%40ss%2Fw', 'us@r', 'us%40r', url]) expect(error).not.toContain(secret);
+    // 存储那一步失败也记下补算错误与时间，同样抹掉凭据
+    const { embeddingFillError, embeddingFillAt } = await providerRow(acme);
+    expect(embeddingFillError).toBeTruthy();
+    expect(embeddingFillAt).toBeInstanceOf(Date);
+    for (const secret of ['p@ss/w', 'p%40ss%2Fw', 'us@r', 'us%40r', url]) expect(embeddingFillError).not.toContain(secret);
   });
 
   it('混合检索连不上外部库：ranked 与不传 hybrid 逐项相同、fallback: false、vectorFallback: store_unreachable，不抛错，warn 里也不带连接串', async () => {
