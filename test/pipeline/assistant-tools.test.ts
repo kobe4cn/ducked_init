@@ -2,11 +2,13 @@
 // 没有的工具与不合 Schema 的输入 400；目录工具按角色过滤（catalogFor：查看者看不到 source: / table: 条目与字段来源，ADR-0005）；
 // 校验工具（定义、映射）把问题转成给模型的文本；validate_plan 校验分析计划（ADR-0050）：只认本轮 catalog_search / catalog_expand 检索到的条目，
 // search / expand 的输出给每个条目带按角色裁剪的目录上算出的语义哈希；
-// 分层总览（#854）：catalog_overview 只给第一层分组（查看者没有 group:sources 汇总行），catalog_expand 认 group: 分组标识，组内条目记进本轮检索
+// 分层总览（#854）：catalog_overview 只给第一层分组（查看者没有 group:sources 汇总行），catalog_expand 认 group: 分组标识，组内条目记进本轮检索；
+// validate_plan 发给模型的参数 Schema 是剥掉条件关键字的 PLAN_SCHEMA、说明附最小示例，结构错误仍以逐条问题返回而不是 400（#1178）
+import { Ajv } from 'ajv';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
-import { catalogFor, invokeTool, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
-import { semanticHash } from '../../app/.server/catalog/plan';
+import { catalogFor, invokeTool, PLAN_EXAMPLE, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
+import { PLAN_SCHEMA, semanticHash, validatePlan } from '../../app/.server/catalog/plan';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
@@ -157,5 +159,37 @@ describe('AI 助手的工具注册表', () => {
     };
     const metricChecked = await invokeTool(author, 'validate_plan', { plan: metricPlan }, {}, { retrieved });
     expect(metricChecked.text).toBe('status: valid');
+  });
+
+  it('validate_plan 发给模型的参数 Schema 是 PLAN_SCHEMA（剥掉 if / not 等条件关键字），说明末尾附最小示例（#1178）', async () => {
+    const { acme } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const tool = toolsFor(analyst).find(t => t.name === 'validate_plan')!;
+    const schema = tool.inputSchema as { required: string[]; properties: { plan: { required: string[] } } };
+    expect(schema.required).toEqual(['plan']);
+    expect(schema.properties.plan.required).toEqual(expect.arrayContaining(['schemaVersion', 'mode', 'selected', 'request', 'steps', 'assumptions', 'questions']));
+    const sent = JSON.stringify(tool.inputSchema);
+    for (const k of ['"if"', '"then"', '"not"', '"allOf"']) expect(sent).not.toContain(k);
+    expect(tool.description).toContain(`最小合法示例（draft_query）：${JSON.stringify(PLAN_EXAMPLE)}`);
+  });
+
+  it('validate_plan 的最小示例能通过 PLAN_SCHEMA 的结构校验（#1178）', () => {
+    expect(new Ajv({ strict: false }).compile(PLAN_SCHEMA)(PLAN_EXAMPLE)).toBe(true);
+    // 空目录下条目没检索到，status 是 invalid；只断言结构与步骤检查通过（plan 不为 null）
+    expect(validatePlan(PLAN_EXAMPLE, { catalog: { entries: [] }, retrieved: new Set() }).plan).not.toBeNull();
+  });
+
+  it('validate_plan 结构错误的计划不抛 400，以 status: invalid 和中文的逐条问题返回（#1178）', async () => {
+    const { acme } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const plan = { ...PLAN_EXAMPLE, steps: [PLAN_EXAMPLE.steps[0], { id: 's2', action: 'aggregate', agg: 'count', inputs: ['s1', 's1'] }] };
+    const result = await invokeTool(analyst, 'validate_plan', { plan }, {}, { retrieved: new Set() });
+    expect(result.text).toContain('status: invalid');
+    expect(result.text).toContain('最多 1 项');
+    // 非 aggregate 步骤带 agg：报中文原因而不是 must NOT be valid
+    const fetchWithAgg = { ...PLAN_EXAMPLE, steps: [{ id: 's1', action: 'fetch', agg: 'count', inputs: ['metric:order_count'] }] };
+    const rejected = await invokeTool(analyst, 'validate_plan', { plan: fetchWithAgg }, {}, { retrieved: new Set() });
+    expect(rejected.text).toContain('只有 aggregate 步骤能写 agg');
+    expect(rejected.text).not.toContain('must NOT');
   });
 });
