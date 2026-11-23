@@ -8,7 +8,7 @@ import { closeDb, getDb } from '../../app/.server/db/client';
 import { randomUUID } from 'node:crypto';
 import { auditLogs, modelProviders, tasks } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
-import { draftWorkbenchSql, interpretResult, previewInterpretation } from '../../app/.server/workbench-ai';
+import { draftWorkbenchSql, interpretResult, isDetail, previewInterpretation } from '../../app/.server/workbench-ai';
 import { resetDb } from '../http/harness';
 import { listCatalog } from '../../app/.server/workbench';
 import { memberOf, onLake } from './fixtures';
@@ -210,7 +210,7 @@ describe('AI 解读结果', () => {
     const body = JSON.stringify(received[0].body);
     for (const v of values) expect(body).not.toContain(v);
     const content = sentContent(received[0].body);
-    expect(Object.keys(content).sort()).toEqual(['columns', 'rowCount', 'sql', 'truncated']);
+    expect(Object.keys(content).sort()).toEqual(['columns', 'facts', 'rowCount', 'sql', 'truncated']);
     expect(content.columns).toEqual([
       { name: 'event_type', type: 'VARCHAR', nonNull: values.length, distinct: values.length },
       expect.objectContaining({ name: 'n', type: 'BIGINT', nonNull: values.length }),
@@ -243,7 +243,7 @@ describe('AI 解读结果', () => {
     const out = await interpretResult(await analyst(), sql, true, null);
     expect(out).toMatchObject({ text: '上海的客户最多', columns: ['city', 'n'], dropped: [] });
     expect(JSON.stringify(received[0].body)).toContain('city');
-    expect(Object.keys(sentContent(received[0].body)).sort()).toEqual(['columns', 'rows']);
+    expect(Object.keys(sentContent(received[0].body)).sort()).toEqual(['columns', 'facts', 'rows', 'sql', 'truncated']);
     expect(out.samples).toBe(true);
     const [detail] = await interpreted(sql);
     expect(Object.keys(detail).sort()).toEqual(['columns', 'dropped', 'rows', 'samples', 'sql']);
@@ -267,6 +267,70 @@ describe('AI 解读结果', () => {
     expect(await previewInterpretation(await analyst(), "SELECT 'a' AS contact_x, 1 AS _hash, 2 AS k")).toMatchObject({ sent: ['k'], dropped: ['contact_x', '_hash'] });
     expect(await errorOf(interpretResult(await analyst(), 'SELECT phone, email FROM silver.customer', true, null))).toMatch(/^400 没有可以发送的列/);
     expect(f).not.toHaveBeenCalled();
+  });
+
+  /** 发给模型的全部消息文本 */
+  const promptOf = (body: unknown) => (body as { messages: { content: string }[] }).messages.map(m => m.content).join('\n');
+  type Fact = { column: string; sum: number; max: number; min: number; maxShare?: number; maxAt?: string; minAt?: string };
+
+  it('分组结果（开关打开）：提示写明可以点名分组，user 带 SQL 与数值事实（合计、最大、最小与所在行的分组名）', async () => {
+    await setSamples(true);
+    const sql = 'SELECT event_type, count(*) n FROM silver.event GROUP BY 1 ORDER BY 1';
+    const { received } = modelSays('浏览最多');
+    const out = await interpretResult(await analyst(), sql, true, null);
+    const prompt = promptOf(received[0].body);
+    expect(prompt).toContain('可以点名分组');
+    expect(prompt).toContain('所在行');
+    expect(prompt).toContain('第一句先给结论');
+    expect(prompt).not.toContain('不点名');
+    const content = sentContent(received[0].body);
+    expect(content.sql).toBe(sql);
+    const n = (content.facts as Fact[]).find(f => f.column === 'n')!;
+    const counts = out.result.rows.map(r => Number(r[1]));
+    const groups = out.result.rows.map(r => String(r[0]));
+    expect(groups.length).toBeGreaterThan(1);
+    expect(n).toMatchObject({ sum: counts.reduce((a, b) => a + b, 0), max: Math.max(...counts), min: Math.min(...counts) });
+    expect(groups).toContain(n.maxAt);
+    expect(groups).toContain(n.minAt);
+    expect(n.maxShare).toBeCloseTo(n.max / n.sum, 3);
+  });
+
+  it('明细结果（有 openid 列）：提示写明不点名，没有「所在行」，facts 不带 maxAt / minAt，user 带 SQL', async () => {
+    await setSamples(true);
+    const sql = "SELECT 'o1' AS openid, 3 AS n UNION ALL SELECT 'o2', 5";
+    const { received } = modelSays('人均几次');
+    await interpretResult(await analyst(), sql, true, null);
+    const prompt = promptOf(received[0].body);
+    expect(prompt).toContain('不点名');
+    expect(prompt).not.toContain('所在行');
+    const content = sentContent(received[0].body);
+    expect(content.sql).toBe(sql);
+    expect(content.facts).toEqual([{ column: 'n', sum: 8, max: 5, min: 3, maxShare: 0.625, minShare: 0.375 }]);
+  });
+
+  it('开关关闭的分组结果：user 带 SQL 与数值事实，facts 不带所在行，请求体里仍没有结果行取值', async () => {
+    await setSamples(false);
+    const sql = 'SELECT event_type, count(*) n FROM silver.event GROUP BY 1';
+    const { received } = modelSays('浏览最多');
+    const out = await interpretResult(await analyst(), sql, true, null);
+    const content = sentContent(received[0].body);
+    expect(content.sql).toBe(sql);
+    const facts = content.facts as Fact[];
+    expect(facts.map(f => f.column)).toEqual(['n']);
+    expect(facts[0]).not.toHaveProperty('maxAt');
+    expect(facts[0]).not.toHaveProperty('minAt');
+    const body = JSON.stringify(received[0].body);
+    for (const r of out.result.rows) expect(body).not.toContain(String(r[0]));
+  });
+
+  it('isDetail：标识列名或因敏感被剔除算明细；paid、城市 + 计数、只有系统列被剔除都不算', () => {
+    const of = (...names: string[]) => ({ columns: names.map(name => ({ name, type: 'VARCHAR' })), rows: [], truncated: false });
+    expect(isDetail(of('customer_id', 'n'), [true, true])).toBe(true);
+    expect(isDetail(of('openid'), [true])).toBe(true);
+    expect(isDetail(of('city', 'phone'), [true, false])).toBe(true);
+    expect(isDetail(of('paid'), [true])).toBe(false);
+    expect(isDetail(of('city', 'n'), [true, true])).toBe(false);
+    expect(isDetail(of('_hash', 'city'), [false, true])).toBe(false);
   });
 
   it('不带确认时 400，不请求模型', async () => {
