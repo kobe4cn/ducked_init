@@ -87,6 +87,7 @@ describe('混合检索', () => {
     const text = haystack(c.entries.find(e => e.id === 'metric:churn_forecast')!);
     expect(terms(QUERY).every(w => !text.includes(w))).toBe(true);
     const callsBefore = received.length;
+    const fillLogIds = new Set((await getDb().select({ id: llmCalls.id }).from(llmCalls).where(eq(llmCalls.tenantId, acme))).map(l => l.id));
 
     const plain = await rankedSearch(acme, 'full', c, QUERY, {});
     expect(plain.fallback).toBe(false);
@@ -102,7 +103,7 @@ describe('混合检索', () => {
     expect(received.slice(callsBefore).map(r => r.body.input)).toEqual([[QUERY]]); // 只为查询算一次向量
 
     // 查询的调用日志只记条数与 token，不含查询文本；缓存齐了不再入队补算
-    const queryLogs = (await getDb().select().from(llmCalls).where(eq(llmCalls.tenantId, acme))).filter(l => l.inputCount === 1);
+    const queryLogs = (await getDb().select().from(llmCalls).where(eq(llmCalls.tenantId, acme))).filter(l => !fillLogIds.has(l.id)); // 补算的末批也可能只有 1 条，按查询前已有的日志排除
     expect(queryLogs.map(l => ({ purpose: l.purpose, model: l.model, promptTokens: l.promptTokens, error: l.error })))
       .toEqual([{ purpose: 'embedding', model: 'text-embedding-v3', promptTokens: 3, error: null }]);
     expect(JSON.stringify(queryLogs)).not.toContain(QUERY);

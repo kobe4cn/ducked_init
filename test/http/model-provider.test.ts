@@ -299,7 +299,7 @@ describe('模型服务页', () => {
     await save(admin); // chat 也配置，验证 embedding 的操作不动它
     await saveEmbedding(admin);
 
-    const { received } = fakeLlm(setLlm, () => embeddings([[0.1, 0.2, 0.3]], { prompt_tokens: 5 }));
+    const { received } = fakeLlm(setLlm, (_n, body) => embeddings(body.input.map(() => [0.1, 0.2, 0.3]), { prompt_tokens: 5 }));
     const passed = await admin.post('/model-provider', { intent: 'embedding_test' });
     expect(passed.status).toBe(200);
     const okPage = await passed.text();
@@ -309,10 +309,12 @@ describe('模型服务页', () => {
     expect(okPage).toMatch(/data-embedding-duration-ms="\d+"/);
     expect(received).toHaveLength(1);
     expect(received[0].url).toBe('https://embed-tenant.example.com/v1/embeddings');
-    expect(received[0].body).toMatchObject({ model: 'bge-m3', input: ['连通测试'] });
+    expect(received[0].body.model).toBe('bge-m3');
+    expect(received[0].body.input).toHaveLength(10); // 一次发满一批（默认 10 条），批大小超限在测试时就暴露
+    expect(new Set(received[0].body.input).size).toBe(10);
     expect(received[0].headers.get('authorization')).toBe(`Bearer ${EKEY}`);
     const [call] = await embeddingCalls(acme);
-    expect(call).toMatchObject({ model: 'bge-m3', inputCount: 1, promptTokens: 5, error: null });
+    expect(call).toMatchObject({ model: 'bge-m3', inputCount: 10, promptTokens: 5, error: null });
 
     fakeLlm(setLlm, () => new Response(`invalid api key ${EKEY}`, { status: 401 }));
     const failedPage = await (await admin.post('/model-provider', { intent: 'embedding_test' })).text();
@@ -338,6 +340,30 @@ describe('模型服务页', () => {
     // 本来就没配置时再恢复：不记审计
     expect((await admin.post('/model-provider', { intent: 'embedding_reset' })).status).toBe(302);
     expect(await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.reset'))).toHaveLength(1);
+  });
+
+  it('测试 embedding 发的条数等于批大小：LLM_EMBEDDING_BATCH_SIZE=5 时发 5 条；服务商拒绝批大小时页面显示服务商的报错', async () => {
+    await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    platformEmbedding();
+
+    vi.stubEnv('LLM_EMBEDDING_BATCH_SIZE', '5');
+    const { received } = fakeLlm(setLlm, (_n, body) => embeddings(body.input.map(() => [0.1, 0.2])));
+    const okPage = await (await admin.post('/model-provider', { intent: 'embedding_test' })).text();
+    expect(okPage).toContain('data-embedding-test="ok"');
+    expect(okPage).toContain('data-embedding-dimensions="2"');
+    expect(received).toHaveLength(1);
+    expect(received[0].body.input).toHaveLength(5);
+    expect(new Set(received[0].body.input).size).toBe(5);
+
+    vi.stubEnv('LLM_EMBEDDING_BATCH_SIZE', '64');
+    const rejected = fakeLlm(setLlm, (_n, body) => (body.input.length > 10
+      ? new Response('{"code":"InvalidParameter","message":"batch size is invalid, it should not be larger than 10.: input.contents"}', { status: 400 })
+      : embeddings(body.input.map(() => [0.1, 0.2]))));
+    const failedPage = await (await admin.post('/model-provider', { intent: 'embedding_test' })).text();
+    expect(rejected.received[0].body.input).toHaveLength(64);
+    expect(failedPage).toContain('data-embedding-test="failed"');
+    expect(failedPage).toContain('batch size is invalid, it should not be larger than 10.');
   });
 
   it('测试连通性：成功显示模型名与耗时，失败显示抹掉 Key 的错误；每次都记一条 connectivity', async () => {

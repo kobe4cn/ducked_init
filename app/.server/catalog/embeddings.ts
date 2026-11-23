@@ -17,8 +17,18 @@ import { type VectorHit } from './vector';
 import { pgvectorStore, redactUrl } from './vector-store-pgvector';
 import { platformStore, type VectorStore } from './vector-store';
 
-/** 每批补算的条数：一次 /embeddings 请求的输入条数 */
-export const EMBED_BATCH = 64;
+/** 每批补算默认的条数：DashScope text-embedding-v3 / v4 每批最多 10 条（OpenAI 是 2048），默认取最严的，平台可用 LLM_EMBEDDING_BATCH_SIZE 调大 */
+const DEFAULT_EMBED_BATCH = 10;
+
+/** 每批补算的条数（一次 /embeddings 请求的输入条数），「测试 embedding」也发这么多条：LLM_EMBEDDING_BATCH_SIZE 每次调用都读（默认参数在调用时求值，stubEnv 生效），
+ *  正整数字符串才用（照 llm.ts 的 timeoutMs）；没填或空串用默认 10，填了但非法时告警后回落默认——配错不让补算整个失败 */
+export function embedBatchSize(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.LLM_EMBEDDING_BATCH_SIZE;
+  if (!raw) return DEFAULT_EMBED_BATCH;
+  if (/^\d+$/.test(raw) && Number(raw) > 0) return Number(raw);
+  console.warn(`LLM_EMBEDDING_BATCH_SIZE=${JSON.stringify(raw)} 不是正整数，按默认 ${DEFAULT_EMBED_BATCH} 条一批`);
+  return DEFAULT_EMBED_BATCH;
+}
 
 /** 查询向量一次 embedding 的短超时：检索在请求路径上，宁可只走关键词也不让成员等一个完整超时（补算默认 LLM_TIMEOUT_SECONDS，60 秒） */
 export const QUERY_EMBED_TIMEOUT_MS = 3000;
@@ -72,7 +82,7 @@ export async function ensureEmbeddings(tenantId: string): Promise<'queued' | 'fr
 
 /**
  * 补算（在 catalog.embed 任务的调度器结束钩子里跑，不进请求）：开始时解析一次 provider 与向量存储（ADR-0058），一次补算只用一个模型、一个存储；
- * 把两类投影里当前模型还没有向量的文字按每批 EMBED_BATCH 条调 embedding 写入，全部写完后删掉旧模型的行和投影里已没有的哈希的行。
+ * 把两类投影里当前模型还没有向量的文字按每批 embedBatchSize() 条（开始时读一次）调 embedding 写入，全部写完后删掉旧模型的行和投影里已没有的哈希的行。
  * 某一批失败就停（不删旧行、保留已写好的批次），抛出交给调用方打日志；没配置 embedding 端点时什么都不做。
  * 存储是外部库时：store 的调用连不上就把抹掉凭据的错误写进 model_providers.vector_store_error（页面「向量存储」卡能看到）再抛出，
  * 全部成功时清掉这个错误——只写检查结果两列，不动 updated_at（照 testVectorStore）；embedWith 失败是 embedding 端点的事，不算外部库的错、不写这两列
@@ -80,6 +90,7 @@ export async function ensureEmbeddings(tenantId: string): Promise<'queued' | 'fr
 export async function fillEmbeddings(tenantId: string): Promise<void> {
   const provider = await resolveEmbeddingProvider(tenantId);
   if (!provider) return;
+  const batchSize = embedBatchSize();
   const { store, url } = await resolveVectorStore(tenantId);
   const wanted = await projectionTexts(getDb(), tenantId);
   const storeCall = async <T>(run: () => Promise<T>): Promise<T> => {
@@ -94,8 +105,8 @@ export async function fillEmbeddings(tenantId: string): Promise<void> {
   };
   const existing = await storeCall(() => store.hashes(provider.model));
   const missing = wanted.filter(r => !existing.has(r.textHash));
-  for (let i = 0; i < missing.length; i += EMBED_BATCH) {
-    const batch = missing.slice(i, i + EMBED_BATCH);
+  for (let i = 0; i < missing.length; i += batchSize) {
+    const batch = missing.slice(i, i + batchSize);
     const vectors = await embedWith(tenantId, provider, batch.map(r => r.text));
     await storeCall(() => store.upsert(provider.model, batch.map((r, j) => ({ textHash: r.textHash, vector: vectors[j] }))));
   }
