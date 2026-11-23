@@ -23,7 +23,7 @@ import { getDb, isUniqueViolation } from './db/client';
 import { publishedTagsOf, publishedTagsReferencing } from './dsl-dependencies';
 import { dslDefinitions, dslVersions, snapshots, tasks, type SnapshotTrigger, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
-import { chatJson, LlmError, resolveProvider, schemaErrors, validatorFor } from './llm';
+import { assertSchema, chatJson, LlmError, resolveProvider } from './llm';
 import { publishedPlans } from './mappings';
 import { failedErrors, type AssertionResult } from './pipeline/assertions';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
@@ -207,29 +207,25 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
   const { catalog, entries, ambiguity } = await draftSearch(actor, request, SEARCH_LIMIT);
   const messages = definitionDraftMessages(kind, request, catalog, entries);
   if (!Array.isArray(messages)) throw new DslError(messages.unavailable);
-  let out: Record<string, unknown>;
+  // 指标沿用一句话解析的输出形状（#1162）：宽松 Schema 放行平铺输出（llm_calls.schema_valid 记的是宽松校验的结果，与 #959 一致），
+  // 收拢（normalizeParseOutput）后仍按 METRIC_PARSE_SCHEMA 严格校验（不合时抛 LlmError，与模型失败同一条失败路径），另带回逐项说明
+  let spec: object;
+  let explanation: DraftExplanation | null = null;
+  let normalized = false;
   try {
-    out = await chatJson<Record<string, unknown>>(tenantId, definitionDraftPurpose(kind), messages, definitionDraftSchema(kind));
+    spec = await chatJson<Record<string, unknown>>(tenantId, definitionDraftPurpose(kind), messages, definitionDraftSchema(kind));
+    if (kind === 'metric') {
+      const collected = normalizeParseOutput(spec as Record<string, unknown>);
+      normalized = collected.normalized;
+      assertSchema(METRIC_PARSE_SCHEMA, collected.output);
+      const parsed = collected.output as { spec: object } & DraftExplanation;
+      spec = parsed.spec;
+      explanation = { items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported };
+    }
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
-    await failed({ stage: 'model', error: e.message.slice(0, 200) });
+    await failed({ stage: 'model', error: e.message.slice(0, 200), ...(normalized && { normalized: true }) });
     throw new DslError(`模型生成草稿失败：${e.message}`, 422);
-  }
-  // 指标沿用一句话解析的输出形状（#1162）：宽松 Schema 放行平铺输出（llm_calls.schema_valid 记的是宽松校验的结果，与 #959 一致），
-  // 收拢（normalizeParseOutput）后仍按 METRIC_PARSE_SCHEMA 严格校验，另带回逐项说明
-  let spec: object = out;
-  let explanation: DraftExplanation | null = null;
-  if (kind === 'metric') {
-    const { output, normalized } = normalizeParseOutput(out);
-    const validate = validatorFor(METRIC_PARSE_SCHEMA);
-    if (!validate(output)) {
-      const message = `模型返回的 JSON 不符合 Schema：${schemaErrors(validate)}`;
-      await failed({ stage: 'model', error: message.slice(0, 200), ...(normalized && { normalized: true }) });
-      throw new DslError(`模型生成草稿失败：${message}`, 422);
-    }
-    const parsed = output as { spec: object } & DraftExplanation;
-    spec = parsed.spec;
-    explanation = { items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported };
   }
   const yaml = definitionOutputToYaml(kind, spec);
   const checked = DSL_KINDS[kind].check(yaml, ctx);

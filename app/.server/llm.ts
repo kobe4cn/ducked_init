@@ -238,6 +238,12 @@ function describeError(e: ErrorObject) {
 /** 校验错误的中文摘要，最多列三条；导出给调用方严格校验时报错文案与 callModel 一致（#959） */
 export const schemaErrors = (v: ValidateFunction) => (v.errors ?? []).slice(0, 3).map(describeError).join('；');
 
+/** 按 schema 校验 value，不合时抛 LlmError（文案与 callModel 一致）；导出给调用方收拢后的严格校验（#1162） */
+export function assertSchema(schema: object, value: unknown): void {
+  const validate = validatorFor(schema);
+  if (!validate(value)) throw new LlmError(`模型返回的 JSON 不符合 Schema：${schemaErrors(validate)}`);
+}
+
 /** 一次调用的统计，调用日志用：令牌数与 Schema 校验结果（没走到校验时为 null） */
 export interface CallStats { usage?: { prompt_tokens?: number; completion_tokens?: number }; schemaValid: boolean | null }
 
@@ -368,7 +374,7 @@ export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[]
     stats.schemaValid = validate(parsed);
     // 可选键为 null 时删掉再校验，最多 3 轮；没删掉任何东西就停（报错用最后一次的 schemaErrors）
     for (let round = 0; !stats.schemaValid && round < 3 && dropNullOptionals(parsed, validate.errors); round++) stats.schemaValid = validate(parsed);
-    if (!stats.schemaValid) throw new LlmError(`模型返回的 JSON 不符合 Schema：${schemaErrors(validate)}`);
+    if (!stats.schemaValid) assertSchema(schema, parsed);
     return parsed as T;
   });
 }
