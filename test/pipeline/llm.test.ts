@@ -1,15 +1,17 @@
 // test/pipeline/llm.test.ts —— 模型服务客户端（ADR-0035）：按租户配置 > 平台默认（环境变量）解析端点，chatJson → 注入的假 fetch → platform.llm_calls 的调用日志；
 // callModel 容错（#1160）：可选键为 null（qwen-max）按没给处理（必填键为 null 仍不合格、Schema 允许 null 的原样保留）、输出截断（finish_reason: length）报截断原因、```json 代码块去外壳、minItems / maximum 等报中文；
 // LLM_CHAT_EXTRA（#952）：服务商参数合并进 chat 请求体（平台字段不被覆盖、档位 LLM_<TIER>_CHAT_EXTRA 覆盖默认），不是合法 JSON 对象时调用失败并记 error；
+// 租户服务商参数（#1169）：租户默认 chat_extra 与档位的 fast_ / reasoning_chat_extra 进租户请求体（档位覆盖、只填模型名或带端点的档位继承默认），
+// 平台 LLM_*CHAT_EXTRA 不串进租户请求体；saveModelProvider / saveTierProvider 拒绝非对象 JSON 与受保护键、审计只记 chatExtraChanged、reset 清列；
 // LLM_TIMEOUT_SECONDS（#952）：控制 chat 超时与超时消息里的秒数，不是正整数时回落 60；
 // embedding 端点（ADR-0049）：租户 embedding 三项 > 平台 LLM_EMBEDDING_*（与 chat 互不影响），都没配置时 embed 返回 null；
 // tableContextFor：采集统计 + 允许时原始层的脱敏样本行
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { llmCalls, modelProviders } from '../../app/.server/db/schema';
+import { auditLogs, llmCalls, modelProviders } from '../../app/.server/db/schema';
 import { chatJson, chatTools, embed, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch } from '../../app/.server/llm';
-import { tableContextFor } from '../../app/.server/model-provider';
+import { ModelProviderError, resetModelProvider, resetTierProvider, saveModelProvider, saveTierProvider, tableContextFor } from '../../app/.server/model-provider';
 import { encryptForTenant } from '../../app/.server/secrets';
 import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
@@ -34,9 +36,9 @@ const BASE_WITH_SLASH = 'https://platform.example.com/v1/';
 const USAGE = { prompt_tokens: 120, completion_tokens: 30 };
 
 /** 档位列（tenantProvider 的第二个参数）：model 必填；要换端点时 baseUrl 与 apiKey 一起给，Key 明文进来、插库前加密 */
-interface TierCols { model: string; baseUrl?: string; apiKey?: string }
+interface TierCols { model: string; baseUrl?: string; apiKey?: string; chatExtra?: string }
 
-async function tenantProvider(tenantId: string, tiers: { fast?: TierCols; reasoning?: TierCols } = {}) {
+async function tenantProvider(tenantId: string, tiers: { fast?: TierCols; reasoning?: TierCols; chatExtra?: string } = {}) {
   const tier = (t: 'fast' | 'reasoning') => ({ model: tiers[t]?.model ?? null, baseUrl: tiers[t]?.baseUrl ?? null, apiKey: tiers[t]?.apiKey ?? null });
   const fast = tier('fast'), reasoning = tier('reasoning');
   const seal = (k: string | null) => k ? encryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, { apiKey: k }) : null;
@@ -45,6 +47,7 @@ async function tenantProvider(tenantId: string, tiers: { fast?: TierCols; reason
     apiKey: await encryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, { apiKey: 'sk-tenant-secret' }),
     fastModel: fast.model, fastBaseUrl: fast.baseUrl, fastApiKey: await seal(fast.apiKey),
     reasoningModel: reasoning.model, reasoningBaseUrl: reasoning.baseUrl, reasoningApiKey: await seal(reasoning.apiKey),
+    chatExtra: tiers.chatExtra ?? null, fastChatExtra: tiers.fast?.chatExtra ?? null, reasoningChatExtra: tiers.reasoning?.chatExtra ?? null,
   });
 }
 
@@ -504,6 +507,92 @@ describe('按用途选档位（ADR-0055）', () => {
     await expect(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)).rejects.toThrow(/未配置模型服务/);
     expect(f).not.toHaveBeenCalled();
     expect(await calls(acme)).toHaveLength(0);
+  });
+});
+
+describe('租户的服务商参数（#1169）', () => {
+  const ROUTE = { assertion_draft: 'fast', mapping_draft: 'reasoning', connectivity: null } as const;
+
+  it('租户默认与档位的服务商参数进入请求体：档位有值时覆盖，只填模型名或带端点但没填的档位继承默认，平台字段不被覆盖', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    await tenantProvider(acme, {
+      chatExtra: JSON.stringify({ enable_thinking: false, top_p: 0.9, model: 'evil-model', temperature: 1 }),
+      fast: { model: 'qwen3.8-flash', chatExtra: JSON.stringify({ enable_thinking: false, top_k: 5 }) },
+      reasoning: { model: 'deepseek-reasoner', baseUrl: 'https://tenant-reasoning.example.com/v1', apiKey: 'sk-tenant-reasoning-secret' },
+    });
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    for (const purpose of Object.keys(ROUTE) as (keyof typeof ROUTE)[]) await chatJson(acme, purpose, MESSAGES, SCHEMA);
+
+    const rest = { messages: MESSAGES, response_format: { type: 'json_object' }, temperature: 0 };
+    // fast 档自己的覆盖默认：默认的 top_p 不出现
+    expect(received[0].body).toEqual({ enable_thinking: false, top_k: 5, model: 'qwen3.8-flash', ...rest });
+    // reasoning 档带自己的端点、没填服务商参数：继承租户默认的
+    expect(received[1].url).toBe('https://tenant-reasoning.example.com/v1/chat/completions');
+    expect(received[1].body).toEqual({ enable_thinking: false, top_p: 0.9, model: 'deepseek-reasoner', ...rest });
+    // 不分档的用途用租户默认的
+    expect(received[2].body).toEqual({ enable_thinking: false, top_p: 0.9, model: 'deepseek-chat', ...rest });
+  });
+
+  it('只填模型名的档位继承租户默认；租户没填时平台的 LLM_*CHAT_EXTRA 不进租户请求体', async () => {
+    const acme = await newTenant('acme');
+    const globex = await newTenant('globex');
+    platformDefault(BASE_WITH_SLASH);
+    vi.stubEnv('LLM_CHAT_EXTRA', JSON.stringify({ platform_only: true }));
+    vi.stubEnv('LLM_FAST_CHAT_EXTRA', JSON.stringify({ platform_fast: true }));
+    await tenantProvider(acme, { chatExtra: JSON.stringify({ enable_thinking: false }), fast: { model: 'qwen3.8-flash' } });
+    await tenantProvider(globex, { fast: { model: 'qwen3.8-flash' } });
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'assertion_draft', MESSAGES, SCHEMA);
+    await chatJson(globex, 'assertion_draft', MESSAGES, SCHEMA);
+    await chatJson(globex, 'connectivity', MESSAGES, SCHEMA);
+
+    expect(received[0].body).toMatchObject({ enable_thinking: false, model: 'qwen3.8-flash' });
+    expect(received[0].body).not.toHaveProperty('platform_only');
+    expect(received[0].body).not.toHaveProperty('platform_fast');
+    for (const r of received.slice(1)) {
+      expect(r.body).not.toHaveProperty('platform_only');
+      expect(r.body).not.toHaveProperty('platform_fast');
+    }
+  });
+
+  it('save 存原文、空串存 null，拒绝非对象 JSON 与受保护键；审计只记 chatExtraChanged；reset 清列', async () => {
+    const acme = await newTenant('acme');
+    const admin = await memberOf(acme, 'admin@acme.com', 'admin');
+    const base = { baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat', apiKey: 'sk-tenant-secret' };
+    const row = async () => (await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme)))[0];
+
+    for (const bad of ['[1]', 'null', '"x"', '{oops', '{"model":"x"}', '{"enable_thinking":false,"messages":[]}']) {
+      expect(await failure(saveModelProvider(admin, { ...base, chatExtra: bad }))).toBeInstanceOf(ModelProviderError);
+    }
+    expect(await row()).toBeUndefined();
+
+    const extra = '{"enable_thinking": false}';
+    await saveModelProvider(admin, { ...base, chatExtra: extra });
+    await saveTierProvider(admin, 'fast', { baseUrl: '', model: 'qwen3.8-flash', apiKey: '', chatExtra: '{"top_k": 5}' });
+    expect(await failure(saveTierProvider(admin, 'reasoning', { baseUrl: '', model: 'r1', apiKey: '', chatExtra: '{"tools":[]}' })))
+      .toBeInstanceOf(ModelProviderError);
+    expect(await row()).toMatchObject({ chatExtra: extra, fastChatExtra: '{"top_k": 5}', reasoningChatExtra: null });
+
+    // 不带 chatExtra 时不动列；带空串清成 null
+    await saveModelProvider(admin, base);
+    expect((await row()).chatExtra).toBe(extra);
+    await saveTierProvider(admin, 'fast', { baseUrl: '', model: 'qwen3.8-flash', apiKey: '', chatExtra: '  ' });
+    expect((await row()).fastChatExtra).toBeNull();
+
+    const audits = await getDb().select().from(auditLogs).where(eq(auditLogs.tenantId, acme)).orderBy(auditLogs.createdAt);
+    const details = audits.filter(a => a.action === 'model_provider.updated').map(a => a.detail as Record<string, unknown>);
+    expect(details.map(d => d.chatExtraChanged)).toEqual([true, true, false, true]);
+    expect(JSON.stringify(audits)).not.toContain('enable_thinking');
+    expect(JSON.stringify(audits)).not.toContain('top_k');
+
+    await saveTierProvider(admin, 'fast', { baseUrl: '', model: 'qwen3.8-flash', apiKey: '', chatExtra: '{"top_k": 5}' });
+    await resetTierProvider(admin, 'fast');
+    expect(await row()).toMatchObject({ chatExtra: extra, fastChatExtra: null });
+    await resetModelProvider(admin);
+    expect((await row()).chatExtra).toBeNull();
   });
 });
 

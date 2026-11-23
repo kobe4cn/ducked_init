@@ -721,6 +721,8 @@ export const dslVersions = platform.table('dsl_versions', {
 // allow_samples 打开后才把敏感列已哈希的样本行发给模型，默认只发表结构与列统计
 // fast / reasoning 档位三列（ADR-0055）：租户按档位绑的模型，只在 chat 三列整套生效时才起作用。模型名必填；
 // 端点留空表示沿用本租户默认的端点与 Key（这时档位的端点与 Key 都存 null），要换端点时端点与 Key 一起填，Key 用同一个 context 加密
+// 服务商参数三列（#1169）：chat_extra 是租户默认的、fast_ / reasoning_chat_extra 是档位的，JSON 对象原文（不是密钥，页面回显），
+// 合并进租户自配时的 chat 请求体；档位为空时继承租户默认的那份，平台的 LLM_*CHAT_EXTRA 对租户自配不生效
 // 向量存储四列（ADR-0058，#848）：vector_store 选平台库还是租户自己的外部 pgvector（默认 platform；#849 起检索真正切换）。
 // 连接串整串用 context vector_store 加密（url 只在这一个输入框里换主机）、保存时先测连通失败不保存，checked_at / error 记最近一次结果；
 // 切回 platform 时这三列保留，方便撤回
@@ -738,6 +740,9 @@ export const modelProviders = platform.table('model_providers', {
   reasoningModel: text('reasoning_model'),
   reasoningBaseUrl: text('reasoning_base_url'),
   reasoningApiKey: text('reasoning_api_key'),
+  chatExtra: text('chat_extra'),
+  fastChatExtra: text('fast_chat_extra'),
+  reasoningChatExtra: text('reasoning_chat_extra'),
   allowSamples: boolean('allow_samples').notNull().default(false),
   // 最近一次「测试连通性」的工具调用探测（AI 助手要用，ADR-0042）：结果与当时生效的端点、模型；端点或模型变了就作废
   toolsSupported: boolean('tools_supported'),

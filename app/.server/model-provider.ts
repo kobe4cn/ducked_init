@@ -6,6 +6,7 @@
 // fast / reasoning 档位（ADR-0055 路由③a）是租户按用途绑的模型，只在 chat 三项整套生效时才有意义，保存 / 恢复同样在这里
 // 向量存储（ADR-0058，#848）也在这里：选平台库还是外部 pgvector、连接串加密保存（context vector_store，不回显），
 // 保存时先测连通失败不保存；切换存储后的清理与补算也在保存后触发（#849-1：embeddings.ts 按这里的选型解析存储）
+// 服务商参数（#1169）：租户默认与 fast / reasoning 档位各存一份 JSON 对象原文，不是密钥、页面回显，审计只记变没变
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
@@ -15,11 +16,13 @@ import { preparePgvector, redactUrl } from './catalog/vector-store-pgvector';
 import { platformStore } from './catalog/vector-store';
 import { getDb } from './db/client';
 import { modelProviders } from './db/schema';
-import { chatJson, chatTools, chatToolsWith, embed, embeddingSource, LlmError, MODEL_PROVIDER_CONTEXT, providerSource, resolveEmbeddingProvider, resolveProvider, resolveRoute, type LlmRoute } from './llm';
+import { CHAT_EXTRA_PROTECTED, chatJson, chatTools, chatToolsWith, embed, embeddingSource, LlmError, MODEL_PROVIDER_CONTEXT, parseChatExtraObject, providerSource, resolveEmbeddingProvider, resolveProvider, resolveRoute, type LlmRoute } from './llm';
 import { buildTableContext, type TableContext } from './pipeline/llm-context';
+import { formatServer } from './i18n';
 import { decryptForTenant, encryptForTenant } from './secrets';
 import { maskedSample, SourceViewError } from './source-views';
 import { confirmedTables } from './sources';
+import { msg } from '~/lib/i18n';
 
 /** 可以展示给管理员的输入错误 */
 export class ModelProviderError extends Error {
@@ -32,11 +35,13 @@ export interface ModelProviderView {
   baseUrl: string | null;
   model: string | null;
   apiKeySet: boolean;
+  /** 租户默认的服务商参数原文（#1169），没填为 null */
+  chatExtra: string | null;
   allowSamples: boolean;
   /** embedding 端点（ADR-0049）自成一套，与 chat 互不影响：来源按 embeddingSource 另算，没有版本共用一个租户 */
   embedding: { source: 'tenant' | 'platform' | 'none'; baseUrl: string | null; model: string | null; apiKeySet: boolean };
   /** 档位（ADR-0055 路由③a）：租户按用途绑的模型。model 为空表示该档没绑定、用默认那一套；端点为空表示沿用本租户默认的端点与 Key */
-  tiers: Record<'fast' | 'reasoning', { model: string | null; baseUrl: string | null; apiKeySet: boolean }>;
+  tiers: Record<'fast' | 'reasoning', { model: string | null; baseUrl: string | null; apiKeySet: boolean; chatExtra: string | null }>;
   /** 向量存储（ADR-0058，#848）：当前选的库与最近一次连通检查；连接串只告诉页面有没有，明文与密文都不出这个模块 */
   vectorStore: { kind: 'platform' | 'pgvector'; urlSet: boolean; checkedAt: string | null; error: string | null };
 }
@@ -56,6 +61,7 @@ export async function getModelProvider(actor: CurrentMember): Promise<ModelProvi
     baseUrl: row?.baseUrl ?? null,
     model: row?.model ?? null,
     apiKeySet: Boolean(row?.apiKey),
+    chatExtra: row?.chatExtra ?? null,
     allowSamples: row?.allowSamples ?? false,
     embedding: {
       source: embeddingSource(row) ?? 'none',
@@ -76,16 +82,37 @@ export async function getModelProvider(actor: CurrentMember): Promise<ModelProvi
   };
 }
 
-/** 行上某一档的三列：没绑定时 model 为 null，端点与 Key 为 null 表示沿用本租户默认的那一套 */
+/** 行上某一档的四列：没绑定时 model 为 null，端点与 Key 为 null 表示沿用本租户默认的那一套，服务商参数为 null 表示继承租户默认的 */
 function tierOf(row: Awaited<ReturnType<typeof rowOf>> | undefined, tier: 'fast' | 'reasoning') {
-  if (tier === 'fast') return { model: row?.fastModel ?? null, baseUrl: row?.fastBaseUrl ?? null, apiKey: row?.fastApiKey ?? null };
-  return { model: row?.reasoningModel ?? null, baseUrl: row?.reasoningBaseUrl ?? null, apiKey: row?.reasoningApiKey ?? null };
+  if (tier === 'fast') {
+    return { model: row?.fastModel ?? null, baseUrl: row?.fastBaseUrl ?? null, apiKey: row?.fastApiKey ?? null, chatExtra: row?.fastChatExtra ?? null };
+  }
+  return { model: row?.reasoningModel ?? null, baseUrl: row?.reasoningBaseUrl ?? null, apiKey: row?.reasoningApiKey ?? null, chatExtra: row?.reasoningChatExtra ?? null };
 }
 
 /** 页面上某一档的显示：绑定的模型与端点，Key 只告诉有没有 */
 function tierView(row: Awaited<ReturnType<typeof rowOf>> | undefined, tier: 'fast' | 'reasoning') {
   const t = tierOf(row, tier);
-  return { model: t.model, baseUrl: t.baseUrl, apiKeySet: Boolean(t.apiKey) };
+  return { model: t.model, baseUrl: t.baseUrl, apiKeySet: Boolean(t.apiKey), chatExtra: t.chatExtra };
+}
+
+/**
+ * 校验要保存的服务商参数（#1169）：undefined 表示这次不改（返回 undefined），空白存 null；
+ * 否则须是 JSON 对象且不含平台字段（CHAT_EXTRA_PROTECTED，调用时本来也会删掉，这里直接报错免得管理员以为生效了），存原文
+ */
+function parseChatExtra(raw: string | undefined): string | null | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (!value) return null;
+  const parsed = parseChatExtraObject(value);
+  if (!parsed) {
+    throw new ModelProviderError(formatServer('zh-CN', msg('服务商参数须是 JSON 对象，如 {example}', { example: '{"enable_thinking": false}' })));
+  }
+  const protectedKeys = CHAT_EXTRA_PROTECTED.filter(k => Object.hasOwn(parsed, k));
+  if (protectedKeys.length) {
+    throw new ModelProviderError(formatServer('zh-CN', msg('服务商参数不能包含平台字段：{keys}', { keys: protectedKeys.join(', ') })));
+  }
+  return value;
 }
 
 function parseBaseUrl(raw: string) {
@@ -116,24 +143,27 @@ async function sealApiKey(tenantId: string, existing: string | null, existingBas
 /**
  * 保存本租户的模型服务：apiKey 留空沿用原来的 Key，填了新值就加密保存并在审计里记轮换
  */
-export async function saveModelProvider(actor: CurrentMember, input: { baseUrl: string; model: string; apiKey: string }) {
+export async function saveModelProvider(actor: CurrentMember, input: { baseUrl: string; model: string; apiKey: string; chatExtra?: string }) {
   assertCan(actor, 'model_provider:manage');
   const tenantId = actor.tenant.id;
   const baseUrl = parseBaseUrl(input.baseUrl);
   const model = input.model.trim();
   if (!model) throw new ModelProviderError('请填写模型名');
+  const chatExtra = parseChatExtra(input.chatExtra);
   const row = await rowOf(tenantId);
+  const extra = chatExtra === undefined ? {} : { chatExtra };
+  const chatExtraChanged = chatExtra !== undefined && chatExtra !== (row?.chatExtra ?? null);
   const { sealed, rotated } = await sealApiKey(tenantId, row?.apiKey ?? null, row?.baseUrl ?? null, baseUrl, input.apiKey.trim());
   // 端点或模型变了，旧的工具调用探测结果作废
   const probe = row?.baseUrl === baseUrl && row.model === model ? {} : NO_PROBE;
   await getDb().transaction(async tx => {
-    await tx.insert(modelProviders).values({ tenantId, baseUrl, model, apiKey: sealed })
-      .onConflictDoUpdate({ target: modelProviders.tenantId, set: { baseUrl, model, apiKey: sealed, ...probe, updatedAt: new Date() } });
+    await tx.insert(modelProviders).values({ tenantId, baseUrl, model, apiKey: sealed, ...extra })
+      .onConflictDoUpdate({ target: modelProviders.tenantId, set: { baseUrl, model, apiKey: sealed, ...extra, ...probe, updatedAt: new Date() } });
     await recordAudit(tx, {
       tenantId, actor,
       action: 'model_provider.updated',
       targetType: 'model_provider',
-      detail: { baseUrl, model, credentialsRotated: rotated },
+      detail: { baseUrl, model, credentialsRotated: rotated, chatExtraChanged },
     });
   });
 }
@@ -159,12 +189,12 @@ export async function saveEmbeddingProvider(actor: CurrentMember, input: { baseU
   });
 }
 
-/** 恢复平台默认：清空端点、模型名、Key 与工具调用探测结果（是否允许发送样本行保留），之后 resolveProvider 回到环境变量的配置。本来就没配置时什么也不做 */
+/** 恢复平台默认：清空端点、模型名、Key、服务商参数与工具调用探测结果（是否允许发送样本行保留），之后 resolveProvider 回到环境变量的配置。本来就没配置时什么也不做 */
 export async function resetModelProvider(actor: CurrentMember) {
   assertCan(actor, 'model_provider:manage');
   const tenantId = actor.tenant.id;
   await getDb().transaction(async tx => {
-    const cleared = await tx.update(modelProviders).set({ baseUrl: null, model: null, apiKey: null, ...NO_PROBE, updatedAt: new Date() })
+    const cleared = await tx.update(modelProviders).set({ baseUrl: null, model: null, apiKey: null, chatExtra: null, ...NO_PROBE, updatedAt: new Date() })
       .where(and(eq(modelProviders.tenantId, tenantId), isNotNull(modelProviders.baseUrl)))
       .returning({ tenantId: modelProviders.tenantId });
     if (cleared.length) await recordAudit(tx, { tenantId, actor, action: 'model_provider.reset', targetType: 'model_provider' });
@@ -183,23 +213,25 @@ export async function resetEmbeddingProvider(actor: CurrentMember) {
   });
 }
 
-/** 只写某一档三列（保存与恢复共用），别的列一律不动 */
-function tierColumns(tier: 'fast' | 'reasoning', values: { model: string | null; baseUrl: string | null; apiKey: string | null }) {
+/** 只写某一档的列（保存与恢复共用），别的列一律不动；chatExtra 为 undefined 时不写服务商参数那一列 */
+function tierColumns(tier: 'fast' | 'reasoning', values: { model: string | null; baseUrl: string | null; apiKey: string | null; chatExtra?: string | null }) {
+  const extra = values.chatExtra === undefined ? {} : tier === 'fast' ? { fastChatExtra: values.chatExtra } : { reasoningChatExtra: values.chatExtra };
   return tier === 'fast'
-    ? { fastModel: values.model, fastBaseUrl: values.baseUrl, fastApiKey: values.apiKey }
-    : { reasoningModel: values.model, reasoningBaseUrl: values.baseUrl, reasoningApiKey: values.apiKey };
+    ? { fastModel: values.model, fastBaseUrl: values.baseUrl, fastApiKey: values.apiKey, ...extra }
+    : { reasoningModel: values.model, reasoningBaseUrl: values.baseUrl, reasoningApiKey: values.apiKey, ...extra };
 }
 
 /**
- * 保存某一档绑定的模型（ADR-0055 路由③a）：模型名必填，只写该档三列，chat 与另一档的配置、工具调用探测结果都不动。
+ * 保存某一档绑定的模型（ADR-0055 路由③a）：模型名必填，只写该档的列，chat 与另一档的配置、工具调用探测结果都不动。
  * 档位只在 chat 三项整套生效时才有意义，本租户还没有自己的模型服务时 400。端点留空表示沿用本租户默认的端点与 Key（都存 null）；
  * 填了端点就按 chat 的规则要 Key（同一个加密 context），端点与 Key 必须一起填
  */
-export async function saveTierProvider(actor: CurrentMember, tier: 'fast' | 'reasoning', input: { baseUrl: string; model: string; apiKey: string }) {
+export async function saveTierProvider(actor: CurrentMember, tier: 'fast' | 'reasoning', input: { baseUrl: string; model: string; apiKey: string; chatExtra?: string }) {
   assertCan(actor, 'model_provider:manage');
   const tenantId = actor.tenant.id;
   const model = input.model.trim();
   if (!model) throw new ModelProviderError('请填写模型名');
+  const chatExtra = parseChatExtra(input.chatExtra);
   const row = await rowOf(tenantId);
   if (!row?.baseUrl || !row.model || !row.apiKey) throw new ModelProviderError('先保存本租户的模型服务后才能按用途配置档位');
   let baseUrl: string | null = null;
@@ -212,25 +244,27 @@ export async function saveTierProvider(actor: CurrentMember, tier: 'fast' | 'rea
   } else if (input.apiKey.trim()) {
     throw new ModelProviderError('填了 API Key 须同时填写端点；端点留空表示沿用本租户的端点与 Key');
   }
+  const columns = tierColumns(tier, { model, baseUrl, apiKey: sealed, chatExtra });
+  const chatExtraChanged = chatExtra !== undefined && chatExtra !== tierOf(row, tier).chatExtra;
   await getDb().transaction(async tx => {
-    await tx.insert(modelProviders).values({ tenantId, ...tierColumns(tier, { model, baseUrl, apiKey: sealed }) })
-      .onConflictDoUpdate({ target: modelProviders.tenantId, set: { ...tierColumns(tier, { model, baseUrl, apiKey: sealed }), updatedAt: new Date() } });
+    await tx.insert(modelProviders).values({ tenantId, ...columns })
+      .onConflictDoUpdate({ target: modelProviders.tenantId, set: { ...columns, updatedAt: new Date() } });
     await recordAudit(tx, {
       tenantId, actor,
       action: 'model_provider.updated',
       targetType: 'model_provider',
-      detail: { tier, baseUrl, model, credentialsRotated: rotated },
+      detail: { tier, baseUrl, model, credentialsRotated: rotated, chatExtraChanged },
     });
   });
 }
 
-/** 恢复该档的默认（不再绑定）：只清该档三列，chat 与另一档、工具调用探测结果都不动；本来就没绑定时不记审计 */
+/** 恢复该档的默认（不再绑定）：只清该档的列（含服务商参数），chat 与另一档、工具调用探测结果都不动；本来就没绑定时不记审计 */
 export async function resetTierProvider(actor: CurrentMember, tier: 'fast' | 'reasoning') {
   assertCan(actor, 'model_provider:manage');
   const tenantId = actor.tenant.id;
   const modelColumn = tier === 'fast' ? modelProviders.fastModel : modelProviders.reasoningModel;
   await getDb().transaction(async tx => {
-    const cleared = await tx.update(modelProviders).set({ ...tierColumns(tier, { model: null, baseUrl: null, apiKey: null }), updatedAt: new Date() })
+    const cleared = await tx.update(modelProviders).set({ ...tierColumns(tier, { model: null, baseUrl: null, apiKey: null, chatExtra: null }), updatedAt: new Date() })
       .where(and(eq(modelProviders.tenantId, tenantId), isNotNull(modelColumn)))
       .returning({ tenantId: modelProviders.tenantId });
     if (cleared.length) await recordAudit(tx, { tenantId, actor, action: 'model_provider.reset', targetType: 'model_provider', detail: { tier } });
