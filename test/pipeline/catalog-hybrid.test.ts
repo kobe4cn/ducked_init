@@ -87,6 +87,13 @@ async function tenantEmbedding(tenantId: string, model: string) {
 describe('混合检索', () => {
   it('缓存齐全时 hybrid: true 把向量一路融合进结果（只靠向量命中的条目能进结果、理由带 lane: vector），fallback: false；不传 hybrid 不发 embedding 请求、结果不含该条目', async () => {
     const { acme, c, received } = await hybridReady();
+    // 租户没有 model_providers 行（走平台 embedding）：补算成功时 upsert 建行，只写 embedding_fill_* 两列（#1172）
+    const [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
+    expect(row).toBeDefined();
+    expect(row.embeddingFillError).toBeNull();
+    expect(row.embeddingFillAt).toBeInstanceOf(Date);
+    expect({ baseUrl: row.baseUrl, embeddingBaseUrl: row.embeddingBaseUrl, embeddingModel: row.embeddingModel, vectorStore: row.vectorStore })
+      .toEqual({ baseUrl: null, embeddingBaseUrl: null, embeddingModel: null, vectorStore: 'platform' });
     // 前置：查询的词没有一个出现在目标指标的检索文字里，它只可能靠向量命中
     const text = haystack(c.entries.find(e => e.id === 'metric:churn_forecast')!);
     expect(terms(QUERY).every(w => !text.includes(w))).toBe(true);
@@ -101,6 +108,7 @@ describe('混合检索', () => {
 
     const hybrid = await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true });
     expect(hybrid.fallback).toBe(false);
+    expect(hybrid.vectorFallback).toBeUndefined(); // 补算成功时建出的 model_providers 行没改变 provider 的解析
     const hit = hybrid.ranked.find(r => r.entry.id === 'metric:churn_forecast')!;
     expect(hit, JSON.stringify(hybrid.ranked.map(r => [r.entry.id, r.reasons.map(x => x.lane)]))).toBeDefined();
     expect(hit.reasons).toContainEqual({ lane: 'vector', matched: ['1.00'] });
