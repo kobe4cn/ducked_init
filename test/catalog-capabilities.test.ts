@@ -3,7 +3,7 @@
 // 模板产出列与各模板按默认参数编译出的 SELECT 在内存 DuckDB 里 DESCRIBE 出来的列名与类型一致（纯函数，不碰平台库与数据湖）
 import { DuckDBInstance } from '@duckdb/node-api';
 import { describe, expect, it } from 'vitest';
-import { buildCatalog, expand, toMarkdown, type CapabilityEntry } from '../app/.server/catalog';
+import { buildCatalog, expand, search, toMarkdown, type CapabilityEntry } from '../app/.server/catalog';
 import { CAPABILITIES, CAPABILITY_EXAMPLES, TEMPLATE_OUTPUTS } from '../app/.server/catalog/capabilities';
 import { AGGS, checkMetric, FILTER_OPS, MAX_DIMENSIONS, MAX_HOPS, METRIC_SCHEMA, RATIO_AGGS, type DslContext } from '../app/.server/pipeline/dsl/metric-spec';
 import { checkTag, TAG_CONDITIONS, TAG_SCHEMA } from '../app/.server/pipeline/dsl/tag-spec';
@@ -31,9 +31,9 @@ describe('能力说明', () => {
     expect(new Set(CAPABILITY_EXAMPLES.map(e => e.key)).size).toBe(CAPABILITY_EXAMPLES.length);
   });
 
-  it('目录里有三个能力条目，注册表的每一项都出现在能力说明里', () => {
+  it('目录里有四个能力条目，注册表的每一项都出现在能力说明里', () => {
     const c = buildCatalog({});
-    expect(c.entries.filter(e => e.kind === 'capability').map(e => e.id)).toEqual(['capability:metric-dsl', 'capability:tag-dsl', 'capability:templates']);
+    expect(c.entries.filter(e => e.kind === 'capability').map(e => e.id)).toEqual(['capability:metric-dsl', 'capability:tag-dsl', 'capability:templates', 'capability:workbench-sql']);
     expect(expand(c, 'capability:metric-dsl')).toEqual(capability('capability:metric-dsl'));
 
     const metric = capability('capability:metric-dsl');
@@ -52,6 +52,14 @@ describe('能力说明', () => {
       for (const key of Object.keys(TEMPLATES[id].defaults)) expect(names(templates), `${id}.${key}`).toContain(key);
       for (const col of TEMPLATE_OUTPUTS[id].columns) expect(text(templates)).toContain(`\`${col.name}\` ${col.type}`);
     }
+  });
+
+  it('检索「工作台 SQL 消费者」命中 capability:workbench-sql，说明含 _identities 与统一消费者的写法（#1183）', () => {
+    const c = buildCatalog({});
+    expect(search(c, '工作台 SQL 消费者')[0]?.id).toBe('capability:workbench-sql');
+    const md = toMarkdown(expand(c, 'capability:workbench-sql')!);
+    for (const s of ['silver', 'gold', 'sandbox_', 'silver._identities', '_customer_source', 'consumer_id', 'silver._consumer']) expect(md, s).toContain(s);
+    expect(md).toContain('i._source = b._customer_source AND i.customer_id = b.customer_id');
   });
 
   it('模板产出列与按默认参数编译出的 SELECT 的列名、类型一致', async () => {

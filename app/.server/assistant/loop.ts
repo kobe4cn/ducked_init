@@ -103,6 +103,7 @@ const systemPrompt = (page: AssistantPage, priorPlan?: AnalysisPlan) => [
   '计划里用 rationale 一两句话说明为何选这些条目，写给成员看，只提本轮检索到、成员看得到的条目。',
   'validate_plan 返回 needs_clarification 时，把计划里的问题逐条向成员追问，本轮不再继续；返回 unsupported 时，向成员说明做不到的原因与问题里建议的下一步。',
   '把 SQL 填进工作台前，先用 validate_plan 校验一份 draft_query 计划，通过后再调 prefill_workbench。',
+  'draft_query 的 SQL 凡是按人 / 消费者聚合或排名（如 Top N 人、按城市汇总），都经 silver._identities 换成 consumer_id 按统一消费者归集，消费者属性取 silver._consumer；成员明确要求按源身份时才用源端 customer_id。写法见 capability:workbench-sql。',
   '起草指标、标签或映射时，先用 validate_* 校验，通过后再用 save_* 保存为草稿；不通过时按问题清单修改后重试。保存后提醒成员草稿要由另一位有发布权限的成员发布。',
   `定义的 key 只能用小写字母、数字与下划线，以小写字母开头（${DSL_KEY_PATTERN.source}）。`,
   `成员当前在页面 ${clip(page.path)}「${clip(page.title)}」。`,

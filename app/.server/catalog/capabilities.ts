@@ -1,5 +1,5 @@
-// app/.server/catalog/capabilities.ts —— 语义目录（ADR-0041）的平台能力说明：指标 DSL、标签 DSL 与分析模板三个条目，
-// 内容从代码注册表（AGGS、RATIO_AGGS、FILTER_OPS、MAX_DIMENSIONS、MAX_HOPS、METRIC_SCHEMA、TAG_CONDITIONS、TEMPLATES）生成，
+// app/.server/catalog/capabilities.ts —— 语义目录（ADR-0041）的平台能力说明：指标 DSL、标签 DSL、分析模板与工作台 SQL 四个条目，
+// 前三个的内容从代码注册表（AGGS、RATIO_AGGS、FILTER_OPS、MAX_DIMENSIONS、MAX_HOPS、METRIC_SCHEMA、TAG_CONDITIONS、TEMPLATES）生成，
 // 每项的说明写成 satisfies Record<注册表的项, …>，注册表新增一项却没写说明时类型检查不通过。
 // 手写示例只用标准实体的非敏感字段，测试里逐个过 checkMetric / checkTag；模板产出列按各模板 compile 出来的 SELECT 写，测试里对照 DESCRIBE
 import { CHANNELS } from '../../lib/canonical-model';
@@ -8,6 +8,7 @@ import { METRIC_SCHEMA } from '../pipeline/dsl/metric-spec';
 import { TAG_CONDITIONS, TAG_SCHEMA } from '../pipeline/dsl/tag-spec';
 import { TEMPLATES, type TemplateId } from '../pipeline/templates';
 import type { DslKind } from '../pipeline/dsl';
+import { customerSourceColumn } from '../../lib/customer-source';
 import type { CapabilityEntry, CapabilityItem, OutputColumn } from './index';
 
 const METRIC_KEY_TEXT = {
@@ -193,9 +194,12 @@ default: inactive
 const items = (texts: Record<string, string>): CapabilityItem[] => Object.entries(texts).map(([name, description]) => ({ name, description }));
 const examplesOf = (kind: CapabilityExample['kind']) => CAPABILITY_EXAMPLES.filter(e => e.kind === kind).map(e => ({ key: e.key, yaml: e.yaml, note: e.note }));
 
+const IDENTITIES = 'silver._identities';
+const CONSUMER = 'silver._consumer';
+
 const templateIds = Object.keys(TEMPLATES) as TemplateId[];
 
-/** 三个能力说明条目 */
+/** 四个能力说明条目 */
 export const CAPABILITIES: CapabilityEntry[] = [
   {
     kind: 'capability', id: 'capability:metric-dsl', name: '指标 DSL',
@@ -234,6 +238,38 @@ export const CAPABILITIES: CapabilityEntry[] = [
       },
       { title: `${id} 产出列`, items: TEMPLATE_OUTPUTS[id].columns },
     ]),
+    examples: [],
+  },
+  {
+    kind: 'capability', id: 'capability:workbench-sql', name: '工作台 SQL',
+    description: `工作台 SQL 只能读标准层 silver、结果层 gold、成员自己的沙箱 sandbox_<成员> 与别人分享的沙箱表；按「人 / 消费者」聚合或排名时，要经 ${IDENTITIES} 换成统一消费者 consumer_id 再聚合，消费者属性取 ${CONSUMER}`,
+    sections: [
+      {
+        title: '可读的层',
+        items: [
+          { name: 'silver', description: '标准层：各标准实体与自定义实体，每行带 _source（来自哪个数据源）' },
+          { name: 'gold', description: '结果层：指标、标签与模板产出的快照' },
+          { name: 'sandbox_<成员>', description: '成员自己的沙箱；别人分享的沙箱表也能读' },
+        ],
+      },
+      {
+        title: '换算到统一消费者',
+        items: [
+          { name: IDENTITIES, description: '身份映射，列 _source、customer_id、consumer_id：同一个人在不同数据源里的 customer_id 对应同一个 consumer_id' },
+          { name: '订单等引用 customer 的实体', description: `按 i._source = b.${customerSourceColumn('customer_id')} AND i.customer_id = b.customer_id 关联 ${IDENTITIES}` },
+          { name: 'customer 表本身', description: `按 i._source = c._source AND i.customer_id = c.customer_id 关联 ${IDENTITIES}` },
+          { name: CONSUMER, description: '统一消费者：consumer_id 与 city、gender、birthday 等非敏感属性（每列另有 <列>__source 说明取自哪个源）；城市等消费者属性从这里取，不取源记录自己的 silver.customer.city' },
+          { name: '源身份', description: '只有成员明确要按源身份（单个数据源里的 customer_id）统计时，才直接用源端 customer_id' },
+        ],
+      },
+      {
+        title: '示例 SQL',
+        items: [{
+          name: '按统一消费者的城市汇总实收',
+          description: `SELECT cs.city, SUM(b.amount) AS amount FROM silver."order" b INNER JOIN ${IDENTITIES} i ON i._source = b.${customerSourceColumn('customer_id')} AND i.customer_id = b.customer_id LEFT JOIN ${CONSUMER} cs ON cs.consumer_id = i.consumer_id GROUP BY cs.city`,
+        }],
+      },
+    ],
     examples: [],
   },
 ];
