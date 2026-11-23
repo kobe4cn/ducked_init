@@ -61,6 +61,8 @@ describe('用模型生成指标定义草稿', () => {
     expect(call).toMatchObject({ purpose: 'metric_draft', schemaValid: true });
     const [system, user] = received[0]!.body.messages;
     expect(system).toMatchObject({ role: 'system', content: expect.stringContaining('## capability:metric-dsl 指标 DSL') });
+    // DSL 没有时间分桶：提示词写明时间字段不能做维度、按小时 / 天 / 月分组或取峰值做不到（#1166）
+    expect(system!.content).toMatch(/时间（timestamp）字段不能做维度.*按小时 \/ 天 \/ 月分组或取峰值时，说明做不到/);
     expect(user!.role).toBe('user');
     // 依次是目录分层上下文（第一层分组 + 相关分组的组内列表）、按需求搜出的条目与需求原文
     const [overviewPart, searchPart] = user!.content.split('# 与需求相关的条目');
