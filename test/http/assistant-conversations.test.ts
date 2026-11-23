@@ -128,7 +128,7 @@ describe('助手对话', () => {
     expect(Object.keys(rows[0]).sort()).toEqual(['createdAt', 'id', 'memberId', 'sealed', 'tenantId', 'updatedAt']);
   });
 
-  it('校验过的计划随对话加密保存（ADR-0050）：?id= 读回的 assistant 消息只带 planCard、不带原始 plan（#539），sealed 里没有条目 id 明文；续写时发给模型的历史不带计划', async () => {
+  it('校验过的计划随对话加密保存（ADR-0050）：?id= 读回的 assistant 消息只带 planCard、不带原始 plan（#539），sealed 里没有条目 id 明文；续写时发给模型的历史不带计划、系统提示带计划摘要（#1179）', async () => {
     const { acme } = await publishedIdentitySources();
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     const client = await loginAs(app, 'analyst@acme.com');
@@ -159,12 +159,15 @@ describe('助手对话', () => {
       { role: 'assistant', content: '计划可用', toolsUsed: ['catalog_search', 'validate_plan'], planCard: expect.objectContaining({ status: 'valid', mode: 'reuse_result' }) },
     ]);
 
-    // 续写：交给模型的历史只有文字（不含计划，比如哈希值与 schemaVersion）；本轮没再校验，新消息不带 plan
+    // 续写：交给模型的历史只有文字（不含计划，比如哈希值与 schemaVersion）；计划只以摘要进系统提示末尾的 prior_plan（#1179，带哈希、不带完整 JSON）；
+    // 本轮没再校验，新消息不带 plan
     const second = await (await post(client, { conversationId: first.conversationId, message: '谢谢', page: PAGE })).json();
     expect(second).toMatchObject({ conversationId: first.conversationId, reply: '不客气', toolsUsed: [] });
-    const sent = JSON.stringify(received[3].body.messages);
-    expect(sent).not.toContain(hash);
-    expect(sent).not.toContain('schemaVersion');
+    const [system, ...history] = received[3].body.messages;
+    expect(JSON.stringify(history)).not.toContain(hash);
+    expect(system.content).toContain(`prior_plan:\nmode: reuse_result`);
+    expect(system.content).toContain(`semanticHash: ${hash}`);
+    expect(JSON.stringify(received[3].body.messages)).not.toContain('schemaVersion');
     const after = await (await client.get(`/assistant?id=${first.conversationId}`)).json();
     expect(after.conversation.messages.at(-1)).toEqual({ role: 'assistant', content: '不客气', toolsUsed: [] });
 

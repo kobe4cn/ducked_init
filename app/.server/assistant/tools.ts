@@ -6,7 +6,7 @@
 // 分析计划（ADR-0050）：目录检索工具的输出给每个条目带语义哈希（同一份按角色裁剪的目录上算），并把条目 id 记进 ToolCtx.retrieved（助手循环每轮新建）；
 // 目录总览分层（#854）：catalog_overview 只给第一层分组（groupOverview），catalog_expand 认 group: 分组标识（groupItems，组内条目同样带哈希并记进 retrieved），
 // 大目录不再截掉条目；查看者的目录里没有数据源条目，第一层不出 group:sources 汇总行、展开也回「没有这个条目」；
-// validate_plan 只认本轮检索到的条目，校验结果渲染成文本、不带 rejected（不计修正次数）；它不对外开放（external: false），外部没有这个上下文。
+// validate_plan 只认本轮检索到的条目与对话里最近一份计划引用过的条目（#1179，助手循环预先记进 retrieved），依赖变了的问题提示重新检索，校验结果渲染成文本、不带 rejected（不计修正次数）；它不对外开放（external: false），外部没有这个上下文。
 // validate_plan 发给模型的参数 Schema 是剥掉条件关键字的 PLAN_SCHEMA、说明附最小示例（PLAN_EXAMPLE），入参校验另用 inputCheck 只查 plan 是对象，结构错误仍由 validatePlan 逐条返回（#1178）。
 // 本轮校验过的计划经 ToolCtx 带走随对话保存；save_definition_draft 存草稿前对最新目录重新校验（本轮的优先，其次对话里最近一份），
 // 不是 valid 就不保存、说明原因（依赖变了 / 看不到所选条目时说计划已过期，否则写明计划状态，如 clarify 计划的 needs_clarification），不带 rejected；外部经 MCP 调用不带 ctx，没有计划，行为与不带计划时一致。
@@ -58,7 +58,7 @@ export interface ToolResult { text: string; rejected?: { issues: string; yaml: s
 export const catalogFor = async (member: CurrentMember): Promise<Catalog> =>
   visibleCatalog(await tenantCatalog(member.tenant.id), visibilityClass(member.role));
 
-/** 一次助手对话轮的上下文：retrieved 是本轮 catalog_search / catalog_expand 返回过的条目 id，validate_plan 只认这些（防止模型引用没检索过的条目）；
+/** 一次助手对话轮的上下文：retrieved 是本轮 catalog_search / catalog_expand 返回过的条目 id，助手循环一开始预先填入对话里最近一份计划引用过的条目（#1179），validate_plan 只认这些（防止模型引用没检索过的条目）；
  * plan 是本轮 validate_plan 收到的最后一份结构合法的计划，priorPlan 是对话里最近一份（助手循环带入）；存草稿与填工作台前都优先用 plan、其次 priorPlan 重新校验；
  * workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（多次通过以最后一次为准，之后的拒绝不清掉之前通过的值）；
  * choices 是本轮最后一次 catalog_search 判为歧义的追问候选（⑥-3，只有词与候选条目 id）或未命中说法的候选组（⑥-5，kind: 'missing'）：随答复返回、由路由加密存进对话，不进发给模型的请求 */
@@ -104,10 +104,14 @@ const planIssueRef = (i: PlanIssue) => `${i.path}${i.entryId ? `（${i.entryId}�
 /** 计划的一条问题：- path（entryId）：message；下一步：next（validate_plan 的输出与存草稿前重新校验共用） */
 const planIssueLine = (i: PlanIssue) => `- ${planIssueRef(i)}：${i.message}${i.next ? `；下一步：${i.next}` : ''}`;
 
-const planIssueLines = (issues: PlanIssue[]) => issues.map(planIssueLine).join('\n');
-
 const isDependencyIssue = (i: PlanIssue) => i.path.endsWith('.version') || i.path.endsWith('.semanticHash');
 const isHiddenIssue = (i: PlanIssue) => i.kind === 'hidden';
+
+/** 依赖变了的一条问题：validate_plan 与存草稿 / 填工作台前的重新校验共用，带上重新检索的提示（#1179：沿用对话里的计划、条目已升版时模型据此重新检索） */
+const dependencyLine = (i: PlanIssue) => `- ${planIssueRef(i)}：依赖变了（版本或语义哈希与当前目录不一致，要重新检索、换上当前的 version 与 semanticHash）——${i.message}`;
+
+/** validate_plan 的问题清单：依赖变了的那几条按 dependencyLine 写 */
+const planIssueLines = (issues: PlanIssue[]) => issues.map(i => (isDependencyIssue(i) ? dependencyLine(i) : planIssueLine(i))).join('\n');
 
 /** 重新校验没通过时的两种动作：存草稿与把 SQL 填进工作台，文案只差「保存 / 填入」那几个词（save 的逐字文案有历史用例断言） */
 type StaleAction = 'save' | 'prefill';
@@ -142,7 +146,7 @@ function stalePlanReply(status: Exclude<PlanStatus, 'valid'>, plan: AnalysisPlan
     return [`${words.failed}：计划状态是 ${status}（mode 是 ${plan.mode}），${STATUS_NEXT[action][status]}。`, ...issues.map(planIssueLine)].join('\n');
   }
   const lines = issues.map(i => {
-    if (isDependencyIssue(i)) return `- ${planIssueRef(i)}：依赖变了（版本或语义哈希与当前目录不一致）——${i.message}`;
+    if (isDependencyIssue(i)) return dependencyLine(i);
     if (isHiddenIssue(i)) return `- ${planIssueRef(i)}：看不到所选条目（权限变了，或条目已停用 / 删除）`;
     return planIssueLine(i);
   });
@@ -274,8 +278,8 @@ export const TOOLS: AssistantTool[] = [
   },
   {
     name: 'validate_plan',
-    description: '校验一份分析计划（JSON）：结构、步骤与选中的目录条目、口径可加性与平台能力。计划只能引用本轮 catalog_search / catalog_expand 返回过的条目，'
-      + '并带上返回的 semanticHash（指标、标签、模板还要带 version）；可选的 excluded 列出检索到但没选的口径（id 也必须来自本轮检索）和原因，'
+    description: '校验一份分析计划（JSON）：结构、步骤与选中的目录条目、口径可加性与平台能力。计划只能引用本轮 catalog_search / catalog_expand 返回过的条目或对话里最近一份计划引用过的条目，'
+      + '并带上返回的 semanticHash（指标、标签、模板还要带 version）；可选的 excluded 列出检索到但没选的口径（id 也必须来自本轮检索或对话里最近一份计划）和原因，'
       + '可选的 rationale 说明为何选；原因里不要写目录以外的名称。返回 status（valid / needs_clarification / unsupported / invalid）与逐条问题。'
       + `最小合法示例（draft_query）：${JSON.stringify(PLAN_EXAMPLE)}`,
     // 发给模型的是计划的完整结构（#1178），入参只查 plan 是对象：结构错误由 validatePlan 以 status: invalid 与逐条问题返回，不在 invokeTool 处 400
