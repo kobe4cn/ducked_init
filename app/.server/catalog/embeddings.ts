@@ -26,7 +26,7 @@ export function embedBatchSize(env: Record<string, string | undefined> = process
   const raw = env.LLM_EMBEDDING_BATCH_SIZE;
   if (!raw) return DEFAULT_EMBED_BATCH;
   if (/^\d+$/.test(raw) && Number(raw) > 0) return Number(raw);
-  console.warn(`LLM_EMBEDDING_BATCH_SIZE=${JSON.stringify(raw)} 不是正整数，按默认 ${DEFAULT_EMBED_BATCH} 条一批`);
+  console.warn(`LLM_EMBEDDING_BATCH_SIZE=${JSON.stringify(raw)} is not a positive integer, falling back to the default batch size ${DEFAULT_EMBED_BATCH}`);
   return DEFAULT_EMBED_BATCH;
 }
 
