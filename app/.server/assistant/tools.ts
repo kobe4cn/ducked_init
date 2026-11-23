@@ -7,6 +7,7 @@
 // 目录总览分层（#854）：catalog_overview 只给第一层分组（groupOverview），catalog_expand 认 group: 分组标识（groupItems，组内条目同样带哈希并记进 retrieved），
 // 大目录不再截掉条目；查看者的目录里没有数据源条目，第一层不出 group:sources 汇总行、展开也回「没有这个条目」；
 // validate_plan 只认本轮检索到的条目，校验结果渲染成文本、不带 rejected（不计修正次数）；它不对外开放（external: false），外部没有这个上下文。
+// validate_plan 发给模型的参数 Schema 是剥掉条件关键字的 PLAN_SCHEMA、说明附最小示例（PLAN_EXAMPLE），入参校验另用 inputCheck 只查 plan 是对象，结构错误仍由 validatePlan 逐条返回（#1178）。
 // 本轮校验过的计划经 ToolCtx 带走随对话保存；save_definition_draft 存草稿前对最新目录重新校验（本轮的优先，其次对话里最近一份），
 // 不是 valid 就不保存、说明原因（依赖变了 / 看不到所选条目时说计划已过期，否则写明计划状态，如 clarify 计划的 needs_clarification），不带 rejected；外部经 MCP 调用不带 ctx，没有计划，行为与不带计划时一致。
 // prefill_workbench（#424 选 A）把 draft_query 计划写好的 SQL 准备填进工作台：同样对最新目录重新校验计划（没有计划时拒绝，与存草稿不同），
@@ -20,7 +21,7 @@ import type { CurrentMember } from '../auth';
 import { expand, groupItems, groupOverview, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
 import { judgeAmbiguity, type AmbiguityGroup } from '../catalog/ambiguity';
 import { tenantCatalog } from '../catalog/load';
-import { planRetrievedIds, semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type PlanStatus } from '../catalog/plan';
+import { PLAN_SCHEMA, planRetrievedIds, semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type PlanStatus } from '../catalog/plan';
 import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
 import type { HitReason, Ranked } from '../catalog/rank';
 import { getDb } from '../db/client';
@@ -36,14 +37,17 @@ import { MAX_CELL, redactResult } from '../workbench-ai';
 export interface AssistantTool {
   name: string;
   description: string;
+  /** 发给模型（与 MCP tools/list）的参数 Schema */
   inputSchema: object;
+  /** invokeTool 的入参校验用这份（没有时用 inputSchema）：validate_plan 只查 plan 是对象，结构错误交给 validatePlan 逐条列出 */
+  inputCheck?: object;
   outputSchema: object;
   permission: Permission;
   /** 是否允许外部（MCP）调用 */
   external: boolean;
   /** 除权限外另要的令牌授权：allowQuery 是签发令牌时勾选的「允许执行查询」 */
   requires?: keyof ToolGrants;
-  /** input 已按 inputSchema 校验过；返回给模型的文本，不通过时带上问题清单；ctx 是本轮对话的上下文（检索到的候选），目录检索类工具用它 */
+  /** input 已按 inputCheck ?? inputSchema 校验过；返回给模型的文本，不通过时带上问题清单；ctx 是本轮对话的上下文（检索到的候选），目录检索类工具用它 */
   run(actor: CurrentMember, input: Record<string, unknown>, ctx?: ToolCtx): Promise<string | ToolResult>;
 }
 
@@ -171,6 +175,27 @@ function mappingTable(yaml: string): unknown {
 /** prefill_workbench 接受的 SQL 上限：工作台路由 ?sql= 超过这个字数会被忽略（app/routes/workbench.tsx 的 MAX_SQL_PARAM 同值，不从路由文件导入） */
 const MAX_PREFILL_SQL = 20_000;
 
+/** 发给模型前从参数 Schema 里剥掉的关键字：条件与组合（服务商不一定接受）及引用 / 元信息；这些跨字段规则仍由 Ajv 用完整 Schema 校验 */
+const MODEL_DROPPED_KEYS = new Set(['if', 'then', 'else', 'not', 'allOf', '$id', '$schema', '$ref']);
+
+/** Schema 的深拷贝，递归去掉 MODEL_DROPPED_KEYS；不改原 Schema */
+function forModel(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(forModel);
+  if (!schema || typeof schema !== 'object') return schema;
+  return Object.fromEntries(Object.entries(schema).filter(([k]) => !MODEL_DROPPED_KEYS.has(k)).map(([k, v]) => [k, forModel(v)]));
+}
+
+/** validate_plan 说明末尾附的最小合法 draft_query 计划（#1178）：fetch 的 inputs 引用 selected 的 id，aggregate 带 agg、inputs 恰好一个前面的步骤 */
+export const PLAN_EXAMPLE: AnalysisPlan = {
+  schemaVersion: 1,
+  mode: 'draft_query',
+  selected: [{ id: 'metric:order_count', version: 1, semanticHash: '<从 catalog_search 或 catalog_expand 的输出里抄>' }],
+  request: { dimensions: ['consumer.city'] },
+  steps: [{ id: 's1', action: 'fetch', inputs: ['metric:order_count'] }, { id: 's2', action: 'aggregate', agg: 'count', inputs: ['s1'] }],
+  assumptions: [{ text: '按下单时间统计', confirmed: false }],
+  questions: [],
+};
+
 export const TOOLS: AssistantTool[] = [
   {
     name: 'catalog_overview',
@@ -251,8 +276,11 @@ export const TOOLS: AssistantTool[] = [
     name: 'validate_plan',
     description: '校验一份分析计划（JSON）：结构、步骤与选中的目录条目、口径可加性与平台能力。计划只能引用本轮 catalog_search / catalog_expand 返回过的条目，'
       + '并带上返回的 semanticHash（指标、标签、模板还要带 version）；可选的 excluded 列出检索到但没选的口径（id 也必须来自本轮检索）和原因，'
-      + '可选的 rationale 说明为何选；原因里不要写目录以外的名称。返回 status（valid / needs_clarification / unsupported / invalid）与逐条问题',
-    inputSchema: { type: 'object', required: ['plan'], properties: { plan: { type: 'object' } }, additionalProperties: false },
+      + '可选的 rationale 说明为何选；原因里不要写目录以外的名称。返回 status（valid / needs_clarification / unsupported / invalid）与逐条问题。'
+      + `最小合法示例（draft_query）：${JSON.stringify(PLAN_EXAMPLE)}`,
+    // 发给模型的是计划的完整结构（#1178），入参只查 plan 是对象：结构错误由 validatePlan 以 status: invalid 与逐条问题返回，不在 invokeTool 处 400
+    inputSchema: { type: 'object', required: ['plan'], properties: { plan: forModel(PLAN_SCHEMA) }, additionalProperties: false },
+    inputCheck: { type: 'object', required: ['plan'], properties: { plan: { type: 'object' } }, additionalProperties: false },
     outputSchema: TEXT,
     permission: 'definitions:read',
     external: false,
@@ -420,7 +448,7 @@ export const externalToolsFor = (member: CurrentMember, tokenGrants: ToolGrants)
   TOOLS.filter(t => t.external && hasGrant(t, tokenGrants) && can(member.role, t.permission));
 
 const ajv = new Ajv({ allErrors: true, strict: false });
-const validators = new Map<string, ValidateFunction>(TOOLS.map(t => [t.name, ajv.compile(t.inputSchema)]));
+const validators = new Map<string, ValidateFunction>(TOOLS.map(t => [t.name, ajv.compile(t.inputCheck ?? t.inputSchema)]));
 
 const badRequest = (message: string) => data({ message }, { status: 400 });
 

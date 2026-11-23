@@ -264,10 +264,15 @@ export function describeSchemaError(e: ErrorObject): { path: Path; message: stri
     case 'type': return { path, message: `应为${String(p.type).split(',').map(t => TYPE_LABELS[t] ?? t).join('或')}` };
     case 'const': return { path, message: `应为 ${p.allowedValue}（标准模型 v${MODEL_MAJOR}）` };
     case 'enum': return { path, message: `应为以下之一：${(p.allowedValues as string[]).join('、')}` };
-    case 'minLength': case 'minItems': case 'minProperties': return { path, message: '不能为空' };
+    case 'minLength': case 'minProperties': return { path, message: '不能为空' };
+    case 'minItems': return { path, message: p.limit === 1 ? '不能为空' : `至少要有 ${p.limit} 项` };
+    case 'maxItems': return { path, message: `最多 ${p.limit} 项` };
+    // 计划的步骤（plan.ts）用 not 拦非 aggregate 步骤带 agg
+    case 'not': return { path, message: path.at(-2) === 'steps' ? '只有 aggregate 步骤能写 agg' : '不符合要求' };
     case 'uniqueItems': return { path, message: '不能有重复项' };
     case 'maxLength': return { path, message: `不能超过 ${p.limit} 字` };
     case 'minimum': return { path, message: `应不小于 ${p.limit}` };
+    case 'maximum': return { path, message: `应不大于 ${p.limit}` };
     case 'pattern': return { path, message: path.at(-1) === 'key_space' ? '键空间只能用小写字母、数字与下划线' : `应符合 ${p.pattern}` };
     default: return { path, message: e.message ?? e.keyword };
   }
