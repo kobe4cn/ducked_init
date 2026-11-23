@@ -1,6 +1,6 @@
 // test/pipeline/dsl-model-draft.test.ts —— 用模型按需求生成指标 / 标签定义草稿的流水线接缝（ADR-0035）：modelDraftForDefinition → 注入的假 fetch（setLlmFetch）
-// → 转出的 YAML 过该种类的校验后返回、不写 dsl_versions；platform.llm_calls 的调用日志（purpose = metric_draft / tag_draft）与失败时的审计 definition.model_draft_failed；
-// 生成的草稿保存后照常双人发布
+// → 转出的 YAML 过该种类的校验后返回（指标沿用一句话解析的输出形状，另带逐项说明 explanation，标签为 null）、不写 dsl_versions；
+// platform.llm_calls 的调用日志（purpose = metric_draft / tag_draft）与失败时的审计 definition.model_draft_failed；生成的草稿保存后照常双人发布
 import { and, eq } from 'drizzle-orm';
 import { parse } from 'yaml';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +13,7 @@ import { knowledgeKey } from '../../app/.server/knowledge/catalog';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { createDefinition, DslError, modelDraftForDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { definitionDraftMessages, SEARCH_LIMIT } from '../../app/.server/pipeline/dsl/model-draft';
+import { checkMetric, type DslContext } from '../../app/.server/pipeline/dsl/metric-spec';
 import { setLlmFetch, type LlmMessage } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
@@ -28,14 +29,24 @@ const USAGE = { prompt_tokens: 600, completion_tokens: 100 };
 
 const REQUEST = '近 30 天每个城市已支付订单的金额合计';
 
-/** 模型对 REQUEST 的回答 */
+/** 模型对 REQUEST 的回答（#1162 起沿用一句话解析的输出形状：spec 加逐项说明、认不出的词与不支持的说法） */
 const MODEL_REVENUE = {
-  base: 'order',
-  measure: { agg: 'sum', field: 'amount' },
-  filter: [{ field: 'status', op: 'in', value: ['paid'] }],
-  window: { field: 'created_at', days: 30 },
-  dimensions: [{ name: 'city', path: 'order.customer_id -> customer.city' }],
-  description: '近 30 天已支付订单金额',
+  spec: {
+    base: 'order',
+    measure: { agg: 'sum', field: 'amount' },
+    filter: [{ field: 'status', op: 'in', value: ['paid'] }],
+    window: { field: 'created_at', days: 30 },
+    dimensions: [{ name: 'city', path: 'order.customer_id -> customer.city' }],
+    description: '近 30 天已支付订单金额',
+  },
+  items: [
+    { path: 'measure.field', reason: '金额合计用 order.amount' },
+    { path: 'filter.0', reason: '已支付订单是 status 在 paid 里' },
+    { path: 'window', reason: '近 30 天按下单时间 created_at' },
+    { path: 'dimensions.0', reason: '每个城市按客户所在城市分组' },
+  ],
+  unknowns: [],
+  unsupported: [],
 };
 
 const calls = (tenantId: string) => getDb().select().from(llmCalls).where(eq(llmCalls.tenantId, tenantId));
@@ -52,9 +63,11 @@ describe('用模型生成指标定义草稿', () => {
     platformDefault();
     const { received } = fakeLlm(setLlmFetch, () => json(MODEL_REVENUE, USAGE));
 
-    const { yaml } = await modelDraftForDefinition(analyst, 'metric', REQUEST);
+    const { yaml, explanation } = await modelDraftForDefinition(analyst, 'metric', REQUEST);
     expect(yaml.startsWith('# 模型根据需求生成，请核对\n')).toBe(true);
-    expect(parse(yaml)).toEqual(MODEL_REVENUE);
+    expect(parse(yaml)).toEqual(MODEL_REVENUE.spec);
+    // 返回逐项说明（#1162）：等于模型给的三项；purpose 仍是 metric_draft（reasoning 档）
+    expect(explanation).toEqual({ items: MODEL_REVENUE.items, unknowns: [], unsupported: [] });
     expect(await getDb().select().from(dslVersions)).toHaveLength(0);
 
     const [call] = await calls(acme);
@@ -95,11 +108,37 @@ describe('用模型生成指标定义草稿', () => {
     expect(searchPart).toContain('业务说明：退款单也算一笔订单，状态记为 refunded');
   });
 
-  it('模型返回不合 Schema 时拒绝：调用日志 schema_valid = false，记一条失败审计，不含需求原文', async () => {
+  it('带 -> 路径的品类过滤与时间窗口原样保留在 YAML 里并过指标校验（奶粉消费金额 近 90 天）', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     platformDefault();
-    fakeLlm(setLlmFetch, () => json({ base: 'order', measure: { agg: 'median', field: 'amount' } }, USAGE));
+    const REPLY = {
+      spec: {
+        base: 'order_item',
+        measure: { agg: 'sum', field: 'amount' },
+        filter: [{ field: 'order_item.product_id -> product.category', op: 'eq', value: '奶粉' }],
+        window: { field: 'order_item.order_id -> order.created_at', days: 90 },
+      },
+      items: [{ path: 'filter.0', reason: '奶粉是商品的品类' }],
+      unknowns: [],
+      unsupported: [],
+    };
+    fakeLlm(setLlmFetch, () => json(REPLY, USAGE));
+
+    const { yaml, explanation } = await modelDraftForDefinition(analyst, 'metric', '奶粉消费金额 近 90 天');
+    expect(yaml).toContain('order_item.product_id -> product.category');
+    expect(yaml).toContain('order_item.order_id -> order.created_at');
+    // 路径原样保留：过指标校验（order_item / product / order 都是标准实体、关系是内置的，空上下文即可）
+    const ctx: DslContext = { published: new Map(), plans: [], metrics: new Map() };
+    expect(checkMetric(yaml, ctx)).toMatchObject({ ok: true });
+    expect(explanation).toEqual({ items: REPLY.items, unknowns: [], unsupported: [] });
+  });
+
+  it('模型返回不合 Schema 时拒绝：调用日志 schema_valid = false，记一条失败审计，不含需求原文与说明', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json({ spec: { base: 'order', measure: { agg: 'median', field: 'amount' } }, items: [{ path: 'measure', reason: '金额取中位数' }], unknowns: [], unsupported: [] }, USAGE));
 
     const e = await failure(modelDraftForDefinition(analyst, 'metric', REQUEST));
     expect(e).toBeInstanceOf(DslError);
@@ -109,13 +148,32 @@ describe('用模型生成指标定义草稿', () => {
     expect(audit).toMatchObject({ actorEmail: analyst.email, targetType: 'definition', detail: { kind: 'metric', stage: 'model' } });
     expect(String(audit!.detail.error)).toContain('不符合 Schema');
     expect(JSON.stringify(audit!.detail)).not.toContain(REQUEST);
+    expect(JSON.stringify(audit!.detail)).not.toContain('金额取中位数');
+  });
+
+  it('模型把定义平铺在顶层、收拢后不合严格 Schema 时拒绝：schema_valid 仍是宽松结果，审计带 normalized 且不含需求原文与说明', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json({ base: 'order', measure: { agg: 'median', field: 'amount' }, items: [{ path: 'measure', reason: '金额取中位数' }] }, USAGE));
+
+    const e = await failure(modelDraftForDefinition(analyst, 'metric', REQUEST));
+    expect(e).toBeInstanceOf(DslError);
+    expect(e.status).toBe(422);
+    // 宽松 Schema 放行了平铺输出（#959），schema_valid 记的是宽松校验的结果
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'metric_draft', schemaValid: true });
+    const [audit] = await failures(acme);
+    expect(audit).toMatchObject({ detail: { kind: 'metric', stage: 'model', normalized: true } });
+    expect(String(audit!.detail.error)).toContain('不符合 Schema');
+    expect(JSON.stringify(audit!.detail)).not.toContain(REQUEST);
+    expect(JSON.stringify(audit!.detail)).not.toContain('金额取中位数');
   });
 
   it('转出的 YAML 不过指标校验时拒绝：带问题列表，审计只记问题数与位置，不含取值', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     platformDefault();
-    fakeLlm(setLlmFetch, () => json({ base: 'order', measure: { agg: 'count' }, filter: [{ field: 'channel_code', op: 'eq', value: 'vip-secret-42' }] }, USAGE));
+    fakeLlm(setLlmFetch, () => json({ spec: { base: 'order', measure: { agg: 'count' }, filter: [{ field: 'channel_code', op: 'eq', value: 'vip-secret-42' }] }, items: [], unknowns: [], unsupported: [] }, USAGE));
 
     const e = await failure(modelDraftForDefinition(analyst, 'metric', REQUEST));
     expect(e.status).toBe(422);
@@ -178,9 +236,11 @@ describe('用模型生成标签定义草稿', () => {
     platformDefault();
     const { received } = fakeLlm(setLlmFetch, () => json(MODEL_TIER, USAGE));
 
-    const { yaml } = await modelDraftForDefinition(analyst, 'tag', TAG_REQUEST);
+    const { yaml, explanation } = await modelDraftForDefinition(analyst, 'tag', TAG_REQUEST);
     expect(yaml.startsWith('# 模型根据需求生成，请核对\n')).toBe(true);
     expect(parse(yaml)).toEqual(MODEL_TIER);
+    // 标签不走一句话解析的输出形状（#1162）：没有逐项说明
+    expect(explanation).toBeNull();
     expect(await getDb().select().from(dslVersions)).toHaveLength(3);
 
     expect((await calls(acme))[0]).toMatchObject({ purpose: 'tag_draft', schemaValid: true });

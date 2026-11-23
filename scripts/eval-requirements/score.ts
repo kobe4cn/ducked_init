@@ -8,10 +8,10 @@ import { deriveProjection } from '../../app/.server/catalog/projection';
 import { rank } from '../../app/.server/catalog/rank';
 import { AGGREGATE_FNS, PLAN_MODES, PLAN_SCHEMA, semanticHash, validatePlan, type PlanMode } from '../../app/.server/catalog/plan';
 import { CLAIM_TYPES } from '../../app/lib/semantic-claims';
-import { callModel, LlmError, type LlmMessage, type LlmProvider } from '../../app/.server/llm';
+import { callModel, LlmError, schemaErrors, validatorFor, type LlmMessage, type LlmProvider } from '../../app/.server/llm';
 import { DSL_KINDS, type DslKind } from '../../app/.server/pipeline/dsl';
 import type { MetricSpec, RatioPart } from '../../app/.server/pipeline/dsl/metric-spec';
-import { completeDraftPaths, definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml, SEARCH_LIMIT } from '../../app/.server/pipeline/dsl/model-draft';
+import { completeDraftPaths, definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml, METRIC_PARSE_SCHEMA, normalizeParseOutput, SEARCH_LIMIT } from '../../app/.server/pipeline/dsl/model-draft';
 import { tagMetrics, type TagSpec } from '../../app/.server/pipeline/dsl/tag-spec';
 import { CATALOG, CONTEXT, type GoldenCase, type GoldenEntry } from './golden';
 import { expectedMode } from './plan-modes';
@@ -141,8 +141,20 @@ export async function runCase(provider: LlmProvider, c: GoldenCase): Promise<Cas
     if (!(e instanceof LlmError)) throw e;
     return { id: c.id, kind: c.kind, valid: false, ...scoreStructure(c.kind, c.expected, null), failed: { stage: 'model', message: e.message } };
   }
+  // 指标起草沿用一句话解析的输出形状（#1162）：模型答复是 spec 加三键（宽松 Schema 也放行平铺输出），照产品侧收拢进 spec
+  // 再按严格 Schema 校验——不合形状算模型阶段失败（产品的 422 同归因），过了才转 YAML 打分
+  let spec: object = out;
+  if (c.kind === 'metric') {
+    const parsed = normalizeParseOutput(out as Record<string, unknown>);
+    const validate = validatorFor(METRIC_PARSE_SCHEMA);
+    if (!validate(parsed.output)) {
+      const message = `模型返回的 JSON 不符合 Schema：${schemaErrors(validate)}`;
+      return { id: c.id, kind: c.kind, valid: false, ...scoreStructure(c.kind, c.expected, null), failed: { stage: 'model', message } };
+    }
+    spec = (parsed.output as { spec: object }).spec;
+  }
   // 按产品实际存下的定义打分：路径首段补过实体名的（definitionOutputToYaml 内部也补）
-  const completed = completeDraftPaths(c.kind, out);
+  const completed = completeDraftPaths(c.kind, spec);
   const got = DSL_KINDS[c.kind].check(definitionOutputToYaml(c.kind, completed), CONTEXT);
   const result = { id: c.id, kind: c.kind, valid: got.ok, ...scoreStructure(c.kind, c.expected, completed) };
   return got.ok ? result : { ...result, failed: { stage: 'definition', message: `定义校验不过：${got.issues.length} 个问题`, issues: got.issues.length } };
