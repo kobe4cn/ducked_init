@@ -20,6 +20,7 @@ import { checkDraftedSql, listCatalog, runQuery, WorkbenchError, type CatalogEnt
 import { SNAPSHOT_TABLE } from './pipeline/task-contracts';
 import { templateOfKind } from './pipeline/templates';
 import { samplesAllowed } from './model-provider';
+import { UUID } from './tenants';
 import { looksSensitive } from '../lib/sensitive';
 
 /** 可以展示给成员的错误；状态码与 WorkbenchError 对齐（透传它的 status） */
@@ -53,8 +54,6 @@ const tableLine = (t: { ref: string; columns: { name: string; type: string }[] }
 
 /** 提示里的中文片段（给模型看的提示词，不是界面文案） */
 const NOTE = { metric: '指标', tag: '标签', template: '模板', latest: '最新快照', truncated: '…（目录太长，部分表略去）' } as const;
-
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
  * 结果层写进提示的行：<种类>__<任务 ID> 的快照按本租户的 platform.tasks 归组（模板任务按 kind，gold.dsl 按 params.kind:params.key），
