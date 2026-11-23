@@ -3,6 +3,7 @@
 // 补算批量请求失败时记下 embedding_fill_error、10 分钟内检索不再入队（backoff）、catalog_search 输出 not_ready，成功后清空错误（#1172）；
 // catalog_search（内部与 MCP 同一入口）按租户 hybrid_search 开关决定是否走混合（#432）；
 // hybridReady 断言向量缓存齐全，缺了就在报错里列出诊断（#610）
+import { createHash } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runTool } from '../../app/.server/assistant/tools';
@@ -189,6 +190,23 @@ describe('混合检索', () => {
     expect(hit).toBeDefined();
     expect(hit.reasons).toContainEqual({ lane: 'vector', matched: ['1.00'] });
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('这批行只缺一部分向量时不降级：照旧返回向量命中（lane: vector）、vectorFallback 为 undefined，并入队一个 catalog.embed（#1172）', async () => {
+    const { acme, c } = await hybridReady();
+    // 直接往投影里加一个假条目：这批行只缺它这一个哈希
+    const text = '假条目，只缺它的向量';
+    await getDb().insert(catalogProjection).values({
+      tenantId: acme, visibilityClass: 'full', entryId: 'fake:partial', text, textHash: createHash('sha256').update(text).digest('hex'),
+      subjects: [], aliases: [], spaceId: null, catalogVersion: 1,
+    });
+
+    const hybrid = await rankedSearch(acme, 'full', c, QUERY, {}, 20, { hybrid: true });
+    expect(hybrid.vectorFallback).toBeUndefined();
+    const hit = hybrid.ranked.find(r => r.entry.id === 'metric:churn_forecast')!;
+    expect(hit, JSON.stringify(hybrid.ranked.map(r => [r.entry.id, r.reasons.map(x => x.lane)]))).toBeDefined();
+    expect(hit.reasons.map(r => r.lane)).toContain('vector');
+    expect((await embedTasks(acme)).map(t => t.status)).toEqual(['succeeded', 'queued']); // 缺的那一个入队补算
   });
 
   it('catalog_search 按租户 hybrid_search 开关走混合 / 原有路径（MCP 是同一入口，开关同样作用）：关着时排到的条目与不传 hybrid 的 rankedSearch 一致、不发 embedding 请求；打开后向量一路生效', async () => {
