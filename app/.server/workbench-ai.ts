@@ -1,19 +1,24 @@
 // app/.server/workbench-ai.ts —— 工作台 AI 起草 SQL（ADR-0043）：按成员此刻能读的目录（listCatalog：表、字段与类型，不含取值）请模型写一条只读 SQL，
 // 在只读挂载上按工作台白名单校验（checkDraftedSql，不执行），通过后只交给页面填进编辑框，由成员自己执行。
+// 提示里的结果层快照按任务归组、每个指标 / 标签 / 模板只给最新一张；目录太长时先略去结果层与沙箱，silver 与原始表最后才裁（catalogText）。
 // 审计 workbench.ai_drafted 记 SQL 与是否通过校验，不记需求原文；模型判断做不到时（需要的表不在目录里、要写数据）422 给出它的原因，审计只记 { unsupported: true }；不自动重试。
 // 结果解读：成员确认后服务端按 SQL 重新执行（不信客户端传来的行），租户打开「发送脱敏样本」时把前 INTERPRET_ROWS 行发给模型服务，
 // 没打开时只发 SQL、列名与类型、行数和每列统计（按全部结果行算），不发任何行；结果列无法回溯到字段，
 // 所以按列名与取值保守剔除系统列、名字像敏感字段的列与取值里有 64 位十六进制哈希的列（统计也只算留下的列）。审计 workbench.result_interpreted 不记取值，记 samples；
 // 解读连同 SQL、行数与发送的列名存进本人的助手对话（appendInterpretation），不存结果行
+import { and, eq, inArray } from 'drizzle-orm';
 import { assertCan } from './access';
 import { appendInterpretation, assertOwnConversation } from './assistant/conversations';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
 import { isSystemColumn } from './catalog';
 import { getDb } from './db/client';
+import { tasks } from './db/schema';
 import { chatJson, LlmError, resolveProvider, type LlmMessage } from './llm';
 import { normalizeWorkbenchSql, type WorkbenchResult } from './pipeline/workbench-engine';
-import { checkDraftedSql, listCatalog, runQuery, WorkbenchError, type QueryOutcome, type WorkbenchCatalog } from './workbench';
+import { checkDraftedSql, listCatalog, runQuery, WorkbenchError, type CatalogEntry, type QueryOutcome, type WorkbenchCatalog } from './workbench';
+import { SNAPSHOT_TABLE } from './pipeline/task-contracts';
+import { templateOfKind } from './pipeline/templates';
 import { samplesAllowed } from './model-provider';
 import { looksSensitive } from '../lib/sensitive';
 
@@ -24,7 +29,7 @@ export class WorkbenchAiError extends Error {
 
 /** 需求最多的字数 */
 export const MAX_REQUEST = 2000;
-/** 目录在提示里最多占的字数，超出的表略去 */
+/** 目录在提示里最多占的字数，超出时按层略去整行（catalogText） */
 const MAX_CATALOG = 30_000;
 
 /**
@@ -44,18 +49,83 @@ const SCHEMA = {
 /** 做不到的原因最多的字数 */
 const MAX_UNSUPPORTED = 500;
 
-/** 目录写进提示：每张表一行「引用(字段 类型, …)」 */
-function catalogText(catalog: WorkbenchCatalog): string {
-  const line = (t: { ref: string; columns: { name: string; type: string }[] }) => `${t.ref}(${t.columns.map(c => `${c.name} ${c.type}`).join(', ')})`;
-  const lines = [
-    ...[...catalog.silver, ...catalog.gold, ...catalog.mine, ...catalog.shared].map(line),
-    ...catalog.raw.flatMap(s => s.tables.map(line)),
-  ];
-  const text = lines.join('\n');
-  return text.length > MAX_CATALOG ? `${text.slice(0, MAX_CATALOG)}\n…（目录太长，后面的表略去）` : text;
+const tableLine = (t: { ref: string; columns: { name: string; type: string }[] }) => `${t.ref}(${t.columns.map(c => `${c.name} ${c.type}`).join(', ')})`;
+
+/** 提示里的中文片段（给模型看的提示词，不是界面文案） */
+const NOTE = { metric: '指标', tag: '标签', template: '模板', latest: '最新快照', truncated: '…（目录太长，部分表略去）' } as const;
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * 结果层写进提示的行：<种类>__<任务 ID> 的快照按本租户的 platform.tasks 归组（模板任务按 kind，gold.dsl 按 params.kind:params.key），
+ * 每组只留 finished_at 最新、succeeded 的那张并在行尾注明是谁的最新快照；名字不是快照、查不到任务或任务没成功的表原样保留。
+ * 只用在提示里，listCatalog 的输出（目录树、补全）不变
+ */
+async function goldSnapshots(tenantId: string, gold: WorkbenchCatalog['gold']): Promise<string[]> {
+  const taskIdOf = (e: CatalogEntry) => (SNAPSHOT_TABLE.test(`gold.${e.name}`) && UUID.test(e.name.slice(-36)) ? e.name.slice(-36) : undefined);
+  const ids = gold.map(taskIdOf).filter((id): id is string => id !== undefined);
+  const found = ids.length
+    ? await getDb().select({ id: tasks.id, kind: tasks.kind, params: tasks.params, status: tasks.status, finishedAt: tasks.finishedAt })
+      .from(tasks).where(and(eq(tasks.tenantId, tenantId), inArray(tasks.id, ids)))
+    : [];
+  const byId = new Map(found.map(t => [t.id, t]));
+  /** 快照所属的组与注释；不归组时 undefined */
+  const groupOf = (e: CatalogEntry) => {
+    const id = taskIdOf(e);
+    const task = id === undefined ? undefined : byId.get(id);
+    if (!task || task.status !== 'succeeded') return undefined;
+    const { kind, key } = task.params;
+    if (task.kind === 'gold.dsl' && (kind === 'metric' || kind === 'tag') && typeof key === 'string') {
+      return { key: `${kind}:${key}`, note: `${NOTE[kind]} ${key}`, at: task.finishedAt?.getTime() ?? 0 };
+    }
+    const template = templateOfKind(task.kind);
+    return template ? { key: task.kind, note: `${NOTE.template} ${template}`, at: task.finishedAt?.getTime() ?? 0 } : undefined;
+  };
+  const groups = gold.map(groupOf);
+  const latest = new Map<string, number>();
+  groups.forEach((g, i) => {
+    if (!g) return;
+    const best = latest.get(g.key);
+    if (best === undefined || g.at > groups[best]!.at) latest.set(g.key, i);
+  });
+  return gold.flatMap((e, i) => {
+    const g = groups[i];
+    if (!g) return [tableLine(e)];
+    return latest.get(g.key) === i ? [`${tableLine(e)}  -- ${g.note} ${NOTE.latest}`] : [];
+  });
 }
 
-function draftMessages(request: string, catalog: WorkbenchCatalog): LlmMessage[] {
+/**
+ * 目录写进提示：每张表一行「引用(字段 类型, …)」，按 silver、gold、mine、shared、原始表的顺序。
+ * 超过 MAX_CATALOG 字时按整行、按层裁剪：silver 与原始表 > 自己的沙箱 > 分享给我的 > 结果层；
+ * 某层放不下时只留这层开头放得下的行，后面的层全部略去，truncated 为真
+ */
+function catalogText(catalog: WorkbenchCatalog, gold: string[]): { text: string; truncated: boolean } {
+  const sections: { tier: number; lines: string[] }[] = [
+    { tier: 0, lines: catalog.silver.map(tableLine) },
+    { tier: 3, lines: gold },
+    { tier: 1, lines: catalog.mine.map(tableLine) },
+    { tier: 2, lines: catalog.shared.map(tableLine) },
+    { tier: 0, lines: catalog.raw.flatMap(s => s.tables.map(tableLine)) },
+  ];
+  const keep = sections.map(s => s.lines.map(() => false));
+  let budget = MAX_CATALOG;
+  let truncated = false;
+  for (const tier of [0, 1, 2, 3]) {
+    for (const [si, section] of sections.entries()) {
+      if (section.tier !== tier) continue;
+      for (const [li, line] of section.lines.entries()) {
+        if (truncated || line.length + 1 > budget) { truncated = true; continue; }
+        budget -= line.length + 1;
+        keep[si]![li] = true;
+      }
+    }
+  }
+  const text = sections.flatMap((s, si) => s.lines.filter((_, li) => keep[si]![li])).join('\n');
+  return { text: truncated ? `${text}\n${NOTE.truncated}` : text, truncated };
+}
+
+function draftMessages(request: string, catalog: string): LlmMessage[] {
   return [
     {
       role: 'system',
@@ -64,7 +134,7 @@ function draftMessages(request: string, catalog: WorkbenchCatalog): LlmMessage[]
         '只写一条 SELECT（可以带 WITH），不写 INSERT / UPDATE / DELETE / CREATE / DROP 等写语句，不写多条语句。',
         '只能读下面列出的表，表名照列出的引用写（带 schema 或数据源名与引号），不要编造表或字段；需要的表或字段不在下面列出的目录里，或需求要删除 / 修改 / 写入数据（工作台只读）时，不要编造、不要改写成别的查询，回答 {"unsupported": "一句话原因"}。',
         '能读的表（引用(字段 类型, …)）：',
-        catalogText(catalog) || '（没有能读的表）',
+        catalog || '（没有能读的表）',
       ].join('\n'),
     },
     { role: 'user', content: request },
@@ -75,9 +145,9 @@ function draftMessages(request: string, catalog: WorkbenchCatalog): LlmMessage[]
  * 按需求起草一条工作台 SQL，通过白名单校验后返回，不执行（ADR-0043）。
  * 需求为空或超过 MAX_REQUEST 字时 400；没配置模型服务时 409（都不发请求）；模型失败或 SQL 没通过校验时 422（没通过时审计 valid: false）；
  * 模型判断做不到时 422，报错就是它给的原因（截到 MAX_UNSUPPORTED 字），审计 { unsupported: true }，不记原因（可能复述需求）；
- * 同租户已有查询在运行时 429
+ * 同租户已有查询在运行时 429。目录太长、提示里略去了表时 catalogTruncated 为真
  */
-export async function draftWorkbenchSql(actor: CurrentMember, request: string): Promise<{ sql: string }> {
+export async function draftWorkbenchSql(actor: CurrentMember, request: string): Promise<{ sql: string; catalogTruncated: boolean }> {
   assertCan(actor, 'sandbox');
   if (!request.trim()) throw new WorkbenchAiError('请先写下要查什么', 400);
   if (request.length > MAX_REQUEST) throw new WorkbenchAiError(`需求最多 ${MAX_REQUEST} 字`, 400);
@@ -85,9 +155,10 @@ export async function draftWorkbenchSql(actor: CurrentMember, request: string): 
   if (!(await resolveProvider(tenantId))) throw new WorkbenchAiError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务', 409);
   try {
     const catalog = await listCatalog(actor);
+    const { text, truncated } = catalogText(catalog, await goldSnapshots(tenantId, catalog.gold));
     let output: { sql?: string; unsupported?: string };
     try {
-      output = await chatJson<{ sql?: string; unsupported?: string }>(tenantId, 'workbench_draft', draftMessages(request, catalog), SCHEMA);
+      output = await chatJson<{ sql?: string; unsupported?: string }>(tenantId, 'workbench_draft', draftMessages(request, text), SCHEMA);
     } catch (e) {
       if (e instanceof LlmError) throw new WorkbenchAiError(`模型起草 SQL 失败：${e.message}`, 422);
       throw e;
@@ -100,7 +171,7 @@ export async function draftWorkbenchSql(actor: CurrentMember, request: string): 
     // unsupported 没给或只有空白时 SCHEMA anyOf 的第一个分支不成立（它要求有非空白字符），通过校验靠的是第二个分支，所以一定有非空的 sql
     const { sql, problem } = await checkDraftedSql(actor, output.sql!);
     if (problem) throw new WorkbenchAiError(`AI 起草的 SQL 没有通过校验：${problem}`, 422);
-    return { sql };
+    return { sql, catalogTruncated: truncated };
   } catch (e) {
     // 目录读取、校验时挂载出错或已有查询在运行：照原状态码给出
     if (e instanceof WorkbenchError) throw new WorkbenchAiError(e.message, e.status);

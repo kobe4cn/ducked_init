@@ -107,6 +107,7 @@ describe('AI 起草', () => {
     const html = await res.text();
     expect(html).toMatch(/<textarea[^>]*name="sql"[^>]*>SELECT city, count\(\*\) AS n FROM silver.customer GROUP BY city<\/textarea>/);
     expect(html).toContain('data-drafted');
+    expect(html).not.toContain('data-catalog-truncated');
     expect(html).not.toContain('data-workbench-result');
     expect(await lastAudit()).toEqual(before);
 

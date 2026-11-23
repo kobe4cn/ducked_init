@@ -1279,6 +1279,7 @@
   "百分比": "Percent",
   "盘点数据湖": "Inventory the data lake",
   "目录": "Catalog",
+  "目录太长，AI 起草时只看到了部分表（优先保留 silver 和数据源原始表）": "The catalog is too long, so AI drafting saw only some tables (silver and raw source tables are kept first)",
   "目录登记 {registered, plural, other {# 个文件}}，当前 {current, plural, other {# 个数据文件}}共 {rows} 行；内联在目录库中 {inlined} 行（没有对应文件）": "The catalog registers {registered, plural, one {# file} other {# files}}; currently {current, plural, one {# data file} other {# data files}} with {rows} rows; {inlined} rows are inlined in the catalog (no file behind them)",
   "目标": "Target",
   "目标实体": "Target entity",
