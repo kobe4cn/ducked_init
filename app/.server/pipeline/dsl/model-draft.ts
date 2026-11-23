@@ -33,7 +33,7 @@ const METRIC_RULES = [
   '- 需求没提到的部分不要加；不要输出 device_attribution。',
 ];
 
-/** 输出格式与逐项说明的规则（#1162；构建器的一句话解析已删除，#1164）：来源词是「需求」还是「句子」，只替换它，其余逐字相同 */
+/** 输出格式与逐项说明的规则（#1162）：source 是提示词里称呼成员输入的来源词（现在只有起草的「需求」） */
 const metricOutputLines = (source: string) => [
   '输出格式：',
   '{ "spec": { "base": 基础实体, "measure": 度量, "filter"?: 过滤条件数组, "window"?: 时间窗口, … },',
@@ -48,7 +48,7 @@ const metricOutputLines = (source: string) => [
   `- ${source}支撑不了的写法不要写进 spec；unsupported 里的说法一律不进 spec。`,
 ];
 
-/** 指标的 system 提示词（#1162，原与已删除的一句话解析共用）：task 是角色说明里的任务，source 是来源词（「需求」或「句子」），其余逐字相同 */
+/** 指标的 system 提示词（#1162）：task 是角色说明里的任务，source 是来源词（现在只有起草的「需求」） */
 const metricSystem = (task: string, source: string) => [
   `你是 CRM 数据平台的指标助手：${task}，只输出一个符合给定 JSON Schema 的 JSON 对象（顶层是 spec、items、unknowns、unsupported 四个键，指标定义只放在 spec 里），不要输出别的文字。`,
   `成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按${source}搜出的目录条目与${source}原文。`,
