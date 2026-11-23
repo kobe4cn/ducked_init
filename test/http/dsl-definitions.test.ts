@@ -940,7 +940,7 @@ describe('一句话解析', () => {
 });
 
 describe('用模型生成标签草稿', () => {
-  it('标签新建页生成草稿填进编辑框、不保存；没有可引用的已发布指标时 400 提示，编辑框保持原内容', async () => {
+  it('标签新建页生成草稿填进编辑框、不保存；没有可引用的已发布指标时 400 提示、模型判断做不到时 422 显示原因，编辑框保持原内容', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     await memberOf(acme, 'analyst@acme.com', 'analyst');
     const analyst = await loginAs(app, 'analyst@acme.com');
@@ -964,5 +964,14 @@ describe('用模型生成标签草稿', () => {
     expect(editorYaml(html)).toContain('gte: 1000');
     expect(html).toContain('data-generated');
     expect(await getDb().select().from(dslVersions)).toHaveLength(1);
+
+    // 模型判断做不到（#1165）：422，页面显示模型给的原因、不显示 Schema 报错，编辑框保持原内容
+    modelReplies({ unsupported: ['按小时的峰值需要按小时分桶的指标'] });
+    const unsupported = await analyst.post('/analytics/definitions/new?kind=tag&mode=yaml', { intent: 'model-draft', kind: 'tag', key: '', request: '按小时的峰值', yaml: tag });
+    expect(unsupported.status).toBe(422);
+    const unsupportedHtml = await unsupported.text();
+    expect(unsupportedHtml).toContain('模型判断做不到：按小时的峰值需要按小时分桶的指标');
+    expect(unsupportedHtml).not.toContain('must NOT');
+    expect(editorYaml(unsupportedHtml)).toBe(tag);
   });
 });

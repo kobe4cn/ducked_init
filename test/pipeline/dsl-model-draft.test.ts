@@ -219,6 +219,7 @@ const SPACE = '00000000-0000-0000-0000-000000000000';
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: created_at, days: 30 }\ndescription: 近 30 天订单金额\n';
 const REVENUE_BY_CITY = 'base: order\nmeasure: { agg: sum, field: amount }\ndimensions:\n  - { name: city, path: order.customer_id -> customer.city }\n';
+const ORDER_COUNT_30D = 'base: order\nmeasure: { agg: count }\nwindow: { field: created_at, days: 30 }\n';
 const TAG_REQUEST = '近 30 天消费满 1000 的是高价值客户，其余为普通';
 
 /** 模型对 TAG_REQUEST 的回答 */
@@ -280,18 +281,73 @@ describe('用模型生成标签定义草稿', () => {
     expect((await calls(acme)).map(c => c.purpose)).toEqual(['tag_draft', 'tag_draft']);
   });
 
-  it('模型输出不合 SINGLE_TAG_SCHEMA 时 422，记审计', async () => {
+  it('模型输出不合标签草稿 Schema（比较写 between、unsupported 与 rules 混在一个对象里）时 422，记审计', async () => {
     const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     await createDefinition(author, 'metric', 'revenue_30d', REVENUE);
     await publishDefinition(reviewer, 'metric', 'revenue_30d', 1);
     platformDefault();
-    fakeLlm(setLlmFetch, () => json({ metric: 'revenue_30d', rules: [{ value: 'high', when: { between: [1, 2] } }], default: 'normal' }, USAGE));
 
-    const e = await failure(modelDraftForDefinition(analyst, 'tag', TAG_REQUEST));
+    for (const output of [
+      { metric: 'revenue_30d', rules: [{ value: 'high', when: { between: [1, 2] } }], default: 'normal' },
+      { ...MODEL_TIER, unsupported: ['做不到'] },
+    ]) {
+      fakeLlm(setLlmFetch, () => json(output, USAGE));
+      const e = await failure(modelDraftForDefinition(analyst, 'tag', TAG_REQUEST));
+      expect(e.status).toBe(422);
+    }
+    expect((await calls(acme)).map(c => c.schemaValid)).toEqual([false, false]);
+    expect((await failures(acme)).map(f => f.detail)).toEqual([
+      expect.objectContaining({ kind: 'tag', stage: 'model' }),
+      expect.objectContaining({ kind: 'tag', stage: 'model' }),
+    ]);
+  });
+
+  it('需求涉及多个指标时生成多指标写法（all），过标签校验，保存后能发布', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(author, 'metric', 'order_count_30d', ORDER_COUNT_30D);
+    await publishDefinition(reviewer, 'metric', 'order_count_30d', 1);
+    await createDefinition(author, 'metric', 'revenue_30d', REVENUE);
+    await publishDefinition(reviewer, 'metric', 'revenue_30d', 1);
+    platformDefault();
+    const multi = {
+      rules: [{ value: 'frequent_free', when: { all: [{ metric: 'order_count_30d', gte: 3 }, { metric: 'revenue_30d', eq: 0 }] } }],
+      default: 'other',
+    };
+    const { received } = fakeLlm(setLlmFetch, () => json(multi, USAGE));
+
+    const { yaml } = await modelDraftForDefinition(analyst, 'tag', '近 30 天下单 3 次以上但消费为 0 的人');
+    expect(parse(yaml)).toEqual(multi);
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'tag_draft', schemaValid: true });
+    // 提示词写出单指标、多指标、做不到三种骨架
+    const system = received[0]!.body.messages[0]!.content;
+    expect(system).toContain('"all"');
+    expect(system).toContain('"unsupported"');
+    expect(system).not.toContain('只用单指标写法');
+
+    await createDefinition(author, 'tag', 'frequent_free', yaml);
+    expect(await publishDefinition(reviewer, 'tag', 'frequent_free', 1)).toMatchObject({ status: 'queued' });
+  });
+
+  it('模型判断做不到时 422 显示它给的原因、不带 Schema 报错；审计阶段 unsupported 只记条数', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    await createDefinition(author, 'metric', 'revenue_30d', REVENUE);
+    await publishDefinition(reviewer, 'metric', 'revenue_30d', 1);
+    platformDefault();
+    const reason = '按小时的峰值需要按小时分桶的指标，目录里没有';
+    fakeLlm(setLlmFetch, () => json({ unsupported: [reason] }, USAGE));
+
+    const e = await failure(modelDraftForDefinition(analyst, 'tag', '按小时的峰值'));
     expect(e.status).toBe(422);
-    expect((await calls(acme))[0]).toMatchObject({ purpose: 'tag_draft', schemaValid: false });
-    expect((await failures(acme))[0]!.detail).toMatchObject({ kind: 'tag', stage: 'model' });
+    expect(e.message).toContain(reason);
+    expect(e.message).not.toContain('must NOT');
+    expect(e.issues).toEqual([]);
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'tag_draft', schemaValid: true });
+    const [audit] = await failures(acme);
+    expect(audit!.detail).toEqual({ kind: 'tag', stage: 'unsupported', reasons: 1 });
+    expect(JSON.stringify(audit!.detail)).not.toContain('峰值');
   });
 
   it('没有可引用的已发布指标时 400、不发请求', async () => {

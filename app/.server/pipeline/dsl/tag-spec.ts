@@ -49,19 +49,6 @@ const rulesOf = (when: object) => ({
   items: { type: 'object', required: ['value', 'when'], additionalProperties: false, properties: { value: tagValue, when } },
 });
 
-/** 单指标写法的 JSON Schema（模型生成标签草稿只出这种写法） */
-export const SINGLE_TAG_SCHEMA = {
-  type: 'object',
-  required: ['metric', 'rules', 'default'],
-  additionalProperties: false,
-  properties: {
-    metric: { type: 'string', minLength: 1 },
-    rules: rulesOf(comparison),
-    default: tagValue,
-    description: DESCRIPTION_SCHEMA,
-  },
-} as const;
-
 /** 标签定义的 JSON Schema：写了 metric 是单指标写法（when 为比较），没写是多指标写法（when 为 all / any） */
 export const TAG_SCHEMA = {
   type: 'object',

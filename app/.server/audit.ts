@@ -25,6 +25,15 @@ const knowledgeTarget = (d: Detail) => `${d.targetId}${d.mappingId ? `（映射 
 const subjectTarget = (d: Detail) => `主题 ${d.subjectId}`;
 const membershipTarget = (verb: string) => (d: Detail) => `${d.targetId} ${verb}主题 ${d.subjectId}`;
 const dslLabel = (d: Detail) => (d.kind === 'tag' ? '标签' : '指标');
+
+/** 模型生成定义草稿失败的阶段说明：模型服务出错、模型判断做不到（#1165，只记原因条数）或转出的定义不过校验 */
+function modelDraftFailure(d: Detail) {
+  switch (d.stage) {
+    case 'model': return `模型服务：${d.error}`;
+    case 'unsupported': return `模型判断做不到（${d.reasons} 条原因）`;
+    default: return `定义校验有 ${d.issues} 处问题`;
+  }
+}
 /** 映射生成稿的来源（mapping_generations.origin）在审计里的说法 */
 const GENERATION_ORIGIN: Record<'model' | 'rules' | 'reuse' | 'assertions', string> = {
   model: '模型生成的', rules: '规则生成的', reuse: '复用已发布映射得到的', assertions: '模型建议了断言的',
@@ -185,10 +194,10 @@ const ACTIONS = {
   },
   'template.drafted': { label: '起草模板参数', describe: (d: Detail) => `${templateLabel(d.template)}，第 ${d.version} 版草稿` },
   'definition.drafted': { label: '起草指标或标签', describe: (d: Detail) => `${dslLabel(d)} ${d.key}，第 ${d.version} 版草稿` },
-  // 模型输出不合 Schema、请求失败或转出的定义不过校验（ADR-0035）：只记种类、阶段、错误摘要与问题位置，不记需求原文、模型原文与取值
+  // 模型输出不合 Schema、请求失败、模型判断做不到或转出的定义不过校验（ADR-0035）：只记种类、阶段、错误摘要、原因条数与问题位置，不记需求原文、模型原文与取值
   'definition.model_draft_failed': {
     label: '模型生成定义草稿失败',
-    describe: (d: Detail) => `${dslLabel(d)}，${d.stage === 'model' ? `模型服务：${d.error}` : `定义校验有 ${d.issues} 处问题`}`,
+    describe: (d: Detail) => `${dslLabel(d)}，${modelDraftFailure(d)}`,
   },
   // 一句话解析失败（#516）：口径同 definition.model_draft_failed，只记阶段、错误摘要与问题位置，不记原句、解析说明与取值
   'definition.metric_parse_failed': {
