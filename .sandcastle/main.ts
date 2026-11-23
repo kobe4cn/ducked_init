@@ -963,12 +963,22 @@ const MIGRATION_CHAIN_OK = migrationChainOk("HEAD");
  * 为 false 时只更新 PR（留给人审的 PR 不和 main 冲突）。
  * 任何一步不成都返回原因，由调用方留 PR。
  */
-async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{ ok: true } | { ok: false; reason: string }> {
+type HostGap = { release: () => void; reacquire: () => Promise<void> };
+
+/**
+ * 调用方持有宿主机锁（withHost）。开沙箱、rebase、跑门槛这段放开锁（和 build 一样只动本票的分支与 worktree；
+ * 这张票还在 running 里，它改的文件不会被新票占用；票没关，清理不会删它的 worktree），push 与合并前再拿回锁。
+ * 放开期间别的票可能先合进 main：这里的合并会失败，按原有路径留 PR。
+ */
+async function rebaseAndMerge(issue: Issue, pr: string, host: HostGap, merge = true): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (isExternal(issue)) return { ok: false, reason: `外部 PR 的分支 ${issue.branch} 不由 Sandcastle rebase 或合并。` };
-  await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]);
   const env = testEnv(issue.id);
-  const sandbox = await sandcastle.createSandbox({ branch: issue.branch, baseBranch: BASE_REF, sandbox: sandboxFor(env), hooks, copyToWorktree });
+  host.release();
+  let opened: Awaited<ReturnType<typeof sandcastle.createSandbox>> | undefined;
   try {
+    await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]);
+    const sandbox = await sandcastle.createSandbox({ branch: issue.branch, baseBranch: BASE_REF, sandbox: sandboxFor(env), hooks, copyToWorktree });
+    opened = sandbox;
     const behind = await sandbox.exec(`git merge-base --is-ancestor ${BASE_REF} HEAD`);
     if (behind.exitCode === 0) {
       return { ok: false, reason: `分支已经包含最新的 ${BASE_REF}，失败不是冲突造成的，需要人看。` };
@@ -1019,6 +1029,7 @@ async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{
       return { ok: false, reason: `rebase 后门槛失败：\n\n\`\`\`\n${gate.stdout.slice(-2000)}\n\`\`\`` };
     }
 
+    await host.reacquire();
     await gitRemoteOrThrow(["push", "--force-with-lease", REMOTE, issue.branch]);
     if (!merge) {
       sh("gh", ["pr", "comment", pr, "--body", `Sandcastle 把分支 rebase 到最新的 ${BASE_REF}（原来和它冲突），门槛重跑通过。`]);
@@ -1037,8 +1048,11 @@ async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{
     }
     return { ok: false, reason: `rebase 并通过门槛后仍合并失败：${last.slice(0, 300)}` };
   } finally {
-    await sandbox.close();
-    await dropTestResources(issue.id);
+    if (opened) {
+      await opened.close();
+      await dropTestResources(issue.id);
+    }
+    await host.reacquire();
   }
 }
 
@@ -1103,19 +1117,19 @@ function issueClosed(id: string) {
  * 要留给人审的分支如果和最新的 origin/main 有文本冲突（或 drizzle 迁移链分叉），走 rebaseAndMerge 但不合并。
  * 返回附在 leaveForHuman 说明后面的一句话；不需要 rebase 时为空串。
  */
-async function rebaseIfConflicting(issue: Issue, pr: string): Promise<string> {
+async function rebaseIfConflicting(issue: Issue, pr: string, host: HostGap): Promise<string> {
   await gitRemoteOrThrow(["fetch", REMOTE, BASE_BRANCH]);
   const clean = trySh("git", ["merge-tree", "--write-tree", "--name-only", BASE_REF, issue.branch]).ok;
   const chainOk = trySh("sh", ["-c", migrationChainOk(issue.branch)]).ok;
   if (clean && chainOk) return "";
   console.log(`  ↻ #${issue.id} 和最新的 ${BASE_REF} 冲突，rebase 后再留给人审`);
-  const r = await untilAfterLimit(`rebase #${issue.id}`, () => rebaseAndMerge(issue, pr, false));
+  const r = await untilAfterLimit(`rebase #${issue.id}`, () => rebaseAndMerge(issue, pr, host, false));
   return r.ok
     ? `\n\n分支和最新的 ${BASE_REF} 冲突，已 rebase 并重跑门槛通过。`
     : `\n\n⚠️ 分支和最新的 ${BASE_REF} 冲突，自动 rebase 没成：${r.reason}`;
 }
 
-async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnType<typeof build>>>) {
+async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnType<typeof build>>>, host: HostGap) {
   // 运行期间人已经合并了这张票的 PR 或关了票：不再 push、开 PR、打标签，本地分支留着备查。
   if (issueClosed(issue.id)) {
     console.log(`  ⏭ #${issue.id} 已被关闭（运行期间有人合并了 PR 或关了票），跳过落地`);
@@ -1224,7 +1238,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     : "";
   if (result.verdict !== "merge") {
     // 开工后 main 上合进了改同一处的票：先 rebase 好再交给人，免得人审的是一个合不进去的 PR。
-    const rebaseNote = result.gate.ok ? await rebaseIfConflicting(issue, pr) : "";
+    const rebaseNote = result.gate.ok ? await rebaseIfConflicting(issue, pr, host) : "";
     leaveForHuman(
       issue,
       pr,
@@ -1257,7 +1271,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
     : { ok: false as const, out: `本票的 drizzle 迁移没有接在 ${BASE_REF} 最新的迁移后面。` };
   if (!merged.ok) {
     console.log(`  ↻ #${issue.id} 没能直接合并，rebase 到最新的 ${BASE_REF} 后重试`);
-    const retry = await untilAfterLimit(`rebase #${issue.id}`, () => rebaseAndMerge(issue, pr));
+    const retry = await untilAfterLimit(`rebase #${issue.id}`, () => rebaseAndMerge(issue, pr, host));
     if (!retry.ok) {
       leaveForHuman(issue, pr, `合并失败：${merged.out.slice(0, 300)}\n\nrebase 后重试也没成：${retry.reason}`);
       console.log(`  ◐ #${issue.id} 合并失败，留 PR #${pr}`);
@@ -1277,11 +1291,35 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
  * 宿主机上的 git 与 GitHub 标签操作串行做：调度（整理、prep、plan）和落地不交错，
  * 免得落地合并的同时清理删掉它的 worktree，或 prep 挂着的工作区被快进。build 在沙箱里跑，不占锁。
  */
-let hostQueue: Promise<unknown> = Promise.resolve();
-function withHost<T>(fn: () => Promise<T>): Promise<T> {
-  const run = hostQueue.then(fn);
-  hostQueue = run.catch(() => {});
-  return run;
+let hostTail: Promise<void> = Promise.resolve();
+/** 排队拿锁（先来先得），返回释放函数。 */
+function acquireHost(): Promise<() => void> {
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  const ready = hostTail;
+  hostTail = ready.then(() => held);
+  return ready.then(() => release);
+}
+/**
+ * 持锁跑 fn。fn 拿到的 HostGap 能中途放开锁、之后再排队拿回：落地里的 rebase 补救要在沙箱里跑门槛（完整测试
+ * 半小时以上，还可能排队），期间放开锁让调度照常开新票（2026-11-24 #1165 的 rebase 让空位白等了约 40 分钟）。
+ */
+async function withHost<T>(fn: (gap: HostGap) => Promise<T>): Promise<T> {
+  let release: (() => void) | null = await acquireHost();
+  const gap: HostGap = {
+    release: () => {
+      release?.();
+      release = null;
+    },
+    reacquire: async () => {
+      if (!release) release = await acquireHost();
+    },
+  };
+  try {
+    return await fn(gap);
+  } finally {
+    gap.release();
+  }
 }
 
 /** 有票做完、让出空位时叫醒主循环；主循环没在等时记下来，下次等的时候立刻返回。 */
@@ -1308,7 +1346,7 @@ async function waitForSlotOrPoll(ms: number) {
   slotFreed = false;
 }
 
-/** 正在 build 或落地的票。一张票从开工到落地完一直占着空位：落地里的 rebase 补救也要跑门槛。 */
+/** 正在 build 或落地的票。一张票从开工到落地完一直占着空位：落地里的 rebase 补救也要跑门槛（跑门槛时放开宿主机锁，调度照常开另一个空位）。 */
 const running = new Map<string, Issue>();
 
 /** 一张票独立跑完 build → 落地，做完就让出空位，不等同批的其他票。 */
@@ -1321,9 +1359,9 @@ function start(issue: Issue) {
     ]);
     // 落地在宿主机上做：用宿主机的 git / gh 凭据，沙箱没有写仓库的权限。
     // 每张票单独兜底：一张票落地出错（网络、人在运行中途合并或删了分支等）不让整个运行崩掉。
-    await withHost(async () => {
+    await withHost(async (host) => {
       try {
-        await retryTransient(`落地 #${issue.id}`, () => land(issue, outcome!));
+        await retryTransient(`落地 #${issue.id}`, () => land(issue, outcome!, host));
       } catch (e) {
         const reason = String((e as { stderr?: unknown }).stderr || e).trim().slice(0, 500);
         console.error(`  ✗ #${issue.id} 落地出错：${reason}`);
