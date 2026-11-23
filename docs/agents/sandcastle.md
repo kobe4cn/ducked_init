@@ -42,7 +42,7 @@ reviewer 的结论有三种：`merge`、`revise`、`pr`（规则在 `.sandcastle
 
 全部满足才合并（`gh pr merge --rebase`），否则留 PR 并在 PR 上评论原因：
 
-1. reviewer 给出 `<verdict>merge</verdict>`：验收标准都实现且有测试、没有要人判断的问题、没改页面（改了页面留 PR 附截图，见「浏览器验收」）、没动 ADR / 权限 / 敏感字段处理、没改弱已有测试（规则在 `.sandcastle/review-prompt.md`）。
+1. reviewer 给出 `<verdict>merge</verdict>`：验收标准都实现且有测试、没有要人判断的问题、改了页面的浏览器验收每步都通过（见「浏览器验收」）、没动权限 / 敏感字段处理、没有改已有数据或删改列的迁移、票里没要求人亲自验收、没改弱已有测试（新增 / 修改 ADR 和代拍板本身不再拦合并，2026-11-24）（规则在 `.sandcastle/review-prompt.md`）。
 2. 门槛通过：脚本在沙箱里自己跑 `npm run typecheck` 与完整测试。
    - 完整测试同一时间只跑一个（`runGate` 排队）：两个沙箱同时跑时 CPU 和 PG 被挤满，各要 75–90 分钟还容易超时（2026-11-23）。排上队的用 8 个 worker（`FULL_GATE_WORKERS`），宿主机 PG 要 `max_connections` ≥ 600（`db_script/pg_setup.sh`）；精简门槛不排队，仍用 4 个 worker。门槛用时（和排队时间）打进日志，并在 PR 的 **Gate** 一节末尾写一行 `GATE_TIME`。
    - 分级门槛：分支相对 `origin/main` 只改了页面（`app/routes/`）、组件（`app/components/`）、翻译表（`app/i18n/en.*.json`）、测试文件、`test/i18n-ratchet-baseline.json` 和文档时，只跑 `test/http`、`test/` 根目录的单元测试和改到的测试文件，不跑占全量约 3/4 时间的 `test/pipeline`（这些文件只被页面渲染用到，服务端和 pipeline 测试不引用）。改到其他任何文件（`app/.server/`、`app/lib/`、迁移、依赖、配置、测试夹具等）仍跑完整测试。判断规则在 `.sandcastle/main.ts` 的 `LIGHT_PATHS`。
@@ -138,7 +138,7 @@ Sandcastle 处理期间，PR 作者不要往这个分支推提交。本地和远
 
 截图和 `RESULT.md`（每一步的结论）写在 worktree 的 `.browser-check/`，不提交。关沙箱前脚本把它拷到宿主机 `$TMPDIR/sandcastle-browser-check/issue-<n>/`，开 PR 时把 `RESULT.md` 写进正文的 **Browser check** 一节，截图用 `gh --attach` 附上。
 
-改了页面的票**一律留 PR**（reviewer 给 `pr`）。你看截图和结论，没问题就合并。等确认这套验收靠得住，再考虑放宽成验收通过就自动合并。
+改了页面的票：`RESULT.md` 每一步都是 ✅ 时可以自动合并（2026-11-24 放宽）；有 ❌、⚠️ 或没验证到的步骤才留 PR，由你看截图和结论后合并。
 
 ## 验收说明
 

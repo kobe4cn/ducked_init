@@ -46,7 +46,7 @@
 7. 写 `.browser-check/RESULT.md`（中文，会原样进 PR 正文）：Browser check 每一步 ✅/❌/⚠️ 一行，引用对应截图文件名；页面或服务端报错；没能验证的及原因。
 8. 收尾：`playwright-cli close`，停掉 dev server（`kill %1` 或按端口找进程）。`.browser-check/` 不提交（已在 `.gitignore`），编排脚本会把它拷出来附到 PR 上。
 
-浏览器验收通过与否都不影响你输出 COMPLETE；改了页面的票一律留 PR 由人看截图后合并。
+浏览器验收通过与否都不影响你输出 COMPLETE；改了页面的票只有 `RESULT.md` 每一步都是 ✅ 时才可能自动合并，否则留 PR 由人看截图。
 
 # 验收说明
 

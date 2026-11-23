@@ -324,7 +324,9 @@ const GIT_REMOTE_TIMEOUT_MS = 5 * 60_000;
 const TIMEOUT_TEXT = "命令超时";
 const sh = (cmd: string, args: string[], timeout = SH_TIMEOUT_MS) => {
   try {
-    return execFileSync(cmd, args, { encoding: "utf8", timeout, killSignal: "SIGKILL" }).trim();
+    // stderr 不透传到终端：trySh 探测时的预期失败（如 `gh pr view` 的 no pull requests found）每轮会刷屏；
+    // 失败时 stderr 仍在抛出的错误里（e.stderr / message），调用方照常拿得到。
+    return execFileSync(cmd, args, { encoding: "utf8", timeout, killSignal: "SIGKILL", stdio: ["ignore", "pipe", "pipe"] }).trim();
   } catch (e) {
     if ((e as { code?: unknown }).code === "ETIMEDOUT") throw new Error(`${TIMEOUT_TEXT}（${timeout / 1000} 秒）：${cmd} ${args.join(" ").slice(0, 200)}`);
     throw e;

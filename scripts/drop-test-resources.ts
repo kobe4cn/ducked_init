@@ -91,6 +91,8 @@ async function collectBucketTenants(db: string) {
       `SELECT DISTINCT from_path FROM platform.lake_migrations WHERE from_path LIKE 's3://lake-%'`);
     for (const r of migrated) if (isTenantBucketRoot(r.from_path)) bucketTenants.push({ tenantId: null, dataPath: r.from_path });
   } catch (e) {
+    // 表不存在（42P01，如 crm_source_test / crm_vector_test 没有 platform schema）是常态，不打日志
+    if ((e as { code?: unknown }).code === "42P01") return;
     console.log(`PG：${db} 里没有可回收的桶租户（${e instanceof Error ? e.message : e}）`);
   } finally {
     await client.end().catch(() => {});
