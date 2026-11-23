@@ -44,27 +44,39 @@ reviewer 的结论有三种：`merge`、`revise`、`pr`（规则在 `.sandcastle
 
 1. reviewer 给出 `<verdict>merge</verdict>`：验收标准都实现且有测试、没有要人判断的问题、改了页面的浏览器验收每步都通过（见「浏览器验收」）、没动权限 / 敏感字段处理、没有改已有数据或删改列的迁移、票里没要求人亲自验收、没改弱已有测试（新增 / 修改 ADR 和代拍板本身不再拦合并，2026-11-24）（规则在 `.sandcastle/review-prompt.md`）。
 2. 门槛通过：脚本在沙箱里自己跑 `npm run typecheck` 与完整测试。
-   - 完整测试同一时间只跑一个（`runGate` 排队）：两个沙箱同时跑时 CPU 和 PG 被挤满，各要 75–90 分钟还容易超时（2026-11-23）。排上队的用 8 个 worker（`FULL_GATE_WORKERS`），宿主机 PG 要 `max_connections` ≥ 600（`db_script/pg_setup.sh`）；精简门槛不排队，仍用 4 个 worker。门槛用时（和排队时间）打进日志，并在 PR 的 **Gate** 一节末尾写一行 `GATE_TIME`。
-   - 分级门槛：分支相对 `origin/main` 只改了页面（`app/routes/`）、组件（`app/components/`）、翻译表（`app/i18n/en.*.json`）、测试文件、`test/i18n-ratchet-baseline.json` 和文档时，只跑 `test/http`、`test/` 根目录的单元测试和改到的测试文件，不跑占全量约 3/4 时间的 `test/pipeline`（这些文件只被页面渲染用到，服务端和 pipeline 测试不引用）。改到其他任何文件（`app/.server/`、`app/lib/`、迁移、依赖、配置、测试夹具等）仍跑完整测试。判断规则在 `.sandcastle/main.ts` 的 `LIGHT_PATHS`。
-   - 落地前的 rebase 只在追加型文件（`APPEND_ONLY`：翻译表、索引、棘轮基线）上冲突、迁移链也没分叉时，rebase 后一律跑精简门槛（`GATE_LIGHT=1`），哪怕分支改了服务端代码：分支在开工时的 main 上已过一次门槛，rebase 没动代码逻辑。
-   - 兜底：每 4 张（`GATE_FULL_EVERY`）走精简门槛的票之后，下一张强制跑完整测试（`GATE_FULL=1`），漏网的问题在这里暴露。计数在进程内，重启后从 0 算。门槛输出第一行 `GATE_TIER: light|full`，PR 的 **Gate** 一节写明跑的是精简门槛还是完整测试。rebase 补救后重跑的门槛按同样规则分级，不计数。
+   - 门槛同一时间只跑一个，不分档位（`runGate` 排队）：两个沙箱同时跑时 CPU 和 PG 被挤满，2026-11-24 实测完整门槛同时跑要 76.6 分钟（失败）、精简门槛 37.7 分钟，比先后跑（约 33 + 21 分钟）还慢。排上队的门槛用 8 个 worker（`GATE_WORKERS`），宿主机 PG 要 `max_connections` ≥ 600（`db_script/pg_setup.sh`）；agent 自己在沙箱里跑单个测试文件不排队，仍是 4 个 worker。门槛用时（和排队时间）打进日志，并在 PR 的 **Gate** 一节末尾写一行 `GATE_TIME`。
+   - 按依赖选测试，规则见下面「合并门槛怎么选测试」。门槛输出里有一行 `GATE_TIER: selected|full`，PR 的 **Gate** 一节写明跑的是哪一档。
    - 完整测试失败、且失败的文件不超过 3 个时，先把这几个文件单独重跑一次：重跑通过算通过，PR 的 **Gate** 一节标出「偶发失败」和第一次的失败摘要。脚本还会给每个偶发失败的文件开一张票，标题是 `偶发失败：<文件>`，带 `flaky`、`Sandcastle`、`ready-for-agent` 标签，正文附失败摘要、复现方法和验收标准；下次调度会自动 prep 并修：prep 先查同样的报错是否已被别的提交修掉，修掉了就只核实、不改代码；没修掉要给出修复前变红、修复后变绿的复现（跨沙箱竞争写并发用例），重复单跑总共不超过 20 分钟。已经有同名的 open 票时，就在那张票上追加一次出现记录。票号会评论到 PR 上。重跑仍失败、或失败文件更多，才算门槛失败。
    - 门槛失败时让 implementer 用新会话修一次，再跑一次门槛。
    - 失败摘要只取 vitest 的 Failed Tests / Failed Suites 一节。
 3. GitHub 能 rebase 合并，且本票的 drizzle 迁移接在 `origin/main` 最新的迁移后面（两张票各加一个迁移时没有文本冲突，但迁移链会分叉，所以合并前脚本先查）。
 
-   不满足时脚本自动补救一次：在原分支上开沙箱 `git rebase origin/main`；有冲突或迁移链分叉就开一次 agent 会话按 `.sandcastle/rebase-prompt.md` 处理（追加型文件两边都留，迁移删掉重新 `db:generate`，要做判断的放弃并在 issue 上评论）；然后**重跑门槛**（按上面的分级规则），通过才 force-push 再合并。补救不成就留 PR 并写原因。代价是这张票多跑一遍完整测试。
+   不满足时脚本自动补救一次：在原分支上开沙箱 `git rebase origin/main`；有冲突或迁移链分叉就开一次 agent 会话按 `.sandcastle/rebase-prompt.md` 处理（追加型文件两边都留，迁移删掉重新 `db:generate`，要做判断的放弃并在 issue 上评论）；然后**重跑门槛**（和开工时同一套选测试规则，按分支相对新 main 的改动选，冲突文件已在其中），通过才 force-push 再合并。补救不成就留 PR 并写原因。
 
-   reviewer 不给 `merge`、但门槛通过、要留 PR 给人审的票，也先查一次：和最新的 `origin/main` 有文本冲突或迁移链分叉（开工后 main 上合进了改同一处的票）时，同样 rebase、处理冲突，但只跑 typecheck、不重跑测试（省一遍完整门槛，也不占完整门槛的队列；2026-11-24），force-push 后不合并，PR 上评论冲突文件并写明 Gate 里的测试结果是 rebase 之前的，由人合并前判断是否补跑。这样人审到的 PR 能直接合并。补救不成就在「没有自动合并」的评论里写上原因。
+   reviewer 不给 `merge`、但门槛通过、要留 PR 给人审的票，也先查一次：和最新的 `origin/main` 有文本冲突或迁移链分叉（开工后 main 上合进了改同一处的票）时，同样 rebase、处理冲突，但只跑 typecheck、不重跑测试（省一遍门槛，也不占门槛的队列；2026-11-24），force-push 后不合并，PR 上评论冲突文件并写明 Gate 里的测试结果是 rebase 之前的，由人合并前判断是否补跑。这样人审到的 PR 能直接合并。补救不成就在「没有自动合并」的评论里写上原因。
 
 4. 验收说明齐全：implementer 写了 `.pr-notes/验收说明.md` 且格式对（三个小标题、「怎么验证」有编号步骤，检查在 `.sandcastle/pr-body.ts` 的 `checkAcceptanceNotes`）。缺失或格式不对时正文写警告、留 PR（见「验收说明」）。
 
 GitHub CI 不作为门槛。
 
+### 合并门槛怎么选测试（2026-11-24）
+
+代码在 `.sandcastle/main.ts` 的 `GATE_SELECT`。改动范围是分支相对它和 `origin/main` 分叉点的 diff。
+
+- **每次都跑**：`test/http` 全部、`test/` 根目录的单元测试。`test/http/harness.ts` 另起 vite、用 `ssrLoadModule` 加载整个应用，vitest 的依赖图看不到它和 `app/` 的关系（改 `workbench-ai.ts` 选不到 `test/http/workbench.test.ts`），所以不靠依赖图选。
+- **`test/pipeline` 按依赖图选**：`vitest related <改到的文件>` 选中的文件，加上分支改到的 pipeline 测试文件本身。
+- **退回完整测试**（`GATE_TIER: full`，输出里写原因）：
+  - 改到 `FULL_PATHS`：依赖图看不到的测试基础设施，`vitest.config.ts`、`vite.config.ts`、`test/global-setup.ts`、`test/setup-env.ts`、`test/http/harness.ts`、`drizzle/`、`package.json`、`pnpm-lock.yaml`、`.sandcastle/Containerfile`。发现新的盲区就加进这份名单。
+  - 选中的 pipeline 文件超过总数一半：改 `llm.ts`、`schema.ts`、`audit.ts`、`model-draft.ts` 这类核心模块时依赖图几乎全选（80 多个），挑着跑省不了多少。
+  - `vitest related` 失败或超时（300 秒）；`GATE_FULL=1`。
+- **兜底**：按依赖选测试的票每合并 4 张（`MAIN_CHECK_EVERY`），脚本在后台对当时的 `origin/main` 跑一次完整测试（`runMainFullCheck`，和票的门槛排同一个队，测试资源后缀 `_imain`）。兜住依赖图漏选，和两张票各自通过、合在一起才坏的情况。计数和上次通过的提交存在 `.sandcastle/logs/main-check.json`，重启后接着算。失败时开一张 `sandcastle:main-broken` + `Sandcastle` + `ready-for-agent` 的修复票，正文列出失败摘要和上次通过以来进 main 的提交；调度和 prep 时这类票排最前。自动合并照常，不暂停。已有 open 的修复票时只在上面追加评论。
+
+上线前用历史门槛失败验证过（12 个 `test/pipeline` 失败样例，在各 PR 当时的提交上重跑选测试）：9 个退回完整测试，1 个按依赖选且选中了失败的文件，2 个没选中的都是环境原因的失败（2026-11-07 三个门槛同时跑超时、数据湖认证失败），和改动无关。同一套规则下，最近 9 个 PR 里 6 个走按依赖选（pipeline 只跑 0–7 个文件），#1203、#1205、#1200 原来都要跑完整测试。
+
 ## 其他规则
 
 - 只跑指定的票：`SANDCASTLE_ONLY=328,329 npm run run:sandcastle`（prep 与 plan 都只看名单里的票；拆出来的子票不在名单里，要另外加）。
-- plan 由脚本自己算，不用 agent：在已准备的票里排除 `## Blocked by` 里还有 open 票的（括号里的票号是说明，不算），剩下的按编号从小到大选，和已选的票改同一个文件（指引里 `- **Change**: \`path\`` 行的路径，以及 `**Change**` 下缩进子条目开头的路径；一条 Change 都没有时兜底取指引里 New / Reuse / ADRs / Tests 之外的 `path:行号` 引用，并在日志里警告；解析在 `.sandcastle/guide.ts`）就跳过，所以冲突时总是编号小的先做，最多 `MAX_PARALLEL`（2）张。只追加的索引文件（`APPEND_ONLY`：`test/CATALOG.md`、`test/README.md`、`CONTEXT.md`、`docs/adr/README.md`，以及翻译表 `app/i18n/en.client.json`、`app/i18n/en.server.json`（按键排序，`npm run i18n:sort`，新词条插在各自位置，并行的票很少文本冲突）和中文棘轮基线 `test/i18n-ratchet-baseline.json`，冲突时 rebase 重算）不算改同一个文件，两张票都改它们也照常并行——冲突交给 rebase（`rebase-prompt.md` 已写明两边都在追加的文件两边都保留）。被 blocker 挡住的票不占文件。等人审（`sandcastle:pr-open`）的票也占着它的文件：PR 合入或关闭之前，改同一个文件的票不会开工，免得两个 PR 在同一个文件上冲突；代价是 PR 一直不审，这些票就一直排不上。跳过原因会打在日志里。
+- plan 由脚本自己算，不用 agent：在已准备的票里排除 `## Blocked by` 里还有 open 票的（括号里的票号是说明，不算），剩下的按编号从小到大选（`sandcastle:main-broken` 修复票排最前），和已选的票改同一个文件（指引里 `- **Change**: \`path\`` 行的路径，以及 `**Change**` 下缩进子条目开头的路径；一条 Change 都没有时兜底取指引里 New / Reuse / ADRs / Tests 之外的 `path:行号` 引用，并在日志里警告；解析在 `.sandcastle/guide.ts`）就跳过，所以冲突时总是编号小的先做，最多 `MAX_PARALLEL`（2）张。只追加的索引文件（`APPEND_ONLY`：`test/CATALOG.md`、`test/README.md`、`CONTEXT.md`、`docs/adr/README.md`，以及翻译表 `app/i18n/en.client.json`、`app/i18n/en.server.json`（按键排序，`npm run i18n:sort`，新词条插在各自位置，并行的票很少文本冲突）和中文棘轮基线 `test/i18n-ratchet-baseline.json`，冲突时 rebase 重算）不算改同一个文件，两张票都改它们也照常并行——冲突交给 rebase（`rebase-prompt.md` 已写明两边都在追加的文件两边都保留）。被 blocker 挡住的票不占文件。等人审（`sandcastle:pr-open`）的票也占着它的文件：PR 合入或关闭之前，改同一个文件的票不会开工，免得两个 PR 在同一个文件上冲突；代价是 PR 一直不审，这些票就一直排不上。跳过原因会打在日志里。
 - prep 和 plan 都按票号从小到大处理：prep 一张接一张串行跑完，plan 才开始选票。
 - 有 open blocker 的票不会被 prep（脚本直接跳过，不开 prep 会话，日志打「跳过 prep #n」），也不会被 plan 选中。blocker 留成 PR 时，依赖它的票在你合并之后的下一次轮询开工（运行已结束时要重新运行）。
 - 每次调度开头重新查询 issue，拆出来的子票在下次调度被看到。plan 选不出票、但这次拆出了还没 prep 的子票时，马上再调度一次，不算空转。

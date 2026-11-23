@@ -36,7 +36,7 @@
 //        SANDCASTLE_ONLY=328,329 npm run run:sandcastle   只处理这几张票（试跑、单独补跑）
 
 import { execFile, execFileSync } from "node:child_process";
-import { cpSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { parseEnv, promisify } from "node:util";
@@ -46,7 +46,7 @@ import {
   AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, usageTable,
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
-import { APPEND_ONLY, blockersOf, changedFiles, flakyTickets, splitChildren } from "./guide.ts";
+import { blockersOf, changedFiles, flakyTickets, splitChildren } from "./guide.ts";
 import { acceptanceSection, checkAcceptanceNotes, replaceSection, restSections } from "./pr-body.ts";
 
 // ---------------------------------------------------------------------------
@@ -84,7 +84,14 @@ const LABEL = {
   stuck: "sandcastle:stuck", // 需要人介入（见 issue 评论）
   decided: "sandcastle:decided", // agent 代拍板过设计决定，等人事后确认（人看过后去掉）
   flaky: "flaky", // 门槛里重跑才通过的测试文件，脚本自动开票
+  mainBroken: "sandcastle:main-broken", // main 上的兜底完整测试失败，脚本自动开票；调度和 prep 时排最前（runMainFullCheck）
 } as const;
+
+/** 调度顺序：main 坏了的修复票排最前，其余按编号从小到大（早建的票通常是后面票的 blocker）。 */
+const byUrgency = (a: { number: number; labels: { name: string }[] }, b: { number: number; labels: { name: string }[] }) => {
+  const urgent = (i: typeof a) => (i.labels.some((l) => l.name === LABEL.mainBroken) ? 0 : 1);
+  return urgent(a) - urgent(b) || a.number - b.number;
+};
 
 // 同一会话超过预算前自动压缩；预算本身靠 prep 把票切小来保证。
 const claudeEnv = { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(CONTEXT_BUDGET) };
@@ -218,38 +225,56 @@ const envPrefix = (env: Record<string, string>) =>
 // 失败的文件不超过 GATE_RERUN_MAX 个时单独重跑一次，重跑通过算通过，但输出 GATE_FLAKY 让 PR 上标出来。
 // 失败摘要只取 vitest 的 Failed Tests / Failed Suites 一节（去掉颜色、每行截断），不 grep 日志里的 Error。
 //
-// 分级门槛（2026-11-22）：分支相对 origin/main 只改了页面、组件、翻译表、测试文件和文档时（LIGHT_PATHS），
-// 只跑 test/http 和 test/ 根目录的单元测试（加上改到的测试文件），不跑占全量约 3/4 时间的 test/pipeline：
-// 这些文件只被页面渲染用到，pipeline 测试和服务端都不引用它们。改到其他任何文件仍跑完整测试。
-// 环境变量 GATE_FULL=1 强制完整测试：每 GATE_FULL_EVERY 张走精简门槛的票后跑一次，兜住漏网的问题。
-// 环境变量 GATE_LIGHT=1 强制精简门槛：落地前的 rebase 只在追加型文件（翻译表、索引、棘轮基线）上冲突时用，
-// 分支代码在开工时的 main 上已过一次门槛，rebase 没动代码逻辑，不必再跑一小时完整测试（2026-11-23）。
-// 输出第一行是 GATE_TIER: full|light，脚本据此计数、写进 PR。
+// 按依赖选测试（2026-11-24，规则见 docs/agents/sandcastle.md「合并门槛怎么选测试」）：
+// - 每次都跑 test/http 全部与 test/ 根目录的单元测试。test/http 的 harness 另起 vite、用 ssrLoadModule 加载整个应用，
+//   vitest 的依赖图看不到它和 app/ 的关系（改 workbench-ai.ts 选不到 test/http/workbench.test.ts），所以不能靠依赖图选。
+// - test/pipeline 只跑 `vitest related <分支改到的文件>` 选中的，加上分支改到的 pipeline 测试文件本身。
+// - 退回完整测试：改到 FULL_PATHS（依赖图看不到的测试基础设施：配置、全局 setup、HTTP harness、迁移、依赖、镜像）；
+//   选中的 pipeline 文件超过总数一半（改核心模块时几乎全选，挑着跑省不了多少）；vitest related 失败或超时；GATE_FULL=1。
+// - rebase 后重跑也走同一套规则（分支相对新 main 的改动已含冲突文件）；两张票合在一起才出的问题由
+//   main 上定期的兜底完整测试发现（见 runMainFullCheck）。
+// 输出里有一行 GATE_TIER: full|selected，脚本据此计数、写进 PR。
 const GATE_RERUN_MAX = 3;
-const GATE_FULL_EVERY = 4;
-const LIGHT_PATHS = String.raw`^(app/routes/|app/components/|app/i18n/en\.(client|server)\.json$|test/.*\.test\.tsx?$|test/i18n-ratchet-baseline\.json$|test/CATALOG\.md$|docs/|[^/]*\.md$)`;
-let lightGatesSinceFull = 0;
-const gateTier = (stdout: string): "light" | "full" => (stdout.includes("GATE_TIER: light") ? "light" : "full");
-// 门槛走精简还是完整：GATE_SCRIPT 和开跑前的 GATE_TIER_PROBE 共用这段判断（完整测试要排队，见 runGate）。
-const GATE_TIER_DECIDE = String.raw`
+const FULL_PATHS = String.raw`^(vitest\.config\.ts|vite\.config\.ts|test/global-setup\.ts|test/setup-env\.ts|test/http/harness\.ts|drizzle/|package\.json$|pnpm-lock\.yaml$|\.sandcastle/Containerfile$)`;
+type GateTier = "selected" | "full";
+const gateTier = (stdout: string): GateTier => (stdout.includes("GATE_TIER: selected") ? "selected" : "full");
+const gateTierName = (tier: GateTier) => (tier === "selected" ? "按依赖选" : "完整");
+const GATE_SELECT = String.raw`
 changed=$(git diff --name-only "$(git merge-base HEAD ${BASE_REF})" HEAD)
-others=$(printf '%s\n' "$changed" | grep . | grep -vE '${LIGHT_PATHS}')
-is_light() { [ "$GATE_FULL" != "1" ] && { [ "$GATE_LIGHT" = "1" ] || { [ -n "$changed" ] && [ -z "$others" ]; }; }; }
+existing=$(printf '%s\n' "$changed" | while read -r f; do [ -n "$f" ] && [ -f "$f" ] && printf '%s ' "$f"; done)
+infra=$(printf '%s\n' "$changed" | grep -E '${FULL_PATHS}' | head -5)
+total=$(ls test/pipeline/*.test.ts | wc -l | tr -d ' '); limit=$((total / 2))
+tier=full; reason=""
+if [ "$GATE_FULL" = "1" ]; then reason="GATE_FULL=1"
+elif [ -n "$infra" ]; then reason="改到依赖图看不到的测试基础设施：$(echo $infra)"
+else
+  picked=""
+  if [ -n "$existing" ]; then
+    if timeout 300 npx vitest related $existing --run --passWithNoTests --reporter=verbose --testNamePattern=__gate_select_none__ > /tmp/gate-related.log 2>&1; then
+      picked=$(plain /tmp/gate-related.log | grep -oE 'test/pipeline/[^ ]+\.test\.ts' | sort -u)
+    else reason="vitest related 失败或超时（见 /tmp/gate-related.log）"
+    fi
+  fi
+  if [ -z "$reason" ]; then
+    picked=$(printf '%s\n%s\n' "$picked" "$(printf '%s\n' "$changed" | grep -E '^test/pipeline/.+\.test\.ts$' | while read -r f; do [ -f "$f" ] && echo "$f"; done)" | grep . | sort -u)
+    n=$(printf '%s\n' "$picked" | grep -c .)
+    if [ "$n" -gt "$limit" ]; then reason="依赖图选中 $n 个 pipeline 测试文件，超过总数 $total 的一半"
+    else tier=selected
+    fi
+  fi
+fi
 `;
-const GATE_TIER_PROBE = `${GATE_TIER_DECIDE}\nif is_light; then echo light; else echo full; fi`;
 const GATE_SCRIPT = String.raw`
 plain() { sed 's/\[[0-9;]*m//g' "$1"; }
 failures() { plain "$1" | sed -n '/Failed \(Tests\|Suites\)/,/Test Files/p' | grep -v 'Test Files' | cut -c1-300 | head -80; }
 totals() { plain "$1" | grep -E "Test Files|Tests " | tail -2; }
-${GATE_TIER_DECIDE}
-if is_light; then
-  [ "$GATE_LIGHT" = "1" ] && [ -n "$others" ] && echo "GATE_TIER: light（rebase 只在追加型文件上冲突，分支已在开工时的 main 上跑过门槛）"
-  extra=$(printf '%s\n' "$changed" | grep -E '^test/.+\.test\.tsx?$' | grep -v '^test/http/' | while read -r f; do [ -f "$f" ] && printf '%s ' "$f"; done)
-  echo "GATE_TIER: light（只改了页面 / 组件 / 翻译表 / 测试 / 文档：跑 test/http 与 test/ 根目录单元测试，不跑 test/pipeline）"
-  testcmd="npx vitest run test/http $(ls test/*.test.ts test/*.test.tsx 2>/dev/null | tr '\n' ' ') $extra"
+${GATE_SELECT}
+if [ "$tier" = selected ]; then
+  echo "GATE_TIER: selected（test/http 全部、test/ 根目录单元测试，加 test/pipeline 里依赖图选中的 $n / $total 个）"
+  [ -n "$picked" ] && printf '%s\n' "$picked" | sed 's/^/  /'
+  testcmd="npx vitest run test/http $(ls test/*.test.ts test/*.test.tsx 2>/dev/null | tr '\n' ' ') $(echo $picked)"
 else
-  echo "GATE_TIER: full"
-  [ -n "$others" ] && { echo "改到这些文件，跑完整测试："; printf '%s\n' "$others" | head -10; }
+  echo "GATE_TIER: full（$reason）"
   testcmd="npm run test"
 fi
 npm run typecheck > /tmp/gate-typecheck.log 2>&1 || { plain /tmp/gate-typecheck.log | tail -40; exit 1; }
@@ -258,46 +283,43 @@ files=$(plain /tmp/gate-test.log | grep -oE "FAIL +test/[^ ]+\.test\.tsx?" | awk
 count=$(printf '%s
 ' "$files" | grep -c .)
 if [ "$count" -eq 0 ] || [ "$count" -gt ${GATE_RERUN_MAX} ]; then
-  echo "完整测试失败（失败文件 $count 个，不重跑）："; failures /tmp/gate-test.log; totals /tmp/gate-test.log; exit 1
+  echo "测试失败（失败文件 $count 个，不重跑）："; failures /tmp/gate-test.log; totals /tmp/gate-test.log; exit 1
 fi
-echo "完整测试有 $count 个文件失败，单独重跑一次："; echo "$files"
+echo "测试有 $count 个文件失败，单独重跑一次："; echo "$files"
 npx vitest run $files > /tmp/gate-rerun.log 2>&1 || {
   echo "重跑仍失败："; failures /tmp/gate-rerun.log; totals /tmp/gate-rerun.log; exit 1
 }
 echo "GATE_FLAKY: 重跑通过。第一次的失败："; failures /tmp/gate-test.log; totals /tmp/gate-test.log
 `;
 
-// 完整测试同一时间只跑一个：两个沙箱同时跑时 CPU 和 PG 都被挤满，单个用例常要 30 多秒，各跑 75–90 分钟，
-// 还容易超时失败（2026-11-23 #1141、#1160、#1166/#1167）。精简门槛不排队，照常并行。
-// 排上队的完整测试独占一份连接预算，用 8 个 worker（约 300 个连接）；另一个沙箱的精简门槛或 agent 自己跑测试仍是 4 个
+// 门槛同一时间只跑一个（不分档位）：两个沙箱同时跑时 CPU 和 PG 都被挤满，单个用例常要 30 多秒，各跑 75–90 分钟，
+// 还容易超时失败（2026-11-23 #1141、#1160、#1166/#1167）。2026-11-24 起精简门槛也排队：和完整测试同时跑时
+// 完整 76.6 分钟（失败）、精简 37.7 分钟，比先后跑（约 33 + 21 分钟）还慢。
+// 排上队的门槛独占一份连接预算，用 8 个 worker（约 300 个连接）；agent 自己在另一个沙箱跑测试仍是 4 个
 // worker（约 150 个），所以宿主机 PG 要 max_connections ≥ 600（db_script/pg_setup.sh）。
-const FULL_GATE_WORKERS = "8";
-let fullGateQueue: Promise<unknown> = Promise.resolve();
+const GATE_WORKERS = "8";
+let gateQueue: Promise<unknown> = Promise.resolve();
 type ExecResult = { stdout: string; exitCode: number };
 const minutes = (ms: number) => (ms / 60_000).toFixed(1);
 
-/** 跑一次门槛：完整测试先排队；用时（和排队时间）打进日志，并追加在输出末尾一行 GATE_TIME（进 PR 的 Gate 一节）。 */
+/** 跑一次门槛：所有门槛排同一个队；用时（和排队时间）打进日志，并追加在输出末尾一行 GATE_TIME（进 PR 的 Gate 一节）。 */
 async function runGate<R extends ExecResult>(
   exec: (command: string) => Promise<R>,
   issueId: string,
   env: Record<string, string>,
 ): Promise<R> {
-  const probe = await exec(`${envPrefix(env)} sh -c ${shellQuote(GATE_TIER_PROBE)}`);
-  const full = probe.stdout.trim().split("\n").at(-1) !== "light";
   const queued = Date.now();
   const go = async () => {
     const waited = Date.now() - queued;
-    if (full && waited > 5_000) console.log(`  ⏳ #${issueId} 排队 ${minutes(waited)} 分钟后开始跑完整测试`);
+    if (waited > 5_000) console.log(`  ⏳ #${issueId} 排队 ${minutes(waited)} 分钟后开始跑门槛`);
     const started = Date.now();
-    const gateEnv = full ? { ...env, CRM_TEST_WORKERS: FULL_GATE_WORKERS } : env;
-    const r = await exec(`${envPrefix(gateEnv)} sh -c ${shellQuote(GATE_SCRIPT)}`);
-    const took = `${full ? "完整" : "精简"}门槛用时 ${minutes(Date.now() - started)} 分钟${full && waited > 5_000 ? `（之前排队 ${minutes(waited)} 分钟）` : ""}`;
+    const r = await exec(`${envPrefix({ ...env, CRM_TEST_WORKERS: GATE_WORKERS })} sh -c ${shellQuote(GATE_SCRIPT)}`);
+    const took = `${gateTierName(gateTier(r.stdout))}门槛用时 ${minutes(Date.now() - started)} 分钟${waited > 5_000 ? `（之前排队 ${minutes(waited)} 分钟）` : ""}`;
     console.log(`  ⏱ #${issueId} ${took}，${r.exitCode === 0 ? "通过" : "失败"}`);
     return { ...r, stdout: `${r.stdout}\nGATE_TIME: ${took}` };
   };
-  if (!full) return go();
-  const run = fullGateQueue.then(go);
-  fullGateQueue = run.catch(() => {});
+  const run = gateQueue.then(go);
+  gateQueue = run.catch(() => {});
   return run;
 }
 
@@ -417,15 +439,15 @@ function syncHostBase() {
  * 才查得到。2026-11-05 #393 刚打上 prepped，plan 用 --search 没查到，脚本以为没票可做就退出了。
  * 排除的标签在本地过滤。
  */
-const listIssues = (include: string[], exclude: string[] = []): { number: number; title: string; body: string; updatedAt: string }[] =>
+type ListedIssue = { number: number; title: string; body: string; labels: { name: string }[]; updatedAt: string };
+const listIssues = (include: string[], exclude: string[] = []): ListedIssue[] =>
   (JSON.parse(
     sh("gh", [
       "issue", "list", "--state", "open", "--limit", "200",
       ...include.flatMap((label) => ["--label", label]), "--json", "number,title,body,labels,updatedAt",
     ]),
-  ) as { number: number; title: string; body: string; labels: { name: string }[]; updatedAt: string }[])
-    .filter((issue) => !issue.labels.some((label) => exclude.includes(label.name)))
-    .map(({ number, title, body, updatedAt }) => ({ number, title, body, updatedAt }));
+  ) as ListedIssue[])
+    .filter((issue) => !issue.labels.some((label) => exclude.includes(label.name)));
 
 const q = (label: string) => `label:"${label}"`;
 const notIn = (...labels: string[]) => labels.map((l) => `-${q(l)}`).join(" ");
@@ -569,7 +591,7 @@ function plan(running: ReadonlySet<string>, slots: number, quiet = false): Issue
     for (const f of changedFiles(r.body).files) if (!taken.has(f)) taken.set(f, r.number);
   }
   const picked: Issue[] = [];
-  for (const issue of candidates.filter((c) => allowed(c.number) && !running.has(String(c.number))).sort((a, b) => a.number - b.number)) {
+  for (const issue of candidates.filter((c) => allowed(c.number) && !running.has(String(c.number))).sort(byUrgency)) {
     const open = openBlockers(issue.body);
     if (open.length > 0) {
       log(`  跳过 #${issue.number}：blocker ${open.map((n) => `#${n}`).join("、")} 还没关`);
@@ -896,13 +918,8 @@ async function build(issue: Issue) {
     }
     const review = reviews.at(-1)!;
 
-    // 每 GATE_FULL_EVERY 张走精简门槛的票后，这张强制跑完整测试（计数在进程内，重启后从 0 算）。
-    const forceFull = lightGatesSinceFull >= GATE_FULL_EVERY;
-    const gateEnv = forceFull ? { ...env, GATE_FULL: "1" } : env;
-    const gate = () => runGate((c) => sandbox.exec(c), issue.id, gateEnv);
+    const gate = () => runGate((c) => sandbox.exec(c), issue.id, env);
     let gateResult = await gate();
-    if (gateTier(gateResult.stdout) === "light") lightGatesSinceFull++;
-    else lightGatesSinceFull = 0;
     let fix: sandcastle.SandboxRunResult | undefined;
     if (gateResult.exitCode !== 0) {
       // 给 implementer 一次修的机会（新会话），再跑一次门槛。
@@ -986,11 +1003,9 @@ async function rebaseAndMerge(issue: Issue, pr: string, host: HostGap, merge = t
       return { ok: false, reason: `分支已经包含最新的 ${BASE_REF}，失败不是冲突造成的，需要人看。` };
     }
 
-    // 冲突只在追加型文件（翻译表、索引、棘轮基线）上：rebase 后跑精简门槛（见 GATE_SCRIPT 的 GATE_LIGHT）
     // merge-tree 有冲突时退出码 1、冲突文件列在 stdout 第一行（树 id）之后；`; true` 让 trySh 拿到 stdout
     const probe = trySh("sh", ["-c", `git merge-tree --write-tree --name-only ${BASE_REF} ${issue.branch}; true`]);
     const conflictFiles = probe.ok ? probe.out.split("\n\n")[0]!.split("\n").slice(1).filter(Boolean) : [];
-    const appendOnlyConflict = conflictFiles.length > 0 && conflictFiles.every((f) => APPEND_ONLY.has(f));
     const rebase = await sandbox.exec(`git rebase ${BASE_REF}`);
     const conflicted = rebase.exitCode !== 0;
     const chainBroken = !conflicted && (await sandbox.exec(MIGRATION_CHAIN_OK)).exitCode !== 0;
@@ -1039,10 +1054,8 @@ async function rebaseAndMerge(issue: Issue, pr: string, host: HostGap, merge = t
       return { ok: true };
     }
 
-    const lightOk = appendOnlyConflict && (await sandbox.exec(MIGRATION_CHAIN_OK)).exitCode === 0;
-    if (lightOk) console.log(`  ⚡ #${issue.id} 只在 ${conflictFiles.join("、")} 上冲突，rebase 后跑精简门槛`);
-    const gateEnv = lightOk ? { ...env, GATE_LIGHT: "1" } : env;
-    const gate = await runGate((c) => sandbox.exec(c), issue.id, gateEnv);
+    // rebase 后的门槛和开工时同一套选测试规则（分支相对新 main 的改动），不再因冲突强制完整测试（2026-11-24）。
+    const gate = await runGate((c) => sandbox.exec(c), issue.id, env);
     if (gate.exitCode !== 0) {
       return { ok: false, reason: `rebase 后门槛失败：\n\n\`\`\`\n${gate.stdout.slice(-2000)}\n\`\`\`` };
     }
@@ -1197,7 +1210,7 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
 
   const overBudget = peak > CONTEXT_BUDGET ? "\n\n⚠️ 超过上下文预算，考虑把同类票切得更小。" : "";
   const flaky = result.gate.output.includes("GATE_FLAKY");
-  const tierName = result.gate.tier === "light" ? "精简门槛（test/http 与单元测试，没跑 test/pipeline）" : "完整测试";
+  const tierName = result.gate.tier === "selected" ? "按依赖选的测试（test/http 与单元测试全跑，test/pipeline 只跑依赖图选中的）" : "完整测试";
   // 先 push 开 PR 才有 PR 号；开票放在后面，票号用评论补到 PR 上。
   const gateNote = !result.gate.ok
     ? `❌ 门槛失败：\n\n\`\`\`\n${result.gate.output}\n\`\`\``
@@ -1295,6 +1308,101 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
   await gitRemote(["push", REMOTE, "--delete", issue.branch]);
   trySh("git", ["branch", "-D", issue.branch]);
   console.log(`  ✓ #${issue.id} 已合并（PR #${pr}）`);
+  noteMerged(result.gate.tier);
+}
+
+// ---------------------------------------------------------------------------
+// main 上定期的兜底完整测试（2026-11-24）
+// ---------------------------------------------------------------------------
+// 按依赖选测试的票每合并 MAIN_CHECK_EVERY 张，对当时的 origin/main 跑一次完整测试（和票的门槛排同一个队）。
+// 兜住依赖图漏选，和「两张票各自通过、合在一起才坏」。失败就开一张带 LABEL.mainBroken 的修复票（调度时排最前），
+// 自动合并照常、不暂停。状态存在 MAIN_CHECK_FILE：重启后接着计数，失败票里列出上次通过以来进 main 的提交。
+const MAIN_CHECK_EVERY = 4;
+const MAIN_CHECK_FILE = ".sandcastle/logs/main-check.json";
+const MAIN_CHECK_ID = "main"; // 测试资源后缀 _imain，和票的 _i<n> 不撞
+type MainCheckState = { lastPass: string | null; selectedSince: number };
+const readMainCheck = (): MainCheckState => {
+  try {
+    return JSON.parse(readFileSync(MAIN_CHECK_FILE, "utf8")) as MainCheckState;
+  } catch {
+    return { lastPass: null, selectedSince: 0 };
+  }
+};
+const writeMainCheck = (s: MainCheckState) => writeFileSync(MAIN_CHECK_FILE, `${JSON.stringify(s)}\n`);
+let mainCheckRunning = false;
+
+/** 票合并后记一笔；按依赖选测试的票攒够 MAIN_CHECK_EVERY 张就在后台开跑兜底（不等它，不占宿主机锁）。 */
+function noteMerged(tier: GateTier) {
+  const s = readMainCheck();
+  if (tier === "selected") s.selectedSince++;
+  writeMainCheck(s);
+  if (s.selectedSince < MAIN_CHECK_EVERY || mainCheckRunning) return;
+  mainCheckRunning = true;
+  void runMainFullCheck()
+    .catch((e) => console.warn(`  ⚠ main 兜底完整测试没跑成：${e instanceof Error ? e.message : e}（下一张票合并后再试）`))
+    .finally(() => (mainCheckRunning = false));
+}
+
+async function runMainFullCheck() {
+  const sha = sh("git", ["rev-parse", BASE_REF]);
+  const short = sha.slice(0, 8);
+  const counted = readMainCheck().selectedSince;
+  // 本地分支先指到这个提交：createSandbox 从本地分支建 worktree（本地没有才从 main 新建，那时的 main 可能又变了）。
+  const branch = `sandcastle/main-check-${short}`;
+  sh("git", ["branch", "-f", branch, sha]);
+  console.log(`  🛡 main 兜底完整测试排队：${short}（上次通过以来合并了 ${counted} 张按依赖选测试的票）`);
+  const env = testEnv(MAIN_CHECK_ID);
+  let gate: ExecResult;
+  const sandbox = await sandcastle.createSandbox({ branch, baseBranch: BASE_REF, sandbox: sandboxFor(env), hooks, copyToWorktree });
+  try {
+    gate = await runGate((c) => sandbox.exec(c), MAIN_CHECK_ID, { ...env, GATE_FULL: "1" });
+  } finally {
+    await sandbox.close();
+    await dropTestResources(MAIN_CHECK_ID);
+    // 跑完就扔：worktree 里测试留下的文件不要（close 没删掉时强删），再删本地分支
+    trySh("git", ["worktree", "remove", "--force", sandbox.worktreePath]);
+    trySh("git", ["branch", "-D", branch]);
+  }
+  // 跑的期间又合并进来的票留给下一次兜底。
+  const now = readMainCheck();
+  const rest = Math.max(0, now.selectedSince - counted);
+  if (gate.exitCode === 0) {
+    writeMainCheck({ lastPass: sha, selectedSince: rest });
+    console.log(`  🛡 main 兜底完整测试通过：${short}${gate.stdout.includes("GATE_FLAKY") ? "（有偶发失败，重跑通过）" : ""}`);
+    return;
+  }
+  writeMainCheck({ lastPass: now.lastPass, selectedSince: rest });
+  const commits = now.lastPass
+    ? trySh("git", ["log", "--oneline", `${now.lastPass}..${sha}`]).out
+    : `（之前没有通过记录，下面是最近 20 个提交）\n${trySh("git", ["log", "--oneline", "-n", "20", sha]).out}`;
+  const summary = `\`\`\`\n${gate.stdout.slice(-3000)}\n\`\`\``;
+  const open = JSON.parse(sh("gh", ["issue", "list", "--state", "open", "--label", LABEL.mainBroken, "--json", "number"])) as { number: number }[];
+  if (open[0]) {
+    sh("gh", ["issue", "comment", String(open[0].number), "--body", `main（${short}）上的兜底完整测试又失败了：\n\n${summary}`]);
+    console.log(`  🛡 main 兜底完整测试失败：${short}，已记在 #${open[0].number}`);
+    return;
+  }
+  trySh("gh", ["label", "create", LABEL.mainBroken, "--color", "d73a4a", "--description", "main 上的兜底完整测试失败（Sandcastle 自动开票，调度时排最前）"]);
+  const body = [
+    `Sandcastle 在 main 的 \`${sha}\` 上跑兜底完整测试（\`GATE_FULL=1\`，8 个 worker），没通过。`,
+    "按依赖选测试的票只跑 test/http、test/ 根目录单元测试和依赖图选中的 test/pipeline 文件；这里失败说明要么依赖图漏选了，要么两张各自通过的票合在一起才出问题。",
+    "", "## 失败摘要", "", summary, "",
+    "## 上次兜底通过以来进 main 的提交", "", "```", commits.slice(0, 4000), "```", "",
+    "## 怎么修", "",
+    "- 先在 main 上单跑失败的文件确认能稳定复现；复现不了就按偶发失败处理（照 `flaky` 票的做法），在评论里写明。",
+    "- 用上面的提交列表缩小范围（`git bisect run npx vitest run <失败的文件>`），找到引入问题的提交，修掉并补能锁住它的用例。",
+    "- 如果是依赖图看不到的依赖导致漏选（某个文件改了、测试却没被选中），在评论里写明是哪个文件，交给人加进 `.sandcastle/main.ts` 的 `FULL_PATHS`。",
+    "",
+    "## Acceptance criteria", "",
+    "- [ ] 失败的测试文件在 main 上单跑通过；原因（哪个提交引入、为什么）写进提交信息",
+    "- [ ] 不放宽全局超时，不删除或改弱断言",
+    "- [ ] 是不是依赖图漏选导致的，在 issue 评论里写明结论",
+  ].join("\n");
+  const url = sh("gh", [
+    "issue", "create", "--title", `main 上的兜底完整测试失败（${short}）`, "--body", body,
+    "--label", LABEL.mainBroken, "--label", LABEL.picked, "--label", "ready-for-agent",
+  ]);
+  console.log(`  🛡 main 兜底完整测试失败：${short}，已开票 ${url}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,7 +1528,7 @@ async function schedule(): Promise<ScheduleResult> {
   // 按编号从小到大：和 plan 的顺序一致，早建的票（通常是后面票的 blocker）先 prep、先开工。
   const toPrep = listIssues([LABEL.picked], [LABEL.prepped, LABEL.prOpen, LABEL.stuck])
     .filter((issue) => allowed(issue.number))
-    .sort((a, b) => a.number - b.number);
+    .sort(byUrgency);
   let prepLimitedUntil: number | undefined;
   const slots = MAX_PARALLEL - running.size;
   for (const issue of toPrep) {
