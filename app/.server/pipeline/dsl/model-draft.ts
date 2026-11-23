@@ -12,17 +12,17 @@ import { CONSUMER_ENTITY, METRIC_SCHEMA, type MetricSpec, type RatioPart } from 
 import type { DslKind } from './index';
 import { TAG_SCHEMA } from './tag-spec';
 
-/** 按需求搜出的条目最多几条（起草与一句话解析的检索都由 catalog/draft-search.ts 取，这里是截断上限） */
+/** 按需求搜出的条目最多几条（起草的检索由 catalog/draft-search.ts 取，这里是截断上限） */
 export const SEARCH_LIMIT = 15;
 /** 搜出的条目估算最多多少 token，超过时减少条数 */
 const SEARCH_TOKENS = 6000;
 
 const capability = (id: string) => toMarkdown(CAPABILITIES.find(c => c.id === id)!);
 
-/** 指标能力说明（怎么写指标定义，含 YAML 示例），起草与一句话解析共用 */
+/** 指标能力说明（怎么写指标定义，含 YAML 示例），指标起草用 */
 const METRIC_CAPABILITY = capability('capability:metric-dsl');
 
-/** 怎么写指标（起草与一句话解析共用）：只用目录里的东西、类型与取值规则 */
+/** 怎么写指标（指标起草用）：只用目录里的东西、类型与取值规则 */
 const METRIC_RULES = [
   '规则：',
   '- 只用目录里列出的实体、字段与关系，不要编造；目录里没有的字段（包括敏感字段）一律不要用。',
@@ -33,7 +33,7 @@ const METRIC_RULES = [
   '- 需求没提到的部分不要加；不要输出 device_attribution。',
 ];
 
-/** 输出格式与逐项说明的规则（起草与一句话解析共用，#1162）：来源词是「需求」还是「句子」，只替换它，其余逐字相同 */
+/** 输出格式与逐项说明的规则（#1162；构建器的一句话解析已删除，#1164）：来源词是「需求」还是「句子」，只替换它，其余逐字相同 */
 const metricOutputLines = (source: string) => [
   '输出格式：',
   '{ "spec": { "base": 基础实体, "measure": 度量, "filter"?: 过滤条件数组, "window"?: 时间窗口, … },',
@@ -48,7 +48,7 @@ const metricOutputLines = (source: string) => [
   `- ${source}支撑不了的写法不要写进 spec；unsupported 里的说法一律不进 spec。`,
 ];
 
-/** 指标的 system 提示词（起草与一句话解析共用，#1162）：task 是角色说明里的任务，source 是来源词（「需求」或「句子」），其余逐字相同 */
+/** 指标的 system 提示词（#1162，原与已删除的一句话解析共用）：task 是角色说明里的任务，source 是来源词（「需求」或「句子」），其余逐字相同 */
 const metricSystem = (task: string, source: string) => [
   `你是 CRM 数据平台的指标助手：${task}，只输出一个符合给定 JSON Schema 的 JSON 对象（顶层是 spec、items、unknowns、unsupported 四个键，指标定义只放在 spec 里），不要输出别的文字。`,
   `成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按${source}搜出的目录条目与${source}原文。`,
@@ -58,12 +58,8 @@ const metricSystem = (task: string, source: string) => [
   METRIC_CAPABILITY,
 ].join('\n');
 
-/** 指标起草（#1162）：输出形状与一句话解析相同（spec 加逐项说明、认不出的词与不支持的说法），由调用方收拢平铺输出后严格校验、带回说明 */
+/** 指标起草（#1162）：输出形状是 spec 加逐项说明、认不出的词与不支持的说法，由调用方收拢平铺输出后严格校验、带回说明 */
 const METRIC_DRAFT_SYSTEM = metricSystem('按成员的需求写一个指标定义', '需求');
-
-/** 一句话解析（#516）：spec 是指标定义，另有逐项说明、认不出的词与不支持的说法；提示词要写出输出骨架——
- *  模型看不到 METRIC_PARSE_SCHEMA（callModel 只发 response_format: json_object），不写骨架时模型会照 YAML 示例把定义平铺到顶层（#959） */
-const METRIC_PARSE_SYSTEM = metricSystem('把成员的一句话解析成一个指标定义', '句子');
 
 const TAG_SYSTEM = [
   '你是 CRM 数据平台的标签助手：按成员的需求写一个标签定义，只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
@@ -174,19 +170,6 @@ export function normalizeParseOutput(raw: Record<string, unknown>): { output: un
   if ('spec' in raw) return { output: raw, normalized: false };
   const { items, unknowns, unsupported, ...spec } = raw;
   return { output: { spec, items: items ?? [], unknowns: unknowns ?? [], unsupported: unsupported ?? [] }, normalized: true };
-}
-
-/**
- * 一句话解析成指标表单（#516）发给模型的消息，结构与 definitionDraftMessages 相同：
- * system 是指标规则（共用）加解析说明，user 依次是目录分层上下文（第一层分组、相关分组的组内列表）、按句子搜出的条目与句子原文；
- * 条目由调用方经 catalog/draft-search.ts 排好传入（#853，与起草同一条检索），这里只按 SEARCH_TOKENS 截断
- */
-export function metricParseMessages(sentence: string, catalog: Catalog, ranked: CatalogEntry[]): LlmMessage[] {
-  const user = [layeredContext(catalog, ranked, OVERVIEW_TOKENS), `# 与需求相关的条目\n\n${relevantMarkdown(ranked)}`, `# 句子\n\n${sentence}`].join('\n\n');
-  return [
-    { role: 'system', content: METRIC_PARSE_SYSTEM },
-    { role: 'user', content: user },
-  ];
 }
 
 /** `->` 路径首段没写实体名时补成 <base>.<字段>；首段已有 `.`、不含 `->` 的裸字段原样返回（留给校验） */
