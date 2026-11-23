@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { embedBatchSize, ensureEmbeddings, readEmbeddings } from '../../app/.server/catalog/embeddings';
+import { EMBED_FILL_BACKOFF_MS, embedBatchSize, ensureEmbeddings, readEmbeddings } from '../../app/.server/catalog/embeddings';
 import { cmp } from '../../app/lib/compare';
 import { refreshProjection } from '../../app/.server/catalog/projection';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -17,7 +17,7 @@ import { embeddings, fakeLlm, platformEmbedding, type LlmBody } from './llm-fixt
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+afterEach(() => { vi.useRealTimers(); setLlmFetch(undefined); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 /** 当前环境下的批大小（没设 LLM_EMBEDDING_BATCH_SIZE 时是默认 10） */
 const EMBED_BATCH = embedBatchSize();
@@ -65,10 +65,13 @@ async function expectAligned(tenantId: string, model: string, hashes: string[]) 
 
 /** 给租户配自己的 embedding 三项（chat 三列为空），换模型用 */
 async function tenantEmbedding(tenantId: string, model: string) {
-  await getDb().insert(modelProviders).values({
-    tenantId, embeddingBaseUrl: 'https://tenant-embed.example.com/v1', embeddingModel: model,
+  const columns = {
+    embeddingBaseUrl: 'https://tenant-embed.example.com/v1', embeddingModel: model,
     embeddingApiKey: await encryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, { apiKey: 'sk-tenant-embed-secret' }),
-  });
+  };
+  // upsert：之前的补算成功时已经建了本行（只写了 embedding_fill_* 两列，#1172）
+  await getDb().insert(modelProviders).values({ tenantId, ...columns })
+    .onConflictDoUpdate({ target: modelProviders.tenantId, set: columns });
 }
 
 /** 直接往投影里加一个假条目（只占 full 一类），返回它的文本哈希 */
@@ -212,6 +215,9 @@ describe('检索向量缓存', () => {
     expect(partial.filter(r => r.modelId === 'text-embedding-v3')).toEqual(stored); // 失败就停：旧模型的行没删
 
     const ok = fakeLlm(setLlmFetch, byLength);
+    expect(await ensureEmbeddings(acme)).toBe('backoff'); // 刚失败：退避期内不入队（#1172）
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + EMBED_FILL_BACKOFF_MS + 60_000); // 拨过退避期
     expect(await ensureEmbeddings(acme)).toBe('queued');
     await drain();
     expect(ok.received.map(r => r.body.input.length)).toEqual(batches(stored.length + 1 - EMBED_BATCH)); // 只补缺的

@@ -240,7 +240,7 @@ export const TOOLS: AssistantTool[] = [
     name: 'catalog_search',
     description: '按关键词、别名与名称搜索目录条目，返回展开后的条目、命中理由与歧义判定；ambiguous 为 true 时，先用给出的追问问清楚口径，再继续；'
       + '输出里有「默认口径：」行时，回答里要写明按哪个默认口径理解了哪个词；'
-      + '输出里有「vector_fallback:」行时，表示向量一路没用上（结果只来自关键词）',
+      + '输出里有「vector_fallback:」行时，表示向量一路没用上（结果只来自关键词），其中 not_ready 表示向量还没补算好，结果只来自关键词',
     inputSchema: {
       type: 'object', required: ['query'],
       properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 } },

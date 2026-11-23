@@ -12,7 +12,7 @@
 
 **切换存储与换模型。** 切到外部库时删掉平台表里本租户的行（平台库不再存这个租户的向量）；切回系统自带时保留外部库里的行（不替租户删它自己库里的数据）；新存储一律从零补算。换模型时在当前生效的存储里删掉旧模型的行、按新模型重算（同 ADR-0049）。
 
-**不可达时降级。** 外部库连不上时向量一路降级关闭，同 embedding 失败（ADR-0049 :16）：只去掉这一路，关键词与别名检索照常。`rankedSearch` 的返回带 `vectorFallback` 原因（`off` / `embed_failed` / `store_unreachable`），`catalog_search` 输出一行 `vector_fallback`；上次连通检查的时间与错误记在 `model_providers`。
+**不可达时降级。** 外部库连不上时向量一路降级关闭，同 embedding 失败（ADR-0049 :16）：只去掉这一路，关键词与别名检索照常。`rankedSearch` 的返回带 `vectorFallback` 原因（`off` / `embed_failed` / `store_unreachable` / `not_ready`），`catalog_search` 输出一行 `vector_fallback`；上次连通检查的时间与错误记在 `model_providers`。`not_ready`（#1172）表示这批行的哈希在存储里一个向量都没有（只缺一部分照常返回 hits 并入队）。补算（`fillEmbeddings`）不论 embedding 还是存储哪一步失败，都把抹掉 Key 与连接串的原因记进 `model_providers.embedding_fill_error`、时间记进 `embedding_fill_at`（成功时清空错误、更新时间；租户没有这一行时 upsert 建行只写这两列），因为补算跑在任务的成功后钩子里、任务本身仍记 succeeded；最近一次失败后 10 分钟（`EMBED_FILL_BACKOFF_MS`）内 `ensureEmbeddings` 返回 `backoff`、不再入队，免得每次检索都重发注定失败的批量请求。
 
 ## Consequences
 
