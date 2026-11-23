@@ -5,11 +5,13 @@ import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, modelProviders } from '../../app/.server/db/schema';
+import { randomUUID } from 'node:crypto';
+import { auditLogs, modelProviders, tasks } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
 import { draftWorkbenchSql, interpretResult, previewInterpretation } from '../../app/.server/workbench-ai';
 import { resetDb } from '../http/harness';
-import { memberOf } from './fixtures';
+import { listCatalog } from '../../app/.server/workbench';
+import { memberOf, onLake } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { fakeLlm, json, platformDefault } from './llm-fixtures';
 
@@ -35,7 +37,7 @@ describe('AI 起草 SQL', () => {
     const { received } = modelWrites(sql);
     const queries = (await audits('workbench.query')).length;
 
-    expect(await draftWorkbenchSql(await analyst(), '每个城市的客户数')).toEqual({ sql });
+    expect(await draftWorkbenchSql(await analyst(), '每个城市的客户数')).toEqual({ sql, catalogTruncated: false });
 
     expect((await audits('workbench.query')).length).toBe(queries);
     expect(await drafted(sql)).toEqual([{ sql, valid: true }]);
@@ -48,7 +50,7 @@ describe('AI 起草 SQL', () => {
 
   it('返回与审计的都是去掉结尾分号与空白后的 SQL', async () => {
     modelWrites('  SELECT count(*) FROM silver.customer;\n');
-    expect(await draftWorkbenchSql(await analyst(), '客户总数')).toEqual({ sql: 'SELECT count(*) FROM silver.customer' });
+    expect(await draftWorkbenchSql(await analyst(), '客户总数')).toEqual({ sql: 'SELECT count(*) FROM silver.customer', catalogTruncated: false });
     expect(await drafted('SELECT count(*) FROM silver.customer')).toEqual([{ sql: 'SELECT count(*) FROM silver.customer', valid: true }]);
   });
 
@@ -127,10 +129,50 @@ describe('AI 起草 SQL', () => {
     it('sql 有值、unsupported 为空时照常走起草成功的路径', async () => {
       modelRefuses({ sql: 'SELECT 1', unsupported: '' });
       const before = (await unsupportedAudits()).length;
-      expect(await draftWorkbenchSql(await analyst(), '随便查查')).toEqual({ sql: 'SELECT 1' });
+      expect(await draftWorkbenchSql(await analyst(), '随便查查')).toEqual({ sql: 'SELECT 1', catalogTruncated: false });
       expect(await drafted('SELECT 1')).toEqual([{ sql: 'SELECT 1', valid: true }]);
       expect((await unsupportedAudits()).length).toBe(before);
     });
+  });
+
+  it('同一个指标有两次 gold.dsl 快照时，提示里只有最新的那张，行尾注明是哪个指标的最新快照', async () => {
+    const snapshot = async (finishedAt: Date) => {
+      const [task] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'gold.dsl', status: 'succeeded', params: { kind: 'metric', key: 'k1' }, finishedAt }).returning();
+      await onLake(acme, `CREATE TABLE gold."metric__${task!.id}" AS SELECT 1 AS x`);
+      return `lake.gold."metric__${task!.id}"`;
+    };
+    const older = await snapshot(new Date('2026-01-01T00:00:00Z'));
+    const newer = await snapshot(new Date('2026-02-01T00:00:00Z'));
+    try {
+      const { received } = modelWrites('SELECT 1 AS one');
+      expect(await draftWorkbenchSql(await analyst(), '指标 k1')).toMatchObject({ catalogTruncated: false });
+      const prompt = received[0].body.messages[0].content;
+      expect(prompt).toContain(`${newer}(x INTEGER)  -- 指标 k1 最新快照`);
+      expect(prompt).not.toContain(older);
+      // 目录树（listCatalog）照旧列出两张
+      expect((await listCatalog(await analyst())).gold.map(e => e.ref)).toEqual(expect.arrayContaining([older, newer]));
+    } finally {
+      await onLake(acme, `DROP TABLE ${older.slice(5)}; DROP TABLE ${newer.slice(5)}`);
+    }
+  });
+
+  it('目录超长时先略去结果层，silver 与原始表仍在提示里，catalogTruncated 为真', async () => {
+    const columns = Array.from({ length: 120 }, (_, i) => `1 AS a_rather_long_column_name_${String(i).padStart(3, '0')}`).join(', ');
+    const tables = Array.from({ length: 10 }, () => `gold."metric__${randomUUID()}"`);
+    for (const t of tables) await onLake(acme, `CREATE TABLE ${t} AS SELECT ${columns}`);
+    try {
+      const catalog = await listCatalog(await analyst());
+      const raw = catalog.raw.flatMap(s => s.tables.map(t => t.ref));
+      expect(raw.length).toBeGreaterThan(0);
+      const { received } = modelWrites('SELECT 1 AS one');
+      expect(await draftWorkbenchSql(await analyst(), '随便查查')).toMatchObject({ catalogTruncated: true });
+      const prompt = received[0].body.messages[0].content;
+      for (const ref of [...catalog.silver.map(e => e.ref), ...raw]) expect(prompt).toContain(ref);
+      expect(prompt).toContain('…（目录太长，部分表略去）');
+      expect(tables.filter(t => prompt.includes(`lake.${t}`)).length).toBeLessThan(tables.length);
+    } finally {
+      await onLake(acme, tables.map(t => `DROP TABLE ${t}`).join('; '));
+    }
   });
 
   it('查看者 403', async () => {

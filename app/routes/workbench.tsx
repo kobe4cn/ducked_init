@@ -247,6 +247,7 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
   const shareId = actionData && 'shareId' in actionData ? actionData.shareId : null;
   const preview = actionData && 'preview' in actionData ? actionData.preview : null;
   const interpretation = actionData && 'interpretation' in actionData ? actionData.interpretation : null;
+  const catalogTruncated = actionData && 'catalogTruncated' in actionData && actionData.catalogTruncated;
   /** 这个页面上的解读存进的助手对话，表单里一直带着 */
   const conversationId = actionData && 'conversationId' in actionData ? actionData.conversationId ?? '' : '';
   const conversationField = conversationId && <input type="hidden" name="conversationId" value={conversationId} />;
@@ -263,6 +264,9 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
           <Form method="post" action="/workbench" className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm">
             {conversationField}
             <label htmlFor="sql" className="text-sm font-medium">SQL</label>
+            {catalogTruncated && (
+              <p className="text-sm text-slate-500" data-catalog-truncated>{t('目录太长，AI 起草时只看到了部分表（优先保留 silver 和数据源原始表）')}</p>
+            )}
             {/* defaultValue 只在挂载时生效：起草后或从侧栏打开 ?sql= 时换 key，让编辑框重新挂载、填入 SQL */}
             <SqlEditor
               key={draftId ?? `sql:${initialSql}`}
