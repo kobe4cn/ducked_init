@@ -17,6 +17,8 @@ import { eq } from 'drizzle-orm';
 import { getDb } from './db/client';
 import { llmCalls, modelProviders } from './db/schema';
 import { decryptForTenant } from './secrets';
+import { formatServer } from './i18n';
+import { msg, type Msg } from '~/lib/i18n';
 
 /** 调用的用途，记进调用日志 */
 export type LlmPurpose = 'connectivity' | 'tool_probe' | 'assistant' | 'mapping_draft' | 'metric_draft' | 'tag_draft' | 'assertion_draft'
@@ -200,6 +202,9 @@ export function validatorFor(schema: object) {
   return v;
 }
 
+/** 本层报错固定出中文（LlmError 还不是 MsgError），句式走 msg() 以便词典与将来按语言出（ADR-0060） */
+const zh = (m: Msg) => formatServer('zh-CN', m);
+
 /** 一条校验错误的中文说明（常见的几种，其余用 ajv 的原文） */
 function describeError(e: ErrorObject) {
   const p = e.params as Record<string, unknown>;
@@ -209,12 +214,12 @@ function describeError(e: ErrorObject) {
     case 'additionalProperties': return `${at}不认识的项 ${p.additionalProperty}`;
     case 'type': return `${at}应为 ${p.type}`;
     case 'enum': return `${at}应为以下之一：${(p.allowedValues as unknown[]).join('、')}`;
-    case 'minItems': return `${at}至少要有 ${p.limit} 项`;
-    case 'maxItems': return `${at}最多 ${p.limit} 项`;
-    case 'minLength': return `${at}至少 ${p.limit} 个字`;
-    case 'maxLength': return `${at}最多 ${p.limit} 个字`;
-    case 'minimum': return `${at}不能小于 ${p.limit}`;
-    case 'maximum': return `${at}不能大于 ${p.limit}`;
+    case 'minItems': return zh(msg('{at}至少要有 {limit} 项', { at, limit: p.limit }));
+    case 'maxItems': return zh(msg('{at}最多 {limit} 项', { at, limit: p.limit }));
+    case 'minLength': return zh(msg('{at}至少 {limit} 个字', { at, limit: p.limit }));
+    case 'maxLength': return zh(msg('{at}最多 {limit} 个字', { at, limit: p.limit }));
+    case 'minimum': return zh(msg('{at}不能小于 {limit}', { at, limit: p.limit }));
+    case 'maximum': return zh(msg('{at}不能大于 {limit}', { at, limit: p.limit }));
     default: return `${at}${e.message ?? e.keyword}`;
   }
 }
@@ -339,7 +344,7 @@ export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[]
     const { content, finishReason } = await postChat(provider, { messages, response_format: { type: 'json_object' } }, stats);
     if (typeof content !== 'string') throw new LlmError('模型服务的返回里没有 choices[0].message.content');
     // 截断检查放在解析之前：截断的输出多半也不是合法 JSON，先报原因更清楚（schemaValid 留 null）
-    if (finishReason === 'length') throw new LlmError('模型输出被截断（达到输出长度上限），请把需求写得更具体，或换上下文更长的模型');
+    if (finishReason === 'length') throw new LlmError(zh(msg('模型输出被截断（达到输出长度上限），请把需求写得更具体，或换上下文更长的模型')));
     // 有的模型把 JSON 包在 ```json … ``` 代码块里：去掉外壳再解析
     const fenced = content.trim().match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
     let parsed: unknown;
