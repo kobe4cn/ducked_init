@@ -117,6 +117,22 @@ describe('AI 起草', () => {
     expect(page).toContain('AI 起草的 SQL 没有通过校验');
     expect(page).toMatch(/<textarea[^>]*name="sql"[^>]*>SELECT 1<\/textarea>/);
   });
+
+  it('模型判断做不到时 422：页面标题「AI 没有起草 SQL」下是模型给的原因，没有 Schema 报错，编辑框保留原来的 SQL', async () => {
+    await memberOf(acme, 'an-ai-no@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an-ai-no@acme.com');
+    platformDefault();
+    fakeLlm(f => app.setLlmFetch(f), () => json({ unsupported: '工作台只读，不能删除数据' }));
+
+    const res = await analyst.post('/workbench', { intent: 'draft', request: '删除测试奶站的数据', sql: 'SELECT 1' });
+    expect(res.status).toBe(422);
+    const page = await res.text();
+    expect(page).toContain('AI 没有起草 SQL');
+    expect(page).toContain('工作台只读，不能删除数据');
+    expect(page).not.toContain('must NOT');
+    expect(page).not.toContain('data-drafted');
+    expect(page).toMatch(/<textarea[^>]*name="sql"[^>]*>SELECT 1<\/textarea>/);
+  });
 });
 
 describe('AI 解读', () => {

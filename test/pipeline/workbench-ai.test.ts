@@ -76,6 +76,48 @@ describe('AI 起草 SQL', () => {
     expect(await errorOf(draftWorkbenchSql(await analyst(), '每个城市的客户数'))).toMatch(/^422 /);
   });
 
+  describe('模型判断做不到（unsupported）', () => {
+    /** 审计里 { unsupported: true } 的条数（库在用例间共用，先数再比） */
+    const unsupportedAudits = async () => (await audits('workbench.ai_drafted')).filter(a => (a.detail as { unsupported?: boolean }).unsupported);
+    const modelRefuses = (reply: Record<string, string>) => { platformDefault(); return fakeLlm(setLlmFetch, () => json(reply)); };
+
+    it('需要的表不在目录里：422 带模型给的原因，审计恰好是 { unsupported: true }，不记原因与需求原文，不执行', async () => {
+      modelRefuses({ unsupported: '目录里没有退货表' });
+      const before = (await unsupportedAudits()).length;
+      const queries = (await audits('workbench.query')).length;
+
+      expect(await errorOf(draftWorkbenchSql(await analyst(), '各城市的退货件数'))).toBe('422 目录里没有退货表');
+
+      const after = await unsupportedAudits();
+      expect(after.length).toBe(before + 1);
+      expect(after.at(-1)!.detail).toEqual({ unsupported: true });
+      expect(JSON.stringify(after)).not.toContain('退货');
+      expect((await audits('workbench.query')).length).toBe(queries);
+    });
+
+    it('「删除测试奶站的数据」这类写操作需求：422 带原因；提示词写明做不到时回答 unsupported、工作台只读', async () => {
+      const { received } = modelRefuses({ unsupported: '工作台只读，不能删除数据' });
+      expect(await errorOf(draftWorkbenchSql(await analyst(), '删除测试奶站的数据'))).toBe('422 工作台只读，不能删除数据');
+      const system = received[0].body.messages.find(m => m.role === 'system')!.content;
+      expect(system).toContain('{"unsupported"');
+      expect(system).toContain('只读');
+      expect(system).toContain('删除');
+    });
+
+    it('sql 与 unsupported 都给时按做不到处理；原因去掉首尾空白、截到 500 字', async () => {
+      modelRefuses({ sql: 'SELECT 1', unsupported: `  ${'缺'.repeat(600)}\n` });
+      const before = (await unsupportedAudits()).length;
+      expect(await errorOf(draftWorkbenchSql(await analyst(), '随便查查'))).toBe(`422 ${'缺'.repeat(500)}`);
+      expect((await unsupportedAudits()).length).toBe(before + 1);
+      expect(await drafted('SELECT 1')).toEqual([]);
+    });
+
+    it.each([['空字符串', ''], ['只有空白', ' \n ']])('unsupported 是%s时仍是模型失败（422 模型起草 SQL 失败）', async (_, unsupported) => {
+      modelRefuses({ unsupported });
+      expect(await errorOf(draftWorkbenchSql(await analyst(), '随便查查'))).toMatch(/^422 模型起草 SQL 失败/);
+    });
+  });
+
   it('查看者 403', async () => {
     modelWrites('SELECT 1');
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
