@@ -116,6 +116,21 @@ describe('AI 起草 SQL', () => {
       modelRefuses({ unsupported });
       expect(await errorOf(draftWorkbenchSql(await analyst(), '随便查查'))).toMatch(/^422 模型起草 SQL 失败/);
     });
+
+    it('sql 为空、unsupported 有原因时按做不到处理，不报 Schema 错误', async () => {
+      modelRefuses({ sql: '', unsupported: '目录里没有退货表' });
+      const before = (await unsupportedAudits()).length;
+      expect(await errorOf(draftWorkbenchSql(await analyst(), '各城市的退货件数'))).toBe('422 目录里没有退货表');
+      expect((await unsupportedAudits()).length).toBe(before + 1);
+    });
+
+    it('sql 有值、unsupported 为空时照常走起草成功的路径', async () => {
+      modelRefuses({ sql: 'SELECT 1', unsupported: '' });
+      const before = (await unsupportedAudits()).length;
+      expect(await draftWorkbenchSql(await analyst(), '随便查查')).toEqual({ sql: 'SELECT 1' });
+      expect(await drafted('SELECT 1')).toEqual([{ sql: 'SELECT 1', valid: true }]);
+      expect((await unsupportedAudits()).length).toBe(before);
+    });
   });
 
   it('查看者 403', async () => {
