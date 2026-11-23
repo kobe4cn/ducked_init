@@ -123,7 +123,6 @@ export default function Settings({ loaderData, actionData }: Route.ComponentProp
         <SectionHeader title={t('个人令牌')}>
           {t('平台外的 Agent（如 Claude Code）带 Authorization: Bearer <令牌> 访问 {url}，代表你操作。能做的事永远等于你当前的角色，Agent 不能发布。', { url: mcpUrl })}
         </SectionHeader>
-        <McpConnect kind="placeholder" url={mcpUrl} token={null} tools={mcpTools.base} queryOnly={mcpTools.queryOnly} />
         <Form method="post">
           <input type="hidden" name="intent" value="create" />
           <FieldGroup>
@@ -149,6 +148,10 @@ export default function Settings({ loaderData, actionData }: Route.ComponentProp
             </div>
           </FieldGroup>
         </Form>
+        {/* 放在签发表单之后：片段较长，放前面会把表单挤到下面 */}
+        <div className="border-t pt-2">
+          <McpConnect kind="placeholder" url={mcpUrl} token={null} tools={mcpTools.base} queryOnly={mcpTools.queryOnly} />
+        </div>
       </div>
 
       {tokens.length === 0 ? (
