@@ -717,7 +717,8 @@ describe('用模型生成指标草稿', () => {
     expect(page).toMatch(/<textarea[^>]*name="request"/);
     expect(page).toMatch(/<button[^>]*formNoValidate=""[^>]*value="model-draft"|<button[^>]*value="model-draft"[^>]*formNoValidate=""/);
 
-    modelReplies({ base: 'order', measure: { agg: 'sum', field: 'amount' }, filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'created_at', days: 30 } });
+    // 模型答复沿用一句话解析的输出形状（#1162）：spec 加 items / unknowns / unsupported（说明的展示留给 #1163）
+    modelReplies({ spec: { base: 'order', measure: { agg: 'sum', field: 'amount' }, filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'created_at', days: 30 } }, items: [], unknowns: [], unsupported: [] });
     const generated = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request, yaml: REVENUE });
     expect(generated.status).toBe(200);
     const html = await generated.text();
@@ -732,7 +733,7 @@ describe('用模型生成指标草稿', () => {
     expect(saved.headers.get('location')).toBe('/analytics/definitions/metric/paid_revenue_30d');
     expect((await getDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'paid_revenue_30d')).draft).toMatchObject({ version: 1, yaml });
 
-    modelReplies({ base: 'order', measure: { agg: 'sum', field: 'channel' } });
+    modelReplies({ spec: { base: 'order', measure: { agg: 'sum', field: 'channel' } }, items: [], unknowns: [], unsupported: [] });
     const bad = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: 'x', request, yaml: REVENUE });
     expect(bad.status).toBe(422);
     const badHtml = await bad.text();
@@ -752,7 +753,7 @@ describe('用模型生成指标草稿', () => {
       await addAlias(analyst, { targetId: `metric:${key}`, alias: '营收' });
     }
 
-    modelReplies({ base: 'order', measure: { agg: 'sum', field: 'amount' } });
+    modelReplies({ spec: { base: 'order', measure: { agg: 'sum', field: 'amount' } }, items: [], unknowns: [], unsupported: [] });
     const res = await (await loginAs(app, 'analyst@acme.com'))
       .post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request: '营收', yaml: REVENUE });
     expect(res.status).toBe(200);

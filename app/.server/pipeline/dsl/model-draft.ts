@@ -1,5 +1,5 @@
 // app/.server/pipeline/dsl/model-draft.ts —— 用模型按自然语言需求生成定义草稿（ADR-0035，纯函数，不读库、不发请求）：
-// 每种可生成的定义给出模型必须遵守的输出 Schema（直接用该种类的定义 Schema）、调用用途、提示词与给模型的上下文；
+// 每种可生成的定义给出模型必须遵守的输出 Schema（指标沿用一句话解析的输出形状，#1162：宽松 Schema 放行，调用方收拢后严格校验）、调用用途、提示词与给模型的上下文；
 // 上下文取自语义目录（ADR-0041）：system 是简短的角色说明加该种类的能力说明，user 是目录分层上下文（第一层分组、相关分组的组内列表，#855）、
 // 按需求检索出的条目与需求原文。检索在 catalog/draft-search.ts（与助手同一条路，#827），排好的条目由调用方传入，这里只管截断与拼消息。
 // 目录里本就没有敏感字段、哈希列与明细行（ADR-0005），统计只有 ADR-0016 的常见取值。
@@ -33,10 +33,27 @@ const METRIC_RULES = [
   '- 需求没提到的部分不要加；不要输出 device_attribution。',
 ];
 
-const METRIC_SYSTEM = [
-  '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（与下面 YAML 示例同样的结构），不要输出别的文字。',
+/** 输出格式与逐项说明的规则（起草与一句话解析共用，#1162）：来源词是「需求」还是「句子」，只替换它，其余逐字相同 */
+const metricOutputLines = (source: string) => [
+  '输出格式：',
+  '{ "spec": { "base": 基础实体, "measure": 度量, "filter"?: 过滤条件数组, "window"?: 时间窗口, … },',
+  '  "items": [{ "path": 在 spec 里的位置, "reason": 一句话说明 }], "unknowns": [], "unsupported": [] }',
+  '四个键都必须有，没有内容给空列表；下面 YAML 示例是 spec 里面的写法，不要把定义平铺到顶层。',
+  '解析说明：',
+  `- items 逐项说明 spec 的每个部分是怎么从${source}来的：path 用它在 spec 里的位置（如 measure.field、filter.0、window），reason 一句话。`,
+  `- ${source}里认不出的词照原话进 unknowns（如目录里没有的字段、对应不上的说法），不要猜。`,
+  '- 「或」只在同一字段的不同取值时改写成一个 in 过滤（value 是列表）；跨字段的「或」表达不了，整句原话进 unsupported，不写进 spec。',
+  '- 时间只认「近 N 天」，写成 window；「上个月」「今年」等其他时间说法整句原话进 unsupported，不写进 spec；按小时 / 天 / 月分组、取峰值的说法也整句原话进 unsupported。',
+  '- 「分母为 0 时算 0」整句原话进 unsupported：编译用 NULLIF，分母为 0 时结果是空，不是 0。',
+  `- ${source}支撑不了的写法不要写进 spec；unsupported 里的说法一律不进 spec。`,
+];
+
+/** 指标起草（#1162）：输出形状与一句话解析相同（spec 加逐项说明、认不出的词与不支持的说法），由调用方收拢平铺输出后严格校验、带回说明 */
+const METRIC_DRAFT_SYSTEM = [
+  '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（顶层是 spec、items、unknowns、unsupported 四个键，指标定义只放在 spec 里），不要输出别的文字。',
   '成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按需求搜出的目录条目与需求原文。',
   ...METRIC_RULES,
+  ...metricOutputLines('需求'),
   '',
   METRIC_CAPABILITY,
 ].join('\n');
@@ -47,17 +64,7 @@ const METRIC_PARSE_SYSTEM = [
   '你是 CRM 数据平台的指标助手：把成员的一句话解析成一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（顶层是 spec、items、unknowns、unsupported 四个键，指标定义只放在 spec 里），不要输出别的文字。',
   '成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按句子搜出的目录条目与句子原文。',
   ...METRIC_RULES,
-  '输出格式：',
-  '{ "spec": { "base": 基础实体, "measure": 度量, "filter"?: 过滤条件数组, "window"?: 时间窗口, … },',
-  '  "items": [{ "path": 在 spec 里的位置, "reason": 一句话说明 }], "unknowns": [], "unsupported": [] }',
-  '四个键都必须有，没有内容给空列表；下面 YAML 示例是 spec 里面的写法，不要把定义平铺到顶层。',
-  '解析说明：',
-  '- items 逐项说明 spec 的每个部分是怎么从句子来的：path 用它在 spec 里的位置（如 measure.field、filter.0、window），reason 一句话。',
-  '- 句子里认不出的词照原话进 unknowns（如目录里没有的字段、对应不上的说法），不要猜。',
-  '- 「或」只在同一字段的不同取值时改写成一个 in 过滤（value 是列表）；跨字段的「或」表达不了，整句原话进 unsupported，不写进 spec。',
-  '- 时间只认「近 N 天」，写成 window；「上个月」「今年」等其他时间说法整句原话进 unsupported，不写进 spec；按小时 / 天 / 月分组、取峰值的说法也整句原话进 unsupported。',
-  '- 「分母为 0 时算 0」整句原话进 unsupported：编译用 NULLIF，分母为 0 时结果是空，不是 0。',
-  '- 句子支撑不了的写法不要写进 spec；unsupported 里的说法一律不进 spec。',
+  ...metricOutputLines('句子'),
   '',
   METRIC_CAPABILITY,
 ].join('\n');
@@ -77,9 +84,39 @@ const TAG_SYSTEM = [
 const tagUnavailable = (catalog: Catalog) =>
   catalog.entries.some(e => e.kind === 'metric' && !e.dimensions.length) ? null : '本租户还没有标签能引用的指标：请先发布一个数值型指标（没有维度）';
 
-/** 可由模型生成的定义：输出 Schema、调用用途、system 提示词与目录里没东西可用时给成员的提示 */
+/** 一句话解析的输出 Schema（#516）：spec 是指标定义（METRIC_SCHEMA），另有逐项说明、认不出的词与不支持的说法，四个键都必填；指标起草沿用这个形状（#1162） */
+export const METRIC_PARSE_SCHEMA = {
+  type: 'object',
+  required: ['spec', 'items', 'unknowns', 'unsupported'],
+  additionalProperties: false,
+  properties: {
+    spec: METRIC_SCHEMA,
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['path', 'reason'],
+        additionalProperties: false,
+        properties: { path: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } },
+      },
+    },
+    unknowns: { type: 'array', items: { type: 'string' } },
+    unsupported: { type: 'array', items: { type: 'string' } },
+  },
+} as const;
+
+/** 宽松 Schema（#959 兜底）：callModel 只发 response_format: json_object、模型看不到上面的 Schema，常把定义平铺在顶层
+ *  （qwen-plus 必现），严格 Schema 会让一句话解析必然失败——也接受顶层有 base 或 measure 的平铺输出，收拢
+ *  （normalizeParseOutput）后再按 METRIC_PARSE_SCHEMA 严格校验。必须是模块级常量：validatorFor 用 WeakMap 按对象缓存
+ *  编译结果，每次调用新建对象会反复编译；指标起草也走它（#1162），定义在 DRAFTS 之前免得撞 TDZ */
+export const METRIC_PARSE_LENIENT_SCHEMA = {
+  anyOf: [METRIC_PARSE_SCHEMA, { type: 'object', anyOf: [{ required: ['base'] }, { required: ['measure'] }] }],
+} as const;
+
+/** 可由模型生成的定义：输出 Schema、调用用途、system 提示词与目录里没东西可用时给成员的提示；
+ *  指标走一句话解析的输出形状（#1162）：宽松 Schema 放行平铺输出，由调用方（dsl-definitions.ts）收拢后严格校验 */
 const DRAFTS = {
-  metric: { schema: METRIC_SCHEMA, purpose: 'metric_draft', system: METRIC_SYSTEM, unavailable: () => null },
+  metric: { schema: METRIC_PARSE_LENIENT_SCHEMA, purpose: 'metric_draft', system: METRIC_DRAFT_SYSTEM, unavailable: () => null },
   tag: { schema: SINGLE_TAG_SCHEMA, purpose: 'tag_draft', system: TAG_SYSTEM, unavailable: tagUnavailable },
 } satisfies Record<DslKind, { schema: object; purpose: LlmPurpose; system: string; unavailable: (catalog: Catalog) => string | null }>;
 
@@ -111,35 +148,6 @@ export function definitionDraftMessages(kind: DslKind, request: string, catalog:
     { role: 'user', content: user },
   ];
 }
-
-/** 一句话解析的输出 Schema（#516）：spec 是指标定义（METRIC_SCHEMA），另有逐项说明、认不出的词与不支持的说法，四个键都必填 */
-export const METRIC_PARSE_SCHEMA = {
-  type: 'object',
-  required: ['spec', 'items', 'unknowns', 'unsupported'],
-  additionalProperties: false,
-  properties: {
-    spec: METRIC_SCHEMA,
-    items: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['path', 'reason'],
-        additionalProperties: false,
-        properties: { path: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } },
-      },
-    },
-    unknowns: { type: 'array', items: { type: 'string' } },
-    unsupported: { type: 'array', items: { type: 'string' } },
-  },
-} as const;
-
-/** 宽松 Schema（#959 兜底）：callModel 只发 response_format: json_object、模型看不到上面的 Schema，常把定义平铺在顶层
- *  （qwen-plus 必现），严格 Schema 会让一句话解析必然失败——也接受顶层有 base 或 measure 的平铺输出，收拢
- *  （normalizeParseOutput）后再按 METRIC_PARSE_SCHEMA 严格校验。必须是模块级常量：validatorFor 用 WeakMap 按对象缓存
- *  编译结果，每次调用新建对象会反复编译 */
-export const METRIC_PARSE_LENIENT_SCHEMA = {
-  anyOf: [METRIC_PARSE_SCHEMA, { type: 'object', anyOf: [{ required: ['base'] }, { required: ['measure'] }] }],
-} as const;
 
 /**
  * 收拢平铺的解析输出（#959 兜底，纯函数、不校验）：有 spec 键原样返回；否则模型是把定义平铺在顶层，

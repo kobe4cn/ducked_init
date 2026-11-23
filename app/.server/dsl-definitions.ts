@@ -23,12 +23,12 @@ import { getDb, isUniqueViolation } from './db/client';
 import { publishedTagsOf, publishedTagsReferencing } from './dsl-dependencies';
 import { dslDefinitions, dslVersions, snapshots, tasks, type SnapshotTrigger, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
-import { chatJson, LlmError, resolveProvider } from './llm';
+import { chatJson, LlmError, resolveProvider, schemaErrors, validatorFor } from './llm';
 import { publishedPlans } from './mappings';
 import { failedErrors, type AssertionResult } from './pipeline/assertions';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
-import { definitionDraftMessages, definitionDraftPurpose, definitionDraftSchema, definitionOutputToYaml, SEARCH_LIMIT } from './pipeline/dsl/model-draft';
+import { definitionDraftMessages, definitionDraftPurpose, definitionDraftSchema, definitionOutputToYaml, METRIC_PARSE_SCHEMA, normalizeParseOutput, SEARCH_LIMIT } from './pipeline/dsl/model-draft';
 import { checkMetric, type DslCheck, type DslContext, type DslIssue, type MetricSpec } from './pipeline/dsl/metric-spec';
 import { withMetric } from './pipeline/dsl/tag-spec';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './pipeline/identity-engine';
@@ -183,14 +183,18 @@ export async function createDefinition(actor: CurrentMember, kind: string, key: 
   }
 }
 
+/** 模型起草指标时一并带回的逐项说明（#1162，输出形状与一句话解析相同）：spec 每部分怎么来的、认不出的词与不支持的说法；标签没有，为 null */
+export type DraftExplanation = { items: { path: string; reason: string }[]; unknowns: string[]; unsupported: string[] };
+
 /**
  * 用模型按自然语言需求生成定义草稿（ADR-0003、ADR-0035）：上下文取自本租户的语义目录（ADR-0041：分层目录、按需求检索出的条目与该种类的能力说明）；
  * 检索与助手 catalog_search 同一条路（draftSearch，#827：按成员权限的目录、租户开 hybrid_search 时带向量一路），需求有歧义时照常起草，
- * 另把歧义词与候选带回页面提示成员；模型输出按该种类的 Schema 校验、转成 YAML 后须过该种类的校验，只返回 YAML，不保存（之后照常保存草稿、双人发布）。
+ * 另把歧义词与候选带回页面提示成员；模型输出按该种类的 Schema 校验、转成 YAML 后须过该种类的校验，返回 YAML 与逐项说明（指标沿用一句话解析的
+ * 输出形状，#1162；标签没有说明），不保存（之后照常保存草稿、双人发布）。
  * 没配置模型服务、或上下文里没东西可用（标签没有可引用的指标）时 400、不发请求；
- * 模型失败或转出的 YAML 不过校验时记审计 definition.model_draft_failed（不含需求原文、模型原文与取值），抛 422
+ * 模型失败或转出的 YAML 不过校验时记审计 definition.model_draft_failed（不含需求原文、逐项说明、模型原文与取值），抛 422
  */
-export async function modelDraftForDefinition(actor: CurrentMember, kind: string, request: string): Promise<{ yaml: string; ambiguity: DraftAmbiguity | null }> {
+export async function modelDraftForDefinition(actor: CurrentMember, kind: string, request: string): Promise<{ yaml: string; ambiguity: DraftAmbiguity | null; explanation: DraftExplanation | null }> {
   assertCan(actor, 'definitions:draft');
   requireKind(kind);
   if (!request.trim()) throw new DslError('请先写下需求');
@@ -203,21 +207,37 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
   const { catalog, entries, ambiguity } = await draftSearch(actor, request, SEARCH_LIMIT);
   const messages = definitionDraftMessages(kind, request, catalog, entries);
   if (!Array.isArray(messages)) throw new DslError(messages.unavailable);
-  let output: object;
+  let out: Record<string, unknown>;
   try {
-    output = await chatJson<object>(tenantId, definitionDraftPurpose(kind), messages, definitionDraftSchema(kind));
+    out = await chatJson<Record<string, unknown>>(tenantId, definitionDraftPurpose(kind), messages, definitionDraftSchema(kind));
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
     await failed({ stage: 'model', error: e.message.slice(0, 200) });
     throw new DslError(`模型生成草稿失败：${e.message}`, 422);
   }
-  const yaml = definitionOutputToYaml(kind, output);
+  // 指标沿用一句话解析的输出形状（#1162）：宽松 Schema 放行平铺输出（llm_calls.schema_valid 记的是宽松校验的结果，与 #959 一致），
+  // 收拢（normalizeParseOutput）后仍按 METRIC_PARSE_SCHEMA 严格校验，另带回逐项说明
+  let spec: object = out;
+  let explanation: DraftExplanation | null = null;
+  if (kind === 'metric') {
+    const { output, normalized } = normalizeParseOutput(out);
+    const validate = validatorFor(METRIC_PARSE_SCHEMA);
+    if (!validate(output)) {
+      const message = `模型返回的 JSON 不符合 Schema：${schemaErrors(validate)}`;
+      await failed({ stage: 'model', error: message.slice(0, 200), ...(normalized && { normalized: true }) });
+      throw new DslError(`模型生成草稿失败：${message}`, 422);
+    }
+    const parsed = output as { spec: object } & DraftExplanation;
+    spec = parsed.spec;
+    explanation = { items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported };
+  }
+  const yaml = definitionOutputToYaml(kind, spec);
   const checked = DSL_KINDS[kind].check(yaml, ctx);
   if (!checked.ok) {
     await failed({ stage: 'definition', issues: checked.issues.length, paths: checked.issues.slice(0, 10).map(i => i.path) });
     throw new DslError(`模型生成的${DSL_KINDS[kind].label}定义有 ${checked.issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, checked.issues);
   }
-  return { yaml, ambiguity };
+  return { yaml, ambiguity, explanation };
 }
 
 /** dslDefinitionAdapter 的上下文：租户、种类与键；parentId 是定义行 ID */

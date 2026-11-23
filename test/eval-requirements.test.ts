@@ -38,7 +38,8 @@ describe('需求黄金集', () => {
 describe('需求评测跑分', () => {
   it('指标：模型输出与期望一致时校验通过、命中率 1，消息与产品相同', async () => {
     const c = caseNamed('paid-revenue-by-city');
-    const { f } = fakeLlm(setLlmFetch, () => json(c.expected));
+    // 模型答复是指标起草的输出形状（#1162）：spec 加 items / unknowns / unsupported；平铺的答复由宽松 Schema 放行（下一例）
+    const { f } = fakeLlm(setLlmFetch, () => json({ spec: c.expected, items: [], unknowns: [], unsupported: [] }));
     const r = await runCase(PROVIDER, c);
     expect(r).toEqual({
       id: 'paid-revenue-by-city', kind: 'metric', valid: true, hits: 6, items: 6, hitRate: 1,
