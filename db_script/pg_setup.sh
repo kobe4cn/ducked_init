@@ -54,7 +54,8 @@ container run -d \
         -c checkpoint_timeout=30min \
         -c synchronous_commit=off \
         -c maintenance_work_mem=1GB \
-        -c max_parallel_maintenance_workers=4
+        -c max_parallel_maintenance_workers=4 \
+        -c max_connections=600
 
 if test $status -ne 0
     echo "ERROR: Failed to start PostgreSQL container."

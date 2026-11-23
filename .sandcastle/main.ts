@@ -58,7 +58,7 @@ import { acceptanceSection, checkAcceptanceNotes, replaceSection, restSections }
 const AGENT_IDLE_TIMEOUT_S = 40 * 60;
 const POLL_INTERVAL_MS = 10 * 60_000; // 有空位时隔多久重新调度一次（整理 → prep → plan），看有没有新开得了工的票
 const MAX_ITERATIONS = 12; // 连续空转（没有票在做、也开不出新票）多少次就结束运行：12 × 10 分钟，等人审 PR 最多等约 2 小时
-const MAX_PARALLEL = 2; // 同时实现的票数：受 PG max_connections（每个沙箱 4 个 worker 约 150 个连接，2 个要 300）与机器负载限制；3 个门槛同时跑完整测试会大面积超时（2026-11-07）
+const MAX_PARALLEL = 2; // 同时实现的票数：受 PG max_connections 与机器负载限制；完整测试另外排队、同一时间只跑一个（runGate）；3 个门槛同时跑完整测试会大面积超时（2026-11-07）
 const IMPLEMENT_MAX_ITERATIONS = 3; // 一张票最多开几次全新会话；超过说明票太大，交给人
 /** 第一次没做完时脚本留在 issue 上的标记；prep 看到它就按「实现没做完」重新准备，再没做完才打 stuck。 */
 const REPREP_MARK = "<!-- sandcastle:reprep -->";
@@ -230,13 +230,19 @@ const GATE_FULL_EVERY = 4;
 const LIGHT_PATHS = String.raw`^(app/routes/|app/components/|app/i18n/en\.(client|server)\.json$|test/.*\.test\.tsx?$|test/i18n-ratchet-baseline\.json$|test/CATALOG\.md$|docs/|[^/]*\.md$)`;
 let lightGatesSinceFull = 0;
 const gateTier = (stdout: string): "light" | "full" => (stdout.includes("GATE_TIER: light") ? "light" : "full");
+// 门槛走精简还是完整：GATE_SCRIPT 和开跑前的 GATE_TIER_PROBE 共用这段判断（完整测试要排队，见 runGate）。
+const GATE_TIER_DECIDE = String.raw`
+changed=$(git diff --name-only "$(git merge-base HEAD ${BASE_REF})" HEAD)
+others=$(printf '%s\n' "$changed" | grep . | grep -vE '${LIGHT_PATHS}')
+is_light() { [ "$GATE_FULL" != "1" ] && { [ "$GATE_LIGHT" = "1" ] || { [ -n "$changed" ] && [ -z "$others" ]; }; }; }
+`;
+const GATE_TIER_PROBE = `${GATE_TIER_DECIDE}\nif is_light; then echo light; else echo full; fi`;
 const GATE_SCRIPT = String.raw`
 plain() { sed 's/\[[0-9;]*m//g' "$1"; }
 failures() { plain "$1" | sed -n '/Failed \(Tests\|Suites\)/,/Test Files/p' | grep -v 'Test Files' | cut -c1-300 | head -80; }
 totals() { plain "$1" | grep -E "Test Files|Tests " | tail -2; }
-changed=$(git diff --name-only "$(git merge-base HEAD ${BASE_REF})" HEAD)
-others=$(printf '%s\n' "$changed" | grep . | grep -vE '${LIGHT_PATHS}')
-if [ "$GATE_FULL" != "1" ] && { [ "$GATE_LIGHT" = "1" ] || { [ -n "$changed" ] && [ -z "$others" ]; }; }; then
+${GATE_TIER_DECIDE}
+if is_light; then
   [ "$GATE_LIGHT" = "1" ] && [ -n "$others" ] && echo "GATE_TIER: light（rebase 只在追加型文件上冲突，分支已在开工时的 main 上跑过门槛）"
   extra=$(printf '%s\n' "$changed" | grep -E '^test/.+\.test\.tsx?$' | grep -v '^test/http/' | while read -r f; do [ -f "$f" ] && printf '%s ' "$f"; done)
   echo "GATE_TIER: light（只改了页面 / 组件 / 翻译表 / 测试 / 文档：跑 test/http 与 test/ 根目录单元测试，不跑 test/pipeline）"
@@ -260,6 +266,40 @@ npx vitest run $files > /tmp/gate-rerun.log 2>&1 || {
 }
 echo "GATE_FLAKY: 重跑通过。第一次的失败："; failures /tmp/gate-test.log; totals /tmp/gate-test.log
 `;
+
+// 完整测试同一时间只跑一个：两个沙箱同时跑时 CPU 和 PG 都被挤满，单个用例常要 30 多秒，各跑 75–90 分钟，
+// 还容易超时失败（2026-11-23 #1141、#1160、#1166/#1167）。精简门槛不排队，照常并行。
+// 排上队的完整测试独占一份连接预算，用 8 个 worker（约 300 个连接）；另一个沙箱的精简门槛或 agent 自己跑测试仍是 4 个
+// worker（约 150 个），所以宿主机 PG 要 max_connections ≥ 600（db_script/pg_setup.sh）。
+const FULL_GATE_WORKERS = "8";
+let fullGateQueue: Promise<unknown> = Promise.resolve();
+type ExecResult = { stdout: string; exitCode: number };
+const minutes = (ms: number) => (ms / 60_000).toFixed(1);
+
+/** 跑一次门槛：完整测试先排队；用时（和排队时间）打进日志，并追加在输出末尾一行 GATE_TIME（进 PR 的 Gate 一节）。 */
+async function runGate<R extends ExecResult>(
+  exec: (command: string) => Promise<R>,
+  issueId: string,
+  env: Record<string, string>,
+): Promise<R> {
+  const probe = await exec(`${envPrefix(env)} sh -c ${shellQuote(GATE_TIER_PROBE)}`);
+  const full = probe.stdout.trim().split("\n").at(-1) !== "light";
+  const queued = Date.now();
+  const go = async () => {
+    const waited = Date.now() - queued;
+    if (full && waited > 5_000) console.log(`  ⏳ #${issueId} 排队 ${minutes(waited)} 分钟后开始跑完整测试`);
+    const started = Date.now();
+    const gateEnv = full ? { ...env, CRM_TEST_WORKERS: FULL_GATE_WORKERS } : env;
+    const r = await exec(`${envPrefix(gateEnv)} sh -c ${shellQuote(GATE_SCRIPT)}`);
+    const took = `${full ? "完整" : "精简"}门槛用时 ${minutes(Date.now() - started)} 分钟${full && waited > 5_000 ? `（之前排队 ${minutes(waited)} 分钟）` : ""}`;
+    console.log(`  ⏱ #${issueId} ${took}，${r.exitCode === 0 ? "通过" : "失败"}`);
+    return { ...r, stdout: `${r.stdout}\nGATE_TIME: ${took}` };
+  };
+  if (!full) return go();
+  const run = fullGateQueue.then(go);
+  fullGateQueue = run.catch(() => {});
+  return run;
+}
 
 // 仓库用 pnpm（package.json 的 packageManager）。拷进来的 node_modules 是宿主机 darwin 的，
 // 缺 linux 原生包（rolldown、typescript-go），npm install 补不上，要用 pnpm 按锁文件重装。
@@ -753,7 +793,7 @@ function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
       return `#${existing}`;
     }
     const body = [
-      `${list} 在 ${seen}的完整测试里失败，单独重跑通过。沙箱里完整测试用 4 个 worker 并行（\`CRM_TEST_WORKERS=4\`），约 40 分钟。`,
+      `${list} 在 ${seen}的完整测试里失败，单独重跑通过。沙箱里门槛的完整测试用 8 个 worker 并行（\`CRM_TEST_WORKERS=8\`，同一时间只跑一个），agent 自己跑测试用 4 个。`,
       "", "## 第一次的失败", "", summary, "",
       "## 怎么修", "",
       "按诊断难 bug 的做法：先有一条能让它稳定变红的命令，再改。",
@@ -857,7 +897,7 @@ async function build(issue: Issue) {
     // 每 GATE_FULL_EVERY 张走精简门槛的票后，这张强制跑完整测试（计数在进程内，重启后从 0 算）。
     const forceFull = lightGatesSinceFull >= GATE_FULL_EVERY;
     const gateEnv = forceFull ? { ...env, GATE_FULL: "1" } : env;
-    const gate = () => sandbox.exec(`${envPrefix(gateEnv)} sh -c ${shellQuote(GATE_SCRIPT)}`);
+    const gate = () => runGate((c) => sandbox.exec(c), issue.id, gateEnv);
     let gateResult = await gate();
     if (gateTier(gateResult.stdout) === "light") lightGatesSinceFull++;
     else lightGatesSinceFull = 0;
@@ -974,7 +1014,7 @@ async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{
     const lightOk = appendOnlyConflict && (await sandbox.exec(MIGRATION_CHAIN_OK)).exitCode === 0;
     if (lightOk) console.log(`  ⚡ #${issue.id} 只在 ${conflictFiles.join("、")} 上冲突，rebase 后跑精简门槛`);
     const gateEnv = lightOk ? { ...env, GATE_LIGHT: "1" } : env;
-    const gate = await sandbox.exec(`${envPrefix(gateEnv)} sh -c ${shellQuote(GATE_SCRIPT)}`);
+    const gate = await runGate((c) => sandbox.exec(c), issue.id, gateEnv);
     if (gate.exitCode !== 0) {
       return { ok: false, reason: `rebase 后门槛失败：\n\n\`\`\`\n${gate.stdout.slice(-2000)}\n\`\`\`` };
     }
