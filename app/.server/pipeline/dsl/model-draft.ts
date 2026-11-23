@@ -48,26 +48,22 @@ const metricOutputLines = (source: string) => [
   `- ${source}支撑不了的写法不要写进 spec；unsupported 里的说法一律不进 spec。`,
 ];
 
-/** 指标起草（#1162）：输出形状与一句话解析相同（spec 加逐项说明、认不出的词与不支持的说法），由调用方收拢平铺输出后严格校验、带回说明 */
-const METRIC_DRAFT_SYSTEM = [
-  '你是 CRM 数据平台的指标助手：按成员的需求写一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（顶层是 spec、items、unknowns、unsupported 四个键，指标定义只放在 spec 里），不要输出别的文字。',
-  '成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按需求搜出的目录条目与需求原文。',
+/** 指标的 system 提示词（起草与一句话解析共用，#1162）：task 是角色说明里的任务，source 是来源词（「需求」或「句子」），其余逐字相同 */
+const metricSystem = (task: string, source: string) => [
+  `你是 CRM 数据平台的指标助手：${task}，只输出一个符合给定 JSON Schema 的 JSON 对象（顶层是 spec、items、unknowns、unsupported 四个键，指标定义只放在 spec 里），不要输出别的文字。`,
+  `成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按${source}搜出的目录条目与${source}原文。`,
   ...METRIC_RULES,
-  ...metricOutputLines('需求'),
+  ...metricOutputLines(source),
   '',
   METRIC_CAPABILITY,
 ].join('\n');
 
+/** 指标起草（#1162）：输出形状与一句话解析相同（spec 加逐项说明、认不出的词与不支持的说法），由调用方收拢平铺输出后严格校验、带回说明 */
+const METRIC_DRAFT_SYSTEM = metricSystem('按成员的需求写一个指标定义', '需求');
+
 /** 一句话解析（#516）：spec 是指标定义，另有逐项说明、认不出的词与不支持的说法；提示词要写出输出骨架——
  *  模型看不到 METRIC_PARSE_SCHEMA（callModel 只发 response_format: json_object），不写骨架时模型会照 YAML 示例把定义平铺到顶层（#959） */
-const METRIC_PARSE_SYSTEM = [
-  '你是 CRM 数据平台的指标助手：把成员的一句话解析成一个指标定义，只输出一个符合给定 JSON Schema 的 JSON 对象（顶层是 spec、items、unknowns、unsupported 四个键，指标定义只放在 spec 里），不要输出别的文字。',
-  '成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按句子搜出的目录条目与句子原文。',
-  ...METRIC_RULES,
-  ...metricOutputLines('句子'),
-  '',
-  METRIC_CAPABILITY,
-].join('\n');
+const METRIC_PARSE_SYSTEM = metricSystem('把成员的一句话解析成一个指标定义', '句子');
 
 const TAG_SYSTEM = [
   '你是 CRM 数据平台的标签助手：按成员的需求写一个标签定义，只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
