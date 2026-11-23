@@ -252,7 +252,7 @@ describe('模型服务页', () => {
     expect(await row()).toMatchObject({ fastModel: 'qwen-flash', fastChatExtra: '{"top_k": 20}', reasoningChatExtra: null });
     expect(await page()).toContain('{&quot;top_k&quot;: 20}</textarea>');
 
-    // 非法 JSON 与受保护键 400，错误显示在页面上，表单里是用户填的内容
+    // 非法 JSON 与受保护键 400，错误显示在页面上，库里的值不变（用户输入不丢靠表单 key 不变、不重挂载，HTTP 测不到，见浏览器验收）
     const bad = await save(admin, '', 'not json');
     expect(bad.status).toBe(400);
     const badPage = await bad.text();
