@@ -433,6 +433,8 @@ export function checkMetric(text: string, ctx: DslContext): DslCheck<MetricSpec>
     if (d.as_of !== undefined && d.as_of !== 'current') issue(['dimensions', i, 'as_of'], '暂不支持按时间点关联，as_of 只能写 current');
     const resolved = resolvePath(d.path, spec.base, ctx);
     if (typeof resolved === 'string') issue(['dimensions', i, 'path'], resolved);
+    // DSL 没有时间分桶：时间戳做维度每个时刻各成一组（#1166）；date 按天本身就是分组，放行
+    else if (resolved.type === 'timestamp') issue(['dimensions', i, 'path'], '时间字段不能直接做维度（DSL 没有时间分桶，每个时刻会各成一组）；要按时间范围统计请用 window');
   }
 
   return done(spec);
