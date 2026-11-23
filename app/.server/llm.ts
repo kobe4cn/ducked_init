@@ -389,12 +389,13 @@ export interface ToolReply { content: string | null; toolCalls: LlmToolCall[] }
 
 /**
  * 带工具调用模型（OpenAI 兼容的 tools + tool_choice: auto，不带 response_format：很多服务不接受两者同时出现），返回文本回复与要调用的工具。
+ * tools 为空数组时请求体里既不带 tools 也不带 tool_choice（空 tools 配 tool_choice 很多服务商直接 400；助手超限后的总结请求这样用，#1180）。
  * 不查库、不记日志；失败与 callModel 一样抛抹掉 Key 的 LlmError，既没有文本也没有工具调用时也算失败
  */
 export async function callTools(provider: LlmProvider, messages: LlmMessage[], tools: LlmTool[], stats: CallStats = { schemaValid: null }): Promise<ToolReply> {
   return masked(provider.apiKey, async () => {
     const message = await postChat(provider, {
-      messages, tools: tools.map(t => ({ type: 'function', function: t })), tool_choice: 'auto',
+      messages, ...(tools.length ? { tools: tools.map(t => ({ type: 'function', function: t })), tool_choice: 'auto' } : {}),
     }, stats);
     const raw = Array.isArray(message.tool_calls) ? message.tool_calls as { id?: unknown; function?: { name?: unknown; arguments?: unknown } }[] : [];
     const toolCalls = raw.flatMap(c => typeof c?.function?.name === 'string' ? [{

@@ -9,16 +9,17 @@
 // 它的摘要（不含 rationale 与步骤）拼在系统提示末尾，模型沿用它时不必重新检索；存草稿 / 填工作台前照旧对当前目录重新校验
 // 本轮 prefill_workbench 通过校验的 SQL（ToolCtx.workbenchSql）随答复返回；本轮最后一次 catalog_search 判为歧义的追问候选（ToolCtx.choices，⑥-3）也随答复返回；
 // 返回给前端的只有文字答复、用过的工具名、本轮的计划、这份 SQL 与歧义候选，不回传工具原文；
+// 工具调用次数到 MAX_TOOL_CALLS 时不带工具再请求一次，让模型总结本轮进展与下一步（#1180，失败时退回 LIMIT_REPLY）；本轮已有 valid 计划后 prefill_workbench 最多免计 2 次；
 // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮每次请求都用同一套端点与模型（chatToolsWith）、在 platform.llm_calls 记一条 assistant（route=reasoning），不存提示词与答复原文
 import type { CurrentMember } from '../auth';
 import { planRetrievedIds, type AnalysisPlan } from '../catalog/plan';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
-import { chatToolsWith, LlmError, resolveRoute, type LlmMessage } from '../llm';
+import { chatToolsWith, LlmError, resolveRoute, type LlmMessage, type LlmRoute } from '../llm';
 import { toolSupport } from '../model-provider';
 import type { ChoiceGroup } from './conversations';
 import { invokeTool, toolsFor, type ToolCtx, type ToolResult } from './tools';
 
-/** 每轮最多调用工具的次数，超出时结束本轮并告知成员；要给检索、展开、校验计划与保存草稿都留出次数 */
+/** 每轮最多调用工具的次数，用完时不带工具再请求一次、让模型总结进展与下一步（#1180）；要给检索、展开、校验计划与保存草稿都留出次数 */
 export const MAX_TOOL_CALLS = 12;
 /** 每轮交给模型的对话最多几条 */
 export const MAX_HISTORY = 40;
@@ -26,7 +27,14 @@ export const MAX_HISTORY = 40;
 export const MAX_CONTENT = 4000;
 /** 校验或保存不通过后，模型最多再修正的次数 */
 export const MAX_FIXES = 3;
-const LIMIT_REPLY = `本轮已调用 ${MAX_TOOL_CALLS} 次工具，达到上限，先结束本轮。可以把问题问得更具体一些再试。`;
+/** 本轮已有 valid 计划后，不计入 MAX_TOOL_CALLS 的 prefill_workbench 最多几次（#1180） */
+const MAX_FREE_PREFILLS = 2;
+/** 超限后的总结请求失败时的答复 */
+const LIMIT_REPLY = '本轮工具调用次数用完，已保存目前的进展；回复『继续』可以接着做';
+/** 超限后追加在消息末尾的 system 提示：总结进展与下一步，不编造 */
+const LIMIT_PROMPT = '本轮工具调用次数已用完，不能再调用工具。请用中文简短总结：这一轮查到了什么；计划是否已通过 validate_plan 校验；成员下一步该怎么说（例如「回复『填入工作台』」或「回复『继续』」）。不要编造没查到的结果，不要声称已执行查询或已填入工作台（除非 prefill_workbench 确实返回了已准备好）。';
+/** 超限时没执行的调用回填的 tool 消息：assistant 消息里的每个 tool_call 都要有对应回复，否则服务商拒绝下一次请求 */
+const SKIPPED = '未执行：本轮工具调用次数已用完';
 
 /** 交给成员的问题清单最多列几行、YAML 最多几个字（侧栏把答复截到 4000 字，代码块要能闭合） */
 const MAX_ISSUE_LINES = 20;
@@ -41,7 +49,7 @@ function unfixedReply({ issues, yaml }: NonNullable<ToolResult['rejected']>) {
 
 const TOOLS_UNSUPPORTED = '该模型服务不支持工具调用，AI 助手无法使用：请管理员到「模型服务」页换一个支持工具调用的模型';
 
-/** 五个 return 共用的展开：本轮校验过的计划、通过校验的 SQL 与最后一次搜索留下的歧义候选（⑥-3），没有的键不出现 */
+/** 各个 return 共用的展开：本轮校验过的计划、通过校验的 SQL 与最后一次搜索留下的歧义候选（⑥-3），没有的键不出现 */
 const extras = (ctx: ToolCtx) => ({
   ...(ctx.plan ? { plan: ctx.plan } : {}),
   ...(ctx.workbenchSql ? { workbenchSql: ctx.workbenchSql } : {}),
@@ -118,8 +126,23 @@ async function callTool(actor: CurrentMember, name: string, args: string, ctx: T
 }
 
 /**
+ * 工具调用次数用完（#1180）：在 messages 末尾追加 LIMIT_PROMPT，不带工具再请求一次，用模型的总结作答复；
+ * 请求出任何错（含既没有文本也没有工具调用）都退回 LIMIT_REPLY，不转 422：本轮的 plan / workbenchSql 要照常带回
+ */
+async function finishAtLimit(tenantId: string, route: LlmRoute, messages: LlmMessage[], toolsUsed: string[], ctx: ToolCtx) {
+  messages.push({ role: 'system', content: LIMIT_PROMPT });
+  let reply = LIMIT_REPLY;
+  try {
+    const response = await chatToolsWith(tenantId, 'assistant', route, messages, []);
+    if (response.content) reply = response.content;
+  } catch { /* 退回 LIMIT_REPLY */ }
+  return { reply, toolsUsed, ...extras(ctx) };
+}
+
+/**
  * 一轮问答：没配置模型服务 409；最近一次探测为不支持工具调用时 422（不发请求），模型服务出错 422；对话不合格 400。
- * 第 MAX_TOOL_CALLS 次工具调用之后模型还要调用工具时，结束本轮并告知。
+ * 第 MAX_TOOL_CALLS 次工具调用之后模型还要调用工具时，没执行的调用回填「未执行」，再不带工具请求一次、用模型对进展与下一步的总结作答复
+ * （#1180，这次请求失败时用 LIMIT_REPLY），plan / workbenchSql 照常返回；本轮 validate_plan 返回过 valid 后 prefill_workbench 最多免计 MAX_FREE_PREFILLS 次。
  * priorPlan 是对话里最近一份计划（ADR-0050）：不带进发给模型的历史，摘要拼在系统提示末尾、它的条目预先算作本轮已检索（#1179），
  * 并经 ToolCtx 给存草稿 / 填工作台前的重新校验兜底；
  * 返回的 plan 只来自本轮 validate_plan（不回传 priorPlan），workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（没有时都缺省）。
@@ -148,6 +171,10 @@ export async function assistantTurn(
   // 经助手的操作在审计里注明（只加在这里传给工具的 actor 上）
   const via: CurrentMember = { ...actor, via: 'assistant' };
   let failures = 0;
+  // 本轮 validate_plan 返回过 status: valid 之后（之后再校验失败也不撤回）prefill_workbench 免计，最多 MAX_FREE_PREFILLS 次；
+  // 不用 ctx.plan 判断：status 不是 valid 时 validate_plan 也会写它
+  let planValid = false;
+  let freePrefills = 0;
   for (;;) {
     let response;
     try {
@@ -157,16 +184,21 @@ export async function assistantTurn(
       throw e;
     }
     if (!response.toolCalls.length) return { reply: response.content!, toolsUsed, ...extras(ctx) };
-    if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...extras(ctx) };
-    // 一次给出的调用超出剩下的次数时只执行到上限就结束本轮
+    // 一次给出的调用超出剩下的次数时只执行到上限，其余回填「未执行」后请求总结
     messages.push({
       role: 'assistant', content: response.content ?? '',
       tool_calls: response.toolCalls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })),
     });
-    for (const c of response.toolCalls) {
-      if (toolsUsed.length === MAX_TOOL_CALLS) return { reply: LIMIT_REPLY, toolsUsed, ...extras(ctx) };
+    for (const [i, c] of response.toolCalls.entries()) {
+      const free = c.name === 'prefill_workbench' && planValid && freePrefills < MAX_FREE_PREFILLS;
+      if (!free && toolsUsed.length - freePrefills === MAX_TOOL_CALLS) {
+        for (const skipped of response.toolCalls.slice(i)) messages.push({ role: 'tool', tool_call_id: skipped.id, content: SKIPPED });
+        return finishAtLimit(tenantId, route, messages, toolsUsed, ctx);
+      }
+      if (free) freePrefills++;
       toolsUsed.push(c.name);
       const result = await callTool(via, c.name, c.arguments, ctx);
+      if (c.name === 'validate_plan' && result.text.startsWith('status: valid')) planValid = true;
       if (result.rejected && ++failures > MAX_FIXES) return { reply: unfixedReply(result.rejected), toolsUsed, ...extras(ctx) };
       // 保存成功后再起草下一份，重新计修正次数
       if (result.saved) failures = 0;

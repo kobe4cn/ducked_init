@@ -1,5 +1,5 @@
 // test/pipeline/assistant.test.ts —— AI 助手的一轮问答（ADR-0043）：assistantTurn → 注入的假 fetch（setLlmFetch）。模型的 tool_calls 按注册表调用工具、
-// 结果作为 role: tool 回填，直到模型给出文字答复；系统提示带当前页面；每轮最多 MAX_TOOL_CALLS 次工具调用；工具出错时把错误文本回填给模型；
+// 结果作为 role: tool 回填，直到模型给出文字答复；系统提示带当前页面；每轮最多 MAX_TOOL_CALLS 次工具调用，用完时不带工具请求一次总结（#1180）；工具出错时把错误文本回填给模型；
 // 没配置模型服务 409、模型服务出错 422、对话过长 400；platform.llm_calls 每次请求记一条 assistant。
 // 分析计划（ADR-0050）：同一轮的检索结果进同一个候选集合，validate_plan 只认这些条目，校验结果（status）回填给模型
 // 起草（ADR-0042、ADR-0043）：助手校验后保存指标 / 标签 / 映射草稿，作者是成员、审计带 via: 'assistant'，照常双人发布；不通过时最多再修正 MAX_FIXES 次
@@ -136,25 +136,62 @@ describe('AI 助手的一轮问答', () => {
     expect(system).not.toContain('prior_plan:');
   });
 
-  it(`连续要求调用工具时，第 ${MAX_TOOL_CALLS} 次之后结束本轮并告知`, async () => {
+  it(`连续要求调用工具超过 ${MAX_TOOL_CALLS} 次：不带工具再请求一次，用模型的总结作答复`, async () => {
     platformDefault();
     const acme = await newTenant('acme');
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
-    const { received } = fakeLlm(setLlmFetch, n => toolCalls({ name: 'catalog_overview', args: {}, id: `call_${n}` }, TOOL_USAGE));
+    const SUMMARY = '已查到客户相关分组，计划还没校验；回复「继续」接着做';
+    const { received } = fakeLlm(setLlmFetch, (n, body) => body.tools
+      ? toolCalls({ name: 'catalog_overview', args: {}, id: `call_${n}` }, TOOL_USAGE)
+      : text(SUMMARY, TEXT_USAGE));
 
     const turn = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
     expect(MAX_TOOL_CALLS).toBe(12);
-    expect(turn.toolsUsed).toHaveLength(MAX_TOOL_CALLS);
-    expect(turn.reply).toContain(`${MAX_TOOL_CALLS} 次`);
-    expect(received).toHaveLength(MAX_TOOL_CALLS + 1);
-    expect(await calls(acme)).toHaveLength(MAX_TOOL_CALLS + 1);
+    expect(turn).toEqual({ reply: SUMMARY, toolsUsed: Array(MAX_TOOL_CALLS).fill('catalog_overview') });
+    expect(received).toHaveLength(MAX_TOOL_CALLS + 2);
+    const last = received.at(-1)!.body;
+    expect(last).not.toHaveProperty('tools');
+    expect(last).not.toHaveProperty('tool_choice');
+    expect(last.messages.at(-1)!.role).toBe('system');
+    expect(last.messages.at(-1)!.content).toContain('不要编造');
+    // 最后一次要工具的 assistant 消息里的调用也有对应的 tool 消息（未执行）
+    const ids = last.messages.flatMap(m => (m as { tool_calls?: { id: string }[] }).tool_calls?.map(c => c.id) ?? []);
+    const answered = last.messages.filter(m => m.role === 'tool').map(m => m.tool_call_id);
+    expect(answered).toEqual(ids);
+    expect(last.messages.filter(m => m.role === 'tool').at(-1)!.content).toBe('未执行：本轮工具调用次数已用完');
+    const logged = await calls(acme);
+    expect(logged).toHaveLength(MAX_TOOL_CALLS + 2);
+    expect(logged.every(c => c.purpose === 'assistant' && c.error === null)).toBe(true);
 
-    // 一次给出 MAX_TOOL_CALLS + 1 个调用：执行满 MAX_TOOL_CALLS 个就结束本轮
-    const { received: batch } = fakeLlm(setLlmFetch, () => toolCalls(Array.from({ length: MAX_TOOL_CALLS + 1 }, (_, i) => ({ id: `b${i}`, name: 'catalog_overview', args: {} }))));
+    // 一次给出 MAX_TOOL_CALLS + 1 个调用：执行满 MAX_TOOL_CALLS 个，最后一个补「未执行」，再请求总结
+    const { received: batch } = fakeLlm(setLlmFetch, (_, body) => body.tools
+      ? toolCalls(Array.from({ length: MAX_TOOL_CALLS + 1 }, (_, i) => ({ id: `b${i}`, name: 'catalog_overview', args: {} })))
+      : text(SUMMARY, TEXT_USAGE));
     const batched = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
     expect(batched.toolsUsed).toHaveLength(MAX_TOOL_CALLS);
-    expect(batched.reply).toContain(`${MAX_TOOL_CALLS} 次`);
-    expect(batch).toHaveLength(1);
+    expect(batched.reply).toBe(SUMMARY);
+    expect(batch).toHaveLength(2);
+    const tools = batch[1].body.messages.filter(m => m.role === 'tool');
+    expect(tools.map(m => m.tool_call_id)).toEqual(Array.from({ length: MAX_TOOL_CALLS + 1 }, (_, i) => `b${i}`));
+    expect(tools.filter(m => m.content === '未执行：本轮工具调用次数已用完')).toHaveLength(1);
+    expect(tools.at(-1)!.content).toBe('未执行：本轮工具调用次数已用完');
+  });
+
+  it('超限后的总结请求失败：退回 LIMIT_REPLY，本轮进展照常返回，llm_calls 最后一条带 error', async () => {
+    platformDefault();
+    const acme = await newTenant('acme');
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    fakeLlm(setLlmFetch, (n, body) => body.tools
+      ? toolCalls({ name: 'catalog_overview', args: {}, id: `call_${n}` }, TOOL_USAGE)
+      : new Response('boom', { status: 500 }));
+
+    const turn = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
+    expect(turn.reply).toBe('本轮工具调用次数用完，已保存目前的进展；回复『继续』可以接着做');
+    expect(turn.toolsUsed).toHaveLength(MAX_TOOL_CALLS);
+    const logged = await calls(acme);
+    expect(logged).toHaveLength(MAX_TOOL_CALLS + 2);
+    // 只有不带工具的总结请求失败
+    expect(logged.filter(c => c.error)).toHaveLength(1);
   });
 
   it('没配置模型服务 409、不发请求；模型服务出错 422；对话过长或格式不对 400', async () => {
@@ -242,6 +279,40 @@ describe('计划随对话，存草稿 / 填工作台前重新校验（ADR-0050�
     });
     expect(turn.reply).toContain('```yaml\n' + BAD_METRIC + '```');
     expect(await getDb().select().from(dslVersions)).toHaveLength(before);
+  });
+
+  it(`计划 valid 后的 prefill_workbench 不占 ${MAX_TOOL_CALLS} 次的预算：第 ${MAX_TOOL_CALLS + 1} 次是 prefill 时照常执行并返回 workbenchSql`, async () => {
+    const { analyst, plan } = await draftQueryPlan();
+    const steps = [
+      toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }, TOOL_USAGE),
+      ...Array.from({ length: MAX_TOOL_CALLS - 2 }, () => toolCalls({ name: 'catalog_overview', args: {} }, TOOL_USAGE)),
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+      toolCalls({ name: 'prefill_workbench', args: { sql: CITY_COUNT } }, TOOL_USAGE),
+    ];
+    const { received } = fakeLlm(setLlmFetch, n => steps[n - 1] ?? text('已填入，去工作台执行', TEXT_USAGE));
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '按城市统计客户数，填进工作台' }], PAGE);
+    expect(turn.toolsUsed).toHaveLength(MAX_TOOL_CALLS + 1);
+    expect(turn.toolsUsed.at(-2)).toBe('validate_plan');
+    expect(turn.toolsUsed.at(-1)).toBe('prefill_workbench');
+    expect(turn).toMatchObject({ reply: '已填入，去工作台执行', plan, workbenchSql: CITY_COUNT });
+    expect(received.at(-1)!.body.tools).toBeDefined();
+  });
+
+  it('计划 valid 后免计的 prefill_workbench 最多 2 次，第 3 次起照常计次数', async () => {
+    const { analyst, plan } = await draftQueryPlan();
+    const steps = [
+      toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }, TOOL_USAGE),
+      ...Array.from({ length: MAX_TOOL_CALLS - 2 }, () => toolCalls({ name: 'catalog_overview', args: {} }, TOOL_USAGE)),
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+    ];
+    const { received } = fakeLlm(setLlmFetch, (n, body) => !body.tools
+      ? text('计划已通过校验；回复「填入工作台」', TEXT_USAGE)
+      : steps[n - 1] ?? toolCalls({ name: 'prefill_workbench', args: { sql: CITY_COUNT } }, TOOL_USAGE));
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '按城市统计客户数，填进工作台' }], PAGE);
+    expect(turn.toolsUsed).toHaveLength(MAX_TOOL_CALLS + 2);
+    expect(turn.toolsUsed.slice(-2)).toEqual(['prefill_workbench', 'prefill_workbench']);
+    expect(turn).toMatchObject({ reply: '计划已通过校验；回复「填入工作台」', plan, workbenchSql: CITY_COUNT });
+    expect(received.at(-1)!.body).not.toHaveProperty('tools');
   });
 
   it('两次请求之间发布了新版本指标（依赖变了）：拒绝保存、不写 dsl_versions，答复说明原因并提示重新检索', async () => {
