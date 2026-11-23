@@ -959,8 +959,8 @@ const MIGRATION_CHAIN_OK = migrationChainOk("HEAD");
 
 /**
  * 把分支 rebase 到最新的 origin/main：没冲突直接 rebase；有冲突开一次 agent 会话按
- * rebase-prompt.md 解决。然后重跑门槛，通过才 force-push；merge 为 true 时再合并一次，
- * 为 false 时只更新 PR（留给人审的 PR 不和 main 冲突）。
+ * rebase-prompt.md 解决。merge 为 true 时重跑门槛，通过才 force-push 再合并；
+ * 为 false 时只跑 typecheck 就 force-push 更新 PR（留给人审的 PR 不和 main 冲突，测试由人合并前决定是否补跑）。
  * 任何一步不成都返回原因，由调用方留 PR。
  */
 type HostGap = { release: () => void; reacquire: () => Promise<void> };
@@ -1021,6 +1021,22 @@ async function rebaseAndMerge(issue: Issue, pr: string, host: HostGap, merge = t
       }
     }
 
+    // 留给人审的 PR（merge 为 false）只跑 typecheck、不重跑测试：人合并前看 PR 评论里的冲突文件，
+    // 需要时再补跑门槛。省掉一遍完整测试，也不占完整门槛的队列。
+    if (!merge) {
+      const tc = await sandbox.exec("npm run typecheck > /tmp/rebase-typecheck.log 2>&1 || { tail -40 /tmp/rebase-typecheck.log; exit 1; }");
+      if (tc.exitCode !== 0) {
+        return { ok: false, reason: `rebase 后 typecheck 失败：\n\n\`\`\`\n${tc.stdout.slice(-2000)}\n\`\`\`` };
+      }
+      await host.reacquire();
+      await gitRemoteOrThrow(["push", "--force-with-lease", REMOTE, issue.branch]);
+      const files = conflictFiles.length ? conflictFiles.map((f) => `\`${f}\``).join("、") : "（没有文本冲突，迁移链分叉）";
+      const how = conflicted || chainBroken ? "冲突由 agent 处理" : "rebase 没有冲突";
+      console.log(`  ↻ #${issue.id} rebase 后 typecheck 通过，不重跑测试，留给人审`);
+      sh("gh", ["pr", "comment", pr, "--body", `Sandcastle 把分支 rebase 到最新的 ${BASE_REF}（原来和它冲突，${how}；冲突文件：${files}）。rebase 后只跑了 typecheck（通过），**没有重跑测试**：PR 正文 Gate 里的测试结果是 rebase 之前的，合并前请判断是否要补跑。`]);
+      return { ok: true };
+    }
+
     const lightOk = appendOnlyConflict && (await sandbox.exec(MIGRATION_CHAIN_OK)).exitCode === 0;
     if (lightOk) console.log(`  ⚡ #${issue.id} 只在 ${conflictFiles.join("、")} 上冲突，rebase 后跑精简门槛`);
     const gateEnv = lightOk ? { ...env, GATE_LIGHT: "1" } : env;
@@ -1031,10 +1047,6 @@ async function rebaseAndMerge(issue: Issue, pr: string, host: HostGap, merge = t
 
     await host.reacquire();
     await gitRemoteOrThrow(["push", "--force-with-lease", REMOTE, issue.branch]);
-    if (!merge) {
-      sh("gh", ["pr", "comment", pr, "--body", `Sandcastle 把分支 rebase 到最新的 ${BASE_REF}（原来和它冲突），门槛重跑通过。`]);
-      return { ok: true };
-    }
     // GitHub 重新计算可合并状态要一点时间。
     let last = "";
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -1125,7 +1137,7 @@ async function rebaseIfConflicting(issue: Issue, pr: string, host: HostGap): Pro
   console.log(`  ↻ #${issue.id} 和最新的 ${BASE_REF} 冲突，rebase 后再留给人审`);
   const r = await untilAfterLimit(`rebase #${issue.id}`, () => rebaseAndMerge(issue, pr, host, false));
   return r.ok
-    ? `\n\n分支和最新的 ${BASE_REF} 冲突，已 rebase 并重跑门槛通过。`
+    ? `\n\n分支和最新的 ${BASE_REF} 冲突，已 rebase，只重跑了 typecheck（通过），没有重跑测试。`
     : `\n\n⚠️ 分支和最新的 ${BASE_REF} 冲突，自动 rebase 没成：${r.reason}`;
 }
 
