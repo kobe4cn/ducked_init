@@ -2,6 +2,7 @@
 // 测试连通性与工具调用探测（假 fetch 经 app.setLlmFetch 注入，结果看页面与 platform.llm_calls），恢复平台默认后 resolveProvider 回到环境变量；
 // 开关发送脱敏样本（默认关、记审计）；embedding 三项（ADR-0049）自成一张卡，与 chat 互不影响（不动 chat 配置与探测结果）；
 // fast / reasoning 档位（ADR-0055 路由③a）一张卡：只填模型名时沿用租户端点与 Key，没有自己的模型服务 400，恢复只清该档三列；非管理员 403；
+// 服务商参数（#1170）：chat 与档位表单的 chatExtra 存原文、回显，不带该字段不动已存值，非法 JSON / 平台字段 400，恢复默认后清空；
 // 向量存储（ADR-0058，#848）一张卡：选系统自带还是外部 pgvector，连接串加密不回显（假替身经 app.setPgvectorConnect 注入，不连真实地址），
 // 保存时先测连通失败不保存，审计只记 from / to / urlRotated，切回系统自带时已存的连接串保留
 import { and, eq } from 'drizzle-orm';
@@ -26,14 +27,15 @@ const NEW_EKEY = 'sk-embed-rotated-5678';
 const TKEY = 'sk-tier-fast-1234';
 const NEW_TKEY = 'sk-tier-rotated-5678';
 
-const save = (admin: Client, apiKey = KEY) =>
-  admin.post('/model-provider', { intent: 'save', baseUrl: 'https://tenant.example.com/v1/', model: 'deepseek-chat', apiKey });
+/** chatExtra 不传就不放进表单（后端「不传不动列」） */
+const save = (admin: Client, apiKey = KEY, chatExtra?: string) =>
+  admin.post('/model-provider', { intent: 'save', baseUrl: 'https://tenant.example.com/v1/', model: 'deepseek-chat', apiKey, ...(chatExtra === undefined ? {} : { chatExtra }) });
 
 const saveEmbedding = (admin: Client, apiKey = EKEY, baseUrl = 'https://embed-tenant.example.com/v1/') =>
   admin.post('/model-provider', { intent: 'embedding_save', embeddingBaseUrl: baseUrl, embeddingModel: 'bge-m3', embeddingApiKey: apiKey });
 
-const tierSave = (admin: Client, tier: 'fast' | 'reasoning', model: string, baseUrl = '', apiKey = '') =>
-  admin.post('/model-provider', { intent: 'tier_save', tier, model, baseUrl, apiKey });
+const tierSave = (admin: Client, tier: 'fast' | 'reasoning', model: string, baseUrl = '', apiKey = '', chatExtra?: string) =>
+  admin.post('/model-provider', { intent: 'tier_save', tier, model, baseUrl, apiKey, ...(chatExtra === undefined ? {} : { chatExtra }) });
 
 const tierReset = (admin: Client, tier: 'fast' | 'reasoning') => admin.post('/model-provider', { intent: 'tier_reset', tier });
 
@@ -225,6 +227,49 @@ describe('模型服务页', () => {
     const audit = await (await admin.get('/audit')).text();
     expect(audit).toContain('reasoning 档 沿用默认端点，模型 qwen-max');
     expect(audit).toContain('fast 档 https://fast.example.com/v1，模型 qwen-flash');
+  });
+
+  it('服务商参数（#1170）：chat 与档位卡片保存后入库并回显，不带该字段的保存不动它；非法 JSON 与平台字段 400 且报错显示在页面上；恢复默认后清空', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    const EXTRA = '{"enable_thinking": false}';
+    // React 转义 textarea 里的引号；placeholder 也是同一个示例，所以按 textarea 的内容（后跟闭合标签）断言
+    const ESCAPED = '{&quot;enable_thinking&quot;: false}</textarea>';
+    const row = async () => (await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme)))[0];
+    const page = async () => (await admin.get('/model-provider')).text();
+    expect(await page()).toContain('服务商参数（可选）');
+
+    await save(admin);
+    expect((await save(admin, '', EXTRA)).status).toBe(302);
+    expect((await row()).chatExtra).toBe(EXTRA);
+    expect(await page()).toContain(ESCAPED);
+    // 不带 chatExtra 字段的保存不清掉已存的值
+    expect((await save(admin, '')).status).toBe(302);
+    expect((await row()).chatExtra).toBe(EXTRA);
+
+    // 档位只填模型名加服务商参数能保存
+    expect((await tierSave(admin, 'fast', 'qwen-flash', '', '', '{"top_k": 20}')).status).toBe(302);
+    expect(await row()).toMatchObject({ fastModel: 'qwen-flash', fastChatExtra: '{"top_k": 20}', reasoningChatExtra: null });
+    expect(await page()).toContain('{&quot;top_k&quot;: 20}</textarea>');
+
+    // 非法 JSON 与受保护键 400，错误显示在页面上，表单里是用户填的内容
+    const bad = await save(admin, '', 'not json');
+    expect(bad.status).toBe(400);
+    const badPage = await bad.text();
+    expect(badPage).toContain('服务商参数须是 JSON 对象');
+    const protectedKey = await tierSave(admin, 'reasoning', 'qwen-max', '', '', '{"model": "x"}');
+    expect(protectedKey.status).toBe(400);
+    expect(await protectedKey.text()).toContain('服务商参数不能包含平台字段');
+    expect((await row()).chatExtra).toBe(EXTRA);
+
+    // 恢复默认之后清空
+    expect((await tierReset(admin, 'fast')).status).toBe(302);
+    expect((await row()).fastChatExtra).toBeNull();
+    expect((await admin.post('/model-provider', { intent: 'reset' })).status).toBe(302);
+    expect((await row()).chatExtra).toBeNull();
+    const after = await page();
+    expect(after).not.toContain(ESCAPED);
+    expect(after).not.toContain('{&quot;top_k&quot;: 20}</textarea>');
   });
 
   it('保存档位不清探测结果、不改 chat 与 embedding；恢复档位只清该档三列：另一档、chat 与 embedding 的配置、工具调用探测结果都不动；本来没绑定时不记审计；chat 的恢复不动档位列', async () => {

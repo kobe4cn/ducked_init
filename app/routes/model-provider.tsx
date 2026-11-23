@@ -1,6 +1,6 @@
 // app/routes/model-provider.tsx —— 模型服务（仅管理员）：看当前用平台默认还是本租户配置；保存端点、模型名与 API Key（Key 不回显，留空沿用）、
 // 恢复平台默认、测试连通性（同时显示是否支持工具调用）、开关发送脱敏样本；embedding 端点（ADR-0049）单独一张卡，与 chat 互不影响；
-// fast / reasoning 档位（ADR-0055 路由③a）再一张卡，按用途换模型，端点留空沿用本租户的端点与 Key；
+// fast / reasoning 档位（ADR-0055 路由③a）再一张卡，按用途换模型，端点留空沿用本租户的端点与 Key；chat 与两档各有可选的服务商参数（#1170，JSON 对象，如关思考）；
 // 向量存储（ADR-0058，#848）一张卡：选系统自带还是外部 pgvector，连接串加密不回显，保存时先测连通失败不保存
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleAlert } from 'lucide-react';
@@ -40,6 +40,8 @@ export async function action({ request }: Route.ActionArgs) {
   const member = await requirePermission(request, 'model_provider:manage');
   const form = await request.formData();
   const field = (name: string) => String(form.get(name) ?? '');
+  // 服务商参数：表单没带这个字段时传 undefined，后端不动已存的值（只有带了且为空才清掉）
+  const chatExtraField = () => (form.has('chatExtra') ? field('chatExtra') : undefined);
   // 档位表单带的 tier 字段，取值不是 fast / reasoning 时按不合法输入返回 400
   const tierField = () => {
     const tier = field('tier');
@@ -48,12 +50,12 @@ export async function action({ request }: Route.ActionArgs) {
   try {
     switch (field('intent')) {
       case 'save':
-        await saveModelProvider(member, { baseUrl: field('baseUrl'), model: field('model'), apiKey: field('apiKey') });
+        await saveModelProvider(member, { baseUrl: field('baseUrl'), model: field('model'), apiKey: field('apiKey'), chatExtra: chatExtraField() });
         break;
       case 'tier_save': {
         const tier = tierField();
         if (!tier) return data({ error: formatServer(await getLocale(request), msg('档位须是 fast 或 reasoning')) }, { status: 400 });
-        await saveTierProvider(member, tier, { baseUrl: field('baseUrl'), model: field('model'), apiKey: field('apiKey') });
+        await saveTierProvider(member, tier, { baseUrl: field('baseUrl'), model: field('model'), apiKey: field('apiKey'), chatExtra: chatExtraField() });
         break;
       }
       case 'tier_reset': {
@@ -149,10 +151,26 @@ const tierLabel = (t: T, tier: 'fast' | 'reasoning') => ({
   reasoning: { title: t('推理档（reasoning）'), hint: t('AI 助手、起草映射、指标、标签这类要推理的用途') },
 })[tier];
 
+/** 服务商参数（#1170）：可选的 JSON 对象，随每次 chat 请求带给服务商（如关思考）。示例含花括号，放 placeholder 而不进 t()（ICU 会当成变量） */
+function ChatExtraField({ id, defaultValue, children }: { id: string; defaultValue: string | null; children: React.ReactNode }) {
+  const t = useT();
+  return (
+    <Field>
+      <FieldLabel htmlFor={id}>{t('服务商参数（可选）')}</FieldLabel>
+      <textarea
+        id={id} name="chatExtra" rows={3} defaultValue={defaultValue ?? ''}
+        placeholder='{"enable_thinking": false}'
+        className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+      />
+      <p className="text-sm text-slate-400">{children}</p>
+    </Field>
+  );
+}
+
 /** 「按用途选模型」卡片里的一档：当前绑定 + 换模型的表单。chatReady 是本租户的模型服务（chat 三项）是否已保存，没有时档位无从生效 */
 function TierSection({ tier, state, chatReady, submitting }: {
   tier: 'fast' | 'reasoning';
-  state: { model: string | null; baseUrl: string | null; apiKeySet: boolean };
+  state: { model: string | null; baseUrl: string | null; apiKeySet: boolean; chatExtra: string | null };
   chatReady: boolean;
   submitting: boolean;
 }) {
@@ -185,7 +203,7 @@ function TierSection({ tier, state, chatReady, submitting }: {
         )}
       </div>
       {/* 输入框是非受控的：保存 / 恢复默认后 loader 给的是新值，但已挂载的输入框不会跟着 defaultValue 刷新。key 只用已保存值拼，值一变表单重挂载显示新值；提交失败（400）时这些值不变，用户改到一半的内容不会丢 */}
-      <Form method="post" key={`${state.model ?? ''}|${state.baseUrl ?? ''}|${state.apiKeySet}`}>
+      <Form method="post" key={`${state.model ?? ''}|${state.baseUrl ?? ''}|${state.apiKeySet}|${state.chatExtra ?? ''}`}>
         <input type="hidden" name="intent" value="tier_save" />
         <input type="hidden" name="tier" value={tier} />
         <FieldGroup>
@@ -193,6 +211,9 @@ function TierSection({ tier, state, chatReady, submitting }: {
             <FieldLabel htmlFor={`${tier}-model`}>{t('模型名')}</FieldLabel>
             <Input id={`${tier}-model`} name="model" required defaultValue={state.model ?? ''} placeholder={t('如：qwen-max')} />
           </Field>
+          <ChatExtraField id={`${tier}-chat-extra`} defaultValue={state.chatExtra}>
+            {t('不填时沿用本租户默认的那份；model、messages 等平台字段写了也不生效。')}
+          </ChatExtraField>
           <Field>
             <FieldLabel htmlFor={`${tier}-base-url`}>{t('端点')}</FieldLabel>
             <Input id={`${tier}-base-url`} name="baseUrl" defaultValue={state.baseUrl ?? ''} placeholder={t('留空沿用本租户的端点与 Key')} />
@@ -324,7 +345,7 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
       <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">
         <SectionHeader title={t('本租户的模型服务')}>{t('API Key 加密保存，保存后不再显示。')}</SectionHeader>
         {/* 同档位表单：非受控输入框不跟着新 defaultValue 刷新，恢复平台默认后靠 key 重挂载回服务端新值 */}
-        <Form method="post" key={`${provider.baseUrl ?? ''}|${provider.model ?? ''}|${provider.apiKeySet}`}>
+        <Form method="post" key={`${provider.baseUrl ?? ''}|${provider.model ?? ''}|${provider.apiKeySet}|${provider.chatExtra ?? ''}`}>
           <input type="hidden" name="intent" value="save" />
           <FieldGroup>
             <Field>
@@ -336,6 +357,9 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
               <FieldLabel htmlFor="model-name">{t('模型名')}</FieldLabel>
               <Input id="model-name" name="model" required defaultValue={provider.model ?? ''} placeholder={t('如：gpt-4o-mini')} />
             </Field>
+            <ChatExtraField id="model-chat-extra" defaultValue={provider.chatExtra}>
+              {t('model、messages 等平台字段写了也不生效。')}
+            </ChatExtraField>
             <Field>
               <FieldLabel htmlFor="model-api-key">API Key</FieldLabel>
               <Input
