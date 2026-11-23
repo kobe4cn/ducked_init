@@ -46,7 +46,7 @@ import {
   AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, usageTable,
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
-import { blockersOf, changedFiles, flakyTickets, splitChildren } from "./guide.ts";
+import { APPEND_ONLY, blockersOf, changedFiles, flakyTickets, splitChildren } from "./guide.ts";
 import { acceptanceSection, checkAcceptanceNotes, replaceSection, restSections } from "./pr-body.ts";
 
 // ---------------------------------------------------------------------------
@@ -219,6 +219,8 @@ const envPrefix = (env: Record<string, string>) =>
 // 只跑 test/http 和 test/ 根目录的单元测试（加上改到的测试文件），不跑占全量约 3/4 时间的 test/pipeline：
 // 这些文件只被页面渲染用到，pipeline 测试和服务端都不引用它们。改到其他任何文件仍跑完整测试。
 // 环境变量 GATE_FULL=1 强制完整测试：每 GATE_FULL_EVERY 张走精简门槛的票后跑一次，兜住漏网的问题。
+// 环境变量 GATE_LIGHT=1 强制精简门槛：落地前的 rebase 只在追加型文件（翻译表、索引、棘轮基线）上冲突时用，
+// 分支代码在开工时的 main 上已过一次门槛，rebase 没动代码逻辑，不必再跑一小时完整测试（2026-11-23）。
 // 输出第一行是 GATE_TIER: full|light，脚本据此计数、写进 PR。
 const GATE_RERUN_MAX = 3;
 const GATE_FULL_EVERY = 4;
@@ -231,7 +233,8 @@ failures() { plain "$1" | sed -n '/Failed \(Tests\|Suites\)/,/Test Files/p' | gr
 totals() { plain "$1" | grep -E "Test Files|Tests " | tail -2; }
 changed=$(git diff --name-only "$(git merge-base HEAD ${BASE_REF})" HEAD)
 others=$(printf '%s\n' "$changed" | grep . | grep -vE '${LIGHT_PATHS}')
-if [ "$GATE_FULL" != "1" ] && [ -n "$changed" ] && [ -z "$others" ]; then
+if [ "$GATE_FULL" != "1" ] && { [ "$GATE_LIGHT" = "1" ] || { [ -n "$changed" ] && [ -z "$others" ]; }; }; then
+  [ "$GATE_LIGHT" = "1" ] && [ -n "$others" ] && echo "GATE_TIER: light（rebase 只在追加型文件上冲突，分支已在开工时的 main 上跑过门槛）"
   extra=$(printf '%s\n' "$changed" | grep -E '^test/.+\.test\.tsx?$' | grep -v '^test/http/' | while read -r f; do [ -f "$f" ] && printf '%s ' "$f"; done)
   echo "GATE_TIER: light（只改了页面 / 组件 / 翻译表 / 测试 / 文档：跑 test/http 与 test/ 根目录单元测试，不跑 test/pipeline）"
   testcmd="npx vitest run test/http $(ls test/*.test.ts test/*.test.tsx 2>/dev/null | tr '\n' ' ') $extra"
@@ -924,6 +927,11 @@ async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{
       return { ok: false, reason: `分支已经包含最新的 ${BASE_REF}，失败不是冲突造成的，需要人看。` };
     }
 
+    // 冲突只在追加型文件（翻译表、索引、棘轮基线）上：rebase 后跑精简门槛（见 GATE_SCRIPT 的 GATE_LIGHT）
+    // merge-tree 有冲突时退出码 1、冲突文件列在 stdout 第一行（树 id）之后；`; true` 让 trySh 拿到 stdout
+    const probe = trySh("sh", ["-c", `git merge-tree --write-tree --name-only ${BASE_REF} ${issue.branch}; true`]);
+    const conflictFiles = probe.ok ? probe.out.split("\n\n")[0]!.split("\n").slice(1).filter(Boolean) : [];
+    const appendOnlyConflict = conflictFiles.length > 0 && conflictFiles.every((f) => APPEND_ONLY.has(f));
     const rebase = await sandbox.exec(`git rebase ${BASE_REF}`);
     const conflicted = rebase.exitCode !== 0;
     const chainBroken = !conflicted && (await sandbox.exec(MIGRATION_CHAIN_OK)).exitCode !== 0;
@@ -955,7 +963,10 @@ async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{
       }
     }
 
-    const gate = await sandbox.exec(`${envPrefix(env)} sh -c ${shellQuote(GATE_SCRIPT)}`);
+    const lightOk = appendOnlyConflict && (await sandbox.exec(MIGRATION_CHAIN_OK)).exitCode === 0;
+    if (lightOk) console.log(`  ⚡ #${issue.id} 只在 ${conflictFiles.join("、")} 上冲突，rebase 后跑精简门槛`);
+    const gateEnv = lightOk ? { ...env, GATE_LIGHT: "1" } : env;
+    const gate = await sandbox.exec(`${envPrefix(gateEnv)} sh -c ${shellQuote(GATE_SCRIPT)}`);
     if (gate.exitCode !== 0) {
       return { ok: false, reason: `rebase 后门槛失败：\n\n\`\`\`\n${gate.stdout.slice(-2000)}\n\`\`\`` };
     }

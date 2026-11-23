@@ -45,6 +45,7 @@ reviewer 的结论有三种：`merge`、`revise`、`pr`（规则在 `.sandcastle
 1. reviewer 给出 `<verdict>merge</verdict>`：验收标准都实现且有测试、没有要人判断的问题、没改页面（改了页面留 PR 附截图，见「浏览器验收」）、没动 ADR / 权限 / 敏感字段处理、没改弱已有测试（规则在 `.sandcastle/review-prompt.md`）。
 2. 门槛通过：脚本在沙箱里自己跑 `npm run typecheck` 与完整测试（沙箱里 4 个 worker，约 40 分钟）。
    - 分级门槛：分支相对 `origin/main` 只改了页面（`app/routes/`）、组件（`app/components/`）、翻译表（`app/i18n/en.*.json`）、测试文件、`test/i18n-ratchet-baseline.json` 和文档时，只跑 `test/http`、`test/` 根目录的单元测试和改到的测试文件，不跑占全量约 3/4 时间的 `test/pipeline`（这些文件只被页面渲染用到，服务端和 pipeline 测试不引用）。改到其他任何文件（`app/.server/`、`app/lib/`、迁移、依赖、配置、测试夹具等）仍跑完整测试。判断规则在 `.sandcastle/main.ts` 的 `LIGHT_PATHS`。
+   - 落地前的 rebase 只在追加型文件（`APPEND_ONLY`：翻译表、索引、棘轮基线）上冲突、迁移链也没分叉时，rebase 后一律跑精简门槛（`GATE_LIGHT=1`），哪怕分支改了服务端代码：分支在开工时的 main 上已过一次门槛，rebase 没动代码逻辑。
    - 兜底：每 4 张（`GATE_FULL_EVERY`）走精简门槛的票之后，下一张强制跑完整测试（`GATE_FULL=1`），漏网的问题在这里暴露。计数在进程内，重启后从 0 算。门槛输出第一行 `GATE_TIER: light|full`，PR 的 **Gate** 一节写明跑的是精简门槛还是完整测试。rebase 补救后重跑的门槛按同样规则分级，不计数。
    - 完整测试失败、且失败的文件不超过 3 个时，先把这几个文件单独重跑一次：重跑通过算通过，PR 的 **Gate** 一节标出「偶发失败」和第一次的失败摘要。脚本还会给每个偶发失败的文件开一张票，标题是 `偶发失败：<文件>`，带 `flaky`、`Sandcastle`、`ready-for-agent` 标签，正文附失败摘要、复现方法和验收标准；下次调度会自动 prep 并修：prep 先查同样的报错是否已被别的提交修掉，修掉了就只核实、不改代码；没修掉要给出修复前变红、修复后变绿的复现（跨沙箱竞争写并发用例），重复单跑总共不超过 20 分钟。已经有同名的 open 票时，就在那张票上追加一次出现记录。票号会评论到 PR 上。重跑仍失败、或失败文件更多，才算门槛失败。
    - 门槛失败时让 implementer 用新会话修一次，再跑一次门槛。
