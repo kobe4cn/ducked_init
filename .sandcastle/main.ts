@@ -53,6 +53,9 @@ import { acceptanceSection, checkAcceptanceNotes, replaceSection, restSections }
 // Configuration
 // ---------------------------------------------------------------------------
 
+// agent 多久没输出算卡死：库默认 600 秒。门槛失败后的 fix 会话要在后台重跑一批慢测试（单个文件就要 5 分钟以上，
+// 两个沙箱同时跑时更慢），等通知期间没有输出，10 分钟就被判卡死、票打 stuck（2026-11-23 #1141、#1160）。
+const AGENT_IDLE_TIMEOUT_S = 40 * 60;
 const POLL_INTERVAL_MS = 10 * 60_000; // 有空位时隔多久重新调度一次（整理 → prep → plan），看有没有新开得了工的票
 const MAX_ITERATIONS = 12; // 连续空转（没有票在做、也开不出新票）多少次就结束运行：12 × 10 分钟，等人审 PR 最多等约 2 小时
 const MAX_PARALLEL = 2; // 同时实现的票数：受 PG max_connections（每个沙箱 4 个 worker 约 150 个连接，2 个要 300）与机器负载限制；3 个门槛同时跑完整测试会大面积超时（2026-11-07）
@@ -799,6 +802,7 @@ async function build(issue: Issue) {
       const r = await run("implement", `implement-${issue.id}-${session}`, (agent) => sandbox.run({
         name: `implement-${issue.id}-${session}`,
         maxIterations: 1,
+        idleTimeoutSeconds: AGENT_IDLE_TIMEOUT_S,
         completionSignal: [COMPLETE, NEEDS_DECISION],
         agent,
         promptFile: "./.sandcastle/implement-prompt.md",
@@ -818,6 +822,7 @@ async function build(issue: Issue) {
       run("review", `review-${issue.id}-${round}`, (agent) => sandbox.run({
         name: `review-${issue.id}-${round}`,
         maxIterations: 1,
+        idleTimeoutSeconds: AGENT_IDLE_TIMEOUT_S,
         agent,
         promptFile: "./.sandcastle/review-prompt.md",
         promptArgs: { TASK_ID: issue.id, BRANCH: issue.branch, ROUND: round, REVISE_MAX },
@@ -831,6 +836,7 @@ async function build(issue: Issue) {
       const revise = await run("revise", name, (agent) => sandbox.run({
         name,
         maxIterations: 1,
+        idleTimeoutSeconds: AGENT_IDLE_TIMEOUT_S,
         agent,
         prompt: [
           `分支 ${issue.branch}（issue #${issue.id}：${issue.title}）的 review 打回了，修改意见如下。`,
@@ -861,6 +867,7 @@ async function build(issue: Issue) {
       fix = await run("fix", `fix-${issue.id}`, (agent) => sandbox.run({
         name: `fix-${issue.id}`,
         maxIterations: 1,
+        idleTimeoutSeconds: AGENT_IDLE_TIMEOUT_S,
         agent,
         prompt: [
           `分支 ${issue.branch}（issue #${issue.id}）在合并门槛上失败，摘要如下；完整日志在 /tmp/gate-typecheck.log、/tmp/gate-test.log 与重跑的 /tmp/gate-rerun.log（用 grep 看，不要整读）。测试失败的文件不超过 ${GATE_RERUN_MAX} 个时已经单独重跑过一次，仍失败才到你这里。`,
@@ -940,6 +947,7 @@ async function rebaseAndMerge(issue: Issue, pr: string, merge = true): Promise<{
       await runAgent("rebase", issue.id, `rebase-${issue.id}`, env, [], (agent) => sandbox.run({
         name: `rebase-${issue.id}`,
         maxIterations: 1,
+        idleTimeoutSeconds: AGENT_IDLE_TIMEOUT_S,
         agent,
         promptFile: "./.sandcastle/rebase-prompt.md",
         promptArgs: {
@@ -1342,6 +1350,7 @@ async function schedule(): Promise<ScheduleResult> {
         sandbox: podman(),
         name: `prep-${issue.number}`,
         maxIterations: 1,
+        idleTimeoutSeconds: AGENT_IDLE_TIMEOUT_S,
         agent,
         promptFile: "./.sandcastle/prep-prompt.md",
         promptArgs: {
