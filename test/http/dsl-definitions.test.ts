@@ -11,8 +11,7 @@
 // 指标新建页默认是条件构建器（?mode=builder|yaml）：「检查」只编译给出摘要与编译出的 SQL、不保存（YAML 模式也能检查），
 // 不合法按行列 400（行列号指向生成的 YAML，一并显示；fieldsFor 里没有的字段服务端兜底拦下），保存得到与手写 YAML 一样的草稿；
 // 词表外的聚合也回显进构建器（下拉多一个当前值选项、标出「不支持」）；时间窗口天数 0 / 负数按 window.days 400（客户端不再静默丢掉窗口）；
-// 构建器模式还有一句话解析（intent=parse，#517）：解析结果填进构建器（隐藏字段 form 回显）并逐项说明、未知项与不支持的说法（固定原因说明）、
-// 构建器装不下的维度名显式提示；已有内容时先列差异（intent=applyParse 确认后才覆盖、parsed 不信客户端），失败（422 / 409）表单保持原内容
+// 构建器不接模型（#1164）：intent=parse / applyParse 按未知操作 400、不调模型、不落库
 // 构建器与 YAML 的切换带上内容（intent=to-yaml / to-builder(-confirmed)，#797，切换改成本页表单的 POST、应答的 mode 覆盖 URL）：
 // YAML → 构建器把表单回显进隐藏字段（有构建器表达不了的维度 / 只读项先列出、确认后才切，YAML 不合法 400 不切换），构建器 → YAML 给 formToYaml
 // 的结果（空构建器给示例），切换都不落库；种类切换仍是链接，有未保存内容时客户端先确认（app/lib/unsaved-changes.ts，纯函数另测）
@@ -734,7 +733,7 @@ describe('用模型生成指标草稿', () => {
     expect(page).toMatch(/<textarea[^>]*name="request"/);
     expect(page).toMatch(/<button[^>]*formNoValidate=""[^>]*value="model-draft"|<button[^>]*value="model-draft"[^>]*formNoValidate=""/);
 
-    // 模型答复沿用一句话解析的输出形状（#1162）：spec 加 items / unknowns / unsupported；编辑框是示例，直接填入（#1163）
+    // 模型答复带逐项说明（#1162）：spec 加 items / unknowns / unsupported；编辑框是示例，直接填入（#1163）
     modelReplies({ spec: { base: 'order', measure: { agg: 'sum', field: 'amount' }, filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'created_at', days: 30 } }, items: [], unknowns: [], unsupported: [] });
     const generated = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request, yaml: editorYaml(page) });
     expect(generated.status).toBe(200);
@@ -879,161 +878,25 @@ describe('用模型生成指标草稿', () => {
     const viewer = await loginAs(app, 'viewer@acme.com');
     expect((await viewer.post('/analytics/definitions/new', { intent: 'model-draft', kind: 'metric', request: '订单数', yaml: REVENUE })).status).toBe(403);
   });
-});
-
-/** 构建器隐藏字段 form 里回显的表单 JSON */
-const builderFormOfHtml = (html: string) => JSON.parse(
-  html.match(/<input[^>]*name="form"[^>]*value="([^"]*)"/)![1]!.replace(/&quot;/g, '"').replace(/&amp;/g, '&'),
-);
-
-/** 一句话解析应答里隐藏字段 parsed 的 JSON（确认覆盖时原样提交回去） */
-const parsedOfHtml = (html: string) => html.match(/<input[^>]*name="parsed"[^>]*value="([^"]*)"/)![1]!.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-
-/** 模型对一句话的解析答复：spec（MetricSpec）加逐项说明、未知项与不支持的说法（形状照 test/pipeline/metric-parse.test.ts 的 MODEL_PARSE） */
-const PARSE_REPLY = {
-  spec: {
-    base: 'order',
-    measure: { agg: 'sum', field: 'amount' },
-    filter: [{ field: 'status', op: 'eq', value: 'paid' }],
-    window: { field: 'created_at', days: 30 },
-    // 两种维度：单段路径的进表单 dimensions，多跳的进 readonly（key = dimensions.N），构建器都装不下
-    dimensions: [{ name: 'city', path: 'order.customer_id -> customer.city' }, { name: 'channel', path: 'order.channel' }],
-  },
-  items: [
-    { path: 'measure.field', reason: '金额合计用 order.amount' },
-    { path: 'filter.0', reason: '成功订单是 status 等于 paid' },
-    { path: 'window', reason: '近 30 天按下单时间 created_at' },
-  ],
-  unknowns: ['不扣退款'],
-  unsupported: ['「按付款时间」取数'],
-};
-
-describe('一句话解析', () => {
-  it('分析师输入一句话：空构建器直接填入，逐项说明、未知项、不支持的说法与原因、没填入的维度一并显示；不写 dsl_versions', async () => {
+  it('构建器的一句话解析已删除（#1164）：intent=parse / applyParse 按未知操作 400、不调模型、不写 dsl_versions；构建器页不再有一句话框', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'analyst@acme.com', 'analyst');
     const analyst = await loginAs(app, 'analyst@acme.com');
-    const sentence = '近 30 天成功订单的消费金额，不扣退款';
+    platformDefault();
+    const { f } = fakeLlm(g => app.setLlmFetch(g), () => json({ spec: { base: 'order', measure: { agg: 'count' } }, items: [], unknowns: [], unsupported: [] }));
 
-    // 一句话框与「解析一句话」在构建器模式，和隐藏字段 form 在同一个表单（一起提交才能算差异）
     const page = await (await analyst.get('/analytics/definitions/new?kind=metric')).text();
-    expect(page).toMatch(/<textarea[^>]*name="sentence"/);
-    expect(page).toMatch(/<button[^>]*formNoValidate=""[^>]*value="parse"|<button[^>]*value="parse"[^>]*formNoValidate=""/);
+    expect(page).not.toMatch(/name="sentence"/);
+    expect(page).not.toContain('value="parse"');
+    expect(page).not.toContain('解析一句话');
 
-    modelReplies(PARSE_REPLY);
-    const parsed = await analyst.post('/analytics/definitions/new?kind=metric', { intent: 'parse', kind: 'metric', key: '', sentence });
-    expect(parsed.status).toBe(200);
-    const html = await parsed.text();
-    // 回显的 form（构建器隐藏字段）是解析结果
-    expect(builderFormOfHtml(html)).toMatchObject({
-      base: 'order', agg: 'sum', field: 'amount',
-      filter: [{ field: 'status', op: 'eq', value: 'paid' }],
-      window: { field: 'created_at', days: 30 },
-    });
-    // 逐项说明（位置转中文）、未知项、不支持的说法与固定原因说明
-    expect(html).toContain('data-parse-items');
-    expect(html).toContain('计算什么：金额合计用 order.amount');
-    expect(html).toContain('条件第 1 行：成功订单是 status 等于 paid');
-    expect(html).toContain('时间窗口：近 30 天按下单时间 created_at');
-    expect(html).toContain('data-parse-unknowns');
-    expect(html).toContain('不扣退款');
-    expect(html).toContain('data-parse-unsupported');
-    expect(html).toContain('「按付款时间」取数');
-    expect(html).toContain('为什么不能做');
-    expect(html).toContain('「或」只能是同一个字段的多个取值');
-    // 构建器没有维度控件：两种维度的名字都显式提示没填入（单段路径的在前），句子回显
-    expect(html).toContain('data-parse-dropped');
-    expect(html).toContain('以下维度构建器不支持，没有填入：channel、city');
-    expect(html).toContain(sentence);
-    // 构建器是空的：没有差异、没有确认覆盖
-    expect(html).not.toContain('data-parse-diff');
-    expect(html).not.toContain('value="applyParse"');
-    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
-  });
-
-  it('一句话里的词挂两个同别名指标时：解析照常填入构建器，解析面板上方出现「这些词有多种理解」与指向业务知识页的候选链接', async () => {
-    const { acme } = await publishedIdentitySources({ orders: true });
-    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
-    const reviewer = await memberOf(acme, 'de@acme.com', 'data_engineer');
-    // 两个窗口时间字段不同的指标挂同一个别名「营收」：检索判出歧义（与 YAML 模式的起草同一个判定，#827 / #853）
-    const windowed = (field: string) => `base: order\nmeasure: { agg: sum, field: amount }\nwindow: { field: ${field}, days: 30 }\n`;
-    for (const [key, field] of [['revenue_365d', 'created_at'], ['gmv_365d', 'paid_at']] as const) {
-      await createDefinition(analyst, 'metric', key, windowed(field));
-      await publishDefinition(reviewer, 'metric', key, 1);
-      await addAlias(analyst, { targetId: `metric:${key}`, alias: '营收' });
+    const current = JSON.stringify({ base: 'order', agg: 'count', filter: [], dimensions: [], readonly: [] });
+    for (const intent of ['parse', 'applyParse']) {
+      const res = await analyst.post('/analytics/definitions/new?kind=metric', { intent, kind: 'metric', key: 'order_count', sentence: '订单数', form: current, parsed: current });
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain('未知操作');
     }
-
-    modelReplies(PARSE_REPLY);
-    const res = await (await loginAs(app, 'analyst@acme.com'))
-      .post('/analytics/definitions/new?kind=metric', { intent: 'parse', kind: 'metric', key: '', sentence: '营收' });
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    // 解析照常填入构建器（逐项说明照常），面板上方出现歧义提示：词、两个候选链接与说明
-    expect(builderFormOfHtml(html)).toMatchObject({ base: 'order', agg: 'sum', field: 'amount' });
-    expect(html).toContain('data-parse-items');
-    expect(html).toMatch(/data-ambiguity[^>]*>.*?这些词有多种理解/s);
-    expect(html).toMatch(/<a[^>]*href="\/knowledge\?item=metric%3Arevenue_365d"[^>]*>revenue_365d<\/a>/);
-    expect(html).toMatch(/<a[^>]*href="\/knowledge\?item=metric%3Agmv_365d"[^>]*>gmv_365d<\/a>/);
-    expect(html).toContain('请确认解析结果是否是你要的口径，或改写这句话');
-  });
-
-  it('构建器已有不同内容时先列差异、表单不变，确认覆盖（applyParse）后才换成解析结果；parsed 读不出来 400', async () => {
-    const acme = await newTenant('acme');
-    await memberOf(acme, 'analyst@acme.com', 'analyst');
-    const analyst = await loginAs(app, 'analyst@acme.com');
-    const current = JSON.stringify({ base: 'order', agg: 'count', filter: [], dimensions: [], readonly: [] });
-
-    modelReplies(PARSE_REPLY);
-    const parsed = await analyst.post('/analytics/definitions/new?kind=metric', { intent: 'parse', kind: 'metric', key: '', sentence: '近 30 天成功订单的消费金额', form: current });
-    expect(parsed.status).toBe(200);
-    const html = await parsed.text();
-    // 表单还是当前内容（行数），差异列出会被替换的句子（原来 → 解析后）
-    expect(builderFormOfHtml(html)).toMatchObject({ base: 'order', agg: 'count' });
-    expect(builderFormOfHtml(html)).not.toHaveProperty('field');
-    expect(html).toContain('data-parse-diff');
-    expect(html).toContain('计算行数。 → 计算实付金额求和。');
-    expect(html).toContain('不排除任何记录。 → 只算 订单状态 等于 paid 的记录。');
-    expect(html).toContain('不限时间。 → 近 30 天，按下单时间。');
-    expect(html).toMatch(/<input[^>]*name="parsed"/);
-    expect(html).toMatch(/<button[^>]*formNoValidate=""[^>]*value="applyParse"|<button[^>]*value="applyParse"[^>]*formNoValidate=""/);
-
-    // 把应答里的 parsed 原样提交，确认覆盖后 form 才变成解析结果（不再有差异与确认按钮）
-    const applied = await analyst.post('/analytics/definitions/new?kind=metric', { intent: 'applyParse', kind: 'metric', key: '', form: current, parsed: parsedOfHtml(html) });
-    expect(applied.status).toBe(200);
-    const appliedHtml = await applied.text();
-    expect(builderFormOfHtml(appliedHtml)).toMatchObject({ base: 'order', agg: 'sum', field: 'amount', window: { field: 'created_at', days: 30 } });
-    expect(appliedHtml).not.toContain('data-parse-diff');
-    expect(appliedHtml).not.toContain('value="applyParse"');
-
-    // 不信客户端：parsed 读不出来（不是那一份 JSON）按 400，不落库
-    const bad = await analyst.post('/analytics/definitions/new?kind=metric', { intent: 'applyParse', kind: 'metric', key: '', form: current, parsed: '不是 JSON' });
-    expect(bad.status).toBe(400);
-    expect(await bad.text()).toContain('解析结果读不出来');
-    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
-  });
-
-  it('模型答复不过校验时 422、未配置模型服务时 409，构建器都保持原内容', async () => {
-    const acme = await newTenant('acme');
-    await memberOf(acme, 'analyst@acme.com', 'analyst');
-    const analyst = await loginAs(app, 'analyst@acme.com');
-    const current = JSON.stringify({ base: 'order', agg: 'count', filter: [], dimensions: [], readonly: [] });
-
-    modelReplies({ ...PARSE_REPLY, spec: { base: 'order', measure: { agg: 'sum', field: 'channel' } } });
-    const bad = await analyst.post('/analytics/definitions/new?kind=metric', { intent: 'parse', kind: 'metric', key: '', sentence: '近 30 天成功订单的消费金额', form: current });
-    expect(bad.status).toBe(422);
-    const badHtml = await bad.text();
-    expect(badHtml).toContain('解析出的指标定义有');
-    expect(builderFormOfHtml(badHtml)).toMatchObject({ base: 'order', agg: 'count' });
-    expect(badHtml).not.toContain('data-parse-items');
-
-    vi.stubEnv('LLM_BASE_URL', '');
-    vi.stubEnv('LLM_MODEL', '');
-    vi.stubEnv('LLM_API_KEY', '');
-    const none = await analyst.post('/analytics/definitions/new?kind=metric', { intent: 'parse', kind: 'metric', key: '', sentence: '近 30 天成功订单的消费金额', form: current });
-    expect(none.status).toBe(409);
-    const noneHtml = await none.text();
-    expect(noneHtml).toContain('未配置模型服务');
-    expect(builderFormOfHtml(noneHtml)).toMatchObject({ base: 'order', agg: 'count' });
+    expect(f).not.toHaveBeenCalled();
     expect(await getDb().select().from(dslVersions)).toHaveLength(0);
   });
 });

@@ -8,10 +8,9 @@
 // YAML 里有构建器表达不了的项（维度、只读项）时先逐项列出、确认（to-builder-confirmed）后才切，YAML 读不出来 400 不切换、编辑框保持原内容；空构建器切 YAML 给示例。
 // 种类切换仍是链接（内容带不过去），有还没保存的内容时客户端先确认（app/lib/unsaved-changes.ts：快照比基线，页面上有 action 回显一律算未保存）。
 // 可以写下需求后用模型生成草稿（intent=model-draft，ADR-0035，只在 YAML 模式）：生成的 YAML 填进编辑框、不保存，失败时编辑框保持原内容；
-// 指标草稿在编辑框上方逐项说明（#1163，与一句话解析同一个面板），编辑框已有内容（不是空也不是示例）时先给只读草稿，
-// 点「确认覆盖」（intent=applyDraft，草稿重新 checkMetric、不信客户端）才替换；标签草稿仍直接填入
-// 指标的构建器模式还能写一句话解析（intent=parse，#517）：parseMetricSentence 把句子解析成表单填进构建器并逐项说明，
-// 已有内容时先列出差异（intent=applyParse 确认后才覆盖），解析失败时表单保持原样
+// 指标草稿在编辑框上方逐项说明（#1163），编辑框已有内容（不是空也不是示例）时先给只读草稿，
+// 点「确认覆盖」（intent=applyDraft，草稿重新 checkMetric、不信客户端）才替换；标签草稿仍直接填入。
+// 构建器不接模型（#1164，ADR-0035）：AI 起草只走 YAML 模式；不认识的 intent（包括已删除的 parse / applyParse）按未知操作 400
 import { useEffect, useRef } from 'react';
 import { data, Form, Link, redirect, useNavigation } from 'react-router';
 import type { Route } from './+types/analytics.definitions.new';
@@ -20,9 +19,8 @@ import { requirePermission } from '~/.server/access';
 import type { DraftAmbiguity as DraftAmbiguityInfo } from '~/.server/catalog/draft-search';
 import { publishedCustomEntities } from '~/.server/custom-entities';
 import { createDefinition, type DraftExplanation, DslError, dslContext, modelDraftForDefinition } from '~/.server/dsl-definitions';
-import { errorTextFor } from '~/.server/i18n';
+import { errorTextFor, formatServer } from '~/.server/i18n';
 import { getLocale } from '~/.server/locale';
-import { MetricParseError, parseMetricSentence } from '~/.server/metric-parse';
 import { DSL_KINDS, isDslKind, type DslKind } from '~/.server/pipeline/dsl';
 import { checkMetric, compileMetric, type DslIssue, fieldsFor } from '~/.server/pipeline/dsl/metric-spec';
 import { metricOf } from '~/.server/pipeline/dsl/tag-spec';
@@ -31,9 +29,9 @@ import { todayUtc } from '~/.server/templates';
 import { CANONICAL_ENTITIES, entityOf, type FieldType } from '~/lib/canonical-model';
 import { cmp } from '~/lib/compare';
 import { formToYaml as tagFormToYaml, yamlToForm as tagYamlToForm, type TagForm } from '~/lib/tag-form';
-import { diffForms, formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
+import { formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
 import { hasUnsavedChanges, snapshotOf } from '~/lib/unsaved-changes';
-import { makeT, msgText, useT } from '~/lib/i18n';
+import { makeT, msg, msgText, useT } from '~/lib/i18n';
 import enClient from '~/i18n/en.client.json';
 import { TAG_CONDITIONS, type TagCondition } from '~/lib/tag-vocab';
 import { navFor } from '~/.server/nav';
@@ -247,6 +245,9 @@ export async function loader({ request }: Route.LoaderArgs) {
   };
 }
 
+/** action 认得的 intent；不带 intent 按保存 */
+const KNOWN_INTENTS = new Set(['save', 'check', 'model-draft', 'applyDraft', 'to-yaml', 'to-builder', 'to-builder-confirmed']);
+
 export async function action({ request }: Route.ActionArgs) {
   const member = await requirePermission(request, 'definitions:draft');
   const form = await request.formData();
@@ -255,8 +256,6 @@ export async function action({ request }: Route.ActionArgs) {
   const yamlInput = String(form.get('yaml') ?? '');
   const requirement = String(form.get('request') ?? '');
   const intent = form.get('intent');
-  /** 一句话解析的句子（构建器模式的「一句话」框；YAML 模式的需求框是 request，两边各回显各的） */
-  const sentence = String(form.get('sentence') ?? '');
   /** 构建器模式：隐藏字段 form 是 MetricForm（指标）或 TagForm（标签）的 JSON（YAML 模式不提交它） */
   const builder = (kind === 'metric' || kind === 'tag') && form.has('form') ? String(form.get('form')) : undefined;
   /** 回显给构建器的是服务端规整过的表单（builderFormOf 逐层规整、丢掉读不出来的条件行），不原样回传客户端的内容，读不出来才不回显；
@@ -264,16 +263,16 @@ export async function action({ request }: Route.ActionArgs) {
   const echo = kind !== 'metric' || builder === undefined ? undefined : (() => { try { return JSON.stringify(builderFormOf(builder)); } catch { return undefined; } })();
   /** 标签构建器的回显同样是服务端规整过的表单（tagFormOf 只在 JSON 读不出时不回显） */
   const tagEcho = kind !== 'tag' || builder === undefined ? undefined : (() => { try { return JSON.stringify(tagFormOf(builder)); } catch { return undefined; } })();
-  /** 各分支共有的回显；echoId 每次提交都变——回显字符串相同时（只多了一条空条件行被丢掉）也换 key 重挂载构建器，控件跟着回显走；parse / parsed / diff 只在 intent=parse 的应答里有，dropped 只在 to-builder 的应答里有，这里占位让组件能统一读 */
+  /** 各分支共有的回显；echoId 每次提交都变——回显字符串相同时（只多了一条空条件行被丢掉）也换 key 重挂载构建器，控件跟着回显走；dropped 只在 to-builder 的应答里有，这里占位让组件能统一读 */
   // 编辑模式默认跟页面当前显示的走：隐藏字段 mode（切换是本页表单的 POST、不改 URL，URL 会停在旧模式上），没带时按 URL（与 loader 同一套读法）；
-  // 不能按「有没有提交 form 字段」猜——空构建器解析一句话（intent=parse）也不提交它，却要留在构建器；只有模式切换的分支在应答里覆盖（to-yaml / to-builder-confirmed）
+  // 不按「有没有提交 form 字段」猜；只有模式切换的分支在应答里覆盖（to-yaml / to-builder-confirmed）
   const urlMode = new URL(request.url).searchParams.get('mode') === 'yaml' ? 'yaml' as const : 'builder' as const;
   const modeInput = form.get('mode');
   const currentMode = modeInput === 'yaml' || modeInput === 'builder' ? modeInput : urlMode;
   const keep = {
-    key, request: requirement, generated: false, form: echo, tagForm: tagEcho, echoId: crypto.randomUUID(), sentence,
-    parse: undefined, parsed: undefined, diff: undefined, dropped: undefined as DroppedItem[] | undefined,
-    /** model-draft / parse 检索判出的歧义（#827、#853）：词与候选，草稿 / 解析照常生成、在上方提示成员确认；其余分支占位让组件统一读 */
+    key, request: requirement, generated: false, form: echo, tagForm: tagEcho, echoId: crypto.randomUUID(),
+    dropped: undefined as DroppedItem[] | undefined,
+    /** model-draft 检索判出的歧义（#827、#853）：词与候选，草稿照常生成、在上方提示成员确认；其余分支占位让组件统一读 */
     ambiguity: undefined as DraftAmbiguityInfo | undefined,
     /** 指标 model-draft 的逐项说明与待确认的草稿（编辑框已有内容时才有 draft，#1163）；其余分支占位 */
     explanation: null as DraftExplanation | null,
@@ -287,6 +286,10 @@ export async function action({ request }: Route.ActionArgs) {
   // 界面语言：指标摘要 / 差异 / 切构建器时丢弃项的原因与读不出来的报错按它出文字（英文界面查客户端词典，与页面展示同一份，ADR-0060）
   const locale = await getLocale(request);
   const t = makeT(locale, locale === 'en' ? enClient : null);
+  // 白名单：不认识的 intent（包括已删除的构建器一句话解析 parse / applyParse，#1164）按未知操作 400，不能落到下面的保存；不带 intent 按保存
+  if (intent !== null && !KNOWN_INTENTS.has(String(intent))) {
+    return data({ error: formatServer(locale, msg('未知操作')), issues: [] as DslIssue[], yaml, summary: null, sql: null, ...keep }, { status: 400 });
+  }
   try {
     // 模式切换（YAML ↔ 构建器）：提交本页表单，服务端把内容转换后带到目标模式（#797）。字段表只在服务端取（ADR-0005），不信客户端
     if ((kind === 'metric' || kind === 'tag') && intent === 'to-yaml') {
@@ -348,43 +351,6 @@ export async function action({ request }: Route.ActionArgs) {
       if (!result.ok) return invalidMetric(result.issues);
       return { error: null, issues: [], yaml: draft, summary: null, sql: null, ...keep, generated: true };
     }
-    if (kind === 'metric' && intent === 'parse') {
-      const parsed = await parseMetricSentence(member, sentence);
-      // 解析出的表单先 JSON.stringify 再过 builderFormOf 规整（构建器不收 dimensions / readonly），再回显（词表外的聚合也回显，构建器下拉标出「不支持」）
-      const normalized = builderFormOf(JSON.stringify(parsed.form));
-      const shown = JSON.stringify(normalized);
-      const parse = {
-        items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported,
-        // 构建器没有维度控件，builderFormOf 把 dimensions / readonly 都清空了：维度的名字显式提示，不能悄悄丢
-        // （单段路径的维度在 form.dimensions，多跳或 as_of 的在 readonly 里、key 是 dimensions.N、raw 是原维度对象）
-        dropped: [
-          ...parsed.form.dimensions.map(d => d.name),
-          ...parsed.form.readonly.flatMap(r => {
-            const raw = /^dimensions\.\d+$/.test(r.key) && r.raw && typeof r.raw === 'object' && !Array.isArray(r.raw) ? (r.raw as { name?: unknown }).name : undefined;
-            return typeof raw === 'string' ? [raw] : [];
-          }),
-        ],
-      };
-      // 当前构建器有内容（选了基础实体）才比差异；摘要的中文名按解析结果的基础实体取（换实体时旧字段名对不上就显示字段名）
-      let current: MetricForm | undefined;
-      if (builder !== undefined) { try { current = builderFormOf(builder); } catch { current = undefined; } }
-      const diff = current === undefined ? [] : diffForms(
-        t, current, normalized,
-        labelledFields(normalized.base, fieldsFor(normalized.base, await dslContext(getDb(), member.tenant.id)) ?? []),
-      );
-      // 构建器是空的或解析结果与当前内容一样：直接填入；否则先列出差异等成员确认（form 仍是当前内容）；
-      // 句子有歧义时照常解析，歧义提示带回页面（要写在 ...keep 的 ambiguity 占位之后）
-      return diff.length === 0
-        ? { error: null, issues: [], yaml, summary: null, sql: null, ...keep, form: shown, parse, ambiguity: parsed.ambiguity }
-        : { error: null, issues: [], yaml, summary: null, sql: null, ...keep, parsed: shown, diff, parse, ambiguity: parsed.ambiguity };
-    }
-    if (kind === 'metric' && intent === 'applyParse') {
-      // 确认覆盖：读隐藏字段 parsed（parse 应答里那份 JSON），同样不信客户端，过一遍规整再回显
-      let shown: string | undefined;
-      try { shown = JSON.stringify(builderFormOf(String(form.get('parsed') ?? ''))); } catch { /* 按读不出来处理 */ }
-      if (shown === undefined) throw new DslError('解析结果读不出来，请重新点「解析一句话」');
-      return { error: null, issues: [], yaml, summary: null, sql: null, ...keep, form: shown };
-    }
     if (kind === 'metric' && (intent === 'check' || builder !== undefined)) {
       const ctx = await dslContext(getDb(), member.tenant.id);
       const formState = builder !== undefined ? builderFormOf(builder) : yamlToForm(yaml, []);
@@ -403,8 +369,7 @@ export async function action({ request }: Route.ActionArgs) {
     if (kind === 'tag' && builder !== undefined) yaml = tagFormToYaml(tagFormOf(builder));
     await createDefinition(member, kind, key, yaml);
   } catch (e) {
-    // MetricParseError（空句 / 超长 400、未配置模型服务 409、模型失败或不过校验 422）不是 DslError，不补会变成 500；表单保持原样
-    if (e instanceof DslError || e instanceof MetricParseError) return data({ error: await errorTextFor(request, e), issues: e.issues ?? [], yaml, summary: null, sql: null, ...keep }, { status: e.status });
+    if (e instanceof DslError) return data({ error: await errorTextFor(request, e), issues: e.issues ?? [], yaml, summary: null, sql: null, ...keep }, { status: e.status });
     throw e;
   }
   throw redirect(`/analytics/definitions/${kind}/${key}`);
@@ -474,33 +439,6 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
             </Field>
             {builder ? (
               <>
-                {kind === 'metric' && (
-                  <Field>
-                    <FieldLabel htmlFor="sentence">一句话</FieldLabel>
-                    <textarea
-                      id="sentence" name="sentence" rows={2} defaultValue={actionData?.sentence ?? ''}
-                      placeholder={request}
-                      className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                    />
-                    <FieldDescription>写下要算什么，点「解析一句话」：会把这句话与{sends}发给模型服务，解析结果填进下面的构建器并逐项说明，不会保存；构建器已有内容时先列出差异，确认后才覆盖。</FieldDescription>
-                    <div>
-                      <Button type="submit" name="intent" value="parse" variant="outline" formNoValidate disabled={submitting}>解析一句话</Button>
-                    </div>
-                  </Field>
-                )}
-                {/* 句子有歧义时照常解析：解析面板上方提示成员确认或改写（与 YAML 模式起草同一个组件） */}
-                {kind === 'metric' && actionData?.parse && actionData.ambiguity && (
-                  <DraftAmbiguity ambiguity={actionData.ambiguity} hint="请确认解析结果是否是你要的口径，或改写这句话；常用的理解可以在助手里选定后设为默认口径。" />
-                )}
-                {kind === 'metric' && actionData?.parse && <MetricParsePanel parse={actionData.parse} diff={actionData.diff} />}
-                {kind === 'metric' && actionData?.parsed && (
-                  <div className="flex items-center gap-2">
-                    {/* parse 应答里那份解析结果 JSON，确认覆盖时原样提交（服务端仍会规整，不信客户端） */}
-                    <input type="hidden" name="parsed" value={actionData.parsed} />
-                    <Button type="submit" name="intent" value="applyParse" variant="outline" formNoValidate disabled={submitting}>确认覆盖</Button>
-                    <span className="text-sm text-slate-500">把构建器当前内容换成解析出的表单。</span>
-                  </div>
-                )}
                 {/* 构建器的 useState 只在挂载时初始化：key 用每次提交新生成的 echoId，回显字符串相同（只多了一条空条件行被丢掉）也重挂载，控件跟着回显走 */}
                 {kind === 'metric'
                   ? <MetricBuilder key={actionData?.echoId ?? 'blank'} entities={entities ?? []} defaultForm={formOfEcho(actionData?.form)} />
