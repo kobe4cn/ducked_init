@@ -505,7 +505,9 @@ async function cleanupClosedIssues() {
  * 被 blocker 挡住的票不占文件，不会连带挡住编号大的票。
  * running 是正在 build / 落地的票：不再选，它们改的文件和等人审的票一样先占上；最多补满 slots 张。
  */
-function plan(running: ReadonlySet<string>, slots: number): Issue[] {
+function plan(running: ReadonlySet<string>, slots: number, quiet = false): Issue[] {
+  const log = quiet ? () => {} : console.log;
+  const warn = quiet ? () => {} : console.warn;
   const candidates = listIssues([LABEL.picked, LABEL.prepped], [LABEL.prOpen, LABEL.stuck]);
   // 等人审的 PR 还没合进 main：它们改的文件先占上，免得新票在旧 main 上改同一个文件，两个 PR 互相冲突。
   const waiting = listIssues([LABEL.picked, LABEL.prOpen]);
@@ -522,19 +524,19 @@ function plan(running: ReadonlySet<string>, slots: number): Issue[] {
   for (const issue of candidates.filter((c) => allowed(c.number) && !running.has(String(c.number))).sort((a, b) => a.number - b.number)) {
     const open = openBlockers(issue.body);
     if (open.length > 0) {
-      console.log(`  跳过 #${issue.number}：blocker ${open.map((n) => `#${n}`).join("、")} 还没关`);
+      log(`  跳过 #${issue.number}：blocker ${open.map((n) => `#${n}`).join("、")} 还没关`);
       continue;
     }
     const { files, fallback } = changedFiles(issue.body);
-    if (fallback) console.warn(`  ⚠ #${issue.number} 的指引里没认出 Change 行，按指引引用的文件处理：${files.join("、")}`);
-    else if (files.length === 0) console.warn(`  ⚠ #${issue.number} 的指引里没认出要改的文件，按不改已有文件处理`);
+    if (fallback) warn(`  ⚠ #${issue.number} 的指引里没认出 Change 行，按指引引用的文件处理：${files.join("、")}`);
+    else if (files.length === 0) warn(`  ⚠ #${issue.number} 的指引里没认出要改的文件，按不改已有文件处理`);
     const clash = files.find((f) => taken.has(f));
     if (clash) {
       const owner = taken.get(clash)!;
       const why = awaitingReview.has(owner)
         ? `等人审的 #${owner}（PR 合入或关闭后再做）`
         : running.has(String(owner)) ? `正在做的 #${owner}` : `#${owner}`;
-      console.log(`  跳过 #${issue.number}：和${why}都改 ${clash}`);
+      log(`  跳过 #${issue.number}：和${why}都改 ${clash}`);
       continue;
     }
     if (picked.length >= slots) break;
@@ -1309,7 +1311,14 @@ async function schedule(): Promise<ScheduleResult> {
     .filter((issue) => allowed(issue.number))
     .sort((a, b) => a.number - b.number);
   let prepLimitedUntil: number | undefined;
+  const slots = MAX_PARALLEL - running.size;
   for (const issue of toPrep) {
+    // 已有够填满空位的可开工票就先开工，剩下的票等下次调度（有票做完或轮询）再 prep。
+    // 否则一下子建了二十多张票时，要把它们逐张 prep 完（每张几分钟）才开工，空位空等一两个小时（2026-11-23）。
+    if (slots > 0 && plan(new Set(running.keys()), slots, true).length >= slots) {
+      console.log(`  已有 ${slots} 张可开工的票，先开工；其余票下次调度再 prep`);
+      break;
+    }
     const open = openBlockers(issue.body);
     if (open.length > 0) {
       console.log(`  跳过 prep #${issue.number}：blocker ${open.map((n) => `#${n}`).join("、")} 还没关`);
