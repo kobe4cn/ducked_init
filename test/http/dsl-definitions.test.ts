@@ -7,6 +7,7 @@
 // 数据工程师点「重新计算」按生效版本以今天入队（连同下游标签，来源 manual），定义页显示最近一次刷新的时间与来源，分析页快照列表显示来源；
 // 最近一次计算因断言失败且比最新快照新时，定义页显示红色失败提示（#839）：断言名与不合格行数人人可看，不合格的键、来源映射与「查看样本」链接只给有 sources:read 的角色，再算成功提示消失；还没有快照时（发布后第一次计算就失败）不说「继续使用上一版」；
 // 新建页写需求「用模型生成草稿」填进编辑框、不保存，不过校验时 422 保持原内容，未配置模型服务时 400，查看者 403；标签同样能生成，没有可引用的已发布指标时 400；
+// 指标草稿在编辑框上方逐项说明，编辑框已有内容时先给只读草稿、确认覆盖（applyDraft，重新 checkMetric）后才替换（#1163）；
 // 指标新建页默认是条件构建器（?mode=builder|yaml）：「检查」只编译给出摘要与编译出的 SQL、不保存（YAML 模式也能检查），
 // 不合法按行列 400（行列号指向生成的 YAML，一并显示；fieldsFor 里没有的字段服务端兜底拦下），保存得到与手写 YAML 一样的草稿；
 // 词表外的聚合也回显进构建器（下拉多一个当前值选项、标出「不支持」）；时间窗口天数 0 / 负数按 window.days 400（客户端不再静默丢掉窗口）；
@@ -699,6 +700,22 @@ describe('指标与标签定义页', () => {
 const editorYaml = (html: string) => html.match(/<textarea[^>]*name="yaml"[^>]*>([\s\S]*?)<\/textarea>/)![1]
   .replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 
+/** 页面上只读草稿框（待确认覆盖）里的 YAML */
+const draftYaml = (html: string) => html.match(/<textarea[^>]*name="draft"[^>]*>([\s\S]*?)<\/textarea>/)![1]
+  .replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+/** 模型起草指标的答复（#1162 的形状）：spec 带条件与时间窗口，加逐项说明、认不出的词与不支持的说法 */
+const DRAFT_REPLY = {
+  spec: { base: 'order', measure: { agg: 'sum', field: 'amount' }, filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'created_at', days: 30 } },
+  items: [
+    { path: 'measure.field', reason: '金额合计用 order.amount' },
+    { path: 'filter.0', reason: '成功订单是 status 等于 paid' },
+    { path: 'window', reason: '近 30 天按下单时间 created_at' },
+  ],
+  unknowns: ['不扣退款'],
+  unsupported: ['「按付款时间」取数'],
+};
+
 /** 配上平台默认模型服务，替身每次都返回 content */
 function modelReplies(content: unknown) {
   platformDefault();
@@ -717,9 +734,9 @@ describe('用模型生成指标草稿', () => {
     expect(page).toMatch(/<textarea[^>]*name="request"/);
     expect(page).toMatch(/<button[^>]*formNoValidate=""[^>]*value="model-draft"|<button[^>]*value="model-draft"[^>]*formNoValidate=""/);
 
-    // 模型答复沿用一句话解析的输出形状（#1162）：spec 加 items / unknowns / unsupported（说明的展示留给 #1163）
+    // 模型答复沿用一句话解析的输出形状（#1162）：spec 加 items / unknowns / unsupported；编辑框是示例，直接填入（#1163）
     modelReplies({ spec: { base: 'order', measure: { agg: 'sum', field: 'amount' }, filter: [{ field: 'status', op: 'eq', value: 'paid' }], window: { field: 'created_at', days: 30 } }, items: [], unknowns: [], unsupported: [] });
-    const generated = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request, yaml: REVENUE });
+    const generated = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request, yaml: editorYaml(page) });
     expect(generated.status).toBe(200);
     const html = await generated.text();
     const yaml = editorYaml(html);
@@ -755,7 +772,7 @@ describe('用模型生成指标草稿', () => {
 
     modelReplies({ spec: { base: 'order', measure: { agg: 'sum', field: 'amount' } }, items: [], unknowns: [], unsupported: [] });
     const res = await (await loginAs(app, 'analyst@acme.com'))
-      .post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request: '营收', yaml: REVENUE });
+      .post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request: '营收', yaml: '' });
     expect(res.status).toBe(200);
     const html = await res.text();
     // 草稿照常生成，编辑框上方出现歧义提示：词、两个候选链接与说明
@@ -764,6 +781,88 @@ describe('用模型生成指标草稿', () => {
     expect(html).toMatch(/<a[^>]*href="\/knowledge\?item=metric%3Arevenue_365d"[^>]*>revenue_365d<\/a>/);
     expect(html).toMatch(/<a[^>]*href="\/knowledge\?item=metric%3Agmv_365d"[^>]*>gmv_365d<\/a>/);
     expect(html).toContain('请确认模型选的是否是你要的口径，或在需求里写明');
+  });
+
+  it('编辑框为空时直接填入完整 YAML，上方逐项说明、认不出的词与不支持的说法（固定原因），没有「没有填入」的提示', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+
+    modelReplies(DRAFT_REPLY);
+    const res = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request: '近 30 天成功订单的金额', yaml: '  \n' });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const yaml = editorYaml(html);
+    expect(yaml).toContain('# 模型根据需求生成，请核对');
+    expect(yaml).toMatch(/filter:[\s\S]*status/);
+    expect(yaml).toMatch(/window:[\s\S]*days: 30/);
+    expect(html).toContain('data-generated');
+    // 说明在编辑框上方：pathText 把位置转成「条件第 N 行」「时间窗口」
+    expect(html.indexOf('data-metric-parse-panel')).toBeLessThan(html.indexOf('name="yaml"'));
+    expect(html).toContain('计算什么：金额合计用 order.amount');
+    expect(html).toContain('条件第 1 行：成功订单是 status 等于 paid');
+    expect(html).toContain('时间窗口：近 30 天按下单时间 created_at');
+    expect(html).toContain('data-parse-unknowns');
+    expect(html).toContain('不扣退款');
+    expect(html).toContain('data-parse-unsupported');
+    expect(html).toContain('为什么不能做');
+    expect(html).not.toContain('data-parse-dropped');
+    expect(html).not.toContain('没有填入');
+    expect(html).not.toContain('value="applyDraft"');
+  });
+
+  it('编辑框已有不同内容时先不覆盖：给出只读草稿与说明，确认覆盖（applyDraft）后才替换；草稿不过 checkMetric 时 400、编辑框保持原内容', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+
+    modelReplies(DRAFT_REPLY);
+    const res = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request: '近 30 天成功订单的金额', yaml: REVENUE });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // 编辑框还是原内容，没有「已用模型生成草稿」；草稿只读、说明照常展示
+    expect(editorYaml(html)).toBe(REVENUE);
+    expect(html).not.toContain('data-generated');
+    expect(html).toContain('data-draft-confirm');
+    expect(html).toMatch(/<textarea[^>]*name="draft"[^>]*readOnly=""|<textarea[^>]*readOnly=""[^>]*name="draft"/);
+    const draft = draftYaml(html);
+    expect(draft).toContain('# 模型根据需求生成，请核对');
+    expect(draft).toContain('days: 30');
+    expect(html).toContain('条件第 1 行：成功订单是 status 等于 paid');
+    expect(html).toMatch(/<button[^>]*formNoValidate=""[^>]*value="applyDraft"|<button[^>]*value="applyDraft"[^>]*formNoValidate=""/);
+
+    const applied = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'applyDraft', kind: 'metric', key: '', yaml: REVENUE, draft });
+    expect(applied.status).toBe(200);
+    const appliedHtml = await applied.text();
+    expect(editorYaml(appliedHtml)).toBe(draft);
+    expect(appliedHtml).toContain('data-generated');
+    expect(appliedHtml).not.toContain('data-draft-confirm');
+    expect(appliedHtml).not.toContain('data-metric-parse-panel');
+
+    // 不信客户端：回传的草稿重新 checkMetric，不合法 400、编辑框保持原内容
+    const bad = await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'applyDraft', kind: 'metric', key: '', yaml: REVENUE, draft: 'base: order\nmeasure: { agg: sum, field: channel }\n' });
+    expect(bad.status).toBe(400);
+    const badHtml = await bad.text();
+    expect(badHtml).toContain('sum 只能用整数或小数字段');
+    expect(editorYaml(badHtml)).toBe(REVENUE);
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+  });
+
+  it('英文界面下确认覆盖的提示、按钮与说明面板的标题没有汉字', async () => {
+    vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    analyst.store('crm_locale=en; Path=/');
+
+    modelReplies({ ...DRAFT_REPLY, items: [{ path: 'filter.0', reason: 'paid orders' }], unknowns: ['refunds'], unsupported: ['by pay time'] });
+    const html = await (await analyst.post('/analytics/definitions/new?kind=metric&mode=yaml', { intent: 'model-draft', kind: 'metric', key: '', request: 'paid amount', yaml: REVENUE })).text();
+    // 只读草稿里是生成的 YAML（带中文注释），去掉再看
+    const confirm = html.match(/<div[^>]*data-draft-confirm[\s\S]*?value="applyDraft"[\s\S]*?<\/button>/)![0].replace(/<textarea[\s\S]*?<\/textarea>/g, '');
+    expect(confirm).not.toMatch(/[一-鿿]/);
+    const panel = html.match(/<div[^>]*data-metric-parse-panel[\s\S]*?data-parse-unsupported[\s\S]*?<\/div>/)![0];
+    expect(panel).toContain('Condition row 1');
+    expect(panel).not.toMatch(/[一-鿿]/);
   });
 
   it('未配置模型服务时 400 提示；查看者提交 403', async () => {

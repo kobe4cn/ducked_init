@@ -1,16 +1,17 @@
 // app/components/metric-parse-panel.tsx —— 一句话解析结果面板（#517，ADR-0035）：逐项说明、没认出的说法、支持不了的说法与和当前表单的差异。
 // 不支持的说法只带原话（#516 的接口），原因用一段固定说明列出 DSL 的三条限制（issue #517 评论代拍板的选项 A）；
 // 差异只在展示（「确认覆盖」按钮和隐藏字段 parsed 在路由里，与本面板同一个表单），成员确认前构建器不动。
+// YAML 模式「用模型生成草稿」也用它展示起草的逐项说明（#1163，DraftExplanation 没有 dropped）。
 // 界面文字按语言出（useT，ADR-0060）；items[].reason 是模型写的说明、diff 句子是路由 summarize 的输出，都是数据不在这里翻
 import { AlertTriangle } from 'lucide-react';
 import { useT, type T } from '~/lib/i18n';
 
-/** 一句话解析的展示内容：#516 的三个数组加构建器装不下、没填入的维度名（builderFormOf 把 dimensions 清空） */
+/** 一句话解析的展示内容：#516 的三个数组加构建器装不下、没填入的维度名（builderFormOf 把 dimensions 清空；YAML 模式起草没有这一项） */
 export interface MetricParseResult {
   items: { path: string; reason: string }[];
   unknowns: string[];
   unsupported: string[];
-  dropped: string[];
+  dropped?: string[];
 }
 
 /** 和当前表单的差异：一句话会被替换的摘要句子（原来 → 解析后） */
@@ -52,7 +53,7 @@ export function MetricParsePanel({ parse, diff }: { parse: MetricParseResult; di
           <p className="text-slate-500">{t('这些词没对应到本租户的字段，解析时没有采用。')}</p>
         </div>
       )}
-      {parse.dropped.length > 0 && (
+      {parse.dropped !== undefined && parse.dropped.length > 0 && (
         <p data-parse-dropped className="text-amber-600">{t('以下维度构建器不支持，没有填入：{names}。要按维度拆开，请在 YAML 模式里写。', { names: parse.dropped.join(t('、')) })}</p>
       )}
       {parse.unsupported.length > 0 && (
