@@ -152,6 +152,20 @@ describe('用模型生成映射草稿', () => {
     expect(await failures(acme)).toHaveLength(0);
   });
 
+  it('模型对用不到的可选键写 null（qwen-max）时按没给处理：dictionary 为 null 的字段照常采用，YAML 里没有 dictionary', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    platformDefault();
+    // status 的 dictionary 是 null（不是省略），confidence 之外的键都给全
+    fakeLlm(setLlmFetch, () => json({ ...MODEL_ORDERS, fields: MODEL_ORDERS.fields.map(f => f.field === 'status' ? { ...f, dictionary: null } : f) }, USAGE));
+
+    const result = await modelDraftFor(author, sourceId, 'orders', 'order');
+    expect(result.origin).toBe('model');
+    // dictionary 被删掉后 fieldNode 走纯表达式分支：status 是标量，不是带 dictionary 的对象
+    expect(parse(result.yaml).fields.status).toBe('status');
+    const [call] = await calls(acme);
+    expect(call).toMatchObject({ purpose: 'mapping_draft', schemaValid: true, error: null });
+  });
+
   it('起草消费者映射时目录里没有敏感字段与哈希列，消息里没有敏感列的取值', async () => {
     const { author, sourceId } = await tenantWithSource();
     platformDefault();

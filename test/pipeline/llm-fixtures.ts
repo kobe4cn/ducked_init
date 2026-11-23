@@ -64,6 +64,10 @@ export const text = (content: string, usage?: Usage) => reply({ role: 'assistant
 /** 模型给出 JSON 文本答复 */
 export const json = (content: unknown, usage?: Usage) => text(JSON.stringify(content), usage);
 
+/** 模型输出被 max_tokens 截断的答复（finish_reason: length，不带 usage）：content 给截断到一半的文本 */
+export const truncated = (content: string) =>
+  Response.json({ choices: [{ message: { role: 'assistant', content }, finish_reason: 'length' }] });
+
 type Call = { name: string; args: unknown; id?: string };
 
 /** 模型要调用工具：id 默认 call_1、call_2…；args 是字符串时原样作为 arguments（用来造不是 JSON 的参数），否则 JSON.stringify */

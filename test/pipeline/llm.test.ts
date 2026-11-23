@@ -1,4 +1,5 @@
 // test/pipeline/llm.test.ts —— 模型服务客户端（ADR-0035）：按租户配置 > 平台默认（环境变量）解析端点，chatJson → 注入的假 fetch → platform.llm_calls 的调用日志；
+// callModel 容错（#1160）：可选键为 null（qwen-max）按没给处理（必填键为 null 仍不合格、Schema 允许 null 的原样保留）、输出截断（finish_reason: length）报截断原因、```json 代码块去外壳、minItems / maximum 等报中文；
 // LLM_CHAT_EXTRA（#952）：服务商参数合并进 chat 请求体（平台字段不被覆盖、档位 LLM_<TIER>_CHAT_EXTRA 覆盖默认），不是合法 JSON 对象时调用失败并记 error；
 // LLM_TIMEOUT_SECONDS（#952）：控制 chat 超时与超时消息里的秒数，不是正整数时回落 60；
 // embedding 端点（ADR-0049）：租户 embedding 三项 > 平台 LLM_EMBEDDING_*（与 chat 互不影响），都没配置时 embed 返回 null；
@@ -14,7 +15,7 @@ import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
-import { embeddings, fakeLlm, json, platformDefault, platformEmbedding, platformTier, text } from './llm-fixtures';
+import { embeddings, fakeLlm, json, platformDefault, platformEmbedding, platformTier, text, truncated } from './llm-fixtures';
 import { pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -109,6 +110,73 @@ describe('模型服务客户端', () => {
     const [row] = await calls(acme);
     expect(row).toMatchObject({ purpose: 'mapping_draft', model: 'qwen-plus', schemaValid: false, promptTokens: 120, completionTokens: 30 });
     expect(row.error).toMatch(/table/);
+  });
+
+  it('可选键为 null 时按没给处理：删掉后重校验通过，Schema 允许 null 的键原样保留', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    // qwen-max 对用不到的可选键会写 null（extra: type 'array' 不收 null）；note 的 Schema 允许 null，不该被删
+    const NULLABLE = { type: 'object', required: ['table'], properties: { table: { type: 'string' }, extra: { type: 'array' }, note: { type: ['string', 'null'] } } };
+    fakeLlm(setLlmFetch, () => json({ table: 'orders', extra: null, note: null }, USAGE));
+
+    expect(await chatJson(acme, 'mapping_draft', MESSAGES, NULLABLE)).toEqual({ table: 'orders', note: null });
+    const [row] = await calls(acme);
+    expect(row).toMatchObject({ schemaValid: true, error: null });
+  });
+
+  it('必填键为 null 时仍判不合格', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    fakeLlm(setLlmFetch, () => json({ table: null }, USAGE));
+
+    const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA));
+    expect(err).toBeInstanceOf(LlmError);
+    expect(err.message).toMatch(/不符合 Schema：缺少 table/);
+    const [row] = await calls(acme);
+    expect(row.schemaValid).toBe(false);
+  });
+
+  it('输出被 max_tokens 截断（finish_reason: length）时报截断原因，不报「不是 JSON」', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    fakeLlm(setLlmFetch, () => truncated('{"table": "order'));
+
+    const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA));
+    expect(err).toBeInstanceOf(LlmError);
+    expect(err.message).toBe('模型输出被截断（达到输出长度上限），请把需求写得更具体，或换上下文更长的模型');
+    const [row] = await calls(acme);
+    expect(row.schemaValid).toBeNull();
+    expect(row.error).toMatch(/被截断/);
+  });
+
+  it('内容被 ```json 代码块包着时去掉外壳再解析', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    fakeLlm(setLlmFetch, () => text('```json\n{"table": "orders"}\n```', USAGE));
+
+    expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
+    const [row] = await calls(acme);
+    expect(row.schemaValid).toBe(true);
+  });
+
+  it('minItems / maximum 等校验错误是中文说明，不出现 ajv 原文', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const LIMITS = {
+      type: 'object', required: ['rules'],
+      properties: { rules: { type: 'array', minItems: 1 }, score: { type: 'number', maximum: 1 }, name: { type: 'string', minLength: 2 } },
+    };
+    fakeLlm(setLlmFetch, () => json({ rules: [], score: 2, name: 'a' }, USAGE));
+
+    const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, LIMITS));
+    expect(err).toBeInstanceOf(LlmError);
+    expect(err.message).toContain('rules：至少要有 1 项');
+    expect(err.message).toContain('score：不能大于 1');
+    expect(err.message).toContain('name：至少 2 个字');
+    expect(err.message).not.toContain('must NOT');
+    const [row] = await calls(acme);
+    expect(row.schemaValid).toBe(false);
+    expect(row.error).not.toContain('must NOT');
   });
 
   it('HTTP 500 时记 error，消息里没有 Key', async () => {
