@@ -57,6 +57,8 @@ export function createDispatcher({
   let stopped = false;
   let wake: (() => void) | undefined;
   let lastHeartbeat = Date.now();
+  /** 本调度器已收尾（.finally 已执行、名额已释放）的任务与迁移总数：runUntilIdle 用它发现 tick 期间释放的名额（#1141） */
+  let finished = 0;
 
   /** 在独立进程中执行一个任务；进程异常退出、超时或被终止都折算成错误 */
   function start(task: ClaimedTask) {
@@ -86,7 +88,7 @@ export function createDispatcher({
         await runHooks(hooks, task, outcome!);
       })
       .catch(e => console.error(`[调度器] 任务 ${task.id} 结束时出错`, e))
-      .finally(() => { running.delete(task.id); wake?.(); });
+      .finally(() => { finished++; running.delete(task.id); wake?.(); });
     running.set(task.id, { child, done, abort });
   }
 
@@ -99,7 +101,7 @@ export function createDispatcher({
       const abort = new AbortController();
       const done = runLakeMigration(migration, abort.signal)
         .catch(e => console.error(`[调度器] 数据湖迁移 ${migration.id} 出错`, e))
-        .finally(() => { migrations.delete(migration.claim); wake?.(); });
+        .finally(() => { finished++; migrations.delete(migration.claim); wake?.(); });
       migrations.set(migration.claim, { done, abort });
     }
     while (!stopped && busy() < maxWorkers) {
@@ -159,12 +161,17 @@ export function createDispatcher({
   });
 
   return {
-    /** 派发到队列里没有可派发的任务、且本调度器派发的任务全部结束为止（测试与一次性运行时使用） */
+    /**
+     * 派发到队列里没有可派发的任务、且本调度器派发的任务全部结束为止（测试与一次性运行时使用）。
+     * #1141：tick 期间结束的任务会释放租户名额，它调的 wake 会丢（runUntilIdle 那时不在 nap 里），
+     * 所以空闲判断除了 busy() 为 0 还要求 tick 期间没有任务结束，有就立刻再 tick 一次，不把排队的下一个任务留在 queued
+     */
     async runUntilIdle() {
-      await tick();
-      while (busy()) {
-        await nap();
+      for (;;) {
+        const before = finished;
         await tick();
+        if (busy()) { await nap(); continue; }
+        if (finished === before) return;
       }
     },
     /** 持续运行，直到 stop()；之后等运行中的任务结束再返回 */
