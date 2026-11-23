@@ -7,7 +7,8 @@
 // 租户整套自配时读租户自己的档位列（只填模型沿用租户默认端点与 Key，带端点用档位自己的 Key），平台档位不生效；
 // 档位没绑定模型就回落默认并记 fallbackReason='unbound'。
 // chatTools 带工具调用模型（AI 助手，ADR-0042），不要求 JSON。
-// 平台 chat 的请求体可经 LLM_CHAT_EXTRA 合并服务商参数（按档位 LLM_<TIER>_CHAT_EXTRA 覆盖，如 qwen3 思考模型关思考模式），
+// 平台 chat 的请求体可经 LLM_CHAT_EXTRA 合并服务商参数（按档位 LLM_<TIER>_CHAT_EXTRA 覆盖，如 qwen3 思考模型关思考模式）；
+// 租户自配时改用租户存的服务商参数（#1169，chat_extra，档位 fast_ / reasoning_chat_extra 覆盖），平台的不串进租户请求体。
 // 平台字段（model、messages、response_format、tools 等）不会被它覆盖；chat 与 embedding 补算的超时由 LLM_TIMEOUT_SECONDS 控制（默认 60 秒）。
 // embed（ADR-0049）走可选的 embedding 端点：租户的 embedding 三项 > 平台环境变量 LLM_EMBEDDING_*，与 chat 互不影响；
 // 都没配置时返回 null（不发请求、不记日志），调用方只走关键词检索。
@@ -41,7 +42,8 @@ export interface LlmMessage {
 
 export interface LlmProvider {
   baseUrl: string; model: string; apiKey: string; source: 'tenant' | 'platform';
-  /** 平台的 LLM(_<TIER>)_CHAT_EXTRA：env 是变量名（报配置错误用），raw 是原文，调用时才解析合并进 chat 请求体；租户 provider 不带 */
+  /** 服务商参数原文：平台的 LLM(_<TIER>)_CHAT_EXTRA 或租户存的 chat_extra 列（#1169）。env 是报配置错误时用的名字（变量名或说明），
+   *  raw 是原文，调用时才解析合并进 chat 请求体 */
   chatExtra?: { env: string; raw: string };
 }
 
@@ -86,9 +88,15 @@ export const platformProvider = (): LlmProvider => {
 /** 行上某一档的三列（与 model-provider.ts 的 tierOf 同样的取法，不 import 它：那边已 import 本文件，反向会循环）：
  *  没绑定时 model 为 null，端点与 Key 为 null 表示沿用本租户默认的那一套 */
 function tierOf(row: typeof modelProviders.$inferSelect | undefined, tier: 'fast' | 'reasoning') {
-  if (tier === 'fast') return { model: row?.fastModel ?? null, baseUrl: row?.fastBaseUrl ?? null, apiKey: row?.fastApiKey ?? null };
-  return { model: row?.reasoningModel ?? null, baseUrl: row?.reasoningBaseUrl ?? null, apiKey: row?.reasoningApiKey ?? null };
+  if (tier === 'fast') {
+    return { model: row?.fastModel ?? null, baseUrl: row?.fastBaseUrl ?? null, apiKey: row?.fastApiKey ?? null, chatExtra: row?.fastChatExtra ?? null };
+  }
+  return { model: row?.reasoningModel ?? null, baseUrl: row?.reasoningBaseUrl ?? null, apiKey: row?.reasoningApiKey ?? null, chatExtra: row?.reasoningChatExtra ?? null };
 }
+
+/** 租户存的服务商参数（#1169）包成 provider.chatExtra；env 只进配置错误的报错文案 */
+const tenantChatExtra = (raw: string | null, tier?: 'fast' | 'reasoning'): Pick<LlmProvider, 'chatExtra'> =>
+  raw ? { chatExtra: { env: zh(tier ? msg('本租户 {tier} 档位的服务商参数', { tier }) : msg('本租户模型服务的服务商参数')), raw } } : {};
 
 /** 查一次 modelProviders 行并按 providerSource 算出那一套 provider（租户的 Key 解密后返回）；都没有时 provider 为 null。
  *  resolveProvider 与 resolveRoute 共用它，各自不再查第二次库 */
@@ -97,7 +105,7 @@ async function providerRow(tenantId: string): Promise<{ row: typeof modelProvide
   switch (providerSource(row)) {
     case 'tenant': {
       const apiKey = row.apiKey ? (await decryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, row.apiKey)).apiKey : '';
-      return { row, provider: { baseUrl: row.baseUrl!, model: row.model ?? '', apiKey, source: 'tenant' } };
+      return { row, provider: { baseUrl: row.baseUrl!, model: row.model ?? '', apiKey, source: 'tenant', ...tenantChatExtra(row.chatExtra) } };
     }
     case 'platform':
       return { row, provider: platformProvider() };
@@ -126,6 +134,7 @@ const tierEnv = (tier: 'fast' | 'reasoning', suffix: 'MODEL' | 'BASE_URL' | 'API
  * Key 发到档位的端点）。平台默认时 LLM_<TIER>_MODEL 有值就把模型换成它；BASE_URL 与 API_KEY 必须一起填才用
  * 档位自己的端点与 Key（只填一个同样按没绑定处理并 console.warn），只填 MODEL 时端点与 Key 复用默认的。
  * 服务商参数（#952）：档位自己的 LLM_<TIER>_CHAT_EXTRA 覆盖默认的 LLM_CHAT_EXTRA，只填 MODEL 的档位继承默认的。
+ * 租户自配时（#1169）同理用租户的列：档位的 *_chat_extra 有值就用它，否则继承租户默认的 chat_extra；平台的 env 不参与。
  */
 export async function resolveRoute(tenantId: string, purpose: LlmPurpose): Promise<LlmRoute | null> {
   const { row, provider } = await providerRow(tenantId);
@@ -134,16 +143,18 @@ export async function resolveRoute(tenantId: string, purpose: LlmPurpose): Promi
   if (!tier) return { provider, route: null, fallbackReason: null };
 
   if (provider.source === 'tenant') {
-    const { model, baseUrl, apiKey } = tierOf(row, tier);
+    const { model, baseUrl, apiKey, chatExtra } = tierOf(row, tier);
     if (!model) return { provider, route: tier, fallbackReason: 'unbound' };
-    if (!baseUrl) return { provider: { ...provider, model }, route: tier, fallbackReason: null };   // 只填模型名：沿用租户默认端点与 Key
+    // 档位自己的服务商参数优先，没填时继承 provider 上租户默认的那份
+    const extra = chatExtra ? tenantChatExtra(chatExtra, tier) : { chatExtra: provider.chatExtra };
+    if (!baseUrl) return { provider: { ...provider, model, ...extra }, route: tier, fallbackReason: null };   // 只填模型名：沿用租户默认端点与 Key
     if (!apiKey) {
       // 保存校验（#605）不允许只填端点，这里只防脏数据：按没绑定处理，不把租户默认 Key 发到档位端点
       console.warn(`model_providers 的 ${tier} 档位有端点但没有 Key，按未绑定该档位处理`);
       return { provider, route: tier, fallbackReason: 'unbound' };
     }
     const decrypted = (await decryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, apiKey)).apiKey;
-    return { provider: { baseUrl, model, apiKey: decrypted, source: 'tenant' }, route: tier, fallbackReason: null };
+    return { provider: { baseUrl, model, apiKey: decrypted, source: 'tenant', ...extra }, route: tier, fallbackReason: null };
   }
 
   const model = tierEnv(tier, 'MODEL');
@@ -263,7 +274,14 @@ async function postJson(provider: LlmProvider, path: string, payload: Record<str
 
 /** chatExtra 里不允许出现的平台字段：服务商参数垫在请求体最底层，这几个键先删掉再合并，覆盖不了平台自己的；
  *  tools 与 response_format 同时出现很多服务不接受（callTools 的注释），更不能从 extra 混进来 */
-const CHAT_EXTRA_PROTECTED = ['model', 'messages', 'response_format', 'tools', 'tool_choice', 'temperature'];
+export const CHAT_EXTRA_PROTECTED = ['model', 'messages', 'response_format', 'tools', 'tool_choice', 'temperature'];
+
+/** 服务商参数原文解析成对象；JSON 不合法或不是对象（数组、null、标量）返回 null。租户保存时（model-provider.ts）也用它校验 */
+export function parseChatExtraObject(raw: string): Record<string, unknown> | null {
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return null; }
+  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+}
 
 /** 把 provider 的 chatExtra 原文解析成要合并进 /chat/completions 请求体的对象（#952）。
  *  在这里（调用时）而不是解析 provider 时做：logged 的 resolve 在 try 之外，提前抛错会漏记 llm_calls，
@@ -272,11 +290,8 @@ const CHAT_EXTRA_PROTECTED = ['model', 'messages', 'response_format', 'tools', '
 function chatExtraBody(provider: LlmProvider): Record<string, unknown> {
   const { chatExtra } = provider;
   if (!chatExtra) return {};
-  let parsed: unknown;
-  try { parsed = JSON.parse(chatExtra.raw); } catch { parsed = null; }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new LlmError(`模型服务配置错误：${chatExtra.env} 不是合法的 JSON 对象`);
-  }
+  const parsed = parseChatExtraObject(chatExtra.raw);
+  if (!parsed) throw new LlmError(`模型服务配置错误：${chatExtra.env} 不是合法的 JSON 对象`);
   const extra: Record<string, unknown> = { ...parsed };
   for (const key of CHAT_EXTRA_PROTECTED) delete extra[key];
   return extra;
