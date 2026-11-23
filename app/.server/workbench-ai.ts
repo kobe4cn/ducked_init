@@ -386,9 +386,8 @@ export async function interpretResult(
     sent = redacted.columns.map(c => c.name);
     messages = interpretMessages(normalized, redacted, result.truncated, detail, facts);
   } else {
-    const keep = sendable(result, Infinity);
-    ({ sent, dropped } = pickColumns(result, keep));
-    messages = statsMessages(columnStats(normalized, result, keep), detail, facts);
+    ({ sent, dropped } = pickColumns(result, factKeep));
+    messages = statsMessages(columnStats(normalized, result, factKeep), detail, facts);
   }
   if (!sent.length) throw new WorkbenchAiError('没有可以发送的列：结果里的列都是系统列、敏感列或哈希', 400);
   let interpretation: string;
