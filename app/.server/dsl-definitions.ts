@@ -192,7 +192,8 @@ export type DraftExplanation = { items: { path: string; reason: string }[]; unkn
  * 另把歧义词与候选带回页面提示成员；模型输出按该种类的 Schema 校验、转成 YAML 后须过该种类的校验，返回 YAML 与逐项说明（指标沿用一句话解析的
  * 输出形状，#1162；标签没有说明），不保存（之后照常保存草稿、双人发布）。
  * 没配置模型服务、或上下文里没东西可用（标签没有可引用的指标）时 400、不发请求；
- * 模型失败或转出的 YAML 不过校验时记审计 definition.model_draft_failed（不含需求原文、逐项说明、模型原文与取值），抛 422
+ * 模型失败或转出的 YAML 不过校验时记审计 definition.model_draft_failed（不含需求原文、逐项说明、模型原文与取值），抛 422；
+ * 模型判断做不到（标签草稿输出 unsupported，#1165）时 422 只带模型给的原因、不带问题列表，审计阶段 unsupported 只记原因条数
  */
 export async function modelDraftForDefinition(actor: CurrentMember, kind: string, request: string): Promise<{ yaml: string; ambiguity: DraftAmbiguity | null; explanation: DraftExplanation | null }> {
   assertCan(actor, 'definitions:draft');
@@ -226,6 +227,10 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
     if (!(e instanceof LlmError)) throw e;
     await failed({ stage: 'model', error: e.message.slice(0, 200), ...(normalized && { normalized: true }) });
     throw new DslError(`模型生成草稿失败：${e.message}`, 422);
+  }
+  if ('unsupported' in spec && Array.isArray(spec.unsupported)) {
+    await failed({ stage: 'unsupported', reasons: spec.unsupported.length });
+    throw new DslError(`模型判断做不到：${spec.unsupported.join('；')}`, 422);
   }
   const yaml = definitionOutputToYaml(kind, spec);
   const checked = DSL_KINDS[kind].check(yaml, ctx);

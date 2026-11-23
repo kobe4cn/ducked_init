@@ -1,5 +1,5 @@
 // app/.server/pipeline/dsl/model-draft.ts —— 用模型按自然语言需求生成定义草稿（ADR-0035，纯函数，不读库、不发请求）：
-// 每种可生成的定义给出模型必须遵守的输出 Schema（指标沿用一句话解析的输出形状，#1162：宽松 Schema 放行，调用方收拢后严格校验）、调用用途、提示词与给模型的上下文；
+// 每种可生成的定义给出模型必须遵守的输出 Schema（指标沿用一句话解析的输出形状，#1162：宽松 Schema 放行，调用方收拢后严格校验；标签另有「做不到」的出口，#1165）、调用用途、提示词与给模型的上下文；
 // 上下文取自语义目录（ADR-0041）：system 是简短的角色说明加该种类的能力说明，user 是目录分层上下文（第一层分组、相关分组的组内列表，#855）、
 // 按需求检索出的条目与需求原文。检索在 catalog/draft-search.ts（与助手同一条路，#827），排好的条目由调用方传入，这里只管截断与拼消息。
 // 目录里本就没有敏感字段、哈希列与明细行（ADR-0005），统计只有 ADR-0016 的常见取值。
@@ -10,7 +10,7 @@ import { estimateTokens, layeredContext, OVERVIEW_TOKENS, toMarkdown, type Catal
 import type { LlmMessage, LlmPurpose } from '../../llm';
 import { CONSUMER_ENTITY, METRIC_SCHEMA, type MetricSpec, type RatioPart } from './metric-spec';
 import type { DslKind } from './index';
-import { SINGLE_TAG_SCHEMA } from './tag-spec';
+import { TAG_SCHEMA } from './tag-spec';
 
 /** 按需求搜出的条目最多几条（起草与一句话解析的检索都由 catalog/draft-search.ts 取，这里是截断上限） */
 export const SEARCH_LIMIT = 15;
@@ -69,9 +69,16 @@ const TAG_SYSTEM = [
   '你是 CRM 数据平台的标签助手：按成员的需求写一个标签定义，只输出一个符合给定 JSON Schema 的 JSON 对象，不要输出别的文字。',
   '成员的消息里依次是语义目录的第一层分组、相关分组的组内列表、按需求搜出的目录条目与需求原文。',
   '规则：',
-  '- 只用单指标写法：metric 是目录里一个没有维度的已发布指标（metric:<键> 条目里的键），不要编造；不写 missing，when 里直接写比较。',
-  '- rules 按顺序取第一条命中的，when 里的条件全部满足才算命中，至少写一个条件；都没命中的取 default。',
+  '- 引用的指标只能是目录里没有维度的已发布指标（metric:<键> 条目里的键），不要编造；不写 missing。',
+  '- 需求只涉及一个指标时用单指标写法：顶层写 metric，每条规则的 when 里直接写比较（gte / gt / lte / lt / eq）。',
+  '- 需求涉及多个指标时用多指标写法：不写顶层 metric，每条规则的 when 写 { "all": [...] }（全部满足）或 { "any": [...] }（任一满足），只一层、不嵌套，每项是 { "metric": 指标键, 比较 }。',
+  '- rules 按顺序取第一条命中的，至少写一条规则、每条至少一个条件；都没命中的取 default。',
   '- 阈值与取值按需求写，需求没提到的部分不要加。',
+  '- 需求用上面的写法和目录里的指标做不到时（如缺少需要的指标、要按小时等目录没有的粒度），不要硬凑、不要只引用其中一部分指标，只输出 unsupported：每条写一句做不到的原因和需要补充什么；unsupported 不要和 rules 放在同一个对象里。',
+  '输出格式（三选一）：',
+  '- 单指标：{ "metric": 指标键, "rules": [{ "value": 取值, "when": { "gte": 数字 } }], "default": 取值, "description"?: 说明 }',
+  '- 多指标：{ "rules": [{ "value": 取值, "when": { "all": [{ "metric": 指标键, "gte": 数字 }, { "metric": 指标键, "eq": 数字 }] } }], "default": 取值, "description"?: 说明 }',
+  '- 做不到：{ "unsupported": ["原因…"] }',
   '',
   capability('capability:tag-dsl'),
 ].join('\n');
@@ -109,11 +116,25 @@ export const METRIC_PARSE_LENIENT_SCHEMA = {
   anyOf: [METRIC_PARSE_SCHEMA, { type: 'object', anyOf: [{ required: ['base'] }, { required: ['measure'] }] }],
 } as const;
 
+/** 标签草稿的输出 Schema：标签定义（单指标或多指标写法），或「做不到」的原因（形状同一句话解析的 unsupported）；
+ *  TAG_SCHEMA 不认额外键、必须有 rules / default，两支互斥。必须是模块级常量：validatorFor 用 WeakMap 按对象缓存编译结果 */
+export const TAG_DRAFT_SCHEMA = {
+  oneOf: [
+    TAG_SCHEMA,
+    {
+      type: 'object',
+      required: ['unsupported'],
+      additionalProperties: false,
+      properties: { unsupported: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 } } },
+    },
+  ],
+} as const;
+
 /** 可由模型生成的定义：输出 Schema、调用用途、system 提示词与目录里没东西可用时给成员的提示；
  *  指标走一句话解析的输出形状（#1162）：宽松 Schema 放行平铺输出，由调用方（dsl-definitions.ts）收拢后严格校验 */
 const DRAFTS = {
   metric: { schema: METRIC_PARSE_LENIENT_SCHEMA, purpose: 'metric_draft', system: METRIC_DRAFT_SYSTEM, unavailable: () => null },
-  tag: { schema: SINGLE_TAG_SCHEMA, purpose: 'tag_draft', system: TAG_SYSTEM, unavailable: tagUnavailable },
+  tag: { schema: TAG_DRAFT_SCHEMA, purpose: 'tag_draft', system: TAG_SYSTEM, unavailable: tagUnavailable },
 } satisfies Record<DslKind, { schema: object; purpose: LlmPurpose; system: string; unavailable: (catalog: Catalog) => string | null }>;
 
 /** 模型输出必须符合的 JSON Schema 与调用用途 */
