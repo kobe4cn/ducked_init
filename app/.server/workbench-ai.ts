@@ -5,6 +5,7 @@
 // 结果解读：成员确认后服务端按 SQL 重新执行（不信客户端传来的行），租户打开「发送脱敏样本」时把前 INTERPRET_ROWS 行发给模型服务，
 // 没打开时只发 SQL、列名与类型、行数和每列统计（按全部结果行算），不发任何行；结果列无法回溯到字段，
 // 所以按列名与取值保守剔除系统列、名字像敏感字段的列与取值里有 64 位十六进制哈希的列（统计也只算留下的列）。审计 workbench.result_interpreted 不记取值，记 samples；
+// 两种提示都带 SQL 与服务端按全部返回行算好的数值事实（合计、最大、最小、占比，模型只能引用这些数）；按 isDetail 区分分组汇总（可点名分组，事实带所在行）与明细（不点名、只谈分布，不带所在行），关闭开关时也不带所在行；
 // 解读连同 SQL、行数与发送的列名存进本人的助手对话（appendInterpretation），不存结果行
 import { and, eq, inArray } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -206,6 +207,17 @@ const sendable = (result: WorkbenchResult, limit = INTERPRET_ROWS): boolean[] =>
     !isSystemColumn(name) && !looksSensitive({ name }) && !rows.some(row => HASH.test(cellText(row[i]) ?? '')));
 };
 
+/** 列名像标识（customer_id、openid、unionid、mobile）；`(^|_)id$` 不误伤 paid */
+const DETAIL_NAME = /(^|_)id$|openid|unionid|mobile/i;
+
+/**
+ * 结果是不是明细（每行是一个人或一条记录）：有列因为敏感被剔除（敏感列名或取值含哈希；系统列被剔除不算），或列名像标识。
+ * 明细结果的解读不点名、不引用单行取值，数值事实也不带所在行
+ */
+export function isDetail(result: WorkbenchResult, keep: boolean[]): boolean {
+  return result.columns.some(({ name }, i) => (!keep[i] && !isSystemColumn(name)) || DETAIL_NAME.test(name));
+}
+
 /** 要发送与剔除的列名 */
 export function pickColumns(result: WorkbenchResult, keep = sendable(result)): { sent: string[]; dropped: string[] } {
   return {
@@ -254,6 +266,34 @@ function columnStats(sql: string, result: WorkbenchResult, keep: boolean[]) {
   return { sql, rowCount: result.rows.length, truncated: result.truncated, columns };
 }
 
+interface NumericFact { column: string; sum: number; max: number; min: number; maxShare?: number; minShare?: number; maxAt?: string; minAt?: string }
+
+const share = (part: number, sum: number) => Math.round((part / sum) * 1000) / 1000;
+
+/**
+ * 服务端算好的数值事实（按全部结果行、keep 留下的数值列）：合计、最大、最小；合计为正且没有负数时再给最大 / 最小占合计的比例。
+ * detail 为假时再给 maxAt / minAt：第一次出现最大 / 最小值那一行在标签列（第一个留下的、不是这一列本身的列）的取值
+ */
+function numericFacts(result: WorkbenchResult, keep: boolean[], detail: boolean): NumericFact[] {
+  return result.columns.flatMap(({ name, type }, i): NumericFact[] => {
+    if (!keep[i] || !NUMERIC.test(type)) return [];
+    const values = result.rows.map(row => (row[i] === null || row[i] === undefined ? NaN : Number(row[i])));
+    const numbers = values.filter(Number.isFinite);
+    if (!numbers.length) return [];
+    const sum = numbers.reduce((a, b) => a + b, 0);
+    const max = numbers.reduce((a, b) => Math.max(a, b));
+    const min = numbers.reduce((a, b) => Math.min(a, b));
+    const fact: NumericFact = { column: name, sum, max, min };
+    if (sum > 0 && min >= 0) Object.assign(fact, { maxShare: share(max, sum), minShare: share(min, sum) });
+    const label = detail ? -1 : keep.findIndex((k, j) => k && j !== i);
+    if (label >= 0) {
+      const at = (v: number) => cellText(result.rows[values.indexOf(v)]![label])?.slice(0, MAX_CELL);
+      Object.assign(fact, { maxAt: at(max), minAt: at(min) });
+    }
+    return [fact];
+  });
+}
+
 /** 查询出错（SQL 不合规、超时、已有查询在运行）照原状态码给出 */
 async function rerun(actor: CurrentMember, sql: string): Promise<QueryOutcome> {
   try {
@@ -278,35 +318,40 @@ export async function previewInterpretation(
   return { rows: sentRows(result), ...pickColumns(result), samples, result };
 }
 
+/** 两种结果都适用的写作要求 */
 const INTERPRET_INTRO = [
-  '你帮数据分析师解读一条 SQL 查询的结果，回答 JSON 对象 {"interpretation": "..."}，用中文写几段简短的文字。',
-  '只描述聚合规律与分布（总体趋势、占比、集中与离散、异常的分组），不要复述或点名任何单个个人，不要逐行引用取值。',
+  '你帮业务人员解读一条 SQL 查询的结果，回答 JSON 对象 {"interpretation": "..."}，用中文写。',
+  '写给业务人员看：第一句先给结论，用日常用语，不用「长尾」「离散度」这类术语，总共不超过 5 句。先看 sql 弄清这张表回答的是什么问题。',
+  '数值只能引用 facts 里给出的数（合计 sum、最大 max、最小 min、占合计的比例 maxShare / minShare），不要自己估算或推算比例；truncated 为真时合计只覆盖返回的行。',
 ];
 
-/** 不发样本时的提示：只有 SQL、列名与类型、行数和每列统计 */
-function statsMessages(stats: ReturnType<typeof columnStats>): LlmMessage[] {
+/** 每行是一个分组的汇总结果 */
+const GROUPED_RULES = '这是汇总结果，每行是一个分组（城市、品类、日期、等级等）：可以点名分组、引用数值；facts 里的 maxAt / minAt 是最大 / 最小值所在行的分组名。';
+
+/** 每行是一个人或一条明细记录 */
+const DETAIL_RULES = '这是明细结果，每行是一个人或一条明细记录：不点名任何人或记录，不引用单行取值，只谈分布。';
+
+const interpretSystem = (detail: boolean, note: string): string =>
+  [...INTERPRET_INTRO, detail ? DETAIL_RULES : GROUPED_RULES, note].join('\n');
+
+/** 不发样本时的提示：只有 SQL、列名与类型、行数、每列统计和数值事实 */
+function statsMessages(stats: ReturnType<typeof columnStats>, detail: boolean, facts: NumericFact[]): LlmMessage[] {
   return [
     {
       role: 'system',
-      content: [
-        ...INTERPRET_INTRO,
-        '下面只有 SQL、列名与类型、行数和每列统计（非空数 nonNull、去重数 distinct，数值列还有 min / max / avg；敏感列已剔除），没有任何数据行。',
-      ].join('\n'),
+      content: interpretSystem(detail, '下面只有 SQL、列名与类型、行数和每列统计（非空数 nonNull、去重数 distinct，数值列还有 min / max / avg；敏感列已剔除）与数值事实 facts，没有任何数据行。'),
     },
-    { role: 'user', content: JSON.stringify(stats) },
+    { role: 'user', content: JSON.stringify({ ...stats, facts }) },
   ];
 }
 
-function interpretMessages({ columns, rows }: ReturnType<typeof redactResult>): LlmMessage[] {
+function interpretMessages(sql: string, { columns, rows }: ReturnType<typeof redactResult>, truncated: boolean, detail: boolean, facts: NumericFact[]): LlmMessage[] {
   return [
     {
       role: 'system',
-      content: [
-        ...INTERPRET_INTRO,
-        `下面是结果的前 ${rows.length} 行（敏感列已剔除，每格最多 ${MAX_CELL} 字）。`,
-      ].join('\n'),
+      content: interpretSystem(detail, `下面是 SQL、结果的前 ${rows.length} 行（敏感列已剔除，每格最多 ${MAX_CELL} 字）与按全部返回行算好的数值事实 facts。`),
     },
-    { role: 'user', content: JSON.stringify({ columns, rows }) },
+    { role: 'user', content: JSON.stringify({ sql, columns, rows, truncated, facts }) },
   ];
 }
 
@@ -331,15 +376,19 @@ export async function interpretResult(
   let messages: LlmMessage[];
   let sent: string[];
   let dropped: string[];
+  // 数值事实按全部返回行、用比发样本更严的 keep 算：标签列取值来自第 INTERPRET_ROWS 行之后也不会带出哈希；不发样本时不带所在行
+  const factKeep = sendable(result, Infinity);
+  const detail = isDetail(result, factKeep);
+  const facts = numericFacts(result, factKeep, detail || !samples);
   if (samples) {
     const redacted = redactResult(result);
     ({ dropped } = redacted);
     sent = redacted.columns.map(c => c.name);
-    messages = interpretMessages(redacted);
+    messages = interpretMessages(normalized, redacted, result.truncated, detail, facts);
   } else {
     const keep = sendable(result, Infinity);
     ({ sent, dropped } = pickColumns(result, keep));
-    messages = statsMessages(columnStats(normalized, result, keep));
+    messages = statsMessages(columnStats(normalized, result, keep), detail, facts);
   }
   if (!sent.length) throw new WorkbenchAiError('没有可以发送的列：结果里的列都是系统列、敏感列或哈希', 400);
   let interpretation: string;
