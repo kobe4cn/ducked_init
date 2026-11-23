@@ -109,6 +109,7 @@ describe('指标 DSL：校验', () => {
     ok('base: customer\nmeasure: { agg: count }\n');
     ok('base: custom_visit\nmeasure: { agg: sum, field: minutes }\nwindow: { field: visited_on, days: 7 }\n');
     ok('base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: vip, path: order.x_vip_level }\n');
+    ok('base: custom_visit\nmeasure: { agg: count }\ndimensions:\n  - { name: day, path: custom_visit.visited_on }\n'); // date 维度放行（#1166）
     expect(issues('base: order\nmeasure: { agg: count_distinct, field: x_draft_only }\n')[0]).toMatchObject({ line: 2, message: expect.stringMatching(/x_draft_only/) });
   });
 
@@ -129,6 +130,8 @@ describe('指标 DSL：校验', () => {
     ['in 要给列表', 'base: order\nmeasure: { agg: count }\nfilter:\n  - { field: status, op: in, value: paid }\n', 4, /列表/],
     ['窗口不是时间或日期字段', 'base: order\nmeasure: { agg: count }\nwindow: { field: amount, days: 30 }\n', 3, /时间或日期/],
     ['维度终点是敏感字段', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - name: r\n    path: order.store_id -> custom_store.region_id -> custom_region.manager_phone\n', 5, /敏感/],
+    ['维度终点是时间字段（#1166）', 'base: event\nmeasure: { agg: count }\ndimensions:\n  - name: hour\n    path: event.occurred_at\n', 5, /时间字段不能直接做维度/],
+    ['多跳维度路径终点是时间字段（#1166）', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - name: r\n    path: order.customer_id -> customer.registered_at\n', 5, /时间字段不能直接做维度/],
     ['维度路径一跳不是指向主键的关系', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - name: r\n    path: order.channel -> custom_store.name\n', 5, /order\.channel.*custom_store/],
     ['维度路径第一段不是基础实体', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - name: r\n    path: custom_store.name\n', 5, /基础实体 order/],
     ['维度路径超过 3 跳', 'base: order\nmeasure: { agg: count }\ndimensions:\n  - name: r\n    path: order.store_id -> custom_store.region_id -> custom_region.country_id -> custom_country.continent_id -> custom_continent.name\n', 5, /3 跳/],

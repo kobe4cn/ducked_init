@@ -209,7 +209,7 @@ export const CAPABILITIES: CapabilityEntry[] = [
         title: '上限',
         items: [
           { name: 'dimensions', description: `最多 ${MAX_DIMENSIONS} 个维度` },
-          { name: 'path', description: `维度路径最多 ${MAX_HOPS} 跳，每一跳是指向下一实体单列主键的关系，不能成环` },
+          { name: 'path', description: `维度路径最多 ${MAX_HOPS} 跳，每一跳是指向下一实体单列主键的关系，不能成环；终点不能是时间（timestamp）字段，DSL 没有时间分桶` },
         ],
       },
     ],

@@ -29,6 +29,7 @@ const METRIC_RULES = [
   '- sum / avg 只能用整数或小数字段；过滤取值按字段类型写，有取值列表的字段只能用其中的取值。',
   `- filter、measure、window 的字段也能写维度路径，但不能写 ${CONSUMER_ENTITY}.字段。`,
   '- count 数的是基础实体的行数：base 为 order_item 时数的是明细行，要数订单写 { "agg": "count_distinct", "field": "order_id" }。',
+  '- 时间（timestamp）字段不能做维度：DSL 没有时间分桶；需求要按小时 / 天 / 月分组或取峰值时，说明做不到，不要用时间字段凑维度。',
   '- 需求没提到的部分不要加；不要输出 device_attribution。',
 ];
 
@@ -54,7 +55,7 @@ const METRIC_PARSE_SYSTEM = [
   '- items 逐项说明 spec 的每个部分是怎么从句子来的：path 用它在 spec 里的位置（如 measure.field、filter.0、window），reason 一句话。',
   '- 句子里认不出的词照原话进 unknowns（如目录里没有的字段、对应不上的说法），不要猜。',
   '- 「或」只在同一字段的不同取值时改写成一个 in 过滤（value 是列表）；跨字段的「或」表达不了，整句原话进 unsupported，不写进 spec。',
-  '- 时间只认「近 N 天」，写成 window；「上个月」「今年」等其他时间说法整句原话进 unsupported，不写进 spec。',
+  '- 时间只认「近 N 天」，写成 window；「上个月」「今年」等其他时间说法整句原话进 unsupported，不写进 spec；按小时 / 天 / 月分组、取峰值的说法也整句原话进 unsupported。',
   '- 「分母为 0 时算 0」整句原话进 unsupported：编译用 NULLIF，分母为 0 时结果是空，不是 0。',
   '- 句子支撑不了的写法不要写进 spec；unsupported 里的说法一律不进 spec。',
   '',
