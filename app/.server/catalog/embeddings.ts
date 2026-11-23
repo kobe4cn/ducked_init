@@ -131,7 +131,7 @@ export async function fillEmbeddings(tenantId: string): Promise<void> {
     // LlmError 的消息已经过 maskKey；外部库的错误要抹掉连接串。写错误列本身失败只告警，不能吞掉原来的错误
     const message = e instanceof Error ? e.message : String(e);
     await recordFill(tenantId, (url ? redactUrl(message, url) : message).slice(0, 500))
-      .catch(err => console.warn('记录向量补算失败原因时出错', tenantId, err instanceof Error ? err.message : String(err)));
+      .catch(err => console.warn('failed to record embedding fill error', tenantId, err instanceof Error ? err.message : String(err)));
     throw e;
   }
   await recordFill(tenantId, null);
