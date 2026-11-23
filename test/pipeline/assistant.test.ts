@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, dslVersions, llmCalls, mappingVersions } from '../../app/.server/db/schema';
-import { assistantTurn, MAX_FIXES, MAX_TOOL_CALLS } from '../../app/.server/assistant/loop';
+import { assistantTurn, MAX_FIXES, MAX_PLAN_SUMMARY, MAX_TOOL_CALLS } from '../../app/.server/assistant/loop';
 import { catalogFor, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { semanticHash, type AnalysisPlan } from '../../app/.server/catalog/plan';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
@@ -131,6 +131,9 @@ describe('AI 助手的一轮问答', () => {
     expect(system).toContain('validate_plan');
     expect(system).toContain('needs_clarification');
     expect(system).toContain('unsupported');
+    // 没有 priorPlan 时不带「对话里最近一份计划」摘要（#1179）
+    expect(system).toContain('本轮或对话里最近一份计划已检索到的条目');
+    expect(system).not.toContain('prior_plan:');
   });
 
   it(`连续要求调用工具时，第 ${MAX_TOOL_CALLS} 次之后结束本轮并告知`, async () => {
@@ -366,6 +369,61 @@ describe('计划随对话，存草稿 / 填工作台前重新校验（ADR-0050�
     expect(turn.workbenchSql).toBeUndefined();
     const tool = received[3].body.messages.filter(m => m.role === 'tool').at(-1)!;
     expect(tool.content).toBe('未填入：计划的 mode 是 clarify，只有 draft_query 的计划能填入工作台');
+  });
+
+  /** 第二轮：模型沿用对话里的计划，不检索，先 validate_plan 再 prefill_workbench（#1179） */
+  async function reuseWithoutSearch(analyst: CurrentMember, plan: AnalysisPlan) {
+    const steps = [
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+      toolCalls({ name: 'prefill_workbench', args: { sql: CITY_COUNT } }, TOOL_USAGE),
+    ];
+    const { received } = fakeLlm(setLlmFetch, n => steps[n - 1] ?? text('已按这个计划填好', TEXT_USAGE));
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '请按这个计划生成 SQL 填入工作台' }], PAGE, plan);
+    const tools = received.at(-1)!.body.messages.filter(m => m.role === 'tool');
+    return { turn, system: received[0].body.messages[0].content as string, validated: tools[0].content, prefilled: tools[1].content };
+  }
+
+  it('沿用对话里的计划（#1179）：系统提示带计划摘要，第二轮不检索直接 validate_plan 通过、prefill_workbench 返回 workbenchSql', async () => {
+    const { analyst, plan: draft } = await draftQueryPlan();
+    const plan = { ...draft, rationale: '会员数直接用已发布的 member_count，这句理由不进系统提示' };
+    const { turn, system, validated, prefilled } = await reuseWithoutSearch(analyst, plan);
+    expect(turn).toEqual({ reply: '已按这个计划填好', toolsUsed: ['validate_plan', 'prefill_workbench'], plan, workbenchSql: CITY_COUNT });
+    expect(validated).toBe('status: valid');
+    expect(prefilled).toBe('已准备好填入工作台：成员点链接把 SQL 放进编辑器，自己执行');
+    // 摘要：mode、request、selected 的 id / version / semanticHash；不含 rationale，整段不超过 MAX_PLAN_SUMMARY
+    expect(system).toContain('直接写 SQL 调 prefill_workbench');
+    expect(system).toContain('末尾的 prior_plan');
+    const summary = system.slice(system.indexOf('prior_plan:'));
+    expect(summary).toContain('mode: draft_query');
+    expect(summary).toContain('request: {"dimensions":[]}');
+    expect(summary).toContain(`- metric:member_count · version: ${plan.selected[0].version} · semanticHash: ${plan.selected[0].semanticHash}`);
+    expect(system).not.toContain(plan.rationale);
+    expect(summary.length).toBeLessThanOrEqual(MAX_PLAN_SUMMARY);
+  });
+
+  it('沿用对话里的计划，request 超长（#1179）：摘要截到 MAX_PLAN_SUMMARY 字以内', async () => {
+    const { analyst, plan: draft } = await draftQueryPlan();
+    const plan = { ...draft, request: { dimensions: [], population: '近一年'.repeat(1000) } };
+    const { system } = await reuseWithoutSearch(analyst, plan);
+    const summary = system.slice(system.indexOf('prior_plan:'));
+    expect(summary.length).toBeLessThanOrEqual(MAX_PLAN_SUMMARY);
+    expect(summary).toContain('mode: draft_query');
+  });
+
+  it('沿用对话里的计划，但两轮之间指标升版（#1179）：validate_plan 判依赖变了并提示重新检索，prefill_workbench 被拒、不带 workbenchSql', async () => {
+    const { author, reviewer, analyst, plan } = await draftQueryPlan();
+    await saveDslDraft(author, 'metric', 'member_count', `# 换个说法\n${COUNT_MEMBERS}`);
+    await publishDefinition(reviewer, 'metric', 'member_count', 2);
+    const { turn, validated, prefilled } = await reuseWithoutSearch(analyst, plan);
+    expect(turn.workbenchSql).toBeUndefined();
+    // 预填进 retrieved 只免去「不在本次检索结果里」，版本与语义哈希仍按当前目录检查（ADR-0050）
+    expect(validated).toContain('status: invalid');
+    expect(validated).toContain('版本不一致：计划里是 v1，目录里是 v2');
+    expect(validated).not.toContain('不在本次检索结果里');
+    expect(validated).toContain('依赖变了');
+    expect(validated).toContain('重新检索');
+    expect(prefilled).toContain('未填入：计划已过期，填入工作台前用当前目录重新校验没有通过。');
+    expect(prefilled).toContain('请重新检索并校验计划后再填入');
   });
 
   it('本轮和对话里都没有计划：填入被拒、提示先校验 draft_query 计划', async () => {

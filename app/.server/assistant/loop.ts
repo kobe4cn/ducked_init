@@ -3,13 +3,15 @@
 // 助手只能用注册表里的工具，不能执行查询、不能发布；工具出错时把错误文本回填给模型，由它决定怎么继续。
 // 起草（ADR-0042）：校验、保存类工具以「经助手」的成员身份调用（审计带 via: 'assistant'），不通过时问题清单回填给模型修正，
 // 最多再修正 MAX_FIXES 次；仍不通过时不再请求模型，由服务端把问题清单与最后一版 YAML 交给成员。
-// 分析计划（ADR-0050）：每轮新建一个检索候选集合（ToolCtx.retrieved）传给每次工具调用，validate_plan 只认本轮 catalog_search / catalog_expand 返回过的条目；
-// 本轮校验过的最后一份结构合法的计划（ToolCtx.plan）随答复返回、由路由存进对话，对话里最近一份作为 priorPlan 带进下一轮，存草稿 / 填工作台前重新校验
+// 分析计划（ADR-0050）：每轮新建一个检索候选集合（ToolCtx.retrieved）传给每次工具调用，validate_plan 只认本轮 catalog_search / catalog_expand 返回过的条目
+// 与对话里最近一份计划引用过的条目（#1179，一轮开始时用 planRetrievedIds(priorPlan) 预先填入）；
+// 本轮校验过的最后一份结构合法的计划（ToolCtx.plan）随答复返回、由路由存进对话，对话里最近一份作为 priorPlan 带进下一轮：
+// 它的摘要（不含 rationale 与步骤）拼在系统提示末尾，模型沿用它时不必重新检索；存草稿 / 填工作台前照旧对当前目录重新校验
 // 本轮 prefill_workbench 通过校验的 SQL（ToolCtx.workbenchSql）随答复返回；本轮最后一次 catalog_search 判为歧义的追问候选（ToolCtx.choices，⑥-3）也随答复返回；
 // 返回给前端的只有文字答复、用过的工具名、本轮的计划、这份 SQL 与歧义候选，不回传工具原文；
 // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮每次请求都用同一套端点与模型（chatToolsWith）、在 platform.llm_calls 记一条 assistant（route=reasoning），不存提示词与答复原文
 import type { CurrentMember } from '../auth';
-import type { AnalysisPlan } from '../catalog/plan';
+import { planRetrievedIds, type AnalysisPlan } from '../catalog/plan';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
 import { chatToolsWith, LlmError, resolveRoute, type LlmMessage } from '../llm';
 import { toolSupport } from '../model-provider';
@@ -66,17 +68,37 @@ function checkHistory(history: unknown): asserts history is ChatTurn[] {
 
 const clip = (s: unknown) => (typeof s === 'string' ? s.slice(0, 200) : '');
 
-const systemPrompt = (page: AssistantPage) => [
+/** 系统提示末尾「对话里最近一份计划」摘要的字数上限（#1179）：只放 mode、request、selected 与 excluded 的 id，不放 rationale 与步骤 */
+export const MAX_PLAN_SUMMARY = 2000;
+
+/**
+ * 对话里最近一份计划的摘要（#1179）：超长时截到 MAX_PLAN_SUMMARY 字以内。
+ * 块名 prior_plan 与字段都用英文键，说明写在系统提示改过措辞的那一句里（i18n 棘轮按含汉字的行计，提示词不豁免）
+ */
+function planSummary(plan: AnalysisPlan): string {
+  const summary = [
+    'prior_plan:',
+    `mode: ${plan.mode}`,
+    `request: ${JSON.stringify(plan.request)}`,
+    'selected:',
+    ...plan.selected.map(s => `- ${s.id}${s.version === undefined ? '' : ` · version: ${s.version}`} · semanticHash: ${s.semanticHash}`),
+    ...(plan.excluded?.length ? [`excluded: ${plan.excluded.map(x => x.id).join(', ')}`] : []),
+  ].join('\n');
+  return summary.length > MAX_PLAN_SUMMARY ? `${summary.slice(0, MAX_PLAN_SUMMARY - 2)}\n…` : summary;
+}
+
+const systemPrompt = (page: AssistantPage, priorPlan?: AnalysisPlan) => [
   '你是本租户 CRM 数据分析平台的数据助手，用中文回答成员的问题。',
   '你只能用给定的工具读语义目录（实体、字段、关系、指标、标签与模板）、校验并保存草稿，不能执行查询，只能把 draft_query 计划的 SQL 用 prefill_workbench 填进工作台，由成员自己执行；不能发布任何东西，需要这些操作时告诉成员去对应页面自己做。',
   '先用目录工具查清楚再回答，不要编造目录里没有的实体、字段或指标。',
-  '回答成员的数据分析问题前，先用 catalog_overview 看目录分组，再用 catalog_expand 展开分组（group:… 标识）或 catalog_search 检索相关条目，再把分析计划 JSON 交给 validate_plan 校验：计划只能引用本轮检索到的条目，并带上返回的 semanticHash（指标、标签、模板还要带 version）。',
+  '回答成员的数据分析问题前，先用 catalog_overview 看目录分组，再用 catalog_expand 展开分组（group:… 标识）或 catalog_search 检索相关条目，再把分析计划 JSON 交给 validate_plan 校验：计划只能引用本轮或对话里最近一份计划已检索到的条目，并带上返回的 semanticHash（指标、标签、模板还要带 version）；对话里最近一份计划（如有）是末尾的 prior_plan，成员要求按已有计划生成 SQL 时，不必重新 catalog_overview / 检索，直接写 SQL 调 prefill_workbench；要改计划就改完再 validate_plan；条目变了 validate_plan / prefill_workbench 会指出，再按提示重新检索。',
   '计划里用 rationale 一两句话说明为何选这些条目，写给成员看，只提本轮检索到、成员看得到的条目。',
   'validate_plan 返回 needs_clarification 时，把计划里的问题逐条向成员追问，本轮不再继续；返回 unsupported 时，向成员说明做不到的原因与问题里建议的下一步。',
   '把 SQL 填进工作台前，先用 validate_plan 校验一份 draft_query 计划，通过后再调 prefill_workbench。',
   '起草指标、标签或映射时，先用 validate_* 校验，通过后再用 save_* 保存为草稿；不通过时按问题清单修改后重试。保存后提醒成员草稿要由另一位有发布权限的成员发布。',
   `定义的 key 只能用小写字母、数字与下划线，以小写字母开头（${DSL_KEY_PATTERN.source}）。`,
   `成员当前在页面 ${clip(page.path)}「${clip(page.title)}」。`,
+  ...(priorPlan ? [planSummary(priorPlan)] : []),
 ].join('\n');
 
 /** runTool 抛出的 data({ message }, { status }) 或普通错误，转成回填给模型的文本 */
@@ -98,7 +120,8 @@ async function callTool(actor: CurrentMember, name: string, args: string, ctx: T
 /**
  * 一轮问答：没配置模型服务 409；最近一次探测为不支持工具调用时 422（不发请求），模型服务出错 422；对话不合格 400。
  * 第 MAX_TOOL_CALLS 次工具调用之后模型还要调用工具时，结束本轮并告知。
- * priorPlan 是对话里最近一份计划（ADR-0050）：不带进发给模型的历史，只经 ToolCtx 给存草稿 / 填工作台前的重新校验兜底；
+ * priorPlan 是对话里最近一份计划（ADR-0050）：不带进发给模型的历史，摘要拼在系统提示末尾、它的条目预先算作本轮已检索（#1179），
+ * 并经 ToolCtx 给存草稿 / 填工作台前的重新校验兜底；
  * 返回的 plan 只来自本轮 validate_plan（不回传 priorPlan），workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（没有时都缺省）。
  * 一轮开始时解析一次 reasoning 档位的路由（#531）：整轮所有请求用同一个模型，中途改配置不影响本轮（tool_call 历史对模型敏感）
  */
@@ -114,13 +137,14 @@ export async function assistantTurn(
 
   const tools = toolsFor(actor).map(t => ({ name: t.name, description: t.description, parameters: t.inputSchema }));
   const messages: LlmMessage[] = [
-    { role: 'system', content: systemPrompt(page) },
+    { role: 'system', content: systemPrompt(page, priorPlan) },
     ...history.map(m => ({ role: m.role, content: m.content })),
   ];
   const toolsUsed: string[] = [];
   // 本轮的上下文：retrieved 是本轮检索到的候选条目（catalog_search / catalog_expand 记进来，validate_plan 只认这些，每轮新建），
+  // 一开始预先填入对话里最近一份计划引用过的条目（#1179，沿用计划不必重新检索；版本、哈希与可见性仍由 validatePlan 对当前目录检查），
   // priorPlan 是对话里最近一份计划，plan 由本轮 validate_plan 写进（不带 priorPlan 初始化，免得每轮把旧计划再存一遍）
-  const ctx: ToolCtx = { retrieved: new Set(), priorPlan };
+  const ctx: ToolCtx = { retrieved: new Set(priorPlan ? planRetrievedIds(priorPlan) : []), priorPlan };
   // 经助手的操作在审计里注明（只加在这里传给工具的 actor 上）
   const via: CurrentMember = { ...actor, via: 'assistant' };
   let failures = 0;
