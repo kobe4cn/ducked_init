@@ -94,6 +94,42 @@ describe('我的设置：个人令牌', () => {
     expect((await analyst.post('/settings', { intent: 'create', name: 'x'.repeat(65), days: '30' })).status).toBe(400);
   });
 
+  it('签发后的提示给出完整 MCP 地址与填好这次明文的 Claude Code 命令，工具清单随「允许执行查询」多出 run_query；刷新后片段只有占位符', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'an@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an@acme.com');
+    /** 签发提示里本令牌的工具清单（data-mcp-tools 列表里的 li） */
+    const toolsIn = (html: string) => {
+      const list = html.match(/data-mcp-tools="created"[^>]*>(.*?)<\/ul>/)?.[1];
+      if (list === undefined) throw new Error('签发提示里没有工具清单');
+      return [...list.matchAll(/<li[^>]*>([^<]+)<\/li>/g)].map(m => m[1]);
+    };
+
+    const withQuery = await issue(analyst, 'Q', { days: '30', allowQuery: 'on' });
+    const url = withQuery.html.match(/http:\/\/[\w.:-]+\/mcp/)?.[0];
+    expect(url).toBeDefined();
+    expect(withQuery.html).toContain(
+      `claude mcp add --transport http crm ${url} --header &quot;Authorization: Bearer ${withQuery.token}&quot;`,
+    );
+    expect(withQuery.html).toContain('SSE');
+    expect(toolsIn(withQuery.html)).toContain('run_query');
+    expect(toolsIn(withQuery.html)).toContain('save_definition_draft');
+
+    const noQuery = await issue(analyst, 'N');
+    expect(toolsIn(noQuery.html)).not.toContain('run_query');
+    expect(toolsIn(noQuery.html)).toContain('save_definition_draft');
+
+    const page = await (await analyst.get('/settings')).text();
+    expect(page).toContain(`claude mcp add --transport http crm ${url} --header &quot;Authorization: Bearer &lt;你的令牌&gt;&quot;`);
+    // 列表里的前缀本身以 crm_pat_ 开头，所以只看片段：平时那块的片段一律是占位符
+    const snippets = [...page.matchAll(/data-mcp-snippet="[^"]*"[^>]*>([^<]*)</g)].map(m => m[1]);
+    expect(snippets).toHaveLength(4);
+    for (const text of snippets) expect(text).not.toContain('crm_pat_');
+    expect(page).not.toContain(withQuery.token);
+    expect(page).not.toContain(noQuery.token);
+    expect(page).toContain('run_query');
+  });
+
   it('另一位成员看不到、也吊销不了别人的令牌（404），令牌照常可用', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'an@acme.com', 'analyst');
