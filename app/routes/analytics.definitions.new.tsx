@@ -7,7 +7,9 @@
 // 构建器与 YAML 的切换带上内容（intent=to-yaml / to-builder，#797）：切换提交本页表单，服务端转换后回显到目标模式（应答的 mode 覆盖 URL 里的 ?mode=）；
 // YAML 里有构建器表达不了的项（维度、只读项）时先逐项列出、确认（to-builder-confirmed）后才切，YAML 读不出来 400 不切换、编辑框保持原内容；空构建器切 YAML 给示例。
 // 种类切换仍是链接（内容带不过去），有还没保存的内容时客户端先确认（app/lib/unsaved-changes.ts：快照比基线，页面上有 action 回显一律算未保存）。
-// 可以写下需求后用模型生成草稿（intent=model-draft，ADR-0035，只在 YAML 模式）：生成的 YAML 填进编辑框、不保存，失败时编辑框保持原内容
+// 可以写下需求后用模型生成草稿（intent=model-draft，ADR-0035，只在 YAML 模式）：生成的 YAML 填进编辑框、不保存，失败时编辑框保持原内容；
+// 指标草稿在编辑框上方逐项说明（#1163，与一句话解析同一个面板），编辑框已有内容（不是空也不是示例）时先给只读草稿，
+// 点「确认覆盖」（intent=applyDraft，草稿重新 checkMetric、不信客户端）才替换；标签草稿仍直接填入
 // 指标的构建器模式还能写一句话解析（intent=parse，#517）：parseMetricSentence 把句子解析成表单填进构建器并逐项说明，
 // 已有内容时先列出差异（intent=applyParse 确认后才覆盖），解析失败时表单保持原样
 import { useEffect, useRef } from 'react';
@@ -17,12 +19,12 @@ import { DraftAmbiguity } from '~/components/draft-ambiguity';
 import { requirePermission } from '~/.server/access';
 import type { DraftAmbiguity as DraftAmbiguityInfo } from '~/.server/catalog/draft-search';
 import { publishedCustomEntities } from '~/.server/custom-entities';
-import { createDefinition, DslError, dslContext, modelDraftForDefinition } from '~/.server/dsl-definitions';
+import { createDefinition, type DraftExplanation, DslError, dslContext, modelDraftForDefinition } from '~/.server/dsl-definitions';
 import { errorTextFor } from '~/.server/i18n';
 import { getLocale } from '~/.server/locale';
 import { MetricParseError, parseMetricSentence } from '~/.server/metric-parse';
 import { DSL_KINDS, isDslKind, type DslKind } from '~/.server/pipeline/dsl';
-import { checkMetric, compileMetric, fieldsFor } from '~/.server/pipeline/dsl/metric-spec';
+import { checkMetric, compileMetric, type DslIssue, fieldsFor } from '~/.server/pipeline/dsl/metric-spec';
 import { metricOf } from '~/.server/pipeline/dsl/tag-spec';
 import { getDb } from '~/.server/db/client';
 import { todayUtc } from '~/.server/templates';
@@ -31,7 +33,7 @@ import { cmp } from '~/lib/compare';
 import { formToYaml as tagFormToYaml, yamlToForm as tagYamlToForm, type TagForm } from '~/lib/tag-form';
 import { diffForms, formToYaml, summarize, yamlToForm, type Cond, type FormField, type MetricForm, type RatioForm } from '~/lib/metric-form';
 import { hasUnsavedChanges, snapshotOf } from '~/lib/unsaved-changes';
-import { makeT, msgText } from '~/lib/i18n';
+import { makeT, msgText, useT } from '~/lib/i18n';
 import enClient from '~/i18n/en.client.json';
 import { TAG_CONDITIONS, type TagCondition } from '~/lib/tag-vocab';
 import { navFor } from '~/.server/nav';
@@ -273,10 +275,15 @@ export async function action({ request }: Route.ActionArgs) {
     parse: undefined, parsed: undefined, diff: undefined, dropped: undefined as DroppedItem[] | undefined,
     /** model-draft / parse 检索判出的歧义（#827、#853）：词与候选，草稿 / 解析照常生成、在上方提示成员确认；其余分支占位让组件统一读 */
     ambiguity: undefined as DraftAmbiguityInfo | undefined,
+    /** 指标 model-draft 的逐项说明与待确认的草稿（编辑框已有内容时才有 draft，#1163）；其余分支占位 */
+    explanation: null as DraftExplanation | null,
+    draft: null as string | null,
     /** 指标与标签的编辑模式；其他种类没有模式 */
     mode: (kind === 'metric' || kind === 'tag') ? currentMode : undefined,
   };
   let yaml = yamlInput;
+  /** 指标 YAML 不过 checkMetric（「检查」与确认覆盖草稿共用）：按行列 400，编辑框回显调用时的 yaml */
+  const invalidMetric = (issues: DslIssue[]) => data({ error: `指标定义有 ${issues.length} 个问题`, issues, yaml, summary: null, sql: null, ...keep }, { status: 400 });
   // 界面语言：指标摘要 / 差异 / 切构建器时丢弃项的原因与读不出来的报错按它出文字（英文界面查客户端词典，与页面展示同一份，ADR-0060）
   const locale = await getLocale(request);
   const t = makeT(locale, locale === 'en' ? enClient : null);
@@ -327,7 +334,19 @@ export async function action({ request }: Route.ActionArgs) {
     }
     if (intent === 'model-draft') {
       const generated = await modelDraftForDefinition(member, kind, requirement);
-      return { error: null, issues: [], yaml: generated.yaml, summary: null, sql: null, ...keep, generated: true, ambiguity: generated.ambiguity };
+      // 指标：编辑框为空或还是示例时直接填入；已有内容时 yaml 回显原内容（echoId 变了编辑框会重挂载），草稿等成员确认覆盖
+      const blank = yamlInput.trim() === '' || yamlInput.trim() === EXAMPLES.metric.example.trim();
+      if (kind === 'metric' && !blank) {
+        return { error: null, issues: [], yaml: yamlInput, summary: null, sql: null, ...keep, ambiguity: generated.ambiguity, explanation: generated.explanation, draft: generated.yaml };
+      }
+      return { error: null, issues: [], yaml: generated.yaml, summary: null, sql: null, ...keep, generated: true, ambiguity: generated.ambiguity, explanation: generated.explanation };
+    }
+    if (kind === 'metric' && intent === 'applyDraft') {
+      // 确认覆盖：隐藏草稿是客户端回传的，重新 checkMetric，不合法按行列 400、编辑框保持原内容；不回传说明（只显示「已用模型生成草稿」）
+      const draft = String(form.get('draft') ?? '');
+      const result = checkMetric(draft, await dslContext(getDb(), member.tenant.id));
+      if (!result.ok) return invalidMetric(result.issues);
+      return { error: null, issues: [], yaml: draft, summary: null, sql: null, ...keep, generated: true };
     }
     if (kind === 'metric' && intent === 'parse') {
       const parsed = await parseMetricSentence(member, sentence);
@@ -375,7 +394,7 @@ export async function action({ request }: Route.ActionArgs) {
       if (builder !== undefined) yaml = formToYaml(formState, labelled);
       if (intent === 'check') {
         const result = checkMetric(yaml, ctx);
-        if (!result.ok) return data({ error: `指标定义有 ${result.issues.length} 个问题`, issues: result.issues, yaml, summary: null, sql: null, ...keep }, { status: 400 });
+        if (!result.ok) return invalidMetric(result.issues);
         // 只编译、不碰数据湖；摘要给四句（ratio）或三句
         return { error: null, issues: [], yaml, summary: summarize(t, formState, labelled), sql: compileMetric(result.spec, ctx, todayUtc()), ...keep };
       }
@@ -395,6 +414,7 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
   const { email, nav, kind, label, kinds, entities, tagMetrics } = loaderData;
   const { placeholder, example, request, sends } = EXAMPLES[kind];
   const submitting = useNavigation().state === 'submitting';
+  const t = useT();
   // 指标与标签都在构建器与 YAML 间切换：切换提交本页表单（intent=to-*），服务端把内容带到目标模式，应答的 mode 覆盖 URL 里的 ?mode=
   const mode = actionData?.mode ?? loaderData.mode;
   const builder = (kind === 'metric' || kind === 'tag') && mode !== 'yaml';
@@ -495,7 +515,7 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
                     placeholder={request}
                     className="w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
                   />
-                  <FieldDescription>用自然语言写下要算什么，点「用模型生成草稿」：会把需求与{sends}发给模型服务，生成的定义替换编辑框里的内容，不会保存。</FieldDescription>
+                  <FieldDescription>用自然语言写下要算什么，点「用模型生成草稿」：会把需求与{sends}发给模型服务，{t('生成的定义填进编辑框，不会保存；编辑框已有内容时先给出草稿，确认后才覆盖。')}</FieldDescription>
                   <div>
                     <Button type="submit" name="intent" value="model-draft" variant="outline" formNoValidate disabled={submitting}>用模型生成草稿</Button>
                   </div>
@@ -503,6 +523,17 @@ export default function NewDefinition({ loaderData, actionData }: Route.Componen
                 {actionData?.generated && <p className="text-sm text-muted-foreground" data-generated>已用模型生成草稿，请核对后填写键并保存。</p>}
                 {actionData?.ambiguity && (
                   <DraftAmbiguity ambiguity={actionData.ambiguity} hint="请确认模型选的是否是你要的口径，或在需求里写明；常用的理解可以在助手里选定后设为默认口径。" />
+                )}
+                {kind === 'metric' && actionData?.explanation && <MetricParsePanel parse={actionData.explanation} />}
+                {kind === 'metric' && actionData?.draft && (
+                  <div className="space-y-2 rounded-2xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900" data-draft-confirm>
+                    <p className="font-medium">{t('编辑框里已有内容，生成的草稿还没有填入；点「确认覆盖」会替换编辑框现有内容。')}</p>
+                    {/* 确认覆盖时原样提交（服务端重新 checkMetric，不信客户端） */}
+                    <MappingEditor key={actionData.echoId} name="draft" readOnly defaultValue={actionData.draft} />
+                    <div>
+                      <Button type="submit" name="intent" value="applyDraft" variant="outline" formNoValidate disabled={submitting}>{t('确认覆盖')}</Button>
+                    </div>
+                  </div>
                 )}
                 <Field>
                   <FieldLabel>定义（YAML）</FieldLabel>
