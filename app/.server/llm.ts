@@ -1,5 +1,7 @@
 // app/.server/llm.ts —— 模型服务客户端（ADR-0003、ADR-0035）。模型只在设计时产出草稿：调用 OpenAI 兼容的 /chat/completions，
 // 要求返回 JSON 对象并按调用方给的 JSON Schema 校验，不合格就报错，不把半成品交给调用方。
+// 校验的容错（#1160）：模型对用不到的可选键写 null（qwen-max）时按没给处理——删掉出错位置上为 null 的键再校验；输出被 max_tokens
+// 截断（finish_reason: length）时报截断原因而不是「不是 JSON」；内容被 ```json 代码块包着时先去掉外壳；minItems / minimum 等报中文说明。
 // 端点按「租户自己的配置（platform.model_providers，Key 用租户数据密钥加密）> 平台默认（环境变量 LLM_*）」整套选取，不混用。
 // 在选出的一套上按用途分档（ADR-0055）：PURPOSE_TIER 写死每个用途属 fast / reasoning 哪档，平台档位用 LLM_<TIER>_* 环境变量换模型，
 // 租户整套自配时读租户自己的档位列（只填模型沿用租户默认端点与 Key，带端点用档位自己的 Key），平台档位不生效；
@@ -207,6 +209,12 @@ function describeError(e: ErrorObject) {
     case 'additionalProperties': return `${at}不认识的项 ${p.additionalProperty}`;
     case 'type': return `${at}应为 ${p.type}`;
     case 'enum': return `${at}应为以下之一：${(p.allowedValues as unknown[]).join('、')}`;
+    case 'minItems': return `${at}至少要有 ${p.limit} 项`;
+    case 'maxItems': return `${at}最多 ${p.limit} 项`;
+    case 'minLength': return `${at}至少 ${p.limit} 个字`;
+    case 'maxLength': return `${at}最多 ${p.limit} 个字`;
+    case 'minimum': return `${at}不能小于 ${p.limit}`;
+    case 'maximum': return `${at}不能大于 ${p.limit}`;
     default: return `${at}${e.message ?? e.keyword}`;
   }
 }
@@ -231,8 +239,8 @@ async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeou
   }
 }
 
-/** 返回里的 choices[0].message，字段都没校验 */
-interface RawMessage { content?: unknown; tool_calls?: unknown }
+/** 返回里的 choices[0].message（带同一条 choice 的 finish_reason），字段都没校验 */
+interface RawMessage { content?: unknown; tool_calls?: unknown; finishReason?: unknown }
 
 /** POST 一个 JSON 请求到 {baseUrl}{path}（带 Bearer Key 与超时），非 2xx 抛 LlmError（5xx 与 429 算 transient），返回解析后的 JSON，不是 JSON 时返回 null */
 async function postJson(provider: LlmProvider, path: string, payload: Record<string, unknown>, timeout = timeoutMs()): Promise<unknown> {
@@ -270,14 +278,14 @@ function chatExtraBody(provider: LlmProvider): Record<string, unknown> {
 }
 
 /** 发一次 /chat/completions（chatExtra 的服务商参数垫在最底层，payload 之外补上模型名与 temperature 0，平台字段不会被覆盖），
- *  返回 choices[0].message；令牌数填进 stats */
+ *  返回 choices[0].message（带它的 finish_reason，截断判定用）；令牌数填进 stats */
 async function postChat(provider: LlmProvider, payload: Record<string, unknown>, stats: CallStats): Promise<RawMessage> {
   if (!provider.model) throw new LlmError('模型服务配置不完整：没有填写模型名');
   const body = await postJson(provider, '/chat/completions',
     { ...chatExtraBody(provider), model: provider.model, ...payload, temperature: 0 }) as
-    { choices?: { message?: RawMessage }[]; usage?: CallStats['usage'] } | null;
+    { choices?: { message?: RawMessage; finish_reason?: unknown }[]; usage?: CallStats['usage'] } | null;
   stats.usage = body?.usage;
-  return body?.choices?.[0]?.message ?? {};
+  return { ...body?.choices?.[0]?.message ?? {}, finishReason: body?.choices?.[0]?.finish_reason };
 }
 
 /** 发一次 /embeddings（body 是模型名与输入文本），按 data[].index 排好序返回每条输入的向量；usage 的 prompt_tokens 填进 stats。
@@ -294,18 +302,52 @@ async function postEmbeddings(provider: LlmProvider, texts: string[], stats: Cal
   return texts.map((_, i) => byIndex.get(i)!);
 }
 
+/** 普通对象（不是数组、不是 null） */
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** 校验不通过时，把出错位置上值为 null、Schema 不允许 null 的键删掉（qwen-max 对用不到的可选键写 null，按没给处理）。
+ *  只处理 type 错误：Schema 允许 null 的键（如映射的 otherwise）不会报 type 错误，原样保留；必填键删掉后会变成
+ *  required 错误（缺少 x），自然仍不合格。instancePath 是 JSON Pointer，段里的 ~1 / ~0 按指针规则反转义。
+ *  数组元素为 null（父是数组）不处理，交给原报错。返回是否删掉了键 */
+function dropNullOptionals(value: unknown, errors: ErrorObject[] | null | undefined): boolean {
+  let dropped = false;
+  for (const e of errors ?? []) {
+    if (e.keyword !== 'type') continue;
+    const segments = e.instancePath.split('/').slice(1).map(s => s.replaceAll('~1', '/').replaceAll('~0', '~'));
+    const key = segments.pop();
+    if (key === undefined) continue;   // 错误落在根上：没有可删的键
+    let parent: unknown = value;
+    for (const s of segments) {
+      if (Array.isArray(parent)) parent = parent[Number(s)];
+      else if (isRecord(parent)) parent = parent[s];
+      else parent = undefined;
+    }
+    if (isRecord(parent) && parent[key] === null) {
+      delete parent[key];
+      dropped = true;
+    }
+  }
+  return dropped;
+}
+
 /**
  * 用给定的端点调用模型，返回按 schema 校验过的 JSON。不查库、不记日志（评测命令直接用它，产品走 chatJson）。
  * 失败都抛 LlmError（消息里的 API Key 换成 ***，HTTP 错误只带状态码与前 200 字的响应体）；stats 由调用方传入时顺带填上令牌数与校验结果
  */
 export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[], schema: object, stats: CallStats = { schemaValid: null }): Promise<T> {
   return masked(provider.apiKey, async () => {
-    const { content } = await postChat(provider, { messages, response_format: { type: 'json_object' } }, stats);
+    const { content, finishReason } = await postChat(provider, { messages, response_format: { type: 'json_object' } }, stats);
     if (typeof content !== 'string') throw new LlmError('模型服务的返回里没有 choices[0].message.content');
+    // 截断检查放在解析之前：截断的输出多半也不是合法 JSON，先报原因更清楚（schemaValid 留 null）
+    if (finishReason === 'length') throw new LlmError('模型输出被截断（达到输出长度上限），请把需求写得更具体，或换上下文更长的模型');
+    // 有的模型把 JSON 包在 ```json … ``` 代码块里：去掉外壳再解析
+    const fenced = content.trim().match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
     let parsed: unknown;
-    try { parsed = JSON.parse(content); } catch { throw new LlmError('模型返回的内容不是 JSON'); }
+    try { parsed = JSON.parse(fenced ? fenced[1] : content); } catch { throw new LlmError('模型返回的内容不是 JSON'); }
     const validate = validatorFor(schema);
     stats.schemaValid = validate(parsed);
+    // 可选键为 null 时删掉再校验，最多 3 轮；没删掉任何东西就停（报错用最后一次的 schemaErrors）
+    for (let round = 0; !stats.schemaValid && round < 3 && dropNullOptionals(parsed, validate.errors); round++) stats.schemaValid = validate(parsed);
     if (!stats.schemaValid) throw new LlmError(`模型返回的 JSON 不符合 Schema：${schemaErrors(validate)}`);
     return parsed as T;
   });

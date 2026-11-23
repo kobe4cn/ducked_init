@@ -150,6 +150,7 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 | `fakeLlm(set, respond)` | 构造假 fetch（`vi.fn`）并立刻 `set(f)`；第 n 次请求（从 1 数）先记进 `received`（`{ url, headers, body }`，`body` 已解析）再返回 `respond(n, body)`；返回 `{ f, received }` |
 | `text(content, usage?)` | 模型的文字答复 |
 | `json(content, usage?)` | 模型的 JSON 文本答复（`content` 经 `JSON.stringify`） |
+| `truncated(content)` | 模型输出被 `max_tokens` 截断的答复（`finish_reason: length`，不带 usage） |
 | `toolCalls(calls, usage?)` | 模型要调用工具：`{ name, args, id? }` 或其数组，`id` 默认 `call_1`、`call_2`…；`args` 是字符串时原样作为 `arguments`（造不是 JSON 的参数），否则 `JSON.stringify` |
 | `platformEmbedding(baseUrl?)` | `vi.stubEnv` 设平台默认 embedding 端点（ADR-0049，与 chat 的互不影响）：`LLM_EMBEDDING_BASE_URL`（默认 `https://embed.example.com/v1`）、`LLM_EMBEDDING_MODEL=text-embedding-v3`、`LLM_EMBEDDING_API_KEY=sk-embed-secret`；只配一部分时照旧内联 `vi.stubEnv` |
 | `platformTier(tier, model, opts?)` | `vi.stubEnv` 设平台档位（ADR-0055）：`LLM_FAST_*` / `LLM_REASONING_*` 的 `MODEL`，`opts` 里给到的 `baseUrl` / `apiKey` 才设对应变量（要一起给才生效，测「填了又算没填」传空串） |
