@@ -10,7 +10,7 @@ import { and, eq, isNotNull } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
 import type { CurrentMember } from './auth';
-import { ensureEmbeddings } from './catalog/embeddings';
+import { embedBatchSize, ensureEmbeddings } from './catalog/embeddings';
 import { preparePgvector, redactUrl } from './catalog/vector-store-pgvector';
 import { platformStore } from './catalog/vector-store';
 import { getDb } from './db/client';
@@ -397,7 +397,8 @@ export async function testModelProvider(actor: CurrentMember): Promise<Connectiv
 export type EmbeddingTestResult = { ok: true; model: string; dimensions: number; durationMs: number } | { ok: false; error: string };
 
 /**
- * 用当前生效的 embedding 配置发一条样例文本（embed 自己记 purpose=embedding 的调用日志），显示模型、维度与耗时。
+ * 用当前生效的 embedding 配置发一批样例文本（条数等于补算的批大小 embedBatchSize，内容短、互不相同；embed 自己记 purpose=embedding 的调用日志），显示模型、维度与耗时。
+ * 发满一批是为了让服务商的批大小上限（如 DashScope v3/v4 的 10 条）在测试时就暴露，而不是到后台补算才失败。
  * 错误消息由 embed 抹掉了 Key；不写探测结果、不改配置行。租户与平台都没配置时说明原因、不发请求
  */
 export async function testEmbeddingProvider(actor: CurrentMember): Promise<EmbeddingTestResult> {
@@ -407,7 +408,7 @@ export async function testEmbeddingProvider(actor: CurrentMember): Promise<Embed
   const started = Date.now();
   let vectors: number[][] | null;
   try {
-    vectors = await embed(tenantId, ['连通测试']);
+    vectors = await embed(tenantId, Array.from({ length: embedBatchSize() }, (_, i) => `连通测试 ${i + 1}`));
   } catch (e) {
     if (e instanceof LlmError) return { ok: false, error: e.message };
     throw e;

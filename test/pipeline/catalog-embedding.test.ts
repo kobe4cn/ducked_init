@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { EMBED_BATCH, ensureEmbeddings, readEmbeddings } from '../../app/.server/catalog/embeddings';
+import { embedBatchSize, ensureEmbeddings, readEmbeddings } from '../../app/.server/catalog/embeddings';
 import { cmp } from '../../app/lib/compare';
 import { refreshProjection } from '../../app/.server/catalog/projection';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -18,6 +18,9 @@ import { embeddings, fakeLlm, platformEmbedding, type LlmBody } from './llm-fixt
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
 afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+/** 当前环境下的批大小（没设 LLM_EMBEDDING_BATCH_SIZE 时是默认 10） */
+const EMBED_BATCH = embedBatchSize();
 
 /** n 条按 EMBED_BATCH 一批的分批（每批的条数，按顺序） */
 const batches = (n: number) => Array.from({ length: Math.ceil(n / EMBED_BATCH) }, (_, i) => Math.min(EMBED_BATCH, n - i * EMBED_BATCH));
@@ -100,7 +103,7 @@ describe('检索向量缓存', () => {
 
     const texts = await projectionTexts(acme);
     expect(texts.length).toBeGreaterThan(EMBED_BATCH); // 本仓库的规范实体条目足够分出多批
-    expect(received.map(r => r.body.input.length)).toEqual(batches(texts.length)); // 按 64 条一批
+    expect(received.map(r => r.body.input.length)).toEqual(batches(texts.length)); // 按一批 EMBED_BATCH 条
     await expectAligned(acme, 'text-embedding-v3', texts.map(t => t.textHash));
 
     // 再跑一次：向量齐了返回 fresh，不再入队、不发请求
@@ -166,7 +169,7 @@ describe('检索向量缓存', () => {
     expect(stored.length).toBeGreaterThan(EMBED_BATCH);
 
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await fakeProjectionRows(acme, 1, EMBED_BATCH + 6); // 凑出要补算的哈希，第一批（64 条）就失败
+    await fakeProjectionRows(acme, 1, EMBED_BATCH + 6); // 凑出要补算的哈希，第一批（一批 EMBED_BATCH 条）就失败
     setLlmFetch(async () => new Response('server exploded', { status: 500 }));
     expect(await ensureEmbeddings(acme)).toBe('queued');
     await drain();
@@ -213,6 +216,48 @@ describe('检索向量缓存', () => {
     await drain();
     expect(ok.received.map(r => r.body.input.length)).toEqual(batches(stored.length + 1 - EMBED_BATCH)); // 只补缺的
     await expectAligned(acme, 'bge-m3', [...stored.map(r => r.textHash), added].sort(cmp)); // 旧模型的行删掉了
+  });
+
+  it('每批条数取 LLM_EMBEDDING_BATCH_SIZE：没填时按 10 条一批（25 条分 10、10、5），改成 5 时分 5 批；非法值（abc、0、负数、小数）告警后回落 10，空串不告警', async () => {
+    vi.stubEnv('LLM_EMBEDDING_BATCH_SIZE', '');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const acme = await setup();
+    platformEmbedding();
+    fakeLlm(setLlmFetch, byLength);
+    await ensureEmbeddings(acme);
+    await drain(); // 先把现有投影都补齐，之后只缺新加的
+    const before = (await embeddingRows(acme)).length;
+
+    const lengths = async (from: number) => {
+      await fakeProjectionRows(acme, from, 25);
+      const { received } = fakeLlm(setLlmFetch, byLength);
+      expect(await ensureEmbeddings(acme)).toBe('queued');
+      await drain();
+      return received.map(r => r.body.input.length);
+    };
+    expect(await lengths(1)).toEqual([10, 10, 5]);
+    expect(await embeddingRows(acme)).toHaveLength(before + 25);
+    expect(warn).not.toHaveBeenCalled();
+
+    vi.stubEnv('LLM_EMBEDDING_BATCH_SIZE', '5');
+    expect(await lengths(100)).toEqual([5, 5, 5, 5, 5]);
+    expect(await embeddingRows(acme)).toHaveLength(before + 50);
+
+    vi.stubEnv('LLM_EMBEDDING_BATCH_SIZE', 'abc');
+    expect(await lengths(200)).toEqual([10, 10, 5]);
+    expect(await embeddingRows(acme)).toHaveLength(before + 75);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('LLM_EMBEDDING_BATCH_SIZE="abc"'));
+
+    for (const raw of ['0', '-3', '2.5']) {
+      warn.mockClear();
+      expect(embedBatchSize({ LLM_EMBEDDING_BATCH_SIZE: raw })).toBe(10);
+      expect(warn, raw).toHaveBeenCalledTimes(1);
+    }
+    warn.mockClear();
+    expect(embedBatchSize({})).toBe(10);
+    expect(embedBatchSize({ LLM_EMBEDDING_BATCH_SIZE: '' })).toBe(10);
+    expect(embedBatchSize({ LLM_EMBEDDING_BATCH_SIZE: '2048' })).toBe(2048);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it('catalog.projection 任务成功重建投影后顺带入队补算向量：一次 drain 后投影与向量都齐', async () => {
