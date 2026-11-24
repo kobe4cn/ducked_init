@@ -587,6 +587,39 @@ describe('AI 助手起草草稿', () => {
     expect(await getDb().select().from(dslVersions)).toHaveLength(1);
   });
 
+  it(`中途校验通过、之后加未知键被拒超过上限时，答复给最后一版通过的 YAML 并提示可直接保存，不保存（#1185）`, async () => {
+    const { acme } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    const withCaliber = `${COUNT_MEMBERS}caliber: { tax: included }\n`;
+    const calls = [
+      toolCalls({ name: 'validate_definition', args: { kind: 'metric', yaml: COUNT_MEMBERS } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_definition', args: { kind: 'metric', yaml: withCaliber } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_definition', args: { kind: 'metric', yaml: COUNT_MEMBERS } }, TOOL_USAGE),
+      ...Array.from({ length: MAX_FIXES }, () =>
+        toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'member_count', yaml: withCaliber } }, TOOL_USAGE)),
+    ];
+    fakeLlm(setLlmFetch, n => calls[n - 1] ?? text('不该走到这里', TEXT_USAGE));
+
+    const { reply } = await assistantTurn(analyst, [{ role: 'user', content: '把会员数起草成指标并存草稿' }], PAGE);
+    expect(reply).toContain(`修正 ${MAX_FIXES} 次后仍不通过；上一版已通过校验，可以让我直接保存`);
+    expect(reply).toContain('```yaml\n' + COUNT_MEMBERS + '```');
+    expect(reply).not.toContain('caliber: {');
+    expect(reply).not.toContain('草稿没有通过校验');
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
+    // 通过的是标签、被拒的是指标：不同 kind 不用通过的那版，保持原文案
+    const tagThenBad = [
+      toolCalls({ name: 'validate_definition', args: { kind: 'tag', yaml: TIER } }, TOOL_USAGE),
+      ...Array.from({ length: MAX_FIXES + 1 }, () =>
+        toolCalls({ name: 'validate_definition', args: { kind: 'metric', yaml: withCaliber } }, TOOL_USAGE)),
+    ];
+    fakeLlm(setLlmFetch, n => tagThenBad[n - 1] ?? text('不该走到这里', TEXT_USAGE));
+    const other = await assistantTurn(analyst, [{ role: 'user', content: '起草指标' }], PAGE);
+    expect(other.reply).toContain('草稿没有通过校验，未保存');
+    expect(other.reply).not.toContain('可以让我直接保存');
+  });
+
   it('保存映射草稿要 sources:write：分析师没有、强行调用 403，数据工程师可以保存；助手拿不到发布或执行查询的工具', async () => {
     const { acme, author, mappings } = await publishedIdentitySources();
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');

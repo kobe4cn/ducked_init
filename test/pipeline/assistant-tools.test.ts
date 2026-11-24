@@ -173,6 +173,18 @@ describe('AI 助手的工具注册表', () => {
     expect(tool.description).toContain(`最小合法示例（draft_query）：${JSON.stringify(PLAN_EXAMPLE)}`);
   });
 
+  it('validate_definition / save_definition_draft 的说明列出指标与标签 DSL 的顶层键（必填键标出），并说明口径声明与别名不在 YAML 里（#1185）', async () => {
+    const { acme } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    for (const name of ['validate_definition', 'save_definition_draft']) {
+      const { description } = toolsFor(analyst).find(t => t.name === name)!;
+      for (const k of ['base', 'measure', 'filter', 'window', 'rules', 'default', 'missing']) expect(description).toContain(k);
+      expect(description).toContain('必填 base、measure');
+      expect(description).toContain('必填 rules、default');
+      expect(description).toMatch(/口径声明.*别名不在 YAML 里.*业务知识/);
+    }
+  });
+
   it('validate_plan 的最小示例能通过 PLAN_SCHEMA 的结构校验（#1178）', () => {
     expect(new Ajv({ strict: false }).compile(PLAN_SCHEMA)(PLAN_EXAMPLE)).toBe(true);
     // 空目录下条目没检索到，status 是 invalid；只断言结构与步骤检查通过（plan 不为 null）

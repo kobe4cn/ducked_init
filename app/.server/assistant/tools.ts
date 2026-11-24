@@ -27,7 +27,8 @@ import type { HitReason, Ranked } from '../catalog/rank';
 import { getDb } from '../db/client';
 import { dslDefinitions, mappings, spaces, tenants } from '../db/schema';
 import { createDefinition, DslError, saveDslDraft, validateDefinition } from '../dsl-definitions';
-import type { DslIssue } from '../pipeline/dsl/metric-spec';
+import { METRIC_SCHEMA, type DslIssue } from '../pipeline/dsl/metric-spec';
+import { TAG_SCHEMA } from '../pipeline/dsl/tag-spec';
 import { createMapping, MappingError, saveMappingDraft, validateNewMapping } from '../mappings';
 import type { ChoiceGroup } from './conversations';
 import { sourceIdByName } from '../source-config';
@@ -51,8 +52,9 @@ export interface AssistantTool {
   run(actor: CurrentMember, input: Record<string, unknown>, ctx?: ToolCtx): Promise<string | ToolResult>;
 }
 
-/** 工具的结果：rejected 表示校验或保存没有通过，issues 是问题清单的文本、yaml 是被拒的那一版；saved 表示保存了一份草稿 */
-export interface ToolResult { text: string; rejected?: { issues: string; yaml: string }; saved?: true }
+/** 工具的结果：rejected 表示校验或保存没有通过，issues 是问题清单的文本、yaml 是被拒的那一版；saved 表示保存了一份草稿；
+ * validated 是 validate_definition 通过的那一版（助手循环放弃时交给成员，#1185；MCP 只用 text） */
+export interface ToolResult { text: string; rejected?: { issues: string; yaml: string }; saved?: true; validated?: { kind: string; yaml: string } }
 
 /** 本租户的目录，按成员角色过滤（visibleCatalog）：没有 sources:read 时去掉数据源与源表条目，字段不带来源、实体不列映射到它的源表与合并组 */
 export const catalogFor = async (member: CurrentMember): Promise<Catalog> =>
@@ -170,6 +172,13 @@ async function savedOrRejected(yaml: string, save: () => Promise<string>): Promi
 }
 
 const PUBLISH_HINT = '需由另一位有发布权限的成员发布';
+
+/** 一种 DSL 的顶层键与必填键，取自校验用的 Schema（ADR-0041：不另写清单） */
+const dslKeys = (schema: { properties: object; required: readonly string[] }) =>
+  `${Object.keys(schema.properties).join('、')}（必填 ${schema.required.join('、')}；没有别的顶层键）`;
+
+/** 定义工具说明里的 DSL 提示（#1185）：顶层键，以及口径声明、别名不写进 YAML */
+const DSL_KEYS_HINT = `。指标 DSL 顶层键：${dslKeys(METRIC_SCHEMA)}；标签 DSL 顶层键：${dslKeys(TAG_SCHEMA)}。写法见 capability:metric-dsl / capability:tag-dsl。口径声明（含税 / 扣退款 / 币种等）与别名不在 YAML 里，定义发布后在定义页的业务知识面板设置`;
 
 /** 映射草稿的表：取 YAML 里的 table，解析不了时为 undefined（之后的保存会报出问题） */
 function mappingTable(yaml: string): unknown {
@@ -298,7 +307,7 @@ export const TOOLS: AssistantTool[] = [
   },
   {
     name: 'validate_definition',
-    description: '校验一份指标或标签定义（YAML），不保存：通过时回复「校验通过」，否则逐条列出问题',
+    description: `校验一份指标或标签定义（YAML），不保存：通过时回复「校验通过」，否则逐条列出问题${DSL_KEYS_HINT}`,
     inputSchema: {
       type: 'object', required: ['kind', 'yaml'],
       properties: { kind: { enum: ['metric', 'tag'] }, yaml: { type: 'string' } },
@@ -309,7 +318,7 @@ export const TOOLS: AssistantTool[] = [
     external: true,
     run: async (actor, { kind, yaml }) => {
       const result = await validateDefinition(actor, kind as string, yaml as string);
-      if (result.ok) return '校验通过';
+      if (result.ok) return { text: '校验通过', validated: { kind: kind as string, yaml: yaml as string } };
       const issues = issueLines(result.issues);
       return rejected(`有 ${result.issues.length} 个问题：\n${issues}`, issues, yaml as string);
     },
@@ -337,7 +346,7 @@ export const TOOLS: AssistantTool[] = [
   },
   {
     name: 'save_definition_draft',
-    description: `把校验通过的指标或标签定义（YAML）保存为草稿，作者是当前成员；定义已存在时改它的草稿。key 只用小写字母、数字与下划线，以小写字母开头。保存后${PUBLISH_HINT}`,
+    description: `把校验通过的指标或标签定义（YAML）保存为草稿，作者是当前成员；定义已存在时改它的草稿。key 只用小写字母、数字与下划线，以小写字母开头。保存后${PUBLISH_HINT}${DSL_KEYS_HINT}`,
     inputSchema: {
       type: 'object', required: ['kind', 'key', 'yaml'],
       properties: { kind: { enum: ['metric', 'tag'] }, key: { type: 'string' }, yaml: { type: 'string' } },
