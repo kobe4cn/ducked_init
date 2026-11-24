@@ -20,6 +20,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useFetcher, useLocation } from 'react-router';
 import { AlertTriangle, History, Send, Sparkles, X } from 'lucide-react';
+import { AssistantMarkdown } from '~/components/assistant-markdown';
 import { KnowledgeAskCard } from '~/components/knowledge-ask-card';
 import { PlanCard } from '~/components/plan-card';
 import { Button } from '~/components/ui/button';
@@ -313,7 +314,8 @@ export function AssistantMessages({ messages, busy, readOnlyOwner, conversationI
             </div>
           ) : (
             <>
-              <p className="whitespace-pre-wrap">{m.content}</p>
+              {/* 助手回复按 Markdown 渲染（#1186），成员自己发的消息仍按纯文本 */}
+              {m.role === 'assistant' ? <AssistantMarkdown content={m.content} /> : <p className="whitespace-pre-wrap">{m.content}</p>}
               {m.planCard && <PlanCard card={m.planCard} workbenchSql={m.workbenchSql} onFollowUp={readOnlyOwner ? undefined : onFollowUp} />}
               {!m.planCard && m.workbenchSql && <Link data-prefill to={`/workbench?sql=${encodeURIComponent(m.workbenchSql)}`} className="text-xs underline">{t('填入工作台')}</Link>}
               {/* 追问的候选按钮（⑥-3 歧义 / ⑥-5 未命中）：被分享人只读，服务端照旧返回 choices，这里不渲染按钮 */}
