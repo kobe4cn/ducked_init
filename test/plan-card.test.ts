@@ -1,4 +1,4 @@
-// test/plan-card.test.ts —— 计划卡视图 planCardView()（#452 / #453，ADR-0050 / 0005，纯函数，不连库）：模板条目的数据截至取快照时间，
+// test/plan-card.test.ts —— 计划卡视图 planCardView()（#452 / #453，ADR-0050 / 0005，纯函数，不连库）：模板、指标与标签条目的数据截至取快照时间（指标与标签 #1182），
 // 没有快照写「暂无快照」；目录里没有的所选条目只留 id，状态按重新校验给出（不是 valid）；重新校验通过且 reuse_result 时
 // 给 resultHref（所选条目里第一个有结果页的：模板 / 指标 / 标签），clarify / unsupported 原样带上 questions / reason；
 // excluded（#539）目录里有的条目带 id 与名称、没有的只有 reason，excluded 的 id 也算检索过（状态可仍为 valid）
@@ -12,6 +12,27 @@ const SPACE = '00000000-0000-0000-0000-00000000000a';
 const AT = '2026-10-01T00:00:00.000Z';
 
 describe('计划卡视图 planCardView', () => {
+  it('指标与标签取最新快照时间，没有快照的指标写「暂无快照」（#1182）', () => {
+    const snapshot = { table: 'gold.metric_revenue__t1', rows: 42916, at: AT };
+    const catalog: Catalog = buildCatalog({
+      definitions: [
+        { kind: 'metric', key: 'revenue', version: 1, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\n', spaceId: SPACE, snapshot },
+        { kind: 'metric', key: 'orders', version: 1, yaml: 'base: order\nmeasure: { agg: count }\n', spaceId: SPACE },
+        { kind: 'tag', key: 'spender', version: 1, yaml: 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1000 } }\ndefault: low\n', spaceId: SPACE, snapshot: { ...snapshot, at: '2026-10-02T00:00:00.000Z' } },
+      ],
+    });
+    const ids = ['metric:revenue', 'metric:orders', 'tag:spender'];
+    const ref = (id: string): SelectedRef => {
+      const e = catalog.entries.find(x => x.id === id)!;
+      return { id, version: (e as { version: number }).version, semanticHash: semanticHash(e) };
+    };
+    const card = planCardView(catalog, {
+      schemaVersion: 1, mode: 'draft_query', selected: ids.map(ref), request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: ids }], assumptions: [], questions: [],
+    });
+    expect(card.selected.map(s => s.asOf)).toEqual([AT, '暂无快照', '2026-10-02T00:00:00.000Z']);
+  });
+
   it('模板取快照时间、没有快照写「暂无快照」；目录里没有的条目只留 id，状态不是 valid', () => {
     const catalog: Catalog = buildCatalog({
       templates: [

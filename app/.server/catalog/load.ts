@@ -59,7 +59,6 @@ export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenant
     const s = statsByEntity.get(p.entity);
     statsByEntity.set(p.entity, { entity: p.entity, rows: (s?.rows ?? 0) + r.rows, at: s && s.at > at ? s.at : at });
   }
-  const definitions = (await publishedDependents(db, tenantId)).map(d => ({ kind: d.kind, key: d.key, version: d.version, yaml: d.yaml, spaceId: d.spaceId }));
   const publishedTemplates = await db
     .selectDistinctOn([templateVersions.definitionId], { template: templateDefinitions.template, version: templateVersions.version, params: templateVersions.params, spaceId: templateDefinitions.spaceId })
     .from(templateVersions)
@@ -72,10 +71,14 @@ export async function loadCatalogInput(db: Tx | ReturnType<typeof getDb>, tenant
     .where(and(eq(snapshots.tenantId, tenantId), isNull(snapshots.expiredAt)))
     // selectDistinctOn 要求第一个排序键是 template，其后按统计日 newestFirst 挑最新一张
     .orderBy(snapshots.template, ...newestFirst);
-  const templates = publishedTemplates.filter(t => Object.hasOwn(TEMPLATES, t.template)).map(t => {
-    const s = latestSnapshots.find(x => x.template === t.template);
-    return { template: t.template as TemplateId, version: t.version, params: t.params, spaceId: t.spaceId, snapshot: s ? { table: s.table, rows: s.rows, at: s.at.toISOString() } : null };
+  // 键是模板名或 metric:<key> / tag:<key>（registerDslSnapshot 写入，和目录 id 相同）
+  const snapshotOf = new Map(latestSnapshots.map(s => [s.template, { table: s.table, rows: s.rows, at: s.at.toISOString() }]));
+  const definitions = (await publishedDependents(db, tenantId)).map(d => {
+    const snapshot = snapshotOf.get(`${d.kind}:${d.key}`);
+    return { kind: d.kind, key: d.key, version: d.version, yaml: d.yaml, spaceId: d.spaceId, ...(snapshot && { snapshot }) };
   });
+  const templates = publishedTemplates.filter(t => Object.hasOwn(TEMPLATES, t.template)).map(t =>
+    ({ template: t.template as TemplateId, version: t.version, params: t.params, spaceId: t.spaceId, snapshot: snapshotOf.get(t.template) ?? null }));
   return {
     sources: rows,
     tables,

@@ -9,6 +9,7 @@ import {
 import { groupedText } from './catalog-groups';
 import { knowledgeKey } from '../app/.server/knowledge/catalog';
 import { semanticHash } from '../app/.server/catalog/plan';
+import { stripStats } from '../app/.server/catalog/versions';
 import type { MergeMappingParam } from '../app/.server/pipeline/merge-engine';
 
 /** 手写目录输入里定义与模板所属的空间：目录只记录它，不按它过滤（ADR-0048） */
@@ -410,6 +411,33 @@ describe('语义目录', () => {
     expect(toMarkdown(groupItems(c, 'group:templates')!)).toContain('- template:rfm ');
     expect(search(c, '消费金额')[0]?.id).toBe('metric:revenue');
     expect(groupedText(buildCatalog(withDefinitions(5)))).toBe(groupedText(c));
+  });
+
+  it('指标与标签带最新快照：Markdown 写表名、行数、截至时间与结果粒度（标签每个统一消费者一行，指标按有无维度），没有快照写「还没有快照」；快照变了语义哈希、去统计结果与分层输出不变（#1182）', () => {
+    const snap = (rows: number, at: string) => ({ table: `gold.x__${rows}`, rows, at });
+    const withSnapshots = (rows = 42916, at = '2026-11-19T00:00:00.000Z'): CatalogInput => ({
+      ...input(),
+      definitions: [
+        { kind: 'metric', key: 'revenue', version: 2, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\n', spaceId: SPACE, snapshot: snap(rows, at) },
+        { kind: 'metric', key: 'store_orders', version: 1, yaml: 'base: order\nmeasure: { agg: count }\ndimensions:\n  - { name: store, path: order.store_id -> custom_store.name }\n', spaceId: SPACE, snapshot: snap(rows + 1, at) },
+        { kind: 'metric', key: 'orders', version: 1, yaml: 'base: order\nmeasure: { agg: count }\n', spaceId: SPACE },
+        { kind: 'tag', key: 'spender', version: 1, yaml: 'metric: revenue\nrules:\n  - { value: high, when: { gte: 1000 } }\ndefault: low\n', spaceId: SPACE, snapshot: snap(rows + 2, at) },
+      ],
+    });
+    const c = buildCatalog(withSnapshots());
+    const md = (id: string) => toMarkdown(expand(c, id)!);
+    expect(md('metric:revenue')).toContain('- 快照：`gold.x__42916`，42916 行，截至 2026-11-19T00:00:00.000Z（每个消费者一行）');
+    expect(md('metric:store_orders')).toContain('- 快照：`gold.x__42917`，42917 行，截至 2026-11-19T00:00:00.000Z（每个消费者×维度取值一行）');
+    expect(md('tag:spender')).toContain('- 快照：`gold.x__42918`，42918 行，截至 2026-11-19T00:00:00.000Z（每个统一消费者一行）');
+    expect(md('metric:orders')).toContain('- 快照：还没有快照');
+    expect(expand(c, 'metric:orders')).not.toHaveProperty('snapshot');
+
+    const changed = buildCatalog(withSnapshots(7, '2026-11-20T00:00:00.000Z'));
+    for (const id of ['metric:revenue', 'metric:store_orders', 'tag:spender']) expect(semanticHash(expand(changed, id)!), id).toBe(semanticHash(expand(c, id)!));
+    const noSnapshots: CatalogInput = { ...withSnapshots(), definitions: withSnapshots().definitions!.map(({ snapshot: _, ...d }) => d) };
+    expect(stripStats(changed)).toEqual(stripStats(c));
+    expect(JSON.stringify(stripStats(c))).toBe(JSON.stringify(stripStats(buildCatalog(noSnapshots))));
+    expect(groupedText(changed)).toBe(groupedText(c));
   });
 
   it('条目带 knowledge.aliases 时搜索与 Markdown 含别名（映射字段的在血缘项下）；挂不上的丢掉，没有知识时条目没有 knowledge 键', () => {
