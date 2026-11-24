@@ -1,7 +1,7 @@
 // app/routes/model-provider.tsx —— 模型服务（仅管理员）：看当前用平台默认还是本租户配置；保存端点、模型名与 API Key（Key 不回显，留空沿用）、
 // 恢复平台默认、测试连通性（同时显示是否支持工具调用）、开关发送脱敏样本；embedding 端点（ADR-0049）单独一张卡，与 chat 互不影响；
 // fast / reasoning 档位（ADR-0055 路由③a）再一张卡，按用途换模型，端点留空沿用本租户的端点与 Key；chat 与两档各有可选的服务商参数（#1170，JSON 对象，如关思考）；
-// 向量存储（ADR-0058，#848）一张卡：选系统自带还是外部 pgvector，连接串加密不回显，保存时先测连通失败不保存
+// 向量存储（ADR-0058，#848）一张卡：选系统自带还是外部 pgvector，连接串加密不回显，保存时先测连通失败不保存；向量检索卡显示上次补算的时间或失败原因（#1173）
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleAlert } from 'lucide-react';
 import type { Route } from './+types/model-provider';
@@ -143,6 +143,27 @@ function VectorStoreStatus({ checkedAt, error }: { checkedAt: string | null; err
       <AlertTriangle className="size-4" />{t('还没有测试过连接')}
     </span>
   );
+}
+
+/** 向量检索卡上的「上次补算」状态行（#1173）：error 非空即失败（原因写库时已脱敏），否则有时间就是成功；从未补算过不渲染 */
+function EmbeddingFillStatus({ fill }: { fill: { at: string | null; error: string | null } | null }) {
+  const t = useT();
+  const locale = useLocale();
+  if (fill?.error) {
+    return (
+      <div data-embedding-fill="failed" className="flex items-center gap-1 text-sm text-red-600">
+        <CircleAlert className="size-4" />{t('上次补算失败：{error}', { error: fill.error })}
+      </div>
+    );
+  }
+  if (fill?.at) {
+    return (
+      <div data-embedding-fill="ok" className="flex items-center gap-1 text-sm text-emerald-600">
+        <CheckCircle2 className="size-4" />{t('上次补算成功：{at}', { at: formatDateTime(locale, fill.at) })}
+      </div>
+    );
+  }
+  return null;
 }
 
 /** 每档的名字与它管哪些用途（ADR-0055 的 PURPOSE_TIER 决定，页面只做说明） */
@@ -383,6 +404,7 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
         <SectionHeader title={t('向量检索（可选）')}>
           <span data-embedding-source={provider.embedding.source}>{embeddingSourceLabel(t, provider.embedding.source)}</span>
         </SectionHeader>
+        <EmbeddingFillStatus fill={provider.embedding.fill} />
         <div className="flex flex-wrap gap-2">
           <Form method="post">
             <input type="hidden" name="intent" value="embedding_test" />
