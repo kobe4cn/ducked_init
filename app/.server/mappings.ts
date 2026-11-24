@@ -25,7 +25,7 @@ import { dropAssertions, ruleAssertions } from './pipeline/assertion-fallback';
 import { customAssertionName } from './pipeline/custom-assertions';
 import { draftCustomMapping, draftMapping, DraftError, reuseMappingYaml } from './pipeline/mapping-draft';
 import {
-  ASSERTION_DRAFT_SCHEMA, assertionDraftMessages, assertionsToYaml, type AssertionDraft, dropItems, MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type DraftItem, type ModelDraft,
+  ASSERTION_DRAFT_SCHEMA, assertionDraftMessages, assertionsToYaml, type AssertionDraft, adoptModelDraft, MODEL_DRAFT_SCHEMA, modelDraftMessages, type DraftItem, type ModelDraft,
 } from './pipeline/model-draft';
 import { checkMapping, type CustomerSources, mappingTemplate, type MappingIssue, type MergePlan, type PublishedPlan } from './pipeline/mapping-spec';
 import type { Rename } from './pipeline/schema-repair';
@@ -273,32 +273,28 @@ export async function modelDraftFor(
     await failed({ stage: 'model', error: e.message.slice(0, 200) });
     throw new MappingError(`模型生成草稿失败：${e.message}`, 422);
   }
-  const { yaml, items } = modelOutputToYaml(base.yaml, out);
   /** 整份不采用：审计只记问题数与前 10 个位置，错误带问题列表（行号指模型生成的那份） */
   const reject = async (issues: MappingIssue[]): Promise<never> => {
     await failed({ stage: 'mapping', issues: issues.length, paths: issues.slice(0, 10).map(i => i.path) });
     throw new MappingError(`模型生成的映射有 ${issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, issues);
   };
-  try {
-    await checkMappingDraft(tenantId, sourceId, yaml);
-  } catch (e) {
-    if (!(e instanceof MappingError)) throw e;
-    // 只去掉有问题的个别项（退回规则草稿或删除）再校验一次；有定位不到的项时 dropItems 返回 null，整份不采用
-    const partial = dropItems(base.yaml, yaml, items, e.issues);
-    if (!partial) return reject(e.issues);
+  const r = await adoptModelDraft(base.yaml, out, async (y) => {
     try {
-      await checkMappingDraft(tenantId, sourceId, partial.yaml);
-    } catch (e2) {
-      if (!(e2 instanceof MappingError)) throw e2;
-      return reject(e2.issues);
+      await checkMappingDraft(tenantId, sourceId, y);
+      return [];
+    } catch (e) {
+      if (e instanceof MappingError) return e.issues;
+      throw e;
     }
+  });
+  if (r.status === 'rejected') return reject(r.issues);
+  if (r.status === 'partial') {
     await recordAudit(getDb(), {
       tenantId, actor, action: 'mapping.model_draft_partial', targetType: 'source', targetId: sourceId,
-      detail: { sourceId, source: source.name, table, entity, dropped: partial.items.filter(i => i.dropped).map(i => i.path), issues: e.issues.length },
+      detail: { sourceId, source: source.name, table, entity, dropped: r.dropped, issues: r.issues },
     });
-    return record('model', partial.yaml, partial.items);
   }
-  return record('model', yaml, items);
+  return record('model', r.yaml, r.items);
 }
 
 /**

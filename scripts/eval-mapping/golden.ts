@@ -2,6 +2,8 @@
 // 表统计照采集的写法：文本列才有 top，敏感列（手机号、邮箱）不给 top；列名与期望 YAML 引用的源列一致
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { noteKey } from '../../app/lib/business-note-key';
+import { buildCatalog, type CatalogInput } from '../../app/.server/catalog';
 import type { ColumnProfile, TableProfile } from '../../app/.server/pipeline/source-engine';
 
 /** 样例要考的情形：字段改名、金额以分计、状态是中文或数字枚举、有重复行要去重 */
@@ -79,3 +81,18 @@ export const GOLDEN: GoldenCase[] = [
     column('更新时间', 'TIMESTAMP', { min: '2024-01-01 10:01:00', max: '2024-12-01 10:00:00' }),
   ], [], ['订单编号'])),
 ];
+
+/** 发给模型的固定目录（产品带本租户的语义目录，ADR-0041）：只有标准实体、实体行数与两条业务说明，纯函数构造，不连库 */
+export const CATALOG_INPUT: CatalogInput = {
+  entityStats: [
+    { entity: 'customer', rows: 5000, at: '2024-12-01T00:00:00.000Z' },
+    { entity: 'order', rows: 32000, at: '2024-12-01T00:00:00.000Z' },
+    { entity: 'event', rows: 420000, at: '2024-12-01T00:00:00.000Z' },
+  ],
+  notes: new Map([
+    [noteKey('order', 'status'), '已支付是 paid；发货后是 shipped，确认收货后是 completed，退款后是 refunded'],
+    [noteKey('event', 'event_type'), '浏览是 view，加购是 add_to_cart，登录是 login'],
+  ]),
+};
+
+export const CATALOG = buildCatalog(CATALOG_INPUT);

@@ -245,6 +245,32 @@ export function dropItems(rulesYaml: string, yaml: string, items: DraftItem[], i
   };
 }
 
+/** adoptModelDraft 的结果：整份通过、部分采用（dropped 是去掉的项的路径，issues 是第一次校验的问题数）或整份不采用 */
+export type AdoptedDraft =
+  | { status: 'full' | 'partial'; yaml: string; items: DraftItem[]; dropped: string[]; issues: number }
+  | { status: 'rejected'; issues: MappingIssue[] };
+
+/**
+ * 模型输出 → 采用的映射 YAML（产品的 modelDraftFor 与映射评测共用）：转 YAML 后用 check 校验，通过就是 full；
+ * 不过时用 dropItems 去掉有问题的个别项再校验一次，通过就是 partial；定位不到个别项（dropItems 返回 null）时带第一次的问题、
+ * 第二次仍不过时带第二次的问题，都是 rejected。check 返回问题列表，空数组表示通过
+ */
+export async function adoptModelDraft(
+  rulesYaml: string, out: ModelDraft, check: (yaml: string) => MappingIssue[] | Promise<MappingIssue[]>,
+): Promise<AdoptedDraft> {
+  const { yaml, items } = modelOutputToYaml(rulesYaml, out);
+  const issues = await check(yaml);
+  if (!issues.length) return { status: 'full', yaml, items, dropped: [], issues: 0 };
+  const partial = dropItems(rulesYaml, yaml, items, issues);
+  if (!partial) return { status: 'rejected', issues };
+  const again = await check(partial.yaml);
+  if (again.length) return { status: 'rejected', issues: again };
+  return {
+    status: 'partial', yaml: partial.yaml, items: partial.items,
+    dropped: partial.items.filter(i => i.dropped).map(i => i.path), issues: issues.length,
+  };
+}
+
 /** 模型建议的一条断言：写法同映射 YAML 的 assertions，另带置信度与理由 */
 export type ModelAssertion = CustomAssertion & Reasoned;
 export interface AssertionDraft { assertions: ModelAssertion[] }
