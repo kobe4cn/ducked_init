@@ -141,10 +141,11 @@ describe('AI 助手', () => {
     platformTier('reasoning', 'qwen-max');
     expect(await support()).toBeNull();
 
-    // 管理员「测试连通性」发 3 次请求：connectivity、默认模型的 tool_probe、档位模型的 tool_probe；存进三列的是档位那一套的结果
+    // 管理员「测试连通性」发 4 次请求：connectivity、默认模型的 tool_probe、档位模型的 tool_probe，再给 reasoning 档位测一次 JSON（#1213）；
+    // 存进三列的是档位那一套的结果
     const probed = await probeTier(() => toolCalls({ id: 'p', name: 'ping', args: {} }));
     expect(probed.received.map(({ body }) => [body.model, Boolean(body.tools)])).toEqual([
-      ['qwen-plus', false], ['qwen-plus', true], ['qwen-max', true],
+      ['qwen-plus', false], ['qwen-plus', true], ['qwen-max', true], ['qwen-max', false],
     ]);
     expect(await support()).toBe(true);
     const probes = await getDb().select().from(llmCalls).where(and(eq(llmCalls.tenantId, acme), eq(llmCalls.purpose, 'tool_probe')));

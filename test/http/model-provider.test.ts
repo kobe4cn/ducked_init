@@ -179,6 +179,7 @@ describe('模型服务页', () => {
     expect(await noChat.text()).toContain('先保存本租户的模型服务');
 
     await save(admin);
+    fakeLlm(setLlm, ok); // 保存档位前先测一次 JSON 请求（#1213）
     // 只填模型名：档位的端点和 Key 都存 null
     expect((await tierSave(admin, 'reasoning', 'qwen-max')).status).toBe(302);
     let [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
@@ -240,6 +241,7 @@ describe('模型服务页', () => {
     expect(await page()).toContain('服务商参数（可选）');
 
     await save(admin);
+    fakeLlm(setLlm, ok); // 保存档位前先测一次 JSON 请求（#1213）
     expect((await save(admin, '', EXTRA)).status).toBe(302);
     expect((await row()).chatExtra).toBe(EXTRA);
     expect(await page()).toContain(ESCAPED);
@@ -277,6 +279,7 @@ describe('模型服务页', () => {
     const admin = await loginAs(app, 'admin@acme.com');
     await save(admin);
     await saveEmbedding(admin);
+    fakeLlm(setLlm, ok); // 保存档位前先测一次 JSON 请求（#1213）
     await tierSave(admin, 'fast', 'qwen-flash', 'https://fast.example.com/v1', TKEY);
     await tierSave(admin, 'reasoning', 'qwen-max');
     fakeLlm(setLlm, n => n === 1 ? ok() : toolCalls({ name: 'ping', args: {} }));
@@ -295,6 +298,7 @@ describe('模型服务页', () => {
     });
     let [row] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
     const beforeTierSave = chatAndEmbedding(row);
+    fakeLlm(setLlm, ok);
     expect((await tierSave(admin, 'reasoning', 'qwen-max-2')).status).toBe(302);
     expect((await tierSave(admin, 'fast', 'qwen-flash', 'https://fast.example.com/v1', NEW_TKEY)).status).toBe(302);
     expect(await probed()).toEqual({ supported: true, baseUrl: 'https://tenant.example.com/v1', model: 'qwen-max' });
@@ -434,6 +438,79 @@ describe('模型服务页', () => {
     const calls = await connectivityCalls(acme);
     expect(calls).toHaveLength(2);
     expect(calls.map(c => c.error === null).sort()).toEqual([false, true]);
+  });
+
+  it('保存档位前先发一次 json_object 请求（#1213）：模型名错误时 400、页面显示抹掉 Key 的错误，档位列不变、不记审计；探测用表单里的模型、端点与 Key', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    await save(admin);
+    const { received } = fakeLlm(setLlm, (_n, body) => body.model === 'qwen4-Max'
+      ? new Response(`model qwen4-Max not found (key ${TKEY})`, { status: 404 })
+      : ok());
+    const tierColumns = async () => {
+      const [r] = await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme));
+      return { model: r.fastModel, baseUrl: r.fastBaseUrl, apiKey: r.fastApiKey, chatExtra: r.fastChatExtra };
+    };
+    const tierAudits = async () =>
+      (await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.updated'))).filter(l => l.detail.tier);
+
+    const failed = await tierSave(admin, 'fast', 'qwen4-Max', 'https://fast.example.com/v1/', TKEY);
+    expect(failed.status).toBe(400);
+    const failedPage = await failed.text();
+    expect(failedPage).toContain('HTTP 404');
+    expect(failedPage).not.toContain(TKEY);
+    expect(await tierColumns()).toEqual({ model: null, baseUrl: null, apiKey: null, chatExtra: null });
+    expect(await tierAudits()).toHaveLength(0);
+    expect(received).toHaveLength(1);
+    expect(received[0].url).toBe('https://fast.example.com/v1/chat/completions');
+    expect(received[0].headers.get('authorization')).toBe(`Bearer ${TKEY}`);
+    expect(received[0].body).toMatchObject({ model: 'qwen4-Max', response_format: { type: 'json_object' } });
+    const logged = await connectivityCalls(acme);
+    expect(logged).toMatchObject([{ model: 'qwen4-Max', route: 'fast' }]);
+    expect(logged[0].error).not.toContain(TKEY);
+
+    // 改对模型名后保存成功；端点没变、Key 留空时探测用档位已存的 Key，不用租户默认 Key
+    expect((await tierSave(admin, 'fast', 'qwen-flash', 'https://fast.example.com/v1', TKEY)).status).toBe(302);
+    expect((await tierSave(admin, 'fast', 'qwen-flash-2', 'https://fast.example.com/v1', '')).status).toBe(302);
+    expect(received[2].headers.get('authorization')).toBe(`Bearer ${TKEY}`);
+    expect((await tierColumns()).model).toBe('qwen-flash-2');
+    // 只填模型名：用租户默认的端点与 Key；表单带的服务商参数随探测请求发出
+    expect((await tierSave(admin, 'reasoning', 'qwen-max', '', '', '{"enable_thinking": false}')).status).toBe(302);
+    expect(received[3].url).toBe('https://tenant.example.com/v1/chat/completions');
+    expect(received[3].headers.get('authorization')).toBe(`Bearer ${KEY}`);
+    expect(received[3].body).toMatchObject({ model: 'qwen-max', enable_thinking: false, response_format: { type: 'json_object' } });
+    expect(await tierAudits()).toHaveLength(3);
+  });
+
+  it('测试连通性对默认与绑定了的档位各发一次 JSON 请求、分别显示耗时；超过 LLM_TIMEOUT_SECONDS 的一半时提示可能是思考模型，没绑定的档位显示使用默认（#1213）', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    await save(admin);
+    fakeLlm(setLlm, ok);
+    expect((await tierSave(admin, 'fast', 'qwen-flash')).status).toBe(302);
+
+    vi.stubEnv('LLM_TIMEOUT_SECONDS', '1'); // 阈值 500 ms
+    const { received } = fakeLlm(setLlm, async (_n, body) => {
+      if (body.tools) return toolCalls({ name: 'ping', args: {} });
+      if (body.model === 'qwen-flash') await new Promise(resolve => setTimeout(resolve, 600));
+      return ok();
+    });
+    const page = await (await admin.post('/model-provider', { intent: 'test' })).text();
+    expect(page).toContain('data-connectivity="ok"');
+    expect(page).toContain('data-model="deepseek-chat"');
+    expect(page).toContain('data-connectivity-fast="ok"');
+    expect(Number(/data-duration-ms-fast="(\d+)"/.exec(page)?.[1])).toBeGreaterThanOrEqual(600);
+    expect(page).toContain('data-slow-hint="fast"');
+    expect(page).toContain('可能是思考模型，可在服务商参数里关闭思考');
+    expect(page).not.toContain('data-slow-hint="default"');
+    expect(page).toContain('data-connectivity-reasoning="default"');
+    expect(page).not.toContain('data-duration-ms-reasoning');
+
+    const jsonRequests = received.filter(r => !r.body.tools);
+    expect(jsonRequests.map(r => r.body.model)).toEqual(['deepseek-chat', 'qwen-flash']);
+    expect(jsonRequests.every(r => r.body.response_format?.type === 'json_object')).toBe(true);
+    // 保存档位那次 + 默认 + fast，各记一条 connectivity
+    expect((await connectivityCalls(acme)).map(c => c.route).sort()).toEqual(['fast', 'fast', null].sort());
   });
 
   it('测试连通性时一并探测工具调用：返回 tool_calls 显示支持，400 提示不支持，只回文本提示没能确认，连通结果照旧；每次记一条 tool_probe', async () => {

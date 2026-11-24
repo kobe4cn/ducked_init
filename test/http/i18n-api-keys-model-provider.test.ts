@@ -6,13 +6,14 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
 import { memberOf, newTenant } from '../pipeline/fixtures';
+import { fakeLlm, json } from '../pipeline/llm-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
 afterAll(async () => { await app?.close(); await closeDb(); });
 beforeEach(async () => { await resetDb(); });
-afterEach(() => { app.setPgvectorConnect(undefined); vi.unstubAllEnvs(); });
+afterEach(() => { app.setPgvectorConnect(undefined); app.setLlmFetch(undefined); vi.unstubAllEnvs(); });
 
 /** 水合数据里的 script 会带中文词典键（键就是中文原文），语言切换选项的「中文」按母语名显示（ADR-0060），断言前都去掉 */
 const stripScripts = (html: string) => html.replace(/<script[\s\S]*?<\/script>/g, '').replace(/<form[^>]*action="\/locale"[\s\S]*?<\/form>/g, '');
@@ -87,6 +88,7 @@ describe('英文界面：模型服务页', () => {
     const admin = await enAdmin();
     // 保存本租户的模型服务与一个档位（只填模型名，端点沿用），再保存外部 pgvector（替身连通，写入 checked_at）
     expect((await admin.post('/model-provider', { intent: 'save', baseUrl: 'https://tenant.example.com/v1/', model: 'deepseek-chat', apiKey: 'sk-tenant-secret-1234' })).status).toBe(302);
+    fakeLlm(f => app.setLlmFetch(f), () => json({ ok: true })); // 保存档位前先测一次 JSON 请求（#1213）
     expect((await admin.post('/model-provider', { intent: 'tier_save', tier: 'fast', model: 'qwen-fast', baseUrl: '', apiKey: '' })).status).toBe(302);
     pgvectorOk();
     expect((await admin.post('/model-provider', { intent: 'vector_store_save', vectorStore: 'pgvector', vectorStoreUrl: 'postgres://vector:sec%40ret@pg.example.com:5432/vectors' })).status).toBe(200);
@@ -143,6 +145,7 @@ describe('中文界面输出与改造前一致', () => {
     await memberOf(tenantId, 'admin@acme.com', 'admin');
     const admin = await loginAs(app, 'admin@acme.com');
     expect((await admin.post('/model-provider', { intent: 'save', baseUrl: 'https://tenant.example.com/v1/', model: 'deepseek-chat', apiKey: 'sk-tenant-secret-1234' })).status).toBe(302);
+    fakeLlm(f => app.setLlmFetch(f), () => json({ ok: true })); // 保存档位前先测一次 JSON 请求（#1213）
     expect((await admin.post('/model-provider', { intent: 'tier_save', tier: 'fast', model: 'qwen-fast', baseUrl: '', apiKey: '' })).status).toBe(302);
     pgvectorOk();
     expect((await admin.post('/model-provider', { intent: 'vector_store_save', vectorStore: 'pgvector', vectorStoreUrl: 'postgres://vector:sec%40ret@pg.example.com:5432/vectors' })).status).toBe(200);

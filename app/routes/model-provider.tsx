@@ -11,7 +11,7 @@ import { errorTextFor, formatServer } from '~/.server/i18n';
 import { getLocale } from '~/.server/locale';
 import {
   getModelProvider, ModelProviderError, resetEmbeddingProvider, resetModelProvider, resetTierProvider, SAMPLE_ROWS, saveEmbeddingProvider,
-  saveModelProvider, saveTierProvider, saveVectorStore, setAllowSamples, testEmbeddingProvider, testModelProvider, testVectorStore,
+  saveModelProvider, saveTierProvider, saveVectorStore, setAllowSamples, testEmbeddingProvider, testModelProvider, testVectorStore, type TierConnectivity,
 } from '~/.server/model-provider';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
@@ -172,6 +172,41 @@ const tierLabel = (t: T, tier: 'fast' | 'reasoning') => ({
   reasoning: { title: t('推理档（reasoning）'), hint: t('AI 助手、起草映射、指标、标签这类要推理的用途') },
 })[tier];
 
+/** 连通测试耗时超过 LLM_TIMEOUT_SECONDS 一半时的提示（#1213）：amber 加图标，颜色不是唯一信号 */
+function SlowHint({ which }: { which: 'default' | 'fast' | 'reasoning' }) {
+  const t = useT();
+  return (
+    <div data-slow-hint={which} className="flex items-center gap-1 text-amber-600">
+      <AlertTriangle className="size-4" />{t('可能是思考模型，可在服务商参数里关闭思考')}
+    </div>
+  );
+}
+
+/** 连通测试里一档的一行（#1213）：没绑定显示「使用默认」，成功显示模型与耗时，失败显示抹掉 Key 的错误 */
+function TierConnectivityRow({ tier, result }: { tier: 'fast' | 'reasoning'; result: TierConnectivity }) {
+  const t = useT();
+  const title = tierLabel(t, tier).title;
+  const state = (value: 'ok' | 'failed' | 'default') => ({ [`data-connectivity-${tier}`]: value });
+  if (result.ok === 'default') {
+    return <div {...state('default')} className="text-muted-foreground">{t('{kind}：{state}', { kind: title, state: t('使用默认') })}</div>;
+  }
+  if (!result.ok) {
+    return (
+      <div {...state('failed')} className="flex items-center gap-1 text-red-600">
+        <CircleAlert className="size-4" />{t('{kind}：{state}', { kind: title, state: t('{kind}：{reason}', { kind: t('连通失败'), reason: result.error }) })}
+      </div>
+    );
+  }
+  return (
+    <div>
+      <div {...state('ok')} {...{ [`data-duration-ms-${tier}`]: result.durationMs }} className="flex items-center gap-1">
+        <CheckCircle2 className="size-4 text-emerald-600" />{t('{kind}：{state}', { kind: title, state: t('模型 {model}，耗时 {ms} ms', { model: result.model, ms: result.durationMs }) })}
+      </div>
+      {result.slow && <SlowHint which={tier} />}
+    </div>
+  );
+}
+
 /** 服务商参数（#1170）：可选的 JSON 对象，随每次 chat 请求带给服务商（如关思考）。示例含花括号，放 placeholder 而不进 t()（ICU 会当成变量） */
 function ChatExtraField({ id, defaultValue, children }: { id: string; defaultValue: string | null; children: React.ReactNode }) {
   const t = useT();
@@ -285,19 +320,19 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
         </Alert>
       )}
 
-      {tested && (tested.ok ? (
+      {tested && (tested.default.ok ? (
         <Alert role="status" data-connectivity="ok">
           <CheckCircle2 className="text-emerald-600" />
           <AlertTitle>{t('连通成功')}</AlertTitle>
           <AlertDescription className="space-y-1">
-            <div data-model={tested.model} data-duration-ms={tested.durationMs}>
-              {t('模型 {model}，耗时 {ms} ms', { model: tested.model, ms: tested.durationMs })}
+            <div data-model={tested.default.model} data-duration-ms={tested.default.durationMs}>
+              {t('模型 {model}，耗时 {ms} ms', { model: tested.default.model, ms: tested.default.durationMs })}
             </div>
-            {tested.tools ? (
+            {tested.default.tools ? (
               <div data-tools="yes" className="flex items-center gap-1 text-emerald-600">
                 <CheckCircle2 className="size-4" />{t('支持工具调用')}
               </div>
-            ) : tested.tools === false ? (
+            ) : tested.default.tools === false ? (
               <div data-tools="no" className="flex items-center gap-1 text-amber-600">
                 <AlertTriangle className="size-4" />{t('该模型服务不支持工具调用，AI 助手无法使用')}
               </div>
@@ -306,15 +341,26 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
                 <AlertTriangle className="size-4" />{t('这次没能确认是否支持工具调用（模型没有调用探测工具，或服务暂时不可用），可以再测一次')}
               </div>
             )}
+            {tested.default.slow && <SlowHint which="default" />}
           </AlertDescription>
         </Alert>
       ) : (
         <Alert variant="destructive" role="alert" data-connectivity="failed">
           <CircleAlert />
           <AlertTitle>{t('连通失败')}</AlertTitle>
-          <AlertDescription>{tested.error}</AlertDescription>
+          <AlertDescription>{tested.default.error}</AlertDescription>
         </Alert>
       ))}
+
+      {tested && (
+        <Alert role="status" data-connectivity-tiers>
+          <AlertTitle>{t('按用途选模型')}</AlertTitle>
+          <AlertDescription className="space-y-1">
+            <TierConnectivityRow tier="fast" result={tested.fast} />
+            <TierConnectivityRow tier="reasoning" result={tested.reasoning} />
+          </AlertDescription>
+        </Alert>
+      )}
 
       {embeddingTested && (embeddingTested.ok ? (
         <Alert role="status" data-embedding-test="ok">

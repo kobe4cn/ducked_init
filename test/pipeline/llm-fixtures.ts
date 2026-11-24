@@ -43,8 +43,8 @@ export interface LlmBody {
 /** 假 fetch 收到的一次请求 */
 export interface LlmRequest { url: string; headers: Headers; body: LlmBody }
 
-/** 假 fetch：第 n 次请求（从 1 数）记进 received 后返回 respond(n, body)；构造完立刻 set(f) */
-export function fakeLlm(set: (f: typeof fetch | undefined) => void, respond: (n: number, body: LlmBody) => Response): { f: Mock; received: LlmRequest[] } {
+/** 假 fetch：第 n 次请求（从 1 数）记进 received 后返回 respond(n, body)（可以是 Promise，用来控制耗时）；构造完立刻 set(f) */
+export function fakeLlm(set: (f: typeof fetch | undefined) => void, respond: (n: number, body: LlmBody) => Response | Promise<Response>): { f: Mock; received: LlmRequest[] } {
   const received: LlmRequest[] = [];
   const f = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
     const body: LlmBody = JSON.parse(init?.body as string);

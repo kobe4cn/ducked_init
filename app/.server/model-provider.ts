@@ -8,6 +8,7 @@
 // 保存时先测连通失败不保存；切换存储后的清理与补算也在保存后触发（#849-1：embeddings.ts 按这里的选型解析存储）
 // 向量补算的最近结果（#1172 写）在这里给页面看；改 embedding 配置或向量存储时清空，补算退避立即失效（#1173）
 // 服务商参数（#1169）：租户默认与 fast / reasoning 档位各存一份 JSON 对象原文，不是密钥、页面回显，审计只记变没变
+// #1213：保存档位前先用表单里的配置发一次 json_object 请求，失败不保存；测试连通性对默认与绑定了的档位各测一次 JSON 并计时，超过超时一半时标 slow
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { assertCan } from './access';
 import { recordAudit } from './audit';
@@ -17,7 +18,10 @@ import { preparePgvector, redactUrl } from './catalog/vector-store-pgvector';
 import { platformStore } from './catalog/vector-store';
 import { getDb } from './db/client';
 import { modelProviders } from './db/schema';
-import { CHAT_EXTRA_PROTECTED, chatJson, chatTools, chatToolsWith, embed, embeddingSource, LlmError, MODEL_PROVIDER_CONTEXT, parseChatExtraObject, providerSource, resolveEmbeddingProvider, resolveProvider, resolveRoute, type LlmRoute } from './llm';
+import {
+  CHAT_EXTRA_PROTECTED, chatJson, chatJsonWith, chatTools, chatToolsWith, embed, embeddingSource, LlmError, MODEL_PROVIDER_CONTEXT, parseChatExtraObject, providerSource,
+  resolveEmbeddingProvider, resolveProvider, resolveRoute, tenantChatExtra, timeoutMs, type LlmProvider, type LlmRoute,
+} from './llm';
 import { buildTableContext, type TableContext } from './pipeline/llm-context';
 import { formatServer } from './i18n';
 import { decryptForTenant, encryptForTenant } from './secrets';
@@ -257,6 +261,7 @@ export async function saveTierProvider(actor: CurrentMember, tier: 'fast' | 'rea
   } else if (input.apiKey.trim()) {
     throw new ModelProviderError('填了 API Key 须同时填写端点；端点留空表示沿用本租户的端点与 Key');
   }
+  await probeTier(tenantId, tier, await tierProvider(tenantId, row, tier, { model, baseUrl, apiKey: input.apiKey.trim(), chatExtra }));
   const columns = tierColumns(tier, { model, baseUrl, apiKey: sealed, chatExtra });
   const chatExtraChanged = chatExtra !== undefined && chatExtra !== tierOf(row, tier).chatExtra;
   await getDb().transaction(async tx => {
@@ -269,6 +274,36 @@ export async function saveTierProvider(actor: CurrentMember, tier: 'fast' | 'rea
       detail: { tier, baseUrl, model, credentialsRotated: rotated, chatExtraChanged },
     });
   });
+}
+
+/**
+ * 用表单里还没写库的档位配置拼出 provider（规则同 llm.ts 的 resolveRoute）：没填端点用租户默认的端点与 Key；
+ * 填了端点时 Key 用填的，留空用档位已存的（sealApiKey 已保证端点没变），绝不把租户默认 Key 发到档位端点。
+ * 服务商参数这次没带（undefined）用档位已存的，档位没有就继承租户默认的
+ */
+async function tierProvider(tenantId: string, row: NonNullable<Awaited<ReturnType<typeof rowOf>>>, tier: 'fast' | 'reasoning',
+  input: { model: string; baseUrl: string | null; apiKey: string; chatExtra: string | null | undefined }): Promise<LlmProvider> {
+  const stored = tierOf(row, tier);
+  const sealedKey = input.baseUrl ? stored.apiKey : row.apiKey;
+  const apiKey = input.baseUrl && input.apiKey
+    ? input.apiKey
+    : (await decryptForTenant(tenantId, MODEL_PROVIDER_CONTEXT, sealedKey!)).apiKey;
+  const tierExtra = input.chatExtra === undefined ? stored.chatExtra : input.chatExtra;
+  return {
+    baseUrl: input.baseUrl ?? row.baseUrl!, model: input.model, apiKey, source: 'tenant',
+    ...(tierExtra ? tenantChatExtra(tierExtra, tier) : tenantChatExtra(row.chatExtra)),
+  };
+}
+
+/** 保存档位前用这套配置发一次 json_object 请求（#1213）：模型名写错、端点不通等在保存时就报出来，失败不写库、不记审计；
+ *  错误消息由 masked 抹掉了 Key，调用日志记一条 connectivity */
+async function probeTier(tenantId: string, tier: 'fast' | 'reasoning', provider: LlmProvider) {
+  try {
+    await chatJsonWith(tenantId, 'connectivity', { provider, route: tier, fallbackReason: null }, PING_MESSAGES, JSON_OBJECT_PING);
+  } catch (e) {
+    if (e instanceof LlmError) throw new ModelProviderError(e.message);
+    throw e;
+  }
 }
 
 /** 恢复该档的默认（不再绑定）：只清该档的列（含服务商参数），chat 与另一档、工具调用探测结果都不动；本来就没绑定时不记审计 */
@@ -381,10 +416,26 @@ export async function testVectorStore(actor: CurrentMember): Promise<VectorStore
   return result;
 }
 
-/** tools：模型是否支持工具调用（AI 助手要用，ADR-0042）；null 是这次没能确认（模型没调用探测工具，或临时故障） */
-export type ConnectivityResult = { ok: true; model: string; durationMs: number; tools: boolean | null } | { ok: false; error: string };
+/** 一套配置发一次 JSON 请求的结果：durationMs 只计这一次请求；slow 是耗时超过 LLM_TIMEOUT_SECONDS 的一半（#1213，多半是没关思考的思考模型） */
+export type JsonPingResult = { ok: true; model: string; durationMs: number; slow: boolean } | { ok: false; error: string };
+
+/** 档位的连通结果：没绑定时不发请求，ok 为 'default'（走的就是默认那套，再测一次没有新信息） */
+export type TierConnectivity = JsonPingResult | { ok: 'default' };
+
+/** 默认那套另带 tools：模型是否支持工具调用（AI 助手要用，ADR-0042）；null 是这次没能确认（模型没调用探测工具，或临时故障） */
+export interface ConnectivityResult {
+  default: (Extract<JsonPingResult, { ok: true }> & { tools: boolean | null }) | Extract<JsonPingResult, { ok: false }>;
+  fast: TierConnectivity;
+  reasoning: TierConnectivity;
+}
 
 const PING_SCHEMA = { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } };
+
+/** 连通探测用的 Schema（#1213）：根上包一层 anyOf，callModel 看到根不是 object 就直接发 response_format json_object——
+ *  业务调用遇到 json_schema 被拒时最终也回落到 json_object，探测测的是这条所有服务商都得支持的路，也不碰 json_schema 的回退缓存 */
+const JSON_OBJECT_PING = { anyOf: [PING_SCHEMA] };
+
+const PING_MESSAGES = [{ role: 'user' as const, content: '只回复 JSON：{"ok": true}' }];
 
 const PING_TOOL = { name: 'ping', description: '连通性探测：收到请求就调用它', parameters: { type: 'object', properties: {} } };
 
@@ -407,9 +458,29 @@ async function probeTools(tenantId: string, route?: LlmRoute): Promise<boolean |
   }
 }
 
+/** 发一次 json_object 请求（call）并计时；错误消息由 masked 抹掉了 Key，调用日志里记一条 connectivity */
+async function pingJson(model: string, call: () => Promise<unknown>): Promise<JsonPingResult> {
+  const started = Date.now();
+  try {
+    await call();
+  } catch (e) {
+    if (e instanceof LlmError) return { ok: false, error: e.message };
+    throw e;
+  }
+  const durationMs = Date.now() - started;
+  return { ok: true, model, durationMs, slow: durationMs > timeoutMs() / 2 };
+}
+
+/** 档位（#1213）：按 PURPOSE_TIER 里属于该档的用途解析路由，没绑定时不发请求 */
+async function pingTier(tenantId: string, purpose: 'assertion_draft' | 'assistant'): Promise<TierConnectivity> {
+  const route = await resolveRoute(tenantId, purpose);
+  if (!route || route.fallbackReason === 'unbound') return { ok: 'default' };
+  return pingJson(route.provider.model, () => chatJsonWith(tenantId, 'connectivity', route, PING_MESSAGES, JSON_OBJECT_PING));
+}
+
 /**
- * 用当前生效的配置发一次小请求；错误消息由 chatJson 抹掉了 Key，调用日志里记一条 connectivity。
- * 连通后再探测是否支持工具调用（不计入耗时），结果连同这次的端点与模型存下来（不确定时不存）（没有配置行时插入一行，端点、模型名与 Key 为空）。
+ * 用当前生效的配置对默认、fast、reasoning 三套各发一次 JSON 请求（#1213；没绑定的档位不发），各自计时。
+ * 默认那套连通后再探测是否支持工具调用（不计入耗时），结果连同这次的端点与模型存下来（不确定时不存）（没有配置行时插入一行，端点、模型名与 Key 为空）。
  * reasoning 档位绑定了不同模型时（#531；平台与租户档位都会，租户档位自路由③b 起生效）再探一次档位模型：三列里存的是助手实际要用的那一套的结果
  * （没有不同模型时就是默认这一套），返回给页面的 tools 仍显示默认这一次的
  */
@@ -418,14 +489,10 @@ export async function testModelProvider(actor: CurrentMember): Promise<Connectiv
   const tenantId = actor.tenant.id;
   const provider = await resolveProvider(tenantId);
   const model = provider?.model ?? '';
-  const started = Date.now();
-  try {
-    await chatJson(tenantId, 'connectivity', [{ role: 'user', content: '只回复 JSON：{"ok": true}' }], PING_SCHEMA);
-  } catch (e) {
-    if (e instanceof LlmError) return { ok: false, error: e.message };
-    throw e;
-  }
-  const durationMs = Date.now() - started;
+  // 默认那套由 chatJson 自己解析：没有任何模型服务时照旧报「未配置模型服务」，不发请求、不记日志
+  const pinged = await pingJson(model, () => chatJson(tenantId, 'connectivity', PING_MESSAGES, JSON_OBJECT_PING));
+  const tiers = async () => ({ fast: await pingTier(tenantId, 'assertion_draft'), reasoning: await pingTier(tenantId, 'assistant') });
+  if (!pinged.ok) return { default: pinged, ...(await tiers()) };
   const tools = await probeTools(tenantId);
   let probe = tools !== null ? { toolsSupported: tools, toolsProbedBaseUrl: provider?.baseUrl ?? '', toolsProbedModel: model } : null;
   const tier = await resolveRoute(tenantId, 'assistant');
@@ -437,7 +504,7 @@ export async function testModelProvider(actor: CurrentMember): Promise<Connectiv
     await getDb().insert(modelProviders).values({ tenantId, ...probe })
       .onConflictDoUpdate({ target: modelProviders.tenantId, set: probe });
   }
-  return { ok: true, model, durationMs, tools };
+  return { default: { ...pinged, tools }, ...(await tiers()) };
 }
 
 /** 测试 embedding：向量维度是第一条样例的长度 */

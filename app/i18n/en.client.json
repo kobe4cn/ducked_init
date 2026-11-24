@@ -573,6 +573,7 @@
   "可执行查询": "Can run queries",
   "可用": "Available",
   "可用接口": "Available APIs",
+  "可能是思考模型，可在服务商参数里关闭思考": "May be a thinking model; you can turn off thinking in the provider parameters",
   "可选": "Optional",
   "各取值人数": "Customers per value",
   "各渠道同意人数": "Consenting customers per channel",
