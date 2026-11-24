@@ -40,7 +40,7 @@ import { requireSource } from './source-config';
 import { mappingDrift } from './source-drift';
 import { confirmedTables } from './sources';
 import { lockTenant } from './tenant-lock';
-import { CANONICAL_ENTITIES, entityLabel, entityOf, type EntityRelation } from '../lib/canonical-model';
+import { CANONICAL_ENTITIES, entityLabel, entityOf, isCustomEntity, type EntityRelation } from '../lib/canonical-model';
 import { cmp, cmpName } from '../lib/compare';
 import { entityForTable } from '../lib/field-synonyms';
 import { diffPlans } from '../lib/mapping-diff';
@@ -237,6 +237,7 @@ export interface ModelDraftResult {
 
 /**
  * 用模型生成映射草稿（ADR-0035）：按「复用已发布映射 > 模型 > 按规则」的顺序。复用命中时不调用模型；没配置模型服务时用规则草稿并提示；
+ * 自定义实体复用未命中后不调模型（模型 Schema 只有 fields，自定义实体只能写 extensions，#1268），同样给规则草稿并提示；
  * 否则把表上下文、规则草稿与本租户的语义目录（ADR-0041）发给模型（purpose = mapping_draft），输出转成 YAML 后须过映射校验。成功时写一行生成记录，不保存映射。
  * 转出的 YAML 有问题时，只要每个问题都能定位到个别字段项、dedupe 或 identity，就去掉这些项（退回规则草稿里的同名项，没有就删掉）再校验一次：
  * 第二次通过才采用，并记审计 mapping.model_draft_partial（只记去掉了哪些位置与问题数）。模型失败、有定位不到这三类项的问题，或第二次仍不过时
@@ -254,6 +255,7 @@ export async function modelDraftFor(
     return { yaml, generationId: row.id, origin, items };
   };
   if (base.origin === 'reuse') return { ...await record('reuse', base.yaml), reusedFrom: base.reusedFrom };
+  if (isCustomEntity(entity)) return { ...await record('rules', base.yaml), notice: '自定义实体暂不支持模型起草，已按规则生成' };
   if (!(await resolveProvider(tenantId))) return { ...await record('rules', base.yaml), notice: '未配置模型服务，已按规则生成' };
 
   const context = await tableContextFor(tenantId, sourceId, table).catch((e: unknown) => {

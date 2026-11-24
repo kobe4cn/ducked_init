@@ -1,5 +1,6 @@
 // scripts/eval-mapping/score.ts —— 映射评测的跑分（ADR-0035）：对一个黄金样例走与产品相同的规则草稿、表上下文（不带样本）、提示词（带固定目录，ADR-0041）
-// 与模型输出转 YAML，并与产品同样部分采用（adoptModelDraft），再拿实际采用的映射与期望映射的合并计划逐字段比较。不读库、不写调用日志（用 callModel 而不是 chatJson）
+// 与模型输出转 YAML，并与产品同样部分采用（adoptModelDraft），再拿实际采用的映射与期望映射的合并计划逐字段比较。不读库、不写调用日志（用 callModel 而不是 chatJson）。
+// 自定义实体样例与产品一样不调模型（#1268）：按规则草稿打分，结果带 rules: true
 import { parseDocument } from 'yaml';
 import { entityOf } from '../../app/lib/canonical-model';
 import { diffPlans, type PlanDiff } from '../../app/lib/mapping-diff';
@@ -26,6 +27,8 @@ export interface CaseResult {
   /** 部分采用：去掉了哪些项（路径同审计 mapping.model_draft_partial 的 dropped）；整份通过时不带 */
   partial?: true;
   dropped?: string[];
+  /** 自定义实体样例：不调模型（#1268），按规则草稿打分，计入整份通过 */
+  rules?: true;
 }
 
 /** 映射校验的一个问题：路径与消息，样本原文已换成 <值> */
@@ -99,6 +102,12 @@ export async function runCase(c: GoldenCase, provider: LlmProvider): Promise<Cas
   const fail = (stage: FailStage, message: string, issues?: readonly MappingIssue[]): CaseResult =>
     ({ ...base, ...failedScore(want.spec, want.plan), failed: { stage, message, ...(issues && { issues: issues.length, problems: redactIssues(issues) }) } });
 
+  // 自定义实体不调模型（#1268）：产品退回规则草稿，这里同样按规则草稿打分
+  if (reg) {
+    const got = check(rulesYaml);
+    if (!got.ok) return fail('mapping', `映射校验不过：${got.issues.length} 个问题`, got.issues);
+    return { ...base, ...scoreDiff(want.plan, diffPlans(want.plan, got.plan)), rules: true };
+  }
   let out: ModelDraft;
   try {
     out = await callModel<ModelDraft>(provider, modelDraftMessages(buildTableContext(c.profile), c.entity, rulesYaml, CATALOG), MODEL_DRAFT_SCHEMA);
