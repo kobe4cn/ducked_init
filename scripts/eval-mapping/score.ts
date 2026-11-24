@@ -1,5 +1,5 @@
-// scripts/eval-mapping/score.ts —— 映射评测的跑分（ADR-0035）：对一个黄金样例走与产品相同的规则草稿、表上下文（不带样本）、提示词与模型输出转 YAML，
-// 再与期望映射的合并计划逐字段比较。不读库、不写调用日志（用 callModel 而不是 chatJson）
+// scripts/eval-mapping/score.ts —— 映射评测的跑分（ADR-0035）：对一个黄金样例走与产品相同的规则草稿、表上下文（不带样本）、提示词（带固定目录，ADR-0041）
+// 与模型输出转 YAML，并与产品同样部分采用（adoptModelDraft），再拿实际采用的映射与期望映射的合并计划逐字段比较。不读库、不写调用日志（用 callModel 而不是 chatJson）
 import { parseDocument } from 'yaml';
 import { entityOf } from '../../app/lib/canonical-model';
 import { diffPlans, type PlanDiff } from '../../app/lib/mapping-diff';
@@ -7,8 +7,8 @@ import { callModel, LlmError, type LlmProvider } from '../../app/.server/llm';
 import { buildTableContext } from '../../app/.server/pipeline/llm-context';
 import { draftMapping } from '../../app/.server/pipeline/mapping-draft';
 import { checkMapping, type MappingIssue, type MappingSpec, type MergePlan } from '../../app/.server/pipeline/mapping-spec';
-import { MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type ModelDraft } from '../../app/.server/pipeline/model-draft';
-import type { GoldenCase } from './golden';
+import { adoptModelDraft, MODEL_DRAFT_SCHEMA, modelDraftMessages, type ModelDraft } from '../../app/.server/pipeline/model-draft';
+import { CATALOG, type GoldenCase } from './golden';
 
 /** 失败在哪一步：模型调用（含输出不合 Schema）或映射校验 */
 export type FailStage = 'model' | 'mapping';
@@ -23,6 +23,9 @@ export interface CaseResult {
   edits: number;
   /** problems：失败于映射校验时的问题清单（脱敏，见 redactIssues） */
   failed?: { stage: FailStage; message: string; issues?: number; problems?: Problem[] };
+  /** 部分采用：去掉了哪些项（路径同审计 mapping.model_draft_partial 的 dropped）；整份通过时不带 */
+  partial?: true;
+  dropped?: string[];
 }
 
 /** 映射校验的一个问题：路径与消息，样本原文已换成 <值> */
@@ -86,14 +89,23 @@ export async function runCase(c: GoldenCase, provider: LlmProvider): Promise<Cas
   const rulesYaml = draftMapping(c.profile, entity);
   let out: ModelDraft;
   try {
-    out = await callModel<ModelDraft>(provider, modelDraftMessages(buildTableContext(c.profile), c.entity, rulesYaml), MODEL_DRAFT_SCHEMA);
+    out = await callModel<ModelDraft>(provider, modelDraftMessages(buildTableContext(c.profile), c.entity, rulesYaml, CATALOG), MODEL_DRAFT_SCHEMA);
   } catch (e) {
     if (e instanceof LlmError) return fail('model', e.message);
     throw e;
   }
-  const got = checkMapping(withoutExtensions(modelOutputToYaml(rulesYaml, out).yaml), columns);
-  if (!got.ok) return fail('mapping', `映射校验不过：${got.issues.length} 个问题`, got.issues);
-  return { ...base, ...scoreDiff(want.plan, diffPlans(want.plan, got.plan)) };
+  // 校验与算分都去掉 extensions，传给 adoptModelDraft 的是原始规则草稿（dropItems 按它退回个别项）
+  const r = await adoptModelDraft(rulesYaml, out, (y) => {
+    const g = checkMapping(withoutExtensions(y), columns);
+    return g.ok ? [] : g.issues;
+  });
+  if (r.status === 'rejected') return fail('mapping', `映射校验不过：${r.issues.length} 个问题`, r.issues);
+  const got = checkMapping(withoutExtensions(r.yaml), columns);
+  if (!got.ok) throw new Error(`样例 ${c.name} 采用的映射不过校验`);
+  return {
+    ...base, ...scoreDiff(want.plan, diffPlans(want.plan, got.plan)),
+    ...(r.status === 'partial' && { partial: true as const, dropped: r.dropped }),
+  };
 }
 
 /** 总体：准确率按列加权（做对的列总数 / 期望列总数），改动项数取各例之和 */
