@@ -189,6 +189,23 @@ describe('AI 解读', () => {
     expect(received).toHaveLength(1);
   });
 
+  it('解读里有在结果里找不到出处的数字时，解读下方用琥珀色列出这些数字；数字都对得上时没有这一行', async () => {
+    await memberOf(acme, 'an-int-num@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an-int-num@acme.com');
+    const sql = "SELECT '苏州' AS city, 3606 AS n UNION ALL SELECT '无锡', 122";
+    platformDefault();
+    const replies = ['苏州最多，有 3606 位；全国约 98765 位。', '苏州最多，有 3606 位。'];
+    fakeLlm(f => app.setLlmFetch(f), () => json({ interpretation: replies.shift() }));
+
+    const flagged = await (await analyst.post('/workbench', { intent: 'interpret', sql, confirmed: '1' })).text();
+    expect(flagged).toMatch(/data-interpret="unverified"[^>]*>[^<]*找不到出处[^<]*98765/);
+    expect(flagged).not.toMatch(/data-interpret="unverified"[^>]*>[^<]*3606/);
+
+    const clean = await (await analyst.post('/workbench', { intent: 'interpret', sql, confirmed: '1' })).text();
+    expect(clean).toContain('data-interpret="result"');
+    expect(clean).not.toContain('data-interpret="unverified"');
+  });
+
   it('租户没打开「发送脱敏样本」时确认框与解读结果都说明只发送结构与统计、没有发送样本行，并指向「模型服务」页；管理员打开后文案回到「将发送前 N 行」', async () => {
     await memberOf(acme, 'an-int2@acme.com', 'analyst');
     const analyst = await loginAs(app, 'an-int2@acme.com');

@@ -331,6 +331,7 @@
   "从源表一键生成": "Generate from a source table",
   "令牌可用的工具": "Tools available to a personal token",
   "以上与下面的密钥只对对象存储上的文件（s3://…）需要。": "The settings above and the keys below are needed only for files on object storage (s3://…).",
+  "以下数字在结果里找不到出处，请核对：{numbers}": "These numbers could not be found in the result; please check them: {numbers}",
   "以下维度构建器不支持，没有填入：{names}。要按维度拆开，请在 YAML 模式里写。": "The builder does not support the following dimensions, so they were not filled in: {names}. To split by dimension, write them in YAML mode.",
   "任务": "Tasks",
   "优惠券": "Coupon",

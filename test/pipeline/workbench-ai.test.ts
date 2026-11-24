@@ -261,7 +261,7 @@ describe('AI 解读结果', () => {
     ]);
     for (const key of ['nonNull', 'distinct', 'min', 'max', 'avg', 'rowCount', 'event_type', 'BIGINT']) expect(body).toContain(key);
     const [detail] = await interpreted(sql);
-    expect(detail).toEqual({ sql, rows: values.length, columns: ['event_type', 'n'], dropped: [], samples: false });
+    expect(detail).toEqual({ sql, rows: values.length, columns: ['event_type', 'n'], dropped: [], samples: false, unverified: 0 });
     expect((await listAuditLogs(acme)).map(l => l.summary)).toContain(`发送 ${values.length} 行结果的结构与统计（未发送样本行）：列 event_type、n：${sql}`);
   });
 
@@ -276,7 +276,7 @@ describe('AI 解读结果', () => {
     expect((sentContent(received[0].body).columns as { name: string }[]).map(c => c.name)).toEqual(['city']);
   });
 
-  it('开关打开时照旧发前 50 行：预览不请求模型，列出要发送与剔除的列；确认后把聚合结果发给模型，审计的键恰好是 sql、rows、columns、dropped、samples', async () => {
+  it('开关打开时照旧发前 50 行：预览不请求模型，列出要发送与剔除的列；确认后把聚合结果发给模型，审计的键恰好是 sql、rows、columns、dropped、samples、unverified', async () => {
     await setSamples(true);
     const sql = 'SELECT city, count(*) n FROM silver.customer GROUP BY 1 ORDER BY 1';
     const { f, received } = modelSays('上海的客户最多');
@@ -290,8 +290,8 @@ describe('AI 解读结果', () => {
     expect(Object.keys(sentContent(received[0].body)).sort()).toEqual(['columns', 'facts', 'rows', 'sql', 'truncated']);
     expect(out.samples).toBe(true);
     const [detail] = await interpreted(sql);
-    expect(Object.keys(detail).sort()).toEqual(['columns', 'dropped', 'rows', 'samples', 'sql']);
-    expect(detail).toEqual({ sql, rows: out.rows, columns: ['city', 'n'], dropped: [], samples: true });
+    expect(Object.keys(detail).sort()).toEqual(['columns', 'dropped', 'rows', 'samples', 'sql', 'unverified']);
+    expect(detail).toEqual({ sql, rows: out.rows, columns: ['city', 'n'], dropped: [], samples: true, unverified: 0 });
     expect((await listAuditLogs(acme)).map(l => l.summary)).toContain(`发送前 ${out.rows} 行的 city、n：${sql}`);
   });
 
@@ -365,6 +365,41 @@ describe('AI 解读结果', () => {
     expect(facts[0]).not.toHaveProperty('minAt');
     const body = JSON.stringify(received[0].body);
     for (const r of out.result.rows) expect(body).not.toContain(String(r[0]));
+  });
+
+  it.each([
+    ['不合 Schema 的 JSON', () => json({ text: 'x' })],
+    ['HTTP 500', () => new Response('', { status: 500 })],
+  ])('模型返回%s时 422「模型解读结果失败」，不记 workbench.result_interpreted 审计', async (_, reply) => {
+    await setSamples(true);
+    platformDefault();
+    fakeLlm(setLlmFetch, reply);
+    const before = (await audits('workbench.result_interpreted')).length;
+    expect(await errorOf(interpretResult(await analyst(), 'SELECT 1 AS n', true, null))).toMatch(/^422 模型解读结果失败/);
+    expect((await audits('workbench.result_interpreted')).length).toBe(before);
+  });
+
+  describe('数字核对（#1218）', () => {
+    it('开关打开的分组结果：facts 里的最大值不报，编出来的数进 unverified；审计 unverified 只记个数、不记这个数', async () => {
+      await setSamples(true);
+      const sql = "SELECT '苏州' AS city, 3606 AS n UNION ALL SELECT '上海', 2100 UNION ALL SELECT '无锡', 122";
+      modelSays('苏州最多，有 3606 位；全国约 98765 位。');
+      const out = await interpretResult(await analyst(), sql, true, null);
+      expect(out.unverified).toEqual(['98765']);
+      const [detail] = await interpreted(sql);
+      expect(detail.unverified).toBe(1);
+      expect(JSON.stringify(detail)).not.toContain('98765');
+    });
+
+    it('开关关闭：对得上行数 rowCount 的数不报；只在没发出去的结果行里出现的取值（SQL 里也没写出来）也算找不到出处', async () => {
+      await setSamples(false);
+      const sql = Array.from({ length: 12 }, (_, i) => `SELECT 'c${i + 1}' AS city, ${i + 1} * 100 AS n`).join(' UNION ALL ');
+      const { received } = modelSays('共 12 个城市，c7 有 700 位。');
+      const out = await interpretResult(await analyst(), sql, true, null);
+      expect(sentContent(received[0].body).rowCount).toBe(12);
+      expect(out.unverified).toEqual(['700']);
+      expect((await interpreted(sql))[0]!.unverified).toBe(1);
+    });
   });
 
   it('isDetail：标识列名或因敏感被剔除算明细；paid、城市 + 计数、只有系统列被剔除都不算', () => {
