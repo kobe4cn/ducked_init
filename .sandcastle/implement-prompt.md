@@ -12,6 +12,7 @@
 
 这次会话要在 ~150k token 内完成。遵守 `CLAUDE.md` 的「Context budget」：
 
+- 上下文到约 100k 时，hook 会提醒你收尾交接：提交能通过测试的部分、在 issue 上留进度评论（已完成 / 未完成 / 下一步的 file:line），然后结束会话、**不输出 COMPLETE**，下一个全新会话会接着做。收到提醒就照做，不要硬撑着做完：压缩后的会话会丢细节，换新会话更可靠。
 - 票的 `## Implementation guide` 就是你的探索结果。从它的 `file:line` 出发，`grep -n` 确认行号再改。不要做广泛探索。
 - 只整读要改的、300 行以内的文件；长文件用 `grep -n` + `sed -n` 读要改的函数。
 - 写测试前读 `test/README.md`，相似测试从 `test/CATALOG.md` 用 `grep -n` 找。
@@ -41,7 +42,7 @@
 1. 准备：`rm -rf .browser-check && mkdir .browser-check`，`node --import tsx scripts/browser-lab.ts`（在这张票自己的验收库里建租户 `crmlab-smoke` 与 `admin@` / `eng@` / `an@crmlab-smoke.test`，环境变量已配好）。
 2. 起 dev server（后台，输出写文件）：`npx react-router dev --port 5180 --strictPort > /tmp/dev.log 2>&1 &`，等 `curl -s -o /dev/null http://localhost:5180/login` 成功。
 3. 登录：`playwright-cli open http://localhost:5180/login` → `snapshot` 找邮箱框和「发送登录链接」的 ref → `fill` / `click` → `grep -o 'http://localhost:5180/auth/verify?token=[A-Za-z0-9_-]*' /tmp/dev.log | tail -1` → `goto` 这个链接 → **点「登录」按钮** → 地址离开 `/auth` 才算登录。换角色先点「退出登录」。
-4. 照 Browser check 操作。验收租户是空的：需要的数据（数据源、定义等）在页面上自己建，建不出来就写进结论。每个要看的状态截一张：`playwright-cli screenshot --filename=.browser-check/<两位序号>-<说明>.png`，然后**用 Read 看截图**，对照 Browser check 和 `docs/agents/ui.md` 判断。
+4. 照 Browser check 操作。验收租户是空的：需要的数据（数据源、定义等）在页面上自己建，建不出来就写进结论。每个要看的状态截一张：`playwright-cli screenshot --filename=.browser-check/<两位序号>-<说明>.png`，然后**用 Read 看截图**，对照 Browser check 和 `docs/agents/ui.md` 判断。当前模型看不到图片时（Read 图片会被 hook 拦下并说明），截图照样保存，改用 `playwright-cli snapshot`、`playwright-cli eval` 取文字、class、样式和尺寸核对，RESULT.md 里注明截图未经目视核对。
 5. 查错：`playwright-cli console error`，`grep -n -i error /tmp/dev.log`。首次加载时 vite 的 `Failed to fetch dynamically imported module` / 依赖预构建重载是噪声，刷新后不再出现就忽略。
 6. 发现问题就修（能用 HTTP 测试锁住的补测试），提交后重新截图。
 7. 写 `.browser-check/RESULT.md`（中文，会原样进 PR 正文）：Browser check 每一步 ✅/❌/⚠️ 一行，引用对应截图文件名；页面或服务端报错；没能验证的及原因。

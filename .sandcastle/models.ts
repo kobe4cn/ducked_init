@@ -191,9 +191,10 @@ const shellQuote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
  * createSandbox 里的 sandbox.run 不用 agent provider 的 env（只用容器启动时的），所以档案的 env 加在命令前面：
  * `env -u … K=V claude …`，另加 SANDCASTLE_PROFILE（implementer 在进度评论里写明用的档案）。命令在容器里由 sh -c 执行，`${VAR}` 写成 "$VAR"，密钥不出现在宿主机的命令行里。
  */
-export function agentFor(profile: Profile, env: Record<string, string>): sandcastle.AgentProvider {
+export function agentFor(profile: Profile, env: Record<string, string>, phase?: Phase): sandcastle.AgentProvider {
   const base = sandcastle.claudeCode(profile.model, { env, ...(profile.effort ? { effort: profile.effort } : {}) });
-  const assignments = Object.entries({ ...profile.env, SANDCASTLE_PROFILE: profile.name }).map(([k, v]) => {
+  // SANDCASTLE_PHASE 给 .claude/hooks/sandcastle-context.mjs：上下文到预算时按阶段给出不同的收尾要求。
+  const assignments = Object.entries({ ...profile.env, SANDCASTLE_PROFILE: profile.name, ...(phase ? { SANDCASTLE_PHASE: phase } : {}) }).map(([k, v]) => {
     const ref = SECRET_REF.exec(v);
     return `${k}=${ref ? `"$${ref[1]}"` : shellQuote(v)}`;
   });

@@ -113,7 +113,10 @@ Sandcastle 处理期间，PR 作者不要往这个分支推提交。本地和远
 - 每个会话设 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=150000`，用别家模型时也一样（见「模型配置」）。真正保证预算的是 prep 把票切小（`docs/agents/ticket-sizing.md`）。
 - implementer 不跑完整测试（沙箱里很慢），完整测试由门槛跑。
 - PR 正文的 **Budget** 一节记录上下文峰值，超过 150k 时会标出来。峰值取会话文件里单条消息的最大上下文（输入 + 缓存写 + 缓存读），不是会话结束时的大小：中途自动压缩过的会话，结束时只剩几十 k。每次 run 的峰值也写进 `.sandcastle/logs/usage.jsonl` 的 `peak` 字段和 PR 的 Usage 表。
-- 自动压缩管不住单次工具结果过大的情况，压缩只发生在两轮之间。2026-11-17 到 11-22 的 glm 档案在 review 阶段 Read 浏览器截图时，上报的上下文会从约 100k 一下跳到 200k 以上（`.browser-check/*.png`），这 22 个会话就是那周所有超过 150k 的会话；同期 opus 各阶段峰值最高 116k（implement），prep、review 不超过 87k。再启用 glm 档案前先确认这个问题。
+- 每个会话还有 `.claude/hooks/sandcastle-context.mjs` 守着（只在有 `SANDCASTLE_PROFILE` 时生效，宿主机会话不受影响）。自动压缩只在两轮之间发生，管不住单次很大的工具结果，也会让会话丢细节，所以这个 hook 在每次工具调用后，用会话记录里最近一条消息的上下文加上刚返回的结果估算：
+  - 到 100k 时要求收尾。implement 提交能过测试的部分、在 issue 上留进度评论、不输出 COMPLETE 结束，下一个全新会话接着做；3 次会话做不完退回 prep，把剩下的拆成更小的票。其他阶段把手上一项做完、输出结论。阶段名经 `SANDCASTLE_PHASE` 传进容器。
+  - 之后每多 10k 再提醒一次，到 130k 时要求立刻结束。
+  - 档案 `env` 里标了 `SANDCASTLE_NO_IMAGES=1` 的（模型看不到图片），Read 图片会被拦下，浏览器验收改用 `playwright-cli snapshot` / `eval` 文字核对，截图照样保存给人看。glm-5.3 看不到图片，一张 1280×720 截图却照样计约 6–7 万 token：2026-11-17 到 11-22 所有超过 150k 的会话（22 个，都是 glm 的 implement）都是读截图撑上去的，最高 407k。
 
 ## 模型配置
 
@@ -123,7 +126,7 @@ Sandcastle 处理期间，PR 作者不要往这个分支推提交。本地和远
 - `env` 照抄厂商给 Claude Code 的配置（比如智谱 coding plan 的 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_DEFAULT_*_MODEL`）。只对这次会话的 claude 进程生效，加在命令前面（`env K=V claude …`），因为 `createSandbox` 里的 `sandbox.run` 不用 agent provider 的 env。
 - 密钥不写进 `models.json`：值写成 `"${GLM_API_KEY}"`，在容器里从同名环境变量取。变量要列在 `.sandcastle/.env` 里，sandcastle 只把那里列出的变量带进容器。
 - 档案设了 `ANTHROPIC_BASE_URL` 就算别家：命令前 `env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY`，Claude 的凭据不会发到别家的接口。别家档案没设 `ANTHROPIC_DEFAULT_HAIKU_MODEL`（后台小任务和子 agent 用）或 `limitPattern` 时启动会警告。
-- 上下文预算统一 150k：档案里的 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 警告后忽略。
+- 上下文预算统一 150k：档案里的 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 警告后忽略。模型看不到图片的档案在 `env` 里加 `"SANDCASTLE_NO_IMAGES": "1"`（见「上下文预算」）。
 - `phases` 给每个阶段一个有序的档案列表，6 个阶段都要写。每次调度开头读一次：改了配置下次调度生效，不用重启。第一次就读不成（JSON 坏了、档案名不存在、阶段用到的档案引用的变量不在 `.sandcastle/.env` 里）直接退出；运行中途改坏了就警告并沿用上一份。
 - 换档案以一次会话为单位：implement 的每次会话单独挑档案，档案名经环境变量 `SANDCASTLE_PROFILE` 给 implementer，进度评论第一行写明。不用 promptArgs：运行中的旧进程也会读到新提示词，多出的占位符会让它报错。撞上限额（Claude 档案认 `hit your … limit`，别家认 `limitPattern`）就记下这个档案的重置时间，重置前所有票都跳过它，用列表里的下一个；认不出重置时间就跳过 1 小时。重置时间认「resets 6:20am (UTC)」和「2026-11-07 15:30:00」两种，后一种按 `resetTimeZone` 解析。列表里的都在等时，分支推到远端，等最早恢复的那个，不打 stuck。其他报错照常走临时错误重试。
 - 智谱 coding plan 撞限额的错误码是 1308（5 小时额度）和 1310（周 / 月额度），报错是「已达到…的使用上限。您的限额将在 … 重置」；1302 是并发过高，1113 多半是 Key 或 Base URL 配错，都不算限额。

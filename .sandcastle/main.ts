@@ -108,7 +108,7 @@ async function runAgent<T extends AgentRun>(
   usage: UsageRecord[],
   fn: (agent: sandcastle.AgentProvider) => Promise<T>,
 ): Promise<T> {
-  const { run, profile } = await runWithProfile(phase, name, (p) => fn(agentFor(p, { ...claudeEnv, ...env })));
+  const { run, profile } = await runWithProfile(phase, name, (p) => fn(agentFor(p, { ...claudeEnv, ...env }, phase)));
   usage.push(recordUsage(issue, phase, run, name, profile));
   return run;
 }

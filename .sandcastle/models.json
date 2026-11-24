@@ -16,7 +16,8 @@
         "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3[1m]",
         "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.3[1m]",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        "API_TIMEOUT_MS": "3000000"
+        "API_TIMEOUT_MS": "3000000",
+        "SANDCASTLE_NO_IMAGES": "1"
       },
       "limitPattern": "使用上限|Usage limit reached|\"code\":\\s*\"?13(08|10)\\b",
       "resetTimeZone": "Asia/Shanghai"
@@ -24,7 +25,7 @@
   },
   "phases": {
     "prep": ["opus"],
-    "implement": ["opus"],
+    "implement": ["glm", "opus"],
     "review": ["opus"],
     "revise": ["opus"],
     "fix": ["opus"],
