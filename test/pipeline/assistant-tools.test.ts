@@ -51,8 +51,21 @@ describe('AI 助手的工具注册表', () => {
     expect(overview).not.toMatch(/(source|table):/);
     const field = await runTool(viewer, 'catalog_expand', { id: mapped.id });
     expect(field).toContain(`## ${mapped.id}`);
-    expect(field).toContain('- 来源：未映射');
-    expect(await runTool(viewer, 'catalog_expand', { id: 'entity:customer' })).not.toMatch(/(source|table):/);
+    // 来源被隐藏时写中性文字，不说「未映射」（#1188）
+    expect(field).toContain('- 来源：按你的角色不显示');
+    expect(field).not.toContain('未映射');
+    const entity = await runTool(viewer, 'catalog_expand', { id: 'entity:customer' });
+    expect(entity).not.toMatch(/(source|table):/);
+    expect(entity).toContain('- 映射来源：按你的角色不显示');
+    expect(entity).not.toContain('未映射');
+    const viewerSearch = await runTool(viewer, 'catalog_search', { query: 'customer' });
+    expect(viewerSearch).toContain('## entity:customer');
+    expect(viewerSearch).toContain('- 映射来源：按你的角色不显示');
+    expect(viewerSearch).not.toContain('未映射');
+    // 分析师的实体仍列出映射来源
+    const analystEntity = await runTool(analyst, 'catalog_expand', { id: 'entity:customer' });
+    expect(analystEntity).toMatch(/- 映射来源：\S*\//);
+    expect(analystEntity).not.toContain('按你的角色不显示');
     // 组内列表也没有数据源、源表与字段来源
     const grouped = await runTool(viewer, 'catalog_expand', { id: 'group:entity:customer' });
     expect(grouped).toContain('- entity:customer ');

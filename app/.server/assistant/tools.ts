@@ -70,8 +70,9 @@ const TEXT = { type: 'string' };
 
 const LANE_NAMES: Record<HitReason['lane'], string> = { id: '标识', alias: '别名', name: '名称', keyword: '关键词', vector: '语义', expand: '依赖展开' };
 
-/** 条目的 Markdown 加一行语义哈希：模型把哈希带进计划，validatePlan 用它发现条目内容变了（哈希在成员自己那份按角色裁剪的目录上算） */
-const withHash = (e: CatalogEntry) => `${toMarkdown(e)}\nsemanticHash: ${semanticHash(e)}`;
+/** 条目的 Markdown 加一行语义哈希：模型把哈希带进计划，validatePlan 用它发现条目内容变了（哈希在成员自己那份按角色裁剪的目录上算）。
+ *  restricted 目录里被清掉的来源写「按你的角色不显示」：只改渲染，不往条目上加标记，哈希与投影都不变（#1188） */
+const withHash = (e: CatalogEntry, restricted: boolean) => `${toMarkdown(e, { restricted })}\nsemanticHash: ${semanticHash(e)}`;
 
 /** 命中理由一行：「命中：别名「GMV」；关键词「营收」、「30天」」，补召回的是「依赖展开「entity:order 的时间字段」」 */
 const hitLine = (reasons: HitReason[]) =>
@@ -242,7 +243,7 @@ export const TOOLS: AssistantTool[] = [
       const entry = expand(c, key);
       if (!entry) return '没有这个条目';
       ctx?.retrieved.add(entry.id);
-      return withHash(entry);
+      return withHash(entry, visibilityClass(actor.role) === 'restricted');
     },
   },
   {
@@ -266,7 +267,8 @@ export const TOOLS: AssistantTool[] = [
         .filter(s => q.includes(s.name)).map(s => s.id);
       const c = await catalogFor(actor);
       const [tenant] = await getDb().select({ hybridSearch: tenants.hybridSearch }).from(tenants).where(eq(tenants.id, actor.tenant.id));
-      const { ranked, fallback, vectorFallback } = await rankedSearch(actor.tenant.id, visibilityClass(actor.role), c, q,
+      const visibility = visibilityClass(actor.role);
+      const { ranked, fallback, vectorFallback } = await rankedSearch(actor.tenant.id, visibility, c, q,
         { spaceIds, memberSpaceId: actor.space.id }, limit as number | undefined, { hybrid: tenant?.hybridSearch ?? false });
       // 排到的条目都算本轮检索到（含投影不可用回退的那部分），每个都带语义哈希
       for (const r of ranked) ctx?.retrieved.add(r.entry.id);
@@ -275,8 +277,9 @@ export const TOOLS: AssistantTool[] = [
       // 歧义候选留在轮上下文里（⑥-3）：随本轮答复返回并加密存进对话，供前端点选、/assistant 的 choice 入参核对；同一轮再搜且不歧义时清空，只认最后一次。
       // 不歧义但词未命中（没有任何标识 / 别名 / 名称命中）时改留未命中候选组（⑥-5），同样是最后一次搜索说了算
       if (ctx) ctx.choices = ambiguous ? groups.map(g => ({ term: g.term, candidates: g.candidates })) : missingGroup(ranked, fallback, q);
+      const restricted = visibility === 'restricted';
       const entries = ranked.length
-        ? ranked.map(r => r.reasons.length ? `${withHash(r.entry)}\n${hitLine(r.reasons)}` : withHash(r.entry)).join('\n\n')
+        ? ranked.map(r => r.reasons.length ? `${withHash(r.entry, restricted)}\n${hitLine(r.reasons)}` : withHash(r.entry, restricted)).join('\n\n')
         : toMarkdown([]);
       // 词的默认指向（ADR-0056）：没追问、按默认条目处理的组，每项一行（指标的名称就是键），让助手在回答里转述这一句
       const defaultLines = defaults.map(({ term, entryId }) =>

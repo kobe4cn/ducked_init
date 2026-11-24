@@ -15,7 +15,7 @@
     "app/.server/catalog/capabilities.ts": 106,
     "app/.server/catalog/embeddings.ts": 4,
     "app/.server/catalog/expand.ts": 4,
-    "app/.server/catalog/index.ts": 49,
+    "app/.server/catalog/index.ts": 50,
     "app/.server/catalog/plan.ts": 28,
     "app/.server/catalog/projection.ts": 1,
     "app/.server/catalog/tx.ts": 2,
