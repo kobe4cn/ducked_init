@@ -1,12 +1,12 @@
 // scripts/eval-mapping/report.ts —— 映射评测的结果文件（ADR-0035）：一次评测记成 { 模型、端点主机、提示词哈希、开始时间、各例与总体的准确率和改动数 }，
-// 用来在换模型或改提示词前后对比两次。只记主机，不记 Key、完整 URL、请求与模型原文（纯函数）
+// 用来在换模型或改提示词前后对比两次。只记主机，不记 Key、完整 URL、请求与模型原文；失败于映射校验时带脱敏后的问题清单（路径 + 消息，不含样本原文）（纯函数）
 import { createHash } from 'node:crypto';
 import type { TableContext } from '../../app/.server/pipeline/llm-context';
 import { MODEL_DRAFT_SCHEMA, modelDraftMessages } from '../../app/.server/pipeline/model-draft';
-import type { CaseResult, FailStage, Score } from './score';
+import type { CaseResult, FailStage, Problem, Score } from './score';
 
 export interface ReportScore { accuracy: number; edits: number; stage?: FailStage }
-export interface ReportCase extends ReportScore { name: string }
+export interface ReportCase extends ReportScore { name: string; problems?: Problem[] }
 
 export interface EvalReport {
   model: string;
@@ -32,7 +32,11 @@ export function toReport(results: CaseResult[], total: Score, meta: { model: str
     host: new URL(meta.baseUrl).host,
     promptHash: promptHash(),
     startedAt: meta.startedAt.toISOString(),
-    cases: results.map(r => ({ name: r.name, accuracy: r.accuracy, edits: r.edits, ...(r.failed ? { stage: r.failed.stage } : {}) })),
+    cases: results.map(r => ({
+      name: r.name, accuracy: r.accuracy, edits: r.edits,
+      ...(r.failed && { stage: r.failed.stage }),
+      ...(r.failed?.stage === 'mapping' && r.failed.problems && { problems: r.failed.problems }),
+    })),
     total: { accuracy: total.accuracy, edits: total.edits },
   };
 }
@@ -59,7 +63,7 @@ export interface Comparison {
 }
 
 const metaOf = (r: EvalReport): ReportMeta => ({ model: r.model, host: r.host, promptHash: r.promptHash, startedAt: r.startedAt });
-const score = ({ name: _, ...s }: ReportCase): ReportScore => s;
+const score = ({ name: _, problems: __, ...s }: ReportCase): ReportScore => s;
 const delta = (a: ReportScore, b: ReportScore): ScoreDelta => ({ a, b, delta: { accuracy: b.accuracy - a.accuracy, edits: b.edits - a.edits } });
 
 export function compareReports(a: EvalReport, b: EvalReport): Comparison {

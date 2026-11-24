@@ -203,7 +203,9 @@ export function draftMapping(table: TableProfile, entity: CanonicalEntity, opts:
   const unmapped = entity.fields.filter(f => !mapped.has(f.name));
   if (unmapped.length) {
     tail.push('没有对应上的标准字段：');
-    for (const f of unmapped) tail.push(`  ${f.name}（${f.label}）${rejected.has(f.name) ? `：${rejected.get(f.name)}` : ''}`);
+    for (const f of unmapped) {
+      tail.push(`  ${f.name}（${f.label}）${rejected.has(f.name) ? `：${rejected.get(f.name)}` : ''}${f.enum ? `（标准值：${f.enum.join('、')}）` : ''}`);
+    }
   }
   const extra = table.columns.filter(c => !used.has(c.name));
   if (extra.length) {

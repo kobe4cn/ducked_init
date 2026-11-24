@@ -75,7 +75,7 @@
     "app/.server/pipeline/identity-engine.ts": 1,
     "app/.server/pipeline/key-check-engine.ts": 5,
     "app/.server/pipeline/lake-engine.ts": 1,
-    "app/.server/pipeline/mapping-draft.ts": 31,
+    "app/.server/pipeline/mapping-draft.ts": 32,
     "app/.server/pipeline/mapping-spec.ts": 83,
     "app/.server/pipeline/merge-engine.ts": 121,
     "app/.server/pipeline/model-draft.ts": 31,
