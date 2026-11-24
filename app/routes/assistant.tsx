@@ -2,6 +2,7 @@
 // GET 返回是否配置了模型服务、最近一次探测是否支持工具调用（toolSupport：true / false / 没探测过为 null）、能否管理模型服务（canManageProvider，侧栏据此决定给不给「模型服务」页的链接）、成员可用的工具名、「我的对话」与「分享给我的」两个列表；带 ?id= 时再返回这个对话（本人或被分享人才能读，否则 404）。
 // POST 接 JSON：{ conversationId?, message, page } 跑一轮问答（历史从保存的对话里取，只有本人能续写），记进对话后返回 { conversationId, reply, toolsUsed, workbenchSql?, planCard?, choices? }
 // （workbenchSql 是本轮 prefill_workbench 通过校验的 SQL，有值时才带，前端拿它渲染「填入工作台」链接）；
+// 一轮把 request.signal 传给 assistantTurn（#1248）：客户端中止后不再发模型请求，本轮抛 400、不写对话（appendTurn 不执行），已存下的草稿与审计照常保留；
 // 计划随对话保存（ADR-0050）：本轮校验过的计划存进 assistant 消息，续写时把对话里最近一份带给 assistantTurn 作 priorPlan（存草稿前重新校验用），发给模型的只有文字；
 // 计划卡（#452，P4⑯a）：带 plan 的消息在读时按读者自己的目录组装 planCard（读时再校验、不存状态），POST 返回与 ?id= 读回都带；
 // 读回响应只给 planCard、不给原始 plan（#539：被分享人看不到的 excluded 条目 id 不能出现在 HTML / JSON 里），
@@ -180,7 +181,7 @@ export async function action({ request }: Route.ActionArgs) {
       }
     }
     const page = { path: String(body?.page?.path ?? ''), title: String(body?.page?.title ?? '') };
-    const { reply, toolsUsed, plan, workbenchSql, choices } = await assistantTurn(member, [...history, { role: 'user', content: userText }], page, priorPlan);
+    const { reply, toolsUsed, plan, workbenchSql, choices } = await assistantTurn(member, [...history, { role: 'user', content: userText }], page, priorPlan, request.signal);
     const conversationId = await appendTurn(member, id, { userText, reply, toolsUsed, ...(plan ? { plan } : {}), ...(workbenchSql ? { workbenchSql } : {}), ...(choices ? { choices } : {}), ...(chosen ? { chosen } : {}) });
     // 本轮校验过计划时带计划卡、判出过歧义时带候选：都按成员自己的目录读时组装；被拒的那轮（如 reuse_result 计划填工作台）校验过计划也带
     const pair = plan || choices ? await catalogPairFor(member) : null;

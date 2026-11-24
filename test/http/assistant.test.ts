@@ -5,7 +5,7 @@
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { llmCalls } from '../../app/.server/db/schema';
+import { assistantConversations, llmCalls } from '../../app/.server/db/schema';
 import { memberOf, newTenant } from '../pipeline/fixtures';
 import { fakeLlm, json, platformDefault, platformTier, text, toolCalls } from '../pipeline/llm-fixtures';
 import { loginAs, resetDb, startApp, type Client, type TestApp } from './harness';
@@ -59,6 +59,37 @@ describe('AI 助手', () => {
     expect((await ask(viewer, { message: 'x'.repeat(4001), page: TURN.page })).status).toBe(400);
     expect((await viewer.request('/assistant', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{oops' })).status).toBe(400);
   });
+
+  it('客户端中止请求即取消这一轮：第 2 次模型请求的 fetch 被中止，这轮不写对话（#1248）', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    platformDefault();
+    // 第 1 次回 catalog_search 工具调用；第 2 次挂起并遵守 init.signal：客户端中止时 reject
+    const signals: (AbortSignal | undefined)[] = [];
+    app.setLlmFetch(((url: string | URL | Request, init?: RequestInit) => {
+      signals.push(init?.signal as AbortSignal | undefined);
+      return signals.length === 1
+        ? Promise.resolve(toolCalls({ id: 'c1', name: 'catalog_search', args: { query: '客户' } }))
+        : new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener('abort', function aborted(this: AbortSignal) { reject(this.reason); }));
+    }) as unknown as typeof fetch);
+    const controller = new AbortController();
+    const pending = viewer.request('/assistant', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(TURN), signal: controller.signal,
+    }).then(r => r.status, () => 'aborted');
+    // 等第 2 次模型请求挂起后再中止（监听器挂到已中止的 signal 上不会回放）
+    await expect.poll(() => signals.length).toBe(2);
+    controller.abort();
+    // react-router 在请求中止后丢弃本轮的答复（客户端已走，看到的无关紧要），动作本身照常跑完才返回
+    await pending;
+    await expect.poll(() => signals[1]?.aborted).toBe(true);
+    // 中止的这轮不调用 appendTurn：对话表里没有新行；被中止的那次请求记一行带 error 的 llm_calls
+    expect(await getDb().select().from(assistantConversations).where(eq(assistantConversations.tenantId, acme))).toHaveLength(0);
+    const logged = await getDb().select().from(llmCalls).where(eq(llmCalls.tenantId, acme));
+    expect(logged).toHaveLength(2);
+    expect(logged.at(-1)!.error).toBe('请求已取消');
+  }, 30_000);
 
   it('探测结果按租户存下并带端点与模型：不支持时 GET 为 false、POST 422 不发请求；改了模型、恢复平台默认、平台默认换了模型后作废', async () => {
     platformDefault();
