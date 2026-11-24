@@ -52,8 +52,9 @@ export interface LlmProvider {
 /** transient：超时、连不上、HTTP 5xx 或 429，过一会儿再试可能就好了 */
 export class LlmError extends Error {
   /** status：HTTP 错误的状态码（postJson 填），callModel 据此判断要不要退回 json_object；
-   *  timeout：超时（masked 填，此时 transient 也为 true）。logged 的重试只认 transient 且不是超时的——超时再等一轮太久（ADR-0035） */
-  constructor(message: string, readonly transient = false, readonly status?: number, readonly timeout = false) { super(message); }
+   *  timeout：超时（masked 填，此时 transient 也为 true）。logged 的重试只认 transient 且不是超时的——超时再等一轮太久（ADR-0035）；
+   *  aborted：外部 signal 中止（#1248），此时 transient 与 timeout 都是 false */
+  constructor(message: string, readonly transient = false, readonly status?: number, readonly timeout = false, readonly aborted = false) { super(message); }
 }
 
 /** 租户 API Key 的加密 context（ADR-0009），解密时须给出同一个 */
@@ -228,6 +229,14 @@ export function validatorFor(schema: object) {
 /** 本层报错固定出中文（LlmError 还不是 MsgError），句式走 msg() 以便词典与将来按语言出（ADR-0060） */
 const zh = (m: Msg) => formatServer('zh-CN', m);
 
+/** 外部 signal 中止的文案（#1248）：LlmError 与助手一轮的 AssistantError 共用（本层报错固定中文，句式走 msg() 进词典） */
+export const ABORTED = zh(msg('请求已取消'));
+
+/** 调用前检查外部 signal（#1248）：已中止时不发请求、不记 llm_calls，抛 aborted 的 LlmError（不是超时也不 transient，不重试） */
+export function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new LlmError(ABORTED, false, undefined, false, true);
+}
+
 /** 一条校验错误的中文说明（常见的几种，其余用 ajv 的原文） */
 function describeError(e: ErrorObject) {
   const p = e.params as Record<string, unknown>;
@@ -261,11 +270,14 @@ export interface CallStats { usage?: { prompt_tokens?: number; completion_tokens
 
 const maskKey = (apiKey: string, s: string) => (apiKey ? s.replaceAll(apiKey, '***') : s);
 
-/** 跑 run，失败都转成 LlmError，消息里的 API Key 换成 ***；timeout 只是超时消息里的秒数，中断本身由 postJson 的 AbortSignal 负责 */
-async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeoutMs()): Promise<T> {
+/** 跑 run，失败都转成 LlmError，消息里的 API Key 换成 ***；timeout 只是超时消息里的秒数，中断本身由 postJson 的 AbortSignal 负责。
+ *  signal 是调用方的外部 signal（#1248）：中止时 fetch 以 AbortError 拒绝，名字与外部中止分不开，只看 signal.aborted——
+ *  此时不算超时、不标 transient（logged 不重试） */
+async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeoutMs(), signal?: AbortSignal): Promise<T> {
   try {
     return await run();
   } catch (e) {
+    if (signal?.aborted) throw new LlmError(ABORTED, false, undefined, false, true);
     const timedOut = e instanceof Error && e.name === 'TimeoutError';
     throw new LlmError(maskKey(apiKey, e instanceof LlmError ? e.message
       : timedOut ? `模型服务 ${timeout / 1000} 秒内没有返回`
@@ -277,14 +289,14 @@ async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeou
 /** 返回里的 choices[0].message（带同一条 choice 的 finish_reason），字段都没校验 */
 interface RawMessage { content?: unknown; tool_calls?: unknown; finishReason?: unknown }
 
-/** POST 一个 JSON 请求到 {baseUrl}{path}（带 Bearer Key 与超时），非 2xx 抛 LlmError（5xx 与 429 算 transient），返回解析后的 JSON，不是 JSON 时返回 null */
-async function postJson(provider: LlmProvider, path: string, payload: Record<string, unknown>, timeout = timeoutMs()): Promise<unknown> {
+/** POST 一个 JSON 请求到 {baseUrl}{path}（带 Bearer Key 与超时，外部 signal 一并合进同一个 AbortSignal，#1248），非 2xx 抛 LlmError（5xx 与 429 算 transient），返回解析后的 JSON，不是 JSON 时返回 null */
+async function postJson(provider: LlmProvider, path: string, payload: Record<string, unknown>, timeout = timeoutMs(), signal?: AbortSignal): Promise<unknown> {
   const { baseUrl, apiKey } = provider;
   const res = await llmFetch()(`${baseUrl.replace(/\/+$/, '')}${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(timeout),
+    signal: signal ? AbortSignal.any([AbortSignal.timeout(timeout), signal]) : AbortSignal.timeout(timeout),
   });
   // 先遮蔽再截断：Key 跨过截断处时半截 Key 就遮不住了
   if (!res.ok) throw new LlmError(`模型服务返回 HTTP ${res.status}：${maskKey(apiKey, await res.text()).slice(0, 200)}`, res.status >= 500 || res.status === 429, res.status);
@@ -318,10 +330,10 @@ function chatExtraBody(provider: LlmProvider): Record<string, unknown> {
 
 /** 发一次 /chat/completions（chatExtra 的服务商参数垫在最底层，payload 之外补上模型名与 temperature 0，平台字段不会被覆盖），
  *  返回 choices[0].message（带它的 finish_reason，截断判定用）；令牌数填进 stats */
-async function postChat(provider: LlmProvider, payload: Record<string, unknown>, stats: CallStats): Promise<RawMessage> {
+async function postChat(provider: LlmProvider, payload: Record<string, unknown>, stats: CallStats, signal?: AbortSignal): Promise<RawMessage> {
   if (!provider.model) throw new LlmError('模型服务配置不完整：没有填写模型名');
   const body = await postJson(provider, '/chat/completions',
-    { ...chatExtraBody(provider), model: provider.model, ...payload, temperature: 0 }) as
+    { ...chatExtraBody(provider), model: provider.model, ...payload, temperature: 0 }, undefined, signal) as
     { choices?: { message?: RawMessage; finish_reason?: unknown }[]; usage?: CallStats['usage'] } | null;
   stats.usage = body?.usage;
   return { ...body?.choices?.[0]?.message ?? {}, finishReason: body?.choices?.[0]?.finish_reason };
@@ -392,19 +404,19 @@ const jsonObjectOnly = new Map<string, WeakSet<object>>();
  * 失败都抛 LlmError（消息里的 API Key 换成 ***，HTTP 错误只带状态码与前 200 字的响应体）；stats 由调用方传入时顺带填上令牌数与校验结果
  */
 export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[], schema: object, stats: CallStats = { schemaValid: null },
-  name = 'output'): Promise<T> {
+  name = 'output', signal?: AbortSignal): Promise<T> {
   return masked(provider.apiKey, async () => {
     // 根是 object 的 Schema 剥掉条件关键字后以 json_schema（strict: false，现有 Schema 多不满足 strict）发给模型；
     // 根不是 object（如根上 anyOf）或这个端点 + 模型拒绝过这份 Schema 时发 json_object。HTTP 400 / 422 时同一模型改发 json_object 一次，成功才记缓存
     const modelSchema = schemaForModel(schema);
     const key = `${provider.baseUrl}|${provider.model}`;
     const asSchema = isRecord(modelSchema) && modelSchema.type === 'object' && !jsonObjectOnly.get(key)?.has(schema);
-    const jsonObject = () => postChat(provider, { messages, response_format: { type: 'json_object' } }, stats);
+    const jsonObject = () => postChat(provider, { messages, response_format: { type: 'json_object' } }, stats, signal);
     let reply: RawMessage;
     if (!asSchema) reply = await jsonObject();
     else {
       try {
-        reply = await postChat(provider, { messages, response_format: { type: 'json_schema', json_schema: { name, schema: modelSchema, strict: false } } }, stats);
+        reply = await postChat(provider, { messages, response_format: { type: 'json_schema', json_schema: { name, schema: modelSchema, strict: false } } }, stats, signal);
       } catch (e) {
         if (!(e instanceof LlmError && (e.status === 400 || e.status === 422))) throw e;
         reply = await jsonObject();
@@ -430,7 +442,7 @@ export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[]
     for (let round = 0; !stats.schemaValid && round < 3 && dropNullOptionals(parsed, validate.errors); round++) stats.schemaValid = validate(parsed);
     if (!stats.schemaValid) assertSchema(schema, parsed);
     return parsed as T;
-  });
+  }, undefined, signal);
 }
 
 /** 去掉开头的 <think>…</think>（大小写不敏感，到第一个 </think>）；没闭合时原样返回 */
@@ -469,11 +481,11 @@ export interface ToolReply { content: string | null; toolCalls: LlmToolCall[] }
  * tools 为空数组时请求体里既不带 tools 也不带 tool_choice（空 tools 配 tool_choice 很多服务商直接 400；助手超限后的总结请求这样用，#1180）。
  * 不查库、不记日志；失败与 callModel 一样抛抹掉 Key 的 LlmError，既没有文本也没有工具调用时也算失败
  */
-export async function callTools(provider: LlmProvider, messages: LlmMessage[], tools: LlmTool[], stats: CallStats = { schemaValid: null }): Promise<ToolReply> {
+export async function callTools(provider: LlmProvider, messages: LlmMessage[], tools: LlmTool[], stats: CallStats = { schemaValid: null }, signal?: AbortSignal): Promise<ToolReply> {
   return masked(provider.apiKey, async () => {
     const message = await postChat(provider, {
       messages, ...(tools.length ? { tools: tools.map(t => ({ type: 'function', function: t })), tool_choice: 'auto' } : {}),
-    }, stats);
+    }, stats, signal);
     const raw = Array.isArray(message.tool_calls) ? message.tool_calls as { id?: unknown; function?: { name?: unknown; arguments?: unknown } }[] : [];
     const toolCalls = raw.flatMap(c => typeof c?.function?.name === 'string' ? [{
       // 部分兼容接口不给 id：本地生成，loop 回填 tool_call_id 用的是同一个值
@@ -484,7 +496,7 @@ export async function callTools(provider: LlmProvider, messages: LlmMessage[], t
     const content = typeof message.content === 'string' && message.content ? message.content : null;
     if (content === null && !toolCalls.length) throw new LlmError('模型服务的返回里既没有内容也没有工具调用');
     return { content, toolCalls };
-  });
+  }, undefined, signal);
 }
 
 /**
@@ -526,10 +538,13 @@ async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider:
   }
 }
 
-/** 按租户的模型服务 callModel，记调用日志（logged） */
-export const chatJson = <T>(tenantId: string, purpose: LlmPurpose, messages: LlmMessage[], schema: object): Promise<T> =>
-  logged(tenantId, purpose, (provider, stats) => callModel<T>(provider, messages, schema, stats, purpose), resolveRoute,
+/** 按租户的模型服务 callModel，记调用日志（logged）。signal 已中止时不发请求、不记日志（#1248；仍以 rejected promise 报出，不变成同步抛错） */
+export const chatJson = async <T>(tenantId: string, purpose: LlmPurpose, messages: LlmMessage[], schema: object,
+  opts: { signal?: AbortSignal } = {}): Promise<T> => {
+  throwIfAborted(opts.signal);
+  return logged(tenantId, purpose, (provider, stats) => callModel<T>(provider, messages, schema, stats, purpose, opts.signal), resolveRoute,
     { retry: purpose !== 'connectivity' });
+};
 
 /** 按租户的模型服务 callTools，记调用日志（logged；schema_valid 为 null） */
 export const chatTools = (tenantId: string, purpose: LlmPurpose, messages: LlmMessage[], tools: LlmTool[]): Promise<ToolReply> =>
@@ -538,10 +553,14 @@ export const chatTools = (tenantId: string, purpose: LlmPurpose, messages: LlmMe
 /**
  * 按调用方解析好的档位路由（route）调 callTools 并记调用日志（口径同 chatTools，route / fallback_reason 用传入的 route 的值）。
  * 助手一轮问答开始时解析一次、整轮复用（#531）：tool_call 历史对模型敏感，一次调用中途换模型会不兼容，
- * 路由不再由 logged 每次自己解析（照 embedWith 的写法）
+ * 路由不再由 logged 每次自己解析（照 embedWith 的写法）。opts.signal 是这一轮的外部中止（#1248）：
+ * 调用前已中止时不发请求、不记日志，途中中止时那次请求照常记一行带 error 的日志（已经计费）
  */
-export const chatToolsWith = (tenantId: string, purpose: LlmPurpose, route: LlmRoute, messages: LlmMessage[], tools: LlmTool[]): Promise<ToolReply> =>
-  logged(tenantId, purpose, (provider, stats) => callTools(provider, messages, tools, stats), async () => route);
+export const chatToolsWith = async (tenantId: string, purpose: LlmPurpose, route: LlmRoute, messages: LlmMessage[], tools: LlmTool[],
+  opts: { signal?: AbortSignal } = {}): Promise<ToolReply> => {
+  throwIfAborted(opts.signal);
+  return logged(tenantId, purpose, (provider, stats) => callTools(provider, messages, tools, stats, opts.signal), async () => route);
+};
 
 /** 按调用方给出的路由调 callModel 并记调用日志（口径同 chatJson，connectivity 以外的用途也重试 1 次）：保存档位前用还没写库的配置探测一次（#1213）、
  *  连通测试按已解析的档位各测一次时用，路由不再由 logged 自己解析 */
