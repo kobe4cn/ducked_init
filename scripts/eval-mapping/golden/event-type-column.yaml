@@ -1,0 +1,11 @@
+# 改写自 crm-seed events_s3.events.event（去掉 customer_source）：event_type 取列 event_name，时间是 Unix 毫秒
+model: 1
+entity: event
+table: events
+fields:
+  event_id: event_id
+  customer_id: user_id
+  device_id: device_id
+  event_type: event_name
+  occurred_at: from_epoch_millis(ts_ms)
+  page: page

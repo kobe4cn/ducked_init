@@ -1,0 +1,10 @@
+# 改写自 crm-seed mall_pg.products.product：字段改名（sku → product_id、title → name、list_price → price）
+model: 1
+entity: product
+table: products
+fields:
+  product_id: sku
+  name: title
+  category: category
+  brand: brand
+  price: list_price

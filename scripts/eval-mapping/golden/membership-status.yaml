@@ -1,0 +1,17 @@
+# 改写自 crm-seed loyalty_pg.memberships.membership：会员状态是中文，字段改名（card_no → membership_id、tier → level）
+model: 1
+entity: membership
+table: memberships
+fields:
+  membership_id: card_no
+  customer_id: member_id
+  level: tier
+  points: points_balance
+  status:
+    expr: status
+    dictionary:
+      正常: active
+      冻结: frozen
+      注销: cancelled
+  joined_at: joined_at
+  expires_at: expires_at

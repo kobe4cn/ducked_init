@@ -5,7 +5,7 @@ import { entityOf } from '../../app/lib/canonical-model';
 import { diffPlans, type PlanDiff } from '../../app/lib/mapping-diff';
 import { callModel, LlmError, type LlmProvider } from '../../app/.server/llm';
 import { buildTableContext } from '../../app/.server/pipeline/llm-context';
-import { draftMapping } from '../../app/.server/pipeline/mapping-draft';
+import { draftCustomMapping, draftMapping } from '../../app/.server/pipeline/mapping-draft';
 import { checkMapping, type MappingIssue, type MappingSpec, type MergePlan } from '../../app/.server/pipeline/mapping-spec';
 import { adoptModelDraft, MODEL_DRAFT_SCHEMA, modelDraftMessages, type ModelDraft } from '../../app/.server/pipeline/model-draft';
 import { CATALOG, type GoldenCase } from './golden';
@@ -75,18 +75,30 @@ function withoutExtensions(text: string) {
   return doc.toString({ nullStr: 'null', lineWidth: 0 });
 }
 
-/** 跑一个样例；期望 YAML 本身不过校验、实体不存在时直接抛错（黄金集写错了） */
+/**
+ * 跑一个样例；期望 YAML 本身不过校验、实体不存在时直接抛错（黄金集写错了）。
+ * 自定义实体样例与产品一样：规则草稿用 draftCustomMapping，校验带登记，不删 extensions（自定义实体只有 extensions）
+ */
 export async function runCase(c: GoldenCase, provider: LlmProvider): Promise<CaseResult> {
   const columns = () => c.profile.columns.map(({ name, type }) => ({ name, type }));
-  const want = checkMapping(c.expectedYaml, columns);
+  const reg = c.registration;
+  const customEntities = reg && new Map([[reg.name, reg]]);
+  // 标准实体去掉 extensions 再校验与算分：规则草稿里的扩展字段期望映射没有
+  const check = (y: string) => checkMapping(reg ? y : withoutExtensions(y), columns, customEntities);
+  const want = checkMapping(c.expectedYaml, columns, customEntities);
   if (!want.ok) throw new Error(`黄金样例 ${c.name} 的期望映射不过校验：${want.issues.map(i => i.message).join('；')}`);
-  const entity = entityOf(c.entity);
-  if (!entity) throw new Error(`黄金样例 ${c.name} 的实体 ${c.entity} 不存在`);
+  let rulesYaml: string;
+  if (reg) {
+    rulesYaml = draftCustomMapping(c.profile, reg);
+  } else {
+    const entity = entityOf(c.entity);
+    if (!entity) throw new Error(`黄金样例 ${c.name} 的实体 ${c.entity} 不存在`);
+    rulesYaml = draftMapping(c.profile, entity);
+  }
   const base = { name: c.name, expected: want.plan.columns.length };
   const fail = (stage: FailStage, message: string, issues?: readonly MappingIssue[]): CaseResult =>
     ({ ...base, ...failedScore(want.spec, want.plan), failed: { stage, message, ...(issues && { issues: issues.length, problems: redactIssues(issues) }) } });
 
-  const rulesYaml = draftMapping(c.profile, entity);
   let out: ModelDraft;
   try {
     out = await callModel<ModelDraft>(provider, modelDraftMessages(buildTableContext(c.profile), c.entity, rulesYaml, CATALOG), MODEL_DRAFT_SCHEMA);
@@ -94,13 +106,13 @@ export async function runCase(c: GoldenCase, provider: LlmProvider): Promise<Cas
     if (e instanceof LlmError) return fail('model', e.message);
     throw e;
   }
-  // 校验与算分都去掉 extensions，传给 adoptModelDraft 的是原始规则草稿（dropItems 按它退回个别项）
+  // 传给 adoptModelDraft 的是原始规则草稿（dropItems 按它退回个别项）
   const r = await adoptModelDraft(rulesYaml, out, (y) => {
-    const g = checkMapping(withoutExtensions(y), columns);
+    const g = check(y);
     return g.ok ? [] : g.issues;
   });
   if (r.status === 'rejected') return fail('mapping', `映射校验不过：${r.issues.length} 个问题`, r.issues);
-  const got = checkMapping(withoutExtensions(r.yaml), columns);
+  const got = check(r.yaml);
   if (!got.ok) throw new Error(`样例 ${c.name} 采用的映射不过校验`);
   return {
     ...base, ...scoreDiff(want.plan, diffPlans(want.plan, got.plan)),

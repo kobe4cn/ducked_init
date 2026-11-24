@@ -1,11 +1,11 @@
-// test/eval-mapping.test.ts —— 映射评测（#217，ADR-0035）：黄金集的期望 YAML 都能对着自己的表统计过校验、四类样例都有；
+// test/eval-mapping.test.ts —— 映射评测（#217，ADR-0035）：黄金集的期望 YAML 都能对着自己的表统计过校验（自定义样例带登记）、规则草稿都能生成、六类样例都有；
 // runCase 用假 fetch 跑出的准确率与人工改动项数：与期望一致、改一个表达式少一列、不合 Schema、不过校验时的问题清单（脱敏）；
-// 提示词带固定目录，个别项不过校验时与产品同样部分采用（带 partial 与 dropped）（纯函数，不读库）
+// 提示词带固定目录，个别项不过校验时与产品同样部分采用（带 partial 与 dropped）；自定义实体样例的模型草稿与产品一样整份不采用（缺口见 #1268）（纯函数，不读库）
 import { afterEach, describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import { entityOf } from '../app/lib/canonical-model';
 import { setLlmFetch } from '../app/.server/llm';
-import { draftMapping } from '../app/.server/pipeline/mapping-draft';
+import { draftCustomMapping, draftMapping } from '../app/.server/pipeline/mapping-draft';
 import { checkMapping, type FieldSpec } from '../app/.server/pipeline/mapping-spec';
 import type { ModelDraft, ModelField } from '../app/.server/pipeline/model-draft';
 import { GOLDEN, type GoldenCase } from '../scripts/eval-mapping/golden';
@@ -32,13 +32,15 @@ function perfectDraft(c: GoldenCase): ModelDraft {
 const caseNamed = (name: string) => GOLDEN.find(c => c.name === name)!;
 
 describe('映射黄金集', () => {
-  it('期望 YAML 都能对着自己的表统计过校验，四类样例都有', () => {
+  it('期望 YAML 都能对着自己的表统计过校验（自定义样例带登记），规则草稿都能生成，六类样例都有', () => {
     for (const c of GOLDEN) {
-      const r = checkMapping(c.expectedYaml, () => c.profile.columns.map(({ name, type }) => ({ name, type })));
+      const reg = c.registration;
+      const r = checkMapping(c.expectedYaml, () => c.profile.columns.map(({ name, type }) => ({ name, type })), reg && new Map([[reg.name, reg]]));
       expect(r.ok ? [] : r.issues, c.name).toEqual([]);
+      expect(() => (reg ? draftCustomMapping(c.profile, reg) : draftMapping(c.profile, entityOf(c.entity)!)), c.name).not.toThrow();
     }
-    expect(GOLDEN.length).toBeGreaterThanOrEqual(5);
-    expect(new Set(GOLDEN.flatMap(c => c.kinds))).toEqual(new Set(['rename', 'cents', 'status_enum', 'dedupe']));
+    expect(GOLDEN.length).toBeGreaterThanOrEqual(10);
+    expect(new Set(GOLDEN.flatMap(c => c.kinds))).toEqual(new Set(['rename', 'cents', 'status_enum', 'dedupe', 'custom_entity', 'event_type']));
   });
 });
 
@@ -80,6 +82,15 @@ describe('映射评测跑分', () => {
     expect(r.failed!.issues).toBeGreaterThan(0);
     expect(r).not.toHaveProperty('partial');
     expect(JSON.stringify(r)).not.toContain(PROVIDER.apiKey);
+  });
+
+  it('自定义实体样例：走自定义规则草稿、带登记校验，模型草稿写的 fields 定位不到个别项，整份不采用（已知缺口，#1268）', async () => {
+    const c = caseNamed('custom-store');
+    fakeLlm(setLlmFetch, () => json({ fields: [{ field: 'store_name', expr: 'store_name', confidence: 0.9, reason: 'x' }] }));
+    const r = await runCase(c, PROVIDER);
+    // 期望 3 列（store_id、store_name、region_id），改动 = 3 列 + 去重
+    expect(r).toMatchObject({ name: 'custom-store', accuracy: 0, expected: 3, edits: 4, failed: { stage: 'mapping' } });
+    expect(r).not.toHaveProperty('partial');
   });
 
   it('值字典写了非标准枚举值：问题清单带路径与消息，源取值与模型给的值都换成 <值>', async () => {

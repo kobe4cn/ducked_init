@@ -1,0 +1,9 @@
+# 改写自 crm-seed pos_mysql.stores.custom_store：自定义实体（门店维度）只写 extensions 与 dedupe（ADR-0019）；主键列在表统计里叫 store_id
+model: 1
+entity: custom_store
+table: stores
+extensions:
+  store_id: { type: string, expr: store_id }
+  store_name: { type: string, expr: store_name }
+  region_id: { type: string, expr: region_id }
+dedupe: { key: [store_id] }
