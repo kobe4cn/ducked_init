@@ -27,7 +27,7 @@ import { resolveProvider } from '~/.server/llm';
 import { getLocale } from '~/.server/locale';
 import { toolSupport } from '~/.server/model-provider';
 import {
-  appendTurn, ConversationError, lastChoices, listMyConversations, listSharedWithMe, readConversation, shareConversation, unshareConversation,
+  appendTurn, ConversationError, historyTurns, lastChoices, listMyConversations, listSharedWithMe, readConversation, shareConversation, unshareConversation,
   type Conversation, type StoredMessage,
 } from '~/.server/assistant/conversations';
 import { askCardFor, proposeFromChoice, type AskCard } from '~/.server/assistant/knowledge-ask';
@@ -85,7 +85,7 @@ export async function loader({ request }: Route.LoaderArgs) {
       const catalog = pair?.catalog ?? null;
       conversation = {
         ...read,
-        messages: await Promise.all(read.messages.map(async ({ plan, choices, ...m }, i) => {
+        messages: await Promise.all(read.messages.map(async ({ plan, choices, source: _source, ...m }, i) => {
           const chosen = chosenBefore(i);
           const askCard = chosen ? await askCardFor(member, chosen, i - 1) : null;
           return {
@@ -155,7 +155,7 @@ export async function action({ request }: Route.ActionArgs) {
       // 追加前的消息数就是这条 chosen user 消息将要落到的下标（⑥-4 卡片与提交都按它取回选择）
       chosenIndex = conversation.messages.length;
       // 保存的对话可以很长，交给模型的只取最近的若干轮（一问一答成对，加上这次的问题不超过 MAX_HISTORY 条）
-      history = conversation.messages.slice(-(MAX_HISTORY - 2)).map(({ role, content }) => ({ role, content }));
+      history = historyTurns(conversation.messages, MAX_HISTORY - 2);
       // 最近一份计划在完整消息里倒着找（截过的 history 里可能没有）；它不发给模型，只作存草稿前重新校验的兜底
       priorPlan = conversation.messages.filter(m => m.plan).at(-1)?.plan;
       if (choice || none) {

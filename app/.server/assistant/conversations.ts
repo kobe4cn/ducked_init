@@ -1,6 +1,7 @@
 // app/.server/assistant/conversations.ts —— AI 助手对话的保存与只读分享（ADR-0043）。
 // 对话按成员存在 platform.assistant_conversations：标题与消息用租户数据密钥加密后存一个字段（ADR-0009），表里没有明文。
-// 消息只有成员与助手的文字和用过的工具名，不存工具输出、不存查询结果行；工作台的结果解读另存 SQL、行数与发送的列名（query）。
+// 消息只有成员与助手的文字和用过的工具名，不存工具输出、不存查询结果行；工作台的结果解读另存 SQL、行数与发送的列名（query）；
+// 解读那条 assistant 消息标 source: 'interpretation'（#1259），续写时以引用形式（user 角色、<interpretation> 边界）发给模型，不当作助手说过的话。
 // 分析计划（ADR-0050）随校验它的那轮 assistant 消息保存（plan）：只存计划本身（条目 id、版本与语义哈希），不存检索结果与工具原文（ADR-0043）；
 // 本轮 prefill_workbench 通过校验的 SQL 也随那条 assistant 消息保存（workbenchSql），只存进加密的消息体、不写进 content（content 会作为历史发给模型）。
 // 歧义追问的结构化候选（⑥-3，ADR-0047）随判出歧义的那轮 assistant 消息保存（choices：词与候选条目 id，名称读时按读者目录组装，#539）；
@@ -16,7 +17,7 @@ import { getDb } from '../db/client';
 import { assistantConversations, assistantConversationShares, members } from '../db/schema';
 import { decryptForTenant, encryptForTenant } from '../secrets';
 import { normalizeEmail, UUID } from '../tenants';
-import { MAX_CONTENT } from './loop';
+import { MAX_CONTENT, type ChatTurn } from './loop';
 
 export const ASSISTANT_CONTEXT = 'assistant.conversation';
 /** 列表最多列出的对话数 */
@@ -39,6 +40,8 @@ export interface StoredMessage {
   choices?: ChoiceGroup[];
   /** 点选候选回答的那条 user 消息带的选择（⑥-3 / ⑥-5，ADR-0046：用户的回答只当数据，content 由服务端按它生成） */
   chosen?: { term: string; entryId: string; kind?: 'missing' };
+  /** 工作台结果解读写进来的 assistant 消息（#1259）：存储与面板仍是 assistant，发给模型时改成引用（user 角色、包在 <interpretation> 里） */
+  source?: 'interpretation';
 }
 interface SealedBody { title: string; messages: StoredMessage[] }
 export interface ConversationSummary { id: string; title: string; updatedAt: Date }
@@ -140,8 +143,19 @@ export async function appendInterpretation(actor: CurrentMember, id: string | nu
   return appendMessages(actor, id, `解读：${titleOf(sql, SQL_TITLE_LENGTH)}`, [
     // 截的是 SQL，代码块照样闭合
     { role: 'user', content: `${prefix}${sql.slice(0, MAX_CONTENT - prefix.length - suffix.length)}${suffix}`, query },
-    { role: 'assistant', content: text.slice(0, MAX_CONTENT) },
+    { role: 'assistant', content: text.slice(0, MAX_CONTENT), source: 'interpretation' },
   ]);
+}
+
+/**
+ * 保存的对话转成发给模型的最近 keep 条历史（#1259）：解读标上 source: 'interpretation'，assistantTurn 会把它改成引用发出。
+ * 旧对话里的解读没有 source，按「前一条 user 带 query」认出来；所以先在完整消息上标记再切片，切片切掉前一条也不丢标记
+ */
+export function historyTurns(messages: StoredMessage[], keep: number): ChatTurn[] {
+  return messages.map(({ role, content, source }, i): ChatTurn =>
+    source === 'interpretation' || (role === 'assistant' && messages[i - 1]?.query)
+      ? { role, content, source: 'interpretation' }
+      : { role, content }).slice(-keep);
 }
 
 /** 标题：text 合并空白后的前 length 字 */
