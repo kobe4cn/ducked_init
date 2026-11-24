@@ -12,7 +12,9 @@
 // 返回给前端的只有文字答复、用过的工具名、本轮的计划、这份 SQL 与歧义候选，不回传工具原文；
 // 工具调用次数到 MAX_TOOL_CALLS 时不带工具再请求一次，让模型总结本轮进展与下一步（#1180，失败时退回 LIMIT_REPLY）；本轮已有 valid 计划后 prefill_workbench 最多免计 2 次；
 // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮每次请求都用同一套端点与模型（chatToolsWith）、在 platform.llm_calls 记一条 assistant（route=reasoning），不存提示词与答复原文
+import { can, deniedReason } from '../access';
 import type { CurrentMember } from '../auth';
+import type { Role } from '../db/schema';
 import { planRetrievedIds, type AnalysisPlan } from '../catalog/plan';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
 import { chatToolsWith, LlmError, resolveRoute, type LlmMessage, type LlmRoute } from '../llm';
@@ -114,16 +116,46 @@ function planSummary(plan: AnalysisPlan): string {
   return summary.length > MAX_PLAN_SUMMARY ? `${summary.slice(0, MAX_PLAN_SUMMARY - 2)}\n…` : summary;
 }
 
-const systemPrompt = (page: AssistantPage, priorPlan?: AnalysisPlan) => [
+/**
+ * 按成员角色给模型的能力说明（#1189，ADR-0005）：成员缺哪项权限就写一句「这位成员…」，
+ * 让模型被问到时说明要由有相应权限的成员来做，而不是建议成员去自己进不去的页面；管理员一句都没有
+ */
+function memberLimits(role: Role): string[] {
+  return [
+    ...(can(role, 'sources:read') ? [] : [`这位成员看不到数据源和源表（${deniedReason('sources:read')}）：被问到数据源、源表或映射时，说明需要有相应权限的成员来做，不要建议成员去数据源或映射页面。`]),
+    ...(can(role, 'definitions:draft') ? [] : [`这位成员不能起草指标、标签或映射（${deniedReason('definitions:draft')}）：被要求起草或存草稿时，说明需要有相应权限的成员来做，不要建议成员去指标管理等页面新建或存草稿，也不要调 save_* 工具。`]),
+    ...(can(role, 'publish') ? [] : [`这位成员不能发布映射或定义（${deniedReason('publish')}）：被要求发布时，说明需要有相应权限的成员来做。`]),
+  ];
+}
+
+/** 助手自己能做什么：校验并保存草稿只对能起草的成员、填工作台只对有沙箱的成员（工具按同样的权限由 toolsFor 给出） */
+function assistantAbilities(role: Role): string {
+  const draft = can(role, 'definitions:draft');
+  const sandbox = can(role, 'sandbox');
+  // 「去对应页面自己做」只对能做这些操作的成员成立：能发布的去对应页面，只有沙箱的只能自己执行查询
+  let handOff = '';
+  if (can(role, 'publish')) handOff = '，需要这些操作时告诉成员去对应页面自己做';
+  else if (sandbox) handOff = '，需要执行查询时告诉成员去工作台自己做';
+  return [
+    `你只能用给定的工具读语义目录（实体、字段、关系、指标、标签与模板）${draft ? '、校验并保存草稿' : ''}，不能执行查询`,
+    sandbox ? '，只能把 draft_query 计划的 SQL 用 prefill_workbench 填进工作台，由成员自己执行' : '',
+    '；不能发布任何东西',
+    handOff,
+    '。',
+  ].join('');
+}
+
+const systemPrompt = (page: AssistantPage, role: Role, priorPlan?: AnalysisPlan) => [
   '你是本租户 CRM 数据分析平台的数据助手，用中文回答成员的问题。',
-  '你只能用给定的工具读语义目录（实体、字段、关系、指标、标签与模板）、校验并保存草稿，不能执行查询，只能把 draft_query 计划的 SQL 用 prefill_workbench 填进工作台，由成员自己执行；不能发布任何东西，需要这些操作时告诉成员去对应页面自己做。',
+  assistantAbilities(role),
+  ...memberLimits(role),
   '先用目录工具查清楚再回答，不要编造目录里没有的实体、字段或指标。',
   '回答成员的数据分析问题前，先用 catalog_overview 看目录分组，再用 catalog_expand 展开分组（group:… 标识）或 catalog_search 检索相关条目，再把分析计划 JSON 交给 validate_plan 校验：计划只能引用本轮或对话里最近一份计划已检索到的条目，并带上返回的 semanticHash（指标、标签、模板还要带 version）；对话里最近一份计划（如有）是末尾的 prior_plan，成员要求按已有计划生成 SQL 时，不必重新 catalog_overview / 检索，直接写 SQL 调 prefill_workbench；要改计划就改完再 validate_plan；条目变了 validate_plan / prefill_workbench 会指出，再按提示重新检索。',
   '计划里用 rationale 一两句话说明为何选这些条目，写给成员看，只提本轮检索到、成员看得到的条目。',
   'validate_plan 返回 needs_clarification 时，把计划里的问题逐条向成员追问，本轮不再继续；返回 unsupported 时，向成员说明做不到的原因与问题里建议的下一步。',
   '把 SQL 填进工作台前，先用 validate_plan 校验一份 draft_query 计划，通过后再调 prefill_workbench。',
   'draft_query 的 SQL 凡是按人 / 消费者聚合或排名（如 Top N 人、按城市汇总），都经 silver._identities 换成 consumer_id 按统一消费者归集，消费者属性取 silver._consumer；成员明确要求按源身份时才用源端 customer_id。写法见 capability:workbench-sql。',
-  '起草指标、标签或映射时，先用 validate_* 校验，通过后再用 save_* 保存为草稿；不通过时按问题清单修改后重试。保存后提醒成员草稿要由另一位有发布权限的成员发布。',
+  ...(can(role, 'definitions:draft') ? ['起草指标、标签或映射时，先用 validate_* 校验，通过后再用 save_* 保存为草稿；不通过时按问题清单修改后重试。保存后提醒成员草稿要由另一位有发布权限的成员发布。'] : []),
   `定义的 key 只能用小写字母、数字与下划线，以小写字母开头（${DSL_KEY_PATTERN.source}）。`,
   `成员当前在页面 ${clip(page.path)}「${clip(page.title)}」。`,
   ...(priorPlan ? [planSummary(priorPlan)] : []),
@@ -180,7 +212,7 @@ export async function assistantTurn(
 
   const tools = toolsFor(actor).map(t => ({ name: t.name, description: t.description, parameters: t.inputSchema }));
   const messages: LlmMessage[] = [
-    { role: 'system', content: systemPrompt(page, priorPlan) },
+    { role: 'system', content: systemPrompt(page, actor.role, priorPlan) },
     ...history.map(m => ({ role: m.role, content: m.content })),
   ];
   const toolsUsed: string[] = [];
