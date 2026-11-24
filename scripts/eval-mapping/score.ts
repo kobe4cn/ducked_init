@@ -6,7 +6,7 @@ import { diffPlans, type PlanDiff } from '../../app/lib/mapping-diff';
 import { callModel, LlmError, type LlmProvider } from '../../app/.server/llm';
 import { buildTableContext } from '../../app/.server/pipeline/llm-context';
 import { draftMapping } from '../../app/.server/pipeline/mapping-draft';
-import { checkMapping, type MappingSpec, type MergePlan } from '../../app/.server/pipeline/mapping-spec';
+import { checkMapping, type MappingIssue, type MappingSpec, type MergePlan } from '../../app/.server/pipeline/mapping-spec';
 import { MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type ModelDraft } from '../../app/.server/pipeline/model-draft';
 import type { GoldenCase } from './golden';
 
@@ -21,7 +21,27 @@ export interface CaseResult {
   expected: number;
   /** 把模型草稿改成期望映射要动的项数 */
   edits: number;
-  failed?: { stage: FailStage; message: string; issues?: number };
+  /** problems：失败于映射校验时的问题清单（脱敏，见 redactIssues） */
+  failed?: { stage: FailStage; message: string; issues?: number; problems?: Problem[] };
+}
+
+/** 映射校验的一个问题：路径与消息，样本原文已换成 <值> */
+export interface Problem { path: string; message: string }
+
+const HIDDEN = '<值>';
+
+/**
+ * 映射校验问题脱敏，供评测打印与写结果文件：path 里值字典的源取值、message 里引号内的片段、「X 不是标准枚举值」的 X（模型给的值）
+ * 与表达式错误「多余的内容：…」的片段都换成 <值>；标准枚举列表、列名与字段名保留；不带 hint 与行列
+ */
+export function redactIssues(issues: readonly MappingIssue[]): Problem[] {
+  return issues.map(({ path, message }) => ({
+    path: path.replace(/(^|\.)dictionary\..*$/, `$1dictionary.${HIDDEN}`),
+    message: message
+      .replace(/^[\s\S]*? (不是标准枚举值)/, `${HIDDEN} $1`)
+      .replace(/(多余的内容：)[\s\S]*$/, `$1${HIDDEN}`)
+      .replace(/「[^」]*」|"[^"]*"|“[^”]*”|'[^']*'/g, q => `${q[0]}${HIDDEN}${q.at(-1)}`),
+  }));
 }
 
 export interface Score { accuracy: number; correct: number; edits: number }
@@ -60,8 +80,8 @@ export async function runCase(c: GoldenCase, provider: LlmProvider): Promise<Cas
   const entity = entityOf(c.entity);
   if (!entity) throw new Error(`黄金样例 ${c.name} 的实体 ${c.entity} 不存在`);
   const base = { name: c.name, expected: want.plan.columns.length };
-  const fail = (stage: FailStage, message: string, issues?: number): CaseResult =>
-    ({ ...base, ...failedScore(want.spec, want.plan), failed: { stage, message, ...(issues !== undefined && { issues }) } });
+  const fail = (stage: FailStage, message: string, issues?: readonly MappingIssue[]): CaseResult =>
+    ({ ...base, ...failedScore(want.spec, want.plan), failed: { stage, message, ...(issues && { issues: issues.length, problems: redactIssues(issues) }) } });
 
   const rulesYaml = draftMapping(c.profile, entity);
   let out: ModelDraft;
@@ -72,7 +92,7 @@ export async function runCase(c: GoldenCase, provider: LlmProvider): Promise<Cas
     throw e;
   }
   const got = checkMapping(withoutExtensions(modelOutputToYaml(rulesYaml, out).yaml), columns);
-  if (!got.ok) return fail('mapping', `映射校验不过：${got.issues.length} 个问题`, got.issues.length);
+  if (!got.ok) return fail('mapping', `映射校验不过：${got.issues.length} 个问题`, got.issues);
   return { ...base, ...scoreDiff(want.plan, diffPlans(want.plan, got.plan)) };
 }
 

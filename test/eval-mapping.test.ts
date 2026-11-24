@@ -1,12 +1,12 @@
 // test/eval-mapping.test.ts —— 映射评测（#217，ADR-0035）：黄金集的期望 YAML 都能对着自己的表统计过校验、四类样例都有；
-// runCase 用假 fetch 跑出的准确率与人工改动项数：与期望一致、改一个表达式少一列、不合 Schema（纯函数，不读库）
+// runCase 用假 fetch 跑出的准确率与人工改动项数：与期望一致、改一个表达式少一列、不合 Schema、不过校验时的问题清单（脱敏）（纯函数，不读库）
 import { afterEach, describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import { setLlmFetch } from '../app/.server/llm';
 import { checkMapping, type FieldSpec } from '../app/.server/pipeline/mapping-spec';
 import type { ModelDraft, ModelField } from '../app/.server/pipeline/model-draft';
 import { GOLDEN, type GoldenCase } from '../scripts/eval-mapping/golden';
-import { runCase, summarize } from '../scripts/eval-mapping/score';
+import { redactIssues, runCase, summarize } from '../scripts/eval-mapping/score';
 import { fakeLlm, json } from './pipeline/llm-fixtures';
 
 afterEach(() => { setLlmFetch(undefined); });
@@ -75,6 +75,36 @@ describe('映射评测跑分', () => {
     expect(r).toMatchObject({ accuracy: 0, expected: 8, edits: 8, failed: { stage: 'mapping', issues: expect.any(Number) } });
     expect(r.failed!.issues).toBeGreaterThan(0);
     expect(JSON.stringify(r)).not.toContain(PROVIDER.apiKey);
+  });
+
+  it('值字典写了非标准枚举值：问题清单带路径与消息，源取值与模型给的值都换成 <值>', async () => {
+    const c = caseNamed('chinese-header-code-status');
+    const draft = perfectDraft(c);
+    const wrong: Record<string, string> = { '3': 'delivering', '4': 'canceled_x', '21': 'refund_done' };
+    draft.fields = draft.fields.map(f => (f.field === 'status'
+      ? { ...f, dictionary: f.dictionary!.map(d => ({ from: d.from, to: wrong[d.from] ?? d.to })) }
+      : f));
+    fakeLlm(setLlmFetch, () => json(draft));
+    const r = await runCase(c, PROVIDER);
+    expect(r.failed).toMatchObject({ stage: 'mapping', issues: 3 });
+    expect(r.failed!.problems).toHaveLength(3);
+    for (const p of r.failed!.problems!) {
+      expect(p).toEqual({ path: 'fields.status.dictionary.<值>', message: expect.stringContaining('<值> 不是标准枚举值（可选：created、') });
+    }
+    const text = JSON.stringify(r);
+    for (const v of [...Object.values(wrong), 'dictionary.3', 'dictionary.21']) expect(text).not.toContain(v);
+  });
+
+  it('redactIssues：引号片段、多余的内容换成 <值>，不带 hint 与行列', () => {
+    expect(redactIssues([
+      { line: 3, col: 5, path: 'fields.amount', message: '多余的内容：abc 123', hint: 'amount: x' },
+      { line: 4, col: 1, path: 'fields.order_id', message: '没有列「秘密列」，也没有 "abc" 与 “啊”' },
+      { line: 5, col: 1, path: 'fields.status.otherwise', message: 'foo bar 不是标准枚举值（可选：created、paid，或 null）' },
+    ])).toEqual([
+      { path: 'fields.amount', message: '多余的内容：<值>' },
+      { path: 'fields.order_id', message: '没有列「<值>」，也没有 "<值>" 与 “<值>”' },
+      { path: 'fields.status.otherwise', message: '<值> 不是标准枚举值（可选：created、paid，或 null）' },
+    ]);
   });
 
   it('总体准确率按列加权，改动项数相加', () => {

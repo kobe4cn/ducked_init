@@ -6,6 +6,7 @@ import { entityOf } from '../app/lib/canonical-model';
 import { entityForTable, fieldsForColumn, normalizeName, standardValue } from '../app/lib/field-synonyms';
 import { draftCustomMapping, draftMapping, fieldNameFor, reuseMappingYaml } from '../app/.server/pipeline/mapping-draft';
 import { checkMapping } from '../app/.server/pipeline/mapping-spec';
+import { GOLDEN } from '../scripts/eval-mapping/golden';
 import type { ColumnProfile, TableProfile } from '../app/.server/pipeline/source-engine';
 
 const column = (name: string, type: string, extra: Partial<ColumnProfile> = {}): ColumnProfile =>
@@ -531,5 +532,14 @@ describe('复用已发布映射', () => {
     const doc = parse(reuseMappingYaml(PUBLISHED.replaceAll('customer_source: 门店1', 'customer_source: 会员'), FROM));
     expect(doc.fields.customer_id.customer_source).toBe('会员');
     expect(doc.extensions.member_id.customer_source).toBe('会员');
+  });
+});
+
+describe('没有对应上的标准字段', () => {
+  it('有标准枚举的字段在表尾写出标准值（中文表头的状态码样例）', () => {
+    const c = GOLDEN.find(g => g.name === 'chinese-header-code-status')!;
+    const yaml = draftMapping(c.profile, entityOf('order')!);
+    const line = yaml.split('\n').find(l => /^#\s+status（/.test(l));
+    expect(line).toContain(`标准值：${entityOf('order')!.fields.find(f => f.name === 'status')!.enum!.join('、')}`);
   });
 });
