@@ -83,6 +83,12 @@ describe('checkBudget：上下文到预算时要求收尾', () => {
     expect(checkBudget(post(p), {}, new Map())).toBeUndefined();
   });
 
+  it('没有阶段名时 implement 与其他阶段的收尾要求都给', () => {
+    const reason = checkBudget(post(transcript('nophase', [SOFT + 1_000])), { SANDCASTLE_PROFILE: 'glm' }, new Map());
+    expect(reason).toContain('进度评论');
+    expect(reason).toContain('输出结论');
+  });
+
   it('子代理里的工具调用不提醒（上下文另算）', () => {
     expect(checkBudget({ ...post(transcript('sub', [HARD + 1_000])), agent_id: 'a1' }, env, new Map())).toBeUndefined();
   });

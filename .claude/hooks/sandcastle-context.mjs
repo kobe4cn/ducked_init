@@ -76,10 +76,11 @@ export function checkBudget(input, env, state) {
   if (last && ctx < last + STEP && !(ctx >= HARD && last < HARD)) return undefined;
   state.set(input.session_id, ctx);
   const phase = env.SANDCASTLE_PHASE ?? '';
-  const handoff =
-    phase === 'implement'
-      ? '收尾交接：把已经能通过测试的改动提交（提交信息写明完成了哪些验收标准）；在 issue 上留进度评论，写清已完成、未完成、下一步从哪个 file:line 接着做；然后结束会话，**不要输出 <promise>COMPLETE</promise>**。下一个全新会话会按这条评论接着做；3 次会话仍做不完，prep 会把剩下的拆成更小的票。'
-      : '收尾：不再开始新的探索或改动，把手上这一项做完、提交，按提示词的要求输出结论；没来得及看的部分在输出里写明，交给下一轮。';
+  const impl =
+    '收尾交接：把已经能通过测试的改动提交（提交信息写明完成了哪些验收标准）；在 issue 上留进度评论，写清已完成、未完成、下一步从哪个 file:line 接着做；然后结束会话，**不要输出 <promise>COMPLETE</promise>**。下一个全新会话会按这条评论接着做；3 次会话仍做不完，prep 会把剩下的拆成更小的票。';
+  const other = '收尾：不再开始新的探索或改动，把手上这一项做完、提交，按提示词的要求输出结论；没来得及看的部分在输出里写明，交给下一轮。';
+  // 没有阶段名（编排脚本还是旧进程，没传 SANDCASTLE_PHASE）时两种都给，由 agent 按自己的任务对号入座
+  const handoff = phase === 'implement' ? impl : phase ? other : `若你在实现一张票（implement）——${impl}若是其他阶段（prep / review / revise / fix / rebase）——${other}`;
   const level = ctx >= HARD ? `已到 ${k(ctx)}，接近 150k 预算上限，立刻` : `已到约 ${k(ctx)}（预算 150k），现在`;
   return `上下文预算：本会话上下文${level}${handoff}之后只读必要的几行（grep -n / sed -n 小范围），不要再整读文件或跑输出很长的命令。`;
 }
