@@ -29,7 +29,7 @@ export interface ColumnDiff { added: string[]; removed: string[] }
 /** 两版目录按条目标识比出的差异；changed 的 keys 是变了的顶层键，源表条目另给列级明细 */
 export interface CatalogDiff { added: DiffItem[]; removed: DiffItem[]; changed: (DiffItem & { keys: string[]; columns?: ColumnDiff })[] }
 
-/** 去掉统计后的单个条目：源表与实体的统计、字段来源的源端样本、模板的快照；指标、标签与模板的 version 是定义的版本，保留 */
+/** 去掉统计后的单个条目：源表与实体的统计、字段来源的源端样本、模板与指标、标签的快照；指标、标签与模板的 version 是定义的版本，保留 */
 export function stripEntryStats(e: CatalogEntry): CatalogEntry {
   switch (e.kind) {
     case 'table':
@@ -39,12 +39,18 @@ export function stripEntryStats(e: CatalogEntry): CatalogEntry {
       return { ...e, lineage: e.lineage.map(l => ({ ...l, sample: [] })) };
     case 'template':
       return { ...e, snapshot: null };
+    case 'metric':
+    case 'tag': {
+      // 去掉键而不是设成 null：和没有快照时的旧版本 JSON 相同
+      const { snapshot: _, ...rest } = e;
+      return rest;
+    }
     default:
       return e;
   }
 }
 
-/** 去掉统计后的条目：源表与实体的统计、字段来源的源端样本、模板的快照；指标、标签与模板的 version 是定义的版本，保留 */
+/** 去掉统计后的条目：源表与实体的统计、字段来源的源端样本、模板与指标、标签的快照；指标、标签与模板的 version 是定义的版本，保留 */
 export const stripStats = (c: Catalog): CatalogEntry[] => c.entries.map(stripEntryStats);
 
 /** 键排好序的 JSON，键顺序不同视为相同 */

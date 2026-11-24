@@ -28,9 +28,9 @@ export interface PlanCardView {
   resultHref?: string;
 }
 
-/** 条目的数据截至：模板取快照时间，实体取最近一次合并时间，源表取采样时间，指标与其他条目或没有快照时写「暂无快照」 */
+/** 条目的数据截至：模板、指标与标签取最新快照时间，实体取最近一次合并时间，源表取采样时间，其他条目或没有快照时写「暂无快照」 */
 const asOfOf = (e: CatalogEntry): string => {
-  if (e.kind === 'template') return e.snapshot?.at ?? '暂无快照';
+  if (e.kind === 'template' || e.kind === 'metric' || e.kind === 'tag') return e.snapshot?.at ?? '暂无快照';
   if (e.kind === 'entity' || e.kind === 'table') return e.stats?.at ?? '暂无快照';
   return '暂无快照';
 };

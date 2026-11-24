@@ -50,7 +50,7 @@ export interface CatalogInput {
   /** 各实体在标准层的行数（最近一次合并成功的各映射之和）与最近一次合并时间 */
   entityStats?: { entity: string; rows: number; at: string }[];
   /** 已发布的指标与标签：每个键最新的已发布版本的 YAML（发布时已校验过） */
-  definitions?: { kind: DslKind; key: string; version: number; yaml: string; spaceId: string }[];
+  definitions?: { kind: DslKind; key: string; version: number; yaml: string; spaceId: string; snapshot?: TemplateSnapshot }[];
   /** 已发布的模板定义（最新的已发布版本的参数）与最近一次没过期的快照 */
   templates?: { template: TemplateId; version: number; params: Record<string, unknown>; snapshot: TemplateSnapshot | null; spaceId: string }[];
   /** 业务说明的当前内容（currentNotes）：键是 noteKey，空串是已清空 */
@@ -139,6 +139,8 @@ export interface MetricEntry extends Base {
   dependencies: DefinitionDependencies;
   /** 系统事实：从 DSL 确定性生成的口径文字（knowledge/derive.ts） */
   system: SystemFacts;
+  /** 最新一张未过期的结果快照；没有时没有 */
+  snapshot?: TemplateSnapshot;
   /** 业务知识；没有时没有 */
   knowledge?: Knowledge;
 }
@@ -152,6 +154,8 @@ export interface TagEntry extends Base {
   dependencies: DefinitionDependencies;
   /** 系统事实：从 DSL 确定性生成的口径文字（knowledge/derive.ts） */
   system: SystemFacts;
+  /** 最新一张未过期的结果快照；没有时没有 */
+  snapshot?: TemplateSnapshot;
   /** 业务知识；没有时没有 */
   knowledge?: Knowledge;
 }
@@ -416,7 +420,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
         kind: 'metric', id: metricId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version, spaceId: d.spaceId,
         base: entityId(spec.base), measure: measureText(spec.measure), dimensions: (spec.dimensions ?? []).map(x => x.name),
         ...(spec.window && { window: { field: spec.window.field, days: spec.window.days } }), ...(spec.filter?.length && { filter: spec.filter }),
-        dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)), system: { text: metricText(spec), claims: metricClaims(spec) }, ...knowledgeOf(metricId(d.key)),
+        dependencies: dependencyIds(DSL_KINDS.metric.dependencies(spec)), system: { text: metricText(spec), claims: metricClaims(spec) }, ...(d.snapshot && { snapshot: d.snapshot }), ...knowledgeOf(metricId(d.key)),
       });
     } else {
       const spec = parse(d.yaml) as TagSpec;
@@ -424,7 +428,7 @@ export function buildCatalog(input: CatalogInput): Catalog {
       entries.push({
         kind: 'tag', id: tagId(d.key), name: d.key, description: descriptionOf(spec), key: d.key, version: d.version, spaceId: d.spaceId,
         values: [...new Set(values)], dependencies: dependencyIds(DSL_KINDS.tag.dependencies(spec)), system: { text: tagText(spec), claims: tagClaims(spec, metricSpecs) },
-        ...knowledgeOf(tagId(d.key)),
+        ...(d.snapshot && { snapshot: d.snapshot }), ...knowledgeOf(tagId(d.key)),
       });
     }
   }
@@ -845,13 +849,14 @@ function entryMarkdown(e: CatalogEntry): string {
       return [...head, `- ${e.from} → ${e.to}`].join('\n');
     case 'metric':
       return [...head, `- 指标 ${code(e.key)}（第 ${e.version} 版），基础实体 ${e.base}，度量 ${code(e.measure)}`, `- 口径（系统生成）：${e.system.text}`, `- 口径声明（系统生成）：${e.system.claims.map(claimPhrase).join('、')}`,
+        snapshotLine(e.snapshot, e.dimensions.length ? '每个消费者×维度取值一行' : '每个消费者一行'),
         ...(e.dimensions.length ? [`- 维度：${e.dimensions.map(code).join(', ')}`] : []), ...dependenciesMarkdown(e.dependencies)].join('\n');
     case 'tag':
       return [...head, `- 标签 ${code(e.key)}（第 ${e.version} 版），取值 ${e.values.map(v => code(String(v))).join(', ')}`, `- 口径（系统生成）：${e.system.text}`, `- 口径声明（系统生成）：${e.system.claims.map(claimPhrase).join('、')}`,
-        ...dependenciesMarkdown(e.dependencies)].join('\n');
+        snapshotLine(e.snapshot, '每个统一消费者一行'), ...dependenciesMarkdown(e.dependencies)].join('\n');
     case 'template':
       return [...head, `- 模板 ${code(e.template)}（定义第 ${e.version} 版），读 ${e.entities.join(', ')}`, `- 参数：${code(JSON.stringify(e.params))}`,
-        `- 快照：${e.snapshot ? `${code(e.snapshot.table)}，${e.snapshot.rows} 行，截至 ${e.snapshot.at}` : '还没有快照'}`,
+        snapshotLine(e.snapshot ?? undefined),
         '', '| 产出列 | 类型 | 说明 |', '|---|---|---|', ...e.columns.map(c => `| ${code(c.name)} | ${c.type} | ${c.description} |`)].join('\n');
     case 'capability':
       return [...head,
@@ -859,6 +864,10 @@ function entryMarkdown(e: CatalogEntry): string {
         ...e.examples.flatMap(x => [`### 示例 ${x.key}：${x.note}`, '', '```yaml', x.yaml.trimEnd(), '```', ''])].join('\n').trimEnd();
   }
 }
+
+/** 「快照：…」一行：表名、行数、截至时间，指标与标签再写结果粒度；没有快照时写「还没有快照」 */
+const snapshotLine = (s: TemplateSnapshot | undefined, grain?: string) =>
+  `- 快照：${s ? `${code(s.table)}，${s.rows} 行，截至 ${s.at}${grain ? `（${grain}）` : ''}` : '还没有快照'}`;
 
 const dependenciesMarkdown = (d: DefinitionDependencies) => [
   ...(d.metrics.length ? [`- 引用指标：${d.metrics.join(', ')}`] : []),
