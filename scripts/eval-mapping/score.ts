@@ -108,9 +108,17 @@ export async function runCase(c: GoldenCase, provider: LlmProvider): Promise<Cas
   };
 }
 
-/** 总体：准确率按列加权（做对的列总数 / 期望列总数），改动项数取各例之和 */
-export function summarize(results: CaseResult[]): Score & { expected: number } {
+/** 按样例数计：整份通过、部分采用（去掉了个别项）、失败 */
+export interface CaseCounts { full: number; partial: number; failed: number }
+
+/** 总体：准确率按列加权（做对的列总数 / 期望列总数），改动项数取各例之和；另按样例数分开计整份通过、部分采用与失败 */
+export function summarize(results: CaseResult[]): Score & { expected: number } & CaseCounts {
   const correct = results.reduce((n, r) => n + r.correct, 0);
   const expected = results.reduce((n, r) => n + r.expected, 0);
-  return { accuracy: expected ? correct / expected : 1, correct, expected, edits: results.reduce((n, r) => n + r.edits, 0) };
+  const failed = results.filter(r => r.failed).length;
+  const partial = results.filter(r => !r.failed && r.partial).length;
+  return {
+    accuracy: expected ? correct / expected : 1, correct, expected, edits: results.reduce((n, r) => n + r.edits, 0),
+    full: results.length - failed - partial, partial, failed,
+  };
 }

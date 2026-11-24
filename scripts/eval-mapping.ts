@@ -1,6 +1,6 @@
 // scripts/eval-mapping.ts —— 用法：pnpm eval:mapping（.env 或环境变量里要有 LLM_BASE_URL、LLM_MODEL、LLM_API_KEY）
-// 映射生成的评测（ADR-0035）：对黄金集（scripts/eval-mapping/golden）的每个样例，用真实模型服务走与产品相同的规则草稿、表上下文、提示词与转 YAML，
-// 与期望映射逐字段比较，打印每例与总体的准确率、人工改动项数，失败的样例标出失败阶段，失败于映射校验的逐条打印问题（路径 + 消息，样本原文换成 <值>）；结果另存到 scripts/eval-mapping/out/<时间戳>-<模型>.json，
+// 映射生成的评测（ADR-0035）：对黄金集（scripts/eval-mapping/golden）的每个样例，用真实模型服务走与产品相同的规则草稿、表上下文、提示词（带固定目录）、转 YAML 与部分采用，
+// 与期望映射逐字段比较，打印每例与总体的准确率、人工改动项数，部分采用的样例列出去掉的项，总体另打印整份通过与部分采用的样例数，失败的样例标出失败阶段，失败于映射校验的逐条打印问题（路径 + 消息，样本原文换成 <值>）；结果另存到 scripts/eval-mapping/out/<时间戳>-<模型>.json，
 // 供 pnpm eval:mapping:compare 对比两次。不连平台库，不进 CI；不打印也不保存 Key、完整 URL、请求与模型原文
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -26,11 +26,12 @@ for (const c of GOLDEN) {
   const r = await runCase(c, provider);
   results.push(r);
   const failed = r.failed ? `  失败于${r.failed.stage === 'model' ? '模型调用' : '映射校验'}：${r.failed.message}` : '';
-  console.log(`${r.name.padEnd(28)} 准确率 ${pct(r.accuracy).padStart(6)}（${r.correct}/${r.expected}）  改动 ${String(r.edits).padStart(2)}${failed}`);
+  const partial = r.partial ? `  部分采用，去掉 ${(r.dropped ?? []).join('、')}` : '';
+  console.log(`${r.name.padEnd(28)} 准确率 ${pct(r.accuracy).padStart(6)}（${r.correct}/${r.expected}）  改动 ${String(r.edits).padStart(2)}${failed}${partial}`);
   for (const p of r.failed?.problems ?? []) console.log(`    ${p.path}  ${p.message}`);
 }
 const total = summarize(results);
-console.log(`${'总体'.padEnd(26)} 准确率 ${pct(total.accuracy).padStart(6)}（${total.correct}/${total.expected}）  改动 ${String(total.edits).padStart(2)}`);
+console.log(`${'总体'.padEnd(26)} 准确率 ${pct(total.accuracy).padStart(6)}（${total.correct}/${total.expected}）  改动 ${String(total.edits).padStart(2)}  整份通过 ${total.full}/${results.length}、部分采用 ${total.partial}/${results.length}`);
 
 const report = toReport(results, total, { model: provider.model, baseUrl: provider.baseUrl, startedAt });
 const outDir = join(import.meta.dirname, 'eval-mapping', 'out');
