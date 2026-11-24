@@ -25,6 +25,8 @@ beforeEach(async () => { await resetDb(); });
 afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); });
 
 const SCHEMA = { type: 'object', required: ['table'], properties: { table: { type: 'string' } } };
+/** chatJson 发出的 response_format：SCHEMA 以 json_schema 发出，name 是用途（#1191） */
+const asSchema = (name: string) => ({ type: 'json_schema', json_schema: { name, schema: SCHEMA, strict: false } });
 const MESSAGES = [
   { role: 'system' as const, content: '你是映射助手' },
   { role: 'user' as const, content: '样本行：13800138000' },
@@ -67,7 +69,7 @@ describe('模型服务客户端', () => {
     expect(received).toHaveLength(1);
     expect(received[0].url).toBe('https://platform.example.com/v1/chat/completions');
     expect(received[0].headers.get('authorization')).toBe('Bearer sk-platform-secret');
-    expect(received[0].body).toEqual({ model: 'qwen-plus', messages: MESSAGES, response_format: { type: 'json_object' }, temperature: 0 });
+    expect(received[0].body).toEqual({ model: 'qwen-plus', messages: MESSAGES, response_format: asSchema('connectivity'), temperature: 0 });
     // 平台默认端点解析出的调用记 source='platform'（#843）
     const [row] = await calls(acme);
     expect(row.source).toBe('platform');
@@ -198,6 +200,69 @@ describe('模型服务客户端', () => {
     expect(row.error).not.toContain('sk-platform-secret');
   });
 
+  it('json_schema 里的 Schema 剥掉 allOf / if / then / not，原 Schema 不变，本地仍按完整 Schema 校验（#1191）', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const conditional = {
+      type: 'object', required: ['mode'],
+      properties: { mode: { type: 'string', not: { const: 'bad' } }, dims: { type: 'array', items: { type: 'string' } } },
+      allOf: [{ if: { properties: { mode: { const: 'group' } } }, then: { required: ['dims'] } }],
+    };
+    const original = structuredClone(conditional);
+    const { received } = fakeLlm(setLlmFetch, () => json({ mode: 'group' }, USAGE));
+
+    const err = await failure(chatJson(acme, 'metric_draft', MESSAGES, conditional));
+    expect(received[0].body.response_format).toEqual({ type: 'json_schema', json_schema: {
+      name: 'metric_draft', strict: false,
+      schema: { type: 'object', required: ['mode'], properties: { mode: { type: 'string' }, dims: { type: 'array', items: { type: 'string' } } } },
+    } });
+    expect(conditional).toEqual(original);
+    // 返回缺 dims，只违反 if / then：本地校验仍拒绝
+    expect(err).toBeInstanceOf(LlmError);
+    expect((await calls(acme))[0].schemaValid).toBe(false);
+  });
+
+  it('服务商 400 拒绝 json_schema 时同一模型改发 json_object 成功，之后这个端点 + 模型直接发 json_object（#1191）', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, (n, body) => (body.response_format as { type: string }).type === 'json_schema'
+      ? new Response('response_format json_schema not supported', { status: 400 }) : json({ table: 'orders' }, USAGE));
+
+    expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
+    expect(received).toHaveLength(2);
+    expect(received[0].body.response_format).toEqual(asSchema('connectivity'));
+    expect(received[1].body).toEqual({ model: 'qwen-plus', messages: MESSAGES, response_format: { type: 'json_object' }, temperature: 0 });
+    // 只记一行日志，令牌数来自成功的那次
+    const rows = await calls(acme);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ schemaValid: true, error: null, promptTokens: 120 });
+
+    expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
+    expect(received).toHaveLength(3);
+    expect(received[2].body.response_format).toEqual({ type: 'json_object' });
+  });
+
+  it('HTTP 500 时不回退 json_object：只发一次请求，抛 transient 错误（#1191）', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, () => new Response('upstream failed', { status: 500 }));
+
+    const err = await failure(chatJson(acme, 'connectivity', MESSAGES, SCHEMA));
+    expect(received).toHaveLength(1);
+    expect(err).toBeInstanceOf(LlmError);
+    expect((err as LlmError).transient).toBe(true);
+  });
+
+  it('根不是 object 的 Schema（根上 anyOf）直接发 json_object（#1191）', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'metric_parse', MESSAGES, { anyOf: [SCHEMA, { type: 'object', required: ['error'] }] });
+    expect(received).toHaveLength(1);
+    expect(received[0].body.response_format).toEqual({ type: 'json_object' });
+  });
+
   it('成功时记令牌数与耗时，日志里没有提示词与返回原文', async () => {
     const acme = await newTenant('acme');
     platformDefault(BASE_WITH_SLASH);
@@ -233,7 +298,7 @@ describe('模型服务客户端', () => {
     await chatTools(acme, 'assistant', MESSAGES, [TOOL]);
     expect(received[0].body).toEqual({
       enable_thinking: false, top_p: 0.9,
-      model: 'qwen-plus', messages: MESSAGES, response_format: { type: 'json_object' }, temperature: 0,
+      model: 'qwen-plus', messages: MESSAGES, response_format: asSchema('connectivity'), temperature: 0,
     });
     // chatTools 不带 response_format，tools 是平台给的、不是 extra 里的 evil
     expect(received[1].body).toEqual({
@@ -247,7 +312,7 @@ describe('模型服务客户端', () => {
     await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
     expect(received[2].body).toEqual({
       enable_thinking: false, top_k: 5,
-      model: 'qwen3.8-flash', messages: MESSAGES, response_format: { type: 'json_object' }, temperature: 0,
+      model: 'qwen3.8-flash', messages: MESSAGES, response_format: asSchema('metric_parse'), temperature: 0,
     });
   });
 
@@ -525,14 +590,14 @@ describe('租户的服务商参数（#1169）', () => {
 
     for (const purpose of Object.keys(ROUTE) as (keyof typeof ROUTE)[]) await chatJson(acme, purpose, MESSAGES, SCHEMA);
 
-    const rest = { messages: MESSAGES, response_format: { type: 'json_object' }, temperature: 0 };
+    const rest = (purpose: string) => ({ messages: MESSAGES, response_format: asSchema(purpose), temperature: 0 });
     // fast 档自己的覆盖默认：默认的 top_p 不出现
-    expect(received[0].body).toEqual({ enable_thinking: false, top_k: 5, model: 'qwen3.8-flash', ...rest });
+    expect(received[0].body).toEqual({ enable_thinking: false, top_k: 5, model: 'qwen3.8-flash', ...rest('assertion_draft') });
     // reasoning 档带自己的端点、没填服务商参数：继承租户默认的
     expect(received[1].url).toBe('https://tenant-reasoning.example.com/v1/chat/completions');
-    expect(received[1].body).toEqual({ enable_thinking: false, top_p: 0.9, model: 'deepseek-reasoner', ...rest });
+    expect(received[1].body).toEqual({ enable_thinking: false, top_p: 0.9, model: 'deepseek-reasoner', ...rest('mapping_draft') });
     // 不分档的用途用租户默认的
-    expect(received[2].body).toEqual({ enable_thinking: false, top_p: 0.9, model: 'deepseek-chat', ...rest });
+    expect(received[2].body).toEqual({ enable_thinking: false, top_p: 0.9, model: 'deepseek-chat', ...rest('connectivity') });
   });
 
   it('只填模型名的档位继承租户默认；租户没填时平台的 LLM_*CHAT_EXTRA 不进租户请求体', async () => {

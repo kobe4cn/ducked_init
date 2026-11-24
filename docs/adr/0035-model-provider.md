@@ -4,6 +4,8 @@ ADR-0003 定下大语言模型只在设计时产出草稿。要落地（#18，�
 
 **OpenAI 兼容接口。** 只接 `POST <端点>/chat/completions`（通义千问、DeepSeek、自建 vLLM 等都兼容），请求带 `response_format: { type: 'json_object' }` 与 `temperature: 0`，60 秒超时。返回取 `choices[0].message.content` 解析成 JSON，按调用方给的 JSON Schema 用 ajv 校验；不是 JSON 或不合 Schema 都算失败、抛 `LlmError`，不把半成品交给调用方。校验之后的语义检查（映射校验、空跑、双人发布）照旧由各功能负责。入口是 `app/.server/llm.ts` 的 `chatJson`。
 
+**修订（#1191）：把 Schema 交给模型。** 只发 `json_object` 时模型只能按提示词猜字段类型（`inkling-2-mini` 把 `dimensions` 写成字符串，整份计划作废）。`callModel` 现在对根是 `type: 'object'` 的 Schema 发 `response_format: { type: 'json_schema', json_schema: { name, schema, strict: false } }`：`schema` 是 `schemaForModel` 剥掉 `allOf` / `if` / `then` / `else` / `not` / `$id` / `$schema` / `$ref` 的深拷贝（Ollama 遇到条件关键字会悄悄忽略整个约束），`name` 是用途；`strict` 为 false，因为现有 Schema 多有可选字段、缺 `additionalProperties`。本地 ajv 仍用完整 Schema，条件规则靠它兜底。根不是 object 的 Schema（如根上 `anyOf` 的 `METRIC_PARSE_LENIENT_SCHEMA`）照旧发 `json_object`。服务商对 `json_schema` 回 HTTP 400 / 422 时，同一模型改发一次 `json_object`；成功后按 `${baseUrl}|${model}` 记进进程内缓存，之后这个端点 + 模型直接发 `json_object`，回退仍失败就照原样抛错、不记缓存。500 / 429 / 超时不回退。一次调用只记一行 `llm_calls`，令牌数取最后一次请求的。
+
 **校验前的容错（#1160）。** 哪家模型、哪个用途会对用不到的可选键写 null（qwen-max 的映射草稿每次都这样）事先没法穷举，所以在客户端统一处理，不逐个放宽 Schema：解析后先把内容被 ```json 代码块包着的外壳去掉；`finish_reason` 为 `length`（输出被 `max_tokens` 截断）直接报截断原因，不再当「不是 JSON」；校验不通过时把出错位置上值为 null、Schema 又不允许 null 的键删掉再校验（最多几轮）——Schema 允许 null 的键（如映射的 `otherwise`）原样保留，必填键删掉后会变成「缺少」错误、仍算不合格。Schema 报错的位置与关键词（`minItems`、`maximum` 等）都给中文说明。
 
 **配置：租户整套覆盖平台默认，不混用。** 平台默认由环境变量 `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` 提供，三项都有才生效。租户在 `platform.model_providers` 填了端点就整套用租户的（端点、模型、Key），不会出现租户的端点配平台的 Key——那样会把平台的 Key 发给租户指定的主机。都没有时报「未配置模型服务」，不发请求；租户填了端点却没填模型名时报「配置不完整」，也不退回平台默认。
