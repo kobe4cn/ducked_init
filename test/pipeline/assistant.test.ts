@@ -13,7 +13,7 @@ import { assistantTurn, ERROR_REPLY, MAX_FIXES, MAX_PLAN_SUMMARY, MAX_TOOL_CALLS
 import { catalogFor, PLAN_MODE_RULE, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { semanticHash, type AnalysisPlan } from '../../app/.server/catalog/plan';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
-import { setLlmFetch } from '../../app/.server/llm';
+import { ABORTED, setLlmFetch } from '../../app/.server/llm';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
@@ -370,6 +370,34 @@ describe('计划随对话，存草稿 / 填工作台前重新校验（ADR-0050�
     fakeLlm(setLlmFetch, () => new Response('boom', { status: 500 }));
     await expect(assistantTurn(analyst, [{ role: 'user', content: '统计会员数' }], PAGE))
       .rejects.toMatchObject({ status: 422, message: expect.stringContaining('不支持工具调用或调用失败') });
+  });
+
+  it('第 3 次请求返回时客户端已中止（#1248）：假 fetch 只被调 3 次、这批 save_definition_draft 不再执行，抛 400 的 AssistantError（文案 ABORTED），不返回 ERROR_REPLY', async () => {
+    const { acme, analyst, plan } = await memberCountPlan();
+    const controller = new AbortController();
+    const steps = [
+      toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+    ];
+    // 计划 valid 后第 3 次请求返回 save_definition_draft 时 signal 已中止：执行了就会写 dsl_versions 与审计，行数不动即证明没执行
+    const { f } = fakeLlm(setLlmFetch, n => {
+      if (n === 3) {
+        controller.abort();
+        return toolCalls({ name: 'save_definition_draft', args: { kind: 'metric', key: 'member_count', yaml: COUNT_MEMBERS } }, TOOL_USAGE);
+      }
+      return steps[n - 1];
+    });
+    const drafts = (await getDb().select().from(dslVersions)).length;
+    const audits = (await getDb().select().from(auditLogs)).length;
+    await expect(assistantTurn(analyst, [{ role: 'user', content: '统计会员数并保存' }], PAGE, undefined, controller.signal))
+      .rejects.toMatchObject({ status: 400, message: ABORTED });
+    expect(f).toHaveBeenCalledTimes(3);
+    expect((await getDb().select().from(dslVersions)).length).toBe(drafts);
+    expect((await getDb().select().from(auditLogs)).length).toBe(audits);
+    // 假 fetch 不理 signal，被中止的那次照样返回并记日志：三次都成功，没有第 4 行
+    const logged = await calls(acme);
+    expect(logged).toHaveLength(3);
+    expect(logged.filter(c => c.error)).toHaveLength(0);
   });
 
   it(`同一轮校验了计划、起草连续 ${MAX_FIXES + 1} 次被拒：答复是问题清单与最后一版 YAML，计划仍随这一轮返回`, async () => {

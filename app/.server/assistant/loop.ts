@@ -18,7 +18,7 @@ import type { CurrentMember } from '../auth';
 import type { Role } from '../db/schema';
 import { planRetrievedIds, type AnalysisPlan } from '../catalog/plan';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
-import { chatToolsWith, LlmError, resolveRoute, type LlmMessage, type LlmRoute } from '../llm';
+import { ABORTED, chatToolsWith, LlmError, resolveRoute, type LlmMessage, type LlmRoute } from '../llm';
 import { dataOnlyNotice } from '../llm-prompts';
 import { toolSupport } from '../model-provider';
 import type { ChoiceGroup } from './conversations';
@@ -221,15 +221,19 @@ async function callTool(actor: CurrentMember, name: string, args: string, ctx: T
 
 /**
  * 工具调用次数用完（#1180）：在 messages 末尾追加 LIMIT_PROMPT，不带工具再请求一次，用模型的总结作答复；
- * 请求出任何错（含既没有文本也没有工具调用）都退回 LIMIT_REPLY，不转 422：本轮的 plan / workbenchSql 要照常带回
+ * 请求出任何错（含既没有文本也没有工具调用）都退回 LIMIT_REPLY，不转 422：本轮的 plan / workbenchSql 要照常带回。
+ * 客户端已中止（signal）时不再请求总结，抛 400 的 AssistantError（#1248）
  */
-async function finishAtLimit(tenantId: string, route: LlmRoute, messages: LlmMessage[], toolsUsed: string[], ctx: ToolCtx) {
+async function finishAtLimit(tenantId: string, route: LlmRoute, messages: LlmMessage[], toolsUsed: string[], ctx: ToolCtx, signal?: AbortSignal) {
   messages.push({ role: 'system', content: LIMIT_PROMPT });
   let reply = LIMIT_REPLY;
   try {
-    const response = await chatToolsWith(tenantId, 'assistant', route, messages, []);
+    const response = await chatToolsWith(tenantId, 'assistant', route, messages, [], { signal });
     if (response.content) reply = response.content;
-  } catch { /* 退回 LIMIT_REPLY */ }
+  } catch (e) {
+    if (e instanceof LlmError && e.aborted) throw new AssistantError(ABORTED, 400);
+    /* 退回 LIMIT_REPLY */
+  }
   return { reply, toolsUsed, ...extras(ctx) };
 }
 
@@ -241,10 +245,12 @@ async function finishAtLimit(tenantId: string, route: LlmRoute, messages: LlmMes
  * priorPlan 是对话里最近一份计划（ADR-0050）：不带进发给模型的历史，摘要拼在系统提示末尾、它的条目预先算作本轮已检索（#1179），
  * 并经 ToolCtx 给存草稿 / 填工作台前的重新校验兜底；
  * 返回的 plan 只来自本轮 validate_plan（不回传 priorPlan），workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（没有时都缺省）。
- * 一轮开始时解析一次 reasoning 档位的路由（#531）：整轮所有请求用同一个模型，中途改配置不影响本轮（tool_call 历史对模型敏感）
+ * 一轮开始时解析一次 reasoning 档位的路由（#531）：整轮所有请求用同一个模型，中途改配置不影响本轮（tool_call 历史对模型敏感）。
+ * signal 是这一轮的外部中止（#1248，路由传 request.signal）：客户端中止后不再发后续模型请求、不执行后续工具，抛 400 的
+ * AssistantError（不返回 ERROR_REPLY），本轮已存下的草稿与审计照常保留
  */
 export async function assistantTurn(
-  actor: CurrentMember, history: ChatTurn[], page: AssistantPage, priorPlan?: AnalysisPlan,
+  actor: CurrentMember, history: ChatTurn[], page: AssistantPage, priorPlan?: AnalysisPlan, signal?: AbortSignal,
 ): Promise<{ reply: string; toolsUsed: string[]; plan?: AnalysisPlan; workbenchSql?: string; choices?: ChoiceGroup[] }> {
   checkHistory(history);
   const tenantId = actor.tenant.id;
@@ -276,10 +282,14 @@ export async function assistantTurn(
   let planValid = false;
   let freePrefills = 0;
   for (;;) {
+    // 客户端中止（#1248）：不再发后续模型请求（chatToolsWith 里也会先查一次，这里在工具执行完的间隙也拦下）
+    if (signal?.aborted) throw new AssistantError(ABORTED, 400);
     let response;
     try {
-      response = await chatToolsWith(tenantId, 'assistant', route, messages, tools);
+      response = await chatToolsWith(tenantId, 'assistant', route, messages, tools, { signal });
     } catch (e) {
+      // 客户端中止（#1248）：不是模型服务的错（不 transient、不算超时），抛 400 结束本轮，不走 #1209 的 ERROR_REPLY
+      if (e instanceof LlmError && e.aborted) throw new AssistantError(ABORTED, 400);
       if (e instanceof LlmError && toolsUsed.length) return { reply: ERROR_REPLY, toolsUsed, ...extras(ctx) };
       if (e instanceof LlmError) throw new AssistantError(`该模型服务不支持工具调用或调用失败：${e.message}`, 422);
       throw e;
@@ -291,10 +301,12 @@ export async function assistantTurn(
       tool_calls: response.toolCalls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })),
     });
     for (const [i, c] of response.toolCalls.entries()) {
+      // 客户端中止（#1248）：这批以及后面的工具不再执行（超限时的总结也不再请求）
+      if (signal?.aborted) throw new AssistantError(ABORTED, 400);
       const free = c.name === 'prefill_workbench' && planValid && freePrefills < MAX_FREE_PREFILLS;
       if (!free && toolsUsed.length - freePrefills === toolLimit) {
         for (const skipped of response.toolCalls.slice(i)) messages.push({ role: 'tool', tool_call_id: skipped.id, content: wrapToolResult(skipped.name, SKIPPED) });
-        return finishAtLimit(tenantId, route, messages, toolsUsed, ctx);
+        return finishAtLimit(tenantId, route, messages, toolsUsed, ctx, signal);
       }
       if (free) freePrefills++;
       toolsUsed.push(c.name);
