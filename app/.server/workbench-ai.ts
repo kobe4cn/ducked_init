@@ -42,7 +42,7 @@ const MAX_CATALOG = 30_000;
  * 长度限制写在 anyOf 的分支里而不是顶层 properties：另一项是空字符串时（{"sql": "", "unsupported": "原因"}、
  * {"sql": "SELECT 1", "unsupported": ""}）只要有一个分支成立就通过，不报 Schema 错误
  */
-const SCHEMA = {
+export const WORKBENCH_DRAFT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: { sql: { type: 'string' }, unsupported: { type: 'string' }, notes: { type: 'array' } },
@@ -53,7 +53,7 @@ const SCHEMA = {
 };
 /** 做不到的原因最多的字数 */
 const MAX_UNSUPPORTED = 500;
-/** 口径假设最多的条数与每条最多的字数。SCHEMA 里 notes 不限条目类型与长度：模型的小偏差（条目是 null、数字，条数过多）不报 Schema 错，在代码里过滤和截断 */
+/** 口径假设最多的条数与每条最多的字数。WORKBENCH_DRAFT_SCHEMA 里 notes 不限条目类型与长度：模型的小偏差（条目是 null、数字，条数过多）不报 Schema 错，在代码里过滤和截断 */
 const MAX_NOTES = 3;
 const MAX_NOTE = 200;
 
@@ -106,7 +106,7 @@ async function goldSnapshots(tenantId: string, gold: WorkbenchCatalog['gold']): 
  * 超过 MAX_CATALOG 字时按整行、按层裁剪：silver 与原始表 > 自己的沙箱 > 分享给我的 > 结果层；
  * 某层放不下时只留这层开头放得下的行，后面的层全部略去，truncated 为真
  */
-function catalogText(catalog: WorkbenchCatalog, gold: string[]): { text: string; truncated: boolean } {
+export function catalogText(catalog: WorkbenchCatalog, gold: string[]): { text: string; truncated: boolean } {
   const sections: { tier: number; lines: string[] }[] = [
     { tier: 0, lines: catalog.silver.map(tableLine) },
     { tier: 3, lines: gold },
@@ -131,7 +131,7 @@ function catalogText(catalog: WorkbenchCatalog, gold: string[]): { text: string;
   return { text: truncated ? `${text}\n${NOTE.truncated}` : text, truncated };
 }
 
-function draftMessages(request: string, catalog: string): LlmMessage[] {
+export function draftMessages(request: string, catalog: string): LlmMessage[] {
   return [
     {
       role: 'system',
@@ -165,7 +165,7 @@ export async function draftWorkbenchSql(actor: CurrentMember, request: string): 
     const { text, truncated } = catalogText(catalog, await goldSnapshots(tenantId, catalog.gold));
     let output: { sql?: string; unsupported?: string; notes?: unknown[] };
     try {
-      output = await chatJson<{ sql?: string; unsupported?: string; notes?: unknown[] }>(tenantId, 'workbench_draft', draftMessages(request, text), SCHEMA);
+      output = await chatJson<{ sql?: string; unsupported?: string; notes?: unknown[] }>(tenantId, 'workbench_draft', draftMessages(request, text), WORKBENCH_DRAFT_SCHEMA);
     } catch (e) {
       if (e instanceof LlmError) throw new WorkbenchAiError(`模型起草 SQL 失败：${e.message}`, 422);
       throw e;
@@ -175,7 +175,7 @@ export async function draftWorkbenchSql(actor: CurrentMember, request: string): 
       await recordAudit(getDb(), { tenantId, actor, action: 'workbench.ai_drafted', targetType: 'workbench', detail: { unsupported: true } });
       throw new WorkbenchAiError(reason.slice(0, MAX_UNSUPPORTED), 422);
     }
-    // unsupported 没给或只有空白时 SCHEMA anyOf 的第一个分支不成立（它要求有非空白字符），通过校验靠的是第二个分支，所以一定有非空的 sql
+    // unsupported 没给或只有空白时 WORKBENCH_DRAFT_SCHEMA anyOf 的第一个分支不成立（它要求有非空白字符），通过校验靠的是第二个分支，所以一定有非空的 sql
     const { sql, problem } = await checkDraftedSql(actor, output.sql!);
     if (problem) throw new WorkbenchAiError(`AI 起草的 SQL 没有通过校验：${problem}`, 422);
     const notes = (output.notes ?? []).filter((n): n is string => typeof n === 'string').map(n => n.trim()).filter(Boolean)
