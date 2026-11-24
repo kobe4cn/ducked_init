@@ -425,7 +425,7 @@ export const TOOLS: AssistantTool[] = [
       const plan = ctx?.plan ?? ctx?.priorPlan;
       if (!plan) return '未填入：本轮和对话里都没有校验过的分析计划，先检索并用 validate_plan 校验一份 draft_query 计划';
       if (plan.mode !== 'draft_query') return `未填入：计划的 mode 是 ${plan.mode}，只有 draft_query 的计划能填入工作台`;
-      // 填入前对当前目录重新校验（ADR-0050）：selected 与 excluded 都当作检索过（planRetrievedIds），拦下来的只有依赖变了与看不到所选条目
+      // 填入前对当前目录重新校验（ADR-0050）：selected 与 excluded 都当作检索过（planRetrievedIds），拦下来的是依赖变了、看不到所选条目，以及口径不合 / 需追问（#1184）
       const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: planRetrievedIds(plan) });
       if (check.status !== 'valid') return stalePlanReply(check.status, plan, check.issues, 'prefill');
       if ((sql as string).length > MAX_PREFILL_SQL) return `未填入：SQL 超过 ${MAX_PREFILL_SQL} 字，工作台的链接放不下，请精简后重试`;

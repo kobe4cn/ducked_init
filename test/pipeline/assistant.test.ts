@@ -360,7 +360,7 @@ describe('计划随对话，存草稿 / 填工作台前重新校验（ADR-0050�
     expect(await versions()).toBe(before);
   });
 
-  /** 选中 member_count 的 draft_query 计划：draft_query 不做口径与粒度检查，校验仍是 valid */
+  /** 选中 member_count 的 draft_query 计划：draft_query 不查粒度；计划没提口径要求，校验仍是 valid */
   async function draftQueryPlan() {
     const { acme, author, reviewer, analyst, plan } = await memberCountPlan();
     return { acme, author, reviewer, analyst, plan: { ...plan, mode: 'draft_query' as const } };
