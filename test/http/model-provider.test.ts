@@ -693,4 +693,58 @@ describe('模型服务页', () => {
       { from: 'platform', to: 'pgvector', urlRotated: false },
     ]);
   });
+
+  it('向量检索卡显示上次补算（#1173）：预置失败显示红色原因，只有时间显示成功，从未补算不显示；保存 / 恢复 embedding、切换向量存储都清空这两列', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    const fillOf = async () => {
+      const [row] = await getDb().select({ error: modelProviders.embeddingFillError, at: modelProviders.embeddingFillAt })
+        .from(modelProviders).where(eq(modelProviders.tenantId, acme));
+      return row;
+    };
+    const failWith = (error: string) =>
+      getDb().update(modelProviders).set({ embeddingFillError: error, embeddingFillAt: new Date() }).where(eq(modelProviders.tenantId, acme));
+
+    expect(await (await admin.get('/model-provider')).text()).not.toContain('data-embedding-fill'); // 从未补算
+
+    await getDb().insert(modelProviders).values({ tenantId: acme, embeddingFillError: 'boom timeout', embeddingFillAt: new Date() });
+    const failed = await (await admin.get('/model-provider')).text();
+    expect(failed).toContain('data-embedding-fill="failed"');
+    expect(failed).toContain('上次补算失败：boom timeout');
+
+    await getDb().update(modelProviders).set({ embeddingFillError: null }).where(eq(modelProviders.tenantId, acme));
+    const succeeded = await (await admin.get('/model-provider')).text();
+    expect(succeeded).toContain('data-embedding-fill="ok"');
+    expect(succeeded).toContain('上次补算成功：');
+
+    // 保存 embedding 配置：两列清空，页面不再显示
+    await failWith('boom timeout');
+    expect((await saveEmbedding(admin)).status).toBe(302);
+    expect(await fillOf()).toEqual({ error: null, at: null });
+    expect(await (await admin.get('/model-provider')).text()).not.toContain('data-embedding-fill');
+
+    // 恢复平台默认：有租户配置时清空
+    await failWith('boom timeout');
+    expect((await admin.post('/model-provider', { intent: 'embedding_reset' })).status).toBe(302);
+    expect(await fillOf()).toEqual({ error: null, at: null });
+    // 走平台 embedding 的租户（没有 embedding 三项）点恢复默认同样清空，不另记审计
+    await failWith('boom timeout');
+    expect((await admin.post('/model-provider', { intent: 'embedding_reset' })).status).toBe(302);
+    expect(await fillOf()).toEqual({ error: null, at: null });
+    const resets = await getDb().select().from(auditLogs).where(eq(auditLogs.action, 'model_provider.reset'));
+    expect(resets).toHaveLength(1);
+
+    // 切到外部 pgvector、再切回系统自带：各自清空
+    pgvectorStub();
+    await failWith('boom timeout');
+    expect((await saveVectorStore(admin, 'pgvector', PURL)).status).toBe(200);
+    expect(await fillOf()).toEqual({ error: null, at: null });
+    await failWith('boom timeout');
+    expect((await saveVectorStore(admin, 'platform')).status).toBe(302);
+    expect(await fillOf()).toEqual({ error: null, at: null });
+    // 本来就是系统自带时保存不写库：配置没变，补算状态保留
+    await failWith('boom timeout');
+    expect((await saveVectorStore(admin, 'platform')).status).toBe(302);
+    expect((await fillOf()).error).toBe('boom timeout');
+  });
 });

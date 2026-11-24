@@ -6,6 +6,7 @@
 // fast / reasoning 档位（ADR-0055 路由③a）是租户按用途绑的模型，只在 chat 三项整套生效时才有意义，保存 / 恢复同样在这里
 // 向量存储（ADR-0058，#848）也在这里：选平台库还是外部 pgvector、连接串加密保存（context vector_store，不回显），
 // 保存时先测连通失败不保存；切换存储后的清理与补算也在保存后触发（#849-1：embeddings.ts 按这里的选型解析存储）
+// 向量补算的最近结果（#1172 写）在这里给页面看；改 embedding 配置或向量存储时清空，补算退避立即失效（#1173）
 // 服务商参数（#1169）：租户默认与 fast / reasoning 档位各存一份 JSON 对象原文，不是密钥、页面回显，审计只记变没变
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -39,12 +40,19 @@ export interface ModelProviderView {
   chatExtra: string | null;
   allowSamples: boolean;
   /** embedding 端点（ADR-0049）自成一套，与 chat 互不影响：来源按 embeddingSource 另算，没有版本共用一个租户 */
-  embedding: { source: 'tenant' | 'platform' | 'none'; baseUrl: string | null; model: string | null; apiKeySet: boolean };
+  /** fill：最近一次向量补算的结果（#1172 写、#1173 显示）；error 已脱敏，非空即失败；从未补算过为 null */
+  embedding: {
+    source: 'tenant' | 'platform' | 'none'; baseUrl: string | null; model: string | null; apiKeySet: boolean;
+    fill: { at: string | null; error: string | null } | null;
+  };
   /** 档位（ADR-0055 路由③a）：租户按用途绑的模型。model 为空表示该档没绑定、用默认那一套；端点为空表示沿用本租户默认的端点与 Key */
   tiers: Record<'fast' | 'reasoning', { model: string | null; baseUrl: string | null; apiKeySet: boolean; chatExtra: string | null }>;
   /** 向量存储（ADR-0058，#848）：当前选的库与最近一次连通检查；连接串只告诉页面有没有，明文与密文都不出这个模块 */
   vectorStore: { kind: 'platform' | 'pgvector'; urlSet: boolean; checkedAt: string | null; error: string | null };
 }
+
+/** 清空最近一次补算的结果（#1173）：改了 embedding 配置或向量存储后退避立即失效，下一次检索就入队补算 */
+const NO_FILL = { embeddingFillError: null, embeddingFillAt: null };
 
 const rowOf = async (tenantId: string) =>
   (await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, tenantId)))[0];
@@ -68,6 +76,9 @@ export async function getModelProvider(actor: CurrentMember): Promise<ModelProvi
       baseUrl: row?.embeddingBaseUrl ?? null,
       model: row?.embeddingModel ?? null,
       apiKeySet: Boolean(row?.embeddingApiKey),
+      fill: row?.embeddingFillError || row?.embeddingFillAt
+        ? { at: row.embeddingFillAt?.toISOString() ?? null, error: row.embeddingFillError ?? null }
+        : null,
     },
     tiers: {
       fast: tierView(row, 'fast'),
@@ -178,8 +189,8 @@ export async function saveEmbeddingProvider(actor: CurrentMember, input: { baseU
   const row = await rowOf(tenantId);
   const { sealed, rotated } = await sealApiKey(tenantId, row?.embeddingApiKey ?? null, row?.embeddingBaseUrl ?? null, baseUrl, input.apiKey.trim());
   await getDb().transaction(async tx => {
-    await tx.insert(modelProviders).values({ tenantId, embeddingBaseUrl: baseUrl, embeddingModel: model, embeddingApiKey: sealed })
-      .onConflictDoUpdate({ target: modelProviders.tenantId, set: { embeddingBaseUrl: baseUrl, embeddingModel: model, embeddingApiKey: sealed, updatedAt: new Date() } });
+    await tx.insert(modelProviders).values({ tenantId, embeddingBaseUrl: baseUrl, embeddingModel: model, embeddingApiKey: sealed, ...NO_FILL })
+      .onConflictDoUpdate({ target: modelProviders.tenantId, set: { embeddingBaseUrl: baseUrl, embeddingModel: model, embeddingApiKey: sealed, ...NO_FILL, updatedAt: new Date() } });
     await recordAudit(tx, {
       tenantId, actor,
       action: 'model_provider.updated',
@@ -209,6 +220,8 @@ export async function resetEmbeddingProvider(actor: CurrentMember) {
     const cleared = await tx.update(modelProviders).set({ embeddingBaseUrl: null, embeddingModel: null, embeddingApiKey: null, updatedAt: new Date() })
       .where(and(eq(modelProviders.tenantId, tenantId), isNotNull(modelProviders.embeddingBaseUrl)))
       .returning({ tenantId: modelProviders.tenantId });
+    // 走平台 embedding 的租户补算时也会建行：补算状态不论有没有租户配置都清空，下一次检索不再退避（#1173）；不动 updatedAt、不另记审计
+    await tx.update(modelProviders).set(NO_FILL).where(eq(modelProviders.tenantId, tenantId));
     if (cleared.length) await recordAudit(tx, { tenantId, actor, action: 'model_provider.reset', targetType: 'model_provider', detail: { embedding: true } });
   });
 }
@@ -296,8 +309,8 @@ export async function saveVectorStore(actor: CurrentMember, input: { kind: strin
   if (input.kind === 'platform') {
     if (from === 'platform') return { ok: true }; // 什么都没变，不写库也不记审计（同 setAllowSamples）
     await getDb().transaction(async tx => {
-      await tx.insert(modelProviders).values({ tenantId, vectorStore: 'platform' })
-        .onConflictDoUpdate({ target: modelProviders.tenantId, set: { vectorStore: 'platform', updatedAt: new Date() } });
+      await tx.insert(modelProviders).values({ tenantId, vectorStore: 'platform', ...NO_FILL })
+        .onConflictDoUpdate({ target: modelProviders.tenantId, set: { vectorStore: 'platform', ...NO_FILL, updatedAt: new Date() } });
       await recordAudit(tx, { tenantId, actor, action: 'model_provider.vector_store_updated', targetType: 'model_provider', detail: { from, to: 'platform', urlRotated: false } });
     });
     // 切回「系统自带」（ADR-0058）：外部库的行保留不删（租户自己的库），平台表入队从零补算。
@@ -327,10 +340,10 @@ export async function saveVectorStore(actor: CurrentMember, input: { kind: strin
   const urlRotated = Boolean(filled) && filled !== existingUrl;
   const sealed = urlRotated ? await encryptForTenant(tenantId, VECTOR_STORE_CONTEXT, { url }) : row?.vectorStoreUrl ?? null;
   await getDb().transaction(async tx => {
-    await tx.insert(modelProviders).values({ tenantId, vectorStore: 'pgvector', vectorStoreUrl: sealed, vectorStoreCheckedAt: new Date(), vectorStoreError: null })
+    await tx.insert(modelProviders).values({ tenantId, vectorStore: 'pgvector', vectorStoreUrl: sealed, vectorStoreCheckedAt: new Date(), vectorStoreError: null, ...NO_FILL })
       .onConflictDoUpdate({
         target: modelProviders.tenantId,
-        set: { vectorStore: 'pgvector', vectorStoreUrl: sealed, vectorStoreCheckedAt: new Date(), vectorStoreError: null, updatedAt: new Date() },
+        set: { vectorStore: 'pgvector', vectorStoreUrl: sealed, vectorStoreCheckedAt: new Date(), vectorStoreError: null, ...NO_FILL, updatedAt: new Date() },
       });
     if (from !== 'pgvector' || urlRotated) {
       await recordAudit(tx, { tenantId, actor, action: 'model_provider.vector_store_updated', targetType: 'model_provider', detail: { from, to: 'pgvector', urlRotated } });
