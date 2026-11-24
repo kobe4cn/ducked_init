@@ -765,6 +765,7 @@ export const modelProviders = platform.table('model_providers', {
 // route / fallback_reason（#528 路由①）记这一档用的档位与从更高档回落的原因，为空表示没有分档（现有调用都记 null，下一张票接上）
 // source（#843）记这次实际用的端点是租户的还是平台的：chat 由 resolveRoute、embedding 由 resolveEmbeddingProvider 填进 provider.source，
 // logged 原样写入。可空、没有默认值：迁移前的旧行为空；未配置模型服务时不发请求也不记日志，不会出现新的空行
+// attempt（#1215）记这一行是同一次调用的第几次尝试：logged 对 transient 错误重试 1 次时第 2 次记 2，旧行都算第 1 次
 export const llmCalls = platform.table('llm_calls', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
@@ -779,6 +780,7 @@ export const llmCalls = platform.table('llm_calls', {
   durationMs: integer('duration_ms').notNull(),
   schemaValid: boolean('schema_valid'),
   error: text('error'),
+  attempt: integer('attempt').notNull().default(1),
   createdAt: createdAt(),
 }, t => [index('llm_calls_tenant_created_idx').on(t.tenantId, t.createdAt)]);
 

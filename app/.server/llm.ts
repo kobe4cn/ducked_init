@@ -49,8 +49,9 @@ export interface LlmProvider {
 
 /** transient：超时、连不上、HTTP 5xx 或 429，过一会儿再试可能就好了 */
 export class LlmError extends Error {
-  /** status：HTTP 错误的状态码（postJson 填），callModel 据此判断要不要退回 json_object */
-  constructor(message: string, readonly transient = false, readonly status?: number) { super(message); }
+  /** status：HTTP 错误的状态码（postJson 填），callModel 据此判断要不要退回 json_object；
+   *  timeout：超时（masked 填，此时 transient 也为 true）。logged 的重试只认 transient 且不是超时的——超时再等一轮太久（ADR-0035） */
+  constructor(message: string, readonly transient = false, readonly status?: number, readonly timeout = false) { super(message); }
 }
 
 /** 租户 API Key 的加密 context（ADR-0009），解密时须给出同一个 */
@@ -69,6 +70,14 @@ let fetchOverride: typeof fetch | undefined;
 export function setLlmFetch(f: typeof fetch | undefined) { fetchOverride = f; jsonObjectOnly.clear(); }
 
 const llmFetch = () => fetchOverride ?? fetch;
+
+const realSleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+let sleepOverride: ((ms: number) => Promise<void>) | undefined;
+
+/** 测试通过它注入假的重试等待（记下毫秒数、不真等）；传 undefined 恢复真实等待 */
+export function setLlmSleep(f: ((ms: number) => Promise<void>) | undefined) { sleepOverride = f; }
+
+const llmSleep = (ms: number) => (sleepOverride ?? realSleep)(ms);
 
 /** 选哪一套：租户填了端点就整套用租户的，否则三个环境变量都有才用平台默认；都没有返回 null。不解密，模型服务页也用它 */
 export function providerSource(row: { baseUrl: string | null } | undefined): LlmProvider['source'] | null {
@@ -258,7 +267,8 @@ async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeou
     const timedOut = e instanceof Error && e.name === 'TimeoutError';
     throw new LlmError(maskKey(apiKey, e instanceof LlmError ? e.message
       : timedOut ? `模型服务 ${timeout / 1000} 秒内没有返回`
-      : `调用模型服务失败：${e instanceof Error ? e.message : String(e)}`), e instanceof LlmError ? e.transient : true);
+      : `调用模型服务失败：${e instanceof Error ? e.message : String(e)}`), e instanceof LlmError ? e.transient : true,
+      e instanceof LlmError ? e.status : undefined, e instanceof LlmError ? e.timeout : timedOut);
   }
 }
 
@@ -448,40 +458,47 @@ export async function callTools(provider: LlmProvider, messages: LlmMessage[], t
 
 /**
  * 按租户与用途选档位（resolve，默认 chat 的 resolveRoute）后调用 call。没配置模型服务或没填模型名时直接报错、不发请求、不记日志；
- * 其余调用（成功或失败）都记日志，embedding 调用带上条数 inputCount。日志直接写平台库，不进调用方的事务：调用方回滚时调用记录也要留下
+ * 其余调用（成功或失败）都记日志，embedding 调用带上条数 inputCount。日志直接写平台库，不进调用方的事务：调用方回滚时调用记录也要留下。
+ * retry 为 true 时，第 1 次抛 transient 且不是超时的 LlmError（429、5xx、网络错误）就等 1–3 秒（带抖动）用同一路由再试 1 次（ADR-0035、ADR-0055）；
+ * 每次尝试各记一行，attempt 是第几次
  */
 async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider: LlmProvider, stats: CallStats) => Promise<T>,
-  resolve: (tenantId: string, purpose: LlmPurpose) => Promise<LlmRoute | null> = resolveRoute, inputCount: number | null = null): Promise<T> {
+  resolve: (tenantId: string, purpose: LlmPurpose) => Promise<LlmRoute | null> = resolveRoute,
+  { inputCount = null, retry = false }: { inputCount?: number | null; retry?: boolean } = {}): Promise<T> {
   const { provider, route, fallbackReason } = (await resolve(tenantId, purpose)) ?? {};
   if (!provider) throw new LlmError('未配置模型服务：请在「模型服务」页填写端点、模型与 API Key，或由平台配置默认模型服务');
   const { model } = provider;
   if (!model) throw new LlmError('模型服务配置不完整：没有填写模型名');
 
-  const started = Date.now();
-  const stats: CallStats = { schemaValid: null };
-  let error: string | null = null;
-  try {
-    return await call(provider, stats);
-  } catch (e) {
-    error = (e as Error).message;
-    throw e;
-  } finally {
-    await getDb().insert(llmCalls).values({
-      tenantId, purpose, model, schemaValid: stats.schemaValid, error, inputCount,
-      // 档位与回落原因（ADR-0055）：route 是这次调用所属的档位，fallbackReason 为 'unbound' 表示该档位没绑定模型
-      route, fallbackReason,
-      // 来源（#843）就是这次实际解析到的端点的 source（chat 由 resolveRoute、embedding 由 resolveEmbeddingProvider 填好），
-      // 不在日志层另行推算：embedding 与 chat 可能来自不同套配置
-      source: provider.source,
-      promptTokens: stats.usage?.prompt_tokens ?? null, completionTokens: stats.usage?.completion_tokens ?? null,
-      durationMs: Date.now() - started,
-    }).catch(e => console.error('记录模型调用日志失败', e));
+  for (let attempt = 1; ; attempt++) {
+    const started = Date.now();
+    const stats: CallStats = { schemaValid: null };
+    let error: string | null = null;
+    try {
+      return await call(provider, stats);
+    } catch (e) {
+      error = (e as Error).message;
+      if (!(retry && attempt === 1 && e instanceof LlmError && e.transient && !e.timeout)) throw e;
+    } finally {
+      await getDb().insert(llmCalls).values({
+        tenantId, purpose, model, schemaValid: stats.schemaValid, error, inputCount, attempt,
+        // 档位与回落原因（ADR-0055）：route 是这次调用所属的档位，fallbackReason 为 'unbound' 表示该档位没绑定模型
+        route, fallbackReason,
+        // 来源（#843）就是这次实际解析到的端点的 source（chat 由 resolveRoute、embedding 由 resolveEmbeddingProvider 填好），
+        // 不在日志层另行推算：embedding 与 chat 可能来自不同套配置
+        source: provider.source,
+        promptTokens: stats.usage?.prompt_tokens ?? null, completionTokens: stats.usage?.completion_tokens ?? null,
+        durationMs: Date.now() - started,
+      }).catch(e => console.error('记录模型调用日志失败', e));
+    }
+    await llmSleep(1000 + Math.random() * 2000);
   }
 }
 
 /** 按租户的模型服务 callModel，记调用日志（logged） */
 export const chatJson = <T>(tenantId: string, purpose: LlmPurpose, messages: LlmMessage[], schema: object): Promise<T> =>
-  logged(tenantId, purpose, (provider, stats) => callModel<T>(provider, messages, schema, stats, purpose));
+  logged(tenantId, purpose, (provider, stats) => callModel<T>(provider, messages, schema, stats, purpose), resolveRoute,
+    { retry: purpose !== 'connectivity' });
 
 /** 按租户的模型服务 callTools，记调用日志（logged；schema_valid 为 null） */
 export const chatTools = (tenantId: string, purpose: LlmPurpose, messages: LlmMessage[], tools: LlmTool[]): Promise<ToolReply> =>
@@ -495,10 +512,11 @@ export const chatTools = (tenantId: string, purpose: LlmPurpose, messages: LlmMe
 export const chatToolsWith = (tenantId: string, purpose: LlmPurpose, route: LlmRoute, messages: LlmMessage[], tools: LlmTool[]): Promise<ToolReply> =>
   logged(tenantId, purpose, (provider, stats) => callTools(provider, messages, tools, stats), async () => route);
 
-/** 按调用方给出的路由调 callModel 并记调用日志（口径同 chatJson）：保存档位前用还没写库的配置探测一次（#1213）、
+/** 按调用方给出的路由调 callModel 并记调用日志（口径同 chatJson，connectivity 以外的用途也重试 1 次）：保存档位前用还没写库的配置探测一次（#1213）、
  *  连通测试按已解析的档位各测一次时用，路由不再由 logged 自己解析 */
 export const chatJsonWith = <T>(tenantId: string, purpose: LlmPurpose, route: LlmRoute, messages: LlmMessage[], schema: object): Promise<T> =>
-  logged(tenantId, purpose, (provider, stats) => callModel<T>(provider, messages, schema, stats, purpose), async () => route);
+  logged(tenantId, purpose, (provider, stats) => callModel<T>(provider, messages, schema, stats, purpose), async () => route,
+    { retry: purpose !== 'connectivity' });
 
 /**
  * 按租户的 embedding 端点（resolveEmbeddingProvider）调 /embeddings，返回按输入顺序排好的向量，记调用日志
@@ -511,7 +529,7 @@ export async function embed(tenantId: string, texts: string[]): Promise<number[]
   if (!provider) return null;
   return logged(tenantId, 'embedding',
     (p, stats) => masked(p.apiKey, () => postEmbeddings(p, texts, stats)),
-    async () => ({ provider, route: null, fallbackReason: null }), texts.length);
+    async () => ({ provider, route: null, fallbackReason: null }), { inputCount: texts.length });
 }
 
 /**
@@ -525,7 +543,9 @@ export async function callEmbeddings(provider: LlmProvider, texts: string[], sta
 /**
  * 按调用方传入的 embedding 端点调 /embeddings 并记调用日志（日志口径同 embed：purpose embedding、模型、条数、prompt_tokens 与耗时，
  * 不记请求文本与向量）。补算用 provider 由调用方在开始时解析一次传入，保证一次补算只用一个模型，不会中途换端点；
- * 检索的查询向量一路传更短的 timeoutMs（catalog/embeddings.ts 的 QUERY_EMBED_TIMEOUT_MS），补算不传、仍是默认超时
+ * 检索的查询向量一路传更短的 timeoutMs（catalog/embeddings.ts 的 QUERY_EMBED_TIMEOUT_MS），补算不传、仍是默认超时；
+ * retry 只有补算打开（logged 的同模型重试 1 次），查询向量不重试、免得拖慢检索
  */
-export const embedWith = (tenantId: string, provider: LlmProvider, texts: string[], opts: { timeoutMs?: number } = {}): Promise<number[][]> =>
-  logged(tenantId, 'embedding', (p, stats) => callEmbeddings(p, texts, stats, opts), async () => ({ provider, route: null, fallbackReason: null }), texts.length);
+export const embedWith = (tenantId: string, provider: LlmProvider, texts: string[], opts: { timeoutMs?: number; retry?: boolean } = {}): Promise<number[][]> =>
+  logged(tenantId, 'embedding', (p, stats) => callEmbeddings(p, texts, stats, { timeoutMs: opts.timeoutMs }), async () => ({ provider, route: null, fallbackReason: null }),
+    { inputCount: texts.length, retry: opts.retry });

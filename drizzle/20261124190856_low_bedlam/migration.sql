@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."llm_calls" ADD COLUMN "attempt" integer DEFAULT 1 NOT NULL;
