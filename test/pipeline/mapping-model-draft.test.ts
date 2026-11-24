@@ -497,14 +497,65 @@ describe('用模型建议断言', () => {
     expect(JSON.stringify(audit.detail)).not.toMatch(/weird_value|猜的/);
   });
 
-  it('没有配置模型服务时 400、不发请求', async () => {
+  it('个别断言不过校验时去掉这些、采用其余：items 末尾是被丢的断言名带 dropped，审计记 model_draft_partial（kind assertions，不含理由与取值）', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    const mapping = await createMapping(author, sourceId, ORDERS);
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json({ assertions: [
+      ...MODEL_ASSERTIONS.assertions,
+      { field: 'no_such_field', check: 'not_null', level: 'warn', confidence: 0.3, reason: '猜的字段' },
+    ] }, USAGE));
+
+    const result = await modelAssertionsForMapping(author, mapping.id);
+    expect(result.origin).toBe('assertions');
+    expect(parse(result.yaml).assertions).toEqual(MODEL_ASSERTIONS.assertions.map(({ confidence: _c, reason: _r, ...a }) => a));
+    expect(result.yaml).not.toContain('no_such_field');
+    expect(result.items.map(i => i.path)).toEqual(['assertions.0', 'assertions.1', 'assertions.2', 'custom:no_such_field:not_null']);
+    expect(result.items[3]).toMatchObject({ confidence: 0.3, reason: '猜的字段', dropped: expect.any(String) });
+    const [generation] = await generations(acme);
+    expect(generation).toMatchObject({ id: result.generationId, origin: 'assertions', mappingId: mapping.id, yaml: result.yaml, items: result.items });
+    const [audit] = await partials(acme);
+    expect(audit).toMatchObject({ actorEmail: author.email, targetType: 'source', targetId: sourceId });
+    expect(audit.detail).toEqual({
+      mappingId: mapping.id, sourceId, source: '门店1', table: 'orders', entity: 'order', kind: 'assertions', dropped: ['custom:no_such_field:not_null'], issues: 1,
+    });
+    expect(JSON.stringify(audit.detail)).not.toMatch(/猜的|paid|refunded/);
+    expect(await failures(acme)).toHaveLength(0);
+  });
+
+  it('没有配置模型服务时按规则生成基础断言（主键非空、唯一，数值列范围）并提示，不发请求，生成记录的来源是 rules', async () => {
     const { acme, author, sourceId } = await tenantWithSource();
     const mapping = await createMapping(author, sourceId, ORDERS);
     const { f } = fakeLlm(setLlmFetch, () => json(MODEL_ASSERTIONS, USAGE));
-    const e = await failure(modelAssertionsForMapping(author, mapping.id));
-    expect(e.status).toBe(400);
-    expect(e.message).toContain('未配置模型服务');
+
+    const result = await modelAssertionsForMapping(author, mapping.id);
+    expect(result).toMatchObject({ origin: 'rules', items: [], notice: '未配置模型服务，已按规则生成' });
     expect(f).not.toHaveBeenCalled();
-    expect(await generations(acme)).toHaveLength(0);
+    expect(await calls(acme)).toHaveLength(0);
+    expect(result.yaml.startsWith(ORDERS)).toBe(true);
+    const assertions = parse(result.yaml).assertions as { field: string; check: string; level: string; min?: unknown; max?: unknown }[];
+    expect(assertions).toEqual(expect.arrayContaining([
+      { field: 'order_id', check: 'not_null', level: 'error' },
+      { field: 'order_id', check: 'unique', level: 'error' },
+      expect.objectContaining({ field: 'amount', check: 'range', level: 'warn', min: expect.any(Number), max: expect.any(Number) }),
+    ]));
+    expect(await generations(acme)).toEqual([expect.objectContaining({ id: result.generationId, origin: 'rules', items: [], mappingId: mapping.id, yaml: result.yaml })]);
+  });
+
+  it('没有配置模型服务、映射已有自定义断言时，规则断言合并进来：原有的还在，同字段同检查不重复', async () => {
+    const { author, sourceId } = await tenantWithSource();
+    const mine = `${ORDERS}assertions:\n  - { field: order_id, check: not_null, level: warn }\n  - { field: status, check: in, level: warn, values: [paid, refunded] }\n`;
+    const mapping = await createMapping(author, sourceId, mine);
+
+    const result = await modelAssertionsForMapping(author, mapping.id);
+    expect(result.origin).toBe('rules');
+    const assertions = parse(result.yaml).assertions as { field: string; check: string; level: string }[];
+    expect(assertions.slice(0, 2)).toEqual([
+      { field: 'order_id', check: 'not_null', level: 'warn' },
+      { field: 'status', check: 'in', level: 'warn', values: ['paid', 'refunded'] },
+    ]);
+    const names = assertions.map(a => `${a.field}:${a.check}`);
+    expect(new Set(names).size).toBe(names.length);
+    expect(names).toContain('order_id:unique');
   });
 });

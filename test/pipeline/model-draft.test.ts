@@ -2,8 +2,10 @@
 // 个别项不过校验时去掉这些项（退回规则草稿里的同名项，没有就删掉）；模型建议的断言只换 assertions 块
 import { parse, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
+import { dropAssertions, ruleAssertions } from '../../app/.server/pipeline/assertion-fallback';
 import { assertionsToYaml, dropItems, modelOutputToYaml, type AssertionDraft, type ModelDraft } from '../../app/.server/pipeline/model-draft';
-import type { MappingIssue } from '../../app/.server/pipeline/mapping-spec';
+import type { MappingIssue, MergePlan } from '../../app/.server/pipeline/mapping-spec';
+import type { TableProfile } from '../../app/.server/pipeline/source-engine';
 import { readForm } from '../../app/lib/mapping-form';
 import { entityOf } from '../../app/lib/canonical-model';
 
@@ -192,5 +194,58 @@ describe('模型建议的断言转映射 YAML', () => {
     const { yaml } = assertionsToYaml(MAPPING, { assertions: [{ field: 'status', check: 'in', level: 'warn', values: ['paid', 'refunded'], confidence: 0.8, reason: '常见取值' }] });
     expect(parse(yaml).assertions).toEqual([{ field: 'status', check: 'in', level: 'warn', values: ['paid', 'refunded'] }]);
     expect(parse(assertionsToYaml(MAPPING, { assertions: [] }).yaml)).not.toHaveProperty('assertions');
+  });
+});
+
+describe('没配模型时按规则出的基础断言', () => {
+  const col = (name: string, min: string | null, max: string | null) => ({ name, type: 'BIGINT', nullRate: 0, distinct: 10, min, max });
+  const profile: TableProfile = { name: 'orders', rows: 10, sampleRows: 10, watermarkCandidates: [], primaryKey: ['id'], keyCandidates: [], columns: [
+    col('id', '1', '10'), col('amount', '0', '4999.5'), col('phone_no', '100', '200'), col('qty', '1', '9'), col('note', null, null),
+  ] };
+  const plan = (key: string[]): MergePlan => ({
+    entity: 'order', table: 'orders', key, latest: null, entityColumns: [],
+    columns: [
+      { name: 'order_id', type: 'string', expr: 'string(id)' },
+      { name: 'amount', type: 'decimal', expr: ' amount ' },
+      { name: 'phone', type: 'integer', expr: 'phone_no', sensitive: true },
+      { name: 'quantity', type: 'integer', expr: 'qty * 2' },
+      { name: 'tip', type: 'decimal', expr: 'note' },
+    ],
+  });
+
+  it('主键非空、单字段主键唯一；不敏感的裸列数值字段按列统计出 range（数字，warn）；敏感列、非裸列表达式、统计没有范围的不出', () => {
+    expect(ruleAssertions(plan(['order_id']), profile)).toEqual([
+      { field: 'order_id', check: 'not_null', level: 'error' },
+      { field: 'order_id', check: 'unique', level: 'error' },
+      { field: 'amount', check: 'range', level: 'warn', min: 0, max: 4999.5 },
+    ]);
+  });
+
+  it('复合主键只出非空不出唯一；没有列统计时不出 range', () => {
+    expect(ruleAssertions(plan(['order_id', 'amount']), null)).toEqual([
+      { field: 'order_id', check: 'not_null', level: 'error' },
+      { field: 'amount', check: 'not_null', level: 'error' },
+    ]);
+  });
+});
+
+describe('模型建议的断言个别不过校验时去掉', () => {
+  const issue = (path: string, message: string): MappingIssue => ({ line: 1, col: 1, path, message });
+
+  it('去掉问题落在的断言，留下的按新序号，被丢的以断言名追加在 items 末尾', () => {
+    const out: AssertionDraft = { assertions: [
+      { field: 'nope', check: 'not_null', level: 'warn', confidence: 0.2, reason: '猜的' },
+      ...SUGGESTED.assertions,
+    ] };
+    const partial = dropAssertions(MAPPING, out, [issue('assertions.0.field', '没有字段 nope'), issue('assertions.0', '再一条')])!;
+    expect(parse(partial.yaml).assertions).toEqual(parse(assertionsToYaml(MAPPING, SUGGESTED).yaml).assertions);
+    expect(partial.items.map(i => i.path)).toEqual(['assertions.0', 'assertions.1', 'custom:nope:not_null']);
+    expect(partial.items[2]).toEqual({ path: 'custom:nope:not_null', confidence: 0.2, reason: '猜的', dropped: '没有字段 nope；再一条' });
+    expect(partial.dropped).toEqual(['custom:nope:not_null']);
+  });
+
+  it('有不在 assertions.<序号> 下的问题、或全部被丢时返回 null', () => {
+    expect(dropAssertions(MAPPING, SUGGESTED, [issue('fields.order_id', '表达式错')])).toBeNull();
+    expect(dropAssertions(MAPPING, SUGGESTED, [issue('assertions.0', 'a'), issue('assertions.1.min', 'b')])).toBeNull();
   });
 });

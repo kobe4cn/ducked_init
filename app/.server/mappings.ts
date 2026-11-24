@@ -21,6 +21,8 @@ import { publishedDependents } from './dsl-dependencies';
 import { dryRun } from './pipeline/dry-run-engine';
 import { identityRules } from './pipeline/identity-engine';
 import { openTenantLake, redactLakeSecrets } from './pipeline/lake-engine';
+import { dropAssertions, ruleAssertions } from './pipeline/assertion-fallback';
+import { customAssertionName } from './pipeline/custom-assertions';
 import { draftCustomMapping, draftMapping, DraftError, reuseMappingYaml } from './pipeline/mapping-draft';
 import {
   ASSERTION_DRAFT_SCHEMA, assertionDraftMessages, assertionsToYaml, type AssertionDraft, dropItems, MODEL_DRAFT_SCHEMA, modelDraftMessages, modelOutputToYaml, type DraftItem, type ModelDraft,
@@ -334,7 +336,10 @@ export async function modelDraftForMapping(actor: CurrentMember, mappingId: stri
 /**
  * 用模型为已有映射建议自定义断言（ADR-0026、ADR-0035）：把源表的表上下文与当前 YAML（草稿，没有草稿时是最新已发布版本）发给模型
  * （purpose = assertion_draft），只换掉 YAML 的 assertions 块，须过映射校验；成功时写一行生成记录（origin = assertions），不保存映射。
- * 没配置模型服务时 400、不发请求；模型失败或替换后不过校验时记审计 mapping.model_draft_failed（kind = assertions，不含模型原文、理由与取值），抛 422
+ * 没配置模型服务时不发请求，按规则出基础断言（主键非空 / 唯一、数值列范围，见 ruleAssertions），按「字段 + 检查」去重后合并进已有的 assertions 块，
+ * 生成记录 origin = rules 并提示「已按规则生成」。个别断言不过校验时去掉这些、再校验一次后采用其余，记审计 mapping.model_draft_partial（kind = assertions，
+ * 只记去掉的断言名与问题数）；模型失败、全部被丢、有定位不到个别断言的问题或第二次仍不过时记审计 mapping.model_draft_failed
+ * （kind = assertions，不含模型原文、理由与取值），抛 422
  */
 export async function modelAssertionsForMapping(actor: CurrentMember, mappingId: string): Promise<ModelDraftResult> {
   assertCan(actor, 'sources:write');
@@ -343,7 +348,22 @@ export async function modelAssertionsForMapping(actor: CurrentMember, mappingId:
   if (mapping.sourceViewId) throw new MappingError('用模型建议断言要用源表的列统计，读源视图的映射请直接编辑');
   const { sourceId, tableName: table, entity } = mapping;
   const base = await latestYaml(mappingId);
-  if (!(await resolveProvider(tenantId))) throw new MappingError('未配置模型服务：请在「模型服务」页填写端点、模型与 API Key，或由平台配置默认模型服务');
+  const record = async (origin: 'rules' | 'assertions', yaml: string, items: DraftItem[]) => {
+    const [row] = await getDb().insert(mappingGenerations).values({
+      tenantId, sourceId, tableName: table, entity, mappingId, origin, yaml, items, createdByEmail: actor.email,
+    }).returning({ id: mappingGenerations.id });
+    return { yaml, generationId: row.id, origin, items };
+  };
+  if (!(await resolveProvider(tenantId))) {
+    const { plan } = await checkMappingDraft(tenantId, sourceId, base);
+    const profiled = (await profiledTables(tenantId, sourceId))(table);
+    const mine = plan.assertions ?? [];
+    const has = new Set(mine.map(customAssertionName));
+    const merged = [...mine, ...ruleAssertions(plan, typeof profiled === 'string' ? null : profiled.table).filter(a => !has.has(customAssertionName(a)))];
+    const { yaml } = assertionsToYaml(base, { assertions: merged.map(a => ({ ...a, confidence: 1, reason: '' })) });
+    await checkMappingDraft(tenantId, sourceId, yaml);
+    return { ...await record('rules', yaml, []), notice: '未配置模型服务，已按规则生成' };
+  }
 
   const context = await tableContextFor(tenantId, sourceId, table).catch((e: unknown) => {
     throw new MappingError(e instanceof Error ? e.message : String(e));
@@ -366,13 +386,26 @@ export async function modelAssertionsForMapping(actor: CurrentMember, mappingId:
     await checkMappingDraft(tenantId, sourceId, yaml);
   } catch (e) {
     if (!(e instanceof MappingError)) throw e;
-    await failed({ stage: 'mapping', issues: e.issues.length, paths: e.issues.slice(0, 10).map(i => i.path) });
-    throw new MappingError(`模型建议的断言有 ${e.issues.length} 处问题，未采用，编辑框保持原内容（行号指替换后的那份）`, 422, e.issues);
+    const reject = async (issues: MappingIssue[]): Promise<never> => {
+      await failed({ stage: 'mapping', issues: issues.length, paths: issues.slice(0, 10).map(i => i.path) });
+      throw new MappingError(`模型建议的断言有 ${issues.length} 处问题，未采用，编辑框保持原内容（行号指替换后的那份）`, 422, issues);
+    };
+    // 只去掉有问题的个别断言再校验一次；全部被丢或有定位不到个别断言的问题时 dropAssertions 返回 null，整份不采用
+    const partial = dropAssertions(base, out, e.issues);
+    if (!partial) return reject(e.issues);
+    try {
+      await checkMappingDraft(tenantId, sourceId, partial.yaml);
+    } catch (e2) {
+      if (!(e2 instanceof MappingError)) throw e2;
+      return reject(e2.issues);
+    }
+    await recordAudit(getDb(), {
+      tenantId, actor, action: 'mapping.model_draft_partial', targetType: 'source', targetId: sourceId,
+      detail: { mappingId, sourceId, source: source.name, table, entity, kind: 'assertions', dropped: partial.dropped, issues: e.issues.length },
+    });
+    return record('assertions', partial.yaml, partial.items);
   }
-  const [row] = await getDb().insert(mappingGenerations).values({
-    tenantId, sourceId, tableName: table, entity, mappingId, origin: 'assertions', yaml, items, createdByEmail: actor.email,
-  }).returning({ id: mappingGenerations.id });
-  return { yaml, generationId: row.id, origin: 'assertions', items };
+  return record('assertions', yaml, items);
 }
 
 /** 映射当前在改的 YAML：草稿，没有草稿时是最新已发布版本 */
