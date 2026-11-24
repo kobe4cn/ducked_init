@@ -11,6 +11,7 @@
 // 本轮 prefill_workbench 通过校验的 SQL（ToolCtx.workbenchSql）随答复返回；本轮最后一次 catalog_search 判为歧义的追问候选（ToolCtx.choices，⑥-3）也随答复返回；
 // 返回给前端的只有文字答复、用过的工具名、本轮的计划、这份 SQL 与歧义候选，不回传工具原文；
 // 工具调用次数到 MAX_TOOL_CALLS 时不带工具再请求一次，让模型总结本轮进展与下一步（#1180，失败时退回 LIMIT_REPLY）；本轮已有 valid 计划后 prefill_workbench 最多免计 2 次；
+// 中途模型出错且本轮已调用过工具时返回 ERROR_REPLY 与本轮进展，第一次请求就出错仍 422（#1209）；
 // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮每次请求都用同一套端点与模型（chatToolsWith）、在 platform.llm_calls 记一条 assistant（route=reasoning），不存提示词与答复原文
 import { can, deniedReason } from '../access';
 import type { CurrentMember } from '../auth';
@@ -34,6 +35,8 @@ export const MAX_FIXES = 3;
 const MAX_FREE_PREFILLS = 2;
 /** 超限后的总结请求失败时的答复 */
 const LIMIT_REPLY = '本轮工具调用次数用完，已保存目前的进展；回复『继续』可以接着做';
+/** 本轮已调用过工具后请求模型出错时的答复（#1209）：本轮的 plan / workbenchSql / choices 照常带回 */
+export const ERROR_REPLY = '模型服务出错，本轮已保存目前的进展；回复『继续』可以重试';
 /** 超限后追加在消息末尾的 system 提示：总结进展与下一步，不编造 */
 const LIMIT_PROMPT = '本轮工具调用次数已用完，不能再调用工具。请用中文简短总结：这一轮查到了什么；计划是否已通过 validate_plan 校验；成员下一步该怎么说（例如「回复『填入工作台』」或「回复『继续』」）。不要编造没查到的结果，不要声称已执行查询或已填入工作台（除非 prefill_workbench 确实返回了已准备好）。';
 /** 超限时没执行的调用回填的 tool 消息：assistant 消息里的每个 tool_call 都要有对应回复，否则服务商拒绝下一次请求 */
@@ -192,7 +195,8 @@ async function finishAtLimit(tenantId: string, route: LlmRoute, messages: LlmMes
 }
 
 /**
- * 一轮问答：没配置模型服务 409；最近一次探测为不支持工具调用时 422（不发请求），模型服务出错 422；对话不合格 400。
+ * 一轮问答：没配置模型服务 409；最近一次探测为不支持工具调用时 422（不发请求）；模型服务出错时本轮还没调用过工具 422，
+ * 已调用过工具（含出错 / 被拒的调用）则返回 ERROR_REPLY 与本轮的 plan / workbenchSql / choices（#1209）；对话不合格 400。
  * 第 MAX_TOOL_CALLS 次工具调用之后模型还要调用工具时，没执行的调用回填「未执行」，再不带工具请求一次、用模型对进展与下一步的总结作答复
  * （#1180，这次请求失败时用 LIMIT_REPLY），plan / workbenchSql 照常返回；本轮 validate_plan 返回过 valid 后 prefill_workbench 最多免计 MAX_FREE_PREFILLS 次。
  * priorPlan 是对话里最近一份计划（ADR-0050）：不带进发给模型的历史，摘要拼在系统提示末尾、它的条目预先算作本轮已检索（#1179），
@@ -234,6 +238,7 @@ export async function assistantTurn(
     try {
       response = await chatToolsWith(tenantId, 'assistant', route, messages, tools);
     } catch (e) {
+      if (e instanceof LlmError && toolsUsed.length) return { reply: ERROR_REPLY, toolsUsed, ...extras(ctx) };
       if (e instanceof LlmError) throw new AssistantError(`该模型服务不支持工具调用或调用失败：${e.message}`, 422);
       throw e;
     }

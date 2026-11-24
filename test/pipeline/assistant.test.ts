@@ -1,6 +1,6 @@
 // test/pipeline/assistant.test.ts —— AI 助手的一轮问答（ADR-0043）：assistantTurn → 注入的假 fetch（setLlmFetch）。模型的 tool_calls 按注册表调用工具、
 // 结果作为 role: tool 回填，直到模型给出文字答复；系统提示带当前页面；每轮最多 MAX_TOOL_CALLS 次工具调用，用完时不带工具请求一次总结（#1180）；工具出错时把错误文本回填给模型；
-// 没配置模型服务 409、模型服务出错 422、对话过长 400；platform.llm_calls 每次请求记一条 assistant。
+// 没配置模型服务 409、第一次请求模型就出错 422（已调用过工具后出错返回 ERROR_REPLY 与本轮进展，#1209）、对话过长 400；platform.llm_calls 每次请求记一条 assistant。
 // 分析计划（ADR-0050）：同一轮的检索结果进同一个候选集合，validate_plan 只认这些条目，校验结果（status）回填给模型
 // 起草（ADR-0042、ADR-0043）：助手校验后保存指标 / 标签 / 映射草稿，作者是成员、审计带 via: 'assistant'，照常双人发布；不通过时最多再修正 MAX_FIXES 次
 // 填工作台（#436，ADR-0050 / 0043）：draft_query 计划对当前目录重新校验通过后，prefill_workbench 把白名单检查过的 SQL 经 ToolCtx.workbenchSql 随本轮返回
@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, dslVersions, llmCalls, mappingVersions } from '../../app/.server/db/schema';
-import { assistantTurn, MAX_FIXES, MAX_PLAN_SUMMARY, MAX_TOOL_CALLS } from '../../app/.server/assistant/loop';
+import { assistantTurn, ERROR_REPLY, MAX_FIXES, MAX_PLAN_SUMMARY, MAX_TOOL_CALLS } from '../../app/.server/assistant/loop';
 import { catalogFor, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { semanticHash, type AnalysisPlan } from '../../app/.server/catalog/plan';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
@@ -300,6 +300,27 @@ describe('计划随对话，存草稿 / 填工作台前重新校验（ADR-0050�
       },
     };
   }
+
+  it('检索、校验计划（valid）后第三次请求模型 500：不转 422，返回 ERROR_REPLY 并带回计划，llm_calls 最后一条带 error；第一次就 500 仍 422（#1209）', async () => {
+    const { acme, analyst, plan } = await memberCountPlan();
+    const steps = [
+      toolCalls({ name: 'catalog_search', args: { query: 'member_count' } }, TOOL_USAGE),
+      toolCalls({ name: 'validate_plan', args: { plan } }, TOOL_USAGE),
+    ];
+    fakeLlm(setLlmFetch, n => steps[n - 1] ?? new Response('boom', { status: 500 }));
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '统计会员数' }], PAGE);
+    expect(turn).toEqual({ reply: ERROR_REPLY, toolsUsed: ['catalog_search', 'validate_plan'], plan });
+    expect(ERROR_REPLY).toContain('模型服务出错');
+    expect(ERROR_REPLY).toContain('继续');
+    const logged = await calls(acme);
+    expect(logged).toHaveLength(3);
+    expect(logged.filter(c => c.error)).toHaveLength(1);
+    expect(logged.at(-1)!.error).toBeTruthy();
+
+    fakeLlm(setLlmFetch, () => new Response('boom', { status: 500 }));
+    await expect(assistantTurn(analyst, [{ role: 'user', content: '统计会员数' }], PAGE))
+      .rejects.toMatchObject({ status: 422, message: expect.stringContaining('不支持工具调用或调用失败') });
+  });
 
   it(`同一轮校验了计划、起草连续 ${MAX_FIXES + 1} 次被拒：答复是问题清单与最后一版 YAML，计划仍随这一轮返回`, async () => {
     const { analyst, plan } = await memberCountPlan();
