@@ -2,6 +2,7 @@
 // 要求返回 JSON 对象并按调用方给的 JSON Schema 校验，不合格就报错，不把半成品交给调用方。
 // 校验的容错（#1160）：模型对用不到的可选键写 null（qwen-max）时按没给处理——删掉出错位置上为 null 的键再校验；输出被 max_tokens
 // 截断（finish_reason: length）时报截断原因而不是「不是 JSON」；内容被 ```json 代码块包着时先去掉外壳；minItems / minimum 等报中文说明。
+// 解析加固（#1224）：开头的 <think>…</think> 先去掉，再取第一个完整 JSON 对象；服务商没给工具调用 id 时本地生成（call_<uuid>）。
 // 端点按「租户自己的配置（platform.model_providers，Key 用租户数据密钥加密）> 平台默认（环境变量 LLM_*）」整套选取，不混用。
 // 在选出的一套上按用途分档（ADR-0055）：PURPOSE_TIER 写死每个用途属 fast / reasoning 哪档，平台档位用 LLM_<TIER>_* 环境变量换模型，
 // 租户整套自配时读租户自己的档位列（只填模型沿用租户默认端点与 Key，带端点用档位自己的 Key），平台档位不生效；
@@ -13,6 +14,7 @@
 // embed（ADR-0049）走可选的 embedding 端点：租户的 embedding 三项 > 平台环境变量 LLM_EMBEDDING_*，与 chat 互不影响；
 // 都没配置时返回 null（不发请求、不记日志），调用方只走关键词检索。
 // chatJson 与 chatTools 的每次调用（成功、HTTP 失败、校验失败）都在 platform.llm_calls 记一行：用途、模型、令牌数、耗时、校验结果与错误摘要，不存提示词与返回原文；评测命令用不查库、不记日志的 callModel
+import { randomUUID } from 'node:crypto';
 import { Ajv, type ErrorObject, type ValidateFunction } from 'ajv';
 import { eq } from 'drizzle-orm';
 import { getDb } from './db/client';
@@ -413,10 +415,15 @@ export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[]
     if (typeof content !== 'string') throw new LlmError('模型服务的返回里没有 choices[0].message.content');
     // 截断检查放在解析之前：截断的输出多半也不是合法 JSON，先报原因更清楚（schemaValid 留 null）
     if (finishReason === 'length') throw new LlmError(zh(msg('模型输出被截断（达到输出长度上限），请把需求写得更具体，或换上下文更长的模型')));
-    // 有的模型把 JSON 包在 ```json … ``` 代码块里：去掉外壳再解析
-    const fenced = content.trim().match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
+    // 思考模型在正文前输出 <think>…</think>：先去掉；有的模型把 JSON 包在 ```json … ``` 代码块里：去掉外壳；
+    // 整段不是 JSON 时（前后带说明文字）取第一个完整的 JSON 对象
+    const body = stripThink(content).trim();
+    const fenced = body.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
+    const candidate = fenced ? fenced[1] : body;
     let parsed: unknown;
-    try { parsed = JSON.parse(fenced ? fenced[1] : content); } catch { throw new LlmError('模型返回的内容不是 JSON'); }
+    try { parsed = JSON.parse(candidate); } catch {
+      try { parsed = JSON.parse(firstJsonObject(candidate) ?? ''); } catch { throw new LlmError('模型返回的内容不是 JSON'); }
+    }
     const validate = validatorFor(schema);
     stats.schemaValid = validate(parsed);
     // 可选键为 null 时删掉再校验，最多 3 轮；没删掉任何东西就停（报错用最后一次的 schemaErrors）
@@ -424,6 +431,29 @@ export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[]
     if (!stats.schemaValid) assertSchema(schema, parsed);
     return parsed as T;
   });
+}
+
+/** 去掉开头的 <think>…</think>（大小写不敏感，到第一个 </think>）；没闭合时原样返回 */
+function stripThink(s: string): string {
+  return s.trim().replace(/^<think>[\s\S]*?<\/think>/i, '');
+}
+
+/** 从第一个 { 起按括号深度扫描（跳过字符串里的括号与转义），返回第一个完整的 {…}；没有时返回 null */
+function firstJsonObject(s: string): string | null {
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return s.slice(start, i + 1);
+  }
+  return null;
 }
 
 /** 给模型的一个工具：parameters 是输入的 JSON Schema */
@@ -446,7 +476,8 @@ export async function callTools(provider: LlmProvider, messages: LlmMessage[], t
     }, stats);
     const raw = Array.isArray(message.tool_calls) ? message.tool_calls as { id?: unknown; function?: { name?: unknown; arguments?: unknown } }[] : [];
     const toolCalls = raw.flatMap(c => typeof c?.function?.name === 'string' ? [{
-      id: typeof c.id === 'string' ? c.id : '',
+      // 部分兼容接口不给 id：本地生成，loop 回填 tool_call_id 用的是同一个值
+      id: typeof c.id === 'string' && c.id ? c.id : `call_${randomUUID()}`,
       name: c.function.name,
       arguments: typeof c.function.arguments === 'string' ? c.function.arguments : JSON.stringify(c.function.arguments ?? {}),
     }] : []);
