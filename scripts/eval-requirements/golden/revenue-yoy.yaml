@@ -1,4 +1,6 @@
 request: 近 30 天营收同比去年同期增长多少
+kind: metric
+expected_unsupported: true
 failure_type: d
 covers: [same-name]
 retrieval:
