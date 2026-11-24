@@ -440,6 +440,28 @@ describe('编写与发布映射', () => {
     expect(panel).toMatch(/自定义：实付金额 取值范围（警告级）：样本里有 \d+ 行不合格/);
   });
 
+  it('event 映射的空跑面板提示样例里有没有登录事件，列出认的 event_type 取值；别的实体没有这一条', async () => {
+    const { tenantId, sourceId } = await tenantWithSource('acme');
+    const engineer = await memberOf(tenantId, 'de@acme.com');
+    const author = await loginAs(app, 'de@acme.com');
+    const yaml = 'model: 1\nentity: event\ntable: events\nfields:\n  event_id: string(customer_id)\n  event_type: event_type\n  occurred_at: occurred_at\n';
+    const id = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml }));
+    const orders = mappingIdOf(await author.post('/mappings', { intent: 'create', sourceId, yaml: ORDERS }));
+    await confirmWatermark(engineer, sourceId, 'orders', 'order_id');
+    await syncSource(engineer, sourceId);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+    const none = await (await author.post(`/mappings/${id}`, { intent: 'dryrun', version: '1' })).text();
+    expect(none).toMatch(/data-assertion="login-events" data-ok="false"/);
+    expect(none).toContain('样例里没有登录事件（event_type 为 login）');
+
+    await author.post(`/mappings/${id}`, { intent: 'save', yaml: `${yaml}login_events: [view, sign_in]\n` });
+    const some = await (await author.post(`/mappings/${id}`, { intent: 'dryrun', version: '1' })).text();
+    expect(some).toMatch(/data-assertion="login-events" data-ok="true"/);
+    expect(some).toMatch(/样例里有 \d+ 行登录事件（event_type 为 view、sign_in）/);
+
+    expect(await (await author.post(`/mappings/${orders}`, { intent: 'dryrun', version: '1' })).text()).not.toContain('data-assertion="login-events"');
+  });
+
   it('发布者不能是最后保存草稿的人：A 起草、B 修改后 A 能发布、B 不能，反过来也一样', async () => {
     const { sourceId } = await tenantWithSource('acme');
     const a = await loginAs(app, 'de@acme.com');

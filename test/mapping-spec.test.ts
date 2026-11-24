@@ -516,6 +516,32 @@ describe('属性取舍的数据源优先级', () => {
   });
 });
 
+describe('登录事件的取值', () => {
+  const EVENTS = (table: string) => (table === 'events'
+    ? [['id', 'BIGINT'], ['type', 'VARCHAR']].map(([name, type]) => ({ name, type }))
+    : `数据源中没有表 ${table}`);
+  const BASE = 'model: 1\nentity: event\ntable: events\nfields:\n  event_id: string(id)\n  event_type: type\n';
+
+  it('取值带进合并计划；没写时计划里没有', () => {
+    const r = checkMapping(`${BASE}login_events: [sign_in, login]\n`, EVENTS);
+    expect(r.ok && r.plan.loginEvents).toEqual(['sign_in', 'login']);
+    const plain = checkMapping(BASE, EVENTS);
+    expect(plain.ok && 'loginEvents' in plain.plan).toBe(false);
+  });
+
+  it('空列表、重复项、空串被拒', () => {
+    expect(issuesWith(`${BASE}login_events: []\n`, EVENTS)).toEqual([expect.objectContaining({ path: 'login_events' })]);
+    expect(issuesWith(`${BASE}login_events: [login, login]\n`, EVENTS)).toEqual([expect.objectContaining({ path: 'login_events' })]);
+    expect(issuesWith(`${BASE}login_events: ['']\n`, EVENTS)).toEqual([expect.objectContaining({ path: 'login_events.0' })]);
+  });
+
+  it('只有行为事件（event）映射能配置登录事件的取值', () => {
+    expect(issues(`${ok}login_events: [login]\n`)).toEqual([
+      expect.objectContaining({ path: 'login_events', message: expect.stringContaining('event') }),
+    ]);
+  });
+});
+
 describe('映射报错给出改法', () => {
   const withFields = (lines: string) => ok.replace(/  amount: .*\n  created_at: .*\n/, lines);
 
