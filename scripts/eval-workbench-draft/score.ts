@@ -4,6 +4,7 @@ import type { DuckDBConnection } from '@duckdb/node-api';
 // 先加载助手工具再加载 workbench-ai：两者循环引用（tools 顶层用到 workbench-ai 的 MAX_CELL），直接从 workbench-ai 进入时 node 报 MAX_CELL 未初始化；产品里一直是先加载 tools
 import '../../app/.server/assistant/tools';
 import { callModel, LlmError, type LlmProvider } from '../../app/.server/llm';
+import { lit } from '../../app/.server/pipeline/source-engine';
 import { checkWorkbenchSql, WorkbenchSqlError } from '../../app/.server/pipeline/workbench-engine';
 import { collectRefs } from '../../app/.server/pipeline/sql-refs';
 import { catalogText, draftMessages, WORKBENCH_DRAFT_SCHEMA } from '../../app/.server/workbench-ai';
@@ -31,7 +32,7 @@ const CATALOG_TEXT = catalogText(WORKBENCH_CATALOG, []).text;
 
 /** 引用的表（不含 CTE），schema.table 小写 */
 async function referencedTables(con: DuckDBConnection, sql: string): Promise<Set<string>> {
-  const [{ j }] = (await con.runAndReadAll(`SELECT json_serialize_sql('${sql.replace(/'/g, "''")}') AS j`)).getRowObjectsJson() as { j: string }[];
+  const [{ j }] = (await con.runAndReadAll(`SELECT json_serialize_sql(${lit(sql)}) AS j`)).getRowObjectsJson() as { j: string }[];
   const tree = JSON.parse(j) as { statements?: unknown[] };
   return new Set(collectRefs(tree.statements ?? []).tables.filter(t => !t.cte).map(t => `${t.schema}.${t.table}`.toLowerCase()));
 }
