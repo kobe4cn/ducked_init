@@ -7,6 +7,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import type { CurrentMember } from '../../app/.server/auth';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { tenantCatalog } from '../../app/.server/catalog/load';
+import { createCustomEntity, publishCustomEntity } from '../../app/.server/custom-entities';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, mappingGenerations } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
@@ -112,6 +113,30 @@ describe('用模型生成映射草稿', () => {
     expect(f).not.toHaveBeenCalled();
     expect(await calls(acme)).toHaveLength(0);
     expect(await generations(acme)).toEqual([expect.objectContaining({ id: result.generationId, origin: 'rules', items: [] })]);
+  });
+
+  it('自定义实体不调模型：返回规则草稿与提示，不发请求，生成记录的来源是 rules', async () => {
+    const { acme, author, reviewer, sourceId } = await tenantWithSource();
+    platformDefault();
+    await publishCustomEntity(reviewer, await createCustomEntity(author, {
+      name: 'custom_order_x', label: '订单扩展', kind: 'fact', primaryKey: ['order_id'],
+      fields: [{ name: 'order_id', type: 'string', description: '', sensitive: false }],
+    }), 1);
+    const { f } = fakeLlm(setLlmFetch, () => json(MODEL_ORDERS, USAGE));
+
+    const result = await modelDraftFor(author, sourceId, 'orders', 'custom_order_x');
+    expect(result).toMatchObject({ origin: 'rules', notice: '自定义实体暂不支持模型起草，已按规则生成' });
+    const yaml = parse(result.yaml);
+    expect(yaml).toMatchObject({
+      entity: 'custom_order_x', table: 'orders',
+      extensions: { order_id: { type: 'string', expr: 'string(order_id)' } }, dedupe: { key: ['order_id'] },
+    });
+    expect(yaml).not.toHaveProperty('fields');
+    expect(f).not.toHaveBeenCalled();
+    expect(await calls(acme)).toHaveLength(0);
+    expect(await generations(acme)).toEqual([expect.objectContaining({
+      id: result.generationId, entity: 'custom_order_x', tableName: 'orders', origin: 'rules', items: [], mappingId: null, createdByEmail: author.email,
+    })]);
   });
 
   it('配置了模型服务时把表上下文与规则草稿发给模型，转出的 YAML 记进生成记录（每项的置信度与理由），不保存映射', async () => {

@@ -52,7 +52,7 @@
     "app/.server/llm-prompts.ts": 1,
     "app/.server/llm.ts": 19,
     "app/.server/mailer.ts": 7,
-    "app/.server/mappings.ts": 59,
+    "app/.server/mappings.ts": 60,
     "app/.server/mcp.ts": 5,
     "app/.server/member-tokens.ts": 5,
     "app/.server/members.ts": 9,

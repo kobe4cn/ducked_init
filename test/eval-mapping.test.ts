@@ -1,6 +1,6 @@
 // test/eval-mapping.test.ts —— 映射评测（#217，ADR-0035）：黄金集的期望 YAML 都能对着自己的表统计过校验（自定义样例带登记）、规则草稿都能生成、六类样例都有；
 // runCase 用假 fetch 跑出的准确率与人工改动项数：与期望一致、改一个表达式少一列、不合 Schema、不过校验时的问题清单（脱敏）；
-// 提示词带固定目录，个别项不过校验时与产品同样部分采用（带 partial 与 dropped）；自定义实体样例的模型草稿与产品一样整份不采用（缺口见 #1268）（纯函数，不读库）
+// 提示词带固定目录，个别项不过校验时与产品同样部分采用（带 partial 与 dropped）；自定义实体样例与产品一样不调模型，按规则草稿打分、带 rules: true（#1268）（纯函数，不读库）
 import { afterEach, describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import { entityOf } from '../app/lib/canonical-model';
@@ -84,12 +84,12 @@ describe('映射评测跑分', () => {
     expect(JSON.stringify(r)).not.toContain(PROVIDER.apiKey);
   });
 
-  it('自定义实体样例：走自定义规则草稿、带登记校验，模型草稿写的 fields 定位不到个别项，整份不采用（已知缺口，#1268）', async () => {
+  it('自定义实体样例：不调模型（#1268），按规则草稿打分并带 rules: true；这里规则草稿与期望一致', async () => {
     const c = caseNamed('custom-store');
-    fakeLlm(setLlmFetch, () => json({ fields: [{ field: 'store_name', expr: 'store_name', confidence: 0.9, reason: 'x' }] }));
+    const { f } = fakeLlm(setLlmFetch, () => json({ fields: [{ field: 'store_name', expr: 'store_name', confidence: 0.9, reason: 'x' }] }));
     const r = await runCase(c, PROVIDER);
-    // 期望 3 列（store_id、store_name、region_id），改动 = 3 列 + 去重
-    expect(r).toMatchObject({ name: 'custom-store', accuracy: 0, expected: 3, edits: 4, failed: { stage: 'mapping' } });
+    expect(f).not.toHaveBeenCalled();
+    expect(r).toEqual({ name: 'custom-store', accuracy: 1, correct: 3, expected: 3, edits: 0, rules: true });
     expect(r).not.toHaveProperty('partial');
   });
 
