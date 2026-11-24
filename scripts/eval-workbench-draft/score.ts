@@ -1,6 +1,8 @@
 // scripts/eval-workbench-draft/score.ts —— 工作台 SQL 起草评测的跑分（ADR-0043）：对一个黄金样例走与产品相同的目录文本、提示词与输出 Schema，
 // 按工作台白名单校验（checkWorkbenchSql，只解析不执行），再看引用的表与必须含的片段命中几项。不读库、不写调用日志（用 callModel 而不是 chatJson）
 import type { DuckDBConnection } from '@duckdb/node-api';
+// 先加载助手工具再加载 workbench-ai：两者循环引用（tools 顶层用到 workbench-ai 的 MAX_CELL），直接从 workbench-ai 进入时 node 报 MAX_CELL 未初始化；产品里一直是先加载 tools
+import '../../app/.server/assistant/tools';
 import { callModel, LlmError, type LlmProvider } from '../../app/.server/llm';
 import { checkWorkbenchSql, WorkbenchSqlError } from '../../app/.server/pipeline/workbench-engine';
 import { collectRefs } from '../../app/.server/pipeline/sql-refs';
