@@ -1,7 +1,7 @@
 // test/plan-card-render.test.ts —— 计划卡组件的服务端渲染（#453，P4⑯b，纯函数，不连库；仓库没有 jsdom，用
 // renderToStaticMarkup，Link 要包在 MemoryRouter 里，onClick 不会被渲染，按钮按 data-next 断言）：valid 时按 mode
 // 给下一步入口——reuse_result 链到所选条目的结果页、draft_definition 给「存草稿」按钮、draft_query 有 workbenchSql
-// 给「填入工作台」链接、没有给按钮；不传 onFollowUp（被分享人只读）时没有按钮、链接照样渲染；invalid 只提示重新提问；
+// 给「填入工作台」链接、没有给按钮；不传 onFollowUp（被分享人只读）时没有按钮、链接照样渲染；invalid 只提示重新提问，catalogChanged（#1190）时提示「你能看到的目录已变化」；
 // clarify / needs_clarification 用 amber 列出问题与建议；unsupported 用 red 给出原因与「新建定义」；「排除了哪些口径」
 // （#539）有名称的项显示名称与原因、没名称的显示「你看不到的条目」，没有 excluded 时没有这个标题
 import { createElement } from 'react';
@@ -53,6 +53,17 @@ describe('计划卡的下一步入口', () => {
     const html = render(card({ status: 'invalid', mode: 'reuse_result', resultHref: '/analytics/definitions/metric/revenue_30d', issues: [{ message: '依赖变了' }] }), { onFollowUp: () => {}, workbenchSql: 'SELECT 1' });
     expect(html).toContain('计划已过期或不再适用，请重新提问');
     noEntry(html);
+  });
+
+  it('invalid 且 catalogChanged 时只提示「你能看到的目录已变化（例如角色调整），请重新提问」，不提示计划已过期，真正的条目问题照列（#1190）', () => {
+    const html = render(card({ status: 'invalid', catalogChanged: true }), { onFollowUp: () => {} });
+    expect(html).toContain('你能看到的目录已变化（例如角色调整），请重新提问');
+    expect(html).not.toContain('计划已过期或不再适用');
+    expect(html).not.toContain('<li');
+    noEntry(html);
+    const mixed = render(card({ status: 'invalid', catalogChanged: true, issues: [{ message: '依赖变了' }] }));
+    expect(mixed).toContain('依赖变了');
+    expect(mixed).toContain('你能看到的目录已变化（例如角色调整），请重新提问');
   });
 });
 

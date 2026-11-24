@@ -941,7 +941,7 @@ select created_at, purpose, route, fallback_reason, model, prompt_tokens, comple
 | AI-PL5 | 「把每个人的客单价加起来，算全体客单价」 | 可加性检查不通过：不 `reuse_result`；改走 `draft_query`（sum(营收)/sum(订单数)）或 `unsupported` 并说明原因 | 计划卡写明「比率不能直接求和」 |
 | AI-PL6 | 「近一年**不含税**营收」 | 口径检查：`revenue_365d` 声明含税「是」，与需求不相容 → 不 `reuse_result`；给 `draft_definition` 或 `unsupported` 并说明要新定义 | 不会把含税的结果当成不含税给出 |
 | AI-PL7 | SK.18 的「近一年不扣退款的 GMV 前 10 名」（`gmv_365d` 声明待复核时） | `needs_clarification`：待复核的声明按未知处理 | SK.19 复核后再问 → 可 reuse |
-| AI-PL8 | **执行前重校验**：得到 AI-PL2 的计划卡后，**先不点**；admin 把 an 改成查看者 → an 回来点「存草稿」 | 拒绝，计划卡显示「计划已过期或不再适用，请重新提问」；没有草稿生成。把 an 改回分析师 | |
+| AI-PL8 | **执行前重校验**：得到 AI-PL2 的计划卡后，**先不点**；admin 把 an 改成查看者 → an 回来点「存草稿」 | 拒绝，计划卡只显示一行「你能看到的目录已变化（例如角色调整），请重新提问」，没有「语义哈希与当前目录不一致」（#1190）；没有草稿生成。把 an 改回分析师 | |
 | AI-PL9 | **过期计划**：问「试饮领取次数在哪里看」得到 `reuse_result`（`trial_received`）计划卡后，eng 发布 `trial_received` 第 2 版（窗口或过滤随便改一处）→ an 让助手按这个计划继续 | 语义哈希变了 → 重新校验发现不一致，要求重新检索；不沿用旧版本的结论。做完发第 3 版改回文件内容（不要动 `revenue_365d`，它挂着 SK 的知识） | |
 | AI-PL10 | 刷新页面后对话里的计划卡与填入工作台的 SQL 链接还在 | 计划随对话加密保存（ADR-0043）；平台库里是密文 |
 

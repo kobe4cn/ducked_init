@@ -6,9 +6,11 @@
 // 状态按重新校验的结果给出（不是 valid）、不报错。卡片只进响应：不写库（sealed 里存的是 plan 本身），也不拼进发给模型的
 // content（ADR-0043）。questions / reason 原样带上；重新校验通过且 mode 是 reuse_result 时给 resultHref——所选条目里第一个
 // 有结果页的条目（模板 / 指标 / 标签，实体与源表没有结果页，路由见 app/routes.ts），找不到就不给（#453）。纯函数：
-// 同一份目录与计划每次相同
+// 同一份目录与计划每次相同。传入另一类可见性的目录（other，ADR-0047）时，区分「读者看到的目录变了」（#1190）：哈希不一致但
+// 等于另一类目录里同 id 条目的哈希、或读者目录里没有而另一类目录里有的条目，不算条目问题，只给 catalogChanged——
+// 另一类目录里的任何内容都不进卡片（读者看不到的东西不能泄露）
 import { expand, type Catalog, type CatalogEntry, type MetricEntry } from '../catalog';
-import { planRetrievedIds, validatePlan, type AnalysisPlan, type PlanMode, type PlanStatus } from '../catalog/plan';
+import { planRetrievedIds, semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type PlanMode, type PlanStatus } from '../catalog/plan';
 
 /** 计划卡视图：字段从计划与重新校验的结果组装，客户端组件（app/components/plan-card.tsx）只读 */
 export interface PlanCardView {
@@ -18,6 +20,8 @@ export interface PlanCardView {
   assumptions: { text: string; confirmed: boolean }[];
   request: { windowDays?: number; grain?: string; dimensions: string[]; population?: string };
   issues: { message: string; next?: string }[];
+  /** 读者看到的目录变了（如角色调整、计划被分享给另一类成员）：这些条目的问题已从 issues 去掉，卡片只提示重新提问（#1190） */
+  catalogChanged?: true;
   questions: string[];
   reason?: string;
   /** 为何选这些条目（计划里模型写的，给成员看）；旧计划没有，卡片上也没有这个键 */
@@ -35,9 +39,23 @@ const asOfOf = (e: CatalogEntry): string => {
   return '暂无快照';
 };
 
-export function planCardView(catalog: Catalog, plan: AnalysisPlan): PlanCardView {
+/** 这条问题是不是「读者看到的目录变了」：哈希问题看另一类目录里同 id 条目的哈希是否等于计划里的，hidden 看另一类目录里有没有这个 id */
+const isCatalogChange = (issue: PlanIssue, plan: AnalysisPlan, other: Catalog): boolean => {
+  if (issue.entryId === undefined) return false;
+  const e = expand(other, issue.entryId);
+  if (e === null) return false;
+  if (issue.kind === 'hidden') return true;
+  if (!issue.path.endsWith('.semanticHash')) return false;
+  const s = plan.selected[Number(issue.path.split('.')[1])];
+  return s !== undefined && s.semanticHash === semanticHash(e);
+};
+
+/** other 是另一类可见性的目录（读者 full 时给 restricted，反之给 full）；不传时不区分目录变化 */
+export function planCardView(catalog: Catalog, plan: AnalysisPlan, other?: Catalog): PlanCardView {
   // 重新校验的写法照 tools.ts 存草稿前那次：selected 与 excluded 都当作检索过（planRetrievedIds），只看当前目录里还成不成立
   const check = validatePlan(plan, { catalog, retrieved: planRetrievedIds(plan) });
+  const changed = other ? check.issues.filter(i => isCatalogChange(i, plan, other)) : [];
+  const issues = check.issues.filter(i => !changed.includes(i));
   // request 没写窗口时取所选指标声明的窗口（第一个带窗口的指标）
   const metricWindow = plan.selected
     .map(s => expand(catalog, s.id))
@@ -70,7 +88,8 @@ export function planCardView(catalog: Catalog, plan: AnalysisPlan): PlanCardView
       dimensions: r.dimensions,
       ...(r.population !== undefined ? { population: r.population } : {}),
     },
-    issues: check.issues.map(i => ({ message: i.message, ...(i.next ? { next: i.next } : {}) })),
+    issues: issues.map(i => ({ message: i.message, ...(i.next ? { next: i.next } : {}) })),
+    ...(changed.length ? { catalogChanged: true as const } : {}),
     questions: plan.questions,
     ...(plan.reason ? { reason: plan.reason } : {}),
     ...(plan.rationale ? { rationale: plan.rationale } : {}),

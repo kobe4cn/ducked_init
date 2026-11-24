@@ -166,7 +166,8 @@ function NextSteps({ card, unsupported, clarify, workbenchSql, onFollowUp }: {
           {card.issues.map((i, j) => <li key={j}>{i.next ? t('{message}（{next}）', { message: i.message, next: i.next }) : i.message}</li>)}
         </ul>
       )}
-      <p>{t('计划已过期或不再适用，请重新提问')}</p>
+      {/* 读者看到的目录变了（角色调整、被分享给另一类成员，#1190）：只提示重新提问；条目真的变了时仍是「计划已过期」 */}
+      <p>{card.catalogChanged ? t('你能看到的目录已变化（例如角色调整），请重新提问') : t('计划已过期或不再适用，请重新提问')}</p>
     </>
   );
 }

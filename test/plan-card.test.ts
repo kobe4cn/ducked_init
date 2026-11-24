@@ -1,11 +1,13 @@
 // test/plan-card.test.ts —— 计划卡视图 planCardView()（#452 / #453，ADR-0050 / 0005，纯函数，不连库）：模板、指标与标签条目的数据截至取快照时间（指标与标签 #1182），
 // 没有快照写「暂无快照」；目录里没有的所选条目只留 id，状态按重新校验给出（不是 valid）；重新校验通过且 reuse_result 时
 // 给 resultHref（所选条目里第一个有结果页的：模板 / 指标 / 标签），clarify / unsupported 原样带上 questions / reason；
-// excluded（#539）目录里有的条目带 id 与名称、没有的只有 reason，excluded 的 id 也算检索过（状态可仍为 valid）
+// excluded（#539）目录里有的条目带 id 与名称、没有的只有 reason，excluded 的 id 也算检索过（状态可仍为 valid）；
+// 传另一类可见性的目录时（#1190），按另一类目录哈希对得上、或只在另一类目录里的条目归为 catalogChanged，内容真变时问题照旧
 import { describe, expect, it } from 'vitest';
 import { buildCatalog, type Catalog, type CatalogEntry } from '../app/.server/catalog';
 import { semanticHash, type AnalysisPlan, type SelectedRef } from '../app/.server/catalog/plan';
 import { planCardView } from '../app/.server/assistant/plan-card';
+import { visibleCatalog } from '../app/.server/catalog/projection';
 import { RETRIEVAL_CATALOG } from '../scripts/eval-requirements/retrieval-catalog';
 
 const SPACE = '00000000-0000-0000-0000-00000000000a';
@@ -65,6 +67,48 @@ describe('计划卡视图 planCardView', () => {
     ]);
     expect(card.status).not.toBe('valid');
     expect(card.issues.map(i => i.message)).toContain('选中的条目不在可见目录里（无权限、未发布或已停用）');
+  });
+
+  it('读者看到的目录变了（full 生成、restricted 读，或反过来）：归为 catalogChanged、issues 里没有哈希与可见性问题；条目内容真变时问题照旧、没有 catalogChanged（#1190）', () => {
+    const lineage = [{ source: '商城', table: 'orders', expr: 'channel', sourceColumns: ['channel'], dictionary: false, sample: [] }];
+    const full: Catalog = { entries: RETRIEVAL_CATALOG.entries.map(e => e.id === 'field:consent.channel' && e.kind === 'field' ? { ...e, lineage } : e) };
+    const restricted = visibleCatalog(full, 'restricted');
+    const ref = (c: Catalog, id: string): SelectedRef => ({ id, semanticHash: semanticHash(c.entries.find(e => e.id === id)!) });
+    const planOf = (selected: SelectedRef[]): AnalysisPlan => ({
+      schemaVersion: 1, mode: 'draft_definition', selected, request: { dimensions: [] },
+      steps: [{ id: 's1', action: 'answer', inputs: selected.map(s => s.id) }], assumptions: [], questions: [],
+    });
+    const plan = (c: Catalog, ids: string[]) => planOf(ids.map(id => ref(c, id)));
+    const HASH = '语义哈希与当前目录不一致（条目内容变了）';
+    const HIDDEN = '选中的条目不在可见目录里（无权限、未发布或已停用）';
+    // 分析师（full）生成，含字段与源表；查看者（restricted）读：字段投影不同、源表看不到
+    const analystPlan = plan(full, ['field:consent.channel', 'table:商城/members']);
+    const asViewer = planCardView(restricted, analystPlan, full);
+    expect(asViewer.status).toBe('invalid');
+    expect(asViewer.catalogChanged).toBe(true);
+    expect(asViewer.issues).toEqual([]);
+    // 读者只得到布尔结论：另一类目录里的条目名称与来源不进卡片
+    expect(JSON.stringify(asViewer)).not.toContain('orders');
+    expect(asViewer.selected[1]).toEqual({ id: 'table:商城/members' });
+    // 不传 other 时行为不变
+    expect(planCardView(restricted, analystPlan).catalogChanged).toBeUndefined();
+    expect(planCardView(restricted, analystPlan).issues.map(i => i.message)).toEqual([HASH, HIDDEN]);
+    // 查看者生成、分析师读
+    const viewerPlan = plan(restricted, ['field:consent.channel']);
+    expect(planCardView(full, viewerPlan, restricted)).toMatchObject({ catalogChanged: true, issues: [] });
+
+    // 条目内容真变了：两类哈希都对不上，问题照旧；混合时保留真正的问题并带 catalogChanged
+    const stale = { ...ref(full, 'field:consent.channel'), semanticHash: 'stale' };
+    const changed = planCardView(restricted, planOf([stale]), full);
+    expect(changed.catalogChanged).toBeUndefined();
+    expect(changed.issues.map(i => i.message)).toEqual([HASH]);
+    const mixed = planCardView(restricted, planOf([stale, ref(full, 'table:商城/members')]), full);
+    expect(mixed.catalogChanged).toBe(true);
+    expect(mixed.issues.map(i => i.message)).toEqual([HASH]);
+    // 两类目录里都没有的条目仍是可见性问题
+    const gone = planCardView(restricted, planOf([{ id: 'table:商城/nope', semanticHash: 'x' }]), full);
+    expect(gone.catalogChanged).toBeUndefined();
+    expect(gone.issues.map(i => i.message)).toEqual([HIDDEN]);
   });
 
   it('reuse_result 重新校验通过时给所选条目里第一个有结果页的 resultHref；实体与源表跳过，不是 valid 或不是 reuse_result 时不给；clarify / unsupported 原样带上 questions / reason', () => {
