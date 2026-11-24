@@ -60,6 +60,13 @@ export interface ToolResult { text: string; rejected?: { issues: string; yaml: s
 export const catalogFor = async (member: CurrentMember): Promise<Catalog> =>
   visibleCatalog(await tenantCatalog(member.tenant.id), visibilityClass(member.role));
 
+/** 成员自己的目录（catalog，同 catalogFor）与另一类可见性的目录（other）：计划卡用 other 判断「读者看到的目录变了」（#1190），other 的内容不给读者 */
+export const catalogPairFor = async (member: CurrentMember): Promise<{ catalog: Catalog; other: Catalog }> => {
+  const full = await tenantCatalog(member.tenant.id);
+  const cls = visibilityClass(member.role);
+  return { catalog: visibleCatalog(full, cls), other: visibleCatalog(full, cls === 'full' ? 'restricted' : 'full') };
+};
+
 /** 一次助手对话轮的上下文：retrieved 是本轮 catalog_search / catalog_expand 返回过的条目 id，助手循环一开始预先填入对话里最近一份计划引用过的条目（#1179），validate_plan 只认这些（防止模型引用没检索过的条目）；
  * plan 是本轮 validate_plan 收到的最后一份结构合法的计划，priorPlan 是对话里最近一份（助手循环带入）；存草稿与填工作台前都优先用 plan、其次 priorPlan 重新校验；
  * workbenchSql 是本轮 prefill_workbench 通过校验的 SQL（多次通过以最后一次为准，之后的拒绝不清掉之前通过的值）；

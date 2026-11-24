@@ -33,7 +33,7 @@ import {
 import { askCardFor, proposeFromChoice, type AskCard } from '~/.server/assistant/knowledge-ask';
 import { AssistantError, assistantTurn, MAX_HISTORY, type ChatTurn } from '~/.server/assistant/loop';
 import { planCardView, type PlanCardView } from '~/.server/assistant/plan-card';
-import { catalogFor, toolsFor } from '~/.server/assistant/tools';
+import { catalogFor, catalogPairFor, toolsFor } from '~/.server/assistant/tools';
 import { KnowledgeError } from '~/.server/knowledge/basis';
 import { ProposalError } from '~/.server/knowledge/proposals';
 import type { Locale } from '~/lib/i18n';
@@ -81,7 +81,8 @@ export async function loader({ request }: Route.LoaderArgs) {
       // 「记为知识提案」卡片（⑥-4 / ⑥-6）：点选候选的那条 user 消息带 chosen，卡片加在它后面那条 assistant 消息上，读时计算、不存库
       // （审核状态变了，读回跟着变）；歧义点选出 term_default、未命中点选出 alias；只给本人组装——被分享人只读，不能替主人提提案
       const chosenBefore = (i: number) => (read.owned ? read.messages[i - 1]?.chosen : undefined);
-      const catalog = read.messages.some(m => m.plan || m.choices) ? await catalogFor(member) : null;
+      const pair = read.messages.some(m => m.plan || m.choices) ? await catalogPairFor(member) : null;
+      const catalog = pair?.catalog ?? null;
       conversation = {
         ...read,
         messages: await Promise.all(read.messages.map(async ({ plan, choices, ...m }, i) => {
@@ -89,7 +90,7 @@ export async function loader({ request }: Route.LoaderArgs) {
           const askCard = chosen ? await askCardFor(member, chosen, i - 1) : null;
           return {
             ...m,
-            ...(plan && catalog ? { planCard: planCardView(catalog, plan) } : {}),
+            ...(plan && catalog ? { planCard: planCardView(catalog, plan, pair?.other) } : {}),
             ...(choices && catalog ? { choices: choicesView(catalog, choices) } : {}),
             ...(askCard ? { askCard } : {}),
           };
@@ -182,14 +183,15 @@ export async function action({ request }: Route.ActionArgs) {
     const { reply, toolsUsed, plan, workbenchSql, choices } = await assistantTurn(member, [...history, { role: 'user', content: userText }], page, priorPlan);
     const conversationId = await appendTurn(member, id, { userText, reply, toolsUsed, ...(plan ? { plan } : {}), ...(workbenchSql ? { workbenchSql } : {}), ...(choices ? { choices } : {}), ...(chosen ? { chosen } : {}) });
     // 本轮校验过计划时带计划卡、判出过歧义时带候选：都按成员自己的目录读时组装；被拒的那轮（如 reuse_result 计划填工作台）校验过计划也带
-    const catalog = plan || choices ? await catalogFor(member) : null;
+    const pair = plan || choices ? await catalogPairFor(member) : null;
+    const catalog = pair?.catalog ?? null;
     // 「记为知识提案」卡片（⑥-4 / ⑥-6）：点选候选回答的那轮按存下的 chosen 确定性组装（不是模型生成的），无权限 / 已有同词提案 /
     // 词已是名称或别名 / 指纹已拒绝时不带（askCardFor 里检查，与提交同一套条件）；歧义点选出 term_default、未命中点选出 alias
     const askCard = chosen ? await askCardFor(member, chosen, chosenIndex) : null;
     return Response.json({
       conversationId, reply, toolsUsed,
       ...(workbenchSql ? { workbenchSql } : {}),
-      ...(plan && catalog ? { planCard: planCardView(catalog, plan) } : {}),
+      ...(plan && catalog ? { planCard: planCardView(catalog, plan, pair?.other) } : {}),
       ...(choices && catalog ? { choices: choicesView(catalog, choices) } : {}),
       ...(askCard ? { askCard } : {}),
     });

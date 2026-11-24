@@ -295,7 +295,9 @@ describe('助手对话', () => {
     expect(viewerCard.status).toBe('invalid');
     // 不是 valid 就不给现有结果的入口（#453）
     expect(viewerCard.resultHref).toBeUndefined();
-    expect(viewerCard.issues.map(i => i.message)).toContain('选中的条目不在可见目录里（无权限、未发布或已停用）');
+    // 源表在分析师的目录里有：是读者看到的目录不同（#1190），归为 catalogChanged，不列可见性问题
+    expect(viewerCard.catalogChanged).toBe(true);
+    expect(viewerCard.issues.map(i => i.message)).not.toContain('选中的条目不在可见目录里（无权限、未发布或已停用）');
     expect(viewerCard.selected.find(s => s.id === 'table:CRM/orders')).toEqual({ id: 'table:CRM/orders' });
     expect(viewerCard.selected.find(s => s.id === 'metric:revenue_30d')?.name).toBe(metric.name);
     expect(JSON.stringify(viewerCard)).not.toContain(table.description);
