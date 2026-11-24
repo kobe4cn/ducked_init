@@ -104,9 +104,9 @@ describe('确定性检索（rank()）', () => {
       const r = retrieve(g);
       expect(targets.filter(t => !r.top.slice(0, 5).includes(t)), `${id} 没进前 5 的指标：${r.top.slice(0, 10).join(', ')}`).toEqual([]);
     }
-    const g = GOLDEN_ALL.find(x => x.id === 'consumption-amount')!;
-    expect(retrieve(g).top.slice(0, 10)).not.toEqual(expect.arrayContaining(['field:coupon.customer_id']));
-    expect(retrieve(g).top.slice(0, 10)).not.toEqual(expect.arrayContaining(['field:consent.customer_id']));
+    const top10 = retrieve(GOLDEN_ALL.find(x => x.id === 'consumption-amount')!).top.slice(0, 10);
+    expect(top10).not.toContain('field:coupon.customer_id');
+    expect(top10).not.toContain('field:consent.customer_id');
   });
 
   for (const g of GOLDEN_ALL) {
