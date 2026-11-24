@@ -6,6 +6,7 @@
 // 没打开时只发 SQL、列名与类型、行数和每列统计（按全部结果行算），不发任何行；结果列无法回溯到字段，
 // 所以按列名与取值保守剔除系统列、名字像敏感字段的列与取值里有 64 位十六进制哈希的列（统计也只算留下的列）。审计 workbench.result_interpreted 不记取值，记 samples；
 // 两种提示都带 SQL 与服务端按全部返回行算好的数值事实（合计、最大、最小、占比，模型只能引用这些数）；按 isDetail 区分分组汇总（可点名分组，事实带所在行）与明细（不点名、只谈分布，不带所在行），关闭开关时也不带所在行；
+// 模型不一定照做：解读里的数字逐个在发出去的 user 消息里找出处（uncitedNumbers），找不到的只返回给页面标出、不重写，审计只记个数；
 // 解读连同 SQL、行数与发送的列名存进本人的助手对话（appendInterpretation），不存结果行
 import { and, eq, inArray } from 'drizzle-orm';
 import { assertCan } from './access';
@@ -16,6 +17,7 @@ import { isSystemColumn } from './catalog';
 import { getDb } from './db/client';
 import { tasks } from './db/schema';
 import { chatJson, LlmError, resolveProvider, type LlmMessage } from './llm';
+import { uncitedNumbers } from './interpretation-numbers';
 import { normalizeWorkbenchSql, type WorkbenchResult } from './pipeline/workbench-engine';
 import { checkDraftedSql, listCatalog, runQuery, WorkbenchError, type CatalogEntry, type QueryOutcome, type WorkbenchCatalog } from './workbench';
 import { SNAPSHOT_TABLE } from './pipeline/task-contracts';
@@ -366,11 +368,12 @@ function interpretMessages(sql: string, { columns, rows }: ReturnType<typeof red
  * 租户打开「发送脱敏样本」时只发前 INTERPRET_ROWS 行里没被剔除的列，没打开时只发 SQL、行数与留下的列的类型和统计（samples: false，不发任何行）；
  * 全部被剔除时 400；模型失败时 422。
  * 解读存进本人的助手对话 conversationId（null 时新建；不是自己的对话时 404，不发请求），返回对话 id。
- * 审计 workbench.result_interpreted { sql, rows, columns, dropped, samples }，不记取值与解读。result 是这次执行的结果，只给页面显示表格，不进审计
+ * 解读里在发给模型的内容（含 facts 的占比与数值两两之比）里找不到出处的数字放进 unverified（原文片段，uncitedNumbers），只给页面标出，不进对话、不进审计。
+ * 审计 workbench.result_interpreted { sql, rows, columns, dropped, samples, unverified }（unverified 只记个数），不记取值与解读。result 是这次执行的结果，只给页面显示表格，不进审计
  */
 export async function interpretResult(
   actor: CurrentMember, sql: string, confirmed: boolean, conversationId: string | null,
-): Promise<{ text: string; rows: number; columns: string[]; dropped: string[]; samples: boolean; result: QueryOutcome; conversationId: string }> {
+): Promise<{ text: string; unverified: string[]; rows: number; columns: string[]; dropped: string[]; samples: boolean; result: QueryOutcome; conversationId: string }> {
   assertCan(actor, 'sandbox');
   if (!confirmed) throw new WorkbenchAiError('请先确认要发送给模型服务的列', 400);
   const tenantId = actor.tenant.id;
@@ -405,10 +408,12 @@ export async function interpretResult(
   }
   const rows = samples ? sentRows(result) : result.rows.length;
   const text = interpretation.slice(0, MAX_INTERPRETATION);
+  // 出处只认发出去的 user 消息：开关关闭时结果行没发给模型，拿它当出处会让返回值间接泄露取值
+  const unverified = uncitedNumbers(text, messages.find(m => m.role === 'user')?.content ?? '');
   const savedConversationId = await appendInterpretation(actor, conversationId, { sql: normalized, rows, columns: sent }, text);
   await recordAudit(getDb(), {
     tenantId, actor, action: 'workbench.result_interpreted', targetType: 'workbench',
-    detail: { sql: normalized, rows, columns: sent, dropped, samples },
+    detail: { sql: normalized, rows, columns: sent, dropped, samples, unverified: unverified.length },
   });
-  return { text, rows, columns: sent, dropped, samples, result, conversationId: savedConversationId };
+  return { text, unverified, rows, columns: sent, dropped, samples, result, conversationId: savedConversationId };
 }

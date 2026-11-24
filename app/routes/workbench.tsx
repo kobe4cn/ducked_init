@@ -362,6 +362,11 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
             <div className="space-y-3 rounded-2xl border bg-white p-6 shadow-sm" data-interpret="result">
               <h2 className="flex items-center gap-1 text-base font-semibold"><Sparkles className="size-4 text-amber-600" />AI 解读</h2>
               <p className="whitespace-pre-wrap text-sm">{interpretation.text}</p>
+              {interpretation.unverified.length > 0 && (
+                <p className="text-sm text-amber-600" data-interpret="unverified">
+                  {t('以下数字在结果里找不到出处，请核对：{numbers}', { numbers: interpretation.unverified.join('、') })}
+                </p>
+              )}
               <p className="text-sm text-slate-400">
                 {`${interpretation.samples ? `依据前 ${interpretation.rows} 行的 ` : `依据 ${interpretation.rows} 行结果的结构与统计（没有发送样本行）：`}${interpretation.columns.join('、')}${interpretation.dropped.length ? `；已剔除 ${interpretation.dropped.join('、')}` : ''}。AI 的解读可能有误，请核对。已存进 AI 助手的「历史对话」。`}
               </p>
