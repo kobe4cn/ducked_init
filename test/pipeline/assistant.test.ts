@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, dslVersions, llmCalls, mappingVersions } from '../../app/.server/db/schema';
-import { assistantTurn, ERROR_REPLY, MAX_FIXES, MAX_PLAN_SUMMARY, MAX_TOOL_CALLS } from '../../app/.server/assistant/loop';
+import { assistantTurn, ERROR_REPLY, MAX_FIXES, MAX_PLAN_SUMMARY, MAX_TOOL_CALLS, maxFixes, maxToolCalls } from '../../app/.server/assistant/loop';
 import { catalogFor, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { semanticHash, type AnalysisPlan } from '../../app/.server/catalog/plan';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
@@ -215,6 +215,47 @@ describe('AI 助手的一轮问答', () => {
     expect(tools.map(m => m.tool_call_id)).toEqual(Array.from({ length: MAX_TOOL_CALLS + 1 }, (_, i) => `b${i}`));
     expect(tools.filter(m => m.content === '未执行：本轮工具调用次数已用完')).toHaveLength(1);
     expect(tools.at(-1)!.content).toBe('未执行：本轮工具调用次数已用完');
+  });
+
+  it('上限取 ASSISTANT_MAX_TOOL_CALLS / ASSISTANT_MAX_FIXES：正整数才用；没填或空串用默认 12 / 3 不告警，非法值（abc、0、负数、小数）告警后回落默认（#1225）', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(maxToolCalls({ ASSISTANT_MAX_TOOL_CALLS: '20' })).toBe(20);
+      expect(maxFixes({ ASSISTANT_MAX_FIXES: '5' })).toBe(5);
+      expect(maxToolCalls({})).toBe(12);
+      expect(maxToolCalls({ ASSISTANT_MAX_TOOL_CALLS: '' })).toBe(12);
+      expect(maxFixes({})).toBe(3);
+      expect(maxFixes({ ASSISTANT_MAX_FIXES: '' })).toBe(3);
+      expect(warn).not.toHaveBeenCalled();
+      for (const raw of ['abc', '0', '-3', '2.5']) {
+        warn.mockClear();
+        expect(maxToolCalls({ ASSISTANT_MAX_TOOL_CALLS: raw }), raw).toBe(12);
+        expect(warn, raw).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining(`ASSISTANT_MAX_TOOL_CALLS=${JSON.stringify(raw)}`));
+        warn.mockClear();
+        expect(maxFixes({ ASSISTANT_MAX_FIXES: raw }), raw).toBe(3);
+        expect(warn, raw).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining(`ASSISTANT_MAX_FIXES=${JSON.stringify(raw)}`));
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('ASSISTANT_MAX_TOOL_CALLS=2：调用 2 次工具后不带工具再请求一次总结，共 4 次请求（#1225）', async () => {
+    vi.stubEnv('ASSISTANT_MAX_TOOL_CALLS', '2');
+    platformDefault();
+    const acme = await newTenant('acme');
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const SUMMARY = '已查到客户相关分组；回复「继续」接着做';
+    const { received } = fakeLlm(setLlmFetch, (n, body) => body.tools
+      ? toolCalls({ name: 'catalog_overview', args: {}, id: `call_${n}` }, TOOL_USAGE)
+      : text(SUMMARY, TEXT_USAGE));
+
+    const turn = await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
+    expect(turn).toEqual({ reply: SUMMARY, toolsUsed: ['catalog_overview', 'catalog_overview'] });
+    expect(received).toHaveLength(4);
+    expect(received.at(-1)!.body).not.toHaveProperty('tools');
   });
 
   it('超限后的总结请求失败：退回 LIMIT_REPLY，本轮进展照常返回，llm_calls 最后一条带 error', async () => {
@@ -645,6 +686,21 @@ describe('AI 助手起草草稿', () => {
     expect((await assistantTurn(analyst, [{ role: 'user', content: '统计会员数' }], PAGE)).reply).toBe('改好并保存了');
     expect(again[1].body.messages.at(-1)!.content).toMatch(/未保存.*\n- base/s);
     expect(await getDb().select().from(dslVersions)).toHaveLength(1);
+  });
+
+  it('ASSISTANT_MAX_FIXES=1：第 2 次被拒就停，不保存，答复写「已修正 1 次」（#1225）', async () => {
+    vi.stubEnv('ASSISTANT_MAX_FIXES', '1');
+    const { acme } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    const { received } = fakeLlm(setLlmFetch, n =>
+      toolCalls({ name: 'validate_definition', args: { kind: 'metric', yaml: BAD_METRIC }, id: `v${n}` }, TOOL_USAGE));
+
+    const turn = await assistantTurn(analyst, [{ role: 'user', content: '统计会员数' }], PAGE);
+    expect(received).toHaveLength(2);
+    expect(turn.reply).toContain('草稿没有通过校验，未保存（已修正 1 次）');
+    expect(turn.reply).toContain('```yaml\n' + BAD_METRIC + '```');
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
   });
 
   it(`中途校验通过、之后加未知键被拒超过上限时，答复给最后一版通过的 YAML 并提示可直接保存，不保存（#1185）`, async () => {

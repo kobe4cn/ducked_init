@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { EMBED_FILL_BACKOFF_MS, embedBatchSize, ensureEmbeddings, readEmbeddings } from '../../app/.server/catalog/embeddings';
+import { EMBED_FILL_BACKOFF_MS, embedBatchSize, ensureEmbeddings, queryEmbedTimeoutMs, readEmbeddings } from '../../app/.server/catalog/embeddings';
 import { cmp } from '../../app/lib/compare';
 import { refreshProjection } from '../../app/.server/catalog/projection';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -264,6 +264,20 @@ describe('检索向量缓存', () => {
     expect(embedBatchSize({ LLM_EMBEDDING_BATCH_SIZE: '' })).toBe(10);
     expect(embedBatchSize({ LLM_EMBEDDING_BATCH_SIZE: '2048' })).toBe(2048);
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('查询向量的超时取 LLM_QUERY_EMBED_TIMEOUT_MS（毫秒）：5000 时用 5000；没填或空串用 3000 不告警，非法值（abc、0、负数、小数）告警后回落 3000（#1225）', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(queryEmbedTimeoutMs({ LLM_QUERY_EMBED_TIMEOUT_MS: '5000' })).toBe(5000);
+    expect(queryEmbedTimeoutMs({})).toBe(3000);
+    expect(queryEmbedTimeoutMs({ LLM_QUERY_EMBED_TIMEOUT_MS: '' })).toBe(3000);
+    expect(warn).not.toHaveBeenCalled();
+    for (const raw of ['abc', '0', '-3', '2.5']) {
+      warn.mockClear();
+      expect(queryEmbedTimeoutMs({ LLM_QUERY_EMBED_TIMEOUT_MS: raw }), raw).toBe(3000);
+      expect(warn, raw).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(`LLM_QUERY_EMBED_TIMEOUT_MS=${JSON.stringify(raw)}`));
+    }
   });
 
   it('catalog.projection 任务成功重建投影后顺带入队补算向量：一次 drain 后投影与向量都齐', async () => {

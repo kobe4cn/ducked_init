@@ -109,8 +109,8 @@ function missingGroup(ranked: Ranked[], fallback: boolean, q: string): ChoiceGro
 const issueLines = (issues: DslIssue[]) =>
   issues.map(i => `- ${i.path || '（文档）'}（第 ${i.line} 行第 ${i.col} 列）：${i.message}`).join('\n');
 
-/** 计划一条问题的引用：path（entryId） */
-const planIssueRef = (i: PlanIssue) => `${i.path}${i.entryId ? `（${i.entryId}）` : ''}`;
+/** 计划一条问题的引用：path（entryId）；根上出错时 path 是空串，显示「（计划）」 */
+const planIssueRef = (i: PlanIssue) => `${i.path || '（计划）'}${i.entryId ? `（${i.entryId}）` : ''}`;
 
 /** 计划的一条问题：- path（entryId）：message；下一步：next（validate_plan 的输出与存草稿前重新校验共用） */
 const planIssueLine = (i: PlanIssue) => `- ${planIssueRef(i)}：${i.message}${i.next ? `；下一步：${i.next}` : ''}`;

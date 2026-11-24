@@ -30,8 +30,19 @@ export function embedBatchSize(env: Record<string, string | undefined> = process
   return DEFAULT_EMBED_BATCH;
 }
 
-/** 查询向量一次 embedding 的短超时：检索在请求路径上，宁可只走关键词也不让成员等一个完整超时（补算默认 LLM_TIMEOUT_SECONDS，60 秒） */
+/** 查询向量一次 embedding 短超时的默认值（毫秒，LLM_QUERY_EMBED_TIMEOUT_MS 没填或非法时用）：检索在请求路径上，
+ *  宁可只走关键词也不让成员等一个完整超时（补算默认 LLM_TIMEOUT_SECONDS，60 秒） */
 export const QUERY_EMBED_TIMEOUT_MS = 3000;
+
+/** 查询向量的超时（毫秒）：LLM_QUERY_EMBED_TIMEOUT_MS 每次调用都读，写法照 embedBatchSize——没填或空串用默认 QUERY_EMBED_TIMEOUT_MS，
+ *  填了但不是正整数时告警后回落默认 */
+export function queryEmbedTimeoutMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.LLM_QUERY_EMBED_TIMEOUT_MS;
+  if (!raw) return QUERY_EMBED_TIMEOUT_MS;
+  if (/^\d+$/.test(raw) && Number(raw) > 0) return Number(raw);
+  console.warn(`LLM_QUERY_EMBED_TIMEOUT_MS=${JSON.stringify(raw)} is not a positive integer, falling back to the default ${QUERY_EMBED_TIMEOUT_MS} ms`);
+  return QUERY_EMBED_TIMEOUT_MS;
+}
 
 /** 补算失败后的退避期（#1172）：最近一次补算失败且不到这么久时 ensureEmbeddings 不入队，免得每次检索都重新发一遍注定失败的批量请求 */
 export const EMBED_FILL_BACKOFF_MS = 10 * 60_000;
@@ -149,7 +160,7 @@ async function recordFill(tenantId: string, error: string | null): Promise<void>
 export type VectorFallback = 'off' | 'embed_failed' | 'store_unreachable' | 'not_ready';
 
 /**
- * 检索查询的向量一路（ADR-0047、0049）：对查询文本算一次 embedding（QUERY_EMBED_TIMEOUT_MS 短超时），从租户选定的向量存储（ADR-0058）
+ * 检索查询的向量一路（ADR-0047、0049）：对查询文本算一次 embedding（queryEmbedTimeoutMs() 短超时，默认 QUERY_EMBED_TIMEOUT_MS，可用 LLM_QUERY_EMBED_TIMEOUT_MS 调），从租户选定的向量存储（ADR-0058）
  * 按余弦相似度取本批行的前 LANE_LIMIT 个哈希，展开回行排出名次（顺序与 vectorLane 一致：相似度降序、同分按 entryId 升序）。
  * 查询向量不缓存、不落库；调用日志（embedWith 经 logged）只记条数与 token，不含查询文本。
  * 行只用调用方按可见类读出的那批（restricted 不另按 full 类读），topN 也只喂这批行的哈希，restricted 条目带不出来；
@@ -172,7 +183,7 @@ export async function vectorHits(tenantId: string, rows: ProjectionRow[], query:
     const resolvedProvider = await resolveEmbeddingProvider(tenantId);
     if (!resolvedProvider) return { fallback: 'off' };
     provider = resolvedProvider;
-    [queryVec] = await embedWith(tenantId, provider, [query], { timeoutMs: QUERY_EMBED_TIMEOUT_MS });
+    [queryVec] = await embedWith(tenantId, provider, [query], { timeoutMs: queryEmbedTimeoutMs() });
   } catch (e) {
     console.warn('混合检索的向量一路不可用，只走关键词', tenantId, logged(e));
     return { fallback: 'embed_failed' };
