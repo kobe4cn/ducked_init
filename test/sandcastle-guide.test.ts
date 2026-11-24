@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { blockersOf, changedFiles, flakyFailures, flakySignature, flakyTickets, splitChildren } from '../.sandcastle/guide';
+import { blockersOf, changedFiles, flakyFailures, flakySignature, flakyEnvironmental, flakyTickets, flakyTriage, splitChildren } from '../.sandcastle/guide';
 
 const guide = (lines: string) => `## What to build\n\n改 \`app/x.ts:1\`。\n\n## Implementation guide\n\n${lines}\n\n## Blocked by\n\n- #1\n`;
 
@@ -203,5 +203,40 @@ describe('Sandcastle 偶发失败按签名分组开票 flakyTickets', () => {
     expect(t!.signature).toBe('Error: expected --> got');
     expect(t!.marker).toBe('<!-- flaky-sig: Error: expected --› got -->');
     expect(t!.existing).toBe(15);
+  });
+});
+
+describe('Sandcastle 偶发失败开不开票 flakyTriage / flakyEnvironmental', () => {
+  const now = new Date('2026-11-24T08:00:00Z');
+  const timeout = { files: ['test/a.test.ts'], signature: 'Error: Test timed out in Nms.', existing: undefined };
+  const assertion = { files: ['test/b.test.ts'], signature: 'AssertionError: expected N to be N', existing: undefined };
+  const seen = (file: string, at: string) => ({ file, signature: 'x', at, issue: '1100' });
+
+  it('(a) 超时、连不上、空签名算环境症状；断言失败不算', () => {
+    for (const s of ['Error: Test timed out in Nms.', 'Error: Hook timed out in Nms.', 'Error: timeout exceeded when trying to connect', 'Error: connect ETIMEDOUT <ip>:N', 'Error: read ECONNRESET', '源库连接超时', ''])
+      expect(flakyEnvironmental(s), s).toBe(true);
+    expect(flakyEnvironmental('AssertionError: expected N to be N')).toBe(false);
+  });
+
+  it('(b) 超时类第一次出现只记录不开票；断言类马上开票；两种都记进历史', () => {
+    const r = flakyTriage([timeout, assertion], [], '1200', now);
+    expect(r.ticket).toEqual([assertion]);
+    expect(r.deferred).toEqual([timeout]);
+    expect(r.history.map((h) => [h.file, h.issue, h.at])).toEqual([
+      ['test/a.test.ts', '1200', now.toISOString()],
+      ['test/b.test.ts', '1200', now.toISOString()],
+    ]);
+  });
+
+  it('(c) 同一文件 7 天内出现过就开票；超过 7 天的旧记录不算，并从历史里删掉', () => {
+    expect(flakyTriage([timeout], [seen('test/a.test.ts', '2026-11-18T09:00:00Z')], '1200', now).ticket).toEqual([timeout]);
+    const old = flakyTriage([timeout], [seen('test/a.test.ts', '2026-11-16T09:00:00Z'), seen('test/z.test.ts', '2026-11-23T00:00:00Z')], '1200', now);
+    expect(old.deferred).toEqual([timeout]);
+    expect(old.history.map((h) => h.file)).toEqual(['test/z.test.ts', 'test/a.test.ts']);
+  });
+
+  it('(d) 已有老票的组照旧追加，不管是不是超时类', () => {
+    const known = { ...timeout, existing: 1230 };
+    expect(flakyTriage([known], [], '1200', now)).toMatchObject({ ticket: [known], deferred: [] });
   });
 });

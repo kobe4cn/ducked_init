@@ -186,3 +186,41 @@ export const flakyTickets = (
     return { files: groupFiles, signature, marker, title, existing: existing?.number };
   });
 };
+
+/** 偶发失败的一次出现，记在 .sandcastle/logs/flaky.json，flakyTriage 按它判断「同一文件 7 天内第二次」。 */
+export type FlakySighting = { file: string; signature: string; at: string; issue: string };
+export const FLAKY_WINDOW_DAYS = 7;
+
+/**
+ * 报错只是超时或连不上（负载、并发抢 PG 这类环境症状）：签名含 timeout / timed out / ETIMEDOUT / ECONN* / connect / 超时 / 连接。
+ * 签名为空（摘要截断、日志被冲掉）也算：没有报错可查，开票只会是一张没法修的空票（#1236）。
+ */
+export const flakyEnvironmental = (signature: string): boolean =>
+  signature === "" || /time(?:d)? ?out|ETIMEDOUT|ECONN|EPIPE|connect|超时|连接/i.test(signature);
+
+/**
+ * 偶发失败开不开票（2026-11-24）：过去 40 多张偶发失败票七成是负载下超时、并发抢资源，修完产品代码不变，
+ * 单次负载抖动就开票会把真 bug（#563、#1141）淹掉。规则：
+ * - 已有同签名 / 同标题的票：照旧在老票上追加一次出现记录；
+ * - 报错是断言失败这类（flakyEnvironmental 为假）：马上开票，可能是真 bug；
+ * - 只是超时 / 连不上：同一文件在 FLAKY_WINDOW_DAYS 天内已经出现过才开票，否则只记一次出现、不开票。
+ * 返回要开票（或追加）的组、只记录的组，以及去掉窗口外旧记录、加上这次出现后的新历史。
+ */
+export const flakyTriage = <G extends { files: string[]; signature: string; existing?: number }>(
+  groups: G[],
+  history: FlakySighting[],
+  issue: string,
+  now: Date,
+): { ticket: G[]; deferred: G[]; history: FlakySighting[] } => {
+  const since = now.getTime() - FLAKY_WINDOW_DAYS * 86_400_000;
+  const recent = history.filter((h) => Date.parse(h.at) >= since);
+  const ticket: G[] = [];
+  const deferred: G[] = [];
+  for (const g of groups) {
+    const seenBefore = recent.some((h) => g.files.includes(h.file));
+    (g.existing !== undefined || !flakyEnvironmental(g.signature) || seenBefore ? ticket : deferred).push(g);
+  }
+  const at = now.toISOString();
+  const sightings = groups.flatMap((g) => g.files.map((file) => ({ file, signature: g.signature, at, issue })));
+  return { ticket, deferred, history: [...recent, ...sightings] };
+};

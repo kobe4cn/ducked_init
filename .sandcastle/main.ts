@@ -37,7 +37,7 @@
 
 import { execFile, execFileSync } from "node:child_process";
 import { cpSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { cpus, loadavg, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { parseEnv, promisify } from "node:util";
 import * as sandcastle from "@ai-hero/sandcastle";
@@ -46,7 +46,7 @@ import {
   AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, usageTable,
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
-import { blockersOf, changedFiles, flakyTickets, splitChildren } from "./guide.ts";
+import { blockersOf, changedFiles, type FlakySighting, flakyTickets, flakyTriage, splitChildren } from "./guide.ts";
 import { acceptanceSection, checkAcceptanceNotes, replaceSection, restSections } from "./pr-body.ts";
 
 // ---------------------------------------------------------------------------
@@ -803,33 +803,53 @@ function reopenRequestedRevisions() {
 /**
  * 门槛里重跑才通过的测试文件：按报错签名去重开票（带 Sandcastle，下次调度自动 prep + 修）。
  * 同签名（同根因落在不同文件）只开一张；已有同签名、或标题 `偶发失败：<文件>` 相同的老票，
- * 就在那张票上追加一次出现记录，不重复开票。返回票号，写进 PR 的 Gate 一节。
+ * 就在那张票上追加一次出现记录，不重复开票。只是超时 / 连不上、且同一文件 7 天内第一次出现的，
+ * 只记进 FLAKY_FILE、不开票（规则见 guide.ts 的 flakyTriage）。返回票号与只记录的文件，写进 PR 评论。
  */
-function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
+const FLAKY_FILE = ".sandcastle/logs/flaky.json";
+function reportFlaky(issue: Issue, pr: string, gateOutput: string): { tickets: string[]; deferred: string[] } {
   // 单元测试和后面一段各可能重跑通过一次（两个 GATE_FLAKY）：每段重跑前列出的文件都要算上
   const parts = gateOutput.split("GATE_FLAKY");
   const before = parts.slice(0, -1).join("\n");
   const after = parts.slice(1).join("\n");
   const files = [...new Set(before.match(/^test\/\S+\.test\.tsx?$/gm) ?? [])];
-  if (files.length === 0) return [];
+  if (files.length === 0) return { tickets: [], deferred: [] };
   trySh("gh", ["label", "create", LABEL.flaky, "--color", "fbca04", "--description", "偶发失败的测试（Sandcastle 门槛自动开票）"]);
   const open: { number: number; title: string; body: string }[] = JSON.parse(
     sh("gh", ["issue", "list", "--state", "open", "--label", LABEL.flaky, "--limit", "100", "--json", "number,title,body"]),
   );
   const seen = `#${issue.id} 的门槛（PR #${pr}）`;
   const summary = `\`\`\`\n${after.trim().slice(0, 3000)}\n\`\`\``;
-  // 分组、签名标记、标题与已有票的匹配见 guide.ts 的 flakyTickets；这里只拼正文 / 评论并调 gh。
-  return flakyTickets(files, after, open).map(({ files: groupFiles, marker, title, existing }) => {
+  // 当时的环境：判断是不是负载 / 并发问题时先看这个
+  const others = [...running.values()].filter((i) => i.id !== issue.id).map((i) => `#${i.id}`);
+  const load = loadavg().map((n) => n.toFixed(1)).join(" / ");
+  const env = `开票时：同时在做的票 ${others.length ? others.join("、") : "无"}；宿主机 1 / 5 / 15 分钟负载 ${load}（${cpus().length} 核）。`;
+  // 分组、签名标记、标题与已有票的匹配见 guide.ts 的 flakyTickets；开不开票见 flakyTriage；这里只拼正文 / 评论并调 gh。
+  let history: FlakySighting[] = [];
+  try {
+    history = JSON.parse(readFileSync(FLAKY_FILE, "utf8")) as FlakySighting[];
+  } catch {}
+  const triage = flakyTriage(flakyTickets(files, after, open), history, issue.id, new Date());
+  writeFileSync(FLAKY_FILE, `${JSON.stringify(triage.history, null, 1)}\n`);
+  const deferred = triage.deferred.flatMap((g) => g.files);
+  if (deferred.length) console.log(`  ⚠ #${issue.id} 门槛偶发超时 / 连接失败，7 天内第一次，只记录不开票：${deferred.join("、")}`);
+  // 同一文件 7 天内之前的出现（超时类第二次出现才开票，票里列出前几次，方便判断是不是同一个环境时段）
+  const prior = (groupFiles: string[]) => {
+    const seenAt = history.filter((h) => groupFiles.includes(h.file)).map((h) => `${h.at.slice(0, 16)}Z #${h.issue} 的门槛（\`${h.file}\`）`);
+    return seenAt.length ? `7 天内之前的出现：${seenAt.join("；")}。` : "";
+  };
+  const tickets = triage.ticket.map(({ files: groupFiles, marker, title, existing }) => {
     const list = groupFiles.map((f) => `\`${f}\``).join("、");
     if (existing !== undefined) {
       const again = marker
         ? `又出现一次：${seen}，这次失败的文件：${list}。`
         : `又出现一次：${seen}。`;
-      sh("gh", ["issue", "comment", String(existing), "--body", `${again}第一次的失败：\n\n${summary}`]);
+      sh("gh", ["issue", "comment", String(existing), "--body", `${again}${env}第一次的失败：\n\n${summary}`]);
       return `#${existing}`;
     }
     const body = [
       `${list} 在 ${seen}的完整测试里失败，单独重跑通过。沙箱里门槛的完整测试用 8 个 worker 并行（\`CRM_TEST_WORKERS=8\`，同一时间只跑一个），agent 自己跑测试用 4 个。`,
+      "", env, ...(prior(groupFiles) ? ["", prior(groupFiles)] : []),
       "", "## 第一次的失败", "", summary, "",
       "## 怎么修", "",
       "按诊断难 bug 的做法：先有一条能让它稳定变红的命令，再改。",
@@ -851,6 +871,7 @@ function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
     ]);
     return `#${url.split("/").pop()}`;
   });
+  return { tickets, deferred };
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,8 +1275,12 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
   );
   reportDecisions(issue.id, pr);
   if (flaky && result.gate.ok) {
-    const tickets = reportFlaky(issue, pr, result.gate.output);
-    if (tickets.length) sh("gh", ["pr", "comment", pr, "--body", `门槛里的偶发失败已开票：${tickets.join("、")}`]);
+    const { tickets, deferred } = reportFlaky(issue, pr, result.gate.output);
+    const notes = [
+      ...(tickets.length ? [`门槛里的偶发失败已开票：${tickets.join("、")}`] : []),
+      ...(deferred.length ? [`门槛里重跑才通过、报错只是超时或连接失败，7 天内第一次出现，只记进 .sandcastle/logs/flaky.json、不开票：${deferred.map((f) => `\`${f}\``).join("、")}`] : []),
+    ];
+    if (notes.length) sh("gh", ["pr", "comment", pr, "--body", notes.join("\n\n")]);
   }
 
   // 外部 PR 一律留给人合并：不 rebase、不合并，只报告 review 与门槛结果。
