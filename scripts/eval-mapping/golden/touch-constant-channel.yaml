@@ -1,0 +1,17 @@
+# 改写自 crm-seed wecom_duckdb.mass_sends.touch：渠道是常量 wechat，结果是中文，时间是不带时区的北京时间
+model: 1
+entity: touch
+table: mass_sends
+fields:
+  touch_id: send_id
+  customer_id: external_userid
+  campaign_id: campaign_id
+  channel: "'wechat'"
+  status:
+    expr: result
+    dictionary:
+      失败: failed
+      送达: delivered
+      已读: opened
+      点击: clicked
+  sent_at: from_timezone(send_time, 'Asia/Shanghai')

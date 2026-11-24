@@ -1,0 +1,9 @@
+# 改写自 crm-seed wecom_duckdb.chats.event（去掉 extensions）：event_type 是常量，时间是不带时区的北京时间
+model: 1
+entity: event
+table: chats
+fields:
+  event_id: chat_id
+  customer_id: external_userid
+  event_type: "'wecom_chat'"
+  occurred_at: from_timezone(chat_time, 'Asia/Shanghai')
