@@ -217,4 +217,14 @@ describe('AI 助手的工具注册表', () => {
     expect(rejected.text).toContain('只有 aggregate 步骤能写 agg');
     expect(rejected.text).not.toContain('must NOT');
   });
+
+  it('validate_plan 根路径的报错（缺 schemaVersion）显示「（计划）」，没有空白路径的行（#1225）', async () => {
+    const { acme } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const { schemaVersion: _omit, ...plan } = PLAN_EXAMPLE;
+    const result = await invokeTool(analyst, 'validate_plan', { plan }, {}, { retrieved: new Set() });
+    expect(result.text).toContain('status: invalid');
+    expect(result.text).toContain('- （计划）：');
+    expect(result.text).not.toMatch(/^- ：/m);
+  });
 });

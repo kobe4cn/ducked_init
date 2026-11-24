@@ -2,7 +2,7 @@
 // 按模型的 tool_calls 调注册表里的工具（runTool 按登记的权限检查）、结果作为 role: tool 回填，直到模型给出文字答复。
 // 助手只能用注册表里的工具，不能执行查询、不能发布；工具出错时把错误文本回填给模型，由它决定怎么继续。
 // 起草（ADR-0042）：校验、保存类工具以「经助手」的成员身份调用（审计带 via: 'assistant'），不通过时问题清单回填给模型修正，
-// 最多再修正 MAX_FIXES 次；仍不通过时不再请求模型，由服务端把问题清单与最后一版 YAML 交给成员；本轮有过同 kind 的定义校验通过时，
+// 最多再修正 maxFixes() 次（默认 MAX_FIXES，可用 ASSISTANT_MAX_FIXES 调）；仍不通过时不再请求模型，由服务端把问题清单与最后一版 YAML 交给成员；本轮有过同 kind 的定义校验通过时，
 // 交的是最后一版通过的 YAML 并提示可直接保存（#1185）。中途校验通过不清零修正次数（通过 / 被拒交替也会到上限），保存成功才清零。
 // 分析计划（ADR-0050）：每轮新建一个检索候选集合（ToolCtx.retrieved）传给每次工具调用，validate_plan 只认本轮 catalog_search / catalog_expand 返回过的条目
 // 与对话里最近一份计划引用过的条目（#1179，一轮开始时用 planRetrievedIds(priorPlan) 预先填入）；
@@ -10,7 +10,7 @@
 // 它的摘要（不含 rationale 与步骤）拼在系统提示末尾，模型沿用它时不必重新检索；存草稿 / 填工作台前照旧对当前目录重新校验
 // 本轮 prefill_workbench 通过校验的 SQL（ToolCtx.workbenchSql）随答复返回；本轮最后一次 catalog_search 判为歧义的追问候选（ToolCtx.choices，⑥-3）也随答复返回；
 // 返回给前端的只有文字答复、用过的工具名、本轮的计划、这份 SQL 与歧义候选，不回传工具原文；
-// 工具调用次数到 MAX_TOOL_CALLS 时不带工具再请求一次，让模型总结本轮进展与下一步（#1180，失败时退回 LIMIT_REPLY）；本轮已有 valid 计划后 prefill_workbench 最多免计 2 次；
+// 工具调用次数到 maxToolCalls()（默认 MAX_TOOL_CALLS，可用 ASSISTANT_MAX_TOOL_CALLS 调）时不带工具再请求一次，让模型总结本轮进展与下一步（#1180，失败时退回 LIMIT_REPLY）；本轮已有 valid 计划后 prefill_workbench 最多免计 2 次；
 // 中途模型出错且本轮已调用过工具时返回 ERROR_REPLY 与本轮进展，第一次请求就出错仍 422（#1209）；
 // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮每次请求都用同一套端点与模型（chatToolsWith）、在 platform.llm_calls 记一条 assistant（route=reasoning），不存提示词与答复原文
 import { can, deniedReason } from '../access';
@@ -23,14 +23,34 @@ import { toolSupport } from '../model-provider';
 import type { ChoiceGroup } from './conversations';
 import { invokeTool, toolsFor, type ToolCtx, type ToolResult } from './tools';
 
-/** 每轮最多调用工具的次数，用完时不带工具再请求一次、让模型总结进展与下一步（#1180）；要给检索、展开、校验计划与保存草稿都留出次数 */
+/** 每轮最多调用工具次数的默认值（ASSISTANT_MAX_TOOL_CALLS 没填或非法时用），用完时不带工具再请求一次、让模型总结进展与下一步（#1180）；
+ *  要给检索、展开、校验计划与保存草稿都留出次数 */
 export const MAX_TOOL_CALLS = 12;
 /** 每轮交给模型的对话最多几条 */
 export const MAX_HISTORY = 40;
 /** 每条消息最多几个字 */
 export const MAX_CONTENT = 4000;
-/** 校验或保存不通过后，模型最多再修正的次数 */
+/** 校验或保存不通过后，模型最多再修正次数的默认值（ASSISTANT_MAX_FIXES 没填或非法时用） */
 export const MAX_FIXES = 3;
+
+/** 读一个正整数环境变量（写法照 catalog/embeddings.ts 的 embedBatchSize）：没填或空串用默认，填了但非法时告警后回落默认 */
+function positiveIntEnv(env: Record<string, string | undefined>, name: string, fallback: number): number {
+  const raw = env[name];
+  if (!raw) return fallback;
+  if (/^\d+$/.test(raw) && Number(raw) > 0) return Number(raw);
+  console.warn(`${name}=${JSON.stringify(raw)} is not a positive integer, falling back to the default ${fallback}`);
+  return fallback;
+}
+
+/** 每轮最多调用工具的次数：ASSISTANT_MAX_TOOL_CALLS 每次调用都读（默认参数在调用时求值，stubEnv 生效），默认 MAX_TOOL_CALLS */
+export function maxToolCalls(env: Record<string, string | undefined> = process.env): number {
+  return positiveIntEnv(env, 'ASSISTANT_MAX_TOOL_CALLS', MAX_TOOL_CALLS);
+}
+
+/** 校验或保存不通过后模型最多再修正的次数：ASSISTANT_MAX_FIXES 每次调用都读，默认 MAX_FIXES */
+export function maxFixes(env: Record<string, string | undefined> = process.env): number {
+  return positiveIntEnv(env, 'ASSISTANT_MAX_FIXES', MAX_FIXES);
+}
 /** 本轮已有 valid 计划后，不计入 MAX_TOOL_CALLS 的 prefill_workbench 最多几次（#1180） */
 const MAX_FREE_PREFILLS = 2;
 /** 超限后的总结请求失败时的答复 */
@@ -46,18 +66,18 @@ const SKIPPED = '未执行：本轮工具调用次数已用完';
 const MAX_ISSUE_LINES = 20;
 const MAX_YAML = 2500;
 
-/** 放弃时的答复：问题清单与 YAML；valid 是本轮最后一版通过校验的同类定义（#1185），有时给它而不是被拒的那版，过长截断时提示重新起草 */
-function unfixedReply({ issues, yaml }: NonNullable<ToolResult['rejected']>, valid?: string) {
+/** 放弃时的答复：问题清单与 YAML；fixes 是本轮的修正上限（和循环判断用同一个值）；valid 是本轮最后一版通过校验的同类定义（#1185），有时给它而不是被拒的那版，过长截断时提示重新起草 */
+function unfixedReply({ issues, yaml }: NonNullable<ToolResult['rejected']>, fixes: number, valid?: string) {
   const lines = issues.split('\n');
   const listed = lines.length > MAX_ISSUE_LINES ? [...lines.slice(0, MAX_ISSUE_LINES), `……另有 ${lines.length - MAX_ISSUE_LINES} 行`] : lines;
   const shown = valid ?? yaml;
   const clipped = shown.length > MAX_YAML;
   const body = clipped ? `${shown.slice(0, MAX_YAML)}\n# ……YAML 过长，只显示前 ${MAX_YAML} 字` : shown;
-  let head = `草稿没有通过校验，未保存（已修正 ${MAX_FIXES} 次）。问题清单：`;
+  let head = `草稿没有通过校验，未保存（已修正 ${fixes} 次）。问题清单：`;
   let label = '最后一版 YAML';
   if (valid !== undefined) {
     const next = clipped ? `但过长只显示前 ${MAX_YAML} 字，请让我重新起草后保存` : '可以让我直接保存';
-    head = `未保存：修正 ${MAX_FIXES} 次后仍不通过；上一版已通过校验，${next}。最后一次的问题清单：`;
+    head = `未保存：修正 ${fixes} 次后仍不通过；上一版已通过校验，${next}。最后一次的问题清单：`;
     label = '通过校验的那一版 YAML';
   }
   return `${head}\n${listed.join('\n')}\n\n${label}：\n\n\`\`\`yaml\n${body.endsWith('\n') ? body : `${body}\n`}\`\`\``;
@@ -220,6 +240,9 @@ export async function assistantTurn(
     ...history.map(m => ({ role: m.role, content: m.content })),
   ];
   const toolsUsed: string[] = [];
+  // 上限一轮开始时读一次，中途改环境变量不影响本轮
+  const toolLimit = maxToolCalls();
+  const fixLimit = maxFixes();
   // 本轮的上下文：retrieved 是本轮检索到的候选条目（catalog_search / catalog_expand 记进来，validate_plan 只认这些，每轮新建），
   // 一开始预先填入对话里最近一份计划引用过的条目（#1179，沿用计划不必重新检索；版本、哈希与可见性仍由 validatePlan 对当前目录检查），
   // priorPlan 是对话里最近一份计划，plan 由本轮 validate_plan 写进（不带 priorPlan 初始化，免得每轮把旧计划再存一遍）
@@ -250,7 +273,7 @@ export async function assistantTurn(
     });
     for (const [i, c] of response.toolCalls.entries()) {
       const free = c.name === 'prefill_workbench' && planValid && freePrefills < MAX_FREE_PREFILLS;
-      if (!free && toolsUsed.length - freePrefills === MAX_TOOL_CALLS) {
+      if (!free && toolsUsed.length - freePrefills === toolLimit) {
         for (const skipped of response.toolCalls.slice(i)) messages.push({ role: 'tool', tool_call_id: skipped.id, content: SKIPPED });
         return finishAtLimit(tenantId, route, messages, toolsUsed, ctx);
       }
@@ -259,8 +282,8 @@ export async function assistantTurn(
       const result = await callTool(via, c.name, c.arguments, ctx);
       if (c.name === 'validate_plan' && result.text.startsWith('status: valid')) planValid = true;
       if (result.validated) lastValid = result.validated;
-      if (result.rejected && ++failures > MAX_FIXES) {
-        return { reply: unfixedReply(result.rejected, sameKindValid(c.name, c.arguments, lastValid)), toolsUsed, ...extras(ctx) };
+      if (result.rejected && ++failures > fixLimit) {
+        return { reply: unfixedReply(result.rejected, fixLimit, sameKindValid(c.name, c.arguments, lastValid)), toolsUsed, ...extras(ctx) };
       }
       // 保存成功后再起草下一份，重新计修正次数与通过的那版
       if (result.saved) { failures = 0; lastValid = undefined; }
