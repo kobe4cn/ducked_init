@@ -708,6 +708,13 @@ describe('助手对话', () => {
     expect(id).toBeDefined();
     const read = (await (await client.get(`/assistant?id=${id}`)).json()).conversation.messages;
     expect(read.at(-1)).toEqual({ role: 'assistant', content: injected });
+    // 存储时带来源：解密后最后一条 assistant 标 source: 'interpretation'，前一条 user 不带 source
+    const [row] = await getDb().select().from(assistantConversations)
+      .where(and(eq(assistantConversations.tenantId, acme), eq(assistantConversations.id, id!)));
+    const stored = JSON.parse((await decryptForTenant(acme, ASSISTANT_CONTEXT, row.sealed)).body).messages;
+    expect(stored.at(-1)).toEqual({ role: 'assistant', content: injected, source: 'interpretation' });
+    expect(stored.at(-2).role).toBe('user');
+    expect('source' in stored.at(-2)).toBe(false);
 
     const requests = fakeModel(['好的']);
     expect((await post(client, { conversationId: id, message: '接着说说', page: PAGE })).status).toBe(200);
