@@ -129,7 +129,7 @@ export async function fillEmbeddings(tenantId: string): Promise<void> {
     const missing = wanted.filter(r => !existing.has(r.textHash));
     for (let i = 0; i < missing.length; i += batchSize) {
       const batch = missing.slice(i, i + batchSize);
-      const vectors = await embedWith(tenantId, provider, batch.map(r => r.text));
+      const vectors = await embedWith(tenantId, provider, batch.map(r => r.text), { retry: true });
       await storeCall(() => store.upsert(provider.model, batch.map((r, j) => ({ textHash: r.textHash, vector: vectors[j] }))));
     }
     await storeCall(() => store.deleteOtherModels(provider.model));

@@ -14,15 +14,16 @@ import { acceptProposal, rejectProposal } from '../../app/.server/knowledge/prop
 import { IMPORT_GENERATOR_VERSION } from '../../app/.server/knowledge/import-draft';
 import { ImportError, importFromSource } from '../../app/.server/knowledge/import';
 import { saveKnowledgeSource } from '../../app/.server/knowledge/sources';
-import { setLlmFetch } from '../../app/.server/llm';
+import { setLlmFetch, setLlmSleep } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { fakeLlm, json, platformDefault } from './llm-fixtures';
 
 afterAll(async () => { await closeDb(); });
-beforeEach(async () => { await resetDb(); });
-afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); });
+// 500 时 chatJson 会重试 1 次（#1215）：等待换成立即返回
+beforeEach(async () => { await resetDb(); setLlmSleep(() => Promise.resolve()); });
+afterEach(() => { setLlmFetch(undefined); setLlmSleep(undefined); vi.unstubAllEnvs(); });
 
 const REVENUE = 'base: order\nmeasure: { agg: sum, field: amount }\ndescription: 实付金额\n';
 const USAGE = { prompt_tokens: 500, completion_tokens: 80 };
@@ -247,7 +248,7 @@ describe('把知识来源解析成知识提案', () => {
     vi.stubEnv('LLM_API_KEY', '');
     const none = await failure(importFromSource(analyst, source.id));
     expect(none).toMatchObject({ status: 409, message: expect.stringContaining('未配置模型服务') });
-    expect(await calls(acme)).toHaveLength(1); // 409 不发请求，llm_calls 只有 500 那条失败记录
+    expect(await calls(acme)).toHaveLength(2); // 409 不发请求，llm_calls 只有 500 那次的两次尝试（重试 1 次，#1215）
     await expect(importFromSource(analyst, '00000000-0000-0000-0000-000000000000')).rejects.toMatchObject({ status: 400, message: '没有这个来源' });
   });
 });

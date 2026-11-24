@@ -8,7 +8,7 @@ import { cmp } from '../../app/lib/compare';
 import { refreshProjection } from '../../app/.server/catalog/projection';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { catalogEmbeddings, catalogProjection, llmCalls, modelProviders, tasks } from '../../app/.server/db/schema';
-import { MODEL_PROVIDER_CONTEXT, setLlmFetch } from '../../app/.server/llm';
+import { MODEL_PROVIDER_CONTEXT, setLlmFetch, setLlmSleep } from '../../app/.server/llm';
 import { encryptForTenant } from '../../app/.server/secrets';
 import { enqueueTask } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
@@ -16,8 +16,10 @@ import { drain, newTenant } from './fixtures';
 import { embeddings, fakeLlm, platformEmbedding, type LlmBody } from './llm-fixtures';
 
 afterAll(async () => { await closeDb(); });
-beforeEach(async () => { await resetDb(); });
-afterEach(() => { vi.useRealTimers(); setLlmFetch(undefined); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+/** 补算逐批重试前的等待（#1215）：记下毫秒数、不真等 */
+let waits: number[] = [];
+beforeEach(async () => { await resetDb(); waits = []; setLlmSleep(ms => { waits.push(ms); return Promise.resolve(); }); });
+afterEach(() => { vi.useRealTimers(); setLlmFetch(undefined); setLlmSleep(undefined); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 /** 当前环境下的批大小（没设 LLM_EMBEDDING_BATCH_SIZE 时是默认 10） */
 const EMBED_BATCH = embedBatchSize();
@@ -161,7 +163,7 @@ describe('检索向量缓存', () => {
     expect((await readEmbeddings(globex, 'text-embedding-v3', hashes)).size).toBe(hashes.length);
   });
 
-  it('embedding 请求失败时任务仍结束、已存的向量不动、调用日志记 error；llm_calls 只记条数与 token、不记文本', async () => {
+  it('embedding 请求失败（重试 1 次仍失败）时任务仍结束、已存的向量不动、两次尝试各记一行 error；llm_calls 只记条数与 token、不记文本', async () => {
     const acme = await setup();
     platformEmbedding();
     fakeLlm(setLlmFetch, byLength);
@@ -182,7 +184,7 @@ describe('检索向量缓存', () => {
     const logs = await callLogs(acme);
     expect(logs.filter(l => l.error === null)).toHaveLength(okBatches.length);
     const failed = logs.filter(l => l.error !== null);
-    expect(failed).toHaveLength(1);
+    expect(failed.map(l => l.attempt).sort()).toEqual([1, 2]); // 失败的那批重试了 1 次（#1215）
     expect(failed[0]).toMatchObject({
       purpose: 'embedding', model: 'text-embedding-v3', inputCount: EMBED_BATCH,
       promptTokens: null, completionTokens: null, schemaValid: null,
@@ -190,6 +192,21 @@ describe('检索向量缓存', () => {
     expect(failed[0].error).toContain('HTTP 500');
     expect(JSON.stringify(failed[0])).not.toContain('假条目');
     expect(JSON.stringify(failed[0])).not.toContain('capability:');
+  });
+
+  it('某批第 1 次 503、重试成功时任务结束后向量全部写好，只等 1 次（#1215）', async () => {
+    const acme = await setup();
+    platformEmbedding();
+    const { received } = fakeLlm(setLlmFetch, (n, body) => (n === 2 ? new Response('busy', { status: 503 }) : byLength(n, body)));
+    expect(await ensureEmbeddings(acme)).toBe('queued');
+    await drain();
+    const texts = await projectionTexts(acme);
+    expect(received).toHaveLength(batches(texts.length).length + 1);
+    expect(await embeddingRows(acme)).toHaveLength(texts.length);
+    expect(waits).toHaveLength(1);
+    const logs = await callLogs(acme);
+    expect(logs.filter(l => l.error !== null).map(l => l.attempt)).toEqual([1]);
+    expect(logs.filter(l => l.attempt === 2)).toHaveLength(1);
   });
 
   it('某一批失败就停（不删旧行、保留已写好的批次），恢复后再补算一次补齐并清掉旧模型的行', async () => {
@@ -207,7 +224,8 @@ describe('检索向量缓存', () => {
     const failing = fakeLlm(setLlmFetch, (n, body) => (n === 1 ? byLength(n, body) : new Response('server exploded', { status: 500 })));
     expect(await ensureEmbeddings(acme)).toBe('queued');
     await drain();
-    expect(failing.received.map(r => r.body.input.length)).toEqual(batches(stored.length + 1).slice(0, 2)); // 第一批成功、第二批失败就停
+    const [first, second] = batches(stored.length + 1);
+    expect(failing.received.map(r => r.body.input.length)).toEqual([first, second, second]); // 第一批成功、第二批重试 1 次仍失败就停（#1215）
     expect(failing.received.every(r => r.body.model === 'bge-m3')).toBe(true); // 一次补算只用一个模型
     expect(warn).toHaveBeenCalled(); // 结束钩子打日志，任务仍是 succeeded
     const partial = await embeddingRows(acme);

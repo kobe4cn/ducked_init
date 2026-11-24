@@ -10,7 +10,7 @@ import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, modelProviders } from '../../app/.server/db/schema';
-import { chatJson, chatTools, embed, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch } from '../../app/.server/llm';
+import { chatJson, chatTools, embed, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch, setLlmSleep } from '../../app/.server/llm';
 import { ModelProviderError, resetModelProvider, resetTierProvider, saveModelProvider, saveTierProvider, tableContextFor } from '../../app/.server/model-provider';
 import { encryptForTenant } from '../../app/.server/secrets';
 import { syncSource } from '../../app/.server/source-sync';
@@ -21,8 +21,10 @@ import { embeddings, fakeLlm, json, platformDefault, platformEmbedding, platform
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
-beforeEach(async () => { await resetDb(); });
-afterEach(() => { setLlmFetch(undefined); vi.unstubAllEnvs(); });
+/** 重试前的等待（#1215）：记下毫秒数、不真等 */
+let waits: number[] = [];
+beforeEach(async () => { await resetDb(); waits = []; setLlmSleep(ms => { waits.push(ms); return Promise.resolve(); }); });
+afterEach(() => { setLlmFetch(undefined); setLlmSleep(undefined); vi.unstubAllEnvs(); });
 
 const SCHEMA = { type: 'object', required: ['table'], properties: { table: { type: 'string' } } };
 /** chatJson 发出的 response_format：SCHEMA 以 json_schema 发出，name 是用途（#1191） */
@@ -262,13 +264,13 @@ describe('模型服务客户端', () => {
     expect(received).toHaveLength(4);
   });
 
-  it('HTTP 500 时不回退 json_object：只发一次请求，抛 transient 错误（#1191）', async () => {
+  it('HTTP 500 时不回退 json_object：重试的那次仍发 json_schema，共 2 次请求，抛 transient 错误（#1191、#1215）', async () => {
     const acme = await newTenant('acme');
     platformDefault(BASE_WITH_SLASH);
     const { received } = fakeLlm(setLlmFetch, () => new Response('upstream failed', { status: 500 }));
 
-    const err = await failure(chatJson(acme, 'connectivity', MESSAGES, SCHEMA));
-    expect(received).toHaveLength(1);
+    const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA));
+    expect(received.map(r => r.body.response_format)).toEqual([asSchema('mapping_draft'), asSchema('mapping_draft')]);
     expect(err).toBeInstanceOf(LlmError);
     expect((err as LlmError).transient).toBe(true);
   });
@@ -564,7 +566,7 @@ describe('按用途选档位（ADR-0055）', () => {
     expect(logged).not.toContain('sk-tenant-reasoning-secret');
   });
 
-  it('配了档位、返回 500 或 429 时只发一次请求，抛 transient 的 LlmError，不换模型不重试', async () => {
+  it('配了档位、返回 500 或 429 时同一档位模型重试 1 次共 2 次请求，抛 transient 的 LlmError，不换模型（#1215）', async () => {
     const acme = await newTenant('acme');
     platformDefault(BASE_WITH_SLASH);
     platformTier('reasoning', 'qwen-max');
@@ -575,8 +577,8 @@ describe('按用途选档位（ADR-0055）', () => {
       expect(err).toBeInstanceOf(LlmError);
       expect(err.transient).toBe(true);
       expect(err.message).toMatch(new RegExp(String(status)));
-      expect(f).toHaveBeenCalledTimes(1);
-      expect(received[0].body.model).toBe('qwen-max');
+      expect(f).toHaveBeenCalledTimes(2);
+      expect(received.map(r => r.body.model)).toEqual(['qwen-max', 'qwen-max']);
       const rows = await calls(acme);
       expect(rows.at(-1)).toMatchObject({ model: 'qwen-max', route: 'reasoning', fallbackReason: null, error: expect.stringMatching(new RegExp(String(status))) });
     }
@@ -592,6 +594,102 @@ describe('按用途选档位（ADR-0055）', () => {
     await expect(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)).rejects.toThrow(/未配置模型服务/);
     expect(f).not.toHaveBeenCalled();
     expect(await calls(acme)).toHaveLength(0);
+  });
+});
+
+describe('transient 错误重试 1 次（#1215）', () => {
+  const attempts = async (tenantId: string) => (await calls(tenantId)).sort((a, b) => a.attempt - b.attempt);
+
+  it('第 1 次 503、第 2 次 200 时拿到结果：llm_calls 两行 attempt 1、2，第 1 行带 error；只等 1 次，1–3 秒', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, n => n === 1 ? new Response('busy', { status: 503 }) : json({ table: 'orders' }, USAGE));
+
+    expect(await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
+    expect(received).toHaveLength(2);
+    const rows = await attempts(acme);
+    expect(rows).toMatchObject([
+      { attempt: 1, error: expect.stringMatching(/503/), promptTokens: null },
+      { attempt: 2, error: null, schemaValid: true, promptTokens: 120 },
+    ]);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toBeGreaterThanOrEqual(1000);
+    expect(waits[0]).toBeLessThanOrEqual(3000);
+  });
+
+  it('两次都 503 时抛 transient 的 LlmError：正好 2 次请求、2 行', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, () => new Response('busy', { status: 503 }));
+
+    const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)) as LlmError;
+    expect(err).toBeInstanceOf(LlmError);
+    expect(err.transient).toBe(true);
+    expect(err.message).toMatch(/503/);
+    expect(received).toHaveLength(2);
+    expect((await attempts(acme)).map(r => r.attempt)).toEqual([1, 2]);
+  });
+
+  it('第 1 次 429 也重试，第 2 次成功拿到结果', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, n => n === 1 ? new Response('slow down', { status: 429 }) : json({ table: 'orders' }));
+
+    expect(await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
+    expect(received).toHaveLength(2);
+  });
+
+  it('网络错误（连不上）也重试', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, n => { if (n === 1) throw new TypeError('fetch failed'); return json({ table: 'orders' }); });
+
+    expect(await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
+    expect(received).toHaveLength(2);
+  });
+
+  it('超时不重试：只发 1 次请求、不等待，错误带 timeout', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, () => { throw new DOMException('signal timed out', 'TimeoutError'); });
+
+    const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)) as LlmError;
+    expect(err.transient).toBe(true);
+    expect(err.timeout).toBe(true);
+    expect(received).toHaveLength(1);
+    expect(waits).toEqual([]);
+    expect((await calls(acme)).map(r => r.attempt)).toEqual([1]);
+  });
+
+  it('401（非 429 的 4xx）不重试：只发 1 次', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, () => new Response('bad key', { status: 401 }));
+
+    const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)) as LlmError;
+    expect(err.transient).toBe(false);
+    expect(received).toHaveLength(1);
+    expect(waits).toEqual([]);
+  });
+
+  it('connectivity 用途 503 时不重试：只发 1 次，如实反映这一次请求', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, () => new Response('busy', { status: 503 }));
+
+    await failure(chatJson(acme, 'connectivity', MESSAGES, SCHEMA));
+    expect(received).toHaveLength(1);
+    expect(waits).toEqual([]);
+  });
+
+  it('chatTools（助手）503 时不重试：只发 1 次', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, () => new Response('busy', { status: 503 }));
+
+    await failure(chatTools(acme, 'assistant', MESSAGES, [{ name: 'lookup_metric', description: '查指标', parameters: { type: 'object' } }]));
+    expect(received).toHaveLength(1);
+    expect(waits).toEqual([]);
   });
 });
 
