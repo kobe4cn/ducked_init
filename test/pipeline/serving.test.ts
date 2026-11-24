@@ -286,12 +286,14 @@ describe('自动重建服务库', () => {
       return (await currentServingStore(acme))!.snapshots.find(s => s.template === 'rfm')!;
     };
 
-    // 统计日早一天、刚登记的回刷快照：服务库仍用统计日为当天的那张（publishedDefinitions 里 runTask 跑出的）
-    await register(new Date(Date.now() - 86_400_000).toISOString().slice(0, 10), 'backfill');
+    // 统计日都从 rfm 自己的 asOf 推，不再取当前时钟：用例跨 UTC 零点时「前一天」会和 rfm 落在同一统计日
+    const asOf = (rfm.params as { asOf: string }).asOf;
+    // 统计日早一天、刚登记的回刷快照：服务库仍用 publishedDefinitions 里 runTask 跑出的那张
+    await register(new Date(Date.parse(asOf) - 86_400_000).toISOString().slice(0, 10), 'backfill');
     expect((await rebuild()).id).toBe(rfm.id);
 
     // 同一统计日、登记更晚的另一张：服务库换成它
-    const later = await register(todayUtc(), 'manual');
+    const later = await register(asOf, 'manual');
     expect((await rebuild()).id).toBe(later.id);
   });
 
