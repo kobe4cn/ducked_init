@@ -43,7 +43,7 @@ import { parseEnv, promisify } from "node:util";
 import * as sandcastle from "@ai-hero/sandcastle";
 import { podman } from "@ai-hero/sandcastle/sandboxes/podman";
 import {
-  AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, usageTable,
+  AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, sessionPeak, usageTable,
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
 import { blockersOf, changedFiles, type FlakySighting, flakyTickets, flakyTriage, splitChildren } from "./guide.ts";
@@ -628,19 +628,13 @@ function plan(running: ReadonlySet<string>, slots: number, quiet = false): Issue
   return picked;
 }
 
-/** 每次迭代结束时的上下文大小（最后一条 assistant 消息的输入 token）。 */
 /** implement 的几次会话合在一起（每次会话单独挑档案，分开跑）。 */
 type Sessions = { iterations: sandcastle.IterationResult[]; stdout: string; completionSignal?: string };
 const peakContext = (...runs: ({ readonly iterations: readonly sandcastle.IterationResult[] } | undefined)[]) =>
   Math.max(
     0,
-    ...runs.flatMap((run) =>
-      (run?.iterations ?? []).map((it) =>
-        it.usage
-          ? it.usage.inputTokens + it.usage.cacheCreationInputTokens + it.usage.cacheReadInputTokens
-          : 0,
-      ),
-    ),
+    // 每次会话取会话文件里单条消息的最大上下文；只看结束时的大小会漏掉中途压缩前的峰值。
+    ...runs.flatMap((run) => (run?.iterations ?? []).map(sessionPeak)),
   );
 
 const tagged = (stdout: string, tag: string) =>

@@ -320,6 +320,8 @@ export interface UsageRecord {
   readonly cacheCreation: number;
   readonly cacheRead: number;
   readonly output: number;
+  /** 这次 run 里单条消息的最大上下文（输入 + 缓存写 + 缓存读），预算看的就是它；会话中途压缩过时比结束时的大得多。 */
+  readonly peak: number;
 }
 
 /**
@@ -327,7 +329,7 @@ export interface UsageRecord {
  * IterationResult.usage 只是最后一条消息的快照，不能当总数用；没有会话文件时退回用它。
  */
 function sessionTotals(it: sandcastle.IterationResult) {
-  const zero = { input: 0, cacheCreation: 0, cacheRead: 0, output: 0 };
+  const zero = { input: 0, cacheCreation: 0, cacheRead: 0, output: 0, peak: 0 };
   if (it.sessionFilePath && existsSync(it.sessionFilePath)) {
     const byId = new Map<string, Record<string, number>>();
     for (const line of readFileSync(it.sessionFilePath, "utf8").split("\n")) {
@@ -345,18 +347,30 @@ function sessionTotals(it: sandcastle.IterationResult) {
       sum.cacheCreation += u.cache_creation_input_tokens ?? 0;
       sum.cacheRead += u.cache_read_input_tokens ?? 0;
       sum.output += u.output_tokens ?? 0;
+      sum.peak = Math.max(sum.peak, (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0));
     }
     return sum;
   }
   const u = it.usage;
-  return u ? { input: u.inputTokens, cacheCreation: u.cacheCreationInputTokens, cacheRead: u.cacheReadInputTokens, output: u.outputTokens } : zero;
+  return u
+    ? {
+        input: u.inputTokens, cacheCreation: u.cacheCreationInputTokens, cacheRead: u.cacheReadInputTokens, output: u.outputTokens,
+        peak: u.inputTokens + u.cacheCreationInputTokens + u.cacheReadInputTokens,
+      }
+    : zero;
 }
+
+/** 一次会话的上下文峰值：会话文件里单条 assistant 消息的最大上下文；没有会话文件时退回最后一条消息（只是结束时的大小）。 */
+export const sessionPeak = (it: sandcastle.IterationResult) => sessionTotals(it).peak;
 
 /** 记一次 run 的用量：追加到 .sandcastle/logs/usage.jsonl 并返回，调用方收集起来写进 PR。写不进只警告。 */
 export function recordUsage(issue: string, phase: Phase, run: AgentRun, name: string, profile: Profile): UsageRecord {
   const totals = run.iterations.map(sessionTotals).reduce(
-    (a, b) => ({ input: a.input + b.input, cacheCreation: a.cacheCreation + b.cacheCreation, cacheRead: a.cacheRead + b.cacheRead, output: a.output + b.output }),
-    { input: 0, cacheCreation: 0, cacheRead: 0, output: 0 },
+    (a, b) => ({
+      input: a.input + b.input, cacheCreation: a.cacheCreation + b.cacheCreation, cacheRead: a.cacheRead + b.cacheRead, output: a.output + b.output,
+      peak: Math.max(a.peak, b.peak),
+    }),
+    { input: 0, cacheCreation: 0, cacheRead: 0, output: 0, peak: 0 },
   );
   const record: UsageRecord = {
     at: new Date().toISOString(), issue, phase, run: name, profile: profile.name, model: profile.model,
@@ -376,6 +390,6 @@ const k = (n: number) => `${(n / 1000).toFixed(1)}k`;
 /** PR 正文里的用量表：每次 run 一行，只记 token 数（别家档案的「费用」是按 Claude 单价算的，没有意义）。 */
 export function usageTable(records: readonly UsageRecord[]): string {
   if (records.length === 0) return "（没有记录到用量）";
-  const rows = records.map((r) => `| ${r.run} | ${r.profile}（${r.model}） | ${r.sessions} | ${k(r.input)} | ${k(r.cacheCreation)} | ${k(r.cacheRead)} | ${k(r.output)} |`);
-  return ["| 会话 | 档案 | 次数 | 输入 | 缓存写 | 缓存读 | 输出 |", "|---|---|---|---|---|---|---|", ...rows].join("\n");
+  const rows = records.map((r) => `| ${r.run} | ${r.profile}（${r.model}） | ${r.sessions} | ${k(r.input)} | ${k(r.cacheCreation)} | ${k(r.cacheRead)} | ${k(r.output)} | ${k(r.peak)} |`);
+  return ["| 会话 | 档案 | 次数 | 输入 | 缓存写 | 缓存读 | 输出 | 上下文峰值 |", "|---|---|---|---|---|---|---|---|", ...rows].join("\n");
 }

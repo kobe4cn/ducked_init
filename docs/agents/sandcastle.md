@@ -112,7 +112,8 @@ Sandcastle 处理期间，PR 作者不要往这个分支推提交。本地和远
 - 编码规范：reviewer 按 `.sandcastle/CODING_STANDARDS.md` 和根目录的 `CODING_STANDARDS.md` 审，implementer 提交前按这两份自查。review 里反复出现的问题补进 `.sandcastle/CODING_STANDARDS.md`。
 - 每个会话设 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=150000`，用别家模型时也一样（见「模型配置」）。真正保证预算的是 prep 把票切小（`docs/agents/ticket-sizing.md`）。
 - implementer 不跑完整测试（沙箱里很慢），完整测试由门槛跑。
-- PR 正文的 **Budget** 一节记录上下文峰值，超过 150k 时会标出来。
+- PR 正文的 **Budget** 一节记录上下文峰值，超过 150k 时会标出来。峰值取会话文件里单条消息的最大上下文（输入 + 缓存写 + 缓存读），不是会话结束时的大小：中途自动压缩过的会话，结束时只剩几十 k。每次 run 的峰值也写进 `.sandcastle/logs/usage.jsonl` 的 `peak` 字段和 PR 的 Usage 表。
+- 自动压缩管不住单次工具结果过大的情况，压缩只发生在两轮之间。2026-11-17 到 11-22 的 glm 档案在 review 阶段 Read 浏览器截图时，上报的上下文会从约 100k 一下跳到 200k 以上（`.browser-check/*.png`），这 22 个会话就是那周所有超过 150k 的会话；同期 opus 各阶段峰值最高 116k（implement），prep、review 不超过 87k。再启用 glm 档案前先确认这个问题。
 
 ## 模型配置
 
