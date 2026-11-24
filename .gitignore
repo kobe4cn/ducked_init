@@ -20,6 +20,7 @@ scripts/eval-requirements/out/
 scripts/eval-assertions/out/
 scripts/eval-workbench-draft/out/
 scripts/eval-interpret/out/
+scripts/eval-knowledge-import/out/
 
 # Sandcastle 沙箱里的浏览器验收：截图与结论（由 .sandcastle/main.ts 拷出附到 PR），playwright-cli 的会话文件
 .browser-check/
