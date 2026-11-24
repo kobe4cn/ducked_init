@@ -358,8 +358,10 @@ function dropNullOptionals(value: unknown, errors: ErrorObject[] | null | undefi
 }
 
 /** 发给模型前从 Schema 里剥掉的关键字：条件与组合（服务商不一定接受，Ollama 遇到会悄悄忽略整个约束）及引用 / 元信息；
- *  这些跨字段规则仍由 Ajv 用完整 Schema 校验（#1178、#1191） */
-export const MODEL_DROPPED_KEYS = new Set(['if', 'then', 'else', 'not', 'allOf', '$id', '$schema', '$ref']);
+ *  这些跨字段规则仍由 Ajv 用完整 Schema 校验（#1178、#1191）。uniqueItems / contains / minContains / maxContains 也剥掉：
+ *  DashScope 遇到 type 为 array 且带这几个关键字时整份 json_schema 回 400（实测 qwen-plus、qwen3.8-flash） */
+export const MODEL_DROPPED_KEYS = new Set(['if', 'then', 'else', 'not', 'allOf', '$id', '$schema', '$ref',
+  'uniqueItems', 'contains', 'minContains', 'maxContains']);
 
 /** Schema 的深拷贝，递归去掉 MODEL_DROPPED_KEYS；不改原 Schema。callModel 的 json_schema 与助手 validate_plan 的工具参数共用 */
 export function schemaForModel(schema: unknown): unknown {
@@ -368,9 +370,10 @@ export function schemaForModel(schema: unknown): unknown {
   return Object.fromEntries(Object.entries(schema).filter(([k]) => !MODEL_DROPPED_KEYS.has(k)).map(([k, v]) => [k, schemaForModel(v)]));
 }
 
-/** 拒绝过 json_schema、退回 json_object 成功的端点与模型（键 `${baseUrl}|${model}`），之后直接发 json_object（ADR-0035 修订）。
- *  进程内缓存，setLlmFetch 时清空 */
-const jsonObjectOnly = new Set<string>();
+/** 拒绝过某份 json_schema、退回 json_object 成功的端点与模型（键 `${baseUrl}|${model}`）→ 被拒的那些 Schema（按对象身份），
+ *  之后这个端点 + 模型 + Schema 直接发 json_object（ADR-0035 修订）。按 Schema 记：服务商常常只拒某个关键字，
+ *  一份 Schema 被拒不该让同一模型的其他 Schema 也不发。进程内缓存，setLlmFetch 时清空 */
+const jsonObjectOnly = new Map<string, WeakSet<object>>();
 
 /**
  * 用给定的端点调用模型，返回按 schema 校验过的 JSON。不查库、不记日志（评测命令直接用它，产品走 chatJson）。
@@ -380,10 +383,10 @@ export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[]
   name = 'output'): Promise<T> {
   return masked(provider.apiKey, async () => {
     // 根是 object 的 Schema 剥掉条件关键字后以 json_schema（strict: false，现有 Schema 多不满足 strict）发给模型；
-    // 根不是 object（如根上 anyOf）或端点拒绝过时发 json_object。HTTP 400 / 422 时同一模型改发 json_object 一次，成功才记缓存
+    // 根不是 object（如根上 anyOf）或这个端点 + 模型拒绝过这份 Schema 时发 json_object。HTTP 400 / 422 时同一模型改发 json_object 一次，成功才记缓存
     const modelSchema = schemaForModel(schema);
     const key = `${provider.baseUrl}|${provider.model}`;
-    const asSchema = isRecord(modelSchema) && modelSchema.type === 'object' && !jsonObjectOnly.has(key);
+    const asSchema = isRecord(modelSchema) && modelSchema.type === 'object' && !jsonObjectOnly.get(key)?.has(schema);
     const jsonObject = () => postChat(provider, { messages, response_format: { type: 'json_object' } }, stats);
     let reply: RawMessage;
     if (!asSchema) reply = await jsonObject();
@@ -393,7 +396,7 @@ export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[]
       } catch (e) {
         if (!(e instanceof LlmError && (e.status === 400 || e.status === 422))) throw e;
         reply = await jsonObject();
-        jsonObjectOnly.add(key);
+        jsonObjectOnly.set(key, (jsonObjectOnly.get(key) ?? new WeakSet()).add(schema));
       }
     }
     const { content, finishReason } = reply;
