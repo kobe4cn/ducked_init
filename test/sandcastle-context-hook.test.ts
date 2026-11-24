@@ -68,6 +68,13 @@ describe('checkBudget：上下文到预算时要求收尾', () => {
     expect(reason).toContain('不要输出 <promise>COMPLETE</promise>');
   });
 
+  it('改文件的工具（Edit / Write 等）返回里的整份原文件不计入', () => {
+    const p = transcript('edit', [SOFT - 10_000]);
+    const big = { filePath: '/w/test/CATALOG.md', originalFile: 'x'.repeat(180_000) };
+    expect(checkBudget({ ...post(p, big), tool_name: 'Edit' }, env, new Map())).toBeUndefined();
+    expect(checkBudget({ ...post(p, big), tool_name: 'Bash' }, env, new Map())).toBeDefined();
+  });
+
   it('同一会话每多 10k 才再提醒；越过 HARD 时一定提醒并要求立刻结束', () => {
     const state = new Map();
     expect(checkBudget(post(transcript('a', [SOFT + 1_000])), env, state)).toBeDefined();

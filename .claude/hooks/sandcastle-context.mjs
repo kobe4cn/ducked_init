@@ -42,7 +42,11 @@ export function lastContext(transcriptPath, tailBytes = 512 * 1024) {
 }
 
 /** 刚返回的工具结果大约多少 token：按 3 个字符 1 个 token 粗估（中文偏多时偏保守）。 */
-export const resultTokens = (response) => Math.ceil(JSON.stringify(response ?? '').length / 3);
+// 改文件的工具：hook 收到的 tool_response 带整份原文件（originalFile）和补丁，模型实际只看到一句「已修改」，按 0 算。
+//   不排除的话，改一下 test/CATALOG.md 这种大文件就会被估成 +60k，误报收尾（2026-11-24 #1268 实际 56k 时被报成 116k）。
+const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
+export const resultTokens = (response, toolName) =>
+  EDIT_TOOLS.has(toolName) ? 0 : Math.ceil(JSON.stringify(response ?? '').length / 3);
 
 const k = (n) => `${Math.round(n / 1000)}k`;
 
@@ -70,7 +74,7 @@ export function checkRead(input, env, state = new Map()) {
 /** 返回给 agent 的收尾要求；还没到预算返回 undefined。state 记这个会话上次在多大时提醒过。 */
 export function checkBudget(input, env, state) {
   if (!env.SANDCASTLE_PROFILE || input.agent_id) return undefined; // 子代理的上下文另算，它的结论回到主线程时由 Agent 工具的 PostToolUse 计入
-  const ctx = lastContext(input.transcript_path) + resultTokens(input.tool_response);
+  const ctx = lastContext(input.transcript_path) + resultTokens(input.tool_response, input.tool_name);
   if (ctx < SOFT) return undefined;
   const last = state.get(input.session_id) ?? 0;
   if (last && ctx < last + STEP && !(ctx >= HARD && last < HARD)) return undefined;
