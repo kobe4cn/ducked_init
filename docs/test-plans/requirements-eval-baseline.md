@@ -58,6 +58,24 @@ LLM_BASE_URL=… LLM_MODEL=qwen-plus LLM_API_KEY=… pnpm eval:requirements   # 
 
 合计行由两张表的条数加权算出（调参集 34 条、验收集 8 条）。#1226 之前（评测自拼提示词、不带 `PLAN_EXAMPLE`、没有修正回合，2026-11-24 用 qwen-plus 跑一次）模式正确率只有 12.5%，大多数条目在 Schema 就失败（缺 schemaVersion、reason 为空）。
 
+**draft_definition 类（#1227）**：有 `LLM_*` 时，评测在调参集、验收集两张表之后再打一张「计划模式（按期望模式，调参集 + 验收集）」表，每种期望模式一行（`plan-modes.ts`：draft_definition 19 条、clarify 9、unsupported 6、draft_query 5、reuse_result 3）。取上面同样 3 次运行里 draft_definition 行的模式正确率：
+
+| 期望模式 | 条数 | 模式正确率 | 目标 |
+|---|---|---|---|
+| draft_definition | 19 | x%–y%（3 次区间，待跑） | ≥ 60% |
+
+#1227 之前评测没有按期望模式分组的统计，只能从逐条输出里数。#1227 在 validate_plan 说明与能起草定义的角色的助手系统提示里加了选模式的规则（`PLAN_MODE_RULE`）：消费者粒度、可复用的口径（窗口 + 过滤）优先 draft_definition，只有跨粒度汇总或一次性查询才用 draft_query。
+
+**AI-PL2 重放（#1227）**：用例见 `docs/test-plans/acceptance-plan.md` 的 AI-PL2（「每个消费者近 180 天在京东渠道的消费金额」，期望 `draft_definition`）。方法照 `docs/ai-capability-audit-part2.md` §6.1：在 dev server（5180）上用 `an@fmcglab.test` 调 `POST /assistant`，每轮新开一个对话，跑 3 轮；可经 `scripts/llm-capture-proxy.ts` 记下请求。看返回的 `plan.mode`：
+
+| 轮次 | 计划模式 | 选中 / 起草的定义 | 判定 |
+|---|---|---|---|
+| 1 | 待跑 | 待跑 | 待跑 |
+| 2 | 待跑 | 待跑 | 待跑 |
+| 3 | 待跑 | 待跑 | 待跑 |
+
+判定：3 轮至少 2 轮是 draft_definition。#1227 之前（审计 §6.1，2026-11-24，qwen-plus）3/3 都是 draft_query 加工作台 SQL。
+
 ## 起草
 
 **待重测**：#1210 给 d 类的 hourly-orders、churn-forecast、revenue-yoy 补了 `kind: metric` 与 `expected_unsupported: true`，起草样例由 19 条变 22 条（调参集 17 → 19、验收集 2 → 3）。期望做不到的样例模型给出 unsupported（指标收拢后 `unsupported` 非空）记为通过、给出定义记为失败（失败于定义校验），不计结构项、不进命中率；普通样例模型给出 unsupported 记为失败于「模型判断做不到」并带原因，不再报「定义校验不过」。下表还是 #1210 之前的数，要用真实模型重跑。

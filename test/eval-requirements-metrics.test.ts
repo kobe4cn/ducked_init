@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import type { PlanMode } from '../app/.server/catalog/plan';
 import { GOLDEN_ALL } from '../scripts/eval-requirements/golden';
 import { PLAN_MODE_BY_ID, expectedMode } from '../scripts/eval-requirements/plan-modes';
-import { groupByType, retrievalRows, VIEWS, type RetrievalRow, type RetrievalVectors } from '../scripts/eval-requirements/retrieval';
+import { groupByMode, groupByType, retrievalRows, VIEWS, type RetrievalRow, type RetrievalVectors } from '../scripts/eval-requirements/retrieval';
 
 const row = (id: string, type: RetrievalRow['type'], recall: number | null, asked: boolean, shouldAsk: boolean, mode: PlanMode | null = null, expected: PlanMode = 'draft_query', planned = mode !== null,
   firstPass = false, passed = false): RetrievalRow =>
@@ -44,6 +44,20 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(g.c.modeAccuracy).toBe(0);
     expect(g.d.modeAccuracy).toBeNull();
     expect(g.合计.modeAccuracy).toBe(2 / 5);
+  });
+
+  it('按期望模式分组（#1227）：每种模式一组，模式正确率按该组跑过模型的条数算，没跑的组为 null，空组 cases 为 0', () => {
+    const g = groupByMode([
+      row('d1', 'a', null, false, false, 'draft_definition', 'draft_definition'), // 一致
+      row('d2', 'b', null, false, false, 'draft_query', 'draft_definition'), // 不一致
+      row('q1', 'a', null, false, false, null, 'draft_query'), // 没跑模型
+    ]);
+    expect(Object.keys(g).sort()).toEqual(['clarify', 'draft_definition', 'draft_query', 'reuse_result', 'unsupported']);
+    expect(g.draft_definition.cases).toBe(2);
+    expect(g.draft_definition.modeAccuracy).toBe(0.5);
+    expect(g.draft_query.cases).toBe(1);
+    expect(g.draft_query.modeAccuracy).toBeNull();
+    expect(g.reuse_result).toMatchObject({ cases: 0, modeAccuracy: null, firstPassRate: null, fixedPassRate: null });
   });
 
   it('首次合格率 / 修正后合格率：合格条数 / 跑过模型的条数（分母同模式正确率），没跑的不计入，一条都没跑为 null', () => {

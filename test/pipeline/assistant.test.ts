@@ -10,7 +10,7 @@ import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, dslVersions, llmCalls, mappingVersions } from '../../app/.server/db/schema';
 import { assistantTurn, ERROR_REPLY, MAX_FIXES, MAX_PLAN_SUMMARY, MAX_TOOL_CALLS, maxFixes, maxToolCalls } from '../../app/.server/assistant/loop';
-import { catalogFor, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
+import { catalogFor, PLAN_MODE_RULE, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { semanticHash, type AnalysisPlan } from '../../app/.server/catalog/plan';
 import { createDefinition, deleteDefinition, publishDefinition, saveDslDraft } from '../../app/.server/dsl-definitions';
 import { setLlmFetch } from '../../app/.server/llm';
@@ -87,6 +87,8 @@ describe('AI 助手的一轮问答', () => {
     expect(viewer).not.toContain('保存草稿');
     expect(viewer).not.toContain('保存后提醒成员');
     expect(viewer).not.toContain('由成员自己执行');
+    // 选模式的规则（#1227）只给能起草定义的角色
+    expect(viewer).not.toContain(PLAN_MODE_RULE);
 
     const analyst = await systemFor('an@acme.com', 'analyst');
     expect(analyst).not.toContain(SOURCES);
@@ -94,11 +96,13 @@ describe('AI 助手的一轮问答', () => {
     expect(analyst).toContain(PUBLISH);
     expect(analyst).toContain('保存后提醒成员草稿要由另一位有发布权限的成员发布');
     expect(analyst).toContain('由成员自己执行');
+    expect(analyst).toContain(PLAN_MODE_RULE);
 
     const admin = await systemFor('admin@acme.com', 'admin');
     expect(admin).not.toMatch(/这位成员(看不到|不能)/);
     expect(admin).toContain('保存后提醒成员草稿要由另一位有发布权限的成员发布');
     expect(admin).toContain('告诉成员去对应页面自己做');
+    expect(admin).toContain(PLAN_MODE_RULE);
   });
 
   it('一轮开始时解析一次档位模型，整轮所有请求都用它：中途改档位配置不影响本轮；llm_calls 每条都记 route reasoning', async () => {
