@@ -51,7 +51,7 @@ export function maxToolCalls(env: Record<string, string | undefined> = process.e
 export function maxFixes(env: Record<string, string | undefined> = process.env): number {
   return positiveIntEnv(env, 'ASSISTANT_MAX_FIXES', MAX_FIXES);
 }
-/** 本轮已有 valid 计划后，不计入 MAX_TOOL_CALLS 的 prefill_workbench 最多几次（#1180） */
+/** 本轮已有 valid 计划后，不计入工具调用上限（maxToolCalls()）的 prefill_workbench 最多几次（#1180） */
 const MAX_FREE_PREFILLS = 2;
 /** 超限后的总结请求失败时的答复 */
 const LIMIT_REPLY = '本轮工具调用次数用完，已保存目前的进展；回复『继续』可以接着做';
@@ -217,7 +217,7 @@ async function finishAtLimit(tenantId: string, route: LlmRoute, messages: LlmMes
 /**
  * 一轮问答：没配置模型服务 409；最近一次探测为不支持工具调用时 422（不发请求）；模型服务出错时本轮还没调用过工具 422，
  * 已调用过工具（含出错 / 被拒的调用）则返回 ERROR_REPLY 与本轮的 plan / workbenchSql / choices（#1209）；对话不合格 400。
- * 第 MAX_TOOL_CALLS 次工具调用之后模型还要调用工具时，没执行的调用回填「未执行」，再不带工具请求一次、用模型对进展与下一步的总结作答复
+ * 工具调用次数到本轮上限（maxToolCalls()，默认 MAX_TOOL_CALLS）之后模型还要调用工具时，没执行的调用回填「未执行」，再不带工具请求一次、用模型对进展与下一步的总结作答复
  * （#1180，这次请求失败时用 LIMIT_REPLY），plan / workbenchSql 照常返回；本轮 validate_plan 返回过 valid 后 prefill_workbench 最多免计 MAX_FREE_PREFILLS 次。
  * priorPlan 是对话里最近一份计划（ADR-0050）：不带进发给模型的历史，摘要拼在系统提示末尾、它的条目预先算作本轮已检索（#1179），
  * 并经 ToolCtx 给存草稿 / 填工作台前的重新校验兜底；
