@@ -4,16 +4,24 @@
 // 别名一路同分时先按别名以外的文字里的关键词命中数、再按标识排（多个近义指标挂同一别名很常见，按标识排会让近义项占第 1）；
 // 查询里的别名出现如果落在别的条目更长的名称命中里（名称在查询里按该条目自身文字往两边延长，如 order.channel 的「渠道」延长成「下单渠道」），就不算，与点名排除的「最长匹配」一致。
 // 作用域只加权不排除：成员这次明确说的（scope.subjects、scope.spaceIds、查询里出现的主题名）> 页面上下文 > 对话里已确定的主题 > 成员所属空间，
-// 一个条目只取命中的最高一级；不命中作用域的不扣分、不去掉。纯函数，不读库；能力条目不特殊处理，由调用方过滤
+// 一个条目只取命中的最高一级；不命中作用域的不扣分、不去掉。
+// 度量说法模式（#1192）：查询含 MEASURE_WORDS 里的词（金额、次数、人数……）时，外键字段（string、名字以 _id 结尾、不是本实体主键）不进关键词一路
+// （「消费金额」的「消费」会命中「消费者 ID」，把 customer_id 们推到前排），另加 measure 一路：已发布指标按它的度量字段（sum(amount) 的 amount）
+// 在关键词一路的命中数排，让「消费金额」找得到没写说明的 revenue_365d（已被标识、名称或别名命中的指标、度量字段名称被直接说出的、没说平均时的 avg 度量不进这一路，
+// 免得「近 30 天营收」「实付金额合计」这类已经点名的查询被它改了第 1 名）。不含度量词时这两处都不生效，排序与分数和原来逐项相同。纯函数，不读库；能力条目不特殊处理，由调用方过滤
 import { cmp } from '../../lib/compare';
 import { expand } from './expand';
-import { terms, type Catalog, type CatalogEntry } from './index';
+import { terms, type Catalog, type CatalogEntry, type MetricEntry } from './index';
 import type { ProjectionRow } from './projection';
 import type { VectorHit } from './vector';
 
 export const RRF_K = 60;
-// vector 放最后一个键：计分循环按 Object.keys(lanes) 遍历，放最后原有各路的理由顺序不变
-export const LANE_WEIGHTS = { id: 4, alias: 3, name: 2, keyword: 1, vector: 1 } as const;
+// vector、measure 放在最后：计分循环按 Object.keys(lanes) 遍历，放最后原有各路的理由顺序不变
+export const LANE_WEIGHTS = { id: 4, alias: 3, name: 2, keyword: 1, vector: 1, measure: 3 } as const;
+/** 度量说法：查询里含其中任一个时进度量说法模式。不收「消费」：「消费者」到处都是，会让问消费者的查询也进这个模式 */
+export const MEASURE_WORDS = ['金额', '营收', '收入', '销售额', '次数', '人数', '数量', '单数', '件数', '客单价'] as const;
+/** 说了平均：平均类度量（avg）才进度量说法一路 */
+export const AVERAGE_WORDS = ['平均', '均值', '人均', '客单价'] as const;
 /** 每一路最多取的名次 */
 export const LANE_LIMIT = 30;
 export const SCOPE_BOOST = { explicit: 1, page: 0.5, conversation: 0.25, member: 0.1 } as const;
@@ -83,6 +91,17 @@ function contained(entryId: string, texts: string[], q: string): LaneHit {
   return { entryId, score: matched[0]?.length ?? 0, matched };
 }
 
+/** 外键字段：string 类型、名字以 _id 结尾、不在本实体的主键里 */
+const isForeignKey = (e: CatalogEntry, entities: Map<string, string[]>) => e.kind === 'field' && e.type === 'string' && e.field.endsWith('_id')
+  && !(entities.get(e.entity) ?? []).includes(e.field);
+
+/** 指标的度量字段：依赖字段里属于基础实体、名字出现在度量文字（如 sum(amount)）里的 */
+const measureFields = (m: MetricEntry) => {
+  const names = new Set(m.measure.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []);
+  const prefix = `field:${m.base.slice(m.base.indexOf(':') + 1)}.`;
+  return m.dependencies.fields.filter(f => f.startsWith(prefix) && names.has(f.slice(prefix.length)));
+};
+
 const intersects = (a: readonly string[], b: ReadonlySet<string>) => a.some(x => b.has(x.toLowerCase()));
 
 export function rank(rows: ProjectionRow[], c: Catalog, query: string, scope: RankScope = {}, limit = 20, vector: VectorHit[] = []): Ranked[] {
@@ -94,8 +113,10 @@ export function rank(rows: ProjectionRow[], c: Catalog, query: string, scope: Ra
   });
   const presentIds = new Set(present.map(p => p.row.entryId));
   const words = terms(query);
-  const keywordHits = present.map(({ row: r }) => {
-    const matched = words.filter(w => r.text.includes(w));
+  const measureMode = MEASURE_WORDS.some(w => q.includes(w));
+  const entityKeys = new Map(c.entries.flatMap(e => (e.kind === 'entity' ? [[e.entity, e.key] as const] : [])));
+  const keywordHits = present.map(({ row: r, entry }) => {
+    const matched = measureMode && isForeignKey(entry, entityKeys) ? [] : words.filter(w => r.text.includes(w));
     return { entryId: r.entryId, score: matched.length, matched };
   });
   // 别名一路的次级比较：别名以外的文字里命中的关键词数。别名本身已经在别名一路记过分，再算进来会让只靠别名带上这个词的条目多一票
@@ -108,13 +129,30 @@ export function rank(rows: ProjectionRow[], c: Catalog, query: string, scope: Ra
   // 只用名称命中造跨度：别名命中不算（只能靠别名命中的条目不能被别人的说明文字压掉）
   const spans = present.flatMap(({ row: r, entry }, i) => (nameHits[i]!.score > 0 ? nameSpans(r.entryId, entry.name, r.text, q) : []));
 
+  const idHits = ordered(present.map(({ row: r }) => contained(r.entryId, [r.entryId, r.entryId.slice(r.entryId.indexOf(':') + 1)], q)));
+  const aliasHits = ordered(present.map(({ row: r }) => uncovered(contained(r.entryId, r.aliases, q), r.text, spans, q)), id => evidence.get(id) ?? 0);
+  const keywordScore = new Map(keywordHits.map(h => [h.entryId, h.score]));
+  // 度量说法一路：已发布指标按度量字段的关键词命中数排，同分按指标自身的关键词命中数、再按标识；matched 是命中了的度量字段。
+  // 度量字段的名称直接出现在查询里（「实付金额」）时成员说的是字段本身，这个字段不给指标加分；平均类度量只在查询说了平均时算（金额、次数、人数说的是合计）
+  const named = new Set(nameHits.filter(h => h.score > 0).map(h => h.entryId));
+  const namedHere = new Set([...named, ...idHits.map(h => h.entryId), ...aliasHits.map(h => h.entryId)]);
+  const wantsAverage = AVERAGE_WORDS.some(w => q.includes(w));
+  const measureHits = measureMode
+    ? present.flatMap(({ entry }) => {
+      if (entry.kind !== 'metric' || namedHere.has(entry.id) || (entry.measure.startsWith('avg(') && !wantsAverage)) return [];
+      const matched = measureFields(entry).filter(f => (keywordScore.get(f) ?? 0) > 0 && !named.has(f));
+      return [{ entryId: entry.id, score: Math.max(0, ...matched.map(f => keywordScore.get(f)!)), matched }];
+    })
+    : [];
+
   const lanes: Record<Lane, LaneHit[]> = {
-    id: ordered(present.map(({ row: r }) => contained(r.entryId, [r.entryId, r.entryId.slice(r.entryId.indexOf(':') + 1)], q))),
-    alias: ordered(present.map(({ row: r }) => uncovered(contained(r.entryId, r.aliases, q), r.text, spans, q)), id => evidence.get(id) ?? 0),
+    id: idHits,
+    alias: aliasHits,
     name: ordered(nameHits),
     keyword: ordered(keywordHits),
     // 向量一路的名次就是传入顺序（vectorLane 已按相似度排好）：过滤不在本目录里的 entryId，保持顺序截到 LANE_LIMIT；matched 是两位相似度
     vector: vector.filter(h => presentIds.has(h.entryId)).slice(0, LANE_LIMIT).map(h => ({ entryId: h.entryId, score: h.similarity, matched: [h.similarity.toFixed(2)] })),
+    measure: ordered(measureHits, id => keywordScore.get(id) ?? 0),
   };
 
   const fused = new Map<string, { score: number; reasons: HitReason[] }>();

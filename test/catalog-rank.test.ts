@@ -2,11 +2,12 @@
 // 另一个指标只有说明里有这个词：别名命中排在只有正文命中的前面；不给作用域、只给 memberSpaceId 时分数等于按常量算的 RRF；
 // 查询里说了主题名、scope.subjects 或 scope.spaceIds 给了其中一个时它排第一，另一个仍在结果里。
 // 别名一路同分时按别名以外的文字里的关键词命中数排；别名出现被别的条目更长的名称命中覆盖时不算（#400）。
+// 度量说法（#1192）：查询含度量词时外键字段不进关键词一路，度量字段被命中的指标进 measure 一路；不含度量词时两样都不生效。
 // 依赖展开（expand.ts）：带「近 7 天」时补锚点实体的时间字段，「每个城市」补锚点到 customer 的关系，都标 expand、排在直接命中之后；两种词都没有时与不截断的结果的前 limit 个相同
 import { describe, expect, it } from 'vitest';
 import { buildCatalog, type CatalogInput } from '../app/.server/catalog';
 import { deriveProjection } from '../app/.server/catalog/projection';
-import { LANE_WEIGHTS, RRF_K, SCOPE_BOOST, rank } from '../app/.server/catalog/rank';
+import { LANE_WEIGHTS, MEASURE_WORDS, RRF_K, SCOPE_BOOST, rank } from '../app/.server/catalog/rank';
 
 const SPACE_A = '00000000-0000-0000-0000-00000000000a';
 const SPACE_B = '00000000-0000-0000-0000-00000000000b';
@@ -108,9 +109,10 @@ describe('检索排序 rank()', () => {
     });
     const r = rank(deriveProjection(tie, 'full'), tie, '门店营收');
     expect(r.map(x => x.entry.id).slice(0, 3)).toEqual(['metric:zzz', 'metric:mmm', 'metric:aaa']);
-    // 关键词：zzz 命中 门店 / 店营 / 营收，mmm 命中 门店 / 营收，aaa 只命中 营收（与只命中「门店」的 order.channel、order.store_id 同分，按标识排第 5）
+    // 关键词：zzz 命中 门店 / 店营 / 营收，mmm 命中 门店 / 营收，aaa 只命中 营收（与只命中「门店」的 order.channel 同分，按标识排第 4；
+    // 「营收」是度量词，外键 order.store_id 不进关键词一路，#1192）
     expect(r[0]!.score).toBeCloseTo(rrf(LANE_WEIGHTS.alias, 1) + rrf(LANE_WEIGHTS.keyword, 1), 12);
-    expect(r[2]!.score).toBeCloseTo(rrf(LANE_WEIGHTS.alias, 3) + rrf(LANE_WEIGHTS.keyword, 5), 12);
+    expect(r[2]!.score).toBeCloseTo(rrf(LANE_WEIGHTS.alias, 3) + rrf(LANE_WEIGHTS.keyword, 4), 12);
   });
 
   it('别名一路的次级比较不算别名本身带来的关键词：只靠别名带上「营收」的条目不多占一票', () => {
@@ -152,5 +154,29 @@ describe('检索排序 rank()', () => {
     // 查询没有被更长名称覆盖时别名照常命中
     expect(rank(deriveProjection(ch, 'full'), ch, '各渠道触达次数').find(x => x.entry.id === 'field:touch.channel')?.reasons)
       .toContainEqual({ lane: 'alias', matched: ['渠道'] });
+  });
+
+  /** spend 是 sum(amount)、没写说明：检索文字里没有「消费金额」，只能靠度量字段 order.amount 被命中 */
+  const spendCatalog = buildCatalog({ definitions: [{ kind: 'metric', key: 'spend', version: 1, yaml: 'base: order\nmeasure: { agg: sum, field: amount }\n', spaceId: SPACE_A }] });
+  const spendRows = deriveProjection(spendCatalog, 'full');
+  const lanesOf = (r: ReturnType<typeof rank>, id: string) => r.find(x => x.entry.id === id)?.reasons.map(h => h.lane) ?? [];
+
+  it('度量说法：含「金额」时外键字段不进关键词一路，度量字段被命中的指标进 measure 一路、理由列出度量字段', () => {
+    expect(MEASURE_WORDS).toContain('金额');
+    const r = rank(spendRows, spendCatalog, '消费金额', {}, 10_000);
+    expect(r[0]!.entry.id).toBe('metric:spend');
+    expect(r[0]!.reasons).toEqual([{ lane: 'measure', matched: ['field:order.amount'] }]);
+    expect(r[0]!.score).toBeCloseTo(rrf(LANE_WEIGHTS.measure, 1), 12);
+    // customer_id 的「消费者 ID」只靠「消费」命中：外键不进关键词一路
+    for (const id of ['field:order.customer_id', 'field:coupon.customer_id', 'field:consent.customer_id']) expect(lanesOf(r, id), id).not.toContain('keyword');
+    expect(lanesOf(r, 'field:order.amount')).toContain('keyword');
+  });
+
+  it('度量说法：不含度量词时外键字段照旧进关键词一路，没有 measure 一路', () => {
+    const r = rank(spendRows, spendCatalog, '消费', {}, 10_000);
+    expect(MEASURE_WORDS.some(w => '消费'.includes(w))).toBe(false);
+    expect(r.flatMap(x => x.reasons).filter(h => h.lane === 'measure')).toEqual([]);
+    expect(lanesOf(r, 'field:order.customer_id')).toEqual(['keyword']);
+    expect(r.map(x => x.entry.id)).not.toContain('metric:spend');
   });
 });

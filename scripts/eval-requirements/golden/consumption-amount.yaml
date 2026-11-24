@@ -1,0 +1,7 @@
+request: 消费金额
+failure_type: a
+retrieval:
+  candidates: [metric:revenue_365d, metric:revenue_30d]
+  forbidden: []
+  ambiguous: true
+clarify: 消费金额按近 30 天还是近一年算？按下单时间还是支付时间？含不含已退款的订单？

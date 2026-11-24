@@ -45,16 +45,16 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(g.合计.modeAccuracy).toBe(2 / 5);
   });
 
-  it('真实黄金集：合计 Recall@20 与 retrieval-golden 的汇总一致，应追问 12 条、判出 8 条（4 条不是检索歧义），验收集 8 条', () => {
+  it('真实黄金集：合计 Recall@20 与 retrieval-golden 的汇总一致，应追问 13 条、判出 8 条（4 条不是检索歧义，consumption-amount 是 KNOWN_GAPS），验收集 8 条', () => {
     const rows = retrievalRows(GOLDEN_ALL);
     const total = groupByType(rows).合计;
-    expect(total.cases).toBe(40);
+    expect(total.cases).toBe(42);
     expect(total.recall).toBeGreaterThanOrEqual(0.96);
-    expect(total.recall!.toFixed(4)).toBe('0.9615');
-    expect(rows.filter(r => r.shouldAsk)).toHaveLength(12);
+    expect(total.recall!.toFixed(4)).toBe('0.9634');
+    expect(rows.filter(r => r.shouldAsk)).toHaveLength(13);
     expect(rows.filter(r => r.asked)).toHaveLength(8);
-    expect(total.clarifyRecall).toBe(8 / 12);
-    expect(total.clarifyAccuracy).toBe(36 / 40);
+    expect(total.clarifyRecall).toBe(8 / 13);
+    expect(total.clarifyAccuracy).toBe(37 / 42);
     // 没跑模型：每条的 planned 为 false、mode 为 null，正确率不可算
     expect(rows.every(r => !r.planned && r.mode === null)).toBe(true);
     expect(rows.every(r => r.expectedMode === PLAN_MODE_BY_ID[r.id])).toBe(true);
@@ -62,7 +62,7 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(rows.filter(r => r.holdout)).toHaveLength(8);
   });
 
-  it('带手工构造的向量：KNOWN_GAPS 里 churn-forecast 的候选进前 20、合计 Recall@20 比不带时高；不带向量仍为 0.9615', () => {
+  it('带手工构造的向量：KNOWN_GAPS 里 churn-forecast 的候选进前 20、合计 Recall@20 比不带时高；不带向量仍为 0.9634', () => {
     // 期望条目 metric:days_since_last_order 的所有视图行向量 [1, 0]、其余行 [0, 1]（正交、相似度 0），
     // 查询向量只给 churn-forecast 一条 [1, 0]：只有它的检索走向量一路，其余条目与不带向量时完全相同
     const rows = new Map<string, number[]>();
@@ -74,10 +74,10 @@ describe('eval:requirements 的检索与追问指标', () => {
     const vectors: RetrievalVectors = { rows, queries: new Map([['churn-forecast', [1, 0]]]) };
     const plain = retrievalRows(GOLDEN_ALL);
     const withVector = retrievalRows(GOLDEN_ALL, vectors);
-    expect(groupByType(plain).合计.recall!.toFixed(4)).toBe('0.9615');
+    expect(groupByType(plain).合计.recall!.toFixed(4)).toBe('0.9634');
     expect(withVector.find(r => r.id === 'churn-forecast')!.recall!).toBe(1);
     expect(plain.find(r => r.id === 'churn-forecast')!.recall!).toBe(0);
-    expect(groupByType(withVector).合计.recall!).toBeGreaterThan(0.9615);
+    expect(groupByType(withVector).合计.recall!).toBeGreaterThan(0.9634);
   });
 
   it('计划模式期望：PLAN_MODE_BY_ID 覆盖全部条目且没有多余 id，d 类是 unsupported、其余标注追问的是 clarify、有期望定义的是 draft_definition、手工标的 reuse_result 与查看者问血缘的 unsupported，五种模式至少出现四种', () => {

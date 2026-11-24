@@ -10,6 +10,13 @@ import { CATALOG_INPUT, SPACE } from './golden';
 
 /** 额外的已发布定义（键 → 种类与 YAML），都要能对着 CONTEXT 过校验（测试里断言） */
 export const EXTRA_DEFINITIONS: Record<string, { kind: DslKind; yaml: string }> = {
+  // 照抄 fmcg 种子的 revenue_365d（#1192）：不写说明、不挂别名，检索文字里没有「消费金额」，复现 fmcglab 上靠度量字段才能排进前排的情况
+  revenue_365d: { kind: 'metric', yaml: `base: order
+measure: { agg: sum, field: amount }
+filter:
+  - { field: status, op: in, value: [paid, shipped, completed] }
+window: { field: created_at, days: 365 }
+` },
   revenue_paid_30d: { kind: 'metric', yaml: `base: order
 measure: { agg: sum, field: amount }
 filter:

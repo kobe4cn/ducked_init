@@ -1,6 +1,6 @@
-// test/retrieval-golden.test.ts —— 检索黄金集（#317，ADR-0047 的确定性层）：40 条黄金集的标注齐全、分布达标、引用的条目都在固定目录里；
+// test/retrieval-golden.test.ts —— 检索黄金集（#317，ADR-0047 的确定性层）：42 条黄金集的标注齐全、分布达标、引用的条目都在固定目录里；
 // 对 rank()（检索投影上的多路召回 + RRF 融合 + 依赖展开）逐条断言候选都在前 20、第 1 名不是不能选的近义项、歧义判定与标注一致，汇总 Recall@20 不低于 BASELINE；
-// 别名类 6 条另断言别名指向的条目进前 20。歧义按 judgeAmbiguity()（点名排除 + 口径对比，#398）判，做不到的记在 KNOWN_GAPS（用 it.fails，改好后会变红，提醒从清单删掉并抬高 BASELINE）。
+// 别名类 6 条另断言别名指向的条目进前 20；度量说法 2 条断言 revenue_365d 进前 5、「消费金额」前 10 没有外键字段（#1192）。歧义按 judgeAmbiguity()（点名排除 + 口径对比，#398）判，做不到的记在 KNOWN_GAPS（用 it.fails，改好后会变红，提醒从清单删掉并抬高 BASELINE）。
 // 纯函数，不读库、不走模型
 import { describe, expect, it } from 'vitest';
 import { expand } from '../app/.server/catalog';
@@ -15,6 +15,7 @@ const BASELINE = 0.96;
 /** rank() 与歧义判定做不到的条目与原因 */
 const KNOWN_GAPS = new Map<string, string>([
   ['churn-forecast', '「流失」没有出现在任何说明里，days_since_last_order 没进前 20'],
+  ['consumption-amount', '歧义判定只按查询里出现的名称或别名分组，「消费金额」不是任何指标的名称或别名，revenue_30d 与 revenue_365d 分不成一组（排序已让两者进前 5，#1192）'],
   ['pv-7d-alias', '锚点投票：前 5 名里 order 与 consent 各两票（「近」的关键词命中），event 只有 event_type 一票、不是锚点，依赖展开没补 event.occurred_at'],
 ]);
 
@@ -28,11 +29,17 @@ const ALIAS_TARGETS: Record<string, string[]> = {
   'vip-level-alias': ['field:membership.level'],
 };
 
+/** 业务说法（度量词）条目 → 要进前 5 的现成指标（#1192） */
+const TOP_TARGETS: Record<string, string[]> = {
+  'consumption-amount': ['metric:revenue_365d'],
+  'member-revenue-365d': ['metric:revenue_365d'],
+};
+
 const VIEWER = viewerView(RETRIEVAL_CATALOG);
 
 describe('检索黄金集的标注', () => {
-  it('40 条都有失败类型、正确候选、不能选的近义项与追问键，引用的条目都在目录里', () => {
-    expect(GOLDEN_ALL).toHaveLength(40);
+  it('42 条都有失败类型、正确候选、不能选的近义项与追问键，引用的条目都在目录里', () => {
+    expect(GOLDEN_ALL).toHaveLength(42);
     for (const g of GOLDEN_ALL) {
       expect(FAILURE_TYPES, g.id).toContain(g.failure_type);
       expect(ROLES, g.id).toContain(g.role);
@@ -88,6 +95,18 @@ describe('确定性检索（rank()）', () => {
       expect(targets.filter(t => !r.top.includes(t)), `${id} 没进前 20 的别名目标`).toEqual([]);
       expect(g.retrieval.forbidden, `${id} 第 1 名是不能选的近义项`).not.toContain(r.top[0]);
     }
+  });
+
+  it('度量说法 2 条：现成指标 revenue_365d 进前 5；「消费金额」的前 10 没有只靠外键名命中的字段', () => {
+    for (const [id, targets] of Object.entries(TOP_TARGETS)) {
+      const g = GOLDEN_ALL.find(x => x.id === id);
+      if (!g) throw new Error(`黄金集里没有 ${id}`);
+      const r = retrieve(g);
+      expect(targets.filter(t => !r.top.slice(0, 5).includes(t)), `${id} 没进前 5 的指标：${r.top.slice(0, 10).join(', ')}`).toEqual([]);
+    }
+    const g = GOLDEN_ALL.find(x => x.id === 'consumption-amount')!;
+    expect(retrieve(g).top.slice(0, 10)).not.toEqual(expect.arrayContaining(['field:coupon.customer_id']));
+    expect(retrieve(g).top.slice(0, 10)).not.toEqual(expect.arrayContaining(['field:consent.customer_id']));
   });
 
   for (const g of GOLDEN_ALL) {
