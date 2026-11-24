@@ -4,7 +4,7 @@
 // 需求选五种模式之一，带与助手共用的 validate_plan 说明，不合格（status invalid）时最多修正 MAX_FIXES 次（#1226）；最后一份计划的 mode 与 plan-modes.ts 的期望比对，
 // 调用或解析失败也算跑过、记错；没配 LLM_* 时这三列是「未运行」）；调参集与验收集
 // （golden.ts 的 HOLDOUT，不参与调参）各一张 Markdown 表，可直接贴进 docs/test-plans/requirements-eval-baseline.md。
-// 有 LLM_* 时先用真实模型对全部条目跑计划模式（runPlanCase）再打这两张表。
+// 有 LLM_* 时先用真实模型对全部条目跑计划模式（runPlanCase）再打这两张表，再按期望模式（调参集 + 验收集）打一张计划模式表（#1227）。
 // 再在配了 LLM_EMBEDDING_*（三项都有，与 chat 的 LLM_* 互不影响）时对固定目录真实算一次向量，调参集与验收集各打印「向量关 / 向量开」
 // 两组指标与合计 Recall@20 的差值（#416，ADR-0049）；没配只跳过开关对比。
 // 最后在有 LLM_* 时对有 expected 或标了期望做不到（#1210）的样例用真实模型服务走与产品相同的起草消息（固定目录）、输出 Schema 与转 YAML，打印每例与调参集 / 验收集
@@ -14,9 +14,10 @@ import { execSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { cmp } from '../app/lib/compare';
+import { PLAN_MODES, type PlanMode } from '../app/.server/catalog/plan';
 import { callEmbeddings, platformEmbeddingProvider, platformProvider } from '../app/.server/llm';
 import { GOLDEN, GOLDEN_ALL, HOLDOUT } from './eval-requirements/golden';
-import { GROUP_KEYS, groupByType, retrievalRows, VIEWS, type GroupKey, type GroupStats, type RetrievalRow, type RetrievalVectors } from './eval-requirements/retrieval';
+import { GROUP_KEYS, groupByMode, groupByType, retrievalRows, VIEWS, type GroupKey, type GroupStats, type RetrievalRow, type RetrievalVectors } from './eval-requirements/retrieval';
 import { runCase, runPlanCase, summarize, type CaseResult, type FailStage, type Summary } from './eval-requirements/score';
 
 const pct = (x: number | null) => (x === null ? '—' : `${(x * 100).toFixed(1)}%`);
@@ -33,6 +34,17 @@ function table(title: string, groups: Record<GroupKey, GroupStats>) {
   for (const k of GROUP_KEYS) {
     const g = groups[k];
     console.log(`| ${k} | ${g.cases} | ${pct(g.recall)} | ${pct(g.clarifyAccuracy)} | ${pct(g.clarifyRecall)} | ${modePct(g.firstPassRate)} | ${modePct(g.fixedPassRate)} | ${modePct(g.modeAccuracy)} |`);
+  }
+}
+
+/** 按期望模式的计划模式表（Markdown，#1227）：行顺序按 PLAN_MODES */
+function modeTable(title: string, groups: Record<PlanMode, GroupStats>) {
+  console.log(`\n${title}\n`);
+  console.log('| 期望模式 | 条数 | 首次合格率 | 修正后合格率 | 模式正确率 |');
+  console.log('|---|---|---|---|---|');
+  for (const m of PLAN_MODES) {
+    const g = groups[m];
+    console.log(`| ${m} | ${g.cases} | ${modePct(g.firstPassRate)} | ${modePct(g.fixedPassRate)} | ${modePct(g.modeAccuracy)} |`);
   }
 }
 
@@ -66,6 +78,7 @@ if (!provider) {
 const retrieval = split(rows);
 table('调参集', retrieval.tuning);
 table('验收集（不参与调参，只在验收时看）', retrieval.holdout);
+if (provider) modeTable('计划模式（按期望模式，调参集 + 验收集）', groupByMode(rows));
 
 // 开关对比（#416）：单独判断 LLM_EMBEDDING_*（三项都有才跑，与 chat 的 LLM_* 互不影响，只配 embedding 也要跑）。
 // 走 callEmbeddings（不查库、不记调用日志）；向量对两类视图的非能力行按 textHash 去重后现算，查询向量每条 golden 各一条

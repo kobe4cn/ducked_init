@@ -116,3 +116,9 @@ export function groupByType(rows: RetrievalRow[]): Record<GroupKey, GroupStats> 
   const of = (t: GoldenEntry['failure_type']) => stats(rows.filter(r => r.type === t));
   return { a: of('a'), b: of('b'), c: of('c'), d: of('d'), 合计: stats(rows) };
 }
+
+/** 按期望模式分组（#1227）：五种模式各一组，没有行的组 cases 为 0 */
+export function groupByMode(rows: RetrievalRow[]): Record<PlanMode, GroupStats> {
+  const of = (m: PlanMode) => stats(rows.filter(r => r.expectedMode === m));
+  return { reuse_result: of('reuse_result'), draft_definition: of('draft_definition'), draft_query: of('draft_query'), clarify: of('clarify'), unsupported: of('unsupported') };
+}

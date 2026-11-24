@@ -208,10 +208,14 @@ export const PLAN_EXAMPLE: AnalysisPlan = {
   questions: [],
 };
 
-/** validate_plan 的工具说明（附 PLAN_EXAMPLE）：助手工具与计划模式评测（scripts/eval-requirements/score.ts）共用 */
+/** 选计划模式的规则（#1227）：validate_plan 说明与能起草定义的角色的助手系统提示共用 */
+export const PLAN_MODE_RULE = '怎么选模式：消费者粒度、可复用的口径（时间窗口加过滤条件，如「每个消费者近 180 天在京东渠道的消费金额」）优先用 draft_definition 起草指标或标签定义；只有按消费者以外的粒度汇总（如按城市、按天）或一次性的查询才用 draft_query 写工作台 SQL。';
+
+/** validate_plan 的工具说明（附 PLAN_MODE_RULE 与 PLAN_EXAMPLE）：助手工具与计划模式评测（scripts/eval-requirements/score.ts）共用 */
 export const VALIDATE_PLAN_DESCRIPTION = '校验一份分析计划（JSON）：结构、步骤与选中的目录条目、口径可加性与平台能力。计划只能引用本轮 catalog_search / catalog_expand 返回过的条目或对话里最近一份计划引用过的条目，'
   + '并带上返回的 semanticHash（指标、标签、模板还要带 version）；可选的 excluded 列出检索到但没选的口径（id 也必须来自本轮检索或对话里最近一份计划）和原因，'
   + '可选的 rationale 说明为何选；原因里不要写目录以外的名称。返回 status（valid / needs_clarification / unsupported / invalid）与逐条问题。'
+  + PLAN_MODE_RULE
   + `最小合法示例（draft_query）：${JSON.stringify(PLAN_EXAMPLE)}`;
 
 /** validate_plan 返回给模型的文本：status 一行加逐条问题；助手工具与计划模式评测的修正回合共用 */

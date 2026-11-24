@@ -7,7 +7,7 @@
 import { Ajv } from 'ajv';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb } from '../../app/.server/db/client';
-import { catalogFor, invokeTool, PLAN_EXAMPLE, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
+import { catalogFor, invokeTool, PLAN_EXAMPLE, PLAN_MODE_RULE, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { PLAN_SCHEMA, semanticHash, validatePlan } from '../../app/.server/catalog/plan';
 import { createDefinition, publishDefinition } from '../../app/.server/dsl-definitions';
 import { resetDb } from '../http/harness';
@@ -184,6 +184,15 @@ describe('AI 助手的工具注册表', () => {
     const sent = JSON.stringify(tool.inputSchema);
     for (const k of ['"if"', '"then"', '"not"', '"allOf"']) expect(sent).not.toContain(k);
     expect(tool.description).toContain(`最小合法示例（draft_query）：${JSON.stringify(PLAN_EXAMPLE)}`);
+  });
+
+  it('validate_plan 说明在最小示例之前写明怎么选模式：消费者粒度、可复用口径优先 draft_definition，跨粒度汇总或一次性查询才用 draft_query（#1227）', async () => {
+    const { acme } = await publishedIdentitySources();
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const { description } = toolsFor(analyst).find(t => t.name === 'validate_plan')!;
+    for (const k of ['draft_definition', 'draft_query', '消费者粒度', '一次性']) expect(PLAN_MODE_RULE).toContain(k);
+    expect(description).toContain(PLAN_MODE_RULE);
+    expect(description.indexOf(PLAN_MODE_RULE)).toBeLessThan(description.indexOf('最小合法示例'));
   });
 
   it('validate_definition / save_definition_draft 的说明列出指标与标签 DSL 的顶层键（必填键标出），并说明口径声明与别名不在 YAML 里（#1185）', async () => {
