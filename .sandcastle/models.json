@@ -25,7 +25,7 @@
   },
   "phases": {
     "prep": ["opus"],
-    "implement": ["glm", "opus"],
+    "implement": ["glm"],
     "review": ["opus"],
     "revise": ["opus"],
     "fix": ["opus"],

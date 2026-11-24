@@ -1,8 +1,10 @@
 // .claude/hooks/sandcastle-context.mjs —— Sandcastle 沙箱里的上下文预算守卫（docs/agents/sandcastle.md「上下文预算」）
 // 只在 SANDCASTLE_PROFILE 有值时生效（编排脚本给容器里的 claude 设的），宿主机上的会话不受影响。
 //
-// PreToolUse(Read)：档案标了 SANDCASTLE_NO_IMAGES=1（模型看不到图片，如 glm-5.3）时拦下读图片：
+// PreToolUse(Read)：档案标了 SANDCASTLE_NO_IMAGES=1（主模型看不到图片，如 glm-5.3）时，主线程读图片一律拦下：
 //   看不到还照样计 token，一张 1280×720 截图约 6–7 万，一下就能把会话撑过 150k。
+//   看图交给 screenshot-checker 子代理（.claude/agents/screenshot-checker.md，model: haiku，glm 档案映射到能看图的 glm-5.3-flash），
+//   每个子代理只许读一张图，自己的上下文也不过 150k。子代理里触发的 hook 输入带 agent_id / agent_type，主线程没有。
 // PostToolUse(*)：从会话记录取最近一条 assistant 消息的上下文（输入 + 缓存写 + 缓存读），加上刚返回的工具结果估算，
 //   到 SOFT 时要求收尾交接（implement 由下一个全新会话接着做，3 次会话做不完退回 prep 拆票），到 HARD 时要求立刻结束。
 //   同一会话每多 STEP 才再提醒一次，避免每次工具调用都刷屏。
@@ -44,21 +46,30 @@ export const resultTokens = (response) => Math.ceil(JSON.stringify(response ?? '
 
 const k = (n) => `${Math.round(n / 1000)}k`;
 
-/** 返回要拦下的原因；不用拦返回 undefined。 */
-export function checkRead(input, env) {
+export const CHECKER = 'screenshot-checker';
+
+/** 返回要拦下的原因；不用拦返回 undefined。state 记每个看图子代理已经读过的图片。 */
+export function checkRead(input, env, state = new Map()) {
   if (!env.SANDCASTLE_PROFILE || env.SANDCASTLE_NO_IMAGES !== '1') return undefined;
   const file = String(input.tool_input?.file_path ?? '');
   if (!IMAGE.test(file)) return undefined;
+  if (input.agent_id && input.agent_type === CHECKER) {
+    const key = `img:${input.agent_id}`;
+    const seen = state.get(key);
+    if (seen && seen !== file) return `Blocked: 每个 ${CHECKER} 只看一张图（已看过 ${seen}），一张约 7 万 token，两张就逼近 150k。只就这一张输出结论；别的截图由主会话另起一个 ${CHECKER}。`;
+    state.set(key, file);
+    return undefined;
+  }
   return (
-    `Blocked: 当前模型档案（${env.SANDCASTLE_PROFILE}）看不到图片，读 ${file} 不会有任何信息，却会占用约几万 token 上下文。` +
-    '浏览器验收改用文字核对：`playwright-cli snapshot`（可加 | grep）看结构与文案，`playwright-cli eval` 取元素的文字、class、计算样式和尺寸，`playwright-cli console error` 看报错。' +
-    '截图照样用 `playwright-cli screenshot --filename=.browser-check/…` 保存（编排脚本会附到 PR 给人看），只是不要 Read 它；RESULT.md 里写明截图未经模型目视核对。'
+    `Blocked: 当前模型档案（${env.SANDCASTLE_PROFILE}）的主模型看不到图片，读 ${file} 不会有任何信息，却会占用约 7 万 token 上下文。` +
+    `看截图用 Agent 工具起 subagent_type: "${CHECKER}"，一次一张，prompt 里给截图路径和要核对的点（Browser check 条目、docs/agents/ui.md 的相关约定）；几张截图可以在同一条消息里并行起几个。` +
+    '它回文字结论，不占你的上下文。文字也能核对的（文案、结构、class、尺寸）先用 `playwright-cli snapshot` / `eval`。'
   );
 }
 
 /** 返回给 agent 的收尾要求；还没到预算返回 undefined。state 记这个会话上次在多大时提醒过。 */
 export function checkBudget(input, env, state) {
-  if (!env.SANDCASTLE_PROFILE) return undefined;
+  if (!env.SANDCASTLE_PROFILE || input.agent_id) return undefined; // 子代理的上下文另算，它的结论回到主线程时由 Agent 工具的 PostToolUse 计入
   const ctx = lastContext(input.transcript_path) + resultTokens(input.tool_response);
   if (ctx < SOFT) return undefined;
   const last = state.get(input.session_id) ?? 0;
@@ -83,10 +94,20 @@ function loadState() {
   }
 }
 
+function saveState(state) {
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify(Object.fromEntries(state)));
+  } catch {
+    // 记不下只会多提醒几次、子代理可能多看一张图
+  }
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   const input = JSON.parse(readFileSync(0, 'utf8'));
   if (input.hook_event_name === 'PreToolUse') {
-    const reason = checkRead(input, process.env);
+    const state = loadState();
+    const reason = checkRead(input, process.env, state);
+    saveState(state);
     if (reason) {
       console.error(reason);
       process.exit(2);
@@ -95,11 +116,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const state = loadState();
     const reason = checkBudget(input, process.env, state);
     if (reason) {
-      try {
-        writeFileSync(STATE_FILE, JSON.stringify(Object.fromEntries(state)));
-      } catch {
-        // 记不下只会多提醒几次
-      }
+      saveState(state);
       console.log(JSON.stringify({ decision: 'block', reason }));
     }
   }

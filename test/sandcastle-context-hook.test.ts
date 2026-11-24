@@ -1,4 +1,4 @@
-// .claude/hooks/sandcastle-context.mjs：Sandcastle 沙箱里的上下文预算守卫（拦看不到图的模型读图片、到预算要求收尾交接）
+// .claude/hooks/sandcastle-context.mjs：Sandcastle 沙箱里的上下文预算守卫（主模型看不到图时读图交给 screenshot-checker、到预算要求收尾交接）
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -26,10 +26,10 @@ const env = { SANDCASTLE_PROFILE: 'glm', SANDCASTLE_PHASE: 'implement' };
 describe('checkRead：看不到图片的档案不读图片', () => {
   const read = (file_path: string) => ({ hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path } });
 
-  it('档案标了 SANDCASTLE_NO_IMAGES=1 时拦下 png / jpg，提示改用 snapshot 核对', () => {
+  it('档案标了 SANDCASTLE_NO_IMAGES=1 时主线程读 png / jpg 被拦，提示交给 screenshot-checker', () => {
     const reason = checkRead(read('/w/.browser-check/01-a.png'), { ...env, SANDCASTLE_NO_IMAGES: '1' });
     expect(reason).toContain('看不到图片');
-    expect(reason).toContain('playwright-cli snapshot');
+    expect(reason).toContain('screenshot-checker');
     expect(checkRead(read('/w/x.JPG'), { ...env, SANDCASTLE_NO_IMAGES: '1' })).toBeDefined();
   });
 
@@ -37,6 +37,17 @@ describe('checkRead：看不到图片的档案不读图片', () => {
     expect(checkRead(read('/w/app/x.ts'), { ...env, SANDCASTLE_NO_IMAGES: '1' })).toBeUndefined();
     expect(checkRead(read('/w/a.png'), env)).toBeUndefined();
     expect(checkRead(read('/w/a.png'), { SANDCASTLE_NO_IMAGES: '1' })).toBeUndefined();
+  });
+
+  it('screenshot-checker 子代理放行一张图，第二张拦下；别的子代理照样拦', () => {
+    const noImg = { ...env, SANDCASTLE_NO_IMAGES: '1' };
+    const state = new Map();
+    const sub = (file: string, agent_type = 'screenshot-checker', agent_id = 'a1') => ({ ...read(file), agent_id, agent_type });
+    expect(checkRead(sub('/w/1.png'), noImg, state)).toBeUndefined();
+    expect(checkRead(sub('/w/1.png'), noImg, state)).toBeUndefined();
+    expect(checkRead(sub('/w/2.png'), noImg, state)).toContain('只看一张图');
+    expect(checkRead(sub('/w/2.png', 'screenshot-checker', 'a2'), noImg, state)).toBeUndefined();
+    expect(checkRead(sub('/w/3.png', 'general-purpose', 'a3'), noImg, state)).toContain('看不到图片');
   });
 });
 
@@ -70,6 +81,10 @@ describe('checkBudget：上下文到预算时要求收尾', () => {
     const p = transcript('other', [SOFT + 1_000]);
     expect(checkBudget(post(p), { ...env, SANDCASTLE_PHASE: 'review' }, new Map())).toContain('输出结论');
     expect(checkBudget(post(p), {}, new Map())).toBeUndefined();
+  });
+
+  it('子代理里的工具调用不提醒（上下文另算）', () => {
+    expect(checkBudget({ ...post(transcript('sub', [HARD + 1_000])), agent_id: 'a1' }, env, new Map())).toBeUndefined();
   });
 });
 
