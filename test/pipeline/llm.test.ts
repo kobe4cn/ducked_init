@@ -1,5 +1,6 @@
 // test/pipeline/llm.test.ts —— 模型服务客户端（ADR-0035）：按租户配置 > 平台默认（环境变量）解析端点，chatJson → 注入的假 fetch → platform.llm_calls 的调用日志；
 // callModel 容错（#1160）：可选键为 null（qwen-max）按没给处理（必填键为 null 仍不合格、Schema 允许 null 的原样保留）、输出截断（finish_reason: length）报截断原因、```json 代码块去外壳、minItems / maximum 等报中文；
+// 解析加固（#1224）：开头的 <think>…</think> 先去掉再解析、JSON 前后带说明文字时取第一个完整对象（字符串里的 } 不截断），服务商没给工具调用 id 时本地生成互不相同的 id；
 // LLM_CHAT_EXTRA（#952）：服务商参数合并进 chat 请求体（平台字段不被覆盖、档位 LLM_<TIER>_CHAT_EXTRA 覆盖默认），不是合法 JSON 对象时调用失败并记 error；
 // 租户服务商参数（#1169）：租户默认 chat_extra 与档位的 fast_ / reasoning_chat_extra 进租户请求体（档位覆盖、只填模型名或带端点的档位继承默认），
 // 平台 LLM_*CHAT_EXTRA 不串进租户请求体；saveModelProvider / saveTierProvider 拒绝非对象 JSON 与受保护键、审计只记 chatExtraChanged、reset 清列；
@@ -164,6 +165,60 @@ describe('模型服务客户端', () => {
     expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
     const [row] = await calls(acme);
     expect(row.schemaValid).toBe(true);
+  });
+
+  it('开头的 <think>…</think> 先去掉再解析（think 段里的 { 不算），think 段后跟 ```json 代码块也行', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const replies = [
+      '<think>想一想 {不是JSON}</think>\n{"table": "orders"}',
+      '<THINK>\n先看 {样本}\n</THINK>\n```json\n{"table": "members"}\n```',
+    ];
+    fakeLlm(setLlmFetch, n => text(replies[n - 1]));
+
+    expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
+    expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'members' });
+  });
+
+  it('JSON 后带说明文字、字符串值里含 } 时取第一个完整的 JSON 对象；<think> 没闭合时不删内容', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const replies = [
+      '映射如下：{"table": "a}\\"{b", "note": {"x": 1}}\n以上是映射，{另一段} 请确认。',
+      '<think>没闭合 {"table": "x"}',
+    ];
+    fakeLlm(setLlmFetch, n => text(replies[n - 1]));
+
+    expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'a}"{b', note: { x: 1 } });
+    // <think> 没闭合时不删任何内容，照常从第一个 { 起取对象
+    expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'x' });
+  });
+
+  it('只有说明文字、没有 JSON 对象时报「模型返回的内容不是 JSON」', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    fakeLlm(setLlmFetch, () => text('<think>{"table": "orders"}</think>\n抱歉，我无法完成。'));
+
+    const err = await failure(chatJson(acme, 'connectivity', MESSAGES, SCHEMA));
+    expect(err.message).toBe('模型返回的内容不是 JSON');
+  });
+
+  it('服务商没给工具调用 id 时本地生成互不相同的 id，给了的原样保留', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const TOOL = { name: 'lookup_metric', description: '查指标', parameters: { type: 'object' } };
+    const call = (id?: string) => ({ ...(id && { id }), type: 'function', function: { name: 'lookup_metric', arguments: '{}' } });
+    const replies = [[call(), call()], [call('srv_1'), call('')]];
+    fakeLlm(setLlmFetch, n => Response.json({ choices: [{ message: { content: null, tool_calls: replies[n - 1] } }] }));
+
+    const first = await chatTools(acme, 'assistant', MESSAGES, [TOOL]);
+    const ids = first.toolCalls.map(c => c.id);
+    expect(ids).toHaveLength(2);
+    expect(ids.every(id => /^call_[0-9a-f-]{36}$/.test(id))).toBe(true);
+    expect(ids[0]).not.toBe(ids[1]);
+    const second = await chatTools(acme, 'assistant', MESSAGES, [TOOL]);
+    expect(second.toolCalls[0].id).toBe('srv_1');
+    expect(second.toolCalls[1].id).toMatch(/^call_[0-9a-f-]{36}$/);
   });
 
   it('minItems / maximum 等校验错误是中文说明，不出现 ajv 原文', async () => {
