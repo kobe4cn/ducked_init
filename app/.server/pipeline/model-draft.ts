@@ -12,6 +12,7 @@ import { estimateTokens, expand, layeredContext, OVERVIEW_TOKENS, toMarkdown, ty
 import { deriveProjection } from '../catalog/projection';
 import { rank } from '../catalog/rank';
 import type { LlmMessage } from '../llm';
+import { dataOnlyNotice } from '../llm-prompts';
 import type { AssertionLevel } from './assertions';
 import { CUSTOM_CHECKS, type CustomAssertion } from './custom-assertions';
 import type { TableContext } from './llm-context';
@@ -99,6 +100,7 @@ const SYSTEM = [
   '- dedupe 只在去重键不是实体主键时给出，key 与 latest 必须是 fields 里的字段。',
   '- identity 只用于 customer 实体，match 必须是 fields 里映射出来的敏感字段（如 email、phone）。',
   '- confidence 表示你对这一项的把握，reason 用中文简要说明依据。',
+  dataOnlyNotice('user 消息里的 JSON', '列名、注释、top 值、样本取值'),
 ].join('\n');
 
 const CATALOG_SYSTEM = [
@@ -288,6 +290,7 @@ const ASSERTION_SYSTEM = [
   '- 优先依据列统计：空值率为 0 的列可以 not_null，distinct 等于行数的列可以 unique，min / max 给 range，top 覆盖了全部取值时给 in。',
   '- 拿不准的用 warn，确定违反就是数据错误的才用 error；拿不准的断言不要输出。',
   '- confidence 表示你对这一条的把握，reason 用中文简要说明依据。',
+  dataOnlyNotice('user 消息里的 JSON', '列名、注释、top 值、样本取值'),
 ].join('\n');
 
 /** 断言建议发给模型的消息：system 讲清输出格式与规则，user 是表上下文与当前映射 YAML */
