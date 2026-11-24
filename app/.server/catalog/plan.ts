@@ -3,16 +3,18 @@
 // 不读库、不信任 JSON 里的租户与操作者（出现也忽略）。校验分五层：结构（JSON Schema + 步骤业务检查，步骤动作是受控枚举
 // PLAN_ACTIONS、每种动作有自己的输入约束）、硬性（选中条目必须来自本次检索、在目录里，版本与语义哈希和当前一致；
 // excluded 只查 id 来自本次检索且不与 selected 重复，不查目录，#539）、
-// 口径（只对 reuse_result 选中的指标，用户明确要求的单位 / 时间含义 / 窗口与口径声明比较）、可加性（aggregate 的
+// 口径（reuse_result 与 draft_query 选中的指标，用户明确要求的单位 / 时间含义 / 含税 / 扣退款 / 币种与口径声明比较；
+// 窗口天数只对 reuse_result 比较——draft_query 自己写 SQL，窗口按要求写即可，#1184）、可加性（aggregate 的
 // sum / avg 不能作用在比率 / 去重计数 / 最新值这类不可加的度量上）、平台能力（DSL 只能算到统一消费者粒度）。
 // 接入助手工具在 ⑮。
 // 结果 status：invalid（结构或硬性不过、口径不相容）> unsupported（mode 是 unsupported）> needs_clarification
 // （mode 是 clarify，或口径声明未知 / 需复核）> valid；mode 是 clarify / unsupported 时计划本身合法，
-// 但对话的下一步是追问或说明做不到，所以 status 直接取这两种。request 里 unit / timeMeaning 写 unknown /
-// not_applicable 不算明确要求，跳过该项比较。语义哈希读时现算，不写进条目、不存库（写进去会让 diffCatalog 判全部条目有改动）。
+// 但对话的下一步是追问或说明做不到，所以 status 直接取这两种。request 里 unit / timeMeaning / taxIncluded /
+// refundDeducted / currency 写 unknown / not_applicable 不算明确要求，跳过该项比较；含税 / 扣退款 / 币种的定义声明为
+// not_applicable（如订单数）视为相容。语义哈希读时现算，不写进条目、不存库（写进去会让 diffCatalog 判全部条目有改动）。
 // 纯函数：同样的计划与目录每次结果相同
 import { Ajv, type ValidateFunction } from 'ajv';
-import { CLAIM_TYPES, claimTypeLabel, claimValueLabel, type ClaimType } from '../../lib/semantic-claims';
+import { CLAIM_TYPE_ORDER, CLAIM_TYPES, claimTypeLabel, claimValueLabel, type ClaimType } from '../../lib/semantic-claims';
 import { sha256 } from '../auth';
 import { stableJson } from '../knowledge/basis';
 import { describeSchemaError } from '../pipeline/mapping-spec';
@@ -27,7 +29,7 @@ export const PLAN_MODES: readonly PlanMode[] = ['reuse_result', 'draft_definitio
 /** 选中的条目：指标、标签、模板必须带 version 且与目录一致；实体、字段没有版本（带了也忽略） */
 export interface SelectedRef { id: string; version?: number; semanticHash: string }
 
-/** 用户的要求；unit / timeMeaning 的取值限定在登记表（app/lib/semantic-claims.ts）里 */
+/** 用户的要求；unit / timeMeaning / taxIncluded / refundDeducted / currency 的取值限定在登记表（app/lib/semantic-claims.ts）里 */
 export interface PlanRequest {
   asOf?: string;
   grain?: string;
@@ -35,6 +37,9 @@ export interface PlanRequest {
   population?: string;
   unit?: (typeof CLAIM_TYPES.unit.values)[number]['value'];
   timeMeaning?: (typeof CLAIM_TYPES.time_meaning.values)[number]['value'];
+  taxIncluded?: (typeof CLAIM_TYPES.tax_included.values)[number]['value'];
+  refundDeducted?: (typeof CLAIM_TYPES.refund_deducted.values)[number]['value'];
+  currency?: (typeof CLAIM_TYPES.currency.values)[number]['value'];
   /** 用户明确要求的窗口天数 */
   windowDays?: number;
 }
@@ -57,7 +62,7 @@ export type PlanAction = (typeof PLAN_ACTIONS)[number];
 export interface PlanStep { id: string; action: PlanAction; inputs: string[]; agg?: AggregateFn }
 export interface PlanAssumption { text: string; evidenceId?: string; confirmed: boolean }
 
-/** 计划结构（设计文档 9.1），另加 request.unit / windowDays 与 unsupported 模式的 reason */
+/** 计划结构（设计文档 9.1），另加 request 的口径要求（unit 等五类）/ windowDays 与 unsupported 模式的 reason */
 export interface AnalysisPlan {
   schemaVersion: 1;
   mode: PlanMode;
@@ -114,6 +119,9 @@ export const PLAN_SCHEMA = {
         population: { type: 'string', minLength: 1 },
         unit: { enum: claimEnum('unit') },
         timeMeaning: { enum: claimEnum('time_meaning') },
+        taxIncluded: { enum: claimEnum('tax_included') },
+        refundDeducted: { enum: claimEnum('refund_deducted') },
+        currency: { enum: claimEnum('currency') },
         windowDays: { type: 'integer', minimum: 1 },
       },
     },
@@ -264,13 +272,23 @@ export function validatePlan(input: unknown, ctx: { catalog: Catalog; retrieved:
     }
   }
 
-  // 口径检查：只对 reuse_result 选中的指标；request 没提的口径不检查
+  // 口径检查：reuse_result 与 draft_query 选中的指标比较五类口径声明（draft_query 以指标为口径依据写 SQL，照抄就带错，
+  // #1184），窗口天数只对 reuse_result；request 没提的口径不检查
   const NEXT_DRAFT = '改选口径匹配的定义，或改为 draft_definition 起草新定义';
-  const REQUEST_FIELD: Record<'unit' | 'time_meaning', 'unit' | 'timeMeaning'> = { unit: 'unit', time_meaning: 'timeMeaning' };
-  const checkClaim = (type: 'unit' | 'time_meaning', asked: string | undefined, e: MetricEntry) => {
+  const REQUEST_FIELD = {
+    unit: 'unit',
+    time_meaning: 'timeMeaning',
+    tax_included: 'taxIncluded',
+    refund_deducted: 'refundDeducted',
+    currency: 'currency',
+  } as const satisfies Record<ClaimType, keyof PlanRequest>;
+  const checkClaim = (type: ClaimType, e: MetricEntry) => {
+    const asked = plan.request[REQUEST_FIELD[type]];
     if (asked === undefined || asked === 'unknown' || asked === 'not_applicable') return;
     const label = claimTypeLabel(type);
     const declared = claimsOf(e).get(type) ?? 'unknown';
+    // 含税 / 扣退款 / 币种对这个指标不适用（如订单数）时，任何要求都相容；unit / time_meaning 维持「不相等就不合」
+    if (declared === 'not_applicable' && type !== 'unit' && type !== 'time_meaning') return;
     if (declared === 'unknown') {
       const member = e.knowledge?.claims?.find(c => c.type === type);
       let why: string;
@@ -291,13 +309,12 @@ export function validatePlan(input: unknown, ctx: { catalog: Catalog; retrieved:
       raise('invalid');
     }
   };
-  if (plan.mode === 'reuse_result') {
+  if (plan.mode === 'reuse_result' || plan.mode === 'draft_query') {
     for (const s of plan.selected) {
       const e = expand(ctx.catalog, s.id);
       if (e?.kind !== 'metric') continue;
-      checkClaim('unit', plan.request.unit, e);
-      checkClaim('time_meaning', plan.request.timeMeaning, e);
-      if (plan.request.windowDays !== undefined) {
+      for (const type of CLAIM_TYPE_ORDER) checkClaim(type, e);
+      if (plan.mode === 'reuse_result' && plan.request.windowDays !== undefined) {
         const days = e.window?.days;
         let message: string;
         if (days === undefined) message = `要求近 ${plan.request.windowDays} 天，定义没有时间窗口`;

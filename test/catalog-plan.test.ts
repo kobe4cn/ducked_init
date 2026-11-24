@@ -1,6 +1,6 @@
 // test/catalog-plan.test.ts —— 分析计划校验 validatePlan()（ADR-0050，#409 / #410）：纯函数，不起库。
 // 结构校验（JSON Schema 与步骤业务检查、动作受控枚举）、硬性检查（本次检索、可见目录、版本、语义哈希；excluded 只查本次检索与不与 selected 重复，#539）、
-// 口径检查（单位 / 时间含义 / 窗口，只对 reuse_result 选中的指标）、可加性与平台能力检查（#410）。
+// 口径检查（单位 / 时间含义 / 含税 / 扣退款 / 币种对 reuse_result 与 draft_query 选中的指标，窗口只对 reuse_result，#1184）、可加性与平台能力检查（#410）。
 // 口径用例的固定目录是检索黄金集的 RETRIEVAL_CATALOG（「营收」别名挂在 revenue_30d 等指标上），
 // 成员声明与可加性的用例手工构造 CatalogInput（不动黄金集的目录）
 import { describe, expect, it } from 'vitest';
@@ -268,6 +268,63 @@ describe('分析计划校验 validatePlan()：口径检查', () => {
     expect(seven.issues[0]!.message).toContain('7');
     expect(seven.issues[0]!.message).toContain('30');
     expect(check(planOf(undefined, { request: { dimensions: [], windowDays: 30 } })).status).toBe('valid');
+  });
+
+  it('要求不含税而选中的指标声明含税时，reuse_result 与 draft_query 都返回 invalid，next 提示 draft_definition（#1184）', () => {
+    const c = claimedCatalog([{ type: 'tax_included', value: 'yes' }]);
+    for (const mode of ['reuse_result', 'draft_query'] as const) {
+      const r = checkClaimed(c, { ...claimedPlan(c, { dimensions: [], taxIncluded: 'no' }), mode });
+      expect(r.status, mode).toBe('invalid');
+      expect(r.issues).toHaveLength(1);
+      expect(r.issues[0]).toMatchObject({ path: 'request.taxIncluded', entryId: 'metric:rev' });
+      expect(r.issues[0]!.message).toContain('含税');
+      expect(r.issues[0]!.next).toContain('改为 draft_definition 起草新定义');
+    }
+  });
+
+  it('不提含税 / 扣退款 / 币种要求时结果不变：声明含税的指标在 reuse_result 与 draft_query 下都 valid（#1184）', () => {
+    const c = claimedCatalog([{ type: 'tax_included', value: 'yes' }, { type: 'refund_deducted', value: 'no' }, { type: 'currency', value: 'USD' }]);
+    for (const mode of ['reuse_result', 'draft_query'] as const) {
+      const r = checkClaimed(c, { ...claimedPlan(c, { dimensions: [] }), mode });
+      expect(r.status, mode).toBe('valid');
+      expect(r.issues).toEqual([]);
+    }
+  });
+
+  it('draft_query 选中扣退款声明需复核的指标、要求不扣退款时返回 needs_clarification（#1184）', () => {
+    const c = claimedCatalog([{ type: 'refund_deducted', value: 'unknown', previous: 'yes', needsReview: true }]);
+    const r = checkClaimed(c, { ...claimedPlan(c, { dimensions: [], refundDeducted: 'no' }), mode: 'draft_query' });
+    expect(r.status).toBe('needs_clarification');
+    expect(r.issues).toHaveLength(1);
+    expect(r.issues[0]!.path).toBe('request.refundDeducted');
+    expect(r.issues[0]!.message).toContain('需复核');
+    expect(r.issues[0]!.next).toContain('追问');
+  });
+
+  it('币种要求与声明不同返回 invalid；声明「不适用」的含税 / 扣退款 / 币种视为相容（#1184）', () => {
+    const usd = claimedCatalog([{ type: 'currency', value: 'USD' }]);
+    const r = checkClaimed(usd, { ...claimedPlan(usd, { dimensions: [], currency: 'CNY' }), mode: 'draft_query' });
+    expect(r.status).toBe('invalid');
+    expect(r.issues[0]!.path).toBe('request.currency');
+
+    const na = claimedCatalog([
+      { type: 'tax_included', value: 'not_applicable' },
+      { type: 'refund_deducted', value: 'not_applicable' },
+      { type: 'currency', value: 'not_applicable' },
+    ]);
+    for (const mode of ['reuse_result', 'draft_query'] as const) {
+      const ok = checkClaimed(na, { ...claimedPlan(na, { dimensions: [], taxIncluded: 'no', refundDeducted: 'yes', currency: 'CNY' }), mode });
+      expect(ok.status, mode).toBe('valid');
+    }
+  });
+
+  it('draft_query 也比较单位 / 时间含义，但不比较窗口天数（#1184）', () => {
+    const c = claimedCatalog([]);
+    const seven = checkClaimed(c, { ...claimedPlan(c, { dimensions: [], windowDays: 7 }), mode: 'draft_query' });
+    expect(seven.status).toBe('valid');
+    const pay = checkClaimed(c, { ...claimedPlan(c, { dimensions: [], timeMeaning: 'pay_time' }), mode: 'draft_query' });
+    expect(pay.status).toBe('invalid');
+    expect(pay.issues[0]!.path).toBe('request.timeMeaning');
   });
 
   it('draft_definition 模式不做口径检查；clarify / unsupported 的合法计划分别是 needs_clarification / unsupported', () => {

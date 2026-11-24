@@ -180,7 +180,7 @@ describe('助手对话', () => {
     const { acme } = await publishedIdentitySources();
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
     const client = await loginAs(app, 'analyst@acme.com');
-    // 计划照上一条用例选中 entity:customer，mode 改成 draft_query（draft_query 不做口径与粒度检查，校验仍是 valid）
+    // 计划照上一条用例选中 entity:customer，mode 改成 draft_query（draft_query 不查粒度；计划没提口径要求，校验仍是 valid）
     const hash = semanticHash((await catalogFor(analyst)).entries.find(e => e.id === 'entity:customer')!);
     const plan = {
       schemaVersion: 1, mode: 'draft_query',
