@@ -1,7 +1,7 @@
 // app/.server/workbench-ai.ts —— 工作台 AI 起草 SQL（ADR-0043）：按成员此刻能读的目录（listCatalog：表、字段与类型，不含取值）请模型写一条只读 SQL，
 // 在只读挂载上按工作台白名单校验（checkDraftedSql，不执行），通过后只交给页面填进编辑框，由成员自己执行。
 // 提示里的结果层快照按任务归组、每个指标 / 标签 / 模板只给最新一张；目录太长时先略去结果层与沙箱，silver 与原始表最后才裁（catalogText）。
-// 审计 workbench.ai_drafted 记 SQL 与是否通过校验，不记需求原文；模型判断做不到时（需要的表不在目录里、要写数据）422 给出它的原因，审计只记 { unsupported: true }；不自动重试。
+// 审计 workbench.ai_drafted 记 SQL 与是否通过校验，不记需求原文；模型判断做不到时（需要的表不在目录里、要写数据）422 给出它的原因，审计只记 { unsupported: true }；不自动重试。成功时可带模型的口径假设 notes（最多 MAX_NOTES 条）给页面列出，notes 不进审计。
 // 结果解读：成员确认后服务端按 SQL 重新执行（不信客户端传来的行），租户打开「发送脱敏样本」时把前 INTERPRET_ROWS 行发给模型服务，
 // 没打开时只发 SQL、列名与类型、行数和每列统计（按全部结果行算），不发任何行；结果列无法回溯到字段，
 // 所以按列名与取值保守剔除系统列、名字像敏感字段的列与取值里有 64 位十六进制哈希的列（统计也只算留下的列）。审计 workbench.result_interpreted 不记取值，记 samples；
@@ -42,7 +42,7 @@ const MAX_CATALOG = 30_000;
 const SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  properties: { sql: { type: 'string' }, unsupported: { type: 'string' } },
+  properties: { sql: { type: 'string' }, unsupported: { type: 'string' }, notes: { type: 'array' } },
   anyOf: [
     { required: ['unsupported'], properties: { unsupported: { minLength: 1, pattern: '\\S' } } },
     { required: ['sql'], properties: { sql: { minLength: 1 } } },
@@ -50,6 +50,9 @@ const SCHEMA = {
 };
 /** 做不到的原因最多的字数 */
 const MAX_UNSUPPORTED = 500;
+/** 口径假设最多的条数与每条最多的字数。SCHEMA 里 notes 不限条目类型与长度：模型的小偏差（条目是 null、数字，条数过多）不报 Schema 错，在代码里过滤和截断 */
+const MAX_NOTES = 3;
+const MAX_NOTE = 200;
 
 const tableLine = (t: { ref: string; columns: { name: string; type: string }[] }) => `${t.ref}(${t.columns.map(c => `${c.name} ${c.type}`).join(', ')})`;
 
@@ -130,7 +133,7 @@ function draftMessages(request: string, catalog: string): LlmMessage[] {
     {
       role: 'system',
       content: [
-        '你为 DuckDB 写一条只读查询 SQL，回答 JSON 对象 {"sql": "..."}，做不到时回答 {"unsupported": "原因"}。',
+        '你为 DuckDB 写一条只读查询 SQL，回答 JSON 对象 {"sql": "..."}，做不到时回答 {"unsupported": "原因"}；写出 SQL 时可以再给 "notes": ["..."]，最多 3 条、每条一句，只写你做的口径假设——时间锚点（今天还是数据里最后一天）、取哪张表（原始表还是标准层）、空值怎么处理，没有需要说明的假设就不给 notes。',
         '只写一条 SELECT（可以带 WITH），不写 INSERT / UPDATE / DELETE / CREATE / DROP 等写语句，不写多条语句。',
         '只能读下面列出的表，表名照列出的引用写（带 schema 或数据源名与引号），不要编造表或字段；需要的表或字段不在下面列出的目录里，或需求要删除 / 修改 / 写入数据（工作台只读）时，不要编造、不要改写成别的查询，回答 {"unsupported": "一句话原因"}。',
         '能读的表（引用(字段 类型, …)）：',
@@ -145,9 +148,10 @@ function draftMessages(request: string, catalog: string): LlmMessage[] {
  * 按需求起草一条工作台 SQL，通过白名单校验后返回，不执行（ADR-0043）。
  * 需求为空或超过 MAX_REQUEST 字时 400；没配置模型服务时 409（都不发请求）；模型失败或 SQL 没通过校验时 422（没通过时审计 valid: false）；
  * 模型判断做不到时 422，报错就是它给的原因（截到 MAX_UNSUPPORTED 字），审计 { unsupported: true }，不记原因（可能复述需求）；
- * 同租户已有查询在运行时 429。目录太长、提示里略去了表时 catalogTruncated 为真
+ * 同租户已有查询在运行时 429。目录太长、提示里略去了表时 catalogTruncated 为真；
+ * 模型给了口径假设时带 notes（去掉空白条，最多 MAX_NOTES 条、每条截到 MAX_NOTE 字，没有就不带这个键），notes 不进审计
  */
-export async function draftWorkbenchSql(actor: CurrentMember, request: string): Promise<{ sql: string; catalogTruncated: boolean }> {
+export async function draftWorkbenchSql(actor: CurrentMember, request: string): Promise<{ sql: string; catalogTruncated: boolean; notes?: string[] }> {
   assertCan(actor, 'sandbox');
   if (!request.trim()) throw new WorkbenchAiError('请先写下要查什么', 400);
   if (request.length > MAX_REQUEST) throw new WorkbenchAiError(`需求最多 ${MAX_REQUEST} 字`, 400);
@@ -156,9 +160,9 @@ export async function draftWorkbenchSql(actor: CurrentMember, request: string): 
   try {
     const catalog = await listCatalog(actor);
     const { text, truncated } = catalogText(catalog, await goldSnapshots(tenantId, catalog.gold));
-    let output: { sql?: string; unsupported?: string };
+    let output: { sql?: string; unsupported?: string; notes?: unknown[] };
     try {
-      output = await chatJson<{ sql?: string; unsupported?: string }>(tenantId, 'workbench_draft', draftMessages(request, text), SCHEMA);
+      output = await chatJson<{ sql?: string; unsupported?: string; notes?: unknown[] }>(tenantId, 'workbench_draft', draftMessages(request, text), SCHEMA);
     } catch (e) {
       if (e instanceof LlmError) throw new WorkbenchAiError(`模型起草 SQL 失败：${e.message}`, 422);
       throw e;
@@ -171,7 +175,9 @@ export async function draftWorkbenchSql(actor: CurrentMember, request: string): 
     // unsupported 没给或只有空白时 SCHEMA anyOf 的第一个分支不成立（它要求有非空白字符），通过校验靠的是第二个分支，所以一定有非空的 sql
     const { sql, problem } = await checkDraftedSql(actor, output.sql!);
     if (problem) throw new WorkbenchAiError(`AI 起草的 SQL 没有通过校验：${problem}`, 422);
-    return { sql, catalogTruncated: truncated };
+    const notes = (output.notes ?? []).filter((n): n is string => typeof n === 'string').map(n => n.trim()).filter(Boolean)
+      .slice(0, MAX_NOTES).map(n => n.slice(0, MAX_NOTE));
+    return notes.length ? { sql, catalogTruncated: truncated, notes } : { sql, catalogTruncated: truncated };
   } catch (e) {
     // 目录读取、校验时挂载出错或已有查询在运行：照原状态码给出
     if (e instanceof WorkbenchError) throw new WorkbenchAiError(e.message, e.status);
