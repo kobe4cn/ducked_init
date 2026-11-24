@@ -200,12 +200,12 @@ describe('模型服务客户端', () => {
     expect(row.error).not.toContain('sk-platform-secret');
   });
 
-  it('json_schema 里的 Schema 剥掉 allOf / if / then / not，原 Schema 不变，本地仍按完整 Schema 校验（#1191）', async () => {
+  it('json_schema 里的 Schema 剥掉 allOf / if / then / not / uniqueItems，原 Schema 不变，本地仍按完整 Schema 校验（#1191）', async () => {
     const acme = await newTenant('acme');
     platformDefault(BASE_WITH_SLASH);
     const conditional = {
       type: 'object', required: ['mode'],
-      properties: { mode: { type: 'string', not: { const: 'bad' } }, dims: { type: 'array', items: { type: 'string' } } },
+      properties: { mode: { type: 'string', not: { const: 'bad' } }, dims: { type: 'array', uniqueItems: true, items: { type: 'string' } } },
       allOf: [{ if: { properties: { mode: { const: 'group' } } }, then: { required: ['dims'] } }],
     };
     const original = structuredClone(conditional);
@@ -222,7 +222,7 @@ describe('模型服务客户端', () => {
     expect((await calls(acme))[0].schemaValid).toBe(false);
   });
 
-  it('服务商 400 拒绝 json_schema 时同一模型改发 json_object 成功，之后这个端点 + 模型直接发 json_object（#1191）', async () => {
+  it('服务商 400 拒绝 json_schema 时同一模型改发 json_object 成功，之后这个端点 + 模型 + Schema 直接发 json_object（#1191）', async () => {
     const acme = await newTenant('acme');
     platformDefault(BASE_WITH_SLASH);
     const { received } = fakeLlm(setLlmFetch, (n, body) => (body.response_format as { type: string }).type === 'json_schema'
@@ -240,6 +240,26 @@ describe('模型服务客户端', () => {
     expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
     expect(received).toHaveLength(3);
     expect(received[2].body.response_format).toEqual({ type: 'json_object' });
+  });
+
+  it('一份 Schema 被拒退回 json_object 后，同一端点 + 模型的其他 Schema 仍发 json_schema（#1191）', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const rejected = { type: 'object', required: ['table'], properties: { table: { type: 'string', pattern: '^o' } } };
+    const { received } = fakeLlm(setLlmFetch, (n, body) => {
+      const rf = body.response_format as { type: string; json_schema?: { schema: unknown } };
+      return rf.type === 'json_schema' && JSON.stringify(rf.json_schema?.schema).includes('pattern')
+        ? new Response('unsupported keyword', { status: 400 }) : json({ table: 'orders' }, USAGE);
+    });
+
+    expect(await chatJson(acme, 'connectivity', MESSAGES, rejected)).toEqual({ table: 'orders' });
+    expect(received.map((r) => (r.body.response_format as { type: string }).type)).toEqual(['json_schema', 'json_object']);
+
+    expect(await chatJson(acme, 'connectivity', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
+    expect(received[2].body.response_format).toEqual(asSchema('connectivity'));
+    expect(await chatJson(acme, 'connectivity', MESSAGES, rejected)).toEqual({ table: 'orders' });
+    expect(received[3].body.response_format).toEqual({ type: 'json_object' });
+    expect(received).toHaveLength(4);
   });
 
   it('HTTP 500 时不回退 json_object：只发一次请求，抛 transient 错误（#1191）', async () => {
