@@ -248,6 +248,8 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
   const preview = actionData && 'preview' in actionData ? actionData.preview : null;
   const interpretation = actionData && 'interpretation' in actionData ? actionData.interpretation : null;
   const catalogTruncated = actionData && 'catalogTruncated' in actionData && actionData.catalogTruncated;
+  /** 模型起草时所做的口径假设（模型原文，不翻译） */
+  const draftNotes = actionData && 'notes' in actionData ? actionData.notes ?? [] : [];
   /** 这个页面上的解读存进的助手对话，表单里一直带着 */
   const conversationId = actionData && 'conversationId' in actionData ? actionData.conversationId ?? '' : '';
   const conversationField = conversationId && <input type="hidden" name="conversationId" value={conversationId} />;
@@ -266,6 +268,12 @@ export default function Workbench({ loaderData, actionData }: Route.ComponentPro
             <label htmlFor="sql" className="text-sm font-medium">SQL</label>
             {catalogTruncated && (
               <p className="text-sm text-slate-500" data-catalog-truncated>{t('目录太长，AI 起草时只看到了部分表（优先保留 silver 和数据源原始表）')}</p>
+            )}
+            {draftNotes.length > 0 && (
+              <div className="space-y-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm" data-draft-notes>
+                <p className="flex items-center gap-1 font-medium text-amber-700"><Sparkles className="size-4" />{t('AI 的口径假设')}</p>
+                <ul className="list-disc space-y-0.5 pl-5 text-slate-700">{draftNotes.map((n, i) => <li key={i}>{n}</li>)}</ul>
+              </div>
             )}
             {/* defaultValue 只在挂载时生效：起草后或从侧栏打开 ?sql= 时换 key，让编辑框重新挂载、填入 SQL */}
             <SqlEditor

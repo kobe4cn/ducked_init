@@ -7,6 +7,7 @@
   "<你的令牌>": "'<your token>'",
   "AI 助手": "AI Assistant",
   "AI 助手、起草映射、指标、标签这类要推理的用途": "Reasoning-heavy uses such as the AI assistant and drafting mappings, metrics, and tags",
+  "AI 的口径假设": "AI's assumptions",
   "API Key 加密保存，保存后不再显示。": "The API Key is stored encrypted and never shown again after saving.",
   "CLV": "CLV",
   "CLV 十档分布": "CLV decile distribution",

@@ -109,6 +109,7 @@ describe('AI 起草', () => {
     expect(html).toContain('data-drafted');
     expect(html).not.toContain('data-catalog-truncated');
     expect(html).not.toContain('data-workbench-result');
+    expect(html).not.toContain('data-draft-notes');
     expect(await lastAudit()).toEqual(before);
 
     reply = 'DELETE FROM silver.customer';
@@ -117,6 +118,27 @@ describe('AI 起草', () => {
     const page = await rejected.text();
     expect(page).toContain('AI 起草的 SQL 没有通过校验');
     expect(page).toMatch(/<textarea[^>]*name="sql"[^>]*>SELECT 1<\/textarea>/);
+  });
+
+  it('模型给了口径假设时，编辑框上方「AI 的口径假设」逐条列出', async () => {
+    await memberOf(acme, 'an-ai-notes@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'an-ai-notes@acme.com');
+    platformDefault();
+    fakeLlm(f => app.setLlmFetch(f), () => json({
+      sql: 'SELECT city, count(*) AS n FROM silver.customer GROUP BY city',
+      notes: ['近 30 天按数据里最后一天往前算', '城市取自标准层 silver.customer'],
+    }));
+
+    const res = await analyst.post('/workbench', { intent: 'draft', request: '各城市近 30 天客户数', sql: 'SELECT 1' });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-draft-notes');
+    expect(html).toContain('AI 的口径假设');
+    const editor = html.search(/<textarea[^>]*name="sql"/);
+    for (const note of ['近 30 天按数据里最后一天往前算', '城市取自标准层 silver.customer']) {
+      expect(html.indexOf(note)).toBeGreaterThan(-1);
+      expect(html.indexOf(note)).toBeLessThan(editor);
+    }
   });
 
   it('模型判断做不到时 422：页面标题「AI 没有起草 SQL」下是模型给的原因，没有 Schema 报错，编辑框保留原来的 SQL', async () => {

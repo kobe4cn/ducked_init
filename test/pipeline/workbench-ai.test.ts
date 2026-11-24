@@ -135,6 +135,50 @@ describe('AI 起草 SQL', () => {
     });
   });
 
+  describe('口径假设（notes）', () => {
+    /** 模型给出这条 SQL，并带上口径假设 */
+    const modelWritesWithNotes = (sql: string, notes: unknown, extra: Record<string, string> = {}) => {
+      platformDefault();
+      return fakeLlm(setLlmFetch, () => json({ sql, notes, ...extra }));
+    };
+
+    it('带 notes 时原样返回；审计仍是 { sql, valid: true }，不含 notes 原文；提示词写明何时给 notes、写什么', async () => {
+      const sql = 'SELECT city, count(*) AS n_notes FROM silver.customer GROUP BY city';
+      const notes = ['近 30 天按数据里最后一天往前算', '城市取自标准层 silver.customer'];
+      const { received } = modelWritesWithNotes(sql, notes);
+
+      expect(await draftWorkbenchSql(await analyst(), '各城市客户数')).toEqual({ sql, catalogTruncated: false, notes });
+
+      expect(await drafted(sql)).toEqual([{ sql, valid: true }]);
+      expect(JSON.stringify(await audits('workbench.ai_drafted'))).not.toContain('最后一天往前算');
+      const system = received[0].body.messages.find(m => m.role === 'system')!.content;
+      expect(system).toContain('"notes"');
+      expect(system).toContain('最多 3 条');
+      expect(system).toContain('时间锚点');
+      expect(system).toContain('没有需要说明的假设就不给');
+    });
+
+    it('超过 3 条截到 3 条，空白条与 null、数字等非字符串丢弃，每条去掉首尾空白、截到 200 字', async () => {
+      const sql = 'SELECT count(*) AS n_trim FROM silver.customer';
+      modelWritesWithNotes(sql, ['  甲  ', ' \n ', null, 7, '乙'.repeat(300), '丙', '丁']);
+      expect(await draftWorkbenchSql(await analyst(), '客户总数')).toEqual({ sql, catalogTruncated: false, notes: ['甲', '乙'.repeat(200), '丙'] });
+    });
+
+    it('notes 全是空白时返回值没有 notes 键', async () => {
+      const sql = 'SELECT count(*) AS n_blank FROM silver.customer';
+      modelWritesWithNotes(sql, ['', '  ']);
+      const result = await draftWorkbenchSql(await analyst(), '客户总数');
+      expect(result).toEqual({ sql, catalogTruncated: false });
+      expect('notes' in result).toBe(false);
+    });
+
+    it('unsupported 与 notes 同时给时照旧 422，不返回 notes', async () => {
+      modelWritesWithNotes('SELECT 2', ['按今天往前算'], { unsupported: '目录里没有扫码表' });
+      expect(await errorOf(draftWorkbenchSql(await analyst(), '各城市扫码次数'))).toBe('422 目录里没有扫码表');
+      expect(await drafted('SELECT 2')).toEqual([]);
+    });
+  });
+
   it('同一个指标有两次 gold.dsl 快照时，提示里只有最新的那张，行尾注明是哪个指标的最新快照', async () => {
     const snapshot = async (finishedAt: Date) => {
       const [task] = await getDb().insert(tasks).values({ tenantId: acme, kind: 'gold.dsl', status: 'succeeded', params: { kind: 'metric', key: 'k1' }, finishedAt }).returning();
