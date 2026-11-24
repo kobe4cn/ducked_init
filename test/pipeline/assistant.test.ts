@@ -58,6 +58,45 @@ describe('AI 助手的一轮问答', () => {
     expect(logged.every(c => c.purpose === 'assistant' && c.error === null)).toBe(true);
   });
 
+  it('系统提示按成员角色写明不能做的操作（看数据源、起草、发布）：查看者三句都有，分析师只有不能发布，管理员一句都没有（#1189）', async () => {
+    platformDefault();
+    const acme = await newTenant('acme');
+    const SOURCES = '这位成员看不到数据源和源表';
+    const DRAFT = '这位成员不能起草指标、标签或映射';
+    const PUBLISH = '这位成员不能发布映射或定义';
+    const systemFor = async (email: string, role: 'viewer' | 'analyst' | 'admin') => {
+      const member = await memberOf(acme, email, role);
+      const { received } = fakeLlm(setLlmFetch, () => text('好的', TEXT_USAGE));
+      await assistantTurn(member, [{ role: 'user', content: QUESTION }], PAGE);
+      return received[0].body.messages[0].content as string;
+    };
+
+    const viewer = await systemFor('viewer@acme.com', 'viewer');
+    expect(viewer).toContain(SOURCES);
+    expect(viewer).toContain('不要建议成员去数据源或映射页面');
+    expect(viewer).toContain(DRAFT);
+    expect(viewer).toContain('不要调 save_* 工具');
+    expect(viewer).toContain(PUBLISH);
+    expect(viewer).toContain('需要有相应权限的成员来做');
+    // 查看者没有起草、填工作台的工具，也不该被叫去对应页面自己做
+    expect(viewer).not.toContain('告诉成员去对应页面自己做');
+    expect(viewer).not.toContain('保存草稿');
+    expect(viewer).not.toContain('保存后提醒成员');
+    expect(viewer).not.toContain('由成员自己执行');
+
+    const analyst = await systemFor('an@acme.com', 'analyst');
+    expect(analyst).not.toContain(SOURCES);
+    expect(analyst).not.toContain(DRAFT);
+    expect(analyst).toContain(PUBLISH);
+    expect(analyst).toContain('保存后提醒成员草稿要由另一位有发布权限的成员发布');
+    expect(analyst).toContain('由成员自己执行');
+
+    const admin = await systemFor('admin@acme.com', 'admin');
+    expect(admin).not.toMatch(/这位成员(看不到|不能)/);
+    expect(admin).toContain('保存后提醒成员草稿要由另一位有发布权限的成员发布');
+    expect(admin).toContain('告诉成员去对应页面自己做');
+  });
+
   it('一轮开始时解析一次档位模型，整轮所有请求都用它：中途改档位配置不影响本轮；llm_calls 每条都记 route reasoning', async () => {
     platformDefault();
     platformTier('reasoning', 'model-a');
