@@ -42,7 +42,7 @@ export function toReport(results: CaseResult[], total: Score, meta: { model: str
 }
 
 /** 结果文件名：<时间戳>-<模型>.json，时间戳去掉冒号与点，模型名里的路径分隔符换成 _ */
-export function reportFileName(report: EvalReport): string {
+export function reportFileName(report: Pick<EvalReport, 'startedAt' | 'model'>): string {
   return `${report.startedAt.replace(/[:.]/g, '-')}-${report.model.replace(/[/\\]/g, '_')}.json`;
 }
 
