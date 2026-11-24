@@ -196,7 +196,7 @@ const MAX_INTERPRETATION = 4000;
 /** 平台的哈希（加盐 sha256）：取值里出现就剔除整列，拼接、取子串等改写也躲不过 */
 const HASH = /[0-9a-f]{64}/i;
 
-const INTERPRET_SCHEMA = {
+export const INTERPRET_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   required: ['interpretation'],
@@ -275,7 +275,7 @@ function columnStats(sql: string, result: WorkbenchResult, keep: boolean[]) {
   return { sql, rowCount: result.rows.length, truncated: result.truncated, columns };
 }
 
-interface NumericFact { column: string; sum: number; max: number; min: number; maxShare?: number; minShare?: number; maxAt?: string; minAt?: string }
+export interface NumericFact { column: string; sum: number; max: number; min: number; maxShare?: number; minShare?: number; maxAt?: string; minAt?: string }
 
 const share = (part: number, sum: number) => Math.round((part / sum) * 1000) / 1000;
 
@@ -366,6 +366,33 @@ function interpretMessages(sql: string, { columns, rows }: ReturnType<typeof red
 }
 
 /**
+ * 解读要发给模型的消息（不请求模型、不查权限，评测也用它）：samples 为真时发前 INTERPRET_ROWS 行里没被剔除的列，
+ * 为假时只发 SQL、行数与留下的列的类型和统计；sent / dropped 是发送与剔除的列名（sent 为空时调用方自己报错），facts 是数值事实，detail 是不是明细结果
+ */
+export function interpretRequest(
+  result: WorkbenchResult, sql: string, samples: boolean,
+): { messages: LlmMessage[]; sent: string[]; dropped: string[]; facts: NumericFact[]; detail: boolean } {
+  const normalized = normalizeWorkbenchSql(sql);
+  let messages: LlmMessage[];
+  let sent: string[];
+  let dropped: string[];
+  // 数值事实按全部返回行、用比发样本更严的 keep 算：标签列取值来自第 INTERPRET_ROWS 行之后也不会带出哈希；不发样本时不带所在行
+  const factKeep = sendable(result, Infinity);
+  const detail = isDetail(result, factKeep);
+  const facts = numericFacts(result, factKeep, detail || !samples);
+  if (samples) {
+    const redacted = redactResult(result);
+    ({ dropped } = redacted);
+    sent = redacted.columns.map(c => c.name);
+    messages = interpretMessages(normalized, redacted, result.truncated, detail, facts);
+  } else {
+    ({ sent, dropped } = pickColumns(result, factKeep));
+    messages = statsMessages(columnStats(normalized, result, factKeep), detail, facts);
+  }
+  return { messages, sent, dropped, facts, detail };
+}
+
+/**
  * 成员确认后解读结果（ADR-0043）：没确认时 400，没配置模型服务时 409（都不发请求）；按 SQL 重新执行，
  * 租户打开「发送脱敏样本」时只发前 INTERPRET_ROWS 行里没被剔除的列，没打开时只发 SQL、行数与留下的列的类型和统计（samples: false，不发任何行）；
  * 全部被剔除时 400；模型失败时 422。
@@ -384,22 +411,7 @@ export async function interpretResult(
   const samples = await samplesAllowed(tenantId);
   const result = await rerun(actor, sql);
   const normalized = normalizeWorkbenchSql(sql);
-  let messages: LlmMessage[];
-  let sent: string[];
-  let dropped: string[];
-  // 数值事实按全部返回行、用比发样本更严的 keep 算：标签列取值来自第 INTERPRET_ROWS 行之后也不会带出哈希；不发样本时不带所在行
-  const factKeep = sendable(result, Infinity);
-  const detail = isDetail(result, factKeep);
-  const facts = numericFacts(result, factKeep, detail || !samples);
-  if (samples) {
-    const redacted = redactResult(result);
-    ({ dropped } = redacted);
-    sent = redacted.columns.map(c => c.name);
-    messages = interpretMessages(normalized, redacted, result.truncated, detail, facts);
-  } else {
-    ({ sent, dropped } = pickColumns(result, factKeep));
-    messages = statsMessages(columnStats(normalized, result, factKeep), detail, facts);
-  }
+  const { messages, sent, dropped } = interpretRequest(result, sql, samples);
   if (!sent.length) throw new WorkbenchAiError('没有可以发送的列：结果里的列都是系统列、敏感列或哈希', 400);
   let interpretation: string;
   try {
