@@ -45,7 +45,7 @@ describe('助手回复按 Markdown 渲染（#1186）', () => {
       'inline <script>x</script> here',
     ].join('\n'));
     expect(html).toContain('<table');
-    expect(html).toContain('<td class="border px-2 py-1">paid</td>');
+    expect(html).toMatch(/<td[^>]*>(<div[^>]*>)?paid(<\/div>)?<\/td>/);
     expect(html).toMatch(/<pre[^>]*><code class="language-sql">SELECT 1 AS n\n<\/code><\/pre>/);
     expect(html).toContain('<strong>revenue</strong>');
     expect(html).toContain('<code class="rounded bg-slate-100 px-1 font-mono text-xs">metric:paid</code>');

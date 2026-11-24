@@ -37,9 +37,10 @@ const components: Components = {
   img: ({ alt }) => <span>{alt}</span>,
   ul: ({ children }) => <ul className="list-disc pl-5">{children}</ul>,
   ol: ({ children }) => <ol className="list-decimal pl-5">{children}</ol>,
-  table: ({ children }) => <div className="overflow-x-auto"><table className="border-collapse text-xs">{children}</table></div>,
-  th: ({ children }) => <th className="border px-2 py-1 text-left font-medium">{children}</th>,
-  td: ({ children }) => <td className="border px-2 py-1">{children}</td>,
+  // 面板只有 420px 宽：表格按内容宽度排、单元格最宽 14rem 再折行，列多时整表横向滚动，而不是把窄列挤成一字一行
+  table: ({ children }) => <div className="overflow-x-auto"><table className="w-max border-collapse text-xs">{children}</table></div>,
+  th: ({ children }) => <th className="whitespace-nowrap border px-2 py-1 text-left align-top font-medium">{children}</th>,
+  td: ({ children }) => <td className="border px-2 py-1 align-top"><div className="max-w-56">{children}</div></td>,
   pre: ({ children }) => <pre className="overflow-x-auto rounded-lg bg-slate-800 p-2 font-mono text-xs text-slate-100">{children}</pre>,
   // 代码块里的 code 继承 pre 的样式，只有行内 code 加浅底：代码块带 language-* 类，或内容以换行结尾（hast 给块级代码补的）
   code: ({ className, children }) => {
