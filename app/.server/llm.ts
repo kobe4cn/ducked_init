@@ -49,7 +49,8 @@ export interface LlmProvider {
 
 /** transient：超时、连不上、HTTP 5xx 或 429，过一会儿再试可能就好了 */
 export class LlmError extends Error {
-  constructor(message: string, readonly transient = false) { super(message); }
+  /** status：HTTP 错误的状态码（postJson 填），callModel 据此判断要不要退回 json_object */
+  constructor(message: string, readonly transient = false, readonly status?: number) { super(message); }
 }
 
 /** 租户 API Key 的加密 context（ADR-0009），解密时须给出同一个 */
@@ -65,7 +66,7 @@ function timeoutMs(env: Record<string, string | undefined> = process.env): numbe
 let fetchOverride: typeof fetch | undefined;
 
 /** 测试通过它注入假 fetch；传 undefined 恢复真实 fetch */
-export function setLlmFetch(f: typeof fetch | undefined) { fetchOverride = f; }
+export function setLlmFetch(f: typeof fetch | undefined) { fetchOverride = f; jsonObjectOnly.clear(); }
 
 const llmFetch = () => fetchOverride ?? fetch;
 
@@ -274,7 +275,7 @@ async function postJson(provider: LlmProvider, path: string, payload: Record<str
     signal: AbortSignal.timeout(timeout),
   });
   // 先遮蔽再截断：Key 跨过截断处时半截 Key 就遮不住了
-  if (!res.ok) throw new LlmError(`模型服务返回 HTTP ${res.status}：${maskKey(apiKey, await res.text()).slice(0, 200)}`, res.status >= 500 || res.status === 429);
+  if (!res.ok) throw new LlmError(`模型服务返回 HTTP ${res.status}：${maskKey(apiKey, await res.text()).slice(0, 200)}`, res.status >= 500 || res.status === 429, res.status);
   return res.json().catch(() => null);
 }
 
@@ -356,13 +357,46 @@ function dropNullOptionals(value: unknown, errors: ErrorObject[] | null | undefi
   return dropped;
 }
 
+/** 发给模型前从 Schema 里剥掉的关键字：条件与组合（服务商不一定接受，Ollama 遇到会悄悄忽略整个约束）及引用 / 元信息；
+ *  这些跨字段规则仍由 Ajv 用完整 Schema 校验（#1178、#1191） */
+export const MODEL_DROPPED_KEYS = new Set(['if', 'then', 'else', 'not', 'allOf', '$id', '$schema', '$ref']);
+
+/** Schema 的深拷贝，递归去掉 MODEL_DROPPED_KEYS；不改原 Schema。callModel 的 json_schema 与助手 validate_plan 的工具参数共用 */
+export function schemaForModel(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(schemaForModel);
+  if (!schema || typeof schema !== 'object') return schema;
+  return Object.fromEntries(Object.entries(schema).filter(([k]) => !MODEL_DROPPED_KEYS.has(k)).map(([k, v]) => [k, schemaForModel(v)]));
+}
+
+/** 拒绝过 json_schema、退回 json_object 成功的端点与模型（键 `${baseUrl}|${model}`），之后直接发 json_object（ADR-0035 修订）。
+ *  进程内缓存，setLlmFetch 时清空 */
+const jsonObjectOnly = new Set<string>();
+
 /**
  * 用给定的端点调用模型，返回按 schema 校验过的 JSON。不查库、不记日志（评测命令直接用它，产品走 chatJson）。
  * 失败都抛 LlmError（消息里的 API Key 换成 ***，HTTP 错误只带状态码与前 200 字的响应体）；stats 由调用方传入时顺带填上令牌数与校验结果
  */
-export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[], schema: object, stats: CallStats = { schemaValid: null }): Promise<T> {
+export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[], schema: object, stats: CallStats = { schemaValid: null },
+  name = 'output'): Promise<T> {
   return masked(provider.apiKey, async () => {
-    const { content, finishReason } = await postChat(provider, { messages, response_format: { type: 'json_object' } }, stats);
+    // 根是 object 的 Schema 剥掉条件关键字后以 json_schema（strict: false，现有 Schema 多不满足 strict）发给模型；
+    // 根不是 object（如根上 anyOf）或端点拒绝过时发 json_object。HTTP 400 / 422 时同一模型改发 json_object 一次，成功才记缓存
+    const modelSchema = schemaForModel(schema);
+    const key = `${provider.baseUrl}|${provider.model}`;
+    const asSchema = isRecord(modelSchema) && modelSchema.type === 'object' && !jsonObjectOnly.has(key);
+    const jsonObject = () => postChat(provider, { messages, response_format: { type: 'json_object' } }, stats);
+    let reply: RawMessage;
+    if (!asSchema) reply = await jsonObject();
+    else {
+      try {
+        reply = await postChat(provider, { messages, response_format: { type: 'json_schema', json_schema: { name, schema: modelSchema, strict: false } } }, stats);
+      } catch (e) {
+        if (!(e instanceof LlmError && (e.status === 400 || e.status === 422))) throw e;
+        reply = await jsonObject();
+        jsonObjectOnly.add(key);
+      }
+    }
+    const { content, finishReason } = reply;
     if (typeof content !== 'string') throw new LlmError('模型服务的返回里没有 choices[0].message.content');
     // 截断检查放在解析之前：截断的输出多半也不是合法 JSON，先报原因更清楚（schemaValid 留 null）
     if (finishReason === 'length') throw new LlmError(zh(msg('模型输出被截断（达到输出长度上限），请把需求写得更具体，或换上下文更长的模型')));
@@ -444,7 +478,7 @@ async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider:
 
 /** 按租户的模型服务 callModel，记调用日志（logged） */
 export const chatJson = <T>(tenantId: string, purpose: LlmPurpose, messages: LlmMessage[], schema: object): Promise<T> =>
-  logged(tenantId, purpose, (provider, stats) => callModel<T>(provider, messages, schema, stats));
+  logged(tenantId, purpose, (provider, stats) => callModel<T>(provider, messages, schema, stats, purpose));
 
 /** 按租户的模型服务 callTools，记调用日志（logged；schema_valid 为 null） */
 export const chatTools = (tenantId: string, purpose: LlmPurpose, messages: LlmMessage[], tools: LlmTool[]): Promise<ToolReply> =>

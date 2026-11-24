@@ -30,6 +30,7 @@ import { createDefinition, DslError, saveDslDraft, validateDefinition } from '..
 import { METRIC_SCHEMA, type DslIssue } from '../pipeline/dsl/metric-spec';
 import { TAG_SCHEMA } from '../pipeline/dsl/tag-spec';
 import { createMapping, MappingError, saveMappingDraft, validateNewMapping } from '../mappings';
+import { schemaForModel } from '../llm';
 import type { ChoiceGroup } from './conversations';
 import { sourceIdByName } from '../source-config';
 import { checkDraftedSql, runQuery, WORKBENCH_ROWS } from '../workbench';
@@ -196,16 +197,6 @@ function mappingTable(yaml: string): unknown {
 /** prefill_workbench 接受的 SQL 上限：工作台路由 ?sql= 超过这个字数会被忽略（app/routes/workbench.tsx 的 MAX_SQL_PARAM 同值，不从路由文件导入） */
 const MAX_PREFILL_SQL = 20_000;
 
-/** 发给模型前从参数 Schema 里剥掉的关键字：条件与组合（服务商不一定接受）及引用 / 元信息；这些跨字段规则仍由 Ajv 用完整 Schema 校验 */
-const MODEL_DROPPED_KEYS = new Set(['if', 'then', 'else', 'not', 'allOf', '$id', '$schema', '$ref']);
-
-/** Schema 的深拷贝，递归去掉 MODEL_DROPPED_KEYS；不改原 Schema */
-function forModel(schema: unknown): unknown {
-  if (Array.isArray(schema)) return schema.map(forModel);
-  if (!schema || typeof schema !== 'object') return schema;
-  return Object.fromEntries(Object.entries(schema).filter(([k]) => !MODEL_DROPPED_KEYS.has(k)).map(([k, v]) => [k, forModel(v)]));
-}
-
 /** validate_plan 说明末尾附的最小合法 draft_query 计划（#1178）：fetch 的 inputs 引用 selected 的 id，aggregate 带 agg、inputs 恰好一个前面的步骤 */
 export const PLAN_EXAMPLE: AnalysisPlan = {
   schemaVersion: 1,
@@ -302,7 +293,7 @@ export const TOOLS: AssistantTool[] = [
       + '可选的 rationale 说明为何选；原因里不要写目录以外的名称。返回 status（valid / needs_clarification / unsupported / invalid）与逐条问题。'
       + `最小合法示例（draft_query）：${JSON.stringify(PLAN_EXAMPLE)}`,
     // 发给模型的是计划的完整结构（#1178），入参只查 plan 是对象：结构错误由 validatePlan 以 status: invalid 与逐条问题返回，不在 invokeTool 处 400
-    inputSchema: { type: 'object', required: ['plan'], properties: { plan: forModel(PLAN_SCHEMA) }, additionalProperties: false },
+    inputSchema: { type: 'object', required: ['plan'], properties: { plan: schemaForModel(PLAN_SCHEMA) }, additionalProperties: false },
     inputCheck: { type: 'object', required: ['plan'], properties: { plan: { type: 'object' } }, additionalProperties: false },
     outputSchema: TEXT,
     permission: 'definitions:read',
