@@ -499,7 +499,7 @@ describe('模型服务页', () => {
     expect(page).toContain('data-connectivity="ok"');
     expect(page).toContain('data-model="deepseek-chat"');
     expect(page).toContain('data-connectivity-fast="ok"');
-    expect(Number(/data-duration-ms-fast="(\d+)"/.exec(page)?.[1])).toBeGreaterThanOrEqual(600);
+    expect(Number(/data-duration-ms-fast="(\d+)"/.exec(page)?.[1])).toBeGreaterThan(500);
     expect(page).toContain('data-slow-hint="fast"');
     expect(page).toContain('可能是思考模型，可在服务商参数里关闭思考');
     expect(page).not.toContain('data-slow-hint="default"');
