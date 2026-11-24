@@ -4,7 +4,9 @@
 import type { DuckDBConnection } from '@duckdb/node-api';
 import type { AssertionResult } from './assertions';
 import { evalCustomAssertions } from './custom-assertions';
+import { LOGIN_EVENT } from './identity-engine';
 import type { MergePlan } from './mapping-spec';
+import { lit } from '../../lib/mapping-expr';
 import { liveRecords, mappingInput, sensitiveColumns, transformRows, unknownValues, type FallbackStat, type SourceViewParam } from './merge-engine';
 
 /** 样例里的一列：是否敏感（值是哈希）、是否必填（去重键与身份打通的匹配字段），以及为空的行数 */
@@ -30,6 +32,8 @@ export interface DryRunResult {
     unknownValues: DryRunUnknown[];
     /** 映射里声明的自定义断言，按声明顺序；老版本的计划没有断言时为空 */
     custom: AssertionResult[];
+    /** 样例里的登录事件（只有 event 计划才有）：values 是认的 event_type 取值，mapped 为假时没有映射 event_type、rows 为 0 */
+    login?: { values: string[]; rows: number; mapped: boolean };
   };
 }
 
@@ -44,6 +48,14 @@ const rows = async <T>(con: DuckDBConnection, sql: string) => (await con.runAndR
 
 /** 必填字段：去重键，加上身份打通的匹配字段（映射出来的） */
 const requiredColumns = (plan: MergePlan) => new Set([...plan.key, ...(plan.identity?.match ?? []).filter(m => plan.columns.some(c => c.name === m))]);
+
+/** 样例里 event_type 是登录取值的行数；老版本的计划没有 loginEvents 时认 login */
+async function loginEvents(con: DuckDBConnection, plan: MergePlan) {
+  const values = plan.loginEvents ?? [LOGIN_EVENT];
+  if (!plan.columns.some(c => c.name === 'event_type')) return { values, rows: 0, mapped: false };
+  const [{ n }] = await rows<{ n: string }>(con, `SELECT count(*) FILTER (WHERE event_type IN (${values.map(lit).join(', ')})) AS n FROM ${ROWS}`);
+  return { values, rows: Number(n), mapped: true };
+}
 
 /**
  * 空跑一个映射：源表还没有同步进原始层时返回 skipped。样例取最近批次里的记录（同一批次按记录哈希，结果确定）；
@@ -69,6 +81,7 @@ export async function dryRun(
     }
     await transformRows(con, plan, salt, { live: SAMPLE, into: ROWS });
     const custom = await evalCustomAssertions(con, ROWS, plan.entity, plan.assertions ?? []);
+    const login = plan.entity === 'event' ? await loginEvents(con, plan) : undefined;
 
     const names = plan.columns.map(c => c.name);
     const [stats] = await rows<Record<string, string>>(con, `SELECT count(*) AS _rows,
@@ -91,6 +104,7 @@ export async function dryRun(
         requiredNulls: Object.fromEntries(columns.filter(c => c.required).map(c => [c.name, c.nulls])),
         unknownValues: unknown,
         custom,
+        ...(login && { login }),
       },
     };
   } finally {

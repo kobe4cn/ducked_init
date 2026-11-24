@@ -41,6 +41,8 @@ export interface MappingSpec {
   identity?: IdentityRules;
   /** 属性取舍的数据源优先级（只用于 customer，ADR-0027）：名次越小越优先，没配的映射排在配了的之后 */
   survivorship?: Survivorship;
+  /** 登录事件的 event_type 取值（只用于 event，ADR-0019 设备归属）：不写时认 login */
+  login_events?: string[];
   /** 行过滤（ADR-0024）：返回布尔的表达式，不满足（含取值为空）的源记录不进标准层 */
   where?: string;
   /** 映射级自定义断言（ADR-0026）：给映射出的字段声明的检查，同一字段的同一种检查只能写一次 */
@@ -150,6 +152,7 @@ export const MAPPING_SCHEMA = {
         priority: { type: 'integer', minimum: 1 },
       },
     },
+    login_events: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 } },
     where: { type: 'string', minLength: 1 },
     assertions: { type: 'array', items: customAssertion },
   },
@@ -197,6 +200,8 @@ export interface MergePlan {
   identity?: IdentityRules;
   /** 属性取舍的名次（只有配置了的 customer 映射才有） */
   survivorship?: Survivorship;
+  /** 登录事件的 event_type 取值：只有配置了的 event 映射才有，没有时认 login */
+  loginEvents?: string[];
   /** 映射声明的键空间，写进标准层的 _key_space */
   keySpace?: string;
   /** 行过滤：返回布尔的表达式，不满足（含取值为空）的源记录视为不存在 */
@@ -716,6 +721,11 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
     issue(['survivorship'], '只有消费者（customer）映射能配置属性取舍的优先级', { atKey: true });
   }
 
+  // 登录事件的取值：只用于 event
+  if (spec.login_events && spec.entity !== 'event') {
+    issue(['login_events'], '只有行为事件（event）映射能配置登录事件的取值', { atKey: true });
+  }
+
   checkAssertions(spec.assertions ?? [], mapped, issue);
 
   if (issues.length) return { ok: false, issues: issues.sort(ISSUE_ORDER) };
@@ -733,6 +743,7 @@ export function checkMapping(text: string, sourceColumns?: SourceColumns, regist
       latest,
       ...(spec.identity && { identity: { match: [...spec.identity.match] } }),
       ...(spec.survivorship && { survivorship: { priority: spec.survivorship.priority } }),
+      ...(spec.login_events && { loginEvents: [...spec.login_events] }),
       ...(spec.key_space && primaryKey && { keySpace: spec.key_space }),
       ...(spec.where && { where: spec.where }),
       ...(spec.assertions && { assertions: spec.assertions.map(a => ({ ...a })) }),

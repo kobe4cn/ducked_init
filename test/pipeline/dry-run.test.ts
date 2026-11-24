@@ -9,6 +9,7 @@ import { syncSource } from '../../app/.server/source-sync';
 import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, publish, selectAllTables, silver } from './fixtures';
+import { events } from './mapping-fixtures';
 import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -105,6 +106,25 @@ describe('映射空跑', () => {
     expect(result.columns.find(c => c.name === 'email')).toMatchObject({ sensitive: true, required: true, nulls: 10 });
     expect(result.columns.find(c => c.name === 'city')).toMatchObject({ sensitive: false, required: false, nulls: 0 });
     expect(result.assertions).toMatchObject({ key: ['customer_id'], keyNulls: 0, keyDuplicates: 0, requiredNulls: { customer_id: 0, email: 10 }, unknownValues: [] });
+  });
+
+  it('event 映射空跑数样例里的登录事件：没写 login_events 时认 login，写了用它；没映射 event_type 时标明；别的实体没有这一项', async () => {
+    const { author, id } = await syncedSource();
+    const EVENT_FIELDS = '  event_type: event_type\n  occurred_at: occurred_at\n';
+    const mapping = await createMapping(author, id, events('events', 'customer_id', EVENT_FIELDS));
+    const plain = await dryRunMapping(author, mapping.id, 1);
+    expect(plain.sampled).toBeGreaterThan(0);
+    expect(plain.assertions.login).toEqual({ values: ['login'], rows: 0, mapped: true });
+
+    const configured = await saveDraft(author, mapping.id, events('events', 'customer_id', `${EVENT_FIELDS}login_events: [view, sign_in]\n`));
+    const withLogin = await dryRunMapping(author, mapping.id, configured);
+    expect(withLogin.assertions.login).toEqual({ values: ['view', 'sign_in'], rows: withLogin.sampled, mapped: true });
+
+    const unmapped = await saveDraft(author, mapping.id, events('events', 'customer_id', '  occurred_at: occurred_at\n'));
+    expect((await dryRunMapping(author, mapping.id, unmapped)).assertions.login).toEqual({ values: ['login'], rows: 0, mapped: false });
+
+    const orders = await createMapping(author, id, ORDERS);
+    expect((await dryRunMapping(author, orders.id, 1)).assertions).not.toHaveProperty('login');
   });
 
   it('样例最多取 50 条；值字典里没有的取值列出来，并标明合并时是写兜底值还是报错', async () => {
