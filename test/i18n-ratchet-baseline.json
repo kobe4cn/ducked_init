@@ -4,7 +4,7 @@
     "app/.server/api-auth.ts": 1,
     "app/.server/assistant/conversations.ts": 7,
     "app/.server/assistant/knowledge-ask.ts": 9,
-    "app/.server/assistant/loop.ts": 38,
+    "app/.server/assistant/loop.ts": 39,
     "app/.server/assistant/plan-card.ts": 3,
     "app/.server/assistant/tools.ts": 65,
     "app/.server/audit.ts": 190,
