@@ -81,6 +81,7 @@
   "表达式为空": "The expression is empty",
   "表达式有误（{error}），请在 YAML 里修改": "The expression is invalid ({error}); edit it in the YAML",
   "请填写名称，用来辨认是哪个外部系统": "Enter a name to identify the external system",
+  "请求已取消": "Request cancelled",
   "请至少勾选一类接口": "Select at least one API type",
   "请至少选择一个标签、指标或 RFM": "Select at least one tag, metric or RFM",
   "调度器失联，任务中断": "Dispatcher lost; task interrupted",

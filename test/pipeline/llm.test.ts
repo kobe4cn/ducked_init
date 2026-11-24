@@ -11,7 +11,7 @@ import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, modelProviders } from '../../app/.server/db/schema';
-import { chatJson, chatTools, embed, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch, setLlmSleep } from '../../app/.server/llm';
+import { chatJson, chatTools, chatToolsWith, embed, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch, setLlmSleep } from '../../app/.server/llm';
 import { ModelProviderError, resetModelProvider, resetTierProvider, saveModelProvider, saveTierProvider, tableContextFor } from '../../app/.server/model-provider';
 import { encryptForTenant } from '../../app/.server/secrets';
 import { syncSource } from '../../app/.server/source-sync';
@@ -429,6 +429,51 @@ describe('模型服务客户端', () => {
       expect(err.message).toMatch(message);
       expect((await calls(acme)).at(-1)).toMatchObject({ purpose: 'connectivity', error: expect.stringMatching(message) });
     }
+  });
+
+  it('chatJson / chatToolsWith 接受外部 signal（#1248）：调用前已中止时不发请求、不记 llm_calls；请求途中中止时 fetch 被取消，抛 aborted 的 LlmError（transient、timeout 都是 false）并记带 error 的调用', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const controller = new AbortController();
+    controller.abort();
+
+    // 调用前已中止：chatJson 与 chatToolsWith 都不发请求、不记日志（惰性起调用，免得后一个提前 reject 变成 unhandled rejection）
+    const route = await resolveRoute(acme, 'assistant');
+    for (const pending of [
+      () => chatJson(acme, 'connectivity', MESSAGES, SCHEMA, { signal: controller.signal }),
+      () => chatToolsWith(acme, 'assistant', route!, MESSAGES, [{ name: 't', description: 'd', parameters: {} }], { signal: controller.signal }),
+    ]) {
+      const err = await failure(pending()) as LlmError;
+      expect(err).toBeInstanceOf(LlmError);
+      expect(err.message).toBe('请求已取消');
+      expect(err.aborted).toBe(true);
+      expect(err.transient).toBe(false);
+      expect(err.timeout).toBe(false);
+    }
+    const { f } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+    expect(f).not.toHaveBeenCalled();
+    expect(await calls(acme)).toHaveLength(0);
+
+    // 请求途中中止：假 fetch 遵守 init.signal（挂上监听后立刻中止，模拟客户端断开），fetch 的 signal 确实被取消
+    const mid = new AbortController();
+    const seen: AbortSignal[] = [];
+    setLlmFetch((_url, init) => new Promise((_resolve, reject) => {
+      const signal = (init as { signal?: AbortSignal } | undefined)?.signal;
+      seen.push(signal!);
+      signal?.addEventListener('abort', () => reject(signal.reason));
+      mid.abort();
+    }));
+    const err = await failure(chatJson(acme, 'connectivity', MESSAGES, SCHEMA, { signal: mid.signal })) as LlmError;
+    expect(err).toBeInstanceOf(LlmError);
+    expect(err.message).toBe('请求已取消');
+    expect(err.aborted).toBe(true);
+    expect(err.transient).toBe(false);
+    expect(err.timeout).toBe(false);
+    expect(seen[0].aborted).toBe(true);
+    // 已经计费的那次请求仍记一行带 error 的调用
+    const rows = await calls(acme);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ purpose: 'connectivity', error: '请求已取消' });
   });
 });
 
