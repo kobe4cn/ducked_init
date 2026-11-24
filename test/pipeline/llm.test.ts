@@ -648,6 +648,8 @@ describe('租户的服务商参数（#1169）', () => {
     const admin = await memberOf(acme, 'admin@acme.com', 'admin');
     const base = { baseUrl: 'https://tenant.example.com/v1', model: 'deepseek-chat', apiKey: 'sk-tenant-secret' };
     const row = async () => (await getDb().select().from(modelProviders).where(eq(modelProviders.tenantId, acme)))[0];
+    // saveTierProvider 保存前会先发一次 json_object 探测（#1213）
+    fakeLlm(setLlmFetch, () => json({ ok: true }, USAGE));
 
     for (const bad of ['[1]', 'null', '"x"', '{oops', '{"model":"x"}', '{"enable_thinking":false,"messages":[]}']) {
       expect(await failure(saveModelProvider(admin, { ...base, chatExtra: bad }))).toBeInstanceOf(ModelProviderError);
