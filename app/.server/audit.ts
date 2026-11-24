@@ -176,10 +176,10 @@ const ACTIONS = {
       ? `模型服务：${d.error}`
       : `映射校验有 ${d.issues} 处问题`}`,
   },
-  // 模型草稿个别项不过校验、去掉后采用其余内容（ADR-0035）：只记去掉了哪些位置与问题数，不记模型原文、表达式与取值
+  // 模型草稿个别项不过校验、去掉后采用其余内容（ADR-0035；详情页建议断言时 kind = assertions，dropped 是断言名）：只记去掉了哪些位置与问题数，不记模型原文、表达式与取值
   'mapping.model_draft_partial': {
     label: '模型生成映射草稿部分采用',
-    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，去掉 ${(d.dropped as string[]).length} 项：${(d.dropped as string[]).join('、')}`,
+    describe: (d: Detail) => `「${d.source}」${d.table} → ${entityLabel(String(d.entity))}，${d.kind === 'assertions' ? '建议断言，' : ''}去掉 ${(d.dropped as string[]).length} 项：${(d.dropped as string[]).join('、')}`,
   },
   // 成员保存从生成草稿开始改过的映射（ADR-0003、ADR-0035）：只记字段名、哪些属性改了与增删改的断言名，这里只显示字段数与是否改了断言
   'mapping.generation_edited': {
