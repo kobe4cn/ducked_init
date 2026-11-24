@@ -75,7 +75,7 @@ export interface ToolCtx { retrieved: Set<string>; plan?: AnalysisPlan; priorPla
 
 const TEXT = { type: 'string' };
 
-const LANE_NAMES: Record<HitReason['lane'], string> = { id: '标识', alias: '别名', name: '名称', keyword: '关键词', vector: '语义', expand: '依赖展开' };
+const LANE_NAMES: Record<HitReason['lane'], string> = { id: '标识', alias: '别名', name: '名称', keyword: '关键词', vector: '语义', measure: '度量字段', expand: '依赖展开' };
 
 /** 条目的 Markdown 加一行语义哈希：模型把哈希带进计划，validatePlan 用它发现条目内容变了（哈希在成员自己那份按角色裁剪的目录上算）。
  *  restricted 目录里被清掉的来源写「按你的角色不显示」：只改渲染，不往条目上加标记，哈希与投影都不变（#1188） */

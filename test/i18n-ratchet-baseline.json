@@ -18,6 +18,7 @@
     "app/.server/catalog/index.ts": 50,
     "app/.server/catalog/plan.ts": 28,
     "app/.server/catalog/projection.ts": 1,
+    "app/.server/catalog/rank.ts": 2,
     "app/.server/catalog/tx.ts": 2,
     "app/.server/catalog/vector-store-pgvector.ts": 2,
     "app/.server/custom-entities.ts": 45,

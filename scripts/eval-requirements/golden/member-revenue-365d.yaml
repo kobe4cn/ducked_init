@@ -1,0 +1,7 @@
+request: P01 这类会员近一年扣除退款的消费金额在哪里看？
+failure_type: a
+retrieval:
+  candidates: [metric:revenue_365d]
+  forbidden: [metric:gross_revenue_30d]
+  ambiguous: false
+clarify: null

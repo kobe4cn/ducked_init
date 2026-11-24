@@ -22,6 +22,7 @@ export const PLAN_MODE_BY_ID: Record<string, PlanMode> = {
   'active-ambiguous': 'clarify',
   'aov-ambiguous': 'clarify',
   'channel-ambiguous': 'clarify',
+  'consumption-amount': 'clarify',
   'dormant-alias': 'clarify',
   'points-ambiguous': 'clarify',
   'purchase-frequency-alias': 'clarify',
@@ -50,6 +51,7 @@ export const PLAN_MODE_BY_ID: Record<string, PlanMode> = {
   // 4. 其余：已有发布指标直接回答的 reuse_result，要查源表 / 血缘 / 属性分组的 draft_query；
   //    其中查看者问血缘的是手工标的 unsupported（目录不带血缘、没有源表，权限做不到）
   'gmv-alias': 'reuse_result', // gross_revenue_30d 挂着 GMV 别名，口径就是按下单时间含退款的营收
+  'member-revenue-365d': 'reuse_result', // revenue_365d 直接回答：近一年、已支付 / 已发货 / 已完成（不含退款）的订单金额
   'viewer-paid-revenue': 'reuse_result', // revenue_paid_30d，查看者目录里也有
   'analyst-pos-sales': 'draft_query', // 看 pos_sales 源表，不是指标
   'analyst-source-tables': 'draft_query', // 列商城数据源的源表
