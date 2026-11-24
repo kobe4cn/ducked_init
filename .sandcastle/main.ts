@@ -269,27 +269,36 @@ plain() { sed 's/\[[0-9;]*m//g' "$1"; }
 failures() { plain "$1" | sed -n '/Failed \(Tests\|Suites\)/,/Test Files/p' | grep -v 'Test Files' | cut -c1-300 | head -80; }
 totals() { plain "$1" | grep -E "Test Files|Tests " | tail -2; }
 ${GATE_SELECT}
+unit=$(ls test/*.test.ts test/*.test.tsx 2>/dev/null | tr '\n' ' ')
 if [ "$tier" = selected ]; then
   echo "GATE_TIER: selected（test/http 全部、test/ 根目录单元测试，加 test/pipeline 里依赖图选中的 $n / $total 个）"
   [ -n "$picked" ] && printf '%s\n' "$picked" | sed 's/^/  /'
-  testcmd="npx vitest run test/http $(ls test/*.test.ts test/*.test.tsx 2>/dev/null | tr '\n' ' ') $(echo $picked)"
+  testcmd="npx vitest run test/http $(echo $picked)"
 else
   echo "GATE_TIER: full（$reason）"
-  testcmd="npm run test"
+  testcmd="npx vitest run test/http test/pipeline"
 fi
-npm run typecheck > /tmp/gate-typecheck.log 2>&1 || { plain /tmp/gate-typecheck.log | tail -40; exit 1; }
-$testcmd > /tmp/gate-test.log 2>&1 && { totals /tmp/gate-test.log; exit 0; }
-files=$(plain /tmp/gate-test.log | grep -oE "FAIL +test/[^ ]+\.test\.tsx?" | awk '{print $2}' | sort -u)
-count=$(printf '%s
+# 跑一段测试：通过返回 0；失败文件不超过 GATE_RERUN_MAX 个时单独重跑一次，重跑通过记 GATE_FLAKY
+stage() {
+  log=$1; shift
+  "$@" > $log 2>&1 && { totals $log; return 0; }
+  files=$(plain $log | grep -oE "FAIL +test/[^ ]+\.test\.tsx?" | awk '{print $2}' | sort -u)
+  count=$(printf '%s
 ' "$files" | grep -c .)
-if [ "$count" -eq 0 ] || [ "$count" -gt ${GATE_RERUN_MAX} ]; then
-  echo "测试失败（失败文件 $count 个，不重跑）："; failures /tmp/gate-test.log; totals /tmp/gate-test.log; exit 1
-fi
-echo "测试有 $count 个文件失败，单独重跑一次："; echo "$files"
-npx vitest run $files > /tmp/gate-rerun.log 2>&1 || {
-  echo "重跑仍失败："; failures /tmp/gate-rerun.log; totals /tmp/gate-rerun.log; exit 1
+  if [ "$count" -eq 0 ] || [ "$count" -gt ${GATE_RERUN_MAX} ]; then
+    echo "测试失败（失败文件 $count 个，不重跑）："; failures $log; totals $log; return 1
+  fi
+  echo "测试有 $count 个文件失败，单独重跑一次："; echo "$files"
+  npx vitest run $files > $log.rerun 2>&1 || { echo "重跑仍失败："; failures $log.rerun; totals $log.rerun; return 1; }
+  echo "GATE_FLAKY: 重跑通过。第一次的失败："; failures $log; totals $log
 }
-echo "GATE_FLAKY: 重跑通过。第一次的失败："; failures /tmp/gate-test.log; totals /tmp/gate-test.log
+npm run typecheck > /tmp/gate-typecheck.log 2>&1 || { plain /tmp/gate-typecheck.log | tail -40; exit 1; }
+# 先跑 test/ 根目录的单元测试（约 1–2 分钟）：i18n 棘轮这类几秒就能报的失败不用等 40 分钟的完整测试
+if [ -n "$unit" ]; then
+  echo "单元测试（test/ 根目录）："
+  stage /tmp/gate-unit.log npx vitest run $unit || exit 1
+fi
+stage /tmp/gate-test.log $testcmd || exit 1
 `;
 
 // 门槛同一时间只跑一个（不分档位）：两个沙箱同时跑时 CPU 和 PG 都被挤满，单个用例常要 30 多秒，各跑 75–90 分钟，
@@ -797,8 +806,11 @@ function reopenRequestedRevisions() {
  * 就在那张票上追加一次出现记录，不重复开票。返回票号，写进 PR 的 Gate 一节。
  */
 function reportFlaky(issue: Issue, pr: string, gateOutput: string): string[] {
-  const [before, after = ""] = gateOutput.split("GATE_FLAKY");
-  const files = [...new Set(before!.match(/^test\/\S+\.test\.tsx?$/gm) ?? [])];
+  // 单元测试和后面一段各可能重跑通过一次（两个 GATE_FLAKY）：每段重跑前列出的文件都要算上
+  const parts = gateOutput.split("GATE_FLAKY");
+  const before = parts.slice(0, -1).join("\n");
+  const after = parts.slice(1).join("\n");
+  const files = [...new Set(before.match(/^test\/\S+\.test\.tsx?$/gm) ?? [])];
   if (files.length === 0) return [];
   trySh("gh", ["label", "create", LABEL.flaky, "--color", "fbca04", "--description", "偶发失败的测试（Sandcastle 门槛自动开票）"]);
   const open: { number: number; title: string; body: string }[] = JSON.parse(
@@ -929,7 +941,7 @@ async function build(issue: Issue) {
         idleTimeoutSeconds: AGENT_IDLE_TIMEOUT_S,
         agent,
         prompt: [
-          `分支 ${issue.branch}（issue #${issue.id}）在合并门槛上失败，摘要如下；完整日志在 /tmp/gate-typecheck.log、/tmp/gate-test.log 与重跑的 /tmp/gate-rerun.log（用 grep 看，不要整读）。测试失败的文件不超过 ${GATE_RERUN_MAX} 个时已经单独重跑过一次，仍失败才到你这里。`,
+          `分支 ${issue.branch}（issue #${issue.id}）在合并门槛上失败，摘要如下；完整日志在 /tmp/gate-typecheck.log、/tmp/gate-unit.log（test/ 根目录单元测试，先跑）、/tmp/gate-test.log，重跑的在同名加 .rerun（用 grep 看，不要整读）。测试失败的文件不超过 ${GATE_RERUN_MAX} 个时已经单独重跑过一次，仍失败才到你这里。`,
           "```", gateResult.stdout.slice(-4000), "```",
           "只修这些失败：用 `npx vitest run <file>` 跑失败的文件确认变绿，按仓库风格写中文提交信息、末尾 (#" + issue.id + ")。",
           "如果失败与本票改动无关（偶发、环境问题）或不能确定怎么修，不要改代码，在输出里说明原因。",

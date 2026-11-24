@@ -29,6 +29,7 @@
 - 开发中只跑相关测试文件：`npx vitest run <file>`。测试连的 PG、MySQL、MongoDB、对象存储都已经通过环境变量配好（宿主机上的容器），不要改连接配置。
 - 提交前跑 `npm run typecheck` 和你改到的、相关的测试文件。**不用跑完整测试**：review 之后编排脚本会自己跑一遍完整测试作为合并门槛，失败时会再叫你修。
 - 改了 `app/i18n/en.client.json` / `en.server.json` 的，提交前跑 `npm run i18n:sort`（词条按键排序，并行的票才不会在文件末尾冲突）。
+- 改了 `app/` 下源文件的，提交前跑 `npm run i18n:ratchet`（几秒）：新增了没接入翻译的中文会失败。按报错接入翻译；按 ADR-0060 本就该留中文的（给模型看的工具返回、知识库原文等），跑 `npm run i18n:ratchet -- --update --allow-increase` 显式调高基线，并在提交信息里写明理由。
 - 不要把 `origin/main` 合并（`git merge`）或 rebase 进分支：合并用的是 rebase，分支里有 merge 提交就合不进去。和 main 的冲突由编排脚本落地前的 rebase 处理。
 - **不要一声不响地等超过 5 分钟**：会话 10 分钟没有任何输出就会被编排脚本当作卡死杀掉，已经写好的改动也不会落地。连跑 N 次、加压复现这类长任务，在后台跑并把输出写文件，然后分段查看：每次用 `timeout 240 sh -c 'until grep -q END /tmp/loop.log; do sleep 15; done'; tail -3 /tmp/loop.log` 这样最多等 4 分钟就返回的命令，看一眼进度再接着等。不要用一条前台命令或一次等待挂到长任务结束。
 - 票里有 **Browser check**：HTTP 测试通过、提交之后，按下面的「浏览器验收」做。
