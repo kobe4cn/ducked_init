@@ -126,7 +126,7 @@
     "app/.server/tenants.ts": 25,
     "app/.server/totp.ts": 2,
     "app/.server/uploads.ts": 5,
-    "app/.server/workbench-ai.ts": 22,
+    "app/.server/workbench-ai.ts": 23,
     "app/.server/workbench.ts": 16,
     "app/components/draft-ambiguity.tsx": 2,
     "app/components/lineage-drawer.tsx": 25,
