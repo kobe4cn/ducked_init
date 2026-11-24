@@ -277,7 +277,7 @@ async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeou
   try {
     return await run();
   } catch (e) {
-    if (signal?.aborted) throw new LlmError(ABORTED, false, undefined, false, true);
+    throwIfAborted(signal);
     const timedOut = e instanceof Error && e.name === 'TimeoutError';
     throw new LlmError(maskKey(apiKey, e instanceof LlmError ? e.message
       : timedOut ? `模型服务 ${timeout / 1000} 秒内没有返回`
