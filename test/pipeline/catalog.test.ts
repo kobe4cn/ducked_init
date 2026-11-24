@@ -106,7 +106,7 @@ describe('语义目录的加载', () => {
     ]) });
     expect(toMarkdown(expand(c, 'field:order.status')!)).toContain('源端样本 `status`');
 
-    // 映射成 external_id 的 unionid（列名不像敏感信息，采集时照样存了取值）与像敏感信息的列不出现
+    // unionid 列名像敏感信息，采集不存取值；与其他像敏感信息的列一样不出现
     const customers = expand(c, 'table:CRM/customers');
     expect(customers?.kind === 'table' && customers.stats!.columns.map(col => col.name)).toEqual(['id', 'updated_at']);
     const all = [groupedText(c), ...c.entries.flatMap(e => [toMarkdown(e), toJson(e)])].join('\n');
