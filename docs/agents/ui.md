@@ -6,6 +6,8 @@ Build on the shadcn components in `app/components/ui/` and lucide icons. Don't a
 
 The one exception is the workbench SQL editor (`app/components/sql-editor.tsx`), which uses CodeMirror 6 (`codemirror`, `@codemirror/lang-sql` and the `@codemirror/*` packages they are built on, no React wrapper, no theme package; ADR-0036). Load it with a dynamic `import()` inside an effect, never at module top level, and keep the server-rendered textarea as the form field. Don't use CodeMirror anywhere else, including the mapping YAML editor.
 
+Assistant panel replies are rendered as Markdown with `react-markdown` + `remark-gfm` (`app/components/assistant-markdown.tsx`, #1186). Use them only there; style the elements with Tailwind yourself. Raw HTML is turned into text, only on-site relative links stay links, and images show their alt text.
+
 ## Page layout
 
 - **Shell**: `AppShell` has a white top bar with the brand, a module-grouped pill nav, an avatar initial and a logout button. The page background is `bg-slate-50`. The nav (`app/.server/nav.ts` `navFor`) has 6 groups: 概览 and 任务 are single links; 数据接入 (数据源、映射、自定义实体、数据质量), 数据模型 (标准模型、数据地图、业务知识), 分析 (指标与标签、查询) and 管理 (成员、API Key、模型服务、模型调用、审计日志、解密) are `<details>`/`<summary>` dropdowns — no JS needed, keyboard operable, remounted closed on navigation. The group holding the current page is `bg-slate-900 text-white`, the current subitem carries `aria-current="page"` (most-specific-path rule from `activeNavTo`). A group whose items are all hidden by permissions is not rendered. Put a new page into 数据接入 / 数据模型 / 分析 / 管理 by its function; add a new single top-level link only for a genuinely standalone module. `OpsShell` keeps a flat row of links.
