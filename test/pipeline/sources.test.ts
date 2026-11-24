@@ -188,6 +188,26 @@ describe('采集表清单、列统计与水位线候选', () => {
     expect(contacts.extra.top).toBeUndefined();
   });
 
+  it('openid、unionid、external_userid 等第三方用户 ID 列即使低基数也不保存取值（#1212）', async () => {
+    const acme = await newTenant('acme');
+    const engineer = await memberOf(acme, 'de@acme.com');
+    const input = await pgSourceInput(READER);
+    await grantOnSource(`
+      CREATE TABLE shop.wx_fans (openid text, unionid text, external_userid text, channel text);
+      INSERT INTO shop.wx_fans SELECT 'oABC_' || (i % 3), 'uXYZ_' || (i % 3), 'wmEXT_' || (i % 3), CASE WHEN i % 3 = 0 THEN 'web' ELSE 'app' END
+      FROM generate_series(1, 30) i;
+      GRANT SELECT ON shop.wx_fans TO ${READER.user};`);
+    const { id } = await registerSource(engineer, input);
+    await selectAllTables(engineer, id);
+    await createDispatcher({ maxWorkers: 2 }).runUntilIdle();
+
+    const source = await getSource(engineer, id);
+    const fans = Object.fromEntries(source.tables.find(t => t.name === 'wx_fans')!.columns.map(c => [c.name, c]));
+    expect(fans.channel.top).toEqual([{ value: 'app', rows: 20 }, { value: 'web', rows: 10 }]);
+    for (const c of ['openid', 'unionid', 'external_userid']) expect(fans[c].top, c).toBeUndefined();
+    expect(JSON.stringify(source.tables)).not.toMatch(/oABC_|uXYZ_|wmEXT_/);
+  });
+
   it('成员从候选中确认水位线字段；不在候选中的字段被拒绝', async () => {
     const acme = await newTenant('acme');
     const engineer = await memberOf(acme, 'de@acme.com');

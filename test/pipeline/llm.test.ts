@@ -18,7 +18,7 @@ import { confirmWatermark, registerSource } from '../../app/.server/sources';
 import { resetDb } from '../http/harness';
 import { drain, memberOf, newTenant, selectAllTables } from './fixtures';
 import { embeddings, fakeLlm, json, platformDefault, platformEmbedding, platformTier, text, truncated } from './llm-fixtures';
-import { pgSourceInput, READER } from './source-fixtures';
+import { grantOnSource, pgSourceInput, READER } from './source-fixtures';
 
 afterAll(async () => { await closeDb(); });
 beforeEach(async () => { await resetDb(); });
@@ -838,6 +838,34 @@ describe('给模型的表上下文', () => {
     expect(sent).not.toContain('消费者');
     // 样本里其余列是 64 位十六进制哈希，会碰巧含有 138 加 8 位数字；只认前后不是十六进制字符的明文手机号
     expect(sent).not.toMatch(/(?<![0-9a-f])138\d{8}(?![0-9a-f])/);
+  });
+
+  it('openid、unionid、external_userid 列打开发送样本后也只有加盐哈希，没有明文（#1212）', async () => {
+    const acme = await newTenant('acme');
+    const author = await memberOf(acme, 'de@acme.com');
+    const input = await pgSourceInput(READER);
+    await grantOnSource(`
+      CREATE TABLE shop.wx_buyers (buyer_key serial primary key, "买家openid" text, unionid text, external_userid text, channel text, updated_at timestamptz);
+      INSERT INTO shop.wx_buyers ("买家openid", unionid, external_userid, channel, updated_at) SELECT
+        'oABC_' || i, 'uXYZ_' || i, 'wmEXT_' || i, CASE WHEN i % 2 = 0 THEN 'web' ELSE 'app' END, timestamptz '2024-06-01' + i * interval '1 hour'
+      FROM generate_series(1, 8) i;
+      GRANT SELECT ON shop.wx_buyers TO ${READER.user};`);
+    const { id } = await registerSource(author, input);
+    await selectAllTables(author, id);
+    await drain();
+    await confirmWatermark(author, id, 'wx_buyers', 'updated_at');
+    await syncSource(author, id);
+    await drain();
+    await allowSamples(acme);
+
+    const { samples } = await tableContextFor(acme, id, 'wx_buyers');
+    expect(samples).toHaveLength(5);
+    for (const r of samples!) {
+      for (const c of ['买家openid', 'unionid', 'external_userid']) expect(String(r[c]), c).toMatch(/^[0-9a-f]{64}$/);
+      expect(['web', 'app']).toContain(r.channel);
+    }
+    const sent = JSON.stringify(samples);
+    for (const plain of ['oABC_', 'uXYZ_', 'wmEXT_']) expect(sent).not.toContain(plain);
   });
 
   it('打开发送样本但表还没同步时只有结构，不报错', async () => {
