@@ -58,7 +58,7 @@ export const MODEL_PROVIDER_CONTEXT = 'model_provider';
 
 /** chat 与 embedding 补算共用的超时毫秒数（ADR-0049）：LLM_TIMEOUT_SECONDS 每次调用都读（默认参数在调用时求值，stubEnv 生效），
  *  正整数字符串才用（照 lakeConnectTimeout 的取法），否则回落默认 60 秒——配错不让所有模型调用一起失败。检索查询向量的短超时由调用方另传 */
-function timeoutMs(env: Record<string, string | undefined> = process.env): number {
+export function timeoutMs(env: Record<string, string | undefined> = process.env): number {
   const raw = env.LLM_TIMEOUT_SECONDS;
   return /^\d+$/.test(raw ?? '') && Number(raw) > 0 ? Number(raw) * 1000 : 60_000;
 }
@@ -96,7 +96,7 @@ function tierOf(row: typeof modelProviders.$inferSelect | undefined, tier: 'fast
 }
 
 /** 租户存的服务商参数（#1169）包成 provider.chatExtra；env 只进配置错误的报错文案 */
-const tenantChatExtra = (raw: string | null, tier?: 'fast' | 'reasoning'): Pick<LlmProvider, 'chatExtra'> =>
+export const tenantChatExtra = (raw: string | null, tier?: 'fast' | 'reasoning'): Pick<LlmProvider, 'chatExtra'> =>
   raw ? { chatExtra: { env: zh(tier ? msg('本租户 {tier} 档位的服务商参数', { tier }) : msg('本租户模型服务的服务商参数')), raw } } : {};
 
 /** 查一次 modelProviders 行并按 providerSource 算出那一套 provider（租户的 Key 解密后返回）；都没有时 provider 为 null。
@@ -494,6 +494,11 @@ export const chatTools = (tenantId: string, purpose: LlmPurpose, messages: LlmMe
  */
 export const chatToolsWith = (tenantId: string, purpose: LlmPurpose, route: LlmRoute, messages: LlmMessage[], tools: LlmTool[]): Promise<ToolReply> =>
   logged(tenantId, purpose, (provider, stats) => callTools(provider, messages, tools, stats), async () => route);
+
+/** 按调用方给出的路由调 callModel 并记调用日志（口径同 chatJson）：保存档位前用还没写库的配置探测一次（#1213）、
+ *  连通测试按已解析的档位各测一次时用，路由不再由 logged 自己解析 */
+export const chatJsonWith = <T>(tenantId: string, purpose: LlmPurpose, route: LlmRoute, messages: LlmMessage[], schema: object): Promise<T> =>
+  logged(tenantId, purpose, (provider, stats) => callModel<T>(provider, messages, schema, stats, purpose), async () => route);
 
 /**
  * 按租户的 embedding 端点（resolveEmbeddingProvider）调 /embeddings，返回按输入顺序排好的向量，记调用日志
