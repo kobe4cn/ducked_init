@@ -127,10 +127,11 @@ describe('映射评测跑分', () => {
     ]);
   });
 
-  it('总体准确率按列加权，改动项数相加', () => {
+  it('总体准确率按列加权，改动项数相加，按样例数分开计整份通过 / 部分采用 / 失败', () => {
     expect(summarize([
       { name: 'a', accuracy: 1, correct: 10, expected: 10, edits: 0 },
       { name: 'b', accuracy: 0, correct: 0, expected: 6, edits: 7, failed: { stage: 'model', message: 'x' } },
-    ])).toEqual({ accuracy: 10 / 16, correct: 10, expected: 16, edits: 7 });
+      { name: 'c', accuracy: 0.5, correct: 2, expected: 4, edits: 1, partial: true, dropped: ['fields.x'] },
+    ])).toEqual({ accuracy: 12 / 20, correct: 12, expected: 20, edits: 8, full: 1, partial: 1, failed: 1 });
   });
 });

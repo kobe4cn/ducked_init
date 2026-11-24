@@ -1,7 +1,8 @@
 // scripts/eval-mapping-compare.ts —— 用法：pnpm eval:mapping:compare <a.json> <b.json>（两份 pnpm eval:mapping 写出的结果文件）
-// 对比两次映射评测（ADR-0035）：模型、主机、提示词哈希是否相同，每例与总体的准确率、改动数及差值（b − a），只在一次里出现的样例单独列出
+// 对比两次映射评测（ADR-0035）：模型、主机、提示词哈希是否相同，每例与总体的准确率、改动数及差值（b − a），两次都有计数时另列整份通过 / 部分采用的样例数（旧结果文件没有，不列），只在一次里出现的样例单独列出
 import { readFileSync } from 'node:fs';
 import { compareReports, type EvalReport, type ReportCase, type ReportScore, type ScoreDelta } from './eval-mapping/report';
+import type { CaseCounts } from './eval-mapping/score';
 
 const files = process.argv.slice(2);
 if (files.length !== 2) {
@@ -29,6 +30,10 @@ const row = (name: string, d: ScoreDelta) =>
   console.log(`${name.padEnd(28)} ${score(d.a).padEnd(16)}${score(d.b).padEnd(16)}准确率 ${signed(d.delta.accuracy, pct)}  改动 ${signed(d.delta.edits, String)}${failed(d)}`);
 for (const d of c.cases) row(d.name, d);
 row('总体', c.total);
+if (c.counts) {
+  const counts = ({ full, partial, failed }: CaseCounts) => `${full}/${full + partial + failed}、${partial}/${full + partial + failed}`;
+  console.log(`整份通过 / 部分采用：a ${counts(c.counts.a)}，b ${counts(c.counts.b)}`);
+}
 const listOnly = (label: string, cases: ReportCase[]) => {
   if (cases.length) console.log(`\n只在 ${label}：${cases.map(s => `${s.name}（${score(s).trim()}${s.stage ? `，失败于${failedAt(s)}` : ''}）`).join('，')}`);
 };
