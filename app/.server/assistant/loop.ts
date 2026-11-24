@@ -2,7 +2,8 @@
 // 按模型的 tool_calls 调注册表里的工具（runTool 按登记的权限检查）、结果作为 role: tool 回填，直到模型给出文字答复。
 // 助手只能用注册表里的工具，不能执行查询、不能发布；工具出错时把错误文本回填给模型，由它决定怎么继续。
 // 起草（ADR-0042）：校验、保存类工具以「经助手」的成员身份调用（审计带 via: 'assistant'），不通过时问题清单回填给模型修正，
-// 最多再修正 MAX_FIXES 次；仍不通过时不再请求模型，由服务端把问题清单与最后一版 YAML 交给成员。
+// 最多再修正 MAX_FIXES 次；仍不通过时不再请求模型，由服务端把问题清单与最后一版 YAML 交给成员；本轮有过同 kind 的定义校验通过时，
+// 交的是最后一版通过的 YAML 并提示可直接保存（#1185）。中途校验通过不清零修正次数（通过 / 被拒交替也会到上限），保存成功才清零。
 // 分析计划（ADR-0050）：每轮新建一个检索候选集合（ToolCtx.retrieved）传给每次工具调用，validate_plan 只认本轮 catalog_search / catalog_expand 返回过的条目
 // 与对话里最近一份计划引用过的条目（#1179，一轮开始时用 planRetrievedIds(priorPlan) 预先填入）；
 // 本轮校验过的最后一份结构合法的计划（ToolCtx.plan）随答复返回、由路由存进对话，对话里最近一份作为 priorPlan 带进下一轮：
@@ -40,11 +41,29 @@ const SKIPPED = '未执行：本轮工具调用次数已用完';
 const MAX_ISSUE_LINES = 20;
 const MAX_YAML = 2500;
 
-function unfixedReply({ issues, yaml }: NonNullable<ToolResult['rejected']>) {
+/** 放弃时的答复：问题清单与 YAML；valid 是本轮最后一版通过校验的同类定义（#1185），有时给它而不是被拒的那版，过长截断时提示重新起草 */
+function unfixedReply({ issues, yaml }: NonNullable<ToolResult['rejected']>, valid?: string) {
   const lines = issues.split('\n');
   const listed = lines.length > MAX_ISSUE_LINES ? [...lines.slice(0, MAX_ISSUE_LINES), `……另有 ${lines.length - MAX_ISSUE_LINES} 行`] : lines;
-  const body = yaml.length > MAX_YAML ? `${yaml.slice(0, MAX_YAML)}\n# ……YAML 过长，只显示前 ${MAX_YAML} 字` : yaml;
-  return `草稿没有通过校验，未保存（已修正 ${MAX_FIXES} 次）。问题清单：\n${listed.join('\n')}\n\n最后一版 YAML：\n\n\`\`\`yaml\n${body.endsWith('\n') ? body : `${body}\n`}\`\`\``;
+  const shown = valid ?? yaml;
+  const clipped = shown.length > MAX_YAML;
+  const body = clipped ? `${shown.slice(0, MAX_YAML)}\n# ……YAML 过长，只显示前 ${MAX_YAML} 字` : shown;
+  let head = `草稿没有通过校验，未保存（已修正 ${MAX_FIXES} 次）。问题清单：`;
+  let label = '最后一版 YAML';
+  if (valid !== undefined) {
+    const next = clipped ? `但过长只显示前 ${MAX_YAML} 字，请让我重新起草后保存` : '可以让我直接保存';
+    head = `未保存：修正 ${MAX_FIXES} 次后仍不通过；上一版已通过校验，${next}。最后一次的问题清单：`;
+    label = '通过校验的那一版 YAML';
+  }
+  return `${head}\n${listed.join('\n')}\n\n${label}：\n\n\`\`\`yaml\n${body.endsWith('\n') ? body : `${body}\n`}\`\`\``;
+}
+
+/** 被拒的调用与通过的那版是同一 kind 的定义工具时，放弃时用通过的那版（映射工具被拒时不用） */
+function sameKindValid(name: string, args: string, lastValid?: { kind: string; yaml: string }): string | undefined {
+  if (!lastValid || (name !== 'validate_definition' && name !== 'save_definition_draft')) return undefined;
+  try {
+    return (JSON.parse(args || '{}') as { kind?: unknown }).kind === lastValid.kind ? lastValid.yaml : undefined;
+  } catch { return undefined; }
 }
 
 const TOOLS_UNSUPPORTED = '该模型服务不支持工具调用，AI 助手无法使用：请管理员到「模型服务」页换一个支持工具调用的模型';
@@ -172,6 +191,8 @@ export async function assistantTurn(
   // 经助手的操作在审计里注明（只加在这里传给工具的 actor 上）
   const via: CurrentMember = { ...actor, via: 'assistant' };
   let failures = 0;
+  // 本轮最后一版校验通过的定义（#1185）：放弃时交给成员；保存成功后清掉，下一份草稿重新算
+  let lastValid: { kind: string; yaml: string } | undefined;
   // 本轮 validate_plan 返回过 status: valid 之后（之后再校验失败也不撤回）prefill_workbench 免计，最多 MAX_FREE_PREFILLS 次；
   // 不用 ctx.plan 判断：status 不是 valid 时 validate_plan 也会写它
   let planValid = false;
@@ -200,9 +221,12 @@ export async function assistantTurn(
       toolsUsed.push(c.name);
       const result = await callTool(via, c.name, c.arguments, ctx);
       if (c.name === 'validate_plan' && result.text.startsWith('status: valid')) planValid = true;
-      if (result.rejected && ++failures > MAX_FIXES) return { reply: unfixedReply(result.rejected), toolsUsed, ...extras(ctx) };
-      // 保存成功后再起草下一份，重新计修正次数
-      if (result.saved) failures = 0;
+      if (result.validated) lastValid = result.validated;
+      if (result.rejected && ++failures > MAX_FIXES) {
+        return { reply: unfixedReply(result.rejected, sameKindValid(c.name, c.arguments, lastValid)), toolsUsed, ...extras(ctx) };
+      }
+      // 保存成功后再起草下一份，重新计修正次数与通过的那版
+      if (result.saved) { failures = 0; lastValid = undefined; }
       messages.push({ role: 'tool', tool_call_id: c.id, content: result.text });
     }
   }
