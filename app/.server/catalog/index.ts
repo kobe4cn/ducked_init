@@ -819,7 +819,13 @@ function groupItemsMarkdown(gi: GroupItems): string {
   return ['# 分组 ' + (gi.page > 1 ? `${gi.id}@${gi.page}` : gi.id), '', ...gi.lines, ...(gi.nextPage ? ['', `- 下一页：${gi.nextPage}`] : [])].join('\n');
 }
 
-function entryMarkdown(e: CatalogEntry): string {
+/** 渲染选项：restricted 是按角色清掉了来源的目录（ADR-0047），空来源写中性文字而不是「未映射」 */
+export type RenderOptions = { restricted?: boolean };
+
+/** 查看者目录里被清掉的来源（实体的映射来源、字段的来源）渲染成这句，免得模型当成「没映射」 */
+const SOURCES_HIDDEN = '按你的角色不显示';
+
+function entryMarkdown(e: CatalogEntry, opts: RenderOptions = {}): string {
   const head = [`## ${e.id} ${e.name}`, ...(e.description ? ['', e.description] : []), '', ...('knowledge' in e ? knowledgeMarkdown(e.knowledge) : [])];
   switch (e.kind) {
     case 'source':
@@ -829,7 +835,7 @@ function entryMarkdown(e: CatalogEntry): string {
         `- 列：${e.columns.map(c => `${code(c.name)} ${c.type}`).join(', ') || '无'}`, ...(e.view ? [] : tableStatsMarkdown(e.stats))].join('\n');
     case 'entity':
       return [...head, `- ${e.custom ? '自定义实体' : '标准实体'} ${code(e.entity)}，主键 ${e.key.map(code).join(', ')}`,
-        `- 映射来源：${e.tables.map(id => (e.unscoped.includes(id) ? `${id}（不在同步范围）` : id)).join(', ') || '未映射'}`,
+        `- 映射来源：${e.tables.map(id => (e.unscoped.includes(id) ? `${id}（不在同步范围）` : id)).join(', ') || (opts.restricted ? SOURCES_HIDDEN : '未映射')}`,
         ...(e.relations.length ? [`- 关系：${e.relations.join(', ')}`] : []),
         ...e.mergeGroups.map(g => `- 合并组（${g.rule}）：${g.members.join(' > ')}`),
         `- 统计：${e.stats ? `${e.stats.rows} 行，统计截至 ${e.stats.at}（最近一次合并）` : NO_STATS}`,
@@ -844,7 +850,7 @@ function entryMarkdown(e: CatalogEntry): string {
             ...(l.note ? [`    - 映射说明${l.noteNeedsReview ? '（待复核）' : ''}：${l.note}`] : []),
             ...knowledgeMarkdown(l.knowledge, '    '),
             ...l.sample.map(c => `    - 源端样本 ${code(c.name)}：${columnStatsText(c)}`)])]
-          : ['- 来源：未映射'])].join('\n');
+          : [`- 来源：${opts.restricted ? SOURCES_HIDDEN : '未映射'}`])].join('\n');
     case 'relation':
       return [...head, `- ${e.from} → ${e.to}`].join('\n');
     case 'metric':
@@ -878,12 +884,12 @@ const dependenciesMarkdown = (d: DefinitionDependencies) => [
 /** 可渲染的结果：分层总览、分组展开、单个条目或搜索结果 */
 export type Renderable = GroupOverview | GroupItems | CatalogEntry | CatalogEntry[];
 
-/** 渲染成 Markdown */
-export function toMarkdown(x: Renderable): string {
-  if (Array.isArray(x)) return x.length ? x.map(entryMarkdown).join('\n\n') : '没有找到相关条目';
+/** 渲染成 Markdown；opts 只影响单个条目与条目列表 */
+export function toMarkdown(x: Renderable, opts?: RenderOptions): string {
+  if (Array.isArray(x)) return x.length ? x.map(e => entryMarkdown(e, opts)).join('\n\n') : '没有找到相关条目';
   if (x.kind === 'groups') return groupsMarkdown(x);
   if (x.kind === 'group') return groupItemsMarkdown(x);
-  return entryMarkdown(x);
+  return entryMarkdown(x, opts);
 }
 
 /** 渲染成 JSON */
