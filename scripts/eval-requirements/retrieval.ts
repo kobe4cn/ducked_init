@@ -53,7 +53,7 @@ export interface RetrievalRow {
   top1: string | null;
   /** 服务端判了歧义（会追问） */
   asked: boolean;
-  /** 标注了期望的追问 */
+  /** 应追问：标注了期望的追问，且期望模式不是 unsupported（超出能力的该说做不到，不算应追问，#1210） */
   shouldAsk: boolean;
   /** 跑过 runPlanCase（不管成没成功）；没跑模型为 false */
   planned: boolean;
@@ -65,9 +65,10 @@ export interface RetrievalRow {
 
 export const retrievalRows = (gs: GoldenEntry[], vectors?: RetrievalVectors): RetrievalRow[] => gs.map(g => {
   const r = retrieve(g, vectors);
+  const mode = expectedMode(g);
   return {
     id: g.id, type: g.failure_type, holdout: g.holdout, recall: recallAt(g, r), top1: r.top[0] ?? null,
-    asked: r.ambiguous, shouldAsk: g.clarify !== null, planned: false, mode: null, expectedMode: expectedMode(g),
+    asked: r.ambiguous, shouldAsk: g.clarify !== null && mode !== 'unsupported', planned: false, mode: null, expectedMode: mode,
   };
 });
 
@@ -77,7 +78,7 @@ export interface GroupStats {
   recall: number | null;
   /** 追问判定与标注一致的条数 / 条数（空组为 1，与 summarize 的通过率一致） */
   clarifyAccuracy: number;
-  /** 应追问的条目里追问了的比例；组里没有应追问的条目时为 null */
+  /** 应追问的条目里追问了的比例；期望模式为 unsupported 的条目不算应追问（d 类全部如此，d 组因此为 null）；组里没有应追问的条目时为 null */
   clarifyRecall: number | null;
   /** 计划模式与期望一致的条数 / 跑过模型的条数（planned，#423，ADR-0050；跑了但失败的 mode 为 null，算错、进分母）；组里一条都没跑模型时为 null */
   modeAccuracy: number | null;

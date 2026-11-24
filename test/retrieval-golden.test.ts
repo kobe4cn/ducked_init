@@ -58,8 +58,8 @@ describe('检索黄金集的标注', () => {
     for (const k of COVERS) expect(GOLDEN_ALL.filter(g => g.covers.includes(k)).length, k).toBeGreaterThanOrEqual(5);
     expect(GOLDEN_ALL.some(g => g.role === 'viewer')).toBe(true);
     for (const id of KNOWN_GAPS.keys()) expect(GOLDEN_ALL.map(g => g.id), id).toContain(id);
-    // 模型评测只拿有 expected 的条目
-    expect(GOLDEN.map(c => c.id)).toEqual(GOLDEN_ALL.filter(g => g.kind && g.expected).map(g => g.id));
+    // 模型评测只拿有 kind、且有 expected 或标了期望做不到的条目（#1210）
+    expect(GOLDEN.map(c => c.id)).toEqual(GOLDEN_ALL.filter(g => g.kind && (g.expected || g.expected_unsupported)).map(g => g.id));
   });
 
   it('验收集（HOLDOUT）共 8 条、都在黄金集里，a–d 每类至少 1 条，holdout 字段与集合一致', () => {

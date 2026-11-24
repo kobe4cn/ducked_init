@@ -6,7 +6,7 @@
 // 有 LLM_* 时先用真实模型对全部条目跑计划模式（runPlanCase）再打这两张表。
 // 再在配了 LLM_EMBEDDING_*（三项都有，与 chat 的 LLM_* 互不影响）时对固定目录真实算一次向量，调参集与验收集各打印「向量关 / 向量开」
 // 两组指标与合计 Recall@20 的差值（#416，ADR-0049）；没配只跳过开关对比。
-// 最后在有 LLM_* 时对有 expected 的样例用真实模型服务走与产品相同的起草消息（固定目录）、输出 Schema 与转 YAML，打印每例与调参集 / 验收集
+// 最后在有 LLM_* 时对有 expected 或标了期望做不到（#1210）的样例用真实模型服务走与产品相同的起草消息（固定目录）、输出 Schema 与转 YAML，打印每例与调参集 / 验收集
 // 的校验通过率与结构命中率；缺密钥跳过计划模式与起草。结果另存到 scripts/eval-requirements/out/<时间戳>-<模型名或 deterministic>.json。
 // 不连平台库，不进 CI；不打印也不保存 Key、完整 URL、请求与模型原文
 import { execSync } from 'node:child_process';
@@ -16,7 +16,7 @@ import { cmp } from '../app/lib/compare';
 import { callEmbeddings, platformEmbeddingProvider, platformProvider } from '../app/.server/llm';
 import { GOLDEN, GOLDEN_ALL, HOLDOUT } from './eval-requirements/golden';
 import { GROUP_KEYS, groupByType, retrievalRows, VIEWS, type GroupKey, type GroupStats, type RetrievalRow, type RetrievalVectors } from './eval-requirements/retrieval';
-import { runCase, runPlanCase, summarize, type CaseResult, type Summary } from './eval-requirements/score';
+import { runCase, runPlanCase, summarize, type CaseResult, type FailStage, type Summary } from './eval-requirements/score';
 
 const pct = (x: number | null) => (x === null ? '—' : `${(x * 100).toFixed(1)}%`);
 /** 百分点差值（开 − 关），正数带 + */
@@ -103,6 +103,7 @@ if (EMBED_VARS.some(v => !process.env[v])) {
   retrievalHybrid = { off: retrieval, on, recallDelta };
 }
 
+const STAGE_LABEL: Record<FailStage, string> = { model: '模型调用', definition: '定义校验', unsupported: '模型判断做不到' };
 const drafts: CaseResult[] = [];
 let draftTotals: { tuning: Summary; holdout: Summary } | null = null;
 if (!provider) {
@@ -113,8 +114,11 @@ if (!provider) {
     const r = await runCase(provider, c);
     drafts.push(r);
     const misses = Object.entries(r.structure).filter(([, hit]) => !hit).map(([k]) => k);
-    const failed = r.failed ? `  失败于${r.failed.stage === 'model' ? '模型调用' : '定义校验'}：${r.failed.message}` : '';
-    console.log(`${`${r.id}（${r.kind}）`.padEnd(36)} 校验 ${r.valid ? '通过' : '不过'}  命中率 ${pct(r.hitRate).padStart(6)}（${r.hits}/${r.items}）${misses.length ? `  未命中：${misses.join('、')}` : ''}${failed}`);
+    const failed = r.failed ? `  失败于${STAGE_LABEL[r.failed.stage]}：${r.failed.message}` : '';
+    const head = `${`${r.id}（${r.kind}）`.padEnd(36)} 校验 ${r.valid ? '通过' : '不过'}`;
+    console.log(r.expectedUnsupported
+      ? `${head}  期望做不到${r.valid ? `，给出了 unsupported：${r.unsupported!.join('；')}` : ''}${failed}`
+      : `${head}  命中率 ${pct(r.hitRate).padStart(6)}（${r.hits}/${r.items}）${misses.length ? `  未命中：${misses.join('、')}` : ''}${failed}`);
   }
   draftTotals = { tuning: summarize(drafts.filter(r => !HOLDOUT.has(r.id))), holdout: summarize(drafts.filter(r => HOLDOUT.has(r.id))) };
   for (const [label, total] of [['总体（调参集）', draftTotals.tuning], ['总体（验收集）', draftTotals.holdout]] as const) {

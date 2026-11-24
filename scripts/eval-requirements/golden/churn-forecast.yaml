@@ -1,4 +1,6 @@
 request: 预测下个月每个消费者的流失概率
+kind: metric
+expected_unsupported: true
 failure_type: d
 retrieval:
   candidates: [metric:days_since_last_order]

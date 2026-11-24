@@ -45,16 +45,20 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(g.合计.modeAccuracy).toBe(2 / 5);
   });
 
-  it('真实黄金集：合计 Recall@20 与 retrieval-golden 的汇总一致，应追问 13 条、判出 8 条（4 条不是检索歧义，consumption-amount 是 KNOWN_GAPS），验收集 8 条', () => {
+  it('真实黄金集：合计 Recall@20 与 retrieval-golden 的汇总一致，应追问 9 条（期望 unsupported 的不算，#1210）、判出 8 条（其中 7 条该问；dormant-alias 不是检索歧义，consumption-amount 是 KNOWN_GAPS，revenue-yoy 判出歧义但该说做不到），验收集 8 条', () => {
     const rows = retrievalRows(GOLDEN_ALL);
     const total = groupByType(rows).合计;
     expect(total.cases).toBe(42);
     expect(total.recall).toBeGreaterThanOrEqual(0.96);
     expect(total.recall!.toFixed(4)).toBe('0.9634');
-    expect(rows.filter(r => r.shouldAsk)).toHaveLength(13);
+    expect(rows.filter(r => r.shouldAsk)).toHaveLength(9);
+    // 期望模式为 unsupported 的条目（d 类全部 + viewer-amount-lineage）不算应追问，d 组的追问召回因此不可算
+    expect(rows.filter(r => r.shouldAsk && r.expectedMode === 'unsupported')).toEqual([]);
+    expect(groupByType(rows).d.clarifyRecall).toBeNull();
     expect(rows.filter(r => r.asked)).toHaveLength(8);
-    expect(total.clarifyRecall).toBe(8 / 13);
-    expect(total.clarifyAccuracy).toBe(37 / 42);
+    expect(total.clarifyRecall).toBe(7 / 9);
+    expect(total.clarifyAccuracy).toBe(39 / 42);
+    expect(rows.filter(r => r.asked !== r.shouldAsk).map(r => r.id).sort()).toEqual(['consumption-amount', 'dormant-alias', 'revenue-yoy']);
     // 没跑模型：每条的 planned 为 false、mode 为 null，正确率不可算
     expect(rows.every(r => !r.planned && r.mode === null)).toBe(true);
     expect(rows.every(r => r.expectedMode === PLAN_MODE_BY_ID[r.id])).toBe(true);

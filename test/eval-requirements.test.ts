@@ -1,5 +1,6 @@
 // test/eval-requirements.test.ts —— 需求评测（#279，ADR-0041）：黄金集的期望都能对着固定上下文过校验、指标与标签都有、只引用目录里有的字段；
-// runCase 用假 fetch 跑出的校验通过与结构命中：与期望一致、字段写错、不合 Schema；runPlanCase（#423，ADR-0050）用假模型选计划模式：
+// runCase 用假 fetch 跑出的校验通过与结构命中：与期望一致、字段写错、不合 Schema，以及「做不到」的计分（#1210：期望做不到的样例给出 unsupported 算通过，
+// 普通样例给出 unsupported 失败于 stage unsupported）；runPlanCase（#423，ADR-0050）用假模型选计划模式：
 // 一致记对、不一致或解析失败记错，查看者条目用查看者目录（纯函数，不读库）
 import { afterEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
@@ -27,11 +28,18 @@ describe('需求黄金集', () => {
     expect(new Set(GOLDEN.map(c => c.kind))).toEqual(new Set(['metric', 'tag']));
     expect(new Set(GOLDEN.map(c => c.id)).size).toBe(GOLDEN.length);
     for (const c of GOLDEN) {
+      if (c.expectedUnsupported) continue; // 期望做不到的样例没有 expected
       const r = DSL_KINDS[c.kind].check(stringify(c.expected), CONTEXT);
       expect(r.ok ? [] : r.issues, c.id).toEqual([]);
       // 敏感字段不在目录里：期望只能用目录里有的字段
       if (r.ok) for (const f of DSL_KINDS[c.kind].dependencies(r.spec).fields) expect(expand(CATALOG, `field:${f.entity}.${f.field}`), `${c.id} ${f.entity}.${f.field}`).not.toBeNull();
     }
+  });
+
+  it('d 类的 hourly-orders、churn-forecast、revenue-yoy 是期望做不到的指标样例，没有 expected', () => {
+    const ids = GOLDEN.filter(c => c.expectedUnsupported).map(c => c.id);
+    expect(ids).toEqual(['churn-forecast', 'hourly-orders', 'revenue-yoy']);
+    for (const id of ids) expect(caseNamed(id)).toEqual({ id, kind: 'metric', request: entryNamed(id).request, expectedUnsupported: true });
   });
 });
 
@@ -110,6 +118,57 @@ describe('需求评测跑分', () => {
     expect(r).toMatchObject({ valid: false, hits: 0, items: 6, hitRate: 0, failed: { stage: 'model' } });
     expect(r.failed!.message).toContain('不符合 Schema');
     expect(JSON.stringify(r)).not.toContain(PROVIDER.apiKey);
+  });
+
+  it('期望做不到的标签样例：模型回顶层 unsupported 算通过，记下原因，不计结构项', async () => {
+    const c = { id: 'tag-unsupported', kind: 'tag' as const, request: '按下个月的流失概率分层', expectedUnsupported: true };
+    fakeLlm(setLlmFetch, () => json({ unsupported: ['平台不做预测'] }));
+    expect(await runCase(PROVIDER, c)).toEqual({
+      id: 'tag-unsupported', kind: 'tag', expectedUnsupported: true, valid: true, unsupported: ['平台不做预测'], structure: {}, hits: 0, items: 0, hitRate: 1,
+    });
+  });
+
+  it('期望做不到的指标样例：unsupported 非空算通过；unsupported 为空、只给了定义算失败于定义校验', async () => {
+    const c = caseNamed('churn-forecast');
+    const spec = caseNamed('order-count-90d').expected;
+    fakeLlm(setLlmFetch, () => json({ spec, items: [], unknowns: [], unsupported: ['预测流失概率'] }));
+    expect(await runCase(PROVIDER, c)).toEqual({
+      id: 'churn-forecast', kind: 'metric', expectedUnsupported: true, valid: true, unsupported: ['预测流失概率'], structure: {}, hits: 0, items: 0, hitRate: 1,
+    });
+
+    fakeLlm(setLlmFetch, () => json({ spec, items: [], unknowns: [], unsupported: [] }));
+    const r = await runCase(PROVIDER, c);
+    expect(r).toMatchObject({ valid: false, items: 0, failed: { stage: 'definition', message: '期望做不到，模型却给出了定义' } });
+    expect(r.unsupported).toBeUndefined();
+    expect(JSON.stringify(r)).not.toContain(PROVIDER.apiKey);
+  });
+
+  it('普通样例上模型回 unsupported：失败于「模型判断做不到」并带原因，不再报定义校验不过', async () => {
+    const tag = caseNamed('spend-tier');
+    fakeLlm(setLlmFetch, () => json({ unsupported: ['没有消费金额指标', '分档口径不明'] }));
+    const r = await runCase(PROVIDER, tag);
+    expect(r).toMatchObject({ valid: false, unsupported: ['没有消费金额指标', '分档口径不明'], hits: 0, items: 3, hitRate: 0, failed: { stage: 'unsupported' } });
+    expect(r.failed!.message).toBe('模型判断做不到：没有消费金额指标；分档口径不明');
+    expect(r.failed!.message).not.toContain('定义校验不过');
+
+    // 指标：spec 照常按收拢后的定义计结构分
+    const metric = caseNamed('paid-revenue-by-city');
+    fakeLlm(setLlmFetch, () => json({ spec: metric.expected, items: [], unknowns: [], unsupported: ['按城市不行'] }));
+    expect(await runCase(PROVIDER, metric)).toMatchObject({
+      valid: false, hits: 6, items: 6, failed: { stage: 'unsupported', message: '模型判断做不到：按城市不行' },
+    });
+  });
+
+  it('总体：混入期望做不到的样例时，通过率按样例数算，命中率不变', () => {
+    const structure = {};
+    const ordinary = [
+      { id: 'a', kind: 'metric' as const, valid: true, structure, hits: 6, items: 6, hitRate: 1 },
+      { id: 'b', kind: 'tag' as const, valid: false, structure, hits: 1, items: 3, hitRate: 1 / 3 },
+    ];
+    expect(summarize([
+      ...ordinary,
+      { id: 'c', kind: 'metric', expectedUnsupported: true, valid: true, unsupported: ['x'], structure, hits: 0, items: 0, hitRate: 1 },
+    ])).toEqual({ cases: 3, valid: 2, validRate: 2 / 3, hits: 7, items: 9, hitRate: 7 / 9 });
   });
 
   it('总体：校验通过率按样例数，命中率按结构项加权', () => {

@@ -29,14 +29,18 @@ const STRUCTURE = {
   tag: ['kind', 'metrics', 'rules'],
 } as const satisfies Record<DslKind, readonly string[]>;
 
-/** 失败在哪一步：模型调用（含输出不合 Schema）或定义校验 */
-export type FailStage = 'model' | 'definition';
+/** 失败在哪一步：模型调用（含输出不合 Schema）、定义校验（期望做不到的样例给出了定义也记在这里），或普通样例上模型判断做不到 */
+export type FailStage = 'model' | 'definition' | 'unsupported';
 
 export interface CaseResult {
   id: string;
   kind: DslKind;
-  /** 转出的定义过了校验 */
+  /** 按本样例的期望计分通过：普通样例是转出的定义过了校验，期望做不到的样例是模型给出了 unsupported */
   valid: boolean;
+  /** 模型给出的做不到的原因（标签的顶层 unsupported，指标收拢后非空的 unsupported） */
+  unsupported?: string[];
+  /** 样例期望做不到（#1210） */
+  expectedUnsupported?: boolean;
   /** 各结构项是否与期望一致 */
   structure: Record<string, boolean>;
   hits: number;
@@ -49,7 +53,7 @@ export interface CaseResult {
 export interface Summary {
   cases: number;
   valid: number;
-  /** 校验通过的样例数 / 样例数 */
+  /** 按期望计分通过的样例数 / 样例数 */
   validRate: number;
   hits: number;
   items: number;
@@ -127,40 +131,67 @@ function scoreStructure(kind: DslKind, expected: object, got: object | null): Pi
 const rankedEntries = (catalog: Catalog, request: string): CatalogEntry[] =>
   rank(deriveProjection(catalog, 'full').filter(r => !r.entryId.startsWith('capability:')), catalog, request, {}, SEARCH_LIMIT).map(r => r.entry);
 
-/** 跑一个样例；期望本身不过校验、目录里没东西可用时直接抛错（黄金集写错了） */
+/** 期望做不到的样例没有期望结构：结构项给空，items 为 0，不进命中率 */
+const NO_STRUCTURE = { structure: {}, hits: 0, items: 0, hitRate: 1 };
+
+/** 跑一个样例；期望本身不过校验、目录里没东西可用时直接抛错（黄金集写错了）。
+ *  期望做不到的样例（#1210）：模型给出 unsupported 算通过，给出定义算失败（stage definition），不比结构；
+ *  普通样例上模型给出 unsupported 算失败（stage unsupported，附原因），不再走定义校验 */
 export async function runCase(provider: LlmProvider, c: GoldenCase): Promise<CaseResult> {
-  const want = DSL_KINDS[c.kind].check(stringify(c.expected), CONTEXT);
-  if (!want.ok) throw new Error(`黄金样例 ${c.id} 的期望不过校验：${want.issues.map(i => i.message).join('；')}`);
+  const expectedUnsupported = c.expectedUnsupported === true;
+  if (!expectedUnsupported) {
+    if (!c.expected) throw new Error(`黄金样例 ${c.id} 既没有 expected 也没有标 expected_unsupported`);
+    const want = DSL_KINDS[c.kind].check(stringify(c.expected), CONTEXT);
+    if (!want.ok) throw new Error(`黄金样例 ${c.id} 的期望不过校验：${want.issues.map(i => i.message).join('；')}`);
+  }
   const messages = definitionDraftMessages(c.kind, c.request, CATALOG, rankedEntries(CATALOG, c.request));
   if (!Array.isArray(messages)) throw new Error(`黄金样例 ${c.id} 无法起草：${messages.unavailable}`);
 
+  const base = { id: c.id, kind: c.kind, ...(expectedUnsupported && { expectedUnsupported }) };
+  const score = (got: object | null) => (expectedUnsupported ? NO_STRUCTURE : scoreStructure(c.kind, c.expected!, got));
   let out: object;
   try {
     out = await callModel<object>(provider, messages, definitionDraftSchema(c.kind));
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
-    return { id: c.id, kind: c.kind, valid: false, ...scoreStructure(c.kind, c.expected, null), failed: { stage: 'model', message: e.message } };
+    return { ...base, valid: false, ...score(null), failed: { stage: 'model', message: e.message } };
   }
   // 指标起草沿用一句话解析的输出形状（#1162）：模型答复是 spec 加三键（宽松 Schema 也放行平铺输出），照产品侧收拢进 spec
-  // 再按严格 Schema 校验——不合形状算模型阶段失败（产品的 422 同归因），过了才转 YAML 打分
-  let spec: object = out;
+  // 再按严格 Schema 校验——不合形状算模型阶段失败（产品的 422 同归因），过了才转 YAML 打分。
+  // 做不到：标签是顶层的 { unsupported }（同产品侧 dsl-definitions 的判法），指标是收拢后非空的 unsupported（Schema 要求 spec 必有，见 #1210 决定）
+  let spec: object | null = out;
+  let unsupported: string[] | null = null;
   if (c.kind === 'metric') {
     const parsed = normalizeParseOutput(out as Record<string, unknown>);
     const validate = validatorFor(METRIC_PARSE_SCHEMA);
     if (!validate(parsed.output)) {
       const message = `模型返回的 JSON 不符合 Schema：${schemaErrors(validate)}`;
-      return { id: c.id, kind: c.kind, valid: false, ...scoreStructure(c.kind, c.expected, null), failed: { stage: 'model', message } };
+      return { ...base, valid: false, ...score(null), failed: { stage: 'model', message } };
     }
-    spec = (parsed.output as { spec: object }).spec;
+    const output = parsed.output as { spec: object; unsupported?: string[] };
+    spec = output.spec;
+    if (output.unsupported?.length) unsupported = output.unsupported;
+  } else if ('unsupported' in out) {
+    unsupported = (out as { unsupported: string[] }).unsupported;
+    spec = null;
+  }
+
+  if (expectedUnsupported) {
+    return unsupported
+      ? { ...base, valid: true, unsupported, ...NO_STRUCTURE }
+      : { ...base, valid: false, ...NO_STRUCTURE, failed: { stage: 'definition', message: '期望做不到，模型却给出了定义' } };
   }
   // 按产品实际存下的定义打分：路径首段补过实体名的（definitionOutputToYaml 内部也补）
-  const completed = completeDraftPaths(c.kind, spec);
-  const got = DSL_KINDS[c.kind].check(definitionOutputToYaml(c.kind, completed), CONTEXT);
-  const result = { id: c.id, kind: c.kind, valid: got.ok, ...scoreStructure(c.kind, c.expected, completed) };
+  const completed = spec && completeDraftPaths(c.kind, spec);
+  if (unsupported) {
+    return { ...base, valid: false, unsupported, ...score(completed), failed: { stage: 'unsupported', message: `模型判断做不到：${unsupported.join('；')}` } };
+  }
+  const got = DSL_KINDS[c.kind].check(definitionOutputToYaml(c.kind, completed!), CONTEXT);
+  const result = { ...base, valid: got.ok, ...score(completed) };
   return got.ok ? result : { ...result, failed: { stage: 'definition', message: `定义校验不过：${got.issues.length} 个问题`, issues: got.issues.length } };
 }
 
-/** 总体：校验通过率按样例数算，命中率按结构项加权 */
+/** 总体：通过率按样例数算（期望做不到的样例给出 unsupported 也算通过），命中率按结构项加权（期望做不到的样例 items 为 0，不计入） */
 export function summarize(results: CaseResult[]): Summary {
   const valid = results.filter(r => r.valid).length;
   const hits = results.reduce((n, r) => n + r.hits, 0);

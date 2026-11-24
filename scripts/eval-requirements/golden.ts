@@ -17,7 +17,10 @@ export interface GoldenCase {
   id: string;
   kind: DslKind;
   request: string;
-  expected: MetricSpec | TagSpec;
+  /** 期望的定义；期望做不到的样例没有 */
+  expected?: MetricSpec | TagSpec;
+  /** 期望做不到（#1210）：模型给出 unsupported 才算通过，不要求过定义校验 */
+  expectedUnsupported?: boolean;
 }
 
 /** 失败类型：a 召回失败、b 选错口径、c 知识缺失（如靠别名才找得到）、d 超出能力 */
@@ -30,12 +33,14 @@ export const ROLES = ['analyst', 'viewer'] as const;
 /** 一条检索标注：query 缺省用 request；candidates 是正确候选集合，forbidden 是不能选的近义项（都是目录条目 id） */
 export interface GoldenRetrieval { query: string; candidates: string[]; forbidden: string[]; ambiguous: boolean }
 
-/** 黄金集的一条：没有合法 DSL 可写的（多为 c、d 类，或要先追问的）没有 kind / expected；clarify 是期望的追问，不需要追问为 null */
+/** 黄金集的一条：没有合法 DSL 可写的（多为 c、d 类，或要先追问的）没有 kind / expected；clarify 是期望的追问，不需要追问为 null。
+ *  expected_unsupported 标「期望做不到」（#1210）：有 kind、没有 expected，起草评测里模型给出 unsupported 才算通过 */
 export interface GoldenEntry {
   id: string;
   kind?: DslKind;
   request: string;
   expected?: MetricSpec | TagSpec;
+  expected_unsupported?: boolean;
   failure_type: (typeof FAILURE_TYPES)[number];
   role: (typeof ROLES)[number];
   covers: (typeof COVERS)[number][];
@@ -116,6 +121,7 @@ export const GOLDEN_ALL: GoldenEntry[] = readdirSync(dir).filter(f => f.endsWith
   return {
     id, request: file.request,
     ...(file.kind && { kind: file.kind }), ...(file.expected && { expected: file.expected }),
+    ...(file.expected_unsupported && { expected_unsupported: true }),
     failure_type: file.failure_type, role: file.role ?? 'analyst', covers: file.covers ?? [],
     retrieval: { ...file.retrieval, query: file.retrieval.query ?? file.request },
     clarify: file.clarify,
@@ -123,5 +129,8 @@ export const GOLDEN_ALL: GoldenEntry[] = readdirSync(dir).filter(f => f.endsWith
   };
 });
 
-/** 模型评测用的样例：有 kind 与 expected 的条目 */
-export const GOLDEN: GoldenCase[] = GOLDEN_ALL.flatMap(({ id, kind, request, expected }) => (kind && expected ? [{ id, kind, request, expected }] : []));
+/** 模型评测用的样例：有 kind，且有 expected 或标了期望做不到的条目 */
+export const GOLDEN: GoldenCase[] = GOLDEN_ALL.flatMap(({ id, kind, request, expected, expected_unsupported }) =>
+  (kind && (expected || expected_unsupported)
+    ? [{ id, kind, request, ...(expected && { expected }), ...(expected_unsupported && { expectedUnsupported: true }) }]
+    : []));

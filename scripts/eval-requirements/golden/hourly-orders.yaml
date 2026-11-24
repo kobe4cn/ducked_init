@@ -1,4 +1,6 @@
 request: 今天每小时的下单量趋势
+kind: metric
+expected_unsupported: true
 failure_type: d
 retrieval:
   candidates: [field:order.created_at]
