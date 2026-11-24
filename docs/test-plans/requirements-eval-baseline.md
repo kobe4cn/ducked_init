@@ -66,7 +66,7 @@ LLM_BASE_URL=… LLM_MODEL=qwen-plus LLM_API_KEY=… pnpm eval:requirements   # 
 
 #1227 之前评测没有按期望模式分组的统计，只能从逐条输出里数。#1227 在 validate_plan 说明与能起草定义的角色的助手系统提示里加了选模式的规则（`PLAN_MODE_RULE`）：消费者粒度、可复用的口径（窗口 + 过滤）优先 draft_definition，只有跨粒度汇总或一次性查询才用 draft_query。
 
-**AI-PL2 重放（#1227）**：用例见 `docs/test-plans/acceptance-plan.md` 的 AI-PL2（「每个消费者近 180 天在京东渠道的消费金额」，期望 `draft_definition`）。方法照 `docs/ai-capability-audit-part2.md` §6.1：在 dev server（5180）上用 `an@fmcglab.test` 调 `POST /assistant`，每轮新开一个对话，跑 3 轮；可经 `scripts/llm-capture-proxy.ts` 记下请求。看返回的 `plan.mode`：
+**AI-PL2 重放（#1227）**：用例见 `docs/test-plans/acceptance-plan.md` 的 AI-PL2（「每个消费者近 180 天在京东渠道的消费金额」，期望 `draft_definition`）。方法照 `docs/ai-capability-audit-part2.md` §6.1：在 dev server（5180）上用 `an@fmcglab.test` 调 `POST /assistant`，每轮新开一个对话，跑 3 轮。看返回的 `plan.mode`：
 
 | 轮次 | 计划模式 | 选中 / 起草的定义 | 判定 |
 |---|---|---|---|
