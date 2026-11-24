@@ -21,7 +21,7 @@ import type { CurrentMember } from '../auth';
 import { expand, groupItems, groupOverview, toMarkdown, type Catalog, type CatalogEntry } from '../catalog';
 import { judgeAmbiguity, type AmbiguityGroup } from '../catalog/ambiguity';
 import { tenantCatalog } from '../catalog/load';
-import { PLAN_SCHEMA, planRetrievedIds, semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type PlanStatus } from '../catalog/plan';
+import { PLAN_SCHEMA, planRetrievedIds, semanticHash, validatePlan, type AnalysisPlan, type PlanCheck, type PlanIssue, type PlanStatus } from '../catalog/plan';
 import { rankedSearch, visibilityClass, visibleCatalog } from '../catalog/projection';
 import type { HitReason, Ranked } from '../catalog/rank';
 import { getDb } from '../db/client';
@@ -208,6 +208,18 @@ export const PLAN_EXAMPLE: AnalysisPlan = {
   questions: [],
 };
 
+/** validate_plan 的工具说明（附 PLAN_EXAMPLE）：助手工具与计划模式评测（scripts/eval-requirements/score.ts）共用 */
+export const VALIDATE_PLAN_DESCRIPTION = '校验一份分析计划（JSON）：结构、步骤与选中的目录条目、口径可加性与平台能力。计划只能引用本轮 catalog_search / catalog_expand 返回过的条目或对话里最近一份计划引用过的条目，'
+  + '并带上返回的 semanticHash（指标、标签、模板还要带 version）；可选的 excluded 列出检索到但没选的口径（id 也必须来自本轮检索或对话里最近一份计划）和原因，'
+  + '可选的 rationale 说明为何选；原因里不要写目录以外的名称。返回 status（valid / needs_clarification / unsupported / invalid）与逐条问题。'
+  + `最小合法示例（draft_query）：${JSON.stringify(PLAN_EXAMPLE)}`;
+
+/** validate_plan 返回给模型的文本：status 一行加逐条问题；助手工具与计划模式评测的修正回合共用 */
+export function planCheckText(check: PlanCheck): string {
+  const issues = planIssueLines(check.issues);
+  return [`status: ${check.status}`, ...(issues ? [issues] : [])].join('\n');
+}
+
 export const TOOLS: AssistantTool[] = [
   {
     name: 'catalog_overview',
@@ -288,10 +300,7 @@ export const TOOLS: AssistantTool[] = [
   },
   {
     name: 'validate_plan',
-    description: '校验一份分析计划（JSON）：结构、步骤与选中的目录条目、口径可加性与平台能力。计划只能引用本轮 catalog_search / catalog_expand 返回过的条目或对话里最近一份计划引用过的条目，'
-      + '并带上返回的 semanticHash（指标、标签、模板还要带 version）；可选的 excluded 列出检索到但没选的口径（id 也必须来自本轮检索或对话里最近一份计划）和原因，'
-      + '可选的 rationale 说明为何选；原因里不要写目录以外的名称。返回 status（valid / needs_clarification / unsupported / invalid）与逐条问题。'
-      + `最小合法示例（draft_query）：${JSON.stringify(PLAN_EXAMPLE)}`,
+    description: VALIDATE_PLAN_DESCRIPTION,
     // 发给模型的是计划的完整结构（#1178），入参只查 plan 是对象：结构错误由 validatePlan 以 status: invalid 与逐条问题返回，不在 invokeTool 处 400
     inputSchema: { type: 'object', required: ['plan'], properties: { plan: schemaForModel(PLAN_SCHEMA) }, additionalProperties: false },
     inputCheck: { type: 'object', required: ['plan'], properties: { plan: { type: 'object' } }, additionalProperties: false },
@@ -302,8 +311,7 @@ export const TOOLS: AssistantTool[] = [
       const check = validatePlan(plan, { catalog: await catalogFor(actor), retrieved: ctx?.retrieved ?? new Set() });
       // 本轮收到的最后一份结构合法的计划（status 不是 valid 也算）带走：随对话保存，存草稿前重新校验用（ADR-0050）
       if (check.plan && ctx) ctx.plan = check.plan;
-      const issues = planIssueLines(check.issues);
-      return [`status: ${check.status}`, ...(issues ? [issues] : [])].join('\n');
+      return planCheckText(check);
     },
   },
   {

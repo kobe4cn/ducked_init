@@ -61,6 +61,10 @@ export interface RetrievalRow {
   mode: PlanMode | null;
   /** 期望的计划模式（plan-modes.ts 的标注） */
   expectedMode: PlanMode;
+  /** 第 1 份计划合格（runPlanCase 的 firstPass，#1226）；没跑模型为 false */
+  firstPass: boolean;
+  /** 最后一份计划合格（含修正后合格，runPlanCase 的 passed）；没跑模型为 false */
+  passed: boolean;
 }
 
 export const retrievalRows = (gs: GoldenEntry[], vectors?: RetrievalVectors): RetrievalRow[] => gs.map(g => {
@@ -68,7 +72,7 @@ export const retrievalRows = (gs: GoldenEntry[], vectors?: RetrievalVectors): Re
   const mode = expectedMode(g);
   return {
     id: g.id, type: g.failure_type, holdout: g.holdout, recall: recallAt(g, r), top1: r.top[0] ?? null,
-    asked: r.ambiguous, shouldAsk: g.clarify !== null && mode !== 'unsupported', planned: false, mode: null, expectedMode: mode,
+    asked: r.ambiguous, shouldAsk: g.clarify !== null && mode !== 'unsupported', planned: false, mode: null, expectedMode: mode, firstPass: false, passed: false,
   };
 });
 
@@ -82,6 +86,10 @@ export interface GroupStats {
   clarifyRecall: number | null;
   /** 计划模式与期望一致的条数 / 跑过模型的条数（planned，#423，ADR-0050；跑了但失败的 mode 为 null，算错、进分母）；组里一条都没跑模型时为 null */
   modeAccuracy: number | null;
+  /** 第 1 份计划就合格的条数 / 跑过模型的条数（#1226，分母同 modeAccuracy）；组里一条都没跑模型时为 null */
+  firstPassRate: number | null;
+  /** 最后一份计划合格（含修正后）的条数 / 跑过模型的条数；组里一条都没跑模型时为 null */
+  fixedPassRate: number | null;
 }
 
 export type GroupKey = (typeof FAILURE_TYPES)[number] | '合计';
@@ -98,6 +106,8 @@ function stats(rows: RetrievalRow[]): GroupStats {
     clarifyAccuracy: rows.length ? rows.filter(r => r.asked === r.shouldAsk).length / rows.length : 1,
     clarifyRecall: should.length ? should.filter(r => r.asked).length / should.length : null,
     modeAccuracy: planned.length ? planned.filter(r => r.mode === r.expectedMode).length / planned.length : null,
+    firstPassRate: planned.length ? planned.filter(r => r.firstPass).length / planned.length : null,
+    fixedPassRate: planned.length ? planned.filter(r => r.passed).length / planned.length : null,
   };
 }
 
