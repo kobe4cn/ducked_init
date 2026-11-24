@@ -1,14 +1,16 @@
 // scripts/eval-requirements/score.ts —— 需求评测的跑分（ADR-0041）：对一个黄金样例走与产品相同的起草消息（definitionDraftMessages，固定目录）、
 // 输出 Schema 与转 YAML，记下转出的定义能否过校验（checkMetric / checkTag），再与期望逐项比较结构。不读库、不写调用日志（用 callModel 而不是 chatJson）。
 // 另有计划模式的评测（#423，ADR-0050）：runPlanCase 让模型对一条需求在五种模式里选一个并给出计划 JSON，validatePlan 解析出 mode，
-// 与 plan-modes.ts 的期望比对。产品的 validate_plan 工具还没接入助手（P4⑮），这里的消息是评测自己拼的，接入后对齐
+// 与 plan-modes.ts 的期望比对。提示里带与助手共用的 validate_plan 说明（含 PLAN_EXAMPLE）与完整 PLAN_SCHEMA，不合格时把同样的校验文本回给模型修正（#1226）
 import { stringify } from 'yaml';
 import { expand, layeredContext, OVERVIEW_TOKENS, toMarkdown, type Catalog, type CatalogEntry } from '../../app/.server/catalog';
 import { deriveProjection } from '../../app/.server/catalog/projection';
 import { rank } from '../../app/.server/catalog/rank';
-import { AGGREGATE_FNS, PLAN_MODES, PLAN_SCHEMA, semanticHash, validatePlan, type PlanMode } from '../../app/.server/catalog/plan';
+import { AGGREGATE_FNS, PLAN_MODES, PLAN_SCHEMA, semanticHash, validatePlan, type PlanCheck, type PlanMode } from '../../app/.server/catalog/plan';
 import { CLAIM_TYPES } from '../../app/lib/semantic-claims';
-import { callModel, LlmError, schemaErrors, validatorFor, type LlmMessage, type LlmProvider } from '../../app/.server/llm';
+import { callModel, LlmError, schemaErrors, schemaForModel, validatorFor, type LlmMessage, type LlmProvider } from '../../app/.server/llm';
+import { MAX_FIXES } from '../../app/.server/assistant/loop';
+import { planCheckText, VALIDATE_PLAN_DESCRIPTION } from '../../app/.server/assistant/tools';
 import { DSL_KINDS, type DslKind } from '../../app/.server/pipeline/dsl';
 import type { MetricSpec, RatioPart } from '../../app/.server/pipeline/dsl/metric-spec';
 import { completeDraftPaths, definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml, METRIC_PARSE_SCHEMA, normalizeParseOutput, SEARCH_LIMIT } from '../../app/.server/pipeline/dsl/model-draft';
@@ -224,6 +226,9 @@ const PLAN_SYSTEM = [
   '- assumptions：你的假设，每项 { text, confirmed }，没有就空数组。',
   '- questions：要追问的问题，clarify 至少一条，其他模式空数组。',
   '- reason：mode 为 unsupported 时必填，其他模式不要写。',
+  // 与助手共用：validate_plan 的工具说明（含 PLAN_EXAMPLE）与发给模型的计划结构（产品里是该工具的 inputSchema）
+  `计划会交给 validate_plan 校验。${VALIDATE_PLAN_DESCRIPTION}`,
+  `计划 JSON 的完整结构（JSON Schema）：${JSON.stringify(schemaForModel(PLAN_SCHEMA))}`,
 ].join('\n');
 
 /** 该条目写进计划 selected 时的依据：指标 / 标签 / 模板带版本，语义哈希按当前目录现算（validatePlan 会比对） */
@@ -234,18 +239,29 @@ const selectableLine = (e: CatalogEntry) => {
 
 export interface PlanCaseResult {
   id: string;
-  /** 模型选的计划模式（validatePlan 解析出的 plan.mode）；模型调用失败或计划结构不合法时为 null */
+  /** 模型选的计划模式（validatePlan 解析出的最后一份 plan.mode）；模型调用失败或计划结构不合法时为 null */
   mode: PlanMode | null;
   /** 期望模式（plan-modes.ts 的标注） */
   expected: PlanMode;
   /** 模式一致为 true；不一致或解析失败为 false */
   correct: boolean;
+  /** 第 1 份计划就合格（validatePlan 的 status 不是 invalid） */
+  firstPass: boolean;
+  /** 最后一份计划合格（含修正后合格） */
+  passed: boolean;
+  /** 修正回合数（不合格后再要计划的次数，最多 MAX_FIXES） */
+  fixes: number;
   failed?: { stage: 'model' | 'plan'; message: string };
 }
 
+/** 「合格」：validatePlan 的 status 不是 invalid（clarify / unsupported 计划的 status 本来就不是 valid） */
+const planOk = (check: PlanCheck) => check.status !== 'invalid';
+
 /**
- * 跑一条需求的计划模式：目录按角色取可见的（查看者用 viewerView），selected 只能从 retrieve 的前 20 里选，
- * 模型输出先过 PLAN_SCHEMA 再交给 validatePlan；只对解析出的 mode 计分，计划里的问题（版本 / 口径 / 可加性）不影响这一列
+ * 跑一条需求的计划模式：目录按角色取可见的（查看者用 viewerView），selected 只能从 retrieve 的前 20 里选。
+ * 对齐产品的 validate_plan：callModel 只要求输出是对象（对应工具的 inputCheck），结构错误交给 validatePlan 逐条报告；
+ * 不合格时把 planCheckText 回给模型要一份完整计划，最多 MAX_FIXES 次、合格即停。产品里 validate_plan 不计修正次数，限次数是评测的约定。
+ * 修正回合里模型调用失败就停下，按最后一份计划计。mode 取最后一份计划，计划里的问题（版本 / 口径 / 可加性）只影响合格率、不影响模式这一列
  */
 export async function runPlanCase(provider: LlmProvider, g: GoldenEntry): Promise<PlanCaseResult> {
   const expected = expectedMode(g);
@@ -262,17 +278,35 @@ export async function runPlanCase(provider: LlmProvider, g: GoldenEntry): Promis
     { role: 'system', content: PLAN_SYSTEM },
     { role: 'user', content: user },
   ];
+  const retrieved = new Set(r.top);
 
   let out: object;
   try {
-    out = await callModel<object>(provider, messages, PLAN_SCHEMA);
+    out = await callModel<object>(provider, messages, { type: 'object' });
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
-    return { id: g.id, mode: null, expected, correct: false, failed: { stage: 'model', message: e.message } };
+    return { id: g.id, mode: null, expected, correct: false, firstPass: false, passed: false, fixes: 0, failed: { stage: 'model', message: e.message } };
   }
-  const check = validatePlan(out, { catalog, retrieved: new Set(r.top) });
+  let check = validatePlan(out, { catalog, retrieved });
+  const firstPass = planOk(check);
+  let fixes = 0;
+  while (!planOk(check) && fixes < MAX_FIXES) {
+    messages.push(
+      { role: 'assistant', content: JSON.stringify(out) },
+      { role: 'user', content: `validate_plan 的结果：\n${planCheckText(check)}\n请修正后重新输出完整的计划 JSON。` },
+    );
+    fixes++;
+    try {
+      out = await callModel<object>(provider, messages, { type: 'object' });
+    } catch (e) {
+      if (!(e instanceof LlmError)) throw e;
+      break;
+    }
+    check = validatePlan(out, { catalog, retrieved });
+  }
+  const passed = planOk(check);
   const mode = check.plan?.mode ?? null;
   return mode === null
-    ? { id: g.id, mode: null, expected, correct: false, failed: { stage: 'plan', message: `计划结构不合法（${check.issues.length} 个问题）：${check.issues[0]?.message ?? ''}` } }
-    : { id: g.id, mode, expected, correct: mode === expected };
+    ? { id: g.id, mode: null, expected, correct: false, firstPass, passed, fixes, failed: { stage: 'plan', message: `计划结构不合法（${check.issues.length} 个问题）：${check.issues[0]?.message ?? ''}` } }
+    : { id: g.id, mode, expected, correct: mode === expected, firstPass, passed, fixes };
 }

@@ -12,7 +12,9 @@ import { DSL_KINDS } from '../app/.server/pipeline/dsl';
 import { CATALOG, CONTEXT, GOLDEN, GOLDEN_ALL } from '../scripts/eval-requirements/golden';
 import { RETRIEVAL_CATALOG } from '../scripts/eval-requirements/retrieval-catalog';
 import { runCase, runPlanCase, summarize } from '../scripts/eval-requirements/score';
-import { fakeLlm, json } from './pipeline/llm-fixtures';
+import { fakeLlm, json, text } from './pipeline/llm-fixtures';
+import { MAX_FIXES } from '../app/.server/assistant/loop';
+import { PLAN_EXAMPLE, VALIDATE_PLAN_DESCRIPTION } from '../app/.server/assistant/tools';
 
 afterEach(() => { setLlmFetch(undefined); });
 
@@ -188,7 +190,7 @@ describe('计划模式评测', () => {
   it('模式一致记对：user 消息带前 20 条目、可选中条目的版本与语义哈希、需求原文', async () => {
     const g = entryNamed('gmv-alias'); // 期望 reuse_result：gross_revenue_30d 挂着 GMV 别名
     const { received } = fakeLlm(setLlmFetch, () => json(plan('reuse_result')));
-    expect(await runPlanCase(PROVIDER, g)).toEqual({ id: 'gmv-alias', mode: 'reuse_result', expected: 'reuse_result', correct: true });
+    expect(await runPlanCase(PROVIDER, g)).toEqual({ id: 'gmv-alias', mode: 'reuse_result', expected: 'reuse_result', correct: true, firstPass: true, passed: true, fixes: 0 });
     const body = JSON.parse(JSON.stringify(received[0]!.body));
     expect(body.messages[0].content).toContain('reuse_result');
     expect(body.messages[0].content).toContain('unsupported');
@@ -200,30 +202,53 @@ describe('计划模式评测', () => {
     expect(user.endsWith(`# 需求\n\n${g.request}`)).toBe(true);
     expect(user).toContain('metric:gross_revenue_30d');
     expect(user).toContain(semanticHash(expand(RETRIEVAL_CATALOG, 'metric:gross_revenue_30d')!));
+    // 与助手共用 validate_plan 的说明（含 PLAN_EXAMPLE）与完整计划结构（#1226）
+    expect(system).toContain(VALIDATE_PLAN_DESCRIPTION);
+    expect(system).toContain(JSON.stringify(PLAN_EXAMPLE));
+    expect(system).toContain('schemaVersion');
   });
 
   it('查看者条目用查看者目录：消息里没有数据源与源表', async () => {
     const g = entryNamed('viewer-paid-revenue'); // 期望 reuse_result：revenue_paid_30d 查看者也可见
     const { received } = fakeLlm(setLlmFetch, () => json(plan('reuse_result')));
-    expect(await runPlanCase(PROVIDER, g)).toEqual({ id: 'viewer-paid-revenue', mode: 'reuse_result', expected: 'reuse_result', correct: true });
+    expect(await runPlanCase(PROVIDER, g)).toEqual({ id: 'viewer-paid-revenue', mode: 'reuse_result', expected: 'reuse_result', correct: true, firstPass: true, passed: true, fixes: 0 });
     expect(received[0]!.body.messages[1].content).not.toContain('source:');
     expect(received[0]!.body.messages[1].content).not.toContain('table:');
   });
 
-  it('模式不一致记错；不合 Schema 或计划结构不合法时 mode 为 null 也记错，Key 不出现在结果里', async () => {
+  it('模式不一致记错；模型回的不是 JSON 记失败于模型调用；修正 MAX_FIXES 次仍不合格时 mode 为 null 也记错，Key 不出现在结果里', async () => {
     const g = entryNamed('gmv-alias');
     fakeLlm(setLlmFetch, () => json(plan('draft_query')));
-    expect(await runPlanCase(PROVIDER, g)).toMatchObject({ mode: 'draft_query', expected: 'reuse_result', correct: false });
+    expect(await runPlanCase(PROVIDER, g)).toMatchObject({ mode: 'draft_query', expected: 'reuse_result', correct: false, firstPass: true, passed: true, fixes: 0 });
 
-    fakeLlm(setLlmFetch, () => json({ schemaVersion: 1, mode: 'reuse_result' })); // 缺必填项，不合 Schema
+    fakeLlm(setLlmFetch, () => text('这不是 JSON'));
+    const notJson = await runPlanCase(PROVIDER, g);
+    expect(notJson).toMatchObject({ mode: null, expected: 'reuse_result', correct: false, firstPass: false, passed: false, fixes: 0, failed: { stage: 'model' } });
+    expect(JSON.stringify(notJson)).not.toContain(PROVIDER.apiKey);
+
+    // 缺必填项、不合 PLAN_SCHEMA：交给 validatePlan 报告并进修正回合，一直不改就在 1 + MAX_FIXES 次后停下
+    const { received } = fakeLlm(setLlmFetch, () => json({ schemaVersion: 1, mode: 'reuse_result' }));
     const bad = await runPlanCase(PROVIDER, g);
-    expect(bad).toMatchObject({ mode: null, expected: 'reuse_result', correct: false, failed: { stage: 'model' } });
+    expect(received).toHaveLength(1 + MAX_FIXES);
+    expect(bad).toMatchObject({ mode: null, expected: 'reuse_result', correct: false, firstPass: false, passed: false, fixes: MAX_FIXES, failed: { stage: 'plan' } });
     expect(JSON.stringify(bad)).not.toContain(PROVIDER.apiKey);
 
     // 合 Schema 但步骤引用不存在的步骤：validatePlan 解析不出计划
     fakeLlm(setLlmFetch, () => json(plan('clarify', { questions: ['按哪个口径？'], steps: [{ id: 's1', action: 'answer', inputs: ['nope'] }] })));
     const broken = await runPlanCase(PROVIDER, g);
-    expect(broken).toMatchObject({ mode: null, correct: false, failed: { stage: 'plan' } });
+    expect(broken).toMatchObject({ mode: null, correct: false, passed: false, failed: { stage: 'plan' } });
     expect(broken.failed!.message).toContain('inputs 引用了不存在的步骤或条目');
+  });
+
+  it('首次不合格时把 validate_plan 的结果与上一份答复回给模型，修正后合格即停、模式按最后一份计', async () => {
+    const g = entryNamed('gmv-alias');
+    const { received } = fakeLlm(setLlmFetch, n => json(n === 1 ? {} : plan('reuse_result')));
+    expect(await runPlanCase(PROVIDER, g)).toEqual({ id: 'gmv-alias', mode: 'reuse_result', expected: 'reuse_result', correct: true, firstPass: false, passed: true, fixes: 1 });
+    expect(received).toHaveLength(2);
+    const messages = received[1]!.body.messages as { role: string; content: string }[];
+    expect(messages).toHaveLength(4);
+    expect(messages[2]).toEqual({ role: 'assistant', content: '{}' });
+    expect(messages[3]!.role).toBe('user');
+    expect(messages[3]!.content).toContain('status: invalid');
   });
 });

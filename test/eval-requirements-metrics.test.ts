@@ -9,8 +9,9 @@ import { GOLDEN_ALL } from '../scripts/eval-requirements/golden';
 import { PLAN_MODE_BY_ID, expectedMode } from '../scripts/eval-requirements/plan-modes';
 import { groupByType, retrievalRows, VIEWS, type RetrievalRow, type RetrievalVectors } from '../scripts/eval-requirements/retrieval';
 
-const row = (id: string, type: RetrievalRow['type'], recall: number | null, asked: boolean, shouldAsk: boolean, mode: PlanMode | null = null, expected: PlanMode = 'draft_query', planned = mode !== null): RetrievalRow =>
-  ({ id, type, holdout: false, recall, top1: null, asked, shouldAsk, planned, mode, expectedMode: expected });
+const row = (id: string, type: RetrievalRow['type'], recall: number | null, asked: boolean, shouldAsk: boolean, mode: PlanMode | null = null, expected: PlanMode = 'draft_query', planned = mode !== null,
+  firstPass = false, passed = false): RetrievalRow =>
+  ({ id, type, holdout: false, recall, top1: null, asked, shouldAsk, planned, mode, expectedMode: expected, firstPass, passed });
 
 describe('eval:requirements 的检索与追问指标', () => {
   it('分组：Recall@20 组内平均且没有候选的不计，追问正确率按条数，应追问召回只看应追问的条目，合计覆盖全部', () => {
@@ -20,12 +21,12 @@ describe('eval:requirements 的检索与追问指标', () => {
       row('a3', 'a', null, true, true),
       row('b1', 'b', 0, true, false),
     ]);
-    expect(g.a).toEqual({ cases: 3, recall: 0.75, clarifyAccuracy: 2 / 3, clarifyRecall: 0.5, modeAccuracy: null });
+    expect(g.a).toEqual({ cases: 3, recall: 0.75, clarifyAccuracy: 2 / 3, clarifyRecall: 0.5, modeAccuracy: null, firstPassRate: null, fixedPassRate: null });
     // 组里没有应追问的条目：应追问召回为 null
-    expect(g.b).toEqual({ cases: 1, recall: 0, clarifyAccuracy: 0, clarifyRecall: null, modeAccuracy: null });
+    expect(g.b).toEqual({ cases: 1, recall: 0, clarifyAccuracy: 0, clarifyRecall: null, modeAccuracy: null, firstPassRate: null, fixedPassRate: null });
     // 空组：没有可算的召回
-    expect(g.c).toEqual({ cases: 0, recall: null, clarifyAccuracy: 1, clarifyRecall: null, modeAccuracy: null });
-    expect(g.合计).toEqual({ cases: 4, recall: 0.5, clarifyAccuracy: 0.5, clarifyRecall: 0.5, modeAccuracy: null });
+    expect(g.c).toEqual({ cases: 0, recall: null, clarifyAccuracy: 1, clarifyRecall: null, modeAccuracy: null, firstPassRate: null, fixedPassRate: null });
+    expect(g.合计).toEqual({ cases: 4, recall: 0.5, clarifyAccuracy: 0.5, clarifyRecall: 0.5, modeAccuracy: null, firstPassRate: null, fixedPassRate: null });
   });
 
   it('计划模式正确率：模式一致的条数 / 跑过模型的条数，跑了但失败（mode 为 null）算错，没跑的不计入，一条都没跑为 null', () => {
@@ -45,6 +46,24 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(g.合计.modeAccuracy).toBe(2 / 5);
   });
 
+  it('首次合格率 / 修正后合格率：合格条数 / 跑过模型的条数（分母同模式正确率），没跑的不计入，一条都没跑为 null', () => {
+    const g = groupByType([
+      row('p1', 'a', null, false, false, 'clarify', 'clarify', true, true, true), // 首次合格
+      row('p2', 'a', null, false, false, 'clarify', 'clarify', true, false, true), // 修正后合格
+      row('p3', 'a', null, false, false, null, 'clarify', true), // 跑了但一直不合格
+      row('p4', 'a', null, false, false, 'clarify', 'clarify', false, true, true), // 没跑模型（标记了合格也不计）
+      row('b1', 'b', 0, false, false, null, 'draft_definition', true), // 组里只有不合格行
+    ]);
+    expect(g.a.firstPassRate).toBe(1 / 3);
+    expect(g.a.fixedPassRate).toBe(2 / 3);
+    expect(g.b.firstPassRate).toBe(0);
+    expect(g.b.fixedPassRate).toBe(0);
+    expect(g.c.firstPassRate).toBeNull();
+    expect(g.c.fixedPassRate).toBeNull();
+    expect(g.合计.firstPassRate).toBe(1 / 4);
+    expect(g.合计.fixedPassRate).toBe(2 / 4);
+  });
+
   it('真实黄金集：合计 Recall@20 与 retrieval-golden 的汇总一致，应追问 9 条（期望 unsupported 的不算，#1210）、判出 8 条（其中 7 条该问；dormant-alias 不是检索歧义，consumption-amount 是 KNOWN_GAPS，revenue-yoy 判出歧义但该说做不到），验收集 8 条', () => {
     const rows = retrievalRows(GOLDEN_ALL);
     const total = groupByType(rows).合计;
@@ -60,9 +79,11 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(total.clarifyAccuracy).toBe(39 / 42);
     expect(rows.filter(r => r.asked !== r.shouldAsk).map(r => r.id).sort()).toEqual(['consumption-amount', 'dormant-alias', 'revenue-yoy']);
     // 没跑模型：每条的 planned 为 false、mode 为 null，正确率不可算
-    expect(rows.every(r => !r.planned && r.mode === null)).toBe(true);
+    expect(rows.every(r => !r.planned && r.mode === null && !r.firstPass && !r.passed)).toBe(true);
     expect(rows.every(r => r.expectedMode === PLAN_MODE_BY_ID[r.id])).toBe(true);
     expect(total.modeAccuracy).toBeNull();
+    expect(total.firstPassRate).toBeNull();
+    expect(total.fixedPassRate).toBeNull();
     expect(rows.filter(r => r.holdout)).toHaveLength(8);
   });
 
