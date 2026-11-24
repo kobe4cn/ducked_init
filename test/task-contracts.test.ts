@@ -37,7 +37,7 @@ const accepted: [TaskKind, Record<string, unknown>][] = [
   ['silver.keycheck', { entities: [{ entity: 'customer', key: ['id'], bySource: false, mappings: [{ mapping: 'm1', columns: ['id'], group: 'g1' }] }] }],
   // entities 允许为空列表（原校验只查每一项的形状，没有长度要求）
   ['silver.keycheck', { entities: [] }],
-  ['silver.merge', { mappings: [mapping], identity: ['phone'], identityForce: true, survivorship: { m1: 1 }, consumerSensitive: ['phone'], relations: [{ from: { entity: 'order', field: 'customer_id' }, ref: { entity: 'customer', field: 'id' }, sensitive: false }], identityExclude: [hash] }],
+  ['silver.merge', { mappings: [mapping], identity: ['phone'], identityForce: true, survivorship: { m1: 1 }, loginEvents: { m1: ['sign_in'] }, consumerSensitive: ['phone'], relations: [{ from: { entity: 'order', field: 'customer_id' }, ref: { entity: 'customer', field: 'id' }, sensitive: false }], identityExclude: [hash] }],
   // 只撤下停用映射（停用的是实体最后一个映射）时 mappings 可以为空
   ['silver.merge', { mappings: [], drop: [{ mapping: 'm1', entity: 'customer' }], identityForce: false, identityExclude: [] }],
   // 早先入队的合并没有这些项
@@ -94,6 +94,8 @@ const rejected: [TaskKind, unknown, string][] = [
   ['silver.merge', { mappings: [mapping], identity: [] }, '参数 identity 必须是非空的字段名列表'],
   ['silver.merge', { mappings: [mapping], identityForce: 'yes' }, '参数 identityForce 必须是布尔值'],
   ['silver.merge', { mappings: [mapping], survivorship: { m1: 0 } }, '参数 survivorship 必须是映射 ID 到正整数名次的对照'],
+  ['silver.merge', { mappings: [mapping], loginEvents: { m1: [] } }, '参数 loginEvents 必须是映射 ID 到登录事件取值列表的对照'],
+  ['silver.merge', { mappings: [mapping], loginEvents: { m1: [1] } }, '参数 loginEvents 必须是映射 ID 到登录事件取值列表的对照'],
   ['silver.merge', { mappings: [mapping], consumerSensitive: 'phone' }, '参数 consumerSensitive 必须是字段名列表'],
   ['silver.merge', { mappings: [mapping], relations: [{ from: { entity: 'order' }, ref: { entity: 'customer', field: 'id' }, sensitive: false }] }, '参数 relations 必须是关系列表（from、ref 与 sensitive）'],
   ['gold.dsl', { key: 'k', sql: 'SELECT 1', entities: ['order'] }, '参数 kind 不合法'],
@@ -170,7 +172,7 @@ describe('任务契约', () => {
     const sync = CONTRACTS['source.sync'].params.parse({ sourceId: 's1', tables: [{ name: 'orders', key: 'id' }, { name: 'events', key: ['a'] }] });
     expect(sync).toMatchObject({ sourceId: 's1', tables: [{ name: 'orders', key: ['id'] }, { name: 'events', key: ['a'] }] });
     const merge = CONTRACTS['silver.merge'].params.parse({ mappings: [mapping] });
-    expect(merge).toMatchObject({ identityForce: false, identityExclude: [], survivorship: {}, consumerSensitive: [], relations: [], drop: [] });
+    expect(merge).toMatchObject({ identityForce: false, identityExclude: [], survivorship: {}, loginEvents: {}, consumerSensitive: [], relations: [], drop: [] });
   });
 
   it('模板契约的公共部分 schema：templateVersion 缺省补成 1、非整数报那句文案、多余键原样保留；模板部分按 templateAt 解析并补模板默认值', () => {
@@ -216,7 +218,7 @@ describe('updateQueuedParams：按契约改写仍在排队的任务参数', () =
       return { ...p, mappings: [mapping, { ...mapping, mapping: 'm2' }], identityForce: true };
     }));
     // 写回的是 f 的返回值（与 insertTask 入库原始参数的做法一致），缺省项也一并写进库
-    expect(seen[0]).toMatchObject({ mappings: [mapping], drop: [], identityForce: false, survivorship: {}, consumerSensitive: [], relations: [], identityExclude: [] });
+    expect(seen[0]).toMatchObject({ mappings: [mapping], drop: [], identityForce: false, survivorship: {}, loginEvents: {}, consumerSensitive: [], relations: [], identityExclude: [] });
     expect(updated).toMatchObject({ id: queued.id, status: 'queued' });
     expect((await getTask(queued.id)).params).toMatchObject({ mappings: [mapping, { ...mapping, mapping: 'm2' }], identityForce: true, drop: [] });
   });

@@ -112,6 +112,7 @@ const NOT_IN_LAKE_REASONS = Object.keys(LAKE_COVERAGE).filter(c => !['in_lake', 
 const WATERMARKS = ['updated_at', 'increment'] as const;
 
 const SURVIVORSHIP = '参数 survivorship 必须是映射 ID 到正整数名次的对照';
+const LOGIN_EVENTS = '参数 loginEvents 必须是映射 ID 到登录事件取值列表的对照';
 
 /** 同步 / 核对一张表的公共字段（key 两边形状不同，各自带）：表名、已确认的水位线字段及其种类、软删除字段 */
 const tableFields = (message: string) => ({
@@ -219,6 +220,8 @@ const mergeParams = z.looseObject({
   consumerSensitive: stringList('参数 consumerSensitive 必须是字段名列表').default([]),
   /** 属性取舍的名次：映射 ID → 正整数名次 */
   survivorship: z.record(z.string(error(SURVIVORSHIP)), z.number(error(SURVIVORSHIP)).int(error(SURVIVORSHIP)).min(1, error(SURVIVORSHIP)), error(SURVIVORSHIP)).default({}),
+  /** 登录事件的取值：event 映射 ID → 登录事件取值列表 */
+  loginEvents: z.record(z.string(error(LOGIN_EVENTS)), z.array(z.string(error(LOGIN_EVENTS)).min(1, error(LOGIN_EVENTS)), error(LOGIN_EVENTS)).min(1, error(LOGIN_EVENTS)), error(LOGIN_EVENTS)).default({}),
   /** 不参与身份匹配的值（规范化后的加盐哈希，只收 64 位十六进制，挡住误传的明文） */
   identityExclude: z.array(z.string(error('参数 identityExclude 必须是哈希（64 位小写十六进制）列表')).regex(/^[0-9a-f]{64}$/, error('参数 identityExclude 必须是哈希（64 位小写十六进制）列表')), error('参数 identityExclude 必须是哈希（64 位小写十六进制）列表')).default([]),
 }).refine(p => p.mappings.length > 0 || p.drop.length > 0, { error: MAPPINGS, path: ['mappings'] });

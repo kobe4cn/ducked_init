@@ -1,5 +1,5 @@
 // test/pipeline/identity-recompute.test.ts —— 身份打通何时重算：改到 customer、event 或 consent、打通结果表不在或上次失败时整表重算，否则跳过并写明原因；
-// customer 映射里可配置的匹配字段与 survivorship 优先级（ADR-0019）
+// customer 映射里可配置的匹配字段与 survivorship 优先级（ADR-0019），event 映射配置的登录取值进合并参数、改了它也强制重算（#1270）
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -13,7 +13,7 @@ import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { listTasks } from '../../app/.server/tasks';
 import { resetDb } from '../http/harness';
 import { drain } from './fixtures';
-import { CRM, LOYALTY, publishedIdentitySources } from './identity-fixtures';
+import { CRM, LOYALTY, TRACKING_EVENTS, publishedIdentitySources } from './identity-fixtures';
 import { grantOnSource } from './source-fixtures';
 import { type Identity, identities, consumerConsent, groupsOf, lastMerge, republish } from './identity-helpers';
 
@@ -173,6 +173,20 @@ describe('身份打通：可配置匹配字段与优先级', () => {
     const merge = await lastMerge(acme);
     expect(merge.params).toMatchObject({ survivorship: { [mappings.crm]: 1 }, identityForce: true });
     expect(merge.result.identities).not.toHaveProperty('skipped');
+  });
+
+  it('给埋点 event 映射配置登录取值并重新发布后，合并参数带上各 event 映射的登录取值（没配置的映射不在里面），且强制重算；取值没变的合并不因它强制', async () => {
+    const { acme, author, reviewer } = await publishedIdentitySources();
+    // 埋点 event 映射（TRACKING_EVENTS）在 fixture 里发布时返回值丢弃，这里从列表里找它
+    const event = (await listMappings(author)).mappings.find(m => m.entity === 'event')!;
+    await republish(author, reviewer, event.id, `${TRACKING_EVENTS}login_events: [login, sign_in]\n`);
+    const merge = await lastMerge(acme);
+    expect(merge.params.loginEvents).toEqual({ [event.id]: ['login', 'sign_in'] });
+    expect(merge.params.identityForce).toBe(true);
+    // 取值没再变：下一次合并不因它强制重算
+    await mergeNow(author);
+    await drain();
+    expect((await lastMerge(acme)).params.identityForce).toBe(false);
   });
 
   it('更高优先级的字段双方都有值且不同时，不按更低优先级的字段合并', async () => {

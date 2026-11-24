@@ -69,10 +69,11 @@ export async function pendingMerge(db: Tx | ReturnType<typeof getDb>, tenantId: 
 /**
  * 这次合并是否要强制重算身份打通（工作进程只看这次改没改到 customer / event，判断不出下面几种情况）：取本租户最近一次真正跑过打通
  * （结果里有 identities 且不是跳过）或没写结果就结束（崩溃、超时，之前提交的映射可能已改了 customer / event）的合并，
- * 它不存在、没写结果、打通失败了，或它的匹配规则与这次的 identity、属性取舍的名次与这次的 survivorship、不参与匹配的值与这次的 exclude（ADR-0039）不同时强制。
+ * 它不存在、没写结果、打通失败了，或它的匹配规则与这次的 identity、属性取舍的名次与这次的 survivorship、登录事件的取值与这次的 loginEvents、
+ * 不参与匹配的值与这次的 exclude（ADR-0039）不同时强制。
  * 多算一次没有坏处，宁可偏向强制
  */
-export async function mustRecomputeIdentities(db: Tx, tenantId: string, identity: unknown, survivorship: Record<string, number>, exclude: string[]) {
+export async function mustRecomputeIdentities(db: Tx, tenantId: string, identity: unknown, survivorship: Record<string, number>, exclude: string[], loginEvents: Record<string, string[]>) {
   const [last] = await db.select({ params: tasks.params, result: tasks.result }).from(tasks)
     .where(and(ofMerge(tenantId), inArray(tasks.status, ['succeeded', 'failed']),
       sql`(${tasks.result} IS NULL OR ${tasks.result} ? 'identities' AND NOT (${tasks.result}->'identities') ? 'skipped')`))
@@ -81,15 +82,24 @@ export async function mustRecomputeIdentities(db: Tx, tenantId: string, identity
   return !r || !r.identities || 'error' in r.identities
     || JSON.stringify(last.params.identity ?? null) !== JSON.stringify(identity ?? null)
     || JSON.stringify(rankEntries(last.params.survivorship)) !== JSON.stringify(rankEntries(survivorship))
-    || JSON.stringify(sortedHashes(last.params.identityExclude)) !== JSON.stringify(exclude);
+    || JSON.stringify(sortedHashes(last.params.identityExclude)) !== JSON.stringify(exclude)
+    || JSON.stringify(loginEntries(last.params.loginEvents)) !== JSON.stringify(loginEntries(loginEvents));
 }
 
 /** 属性取舍的名次（ADR-0027）：各已发布 customer 映射里配置的名次，映射 ID → 名次（没配置的映射不在里面） */
 const survivorshipPriority = (plans: PublishedPlan[]): Record<string, number> =>
   Object.fromEntries(plans.filter(p => p.entity === 'customer' && p.survivorship).map(p => [p.mapping, p.survivorship!.priority]));
 
+/** 登录事件的取值（#1269、#1270）：各已发布 event 映射里配置的取值，映射 ID → 取值列表（没配置的映射不在里面） */
+const loginEventsOf = (plans: PublishedPlan[]): Record<string, string[]> =>
+  Object.fromEntries(plans.filter(p => p.entity === 'event' && p.loginEvents).map(p => [p.mapping, [...p.loginEvents!]]));
+
 /** 名次表按映射 ID 排好的键值对，用来比对是否变了（早先的合并参数里没有这一项，等同于空表） */
 const rankEntries = (ranks: unknown) => Object.entries((ranks ?? {}) as Record<string, number>).sort(([a], [b]) => cmp(a, b));
+
+/** 登录取值表按映射 ID 排好的键值对（每个取值列表也排好），用来比对是否变了（早先的合并参数里没有这一项，等同于空表） */
+const loginEntries = (events: unknown): [string, string[]][] =>
+  Object.entries((events ?? {}) as Record<string, string[]>).sort(([a], [b]) => cmp(a, b)).map(([m, values]): [string, string[]] => [m, [...values].sort()]);
 
 /** 排好序的排除列表，用来比对是否变了（早先的合并参数里没有这一项，等同于空列表） */
 const sortedHashes = (hashes: unknown) => [...((hashes ?? []) as string[])].sort();
@@ -108,7 +118,7 @@ export function relationParams(published: Map<string, RegisteredEntity>, plans: 
  *    （incoming 自己的映射不剔除——恢复映射时撤下它的合并还在排队，要同时带 drop 与它的重建，ADR-0031/#195）；
  * 3. 排队中的同一映射已带 rebuild 时给 incoming 的这条补上 rebuild: true（强制重建的标记不丢）；
  * 4. 结果按映射 ID 用 cmp 排序（码点比较，ADR-0045）；
- * 5. identityForce 取或（已为真的保留），其余字段（identity、survivorship、consumerSensitive、relations、identityExclude）整体取 incoming 的；
+ * 5. identityForce 取或（已为真的保留），其余字段（identity、survivorship、loginEvents、consumerSensitive、relations、identityExclude）整体取 incoming 的；
  *    ...queued 保留 looseObject 带来的未知键（与并进前的写法一致）
  */
 export function mergeQueued(queued: MergeParams, incoming: MergeParams): MergeParams {
@@ -125,6 +135,7 @@ export function mergeQueued(queued: MergeParams, incoming: MergeParams): MergePa
  * 锁住租户行后检查：同一租户同时只有一个合并在排队或运行（两个合并同时写同一张标准层表会冲突）。
  * 已有合并在排队时把映射补进去（同一映射换成最新版本）；已在运行（或补的时候刚被领取）时不入队，返回 null，由定时检查在它之后补上。
  * 给定的映射都没有已发布版本时也不入队。参数里另带身份打通的匹配规则、属性取舍的名次（映射 ID → 名次）与不进 _consumer 的敏感字段，由全部已发布的 customer 映射汇总（重算打通时整表重算，不只看这次的映射），
+ * 以及各 event 映射配置的登录取值 loginEvents（映射 ID → 取值列表，改了它也强制重算，#1270；工作进程在 #1271 里用它），
  * 与要统计孤儿的全部已发布关系（工作进程不读平台库），
  * 本租户不参与匹配的值 identityExclude（排好序的哈希，ADR-0039），以及是否强制重算打通 identityForce（见 mustRecomputeIdentities；补进排队中的合并时，已为真的保留）。
  * opts.rebuild 时给这些映射带上强制重建标记；排队中的映射已带标记时，补进去的同一映射保留它。
@@ -139,13 +150,14 @@ export async function enqueueMerge(tx: Tx, tenantId: string, mappingIds?: string
   const all: PublishedPlan[] = mappingIds ? await publishedPlans(tx, tenantId) : plans;
   const identity = identityRules(all, mappingName);
   const survivorship = survivorshipPriority(all);
+  const loginEvents = loginEventsOf(all);
   const sensitive = consumerSensitive(all);
   const relations = relationParams(await publishedCustomEntities(tx, tenantId), all);
   if (pending?.status === 'running') return null;
   const identityExclude = await excludedHashes(tx, tenantId);
-  const force = await mustRecomputeIdentities(tx, tenantId, identity, survivorship, identityExclude);
+  const force = await mustRecomputeIdentities(tx, tenantId, identity, survivorship, identityExclude, loginEvents);
   // identity 由 schema 推出的入参类型是 string[]（identityRules 返回 readonly string[]），这里复制成可写的
-  const next: MergeParams = { mappings: plans, drop, identity: [...identity], survivorship, consumerSensitive: sensitive, relations, identityExclude, identityForce: force };
+  const next: MergeParams = { mappings: plans, drop, identity: [...identity], survivorship, loginEvents, consumerSensitive: sensitive, relations, identityExclude, identityForce: force };
   if (!pending) {
     // 新任务 drop 为空时不写 drop 键，与早先入队的任务形状一致；写回排队中的任务时总是带（mergeQueued 里显式给）
     const { drop, ...rest } = next;

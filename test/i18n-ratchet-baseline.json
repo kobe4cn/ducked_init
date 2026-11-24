@@ -88,7 +88,7 @@
     "app/.server/pipeline/source-view-engine.ts": 7,
     "app/.server/pipeline/sql-refs.ts": 2,
     "app/.server/pipeline/sync-engine.ts": 14,
-    "app/.server/pipeline/task-contracts.ts": 53,
+    "app/.server/pipeline/task-contracts.ts": 54,
     "app/.server/pipeline/task-hooks.ts": 1,
     "app/.server/pipeline/templates/churn.ts": 2,
     "app/.server/pipeline/templates/clv.ts": 2,
