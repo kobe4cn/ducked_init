@@ -344,22 +344,18 @@ function CustomAssertionItem({ result, label }: { result: AssertionResult; label
   );
 }
 
-/** 空跑结果：基础断言、自定义断言与转换后的样例行（敏感字段是加盐哈希，空值显示为 —） */
 /** event 映射的样例里有没有登录事件：设备归属只认这些 event_type 取值（ADR-0019），样例只是一部分记录，不阻止发布 */
 function LoginAssertion({ login }: { login: NonNullable<DryRunResult['assertions']['login']> }) {
   const t = useT();
   const values = login.values.join(t('、'));
-  return (
-    <Assertion name="login-events" ok={login.rows > 0}>
-      {!login.mapped
-        ? t('没有映射 event_type，设备归属会为空')
-        : login.rows
-          ? t('样例里有 {n} 行登录事件（event_type 为 {values}）', { n: login.rows, values })
-          : t('样例里没有登录事件（event_type 为 {values}）：设备归属只认这些取值，源表的登录写法不同时在映射里配置 login_events', { values })}
-    </Assertion>
-  );
+  let message: string;
+  if (!login.mapped) message = t('没有映射 event_type，设备归属会为空');
+  else if (login.rows) message = t('样例里有 {n} 行登录事件（event_type 为 {values}）', { n: login.rows, values });
+  else message = t('样例里没有登录事件（event_type 为 {values}）：设备归属只认这些取值，源表的登录写法不同时在映射里配置 login_events', { values });
+  return <Assertion name="login-events" ok={login.rows > 0}>{message}</Assertion>;
 }
 
+/** 空跑结果：基础断言、自定义断言与转换后的样例行（敏感字段是加盐哈希，空值显示为 —） */
 function DryRunPanel({ entity, result }: { entity: string; result: DryRunResult & { version: number } }) {
   const t = useT();
   const { assertions: a, columns, rows, sampled } = result;
