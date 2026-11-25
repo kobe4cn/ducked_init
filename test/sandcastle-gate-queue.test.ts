@@ -1,6 +1,6 @@
 // .sandcastle/gate-queue.ts：门槛同一时间只跑一个，票的门槛优先于 main 的兜底完整测试
 import { describe, expect, it } from 'vitest';
-import { createGateQueue } from '../.sandcastle/gate-queue.ts';
+import { createGateQueue } from '../.sandcastle/gate-queue';
 
 /** 一个手动结束的任务：开跑时记进 log，调 finish() 才结束。 */
 function job(log: string[], name: string) {
