@@ -178,15 +178,15 @@ const purposeLabel = (t: T, purpose: TieredPurpose) => {
   return labels[purpose];
 };
 
-/** 「管：A、B、C」一行：用途名逐个翻译后用 t('、') 连起来（英文是逗号加空格） */
+/** 档位卡片下「管：A、B、C」一行：该档当前实际管的用途（ADR-0055 的 PURPOSE_TIER + LLM_PURPOSE_TIER_OVERRIDES 生效后的对照，
+ *  loader 传 tierPurposes，页面只做说明），用途名逐个翻译后用 t('、') 连起来（英文是逗号加空格） */
 const tierPurposesHint = (t: T, purposes: TieredPurpose[]) =>
   t('管：{purposes}', { purposes: purposes.map(p => purposeLabel(t, p)).join(t('、')) });
 
-/** 每档的名字与它当前实际管哪些用途（ADR-0055 的 PURPOSE_TIER + LLM_PURPOSE_TIER_OVERRIDES 生效后的对照，loader 传 tierPurposes，
- *  页面只做说明）；连通测试那行只用 title，purposes 可以不传 */
-const tierLabel = (t: T, tier: 'fast' | 'reasoning', purposes?: TieredPurpose[]) => ({
-  fast: { title: t('快速档（fast）'), hint: purposes ? tierPurposesHint(t, purposes) : '' },
-  reasoning: { title: t('推理档（reasoning）'), hint: purposes ? tierPurposesHint(t, purposes) : '' },
+/** 每档的名字（连通测试那行与档位卡片共用）；档位卡片下的「管：…」说明见 tierPurposesHint */
+const tierLabel = (t: T, tier: 'fast' | 'reasoning') => ({
+  fast: { title: t('快速档（fast）') },
+  reasoning: { title: t('推理档（reasoning）') },
 })[tier];
 
 /** 连通测试耗时超过 LLM_TIMEOUT_SECONDS 一半时的提示（#1213）：amber 加图标，颜色不是唯一信号 */
@@ -249,7 +249,7 @@ function TierSection({ tier, state, purposes, chatReady, submitting }: {
   submitting: boolean;
 }) {
   const t = useT();
-  const label = tierLabel(t, tier, purposes);
+  const label = tierLabel(t, tier);
   const bound = Boolean(state.model);
   let bindingText: string;
   if (!bound) bindingText = t('使用默认');
@@ -263,7 +263,7 @@ function TierSection({ tier, state, purposes, chatReady, submitting }: {
           <p className="text-sm text-slate-500" {...{ [`data-tier-${tier}`]: bound ? 'tenant' : 'default' }}>
             {bindingText}
           </p>
-          <p className="text-sm text-slate-400" {...{ [`data-tier-purposes-${tier}`]: purposes.join(',') }}>{label.hint}</p>
+          <p className="text-sm text-slate-400" {...{ [`data-tier-purposes-${tier}`]: purposes.join(',') }}>{tierPurposesHint(t, purposes)}</p>
         </div>
         {bound && (
           <Form
