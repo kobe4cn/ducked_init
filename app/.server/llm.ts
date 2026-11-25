@@ -4,7 +4,8 @@
 // 截断（finish_reason: length）时报截断原因而不是「不是 JSON」；内容被 ```json 代码块包着时先去掉外壳；minItems / minimum 等报中文说明。
 // 解析加固（#1224）：开头的 <think>…</think> 先去掉，再取第一个完整 JSON 对象；服务商没给工具调用 id 时本地生成（call_<uuid>）。
 // 端点按「租户自己的配置（platform.model_providers，Key 用租户数据密钥加密）> 平台默认（环境变量 LLM_*）」整套选取，不混用。
-// 在选出的一套上按用途分档（ADR-0055）：PURPOSE_TIER 写死每个用途属 fast / reasoning 哪档，平台档位用 LLM_<TIER>_* 环境变量换模型，
+// 在选出的一套上按用途分档（ADR-0055）：PURPOSE_TIER 默认写死每个用途属 fast / reasoning 哪档（平台可用 LLM_PURPOSE_TIER_OVERRIDES
+// 把单个用途改到另一档，不用发版），平台档位用 LLM_<TIER>_* 环境变量换模型，
 // 租户整套自配时读租户自己的档位列（只填模型沿用租户默认端点与 Key，带端点用档位自己的 Key），平台档位不生效；
 // 档位没绑定模型就回落默认并记 fallbackReason='unbound'。
 // chatTools 带工具调用模型（AI 助手，ADR-0042），不要求 JSON。
@@ -28,12 +29,58 @@ import { msg, type Msg } from '~/lib/i18n';
 export type LlmPurpose = 'connectivity' | 'tool_probe' | 'assistant' | 'mapping_draft' | 'metric_draft' | 'tag_draft' | 'assertion_draft'
   | 'workbench_draft' | 'workbench_interpret' | 'knowledge_proposal' | 'knowledge_import' | 'metric_parse' | 'embedding';
 
-/** 每个用途属于哪一档（ADR-0055）：写死在这里，不进库。null 的用途不分档，永远用解析出的那一套 provider */
-export const PURPOSE_TIER: Record<LlmPurpose, 'fast' | 'reasoning' | null> = {
+/** 档位（ADR-0055）：只有 fast 与 reasoning 两档 */
+export type LlmTier = 'fast' | 'reasoning';
+
+/** 每个用途默认属于哪一档（ADR-0055）：默认写死在这里、不进库，平台可用 LLM_PURPOSE_TIER_OVERRIDES 覆盖（purposeTierOverrides）。
+ *  null 的用途不分档，永远用解析出的那一套 provider，也不可被覆盖 */
+export const PURPOSE_TIER: Record<LlmPurpose, LlmTier | null> = {
   assistant: 'reasoning', mapping_draft: 'reasoning', metric_draft: 'reasoning', tag_draft: 'reasoning', workbench_draft: 'reasoning',
   assertion_draft: 'fast', workbench_interpret: 'fast', knowledge_proposal: 'fast', knowledge_import: 'fast', metric_parse: 'fast',
   connectivity: null, tool_probe: null, embedding: null,
 };
+
+/**
+ * 平台级用途分档覆盖（ADR-0055 修订）：每次调用读 LLM_PURPOSE_TIER_OVERRIDES（JSON，如 {"metric_parse":"reasoning"}），
+ * 不做模块级缓存（改环境变量或 vi.stubEnv 立即生效）。没填或空串按没覆盖处理、不告警；JSON 不合法或不是普通对象（数组、标量）
+ * 整体 console.warn 后忽略；逐项检查——键必须是 PURPOSE_TIER 里分了档的用途（connectivity / tool_probe / embedding 不分档，
+ * 不可覆盖）、值必须是 fast / reasoning，未知用途、值为 null 或别的档位都算非法项：逐项 console.warn 后跳过，其余合法项照常生效。
+ * 告警都带原文，方便运维对着改；每次调用都重复告警（与 #1225 的 LLM_QUERY_EMBED_TIMEOUT_MS 一致）
+ */
+function purposeTierOverrides(env: Record<string, string | undefined> = process.env): Partial<Record<LlmPurpose, LlmTier>> {
+  const raw = env.LLM_PURPOSE_TIER_OVERRIDES;
+  if (!raw) return {};
+  const warn = (detail: string) => console.warn(`LLM_PURPOSE_TIER_OVERRIDES=${JSON.stringify(raw)} ${detail}`);
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { warn('不是合法 JSON，整个忽略'); return {}; }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) { warn('不是 JSON 对象，整个忽略'); return {}; }
+  const overrides: Partial<Record<LlmPurpose, LlmTier>> = {};
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    // Object.hasOwn 挡掉 __proto__ 之类的继承键；默认档位为 null（不分档）或键不存在（未知用途）都算非法项
+    const defaultTier = Object.hasOwn(PURPOSE_TIER, key) ? PURPOSE_TIER[key as LlmPurpose] : undefined;
+    if (!defaultTier) { warn(`里的用途「${key}」不存在或不分档，忽略该项`); continue; }
+    if (value !== 'fast' && value !== 'reasoning') { warn(`里用途「${key}」的档位 ${JSON.stringify(value)} 不是 fast / reasoning，忽略该项`); continue; }
+    overrides[key as LlmPurpose] = value;
+  }
+  return overrides;
+}
+
+/** 某个用途当前属于哪一档（ADR-0055 修订）：默认表 + LLM_PURPOSE_TIER_OVERRIDES。不分档的用途返回 null */
+export function purposeTier(purpose: LlmPurpose, env: Record<string, string | undefined> = process.env): LlmTier | null {
+  return purposeTierOverrides(env)[purpose] ?? PURPOSE_TIER[purpose];
+}
+
+/** 每一档当前实际管哪些用途（ADR-0055 修订，按 PURPOSE_TIER 的键序列出；不分档的用途不在里面），模型服务页的分档说明用。
+ *  覆盖表在这里只解析一次（逐项告警一次），不逐个用途重复解析 */
+export function tiersByPurpose(env: Record<string, string | undefined> = process.env): Record<LlmTier, LlmPurpose[]> {
+  const overrides = purposeTierOverrides(env);
+  const tiers: Record<LlmTier, LlmPurpose[]> = { fast: [], reasoning: [] };
+  for (const purpose of Object.keys(PURPOSE_TIER) as LlmPurpose[]) {
+    const tier = overrides[purpose] ?? PURPOSE_TIER[purpose];
+    if (tier) tiers[tier].push(purpose);
+  }
+  return tiers;
+}
 
 /** 对话里的一条消息（OpenAI 兼容格式）：assistant 要调用工具时带 tool_calls（content 可为空串），工具结果是 role 为 tool、带 tool_call_id 的一条 */
 export interface LlmMessage {
@@ -158,7 +205,7 @@ const tierEnv = (tier: 'fast' | 'reasoning', suffix: 'MODEL' | 'BASE_URL' | 'API
 export async function resolveRoute(tenantId: string, purpose: LlmPurpose): Promise<LlmRoute | null> {
   const { row, provider } = await providerRow(tenantId);
   if (!provider) return null;
-  const tier = PURPOSE_TIER[purpose];
+  const tier = purposeTier(purpose);
   if (!tier) return { provider, route: null, fallbackReason: null };
 
   if (provider.source === 'tenant') {

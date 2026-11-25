@@ -20,7 +20,7 @@ import { getDb } from './db/client';
 import { modelProviders } from './db/schema';
 import {
   CHAT_EXTRA_PROTECTED, chatJson, chatJsonWith, chatTools, chatToolsWith, embed, embeddingSource, LlmError, MODEL_PROVIDER_CONTEXT, parseChatExtraObject, providerSource,
-  resolveEmbeddingProvider, resolveProvider, resolveRoute, tenantChatExtra, timeoutMs, type LlmProvider, type LlmRoute,
+  resolveEmbeddingProvider, resolveProvider, resolveRoute, tenantChatExtra, tiersByPurpose, timeoutMs, type LlmProvider, type LlmRoute, type LlmTier,
 } from './llm';
 import { buildTableContext, type TableContext } from './pipeline/llm-context';
 import { formatServer } from './i18n';
@@ -471,8 +471,11 @@ async function pingJson(model: string, call: () => Promise<unknown>): Promise<Js
   return { ok: true, model, durationMs, slow: durationMs > timeoutMs() / 2 };
 }
 
-/** 档位（#1213）：按 PURPOSE_TIER 里属于该档的用途解析路由，没绑定时不发请求 */
-async function pingTier(tenantId: string, purpose: 'assertion_draft' | 'assistant'): Promise<TierConnectivity> {
+/** 档位（#1213）：按该档当前实际管的用途（ADR-0055 默认表 + LLM_PURPOSE_TIER_OVERRIDES，#1277）里的第一个解析路由，没绑定时不发请求；
+ *  该档一个用途都不剩时同样显示「使用默认」、不发请求 */
+async function pingTier(tenantId: string, tier: LlmTier): Promise<TierConnectivity> {
+  const purpose = tiersByPurpose()[tier][0];
+  if (!purpose) return { ok: 'default' };
   const route = await resolveRoute(tenantId, purpose);
   if (!route || route.fallbackReason === 'unbound') return { ok: 'default' };
   return pingJson(route.provider.model, () => chatJsonWith(tenantId, 'connectivity', route, PING_MESSAGES, JSON_OBJECT_PING));
@@ -491,7 +494,7 @@ export async function testModelProvider(actor: CurrentMember): Promise<Connectiv
   const model = provider?.model ?? '';
   // 默认那套由 chatJson 自己解析：没有任何模型服务时照旧报「未配置模型服务」，不发请求、不记日志
   const pinged = await pingJson(model, () => chatJson(tenantId, 'connectivity', PING_MESSAGES, JSON_OBJECT_PING));
-  const tiers = async () => ({ fast: await pingTier(tenantId, 'assertion_draft'), reasoning: await pingTier(tenantId, 'assistant') });
+  const tiers = async () => ({ fast: await pingTier(tenantId, 'fast'), reasoning: await pingTier(tenantId, 'reasoning') });
   if (!pinged.ok) return { default: pinged, ...(await tiers()) };
   const tools = await probeTools(tenantId);
   let probe = tools !== null ? { toolsSupported: tools, toolsProbedBaseUrl: provider?.baseUrl ?? '', toolsProbedModel: model } : null;
