@@ -116,7 +116,7 @@ describe('模型服务客户端', () => {
     expect(err).toBeInstanceOf(LlmError);
     expect(err.message).toMatch(/不符合.*table/);
     const [row] = await calls(acme);
-    expect(row).toMatchObject({ purpose: 'mapping_draft', model: 'qwen-plus', schemaValid: false, promptTokens: 120, completionTokens: 30 });
+    expect(row).toMatchObject({ purpose: 'mapping_draft', model: 'qwen-plus', schemaValid: false, promptTokens: 120, completionTokens: 30, errorKind: null });
     expect(row.error).toMatch(/table/);
   });
 
@@ -717,6 +717,8 @@ describe('按用途选档位（ADR-0055）', () => {
       expect(received.map(r => r.body.model)).toEqual(['qwen-max', 'qwen-max']);
       const rows = await calls(acme);
       expect(rows.at(-1)).toMatchObject({ model: 'qwen-max', route: 'reasoning', fallbackReason: null, error: expect.stringMatching(new RegExp(String(status))) });
+      const attempts = rows.filter(row => row.error?.includes(String(status)));
+      expect(attempts.map(row => row.errorKind)).toEqual([null, null]);
     }
   });
 
@@ -782,6 +784,9 @@ describe('transient 错误重试 1 次（#1215）', () => {
 
     expect(await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)).toEqual({ table: 'orders' });
     expect(received).toHaveLength(2);
+    const failed = (await calls(acme)).filter(row => row.error);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ errorKind: null });
   });
 
   it('超时不重试：只发 1 次请求、不等待，错误带 timeout', async () => {
