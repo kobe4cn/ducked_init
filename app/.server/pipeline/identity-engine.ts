@@ -10,12 +10,14 @@
 // merge 退役的 ID 在上一版 _identities 里的全部源记录追加进 silver._consumer_id_members（服务库按成员解析它的别名，ADR-0029）。
 // 分配表 silver._consumer_ids、变更表 silver._consumer_id_changes、成员表与 _identities 在同一个事务里写入。
 // 之后由 silver.event 的登录事件求设备归属，整表写进 silver._device_owner(device_id, consumer_id, login_at)：
+// 登录取值按事件行所在的映射认（映射在 login_events 里配的取值，没配认 login，#1271）。
 // 每台登录过的设备归属到它全局最近一次登录的统一消费者（登录事件的 customer_id 在它的 _customer_source 内解析：
 // 没声明跨源引用时就是行自己的 _source，ADR-0030；同意同样按 _customer_source 关联），
 // 同一时刻并列时取较小的 consumer_id；匿名事件（customer_id 为空）经 device_id 对应到统一消费者。
 // 最后整表写出 silver._consumer：每个统一消费者一行，customer 的每个非敏感属性取一个存活值并记下来源 <列>__source（ADR-0027），
 // 与 silver._consumer_consent：每个统一消费者每个渠道一行，取各源里 updated_at 最新的同意状态，同一时刻撤回优先，记下来源 _source
 import type { DuckDBConnection } from '@duckdb/node-api';
+import { cmp } from '../../lib/compare';
 import { entityOf } from '../../lib/canonical-model';
 import { tableExists } from './duck-sql';
 import { SILVER_SYSTEM_COLUMNS } from './merge-engine';
@@ -42,7 +44,7 @@ export function identityRules<P extends { entity: string; identity?: { match: st
 export const consumerSensitive = <P extends { entity: string; columns: { name: string; sensitive?: boolean }[] }>(plans: P[]): string[] =>
   [...new Set(plans.filter(p => p.entity === 'customer').flatMap(p => p.columns.filter(c => c.sensitive).map(c => c.name)))].sort();
 
-/** 登录事件的事件类型，先写死，还不能配置 */
+/** 没在 event 映射里配置 login_events 时认的登录取值 */
 export const LOGIN_EVENT = 'login';
 
 /**
@@ -97,6 +99,8 @@ export interface IdentityOptions {
   hotThreshold?: number;
   /** 不参与匹配的值（规范化后的加盐哈希，不分字段）：记录上等于它们的匹配值当作没有值，与映射里写 nullif 相同，也不进 hot */
   exclude?: readonly string[];
+  /** 登录取值（映射 ID → 登录事件取值列表，#1271）：设备归属按事件行所在映射认登录，没配的映射认 login */
+  loginEvents?: Record<string, string[]>;
 }
 
 /**
@@ -190,10 +194,16 @@ export async function resolveIdentities(
       await con.run(`CREATE TABLE IF NOT EXISTS ${DEVICE_OWNER} (device_id VARCHAR, consumer_id VARCHAR, login_at TIMESTAMPTZ)`);
       await con.run(`DELETE FROM ${DEVICE_OWNER}`);
       if (hasEvent) {
+        // 事件行是不是登录：按它所在的映射认（该映射配了 login_events 用它，没配认 login）；配置为空时保持原来的等式（SQL 逐字节不变），
+        // 不为空时映射 ID 排好序再拼，同样的输入拼出同样的 SQL
+        const logins = Object.entries(opts.loginEvents ?? {}).sort(([a], [b]) => cmp(a, b));
+        const isLogin = logins.length
+          ? `(CASE ${logins.map(([m, vs]) => `WHEN e._mapping = ${lit(m)} THEN e.event_type IN (${vs.map(lit).join(', ')})`).join(' ')} ELSE e.event_type = ${lit(LOGIN_EVENT)} END)`
+          : `e.event_type = ${lit(LOGIN_EVENT)}`;
         await con.run(`INSERT INTO ${DEVICE_OWNER}
           SELECT e.device_id, i.consumer_id, e.occurred_at AS login_at
           FROM ${EVENT} e JOIN ${IDENTITIES} i ON i._source = e._customer_source AND i.customer_id = e.customer_id
-          WHERE e.event_type = ${lit(LOGIN_EVENT)} AND e.device_id IS NOT NULL AND e.occurred_at IS NOT NULL
+          WHERE ${isLogin} AND e.device_id IS NOT NULL AND e.occurred_at IS NOT NULL
           QUALIFY row_number() OVER (PARTITION BY e.device_id ORDER BY e.occurred_at DESC, i.consumer_id) = 1
           ORDER BY e.device_id`);
       }
