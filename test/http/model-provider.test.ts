@@ -515,7 +515,7 @@ describe('模型服务页', () => {
   });
 
   it('LLM_PURPOSE_TIER_OVERRIDES 生效后：分档说明显示覆盖后的对照（data-tier-purposes-*），测连通性按该档当前管的用途发请求（#1277）', async () => {
-    const acme = await newTenant('acme');
+    await newTenant('acme');
     const admin = await loginAs(app, 'admin@acme.com');
     await save(admin);
     vi.stubEnv('LLM_PURPOSE_TIER_OVERRIDES', '{"assertion_draft":"reasoning"}');
