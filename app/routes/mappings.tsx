@@ -121,7 +121,7 @@ export async function action({ request }: Route.ActionArgs) {
       }
       case 'model-draft': {
         // 复用 > 模型 > 规则，填进编辑框、不保存；生成记录的 ID 留给之后的比对
-        const draft = await modelDraftFor(member, field('sourceId'), field('table'), field('entity'));
+        const draft = await modelDraftFor(member, field('sourceId'), field('table'), field('entity'), null, request.signal);
         return {
           error: null, issues: [], values: { sourceId: field('sourceId'), yaml: draft.yaml }, draftId: crypto.randomUUID(),
           generationId: draft.generationId, generated: { origin: draft.origin, items: draft.items, reusedFrom: draft.reusedFrom ?? null, notice: draft.notice ?? null },

@@ -15,7 +15,7 @@ import { publishedCustomEntities, type RegisteredEntity, relationsFrom, relation
 import { getDb, isUniqueViolation } from './db/client';
 import { mappingGenerations, mappingIgnoredColumns, mappings, mappingVersions, sources, sourceTables, sourceViews, sourceViewVersions } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
-import { chatJson, LlmError, resolveProvider } from './llm';
+import { chatJson, LlmError, resolveProvider, throwIfAborted } from './llm';
 import { tableContextFor } from './model-provider';
 import { publishedDependents } from './dsl-dependencies';
 import { dryRun } from './pipeline/dry-run-engine';
@@ -241,10 +241,11 @@ export interface ModelDraftResult {
  * 否则把表上下文、规则草稿与本租户的语义目录（ADR-0041）发给模型（purpose = mapping_draft），输出转成 YAML 后须过映射校验。成功时写一行生成记录，不保存映射。
  * 转出的 YAML 有问题时，只要每个问题都能定位到个别字段项、dedupe 或 identity，就去掉这些项（退回规则草稿里的同名项，没有就删掉）再校验一次：
  * 第二次通过才采用，并记审计 mapping.model_draft_partial（只记去掉了哪些位置与问题数）。模型失败、有定位不到这三类项的问题，或第二次仍不过时
- * 记审计 mapping.model_draft_failed（不含提示词、模型原文与取值），抛 422。为已有映射重新生成时传 mappingId，生成记录直接关联它
+ * 记审计 mapping.model_draft_failed（不含提示词、模型原文与取值），抛 422。为已有映射重新生成时传 mappingId，生成记录直接关联它。
+ * 客户端中止（signal）时 422：不写生成记录，也不写 failed / partial 审计（回复到手后中止的也一样，#1252）
  */
 export async function modelDraftFor(
-  actor: CurrentMember, sourceId: string, table: string, entity: string, mappingId: string | null = null,
+  actor: CurrentMember, sourceId: string, table: string, entity: string, mappingId: string | null = null, signal?: AbortSignal,
 ): Promise<ModelDraftResult> {
   const tenantId = actor.tenant.id;
   const base = await draftWithOrigin(actor, sourceId, table, entity);
@@ -266,17 +267,26 @@ export async function modelDraftFor(
     tenantId, actor, action: 'mapping.model_draft_failed', targetType: 'source', targetId: sourceId,
     detail: { sourceId, source: source.name, table, entity, ...detail },
   });
+  /** 模型失败与客户端中止（#1252）共用的 422 报错（写不写审计由调用处决定：中止不是模型失败，不写） */
+  const draftFailed = (e: LlmError) => new MappingError(`模型生成草稿失败：${e.message}`, 422);
+  /** 客户端中止（#1252）：校验阶段的窗口也拦下，走同一条 422，不写 failed / partial 审计、不写生成记录 */
+  const stopIfAborted = (): void => {
+    try { throwIfAborted(signal); } catch (e) { if (e instanceof LlmError) throw draftFailed(e); throw e; }
+  };
   const messages = modelDraftMessages(context, entity, base.yaml, await tenantCatalog(tenantId));
   let out: ModelDraft;
   try {
-    out = await chatJson<ModelDraft>(tenantId, 'mapping_draft', messages, MODEL_DRAFT_SCHEMA);
+    out = await chatJson<ModelDraft>(tenantId, 'mapping_draft', messages, MODEL_DRAFT_SCHEMA, { signal });
+    // 客户端中止（#1252）：假 fetch 不理 signal，回复到手也要拦下；抛出的 LlmError 由 catch 按 aborted 跳过失败审计
+    throwIfAborted(signal);
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
-    await failed({ stage: 'model', error: e.message.slice(0, 200) });
-    throw new MappingError(`模型生成草稿失败：${e.message}`, 422);
+    if (!e.aborted) await failed({ stage: 'model', error: e.message.slice(0, 200) });
+    throw draftFailed(e);
   }
   /** 整份不采用：审计只记问题数与前 10 个位置，错误带问题列表（行号指模型生成的那份） */
   const reject = async (issues: MappingIssue[]): Promise<never> => {
+    stopIfAborted();
     await failed({ stage: 'mapping', issues: issues.length, paths: issues.slice(0, 10).map(i => i.path) });
     throw new MappingError(`模型生成的映射有 ${issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, issues);
   };
@@ -290,6 +300,7 @@ export async function modelDraftFor(
     }
   });
   if (r.status === 'rejected') return reject(r.issues);
+  stopIfAborted();
   if (r.status === 'partial') {
     await recordAudit(getDb(), {
       tenantId, actor, action: 'mapping.model_draft_partial', targetType: 'source', targetId: sourceId,
@@ -323,12 +334,12 @@ export async function draftForMapping(actor: CurrentMember, mappingId: string) {
   return draftFor(actor, mapping.sourceId, mapping.tableName, mapping.entity);
 }
 
-/** 为已有映射（它的源表与实体）用模型重新生成草稿，同 modelDraftFor；生成记录关联这个映射 */
-export async function modelDraftForMapping(actor: CurrentMember, mappingId: string) {
+/** 为已有映射（它的源表与实体）用模型重新生成草稿，同 modelDraftFor（含客户端中止，#1252）；生成记录关联这个映射 */
+export async function modelDraftForMapping(actor: CurrentMember, mappingId: string, signal?: AbortSignal) {
   assertCan(actor, 'sources:write');
   const mapping = await requireMapping(actor.tenant.id, mappingId);
   if (mapping.sourceViewId) throw new MappingError('用模型生成草稿要用源表的列统计，读源视图的映射请直接编辑');
-  return modelDraftFor(actor, mapping.sourceId, mapping.tableName, mapping.entity, mappingId);
+  return modelDraftFor(actor, mapping.sourceId, mapping.tableName, mapping.entity, mappingId, signal);
 }
 
 /**
@@ -337,9 +348,10 @@ export async function modelDraftForMapping(actor: CurrentMember, mappingId: stri
  * 没配置模型服务时不发请求，按规则出基础断言（主键非空 / 唯一、数值列范围，见 ruleAssertions），按「字段 + 检查」去重后合并进已有的 assertions 块，
  * 生成记录 origin = rules 并提示「已按规则生成」。个别断言不过校验时去掉这些、再校验一次后采用其余，记审计 mapping.model_draft_partial（kind = assertions，
  * 只记去掉的断言名与问题数）；模型失败、全部被丢、有定位不到个别断言的问题或第二次仍不过时记审计 mapping.model_draft_failed
- * （kind = assertions，不含模型原文、理由与取值），抛 422
+ * （kind = assertions，不含模型原文、理由与取值），抛 422。
+ * 客户端中止（signal）时 422：不写生成记录，也不写 failed / partial 审计（回复到手后中止的也一样，#1252）
  */
-export async function modelAssertionsForMapping(actor: CurrentMember, mappingId: string): Promise<ModelDraftResult> {
+export async function modelAssertionsForMapping(actor: CurrentMember, mappingId: string, signal?: AbortSignal): Promise<ModelDraftResult> {
   assertCan(actor, 'sources:write');
   const tenantId = actor.tenant.id;
   const mapping = await requireMapping(tenantId, mappingId);
@@ -371,13 +383,21 @@ export async function modelAssertionsForMapping(actor: CurrentMember, mappingId:
     tenantId, actor, action: 'mapping.model_draft_failed', targetType: 'source', targetId: sourceId,
     detail: { mappingId, sourceId, source: source.name, table, entity, kind: 'assertions', ...detail },
   });
+  /** 模型失败与客户端中止（#1252）共用的 422 报错（写不写审计由调用处决定：中止不是模型失败，不写） */
+  const assertionsFailed = (e: LlmError) => new MappingError(`模型建议断言失败：${e.message}`, 422);
+  /** 客户端中止（#1252）：校验阶段的窗口也拦下，走同一条 422，不写 failed / partial 审计、不写生成记录 */
+  const stopIfAborted = (): void => {
+    try { throwIfAborted(signal); } catch (e) { if (e instanceof LlmError) throw assertionsFailed(e); throw e; }
+  };
   let out: AssertionDraft;
   try {
-    out = await chatJson<AssertionDraft>(tenantId, 'assertion_draft', assertionDraftMessages(context, base), ASSERTION_DRAFT_SCHEMA);
+    out = await chatJson<AssertionDraft>(tenantId, 'assertion_draft', assertionDraftMessages(context, base), ASSERTION_DRAFT_SCHEMA, { signal });
+    // 客户端中止（#1252）：假 fetch 不理 signal，回复到手也要拦下；抛出的 LlmError 由 catch 按 aborted 跳过失败审计
+    throwIfAborted(signal);
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
-    await failed({ stage: 'model', error: e.message.slice(0, 200) });
-    throw new MappingError(`模型建议断言失败：${e.message}`, 422);
+    if (!e.aborted) await failed({ stage: 'model', error: e.message.slice(0, 200) });
+    throw assertionsFailed(e);
   }
   const { yaml, items } = assertionsToYaml(base, out);
   try {
@@ -385,6 +405,7 @@ export async function modelAssertionsForMapping(actor: CurrentMember, mappingId:
   } catch (e) {
     if (!(e instanceof MappingError)) throw e;
     const reject = async (issues: MappingIssue[]): Promise<never> => {
+      stopIfAborted();
       await failed({ stage: 'mapping', issues: issues.length, paths: issues.slice(0, 10).map(i => i.path) });
       throw new MappingError(`模型建议的断言有 ${issues.length} 处问题，未采用，编辑框保持原内容（行号指替换后的那份）`, 422, issues);
     };
@@ -397,12 +418,14 @@ export async function modelAssertionsForMapping(actor: CurrentMember, mappingId:
       if (!(e2 instanceof MappingError)) throw e2;
       return reject(e2.issues);
     }
+    stopIfAborted();
     await recordAudit(getDb(), {
       tenantId, actor, action: 'mapping.model_draft_partial', targetType: 'source', targetId: sourceId,
       detail: { mappingId, sourceId, source: source.name, table, entity, kind: 'assertions', dropped: partial.dropped, issues: e.issues.length },
     });
     return record('assertions', partial.yaml, partial.items);
   }
+  stopIfAborted();
   return record('assertions', yaml, items);
 }
 

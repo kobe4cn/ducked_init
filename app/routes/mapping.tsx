@@ -172,10 +172,10 @@ export async function action({ request, params }: Route.ActionArgs) {
         return { error: null, issues: [], yaml: await draftForMapping(await requirePermission(request, 'sources:write'), params.mappingId), draftId: crypto.randomUUID(), dryRun: null };
       case 'model-draft':
         // 复用 > 模型 > 规则，同样只填进编辑框、不保存；编辑框上方列出每项的置信度与理由
-        return generatedDraft(await modelDraftForMapping(await requirePermission(request, 'sources:write'), params.mappingId));
+        return generatedDraft(await modelDraftForMapping(await requirePermission(request, 'sources:write'), params.mappingId, request.signal));
       case 'model-assertions':
         // 只让模型换掉 assertions 块，同样只填进编辑框、不保存
-        return generatedDraft(await modelAssertionsForMapping(await requirePermission(request, 'sources:write'), params.mappingId));
+        return generatedDraft(await modelAssertionsForMapping(await requirePermission(request, 'sources:write'), params.mappingId, request.signal));
       case 'add-columns': {
         // 源表新增的列加为扩展字段，同样只填进编辑框，不保存
         const yaml = await yamlWithColumns(await requirePermission(request, 'sources:write'), params.mappingId, form.getAll('column').map(String));
