@@ -15,7 +15,7 @@ import { publishedCustomEntities, type RegisteredEntity, relationsFrom, relation
 import { getDb, isUniqueViolation } from './db/client';
 import { mappingGenerations, mappingIgnoredColumns, mappings, mappingVersions, sources, sourceTables, sourceViews, sourceViewVersions } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
-import { chatJson, LlmError, resolveProvider, throwIfAborted } from './llm';
+import { chatJson, LlmError, resolveProvider, throwIfAborted, withLlmContext } from './llm';
 import { tableContextFor } from './model-provider';
 import { publishedDependents } from './dsl-dependencies';
 import { dryRun } from './pipeline/dry-run-engine';
@@ -247,6 +247,8 @@ export interface ModelDraftResult {
 export async function modelDraftFor(
   actor: CurrentMember, sourceId: string, table: string, entity: string, mappingId: string | null = null, signal?: AbortSignal,
 ): Promise<ModelDraftResult> {
+  // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用在 llm_calls 里记发起人、共用一个 turn_id（不调模型的分支不受影响）
+  return withLlmContext({ actorEmail: actor.email }, async () => {
   const tenantId = actor.tenant.id;
   const base = await draftWithOrigin(actor, sourceId, table, entity);
   const record = async (origin: ModelDraftResult['origin'], yaml: string, items: DraftItem[] = []) => {
@@ -308,6 +310,7 @@ export async function modelDraftFor(
     });
   }
   return record('model', r.yaml, r.items);
+  });
 }
 
 /**
@@ -352,6 +355,8 @@ export async function modelDraftForMapping(actor: CurrentMember, mappingId: stri
  * 客户端中止（signal）时 422：不写生成记录，也不写 failed / partial 审计（回复到手后中止的也一样，#1252）
  */
 export async function modelAssertionsForMapping(actor: CurrentMember, mappingId: string, signal?: AbortSignal): Promise<ModelDraftResult> {
+  // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用在 llm_calls 里记发起人、共用一个 turn_id（不调模型的分支不受影响）
+  return withLlmContext({ actorEmail: actor.email }, async () => {
   assertCan(actor, 'sources:write');
   const tenantId = actor.tenant.id;
   const mapping = await requireMapping(tenantId, mappingId);
@@ -427,6 +432,7 @@ export async function modelAssertionsForMapping(actor: CurrentMember, mappingId:
   }
   stopIfAborted();
   return record('assertions', yaml, items);
+  });
 }
 
 /** 映射当前在改的 YAML：草稿，没有草稿时是最新已发布版本 */

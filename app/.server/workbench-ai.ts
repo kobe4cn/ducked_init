@@ -16,7 +16,7 @@ import type { CurrentMember } from './auth';
 import { isSystemColumn } from './catalog';
 import { getDb } from './db/client';
 import { tasks } from './db/schema';
-import { chatJson, LlmError, resolveProvider, throwIfAborted, type LlmMessage } from './llm';
+import { chatJson, LlmError, resolveProvider, throwIfAborted, withLlmContext, type LlmMessage } from './llm';
 import { uncitedNumbers } from './interpretation-numbers';
 import { dataOnlyNotice } from './llm-prompts';
 import { normalizeWorkbenchSql, type WorkbenchResult } from './pipeline/workbench-engine';
@@ -156,6 +156,8 @@ export function draftMessages(request: string, catalog: string): LlmMessage[] {
  * 模型给了口径假设时带 notes（去掉空白条，最多 MAX_NOTES 条、每条截到 MAX_NOTE 字，没有就不带这个键），notes 不进审计
  */
 export async function draftWorkbenchSql(actor: CurrentMember, request: string, signal?: AbortSignal): Promise<{ sql: string; catalogTruncated: boolean; notes?: string[] }> {
+  // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用在 llm_calls 里记发起人、共用一个 turn_id（不发请求的分支不受影响）
+  return withLlmContext({ actorEmail: actor.email }, async () => {
   assertCan(actor, 'sandbox');
   if (!request.trim()) throw new WorkbenchAiError('请先写下要查什么', 400);
   if (request.length > MAX_REQUEST) throw new WorkbenchAiError(`需求最多 ${MAX_REQUEST} 字`, 400);
@@ -189,6 +191,7 @@ export async function draftWorkbenchSql(actor: CurrentMember, request: string, s
     if (e instanceof WorkbenchError) throw new WorkbenchAiError(e.message, e.status);
     throw e;
   }
+  });
 }
 
 /** 解读时发给模型服务的行数 */
@@ -407,6 +410,8 @@ export function interpretRequest(
 export async function interpretResult(
   actor: CurrentMember, sql: string, confirmed: boolean, conversationId: string | null, signal?: AbortSignal,
 ): Promise<{ text: string; unverified: string[]; rows: number; columns: string[]; dropped: string[]; samples: boolean; result: QueryOutcome; conversationId: string }> {
+  // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用在 llm_calls 里记发起人、共用一个 turn_id（不发请求的分支不受影响）
+  return withLlmContext({ actorEmail: actor.email }, async () => {
   assertCan(actor, 'sandbox');
   if (!confirmed) throw new WorkbenchAiError('请先确认要发送给模型服务的列', 400);
   const tenantId = actor.tenant.id;
@@ -436,4 +441,5 @@ export async function interpretResult(
     detail: { sql: normalized, rows, columns: sent, dropped, samples, unverified: unverified.length },
   });
   return { text, unverified, rows, columns: sent, dropped, samples, result, conversationId: savedConversationId };
+  });
 }

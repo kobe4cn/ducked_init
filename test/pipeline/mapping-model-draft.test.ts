@@ -380,6 +380,20 @@ describe('用模型生成映射草稿', () => {
     expect(await failures(acme)).toHaveLength(0);
     expect(await partials(acme)).toHaveLength(0);
   });
+
+  it('llm_calls 记发起人与轮次（#1257）：连做两次，两行的 actor_email 都是操作人、turn_id 各不相同', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json(MODEL_ORDERS, USAGE));
+
+    await modelDraftFor(author, sourceId, 'orders', 'order');
+    await modelDraftFor(author, sourceId, 'orders', 'order');
+
+    const logged = await calls(acme);
+    expect(logged).toHaveLength(2);
+    expect(logged.map(row => row.actorEmail)).toEqual([author.email, author.email]);
+    expect(logged[0]!.turnId).not.toBe(logged[1]!.turnId);
+  });
 });
 
 describe('记录成员对生成草稿的修改', () => {
@@ -615,6 +629,21 @@ describe('用模型建议断言', () => {
     const names = assertions.map(a => `${a.field}:${a.check}`);
     expect(new Set(names).size).toBe(names.length);
     expect(names).toContain('order_id:unique');
+  });
+
+  it('llm_calls 记发起人与轮次（#1257）：连建议两次，两行的 actor_email 都是操作人、turn_id 各不相同', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    const mapping = await createMapping(author, sourceId, ORDERS);
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json(MODEL_ASSERTIONS, USAGE));
+
+    await modelAssertionsForMapping(author, mapping.id);
+    await modelAssertionsForMapping(author, mapping.id);
+
+    const logged = await calls(acme);
+    expect(logged).toHaveLength(2);
+    expect(logged.map(row => row.actorEmail)).toEqual([author.email, author.email]);
+    expect(logged[0]!.turnId).not.toBe(logged[1]!.turnId);
   });
 });
 

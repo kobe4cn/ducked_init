@@ -14,7 +14,7 @@ import type { CurrentMember } from '../auth';
 import { tenantCatalog } from '../catalog/load';
 import { getDb } from '../db/client';
 import { knowledgeGenerations, knowledgeProposals } from '../db/schema';
-import { chatJson, LlmError, resolveProvider } from '../llm';
+import { chatJson, LlmError, resolveProvider, withLlmContext } from '../llm';
 import { currentBases, KnowledgeError } from './basis';
 import { dropKnown } from './known';
 import { proposeMany } from './proposals';
@@ -41,6 +41,8 @@ export type SuggestResult =
  * 重复的跳过计进 existing（#953），剩下的经 proposeMany 写进提案（按生成前的依据快照跳过已变的目标），并记一代
  */
 export async function suggestForSubject(actor: CurrentMember, subjectId: string): Promise<SuggestResult> {
+  // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用在 llm_calls 里记发起人、共用一个 turn_id（同样输入已生成过时不调模型，返回 fresh: false 不受影响）
+  return withLlmContext({ actorEmail: actor.email }, async () => {
   assertCan(actor, 'definitions:draft');
   const tenantId = actor.tenant.id;
   const subject = (await listSubjects(getDb(), tenantId)).find(s => s.id === subjectId);
@@ -127,4 +129,5 @@ export async function suggestForSubject(actor: CurrentMember, subjectId: string)
     fresh: true, created: result.created.length, existing: result.existing,
     rejected: result.rejected, invalid: result.invalid, stale: result.stale, skipped,
   };
+  });
 }

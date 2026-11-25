@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { randomUUID } from 'node:crypto';
-import { assistantConversations, auditLogs, modelProviders, tasks } from '../../app/.server/db/schema';
+import { assistantConversations, auditLogs, llmCalls, modelProviders, tasks } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
 import { draftWorkbenchSql, interpretResult, isDetail, previewInterpretation } from '../../app/.server/workbench-ai';
 import { resetDb } from '../http/harness';
@@ -25,6 +25,8 @@ beforeAll(async () => {
 
 const analyst = () => memberOf(acme, 'analyst@acme.com', 'analyst');
 const audits = (action: string) => getDb().select().from(auditLogs).where(and(eq(auditLogs.tenantId, acme), eq(auditLogs.action, action)));
+/** 该用途的 llm_calls 行（库在用例间共用，断言时按调用前的条数切出自己这次新增的） */
+const callsOf = (purpose: string) => getDb().select().from(llmCalls).where(and(eq(llmCalls.tenantId, acme), eq(llmCalls.purpose, purpose)));
 /** 记下这条 SQL 的起草审计（各用例的 SQL 不同，按 SQL 区分；库在用例间共用） */
 const drafted = async (sql: string) => (await audits('workbench.ai_drafted')).map(a => a.detail).filter(d => (d as { sql: string }).sql === sql);
 const errorOf = (p: Promise<unknown>) => p.then(() => '成功', (e: Error & { status?: number }) => `${e.status ?? ''} ${e.message}`);
@@ -237,6 +239,20 @@ describe('AI 起草 SQL', () => {
     modelWrites('SELECT 1');
     const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
     await expect(draftWorkbenchSql(viewer, '每个城市的客户数')).rejects.toMatchObject({ init: { status: 403 } });
+  });
+
+  it('llm_calls 记发起人与轮次（#1257）：连做两次，两行的 actor_email 都是操作人、turn_id 各不相同', async () => {
+    const before = (await callsOf('workbench_draft')).length;
+    modelWrites('SELECT count(*) FROM silver.customer');
+    const me = await analyst();
+
+    await draftWorkbenchSql(me, '客户总数');
+    await draftWorkbenchSql(me, '客户总数');
+
+    const logged = (await callsOf('workbench_draft')).slice(before);
+    expect(logged).toHaveLength(2);
+    expect(logged.map(row => row.actorEmail)).toEqual([me.email, me.email]);
+    expect(logged[0]!.turnId).not.toBe(logged[1]!.turnId);
   });
 });
 
@@ -458,5 +474,20 @@ describe('AI 解读结果', () => {
     const { received } = modelSays('x');
     expect(await errorOf(interpretResult(await analyst(), 'SELECT city FROM silver.customer', false, null))).toMatch(/^400 /);
     expect(received).toEqual([]);
+  });
+
+  it('llm_calls 记发起人与轮次（#1257）：连解读两次，两行的 actor_email 都是操作人、turn_id 各不相同', async () => {
+    const before = (await callsOf('workbench_interpret')).length;
+    modelSays('客户分布在几个城市');
+    const me = await analyst();
+    const sql = 'SELECT city FROM silver.customer';
+
+    await interpretResult(me, sql, true, null);
+    await interpretResult(me, sql, true, null);
+
+    const logged = (await callsOf('workbench_interpret')).slice(before);
+    expect(logged).toHaveLength(2);
+    expect(logged.map(row => row.actorEmail)).toEqual([me.email, me.email]);
+    expect(logged[0]!.turnId).not.toBe(logged[1]!.turnId);
   });
 });

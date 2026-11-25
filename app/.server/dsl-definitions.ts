@@ -23,7 +23,7 @@ import { getDb, isUniqueViolation } from './db/client';
 import { publishedTagsOf, publishedTagsReferencing } from './dsl-dependencies';
 import { dslDefinitions, dslVersions, snapshots, tasks, type SnapshotTrigger, type TaskStatus } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
-import { assertSchema, chatJson, LlmError, resolveProvider } from './llm';
+import { assertSchema, chatJson, LlmError, resolveProvider, withLlmContext } from './llm';
 import { publishedPlans } from './mappings';
 import { failedErrors, type AssertionResult } from './pipeline/assertions';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
@@ -196,6 +196,8 @@ export type DraftExplanation = { items: { path: string; reason: string }[]; unkn
  * 模型判断做不到（标签草稿输出 unsupported，#1165）时 422 只带模型给的原因、不带问题列表，审计阶段 unsupported 只记原因条数
  */
 export async function modelDraftForDefinition(actor: CurrentMember, kind: string, request: string): Promise<{ yaml: string; ambiguity: DraftAmbiguity | null; explanation: DraftExplanation | null }> {
+  // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用（含 hybrid_search 时检索的 embedding）在 llm_calls 里记发起人、共用一个 turn_id
+  return withLlmContext({ actorEmail: actor.email }, async () => {
   assertCan(actor, 'definitions:draft');
   requireKind(kind);
   if (!request.trim()) throw new DslError('请先写下需求');
@@ -239,6 +241,7 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
     throw new DslError(`模型生成的${DSL_KINDS[kind].label}定义有 ${checked.issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, checked.issues);
   }
   return { yaml, ambiguity, explanation };
+  });
 }
 
 /** dslDefinitionAdapter 的上下文：租户、种类与键；parentId 是定义行 ID */
