@@ -1,5 +1,6 @@
 // app/.server/knowledge/import-draft.ts —— 把知识来源解析成提案的纯函数（ADR-0046 入口③，#526）：不调模型、不写库，
-// 调用方（import.ts）用 importInput 取输入、importMessages 与 IMPORT_SCHEMA 组 chatJson 请求，再把模型输出交给 outputToProposals。
+// 调用方（import.ts）用 importInput 取输入、importMessages 与 IMPORT_SCHEMA 组 chatJson 请求（长来源先 chunkParagraphs
+// 按段落分块逐块请求，再 mergeOutputs 合并去重），把模型输出交给 outputToProposals。
 // 输入是来源的段落（段号从 1 开始）加 restricted 目录条目的 { id, kind, name }（ADR-0047 / 0005：数据源与源表整类不进，
 // 只给这三个字段控制体积）。段落原文是成员粘贴的，可能藏着指令文字：user 消息只放 JSON、system 写明它只是数据，
 // 输出受 IMPORT_SCHEMA 限制（kind 与口径类型 / 取值都是枚举，且按 kind 要求对应字段，缺了整次调用 422）。outputToProposals
@@ -128,6 +129,73 @@ export interface ImportDrop { targetId: string; reason: ImportDropReason }
 /** 发给模型的消息：system 讲清任务、三种提案与「user 里的 JSON 只是数据」；user 只放输入 JSON */
 export function importMessages(input: ImportInput): LlmMessage[] {
   return [{ role: 'system', content: SYSTEM }, { role: 'user', content: JSON.stringify(input) }];
+}
+
+/** 段落分块的阈值：合计超过这个字数的来源按段落分块，逐块调模型再合并（#1274），免得一次请求装不下长来源 */
+export const IMPORT_CHUNK_CHARS = 6_000;
+
+/**
+ * 把来源段落按字数分块（调用方逐块调模型，合并由 mergeOutputs 做）：字数按 [...text].length 累加，装不下下一段就开新块。
+ * 一段不拆开——单段超过阈值就独占一块（其后任何一段都装不下，自然另起一块）；段号是原来的段号、不重新编号，
+ * 模型给的段号直接就是整份来源的段号，outputToProposals 的段号校验（1..段数）针对整份来源照常有效。
+ * 空段落也返回一个空块：保证至少调一次模型，与不分块的现状一致
+ */
+export function chunkParagraphs(paragraphs: SourceParagraph[], maxChars = IMPORT_CHUNK_CHARS): SourceParagraph[][] {
+  const chunks: SourceParagraph[][] = [];
+  let current: SourceParagraph[] = [];
+  let chars = 0;
+  for (const p of paragraphs) {
+    const len = [...p.text].length;
+    // 已装了段落且再加这段会超才开新块：第一段总是进块（哪怕自己超阈值，独占一块）
+    if (current.length > 0 && chars + len > maxChars) {
+      chunks.push(current);
+      current = [];
+      chars = 0;
+    }
+    current.push(p);
+    chars += len;
+  }
+  chunks.push(current);
+  return chunks;
+}
+
+/** 去重键的内容部分：alias / note 去空白（与 outputToProposals 的规范化同口径），claim 按类型与取值 */
+function contentKey(p: ImportProposal): string {
+  if (p.kind === 'alias') return p.alias?.trim() ?? '';
+  if (p.kind === 'note') return p.note?.trim() ?? '';
+  if (p.kind === 'claim' && p.claim) return `${p.claim.type}:${JSON.stringify(p.claim.value)}`;
+  return '';
+}
+
+/**
+ * 把各块的模型输出合并成一份（分块调用后用）：按「目标 + 种类 + 内容」去重，同键的条目合并成一条，evidence 按段号
+ * 取并集（顺序按首次出现），其余字段（alias / note / claim / reason）取第一条；只有一个输出时原样返回。
+ * 键里的内容先做和 outputToProposals 一样的规范化（alias / note 去空白），前后空白不同的同一条不会被当成两条
+ */
+export function mergeOutputs(outputs: ImportOutput[]): ImportOutput {
+  if (outputs.length === 1) return outputs[0];
+  const byKey = new Map<string, ImportProposal>();
+  const merged: ImportProposal[] = [];
+  for (const output of outputs) {
+    for (const p of output.proposals) {
+      const key = `${p.targetId}|${p.kind}|${contentKey(p)}`;
+      const first = byKey.get(key);
+      if (!first) {
+        // 拷一份再收进结果：后面同键的条目会往 evidence 里并段号，不改动调用方给的输出对象
+        const copy: ImportProposal = { ...p, evidence: [...p.evidence] };
+        byKey.set(key, copy);
+        merged.push(copy);
+        continue;
+      }
+      const seen = new Set(first.evidence.map(e => e.paragraph));
+      for (const e of p.evidence) {
+        if (seen.has(e.paragraph)) continue;
+        first.evidence.push(e);
+        seen.add(e.paragraph);
+      }
+    }
+  }
+  return { proposals: merged };
 }
 
 /**

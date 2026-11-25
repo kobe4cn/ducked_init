@@ -62,7 +62,7 @@ describe('把知识来源解析成知识提案', () => {
     const { f, received } = fakeLlm(setLlmFetch, () => json(modelOutput(), USAGE));
 
     const out = await importFromSource(analyst, source.id);
-    expect(out).toEqual({ created: 3, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0 });
+    expect(out).toEqual({ created: 3, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0, chunks: 1 });
     expect(f).toHaveBeenCalledTimes(1);
     const [call] = await calls(acme);
     expect(call).toMatchObject({ purpose: 'knowledge_import', model: 'qwen-plus', schemaValid: true,
@@ -101,7 +101,7 @@ describe('把知识来源解析成知识提案', () => {
     fakeLlm(setLlmFetch, () => json(modelOutput(bad), USAGE));
 
     const out = await importFromSource(analyst, source.id);
-    expect(out).toEqual({ created: 3, existing: 0, rejected: 0, invalid: 5, stale: 0, skipped: 0 });
+    expect(out).toEqual({ created: 3, existing: 0, rejected: 0, invalid: 5, stale: 0, skipped: 0, chunks: 1 });
     expect((await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).map(r => r.kind).sort())
       .toEqual(['alias', 'claim', 'note']);
 
@@ -134,7 +134,7 @@ describe('把知识来源解析成知识提案', () => {
     expect(detail.dropped[0]).toEqual({ targetId: 'entity:nope', reason: 'target_not_in_input' });
   });
 
-  it('模型输出 kind:note 但没有 note（正文写进 reason）时不合 Schema：422、没有新提案、没有 knowledge_source.parsed 审计', async () => {
+  it('模型输出 kind:note 但没有 note（正文写进 reason）时不合 Schema：422、没有新提案、记 parse_failed 审计、没有 knowledge_source.parsed 审计', async () => {
     const { acme, analyst, source } = await setup();
     platformDefault();
     fakeLlm(setLlmFetch, () => json(modelOutput([
@@ -145,6 +145,12 @@ describe('把知识来源解析成知识提案', () => {
     const e = await failure(importFromSource(analyst, source.id));
     expect(e).toBeInstanceOf(ImportError);
     expect(e).toMatchObject({ status: 422, message: expect.stringContaining('不符合 Schema') });
+    // 不合 Schema 也是模型失败：留 parse_failed 审计（detail 不含段落原文与提示词）
+    const [audit] = await auditsOf(acme, 'knowledge_source.parse_failed');
+    expect(audit).toMatchObject({ targetType: 'knowledge_source', targetId: source.id,
+      detail: { sourceId: source.id, title: '指标口径文档', kind: 'metric', version: source.version,
+        stage: 'model', error: expect.stringContaining('Schema') } });
+    expect(JSON.stringify(audit!.detail)).not.toContain('订单表存下单与支付信息');
     expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
     expect(await auditsOf(acme, 'knowledge_source.parsed')).toHaveLength(0);
   });
@@ -159,7 +165,7 @@ describe('把知识来源解析成知识提案', () => {
     ] }, USAGE));
 
     const out = await importFromSource(analyst, source.id);
-    expect(out).toEqual({ created: 1, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0 });
+    expect(out).toEqual({ created: 1, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0, chunks: 1 });
 
     // 结果只有提案：指令与 SQL 没被照做——只调了模型，没有工作台审计、没有新任务，审计里也没有段落原文
     expect((await calls(acme)).map(c => c.purpose)).toEqual(['knowledge_import']);
@@ -180,7 +186,7 @@ describe('把知识来源解析成知识提案', () => {
 
     // 再解析同一来源：还会调模型，同样的提案命中已有指纹计 existing
     const second = await importFromSource(analyst, source.id);
-    expect(second).toEqual({ created: 0, existing: 3, rejected: 0, invalid: 0, stale: 0, skipped: 0 });
+    expect(second).toEqual({ created: 0, existing: 3, rejected: 0, invalid: 0, stale: 0, skipped: 0, chunks: 1 });
     expect(f).toHaveBeenCalledTimes(2);
 
     // 拒绝一条后再解析：命中已拒绝的指纹计 rejected，不重新提出
@@ -188,13 +194,13 @@ describe('把知识来源解析成知识提案', () => {
       .where(and(eq(knowledgeProposals.tenantId, acme), eq(knowledgeProposals.kind, 'alias')));
     await rejectProposal(analyst, alias!.id, '不是这个叫法');
     const third = await importFromSource(analyst, source.id);
-    expect(third).toEqual({ created: 0, existing: 2, rejected: 1, invalid: 0, stale: 0, skipped: 0 });
+    expect(third).toEqual({ created: 0, existing: 2, rejected: 1, invalid: 0, stale: 0, skipped: 0, chunks: 1 });
 
     // 再粘贴换版（version + 1）后解析：指纹不含证据，同样的提案仍命中已有那条、证据仍是首版的
     const v2 = await saveKnowledgeSource(analyst, { title: '指标口径文档', kind: 'metric', body: `${BODY}\n\n补充：退货不算流水。` });
     expect(v2.version).toBe(2);
     const fourth = await importFromSource(analyst, source.id);
-    expect(fourth).toEqual({ created: 0, existing: 2, rejected: 1, invalid: 0, stale: 0, skipped: 0 });
+    expect(fourth).toEqual({ created: 0, existing: 2, rejected: 1, invalid: 0, stale: 0, skipped: 0, chunks: 1 });
     const [claim] = await getDb().select().from(knowledgeProposals)
       .where(and(eq(knowledgeProposals.tenantId, acme), eq(knowledgeProposals.kind, 'claim')));
     expect(claim!.evidence).toEqual([{ ref: `source:${source.id}#p2`, version: 1 }]);
@@ -223,13 +229,50 @@ describe('把知识来源解析成知识提案', () => {
 
     // 再解析同一来源：同样的三条和已生效知识相同，落库前丢掉、计 skipped，而不是靠指纹计 existing
     const second = await importFromSource(analyst, source.id);
-    expect(second).toEqual({ created: 0, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 3 });
+    expect(second).toEqual({ created: 0, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 3, chunks: 1 });
     expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(3);
     const [, audit] = await auditsOf(acme, 'knowledge_source.parsed');
     expect(audit!.detail).toMatchObject({ created: 0, skipped: 3 });
   });
 
-  it('模型失败 422 且不留提案与审计；查看者 403；未配置模型服务 409 且不发请求；来源不存在 400', async () => {
+  it('段落合计超过 6,000 字时按段落分块调用：请求数与 llm_calls 都等于块数，各块输出按目标 + 种类 + 内容去重、证据取并集，created 与整份一次调用应得的相同', async () => {
+    // 12 段各约 800 字（合计约 9,600 字，超过 IMPORT_CHUNK_CHARS）：第 1 块装第 1–7 段、第 2 块装第 8–12 段
+    const paragraphs = Array.from({ length: 12 }, (_, i) => `第${i + 1}段的口径说明。${'甲'.repeat(790)}`);
+    const { acme, analyst, source } = await setup(paragraphs.join('\n\n'));
+    platformDefault();
+    // 假模型从请求的 user JSON 里读出这一块的段号：每段回一条该段独有的别名，另外每块都回同一条「成交额」（验证去重）
+    const { f, received } = fakeLlm(setLlmFetch, (_n, body) => {
+      const input = JSON.parse(body.messages[1]!.content) as { paragraphs: { no: number }[] };
+      return json({ proposals: [
+        { kind: 'alias', targetId: 'metric:paid_revenue', alias: '成交额', evidence: [{ paragraph: input.paragraphs[0]!.no }], reason: '每块都提同一条' },
+        ...input.paragraphs.map(p => (
+          { kind: 'alias', targetId: 'metric:paid_revenue', alias: `第${p.no}段的叫法`, evidence: [{ paragraph: p.no }], reason: `第 ${p.no} 段独有` }
+        )),
+      ] }, USAGE);
+    });
+
+    const out = await importFromSource(analyst, source.id);
+    // 12 条各段独有 + 去重后的 1 条「成交额」= 13，与整份一次调用应得的提案数相同
+    expect(out).toEqual({ created: 13, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0, chunks: 2 });
+    expect(f).toHaveBeenCalledTimes(2);
+    expect(await calls(acme)).toHaveLength(2);
+    // 每块的请求只带这一块的段落（第 1 块 1–7 段、第 2 块 8–12 段），段号是原来的段号
+    const firstChunk = JSON.parse(received[0]!.body.messages[1]!.content) as { paragraphs: { no: number }[] };
+    const secondChunk = JSON.parse(received[1]!.body.messages[1]!.content) as { paragraphs: { no: number }[] };
+    expect(firstChunk.paragraphs.map(p => p.no)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(secondChunk.paragraphs.map(p => p.no)).toEqual([8, 9, 10, 11, 12]);
+
+    const rows = await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme));
+    expect(rows).toHaveLength(13);
+    // 「成交额」两块各提一次：合并成一条，证据是两块给的段号（第 1 段与第 8 段）的并集
+    const shared = rows.find(r => r.kind === 'alias' && (r.content as { alias: string }).alias === '成交额')!;
+    expect(shared.evidence).toEqual([
+      { ref: `source:${source.id}#p1`, version: source.version },
+      { ref: `source:${source.id}#p8`, version: source.version },
+    ]);
+  });
+
+  it('模型失败 422 且不留提案、在事务外记 parse_failed 审计（detail 只有那几个键，error 截到 200 字、不含 Key 与段落原文）；查看者 403；未配置模型服务 409 且不发请求；来源不存在 400', async () => {
     const { acme, analyst, viewer, source } = await setup();
     platformDefault();
     fakeLlm(setLlmFetch, () => new Response('upstream sk-platform-secret exploded', { status: 500 }));
@@ -240,6 +283,17 @@ describe('把知识来源解析成知识提案', () => {
     expect(e).toMatchObject({ status: 422, message: expect.stringContaining('500') });
     expect((await calls(acme))[0]).toMatchObject({ purpose: 'knowledge_import', error: expect.stringContaining('500') });
     expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
+    // 失败审计写在事务外，一定留下；detail 键恰好是那几个，error 是 e.message 的前 200 字（Key 已由 llm.ts 抹掉）
+    const [audit] = await auditsOf(acme, 'knowledge_source.parse_failed');
+    expect(audit).toMatchObject({ targetType: 'knowledge_source', targetId: source.id,
+      detail: { sourceId: source.id, title: '指标口径文档', kind: 'metric', version: source.version,
+        stage: 'model', error: expect.stringContaining('500') } });
+    expect(Object.keys(audit!.detail as Record<string, unknown>).sort())
+      .toEqual(['error', 'kind', 'sourceId', 'stage', 'title', 'version']);
+    expect((audit!.detail as { error: string }).error.length).toBeLessThanOrEqual(200);
+    expect(JSON.stringify(audit!.detail)).not.toContain('sk-platform-secret');
+    expect(JSON.stringify(audit!.detail)).not.toContain('成交额');
+    expect(JSON.stringify(audit!.detail)).not.toContain('人民币');
     expect(await auditsOf(acme, 'knowledge_source.parsed')).toHaveLength(0);
 
     await expect(importFromSource(viewer, source.id)).rejects.toMatchObject({ init: { status: 403 } });

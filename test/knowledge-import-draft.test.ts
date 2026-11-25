@@ -3,12 +3,14 @@
 // 段落里藏的指令文字只是数据、不在 system 里；IMPORT_SCHEMA 的 kind enum 是三种、claim 的 type / value 是登记表枚举、
 // 证据只收段号、按 kind 要求对应字段（缺字段不合 Schema）；outputToProposals 丢段号越界或为 0、没有证据、目标不在
 // 输入条目里的提案并返回 dropped（目标与原因），证据 ref 由代码拼成 source:<id>#p<段号> 并带来源版本，
-// mappingId 一律 null、generatorVersion 用常量（纯函数，不碰库）
+// mappingId 一律 null、generatorVersion 用常量；chunkParagraphs 按段落字数分块（一段不拆、单段超阈值独占一块、
+// 空来源也给一块）；mergeOutputs 把各块输出按目标 + 种类 + 内容去重、证据按段号取并集（纯函数，不碰库）
 import { Ajv } from 'ajv';
 import { describe, expect, it } from 'vitest';
 import type { CatalogEntry, DefinitionDependencies, EntityEntry, FieldEntry, MetricEntry, SourceEntry, TableEntry } from '../app/.server/catalog';
 import {
-  IMPORT_GENERATOR_VERSION, IMPORT_SCHEMA, importInput, importMessages, outputToProposals, type ImportOutput,
+  IMPORT_CHUNK_CHARS, IMPORT_GENERATOR_VERSION, IMPORT_SCHEMA, chunkParagraphs, importInput, importMessages,
+  mergeOutputs, outputToProposals, type ImportOutput,
 } from '../app/.server/knowledge/import-draft';
 import { ALIAS_MAX_LENGTH } from '../app/.server/knowledge/aliases';
 import { NOTE_MAX_LENGTH } from '../app/.server/business-notes';
@@ -187,5 +189,73 @@ describe('outputToProposals', () => {
     expect(outputToProposals({ proposals: [
       { kind: 'note', targetId: 'entity:order', note: '没有段落', evidence: [{ paragraph: 1 }], reason: '' },
     ] }, empty, SOURCE).inputs).toEqual([]);
+  });
+});
+
+describe('chunkParagraphs', () => {
+  const para = (no: number, len: number) => ({ no, text: '甲'.repeat(len) });
+
+  it('合计不超过 IMPORT_CHUNK_CHARS（6,000 字）时整份一块：刚好 6,000 字仍一块、6,001 字两块；字数按 [...text].length 算', () => {
+    expect(IMPORT_CHUNK_CHARS).toBe(6000);
+    expect(chunkParagraphs([para(1, 3000), para(2, 3000)])).toEqual([[para(1, 3000), para(2, 3000)]]);
+    expect(chunkParagraphs([para(1, 3000), para(2, 3001)])).toEqual([[para(1, 3000)], [para(2, 3001)]]);
+  });
+
+  it('一段不拆开：单段超过阈值独占一块，前后的段各归各块；块里段号是原来的段号、不重新编号', () => {
+    const long = { no: 2, text: '长'.repeat(7000) };
+    expect(chunkParagraphs([{ no: 1, text: '一段' }, long, { no: 3, text: '三段' }])).toEqual([
+      [{ no: 1, text: '一段' }],
+      [long],
+      [{ no: 3, text: '三段' }],
+    ]);
+  });
+
+  it('从段落边界开新块：8 段各 800 字拆成 7 + 1 两块，段落保持原顺序；空段落来源也给一块（保证至少调一次模型）', () => {
+    const paragraphs = Array.from({ length: 8 }, (_, i) => para(i + 1, 800));
+    const chunks = chunkParagraphs(paragraphs);
+    expect(chunks).toEqual([paragraphs.slice(0, 7), [para(8, 800)]]);
+    expect(chunkParagraphs([])).toEqual([[]]);
+    // maxChars 可显式传小值（分块本身不依赖常量）
+    expect(chunkParagraphs([para(1, 4), para(2, 4), para(3, 4)], 6)).toEqual([[para(1, 4)], [para(2, 4)], [para(3, 4)]]);
+  });
+});
+
+describe('mergeOutputs', () => {
+  it('同目标同种类同内容的提案合并成一条：alias / note 去空白后同文合并，evidence 按段号取并集，其余字段取第一条；内容不同、目标不同都不合并；只有一个输出时原样返回', () => {
+    const first: ImportOutput = { proposals: [
+      { kind: 'alias', targetId: 'metric:paid_revenue', alias: '成交额', evidence: [{ paragraph: 3 }], reason: '第一块的理由' },
+      { kind: 'note', targetId: 'entity:order', note: '订单表存下单与支付信息', evidence: [{ paragraph: 1 }], reason: '说明' },
+    ] };
+    const second: ImportOutput = { proposals: [
+      // 两块都提同一条别名（前后空白不同）：合并、证据并集，alias 与 reason 取第一条
+      { kind: 'alias', targetId: 'metric:paid_revenue', alias: ' 成交额 ', evidence: [{ paragraph: 3 }, { paragraph: 5 }], reason: '第二块的理由' },
+      // 同目标同种类但内容不同：不合并
+      { kind: 'alias', targetId: 'metric:paid_revenue', alias: '流水', evidence: [{ paragraph: 4 }], reason: '另一个别名' },
+      // 同文说明再提一次：合并、证据并集
+      { kind: 'note', targetId: 'entity:order', note: '订单表存下单与支付信息 ', evidence: [{ paragraph: 6 }], reason: '说明二' },
+      // 同文别名但目标不同：不合并
+      { kind: 'alias', targetId: 'entity:order', alias: '成交额', evidence: [{ paragraph: 2 }], reason: '实体的别名' },
+    ] };
+    expect(mergeOutputs([first, second])).toEqual({ proposals: [
+      { kind: 'alias', targetId: 'metric:paid_revenue', alias: '成交额', evidence: [{ paragraph: 3 }, { paragraph: 5 }], reason: '第一块的理由' },
+      { kind: 'note', targetId: 'entity:order', note: '订单表存下单与支付信息', evidence: [{ paragraph: 1 }, { paragraph: 6 }], reason: '说明' },
+      { kind: 'alias', targetId: 'metric:paid_revenue', alias: '流水', evidence: [{ paragraph: 4 }], reason: '另一个别名' },
+      { kind: 'alias', targetId: 'entity:order', alias: '成交额', evidence: [{ paragraph: 2 }], reason: '实体的别名' },
+    ] });
+    expect(mergeOutputs([first])).toEqual(first);
+  });
+
+  it('claim 按类型与取值去重：同类型同取值合并、证据并集（重复段号只留一份），同类型不同取值不合并', () => {
+    const first: ImportOutput = { proposals: [
+      { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'CNY' }, evidence: [{ paragraph: 1 }], reason: '一' },
+    ] };
+    const second: ImportOutput = { proposals: [
+      { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'CNY' }, evidence: [{ paragraph: 1 }, { paragraph: 2 }], reason: '二' },
+      { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'USD' }, evidence: [{ paragraph: 2 }], reason: '三' },
+    ] };
+    expect(mergeOutputs([first, second])).toEqual({ proposals: [
+      { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'CNY' }, evidence: [{ paragraph: 1 }, { paragraph: 2 }], reason: '一' },
+      { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'USD' }, evidence: [{ paragraph: 2 }], reason: '三' },
+    ] });
   });
 });
