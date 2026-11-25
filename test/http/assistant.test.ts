@@ -1,5 +1,6 @@
 // test/http/assistant.test.ts —— AI 助手资源路由 /assistant 的 HTTP 接缝（ADR-0043）：GET 返回是否配置了模型服务、工具调用探测结果与成员可用的工具名，
 // POST JSON { message, page } 跑一轮问答（假 fetch 经 app.setLlmFetch 注入）；模型服务不支持工具调用时返回提示而不是 500；
+// 同一成员同时只能有一轮（#1249）：上一轮进行中再提交 429 且不发模型请求，别的成员互不影响；上一轮不管怎么结束（400/409/422、客户端中止）占位都释放；
 // 「测试连通性」探测为不支持时 POST 422 且不发请求，临时故障不存，改了端点或模型、恢复平台默认后探测结果作废；
 // 顶栏有「AI 助手」按钮；未登录跳转登录页
 import { and, eq } from 'drizzle-orm';
@@ -89,6 +90,71 @@ describe('AI 助手', () => {
     const logged = await getDb().select().from(llmCalls).where(eq(llmCalls.tenantId, acme));
     expect(logged).toHaveLength(2);
     expect(logged.at(-1)!.error).toBe('请求已取消');
+  }, 30_000);
+
+  it('同一成员同时只能有一轮：第一轮挂起时再提交 429 且不多发模型请求；别的成员互不影响；结束后可立刻再提交（#1249）', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    platformDefault();
+    // 第 1 次模型请求挂起到放行为止（viewer 的第一轮进行中），之后的请求直接给文字答复
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let calls = 0;
+    app.setLlmFetch((async () => {
+      calls++;
+      if (calls === 1) await gate;
+      return text('有客户、订单等实体');
+    }) as unknown as typeof fetch);
+    const first = ask(viewer, TURN);
+    await expect.poll(() => calls).toBe(1);
+    // 上一轮进行中同一成员再提交：429、文案，并且不再发模型请求
+    const busy = await ask(viewer, { message: '还有哪些实体？', page: TURN.page });
+    expect(busy.status).toBe(429);
+    expect((await busy.json()).error).toBe('你已有一轮助手在进行，请等它结束后再试');
+    expect(calls).toBe(1);
+    // 另一位成员同一时刻提交不受影响：照常跑完一轮
+    expect((await ask(analyst, TURN)).status).toBe(200);
+    // 放行第一轮后返回 200；占位已释放，同一成员可以立刻再提交
+    release();
+    expect((await first).status).toBe(200);
+    expect((await ask(viewer, { message: '还有哪些实体？', page: TURN.page })).status).toBe(200);
+  }, 30_000);
+
+  it('上一轮不管怎么结束占位都释放：空问题 400、未配置 409、不支持工具调用 422、客户端中止后，马上再提交都不是 429（#1249）', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const viewer = await loginAs(app, 'viewer@acme.com');
+    // 前置校验在占位之前：空问题 400 根本不占；未配置 409 的这轮占过又释放，再提交还是 409 而不是 429
+    expect((await ask(viewer, { message: ' ', page: TURN.page })).status).toBe(400);
+    expect((await ask(viewer, TURN)).status).toBe(409);
+    expect((await ask(viewer, TURN)).status).toBe(409);
+    // 跑进模型服务后的 422：这轮结束后占位立刻归还（再提交还是 422，不是 429）
+    platformDefault();
+    fakeLlm(setLlm, () => new Response('tools not supported', { status: 400 }));
+    expect((await ask(viewer, TURN)).status).toBe(422);
+    expect((await ask(viewer, TURN)).status).toBe(422);
+    // 客户端中止的一轮（写法照 #1248 的用例）：先 await 被中止的那次请求（react-router 等动作跑完才返回），再提交不是 429
+    const signals: (AbortSignal | undefined)[] = [];
+    app.setLlmFetch(((url: string | URL | Request, init?: RequestInit) => {
+      signals.push(init?.signal as AbortSignal | undefined);
+      return signals.length === 1
+        ? Promise.resolve(toolCalls({ id: 'c1', name: 'catalog_search', args: { query: '客户' } }))
+        : new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener('abort', function aborted(this: AbortSignal) { reject(this.reason); }));
+    }) as unknown as typeof fetch);
+    const controller = new AbortController();
+    const pending = viewer.request('/assistant', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(TURN), signal: controller.signal,
+    }).then(r => r.status, () => 'aborted');
+    await expect.poll(() => signals.length).toBe(2);
+    controller.abort();
+    await pending;
+    await expect.poll(() => signals[1]?.aborted).toBe(true);
+    fakeLlm(setLlm, () => text('有客户、订单等实体'));
+    expect((await ask(viewer, TURN)).status).toBe(200);
   }, 30_000);
 
   it('探测结果按租户存下并带端点与模型：不支持时 GET 为 false、POST 422 不发请求；改了模型、恢复平台默认、平台默认换了模型后作废', async () => {
