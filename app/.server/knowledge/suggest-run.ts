@@ -43,91 +43,91 @@ export type SuggestResult =
 export async function suggestForSubject(actor: CurrentMember, subjectId: string): Promise<SuggestResult> {
   // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用在 llm_calls 里记发起人、共用一个 turn_id（同样输入已生成过时不调模型，返回 fresh: false 不受影响）
   return withLlmContext({ actorEmail: actor.email }, async () => {
-  assertCan(actor, 'definitions:draft');
-  const tenantId = actor.tenant.id;
-  const subject = (await listSubjects(getDb(), tenantId)).find(s => s.id === subjectId);
-  if (!subject) throw new KnowledgeError('没有这个主题');
-  // 放在代次查询之前：没配模型服务时无论生成过没有都点不动（与 AC1 一致）
-  if (!(await resolveProvider(tenantId))) throw new SuggestError('未配置模型服务：请在「模型服务」页填写端点、模型与 API Key，或由平台配置默认模型服务', 409);
+    assertCan(actor, 'definitions:draft');
+    const tenantId = actor.tenant.id;
+    const subject = (await listSubjects(getDb(), tenantId)).find(s => s.id === subjectId);
+    if (!subject) throw new KnowledgeError('没有这个主题');
+    // 放在代次查询之前：没配模型服务时无论生成过没有都点不动（与 AC1 一致）
+    if (!(await resolveProvider(tenantId))) throw new SuggestError('未配置模型服务：请在「模型服务」页填写端点、模型与 API Key，或由平台配置默认模型服务', 409);
 
-  const bases = await currentBases(getDb(), tenantId);
-  const catalog = await tenantCatalog(tenantId);
-  // 条目 id 再算一次纯函数拿（无妨）：按它查出待处理与已拒绝的提案，既进输入（模型看得到）也做落库前兜底；
-  // 不用 listProposals，它一次只能按单个 status / targetId 过滤
-  const entryIds = subjectInput(catalog, { id: subject.id, name: subject.name }).entries.map(e => e.id);
-  const byTarget = new Map<string, ProposalBrief[]>();
-  if (entryIds.length) {
-    const rows = await getDb().select({
-      targetId: knowledgeProposals.targetId, kind: knowledgeProposals.kind, content: knowledgeProposals.content,
-      status: knowledgeProposals.status, rejectedReason: knowledgeProposals.rejectedReason, reviewedAt: knowledgeProposals.reviewedAt,
-    }).from(knowledgeProposals).where(and(
-      eq(knowledgeProposals.tenantId, tenantId),
-      inArray(knowledgeProposals.targetId, entryIds),
-      isNull(knowledgeProposals.mappingId),
-      inArray(knowledgeProposals.status, ['proposed', 'rejected']),
-    ));
-    for (const row of rows) {
-      if (row.status !== 'proposed' && row.status !== 'rejected') continue; // 查询已限，这里只为收窄类型
-      const list = byTarget.get(row.targetId) ?? [];
-      list.push({
-        targetId: row.targetId, kind: row.kind, content: row.content,
-        status: row.status, rejectedReason: row.rejectedReason, reviewedAt: row.reviewedAt,
-      });
-      byTarget.set(row.targetId, list);
+    const bases = await currentBases(getDb(), tenantId);
+    const catalog = await tenantCatalog(tenantId);
+    // 条目 id 再算一次纯函数拿（无妨）：按它查出待处理与已拒绝的提案，既进输入（模型看得到）也做落库前兜底；
+    // 不用 listProposals，它一次只能按单个 status / targetId 过滤
+    const entryIds = subjectInput(catalog, { id: subject.id, name: subject.name }).entries.map(e => e.id);
+    const byTarget = new Map<string, ProposalBrief[]>();
+    if (entryIds.length) {
+      const rows = await getDb().select({
+        targetId: knowledgeProposals.targetId, kind: knowledgeProposals.kind, content: knowledgeProposals.content,
+        status: knowledgeProposals.status, rejectedReason: knowledgeProposals.rejectedReason, reviewedAt: knowledgeProposals.reviewedAt,
+      }).from(knowledgeProposals).where(and(
+        eq(knowledgeProposals.tenantId, tenantId),
+        inArray(knowledgeProposals.targetId, entryIds),
+        isNull(knowledgeProposals.mappingId),
+        inArray(knowledgeProposals.status, ['proposed', 'rejected']),
+      ));
+      for (const row of rows) {
+        if (row.status !== 'proposed' && row.status !== 'rejected') continue; // 查询已限，这里只为收窄类型
+        const list = byTarget.get(row.targetId) ?? [];
+        list.push({
+          targetId: row.targetId, kind: row.kind, content: row.content,
+          status: row.status, rejectedReason: row.rejectedReason, reviewedAt: row.reviewedAt,
+        });
+        byTarget.set(row.targetId, list);
+      }
     }
-  }
-  const input = subjectInput(catalog, { id: subject.id, name: subject.name }, byTarget);
-  const [generated] = await getDb().select({ id: knowledgeGenerations.id }).from(knowledgeGenerations)
-    .where(and(
-      eq(knowledgeGenerations.tenantId, tenantId),
-      eq(knowledgeGenerations.subjectId, subject.id),
-      eq(knowledgeGenerations.inputHash, input.inputHash),
-      eq(knowledgeGenerations.generatorVersion, SUGGEST_GENERATOR_VERSION),
-    ));
-  if (generated) return { fresh: false };
+    const input = subjectInput(catalog, { id: subject.id, name: subject.name }, byTarget);
+    const [generated] = await getDb().select({ id: knowledgeGenerations.id }).from(knowledgeGenerations)
+      .where(and(
+        eq(knowledgeGenerations.tenantId, tenantId),
+        eq(knowledgeGenerations.subjectId, subject.id),
+        eq(knowledgeGenerations.inputHash, input.inputHash),
+        eq(knowledgeGenerations.generatorVersion, SUGGEST_GENERATOR_VERSION),
+      ));
+    if (generated) return { fresh: false };
 
-  let output: SuggestOutput;
-  try {
-    output = await chatJson<SuggestOutput>(tenantId, 'knowledge_proposal', suggestMessages(input), SUGGEST_SCHEMA);
-  } catch (e) {
-    if (!(e instanceof LlmError)) throw e;
-    // 失败审计写在事务外（用 getDb）：没有可回滚的写入，审计也一定留下；detail 不放消息与输出原文
-    await recordAudit(getDb(), {
-      tenantId, actor, action: 'knowledge_proposal.generate_failed', targetType: 'analysis_subject', targetId: subject.id,
-      detail: { subjectId: subject.id, stage: 'model', error: e.message.slice(0, 200) },
+    let output: SuggestOutput;
+    try {
+      output = await chatJson<SuggestOutput>(tenantId, 'knowledge_proposal', suggestMessages(input), SUGGEST_SCHEMA);
+    } catch (e) {
+      if (!(e instanceof LlmError)) throw e;
+      // 失败审计写在事务外（用 getDb）：没有可回滚的写入，审计也一定留下；detail 不放消息与输出原文
+      await recordAudit(getDb(), {
+        tenantId, actor, action: 'knowledge_proposal.generate_failed', targetType: 'analysis_subject', targetId: subject.id,
+        detail: { subjectId: subject.id, stage: 'model', error: e.message.slice(0, 200) },
+      });
+      throw new SuggestError(`按主题生成提案失败：${e.message}`, 422);
+    }
+
+    // 不合法的条目（引用输入外、目标不在集合、类型取值不配对、空白超上限）在这里就被丢掉并记下目标与原因（写进审计 detail 的 dropped），
+    // proposeMany 的 invalid 只是库里再拦下的
+    const { inputs, dropped } = outputToProposals(output, input);
+    // invalid 按丢已知之前的条数算（被丢掉的不再同时计进 invalid），已知部分不再交给 proposeMany
+    const { inputs: notKnown, skipped } = dropKnown(inputs, catalog.entries);
+    // 落库前兜底：与生成前待处理 / 已拒绝的提案重复的不再写，跳过的条数计进 existing（集中页「跳过」的一部分）
+    const { kept: toPropose, skipped: pendingSkipped } = dropPending(notKnown, byTarget);
+    const result = await getDb().transaction(async tx => {
+      const r = await proposeMany(tx, tenantId, toPropose, { expectedBases: bases });
+      // 并发重复点击时唯一索引兜底：插不上就当这一代已经记过
+      await tx.insert(knowledgeGenerations).values({
+        tenantId, subjectId: subject.id, inputHash: input.inputHash, generatorVersion: SUGGEST_GENERATOR_VERSION,
+        proposalCount: r.created.length, createdByEmail: actor.email,
+      }).onConflictDoNothing();
+      const invalid = output.proposals.length - inputs.length + r.invalid.length;
+      // 被丢条目只记目标与原因（最多前 20 条），不记提案内容；没有丢弃时不写 dropped 这个键
+      const detail: Record<string, unknown> = {
+        subjectId: subject.id, created: r.created.length, existing: r.existing + pendingSkipped,
+        rejected: r.rejected, invalid, stale: r.stale, skipped,
+      };
+      if (dropped.length > 0) detail.dropped = dropped.slice(0, 20);
+      await recordAudit(tx, {
+        tenantId, actor, action: 'knowledge_proposal.generated', targetType: 'analysis_subject', targetId: subject.id, detail,
+      });
+      return { ...r, existing: r.existing + pendingSkipped, invalid };
     });
-    throw new SuggestError(`按主题生成提案失败：${e.message}`, 422);
-  }
-
-  // 不合法的条目（引用输入外、目标不在集合、类型取值不配对、空白超上限）在这里就被丢掉并记下目标与原因（写进审计 detail 的 dropped），
-  // proposeMany 的 invalid 只是库里再拦下的
-  const { inputs, dropped } = outputToProposals(output, input);
-  // invalid 按丢已知之前的条数算（被丢掉的不再同时计进 invalid），已知部分不再交给 proposeMany
-  const { inputs: notKnown, skipped } = dropKnown(inputs, catalog.entries);
-  // 落库前兜底：与生成前待处理 / 已拒绝的提案重复的不再写，跳过的条数计进 existing（集中页「跳过」的一部分）
-  const { kept: toPropose, skipped: pendingSkipped } = dropPending(notKnown, byTarget);
-  const result = await getDb().transaction(async tx => {
-    const r = await proposeMany(tx, tenantId, toPropose, { expectedBases: bases });
-    // 并发重复点击时唯一索引兜底：插不上就当这一代已经记过
-    await tx.insert(knowledgeGenerations).values({
-      tenantId, subjectId: subject.id, inputHash: input.inputHash, generatorVersion: SUGGEST_GENERATOR_VERSION,
-      proposalCount: r.created.length, createdByEmail: actor.email,
-    }).onConflictDoNothing();
-    const invalid = output.proposals.length - inputs.length + r.invalid.length;
-    // 被丢条目只记目标与原因（最多前 20 条），不记提案内容；没有丢弃时不写 dropped 这个键
-    const detail: Record<string, unknown> = {
-      subjectId: subject.id, created: r.created.length, existing: r.existing + pendingSkipped,
-      rejected: r.rejected, invalid, stale: r.stale, skipped,
+    return {
+      fresh: true, created: result.created.length, existing: result.existing,
+      rejected: result.rejected, invalid: result.invalid, stale: result.stale, skipped,
     };
-    if (dropped.length > 0) detail.dropped = dropped.slice(0, 20);
-    await recordAudit(tx, {
-      tenantId, actor, action: 'knowledge_proposal.generated', targetType: 'analysis_subject', targetId: subject.id, detail,
-    });
-    return { ...r, existing: r.existing + pendingSkipped, invalid };
-  });
-  return {
-    fresh: true, created: result.created.length, existing: result.existing,
-    rejected: result.rejected, invalid: result.invalid, stale: result.stale, skipped,
-  };
   });
 }
