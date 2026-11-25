@@ -15,6 +15,7 @@
 // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮每次请求都用同一套端点与模型（chatToolsWith）、在 platform.llm_calls 记一条 assistant（route=reasoning），不存提示词与答复原文
 import { can, deniedReason } from '../access';
 import type { CurrentMember } from '../auth';
+import { formatServer } from '../i18n';
 import type { Role } from '../db/schema';
 import { planRetrievedIds, type AnalysisPlan } from '../catalog/plan';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
@@ -23,6 +24,7 @@ import { dataOnlyNotice } from '../llm-prompts';
 import { toolSupport } from '../model-provider';
 import type { ChoiceGroup } from './conversations';
 import { invokeTool, PLAN_MODE_RULE, toolsFor, type ToolCtx, type ToolResult } from './tools';
+import { msg } from '~/lib/i18n';
 
 /** 每轮最多调用工具次数的默认值（ASSISTANT_MAX_TOOL_CALLS 没填或非法时用），用完时不带工具再请求一次、让模型总结进展与下一步（#1180）；
  *  要给检索、展开、校验计划与保存草稿都留出次数 */
@@ -102,7 +104,20 @@ const extras = (ctx: ToolCtx) => ({
 });
 
 export class AssistantError extends Error {
-  constructor(message: string, readonly status: 400 | 409 | 422) { super(message); }
+  constructor(message: string, readonly status: 400 | 409 | 422 | 429) { super(message); }
+}
+
+/** 同一成员已有一轮进行中（#1249）：本层报错固定中文，句式走 msg() 进词典（ADR-0060，写法照 llm.ts 的 ABORTED） */
+export const TURN_BUSY = formatServer('zh-CN', msg('你已有一轮助手在进行，请等它结束后再试'));
+
+/** 正在进行一轮的成员（#1249）。进程内占位：多实例部署时只限本进程（取舍见本票 #1249 的决定评论，没用 advisory lock 或 DB 表） */
+const turnsInProgress = new Set<string>();
+
+/** 占住成员的一轮（#1249）：已有进行中的一轮时返回 null（路由回 429），否则记下并返回释放函数；释放必须放进 finally，这轮不管怎么结束都归还 */
+export function claimTurn(memberId: string): (() => void) | null {
+  if (turnsInProgress.has(memberId)) return null;
+  turnsInProgress.add(memberId);
+  return () => { turnsInProgress.delete(memberId); };
 }
 
 /** source: 'interpretation' 是工作台结果解读（#1259）：发给模型时改成 user 角色的引用，不当作助手说过的话 */

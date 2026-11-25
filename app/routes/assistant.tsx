@@ -3,6 +3,7 @@
 // POST 接 JSON：{ conversationId?, message, page } 跑一轮问答（历史从保存的对话里取，只有本人能续写），记进对话后返回 { conversationId, reply, toolsUsed, workbenchSql?, planCard?, choices? }
 // （workbenchSql 是本轮 prefill_workbench 通过校验的 SQL，有值时才带，前端拿它渲染「填入工作台」链接）；
 // 一轮把 request.signal 传给 assistantTurn（#1248）：客户端中止后不再发模型请求，本轮抛 400、不写对话（appendTurn 不执行），已存下的草稿与审计照常保留；
+// 同一成员同时只能有一轮（#1249）：跑问答前先占位（进程内，多实例部署时只限本进程），已有一轮进行中时 429 且不发模型请求；前置校验（问题为空、对话不存在、分享来的对话 403 等）在占位之前，share / unshare 与 knowledge.propose 不占；
 // 计划随对话保存（ADR-0050）：本轮校验过的计划存进 assistant 消息，续写时把对话里最近一份带给 assistantTurn 作 priorPlan（存草稿前重新校验用），发给模型的只有文字；
 // 计划卡（#452，P4⑯a）：带 plan 的消息在读时按读者自己的目录组装 planCard（读时再校验、不存状态），POST 返回与 ?id= 读回都带；
 // 读回响应只给 planCard、不给原始 plan（#539：被分享人看不到的 excluded 条目 id 不能出现在 HTML / JSON 里），
@@ -32,7 +33,7 @@ import {
   type Conversation, type StoredMessage,
 } from '~/.server/assistant/conversations';
 import { askCardFor, proposeFromChoice, type AskCard } from '~/.server/assistant/knowledge-ask';
-import { AssistantError, assistantTurn, MAX_HISTORY, type ChatTurn } from '~/.server/assistant/loop';
+import { AssistantError, assistantTurn, claimTurn, MAX_HISTORY, TURN_BUSY, type ChatTurn } from '~/.server/assistant/loop';
 import { planCardView, type PlanCardView } from '~/.server/assistant/plan-card';
 import { catalogFor, catalogPairFor, toolsFor } from '~/.server/assistant/tools';
 import { KnowledgeError } from '~/.server/knowledge/basis';
@@ -181,21 +182,29 @@ export async function action({ request }: Route.ActionArgs) {
       }
     }
     const page = { path: String(body?.page?.path ?? ''), title: String(body?.page?.title ?? '') };
-    const { reply, toolsUsed, plan, workbenchSql, choices } = await assistantTurn(member, [...history, { role: 'user', content: userText }], page, priorPlan, request.signal);
-    const conversationId = await appendTurn(member, id, { userText, reply, toolsUsed, ...(plan ? { plan } : {}), ...(workbenchSql ? { workbenchSql } : {}), ...(choices ? { choices } : {}), ...(chosen ? { chosen } : {}) });
-    // 本轮校验过计划时带计划卡、判出过歧义时带候选：都按成员自己的目录读时组装；被拒的那轮（如 reuse_result 计划填工作台）校验过计划也带
-    const pair = plan || choices ? await catalogPairFor(member) : null;
-    const catalog = pair?.catalog ?? null;
-    // 「记为知识提案」卡片（⑥-4 / ⑥-6）：点选候选回答的那轮按存下的 chosen 确定性组装（不是模型生成的），无权限 / 已有同词提案 /
-    // 词已是名称或别名 / 指纹已拒绝时不带（askCardFor 里检查，与提交同一套条件）；歧义点选出 term_default、未命中点选出 alias
-    const askCard = chosen ? await askCardFor(member, chosen, chosenIndex) : null;
-    return Response.json({
-      conversationId, reply, toolsUsed,
-      ...(workbenchSql ? { workbenchSql } : {}),
-      ...(plan && catalog ? { planCard: planCardView(catalog, plan, pair?.other) } : {}),
-      ...(choices && catalog ? { choices: choicesView(catalog, choices) } : {}),
-      ...(askCard ? { askCard } : {}),
-    });
+    // 同一成员同时只能有一轮（#1249）：调 assistantTurn 前占位（放在前置校验之后，share / unshare / knowledge.propose 不占），
+    // 已有一轮进行中时 429，走到外层 catch 的 errorResponse。释放放进 finally：这一段不管怎么结束（答复、400/409/422、异常、客户端中止）都归还
+    const release = claimTurn(member.memberId);
+    if (!release) throw new AssistantError(TURN_BUSY, 429);
+    try {
+      const { reply, toolsUsed, plan, workbenchSql, choices } = await assistantTurn(member, [...history, { role: 'user', content: userText }], page, priorPlan, request.signal);
+      const conversationId = await appendTurn(member, id, { userText, reply, toolsUsed, ...(plan ? { plan } : {}), ...(workbenchSql ? { workbenchSql } : {}), ...(choices ? { choices } : {}), ...(chosen ? { chosen } : {}) });
+      // 本轮校验过计划时带计划卡、判出过歧义时带候选：都按成员自己的目录读时组装；被拒的那轮（如 reuse_result 计划填工作台）校验过计划也带
+      const pair = plan || choices ? await catalogPairFor(member) : null;
+      const catalog = pair?.catalog ?? null;
+      // 「记为知识提案」卡片（⑥-4 / ⑥-6）：点选候选回答的那轮按存下的 chosen 确定性组装（不是模型生成的），无权限 / 已有同词提案 /
+      // 词已是名称或别名 / 指纹已拒绝时不带（askCardFor 里检查，与提交同一套条件）；歧义点选出 term_default、未命中点选出 alias
+      const askCard = chosen ? await askCardFor(member, chosen, chosenIndex) : null;
+      return Response.json({
+        conversationId, reply, toolsUsed,
+        ...(workbenchSql ? { workbenchSql } : {}),
+        ...(plan && catalog ? { planCard: planCardView(catalog, plan, pair?.other) } : {}),
+        ...(choices && catalog ? { choices: choicesView(catalog, choices) } : {}),
+        ...(askCard ? { askCard } : {}),
+      });
+    } finally {
+      release();
+    }
   } catch (e) {
     return errorResponse(e, await getLocale(request));
   }
