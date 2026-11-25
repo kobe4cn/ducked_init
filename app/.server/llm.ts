@@ -32,11 +32,19 @@ export type LlmPurpose = 'connectivity' | 'tool_probe' | 'assistant' | 'mapping_
 /** 档位（ADR-0055）：只有 fast 与 reasoning 两档 */
 export type LlmTier = 'fast' | 'reasoning';
 
+/** 分档的用途（ADR-0055）：connectivity / tool_probe / embedding 不分档，其余都属 fast 或 reasoning 之一 */
+export type TieredPurpose = Exclude<LlmPurpose, 'connectivity' | 'tool_probe' | 'embedding'>;
+
+/** 分档用途的默认档位：键必须覆盖全部 TieredPurpose，tiersByPurpose 按它的键序列出 */
+const TIERED_PURPOSE_TIER: Record<TieredPurpose, LlmTier> = {
+  assistant: 'reasoning', mapping_draft: 'reasoning', metric_draft: 'reasoning', tag_draft: 'reasoning', workbench_draft: 'reasoning',
+  assertion_draft: 'fast', workbench_interpret: 'fast', knowledge_proposal: 'fast', knowledge_import: 'fast', metric_parse: 'fast',
+};
+
 /** 每个用途默认属于哪一档（ADR-0055）：默认写死在这里、不进库，平台可用 LLM_PURPOSE_TIER_OVERRIDES 覆盖（purposeTierOverrides）。
  *  null 的用途不分档，永远用解析出的那一套 provider，也不可被覆盖 */
 export const PURPOSE_TIER: Record<LlmPurpose, LlmTier | null> = {
-  assistant: 'reasoning', mapping_draft: 'reasoning', metric_draft: 'reasoning', tag_draft: 'reasoning', workbench_draft: 'reasoning',
-  assertion_draft: 'fast', workbench_interpret: 'fast', knowledge_proposal: 'fast', knowledge_import: 'fast', metric_parse: 'fast',
+  ...TIERED_PURPOSE_TIER,
   connectivity: null, tool_probe: null, embedding: null,
 };
 
@@ -70,14 +78,13 @@ export function purposeTier(purpose: LlmPurpose, env: Record<string, string | un
   return purposeTierOverrides(env)[purpose] ?? PURPOSE_TIER[purpose];
 }
 
-/** 每一档当前实际管哪些用途（ADR-0055 修订，按 PURPOSE_TIER 的键序列出；不分档的用途不在里面），模型服务页的分档说明用。
+/** 每一档当前实际管哪些用途（ADR-0055 修订，按 TIERED_PURPOSE_TIER 的键序列出；不分档的用途不在里面），模型服务页的分档说明用。
  *  覆盖表在这里只解析一次（逐项告警一次），不逐个用途重复解析 */
-export function tiersByPurpose(env: Record<string, string | undefined> = process.env): Record<LlmTier, LlmPurpose[]> {
+export function tiersByPurpose(env: Record<string, string | undefined> = process.env): Record<LlmTier, TieredPurpose[]> {
   const overrides = purposeTierOverrides(env);
-  const tiers: Record<LlmTier, LlmPurpose[]> = { fast: [], reasoning: [] };
-  for (const purpose of Object.keys(PURPOSE_TIER) as LlmPurpose[]) {
-    const tier = overrides[purpose] ?? PURPOSE_TIER[purpose];
-    if (tier) tiers[tier].push(purpose);
+  const tiers: Record<LlmTier, TieredPurpose[]> = { fast: [], reasoning: [] };
+  for (const purpose of Object.keys(TIERED_PURPOSE_TIER) as TieredPurpose[]) {
+    tiers[overrides[purpose] ?? TIERED_PURPOSE_TIER[purpose]].push(purpose);
   }
   return tiers;
 }
