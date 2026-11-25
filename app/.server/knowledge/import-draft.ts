@@ -69,6 +69,9 @@ export const IMPORT_SCHEMA = {
   properties: {
     proposals: {
       type: 'array',
+      // 单块最多 50 条提案（#1275）：超了不合 Schema，按普通模型失败处理（422 + parse_failed），不当成截断。
+      // schemaForModel 只剥 MODEL_DROPPED_KEYS，maxItems 会随 schema 发给模型，让模型自己控制产量
+      maxItems: 50,
       items: {
         type: 'object',
         additionalProperties: false,

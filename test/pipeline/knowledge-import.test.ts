@@ -18,7 +18,7 @@ import { setLlmFetch, setLlmSleep } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
-import { fakeLlm, json, platformDefault } from './llm-fixtures';
+import { fakeLlm, json, platformDefault, truncated } from './llm-fixtures';
 
 afterAll(async () => { await closeDb(); });
 // 500 时 chatJson 会重试 1 次（#1215）：等待换成立即返回
@@ -291,6 +291,51 @@ describe('把知识来源解析成知识提案', () => {
     expect(e).toMatchObject({ status: 422 });
     expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
     expect(await auditsOf(acme, 'knowledge_source.parse_failed')).toHaveLength(1);
+    expect(await auditsOf(acme, 'knowledge_source.parsed')).toHaveLength(0);
+  });
+
+  it('某块输出被截断且不止一段时对半拆块重试：结果照常合并落库返回 200，chunks 计实际成功的调用次数', async () => {
+    // 两段合计不到 6,000 字：整份一块。第 1 次调用被截断（finish_reason: length），从中间拆成两段各自重试
+    const { acme, analyst, source } = await setup('甲段。\n\n乙段。');
+    platformDefault();
+    const { f, received } = fakeLlm(setLlmFetch, (_n, body) => {
+      const input = JSON.parse(body.messages[1]!.content) as { paragraphs: { no: number }[] };
+      // 多于一段的一律截断，单段按段回合法提案（截断只认 truncated 字段，不匹配错误文案）
+      if (input.paragraphs.length > 1) return truncated('{"proposals":[');
+      return json({ proposals: input.paragraphs.map(p => (
+        { kind: 'alias', targetId: 'metric:paid_revenue', alias: `第${p.no}段的叫法`, evidence: [{ paragraph: p.no }], reason: `第 ${p.no} 段独有` }
+      )) }, USAGE);
+    });
+
+    const r = await importFromSource(analyst, source.id);
+    // 截断的那次也发了请求（llm_calls 也记一行，不计进 chunks）：1（截断）+ 2（拆开的两段各一次）= fetch 3 次
+    expect(f).toHaveBeenCalledTimes(3);
+    expect(r).toMatchObject({ created: 2, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0, chunks: 2 });
+    // 截断的一块按段数对半拆：第 2、3 次请求各只带一段（段号是整份来源的段号）
+    const split = received.slice(1).map(req => JSON.parse(req.body.messages[1]!.content) as { paragraphs: { no: number }[] });
+    expect(split.map(s => s.paragraphs.map(p => p.no))).toEqual([[1], [2]]);
+    const rows = await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme));
+    expect(rows).toHaveLength(2);
+    expect(await auditsOf(acme, 'knowledge_source.parse_failed')).toHaveLength(0);
+    expect(await auditsOf(acme, 'knowledge_source.parsed')).toHaveLength(1);
+  });
+
+  it('单段一块仍被截断时不再拆：整次 422、记一条 parse_failed（error 是截断文案）、没有提案', async () => {
+    const { acme, analyst, source } = await setup();
+    platformDefault();
+    const { f } = fakeLlm(setLlmFetch, () => truncated('{"proposals":['));
+
+    const e = await importFromSource(analyst, source.id).then(() => { throw new Error('应当失败'); }, (err: unknown) => err);
+    expect(e).toBeInstanceOf(ImportError);
+    expect(e).toMatchObject({ status: 422, message: expect.stringContaining('解析来源失败：模型输出被截断') });
+    // 三段整份一块 [1,2,3] → 拆成 [1,2] / [3]，[1,2] 再拆成 [1] / [2]：[1] 截断即 422，左半先失败右半不再发
+    expect(f).toHaveBeenCalledTimes(3);
+    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
+    const audits = await auditsOf(acme, 'knowledge_source.parse_failed');
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({ targetType: 'knowledge_source', targetId: source.id,
+      detail: { sourceId: source.id, stage: 'model',
+        error: '模型输出被截断（达到输出长度上限），请把需求写得更具体，或换上下文更长的模型' } });
     expect(await auditsOf(acme, 'knowledge_source.parsed')).toHaveLength(0);
   });
 
