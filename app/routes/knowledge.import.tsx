@@ -64,6 +64,8 @@ export async function action({ request }: Route.ActionArgs) {
       imported: values.title.trim(), created: String(outcome.created),
       skipped: String(outcome.existing + outcome.rejected + outcome.invalid + outcome.stale + outcome.skipped),
     });
+    // 来源太长分块解析过（chunks > 1）：集中页提示里加一句「来源太长，已分段」；split 只是展示参数，手改地址不影响别的
+    if (outcome.chunks > 1) params.set('split', '1');
     throw redirect(`/knowledge?${params.toString()}`);
   } catch (e) {
     // 未配置模型服务 409 / 模型失败 422：来源已保存，给出来源页链接，再提交同标题同正文是安全的重试

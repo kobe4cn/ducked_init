@@ -1087,6 +1087,7 @@
   "条件运算": "Condition operator",
   "来源": "Source",
   "来源原文": "Source text",
+  "来源太长，已分段": "The source was long, so it was parsed in parts",
   "来源已保存：": "Source saved: ",
   "枚举": "Enum values",
   "查看": "View",
