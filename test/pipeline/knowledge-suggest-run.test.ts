@@ -311,4 +311,18 @@ describe('按主题生成知识提案', () => {
     expect((await calls(acme)).filter(c => c.error === null)).toHaveLength(1); // 只有失败后那次重试成功，409 不发请求
     await expect(suggestForSubject(analyst, '00000000-0000-0000-0000-000000000000')).rejects.toMatchObject({ status: 400, message: '没有这个主题' });
   });
+
+  it('llm_calls 记发起人与轮次（#1257）：连点两次（第一次留下的待处理提案改了输入，第二次照常调模型），两行的 actor_email 都是操作人、turn_id 各不相同', async () => {
+    const { acme, analyst, subjectId } = await setup();
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json(modelOutput(), USAGE));
+
+    await suggestForSubject(analyst, subjectId);
+    await suggestForSubject(analyst, subjectId);
+
+    const logged = await calls(acme);
+    expect(logged).toHaveLength(2);
+    expect(logged.map(row => row.actorEmail)).toEqual([analyst.email, analyst.email]);
+    expect(logged[0]!.turnId).not.toBe(logged[1]!.turnId);
+  });
 });

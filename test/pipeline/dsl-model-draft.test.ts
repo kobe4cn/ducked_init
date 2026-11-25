@@ -212,6 +212,21 @@ describe('用模型生成指标定义草稿', () => {
     expect(await calls(acme)).toHaveLength(0);
     await expect(modelDraftForDefinition(viewer, 'metric', REQUEST)).rejects.toMatchObject({ init: { status: 403 } });
   });
+
+  it('llm_calls 记发起人与轮次（#1257）：连做两次，两行的 actor_email 都是操作人、turn_id 各不相同', async () => {
+    const { acme } = await publishedIdentitySources({ orders: true });
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json(MODEL_REVENUE, USAGE));
+
+    await modelDraftForDefinition(analyst, 'metric', REQUEST);
+    await modelDraftForDefinition(analyst, 'metric', REQUEST);
+
+    const logged = await calls(acme);
+    expect(logged).toHaveLength(2);
+    expect(logged.map(row => row.actorEmail)).toEqual([analyst.email, analyst.email]);
+    expect(logged[0]!.turnId).not.toBe(logged[1]!.turnId);
+  });
 });
 
 /** 手写目录输入里定义所属的空间：目录只记录它，不按它过滤（ADR-0048） */
