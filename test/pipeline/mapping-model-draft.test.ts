@@ -364,6 +364,22 @@ describe('用模型生成映射草稿', () => {
     expect(String(audit.detail.error)).toContain('HTTP 500');
     expect(JSON.stringify(audit.detail)).not.toContain('sk-platform-secret');
   });
+
+  it('客户端中止（#1252）：422「模型生成草稿失败：请求已取消」，不写生成记录，无 failed / partial 审计', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    platformDefault();
+    // 假 fetch 不理 signal，照常返回：回复到手但客户端已中止，紧接着的检查要把它拦下来（照 knowledge-import 的 #1251 写法）
+    const controller = new AbortController();
+    fakeLlm(setLlmFetch, () => { controller.abort(); return json(MODEL_ORDERS, USAGE); });
+
+    const e = await failure(modelDraftFor(author, sourceId, 'orders', 'order', null, controller.signal));
+    expect(e).toBeInstanceOf(MappingError);
+    expect(e).toMatchObject({ status: 422, message: '模型生成草稿失败：请求已取消' });
+    // 中止不是模型失败：生成记录与 failed / partial 审计都没有
+    expect(await generations(acme)).toHaveLength(0);
+    expect(await failures(acme)).toHaveLength(0);
+    expect(await partials(acme)).toHaveLength(0);
+  });
 });
 
 describe('记录成员对生成草稿的修改', () => {
@@ -503,6 +519,22 @@ describe('用模型建议断言', () => {
     expect(await generations(acme)).toHaveLength(0);
     const [audit] = await failures(acme);
     expect(audit).toMatchObject({ targetType: 'source', targetId: sourceId, detail: { mappingId: mapping.id, sourceId, table: 'orders', entity: 'order', kind: 'assertions', stage: 'model' } });
+  });
+
+  it('客户端中止（#1252）：422「模型建议断言失败：请求已取消」，不写生成记录，无 failed 审计', async () => {
+    const { acme, author, sourceId } = await tenantWithSource();
+    const mapping = await createMapping(author, sourceId, ORDERS);
+    platformDefault();
+    // 假 fetch 不理 signal，照常返回：断言建议到手但客户端已中止，紧接着的检查要把它拦下来
+    const controller = new AbortController();
+    fakeLlm(setLlmFetch, () => { controller.abort(); return json(MODEL_ASSERTIONS, USAGE); });
+
+    const e = await failure(modelAssertionsForMapping(author, mapping.id, controller.signal));
+    expect(e).toBeInstanceOf(MappingError);
+    expect(e).toMatchObject({ status: 422, message: '模型建议断言失败：请求已取消' });
+    // 中止不是模型失败：生成记录与 failed 审计都没有
+    expect(await generations(acme)).toHaveLength(0);
+    expect(await failures(acme)).toHaveLength(0);
   });
 
   it('替换后的 YAML 过不了校验（不存在的字段、敏感字段用 range）时 422：审计只记阶段、问题数与位置，不含理由与取值', async () => {
