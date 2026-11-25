@@ -327,6 +327,12 @@ const ACTIONS = {
     label: '解析知识来源',
     describe: (d: Detail) => `「${d.title}」（${knowledgeSourceKindLabel(d.kind)}，第 ${d.version} 版）：新建 ${d.created} 条，已有 ${d.existing}、拒绝过 ${d.rejected}、不合法 ${d.invalid}、依据已变 ${d.stale}`,
   },
+  // 解析失败（ADR-0035 失败审计，照 suggest-run 先例）：detail 只有 sourceId、标题、种类、版本、stage 与错误摘要
+  // （e.message 前 200 字，Key 已由 llm.ts 抹掉），不记段落原文、提示词与模型输出。也不进 CATALOG_ACTIONS（没有目录变更）
+  'knowledge_source.parse_failed': {
+    label: '解析知识来源失败',
+    describe: (d: Detail) => `「${d.title}」（${knowledgeSourceKindLabel(d.kind)}，第 ${d.version} 版），模型服务：${d.error}`,
+  },
   // 分析主题与主题归属（ADR-0046）：detail 只有 subjectId（与 targetId），不记主题名
   'analysis_subject.created': { label: '新建分析主题', describe: subjectTarget },
   'analysis_subject.renamed': { label: '修改分析主题名', describe: subjectTarget },
