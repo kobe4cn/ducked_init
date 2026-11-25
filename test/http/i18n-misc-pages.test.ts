@@ -1,6 +1,7 @@
 // test/http/i18n-misc-pages.test.ts —— 模型调用页、敏感字段查看与登录验证页接入双语后的整页断言（#1047，ADR-0060）：
 // 英文界面（CRM_ENABLE_EN_LOCALE + crm_locale cookie）下三个页面写死的文字没有汉字——模型调用页（页头、统计卡、两张表、
-// 分页、来源列；金额列来自服务端 formatCost，#1126 不在本票，夹具给用到的模型配好单价，金额列只剩数字）、
+// 分页、来源列；#1254 加「超时」表头与 ?tab=turns 的轮次表：视图 / 时间窗两组 tab、表头、发起人与分页都是英文，种入带 turn_id 的行才看得到表；
+// 金额列来自服务端 formatCost，#1126 不在本票，夹具给用到的模型配好单价，金额列只剩数字）、
 // 敏感字段查看页（表单、下拉选项与明文面板——标准实体名与字段名经 builtinName 显示英文）、未登录的登录验证页
 // （无 token 与 POST 无效 token 的英文报错）；两份词典的英文值里没有 standard layer（统一 Silver layer）；
 // 中文界面输出与改造前一致（抽查各页一句中文与 auth.verify 的中文报错）。源名、表名、明文与错误文字全 ASCII（数据值不翻）
@@ -76,7 +77,7 @@ describe('英文界面：模型调用页', () => {
     await price('m-fast', '2', '6', 'CNY');
     await price('m-reason', '1', '3', 'CNY');
     await call(acme, { promptTokens: 10, completionTokens: 5, durationMs: 100, schemaValid: true, source: 'tenant' });
-    await call(acme, { purpose: 'mapping_draft', model: 'm-reason', promptTokens: 100, completionTokens: 50, durationMs: 400, schemaValid: false, error: 'HTTP 500 upstream broke', source: 'platform' });
+    await call(acme, { purpose: 'mapping_draft', model: 'm-reason', promptTokens: 100, completionTokens: 50, durationMs: 400, schemaValid: false, error: 'HTTP 500 upstream broke', source: 'platform', turnId: crypto.randomUUID(), actorEmail: 'de@acme.com', cachedTokens: 3 });
 
     const admin = await loginAs(app, 'admin@acme.com');
     admin.store('crm_locale=en; Path=/');
@@ -89,8 +90,8 @@ describe('英文界面：模型调用页', () => {
     // 统计卡：来源卡按租户 / 平台端点分开计数，错误卡的失败次数是 ICU 复数
     expect(html).toContain('Tenant 1 / Platform 1');
     expect(html).toContain('1 failure');
-    // 两张表的表头
-    for (const head of ['Purpose</th>', 'Calls</th>', 'Avg latency</th>', 'P95 latency</th>', 'Schema pass rate</th>', 'Validation pass rate</th>', 'Errors</th>', 'Amount</th>', 'Time</th>', 'Model</th>', 'Source</th>', 'Input tokens</th>', 'Output tokens</th>', 'Duration</th>', 'Schema</th>']) {
+    // 两张表的表头（「超时」列 #1254）
+    for (const head of ['Purpose</th>', 'Calls</th>', 'Avg latency</th>', 'P95 latency</th>', 'Schema pass rate</th>', 'Validation pass rate</th>', 'Errors</th>', 'Timeouts</th>', 'Amount</th>', 'Time</th>', 'Model</th>', 'Source</th>', 'Input tokens</th>', 'Output tokens</th>', 'Duration</th>', 'Schema</th>']) {
       expect(html).toContain(head);
     }
     // 明细里的 Schema 校验结果与分页
@@ -99,6 +100,19 @@ describe('英文界面：模型调用页', () => {
     expect(html).toContain('Page 1 of 1, 50 rows per page');
     // 金额列只剩数字（部分模型未配单价时 formatCost 会下发中文，归 #1126）
     expect(html).toContain('CNY');
+
+    // 「按轮次」视图（#1254）：整页同样没有汉字（种入一条带 turn_id 的行，否则只看到空状态），
+    // 视图与时间窗两组 tab、轮次表头、发起人与分页都是英文
+    const turns = stripScripts(await (await admin.get('/llm-usage?days=7&tab=turns')).text());
+    expect(turns).not.toMatch(/[一-鿿]/);
+    expect(turns).toContain('By purpose');
+    expect(turns).toContain('By turn');
+    expect(turns).toContain('Last 30 days');
+    for (const head of ['Started at</th>', 'Initiator</th>', 'Purpose</th>', 'Requests</th>', 'Tokens (input / output)</th>', 'Cached tokens</th>']) {
+      expect(turns).toContain(head);
+    }
+    expect(turns).toContain('de@acme.com');
+    expect(turns).toContain('Page 1 of 1, 50 rows per page');
   });
 });
 
