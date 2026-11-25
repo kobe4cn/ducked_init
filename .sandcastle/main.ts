@@ -46,6 +46,7 @@ import {
   AllProfilesLimited, CLAUDE_LIMIT_PATTERN, agentFor, limitResetAt, recordUsage, reloadModels, runWithProfile, sessionPeak, usageTable,
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
+import { createGateQueue } from "./gate-queue.ts";
 import { blockersOf, changedFiles, type FlakySighting, flakyTickets, flakyTriage, splitChildren } from "./guide.ts";
 import { acceptanceSection, assistantTexts, checkAcceptanceNotes, replaceSection, restSections, runTagged } from "./pr-body.ts";
 
@@ -306,8 +307,9 @@ stage /tmp/gate-test.log $testcmd || exit 1
 // 完整 76.6 分钟（失败）、精简 37.7 分钟，比先后跑（约 33 + 21 分钟）还慢。
 // 排上队的门槛独占一份连接预算，用 8 个 worker（约 300 个连接）；agent 自己在另一个沙箱跑测试仍是 4 个
 // worker（约 150 个），所以宿主机 PG 要 max_connections ≥ 600（db_script/pg_setup.sh）。
+// 票的门槛优先：main 的兜底完整测试只在没有票等门槛时才开跑（.sandcastle/gate-queue.ts）。
 const GATE_WORKERS = "8";
-let gateQueue: Promise<unknown> = Promise.resolve();
+const gateQueue = createGateQueue();
 type ExecResult = { stdout: string; exitCode: number };
 const minutes = (ms: number) => (ms / 60_000).toFixed(1);
 
@@ -316,6 +318,7 @@ async function runGate<R extends ExecResult>(
   exec: (command: string) => Promise<R>,
   issueId: string,
   env: Record<string, string>,
+  opts: { low?: boolean } = {},
 ): Promise<R> {
   const queued = Date.now();
   const go = async () => {
@@ -327,9 +330,7 @@ async function runGate<R extends ExecResult>(
     console.log(`  ⏱ #${issueId} ${took}，${r.exitCode === 0 ? "通过" : "失败"}`);
     return { ...r, stdout: `${r.stdout}\nGATE_TIME: ${took}` };
   };
-  const run = gateQueue.then(go);
-  gateQueue = run.catch(() => {});
-  return run;
+  return gateQueue.run(go, opts);
 }
 
 // 仓库用 pnpm（package.json 的 packageManager）。拷进来的 node_modules 是宿主机 darwin 的，
@@ -1347,7 +1348,8 @@ async function land(issue: Issue, outcome: PromiseSettledResult<Awaited<ReturnTy
 // ---------------------------------------------------------------------------
 // main 上定期的兜底完整测试（2026-11-24）
 // ---------------------------------------------------------------------------
-// 按依赖选测试的票每合并 MAIN_CHECK_EVERY 张，对当时的 origin/main 跑一次完整测试（和票的门槛排同一个队）。
+// 按依赖选测试的票每合并 MAIN_CHECK_EVERY 张，对当时的 origin/main 跑一次完整测试（和票的门槛排同一个队，
+// 但让票先跑：有票在等门槛时兜底一直往后让，没有票在等才开跑）。
 // 兜住依赖图漏选，和「两张票各自通过、合在一起才坏」。失败就开一张带 LABEL.mainBroken 的修复票（调度时排最前），
 // 自动合并照常、不暂停。状态存在 MAIN_CHECK_FILE：重启后接着计数，失败票里列出上次通过以来进 main 的提交。
 const MAIN_CHECK_EVERY = 4;
@@ -1388,7 +1390,7 @@ async function runMainFullCheck() {
   let gate: ExecResult;
   const sandbox = await sandcastle.createSandbox({ branch, baseBranch: BASE_REF, sandbox: sandboxFor(env), hooks, copyToWorktree });
   try {
-    gate = await runGate((c) => sandbox.exec(c), MAIN_CHECK_ID, { ...env, GATE_FULL: "1" });
+    gate = await runGate((c) => sandbox.exec(c), MAIN_CHECK_ID, { ...env, GATE_FULL: "1" }, { low: true });
   } finally {
     await sandbox.close();
     await dropTestResources(MAIN_CHECK_ID);

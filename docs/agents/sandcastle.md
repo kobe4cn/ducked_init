@@ -70,7 +70,7 @@ GitHub CI 不作为门槛。
   - 改到 `FULL_PATHS`：依赖图看不到的测试基础设施，`vitest.config.ts`、`vite.config.ts`、`test/global-setup.ts`、`test/setup-env.ts`、`test/http/harness.ts`、`drizzle/`、`package.json`、`pnpm-lock.yaml`、`.sandcastle/Containerfile`。发现新的盲区就加进这份名单。
   - 选中的 pipeline 文件超过总数一半：改 `llm.ts`、`schema.ts`、`audit.ts`、`model-draft.ts` 这类核心模块时依赖图几乎全选（80 多个），挑着跑省不了多少。
   - `vitest related` 失败或超时（300 秒）；`GATE_FULL=1`。
-- **兜底**：按依赖选测试的票每合并 4 张（`MAIN_CHECK_EVERY`），脚本在后台对当时的 `origin/main` 跑一次完整测试（`runMainFullCheck`，和票的门槛排同一个队，测试资源后缀 `_imain`）。兜住依赖图漏选，和两张票各自通过、合在一起才坏的情况。计数和上次通过的提交存在 `.sandcastle/logs/main-check.json`，重启后接着算。失败时开一张 `sandcastle:main-broken` + `Sandcastle` + `ready-for-agent` 的修复票，正文列出失败摘要和上次通过以来进 main 的提交；调度和 prep 时这类票排最前。自动合并照常，不暂停。已有 open 的修复票时只在上面追加评论。
+- **兜底**：按依赖选测试的票每合并 4 张（`MAIN_CHECK_EVERY`），脚本在后台对当时的 `origin/main` 跑一次完整测试（`runMainFullCheck`，测试资源后缀 `_imain`）。它和票的门槛排同一个队，但票优先（`.sandcastle/gate-queue.ts`）：有票在等门槛时兜底一直往后让，没有票在等才开跑；已经开跑的不打断。兜住依赖图漏选，和两张票各自通过、合在一起才坏的情况。计数和上次通过的提交存在 `.sandcastle/logs/main-check.json`，重启后接着算。失败时开一张 `sandcastle:main-broken` + `Sandcastle` + `ready-for-agent` 的修复票，正文列出失败摘要和上次通过以来进 main 的提交；调度和 prep 时这类票排最前。自动合并照常，不暂停。已有 open 的修复票时只在上面追加评论。
 
 上线前用历史门槛失败验证过（12 个 `test/pipeline` 失败样例，在各 PR 当时的提交上重跑选测试）：9 个退回完整测试，1 个按依赖选且选中了失败的文件，2 个没选中的都是环境原因的失败（2026-11-07 三个门槛同时跑超时、数据湖认证失败），和改动无关。同一套规则下，最近 9 个 PR 里 6 个走按依赖选（pipeline 只跑 0–7 个文件），#1203、#1205、#1200 原来都要跑完整测试。
 
