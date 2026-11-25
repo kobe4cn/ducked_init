@@ -108,6 +108,7 @@ export async function usageByPurpose(tenantId: string, days: 7 | 30) {
     calls: sql<number>`count(*)`,
     promptTokens: sql<number>`coalesce(sum(${llmCalls.promptTokens}), 0)`,
     completionTokens: sql<number>`coalesce(sum(${llmCalls.completionTokens}), 0)`,
+    cachedTokens: sql<number>`coalesce(sum(${llmCalls.cachedTokens}), 0)`,
   });
   const [grouped, [total], byPurposeModel, bySource, prices, draftCheck] = await Promise.all([
     db.select({ purpose: llmCalls.purpose, ...agg() }).from(llmCalls)
@@ -121,12 +122,13 @@ export async function usageByPurpose(tenantId: string, days: 7 | 30) {
     draftCheckStats(tenantId, days),
   ]);
   // pg 的 count / sum 是字符串，先 Number()（照 toUsage）；金额在各币种内先累加，最后由 formatCost 统一保留 4 位小数
-  const costOfGroups = (groups: { model: string; calls: unknown; promptTokens: unknown; completionTokens: unknown }[]) =>
+  const costOfGroups = (groups: { model: string; calls: unknown; promptTokens: unknown; completionTokens: unknown; cachedTokens: unknown }[]) =>
     formatCost(summarizeCost(groups.map(g => ({
       model: g.model,
       calls: Number(g.calls ?? 0),
       promptTokens: Number(g.promptTokens ?? 0),
       completionTokens: Number(g.completionTokens ?? 0),
+      cachedTokens: Number(g.cachedTokens ?? 0),
     })), prices));
   // 「调用来源」卡（#844）：没有的那项为 0；pg 的 count 是字符串，先 Number()（照 toUsage）
   const bySourceCount = { tenant: 0, platform: 0, unknown: 0 };
@@ -175,6 +177,7 @@ export async function usageAcrossTenants(days: 7 | 30): Promise<TenantModelUsage
       calls: sql<number>`count(*)`,
       promptTokens: sql<number>`coalesce(sum(${llmCalls.promptTokens}), 0)`,
       completionTokens: sql<number>`coalesce(sum(${llmCalls.completionTokens}), 0)`,
+      cachedTokens: sql<number>`coalesce(sum(${llmCalls.cachedTokens}), 0)`,
       errors: sql<number>`count(*) filter (where ${llmCalls.error} is not null)`,
     }).from(llmCalls)
       .innerJoin(tenants, eq(tenants.id, llmCalls.tenantId))
@@ -187,6 +190,7 @@ export async function usageAcrossTenants(days: 7 | 30): Promise<TenantModelUsage
     const calls = Number(r.calls ?? 0);
     const promptTokens = Number(r.promptTokens ?? 0);
     const completionTokens = Number(r.completionTokens ?? 0);
+    const cachedTokens = Number(r.cachedTokens ?? 0);
     return {
       tenantName: r.tenantName,
       model: r.model,
@@ -196,7 +200,7 @@ export async function usageAcrossTenants(days: 7 | 30): Promise<TenantModelUsage
       promptTokens,
       completionTokens,
       errors: Number(r.errors ?? 0),
-      cost: formatCost(summarizeCost([{ model: r.model, calls, promptTokens, completionTokens }], prices)),
+      cost: formatCost(summarizeCost([{ model: r.model, calls, promptTokens, completionTokens, cachedTokens }], prices)),
     };
   }).sort((a, b) => cmpName(a.tenantName, b.tenantName) || cmp(a.model, b.model) || cmp(a.purpose, b.purpose)
     || sourceRank(a.source) - sourceRank(b.source));
@@ -204,7 +208,7 @@ export async function usageAcrossTenants(days: 7 | 30): Promise<TenantModelUsage
 
 /** 明细行取 `llm_calls` 的一部分列（见 listCalls 的 select）加折算好的金额 */
 export type LlmCallRow = Pick<typeof llmCalls.$inferSelect,
-  'id' | 'createdAt' | 'purpose' | 'model' | 'source' | 'promptTokens' | 'completionTokens' | 'durationMs' | 'schemaValid' | 'error'> & { cost: string };
+  'id' | 'createdAt' | 'purpose' | 'model' | 'source' | 'promptTokens' | 'completionTokens' | 'cachedTokens' | 'durationMs' | 'schemaValid' | 'error'> & { cost: string };
 
 /** 最近调用明细（时间倒序）分页：页码夹到 1..pages，total 是窗口内的总条数；每行按当前单价折算金额（ADR-0057） */
 export async function listCalls(tenantId: string, days: 7 | 30, page: number) {
@@ -224,6 +228,7 @@ export async function listCalls(tenantId: string, days: 7 | 30, page: number) {
     source: llmCalls.source,
     promptTokens: llmCalls.promptTokens,
     completionTokens: llmCalls.completionTokens,
+    cachedTokens: llmCalls.cachedTokens,
     durationMs: llmCalls.durationMs,
     schemaValid: llmCalls.schemaValid,
     error: llmCalls.error,
@@ -233,7 +238,7 @@ export async function listCalls(tenantId: string, days: 7 | 30, page: number) {
   // 单行也走 summarizeCost / formatCost（calls: 1），与统计口径一致
   const rows: LlmCallRow[] = picked.map(r => ({
     ...r,
-    cost: formatCost(summarizeCost([{ model: r.model, promptTokens: r.promptTokens, completionTokens: r.completionTokens, calls: 1 }], prices)),
+    cost: formatCost(summarizeCost([{ model: r.model, promptTokens: r.promptTokens, completionTokens: r.completionTokens, cachedTokens: r.cachedTokens, calls: 1 }], prices)),
   }));
   return { rows, total, page: current, pages };
 }

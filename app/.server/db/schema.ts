@@ -793,13 +793,15 @@ export const llmCalls = platform.table('llm_calls', {
   createdAt: createdAt(),
 }, t => [index('llm_calls_tenant_created_idx').on(t.tenantId, t.createdAt)]);
 
-// 模型单价（ADR-0057）：llm_calls.model 原值 → 每百万 token 的输入 / 输出单价，运营者在运营后台维护（ADR-0007）。
+// 模型单价（ADR-0057）：llm_calls.model 原值 → 每百万 token 的输入 / 输出 /（可选）缓存输入单价，运营者在运营后台维护（ADR-0007）。
 // 金额按查看时的当前单价折算，不保留历史版本，每次改动的前后值与删除前的值在审计里；可增改可删除
 export const modelPrices = platform.table('model_prices', {
   id: uuid('id').primaryKey().defaultRandom(),
   model: text('model').notNull().unique(),
   inputPerMTok: numeric('input_per_m_tok', { precision: 12, scale: 4 }).notNull(),
   outputPerMTok: numeric('output_per_m_tok', { precision: 12, scale: 4 }).notNull(),
+  // 缓存输入单价（#1255）：可空，没配（null）时缓存 token 按输入单价折算；表单维护在 #1256
+  cachedInputPerMTok: numeric('cached_input_per_m_tok', { precision: 12, scale: 4 }),
   currency: text('currency').notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   updatedBy: uuid('updated_by'),
