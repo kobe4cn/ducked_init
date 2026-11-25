@@ -56,9 +56,11 @@ export class LlmError extends Error {
    *  timeout：超时（masked 填，此时 transient 也为 true）。logged 的重试只认 transient 且不是超时的——超时再等一轮太久（ADR-0035）；
    *  aborted：外部 signal 中止（#1248），此时 transient 与 timeout 都是 false；
    *  kind：入库的错误分类（#1253），logged 原样写进 llm_calls.error_kind，目前只有超时 'timeout'（masked 填）。
-   *  与 timeout 分开：timeout 管重试与文案，kind 只管日志怎么分类；其余错误（aborted、5xx、429、Schema 不合）都是 undefined */
+   *  与 timeout 分开：timeout 管重试与文案，kind 只管日志怎么分类；其余错误（aborted、5xx、429、Schema 不合）都是 undefined；
+   *  truncated：输出被截断（finish_reason === 'length'，callModel 填）。不是 transient（logged 不重试），调用方拿到它可以
+   *  对输入做拆分重试（知识导入把截断的块对半拆开再调，#1275），判断只认这个字段、不匹配错误消息文本 */
   constructor(message: string, readonly transient = false, readonly status?: number, readonly timeout = false, readonly aborted = false,
-    readonly kind?: 'timeout') { super(message); }
+    readonly kind?: 'timeout', readonly truncated = false) { super(message); }
 }
 
 /** 租户 API Key 的加密 context（ADR-0009），解密时须给出同一个 */
@@ -296,7 +298,8 @@ async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeou
     throw new LlmError(maskKey(apiKey, e instanceof LlmError ? e.message
       : timedOut ? `模型服务 ${timeout / 1000} 秒内没有返回`
       : `调用模型服务失败：${e instanceof Error ? e.message : String(e)}`), e instanceof LlmError ? e.transient : true,
-      e instanceof LlmError ? e.status : undefined, wasTimeout, false, wasTimeout ? 'timeout' : undefined);
+      e instanceof LlmError ? e.status : undefined, wasTimeout, false, wasTimeout ? 'timeout' : undefined,
+      e instanceof LlmError ? e.truncated : false);
   }
 }
 
@@ -440,7 +443,7 @@ export async function callModel<T>(provider: LlmProvider, messages: LlmMessage[]
     const { content, finishReason } = reply;
     if (typeof content !== 'string') throw new LlmError('模型服务的返回里没有 choices[0].message.content');
     // 截断检查放在解析之前：截断的输出多半也不是合法 JSON，先报原因更清楚（schemaValid 留 null）
-    if (finishReason === 'length') throw new LlmError(zh(msg('模型输出被截断（达到输出长度上限），请把需求写得更具体，或换上下文更长的模型')));
+    if (finishReason === 'length') throw new LlmError(zh(msg('模型输出被截断（达到输出长度上限），请把需求写得更具体，或换上下文更长的模型')), false, undefined, false, false, undefined, true);
     // 思考模型在正文前输出 <think>…</think>：先去掉；有的模型把 JSON 包在 ```json … ``` 代码块里：去掉外壳；
     // 整段不是 JSON 时（前后带说明文字）取第一个完整的 JSON 对象
     const body = stripThink(content).trim();

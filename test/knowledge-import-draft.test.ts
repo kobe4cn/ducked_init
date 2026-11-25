@@ -15,6 +15,7 @@ import {
 import { ALIAS_MAX_LENGTH } from '../app/.server/knowledge/aliases';
 import { NOTE_MAX_LENGTH } from '../app/.server/business-notes';
 import { CLAIM_TYPES } from '../app/lib/semantic-claims';
+import { schemaForModel } from '../app/.server/llm';
 
 const SPACE = '00000000-0000-0000-0000-000000000000';
 const NO_DEPS: DefinitionDependencies = { metrics: [], entities: [], fields: [] };
@@ -100,6 +101,12 @@ describe('IMPORT_SCHEMA', () => {
     const values = item.claim.properties.value.enum;
     for (const t of Object.values(CLAIM_TYPES)) for (const v of t.values) expect(values).toContain(v.value);
     expect(item.evidence.items.properties).toEqual({ paragraph: { type: 'integer' } });
+  });
+
+  it('proposals 有 maxItems: 50，发给模型的 schema（schemaForModel 精简后）里也保留', () => {
+    expect(IMPORT_SCHEMA.properties.proposals.maxItems).toBe(50);
+    const model = schemaForModel(IMPORT_SCHEMA) as typeof IMPORT_SCHEMA;
+    expect(model.properties.proposals.maxItems).toBe(50);
   });
 
   it('按 kind 要求对应字段：note 缺 note、alias 缺 alias、claim 缺 claim 都不通过，带上对应字段通过；报错是「缺哪个键」的 required', () => {
