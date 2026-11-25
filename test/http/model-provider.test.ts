@@ -4,7 +4,8 @@
 // fast / reasoning 档位（ADR-0055 路由③a）一张卡：只填模型名时沿用租户端点与 Key，没有自己的模型服务 400，恢复只清该档三列；非管理员 403；
 // 服务商参数（#1170）：chat 与档位表单的 chatExtra 存原文、回显，不带该字段不动已存值，非法 JSON / 平台字段 400，恢复默认后清空；
 // 向量存储（ADR-0058，#848）一张卡：选系统自带还是外部 pgvector，连接串加密不回显（假替身经 app.setPgvectorConnect 注入，不连真实地址），
-// 保存时先测连通失败不保存，审计只记 from / to / urlRotated，切回系统自带时已存的连接串保留
+// 保存时先测连通失败不保存，审计只记 from / to / urlRotated，切回系统自带时已存的连接串保留；
+// LLM_PURPOSE_TIER_OVERRIDES（#1277）：分档说明显示覆盖后的对照（data-tier-purposes-*），测连通性按该档当前管的第一个用途发请求
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -511,6 +512,29 @@ describe('模型服务页', () => {
     expect(jsonRequests.every(r => r.body.response_format?.type === 'json_object')).toBe(true);
     // 保存档位那次 + 默认 + fast，各记一条 connectivity
     expect((await connectivityCalls(acme)).map(c => c.route).sort()).toEqual(['fast', 'fast', null].sort());
+  });
+
+  it('LLM_PURPOSE_TIER_OVERRIDES 生效后：分档说明显示覆盖后的对照（data-tier-purposes-*），测连通性按该档当前管的用途发请求（#1277）', async () => {
+    const acme = await newTenant('acme');
+    const admin = await loginAs(app, 'admin@acme.com');
+    await save(admin);
+    vi.stubEnv('LLM_PURPOSE_TIER_OVERRIDES', '{"assertion_draft":"reasoning"}');
+
+    const page = await (await admin.get('/model-provider')).text();
+    expect(page).toContain('data-tier-purposes-reasoning="assistant,mapping_draft,metric_draft,tag_draft,workbench_draft,assertion_draft"');
+    expect(page).toContain('data-tier-purposes-fast="workbench_interpret,knowledge_proposal,knowledge_import,metric_parse"');
+    expect(page).toContain('管：AI 助手、起草映射、起草指标、起草标签、工作台起草、断言草稿');
+    expect(page).toContain('管：工作台结果解读、知识提案、知识导入、一句话解析');
+    expect(page).not.toContain('这类要快的用途');
+
+    // fast 档的第一个用途被挪走后，ping 走该档剩下的第一个用途（照旧用 assertion_draft 会解析到 reasoning 档、显示「使用默认」）
+    fakeLlm(setLlm, ok);   // tier_save 保存前会先 ping 一次档位模型
+    expect((await tierSave(admin, 'fast', 'qwen-flash')).status).toBe(302);
+    const { received } = fakeLlm(setLlm, ok);   // 换一批假答复，只看测试连通性这次的请求
+    const tested = await (await admin.post('/model-provider', { intent: 'test' })).text();
+    expect(tested).toContain('data-connectivity-fast="ok"');
+    expect(tested).toContain('data-connectivity-reasoning="default"');
+    expect(received.filter(r => !r.body.tools).map(r => r.body.model)).toEqual(['deepseek-chat', 'qwen-flash']);
   });
 
   it('测试连通性时一并探测工具调用：返回 tool_calls 显示支持，400 提示不支持，只回文本提示没能确认，连通结果照旧；每次记一条 tool_probe', async () => {

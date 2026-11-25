@@ -1,6 +1,7 @@
 // app/routes/model-provider.tsx —— 模型服务（仅管理员）：看当前用平台默认还是本租户配置；保存端点、模型名与 API Key（Key 不回显，留空沿用）、
 // 恢复平台默认、测试连通性（同时显示是否支持工具调用）、开关发送脱敏样本；embedding 端点（ADR-0049）单独一张卡，与 chat 互不影响；
-// fast / reasoning 档位（ADR-0055 路由③a）再一张卡，按用途换模型，端点留空沿用本租户的端点与 Key；chat 与两档各有可选的服务商参数（#1170，JSON 对象，如关思考）；
+// fast / reasoning 档位（ADR-0055 路由③a）再一张卡，按用途换模型，端点留空沿用本租户的端点与 Key；
+// 分档说明显示 LLM_PURPOSE_TIER_OVERRIDES 生效后每一档实际管的用途（#1277，loader 传 tierPurposes）；chat 与两档各有可选的服务商参数（#1170，JSON 对象，如关思考）；
 // 向量存储（ADR-0058，#848）一张卡：选系统自带还是外部 pgvector，连接串加密不回显，保存时先测连通失败不保存；向量检索卡显示上次补算的时间或失败原因（#1173）
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { AlertTriangle, CheckCircle2, CircleAlert } from 'lucide-react';
@@ -9,6 +10,7 @@ import { requirePermission } from '~/.server/access';
 import { prefetchEmbeddings } from '~/.server/catalog/versions';
 import { errorTextFor, formatServer } from '~/.server/i18n';
 import { getLocale } from '~/.server/locale';
+import { tiersByPurpose, type LlmPurpose } from '~/.server/llm';
 import {
   getModelProvider, ModelProviderError, resetEmbeddingProvider, resetModelProvider, resetTierProvider, SAMPLE_ROWS, saveEmbeddingProvider,
   saveModelProvider, saveTierProvider, saveVectorStore, setAllowSamples, testEmbeddingProvider, testModelProvider, testVectorStore, type TierConnectivity,
@@ -33,7 +35,8 @@ export function meta({ matches }: Route.MetaArgs) {
 
 export async function loader({ request }: Route.LoaderArgs) {
   const member = await requirePermission(request, 'model_provider:manage');
-  return { email: member.email, nav: navFor(member), provider: await getModelProvider(member), sampleRows: SAMPLE_ROWS };
+  // tierPurposes：LLM_PURPOSE_TIER_OVERRIDES 生效后每一档实际管哪些用途（#1277），分档说明与之一致
+  return { email: member.email, nav: navFor(member), provider: await getModelProvider(member), sampleRows: SAMPLE_ROWS, tierPurposes: tiersByPurpose() };
 }
 
 export async function action({ request }: Route.ActionArgs) {
@@ -166,10 +169,21 @@ function EmbeddingFillStatus({ fill }: { fill: { at: string | null; error: strin
   return null;
 }
 
-/** 每档的名字与它管哪些用途（ADR-0055 的 PURPOSE_TIER 决定，页面只做说明） */
-const tierLabel = (t: T, tier: 'fast' | 'reasoning') => ({
-  fast: { title: t('快速档（fast）'), hint: t('断言草稿、工作台结果解读、一句话解析这类要快的用途') },
-  reasoning: { title: t('推理档（reasoning）'), hint: t('AI 助手、起草映射、指标、标签这类要推理的用途') },
+/** 用途 → 页面显示名（走 t() 接双语）。不分档的 connectivity / tool_probe / embedding 不进档位，不在表里 */
+const purposeLabel = (t: T, purpose: LlmPurpose) => ({
+  assistant: t('AI 助手'), mapping_draft: t('起草映射'), metric_draft: t('起草指标'), tag_draft: t('起草标签'), workbench_draft: t('工作台起草'),
+  assertion_draft: t('断言草稿'), workbench_interpret: t('工作台结果解读'), knowledge_proposal: t('知识提案'), knowledge_import: t('知识导入'), metric_parse: t('一句话解析'),
+})[purpose as Exclude<LlmPurpose, 'connectivity' | 'tool_probe' | 'embedding'>]!;
+
+/** 「管：A、B、C」一行：用途名逐个翻译后用顿号连起来 */
+const tierPurposesHint = (t: T, purposes: LlmPurpose[]) =>
+  t('管：{purposes}', { purposes: purposes.map(p => purposeLabel(t, p)).join('、') });
+
+/** 每档的名字与它当前实际管哪些用途（ADR-0055 的 PURPOSE_TIER + LLM_PURPOSE_TIER_OVERRIDES 生效后的对照，loader 传 tierPurposes，
+ *  页面只做说明）；连通测试那行只用 title，purposes 可以不传 */
+const tierLabel = (t: T, tier: 'fast' | 'reasoning', purposes?: LlmPurpose[]) => ({
+  fast: { title: t('快速档（fast）'), hint: purposes ? tierPurposesHint(t, purposes) : '' },
+  reasoning: { title: t('推理档（reasoning）'), hint: purposes ? tierPurposesHint(t, purposes) : '' },
 })[tier];
 
 /** 连通测试耗时超过 LLM_TIMEOUT_SECONDS 一半时的提示（#1213）：amber 加图标，颜色不是唯一信号 */
@@ -224,14 +238,15 @@ function ChatExtraField({ id, defaultValue, children }: { id: string; defaultVal
 }
 
 /** 「按用途选模型」卡片里的一档：当前绑定 + 换模型的表单。chatReady 是本租户的模型服务（chat 三项）是否已保存，没有时档位无从生效 */
-function TierSection({ tier, state, chatReady, submitting }: {
+function TierSection({ tier, state, purposes, chatReady, submitting }: {
   tier: 'fast' | 'reasoning';
   state: { model: string | null; baseUrl: string | null; apiKeySet: boolean; chatExtra: string | null };
+  purposes: LlmPurpose[];
   chatReady: boolean;
   submitting: boolean;
 }) {
   const t = useT();
-  const label = tierLabel(t, tier);
+  const label = tierLabel(t, tier, purposes);
   const bound = Boolean(state.model);
   let bindingText: string;
   if (!bound) bindingText = t('使用默认');
@@ -245,7 +260,7 @@ function TierSection({ tier, state, chatReady, submitting }: {
           <p className="text-sm text-slate-500" {...{ [`data-tier-${tier}`]: bound ? 'tenant' : 'default' }}>
             {bindingText}
           </p>
-          <p className="text-sm text-slate-400">{label.hint}</p>
+          <p className="text-sm text-slate-400" {...{ [`data-tier-purposes-${tier}`]: purposes.join(',') }}>{label.hint}</p>
         </div>
         {bound && (
           <Form
@@ -297,7 +312,7 @@ function TierSection({ tier, state, chatReady, submitting }: {
 }
 
 export default function ModelProvider({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, provider, sampleRows } = loaderData;
+  const { email, nav, provider, sampleRows, tierPurposes } = loaderData;
   const t = useT();
   const locale = useLocale();
   const submitting = useNavigation().state === 'submitting';
@@ -573,8 +588,8 @@ export default function ModelProvider({ loaderData, actionData }: Route.Componen
             ? t('两档可各自换模型；端点留空时沿用本租户的端点与 Key。')
             : t('先保存本租户的模型服务后档位才生效。')}
         </SectionHeader>
-        <TierSection tier="fast" state={provider.tiers.fast} chatReady={provider.source === 'tenant'} submitting={submitting} />
-        <TierSection tier="reasoning" state={provider.tiers.reasoning} chatReady={provider.source === 'tenant'} submitting={submitting} />
+        <TierSection tier="fast" state={provider.tiers.fast} purposes={tierPurposes.fast} chatReady={provider.source === 'tenant'} submitting={submitting} />
+        <TierSection tier="reasoning" state={provider.tiers.reasoning} purposes={tierPurposes.reasoning} chatReady={provider.source === 'tenant'} submitting={submitting} />
       </div>
 
       <div className="max-w-2xl space-y-4 rounded-2xl border bg-white p-6 shadow-sm">

@@ -5,13 +5,14 @@
 // 租户服务商参数（#1169）：租户默认 chat_extra 与档位的 fast_ / reasoning_chat_extra 进租户请求体（档位覆盖、只填模型名或带端点的档位继承默认），
 // 平台 LLM_*CHAT_EXTRA 不串进租户请求体；saveModelProvider / saveTierProvider 拒绝非对象 JSON 与受保护键、审计只记 chatExtraChanged、reset 清列；
 // LLM_TIMEOUT_SECONDS（#952）：控制 chat 超时与超时消息里的秒数，不是正整数时回落 60；
+// LLM_PURPOSE_TIER_OVERRIDES（#1277，ADR-0055 修订）：平台把单个用途改到另一档（purposeTier / tiersByPurpose，非法项告警后忽略），平台档位与租户档位都生效；
 // embedding 端点（ADR-0049）：租户 embedding 三项 > 平台 LLM_EMBEDDING_*（与 chat 互不影响），都没配置时 embed 返回 null；
 // tableContextFor：采集统计 + 允许时原始层的脱敏样本行
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, modelProviders } from '../../app/.server/db/schema';
-import { chatJson, chatTools, chatToolsWith, embed, embedWith, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch, setLlmSleep } from '../../app/.server/llm';
+import { chatJson, chatTools, chatToolsWith, embed, embedWith, LlmError, MODEL_PROVIDER_CONTEXT, purposeTier, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch, setLlmSleep, tiersByPurpose } from '../../app/.server/llm';
 import { ModelProviderError, resetModelProvider, resetTierProvider, saveModelProvider, saveTierProvider, tableContextFor } from '../../app/.server/model-provider';
 import { encryptForTenant } from '../../app/.server/secrets';
 import { syncSource } from '../../app/.server/source-sync';
@@ -732,6 +733,78 @@ describe('按用途选档位（ADR-0055）', () => {
     await expect(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)).rejects.toThrow(/未配置模型服务/);
     expect(f).not.toHaveBeenCalled();
     expect(await calls(acme)).toHaveLength(0);
+  });
+
+  it('LLM_PURPOSE_TIER_OVERRIDES 可把用途改到另一档（purposeTier / tiersByPurpose 返回生效后的对照）；没填或空串不告警，非法 JSON 或不是对象整体告警后忽略，未知用途、不分档的用途、null、未知档位逐项告警后跳过、其余项照常生效（#1277）', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const env = (raw: string): Record<string, string | undefined> => ({ LLM_PURPOSE_TIER_OVERRIDES: raw });
+
+    expect(purposeTier('metric_parse', env('{"metric_parse":"reasoning"}'))).toBe('reasoning');
+    expect(purposeTier('assistant', env('{"assistant":"fast"}'))).toBe('fast');
+    // 没填或空串：默认表，不告警
+    expect(purposeTier('metric_parse', {})).toBe('fast');
+    expect(purposeTier('metric_parse', env(''))).toBe('fast');
+    expect(tiersByPurpose({})).toEqual(tiersByPurpose(env('')));
+    expect(warn).not.toHaveBeenCalled();
+
+    // 非法 JSON、数组、标量：整体忽略并告警一次，告警带原文
+    for (const raw of ['{bad', '[{"metric_parse":"reasoning"}]', '"fast"', 'null', '3']) {
+      warn.mockClear();
+      expect(purposeTier('metric_parse', env(raw)), raw).toBe('fast');
+      expect(warn, raw).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(`LLM_PURPOSE_TIER_OVERRIDES=${JSON.stringify(raw)}`));
+    }
+
+    // 逐项非法（未知用途、connectivity / tool_probe / embedding 不分档、档位不是 fast / reasoning、值为 null）：各告警一次后跳过，其余合法项照常生效
+    warn.mockClear();
+    const mixed = env(JSON.stringify({
+      metric_parse: 'reasoning', assistant: 'fast', nope: 'fast', connectivity: 'fast', tool_probe: 'reasoning', embedding: 'fast',
+      metric_draft: 'ultra', tag_draft: null,
+    }));
+    expect(tiersByPurpose(mixed)).toEqual({
+      fast: ['assistant', 'assertion_draft', 'workbench_interpret', 'knowledge_proposal', 'knowledge_import'],
+      reasoning: ['mapping_draft', 'metric_draft', 'tag_draft', 'workbench_draft', 'metric_parse'],
+    });
+    expect(warn).toHaveBeenCalledTimes(6);
+    expect(warn.mock.calls.map(c => String(c[0]))).toEqual([
+      expect.stringContaining('nope'),
+      expect.stringContaining('connectivity'),
+      expect.stringContaining('tool_probe'),
+      expect.stringContaining('embedding'),
+      expect.stringContaining('metric_draft'),
+      expect.stringContaining('tag_draft'),
+    ]);
+    for (const call of warn.mock.calls) expect(String(call[0])).toContain(`LLM_PURPOSE_TIER_OVERRIDES=${JSON.stringify(mixed.LLM_PURPOSE_TIER_OVERRIDES)}`);
+    expect(tiersByPurpose(env('{"metric_parse":"reasoning"}')).fast).not.toContain('metric_parse');
+  });
+
+  it('LLM_PURPOSE_TIER_OVERRIDES 把 metric_parse 挪到 reasoning：平台档位变量对覆盖后的档位生效，llm_calls.route 记 reasoning（#1277）', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    platformTier('reasoning', 'qwen-max');
+    vi.stubEnv('LLM_PURPOSE_TIER_OVERRIDES', '{"metric_parse":"reasoning"}');
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
+    await chatJson(acme, 'assertion_draft', MESSAGES, SCHEMA);
+
+    expect(received[0].body.model).toBe('qwen-max');
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'metric_parse', model: 'qwen-max', route: 'reasoning', fallbackReason: null });
+    expect(received[1].body.model).toBe('qwen-plus');
+    expect((await calls(acme))[1]).toMatchObject({ purpose: 'assertion_draft', route: 'fast', fallbackReason: 'unbound' });
+  });
+
+  it('租户自配档位时覆盖同样生效：metric_parse 挪到 reasoning 后用租户 reasoning 档的模型（#1277）', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    await tenantProvider(acme, { fast: { model: 'deepseek-chat-fast' }, reasoning: { model: 'deepseek-reasoner' } });
+    vi.stubEnv('LLM_PURPOSE_TIER_OVERRIDES', '{"metric_parse":"reasoning"}');
+    const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
+
+    expect(received[0].body.model).toBe('deepseek-reasoner');
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'metric_parse', route: 'reasoning', fallbackReason: null });
   });
 });
 
