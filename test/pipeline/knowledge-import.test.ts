@@ -272,6 +272,28 @@ describe('把知识来源解析成知识提案', () => {
     ]);
   });
 
+  it('分块后第 2 块失败时整次 422、第 1 块的提案也不落库、记一条 parse_failed', async () => {
+    // 同上：12 段各约 800 字，第 1 块装第 1–7 段、第 2 块装第 8–12 段
+    const paragraphs = Array.from({ length: 12 }, (_, i) => `第${i + 1}段的口径说明。${'甲'.repeat(790)}`);
+    const { acme, analyst, source } = await setup(paragraphs.join('\n\n'));
+    platformDefault();
+    // 按请求里的段号判断第几块（500 会重试 1 次，#1215，不能按 n 判断）：第 1 块正常回提案，第 2 块一律 500
+    fakeLlm(setLlmFetch, (_n, body) => {
+      const input = JSON.parse(body.messages[1]!.content) as { paragraphs: { no: number }[] };
+      if (input.paragraphs[0]!.no !== 1) return new Response('boom', { status: 500 });
+      return json({ proposals: input.paragraphs.map(p => (
+        { kind: 'alias', targetId: 'metric:paid_revenue', alias: `第${p.no}段的叫法`, evidence: [{ paragraph: p.no }], reason: `第 ${p.no} 段独有` }
+      )) }, USAGE);
+    });
+
+    const e = await importFromSource(analyst, source.id).then(() => { throw new Error('应当失败'); }, (err: unknown) => err);
+    expect(e).toBeInstanceOf(ImportError);
+    expect(e).toMatchObject({ status: 422 });
+    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
+    expect(await auditsOf(acme, 'knowledge_source.parse_failed')).toHaveLength(1);
+    expect(await auditsOf(acme, 'knowledge_source.parsed')).toHaveLength(0);
+  });
+
   it('模型失败 422 且不留提案、在事务外记 parse_failed 审计（detail 只有那几个键，error 截到 200 字、不含 Key 与段落原文）；查看者 403；未配置模型服务 409 且不发请求；来源不存在 400', async () => {
     const { acme, analyst, viewer, source } = await setup();
     platformDefault();
