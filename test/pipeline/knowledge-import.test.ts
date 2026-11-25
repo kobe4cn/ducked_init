@@ -297,7 +297,8 @@ describe('把知识来源解析成知识提案', () => {
   it('模型失败 422 且不留提案、在事务外记 parse_failed 审计（detail 只有那几个键，error 截到 200 字、不含 Key 与段落原文）；查看者 403；未配置模型服务 409 且不发请求；来源不存在 400', async () => {
     const { acme, analyst, viewer, source } = await setup();
     platformDefault();
-    fakeLlm(setLlmFetch, () => new Response('upstream sk-platform-secret exploded', { status: 500 }));
+    // 响应体够长，让 e.message 超过 200 字，才能验证 error 截到前 200 字
+    fakeLlm(setLlmFetch, () => new Response('upstream sk-platform-secret exploded ' + 'x'.repeat(400), { status: 500 }));
 
     const failure = (p: Promise<unknown>) => p.then(() => { throw new Error('应当失败'); }, (e: unknown) => e as ImportError);
     const e = await failure(importFromSource(analyst, source.id));
@@ -312,7 +313,11 @@ describe('把知识来源解析成知识提案', () => {
         stage: 'model', error: expect.stringContaining('500') } });
     expect(Object.keys(audit!.detail as Record<string, unknown>).sort())
       .toEqual(['error', 'kind', 'sourceId', 'stage', 'title', 'version']);
-    expect((audit!.detail as { error: string }).error.length).toBeLessThanOrEqual(200);
+    const error = (audit!.detail as { error: string }).error;
+    const original = e.message.replace(/^解析来源失败：/, '');
+    expect(original.length).toBeGreaterThan(200);
+    expect(error.length).toBe(200);
+    expect(error).toBe(original.slice(0, 200));
     expect(JSON.stringify(audit!.detail)).not.toContain('sk-platform-secret');
     expect(JSON.stringify(audit!.detail)).not.toContain('成交额');
     expect(JSON.stringify(audit!.detail)).not.toContain('人民币');
@@ -326,5 +331,7 @@ describe('把知识来源解析成知识提案', () => {
     expect(none).toMatchObject({ status: 409, message: expect.stringContaining('未配置模型服务') });
     expect(await calls(acme)).toHaveLength(2); // 409 不发请求，llm_calls 只有 500 那次的两次尝试（重试 1 次，#1215）
     await expect(importFromSource(analyst, '00000000-0000-0000-0000-000000000000')).rejects.toMatchObject({ status: 400, message: '没有这个来源' });
+    // 403、409、400 都不写失败审计：仍然只有 500 那次的一条
+    expect(await auditsOf(acme, 'knowledge_source.parse_failed')).toHaveLength(1);
   });
 });
