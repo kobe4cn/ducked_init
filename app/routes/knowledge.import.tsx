@@ -59,7 +59,7 @@ export async function action({ request }: Route.ActionArgs) {
     throw e;
   }
   try {
-    const outcome = await importFromSource(member, saved.id);
+    const outcome = await importFromSource(member, saved.id, request.signal);
     const params = new URLSearchParams({
       imported: values.title.trim(), created: String(outcome.created),
       skipped: String(outcome.existing + outcome.rejected + outcome.invalid + outcome.stale + outcome.skipped),

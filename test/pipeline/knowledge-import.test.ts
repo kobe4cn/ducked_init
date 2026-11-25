@@ -13,7 +13,7 @@ import { currentBases } from '../../app/.server/knowledge/basis';
 import { acceptProposal, rejectProposal } from '../../app/.server/knowledge/proposals';
 import { IMPORT_GENERATOR_VERSION } from '../../app/.server/knowledge/import-draft';
 import { ImportError, importFromSource } from '../../app/.server/knowledge/import';
-import { saveKnowledgeSource } from '../../app/.server/knowledge/sources';
+import { getKnowledgeSource, saveKnowledgeSource } from '../../app/.server/knowledge/sources';
 import { setLlmFetch, setLlmSleep } from '../../app/.server/llm';
 import { resetDb } from '../http/harness';
 import { memberOf } from './fixtures';
@@ -292,6 +292,40 @@ describe('把知识来源解析成知识提案', () => {
     expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
     expect(await auditsOf(acme, 'knowledge_source.parse_failed')).toHaveLength(1);
     expect(await auditsOf(acme, 'knowledge_source.parsed')).toHaveLength(0);
+  });
+
+  it.each([
+    ['单块', 1],
+    ['分块（第 1 块返回时中止）', 12],
+  ])('客户端中止（%s，#1251）：422「请求已取消」，不写提案，parsed 与 parse_failed 审计都没有，来源仍在', async (_, paragraphCount) => {
+    // 12 段各约 800 字时按段落分成两块（第 1 块第 1–7 段、第 2 块第 8–12 段）；单块就是默认的三段来源
+    const body = paragraphCount === 1 ? BODY
+      : Array.from({ length: 12 }, (_, i) => `第${i + 1}段的口径说明。${'甲'.repeat(790)}`).join('\n\n');
+    const { acme, analyst, source } = await setup(body);
+    platformDefault();
+    // 假 fetch 不理 signal，照常返回：模型回复到手但客户端已中止，紧接的检查要把整次拦下来（照 workbench-ai 的 #1250 写法）
+    const controller = new AbortController();
+    const { f } = fakeLlm(setLlmFetch, (_n, reqBody) => {
+      controller.abort();
+      const input = JSON.parse(reqBody.messages[1]!.content) as { paragraphs: { no: number }[] };
+      return json({ proposals: input.paragraphs.map(p => (
+        { kind: 'alias', targetId: 'metric:paid_revenue', alias: `第${p.no}段的叫法`, evidence: [{ paragraph: p.no }], reason: `第 ${p.no} 段独有` }
+      )) }, USAGE);
+    });
+
+    const e = await importFromSource(analyst, source.id, controller.signal)
+      .then(() => { throw new Error('应当失败'); }, (err: unknown) => err);
+    expect(e).toBeInstanceOf(ImportError);
+    expect(e).toMatchObject({ status: 422, message: '解析来源失败：请求已取消' });
+    // 中止不是模型失败：不记 parse_failed，也不进提案（不调 proposeMany），parsed 审计同样没有
+    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
+    expect(await auditsOf(acme, 'knowledge_source.parse_failed')).toHaveLength(0);
+    expect(await auditsOf(acme, 'knowledge_source.parsed')).toHaveLength(0);
+    // 中止后不再发后续块的请求：分块时 fetch 只被调 1 次；llm_calls 只记已发出的那一行（中止不重试）
+    expect(f).toHaveBeenCalledTimes(1);
+    expect(await calls(acme)).toHaveLength(1);
+    // 来源在调模型之前就已保存，中止不影响它
+    await expect(getKnowledgeSource(analyst, source.id)).resolves.toMatchObject({ id: source.id, title: '指标口径文档' });
   });
 
   it('模型失败 422 且不留提案、在事务外记 parse_failed 审计（detail 只有那几个键，error 截到 200 字、不含 Key 与段落原文）；查看者 403；未配置模型服务 409 且不发请求；来源不存在 400', async () => {
