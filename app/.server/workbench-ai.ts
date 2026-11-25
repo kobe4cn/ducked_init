@@ -16,7 +16,7 @@ import type { CurrentMember } from './auth';
 import { isSystemColumn } from './catalog';
 import { getDb } from './db/client';
 import { tasks } from './db/schema';
-import { chatJson, LlmError, resolveProvider, type LlmMessage } from './llm';
+import { chatJson, LlmError, resolveProvider, throwIfAborted, type LlmMessage } from './llm';
 import { uncitedNumbers } from './interpretation-numbers';
 import { dataOnlyNotice } from './llm-prompts';
 import { normalizeWorkbenchSql, type WorkbenchResult } from './pipeline/workbench-engine';
@@ -150,11 +150,12 @@ export function draftMessages(request: string, catalog: string): LlmMessage[] {
 /**
  * 按需求起草一条工作台 SQL，通过白名单校验后返回，不执行（ADR-0043）。
  * 需求为空或超过 MAX_REQUEST 字时 400；没配置模型服务时 409（都不发请求）；模型失败或 SQL 没通过校验时 422（没通过时审计 valid: false）；
+ * 客户端中止（signal）时 422，不写任何审计（回复到手也一样，#1250）；
  * 模型判断做不到时 422，报错就是它给的原因（截到 MAX_UNSUPPORTED 字），审计 { unsupported: true }，不记原因（可能复述需求）；
  * 同租户已有查询在运行时 429。目录太长、提示里略去了表时 catalogTruncated 为真；
  * 模型给了口径假设时带 notes（去掉空白条，最多 MAX_NOTES 条、每条截到 MAX_NOTE 字，没有就不带这个键），notes 不进审计
  */
-export async function draftWorkbenchSql(actor: CurrentMember, request: string): Promise<{ sql: string; catalogTruncated: boolean; notes?: string[] }> {
+export async function draftWorkbenchSql(actor: CurrentMember, request: string, signal?: AbortSignal): Promise<{ sql: string; catalogTruncated: boolean; notes?: string[] }> {
   assertCan(actor, 'sandbox');
   if (!request.trim()) throw new WorkbenchAiError('请先写下要查什么', 400);
   if (request.length > MAX_REQUEST) throw new WorkbenchAiError(`需求最多 ${MAX_REQUEST} 字`, 400);
@@ -165,7 +166,9 @@ export async function draftWorkbenchSql(actor: CurrentMember, request: string): 
     const { text, truncated } = catalogText(catalog, await goldSnapshots(tenantId, catalog.gold));
     let output: { sql?: string; unsupported?: string; notes?: unknown[] };
     try {
-      output = await chatJson<{ sql?: string; unsupported?: string; notes?: unknown[] }>(tenantId, 'workbench_draft', draftMessages(request, text), WORKBENCH_DRAFT_SCHEMA);
+      output = await chatJson<{ sql?: string; unsupported?: string; notes?: unknown[] }>(tenantId, 'workbench_draft', draftMessages(request, text), WORKBENCH_DRAFT_SCHEMA, { signal });
+      // 客户端中止（#1250）：回复到手也不继续，unsupported 审计与 checkDraftedSql 的 valid 审计都不写
+      throwIfAborted(signal);
     } catch (e) {
       if (e instanceof LlmError) throw new WorkbenchAiError(`模型起草 SQL 失败：${e.message}`, 422);
       throw e;
@@ -396,12 +399,13 @@ export function interpretRequest(
  * 成员确认后解读结果（ADR-0043）：没确认时 400，没配置模型服务时 409（都不发请求）；按 SQL 重新执行，
  * 租户打开「发送脱敏样本」时只发前 INTERPRET_ROWS 行里没被剔除的列，没打开时只发 SQL、行数与留下的列的类型和统计（samples: false，不发任何行）；
  * 全部被剔除时 400；模型失败时 422。
+ * 客户端中止（signal）时 422：不写对话也不写审计（回复到手也一样，#1250）。
  * 解读存进本人的助手对话 conversationId（null 时新建；不是自己的对话时 404，不发请求），返回对话 id。
  * 解读里在发给模型的内容（含 facts 的占比与数值两两之比）里找不到出处的数字放进 unverified（原文片段，uncitedNumbers），只给页面标出，不进对话、不进审计。
  * 审计 workbench.result_interpreted { sql, rows, columns, dropped, samples, unverified }（unverified 只记个数），不记取值与解读。result 是这次执行的结果，只给页面显示表格，不进审计
  */
 export async function interpretResult(
-  actor: CurrentMember, sql: string, confirmed: boolean, conversationId: string | null,
+  actor: CurrentMember, sql: string, confirmed: boolean, conversationId: string | null, signal?: AbortSignal,
 ): Promise<{ text: string; unverified: string[]; rows: number; columns: string[]; dropped: string[]; samples: boolean; result: QueryOutcome; conversationId: string }> {
   assertCan(actor, 'sandbox');
   if (!confirmed) throw new WorkbenchAiError('请先确认要发送给模型服务的列', 400);
@@ -415,7 +419,9 @@ export async function interpretResult(
   if (!sent.length) throw new WorkbenchAiError('没有可以发送的列：结果里的列都是系统列、敏感列或哈希', 400);
   let interpretation: string;
   try {
-    ({ interpretation } = await chatJson<{ interpretation: string }>(tenantId, 'workbench_interpret', messages, INTERPRET_SCHEMA));
+    ({ interpretation } = await chatJson<{ interpretation: string }>(tenantId, 'workbench_interpret', messages, INTERPRET_SCHEMA, { signal }));
+    // 客户端中止（#1250）：解读到手也不继续，appendInterpretation 与审计都不写
+    throwIfAborted(signal);
   } catch (e) {
     if (e instanceof LlmError) throw new WorkbenchAiError(`模型解读结果失败：${e.message}`, 422);
     throw e;

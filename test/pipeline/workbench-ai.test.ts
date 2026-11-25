@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { randomUUID } from 'node:crypto';
-import { auditLogs, modelProviders, tasks } from '../../app/.server/db/schema';
+import { assistantConversations, auditLogs, modelProviders, tasks } from '../../app/.server/db/schema';
 import { setLlmFetch } from '../../app/.server/llm';
 import { draftWorkbenchSql, interpretResult, isDetail, previewInterpretation } from '../../app/.server/workbench-ai';
 import { resetDb } from '../http/harness';
@@ -76,6 +76,20 @@ describe('AI 起草 SQL', () => {
     platformDefault();
     fakeLlm(setLlmFetch, () => json({ query: 'SELECT 1' }));
     expect(await errorOf(draftWorkbenchSql(await analyst(), '每个城市的客户数'))).toMatch(/^422 /);
+  });
+
+  it.each([
+    ['合法 SQL', { sql: 'SELECT 1' }],
+    ['做不到', { unsupported: '做不到' }],
+  ])('模型回复返回时客户端已中止（#1250）：模型返回%s也 422，不写 ai_drafted 审计（unsupported 与校验的都不写）', async (_, reply) => {
+    // 假 fetch 不理 signal，照常返回：模型回复到手但客户端已中止，紧接着的检查要把它拦下来
+    platformDefault();
+    const controller = new AbortController();
+    fakeLlm(setLlmFetch, () => { controller.abort(); return json(reply); });
+    const before = (await audits('workbench.ai_drafted')).length;
+    expect(await errorOf(draftWorkbenchSql(await analyst(), '每个城市的客户数', controller.signal)))
+      .toMatch(/^422 模型起草 SQL 失败：请求已取消/);
+    expect((await audits('workbench.ai_drafted')).length).toBe(before);
   });
 
   describe('模型判断做不到（unsupported）', () => {
@@ -390,6 +404,21 @@ describe('AI 解读结果', () => {
     const before = (await audits('workbench.result_interpreted')).length;
     expect(await errorOf(interpretResult(await analyst(), 'SELECT 1 AS n', true, null))).toMatch(/^422 模型解读结果失败/);
     expect((await audits('workbench.result_interpreted')).length).toBe(before);
+  });
+
+  it('模型回复返回时客户端已中止（#1250）：不写对话、不记 result_interpreted 审计，422', async () => {
+    await setSamples(true);
+    const sql = 'SELECT city, count(*) AS n_aborted FROM silver.customer GROUP BY 1';
+    // 假 fetch 不理 signal，照常返回：解读到手但客户端已中止，不能写进对话或审计
+    platformDefault();
+    const controller = new AbortController();
+    fakeLlm(setLlmFetch, () => { controller.abort(); return json({ interpretation: '上海的客户最多' }); });
+    const before = (await interpreted(sql)).length;
+    const conversations = (await getDb().select().from(assistantConversations)).length;
+    expect(await errorOf(interpretResult(await analyst(), sql, true, null, controller.signal)))
+      .toMatch(/^422 模型解读结果失败：请求已取消/);
+    expect((await interpreted(sql)).length).toBe(before);
+    expect((await getDb().select().from(assistantConversations)).length).toBe(conversations);
   });
 
   describe('数字核对（#1218）', () => {

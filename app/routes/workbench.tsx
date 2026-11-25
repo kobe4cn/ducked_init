@@ -80,14 +80,14 @@ export async function action({ request }: Route.ActionArgs) {
   const conversationId = String(form.get('conversationId') ?? '') || null;
   try {
     // AI 起草（ADR-0043）：只把通过校验的 SQL 填进编辑框，不执行、不带结果；draftId 每次都不同，同样的草稿再起草一次也会重新填进编辑框
-    if (intent === 'draft') return { ...await draftWorkbenchSql(member, need), name, intent, request: need, draftId: crypto.randomUUID() };
+    if (intent === 'draft') return { ...await draftWorkbenchSql(member, need, request.signal), name, intent, request: need, draftId: crypto.randomUUID() };
     // AI 解读（ADR-0043）：预览不请求模型；确认时服务端按 SQL 重新执行，不信客户端传来的行；两步都带上这次执行的结果，表格照常显示
     if (intent === 'interpret_preview') {
       const { result, ...preview } = await previewInterpretation(member, sql);
       return { sql, name, intent, preview, result, conversationId };
     }
     if (intent === 'interpret') {
-      const { result, conversationId: savedConversationId, ...interpretation } = await interpretResult(member, sql, form.get('confirmed') === '1', conversationId);
+      const { result, conversationId: savedConversationId, ...interpretation } = await interpretResult(member, sql, form.get('confirmed') === '1', conversationId, request.signal);
       return { sql, name, intent, interpretation, result, conversationId: savedConversationId };
     }
     if (intent === 'save') return { sql, name, saved: await saveAsSandbox(member, name, sql, request.signal) };
