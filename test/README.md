@@ -156,7 +156,7 @@ PostgreSQL 源库 `shop` schema 的内容（确定性造数）：
 | `platformTier(tier, model, opts?)` | `vi.stubEnv` 设平台档位（ADR-0055）：`LLM_FAST_*` / `LLM_REASONING_*` 的 `MODEL`，`opts` 里给到的 `baseUrl` / `apiKey` 才设对应变量（要一起给才生效，测「填了又算没填」传空串） |
 | `embeddings(vectors, usage?)` | embedding 端点的答复：每个向量按出现顺序给 `{ index, embedding }`；要测乱序返回（index 1 在前）时在测试里自己构造 `Response`；`usage` 只带 `prompt_tokens`（/embeddings 没有 completion_tokens） |
 
-`usage` 省略时返回里不带 usage 字段（`platform.llm_calls` 的 token 列为空）；要断言 token 数（或迁移前就带 usage）时显式传 `{ prompt_tokens, completion_tokens }`（`embeddings` 只需 `prompt_tokens`）。非 200 的返回直接写 `new Response(..., { status })`。
+`usage` 省略时返回里不带 usage 字段（`platform.llm_calls` 的 token 列为空）；要断言 token 数（或迁移前就带 usage）时显式传 `{ prompt_tokens, completion_tokens }`（`embeddings` 只需 `prompt_tokens`）；usage 还可带 `completion_tokens_details.reasoning_tokens` / `prompt_tokens_details.cached_tokens` / 顶层 `prompt_cache_hit_tokens`（#1253 记进 llm_calls 的思考与缓存 token）。非 200 的返回直接写 `new Response(..., { status })`。
 
 ### 检索黄金集（`scripts/eval-requirements/golden` + `retrieval-catalog.ts`）
 

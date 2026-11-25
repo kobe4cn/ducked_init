@@ -19,7 +19,7 @@ import { formatServer } from '../i18n';
 import type { Role } from '../db/schema';
 import { planRetrievedIds, type AnalysisPlan } from '../catalog/plan';
 import { DSL_KEY_PATTERN } from '../dsl-definitions';
-import { ABORTED, chatToolsWith, LlmError, resolveRoute, type LlmMessage, type LlmRoute } from '../llm';
+import { ABORTED, chatToolsWith, LlmError, resolveRoute, withLlmContext, type LlmMessage, type LlmRoute } from '../llm';
 import { dataOnlyNotice } from '../llm-prompts';
 import { toolSupport } from '../model-provider';
 import type { ChoiceGroup } from './conversations';
@@ -267,73 +267,76 @@ async function finishAtLimit(tenantId: string, route: LlmRoute, messages: LlmMes
 export async function assistantTurn(
   actor: CurrentMember, history: ChatTurn[], page: AssistantPage, priorPlan?: AnalysisPlan, signal?: AbortSignal,
 ): Promise<{ reply: string; toolsUsed: string[]; plan?: AnalysisPlan; workbenchSql?: string; choices?: ChoiceGroup[] }> {
-  checkHistory(history);
-  const tenantId = actor.tenant.id;
-  // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮所有 chatToolsWith 都用它：中途改配置不影响本轮
-  const route = await resolveRoute(tenantId, 'assistant');
-  if (!route) throw new AssistantError('未配置模型服务：请到「模型服务」页配置端点、模型与 API Key', 409);
-  if (await toolSupport(tenantId, route) === false) throw new AssistantError(TOOLS_UNSUPPORTED, 422);
-
-  const tools = toolsFor(actor).map(t => ({ name: t.name, description: t.description, parameters: t.inputSchema }));
-  const messages: LlmMessage[] = [
-    { role: 'system', content: systemPrompt(page, actor.role, priorPlan) },
-    ...history.map(m => (m.source === 'interpretation' ? { role: 'user' as const, content: wrapInterpretation(m.content) } : { role: m.role, content: m.content })),
-  ];
-  const toolsUsed: string[] = [];
-  // 上限一轮开始时读一次，中途改环境变量不影响本轮
-  const toolLimit = maxToolCalls();
-  const fixLimit = maxFixes();
-  // 本轮的上下文：retrieved 是本轮检索到的候选条目（catalog_search / catalog_expand 记进来，validate_plan 只认这些，每轮新建），
-  // 一开始预先填入对话里最近一份计划引用过的条目（#1179，沿用计划不必重新检索；版本、哈希与可见性仍由 validatePlan 对当前目录检查），
-  // priorPlan 是对话里最近一份计划，plan 由本轮 validate_plan 写进（不带 priorPlan 初始化，免得每轮把旧计划再存一遍）
-  const ctx: ToolCtx = { retrieved: new Set(priorPlan ? planRetrievedIds(priorPlan) : []), priorPlan };
-  // 经助手的操作在审计里注明（只加在这里传给工具的 actor 上）
-  const via: CurrentMember = { ...actor, via: 'assistant' };
-  let failures = 0;
-  // 本轮最后一版校验通过的定义（#1185）：放弃时交给成员；保存成功后清掉，下一份草稿重新算
-  let lastValid: { kind: string; yaml: string } | undefined;
-  // 本轮 validate_plan 返回过 status: valid 之后（之后再校验失败也不撤回）prefill_workbench 免计，最多 MAX_FREE_PREFILLS 次；
-  // 不用 ctx.plan 判断：status 不是 valid 时 validate_plan 也会写它
-  let planValid = false;
-  let freePrefills = 0;
-  for (;;) {
-    // 客户端中止（#1248）：不再发后续模型请求（chatToolsWith 里也会先查一次，这里在工具执行完的间隙也拦下）
-    if (signal?.aborted) throw new AssistantError(ABORTED, 400);
-    let response;
-    try {
-      response = await chatToolsWith(tenantId, 'assistant', route, messages, tools, { signal });
-    } catch (e) {
-      // 客户端中止（#1248）：不是模型服务的错（不 transient、不算超时），抛 400 结束本轮，不走 #1209 的 ERROR_REPLY
-      if (e instanceof LlmError && e.aborted) throw new AssistantError(ABORTED, 400);
-      if (e instanceof LlmError && toolsUsed.length) return { reply: ERROR_REPLY, toolsUsed, ...extras(ctx) };
-      if (e instanceof LlmError) throw new AssistantError(`该模型服务不支持工具调用或调用失败：${e.message}`, 422);
-      throw e;
-    }
-    if (!response.toolCalls.length) return { reply: response.content!, toolsUsed, ...extras(ctx) };
-    // 一次给出的调用超出剩下的次数时只执行到上限，其余回填「未执行」后请求总结
-    messages.push({
-      role: 'assistant', content: response.content ?? '',
-      tool_calls: response.toolCalls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })),
-    });
-    for (const [i, c] of response.toolCalls.entries()) {
-      // 客户端中止（#1248）：这批以及后面的工具不再执行（超限时的总结也不再请求）
+  // 整轮包进 withLlmContext（#1253）：这一轮里的所有模型调用（含工具里查询向量的 embedding）在 llm_calls 里共用同一个 turn_id、记提问人
+  return withLlmContext({ actorEmail: actor.email }, async () => {
+    checkHistory(history);
+    const tenantId = actor.tenant.id;
+    // 一轮开始时解析一次 reasoning 档位的路由（#531），整轮所有 chatToolsWith 都用它：中途改配置不影响本轮
+    const route = await resolveRoute(tenantId, 'assistant');
+    if (!route) throw new AssistantError('未配置模型服务：请到「模型服务」页配置端点、模型与 API Key', 409);
+    if (await toolSupport(tenantId, route) === false) throw new AssistantError(TOOLS_UNSUPPORTED, 422);
+  
+    const tools = toolsFor(actor).map(t => ({ name: t.name, description: t.description, parameters: t.inputSchema }));
+    const messages: LlmMessage[] = [
+      { role: 'system', content: systemPrompt(page, actor.role, priorPlan) },
+      ...history.map(m => (m.source === 'interpretation' ? { role: 'user' as const, content: wrapInterpretation(m.content) } : { role: m.role, content: m.content })),
+    ];
+    const toolsUsed: string[] = [];
+    // 上限一轮开始时读一次，中途改环境变量不影响本轮
+    const toolLimit = maxToolCalls();
+    const fixLimit = maxFixes();
+    // 本轮的上下文：retrieved 是本轮检索到的候选条目（catalog_search / catalog_expand 记进来，validate_plan 只认这些，每轮新建），
+    // 一开始预先填入对话里最近一份计划引用过的条目（#1179，沿用计划不必重新检索；版本、哈希与可见性仍由 validatePlan 对当前目录检查），
+    // priorPlan 是对话里最近一份计划，plan 由本轮 validate_plan 写进（不带 priorPlan 初始化，免得每轮把旧计划再存一遍）
+    const ctx: ToolCtx = { retrieved: new Set(priorPlan ? planRetrievedIds(priorPlan) : []), priorPlan };
+    // 经助手的操作在审计里注明（只加在这里传给工具的 actor 上）
+    const via: CurrentMember = { ...actor, via: 'assistant' };
+    let failures = 0;
+    // 本轮最后一版校验通过的定义（#1185）：放弃时交给成员；保存成功后清掉，下一份草稿重新算
+    let lastValid: { kind: string; yaml: string } | undefined;
+    // 本轮 validate_plan 返回过 status: valid 之后（之后再校验失败也不撤回）prefill_workbench 免计，最多 MAX_FREE_PREFILLS 次；
+    // 不用 ctx.plan 判断：status 不是 valid 时 validate_plan 也会写它
+    let planValid = false;
+    let freePrefills = 0;
+    for (;;) {
+      // 客户端中止（#1248）：不再发后续模型请求（chatToolsWith 里也会先查一次，这里在工具执行完的间隙也拦下）
       if (signal?.aborted) throw new AssistantError(ABORTED, 400);
-      const free = c.name === 'prefill_workbench' && planValid && freePrefills < MAX_FREE_PREFILLS;
-      if (!free && toolsUsed.length - freePrefills === toolLimit) {
-        for (const skipped of response.toolCalls.slice(i)) messages.push({ role: 'tool', tool_call_id: skipped.id, content: wrapToolResult(skipped.name, SKIPPED) });
-        return finishAtLimit(tenantId, route, messages, toolsUsed, ctx, signal);
+      let response;
+      try {
+        response = await chatToolsWith(tenantId, 'assistant', route, messages, tools, { signal });
+      } catch (e) {
+        // 客户端中止（#1248）：不是模型服务的错（不 transient、不算超时），抛 400 结束本轮，不走 #1209 的 ERROR_REPLY
+        if (e instanceof LlmError && e.aborted) throw new AssistantError(ABORTED, 400);
+        if (e instanceof LlmError && toolsUsed.length) return { reply: ERROR_REPLY, toolsUsed, ...extras(ctx) };
+        if (e instanceof LlmError) throw new AssistantError(`该模型服务不支持工具调用或调用失败：${e.message}`, 422);
+        throw e;
       }
-      if (free) freePrefills++;
-      toolsUsed.push(c.name);
-      const result = await callTool(via, c.name, c.arguments, ctx);
-      if (c.name === 'validate_plan' && result.text.startsWith('status: valid')) planValid = true;
-      if (result.validated) lastValid = result.validated;
-      if (result.rejected && ++failures > fixLimit) {
-        return { reply: unfixedReply(result.rejected, fixLimit, sameKindValid(c.name, c.arguments, lastValid)), toolsUsed, ...extras(ctx) };
+      if (!response.toolCalls.length) return { reply: response.content!, toolsUsed, ...extras(ctx) };
+      // 一次给出的调用超出剩下的次数时只执行到上限，其余回填「未执行」后请求总结
+      messages.push({
+        role: 'assistant', content: response.content ?? '',
+        tool_calls: response.toolCalls.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })),
+      });
+      for (const [i, c] of response.toolCalls.entries()) {
+        // 客户端中止（#1248）：这批以及后面的工具不再执行（超限时的总结也不再请求）
+        if (signal?.aborted) throw new AssistantError(ABORTED, 400);
+        const free = c.name === 'prefill_workbench' && planValid && freePrefills < MAX_FREE_PREFILLS;
+        if (!free && toolsUsed.length - freePrefills === toolLimit) {
+          for (const skipped of response.toolCalls.slice(i)) messages.push({ role: 'tool', tool_call_id: skipped.id, content: wrapToolResult(skipped.name, SKIPPED) });
+          return finishAtLimit(tenantId, route, messages, toolsUsed, ctx, signal);
+        }
+        if (free) freePrefills++;
+        toolsUsed.push(c.name);
+        const result = await callTool(via, c.name, c.arguments, ctx);
+        if (c.name === 'validate_plan' && result.text.startsWith('status: valid')) planValid = true;
+        if (result.validated) lastValid = result.validated;
+        if (result.rejected && ++failures > fixLimit) {
+          return { reply: unfixedReply(result.rejected, fixLimit, sameKindValid(c.name, c.arguments, lastValid)), toolsUsed, ...extras(ctx) };
+        }
+        // 保存成功后再起草下一份，重新计修正次数与通过的那版
+        if (result.saved) { failures = 0; lastValid = undefined; }
+        messages.push({ role: 'tool', tool_call_id: c.id, content: wrapToolResult(c.name, result.text) });
       }
-      // 保存成功后再起草下一份，重新计修正次数与通过的那版
-      if (result.saved) { failures = 0; lastValid = undefined; }
-      messages.push({ role: 'tool', tool_call_id: c.id, content: wrapToolResult(c.name, result.text) });
     }
-  }
+  });
 }

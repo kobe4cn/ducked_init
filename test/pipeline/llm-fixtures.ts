@@ -3,7 +3,11 @@
 // 夹具不碰 afterEach：setLlmFetch(undefined) 与 vi.unstubAllEnvs() 由各文件自己写
 import { type Mock, vi } from 'vitest';
 
-type Usage = { prompt_tokens: number; completion_tokens: number };
+/** usage 的形状（OpenAI 兼容）：思考与缓存 token 在 details 里（#1253），DeepSeek 的缓存命中数放在顶层 prompt_cache_hit_tokens */
+type Usage = {
+  prompt_tokens: number; completion_tokens: number;
+  prompt_tokens_details?: { cached_tokens?: number }; completion_tokens_details?: { reasoning_tokens?: number }; prompt_cache_hit_tokens?: number;
+};
 
 /** embedding 端点的答复：每个向量按出现顺序给 index（要测乱序返回时在测试里自己构造 Response）；
  *  /embeddings 的 usage 没有 completion_tokens，这里只带 prompt_tokens（llm_calls 的 completion_tokens 为空） */

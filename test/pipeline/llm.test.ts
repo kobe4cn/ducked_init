@@ -11,7 +11,7 @@ import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { auditLogs, llmCalls, modelProviders } from '../../app/.server/db/schema';
-import { chatJson, chatTools, chatToolsWith, embed, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch, setLlmSleep } from '../../app/.server/llm';
+import { chatJson, chatTools, chatToolsWith, embed, embedWith, LlmError, MODEL_PROVIDER_CONTEXT, resolveEmbeddingProvider, resolveProvider, resolveRoute, setLlmFetch, setLlmSleep } from '../../app/.server/llm';
 import { ModelProviderError, resetModelProvider, resetTierProvider, saveModelProvider, saveTierProvider, tableContextFor } from '../../app/.server/model-provider';
 import { encryptForTenant } from '../../app/.server/secrets';
 import { syncSource } from '../../app/.server/source-sync';
@@ -358,6 +358,42 @@ describe('模型服务客户端', () => {
     expect(logged).not.toContain('13900139000');
   });
 
+  it('usage 带思考与缓存 token 时分别记进 reasoning_tokens / cached_tokens（#1253）：OpenAI 的 details、DeepSeek 的 prompt_cache_hit_tokens、都没有时两列为 null', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    // OpenAI 兼容的 details：思考 token 在 completion_tokens_details、缓存 token 在 prompt_tokens_details
+    fakeLlm(setLlmFetch, () => json({ table: 'orders' }, {
+      prompt_tokens: 120, completion_tokens: 30,
+      prompt_tokens_details: { cached_tokens: 100 }, completion_tokens_details: { reasoning_tokens: 12 },
+    }));
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+    expect((await calls(acme)).at(-1)).toMatchObject({ reasoningTokens: 12, cachedTokens: 100, errorKind: null });
+
+    // DeepSeek 不给 details、把命中缓存的输入 token 数放在顶层 prompt_cache_hit_tokens：只填 cached_tokens
+    fakeLlm(setLlmFetch, () => json({ table: 'orders' }, { prompt_tokens: 120, completion_tokens: 30, prompt_cache_hit_tokens: 80 }));
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+    expect((await calls(acme)).at(-1)).toMatchObject({ reasoningTokens: null, cachedTokens: 80 });
+
+    // 都没有时两列为 null（成功的行 error_kind 也为 null）
+    fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+    expect((await calls(acme)).at(-1)).toMatchObject({ reasoningTokens: null, cachedTokens: null, errorKind: null });
+  });
+
+  it('不在轮次上下文里的调用（直接调 chatJson）每行 turn_id 都不同、actor_email 为 null（#1253）', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
+
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+    await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
+    const rows = await calls(acme);
+    expect(rows).toHaveLength(2);
+    expect(rows.every(row => row.actorEmail === null)).toBe(true);
+    expect(rows.every(row => typeof row.turnId === 'string' && row.turnId)).toBe(true);
+    expect(rows[0]!.turnId).not.toBe(rows[1]!.turnId);
+  });
+
   it('LLM_CHAT_EXTRA 合并进 /chat/completions 请求体，档位 LLM_<TIER>_CHAT_EXTRA 覆盖默认，平台字段不被覆盖', async () => {
     const acme = await newTenant('acme');
     platformDefault(BASE_WITH_SLASH);
@@ -415,7 +451,7 @@ describe('模型服务客户端', () => {
     expect(await calls(acme)).toHaveLength(2);
   });
 
-  it('LLM_TIMEOUT_SECONDS 控制 chat 超时，超时消息里的秒数跟着变；不是正整数时回落 60', async () => {
+  it('LLM_TIMEOUT_SECONDS 控制 chat 超时，超时消息里的秒数跟着变；不是正整数时回落 60；超时的行记 error_kind: timeout（#1253）', async () => {
     const acme = await newTenant('acme');
     platformDefault(BASE_WITH_SLASH);
     // 假 fetch 同步 throw TimeoutError，不会真的等：断言的是超时消息里的秒数跟着环境变量走
@@ -427,7 +463,7 @@ describe('模型服务客户端', () => {
       expect(err).toBeInstanceOf(LlmError);
       expect(err.transient).toBe(true);
       expect(err.message).toMatch(message);
-      expect((await calls(acme)).at(-1)).toMatchObject({ purpose: 'connectivity', error: expect.stringMatching(message) });
+      expect((await calls(acme)).at(-1)).toMatchObject({ purpose: 'connectivity', error: expect.stringMatching(message), errorKind: 'timeout' });
     }
   });
 
@@ -994,6 +1030,18 @@ describe('embedding 端点', () => {
       expect(row.error).toBeTruthy();
       expect(row.error).not.toContain('sk-embed-secret');
     }
+    // 只有超时记 error_kind（#1253）：连不上、5xx、429 与成功都为 null
+    expect(rows.map(row => row.errorKind)).toEqual(['timeout', null, null, null]);
+  });
+
+  it('查询向量的短超时（embedWith 传 timeoutMs）也记 error_kind: timeout（#1253）', async () => {
+    const acme = await newTenant('acme');
+    platformEmbedding();
+    fakeLlm(setLlmFetch, () => { throw new DOMException('signal timed out', 'TimeoutError'); });
+    const provider = await resolveEmbeddingProvider(acme);
+
+    await failure(embedWith(acme, provider!, ['成交额'], { timeoutMs: 3000 }));
+    expect((await calls(acme)).at(-1)).toMatchObject({ purpose: 'embedding', errorKind: 'timeout', error: '模型服务 3 秒内没有返回' });
   });
 });
 

@@ -8,7 +8,7 @@ import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CurrentMember } from '../../app/.server/auth';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, dslVersions, llmCalls, mappingVersions } from '../../app/.server/db/schema';
+import { auditLogs, dslVersions, llmCalls, mappingVersions, tenants } from '../../app/.server/db/schema';
 import { assistantTurn, ERROR_REPLY, MAX_FIXES, MAX_PLAN_SUMMARY, MAX_TOOL_CALLS, maxFixes, maxToolCalls } from '../../app/.server/assistant/loop';
 import { catalogFor, PLAN_MODE_RULE, runTool, TOOLS, toolsFor } from '../../app/.server/assistant/tools';
 import { semanticHash, type AnalysisPlan } from '../../app/.server/catalog/plan';
@@ -17,7 +17,7 @@ import { ABORTED, setLlmFetch } from '../../app/.server/llm';
 import { saveBusinessNote } from '../../app/.server/business-notes';
 import { resetDb } from '../http/harness';
 import { memberOf, newTenant } from './fixtures';
-import { fakeLlm, platformDefault, platformTier, text, toolCalls } from './llm-fixtures';
+import { embeddings, fakeLlm, platformDefault, platformEmbedding, platformTier, text, toolCalls } from './llm-fixtures';
 import { CRM, publishedIdentitySources } from './identity-fixtures';
 
 afterAll(async () => { await closeDb(); });
@@ -60,6 +60,34 @@ describe('AI 助手的一轮问答', () => {
     const logged = await calls(acme);
     expect(logged).toHaveLength(2);
     expect(logged.every(c => c.purpose === 'assistant' && c.error === null)).toBe(true);
+  });
+
+  it('一轮里的所有 llm_calls 行（assistant 与查询向量的 embedding）共用同一个 turn_id、actor_email 是提问人；换一轮 turn_id 就不同（#1253）', async () => {
+    platformDefault();
+    platformEmbedding();
+    const acme = await newTenant('acme');
+    const viewer = await memberOf(acme, 'viewer@acme.com', 'viewer');
+    const analyst = await memberOf(acme, 'an@acme.com', 'analyst');
+    // 租户开 hybrid_search（运营切换，默认关）后 catalog_search 会为查询算一次 embedding（catalog/embeddings.ts 的短超时一路）
+    await getDb().update(tenants).set({ hybridSearch: true }).where(eq(tenants.id, acme));
+    // 每轮第 1 次 chat 请求要 catalog_search，工具里的混合检索为查询算一次向量（body 带 input 的 /embeddings 请求），之后给文字答复
+    let chats = 0;
+    fakeLlm(setLlmFetch, (_n, body) => {
+      if ('input' in body) return embeddings([[0.1, 0.2]], { prompt_tokens: 3 });
+      chats += 1;
+      return chats % 2 === 1 ? toolCalls({ name: 'catalog_search', args: { query: QUESTION } }, TOOL_USAGE) : text('客户实体有城市等字段', TEXT_USAGE);
+    });
+
+    await assistantTurn(viewer, [{ role: 'user', content: QUESTION }], PAGE);
+    await assistantTurn(analyst, [{ role: 'user', content: QUESTION }], PAGE);
+    const logged = await calls(acme);
+    // 每轮 3 行：assistant、embedding（查询向量）、assistant
+    expect(logged.map(row => row.purpose)).toEqual(['assistant', 'embedding', 'assistant', 'assistant', 'embedding', 'assistant']);
+    const [first, second] = [logged.slice(0, 3), logged.slice(3)];
+    for (const turn of [first, second]) expect(new Set(turn.map(row => row.turnId)).size).toBe(1);
+    expect(first[0]!.turnId).not.toBe(second[0]!.turnId);
+    expect(first.map(row => row.actorEmail)).toEqual(['viewer@acme.com', 'viewer@acme.com', 'viewer@acme.com']);
+    expect(second.map(row => row.actorEmail)).toEqual(['an@acme.com', 'an@acme.com', 'an@acme.com']);
   });
 
   it('系统提示按成员角色写明不能做的操作（看数据源、起草、发布）：查看者三句都有，分析师只有不能发布，管理员一句都没有（#1189）', async () => {
