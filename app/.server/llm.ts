@@ -15,6 +15,7 @@
 // 都没配置时返回 null（不发请求、不记日志），调用方只走关键词检索。
 // chatJson 与 chatTools 的每次调用（成功、HTTP 失败、校验失败）都在 platform.llm_calls 记一行：用途、模型、令牌数、耗时、校验结果与错误摘要，不存提示词与返回原文；评测命令用不查库、不记日志的 callModel
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Ajv, type ErrorObject, type ValidateFunction } from 'ajv';
 import { eq } from 'drizzle-orm';
 import { getDb } from './db/client';
@@ -53,8 +54,11 @@ export interface LlmProvider {
 export class LlmError extends Error {
   /** status：HTTP 错误的状态码（postJson 填），callModel 据此判断要不要退回 json_object；
    *  timeout：超时（masked 填，此时 transient 也为 true）。logged 的重试只认 transient 且不是超时的——超时再等一轮太久（ADR-0035）；
-   *  aborted：外部 signal 中止（#1248），此时 transient 与 timeout 都是 false */
-  constructor(message: string, readonly transient = false, readonly status?: number, readonly timeout = false, readonly aborted = false) { super(message); }
+   *  aborted：外部 signal 中止（#1248），此时 transient 与 timeout 都是 false；
+   *  kind：入库的错误分类（#1253），logged 原样写进 llm_calls.error_kind，目前只有超时 'timeout'（masked 填）。
+   *  与 timeout 分开：timeout 管重试与文案，kind 只管日志怎么分类；其余错误（aborted、5xx、429、Schema 不合）都是 undefined */
+  constructor(message: string, readonly transient = false, readonly status?: number, readonly timeout = false, readonly aborted = false,
+    readonly kind?: 'timeout') { super(message); }
 }
 
 /** 租户 API Key 的加密 context（ADR-0009），解密时须给出同一个 */
@@ -265,8 +269,16 @@ export function assertSchema(schema: object, value: unknown): void {
   if (!validate(value)) throw new LlmError(`模型返回的 JSON 不符合 Schema：${schemaErrors(validate)}`);
 }
 
-/** 一次调用的统计，调用日志用：令牌数与 Schema 校验结果（没走到校验时为 null） */
-export interface CallStats { usage?: { prompt_tokens?: number; completion_tokens?: number }; schemaValid: boolean | null }
+/** 一次调用的统计，调用日志用：令牌数与 Schema 校验结果（没走到校验时为 null）。
+ *  usage 的 details（#1253）：OpenAI 兼容的思考 token 在 completion_tokens_details、缓存 token 在 prompt_tokens_details，
+ *  DeepSeek 不给 details、把命中缓存的输入 token 数放在顶层 prompt_cache_hit_tokens */
+export interface CallStats {
+  usage?: {
+    prompt_tokens?: number; completion_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number }; completion_tokens_details?: { reasoning_tokens?: number }; prompt_cache_hit_tokens?: number;
+  };
+  schemaValid: boolean | null;
+}
 
 const maskKey = (apiKey: string, s: string) => (apiKey ? s.replaceAll(apiKey, '***') : s);
 
@@ -279,10 +291,12 @@ async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeou
   } catch (e) {
     throwIfAborted(signal);
     const timedOut = e instanceof Error && e.name === 'TimeoutError';
+    const wasTimeout = e instanceof LlmError ? e.timeout : timedOut;
+    // 超时（含查询向量的短超时）标上 kind，logged 写进 llm_calls.error_kind（#1253）
     throw new LlmError(maskKey(apiKey, e instanceof LlmError ? e.message
       : timedOut ? `模型服务 ${timeout / 1000} 秒内没有返回`
       : `调用模型服务失败：${e instanceof Error ? e.message : String(e)}`), e instanceof LlmError ? e.transient : true,
-      e instanceof LlmError ? e.status : undefined, e instanceof LlmError ? e.timeout : timedOut);
+      e instanceof LlmError ? e.status : undefined, wasTimeout, false, wasTimeout ? 'timeout' : undefined);
   }
 }
 
@@ -499,6 +513,17 @@ export async function callTools(provider: LlmProvider, messages: LlmMessage[], t
   }, undefined, signal);
 }
 
+/** 一轮模型调用的上下文（#1253）：withLlmContext 包起来的所有调用在 llm_calls 里共用同一个 turn_id（写法照 catalog/tx.ts 的 ALS） */
+interface LlmTurnContext { turnId: string; actorEmail: string | null }
+
+const storage = new AsyncLocalStorage<LlmTurnContext>();
+
+/** 在一轮上下文里跑 fn（#1253）：生成一个 turnId，这一轮里的所有 llm_calls 行共用它，actor_email 记发起人（没有时 null）。
+ *  助手一轮（assistantTurn）包一层：整轮的 chat 与工具里查询向量的 embedding 就都带上同一个上下文 */
+export function withLlmContext<T>(ctx: { actorEmail: string | null }, fn: () => Promise<T>): Promise<T> {
+  return storage.run({ turnId: randomUUID(), ...ctx }, fn);
+}
+
 /**
  * 按租户与用途选档位（resolve，默认 chat 的 resolveRoute）后调用 call。没配置模型服务或没填模型名时直接报错、不发请求、不记日志；
  * 其余调用（成功或失败）都记日志，embedding 调用带上条数 inputCount。日志直接写平台库，不进调用方的事务：调用方回滚时调用记录也要留下。
@@ -517,20 +542,28 @@ async function logged<T>(tenantId: string, purpose: LlmPurpose, call: (provider:
     const started = Date.now();
     const stats: CallStats = { schemaValid: null };
     let error: string | null = null;
+    let errorKind: 'timeout' | null = null;
     try {
       return await call(provider, stats);
     } catch (e) {
       error = (e as Error).message;
+      if (e instanceof LlmError && e.kind) errorKind = e.kind;
       if (!(retry && attempt === 1 && e instanceof LlmError && e.transient && !e.timeout)) throw e;
     } finally {
+      // 轮次（#1253）：withLlmContext 里的调用共用它的 turn_id 与发起人；不在任何轮次里的调用每次自己生成一个、不带发起人
+      const turn = storage.getStore();
       await getDb().insert(llmCalls).values({
-        tenantId, purpose, model, schemaValid: stats.schemaValid, error, inputCount, attempt,
+        tenantId, purpose, model, schemaValid: stats.schemaValid, error, errorKind, inputCount, attempt,
+        turnId: turn?.turnId ?? randomUUID(), actorEmail: turn?.actorEmail ?? null,
         // 档位与回落原因（ADR-0055）：route 是这次调用所属的档位，fallbackReason 为 'unbound' 表示该档位没绑定模型
         route, fallbackReason,
         // 来源（#843）就是这次实际解析到的端点的 source（chat 由 resolveRoute、embedding 由 resolveEmbeddingProvider 填好），
         // 不在日志层另行推算：embedding 与 chat 可能来自不同套配置
         source: provider.source,
         promptTokens: stats.usage?.prompt_tokens ?? null, completionTokens: stats.usage?.completion_tokens ?? null,
+        // 思考与缓存 token（#1253）：DeepSeek 没给 details 时用顶层的 prompt_cache_hit_tokens 当缓存命中数
+        reasoningTokens: stats.usage?.completion_tokens_details?.reasoning_tokens ?? null,
+        cachedTokens: stats.usage?.prompt_tokens_details?.cached_tokens ?? stats.usage?.prompt_cache_hit_tokens ?? null,
         durationMs: Date.now() - started,
       }).catch(e => console.error('记录模型调用日志失败', e));
     }

@@ -766,6 +766,10 @@ export const modelProviders = platform.table('model_providers', {
 // source（#843）记这次实际用的端点是租户的还是平台的：chat 由 resolveRoute、embedding 由 resolveEmbeddingProvider 填进 provider.source，
 // logged 原样写入。可空、没有默认值：迁移前的旧行为空；未配置模型服务时不发请求也不记日志，不会出现新的空行
 // attempt（#1215）记这一行是同一次调用的第几次尝试：logged 对 transient 错误重试 1 次时第 2 次记 2，旧行都算第 1 次
+// turn_id / actor_email（#1253）：一次「轮次」的 ID 与发起人 email——withLlmContext 包起来的调用（助手一轮，含工具里查询向量的 embedding）
+// 共用同一个 turn_id、记提问人；不在任何轮次里的调用每次自己生成一个 turn_id、actor_email 为 null（其余用途接进来是后续子票）。
+// reasoning_tokens / cached_tokens（#1253）：服务商 usage 的 details 里带的思考与缓存 token（DeepSeek 的缓存命中数在顶层 prompt_cache_hit_tokens）。
+// error_kind（#1253）目前只有 'timeout'（超时），其他错误与成功为 null。都可空、没有默认值：迁移前的旧行为空
 export const llmCalls = platform.table('llm_calls', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
@@ -777,9 +781,14 @@ export const llmCalls = platform.table('llm_calls', {
   inputCount: integer('input_count'),
   promptTokens: integer('prompt_tokens'),
   completionTokens: integer('completion_tokens'),
+  reasoningTokens: integer('reasoning_tokens'),
+  cachedTokens: integer('cached_tokens'),
+  turnId: uuid('turn_id'),
+  actorEmail: text('actor_email'),
   durationMs: integer('duration_ms').notNull(),
   schemaValid: boolean('schema_valid'),
   error: text('error'),
+  errorKind: text('error_kind'),
   attempt: integer('attempt').notNull().default(1),
   createdAt: createdAt(),
 }, t => [index('llm_calls_tenant_created_idx').on(t.tenantId, t.createdAt)]);
