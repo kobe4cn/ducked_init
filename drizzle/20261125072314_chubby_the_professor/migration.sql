@@ -1,0 +1,1 @@
+ALTER TABLE "platform"."model_prices" ADD COLUMN "cached_input_per_m_tok" numeric(12,4);

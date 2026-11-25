@@ -43,14 +43,33 @@ const post = (browser: ReturnType<TestApp['client']>, overrides: Record<string, 
 describe('costOf：按当前单价折算金额（ADR-0057）', () => {
   const price = { inputPerMTok: 2.5, outputPerMTok: 10, currency: 'CNY' } as const;
 
-  it('金额 = prompt × 输入单价 / 1e6 + completion × 输出单价 / 1e6', () => {
-    expect(costOf(1_234_567, 89_000, price)).toBeCloseTo(1_234_567 * 2.5 / 1e6 + 89_000 * 10 / 1e6, 10);
+  it('金额 = (prompt − cached) × 输入单价 / 1e6 + cached × 缓存单价 / 1e6 + completion × 输出单价 / 1e6', () => {
+    expect(costOf(1_234_567, 89_000, null, price)).toBeCloseTo(1_234_567 * 2.5 / 1e6 + 89_000 * 10 / 1e6, 10);
   });
 
   it('token 为 null 按 0 算', () => {
-    expect(costOf(null, 89_000, price)).toBeCloseTo(0.89, 10);
-    expect(costOf(1_000_000, null, price)).toBeCloseTo(2.5, 10);
-    expect(costOf(null, null, price)).toBe(0);
+    expect(costOf(null, 89_000, null, price)).toBeCloseTo(0.89, 10);
+    expect(costOf(1_000_000, null, null, price)).toBeCloseTo(2.5, 10);
+    expect(costOf(null, null, null, price)).toBe(0);
+  });
+
+  it('cachedTokens 为 null 时结果与旧公式（全部 prompt 按输入单价）相同', () => {
+    expect(costOf(1_234_567, 89_000, null, price)).toBeCloseTo(1_234_567 * 2.5 / 1e6 + 89_000 * 10 / 1e6, 10);
+  });
+
+  it('没配缓存单价（字段缺省或为 null）时缓存 token 按输入单价算，结果与旧公式相同', () => {
+    const withCached = costOf(1_000_000, 89_000, 400_000, price);
+    expect(withCached).toBeCloseTo(1_000_000 * 2.5 / 1e6 + 89_000 * 10 / 1e6, 10);
+    expect(costOf(1_000_000, 89_000, 400_000, { ...price, cachedInputPerMTok: null })).toBeCloseTo(withCached, 10);
+  });
+
+  it('配了缓存单价时等于手算：缓存部分按缓存单价、剩余 prompt 按输入单价', () => {
+    // (1_000_000 − 400_000) × 2.5 / 1e6 + 400_000 × 0.5 / 1e6 + 89_000 × 10 / 1e6
+    expect(costOf(1_000_000, 89_000, 400_000, { ...price, cachedInputPerMTok: 0.5 }))
+      .toBeCloseTo(600_000 * 2.5 / 1e6 + 400_000 * 0.5 / 1e6 + 89_000 * 10 / 1e6, 10);
+    // 缓存 token 为 0 时缓存单价不参与
+    expect(costOf(1_000_000, 89_000, 0, { ...price, cachedInputPerMTok: 0.5 }))
+      .toBeCloseTo(1_000_000 * 2.5 / 1e6 + 89_000 * 10 / 1e6, 10);
   });
 });
 

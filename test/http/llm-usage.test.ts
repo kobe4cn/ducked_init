@@ -35,9 +35,9 @@ const callRow = (html: string, id: string) => html.match(new RegExp(`<tr[^>]*dat
 const turnRow = (html: string, turnId: string) => html.match(new RegExp(`<tr[^>]*data-turn="${turnId}"[\\s\\S]*?</tr>`))?.[0] ?? '';
 /** 明细行第一个单元格（时间列）的文本 */
 const timeCell = (rowHtml: string) => rowHtml.match(/<td[^>]*>([^<]*)<\/td>/)?.[1] ?? '';
-/** 直接给模型配单价（numeric 列传字符串），不经过运营后台 */
-const price = (model: string, inputPerMTok: string, outputPerMTok: string, currency: 'CNY' | 'USD') =>
-  getDb().insert(modelPrices).values({ model, inputPerMTok, outputPerMTok, currency });
+/** 直接给模型配单价（numeric 列传字符串），不经过运营后台；cached 是可选的缓存输入单价（#1255，表单在 #1256） */
+const price = (model: string, inputPerMTok: string, outputPerMTok: string, currency: 'CNY' | 'USD', cached?: string) =>
+  getDb().insert(modelPrices).values({ model, inputPerMTok, outputPerMTok, currency, ...(cached === undefined ? {} : { cachedInputPerMTok: cached }) });
 
 describe('模型调用统计', () => {
   it('管理员按用途看到近 7 / 30 天的统计与总计，数值与手算一致，看不到其他租户', async () => {
@@ -189,6 +189,30 @@ describe('模型调用统计', () => {
     expect(usageCell(usageRow(html, 'assistant'), 'cost')).toBe('未配置单价');
     // 总计用全部分组重算（CNY 0.0060×2、USD 0.0080×2），别的租户的 9.00 不出现
     expect(usageCell(usageRow(html, 'total'), 'cost')).toBe('CNY 0.0120 + USD 0.0160（部分模型未配置单价）');
+  });
+
+  it('配了缓存单价时，统计、总计与明细的金额都先减掉缓存 token 再按各单价折算，与手算一致', async () => {
+    const acme = await newTenant('acme');
+    await price('m-fast', '2', '8', 'CNY', '0.5'); // 缓存输入单价 0.5，比输入单价便宜
+    const [a, b, c] = (await getDb().insert(llmCalls).values([
+      // (1000 − 600) × 2 / 1e6 + 600 × 0.5 / 1e6 + 500 × 8 / 1e6 = CNY 0.0051
+      { tenantId: acme, purpose: 'connectivity', model: 'm-fast', durationMs: 100, promptTokens: 1000, completionTokens: 500, cachedTokens: 600, createdAt: ago(1) },
+      // (2000 − 400) × 2 / 1e6 + 400 × 0.5 / 1e6 + 1000 × 8 / 1e6 = CNY 0.0114
+      { tenantId: acme, purpose: 'connectivity', model: 'm-fast', durationMs: 100, promptTokens: 2000, completionTokens: 1000, cachedTokens: 400, createdAt: ago(2) },
+      // cached_tokens 为 null 按 0 算：500 × 2 / 1e6 + 100 × 8 / 1e6 = CNY 0.0018
+      { tenantId: acme, purpose: 'connectivity', model: 'm-fast', durationMs: 100, promptTokens: 500, completionTokens: 100, createdAt: ago(3) },
+    ]).returning({ id: llmCalls.id })).map(r => r.id);
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const html = await (await admin.get('/llm-usage?days=7')).text();
+    // 统计与总计：合计 prompt 3500（其中缓存 1000）、completion 1600 → (2500 × 2 + 1000 × 0.5 + 1600 × 8)/1e6 = CNY 0.0183
+    //（缓存全按输入单价算是 0.0198、缓存单价算整份 prompt 是 0.0203，都不是这个数）
+    expect(usageCell(usageRow(html, 'connectivity'), 'cost')).toBe('CNY 0.0183');
+    expect(usageCell(usageRow(html, 'total'), 'cost')).toBe('CNY 0.0183');
+    // 明细每行单独折算
+    expect(usageCell(callRow(html, a), 'cost')).toBe('CNY 0.0051');
+    expect(usageCell(callRow(html, b), 'cost')).toBe('CNY 0.0114');
+    expect(usageCell(callRow(html, c), 'cost')).toBe('CNY 0.0018');
   });
 
   it('数据工程师 / 分析师 / 查看者看不到入口，打开 403；没有调用时是空状态', async () => {

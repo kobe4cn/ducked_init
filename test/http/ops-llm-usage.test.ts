@@ -17,9 +17,9 @@ const ago = (days: number) => new Date(Date.now() - days * 86400_000);
 /** 造一条调用记录（默认 connectivity / m-fast，近 1 天） */
 const call = (tenantId: string, over: Partial<typeof llmCalls.$inferInsert> = {}) =>
   getDb().insert(llmCalls).values({ tenantId, purpose: 'connectivity', model: 'm-fast', durationMs: 100, createdAt: ago(1), ...over });
-/** 直接给模型配单价（numeric 列传字符串），不经过运营后台 */
-const price = (model: string, inputPerMTok: string, outputPerMTok: string, currency: 'CNY' | 'USD') =>
-  getDb().insert(modelPrices).values({ model, inputPerMTok, outputPerMTok, currency });
+/** 直接给模型配单价（numeric 列传字符串），不经过运营后台；cached 是可选的缓存输入单价（#1255，表单在 #1256） */
+const price = (model: string, inputPerMTok: string, outputPerMTok: string, currency: 'CNY' | 'USD', cached?: string) =>
+  getDb().insert(modelPrices).values({ model, inputPerMTok, outputPerMTok, currency, ...(cached === undefined ? {} : { cachedInputPerMTok: cached }) });
 
 /** 汇总表里（租户、模型、用途）一行 的 HTML（旧行 source 为 null，渲染成 data-source="none"） */
 const usageRow = (html: string, tenant: string, model: string, purpose: string) =>
@@ -89,6 +89,22 @@ describe('运营后台模型调用汇总', () => {
     // days 不在白名单：回退 7 天
     const fallback = usageRow(await (await browser.get('/ops/llm-usage?days=99')).text(), '示例商贸', 'm-fast', 'connectivity');
     expect(usageCell(fallback, 'calls')).toBe('2');
+  });
+
+  it('配了缓存单价时金额先减掉缓存 token 再按各单价折算，与手算一致', async () => {
+    const acme = (await createTenant('acme', '示例商贸', 'admin@acme.com')).tenant.id;
+    await price('m-fast', '2', '8', 'CNY', '0.5'); // 缓存输入单价 0.5，比输入单价便宜
+    await call(acme, { promptTokens: 1000, completionTokens: 500, cachedTokens: 600 }); // (400 × 2 + 600 × 0.5 + 500 × 8)/1e6
+    await call(acme, { promptTokens: 2000, completionTokens: 1000, cachedTokens: 400 }); // (1600 × 2 + 400 × 0.5 + 1000 × 8)/1e6
+    await call(acme, { promptTokens: 500, completionTokens: 100 }); // cached_tokens 为 null 按 0 算
+
+    const browser = await operator();
+    const html = await (await browser.get('/ops/llm-usage?days=7')).text();
+    // 合计 prompt 3500（其中缓存 1000）、completion 1600 → (2500 × 2 + 1000 × 0.5 + 1600 × 8)/1e6 = CNY 0.0183
+    //（缓存全按输入单价算是 0.0198，不是这个数）
+    const row = usageRow(html, '示例商贸', 'm-fast', 'connectivity');
+    expect(usageCell(row, 'calls')).toBe('3');
+    expect(usageCell(row, 'cost')).toBe('CNY 0.0183');
   });
 
   it('按（租户、模型、用途、来源）分组：同一组的租户 / 平台 / 旧行分成三行，窗口外不计入', async () => {

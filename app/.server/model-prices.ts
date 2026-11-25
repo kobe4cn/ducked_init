@@ -15,6 +15,8 @@ export interface ModelPrice {
   model: string;
   inputPerMTok: number;
   outputPerMTok: number;
+  /** 缓存输入单价（#1255）：没配（null）时缓存 token 按输入单价折算 */
+  cachedInputPerMTok: number | null;
   currency: PriceCurrency;
   updatedAt: Date;
 }
@@ -53,9 +55,10 @@ type PriceRow = typeof modelPrices.$inferSelect;
 
 const toPrice = (r: PriceRow): ModelPrice => ({
   model: r.model,
-  // pg 把 numeric 返回成字符串（"2.5000"），统一转成数字
+  // pg 把 numeric 返回成字符串（"2.5000"），统一转成数字；缓存单价可空，null 保留 null（不能 Number(null) 得 0，缓存 token 就成免费了）
   inputPerMTok: Number(r.inputPerMTok),
   outputPerMTok: Number(r.outputPerMTok),
+  cachedInputPerMTok: r.cachedInputPerMTok == null ? null : Number(r.cachedInputPerMTok),
   currency: r.currency as PriceCurrency,
   updatedAt: r.updatedAt,
 });
@@ -71,13 +74,21 @@ export async function priceMap(): Promise<Map<string, ModelPrice>> {
   return new Map((await listModelPrices()).map(p => [p.model, p]));
 }
 
-/** 金额 = prompt_tokens × 输入单价 / 1e6 + completion_tokens × 输出单价 / 1e6（ADR-0057）；token 为 null 按 0 算 */
+/**
+ * 金额 = (prompt_tokens − cached_tokens) × 输入单价 / 1e6 + cached_tokens × 缓存单价（没配按输入单价）/ 1e6
+ * + completion_tokens × 输出单价 / 1e6（ADR-0057，#1255）；token 为 null 按 0 算。
+ * prompt_tokens 本身已包含缓存 token（#1253 记的 cached_tokens 是 prompt 的一部分），所以先减掉再按各自单价算
+ */
 export function costOf(
   promptTokens: number | null,
   completionTokens: number | null,
-  price: Pick<ModelPrice, 'inputPerMTok' | 'outputPerMTok'>,
+  cachedTokens: number | null,
+  price: Pick<ModelPrice, 'inputPerMTok' | 'outputPerMTok'> & { cachedInputPerMTok?: number | null },
 ): number {
-  return ((promptTokens ?? 0) * price.inputPerMTok + (completionTokens ?? 0) * price.outputPerMTok) / 1_000_000;
+  const cached = cachedTokens ?? 0;
+  return (((promptTokens ?? 0) - cached) * price.inputPerMTok
+    + cached * (price.cachedInputPerMTok ?? price.inputPerMTok)
+    + (completionTokens ?? 0) * price.outputPerMTok) / 1_000_000;
 }
 
 /** 一组调用折算后的结果：各币种金额（先累加，显示时才保留 4 位小数）与已配价 / 未配价的调用次数 */
@@ -89,14 +100,14 @@ export interface CostSummary {
 
 /** 把按 (purpose, model) 或单次调用的一组行折算成各币种金额（ADR-0057）：未配单价的模型只计 unpricedCalls，不当 0 算 */
 export function summarizeCost(
-  rows: { model: string; promptTokens: number | null; completionTokens: number | null; calls: number }[],
+  rows: { model: string; promptTokens: number | null; completionTokens: number | null; cachedTokens: number | null; calls: number }[],
   prices: Map<string, ModelPrice>,
 ): CostSummary {
   const summary: CostSummary = { byCurrency: {}, pricedCalls: 0, unpricedCalls: 0 };
   for (const r of rows) {
     const p = prices.get(r.model);
     if (p === undefined) { summary.unpricedCalls += r.calls; continue; }
-    summary.byCurrency[p.currency] = (summary.byCurrency[p.currency] ?? 0) + costOf(r.promptTokens, r.completionTokens, p);
+    summary.byCurrency[p.currency] = (summary.byCurrency[p.currency] ?? 0) + costOf(r.promptTokens, r.completionTokens, r.cachedTokens, p);
     summary.pricedCalls += r.calls;
   }
   return summary;
