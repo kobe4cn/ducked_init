@@ -4,6 +4,8 @@
 // 失败都按整次失败处理）→ 模型失败时事务外记 knowledge_source.parse_failed 审计再 422（detail 只有标题、种类、版本、stage 与
 // 错误摘要，不记原文）→ dropKnown 丢掉和调模型前已生效知识相同的提案（#948）→ 事务里 proposeMany 与审计
 // knowledge_source.parsed（detail 只有标题、种类、版本、各类计数与被丢条目的目标与原因，不记段落原文、提示词与提案内容）。
+// 客户端中止（外部 signal，#1251）：422「解析来源失败：请求已取消」，不写提案与任何审计（含 parse_failed——中止不是模型失败），
+// 分块时中止后不再发后续块的请求（已发出的那次照常记 llm_calls，已经计费）；来源在调模型之前就已保存，中止不影响。
 // 来源只是待解析的数据，SQL 与文本绝不执行：本文件不 import 工作台、pipeline 与 DuckDB 相关模块。
 // 同一来源再解析会再调一次模型，重复提案靠指纹去重（不建代次表）；路由与页面在 #527 接
 import { assertCan } from '../access';
@@ -11,7 +13,7 @@ import { recordAudit } from '../audit';
 import type { CurrentMember } from '../auth';
 import { tenantCatalog } from '../catalog/load';
 import { getDb } from '../db/client';
-import { chatJson, LlmError, resolveProvider } from '../llm';
+import { chatJson, LlmError, resolveProvider, throwIfAborted } from '../llm';
 import { currentBases } from './basis';
 import { chunkParagraphs, IMPORT_SCHEMA, importInput, importMessages, mergeOutputs, outputToProposals, type ImportOutput } from './import-draft';
 import { dropKnown } from './known';
@@ -41,9 +43,10 @@ export interface ImportResult {
  * 逐块调用、各块输出合并去重（#1274），任何一块失败都按整次失败处理；不合 IMPORT_SCHEMA 的输出整次 422 并在
  * 事务外记 parse_failed 审计（只记 stage 与错误摘要），合 Schema 但不合法的单条丢弃、计入 invalid 并把目标与
  * 原因记进审计（#955），与调模型前已生效知识相同的丢掉、计入 skipped（#948），剩下的经 proposeMany 写进提案
- * （按解析前的依据快照跳过已变的目标），审计只记计数
+ * （按解析前的依据快照跳过已变的目标），审计只记计数。signal 是外部中止（#1251）：中止时 422「解析来源失败：请求已取消」，
+ * 不写提案与任何审计（含 parse_failed），分块时中止后不再发后续块的请求
  */
-export async function importFromSource(actor: CurrentMember, sourceId: unknown): Promise<ImportResult> {
+export async function importFromSource(actor: CurrentMember, sourceId: unknown, signal?: AbortSignal): Promise<ImportResult> {
   assertCan(actor, 'definitions:draft');
   const tenantId = actor.tenant.id;
   const source = await getKnowledgeSource(actor, sourceId);
@@ -60,20 +63,25 @@ export async function importFromSource(actor: CurrentMember, sourceId: unknown):
   try {
     for (const chunk of chunks) {
       // 每块只换段落、条目整份照带（模型要认得目标）；合并去重后段号仍是整份来源的段号，段号校验针对整份来源
-      outputs.push(await chatJson<ImportOutput>(tenantId, 'knowledge_import', importMessages({ ...input, paragraphs: chunk }), IMPORT_SCHEMA));
+      outputs.push(await chatJson<ImportOutput>(tenantId, 'knowledge_import', importMessages({ ...input, paragraphs: chunk }), IMPORT_SCHEMA, { signal }));
+      // 模型回复到手时客户端可能已中止（途中中止的请求已发出并计费，llm_calls 留着）：拦下来，不进提案与审计（#1251）
+      throwIfAborted(signal);
     }
     output = mergeOutputs(outputs);
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
     // 失败审计写在事务外（用 getDb）：整次失败没有可回滚的写入，审计也一定留下（照 suggest-run 先例）；
-    // detail 只记阶段与错误摘要（Key 已由 llm.ts 抹掉），不放段落原文、提示词与模型输出
-    await recordAudit(getDb(), {
-      tenantId, actor, action: 'knowledge_source.parse_failed', targetType: 'knowledge_source', targetId: source.id,
-      detail: {
-        sourceId: source.id, title: source.title, kind: source.kind, version: source.version,
-        stage: 'model', error: e.message.slice(0, 200),
-      },
-    });
+    // detail 只记阶段与错误摘要（Key 已由 llm.ts 抹掉），不放段落原文、提示词与模型输出。
+    // 客户端中止（#1251）不是模型失败：不记 parse_failed，只走同一条 422（来源已保存，再提交同标题同正文是安全的重试）
+    if (!e.aborted) {
+      await recordAudit(getDb(), {
+        tenantId, actor, action: 'knowledge_source.parse_failed', targetType: 'knowledge_source', targetId: source.id,
+        detail: {
+          sourceId: source.id, title: source.title, kind: source.kind, version: source.version,
+          stage: 'model', error: e.message.slice(0, 200),
+        },
+      });
+    }
     throw new ImportError(`解析来源失败：${e.message}`, 422);
   }
 
