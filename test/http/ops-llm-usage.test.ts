@@ -1,7 +1,7 @@
 // test/http/ops-llm-usage.test.ts —— 运营后台「模型调用汇总」页（#746）：跨租户按（租户、模型、用途、来源）分组汇总近 7/30 天的调用，
 // 次数、token、按当前单价折算的金额（ADR-0057）与错误率和手算一致；来源（#844）是分组键之一：同一组的租户 / 平台 / 旧行分成三行，
 // 列显示「租户」/「平台」/「—」；窗口外的调用不出现；未登录与成员会话（包括租户管理员）
-// 被拒（302 到 /ops/login）；页面只放聚合数，不含错误原文（ADR-0007）
+// 被拒（302 到 /ops/login）；页面只放聚合数，不含错误原文，也不显示成员 email（actor_email，ADR-0007，#1254）
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { llmCalls, modelPrices } from '../../app/.server/db/schema';
@@ -126,7 +126,8 @@ describe('运营后台模型调用汇总', () => {
     expect((await app.client().get('/ops/llm-usage')).headers.get('Location')).toBe('/ops/login');
 
     const acme = (await createTenant('acme', '示例商贸', 'admin@acme.com')).tenant.id;
-    await call(acme, { promptTokens: 100, completionTokens: 100, error: 'secret-business-text' });
+    // 带 actor_email 的行（#1253 之后会有）：运营页不显示成员 email（ADR-0007，#1254）
+    await call(acme, { promptTokens: 100, completionTokens: 100, error: 'secret-business-text', turnId: crypto.randomUUID(), actorEmail: 'secret-member@acme.com' });
     const admin = await loginAs(app, 'admin@acme.com');
     const denied = await admin.get('/ops/llm-usage');
     expect(denied.status).toBe(302);
@@ -137,5 +138,6 @@ describe('运营后台模型调用汇总', () => {
     const html = await (await browser.get('/ops/llm-usage')).text();
     expect(usageCell(usageRow(html, '示例商贸', 'm-fast', 'connectivity'), 'errors')).toBe('1（100%）');
     expect(html).not.toContain('secret-business-text');
+    expect(html).not.toContain('secret-member@acme.com');
   });
 });

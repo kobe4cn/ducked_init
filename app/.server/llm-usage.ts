@@ -1,9 +1,10 @@
-// app/.server/llm-usage.ts —— 模型调用统计（#303，Spec #1 故事 94）：给「模型调用」页按用途汇总 platform.llm_calls（近 N 天）并取最近调用明细；
+// app/.server/llm-usage.ts —— 模型调用统计（#303，Spec #1 故事 94）：给「模型调用」页按用途汇总 platform.llm_calls（近 N 天）并取最近调用明细，
+// 另有「按轮次」视图（#1254）：按 turn_id 分组看每轮的请求次数、token 合计与发起人（listTurns）；
 // 运营后台「模型调用汇总」（#746）跨租户按（租户、模型、用途）分组，只取聚合数（ADR-0007）。
 // 质量看 Schema 通过率、错误率与耗时；成本按 (purpose, model) 分组、用查看时的当前单价折算成各币种金额（ADR-0057，#745）。
 // 映射草稿另有「校验通过率」（#802）：不在 llm_calls 记，从 mapping_generations 加审计算（ADR-0035，见 draftCheckStats）。
 // 总计是单独一条不分组的聚合（不能拿各用途的 P95 再平均）；pg 把 bigint / numeric / double 当字符串返回，统一 Number() + Math.round 成整数
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, isNotNull, sql } from 'drizzle-orm';
 import { cmp, cmpName } from '../lib/compare';
 import { getDb } from './db/client';
 import { auditLogs, llmCalls, mappingGenerations, tenants } from './db/schema';
@@ -27,6 +28,8 @@ export interface PurposeUsage {
   schemaChecked: number;
   schemaValid: number;
   errors: number;
+  /** 超时次数（#1254）：error_kind = 'timeout' 的行，是错误的子集（超时行也写 error），不从错误数里减 */
+  timeouts: number;
   /** 按当前单价折算的金额（ADR-0057）：各币种「CNY 0.1234 + USD 0.0100」，未配单价时有对应提示 */
   cost: string;
   /** 映射草稿的「校验通过率」（#802）：checked 分母（做了映射校验的生成）、passed 通过、partial 部分采用；只有 mapping_draft 行有 */
@@ -46,6 +49,7 @@ const agg = () => ({
   schemaChecked: sql<number>`count(*) filter (where ${llmCalls.schemaValid} is not null)`,
   schemaValid: sql<number>`count(*) filter (where ${llmCalls.schemaValid})`,
   errors: sql<number>`count(*) filter (where ${llmCalls.error} is not null)`,
+  timeouts: sql<number>`count(*) filter (where ${llmCalls.errorKind} = 'timeout')`,
 });
 
 const toUsage = (r: Record<string, unknown>, purpose: string): Omit<PurposeUsage, 'cost'> => ({
@@ -58,6 +62,7 @@ const toUsage = (r: Record<string, unknown>, purpose: string): Omit<PurposeUsage
   schemaChecked: Number(r.schemaChecked ?? 0),
   schemaValid: Number(r.schemaValid ?? 0),
   errors: Number(r.errors ?? 0),
+  timeouts: Number(r.timeouts ?? 0),
 });
 
 /**
@@ -230,5 +235,59 @@ export async function listCalls(tenantId: string, days: 7 | 30, page: number) {
     ...r,
     cost: formatCost(summarizeCost([{ model: r.model, promptTokens: r.promptTokens, completionTokens: r.completionTokens, calls: 1 }], prices)),
   }));
+  return { rows, total, page: current, pages };
+}
+
+/** 「按轮次」视图的一行（#1254）：一个 turn_id 在窗口内的调用聚合；不折算金额（只看次数与 token） */
+export interface TurnUsage {
+  turnId: string;
+  /** 这轮最早一次调用的时间（分组里的 min(created_at)） */
+  startedAt: Date;
+  /** 发起人：只有助手一轮（withLlmContext）记提问人，其他用途为 null */
+  actorEmail: string | null;
+  /** 这轮出现过的用途，去重后按字典序（页面用 ', ' 拼，不在 SQL 里拼，避免英文界面漏汉字） */
+  purposes: string[];
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+  /** 其中缓存 token：超时的调用四种 token 都是 null，不在合计里 */
+  cachedTokens: number;
+}
+
+/**
+ * 按轮次（turn_id）分组（#1254）：窗口内带 turn_id 的行才出现（旧行为 null，不出现），开始时间倒序、同开始按 turn_id 倒序保证稳定，
+ * 分页与页码夹取照 listCalls（LLM_CALL_PAGE_SIZE、total 是窗口内的总轮次数 count(distinct turn_id)）。
+ * 跨窗口边界的轮次只算窗口内的行；pg 的 count / sum 是字符串、timestamp 已是 Date，统一 Number() / new Date()（照 toUsage）
+ */
+export async function listTurns(tenantId: string, days: 7 | 30, page: number) {
+  const db = getDb();
+  const where = and(inWindow(tenantId, days), isNotNull(llmCalls.turnId));
+  const [counted] = await db.select({ total: sql<number>`count(distinct ${llmCalls.turnId})` }).from(llmCalls).where(where);
+  const total = Number(counted?.total ?? 0);
+  const pages = Math.max(1, Math.ceil(total / LLM_CALL_PAGE_SIZE));
+  const current = Math.min(Math.max(1, page), pages);
+  const picked = total === 0 ? [] : await db.select({
+    turnId: llmCalls.turnId,
+    startedAt: sql<Date | string>`min(${llmCalls.createdAt})`,
+    actorEmail: sql<string | null>`max(${llmCalls.actorEmail})`,
+    purposes: sql<string[]>`array_agg(distinct ${llmCalls.purpose} order by ${llmCalls.purpose})`,
+    calls: sql<number>`count(*)`,
+    promptTokens: sql<number>`coalesce(sum(${llmCalls.promptTokens}), 0)`,
+    completionTokens: sql<number>`coalesce(sum(${llmCalls.completionTokens}), 0)`,
+    cachedTokens: sql<number>`coalesce(sum(${llmCalls.cachedTokens}), 0)`,
+  }).from(llmCalls).where(where)
+    .groupBy(llmCalls.turnId)
+    .orderBy(desc(sql`min(${llmCalls.createdAt})`), desc(llmCalls.turnId))
+    .limit(LLM_CALL_PAGE_SIZE).offset((current - 1) * LLM_CALL_PAGE_SIZE);
+  const rows: TurnUsage[] = picked.flatMap(r => r.turnId ? [{
+    turnId: r.turnId,
+    startedAt: new Date(r.startedAt),
+    actorEmail: r.actorEmail ?? null,
+    purposes: r.purposes ?? [],
+    calls: Number(r.calls ?? 0),
+    promptTokens: Number(r.promptTokens ?? 0),
+    completionTokens: Number(r.completionTokens ?? 0),
+    cachedTokens: Number(r.cachedTokens ?? 0),
+  }] : []);
   return { rows, total, page: current, pages };
 }

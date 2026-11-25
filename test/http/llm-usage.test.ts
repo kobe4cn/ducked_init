@@ -3,6 +3,8 @@
 // 映射草稿一行另有「校验通过率」（#802）：从 mapping_generations（origin=model，items 带 dropped 键的是部分采用）加
 // mapping.model_draft_failed 审计（stage=mapping、无 kind）算，部分采用单独计数，其他用途与总计是「—」；
 // 指标卡另有「调用来源」卡（#844）：窗口内按租户 / 平台端点分开计数，旧行计入「未记录」，别的租户与窗口外不计入；
+// 「按轮次」视图（#1254，?tab=turns）：按 turn_id 聚合出每轮的请求次数、token / 缓存合计、发起人与用途，旧行（turn_id 为 null）不出现；
+// 统计表与总计新增「超时」列（#1254）：数 error_kind = 'timeout' 的行（错误的子集），表下注明超时调用的 token 不在统计里；
 // 数据工程师 / 分析师 / 查看者看不到入口、打开 403；
 // 数字与日期跟随界面语言（#928）：英文界面（开关 + crm_locale=en）明细时间是 M/D/YYYY, h:mm:ss AM、token 仍带千分位，中文界面保持 2026/… 格式
 import { eq } from 'drizzle-orm';
@@ -29,6 +31,8 @@ const usageRow = (html: string, purpose: string) => html.match(new RegExp(`<tr[^
 const usageCell = (rowHtml: string, col: string) => rowHtml.match(new RegExp(`data-col="${col}"[^>]*>([^<]*)<`))?.[1] ?? '';
 /** 明细里某次调用的一行 HTML */
 const callRow = (html: string, id: string) => html.match(new RegExp(`<tr[^>]*data-call-id="${id}"[\\s\\S]*?</tr>`))?.[0] ?? '';
+/** 「按轮次」表里某个轮次的一行 HTML */
+const turnRow = (html: string, turnId: string) => html.match(new RegExp(`<tr[^>]*data-turn="${turnId}"[\\s\\S]*?</tr>`))?.[0] ?? '';
 /** 明细行第一个单元格（时间列）的文本 */
 const timeCell = (rowHtml: string) => rowHtml.match(/<td[^>]*>([^<]*)<\/td>/)?.[1] ?? '';
 /** 直接给模型配单价（numeric 列传字符串），不经过运营后台 */
@@ -303,12 +307,93 @@ describe('模型调用统计', () => {
     expect(usageCell(callRow(html, legacy), 'source')).toBe('—');
   });
 
+  it('「按轮次」视图（?tab=turns）按 turn_id 聚合：请求次数、token 与缓存合计、发起人（null 是「—」）与用途拼接，按开始时间倒序；旧行、窗口外与别的租户的轮次不出现', async () => {
+    const acme = await newTenant('acme');
+    const globex = await newTenant('globex');
+    const initech = await newTenant('initech');
+    const oldTurn = crypto.randomUUID();
+    const newTurn = crypto.randomUUID();
+    // 新轮次（1 天前）：3 次调用、两种用途，输入 30+40+50 / 输出 15+20+25，缓存 7+null+0=7（同一轮同一发起人）
+    await call(acme, { turnId: newTurn, actorEmail: 'an@acme.com', purpose: 'assistant', promptTokens: 30, completionTokens: 15, cachedTokens: 7 });
+    await call(acme, { turnId: newTurn, actorEmail: 'an@acme.com', purpose: 'assistant', promptTokens: 40, completionTokens: 20 });
+    await call(acme, { turnId: newTurn, actorEmail: 'an@acme.com', purpose: 'connectivity', promptTokens: 50, completionTokens: 25 });
+    // 旧轮次（3 天前）：发起人为 null
+    await call(acme, { turnId: oldTurn, purpose: 'assistant', promptTokens: 10, completionTokens: 5, createdAt: ago(3) });
+    // 旧行（turn_id 为 null）不出现在按轮次视图里
+    await call(acme, { promptTokens: 999, completionTokens: 999 });
+    // 窗口外与别的租户的轮次不出现
+    const outWindowTurn = crypto.randomUUID();
+    const initechTurn = crypto.randomUUID();
+    await call(acme, { turnId: outWindowTurn, promptTokens: 1, createdAt: ago(40) });
+    await call(initech, { turnId: initechTurn, actorEmail: 'de@initech.com', promptTokens: 111 });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const html = await (await admin.get('/llm-usage?tab=turns')).text();
+    // 开始时间倒序：新轮次在前；旧行、窗口外与别的租户的轮次都不出现（整页只有这两轮的行）
+    expect(html.indexOf(`data-turn="${newTurn}"`)).toBeLessThan(html.indexOf(`data-turn="${oldTurn}"`));
+    expect(html.match(/<tr[^>]*data-turn=/g)).toHaveLength(2);
+    expect(html).not.toContain(`data-turn="${outWindowTurn}"`);
+    expect(html).not.toContain(`data-turn="${initechTurn}"`);
+    expect(html).not.toContain('de@initech.com');
+    // 新轮次：3 次请求、输入 / 输出合计、其中缓存 7、发起人、用途去重后按字典序用 , 拼
+    const row = turnRow(html, newTurn);
+    expect(usageCell(row, 'calls')).toBe('3');
+    expect(usageCell(row, 'tokens')).toBe('120 / 60');
+    expect(usageCell(row, 'cached')).toBe('7');
+    expect(usageCell(row, 'actor')).toBe('an@acme.com');
+    expect(usageCell(row, 'purposes')).toBe('assistant, connectivity');
+    // 旧轮次：发起人 null 显示 —
+    expect(usageCell(turnRow(html, oldTurn), 'actor')).toBe('—');
+    // 指标卡两种视图都显示：总调用 5（含 turn_id 为 null 的旧行）
+    const tile = (label: string) => html.match(new RegExp(`${label}</div><div[^>]*>([^<]*)<`))?.[1];
+    expect(tile('总调用')).toBe('5');
+    // 分页同明细（每页 50、总轮次数做分母）
+    expect(html).toContain('第 1 / 1 页，每页 50 条');
+    // 切天数的链接保留视图（当前 days=7、目标 days=30 都带 tab=turns）；切回「按用途」的链接带 days
+    expect(html).toContain('href="/llm-usage?days=7&amp;tab=turns"');
+    expect(html).toContain('href="/llm-usage?days=30&amp;tab=turns"');
+    expect(html).toContain('href="/llm-usage?days=7&amp;tab=purpose"');
+    // 30 天窗口：仍是这两轮（40 天前的不出现），旧行还是不出现
+    const month = await (await admin.get('/llm-usage?days=30&tab=turns')).text();
+    expect(month.match(/<tr[^>]*data-turn=/g)).toHaveLength(2);
+    expect(month).not.toContain(`data-turn="${outWindowTurn}"`);
+
+    // 有调用但没有带 turn_id 的行：轮次视图一句空状态（不是整页空状态）
+    await call(globex, { promptTokens: 1 });
+    const other = await loginAs(app, 'admin@globex.com');
+    const empty = await (await other.get('/llm-usage?tab=turns')).text();
+    expect(empty).toContain('近 7 天没有按轮次记录的调用');
+    expect(empty).not.toContain('暂无模型调用');
+  });
+
+  it('按用途的表与总计新增「超时」列：数 error_kind 为 timeout 的行（错误的子集，不从错误数里减），表下注明超时调用的 token 不在统计里', async () => {
+    const acme = await newTenant('acme');
+    await call(acme, { promptTokens: 10, completionTokens: 5 }); // 成功
+    await call(acme, { error: '请求超时', errorKind: 'timeout' }); // 超时：token 都是 null
+    await call(acme, { error: 'HTTP 500', errorKind: null }); // 其他错误：error_kind 为 null
+    await call(acme, { purpose: 'assistant', error: '请求超时', errorKind: 'timeout', promptTokens: 1, completionTokens: 1 });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const html = await (await admin.get('/llm-usage?days=7')).text();
+    // connectivity：1 次超时、2 次错误（超时是错误的子集，不从错误数里减）；assistant：1 次超时
+    expect(usageCell(usageRow(html, 'connectivity'), 'timeouts')).toBe('1');
+    expect(usageCell(usageRow(html, 'connectivity'), 'errors')).toBe('2（66.7%）');
+    expect(usageCell(usageRow(html, 'assistant'), 'timeouts')).toBe('1');
+    // 总计共用 UsageRow：2 次超时
+    expect(usageCell(usageRow(html, 'total'), 'timeouts')).toBe('2');
+    // 表头在「错误」之后，表下注明超时调用的 token 不在统计里
+    expect(html.indexOf('超时</th>')).toBeGreaterThan(html.indexOf('错误</th>'));
+    expect(html).toContain('data-note="timeouts"');
+    expect(html).toContain('超时的调用拿不到 token，这些调用的 token 不在统计里');
+  });
+
   it('英文界面（开关 + crm_locale=en）下明细时间是英文格式（AM/PM）、token 仍带千分位；不开开关时同一行还是中文格式', async () => {
     const acme = await newTenant('acme');
     const at = new Date(Date.now() - 60_000); // 已知时间：落在 7 天窗口内
+    const turn = crypto.randomUUID();
     const [id] = (await getDb().insert(llmCalls).values({
       tenantId: acme, purpose: 'connectivity', model: 'm-fast', durationMs: 100,
-      promptTokens: 1234567, completionTokens: 8901, createdAt: at,
+      promptTokens: 1234567, completionTokens: 8901, cachedTokens: 100, turnId: turn, actorEmail: 'an@acme.com', createdAt: at,
     }).returning({ id: llmCalls.id })).map(r => r.id);
 
     const admin = await loginAs(app, 'admin@acme.com');
@@ -320,6 +405,13 @@ describe('模型调用统计', () => {
     expect(timeCell(en)).toMatch(/^\d{1,2}\/\d{1,2}\/\d{4}, \d{1,2}:\d{2}:\d{2} [AP]M$/);
     expect(en).toContain('1,234,567');
     expect(en).toContain('8,901');
+    // 「按轮次」视图（#1254）：同一轮的开始时间也是英文格式，token / 缓存带千分位，发起人原样
+    const enTurns = turnRow(await (await admin.get('/llm-usage?tab=turns')).text(), turn);
+    expect(timeCell(enTurns)).toMatch(/^\d{1,2}\/\d{1,2}\/\d{4}, \d{1,2}:\d{2}:\d{2} [AP]M$/);
+    expect(usageCell(enTurns, 'calls')).toBe('1');
+    expect(usageCell(enTurns, 'tokens')).toBe('1,234,567 / 8,901');
+    expect(usageCell(enTurns, 'cached')).toBe('100');
+    expect(usageCell(enTurns, 'actor')).toBe('an@acme.com');
 
     // 关掉开关（cookie 还在）：同一行回到 2026/… 的中文格式，token 不变
     vi.unstubAllEnvs();
