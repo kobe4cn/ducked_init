@@ -221,7 +221,7 @@ export const HANDLERS = {
       if (!piiSalt) throw new Error('缺少敏感信息盐');
       const p = CONTRACTS['silver.merge'].params.parse(raw);
       const result = await mergeToSilver(session, p.mappings, piiSalt, redact, p.identity, p.relations, p.identityForce,
-        p.consumerSensitive, p.survivorship, p.drop, taskId, p.identityExclude);
+        p.consumerSensitive, p.survivorship, p.drop, taskId, p.identityExclude, p.loginEvents);
       const failed = result.mappings.filter(m => 'error' in m);
       const problems = [
         ...(failed.length ? [`${failed.length} 个映射合并失败：${failed.map(m => `${m.entity} ← ${m.table}（${'error' in m ? m.error : ''}）`).join('；')}`] : []),

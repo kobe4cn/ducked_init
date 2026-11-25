@@ -116,6 +116,22 @@ describe('身份打通：多源消费者确定性合并', () => {
     expect(await views()).toEqual([{ consumer_id: await consumerOf('crm:3'), value: 1 }]);
   });
 
+  it('埋点映射配置 login_events 后按配置的取值认登录事件，这个映射里的 login 不再算登录', async () => {
+    const { acme, author, reviewer, sources, names } = await publishedIdentitySources();
+    await grantOnSource(`INSERT INTO tracking.events (event_id, user_id, device_id, event_type, ts) VALUES ('e10', 'u1', 'd5', 'sign_in', '2024-06-05 09:00')`);
+    await syncSource(author, sources.tracking);
+    await drain();
+    // 配置之前 sign_in 不算登录：d5 没有归属，设备仍按 login 算
+    expect((await identities(acme)).devices.map(d => d.device_id)).toEqual(['d1', 'd2']);
+
+    const events = (await listMappings(author)).mappings.find(m => m.entity === 'event')!;
+    await republish(author, reviewer, events.id, TRACKING_EVENTS.replace('entity: event\n', 'entity: event\nlogin_events: [sign_in]\n'));
+    const { rows, devices } = await identities(acme);
+    const u1 = rows.find(r => `${names[r._source]}:${r.customer_id}` === 'tracking:u1')!.consumer_id;
+    // 重新发布（login_events 变了强制重算）后只有 sign_in 算登录：d5 归 u1；d1、d2 的 login 不再算，没有归属
+    expect(devices).toEqual([{ device_id: 'd5', consumer_id: u1, login_at: '2024-06-05 09:00' }]);
+  });
+
   it('event 指标的快照里匿名事件经设备归属计入设备主人；没有 _device_owner 的老湖给出提示', async () => {
     const { acme, names } = await publishedIdentitySources();
     const { rows } = await identities(acme);
