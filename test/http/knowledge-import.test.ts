@@ -78,6 +78,9 @@ describe('知识粘贴导入页与来源原文页', () => {
     expect(html).toContain(`已从《${TITLE}》新建 3 条提案，跳过 0 条`);
     expect(statOf(html, '待确认提案')).toBe('3');
     expect(html).toContain('href="/knowledge/import"');
+    // 三段短正文不分块：地址不带 split，提示里也没有「来源太长，已分段」
+    expect(res.headers.get('location')!).not.toContain('split');
+    expect(html).not.toContain('来源太长，已分段');
 
     // 同样内容再提交：模型再调一次，重复提案按指纹计跳过
     const again = await an.post('/knowledge/import', { title: TITLE, kind: 'metric', body: BODY });
@@ -94,6 +97,27 @@ describe('知识粘贴导入页与来源原文页', () => {
     const source = await theSource(acme);
     expect(source.title).toBe(TITLE);
   }, 180_000); // 每个用例都跑 publishedIdentitySources（平均 26.8 s，docs/test-plans/test-duration-report.md），4 个 worker 并行时超过默认的 90 s
+
+  it('长正文分块解析（chunks=2）：302 地址带 split=1，集中页提示在计数后有「来源太长，已分段」', async () => {
+    const { acme } = await setup();
+    const an = await loginAs(app, 'an@acme.com');
+    platformDefault();
+    // 固定应答：两块都回同样三条，去重后 created=3、skipped=0（#1276 的 Watch out）
+    fakeLlm(f => app.setLlmFetch(f), () => json(modelOutput()));
+    // 12 段各约 800 字（合计约 9,600 字，超过 IMPORT_CHUNK_CHARS = 6,000）：正好分 2 块
+    const paragraphs = Array.from({ length: 12 }, (_, i) => `第${i + 1}段的口径说明。${'甲'.repeat(790)}`);
+    const res = await an.post('/knowledge/import', { title: TITLE, kind: 'metric', body: paragraphs.join('\n\n') });
+    expect(res.status).toBe(302);
+    expect(decodeURIComponent(res.headers.get('location')!)).toBe(`/knowledge?imported=${TITLE}&created=3&skipped=0&split=1`);
+
+    const html = await pageOf(an, res.headers.get('location')!);
+    expect(html).toContain(`已从《${TITLE}》新建 3 条提案，跳过 0 条`);
+    expect(html).toContain('来源太长，已分段');
+    expect(statOf(html, '待确认提案')).toBe('3');
+    // 来源只保存一条（第 1 版），分段不影响保存
+    const source = await theSource(acme);
+    expect(source.title).toBe(TITLE);
+  }, 180_000); // 每个用例都跑 publishedIdentitySources，4 个 worker 并行时超过默认的 90 s
 
   it('提案全部接受后同标题同正文再提交：和已生效知识相同的提案落库前丢掉，302 带 created=0&skipped=3，提案表不增加', async () => {
     const { acme, analyst } = await setup();

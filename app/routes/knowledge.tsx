@@ -80,6 +80,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     title: importedName,
     created: Number(search.get('created')) || 0,
     skipped: Number(search.get('skipped')) || 0,
+    split: search.get('split') === '1',
   };
   return { email: member.email, nav: navFor(member), hub, selected, subjectIds, canSuggest: can(member.role, 'definitions:draft'), suggested, packApplied, imported };
 }
@@ -230,7 +231,10 @@ export default function Knowledge({ loaderData, actionData }: Route.ComponentPro
       {imported && !actionData?.error && (
         <Alert role="status" className="mb-4">
           <CheckCircle2 className="text-emerald-600" />
-          <AlertTitle>{t('已从《{title}》新建 {created, plural, other {# 条提案}}，跳过 {skipped} 条', { title: imported.title, created: imported.created, skipped: imported.skipped })}</AlertTitle>
+          <AlertTitle>
+            {t('已从《{title}》新建 {created, plural, other {# 条提案}}，跳过 {skipped} 条', { title: imported.title, created: imported.created, skipped: imported.skipped })}
+            {imported.split && <>　{t('来源太长，已分段')}</>}
+          </AlertTitle>
         </Alert>
       )}
       {actionData?.error && !actionData.targetId && (
