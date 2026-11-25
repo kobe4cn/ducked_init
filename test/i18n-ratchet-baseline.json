@@ -79,7 +79,7 @@
     "app/.server/pipeline/mapping-draft.ts": 32,
     "app/.server/pipeline/mapping-spec.ts": 84,
     "app/.server/pipeline/merge-engine.ts": 121,
-    "app/.server/pipeline/model-draft.ts": 33,
+    "app/.server/pipeline/model-draft.ts": 34,
     "app/.server/pipeline/reveal-engine.ts": 6,
     "app/.server/pipeline/schema-diff.ts": 1,
     "app/.server/pipeline/schema-repair.ts": 9,
