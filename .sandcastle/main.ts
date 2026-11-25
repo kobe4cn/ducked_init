@@ -47,7 +47,7 @@ import {
   type AgentRun, type Phase, type UsageRecord,
 } from "./models.ts";
 import { blockersOf, changedFiles, type FlakySighting, flakyTickets, flakyTriage, splitChildren } from "./guide.ts";
-import { acceptanceSection, checkAcceptanceNotes, replaceSection, restSections } from "./pr-body.ts";
+import { acceptanceSection, assistantTexts, checkAcceptanceNotes, replaceSection, restSections, runTagged } from "./pr-body.ts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -637,8 +637,10 @@ const peakContext = (...runs: ({ readonly iterations: readonly sandcastle.Iterat
     ...runs.flatMap((run) => (run?.iterations ?? []).map(sessionPeak)),
   );
 
-const tagged = (stdout: string, tag: string) =>
-  new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(stdout)?.[1]?.trim();
+/** 一次运行的结论标签：最终输出里没有时到会话文件的 assistant 文字里找（见 pr-body.ts 的 runTagged）。 */
+const runTag = (run: sandcastle.SandboxRunResult, tag: string) =>
+  runTagged(run.stdout, run.iterations.flatMap((it) =>
+    it.sessionFilePath && existsSync(it.sessionFilePath) ? assistantTexts(readFileSync(it.sessionFilePath, "utf8")) : []), tag);
 
 type Issue = { id: string; title: string; branch: string };
 
@@ -921,8 +923,8 @@ async function build(issue: Issue) {
     // reviewer 给 revise：修改意见交给新的 implementer 会话，改完再审一次。
     const reviews = [await runReview(0)];
     const revisions: { items: string; run: sandcastle.SandboxRunResult }[] = [];
-    while (revisions.length < REVISE_MAX && tagged(reviews.at(-1)!.stdout, "verdict") === "revise") {
-      const items = tagged(reviews.at(-1)!.stdout, "revise") ?? "（reviewer 没有列出修改意见）";
+    while (revisions.length < REVISE_MAX && runTag(reviews.at(-1)!, "verdict") === "revise") {
+      const items = runTag(reviews.at(-1)!, "revise") ?? "（reviewer 没有列出修改意见）";
       const name = `revise-${issue.id}-${revisions.length + 1}`;
       const revise = await run("revise", name, (agent) => sandbox.run({
         name,
@@ -972,8 +974,8 @@ async function build(issue: Issue) {
       implement,
       runs: [...reviews, ...revisions.map((r) => r.run), fix],
       revisions: revisions.map((r) => r.items),
-      verdict: tagged(review.stdout, "verdict"),
-      summary: tagged(review.stdout, "review-summary") ?? "（reviewer 没有给出摘要）",
+      verdict: runTag(review, "verdict"),
+      summary: runTag(review, "review-summary") ?? "（reviewer 没有给出摘要）",
       gate: { ok: gateResult.exitCode === 0, output: gateResult.stdout.slice(-3000), tier: gateTier(gateResult.stdout) },
       browser: collectBrowserCheck(sandbox.worktreePath, issue.id),
       notes: readAcceptanceNotes(sandbox.worktreePath),

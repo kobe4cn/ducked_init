@@ -1,7 +1,8 @@
 // test/sandcastle-pr-body.test.ts —— Sandcastle PR 正文的验收说明（`.sandcastle/pr-body.ts`，纯函数、不连库）：
-// 格式检查（三个小标题、编号步骤、不出现二级标题）、准备段落的两种形态、正文各节顺序与折叠、只替换一节。
+// 格式检查（三个小标题、编号步骤、不出现二级标题）、准备段落的两种形态、正文各节顺序与折叠、只替换一节；
+// 从会话输出取 reviewer 结论标签（最终输出没有时往前找会话里的 assistant 文字）。
 import { describe, expect, it } from 'vitest';
-import { acceptanceSection, checkAcceptanceNotes, replaceSection, restSections } from '../.sandcastle/pr-body';
+import { acceptanceSection, assistantTexts, checkAcceptanceNotes, replaceSection, restSections, runTagged } from '../.sandcastle/pr-body';
 
 const notes = [
   '### 做了什么', '',
@@ -134,5 +135,29 @@ describe('Sandcastle 只替换正文一节 replaceSection', () => {
     expect(replaceSection('Closes #7', '验收说明', '## 验收说明\n\n内容\n\n### 做了什么\n\n…')).toBe(
       'Closes #7\n\n## 验收说明\n\n内容\n\n### 做了什么\n\n…',
     );
+  });
+});
+
+describe('Sandcastle 结论标签 runTagged / assistantTexts', () => {
+  const line = (type: string, content: unknown[]) => JSON.stringify({ type, message: { content } });
+  const jsonl = [
+    line('user', [{ type: 'text', text: '提示词里的例子 <verdict>pr</verdict>' }]),
+    line('assistant', [{ type: 'thinking', thinking: '<verdict>revise</verdict>' }, { type: 'text', text: '审完了\n<verdict>merge</verdict>\n<review-summary>\n无问题\n</review-summary>' }]),
+    line('assistant', [{ type: 'tool_use', name: 'Bash', input: {} }]),
+    '截断的半行 {',
+    line('assistant', [{ type: 'text', text: '后台测试也跑完了，全部通过。' }]),
+  ].join('\n');
+
+  it('assistantTexts 只取 assistant 的文字块，跳过用户消息、thinking、工具调用和坏行', () => {
+    expect(assistantTexts(jsonl)).toEqual(['审完了\n<verdict>merge</verdict>\n<review-summary>\n无问题\n</review-summary>', '后台测试也跑完了，全部通过。']);
+  });
+
+  it('最终输出有标签时用它；没有时取会话里最近一处（被后台通知唤起多说一句的情形）', () => {
+    const texts = assistantTexts(jsonl);
+    expect(runTagged('<verdict>pr</verdict>', texts, 'verdict')).toBe('pr');
+    expect(runTagged('后台测试也跑完了，全部通过。', texts, 'verdict')).toBe('merge');
+    expect(runTagged('后台测试也跑完了，全部通过。', texts, 'review-summary')).toBe('无问题');
+    expect(runTagged('没有结论', [...texts, '<verdict>revise</verdict>'], 'verdict')).toBe('revise');
+    expect(runTagged('没有结论', [], 'verdict')).toBeUndefined();
   });
 });

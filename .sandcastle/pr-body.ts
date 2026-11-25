@@ -111,3 +111,34 @@ export const replaceSection = (body: string, title: string, content: string): st
   const end = stop === -1 ? lines.length : stop;
   return [...lines.slice(0, start), ...section, ...(end < lines.length ? [""] : []), ...lines.slice(end)].join("\n");
 };
+
+/** `<tag>…</tag>` 里的内容（第一处，去掉首尾空白）；没有返回 undefined。 */
+export const tagged = (text: string, tag: string): string | undefined =>
+  new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text)?.[1]?.trim();
+
+/** 会话 JSONL 里 assistant 消息的文字块（不含 thinking、工具调用），按出现顺序。 */
+export const assistantTexts = (jsonl: string): string[] =>
+  jsonl.split("\n").flatMap((line) => {
+    if (!line.startsWith("{")) return [];
+    try {
+      const o = JSON.parse(line);
+      if (o.type !== "assistant" || !Array.isArray(o.message?.content)) return [];
+      return o.message.content.filter((c: { type?: string; text?: unknown }) => c.type === "text" && typeof c.text === "string").map((c: { text: string }) => c.text);
+    } catch {
+      return [];
+    }
+  });
+
+/**
+ * 会话输出里的结论标签：先看最终输出（stdout 只是会话最后一条 result）；找不到时从会话里的 assistant 文字往前找最近一处。
+ * reviewer 输出结论后被后台任务的完成通知唤起、又多说一句时，结论就不在最后一条里了（2026-11-25 #1270 的 merge 结论因此丢了，PR #1297 被留成等人审）。
+ */
+export const runTagged = (stdout: string, texts: readonly string[], tag: string): string | undefined => {
+  const direct = tagged(stdout, tag);
+  if (direct !== undefined) return direct;
+  for (let i = texts.length - 1; i >= 0; i--) {
+    const found = tagged(texts[i], tag);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+};
