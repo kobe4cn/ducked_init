@@ -175,9 +175,9 @@ const purposeLabel = (t: T, purpose: LlmPurpose) => ({
   assertion_draft: t('断言草稿'), workbench_interpret: t('工作台结果解读'), knowledge_proposal: t('知识提案'), knowledge_import: t('知识导入'), metric_parse: t('一句话解析'),
 })[purpose as Exclude<LlmPurpose, 'connectivity' | 'tool_probe' | 'embedding'>]!;
 
-/** 「管：A、B、C」一行：用途名逐个翻译后用顿号连起来 */
+/** 「管：A、B、C」一行：用途名逐个翻译后用 t('、') 连起来（英文是逗号加空格） */
 const tierPurposesHint = (t: T, purposes: LlmPurpose[]) =>
-  t('管：{purposes}', { purposes: purposes.map(p => purposeLabel(t, p)).join('、') });
+  t('管：{purposes}', { purposes: purposes.map(p => purposeLabel(t, p)).join(t('、')) });
 
 /** 每档的名字与它当前实际管哪些用途（ADR-0055 的 PURPOSE_TIER + LLM_PURPOSE_TIER_OVERRIDES 生效后的对照，loader 传 tierPurposes，
  *  页面只做说明）；连通测试那行只用 title，purposes 可以不传 */

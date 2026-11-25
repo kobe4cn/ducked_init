@@ -100,6 +100,9 @@ describe('英文界面：模型服务页', () => {
     expect(html).toContain('Currently using this tenant&#x27;s configuration');
     expect(html).toContain('Model qwen-fast, endpoint inherits this tenant&#x27;s default');
     expect(html).toContain('Fast tier (fast)');
+    // 档位卡的「管：…」用途名用 t('、') 连接（#1277）：英文是逗号加空格，不出现中文顿号（、不在上面汉字的正则范围里）
+    expect(html).toContain('Covers: AI Assistant, Draft mapping');
+    expect(html).not.toContain('、');
     // 向量存储：选型、状态行的英文格式时间（zh-CN 是 2026/11/22 10:30:00 这样的 24 小时制）
     expect(html).toContain('>External pgvector</span>');
     expect(html).toMatch(/Last checked \d{1,2}\/\d{1,2}\/\d{4}, [\d:]+ [AP]M/);
