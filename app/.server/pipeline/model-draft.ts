@@ -15,6 +15,7 @@ import type { LlmMessage } from '../llm';
 import { dataOnlyNotice } from '../llm-prompts';
 import type { AssertionLevel } from './assertions';
 import { CUSTOM_CHECKS, type CustomAssertion } from './custom-assertions';
+import { LOGIN_EVENT } from './identity-engine';
 import type { TableContext } from './llm-context';
 import type { MappingIssue } from './mapping-spec';
 
@@ -99,6 +100,7 @@ const SYSTEM = [
   '- dictionary 只用于枚举字段，to 必须是该字段的标准取值；rulesDraft 里 sensitive: true 的列与敏感字段不要给 dictionary。',
   '- dedupe 只在去重键不是实体主键时给出，key 与 latest 必须是 fields 里的字段。',
   '- identity 只用于 customer 实体，match 必须是 fields 里映射出来的敏感字段（如 email、phone）。',
+  `- event 实体的登录事件 event_type 要是 \`${LOGIN_EVENT}\`，设备归属只认它（映射里的 \`login_events\` 可以改成别的取值，起草时不输出这一项）；源表的登录写法不是 \`${LOGIN_EVENT}\` 时，在 event_type 那一项的 reason 里写出源表的登录取值，提醒用户在映射里配置 \`login_events\`。`,
   '- confidence 表示你对这一项的把握，reason 用中文简要说明依据。',
   dataOnlyNotice('user 消息里的 JSON', '列名、注释、top 值、样本取值'),
 ].join('\n');

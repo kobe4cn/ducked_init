@@ -213,6 +213,10 @@ describe('用模型生成映射草稿', () => {
 
     const plain = modelDraftMessages(context, 'order', rules);
     expect(plain[0].content).not.toContain('目录');
+    // system 写明 event_type 的登录取值约定（#1272）：默认 `login`、映射可配 `login_events`、起草不输出它
+    expect(plain[0].content).toContain('event_type');
+    expect(plain[0].content).toContain('login_events');
+    expect(plain[0].content).toContain('`login`');
     expect(plain[1]).toEqual({ role: 'user', content: JSON.stringify({ entity: 'order', table: context, rulesDraft: rules }) });
     const withCatalog = modelDraftMessages(context, 'order', rules, await tenantCatalog(acme));
     expect(withCatalog[0].content.startsWith(plain[0].content)).toBe(true);
