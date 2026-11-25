@@ -158,39 +158,39 @@ export function draftMessages(request: string, catalog: string): LlmMessage[] {
 export async function draftWorkbenchSql(actor: CurrentMember, request: string, signal?: AbortSignal): Promise<{ sql: string; catalogTruncated: boolean; notes?: string[] }> {
   // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用在 llm_calls 里记发起人、共用一个 turn_id（不发请求的分支不受影响）
   return withLlmContext({ actorEmail: actor.email }, async () => {
-  assertCan(actor, 'sandbox');
-  if (!request.trim()) throw new WorkbenchAiError('请先写下要查什么', 400);
-  if (request.length > MAX_REQUEST) throw new WorkbenchAiError(`需求最多 ${MAX_REQUEST} 字`, 400);
-  const tenantId = actor.tenant.id;
-  if (!(await resolveProvider(tenantId))) throw new WorkbenchAiError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务', 409);
-  try {
-    const catalog = await listCatalog(actor);
-    const { text, truncated } = catalogText(catalog, await goldSnapshots(tenantId, catalog.gold));
-    let output: { sql?: string; unsupported?: string; notes?: unknown[] };
+    assertCan(actor, 'sandbox');
+    if (!request.trim()) throw new WorkbenchAiError('请先写下要查什么', 400);
+    if (request.length > MAX_REQUEST) throw new WorkbenchAiError(`需求最多 ${MAX_REQUEST} 字`, 400);
+    const tenantId = actor.tenant.id;
+    if (!(await resolveProvider(tenantId))) throw new WorkbenchAiError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务', 409);
     try {
-      output = await chatJson<{ sql?: string; unsupported?: string; notes?: unknown[] }>(tenantId, 'workbench_draft', draftMessages(request, text), WORKBENCH_DRAFT_SCHEMA, { signal });
-      // 客户端中止（#1250）：回复到手也不继续，unsupported 审计与 checkDraftedSql 的 valid 审计都不写
-      throwIfAborted(signal);
+      const catalog = await listCatalog(actor);
+      const { text, truncated } = catalogText(catalog, await goldSnapshots(tenantId, catalog.gold));
+      let output: { sql?: string; unsupported?: string; notes?: unknown[] };
+      try {
+        output = await chatJson<{ sql?: string; unsupported?: string; notes?: unknown[] }>(tenantId, 'workbench_draft', draftMessages(request, text), WORKBENCH_DRAFT_SCHEMA, { signal });
+        // 客户端中止（#1250）：回复到手也不继续，unsupported 审计与 checkDraftedSql 的 valid 审计都不写
+        throwIfAborted(signal);
+      } catch (e) {
+        if (e instanceof LlmError) throw new WorkbenchAiError(`模型起草 SQL 失败：${e.message}`, 422);
+        throw e;
+      }
+      const reason = output.unsupported?.trim();
+      if (reason) {
+        await recordAudit(getDb(), { tenantId, actor, action: 'workbench.ai_drafted', targetType: 'workbench', detail: { unsupported: true } });
+        throw new WorkbenchAiError(reason.slice(0, MAX_UNSUPPORTED), 422);
+      }
+      // unsupported 没给或只有空白时 WORKBENCH_DRAFT_SCHEMA anyOf 的第一个分支不成立（它要求有非空白字符），通过校验靠的是第二个分支，所以一定有非空的 sql
+      const { sql, problem } = await checkDraftedSql(actor, output.sql!);
+      if (problem) throw new WorkbenchAiError(`AI 起草的 SQL 没有通过校验：${problem}`, 422);
+      const notes = (output.notes ?? []).filter((n): n is string => typeof n === 'string').map(n => n.trim()).filter(Boolean)
+        .slice(0, MAX_NOTES).map(n => n.slice(0, MAX_NOTE));
+      return notes.length ? { sql, catalogTruncated: truncated, notes } : { sql, catalogTruncated: truncated };
     } catch (e) {
-      if (e instanceof LlmError) throw new WorkbenchAiError(`模型起草 SQL 失败：${e.message}`, 422);
+      // 目录读取、校验时挂载出错或已有查询在运行：照原状态码给出
+      if (e instanceof WorkbenchError) throw new WorkbenchAiError(e.message, e.status);
       throw e;
     }
-    const reason = output.unsupported?.trim();
-    if (reason) {
-      await recordAudit(getDb(), { tenantId, actor, action: 'workbench.ai_drafted', targetType: 'workbench', detail: { unsupported: true } });
-      throw new WorkbenchAiError(reason.slice(0, MAX_UNSUPPORTED), 422);
-    }
-    // unsupported 没给或只有空白时 WORKBENCH_DRAFT_SCHEMA anyOf 的第一个分支不成立（它要求有非空白字符），通过校验靠的是第二个分支，所以一定有非空的 sql
-    const { sql, problem } = await checkDraftedSql(actor, output.sql!);
-    if (problem) throw new WorkbenchAiError(`AI 起草的 SQL 没有通过校验：${problem}`, 422);
-    const notes = (output.notes ?? []).filter((n): n is string => typeof n === 'string').map(n => n.trim()).filter(Boolean)
-      .slice(0, MAX_NOTES).map(n => n.slice(0, MAX_NOTE));
-    return notes.length ? { sql, catalogTruncated: truncated, notes } : { sql, catalogTruncated: truncated };
-  } catch (e) {
-    // 目录读取、校验时挂载出错或已有查询在运行：照原状态码给出
-    if (e instanceof WorkbenchError) throw new WorkbenchAiError(e.message, e.status);
-    throw e;
-  }
   });
 }
 
@@ -412,34 +412,34 @@ export async function interpretResult(
 ): Promise<{ text: string; unverified: string[]; rows: number; columns: string[]; dropped: string[]; samples: boolean; result: QueryOutcome; conversationId: string }> {
   // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用在 llm_calls 里记发起人、共用一个 turn_id（不发请求的分支不受影响）
   return withLlmContext({ actorEmail: actor.email }, async () => {
-  assertCan(actor, 'sandbox');
-  if (!confirmed) throw new WorkbenchAiError('请先确认要发送给模型服务的列', 400);
-  const tenantId = actor.tenant.id;
-  if (!(await resolveProvider(tenantId))) throw new WorkbenchAiError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务', 409);
-  if (conversationId !== null) await assertOwnConversation(actor, conversationId);
-  const samples = await samplesAllowed(tenantId);
-  const result = await rerun(actor, sql);
-  const normalized = normalizeWorkbenchSql(sql);
-  const { messages, sent, dropped } = interpretRequest(result, sql, samples);
-  if (!sent.length) throw new WorkbenchAiError('没有可以发送的列：结果里的列都是系统列、敏感列或哈希', 400);
-  let interpretation: string;
-  try {
-    ({ interpretation } = await chatJson<{ interpretation: string }>(tenantId, 'workbench_interpret', messages, INTERPRET_SCHEMA, { signal }));
-    // 客户端中止（#1250）：解读到手也不继续，appendInterpretation 与审计都不写
-    throwIfAborted(signal);
-  } catch (e) {
-    if (e instanceof LlmError) throw new WorkbenchAiError(`模型解读结果失败：${e.message}`, 422);
-    throw e;
-  }
-  const rows = samples ? sentRows(result) : result.rows.length;
-  const text = interpretation.slice(0, MAX_INTERPRETATION);
-  // 出处只认发出去的 user 消息：开关关闭时结果行没发给模型，拿它当出处会让返回值间接泄露取值
-  const unverified = uncitedNumbers(text, messages.find(m => m.role === 'user')?.content ?? '');
-  const savedConversationId = await appendInterpretation(actor, conversationId, { sql: normalized, rows, columns: sent }, text);
-  await recordAudit(getDb(), {
-    tenantId, actor, action: 'workbench.result_interpreted', targetType: 'workbench',
-    detail: { sql: normalized, rows, columns: sent, dropped, samples, unverified: unverified.length },
-  });
-  return { text, unverified, rows, columns: sent, dropped, samples, result, conversationId: savedConversationId };
+    assertCan(actor, 'sandbox');
+    if (!confirmed) throw new WorkbenchAiError('请先确认要发送给模型服务的列', 400);
+    const tenantId = actor.tenant.id;
+    if (!(await resolveProvider(tenantId))) throw new WorkbenchAiError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务', 409);
+    if (conversationId !== null) await assertOwnConversation(actor, conversationId);
+    const samples = await samplesAllowed(tenantId);
+    const result = await rerun(actor, sql);
+    const normalized = normalizeWorkbenchSql(sql);
+    const { messages, sent, dropped } = interpretRequest(result, sql, samples);
+    if (!sent.length) throw new WorkbenchAiError('没有可以发送的列：结果里的列都是系统列、敏感列或哈希', 400);
+    let interpretation: string;
+    try {
+      ({ interpretation } = await chatJson<{ interpretation: string }>(tenantId, 'workbench_interpret', messages, INTERPRET_SCHEMA, { signal }));
+      // 客户端中止（#1250）：解读到手也不继续，appendInterpretation 与审计都不写
+      throwIfAborted(signal);
+    } catch (e) {
+      if (e instanceof LlmError) throw new WorkbenchAiError(`模型解读结果失败：${e.message}`, 422);
+      throw e;
+    }
+    const rows = samples ? sentRows(result) : result.rows.length;
+    const text = interpretation.slice(0, MAX_INTERPRETATION);
+    // 出处只认发出去的 user 消息：开关关闭时结果行没发给模型，拿它当出处会让返回值间接泄露取值
+    const unverified = uncitedNumbers(text, messages.find(m => m.role === 'user')?.content ?? '');
+    const savedConversationId = await appendInterpretation(actor, conversationId, { sql: normalized, rows, columns: sent }, text);
+    await recordAudit(getDb(), {
+      tenantId, actor, action: 'workbench.result_interpreted', targetType: 'workbench',
+      detail: { sql: normalized, rows, columns: sent, dropped, samples, unverified: unverified.length },
+    });
+    return { text, unverified, rows, columns: sent, dropped, samples, result, conversationId: savedConversationId };
   });
 }

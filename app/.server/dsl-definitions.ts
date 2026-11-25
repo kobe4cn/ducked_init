@@ -198,49 +198,49 @@ export type DraftExplanation = { items: { path: string; reason: string }[]; unkn
 export async function modelDraftForDefinition(actor: CurrentMember, kind: string, request: string): Promise<{ yaml: string; ambiguity: DraftAmbiguity | null; explanation: DraftExplanation | null }> {
   // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用（含 hybrid_search 时检索的 embedding）在 llm_calls 里记发起人、共用一个 turn_id
   return withLlmContext({ actorEmail: actor.email }, async () => {
-  assertCan(actor, 'definitions:draft');
-  requireKind(kind);
-  if (!request.trim()) throw new DslError('请先写下需求');
-  const tenantId = actor.tenant.id;
-  if (!(await resolveProvider(tenantId))) throw new DslError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务');
-  const ctx = await dslContext(getDb(), tenantId);
-  const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
-    tenantId, actor, action: 'definition.model_draft_failed', targetType: 'definition', detail: { kind, ...detail },
-  });
-  const { catalog, entries, ambiguity } = await draftSearch(actor, request, SEARCH_LIMIT);
-  const messages = definitionDraftMessages(kind, request, catalog, entries);
-  if (!Array.isArray(messages)) throw new DslError(messages.unavailable);
-  // 指标沿用一句话解析的输出形状（#1162）：宽松 Schema 放行平铺输出（llm_calls.schema_valid 记的是宽松校验的结果，与 #959 一致），
-  // 收拢（normalizeParseOutput）后仍按 METRIC_PARSE_SCHEMA 严格校验（不合时抛 LlmError，与模型失败同一条失败路径），另带回逐项说明
-  let spec: object;
-  let explanation: DraftExplanation | null = null;
-  let normalized = false;
-  try {
-    spec = await chatJson<Record<string, unknown>>(tenantId, definitionDraftPurpose(kind), messages, definitionDraftSchema(kind));
-    if (kind === 'metric') {
-      const collected = normalizeParseOutput(spec as Record<string, unknown>);
-      normalized = collected.normalized;
-      assertSchema(METRIC_PARSE_SCHEMA, collected.output);
-      const parsed = collected.output as { spec: object } & DraftExplanation;
-      spec = parsed.spec;
-      explanation = { items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported };
+    assertCan(actor, 'definitions:draft');
+    requireKind(kind);
+    if (!request.trim()) throw new DslError('请先写下需求');
+    const tenantId = actor.tenant.id;
+    if (!(await resolveProvider(tenantId))) throw new DslError('未配置模型服务：请让租户管理员在「模型服务」页配置，或由平台配置默认模型服务');
+    const ctx = await dslContext(getDb(), tenantId);
+    const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
+      tenantId, actor, action: 'definition.model_draft_failed', targetType: 'definition', detail: { kind, ...detail },
+    });
+    const { catalog, entries, ambiguity } = await draftSearch(actor, request, SEARCH_LIMIT);
+    const messages = definitionDraftMessages(kind, request, catalog, entries);
+    if (!Array.isArray(messages)) throw new DslError(messages.unavailable);
+    // 指标沿用一句话解析的输出形状（#1162）：宽松 Schema 放行平铺输出（llm_calls.schema_valid 记的是宽松校验的结果，与 #959 一致），
+    // 收拢（normalizeParseOutput）后仍按 METRIC_PARSE_SCHEMA 严格校验（不合时抛 LlmError，与模型失败同一条失败路径），另带回逐项说明
+    let spec: object;
+    let explanation: DraftExplanation | null = null;
+    let normalized = false;
+    try {
+      spec = await chatJson<Record<string, unknown>>(tenantId, definitionDraftPurpose(kind), messages, definitionDraftSchema(kind));
+      if (kind === 'metric') {
+        const collected = normalizeParseOutput(spec as Record<string, unknown>);
+        normalized = collected.normalized;
+        assertSchema(METRIC_PARSE_SCHEMA, collected.output);
+        const parsed = collected.output as { spec: object } & DraftExplanation;
+        spec = parsed.spec;
+        explanation = { items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported };
+      }
+    } catch (e) {
+      if (!(e instanceof LlmError)) throw e;
+      await failed({ stage: 'model', error: e.message.slice(0, 200), ...(normalized && { normalized: true }) });
+      throw new DslError(`模型生成草稿失败：${e.message}`, 422);
     }
-  } catch (e) {
-    if (!(e instanceof LlmError)) throw e;
-    await failed({ stage: 'model', error: e.message.slice(0, 200), ...(normalized && { normalized: true }) });
-    throw new DslError(`模型生成草稿失败：${e.message}`, 422);
-  }
-  if ('unsupported' in spec && Array.isArray(spec.unsupported)) {
-    await failed({ stage: 'unsupported', reasons: spec.unsupported.length });
-    throw new DslError(`模型判断做不到：${spec.unsupported.join('；')}`, 422);
-  }
-  const yaml = definitionOutputToYaml(kind, spec);
-  const checked = DSL_KINDS[kind].check(yaml, ctx);
-  if (!checked.ok) {
-    await failed({ stage: 'definition', issues: checked.issues.length, paths: checked.issues.slice(0, 10).map(i => i.path) });
-    throw new DslError(`模型生成的${DSL_KINDS[kind].label}定义有 ${checked.issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, checked.issues);
-  }
-  return { yaml, ambiguity, explanation };
+    if ('unsupported' in spec && Array.isArray(spec.unsupported)) {
+      await failed({ stage: 'unsupported', reasons: spec.unsupported.length });
+      throw new DslError(`模型判断做不到：${spec.unsupported.join('；')}`, 422);
+    }
+    const yaml = definitionOutputToYaml(kind, spec);
+    const checked = DSL_KINDS[kind].check(yaml, ctx);
+    if (!checked.ok) {
+      await failed({ stage: 'definition', issues: checked.issues.length, paths: checked.issues.slice(0, 10).map(i => i.path) });
+      throw new DslError(`模型生成的${DSL_KINDS[kind].label}定义有 ${checked.issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, checked.issues);
+    }
+    return { yaml, ambiguity, explanation };
   });
 }
 

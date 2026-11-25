@@ -249,67 +249,67 @@ export async function modelDraftFor(
 ): Promise<ModelDraftResult> {
   // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用在 llm_calls 里记发起人、共用一个 turn_id（不调模型的分支不受影响）
   return withLlmContext({ actorEmail: actor.email }, async () => {
-  const tenantId = actor.tenant.id;
-  const base = await draftWithOrigin(actor, sourceId, table, entity);
-  const record = async (origin: ModelDraftResult['origin'], yaml: string, items: DraftItem[] = []) => {
-    const [row] = await getDb().insert(mappingGenerations).values({
-      tenantId, sourceId, tableName: table, entity, mappingId, origin, yaml, items, createdByEmail: actor.email,
-    }).returning({ id: mappingGenerations.id });
-    return { yaml, generationId: row.id, origin, items };
-  };
-  if (base.origin === 'reuse') return { ...await record('reuse', base.yaml), reusedFrom: base.reusedFrom };
-  if (isCustomEntity(entity)) return { ...await record('rules', base.yaml), notice: '自定义实体暂不支持模型起草，已按规则生成' };
-  if (!(await resolveProvider(tenantId))) return { ...await record('rules', base.yaml), notice: '未配置模型服务，已按规则生成' };
+    const tenantId = actor.tenant.id;
+    const base = await draftWithOrigin(actor, sourceId, table, entity);
+    const record = async (origin: ModelDraftResult['origin'], yaml: string, items: DraftItem[] = []) => {
+      const [row] = await getDb().insert(mappingGenerations).values({
+        tenantId, sourceId, tableName: table, entity, mappingId, origin, yaml, items, createdByEmail: actor.email,
+      }).returning({ id: mappingGenerations.id });
+      return { yaml, generationId: row.id, origin, items };
+    };
+    if (base.origin === 'reuse') return { ...await record('reuse', base.yaml), reusedFrom: base.reusedFrom };
+    if (isCustomEntity(entity)) return { ...await record('rules', base.yaml), notice: '自定义实体暂不支持模型起草，已按规则生成' };
+    if (!(await resolveProvider(tenantId))) return { ...await record('rules', base.yaml), notice: '未配置模型服务，已按规则生成' };
 
-  const context = await tableContextFor(tenantId, sourceId, table).catch((e: unknown) => {
-    throw new MappingError(e instanceof Error ? e.message : String(e));
-  });
-  const source = await requireSource(tenantId, sourceId);
-  const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
-    tenantId, actor, action: 'mapping.model_draft_failed', targetType: 'source', targetId: sourceId,
-    detail: { sourceId, source: source.name, table, entity, ...detail },
-  });
-  /** 模型失败与客户端中止（#1252）共用的 422 报错（写不写审计由调用处决定：中止不是模型失败，不写） */
-  const draftFailed = (e: LlmError) => new MappingError(`模型生成草稿失败：${e.message}`, 422);
-  /** 客户端中止（#1252）：校验阶段的窗口也拦下，走同一条 422，不写 failed / partial 审计、不写生成记录 */
-  const stopIfAborted = (): void => {
-    try { throwIfAborted(signal); } catch (e) { if (e instanceof LlmError) throw draftFailed(e); throw e; }
-  };
-  const messages = modelDraftMessages(context, entity, base.yaml, await tenantCatalog(tenantId));
-  let out: ModelDraft;
-  try {
-    out = await chatJson<ModelDraft>(tenantId, 'mapping_draft', messages, MODEL_DRAFT_SCHEMA, { signal });
-    // 客户端中止（#1252）：假 fetch 不理 signal，回复到手也要拦下；抛出的 LlmError 由 catch 按 aborted 跳过失败审计
-    throwIfAborted(signal);
-  } catch (e) {
-    if (!(e instanceof LlmError)) throw e;
-    if (!e.aborted) await failed({ stage: 'model', error: e.message.slice(0, 200) });
-    throw draftFailed(e);
-  }
-  /** 整份不采用：审计只记问题数与前 10 个位置，错误带问题列表（行号指模型生成的那份） */
-  const reject = async (issues: MappingIssue[]): Promise<never> => {
-    stopIfAborted();
-    await failed({ stage: 'mapping', issues: issues.length, paths: issues.slice(0, 10).map(i => i.path) });
-    throw new MappingError(`模型生成的映射有 ${issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, issues);
-  };
-  const r = await adoptModelDraft(base.yaml, out, async (y) => {
-    try {
-      await checkMappingDraft(tenantId, sourceId, y);
-      return [];
-    } catch (e) {
-      if (e instanceof MappingError) return e.issues;
-      throw e;
-    }
-  });
-  if (r.status === 'rejected') return reject(r.issues);
-  stopIfAborted();
-  if (r.status === 'partial') {
-    await recordAudit(getDb(), {
-      tenantId, actor, action: 'mapping.model_draft_partial', targetType: 'source', targetId: sourceId,
-      detail: { sourceId, source: source.name, table, entity, dropped: r.dropped, issues: r.issues },
+    const context = await tableContextFor(tenantId, sourceId, table).catch((e: unknown) => {
+      throw new MappingError(e instanceof Error ? e.message : String(e));
     });
-  }
-  return record('model', r.yaml, r.items);
+    const source = await requireSource(tenantId, sourceId);
+    const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
+      tenantId, actor, action: 'mapping.model_draft_failed', targetType: 'source', targetId: sourceId,
+      detail: { sourceId, source: source.name, table, entity, ...detail },
+    });
+    /** 模型失败与客户端中止（#1252）共用的 422 报错（写不写审计由调用处决定：中止不是模型失败，不写） */
+    const draftFailed = (e: LlmError) => new MappingError(`模型生成草稿失败：${e.message}`, 422);
+    /** 客户端中止（#1252）：校验阶段的窗口也拦下，走同一条 422，不写 failed / partial 审计、不写生成记录 */
+    const stopIfAborted = (): void => {
+      try { throwIfAborted(signal); } catch (e) { if (e instanceof LlmError) throw draftFailed(e); throw e; }
+    };
+    const messages = modelDraftMessages(context, entity, base.yaml, await tenantCatalog(tenantId));
+    let out: ModelDraft;
+    try {
+      out = await chatJson<ModelDraft>(tenantId, 'mapping_draft', messages, MODEL_DRAFT_SCHEMA, { signal });
+      // 客户端中止（#1252）：假 fetch 不理 signal，回复到手也要拦下；抛出的 LlmError 由 catch 按 aborted 跳过失败审计
+      throwIfAborted(signal);
+    } catch (e) {
+      if (!(e instanceof LlmError)) throw e;
+      if (!e.aborted) await failed({ stage: 'model', error: e.message.slice(0, 200) });
+      throw draftFailed(e);
+    }
+    /** 整份不采用：审计只记问题数与前 10 个位置，错误带问题列表（行号指模型生成的那份） */
+    const reject = async (issues: MappingIssue[]): Promise<never> => {
+      stopIfAborted();
+      await failed({ stage: 'mapping', issues: issues.length, paths: issues.slice(0, 10).map(i => i.path) });
+      throw new MappingError(`模型生成的映射有 ${issues.length} 处问题，未采用，编辑框保持原内容（行号指模型生成的那份）`, 422, issues);
+    };
+    const r = await adoptModelDraft(base.yaml, out, async (y) => {
+      try {
+        await checkMappingDraft(tenantId, sourceId, y);
+        return [];
+      } catch (e) {
+        if (e instanceof MappingError) return e.issues;
+        throw e;
+      }
+    });
+    if (r.status === 'rejected') return reject(r.issues);
+    stopIfAborted();
+    if (r.status === 'partial') {
+      await recordAudit(getDb(), {
+        tenantId, actor, action: 'mapping.model_draft_partial', targetType: 'source', targetId: sourceId,
+        detail: { sourceId, source: source.name, table, entity, dropped: r.dropped, issues: r.issues },
+      });
+    }
+    return record('model', r.yaml, r.items);
   });
 }
 
@@ -357,81 +357,81 @@ export async function modelDraftForMapping(actor: CurrentMember, mappingId: stri
 export async function modelAssertionsForMapping(actor: CurrentMember, mappingId: string, signal?: AbortSignal): Promise<ModelDraftResult> {
   // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用在 llm_calls 里记发起人、共用一个 turn_id（不调模型的分支不受影响）
   return withLlmContext({ actorEmail: actor.email }, async () => {
-  assertCan(actor, 'sources:write');
-  const tenantId = actor.tenant.id;
-  const mapping = await requireMapping(tenantId, mappingId);
-  if (mapping.sourceViewId) throw new MappingError('用模型建议断言要用源表的列统计，读源视图的映射请直接编辑');
-  const { sourceId, tableName: table, entity } = mapping;
-  const base = await latestYaml(mappingId);
-  const record = async (origin: 'rules' | 'assertions', yaml: string, items: DraftItem[]) => {
-    const [row] = await getDb().insert(mappingGenerations).values({
-      tenantId, sourceId, tableName: table, entity, mappingId, origin, yaml, items, createdByEmail: actor.email,
-    }).returning({ id: mappingGenerations.id });
-    return { yaml, generationId: row.id, origin, items };
-  };
-  if (!(await resolveProvider(tenantId))) {
-    const { plan } = await checkMappingDraft(tenantId, sourceId, base);
-    const profiled = (await profiledTables(tenantId, sourceId))(table);
-    const mine = plan.assertions ?? [];
-    const has = new Set(mine.map(customAssertionName));
-    const merged = [...mine, ...ruleAssertions(plan, typeof profiled === 'string' ? null : profiled.table).filter(a => !has.has(customAssertionName(a)))];
-    const { yaml } = assertionsToYaml(base, { assertions: merged.map(a => ({ ...a, confidence: 1, reason: '' })) });
-    await checkMappingDraft(tenantId, sourceId, yaml);
-    return { ...await record('rules', yaml, []), notice: '未配置模型服务，已按规则生成' };
-  }
-
-  const context = await tableContextFor(tenantId, sourceId, table).catch((e: unknown) => {
-    throw new MappingError(e instanceof Error ? e.message : String(e));
-  });
-  const source = await requireSource(tenantId, sourceId);
-  const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
-    tenantId, actor, action: 'mapping.model_draft_failed', targetType: 'source', targetId: sourceId,
-    detail: { mappingId, sourceId, source: source.name, table, entity, kind: 'assertions', ...detail },
-  });
-  /** 模型失败与客户端中止（#1252）共用的 422 报错（写不写审计由调用处决定：中止不是模型失败，不写） */
-  const assertionsFailed = (e: LlmError) => new MappingError(`模型建议断言失败：${e.message}`, 422);
-  /** 客户端中止（#1252）：校验阶段的窗口也拦下，走同一条 422，不写 failed / partial 审计、不写生成记录 */
-  const stopIfAborted = (): void => {
-    try { throwIfAborted(signal); } catch (e) { if (e instanceof LlmError) throw assertionsFailed(e); throw e; }
-  };
-  let out: AssertionDraft;
-  try {
-    out = await chatJson<AssertionDraft>(tenantId, 'assertion_draft', assertionDraftMessages(context, base), ASSERTION_DRAFT_SCHEMA, { signal });
-    // 客户端中止（#1252）：假 fetch 不理 signal，回复到手也要拦下；抛出的 LlmError 由 catch 按 aborted 跳过失败审计
-    throwIfAborted(signal);
-  } catch (e) {
-    if (!(e instanceof LlmError)) throw e;
-    if (!e.aborted) await failed({ stage: 'model', error: e.message.slice(0, 200) });
-    throw assertionsFailed(e);
-  }
-  const { yaml, items } = assertionsToYaml(base, out);
-  try {
-    await checkMappingDraft(tenantId, sourceId, yaml);
-  } catch (e) {
-    if (!(e instanceof MappingError)) throw e;
-    const reject = async (issues: MappingIssue[]): Promise<never> => {
-      stopIfAborted();
-      await failed({ stage: 'mapping', issues: issues.length, paths: issues.slice(0, 10).map(i => i.path) });
-      throw new MappingError(`模型建议的断言有 ${issues.length} 处问题，未采用，编辑框保持原内容（行号指替换后的那份）`, 422, issues);
+    assertCan(actor, 'sources:write');
+    const tenantId = actor.tenant.id;
+    const mapping = await requireMapping(tenantId, mappingId);
+    if (mapping.sourceViewId) throw new MappingError('用模型建议断言要用源表的列统计，读源视图的映射请直接编辑');
+    const { sourceId, tableName: table, entity } = mapping;
+    const base = await latestYaml(mappingId);
+    const record = async (origin: 'rules' | 'assertions', yaml: string, items: DraftItem[]) => {
+      const [row] = await getDb().insert(mappingGenerations).values({
+        tenantId, sourceId, tableName: table, entity, mappingId, origin, yaml, items, createdByEmail: actor.email,
+      }).returning({ id: mappingGenerations.id });
+      return { yaml, generationId: row.id, origin, items };
     };
-    // 只去掉有问题的个别断言再校验一次；全部被丢或有定位不到个别断言的问题时 dropAssertions 返回 null，整份不采用
-    const partial = dropAssertions(base, out, e.issues);
-    if (!partial) return reject(e.issues);
+    if (!(await resolveProvider(tenantId))) {
+      const { plan } = await checkMappingDraft(tenantId, sourceId, base);
+      const profiled = (await profiledTables(tenantId, sourceId))(table);
+      const mine = plan.assertions ?? [];
+      const has = new Set(mine.map(customAssertionName));
+      const merged = [...mine, ...ruleAssertions(plan, typeof profiled === 'string' ? null : profiled.table).filter(a => !has.has(customAssertionName(a)))];
+      const { yaml } = assertionsToYaml(base, { assertions: merged.map(a => ({ ...a, confidence: 1, reason: '' })) });
+      await checkMappingDraft(tenantId, sourceId, yaml);
+      return { ...await record('rules', yaml, []), notice: '未配置模型服务，已按规则生成' };
+    }
+
+    const context = await tableContextFor(tenantId, sourceId, table).catch((e: unknown) => {
+      throw new MappingError(e instanceof Error ? e.message : String(e));
+    });
+    const source = await requireSource(tenantId, sourceId);
+    const failed = (detail: Record<string, unknown>) => recordAudit(getDb(), {
+      tenantId, actor, action: 'mapping.model_draft_failed', targetType: 'source', targetId: sourceId,
+      detail: { mappingId, sourceId, source: source.name, table, entity, kind: 'assertions', ...detail },
+    });
+    /** 模型失败与客户端中止（#1252）共用的 422 报错（写不写审计由调用处决定：中止不是模型失败，不写） */
+    const assertionsFailed = (e: LlmError) => new MappingError(`模型建议断言失败：${e.message}`, 422);
+    /** 客户端中止（#1252）：校验阶段的窗口也拦下，走同一条 422，不写 failed / partial 审计、不写生成记录 */
+    const stopIfAborted = (): void => {
+      try { throwIfAborted(signal); } catch (e) { if (e instanceof LlmError) throw assertionsFailed(e); throw e; }
+    };
+    let out: AssertionDraft;
     try {
-      await checkMappingDraft(tenantId, sourceId, partial.yaml);
-    } catch (e2) {
-      if (!(e2 instanceof MappingError)) throw e2;
-      return reject(e2.issues);
+      out = await chatJson<AssertionDraft>(tenantId, 'assertion_draft', assertionDraftMessages(context, base), ASSERTION_DRAFT_SCHEMA, { signal });
+      // 客户端中止（#1252）：假 fetch 不理 signal，回复到手也要拦下；抛出的 LlmError 由 catch 按 aborted 跳过失败审计
+      throwIfAborted(signal);
+    } catch (e) {
+      if (!(e instanceof LlmError)) throw e;
+      if (!e.aborted) await failed({ stage: 'model', error: e.message.slice(0, 200) });
+      throw assertionsFailed(e);
+    }
+    const { yaml, items } = assertionsToYaml(base, out);
+    try {
+      await checkMappingDraft(tenantId, sourceId, yaml);
+    } catch (e) {
+      if (!(e instanceof MappingError)) throw e;
+      const reject = async (issues: MappingIssue[]): Promise<never> => {
+        stopIfAborted();
+        await failed({ stage: 'mapping', issues: issues.length, paths: issues.slice(0, 10).map(i => i.path) });
+        throw new MappingError(`模型建议的断言有 ${issues.length} 处问题，未采用，编辑框保持原内容（行号指替换后的那份）`, 422, issues);
+      };
+      // 只去掉有问题的个别断言再校验一次；全部被丢或有定位不到个别断言的问题时 dropAssertions 返回 null，整份不采用
+      const partial = dropAssertions(base, out, e.issues);
+      if (!partial) return reject(e.issues);
+      try {
+        await checkMappingDraft(tenantId, sourceId, partial.yaml);
+      } catch (e2) {
+        if (!(e2 instanceof MappingError)) throw e2;
+        return reject(e2.issues);
+      }
+      stopIfAborted();
+      await recordAudit(getDb(), {
+        tenantId, actor, action: 'mapping.model_draft_partial', targetType: 'source', targetId: sourceId,
+        detail: { mappingId, sourceId, source: source.name, table, entity, kind: 'assertions', dropped: partial.dropped, issues: e.issues.length },
+      });
+      return record('assertions', partial.yaml, partial.items);
     }
     stopIfAborted();
-    await recordAudit(getDb(), {
-      tenantId, actor, action: 'mapping.model_draft_partial', targetType: 'source', targetId: sourceId,
-      detail: { mappingId, sourceId, source: source.name, table, entity, kind: 'assertions', dropped: partial.dropped, issues: e.issues.length },
-    });
-    return record('assertions', partial.yaml, partial.items);
-  }
-  stopIfAborted();
-  return record('assertions', yaml, items);
+    return record('assertions', yaml, items);
   });
 }
 
