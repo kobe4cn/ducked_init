@@ -36,17 +36,20 @@ function parseAmount(label: string, raw: unknown): number {
   return v;
 }
 
-/** 校验表单：模型名去首尾空白、非空、最长 100 字；币种只认白名单 */
+/** 校验表单：模型名去首尾空白、非空、最长 100 字；币种只认白名单；缓存输入单价可留空（#1256），留空按 null 存 */
 function parsePrice(raw: Record<string, unknown>) {
   const model = String(raw.model ?? '').trim();
   if (!model) throw new ModelPriceError('模型名不能为空');
   if (model.length > 100) throw new ModelPriceError('模型名最长 100 字');
   const currency = String(raw.currency ?? '').trim();
   if (!CURRENCIES.includes(currency as PriceCurrency)) throw new ModelPriceError('币种只能是 CNY 或 USD');
+  const cached = String(raw.cachedInputPerMTok ?? '').trim();
   return {
     model,
     inputPerMTok: parseAmount('输入单价', raw.inputPerMTok),
     outputPerMTok: parseAmount('输出单价', raw.outputPerMTok),
+    // 空串要在 parseAmount 之前判掉：Number('') 是 0，再被正则拒成「最多 4 位小数」就说不清了
+    cachedInputPerMTok: cached === '' ? null : parseAmount('缓存输入单价', cached),
     currency: currency as PriceCurrency,
   };
 }
@@ -121,12 +124,13 @@ export function formatCost(summary: CostSummary): string {
   return parts.join(' + ') + (summary.unpricedCalls > 0 ? '（部分模型未配置单价）' : '');
 }
 
-/** 与已存的一行比是否同值：numeric 读出来是字符串，先转数字再比，否则 "2.0000" 和 "2" 会被当成变了 */
-const samePrice = (r: PriceRow, p: { inputPerMTok: number; outputPerMTok: number; currency: string }) =>
-  Number(r.inputPerMTok) === p.inputPerMTok && Number(r.outputPerMTok) === p.outputPerMTok && r.currency === p.currency;
+/** 与已存的一行比是否同值：numeric 读出来是字符串，先转数字再比，否则 "2.0000" 和 "2" 会被当成变了；缓存单价两边都为 null 才算同值 */
+const samePrice = (r: PriceRow, p: { inputPerMTok: number; outputPerMTok: number; cachedInputPerMTok: number | null; currency: string }) =>
+  Number(r.inputPerMTok) === p.inputPerMTok && Number(r.outputPerMTok) === p.outputPerMTok && r.currency === p.currency
+  && (r.cachedInputPerMTok == null ? p.cachedInputPerMTok == null : p.cachedInputPerMTok != null && Number(r.cachedInputPerMTok) === p.cachedInputPerMTok);
 
-const detailOf = (p: { inputPerMTok: number; outputPerMTok: number; currency: string }) =>
-  ({ inputPerMTok: p.inputPerMTok, outputPerMTok: p.outputPerMTok, currency: p.currency });
+const detailOf = (p: { inputPerMTok: number; outputPerMTok: number; cachedInputPerMTok: number | null; currency: string }) =>
+  ({ inputPerMTok: p.inputPerMTok, outputPerMTok: p.outputPerMTok, cachedInputPerMTok: p.cachedInputPerMTok, currency: p.currency });
 
 /**
  * 新增或修改一个模型的单价（填已有模型名就是修改），审计与变更写在同一事务里；同值保存是 no-op、不写审计。
@@ -138,8 +142,14 @@ export async function upsertModelPrice(operator: OperatorActor, raw: Record<stri
     await getDb().transaction(async tx => {
       const [existing] = await tx.select().from(modelPrices).where(eq(modelPrices.model, price.model)).for('update');
       if (!existing) {
-        // numeric 列写入也要字符串（读出在 toPrice 里统一转数字）
-        await tx.insert(modelPrices).values({ ...price, inputPerMTok: String(price.inputPerMTok), outputPerMTok: String(price.outputPerMTok), updatedBy: operator?.operatorId ?? null });
+        // numeric 列写入也要字符串（读出在 toPrice 里统一转数字）；缓存单价可空，null 原样写入
+        await tx.insert(modelPrices).values({
+          ...price,
+          inputPerMTok: String(price.inputPerMTok),
+          outputPerMTok: String(price.outputPerMTok),
+          cachedInputPerMTok: price.cachedInputPerMTok == null ? null : String(price.cachedInputPerMTok),
+          updatedBy: operator?.operatorId ?? null,
+        });
         await recordAudit(tx, {
           tenantId: null,
           operator,
@@ -156,6 +166,8 @@ export async function upsertModelPrice(operator: OperatorActor, raw: Record<stri
           ...price,
           inputPerMTok: String(price.inputPerMTok),
           outputPerMTok: String(price.outputPerMTok),
+          // 不带缓存单价（直接调 upsert 的测试）按留空处理：存 null，修改时清掉原值
+          cachedInputPerMTok: price.cachedInputPerMTok == null ? null : String(price.cachedInputPerMTok),
           updatedAt: new Date(),
           updatedBy: operator?.operatorId ?? null,
         })
