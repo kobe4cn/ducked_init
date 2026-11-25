@@ -275,7 +275,7 @@ export async function assistantTurn(
     const route = await resolveRoute(tenantId, 'assistant');
     if (!route) throw new AssistantError('未配置模型服务：请到「模型服务」页配置端点、模型与 API Key', 409);
     if (await toolSupport(tenantId, route) === false) throw new AssistantError(TOOLS_UNSUPPORTED, 422);
-  
+
     const tools = toolsFor(actor).map(t => ({ name: t.name, description: t.description, parameters: t.inputSchema }));
     const messages: LlmMessage[] = [
       { role: 'system', content: systemPrompt(page, actor.role, priorPlan) },
