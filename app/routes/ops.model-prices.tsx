@@ -36,6 +36,7 @@ export async function action({ request }: Route.ActionArgs) {
       model: form.get('model'),
       inputPerMTok: form.get('inputPerMTok'),
       outputPerMTok: form.get('outputPerMTok'),
+      cachedInputPerMTok: form.get('cachedInputPerMTok'),
       currency: form.get('currency'),
     });
   } catch (e) {
@@ -70,6 +71,7 @@ export default function OpsModelPrices({ loaderData, actionData }: Route.Compone
                 <TableHead>模型</TableHead>
                 <TableHead className="text-right">输入单价（每百万 token）</TableHead>
                 <TableHead className="text-right">输出单价（每百万 token）</TableHead>
+                <TableHead className="text-right">缓存输入单价（每百万 token）</TableHead>
                 <TableHead>币种</TableHead>
                 <TableHead>更新时间</TableHead>
                 <TableHead><span className="sr-only">操作</span></TableHead>
@@ -81,6 +83,9 @@ export default function OpsModelPrices({ loaderData, actionData }: Route.Compone
                   <TableCell className="font-mono">{p.model}</TableCell>
                   <TableCell className="text-right">{p.inputPerMTok}</TableCell>
                   <TableCell className="text-right">{p.outputPerMTok}</TableCell>
+                  <TableCell className="text-right">
+                    {p.cachedInputPerMTok ?? <span className="text-slate-500">同输入单价</span>}
+                  </TableCell>
                   <TableCell>{p.currency}</TableCell>
                   <TableCell className="text-slate-500">{new Date(p.updatedAt).toLocaleString('zh-CN')}</TableCell>
                   <TableCell className="text-right">
@@ -111,7 +116,7 @@ export default function OpsModelPrices({ loaderData, actionData }: Route.Compone
               <FieldLabel htmlFor="price-model">模型名</FieldLabel>
               <Input id="price-model" name="model" required placeholder="qwen-plus" />
             </Field>
-            <div className="grid gap-4 sm:grid-cols-3">
+            <div className="grid gap-4 sm:grid-cols-4">
               <Field>
                 <FieldLabel htmlFor="price-input">输入单价（每百万 token）</FieldLabel>
                 <Input id="price-input" name="inputPerMTok" required inputMode="decimal" placeholder="2.5" />
@@ -119,6 +124,10 @@ export default function OpsModelPrices({ loaderData, actionData }: Route.Compone
               <Field>
                 <FieldLabel htmlFor="price-output">输出单价（每百万 token）</FieldLabel>
                 <Input id="price-output" name="outputPerMTok" required inputMode="decimal" placeholder="10" />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="price-cached">缓存输入单价（每百万 token，可留空）</FieldLabel>
+                <Input id="price-cached" name="cachedInputPerMTok" inputMode="decimal" placeholder="0.5" />
               </Field>
               <Field>
                 <FieldLabel htmlFor="price-currency">币种</FieldLabel>

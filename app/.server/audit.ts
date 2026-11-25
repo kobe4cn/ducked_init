@@ -41,6 +41,9 @@ const GENERATION_ORIGIN: Record<'model' | 'rules' | 'reuse' | 'assertions', stri
 
 
 // 每种审计动作的名称，以及把明细写成一句话的方式；新增动作只改这里
+// 缓存输入单价（#1256）在审计文本里的显示：null 与 undefined（旧审计行没有这个字段，不能报错）都显示「同输入单价」
+const cachedPriceText = (v: unknown) => (v == null ? '同输入单价' : String(v));
+
 const ACTIONS = {
   'tenant.created': { label: '开通租户', describe: (d: Detail) => `租户「${d.name}」，首个管理员 ${d.adminEmail}` },
   'tenant.renamed': { label: '租户改名', describe: (d: Detail) => `${d.from} → ${d.to}` },
@@ -408,22 +411,23 @@ const ACTIONS = {
   'operator.totp_bound': { label: '绑定 TOTP', describe: (d: Detail) => `${d.email}` },
   'operator.totp_reset': { label: '重置 TOTP', describe: (d: Detail) => `${d.email}` },
   'operator.logged_in': { label: '运营者登录', describe: (d: Detail) => `${d.email}` },
-  // 模型单价（ADR-0057）：平台级元数据；改动的前后值都记在 detail 里，以后要按调用时单价折算可从审计重建价格历史
+  // 模型单价（ADR-0057）：平台级元数据；改动的前后值都记在 detail 里，以后要按调用时单价折算可从审计重建价格历史。
+  // 缓存输入单价（#1256）跟在单价后面：留空（null）时显示「同输入单价」
   'model_price.created': {
     label: '新增模型单价',
-    describe: (d: Detail) => `${d.model}：输入 ${d.inputPerMTok}、输出 ${d.outputPerMTok} ${d.currency} / 百万 token`,
+    describe: (d: Detail) => `${d.model}：输入 ${d.inputPerMTok}、输出 ${d.outputPerMTok} ${d.currency} / 百万 token、缓存输入 ${cachedPriceText(d.cachedInputPerMTok)}`,
   },
   'model_price.updated': {
     label: '修改模型单价',
     describe: (d: Detail) => {
-      const from = d.from as { inputPerMTok: number; outputPerMTok: number; currency: string };
-      const to = d.to as { inputPerMTok: number; outputPerMTok: number; currency: string };
-      return `${d.model}：输入 ${from.inputPerMTok} → ${to.inputPerMTok}、输出 ${from.outputPerMTok} → ${to.outputPerMTok}（${from.currency} → ${to.currency}）`;
+      const from = d.from as { inputPerMTok: number; outputPerMTok: number; cachedInputPerMTok?: number | null; currency: string };
+      const to = d.to as { inputPerMTok: number; outputPerMTok: number; cachedInputPerMTok?: number | null; currency: string };
+      return `${d.model}：输入 ${from.inputPerMTok} → ${to.inputPerMTok}、输出 ${from.outputPerMTok} → ${to.outputPerMTok}（${from.currency} → ${to.currency}）、缓存输入 ${cachedPriceText(from.cachedInputPerMTok)} → ${cachedPriceText(to.cachedInputPerMTok)}`;
     },
   },
   'model_price.deleted': {
     label: '删除模型单价',
-    describe: (d: Detail) => `${d.model}：删除前 输入 ${d.inputPerMTok}、输出 ${d.outputPerMTok} ${d.currency} / 百万 token`,
+    describe: (d: Detail) => `${d.model}：删除前 输入 ${d.inputPerMTok}、输出 ${d.outputPerMTok} ${d.currency} / 百万 token、缓存输入 ${cachedPriceText(d.cachedInputPerMTok)}`,
   },
 } satisfies Record<string, { label: string; describe: (d: Detail) => string }>;
 export type AuditAction = keyof typeof ACTIONS;

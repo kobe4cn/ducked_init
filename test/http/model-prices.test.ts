@@ -80,12 +80,12 @@ describe('运营后台模型单价页', () => {
 
     expect((await post(browser)).status).toBe(302);
     const created = await (await browser.get('/ops/model-prices')).text();
-    expect(rowCells(created, 'data-model', 'm-fast').slice(0, 4)).toEqual(['m-fast', '2.5', '10', 'CNY']);
+    expect(rowCells(created, 'data-model', 'm-fast').slice(0, 5)).toEqual(['m-fast', '2.5', '10', '同输入单价', 'CNY']);
 
     expect((await post(browser, { inputPerMTok: '3', outputPerMTok: '8', currency: 'USD' })).status).toBe(302);
     const updated = await (await browser.get('/ops/model-prices')).text();
-    expect(rowCells(updated, 'data-model', 'm-fast').slice(0, 4)).toEqual(['m-fast', '3', '8', 'USD']);
-    expect(await listModelPrices()).toMatchObject([{ model: 'm-fast', inputPerMTok: 3, outputPerMTok: 8, currency: 'USD' }]);
+    expect(rowCells(updated, 'data-model', 'm-fast').slice(0, 5)).toEqual(['m-fast', '3', '8', '同输入单价', 'USD']);
+    expect(await listModelPrices()).toMatchObject([{ model: 'm-fast', inputPerMTok: 3, outputPerMTok: 8, cachedInputPerMTok: null, currency: 'USD' }]);
 
     const events = await (await browser.get('/ops/audit')).text();
     const actions = auditActions(events);
@@ -113,9 +113,43 @@ describe('运营后台模型单价页', () => {
     }
     expect(rows[1].detail).toEqual({
       model: 'm-fast',
-      from: { inputPerMTok: 2.5, outputPerMTok: 10, currency: 'CNY' },
-      to: { inputPerMTok: 3, outputPerMTok: 8, currency: 'USD' },
+      from: { inputPerMTok: 2.5, outputPerMTok: 10, cachedInputPerMTok: null, currency: 'CNY' },
+      to: { inputPerMTok: 3, outputPerMTok: 8, cachedInputPerMTok: null, currency: 'USD' },
     });
+  });
+
+  it('缓存输入单价可留空：留空新建显示「同输入单价」（存 null）、只改缓存单价也写一条修改审计，同值仍是 no-op', async () => {
+    const { browser } = await operator();
+    expect((await post(browser)).status).toBe(302);
+    const created = await (await browser.get('/ops/model-prices')).text();
+    expect(rowCells(created, 'data-model', 'm-fast').slice(0, 5)).toEqual(['m-fast', '2.5', '10', '同输入单价', 'CNY']);
+    expect(await listModelPrices()).toMatchObject([{ model: 'm-fast', cachedInputPerMTok: null }]);
+
+    // 只改缓存单价：输入 / 输出 / 币种不变，也算修改、写 model_price.updated
+    expect((await post(browser, { cachedInputPerMTok: '0.5' })).status).toBe(302);
+    const updated = await (await browser.get('/ops/model-prices')).text();
+    expect(rowCells(updated, 'data-model', 'm-fast').slice(0, 5)).toEqual(['m-fast', '2.5', '10', '0.5', 'CNY']);
+    expect(await listModelPrices()).toMatchObject([{ model: 'm-fast', inputPerMTok: 2.5, outputPerMTok: 10, cachedInputPerMTok: 0.5, currency: 'CNY' }]);
+
+    const events = await (await browser.get('/ops/audit')).text();
+    const actions = auditActions(events);
+    expect(times(actions, '新增模型单价')).toBe(1);
+    expect(times(actions, '修改模型单价')).toBe(1);
+    expect(events).toContain('输入 2.5、输出 10 CNY / 百万 token、缓存输入 同输入单价');
+    expect(events).toContain('缓存输入 同输入单价 → 0.5');
+    const [row] = await getDb().select().from(auditLogs)
+      .where(inArray(auditLogs.action, ['model_price.updated']))
+      .orderBy(asc(auditLogs.createdAt));
+    expect(row.detail).toEqual({
+      model: 'm-fast',
+      from: { inputPerMTok: 2.5, outputPerMTok: 10, cachedInputPerMTok: null, currency: 'CNY' },
+      to: { inputPerMTok: 2.5, outputPerMTok: 10, cachedInputPerMTok: 0.5, currency: 'CNY' },
+    });
+
+    // "0.5000" 与 0.5 是同一个值：no-op，不写审计
+    expect((await post(browser, { cachedInputPerMTok: '0.5000' })).status).toBe(302);
+    const after = await (await browser.get('/ops/audit')).text();
+    expect(times(auditActions(after), '修改模型单价')).toBe(1);
   });
 
   it('同值保存是 no-op：不报错、不写审计（"3" 与 "3.0000" 是同一个值）', async () => {
@@ -138,6 +172,8 @@ describe('运营后台模型单价页', () => {
       { outputPerMTok: '-0.1' },
       { inputPerMTok: '2.50001' },
       { outputPerMTok: '10.00001' },
+      { cachedInputPerMTok: '-1' },
+      { cachedInputPerMTok: '0.12345' },
       { currency: 'EUR' },
       { currency: 'cny' },
     ];
@@ -190,7 +226,7 @@ describe('运营后台模型单价页', () => {
     expect(events).toContain('m-drop：删除前 输入 1.5、输出 6 USD / 百万 token');
     const [row] = await getDb().select().from(auditLogs).where(inArray(auditLogs.action, ['model_price.deleted']));
     expect(row).toMatchObject({ tenantId: null, actorType: 'operator', actorEmail: OPS, targetId: 'm-drop' });
-    expect(row.detail).toEqual({ model: 'm-drop', inputPerMTok: 1.5, outputPerMTok: 6, currency: 'USD' });
+    expect(row.detail).toEqual({ model: 'm-drop', inputPerMTok: 1.5, outputPerMTok: 6, cachedInputPerMTok: null, currency: 'USD' });
   });
 
   it('成员会话（包括租户管理员）访问模型单价页一律被拒绝', async () => {
