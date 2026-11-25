@@ -40,10 +40,10 @@ const GENERATION_ORIGIN: Record<'model' | 'rules' | 'reuse' | 'assertions', stri
 };
 
 
-// 每种审计动作的名称，以及把明细写成一句话的方式；新增动作只改这里
 // 缓存输入单价（#1256）在审计文本里的显示：null 与 undefined（旧审计行没有这个字段，不能报错）都显示「同输入单价」
 const cachedPriceText = (v: unknown) => (v == null ? '同输入单价' : String(v));
 
+// 每种审计动作的名称，以及把明细写成一句话的方式；新增动作只改这里
 const ACTIONS = {
   'tenant.created': { label: '开通租户', describe: (d: Detail) => `租户「${d.name}」，首个管理员 ${d.adminEmail}` },
   'tenant.renamed': { label: '租户改名', describe: (d: Detail) => `${d.from} → ${d.to}` },
