@@ -1,7 +1,8 @@
 // app/routes/settings.tsx —— 我的设置（任一成员）：个人令牌的签发（明文只在签发后的这次响应里展示一次）、列表与吊销（ADR-0042）。
 // 令牌给平台外的 Agent 经 /mcp 代表本人接入，权限永远等于本人当前角色；只能吊销自己的令牌。
 // 「接入方式」给完整 MCP 地址与可复制的配置片段：签发那次响应里填明文，平时（loader 渲染）一律填占位符；
-// 工具清单由服务端用 /mcp 的 tools/list 同一个 externalToolsFor 算，随成员角色与「允许执行查询」变
+// 工具清单由服务端用 /mcp 的 tools/list 同一个 externalToolsFor 算，随成员角色与「允许执行查询」变；
+// 角色执行不了查询时勾选框禁用、存为不允许（action 不信任表单），列表里这种令牌标「当前角色不可用」
 import { data, Form, redirect, useNavigation } from 'react-router';
 import { CircleAlert, KeyRound } from 'lucide-react';
 import type { Route } from './+types/settings';
@@ -48,6 +49,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     email: member.email,
     nav: navFor(member),
     mcpUrl: mcpUrlOf(request),
+    canQuery: queryOnly.length > 0,
     mcpTools: { base, queryOnly },
     tokens: rows.map(r => ({
       id: r.id,
@@ -70,7 +72,10 @@ export async function action({ request }: Route.ActionArgs) {
     switch (field('intent')) {
       case 'create': {
         // 不重定向：明文只在这次响应里出现，刷新或离开后再也看不到
-        const allowQuery = form.get('allowQuery') !== null;
+        // 角色执行不了查询时勾了也拿不到 run_query，action 不信任表单，一律按不允许存
+        const base = externalToolsFor(member, {}).map(t => t.name);
+        const queryReachable = externalToolsFor(member, { allowQuery: true }).some(t => !base.includes(t.name));
+        const allowQuery = form.get('allowQuery') !== null && queryReachable;
         const { token, row } = await createMemberToken(member, { name: field('name'), days: Number(field('days')), allowQuery });
         const tools = externalToolsFor(member, { allowQuery }).map(t => t.name);
         return { created: { name: row.name, token, mcpUrl: mcpUrlOf(request), tools } };
@@ -89,7 +94,7 @@ export async function action({ request }: Route.ActionArgs) {
 }
 
 export default function Settings({ loaderData, actionData }: Route.ComponentProps) {
-  const { email, nav, tokens, mcpUrl, mcpTools } = loaderData;
+  const { email, nav, tokens, mcpUrl, canQuery, mcpTools } = loaderData;
   const t = useT();
   const locale = useLocale();
   const submitting = useNavigation().state === 'submitting';
@@ -139,10 +144,14 @@ export default function Settings({ loaderData, actionData }: Route.ComponentProp
               </Field>
             </div>
             <Field orientation="horizontal">
-              <input type="checkbox" id="token-allow-query" name="allowQuery" className="size-4" />
+              <input type="checkbox" id="token-allow-query" name="allowQuery" className="size-4" disabled={!canQuery} />
               <FieldLabel htmlFor="token-allow-query">{t('允许执行查询')}</FieldLabel>
             </Field>
-            <FieldDescription>{t('勾选后 Agent 可以按你的权限执行工作台查询（结果剔除敏感列与哈希列），每次记审计。Agent 背后的模型由你选择，平台管不到数据流向。')}</FieldDescription>
+            <FieldDescription>
+              {canQuery
+                ? t('勾选后 Agent 可以按你的权限执行工作台查询（结果剔除敏感列与哈希列），每次记审计。Agent 背后的模型由你选择，平台管不到数据流向。')
+                : t('你当前的角色不能执行查询，令牌拿不到 run_query')}
+            </FieldDescription>
             <div>
               <Button type="submit" disabled={submitting}>{t('签发')}</Button>
             </div>
@@ -175,7 +184,7 @@ export default function Settings({ loaderData, actionData }: Route.ComponentProp
                 <TableRow key={tok.id} data-member-token-id={tok.id}>
                   <TableCell>{tok.name}</TableCell>
                   <TableCell className="font-mono">{`${tok.prefix}…`}</TableCell>
-                  <TableCell>{tok.allowQuery ? <Badge variant="outline">{t('可执行查询')}</Badge> : <span className="text-slate-500">{t('不允许')}</span>}</TableCell>
+                  <TableCell><QueryCell allowQuery={tok.allowQuery} canQuery={canQuery} /></TableCell>
                   <TableCell className="text-slate-500">{formatTime(tok.expiresAt)}</TableCell>
                   <TableCell className="text-slate-500">{formatTime(tok.createdAt)}</TableCell>
                   <TableCell className="text-slate-500">{tok.lastUsedAt ? formatTime(tok.lastUsedAt) : t('从未使用')}</TableCell>
@@ -203,6 +212,13 @@ export default function Settings({ loaderData, actionData }: Route.ComponentProp
       )}
     </AppShell>
   );
+}
+
+/** 列表里「执行查询」那一格：允许查询的令牌在成员当前角色执行不了查询时标「当前角色不可用」，与实际能力一致 */
+function QueryCell({ allowQuery, canQuery }: { allowQuery: boolean; canQuery: boolean }) {
+  const t = useT();
+  if (!allowQuery) return <span className="text-slate-500">{t('不允许')}</span>;
+  return <Badge variant="outline">{canQuery ? t('可执行查询') : t('可执行查询（当前角色不可用）')}</Badge>;
 }
 
 /** 一段可复制的配置；data-mcp-snippet 标明是哪一段 */
