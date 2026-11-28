@@ -67,19 +67,19 @@ LLM_BASE_URL=… LLM_MODEL=qwen-plus LLM_API_KEY=… pnpm eval:requirements   # 
 | 验收集 | 87.5%–100.0% | 100.0% | 75.0%–87.5% |
 | 合计 | 90.5%–95.2% | 100.0% | 57.1%–66.7% |
 
-**期望模式标错（#1324）**：`plan-modes.ts` 里 aov-per-order、days-since-last-order、item-revenue-30d、login-count-30d、paid-order-count-365d、revenue-by-paid-time、revenue-with-refund 这 7 条标的是 draft_definition，但固定目录里已有口径完全一致的已发布指标，应为 reuse_result；模型选复用被判错，上面的模式正确率因此偏低。按改正后的期望重数（42 条）：qwen-plus 20–23 条对，qwen4-max 31–35 条对；其中 clarify qwen-plus 0–1/9、qwen4-max 8–9/9。#1324 修完后按新期望再记一次基线。
+**期望模式标错（#1324）**：`plan-modes.ts` 里 aov-per-order、days-since-last-order、item-revenue-30d、login-count-30d、paid-order-count-365d、revenue-by-paid-time、revenue-with-refund 这 7 条标的是 draft_definition，但固定目录里已有口径完全一致的已发布指标，应为 reuse_result；模型选复用被判错，上面的模式正确率因此偏低。按改正后的期望重数（42 条）：qwen-plus 20–23 条对，qwen4-max 31–35 条对；其中 clarify qwen-plus 0–1/9、qwen4-max 8–9/9。#1324 已按上表改正期望：6 条改标 reuse_result；item-revenue-30d 例外——目录里的 `item_revenue_30d` 不带订单状态过滤（见下文 #367 一条），与本条期望口径不同，保留 draft_definition（上句重数按 7 条全改估，各轮实际再少 1 条复用判对、draft_definition 多 1 条错），`test/eval-requirements-metrics.test.ts` 加了口径断言防再标错。不重跑模型，上面的模式正确率数字仍按旧期望测得。
 
 **clarify 偏低的原因**：评测的计划模式只给模型检索结果，不带服务端歧义判定（`ambiguous: true` 与追问建议）；产品里助手的 `catalog_search` 会带。所以 qwen-plus 的 clarify 列比产品里悲观，不代表产品表现。
 
 合计行由两张表的条数加权算出（调参集 34 条、验收集 8 条）。#1226 之前（评测自拼提示词、不带 `PLAN_EXAMPLE`、没有修正回合，2026-11-24 用 qwen-plus 跑一次）模式正确率只有 12.5%，大多数条目在 Schema 就失败（缺 schemaVersion、reason 为空）。
 
-**draft_definition 类（#1227）**：有 `LLM_*` 时，评测在调参集、验收集两张表之后再打一张「计划模式（按期望模式，调参集 + 验收集）」表，每种期望模式一行（`plan-modes.ts`：draft_definition 19 条、clarify 9、unsupported 6、draft_query 5、reuse_result 3）。取上面同样 3 次运行里 draft_definition 行的模式正确率：
+**draft_definition 类（#1227）**：有 `LLM_*` 时，评测在调参集、验收集两张表之后再打一张「计划模式（按期望模式，调参集 + 验收集）」表，每种期望模式一行（`plan-modes.ts`：draft_definition 13 条、clarify 9、unsupported 6、draft_query 5、reuse_result 9，#1324 起 6 条与目录同口径的从 draft_definition 改标 reuse_result）。取上面同样 3 次运行里 draft_definition 行的模式正确率：
 
 | 期望模式 | 条数 | 模式正确率 | 目标 |
 |---|---|---|---|
-| draft_definition | 19 | qwen-plus 31.6%–36.8%，qwen4-max 31.6%–36.8% | ≥ 60% |
+| draft_definition | 13 | qwen-plus 31.6%–36.8%，qwen4-max 31.6%–36.8%（按 #1324 改正期望前的 19 条测得，改正后 46%–54%） | ≥ 60% |
 
-两个模型都没到目标。按 #1324 改正期望后 draft_definition 剩 12 条，两个模型都是 6–7 条对（50%–58%），仍不到 60%；主要错法是要新口径的需求被套用了现成指标（如 spend-tier 按金额分 3 档却复用只有 high 档的 `high_spender`）。
+两个模型都没到目标。按 #1324 改正期望后 draft_definition 剩 13 条（item-revenue-30d 因口径不同保留，见上），两个模型都是 6–7 条对（46%–54%），仍不到 60%；主要错法是要新口径的需求被套用了现成指标（如 spend-tier 按金额分 3 档却复用只有 high 档的 `high_spender`）。
 
 #1227 之前评测没有按期望模式分组的统计，只能从逐条输出里数。#1227 在 validate_plan 说明与能起草定义的角色的助手系统提示里加了选模式的规则（`PLAN_MODE_RULE`）：消费者粒度、可复用的口径（窗口 + 过滤）优先 draft_definition，只有跨粒度汇总或一次性查询才用 draft_query。
 
