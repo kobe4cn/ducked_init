@@ -6,7 +6,8 @@
 // message 与 next，提示在下方输入框回答）> 通过（按 mode 给下一步入口：reuse_result 链到所选条目的结果页 resultHref、
 // draft_definition 给「存草稿」、draft_query 有 workbenchSql 给「填入工作台」链接、没有给按钮；按钮只替本人发一句固定
 // 续写 onFollowUp，存草稿与填入工作台都会在助手工具里重新校验；不传 onFollowUp（被分享人只读）时不渲染按钮，链接照样
-// 渲染）> 过期（只提示重新提问，不给任何执行入口）。「排除了哪些口径」（excluded，#539）对所有 status 都显示，
+// 渲染；「存草稿」还看读者的角色——卡片带 canDraft: false（读者没有 definitions:draft，路由读时按角色补，#1327）时不给按钮，
+// 改一行灰字提示转给能起草的角色）> 过期（只提示重新提问，不给任何执行入口）。「排除了哪些口径」（excluded，#539）对所有 status 都显示，
 // 读者看不到的条目服务端只给原因，这里显示「你看不到的条目」。
 // 界面文字按界面语言翻译（ADR-0060，#1013）：显示文字走 t()；卡片数据（reason / issues / questions / assumptions /
 // 所选条目的名称与说明）原样显示，不翻。两条固定续写（DRAFT_FOLLOW_UP / WORKBENCH_FOLLOW_UP）是发给服务端的请求
@@ -150,9 +151,9 @@ function NextSteps({ card, unsupported, clarify, workbenchSql, onFollowUp }: {
         {card.mode === 'reuse_result' && card.resultHref && (
           <Link to={card.resultHref} data-next="result" className="underline">{t('查看已有结果')}</Link>
         )}
-        {card.mode === 'draft_definition' && onFollowUp && (
-          <button type="button" data-next="draft" onClick={() => onFollowUp(DRAFT_FOLLOW_UP)} className="underline">{t('存草稿')}</button>
-        )}
+        {card.mode === 'draft_definition' && (card.canDraft === false
+          ? <p className="text-slate-500">{t('你的角色不能起草定义，可把这份计划转给分析师、数据工程师或管理员')}</p>
+          : onFollowUp && <button type="button" data-next="draft" onClick={() => onFollowUp(DRAFT_FOLLOW_UP)} className="underline">{t('存草稿')}</button>)}
         {card.mode === 'draft_query' && (workbenchSql
           ? <Link to={`/workbench?sql=${encodeURIComponent(workbenchSql)}`} data-prefill data-next="workbench" className="underline">{t('填入工作台')}</Link>
           : onFollowUp && <button type="button" data-next="workbench" onClick={() => onFollowUp(WORKBENCH_FOLLOW_UP)} className="underline">{t('填入工作台')}</button>)}
