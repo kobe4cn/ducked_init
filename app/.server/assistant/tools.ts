@@ -421,16 +421,17 @@ export const TOOLS: AssistantTool[] = [
   {
     name: 'run_query',
     description: `按数据查询工作台的规则执行一条只读 SQL（只能读 silver、gold 与自己能读的沙箱表），最多返回 ${WORKBENCH_ROWS} 行。`
-      + `返回 JSON { columns, rows, truncated, dropped }：系统列、名字像敏感字段的列与取值含哈希的列被剔除，列名在 dropped 里；每格最多 ${MAX_CELL} 字`,
+      + `返回 JSON { columns, rows, truncated, dropped }：系统列、名字像敏感字段的列、由敏感列算出的列（起别名也一样）与取值含哈希的列被剔除，列名在 dropped 里；每格最多 ${MAX_CELL} 字`,
     inputSchema: { type: 'object', required: ['sql'], properties: { sql: { type: 'string' } }, additionalProperties: false },
     outputSchema: TEXT,
     permission: 'sandbox',
     external: true,
     requires: 'allowQuery',
     run: async (actor, { sql }) => {
-      // runQuery 自己记 workbench.query（actor 带着 via）；出错时抛 WorkbenchError，由调用方转成工具错误。全部行都交出去，哈希按全部行判断
+      // runQuery 自己记 workbench.query（actor 带着 via）；出错时抛 WorkbenchError，由调用方转成工具错误。全部行都交出去，哈希按全部行判断；
+      // 起别名躲过列名规则的派生敏感列按 result.sensitive 剔（#1338，宁可多剔）
       const result = await runQuery(actor, sql as string);
-      const { columns, rows, dropped } = redactResult(result, Infinity);
+      const { columns, rows, dropped } = redactResult(result, Infinity, new Set(result.sensitive ?? []));
       return JSON.stringify({ columns: columns.map(c => c.name), rows, truncated: result.truncated, dropped });
     },
   },

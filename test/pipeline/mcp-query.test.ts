@@ -1,5 +1,5 @@
 // test/pipeline/mcp-query.test.ts —— 令牌允许执行查询时经 MCP 执行查询（#299，ADR-0042 / 0036 / 0043）：externalToolsFor(成员, { allowQuery }) 才有 run_query，
-// invokeTool 按工作台规则执行、对全部返回行剔除敏感列、系统列与取值含哈希的列，每次执行记 workbench.query 带 via: 'mcp'；
+// invokeTool 按工作台规则执行、对全部返回行剔除敏感列、系统列、由敏感列算出的列（起别名也一样，#1338）与取值含哈希的列，每次执行记 workbench.query 带 via: 'mcp'；
 // handleMcp 把白名单、并发 429 等 WorkbenchError 转成 isError 的工具结果。平台内助手的 toolsFor 没有它
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -72,6 +72,24 @@ describe('run_query', () => {
     expect(out.columns).toEqual(['city']);
     expect(out.dropped).toEqual(['p', 'email', '_hash', 'contact_x']);
     expect(JSON.stringify(out)).not.toMatch(HASH);
+  });
+
+  it('工具描述写明由敏感列算出的列（起别名也一样）也剔除', async () => {
+    const tool = externalToolsFor(await analyst(), { allowQuery: true }).find(t => t.name === 'run_query');
+    expect(tool?.description).toContain('由敏感列算出的列（起别名也一样）');
+  });
+
+  // 不依赖种子表有没有明文敏感列：用 CTE 字面量造一行生日与城市（照 workbench-ai.test.ts 的写法）
+  const C = "WITH c AS (SELECT DATE '1990-05-17' AS birthday, 'sh' AS city)";
+
+  it.each([
+    ['结果列直接起别名', `${C} SELECT birthday AS d, city FROM c`],
+    ['CTE 里的别名再被外层引用', `${C}, t AS (SELECT birthday AS d, city FROM c) SELECT d, city FROM t`],
+  ])('明文敏感字段起了别名（%s）也剔除：dropped 含别名，行里没有生日取值', async (_, sql) => {
+    const out = await run(await analyst(), sql);
+    expect(out.columns).toEqual(['city']);
+    expect(out.dropped).toContain('d');
+    expect(JSON.stringify(out.rows)).not.toContain('1990-05-17');
   });
 
   it('前 50 行没有哈希、之后才有时照样剔除', async () => {

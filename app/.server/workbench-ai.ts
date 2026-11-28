@@ -249,7 +249,7 @@ export function pickColumns(result: WorkbenchResult, keep = sendable(result)): {
 
 /**
  * 剔除后交出去的结果：前 limit 行里没被剔除的列，单元格转成字符串、每格最多 MAX_CELL 字；dropped 是剔除的列名。
- * 哈希按交出去的这些行判断：解读只发前 INTERPRET_ROWS 行，MCP 的 run_query 交出全部行（limit 传 Infinity，不传 derived，行为不变）
+ * 哈希按交出去的这些行判断：解读只发前 INTERPRET_ROWS 行，MCP 的 run_query 交出全部行（limit 传 Infinity，derived 同样传 result.sensitive）
  */
 export function redactResult(result: WorkbenchResult, limit = INTERPRET_ROWS, derived: ReadonlySet<string> = NONE): { columns: WorkbenchResult['columns']; rows: (string | null)[][]; dropped: string[] } {
   const keep = sendable(result, limit, derived);
