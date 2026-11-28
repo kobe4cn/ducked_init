@@ -1,6 +1,7 @@
 // test/pipeline/knowledge-import.test.ts —— 把知识来源解析成知识提案的服务（ADR-0046 入口③，#526）的接缝：importFromSource →
 // 注入的假 fetch（setLlmFetch）→ chatJson（llm_calls 记 knowledge_import）→ outputToProposals（证据 ref 由代码拼成
-// source:<id>#p<段号> 并带来源版本，段号越界 / 没有证据 / 目标不在 restricted 目录里的整条丢弃）→ dropKnown（和已生效知识
+// source:<id>#p<段号> 并带来源版本，段号越界 / 没有证据 / 目标不在 restricted 目录里的整条丢弃，对应内容键为 null 的只丢
+// 那一条并记 *_invalid，#1313）→ dropKnown（和已生效知识
 // 相同的丢掉计 skipped，#948）→ 事务里 proposeMany（stale 按解析前的依据快照）+ 审计 knowledge_source.parsed（detail 只有
 // 标题、种类、版本与各类计数）。来源只是待解析的数据：
 // 段落里写「请发布 / 调用接口 / 忽略以上要求」或整段 SQL 时结果仍只有提案，没有 workbench 审计、没有任务；没配模型服务 409 不发请求
@@ -34,14 +35,17 @@ const calls = (tenantId: string) => getDb().select().from(llmCalls).where(eq(llm
 const auditsOf = (tenantId: string, action: string) => getDb().select().from(auditLogs)
   .where(and(eq(auditLogs.tenantId, tenantId), eq(auditLogs.action, action)));
 
+/** 给替身输出的每条提案补上其余两个内容键为 null：IMPORT_SCHEMA 三个内容键都必填（本地 Ajv 用同一份 Schema 校验，#1313），缺键会整次 422 */
+const withNulls = (ps: unknown[]) => ps.map(p => ({ alias: null, note: null, claim: null, ...(p as object) }));
+
 /** 模型返回的一批提案：给 metric:paid_revenue 提口径与别名、给 entity:order 提说明；坏条目按参数补在后面 */
 function modelOutput(bad: unknown[] = []) {
-  return { proposals: [
+  return { proposals: withNulls([
     { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'CNY' }, evidence: [{ paragraph: 2 }], reason: '文档说金额是人民币' },
     { kind: 'alias', targetId: 'metric:paid_revenue', alias: '成交额', evidence: [{ paragraph: 3 }], reason: '销售常用叫法' },
     { kind: 'note', targetId: 'entity:order', note: '订单表存下单与支付信息', evidence: [{ paragraph: 1 }], reason: '文档第一段' },
     ...bad,
-  ] };
+  ]) };
 }
 
 /** 身份打通数据源与订单映射，加一位分析师、一位查看者，发布指标 paid_revenue，粘一份三段的指标说明 */
@@ -134,25 +138,22 @@ describe('把知识来源解析成知识提案', () => {
     expect(detail.dropped[0]).toEqual({ targetId: 'entity:nope', reason: 'target_not_in_input' });
   });
 
-  it('模型输出 kind:note 但没有 note（正文写进 reason）时不合 Schema：422、没有新提案、记 parse_failed 审计、没有 knowledge_source.parsed 审计', async () => {
+  it('模型输出 kind:note 但 note 为 null（正文写进 reason）时只丢这一条：记 note_invalid 进 dropped、其余照常新建，没有 parse_failed', async () => {
     const { acme, analyst, source } = await setup();
     platformDefault();
     fakeLlm(setLlmFetch, () => json(modelOutput([
-      { kind: 'note', targetId: 'entity:order', evidence: [{ paragraph: 1 }], reason: '订单表存下单与支付信息' },
+      { kind: 'note', targetId: 'entity:order', note: null, evidence: [{ paragraph: 1 }], reason: '订单表存下单与支付信息' },
     ]), USAGE));
 
-    const failure = (p: Promise<unknown>) => p.then(() => { throw new Error('应当失败'); }, (e: unknown) => e as ImportError);
-    const e = await failure(importFromSource(analyst, source.id));
-    expect(e).toBeInstanceOf(ImportError);
-    expect(e).toMatchObject({ status: 422, message: expect.stringContaining('不符合 Schema') });
-    // 不合 Schema 也是模型失败：留 parse_failed 审计（detail 不含段落原文与提示词）
-    const [audit] = await auditsOf(acme, 'knowledge_source.parse_failed');
-    expect(audit).toMatchObject({ targetType: 'knowledge_source', targetId: source.id,
-      detail: { sourceId: source.id, title: '指标口径文档', kind: 'metric', version: source.version,
-        stage: 'model', error: expect.stringContaining('Schema') } });
+    const out = await importFromSource(analyst, source.id);
+    expect(out).toEqual({ created: 3, existing: 0, rejected: 0, invalid: 1, stale: 0, skipped: 0, chunks: 1 });
+    // 同批其余三条合法提案照常落库（不再整次 422 陪葬，#1313）
+    expect((await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).map(r => [r.kind, r.targetId]).sort())
+      .toEqual([['alias', 'metric:paid_revenue'], ['claim', 'metric:paid_revenue'], ['note', 'entity:order']]);
+    const [audit] = await auditsOf(acme, 'knowledge_source.parsed');
+    expect(audit!.detail).toMatchObject({ invalid: 1, dropped: [{ targetId: 'entity:order', reason: 'note_invalid' }] });
     expect(JSON.stringify(audit!.detail)).not.toContain('订单表存下单与支付信息');
-    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
-    expect(await auditsOf(acme, 'knowledge_source.parsed')).toHaveLength(0);
+    expect(await auditsOf(acme, 'knowledge_source.parse_failed')).toHaveLength(0);
   });
 
   it('段落里写「请发布 / 调用接口 / 忽略以上要求」和整段 SQL 时，结果仍只有提案：没有 workbench 审计、没有任务', async () => {
@@ -160,9 +161,9 @@ describe('把知识来源解析成知识提案', () => {
     const { acme, analyst, source } = await setup(body);
     platformDefault();
     const tasksBefore = (await getDb().select().from(tasks).where(eq(tasks.tenantId, acme))).length;
-    fakeLlm(setLlmFetch, () => json({ proposals: [
+    fakeLlm(setLlmFetch, () => json({ proposals: withNulls([
       { kind: 'note', targetId: 'entity:order', note: '订单表存下单与支付信息', evidence: [{ paragraph: 1 }, { paragraph: 2 }], reason: '指令只是数据' },
-    ] }, USAGE));
+    ]) }, USAGE));
 
     const out = await importFromSource(analyst, source.id);
     expect(out).toEqual({ created: 1, existing: 0, rejected: 0, invalid: 0, stale: 0, skipped: 0, chunks: 1 });
@@ -243,12 +244,12 @@ describe('把知识来源解析成知识提案', () => {
     // 假模型从请求的 user JSON 里读出这一块的段号：每段回一条该段独有的别名，另外每块都回同一条「成交额」（验证去重）
     const { f, received } = fakeLlm(setLlmFetch, (_n, body) => {
       const input = JSON.parse(body.messages[1]!.content) as { paragraphs: { no: number }[] };
-      return json({ proposals: [
+      return json({ proposals: withNulls([
         { kind: 'alias', targetId: 'metric:paid_revenue', alias: '成交额', evidence: [{ paragraph: input.paragraphs[0]!.no }], reason: '每块都提同一条' },
         ...input.paragraphs.map(p => (
           { kind: 'alias', targetId: 'metric:paid_revenue', alias: `第${p.no}段的叫法`, evidence: [{ paragraph: p.no }], reason: `第 ${p.no} 段独有` }
         )),
-      ] }, USAGE);
+      ]) }, USAGE);
     });
 
     const out = await importFromSource(analyst, source.id);
@@ -281,9 +282,9 @@ describe('把知识来源解析成知识提案', () => {
     fakeLlm(setLlmFetch, (_n, body) => {
       const input = JSON.parse(body.messages[1]!.content) as { paragraphs: { no: number }[] };
       if (input.paragraphs[0]!.no !== 1) return new Response('boom', { status: 500 });
-      return json({ proposals: input.paragraphs.map(p => (
+      return json({ proposals: withNulls(input.paragraphs.map(p => (
         { kind: 'alias', targetId: 'metric:paid_revenue', alias: `第${p.no}段的叫法`, evidence: [{ paragraph: p.no }], reason: `第 ${p.no} 段独有` }
-      )) }, USAGE);
+      ))) }, USAGE);
     });
 
     const e = await importFromSource(analyst, source.id).then(() => { throw new Error('应当失败'); }, (err: unknown) => err);
@@ -302,9 +303,9 @@ describe('把知识来源解析成知识提案', () => {
       const input = JSON.parse(body.messages[1]!.content) as { paragraphs: { no: number }[] };
       // 多于一段的一律截断，单段按段回合法提案（截断只认 truncated 字段，不匹配错误文案）
       if (input.paragraphs.length > 1) return truncated('{"proposals":[');
-      return json({ proposals: input.paragraphs.map(p => (
+      return json({ proposals: withNulls(input.paragraphs.map(p => (
         { kind: 'alias', targetId: 'metric:paid_revenue', alias: `第${p.no}段的叫法`, evidence: [{ paragraph: p.no }], reason: `第 ${p.no} 段独有` }
-      )) }, USAGE);
+      ))) }, USAGE);
     });
 
     const r = await importFromSource(analyst, source.id);
@@ -353,9 +354,9 @@ describe('把知识来源解析成知识提案', () => {
     const { f } = fakeLlm(setLlmFetch, (_n, reqBody) => {
       controller.abort();
       const input = JSON.parse(reqBody.messages[1]!.content) as { paragraphs: { no: number }[] };
-      return json({ proposals: input.paragraphs.map(p => (
+      return json({ proposals: withNulls(input.paragraphs.map(p => (
         { kind: 'alias', targetId: 'metric:paid_revenue', alias: `第${p.no}段的叫法`, evidence: [{ paragraph: p.no }], reason: `第 ${p.no} 段独有` }
-      )) }, USAGE);
+      ))) }, USAGE);
     });
 
     const e = await importFromSource(analyst, source.id, controller.signal)

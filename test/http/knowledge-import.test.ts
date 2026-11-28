@@ -36,12 +36,15 @@ const panelOf = (html: string, targetId: string) =>
 const theSource = async (tenantId: string) =>
   (await getDb().select().from(knowledgeSources).where(eq(knowledgeSources.tenantId, tenantId)))[0]!;
 
+/** 给替身输出的每条提案补上其余两个内容键为 null：IMPORT_SCHEMA 三个内容键都必填（本地 Ajv 用同一份 Schema 校验，#1313） */
+const withNulls = (ps: Record<string, unknown>[]) => ps.map(p => ({ alias: null, note: null, claim: null, ...p }));
+
 /** 模型替身返回的一批提案（照 pipeline/knowledge-import.test.ts）：给 metric:paid_revenue 提口径与别名、给 entity:order 提说明，证据指三段 */
-const modelOutput = () => ({ proposals: [
+const modelOutput = () => ({ proposals: withNulls([
   { kind: 'claim', targetId: TARGET, claim: { type: 'currency', value: 'CNY' }, evidence: [{ paragraph: 2 }], reason: '文档说金额是人民币' },
   { kind: 'alias', targetId: TARGET, alias: '成交额', evidence: [{ paragraph: 3 }], reason: '销售常用叫法' },
   { kind: 'note', targetId: 'entity:order', note: '订单表存下单与支付信息', evidence: [{ paragraph: 1 }], reason: '文档第一段' },
-] });
+]) });
 
 /** 身份打通数据源与订单映射，加一位分析师、一位查看者，发布指标 paid_revenue（sum(amount)，系统单位未知） */
 async function setup() {
