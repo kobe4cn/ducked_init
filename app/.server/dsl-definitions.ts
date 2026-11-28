@@ -28,7 +28,7 @@ import { publishedPlans } from './mappings';
 import { failedErrors, type AssertionResult } from './pipeline/assertions';
 import { DSL_KINDS, isDslKind, type DslKind } from './pipeline/dsl';
 import { compileMetricDiff, compileTagDiff } from './pipeline/dsl/impact';
-import { definitionDraftMessages, definitionDraftPurpose, definitionDraftSchema, definitionOutputToYaml, METRIC_PARSE_SCHEMA, normalizeParseOutput, SEARCH_LIMIT } from './pipeline/dsl/model-draft';
+import { definitionDraftMessages, definitionDraftPurpose, definitionDraftSchema, definitionOutputToYaml, METRIC_PARSE_SCHEMA, normalizeParseOutput, SEARCH_LIMIT, wholeUnsupported } from './pipeline/dsl/model-draft';
 import { checkMetric, type DslCheck, type DslContext, type DslIssue, type MetricSpec } from './pipeline/dsl/metric-spec';
 import { withMetric } from './pipeline/dsl/tag-spec';
 import { CONSUMER, DEVICE_OWNER, IDENTITIES } from './pipeline/identity-engine';
@@ -193,7 +193,8 @@ export type DraftExplanation = { items: { path: string; reason: string }[]; unkn
  * 输出形状，#1162；标签没有说明），不保存（之后照常保存草稿、双人发布）。
  * 没配置模型服务、或上下文里没东西可用（标签没有可引用的指标）时 400、不发请求；
  * 模型失败或转出的 YAML 不过校验时记审计 definition.model_draft_failed（不含需求原文、逐项说明、模型原文与取值），抛 422；
- * 模型判断做不到（标签草稿输出 unsupported，#1165）时 422 只带模型给的原因、不带问题列表，审计阶段 unsupported 只记原因条数
+ * 模型判断做不到（标签草稿输出 unsupported，#1165；指标 spec 为空对象且 unsupported 非空，#1323）时 422 只带模型给的原因、不带问题列表，
+ * 审计阶段 unsupported 只记原因条数
  */
 export async function modelDraftForDefinition(actor: CurrentMember, kind: string, request: string): Promise<{ yaml: string; ambiguity: DraftAmbiguity | null; explanation: DraftExplanation | null }> {
   // 整个入口包进 withLlmContext（#1257）：这次操作里的模型调用（含 hybrid_search 时检索的 embedding）在 llm_calls 里记发起人、共用一个 turn_id
@@ -211,7 +212,8 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
     const messages = definitionDraftMessages(kind, request, catalog, entries);
     if (!Array.isArray(messages)) throw new DslError(messages.unavailable);
     // 指标沿用一句话解析的输出形状（#1162）：宽松 Schema 放行平铺输出（llm_calls.schema_valid 记的是宽松校验的结果，与 #959 一致），
-    // 收拢（normalizeParseOutput）后仍按 METRIC_PARSE_SCHEMA 严格校验（不合时抛 LlmError，与模型失败同一条失败路径），另带回逐项说明
+    // 收拢（normalizeParseOutput）后先判整条做不到（#1323：spec 为空对象且 unsupported 非空，否则严格校验会报缺 base / measure 的
+    // Schema 错，成员看不到原因），再按 METRIC_PARSE_SCHEMA 严格校验（不合时抛 LlmError，与模型失败同一条失败路径），另带回逐项说明
     let spec: object;
     let explanation: DraftExplanation | null = null;
     let normalized = false;
@@ -220,10 +222,16 @@ export async function modelDraftForDefinition(actor: CurrentMember, kind: string
       if (kind === 'metric') {
         const collected = normalizeParseOutput(spec as Record<string, unknown>);
         normalized = collected.normalized;
-        assertSchema(METRIC_PARSE_SCHEMA, collected.output);
-        const parsed = collected.output as { spec: object } & DraftExplanation;
-        spec = parsed.spec;
-        explanation = { items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported };
+        const whole = wholeUnsupported(collected.output);
+        if (whole) {
+          // 走下面标签那段现成的「做不到」分支（#1165）：422 带原因、审计 stage: unsupported
+          spec = { unsupported: whole };
+        } else {
+          assertSchema(METRIC_PARSE_SCHEMA, collected.output);
+          const parsed = collected.output as { spec: object } & DraftExplanation;
+          spec = parsed.spec;
+          explanation = { items: parsed.items, unknowns: parsed.unknowns, unsupported: parsed.unsupported };
+        }
       }
     } catch (e) {
       if (!(e instanceof LlmError)) throw e;

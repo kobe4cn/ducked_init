@@ -1,9 +1,10 @@
-// test/pipeline/definition-draft-paths.test.ts —— 模型起草的指标定义补路径首段的实体名（#367，ADR-0035，纯函数）：
-// `->` 路径首段没写实体名时按 base 补成 <base>.<字段> 再转 YAML，补全后能过 checkMetric；校验本身不放宽，传入的对象不改
+// test/pipeline/definition-draft-paths.test.ts —— 模型起草的输出后处理纯函数（ADR-0035）：
+// `->` 路径首段没写实体名时按 base 补成 <base>.<字段> 再转 YAML（#367），补全后能过 checkMetric；校验本身不放宽，传入的对象不改。
+// 另测整条做不到的判法 wholeUnsupported（#1323）：收拢后的输出 spec 是空对象且 unsupported 非空才算
 import { describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 import { checkMetric } from '../../app/.server/pipeline/dsl/metric-spec';
-import { completeDraftPaths, definitionOutputToYaml } from '../../app/.server/pipeline/dsl/model-draft';
+import { completeDraftPaths, definitionOutputToYaml, wholeUnsupported } from '../../app/.server/pipeline/dsl/model-draft';
 import { CONTEXT } from '../../scripts/eval-requirements/golden';
 
 const BY_CITY = { base: 'order', measure: { agg: 'sum', field: 'amount' }, dimensions: [{ name: 'city', path: 'customer_id -> customer.city' }] };
@@ -52,5 +53,14 @@ describe('起草的指标补路径首段的实体名', () => {
   it('标签原样返回', () => {
     const tag = { metric: 'x', rules: [] };
     expect(completeDraftPaths('tag', tag)).toBe(tag);
+  });
+});
+
+describe('整条做不到的判法（#1323）', () => {
+  it('spec 是空对象、unsupported 非空时返回原因；spec 非空、unsupported 为空或没有 spec 时是 null', () => {
+    expect(wholeUnsupported({ spec: {}, items: [], unknowns: [], unsupported: ['预测下个月会流失的消费者'] })).toEqual(['预测下个月会流失的消费者']);
+    expect(wholeUnsupported({ spec: { base: 'order' }, unsupported: ['按城市不行'] })).toBeNull();
+    expect(wholeUnsupported({ spec: {}, unsupported: [] })).toBeNull();
+    expect(wholeUnsupported({ items: [] })).toBeNull();
   });
 });

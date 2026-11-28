@@ -1,5 +1,5 @@
 // app/.server/pipeline/dsl/model-draft.ts —— 用模型按自然语言需求生成定义草稿（ADR-0035，纯函数，不读库、不发请求）：
-// 每种可生成的定义给出模型必须遵守的输出 Schema（指标沿用一句话解析的输出形状，#1162：宽松 Schema 放行，调用方收拢后严格校验；标签另有「做不到」的出口，#1165）、调用用途、提示词与给模型的上下文；
+// 每种可生成的定义给出模型必须遵守的输出 Schema（指标沿用一句话解析的输出形状，#1162：宽松 Schema 放行，调用方收拢后严格校验；标签与指标都有「做不到」的出口，#1165、#1323）、调用用途、提示词与给模型的上下文；
 // 上下文取自语义目录（ADR-0041）：system 是简短的角色说明加该种类的能力说明，user 是目录分层上下文（第一层分组、相关分组的组内列表，#855）、
 // 按需求检索出的条目与需求原文。检索在 catalog/draft-search.ts（与助手同一条路，#827），排好的条目由调用方传入，这里只管截断与拼消息。
 // 目录里本就没有敏感字段、哈希列与明细行（ADR-0005），统计只有 ADR-0016 的常见取值。
@@ -46,6 +46,7 @@ const metricOutputLines = (source: string) => [
   '- 时间只认「近 N 天」，写成 window；「上个月」「今年」等其他时间说法整句原话进 unsupported，不写进 spec；按小时 / 天 / 月分组、取峰值的说法也整句原话进 unsupported。',
   '- 「分母为 0 时算 0」整句原话进 unsupported：编译用 NULLIF，分母为 0 时结果是空，不是 0。',
   `- ${source}支撑不了的写法不要写进 spec；unsupported 里的说法一律不进 spec。`,
+  '- 整条需求都做不到时 spec 给空对象 {}，原因写进 unsupported。',
 ];
 
 /** 指标的 system 提示词（#1162）：task 是角色说明里的任务，source 是来源词（现在只有起草的「需求」） */
@@ -106,10 +107,24 @@ export const METRIC_PARSE_SCHEMA = {
 
 /** 宽松 Schema（#959 兜底）：callModel 只发 response_format: json_object、模型看不到上面的 Schema，常把定义平铺在顶层
  *  （qwen-plus 必现），严格 Schema 会让一句话解析必然失败——也接受顶层有 base 或 measure 的平铺输出，收拢
- *  （normalizeParseOutput）后再按 METRIC_PARSE_SCHEMA 严格校验。必须是模块级常量：validatorFor 用 WeakMap 按对象缓存
- *  编译结果，每次调用新建对象会反复编译；指标起草也走它（#1162），定义在 DRAFTS 之前免得撞 TDZ */
+ *  （normalizeParseOutput）后再按 METRIC_PARSE_SCHEMA 严格校验。第三支是「整条做不到」（#1323，同标签 #1165 的出口）：
+ *  spec 为空对象、unsupported 非空——严格 Schema 要求 spec 有 base / measure，这种答复原本只会报缺字段的 Schema 错。
+ *  必须是模块级常量：validatorFor 用 WeakMap 按对象缓存编译结果，每次调用新建对象会反复编译；指标起草也走它（#1162），
+ *  定义在 DRAFTS 之前免得撞 TDZ */
 export const METRIC_PARSE_LENIENT_SCHEMA = {
-  anyOf: [METRIC_PARSE_SCHEMA, { type: 'object', anyOf: [{ required: ['base'] }, { required: ['measure'] }] }],
+  anyOf: [
+    METRIC_PARSE_SCHEMA,
+    { type: 'object', anyOf: [{ required: ['base'] }, { required: ['measure'] }] },
+    {
+      type: 'object',
+      required: ['unsupported'],
+      // 不限额外键：四键齐全的答复（items / unknowns 为空列表）也要能过
+      properties: {
+        unsupported: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 } },
+        spec: { type: 'object', maxProperties: 0 },
+      },
+    },
+  ],
 } as const;
 
 /** 标签草稿的输出 Schema：标签定义（单指标或多指标写法），或「做不到」的原因（形状同一句话解析的 unsupported）；
@@ -170,6 +185,20 @@ export function normalizeParseOutput(raw: Record<string, unknown>): { output: un
   if ('spec' in raw) return { output: raw, normalized: false };
   const { items, unknowns, unsupported, ...spec } = raw;
   return { output: { spec, items: items ?? [], unknowns: unknowns ?? [], unsupported: unsupported ?? [] }, normalized: true };
+}
+
+/**
+ * 整条做不到的判法（#1323，纯函数）：收拢（normalizeParseOutput）后的输出里 spec 是空对象（没有任何键）且 unsupported 非空时
+ * 返回原因（模型判断整条需求做不到，与标签的出口 #1165 同归因），否则返回 null——spec 有内容时 unsupported 只作说明，照常走严格校验。
+ * 平铺的「整体做不到」（没有 spec、顶层也没有 base / measure）收拢后 spec 就是 {}，同样命中
+ */
+export function wholeUnsupported(output: unknown): string[] | null {
+  if (typeof output !== 'object' || output === null) return null;
+  const { spec, unsupported } = output as Record<string, unknown>;
+  if (typeof spec !== 'object' || spec === null || Object.keys(spec).length > 0) return null;
+  if (!Array.isArray(unsupported)) return null;
+  const reasons = unsupported.filter((r): r is string => typeof r === 'string' && r.length > 0);
+  return reasons.length ? reasons : null;
 }
 
 /** `->` 路径首段没写实体名时补成 <base>.<字段>；首段已有 `.`、不含 `->` 的裸字段原样返回（留给校验） */
