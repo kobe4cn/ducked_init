@@ -433,6 +433,11 @@ const ACTIONS = {
 } satisfies Record<string, { label: string; describe: (d: Detail) => string }>;
 export type AuditAction = keyof typeof ACTIONS;
 
+/** 审计动作的中文名；不是审计动作（catalog.initial 等）时返回 undefined */
+export function auditActionLabel(action: string): string | undefined {
+  return Object.hasOwn(ACTIONS, action) ? ACTIONS[action as AuditAction].label : undefined;
+}
+
 export const AUDIT_PAGE_SIZE = 200;
 
 export type Tx = Parameters<Parameters<Db['transaction']>[0]>[0];
