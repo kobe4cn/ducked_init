@@ -1,17 +1,27 @@
 // test/eval-requirements-metrics.test.ts —— pnpm eval:requirements 的检索与追问指标（#318，ADR-0041 / ADR-0047）：
 // groupByType 按失败类型 a–d 与合计算组内平均 Recall@20（没有候选的不计）、追问正确率与应追问召回；
-// 计划模式的期望（#423，ADR-0050 的 plan-modes.ts）覆盖全部条目且与标注规则一致；
+// 计划模式的期望（#423，ADR-0050 的 plan-modes.ts）覆盖全部条目且与标注规则一致；目录里已有同口径发布定义的标 reuse_result，
+// 标 draft_definition 的期望与固定目录里任何发布定义口径都不同（#1324，有断言防再标错）；
 // 对真实黄金集跑 retrievalRows，合计与 test/retrieval-golden.test.ts 的汇总一致。
 // 带手工构造的向量时向量一路参与融合（#416，ADR-0047 / 0049）：确定性测试不调真实 embedding，「有收益」只用手工向量证明机制。纯函数，不读库、不走模型
 import { describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 import type { PlanMode } from '../app/.server/catalog/plan';
-import { GOLDEN_ALL } from '../scripts/eval-requirements/golden';
+import { CATALOG_INPUT, GOLDEN_ALL } from '../scripts/eval-requirements/golden';
 import { PLAN_MODE_BY_ID, expectedMode } from '../scripts/eval-requirements/plan-modes';
+import { EXTRA_DEFINITIONS } from '../scripts/eval-requirements/retrieval-catalog';
 import { groupByMode, groupByType, retrievalRows, VIEWS, type RetrievalRow, type RetrievalVectors } from '../scripts/eval-requirements/retrieval';
 
 const row = (id: string, type: RetrievalRow['type'], recall: number | null, asked: boolean, shouldAsk: boolean, mode: PlanMode | null = null, expected: PlanMode = 'draft_query', planned = mode !== null,
   firstPass = false, passed = false): RetrievalRow =>
   ({ id, type, holdout: false, recall, top1: null, asked, shouldAsk, planned, mode, expectedMode: expected, firstPass, passed });
+
+/** 去掉 description 再比口径：说明不影响口径，expected 已是解析后的对象，目录定义这边同样 parse 后去掉 */
+const stripDescription = (spec: object): Record<string, unknown> => {
+  const copy = { ...spec } as Record<string, unknown>;
+  delete copy.description;
+  return copy;
+};
 
 describe('eval:requirements 的检索与追问指标', () => {
   it('分组：Recall@20 组内平均且没有候选的不计，追问正确率按条数，应追问召回只看应追问的条目，合计覆盖全部', () => {
@@ -119,19 +129,36 @@ describe('eval:requirements 的检索与追问指标', () => {
     expect(groupByType(withVector).合计.recall!).toBeGreaterThan(0.9634);
   });
 
-  it('计划模式期望：PLAN_MODE_BY_ID 覆盖全部条目且没有多余 id，d 类是 unsupported、其余标注追问的是 clarify、有期望定义的是 draft_definition、手工标的 reuse_result 与查看者问血缘的 unsupported，五种模式至少出现四种', () => {
+  it('计划模式期望：PLAN_MODE_BY_ID 覆盖全部条目且没有多余 id，d 类是 unsupported、其余标注追问的是 clarify、有期望定义的是 draft_definition 或 reuse_result、查看者问血缘的 unsupported，五种模式至少出现四种', () => {
     expect(new Set(Object.keys(PLAN_MODE_BY_ID))).toEqual(new Set(GOLDEN_ALL.map(g => g.id)));
     for (const g of GOLDEN_ALL) {
       expect(expectedMode(g), g.id).toBe(PLAN_MODE_BY_ID[g.id]);
       if (g.failure_type === 'd') expect(PLAN_MODE_BY_ID[g.id], g.id).toBe('unsupported');
       else if (g.clarify !== null) expect(PLAN_MODE_BY_ID[g.id], g.id).toBe('clarify');
-      else if (g.kind) expect(PLAN_MODE_BY_ID[g.id], g.id).toBe('draft_definition');
+      else if (g.kind) expect(['draft_definition', 'reuse_result'], g.id).toContain(PLAN_MODE_BY_ID[g.id]);
     }
-    // 手工标的 reuse_result：固定目录里已有能直接回答的发布指标（GMV → gross_revenue_30d、按支付时间的营收 → revenue_paid_30d），
-    // 查看者问血缘的是 unsupported（问的是血缘，写 SQL 回答不了；查看者目录不带血缘、没有源表，权限做不到，同 viewer-source-tables），其余逐条标的都是 draft_query
+    // reuse_result 不只是手工标的（GMV → gross_revenue_30d、按支付时间的营收 → revenue_paid_30d）：#1324 起有期望定义、
+    // 与目录里发布定义同口径的也标 reuse_result（见下一条 it 的断言），查看者问血缘的是 unsupported（问的是血缘，写 SQL 回答不了；
+    // 查看者目录不带血缘、没有源表，权限做不到，同 viewer-source-tables），其余逐条标的都是 draft_query
     expect(PLAN_MODE_BY_ID['gmv-alias']).toBe('reuse_result');
     expect(PLAN_MODE_BY_ID['viewer-paid-revenue']).toBe('reuse_result');
     expect(PLAN_MODE_BY_ID['viewer-amount-lineage']).toBe('unsupported');
     expect(new Set(Object.values(PLAN_MODE_BY_ID)).size).toBeGreaterThanOrEqual(4);
+  });
+
+  it('计划模式期望的口径核对（#1324）：标 draft_definition 且有期望定义的条目，期望与固定目录里任何发布指标 / 标签的口径都不同（去掉 description 后不深相等）；改标 reuse_result 的 6 条各自能在目录里找到深相等的定义（对照，证明比较真能抓到标错）', () => {
+    // 目录定义 = CATALOG_INPUT.definitions（golden 的 PUBLISHED_METRICS）+ EXTRA_DEFINITIONS，与 RETRIEVAL_CATALOG 的拼法一致（retrieval-catalog.ts）
+    const catalogDefs = [...CATALOG_INPUT.definitions!.map(d => d.yaml), ...Object.values(EXTRA_DEFINITIONS).map(d => d.yaml)]
+      .map(yaml => stripDescription(parse(yaml) as Record<string, unknown>));
+    for (const g of GOLDEN_ALL) {
+      if (PLAN_MODE_BY_ID[g.id] !== 'draft_definition' || !g.expected) continue;
+      const spec = stripDescription(g.expected);
+      for (const def of catalogDefs) expect(spec, `${g.id} 的期望与目录里某个发布定义同口径`).not.toEqual(def);
+    }
+    // 正向对照：#1324 从 draft_definition 改标的 6 条（第 7 条 item-revenue-30d 目录里的 item_revenue_30d 不带订单状态过滤、口径不同，保留 draft_definition）
+    for (const id of ['aov-per-order', 'days-since-last-order', 'login-count-30d', 'paid-order-count-365d', 'revenue-by-paid-time', 'revenue-with-refund']) {
+      const g = GOLDEN_ALL.find(x => x.id === id)!;
+      expect(catalogDefs, id).toContainEqual(stripDescription(g.expected!));
+    }
   });
 });
