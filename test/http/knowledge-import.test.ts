@@ -1,7 +1,7 @@
 // test/http/knowledge-import.test.ts —— 知识粘贴导入页 /knowledge/import 与来源原文页 /knowledge/sources/:id（ADR-0046 入口③，#527）的 HTTP 接缝：
 // 分析师粘贴标题、种类与正文提交后保存来源并调模型解析，302 回集中页带计数（跳过 = 已有 + 拒绝过 + 不合法 + 依据已变 + 和已生效知识相同，#948）、页顶提示《标题》与新提案；
 // 查看者打不开导入页（GET / POST 都 403）、集中页没有入口；未配置模型服务 409 时页面原地显示错误、带回已填的值与来源页链接；
-// 来源页按段渲染（段落带 p<段号> 锚点、段前显示段号），有 definitions:read 就能看，非 UUID / 不存在 400，?v= 与当前版本不同时提示段号可能对不上；
+// 来源页按段渲染（段落带 p<段号> 锚点、段前显示段号），有 definitions:read 就能看，非 UUID / 不存在 / 别的租户 404（#1335），?v= 与当前版本不同时提示段号可能对不上；
 // 知识面板里 source:<id>#p<段号> 证据渲染成指向来源页对应段落的链接（?v=<证据版本>#p<段号>），非 source 证据仍是纯文本
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,7 +13,7 @@ import { acceptProposal, proposeKnowledge } from '../../app/.server/knowledge/pr
 import { memberOf } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { fakeLlm, json, platformDefault } from '../pipeline/llm-fixtures';
-import { loginAs, resetDb, startApp, type TestApp } from './harness';
+import { createTenant, loginAs, resetDb, startApp, type TestApp } from './harness';
 
 let app: TestApp;
 beforeAll(async () => { app = await startApp(); });
@@ -218,7 +218,7 @@ describe('知识粘贴导入页与来源原文页', () => {
     expect(html).not.toContain('粘贴导入');
   });
 
-  it('来源页按段显示、段落有锚点与段号：有 definitions:read 就能看（查看者可以），非 UUID 与不存在的来源 400', async () => {
+  it('来源页按段显示、段落有锚点与段号：有 definitions:read 就能看（查看者可以），非 UUID 与不存在的来源 404（页面不存在，不再是 Internal Server Error）', async () => {
     const { saved } = shared;
     const viewer = await loginAs(app, 'view@acme.com');
 
@@ -236,8 +236,34 @@ describe('知识粘贴导入页与来源原文页', () => {
     expect(html).toContain('金额字段 amount 存的是人民币（元）。');
     expect(html).not.toContain('段号可能对不上'); // 没带 ?v= 时不提示
 
-    expect((await viewer.get('/knowledge/sources/not-a-uuid')).status).toBe(400);
-    expect((await viewer.get('/knowledge/sources/00000000-0000-0000-0000-000000000000')).status).toBe(400);
+    // 找不到的 ID 是 404，页面显示「页面不存在」，不再 400 显示 Internal Server Error（#1335）。
+    // 「Internal Server Error」仍会出现在 RR 序列化进 hydration 流的 ErrorResponse 里（/analytics/snapshots 的 404 同样如此），
+    // 肉眼看到的错误页才是断言对象：标题是 404、说明是「页面不存在」、没有旧的 400 页文案
+    for (const id of ['not-a-uuid', '00000000-0000-0000-0000-000000000000']) {
+      const res = await viewer.get(`/knowledge/sources/${id}`);
+      expect(res.status).toBe(404);
+      const html = decode(await res.text());
+      expect(html).toContain('页面不存在');
+      expect(html).toMatch(/<h1[^>]*>404<\/h1>/);
+      expect(html).not.toContain('没有这个来源');
+      expect(html).not.toContain('出错了');
+    }
+  });
+
+  it('跨租户访问来源页 404：B 租户管理员打开 A 租户的来源，和其他资源页一样显示「页面不存在」', async () => {
+    const { saved } = shared;
+    await createTenant('globex', '环球零售', 'admin@globex.com');
+    const adminB = await loginAs(app, 'admin@globex.com');
+
+    const res = await adminB.get(`/knowledge/sources/${saved.id}`);
+    expect(res.status).toBe(404);
+    const html = decode(await res.text());
+    expect(html).toContain('页面不存在');
+    expect(html).toMatch(/<h1[^>]*>404<\/h1>/);
+    expect(html).not.toContain('没有这个来源');
+
+    // B 租户自己的成员不受影响（会话正常）
+    expect((await adminB.get('/knowledge')).status).toBe(200);
   });
 
   it('来源页 ?v=N 读得到的历史版本直接显示那一版（页头「第 N 版（当前第 M 版）」），版本不存在时回退当前版并提示段号可能对不上', async () => {
