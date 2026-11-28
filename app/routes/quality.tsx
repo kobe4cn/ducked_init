@@ -12,10 +12,11 @@ import { excludeValue, ExclusionError, includeValue, listExcludedValues } from '
 import { latestIdentitySummary } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
 import { HOT_VALUE_THRESHOLD } from '~/.server/pipeline/identity-engine';
-import { ASSERTION_LABELS, describeCustom, SAMPLE_LIMIT, type AssertionLevel } from '~/.server/pipeline/assertions';
+import { ASSERTION_LABELS, describeCustom, SAMPLE_LIMIT, type AssertionLevel, type AssertionResult } from '~/.server/pipeline/assertions';
 import { latestResultCheck, mappingLabels, QUALITY_QUARANTINE, QUALITY_RUNS, readQuality } from '~/.server/quality';
 import { listSources } from '~/.server/sources';
 import { UUID } from '~/.server/tenants';
+import { useT } from '~/lib/i18n';
 import { AppShell } from '~/components/app-shell';
 import { PageHeader } from '~/components/page-header';
 import { StatTile } from '~/components/stat-tile';
@@ -33,7 +34,8 @@ export async function loader({ request }: Route.LoaderArgs) {
   const task = new URL(request.url).searchParams.get('task');
   const taskFilter = task && UUID.test(task) ? task : null;
   const { runs, quarantine } = await readQuality(member.tenant.id, { taskId: taskFilter ?? undefined });
-  // 「最近一次」只看结果层任务：合并任务的自定义断言也写运行记录，error 失败时还会回滚、不留记录
+  // 「最近一次」按每个结果层任务（每个定义、每个模板任务）最近一次运行汇总（#1329），不只看最后完成的一个：
+  // 合并任务的自定义断言也写运行记录，error 失败时还会回滚、不留记录，所以只数结果层任务
   const check = await latestResultCheck(member.tenant.id);
   const latest = check?.assertions ?? [];
   // 结果里的 sources 是数据源 ID（工作进程不读平台库），在这里换成名字；删掉的数据源照旧显示 ID
@@ -60,9 +62,12 @@ export async function loader({ request }: Route.LoaderArgs) {
     excluded: excluded.map(e => ({ ...e, createdAt: e.createdAt.toISOString() })),
     limits: { runs: QUALITY_RUNS, quarantine: QUALITY_QUARANTINE, sample: SAMPLE_LIMIT },
     latest: {
-      taskId: check?.taskId,
-      errors: latest.filter(a => a.level === 'error' && a.failed > 0).length,
-      warns: latest.filter(a => a.level === 'warn' && a.failed > 0).length,
+      /** 「最近一次」统计覆盖的结果层任务数（每个任务键各取最近一次运行） */
+      tasks: check?.tasks ?? 0,
+      /** 有失败断言的任务里最近完成的一个：提示链到它的 ?task= 筛选 */
+      failedTaskId: check?.failedTaskId,
+      errors: failedChecks(latest, 'error'),
+      warns: failedChecks(latest, 'warn'),
     },
   };
 }
@@ -91,6 +96,13 @@ export async function action({ request }: Route.ActionArgs) {
     throw e;
   }
 }
+
+/**
+ * 某级别不合格的断言条数。内置断言按任务读到的实体跑，同一次刷新里读同一实体的多个任务会各报一遍同一条断言，
+ * 所以按 (level, name, entity) 去重：一条断言在任一任务的最近一次运行里失败就算 1，不随扇出的任务数放大（#1329）
+ */
+const failedChecks = (assertions: AssertionResult[], level: AssertionLevel) =>
+  new Set(assertions.filter(a => a.level === level && a.failed > 0).map(a => `${a.level}\u0000${a.name}\u0000${a.entity}`)).size;
 
 /** 内置断言的中文名，加上运行记录里映射自定义断言（custom:<字段>:<检查>）现转的中文名 */
 const labelsFor = (names: string[]): Record<string, string> => ({
@@ -129,8 +141,16 @@ function HashAction({ intent, hash, children }: { intent: 'exclude' | 'include';
 
 export default function Quality({ loaderData, actionData }: Route.ComponentProps) {
   const { email, nav, canWrite, runs, quarantine, taskFilter, hot, hotThreshold, excluded, labels, limits, latest } = loaderData;
+  const t = useT();
   const label = (name: string) => labels[name] ?? name;
   const isExcluded = (hash: string) => excluded.some(e => e.hash === hash);
+  // 「最近一次」两个统计共用的提示：写统计覆盖了几个结果层任务；有失败时链到其中一个失败任务，只看它的断言与隔离区
+  const latestHint = latest.tasks ? (
+    <>
+      {t('{tasks, plural, other {覆盖 # 个结果层任务}}', { tasks: latest.tasks })}
+      {latest.failedTaskId && <>，<Link className="underline" to={`/quality?task=${latest.failedTaskId}`}>{t('查看样本')}</Link></>}
+    </>
+  ) : t('还没有运行记录');
   return (
     <AppShell email={email} nav={nav}>
       <PageHeader title="数据质量" description="结果层任务计算前对标准层做的内置检查，以及合并时映射里写的自定义断言。阻断级失败时任务不产出新快照（自定义断言则是这个映射合并失败），告警级只记录；不合格行的样本放在隔离区，敏感字段只有哈希。" />
@@ -142,8 +162,8 @@ export default function Quality({ loaderData, actionData }: Route.ComponentProps
       )}
 
       <div className="grid gap-4 sm:grid-cols-3">
-        <StatTile label="最近一次阻断失败" value={latest.errors} tone={latest.errors ? 'text-red-600' : undefined} hint={latest.taskId ? `结果层任务 ${latest.taskId}` : '还没有运行记录'} />
-        <StatTile label="最近一次告警" value={latest.warns} tone={latest.warns ? 'text-amber-600' : undefined} hint="告警不阻断任务" />
+        <StatTile label="最近一次阻断失败" value={latest.errors} tone={latest.errors ? 'text-red-600' : undefined} hint={latestHint} />
+        <StatTile label="最近一次告警" value={latest.warns} tone={latest.warns ? 'text-amber-600' : undefined} hint={latestHint} />
         <StatTile label="隔离区样本" value={quarantine.length} hint={`最近 ${limits.quarantine} 行`} />
       </div>
 
