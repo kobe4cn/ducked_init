@@ -4,7 +4,8 @@
 // in / not_in 写列表），只写当前 agg 适用的键（切换 agg 后不适用的键自然丢掉，METRIC_SCHEMA 的 allOf），维度最多 MAX_DIMENSIONS 个。
 // YAML → 表单：认不出的写法（consumer_via、device_attribution、维度的 as_of、含 -> 或 consumer. 前缀的路径、Schema 之外的键或非标量取值、不认识的顶层键）
 // 标成只读并说明原因，原始值原样保存在 readonly[].raw 里，formToYaml 原样写回，保证往返不丢信息（ADR-0017：YAML 仍是唯一格式）。
-// summarize 是四句摘要：计算什么 / 只算哪些记录 / 按什么时间 / ratio 时分母为 0 或为空怎么办（ADR-0025，措辞参考 .server/knowledge/derive.ts 的口径文字，那是 .server 的不能 import）。
+// summarize 是四句摘要：计算什么 / 只算哪些记录 / 按什么时间 / ratio 时分母为 0 或为空怎么办（ADR-0025，措辞参考 .server/knowledge/derive.ts 的口径文字，那是 .server 的不能 import）；
+// readonly 里的过滤与窗口（路径字段）也按原值并进第二、三句，其余只读项在末尾追加一句「以 YAML 与 SQL 为准」，摘要不与编译出的 SQL 矛盾。
 // diffForms 比两张表单的摘要句子（按位置配对、只留不相等的项）：新建指标页解析一句话后展示和当前表单的差异。
 // 只能 import app/lib 里的东西（.server 的只能 import type）
 import { parseDocument, stringify } from 'yaml';
@@ -335,24 +336,74 @@ function measurePhrase(t: T, form: MetricForm, fields: readonly FormField[]): st
   return phrase[form.agg]();
 }
 
+/** readonly 过滤项的原值读回条件（摘要用，与 readCond 的差别：字段允许是路径）：取值转成字符串只作显示；形状不对（op 不认识、取值不是标量或标量列表）返回 undefined，留在末尾附加句里 */
+function condOf(raw: unknown): Cond | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const { field, op, value, ...rest } = raw as Record<string, unknown>;
+  if (Object.keys(rest).length || typeof field !== 'string' || !isOps(op)) return undefined;
+  const scalar = (x: unknown): string | undefined => (typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean') ? String(x) : undefined;
+  if (value === undefined) return { field, op };
+  const one = scalar(value);
+  if (one !== undefined) return { field, op, value: one };
+  if (Array.isArray(value) && value.every(x => scalar(x) !== undefined)) return { field, op, value: value.map(x => scalar(x)!) };
+  return undefined;
+}
+
 /**
- * 指标表单的四句摘要：① 计算什么（聚合与字段）② 只算哪些记录（filter 只保留满足条件的行：顶层写「只算 … 的记录」，ratio 分子、分母自己的过滤写「分子只算 … 的记录」，多条用「并且」，没有任何过滤时「不排除任何记录」）
+ * 指标表单的摘要句子：① 计算什么（聚合与字段）② 只算哪些记录（filter 只保留满足条件的行：顶层写「只算 … 的记录」，ratio 分子、分母自己的过滤写「分子只算 … 的记录」，多条用「并且」，没有任何过滤时「不排除任何记录」）
  * ③ 按什么时间（「近 N 天，按 xx 时间」，没有时「不限时间」）④ ratio 时「分母为 0 或为空时结果记为空」（与 compileMetric 的 NULLIF 一致）；非 ratio 时省略，返回三句。
- * 句子按界面语言出（t 由调用方构造），中文界面回退中文原文、逐字与改造前一致
+ * readonly 里的过滤（filter.N、measure.numerator.filter.N、measure.denominator.filter.N）与窗口（window）也按原值并进第二、三句——路径字段（ADR-0038）的写法，字段直接显示路径原文；
+ * 其余 readonly 项（维度、不认识的键、$yaml、形状读不出的过滤 / 窗口）在末尾追加一句「另有构建器表达不了的项：…，以 YAML 与下方 SQL 为准」，没有剩余时不追加，原有句子逐字不变。
+ * 附加句只能放最后：diffForms 按位置配对句子。句子按界面语言出（t 由调用方构造），中文界面回退中文原文、逐字与改造前一致
  */
 export function summarize(t: T, form: MetricForm, fields: readonly FormField[]): string[] {
   // filter 只保留满足条件的行（全部满足）；分子、分母自己的 filter 只限制分子或分母，各自写明范围
+  const used = new Set<string>(); // 已写进第二、三句的 readonly 项；剩下的是构建器表达不了的，末尾统一提示
+  /** at 位置（filter / measure.numerator.filter…）的完整条件列表：readonly 原值按原下标放回，表单条件按顺序填剩下的位置（与 formToYaml 的 placeBack 对称） */
+  const allConds = (at: string, built: readonly Cond[]): Cond[] => {
+    const raws = new Map<number, Cond>();
+    for (const r of form.readonly) {
+      const i = r.key.startsWith(`${at}.`) ? r.key.slice(at.length + 1) : '';
+      if (!/^\d+$/.test(i)) continue;
+      const cond = condOf(r.raw);
+      if (cond === undefined) continue;
+      raws.set(Number(i), cond);
+      used.add(r.key);
+    }
+    if (!raws.size) return [...built];
+    const out: Cond[] = [];
+    let next = 0;
+    for (let i = 0; i <= Math.max(...raws.keys()); i++) {
+      const raw = raws.get(i);
+      if (raw !== undefined) out.push(raw);
+      else if (next < built.length) out.push(built[next++]!);
+    }
+    return [...out, ...built.slice(next)];
+  };
   const scope = (who: '' | 'numerator' | 'denominator', conds: readonly Cond[]) =>
     conds.length ? [t('{who, select, numerator {分子} denominator {分母} other {}}只算 {conds} 的记录', { who, conds: filterTexts(t, conds, fields).join(t(' 并且 ')) })] : [];
   const scopes = [
-    ...scope('', form.filter),
-    ...(form.agg === 'ratio' ? [...scope('numerator', form.numerator?.filter ?? []), ...scope('denominator', form.denominator?.filter ?? [])] : []),
+    ...scope('', allConds('filter', form.filter)),
+    ...(form.agg === 'ratio' ? [...scope('numerator', allConds('measure.numerator.filter', form.numerator?.filter ?? [])), ...scope('denominator', allConds('measure.denominator.filter', form.denominator?.filter ?? []))] : []),
   ];
+  // 窗口：readonly 里形状完整的 window（路径字段的窗口）也成句，字段显示路径原文
+  let win = form.window;
+  if (win === undefined) {
+    const raw = form.readonly.find(r => r.key === 'window')?.raw;
+    const item = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
+    const { field, days } = item ?? {};
+    if (typeof field === 'string' && typeof days === 'number') {
+      win = { field, days };
+      used.add('window');
+    }
+  }
+  const rest = form.readonly.filter(r => !used.has(r.key)).map(r => r.key);
   return [
     measurePhrase(t, form, fields),
     scopes.length ? t('{scopes}。', { scopes: scopes.join(t('；')) }) : t('不排除任何记录。'),
-    form.window ? t('近 {days} 天，按{field}。', { days: form.window.days, field: labelOf(t, form.window.field, fields) }) : t('不限时间。'),
+    win ? t('近 {days} 天，按{field}。', { days: win.days, field: labelOf(t, win.field, fields) }) : t('不限时间。'),
     ...(form.agg === 'ratio' ? [t('分母为 0 或为空时结果记为空。')] : []),
+    ...(rest.length ? [t('另有构建器表达不了的项：{keys}，以 YAML 与下方 SQL 为准。', { keys: rest.join(t('、')) })] : []),
   ];
 }
 

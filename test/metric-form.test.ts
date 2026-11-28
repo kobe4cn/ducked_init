@@ -42,6 +42,9 @@ const ORDER: FormField[] = entityOf('order')!.fields
   .map(f => ({ name: f.name, type: f.type, label: f.label, ...(f.enum && { enum: f.enum }) }));
 const LINE: FormField[] = [field('line_id'), field('order_id'), field('visit_id'), field('qty', 'integer')]
   .map(f => ({ name: f.name, type: f.type }));
+const ITEM: FormField[] = entityOf('order_item')!.fields
+  .filter(f => !f.pii)
+  .map(f => ({ name: f.name, type: f.type, label: f.label }));
 
 const empty: Pick<MetricForm, 'filter' | 'dimensions' | 'readonly'> = { filter: [], dimensions: [], readonly: [] };
 
@@ -187,6 +190,71 @@ describe('四句摘要', () => {
       denominator: { agg: 'count', filter: [{ field: 'status', op: 'in', value: ['paid', 'completed'] }, { field: 'channel', op: 'not_null' }] },
     }, ORDER)[1]).toBe('分母只算 订单状态 在 paid、completed 中 并且 渠道 不为空 的记录。');
     expect(summarize(zh, { base: 'order', agg: 'count', ...empty }, ORDER)[1]).toBe('不排除任何记录。');
+  });
+
+  // #1315：路径字段的过滤与窗口在 readonly 里，摘要也要按原值成句（字段显示路径原文），不再与 SQL 矛盾
+  it('路径字段的过滤与窗口（readonly）也写进第二、三句：字段直接显示路径原文', () => {
+    const yaml = `base: order_item
+measure: { agg: sum, field: amount }
+filter:
+  - { field: order_item.product_id -> product.category, op: eq, value: 奶粉 }
+window: { field: order_item.order_id -> order.created_at, days: 30 }
+`;
+    const form = yamlToForm(yaml, ITEM);
+    expect(form.readonly.map(r => r.key)).toEqual(['filter.0', 'window']);
+    expect(summarize(zh, form, ITEM)).toEqual([
+      '计算金额求和。',
+      '只算 order_item.product_id -> product.category 等于 奶粉 的记录。',
+      '近 30 天，按order_item.order_id -> order.created_at。',
+    ]);
+  });
+
+  it('ratio 分子 / 分母 filter 里的路径条目按原下标并进各自的过滤句', () => {
+    const yaml = `base: order
+measure:
+  agg: ratio
+  numerator:
+    agg: count
+    filter:
+      - { field: status, op: eq, value: paid }
+      - { field: order.store_id -> custom_store.name, op: eq, value: milk }
+  denominator:
+    agg: count
+    filter: [{ field: order.customer_id -> customer.city, op: not_null }]
+`;
+    const form = yamlToForm(yaml, ORDER);
+    expect(form.readonly.map(r => r.key)).toEqual(['measure.numerator.filter.1', 'measure.denominator.filter.0']);
+    expect(summarize(zh, form, ORDER)).toEqual([
+      '计算分子行数 ÷ 分母行数。',
+      '分子只算 订单状态 等于 paid 并且 order.store_id -> custom_store.name 等于 milk 的记录；分母只算 order.customer_id -> customer.city 不为空 的记录。',
+      '不限时间。',
+      '分母为 0 或为空时结果记为空。',
+    ]);
+  });
+
+  it('其余 readonly 项（维度的 as_of 等）在末尾追加一句，键名在句中，英文界面也是英文', () => {
+    const yaml = `base: order_item
+measure: { agg: sum, field: amount }
+filter:
+  - { field: order_item.product_id -> product.category, op: eq, value: 奶粉 }
+window: { field: order_item.order_id -> order.created_at, days: 30 }
+dimensions:
+  - { name: store, path: order_item.product_id -> product.brand, as_of: current }
+`;
+    const form = yamlToForm(yaml, ITEM);
+    expect(form.readonly.map(r => r.key)).toEqual(['filter.0', 'window', 'dimensions.0']);
+    expect(summarize(zh, form, ITEM)).toEqual([
+      '计算金额求和。',
+      '只算 order_item.product_id -> product.category 等于 奶粉 的记录。',
+      '近 30 天，按order_item.order_id -> order.created_at。',
+      '另有构建器表达不了的项：dimensions.0，以 YAML 与下方 SQL 为准。',
+    ]);
+    // 英文界面附加句也是英文（路径原文与过滤值「奶粉」原样输出，不进翻译）
+    expect(summarize(en, form, ITEM).at(-1)).toBe("Also has items the builder can't express: dimensions.0. Trust the YAML and the SQL below.");
+    // 整份读不出（$yaml）时同样只在末尾提示
+    const broken = yamlToForm('base: [1]\n', ITEM);
+    expect(broken.readonly.map(r => r.key)).toEqual(['$yaml']);
+    expect(summarize(zh, broken, ITEM)).toEqual(['计算行数。', '不排除任何记录。', '不限时间。', '另有构建器表达不了的项：$yaml，以 YAML 与下方 SQL 为准。']);
   });
 });
 

@@ -188,6 +188,37 @@ describe('指标与标签定义页', () => {
     expect((await getDefinition(await memberOf(acme, 'analyst@acme.com', 'analyst'), 'metric', 'paid_amount_30d')).draft).toMatchObject({ version: 1, yaml: formToYaml(form, fields) });
   });
 
+  // #1315：路径字段的过滤与窗口在 readonly 里，摘要也要按原值成句（字段显示路径原文），不写与 SQL 矛盾的「不排除任何记录 / 不限时间」
+  it('YAML 模式检查路径字段的定义：摘要含路径过滤与近 30 天窗口，与编译出的 SQL 一致', async () => {
+    const acme = await newTenant('acme');
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const analyst = await loginAs(app, 'analyst@acme.com');
+    const yaml = 'base: order_item\nmeasure: { agg: sum, field: amount }\nfilter:\n  - { field: order_item.product_id -> product.category, op: eq, value: 奶粉 }\nwindow: { field: order_item.order_id -> order.created_at, days: 30 }\n';
+    const check = await analyst.post('/analytics/definitions/new', { kind: 'metric', intent: 'check', yaml });
+    expect(check.status).toBe(200);
+    const page = await check.text();
+    const summary = page.match(/<ul data-summary[^>]*>([\s\S]*?)<\/ul>/)![1];
+    expect(summary.match(/<li>/g)).toHaveLength(3);
+    expect(summary).toContain('<li>计算金额求和。</li>');
+    expect(summary).toContain('只算 order_item.product_id -&gt; product.category 等于 奶粉 的记录。</li>');
+    expect(summary).toContain('近 30 天，按order_item.order_id -&gt; order.created_at。</li>');
+    expect(summary).not.toContain('不排除任何记录');
+    expect(summary).not.toContain('不限时间');
+    // 编译出的 SQL 里确有这条过滤与窗口：摘要与 SQL 不再互相矛盾
+    expect(page).toMatch(/data-compiled-sql[^>]*>[^<]*category[^<]*奶粉/);
+    expect(await getDb().select().from(dslVersions)).toHaveLength(0);
+
+    // 带构建器表达不了的维度（as_of）时，摘要末尾多一句「以 YAML 与 SQL 为准」，键名在句中
+    const withDim = await analyst.post('/analytics/definitions/new', {
+      kind: 'metric', intent: 'check',
+      yaml: `${yaml}dimensions:\n  - { name: brand, path: order_item.product_id -> product.brand, as_of: current }\n`,
+    });
+    expect(withDim.status).toBe(200);
+    const dimSummary = (await withDim.text()).match(/<ul data-summary[^>]*>([\s\S]*?)<\/ul>/)![1];
+    expect(dimSummary.match(/<li>/g)).toHaveLength(4);
+    expect(dimSummary).toContain('另有构建器表达不了的项：dimensions.0，以 YAML 与下方 SQL 为准。');
+  });
+
   it('英文界面下构建器「检查」的摘要句子是英文（字段名走 CANONICAL_NAMES 词典），摘要里没有汉字', async () => {
     vi.stubEnv('CRM_ENABLE_EN_LOCALE', '1');
     const acme = await newTenant('acme');
