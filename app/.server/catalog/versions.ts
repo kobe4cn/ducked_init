@@ -22,9 +22,10 @@ export type CatalogVersionReason = AuditAction | 'source.profiled' | 'source.syn
 
 export interface DiffItem { id: string; kind: CatalogEntry['kind']; name: string }
 
-/** 源表条目 columns 键的变化明细：新增与删除的列名（各自排序）。只改了列类型的列不在里面；两个数组都为空时不写这个字段。
- *  旧版本存在 catalog_versions.diff 里的数据没有这个字段，读取时须容忍缺失 */
-export interface ColumnDiff { added: string[]; removed: string[] }
+/** 源表条目 columns 键的变化明细：新增与删除的列名（各自排序）。只改了列类型的列不在里面；added 与 removed 都为空时不写这个字段。
+ *  unlisted 是平台规则（如 #1212 敏感列）不再列出的列：源端仍在，记版本时进了 removed，读取时按最新采集分出来（见 withUnlistedColumns），不落库。
+ *  旧版本存在 catalog_versions.diff 里的数据没有这些字段，读取时须容忍缺失 */
+export interface ColumnDiff { added: string[]; removed: string[]; unlisted?: string[] }
 
 /** 两版目录按条目标识比出的差异；changed 的 keys 是变了的顶层键，源表条目另给列级明细 */
 export interface CatalogDiff { added: DiffItem[]; removed: DiffItem[]; changed: (DiffItem & { keys: string[]; columns?: ColumnDiff })[] }
@@ -189,6 +190,38 @@ export interface CatalogChangesForMember {
 }
 
 /**
+ * full 成员看的变化里，把 changed 条目列级明细的「删除列」按最新一次采集分一分（#1334）：removed 里源端仍在的列，
+ * 是平台规则（如 #1212 敏感列）不再列出而不是源端删列，挪进 unlisted 交给页面显示「不再列出」；不在采集里的照旧留在
+ * removed（源端真删了列，或改了名——旧名不在采集里）。比对的是最新采集而不是记版本当时的采集：某列后来又被重新列出时，
+ * 那一版会显示成「不再列出」，可接受。复用 loadCatalogInput 取采集（不另写一份 SQL），变更记录页访问频率低，
+ * 只在有 removed 列时才多查这一次；受限类别看不到源表条目，不进这里、不必多查
+ */
+async function withUnlistedColumns(tenantId: string, rows: { version: number; reason: CatalogVersionReason; createdAt: Date; diff: CatalogDiff }[]) {
+  if (!rows.some(v => v.diff.changed.some(x => x.columns?.removed.length))) return rows;
+  const input = await loadCatalogInput(getDb(), tenantId, { stats: false });
+  const sourceName = new Map((input.sources ?? []).map(s => [s.id, s.name]));
+  // 条目标识同 index.ts 的 tableId（未导出）：table:<数据源名>/<表名>，数据源名不转义
+  const liveColumns = new Map<string, ReadonlySet<string>>();
+  for (const t of input.tables ?? []) {
+    const source = sourceName.get(t.sourceId);
+    if (source !== undefined) liveColumns.set(`table:${source}/${t.name}`, new Set(t.columns.map(c => c.name)));
+  }
+  return rows.map(v => ({
+    ...v,
+    diff: {
+      ...v.diff,
+      changed: v.diff.changed.map(x => {
+        if (!x.columns?.removed.length) return x;
+        const unlisted = x.columns.removed.filter(c => liveColumns.get(x.id)?.has(c));
+        // unlisted 为空不写这个字段（与旧数据一致）；removed 只留源端不在的，沿用记版本时排好的顺序
+        if (!unlisted.length) return x;
+        return { ...x, columns: { ...x.columns, removed: x.columns.removed.filter(c => !liveColumns.get(x.id)?.has(c)), unlisted } };
+      }),
+    },
+  }));
+}
+
+/**
  * 按成员的可见性类别裁剪的变更记录（与 visibleCatalog 共用规则，ADR-0047）：full 原样返回；
  * restricted 去掉数据源与源表条目，changed 的 keys 去掉该种类要清空的键、去掉后为空的条目整条不显示，
  * 与数据源有关的原因（SOURCE_REASONS）统一返回 sources 并清空差异（ADR-0005）
@@ -198,7 +231,7 @@ export async function catalogChangesFor(member: CurrentMember, since: number, li
   // reason 列是 text，写进去的原因都来自白名单（recordCatalogVersion 的 reason 参数），这里收窄回 CatalogVersionReason
   const rows = versions.map(({ reason, ...v }) => ({ ...v, reason: reason as CatalogVersionReason }));
   if (visibilityClass(member.role) === 'full') {
-    return { current, versions: rows.map(v => ({ ...v, masked: false })) };
+    return { current, versions: (await withUnlistedColumns(member.tenant.id, rows)).map(v => ({ ...v, masked: false })) };
   }
   return {
     current,
